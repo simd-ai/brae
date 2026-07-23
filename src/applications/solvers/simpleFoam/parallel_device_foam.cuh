@@ -33,6 +33,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <sstream>
 #include <fstream>
 #include <filesystem>
@@ -286,7 +287,28 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
             return s ? s->scalarOr("relTol", 0.0) : 0.0;
         };
-        const scalar relTolP = solverRelTol("p"), relTolU = solverRelTol("U");
+        scalar       relTolP = solverRelTol("p");
+        const scalar relTolU = solverRelTol("U");
+        // Distributed stability guard. The multi-rank pressure preconditioner is one-level block-Jacobi AMG,
+        // which is only marginally stable on graded meshes at a LOOSE per-step tolerance -- combined with the
+        // non-deterministic order of MPI reductions it can flip to NaN on a case that converges single-GPU.
+        // So on a genuine multi-rank run we solve pressure to its ABSOLUTE tolerance (relTol 0) by default.
+        // A user who has validated their case and wants the looser/faster solve opts back in with
+        // BRAE_DIST_PRESSURE_RELTOL=1 (then the fvSolution relTol is honoured as-is). Single-rank runs of the
+        // parallel binary keep the case value (the single-GPU solve is stable at loose tolerance).
+        {
+            const char* keepLoose = std::getenv("BRAE_DIST_PRESSURE_RELTOL");
+            const bool  optOut     = keepLoose && std::atoi(keepLoose) != 0;
+            if (Pstream::nProcs() > 1 && relTolP > 0.0 && !optOut)
+            {
+                if (Pstream::master())
+                    std::fprintf(stderr,
+                        "brae: distributed run -> pressure relTol forced 0 (was %g) for stability "
+                        "[one-level block-Jacobi preconditioner; set BRAE_DIST_PRESSURE_RELTOL=1 to keep the case value].\n",
+                        relTolP);
+                relTolP = 0.0;
+            }
+        }
         // Turbulence transport relTol: OF solves k and (epsilon|omega) loosely per SIMPLE step. One knob covers
         // both here, so take the TIGHTER of the two (fmin) -- never solve a field looser than its case asks.
         const scalar relTolKE = sa ? solverRelTol("nuTilda")
