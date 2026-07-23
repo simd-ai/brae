@@ -33,3 +33,5 @@ Testing/
 # python bytecode
 __pycache__/
 *.pyc
+
+demo/

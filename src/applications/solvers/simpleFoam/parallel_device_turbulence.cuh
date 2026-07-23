@@ -159,7 +159,11 @@ inline scalar deviceParallelScalarTransport(
     label globalNCells,
     const DeviceBuffer<scalar>& ones,
     const DeviceBuffer<label>&               isWallCell,  // per-cell wall mask (empty -> no constraint, e.g. k)
-    const DeviceBuffer<scalar>&              wallVal)     // per-cell eps0 (read only where isWallCell)
+    const DeviceBuffer<scalar>&              wallVal,     // per-cell eps0 (read only where isWallCell)
+    // INEXACT SIMPLE, same as the momentum/pressure solves: OF stops each turbulence transport at a RELATIVE
+    // reduction per outer iteration. Trailing + defaulted 0.0 so existing callers keep the fully-converged
+    // behaviour the np=1-vs-np>1 correctness tests rely on.
+    scalar relTol = 0.0)
 {
     const label lnC = dm.nCells;
 
@@ -222,7 +226,7 @@ inline scalar deviceParallelScalarTransport(
     const DeviceLduView mv = deviceLduView(dm, diagC, mUp, mLo);
     const scalar nf = deviceParallelNormFactor(mv, halo, ifCoeff, psi, b, ones, globalNCells);
     const DeviceSolverPerf perf =
-        deviceParallelJacobiBiCGStab(mv, halo, ifCoeff, b, psi, nf, tol, 0.0, maxIter);
+        deviceParallelJacobiBiCGStab(mv, halo, ifCoeff, b, psi, nf, tol, relTol, maxIter);
     return perf.initialResidual;
 }
 
@@ -252,7 +256,7 @@ inline void parallelDeviceKEpsilonCorrect(
     const DeviceBuffer<label>& isWallCell,
     scalar nu, scalar relaxEps, scalar relaxK, scalar tol, int maxIter, label globalNCells,
     const DeviceBuffer<scalar>& ones, bool bounded, const KEpsilonCoeffs& co,
-    scalar* resEps = nullptr, scalar* resK = nullptr)
+    scalar* resEps = nullptr, scalar* resK = nullptr, scalar relTolKE = 0.0)
 {
     constexpr int TPB = 128;
     const int nC = dm.nCells;
@@ -347,7 +351,7 @@ inline void parallelDeviceKEpsilonCorrect(
             co.C1, co.C2, co.C3, co.Cmu, bounded ? 1 : 0, SpE.data(), SuE.data(), nC);
     const scalar rE = deviceParallelScalarTransport(dm, halo, dbEps, faceCellsD, procStart, weightsD,
         phiInt, phiBnd, phiF, Deps_i, Deps_b, DepsGeo, SpE, SuE, eps, relaxEps, tol, maxIter, globalNCells, ones,
-        isWallCell, eps0);
+        isWallCell, eps0, relTolKE);
     detail::boundFieldKernel<<<nb(nC), TPB, 0, cudaStreamPerThread>>>(eps.data(), 1e-15, nC);
     if (resEps) *resEps = rE;
 
@@ -362,7 +366,7 @@ inline void parallelDeviceKEpsilonCorrect(
     DeviceBuffer<label> noWall; DeviceBuffer<scalar> noVal;
     const scalar rK = deviceParallelScalarTransport(dm, halo, dbK, faceCellsD, procStart, weightsD,
         phiInt, phiBnd, phiF, Dk_i, Dk_b, DkGeo, SpK, SuK, k, relaxK, tol, maxIter, globalNCells, ones,
-        noWall, noVal);
+        noWall, noVal, relTolKE);
     detail::boundFieldKernel<<<nb(nC), TPB, 0, cudaStreamPerThread>>>(k.data(), 1e-15, nC);
     if (resK) *resK = rK;
 
@@ -391,7 +395,8 @@ inline void parallelDeviceKOmegaSSTCorrect(
     scalar nu, scalar relaxOmega, scalar relaxK, scalar tol, int maxIter, label globalNCells,
     const DeviceBuffer<scalar>& ones, bool bounded, const KOmegaSSTCoeffs& co,
     bool lm = false,                                     // kOmegaSSTLM: F1 override + k-production intermittency
-    const DeviceBuffer<scalar>* gammaIntEff = nullptr)   // effective intermittency (nullptr -> plain kOmegaSST)
+    const DeviceBuffer<scalar>* gammaIntEff = nullptr,   // effective intermittency (nullptr -> plain kOmegaSST)
+    scalar relTolKE = 0.0)
 {
     constexpr int TPB = 128;
     const int nC = dm.nCells;
@@ -478,7 +483,7 @@ inline void parallelDeviceKOmegaSSTCorrect(
         DeviceBuffer<scalar> Sp(std::vector<scalar>(nC,0.0)), Su(std::vector<scalar>(nC,0.0));
         deviceOmegaReaction(dm.V, gamma, beta, GbyNu0lim, F1, CD, omega, divU, Sp, Su);
         deviceParallelScalarTransport(dm, halo, dbOmega, faceCellsD, procStart, weightsD, phiInt, phiBnd, phiF,
-            gInt, gBnd, gGeo, Sp, Su, omega, relaxOmega, tol, maxIter, globalNCells, ones, isWallCell, omega0);
+            gInt, gBnd, gGeo, Sp, Su, omega, relaxOmega, tol, maxIter, globalNCells, ones, isWallCell, omega0, relTolKE);
         detail::boundFieldKernel<<<nb(nC), TPB, 0, cudaStreamPerThread>>>(omega.data(), 1e-15, nC);
     }
     // ---- k equation ----
@@ -489,7 +494,7 @@ inline void parallelDeviceKOmegaSSTCorrect(
         deviceKReactionSST(dm.V, k, omega, G, divU, co, Sp, Su, gammaIntEff ? gammaIntEff->data() : nullptr);   // lm: Pk*=gammaIntEff
         DeviceBuffer<label> noWall; DeviceBuffer<scalar> noVal;
         deviceParallelScalarTransport(dm, halo, dbK, faceCellsD, procStart, weightsD, phiInt, phiBnd, phiF,
-            gInt, gBnd, gGeo, Sp, Su, k, relaxK, tol, maxIter, globalNCells, ones, noWall, noVal);
+            gInt, gBnd, gGeo, Sp, Su, k, relaxK, tol, maxIter, globalNCells, ones, noWall, noVal, relTolKE);
         detail::boundFieldKernel<<<nb(nC), TPB, 0, cudaStreamPerThread>>>(k.data(), 1e-15, nC);
     }
     // ---- correctNut (Bradshaw limiter) ----
@@ -515,7 +520,7 @@ inline void parallelDeviceKOmegaSSTLMCorrect(
     const std::vector<DeviceBuffer<scalar>>& weightsD, const std::vector<DeviceBuffer<scalar>>& geomD,
     const DeviceBuffer<label>& isWallCell,
     scalar nu, scalar relaxOmega, scalar relaxK, scalar tol, int maxIter, label globalNCells,
-    const DeviceBuffer<scalar>& ones, bool bounded, const KOmegaSSTCoeffs& co)
+    const DeviceBuffer<scalar>& ones, bool bounded, const KOmegaSSTCoeffs& co, scalar relTolKE = 0.0)
 {
     constexpr int TPB = 128;
     const int nC = dm.nCells;
@@ -579,7 +584,7 @@ inline void parallelDeviceKOmegaSSTLMCorrect(
         deviceLMAddReaction(dm, spR, suR, Sp, Su);
         addBounded(Sp);
         deviceParallelScalarTransport(dm, halo, dbReThetat, faceCellsD, procStart, weightsD, phiInt, phiBnd, phiF,
-            gI, gB, gG, Sp, Su, ReThetat, relaxK, tol, maxIter, globalNCells, ones, noWall, noVal);
+            gI, gB, gG, Sp, Su, ReThetat, relaxK, tol, maxIter, globalNCells, ones, noWall, noVal, relTolKE);
         detail::boundFieldKernel<<<nb(nC), TPB, 0, cudaStreamPerThread>>>(ReThetat.data(), 0.0, nC);
     }
 
@@ -595,7 +600,7 @@ inline void parallelDeviceKOmegaSSTLMCorrect(
         deviceLMAddReaction(dm, spG, suG, Sp, Su);
         addBounded(Sp);
         deviceParallelScalarTransport(dm, halo, dbGammaInt, faceCellsD, procStart, weightsD, phiInt, phiBnd, phiF,
-            gI, gB, gG, Sp, Su, gammaInt, relaxK, tol, maxIter, globalNCells, ones, noWall, noVal);
+            gI, gB, gG, Sp, Su, gammaInt, relaxK, tol, maxIter, globalNCells, ones, noWall, noVal, relTolKE);
         detail::boundFieldKernel<<<nb(nC), TPB, 0, cudaStreamPerThread>>>(gammaInt.data(), 0.0, nC);
     }
 
@@ -623,7 +628,7 @@ inline void parallelDeviceSpalartAllmarasCorrect(
     const std::vector<DeviceBuffer<label>>& faceCellsD, const std::vector<label>& procStart,
     const std::vector<DeviceBuffer<scalar>>& weightsD, const std::vector<DeviceBuffer<scalar>>& geomD,
     scalar nu, scalar relax, scalar tol, int maxIter, label globalNCells,
-    const DeviceBuffer<scalar>& ones, bool bounded, const SpalartAllmarasCoeffs& co)
+    const DeviceBuffer<scalar>& ones, bool bounded, const SpalartAllmarasCoeffs& co, scalar relTolKE = 0.0)
 {
     constexpr int TPB = 128;
     const int nC = dm.nCells;
@@ -694,7 +699,7 @@ inline void parallelDeviceSpalartAllmarasCorrect(
     if (bounded) { DeviceBuffer<scalar> vDiv; deviceHadamard(vDiv, divU, dm.V); deviceAxpy(-1.0, vDiv, Sp); }
     DeviceBuffer<label> noWall; DeviceBuffer<scalar> noVal;
     deviceParallelScalarTransport(dm, halo, dbNuTilda, faceCellsD, procStart, weightsD, phiInt, phiBnd, phiF,
-        gI, gB, gG, Sp, Su, nuTilda, relax, tol, maxIter, globalNCells, ones, noWall, noVal);
+        gI, gB, gG, Sp, Su, nuTilda, relax, tol, maxIter, globalNCells, ones, noWall, noVal, relTolKE);
     detail::boundFieldKernel<<<nb(nC), TPB, 0, cudaStreamPerThread>>>(nuTilda.data(), 1e-15, nC);
 
     deviceNutSA(nuTilda, nu, co.Cv1, nut);   // nut = nuTilda*fv1

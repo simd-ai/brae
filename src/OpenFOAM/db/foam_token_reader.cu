@@ -519,4 +519,81 @@ void readBinaryCompactFaces(const std::string& path, std::vector<label>& offsets
     expectCloseParen(b, i);
 }
 
+// Byte-level helpers for the mixed ASCII/binary cellZones parser below.
+namespace {
+
+// Skip whitespace/comments, then read a token up to the next whitespace or a ( ) { } ; delimiter.
+// Reads compound tokens like "List<label>" whole (the '<' '>' are not delimiters).
+std::string readWordBytes(const std::vector<char>& b, std::size_t& i)
+{
+    skipSpaceAndComments(b, i);
+    std::string w;
+    while (i < b.size())
+    {
+        const char c = b[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r'
+            || c == '(' || c == ')' || c == '{' || c == '}' || c == ';') break;
+        w += c;
+        ++i;
+    }
+    return w;
+}
+
+// Skip whitespace/comments, then require and consume the single byte `ch`.
+void expectByte(const std::vector<char>& b, std::size_t& i, char ch)
+{
+    skipSpaceAndComments(b, i);
+    if (i >= b.size() || b[i] != ch)
+        throw std::runtime_error(std::string("brae binary cellZones: expected '") + ch + "'");
+    ++i;
+}
+
+// Advance past the next occurrence of `ch` (consuming it). Used to skip flat entries like "type cellZone;".
+void skipPastByte(const std::vector<char>& b, std::size_t& i, char ch)
+{
+    while (i < b.size() && b[i] != ch) ++i;
+    if (i < b.size()) ++i;
+}
+
+} // namespace
+
+std::vector<std::pair<std::string, std::vector<label>>> readBinaryCellZones(const std::string& path)
+{
+    const std::vector<char> b = readBytes(path);
+    std::size_t i = headerPayloadOffset(b);        // past the FoamFile header (incl. nested meta{})
+    const std::size_t nz = readAsciiCount(b, i);   // nZones, cursor left just past the outer '('
+    std::vector<std::pair<std::string, std::vector<label>>> zones;
+    zones.reserve(nz);
+    for (std::size_t z = 0; z < nz; ++z)
+    {
+        const std::string name = readWordBytes(b, i);   // zone name (glued after '(' / previous '}')
+        expectByte(b, i, '{');
+        std::vector<label> cells;
+        for (;;)
+        {
+            skipSpaceAndComments(b, i);
+            if (i < b.size() && b[i] == '}') { ++i; break; }
+            const std::string key = readWordBytes(b, i);
+            if (key == "cellLabels")
+            {
+                // Optional compound token "List<label>" (some writers omit it: `cellLabels N(...)`).
+                skipSpaceAndComments(b, i);
+                if (i < b.size() && !(b[i] >= '0' && b[i] <= '9'))
+                    readWordBytes(b, i);
+                const std::size_t n = readAsciiCount(b, i);   // count, cursor just past '('
+                cells.resize(n);
+                readRaw(b, i, cells.data(), n);               // n raw int32 labels
+                expectCloseParen(b, i);
+                skipPastByte(b, i, ';');
+            }
+            else
+            {
+                skipPastByte(b, i, ';');   // e.g. "type cellZone;"
+            }
+        }
+        zones.emplace_back(name, std::move(cells));
+    }
+    return zones;
+}
+
 } // namespace brae

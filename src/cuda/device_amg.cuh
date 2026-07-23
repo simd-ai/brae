@@ -29,6 +29,12 @@ struct AMGGraphCache {
 struct PCGGraphCache {
     cudaGraphExec_t exec = nullptr; cudaGraph_t graph = nullptr;
     cudaGraphConditionalHandle handle{}; const void* key = nullptr;
+    // tol/relTol/maxIter are baked into the captured pcgSetCondK node, so they are part of the
+    // cache identity: replaying with a changed convergence control would silently keep the stale
+    // bound. They stay constant per field in the SIMPLE loop (no extra re-capture there), so
+    // including them in the key only guards the case where a caller reuses this cache with new
+    // controls. Sentinels chosen so the first solve always misses.
+    scalar keyTol = -1.0; scalar keyRelTol = -1.0; int keyMaxIter = -1;
     DeviceBuffer<scalar> pA, Ax, sNormF, sInit, sRes; DeviceBuffer<int> sIter;   // persistent (graph-referenced)
     ~PCGGraphCache();
 };

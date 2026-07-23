@@ -6,6 +6,7 @@
 #include "cf_types.cuh"
 #include <string>
 #include <vector>
+#include <utility>
 #include <cstddef>
 
 namespace brae {
@@ -18,6 +19,12 @@ std::string foamFormat(const std::string& path);
 std::vector<vector> readBinaryPoints(const std::string& path);
 std::vector<label>  readBinaryLabelList(const std::string& path);
 void readBinaryCompactFaces(const std::string& path, std::vector<label>& offsets, std::vector<label>& verts);
+
+// Binary constant/polyMesh/cellZones reader. cellZones is a MIXED file: the ZoneMesh structure
+// (nZones, zone names, `{ type cellZone; cellLabels ... }`) is ASCII, but each zone's cellLabels
+// list payload is a raw binary blob. The ASCII TokenStream mangles that blob, so binary meshes
+// need this dedicated parser. Returns (zoneName -> cell labels) in file order.
+std::vector<std::pair<std::string, std::vector<label>>> readBinaryCellZones(const std::string& path);
 
 class TokenStream
 {

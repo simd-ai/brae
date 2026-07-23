@@ -21,11 +21,21 @@ namespace brae {
 inline std::map<std::string, std::vector<label>> readCellZones(const std::string& polyMeshDir)
 {
     std::map<std::string, std::vector<label>> zones;
+    const std::string path = polyMeshDir + "/cellZones";
     {
-        std::ifstream f(polyMeshDir + "/cellZones");
-        if (!f.good()) return zones;
+        std::ifstream f(path);
+        std::ifstream g(path + ".gz");
+        if (!f.good() && !g.good()) return zones;
     }
-    TokenStream ts(polyMeshDir + "/cellZones");
+    // A binary polyMesh writes each zone's cellLabels list as a raw blob the ASCII TokenStream
+    // cannot tokenize (it mangles the bytes -> "read past end"). Route those to the byte-level reader.
+    if (foamFormat(path) == "binary")
+    {
+        for (auto& zp : readBinaryCellZones(path))
+            zones[zp.first] = std::move(zp.second);
+        return zones;
+    }
+    TokenStream ts(path);
     const label nz = ts.nextLabel();
     ts.expect("(");
     for (label z = 0; z < nz; ++z)

@@ -22,6 +22,7 @@
 #include "local_assembly.cuh"   // computeProcUpwindD
 #include "device_kepsilon.cuh"   // DeviceWallData / KEpsilonCoeffs / buildDeviceWallData (Phase 4b turbulence)
 #include "komega_sst_coeffs.cuh"
+#include "device_komega_sst.cuh" // deviceS2/deviceF2/deviceNutSST for validateTurbulence()'s SST nut seeding
 #include "cell_wall_dist.cuh"
 #include "parallel_device_interface.cuh"   // deviceMomentumInterface / deviceInterfaceOffDiagSum (shared)
 #include "device_mrf.cuh"          // DeviceMRF: Coriolis source + makeRelative frame flux (rotating cell zone)
@@ -596,13 +597,25 @@ public:
         bool limitedU = false,                 // div(phi,U) "limitedLinear" (magSqr): implicit TVD limited convection
         scalar limitedTwoByk = 2.0,            // 2/max(k_,SMALL) from the scheme coefficient (limitedLinear 1 -> 2)
         bool limitedV = false,                 // div(phi,U) "limitedLinearV" (NVDVTVDV vector limiter): implicit
-        const std::string& amgCacheDir = "")   // polyMesh dir for the per-rank AMG-hierarchy disk cache ("" = off)
+        const std::string& amgCacheDir = "",   // polyMesh dir for the per-rank AMG-hierarchy disk cache ("" = off)
+        // INEXACT SIMPLE. OF -- and brae's own single-GPU path (gpuSimpleFoam.cu reads solvers/<f>/relTol) --
+        // solve each equation only to a RELATIVE tolerance per outer iteration, because an outer iteration is
+        // itself an approximation: driving momentum and pressure to full ABSOLUTE tolerance every step is
+        // wasted work. This path used to hardcode 0.0 at the three solve call sites, so it over-solved both
+        // (measured: ~340-560 combined Krylov iterations per SIMPLE step on a 391k-cell/rank pitzDaily).
+        // Default stays 0.0 so the np=1-vs-np>1 correctness tests keep their tight, fully-converged compare.
+        scalar relTolU = 0.0,
+        scalar relTolP = 0.0,
+        scalar relTolKE = 0.0)   // k/epsilon/omega/nuTilda transport (OF: min of the turbulence fields' relTol)
         : P_(part),
           nu_(nu),
           relaxU_(relaxU),
           relaxP_(relaxP),
           tolU_(tolU),
           tolP_(tolP),
+          relTolU_(relTolU),
+          relTolP_(relTolP),
+          relTolKE_(relTolKE),
           maxIter_(maxIter),
           bounded_(bounded),
           linearUpwind_(linearUpwind),
@@ -960,6 +973,54 @@ public:
             geomD_.back().copyFrom(gd);
             ++pj;
         }
+        validateTurbulence();   // OF turbulence->validate(): seed nut from the bounded k/eps BEFORE iteration 1
+    }
+
+    // OF simpleFoam.C:92 `turbulence->validate()` -> eddyViscosity::validate() -> correctNut(): bound the
+    // fields just read from disk and recompute the INTERNAL nut from them BEFORE iteration 1. The single-GPU
+    // path already does this (device_simple_foam validateTurbulence); the DISTRIBUTED path did not, so its
+    // first momentum predictor ran with nut straight from 0/nut -- `uniform 0` in pitzDaily and motorBike,
+    // i.e. fully laminar. Measured consequence on pitzFS (Re-high, graded): iteration 1 overshoots U by ~108x
+    // (2.7e3 vs 2.5e1), the k/epsilon production then sees those velocity gradients, epsilon comes out ~85x
+    // too large, nut = Cmu*k^2/eps collapses, and the run is all-NaN by iteration ~10. Seeding nut here is
+    // the whole fix; every model needs it, so it is one method called from each enable*.
+    void validateTurbulence()
+    {
+        if (!turbulent_) return;
+        if (turbModel_ == 3)                       // SpalartAllmaras: bound(nuTilda,0), nut = nuTilda*fv1
+        {
+            deviceBoundField(dm_, nuTilda_, 0.0);
+            deviceNutSA(nuTilda_, nu_, saCoeffs_.Cv1, nut_);
+            return;
+        }
+        deviceBoundField(dm_, k_,   1e-15);        // bound(k_, kMin_)
+        deviceBoundField(dm_, eps_, 1e-15);        // bound(epsilon_|omega_, ...Min_)
+        if (turbModel_ == 1 || turbModel_ == 2)    // kOmegaSST(-LM): nut = a1*k/max(a1*omega, b1*F2*sqrt(S2))
+        {
+            // halo-consistent gradU, exactly as parallelDeviceKOmegaSSTCorrect builds it (cut value from the halo)
+            const DeviceBuffer<scalar>* Uc[3] = { &Uk_[0], &Uk_[1], &Uk_[2] };
+            DeviceBuffer<scalar> gradU(static_cast<std::size_t>(9) * lnC_);
+            for (int i = 0; i < 3; ++i)
+            {
+                DeviceBuffer<scalar> ub;
+                deviceBCValue(dbU_.comp[i], *Uc[i], ub);
+                halo_.exchange(Uc[i]->data());
+                halo_.scatterBoundaryValues(Uc[i]->data(), weightsD_, procStart_, ub.data());
+                halo_.waitExchange();
+                DeviceBuffer<scalar> gx, gy, gz;
+                deviceGaussGrad(dm_, *Uc[i], ub, gx, gy, gz);
+                const std::size_t n = static_cast<std::size_t>(lnC_);
+                cudaCheck(cudaMemcpyAsync(gradU.data() + (0*3+i)*n, gx.data(), n*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "validate gradU x");
+                cudaCheck(cudaMemcpyAsync(gradU.data() + (1*3+i)*n, gy.data(), n*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "validate gradU y");
+                cudaCheck(cudaMemcpyAsync(gradU.data() + (2*3+i)*n, gz.data(), n*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "validate gradU z");
+            }
+            DeviceBuffer<scalar> S2, F2;
+            deviceS2(gradU, static_cast<int>(lnC_), S2);
+            deviceF2(k_, eps_, yCell_, nu_, sstCoeffs_, F2);
+            deviceNutSST(k_, eps_, F2, S2, sstCoeffs_, nut_);
+        }
+        else                                       // kEpsilon: nut = Cmu*k^2/eps
+            deviceNut(k_, eps_, nut_, keCoeffs_);
     }
 
     // Turn on distributed k-omega SST. Second field is OMEGA (stored in eps_/dbEps_), plus the cell wall
@@ -1006,6 +1067,7 @@ public:
             geomD_.back().copyFrom(gd);
             ++pj;
         }
+        validateTurbulence();   // OF turbulence->validate(): seed nut from the bounded k/omega BEFORE iteration 1
     }
     // kOmegaSSTLM (Langtry-Menter transition): the shared SST scaffolding + the two extra transition transport
     // fields ReThetat/gammaInt (device-resident, with boundaries). step() then runs parallelDeviceKOmegaSSTLMCorrect.
@@ -1057,6 +1119,7 @@ public:
             geomD_.back().copyFrom(gd);
             ++pj;
         }
+        validateTurbulence();   // OF turbulence->validate(): seed nut = nuTilda*fv1 BEFORE iteration 1
     }
     std::vector<scalar> reconstructNuTilda() const { return reconstructField(P_.Lm.cellProcAddr, nuTilda_.host(), P_.globalNCells); }
     std::vector<scalar> reconstructReThetat() const { return reconstructField(P_.Lm.cellProcAddr, ReThetat_.host(), P_.globalNCells); }
@@ -1096,7 +1159,7 @@ private:
     }
 
     const Partition& P_;
-    scalar nu_, relaxU_, relaxP_, tolU_, tolP_;
+    scalar nu_, relaxU_, relaxP_, tolU_, tolP_, relTolU_, relTolP_, relTolKE_;
     int    maxIter_;
     bool   bounded_ = false;
     bool   linearUpwind_ = false;
@@ -1441,6 +1504,20 @@ inline ParStepResidual ParallelDeviceSimple::step()
         // per-component linearUpwind or (linearUpwindV) the vector-limited deviceLinearUpwindVCorr computed once.
         // (limitedLinear does NOT come here -- it is built implicitly into the matrix above.)
         DeviceBuffer<scalar> gUx[3], gUy[3], gUz[3];
+        // AMI-face contribution to grad(U): the single-GPU BAKES this into gU (deviceAmiAddGradRot/Grad) so the
+        // INTERNAL linearUpwind reconstruction at AMI-adjacent cells carries the interface neighbour. Without it the
+        // reconstruction is wrong there -> the deferred source diverges (the AMI-FACE deviceAmiAddLinUpwindCorr below
+        // is a SEPARATE term for the AMI faces themselves, NOT a substitute). The non-orth block gets away without it
+        // because deviceAmiAddLapCorr recomputes the interface term from the gathered gradients.
+        DeviceBuffer<scalar> amiURot[3];   // rotated AMI-interp of the current U (for the rotational grad correction)
+        if (ami_.active && ami_.local.rotational)
+        {
+            DeviceBuffer<scalar> uxE, uyE, uzE;
+            distributedAmiGather(ami_, Uk_[0], uxE);
+            distributedAmiGather(ami_, Uk_[1], uyE);
+            distributedAmiGather(ami_, Uk_[2], uzE);
+            deviceAmiInterpolateVec(ami_.local, uxE, uyE, uzE, amiURot[0], amiURot[1], amiURot[2]);
+        }
         for (int k = 0; k < 3; ++k)
         {
             DeviceBuffer<scalar> ub;
@@ -1449,6 +1526,17 @@ inline ParStepResidual ParallelDeviceSimple::step()
             halo_.scatterBoundaryValues(Uk_[k].data(), weightsD_, procStart_, ub.data());
             halo_.waitExchange();
             deviceGaussGrad(dm_, Uk_[k], ub, gUx[k], gUy[k], gUz[k]);
+            if (ami_.active)
+            {
+                if (ami_.local.rotational)
+                    deviceAmiAddGradRot(ami_.local, Uk_[k], amiURot[k], dm_.V, gUx[k], gUy[k], gUz[k]);
+                else
+                {
+                    DeviceBuffer<scalar> ukE;
+                    distributedAmiGather(ami_, Uk_[k], ukE);
+                    deviceAmiAddGrad(ami_.local, ukE, dm_.V, gUx[k], gUy[k], gUz[k]);
+                }
+            }
         }
         // AMI linearUpwind correction reads the rotated neighbour stencil of ALL 3 components' gradients -> gather
         // each of the 9 gradient arrays (extended [local|gathered]). gUE holds the extended gradients per component.
@@ -1559,7 +1647,7 @@ inline ParStepResidual ParallelDeviceSimple::step()
         const scalar nf = deviceParallelNormFactor(mv, halo_, ifCoeff, Uk_[k], b, ones_, P_.globalNCells, amip);
         if (!bicgGCache_[k]) bicgGCache_[k] = std::make_unique<BiCGGraphCache>();   // lazy: whole-loop graph (BRAE_PARALLEL_GRAPH=3)
         const DeviceSolverPerf up =
-            deviceParallelJacobiBiCGStab(mv, halo_, ifCoeff, b, Uk_[k], nf, tolU_, 0.0, maxIter_, 1, bicgGCache_[k].get(), amip);
+            deviceParallelJacobiBiCGStab(mv, halo_, ifCoeff, b, Uk_[k], nf, tolU_, relTolU_, maxIter_, 1, bicgGCache_[k].get(), amip);
         kIters_ += up.nIterations;
         if (validC_[k] && up.initialResidual > res.Ux) res.Ux = up.initialResidual;
         dumpStage("Upred", Uk_[k], k);
@@ -1780,10 +1868,10 @@ inline ParStepResidual ParallelDeviceSimple::step()
     if (useAMG_)
     {
         amgGalerkin(pAMG_, pDiagC, pU_, pL_);
-        pp = deviceParallelAMGPCG(pv, halo_, pIfCoeff, pb, pSol, pAMG_, nfp, tolP_, 0.0, maxIter_);
+        pp = deviceParallelAMGPCG(pv, halo_, pIfCoeff, pb, pSol, pAMG_, nfp, tolP_, relTolP_, maxIter_);
     }
     else
-        pp = deviceParallelJacobiPCG(pv, halo_, pIfCoeff, pb, pSol, nfp, tolP_, 0.0, maxIter_, pamip);
+        pp = deviceParallelJacobiPCG(pv, halo_, pIfCoeff, pb, pSol, nfp, tolP_, relTolP_, maxIter_, pamip);
     kIters_ += pp.nIterations;
     res.p = pp.initialResidual;
     dumpStage("pSol", pSol);
@@ -1870,27 +1958,28 @@ inline ParStepResidual ParallelDeviceSimple::step()
         {
             parallelDeviceSpalartAllmarasCorrect(dm_, halo_, dbU_, dbNuTilda_, Uk_[0], Uk_[1], Uk_[2],
                 nuTilda_, nut_, yCell_, phiInt_, phiBnd_, phiFc, faceCellsD_, procStart_, weightsD_, geomD_,
-                nu_, relaxK_, tolU_, maxIter_, P_.globalNCells, ones_, bounded_, saCoeffs_);
+                nu_, relaxK_, tolU_, maxIter_, P_.globalNCells, ones_, bounded_, saCoeffs_, relTolKE_);
         }
         else if (turbModel_ == 2)   // k-omega SST + Langtry-Menter transition (eps_ holds omega)
         {
             parallelDeviceKOmegaSSTLMCorrect(dm_, halo_, wall_, dbU_, dbK_, dbEps_, dbReThetat_, dbGammaInt_,
                 Uk_[0], Uk_[1], Uk_[2], k_, eps_, nut_, ReThetat_, gammaInt_, yCell_,
                 phiInt_, phiBnd_, phiFc, faceCellsD_, procStart_, weightsD_, geomD_,
-                isWallCell_, nu_, relaxEps_, relaxK_, tolU_, maxIter_, P_.globalNCells, ones_, bounded_, sstCoeffs_);
+                isWallCell_, nu_, relaxEps_, relaxK_, tolU_, maxIter_, P_.globalNCells, ones_, bounded_, sstCoeffs_, relTolKE_);
         }
         else if (turbModel_ == 1)   // k-omega SST (eps_ holds omega)
         {
             parallelDeviceKOmegaSSTCorrect(dm_, halo_, wall_, dbU_, dbK_, dbEps_, Uk_[0], Uk_[1], Uk_[2],
                 k_, eps_, nut_, yCell_, phiInt_, phiBnd_, phiFc, faceCellsD_, procStart_, weightsD_, geomD_,
-                isWallCell_, nu_, relaxEps_, relaxK_, tolU_, maxIter_, P_.globalNCells, ones_, bounded_, sstCoeffs_);
+                isWallCell_, nu_, relaxEps_, relaxK_, tolU_, maxIter_, P_.globalNCells, ones_, bounded_, sstCoeffs_,
+                /*lm*/ false, /*gammaIntEff*/ nullptr, relTolKE_);
         }
         else                   // k-epsilon
         {
             scalar rEps = 0, rK = 0;
             parallelDeviceKEpsilonCorrect(dm_, halo_, wall_, dbU_, dbK_, dbEps_, Uk_[0], Uk_[1], Uk_[2],
                 k_, eps_, nut_, phiInt_, phiBnd_, phiFc, faceCellsD_, procStart_, weightsD_, geomD_, isWallCell_,
-                nu_, relaxEps_, relaxK_, tolU_, maxIter_, P_.globalNCells, ones_, bounded_, keCoeffs_, &rEps, &rK);
+                nu_, relaxEps_, relaxK_, tolU_, maxIter_, P_.globalNCells, ones_, bounded_, keCoeffs_, &rEps, &rK, relTolKE_);
         }
     }
     return res;

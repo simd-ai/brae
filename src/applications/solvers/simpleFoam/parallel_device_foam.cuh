@@ -34,6 +34,7 @@
 #include <cmath>
 #include <cstdio>
 #include <sstream>
+#include <fstream>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -278,6 +279,18 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             return s ? s->scalarOr("tolerance", def) : def;
         };
         const scalar tolP = solverTol("p", 1e-6), tolU = solverTol("U", 1e-8);
+        // relTol: SIMPLE only needs a loose per-step solve, so OF stops each equation at a RELATIVE reduction.
+        // Same read as the single-GPU path (gpuSimpleFoam.cu solverRelTol); default 0 = solve to absolute tol.
+        auto solverRelTol = [&](const std::string& f)
+        {
+            const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
+            return s ? s->scalarOr("relTol", 0.0) : 0.0;
+        };
+        const scalar relTolP = solverRelTol("p"), relTolU = solverRelTol("U");
+        // Turbulence transport relTol: OF solves k and (epsilon|omega) loosely per SIMPLE step. One knob covers
+        // both here, so take the TIGHTER of the two (fmin) -- never solve a field looser than its case asks.
+        const scalar relTolKE = sa ? solverRelTol("nuTilda")
+                                   : std::fmin(solverRelTol("k"), solverRelTol(sst ? "omega" : "epsilon"));
 
         const FoamDict* simple = fvSolution.subDict("SIMPLE");
         // nNonOrthogonalCorrectors: OF re-solves the pEqn (n+1) times, recomputing the explicit non-orth
@@ -487,7 +500,8 @@ inline int runParallelDeviceFoam(int argc, char** argv)
             ParallelDeviceSimple solver(P, U0, p0, nu, relaxU, relaxP, tolU, tolP, 2000, boundedDiv, linUpwind, lust,
                                         /*linUpwindV*/ linUpwindV, /*nonOrth*/ useNonOrth, /*consistent*/ consistent,
                                         /*limitedU*/ limitedU, /*limitedTwoByk*/ limitedTwoByk, /*limitedV*/ limitedVsch,
-                                        /*amgCacheDir*/ caseDir + "/constant/polyMesh");
+                                        /*amgCacheDir*/ caseDir + "/constant/polyMesh",
+                                        /*relTolU*/ relTolU, /*relTolP*/ relTolP, /*relTolKE*/ relTolKE);
             if (turbulent && sa)  solver.enableTurbulenceSA(U0, nuTilda0, nut0, saCoeffs, relaxNuTilda);
             else if (turbulent && lm)  solver.enableTurbulenceSSTLM(U0, k0, eps0, nut0, ReThetat0, gammaInt0, sstCoeffs, relaxK, relaxEps);
             else if (turbulent && sst) solver.enableTurbulenceSST(U0, k0, eps0, nut0, sstCoeffs, relaxK, relaxEps);

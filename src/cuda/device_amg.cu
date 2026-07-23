@@ -15,6 +15,7 @@
 #include <map>
 #include <unordered_map>
 #include <vector>
+#include <mutex>
 
 namespace cg = cooperative_groups;
 
@@ -37,7 +38,8 @@ constexpr int TPB = 256;
 constexpr scalar OMEGA = 0.8;          // weighted-Jacobi relaxation
 constexpr int NPRE = 1, NPOST = 1, NCOARSE = 500;
 constexpr int CHEB_DEG_DEFAULT = 2;    // Chebyshev smoother degree (per pre/post smooth)
-constexpr scalar CHEB_EIGRATIO = 30.0; // Chebyshev interval [lambdaMax/ratio, 1.1*lambdaMax]
+constexpr scalar CHEB_EIGRATIO = 30.0; // Chebyshev interval [upper/ratio, upper]
+constexpr scalar CHEB_UPPER_SAFETY = 1.2; // interval top = safety * lambdaMax; > 1 to over-cover (under-cover diverges)
 
 // Feature flags (env vars), documented here once. The two default-ON flags preserve accuracy and opt out with
 // =0; the rest are experimental smoother/coarsening levers, off unless set.
@@ -101,6 +103,22 @@ inline bool useFP32()
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 
 // V-cycle work kernels are templated on the value type: <scalar> is the FP64 path, <float> the mixed-precision
+// Diagonal floor for the coarse-grid Jacobi/PCG divisions. The default injection Galerkin always
+// yields a strictly positive coarse diagonal (a sum of positive fine diagonals), but the general
+// RAP under smoothed aggregation (BRAE_AMG_SA) can produce a near-zero or negative coarse diag
+// (the BRAE_AMG_DEBUG block reports exactly this). Dividing by it gives Inf/NaN, which propagates
+// through prolongation into the outer residual and runs the solve to maxIter on garbage. This
+// helper is a STRICT no-op for any diagonal of magnitude > 1e-300, so it never perturbs a
+// well-formed operator; it only replaces a would-be division by (near) zero.
+template <typename T>
+__device__ __forceinline__
+T safeDiag(T d)
+{
+    const T floor = T(1e-300);
+    if (d > floor)  return d;
+    if (d < -floor) return d;
+    return (d < T(0)) ? -floor : floor;
+}
 // V-cycle / FP32 GS. T(OMEGA) and T(0) reproduce the FP64 and FP32 constants exactly, so each instantiation is
 // byte-identical to the hand-written twin it replaces.
 template <typename T>
@@ -111,15 +129,6 @@ void zeroT(
 {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i < n) x[i] = T(0);
-}
-__global__
-void fillK(
-    int n,
-    scalar* x,
-    scalar v)
-{
-    const int i = blockIdx.x*blockDim.x + threadIdx.x;
-    if (i < n) x[i] = v;
 }
 // weighted-Jacobi update: x += omega*(b - Ax)/diag
 template <typename T>
@@ -530,7 +539,7 @@ void coarseJacobiFusedKernel(
                 const scalar* rem = cluster.map_shared_rank(rd, g / cpb);
                 Ax += lower[f] * rem[g % cpb];
             }
-            wr[i] = rd[i] + omega * (rc[c] - Ax) / diag[c];
+            wr[i] = rd[i] + omega * (rc[c] - Ax) / safeDiag(diag[c]);
         }
         cluster.sync();                                       // all writes (wr) + reads (rd) done -> swap
         scalar* t = rd;
@@ -583,7 +592,7 @@ void coarseJacobiSingleBlockKernel(
                 const int f = losort[k];
                 Ax += lower[f] * rd[owner[f]];
             }
-            wr[c] = rd[c] + omega * (rc[c] - Ax) / diag[c];
+            wr[c] = rd[c] + omega * (rc[c] - Ax) / safeDiag(diag[c]);
         }
         __syncthreads();
         scalar* t = rd;
@@ -663,7 +672,7 @@ void coarsePCGKernel(
     {
         x[i]=0.0;
         r[i]=rc[i];
-        z[i]=r[i]/diag[i];
+        z[i]=r[i]/safeDiag(diag[i]);
         p[i]=z[i];
     }
     __syncthreads();
@@ -689,7 +698,7 @@ void coarsePCGKernel(
         {
             x[i]+=alpha*p[i];
             r[i]-=alpha*Ap[i];
-            z[i]=r[i]/diag[i];
+            z[i]=r[i]/safeDiag(diag[i]);
         }
         __syncthreads();
         const scalar rznew = blockDot(r, z, nC, red);
@@ -726,7 +735,15 @@ void deviceCoarseJacobiFused(
 {
     const int nC = cv.nCells, cpb = (nC + CCL - 1) / CCL;
     const std::size_t shBytes = 2 * static_cast<std::size_t>(cpb) * sizeof(scalar);
-    cudaCheck(cudaFuncSetAttribute(coarseJacobiFusedKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024), "coarse shmem optin");
+    // Opt into the &gt;48KB dynamic shared memory ONCE. This is a non-stream host runtime call, and
+    // deviceCoarseJacobiFused is reachable from vcycleAt, which is stream-captured -- issuing it
+    // during capture is at best ignored and at worst refuses the capture. The attribute is a
+    // per-function property, so setting it a single time at first use is sufficient.
+    static std::once_flag coarseShmemOptin;
+    std::call_once(coarseShmemOptin, []()
+    {
+        cudaCheck(cudaFuncSetAttribute(coarseJacobiFusedKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 99 * 1024), "coarse shmem optin");
+    });
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = dim3(CCL);
     cfg.blockDim = dim3(TPB);
@@ -1574,7 +1591,15 @@ AMGData buildAMG(
     const std::vector<scalar>& faceWeights,
     int nFine)
 {
-    constexpr int TARGET = 64;        // keep coarsening until the coarsest grid is <= TARGET cells
+    // Keep coarsening until the coarsest grid is <= TARGET cells. Overridable (BRAE_AMG_TARGET)
+    // so a tiny mesh can still be made to build a real hierarchy: the demo/teaching cases are
+    // below the default target and would otherwise get zero levels (coarsest solve only).
+    static const int TARGET = []()
+    {
+        const char* e = std::getenv("BRAE_AMG_TARGET");
+        const int v = e ? std::atoi(e) : 64;
+        return v > 0 ? v : 64;
+    }();
     AMGData A;
     A.nFine = nFine;
     // Multicolor Gauss-Seidel smoother (BRAE_AMG_GS): color every smoothed grid once at build (host, static geometry).
@@ -1742,6 +1767,13 @@ void amgGalerkin(
         }
     }
     cudaCheck(cudaGetLastError(), "galerkin");
+    // The coarse operators just changed, so any Chebyshev spectrum estimate keyed to the old
+    // operator is stale. Across SIMPLE steps the pressure matrix is re-weighted non-uniformly
+    // (face fluxes / Ap evolve with the velocity field), which shifts the spectrum of D^-1 A,
+    // not just its diagonal scale -- a frozen interval eventually fails to cover the top modes
+    // and the Chebyshev smoother stops damping them. Re-estimate on the next solve. No cost
+    // unless BRAE_CHEBYSHEV is on (ensureSpectrum early-returns otherwise).
+    A.spectrumReady = false;
     static bool saDbgOnce = false;                             // report the SA coarse-operator health just once
     if (A.saSmooth && std::getenv("BRAE_AMG_DEBUG") && !saDbgOnce)   // diag sign + dominance + coarsest definiteness
     {
@@ -1813,6 +1845,22 @@ void amgGalerkin(
 
 // Power iteration on D^-1 A -> estimate of its largest eigenvalue (sets the Chebyshev smoothing interval). Uses
 // host-scalar reductions (deviceDot), so it MUST run outside any captured graph, called once per matrix, gated on
+// High-frequency seed for the power iteration. The CONSTANT vector is the Laplacian's
+// near-null-space (the SMALLEST eigenvalue of D^-1 A), so starting there makes power iteration
+// reach lambda_max only through round-off: in exact arithmetic a constant start is orthogonal to
+// every non-constant mode and never leaves the null space. In few iterations it UNDER-estimates
+// lambda_max badly, and an under-estimated Chebyshev interval [., 1.1*lambdaMax] leaves the true
+// top modes ABOVE the interval, where the Chebyshev polynomial amplifies rather than damps them
+// -> the smoother diverges (observed as a stall at ~1.6e-3 on a 1M-cell Laplacian). A period-7
+// sawtooth injects broad spectral content, exactly as the SA path's hostSpectralRadius does.
+__global__
+void fillSeedK(
+    int n,
+    scalar* __restrict__ x)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) x[i] = 1.0 + 0.1*static_cast<scalar>(i % 7);
+}
 // amg.spectrumReady. x/ax/z are grid-g sized scratch (the V-cycle's vX/vAx/vR, free before the first cycle).
 static scalar estimateLambdaMax(
     const DeviceLduView& A,
@@ -1821,9 +1869,12 @@ static scalar estimateLambdaMax(
     DeviceBuffer<scalar>& z)
 {
     const int n = A.nCells;
-    fillK<<<nBlocks(n),TPB>>>(n, x.data(), 1.0);
+    fillSeedK<<<nBlocks(n),TPB>>>(n, x.data());
     scalar lam = 1.0;
-    for (int it = 0; it < 12; ++it)
+    // 25 iterations, not 12: power iteration converges to lambda_max FROM BELOW, and every ms of
+    // under-estimate risks divergence in the Chebyshev smoother, while an over-estimate only mildly
+    // slows convergence -> spend the extra iterations, they run once per matrix.
+    for (int it = 0; it < 25; ++it)
     {
         const scalar nrm = std::sqrt(deviceDot(x, x));
         if (!(nrm > 0.0)) break;
@@ -1851,7 +1902,7 @@ static void ensureSpectrum(
 }
 
 // Preconditioned Chebyshev (polynomial) smoother of degree `deg` on the interval [upper/CHEB_EIGRATIO, upper] of
-// D^-1 A (upper = 1.1*lambdaMax). Damps the high-frequency error far better per flop than weighted-Jacobi, this is
+// D^-1 A (upper = CHEB_UPPER_SAFETY*lambdaMax). Damps the high-frequency error far better per flop than weighted-Jacobi, this is
 // the standard GPU-AMG smoother upgrade. x is the in/out guess (zero on pre-smooth, prolonged correction on post-);
 // d is grid-sized scratch. All coefficients are host CONSTANTS (no device reductions) -> graph-capturable.
 static void chebyshevSmooth(
@@ -1864,7 +1915,11 @@ static void chebyshevSmooth(
     int deg)
 {
     const int n = A.nCells;
-    const scalar upper = 1.1*lambdaMax, lower = upper/CHEB_EIGRATIO;
+    // Bias the interval top ABOVE the power-iteration estimate: the estimate converges to
+    // lambda_max from below, so the true top eigenvalues can sit just past it, exactly where the
+    // Chebyshev polynomial amplifies. Over-covering the interval only mildly slows smoothing;
+    // under-covering it diverges. 1.2 (not 1.1) buys margin for the residual under-estimate.
+    const scalar upper = CHEB_UPPER_SAFETY*lambdaMax, lower = upper/CHEB_EIGRATIO;
     const scalar theta = 0.5*(upper+lower), delta = 0.5*(upper-lower), sigma = theta/delta;
     zeroT<scalar><<<nBlocks(n),TPB>>>(n, d.data());                       // avoid 0*Inf=NaN on the c1=0 first step
     deviceAmul(A, x, ax);                                        // step 0: d = (1/theta)(b-Ax)/D ; x += d
@@ -2659,7 +2714,7 @@ static DeviceSolverPerf deviceAMGPCGGraph(
     }
     cudaMemsetAsync(c.sIter.data(), 0, sizeof(int), cudaStreamPerThread);   // WHILE-body counter (0 = iter-1)
     // WHILE body = steady-state iteration 1+ (captured once, replayed on-device)
-    if (!c.exec || c.key != psi.data())
+    if (!c.exec || c.key != psi.data() || c.keyTol != tol || c.keyRelTol != relTol || c.keyMaxIter != maxIter)
     {
         if (c.exec)
         {
@@ -2699,6 +2754,9 @@ static DeviceSolverPerf deviceAMGPCGGraph(
         cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &tmp), "pcg capture end");
         cudaCheck(cudaGraphInstantiate(&c.exec, c.graph, 0), "pcg graph instantiate");
         c.key = psi.data();
+        c.keyTol = tol;
+        c.keyRelTol = relTol;
+        c.keyMaxIter = maxIter;
     }
     cudaCheck(cudaGraphLaunch(c.exec, cudaStreamPerThread), "pcg graph launch");
     scalar finalRes;
@@ -2799,7 +2857,7 @@ DeviceSolverPerf deviceParallelAMGPCGGraph(
     if (convergedHost(res1) || maxIter <= 1) { perf.finalResidual = res1; perf.nIterations = 1; return perf; }
     cudaMemsetAsync(c.sIter.data(), 0, sizeof(int), strm);
 
-    if (!c.exec || c.key != psi.data())
+    if (!c.exec || c.key != psi.data() || c.keyTol != tol || c.keyRelTol != relTol || c.keyMaxIter != maxIter)
     {
         if (c.exec)  { cudaGraphExecDestroy(c.exec);  c.exec  = nullptr; }
         if (c.graph) { cudaGraphDestroy(c.graph);     c.graph = nullptr; }
@@ -2831,6 +2889,9 @@ DeviceSolverPerf deviceParallelAMGPCGGraph(
         cudaCheck(cudaStreamEndCapture(strm, &tmp), "pgraph capture end");
         cudaCheck(cudaGraphInstantiate(&c.exec, c.graph, 0), "pgraph instantiate");
         c.key = psi.data();
+        c.keyTol = tol;
+        c.keyRelTol = relTol;
+        c.keyMaxIter = maxIter;
     }
     cudaCheck(cudaGraphLaunch(c.exec, strm), "pgraph launch");
     scalar finalRes; int whileIters;
