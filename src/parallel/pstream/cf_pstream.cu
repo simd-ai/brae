@@ -2,6 +2,7 @@
 // (non-blocking exchange + Allreduce); not copied verbatim.
 #include <chrono>
 #include <cstdlib>
+#include <cstdio>
 #include "cf_pstream.cuh"
 
 #include <mpi.h>
@@ -20,10 +21,12 @@ namespace {
     bool                     g_nvshmem = false; // NVSHMEM device transport bootstrapped
     std::vector<MPI_Request> g_requests;   // pending isend/irecv
 
-    // Bind this rank to one GPU (rank % visibleGPUs). Defensive: a host-only build or a CPU-only CI node has
-    // no device, so a missing/zero device count is not an error -- the binding is simply skipped and any CUDA
-    // error state is cleared so later code is unaffected. On GB10 (one GPU) every rank binds to device 0.
-    void bindRankToDevice()
+    // Bind this rank to one GPU (nodeLocalRank % visibleGPUs), so each host's ranks map onto that host's own
+    // GPUs -- correct for both single-node (localRank == g_rank) and multi-node runs. Defensive: a host-only
+    // build or a CPU-only CI node has no device, so a missing/zero device count is not an error -- the binding
+    // is simply skipped and any CUDA error state is cleared so later code is unaffected. On GB10 (one GPU)
+    // every rank binds to device 0.
+    void bindRankToDevice(int nodeLocalRank)
     {
         int nDev = 0;
         if (cudaGetDeviceCount(&nDev) != cudaSuccess || nDev <= 0)
@@ -32,8 +35,39 @@ namespace {
             g_device = -1;
             return;
         }
-        g_device = g_rank % nDev;
+        g_device = nodeLocalRank % nDev;
         cudaSetDevice(g_device);
+    }
+
+    // Single-node NVSHMEM auto-config + rank/GPU sanity, run once before bootstrap. `localSize` is the number
+    // of ranks sharing THIS host (from MPI_COMM_TYPE_SHARED).
+    //   (1) Oversubscription guard: on real multi-GPU, NVSHMEM uses NVLS multicast, which needs one PE per GPU
+    //       -- two PEs on one GPU makes it fail with an opaque `cuMulticastAddDevice failed`. If a MULTI-GPU
+    //       node has more ranks than GPUs, abort cleanly with guidance instead of that crash. The guard is
+    //       gated on nDev > 1: a SINGLE-GPU node with several ranks is the intended simulated-halo dev/test
+    //       mode (NVLS is never engaged on one GPU), so np=2/4/8 on one GPU stays valid and is left untouched.
+    //   (2) Single-node transport: when every world rank is on one host there is no inter-node fabric, so the
+    //       remote (IB) transport must not be attempted (it fails to init and takes the run down). Disable it.
+    //       setenv overwrite=0 respects an explicit NVSHMEM_REMOTE_TRANSPORT (needed for genuine multi-node).
+    void configureNvshmemTransport(int localSize)
+    {
+        int nDev = 0;
+        if (cudaGetDeviceCount(&nDev) != cudaSuccess) { cudaGetLastError(); nDev = 0; }
+
+        if (nDev > 1 && localSize > nDev)
+        {
+            if (g_rank == 0)
+                std::fprintf(stderr,
+                    "brae FATAL: %d ranks on a node with only %d GPU(s). brae maps one rank per GPU "
+                    "(NVSHMEM needs one PE per GPU; oversubscription fails in NVLS multicast). "
+                    "Re-run with np = number of GPUs (mpirun -np %d).\n",
+                    localSize, nDev, nDev);
+            MPI_Barrier(MPI_COMM_WORLD);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+
+        if (localSize == g_nprocs)                       // whole job on one host -> no remote fabric needed
+            setenv("NVSHMEM_REMOTE_TRANSPORT", "none", 0);
     }
 
     // Bootstrap NVSHMEM off the existing MPI communicator so PE ids line up with MPI ranks. The CUDA device
@@ -72,7 +106,17 @@ void Pstream::init(int& argc, char**& argv)
         MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &g_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &g_nprocs);
-    bindRankToDevice();
+
+    // Node-local rank/size (ranks sharing this host) -> per-node GPU binding + single-node NVSHMEM auto-config.
+    MPI_Comm node;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, g_rank, MPI_INFO_NULL, &node);
+    int localRank = 0, localSize = 1;
+    MPI_Comm_rank(node, &localRank);
+    MPI_Comm_size(node, &localSize);
+    MPI_Comm_free(&node);
+
+    bindRankToDevice(localRank);
+    configureNvshmemTransport(localSize);   // may MPI_Abort on rank/GPU oversubscription
     bootstrapNvshmem();
     g_init = true;
 }
