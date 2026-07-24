@@ -112,11 +112,28 @@ DeviceSolverPerf deviceParallelJacobiBiCGStabGraph(
 
 struct AMGData;   // fwd (device_amg.cuh); passed by ref so this header need not include the AMG hierarchy
 
+// Stage-1 OVERLAP context (BRAE_OVERLAP). When passed (non-null amgExt), the AMG-PCG preconditioner runs a
+// RESTRICTED ADDITIVE SCHWARZ solve on the overlapped (owned + one ghost ring) domain instead of the owned-only
+// V-cycle, so the local solve sees across the processor cut. amgExt/exView are the extended hierarchy + fine
+// matrix (owned cells 0..nOwned, ghost cells nOwned..nOwned+nGhost); exRes/exCorr are caller-owned scratch of
+// length nOwned+nGhost; ghOff[i] is interface i's offset into the ghost block (ghost of face f -> nOwned+ghOff[i]+f).
+struct OverlapCtx
+{
+    AMGData*              amgExt = nullptr;
+    DeviceLduView         exView;
+    DeviceBuffer<scalar>* exRes  = nullptr;
+    DeviceBuffer<scalar>* exCorr = nullptr;
+    int                   nOwned = 0;
+    int                   nGhost = 0;
+    std::vector<int>      ghOff;
+};
+
 // AMG-preconditioned distributed CG: identical recurrence to deviceParallelJacobiPCG (halo-coupled matvec +
 // GLOBAL fused reductions), but the preconditioner z=M^-1 r is a per-rank LOCAL AMG V-cycle (amgVCycleApply)
 // instead of point-Jacobi. This is the block-Jacobi/additive-Schwarz AMG preconditioner: it converges the
 // pressure on stiff/graded meshes where point-Jacobi caps its iteration count and the SIMPLE loop diverges.
 // `amg` must be built on A's LOCAL internal addressing (buildAMG) and current for this step (amgGalerkin).
+// `ov` (optional): when set, the preconditioner is the overlapped RAS solve instead of the owned-only V-cycle.
 DeviceSolverPerf deviceParallelAMGPCG(
     const DeviceLduView& A,
     DeviceHalo& halo,
@@ -127,6 +144,7 @@ DeviceSolverPerf deviceParallelAMGPCG(
     scalar normFactor,
     scalar tol,
     scalar relTol,
-    int maxIter);
+    int maxIter,
+    OverlapCtx* ov = nullptr);
 
 } // namespace brae

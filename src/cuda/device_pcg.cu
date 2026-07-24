@@ -9,11 +9,41 @@
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
+#include <algorithm>
+#include <vector>
 
 
 namespace brae {
 
 namespace {
+
+// Aggregation coarse-space kernels (balanced two-level, BRAE_COARSE_SPACE != 0). Z is a partition-of-unity: each fine cell
+// belongs to exactly one (global) aggregate. aggSumK = Z^T (sum fine values into their aggregate, atomic scatter);
+// aggGatherK = Z (broadcast an aggregate's coarse value back to its fine cells). CS_TPB/csBlocks are local here.
+constexpr int CS_TPB = 256;
+inline int csBlocks(int n) { return (n + CS_TPB - 1) / CS_TPB; }
+__global__ void aggSumK(int n, const label* __restrict__ agg, const scalar* __restrict__ v, scalar* __restrict__ csum)
+{ const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) atomicAdd(&csum[agg[i]], v[i]); }
+__global__ void aggGatherK(int n, const label* __restrict__ agg, const scalar* __restrict__ mu, scalar* __restrict__ out)
+{ const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) out[i] = mu[agg[i]]; }
+
+// GALERKIN coarse-operator assembly: E = Z^T A Z scattered straight from the LDU matrix (no matvecs). E[a][b] =
+// sum over matrix entries (i,j) with i in aggregate a, j in aggregate b, of A[i][j]. Diagonal + internal faces are
+// local; interface faces use the neighbour's (exchanged) aggregate id. E is row-major totalCoarse x totalCoarse.
+__global__ void galDiagK(int n, const label* __restrict__ agg, const scalar* __restrict__ diag, int tc, scalar* __restrict__ E)
+{ const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) { const label a = agg[i]; atomicAdd(&E[static_cast<std::size_t>(a) * tc + a], diag[i]); } }
+__global__ void galFaceK(int nF, const label* __restrict__ own, const label* __restrict__ nei, const label* __restrict__ agg,
+                         const scalar* __restrict__ up, const scalar* __restrict__ lo, int tc, scalar* __restrict__ E)
+{ const int f = blockIdx.x * blockDim.x + threadIdx.x; if (f < nF) { const label ao = agg[own[f]], an = agg[nei[f]];
+    atomicAdd(&E[static_cast<std::size_t>(ao) * tc + an], up[f]); atomicAdd(&E[static_cast<std::size_t>(an) * tc + ao], lo[f]); } }
+__global__ void galIfaceK(int n, const label* __restrict__ faceCells, const label* __restrict__ agg,
+                          const scalar* __restrict__ nbrAggS, const scalar* __restrict__ ifCoeff, int tc, scalar* __restrict__ E)
+{ const int f = blockIdx.x * blockDim.x + threadIdx.x; if (f < n) { const label ao = agg[faceCells[f]]; const int an = static_cast<int>(nbrAggS[f] + 0.5);
+    atomicAdd(&E[static_cast<std::size_t>(ao) * tc + an], -ifCoeff[f]); } }
+__global__ void labelToScalarK(int n, const label* __restrict__ src, scalar* __restrict__ dst)
+{ const int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) dst[i] = static_cast<scalar>(src[i]); }
+
 // BiCGStab device-scalar recurrence kernels (1 thread): keep omega/beta off the host (like the AMG-PCG scalars).
 // Breakdown is OF PBiCGStab's SolverPerformance::checkSingularity: |rho(rA0rA)| or |omega| < VSMALL. We detect it
 // ON-DEVICE into a flag `bd` (read only on the K-cadence convergence check, not every iter -> removes the 2 per-iter
@@ -382,15 +412,38 @@ DeviceSolverPerf deviceParallelAMGPCG(
     scalar normFactor,
     scalar tol,
     scalar relTol,
-    int maxIter)
+    int maxIter,
+    OverlapCtx* ov)
 {
     const int nC = A.nCells;
+    // Stage-1 OVERLAP: restricted additive Schwarz preconditioner. z = owned part of (extended AMG)^-1 [rr; ghost rr].
+    // The ghost residual is the neighbour's rr at the interface (halo.exchange), placed in the ghost block; after
+    // the extended V-cycle the owned correction is kept (RAS). Replaces the owned-only amgVCycleApply when ov is set.
+    auto precond = [&](const DeviceBuffer<scalar>& rIn, DeviceBuffer<scalar>& zOut, bool parGraph)
+    {
+        if (!ov || !ov->amgExt) { amgVCycleApply(amg, A, rIn, zOut, parGraph); return; }
+        DeviceBuffer<scalar>& xr = *ov->exRes;
+        DeviceBuffer<scalar>& xc = *ov->exCorr;
+        cudaMemcpyAsync(xr.data(), rIn.data(), static_cast<std::size_t>(ov->nOwned) * sizeof(scalar),
+                        cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        halo.exchange(rIn.data());                              // recvData(i) = neighbour rr at their interface (my ghosts)
+        for (int i = 0; i < halo.nInterfaces(); ++i)
+        {
+            const int n = static_cast<int>(halo.size(i));
+            if (n <= 0) continue;
+            cudaMemcpyAsync(xr.data() + ov->nOwned + ov->ghOff[i], halo.recvData(i),
+                            static_cast<std::size_t>(n) * sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        }
+        amgVCycleApply(*ov->amgExt, ov->exView, xr, xc, false); // extended (overlapped) V-cycle
+        cudaMemcpyAsync(zOut.data(), xc.data(), static_cast<std::size_t>(ov->nOwned) * sizeof(scalar),
+                        cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    };
     DeviceBuffer<scalar> wA(nC), rA(nC), pA(nC), Ax(nC), ApA;
 
     amgPrepareFP32(amg, A);   // cast the local hierarchy to FP32 once (matrices are current post-amgGalerkin) -> FP32 V-cycles
     // BRAE_PARALLEL_GRAPH: 0 off, 1 = V-cycle-only graph replay (below), 2 = WHOLE-loop conditional graph (the 2x lever).
     static const int g_parGraphLevel = std::getenv("BRAE_PARALLEL_GRAPH") ? std::atoi(std::getenv("BRAE_PARALLEL_GRAPH")) : 0;
-    if (g_parGraphLevel >= 2)
+    if (g_parGraphLevel >= 2 && !ov)   // overlap uses the direct path (the RAS apply is not captured in the graph)
     {
         const DeviceSolverPerf gp = deviceParallelAMGPCGGraph(A, amg, halo, ifaceCoeffs, b, psi, normFactor, tol, relTol, maxIter);
         if (gp.nIterations >= 0) return gp;   // whole-loop graph ran; else (CUDA<13) fall through to the direct path
@@ -401,251 +454,204 @@ DeviceSolverPerf deviceParallelAMGPCG(
     deviceCopy(rA, b);
     deviceAxpy(-1.0, Ax, rA);
 
-    // ---- TWO-LEVEL additive Schwarz: coarse space of subdomain constants (Nicolaides) ----------------------
-    // The local AMG V-cycle alone is a ONE-LEVEL, zero-overlap block-Jacobi preconditioner: it never
-    // communicates, so information crosses one subdomain per Krylov iteration and the condition number grows
-    // with the subdomain count (Toselli-Widlund: kappa = O(H^-2) with no overlap). That is why iteration counts
-    // climb with nProcs. The fix is a coarse space supplying the missing GLOBAL mode:
-    //     M^-1 = sum_i Ri^T Ai^-1 Ri   +   R0^T A0^-1 R0
-    //            \___ local V-cycle __/     \__ this block __/
-    // R0 maps a field to one value per subdomain (its sum); R0^T broadcasts a per-subdomain value back. The
-    // coarse operator A0 = R0 A R0^T is nProcs x nProcs -- tiny, assembled ONCE per solve, solved redundantly.
-    // Assembly without nProcs matvecs: one matvec of the global all-ones gives each rank its ROW SUM of A0,
-    // and the off-diagonals are just the interface coefficient sums (the interface entry is -ifCoeff, see
-    // scatterKernel), so A0(i,i) = rowSum_i - sum_{j!=i} A0(i,j).
-    // BRAE_COARSE_SPACE: 0 = one-level (local AMG only); 1 = ADDITIVE two-level (M^-1 = local + coarse, default);
-    // 2 = HYBRID/multiplicative two-level (coarse -> smooth -> coarse, symmetric). Additive applies the coarse
-    // correction in PARALLEL with the local solve, so the two levels do not see each other and the coarse mode
-    // is only partially removed (measured: recovers ~40% of the np=1->np=2 gap). Hybrid applies the local solve
-    // to the residual AFTER the coarse correction and re-corrects, so the coarse space is removed EXACTLY once
-    // per application -- the standard route from "helps a bit" toward rank-independence. Costs 2 extra halo
-    // matvecs + 2 extra reduces per iteration, paid back by fewer (and, as nSub grows, far fewer) iterations.
-    // DEFAULT 0 = one-level (local AMG only) -- the shipping, stable behaviour. The two-level variants are
-    // EXPERIMENTAL and opt-in: 1 = additive (over-corrects on delta=0 decompositions -> unstable), 2 = hybrid
-    // (not SPD-safe here), 3 = deflated-CG (the correct non-overlapping framework; robust only with a coarse
-    // space richer than the current subdomain-constant one). Kept for the coarse-space R&D; NOT on by default.
+    // ---- TWO-LEVEL preconditioner (BRAE_COARSE_SPACE != 0): aggregation coarse space + balanced Schwarz --------
+    // The local AMG V-cycle alone is a ONE-LEVEL, zero-overlap block-Jacobi preconditioner: it never communicates,
+    // so the condition number grows with the subdomain count and Krylov counts climb with nProcs. The optional
+    // two-level path below adds an AMG-aggregation coarse space Z (~BRAE_COARSE_DIM aggregates/rank) and applies it
+    // in BALANCED (hybrid) form, which removes the slow cross-subdomain mode the block-Jacobi solve leaves behind.
+    // DEFAULT 0 = one-level (local AMG only) -- the shipping single-node behaviour; nonzero = balanced two-level.
     static const int coarseMode = std::getenv("BRAE_COARSE_SPACE") ? std::atoi(std::getenv("BRAE_COARSE_SPACE")) : 0;
-    const bool useCoarse = (coarseMode != 0);
     const int nSub = Pstream::nProcs();
     const int myP  = Pstream::myProcNo();
-    DeviceBuffer<scalar> ones;
-    std::vector<scalar> A0;                                     // nSub x nSub, row-major, replicated on every rank
-    if (useCoarse && nSub > 1)
-    {
-        ones.copyFrom(std::vector<scalar>(nC, 1.0));
-        DeviceBuffer<scalar> q(nC);
-        deviceParallelAmul(A, halo, ifaceCoeffs, ones, q);      // q = A * 1_global (neighbour values are 1 too)
-        const scalar rowSum = deviceDot(ones, q);               // = sum_j A0(myP, j)
-        A0.assign(static_cast<std::size_t>(nSub) * nSub, 0.0);
-        scalar offTot = 0.0;
-        for (int i = 0; i < halo.nInterfaces(); ++i)
-        {
-            const label nIf = halo.size(i);
-            if (nIf <= 0) continue;
-            DeviceBuffer<scalar> onesIf;
-            onesIf.copyFrom(std::vector<scalar>(static_cast<std::size_t>(nIf), 1.0));
-            const scalar s = -deviceDot(ifaceCoeffs[i], onesIf);   // off-diagonal entry is -ifCoeff
-            A0[static_cast<std::size_t>(myP) * nSub + halo.neighbour(i)] += s;
-            offTot += s;
-        }
-        A0[static_cast<std::size_t>(myP) * nSub + myP] = rowSum - offTot;
-        Pstream::allReduce(A0.data(), nSub * nSub, ReduceOp::Sum);
-    }
-    // Coarse solve with NULLSPACE DEFLATION. A0 = R0 A R0^T inherits A's near-nullspace: the constant vector 1
-    // (the GLOBAL pressure level). With a weak or absent Dirichlet BC -- one subdomain touching the outlet, or a
-    // closed all-Neumann domain -- A0 is (near-)singular in the 1-direction; a plain LU then divides by a tiny
-    // pivot and returns an ENORMOUS coarse correction -> NaN (the earlier "additive goes NaN by iter ~50" bug).
-    // The physical fix: the coarse space must NOT set the global level (the reference/BC pins it), so solve the
-    // CONSTRAINED system that forces the coarse correction to be mean-free, 1^T y = 0:
-    //   [ A0  1 ] [y]   [c]
-    //   [ 1^T 0 ] [l] = [0]
-    // This (nSub+1) saddle system is non-singular whenever A0 is SPD on 1^perp (always, for a Poisson operator),
-    // so it is robust for closed, weak-Dirichlet and strong-Dirichlet domains alike. l is the Lagrange
-    // multiplier (absorbs the global-constant component); we keep only y.
-    auto coarseSolve = [&](const std::vector<scalar>& c)
-    {
-        const int n = nSub, m = n + 1;
-        std::vector<scalar> M(static_cast<std::size_t>(m) * m, 0.0), y(m, 0.0);
-        for (int i = 0; i < n; ++i)
-        {
-            for (int j = 0; j < n; ++j) M[static_cast<std::size_t>(i) * m + j] = A0[static_cast<std::size_t>(i) * n + j];
-            M[static_cast<std::size_t>(i) * m + n] = 1.0;      // [ A0 | 1 ]
-            M[static_cast<std::size_t>(n) * m + i] = 1.0;      // [ 1^T| 0 ]
-            y[i] = c[i];
-        }
-        for (int k = 0; k < m; ++k)                            // dense LU, partial pivoting (saddle system is indefinite)
-        {
-            int p = k; scalar mx = std::fabs(M[static_cast<std::size_t>(k) * m + k]);
-            for (int i = k + 1; i < m; ++i)
-            { const scalar v = std::fabs(M[static_cast<std::size_t>(i) * m + k]); if (v > mx) { mx = v; p = i; } }
-            if (mx < 1e-300) continue;
-            if (p != k)
-            {
-                for (int j = 0; j < m; ++j) std::swap(M[static_cast<std::size_t>(k) * m + j], M[static_cast<std::size_t>(p) * m + j]);
-                std::swap(y[k], y[p]);
-            }
-            const scalar d = M[static_cast<std::size_t>(k) * m + k];
-            for (int i = k + 1; i < m; ++i)
-            {
-                const scalar f = M[static_cast<std::size_t>(i) * m + k] / d;
-                if (f == 0.0) continue;
-                for (int j = k; j < m; ++j) M[static_cast<std::size_t>(i) * m + j] -= f * M[static_cast<std::size_t>(k) * m + j];
-                y[i] -= f * y[k];
-            }
-        }
-        std::vector<scalar> z(m, 0.0);
-        for (int i = m - 1; i >= 0; --i)
-        {
-            scalar s = y[i];
-            for (int j = i + 1; j < m; ++j) s -= M[static_cast<std::size_t>(i) * m + j] * z[j];
-            const scalar d = M[static_cast<std::size_t>(i) * m + i];
-            z[i] = (std::fabs(d) < 1e-300) ? 0.0 : s / d;
-        }
-        return std::vector<scalar>(z.begin(), z.begin() + n);   // drop the Lagrange multiplier
-    };
 
-    // ===== DEFLATED PCG (coarseMode 3): the ROBUST two-level method for NON-overlapping subdomains =====
-    // Additive Schwarz over-corrects on delta=0 decompositions -- the local V-cycle and the coarse solve both
-    // touch the cross-subdomain (mass-imbalance) mode, so their SUM overshoots and the SIMPLE loop diverges to
-    // NaN. Deflation instead PROJECTS the coarse space out of the Krylov iteration EXACTLY each step, so that
-    // mode is removed to machine precision -- no overshoot, and robust for ANY case (closed / weak- /
-    // strong-Dirichlet) because coarseSolve is the mean-free saddle solve. With Z = subdomain indicators,
-    // E = Z^T A Z = A0, Q = Z E^-1 Z^T, P = I - A Q:  the correction d to psi solves A d = rA as
-    //   d = Q rA + P^T d_hat,   d_hat from M^-1-preconditioned CG on the deflated system  P A d_hat = P rA.
-    // On this rank Z is `ones` (its own column); Z^T v = per-subdomain sums (one allReduce); A Z mu is one
-    // distributed matvec of (mu_myP * ones) -- the halo brings the neighbour mu automatically. (Tang et al.
-    // 2009, DEF1.) rA already holds b - A*psi.
-    if (coarseMode == 3 && !A0.empty())
+    // ===== AGGREGATION coarse space + BALANCED two-level =====================================================
+    // Z is ~kc aggregate-indicators PER subdomain, taken from the AMG agglomeration map composed down to the first
+    // level with <= BRAE_COARSE_DIM cells (coarse dim = sum_r kc_r). E = Z^T A Z is assembled by GALERKIN SCATTER
+    // straight from the LDU matrix (the halo supplies the cross-rank coupling), and the nullspace of a closed
+    // all-Neumann domain is handled by a mean-free saddle solve (the aggregate indicators sum to the global 1).
+    if (coarseMode != 0 && nSub > 1 && amg.nLevels() > 0)
     {
-        DeviceSolverPerf perf3;
-        auto Zt = [&](const DeviceBuffer<scalar>& v)               // Z^T v : replicated per-subdomain sums
+        const int targetKc = std::getenv("BRAE_COARSE_DIM") ? std::atoi(std::getenv("BRAE_COARSE_DIM")) : 32;
+        // compose fine -> level-(L+1) aggregation until the coarse count drops to <= targetKc
+        std::vector<label> f2a(nC);
+        for (int i = 0; i < nC; ++i) f2a[i] = i;
+        int kcLocal = nC;
+        for (int L = 0; L < amg.nLevels(); ++L)
         {
-            std::vector<scalar> s(static_cast<std::size_t>(nSub), 0.0);
-            s[myP] = deviceDot(v, ones);
-            Pstream::allReduce(s.data(), nSub, ReduceOp::Sum);
-            return s;
-        };
-        DeviceBuffer<scalar> tmpZ(nC), tmpC(nC);
-        auto AZ = [&](const std::vector<scalar>& mu, DeviceBuffer<scalar>& out)   // out = A Z mu
-        {
-            deviceCopy(tmpZ, ones); deviceScale(tmpZ, mu[myP]);    // (Z mu)_local = mu_myP * ones
-            deviceParallelAmul(A, halo, ifaceCoeffs, tmpZ, out);   // halo supplies the neighbour's mu
-        };
-        auto project = [&](DeviceBuffer<scalar>& v)                // v <- P v = v - A Z E^-1 Z^T v
-        {
-            const std::vector<scalar> mu = coarseSolve(Zt(v));
-            AZ(mu, tmpC);
-            deviceAxpy(-1.0, tmpC, v);
-        };
-        DeviceBuffer<scalar> dcoarse(nC);                          // coarse part of the correction: Q rA
-        {
-            const std::vector<scalar> nu = coarseSolve(Zt(rA));
-            deviceCopy(dcoarse, ones); deviceScale(dcoarse, nu[myP]);
+            const std::vector<label> m = amg.level[L].map.host();     // grid L -> grid L+1
+            for (int i = 0; i < nC; ++i) f2a[i] = m[f2a[i]];
+            kcLocal = amg.level[L].nCoarse;
+            if (kcLocal <= targetKc) break;
         }
-        DeviceBuffer<scalar> xh(nC), rr(nC), zz(nC), pp(nC), Apd(nC);
-        deviceCopy(xh, ones); deviceScale(xh, 0.0);                // d_hat = 0
-        deviceCopy(rr, rA); project(rr);                           // r = P rA
-        amgVCycleApply(amg, A, rr, zz, g_parGraph);                // z = M^-1 r
-        deviceCopy(pp, zz);
-        scalar rd[2]; rd[0] = deviceDot(rr, zz); rd[1] = deviceSumMag(rr);
-        Pstream::allReduce(rd, 2, ReduceOp::Sum);
-        perf3.initialResidual = rd[1] / normFactor;
-        perf3.finalResidual   = perf3.initialResidual;
-        auto conv3 = [&](scalar fr) { return (fr < tol) || (relTol > 0.0 && fr < relTol * perf3.initialResidual); };
-        scalar rzOld = rd[0];
-        int nit = 0;
-        if (!conv3(perf3.finalResidual))
+        if (kcLocal < 1) kcLocal = 1;
+        // global coarse indexing: each rank fills its own slot, allReduce gives every rank the offsets
+        std::vector<scalar> kcS(static_cast<std::size_t>(nSub), 0.0); kcS[myP] = kcLocal;
+        Pstream::allReduce(kcS.data(), nSub, ReduceOp::Sum);
+        std::vector<int> off(static_cast<std::size_t>(nSub) + 1, 0);
+        for (int r = 0; r < nSub; ++r) off[r + 1] = off[r] + static_cast<int>(kcS[r] + 0.5);
+        const int totalCoarse = off[nSub], myOff = off[myP];
+        DeviceBuffer<label> aggDev;
+        { std::vector<label> ag(nC); for (int i = 0; i < nC; ++i) ag[i] = f2a[i] + myOff; aggDev.copyFrom(ag); }
+        static bool announced = false;
+        if (Pstream::master() && !announced)
+        { std::fprintf(stderr, "brae coarse space (balanced two-level): ~%d aggregates/rank, totalCoarse=%d\n", kcLocal, totalCoarse); announced = true; }
+
+        DeviceBuffer<scalar> muDev(totalCoarse), tmpZ(nC);
+        auto Zt = [&](const DeviceBuffer<scalar>& v)                  // Z^T v -> replicated coarse vector (len totalCoarse)
         {
-            do
+            DeviceBuffer<scalar> cdev(totalCoarse);
+            cudaMemset(cdev.data(), 0, static_cast<std::size_t>(totalCoarse) * sizeof(scalar));
+            aggSumK<<<csBlocks(nC), CS_TPB>>>(nC, aggDev.data(), v.data(), cdev.data());
+            std::vector<scalar> c = cdev.host();
+            Pstream::allReduce(c.data(), totalCoarse, ReduceOp::Sum);
+            return c;
+        };
+        auto Zmu = [&](const std::vector<scalar>& mu, DeviceBuffer<scalar>& out)   // out = Z mu (broadcast to fine)
+        {
+            muDev.copyFrom(mu);
+            aggGatherK<<<csBlocks(nC), CS_TPB>>>(nC, aggDev.data(), muDev.data(), out.data());
+        };
+        // E = Z^T A Z (totalCoarse x totalCoarse, replicated) by GALERKIN SCATTER straight from the LDU matrix --
+        // replaces the O(totalCoarse) collective matvecs (the dominant cost) with 3 device kernels + ONE halo
+        // exchange of the aggregate ids. Diagonal + internal faces are local; interface faces scatter the -ifCoeff
+        // coupling into E[agg(owner)][nbrAgg], where nbrAgg is the neighbour cell's (exchanged) global aggregate id.
+        std::vector<scalar> E(static_cast<std::size_t>(totalCoarse) * totalCoarse, 0.0);
+        {
+            DeviceBuffer<scalar> Edev(static_cast<int>(E.size()));
+            cudaMemset(Edev.data(), 0, E.size() * sizeof(scalar));
+            galDiagK<<<csBlocks(nC), CS_TPB>>>(nC, aggDev.data(), A.diag, totalCoarse, Edev.data());
+            if (A.nInternalFaces > 0)
+                galFaceK<<<csBlocks(A.nInternalFaces), CS_TPB>>>(
+                    A.nInternalFaces, A.owner, A.nei, aggDev.data(), A.upper, A.lower, totalCoarse, Edev.data());
+            DeviceBuffer<scalar> aggS(nC);                              // aggregate ids as scalars, to exchange over the halo
+            labelToScalarK<<<csBlocks(nC), CS_TPB>>>(nC, aggDev.data(), aggS.data());
+            halo.exchange(aggS.data());                                // recvData(i) = neighbour's aggregate ids at the cut
+            for (int i = 0; i < halo.nInterfaces(); ++i)
             {
-                deviceParallelAmul(A, halo, ifaceCoeffs, pp, Apd); // A p
-                project(Apd);                                       // w = P A p
-                const scalar pw = Pstream::allReduce(deviceDot(pp, Apd), ReduceOp::Sum);
-                const scalar alpha = rzOld / pw;
-                deviceAxpy(alpha, pp, xh);                          // d_hat += alpha p
-                deviceAxpy(-alpha, Apd, rr);                        // r -= alpha w
-                amgVCycleApply(amg, A, rr, zz, g_parGraph);         // z = M^-1 r
-                scalar rd2[2]; rd2[0] = deviceDot(rr, zz); rd2[1] = deviceSumMag(rr);
+                const int nIf2 = static_cast<int>(halo.size(i));
+                if (nIf2 <= 0) continue;
+                galIfaceK<<<csBlocks(nIf2), CS_TPB>>>(
+                    nIf2, halo.faceCellsDev(i), aggDev.data(), halo.recvData(i), ifaceCoeffs[i].data(), totalCoarse, Edev.data());
+            }
+            E = Edev.host();
+            Pstream::allReduce(E.data(), static_cast<int>(E.size()), ReduceOp::Sum);
+        }
+        // Is the coarse operator SINGULAR? A closed/all-Neumann domain has A 1 = 0, hence E 1 = 0 (row sums ~0),
+        // and the coarse solve MUST be mean-free (saddle constraint 1^T y = 0). For a NON-singular (open, with a
+        // fixedValue-p patch) system that constraint is WRONG: it removes a real coarse dof and injects a spurious
+        // correction that diverges (measured: mode 4 -> pressure residual 23, mode 3 -> NaN, on open pitzDaily).
+        // Detect from E's row sums vs its diagonal scale; apply the saddle constraint ONLY when singular.
+        scalar csMaxRow = 0.0, csMaxDiag = 0.0;
+        for (int i = 0; i < totalCoarse; ++i)
+        {
+            scalar rs = 0.0;
+            for (int j = 0; j < totalCoarse; ++j) rs += E[static_cast<std::size_t>(i) * totalCoarse + j];
+            csMaxRow  = std::max(csMaxRow,  std::fabs(rs));
+            csMaxDiag = std::max(csMaxDiag, std::fabs(E[static_cast<std::size_t>(i) * totalCoarse + i]));
+        }
+        const bool singularE = (csMaxDiag > 0.0) && (csMaxRow < 1e-8 * csMaxDiag);
+        // Factor the coarse (saddle) operator ONCE per pressure solve; Esolve then only substitutes. E is fixed
+        // within a solve, so re-factoring it on every PCG iteration was O(nIter * n^3) waste -> now O(n^3 + nIter*n^2).
+        const int nE = totalCoarse, mM = singularE ? nE + 1 : nE;
+        std::vector<scalar> LU(static_cast<std::size_t>(mM) * mM, 0.0);
+        std::vector<int>    piv(static_cast<std::size_t>(mM));
+        for (int i = 0; i < nE; ++i)
+            for (int j = 0; j < nE; ++j) LU[static_cast<std::size_t>(i) * mM + j] = E[static_cast<std::size_t>(i) * nE + j];
+        if (singularE)
+            for (int i = 0; i < nE; ++i) { LU[static_cast<std::size_t>(i) * mM + nE] = 1.0; LU[static_cast<std::size_t>(nE) * mM + i] = 1.0; }
+        for (int k = 0; k < mM; ++k)   // LU factorisation with partial pivoting, in place; L stored below the diagonal
+        {
+            int p = k; scalar mx = std::fabs(LU[static_cast<std::size_t>(k) * mM + k]);
+            for (int i = k + 1; i < mM; ++i) { const scalar v = std::fabs(LU[static_cast<std::size_t>(i) * mM + k]); if (v > mx) { mx = v; p = i; } }
+            piv[k] = p;
+            if (p != k) for (int j = 0; j < mM; ++j) std::swap(LU[static_cast<std::size_t>(k) * mM + j], LU[static_cast<std::size_t>(p) * mM + j]);
+            const scalar d = LU[static_cast<std::size_t>(k) * mM + k];
+            if (std::fabs(d) < 1e-300) continue;
+            for (int i = k + 1; i < mM; ++i)
+            {
+                const scalar f = LU[static_cast<std::size_t>(i) * mM + k] / d;
+                LU[static_cast<std::size_t>(i) * mM + k] = f;
+                for (int j = k + 1; j < mM; ++j) LU[static_cast<std::size_t>(i) * mM + j] -= f * LU[static_cast<std::size_t>(k) * mM + j];
+            }
+        }
+        auto Esolve = [&](const std::vector<scalar>& c)   // solve E y = c via the stored LU (forward + back substitution)
+        {
+            std::vector<scalar> y(static_cast<std::size_t>(mM), 0.0);
+            for (int i = 0; i < nE; ++i) y[i] = c[i];
+            for (int k = 0; k < mM; ++k) if (piv[k] != k) std::swap(y[k], y[piv[k]]);       // apply the row swaps
+            for (int i = 0; i < mM; ++i) { scalar s = y[i]; for (int j = 0; j < i; ++j) s -= LU[static_cast<std::size_t>(i) * mM + j] * y[j]; y[i] = s; }   // forward (unit L)
+            for (int i = mM - 1; i >= 0; --i)
+            {
+                scalar s = y[i];
+                for (int j = i + 1; j < mM; ++j) s -= LU[static_cast<std::size_t>(i) * mM + j] * y[j];
+                const scalar d = LU[static_cast<std::size_t>(i) * mM + i];
+                y[i] = (std::fabs(d) < 1e-300) ? 0.0 : s / d;
+            }
+            return std::vector<scalar>(y.begin(), y.begin() + nE);
+        };
+
+        // ===== BALANCED (hybrid) TWO-LEVEL apply + PCG ==========================================================
+        // M_bal^-1 r = Q r + (I - Q A) M_L^-1 (I - A Q) r, with Q = Z E^-1 Z^T the aggregation coarse correction and
+        // M_L^-1 the local AMG V-cycle (block-Jacobi Schwarz). The balanced form maps every coarse direction to
+        // eigenvalue EXACTLY 1 -- unlike the additive M_L^-1 + Q, which shifts theta -> theta+1 and over-corrects --
+        // so the coarse space cleanly removes the slow cross-subdomain mode instead of fighting the local solve.
+        // Measured at scale: ~2x fewer pressure Krylov iterations and a net wall-clock win despite the extra apply.
+        // The preconditioner is SPD (symmetric V-cycle in a symmetric Q sandwich), so ordinary PCG stays valid.
+        DeviceSolverPerf perf5;
+        DeviceBuffer<scalar> zz(nC), pp(nC), Ap(nC), bAz(nC), bt(nC), by(nC), bAy(nC), bzn(nC);
+        auto applyQ = [&](const DeviceBuffer<scalar>& r, DeviceBuffer<scalar>& out)   // out = Q r = Z E^-1 Z^T r
+        {
+            const std::vector<scalar> mu = Esolve(Zt(r)); Zmu(mu, out);
+        };
+        auto applyM = [&](const DeviceBuffer<scalar>& r, DeviceBuffer<scalar>& z)
+        {
+            applyQ(r, tmpZ);                                            // tmpZ = Q r
+            deviceParallelAmul(A, halo, ifaceCoeffs, tmpZ, bAz);        // A Q r
+            deviceCopy(bt, r); deviceAxpy(-1.0, bAz, bt);              // t = (I - A Q) r
+            amgVCycleApply(amg, A, bt, by, g_parGraph);                // y = M_L^-1 t
+            deviceParallelAmul(A, halo, ifaceCoeffs, by, bAy);         // A y
+            applyQ(bAy, bzn);                                          // Q A y
+            deviceCopy(z, tmpZ); deviceAxpy(1.0, by, z); deviceAxpy(-1.0, bzn, z);   // z = Q r + y - Q A y
+        };
+        applyM(rA, zz);                                        // rA already = b - A*psi
+        deviceCopy(pp, zz);
+        scalar rd[2]; rd[0] = deviceDot(rA, zz); rd[1] = deviceSumMag(rA);
+        Pstream::allReduce(rd, 2, ReduceOp::Sum);
+        perf5.initialResidual = rd[1] / normFactor;
+        perf5.finalResidual   = perf5.initialResidual;
+        auto conv5 = [&](scalar fr) { return (fr < tol) || (relTol > 0.0 && fr < relTol * perf5.initialResidual); };
+        scalar rzOld = rd[0]; int nit = 0;
+        if (!conv5(perf5.finalResidual))
+        {
+            do {
+                deviceParallelAmul(A, halo, ifaceCoeffs, pp, Ap);
+                const scalar pAp = Pstream::allReduce(deviceDot(pp, Ap), ReduceOp::Sum);
+                const scalar alpha = rzOld / pAp;
+                deviceAxpy(alpha, pp, psi);
+                deviceAxpy(-alpha, Ap, rA);
+                applyM(rA, zz);
+                scalar rd2[2]; rd2[0] = deviceDot(rA, zz); rd2[1] = deviceSumMag(rA);
                 Pstream::allReduce(rd2, 2, ReduceOp::Sum);
-                perf3.finalResidual = rd2[1] / normFactor;
+                perf5.finalResidual = rd2[1] / normFactor;
                 ++nit;
-                if (conv3(perf3.finalResidual)) break;
+                if (conv5(perf5.finalResidual)) break;
                 const scalar beta = rd2[0] / rzOld;
-                deviceScale(pp, beta); deviceAxpy(1.0, zz, pp);    // p = z + beta p
+                deviceScale(pp, beta); deviceAxpy(1.0, zz, pp);
                 rzOld = rd2[0];
             } while (nit < maxIter);
         }
-        // reconstruct: d = Q rA + P^T d_hat ,  P^T d_hat = d_hat - Z E^-1 (Z^T A d_hat)
-        deviceParallelAmul(A, halo, ifaceCoeffs, xh, Apd);         // A d_hat
-        {
-            const std::vector<scalar> mu = coarseSolve(Zt(Apd));
-            deviceCopy(tmpC, ones); deviceScale(tmpC, mu[myP]);
-            deviceAxpy(-1.0, tmpC, xh);                            // d_hat <- P^T d_hat
-        }
-        deviceAxpy(1.0, dcoarse, xh);                             // d = Q rA + P^T d_hat
-        deviceAxpy(1.0, xh, psi);                                 // psi += d
-        perf3.nIterations = nit;
-        return perf3;
+        perf5.nIterations = nit;
+        return perf5;
     }
 
     DeviceSolverPerf perf;
     scalar red[2];
-    // Q r = R0^T A0^-1 R0 r : the coarse correction. For the subdomain-constant (Nicolaides) R0, R0 r is one
-    // scalar per subdomain (the local residual sum) and Q r is constant per subdomain, so applyQ returns just
-    // the local coefficient q with Q r == q * ones. One global reduce of nSub scalars.
-    auto applyQ = [&](const DeviceBuffer<scalar>& r) -> scalar
+    auto fusedReduce = [&]()   // wA = M^-1 rA (local AMG V-cycle, or the overlapped RAS solve when ov is set) ; red = [dot(wA,rA), sumMag(rA)]
     {
-        std::vector<scalar> cbuf(static_cast<std::size_t>(nSub), 0.0);
-        cbuf[myP] = deviceDot(r, ones);
-        Pstream::allReduce(cbuf.data(), nSub, ReduceOp::Sum);
-        const std::vector<scalar> y = coarseSolve(cbuf);
-        return y[myP];
-    };
-    DeviceBuffer<scalar> hAx(nC), ht(nC), hs(nC);              // hybrid temporaries: PRE-SIZED (amgVCycleApply writes into a caller-allocated z)
-    auto fusedReduce = [&]()   // wA = M^-1 rA (LOCAL AMG V-cycle [+ coarse]) ; red = [ dot(wA,rA), sumMag(rA) ]
-    {
-        if (coarseMode == 2 && !A0.empty())
-        {
-            // symmetric HYBRID two-level:  z = Qr ; z += Mloc^-1(r - Az) ; z += Q(r - Az)
-            const scalar q0 = applyQ(rA);
-            deviceCopy(wA, ones); deviceScale(wA, q0);                       // z = Q r
-            deviceParallelAmul(A, halo, ifaceCoeffs, wA, hAx);              // A z
-            deviceCopy(ht, rA); deviceAxpy(-1.0, hAx, ht);                  // t = r - A z
-            amgVCycleApply(amg, A, ht, hs, g_parGraph);                     // s = Mloc^-1 t
-            deviceAxpy(1.0, hs, wA);                                        // z += s
-            deviceParallelAmul(A, halo, ifaceCoeffs, wA, hAx);             // A z
-            deviceCopy(ht, rA); deviceAxpy(-1.0, hAx, ht);                 // t = r - A z
-            const scalar q1 = applyQ(ht);
-            deviceAxpy(q1, ones, wA);                                      // z += Q t
-            red[0] = deviceDot(wA, rA);
-            red[1] = deviceSumMag(rA);
-            Pstream::allReduce(red, 2, ReduceOp::Sum);
-            return;
-        }
-        amgVCycleApply(amg, A, rA, wA, g_parGraph);             // <-- the only change vs deviceParallelJacobiPCG (opt: graph replay)
-        if (!A0.empty())
-        {
-            // ONE collective carries both the coarse RHS and the two scalars: [ c (my slot), dot, sumMag ].
-            // The corrected dot needs no second collective because <wA + R0^T y, rA> = <wA,rA> + sum_i y_i c_i.
-            std::vector<scalar> buf(static_cast<std::size_t>(nSub) + 2, 0.0);
-            buf[myP]        = deviceDot(rA, ones);              // c_myP = (R0 rA)_myP
-            buf[nSub]       = deviceDot(wA, rA);
-            buf[nSub + 1]   = deviceSumMag(rA);
-            Pstream::allReduce(buf.data(), nSub + 2, ReduceOp::Sum);
-            const std::vector<scalar> c(buf.begin(), buf.begin() + nSub);
-            const std::vector<scalar> y = coarseSolve(c);
-            deviceAxpy(y[myP], ones, wA);                       // wA += R0^T A0^-1 R0 rA
-            scalar extra = 0.0;
-            for (int i = 0; i < nSub; ++i) extra += y[i] * c[i];
-            red[0] = buf[nSub] + extra;
-            red[1] = buf[nSub + 1];
-        }
-        else
-        {
-            red[0] = deviceDot(wA, rA);
-            red[1] = deviceSumMag(rA);
-            Pstream::allReduce(red, 2, ReduceOp::Sum);
-        }
+        precond(rA, wA, g_parGraph);
+        red[0] = deviceDot(wA, rA);
+        red[1] = deviceSumMag(rA);
+        Pstream::allReduce(red, 2, ReduceOp::Sum);
     };
 
     fusedReduce();

@@ -34,6 +34,12 @@ public:
     int   nInterfaces() const { return static_cast<int>(nbr_.size()); }
     int   neighbour(int i) const { return nbr_[i]; }
     label size(int i)      const { return size_[i]; }
+    // Interface i's local owner cells (one per face), for callers that scatter per-interface-face data (e.g. the
+    // Galerkin coarse-operator assembly: aggregate of each cut face's owner). Same order as size(i)/recvData(i).
+    const label* faceCellsDev(int i) const { return faceCellsD_[i].data(); }
+    // Device pointer to interface i's local owner cells (one per face). Lets callers fold the interface into their
+    // own kernels (e.g. the Galerkin coarse-operator scatter) without a round-trip.
+    const label* faceCells(int i) const { return faceCellsD_[i].data(); }
 
     // Post the exchange: pack psi at the interface faceCells and put to the neighbours on `stream` (no wait).
     // Do the local product between postExchange and waitExchange to overlap it with the transfer.
