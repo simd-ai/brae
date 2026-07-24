@@ -412,38 +412,15 @@ DeviceSolverPerf deviceParallelAMGPCG(
     scalar normFactor,
     scalar tol,
     scalar relTol,
-    int maxIter,
-    OverlapCtx* ov)
+    int maxIter)
 {
     const int nC = A.nCells;
-    // Stage-1 OVERLAP: restricted additive Schwarz preconditioner. z = owned part of (extended AMG)^-1 [rr; ghost rr].
-    // The ghost residual is the neighbour's rr at the interface (halo.exchange), placed in the ghost block; after
-    // the extended V-cycle the owned correction is kept (RAS). Replaces the owned-only amgVCycleApply when ov is set.
-    auto precond = [&](const DeviceBuffer<scalar>& rIn, DeviceBuffer<scalar>& zOut, bool parGraph)
-    {
-        if (!ov || !ov->amgExt) { amgVCycleApply(amg, A, rIn, zOut, parGraph); return; }
-        DeviceBuffer<scalar>& xr = *ov->exRes;
-        DeviceBuffer<scalar>& xc = *ov->exCorr;
-        cudaMemcpyAsync(xr.data(), rIn.data(), static_cast<std::size_t>(ov->nOwned) * sizeof(scalar),
-                        cudaMemcpyDeviceToDevice, cudaStreamPerThread);
-        halo.exchange(rIn.data());                              // recvData(i) = neighbour rr at their interface (my ghosts)
-        for (int i = 0; i < halo.nInterfaces(); ++i)
-        {
-            const int n = static_cast<int>(halo.size(i));
-            if (n <= 0) continue;
-            cudaMemcpyAsync(xr.data() + ov->nOwned + ov->ghOff[i], halo.recvData(i),
-                            static_cast<std::size_t>(n) * sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
-        }
-        amgVCycleApply(*ov->amgExt, ov->exView, xr, xc, false); // extended (overlapped) V-cycle
-        cudaMemcpyAsync(zOut.data(), xc.data(), static_cast<std::size_t>(ov->nOwned) * sizeof(scalar),
-                        cudaMemcpyDeviceToDevice, cudaStreamPerThread);
-    };
     DeviceBuffer<scalar> wA(nC), rA(nC), pA(nC), Ax(nC), ApA;
 
     amgPrepareFP32(amg, A);   // cast the local hierarchy to FP32 once (matrices are current post-amgGalerkin) -> FP32 V-cycles
     // BRAE_PARALLEL_GRAPH: 0 off, 1 = V-cycle-only graph replay (below), 2 = WHOLE-loop conditional graph (the 2x lever).
     static const int g_parGraphLevel = std::getenv("BRAE_PARALLEL_GRAPH") ? std::atoi(std::getenv("BRAE_PARALLEL_GRAPH")) : 0;
-    if (g_parGraphLevel >= 2 && !ov)   // overlap uses the direct path (the RAS apply is not captured in the graph)
+    if (g_parGraphLevel >= 2)
     {
         const DeviceSolverPerf gp = deviceParallelAMGPCGGraph(A, amg, halo, ifaceCoeffs, b, psi, normFactor, tol, relTol, maxIter);
         if (gp.nIterations >= 0) return gp;   // whole-loop graph ran; else (CUDA<13) fall through to the direct path
@@ -646,9 +623,9 @@ DeviceSolverPerf deviceParallelAMGPCG(
 
     DeviceSolverPerf perf;
     scalar red[2];
-    auto fusedReduce = [&]()   // wA = M^-1 rA (local AMG V-cycle, or the overlapped RAS solve when ov is set) ; red = [dot(wA,rA), sumMag(rA)]
+    auto fusedReduce = [&]()   // wA = M^-1 rA (local AMG V-cycle) ; red = [ dot(wA,rA), sumMag(rA) ] in ONE collective
     {
-        precond(rA, wA, g_parGraph);
+        amgVCycleApply(amg, A, rA, wA, g_parGraph);
         red[0] = deviceDot(wA, rA);
         red[1] = deviceSumMag(rA);
         Pstream::allReduce(red, 2, ReduceOp::Sum);

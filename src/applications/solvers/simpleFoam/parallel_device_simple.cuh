@@ -41,15 +41,6 @@ namespace brae {
 
 namespace detail {
 
-// Stage-1 OVERLAP: fill the extended matrix's interface off-diagonal block, dst[i] = -src[i]
-// (upper/lower on the owned<->ghost face = a_og = -ifCoeff, matching the global matvec's -ifCoeff*psiNbr).
-__global__
-void negCopyK(scalar* __restrict__ dst, const scalar* __restrict__ src, int n)
-{
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = -src[i];
-}
-
 // L4: the processor contribution to H(). lduMatrix::H(psi) = -offdiag.psi, and the PARALLEL A.psi carries
 // -ifCoeff*psiNbr at each interface face, so H picks up +ifCoeff*psiNbr there. deviceMatrixH already divided
 // by V, hence the /V. atomicAdd: a cell may own several faces on one interface.
@@ -800,55 +791,6 @@ public:
                                     std::chrono::high_resolution_clock::now() - t0).count(),
                                 loaded ? "cache HIT" : "built", pAMG_.nLevels());
 
-                // ---- STAGE 1 OVERLAP (BRAE_OVERLAP>=1): AMG on OWNED + 1 GHOST RING (owned-only AMG stays pAMG_) ----
-                // Extend the local internal graph with one ghost node per interface face, connected to its owner cell
-                // by the interface face (coeff = ifCoeff, folded in at assembly time). Ghost of interface i, face f ->
-                // extended cell lnC_ + ghOff_[i] + f. The structure is static; the matrix values (owned + exchanged
-                // ghost diagonal + interface off-diagonals) are assembled per step. faceWeight for the interface faces
-                // is a placeholder 1.0 here (only affects the agglomeration heuristic; refined later).
-                if (std::getenv("BRAE_OVERLAP") && std::atoi(std::getenv("BRAE_OVERLAP")) >= 1)
-                {
-                    std::vector<label>  exOwner(ownerInt), exNei(neiInt);
-                    std::vector<scalar> exFw(fwAMG);
-                    // CUSTOM AGGREGATION: give the owned<->ghost faces a WEAK aggregation weight so buildAMG keeps each
-                    // ghost as its own aggregate instead of lumping it with an owned cell. (Lumping let the ghost's large
-                    // neighbour-diagonal + residual contaminate the owned coarse correction -> divergence.) The real
-                    // coupling is still captured: amgGalerkin builds the coarse operator from the ACTUAL matrix values,
-                    // not these aggregation weights. wGhost = 1e-3 * (smallest internal face weight).
-                    scalar wmin = fwAMG.empty() ? 1.0 : fwAMG[0];
-                    for (scalar w : fwAMG) wmin = std::fmin(wmin, std::fabs(w));
-                    const scalar wGhost = 1e-3 * wmin;
-                    ghOff_.assign(P_.Lm.procFaceCells.size() + 1, 0);
-                    int nGhost = 0;
-                    for (std::size_t i = 0; i < P_.Lm.procFaceCells.size(); ++i)
-                    {
-                        const std::vector<label>& fc = P_.Lm.procFaceCells[i];
-                        ghOff_[i] = nGhost;
-                        for (std::size_t f = 0; f < fc.size(); ++f)
-                        {
-                            exOwner.push_back(fc[f]);
-                            exNei.push_back(static_cast<label>(lnC_) + static_cast<label>(nGhost) + static_cast<label>(f));
-                            exFw.push_back(wGhost);
-                        }
-                        nGhost += static_cast<int>(fc.size());
-                    }
-                    ghOff_[P_.Lm.procFaceCells.size()] = nGhost;
-                    nGhost_ = nGhost;
-                    if (nGhost > 0)
-                    {
-                        pAMGext_ = buildAMG(exOwner, exNei, exFw, static_cast<int>(lnC_) + nGhost);
-                        // Extended fine matrix: addressing built once (zero values), assembled per step in solvePressure.
-                        const std::vector<scalar> z0(static_cast<std::size_t>(lnC_) + nGhost, 0.0);
-                        const std::vector<scalar> zf(exOwner.size(), 0.0);
-                        exLdu_ = buildDeviceLdu(z0, zf, zf, exOwner, exNei, static_cast<int>(lnC_) + nGhost);
-                        exRes_.resize(static_cast<int>(lnC_) + nGhost);
-                        exCorr_.resize(static_cast<int>(lnC_) + nGhost);
-                        useOverlap_ = true;
-                        if (P_.rank == 0)
-                            std::printf("[overlap] pAMGext: %d owned + %d ghost = %d ext cells, %d levels\n",
-                                        (int)lnC_, nGhost, (int)lnC_ + nGhost, pAMGext_.nLevels());
-                    }
-                }
             }
         }
     }
@@ -1252,15 +1194,6 @@ private:
     DeviceHalo           halo_;
     bool     useAMG_ = false;   // pressure preconditioned by the local per-rank AMG V-cycle (else point-Jacobi)
     AMGData  pAMG_;             // the local pressure-Laplacian hierarchy (built once, Galerkin-recoarsened per step)
-    // Stage-1 OVERLAP (BRAE_OVERLAP): a SECOND AMG hierarchy on the owned cells + one ghost ring (the neighbour's
-    // interface cells), so the local solve sees across the processor cut -> overlapping additive Schwarz. Structure
-    // is static (built once here); the extended matrix VALUES are assembled per step. Default off.
-    AMGData  pAMGext_;
-    bool     useOverlap_ = false;
-    int      nGhost_ = 0;
-    std::vector<int> ghOff_;    // ghost-block offset per interface: ghost of interface i, face f -> lnC_ + ghOff_[i] + f
-    DeviceLduMatrix      exLdu_;         // extended fine matrix (owned + ghost); addressing built once, values per step
-    DeviceBuffer<scalar> exRes_, exCorr_;// RAS scratch, length lnC_ + nGhost_
     // Persistent pressure-solve buffers (graph-referenced): STABLE addresses across steps (resize is a no-op when
     // the size is unchanged), so the whole-loop conditional graph (BRAE_PARALLEL_GRAPH=2) captures ONCE and
     // replays across all steps instead of re-instantiating per step. Values are overwritten by the assembly each
@@ -1932,56 +1865,11 @@ inline ParStepResidual ParallelDeviceSimple::step()
     // pressure solve: local-AMG-preconditioned distributed CG (the strong preconditioner that converges on graded
     // meshes), else point-Jacobi CG. amgGalerkin re-coarsens the hierarchy from THIS step's pressure matrix
     // (pDiagC includes the interface + boundary diagonal terms; pU_/pL_ are the internal Laplacian off-diagonals).
-    // Stage-1 OVERLAP: assemble the extended (owned + ghost ring) matrix from THIS step's pressure matrix, so the
-    // RAS preconditioner solves on the overlapped domain. Owned block = pDiagC / pU_ / pL_; ghost diagonal = the
-    // neighbour's pDiagC (halo exchange); interface off-diagonals = -pIfCoeff (a_og). Then Galerkin-recoarsen pAMGext_.
-    OverlapCtx  ovc;
-    OverlapCtx* ovp = nullptr;
-    if (useOverlap_ && useAMG_ && nGhost_ > 0 && !ami_.active)
-    {
-        const int nOw = static_cast<int>(lnC_);
-        cudaMemcpyAsync(exLdu_.diag.data(), pDiagC.data(), static_cast<std::size_t>(nOw) * sizeof(scalar),
-                        cudaMemcpyDeviceToDevice, cudaStreamPerThread);
-        halo_.exchange(pDiagC.data());                                     // recvData(i) = neighbour diagonal at interface
-        for (int i = 0; i < halo_.nInterfaces(); ++i)
-        {
-            const int n = static_cast<int>(halo_.size(i));
-            if (n <= 0) continue;
-            cudaMemcpyAsync(exLdu_.diag.data() + nOw + ghOff_[i], halo_.recvData(i),
-                            static_cast<std::size_t>(n) * sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
-        }
-        cudaMemcpyAsync(exLdu_.upper.data(), pU_.data(), static_cast<std::size_t>(nIf_) * sizeof(scalar),
-                        cudaMemcpyDeviceToDevice, cudaStreamPerThread);
-        cudaMemcpyAsync(exLdu_.lower.data(), pL_.data(), static_cast<std::size_t>(nIf_) * sizeof(scalar),
-                        cudaMemcpyDeviceToDevice, cudaStreamPerThread);
-        constexpr int TPB = 128;
-        const bool noCouple = std::getenv("BRAE_OVERLAP_NOCOUPLE") != nullptr;   // debug: 0 interface off-diag -> RAS==mode0
-        if (!noCouple)
-        for (int i = 0; i < static_cast<int>(pIfCoeff.size()); ++i)
-        {
-            const int n = static_cast<int>(halo_.size(i));
-            if (n <= 0) continue;
-            detail::negCopyK<<<(n + TPB - 1) / TPB, TPB, 0, cudaStreamPerThread>>>(
-                exLdu_.upper.data() + nIf_ + ghOff_[i], pIfCoeff[i].data(), n);
-            detail::negCopyK<<<(n + TPB - 1) / TPB, TPB, 0, cudaStreamPerThread>>>(
-                exLdu_.lower.data() + nIf_ + ghOff_[i], pIfCoeff[i].data(), n);
-        }
-        amgGalerkin(pAMGext_, exLdu_.diag, exLdu_.upper, exLdu_.lower);
-        amgPrepareFP32(pAMGext_, exLdu_.view());   // cast the extended hierarchy to FP32 mirrors (else the V-cycle runs on garbage)
-        ovc.amgExt = &pAMGext_;
-        ovc.exView = exLdu_.view();
-        ovc.exRes  = &exRes_;
-        ovc.exCorr = &exCorr_;
-        ovc.nOwned = nOw;
-        ovc.nGhost = nGhost_;
-        ovc.ghOff.assign(ghOff_.begin(), ghOff_.end());
-        ovp = &ovc;
-    }
     DeviceSolverPerf pp;
     if (useAMG_)
     {
         amgGalerkin(pAMG_, pDiagC, pU_, pL_);
-        pp = deviceParallelAMGPCG(pv, halo_, pIfCoeff, pb, pSol, pAMG_, nfp, tolP_, relTolP_, maxIter_, ovp);
+        pp = deviceParallelAMGPCG(pv, halo_, pIfCoeff, pb, pSol, pAMG_, nfp, tolP_, relTolP_, maxIter_);
     }
     else
         pp = deviceParallelJacobiPCG(pv, halo_, pIfCoeff, pb, pSol, nfp, tolP_, relTolP_, maxIter_, pamip);
