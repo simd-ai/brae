@@ -155,13 +155,13 @@ DeviceSolverPerf deviceJacobiPCG(
             if (nIter == 0) deviceCopy(pA, wA);             // pA = wA
             else                                            // pA = wA + beta*pA
             {
-                const scalar beta = wArA / wArAold;
+                const scalar beta = (std::fabs(wArAold) > 1e-300) ? wArA / wArAold : 0.0;   // guard breakdown -> 0, not Inf/NaN
                 deviceScale(pA, beta);
                 deviceAxpy(1.0, wA, pA);
             }
             deviceAmul(A, pA, wA);                          // wA = A*pA
             const scalar wApA  = deviceDot(wA, pA);
-            const scalar alpha = wArA / wApA;
+            const scalar alpha = (std::fabs(wApA) > 1e-300) ? wArA / wApA : 0.0;   // guard pAp~0 breakdown -> 0, not Inf/NaN
             deviceAxpy(alpha, pA, psi);                     // psi += alpha*pA
             deviceAxpy(-alpha, wA, rA);                     // rA  -= alpha*wA
             perf.finalResidual = deviceSumMag(rA) / normFactor;

@@ -108,13 +108,14 @@ inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 // RAP under smoothed aggregation (BRAE_AMG_SA) can produce a near-zero or negative coarse diag
 // (the BRAE_AMG_DEBUG block reports exactly this). Dividing by it gives Inf/NaN, which propagates
 // through prolongation into the outer residual and runs the solve to maxIter on garbage. This
-// helper is a STRICT no-op for any diagonal of magnitude > 1e-300, so it never perturbs a
-// well-formed operator; it only replaces a would-be division by (near) zero.
+// helper is a STRICT no-op for any diagonal of magnitude > the type floor (1e-300 for FP64,
+// 1e-30 for FP32 -- 1e-300 underflows to 0.0f in float, which would defeat the guard entirely),
+// so it never perturbs a well-formed operator; it only replaces a would-be division by (near) zero.
 template <typename T>
 __device__ __forceinline__
 T safeDiag(T d)
 {
-    const T floor = T(1e-300);
+    const T floor = T(sizeof(T) == 4 ? 1e-30 : 1e-300);
     if (d > floor)  return d;
     if (d < -floor) return d;
     return (d < T(0)) ? -floor : floor;
@@ -141,7 +142,7 @@ void smoothT(
     T* __restrict__ x)
 {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
-    if (i < n) x[i] += T(OMEGA)*(b[i]-Ax[i])/diag[i];
+    if (i < n) x[i] += T(OMEGA)*(b[i]-Ax[i])/safeDiag(diag[i]);   // safeDiag: floor the (FP32) diagonal, never divide by ~0 -> no Inf/NaN preconditioner
 }
 template <typename T>
 __global__
@@ -184,7 +185,7 @@ void gsColorT(
         const int f = losort[k];
         off += lower[f] * x[owner[f]];
     }
-    x[c] = (b[c] - off) / diag[c];
+    x[c] = (b[c] - off) / safeDiag(diag[c]);   // safeDiag: floor the (FP32) diagonal, never divide by ~0
 }
 // z = src/diag: applies the diagonal (Jacobi) preconditioner, used by the power iteration on D^-1 A.
 __global__

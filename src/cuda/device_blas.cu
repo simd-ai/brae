@@ -111,14 +111,16 @@ void scaleDevKernel(const scalar* __restrict__ a, scalar* __restrict__ x, int n)
 __global__
 void scalarDivK(const scalar* num, const scalar* den, scalar* out)
 {
-    if (threadIdx.x == 0 && blockIdx.x == 0) *out = (*num) / (*den);
+    // Guard the pressure-PCG divide (den = pAp / wArAold): a near-zero/breakdown denominator yields 0 (no update this
+    // iteration) instead of Inf/NaN, mirroring the momentum BiCGStab's OF-checkSingularity guard. Healthy solve: bit-identical.
+    if (threadIdx.x == 0 && blockIdx.x == 0) { const scalar d = *den; *out = (fabs(d) > scalar(1e-300)) ? (*num) / d : scalar(0); }
 }
 
 
 __global__
 void scalarDivNegK(const scalar* num, const scalar* den, scalar* out, scalar* outNeg)
 {
-    if (threadIdx.x == 0 && blockIdx.x == 0) { const scalar q = (*num) / (*den); *out = q; *outNeg = -q; }
+    if (threadIdx.x == 0 && blockIdx.x == 0) { const scalar d = *den; const scalar q = (fabs(d) > scalar(1e-300)) ? (*num) / d : scalar(0); *out = q; *outNeg = -q; }
 }
 
 

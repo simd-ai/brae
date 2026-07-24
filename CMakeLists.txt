@@ -248,7 +248,8 @@ if(BRAE_WITH_NVSHMEM)
         add_test(NAME distributed_ami_gather_np${_np}
                  COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
                          $<TARGET_FILE:test_distributed_ami_gather>
-                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/tc_wedge_ami)
+                         # committed cyclicAMI fixture (tc_wedge_ami is gitignored -> absent on a fresh CI checkout)
+                         ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannelAMI)
     endforeach()
 
     # Phase 4a L8: device distributed momentum PREDICTOR vs the host predictor

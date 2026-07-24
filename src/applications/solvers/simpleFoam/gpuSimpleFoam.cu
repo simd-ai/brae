@@ -484,12 +484,45 @@ int main(int argc, char** argv)
         SurfaceScalarField phi = fvc::flux(U, m, g, fvp);
 
         const std::string secondName = ctl.sst ? "omega" : "epsilon";   // the 2nd turbulence scalar
+        // Wall-function fidelity guard -- fail loud on the two silently-wrong cases the BC parser can't catch:
+        //  (1) nutUSpaldingWallFunction on a non-SA model: brae picks the wall model from the RAS model (Spalding for
+        //      SA, nutk otherwise), NOT the BC, so it would silently apply nutkWallFunction (wrong wall shear/Cf/Cd).
+        //  (2) a nut/epsilon/omega wall-function BC on a patch NOT typed 'wall': brae gates the near-wall model on the
+        //      geometric patch type, so the wall function would be SILENTLY inert. Conservative on the patch match --
+        //      only errors when the BC patch resolves to a concrete non-'wall' patch (group/regex names are skipped).
+        auto patchGeoType = [&](const std::string& nm) -> std::string {
+            for (const auto& q : fvp) if (q.name == nm) return q.type;
+            return "";
+        };
+        auto guardWallFn = [&](const FieldData<scalar>& fd, const std::string& field) {
+            auto isWF = [](const std::string& t) {
+                return t == "nutkWallFunction" || t == "nutUSpaldingWallFunction" || t == "nutLowReWallFunction"
+                    || t == "nutUBlendedWallFunction" || t == "epsilonWallFunction" || t == "omegaWallFunction";
+            };
+            for (const auto& pb : fd.boundary)
+            {
+                if (!isWF(pb.type)) continue;
+                const std::string gt = patchGeoType(pb.name);
+                if (!gt.empty() && gt != "wall")
+                    throw std::runtime_error(field + " boundary '" + pb.name + "' uses " + pb.type + ", but the patch"
+                        " is type '" + gt + "' (not 'wall'). brae applies the near-wall model only on 'wall' patches, so"
+                        " it would be SILENTLY inert (no wall shear / near-wall constraint). Retype the patch as 'wall'"
+                        " in constant/polyMesh/boundary.");
+                if (pb.type == "nutUSpaldingWallFunction" && !ctl.sa)
+                    throw std::runtime_error(field + " boundary '" + pb.name + "' uses nutUSpaldingWallFunction, but"
+                        " this is a " + std::string(ctl.sst ? "kOmegaSST" : "kEpsilon") + " case -- brae applies"
+                        " nutkWallFunction there (Spalding is SA-only), silently changing the wall shear. Use"
+                        " nutkWallFunction, or run the SpalartAllmaras model.");
+            }
+        };
         GeometricField<scalar> k, eps, nut, ReThetat, gammaInt;   // ReThetat/gammaInt: kOmegaSSTLM transition
         if (ctl.sa)   // Spalart-Allmaras (one-equation): nuTilda -> the "k" slot, nut. BCs (freestream + fixedValue-0 wall) need no inlet calc.
         {
             k   = buildField<scalar>(readField<scalar>(fieldDir + "/nuTilda"), fvp, nC);
             k.evaluateBoundary();
-            nut = buildField<scalar>(readField<scalar>(fieldDir + "/nut"), fvp, nC);
+            const FieldData<scalar> nutFD = readField<scalar>(fieldDir + "/nut");
+            guardWallFn(nutFD, "nut");
+            nut = buildField<scalar>(nutFD, fvp, nC);
             nut.evaluateBoundary();
         }
         else if (ctl.turbulent)
@@ -500,7 +533,10 @@ int main(int argc, char** argv)
             k.evaluateBoundary();
             eps = buildField<scalar>(sFD, fvp, nC);
             eps.evaluateBoundary();
-            nut = buildField<scalar>(readField<scalar>(fieldDir + "/nut"), fvp, nC);
+            const FieldData<scalar> nutFD = readField<scalar>(fieldDir + "/nut");
+            guardWallFn(nutFD, "nut");
+            guardWallFn(sFD, secondName);
+            nut = buildField<scalar>(nutFD, fvp, nC);
             nut.evaluateBoundary();
             if (ctl.lm)   // kOmegaSSTLM transition fields
             {
@@ -524,11 +560,29 @@ int main(int argc, char** argv)
             const auto zones = readCellZones(caseDir + "/constant/polyMesh");
             const auto it = zones.find(mrfCfg.cellZone);
             std::vector<label> zoneCells = (it != zones.end()) ? it->second : std::vector<label>{};
-            if (zoneCells.empty())   // whole-mesh fallback
+            if (zoneCells.empty())
             {
-                zoneCells.resize(nC);
-                for (label c = 0; c < nC; ++c)
-                    zoneCells[c] = c;
+                // A named zone that isn't in cellZones is almost always a typo (or a binary/unparsed zone): the
+                // old silent whole-mesh fallback then turned the ENTIRE domain into a rotating frame. Refuse that,
+                // and report the zones that ARE present -- EXCEPT for the explicit 'all' convention (deliberate
+                // whole-domain rotation, e.g. rotatingCylinders), which we honour but announce loudly.
+                if (mrfCfg.cellZone == "all")
+                {
+                    std::printf("  MRF: cellZone 'all' -> rotating the WHOLE mesh (%d cells)\n", nC);
+                    zoneCells.resize(nC);
+                    for (label c = 0; c < nC; ++c) zoneCells[c] = c;
+                }
+                else
+                {
+                    std::string avail;
+                    for (const auto& z : zones) avail += (avail.empty() ? "" : ", ") + z.first;
+                    throw std::runtime_error(
+                        std::string("MRF cellZone '") + mrfCfg.cellZone
+                        + "' not found or empty in constant/polyMesh/cellZones (available: "
+                        + (avail.empty() ? std::string("<none>") : avail)
+                        + "). Refusing to silently rotate the ENTIRE domain -- fix the 'cellZone' name in"
+                          " constant/MRFProperties (use 'all' for deliberate whole-mesh rotation).");
+                }
             }
             mrfZone = buildMRFZone(m, zoneCells, mrfCfg.axis, mrfCfg.omega, mrfCfg.origin);
             mrfCorrectBoundaryVelocity(U, mrfZone, g, fvp, mrfCfg.nonRotatingPatches);   // in-zone walls -> Omega x r
@@ -561,6 +615,15 @@ int main(int argc, char** argv)
             if (a.good() || b.good()) fvoZones = readCellZones(caseDir + "/constant/polyMesh");
         }
         const FvOptionsData fvo = readFvOptions(caseDir, fvoZones, g.V(), nC, g.C());
+        if (!fvo.unsupported.empty())   // fail loud rather than run a valid-looking case with a silently-dropped source
+        {
+            std::string msg = "fvOptions contains source(s) brae cannot apply (they would be SILENTLY dropped -> wrong physics):";
+            for (const auto& u : fvo.unsupported) msg += "\n  - " + u;
+            msg += "\nRemove/disable them, or use a supported form. Supported: vectorSemiImplicitSource,"
+                   " explicitPorositySource[DarcyForchheimer], meanVelocityForce, limitVelocity,"
+                   " actuationDiskSource[Froude], rotorDisk, velocityDampingConstraint; selectionMode all|cellZone.";
+            throw std::runtime_error(msg);
+        }
         if (!fvo.empty())
         {
             solver.setFvOptions(fvo);
@@ -679,7 +742,28 @@ int main(int argc, char** argv)
                                 e.field.c_str(), e.perf.initialResidual, e.perf.finalResidual, e.perf.nIterations);
                 std::printf("ExecutionTime = %.2f s  ClockTime = %.0f s\n\n", _et, _et);
             }
+            // NaN/divergence guard: a non-finite momentum/pressure residual means the solve blew up (FP32 overflow,
+            // singular pressure, turbulence blow-up, or an under-stabilised case). Without this the loop runs to
+            // endTime (ok(NaN,tol) is always false -> never "converges") and WRITES the NaN field as the solution.
+            // Abort loudly and write nothing. Opt out (e.g. to inspect the field) with BRAE_ALLOW_NONFINITE=1.
+            if (!std::getenv("BRAE_ALLOW_NONFINITE")
+                && !(std::isfinite(r.p) && std::isfinite(r.Ux) && std::isfinite(r.Uy) && std::isfinite(r.Uz)))
+                throw std::runtime_error(
+                    "solution diverged: non-finite residual at iteration " + std::to_string(iter)
+                    + " (p=" + std::to_string(r.p) + " Ux=" + std::to_string(r.Ux)
+                    + " Uy=" + std::to_string(r.Uy) + " Uz=" + std::to_string(r.Uz) + "). Likely causes:"
+                    + " too-loose relaxation, a high-non-orthogonality mesh, a singular pressure system, or"
+                    + " turbulence blow-up. No field written. Set BRAE_ALLOW_NONFINITE=1 to continue anyway.");
+            // OF residualControl: also gate on every turbulence field (k/epsilon/omega/nuTilda) that lists a target.
+            // Previously ONLY p and Ux were checked, so a turbulent case could report "converged" with k/epsilon
+            // still far from tol -- the substantive bug this fixes. Unlisted fields have target -1 -> ok() ignores
+            // them (OF). U stays gated on Ux alone: brae tracks no valid/solved directions, so the out-of-plane
+            // component of a 2D/empty or wedge case has a DEGENERATE residual (stuck ~0.1, never reaching tol) that
+            // would wrongly block convergence on every 2D case -- gating all U components needs that infra first.
             converged = hasRC && ok(r.p, rcP) && ok(r.Ux, rcU);
+            if (converged)
+                for (const auto& e : turbulenceReport())
+                    if (!ok(e.perf.initialResidual, resCtl->scalarOr(e.field, -1))) { converged = false; break; }
             const scalar tval = startTimeVal + (scalar)iter * deltaT;               // OF time value at this step
             if (!converged && iter != endTime && isWriteTime(iter, tval)) writeTimeDir(timeName(tval));  // intermediate writes
         }
