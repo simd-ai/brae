@@ -135,12 +135,27 @@ int main(int argc, char** argv)
         }
         const std::string fieldDir = caseDir + "/" + startStr;   // solver reads <startTime> exactly as in OpenFOAM
         const int   endTime   = controlDict.intOr("endTime", 1000);
+        // Steady simpleFoam's endTime is an INTEGER iteration count. A fractional endTime (e.g. 0.3, copy-pasted from
+        // a transient case) truncates to 0 -> the loop runs 0 iterations and would write the initial field as "the
+        // solution". Refuse endTime < 1.
+        if (endTime < 1)
+            throw std::runtime_error("controlDict endTime = " + std::to_string(endTime) + " (< 1). Steady simpleFoam"
+                " runs an integer iteration count; a fractional endTime truncates to 0 and would write the initial"
+                " field as the solution. Set endTime to the number of SIMPLE iterations.");
         const int   precision = controlDict.intOr("writePrecision", 16);
 
         DeviceSimpleControls ctl;
         ctl.caseDir = caseDir;
         ctl.writeCache = std::getenv("BRAE_MESH_CACHE") != nullptr;   // -partition (above) or the env
         ctl.nu = transport.scalarOr("nu", 1e-5);
+        // brae is Newtonian-only; a non-Newtonian transportModel has no top-level nu, so it would silently run with
+        // the default constant nu (the wrong viscosity for a shear-thinning/thickening fluid). Fail loud instead.
+        {
+            const std::string tModel = transport.wordOr("transportModel", "Newtonian");
+            if (tModel != "Newtonian")
+                throw std::runtime_error("constant/transportProperties transportModel '" + tModel + "' is not"
+                    " supported -- brae is Newtonian-only and would silently use a constant nu. Only 'Newtonian' is supported.");
+        }
         // read schemes: div(phi,U) "bounded" -> -Sp(div(phi),.); "linearUpwind" -> deferred gradient correction;
         // laplacian/snGrad "corrected" -> non-orthogonal correction (nonOrthDeltaCoeffs implicit + corrVec.grad explicit).
         {

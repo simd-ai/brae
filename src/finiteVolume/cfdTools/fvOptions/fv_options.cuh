@@ -239,6 +239,7 @@ inline FvOptionsData readFvOptions(
                 if (it != zones.end()) fo.adMonitorCells = it->second;
             }
             if (fo.adMonitorCells.empty()) continue;
+            if (fo.adActive) fo.unsupported.push_back("source '" + s.first + "': a 2nd actuationDiskSource -- brae keeps only one");
             fo.adActive = true;
             ++fo.count;
             continue;
@@ -304,6 +305,7 @@ inline FvOptionsData readFvOptions(
                 if (it != zones.end()) rp.cells = it->second;
             }
             if (rp.cells.empty() || rp.bladeR.empty() || rp.pAlpha.empty()) continue;
+            if (rp.active) fo.unsupported.push_back("source '" + s.first + "': a 2nd rotorDisk -- brae keeps only one");
             rp.active = true;
             ++fo.count;
             continue;
@@ -331,6 +333,7 @@ inline FvOptionsData readFvOptions(
             fo.porD = adjustNeg(last3(df.scalarListOr("d", {})));
             fo.porF = adjustNeg(last3(df.scalarListOr("f", {})));
             fo.porCells = it->second;
+            if (fo.porActive) fo.unsupported.push_back("source '" + s.first + "': a 2nd explicitPorositySource -- brae keeps only one");
             fo.porActive = true;
             ++fo.count;
             continue;
