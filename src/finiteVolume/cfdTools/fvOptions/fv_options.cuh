@@ -312,7 +312,12 @@ inline FvOptionsData readFvOptions(
         if (isPor)   // explicitPorositySource (DarcyForchheimer)
         {
             const std::string pm = co.wordOr("type", "");
-            if (pm != "DarcyForchheimer") continue;                       // (powerLaw/fixedCoeff: future)
+            if (pm != "DarcyForchheimer")   // powerLaw / fixedCoeff not implemented -> would silently apply ZERO resistance
+            {
+                fo.unsupported.push_back("porosity source '" + s.first + "' uses model '" + pm
+                                         + "' -- only DarcyForchheimer is supported (others would apply no resistance)");
+                continue;
+            }
             const std::string zn = co.wordOr("cellZone", "");
             const auto it = zones.find(zn);
             if (it == zones.end() || it->second.empty()) continue;

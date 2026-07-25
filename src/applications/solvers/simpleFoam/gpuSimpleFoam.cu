@@ -144,8 +144,10 @@ int main(int argc, char** argv)
         // read schemes: div(phi,U) "bounded" -> -Sp(div(phi),.); "linearUpwind" -> deferred gradient correction;
         // laplacian/snGrad "corrected" -> non-orthogonal correction (nonOrthDeltaCoeffs implicit + corrVec.grad explicit).
         {
-            std::istringstream fsch(readFileExpanded(caseDir + "/system/fvSchemes"));   // $var expanded ($turbulence)
+            const std::string schemesText = readFileExpanded(caseDir + "/system/fvSchemes");   // $var expanded ($turbulence)
+            std::istringstream fsch(schemesText);
             std::string ln;
+            bool foundDivU = false;   // require an EXPLICIT div(phi,U); brae does not resolve the divSchemes 'default'
             auto hasWord = [](const std::string& s, const std::string& w)   // whole-word match (so "uncorrected" != "corrected")
             {
                 for (std::size_t p = s.find(w); p != std::string::npos; p = s.find(w, p + 1))
@@ -205,6 +207,7 @@ int main(int argc, char** argv)
             {
                 if (ln.find("div(phi,U)") != std::string::npos)
                 {
+                    foundDivU = true;
                     checkDiv(ln, "U", {"upwind", "linearUpwind", "linearUpwindV", "LUST"}, {"limitedLinear", "limitedLinearV"});
                     if (ln.find("bounded") != std::string::npos)      ctl.bounded = true;
                     if (ln.find("linearUpwind") != std::string::npos) ctl.linearUpwind = true;   // linearUpwindV contains this -> upwind matrix + gradients
@@ -260,6 +263,10 @@ int main(int argc, char** argv)
                     }
                 }
             }
+            if (!schemesText.empty() && !foundDivU)
+                throw std::runtime_error("fvSchemes: no explicit div(phi,U) scheme. brae does not resolve the"
+                    " divSchemes 'default' for momentum convection (it would silently run first-order upwind)."
+                    " Add e.g. 'div(phi,U)  bounded Gauss linearUpwind grad(U);'.");
         }
         const std::string simType = turbProps.wordOr("simulationType", "laminar");
         ctl.turbulent = (simType == "RAS");
@@ -353,10 +360,24 @@ int main(int argc, char** argv)
         const FoamDict* rf  = fvSolution.subDict("relaxationFactors");
         const FoamDict* eqs = rf ? rf->subDict("equations") : nullptr;
         const FoamDict* fld = rf ? rf->subDict("fields") : nullptr;
-        ctl.relaxU   = eqs ? eqs->scalarOr("U", 1.0) : 1.0;
-        ctl.relaxK   = eqs ? eqs->scalarOr(ctl.sa ? "nuTilda" : "k", 1.0) : 1.0;   // SA: relaxK carries the nuTilda relax
-        ctl.relaxEps = eqs ? eqs->scalarOr(ctl.sst ? "omega" : "epsilon", 1.0) : 1.0;
-        ctl.relaxP   = fld ? fld->scalarOr("p", 1.0) : 1.0;
+        // OF accepts BOTH the modern nested {equations{} fields{}} and the legacy FLAT {p ..; U ..;} form. Fall back
+        // to the flat keys (read from rf itself) when a sub-dict is absent, so a legacy case isn't silently left
+        // un-relaxed (all factors 1.0 -> the steady SIMPLE loop typically diverges).
+        const FoamDict* eqSrc  = eqs ? eqs : rf;
+        const FoamDict* fldSrc = fld ? fld : rf;
+        ctl.relaxU   = eqSrc  ? eqSrc->scalarOr("U", 1.0) : 1.0;
+        ctl.relaxK   = eqSrc  ? eqSrc->scalarOr(ctl.sa ? "nuTilda" : "k", 1.0) : 1.0;   // SA: relaxK carries the nuTilda relax
+        ctl.relaxEps = eqSrc  ? eqSrc->scalarOr(ctl.sst ? "omega" : "epsilon", 1.0) : 1.0;
+        ctl.relaxP   = fldSrc ? fldSrc->scalarOr("p", 1.0) : 1.0;
+        // A relaxation factor <= 0 divides by zero in the diagonal-relaxation kernel (Inf diag -> NaN). OF's
+        // fvMatrix::relax skips relaxation for alpha <= 0; match that (treat as 1.0 = no under-relaxation) + warn.
+        auto fixRelax = [](scalar& a, const char* nm) {
+            if (a <= 0.0) { std::fprintf(stderr, "brae WARNING: relaxationFactors %s = %g <= 0; using 1.0 (no under-relaxation)\n", nm, a); a = 1.0; }
+        };
+        fixRelax(ctl.relaxU, "U");
+        fixRelax(ctl.relaxK, ctl.sa ? "nuTilda" : "k");
+        fixRelax(ctl.relaxEps, ctl.sst ? "omega" : "epsilon");
+        fixRelax(ctl.relaxP, "p");
 
         const FoamDict* solvers = fvSolution.subDict("solvers");
         auto solverTol = [&](const std::string& f, scalar def)

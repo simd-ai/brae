@@ -41,6 +41,10 @@ GeometricField<T> buildField(
 {
     GeometricField<T> gf;
     if (fd.internalUniform) gf.internal.assign(nCells, fd.internalUniformValue);
+    else if (static_cast<label>(fd.internalField.size()) != nCells)   // wrong mesh / decomposed field / hand-edit
+        throw std::runtime_error("field internalField has " + std::to_string(fd.internalField.size())
+            + " values but the mesh has " + std::to_string(nCells) + " cells (size mismatch) -- refusing to read"
+              " out of bounds. Check the field is for THIS mesh (not a decomposed/other-mesh field).");
     else                    gf.internal = fd.internalField;
 
     for (const FvPatch& p : patches)
