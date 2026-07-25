@@ -170,6 +170,11 @@ std::string expandIncludes(const std::string& text, const std::string& baseDir, 
             std::size_t j = i + 1;
             while (j < text.size() && std::isalpha(static_cast<unsigned char>(text[j]))) ++j;
             const std::string dir = text.substr(i + 1, j - i - 1);
+            // brae does not evaluate #calc/#eval/#codeStream: the raw expression string flows into stod/stoi and is
+            // silently mis-parsed (e.g. endTime #calc "1000*2" -> 1000). Fail loud rather than run a wrong control value.
+            if (dir == "calc" || dir == "eval" || dir == "codeStream")
+                throw std::runtime_error("brae does not evaluate #" + dir + " directives -- the expression would be"
+                    " silently mis-parsed into a wrong value. Replace it with a literal value.");
             if (dir == "includeFunc")
             {
                 // #includeFunc <name>[(args)] (unquoted; OF function-template include). brae only RUNS force/forceCoeffs

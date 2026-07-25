@@ -112,7 +112,33 @@ int main(int argc, char** argv)
         const FoamDict transport   = readDict(caseDir + "/constant/transportProperties");
         const FoamDict turbProps   = readDict(caseDir + "/constant/turbulenceProperties");
 
-        const std::string startStr = controlDict.wordOr("startTime", "0");
+        std::string startStr = controlDict.wordOr("startTime", "0");
+        // OF startFrom: 'latestTime' restarts from the newest numeric time directory, 'firstTime' from the earliest
+        // (default 'startTime' uses startTime). brae previously IGNORED startFrom, so a 'latestTime' restart silently
+        // re-ran from startTime (scratch). Resolve it by scanning the case's numeric time dirs that hold a U field.
+        {
+            const std::string startFrom = controlDict.wordOr("startFrom", "startTime");
+            if (startFrom == "latestTime" || startFrom == "firstTime")
+            {
+                namespace fs = std::filesystem;
+                std::error_code ec;
+                double best = 0.0; std::string bestName;
+                for (const auto& e : fs::directory_iterator(caseDir, ec))
+                {
+                    if (!e.is_directory()) continue;
+                    const std::string nm = e.path().filename().string();
+                    char* end = nullptr; const double t = std::strtod(nm.c_str(), &end);
+                    if (end == nm.c_str() || *end != '\0') continue;   // not a pure number -> skip constant/system/*.orig
+                    if (!(fs::exists(e.path() / "U") || fs::exists(e.path() / "U.gz"))) continue;   // must be a field dir
+                    if (bestName.empty() || (startFrom == "latestTime" ? t > best : t < best)) { best = t; bestName = nm; }
+                }
+                if (!bestName.empty() && bestName != startStr)
+                {
+                    std::fprintf(stderr, "brae: startFrom %s -> starting from time '%s'\n", startFrom.c_str(), bestName.c_str());
+                    startStr = bestName;
+                }
+            }
+        }
         // OF `restore0Dir` convention (NOT a solver fallback): tutorials needing a mesh-prep step (snappyHexMesh /
         // setFields / changeDictionary, e.g. motorBike) ship the flow fields in <startTime>.orig, because
         // snappyHexMesh writes mesh-level fields (cellLevel/pointLevel/...) INTO <startTime>. OpenFOAM's Allrun copies
