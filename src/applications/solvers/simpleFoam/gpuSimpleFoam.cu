@@ -189,6 +189,7 @@ int main(int argc, char** argv)
             std::istringstream fsch(schemesText);
             std::string ln;
             bool foundDivU = false;   // require an EXPLICIT div(phi,U); brae does not resolve the divSchemes 'default'
+            bool warnedLeastSq = false, warnedCellMD = false;   // #14: warn-once on grad schemes brae approximates
             auto hasWord = [](const std::string& s, const std::string& w)   // whole-word match (so "uncorrected" != "corrected")
             {
                 for (std::size_t p = s.find(w); p != std::string::npos; p = s.find(w, p + 1))
@@ -265,6 +266,12 @@ int main(int argc, char** argv)
                     scalar kc;
                     if (std::sscanf(s, "%lf", &kc) == 1) ctl.gradULimitK = kc;
                 }
+                // #14: brae computes gradients via Gauss linear only. These are valid ALTERNATIVE discretisations
+                // (not wrong answers), so warn-once rather than fail -- the user should know brae is approximating.
+                if (!warnedLeastSq && ln.find("leastSquares") != std::string::npos)
+                { warnedLeastSq = true; std::fprintf(stderr, "brae WARNING: gradScheme 'leastSquares' is approximated as Gauss linear (differs on skewed meshes)\n"); }
+                if (!warnedCellMD && ln.find("cellMDLimited") != std::string::npos)
+                { warnedCellMD = true; std::fprintf(stderr, "brae WARNING: grad limiter 'cellMDLimited' is not applied (runs unlimited)\n"); }
                 if (std::getenv("BRAE_SCHEME_DEBUG") && ln.find("div(phi,") != std::string::npos) std::fprintf(stderr, "[scheme] %s\n", ln.c_str());
                 if (ln.find("div(phi,k)") != std::string::npos)
                 {
