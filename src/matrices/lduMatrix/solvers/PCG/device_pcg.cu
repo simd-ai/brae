@@ -8,6 +8,7 @@
 #include "device_halo.cuh"
 #include "device_reduce.cuh"   // DeviceReducer: on-stream NVSHMEM global reduction (replaces host MPI_Allreduce)
 #include "cf_pstream.cuh"
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 #include <map>
 #include <cmath>
@@ -352,12 +353,14 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
 
     // ---- iteration 0, host-driven: the loop's nIter == 0 path, verbatim (syncs 2 and 3 of 4) --------
     deviceDotInto(c.rA0, c.rA, s.rr.data());
-    bicgRhoSingK<<<1,1>>>(s.rr.data(), s.bd.data());
+    { scalar* rr = s.rr.data(); scalar* bd = s.bd.data();
+      pcudaParallelFor(1, 1, [=] __device__ () { bicgRhoSingK(rr, bd); }); }
     deviceCopy(c.pA, c.rA);
     applyPrecon(c.yA, c.pA);
     deviceAmul(sA, c.yA, c.AyA);
     deviceDotInto(c.rA0, c.AyA, s.r0Ay.data());
-    bicgAlphaK<<<1,1>>>(s.rr.data(), s.r0Ay.data(), s.alpha.data(), s.negAlpha.data(), s.bd.data());
+    { scalar* rr = s.rr.data(); scalar* r0Ay = s.r0Ay.data(); scalar* al = s.alpha.data(); scalar* negAl = s.negAlpha.data(); scalar* bd = s.bd.data();
+      pcudaParallelFor(1, 1, [=] __device__ () { bicgAlphaK(rr, r0Ay, al, negAl, bd); }); }
     deviceFusedSxpy(c.sA, c.rA, s.negAlpha.data(), c.AyA);
     deviceSumMagInto(c.sA, s.sNorm.data());
     bicgNormK<<<1,1>>>(s.sNorm.data(), c.gNormF.data(), c.gSN.data());              // |s|/nf on the device
@@ -372,7 +375,8 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
     deviceAmul(sA, c.zA, c.tA);
     deviceDotInto(c.tA, c.tA, s.tt.data());
     deviceDotInto(c.tA, c.sA, s.ts.data());
-    omegaK<<<1,1>>>(s.ts.data(), s.tt.data(), s.omega.data(), s.negOmega.data(), s.bd.data());
+    { scalar* ts = s.ts.data(); scalar* tt = s.tt.data(); scalar* om = s.omega.data(); scalar* negOm = s.negOmega.data(); scalar* bd = s.bd.data();
+      pcudaParallelFor(1, 1, [=] __device__ () { omegaK(ts, tt, om, negOm, bd); }); }
     deviceFusedAxpy2(psi, s.alpha.data(), c.yA, s.omega.data(), c.zA);
     deviceFusedSxpy(c.rA, c.sA, s.negOmega.data(), c.tA);
     deviceSumMagInto(c.rA, s.rNorm.data());
@@ -434,13 +438,17 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
         cudaCheck(cudaStreamBeginCaptureToGraph(cudaStreamPerThread, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal), "bicg capture A");
         deviceScalarCopy(s.rr.data(), s.rrOld.data());                                   // rA0rAold = rA0rA
         deviceDotInto(c.rA0, c.rA, s.rr.data());
-        bicgRhoSingK<<<1,1>>>(s.rr.data(), s.bd.data());
-        bicgBetaK<<<1,1>>>(s.rr.data(), s.rrOld.data(), s.alpha.data(), s.omega.data(), s.beta.data(), s.bd.data());
+        { scalar* rr = s.rr.data(); scalar* bd = s.bd.data();
+      pcudaParallelFor(1, 1, [=] __device__ () { bicgRhoSingK(rr, bd); }); }
+        { scalar* rr = s.rr.data(); scalar* rrOld = s.rrOld.data(); scalar* al = s.alpha.data();
+          scalar* om = s.omega.data(); scalar* beta = s.beta.data(); scalar* bd = s.bd.data();
+          pcudaParallelFor(1, 1, [=] __device__ () { bicgBetaK(rr, rrOld, al, om, beta, bd); }); }
         deviceFusedBicgP(c.rA, c.pA, c.AyA, s.beta.data(), s.negOmega.data());
         applyPrecon(c.yA, c.pA);
         deviceAmul(sA, c.yA, c.AyA);
         deviceDotInto(c.rA0, c.AyA, s.r0Ay.data());
-        bicgAlphaK<<<1,1>>>(s.rr.data(), s.r0Ay.data(), s.alpha.data(), s.negAlpha.data(), s.bd.data());
+        { scalar* rr = s.rr.data(); scalar* r0Ay = s.r0Ay.data(); scalar* al = s.alpha.data(); scalar* negAl = s.negAlpha.data(); scalar* bd = s.bd.data();
+      pcudaParallelFor(1, 1, [=] __device__ () { bicgAlphaK(rr, r0Ay, al, negAl, bd); }); }
         deviceFusedSxpy(c.sA, c.rA, s.negAlpha.data(), c.AyA);
         deviceSumMagInto(c.sA, s.sNorm.data());
         bicgNormK<<<1,1>>>(s.sNorm.data(), c.gNormF.data(), c.gSN.data());
@@ -471,7 +479,8 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
         deviceAmul(sA, c.zA, c.tA);
         deviceDotInto(c.tA, c.tA, s.tt.data());
         deviceDotInto(c.tA, c.sA, s.ts.data());
-        omegaK<<<1,1>>>(s.ts.data(), s.tt.data(), s.omega.data(), s.negOmega.data(), s.bd.data());
+        { scalar* ts = s.ts.data(); scalar* tt = s.tt.data(); scalar* om = s.omega.data(); scalar* negOm = s.negOmega.data(); scalar* bd = s.bd.data();
+      pcudaParallelFor(1, 1, [=] __device__ () { omegaK(ts, tt, om, negOm, bd); }); }
         deviceFusedAxpy2(psi, s.alpha.data(), c.yA, s.omega.data(), c.zA);
         deviceFusedSxpy(c.rA, c.sA, s.negOmega.data(), c.tA);
         deviceSumMagInto(c.rA, s.rNorm.data());
@@ -600,17 +609,26 @@ DeviceSolverPerf deviceJacobiBiCGStab(
         {
             if (nIter > 0) deviceScalarCopy(s.rr.data(), s.rrOld.data());   // rA0rAold = rA0rA
             deviceDotInto(rA0, rA, s.rr.data());                  // rA0rA = rA0 . rA
-            bicgRhoSingK<<<1,1>>>(s.rr.data(), s.bd.data());      // OF checkSingularity(mag(rA0rA)) -> flag (no host read)
+            {
+                scalar* rr = s.rr.data(); scalar* bd = s.bd.data();
+                pcudaParallelFor(1, 1, [=] __device__ () { bicgRhoSingK(rr, bd); });   // OF checkSingularity(mag(rA0rA)) -> flag (no host read)
+            }
             if (nIter == 0) deviceCopy(pA, rA);
             else
             {
-                bicgBetaK<<<1,1>>>(s.rr.data(), s.rrOld.data(), s.alpha.data(), s.omega.data(), s.beta.data(), s.bd.data());
+                scalar* rr = s.rr.data(); scalar* rrOld = s.rrOld.data(); scalar* al = s.alpha.data();
+                scalar* om = s.omega.data(); scalar* beta = s.beta.data(); scalar* bd = s.bd.data();
+                pcudaParallelFor(1, 1, [=] __device__ () { bicgBetaK(rr, rrOld, al, om, beta, bd); });
                 deviceFusedBicgP(rA, pA, AyA, s.beta.data(), s.negOmega.data());            // pA = rA + beta*(pA - omega*AyA)  [fused 3->1]
             }
             applyPrecon(yA, pA);
             deviceAmul(A, yA, AyA);          // yA = M^-1 pA; AyA = A yA
             deviceDotInto(rA0, AyA, s.r0Ay.data());
-            bicgAlphaK<<<1,1>>>(s.rr.data(), s.r0Ay.data(), s.alpha.data(), s.negAlpha.data(), s.bd.data());   // alpha = rA0rA/(rA0.AyA), guarded
+            {
+                scalar* rr = s.rr.data(); scalar* r0Ay = s.r0Ay.data(); scalar* al = s.alpha.data();
+                scalar* negAl = s.negAlpha.data(); scalar* bd = s.bd.data();
+                pcudaParallelFor(1, 1, [=] __device__ () { bicgAlphaK(rr, r0Ay, al, negAl, bd); });   // alpha = rA0rA/(rA0.AyA), guarded
+            }
             deviceFusedSxpy(sA, rA, s.negAlpha.data(), AyA);                            // sA = rA - alpha*AyA  [fused 2->1]
             const bool check = ((nIter + 1) % K == 0) || (nIter + 1 >= maxIter);        // read |s|/|r|/bd only on check iters
             if (check)                                          // mid-iter early-exit only when we read |s|
@@ -633,7 +651,11 @@ DeviceSolverPerf deviceJacobiBiCGStab(
             deviceAmul(A, zA, tA);           // zA = M^-1 sA; tA = A zA
             deviceDotInto(tA, tA, s.tt.data());
             deviceDotInto(tA, sA, s.ts.data());
-            omegaK<<<1,1>>>(s.ts.data(), s.tt.data(), s.omega.data(), s.negOmega.data(), s.bd.data());     // omega = tt>tiny ? ts/tt : 0 (+singularity flag)
+            {
+                scalar* ts = s.ts.data(); scalar* tt = s.tt.data(); scalar* om = s.omega.data();
+                scalar* negOm = s.negOmega.data(); scalar* bd = s.bd.data();
+                pcudaParallelFor(1, 1, [=] __device__ () { omegaK(ts, tt, om, negOm, bd); });     // omega = tt>tiny ? ts/tt : 0 (+singularity flag)
+            }
             deviceFusedAxpy2(psi, s.alpha.data(), yA, s.omega.data(), zA);               // psi += alpha*yA + omega*zA  [fused 2->1]
             deviceFusedSxpy(rA, sA, s.negOmega.data(), tA);                             // rA = sA - omega*tA  [fused 2->1]
             if (check)

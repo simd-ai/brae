@@ -3,6 +3,7 @@
 // per boundary face; the BC category (bcType) selects the formula. Split from device_boundary.cu (the per-iteration
 // flow-BC value updates are in device_boundary_flow.cu). Shared internal decls: device_boundary.cuh.
 #include "device_boundary.cuh"
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -12,7 +13,7 @@ constexpr int TPB = 256;
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 
 
-__global__
+__device__
 void bcValueKernel(
     int n,
     const label* __restrict__ type,
@@ -52,7 +53,7 @@ void bcValueKernel(
 
 // mixed-aware laplacian gradient weight: w = vf (fixedValue vf=1 -> gradIC=-dc; zeroGradient vf=0 -> 0). vf[i] is
 // read ONLY for type==5 (the ternary short-circuits), so a non-mixed boundary with no valueFraction is safe.
-__global__
+__device__
 void bcLaplacianKernel(
     int n,
     const label* __restrict__ type,
@@ -84,7 +85,7 @@ void bcLaplacianKernel(
 
 
 // same as bcLaplacianKernel but gamma is given per BOUNDARY FACE (e.g. nuEff = nu + nutkWallFunction at walls).
-__global__
+__device__
 void bcLaplacianFaceKernel(
     int n,
     const label* __restrict__ type,
@@ -111,7 +112,7 @@ void bcLaplacianFaceKernel(
 }
 
 
-__global__
+__device__
 void bcDivKernel(
     int n,
     const label* __restrict__ type,
@@ -151,7 +152,7 @@ void bcDivKernel(
 }
 
 
-__global__
+__device__
 void bcMatrixFluxKernel(
     int n,
     const label* __restrict__ fc,
@@ -169,12 +170,20 @@ void bcMatrixFluxKernel(
 void deviceBCValue(const DeviceBoundary& db, const DeviceBuffer<scalar>& internal, DeviceBuffer<scalar>& value, const int* skipIf)
 {
     value.resize(db.n);
-    bcValueKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.refValue.data(), db.valueFraction.data(),
-                                          db.faceCell.data(), internal.data(),
-                                          db.refGrad.size() ? db.refGrad.data() : nullptr,
-                                          db.deltaCoeffs.data(), value.data(), skipIf,
-                                          db.ioStored.size() ? db.ioStored.data() : nullptr,
-                                          db.ioFresh.size()  ? db.ioFresh.data()  : nullptr);
+    {
+        const int n = db.n;
+        const label *type = db.bcType.data(), *fc = db.faceCell.data();
+        const scalar *ref = db.refValue.data(), *vf = db.valueFraction.data(), *internald = internal.data();
+        const scalar *rgr = db.refGrad.size() ? db.refGrad.data() : nullptr;
+        const scalar *dcv = db.deltaCoeffs.data();
+        scalar* valued = value.data();
+        const int* skipIfd = skipIf;
+        const scalar* ioStoredd = db.ioStored.size() ? db.ioStored.data() : nullptr;
+        const label* ioFreshd = db.ioFresh.size() ? db.ioFresh.data() : nullptr;
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            bcValueKernel(n, type, ref, vf, fc, internald, rgr, dcv, valued, skipIfd, ioStoredd, ioFreshd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "bcValue");
 }
 
@@ -187,9 +196,17 @@ void deviceBCLaplacianCoeffsFace(
 {
     iC.resize(db.n);
     bC.resize(db.n);
-    bcLaplacianFaceKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.refValue.data(), db.valueFraction.data(),
-                                                  db.deltaCoeffs.data(), db.magSf.data(), gammaFace.data(),
-                                                  db.refGrad.size() ? db.refGrad.data() : nullptr, iC.data(), bC.data());
+    {
+        const int n = db.n;
+        const label* type = db.bcType.data();
+        const scalar *ref = db.refValue.data(), *vf = db.valueFraction.data(), *dc = db.deltaCoeffs.data();
+        const scalar *magSf = db.magSf.data(), *gammaFaced = gammaFace.data();
+        const scalar *rgr = db.refGrad.size() ? db.refGrad.data() : nullptr;
+        scalar *iCd = iC.data(), *bCd = bC.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            bcLaplacianFaceKernel(n, type, ref, vf, dc, magSf, gammaFaced, rgr, iCd, bCd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "bcLaplacianFace");
 }
 
@@ -202,10 +219,17 @@ void deviceBCLaplacianCoeffs(
 {
     iC.resize(db.n);
     bC.resize(db.n);
-    bcLaplacianKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.refValue.data(), db.valueFraction.data(),
-                                              db.deltaCoeffs.data(), db.magSf.data(), gammaCell.data(), db.faceCell.data(),
-                                              db.refGrad.size() ? db.refGrad.data() : nullptr,
-                                              iC.data(), bC.data());
+    {
+        const int n = db.n;
+        const label *type = db.bcType.data(), *fc = db.faceCell.data();
+        const scalar *ref = db.refValue.data(), *vf = db.valueFraction.data(), *dc = db.deltaCoeffs.data();
+        const scalar *magSf = db.magSf.data(), *gammaCelld = gammaCell.data();
+        const scalar *rgr = db.refGrad.size() ? db.refGrad.data() : nullptr;
+        scalar *iCd = iC.data(), *bCd = bC.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            bcLaplacianKernel(n, type, ref, vf, dc, magSf, gammaCelld, fc, rgr, iCd, bCd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "bcLaplacian");
 }
 
@@ -218,9 +242,17 @@ void deviceBCDivCoeffs(
 {
     iC.resize(db.n);
     bC.resize(db.n);
-    bcDivKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.refValue.data(), db.valueFraction.data(),
-                                        db.refGrad.size() ? db.refGrad.data() : nullptr, db.deltaCoeffs.data(),
-                                        phiB.data(), iC.data(), bC.data());
+    {
+        const int n = db.n;
+        const label* type = db.bcType.data();
+        const scalar *ref = db.refValue.data(), *vf = db.valueFraction.data();
+        const scalar *rgr = db.refGrad.size() ? db.refGrad.data() : nullptr;
+        const scalar *dcv = db.deltaCoeffs.data(), *phiBd = phiB.data();
+        scalar *iCd = iC.data(), *bCd = bC.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            bcDivKernel(n, type, ref, vf, rgr, dcv, phiBd, iCd, bCd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "bcDiv");
 }
 
@@ -233,7 +265,13 @@ void deviceMatrixFluxBoundary(
     DeviceBuffer<scalar>& fluxB)
 {
     fluxB.resize(db.n);
-    bcMatrixFluxKernel<<<nBlocks(db.n), TPB>>>(db.n, db.faceCell.data(), iC.data(), bC.data(), p.data(), fluxB.data());
+    {
+        const int n = db.n;
+        const label* fc = db.faceCell.data();
+        const scalar *iCd = iC.data(), *bCd = bC.data(), *pd = p.data();
+        scalar* fluxBd = fluxB.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { bcMatrixFluxKernel(n, fc, iCd, bCd, pd, fluxBd); });
+    }
     cudaCheck(cudaGetLastError(), "bcMatrixFlux");
 }
 

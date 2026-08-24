@@ -9,7 +9,9 @@
 #include "amg_kernels.cuh"        // mixed-precision V-cycle template kernels (zeroT/smoothT/residualT/gsColorT/restrictT/prolongT)
 #include "device_amg_internal.cuh"// shared AMG-core infra: LduF/lduF/cast_ (FP32 stack), Coloring/greedyColor/gsSweep, gsScaleInvK
 #include <cuda_runtime.h>
-#include <cooperative_groups.h>
+#ifndef BRAE_ACPP
+#include <cooperative_groups.h>   // unused in this file (no cg:: calls) but kept for the CUDA build as-is
+#endif
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -21,7 +23,9 @@
 #include <vector>
 #include <mutex>
 
+#ifndef BRAE_ACPP
 namespace cg = cooperative_groups;
+#endif
 
 namespace brae {
 
@@ -32,20 +36,24 @@ void amgCastFP32(AMGData& amg, const DeviceLduView& A);
 
 AMGGraphCache::~AMGGraphCache()
 {
+#ifndef BRAE_ACPP
     if (exec) cudaGraphExecDestroy(exec);
     if (graph) cudaGraphDestroy(graph);
+#endif
 }
 
 PCGGraphCache::~PCGGraphCache()
 {
+#ifndef BRAE_ACPP
     if (exec) cudaGraphExecDestroy(exec);
     if (graph) cudaGraphDestroy(graph);
+#endif
 }
 
 namespace {
 // General Galerkin RAP scatter (BRAE_AMG_SA): A_c[dst] += w * A_fine[src] over a precomputed triple list.
 // srcKind/dstKind: 0=diag 1=upper 2=lower. One thread per triple into the zeroed coarse LDU; the SA twin of galDiagK/galFaceK.
-__global__
+__device__
 void rapScatterK(
     int nT,
     const label* __restrict__ srcKind,
@@ -112,6 +120,45 @@ void galDiagGatherK(
         s += up[f] + lo[f];
     }
     cDiag[ci] = s;
+}
+__device__
+void galDiagK(
+    int nF,
+    const label* __restrict__ map,
+    const scalar* __restrict__ fineDiag,
+    scalar* __restrict__ cDiag)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c < nF) atomicAdd(&cDiag[map[c]], fineDiag[c]);
+}
+__device__
+void galFaceK(
+    int nFaces,
+    const label* __restrict__ fr,
+    const label* __restrict__ flip,
+    const scalar* __restrict__ up,
+    const scalar* __restrict__ lo,
+    scalar* __restrict__ cDiag,
+    scalar* __restrict__ cUp,
+    scalar* __restrict__ cLo)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nFaces) return;
+    const int cf = fr[f];
+    if (cf >= 0)
+    {
+        if (!flip[f])
+        {
+            atomicAdd(&cUp[cf], up[f]);
+            atomicAdd(&cLo[cf], lo[f]);
+        }
+        else
+        {
+            atomicAdd(&cUp[cf], lo[f]);
+            atomicAdd(&cLo[cf], up[f]);
+        }
+    }
+    else atomicAdd(&cDiag[-1-cf], up[f]+lo[f]);
 }
 __global__
 void galFaceGatherK(
@@ -1031,16 +1078,21 @@ void amgGalerkin(
             fl = A.level[k-1].cLower.data();
             nFaces = A.level[k-1].nCoarseFaces;
         }
+        zeroTLaunch<scalar>(L.nCoarse, L.cDiag.data());
+        zeroTLaunch<scalar>(L.nCoarseFaces, L.cUpper.data());
+        zeroTLaunch<scalar>(L.nCoarseFaces, L.cLower.data());
         if (A.saSmooth)                                          // general Galerkin A_c = P^T A P (precomputed RAP recipe)
         {
             // The SA path still SCATTERS, so it is still order-dependent. It is opt-in (BRAE_AMG_SA) and
             // off by default; leaving it as it was keeps this change to one behaviour at a time. The
             // determinism gate asserts the DEFAULT path, and the SA path is listed as a known gap.
-            zeroT<scalar><<<nBlocks(L.nCoarse),TPB>>>(L.nCoarse, L.cDiag.data());
-            zeroT<scalar><<<nBlocks(L.nCoarseFaces),TPB>>>(L.nCoarseFaces, L.cUpper.data());
-            zeroT<scalar><<<nBlocks(L.nCoarseFaces),TPB>>>(L.nCoarseFaces, L.cLower.data());
-            rapScatterK<<<nBlocks(L.nTriples),TPB>>>(L.nTriples, L.rapSrcKind.data(), L.rapSrcIdx.data(), L.rapW.data(),
-                L.rapDstKind.data(), L.rapDstIdx.data(), fd, fu, fl, L.cDiag.data(), L.cUpper.data(), L.cLower.data());
+            const int nT = L.nTriples;
+            const label* srcKind = L.rapSrcKind.data(); const label* srcIdx = L.rapSrcIdx.data();
+            const scalar* w = L.rapW.data();
+            const label* dstKind = L.rapDstKind.data(); const label* dstIdx = L.rapDstIdx.data();
+            scalar* cDiag = L.cDiag.data(); scalar* cUp = L.cUpper.data(); scalar* cLo = L.cLower.data();
+            pcudaParallelFor(nBlocks(nT), TPB, [=] __device__ () {
+                rapScatterK(nT, srcKind, srcIdx, w, dstKind, dstIdx, fd, fu, fl, cDiag, cUp, cLo); });
         }
         else       // injection Galerkin (default): fixed-order GATHER per coarse entity, no pre-zero needed
         {

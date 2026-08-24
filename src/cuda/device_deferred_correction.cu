@@ -3,6 +3,7 @@
 // (its vector-limited variant), and the LUST linear part (0.75*linear + 0.25*linearUpwind). Split from device_simple.cu
 // (the pressure-velocity coupling stays there). Shared decls: device_simple.cuh.
 #include "device_simple.cuh"
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -15,7 +16,7 @@ inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 // linearUpwind deferred correction for div(phi,U_i): the matrix stays pure upwind; the explicit correction
 // is the convective transport of grad(U_i)_upwind . (Cf - C_upwind). Per cell: Sum(+/-) phi_f * (grad_upwind . d).
 // (boundary faces use pure upwind -> no correction, as in OpenFOAM.) Caller does source -= corrSource.
-__global__
+__device__
 void linearUpwindCorrKernel(
     int nC,
     const label* __restrict__ ownerStart,
@@ -64,9 +65,19 @@ void deviceLinearUpwindCorr(
     DeviceBuffer<scalar>& corrSource)
 {
     corrSource.resize(dm.nCells);
-    linearUpwindCorrKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
-        dm.owner.data(), dm.nei.data(), phiInt.data(), gx.data(), gy.data(), gz.data(),
-        dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(), dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(), corrSource.data());
+    {
+        const int nC = dm.nCells;
+        const label *ownerStart = dm.ownerStart.data(), *losort = dm.losort.data(), *losortStart = dm.losortStart.data();
+        const label *own = dm.owner.data(), *nei = dm.nei.data();
+        const scalar *phid = phiInt.data(), *gxd = gx.data(), *gyd = gy.data(), *gzd = gz.data();
+        const scalar *dOwnX = dm.dOwnX.data(), *dOwnY = dm.dOwnY.data(), *dOwnZ = dm.dOwnZ.data();
+        const scalar *dNeiX = dm.dNeiX.data(), *dNeiY = dm.dNeiY.data(), *dNeiZ = dm.dNeiZ.data();
+        scalar* corrSourced = corrSource.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            linearUpwindCorrKernel(nC, ownerStart, losort, losortStart, own, nei, phid, gxd, gyd, gzd,
+                                   dOwnX, dOwnY, dOwnZ, dNeiX, dNeiY, dNeiZ, corrSourced);
+        });
+    }
     cudaCheck(cudaGetLastError(), "linearUpwindCorr");
 }
 
@@ -75,7 +86,7 @@ void deviceLinearUpwindCorr(
 // components at each face (hence a face kernel, not the per-component linearUpwindCorrKernel):
 //   sfCorr_i = (Cf-C_up).grad(U_i)_up ; maxCorr = (phi>0)?(1-w)(U[nei]-U[own]):w(U[own]-U[nei]) ;
 //   sfCorrs=|sfCorr|^2, maxCorrs=sfCorr.maxCorr ; if maxCorrs<0 -> 0 ; else if sfCorrs>maxCorrs -> *= maxCorrs/sfCorrs.
-__global__
+__device__
 void linearUpwindVFaceKernel(
     int nIf,
     const label* __restrict__ own,
@@ -141,7 +152,7 @@ void linearUpwindVFaceKernel(
     fcZ[f] = cz;
 }
 // div(phi * faceCorr) gather (per cell), same owner(+)/losort(-) sum as linearUpwindCorrKernel but on a precomputed face field.
-__global__
+__device__
 void divFaceCorrKernel(
     int nC,
     const label* __restrict__ ownerStart,
@@ -178,24 +189,40 @@ void deviceLinearUpwindVCorr(
 {
     const int nIf = dm.nInternalFaces;
     DeviceBuffer<scalar> fcX(nIf), fcY(nIf), fcZ(nIf);
-    linearUpwindVFaceKernel<<<nBlocks(nIf), TPB>>>(nIf, dm.owner.data(), dm.nei.data(), phiInt.data(), dm.w.data(),
-        dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(), dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
-        gUx[0].data(), gUy[0].data(), gUz[0].data(), gUx[1].data(), gUy[1].data(), gUz[1].data(),
-        gUx[2].data(), gUy[2].data(), gUz[2].data(), U0.data(), U1.data(), U2.data(),
-        fcX.data(), fcY.data(), fcZ.data());
+    const scalar* phid = phiInt.data();
+    scalar *fcXd = fcX.data(), *fcYd = fcY.data(), *fcZd = fcZ.data();
+    {
+        const label *own = dm.owner.data(), *nei = dm.nei.data();
+        const scalar *wd = dm.w.data();
+        const scalar *dOwnX = dm.dOwnX.data(), *dOwnY = dm.dOwnY.data(), *dOwnZ = dm.dOwnZ.data();
+        const scalar *dNeiX = dm.dNeiX.data(), *dNeiY = dm.dNeiY.data(), *dNeiZ = dm.dNeiZ.data();
+        const scalar *g0x=gUx[0].data(),*g0y=gUy[0].data(),*g0z=gUz[0].data();
+        const scalar *g1x=gUx[1].data(),*g1y=gUy[1].data(),*g1z=gUz[1].data();
+        const scalar *g2x=gUx[2].data(),*g2y=gUy[2].data(),*g2z=gUz[2].data();
+        const scalar *U0d=U0.data(),*U1d=U1.data(),*U2d=U2.data();
+        pcudaParallelFor(nBlocks(nIf), TPB, [=] __device__ () {
+            linearUpwindVFaceKernel(nIf, own, nei, phid, wd, dOwnX, dOwnY, dOwnZ, dNeiX, dNeiY, dNeiZ,
+                                    g0x, g0y, g0z, g1x, g1y, g1z, g2x, g2y, g2z, U0d, U1d, U2d, fcXd, fcYd, fcZd);
+        });
+    }
     corrX.resize(dm.nCells);
     corrY.resize(dm.nCells);
     corrZ.resize(dm.nCells);
-    divFaceCorrKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), phiInt.data(), fcX.data(), corrX.data());
-    divFaceCorrKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), phiInt.data(), fcY.data(), corrY.data());
-    divFaceCorrKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), phiInt.data(), fcZ.data(), corrZ.data());
+    {
+        const int nC = dm.nCells;
+        const label *ownerStart = dm.ownerStart.data(), *losort = dm.losort.data(), *losortStart = dm.losortStart.data();
+        scalar *corrXd = corrX.data(), *corrYd = corrY.data(), *corrZd = corrZ.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { divFaceCorrKernel(nC, ownerStart, losort, losortStart, phid, fcXd, corrXd); });
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { divFaceCorrKernel(nC, ownerStart, losort, losortStart, phid, fcYd, corrYd); });
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { divFaceCorrKernel(nC, ownerStart, losort, losortStart, phid, fcZd, corrZd); });
+    }
     cudaCheck(cudaGetLastError(), "linearUpwindVCorr");
 }
 
 // LUST linear-part deferred correction: div(phi*(linear_face - upwind_face)) = div(phi*(w-pos0)*(field[P]-field[N])).
 // Same divergence gather as linearUpwindCorrKernel. OF LUST = 0.75*linear + 0.25*linearUpwind, so the caller adds
 // 0.75*this + 0.25*linearUpwindCorr. w = owner linear weight (dm.w), pos0 = (phi>=0) = the upwind owner weight.
-__global__
+__device__
 void linearCorrKernel(
     int nC,
     const label* __restrict__ ownerStart,
@@ -233,8 +260,16 @@ void deviceLinearCorr(
     DeviceBuffer<scalar>& corrSource)
 {
     corrSource.resize(dm.nCells);
-    linearCorrKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
-        dm.owner.data(), dm.nei.data(), phiInt.data(), dm.w.data(), field.data(), corrSource.data());
+    {
+        const int nC = dm.nCells;
+        const label *ownerStart = dm.ownerStart.data(), *losort = dm.losort.data(), *losortStart = dm.losortStart.data();
+        const label *own = dm.owner.data(), *nei = dm.nei.data();
+        const scalar *phid = phiInt.data(), *wd = dm.w.data(), *fieldd = field.data();
+        scalar* corrSourced = corrSource.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            linearCorrKernel(nC, ownerStart, losort, losortStart, own, nei, phid, wd, fieldd, corrSourced);
+        });
+    }
     cudaCheck(cudaGetLastError(), "linearCorr");
 }
 

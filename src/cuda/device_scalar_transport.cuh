@@ -19,6 +19,7 @@
 #include "device_amg.cuh"         // deviceSymGaussSeidel
 #include "stage_dump.cuh"      // Phase 0 stage harness
 #include "device_ddt.cuh"         // ScalarDdt + deviceFvmDdtDiag/Source (transient turbulence)
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 #include <vector>
 #include <fstream>
@@ -101,7 +102,7 @@ void svGatherKernel(
     if (s != 0.0) source[c] += s;
 }
 // Zeroing pass: independent per face, no accumulation, so it needs no ordering guarantee of its own.
-__global__
+__device__
 void svZeroFaceKernel(
     int nIf,
     const label* __restrict__ own,
@@ -116,7 +117,7 @@ void svZeroFaceKernel(
 }
 
 
-__global__
+__device__
 void svBndKernel(
     int nB,
     const label* __restrict__ faceCell,
@@ -129,7 +130,7 @@ void svBndKernel(
 }
 
 
-__global__
+__device__
 void svCellKernel(
     int nC,
     const label* __restrict__ isW,
@@ -141,7 +142,7 @@ void svCellKernel(
     if (c < nC && isW[c]) source[c] = relaxedDiag[c] * eps0[c];
 }
 // shared turbulence-common kernels (effective diffusivity D + OF bound override); used by k/eps + k-omega.
-static __global__
+static __device__
 void depsKernel(int nC, const scalar* __restrict__ nut, scalar sigma, scalar nu, scalar* __restrict__ D)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -149,7 +150,7 @@ void depsKernel(int nC, const scalar* __restrict__ nut, scalar sigma, scalar nu,
 }
 
 
-static __global__
+static __device__
 // OF epsilonWallFunctionFvPatchScalarField::updateCoeffs(weights), epsilonWallFunction.C:586 --
 //     G[celli]       = (1 - w)*G[celli]       + w*G0[celli];
 //     epsilon[celli] = (1 - w)*epsilon[celli] + w*epsilon0[celli];
@@ -183,6 +184,24 @@ void overrideKernel(
 }
 } // anon (scaffold setValues kernels)
 
+// Shared by both setValues call sites below. A non-template free function deliberately: nvcc forbids an
+// extended __device__ lambda inside a function templated on a local lambda type (deviceSolveScalarTransport<Reaction>).
+inline void applySetValuesKernels(
+    const DeviceMesh& dm, int nC,
+    const label* __restrict__ isW, const scalar* __restrict__ val,
+    DeviceBuffer<scalar>& aU, DeviceBuffer<scalar>& aL, DeviceBuffer<scalar>& src,
+    DeviceBuffer<scalar>& aIC, DeviceBuffer<scalar>& aBC, DeviceBuffer<scalar>& aRD)
+{
+    const int nIf = dm.nInternalFaces, nB = dm.nBndFaces;
+    const label *own = dm.owner.data(), *nei = dm.nei.data(), *bndCell = dm.bndCell.data();
+    const label *ownerStart = dm.ownerStart.data(), *losort = dm.losort.data(), *losortStart = dm.losortStart.data();
+    scalar *aUd = aU.data(), *aLd = aL.data(), *srcd = src.data();
+    scalar *aICd = aIC.data(), *aBCd = aBC.data(), *aRDd = aRD.data();
+    svGatherKernel<<<nBlocks(nC), TPB>>>(nC, own, nei, ownerStart, losort, losortStart, isW, val, aUd, aLd, srcd);
+    pcudaParallelFor(nBlocks(nIf), TPB, [=] __device__ () { svZeroFaceKernel(nIf, own, nei, isW, aUd, aLd); });
+    pcudaParallelFor(nBlocks(nB), TPB, [=] __device__ () { svBndKernel(nB, bndCell, isW, aICd, aBCd); });
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { svCellKernel(nC, isW, aRDd, val, srcd); });
+}
 
 // One scalar-transport sub-step of a two-equation RAS correct(): assemble div(phi,f) - laplacian(D,f)
 // [- Sp(div(phi),f) if bounded], add the model reaction (diag+source via `reaction`), relax, optionally
@@ -451,22 +470,12 @@ void deviceSolveScalarTransport(
     }
     if (fvoSetMask && fvoSetVal)   // fvOptions scalarFixedValueConstraint (OF: before boundaryManipulate)
     {
-        svGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.owner.data(), dm.nei.data(), dm.ownerStart.data(),
-                                            dm.losort.data(), dm.losortStart.data(), fvoSetMask->data(), fvoSetVal->data(),
-                                            aU.data(), aL.data(), src.data());
-        svZeroFaceKernel<<<nBlocks(dm.nInternalFaces), TPB>>>(dm.nInternalFaces, dm.owner.data(), dm.nei.data(), fvoSetMask->data(), aU.data(), aL.data());
-        svBndKernel<<<nBlocks(dm.nBndFaces), TPB>>>(dm.nBndFaces, dm.bndCell.data(), fvoSetMask->data(), aIC.data(), aBC.data());
-        svCellKernel<<<nBlocks(nC), TPB>>>(nC, fvoSetMask->data(), aRD.data(), fvoSetVal->data(), src.data());
+        applySetValuesKernels(dm, nC, fvoSetMask->data(), fvoSetVal->data(), aU, aL, src, aIC, aBC, aRD);
         cudaCheck(cudaGetLastError(), "fvOptionsSetValues");
     }
         if (wall && eps0)   // eps near-wall setValues constraint (k has none)
     {
-        svGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.owner.data(), dm.nei.data(), dm.ownerStart.data(),
-                                            dm.losort.data(), dm.losortStart.data(), wall->isWallCell.data(), eps0->data(),
-                                            aU.data(), aL.data(), src.data());
-        svZeroFaceKernel<<<nBlocks(dm.nInternalFaces), TPB>>>(dm.nInternalFaces, dm.owner.data(), dm.nei.data(), wall->isWallCell.data(), aU.data(), aL.data());
-        svBndKernel<<<nBlocks(dm.nBndFaces), TPB>>>(dm.nBndFaces, dm.bndCell.data(), wall->isWallCell.data(), aIC.data(), aBC.data());
-        svCellKernel<<<nBlocks(nC), TPB>>>(nC, wall->isWallCell.data(), aRD.data(), eps0->data(), src.data());
+        applySetValuesKernels(dm, nC, wall->isWallCell.data(), eps0->data(), aU, aL, src, aIC, aBC, aRD);
         if (ami && ami->n) interfaceZeroWallIfCoeff(*ami, wall->isWallCell);   // wall/interface cells: don't perturb the fixed eps
         if (cyc && cyc->n) interfaceZeroWallIfCoeff(*cyc, wall->isWallCell);
         cudaCheck(cudaGetLastError(), "setValues");

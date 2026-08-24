@@ -705,6 +705,7 @@ void launchRollback(
 // first wait was a cudaMemcpy sync each). The spin is bounded: past two seconds it falls back to the
 // stream sync and, if the number is still wrong, throws -- a wedge is reported, not waited on. A
 // conditional WHILE graph would take the host out of the loop entirely; it is the next step (header).
+#ifndef BRAE_ACPP
 struct ResidualMailbox
 {
     scalar sum[COLOUR_GS_MAX_COMPONENTS];
@@ -775,6 +776,7 @@ void waitForSequence(
     // keeps the reads of sum[] and nf[] after the read of seq (the host is an aarch64 here).
     std::atomic_thread_fence(std::memory_order_acquire);
 }
+#endif // !BRAE_ACPP
 
 // The explicit residual pass for the active components: every block of the block table, so every
 // row of the permuted layout, with the partials in the colour launches' slots. The initial
@@ -1244,10 +1246,13 @@ void deviceColourGaussSeidelFused(
         return;
     }
 
+#ifndef BRAE_ACPP
     ResidualMailbox* mailboxDev = nullptr;
     ResidualMailbox* mailbox = residualMailbox(&mailboxDev);
     static unsigned long long mailboxSeq = 0;
+#endif
     scalar hRes[NC_MAX];
+    scalar hNf[NC_MAX];
     // The sums of the active components' residual partials, whichever launches wrote them,
     // published with the normFactors asked for; then the wait.
     auto publishResiduals = [&](
@@ -1255,6 +1260,19 @@ void deviceColourGaussSeidelFused(
         const ColourGSNormFactors& nfPtrs)
     {
         launchResidualSum(colouring, ops, slot);
+#ifdef BRAE_ACPP
+        // No mapped-pinned-memory host spin under PCUDA: two plain blocking D2H reads instead of one
+        // mailbox publish. Same values, one extra sync -- correctness-equivalent, not perf-equivalent.
+        cudaCheck(cudaMemcpyAsync(hRes, colouring.dRes.data(), (std::size_t)nComp*sizeof(scalar),
+                                  cudaMemcpyDeviceToHost, cudaStreamPerThread), "colourGaussSeidel residual read");
+        for (int k = 0; k < nComp; ++k)
+        {
+            if (nfPtrs.p[k])
+                cudaCheck(cudaMemcpyAsync(&hNf[k], nfPtrs.p[k], sizeof(scalar),
+                                          cudaMemcpyDeviceToHost, cudaStreamPerThread), "colourGaussSeidel normFactor read");
+        }
+        cudaCheck(cudaStreamSynchronize(cudaStreamPerThread), "colourGaussSeidel residual sync");
+#else
         const unsigned long long seq = ++mailboxSeq;
         publishResidualsKernel<<<1, 1, 0, cudaStreamPerThread>>>(colouring.dRes.data(), nComp, nfPtrs, mailboxDev, seq);
         cudaCheck(cudaGetLastError(), "colourGaussSeidel publish residuals");
@@ -1262,7 +1280,9 @@ void deviceColourGaussSeidelFused(
         for (int k = 0; k < nComp; ++k)
         {
             hRes[k] = reinterpret_cast<const volatile scalar*>(mailbox->sum)[k];
+            if (nfPtrs.p[k]) hNf[k] = reinterpret_cast<const volatile scalar*>(mailbox->nf)[k];
         }
+#endif
     };
 
     // smoothSolver.C:127-150: the initial residual, which also seeds the final one. No sweep has run,
@@ -1285,7 +1305,7 @@ void deviceColourGaussSeidelFused(
     {
         if (comps[k].dNormFactor)
         {
-            nf[k] = reinterpret_cast<const volatile scalar*>(mailbox->nf)[k];
+            nf[k] = hNf[k];
         }
         else
         {

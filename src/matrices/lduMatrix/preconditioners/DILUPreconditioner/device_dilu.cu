@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include "device_blas.cuh"
+#include "pcuda_compat.cuh"
 #include <algorithm>
 
 namespace brae {
@@ -16,7 +17,7 @@ inline int nBlk(int n) { return (n + TPB_D - 1) / TPB_D; }
 //     d[c] = diag[c] - sum_{f : nei[f] == c} upper[f]*lower[f]/d[owner[f]]
 // The faces are exactly losort[losortStart[c] .. losortStart[c+1]), in increasing face index -- the order
 // OF's sequential loop meets them in, so the summation order matches.
-__global__ void diluDiagLevelK(
+__device__ void diluDiagLevelK(
     const label* __restrict__ cells, int n,
     const label* __restrict__ owner, const label* __restrict__ losort, const label* __restrict__ losortStart,
     const scalar* __restrict__ upper, const scalar* __restrict__ lower,
@@ -72,6 +73,10 @@ __global__ void diluDiagLevelK(
 constexpr int TPB_SINGLE_D = 1024;
 constexpr int DILU_SINGLE_MEAN_MAX = 512;   // FP-2 measurement, see diluSingleBlock
 
+#ifndef BRAE_ACPP
+// __launch_bounds__ on a PCUDA __global__ kernel doesn't parse (the macro that expands __global__ into
+// SSCP annotations doesn't compose with it), and PCUDA has no equivalent hint. No correctness loss: the
+// per-level walk below is the fallback these kernels exist to beat, not a degraded path.
 __global__ void __launch_bounds__(1024) diluDiagSingleK(
     const label* __restrict__ off, int nLevels, const label* __restrict__ cells,
     const label* __restrict__ owner, const label* __restrict__ losort, const label* __restrict__ losortStart,
@@ -139,9 +144,14 @@ __global__ void __launch_bounds__(1024) diluBwdSingleK(
         __syncthreads();
     }
 }
+#endif // !BRAE_ACPP
 
 bool diluSingleBlock(const DeviceDilu& d)
 {
+#ifdef BRAE_ACPP
+    (void)d;
+    return false;   // the single-block kernels above are excluded from the ACPP build; always per-level
+#else
     static const bool forceLevels = std::getenv("BRAE_DILU_PER_LEVEL") != nullptr;
     // BRAE_DILU_SINGLE=1 takes the single-block walk whatever the mean width says. It exists for the
     // identity gate, which has to compare the two walks on a mesh the switch would send per-level --
@@ -168,15 +178,16 @@ bool diluSingleBlock(const DeviceDilu& d)
                     single ? "single-block" : "per-level", levels, d.maxLevelWidth, d.nCells / levels);
     }
     return single;
+#endif // !BRAE_ACPP
 }
 
-__global__ void reciprocalK(scalar* __restrict__ d, scalar* __restrict__ rD, int n)
+__device__ void reciprocalK(scalar* __restrict__ d, scalar* __restrict__ rD, int n)
 {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i < n) rD[i] = scalar(1)/d[i];
 }
 
-__global__ void diluInitK(const scalar* __restrict__ rD, const scalar* __restrict__ r,
+__device__ void diluInitK(const scalar* __restrict__ rD, const scalar* __restrict__ r,
                           scalar* __restrict__ w, int n)
 {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
@@ -185,7 +196,7 @@ __global__ void diluInitK(const scalar* __restrict__ rD, const scalar* __restric
 
 // Forward sweep, one level, as a gather over the faces where this cell is the UPPER cell:
 //     w[c] -= rD[c] * sum_{f : nei[f] == c} lower[f]*w[owner[f]]
-__global__ void diluFwdLevelK(
+__device__ void diluFwdLevelK(
     const label* __restrict__ cells, int n,
     const label* __restrict__ owner, const label* __restrict__ losort, const label* __restrict__ losortStart,
     const scalar* __restrict__ lower, const scalar* __restrict__ rD, scalar* __restrict__ w)
@@ -211,7 +222,7 @@ __global__ void diluFwdLevelK(
 //     w[c] -= rD[c] * sum_{f : owner[f] == c} upper[f]*w[nei[f]]
 // OF walks the faces in DECREASING index, so the gather runs the owner's face run in reverse to keep the
 // same summation order.
-__global__ void diluBwdLevelK(
+__device__ void diluBwdLevelK(
     const label* __restrict__ cells, int n,
     const label* __restrict__ nei, const label* __restrict__ ownerStart,
     const scalar* __restrict__ upper, const scalar* __restrict__ rD, scalar* __restrict__ w)
@@ -296,24 +307,39 @@ DeviceDilu buildDeviceDilu(const std::vector<label>& owner, const std::vector<la
 void diluUpdate(const DeviceLduView& A, DeviceDilu& d)
 {
     if (!d.valid) return;
+    const label *owner = A.owner, *losort = A.losort, *losortStart = A.losortStart;
+    const scalar *upper = A.upper, *lower = A.lower, *diag = A.diag;
+    scalar* workd = d.work.data();
+#ifndef BRAE_ACPP
     if (diluSingleBlock(d))                              // announces which walk, once per process
     {
         diluDiagSingleK<<<1, TPB_SINGLE_D>>>(d.fwdOffD.data(), d.levels(), d.fwdCells.data(),
                                              A.owner, A.losort, A.losortStart,
                                              A.upper, A.lower, A.diag, d.work.data());
-        reciprocalK<<<nBlk(d.nCells), TPB_D>>>(d.work.data(), d.rD.data(), d.nCells);
+        {
+            scalar* rDd = d.rD.data();
+            const int nC = d.nCells;
+            pcudaParallelFor(nBlk(nC), TPB_D, [=] __device__ () { reciprocalK(workd, rDd, nC); });
+        }
         cudaCheck(cudaGetLastError(), "dilu update");
         return;
     }
+#endif // !BRAE_ACPP
     for (int L = 0; L + 1 < (int)d.fwdOff.size(); ++L)
     {
         const int b = d.fwdOff[(std::size_t)L], e = d.fwdOff[(std::size_t)L+1];
         if (e <= b) continue;
-        diluDiagLevelK<<<nBlk(e-b), TPB_D>>>(d.fwdCells.data() + b, e - b,
-                                             A.owner, A.losort, A.losortStart,
-                                             A.upper, A.lower, A.diag, d.work.data());
+        const label* cells = d.fwdCells.data() + b;
+        const int n = e - b;
+        pcudaParallelFor(nBlk(n), TPB_D, [=] __device__ () {
+            diluDiagLevelK(cells, n, owner, losort, losortStart, upper, lower, diag, workd);
+        });
     }
-    reciprocalK<<<nBlk(d.nCells), TPB_D>>>(d.work.data(), d.rD.data(), d.nCells);
+    {
+        scalar* rDd = d.rD.data();
+        const int nC = d.nCells;
+        pcudaParallelFor(nBlk(nC), TPB_D, [=] __device__ () { reciprocalK(workd, rDd, nC); });
+    }
     cudaCheck(cudaGetLastError(), "dilu update");
 }
 
@@ -321,7 +347,14 @@ void diluApply(const DeviceLduView& A, const DeviceDilu& d, const DeviceBuffer<s
                DeviceBuffer<scalar>& w)
 {
     w.resize(d.nCells);
-    diluInitK<<<nBlk(d.nCells), TPB_D>>>(d.rD.data(), r.data(), w.data(), d.nCells);
+    const scalar* rDd = d.rD.data();
+    scalar* wd = w.data();
+    {
+        const scalar* rd = r.data();
+        const int nC = d.nCells;
+        pcudaParallelFor(nBlk(nC), TPB_D, [=] __device__ () { diluInitK(rDd, rd, wd, nC); });
+    }
+#ifndef BRAE_ACPP
     if (diluSingleBlock(d))
     {
         diluFwdSingleK<<<1, TPB_SINGLE_D>>>(d.fwdOffD.data(), d.levels(), d.fwdCells.data(),
@@ -333,21 +366,34 @@ void diluApply(const DeviceLduView& A, const DeviceDilu& d, const DeviceBuffer<s
         cudaCheck(cudaGetLastError(), "dilu apply");
         return;
     }
-    for (int L = 0; L + 1 < (int)d.fwdOff.size(); ++L)
+#endif // !BRAE_ACPP
     {
-        const int b = d.fwdOff[(std::size_t)L], e = d.fwdOff[(std::size_t)L+1];
-        if (e <= b) continue;
-        diluFwdLevelK<<<nBlk(e-b), TPB_D>>>(d.fwdCells.data() + b, e - b,
-                                            A.owner, A.losort, A.losortStart,
-                                            A.lower, d.rD.data(), w.data());
+        const label *owner = A.owner, *losort = A.losort, *losortStart = A.losortStart;
+        const scalar* lower = A.lower;
+        for (int L = 0; L + 1 < (int)d.fwdOff.size(); ++L)
+        {
+            const int b = d.fwdOff[(std::size_t)L], e = d.fwdOff[(std::size_t)L+1];
+            if (e <= b) continue;
+            const label* cells = d.fwdCells.data() + b;
+            const int n = e - b;
+            pcudaParallelFor(nBlk(n), TPB_D, [=] __device__ () {
+                diluFwdLevelK(cells, n, owner, losort, losortStart, lower, rDd, wd);
+            });
+        }
     }
-    for (int L = 0; L + 1 < (int)d.bwdOff.size(); ++L)
     {
-        const int b = d.bwdOff[(std::size_t)L], e = d.bwdOff[(std::size_t)L+1];
-        if (e <= b) continue;
-        diluBwdLevelK<<<nBlk(e-b), TPB_D>>>(d.bwdCells.data() + b, e - b,
-                                            A.nei, A.ownerStart,
-                                            A.upper, d.rD.data(), w.data());
+        const label *nei = A.nei, *ownerStart = A.ownerStart;
+        const scalar* upper = A.upper;
+        for (int L = 0; L + 1 < (int)d.bwdOff.size(); ++L)
+        {
+            const int b = d.bwdOff[(std::size_t)L], e = d.bwdOff[(std::size_t)L+1];
+            if (e <= b) continue;
+            const label* cells = d.bwdCells.data() + b;
+            const int n = e - b;
+            pcudaParallelFor(nBlk(n), TPB_D, [=] __device__ () {
+                diluBwdLevelK(cells, n, nei, ownerStart, upper, rDd, wd);
+            });
+        }
     }
     cudaCheck(cudaGetLastError(), "dilu apply");
 }

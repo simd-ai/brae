@@ -11,6 +11,7 @@
 #include "amg_kernels.cuh"         // zeroT/smoothT/residualT/restrictT/prolongT<T>
 #include "device_ldu.cuh"          // DeviceLduView / deviceAmul
 #include "device_blas.cuh"         // deviceCopy / deviceDot / deviceReciprocalV
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <limits>
@@ -63,7 +64,7 @@ void amgRefuseAsymmetric(
 }
 
 namespace {
-__global__
+__device__
 void prolongToK(
     int nF,
     const label* __restrict__ map,
@@ -75,7 +76,7 @@ void prolongToK(
 }
 // Smoothed-aggregation sparse prolongator apply (BRAE_AMG_SA): restrict = P^T, prolong = P.
 // restrict: rc += P^T r  (each fine cell f scatters val*r[f] into its coarse columns, atomically).
-__global__
+__device__
 void restrictSparseK(
     int nF,
     const label* __restrict__ rowPtr,
@@ -91,7 +92,7 @@ void restrictSparseK(
         atomicAdd(&rc[col[k]], val[k]*rf);
 }
 // prolong (ADD): x[f] += sum_k P[f][k]*xc[col], the smoothed-P twin of prolongT.
-__global__
+__device__
 void prolongSparseK(
     int nF,
     const label* __restrict__ rowPtr,
@@ -108,7 +109,7 @@ void prolongSparseK(
     x[f] += s;
 }
 // prolong (SET): pc[f] = sum_k P[f][k]*xc[col], the corrScaling line-search path (writes pc, not added yet).
-__global__
+__device__
 void prolongToSparseK(
     int nF,
     const label* __restrict__ rowPtr,
@@ -126,7 +127,7 @@ void prolongToSparseK(
 }
 
 // Energy-minimising coarse-correction scale (OF GAMG): alpha = (r . c)/(c . Ac), guarded since c.Ac = ||c||_A^2 >= 0.
-__global__
+__device__
 void scaleFactorK(
     const scalar* __restrict__ num,
     const scalar* __restrict__ den,
@@ -153,7 +154,7 @@ void vcycleAt(
 {
     const int n = Ag.nCells;
     if (asymmetric) amgRefuseAsymmetric(useChebyshev(), amg.corrScaling, amg.saSmooth);
-    zeroT<scalar><<<nBlocks(n),TPB>>>(n, xg.data());
+    zeroTLaunch<scalar>(n, xg.data());
     if (g == amg.nLevels())                                    // coarsest: approximate solve
     {
         // BRAE_NCOARSE_CG overrides the coarsest PCG iteration CAP (item 80: it converges, it does not count).
@@ -177,7 +178,7 @@ void vcycleAt(
         else for (int s = 0; s < NCOARSE; ++s)
         {
             deviceAmul(Ag, xg, amg.vAx[g]);
-            smoothT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
+            smoothTLaunch<scalar>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
         }
         return;
     }
@@ -187,46 +188,63 @@ void vcycleAt(
     else for (int s = 0; s < nPreSweeps(); ++s)
     {
         deviceAmul(Ag, xg, amg.vAx[g]);
-        smoothT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
+        smoothTLaunch<scalar>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
     }
     deviceAmul(Ag, xg, amg.vAx[g]);
-    residualT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), amg.vR[g].data());
+    residualTLaunch<scalar>(n, bg.data(), amg.vAx[g].data(), amg.vR[g].data());
     const int nc = amg.level[g].nCoarse;
     const AMGLevel& Lg = amg.level[g];
+    zeroTLaunch<scalar>(nc, amg.vB[g+1].data());
     if (amg.saSmooth)                                            // restrict rc = P^T r (sparse smoothed prolongator)
     {
         // Sparse-prolongator restriction still scatters; the SA path is opt-in and remains nondeterministic.
-        zeroT<scalar><<<nBlocks(nc),TPB>>>(nc, amg.vB[g+1].data());
-        restrictSparseK<<<nBlocks(n),TPB>>>(n, Lg.Prow.data(), Lg.Pcol.data(), Lg.Pval.data(), amg.vR[g].data(), amg.vB[g+1].data());
+        const label* rowPtr = Lg.Prow.data(); const label* col = Lg.Pcol.data(); const scalar* val = Lg.Pval.data();
+        const scalar* r = amg.vR[g].data(); scalar* rc = amg.vB[g+1].data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { restrictSparseK(n, rowPtr, col, val, r, rc); });
     }
     else                                          // fixed-order gather; writes rc, so no pre-zero needed
-        restrictGatherT<scalar><<<nBlocks(nc),TPB>>>(
-            nc, Lg.galCellStart.data(), Lg.galCellList.data(), amg.vR[g].data(), amg.vB[g+1].data());
+        restrictGatherTLaunch<scalar>(nc, Lg.galCellStart.data(), Lg.galCellList.data(), amg.vR[g].data(), amg.vB[g+1].data());
     vcycleAt(g+1, amg, amg.level[g].coarseView(), amg.vB[g+1], amg.vX[g+1], asymmetric);   // recurse to the next coarser grid
     if (amg.corrScaling)
     {
         // OF-GAMG-style scaled coarse correction: alpha = (r . A pc)/(A pc . A pc); xg += alpha*pc. The single
         // line-search per level fixes the magnitude of the prolongation. All scalars stay on the device
         // (deviceDotInto/scaleFactorK/AxpyDev) so it adds NO host sync and remains capturable into the V-cycle graph.
-        if (amg.saSmooth) prolongToSparseK<<<nBlocks(n),TPB>>>(n, Lg.Prow.data(), Lg.Pcol.data(), Lg.Pval.data(), amg.vX[g+1].data(), amg.vPc[g].data());
-        else              prolongToK<<<nBlocks(n),TPB>>>(n, Lg.map.data(), amg.vX[g+1].data(), amg.vPc[g].data());  // c = P*corr
+        if (amg.saSmooth)
+        {
+            const label* rowPtr = Lg.Prow.data(); const label* col = Lg.Pcol.data(); const scalar* val = Lg.Pval.data();
+            const scalar* xc = amg.vX[g+1].data(); scalar* pc = amg.vPc[g].data();
+            pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { prolongToSparseK(n, rowPtr, col, val, xc, pc); });
+        }
+        else
+        {
+            const label* map = Lg.map.data(); const scalar* xc = amg.vX[g+1].data(); scalar* pc = amg.vPc[g].data();
+            pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { prolongToK(n, map, xc, pc); });  // c = P*corr
+        }
         deviceAmul(Ag, amg.vPc[g], amg.vAx[g]);                                       // Ac
         deviceDotInto(amg.vR[g], amg.vPc[g], amg.sScNum.data());                      // r . c   (energy-min, OF GAMG)
         deviceDotInto(amg.vPc[g], amg.vAx[g], amg.sScDen.data());                     // c . Ac  (= ||c||_A^2 > 0)
-        scaleFactorK<<<1,1>>>(amg.sScNum.data(), amg.sScDen.data(), amg.sScAlpha.data());
+        {
+            const scalar* num = amg.sScNum.data(); const scalar* den = amg.sScDen.data(); scalar* out = amg.sScAlpha.data();
+            pcudaParallelFor(dim3(1), dim3(1), [=] __device__ () { scaleFactorK(num, den, out); });
+        }
         deviceAxpyDev(amg.sScAlpha.data(), amg.vPc[g], xg);                           // xg += alpha * c
     }
     else if (amg.saSmooth)
-        prolongSparseK<<<nBlocks(n),TPB>>>(n, Lg.Prow.data(), Lg.Pcol.data(), Lg.Pval.data(), amg.vX[g+1].data(), xg.data());
+    {
+        const label* rowPtr = Lg.Prow.data(); const label* col = Lg.Pcol.data(); const scalar* val = Lg.Pval.data();
+        const scalar* xc = amg.vX[g+1].data(); scalar* xgd = xg.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { prolongSparseK(n, rowPtr, col, val, xc, xgd); });
+    }
     else
-        prolongT<scalar><<<nBlocks(n),TPB>>>(n, Lg.map.data(), amg.vX[g+1].data(), xg.data());
+        prolongTLaunch<scalar>(n, Lg.map.data(), amg.vX[g+1].data(), xg.data());
     if (useChebyshev()) chebyshevSmooth(Ag, bg, xg, amg.vD[g], amg.vAx[g], amg.lambdaMax[g], chebDeg());  // post-smooth
     else if (asymmetric ? useTSGSAsym() : useTSGS()) twoStageGSSmooth(Ag, bg, xg, amg.vD[g], amg.vAx[g], nPostSweeps(), tsgsOrder(), false);  // twoStageGaussSeidel (bwd -> symmetric)
     else if (amg.gsSmooth) for (int s = 0; s < nPostSweeps(); ++s) gsSweep(Ag, bg, xg, amg.coloring[g], false);  // backward GS (symmetric V-cycle)
     else for (int s = 0; s < nPostSweeps(); ++s)
     {
         deviceAmul(Ag, xg, amg.vAx[g]);
-        smoothT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
+        smoothTLaunch<scalar>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
     }
 }
 
@@ -396,7 +414,7 @@ void amgCastFP32(
     for (int g=0; g<=G; ++g)
     {
         const DeviceLduView v = (g==0) ? A : amg.level[g-1].coarseView();
-        cast_<scalar,float><<<nBlocks(v.nCells),TPB>>>(v.nCells, v.diag, amg.fDiag[g].data());
+        castLaunch<scalar,float>(v.nCells, v.diag, amg.fDiag[g].data());
         if (v.nInternalFaces>0)
         {
             // A CSR grid takes its off-diagonals through the row layout instead, in ONE launch where
@@ -409,8 +427,8 @@ void amgCastFP32(
             }
             else
             {
-                cast_<scalar,float><<<nBlocks(v.nInternalFaces),TPB>>>(v.nInternalFaces, v.upper, amg.fUpper[g].data());
-                cast_<scalar,float><<<nBlocks(v.nInternalFaces),TPB>>>(v.nInternalFaces, v.lower, amg.fLower[g].data());
+                castLaunch<scalar,float>(v.nInternalFaces, v.upper, amg.fUpper[g].data());
+                castLaunch<scalar,float>(v.nInternalFaces, v.lower, amg.fLower[g].data());
             }
         }
     }
@@ -459,10 +477,10 @@ void vcycleAtF(
 {
     const int n = Ag.nCells;
     if (asymmetric) amgRefuseAsymmetric(useChebyshev(), amg.corrScaling, amg.saSmooth);
-    zeroT<float><<<nBlocks(n),TPB>>>(n, xg);
+    zeroTLaunch<float>(n, xg);
     if (g == amg.nLevels())                                    // coarsest: cast to FP64, exact FP64 solve, cast back
     {
-        cast_<float,scalar><<<nBlocks(n),TPB>>>(n, bg, amg.vB[g].data());
+        castLaunch<float,scalar>(n, bg, amg.vB[g].data());
         static const int ncoarseCG = [](){ const char* e=std::getenv("BRAE_NCOARSE_CG"); return (e&&std::atoi(e)>0)?std::atoi(e):NCOARSE_CG; }();
         // The asymmetric coarsest solve iterates to COARSE_REL_TOL and this is only its CAP.
         static const int ncoarseAsymCap = [](){ const char* e=std::getenv("BRAE_NCOARSE_CG"); return (e&&std::atoi(e)>0)?std::atoi(e):NCOARSE_ASYM_CAP; }();
@@ -472,35 +490,34 @@ void vcycleAtF(
         else if (n <= SB_CG_MAX) deviceCoarsePCG(topoG, amg.vB[g], amg.vX[g], ncoarseCG);
         else
         {
-            zeroT<scalar><<<nBlocks(n),TPB>>>(n, amg.vX[g].data());
+            zeroTLaunch<scalar>(n, amg.vX[g].data());
             for (int s=0;s<NCOARSE;++s)
             {
                 deviceAmul(topoG, amg.vX[g], amg.vAx[g]);
-                smoothT<scalar><<<nBlocks(n),TPB>>>(n, amg.vB[g].data(), amg.vAx[g].data(), topoG.diag, amg.vX[g].data());
+                smoothTLaunch<scalar>(n, amg.vB[g].data(), amg.vAx[g].data(), topoG.diag, amg.vX[g].data());
             }
         }
-        cast_<scalar,float><<<nBlocks(n),TPB>>>(n, amg.vX[g].data(), xg);
+        castLaunch<scalar,float>(n, amg.vX[g].data(), xg);
         return;
     }
     for (int s=0; s<NPRE; ++s)
     {
         amgSpmvF(amg, g, Ag, xg, amg.vAxF[g].data());
-        smoothT<float><<<nBlocks(n),TPB>>>(n, bg, amg.vAxF[g].data(), Ag.diag, xg);
+        smoothTLaunch<float>(n, bg, amg.vAxF[g].data(), Ag.diag, xg);
     }
     amgSpmvF(amg, g, Ag, xg, amg.vAxF[g].data());
-    residualT<float><<<nBlocks(n),TPB>>>(n, bg, amg.vAxF[g].data(), amg.vRF[g].data());
+    residualTLaunch<float>(n, bg, amg.vAxF[g].data(), amg.vRF[g].data());
     const AMGLevel& Lg = amg.level[g];
     const int nc = Lg.nCoarse;
-    restrictGatherT<float><<<nBlocks(nc),TPB>>>(
-        nc, Lg.galCellStart.data(), Lg.galCellList.data(), amg.vRF[g].data(), amg.vBF[g+1].data());
+    restrictGatherTLaunch<float>(nc, Lg.galCellStart.data(), Lg.galCellList.data(), amg.vRF[g].data(), amg.vBF[g+1].data());
     const DeviceLduView topoC = Lg.coarseView();
     const LduF Ac = lduF(topoC, amg.fDiag[g+1], amg.fUpper[g+1], amg.fLower[g+1]);
     vcycleAtF(g+1, amg, topoC, Ac, amg.vBF[g+1].data(), amg.vXF[g+1].data(), asymmetric);
-    prolongT<float><<<nBlocks(n),TPB>>>(n, Lg.map.data(), amg.vXF[g+1].data(), xg);
+    prolongTLaunch<float>(n, Lg.map.data(), amg.vXF[g+1].data(), xg);
     for (int s=0; s<NPOST; ++s)
     {
         amgSpmvF(amg, g, Ag, xg, amg.vAxF[g].data());
-        smoothT<float><<<nBlocks(n),TPB>>>(n, bg, amg.vAxF[g].data(), Ag.diag, xg);
+        smoothTLaunch<float>(n, bg, amg.vAxF[g].data(), Ag.diag, xg);
     }
 }
 
@@ -532,6 +549,10 @@ void amgPrepareFP32(AMGData& amg, const DeviceLduView& A)
 // design: the outer distributed matvec (deviceParallelAmul) supplies the interface, the local V-cycle need only
 // approximate the local block. amg must be built (buildAMG) and current (amgGalerkin gives it this step's coarse
 // operators). Runs the FP32 V-cycle when amgPrepareFP32 cast the matrices this solve, else the FP64 one.
+//
+// Its captureVcycle branch uses CUDA-graph capture, which ACPP has no equivalent for; device_pcg.cu includes
+// this header for the type but never calls this function, so nothing in the built tree references it there.
+#ifndef BRAE_ACPP
 void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
                     const DeviceBuffer<scalar>& r, DeviceBuffer<scalar>& z, bool captureVcycle)
 {
@@ -545,9 +566,9 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
         if (fp32)
         {
             const LduF A0 = lduF(A, amg.fDiag[0], amg.fUpper[0], amg.fLower[0]);         // grid-0 FP32 matrix view
-            cast_<scalar,float><<<nBlocks(nC),TPB>>>(nC, r.data(), amg.vBF[0].data());   // r -> FP32
+            castLaunch<scalar,float>(nC, r.data(), amg.vBF[0].data());   // r -> FP32
             vcycleAtF(0, amg, A, A0, amg.vBF[0].data(), amg.vXF[0].data());              // FP32 V-cycle
-            cast_<float,scalar><<<nBlocks(nC),TPB>>>(nC, amg.vXF[0].data(), z.data());   // FP32 -> z (FP64)
+            castLaunch<float,scalar>(nC, amg.vXF[0].data(), z.data());   // FP32 -> z (FP64)
         }
         else vcycleAt(0, amg, A, r, z);    // FP64 V-cycle
         return;
@@ -568,9 +589,9 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
             if (gcf.exec)  { cudaGraphExecDestroy(gcf.exec);  gcf.exec  = nullptr; }
             if (gcf.graph) { cudaGraphDestroy(gcf.graph);     gcf.graph = nullptr; }
             cudaCheck(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal), "amgF capture begin");
-            cast_<scalar,float><<<nBlocks(nC),TPB>>>(nC, amg.rA.data(), amg.vBF[0].data());
+            castLaunch<scalar,float>(nC, amg.rA.data(), amg.vBF[0].data());
             vcycleAtF(0, amg, A, A0, amg.vBF[0].data(), amg.vXF[0].data());
-            cast_<float,scalar><<<nBlocks(nC),TPB>>>(nC, amg.vXF[0].data(), amg.wA.data());
+            castLaunch<float,scalar>(nC, amg.vXF[0].data(), amg.wA.data());
             cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &gcf.graph), "amgF capture end");
             cudaCheck(cudaGraphInstantiate(&gcf.exec, gcf.graph, 0), "amgF graph instantiate");
             gcf.key = A.diag;
@@ -594,5 +615,6 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
     }
     deviceCopy(z, amg.wA);
 }
+#endif // !BRAE_ACPP
 
 } // namespace brae

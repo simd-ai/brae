@@ -5,6 +5,7 @@
 #include "stage_dump.cuh"
 #include "device_scalar_transport.cuh"
 #include "thermo_model.cuh"
+#include "pcuda_compat.cuh"
 #include <stdexcept>
 
 namespace brae {
@@ -18,7 +19,7 @@ namespace brae {
 // shifts he by a constant and a constant has zero gradient. A fixedGradient T wall whose gradient
 // was copied across UNSCALED would be wrong by a factor of Cpv, i.e. ~1005 for air -- so this is
 // the difference between a heat-flux wall and an essentially adiabatic one.
-__global__
+__device__
 void heBndFromTK(
     int n,
     ThermoCoeffs c,
@@ -45,7 +46,7 @@ void heBndFromTK(
 // The gradient coefficient is d(he)/dT = Cpv, evaluated AT THE FACE TEMPERATURE. For this liquid OF
 // sets CpMCv = 0, so Cpv is Cp(T_b) for both energy forms -- not the gas Cp - R (717.9 vs 4183, a
 // factor of 5.8 on any fixedGradient/heat-flux temperature patch).
-__global__
+__device__
 void heBndFromTLiquidK(
     int n,
     EnergyForm form,
@@ -93,30 +94,32 @@ void deviceEnergyBoundaryFromT(
                 "brae: converting a temperature boundary to energy for a liquid with "
                 "sensibleInternalEnergy needs the boundary pressure (e = h(T) - p/rho(T)); the caller "
                 "passed none, or one sized for a different patch set.");
-        heBndFromTLiquidK<<<nBlocks(dbT.n), TPB>>>(
-            dbT.n,
-            form,
-            (c.internalEnergy && pBnd) ? pBnd->data() : nullptr,
-            dbT.refValue.data(),
-            hasGrad ? dbT.refGrad.data() : nullptr,
-            dbHe.refValue.data(),
-            hasGrad ? dbHe.refGrad.data() : nullptr);
+        const int n = dbT.n;
+        const scalar* pBndD = (c.internalEnergy && pBnd) ? pBnd->data() : nullptr;
+        const scalar* refTD = dbT.refValue.data();
+        const scalar* gradTD = hasGrad ? dbT.refGrad.data() : nullptr;
+        scalar* refHeD = dbHe.refValue.data();
+        scalar* gradHeD = hasGrad ? dbHe.refGrad.data() : nullptr;
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            heBndFromTLiquidK(n, form, pBndD, refTD, gradTD, refHeD, gradHeD); });
         cudaCheck(cudaGetLastError(), "heBndFromTLiquid");
         return;
     }
-    heBndFromTK<<<nBlocks(dbT.n), TPB>>>(
-        dbT.n,
-        c,
-        dbT.refValue.data(),
-        hasGrad ? dbT.refGrad.data() : nullptr,
-        dbHe.refValue.data(),
-        hasGrad ? dbHe.refGrad.data() : nullptr);
+    {
+        const int n = dbT.n;
+        const scalar* refTD = dbT.refValue.data();
+        const scalar* gradTD = hasGrad ? dbT.refGrad.data() : nullptr;
+        scalar* refHeD = dbHe.refValue.data();
+        scalar* gradHeD = hasGrad ? dbHe.refGrad.data() : nullptr;
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            heBndFromTK(n, c, refTD, gradTD, refHeD, gradHeD); });
+    }
     cudaCheck(cudaGetLastError(), "heBndFromT");
 }
 
 // alphaEff = alpha + alphat. Separate kernel rather than folded into thermoUpdateK because alphat is
 // owned by the turbulence model, which runs after the thermo update, not before it.
-__global__
+__device__
 void alphaEffK(
     int n,
     scalar CpByCpv,
@@ -139,12 +142,11 @@ void deviceAlphaEff(
 {
     if (th.n == 0) return;
     alphaEff.resize(th.n);
-    alphaEffK<<<nBlocks(th.n), TPB>>>(
-        th.n,
-        thermoCpByCpv(c),
-        th.alpha.data(),
-        th.alphat.data(),
-        alphaEff.data());
+    const int n = th.n; const scalar cpByCpv = thermoCpByCpv(c);
+    const scalar* alphaD = th.alpha.data(); const scalar* alphatD = th.alphat.data();
+    scalar* alphaEffD = alphaEff.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+        alphaEffK(n, cpByCpv, alphaD, alphatD, alphaEffD); });
     cudaCheck(cudaGetLastError(), "alphaEff");
 }
 
@@ -156,7 +158,7 @@ void deviceAlphaEff(
 // (OF EEqn.H: he.name() == "e" ? fvc::div(phi, Ekp) : fvc::div(phi, K).) The p/rho term is the flow work
 // that enthalpy already carries internally and internal energy does not, so leaving it out of an "e" case
 // loses the pressure work entirely -- and still converges.
-__global__
+__device__
 void kineticEnergyK(
     int n,
     const scalar* __restrict__ Ux,
@@ -179,7 +181,7 @@ void kineticEnergyK(
 // limiter = clamp(twoByk*r, 0, 1) -- the SAME formula divLimitedFaceKernel uses for the implicit term, so
 // the explicit and implicit halves of the energy equation cannot end up on different schemes.
 // Hardcoding upwind here is worth ~6.6e-4 in T on a limitedLinear case whose implicit term is exact.
-__global__
+__device__
 void kineticFaceFluxK(
     int nF,
     const label* __restrict__ owner,
@@ -237,7 +239,7 @@ void kineticFaceFluxK(
 
 // Boundary half: += phi_b*K_b, and the "bounded" correction -K_c*(sum_f phi_f) that OF's
 // boundedConvectionScheme subtracts. Both scattered with atomics onto the adjacent cell.
-__global__
+__device__
 void kineticBoundaryK(
     int nB,
     const label* __restrict__ faceCell,
@@ -253,7 +255,7 @@ void kineticBoundaryK(
     atomicAdd(&sumPhi[c], phiBnd[i]);
 }
 
-__global__
+__device__
 void kineticBoundedK(
     int n,
     const scalar* __restrict__ K,
@@ -290,10 +292,13 @@ void deviceEnergyKineticSource(
     const int nF = dm.nInternalFaces;
     DeviceBuffer<scalar> K;
     K.resize(nC);
-    kineticEnergyK<<<nBlocks(nC), TPB>>>(nC, Ux.data(), Uy.data(), Uz.data(),
-                                         ekp ? p->data() : nullptr,
-                                         ekp ? rho->data() : nullptr,
-                                         K.data());
+    {
+        const scalar* Uxd = Ux.data(); const scalar* Uyd = Uy.data(); const scalar* Uzd = Uz.data();
+        const scalar* pd = ekp ? p->data() : nullptr; const scalar* rhod = ekp ? rho->data() : nullptr;
+        scalar* Kd = K.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            kineticEnergyK(nC, Uxd, Uyd, Uzd, pd, rhod, Kd); });
+    }
     cudaCheck(cudaGetLastError(), "kineticEnergy");
     if (stageDumpActive() && stageDumpFirstOnly("Ekp")) stageDump("stage_Ekp", K);
 
@@ -317,10 +322,13 @@ void deviceEnergyKineticSource(
         deviceBCValue(dbU.comp[1], Uy, uby);
         deviceBCValue(dbU.comp[2], Uz, ubz);
         Kb.resize(nB);
-        kineticEnergyK<<<nBlocks(nB), TPB>>>(nB, ubx.data(), uby.data(), ubz.data(),
-                                             ekpB ? pBndIn->data() : nullptr,
-                                             ekpB ? rhoBndIn->data() : nullptr,
-                                             Kb.data());
+        {
+            const scalar* ubxd = ubx.data(); const scalar* ubyd = uby.data(); const scalar* ubzd = ubz.data();
+            const scalar* pd = ekpB ? pBndIn->data() : nullptr; const scalar* rhod = ekpB ? rhoBndIn->data() : nullptr;
+            scalar* Kbd = Kb.data();
+            pcudaParallelFor(nBlocks(nB), TPB, [=] __device__ () {
+                kineticEnergyK(nB, ubxd, ubyd, ubzd, pd, rhod, Kbd); });
+        }
         cudaCheck(cudaGetLastError(), "kineticEnergyBnd");
     }
 
@@ -335,15 +343,21 @@ void deviceEnergyKineticSource(
     }
     DeviceBuffer<scalar> ffc;
     ffc.resize(nF);
-    kineticFaceFluxK<<<nBlocks(nF), TPB>>>(nF, dm.owner.data(), dm.nei.data(), phiInt.data(), K.data(),
-                                           limited ? dm.w.data() : nullptr,
-                                           linearUpwind ? 1 : 0,
-                                           (limited || linearUpwind) ? gx.data() : nullptr,
-                                           (limited || linearUpwind) ? gy.data() : nullptr,
-                                           (limited || linearUpwind) ? gz.data() : nullptr,
-                                           dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
-                                           dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
-                                           twoByk, ffc.data());
+    {
+        const label* own = dm.owner.data(); const label* nei = dm.nei.data();
+        const scalar* phiIntD = phiInt.data(); const scalar* Kd = K.data();
+        const scalar* cdwD = limited ? dm.w.data() : nullptr;
+        const int linUp = linearUpwind ? 1 : 0;
+        const scalar* gxd = (limited || linearUpwind) ? gx.data() : nullptr;
+        const scalar* gyd = (limited || linearUpwind) ? gy.data() : nullptr;
+        const scalar* gzd = (limited || linearUpwind) ? gz.data() : nullptr;
+        const scalar* dOwnX = dm.dOwnX.data(); const scalar* dOwnY = dm.dOwnY.data(); const scalar* dOwnZ = dm.dOwnZ.data();
+        const scalar* dNeiX = dm.dNeiX.data(); const scalar* dNeiY = dm.dNeiY.data(); const scalar* dNeiZ = dm.dNeiZ.data();
+        scalar* ffcd = ffc.data();
+        pcudaParallelFor(nBlocks(nF), TPB, [=] __device__ () {
+            kineticFaceFluxK(nF, own, nei, phiIntD, Kd, cdwD, linUp, gxd, gyd, gzd,
+                              dOwnX, dOwnY, dOwnZ, dNeiX, dNeiY, dNeiZ, twoByk, ffcd); });
+    }
     cudaCheck(cudaGetLastError(), "kineticFaceFlux");
     // deviceFaceDivSource returns MINUS V*div (it exists for the laplacian non-orth correction, which
     // wants that sign). Negate so src is +V*div(phi,K), matching the boundary half added below and the
@@ -359,8 +373,12 @@ void deviceEnergyKineticSource(
         DeviceBuffer<scalar> sumPhi;
         sumPhi.resize(nC);
         cudaCheck(cudaMemsetAsync(sumPhi.data(), 0, nC*sizeof(scalar), cudaStreamPerThread), "sumPhi zero");
-        kineticBoundaryK<<<nBlocks(nB), TPB>>>(nB, dbU.comp[0].faceCell.data(), phiBnd.data(), Kb.data(),
-                                               src.data(), sumPhi.data());
+        {
+            const label* faceCell = dbU.comp[0].faceCell.data(); const scalar* phiBndD = phiBnd.data();
+            const scalar* Kbd = Kb.data(); scalar* srcd = src.data(); scalar* sumPhid = sumPhi.data();
+            pcudaParallelFor(nBlocks(nB), TPB, [=] __device__ () {
+                kineticBoundaryK(nB, faceCell, phiBndD, Kbd, srcd, sumPhid); });
+        }
         cudaCheck(cudaGetLastError(), "kineticBoundary");
         // THE bounded CORRECTION IS PART OF THE SCHEME, NOT OF fvc::div. OF writes
         //     fvc::div(phi, Ekp)
@@ -380,7 +398,11 @@ void deviceEnergyKineticSource(
             DeviceBuffer<scalar> divPhiInt;
             deviceFaceDivSource(dm, phiInt, divPhiInt);
             deviceAxpy(-1.0, divPhiInt, sumPhi);
-            kineticBoundedK<<<nBlocks(nC), TPB>>>(nC, K.data(), sumPhi.data(), src.data());
+            {
+                const scalar* Kd = K.data(); const scalar* sumPhid = sumPhi.data(); scalar* srcd = src.data();
+                pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+                    kineticBoundedK(nC, Kd, sumPhid, srcd); });
+            }
             cudaCheck(cudaGetLastError(), "kineticBounded");
         }
     }
