@@ -1,5 +1,6 @@
 // Implicit transient ddt kernels -- see device_ddt.cuh for the OF-2412 correspondence + source refs.
 #include "device_ddt.cuh"
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -9,7 +10,7 @@ constexpr int TPB = 256;
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 
 // diag[i] += a*V[i]   with a = coefft*rDeltaT*rho.
-__global__ void ddtDiagKernel(const scalar* __restrict__ V, int n, scalar a, scalar* __restrict__ diag)
+__device__ void ddtDiagKernel(const scalar* __restrict__ V, int n, scalar a, scalar* __restrict__ diag)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -19,7 +20,7 @@ __global__ void ddtDiagKernel(const scalar* __restrict__ V, int n, scalar a, sca
 // backward/Euler : source[i] += V[i]*(b0*old[i] - b00*old2[i])   (b0=rDeltaT*rho*coefft0, b00=rDeltaT*rho*coefft00)
 // CrankNicolson  : source[i] += V[i]*(b0*old[i] + dc*ddt0[i])    (dc=rho*ocCoeff; the ddt0 term REPLACES the old2 term)
 // old2/ddt0 may be null (Euler / bootstrap): the corresponding term is then structurally absent.
-__global__ void ddtSourceKernel(
+__device__ void ddtSourceKernel(
     const scalar* __restrict__ V, int n, scalar b0, scalar b00, scalar dc,
     const scalar* __restrict__ old, const scalar* __restrict__ old2, const scalar* __restrict__ ddt0,
     scalar* __restrict__ source)
@@ -33,7 +34,7 @@ __global__ void ddtSourceKernel(
 }
 
 // CrankNicolson ddt0 recurrence: ddt0[i] = a*(old[i] - old2[i]) - oc*ddt0[i]   with a = coefft*rDeltaT0. In place.
-__global__ void ddt0UpdateKernel(
+__device__ void ddt0UpdateKernel(
     int n, scalar a, scalar oc, const scalar* __restrict__ old, const scalar* __restrict__ old2, scalar* __restrict__ ddt0)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -47,7 +48,8 @@ void deviceFvmDdtDiag(
 {
     if (!c.active) return;                                   // steadyState / bootstrap -> no-op
     const int n = static_cast<int>(V.size());
-    ddtDiagKernel<<<nBlocks(n), TPB>>>(V.data(), n, c.coefft * c.rDeltaT * rho, diag.data());
+    const scalar* Vd = V.data(); const scalar a = c.coefft * c.rDeltaT * rho; scalar* diagd = diag.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { ddtDiagKernel(Vd, n, a, diagd); });
     cudaCheck(cudaGetLastError(), "fvmDdtDiag");
 }
 
@@ -63,7 +65,10 @@ void deviceFvmDdtSource(
     const scalar dc  = rho * c.ocCoeff;                                    // CrankNicolson ddt0 weight
     const scalar* old2p = psiOld2.size() ? psiOld2.data() : nullptr;
     const scalar* ddt0p = (c.cn && ddt0 && ddt0->size()) ? ddt0->data() : nullptr;   // CN uses ddt0, NOT old2
-    ddtSourceKernel<<<nBlocks(n), TPB>>>(V.data(), n, b0, b00, dc, psiOld.data(), old2p, ddt0p, source.data());
+    const scalar* Vd = V.data(); const scalar* psiOldd = psiOld.data(); scalar* sourced = source.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+        ddtSourceKernel(Vd, n, b0, b00, dc, psiOldd, old2p, ddt0p, sourced);
+    });
     cudaCheck(cudaGetLastError(), "fvmDdtSource");
 }
 
@@ -72,7 +77,9 @@ void deviceFvmDdtUpdateDdt0(
 {
     if (!c.cn || !psiOld2.size() || !ddt0.size()) return;                  // steady/Euler/backward/first-step -> ddt0 untouched (stays 0)
     const int n = static_cast<int>(psiOld.size());
-    ddt0UpdateKernel<<<nBlocks(n), TPB>>>(n, c.coefft0dd * c.rDeltaT0, c.ocCoeff, psiOld.data(), psiOld2.data(), ddt0.data());
+    const scalar a = c.coefft0dd * c.rDeltaT0, oc = c.ocCoeff;
+    const scalar* psiOldd = psiOld.data(); const scalar* psiOld2d = psiOld2.data(); scalar* ddt0d = ddt0.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { ddt0UpdateKernel(n, a, oc, psiOldd, psiOld2d, ddt0d); });
     cudaCheck(cudaGetLastError(), "fvmDdtUpdateDdt0");
 }
 
@@ -105,7 +112,7 @@ __device__ __forceinline__ scalar ddtCorrFace(scalar phiOld, scalar fluxUold, sc
     return rAUf*coeff*rDeltaT*phiCorrEff;
 }
 
-__global__ void ddtCorrIntK(int nIf, const scalar* phiOld, const scalar* fluxUold, const scalar* rAUf,
+__device__ void ddtCorrIntK(int nIf, const scalar* phiOld, const scalar* fluxUold, const scalar* rAUf,
                             const scalar* phiCorrEff, scalar rDeltaT, scalar* out)
 {
     const int f = blockIdx.x*blockDim.x + threadIdx.x;
@@ -114,7 +121,7 @@ __global__ void ddtCorrIntK(int nIf, const scalar* phiOld, const scalar* fluxUol
     out[f] += ddtCorrFace(phiOld[f], fluxUold[f], eff, rAUf[f], rDeltaT);
 }
 
-__global__ void ddtCorrBndK(int nBf, const scalar* phiOld, const scalar* fluxUold, const scalar* rAUb,
+__device__ void ddtCorrBndK(int nBf, const scalar* phiOld, const scalar* fluxUold, const scalar* rAUb,
                             const scalar* mask, const scalar* phiCorrEff, scalar rDeltaT, scalar* out)
 {
     const int b = blockIdx.x*blockDim.x + threadIdx.x;
@@ -144,27 +151,31 @@ void deviceDdtCorrFlux(
     if (nIf > 0 && (int)phiOldInt.size() >= nIf && (int)fluxUoldInt.size() >= nIf
         && (int)rAUf.size() >= nIf && (int)outInt.size() >= nIf)
     {
-        ddtCorrIntK<<<nBlocks(nIf), TPB>>>(nIf, phiOldInt.data(), fluxUoldInt.data(), rAUf.data(),
-                                           (phiCorrEffInt && (int)phiCorrEffInt->size() >= nIf)
-                                               ? phiCorrEffInt->data() : nullptr,
-                                           rDeltaT, outInt.data());
+        const scalar* phiOldd = phiOldInt.data(); const scalar* fluxUoldd = fluxUoldInt.data(); const scalar* rAUfd = rAUf.data();
+        const scalar* eff = (phiCorrEffInt && (int)phiCorrEffInt->size() >= nIf) ? phiCorrEffInt->data() : nullptr;
+        scalar* outIntd = outInt.data();
+        pcudaParallelFor(nBlocks(nIf), TPB, [=] __device__ () {
+            ddtCorrIntK(nIf, phiOldd, fluxUoldd, rAUfd, eff, rDeltaT, outIntd);
+        });
         cudaCheck(cudaGetLastError(), "ddtCorrInt");
     }
     const int nBf = (int)outBnd.size();
     if (nBf > 0 && (int)phiOldBnd.size() >= nBf && (int)fluxUoldBnd.size() >= nBf
         && (int)rAUbnd.size() >= nBf && (int)coeffMask.size() >= nBf)
     {
-        ddtCorrBndK<<<nBlocks(nBf), TPB>>>(nBf, phiOldBnd.data(), fluxUoldBnd.data(), rAUbnd.data(),
-                                           coeffMask.data(),
-                                           (phiCorrEffBnd && (int)phiCorrEffBnd->size() >= nBf)
-                                               ? phiCorrEffBnd->data() : nullptr,
-                                           rDeltaT, outBnd.data());
+        const scalar* phiOldd = phiOldBnd.data(); const scalar* fluxUoldd = fluxUoldBnd.data(); const scalar* rAUbndd = rAUbnd.data();
+        const scalar* maskd = coeffMask.data();
+        const scalar* eff = (phiCorrEffBnd && (int)phiCorrEffBnd->size() >= nBf) ? phiCorrEffBnd->data() : nullptr;
+        scalar* outBndd = outBnd.data();
+        pcudaParallelFor(nBlocks(nBf), TPB, [=] __device__ () {
+            ddtCorrBndK(nBf, phiOldd, fluxUoldd, rAUbndd, maskd, eff, rDeltaT, outBndd);
+        });
         cudaCheck(cudaGetLastError(), "ddtCorrBnd");
     }
 }
 
 namespace {
-__global__ void correctUfK(int n, const label* __restrict__ idx,
+__device__ void correctUfK(int n, const label* __restrict__ idx,
                            const scalar* __restrict__ Sfx, const scalar* __restrict__ Sfy,
                            const scalar* __restrict__ Sfz, const scalar* __restrict__ magSf,
                            const scalar* __restrict__ phi,
@@ -181,7 +192,7 @@ __global__ void correctUfK(int n, const label* __restrict__ idx,
     ux[i] += nx*c;  uy[i] += ny*c;  uz[i] += nz*c;
 }
 
-__global__ void dotSfK(int n, const label* __restrict__ idx,
+__device__ void dotSfK(int n, const label* __restrict__ idx,
                        const scalar* __restrict__ Sfx, const scalar* __restrict__ Sfy,
                        const scalar* __restrict__ Sfz, const scalar* __restrict__ ux,
                        const scalar* __restrict__ uy, const scalar* __restrict__ uz,
@@ -201,15 +212,18 @@ void deviceCorrectUf(
     DeviceBuffer<scalar>& ufx, DeviceBuffer<scalar>& ufy, DeviceBuffer<scalar>& ufz)
 {
     if (n <= 0 || (int)phi.size() < n || (int)ufx.size() < n) return;
-    correctUfK<<<nBlocks(n), TPB>>>(n, faceIdx, Sfx.data(), Sfy.data(), Sfz.data(), magSf.data(),
-                                    phi.data(), ufx.data(), ufy.data(), ufz.data());
+    const scalar *Sfxd=Sfx.data(),*Sfyd=Sfy.data(),*Sfzd=Sfz.data(),*magSfd=magSf.data(),*phid=phi.data();
+    scalar *ufxd=ufx.data(),*ufyd=ufy.data(),*ufzd=ufz.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+        correctUfK(n, faceIdx, Sfxd, Sfyd, Sfzd, magSfd, phid, ufxd, ufyd, ufzd);
+    });
     cudaCheck(cudaGetLastError(), "correctUf");
 }
 
 namespace {
 // OF fvc::surfaceSum(mag(phi)) per cell: |phi| lands on the owner AND the neighbour of every internal
 // face, and on the owner of every boundary face.
-__global__
+__device__
 void surfSumMagIntK(int nIf, const label* __restrict__ own, const label* __restrict__ nei,
                     const scalar* __restrict__ phi, scalar* __restrict__ out)
 {
@@ -219,7 +233,7 @@ void surfSumMagIntK(int nIf, const label* __restrict__ own, const label* __restr
     atomicAdd(&out[own[f]], a);
     atomicAdd(&out[nei[f]], a);
 }
-__global__
+__device__
 void surfSumMagOwnK(int n, const label* __restrict__ own, const scalar* __restrict__ phi,
                     scalar* __restrict__ out)
 {
@@ -245,16 +259,19 @@ void deviceSurfaceSumMagPhi(
     DeviceBuffer<scalar>&       out)
 {
     out.copyFrom(std::vector<scalar>(static_cast<std::size_t>(dm.nCells), scalar(0)));
+    scalar* outd = out.data();
     if (dm.nInternalFaces > 0)
     {
-        surfSumMagIntK<<<nBlocks(dm.nInternalFaces), TPB>>>(dm.nInternalFaces, dm.owner.data(),
-                                                            dm.nei.data(), phiInt.data(), out.data());
+        const int nIf = dm.nInternalFaces;
+        const label *ownd = dm.owner.data(), *neid = dm.nei.data(); const scalar* phiIntd = phiInt.data();
+        pcudaParallelFor(nBlocks(nIf), TPB, [=] __device__ () { surfSumMagIntK(nIf, ownd, neid, phiIntd, outd); });
         cudaCheck(cudaGetLastError(), "surfSumMagInt");
     }
     if (dm.nBndFaces > 0 && (int)phiBnd.size() >= dm.nBndFaces)
     {
-        surfSumMagOwnK<<<nBlocks(dm.nBndFaces), TPB>>>(dm.nBndFaces, dm.bndCell.data(), phiBnd.data(),
-                                                       out.data());
+        const int nBf = dm.nBndFaces;
+        const label* bndCelld = dm.bndCell.data(); const scalar* phiBndd = phiBnd.data();
+        pcudaParallelFor(nBlocks(nBf), TPB, [=] __device__ () { surfSumMagOwnK(nBf, bndCelld, phiBndd, outd); });
         cudaCheck(cudaGetLastError(), "surfSumMagBnd");
     }
     auto addIface = [&](const DeviceBuffer<label>* own, const DeviceBuffer<scalar>* phi)
@@ -262,7 +279,8 @@ void deviceSurfaceSumMagPhi(
         if (!own || !phi) return;
         const int n = static_cast<int>(phi->size());
         if (n == 0 || (int)own->size() < n) return;
-        surfSumMagOwnK<<<nBlocks(n), TPB>>>(n, own->data(), phi->data(), out.data());
+        const label* ownd = own->data(); const scalar* phid = phi->data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { surfSumMagOwnK(n, ownd, phid, outd); });
         cudaCheck(cudaGetLastError(), "surfSumMagIface");
     };
     addIface(cycOwn, cycPhi);
@@ -278,8 +296,9 @@ void deviceDotSf(
 {
     out.resize(n);
     if (n <= 0 || (int)ufx.size() < n) return;
-    dotSfK<<<nBlocks(n), TPB>>>(n, faceIdx, Sfx.data(), Sfy.data(), Sfz.data(),
-                                ufx.data(), ufy.data(), ufz.data(), out.data());
+    const scalar *Sfxd=Sfx.data(),*Sfyd=Sfy.data(),*Sfzd=Sfz.data(),*ufxd=ufx.data(),*ufyd=ufy.data(),*ufzd=ufz.data();
+    scalar* outd = out.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { dotSfK(n, faceIdx, Sfxd, Sfyd, Sfzd, ufxd, ufyd, ufzd, outd); });
     cudaCheck(cudaGetLastError(), "dotSf");
 }
 

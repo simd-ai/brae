@@ -3,6 +3,7 @@
 // slip/symmetry, totalPressure, and the HbyA constraints at slip/mixed faces. Split from device_boundary.cu
 // (the BC matrix/flux contributions are in device_boundary_assembly.cu). Shared decls: device_boundary.cuh.
 #include "device_boundary.cuh"
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -14,7 +15,7 @@ inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 
 // inletOutlet/outletInlet updateCoeffs: valueFraction is BINARY from the flux sign. inletOutlet -> inflow
 // (phi<0) = fixedValue; outletInlet (freestreamPressure) -> the OPPOSITE: outflow (phi>=0) = fixedValue.
-__global__
+__device__
 void ioUpdateKernel(
     int n,
     const label* __restrict__ ioMask,
@@ -34,7 +35,7 @@ void ioUpdateKernel(
 // LOCAL adjacent-cell speed (OF uses the patch |U|; the cell value ~= it and avoids the vf circularity). Using the
 // freestream |Uinf| instead is fine at a true far field but mis-scales an outlet whose speed != |Uinf|. Continuous
 // in the flow angle (not a binary switch); at grazing faces (phi~0) vf->0.5 (the Robin midpoint OF uses).
-__global__
+__device__
 void mixedUpdateKernel(
     int n,
     const label* __restrict__ maskU,
@@ -89,7 +90,7 @@ void mixedUpdateKernel(
 
 // pressureInletOutletVelocity updateCoeffs (directionMixed): per piov face, outflow -> zeroGradient (bcType 0),
 // inflow -> fixedValue (bcType 1) with refValue = n*(n.U_cell) (the normal projection; tangential refValue 0).
-__global__
+__device__
 void piovUpdateKernel(
     int n,
     const label* __restrict__ piov,
@@ -130,7 +131,7 @@ void piovUpdateKernel(
 // slip/symmetry updateCoeffs (OF basicSymmetry, general normal): per symMask face, per component k set the mixed
 // valueFraction vf_k = |n_k| and ref_k = U_c[k] - sign(n_k)*(n.U_c). The cat-5 kernels then give valueIC_k = 1-|n_k|,
 // gradIC_k = -dc*|n_k|, value = U_c - n(n.U_c), OF's symmetry coeffs. sign(0)=0 -> tangential (n_k=0) is zeroGradient.
-__global__
+__device__
 void symUpdateKernel(
     int n,
     const label* __restrict__ sym,
@@ -167,7 +168,7 @@ void symUpdateKernel(
 // (tangential projection) -> phiHbyA_b = HbyA_b.Sf = |Sf|(HbyA_b.n) = 0. The cat-5 deviceBCValue blends `ref` (built
 // from U, not HbyA), which is NOT the HbyA projection on an angled wall, so override it here. (Axis-aligned already
 // gets 0 from ref_normal=0, so this is a no-op there.)
-__global__
+__device__
 void symHbyAKernel(
     int n,
     const label* __restrict__ sym,
@@ -194,7 +195,7 @@ void symHbyAKernel(
 
 
 // at mixed faces, overwrite the HbyA boundary value with the U boundary value (constrainHbyA at fixesValue patches).
-__global__
+__device__
 void selectMixedKernel(
     int n,
     const label* __restrict__ mask,
@@ -211,7 +212,7 @@ void selectMixedKernel(
 
 
 // at inletOutlet faces, put back the zero-gradient (extrapolated) HbyA -- see deviceExtrapolateIOHbyA.
-__global__
+__device__
 void selectIOKernel(
     int n,
     const label* __restrict__ ioMask,
@@ -236,7 +237,7 @@ void selectIOKernel(
 // m2/s2 and one in Pa. Passing rhoBnd = null gives the incompressible form, bit-identical to before.
 // (OF's third branch, the high-speed isentropic form with a named psi and gamma, is NOT implemented --
 // readThermoCoeffs-style refusal happens at load rather than silently running the low-speed form.)
-__global__
+__device__
 void tpUpdateKernel(
     int n,
     const label* __restrict__ tpMask,
@@ -264,7 +265,7 @@ void tpUpdateKernel(
 // avgU is a single patch-wide scalar, computed by the caller as -mdot/dot(rhoBnd, maskedMagSf) -- the
 // mask makes that dot product exactly OF's gSum over this patch. Faces outside the patch have mask 0
 // and are left untouched.
-__global__
+__device__
 void frUpdateKernel(
     int n,
     const scalar* __restrict__ mask,
@@ -293,17 +294,21 @@ void deviceUpdateFlowRateInlet(
 {
     const int n = dbU.comp[0].n;
     if (n == 0) return;
-    frUpdateKernel<<<nBlocks(n), TPB>>>(n, maskMagSf.data(), avgU, nx.data(), ny.data(), nz.data(),
-                                        dbU.comp[0].refValue.data(),
-                                        dbU.comp[1].refValue.data(),
-                                        dbU.comp[2].refValue.data());
+    const scalar* maskD = maskMagSf.data(); const scalar* nxd = nx.data(); const scalar* nyd = ny.data(); const scalar* nzd = nz.data();
+    scalar* r0 = dbU.comp[0].refValue.data(); scalar* r1 = dbU.comp[1].refValue.data(); scalar* r2 = dbU.comp[2].refValue.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+        frUpdateKernel(n, maskD, avgU, nxd, nyd, nzd, r0, r1, r2); });
     cudaCheck(cudaGetLastError(), "frUpdate");
 }
 
 void deviceUpdateInletOutlet(DeviceBoundary& db, const DeviceBuffer<scalar>& phiBnd)
 {
     if (db.n == 0) return;
-    ioUpdateKernel<<<nBlocks(db.n), TPB>>>(db.n, db.ioMask.data(), db.oioMask.data(), phiBnd.data(), db.bcType.data());
+    const int n = db.n;
+    const label* ioMask = db.ioMask.data(); const label* oioMask = db.oioMask.data();
+    const scalar* phiBd = phiBnd.data(); label* bcType = db.bcType.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+        ioUpdateKernel(n, ioMask, oioMask, phiBd, bcType); });
     cudaCheck(cudaGetLastError(), "ioUpdate");
 }
 
@@ -325,14 +330,19 @@ void deviceUpdateMixedFreestream(
     deviceBCValue(dbU.comp[0], Ux, ub0);
     deviceBCValue(dbU.comp[1], Uy, ub1);
     deviceBCValue(dbU.comp[2], Uz, ub2);
-    mixedUpdateKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].mixedMask.data(), dbP.mixedMask.data(), dbP.faceCell.data(),
-                                           phiBnd.data(), dbP.magSf.data(),
-                                           (rhoBnd && rhoBnd->size() == static_cast<std::size_t>(n)) ? rhoBnd->data() : nullptr,
-                                           Ux.data(), Uy.data(), Uz.data(),
-                                           ub0.data(), ub1.data(), ub2.data(),
-                                           dbU.nx.data(), dbU.ny.data(), dbU.nz.data(),
-                                           dbU.comp[0].valueFraction.data(), dbU.comp[1].valueFraction.data(),
-                                           dbU.comp[2].valueFraction.data(), dbP.valueFraction.data());
+    {
+        const label* maskU = dbU.comp[0].mixedMask.data(); const label* maskP = dbP.mixedMask.data();
+        const label* fc = dbP.faceCell.data(); const scalar* phiBd = phiBnd.data(); const scalar* magSf = dbP.magSf.data();
+        const scalar* rhoBndD = (rhoBnd && rhoBnd->size() == static_cast<std::size_t>(n)) ? rhoBnd->data() : nullptr;
+        const scalar* Uxd = Ux.data(); const scalar* Uyd = Uy.data(); const scalar* Uzd = Uz.data();
+        const scalar* ub0d = ub0.data(); const scalar* ub1d = ub1.data(); const scalar* ub2d = ub2.data();
+        const scalar* nxd = dbU.nx.data(); const scalar* nyd = dbU.ny.data(); const scalar* nzd = dbU.nz.data();
+        scalar* vfU0 = dbU.comp[0].valueFraction.data(); scalar* vfU1 = dbU.comp[1].valueFraction.data();
+        scalar* vfU2 = dbU.comp[2].valueFraction.data(); scalar* vfP = dbP.valueFraction.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            mixedUpdateKernel(n, maskU, maskP, fc, phiBd, magSf, rhoBndD, Uxd, Uyd, Uzd,
+                               ub0d, ub1d, ub2d, nxd, nyd, nzd, vfU0, vfU1, vfU2, vfP); });
+    }
     cudaCheck(cudaGetLastError(), "mixedUpdate");
 }
 
@@ -346,10 +356,16 @@ void deviceUpdatePressureInletOutletVelocity(
 {
     const int n = dbU.n;
     if (n == 0) return;
-    piovUpdateKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].piovMask.data(), dbU.comp[0].faceCell.data(), phiBnd.data(),
-                                          dbU.nx.data(), dbU.ny.data(), dbU.nz.data(), Ux.data(), Uy.data(), Uz.data(),
-                                          dbU.comp[0].bcType.data(), dbU.comp[1].bcType.data(), dbU.comp[2].bcType.data(),
-                                          dbU.comp[0].refValue.data(), dbU.comp[1].refValue.data(), dbU.comp[2].refValue.data());
+    {
+        const label* piov = dbU.comp[0].piovMask.data(); const label* fc = dbU.comp[0].faceCell.data();
+        const scalar* phiBd = phiBnd.data();
+        const scalar* nxd = dbU.nx.data(); const scalar* nyd = dbU.ny.data(); const scalar* nzd = dbU.nz.data();
+        const scalar* Uxd = Ux.data(); const scalar* Uyd = Uy.data(); const scalar* Uzd = Uz.data();
+        label* ty0 = dbU.comp[0].bcType.data(); label* ty1 = dbU.comp[1].bcType.data(); label* ty2 = dbU.comp[2].bcType.data();
+        scalar* r0 = dbU.comp[0].refValue.data(); scalar* r1 = dbU.comp[1].refValue.data(); scalar* r2 = dbU.comp[2].refValue.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            piovUpdateKernel(n, piov, fc, phiBd, nxd, nyd, nzd, Uxd, Uyd, Uzd, ty0, ty1, ty2, r0, r1, r2); });
+    }
     cudaCheck(cudaGetLastError(), "piovUpdate");
 }
 
@@ -362,7 +378,7 @@ void deviceUpdatePressureInletOutletVelocity(
 // d_k is exactly zero on the AXIS component -- the rotation leaves it alone -- and there the blend is
 // already pure zeroGradient, which equals target_k, so ref_k is multiplied by zero and left at zero
 // rather than divided by it.
-__global__
+__device__
 void wedgeUpdateKernel(
     int n,
     const label* __restrict__ wdg,
@@ -397,13 +413,16 @@ void deviceUpdateWedge(DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& Ux
 {
     const int n = dbU.n;
     if (n == 0 || dbU.comp[0].wedgeMask.size() == 0) return;
-    wedgeUpdateKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].wedgeMask.data(), dbU.comp[0].faceCell.data(),
-                                           dbU.comp[0].wedgeT.data(),
-                                           dbU.comp[0].valueFraction.data(), dbU.comp[1].valueFraction.data(),
-                                           dbU.comp[2].valueFraction.data(),
-                                           Ux.data(), Uy.data(), Uz.data(),
-                                           dbU.comp[0].refValue.data(), dbU.comp[1].refValue.data(),
-                                           dbU.comp[2].refValue.data());
+    {
+        const label* wdg = dbU.comp[0].wedgeMask.data(); const label* fc = dbU.comp[0].faceCell.data();
+        const scalar* T = dbU.comp[0].wedgeT.data();
+        const scalar* vf0 = dbU.comp[0].valueFraction.data(); const scalar* vf1 = dbU.comp[1].valueFraction.data();
+        const scalar* vf2 = dbU.comp[2].valueFraction.data();
+        const scalar* Uxd = Ux.data(); const scalar* Uyd = Uy.data(); const scalar* Uzd = Uz.data();
+        scalar* r0 = dbU.comp[0].refValue.data(); scalar* r1 = dbU.comp[1].refValue.data(); scalar* r2 = dbU.comp[2].refValue.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            wedgeUpdateKernel(n, wdg, fc, T, vf0, vf1, vf2, Uxd, Uyd, Uzd, r0, r1, r2); });
+    }
     cudaCheck(cudaGetLastError(), "updateWedge");
 }
 
@@ -416,7 +435,7 @@ namespace {
 // through the wedge plane is then identically zero. Evaluating HbyA through U's refValue instead leaves a
 // residual (faceT & U_c) - (faceT & HbyA_c) on every wedge face, which on movingCone's 3800 of them was a
 // net leak the pressure equation answered with a fictitious inflow at the open end.
-__global__
+__device__
 void wedgeFaceValueKernel(
     int n,
     const label* __restrict__ wdg,
@@ -447,9 +466,14 @@ void deviceWedgeFaceValue(
 {
     const int n = dbU.n;
     if (n == 0 || dbU.comp[0].wedgeMask.size() == 0) return;
-    wedgeFaceValueKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].wedgeMask.data(), dbU.comp[0].faceCell.data(),
-                                              dbU.comp[0].wedgeT.data(), fx.data(), fy.data(), fz.data(),
-                                              bx.data(), by.data(), bz.data());
+    {
+        const label* wdg = dbU.comp[0].wedgeMask.data(); const label* fc = dbU.comp[0].faceCell.data();
+        const scalar* T = dbU.comp[0].wedgeT.data();
+        const scalar* fxd = fx.data(); const scalar* fyd = fy.data(); const scalar* fzd = fz.data();
+        scalar* bxd = bx.data(); scalar* byd = by.data(); scalar* bzd = bz.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            wedgeFaceValueKernel(n, wdg, fc, T, fxd, fyd, fzd, bxd, byd, bzd); });
+    }
     cudaCheck(cudaGetLastError(), "wedgeFaceValue");
 }
 
@@ -459,7 +483,7 @@ namespace {
 // adjustPhi mask, which is already !fixesValue() over the same face order -- so the faces to overwrite
 // are exactly the zeros. Kept as its own kernel rather than folded into the flux computation: the
 // unmasked faces must keep the flux the Sf&Uf remap just gave them.
-__global__
+__device__
 void selectFixedFluxKernel(int n, const label* __restrict__ adjustable,
                            const scalar* __restrict__ phiFixed, scalar* __restrict__ phiB)
 {
@@ -475,7 +499,11 @@ void deviceSelectFixedFlux(const DeviceBuffer<label>& adjustable,
 {
     const int n = static_cast<int>(phiB.size());
     if (n == 0 || static_cast<int>(adjustable.size()) != n || static_cast<int>(phiFixed.size()) != n) return;
-    selectFixedFluxKernel<<<nBlocks(n), TPB>>>(n, adjustable.data(), phiFixed.data(), phiB.data());
+    {
+        const label* adjustableD = adjustable.data(); const scalar* phiFixedD = phiFixed.data(); scalar* phiBd = phiB.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            selectFixedFluxKernel(n, adjustableD, phiFixedD, phiBd); });
+    }
     cudaCheck(cudaGetLastError(), "selectFixedFlux");
 }
 
@@ -488,10 +516,15 @@ void deviceUpdateSymmetry(
 {
     const int n = dbU.n;
     if (n == 0) return;
-    symUpdateKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].symMask.data(), dbU.comp[0].faceCell.data(),
-                                         dbU.nx.data(), dbU.ny.data(), dbU.nz.data(), Ux.data(), Uy.data(), Uz.data(),
-                                         dbU.comp[0].valueFraction.data(), dbU.comp[1].valueFraction.data(), dbU.comp[2].valueFraction.data(),
-                                         dbU.comp[0].refValue.data(), dbU.comp[1].refValue.data(), dbU.comp[2].refValue.data());
+    {
+        const label* sym = dbU.comp[0].symMask.data(); const label* fc = dbU.comp[0].faceCell.data();
+        const scalar* nxd = dbU.nx.data(); const scalar* nyd = dbU.ny.data(); const scalar* nzd = dbU.nz.data();
+        const scalar* Uxd = Ux.data(); const scalar* Uyd = Uy.data(); const scalar* Uzd = Uz.data();
+        scalar* vf0 = dbU.comp[0].valueFraction.data(); scalar* vf1 = dbU.comp[1].valueFraction.data(); scalar* vf2 = dbU.comp[2].valueFraction.data();
+        scalar* r0 = dbU.comp[0].refValue.data(); scalar* r1 = dbU.comp[1].refValue.data(); scalar* r2 = dbU.comp[2].refValue.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            symUpdateKernel(n, sym, fc, nxd, nyd, nzd, Uxd, Uyd, Uzd, vf0, vf1, vf2, r0, r1, r2); });
+    }
     cudaCheck(cudaGetLastError(), "symUpdate");
 }
 
@@ -507,9 +540,14 @@ void deviceConstrainSymmetryHbyA(
 {
     const int n = dbU.n;
     if (n == 0) return;
-    symHbyAKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].symMask.data(), dbU.comp[0].faceCell.data(),
-                                       dbU.nx.data(), dbU.ny.data(), dbU.nz.data(), Hx.data(), Hy.data(), Hz.data(),
-                                       hbx.data(), hby.data(), hbz.data());
+    {
+        const label* sym = dbU.comp[0].symMask.data(); const label* fc = dbU.comp[0].faceCell.data();
+        const scalar* nxd = dbU.nx.data(); const scalar* nyd = dbU.ny.data(); const scalar* nzd = dbU.nz.data();
+        const scalar* Hxd = Hx.data(); const scalar* Hyd = Hy.data(); const scalar* Hzd = Hz.data();
+        scalar* hbxd = hbx.data(); scalar* hbyd = hby.data(); scalar* hbzd = hbz.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            symHbyAKernel(n, sym, fc, nxd, nyd, nzd, Hxd, Hyd, Hzd, hbxd, hbyd, hbzd); });
+    }
     cudaCheck(cudaGetLastError(), "constrainSymmetryHbyA");
 }
 
@@ -525,8 +563,13 @@ void deviceExtrapolateIOHbyA(
 {
     const int n = dbU.n;
     if (n == 0) return;
-    selectIOKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].ioMask.data(), extx.data(), exty.data(), extz.data(),
-                                        hbx.data(), hby.data(), hbz.data());
+    {
+        const label* ioMask = dbU.comp[0].ioMask.data();
+        const scalar* extxd = extx.data(); const scalar* extyd = exty.data(); const scalar* extzd = extz.data();
+        scalar* hbxd = hbx.data(); scalar* hbyd = hby.data(); scalar* hbzd = hbz.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            selectIOKernel(n, ioMask, extxd, extyd, extzd, hbxd, hbyd, hbzd); });
+    }
     cudaCheck(cudaGetLastError(), "extrapolateIOHbyA");
 }
 
@@ -546,8 +589,13 @@ void deviceConstrainMixedHbyA(
     deviceBCValue(dbU.comp[0], Ux, ubx);
     deviceBCValue(dbU.comp[1], Uy, uby);
     deviceBCValue(dbU.comp[2], Uz, ubz);
-    selectMixedKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].mixedMask.data(), ubx.data(), uby.data(), ubz.data(),
-                                           hbx.data(), hby.data(), hbz.data());
+    {
+        const label* mask = dbU.comp[0].mixedMask.data();
+        const scalar* ubxd = ubx.data(); const scalar* ubyd = uby.data(); const scalar* ubzd = ubz.data();
+        scalar* hbxd = hbx.data(); scalar* hbyd = hby.data(); scalar* hbzd = hbz.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            selectMixedKernel(n, mask, ubxd, ubyd, ubzd, hbxd, hbyd, hbzd); });
+    }
     cudaCheck(cudaGetLastError(), "constrainMixedHbyA");
 }
 
@@ -556,7 +604,7 @@ namespace {
 // patchInternalField for EVERY boundary face: out[i] = cellField[faceCell[i]]. OF's
 // fvPatchField::patchInternalField(). Small (nBndFaces), so a caller can pull it to the host and do a
 // patch-wide reduction there without moving the whole cell field.
-__global__
+__device__
 void gatherPatchInternalKernel(int n, const label* __restrict__ faceCell,
                                const scalar* __restrict__ cellField, scalar* __restrict__ out)
 {
@@ -570,7 +618,12 @@ void deviceGatherPatchInternal(const DeviceBoundary& db, const DeviceBuffer<scal
 {
     out.resize(db.n);
     if (db.n == 0) return;
-    gatherPatchInternalKernel<<<nBlocks(db.n), TPB>>>(db.n, db.faceCell.data(), cellField.data(), out.data());
+    {
+        const int n = db.n;
+        const label* fc = db.faceCell.data(); const scalar* cellFieldD = cellField.data(); scalar* outd = out.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            gatherPatchInternalKernel(n, fc, cellFieldD, outd); });
+    }
     cudaCheck(cudaGetLastError(), "gatherPatchInternal");
 }
 
@@ -584,10 +637,15 @@ void deviceUpdateTotalPressure(
     const DeviceBuffer<scalar>* rhoBnd)
 {
     if (db.n == 0) return;
-    tpUpdateKernel<<<nBlocks(db.n), TPB>>>(db.n, db.tpMask.data(), db.p0.data(), phiB.data(), Uxb.data(),
-                                           Uyb.data(), Uzb.data(),
-                                           (rhoBnd && rhoBnd->size() == static_cast<std::size_t>(db.n)) ? rhoBnd->data() : nullptr,
-                                           db.refValue.data());
+    {
+        const int n = db.n;
+        const label* tpMask = db.tpMask.data(); const scalar* p0 = db.p0.data(); const scalar* phiBd = phiB.data();
+        const scalar* Uxbd = Uxb.data(); const scalar* Uybd = Uyb.data(); const scalar* Uzbd = Uzb.data();
+        const scalar* rhoBndD = (rhoBnd && rhoBnd->size() == static_cast<std::size_t>(n)) ? rhoBnd->data() : nullptr;
+        scalar* refValueD = db.refValue.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            tpUpdateKernel(n, tpMask, p0, phiBd, Uxbd, Uybd, Uzbd, rhoBndD, refValueD); });
+    }
     cudaCheck(cudaGetLastError(), "tpUpdate");
 }
 
@@ -597,7 +655,7 @@ namespace brae {
 namespace {
 
 // turbulentIntensityKineticEnergyInlet: refValue = 1.5*I^2*|Up|^2, from the CURRENT boundary U.
-__global__
+__device__
 void tkeInletKernel(
     int n,
     const label* __restrict__ mask,
@@ -615,7 +673,7 @@ void tkeInletKernel(
 
 // turbulentMixingLength{DissipationRate,Frequency}Inlet, from the CURRENT boundary k.
 //   epsilon: (Cmu^0.75/L)*k^1.5      omega: sqrt(k)/(Cmu^0.25*L)
-__global__
+__device__
 void mixingLengthInletKernel(
     int n,
     const label* __restrict__ mask,      // 1 = epsilon, 2 = omega
@@ -647,9 +705,13 @@ void deviceUpdateTurbulentInletK(
 {
     const int n = dbK.n;
     if (!n || !mask.size()) return;
-    tkeInletKernel<<<nBlocks(n), TPB>>>(n, mask.data(), intensity.data(),
-                                        dbU.comp[0].refValue.data(), dbU.comp[1].refValue.data(),
-                                        dbU.comp[2].refValue.data(), dbK.refValue.data());
+    {
+        const label* maskD = mask.data(); const scalar* intensityD = intensity.data();
+        const scalar* r0 = dbU.comp[0].refValue.data(); const scalar* r1 = dbU.comp[1].refValue.data();
+        const scalar* r2 = dbU.comp[2].refValue.data(); scalar* kRefD = dbK.refValue.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            tkeInletKernel(n, maskD, intensityD, r0, r1, r2, kRefD); });
+    }
     cudaCheck(cudaGetLastError(), "tkeInlet");
 }
 
@@ -662,9 +724,13 @@ void deviceUpdateTurbulentInletSecond(
 {
     const int n = dbSecond.n;
     if (!n || !mask.size()) return;
-    mixingLengthInletKernel<<<nBlocks(n), TPB>>>(n, mask.data(), len.data(), dbK.refValue.data(),
-                                                 pow(Cmu, scalar(0.75)), pow(Cmu, scalar(0.25)),
-                                                 dbSecond.refValue.data());
+    {
+        const label* maskD = mask.data(); const scalar* lenD = len.data(); const scalar* kRefD = dbK.refValue.data();
+        const scalar cmu75 = pow(Cmu, scalar(0.75)); const scalar cmu25 = pow(Cmu, scalar(0.25));
+        scalar* sRefD = dbSecond.refValue.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            mixingLengthInletKernel(n, maskD, lenD, kRefD, cmu75, cmu25, sRefD); });
+    }
     cudaCheck(cudaGetLastError(), "mixingLengthInlet");
 }
 

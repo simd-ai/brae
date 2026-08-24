@@ -15,6 +15,7 @@
 #include "device_ldu.cuh"     // DeviceLduView
 #include "device_buffer.cuh"  // DeviceBuffer
 #include "device_amg_detail.cuh"  // nBlocks / TPB (for the inline FP32 matvec launch)
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 #include <vector>
 
@@ -64,14 +65,24 @@ inline LduF lduF(const DeviceLduView& t, const DeviceBuffer<float>& d,
 }
 // cast_<scalar,float> = FP64->FP32 (down), cast_<float,scalar> = FP32->FP64 (up).
 template <class S, class D>
-__global__
+__device__
 void cast_(int n, const S* __restrict__ s, D* __restrict__ d)
 {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i < n) d[i] = (D)s[i];
 }
+template <class S, class D>
+inline void castLaunch(int n, const S* s, D* d)
+{
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { cast_<S,D>(n, s, d); });
+}
+template <class S, class D>
+inline void castLaunch(int n, const S* s, D* d, cudaStream_t stream)
+{
+    pcudaParallelFor(nBlocks(n), TPB, size_t(0), stream, [=] __device__ () { cast_<S,D>(n, s, d); });
+}
 // FP32 SpMV: Apsi = A psi (shared FP64 topology + FP32 values). Used by the FP32 V-cycle and the FP32 GS solver.
-static __global__
+static __device__
 void amulFK(int nC, const float* __restrict__ diag, const float* __restrict__ upper, const float* __restrict__ lower,
            const label* __restrict__ nei, const label* __restrict__ owner, const label* __restrict__ ownerStart,
            const label* __restrict__ losort, const label* __restrict__ losortStart,
@@ -91,14 +102,22 @@ void amulFK(int nC, const float* __restrict__ diag, const float* __restrict__ up
 }
 inline void amulF(const LduF& A, const float* x, float* y)
 {
-    amulFK<<<nBlocks(A.nCells),TPB>>>(A.nCells, A.diag, A.upper, A.lower, A.nei, A.owner,
-                                      A.ownerStart, A.losort, A.losortStart, x, y);
+    const int nC = A.nCells;
+    const float* diag = A.diag; const float* upper = A.upper; const float* lower = A.lower;
+    const label* nei = A.nei; const label* owner = A.owner; const label* ownerStart = A.ownerStart;
+    const label* losort = A.losort; const label* losortStart = A.losortStart;
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+        amulFK(nC, diag, upper, lower, nei, owner, ownerStart, losort, losortStart, x, y); });
 }
 // finalRes = sumMag(r) / normFactor -- residual normalisation on-device; shared by the GS solver + AMG-PCG drivers.
-static __global__
+static __device__
 void gsScaleInvK(scalar* a, const scalar* b)
 {
     if (threadIdx.x==0 && blockIdx.x==0) *a = (*a) / (*b);
+}
+inline void gsScaleInvLaunch(scalar* a, const scalar* b, cudaStream_t stream)
+{
+    pcudaParallelFor(dim3(1), dim3(1), size_t(0), stream, [=] __device__ () { gsScaleInvK(a, b); });
 }
 
 } // namespace brae

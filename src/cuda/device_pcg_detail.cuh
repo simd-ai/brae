@@ -13,7 +13,7 @@ namespace brae {
 // breakdown D2H reads). The guarded recurrence stays NaN-safe between checks; for a NON-breakdown solve nothing trips
 // (rho/omega stay >> VSMALL until convergence breaks first) so the iteration is bit-identical to the host-guarded form.
 constexpr scalar BICG_VSMALL = 1e-300;   // = OF solveScalar VSMALL (SolverPerformance.C checkSingularity: mag(x) < vsmall_)
-static __global__
+static __device__
 void omegaK(
     const scalar* __restrict__ ts,
     const scalar* __restrict__ tt,
@@ -30,7 +30,7 @@ void omegaK(
         if (fabs(o) < BICG_VSMALL) *bd = 1.0;            // OF: checkSingularity(mag(omega)) (guards next-iter beta)
     }
 }
-static __global__
+static __device__
 void bicgBetaK(
     const scalar* __restrict__ rr,
     const scalar* __restrict__ rrOld,
@@ -47,14 +47,14 @@ void bicgBetaK(
         if (!ok) *bd = 1.0;
     }
 }
-static __global__
+static __device__
 void bicgRhoSingK(
     const scalar* __restrict__ rr,
     scalar* __restrict__ bd)
 {
     if (threadIdx.x==0 && blockIdx.x==0 && fabs(*rr) < BICG_VSMALL) *bd = 1.0;   // OF: checkSingularity(mag(rA0rA))
 }
-static __global__
+static __device__
 void bicgAlphaK(
     const scalar* __restrict__ rr,
     const scalar* __restrict__ r0Ay,

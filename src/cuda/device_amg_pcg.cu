@@ -25,10 +25,25 @@ void vcycleAt(int g, AMGData& amg, const DeviceLduView& Ag, const DeviceBuffer<s
 void vcycleAtF(int g, AMGData& amg, const DeviceLduView& topoG, const LduF& Ag, const float* bg, float* xg);
 void amgCastFP32(AMGData& amg, const DeviceLduView& A);
 
+#ifdef BRAE_ACPP
+// No CUDA-graph capture under ACPP, so applyPrecond() always takes the direct-launch path. Warn once if a
+// case actually asked for captureVcycle, so the request isn't silently dropped.
+static void warnAcppNoGraphCapture(bool requested)
+{
+    static bool warned = false;
+    if (requested && !warned)
+    {
+        warned = true;
+        std::fprintf(stderr, "brae: captureVcycle requested but unavailable in the ACPP build (no CUDA-graph "
+                              "capture); using direct per-iteration V-cycle launches instead\n");
+    }
+}
+#endif
+
 namespace {
 // Flexible-CG beta (Polak-Ribiere+): beta = max(0, (z.r_new - z.r_old)/rho_old), guarded division. Robust for the
 // nonlinear scaled V-cycle preconditioner; reduces to Fletcher-Reeves when the precond is linear (z.r_old == 0).
-__global__
+__device__
 void flexBetaK(
     const scalar* __restrict__ zrNew,
     const scalar* __restrict__ zrOld,
@@ -56,7 +71,7 @@ void flexBetaK(
 // (the V-cycle graph already keys on A.diag), so no matrix copy is needed; the graph references A, psi, amg.rA/wA and
 // the cache's persistent pA/Ax directly. Non-corrScaling only (flexible-CG falls back to the host loop); normFactor
 // is a device-resident scalar.
-__global__
+__device__
 void pcgSetCondK(
     cudaGraphConditionalHandle h,
     const scalar* res,
@@ -114,9 +129,9 @@ static DeviceSolverPerf deviceAMGPCGGraph(
     {
         if (fp32)
         {
-            cast_<scalar,float><<<nBlocks(nC),TPB>>>(nC, rA.data(), amg.vBF[0].data());
+            castLaunch<scalar,float>(nC, rA.data(), amg.vBF[0].data());
             vcycleAtF(0, amg, A, A0, amg.vBF[0].data(), amg.vXF[0].data());
-            cast_<float,scalar><<<nBlocks(nC),TPB>>>(nC, amg.vXF[0].data(), wA.data());
+            castLaunch<float,scalar>(nC, amg.vXF[0].data(), wA.data());
         }
         else vcycleAt(0, amg, A, rA, wA);
     };
@@ -126,7 +141,7 @@ static DeviceSolverPerf deviceAMGPCGGraph(
     deviceAxpy(-1.0, c.Ax, rA);
     DeviceSolverPerf perf;
     deviceSumMagInto(rA, c.sInit.data());
-    gsScaleInvK<<<1,1,0,cudaStreamPerThread>>>(c.sInit.data(), c.sNormF.data());
+    gsScaleInvLaunch(c.sInit.data(), c.sNormF.data(), cudaStreamPerThread);
     scalar initRes;
     cudaCheck(cudaMemcpyAsync(&initRes, c.sInit.data(), sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "pcg init D2H");
     cudaStreamSynchronize(cudaStreamPerThread);
@@ -148,7 +163,7 @@ static DeviceSolverPerf deviceAMGPCGGraph(
     deviceAxpyDev(dAlpha, c.pA, psi);
     deviceAxpyDev(dNegAlpha, wA, rA);
     deviceSumMagInto(rA, c.sRes.data());
-    gsScaleInvK<<<1,1,0,cudaStreamPerThread>>>(c.sRes.data(), c.sNormF.data());
+    gsScaleInvLaunch(c.sRes.data(), c.sNormF.data(), cudaStreamPerThread);
     scalar res1;
     cudaCheck(cudaMemcpyAsync(&res1, c.sRes.data(), sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "pcg it0 D2H");
     cudaStreamSynchronize(cudaStreamPerThread);
@@ -194,8 +209,14 @@ static DeviceSolverPerf deviceAMGPCGGraph(
         deviceAxpyDev(dAlpha, c.pA, psi);
         deviceAxpyDev(dNegAlpha, wA, rA);
         deviceSumMagInto(rA, c.sRes.data());
-        gsScaleInvK<<<1,1,0,cudaStreamPerThread>>>(c.sRes.data(), c.sNormF.data());   // normalized residual
-        pcgSetCondK<<<1,1,0,cudaStreamPerThread>>>(c.handle, c.sRes.data(), tol, c.sInit.data(), relTol, c.sIter.data(), maxIter-1, minIter-1);   // -1: iteration 0 ran outside the loop
+        gsScaleInvLaunch(c.sRes.data(), c.sNormF.data(), cudaStreamPerThread);   // normalized residual
+        {
+            const cudaGraphConditionalHandle h = c.handle; const scalar* res = c.sRes.data(); const scalar tolD = tol;
+            const scalar* init = c.sInit.data(); const scalar relTolD = relTol; int* iter = c.sIter.data();
+            const int maxI = maxIter-1, minI = minIter-1;
+            pcudaParallelFor(dim3(1), dim3(1), size_t(0), cudaStreamPerThread, [=] __device__ () {
+                pcgSetCondK(h, res, tolD, init, relTolD, iter, maxI, minI); });   // -1: iteration 0 ran outside the loop
+        }
         cudaGraph_t tmp;
         cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &tmp), "pcg capture end");
         cudaCheck(cudaGraphInstantiate(&c.exec, c.graph, 0), "pcg graph instantiate");
@@ -259,9 +280,9 @@ DeviceSolverPerf deviceParallelAMGPCGGraph(
     {
         if (fp32)
         {
-            cast_<scalar,float><<<nBlocks(nC),TPB,0,strm>>>(nC, rA.data(), amg.vBF[0].data());
+            castLaunch<scalar,float>(nC, rA.data(), amg.vBF[0].data(), strm);
             vcycleAtF(0, amg, A, A0, amg.vBF[0].data(), amg.vXF[0].data());
-            cast_<float,scalar><<<nBlocks(nC),TPB,0,strm>>>(nC, amg.vXF[0].data(), wA.data());
+            castLaunch<float,scalar>(nC, amg.vXF[0].data(), wA.data(), strm);
         }
         else vcycleAt(0, amg, A, rA, wA);
     };
@@ -280,7 +301,7 @@ DeviceSolverPerf deviceParallelAMGPCGGraph(
     deviceAxpy(-1.0, c.Ax, rA);
     DeviceSolverPerf perf;
     gsum(rA, c.sInit.data());
-    gsScaleInvK<<<1,1,0,strm>>>(c.sInit.data(), c.sNormF.data());
+    gsScaleInvLaunch(c.sInit.data(), c.sNormF.data(), strm);
     scalar initRes;
     cudaCheck(cudaMemcpyAsync(&initRes, c.sInit.data(), sizeof(scalar), cudaMemcpyDeviceToHost, strm), "pgraph init D2H");
     cudaStreamSynchronize(strm);
@@ -297,7 +318,7 @@ DeviceSolverPerf deviceParallelAMGPCGGraph(
     deviceAxpyDev(dAlpha, c.pA, psi);
     deviceAxpyDev(dNegAlpha, wA, rA);
     gsum(rA, c.sRes.data());
-    gsScaleInvK<<<1,1,0,strm>>>(c.sRes.data(), c.sNormF.data());
+    gsScaleInvLaunch(c.sRes.data(), c.sNormF.data(), strm);
     scalar res1;
     cudaCheck(cudaMemcpyAsync(&res1, c.sRes.data(), sizeof(scalar), cudaMemcpyDeviceToHost, strm), "pgraph it0 D2H");
     cudaStreamSynchronize(strm);
@@ -330,10 +351,16 @@ DeviceSolverPerf deviceParallelAMGPCGGraph(
         deviceAxpyDev(dAlpha, c.pA, psi);
         deviceAxpyDev(dNegAlpha, wA, rA);
         gsum(rA, c.sRes.data());
-        gsScaleInvK<<<1,1,0,strm>>>(c.sRes.data(), c.sNormF.data());
+        gsScaleInvLaunch(c.sRes.data(), c.sNormF.data(), strm);
         // minIter 0: the DISTRIBUTED path does not carry the fvSolution minIter yet (the single-GPU
         // solvers do). Passing 0 keeps it exactly as it was rather than half-wiring it.
-        pcgSetCondK<<<1,1,0,strm>>>(c.handle, c.sRes.data(), tol, c.sInit.data(), relTol, c.sIter.data(), maxIter-1, 0);
+        {
+            const cudaGraphConditionalHandle h = c.handle; const scalar* res = c.sRes.data(); const scalar tolD = tol;
+            const scalar* init = c.sInit.data(); const scalar relTolD = relTol; int* iter = c.sIter.data();
+            const int maxI = maxIter-1;
+            pcudaParallelFor(dim3(1), dim3(1), size_t(0), strm, [=] __device__ () {
+                pcgSetCondK(h, res, tolD, init, relTolD, iter, maxI, 0); });
+        }
         cudaGraph_t tmp;
         cudaCheck(cudaStreamEndCapture(strm, &tmp), "pgraph capture end");
         cudaCheck(cudaGraphInstantiate(&c.exec, c.graph, 0), "pgraph instantiate");
@@ -428,10 +455,11 @@ DeviceSolverPerf deviceAMGPCG(
             const LduF A0 = lduF(A, amg.fDiag[0], amg.fUpper[0], amg.fLower[0]);
             auto runF = [&]()                                                        // cast in -> FP32 V-cycle -> cast out
             {
-                cast_<scalar,float><<<nBlocks(nC),TPB>>>(nC, rA.data(), amg.vBF[0].data());
+                castLaunch<scalar,float>(nC, rA.data(), amg.vBF[0].data());
                 vcycleAtF(0, amg, A, A0, amg.vBF[0].data(), amg.vXF[0].data());
-                cast_<float,scalar><<<nBlocks(nC),TPB>>>(nC, amg.vXF[0].data(), wA.data());
+                castLaunch<float,scalar>(nC, amg.vXF[0].data(), wA.data());
             };
+#ifndef BRAE_ACPP
             if (!captureVcycle)
             {
                 runF();
@@ -457,8 +485,14 @@ DeviceSolverPerf deviceAMGPCG(
                 gcf.key = A.diag;
             }
             cudaCheck(cudaGraphLaunch(gcf.exec, cudaStreamPerThread), "amgF graph launch");
+#else
+            // No CUDA-graph capture under ACPP: always the direct launch, same as !captureVcycle above.
+            warnAcppNoGraphCapture(captureVcycle);
+            runF();
+#endif
             return;
         }
+#ifndef BRAE_ACPP
         if (!captureVcycle)
         {
             vcycleAt(0, amg, A, rA, wA);
@@ -483,6 +517,10 @@ DeviceSolverPerf deviceAMGPCG(
             gc.key = A.diag;
         }
         cudaCheck(cudaGraphLaunch(gc.exec, cudaStreamPerThread), "amg graph launch");
+#else
+        warnAcppNoGraphCapture(captureVcycle);
+        vcycleAt(0, amg, A, rA, wA);
+#endif
     };
 
     // Device-resident Krylov scalars: wArA / pAp / alpha / beta live on the device and feed the *Dev kernels by
@@ -509,7 +547,11 @@ DeviceSolverPerf deviceAMGPCG(
             else if (corrScaling)                             // flexible CG (Polak-Ribiere+): nonlinear precond
             {
                 deviceDotInto(wA, rOld, amg.sZrOld.data());
-                flexBetaK<<<1,1>>>(dWArA, amg.sZrOld.data(), dWArAold, dBeta);
+                {
+                    const scalar* zrNew = dWArA; const scalar* zrOld = amg.sZrOld.data();
+                    const scalar* rhoOld = dWArAold; scalar* out = dBeta;
+                    pcudaParallelFor(dim3(1), dim3(1), [=] __device__ () { flexBetaK(zrNew, zrOld, rhoOld, out); });
+                }
                 deviceFusedScaleAxpy(pA, dBeta, wA);
             }
             else

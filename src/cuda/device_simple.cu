@@ -1,6 +1,7 @@
 // cf GPU offload (G7): SIMPLE coupling-glue kernels. matrixH and matrixFlux reuse the ownerStart/losort
 // gather; rAU / corrector are elementwise; the HbyA flux is a per-face vector interpolation dotted with Sf.
 #include "device_simple.cuh"
+#include "pcuda_compat.cuh"
 #include <cmath>
 #include <cuda_runtime.h>
 
@@ -10,7 +11,7 @@ namespace {
 constexpr int TPB = 256;
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 
-__global__
+__device__
 void matrixHKernel(
     int nC,
     const label* __restrict__ ownerStart,
@@ -49,7 +50,7 @@ void matrixHKernel(
     h += bd * psi[c] + bs;
     H[c] = h / V[c];
 }
-__global__
+__device__
 void reciprocalVKernel(
     int nC,
     const scalar* __restrict__ diagC,
@@ -59,7 +60,7 @@ void reciprocalVKernel(
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c < nC) rAU[c] = V[c] / diagC[c];
 }
-__global__
+__device__
 void vectorFluxKernel(
     int nIf,
     const label* __restrict__ own,
@@ -82,7 +83,7 @@ void vectorFluxKernel(
     const scalar uz = wf * Uz[o] + (1.0 - wf) * Uz[n];
     phi[f] = ux * Sfx[f] + uy * Sfy[f] + uz * Sfz[f];
 }
-__global__
+__device__
 void matrixFluxKernel(
     int nIf,
     const label* __restrict__ own,
@@ -95,7 +96,7 @@ void matrixFluxKernel(
     const int f = blockIdx.x * blockDim.x + threadIdx.x;
     if (f < nIf) flux[f] = upper[f] * p[nei[f]] - lower[f] * p[own[f]];
 }
-__global__
+__device__
 void correctorKernel(
     int nC,
     const scalar* __restrict__ HbyA,
@@ -106,7 +107,7 @@ void correctorKernel(
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c < nC) U[c] = HbyA[c] - rAU[c] * gradP[c];
 }
-__global__
+__device__
 void bndFluxKernel(
     int nB,
     const label* __restrict__ bndGFace,
@@ -123,7 +124,7 @@ void bndFluxKernel(
     const int f = bndGFace[i];
     phiB[i] = uxb[i] * Sfx[f] + uyb[i] * Sfy[f] + uzb[i] * Sfz[f];
 }
-__global__
+__device__
 void relaxKernel(
     int nC,
     const label* __restrict__ ownerStart,
@@ -175,15 +176,23 @@ void deviceMatrixH(
 {
     const int nC = dm.nCells;
     Hk.resize(nC);
-    matrixHKernel<<<nBlocks(nC), TPB>>>(nC, A.ownerStart, A.losort, A.losortStart, A.upper, A.lower, A.owner, A.nei,
-                                        psiK.data(), sourceK.data(), dm.V.data(), dm.bndCellStart.data(), dm.bndPerm.data(),
-                                        bdDiagK.data(), bdSrcK.data(), Hk.data());
+    {
+        const label *ownerStart=A.ownerStart, *losort=A.losort, *losortStart=A.losortStart, *own=A.owner, *nei=A.nei;
+        const scalar *upper=A.upper, *lower=A.lower;
+        const scalar *psid=psiK.data(), *sourced=sourceK.data(), *Vd=dm.V.data();
+        const label *bndCellStart=dm.bndCellStart.data(), *bndPerm=dm.bndPerm.data();
+        const scalar *bdDiagd=bdDiagK.data(), *bdSrcd=bdSrcK.data(); scalar* Hd = Hk.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            matrixHKernel(nC, ownerStart, losort, losortStart, upper, lower, own, nei, psid, sourced, Vd,
+                         bndCellStart, bndPerm, bdDiagd, bdSrcd, Hd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "matrixH");
 }
 // linearUpwind / linearUpwindV / LUST deferred convection corrections moved to device_deferred_correction.cu
 
 namespace {
-__global__
+__device__
 void setRefKernel(
     label ref,
     scalar refValue,
@@ -197,7 +206,7 @@ void setRefKernel(
     }
 }
 // adjustPhi: per-face classify (massIn / fixedMassOut / adjustableMassOut) via atomics into sums[0..2].
-__global__
+__device__
 void adjustReduceKernel(
     int n,
     const label* __restrict__ adj,
@@ -211,7 +220,7 @@ void adjustReduceKernel(
     else if (adj[i]) atomicAdd(&sums[2], f);              // adjustableMassOut
     else atomicAdd(&sums[1], f);                          // fixedMassOut
 }
-__global__
+__device__
 void adjustScaleKernel(
     int n,
     const label* __restrict__ adj,
@@ -229,20 +238,22 @@ scalar deviceAdjustPhi(const DeviceBuffer<label>& adjustable, DeviceBuffer<scala
     if (n == 0) return 1.0;
     DeviceBuffer<scalar> sums(3);
     cudaCheck(cudaMemset(sums.data(), 0, 3 * sizeof(scalar)), "adjustPhi memset");
-    adjustReduceKernel<<<nBlocks(n), TPB>>>(n, adjustable.data(), phiB.data(), sums.data());
+    const label* adjd = adjustable.data(); scalar* phiBd = phiB.data(); scalar* sumsd = sums.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { adjustReduceKernel(n, adjd, phiBd, sumsd); });
     scalar h[3];
     cudaCheck(cudaMemcpy(h, sums.data(), 3 * sizeof(scalar), cudaMemcpyDeviceToHost), "adjustPhi D2H");
     const scalar massIn = h[0], fixedOut = h[1], adjOut = h[2];
     scalar massCorr = 1.0;
     if (std::fabs(adjOut) > 1e-300) massCorr = (massIn - fixedOut) / adjOut;       // OF: (massIn-fixedMassOut)/adjustableMassOut
-    adjustScaleKernel<<<nBlocks(n), TPB>>>(n, adjustable.data(), massCorr, phiB.data());
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { adjustScaleKernel(n, adjd, massCorr, phiBd); });
     cudaCheck(cudaGetLastError(), "adjustPhi");
     return massCorr;
 }
 void deviceSetReference(DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& b, label refCell, scalar refValue)
 {
     if (refCell < 0) return;
-    setRefKernel<<<1, 1>>>(refCell, refValue, diag.data(), b.data());
+    scalar* diagd = diag.data(); scalar* bd = b.data();
+    pcudaParallelFor(1, 1, [=] __device__ () { setRefKernel(refCell, refValue, diagd, bd); });
     cudaCheck(cudaGetLastError(), "setReference");
 }
 
@@ -250,12 +261,13 @@ void deviceReciprocalV(const DeviceMesh& dm, const DeviceBuffer<scalar>& diagC, 
 {
     const int nC = dm.nCells;
     rAU.resize(nC);
-    reciprocalVKernel<<<nBlocks(nC), TPB>>>(nC, diagC.data(), dm.V.data(), rAU.data());
+    const scalar* diagCd = diagC.data(); const scalar* Vd = dm.V.data(); scalar* rAUd = rAU.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { reciprocalVKernel(nC, diagCd, Vd, rAUd); });
     cudaCheck(cudaGetLastError(), "reciprocalV");
 }
 // SIMPLEC rAtU = 1/(1/rAU - H1) = V/rowSum, where rowSum = A*1 = diagA + sum(off-diag) (= 1/rAU - H1).
 // OF (pEqn.H:12): rAtU = 1.0/(1.0/rAU - UEqn.H1()) -- NO floor/guard. Faithful: divide by rowSum directly.
-__global__
+__device__
 void simplecRAtUKernel(
     int n,
     const scalar* __restrict__ V,
@@ -275,7 +287,9 @@ void deviceSimplecRAtU(
 {
     const int nC = dm.nCells;
     rAtU.resize(nC);
-    simplecRAtUKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), rowSum.data(), diagA.data(), rAtU.data());
+    const scalar* Vd = dm.V.data(); const scalar* rowSumd = rowSum.data(); const scalar* diagAd = diagA.data();
+    scalar* rAtUd = rAtU.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { simplecRAtUKernel(nC, Vd, rowSumd, diagAd, rAtUd); });
     cudaCheck(cudaGetLastError(), "simplecRAtU");
 }
 void deviceVectorFlux(
@@ -287,14 +301,25 @@ void deviceVectorFlux(
 {
     const int nIf = dm.nInternalFaces;
     phiInt.resize(nIf);
-    vectorFluxKernel<<<nBlocks(nIf), TPB>>>(nIf, dm.owner.data(), dm.nei.data(), dm.w.data(), dm.Sfx.data(), dm.Sfy.data(),
-                                            dm.Sfz.data(), Ux.data(), Uy.data(), Uz.data(), phiInt.data());
+    {
+        const label *own=dm.owner.data(), *nei=dm.nei.data(); const scalar *wd=dm.w.data();
+        const scalar *Sfxd=dm.Sfx.data(), *Sfyd=dm.Sfy.data(), *Sfzd=dm.Sfz.data();
+        const scalar *Uxd=Ux.data(), *Uyd=Uy.data(), *Uzd=Uz.data(); scalar* phiIntd = phiInt.data();
+        pcudaParallelFor(nBlocks(nIf), TPB, [=] __device__ () {
+            vectorFluxKernel(nIf, own, nei, wd, Sfxd, Sfyd, Sfzd, Uxd, Uyd, Uzd, phiIntd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "vectorFlux");
 }
 void deviceMatrixFluxInternal(const DeviceLduView& A, const DeviceBuffer<scalar>& p, DeviceBuffer<scalar>& fluxInt)
 {
     fluxInt.resize(A.nInternalFaces);
-    matrixFluxKernel<<<nBlocks(A.nInternalFaces), TPB>>>(A.nInternalFaces, A.owner, A.nei, A.upper, A.lower, p.data(), fluxInt.data());
+    {
+        const int nIf = A.nInternalFaces;
+        const label *own=A.owner, *nei=A.nei; const scalar *upper=A.upper, *lower=A.lower;
+        const scalar* pd = p.data(); scalar* fluxIntd = fluxInt.data();
+        pcudaParallelFor(nBlocks(nIf), TPB, [=] __device__ () { matrixFluxKernel(nIf, own, nei, upper, lower, pd, fluxIntd); });
+    }
     cudaCheck(cudaGetLastError(), "matrixFlux");
 }
 void deviceCorrector(
@@ -305,7 +330,8 @@ void deviceCorrector(
 {
     const int nC = static_cast<int>(HbyA.size());
     U.resize(nC);
-    correctorKernel<<<nBlocks(nC), TPB>>>(nC, HbyA.data(), rAU.data(), gradP.data(), U.data());
+    const scalar *HbyAd = HbyA.data(), *rAUd = rAU.data(), *gradPd = gradP.data(); scalar* Ud = U.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { correctorKernel(nC, HbyAd, rAUd, gradPd, Ud); });
     cudaCheck(cudaGetLastError(), "corrector");
 }
 void deviceBoundaryFlux(
@@ -316,8 +342,15 @@ void deviceBoundaryFlux(
     DeviceBuffer<scalar>& phiB)
 {
     phiB.resize(dm.nBndFaces);
-    bndFluxKernel<<<nBlocks(dm.nBndFaces), TPB>>>(dm.nBndFaces, dm.bndGFace.data(), dm.Sfx.data(), dm.Sfy.data(),
-                                                  dm.Sfz.data(), uxb.data(), uyb.data(), uzb.data(), phiB.data());
+    {
+        const int nB = dm.nBndFaces;
+        const label* bndGFaced = dm.bndGFace.data();
+        const scalar *Sfxd=dm.Sfx.data(), *Sfyd=dm.Sfy.data(), *Sfzd=dm.Sfz.data();
+        const scalar *uxbd=uxb.data(), *uybd=uyb.data(), *uzbd=uzb.data(); scalar* phiBd = phiB.data();
+        pcudaParallelFor(nBlocks(nB), TPB, [=] __device__ () {
+            bndFluxKernel(nB, bndGFaced, Sfxd, Sfyd, Sfzd, uxbd, uybd, uzbd, phiBd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "bndFlux");
 }
 void deviceRelaxDiag(
@@ -333,13 +366,22 @@ void deviceRelaxDiag(
 {
     relaxedDiag.resize(A.nCells);
     delta.resize(A.nCells);
-    relaxKernel<<<nBlocks(A.nCells), TPB>>>(A.nCells, A.ownerStart, A.losort, A.losortStart, A.upper, A.lower,
-                                            dm.bndCellStart.data(), dm.bndPerm.data(), iCbnd.data(), A.diag, alpha,
-                                            relaxedDiag.data(), delta.data(), cycSumOff, iCmaxMag, iCmin);
+    {
+        const int nC = A.nCells;
+        const label *ownerStart=A.ownerStart, *losort=A.losort, *losortStart=A.losortStart;
+        const scalar *upper=A.upper, *lower=A.lower;
+        const label *bndCellStart=dm.bndCellStart.data(), *bndPerm=dm.bndPerm.data();
+        const scalar *iCbndd = iCbnd.data(), *rawDiag = A.diag;
+        scalar *relaxedDiagd = relaxedDiag.data(), *deltad = delta.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            relaxKernel(nC, ownerStart, losort, losortStart, upper, lower, bndCellStart, bndPerm, iCbndd, rawDiag,
+                       alpha, relaxedDiagd, deltad, cycSumOff, iCmaxMag, iCmin);
+        });
+    }
     cudaCheck(cudaGetLastError(), "relaxDiag");
 }
 namespace {
-__global__
+__device__
 void cmptMaxMag3Kernel(
     int n,
     const scalar* __restrict__ a,
@@ -359,12 +401,13 @@ void deviceCmptMaxMag3(
 {
     const int n = static_cast<int>(a.size());
     out.resize(n);
-    cmptMaxMag3Kernel<<<nBlocks(n), TPB>>>(n, a.data(), b.data(), c.data(), out.data());
+    const scalar *ad = a.data(), *bd = b.data(), *cd = c.data(); scalar* outd = out.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { cmptMaxMag3Kernel(n, ad, bd, cd, outd); });
     cudaCheck(cudaGetLastError(), "cmptMaxMag3");
 }
 
 
-__global__
+__device__
 void cmptMin3Kernel(
     int n,
     const scalar* __restrict__ a,
@@ -385,7 +428,8 @@ void deviceCmptMin3(
 {
     const int n = static_cast<int>(a.size());
     out.resize(n);
-    cmptMin3Kernel<<<nBlocks(n), TPB>>>(n, a.data(), b.data(), c.data(), out.data());
+    const scalar *ad = a.data(), *bd = b.data(), *cd = c.data(); scalar* outd = out.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { cmptMin3Kernel(n, ad, bd, cd, outd); });
     cudaCheck(cudaGetLastError(), "cmptMin3");
 }
 

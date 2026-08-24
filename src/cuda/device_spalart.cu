@@ -13,6 +13,7 @@
 #include "device_interface.cuh"
 #include "device_amg.cuh"
 #include "nut_wall_function.cuh"
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 #include <cmath>
 #include <vector>
@@ -41,7 +42,7 @@ __device__ inline scalar saPsi(scalar chi, const SpalartAllmarasCoeffs& co)
 }
 
 // Stilda = max(Omega + fv2*nuTilda/(kappa*y)^2, Cs*Omega); Omega = sqrt(2)*mag(skew(gradU)) (vorticity magnitude).
-__global__
+__device__
 void saStildaKernel(
     int nC,
     const scalar* __restrict__ gradU,
@@ -65,7 +66,7 @@ void saStildaKernel(
 
 
 // fw = g*((1+Cw3^6)/(g^6+Cw3^6))^(1/6),  g = r + Cw2*(r^6 - r),  r = min(nuTilda/(Stilda*(kappa*y)^2), 10).
-__global__
+__device__
 void saFwKernel(
     int nC,
     const scalar* __restrict__ nt,
@@ -85,7 +86,7 @@ void saFwKernel(
 }
 
 
-__global__
+__device__
 void saReactionKernel(
     int nC,
     const scalar* __restrict__ V,
@@ -107,7 +108,7 @@ void saReactionKernel(
 }
 
 
-__global__
+__device__
 void saDEffKernel(int nC, const scalar* __restrict__ nt, scalar nu, scalar sigma, scalar* __restrict__ D)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -115,7 +116,7 @@ void saDEffKernel(int nC, const scalar* __restrict__ nt, scalar nu, scalar sigma
 }
 
 
-__global__
+__device__
 void saNutKernel(int nC, const scalar* __restrict__ nt, scalar nu, scalar Cv1, scalar* __restrict__ nut)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -126,7 +127,7 @@ void saNutKernel(int nC, const scalar* __restrict__ nt, scalar nu, scalar Cv1, s
 }
 
 
-__global__
+__device__
 void saMagSqrKernel(
     int nC,
     const scalar* __restrict__ gx,
@@ -144,7 +145,7 @@ void saMagSqrKernel(
 // dTilda=y) and switches to LES in detached regions (fd->1 -> dTilda=CDES*Delta). |gradU| = sqrt(sum_ij (dU_i/dx_j)^2)
 // (full 9-cmpt tensor magnitude); nut recomputed from nuTilda via fv1. lLES = Psi*CDES*Delta with the low-Re Psi (ft2=off).
 // Matches OF SpalartAllmarasDDES. dTilda == y wherever fd==0, so a RANS (des=false) run is untouched.
-__global__
+__device__
 void saDdesDTildaKernel(
     int nC, const scalar* __restrict__ y, const scalar* __restrict__ V, const scalar* __restrict__ gradU,
     const scalar* __restrict__ nt, scalar nu, SpalartAllmarasCoeffs co,
@@ -170,7 +171,7 @@ void saDdesDTildaKernel(
 // |curl U| per CELL, from the packed cell gradient. OF fvc::curl = 2*(*skew(grad U)) with the Hodge dual
 // *T = (T.yz, -T.xz, T.xy), which reduces to the textbook curl once gradU is read OF's way (T_ij = dU_j/dx_i):
 //     curl = (dUz/dy - dUy/dz,  dUx/dz - dUz/dx,  dUy/dx - dUx/dy)
-__global__
+__device__
 void saMagCurlKernel(int nC, const scalar* __restrict__ gradU, scalar* __restrict__ out)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -187,7 +188,7 @@ void saMagCurlKernel(int nC, const scalar* __restrict__ gradU, scalar* __restric
 //     gradU_b = gradU_c + n (x) (snGrad - n & gradU_c),   snGrad = (U_b - U_c)*deltaCoeffs
 // which is the entire difference between a no-slip wall having a shear gradient and having none. Same
 // expression as device_divdevreff.cu's gradBKernel and the SST's sstNutBoundaryK.
-__global__
+__device__
 void saMagCurlBndKernel(
     int nB, int nC,
     const label*  __restrict__ fc,
@@ -234,7 +235,7 @@ void saMagCurlBndKernel(
 // new gradients are wall-normal derivatives: GnuTilda detects the eddy-viscosity ramp that says "this is
 // still an attached boundary layer" and GOmega the vorticity ramp, and where either says so the second
 // factor pulls fd back towards 0, i.e. back to RANS. pos() is OF's STRICT pos (x > 0), not pos0.
-__global__
+__device__
 void saZdesFdKernel(
     int nC,
     const scalar* __restrict__ y,
@@ -286,7 +287,7 @@ void saZdesFdKernel(
 // lLES = CDES*Delta with the IDDES delta Delta = min(max(Cw*y, Cw*hmax), hmax) (hmax = maxDeltaxyz; the wall-normal
 // spacing hwn term is omitted -> hwn=0, a documented simplification). Blending: rd_t/rd_l from nut/nu, fdt/fl/ft the
 // shielding + elevated-stress functions, fB/fe1/fe the WMLES branch. des==false leaves this path untaken (RANS exact).
-__global__
+__device__
 void saIddesDTildaKernel(
     int nC, const scalar* __restrict__ y, const scalar* __restrict__ gradU,
     const scalar* __restrict__ nt, scalar nu, const scalar* __restrict__ hmax, const scalar* __restrict__ hwn,
@@ -376,46 +377,87 @@ void deviceSpalartAllmarasCorrect(
             deviceGaussGrad(dm, nuTilda, nbv0, gx0, gy0, gz0);          // fvc::grad(nuTilda)
 
             DeviceBuffer<scalar> mc(static_cast<std::size_t>(nC)), mcb, ox, oy, oz;
-            saMagCurlKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), mc.data());
+            {
+                const scalar* gradUd = gradU.data(); scalar* mcd = mc.data();
+                pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+                    saMagCurlKernel(nC, gradUd, mcd); });
+            }
             cudaCheck(cudaGetLastError(), "saMagCurl");
             const int nB = dbU.n;
             mcb.resize(static_cast<std::size_t>(nB));
             DeviceBuffer<scalar> ub[3];
             for (int k = 0; k < 3; ++k) deviceBCValue(dbU.comp[k], k == 0 ? Ux : (k == 1 ? Uy : Uz), ub[k]);
-            saMagCurlBndKernel<<<nBlocks(nB), TPB>>>(nB, nC, dbU.comp[0].faceCell.data(), gradU.data(),
-                                                     dbU.nx.data(), dbU.ny.data(), dbU.nz.data(),
-                                                     ub[0].data(), ub[1].data(), ub[2].data(),
-                                                     Ux.data(), Uy.data(), Uz.data(),
-                                                     dbU.comp[0].deltaCoeffs.data(), mcb.data());
+            {
+                const label* fcd = dbU.comp[0].faceCell.data();
+                const scalar* gradUd = gradU.data();
+                const scalar* nxd = dbU.nx.data(); const scalar* nyd = dbU.ny.data(); const scalar* nzd = dbU.nz.data();
+                const scalar* ub0 = ub[0].data(); const scalar* ub1 = ub[1].data(); const scalar* ub2 = ub[2].data();
+                const scalar* Uxd = Ux.data(); const scalar* Uyd = Uy.data(); const scalar* Uzd = Uz.data();
+                const scalar* dcd = dbU.comp[0].deltaCoeffs.data();
+                scalar* mcbd = mcb.data();
+                pcudaParallelFor(nBlocks(nB), TPB, [=] __device__ () {
+                    saMagCurlBndKernel(nB, nC, fcd, gradUd, nxd, nyd, nzd, ub0, ub1, ub2, Uxd, Uyd, Uzd, dcd, mcbd); });
+            }
             cudaCheck(cudaGetLastError(), "saMagCurlBnd");
             deviceGaussGrad(dm, mc, mcb, ox, oy, oz);                   // fvc::grad(mag(curl(U)))
 
             zfd.resize(static_cast<std::size_t>(nC));
             const scalar* wn = wallN->data();
-            saZdesFdKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), gradU.data(), nuTilda.data(), nu,
-                                                 wn, wn + nC, wn + 2*nC,
-                                                 gx0.data(), gy0.data(), gz0.data(),
-                                                 ox.data(), oy.data(), oz.data(), co, zfd.data());
+            {
+                const scalar* yd = y.data(); const scalar* gradUd = gradU.data(); const scalar* nuTildaD = nuTilda.data();
+                const scalar* wnx = wn; const scalar* wny = wn + nC; const scalar* wnz = wn + 2*nC;
+                const scalar* gx0d = gx0.data(); const scalar* gy0d = gy0.data(); const scalar* gz0d = gz0.data();
+                const scalar* oxd = ox.data(); const scalar* oyd = oy.data(); const scalar* ozd = oz.data();
+                scalar* zfdd = zfd.data();
+                pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+                    saZdesFdKernel(nC, yd, gradUd, nuTildaD, nu, wnx, wny, wnz, gx0d, gy0d, gz0d, oxd, oyd, ozd, co, zfdd); });
+            }
             cudaCheck(cudaGetLastError(), "saZdesFd");
         }
         if (iddes && hmax && hwn)
-            saIddesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), gradU.data(), nuTilda.data(), nu, hmax->data(), hwn->data(), co, dTilda.data());
+        {
+            const scalar* yd = y.data(); const scalar* gradUd = gradU.data(); const scalar* nuTildaD = nuTilda.data();
+            const scalar* hmaxd = hmax->data(); const scalar* hwnd = hwn->data(); scalar* dTildad = dTilda.data();
+            pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+                saIddesDTildaKernel(nC, yd, gradUd, nuTildaD, nu, hmaxd, hwnd, co, dTildad); });
+        }
         else
-            saDdesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), dm.V.data(), gradU.data(), nuTilda.data(), nu, co,
-                                                     (lesDelta && lesDelta->size()) ? lesDelta->data() : nullptr,
-                                                     zfd.size() ? zfd.data() : nullptr, dTilda.data());
+        {
+            const scalar* yd = y.data(); const scalar* Vd = dm.V.data(); const scalar* gradUd = gradU.data();
+            const scalar* nuTildaD = nuTilda.data();
+            const scalar* lesDeltaD = (lesDelta && lesDelta->size()) ? lesDelta->data() : nullptr;
+            const scalar* zfdD = zfd.size() ? zfd.data() : nullptr;
+            scalar* dTildad = dTilda.data();
+            pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+                saDdesDTildaKernel(nC, yd, Vd, gradUd, nuTildaD, nu, co, lesDeltaD, zfdD, dTildad); });
+        }
     }
     const DeviceBuffer<scalar>& dScale = des ? dTilda : y;
     DeviceBuffer<scalar> Stilda(static_cast<std::size_t>(nC));
-    saStildaKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), nuTilda.data(), dScale.data(), nu, co, Stilda.data());
+    {
+        const scalar* gradUd = gradU.data(); const scalar* nuTildaD = nuTilda.data(); const scalar* dScaleD = dScale.data();
+        scalar* Stildad = Stilda.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            saStildaKernel(nC, gradUd, nuTildaD, dScaleD, nu, co, Stildad); });
+    }
     DeviceBuffer<scalar> fw(static_cast<std::size_t>(nC));
-    saFwKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), Stilda.data(), dScale.data(), co, fw.data());
+    {
+        const scalar* nuTildaD = nuTilda.data(); const scalar* StildaD = Stilda.data(); const scalar* dScaleD = dScale.data();
+        scalar* fwd = fw.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            saFwKernel(nC, nuTildaD, StildaD, dScaleD, co, fwd); });
+    }
     DeviceBuffer<scalar> nbv;
     deviceBCValue(dbNuTilda, nuTilda, nbv);   // |grad nuTilda|^2
     DeviceBuffer<scalar> gnx, gny, gnz;
     deviceGaussGrad(dm, nuTilda, nbv, gnx, gny, gnz);
     DeviceBuffer<scalar> gradNt2(static_cast<std::size_t>(nC));
-    saMagSqrKernel<<<nBlocks(nC), TPB>>>(nC, gnx.data(), gny.data(), gnz.data(), gradNt2.data());
+    {
+        const scalar* gnxd = gnx.data(); const scalar* gnyd = gny.data(); const scalar* gnzd = gnz.data();
+        scalar* gradNt2d = gradNt2.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            saMagSqrKernel(nC, gnxd, gnyd, gnzd, gradNt2d); });
+    }
     if (const char* sapath = std::getenv("BRAE_DUMP_SA"))   // cell-level SA-term dump (vs OF reference) -- first call only
     {
         static bool saDumped = false;
@@ -442,7 +484,11 @@ void deviceSpalartAllmarasCorrect(
         }
     }
     DeviceBuffer<scalar> D(static_cast<std::size_t>(nC));
-    saDEffKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), nu, co.sigmaNut, D.data());
+    {
+        const scalar* nuTildaD = nuTilda.data(); scalar* Dd = D.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            saDEffKernel(nC, nuTildaD, nu, co.sigmaNut, Dd); });
+    }
     DeviceBuffer<scalar> divU;
     deviceDiv(dm, phiInt, phiBnd, divU);   // for the bounded term
     if (ami && ami->n) interfaceAddDiv(*ami, dm.V, divU);
@@ -463,18 +509,23 @@ void deviceSpalartAllmarasCorrect(
     if (ntBnd.size())
     {
         DB.resize(ntBnd.size());
-        saDEffKernel<<<nBlocks(static_cast<int>(ntBnd.size())), TPB>>>(static_cast<int>(ntBnd.size()),
-                                                                      ntBnd.data(), nu, co.sigmaNut, DB.data());
+        const int nB = static_cast<int>(ntBnd.size());
+        const scalar* ntBndD = ntBnd.data(); scalar* DBd = DB.data();
+        pcudaParallelFor(nBlocks(nB), TPB, [=] __device__ () {
+            saDEffKernel(nB, ntBndD, nu, co.sigmaNut, DBd); });
         cudaCheck(cudaGetLastError(), "SA DEff boundary");
     }
     deviceSolveScalarTransport(dm, dbNuTilda, nuTilda, "nuTilda", D, phiInt, phiBnd, divU, bounded, limited, linearUpwind, nonOrth, twoByk,
                                relax, tol, relTol, checkEvery, gsK,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){
-                                   saReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), nuTilda.data(), Stilda.data(),
-                                       fw.data(), dScale.data(), gradNt2.data(), co, diag.data(), src.data()); },
+                                   deviceSAReaction(dm, nuTilda, Stilda, fw, dScale, gradNt2, co, diag, src); },
                                nullptr, nullptr, ami, cyc, ntDdt, DB.size() ? &DB : nullptr);
     // deviceSolveScalarTransport already bounds to 1e-15 (~ bound(nuTilda, 0)). correctNut: nut = nuTilda*fv1(new).
-    saNutKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), nu, co.Cv1, nut.data());
+    {
+        const scalar* nuTildaD = nuTilda.data(); scalar* nutd = nut.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            saNutKernel(nC, nuTildaD, nu, co.Cv1, nutd); });
+    }
     cudaCheck(cudaGetLastError(), "SA correctNut");
 }
 
@@ -483,7 +534,7 @@ void deviceSpalartAllmarasCorrect(
 // eddyViscosity::validate()->correctNut()), so the FIRST momentum predictor sees a consistent nut.
 // Boundary variant: nu VARIES per face on a compressible mesh (nu = mu/rho), so the scalar-nu form
 // would be wrong there. nuFace == nullptr falls back to the uniform nu.
-__global__
+__device__
 void saNutFaceKernel(int n, const scalar* __restrict__ nt, const scalar* __restrict__ nuFace,
                      scalar nu, scalar Cv1, scalar* __restrict__ nut)
 {
@@ -499,8 +550,11 @@ void deviceNutSABoundary(const DeviceBuffer<scalar>& nuTildaB, const DeviceBuffe
 {
     const int n = static_cast<int>(nuTildaB.size());
     nutB.resize(n);
-    saNutFaceKernel<<<nBlocks(n), TPB>>>(n, nuTildaB.data(), nuFace ? nuFace->data() : nullptr,
-                                         nu, Cv1, nutB.data());
+    const scalar* nuTildaBD = nuTildaB.data();
+    const scalar* nuFaceD = nuFace ? nuFace->data() : nullptr;
+    scalar* nutBd = nutB.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+        saNutFaceKernel(n, nuTildaBD, nuFaceD, nu, Cv1, nutBd); });
     cudaCheck(cudaGetLastError(), "SA correctNut (boundary)");
 }
 
@@ -508,7 +562,9 @@ void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, Dev
 {
     const int nC = static_cast<int>(nuTilda.size());
     nut.resize(nC);
-    saNutKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), nu, Cv1, nut.data());
+    const scalar* nuTildaD = nuTilda.data(); scalar* nutd = nut.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+        saNutKernel(nC, nuTildaD, nu, Cv1, nutd); });
     cudaCheck(cudaGetLastError(), "SA correctNut (validate)");
 }
 
@@ -524,10 +580,15 @@ void deviceSAZdesFd(
     const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& fd)
 {
     fd.resize(static_cast<std::size_t>(nC));
-    saZdesFdKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), gradU.data(), nuTilda.data(), nu,
-                                         wnx.data(), wny.data(), wnz.data(),
-                                         gnx.data(), gny.data(), gnz.data(),
-                                         gox.data(), goy.data(), goz.data(), co, fd.data());
+    {
+        const scalar* yd = y.data(); const scalar* gradUd = gradU.data(); const scalar* nuTildaD = nuTilda.data();
+        const scalar* wnxd = wnx.data(); const scalar* wnyd = wny.data(); const scalar* wnzd = wnz.data();
+        const scalar* gnxd = gnx.data(); const scalar* gnyd = gny.data(); const scalar* gnzd = gnz.data();
+        const scalar* goxd = gox.data(); const scalar* goyd = goy.data(); const scalar* gozd = goz.data();
+        scalar* fdd = fd.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            saZdesFdKernel(nC, yd, gradUd, nuTildaD, nu, wnxd, wnyd, wnzd, gnxd, gnyd, gnzd, goxd, goyd, gozd, co, fdd); });
+    }
     cudaCheck(cudaGetLastError(), "deviceSAZdesFd");
 }
 
@@ -537,7 +598,12 @@ void deviceSADDESdTilda(int nC, const DeviceBuffer<scalar>& y, const DeviceBuffe
     const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& dTilda)
 {
     dTilda.resize(nC);
-    saDdesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), V.data(), gradU.data(), nuTilda.data(), nu, co, nullptr, nullptr, dTilda.data());
+    {
+        const scalar* yd = y.data(); const scalar* Vd = V.data(); const scalar* gradUd = gradU.data();
+        const scalar* nuTildaD = nuTilda.data(); scalar* dTildad = dTilda.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            saDdesDTildaKernel(nC, yd, Vd, gradUd, nuTildaD, nu, co, nullptr, nullptr, dTildad); });
+    }
     cudaCheck(cudaGetLastError(), "deviceSADDESdTilda");
 }
 
@@ -548,7 +614,12 @@ void deviceSAIDDESdTilda(int nC, const DeviceBuffer<scalar>& y, const DeviceBuff
     const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& dTilda)
 {
     dTilda.resize(nC);
-    saIddesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), gradU.data(), nuTilda.data(), nu, hmax.data(), hwn.data(), co, dTilda.data());
+    {
+        const scalar* yd = y.data(); const scalar* gradUd = gradU.data(); const scalar* nuTildaD = nuTilda.data();
+        const scalar* hmaxd = hmax.data(); const scalar* hwnd = hwn.data(); scalar* dTildad = dTilda.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            saIddesDTildaKernel(nC, yd, gradUd, nuTildaD, nu, hmaxd, hwnd, co, dTildad); });
+    }
     cudaCheck(cudaGetLastError(), "deviceSAIDDESdTilda");
 }
 
@@ -559,35 +630,63 @@ void deviceSAStilda(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU, con
     const DeviceBuffer<scalar>& y, scalar nu, const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& Stilda)
 {
     const int nC = dm.nCells; Stilda.resize(nC);
-    saStildaKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), nuTilda.data(), y.data(), nu, co, Stilda.data());
+    {
+        const scalar* gradUd = gradU.data(); const scalar* nuTildaD = nuTilda.data(); const scalar* yd = y.data();
+        scalar* Stildad = Stilda.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            saStildaKernel(nC, gradUd, nuTildaD, yd, nu, co, Stildad); });
+    }
     cudaCheck(cudaGetLastError(), "deviceSAStilda");
 }
 void deviceSAFw(const DeviceMesh& dm, const DeviceBuffer<scalar>& nuTilda, const DeviceBuffer<scalar>& Stilda,
     const DeviceBuffer<scalar>& y, const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& fw)
 {
     const int nC = dm.nCells; fw.resize(nC);
-    saFwKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), Stilda.data(), y.data(), co, fw.data());
+    {
+        const scalar* nuTildaD = nuTilda.data(); const scalar* StildaD = Stilda.data(); const scalar* yd = y.data();
+        scalar* fwd = fw.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            saFwKernel(nC, nuTildaD, StildaD, yd, co, fwd); });
+    }
     cudaCheck(cudaGetLastError(), "deviceSAFw");
 }
 void deviceSAMagSqr(const DeviceMesh& dm, const DeviceBuffer<scalar>& gx, const DeviceBuffer<scalar>& gy,
     const DeviceBuffer<scalar>& gz, DeviceBuffer<scalar>& out)
 {
     const int nC = dm.nCells; out.resize(nC);
-    saMagSqrKernel<<<nBlocks(nC), TPB>>>(nC, gx.data(), gy.data(), gz.data(), out.data());
+    {
+        const scalar* gxd = gx.data(); const scalar* gyd = gy.data(); const scalar* gzd = gz.data();
+        scalar* outd = out.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            saMagSqrKernel(nC, gxd, gyd, gzd, outd); });
+    }
     cudaCheck(cudaGetLastError(), "deviceSAMagSqr");
 }
 void deviceSADEff(const DeviceMesh& dm, const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar sigmaNut, DeviceBuffer<scalar>& D)
 {
     const int nC = dm.nCells; D.resize(nC);
-    saDEffKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), nu, sigmaNut, D.data());
+    {
+        const scalar* nuTildaD = nuTilda.data(); scalar* Dd = D.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            saDEffKernel(nC, nuTildaD, nu, sigmaNut, Dd); });
+    }
     cudaCheck(cudaGetLastError(), "deviceSADEff");
 }
 void deviceSAReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& nuTilda, const DeviceBuffer<scalar>& Stilda,
     const DeviceBuffer<scalar>& fw, const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& gradNt2,
     const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src)
 {
-    saReactionKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.V.data(), nuTilda.data(), Stilda.data(),
-        fw.data(), y.data(), gradNt2.data(), co, diag.data(), src.data());
+    const int nC = dm.nCells;
+    const scalar* Vd = dm.V.data();
+    const scalar* nuTildaD = nuTilda.data();
+    const scalar* StildaD = Stilda.data();
+    const scalar* fwD = fw.data();
+    const scalar* yD = y.data();
+    const scalar* gradNt2D = gradNt2.data();
+    scalar* diagD = diag.data();
+    scalar* srcD = src.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+        saReactionKernel(nC, Vd, nuTildaD, StildaD, fwD, yD, gradNt2D, co, diagD, srcD); });
     cudaCheck(cudaGetLastError(), "deviceSAReaction");
 }
 

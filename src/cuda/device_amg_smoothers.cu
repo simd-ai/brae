@@ -11,6 +11,7 @@
 #include "amg_kernels.cuh"         // smoothT / zeroT / gsColorT (templated V-cycle kernels)
 #include "device_ldu.cuh"          // DeviceLduView / deviceAmul
 #include "device_blas.cuh"         // deviceDot / deviceScale / deviceCopy
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 #include <cmath>
 
@@ -18,7 +19,7 @@ namespace brae {
 
 namespace {
 // z = src/diag: applies the diagonal (Jacobi) preconditioner, used by the power iteration on D^-1 A.
-__global__
+__device__
 void invDiagMulK(
     int n,
     const scalar* __restrict__ src,
@@ -29,7 +30,7 @@ void invDiagMulK(
     if (i < n) z[i] = src[i]/diag[i];
 }
 // Chebyshev polynomial smoother step: d = c1*d + c2*(b - Ax)/diag ; x += d.
-__global__
+__device__
 void chebStepK(
     int n,
     const scalar* __restrict__ b,
@@ -47,7 +48,7 @@ void chebStepK(
 }
 // twoStageGaussSeidel kernels (BRAE_AMG_TSGS). upperMul = strictly-upper-triangle SpMV r = U z; the tsgs* kernels
 // below are the fused Jacobi/correction updates of the polynomial expansion.
-__global__
+__device__
 void upperMulK(
     int n,
     const label* __restrict__ ownerStart,
@@ -65,7 +66,7 @@ void upperMulK(
 }
 // lowerMul = strictly-lower-triangle SpMV r = L z, the transpose of upperMul for the symmetric matrix. Pre-smooth
 // with U and post-smooth with L so the V-cycle preconditioner stays symmetric, as the AMG-PCG outer solver requires.
-__global__
+__device__
 void lowerMulK(
     int n,
     const label* __restrict__ losortStart,
@@ -85,7 +86,7 @@ void lowerMulK(
     }
     r[c] = s;
 }
-__global__
+__device__
 void tsgsZUpdateK(
     int n,
     const scalar* __restrict__ b,
@@ -102,7 +103,7 @@ void tsgsZUpdateK(
         x[i]+=zi;
     }
 }
-__global__
+__device__
 void tsgsCorrSaveK(
     int n,
     const scalar* __restrict__ r,
@@ -119,7 +120,7 @@ void tsgsCorrSaveK(
         x[i]+=mult*zi;
     }
 }
-__global__
+__device__
 void tsgsCorrLastK(
     int n,
     const scalar* __restrict__ r,
@@ -139,7 +140,7 @@ void tsgsCorrLastK(
 // top modes ABOVE the interval, where the Chebyshev polynomial amplifies rather than damps them
 // -> the smoother diverges (observed as a stall at ~1.6e-3 on a 1M-cell Laplacian). A period-7
 // sawtooth injects broad spectral content, exactly as the SA path's hostSpectralRadius does.
-__global__
+__device__
 void fillSeedK(
     int n,
     scalar* __restrict__ x)
@@ -157,7 +158,7 @@ static scalar estimateLambdaMax(
     DeviceBuffer<scalar>& z)
 {
     const int n = A.nCells;
-    fillSeedK<<<nBlocks(n),TPB>>>(n, x.data());
+    { scalar* xd = x.data(); pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { fillSeedK(n, xd); }); }
     scalar lam = 1.0;
     // 25 iterations, not 12: power iteration converges to lambda_max FROM BELOW, and every ms of
     // under-estimate risks divergence in the Chebyshev smoother, while an over-estimate only mildly
@@ -168,7 +169,10 @@ static scalar estimateLambdaMax(
         if (!(nrm > 0.0)) break;
         deviceScale(x, 1.0/nrm);                                  // x <- x/||x||
         deviceAmul(A, x, ax);                                     // ax = A x
-        invDiagMulK<<<nBlocks(n),TPB>>>(n, ax.data(), A.diag, z.data());  // z = D^-1 A x
+        {
+            const scalar* axd = ax.data(); const scalar* diag = A.diag; scalar* zd = z.data();
+            pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { invDiagMulK(n, axd, diag, zd); });  // z = D^-1 A x
+        }
         lam = std::sqrt(deviceDot(z, z));                         // ||D^-1 A x|| (||x||=1) -> Rayleigh-quotient bound
         deviceCopy(x, z);
     }
@@ -209,16 +213,24 @@ void chebyshevSmooth(
     // under-covering it diverges. 1.2 (not 1.1) buys margin for the residual under-estimate.
     const scalar upper = CHEB_UPPER_SAFETY*lambdaMax, lower = upper/CHEB_EIGRATIO;
     const scalar theta = 0.5*(upper+lower), delta = 0.5*(upper-lower), sigma = theta/delta;
-    zeroT<scalar><<<nBlocks(n),TPB>>>(n, d.data());                       // avoid 0*Inf=NaN on the c1=0 first step
+    zeroTLaunch<scalar>(n, d.data());                       // avoid 0*Inf=NaN on the c1=0 first step
     deviceAmul(A, x, ax);                                        // step 0: d = (1/theta)(b-Ax)/D ; x += d
-    chebStepK<<<nBlocks(n),TPB>>>(n, b.data(), ax.data(), A.diag, 0.0, 1.0/theta, d.data(), x.data());
+    {
+        const scalar* bd = b.data(); const scalar* axd = ax.data(); const scalar* diag = A.diag;
+        scalar* dd = d.data(); scalar* xd = x.data(); const scalar c2 = 1.0/theta;
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { chebStepK(n, bd, axd, diag, 0.0, c2, dd, xd); });
+    }
     scalar rho = 1.0/sigma;
     for (int k = 1; k < deg; ++k)
     {
         const scalar rhoNew = 1.0/(2.0*sigma - rho);
         const scalar c1 = rho*rhoNew, c2 = 2.0*rhoNew/delta;
         deviceAmul(A, x, ax);
-        chebStepK<<<nBlocks(n),TPB>>>(n, b.data(), ax.data(), A.diag, c1, c2, d.data(), x.data());
+        {
+            const scalar* bd = b.data(); const scalar* axd = ax.data(); const scalar* diag = A.diag;
+            scalar* dd = d.data(); scalar* xd = x.data();
+            pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { chebStepK(n, bd, axd, diag, c1, c2, dd, xd); });
+        }
         rho = rhoNew;
     }
 }
@@ -249,17 +261,39 @@ void twoStageGSSmooth(
         deviceAmul(A, x, r);                                                                 // r = A x
         if (order == 0)   // == weighted Jacobi
         {
-            smoothT<scalar><<<nBlocks(n),TPB>>>(n, b.data(), r.data(), A.diag, x.data());
+            smoothTLaunch<scalar>(n, b.data(), r.data(), A.diag, x.data());
             continue;
         }
-        tsgsZUpdateK<<<nBlocks(n),TPB>>>(n, b.data(), r.data(), A.diag, z.data(), x.data());  // z=(b-Ax)/D; x+=z
+        {
+            const scalar* bd = b.data(); const scalar* rd = r.data(); const scalar* diag = A.diag;
+            scalar* zd = z.data(); scalar* xd = x.data();
+            pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { tsgsZUpdateK(n, bd, rd, diag, zd, xd); });  // z=(b-Ax)/D; x+=z
+        }
         scalar mult = -1.0;
         for (int k = 0; k < order; ++k)
         {
-            if (forward) upperMulK<<<nBlocks(n),TPB>>>(n, A.ownerStart, A.nei, A.upper, z.data(), r.data());              // r = U z (pre)
-            else         lowerMulK<<<nBlocks(n),TPB>>>(n, A.losortStart, A.losort, A.owner, A.lower, z.data(), r.data()); // r = L z (post -> symmetric)
-            if (k < order - 1) tsgsCorrSaveK<<<nBlocks(n),TPB>>>(n, r.data(), A.diag, mult, z.data(), x.data());
-            else               tsgsCorrLastK<<<nBlocks(n),TPB>>>(n, r.data(), A.diag, mult, x.data());
+            if (forward)
+            {
+                const label* ownerStart = A.ownerStart; const label* nei = A.nei; const scalar* upper = A.upper;
+                const scalar* zd = z.data(); scalar* rd = r.data();
+                pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { upperMulK(n, ownerStart, nei, upper, zd, rd); });              // r = U z (pre)
+            }
+            else
+            {
+                const label* losortStart = A.losortStart; const label* losort = A.losort; const label* owner = A.owner;
+                const scalar* lower = A.lower; const scalar* zd = z.data(); scalar* rd = r.data();
+                pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { lowerMulK(n, losortStart, losort, owner, lower, zd, rd); }); // r = L z (post -> symmetric)
+            }
+            if (k < order - 1)
+            {
+                const scalar* rd = r.data(); const scalar* diag = A.diag; scalar* zd = z.data(); scalar* xd = x.data();
+                pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { tsgsCorrSaveK(n, rd, diag, mult, zd, xd); });
+            }
+            else
+            {
+                const scalar* rd = r.data(); const scalar* diag = A.diag; scalar* xd = x.data();
+                pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { tsgsCorrLastK(n, rd, diag, mult, xd); });
+            }
             mult = -mult;
         }
     }
@@ -282,7 +316,7 @@ void gsSweep(
         const int lo = gc.startH[col], hi = gc.startH[col+1];
         const int nc = hi - lo;
         if (nc <= 0) continue;
-        gsColorT<scalar><<<nBlocks(nc),TPB>>>(lo, hi, gc.cells.data(), b.data(), A.diag,
+        gsColorTLaunch<scalar>(lo, hi, gc.cells.data(), b.data(), A.diag,
             A.ownerStart, A.nei, A.upper, A.losortStart, A.losort, A.owner, A.lower, x.data());
     }
 }

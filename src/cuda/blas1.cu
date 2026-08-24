@@ -2,6 +2,7 @@
 // (coefficient by pointer, no host sync), the single-thread scalar-recurrence ops, and the FUSED multi-term Krylov
 // updates (one pass, bit-identical FP sequence). Split from device_blas.cu (reductions in reductions.cu).
 #include "device_blas.cuh"
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -11,7 +12,7 @@ constexpr int TPB = 256;
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 
 
-__global__
+__device__
 void axpyKernel(scalar a, const scalar* __restrict__ x, scalar* __restrict__ y, int n)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -19,7 +20,7 @@ void axpyKernel(scalar a, const scalar* __restrict__ x, scalar* __restrict__ y, 
 }
 
 
-__global__
+__device__
 void scaleKernel(scalar a, scalar* __restrict__ x, int n)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -27,7 +28,7 @@ void scaleKernel(scalar a, scalar* __restrict__ x, int n)
 }
 
 
-__global__
+__device__
 void jacobiKernel(const scalar* __restrict__ r, const scalar* __restrict__ diag, scalar* __restrict__ z, int n)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -35,7 +36,7 @@ void jacobiKernel(const scalar* __restrict__ r, const scalar* __restrict__ diag,
 }
 
 
-__global__
+__device__
 void hadamardKernel(const scalar* __restrict__ a, const scalar* __restrict__ b, scalar* __restrict__ out, int n)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -44,7 +45,7 @@ void hadamardKernel(const scalar* __restrict__ a, const scalar* __restrict__ b, 
 
 
 // device-resident-scalar variants: the coefficient lives in device memory (read by pointer), never on the host.
-__global__
+__device__
 void axpyDevKernel(const scalar* __restrict__ a, const scalar* __restrict__ x, scalar* __restrict__ y, int n)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -52,7 +53,7 @@ void axpyDevKernel(const scalar* __restrict__ a, const scalar* __restrict__ x, s
 }
 
 
-__global__
+__device__
 void scaleDevKernel(const scalar* __restrict__ a, scalar* __restrict__ x, int n)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -61,7 +62,7 @@ void scaleDevKernel(const scalar* __restrict__ a, scalar* __restrict__ x, int n)
 
 
 // single-thread scalar recurrence ops (cheap launch, NO host sync, same IEEE double op as the host did).
-__global__
+__device__
 void scalarDivK(const scalar* num, const scalar* den, scalar* out)
 {
     // Guard the pressure-PCG divide (den = pAp / wArAold): a near-zero/breakdown denominator yields 0 (no update this
@@ -70,28 +71,28 @@ void scalarDivK(const scalar* num, const scalar* den, scalar* out)
 }
 
 
-__global__
+__device__
 void scalarDivNegK(const scalar* num, const scalar* den, scalar* out, scalar* outNeg)
 {
     if (threadIdx.x == 0 && blockIdx.x == 0) { const scalar d = *den; const scalar q = (fabs(d) > scalar(1e-300)) ? (*num) / d : scalar(0); *out = q; *outNeg = -q; }
 }
 
 
-__global__
+__device__
 void scalarCopyK(const scalar* src, scalar* dst)
 {
     if (threadIdx.x == 0 && blockIdx.x == 0) *dst = *src;
 }
 
 
-__global__
+__device__
 void scalarDivConstK(const scalar* num, scalar denom, scalar* out)
 {
     if (threadIdx.x == 0 && blockIdx.x == 0) *out = (*num) / denom;
 }
 
 
-__global__
+__device__
 void scalarAdd2K(const scalar* a, const scalar* b, scalar c, scalar* out)
 {
     if (threadIdx.x == 0 && blockIdx.x == 0) *out = (*a) + (*b) + c;   // matches host (a+b)+c associativity
@@ -102,7 +103,7 @@ void scalarAdd2K(const scalar* a, const scalar* b, scalar c, scalar* out)
 // sequence of the separate kernels it replaces (fma() where axpy/axpyDev contract under --fmad=true; __dmul_rn for a
 // scale so a new mul+add does NOT contract) -> BIT-IDENTICAL, not just machine-precision. Device-scalar coeffs by ptr.
 // pA = rA + beta*(pA - omega*AyA)   [replaces axpyDev(negOmega,AyA,pA) + scaleDev(beta,pA) + axpy(1,rA,pA)]
-__global__
+__device__
 void fusedBicgPK(
     const scalar* __restrict__ rA,
     scalar* __restrict__ pA,
@@ -120,7 +121,7 @@ void fusedBicgPK(
 
 
 // out = src + a*x   [replaces copy(src->out) + axpyDev(a,x,out)]
-__global__
+__device__
 void fusedSxpyK(
     scalar* __restrict__ out,
     const scalar* __restrict__ src,
@@ -134,7 +135,7 @@ void fusedSxpyK(
 
 
 // y += a*x1 + b*x2   [replaces axpyDev(a,x1,y) + axpyDev(b,x2,y)]
-__global__
+__device__
 void fusedAxpy2K(
     scalar* __restrict__ y,
     const scalar* __restrict__ a,
@@ -152,7 +153,7 @@ void fusedAxpy2K(
 
 
 // p = b*p + w   [replaces scaleDev(b,p) + axpy(1,w,p)]
-__global__
+__device__
 void fusedScaleAxpyK(scalar* __restrict__ p, const scalar* __restrict__ b, const scalar* __restrict__ w, int n)
 {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
@@ -164,7 +165,9 @@ void fusedScaleAxpyK(scalar* __restrict__ p, const scalar* __restrict__ b, const
 void deviceAxpy(scalar a, const DeviceBuffer<scalar>& x, DeviceBuffer<scalar>& y)
 {
     const int n = static_cast<int>(x.size());
-    axpyKernel<<<nBlocks(n), TPB>>>(a, x.data(), y.data(), n);
+    const scalar* xd = x.data();
+    scalar* yd = y.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { axpyKernel(a, xd, yd, n); });
     cudaCheck(cudaGetLastError(), "axpy");
 }
 
@@ -172,7 +175,8 @@ void deviceAxpy(scalar a, const DeviceBuffer<scalar>& x, DeviceBuffer<scalar>& y
 void deviceScale(DeviceBuffer<scalar>& x, scalar a)
 {
     const int n = static_cast<int>(x.size());
-    scaleKernel<<<nBlocks(n), TPB>>>(a, x.data(), n);
+    scalar* xd = x.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { scaleKernel(a, xd, n); });
     cudaCheck(cudaGetLastError(), "scale");
 }
 
@@ -192,7 +196,9 @@ void deviceJacobi(DeviceBuffer<scalar>& z, const DeviceBuffer<scalar>& r, const 
 {
     const int n = static_cast<int>(r.size());
     z.resize(n);
-    jacobiKernel<<<nBlocks(n), TPB>>>(r.data(), diag, z.data(), n);
+    const scalar* rd = r.data();
+    scalar* zd = z.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { jacobiKernel(rd, diag, zd, n); });
     cudaCheck(cudaGetLastError(), "jacobi");
 }
 
@@ -200,7 +206,7 @@ void deviceJacobi(DeviceBuffer<scalar>& z, const DeviceBuffer<scalar>& r, const 
 // out = a ./ b. A zero denominator yields zero rather than a NaN: the only caller is the transonic
 // pressure equation, where a face with rho_f = 0 has no flux to carry anyway, and a NaN there would
 // propagate silently into the whole matrix.
-__global__
+__device__
 void divideKernel(const scalar* __restrict__ a, const scalar* __restrict__ b, scalar* __restrict__ out, int n)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -213,7 +219,10 @@ void deviceDivide(DeviceBuffer<scalar>& out, const DeviceBuffer<scalar>& a, cons
 {
     const int n = static_cast<int>(a.size());
     out.resize(n);
-    divideKernel<<<nBlocks(n), TPB>>>(a.data(), b.data(), out.data(), n);
+    const scalar* ad = a.data();
+    const scalar* bd = b.data();
+    scalar* od = out.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { divideKernel(ad, bd, od, n); });
     cudaCheck(cudaGetLastError(), "divide");
 }
 
@@ -222,7 +231,10 @@ void deviceHadamard(DeviceBuffer<scalar>& out, const DeviceBuffer<scalar>& a, co
 {
     const int n = static_cast<int>(a.size());
     out.resize(n);
-    hadamardKernel<<<nBlocks(n), TPB>>>(a.data(), b.data(), out.data(), n);
+    const scalar* ad = a.data();
+    const scalar* bd = b.data();
+    scalar* od = out.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { hadamardKernel(ad, bd, od, n); });
     cudaCheck(cudaGetLastError(), "hadamard");
 }
 
@@ -236,7 +248,10 @@ void deviceFusedBicgP(
     const scalar* negOmega)
 {
     const int n = static_cast<int>(pA.size());
-    fusedBicgPK<<<nBlocks(n), TPB>>>(rA.data(), pA.data(), AyA.data(), beta, negOmega, n);
+    const scalar* rAd = rA.data();
+    scalar* pAd = pA.data();
+    const scalar* AyAd = AyA.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { fusedBicgPK(rAd, pAd, AyAd, beta, negOmega, n); });
     cudaCheck(cudaGetLastError(), "fusedBicgP");
 }
 
@@ -245,7 +260,10 @@ void deviceFusedSxpy(DeviceBuffer<scalar>& out, const DeviceBuffer<scalar>& src,
 {
     const int n = static_cast<int>(src.size());
     out.resize(n);
-    fusedSxpyK<<<nBlocks(n), TPB>>>(out.data(), src.data(), a, x.data(), n);
+    scalar* outd = out.data();
+    const scalar* srcd = src.data();
+    const scalar* xd = x.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { fusedSxpyK(outd, srcd, a, xd, n); });
     cudaCheck(cudaGetLastError(), "fusedSxpy");
 }
 
@@ -253,7 +271,10 @@ void deviceFusedSxpy(DeviceBuffer<scalar>& out, const DeviceBuffer<scalar>& src,
 void deviceFusedAxpy2(DeviceBuffer<scalar>& y, const scalar* a, const DeviceBuffer<scalar>& x1, const scalar* b, const DeviceBuffer<scalar>& x2)
 {
     const int n = static_cast<int>(y.size());
-    fusedAxpy2K<<<nBlocks(n), TPB>>>(y.data(), a, x1.data(), b, x2.data(), n);
+    scalar* yd = y.data();
+    const scalar* x1d = x1.data();
+    const scalar* x2d = x2.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { fusedAxpy2K(yd, a, x1d, b, x2d, n); });
     cudaCheck(cudaGetLastError(), "fusedAxpy2");
 }
 
@@ -261,7 +282,9 @@ void deviceFusedAxpy2(DeviceBuffer<scalar>& y, const scalar* a, const DeviceBuff
 void deviceFusedScaleAxpy(DeviceBuffer<scalar>& p, const scalar* b, const DeviceBuffer<scalar>& w)
 {
     const int n = static_cast<int>(p.size());
-    fusedScaleAxpyK<<<nBlocks(n), TPB>>>(p.data(), b, w.data(), n);
+    scalar* pd = p.data();
+    const scalar* wd = w.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { fusedScaleAxpyK(pd, b, wd, n); });
     cudaCheck(cudaGetLastError(), "fusedScaleAxpy");
 }
 
@@ -269,7 +292,9 @@ void deviceFusedScaleAxpy(DeviceBuffer<scalar>& p, const scalar* b, const Device
 void deviceAxpyDev(const scalar* dA, const DeviceBuffer<scalar>& x, DeviceBuffer<scalar>& y)
 {
     const int n = static_cast<int>(x.size());
-    axpyDevKernel<<<nBlocks(n), TPB>>>(dA, x.data(), y.data(), n);
+    const scalar* xd = x.data();
+    scalar* yd = y.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { axpyDevKernel(dA, xd, yd, n); });
     cudaCheck(cudaGetLastError(), "axpyDev");
 }
 
@@ -277,42 +302,43 @@ void deviceAxpyDev(const scalar* dA, const DeviceBuffer<scalar>& x, DeviceBuffer
 void deviceScaleDev(const scalar* dA, DeviceBuffer<scalar>& x)
 {
     const int n = static_cast<int>(x.size());
-    scaleDevKernel<<<nBlocks(n), TPB>>>(dA, x.data(), n);
+    scalar* xd = x.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { scaleDevKernel(dA, xd, n); });
     cudaCheck(cudaGetLastError(), "scaleDev");
 }
 
 
 void deviceScalarDiv(const scalar* num, const scalar* den, scalar* out)
 {
-    scalarDivK<<<1, 1>>>(num, den, out);
+    pcudaParallelFor(1, 1, [=] __device__ () { scalarDivK(num, den, out); });
     cudaCheck(cudaGetLastError(), "scalarDiv");
 }
 
 
 void deviceScalarDivNeg(const scalar* num, const scalar* den, scalar* out, scalar* outNeg)
 {
-    scalarDivNegK<<<1, 1>>>(num, den, out, outNeg);
+    pcudaParallelFor(1, 1, [=] __device__ () { scalarDivNegK(num, den, out, outNeg); });
     cudaCheck(cudaGetLastError(), "scalarDivNeg");
 }
 
 
 void deviceScalarCopy(const scalar* src, scalar* dst)
 {
-    scalarCopyK<<<1, 1>>>(src, dst);
+    pcudaParallelFor(1, 1, [=] __device__ () { scalarCopyK(src, dst); });
     cudaCheck(cudaGetLastError(), "scalarCopy");
 }
 
 
 void deviceScalarDivConst(const scalar* num, scalar denom, scalar* out)
 {
-    scalarDivConstK<<<1, 1>>>(num, denom, out);
+    pcudaParallelFor(1, 1, [=] __device__ () { scalarDivConstK(num, denom, out); });
     cudaCheck(cudaGetLastError(), "scalarDivConst");
 }
 
 
 void deviceScalarAdd2(const scalar* a, const scalar* b, scalar c, scalar* out)
 {
-    scalarAdd2K<<<1, 1>>>(a, b, c, out);
+    pcudaParallelFor(1, 1, [=] __device__ () { scalarAdd2K(a, b, c, out); });
     cudaCheck(cudaGetLastError(), "scalarAdd2");
 }
 

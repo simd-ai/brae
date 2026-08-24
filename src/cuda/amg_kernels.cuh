@@ -8,6 +8,7 @@
 // come from device_amg_detail.cuh (inlined per TU). The non-template single-precision K kernels stay in device_amg.cu.
 // ---------------------------------------------------------------------------------------------------------------
 #include "device_amg_detail.cuh"  // safeDiag<T>, OMEGA, and cf_types (scalar/label)
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -15,7 +16,7 @@ namespace brae {
 // V-cycle / FP32 GS. T(OMEGA) and T(0) reproduce the FP64 and FP32 constants exactly, so each instantiation is
 // byte-identical to the hand-written twin it replaces.
 template <typename T>
-__global__
+__device__
 void zeroT(
     int n,
     T* x)
@@ -23,9 +24,14 @@ void zeroT(
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i < n) x[i] = T(0);
 }
+template <typename T>
+inline void zeroTLaunch(int n, T* x)
+{
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { zeroT<T>(n, x); });
+}
 // weighted-Jacobi update: x += omega*(b - Ax)/diag
 template <typename T>
-__global__
+__device__
 void smoothT(
     int n,
     const T* __restrict__ b,
@@ -37,7 +43,12 @@ void smoothT(
     if (i < n) x[i] += T(OMEGA)*(b[i]-Ax[i])/safeDiag(diag[i]);   // safeDiag: floor the (FP32) diagonal, never divide by ~0 -> no Inf/NaN preconditioner
 }
 template <typename T>
-__global__
+inline void smoothTLaunch(int n, const T* b, const T* Ax, const T* diag, T* x)
+{
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { smoothT<T>(n, b, Ax, diag, x); });
+}
+template <typename T>
+__device__
 void residualT(
     int n,
     const T* __restrict__ b,
@@ -47,10 +58,15 @@ void residualT(
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i < n) r[i] = b[i]-Ax[i];
 }
+template <typename T>
+inline void residualTLaunch(int n, const T* b, const T* Ax, T* r)
+{
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { residualT<T>(n, b, Ax, r); });
+}
 // One color of in-place Gauss-Seidel: cells in [lo,hi) share no face, so the writes never race and the
 // off-diagonal reads pick up already-swept colors -> true GS, not Jacobi. Same LDU gather as the SpMV.
 template <typename T>
-__global__
+__device__
 void gsColorT(
     int lo,
     int hi,
@@ -79,9 +95,18 @@ void gsColorT(
     }
     x[c] = (b[c] - off) / safeDiag(diag[c]);   // safeDiag: floor the (FP32) diagonal, never divide by ~0
 }
+template <typename T>
+inline void gsColorTLaunch(int lo, int hi, const label* cells, const T* b, const T* diag,
+    const label* ownerStart, const label* nei, const T* upper,
+    const label* losortStart, const label* losort, const label* owner, const T* lower, T* x)
+{
+    const int n = hi - lo;
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+        gsColorT<T>(lo, hi, cells, b, diag, ownerStart, nei, upper, losortStart, losort, owner, lower, x); });
+}
 
 template <typename T>
-__global__
+__device__
 void restrictT(
     int nF,
     const label* __restrict__ map,
@@ -92,7 +117,12 @@ void restrictT(
     if (c < nF) atomicAdd(&rc[map[c]], r[c]);
 }
 template <typename T>
-__global__
+inline void restrictTLaunch(int nF, const label* map, const T* r, T* rc)
+{
+    pcudaParallelFor(nBlocks(nF), TPB, [=] __device__ () { restrictT<T>(nF, map, r, rc); });
+}
+template <typename T>
+__device__
 void prolongT(
     int nF,
     const label* __restrict__ map,
@@ -101,6 +131,11 @@ void prolongT(
 {
     const int c = blockIdx.x*blockDim.x + threadIdx.x;
     if (c < nF) x[c] += xc[map[c]];   // injection correction
+}
+template <typename T>
+inline void prolongTLaunch(int nF, const label* map, const T* xc, T* x)
+{
+    pcudaParallelFor(nBlocks(nF), TPB, [=] __device__ () { prolongT<T>(nF, map, xc, x); });
 }
 
 } // namespace brae

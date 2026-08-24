@@ -13,6 +13,7 @@
 #include "device_interface.cuh"  // interface<Op>() overloads dispatching to the cyclic/AMI backends
 #include "device_amg.cuh"        // deviceSymGaussSeidel (scalar smoothSolver, for stiff low-Re k/omega)
 #include "nut_wall_function.cuh" // nutkWallFunctionValue / yPlusWall (shared wall-nut physics, BRAE_HD)
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 #include <vector>
 
@@ -27,7 +28,7 @@ namespace {
 inline scalar yPlusLamHost(scalar kappa, scalar E) { scalar y = 11.0; for (int i = 0; i < 10; ++i) y = std::log(std::fmax(E * y, 1.0)) / kappa; return y; }
 
 
-__global__
+__device__
 void gByNuKernel(int nC, const scalar* __restrict__ gradU, scalar* __restrict__ gByNu)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -49,7 +50,7 @@ void gByNuKernel(int nC, const scalar* __restrict__ gradU, scalar* __restrict__ 
 }
 
 
-__global__
+__device__
 void nutKernel(int nC, const scalar* __restrict__ k, const scalar* __restrict__ eps, scalar Cmu, scalar* __restrict__ nut)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -60,7 +61,7 @@ void nutKernel(int nC, const scalar* __restrict__ k, const scalar* __restrict__ 
 // realizableKE rCmu (variable Cmu) + magS from the gradU tensor. S=devSymm(gradU); S2=2*magSqr(S); magS=sqrt(S2);
 // W=2sqrt2*tr(S^3)/(magS*S2); phis=acos(clamp(sqrt6*W,[-1,1]))/3; As=sqrt6*cos(phis); Us=sqrt(S2/2+magSqr(skew));
 // rCmu=1/(A0 + As*Us*k/eps).  (OF realizableKE::rCmu, gradU_ij = t[i*3+j] = dU_j/dx_i.)
-__global__
+__device__
 void rkeStrainKernel(
     int nC,
     const scalar* __restrict__ gradU,
@@ -107,7 +108,7 @@ void rkeStrainKernel(
 }
 
 
-__global__
+__device__
 void rkeNutKernel(
     int nC,
     const scalar* __restrict__ rCmu,
@@ -122,7 +123,7 @@ void rkeNutKernel(
 
 // realizableKE eps reaction: production C1*magS*eps (explicit), destruction fvm::Sp(C2*eps/(k+sqrt(nu*eps)),eps).
 // C1 = max(eta/(5+eta), 0.43), eta = magS*k/eps. No divU term (unlike standard kEpsilon).
-__global__
+__device__
 void rkeEpsReactionKernel(
     int nC,
     const scalar* __restrict__ V,
@@ -145,7 +146,7 @@ void rkeEpsReactionKernel(
 }
 
 
-__global__
+__device__
 void wallFnKernel(
     int nWF,
     const label* __restrict__ wfCell,
@@ -186,7 +187,7 @@ void wallFnKernel(
 
 
 // boundary nut per face: wall -> nutkWallFunction(k[cell], y, nu); else -> nut[cell] (calculated/extrapolated).
-__global__
+__device__
 void boundaryNutKernel(
     int n,
     const label* __restrict__ fc,
@@ -235,7 +236,7 @@ void boundaryNutKernel(
 }
 
 
-__global__
+__device__
 void epsReactionKernel(
     int nC,
     const scalar* __restrict__ V,
@@ -277,7 +278,7 @@ void epsReactionKernel(
 }
 
 
-__global__
+__device__
 void kReactionKernel(
     int nC,
     const scalar* __restrict__ V,
@@ -305,7 +306,7 @@ void kReactionKernel(
 
 // OF Foam::bound(): negative cells -> fvc::average(max(field,floor)) (local face-neighbour avg), positive cells ->
 // max(field,floor). Prevents nut=Cmu k^2/eps blowing up when limitedLinear overshoots eps<0 (vs clamping to floor).
-__global__
+__device__
 void boundClampKernel(int nC, scalar floor, const scalar* __restrict__ x, scalar* __restrict__ cl)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -313,7 +314,7 @@ void boundClampKernel(int nC, scalar floor, const scalar* __restrict__ x, scalar
 }
 
 
-__global__
+__device__
 void boundAvgGatherKernel(
     int nC,
     const label* __restrict__ ownerStart,
@@ -338,7 +339,7 @@ void boundAvgGatherKernel(
 }
 
 
-__global__
+__device__
 void boundApplyKernel(int nC, scalar floor, const scalar* __restrict__ avg, scalar* __restrict__ x)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -393,7 +394,8 @@ void deviceGradU(
 void deviceGByNuFromGradU(const DeviceBuffer<scalar>& gradU, int nC, DeviceBuffer<scalar>& gByNu)
 {
     gByNu.resize(nC);
-    gByNuKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), gByNu.data());
+    const scalar* gradUd = gradU.data(); scalar* gByNud = gByNu.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { gByNuKernel(nC, gradUd, gByNud); });
     cudaCheck(cudaGetLastError(), "gByNu");
 }
 
@@ -422,7 +424,8 @@ void deviceNut(
 {
     const int nC = static_cast<int>(k.size());
     nut.resize(nC);
-    nutKernel<<<nBlocks(nC), TPB>>>(nC, k.data(), eps.data(), co.Cmu, nut.data());
+    const scalar* kd = k.data(); const scalar* epsd = eps.data(); const scalar Cmu = co.Cmu; scalar* nutd = nut.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { nutKernel(nC, kd, epsd, Cmu, nutd); });
     cudaCheck(cudaGetLastError(), "nut");
 }
 
@@ -439,7 +442,9 @@ void deviceRealizableStrain(
 {
     rCmu.resize(nC);
     magS.resize(nC);
-    rkeStrainKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), k.data(), eps.data(), A0, rCmu.data(), magS.data());
+    const scalar *gradUd = gradU.data(), *kd = k.data(), *epsd = eps.data();
+    scalar *rCmud = rCmu.data(), *magSd = magS.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { rkeStrainKernel(nC, gradUd, kd, epsd, A0, rCmud, magSd); });
     cudaCheck(cudaGetLastError(), "rkeStrain");
 }
 
@@ -452,7 +457,8 @@ void deviceRealizableNut(
 {
     const int nC = static_cast<int>(k.size());
     nut.resize(nC);
-    rkeNutKernel<<<nBlocks(nC), TPB>>>(nC, rCmu.data(), k.data(), eps.data(), nut.data());
+    const scalar *rCmud = rCmu.data(), *kd = k.data(), *epsd = eps.data(); scalar* nutd = nut.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { rkeNutKernel(nC, rCmud, kd, epsd, nutd); });
     cudaCheck(cudaGetLastError(), "rkeNut");
 }
 
@@ -467,8 +473,14 @@ void deviceEpsReactionRealizable(
     DeviceBuffer<scalar>& diag,
     DeviceBuffer<scalar>& source)
 {
-    rkeEpsReactionKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.V.data(), eps.data(), k.data(), magS.data(),
-                                                      nu, C2, diag.data(), source.data());
+    {
+        const int nC = dm.nCells;
+        const scalar *Vd = dm.V.data(), *epsd = eps.data(), *kd = k.data(), *magSd = magS.data();
+        scalar *diagd = diag.data(), *sourced = source.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            rkeEpsReactionKernel(nC, Vd, epsd, kd, magSd, nu, C2, diagd, sourced);
+        });
+    }
     cudaCheck(cudaGetLastError(), "rkeEpsReaction");
 }
 
@@ -478,13 +490,22 @@ void deviceBoundField(const DeviceMesh& dm, DeviceBuffer<scalar>& x, scalar floo
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> cl(static_cast<std::size_t>(nC));
-    boundClampKernel<<<nBlocks(nC), TPB>>>(nC, floor, x.data(), cl.data());
+    scalar* xd = x.data(); scalar* cld = cl.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { boundClampKernel(nC, floor, xd, cld); });
     DeviceBuffer<scalar> fi;
     deviceInterpolate(dm, cl, fi);   // linearInterpolate(max(field,floor))
     DeviceBuffer<scalar> avg(static_cast<std::size_t>(nC));
-    boundAvgGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
-                                               dm.bndCellStart.data(), fi.data(), cl.data(), avg.data());
-    boundApplyKernel<<<nBlocks(nC), TPB>>>(nC, floor, avg.data(), x.data());
+    {
+        const label *ownerStart = dm.ownerStart.data(), *losort = dm.losort.data(), *losortStart = dm.losortStart.data();
+        const label* bndCellStart = dm.bndCellStart.data(); const scalar* fid = fi.data(); scalar* avgd = avg.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            boundAvgGatherKernel(nC, ownerStart, losort, losortStart, bndCellStart, fid, cld, avgd);
+        });
+    }
+    {
+        const scalar* avgd = avg.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { boundApplyKernel(nC, floor, avgd, xd); });
+    }
     cudaCheck(cudaGetLastError(), "boundField");
 }
 
@@ -512,10 +533,19 @@ void deviceWallEpsG0(
     cudaCheck(cudaMemsetAsync(G0.data(),   0, nC*sizeof(scalar), cudaStreamPerThread), "G0 zero");
     const scalar Cmu25 = std::pow(co.Cmu, 0.25), Cmu75 = std::pow(co.Cmu, 0.75), yplLam = yPlusLamHost(co.kappa, co.E);
     if (w.nWF > 0)
-        wallFnKernel<<<nBlocks(w.nWF), TPB>>>(w.nWF, w.wfCell.data(), w.wfY.data(), w.wfDc.data(), w.wfUwx.data(),
-                                              w.wfUwy.data(), w.wfUwz.data(), w.invNw.data(), k.data(), Ux.data(), Uy.data(),
-                                              Uz.data(), nu, yplLam, Cmu25, Cmu75, co.kappa, co.E, atmZ0, atmBoundNut, nutWall, eps0.data(), G0.data(),
-                                              (nuFace && nuFace->size()) ? nuFace->data() : nullptr);
+    {
+        const int nWF = w.nWF;
+        const label* wfCell = w.wfCell.data();
+        const scalar *wfY = w.wfY.data(), *wfDc = w.wfDc.data();
+        const scalar *wux = w.wfUwx.data(), *wuy = w.wfUwy.data(), *wuz = w.wfUwz.data(), *invNw = w.invNw.data();
+        const scalar *kd = k.data(), *Uxd = Ux.data(), *Uyd = Uy.data(), *Uzd = Uz.data();
+        const scalar kappa = co.kappa, E = co.E; scalar *eps0d = eps0.data(), *G0d = G0.data();
+        const scalar* nuFaced = (nuFace && nuFace->size()) ? nuFace->data() : nullptr;
+        pcudaParallelFor(nBlocks(nWF), TPB, [=] __device__ () {
+            wallFnKernel(nWF, wfCell, wfY, wfDc, wux, wuy, wuz, invNw, kd, Uxd, Uyd, Uzd, nu, yplLam, Cmu25, Cmu75,
+                        kappa, E, atmZ0, atmBoundNut, nutWall, eps0d, G0d, nuFaced);
+        });
+    }
     cudaCheck(cudaGetLastError(), "wallFn");
 }
 
@@ -531,11 +561,16 @@ void deviceEpsReaction(
     const KEpsilonCoeffs& co,
     const DeviceBuffer<scalar>* rho)
 {
-    epsReactionKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.V.data(), eps.data(), k.data(), gByNu.data(), divU.data(),
-                                                   co.C1, co.C2, co.C3, co.Cmu,
-                                                   co.rng ? 1 : 0, co.eta0, co.beta,
-                                                   diag.data(), source.data(),
-                                                   rho ? rho->data() : nullptr);
+    {
+        const int nC = dm.nCells;
+        const scalar *Vd = dm.V.data(), *epsd = eps.data(), *kd = k.data(), *gByNud = gByNu.data(), *divUd = divU.data();
+        const scalar C1 = co.C1, C2 = co.C2, C3 = co.C3, Cmu = co.Cmu, eta0 = co.eta0, beta = co.beta;
+        const int rng = co.rng ? 1 : 0;
+        scalar *diagd = diag.data(), *sourced = source.data(); const scalar* rhod = rho ? rho->data() : nullptr;
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            epsReactionKernel(nC, Vd, epsd, kd, gByNud, divUd, C1, C2, C3, Cmu, rng, eta0, beta, diagd, sourced, rhod);
+        });
+    }
     cudaCheck(cudaGetLastError(), "epsReaction");
 }
 
@@ -550,8 +585,14 @@ void deviceKReaction(
     DeviceBuffer<scalar>& source,
     const DeviceBuffer<scalar>* rho)
 {
-    kReactionKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.V.data(), k.data(), eps.data(), G.data(), divU.data(),
-                                                 diag.data(), source.data(), rho ? rho->data() : nullptr);
+    {
+        const int nC = dm.nCells;
+        const scalar *Vd = dm.V.data(), *kd = k.data(), *epsd = eps.data(), *Gd = G.data(), *divUd = divU.data();
+        scalar *diagd = diag.data(), *sourced = source.data(); const scalar* rhod = rho ? rho->data() : nullptr;
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            kReactionKernel(nC, Vd, kd, epsd, Gd, divUd, diagd, sourced, rhod);
+        });
+    }
     cudaCheck(cudaGetLastError(), "kReaction");
 }
 
@@ -577,13 +618,21 @@ void deviceBoundaryNut(
     // argument exists; compressible flow does not, so nuFace overrides it when supplied.
     nutBnd.resize(db.n);
     const scalar Cmu25 = std::pow(co.Cmu, 0.25), yplLam = yPlusLamHost(co.kappa, co.E);
-    boundaryNutKernel<<<nBlocks(db.n), TPB>>>(db.n, db.faceCell.data(), isWall.data(), y.data(), k.data(), nut.data(),
-                                              nu, yplLam, Cmu25, co.kappa, co.E, atmZ0, atmBoundNut, nutBnd.data(),
-                                              nuFace ? nuFace->data() : nullptr,
-                                              calcMask ? calcMask->data() : nullptr,
-                                              kBnd ? kBnd->data() : nullptr,
-                                              epsBnd ? epsBnd->data() : nullptr,
-                                              co.Cmu);
+    {
+        const int n = db.n;
+        const label* fc = db.faceCell.data(); const label* isWalld = isWall.data();
+        const scalar *yd = y.data(), *kd = k.data(), *nutd = nut.data();
+        const scalar kappa = co.kappa, E = co.E, Cmu = co.Cmu;
+        scalar* nutBndd = nutBnd.data();
+        const scalar* nuFaced = nuFace ? nuFace->data() : nullptr;
+        const label* calcMaskd = calcMask ? calcMask->data() : nullptr;
+        const scalar* kBndd = kBnd ? kBnd->data() : nullptr;
+        const scalar* epsBndd = epsBnd ? epsBnd->data() : nullptr;
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            boundaryNutKernel(n, fc, isWalld, yd, kd, nutd, nu, yplLam, Cmu25, kappa, E, atmZ0, atmBoundNut,
+                              nutBndd, nuFaced, calcMaskd, kBndd, epsBndd, Cmu);
+        });
+    }
     cudaCheck(cudaGetLastError(), "boundaryNut");
 }
 
@@ -592,7 +641,7 @@ void deviceBoundaryNut(
 
 // out = a/b, face by face. Turns the compressible MASS flux back into the volumetric one the turbulence
 // dilatation term needs (OF compressibleTurbulenceModel::phi()).
-__global__
+__device__
 void divideFaceK(
     int n,
     const scalar* __restrict__ a,
@@ -730,10 +779,16 @@ void deviceKEpsilonCorrect(
         deviceInterpolate(dm, *rho, rhoF);
         const int nIf = dm.nInternalFaces;
         DeviceBuffer<scalar> pvI(static_cast<std::size_t>(nIf));
-        divideFaceK<<<nBlocks(nIf), TPB>>>(nIf, phiInt.data(), rhoF.data(), pvI.data());
+        {
+            const scalar *phiIntd = phiInt.data(), *rhoFd = rhoF.data(); scalar* pvId = pvI.data();
+            pcudaParallelFor(nBlocks(nIf), TPB, [=] __device__ () { divideFaceK(nIf, phiIntd, rhoFd, pvId); });
+        }
         const int nB = static_cast<int>(phiBnd.size());
         DeviceBuffer<scalar> pvB(static_cast<std::size_t>(nB));
-        divideFaceK<<<nBlocks(nB), TPB>>>(nB, phiBnd.data(), rhoBnd->data(), pvB.data());
+        {
+            const scalar *phiBndd = phiBnd.data(), *rhoBndd = rhoBnd->data(); scalar* pvBd = pvB.data();
+            pcudaParallelFor(nBlocks(nB), TPB, [=] __device__ () { divideFaceK(nB, phiBndd, rhoBndd, pvBd); });
+        }
         cudaCheck(cudaGetLastError(), "keVolFlux");
         deviceDiv(dm, pvI, pvB, divU);
         if (ami && ami->n) interfaceAddDiv(*ami, dm.V, divU);
@@ -760,14 +815,22 @@ void deviceKEpsilonCorrect(
             wo << c << ' ' << (int)hIs[c] << ' ' << hW[c] << ' ' << hInv[c] << ' '
                << hE0[c] << ' ' << hG0[c] << ' ' << hE[c] << ' ' << hK[c] << '\n';
     }
-    overrideKernel<<<nBlocks(nC), TPB>>>(nC, wall.isWallCell.data(), G0.data(), eps0.data(), G.data(), eps.data(),
-                                          wall.wallW.size() ? wall.wallW.data() : nullptr);
+    {
+        const label* isWd = wall.isWallCell.data();
+        const scalar* G0d = G0.data(); scalar* eps0d = eps0.data(); scalar* Gd = G.data(); scalar* epsd = eps.data();
+        const scalar* wallWd = wall.wallW.size() ? wall.wallW.data() : nullptr;
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { overrideKernel(nC, isWd, G0d, eps0d, Gd, epsd, wallWd); });
+    }
 
     // epsilon equation (loose solve) with the near-wall setValues constraint
     // DepsilonEff = nut/sigmaEps + nu. OF's laplacian is alpha*rho*DepsilonEff, so compressible wants
     // rho*(nut/sigmaEps) + mu -- build it kinematic with nu=0 then scale, exactly as the SST does.
     DeviceBuffer<scalar> Deps(static_cast<std::size_t>(nC));
-    depsKernel<<<nBlocks(nC), TPB>>>(nC, nut.data(), co.sigmaEps, (rho ? scalar(0) : nu), Deps.data());
+    {
+        const scalar* nutd = nut.data(); const scalar sigmaEps = co.sigmaEps; const scalar nuArg = rho ? scalar(0) : nu;
+        scalar* Depsd = Deps.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { depsKernel(nC, nutd, sigmaEps, nuArg, Depsd); });
+    }
     if (rho && muLam) scaleDEffCompressibleKE(*rho, *muLam, Deps);
     // OF's laplacian(DepsilonEff, epsilon) uses the PATCH diffusivity, DepsilonEff(patchi) = nut_b/sigmaEps
     // + nu_b -- not the adjacent cell's. Identical wherever nut_b happens to equal nut_cell, which is why
@@ -777,8 +840,12 @@ void deviceKEpsilonCorrect(
     {
         const int nB = static_cast<int>(nutBnd->size());
         DepsB.resize(nB); DkB.resize(nB);
-        depsKernel<<<nBlocks(nB), TPB>>>(nB, nutBnd->data(), co.sigmaEps, (rho ? scalar(0) : nu), DepsB.data());
-        depsKernel<<<nBlocks(nB), TPB>>>(nB, nutBnd->data(), co.sigmaK,   (rho ? scalar(0) : nu), DkB.data());
+        {
+            const scalar* nutBndd = nutBnd->data(); const scalar sigmaEps = co.sigmaEps, sigmaK = co.sigmaK;
+            const scalar nuArg = rho ? scalar(0) : nu; scalar *DepsBd = DepsB.data(), *DkBd = DkB.data();
+            pcudaParallelFor(nBlocks(nB), TPB, [=] __device__ () { depsKernel(nB, nutBndd, sigmaEps, nuArg, DepsBd); });
+            pcudaParallelFor(nBlocks(nB), TPB, [=] __device__ () { depsKernel(nB, nutBndd, sigmaK, nuArg, DkBd); });
+        }
         cudaCheck(cudaGetLastError(), "DEffBnd");
         if (rho && rhoBnd && muBnd && muBnd->size())
         {
@@ -796,7 +863,11 @@ void deviceKEpsilonCorrect(
 
     // k equation (loose solve)
     DeviceBuffer<scalar> Dk(static_cast<std::size_t>(nC));
-    depsKernel<<<nBlocks(nC), TPB>>>(nC, nut.data(), co.sigmaK, (rho ? scalar(0) : nu), Dk.data());
+    {
+        const scalar* nutd = nut.data(); const scalar sigmaK = co.sigmaK; const scalar nuArg = rho ? scalar(0) : nu;
+        scalar* Dkd = Dk.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { depsKernel(nC, nutd, sigmaK, nuArg, Dkd); });
+    }
     if (rho && muLam) scaleDEffCompressibleKE(*rho, *muLam, Dk);
     deviceSolveScalarTransport(dm, dbK, k, "k", Dk, phiInt, phiBnd, divPhi, bounded, limitedK, linearUpwindK, nonOrth, twoBykK,
                                relaxK, tol, relTolKE, keCheckEvery, gsK,
@@ -817,7 +888,7 @@ namespace {  // wall-function nut kernels (spaldingNut/blendedNut), used by devi
 // nutUSpaldingWallFunction: wall faces -> Newton uTau from Spalding's law, nut = max(0, uTau^2/magGradU - nu).
 // magGradU = |snGrad U| = |U_cell|*deltaCoeffs (noSlip U_wall=0); magUp = |U_cell|; y = near-wall distance.
 // Warm-started from the previous wall nut (nutBnd in/out), 10 Newton iters with the OF tol=0.01 early-out.
-__global__
+__device__
 void spaldingNutKernel(
     int n,
     const label* __restrict__ fc,
@@ -854,7 +925,7 @@ void spaldingNutKernel(
 //   yPlus = y*uTau/nu ; uTauVis = magUp/yPlus ; uTauLog = kappa*magUp/log(max(E*yPlus, 1+1e-4)).
 // 10 iters, tol 1e-3, under-relaxed uTau update (ut = 0.5*(ut+utNew)), warm-started like the Spalding kernel.
 // magUp/magGradU use the same convention as spaldingNutKernel (|U_cell|, |snGrad U|=|U_cell|*deltaCoeffs).
-__global__
+__device__
 void blendedNutKernel(
     int n,
     const label* __restrict__ fc,
@@ -911,11 +982,17 @@ void deviceBoundaryNutSpalding(
         nutBnd.resize(n);
         cudaCheck(cudaMemsetAsync(nutBnd.data(), 0, n*sizeof(scalar), cudaStreamPerThread), "spalding init");
     }
-    spaldingNutKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].faceCell.data(), isWall.data(), y.data(),
-                                           dbU.comp[0].deltaCoeffs.data(), Ux.data(), Uy.data(), Uz.data(),
-                                           nutCell.data(), nu, co.kappa, co.E, nutBnd.data(),
-                                           nuFace ? nuFace->data() : nullptr,
-                                           nutFile ? nutFile->data() : nullptr);
+    {
+        const label* fc = dbU.comp[0].faceCell.data(); const label* isWalld = isWall.data();
+        const scalar *yd = y.data(), *dcd = dbU.comp[0].deltaCoeffs.data();
+        const scalar *Uxd = Ux.data(), *Uyd = Uy.data(), *Uzd = Uz.data(), *nutCelld = nutCell.data();
+        const scalar kappa = co.kappa, E = co.E; scalar* nutBndd = nutBnd.data();
+        const scalar* nuFaced = nuFace ? nuFace->data() : nullptr;
+        const scalar* nutFiled = nutFile ? nutFile->data() : nullptr;
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            spaldingNutKernel(n, fc, isWalld, yd, dcd, Uxd, Uyd, Uzd, nutCelld, nu, kappa, E, nutBndd, nuFaced, nutFiled);
+        });
+    }
     cudaCheck(cudaGetLastError(), "spaldingNut");
 }
 
@@ -947,11 +1024,17 @@ void deviceBoundaryNutBlended(
         nutBnd.resize(n);
         cudaCheck(cudaMemsetAsync(nutBnd.data(), 0, n*sizeof(scalar), cudaStreamPerThread), "blended init");
     }
-    blendedNutKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].faceCell.data(), isWall.data(), y.data(),
-                                          dbU.comp[0].deltaCoeffs.data(), Ux.data(), Uy.data(), Uz.data(),
-                                          nutCell.data(), nu, kappa, E, nutBnd.data(),
-                                          nuFace ? nuFace->data() : nullptr,
-                                          nutFile ? nutFile->data() : nullptr);
+    {
+        const label* fc = dbU.comp[0].faceCell.data(); const label* isWalld = isWall.data();
+        const scalar *yd = y.data(), *dcd = dbU.comp[0].deltaCoeffs.data();
+        const scalar *Uxd = Ux.data(), *Uyd = Uy.data(), *Uzd = Uz.data(), *nutCelld = nutCell.data();
+        scalar* nutBndd = nutBnd.data();
+        const scalar* nuFaced = nuFace ? nuFace->data() : nullptr;
+        const scalar* nutFiled = nutFile ? nutFile->data() : nullptr;
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            blendedNutKernel(n, fc, isWalld, yd, dcd, Uxd, Uyd, Uzd, nutCelld, nu, kappa, E, nutBndd, nuFaced, nutFiled);
+        });
+    }
     cudaCheck(cudaGetLastError(), "blendedNut");
 }
 
@@ -962,7 +1045,7 @@ namespace brae {
 namespace {
 // nutUWallFunction boundary nut: log-law yPlus, STEPWISE blend (OF's default). Shares the wall-face
 // geometry and the |U_cell - U_wall| convention with the Spalding/Blended kernels above.
-__global__
+__device__
 void nutUWallKernel(
     int n, const label* __restrict__ fc, const label* __restrict__ isWall,
     const scalar* __restrict__ y, const scalar* __restrict__ dc,
@@ -1000,11 +1083,17 @@ void deviceBoundaryNutU(
     const int n = dbU.comp[0].n;
     if (!n) return;
     if (static_cast<int>(nutBnd.size()) != n) nutBnd.resize(n);
-    nutUWallKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].faceCell.data(), isWall.data(), y.data(),
-                                        dbU.comp[0].deltaCoeffs.data(), Ux.data(), Uy.data(), Uz.data(),
-                                        nutCell.data(), nu, kappa, E, yPlusLamHost(kappa, E), nutBnd.data(),
-                                        nuFace ? nuFace->data() : nullptr,
-                                        nutFile ? nutFile->data() : nullptr);
+    {
+        const label* fc = dbU.comp[0].faceCell.data(); const label* isWalld = isWall.data();
+        const scalar *yd = y.data(), *dcd = dbU.comp[0].deltaCoeffs.data();
+        const scalar *Uxd = Ux.data(), *Uyd = Uy.data(), *Uzd = Uz.data(), *nutCelld = nutCell.data();
+        const scalar yplLam = yPlusLamHost(kappa, E); scalar* nutBndd = nutBnd.data();
+        const scalar* nuFaced = nuFace ? nuFace->data() : nullptr;
+        const scalar* nutFiled = nutFile ? nutFile->data() : nullptr;
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            nutUWallKernel(n, fc, isWalld, yd, dcd, Uxd, Uyd, Uzd, nutCelld, nu, kappa, E, yplLam, nutBndd, nuFaced, nutFiled);
+        });
+    }
     cudaCheck(cudaGetLastError(), "nutUWall");
 }
 

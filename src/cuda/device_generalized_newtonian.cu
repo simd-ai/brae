@@ -1,5 +1,6 @@
 // device_generalized_newtonian.cu -- see the header for the OF definitions this reproduces.
 #include "device_generalized_newtonian.cuh"
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -18,7 +19,7 @@ inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 // relying on the clamp is what makes that corner defined.
 constexpr scalar kSmall = 1.0e-15;
 
-__global__
+__device__
 void gnPowerLawMuKernel(
     int nC,
     const scalar* __restrict__ S2,
@@ -52,8 +53,12 @@ void deviceGeneralizedNewtonianPowerLawMu(
     const int nC = static_cast<int>(mu.size());
     if (nC == 0) return;
     if (static_cast<int>(S2.size()) != nC || static_cast<int>(rho.size()) != nC) return;
-    gnPowerLawMuKernel<<<nBlocks(nC), TPB>>>(
-        nC, S2.data(), rho.data(), nuMin, nuMax, n, mu.data());
+    const scalar* S2d = S2.data();
+    const scalar* rhod = rho.data();
+    scalar* mud = mu.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+        gnPowerLawMuKernel(nC, S2d, rhod, nuMin, nuMax, n, mud);
+    });
     cudaCheck(cudaGetLastError(), "generalizedNewtonianPowerLawMu");
 }
 

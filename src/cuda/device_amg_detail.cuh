@@ -125,6 +125,37 @@ T safeDiag(T d)
 // Block-wide dot product a.b, warp-shuffle reduce: each warp reduces its lanes with __shfl_down (no barrier), then
 // warp 0 reduces the per-warp partials. Three barriers per dot instead of ~log2(blockDim), which matters because the
 // single-block coarsest CG runs many sequential dots on one SM. red[] holds the per-warp partials; all threads return the sum.
+#ifdef BRAE_ACPP
+// PCUDA has no warp-shuffle, so this is a shared-memory tree reduction across the whole block instead;
+// red[] needs blockDim.x scalars (deviceCoarsePCG sizes it accordingly), reduced from the next power of two.
+//
+// NOTE: this changes FP summation order vs the CUDA path -- both valid IEEE sums, not bit-identical.
+static __device__
+scalar blockDot(
+    const scalar* a,
+    const scalar* b,
+    int n,
+    scalar* red)
+{
+    const int tid = threadIdx.x;
+    scalar v = 0.0;
+    for (int i = tid; i < n; i += blockDim.x)
+        v += a[i]*b[i];
+    red[tid] = v;
+    __syncthreads();
+    int s = 1;
+    while (s < (int)blockDim.x) s <<= 1;
+    s >>= 1;
+    for (; s > 0; s >>= 1)
+    {
+        if (tid < s && tid + s < (int)blockDim.x) red[tid] += red[tid + s];
+        __syncthreads();
+    }
+    const scalar r = red[0];
+    __syncthreads();
+    return r;
+}
+#else
 static __device__ __forceinline__
 scalar warpReduceSum(scalar v)
 {
@@ -160,5 +191,6 @@ scalar blockDot(
     __syncthreads();                  // (3) red[] free to reuse next call
     return r;
 }
+#endif // !BRAE_ACPP
 
 } // namespace brae
