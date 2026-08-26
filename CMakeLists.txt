@@ -1694,6 +1694,22 @@ add_test(NAME rho_simple_end_to_end_vs_openfoam
 # The COMPRESSIBLE kEpsilon closure against OpenFOAM's own turbulence->correct(), which tools/dumpPEqn
 # brackets so every input it reads and every field it writes can be compared. Carries the control that
 # distinguishes the two fluxes: divU is the VOLUMETRIC one, the div operator takes the MASS one.
+# The COMPRESSIBLE kOmegaSST closure against OpenFOAM's OWN kOmegaSST, instrumented. tools/dumpKOmegaSST
+# is kOmegaSSTBase.C with writes added and its equations untouched, run under tools/dumpPEqn so the
+# model's inputs come from the same iteration. Carries the divU flux control: the compressible reading
+# takes the VOLUMETRIC flux there and the MASS flux in fvm::div, and substituting one for the other must
+# be measurably worse.
+add_executable(test_rho_komegasst_cpp tests/test_rho_komegasst_cpp.cu)
+target_include_directories(test_rho_komegasst_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_komegasst_cpp PRIVATE brae_core)
+add_test(NAME rho_komegasst_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_komegasst_vs_openfoam.sh)
+set_tests_properties(rho_komegasst_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_komegasst_cpp
+                     TIMEOUT 1800)
+
 add_executable(test_rho_kepsilon_cpp tests/test_rho_kepsilon_cpp.cu)
 target_include_directories(test_rho_kepsilon_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_rho_kepsilon_cpp PRIVATE brae_core)

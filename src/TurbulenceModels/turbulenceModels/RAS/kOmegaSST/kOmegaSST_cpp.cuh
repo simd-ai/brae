@@ -71,11 +71,27 @@ std::vector<scalar> CDkOmega(const std::vector<vector>& gradK,
                              const KOmegaSSTCoeffs& co);
 
 // The two blending functions. `y` is the CELL wall distance; `nu` the laminar kinematic viscosity.
+// PER-CELL nu: the compressible lineage's is mu(T)/rho, a field, and both blenders use it in their
+// viscous cross-over term. The scalar forms below forward to these, so every existing caller keeps the
+// constant it already passes rather than being silently rebound.
 std::vector<scalar> F1(const std::vector<scalar>& k, const std::vector<scalar>& omega,
                        const std::vector<scalar>& y, const std::vector<scalar>& CDkOmega,
-                       scalar nu, const KOmegaSSTCoeffs& co);
+                       const std::vector<scalar>& nuC, const KOmegaSSTCoeffs& co);
 std::vector<scalar> F2(const std::vector<scalar>& k, const std::vector<scalar>& omega,
-                       const std::vector<scalar>& y, scalar nu, const KOmegaSSTCoeffs& co);
+                       const std::vector<scalar>& y, const std::vector<scalar>& nuC,
+                       const KOmegaSSTCoeffs& co);
+
+inline std::vector<scalar> F1(const std::vector<scalar>& k, const std::vector<scalar>& omega,
+                              const std::vector<scalar>& y, const std::vector<scalar>& CDkOmega,
+                              scalar nu, const KOmegaSSTCoeffs& co)
+{
+    return F1(k, omega, y, CDkOmega, std::vector<scalar>(k.size(), nu), co);
+}
+inline std::vector<scalar> F2(const std::vector<scalar>& k, const std::vector<scalar>& omega,
+                              const std::vector<scalar>& y, scalar nu, const KOmegaSSTCoeffs& co)
+{
+    return F2(k, omega, y, std::vector<scalar>(k.size(), nu), co);
+}
 
 // nut = a1*k/max(a1*omega, b1*F23*sqrt(S2)).
 std::vector<scalar> correctNut(const std::vector<scalar>& k, const std::vector<scalar>& omega,
@@ -88,7 +104,40 @@ std::vector<scalar> correctNut(const std::vector<scalar>& k, const std::vector<s
 // about how far a solve happens to move a field. (The obvious test -- run one correct() and check the
 // field does not move -- is NOT valid here: OpenFOAM itself stops on a residual plateau, not at an exact
 // fixed point, so solving from its state to 1e-12 moves the field by however much that plateau is worth.)
-struct SSTResiduals { scalar omega = 0, k = 0; };
+struct SSTResiduals
+{
+    scalar omega = 0, k = 0;
+
+    // OPT-IN diagnostics, compared against tools/dumpKOmegaSST's stage_sst* writes. The solver asks for
+    // the residuals every outer iteration and would otherwise pay to copy every intermediate with them.
+    bool captureStages = false;
+    std::vector<scalar> divU, s2, gbyNu0, G, CD, f1, f23;
+    std::vector<tensor> gradU;
+    // the assembled systems, before relax and after, plus the off-diagonals a per-cell view misses
+    std::vector<scalar> omD0, omSrc0, omD, omSrc, omUpper, omLower;
+    std::vector<scalar> kD0,  kSrc0,  kD,  kSrc,  kUpper,  kLower;
+};
+
+// THE COMPRESSIBLE INSTANTIATION, exactly as it was done for kEpsilon. OpenFOAM has ONE
+// kOmegaSSTBase.C templated on the lineage; what the compressible one supplies is alpha = 1, rho = the
+// density field, alphaRhoPhi = the MASS flux, and a nu that varies with temperature. Every term below is
+// already OpenFOAM's -- this struct is what turns the incompressible reading of them into the
+// compressible one, so there is one transcription rather than two.
+//
+// TWO FLUXES, NOT ONE, and it is the same trap. `fvm::div` and the `bounded` Sp take the MASS flux,
+// while divU = fvc::div(fvc::absolute(this->phi(), U)) takes the VOLUMETRIC one, because
+// compressibleTurbulenceModel::phi() returns phi_/fvc::interpolate(rho) when the stored flux has mass
+// dimensions. In the incompressible lineage the two are the same field and the distinction is invisible.
+struct Compressible
+{
+    const std::vector<scalar>*              rho      = nullptr;   // cell density
+    const std::vector<std::vector<scalar>>* rhoBnd   = nullptr;   // its patch values
+    const std::vector<scalar>*              nu       = nullptr;   // laminar KINEMATIC viscosity, per cell
+    const std::vector<std::vector<scalar>>* nuBnd    = nullptr;   // per boundary face
+    const SurfaceScalarField*               phiByRho = nullptr;   // the VOLUMETRIC flux, for divU alone
+    std::vector<scalar>*                    alphat   = nullptr;   // out: rho*nut/Prt (EddyDiffusivity)
+    scalar                                  Prt      = 1.0;
+};
 
 // kOmegaSSTLM's three virtual overrides of this model, supplied by the DERIVED model rather than
 // branched on here -- OpenFOAM's kOmegaSSTLM overrides F1, Pk and epsilonByk and inherits everything
@@ -147,7 +196,11 @@ void correct(
     bool                           correctedLaplacian = false,
     scalar                         snGradLimitCoeff = 0.0,
     // kOmegaSSTLM. Null (the default) is plain kOmegaSST and nothing below changes.
-    const LMHooks*                 lm = nullptr);
+    const LMHooks*                 lm = nullptr,
+    // LAST, and deliberately: every existing caller passes these positionally, and inserting a parameter
+    // ahead of them silently rebinds their arguments. Null throughout is the incompressible reading and
+    // reproduces the previous arithmetic exactly.
+    const Compressible*            comp = nullptr);
 
 } // namespace kOmegaSST
 } // namespace cpu

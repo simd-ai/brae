@@ -41,10 +41,20 @@ SurfaceScalarField effectiveDiffusivity(
     scalar                           nu,
     const PrimitiveMesh&             m,
     const FvGeometry&                g,
-    const std::vector<FvPatch>&      patches)
+    const std::vector<FvPatch>&      patches,
+    // The compressible lineage multiplies the whole thing by rho -- fvm::laplacian(alpha*rho*DkEff(F1))
+    // -- and carries a nu that varies with T. Null throughout is the incompressible reading and
+    // reproduces the previous arithmetic exactly. The CELL PRODUCT is interpolated, as OpenFOAM does:
+    // fvc::interpolate(rho*D), not interpolate(rho)*interpolate(D), which differ on non-uniform fields.
+    const std::vector<scalar>*              rho    = nullptr,
+    const std::vector<std::vector<scalar>>* rhoBnd = nullptr,
+    const std::vector<std::vector<scalar>>* nuBnd  = nullptr)
 {
     static const bool dbg = std::getenv("BRAE_SST_DIFF_DEBUG") != nullptr;
-    SurfaceScalarField sf = fvc::interpolate(DCell, m, g, patches);
+    std::vector<scalar> DRho(DCell.size());
+    for (std::size_t cc = 0; cc < DCell.size(); ++cc)
+        DRho[cc] = DCell[cc] * (rho ? (*rho)[cc] : scalar(1.0));
+    SurfaceScalarField sf = fvc::interpolate(DRho, m, g, patches);
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const std::vector<scalar>& nb = nutField.boundary[pi]->value();
@@ -52,7 +62,9 @@ SurfaceScalarField effectiveDiffusivity(
         {
             const label c = patches[pi].faceCells[i];
             const scalar was = sf.boundary[pi][i];
-            sf.boundary[pi][i] = blend(f1[c], alpha1, alpha2) * nb[i] + nu;
+            const scalar nuF = nuBnd ? (*nuBnd)[pi][i] : nu;
+            sf.boundary[pi][i] = (blend(f1[c], alpha1, alpha2) * nb[i] + nuF)
+                               * (rhoBnd ? (*rhoBnd)[pi][i] : scalar(1.0));
             if (dbg && i == 5)
                 std::printf("      [Deff] patch %-12s face %d: interp %.6e -> nut_b %.6e (nut_b=%.3e)\n",
                             patches[pi].name.c_str(), i, was, sf.boundary[pi][i], nb[i]);
@@ -145,14 +157,17 @@ std::vector<scalar> CDkOmega(const std::vector<vector>& gradK, const std::vector
 
 std::vector<scalar> F1(const std::vector<scalar>& k, const std::vector<scalar>& omega,
                        const std::vector<scalar>& y, const std::vector<scalar>& CD,
-                       scalar nu, const KOmegaSSTCoeffs& co)
+                       // PER CELL: the compressible lineage's nu is mu(T)/rho, a field. Both blenders
+                       // use it in their viscous cross-over term, so a single constant is only right
+                       // for the incompressible reading.
+                       const std::vector<scalar>& nuC, const KOmegaSSTCoeffs& co)
 {
     std::vector<scalar> out(k.size());
     for (std::size_t c = 0; c < k.size(); ++c)
     {
         const scalar CDp = std::fmax(CD[c], 1.0e-10);
         const scalar a = std::fmax((1.0/co.betaStar)*std::sqrt(k[c])/(omega[c]*y[c]),
-                                   500.0*nu/(y[c]*y[c]*omega[c]));
+                                   500.0*nuC[c]/(y[c]*y[c]*omega[c]));
         const scalar b = (4.0*co.alphaOmega2)*k[c]/(CDp*y[c]*y[c]);
         const scalar arg1 = std::fmin(std::fmin(a, b), 10.0);
         const scalar a4 = arg1*arg1*arg1*arg1;                 // pow4
@@ -163,13 +178,14 @@ std::vector<scalar> F1(const std::vector<scalar>& k, const std::vector<scalar>& 
 
 
 std::vector<scalar> F2(const std::vector<scalar>& k, const std::vector<scalar>& omega,
-                       const std::vector<scalar>& y, scalar nu, const KOmegaSSTCoeffs& co)
+                       const std::vector<scalar>& y, const std::vector<scalar>& nuC,
+                       const KOmegaSSTCoeffs& co)
 {
     std::vector<scalar> out(k.size());
     for (std::size_t c = 0; c < k.size(); ++c)
     {
         const scalar arg2 = std::fmin(std::fmax((2.0/co.betaStar)*std::sqrt(k[c])/(omega[c]*y[c]),
-                                                500.0*nu/(y[c]*y[c]*omega[c])), 100.0);
+                                                500.0*nuC[c]/(y[c]*y[c]*omega[c])), 100.0);
         out[c] = std::tanh(arg2*arg2);
     }
     return out;
@@ -186,6 +202,36 @@ std::vector<scalar> correctNut(const std::vector<scalar>& k, const std::vector<s
     return out;
 }
 
+
+
+namespace {
+
+// D() and the full right-hand side of an assembled system, in the SAME form tools/dumpKOmegaSST writes
+// for OpenFOAM's: the diagonal including the boundary internalCoeffs, and the source with boundaryCoeffs
+// folded into their face cells. Matching the capture point to the dump point is not optional -- comparing
+// two different objects measures the capture, not the code.
+void captureSSTSystem(
+    const FvScalarMatrix&       M,
+    const std::vector<FvPatch>& patches,
+    std::vector<scalar>&        D,
+    std::vector<scalar>&        S,
+    std::vector<scalar>*        up = nullptr,
+    std::vector<scalar>*        lo = nullptr)
+{
+    if (up) *up = M.upper;
+    if (lo) *lo = M.lower;
+    D = M.diag;
+    S = M.source;
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        for (label i = 0; i < patches[pi].size; ++i)
+        {
+            const label c = patches[pi].faceCells[i];
+            D[c] += M.internalCoeffs[pi][i];
+            S[c] += M.boundaryCoeffs[pi][i];
+        }
+}
+
+}
 
 void correct(
     const GeometricField<vector>&  U,
@@ -211,7 +257,8 @@ void correct(
     bool                           linearUpwind,
     bool                           correctedLaplacian,
     scalar                         snGradLimitCoeff,
-    const LMHooks*                 lm)
+    const LMHooks*                 lm,
+    const Compressible*            comp)
 {
     if (co.F3)
         throw std::runtime_error(
@@ -223,6 +270,13 @@ void correct(
     const scalar Cmu25 = std::pow(co.betaStar, 0.25);   // kOmegaSST's Cmu IS betaStar
     std::vector<scalar>& nutF = nutField.internal;
 
+    // alpha()*rho() multiplies every source in both equations; alpha is 1 for a single-phase model, so
+    // this is rho or it is 1. Null comp is the incompressible reading, bit-for-bit as before.
+    auto rhoAt = [&](label cc) { return (comp && comp->rho) ? (*comp->rho)[cc] : scalar(1.0); };
+    // this->nu() varies with temperature in the compressible lineage; the incompressible one has a
+    // single constant.
+    auto nuAt = [&](label cc) { return (comp && comp->nu) ? (*comp->nu)[cc] : nu; };
+
     // ---- production, from the CURRENT nut (the previous outer iteration's correctNut) -------------
     const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
     const std::vector<scalar> s2  = S2(gradU);
@@ -230,13 +284,34 @@ void correct(
     std::vector<scalar> G(nC);
     for (label c = 0; c < nC; ++c) G[c] = nutF[c] * gb0[c];      // RAW GbyNu0 -- the k equation's G
 
-    const std::vector<scalar> divU = fvc::div(phi, m, g, patches);
+    // divU takes the VOLUMETRIC flux -- fvc::absolute(this->phi(), U) -- while fvm::div and the
+    // `bounded` Sp below take the MASS flux. Two different fields in the compressible lineage.
+    const std::vector<scalar> divU =
+        fvc::div(comp && comp->phiByRho ? *comp->phiByRho : phi, m, g, patches);
+    // fvc::div(alphaRhoPhi), for `bounded Gauss <scheme>`: boundedConvectionScheme subtracts
+    // Sp(surfaceIntegrate(faceFlux), vf) with the flux the equation is CONVECTED by, which is the mass
+    // flux. Identical to divU when comp is null.
+    const std::vector<scalar> divPhi = fvc::div(phi, m, g, patches);
+
+    if (res && res->captureStages)
+    {
+        res->gradU  = gradU;
+        res->s2     = s2;
+        res->gbyNu0 = gb0;
+        res->divU   = divU;
+        // G is captured AFTER the omegaWallFunction override below, not here: the wall function replaces
+        // it in wall-adjacent cells and that is the G both equations are built from.
+    }
 
     // ---- CDkOmega, F1, F2 ------------------------------------------------------------------------
     const std::vector<vector> gradK  = fvc::gaussGrad(k, m, g, patches);
     const std::vector<vector> gradOm = fvc::gaussGrad(omega, m, g, patches);
     const std::vector<scalar> CD  = CDkOmega(gradK, gradOm, omega.internal, co);
-    std::vector<scalar> f1 = F1(k.internal, omega.internal, y, CD, nu, co);
+    // A per-cell nu, so F1/F2's viscous cross-over terms see the field the compressible lineage has.
+    std::vector<scalar> nuCell(nC);
+    for (label c = 0; c < nC; ++c) nuCell[c] = nuAt(c);
+    std::vector<scalar> f1 = F1(k.internal, omega.internal, y, CD, nuCell, co);
+    if (res && res->captureStages) { res->CD = CD; res->f1 = f1; }
     if (lm)
     {
         // kOmegaSSTLM::F1 = max(kOmegaSST::F1, F3), F3 = exp(-(Ry/120)^8), Ry = y*sqrt(k)/nu
@@ -250,7 +325,8 @@ void correct(
             f1[c] = std::fmax(f1[c], std::exp(-(r4 * r4)));
         }
     }
-    const std::vector<scalar> f23 = F2(k.internal, omega.internal, y, nu, co);
+    const std::vector<scalar> f23 = F2(k.internal, omega.internal, y, nuCell, co);
+    if (res && res->captureStages) res->f23 = f23;
 
     // ---- the production limiter: omega uses the LIMITED GbyNu, k uses the raw G ------------------
     // kOmegaSSTBase.C reassigns GbyNu0 = GbyNu(GbyNu0, F23, S2) AFTER G was taken from the raw value.
@@ -276,17 +352,25 @@ void correct(
         if (patches[pi].type != "wall") continue;
         const FvPatch& wp = patches[pi];
         const std::vector<scalar>& yw = yWall[pi];
-        const std::vector<scalar> nutw = nutkWallFunction(wp, yw, k.internal, nu, co.betaStar, co.kappa, co.E);
+        // PER-FACE nu along the wall. nutkWallFunction and omegaVis are written in terms of nu_w, the
+        // value AT the face; the compressible lineage's nu is mu(T)/rho and varies face to face along a
+        // wall with a temperature gradient. Handing the k-epsilon port a single scalar here produced a
+        // NaN in the first turbulent iteration, so this takes the same overload.
+        std::vector<scalar> nuFace(wp.size);
+        for (label i = 0; i < wp.size; ++i)
+            nuFace[i] = (comp && comp->nuBnd) ? (*comp->nuBnd)[pi][i] : nu;
+        const std::vector<scalar> nutw =
+            nutkWallFunction(wp, yw, k.internal, nuFace, co.betaStar, co.kappa, co.E);
         const std::vector<vector>& Uw = U.boundary[pi]->value();
         for (label i = 0; i < wp.size; ++i)
         {
             const label c = wp.faceCells[i];
             const scalar w = 1.0 / nw[c], kc = k.internal[c];
-            const scalar omegaVis = 6.0*nu/(co.beta1*yw[i]*yw[i]);
+            const scalar omegaVis = 6.0*nuFace[i]/(co.beta1*yw[i]*yw[i]);
             const scalar omegaLog = std::sqrt(kc)/(Cmu25*co.kappa*yw[i]);
             const scalar magGradUw = mag((Uw[i] - U.internal[c]) * wp.deltaCoeffs[i]);
             om0[c] += w * std::sqrt(omegaVis*omegaVis + omegaLog*omegaLog);
-            G0[c]  += w * (nutw[i] + nu) * magGradUw * Cmu25 * std::sqrt(kc) / (co.kappa * yw[i]);
+            G0[c]  += w * (nutw[i] + nuFace[i]) * magGradUw * Cmu25 * std::sqrt(kc) / (co.kappa * yw[i]);
         }
     }
     std::vector<label> wallCells;
@@ -299,15 +383,31 @@ void correct(
             wallCells.push_back(c);
             omVals.push_back(om0[c]);
         }
+    if (res && res->captureStages) res->G = G;
 
     // ---- omega equation --------------------------------------------------------------------------
     {
         std::vector<scalar> DomegaEff(nC);
         for (label c = 0; c < nC; ++c)
-            DomegaEff[c] = blend(f1[c], co.alphaOmega1, co.alphaOmega2)*nutF[c] + nu;
+            DomegaEff[c] = blend(f1[c], co.alphaOmega1, co.alphaOmega2)*nutF[c] + nuAt(c);
         const SurfaceScalarField Df =
             effectiveDiffusivity(DomegaEff, nutField, f1, co.alphaOmega1, co.alphaOmega2,
-                                 nu, m, g, patches);
+                                 nu, m, g, patches,
+                                 comp ? comp->rho : nullptr, comp ? comp->rhoBnd : nullptr,
+                                 comp ? comp->nuBnd : nullptr);
+
+        // fvMatrix's constructor calls psi.boundaryFieldRef().updateCoeffs(), and that is where
+        // OpenFOAM's flux-conditional boundaries read the flux and set their valueFraction, and where the
+        // turbulent inlets RECOMPUTE their refValue from the current fields. Without it every such patch
+        // keeps whatever it was seeded with and contributes nothing to the system, whatever value it
+        // carries -- which is two of the four defects the kEpsilon port turned up, found the same way.
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            // turbulentMixingLengthFrequencyInlet: refValue = sqrt(kp)/(Cmu^0.25*L), from k's CURRENT
+            // patch values. kOmegaSST's Cmu IS betaStar.
+            omega.boundary[pi]->updateTurbulentInlet({}, k.boundary[pi]->value(), co.betaStar);
+            omega.boundary[pi]->updateFromFlux(phi.boundary[pi]);
+        }
 
         FvScalarMatrix M = divWithScheme(phi, omega, limitedLinear, limiterCoeff, m, g, patches);
         {
@@ -331,20 +431,23 @@ void correct(
             const scalar gam  = blend(f1[c], co.gamma1, co.gamma2);
             const scalar beta = blend(f1[c], co.beta1,  co.beta2);
             const scalar V    = g.V()[c];
-            M.source[c] += gam * gbLim[c] * V;                       // == gamma*GbyNu
+            // alpha()*rho() on EVERY source and Sp of the omega equation (kOmegaSSTBase.C). rhoAt is 1
+            // for the incompressible lineage, so the arithmetic there is unchanged.
+            const scalar rc   = rhoAt(c);
+            M.source[c] += rc * gam * gbLim[c] * V;                  // == gamma*GbyNu
             // - SuSp((2/3)*gamma*divU, omega): implicit where the coefficient is positive.
-            const scalar sp1 = (2.0/3.0) * gam * divU[c];
+            const scalar sp1 = (2.0/3.0) * rc * gam * divU[c];
             M.diag[c]   += V * std::fmax(sp1, 0.0);
             M.source[c] -= V * std::fmin(sp1, 0.0) * omega.internal[c];
             // - Sp(beta*omega, omega)
-            M.diag[c]   += beta * omega.internal[c] * V;
+            M.diag[c]   += rc * beta * omega.internal[c] * V;
             // - SuSp((F1 - 1)*CDkOmega/omega, omega)
-            const scalar sp2 = (f1[c] - 1.0) * CD[c] / omega.internal[c];
+            const scalar sp2 = rc * (f1[c] - 1.0) * CD[c] / omega.internal[c];
             M.diag[c]   += V * std::fmax(sp2, 0.0);
             M.source[c] -= V * std::fmin(sp2, 0.0) * omega.internal[c];
             // `bounded`: - Sp(fvc::div(phi), omega). Vanishes where phi is conservative, so it cannot
             // move a converged answer -- it is there to keep the transported scalar bounded on the way.
-            if (bounded) M.diag[c] -= divU[c] * V;
+            if (bounded) M.diag[c] -= divPhi[c] * V;
         }
         if (linearUpwind)
         {
@@ -382,8 +485,12 @@ void correct(
                             divU[c], M.diag[c], M.source[c]);
             }
         }
+        if (res && res->captureStages)
+            captureSSTSystem(M, patches, res->omD0, res->omSrc0);
         relaxMatrix(M, omega, m, patches, relaxOmega);
         setValues(M, omega.internal, m, patches, wallCells, omVals);
+        if (res && res->captureStages)
+            captureSSTSystem(M, patches, res->omD, res->omSrc, &res->omUpper, &res->omLower);
         const SolverPerformance po = pbicgstab(M, omega.internal, m, patches, tol, relTol, maxIter);
         if (res) res->omega = po.initialResidual;
         if (std::getenv("BRAE_SST_DEBUG"))
@@ -412,10 +519,24 @@ void correct(
     {
         std::vector<scalar> DkEff(nC);
         for (label c = 0; c < nC; ++c)
-            DkEff[c] = blend(f1[c], co.alphaK1, co.alphaK2)*nutF[c] + nu;
+            DkEff[c] = blend(f1[c], co.alphaK1, co.alphaK2)*nutF[c] + nuAt(c);
         const SurfaceScalarField Df =
             effectiveDiffusivity(DkEff, nutField, f1, co.alphaK1, co.alphaK2,
-                                 nu, m, g, patches);
+                                 nu, m, g, patches,
+                                 comp ? comp->rho : nullptr, comp ? comp->rhoBnd : nullptr,
+                                 comp ? comp->nuBnd : nullptr);
+
+        // fvMatrix's constructor calls psi.boundaryFieldRef().updateCoeffs(), and that is where
+        // OpenFOAM's flux-conditional boundaries read the flux and set their valueFraction, and where the
+        // turbulent inlets RECOMPUTE their refValue from the current fields. Without it every such patch
+        // keeps whatever it was seeded with and contributes nothing to the system, whatever value it
+        // carries -- which is two of the four defects the kEpsilon port turned up, found the same way.
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            // turbulentIntensityKineticEnergyInlet reads U's patch values.
+            k.boundary[pi]->updateTurbulentInlet(U.boundary[pi]->value(), {}, co.betaStar);
+            k.boundary[pi]->updateFromFlux(phi.boundary[pi]);
+        }
 
         FvScalarMatrix M = divWithScheme(phi, k, limitedLinear, limiterCoeff, m, g, patches);
         {
@@ -440,10 +561,12 @@ void correct(
             // == Pk(G) = min(G, (c1*betaStar)*k*omega), and for kOmegaSSTLM that whole thing scaled by
             // gammaIntEff (kOmegaSSTLM.C:55-62) -- the intermittency IS the switch that turns turbulent
             // production on as the boundary layer transitions.
+            // alpha()*rho() on every source and Sp of the k equation, as for omega above.
+            const scalar rc = rhoAt(c);
             scalar pk = std::fmin(G[c], (co.c1*co.betaStar)*k.internal[c]*omega.internal[c]);
             if (lm) pk *= (*lm->gammaIntEff)[c];
-            M.source[c] += pk * V;
-            const scalar sp = (2.0/3.0) * divU[c];                   // - SuSp((2/3)*divU, k)
+            M.source[c] += rc * pk * V;
+            const scalar sp = (2.0/3.0) * rc * divU[c];              // - SuSp((2/3)*divU, k)
             M.diag[c]   += V * std::fmax(sp, 0.0);
             M.source[c] -= V * std::fmin(sp, 0.0) * k.internal[c];
             // - Sp(epsilonByk, k). kOmegaSSTLM scales epsilonByk by gammaIntEff CLAMPED to [0.1, 1]
@@ -455,8 +578,8 @@ void correct(
                 const scalar ge = (*lm->gammaIntEff)[c];
                 ebk *= (ge < 0.1 ? 0.1 : (ge > 1.0 ? 1.0 : ge));
             }
-            M.diag[c]   += ebk * V;
-            if (bounded) M.diag[c] -= divU[c] * V;                   // - Sp(fvc::div(phi), k)
+            M.diag[c]   += rc * ebk * V;
+            if (bounded) M.diag[c] -= divPhi[c] * V;                 // - Sp(fvc::div(alphaRhoPhi), k)
         }
         if (linearUpwind)
         {
@@ -467,7 +590,11 @@ void correct(
                 fvm::linearUpwindCorrection<scalar, vector>(phi.internal, gradVf, m, g);
             for (label c = 0; c < nC; ++c) M.source[c] -= corr[c];
         }
+        if (res && res->captureStages)
+            captureSSTSystem(M, patches, res->kD0, res->kSrc0);
         relaxMatrix(M, k, m, patches, relaxK);
+        if (res && res->captureStages)
+            captureSSTSystem(M, patches, res->kD, res->kSrc, &res->kUpper, &res->kLower);
         const SolverPerformance pk = pbicgstab(M, k.internal, m, patches, tol, relTol, maxIter);
         if (res) res->k = pk.initialResidual;
         if (std::getenv("BRAE_SST_DEBUG"))
@@ -482,13 +609,27 @@ void correct(
     // scope, from the old U), but F23() inside it reads the MEMBER k_ and omega_, which the two solves
     // above have just overwritten. So S2 is old and F23 is NEW. Reusing the pre-solve f23 here moved
     // omega by 1.5e-01 and nut by 1.2e-01 off OpenFOAM's converged state.
-    const std::vector<scalar> f23New = F2(k.internal, omega.internal, y, nu, co);
+    const std::vector<scalar> f23New = F2(k.internal, omega.internal, y, nuCell, co);
     nutF = correctNut(k.internal, omega.internal, f23New, s2, co);
+
+    // EddyDiffusivity::correctNut, which the COMPRESSIBLE instantiation runs after the model's own:
+    //     alphat = rho*nut/Prt
+    // The energy equation's alphaEff reads this field, so a compressible run without it transports heat
+    // with no turbulent contribution at all.
+    if (comp && comp->alphat && comp->rho)
+    {
+        comp->alphat->resize(nC);
+        for (label c = 0; c < nC; ++c)
+            (*comp->alphat)[c] = (*comp->rho)[c] * nutF[c] / comp->Prt;
+    }
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         if (patches[pi].type != "wall") continue;
         nutField.boundary[pi]->setValue(
-            nutkWallFunction(patches[pi], yWall[pi], k.internal, nu, co.betaStar, co.kappa, co.E));
+            nutkWallFunction(patches[pi], yWall[pi], k.internal,
+                             comp && comp->nuBnd ? (*comp->nuBnd)[pi]
+                                                 : std::vector<scalar>(patches[pi].size, nu),
+                             co.betaStar, co.kappa, co.E));
     }
 
     // OpenFOAM assigns nut_ as a FIELD -- nut_ = a1*k/max(a1*omega, b1*F23*sqrt(S2)) -- and a field
