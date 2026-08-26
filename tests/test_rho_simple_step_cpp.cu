@@ -27,6 +27,7 @@
 #include "rhoSimpleFoam_cpp.cuh"
 
 #include <cmath>
+#include <fstream>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -105,6 +106,54 @@ int main(int argc, char** argv)
                 simpleDict && simpleDict->wordOr("transonic", "no") == "yes" ? "yes" : "no");
 
     cpu::rhoSimple::StepInput in;
+    // fvOptions and MRF: the components already refuse them BY NAME, but nothing was setting these flags
+    // from the case, so a case carrying an fvOption ran with it silently ignored. aerofoilNACA0012's
+    // `limitTemperature` is exactly that -- a source term OpenFOAM applies and brae does not.
+    {
+        auto has = [&](const char* rel)
+        {
+            std::ifstream f2((caseDir + "/" + rel).c_str());
+            return f2.good();
+        };
+        // Walk the fvOptions dict rather than only noting that one exists: limitTemperature is
+        // implemented (it is a correction, not a source), any other type is refused BY NAME. Reading the
+        // file and finding nothing but limitTemperature is what lets aerofoilNACA0012 run; a case adding
+        // an explicitPorositySource beside it still refuses.
+        const std::string fvoPath = has("system/fvOptions") ? caseDir + "/system/fvOptions"
+                                  : (has("constant/fvOptions") ? caseDir + "/constant/fvOptions" : "");
+        if (!fvoPath.empty())
+        {
+            const FoamDict fvo = readDict(fvoPath);
+            bool anyOther = false;
+            for (const auto& entry : fvo.subs)
+            {
+                const FoamDict* o = &entry.second;
+                const std::string ty = o->wordOr("type", "");
+                if (ty == "limitTemperature")
+                {
+                    const std::string sel = o->wordOr("selectionMode", "all");
+                    if (sel != "all")
+                        throw std::runtime_error(
+                            "rhoSimpleFoam: limitTemperature with selectionMode '" + sel
+                            + "'. brae applies it over all cells; a cell subset is a different option. "
+                              "Refusing rather than limiting the wrong cells.");
+                    in.limitT    = true;
+                    in.limitTmin = o->scalarOr("min", 0.0);
+                    in.limitTmax = o->scalarOr("max", 0.0);
+                    std::printf("  fvOption limitTemperature [%g, %g]\n",
+                                (double)in.limitTmin, (double)in.limitTmax);
+                }
+                else if (!ty.empty())
+                {
+                    anyOther = true;
+                }
+            }
+            in.hasFvOptions = anyOther;
+        }
+        in.hasMRF = has("constant/MRFProperties");
+        if (in.hasFvOptions) std::printf("  the case declares fvOptions\n");
+        if (in.hasMRF)       std::printf("  the case declares MRFProperties\n");
+    }
     in.consistent = simpleDict && simpleDict->wordOr("consistent", "no") == "yes";
     in.transonic  = simpleDict && simpleDict->wordOr("transonic",  "no") == "yes";
     // The fixture's schemes: `div(phi,*) bounded Gauss upwind`, `laplacianSchemes default Gauss linear
@@ -128,10 +177,14 @@ int main(int argc, char** argv)
         const cpu::rhoSimple::Residuals r = cpu::rhoSimple::rhoSimpleStep(f, in, m, g, patches);
         if (it <= 12 || it == iters || it % 50 == 0)
         {
-            if (r.count("k"))
-                std::printf("     iter %4d   U %.3e   %s %.3e   p %.3e   k %.3e   eps %.3e\n", it,
+            // The second turbulence scalar is the MODEL's: kEpsilon reports epsilon, kOmegaSST omega.
+            // Looking up "epsilon" unconditionally threw std::out_of_range on an SST case -- a crash
+            // where the solver had actually run.
+            const char* second = r.count("epsilon") ? "epsilon" : (r.count("omega") ? "omega" : nullptr);
+            if (r.count("k") && second)
+                std::printf("     iter %4d   U %.3e   %s %.3e   p %.3e   k %.3e   %s %.3e\n", it,
                             (double)r.at("U"), f.heName.c_str(), (double)r.at(f.heName),
-                            (double)r.at("p"), (double)r.at("k"), (double)r.at("epsilon"));
+                            (double)r.at("p"), (double)r.at("k"), second, (double)r.at(second));
             else
                 std::printf("     iter %4d   U %.3e   %s %.3e   p %.3e\n", it,
                             (double)r.at("U"), f.heName.c_str(), (double)r.at(f.heName), (double)r.at("p"));
@@ -259,7 +312,7 @@ int main(int argc, char** argv)
     std::printf("  refusal -- an unported RAS model\n");
     if (argc > 4)
     {
-        // kOmegaSST is a compressible RAS model brae does not have. It must be refused BY NAME, not run
+        // LaunderSharmaKE is a compressible RAS model brae does not have. It must be refused BY NAME, not run
         // as the kEpsilon it does have and not quietly as laminar -- either would converge to a smooth,
         // plausible, wrong field. The refusal lives in createFields, where OpenFOAM constructs the model.
         bool threw = false;
@@ -271,7 +324,7 @@ int main(int argc, char** argv)
         }
         catch (const std::exception& e) { threw = true; msg = e.what(); }
         check("an unported RAS model is refused", threw);
-        check("and the refusal names it", msg.find("kOmegaSST") != std::string::npos);
+        check("and the refusal names it", msg.find("LaunderSharmaKE") != std::string::npos);
     }
     else
     {

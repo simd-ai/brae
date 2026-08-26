@@ -79,12 +79,14 @@ PYEOF
 grep -q "^End" "$W/case/run.log" \
     || { echo "FAIL: OpenFOAM did not finish"; tail -25 "$W/case/run.log"; exit 1; }
 
-# An UNPORTED model, so the binary can assert the refusal is real: kOmegaSST is a compressible RAS model
-# brae does not have, and it must be refused BY NAME rather than run as kEpsilon or as laminar.
+# An UNPORTED model, so the binary can assert the refusal is real. This was kOmegaSST until kOmegaSST was
+# ported for the compressible lineage; the gate caught its own negative control going stale, which is what
+# a negative control is for. LaunderSharmaKE is a compressible RAS model brae does not have, and it must be
+# refused BY NAME rather than run as kEpsilon or as laminar.
 mkdir -p "$W/unported/constant"
 cp -r "$SRC/constant/." "$W/unported/constant/"
-sed -i 's/RASModel *kEpsilon;/RASModel        kOmegaSST;/' "$W/unported/constant/turbulenceProperties"
-grep -q "kOmegaSST" "$W/unported/constant/turbulenceProperties" \
+sed -i 's/RASModel *kEpsilon;/RASModel        LaunderSharmaKE;/' "$W/unported/constant/turbulenceProperties"
+grep -q "LaunderSharmaKE" "$W/unported/constant/turbulenceProperties" \
     || { echo "FAIL: could not build the unported-model fixture"; exit 1; }
 
 "$BIN" "$W/case" 0 "$ITERS" "$W/unported"

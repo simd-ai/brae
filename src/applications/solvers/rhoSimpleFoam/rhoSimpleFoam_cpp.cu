@@ -1,5 +1,7 @@
 // _cpp REFERENCE implementation -- see rhoSimpleFoam_cpp.cuh for the OpenFOAM provenance and the order.
 #include "rhoSimpleFoam_cpp.cuh"
+#include "kOmegaSST_cpp.cuh"
+#include "cell_wall_dist.cuh"
 #include "fv_matrix_ops.cuh"
 #include "solve_vector.cuh"
 #include "pbicgstab.cuh"
@@ -151,6 +153,22 @@ Residuals rhoSimpleStep(
         f.he.boundary[pi]->updateFromFlux(f.phi.boundary[pi]);
         f.T.boundary[pi]->updateFromFlux(f.phi.boundary[pi]);
     }
+
+    // updateCoeffs() for the FREESTREAM family, which is a different rule from the flux switch above.
+    // freestreamVelocity is a mixed patch whose valueFraction OpenFOAM recomputes from the current flow
+    // ANGLE -- valueFraction() = 0.5 - 0.5*(Up & nf)/mag(Up) (freestreamVelocityFvPatchVectorField.C) --
+    // and freestreamPressure follows it. The incompressible driver has always done this; this one never
+    // did, so on a far-field case every such patch kept the 0.5 it was seeded with for the whole run.
+    // aerofoilNACA0012 is exactly that case: its inlet and outlet are both in the `freestream` group.
+    {
+        std::vector<std::vector<vector>> Ub(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi) Ub[pi] = f.U.boundary[pi]->value();
+        updateMixedFreestream(f.U.boundary, Ub, patches);
+        // p as well: the momentum equation reads p's boundary VALUE through -fvc::grad(p), and in
+        // OpenFOAM that value is the blend the previous iteration's updateCoeffs left behind.
+        updateMixedFreestream(f.p.boundary, Ub, patches);
+        f.p.evaluateBoundary();
+    }
     f.U.evaluateBoundary();
     f.he.evaluateBoundary();
     f.T.evaluateBoundary();
@@ -222,6 +240,32 @@ Residuals rhoSimpleStep(
         res[f.heName] = ep.initialResidual;
         f.he.evaluateBoundary();
     }
+    // fvOptions.correct(he), EEqn.H:27 -- after the energy solve and BEFORE thermo.correct(), which is
+    // what makes it show up in T. limitTemperature clamps he between he(p,Tmin) and he(p,Tmax); on the
+    // boundary it does the same for any patch that does not fix a value, then corrects the boundary.
+    if (in.limitT)
+    {
+        const scalar heMin = hConstTToHe(in.limitTmin, f.thermo);
+        const scalar heMax = hConstTToHe(in.limitTmax, f.thermo);
+        for (label c = 0; c < nC; ++c)
+        {
+            if      (f.he.internal[c] < heMin) f.he.internal[c] = heMin;
+            else if (f.he.internal[c] > heMax) f.he.internal[c] = heMax;
+        }
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (f.he.boundary[pi]->fixesValue()) continue;
+            std::vector<scalar> hb = f.he.boundary[pi]->value();
+            for (auto& v : hb)
+            {
+                if      (v < heMin) v = heMin;
+                else if (v > heMax) v = heMax;
+            }
+            f.he.boundary[pi]->setStoredValues(std::move(hb));
+        }
+        f.he.evaluateBoundary();
+    }
+
     // EEqn.H ends with thermo.correct(): T, and therefore psi, move here and everything below sees them.
     thermoCorrect(f, patches);
 
@@ -384,6 +428,39 @@ Residuals rhoSimpleStep(
             for (std::size_t pi = 0; pi < patches.size(); ++pi)
                 for (label i = 0; i < patches[pi].size; ++i)
                     phiByRho.boundary[pi][i] /= rhof.boundary[pi][i];
+        }
+
+        if (f.rasModel == "kOmegaSST")
+        {
+            // The same compressible instantiation, for the other closure. Both are ONE templated model in
+            // OpenFOAM; what differs here is only which second scalar is transported and that kOmegaSST
+            // needs the wall distance for its F1/F2 blends.
+            kOmegaSST::Compressible sc;
+            sc.rho      = &f.rho.internal;
+            sc.rhoBnd   = &rhoBnd;
+            sc.nu       = &nuLam;
+            sc.nuBnd    = &nuLamBnd;
+            sc.phiByRho = &phiByRho;
+            if (f.alphat.internal.empty())
+                throw std::runtime_error(
+                    "rhoSimpleFoam_cpp: the case is RAS but has no alphat field. OpenFOAM's "
+                    "EddyDiffusivity reads one when the turbulence model is constructed, and the energy "
+                    "equation's alphaEff = CpByCpv*(alpha + alphat) needs it. Refusing rather than "
+                    "running with alphat = 0.");
+            sc.alphat   = &f.alphat.internal;
+            sc.Prt      = in.Prt;
+
+            const std::vector<scalar> y = cellWallDist(m, g, patches);
+            kOmegaSST::SSTResiduals sres;
+            kOmegaSST::correct(f.U, f.k, f.omega, f.nut, f.phi, y, /*nu=*/0.0, m, g, patches,
+                               in.relaxOmega, in.relaxK, in.tolTurb, in.relTolTurb, in.maxIter,
+                               in.sstCoeffs, &sres, in.boundedTurb,
+                               in.sstLimitedLinear, in.sstLimiterCoeff, in.sstLinearUpwind,
+                               in.correctedLaplacian, in.snGradLimitCoeff, /*lm=*/nullptr, &sc);
+            res["omega"] = sres.omega;
+            res["k"]     = sres.k;
+            f.alphat.evaluateBoundary();
+            return res;
         }
 
         kEpsilonRef::Compressible comp;

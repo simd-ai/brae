@@ -1,5 +1,6 @@
 // _cpp REFERENCE implementation -- see createFields_cpp.cuh for the OpenFOAM provenance.
 #include "rhoCreateFields_cpp.cuh"
+#include "patch_entry_lookup.cuh"   // findPatchEntry: OF patch/group/regex resolution
 #include "foam_field_reader.cuh"
 #include "thermo_parse.cuh"
 #include "equation_of_state.cuh"
@@ -396,9 +397,24 @@ RhoSimpleFields createFields(
         heFd.internalUniform = false;
         heFd.internalField.resize(nC);
         for (label c = 0; c < nC; ++c) heFd.internalField[c] = heOf(f.T.internal[c]);
-        for (const auto& tb : tFd.boundary)
+        // OVER THE MESH'S PATCHES, not over the file's entries. OpenFOAM resolves each PATCH to an entry
+        // by name, then by group, then by regex, and an entry matching no patch is simply unused. Walking
+        // the entries instead refuses on ones that were never going to apply: every modern tutorial
+        // carries `#includeEtc "caseDicts/setConstraintTypes"`, which defines an entry for cyclic, wedge,
+        // processor and the rest so that constraint patches get the right condition automatically. On
+        // aerofoilNACA0012 -- whose only constraint patches are `empty` -- that made brae refuse the case
+        // over a `cyclic` entry no patch matched.
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
-            PatchFieldData<scalar> b = tb;          // name, type and structure carried over
+            const PatchFieldData<scalar>* tbp = findPatchEntry(tFd.boundary, patches[pi]);
+            if (!tbp)
+                throw std::runtime_error(
+                    "brae: rhoSimpleFoam createFields found no T boundary entry for patch '"
+                    + patches[pi].name + "'. OpenFOAM resolves a patch to an entry by name, then by "
+                    "group, then by regex; none matched. Refusing rather than inventing one.");
+            const PatchFieldData<scalar>& tb = *tbp;
+            PatchFieldData<scalar> b = tb;          // type and structure carried over
+            b.name = patches[pi].name;              // the PATCH's name, so buildField resolves it directly
             if (tb.type != "fixedValue" && tb.type != "zeroGradient" && tb.type != "inletOutlet"
                 && tb.type != "calculated" && tb.type != "empty" && tb.type != "symmetry"
                 && tb.type != "symmetryPlane" && tb.type != "wedge" && tb.type != "slip")
@@ -447,17 +463,28 @@ RhoSimpleFields createFields(
             f.rasModel  = ras ? ras->wordOr("RASModel", "") : "";
             if (f.turbulent)
             {
-                if (f.rasModel != "kEpsilon")
+                if (f.rasModel != "kEpsilon" && f.rasModel != "kOmegaSST")
                     throw std::runtime_error(
                         "brae: rhoSimpleFoam RASModel '" + f.rasModel + "' is not ported for the "
-                        "compressible lineage (kEpsilon is). Refusing rather than running a different "
-                        "closure, or none.");
-                f.k       = buildField<scalar>(readField<scalar>(timeDir + "/k"), patches, nC);
-                f.epsilon = buildField<scalar>(readField<scalar>(timeDir + "/epsilon"), patches, nC);
-                f.nut     = buildField<scalar>(readField<scalar>(timeDir + "/nut"), patches, nC);
+                        "compressible lineage (kEpsilon and kOmegaSST are). Refusing rather than running "
+                        "a different closure, or none.");
+                f.k   = buildField<scalar>(readField<scalar>(timeDir + "/k"), patches, nC);
+                f.nut = buildField<scalar>(readField<scalar>(timeDir + "/nut"), patches, nC);
                 f.k.evaluateBoundary();
-                f.epsilon.evaluateBoundary();
                 f.nut.evaluateBoundary();
+                // The second turbulence scalar is the model's, not the case directory's: reading
+                // whichever file happens to be present would run kOmegaSST off an epsilon a previous
+                // kEpsilon run left behind.
+                if (f.rasModel == "kOmegaSST")
+                {
+                    f.omega = buildField<scalar>(readField<scalar>(timeDir + "/omega"), patches, nC);
+                    f.omega.evaluateBoundary();
+                }
+                else
+                {
+                    f.epsilon = buildField<scalar>(readField<scalar>(timeDir + "/epsilon"), patches, nC);
+                    f.epsilon.evaluateBoundary();
+                }
                 if (fileExists(timeDir + "/alphat"))
                 {
                     f.alphat = buildField<scalar>(readField<scalar>(timeDir + "/alphat"), patches, nC);

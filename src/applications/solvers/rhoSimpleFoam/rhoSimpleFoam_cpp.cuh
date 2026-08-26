@@ -52,6 +52,7 @@
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
 #include "rhoCreateFields_cpp.cuh"
+#include "komega_sst_coeffs.cuh"   // KOmegaSSTCoeffs, for a case whose RASModel is kOmegaSST
 #include "rhoUEqn_cpp.cuh"
 #include "rhoEEqn_cpp.cuh"
 #include "rhoPEqn_cpp.cuh"
@@ -104,6 +105,14 @@ struct StepInput
     // model runs LAST in the iteration, so the momentum equation of iteration n uses the closure from
     // n-1 -- OpenFOAM's lagged coupling, and correcting before UEqn is a different algorithm.
     KEpsilonCoeffs keCoeffs{};
+    // kOmegaSST's, for a case whose RASModel names it. Its scheme flags are separate because kOmegaSST
+    // takes them as arguments rather than in its coefficients, and the SST tutorials ask for
+    // `bounded Gauss limitedLinear 1` on both scalars where the kEpsilon ones ask for plain upwind.
+    KOmegaSSTCoeffs sstCoeffs{};
+    scalar relaxOmega        = 1.0;
+    bool   sstLimitedLinear  = false;
+    scalar sstLimiterCoeff   = 1.0;
+    bool   sstLinearUpwind   = false;
     scalar relaxK = 1.0, relaxEpsilon = 1.0;
     scalar tolTurb = 1e-12, relTolTurb = 0.0;
     bool   boundedTurb = false;         // `bounded Gauss <scheme>` on div(phi,k) and div(phi,epsilon)
@@ -112,6 +121,14 @@ struct StepInput
     // --- refusals ---
     bool hasMRF              = false;
     bool hasFvOptions        = false;
+    // limitTemperature (fvOptions/corrections/limitTemperature). It is a CORRECTION, not a source: it has
+    // no addSup and no constrain, so the momentum, pressure and energy ASSEMBLIES are untouched and it
+    // acts only as fvOptions.correct(he) after the energy solve, clamping he between he(p,Tmin) and
+    // he(p,Tmax). That is why a case whose only option is this one need not set hasFvOptions -- any
+    // OTHER option still does, and is still refused by name.
+    bool   limitT    = false;
+    scalar limitTmin = 0.0;
+    scalar limitTmax = 0.0;
     bool hasFixedFluxPressure = false;
 };
 

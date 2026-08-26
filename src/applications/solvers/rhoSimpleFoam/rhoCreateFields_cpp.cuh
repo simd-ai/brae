@@ -129,6 +129,9 @@ struct RhoSimpleFields
     bool                   turbulent = false;   // momentumTransport simulationType RAS
     std::string            rasModel;            // e.g. "kEpsilon"; empty when laminar
     GeometricField<scalar> k, epsilon, nut, alphat;
+    // kOmegaSST transports omega where kEpsilon transports epsilon. Which one is populated follows
+    // rasModel, and the driver branches on the same name rather than on which field happens to exist.
+    GeometricField<scalar> omega;
 };
 
 // createFields.H + compressibleCreatePhi.H + createFieldRefs.H + pressureControl.
