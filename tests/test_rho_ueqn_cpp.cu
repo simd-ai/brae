@@ -32,10 +32,14 @@
 #include "foam_dict.cuh"
 #include "fv_matrix_ops.cuh"
 #include "rhoCreateFields_cpp.cuh"
+#include "cellLimitedGrad_cpp.cuh"
+#include "scheme_parse.cuh"
+#include "linearViscousStress_cpp.cuh"
 #include "rhoSimpleFoam_cpp.cuh"   // effectiveTransport: the solver's OWN muEff
 #include "rhoUEqn_cpp.cuh"
 
 #include <cmath>
+#include <numeric>
 #include <fstream>
 #include <cstdio>
 #include <string>
@@ -134,6 +138,72 @@ static double relL2Boundary(
         }
     }
     return relL2(fa, fb);
+}
+
+// A raw BOUNDARY reader for a tensor dump. brae's field reader has no tensor instantiation, and this
+// comparison is not a reason to add one to shared code: the file is ASCII and a patch's `value` entry is
+// either `uniform (9 numbers)` or `nonuniform List<tensor> N ( ... )`. Returns empty if the patch has no
+// value entry, which is how an `empty` patch (size 0 in OpenFOAM) shows up.
+static std::vector<tensor> readTensorPatch(
+    const std::string& path,
+    const std::string& patchName,
+    label              nFaces)
+{
+    std::vector<tensor> out;
+    std::ifstream in(path.c_str());
+    if (!in.good()) return out;
+    const std::string txt((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+
+    const std::size_t bf = txt.find("boundaryField");
+    if (bf == std::string::npos) return out;
+    // The patch's own block: its name at the top level of boundaryField, then its braces.
+    std::size_t at = txt.find(patchName, bf);
+    while (at != std::string::npos)
+    {
+        const std::size_t ob = txt.find('{', at);
+        const std::size_t nl = txt.find('\n', at);
+        if (ob != std::string::npos && (nl == std::string::npos || ob < txt.find('}', at)))
+        {
+            // Scan to the matching close brace so `value` is taken from THIS patch only.
+            std::size_t i = ob + 1;
+            int depth = 1;
+            while (i < txt.size() && depth > 0)
+            {
+                if (txt[i] == '{') ++depth;
+                else if (txt[i] == '}') --depth;
+                ++i;
+            }
+            const std::string blk = txt.substr(ob, i - ob);
+            const std::size_t v = blk.find("value");
+            if (v == std::string::npos) return out;
+            const bool uniform = blk.find("uniform", v) != std::string::npos
+                              && blk.find("nonuniform", v) == std::string::npos;
+            const std::size_t op = blk.find('(', v);
+            if (op == std::string::npos) return out;
+            std::vector<scalar> flat;
+            const std::size_t want = uniform ? 9 : std::size_t(9) * std::size_t(nFaces);
+            for (std::size_t j = op; j < blk.size() && flat.size() < want; )
+            {
+                const char ch = blk[j];
+                if (ch == '(' || ch == ')' || std::isspace((unsigned char)ch)) { ++j; continue; }
+                char* end = nullptr;
+                flat.push_back(std::strtod(blk.c_str() + j, &end));
+                if (end == blk.c_str() + j) break;
+                j = std::size_t(end - blk.c_str());
+            }
+            if (flat.size() < want) return out;
+            out.resize(nFaces);
+            for (label f2 = 0; f2 < nFaces; ++f2)
+                for (int kk = 0; kk < 9; ++kk)
+                    out[f2] = out[f2],
+                    reinterpret_cast<scalar*>(&out[f2])[kk] =
+                        flat[uniform ? std::size_t(kk)
+                                     : std::size_t(9)*std::size_t(f2) + std::size_t(kk)];
+            return out;
+        }
+        at = txt.find(patchName, at + 1);
+    }
+    return out;
 }
 
 int main(int argc, char** argv)
@@ -275,6 +345,371 @@ int main(int argc, char** argv)
             }
         }
     }
+    // updateCoeffs() for the FREESTREAM family, at the point OpenFOAM calls it. freestreamVelocity is a
+    // mixed patch whose valueFraction is recomputed from the current flow ANGLE, and every momentum
+    // coefficient on such a patch is built from that fraction: valueInternalCoeffs = 1 - vf,
+    // valueBoundaryCoeffs = vf*refValue. Adopting OpenFOAM's U VALUES below is not enough -- the value
+    // can match exactly while the fraction behind the coefficients is still the seeded 0.5, which on
+    // aerofoilNACA0012 read as iC 4.9 and bC 1.6e+03 with the values at 0.0.
+    {
+        std::vector<std::vector<vector>> Ub(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi) Ub[pi] = f.U.boundary[pi]->value();
+        updateMixedFreestream(f.U.boundary, Ub, patches);
+        updateMixedFreestream(f.p.boundary, Ub, patches);
+        f.p.evaluateBoundary();
+    }
+
+    // The momentum matrix's SOURCE and OFF-DIAGONALS, which A() and the boundary coefficients do not
+    // cover and which are the whole of H() -- and therefore of HbyA and the pressure equation's flux.
+    // Compared here because on aerofoilNACA0012 HbyA was 8.6e-06 out with rAU and both coefficient sets
+    // exact, which means the disagreement had to be in a part of the matrix nothing was comparing.
+    // The assembled matrix BEFORE relax(), so the assembly and the relaxation can be told apart. brae's
+    // assembleUEqn relaxes internally, so this rebuilds it with relaxU = 1 -- which is NOT a no-op in
+    // OpenFOAM either, but is the closest brae can get to "unrelaxed" without a second entry point.
+    auto compareUnrelaxed = [&](const cpu::rhoSimple::RhoMomentumInput& base)
+    {
+        const std::string sp = caseDir + "/" + dumpT + "/stage_USrc0";
+        const std::string dp = caseDir + "/" + dumpT + "/stage_UDiag0";
+        if (!std::ifstream(sp.c_str()).good()) return;
+        cpu::rhoSimple::RhoMomentumInput un = base;
+        un.relaxU = 1.0;
+        const FvVectorMatrix U0 = cpu::rhoSimple::assembleUEqn(f.U, un, m, g, patches);
+
+        std::vector<char> isW4(nC, 0);
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            if (patches[pi].type == "wall")
+                for (label i = 0; i < patches[pi].size; ++i) isW4[patches[pi].faceCells[i]] = 1;
+
+        const FieldData<vector> sFd = readField<vector>(sp);
+        std::vector<scalar> a, b, aw, bw;
+        for (label c = 0; c < nC; ++c)
+        {
+            vector mine = U0.source[c];
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                for (label i = 0; i < patches[pi].size; ++i)
+                    if (patches[pi].faceCells[i] == c)
+                    {
+                        mine.x += U0.boundaryCoeffs[pi][i].x;
+                        mine.y += U0.boundaryCoeffs[pi][i].y;
+                        mine.z += U0.boundaryCoeffs[pi][i].z;
+                    }
+            const vector& th = sFd.internalField[c];
+            const scalar mm[3] = { mine.x, mine.y, mine.z };
+            const scalar tt[3] = { th.x, th.y, th.z };
+            for (int kk = 0; kk < 3; ++kk)
+            {
+                a.push_back(mm[kk]); b.push_back(tt[kk]);
+                if (isW4[c]) { aw.push_back(mm[kk]); bw.push_back(tt[kk]); }
+            }
+        }
+        auto mg = [](const std::vector<scalar>& v)
+        { return std::sqrt(std::inner_product(v.begin(), v.end(), v.begin(), 0.0)); };
+        std::printf("       %-40s %.6e   (walls %.6e)\n", "UEqn source BEFORE relax",
+                    relL2(a, b), relL2(aw, bw));
+        std::printf("         |brae| %.4e |OF| %.4e   walls: |brae| %.4e |OF| %.4e\n",
+                    mg(a), mg(b), mg(aw), mg(bw));
+        // What brae's own wall-cell source is MADE of, so the missing 100x can be attributed.
+        {
+            const std::vector<vector> expl = cpu::divDevReffExplicit(
+                f.U, muEffInt, muEffBnd, m, g, patches, base.gradULimitK);
+            std::vector<scalar> ex, bc;
+            for (label c = 0; c < nC; ++c)
+            {
+                if (!isW4[c]) continue;
+                ex.push_back(expl[c].x * g.V()[c]);
+                ex.push_back(expl[c].y * g.V()[c]);
+                ex.push_back(expl[c].z * g.V()[c]);
+                vector s2v{0,0,0};
+                for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                    for (label i = 0; i < patches[pi].size; ++i)
+                        if (patches[pi].faceCells[i] == c)
+                        {
+                            s2v.x += U0.boundaryCoeffs[pi][i].x;
+                            s2v.y += U0.boundaryCoeffs[pi][i].y;
+                            s2v.z += U0.boundaryCoeffs[pi][i].z;
+                        }
+                bc.push_back(s2v.x); bc.push_back(s2v.y); bc.push_back(s2v.z);
+            }
+            // and the non-orthogonal correction, by difference: the same matrix with `corrected` off.
+            cpu::rhoSimple::RhoMomentumInput noc = base;
+            noc.relaxU = 1.0;
+            noc.correctedLaplacian = false;
+            const FvVectorMatrix Uo = cpu::rhoSimple::assembleUEqn(f.U, noc, m, g, patches);
+            std::vector<scalar> nonOrth;
+            for (label c = 0; c < nC; ++c)
+            {
+                if (!isW4[c]) continue;
+                nonOrth.push_back(U0.source[c].x - Uo.source[c].x);
+                nonOrth.push_back(U0.source[c].y - Uo.source[c].y);
+                nonOrth.push_back(U0.source[c].z - Uo.source[c].z);
+            }
+            std::printf("         walls, brae's parts: |dev2*V| %.4e   |boundaryCoeffs| %.4e   "
+                        "|nonOrth| %.4e\n", mg(ex), mg(bc), mg(nonOrth));
+        }
+
+        if (std::ifstream(dp.c_str()).good())
+        {
+            const std::vector<scalar> ofD = rawInternal(readField<scalar>(dp), nC);
+            std::vector<scalar> da, db, daw, dbw;
+            for (label c = 0; c < nC; ++c)
+            {
+                da.push_back(U0.diag[c]); db.push_back(ofD[c]);
+                if (isW4[c]) { daw.push_back(U0.diag[c]); dbw.push_back(ofD[c]); }
+            }
+            std::printf("       %-40s %.6e   (walls %.6e)\n", "UEqn diag BEFORE relax",
+                        relL2(da, db), relL2(daw, dbw));
+        }
+    };
+
+    auto compareMomentumMatrix = [&](const FvVectorMatrix& M, scalar gradLimitK)
+    {
+        std::printf("  1b. the momentum matrix's source and off-diagonals\n");
+        const std::string sp = caseDir + "/" + dumpT + "/stage_USrc";
+        if (std::ifstream(sp.c_str()).good())
+        {
+            const FieldData<vector> sFd = readField<vector>(sp);
+            std::vector<scalar> a, b, aw, bw;
+            std::vector<char> isW(nC, 0);
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                if (patches[pi].type == "wall")
+                    for (label i = 0; i < patches[pi].size; ++i) isW[patches[pi].faceCells[i]] = 1;
+            for (label c = 0; c < nC; ++c)
+            {
+                vector mine = M.source[c];
+                for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                    for (label i = 0; i < patches[pi].size; ++i)
+                        if (patches[pi].faceCells[i] == c)
+                        {
+                            mine.x += M.boundaryCoeffs[pi][i].x;
+                            mine.y += M.boundaryCoeffs[pi][i].y;
+                            mine.z += M.boundaryCoeffs[pi][i].z;
+                        }
+                const vector& th = sFd.internalField[c];
+                const scalar mm[3] = { mine.x, mine.y, mine.z };
+                const scalar tt[3] = { th.x, th.y, th.z };
+                for (int kk = 0; kk < 3; ++kk)
+                {
+                    a.push_back(mm[kk]); b.push_back(tt[kk]);
+                    if (isW[c]) { aw.push_back(mm[kk]); bw.push_back(tt[kk]); }
+                }
+            }
+            report("UEqn source + boundaryCoeffs", relL2(a, b), 1e-11);
+            std::printf("       %-40s %.6e\n", "same, on wall-adjacent cells", relL2(aw, bw));
+        }
+        // The off-diagonals are SCALARS even for a vector field, as in OpenFOAM: fvMatrix stores one
+        // upper/lower per face and the components share them.
+        auto face = [&](const char* file, const std::vector<scalar>& mine, const char* what)
+        {
+            const std::string path = caseDir + "/" + dumpT + "/" + file;
+            if (!std::ifstream(path.c_str()).good()) return;
+            const FieldData<scalar> fd = readField<scalar>(path);
+            const std::size_t n = std::min(mine.size(), fd.internalField.size());
+            report(what, relL2(std::vector<scalar>(mine.begin(), mine.begin() + n),
+                               std::vector<scalar>(fd.internalField.begin(),
+                                                   fd.internalField.begin() + n)), 1e-11);
+        };
+        // fvc::grad(U): the explicit dev2 term is built from it and from nothing else, so if the
+        // gradient agrees the source disagreement is in the term's assembly instead.
+        {
+            const std::string gp = caseDir + "/" + dumpT + "/stage_UgradU";
+            std::ifstream gin(gp.c_str());
+            if (gin.good())
+            {
+                const std::string txt((std::istreambuf_iterator<char>(gin)),
+                                      std::istreambuf_iterator<char>());
+                const std::size_t at = txt.find("internalField");
+                const std::size_t op = txt.find('(', at);
+                std::vector<scalar> flat;
+                const std::size_t want = std::size_t(9) * std::size_t(nC);
+                for (std::size_t i2 = op; i2 < txt.size() && flat.size() < want; )
+                {
+                    const char ch = txt[i2];
+                    if (ch == '(' || ch == ')' || std::isspace((unsigned char)ch)) { ++i2; continue; }
+                    char* end = nullptr;
+                    flat.push_back(std::strtod(txt.c_str() + i2, &end));
+                    if (end == txt.c_str() + i2) break;
+                    i2 = std::size_t(end - txt.c_str());
+                }
+                if (flat.size() >= want)
+                {
+                    // With the case's gradScheme applied, as OpenFOAM's fvc::grad(U) resolves it.
+                    // Comparing brae's UNLIMITED gradient against OpenFOAM's cellLimited one read
+                    // 1.9e+00 and measured the harness, not the code.
+                    std::vector<tensor> mineG = fvc::gaussGrad(f.U, m, g, patches);
+                    if (gradLimitK > 0.0) cpu::cellLimitGrad(mineG, f.U, gradLimitK, m, g, patches);
+                    std::vector<char> isW2(nC, 0);
+                    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                        if (patches[pi].type == "wall")
+                            for (label i = 0; i < patches[pi].size; ++i) isW2[patches[pi].faceCells[i]] = 1;
+                    std::vector<scalar> a, b, aw, bw;
+                    for (label c = 0; c < nC; ++c)
+                        for (int kk = 0; kk < 9; ++kk)
+                        {
+                            const scalar mv = reinterpret_cast<const scalar*>(&mineG[c])[kk];
+                            const scalar tv = flat[std::size_t(9)*std::size_t(c) + std::size_t(kk)];
+                            a.push_back(mv); b.push_back(tv);
+                            if (isW2[c]) { aw.push_back(mv); bw.push_back(tv); }
+                        }
+                    report("fvc::grad(U) vs OpenFOAM", relL2(a, b), 1e-11);
+                    std::printf("       %-40s %.6e\n", "same, on wall-adjacent cells", relL2(aw, bw));
+                    // and split the REST: cells against a freestream patch, against the deep interior.
+                    // The wall is exact, so whatever is left is one of these two, and they have very
+                    // different causes -- a boundary value against a limiter or a base scheme.
+                    {
+                        std::vector<char> onFs(nC, 0);
+                        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                            if (patches[pi].type != "wall" && patches[pi].type != "empty")
+                                for (label i = 0; i < patches[pi].size; ++i)
+                                    onFs[patches[pi].faceCells[i]] = 1;
+                        std::vector<scalar> af, bf2, ad, bd;
+                        for (label c = 0; c < nC; ++c)
+                            for (int kk = 0; kk < 9; ++kk)
+                            {
+                                const scalar mv = reinterpret_cast<const scalar*>(&mineG[c])[kk];
+                                const scalar tv = flat[std::size_t(9)*std::size_t(c) + std::size_t(kk)];
+                                if (isW2[c]) continue;
+                                if (onFs[c]) { af.push_back(mv); bf2.push_back(tv); }
+                                else         { ad.push_back(mv); bd.push_back(tv); }
+                            }
+                        // With MAGNITUDES beside them. A relative norm over a region where the field is
+                        // near zero -- and an aerofoil's far field is uniform freestream, so grad(U) is
+                        // near zero there -- reports a large number for a negligible absolute
+                        // difference. Two readings this session were exactly that artifact.
+                        auto mag2 = [](const std::vector<scalar>& v)
+                        {
+                            return std::sqrt(std::inner_product(v.begin(), v.end(), v.begin(), 0.0));
+                        };
+                        std::printf("       %-40s %.6e   |brae| %.3e |OF| %.3e\n",
+                                    "same, on freestream-adjacent cells", relL2(af, bf2),
+                                    mag2(af), mag2(bf2));
+                        std::printf("       %-40s %.6e   |brae| %.3e |OF| %.3e\n",
+                                    "same, deep interior", relL2(ad, bd), mag2(ad), mag2(bd));
+                    }
+                }
+            }
+        }
+        // The dev2 term, in two halves. divDevReffExplicit returns the DIVERGENCE (extensive, carrying
+        // the cell volume as fvMatrix wants it); the tensor it is built from is compared first, so a
+        // disagreement can be attributed to the field or to the div operator's boundary faces, not both.
+        {
+            auto tensorFile = [&](const char* file) -> std::vector<tensor>
+            {
+                const std::string path = caseDir + "/" + dumpT + "/" + file;
+                std::ifstream tin(path.c_str());
+                std::vector<tensor> out;
+                if (!tin.good()) return out;
+                const std::string txt((std::istreambuf_iterator<char>(tin)),
+                                      std::istreambuf_iterator<char>());
+                const std::size_t at = txt.find("internalField");
+                const std::size_t op = txt.find('(', at);
+                std::vector<scalar> flat;
+                const std::size_t want = std::size_t(9) * std::size_t(nC);
+                for (std::size_t i2 = op; i2 < txt.size() && flat.size() < want; )
+                {
+                    const char ch = txt[i2];
+                    if (ch == '(' || ch == ')' || std::isspace((unsigned char)ch)) { ++i2; continue; }
+                    char* end = nullptr;
+                    flat.push_back(std::strtod(txt.c_str() + i2, &end));
+                    if (end == txt.c_str() + i2) break;
+                    i2 = std::size_t(end - txt.c_str());
+                }
+                if (flat.size() < want) return out;
+                out.resize(nC);
+                for (label c = 0; c < nC; ++c)
+                    for (int kk = 0; kk < 9; ++kk)
+                        reinterpret_cast<scalar*>(&out[c])[kk] =
+                            flat[std::size_t(9)*std::size_t(c) + std::size_t(kk)];
+                return out;
+            };
+            std::vector<char> isW3(nC, 0);
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                if (patches[pi].type == "wall")
+                    for (label i = 0; i < patches[pi].size; ++i) isW3[patches[pi].faceCells[i]] = 1;
+
+            const std::vector<tensor> ofT = tensorFile("stage_UdevTensor");
+            if (!ofT.empty())
+            {
+                std::vector<tensor> mineT = fvc::gaussGrad(f.U, m, g, patches);
+                if (gradLimitK > 0.0) cpu::cellLimitGrad(mineT, f.U, gradLimitK, m, g, patches);
+                std::vector<scalar> a, b, aw, bw;
+                for (label c = 0; c < nC; ++c)
+                {
+                    const tensor t = muEffInt[c] * dev2(transpose(mineT[c]));
+                    for (int kk = 0; kk < 9; ++kk)
+                    {
+                        const scalar mv = reinterpret_cast<const scalar*>(&t)[kk];
+                        const scalar tv = reinterpret_cast<const scalar*>(&ofT[c])[kk];
+                        a.push_back(mv); b.push_back(tv);
+                        if (isW3[c]) { aw.push_back(mv); bw.push_back(tv); }
+                    }
+                }
+                report("(rho*nuEff)*dev2(T(grad(U))) tensor", relL2(a, b), 1e-11);
+                std::printf("       %-40s %.6e\n", "same, on wall-adjacent cells", relL2(aw, bw));
+
+                // Its BOUNDARY values. fvc::div reads them on every boundary face, and they carry
+                // gaussGrad's correction -- the wall-normal component of the gradient replaced by the
+                // patch snGrad -- which is how wall shear enters the momentum source. Comparing only the
+                // cells cannot see them, and the cells being exact while the source is 6.5e-03 out on
+                // wall-adjacent cells is exactly the signature of a boundary-value difference.
+                {
+                    const std::vector<std::vector<tensor>> mineTb =
+                        fvc::gradUBoundary(f.U, mineT, m, g, patches);
+                    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                    {
+                        if (patches[pi].type == "empty" || !patches[pi].size) continue;
+                        const std::vector<tensor> ofTb = readTensorPatch(
+                            caseDir + "/" + dumpT + "/stage_UdevTensor",
+                            patches[pi].name, patches[pi].size);
+                        if (ofTb.empty()) continue;
+                        std::vector<scalar> pa, pb;
+                        for (label i = 0; i < patches[pi].size; ++i)
+                        {
+                            const tensor t = muEffBnd[pi][i] * dev2(transpose(mineTb[pi][i]));
+                            for (int kk = 0; kk < 9; ++kk)
+                            {
+                                pa.push_back(reinterpret_cast<const scalar*>(&t)[kk]);
+                                pb.push_back(reinterpret_cast<const scalar*>(&ofTb[i])[kk]);
+                            }
+                        }
+                        std::printf("         dev2 tensor on %-14s %.6e   (%ld faces)\n",
+                                    patches[pi].name.c_str(), relL2(pa, pb), (long)patches[pi].size);
+                    }
+                }
+            }
+
+            const std::string dp = caseDir + "/" + dumpT + "/stage_UdevDiv";
+            if (std::ifstream(dp.c_str()).good())
+            {
+                const FieldData<vector> dFd = readField<vector>(dp);
+                const std::vector<vector> mineD = cpu::divDevReffExplicit(
+                    f.U, muEffInt, muEffBnd, m, g, patches, gradLimitK);
+                std::vector<scalar> a, b, aw, bw;
+                for (label c = 0; c < nC; ++c)
+                {
+                    // Both are PER UNIT VOLUME: divDevReffExplicit returns the divergence and the
+                    // caller multiplies by V when it adds it to the source, so dividing here was wrong
+                    // and made this comparison read 6.4e+07 -- a broken comparison, not a defect.
+                    // NEGATED: divDevReff returns MINUS both its terms (see linearViscousStress_cpp),
+                    // so brae's explicit part is the negative of OpenFOAM's bare fvc::div. Comparing
+                    // them unsigned read exactly 2.0, which is relL2 of a field against its own negative
+                    // -- a sign convention, not a disagreement.
+                    const scalar mm[3] = { -mineD[c].x, -mineD[c].y, -mineD[c].z };
+                    const vector& th = dFd.internalField[c];
+                    const scalar tt[3] = { th.x, th.y, th.z };
+                    for (int kk = 0; kk < 3; ++kk)
+                    {
+                        a.push_back(mm[kk]); b.push_back(tt[kk]);
+                        if (isW3[c]) { aw.push_back(mm[kk]); bw.push_back(tt[kk]); }
+                    }
+                }
+                report("div of that tensor", relL2(a, b), 1e-11);
+                std::printf("       %-40s %.6e\n", "same, on wall-adjacent cells", relL2(aw, bw));
+            }
+        }
+        face("stage_UUpper", M.upper, "UEqn upper (off-diagonal)");
+        face("stage_ULower", M.lower, "UEqn lower (off-diagonal)");
+    };
+
     // phi as OpenFOAM convects with. The momentum boundaryCoeffs are -phi_b*U_b, so with U's boundary
     // matching, anything left in them is the flux.
     {
@@ -308,6 +743,13 @@ int main(int argc, char** argv)
         double d = 0.0, n = 0.0;
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
+            // EMPTY patches are excluded because OpenFOAM excludes them: emptyFvPatch::size() is 0, so
+            // its boundaryField has no entries and the written file carries no values. brae keeps the
+            // mesh's face count there, which is harmless in the solver -- the base coefficients are zero
+            // for the laplacian and the div contributions cancel between front and back, whose Sf are
+            // equal and opposite with the same extrapolated value -- but comparing 16000 brae values
+            // against nothing reads as an enormous disagreement that is not one.
+            if (patches[pi].type == "empty") continue;
             const std::vector<vector>& bv = f.U.boundary[pi]->value();
             for (label i = 0; i < patches[pi].size; ++i)
             {
@@ -349,13 +791,39 @@ int main(int argc, char** argv)
     in.muEff              = &muEffInt;
     in.muEffBnd           = &muEffBnd;
     in.relaxU             = relaxU;
-    in.bounded            = true;
-    in.scheme             = cpu::rhoSimple::DivScheme::upwind;
+    // PARSED, like the gradScheme above. sbMatched says `bounded Gauss upwind` for div(phi,U) while
+    // aerofoilNACA0012 says `bounded Gauss linearUpwind limited` -- and linearUpwind puts a DEFERRED
+    // GRADIENT CORRECTION in the source, which is largest where the gradient is, i.e. at the wall.
+    // Stating `upwind` here left brae's wall-cell momentum source at 2.4e-02 against OpenFOAM's 2.5e+00.
+    {
+        const FieldDivScheme ds = parseFieldDivScheme(caseDir, "U");
+        in.bounded = ds.bounded;
+        in.scheme  = ds.linearUpwind ? cpu::rhoSimple::DivScheme::linearUpwind
+                   : (ds.limited     ? cpu::rhoSimple::DivScheme::limitedLinear
+                                     : cpu::rhoSimple::DivScheme::upwind);
+        in.schemeCoeff = ds.twoByk;
+        std::printf("  divSchemes: div(phi,U) bounded=%d linearUpwind=%d limitedLinear=%d\n",
+                    (int)ds.bounded, (int)ds.linearUpwind, (int)ds.limited);
+    }
     in.correctedLaplacian = true;
+    // PARSED from the case, not stated. divDevRhoReff's explicit term is
+    // fvc::div((rho*nuEff)*dev2(T(fvc::grad(U)))) and OpenFOAM resolves that grad against
+    // gradSchemes/grad(U): sbMatched says plain `Gauss linear` (unlimited) while aerofoilNACA0012 says
+    // `cellLimited Gauss linear 1`. Stating the fixture's own value was safe while there was one fixture
+    // and silently ran the wrong discretisation the moment this binary was pointed at a second case --
+    // the dev2 tensor read 2.3e-01 against OpenFOAM's purely from that.
+    {
+        DeviceSimpleControls sctl;
+        parseFvSchemesControls(caseDir, sctl);
+        in.gradULimitK = sctl.gradULimitK;
+        std::printf("  gradSchemes: grad(U) cellLimited k = %g\n", (double)in.gradULimitK);
+    }
 
     // ---- 1. The assembled momentum matrix, against OpenFOAM's. ----
     std::printf("  1. UEqn assembled with the COMPRESSIBLE divDevRhoReff (mu_eff = rho*nu_eff)\n");
     FvVectorMatrix M = cpu::rhoSimple::assembleUEqn(f.U, in, m, g, patches);
+    compareMomentumMatrix(M, in.gradULimitK);
+    compareUnrelaxed(in);
 
     // rAU = 1/A(). Compared as rAU rather than A so the number is the one pEqn.H actually consumes.
     const std::vector<scalar> A = matrixA<vector>(M, m, g, patches);

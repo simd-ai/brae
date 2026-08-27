@@ -118,6 +118,57 @@ the right one by at least 1e3x, with an absolute floor. That is strictly stronge
 rho, where the two fluxes coincide and nothing could discriminate, now fails the control instead of
 passing it vacuously.
 
+## aerofoilNACA0012: the first shipped tutorial through the new path
+
+It RUNS and CONVERGES, and at t=668 -- where OpenFOAM's own residualControl stops it and brae's U residual
+is 6.9e-05 -- it reads U 5.05e-03, p 1.46e-03, T 9.79e-04, rho 1.43e-03. Not yet a bound worth asserting,
+so it has no registered gate; what follows is what getting there cost, because almost none of it was the
+solver.
+
+**Every rhoSimpleFoam gate STATED its schemes instead of parsing them.** That was safe with one fixture and
+was a silent substitution the moment a second case appeared. sbMatched says `bounded Gauss upwind` on
+div(phi,U) and plain `Gauss linear` on grad(U); aerofoilNACA0012 says `bounded Gauss linearUpwind limited`
+and `cellLimited Gauss linear 1`. Both the gates and the driver harness now call `parseFieldDivScheme` and
+`parseFvSchemesControls`, which the DEVICE path had been using all along. On sbMatched the parsed values
+are exactly what was hardcoded, so nothing there moved.
+
+Three separate scheme defects fell out of that:
+
+| defect | measured |
+|---|---|
+| `div(phi,U)` run as upwind where the case says linearUpwind | wall-cell momentum source 2.4e-02 against OpenFOAM's 2.5e+00 -- a MISSING source term, since linearUpwind's deferred correction is explicit |
+| `divDevRhoReff` ignored `cellLimited` on grad(U) | dev2 tensor 2.27e-01 -> 3.82e-03, wall cells -> exact |
+| the cell limiter evaluated EMPTY patch faces | grad(U) 1.39e-02 -> 1.28e-14 |
+
+The last is worth keeping. `emptyFvPatch::size()` is 0, so OpenFOAM never evaluates those faces; brae keeps
+the mesh's face count. For `div` and `laplacian` that is genuinely inert -- the coefficients are zero and
+the front/back contributions cancel, which is why it survived every 2D tutorial. In the cell limiter it is
+not inert: `Cf - C` on an empty face points OUT OF PLANE, so `extrapolate` is the out-of-plane gradient,
+which is round-off. On a gradient of order 1e5 that round-off still clears the 1e-15 threshold, and
+`r = maxDelta/extrapolate` becomes a real number divided by noise, clamping the limiter far below what any
+real face asks for.
+
+**A correction to an earlier entry in this file.** The non-orthogonal correction was changed to use the
+limited gradient, on the reasoning that one operator should not use two. That was wrong and is reverted:
+`correctedSnGrad<Type>::correction` calls `fullGradCorrection(vf.component(cmpt))`, which resolves
+`grad(U.component(0))` -- a name no case defines -- so it falls back to `default`, unlimited, while the
+dev2 term resolves `grad(U)` and gets the limiter. OpenFOAM uses two different gradients there BY DESIGN,
+because the scheme names differ. Reasoning about what OpenFOAM ought to do instead of reading what it does
+is the exact failure this project keeps finding.
+
+**What had no oracle.** `A()` and the boundary coefficients were compared; the momentum matrix's SOURCE and
+OFF-DIAGONALS were not -- and `H()`, hence `HbyA`, hence the whole pressure flux, is built from those.
+`tools/dumpPEqn` now writes them, plus the pre-relax source and diagonal (which separates assembly from
+relaxation), `fvc::grad(U)`, and the dev2 tensor with its boundary values.
+
+**Other components fixed on the way**: boundary entries resolved per MESH PATCH rather than per file entry
+(`#includeEtc "caseDicts/setConstraintTypes"` defines a `cyclic` entry that matches no patch here, and
+walking the entries refused the case over it); `hasFvOptions` never set from the case, so every refusal it
+guarded was unreachable; `limitTemperature` implemented as the CORRECTION it is (no addSup, no constrain --
+`fvOptions.correct(he)` between the energy solve and `thermo.correct()`); and `freestreamVelocity`'s
+valueFraction, which OpenFOAM recomputes from the flow angle every updateCoeffs and the driver never did --
+that one was causing outright divergence.
+
 ## Open findings, turned up by the port and belonging to other components
 
 **The device kEpsilon has the same `corrected` question, unmeasured.** `device_simple_foam.cu`'s

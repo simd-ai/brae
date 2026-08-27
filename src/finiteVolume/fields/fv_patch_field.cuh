@@ -1515,6 +1515,14 @@ void updateMixedFreestream(
     {
         MixedPatchField<T>* mp = dynamic_cast<MixedPatchField<T>*>(boundary[pi].get());
         if (!mp) continue;
+        // ONLY the freestream family, which is bcCategory 5. This used to be implied by the dynamic_cast
+        // -- freestreamVelocity/freestreamPressure were the only mixed patches brae had -- and stopped
+        // being implied when inletOutlet and outletInlet were reparented onto MixedPatchField to give
+        // them the Robin coefficients. They are governed by the FLUX SIGN, a binary switch, not by the
+        // continuous flow-angle blend below; applying this to them overwrites the valueFraction their own
+        // updateFromFlux just set. Measured on sbMatched, whose outlet is inletOutlet: rAU 1.24e-02 and
+        // the momentum internalCoeffs 2.76e-01 against OpenFOAM.
+        if (mp->bcCategory() != 5) continue;
         if (pi >= Ubnd.size() || Ubnd[pi].size() != static_cast<std::size_t>(patches[pi].size)) continue;
 
         const scalar sign = mp->mixedVelocitySign() ? -1.0 : 1.0;

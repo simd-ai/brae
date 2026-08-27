@@ -210,7 +210,8 @@ FvVectorMatrix assembleUEqn(
         muEff    = &muEffOwned;
         muEffBnd = &muEffBndOwned;
     }
-    addDivDevReff(M, U, *muEff, *muEffBnd, m, g, patches, in.correctedLaplacian, in.snGradLimitCoeff);
+    addDivDevReff(M, U, *muEff, *muEffBnd, m, g, patches, in.correctedLaplacian, in.snGradLimitCoeff,
+                  in.gradULimitK);
 
     // + MRF.DDt(rho, U), UEqn.H:8. MRFZoneList::DDt(rho,U) is rho*DDt(U), so the Coriolis acceleration is
     // formed first and then rho-weighted per cell. Weighting AFTER is not a rearrangement: addCoriolis

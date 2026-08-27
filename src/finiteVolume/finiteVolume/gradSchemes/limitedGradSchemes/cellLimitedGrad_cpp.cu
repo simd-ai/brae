@@ -70,6 +70,10 @@ void limitPass(
         // gradient overshoot precisely where the field is being driven from outside.
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
+            // EMPTY patches contribute NOTHING, because in OpenFOAM they cannot: emptyFvPatch::size() is
+            // 0, so cellLimitedGrad's boundary loops never see those faces. brae keeps the mesh's face
+            // count on an empty patch, and including them here is not harmless -- see the face loop below.
+            if (patches[pi].type == "empty") continue;
             for (label i = 0; i < patches[pi].size; ++i)
             {
                 const label c = patches[pi].faceCells[i];
@@ -104,6 +108,12 @@ void limitPass(
         }
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
+            // EMPTY patches again, and here it MATTERS. On a 2D mesh Cf - C for an empty face points out
+            // of the plane, so `extrapolate` is the out-of-plane gradient -- round-off, not physics. It
+            // still clears the 1e-15 threshold once the gradient itself is of order 1e5, and then
+            // r = maxDelta/extrapolate is a ratio of a real number to noise, which can clamp the limiter
+            // far below what any real face asks for. OpenFOAM never evaluates these faces at all.
+            if (patches[pi].type == "empty") continue;
             for (label i = 0; i < patches[pi].size; ++i)
             {
                 const label c = patches[pi].faceCells[i];

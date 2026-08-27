@@ -25,6 +25,7 @@
 #include "foam_field_reader.cuh"
 #include "foam_dict.cuh"
 #include "rhoSimpleFoam_cpp.cuh"
+#include "scheme_parse.cuh"   // parseFieldDivScheme / parseFvSchemesControls: the CASE's schemes
 
 #include <cmath>
 #include <fstream>
@@ -159,9 +160,41 @@ int main(int argc, char** argv)
     // The fixture's schemes: `div(phi,*) bounded Gauss upwind`, `laplacianSchemes default Gauss linear
     // corrected`. Stated here rather than parsed, because a scheme brae read wrongly would otherwise be
     // invisible -- the gate would compare two solvers running two discretisations and blame the driver.
-    in.schemeU = in.schemeHe = in.schemeKE = cpu::rhoSimple::DivScheme::upwind;
-    in.boundedU = in.boundedHe = in.boundedKE = true;
-    in.correctedLaplacian = true;
+    // PARSED from the case, not stated. Stating sbMatched's own schemes was safe while there was one
+    // fixture and became a silent substitution the moment this binary was pointed at a second case:
+    // aerofoilNACA0012 asks for `bounded Gauss linearUpwind limited` on div(phi,U) and
+    // `cellLimited Gauss linear 1` on grad(U), where sbMatched asks for plain upwind and an unlimited
+    // gradient. linearUpwind's deferred correction is a SOURCE term, and running upwind instead left the
+    // wall-cell momentum source at 2.4e-02 against OpenFOAM's 2.5e+00.
+    {
+        auto pick = [&](const char* field)
+        {
+            const FieldDivScheme ds = parseFieldDivScheme(caseDir, field);
+            return ds;
+        };
+        const FieldDivScheme dU  = pick("U");
+        const FieldDivScheme dHe = pick(f.heName.c_str());
+        in.schemeU  = dU.linearUpwind  ? cpu::rhoSimple::DivScheme::linearUpwind
+                    : (dU.limited      ? cpu::rhoSimple::DivScheme::limitedLinear
+                                       : cpu::rhoSimple::DivScheme::upwind);
+        in.schemeHe = dHe.linearUpwind ? cpu::rhoSimple::DivScheme::linearUpwind
+                    : (dHe.limited     ? cpu::rhoSimple::DivScheme::limitedLinear
+                                       : cpu::rhoSimple::DivScheme::upwind);
+        in.schemeKE      = in.schemeHe;   // div(phi,Ekp) follows the energy entry in every tutorial
+        in.boundedU      = dU.bounded;
+        in.boundedHe     = dHe.bounded;
+        in.boundedKE     = dHe.bounded;
+        in.schemeCoeffU  = dU.twoByk;
+
+        DeviceSimpleControls sctl;
+        parseFvSchemesControls(caseDir, sctl);
+        in.correctedLaplacian = sctl.nonOrth;
+        in.gradULimitK        = sctl.gradULimitK;
+        std::printf("  schemes: div(phi,U) lu=%d bounded=%d | grad(U) cellLimited k=%g | "
+                    "laplacian corrected=%d\n",
+                    (int)dU.linearUpwind, (int)dU.bounded, (double)in.gradULimitK,
+                    (int)in.correctedLaplacian);
+    }
     in.relaxU   = re  ? re->scalarOr("U", 1.0) : 1.0;
     in.relaxHe  = re  ? re->scalarOr(f.heName, 1.0) : 1.0;
     in.relaxPEqn = re ? re->scalarOr("p", 1.0) : 1.0;

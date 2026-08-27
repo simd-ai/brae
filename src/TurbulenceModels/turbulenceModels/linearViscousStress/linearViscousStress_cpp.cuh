@@ -83,7 +83,9 @@ std::vector<vector> divDevReffExplicit(
     const std::vector<std::vector<scalar>>& nuEffBnd,   // [patch][face]
     const PrimitiveMesh&          m,
     const FvGeometry&             g,
-    const std::vector<FvPatch>&   patches);
+    const std::vector<FvPatch>&   patches,
+    // gradSchemes/grad(U): 0 = the unlimited base scheme, >0 = cellLimited with that coefficient.
+    scalar                        gradULimitK = 0.0);
 
 // The full operator as it appears in UEqn.H: the IMPLICIT laplacian assembled into the matrix, and the
 // EXPLICIT dev2 term added to the source.
@@ -104,7 +106,13 @@ void addDivDevReff(
     const std::vector<FvPatch>&   patches,
     bool                          correctedLaplacian = false,
     // `limited <k> corrected` -- caps the non-orth correction against the orthogonal part. 0 = uncapped.
-    scalar                        snGradLimitCoeff = 0.0);
+    scalar                        snGradLimitCoeff = 0.0,
+    // The case's gradScheme for grad(U). divDevRhoReff's explicit term is
+    // fvc::div((rho*nuEff)*dev2(T(fvc::grad(U)))), and OpenFOAM resolves that grad against gradSchemes --
+    // aerofoilNACA0012 asks for `cellLimited Gauss linear 1` on grad(U) while squareBend asks for plain
+    // `Gauss linear`, so a fixture with only the latter cannot tell the two apart. 0 = unlimited, which
+    // is what every existing caller passes and what `Gauss linear` means.
+    scalar                        gradULimitK = 0.0);
 
 } // namespace cpu
 } // namespace brae

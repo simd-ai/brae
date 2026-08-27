@@ -1,5 +1,6 @@
 // _cpp REFERENCE implementation -- see linearViscousStress_cpp.cuh for the OpenFOAM provenance.
 #include "linearViscousStress_cpp.cuh"
+#include "cellLimitedGrad_cpp.cuh"
 #include "fvm.cuh"
 
 namespace brae {
@@ -32,11 +33,16 @@ std::vector<vector> divDevReffExplicit(
     const std::vector<std::vector<scalar>>& nuEffBnd,
     const PrimitiveMesh&          m,
     const FvGeometry&             g,
-    const std::vector<FvPatch>&   patches)
+    const std::vector<FvPatch>&   patches,
+    scalar                        gradULimitK)
 {
     // fvc::grad(U) -- cell tensors, then the boundary tensors with OpenFOAM's gaussGrad boundary
     // correction (wall-normal component replaced by snGrad(U)).
-    const std::vector<tensor> gradU    = fvc::gaussGrad(U, m, g, patches);
+    std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+    // The case's gradScheme, applied to the SAME gradient the dev2 term is built from. OpenFOAM resolves
+    // fvc::grad(U) here against gradSchemes/grad(U); running the unlimited base scheme where the case
+    // names `cellLimited Gauss linear 1` is a different discretisation under the case's own scheme name.
+    if (gradULimitK > 0.0) cellLimitGrad(gradU, U, gradULimitK, m, g, patches);
     const std::vector<std::vector<tensor>> gradUb =
         fvc::gradUBoundary(U, gradU, m, g, patches);
 
@@ -79,7 +85,8 @@ void addDivDevReff(
     const FvGeometry&             g,
     const std::vector<FvPatch>&   patches,
     bool                          correctedLaplacian,
-    scalar                        snGradLimitCoeff)
+    scalar                        snGradLimitCoeff,
+    scalar                        gradULimitK)
 {
     // Implicit half: OpenFOAM writes `- fvm::laplacian(nuEff, U)` inside divDevReff, and UEqn.H adds
     // divDevReff to the equation -- so the laplacian enters with coefficient -1.
@@ -95,6 +102,12 @@ void addDivDevReff(
     // does carry the laplacian's own sign -- improved. That asymmetry is what identified it.
     if (correctedLaplacian)
     {
+        // A DIFFERENT gradient from the dev2 term's, and deliberately so -- this is OpenFOAM's own
+        // behaviour, not an inconsistency. correctedSnGrad<Type>::correction calls fullGradCorrection on
+        // each COMPONENT, and that looks its scheme up as `grad(U.component(0))` rather than `grad(U)`
+        // (correctedSnGrad.C). No case names a component entry, so it falls back to `default`, which on
+        // aerofoilNACA0012 is plain `Gauss linear` while grad(U) itself is `cellLimited Gauss linear 1`.
+        // Limiting this one to match the dev2 term looks tidier and is a different discretisation.
         const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
         const std::vector<vector> corr =
             fvm::laplacianNonOrthSource<vector, tensor>(gammaf, U, gradU, m, g, patches,
@@ -117,7 +130,8 @@ void addDivDevReff(
     //      quantity, so it must be multiplied back by V.
     // tests/test_divdevreff_cpp.cu pins the result against an OpenFOAM dump; do not "simplify" the signs
     // here without re-running it.
-    const std::vector<vector> expl = divDevReffExplicit(U, nuEff, nuEffBnd, m, g, patches);
+    const std::vector<vector> expl =
+        divDevReffExplicit(U, nuEff, nuEffBnd, m, g, patches, gradULimitK);
     const std::vector<scalar>& V = g.V();
     for (std::size_t c = 0; c < expl.size(); ++c)
     {

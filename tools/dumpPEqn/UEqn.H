@@ -31,12 +31,110 @@
     );
     fvVectorMatrix& UEqn = tUEqn.ref();
 
+    // The source BEFORE relax(), so the assembly can be separated from the relaxation. relax() replaces
+    // the diagonal with max(|D|, sumMagOffDiag)/alpha and adds (D - D0)*psi to the source, so a pre-relax
+    // diagonal difference can be invisible in A() and visible only here.
+    if (runTime.timeIndex() == braeDumpIter())
+    {
+        volVectorField USrc0
+        (
+            IOobject("stage_USrc0", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+            mesh, dimensionedVector(dimless, Zero), zeroGradientFvPatchVectorField::typeName
+        );
+        vectorField rhs0(UEqn.source());
+        forAll(mesh.boundary(), pj)
+        {
+            const labelUList& fc = mesh.boundary()[pj].faceCells();
+            const vectorField& bcp = UEqn.boundaryCoeffs()[pj];
+            forAll(fc, i) rhs0[fc[i]] += bcp[i];
+        }
+        USrc0.primitiveFieldRef() = rhs0;
+        USrc0.write();
+        volScalarField UDiag0
+        (
+            IOobject("stage_UDiag0", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+            mesh, dimensionedScalar(dimless, Zero), zeroGradientFvPatchScalarField::typeName
+        );
+        UDiag0.primitiveFieldRef() = UEqn.diag();
+        UDiag0.write();
+    }
+
     UEqn.relax();
 
     fvOptions.constrain(UEqn);
 
     if (runTime.timeIndex() == braeDumpIter())
-    {   // cell volume, so the porosity's V*tr(Cd) contribution can be decomposed from D = V/rAU
+    {
+        // The momentum matrix's SOURCE and OFF-DIAGONALS. rAU compares A() and stage_UIC/UBC compare the
+        // boundary coefficients, but H() -- which is the whole of HbyA -- is built from the source and
+        // the off-diagonals, and neither had an oracle. On aerofoilNACA0012 HbyA is 8.6e-06 out with A()
+        // and both coefficient sets exact, so it has to be one of these.
+        volVectorField USrcDump
+        (
+            IOobject("stage_USrc", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+            mesh, dimensionedVector(dimless, Zero), zeroGradientFvPatchVectorField::typeName
+        );
+        vectorField rhsU(UEqn.source());
+        forAll(mesh.boundary(), pj)
+        {
+            const labelUList& fc = mesh.boundary()[pj].faceCells();
+            const vectorField& bcp = UEqn.boundaryCoeffs()[pj];
+            forAll(fc, i) rhsU[fc[i]] += bcp[i];
+        }
+        USrcDump.primitiveFieldRef() = rhsU;
+        USrcDump.write();
+
+        surfaceScalarField UUp
+        (
+            IOobject("stage_UUpper", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+            mesh, dimensionedScalar(dimless, Zero)
+        );
+        surfaceScalarField ULo(UUp); ULo.rename("stage_ULower");
+        if (UEqn.hasUpper()) UUp.primitiveFieldRef() = UEqn.upper();
+        if (UEqn.hasLower()) ULo.primitiveFieldRef() = UEqn.lower();
+        else if (UEqn.hasUpper()) ULo.primitiveFieldRef() = UEqn.upper();
+        UUp.write(); ULo.write();
+
+        // fvc::grad(U) as the momentum source's explicit dev2 term is built from, and the term itself.
+        // The source is 1.0e-06 out on aerofoilNACA0012 and 1.2e-04 on wall-adjacent cells, so it is one
+        // of these two; the gradient's BOUNDARY carries gaussGrad's correction (normal component replaced
+        // by the patch snGrad), which is exactly what a no-slip wall makes large.
+        volTensorField gradUDump
+        (
+            IOobject("stage_UgradU", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+            fvc::grad(U)
+        );
+        gradUDump.write();
+
+        // The dev2 TENSOR itself -- (rho*nuEff)*dev2(T(grad(U))) -- and then its divergence. The tensor
+        // needs no scheme lookup, so it isolates the two halves: if the tensor agrees and the divergence
+        // does not, the difference is in the div operator's BOUNDARY faces rather than in the field.
+        // The names are forced to the ones the case's divSchemes entry uses
+        // (`div(((rho*nuEff)*dev2(T(grad(U)))))`), because fvc::div looks its scheme up by the ARGUMENT's
+        // name and a freshly-composed expression gets a different one.
+        volScalarField rhoNuEff("(rho*nuEff)", turbulence->muEff());
+        volTensorField devArg
+        (
+            IOobject("((rho*nuEff)*dev2(T(grad(U))))", runTime.timeName(), mesh,
+                     IOobject::NO_READ, IOobject::NO_WRITE),
+            rhoNuEff*dev2(T(fvc::grad(U)))
+        );
+        volTensorField devCopy
+        (
+            IOobject("stage_UdevTensor", runTime.timeName(), mesh, IOobject::NO_READ,
+                     IOobject::NO_WRITE),
+            devArg
+        );
+        devCopy.write();
+        volVectorField devDiv
+        (
+            IOobject("stage_UdevDiv", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+            fvc::div(devArg)
+        );
+        devDiv.write();
+
+
+        // cell volume, so the porosity's V*tr(Cd) contribution can be decomposed from D = V/rAU
         volScalarField VV
         (
             IOobject("stage_V", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),

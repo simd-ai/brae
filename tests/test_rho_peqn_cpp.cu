@@ -162,6 +162,18 @@ int main(int argc, char** argv)
         cpu::rhoSimple::createFields(caseDir + "/" + startT, caseDir, simpleDict, &fvSolution,
                                      m, g, patches);
 
+    // updateCoeffs() for the FREESTREAM family, at the point OpenFOAM calls it. Every momentum
+    // coefficient on such a patch is built from its valueFraction, and rAU = 1/UEqn.A() carries it
+    // straight into the pressure equation -- on aerofoilNACA0012 a seeded 0.5 read as rAU 1.08e-02
+    // against OpenFOAM's, and everything downstream of rAU inherited it.
+    {
+        std::vector<std::vector<vector>> Ub(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi) Ub[pi] = f.U.boundary[pi]->value();
+        updateMixedFreestream(f.U.boundary, Ub, patches);
+        updateMixedFreestream(f.p.boundary, Ub, patches);
+        f.p.evaluateBoundary();
+    }
+
     // Rebuild UEqn from OpenFOAM's own inputs: rAU and HbyA both come from it.
     const FieldData<scalar> muFd = readField<scalar>(caseDir + "/" + dumpT + "/stage_muEff");
     const std::vector<scalar>              muEff    = rawInternal(muFd, nC);
@@ -239,6 +251,44 @@ int main(int argc, char** argv)
             b.push_back(hFd.internalField[c].x); b.push_back(hFd.internalField[c].y); b.push_back(hFd.internalField[c].z);
         }
         report("HbyA = constrainHbyA(rAU*UEqn.H())", relL2(a, b), 1e-10);
+        // WHERE it lives. HbyA = rAU*H() in the cells and U on any patch whose BC is not assignable, so a
+        // disagreement confined to cells touching a patch is the constrain step or the boundary
+        // coefficients H() folds in, and one spread through the interior is H() itself.
+        {
+            std::vector<char> onB(nC, 0);
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                for (label i = 0; i < patches[pi].size; ++i)
+                    if (patches[pi].type != "empty") onB[patches[pi].faceCells[i]] = 1;
+            std::vector<scalar> ai, bi, ab, bb;
+            for (label c = 0; c < nC; ++c)
+            {
+                const scalar mine[3] = { st.HbyA[c].x, st.HbyA[c].y, st.HbyA[c].z };
+                const scalar theirs[3] = { hFd.internalField[c].x, hFd.internalField[c].y,
+                                           hFd.internalField[c].z };
+                for (int kk = 0; kk < 3; ++kk)
+                {
+                    if (onB[c]) { ab.push_back(mine[kk]); bb.push_back(theirs[kk]); }
+                    else        { ai.push_back(mine[kk]); bi.push_back(theirs[kk]); }
+                }
+            }
+            std::printf("       %-40s interior %.6e   touching a patch %.6e\n", "HbyA split",
+                        relL2(ai, bi), relL2(ab, bb));
+            // and per patch, so the offending boundary condition names itself
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                if (patches[pi].type == "empty" || !patches[pi].size) continue;
+                std::vector<scalar> pa, pb;
+                for (label i = 0; i < patches[pi].size; ++i)
+                {
+                    const label c = patches[pi].faceCells[i];
+                    pa.push_back(st.HbyA[c].x); pa.push_back(st.HbyA[c].y); pa.push_back(st.HbyA[c].z);
+                    pb.push_back(hFd.internalField[c].x); pb.push_back(hFd.internalField[c].y);
+                    pb.push_back(hFd.internalField[c].z);
+                }
+                std::printf("         %-24s %.6e   (%s)\n", patches[pi].name.c_str(), relL2(pa, pb),
+                            f.U.boundary[pi]->assignable() ? "assignable" : "NOT assignable");
+            }
+        }
     }
 
     const FieldData<scalar> h0Fd = readField<scalar>(caseDir + "/" + dumpT + "/stage_phiHbyA0");
