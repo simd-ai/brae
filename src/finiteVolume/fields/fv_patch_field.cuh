@@ -548,24 +548,149 @@ class SymmetryPlanePatchField : public fvPatchField<T>
 public:
     bool assignable() const override { return false; }   // OF: symmetry is a transform patch field
     explicit SymmetryPlanePatchField(const FvPatch& p) : fvPatchField<T>(p) {}
+
+    // OF basicSymmetryFvPatchField. For a SCALAR the normal gradient is zero and this is zeroGradient,
+    // which is what the base coefficients already give. For a VECTOR it is a TRANSFORM patch field and
+    // neither the value nor the coefficients are the scalar ones:
+    //
+    //   evaluate:  value = (iF + transform(I - 2*sqr(n), iF))/2 = iF - (n & iF)*n   (the TANGENTIAL part)
+    //   snGrad  =  (transform(I - 2*sqr(n), iF) - iF)*deltaCoeffs/2 = -(n & iF)*n*deltaCoeffs
+    //
+    // and, from transformFvPatchField.C with snGradTransformDiag = cmptMag(nf)
+    // (basicSymmetryFvPatchField.C:121-126):
+    //
+    //   valueInternalCoeffs    =  1 - cmptMag(n)
+    //   valueBoundaryCoeffs    =  value - cmptMultiply(valueInternalCoeffs, iF)
+    //   gradientInternalCoeffs = -deltaCoeffs*cmptMag(n)
+    //   gradientBoundaryCoeffs =  snGrad - cmptMultiply(gradientInternalCoeffs, iF)
+    //
+    // This class used to return the scalar value for every type and the BASE coefficients (1, 0, 0, 0),
+    // so a slip patch on a vector field got the full internal velocity and a matrix contribution that
+    // ignored the plane entirely. It is invisible to any gate that compares FIELDS, because OpenFOAM
+    // writes no `value` for a transform patch; angledDuct's momentum coefficients found it at exactly
+    // 1.0 on the slip patch with every other patch at 1e-14.
     void evaluate(const std::vector<T>& internal) override
     {
-        this->value_ = this->patchInternalField(internal);     // scalar: zeroGradient
+        pif_ = this->patchInternalField(internal);
+        if constexpr (std::is_same<T, vector>::value)
+        {
+            this->value_.resize(this->patch_.size);
+            for (label i = 0; i < this->patch_.size; ++i)
+            {
+                const vector& n = this->patch_.nf[i];
+                const scalar nd = n.x*pif_[i].x + n.y*pif_[i].y + n.z*pif_[i].z;
+                this->value_[i] = vector{ pif_[i].x - nd*n.x,
+                                          pif_[i].y - nd*n.y,
+                                          pif_[i].z - nd*n.z };
+            }
+        }
+        else
+        {
+            this->value_ = pif_;                               // scalar: zeroGradient
+        }
     }
+
+    std::vector<T> valueInternalCoeffs() const override
+    {
+        if constexpr (!std::is_same<T, vector>::value)
+        {
+            return fvPatchField<T>::valueInternalCoeffs();
+        }
+        else
+        {
+        std::vector<T> r(this->patch_.size);
+        for (label i = 0; i < this->patch_.size; ++i)
+        {
+            const vector& n = this->patch_.nf[i];
+            r[i] = vector{ 1.0 - std::fabs(n.x), 1.0 - std::fabs(n.y), 1.0 - std::fabs(n.z) };
+        }
+        return r;
+        }
+    }
+
+    std::vector<T> valueBoundaryCoeffs() const override
+    {
+        if constexpr (!std::is_same<T, vector>::value)
+        {
+            return fvPatchField<T>::valueBoundaryCoeffs();
+        }
+        else
+        {
+        const std::vector<T> vic = valueInternalCoeffs();
+        std::vector<T> r(this->patch_.size);
+        for (label i = 0; i < this->patch_.size; ++i)
+        {
+            const T& p = pifAt(i);
+            r[i] = vector{ this->value_[i].x - vic[i].x*p.x,
+                           this->value_[i].y - vic[i].y*p.y,
+                           this->value_[i].z - vic[i].z*p.z };
+        }
+        return r;
+        }
+    }
+
+    std::vector<T> gradientInternalCoeffs() const override
+    {
+        if constexpr (!std::is_same<T, vector>::value)
+        {
+            return fvPatchField<T>::gradientInternalCoeffs();
+        }
+        else
+        {
+        std::vector<T> r(this->patch_.size);
+        for (label i = 0; i < this->patch_.size; ++i)
+        {
+            const vector& n = this->patch_.nf[i];
+            const scalar dc = this->patch_.deltaCoeffs[i];
+            r[i] = vector{ -dc*std::fabs(n.x), -dc*std::fabs(n.y), -dc*std::fabs(n.z) };
+        }
+        return r;
+        }
+    }
+
+    std::vector<T> gradientBoundaryCoeffs() const override
+    {
+        if constexpr (!std::is_same<T, vector>::value)
+        {
+            return fvPatchField<T>::gradientBoundaryCoeffs();
+        }
+        else
+        {
+        const std::vector<T> gic = gradientInternalCoeffs();
+        std::vector<T> r(this->patch_.size);
+        for (label i = 0; i < this->patch_.size; ++i)
+        {
+            const vector& n = this->patch_.nf[i];
+            const T& p = pifAt(i);
+            const scalar dc = this->patch_.deltaCoeffs[i];
+            const scalar nd = n.x*p.x + n.y*p.y + n.z*p.z;
+            const vector sn { -nd*n.x*dc, -nd*n.y*dc, -nd*n.z*dc };   // snGrad
+            r[i] = vector{ sn.x - gic[i].x*p.x, sn.y - gic[i].y*p.y, sn.z - gic[i].z*p.z };
+        }
+        return r;
+        }
+    }
+
     bool fixesValue() const override { return false; }
     bool isSymmetry() const override { return true; }
+
+private:
+    // The patch internal field, cached at evaluate(). OpenFOAM's coefficient methods call
+    // patchInternalField() directly; brae's take no arguments, so it is kept here instead.
+    std::vector<T> pif_;
+    const T& pifAt(label i) const
+    {
+        static const T zero{};
+        return (i < static_cast<label>(pif_.size())) ? pif_[i] : zero;
+    }
 };
 
-// vector: remove the wall-normal component (value = v - n (n.v)).
-template <> inline void SymmetryPlanePatchField<vector>::evaluate(const std::vector<vector>& internal)
-{
-    for (label i = 0; i < this->patch_.size; ++i)
-    {
-        const vector v = internal[this->patch_.faceCells[i]];
-        const vector n = this->patch_.nf[i];
-        this->value_[i] = v - n * dot(n, v);
-    }
-}
+// The vector case used to live here as an explicit specialization. It computed the right VALUE
+// (v - n(n.v)) but nothing else, so it silently shadowed the in-class evaluate above -- which is the one
+// that caches the patch internal field the four transform coefficients are built from. The value agreed
+// with OpenFOAM while every coefficient was computed against a zero internal field: valueBoundaryCoeffs
+// came out equal to value_ and gradientBoundaryCoeffs came out exactly zero. Kept as a comment because
+// "the value is right so evaluate() is right" is what made this take a while to find.
 
 // wedge (OF wedgeFvPatchField) -- the AXISYMMETRIC constraint patch. The mesh is one cell thick in the
 // azimuthal direction and the two bounding planes are related by a rotation about the symmetry axis, so

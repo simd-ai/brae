@@ -300,7 +300,16 @@ int main(int argc, char** argv)
     // depends on which rho it is fed -- a separate component with its own history in this repo. Taking
     // OpenFOAM's evaluated U here keeps this gate measuring the momentum ASSEMBLY; the BC gets its own.
     const FieldData<vector> uAssFd = readField<vector>(caseDir + "/" + dumpT + "/stage_Uass");
-    const std::vector<std::vector<vector>> uAssBnd = rawBoundary<vector>(uAssFd, patches);
+    // THE BOUNDARY comes from stage_Upost, taken AFTER fvMatrix's constructor called updateCoeffs, which
+    // is the state the matrix was actually assembled from. stage_Uass is taken BEFORE that, so any
+    // boundary OpenFOAM recomputes per iteration -- flowRateInletVelocity, the freestream family -- still
+    // holds the previous iteration's value there. Comparing brae's recomputed inlet against it read
+    // 1.2e-04 on angledDuct: 45.224 against 45.218, which is the lag, not a disagreement. The INTERNAL
+    // field is identical in both, since updateCoeffs touches only boundaries.
+    const std::string upostPath = caseDir + "/" + dumpT + "/stage_Upost";
+    const FieldData<vector> uPostFd = std::ifstream(upostPath.c_str()).good()
+                                    ? readField<vector>(upostPath) : uAssFd;
+    const std::vector<std::vector<vector>> uAssBnd = rawBoundary<vector>(uPostFd, patches);
     // flowRateInletVelocity: the invariant, and the control that it is not met by accident.
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
@@ -350,6 +359,15 @@ int main(int argc, char** argv)
             }
         }
     }
+    // updateCoeffs() for the FLUX-CONDITIONAL family, at the point OpenFOAM calls it: fvMatrix's
+    // constructor calls psi.boundaryFieldRef().updateCoeffs(), and that is where inletOutlet reads
+    // sign(phi) and sets its valueFraction. Until then brae's inletOutlet sits at its refValue -- which
+    // is `inletValue`, and angledDuct's is (0 0 0) -- so the outlet read EXACTLY zero against
+    // OpenFOAM's (24.5, 24.6, 0.086), a relative error of exactly 1.0.
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        f.U.boundary[pi]->updateFromFlux(f.phi.boundary[pi]);
+    f.U.evaluateBoundary();
+
     // updateCoeffs() for the FREESTREAM family, at the point OpenFOAM calls it. freestreamVelocity is a
     // mixed patch whose valueFraction is recomputed from the current flow ANGLE, and every momentum
     // coefficient on such a patch is built from that fraction: valueInternalCoeffs = 1 - vf,
@@ -774,7 +792,7 @@ int main(int argc, char** argv)
             // adopted below: there is nothing to compare against, and zeros are not a measurement.
             {
                 bool hv = false;
-                for (const auto& b : uAssFd.boundary)
+                for (const auto& b : uPostFd.boundary)
                     if (b.name == patches[pi].name && (b.valueUniform || !b.values.empty())) hv = true;
                 if (!hv) continue;
             }
@@ -799,6 +817,33 @@ int main(int argc, char** argv)
         // OpenFOAM's then everything below is comparing two different problems.
         const double ub = n > 0.0 ? std::sqrt(d/n) : std::sqrt(d);
         report("brae's U boundary == OpenFOAM's", ub, 1e-14);
+        // PER PATCH, with the declared type and magnitudes. A boundary disagreement is a boundary
+        // CONDITION, and the only way to say which is to name it.
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            std::string ty = "(none written)";
+            bool hv = false;
+            for (const auto& b : uPostFd.boundary)
+                if (b.name == patches[pi].name)
+                {
+                    ty = b.type;
+                    if (b.valueUniform || !b.values.empty()) hv = true;
+                }
+            if (!hv || !patches[pi].size) { std::printf("       %-16s %-26s (no values written)\n",
+                                                        patches[pi].name.c_str(), ty.c_str()); continue; }
+            std::vector<scalar> a2, b2;
+            const std::vector<vector>& bv2 = f.U.boundary[pi]->value();
+            for (label i = 0; i < patches[pi].size; ++i)
+            {
+                a2.push_back(bv2[i].x); a2.push_back(bv2[i].y); a2.push_back(bv2[i].z);
+                b2.push_back(uAssBnd[pi][i].x); b2.push_back(uAssBnd[pi][i].y);
+                b2.push_back(uAssBnd[pi][i].z);
+            }
+            std::printf("       %-16s %-26s %.6e   brae[0]=(%.4e %.4e %.4e) OF[0]=(%.4e %.4e %.4e)\n",
+                        patches[pi].name.c_str(), ty.c_str(), relL2(a2, b2),
+                        bv2[0].x, bv2[0].y, bv2[0].z,
+                        uAssBnd[pi][0].x, uAssBnd[pi][0].y, uAssBnd[pi][0].z);
+        }
     }
     // Adopt OpenFOAM's evaluated U in place; GeometricField owns unique_ptr patch fields and cannot be
     // copied, and a copy is not wanted anyway -- the point is to assemble from OpenFOAM's exact input.
@@ -815,10 +860,17 @@ int main(int argc, char** argv)
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         bool hasValues = false;
-        for (const auto& b : uAssFd.boundary)
+        for (const auto& b : uPostFd.boundary)
             if (b.name == patches[pi].name && (b.valueUniform || !b.values.empty())) hasValues = true;
         if (hasValues) f.U.boundary[pi]->setValue(uAssBnd[pi]);
     }
+    // AND RE-EVALUATE THE TRANSFORM PATCHES against the internal field just adopted. OpenFOAM's
+    // transformFvPatchField coefficients call patchInternalField() LIVE at assembly; brae's take no
+    // arguments and read a copy cached by evaluate(), so the cache has to be refreshed whenever the
+    // internal field moves under it. These patches carry no OpenFOAM value to overwrite -- that is what
+    // hasValues just established -- so re-evaluating them adopts more of OpenFOAM's state, not less.
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        if (f.U.boundary[pi]->isSymmetry()) f.U.boundary[pi]->evaluate(f.U.internal);
 
     std::vector<std::vector<scalar>> rhoBnd(patches.size());
     for (std::size_t pi = 0; pi < patches.size(); ++pi) rhoBnd[pi] = f.rho.boundary[pi]->value();
@@ -921,6 +973,37 @@ int main(int argc, char** argv)
                     relL2Boundary(M.internalCoeffs, ofUIC, one),
                     relL2Boundary(M.boundaryCoeffs, ofUBC, one),
                     (int)patches[pi].size);
+    }
+    // CONTROL FOR THE TRANSFORM COEFFICIENTS. A slip patch's VALUE is the tangential projection under
+    // both the right and the wrong treatment, so every gate that compares fields passes either way --
+    // and OpenFOAM writes no `value` for a transform patch, so there is nothing there to compare in the
+    // first place. What separates them is only the four coefficient methods. This holds the value fixed
+    // and swaps the patch field for a zeroGradient one, whose (1, 0, 0, 0) coefficients are exactly what
+    // this class returned before: if that reproduces OpenFOAM's coefficients too, the numbers above are
+    // measuring something other than the transform.
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (!patches[pi].size || !f.U.boundary[pi]->isSymmetry()) continue;
+        std::vector<FvPatch> one(patches.size());
+        for (std::size_t q = 0; q < patches.size(); ++q)
+        {
+            one[q] = patches[q];
+            if (q != pi) one[q].size = 0;
+        }
+        const double right = relL2Boundary(M.boundaryCoeffs, ofUBC, one);
+
+        auto zg = std::make_unique<ZeroGradientPatchField<vector>>(patches[pi]);
+        zg->evaluate(f.U.internal);
+        zg->setValue(f.U.boundary[pi]->value());       // same value, base coefficients
+        f.U.boundary[pi].swap(reinterpret_cast<std::unique_ptr<fvPatchField<vector>>&>(zg));
+        const FvVectorMatrix Z = cpu::rhoSimple::assembleUEqn(f.U, in, m, g, patches);
+        const double wrong = relL2Boundary(Z.boundaryCoeffs, ofUBC, one);
+        f.U.boundary[pi].swap(reinterpret_cast<std::unique_ptr<fvPatchField<vector>>&>(zg));
+
+        std::printf("       control: %s as zeroGradient reads bC %.3e (transform reads %.3e)\n",
+                    patches[pi].name.c_str(), wrong, right);
+        check("  and the transform coefficients are what match, not the base ones",
+              wrong > 1e3 * std::max(right, 1e-14));
     }
 
     // ---- 2. THE CONTROL. Assemble the INCOMPRESSIBLE way -- kinematic nu_eff in place of the dynamic

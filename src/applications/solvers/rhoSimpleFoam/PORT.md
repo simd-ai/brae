@@ -191,6 +191,66 @@ guarded was unreachable; `limitTemperature` implemented as the CORRECTION it is 
 valueFraction, which OpenFOAM recomputes from the flow angle every updateCoeffs and the driver never did --
 that one was causing outright divergence.
 
+## The slip / symmetry transform coefficients, and why no field gate could see them
+
+`basicSymmetryFvPatchField` is a **transform** patch field. For a scalar it is zeroGradient, but for a
+vector neither its value nor its four matrix coefficients are the scalar ones. From
+`transformFvPatchField.C` with `snGradTransformDiag() = cmptMag(nf)` (`basicSymmetryFvPatchField.C:121-126`):
+
+    value                  =  iF - (n & iF)*n                 the TANGENTIAL part
+    snGrad                 = -(n & iF)*n*deltaCoeffs
+    valueInternalCoeffs    =  1 - cmptMag(n)
+    valueBoundaryCoeffs    =  value - cmptMultiply(valueInternalCoeffs, iF)
+    gradientInternalCoeffs = -deltaCoeffs*cmptMag(n)
+    gradientBoundaryCoeffs =  snGrad - cmptMultiply(gradientInternalCoeffs, iF)
+
+brae returned the correct tangential VALUE and the BASE coefficients `(1, 0, 0, 0)` for every type, so a
+slip patch contributed to the momentum matrix as if the plane were not there. On angledDuct, whose
+`porosityWall` is `slip`, that read as exactly **1.0** on that patch with every other patch at 1e-14 —
+`internalCoeffs` 2.3e-03 and `boundaryCoeffs` 1.6e-03 over the whole boundary, and `rAU` 6.0e-08.
+
+**No gate that compares fields could have found this.** OpenFOAM writes no `value` entry for a transform
+patch, because the value is reconstructed by `evaluate()` rather than stored — so there is nothing on that
+patch to compare, and the value brae did produce was right anyway. Only the coefficients differ. That is
+why the gate now asserts at coefficient level and carries a control that holds the value fixed and swaps
+the patch field for a zeroGradient one: **1.000e+00 against 5.144e-15**, a 14-order separation.
+
+### A shadowing specialization, and the wrong inference that hid it
+
+The first fix landed the four coefficient methods and moved `internalCoeffs` to 7.4e-16 and `rAU` to
+1.8e-15 — but `boundaryCoeffs` did not move at all, still exactly 1.0 on the slip patch. Both boundary
+coefficients are built from the patch internal field, which brae's argument-less coefficient methods read
+from a copy cached by `evaluate()`; the cache was empty, so `valueBoundaryCoeffs` came out equal to
+`value_` and `gradientBoundaryCoeffs` came out exactly zero.
+
+The cause was an **explicit template specialization further down the file**,
+`SymmetryPlanePatchField<vector>::evaluate`, left from before. It computed the right value and nothing
+else, and for `T = vector` — the only case that needs the transform — it silently shadowed the in-class
+`evaluate`. The reasoning that cost the time was *the value is the correct tangential projection,
+therefore `evaluate()` ran* — true of the specialization, and it is the one that ran. Printing
+`pif_.size()` next to the object address settled in one run what argument had not.
+
+Two consequences worth keeping: a `dynamic_cast` to a base class succeeds for derived classes too and
+proves less than it looks, and `WedgePatchField<vector>` still carries a specialization of the same shape
+— wedge is a transform patch field in OpenFOAM as well, and its coefficients are **not** ported. No
+rhoSimpleFoam tutorial in scope uses one; it is recorded here rather than fixed.
+
+Because the cache is filled at `evaluate()` rather than read live as OpenFOAM does, it goes stale if the
+internal field moves afterwards. The solver calls `evaluateBoundary()` immediately before assembly so this
+does not arise there, but the gate adopts OpenFOAM's internal field *after* evaluating, and now
+re-evaluates the transform patches against it.
+
+**Result on angledDuct at iteration 200**, every figure against `dumpPEqn`'s own:
+
+| | before | after |
+|---|---|---|
+| `UEqn.internalCoeffs()` | 2.3e-03 | **7.41e-16** |
+| `UEqn.boundaryCoeffs()` | 1.6e-03 | **2.57e-15** |
+| `boundaryCoeffs` on `porosityWall` | 1.000e+00 | **5.14e-15** |
+| `rAU = 1/UEqn.A()` | 6.0e-08 | **1.79e-15** |
+| `UEqn source + boundaryCoeffs` | 2.51e-06 | **2.53e-15** |
+
+
 ## Open findings, turned up by the port and belonging to other components
 
 **The device kEpsilon has the same `corrected` question, unmeasured.** `device_simple_foam.cu`'s
