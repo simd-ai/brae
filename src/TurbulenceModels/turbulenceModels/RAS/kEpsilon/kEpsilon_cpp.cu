@@ -163,7 +163,8 @@ void correct(
     KEResiduals* res,
     bool bounded,
     int dropTerm,
-    const Compressible* comp)
+    const Compressible* comp,
+    const cpu::fvOptions::OptionList* fvOpts)
 {
     const label nC = m.nCells();
     const scalar Cmu25 = std::pow(co.Cmu, 0.25);
@@ -353,6 +354,8 @@ void correct(
         if (res && res->captureStages) captureSystem(M, patches, res->epsD0, res->epsSrc0);
         relaxMatrix(M, epsilon, m, patches, relaxEps);
         setValues(M, epsilon.internal, m, patches, wallCells, epsVals);
+        // fvOptions.constrain(epsEqn), kEpsilon.C -- after relax() and the wall manipulation.
+        if (fvOpts) cpu::fvOptions::constrain(*fvOpts, M, epsilon.internal, "epsilon", m, patches);
         if (res)
         {
             // |b - A.psi| per cell, on the SAME assembled matrix the solve is about to use, before the
@@ -469,6 +472,8 @@ void correct(
 
         if (res && res->captureStages) captureSystem(M, patches, res->kD0, res->kSrc0);
         relaxMatrix(M, k, m, patches, relaxK);
+        // fvOptions.constrain(kEqn), kEpsilon.C -- after relax(), as OpenFOAM has it.
+        if (fvOpts) cpu::fvOptions::constrain(*fvOpts, M, k.internal, "k", m, patches);
         if (res && res->captureStages)
         {
             captureSystem(M, patches, res->kD, res->kSrc, &res->kUpper, &res->kLower);

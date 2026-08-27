@@ -34,6 +34,7 @@
 #include "rhoCreateFields_cpp.cuh"
 #include "cellLimitedGrad_cpp.cuh"
 #include "scheme_parse.cuh"
+#include "fvOptions_cpp.cuh"
 #include "linearViscousStress_cpp.cuh"
 #include "rhoSimpleFoam_cpp.cuh"   // effectiveTransport: the solver's OWN muEff
 #include "rhoUEqn_cpp.cuh"
@@ -205,6 +206,10 @@ static std::vector<tensor> readTensorPatch(
     }
     return out;
 }
+
+// The case's fvOptions, at file scope so the diagnostic lambdas above main can name the
+// porosity cells they are reporting on.
+static cpu::fvOptions::OptionList uopts;
 
 int main(int argc, char** argv)
 {
@@ -458,6 +463,28 @@ int main(int argc, char** argv)
             }
             std::printf("       %-40s %.6e   (walls %.6e)\n", "UEqn diag BEFORE relax",
                         relL2(da, db), relL2(daw, dbw));
+            // At a cell the porosity acts on, so the term can be seen rather than inferred.
+            for (const auto& o : uopts.options)
+            {
+                if (!o.fixedCoeff || o.cells.empty()) continue;
+                const label zc = o.cells[0];
+                std::printf("         porosity cell %d: brae diag %.6e   OF diag %.6e   V %.6e   "
+                            "V*tr(alpha) %.6e\n", (int)zc, U0.diag[zc], ofD[zc], g.V()[zc],
+                            g.V()[zc] * (o.alpha.xx + o.alpha.yy + o.alpha.zz));
+                // A cell the porosity does NOT act on. If the diagonal disagrees there too, the porosity
+                // is not the cause and the momentum assembly itself is wrong on this case.
+                std::vector<char> inZone(nC, 0);
+                for (label zz : o.cells) inZone[zz] = 1;
+                for (label c2 = 0; c2 < nC; ++c2)
+                    if (!inZone[c2])
+                    {
+                        std::printf("         non-porosity cell %d: brae diag %.6e   OF diag %.6e   "
+                                    "ratio %.4f\n", (int)c2, U0.diag[c2], ofD[c2],
+                                    ofD[c2] != 0.0 ? (double)(U0.diag[c2]/ofD[c2]) : 0.0);
+                        break;
+                    }
+                break;
+            }
         }
     };
 
@@ -743,6 +770,14 @@ int main(int argc, char** argv)
         double d = 0.0, n = 0.0;
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
+            // Patches OpenFOAM writes no `value` for are skipped for the same reason they are not
+            // adopted below: there is nothing to compare against, and zeros are not a measurement.
+            {
+                bool hv = false;
+                for (const auto& b : uAssFd.boundary)
+                    if (b.name == patches[pi].name && (b.valueUniform || !b.values.empty())) hv = true;
+                if (!hv) continue;
+            }
             // EMPTY patches are excluded because OpenFOAM excludes them: emptyFvPatch::size() is 0, so
             // its boundaryField has no entries and the written file carries no values. brae keeps the
             // mesh's face count there, which is harmless in the solver -- the base coefficients are zero
@@ -769,7 +804,21 @@ int main(int argc, char** argv)
     // copied, and a copy is not wanted anyway -- the point is to assemble from OpenFOAM's exact input.
     if (!uAssFd.internalUniform && static_cast<label>(uAssFd.internalField.size()) == nC)
         f.U.internal = uAssFd.internalField;
-    for (std::size_t pi = 0; pi < patches.size(); ++pi) f.U.boundary[pi]->setValue(uAssBnd[pi]);
+    // ADOPT ONLY WHERE OPENFOAM SUPPLIES VALUES. A transform patch -- slip, noSlip, symmetry, wedge --
+    // is written by OpenFOAM with its TYPE and no `value` entry, because its value is reconstructed by
+    // evaluate() rather than stored. rawBoundary fills zeros for a patch with no value, so adopting
+    // blindly assembles the momentum equation with U = 0 there instead of the projected velocity.
+    // On angledDuct, whose porosityWall is `slip`, that corrupted the whole matrix: the U boundary read
+    // 1.43e+00, the diagonal 9.93e-01 and rAU 8.23e-01, and the error was UNIFORM across the field
+    // rather than confined to any patch -- which is what gave it away, since a real boundary defect
+    // shows up in the cells that touch that boundary.
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        bool hasValues = false;
+        for (const auto& b : uAssFd.boundary)
+            if (b.name == patches[pi].name && (b.valueUniform || !b.values.empty())) hasValues = true;
+        if (hasValues) f.U.boundary[pi]->setValue(uAssBnd[pi]);
+    }
 
     std::vector<std::vector<scalar>> rhoBnd(patches.size());
     for (std::size_t pi = 0; pi < patches.size(); ++pi) rhoBnd[pi] = f.rho.boundary[pi]->value();
@@ -817,6 +866,20 @@ int main(int argc, char** argv)
         parseFvSchemesControls(caseDir, sctl);
         in.gradULimitK = sctl.gradULimitK;
         std::printf("  gradSchemes: grad(U) cellLimited k = %g\n", (double)in.gradULimitK);
+    }
+
+    // The case's fvOptions, applied as UEqn.H applies them. Without this the gate assembles a momentum
+    // equation with no porosity where the case has one, which is a different equation.
+    uopts = cpu::fvOptions::read(caseDir, m);
+    if (uopts.firstUnsupported().empty() && !uopts.empty())
+    {
+        in.fvOpts = &uopts;
+        std::printf("  fvOptions: %zu option(s) applied\n", uopts.options.size());
+        for (const auto& o : uopts.options)
+            std::printf("     %-28s type=%-28s cells=%zu allCells=%d fixedCoeff=%d rhoRef=%g "
+                        "tr(alpha)=%g\n", o.name.c_str(), o.type.c_str(), o.cells.size(),
+                        (int)o.allCells, (int)o.fixedCoeff, (double)o.rhoRef,
+                        (double)(o.alpha.xx + o.alpha.yy + o.alpha.zz));
     }
 
     // ---- 1. The assembled momentum matrix, against OpenFOAM's. ----

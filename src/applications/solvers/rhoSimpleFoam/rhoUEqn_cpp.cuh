@@ -68,6 +68,7 @@
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
+#include "fvOptions_cpp.cuh"
 #include "MRF_cpp.cuh"
 #include "geometric_field.cuh"
 #include "ldu_matrix.cuh"
@@ -125,6 +126,13 @@ struct RhoMomentumInput
     scalar    snGradLimitCoeff   = 0.0;
     bool      hasMRF             = false;   // declared by the case -> must refuse until ported
     bool      hasFvOptions       = false;   // an UNIMPLEMENTED option -> must refuse
+    // WHICH option, so the refusal names it. "Refuse rather than silently substitute" is only useful if
+    // the message says what to implement next; a generic "the case declares fvOptions" sends the reader
+    // back to the dictionary to work it out.
+    std::string fvOptionUnsupported;
+    // The IMPLEMENTED ones. UEqn.H applies fvOptions(rho, U), and for explicitPorositySource that is
+    // eqn -= porosityEqn with the resistance built by the porosity model. Null = no options to apply.
+    const cpu::fvOptions::OptionList* fvOpts = nullptr;
 };
 
 // mu_eff = rho*nu_eff, cells and boundary. Exposed because pEqn.H needs the same product and two

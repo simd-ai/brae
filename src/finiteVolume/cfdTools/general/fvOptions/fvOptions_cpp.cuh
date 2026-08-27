@@ -66,6 +66,28 @@ struct Option
     // DarcyForchheimer, already transformed into the global frame with the 0.5 folded into F.
     tensor D{};
     tensor F{};
+
+    // fixedCoeff (porosityModels::fixedCoeff), the OTHER explicitPorositySource model. Its resistance is
+    //     Cd = rho*(alpha + beta*|U|),  Udiag += V*tr(Cd),  Usource -= V*((Cd - I*tr(Cd)) & U)
+    // (fixedCoeff.C:apply). alpha and beta are diagonal in the coordinate system's frame and transformed
+    // into the global one exactly as d and f are. `rho` is NOT the local density: fixedCoeff::correct
+    // reads `rhoRef` from the dict when the equation is force-dimensioned and uses 1 otherwise, which is
+    // the same dispatch-on-dimensions DarcyForchheimer makes.
+    // fvOptions CONSTRAINTS. These are not source terms: OpenFOAM applies them as eqn.setValues(cells,
+    // values), which forces the value in those cells AND removes the coupling from their neighbours'
+    // equations. Overwriting the field after the solve is NOT the same thing -- the neighbours would have
+    // been solved against the unconstrained value.
+    //   fixedTemperatureConstraint (mode uniform): setValues(cells, he(p, Tuniform, cells))
+    //   FixedValueConstraint<scalar>:              setValues(cells, fieldValues[field])
+    enum class Constraint { none, fixedTemperature, scalarFixedValue };
+    Constraint constraint = Constraint::none;
+    scalar     Tuniform   = 0.0;
+    std::vector<std::pair<std::string, scalar>> fieldValues;
+
+    bool   fixedCoeff = false;
+    tensor alpha{};
+    tensor beta{};
+    scalar rhoRef = 1.0;
 };
 
 struct OptionList
@@ -86,7 +108,28 @@ void addSup(
     FvVectorMatrix&               UEqn,
     const GeometricField<vector>& U,
     scalar                        nu,
-    const FvGeometry&             g);
+    const FvGeometry&             g,
+    // TRUE for a FORCE-dimensioned momentum equation, which is rhoSimpleFoam's. Both porosity models
+    // branch on UEqn.dimensions() in OpenFOAM: fixedCoeff::correct reads `rhoRef` from the dict when the
+    // equation is in force units and uses 1 otherwise (fixedCoeff.C:202-207). Passing this rather than
+    // inspecting dimensions keeps the _cpp reference free of a dimension set it does not carry.
+    bool                          forceDimensions = false);
+
+// fvOptions.constrain(eqn) for a SCALAR equation. `field` is the name the equation solves ("e"/"h" for
+// energy, "k", "epsilon", ...); a constraint that does not name it does nothing. The energy equation
+// takes fixedTemperatureConstraint, whose value is he(p, Tuniform) -- so the caller supplies the
+// conversion rather than this file carrying a thermo.
+void constrain(
+    const OptionList&           opts,
+    FvScalarMatrix&             eqn,
+    std::vector<scalar>&        psi,   // setValues writes the constrained value into it, as OF does
+    const std::string&          field,
+    const PrimitiveMesh&        m,
+    const std::vector<FvPatch>& patches,
+    // he(p, T) for the fixedTemperatureConstraint; unused by the others. Null means an energy constraint
+    // is refused rather than applied with a temperature where an energy belongs -- which is exactly the
+    // mistake the EEqn gate caught once already.
+    scalar                    (*heOfT)(scalar) = nullptr);
 
 } // namespace fvOptions
 } // namespace cpu

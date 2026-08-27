@@ -1,5 +1,6 @@
 // _cpp REFERENCE implementation -- see UEqn_cpp.cuh for the OpenFOAM provenance and the refusal contract.
 #include "rhoUEqn_cpp.cuh"
+#include "fvOptions_cpp.cuh"
 #include "fvm.cuh"
 #include "fv_matrix_ops.cuh"
 #include "linearViscousStress_cpp.cuh"
@@ -90,10 +91,12 @@ void refuseUnsupported(const RhoMomentumInput& in)
             "supplied to this assembly; refusing rather than silently solving a different equation.");
     if (in.hasFvOptions)
         throw std::runtime_error(
-            "rhoSimpleFoam UEqn_cpp: the case declares fvOptions, which UEqn.H applies as "
-            "fvOptions(rho, U), fvOptions.constrain(UEqn) and fvOptions.correct(U) "
-            "(rhoSimpleFoam/UEqn.H:11,17,21). The _cpp reference does not implement it; refusing rather "
-            "than silently solving a different equation.");
+            "rhoSimpleFoam UEqn_cpp: the case declares an fvOption this port does not implement"
+            + (in.fvOptionUnsupported.empty() ? std::string()
+                                              : std::string(" -- '") + in.fvOptionUnsupported + "'")
+            + ". UEqn.H applies fvOptions(rho, U), fvOptions.constrain(UEqn) and fvOptions.correct(U) "
+              "(rhoSimpleFoam/UEqn.H:11,17,21). explicitPorositySource (DarcyForchheimer and fixedCoeff) "
+              "IS implemented; refusing rather than silently solving a different equation.");
     const bool haveMu  = in.muEff && in.muEffBnd;
     const bool haveRho = in.rho && in.rhoBnd && in.nuEff && in.nuEffBnd;
     if (!haveMu && !haveRho)
@@ -212,6 +215,13 @@ FvVectorMatrix assembleUEqn(
     }
     addDivDevReff(M, U, *muEff, *muEffBnd, m, g, patches, in.correctedLaplacian, in.snGradLimitCoeff,
                   in.gradULimitK);
+
+    // == fvOptions(rho, U). rhoSimpleFoam's momentum equation is in FORCE units, which is what selects
+    // fixedCoeff's rhoRef branch over the kinematic one.
+    if (in.fvOpts && !in.fvOpts->empty())
+    {
+        cpu::fvOptions::addSup(*in.fvOpts, M, U, /*nu=*/0.0, g, /*forceDimensions=*/true);
+    }
 
     // + MRF.DDt(rho, U), UEqn.H:8. MRFZoneList::DDt(rho,U) is rho*DDt(U), so the Coriolis acceleration is
     // formed first and then rho-weighted per cell. Weighting AFTER is not a rearrangement: addCoriolis

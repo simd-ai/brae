@@ -52,6 +52,7 @@
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
 #include "rhoCreateFields_cpp.cuh"
+#include "fvOptions_cpp.cuh"
 #include "komega_sst_coeffs.cuh"   // KOmegaSSTCoeffs, for a case whose RASModel is kOmegaSST
 #include "rhoUEqn_cpp.cuh"
 #include "rhoEEqn_cpp.cuh"
@@ -110,6 +111,7 @@ struct StepInput
     // `bounded Gauss limitedLinear 1` on both scalars where the kEpsilon ones ask for plain upwind.
     KOmegaSSTCoeffs sstCoeffs{};
     scalar relaxOmega        = 1.0;
+    scalar gradKLimitK       = 0.0;   // gradSchemes/grad(k) and grad(omega), for CDkOmega and F1
     bool   sstLimitedLinear  = false;
     scalar sstLimiterCoeff   = 1.0;
     bool   sstLinearUpwind   = false;
@@ -121,6 +123,11 @@ struct StepInput
     // --- refusals ---
     bool hasMRF              = false;
     bool hasFvOptions        = false;
+    std::string fvOptionUnsupported;   // which one, so the refusal names it
+    // The IMPLEMENTED fvOptions, read from the case. hasFvOptions above stays TRUE only for the ones
+    // this port does not implement, so a case carrying both an explicitPorositySource and, say, an
+    // explicit heat source is still refused by name rather than run with half its options applied.
+    const cpu::fvOptions::OptionList* fvOpts = nullptr;
     // limitTemperature (fvOptions/corrections/limitTemperature). It is a CORRECTION, not a source: it has
     // no addSup and no constrain, so the momentum, pressure and energy ASSEMBLIES are untouched and it
     // acts only as fvOptions.correct(he) after the energy solve, clamping he between he(p,Tmin) and

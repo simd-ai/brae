@@ -63,8 +63,21 @@ int main(int argc, char** argv)
 
     // ---- the COEFFICIENTS, against the dictionary --------------------------------------------
     // simpleCar: d (5e7 -1000 -1000), f (0 0 0), identity coordinate system. The 0.5 lives in F.
+    //
+    // THIS ASSERTION WAS WRONG, and it is corrected here rather than relaxed. It used to require that
+    // `d.y = -1000 survives with its sign`, which contradicts OpenFOAM: porosityModel.C's
+    // adjustNegativeResistance -- called from DarcyForchheimer.C:67-68 and fixedCoeff.C:122-123 -- turns
+    // a NEGATIVE component into `val*(-maxCmpt)`, i.e. POSITIVE and scaled by the largest component.
+    // Here maxCmpt = 5e7, so d.y = -1000*(-5e7) = 5e10. That is the physical intent of a porous baffle:
+    // flow passes along x and is blocked across it, and a literal negative resistance would ACCELERATE
+    // the flow. All-negative is a fatal error in OpenFOAM, not a clamp.
+    //
+    // Found by porting fixedCoeff for angledDuctExplicitFixedCoeff, whose `alpha (500 -1000 -1000)` is
+    // really (500, 500000, 500000): brae's momentum diagonal read 2.05e-04 against OpenFOAM's 3.15e-02
+    // inside the porous zone and was exact everywhere else.
     check(std::fabs(po->D.xx - 5e7) < 1e-6*5e7, "d.x parsed and transformed to D.xx = 5e7");
-    check(std::fabs(po->D.yy + 1000.0) < 1e-9*1000.0, "d.y = -1000 survives with its sign");
+    check(std::fabs(po->D.yy - 5e10) < 1e-9*5e10,
+          "d.y = -1000 becomes +5e10 (adjustNegativeResistance)");
     check(std::fabs(po->D.xy) + std::fabs(po->D.xz) + std::fabs(po->D.yz) < 1e-6*5e7,
           "an identity coordinate system leaves D diagonal");
 

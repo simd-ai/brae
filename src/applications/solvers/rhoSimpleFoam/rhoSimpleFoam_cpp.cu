@@ -205,6 +205,8 @@ Residuals rhoSimpleStep(
     uin.snGradLimitCoeff   = in.snGradLimitCoeff;
     uin.hasMRF             = in.hasMRF;
     uin.hasFvOptions       = in.hasFvOptions;
+    uin.fvOpts             = in.fvOpts;
+    uin.fvOptionUnsupported = in.fvOptionUnsupported;
     const FvVectorMatrix UEqn = assembleUEqn(f.U, uin, m, g, patches);
     {
         // solve(UEqn == -fvc::grad(p)) on a COPY: the pressure equation needs the ORIGINAL UEqn for
@@ -235,6 +237,23 @@ Residuals rhoSimpleStep(
         ein.hasMRF            = in.hasMRF;
         ein.hasFvOptions      = in.hasFvOptions;
         FvScalarMatrix E = assembleEEqn(f.he, f.U, f.p, f.rho, ein, m, g, patches);
+        // fvOptions.constrain(EEqn), EEqn.H:24. A fixedTemperatureConstraint sets he(p, Tuniform) on its
+        // cells -- an ENERGY, not a temperature. The thermo conversion is supplied here because the
+        // fvOptions reference carries no thermo.
+        if (in.fvOpts && !in.fvOpts->empty())
+        {
+            static ThermoCoeffs tc;   // the lambda below cannot capture, so the thermo goes through here
+            tc = f.thermo;
+            static bool isE;
+            isE = (f.heName == "e");
+            cpu::fvOptions::constrain(
+                *in.fvOpts, E, f.he.internal, f.heName, m, patches,
+                [](scalar T)
+                {
+                    const scalar hs = tc.Cp * (T - tc.Tref) + tc.Href;
+                    return isE ? hs - tc.R * T : hs;
+                });
+        }
         const SolverPerformance ep =
             pbicgstab(E, f.he.internal, m, patches, in.tolHe, in.relTolHe, in.maxIter);
         res[f.heName] = ep.initialResidual;
@@ -450,11 +469,15 @@ Residuals rhoSimpleStep(
             sc.alphat   = &f.alphat.internal;
             sc.Prt      = in.Prt;
 
+            // The case's gradSchemes for grad(k)/grad(omega), which CDkOmega and therefore F1 depend on.
+            KOmegaSSTCoeffs sco = in.sstCoeffs;
+            sco.gradKLimitK      = in.gradKLimitK;
+
             const std::vector<scalar> y = cellWallDist(m, g, patches);
             kOmegaSST::SSTResiduals sres;
             kOmegaSST::correct(f.U, f.k, f.omega, f.nut, f.phi, y, /*nu=*/0.0, m, g, patches,
                                in.relaxOmega, in.relaxK, in.tolTurb, in.relTolTurb, in.maxIter,
-                               in.sstCoeffs, &sres, in.boundedTurb,
+                               sco, &sres, in.boundedTurb,
                                in.sstLimitedLinear, in.sstLimiterCoeff, in.sstLinearUpwind,
                                in.correctedLaplacian, in.snGradLimitCoeff, /*lm=*/nullptr, &sc);
             res["omega"] = sres.omega;
@@ -491,7 +514,7 @@ Residuals rhoSimpleStep(
         kEpsilonRef::KEResiduals kres;
         kEpsilonRef::correct(f.U, f.k, f.epsilon, f.nut, f.phi, /*nu=*/0.0, m, g, patches,
                              in.relaxEpsilon, in.relaxK, in.tolTurb, in.relTolTurb, in.maxIter,
-                             keco, &kres, in.boundedTurb, /*dropTerm=*/0, &comp);
+                             keco, &kres, in.boundedTurb, /*dropTerm=*/0, &comp, in.fvOpts);
         res["epsilon"] = kres.epsilon;
         res["k"]       = kres.k;
         f.alphat.evaluateBoundary();

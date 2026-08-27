@@ -12,6 +12,13 @@ namespace brae {
 
 struct KOmegaSSTCoeffs
 {
+    // gradSchemes/grad(k) and grad(omega). CDkOmega is (2*alphaOmega2/omega)*(grad(k) & grad(omega)) and
+    // F1 is built from it, so the blend between the k-omega and k-epsilon branches is only as right as
+    // these gradients. OpenFOAM resolves each against its own gradSchemes entry -- aerofoilNACA0012 names
+    // `cellLimited Gauss linear 1` for both while squareBend leaves them at the unlimited default, so a
+    // fixture with only the latter cannot tell the two apart. 0 = unlimited.
+    scalar gradKLimitK = 0.0;
+
     scalar alphaK1 = 0.85,     alphaK2 = 1.0;          // k diffusivity blend  (kOmegaSSTBase.C:263,272)
     scalar alphaOmega1 = 0.5,  alphaOmega2 = 0.856;    // omega diffusivity blend         (:281,290)
     scalar gamma1 = 5.0/9.0,   gamma2 = 0.44;          // production coeff blend          (:299,308)

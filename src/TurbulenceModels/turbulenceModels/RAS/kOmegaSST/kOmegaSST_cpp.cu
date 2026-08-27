@@ -1,5 +1,6 @@
 // _cpp REFERENCE implementation -- see kOmegaSST_cpp.cuh for the OpenFOAM provenance and refusals.
 #include "kOmegaSST_cpp.cuh"
+#include "cellLimitedGrad_cpp.cuh"
 #include "nut_wall_function.cuh"
 #include "near_wall_dist.cuh"
 #include "pbicgstab.cuh"
@@ -304,8 +305,14 @@ void correct(
     }
 
     // ---- CDkOmega, F1, F2 ------------------------------------------------------------------------
-    const std::vector<vector> gradK  = fvc::gaussGrad(k, m, g, patches);
-    const std::vector<vector> gradOm = fvc::gaussGrad(omega, m, g, patches);
+    // The case's gradScheme on each, as OpenFOAM resolves grad(k) and grad(omega) separately.
+    std::vector<vector> gradK  = fvc::gaussGrad(k, m, g, patches);
+    std::vector<vector> gradOm = fvc::gaussGrad(omega, m, g, patches);
+    if (co.gradKLimitK > 0.0)
+    {
+        cellLimitGrad(gradK,  k,     co.gradKLimitK, m, g, patches);
+        cellLimitGrad(gradOm, omega, co.gradKLimitK, m, g, patches);
+    }
     const std::vector<scalar> CD  = CDkOmega(gradK, gradOm, omega.internal, co);
     // A per-cell nu, so F1/F2's viscous cross-over terms see the field the compressible lineage has.
     std::vector<scalar> nuCell(nC);

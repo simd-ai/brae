@@ -43,6 +43,7 @@
 //   * the epsilon equation's near-wall rows are then fixed by setValues (manipulateMatrix).
 #include "cf_types.cuh"
 #include "kepsilon_coeffs.cuh"
+#include "fvOptions_cpp.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -152,7 +153,11 @@ void correct(
                              // 8 diffusion nut/sigmak
                              // (epsilonWallFunction's lowReCorrection rides on KEpsilonCoeffs::epsLowRe)
     // LAST, so every existing positional caller is unchanged. Null is the incompressible lineage.
-    const Compressible* comp = nullptr);
+    const Compressible* comp = nullptr,
+    // fvOptions.constrain(epsEqn)/(kEqn) -- kEpsilon.C calls it on both. A scalarFixedValueConstraint
+    // naming k or epsilon forces them on its cells via setValues, which is not the same as overwriting
+    // the field afterwards: setValues also removes the coupling from the neighbours' equations.
+    const cpu::fvOptions::OptionList* fvOpts = nullptr);
 
 } // namespace kEpsilonRef
 } // namespace cpu

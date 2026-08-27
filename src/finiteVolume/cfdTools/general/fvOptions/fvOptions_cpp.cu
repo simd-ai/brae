@@ -1,5 +1,6 @@
 // _cpp REFERENCE implementation -- see fvOptions_cpp.cuh for the OpenFOAM provenance and the sign note.
 #include "fvOptions_cpp.cuh"
+#include "fv_matrix_ops.cuh"
 #include "cell_selection.cuh"   // resolveCellSelection: OF cellSetOption::setSelection, already ported for MRF
 #include "mrf_read.cuh"         // readCellZones
 #include <cmath>
@@ -34,6 +35,26 @@ bool readDimensionedVector(const FoamDict& d, const std::string& key, vector& ou
     if (nums.size() < 3) return false;
     out = vector{ nums[nums.size()-3], nums[nums.size()-2], nums[nums.size()-1] };
     return true;
+}
+
+// porosityModel::adjustNegativeResistance. A NEGATIVE resistance component in the dictionary is not a
+// literal negative coefficient: OpenFOAM replaces it with `val*(-maxCmpt)`, i.e. it becomes POSITIVE and
+// scaled by the largest component. angledDuctExplicitFixedCoeff's `alpha (500 -1000 -1000)` is really
+// (500, 500000, 500000) -- a very strong resistance across the duct and a weak one along it -- and
+// tr(alpha) goes from -1500 to 1000500. Reading it verbatim put the momentum diagonal 667x out inside
+// the porosity zone and exact everywhere else, which is what localised it.
+//
+// All-negative is a fatal error in OpenFOAM, not a clamp, so it is refused here rather than adjusted.
+void adjustNegativeResistance(vector& r, const char* what)
+{
+    const scalar maxCmpt = std::max(r.x, std::max(r.y, r.z));
+    if (maxCmpt < 0.0)
+        throw std::runtime_error(
+            std::string("porosity: every component of `") + what + "` is negative. OpenFOAM treats that "
+            "as a fatal error (porosityModel::adjustNegativeResistance) rather than a resistance.");
+    if (r.x < 0.0) r.x *= -maxCmpt;
+    if (r.y < 0.0) r.y *= -maxCmpt;
+    if (r.z < 0.0) r.z *= -maxCmpt;
 }
 
 // csys().transform(T) for a Cartesian system given by e1/e2: R & T & R^T with R's rows the local axes.
@@ -130,6 +151,54 @@ OptionList read(const std::string& caseDir, const PrimitiveMesh& m)
             list.options.push_back(o);
             continue;
         }
+        // The CONSTRAINTS. Both resolve a cell list the same way a source does and then apply
+        // eqn.setValues on it; the value is what differs.
+        if (o.type == "fixedTemperatureConstraint" || o.type == "scalarFixedValueConstraint")
+        {
+            const FoamDict* cc = d.subDict(o.type + "Coeffs");
+            const FoamDict& cs = cc ? *cc : d;
+            const CellSelection csel = resolveCellSelection(
+                polyMeshDir, cs.wordOr("selectionMode", "all"),
+                cs.wordOr("cellZone", cs.wordOr("cellSet", "")), zones);
+            if (!csel.ok)
+            {
+                o.unsupported = o.type + ": " + csel.reason;
+                list.options.push_back(o);
+                continue;
+            }
+            o.cells    = csel.cells;
+            o.allCells = csel.all;
+
+            if (o.type == "fixedTemperatureConstraint")
+            {
+                // `lookup` mode takes T from a named field per iteration; only `uniform` is implemented,
+                // and the other is refused rather than run as a constant.
+                const std::string mode = cs.wordOr("mode", "uniform");
+                if (mode != "uniform")
+                {
+                    o.unsupported = "fixedTemperatureConstraint mode '" + mode + "'";
+                    list.options.push_back(o);
+                    continue;
+                }
+                o.constraint = Option::Constraint::fixedTemperature;
+                o.Tuniform   = cs.scalarOr("temperature", 0.0);
+            }
+            else
+            {
+                const FoamDict* fv = cs.subDict("fieldValues");
+                if (!fv)
+                {
+                    o.unsupported = "scalarFixedValueConstraint without fieldValues";
+                    list.options.push_back(o);
+                    continue;
+                }
+                o.constraint = Option::Constraint::scalarFixedValue;
+                for (const auto& leaf : fv->leaves)
+                    o.fieldValues.emplace_back(leaf.first, fv->scalarOr(leaf.first, 0.0));
+            }
+            list.options.push_back(o);
+            continue;
+        }
         if (o.type != "explicitPorositySource")
         {
             o.unsupported = o.type.empty() ? std::string("(no type)") : o.type;
@@ -142,6 +211,44 @@ OptionList read(const std::string& caseDir, const PrimitiveMesh& m)
         const FoamDict& src = c ? *c : d;
 
         const std::string pType = src.wordOr("type", "");
+        if (pType == "fixedCoeff")
+        {
+            const CellSelection fsel = resolveCellSelection(
+                polyMeshDir, src.wordOr("selectionMode", "all"),
+                src.wordOr("cellZone", src.wordOr("cellSet", "")), zones);
+            if (!fsel.ok)
+            {
+                o.unsupported = "explicitPorositySource: " + fsel.reason;
+                list.options.push_back(o);
+                continue;
+            }
+            o.cells    = fsel.cells;
+            o.allCells = fsel.all;
+
+            const FoamDict* fcc = src.subDict("fixedCoeffCoeffs");
+            const FoamDict& fc  = fcc ? *fcc : src;
+            vector av{0,0,0}, bv{0,0,0};
+            readDimensionedVector(fc, "alpha", av);
+            readDimensionedVector(fc, "beta",  bv);
+            adjustNegativeResistance(av, "alpha");
+            adjustNegativeResistance(bv, "beta");
+
+            vector fe1{1,0,0}, fe2{0,1,0};
+            if (const FoamDict* cs = fc.subDict("coordinateSystem"))
+            {
+                const FoamDict* rot = cs->subDict("rotation");
+                const FoamDict& r = rot ? *rot : *cs;
+                vector t;
+                if (readDimensionedVector(r, "e1", t)) fe1 = t;
+                if (readDimensionedVector(r, "e2", t)) fe2 = t;
+            }
+            o.fixedCoeff = true;
+            o.alpha  = transformDiag(av, fe1, fe2);
+            o.beta   = transformDiag(bv, fe1, fe2);
+            o.rhoRef = fc.scalarOr("rhoRef", 1.0);
+            list.options.push_back(o);
+            continue;
+        }
         if (pType != "DarcyForchheimer")
         {
             o.unsupported = "explicitPorositySource/" + (pType.empty() ? std::string("(no type)") : pType);
@@ -166,6 +273,9 @@ OptionList read(const std::string& caseDir, const PrimitiveMesh& m)
         vector dv{0,0,0}, fv{0,0,0};
         readDimensionedVector(df, "d", dv);
         readDimensionedVector(df, "f", fv);
+        // DarcyForchheimer.C:67-68 calls it on d and f too, so the same shorthand applies there.
+        adjustNegativeResistance(dv, "d");
+        adjustNegativeResistance(fv, "f");
 
         vector e1{1,0,0}, e2{0,1,0};
         if (const FoamDict* cs = df.subDict("coordinateSystem"))
@@ -192,12 +302,18 @@ void addSup(
     FvVectorMatrix&               UEqn,
     const GeometricField<vector>& U,
     scalar                        nu,
-    const FvGeometry&             g)
+    const FvGeometry&             g,
+    bool                          forceDimensions)
 {
     const std::vector<scalar>& V = g.V();
     for (const Option& o : opts.options)
     {
         if (!o.active || !o.unsupported.empty()) continue;
+        if (o.constraint != Option::Constraint::none) continue;   // constraints are not sources
+
+        // fixedCoeff's rho is the dict's rhoRef on a force-dimensioned equation and 1 otherwise -- it is
+        // NOT the local density, which is easy to assume and wrong (fixedCoeff.C:202-207).
+        const scalar fcRho = forceDimensions ? o.rhoRef : scalar(1.0);
 
         const std::size_t n = o.allCells ? U.internal.size() : o.cells.size();
         for (std::size_t i = 0; i < n; ++i)
@@ -206,11 +322,22 @@ void addSup(
             const vector& u = U.internal[c];
             const scalar magU = std::sqrt(u.x*u.x + u.y*u.y + u.z*u.z);
 
-            // Cd = mu*D + (rho*magU)*F, with mu = nu and rho = 1 for a kinematic equation.
-            const scalar cd[9] = {
-                nu*o.D.xx + magU*o.F.xx, nu*o.D.xy + magU*o.F.xy, nu*o.D.xz + magU*o.F.xz,
-                nu*o.D.yx + magU*o.F.yx, nu*o.D.yy + magU*o.F.yy, nu*o.D.yz + magU*o.F.yz,
-                nu*o.D.zx + magU*o.F.zx, nu*o.D.zy + magU*o.F.zy, nu*o.D.zz + magU*o.F.zz };
+            // Cd, by model. fixedCoeff: rho*(alpha + beta*|U|). DarcyForchheimer: mu*D + (rho*magU)*F,
+            // with mu = nu and rho = 1 for a kinematic equation. Everything below -- the isotropic split,
+            // the diagonal, the sign of the source -- is fixedCoeff.C:apply and is shared by both.
+            scalar cd[9];
+            if (o.fixedCoeff)
+            {
+                const scalar* al = &o.alpha.xx;
+                const scalar* be = &o.beta.xx;
+                for (int k = 0; k < 9; ++k) cd[k] = fcRho * (al[k] + magU * be[k]);
+            }
+            else
+            {
+                const scalar* dd = &o.D.xx;
+                const scalar* ff = &o.F.xx;
+                for (int k = 0; k < 9; ++k) cd[k] = nu * dd[k] + magU * ff[k];
+            }
             const scalar isoCd = cd[0] + cd[4] + cd[8];
 
             UEqn.diag[c] += V[c]*isoCd;
@@ -223,6 +350,53 @@ void addSup(
             UEqn.source[c].y -= V[c]*(a[3]*u.x + a[4]*u.y + a[5]*u.z);
             UEqn.source[c].z -= V[c]*(a[6]*u.x + a[7]*u.y + a[8]*u.z);
         }
+    }
+}
+
+void constrain(
+    const OptionList&           opts,
+    FvScalarMatrix&             eqn,
+    std::vector<scalar>&        psi,
+    const std::string&          field,
+    const PrimitiveMesh&        m,
+    const std::vector<FvPatch>& patches,
+    scalar                    (*heOfT)(scalar))
+{
+    for (const Option& o : opts.options)
+    {
+        if (!o.active || !o.unsupported.empty()) continue;
+        if (o.constraint == Option::Constraint::none) continue;
+
+        std::vector<label>  cells;
+        std::vector<scalar> vals;
+
+        if (o.constraint == Option::Constraint::fixedTemperature)
+        {
+            // The energy equation only. OpenFOAM sets he(p, Tuniform), NOT the temperature: putting a
+            // temperature where an energy belongs is a 400x error that still converges.
+            if (field != "e" && field != "h") continue;
+            if (!heOfT)
+                throw std::runtime_error(
+                    "fvOptions: a fixedTemperatureConstraint is active but no he(T) conversion was "
+                    "supplied. OpenFOAM constrains the energy equation to he(p, Tuniform); refusing "
+                    "rather than constraining it to a temperature.");
+            cells = o.allCells ? std::vector<label>() : o.cells;
+            if (o.allCells) { cells.resize(m.nCells()); for (label c = 0; c < m.nCells(); ++c) cells[c] = c; }
+            vals.assign(cells.size(), heOfT(o.Tuniform));
+        }
+        else
+        {
+            scalar v = 0.0;
+            bool   found = false;
+            for (const auto& fv : o.fieldValues)
+                if (fv.first == field) { v = fv.second; found = true; }
+            if (!found) continue;
+            cells = o.allCells ? std::vector<label>() : o.cells;
+            if (o.allCells) { cells.resize(m.nCells()); for (label c = 0; c < m.nCells(); ++c) cells[c] = c; }
+            vals.assign(cells.size(), v);
+        }
+
+        if (!cells.empty()) setValues(eqn, psi, m, patches, cells, vals);
     }
 }
 

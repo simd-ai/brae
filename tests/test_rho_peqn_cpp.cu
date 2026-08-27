@@ -33,8 +33,10 @@
 #include "rhoCreateFields_cpp.cuh"
 #include "rhoUEqn_cpp.cuh"
 #include "rhoPEqn_cpp.cuh"
+#include "scheme_parse.cuh"
 
 #include <cmath>
+#include <numeric>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -203,9 +205,24 @@ int main(int argc, char** argv)
     uin.rho = &rhoP;            uin.rhoBnd = &rhoBnd;
     uin.muEff = &muEff;         uin.muEffBnd = &muEffBnd;
     uin.relaxU = re ? re->scalarOr("U", 1.0) : 1.0;
-    uin.bounded = true;
-    uin.scheme = cpu::rhoSimple::DivScheme::upwind;
-    uin.correctedLaplacian = true;
+    // PARSED from the case. This gate rebuilds the momentum matrix to get rAU and H(), and HbyA is
+    // rAU*H() -- so a momentum matrix assembled under the wrong scheme propagates straight into the
+    // pressure equation. Stating sbMatched's schemes here read HbyA 9.1e-04 on aerofoilNACA0012, whose
+    // div(phi,U) is `bounded Gauss linearUpwind limited` and whose grad(U) is `cellLimited Gauss linear 1`.
+    {
+        const FieldDivScheme dU = parseFieldDivScheme(caseDir, "U");
+        uin.bounded = dU.bounded;
+        uin.scheme  = dU.linearUpwind ? cpu::rhoSimple::DivScheme::linearUpwind
+                    : (dU.limited     ? cpu::rhoSimple::DivScheme::limitedLinear
+                                      : cpu::rhoSimple::DivScheme::upwind);
+        uin.schemeCoeff = dU.twoByk;
+        DeviceSimpleControls sctl;
+        parseFvSchemesControls(caseDir, sctl);
+        uin.correctedLaplacian = sctl.nonOrth;
+        uin.gradULimitK        = sctl.gradULimitK;
+        std::printf("  schemes: div(phi,U) lu=%d bounded=%d | grad(U) cellLimited k=%g\n",
+                    (int)dU.linearUpwind, (int)dU.bounded, (double)uin.gradULimitK);
+    }
     const FvVectorMatrix UEqn = cpu::rhoSimple::assembleUEqn(f.U, uin, m, g, patches);
 
     // TWO DIFFERENT U's, and pEqn.H uses the second. The momentum matrix is assembled from the velocity
@@ -349,6 +366,42 @@ int main(int argc, char** argv)
         rawInternal(readField<scalar>(caseDir + "/" + dumpT + "/stage_pSrc" + sfx), nC);
     report("pEqn.D() vs OpenFOAM", relL2(matrixD(P, patches), ofD), 1e-10);
     report("pEqn source + boundaryCoeffs vs OpenFOAM", relL2(matrixRhs(P, patches), ofS), 1e-10);
+    {
+        // WITH MAGNITUDES, and split by where it lives. The pressure source is div(phiHbyA), which is the
+        // CONTINUITY ERROR -- near zero at convergence, so a relative norm over it can report a large
+        // number for a negligible absolute difference. Two readings this session were exactly that.
+        const std::vector<scalar> mine = matrixRhs(P, patches);
+        auto mg = [](const std::vector<scalar>& v)
+        { return std::sqrt(std::inner_product(v.begin(), v.end(), v.begin(), 0.0)); };
+        std::vector<char> onB(nC, 0);
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            if (patches[pi].type != "empty")
+                for (label i = 0; i < patches[pi].size; ++i) onB[patches[pi].faceCells[i]] = 1;
+        std::vector<scalar> ai, bi, ab, bb;
+        for (label c = 0; c < nC; ++c)
+        {
+            if (onB[c]) { ab.push_back(mine[c]); bb.push_back(ofS[c]); }
+            else        { ai.push_back(mine[c]); bi.push_back(ofS[c]); }
+        }
+        std::printf("       |brae| %.4e |OF| %.4e   interior %.6e (|%.3e|)   "
+                    "touching a patch %.6e (|%.3e|)\n",
+                    mg(mine), mg(ofS), relL2(ai, bi), mg(bi), relL2(ab, bb), mg(bb));
+        // Per patch: the pressure source at a boundary cell is div(phiHbyA) plus the laplacian's
+        // boundaryCoeffs, and those come from p's own BC -- freestreamPressure here. Naming the patch
+        // says which boundary condition to read.
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (patches[pi].type == "empty" || !patches[pi].size) continue;
+            std::vector<scalar> pa, pb;
+            for (label i = 0; i < patches[pi].size; ++i)
+            {
+                const label c = patches[pi].faceCells[i];
+                pa.push_back(mine[c]); pb.push_back(ofS[c]);
+            }
+            std::printf("         pEqn src on %-14s %.6e   (|OF| %.3e)\n",
+                        patches[pi].name.c_str(), relL2(pa, pb), mg(pb));
+        }
+    }
 
     // ---- 3. THE CONTROL: the OTHER branch must not reproduce this one. ----
     std::printf("  3. control -- the other branch must NOT match\n");

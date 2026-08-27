@@ -118,6 +118,28 @@ the right one by at least 1e3x, with an absolute floor. That is strictly stronge
 rho, where the two fluxes coincide and nothing could discriminate, now fails the control instead of
 passing it vacuously.
 
+## squareBend: the first shipped tutorial GATED through the new path
+
+`rho_squarebend_vs_openfoam` runs OpenFOAM's own tutorial UNMODIFIED -- copied from `$FOAM_TUTORIALS`,
+meshed with blockMesh, its own `flowRateInletVelocity` inlet, its own schemes, its own sutherland thermo.
+It needed no porting work at all: everything the case asks for was already in place by the time it was
+tried, which is what the preceding fixes were for.
+
+At OpenFOAM's OWN convergence -- its residualControl stops it at 156 iterations and brae runs the same 156
+from the same start -- U 3.46e-04, p 2.90e-04, T 1.38e-04, rho 3.43e-04.
+
+COMPARED AT CONVERGENCE, NOT AT THE SHIPPED endTime, and the gate refuses rather than reports if
+residualControl never fires: comparing two unconverged runs compares trajectories. This case reads 2.8e-02
+at its shipped endTime and 1.8e-03 converged, which is a fact about where the run stopped.
+
+**A bound corrected here.** The end-to-end gate asserted that a `flowRateInletVelocity` inlet delivers its
+prescribed mass flow to a fixed 1e-6. That was sbMatched's convergence (8.8e-09 in U, flux to 1.4e-08)
+asserted on every other case: squareBend stops at the tutorial's own residualControl (U 1e-04) and delivers
+the flux to 5.5e-05, which is correct and failed the bound. The assertion is now `10x the U residual the
+loop actually reached`, with an absolute floor -- the flux can only be as exact as the solution. The
+machine-precision form of the same invariant is in `rho_ueqn_vs_openfoam`, on a single assembly, at
+2.2e-15.
+
 ## aerofoilNACA0012: the first shipped tutorial through the new path
 
 It RUNS and CONVERGES, and at t=668 -- where OpenFOAM's own residualControl stops it and brae's U residual
