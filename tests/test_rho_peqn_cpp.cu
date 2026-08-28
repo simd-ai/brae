@@ -259,6 +259,20 @@ int main(int argc, char** argv)
         std::printf("  schemes: div(phi,U) lu=%d bounded=%d | grad(U) cellLimited k=%g\n",
                     (int)dU.linearUpwind, (int)dU.bounded, (double)uin.gradULimitK);
     }
+    // updateCoeffs() ON U BEFORE THE MATRIX IS BUILT. fvMatrix's constructor calls
+    // psi.boundaryFieldRef().updateCoeffs(), and that is where flowRateInletVelocity recomputes its
+    // velocity from rho's PATCH values (avgU = -flowRate/gSum(rho*magSf)) and where inletOutlet reads
+    // sign(phi). This gate rebuilt the momentum matrix without either, so its inlet carried a velocity
+    // derived from whatever rho createFields left there -- and HbyA, which is rAU*UEqn.H(), came out
+    // 8.52e-05 on the inlet-adjacent cells while its deep interior was 1.20e-10. The momentum gate does
+    // all three; this one did only the freestream half.
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        f.U.boundary[pi]->updateFromDensity(rhoBnd[pi]);
+        f.U.boundary[pi]->updateFromFlux(f.phi.boundary[pi]);
+    }
+    f.U.evaluateBoundary();
+
     if (!popts.empty())
     {
         uin.fvOpts = &popts;

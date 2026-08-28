@@ -32,6 +32,7 @@
 #include "rhoCreateFields_cpp.cuh"
 #include "rhoSimpleFoam_cpp.cuh"   // effectiveTransport: the solver's OWN muEff/alphaEff
 #include "rhoEEqn_cpp.cuh"
+#include "thermo_model.cuh"   // thermoCpByCpv: alphaEff = CpByCpv*(alpha + alphat)
 
 #include <cmath>
 #include <fstream>
@@ -253,10 +254,19 @@ int main(int argc, char** argv)
             if (std::ifstream(lamPath.c_str()).good())
             {
                 const std::vector<scalar> ofLam = rawInternal(readField<scalar>(lamPath), nC);
+                // The extraction has to INVERT the formula effectiveTransport actually uses, which is
+                //     alphaEff = CpByCpv*(alpha + alphat)
+                // so the laminar half is CpByCpv*alpha and what comes off is CpByCpv*alphat, not alphat.
+                // Subtracting alphat alone leaves (CpByCpv - 1)*alphat behind -- 40% of it for air on
+                // the sensibleInternalEnergy branch. That was invisible while brae's alphat was ZERO at
+                // this point, which it was only because createFields did not run turbulence->validate();
+                // once validate() set alphat = rho*nut/Prt the way OpenFOAM does, this check failed at
+                // 8.10e-01 on a fixture it had always passed. The bound is unchanged.
+                const scalar cpByCpv = thermoCpByCpv(f.thermo);
                 std::vector<scalar> mineLam(nC);
                 for (label c = 0; c < nC; ++c)
-                    mineLam[c] = mineAlpha[c] - 1.0 * (f.alphat.internal.empty()
-                                                       ? 0.0 : f.alphat.internal[c]);
+                    mineLam[c] = mineAlpha[c] - cpByCpv * (f.alphat.internal.empty()
+                                                           ? 0.0 : f.alphat.internal[c]);
                 report("brae's own laminar alphaEff == OpenFOAM's", relL2(mineLam, ofLam), 1e-12);
                 std::printf("     %-34s brae %.6e   OpenFOAM %.6e\n", "  (the value itself)",
                             mineLam[0], ofLam[0]);

@@ -1,5 +1,6 @@
 // _cpp REFERENCE implementation -- see createFields_cpp.cuh for the OpenFOAM provenance.
 #include "rhoCreateFields_cpp.cuh"
+#include "kEpsilon_cpp.cuh"   // correctNut: turbulence->validate() before the first solve
 #include "patch_entry_lookup.cuh"   // findPatchEntry: OF patch/group/regex resolution
 #include "foam_field_reader.cuh"
 #include "thermo_parse.cuh"
@@ -496,6 +497,32 @@ RhoSimpleFields createFields(
         {
             throw std::runtime_error(
                 "brae: rhoSimpleFoam simulationType '" + sim + "' is neither laminar nor RAS. Refusing.");
+        }
+    }
+
+    // turbulence->validate(), rhoSimpleFoam.C:64 -- BEFORE the SIMPLE loop, and it is not a no-op.
+    // eddyViscosity::validate() calls correctNut(), so OpenFOAM enters its FIRST momentum solve with
+    // nut = Cmu*k^2/epsilon rather than whatever the case's 0/nut file happens to say. angledDuct's
+    // 0/nut is `uniform 0` while Cmu*k^2/eps is 0.09*1/200 = 4.5e-04, and since rho*nut = 5.4e-04
+    // against mu = 1.8e-05 that is THIRTY TIMES the laminar viscosity -- so reading the file left
+    // brae solving the first iteration as if the flow were laminar.
+    //
+    // It showed up as OpenFOAM's own laminar and turbulent U at iteration 1 differing by 1.5847e-01
+    // while brae's turbulent U was 1.5868e-01 from OpenFOAM's: the same number, because brae's
+    // turbulent first iteration WAS the laminar answer. The transient that starts there had not decayed
+    // by 8000 iterations.
+    if (f.turbulent && f.rasModel == "kEpsilon"
+        && static_cast<label>(f.k.internal.size()) == nC
+        && static_cast<label>(f.epsilon.internal.size()) == nC)
+    {
+        const KEpsilonCoeffs keco;
+        f.nut.internal = cpu::kEpsilonRef::correctNut(f.k.internal, f.epsilon.internal, keco);
+        // EddyDiffusivity::correctNut runs straight after for the compressible instantiation:
+        // alphat = rho*nut/Prt. The energy equation reads it through alphaEff on the very first pass.
+        if (static_cast<label>(f.alphat.internal.size()) == nC)
+        {
+            const scalar Prt = 1.0;
+            for (label c = 0; c < nC; ++c) f.alphat.internal[c] = f.rho.internal[c] * f.nut.internal[c] / Prt;
         }
     }
 

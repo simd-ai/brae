@@ -456,6 +456,57 @@ closure error, and fixing the flow exposed it -- is a hypothesis and nothing her
 The decomposition is at least clean now: **the momentum, pressure and energy path is essentially exact**
 (laminar 3.09e-05 with every check passing) and what remains on angledDuct is the compressible closure.
 
+### `turbulence->validate()`: the closure was inert on the first momentum solve
+
+The turbulence fields regressed 4-8x once the flow path was fixed, and the iteration-wise trace named why.
+At iteration 1 the turbulent case read U 1.586845e-01 against OpenFOAM -- 34x the laminar case's
+4.72e-03 at the same point. The measurement that settled it was not brae-against-OpenFOAM at all:
+
+    OpenFOAM's OWN laminar U(1) vs OpenFOAM's OWN turbulent U(1)   1.584710e-01
+    brae's turbulent U(1)        vs OpenFOAM's turbulent U(1)      1.586845e-01
+
+The same number. **brae's turbulent first iteration WAS the laminar answer** -- its closure contributed
+nothing where OpenFOAM's contributed everything.
+
+`rhoSimpleFoam.C:64` calls `turbulence->validate()`, and `eddyViscosity::validate()` is `correctNut()`.
+So OpenFOAM enters its FIRST momentum solve with `nut = Cmu*k^2/epsilon`, not with whatever `0/nut`
+says. angledDuct ships `nut uniform 0` while Cmu*k^2/eps = 0.09*1/200 = **4.5e-04**, and since
+rho*nut = 5.4e-04 against mu = 1.8e-05 that is **thirty times the laminar viscosity**. brae read the file.
+
+Two readings were wrong before the right one, both refused by the source: the `kEpsilon` CONSTRUCTOR does
+not call `correctNut` (only `bound` and `printCoeffs`, kEpsilon.C:182-188), and brae's `evaluateBoundary`
+does not fire the nut wall function (`nutkWallFunction` maps to a calculated field holding the file's 0).
+It is `validate()`, called by the SOLVER, not by the model.
+
+**Iteration 1 after the fix**: p 1.285097e-03 -> **9.333891e-06** (138x), nut 3.14e-01 -> 7.75e-02,
+k 1.52e-01 -> 2.77e-02, U 1.59e-01 -> 8.13e-02.
+
+**And the converged answer does not move**: k 2.809992e-03 before and after, to seven digits. Like the rho
+timing defect, this is a start-state error the fixed point washes out. It is worth having -- it is what
+OpenFOAM does, it matters for any comparison at a fixed iteration count, and it matters for a case that
+does not fully converge -- but it is NOT the cause of the converged regression.
+
+`correctNut()` has three parts and this implements two: `nut = Cmu*k^2/eps` and EddyDiffusivity's
+`alphat = rho*nut/Prt`. The third, `nut_.correctBoundaryConditions()`, fires `nutkWallFunction` on the
+walls and needs a wall distance createFields does not carry. That is very likely the remaining 8.13e-02.
+
+### A gate that had been passing for the wrong reason, for as long as it existed
+
+Fixing `validate()` turned `rho_eeqn_vs_openfoam` RED at `brae's own laminar alphaEff` 8.096090e-01 -- on
+sbMatched, which it had always passed. The gate extracted the laminar half as `alphaEff - 1.0*alphat`,
+but the formula is
+
+    alphaEff = CpByCpv*(alpha + alphat)
+
+so what comes off is `CpByCpv*alphat`. Subtracting `alphat` alone leaves `(CpByCpv - 1)*alphat` behind --
+40% of it for air under sensibleInternalEnergy. The extraction was ALWAYS wrong and was invisible only
+because brae's `alphat` was zero at that point, which it was only because `validate()` was missing. The
+bug hid the check that should have caught it. Fixed by inverting the real formula; the 1e-12 bound is
+untouched.
+
+That is the second gate this session found passing for the wrong reason -- the first being the closure
+gate comparing an unconstrained system because it never read the case's fvOptions.
+
 ### What is left
 
 A disagreement in Ux and Uy that is **essentially zero at the inlet face (6.01e-06) and grows downstream**
