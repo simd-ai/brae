@@ -15,6 +15,12 @@
         // density OpenFOAM held it against. It is the RELAXED solver rho from the previous iteration,
         // which is not thermo.rho() and not the face-cell values.
         volScalarField("stage_rhoU", rho).write();
+        // U AFTER the matrix is built, i.e. after fvMatrix's constructor has called updateCoeffs on its
+        // boundaries. stage_Uass above is taken BEFORE that, so a boundary OpenFOAM recomputes per
+        // iteration -- flowRateInletVelocity, the freestream family -- still carries the PREVIOUS
+        // iteration's value there. A brae-side comparison that recomputes it is then one iteration ahead,
+        // which reads as a small disagreement that is really a lag.
+
         // phi EXACTLY as the momentum equation is convected by. From iteration 2 on this is the
         // CONSERVATIVE flux the previous pressure solve left, which is not what compressibleCreatePhi.H
         // would recompute from rho and U -- so a brae-side phi rebuilt at this point is a different field.
@@ -30,6 +36,16 @@
         fvOptions(rho, U)
     );
     fvVectorMatrix& UEqn = tUEqn.ref();
+
+    // U AFTER the matrix is built -- i.e. after fvMatrix's constructor called updateCoeffs on its
+    // boundaries. stage_Uass is taken BEFORE that, so a boundary OpenFOAM recomputes every iteration
+    // (flowRateInletVelocity, the freestream family) still carries the PREVIOUS iteration's value there.
+    // A brae-side comparison that recomputes it is then one iteration ahead of stage_Uass, which reads
+    // as a disagreement that is really a lag. This is the value to compare such a boundary against.
+    if (runTime.timeIndex() == braeDumpIter())
+    {
+        volVectorField("stage_Upost", U).write();
+    }
 
     // The source BEFORE relax(), so the assembly can be separated from the relaxation. relax() replaces
     // the diagonal with max(|D|, sumMagOffDiag)/alpha and adds (D - D0)*psi to the source, so a pre-relax

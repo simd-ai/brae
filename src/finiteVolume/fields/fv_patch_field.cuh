@@ -1264,7 +1264,23 @@ inline InletOrValue<T> inletOrValue(const PatchFieldData<T>& d)
 template <typename T>
 std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFieldData<T>& d)
 {
-    if (d.type == "fixedGradient")
+    // THE ENERGY BOUNDARY FAMILY -- fixedEnergy, gradientEnergy, mixedEnergy -- handled by the three
+    // branches they derive from. This is NOT a substitution. OpenFOAM's energy patch fields ARE their
+    // base classes as far as the matrix is concerned:
+    //     fixedEnergyFvPatchScalarField    : public fixedValueFvPatchScalarField
+    //     gradientEnergyFvPatchScalarField : public fixedGradientFvPatchScalarField
+    //     mixedEnergyFvPatchScalarField    : public mixedFvPatchScalarField
+    // What each adds is an updateCoeffs() that recomputes its value, gradient or refValue from T through
+    // the thermo -- so the COEFFICIENTS are the base class's, unchanged, and the numbers those coeffs are
+    // built from are written to the file. OpenFOAM writes exactly the entries each base needs: `value`
+    // for fixedEnergy, `gradient` for gradientEnergy, and refValue/refGradient/valueFraction for
+    // mixedEnergy. Reading them is reading what OpenFOAM used.
+    //
+    // The solver does not reach this path: it derives he's boundary conditions from T's, which is the
+    // same relation from the other side. This exists so a gate can read the `he` OpenFOAM WROTE --
+    // test_rho_eeqn_cpp refused angledDuct with `unsupported BC type 'fixedEnergy'` and could not run on
+    // any case whose inlet fixes a temperature, which is most of them.
+    if (d.type == "fixedGradient" || d.type == "gradientEnergy")
     {
         if (!d.hasGradient)
             throw std::runtime_error("brae: patch " + p.name + " is fixedGradient but has no 'gradient' entry.");
@@ -1319,7 +1335,8 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     // recomputes refValue every step, exactly as it does for codedFixedValue and fanPressure.
     if (d.type == "fixedMean")
         return std::make_unique<FixedValuePatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
-    if (d.type == "fixedValue" || d.type == "uniformFixedValue" || d.type == "codedFixedValue")
+    if (d.type == "fixedValue" || d.type == "uniformFixedValue" || d.type == "codedFixedValue"
+     || d.type == "fixedEnergy")   // fixedEnergy: fixedValue on he -- see the energy-family note above
         // uniformFixedValue: steady constant = fixedValue. codedFixedValue: seed with `value`; the NVRTC device kernel
         // (device_coded_bc) OVERWRITES this patch's refValue each step from the compiled `code` snippet (the driver
         // parses the code + wires the solver's coded-BC apply). Building it as fixedValue makes buildField/buildDeviceBoundary succeed.
@@ -1438,7 +1455,7 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     // freestream*/inletOutlet the valueFraction is FIXED, not recomputed from the flux, so the device does
     // not need a per-step update -- the seeded vf is the answer. This is the shape basicThermo maps a
     // `mixed` T patch onto (-> mixedEnergy), which is how an external-convection wall is written.
-    if (d.type == "mixed")
+    if (d.type == "mixed" || d.type == "mixedEnergy")
     {
         if (!d.hasValueFraction)
             throw std::runtime_error(

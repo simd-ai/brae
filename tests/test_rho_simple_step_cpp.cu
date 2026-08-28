@@ -28,6 +28,7 @@
 #include "scheme_parse.cuh"
 #include "fvOptions_cpp.cuh"   // parseFieldDivScheme / parseFvSchemesControls: the CASE's schemes
 
+#include "mrf_read.cuh"   // readCellZones: the porosity zone this case constrains
 #include <cmath>
 #include <fstream>
 #include <cstdio>
@@ -323,8 +324,50 @@ int main(int argc, char** argv)
                            + (double)uFd.internalField[c].z*(double)uFd.internalField[c].z;
             if (isB[c]) { db += q; nb2 += r; } else { di += q; ni += r; }
         }
+        // PER COMPONENT. A uniform whole-field number cannot tell "every component is a little off" from
+        // "one component is badly off and the others are exact" -- and on a duct the cross-stream
+        // component is both the smallest and the last to converge (OpenFOAM's own Uz residual floors at
+        // 8.7e-07 here while Ux reaches 1.1e-08), so it can carry the whole disagreement while
+        // contributing almost nothing to |U|.
+        {
+            const char* cn[3] = {"Ux", "Uy", "Uz"};
+            for (int k2 = 0; k2 < 3; ++k2)
+            {
+                double dc = 0.0, nc = 0.0;
+                for (label c = 0; c < nC; ++c)
+                {
+                    const double a2 = (double)reinterpret_cast<const scalar*>(&f.U.internal[c])[k2];
+                    const double b2 = (double)reinterpret_cast<const scalar*>(&uFd.internalField[c])[k2];
+                    dc += (a2 - b2)*(a2 - b2); nc += b2*b2;
+                }
+                std::printf("       %s rel %.4e   (|%s| rms %.4e)\n", cn[k2],
+                            nc > 0 ? std::sqrt(dc/nc) : 0.0, cn[k2], std::sqrt(nc/nC));
+            }
+        }
         std::printf("       U rel: boundary cells %.4e   interior %.4e\n",
                     nb2 > 0 ? std::sqrt(db/nb2) : 0.0, ni > 0 ? std::sqrt(di/ni) : 0.0);
+        // AND BY CELLZONE, because the per-patch figures below cannot separate two different causes on
+        // this case: porosityWall's face cells are INSIDE the porous block, so "the slip patch disagrees"
+        // and "the porosity disagrees" produce the same number there. The zone split does separate them.
+        for (const auto& z : readCellZones(caseDir + "/constant/polyMesh"))
+        {
+            double din = 0.0, nin = 0.0, dout = 0.0, nout = 0.0;
+            std::vector<char> inz(nC, 0);
+            for (label c : z.second) if (c >= 0 && c < nC) inz[c] = 1;
+            for (label c = 0; c < nC; ++c)
+            {
+                const double dx = (double)f.U.internal[c].x - (double)uFd.internalField[c].x;
+                const double dy = (double)f.U.internal[c].y - (double)uFd.internalField[c].y;
+                const double dz = (double)f.U.internal[c].z - (double)uFd.internalField[c].z;
+                const double q = dx*dx + dy*dy + dz*dz;
+                const double r = (double)uFd.internalField[c].x*(double)uFd.internalField[c].x
+                               + (double)uFd.internalField[c].y*(double)uFd.internalField[c].y
+                               + (double)uFd.internalField[c].z*(double)uFd.internalField[c].z;
+                if (inz[c]) { din += q; nin += r; } else { dout += q; nout += r; }
+            }
+            std::printf("       U in zone '%s' %.4e   outside %.4e\n", z.first.c_str(),
+                        nin > 0 ? std::sqrt(din/nin) : 0.0, nout > 0 ? std::sqrt(dout/nout) : 0.0);
+        }
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
             if (!patches[pi].size) continue;
@@ -351,6 +394,74 @@ int main(int argc, char** argv)
         const std::vector<scalar> ofRho = readInternal(caseDir + "/" + endT + "/rho", nC);
         std::printf("     %-34s %.6e   (reported, see the control)\n", "rho",
                     relL2(f.rho.internal, ofRho));
+        // rho's RANGE beside OpenFOAM's. rho.relax() with this case's 0.01 moves rho only 1% of the way
+        // to thermo.rho() each iteration, so the min is a direct read on whether the relaxation ran at
+        // all: an unrelaxed rho lands on thermo.rho() itself, a relaxed one a hundredth of the way there.
+        {
+            double bmin = 1e300, bmax = -1e300, omin = 1e300, omax = -1e300;
+            for (label c = 0; c < nC; ++c)
+            {
+                bmin = std::min(bmin, (double)f.rho.internal[c]);
+                bmax = std::max(bmax, (double)f.rho.internal[c]);
+                omin = std::min(omin, (double)ofRho[c]);
+                omax = std::max(omax, (double)ofRho[c]);
+            }
+            std::printf("       rho brae [%.8g .. %.8g]   OF [%.8g .. %.8g]   relaxRho %g\n",
+                        bmin, bmax, omin, omax, (double)in.relaxRho);
+            label am = 0;
+            for (label c = 0; c < nC; ++c) if ((double)f.rho.internal[c] >= bmax) { am = c; break; }
+            const std::vector<scalar> ofPf = readInternal(caseDir + "/" + endT + "/p", nC);
+            const std::vector<scalar> ofTf = readInternal(caseDir + "/" + endT + "/T", nC);
+            std::printf("       argmax cell %d: brae rho %.8g p %.8g T %.8g | OF rho %.8g p %.8g T %.8g\n",
+                        (int)am, (double)f.rho.internal[am], (double)f.p.internal[am],
+                        (double)f.T.internal[am], (double)ofRho[am], (double)ofPf[am], (double)ofTf[am]);
+        }
+    }
+    // THE CLOSURE'S OWN FIXED POINT. Nothing above measures it, and it is not a spectator: nut feeds
+    // muEff, which is a coefficient of the momentum equation this gate does bound. The closure gates
+    // (rho_kepsilon, rho_komegasst) assemble ONE system from OpenFOAM's adopted k, epsilon and U and
+    // read machine precision -- which says the assembly is right GIVEN OpenFOAM's state, and says
+    // nothing about where brae's own k and epsilon converge to over 8000 iterations of their own.
+    // angledDuct is where that mattered: momentum coefficients exact to 2.6e-15 at iteration 200, and
+    // U still 9.4e-04 out at convergence with p, T and rho an order of magnitude better.
+    if (f.turbulent)
+    {
+        for (const char* fld : {"k", "epsilon", "omega", "nut", "alphat"})
+        {
+            const std::string path = caseDir + "/" + endT + "/" + fld;
+            if (!std::ifstream(path.c_str()).good()) continue;
+            const GeometricField<scalar>* bf = nullptr;
+            const std::string n(fld);
+            if      (n == "k")       bf = &f.k;
+            else if (n == "epsilon") bf = &f.epsilon;
+            else if (n == "omega")   bf = &f.omega;
+            else if (n == "nut")     bf = &f.nut;
+            else if (n == "alphat")  bf = &f.alphat;
+            if (!bf || static_cast<label>(bf->internal.size()) != nC) continue;
+            const std::vector<scalar> of = readInternal(path, nC);
+            std::printf("     %-34s %.6e   (reported, see the control)\n", fld,
+                        relL2(bf->internal, of));
+            // SPLIT BY CELLZONE. angledDuct's fvOptions pins k = 1, epsilon = 150 and T = 350 across the
+            // 8000 porosity cells, and OpenFOAM's converged fields hold every one of them EXACTLY. So a
+            // whole-field number here averages 8000 cells that must agree to the last bit with 20000 that
+            // are free -- and if brae ever stopped applying the constraint, the in-zone figure is the only
+            // place it would show. Printed separately for exactly that reason.
+            for (const auto& z : readCellZones(caseDir + "/constant/polyMesh"))
+            {
+                double din = 0.0, nin = 0.0, dout = 0.0, nout = 0.0;
+                std::vector<char> inz(nC, 0);
+                for (label c : z.second) if (c >= 0 && c < nC) inz[c] = 1;
+                for (label c = 0; c < nC; ++c)
+                {
+                    const double d = (double)bf->internal[c] - (double)of[c];
+                    if (inz[c]) { din += d*d; nin += (double)of[c]*(double)of[c]; }
+                    else        { dout += d*d; nout += (double)of[c]*(double)of[c]; }
+                }
+                std::printf("       %s in zone '%s' %.4e   outside %.4e\n", fld, z.first.c_str(),
+                            nin  > 0 ? std::sqrt(din/nin)   : 0.0,
+                            nout > 0 ? std::sqrt(dout/nout) : 0.0);
+            }
+        }
     }
 
     // ---- THE CONTROL: the initial field must NOT pass those bounds. ----

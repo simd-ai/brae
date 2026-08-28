@@ -19,6 +19,32 @@
         EEqn += fvc::div(MRF.phi(), p);
     }
 
+    // THE SYSTEM BEFORE relax(), as well as after. fvMatrix::relax adds the boundary internalCoeffs to
+    // the diagonal, clamps it to max(|D|, sumMagOffDiag), divides by alpha, takes the boundary part back
+    // off, and finally does S += (D - D0)*psi. Where that clamp is ACTIVE the relaxed D lands on sumOff
+    // and carries no trace of D0 -- so a wrong unrelaxed diagonal shows up ONLY in the source. On
+    // angledDuct's walls it does exactly that: D agrees to eleven digits while the source is 7.3e-05
+    // out, and D0 was not being written for anything to compare.
+    if (runTime.timeIndex() == braeDumpIter())
+    {
+        volScalarField eD0
+        (
+            IOobject("stage_eD0", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+            mesh, dimensionedScalar(dimless, Zero), zeroGradientFvPatchScalarField::typeName
+        );
+        volScalarField eSrc0(eD0); eSrc0.rename("stage_eSrc0");
+        eD0.primitiveFieldRef() = EEqn.D();
+        scalarField rhs0(EEqn.source());
+        forAll(mesh.boundary(), pj)
+        {
+            const labelUList& fc = mesh.boundary()[pj].faceCells();
+            const scalarField& bcp = EEqn.boundaryCoeffs()[pj];
+            forAll(fc, i) rhs0[fc[i]] += bcp[i];
+        }
+        eSrc0.primitiveFieldRef() = rhs0;
+        eD0.write(); eSrc0.write();
+    }
+
     EEqn.relax();
 
     // Stage harness: the kinetic term and the assembled energy system at iteration 1.

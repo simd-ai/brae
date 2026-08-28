@@ -1702,6 +1702,19 @@ add_test(NAME rho_simple_end_to_end_vs_openfoam
 add_executable(test_rho_komegasst_cpp tests/test_rho_komegasst_cpp.cu)
 target_include_directories(test_rho_komegasst_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_rho_komegasst_cpp PRIVATE brae_core)
+# squareBend: OpenFOAM's OWN tutorial, UNMODIFIED, through the _cpp driver. Every other rhoSimpleFoam
+# gate runs validation/sbMatched, which is derived from this case -- so this is the one that measures
+# whether the port generalises past the fixture it was developed on. Compared at OpenFOAM's own
+# residualControl convergence (156 iterations), not at the shipped endTime.
+add_test(NAME rho_squarebend_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_squarebend_vs_openfoam.sh)
+set_tests_properties(rho_squarebend_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_simple_step_cpp
+                     LABELS slow
+                     TIMEOUT 1800)
+
 add_test(NAME rho_komegasst_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_komegasst_vs_openfoam.sh)
 set_tests_properties(rho_komegasst_vs_openfoam PROPERTIES

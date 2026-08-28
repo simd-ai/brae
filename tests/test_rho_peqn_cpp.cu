@@ -34,6 +34,7 @@
 #include "rhoUEqn_cpp.cuh"
 #include "rhoPEqn_cpp.cuh"
 #include "scheme_parse.cuh"
+#include "fvOptions_cpp.cuh"   // the case's fvOptions: this gate rebuilds UEqn, so it needs them
 
 #include <cmath>
 #include <numeric>
@@ -200,6 +201,41 @@ int main(int argc, char** argv)
     const FoamDict* rf = fvSolution.subDict("relaxationFactors");
     const FoamDict* re = rf ? rf->subDict("equations") : nullptr;
 
+    // THE CASE'S fvOptions, and why a pressure gate needs them at all. This gate rebuilds the momentum
+    // matrix to get rAU and H(), and HbyA is rAU*H() -- so an fvOptions term missing from that matrix
+    // propagates straight into phiHbyA and the pressure source. angledDuct is the case that showed it:
+    // its explicitPorositySource adds V*tr(Cd) to the diagonal across 8000 cells, and without it this
+    // gate read rAU 7.49e-01 where the momentum gate, on the identical case and iteration, read
+    // 1.99e-15. Every number downstream of that was noise, and none of it was brae's.
+    cpu::fvOptions::OptionList popts = cpu::fvOptions::read(caseDir, m);
+    // REFUSE rather than assemble a different equation. Silently dropping an unimplemented option is
+    // exactly the substitution this port exists to catch -- and it would report the gap as a solver
+    // defect, which is worse than not running.
+    if (!popts.firstUnsupported().empty())
+    {
+        std::printf("  REFUSED: fvOptions declares '%s', which is not ported. This gate would otherwise\n"
+                    "           assemble a momentum matrix the case does not have.\n",
+                    popts.firstUnsupported().c_str());
+        return 1;
+    }
+    // pEqn.H applies fvOptions to the PRESSURE equation too -- `fvOptions(psi, p, rho.name())` at
+    // pEqn.H:32 and :63. Nothing in angledDuct targets p, and this gate does not model that term, so it
+    // refuses if a case ever does rather than quietly leaving it out.
+    for (const auto& o : popts.options)
+    {
+        if (!o.active) continue;
+        for (const auto& fv : o.fieldValues)
+        {
+            if (fv.first == "p" || fv.first == "rho")
+            {
+                std::printf("  REFUSED: fvOptions '%s' constrains '%s'; pEqn.H applies fvOptions to the\n"
+                            "           pressure equation and this gate does not model that term.\n",
+                            o.name.c_str(), fv.first.c_str());
+                return 1;
+            }
+        }
+    }
+
     cpu::rhoSimple::RhoMomentumInput uin;
     uin.phi = &f.phi.internal;  uin.phiBnd = &f.phi.boundary;
     uin.rho = &rhoP;            uin.rhoBnd = &rhoBnd;
@@ -222,6 +258,15 @@ int main(int argc, char** argv)
         uin.gradULimitK        = sctl.gradULimitK;
         std::printf("  schemes: div(phi,U) lu=%d bounded=%d | grad(U) cellLimited k=%g\n",
                     (int)dU.linearUpwind, (int)dU.bounded, (double)uin.gradULimitK);
+    }
+    if (!popts.empty())
+    {
+        uin.fvOpts = &popts;
+        std::printf("  fvOptions: %zu option(s) applied to the momentum matrix\n", popts.options.size());
+        for (const auto& o : popts.options)
+            std::printf("     %-24s type=%-26s cells=%zu fixedCoeff=%d tr(alpha)=%g\n",
+                        o.name.c_str(), o.type.c_str(), o.cells.size(), (int)o.fixedCoeff,
+                        (double)(o.alpha.xx + o.alpha.yy + o.alpha.zz));
     }
     const FvVectorMatrix UEqn = cpu::rhoSimple::assembleUEqn(f.U, uin, m, g, patches);
 

@@ -1,6 +1,7 @@
 // _cpp REFERENCE implementation -- see pEqn_cpp.cuh for the OpenFOAM provenance and the refusal contract.
 #include "rhoPEqn_cpp.cuh"
 #include "fvm.cuh"
+#include "fvc.cuh"   // gaussGrad, for the laplacian non-orthogonal correction
 #include "fv_matrix_ops.cuh"
 #include "linearViscousStress_cpp.cuh"   // effectiveFaceViscosity: linear inside, BOUNDARY field on faces
 #include <cmath>
@@ -266,7 +267,24 @@ FvScalarMatrix assemblePEqn(
     const label nC = m.nCells();
 
     // - fvm::laplacian(rhorAUf, p), the term both branches share.
+    //
+    // The SAME two halves as the energy equation's laplacian, and the same half was missing here.
+    // correctedLaplacian selects nonOrthDeltaCoeffs for the implicit coefficients; the explicit
+    // source -= V*div(gamma*magSf*(corrVecs & interpolate(grad(p)))) is a separate term that
+    // gaussLaplacianScheme adds whenever the snGrad scheme is corrected -- independently of
+    // nNonOrthogonalCorrectors, which controls how many times the pressure equation is re-solved and
+    // not whether the correction exists. Added before the sign flip below so it is negated with the
+    // rest of the term.
     FvScalarMatrix M = fvm::laplacian<scalar>(st.rhorAUf, p, m, g, patches, in.correctedLaplacian);
+    if (in.correctedLaplacian)
+    {
+        std::vector<std::vector<scalar>> pb(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi) pb[pi] = p.boundary[pi]->value();
+        const std::vector<vector> gradP = fvc::gaussGrad(p.internal, pb, m, g, patches);
+        const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
+            st.rhorAUf, p, gradP, m, g, patches, in.snGradLimitCoeff);
+        for (label c = 0; c < nC; ++c) M.source[c] -= corr[c];
+    }
     for (label c = 0; c < nC; ++c)
     {
         M.diag[c]   = -M.diag[c];

@@ -84,7 +84,24 @@ porosity1
 }
 EOF
 
-for tag in of v2 noP; do rm -rf "$W/$tag"; cp -r "$W/base" "$W/$tag"; done
+for tag in of v2 noP ofneg v2neg; do rm -rf "$W/$tag"; cp -r "$W/base" "$W/$tag"; done
+
+# THE NEGATIVE-RESISTANCE VARIANT. A negative component in `d` is NOT a literal negative coefficient:
+# porosityModel::adjustNegativeResistance replaces it with val*(-maxCmpt), so it becomes POSITIVE and
+# scaled by the largest component -- here d (2e5 -1e3 -1e3) is really (2e5, 2e8, 2e8). Reading it
+# verbatim gives a resistance that ACCELERATES the flow across the zone, which is a different physics
+# problem, not a small error.
+#
+# NOTHING covered this before. brae had the bug AND a unit test asserting it ("d.y = -1000 survives with
+# its sign"), and this gate could not see it because its own fixture is all-positive, where the
+# adjustment is a no-op. That combination -- a blind gate and a test pinning the defect in place -- is
+# why the case below is run against real OpenFOAM rather than against a hand-computed tensor.
+for tag in ofneg v2neg; do
+    sed -i 's/d   d \[0 -2 0 0 0 0 0\] (2e5 2e5 2e5);/d   d [0 -2 0 0 0 0 0] (2e5 -1e3 -1e3);/' \
+        "$W/$tag/system/fvOptions"
+    grep -q -- "-1e3" "$W/$tag/system/fvOptions" \
+        || { echo "FAIL: could not build the negative-resistance fixture"; exit 1; }
+done
 rm -f "$W/noP/system/fvOptions"          # the control: same mesh, same oracle, no resistance
 
 ( cd "$W/of"  && timeout 1800 simpleFoam > log.of 2>&1 ) || { echo "FAIL: OpenFOAM did not run"; exit 1; }
@@ -93,10 +110,15 @@ rm -f "$W/noP/system/fvOptions"          # the control: same mesh, same oracle, 
 grep -q "explicitPorositySource/DarcyForchheimer on $NZ cells" "$W/v2/log" || {
     echo "FAIL: brae did not report the porosity on $NZ cells"; grep -i fvoption "$W/v2/log"; exit 1; }
 ( cd "$W/noP" && BRAE_SIMPLEFOAM_V2=1 timeout 1800 "$BRAE" > log 2>&1 ) || { echo "FAIL: control run failed"; exit 1; }
+( cd "$W/ofneg" && timeout 1800 simpleFoam > log.of 2>&1 ) \
+    || { echo "FAIL: OpenFOAM did not run the negative-resistance case"; tail -20 "$W/ofneg/log.of"; exit 1; }
+( cd "$W/v2neg" && BRAE_SIMPLEFOAM_V2=1 timeout 1800 "$BRAE" > log 2>&1 ) \
+    || { echo "FAIL: brae did not run the negative-resistance case"; tail -20 "$W/v2neg/log"; exit 1; }
 echo "  ok:   OpenFOAM, brae and the no-porosity control all ran"
 
 latest() { ls -d "$1"/[0-9]* | xargs -n1 basename | sort -n | tail -1; }
-python3 - "$W/v2/$(latest "$W/v2")" "$W/noP/$(latest "$W/noP")" "$W/of/$(latest "$W/of")" <<'PY'
+python3 - "$W/v2/$(latest "$W/v2")" "$W/noP/$(latest "$W/noP")" "$W/of/$(latest "$W/of")" \
+         "$W/v2neg/$(latest "$W/v2neg")" "$W/ofneg/$(latest "$W/ofneg")" <<'PY'
 import re, sys, os, gzip
 def read(f):
     for c in (f, f + '.gz'):
@@ -132,6 +154,33 @@ for f in ['U', 'p', 'k']:
     if f == 'U':
         if a <= 1e-2: print("  ok:   U L2 %.3e <= 1e-02 vs OpenFOAM" % a)
         else:         print("  FAIL: U L2 %.3e > 1e-02 vs OpenFOAM" % a); fails += 1
+# ---- THE NEGATIVE-RESISTANCE VARIANT, against real OpenFOAM ---------------------------------------
+# d (2e5 -1e3 -1e3) is really (2e5, 2e8, 2e8) after porosityModel::adjustNegativeResistance. Taking it
+# verbatim gives a NEGATIVE cross-stream resistance, which accelerates the flow rather than blocking it,
+# so a port that skips the adjustment does not merely differ -- it solves a different problem. This is
+# the only place a negative component is exercised against OpenFOAM; the fixture above is all-positive,
+# where the adjustment is a no-op, and that blindness is how the defect survived with a unit test
+# asserting it.
+if len(sys.argv) > 5:
+    v2n, ofn = sys.argv[4], sys.argv[5]
+    print("  negative-resistance variant  d (2e5 -1e3 -1e3) -> (2e5, 2e8, 2e8)")
+    for f in ['U', 'p']:
+        a = l2(read(v2n + '/' + f), read(ofn + '/' + f))
+        if a is None:
+            print("  %-9s (missing)" % f); fails += 1; continue
+        print("  %-9s %13.4e" % (f, a))
+        if f == 'U':
+            if a <= 1e-2: print("  ok:   U L2 %.3e <= 1e-02 with a negative d component" % a)
+            else:         print("  FAIL: U L2 %.3e > 1e-02 -- adjustNegativeResistance" % a); fails += 1
+    # CONTROL: the negative case must actually differ from the all-positive one, or this variant is
+    # measuring the same problem twice and proves nothing about the adjustment.
+    du = l2(read(v2n + '/U'), read(v2 + '/U'))
+    if du is not None and du > 1e-3:
+        print("  ok:   the negative-d case is a different problem from the positive one (%.3e, control)" % du)
+    else:
+        print("  FAIL: negative-d and positive-d give the same field -- the variant tests nothing")
+        fails += 1
+
 print("PASS" if not fails else "FAIL")
 sys.exit(1 if fails else 0)
 PY

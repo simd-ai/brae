@@ -27,6 +27,7 @@
 #include "foam_field_reader.cuh"
 #include "foam_dict.cuh"
 #include "kEpsilon_cpp.cuh"
+#include "fvOptions_cpp.cuh"   // the case's fvOptions: kEpsilon.C constrains BOTH equations
 #include "linearViscousStress_cpp.cuh"
 
 #include <algorithm>
@@ -265,6 +266,30 @@ int main(int argc, char** argv)
     std::vector<scalar> alphat(nC, 0.0);
 
     scalar tolOverride = 1e-12;
+    // THE CASE'S fvOptions. kEpsilon.C calls fvOptions.constrain() on BOTH the k and the epsilon
+    // equation, and a constraint is not a source: OpenFOAM applies it as setValues(cells, values), which
+    // forces the value in those cells AND ZEROES THE OFF-DIAGONAL COUPLING to their neighbours -- one
+    // side per face, so upper and lower come out wrong by DIFFERENT amounts. This gate did not pass them,
+    // so on angledDuct it compared brae's UNCONSTRAINED matrix against OpenFOAM's constrained one and
+    // read `epsilon upper 8.23e-02, lower 6.44e-01` with every individual term exact (`div upper/lower`
+    // 0.0, `lapl upper/lower` 2.25e-15) and every mesh factor exact. The asymmetry was the tell.
+    cpu::fvOptions::OptionList keOpts = cpu::fvOptions::read(caseDir, m);
+    if (!keOpts.firstUnsupported().empty())
+    {
+        std::printf("  REFUSED: fvOptions declares '%s', which is not ported -- this gate would compare\n"
+                    "           a differently-constrained system.\n", keOpts.firstUnsupported().c_str());
+        return 1;
+    }
+    if (!keOpts.empty())
+    {
+        std::printf("  fvOptions: %zu option(s), constraining k/epsilon as kEpsilon.C does\n",
+                    keOpts.options.size());
+        for (const auto& o : keOpts.options)
+            for (const auto& fv : o.fieldValues)
+                std::printf("     %-22s constrains %-8s = %g on %zu cells\n",
+                            o.name.c_str(), fv.first.c_str(), (double)fv.second, o.cells.size());
+    }
+
     auto runDrop = [&](bool useVolumetricFluxForDivU, int dropTerm,
                    std::vector<scalar>& kOut,
                    std::vector<scalar>& epsOut,
@@ -299,7 +324,7 @@ int main(int argc, char** argv)
         res.captureStages = true;   // the intermediates, which the solver does not ask for
         cpu::kEpsilonRef::correct(U, kk, ee, nn, phi, /*nu=*/0.0, m, g, patches,
                                   relaxEps, relaxK, tolOverride, 0.0, 20000, keco, &res,
-                                  /*bounded=*/true, dropTerm, &comp);
+                                  /*bounded=*/true, dropTerm, &comp, keOpts.empty() ? nullptr : &keOpts);
         kOut = kk.internal; epsOut = ee.internal; nutOut = nn.internal; alphatOut = at;
         return res;
     };

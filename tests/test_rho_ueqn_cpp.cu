@@ -240,6 +240,21 @@ int main(int argc, char** argv)
                                      m, g, patches);
 
     // OpenFOAM's own muEff, so this measures the assembly and not an unported turbulence closure.
+    // T's AND he's updateCoeffs() BEFORE anything is built from them. The solver updates all three
+    // flux-conditional families at the top of the iteration (rhoSimpleFoam_cpp.cu:182-184); this gate
+    // updated only U, and it did it far below -- after muEff had already been built from a T whose
+    // inletOutlet was still sitting at its refValue. On angledDuct that refValue is 293 while the outlet
+    // actually runs at ~350.4 (the porous block is pinned to 350), and brae's own laminar muEff read
+    // 1.281e-01 against OpenFOAM on the outlet with every other patch at 1e-15. sutherland(293) =
+    // 1.8139e-05 against sutherland(350.4) = 2.0805e-05 is exactly that 12.8%: the gate's number, not
+    // the solver's. A gate that reports its own omission as a solver defect costs more than it saves.
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        f.T.boundary[pi]->updateFromFlux(f.phi.boundary[pi]);
+        f.he.boundary[pi]->updateFromFlux(f.phi.boundary[pi]);
+    }
+    f.T.evaluateBoundary();
+
     const FieldData<scalar> muEffFd = readField<scalar>(caseDir + "/" + dumpT + "/stage_muEff");
     const std::vector<scalar> muEffInt = rawInternal(muEffFd, nC);
     const std::vector<std::vector<scalar>> muEffBnd = rawBoundary<scalar>(muEffFd, patches);
@@ -365,7 +380,9 @@ int main(int argc, char** argv)
     // is `inletValue`, and angledDuct's is (0 0 0) -- so the outlet read EXACTLY zero against
     // OpenFOAM's (24.5, 24.6, 0.086), a relative error of exactly 1.0.
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
         f.U.boundary[pi]->updateFromFlux(f.phi.boundary[pi]);
+    }
     f.U.evaluateBoundary();
 
     // updateCoeffs() for the FREESTREAM family, at the point OpenFOAM calls it. freestreamVelocity is a

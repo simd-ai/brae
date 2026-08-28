@@ -503,6 +503,12 @@ RhoSimpleFields createFields(
 
     // initialMass = fvc::domainIntegrate(rho). pEqn.H's closed-volume correction is measured against it.
     f.initialMass = 0.0;
+    // basicThermo's constructor runs calculate() before any solving, so rho_ starts equal to rho.
+    f.rhoThermo = f.rho.internal;
+    f.rhoThermoBnd.resize(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        f.rhoThermoBnd[pi] = f.rho.boundary[pi]->value();
+
     for (label c = 0; c < nC; ++c) f.initialMass += f.rho.internal[c] * g.V()[c];
 
     return f;

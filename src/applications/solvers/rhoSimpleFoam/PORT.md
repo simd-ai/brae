@@ -251,6 +251,229 @@ re-evaluates the transform patches against it.
 | `UEqn source + boundaryCoeffs` | 2.51e-06 | **2.53e-15** |
 
 
+## angledDuct end-to-end: what has been ruled out, and what is left
+
+The tutorial converges in brae and disagrees with OpenFOAM at **U 9.43e-04** (bound 5e-4) with both codes
+run to a deep plateau -- brae's U residual 5.10e-08 against OpenFOAM's 4.97e-08. It is NOT a comparison-
+point artifact: at OpenFOAM's own shipped `residualControl` stop (639 iterations) it reads 9.58e-04, and at
+8000 it reads 9.43e-04. The two numbers agreeing is the evidence that the trajectories have arrived.
+
+### Ruled out, each with the measurement that did it
+
+**The fvOptions constraints.** `scalarFixedValueConstraint` pins k = 1 and epsilon = 150 across the 8000
+porosity cells and `fixedTemperatureConstraint` pins T = 350. brae reproduces all three **bit-exactly**:
+the cellZone split reads `k in zone 'porosity' 0.0000e+00`, likewise epsilon and nut.
+
+**The kEpsilon closure.** Run against `tools/dumpKEpsilon` on angledDuct itself -- not on sbMatched, which
+is where its own gate runs -- every intermediate is machine precision: gradU 3.07e-15, divU 1.95e-13,
+GbyNu 2.80e-15, G 2.86e-15, DkEff 7.64e-16, DepsilonEff 8.61e-16, epsilon D() 1.73e-15, epsilon source
+1.39e-12. A closure that is exact given exact inputs is not the origin of a drift; it can only amplify one.
+
+**The slip patch and the porosity zone as localised causes.** The laminar zone split reads 2.72e-04,
+2.57e-04 and 3.03e-04 in the inlet, outlet and porosity zones -- the same everywhere. `porosityWall`
+(5.31e-04) and `walls` (4.49e-04) are elevated only because boundary cells run at twice the interior
+(4.36e-04 against 2.15e-04), and porosityWall crosses 5e-4 by a hair rather than by a mechanism.
+
+**Uz carrying it.** Uz IS 340x worse in relative terms (7.67e-02 against Ux's 2.23e-04), and that is a red
+herring: |Uz| rms is 8.69e-03 against |Ux| 37.28, so Uz contributes 4.45e-07 of the 1.412e-04 total squared
+error -- 0.3%. The disagreement is in Ux and Uy.
+
+**Stale `pif_` on the transform patch.** The cached patch internal field would go stale if `U.internal`
+moved between `evaluate()` and the coefficient query. It does not: the solver evaluates at line 172 and
+assembles at line 210 with nothing touching `U.internal` between, and the pressure equation uses the
+matrix's stored coefficients exactly as OpenFOAM does.
+
+### Two structural differences found, both benign, both worth knowing
+
+**k's diagonal in the constrained rows** reads 2.96e-02, and every one of the worst cells is in the
+porosity zone -- rows that `scalarFixedValueConstraint` overwrites, where brae's solved k is bit-exact.
+Assembled rows differ, values do not. Same shape as the `epsilonWallFunction`/`setValues` case above.
+
+**epsilon's patch value under a constraint.** `stage_epsIn` on porosityWall reads 5.32e-01 while `walls`
+reads 1.07e-16. OpenFOAM's patch epsilon there is **320.618** and the porosity CELLS are pinned to
+**150**; brae's `EpsilonWallFunctionPatchField` derives from ZeroGradient so its patch value tracks the
+cell. (320.618 - 150)/320.618 = 0.532, which is the reported figure to three digits. Normally the two
+coincide because `epsilonWallFunction`'s `setValues` makes the cell equal the wall value -- the fvOptions
+constraint overwrites the cell afterwards and decouples them. Benign here because that row is overwritten
+regardless, but it is a real difference and it would not be benign anywhere the row survives.
+
+### The rho timing defect, found by the iteration-wise stage trace
+
+Running brae from the same start as OpenFOAM and comparing at iterations 1, 2, 3, 5, 10, 20 puts the first
+divergence at **iteration 1**, and names it: p is exact there (7.45e-08) while rho is already **3.93e-03**
+out -- 28x larger than T's 1.42e-04. rho is computed from p and T, so it cannot be more wrong than both.
+At cell 0 both codes held **identical p (150000) and T (293)** and different rho.
+
+**`thermo.rho()` is not the same function in the two thermo types.** `psiThermo::rho()` returns `p_*psi_`
+(psiThermo.C:150), recomputed from whatever p is when it is called. `rhoThermo::rho()` returns the STORED
+`rho_` (rhoThermo.C:233), which `heRhoThermo::calculate()` fills with `mixture_.rho(pCells, TCells)`
+(heRhoThermo.C:88) -- and `calculate()` runs inside `thermo.correct()`, which rhoSimpleFoam calls at the
+END of EEqn.H. So pEqn.H's `rho = thermo.rho()` hands back a density built from the pressure BEFORE the
+pressure equation ran. brae's `_cpp` path recomputed it live for both types.
+
+The arithmetic closes exactly. angledDuct's `pMaxFactor 1.5` clamps p from 100000 to 150000 on the first
+iteration, so live gives `mixture.rho(150000, 293)` = 1.779455 where OpenFOAM carries
+`mixture.rho(100000, 293)` = 1.186304; relaxed at the case's `rho 0.01` that is 1.192236 against
+OpenFOAM's 1.186303. brae computed 1.1922346 and OpenFOAM wrote 1.1863031.
+
+`updateRho` now branches on `f.thermo.rhoThermoType` -- a flag brae **already had**, and which
+`thermo_types.cuh:59-64` already described in exactly these terms. Only the new `_cpp` path ignored it.
+**rho at iteration 1: 3.933757e-03 -> 1.479426e-06**, and the field range matches OpenFOAM digit for
+digit: brae [1.1843711 .. 1.1863031] against OF [1.1843711 .. 1.1863031].
+
+**It does not move the converged answer.** U turbulent 9.426306e-04 -> 9.426282e-04, laminar 2.764485e-04
+-> 2.764486e-04. At the fixed point `rho.relax()` drops out and p stops moving between `correct()` and
+pEqn, so stored and live coincide. The defect is real and the fix is right -- it matters for the
+trajectory and for any comparison at a fixed iteration count -- but it is not the cause of the end-to-end
+disagreement. `squareBend` and `sbMatched` are `heRhoThermo` too and never caught it: their per-iteration
+pressure excursions are too small to separate stored from live.
+
+### Why the trace cannot go further on U, and what blocks the next instrument
+
+**Iteration-1 U is not a defect.** The case solves `U` at `relTol 0.1` and `p` at GAMG `relTol 0.05`, so
+each outer iteration stops once the residual has fallen 10x (20x for p) and two different linear solvers
+stop at different points. U reads 4.72e-03 at iteration 1 for that reason alone. Everything ALGEBRAIC
+there is exact: assembly source 5.91e-14, gradU 2.08e-15, dev2 3.11e-15, off-diagonals 3.76e-15, diag
+1.24e-15, rAU 2.99e-15, both coefficient sets ~1e-14. That contrast is the whole lesson of the trace --
+rho was findable *because it is computed rather than solved*, so no solver path could explain it. Apply
+the method to algebraic quantities; solved ones only speak at convergence.
+
+**Both downstream instruments were blocked on this case. Both are fixed now.**
+
+The **pEqn gate** built its own momentum matrix WITHOUT fvOptions, so it carried no porosity term at all.
+On angledDuct it reported rAU 7.49e-01 where the momentum gate, on the identical case and iteration,
+reported 1.99e-15, and its worst source error sat on `porosityWall` at 5.21e+01. None of that was brae's.
+It now reads the case's fvOptions and applies them to the matrix it rebuilds, and it REFUSES in two places
+rather than assembling a different equation: on an unported option type, and on any option constraining
+`p` or `rho`, because pEqn.H applies `fvOptions(psi, p, rho.name())` to the pressure equation (pEqn.H:32,
+:63) and this gate does not model that term.
+
+| | before | after |
+|---|---|---|
+| `rAU` | 7.488544e-01 | **1.997937e-15** |
+| `rhorAUf` | 6.925532e-01 | **2.360185e-15** |
+| `pEqn.D()` | 6.758718e-01 | **2.629782e-15** |
+| `HbyA` | 6.221706e-02 | 1.200418e-05 |
+| `pEqn source` | 4.118737e-03 | 5.408488e-05 |
+
+The **EEqn gate** refused with `unsupported BC type 'fixedEnergy'`, and the same wall carried
+`gradientEnergy` and `mixedEnergy` -- this case needs all three, and so does any case whose inlet fixes a
+temperature. They are handled now by the three branches they derive from, which is not a substitution:
+
+    fixedEnergyFvPatchScalarField    : public fixedValueFvPatchScalarField
+    gradientEnergyFvPatchScalarField : public fixedGradientFvPatchScalarField
+    mixedEnergyFvPatchScalarField    : public mixedFvPatchScalarField
+
+What the energy classes add is an `updateCoeffs()` recomputing value, gradient or refValue from T through
+the thermo; the MATRIX coefficients are the base class's, unchanged. OpenFOAM writes exactly the entries
+each base needs, which was checked in the dump before mapping anything -- `value` on the fixedEnergy
+inlet, `gradient` on the gradientEnergy walls, `refValue`/`refGradient`/`valueFraction` on the mixedEnergy
+outlet. The solver never reaches this path: it derives he's boundary conditions from T's, the same
+relation from the other side.
+
+### Three localised signals, where there had been one bulk number
+
+With both instruments running on angledDuct at a developed laminar iteration:
+
+- **`EEqn.D()` is exact** (1.280440e-15) and `EEqn source + boundaryCoeffs` is 3.218870e-06, concentrated
+  on **walls at 1.0166e-02** against porosityWall 3.43e-06, inlet 3.41e-08 and outlet 2.61e-12.
+- **`HbyA`'s interior is 1.20e-10** and its whole residue is boundary cells (2.61e-05), worst on the inlet
+  (8.52e-05) and walls (1.80e-05).
+- **`he` on the outlet** reads 9.489905e-05.
+
+All three sit on boundary cells with the interiors at or near machine precision, which is a different
+statement from the 2.76e-04 spread through the field that the end-to-end comparison reports. Whether they
+are the same defect is not established.
+
+**And one reported number was the gate's own.** `laminar muEff on outlet` read 1.281e-01 with every other
+patch at 1e-15. The momentum gate called `updateFromFlux` on U only -- and below where muEff is built --
+so T's `inletOutlet` was still at its refValue 293 while the outlet runs at ~350.4, the porous block being
+pinned to 350. sutherland(293) = 1.8139e-05 against sutherland(350.4) = 2.0805e-05 is that 12.8% exactly.
+Fixed by updating T and he before muEff: **1.281070e-01 -> 1.364608e-05**.
+
+### THE DEFECT: `corrected` has two halves and this solver only had one
+
+Chasing `EEqn source on walls 1.0166e-02` named it. Three candidates died to measurements first, which is
+worth keeping because each looked right:
+
+- **The relaxation.** `fvMatrix::relax` does `S += (D - D0)*psi`, and where its dominance clamp is active
+  the relaxed `D` lands on `sumMagOffDiag` and carries no trace of `D0` -- so a wrong `D0` would be
+  invisible in `D` and visible only in the source, which is exactly the shape observed. Adding a
+  before-relax dump to the instrument (`stage_eD0`, `stage_eSrc0`) killed it: **D0 is exact**, 1.63e-15,
+  boundary cells and interior alike. The unrelaxed SOURCE was the thing that was wrong.
+- **The boundary coefficients.** At a wall `phi = 0` and the `gradientEnergy` gradient is `uniform 0`, so
+  they should vanish -- and brae's `sum(bC)` at the worst cell is exactly `0.0000000000e+00`.
+- **The kinetic term.** brae's assembled source at that cell is `4.7983400746e-04` and OpenFOAM's own
+  `-stage_keDiv*V` is `4.7983410099e-04` -- seven digits. brae's source WAS the kinetic term, entire.
+
+What was left is a term OpenFOAM's source has and brae's did not. `corrected` changes **two** things
+(gaussLaplacianScheme.C):
+
+    implicit:  the face coefficient uses nonOrthDeltaCoeffs instead of deltaCoeffs
+    explicit:  source -= V * div( gamma*magSf * (corrVecs & interpolate(grad(vf))) )
+
+Passing `correctedLaplacian` to `fvm::laplacian` buys only the first. The second is a separate call,
+`laplacianNonOrthSource`, and **every other equation in the tree already made it** -- simpleFoam's pEqn,
+kEpsilon, kOmegaSST, kOmegaSSTLM, linearViscousStress. rhoSimpleFoam's **energy and pressure** equations
+did not. At cell 629 that missing term is the whole 4.37x between `4.7983400746e-04` and OpenFOAM's
+`2.0967040959e-03`.
+
+**Why it survived every gate.** It moves the SOURCE and leaves the DIAGONAL exact, so every comparison of
+`D()` passed -- and squareBend and sbMatched are near-orthogonal enough that the source barely notices.
+angledDuct is an angled duct. The file's own comment had predicted the failure mode ("leaves the source
+short by the whole non-orthogonal contribution... moves the DIAGONAL by only ~1e-06 while moving the
+SOURCE by ~19%") while the code implemented only half of the fix.
+
+| | before | after |
+|---|---|---|
+| `EEqn` source before relax | 2.143770e-05 | **4.565472e-14** |
+| `EEqn` src0 on `walls` | 5.0799e-05 | **3.7244e-14** |
+| `EEqn source + boundaryCoeffs` | 3.218870e-06 | **7.141894e-15** (gate PASSES) |
+| `pEqn source + boundaryCoeffs` | 5.408488e-05 | **9.474079e-07** |
+
+### End to end on angledDuct, both codes deeply converged
+
+**Laminar now PASSES with every check green**, including the `porosityWall` confinement that had been
+failing since this case was first run:
+
+| | before | after |
+|---|---|---|
+| U | 2.764486e-04 | **3.093530e-05** |
+| p | 6.907273e-06 | **7.347413e-07** |
+| rho | 6.600502e-06 | **2.274500e-06** |
+| per-patch | porosityWall FAIL | **all ok** |
+
+**Turbulent** improves nearly as much on everything the momentum/pressure/energy path owns -- U
+9.426282e-04 -> **3.248515e-04** (inside the 5e-4 bound), p 2.14e-05 -> 4.58e-06, T 6.54e-05 -> 2.05e-06,
+rho 8.82e-05 -> 5.21e-06 -- and `U interior is not where it lives` goes from FAIL to ok.
+
+**But the turbulence fields regressed and that is not explained**: k 7.85e-04 -> 2.81e-03, epsilon
+1.17e-03 -> 7.12e-03, nut 3.14e-04 -> 2.59e-03, all 4-8x worse, with `porosityWall` and `walls` still
+failing their confinement. The closure's own laplacians already call `laplacianNonOrthSource`, so this is
+NOT the same defect. The plausible reading -- that a wrong flow field was partially cancelling a separate
+closure error, and fixing the flow exposed it -- is a hypothesis and nothing here establishes it.
+
+The decomposition is at least clean now: **the momentum, pressure and energy path is essentially exact**
+(laminar 3.09e-05 with every check passing) and what remains on angledDuct is the compressible closure.
+
+### What is left
+
+A disagreement in Ux and Uy that is **essentially zero at the inlet face (6.01e-06) and grows downstream**
+-- 2.56e-04 at the outlet, 4.49e-04 at the walls -- with p at 6.91e-06, T at 2.46e-06 and rho at 6.60e-06,
+all an order better. Laminar reads 2.76e-04 and turbulent 9.43e-04, so the closure amplifies it about 3.4x
+without originating it. It is an accumulation along the flow, not a scalar factor and not a patch.
+
+The method that fits is the iteration-wise stage trace that found the `flowRateInletVelocity` defect on
+this same case: run both codes from the same start and compare stage by stage, iteration by iteration,
+until the first divergence beyond round-off is named. That has not been done yet.
+
+**The gate is written and deliberately NOT registered.** `tests/rho_angledduct_vs_openfoam.sh` runs the
+stock tutorial at OpenFOAM's own convergence and asserts the setup it depends on (the porosity cellZone
+exists, fvOptions still carries a negative alpha, porosityWall is still slip). Registering it now would
+mean choosing a bound that accommodates an unexplained 9.43e-04, which is the failure mode this port
+exists to avoid.
+
+
 ## Open findings, turned up by the port and belonging to other components
 
 **The device kEpsilon has the same `corrected` question, unmeasured.** `device_simple_foam.cu`'s

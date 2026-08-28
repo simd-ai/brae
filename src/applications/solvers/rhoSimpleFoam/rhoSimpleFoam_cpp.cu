@@ -28,6 +28,10 @@ void thermoCorrect(
     {
         f.T.internal[c]   = hConstHeToT(f.he.internal[c], f.thermo);
         f.psi[c]          = perfectGasPsi(f.T.internal[c], f.thermo);
+        // heRhoThermo::calculate() fills rho_ HERE, from the p and T it sees at correct() time
+        // (heRhoThermo.C:88). It is not the same number as p*psi later in the iteration, because the
+        // pressure equation has not run yet.
+        f.rhoThermo[c]    = perfectGasRho(f.p.internal[c], f.T.internal[c], f.thermo);
     }
     // The boundary temperature is NOT recomputed from he here: T's patch values come from T's own
     // boundary conditions, which is what basicThermo::correct() leaves in place -- it recalculates the
@@ -36,8 +40,12 @@ void thermoCorrect(
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const std::vector<scalar>& tb = f.T.boundary[pi]->value();
+        const std::vector<scalar>& pb = f.p.boundary[pi]->value();
         for (label i = 0; i < patches[pi].size; ++i)
-            f.psiBnd[pi][i] = perfectGasPsi(tb[i], f.thermo);
+        {
+            f.psiBnd[pi][i]        = perfectGasPsi(tb[i], f.thermo);
+            f.rhoThermoBnd[pi][i]  = perfectGasRho(pb[i], tb[i], f.thermo);
+        }
     }
 }
 
@@ -106,6 +114,28 @@ void updateRho(
     const std::vector<FvPatch>& patches)
 {
     const std::size_t nC = f.rho.internal.size();
+    // `rho = thermo.rho()`, and WHICH rho that is depends on the thermo type. For hePsiThermo it is
+    // p_*psi_ (psiThermo.C:150), recomputed with the pressure that was just solved. For heRhoThermo it
+    // is the stored rho_ (rhoThermo.C:233), which heRhoThermo::calculate() last filled inside
+    // thermo.correct() at the end of EEqn.H -- from the pressure BEFORE the pressure equation ran.
+    //
+    // Recomputing it live for heRhoThermo is wrong wherever p moves appreciably in one iteration.
+    // angledDuct is such a case: p is clamped from 100000 to pMaxFactor's 150000 on the first
+    // iteration, so live gives mixture.rho(150000, 293) = 1.779455 where OpenFOAM carries
+    // mixture.rho(100000, 293) = 1.186304. Relaxed at the case's 0.01 that is 1.192236 against
+    // OpenFOAM's 1.186303 -- the whole of the 3.93e-03 rho gap at iteration 1, in one cell, with p
+    // and T identical in both codes. squareBend and sbMatched are heRhoThermo too and their gates
+    // never caught it: their per-iteration pressure excursions are too small to separate the two.
+    if (f.thermo.rhoThermoType)
+    {
+        f.rho.internal = f.rhoThermo;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            std::vector<scalar> rb = f.rhoThermoBnd[pi];
+            f.rho.boundary[pi]->setStoredValues(std::move(rb));
+        }
+        return;
+    }
     for (std::size_t c = 0; c < nC; ++c)
         f.rho.internal[c] = perfectGasRho(f.p.internal[c], f.T.internal[c], f.thermo);
     for (std::size_t pi = 0; pi < patches.size(); ++pi)

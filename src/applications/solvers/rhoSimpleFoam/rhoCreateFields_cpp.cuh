@@ -132,6 +132,16 @@ struct RhoSimpleFields
     // kOmegaSST transports omega where kEpsilon transports epsilon. Which one is populated follows
     // rasModel, and the driver branches on the same name rather than on which field happens to exist.
     GeometricField<scalar> omega;
+
+    // heRhoThermo's STORED rho_, and the reason it exists separately from `rho` above.
+    // psiThermo::rho() returns p_*psi_, recomputed from whatever p is when it is called.
+    // rhoThermo::rho() returns rho_ (rhoThermo.C:233), a field heRhoThermo::calculate() fills with
+    // mixture_.rho(pCells, TCells) (heRhoThermo.C:88) -- and calculate() runs in thermo.correct(),
+    // which rhoSimpleFoam calls at the END OF EEqn.H, before the pressure equation. So pEqn.H's
+    // `rho = thermo.rho()` hands back a density built from the PRE-SOLVE pressure, and on a case where
+    // p moves hard in one iteration that is nothing like the post-solve value.
+    std::vector<scalar>              rhoThermo;     // filled by thermoCorrect(), read by updateRho()
+    std::vector<std::vector<scalar>> rhoThermoBnd;
 };
 
 // createFields.H + compressibleCreatePhi.H + createFieldRefs.H + pressureControl.

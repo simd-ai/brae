@@ -1,6 +1,7 @@
 // _cpp REFERENCE implementation -- see EEqn_cpp.cuh for the OpenFOAM provenance and the refusal contract.
 #include "rhoEEqn_cpp.cuh"
 #include "fvm.cuh"
+#include "fvc.cuh"   // gaussGrad, for the laplacian non-orthogonal correction
 #include "fv_matrix_ops.cuh"
 #include "linearViscousStress_cpp.cuh"   // effectiveFaceViscosity -- the SAME face rule for alphaEff
 #include "limitedSchemes_cpp.cuh"
@@ -243,10 +244,38 @@ FvScalarMatrix assembleEEqn(
     // laplacian instead leaves the source short by the whole non-orthogonal contribution -- which on a
     // near-orthogonal mesh moves the DIAGONAL by only ~1e-06 while moving the SOURCE by ~19%, so the
     // diagonal comparison alone would not have caught it.
-    addEqual(M, fvm::laplacian<scalar>(
-                    effectiveFaceViscosity(*in.alphaEff, *in.alphaEffBnd, m, g, patches),
-                    he, m, g, patches, in.correctedLaplacian),
-             -1.0);
+    //
+    // `corrected` HAS TWO HALVES AND THIS EQUATION ONLY HAD ONE. Passing correctedLaplacian to
+    // fvm::laplacian selects nonOrthDeltaCoeffs for the implicit coefficients; the EXPLICIT half --
+    // source -= V*div(gamma*magSf*(corrVecs & interpolate(grad(vf)))) -- is a separate term
+    // (gaussLaplacianScheme.C), and every other equation in the tree adds it: simpleFoam's pEqn,
+    // kEpsilon, kOmegaSST, kOmegaSSTLM and linearViscousStress all call laplacianNonOrthSource. The
+    // energy equation did not, so on any mesh with real non-orthogonality its source was short by the
+    // whole correction while its DIAGONAL stayed exact -- which is precisely why it survived: every
+    // gate that compares D() passed, and squareBend and sbMatched are near-orthogonal enough that the
+    // source barely noticed.
+    //
+    // angledDuct is the case that shows it. At cell 629 on `walls` brae's assembled source was
+    // 4.7983400746e-04 -- equal to its own -div(phi,Ekp)*V to seven digits, with every boundary
+    // coefficient there exactly zero -- against OpenFOAM's 2.0967040959e-03. The whole 4.37x is the
+    // missing correction. The gradient is the UNLIMITED Gauss linear one, because correctedSnGrad's
+    // fullGradCorrection resolves grad(he) through the case's gradSchemes and angledDuct's default is
+    // `Gauss linear`.
+    {
+        const SurfaceScalarField gammaf =
+            effectiveFaceViscosity(*in.alphaEff, *in.alphaEffBnd, m, g, patches);
+        FvScalarMatrix L = fvm::laplacian<scalar>(gammaf, he, m, g, patches, in.correctedLaplacian);
+        if (in.correctedLaplacian)
+        {
+            std::vector<std::vector<scalar>> vb(patches.size());
+            for (std::size_t pi = 0; pi < patches.size(); ++pi) vb[pi] = he.boundary[pi]->value();
+            const std::vector<vector> gradHe = fvc::gaussGrad(he.internal, vb, m, g, patches);
+            const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
+                gammaf, he, gradHe, m, g, patches, in.snGradLimitCoeff);
+            for (label c = 0; c < nC; ++c) L.source[c] -= corr[c];
+        }
+        addEqual(M, L, -1.0);
+    }
 
     // EEqn.relax().
     if (in.relaxHe > 0.0 && in.relaxHe < 1.0)

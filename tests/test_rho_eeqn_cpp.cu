@@ -333,6 +333,80 @@ int main(int argc, char** argv)
     FvScalarMatrix E = cpu::rhoSimple::assembleEEqn(he, f.U, f.p, f.rho, in, m, g, patches);
     const std::vector<scalar> ofD   = rawInternal(readField<scalar>(caseDir + "/" + dumpT + "/stage_eD"), nC);
     const std::vector<scalar> ofSrc = rawInternal(readField<scalar>(caseDir + "/" + dumpT + "/stage_eSrc"), nC);
+    // THE SYSTEM BEFORE relax(), separately. fvMatrix::relax clamps the diagonal to
+    // max(|D|, sumMagOffDiag) before dividing by alpha, and at a wall cell the wall face contributes
+    // NOTHING to the diagonal when he is gradientEnergy -- so sumOff wins, the relaxed D lands on
+    // sumOff/alpha, and it carries no trace of the unrelaxed D0. A wrong D0 is then invisible in D and
+    // visible only through `S += (D - D0)*psi`. That is exactly the shape angledDuct showed: D agreeing
+    // to eleven digits at cell 629 while the source was 7.3e-05 out. Comparing the unrelaxed system
+    // directly is the only way to see which of the two it is.
+    if (std::ifstream((caseDir + "/" + dumpT + "/stage_eD0").c_str()).good())
+    {
+        cpu::rhoSimple::EnergyInput un = in;
+        un.relaxHe = 1.0;                     // no relaxation: D == D0 and source == the raw right-hand side
+        const FvScalarMatrix E0 = cpu::rhoSimple::assembleEEqn(he, f.U, f.p, f.rho, un, m, g, patches);
+        const std::vector<scalar> ofD0 = rawInternal(readField<scalar>(caseDir + "/" + dumpT + "/stage_eD0"), nC);
+        const std::vector<scalar> ofS0 = rawInternal(readField<scalar>(caseDir + "/" + dumpT + "/stage_eSrc0"), nC);
+        std::printf("     EEqn.D()      BEFORE relax                %.6e\n", relL2(matrixD(E0, patches), ofD0));
+        std::printf("     EEqn source   BEFORE relax                %.6e\n", relL2(matrixRhs(E0, patches), ofS0));
+        std::vector<char> isB2(nC, 0);
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            for (label i = 0; i < patches[pi].size; ++i) isB2[patches[pi].faceCells[i]] = 1;
+        const std::vector<scalar> mD0 = matrixD(E0, patches);
+        double db2 = 0.0, nb2 = 0.0, di2 = 0.0, ni2 = 0.0;
+        for (label c = 0; c < nC; ++c)
+        {
+            const double d = (double)mD0[c] - (double)ofD0[c], r = (double)ofD0[c];
+            if (isB2[c]) { db2 += d*d; nb2 += r*r; } else { di2 += d*d; ni2 += r*r; }
+        }
+        std::printf("       D0 split: boundary cells %.4e   interior %.4e\n",
+                    nb2 > 0 ? std::sqrt(db2/nb2) : 0.0, ni2 > 0 ? std::sqrt(di2/ni2) : 0.0);
+        const std::vector<scalar> mS0 = matrixRhs(E0, patches);
+        double sb = 0.0, snb = 0.0, si = 0.0, sni = 0.0;
+        for (label c = 0; c < nC; ++c)
+        {
+            const double d = (double)mS0[c] - (double)ofS0[c], r = (double)ofS0[c];
+            if (isB2[c]) { sb += d*d; snb += r*r; } else { si += d*d; sni += r*r; }
+        }
+        std::printf("       src0 split: boundary cells %.4e   interior %.4e\n",
+                    snb > 0 ? std::sqrt(sb/snb) : 0.0, sni > 0 ? std::sqrt(si/sni) : 0.0);
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (!patches[pi].size) continue;
+            double dp = 0.0, np = 0.0;
+            for (label i = 0; i < patches[pi].size; ++i)
+            {
+                const label c = patches[pi].faceCells[i];
+                const double d = (double)mS0[c] - (double)ofS0[c];
+                dp += d*d; np += (double)ofS0[c]*(double)ofS0[c];
+            }
+            std::printf("         src0 on %-14s %.4e\n", patches[pi].name.c_str(),
+                        np > 0 ? std::sqrt(dp/np) : 0.0);
+        }
+        label w0 = 0; double wd0 = -1.0;
+        for (label c = 0; c < nC; ++c)
+        {
+            const double d = std::fabs((double)mS0[c] - (double)ofS0[c]);
+            if (d > wd0) { wd0 = d; w0 = c; }
+        }
+        std::printf("       worst src0 cell %d: brae %.10e  OF %.10e  diff %.4e  (bnd=%d)\n",
+                    (int)w0, (double)mS0[w0], (double)ofS0[w0], wd0, (int)isB2[w0]);
+        {
+            // The PIECES. At a wall phi = 0 and the he gradient is 0, so every boundary coefficient
+            // there should vanish and the whole source should be the kinetic term -div(phi,Ekp)*V.
+            // Printing them separately says whether that is what brae actually built.
+            double bcSum = 0.0;
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                for (label i = 0; i < patches[pi].size; ++i)
+                    if (patches[pi].faceCells[i] == w0) bcSum += (double)E0.boundaryCoeffs[pi][i];
+            const std::vector<scalar> keD2 = cpu::rhoSimple::kineticEnergy(f.heName, f.U, f.p, f.rho);
+            std::printf("         pieces at %d: brae source() %.10e   sum(bC) %.10e   V %.6e\n",
+                        (int)w0, (double)E0.source[w0], bcSum, (double)g.V()[w0]);
+            std::printf("         kineticEnergy field here %.10e   (times V) %.10e\n",
+                        (double)keD2[w0], (double)keD2[w0] * (double)g.V()[w0]);
+        }
+    }
+
     const double dErr = relL2(matrixD(E, patches), ofD);
     const double sErr = relL2(matrixRhs(E, patches), ofSrc);
     report("EEqn.D() vs OpenFOAM", dErr, 1e-10);
@@ -371,6 +445,31 @@ int main(int argc, char** argv)
         }
         std::printf("     diff on %ld boundary cells %.4e   on %ld interior cells %.4e\n",
                     nb, std::sqrt(db), (long)nC - nb, std::sqrt(di));
+        // THE WORST CELL, with the pieces the difference could come from. A per-patch L2 says where the
+        // disagreement lives; it cannot say what it is made of, and the source at a wall cell has no
+        // boundary contribution at all here (phi = 0, gradient = 0), so the arithmetic has to be read
+        // rather than inferred.
+        {
+            label wc = 0; double wd = -1.0;
+            for (label c = 0; c < nC; ++c)
+            {
+                const double d = std::fabs((double)mine[c] - (double)ofSrc[c]);
+                if (isBnd[c] && d > wd) { wd = d; wc = c; }
+            }
+            std::string on;
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                for (label i = 0; i < patches[pi].size; ++i)
+                    if (patches[pi].faceCells[i] == wc)
+                    { if (on.find(patches[pi].name) == std::string::npos) on += patches[pi].name + " "; }
+            std::printf("       worst boundary cell %d on [%s]\n", (int)wc, on.c_str());
+            std::printf("         brae src %.10e   OF src %.10e   diff %.4e\n",
+                        (double)mine[wc], (double)ofSrc[wc], wd);
+            std::printf("         brae D   %.10e   OF D   %.10e   he %.10e\n",
+                        (double)E.diag[wc], (double)ofD[wc], (double)he.internal[wc]);
+            std::printf("         implied dD0 = diff/he %.4e   (relative to D %.4e)\n",
+                        wd / (double)he.internal[wc],
+                        wd / (double)he.internal[wc] / (double)ofD[wc]);
+        }
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
             if (!patches[pi].size) continue;
