@@ -507,6 +507,84 @@ untouched.
 That is the second gate this session found passing for the wrong reason -- the first being the closure
 gate comparing an unconstrained system because it never read the case's fvOptions.
 
+## The CUDA phase: UEqn is the first module, and it is gated
+
+`src/applications/solvers/rhoSimpleFoam/rhoUEqn.cu` (695 lines) is in `brae_core` and
+`tests/test_rho_ueqn_cuda.cu` measures it against the `_cpp` reference at MATRIX granularity -- diag,
+upper, lower, all three sources and every boundary coefficient on every patch, never a folded single
+number. Seven registered cases: laminar, turbulent, and one per div scheme.
+
+**Zero new `__global__` kernels.** Every kernel is reused from the incompressible device lineage; the file
+is a host-side orchestrator. The compressible differences are the three the manifest names: `mu_eff =
+rho*nu_eff` formed inside the module, `phi` as the MASS flux, and a rho-weighted MRF. The internal-face
+viscosity interpolates the PRODUCT (`interp(rho*nu)`), not `interp(rho)*interp(nu)` -- they differ on a
+non-uniform field, and this is the of-port checklist's item 4.
+
+**Measured, laminar `matrixDumpAsym/282` and turbulent `pitzDailyTurb/1576`:**
+
+| | laminar | turbulent |
+|---|---|---|
+| diag (relaxed) | 8.700e-12 | 2.018e-12 |
+| upper / lower | 1.393e-11 / 9.624e-12 | 3.962e-12 / 4.097e-12 |
+| source x / y / z | 1.227e-11 / 2.737e-12 / 1.444e-13 | 1.261e-11 / 2.229e-12 / 3.168e-14 |
+| internalCoeffs, all 3 | **0.000e+00** | **0.000e+00** |
+| boundaryCoeffs, all 3 | **0.000e+00** | **0.000e+00** |
+
+The 1e-11 on the r-ratio limiters is the scheme's arithmetic, not the port: `r = 2*(gradcf/gradf) - 1`
+divides by a face difference that approaches zero, so the 1e-16 disagreement between the host and device
+Gauss gradients (different summation order) is amplified. `LUST` and `linearUpwindV` reach 1e-16 and are
+held to 1e-13 for exactly that reason -- a single loose bound would hide a real defect in them.
+
+**rho IS SYNTHESIZED and that is deliberate.** No committed fixture ships one, and this gate measures
+CUDA-against-host on identical inputs rather than physics -- physical validity is
+`rho_ueqn_vs_openfoam.sh`'s claim. rho must be NON-UNIFORM or the gate is decoration: with a uniform rho,
+`mu_eff` is a constant multiple of `nu_eff` and a kernel dropping the rho weighting from ONE term would
+still agree on a rescaled matrix. The gate asserts the variation.
+
+**Every control fires, and the fail-proof matches the control's prediction.** The control that matters is
+the one this solver exists for: injecting the KINEMATIC `nu_eff` -- the incompressible `divDevReff` --
+moves the diagonal by **2.883e-01** on the turbulent fixture. Removing the rho weighting from the device
+module turns the gate red at **2.883e-01** on the diagonal, 2.810e-01 upper, 2.272e-01 source x: the
+control forecast the red number and breaking the code produced exactly it. Also asserted: `bounded`
+contributes (7.3e-09, small because it vanishes at convergence -- which is why it needs its own check),
+the scheme moves the off-diagonals (3.2e-01), `linearUpwind` moves the source (2.2e-03) and leaves the
+matrix untouched, and `corrected` moves BOTH the coefficients (2.1e-03) and the source (1.5e-03).
+
+**What the gate does NOT claim**, stated in the script and here: it does not claim the compressible
+equation is right -- that is the `_cpp` gate's claim against OpenFOAM's own matrix; it does not cover
+`relaxU == 1.0`, `hasCoupledPatches`, or DarcyForchheimer porosity, for the reasons in the open findings
+below.
+
+### Open findings against OTHER components, turned up by writing the CUDA module
+
+Recorded rather than fixed out of scope, per the of-port skill. All four were verified against the source.
+
+**`device_fvc.cu`'s gradient limiter counts EMPTY-patch faces; the host does not.** Its boundary loop runs
+`bndCellStart[c]` to `bndCellStart[c+1]` with no `bndIsEmpty` test -- the buffer exists on `DeviceMesh`
+and is never referenced in that file -- while `cellLimitedGrad_cpp.cu:76,111` skips them, its own comment
+noting that on a 2D mesh `Cf - C` for an empty face points out of the plane. This is the defect fixed on
+the host earlier in this port, still live on the device path, and it is shared by EVERY solver.
+
+**`simpleFoam/UEqn.cu:76,82` accumulate into un-zeroed pool memory.** `mag2.resize()` takes a recycled
+block (`DevicePool::take` reuses without zeroing, and falls back to bare `cudaMalloc`), and the three
+`deviceAxpy` calls are `y[i] += a*x[i]`, so `magSqr(U)` accumulates on top of whatever that block last
+held. LATENT, not live: no validation case names `div(phi,U) Gauss limitedLinear` on a vector --
+`mixerVessel2D` uses the V form, a different branch -- which is why every gate passes. It bites the moment
+a case does.
+
+**`relaxU == 1.0` cannot mean two different things.** OpenFOAM relaxes whenever `relaxEquation("U")` finds
+the entry, and `relax(1.0)` is NOT the identity -- it still applies the dominance clamp and the
+`(D - D0)*psi` source step; only `alpha <= 0` early-returns. The host reference uses `relaxU == 1.0` as
+the sentinel for "the case named no factor", so a case with `equations { U 1; }` skips relaxation in brae
+and does not in OpenFOAM. The CUDA module carries a separate `relaxEquationU` flag and therefore
+deliberately disagrees with its own oracle on that one input until the host is fixed.
+
+**DarcyForchheimer on a force-dimensioned equation.** `rhoUEqn_cpp.cu:223` passes `nu = 0.0` into the
+shared `addSup`, which drops the viscous Darcy term and the rho on Forchheimer --
+`DarcyForchheimerTemplates.C:52-53` is `Cd = mu*D + (rho*mag(U))*F`. The CUDA module REFUSES it by name
+rather than reproduce that a second time; `fixedCoeff`, which is what the compressible tutorials use, is
+implemented on both.
+
 ### What is left
 
 A disagreement in Ux and Uy that is **essentially zero at the inlet face (6.01e-06) and grows downstream**
@@ -534,6 +612,56 @@ checking there for the same reason. It is not asserted either way: the ten incom
 their gates, and on a near-orthogonal mesh the effect was 5e-06, which those bounds would not resolve. It
 is recorded rather than fixed because that path is validated and this session's scope was the compressible
 `_cpp` closure.
+
+**`simpleFoam/UEqn.cu`'s `limitedLinear` branch accumulates into UN-ZEROED device buffers.** `mag2.resize(
+dm.nCells)` (UEqn.cu:76) and `m2b.resize(dm.nBndFaces)` (UEqn.cu:82) are each followed by three
+`deviceAxpy(1.0, t, ...)` accumulations, with no assignment anywhere. `DeviceBuffer::resize` takes its block
+from `DevicePool::take`, which hands back a RECYCLED block and states the contract explicitly
+(`device_buffer.cuh:25-27` — "Returned memory is NOT zeroed, same contract as cudaMalloc, and cf always
+writes a buffer before reading it"). The first assembly is right because the pool has no same-size block;
+from the second onward `magSqr(U)` is summed on top of the previous tenant's data, so the NVDTVD ratio and
+the implicit face weights are a function of stale memory. It bites only cases whose `div(phi,U)` is
+`Gauss limitedLinear k`, which is why it has survived. `rhoUEqn.cu` has its own `zeroBuffer` for exactly
+this and its header comment names the defect; the shipped incompressible path still has it. The gate has to
+run TWO consecutive `limitedLinear` assemblies in one process with the pool enabled and require the second
+to match the first — a single-assembly test cannot see it. Recorded rather than fixed because it belongs to
+simpleFoam and that path is gated.
+
+**`device_fvc.cu`'s `cellLimitGradKernel` counts EMPTY-patch faces; the host reference excludes them.**
+`cellLimitedGrad_cpp.cu` skips `patches[pi].type == "empty"` in both the min/max range loop (line 76) and
+the limiter loop (line 116), and its own comment records why the second one matters: on a 2D mesh `Cf - C`
+for an empty face points out of plane, so the extrapolation is the out-of-plane gradient — round-off, but it
+clears the 1e-15 threshold once the gradient is of order 1e5, and then `r = maxDelta/extrapolate` clamps the
+limiter far below what any real face asks for. OpenFOAM never evaluates those faces at all
+(`emptyFvPatch::size()` is 0). The kernel walks `bndCellStart`/`bndPerm` with no guard, although `dm.bndIsEmpty`
+exists, is populated for empty patches (`device_mesh.cuh:118-123`) and is already consulted by
+`tensorDivKernel` (`device_divdevreff.cu:157`). It reaches this solver through `grad(U) cellLimited Gauss
+linear 1` on a 2D case — aerofoilNACA0012 is one — in `divDevRhoReff`'s explicit source and in the deferred
+convection correction, neither of which vanishes at convergence. Recorded rather than fixed because the
+kernel is shared by every solver and needs its own gate (a 2D case at `gradULimitK = 1` against the host
+reference, control = the guard removed).
+
+**`rhoUEqn_cpp.cu` has two defects the CUDA module has now been corrected for, so the two DISAGREE until it
+is fixed.** (1) `rhoUEqn_cpp.cu:249-253` guards `relax` with `in.relaxU > 0.0 && in.relaxU < 1.0` and its
+comment claims "a factor of 1 is the identity". It is not: `fvMatrix::relax()` runs whenever
+`relaxEquation(name)` finds the entry (`fvMatrix.C:1250-1263`, `solution.C:330-334`) and `relax(alpha)`
+early-returns only at `alpha <= 0` (`fvMatrix.C:1102-1107`), so `equations { U 1; }` still applies
+`D = max(|D|, sumOff)`, the asymmetric boundary add/remove and `S += (D - D0)*psi`. The reference needs the
+same `relaxEquationU` sentinel the CUDA input now carries. (2) `rhoUEqn_cpp.cu:32-37` builds
+`limitedLinearV`'s NVDVTVDV limiter from an unconditionally unlimited `fvc::gaussGrad`, but
+`LimitedScheme::calcLimiter` takes `fvc::grad(LimitFunc(phi))` and `limitedLinearV` is NVDVTVDV +
+`limitFuncs::null`, which returns `phi` itself — so the gradient resolves the NAMED `grad(U)` entry and is
+cell-limited when the case says so. `simpleFoam/UEqn.cu` and `UEqn_cpp.cu` carry the same second defect.
+
+**`rhoUEqn.cu` / `rhoUEqn.cuh` are not in the build and have no gate.** Neither file is in
+`CMakeLists.txt`'s `brae_core` source list, nothing in the tree calls `gpu::rhoSimple::assembleUEqn`, and
+`tests/test_rho_ueqn_cuda.cu` does not exist — `rho_ueqn_vs_openfoam.sh` drives `test_rho_ueqn_cpp`, the
+HOST reference, so it says nothing about the device TU. The module compiles standalone under nvcc but no
+build compiles it, so a signature change in any helper would break it silently. of-port steps 5 and 6 have
+not been taken for this module; the header's provenance block now says so instead of naming a gate that
+does not exist. The gate must be field by field against `cpu::rhoSimple::assembleUEqn` on a fixture with a
+NON-UNIFORM rho — otherwise the one factor this module exists for is unmeasured — with the refusals
+asserted and the kinematic-nuEff control that must fail.
 
 
 ## `flowRateInletVelocity`: three defects, and what un-neutralising the inlet exposed

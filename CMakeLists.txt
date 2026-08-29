@@ -107,6 +107,7 @@ add_library(brae_core STATIC
     src/applications/solvers/simpleFoam/createFields_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoCreateFields_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoUEqn_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/rhoUEqn.cu
     src/applications/solvers/rhoSimpleFoam/rhoEEqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoPEqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoPcEqn_cpp.cu
@@ -456,6 +457,30 @@ foreach(_sch limitedLinear limitedLinearV LUST linearUpwindV)
     add_test(NAME ueqn_cuda_scheme_${_sch}
              COMMAND ${CMAKE_COMMAND} -E env BRAE_TEST_SCHEME=${_sch}
                      $<TARGET_FILE:test_ueqn_cuda> ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+endforeach()
+
+# CUDA rhoUEqn against the _cpp reference at MATRIX granularity -- diag, upper, lower, the three
+# sources and every boundary coefficient, not a folded single number. The reference is itself gated
+# against OpenFOAM's own dump by tests/rho_ueqn_vs_openfoam.sh, so this closes OpenFOAM -> _cpp -> CUDA.
+#
+# The fixtures are the incompressible ones because no committed case ships a rho field -- the compressible
+# _cpp gates build their state by running real OpenFOAM. The gate SYNTHESIZES a non-uniform rho and
+# asserts it varies, which is the point: with a uniform rho, mu_eff is a constant multiple of nu_eff and a
+# kernel that dropped the rho weighting from one term would still agree on a rescaled matrix.
+add_executable(test_rho_ueqn_cuda tests/test_rho_ueqn_cuda.cu)
+target_include_directories(test_rho_ueqn_cuda PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_ueqn_cuda PRIVATE brae_core)
+add_test(NAME rho_ueqn_cuda
+         COMMAND test_rho_ueqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym 282 laminar)
+add_test(NAME rho_ueqn_cuda_turbulent
+         COMMAND test_rho_ueqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
+# One binary, one scheme each. The tolerances differ by scheme on purpose -- the r-ratio limiters divide
+# by a face difference that approaches zero, while linearUpwindV and LUST reach 1e-16.
+foreach(_sch upwind limitedLinear limitedLinearV LUST linearUpwindV)
+    add_test(NAME rho_ueqn_cuda_scheme_${_sch}
+             COMMAND ${CMAKE_COMMAND} -E env BRAE_TEST_SCHEME=${_sch}
+                     $<TARGET_FILE:test_rho_ueqn_cuda> ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
 endforeach()
 
 add_executable(test_ueqn_cpp tests/test_ueqn_cpp.cu)
