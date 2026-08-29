@@ -7,14 +7,14 @@
 //              (divDevRhoReff -- the COMPRESSIBLE overload, taking rho)
 //   reference: src/applications/solvers/rhoSimpleFoam/rhoUEqn_cpp.cu   (gated against OpenFOAM's own dumps)
 //   cuda:      src/applications/solvers/rhoSimpleFoam/rhoUEqn.cu
-//   tests:     NOT YET WRITTEN. tests/test_rho_ueqn_cuda.cu does not exist, this file is not in
-//              CMakeLists.txt's brae_core source list, and nothing in the tree calls assembleUEqn -- so
-//              no build compiles this module and no gate measures it. The line is kept as the name the
-//              gate must take (field by field against the _cpp reference: diag/upper/lower, source[0..2],
-//              iC[k]/bC[k], relaxedDiag and delta separately, plus the refusals, plus the discriminating
-//              control the manifest names -- assembling with the KINEMATIC nuEff must FAIL at 6.2e-01
-//              against the dynamic form's 6.1e-15). Until it exists, every claim below is asserted and
-//              measured by nothing.
+//   tests:     tests/test_rho_ueqn_cuda.cu -- field by field against the _cpp reference: diag, upper,
+//              lower, source[0..2] and iC[k]/bC[k] on every patch, never folded into one number.
+//              Registered as seven cases (laminar, turbulent, and one per div scheme). Measured on
+//              matrixDumpAsym/282 and pitzDailyTurb/1576: diag 8.700e-12 / 2.018e-12, off-diagonals
+//              1.393e-11 / 3.962e-12, and every boundary coefficient at 0.000e+00 on both.
+//              THE CONTROL IS THE ONE THE MANIFEST NAMES: injecting the KINEMATIC nuEff -- the
+//              incompressible divDevReff -- moves the diagonal 2.883e-01, and removing the rho weighting
+//              from this module turns the gate red at 2.883e-01, the number the control predicted.
 //
 // WHY THE NAME IS rhoUEqn AND NOT UEqn. brae puts every source directory on ONE include path, so a
 // `UEqn.cuh` here would resolve to src/applications/solvers/simpleFoam/UEqn.cuh, or the reverse,
