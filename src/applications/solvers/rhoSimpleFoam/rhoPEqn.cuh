@@ -8,7 +8,8 @@
 //   reference: src/applications/solvers/rhoSimpleFoam/rhoPEqn_cpp.cu  (gated against OpenFOAM's own dumps,
 //              BOTH branches -- tests/rho_peqn_vs_openfoam.sh runs OpenFOAM twice, transonic no and yes)
 //   cuda:      src/applications/solvers/rhoSimpleFoam/rhoPEqn.cu
-//   tests:     tests/test_rho_peqn_cuda.cu   (NOT YET WRITTEN -- see the note at the end of this header)
+//   tests:     tests/test_rho_peqn_cuda.cu -- registered four times (CMakeLists.txt): subsonic and
+//              transonic, each laminar and turbulent, stage by stage against the _cpp reference.
 //
 // rhoPEqn, not pEqn: simpleFoam already owns pEqn.cuh and brae puts every source directory on one include
 // path. Same reason as rhoUEqn.cuh.

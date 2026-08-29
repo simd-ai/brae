@@ -3,15 +3,21 @@
 // This is the gate PORT.md requires before any .cu is written for this solver: the whole case, run by the
 // host reference, compared against OpenFOAM's own rhoSimpleFoam on the same mesh and dictionaries.
 //
-// LAMINAR, and that is a refusal rather than a simplification. The compressible turbulence closure is a
-// separate manifest component and is not ported, so the driver REFUSES a case whose momentumTransport
-// names RAS or LES instead of running it as if it were laminar. The gate therefore runs a laminar variant
-// of the fixture -- a solver option OpenFOAM honours too -- and additionally asserts that the turbulent
-// original IS refused, so "laminar only" is a stated boundary rather than an untested claim.
+// TURBULENT, AND WITH THE FIXTURE'S OWN INLET. This block used to say the opposite -- "LAMINAR, and that
+// is a refusal", and "THE INLET IS NEUTRALISED" -- and both were true when written and are not now. The
+// driving script says so plainly (rho_simple_end_to_end_vs_openfoam.sh:5 "TURBULENT: the fixture's own
+// kEpsilon, as it ships"; :15 "THE FIXTURE'S OWN INLET ... flowRateInletVelocity, not a substitute"), and
+// the binary's turbulent branch is live below. The closure is ported and gated separately; the
+// flowRateInletVelocity defect the neutralisation existed for is RETIRED (PORT.md: rAU 4.58e-05 ->
+// 6.13e-15, momentum boundaryCoeffs 4.15e-01 -> 4.89e-16).
 //
-// THE INLET IS NEUTRALISED, as in every other rhoSimpleFoam gate: sbMatched's flowRateInletVelocity
-// disagrees with OpenFOAM by ~2.4e-01 (see PORT.md) and would dominate an end-to-end field comparison
-// that is meant to be about the solver.
+// Getting this wrong in a header is not cosmetic: it is the only whole-solver comparison against real
+// OpenFOAM, so a stale "laminar, inlet neutralised" note rules out, for the next reader, the two things
+// the run actually exercises -- the kEpsilon closure and a real inlet at |U| ~ 523 m/s -- and any residual
+// disagreement then gets attributed anywhere but there.
+//
+// What IS still asserted as a boundary: an UNPORTED RAS model is refused BY NAME. The script builds a
+// separate copy with `RASModel LaunderSharmaKE` for exactly that check (:85-88).
 //
 // WHAT IS COMPARED. Both codes start from the same fields and run the same number of iterations, so this
 // compares trajectories -- which is only meaningful because they are meant to be the SAME trajectory,

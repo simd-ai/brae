@@ -41,11 +41,19 @@
 //                A LAGGED coupling: correcting before UEqn instead is a different algorithm that still
 //                converges to something plausible.
 //
-// TURBULENCE IS REFUSED, NOT SKIPPED. The compressible turbulence closure is its own manifest component
-// and is not ported. A case whose momentumTransport names RAS or LES is refused BY NAME here rather than
-// run as if it were laminar -- which would converge to a smooth, plausible, wrong field. Laminar runs in
-// full: muEff is the laminar mu(T) and alphaEff is heThermo's CpByCpv*alpha(T), both from the transport
-// model, both recomputed from the current T each iteration.
+// TURBULENCE: TWO CLOSURES ARE PORTED, EVERY OTHER MODEL IS REFUSED BY NAME. kEpsilon and kOmegaSST run
+// in full, each with its own gate; anything else -- realizableKE, RNGkEpsilon, LaunderSharmaKE,
+// SpalartAllmaras, LES -- throws and names itself rather than running as kEpsilon or as laminar, either
+// of which converges to a smooth, plausible, wrong field.
+//
+// This paragraph used to say the closure was "not ported" and that ANY RAS case was refused. That was
+// true when written; it stopped being true when the closure landed, and a contract paragraph that
+// contradicts the code twenty lines below it is worse than none -- a caller reads it, concludes every
+// turbulent case throws, and neither supplies the closure's inputs nor treats a turbulent run as the
+// supported path it is.
+//
+// Laminar runs in full too: muEff is the laminar mu(T) and alphaEff is heThermo's CpByCpv*alpha(T), both
+// from the transport model, both recomputed from the current T each iteration.
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"

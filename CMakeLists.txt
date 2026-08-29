@@ -506,6 +506,25 @@ endforeach()
 # one. What is actually at risk is the boundary-face ORDER, the padding of the faces DeviceMesh skips,
 # which of the two masks answers which question, and whether the wall set is chosen by the BC or by the
 # patch type; each has its own check, and the two a fixture can make vacuous say so instead of passing.
+# STRUCTURAL measurements on OpenFOAM's angledDuctExplicitFixedCoeff tutorial -- the only case reachable
+# from here that can measure two things this port had correct-by-construction and gated by nothing: the
+# two boundary masks (it gives porosityWall `type slip` on U, and slip is the only patch class where
+# `assignable` and `fixesValue && !inletOutlet` disagree), and the relax -> constrain -> setValues order
+# (its fvOptions constrains k and epsilon on the porosity cellZone, whose own wall carries an
+# epsilonWallFunction, so the two constraints overlap on every cell of that patch).
+#
+# NO CONVERGENCE BOUND. The end-to-end gate on this same tutorial is deliberately unregistered because a
+# bound would have to accommodate an unexplained 9.43e-04; everything here is structural or a single
+# assembly, so none of it inherits that question.
+add_executable(test_rho_angledduct_structural tests/test_rho_angledduct_structural.cu)
+target_include_directories(test_rho_angledduct_structural PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_angledduct_structural PRIVATE brae_core)
+add_test(NAME rho_angledduct_structural
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_angledduct_structural.sh)
+set_tests_properties(rho_angledduct_structural PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77)
+
 add_executable(test_rho_createfields_cuda tests/test_rho_createfields_cuda.cu)
 target_include_directories(test_rho_createfields_cuda PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_rho_createfields_cuda PRIVATE brae_core)

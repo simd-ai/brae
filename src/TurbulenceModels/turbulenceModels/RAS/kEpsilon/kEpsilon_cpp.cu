@@ -166,7 +166,8 @@ void correct(
     const Compressible* comp,
     const cpu::fvOptions::OptionList* fvOpts,
     bool relaxEquationEps,
-    bool relaxEquationK)
+    bool relaxEquationK,
+    bool constrainBeforeWall)
 {
     const label nC = m.nCells();
     const scalar Cmu25 = std::pow(co.Cmu, 0.25);
@@ -378,18 +379,32 @@ void correct(
         // the wall first, a neighbour of a cell that is both wall-adjacent and fvOption-constrained
         // received -coeff*epsilon0 where OpenFOAM gives it -coeff*(the option's value).
         //
-        // UNMEASURED, and saying so is the point. No validation case carries an fvOption on k or epsilon
-        // -- sbMatched has no fvOptions file at all, and the three cases that do constrain momentum or
-        // temperature (simpleCar explicitPorositySource, turbineSiting actuationDiskSource, naca0012
-        // limitTemperature). So `fvOpts` is null on every fixture, this swap is a no-op on all of them,
-        // and rho_kepsilon_vs_openfoam passing across it is evidence of no harm, not of a fix. The
-        // discriminating fixture -- a wall-adjacent cell inside an fvOption cell set -- does not exist
-        // yet; until it does this order is asserted by OpenFOAM's source and by nothing that runs.
-        // "the case names a factor", not "the factor is below 1" -- see the header. Unconditional
-        // relaxation applies a dominance clamp OpenFOAM does not apply when fvSolution names nothing.
+        // MEASURED, on OpenFOAM's own angledDuctExplicitFixedCoeff tutorial, by
+        // tests/rho_angledduct_structural.sh: inverting these two lines moves epsilon by 2.146540e-01
+        // and k by 2.288909e-18. That asymmetry is itself the confirmation -- kEpsilon.C:286-288 gives
+        // the k equation no boundaryManipulate at all, so k CANNOT see this order, and it does not.
+        //
+        // The fixture is the tutorial's porosity block: fvOptions constrains k and epsilon on its 8000
+        // cells while porosityWall (built from that block's own faces) carries an epsilonWallFunction,
+        // so 1520 cells are BOTH wall-constrained and fvOption-constrained. That overlap is the only
+        // place the order can act, because setValues transfers source_[nei] -= coeff*value and then
+        // ZEROES that coeff -- so only the FIRST setValues touching a cell reaches its neighbours.
+        //
+        // An earlier version of this note said the discriminating fixture "does not exist yet". It did;
+        // it was simply not under validation/, and saying it did not exist is what kept the number at
+        // 2.1e-01 unmeasured for as long as it was.
         if (relaxEquationEps) relaxMatrix(M, epsilon, m, patches, relaxEps);
-        if (fvOpts) cpu::fvOptions::constrain(*fvOpts, M, epsilon.internal, "epsilon", m, patches);
-        setValues(M, epsilon.internal, m, patches, wallCells, epsVals);
+        if (constrainBeforeWall)
+        {
+            if (fvOpts) cpu::fvOptions::constrain(*fvOpts, M, epsilon.internal, "epsilon", m, patches);
+            setValues(M, epsilon.internal, m, patches, wallCells, epsVals);
+        }
+        else
+        {
+            // The order this reference used to have, kept ONLY so the difference can be measured.
+            setValues(M, epsilon.internal, m, patches, wallCells, epsVals);
+            if (fvOpts) cpu::fvOptions::constrain(*fvOpts, M, epsilon.internal, "epsilon", m, patches);
+        }
         if (res)
         {
             // |b - A.psi| per cell, on the SAME assembled matrix the solve is about to use, before the

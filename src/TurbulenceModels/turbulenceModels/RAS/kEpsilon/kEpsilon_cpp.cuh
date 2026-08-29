@@ -10,8 +10,11 @@
 //     keys (ofscan schema kEpsilon): Cmu 0.09, C1 1.44, C2 1.92, C3 0, sigmak 1.0, sigmaEps 1.3
 //   brae:
 //     reference: src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon_cpp.cu
-//     cuda:      src/cuda/device_kepsilon.cu (deviceKEpsilonCorrect)
-//     tests:     tests/test_kepsilon_cpp.cu
+//     cuda:      src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon.cu -- the OF-Mirror
+//                device twin of THIS reference. src/cuda/device_kepsilon.cu is the legacy fused path
+//                and is not what this lineage ports.
+//     tests:     tests/test_rho_kepsilon_cpp.cu (this reference against OpenFOAM's own dumps) and
+//                tests/test_rho_kepsilon_cuda.cu (the device twin against this reference).
 //
 // WHY THIS EXISTS AT ALL, this late. kEpsilon is the one turbulence model in this port that was wired
 // straight to CUDA without a host reference, and it is the one that turned out to be wrong: on simpleCar
@@ -176,7 +179,14 @@ void correct(
     // DEFAULTED TRUE so every existing positional caller keeps the arithmetic it was gated with; a
     // caller that knows the case names nothing passes false.
     bool relaxEquationEps = true,
-    bool relaxEquationK   = true);
+    bool relaxEquationK   = true,
+    // DIAGNOSTIC, like dropTerm above, and the only way to MEASURE the ordering rather than assert it.
+    // OpenFOAM is relax() -> fvOptions.constrain() -> boundaryManipulate() (kEpsilon.C:265-267), which is
+    // `true`. `false` is the order this reference used to have. The two differ only where a cell is BOTH
+    // wall-constrained and fvOption-constrained, because setValues transfers source_[nei] -= coeff*value
+    // and then zeroes that coeff, so only the FIRST setValues touching a cell moves anything into its
+    // neighbours -- see the note at the call site.
+    bool constrainBeforeWall = true);
 
 } // namespace kEpsilonRef
 } // namespace cpu

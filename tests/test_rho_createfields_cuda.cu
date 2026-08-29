@@ -16,8 +16,14 @@
 // SLIP, and no compressible validation case carries a slip patch on U: rhoBox is fixedValue/zeroGradient/
 // noSlip/empty, and sbMatched's inletOutlet outlet reads assignable=1, fixesValue=1, isInletOutlet=1, so
 // both rules agree there too. The section below therefore reports itself vacuous instead of passing
-// quietly, and the fail-proof is recorded here rather than implied. The discriminating fixture -- a
-// compressible case with slip on U -- does not exist yet.
+// quietly, and the fail-proof is recorded here rather than implied.
+//
+// THE DISCRIMINATING FIXTURE EXISTS AND IS NOW REGISTERED, just not under validation/. OpenFOAM's own
+// compressible/rhoSimpleFoam/angledDuctExplicitFixedCoeff gives porosityWall `type slip` on U, and slip
+// is non-assignable WITHOUT fixing a value -- measured there as assignable=0, fixesValue=0, so
+// !assignable = 1 while !(fixesValue && !IO) = 0. tests/rho_angledduct_structural.sh runs it and reports
+// the two masks differing on 1600 faces, with a mask derived from the other wrong on all 1600. That is
+// where this conflation is caught; here it still cannot be.
 //
 // Run: test_rho_createfields_cuda <caseDir> <timeDir>
 #include "primitive_mesh.cuh"
