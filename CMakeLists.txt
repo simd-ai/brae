@@ -577,6 +577,15 @@ add_test(NAME rho_ueqn_cuda_turbulent
 
 # One binary, one scheme each. The tolerances differ by scheme on purpose -- the r-ratio limiters divide
 # by a face difference that approaches zero, while linearUpwindV and LUST reach 1e-16.
+# `grad(U) cellLimited Gauss linear 1` on the 2D pitzDailyTurb, which is the ONLY registered arm that
+# makes the EMPTY-patch question visible. emptyFvPatchField is zero-sized in OpenFOAM so those faces do
+# not exist there; brae keeps them and must skip them in both the limiter's range and its face loop, and
+# in the face loop it is not harmless -- Cf - C points out of the 2D plane, so the extrapolate is
+# round-off and the ratio against maxDelta can clamp the limiter below what any real face asks for.
+add_test(NAME rho_ueqn_cuda_cell_limited
+         COMMAND ${CMAKE_COMMAND} -E env BRAE_TEST_GRADLIMIT=1.0
+                 $<TARGET_FILE:test_rho_ueqn_cuda> ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
 foreach(_sch upwind limitedLinear limitedLinearV LUST linearUpwindV)
     add_test(NAME rho_ueqn_cuda_scheme_${_sch}
              COMMAND ${CMAKE_COMMAND} -E env BRAE_TEST_SCHEME=${_sch}

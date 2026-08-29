@@ -171,6 +171,7 @@ void cellLimitGradKernel(
     const label* __restrict__ owner,
     const label* __restrict__ bndCellStart,
     const label* __restrict__ bndPerm,
+    const label* __restrict__ bndIsEmpty,
     const scalar* __restrict__ dOwnX,
     const scalar* __restrict__ dOwnY,
     const scalar* __restrict__ dOwnZ,
@@ -201,9 +202,28 @@ void cellLimitGradKernel(
         maxD = fmax(maxD,d);
         minD = fmin(minD,d);
     }
+    // EMPTY PATCHES CONTRIBUTE NOTHING, because in OpenFOAM they cannot: emptyFvPatchField is a
+    // ZERO-SIZED patch field (emptyFvPatchField.C:41), so there are no faces to evaluate. brae keeps
+    // those faces in its addressing and has to skip them explicitly, and the host reference does
+    // (cellLimitedGrad_cpp.cu:76 and :116). In the FACE loop it is not harmless: on a 2D mesh Cf - C for
+    // an empty face points out of the plane, so the extrapolate is the out-of-plane gradient -- round-off
+    // rather than physics -- and r = maxDelta/extrapolate is then a ratio of a real number to noise,
+    // which can clamp the limiter far below what any real face asks for. Measured on the host when it
+    // was fixed there: grad(U) 1.39e-02 -> 1.28e-14.
+    //
+    // LATENT ON EVERY REGISTERED FIXTURE, and saying so is the point. rho_ueqn_cuda_cell_limited is the
+    // only arm that drives the limiter on a 2D mesh, and it passes at 2e-12 WITH the skip and WITHOUT
+    // it. Both loops are inert on pitzDailyTurb for a reason worth writing down: an empty face's stored
+    // value equals its cell's, so Ubnd - uc is 0 and cannot move a range that already includes the cell
+    // itself at 0; and the mesh is axis-aligned, so dBnd is out-of-plane while the gradient is in it and
+    // dBnd . g underflows to a limiter of 1. Neither holds in general -- the host's own measurement
+    // above is what a case that breaks the second one costs -- so this brings the device into line with
+    // the host and with OpenFOAM's zero-sized empty patch rather than fixing an observed number.
     for (int j = bndCellStart[c]; j < bndCellStart[c+1]; ++j)
     {
-        const scalar d = Ubnd[bndPerm[j]] - uc;
+        const int bk = bndPerm[j];
+        if (bndIsEmpty[bk]) continue;
+        const scalar d = Ubnd[bk] - uc;
         maxD = fmax(maxD,d);
         minD = fmin(minD,d);
     }
@@ -225,6 +245,7 @@ void cellLimitGradKernel(
     for (int j = bndCellStart[c]; j < bndCellStart[c+1]; ++j)
     {
         const int bk = bndPerm[j];
+        if (bndIsEmpty[bk]) continue;   // see the note above -- here it is NOT round-off-harmless
         lim = fmin(lim, limFace(maxD, minD, dBndX[bk]*gcx + dBndY[bk]*gcy + dBndZ[bk]*gcz));
     }
     gx[c] = gcx*lim;
@@ -272,6 +293,7 @@ void cellLimitMinMaxKernel(
     const label* __restrict__ owner,
     const label* __restrict__ bndCellStart,
     const label* __restrict__ bndPerm,
+    const label* __restrict__ bndIsEmpty,
     scalar* __restrict__ maxD,
     scalar* __restrict__ minD)
 {
@@ -283,8 +305,12 @@ void cellLimitMinMaxKernel(
     { const scalar d = U[nei[f]] - uc; mx = fmax(mx,d); mn = fmin(mn,d); }
     for (int j = losortStart[c]; j < losortStart[c+1]; ++j)
     { const scalar d = U[owner[losort[j]]] - uc; mx = fmax(mx,d); mn = fmin(mn,d); }
+    // Empty patches contribute nothing -- emptyFvPatchField is zero-sized in OpenFOAM, so these faces
+    // do not exist there. Same skip as the single-kernel path, and the host reference at
+    // cellLimitedGrad_cpp.cu:76.
     for (int j = bndCellStart[c]; j < bndCellStart[c+1]; ++j)
-    { const scalar d = Ubnd[bndPerm[j]] - uc; mx = fmax(mx,d); mn = fmin(mn,d); }
+    { const int bk = bndPerm[j]; if (bndIsEmpty[bk]) continue;
+      const scalar d = Ubnd[bk] - uc; mx = fmax(mx,d); mn = fmin(mn,d); }
     maxD[c] = mx;
     minD[c] = mn;
 }
@@ -322,6 +348,7 @@ void cellLimitFactorKernel(
     const label* __restrict__ losortStart,
     const label* __restrict__ bndCellStart,
     const label* __restrict__ bndPerm,
+    const label* __restrict__ bndIsEmpty,
     const scalar* __restrict__ dOwnX, const scalar* __restrict__ dOwnY, const scalar* __restrict__ dOwnZ,
     const scalar* __restrict__ dNeiX, const scalar* __restrict__ dNeiY, const scalar* __restrict__ dNeiZ,
     const scalar* __restrict__ dBndX, const scalar* __restrict__ dBndY, const scalar* __restrict__ dBndZ,
@@ -337,8 +364,12 @@ void cellLimitFactorKernel(
         l = fmin(l, limFace(mx, mn, dOwnX[f]*gcx + dOwnY[f]*gcy + dOwnZ[f]*gcz));
     for (int j = losortStart[c]; j < losortStart[c+1]; ++j)
     { const int f = losort[j]; l = fmin(l, limFace(mx, mn, dNeiX[f]*gcx + dNeiY[f]*gcy + dNeiZ[f]*gcz)); }
+    // ...and here the skip is load-bearing rather than tidy: Cf - C on an empty face points out of the
+    // 2D plane, so this extrapolate is round-off and the ratio against maxDelta can clamp the limiter far
+    // below what any real face asks for (cellLimitedGrad_cpp.cu:111-116).
     for (int j = bndCellStart[c]; j < bndCellStart[c+1]; ++j)
-    { const int bk = bndPerm[j]; l = fmin(l, limFace(mx, mn, dBndX[bk]*gcx + dBndY[bk]*gcy + dBndZ[bk]*gcz)); }
+    { const int bk = bndPerm[j]; if (bndIsEmpty[bk]) continue;
+      l = fmin(l, limFace(mx, mn, dBndX[bk]*gcx + dBndY[bk]*gcy + dBndZ[bk]*gcz)); }
     lim[c] = l;
 }
 
@@ -393,7 +424,7 @@ void deviceCellLimitGrad(
         DeviceBuffer<scalar> maxD(nC), minD(nC), lim(nC);
         cellLimitMinMaxKernel<<<nBlocks(nC), TPB>>>(nC, U.data(), Ubnd.data(),
             dm.ownerStart.data(), dm.nei.data(), dm.losort.data(), dm.losortStart.data(), dm.owner.data(),
-            dm.bndCellStart.data(), dm.bndPerm.data(), maxD.data(), minD.data());
+            dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), maxD.data(), minD.data());
         for (int i = 0; i < nIfs; ++i)
             if (ifs[i].n > 0 && ifs[i].nbrVal)
                 ifMinMaxKernel<<<nBlocks(ifs[i].n), TPB>>>(ifs[i].n, ifs[i].ownCell, ifs[i].nbrVal,
@@ -401,7 +432,7 @@ void deviceCellLimitGrad(
         if (k < 1.0) widenKernel<<<nBlocks(nC), TPB>>>(nC, k, maxD.data(), minD.data());
         cellLimitFactorKernel<<<nBlocks(nC), TPB>>>(nC,
             dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
-            dm.bndCellStart.data(), dm.bndPerm.data(),
+            dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(),
             dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(), dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
             dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), maxD.data(), minD.data(),
             gx.data(), gy.data(), gz.data(), lim.data());
@@ -416,7 +447,7 @@ void deviceCellLimitGrad(
     }
     cellLimitGradKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, k, U.data(), Ubnd.data(),
         dm.ownerStart.data(), dm.nei.data(), dm.losort.data(), dm.losortStart.data(), dm.owner.data(),
-        dm.bndCellStart.data(), dm.bndPerm.data(),
+        dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(),
         dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(), dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
         dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), gx.data(), gy.data(), gz.data());
     cudaCheck(cudaGetLastError(), "cellLimitGrad");

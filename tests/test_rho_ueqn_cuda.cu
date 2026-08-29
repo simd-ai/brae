@@ -229,7 +229,17 @@ int main(int argc, char** argv)
               : sch == "upwind"         ? cpu::rhoSimple::DivScheme::upwind
                                         : cpu::rhoSimple::DivScheme::limitedLinear;
     mi.schemeCoeff = 1.0;
-    std::printf("  div(phi,U) scheme under test: %s\n", sch.c_str());
+    // `grad(U) cellLimited Gauss linear <k>`, when the case asks for one. This is the ONE input that
+    // makes the EMPTY-patch question visible: emptyFvPatchField is zero-sized in OpenFOAM, so those
+    // faces do not exist there, and brae has to skip them explicitly in both the min/max range and the
+    // face limit. In the face loop it is not harmless -- Cf - C for an empty face points out of the 2D
+    // plane, so the extrapolate is round-off and r = maxDelta/extrapolate can clamp the limiter far
+    // below what any real face asks for. pitzDailyTurb is 2D, so this arm is where the two paths have to
+    // agree about faces that OpenFOAM does not have.
+    const char* limEnv = std::getenv("BRAE_TEST_GRADLIMIT");
+    mi.gradULimitK = limEnv ? std::atof(limEnv) : 0.0;
+    std::printf("  div(phi,U) scheme under test: %s   grad(U) cellLimited k = %g\n",
+                sch.c_str(), (double)mi.gradULimitK);
     const FvVectorMatrix ref = cpu::rhoSimple::assembleUEqn(U, mi, m, g, fvp);
 
     // ---- the CUDA path ----------------------------------------------------------------------
@@ -287,6 +297,7 @@ int main(int argc, char** argv)
     gi.linearUpwind = true;
     gi.scheme = mi.scheme;
     gi.schemeCoeff = mi.schemeCoeff;
+    gi.gradULimitK = mi.gradULimitK;
 
     gpu::MomentumMatrix M;
     gpu::rhoSimple::assembleUEqn(M, dm, dbU, dUx, dUy, dUz, gi);
