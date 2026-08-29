@@ -909,6 +909,9 @@ int main(int argc, char** argv)
     in.muEff              = &muEffInt;
     in.muEffBnd           = &muEffBnd;
     in.relaxU             = relaxU;
+    // The case NAMES the factor whenever the equations dict has an entry for U -- which is the guard
+    // OpenFOAM uses, not `relaxU < 1`. sbMatched names `U 0.9`, so this is true here.
+    in.relaxEquationU     = (re != nullptr) && re->found("U");
     // PARSED, like the gradScheme above. sbMatched says `bounded Gauss upwind` for div(phi,U) while
     // aerofoilNACA0012 says `bounded Gauss linearUpwind limited` -- and linearUpwind puts a DEFERRED
     // GRADIENT CORRECTION in the source, which is largest where the gradient is, i.e. at the wall.

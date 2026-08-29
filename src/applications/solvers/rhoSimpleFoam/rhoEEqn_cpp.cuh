@@ -98,6 +98,9 @@ struct EnergyInput
     std::string heName;
 
     scalar    relaxHe            = 1.0;
+    // See RhoMomentumInput::relaxEquationU -- the guard is whether the case NAMES a factor, not whether
+    // the factor is below 1.
+    bool      relaxEquationHe    = false;
     // `bounded` on div(phi,he) and on div(phi,Ekp|K) INDEPENDENTLY: they are separate fvSchemes entries
     // and a case may bound one and not the other.
     bool      boundedHe          = false;

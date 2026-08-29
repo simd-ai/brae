@@ -232,6 +232,7 @@ Residuals rhoSimpleStep(
     uin.rho = &f.rho.internal;   uin.rhoBnd = &rhoBnd;
     uin.muEff = &muEff;          uin.muEffBnd = &muEffBnd;
     uin.relaxU             = in.relaxU;
+    uin.relaxEquationU     = in.relaxEquationU;
     uin.bounded            = in.boundedU;
     uin.scheme             = in.schemeU;
     uin.schemeCoeff        = in.schemeCoeffU;
@@ -261,6 +262,7 @@ Residuals rhoSimpleStep(
         ein.alphaEff = &alphaEff;   ein.alphaEffBnd = &alphaEffBnd;
         ein.heName            = f.heName;
         ein.relaxHe           = in.relaxHe;
+        ein.relaxEquationHe   = in.relaxEquationHe;
         ein.boundedHe         = in.boundedHe;
         ein.boundedKE         = in.boundedKE;
         ein.schemeHe          = in.schemeHe;
@@ -567,7 +569,8 @@ Residuals rhoSimpleStep(
         kEpsilonRef::KEResiduals kres;
         kEpsilonRef::correct(f.U, f.k, f.epsilon, f.nut, f.phi, /*nu=*/0.0, m, g, patches,
                              in.relaxEpsilon, in.relaxK, in.tolTurb, in.relTolTurb, in.maxIter,
-                             keco, &kres, in.boundedTurb, /*dropTerm=*/0, &comp, in.fvOpts);
+                             keco, &kres, in.boundedTurb, /*dropTerm=*/0, &comp, in.fvOpts,
+                             in.relaxEquationEps, in.relaxEquationK);
         res["epsilon"] = kres.epsilon;
         res["k"]       = kres.k;
         f.alphat.evaluateBoundary();

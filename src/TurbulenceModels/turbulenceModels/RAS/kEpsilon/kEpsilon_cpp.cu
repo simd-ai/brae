@@ -164,7 +164,9 @@ void correct(
     bool bounded,
     int dropTerm,
     const Compressible* comp,
-    const cpu::fvOptions::OptionList* fvOpts)
+    const cpu::fvOptions::OptionList* fvOpts,
+    bool relaxEquationEps,
+    bool relaxEquationK)
 {
     const label nC = m.nCells();
     const scalar Cmu25 = std::pow(co.Cmu, 0.25);
@@ -383,7 +385,9 @@ void correct(
         // and rho_kepsilon_vs_openfoam passing across it is evidence of no harm, not of a fix. The
         // discriminating fixture -- a wall-adjacent cell inside an fvOption cell set -- does not exist
         // yet; until it does this order is asserted by OpenFOAM's source and by nothing that runs.
-        relaxMatrix(M, epsilon, m, patches, relaxEps);
+        // "the case names a factor", not "the factor is below 1" -- see the header. Unconditional
+        // relaxation applies a dominance clamp OpenFOAM does not apply when fvSolution names nothing.
+        if (relaxEquationEps) relaxMatrix(M, epsilon, m, patches, relaxEps);
         if (fvOpts) cpu::fvOptions::constrain(*fvOpts, M, epsilon.internal, "epsilon", m, patches);
         setValues(M, epsilon.internal, m, patches, wallCells, epsVals);
         if (res)
@@ -507,7 +511,7 @@ void correct(
         }
 
         if (res && res->captureStages) captureSystem(M, patches, res->kD0, res->kSrc0);
-        relaxMatrix(M, k, m, patches, relaxK);
+        if (relaxEquationK) relaxMatrix(M, k, m, patches, relaxK);
         // fvOptions.constrain(kEqn), kEpsilon.C -- after relax(), as OpenFOAM has it.
         if (fvOpts) cpu::fvOptions::constrain(*fvOpts, M, k.internal, "k", m, patches);
         if (res && res->captureStages)

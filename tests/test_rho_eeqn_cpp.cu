@@ -229,6 +229,7 @@ int main(int argc, char** argv)
     const FoamDict* rf = fvSolution.subDict("relaxationFactors");
     const FoamDict* re = rf ? rf->subDict("equations") : nullptr;
     in.relaxHe = re ? re->scalarOr(f.heName, 1.0) : 1.0;
+    in.relaxEquationHe = (re != nullptr) && re->found(f.heName);
     std::printf("     relaxation %s = %g\n", f.heName.c_str(), (double)in.relaxHe);
 
     // ---- 0. The three inputs the boundary terms are built from, each against OpenFOAM's own. With the

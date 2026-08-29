@@ -278,7 +278,20 @@ FvScalarMatrix assembleEEqn(
     }
 
     // EEqn.relax().
-    if (in.relaxHe > 0.0 && in.relaxHe < 1.0)
+    // THE GUARD IS "THE CASE NAMES A FACTOR", NOT "THE FACTOR IS BELOW 1".
+    //
+    // OpenFOAM's fvMatrix::relax() looks the name up -- `if (mesh.relaxEquation(name, coeff)) relax(coeff)`
+    // (fvMatrix.C:1250-1263), and relaxEquation is `eqnRelaxDict_.found(name) || found("default")`
+    // (solution.C:330-334). relax(alpha) itself returns early ONLY on alpha <= 0 (fvMatrix.C:1102-1107),
+    // so a factor of exactly 1 still runs the whole body: the diagonal-dominance clamp
+    // D = max(|D|, sumOff)/alpha and the matching source term S += (D - D0)*psi.
+    //
+    // The previous guard `relaxU > 0 && relaxU < 1` therefore skipped a case that NAMES 1 -- and
+    // validation/sbMatched names `p 1` while validation/kEpsCorrect names `k 1` and `epsilon 1`, so this
+    // is live rather than theoretical. rhoPEqn_cpp and rhoPcEqn_cpp already carry the correct form as
+    // relaxPSpecified; U and he simply never got it, and the device path (rhoUEqn.cu's relaxEquationU)
+    // has had it all along -- so this brings the reference up to the twin it is the oracle for.
+    if (in.relaxEquationHe && in.relaxHe > 0.0)
     {
         relaxMatrix<scalar>(M, he, m, patches, in.relaxHe);
     }

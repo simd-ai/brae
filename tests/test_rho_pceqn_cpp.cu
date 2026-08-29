@@ -190,6 +190,7 @@ int main(int argc, char** argv)
     uin.rho = &rhoP;            uin.rhoBnd = &rhoBnd;
     uin.muEff = &muEff;         uin.muEffBnd = &muEffBnd;
     uin.relaxU = re ? re->scalarOr("U", 1.0) : 1.0;
+    uin.relaxEquationU = (re != nullptr) && re->found("U");
     uin.bounded = true;
     uin.scheme = cpu::rhoSimple::DivScheme::upwind;
     uin.correctedLaplacian = true;

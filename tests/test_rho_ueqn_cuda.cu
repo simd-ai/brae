@@ -29,12 +29,13 @@
 //
 //   * It does not claim the compressible equation is right -- that is rho_ueqn_vs_openfoam.sh's claim,
 //     against OpenFOAM's own assembled matrix. This one claims only that CUDA == _cpp.
-//   * It does not cover relaxU == 1.0. The device carries `relaxEquationU` to distinguish "the case named
-//     no relaxation factor" (OpenFOAM does not relax) from "the case named 1" (OpenFOAM DOES relax, and
-//     relax(1.0) is not the identity -- it still applies the diagonal-dominance clamp and the
-//     (D - D0)*psi source step). The host reference does NOT carry that flag yet and uses relaxU == 1.0
-//     as the sentinel for both, so on that one input the two paths deliberately disagree. Every case here
-//     runs at 0.7, where both relax. Recorded in PORT.md as an open finding against the reference.
+//   * It does not cover relaxU == 1.0, though the two paths now AGREE there. Both carry
+//     `relaxEquationU`, which distinguishes "the case named no factor" (OpenFOAM does not relax) from
+//     "the case named 1" (OpenFOAM DOES relax -- relax(1.0) still applies the diagonal-dominance clamp
+//     and the (D - D0)*psi source step; only alpha <= 0 early-returns). The reference used to use
+//     relaxU == 1.0 as the sentinel for both and has been fixed. No validation case names a factor of
+//     exactly 1 for U, so this gate runs every case at 0.7 where both relax, and the agreement at 1.0 is
+//     asserted by construction rather than measured here.
 //   * It does not cover coupled patches. buildDeviceMesh keeps cyclic/AMI/processor faces out of the LDU,
 //     and the device module REFUSES a mesh that has them (asserted below). The host does not refuse.
 //   * It does not cover DarcyForchheimer porosity. The device refuses it; the host runs it through the
@@ -218,6 +219,7 @@ int main(int argc, char** argv)
     mi.nuEff = &nuEffC;
     mi.nuEffBnd = &nuEffB;
     mi.relaxU = relaxU;
+    mi.relaxEquationU = true;   // matches gi.relaxEquationU on the device side
     mi.bounded = true;
     mi.correctedLaplacian = true;   // both halves are exercised -- see the control below
     mi.linearUpwind = true;
@@ -288,7 +290,7 @@ int main(int argc, char** argv)
     gi.rhoBndFace = &dRhoBnd;
     gi.nuEffCell = &dNuCell;
     gi.nuEffBndFace = &dNuBnd;
-    // The host has no such flag and treats relaxU == 1.0 as "do not relax"; at 0.7 both paths relax and
+    // The host now carries the same flag (RhoMomentumInput::relaxEquationU); at 0.7 both paths relax and
     // the two agree. See the header for the one input this gate therefore does not cover.
     gi.relaxEquationU = true;
     gi.relaxU = relaxU;

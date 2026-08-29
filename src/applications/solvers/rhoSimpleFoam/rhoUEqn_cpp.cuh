@@ -117,6 +117,10 @@ struct RhoMomentumInput
     const std::vector<MRF::Zone>*           mrf      = nullptr;
 
     scalar    relaxU             = 1.0;
+    // Whether fvSolution NAMES a relaxation factor for U. Not the same question as relaxU < 1:
+    // fvMatrix::relax(1.0) still applies the dominance clamp, so a case naming 1 relaxes and a case
+    // naming nothing does not. Mirrors PressureInput::relaxPSpecified.
+    bool      relaxEquationU     = false;
     bool      bounded            = false;
     bool      linearUpwind       = false;
     scalar    gradULimitK        = 0.0;

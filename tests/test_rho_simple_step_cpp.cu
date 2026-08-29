@@ -228,6 +228,12 @@ int main(int argc, char** argv)
     in.relaxRho = rfl ? rfl->scalarOr("rho", 1.0) : 1.0;
     in.relaxK       = re ? re->scalarOr("k", 1.0) : 1.0;
     in.relaxEpsilon = re ? re->scalarOr("epsilon", 1.0) : 1.0;
+    // "the case NAMES a factor", not "the factor is below 1" -- fvMatrix::relax(1.0) still applies the
+    // dominance clamp, and OpenFOAM does not relax at all when fvSolution names nothing.
+    in.relaxEquationU   = (re != nullptr) && re->found("U");
+    in.relaxEquationHe  = (re != nullptr) && re->found(f.heName);
+    in.relaxEquationK   = (re != nullptr) && re->found("k");
+    in.relaxEquationEps = (re != nullptr) && re->found("epsilon");
     in.boundedTurb  = true;   // the fixture's `div(phi,k)`/`div(phi,epsilon)` are `bounded Gauss upwind`
 
     double lastUResidual = 1.0;   // the convergence the loop actually reached; bounds below scale with it

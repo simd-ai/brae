@@ -176,6 +176,7 @@ int main(int argc, char** argv)
     mi.rho = &rhoC;                mi.rhoBnd = &rhoB;
     mi.nuEff = &nuEffC;            mi.nuEffBnd = &nuEffB;
     mi.relaxU = relaxU;
+    mi.relaxEquationU = true;   // the gate NAMES a factor, as the device side does
     mi.bounded = true;
     mi.correctedLaplacian = true;
     const FvVectorMatrix refU = cpu::rhoSimple::assembleUEqn(U, mi, m, g, fvp);

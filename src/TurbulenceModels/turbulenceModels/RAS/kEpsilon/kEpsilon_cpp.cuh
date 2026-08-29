@@ -166,7 +166,17 @@ void correct(
     // fvOptions.constrain(epsEqn)/(kEqn) -- kEpsilon.C calls it on both. A scalarFixedValueConstraint
     // naming k or epsilon forces them on its cells via setValues, which is not the same as overwriting
     // the field afterwards: setValues also removes the coupling from the neighbours' equations.
-    const cpu::fvOptions::OptionList* fvOpts = nullptr);
+    const cpu::fvOptions::OptionList* fvOpts = nullptr,
+    // Whether fvSolution NAMES a relaxation factor for epsilon / k. kEpsilon.C reaches relax() through
+    // fvMatrix::relax(), whose guard is `if (mesh.relaxEquation(name, coeff))` -- so a case naming NO
+    // factor does not relax at all, while this reference used to relax unconditionally with whatever
+    // default the caller carried (1.0), applying a dominance clamp OpenFOAM never applies. That is the
+    // opposite error to the one U and he had, from the same missing distinction.
+    //
+    // DEFAULTED TRUE so every existing positional caller keeps the arithmetic it was gated with; a
+    // caller that knows the case names nothing passes false.
+    bool relaxEquationEps = true,
+    bool relaxEquationK   = true);
 
 } // namespace kEpsilonRef
 } // namespace cpu

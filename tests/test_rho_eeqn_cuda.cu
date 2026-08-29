@@ -177,6 +177,7 @@ int main(int argc, char** argv)
     ein.alphaEff = &alphaC;         ein.alphaEffBnd = &alphaB;
     ein.heName = heName;
     ein.relaxHe = 0.5;
+    ein.relaxEquationHe = true;
     ein.boundedHe = true;
     ein.boundedKE = true;
     ein.correctedLaplacian = true;

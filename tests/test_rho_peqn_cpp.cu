@@ -241,6 +241,7 @@ int main(int argc, char** argv)
     uin.rho = &rhoP;            uin.rhoBnd = &rhoBnd;
     uin.muEff = &muEff;         uin.muEffBnd = &muEffBnd;
     uin.relaxU = re ? re->scalarOr("U", 1.0) : 1.0;
+    uin.relaxEquationU = (re != nullptr) && re->found("U");
     // PARSED from the case. This gate rebuilds the momentum matrix to get rAU and H(), and HbyA is
     // rAU*H() -- so a momentum matrix assembled under the wrong scheme propagates straight into the
     // pressure equation. Stating sbMatched's schemes here read HbyA 9.1e-04 on aerofoilNACA0012, whose

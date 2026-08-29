@@ -153,6 +153,8 @@ int main(int argc, char** argv)
     hin.maxIter = 2000;
     hin.relaxU  = req ? req->scalarOr("U", 1.0) : 1.0;
     hin.relaxHe = req ? req->scalarOr(hf.heName, 1.0) : 1.0;
+    hin.relaxEquationU  = (req != nullptr) && req->found("U");
+    hin.relaxEquationHe = (req != nullptr) && req->found(hf.heName);
     hin.relaxP  = rfl ? rfl->scalarOr("p", 1.0) : 1.0;
     hin.relaxRho = rfl ? rfl->scalarOr("rho", 1.0) : 1.0;
     hin.relaxPEqn = req ? req->scalarOr("p", 1.0) : 1.0;

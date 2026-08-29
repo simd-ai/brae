@@ -36,8 +36,8 @@
 // does not relax) from "the case named 1" (OpenFOAM DOES relax, and relax(1.0) is not the identity -- it
 // still applies the diagonal-dominance clamp and adds (D - D0)*psi to the source; only alpha <= 0
 // early-returns). relaxEquationHe carries that distinction, as relaxEquationU does for the momentum
-// equation. The host reference still uses the 1.0 sentinel, so the two deliberately disagree on that one
-// input until it is fixed there -- recorded in PORT.md.
+// equation. The host reference used the 1.0 sentinel and has been brought into line, so the two now
+// agree; no validation case names a factor of exactly 1 for he, so that agreement is by construction.
 //
 // REFUSED, not ignored -- identical to the reference: MRF (EEqn.H adds fvc::div(MRF.phi(), p) when it is
 // active) and any fvOptions type that is not ported. Refused here and NOT in the reference: a mesh with

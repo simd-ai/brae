@@ -89,6 +89,15 @@ struct StepInput
 
     // --- relaxation ---
     scalar relaxU  = 1.0;
+    // Whether fvSolution NAMES a factor for U / he. NOT the same question as `< 1`:
+    // fvMatrix::relax(1.0) still applies the dominance clamp, so a case naming 1 relaxes and a case
+    // naming nothing does not. relaxPEqnSpecified below has always carried this for p.
+    bool   relaxEquationU  = false;
+    bool   relaxEquationHe = false;
+    // ...and the same for the closure, where the old behaviour was the opposite error: it relaxed
+    // unconditionally, applying a clamp OpenFOAM does not apply when the case names nothing.
+    bool   relaxEquationK   = true;
+    bool   relaxEquationEps = true;
     scalar relaxHe = 1.0;
     scalar relaxP  = 1.0;          // relaxationFactors/FIELDS p, for p.relax() after the solve
     scalar relaxPEqn = 1.0;        // relaxationFactors/EQUATIONS p, for pEqn.relax()
