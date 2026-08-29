@@ -89,6 +89,7 @@ add_library(brae_core STATIC
     src/TurbulenceModels/turbulenceModels/RAS/kOmegaSSTLM/kOmegaSSTLM_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/realizableKE/realizableKE_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon_cpp.cu
+    src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon.cu
     src/TurbulenceModels/turbulenceModels/RAS/SpalartAllmaras/SpalartAllmaras_cpp.cu
     src/finiteVolume/cfdTools/general/fvOptions/fvOptions_cpp.cu
     src/finiteVolume/cfdTools/general/fvOptions/rotorDiskSource_cpp.cu
@@ -484,6 +485,20 @@ endforeach()
 # would be SIMPLE wearing SIMPLEC's name. The flux correction and the HbyA correction are asserted to move
 # their fields independently -- they are one change, and keeping one without the other is worse than
 # neither.
+# The CUDA kEpsilon closure against the _cpp reference, stage by stage. The closure folds a production
+# term, a wall treatment, two transport operators, a relaxation and two solves into k and epsilon, so one
+# number over the solved fields cannot say which of them moved -- eps0/G0/isWallCell are compared on their
+# own for exactly that reason. Three controls carry it: the MASS flux must not serve as divU (they differ
+# only because rho varies here, which is why rho is synthesized varying rather than uniform), nut's
+# boundary must be the PATCH value and not the owner cell's, and the production term must be load-bearing.
+# A fourth runs correct() TWICE in one process: DeviceBuffer::resize takes from a pool that does not zero,
+# and the first call is always right because the pool has nothing to hand back yet.
+add_executable(test_rho_kepsilon_cuda tests/test_rho_kepsilon_cuda.cu)
+target_include_directories(test_rho_kepsilon_cuda PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_kepsilon_cuda PRIVATE brae_core)
+add_test(NAME rho_kepsilon_cuda
+         COMMAND test_rho_kepsilon_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
 add_executable(test_rho_pceqn_cuda tests/test_rho_pceqn_cuda.cu)
 target_include_directories(test_rho_pceqn_cuda PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_rho_pceqn_cuda PRIVATE brae_core)

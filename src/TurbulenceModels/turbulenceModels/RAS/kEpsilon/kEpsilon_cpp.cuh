@@ -87,6 +87,15 @@ struct KEResiduals
     std::vector<scalar> gammaEpsFace;    // the interpolated rho*DepsilonEff the laplacian is built from
     std::vector<scalar> epsD0, epsSrc0, kD0, kSrc0;   // assembled, BEFORE relax and the wall setValues
     std::vector<scalar> epsD, epsSrc, kD, kSrc;   // D() and source + boundaryCoeffs, before each solve
+    // The WALL STAGE on its own. Without these the epsilonWallFunction treatment is only visible folded
+    // into epsSrc, where a wall defect and a relaxation defect are the same number. isWallCell is the
+    // set setValues constrains; Gwall is G AFTER the override, which is what the k equation transports
+    // while `G` above is the pre-override field OpenFOAM's own dump carries.
+    std::vector<scalar> eps0, G0, Gwall;
+    std::vector<label>  isWallCell;
+    // divPhi is the MASS-flux divergence `bounded` subtracts -- a different field from divU whenever rho
+    // is not uniform, and the control for that is worth being able to point at.
+    std::vector<scalar> divPhi;
 };
 
 // GbyNu = gradU && devTwoSymm(gradU).

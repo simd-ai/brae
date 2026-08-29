@@ -194,10 +194,11 @@ void correct(
 
     if (res && res->captureStages)
     {
-        res->gradU = gradU;
-        res->divU  = divU;
-        res->gByNu = gByNu;
-        res->G     = G;      // BEFORE the wall replacement below, which is where OpenFOAM writes it too
+        res->gradU  = gradU;
+        res->divU   = divU;
+        res->divPhi = divPhi;
+        res->gByNu  = gByNu;
+        res->G      = G;     // BEFORE the wall replacement below, which is where OpenFOAM writes it too
     }
 
     // createAveragingWeights: count the adjacent faces that carry an epsilonWallFunction PATCH FIELD.
@@ -269,6 +270,14 @@ void correct(
         epsVals.push_back(eps0[c]);
     }
     if (res) res->wallCells = static_cast<label>(wallCells.size());
+    if (res && res->captureStages)
+    {
+        res->eps0  = eps0;
+        res->G0    = G0;
+        res->Gwall = G;      // AFTER the override -- the field the k equation actually transports
+        res->isWallCell.assign(nC, 0);
+        for (label c = 0; c < nC; ++c) res->isWallCell[c] = (nw[c] != 0) ? 1 : 0;
+    }
 
     // epsilon equation
     {
