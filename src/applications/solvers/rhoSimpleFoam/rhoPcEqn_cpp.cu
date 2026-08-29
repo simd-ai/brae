@@ -1,6 +1,7 @@
 // _cpp REFERENCE implementation -- see pcEqn_cpp.cuh for the OpenFOAM provenance and the refusal contract.
 #include "rhoPcEqn_cpp.cuh"
 #include "fvm.cuh"
+#include "fvc.cuh"   // gaussGrad, for the laplacian non-orthogonal correction
 #include "fv_matrix_ops.cuh"
 #include "linearViscousStress_cpp.cuh"   // effectiveFaceViscosity: linear inside, BOUNDARY field on faces
 #include <cmath>
@@ -248,6 +249,27 @@ FvScalarMatrix assemblePcEqn(
         effectiveFaceViscosity(st.rhorAtU, rhorAtUb, m, g, patches);
 
     FvScalarMatrix M = fvm::laplacian<scalar>(gammaf, p, m, g, patches, in.correctedLaplacian);
+    // `corrected` HAS TWO HALVES AND THIS FILE ONLY HAD ONE. correctedLaplacian selects
+    // nonOrthDeltaCoeffs for the implicit coefficients; the explicit
+    // source -= V*div(gamma*magSf*(corrVec & interpolate(grad p))) is a separate term that
+    // gaussLaplacianScheme adds whenever the snGrad scheme is corrected. pEqn.H's transcription carries
+    // it and EEqn.H's does; this one did not, so on a mesh with real non-orthogonality its source was
+    // short by the whole correction while its DIAGONAL stayed exact -- which is why
+    // rho_pceqn_vs_openfoam.sh passed: sbMatched is near-orthogonal enough that the source barely
+    // notices, and every comparison of D() agreed regardless.
+    //
+    // Found by the CUDA port: test_rho_pceqn_cuda read `pcEqn source` 2.450e-01 against this reference
+    // with rAU, rAtU, rhorAtU, HbyA, phiHbyA and every matrix coefficient at 1e-16. The device had the
+    // term and the reference did not.
+    if (in.correctedLaplacian)
+    {
+        std::vector<std::vector<scalar>> pb(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi) pb[pi] = p.boundary[pi]->value();
+        const std::vector<vector> gradP = fvc::gaussGrad(p.internal, pb, m, g, patches);
+        const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
+            gammaf, p, gradP, m, g, patches, in.snGradLimitCoeff);
+        for (label c = 0; c < nC; ++c) M.source[c] -= corr[c];
+    }
     for (label c = 0; c < nC; ++c)
     {
         M.diag[c]   = -M.diag[c];

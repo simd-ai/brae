@@ -110,6 +110,7 @@ add_library(brae_core STATIC
     src/applications/solvers/rhoSimpleFoam/rhoUEqn.cu
     src/applications/solvers/rhoSimpleFoam/rhoPEqn.cu
     src/applications/solvers/rhoSimpleFoam/rhoEEqn.cu
+    src/applications/solvers/rhoSimpleFoam/rhoPcEqn.cu
     src/applications/solvers/rhoSimpleFoam/rhoEEqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoPEqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoPcEqn_cpp.cu
@@ -477,6 +478,26 @@ endforeach()
 # kinetic-energy source as Ekp = 0.5|U|^2 + p/rho when he is `e` and as K = 0.5|U|^2 when he is `h` --
 # different conservation laws, so both are registered. he, rho and alphaEff are synthesized non-uniform;
 # alphaEff varies on the boundary INDEPENDENTLY of the cells so the patch-value rule is exercised.
+# CUDA rhoPcEqn (SIMPLEC) against the _cpp reference, BOTH BRANCHES. It needs its own gate rather than
+# riding on rho_peqn_cuda: rAtU = 1/(1/rAU - H1) is compared separately from rAU with a control asserting
+# they differ, because if H1 came back zero every downstream number would still agree and the equation
+# would be SIMPLE wearing SIMPLEC's name. The flux correction and the HbyA correction are asserted to move
+# their fields independently -- they are one change, and keeping one without the other is worse than
+# neither.
+add_executable(test_rho_pceqn_cuda tests/test_rho_pceqn_cuda.cu)
+target_include_directories(test_rho_pceqn_cuda PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_pceqn_cuda PRIVATE brae_core)
+add_test(NAME rho_pceqn_cuda_subsonic
+         COMMAND test_rho_pceqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym 282 laminar)
+add_test(NAME rho_pceqn_cuda_subsonic_turbulent
+         COMMAND test_rho_pceqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+add_test(NAME rho_pceqn_cuda_transonic
+         COMMAND ${CMAKE_COMMAND} -E env BRAE_TEST_TRANSONIC=1
+                 $<TARGET_FILE:test_rho_pceqn_cuda> ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym 282 laminar)
+add_test(NAME rho_pceqn_cuda_transonic_turbulent
+         COMMAND ${CMAKE_COMMAND} -E env BRAE_TEST_TRANSONIC=1
+                 $<TARGET_FILE:test_rho_pceqn_cuda> ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
 add_executable(test_rho_eeqn_cuda tests/test_rho_eeqn_cuda.cu)
 target_include_directories(test_rho_eeqn_cuda PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_rho_eeqn_cuda PRIVATE brae_core)
