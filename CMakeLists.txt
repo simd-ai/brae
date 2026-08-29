@@ -113,6 +113,7 @@ add_library(brae_core STATIC
     src/applications/solvers/rhoSimpleFoam/rhoEEqn.cu
     src/applications/solvers/rhoSimpleFoam/rhoPcEqn.cu
     src/applications/solvers/rhoSimpleFoam/rhoSimpleFoam.cu
+    src/applications/solvers/rhoSimpleFoam/rhoCreateFields.cu
     src/applications/solvers/rhoSimpleFoam/rhoEEqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoPEqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoPcEqn_cpp.cu
@@ -500,6 +501,21 @@ endforeach()
 # EXACT at iteration 1 and 1.3e-01 wrong at iteration 2 with every per-stage gate green, so a
 # one-iteration driver test would have certified it. Laminar on purpose: the closure has its own device
 # gate, and running it here would fold two more Krylov solves into a comparison about ORDER.
+# The device projection of createFields against the host field set it projects. An upload is a copy, so
+# the field checks assert EXACT equality -- a tolerance on a memcpy admits a defect rather than measuring
+# one. What is actually at risk is the boundary-face ORDER, the padding of the faces DeviceMesh skips,
+# which of the two masks answers which question, and whether the wall set is chosen by the BC or by the
+# patch type; each has its own check, and the two a fixture can make vacuous say so instead of passing.
+add_executable(test_rho_createfields_cuda tests/test_rho_createfields_cuda.cu)
+target_include_directories(test_rho_createfields_cuda PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_createfields_cuda PRIVATE brae_core)
+# rhoBox is laminar and has neither inletOutlet nor a wall function; sbMatched has both, so between them
+# every control below is exercised rather than reported vacuous.
+add_test(NAME rho_createfields_cuda_laminar
+         COMMAND test_rho_createfields_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/rhoBox 0.orig)
+add_test(NAME rho_createfields_cuda_turbulent
+         COMMAND test_rho_createfields_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/sbMatched 0.orig)
+
 add_executable(test_rho_simple_step_cuda tests/test_rho_simple_step_cuda.cu)
 target_include_directories(test_rho_simple_step_cuda PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_rho_simple_step_cuda PRIVATE brae_core)

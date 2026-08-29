@@ -49,6 +49,7 @@
 #include "device_boundary.cuh"
 #include "rhoSimpleFoam_cpp.cuh"
 #include "rhoSimpleFoam.cuh"
+#include "rhoCreateFields.cuh"
 
 #include <cmath>
 #include <cstdio>
@@ -86,24 +87,15 @@ static void check(const char* what, bool ok)
     std::printf("     %-40s %s\n", what, ok ? "ok" : "FAIL");
 }
 
-// Flatten a per-patch host array into the boundary-face order DeviceMesh uses.
+// The flattening is rhoCreateFields.cu's, not a fourth private copy of it -- the padding convention is
+// part of the contract and drifts the moment it is duplicated.
 static std::vector<scalar> flat(const std::vector<std::vector<scalar>>& v,
                                 const std::vector<FvPatch>& fvp, int nBnd, scalar pad)
-{
-    std::vector<scalar> out;
-    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-        for (label i = 0; i < fvp[pi].size; ++i) out.push_back(v[pi][i]);
-    out.resize(nBnd, pad);
-    return out;
-}
+{ return gpu::rhoSimple::flattenBoundary(v, fvp, nBnd, pad); }
 
 static std::vector<scalar> flatBnd(const GeometricField<scalar>& f,
                                    const std::vector<FvPatch>& fvp, int nBnd, scalar pad)
-{
-    std::vector<std::vector<scalar>> v(fvp.size());
-    for (std::size_t pi = 0; pi < fvp.size(); ++pi) v[pi] = f.boundary[pi]->value();
-    return flat(v, fvp, nBnd, pad);
-}
+{ return gpu::rhoSimple::flattenFieldBoundary(f, fvp, nBnd, pad); }
 
 int main(int argc, char** argv)
 {
@@ -179,41 +171,22 @@ int main(int argc, char** argv)
     check("the case asks for 0 non-orthogonal correctors", caseNonOrth == 0);
 
     // ---- the DEVICE side ---------------------------------------------------------------------
-    const DeviceMesh dm = buildDeviceMesh(m, g, fvp);
-    DeviceVectorBoundary dbU = buildDeviceVectorBoundary(df.U, fvp, g);
-    DeviceBoundary dbP  = buildDeviceBoundary(df.p, fvp, g);
-    DeviceBoundary dbHe = buildDeviceBoundary(df.he, fvp, g);
+    // THE DEVICE PROJECTION, from the module that owns it. Every line this replaces was hand-rolled
+    // here before rhoCreateFields.cu existed -- the mesh, the four boundary objects, the field upload,
+    // the boundary flattening and the two masks. Calling it is also the integration proof: if the driver
+    // still lands where it did on a hand-rolled state, the projection is equivalent to it.
+    gpu::rhoSimple::RhoDeviceFields dev =
+        gpu::rhoSimple::createDeviceFields(df, m, g, fvp);
+    const DeviceMesh&           dm   = dev.dm;
+    DeviceVectorBoundary&       dbU  = dev.dbU;
+    DeviceBoundary&             dbP  = dev.dbP;
+    DeviceBoundary&             dbHe = dev.dbHe;
+    gpu::rhoSimple::RhoSolverFields& gf = dev.f;
 
-    gpu::rhoSimple::RhoSolverFields gf;
+    // The workspace lives ACROSS iterations, deliberately: allocating the pressure buffers fresh each
+    // step gives the persistent AMG hierarchy a different fine matrix every time, and the cached V-cycle
+    // and PCG graphs are keyed on that matrix.
     gpu::rhoSimple::RhoSolverWorkspace w;
-
-    auto uploadVec = [&](const GeometricField<vector>& f)
-    {
-        std::vector<scalar> x(nC), y(nC), z(nC);
-        for (label c = 0; c < nC; ++c) { x[c] = f.internal[c].x; y[c] = f.internal[c].y; z[c] = f.internal[c].z; }
-        gf.Ux.copyFrom(x); gf.Uy.copyFrom(y); gf.Uz.copyFrom(z);
-        std::vector<std::vector<scalar>> bx(fvp.size()), by(fvp.size()), bz(fvp.size());
-        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-        {
-            const std::vector<vector>& b = f.boundary[pi]->value();
-            bx[pi].resize(b.size()); by[pi].resize(b.size()); bz[pi].resize(b.size());
-            for (std::size_t i = 0; i < b.size(); ++i) { bx[pi][i] = b[i].x; by[pi][i] = b[i].y; bz[pi][i] = b[i].z; }
-        }
-        gf.UxBnd.copyFrom(flat(bx, fvp, dm.nBndFaces, 0.0));
-        gf.UyBnd.copyFrom(flat(by, fvp, dm.nBndFaces, 0.0));
-        gf.UzBnd.copyFrom(flat(bz, fvp, dm.nBndFaces, 0.0));
-    };
-
-    // The device state, seeded from df -- the SAME numbers the host run starts from.
-    uploadVec(df.U);
-    gf.p.copyFrom(df.p.internal);       gf.pBnd.copyFrom(flatBnd(df.p, fvp, dm.nBndFaces, 0.0));
-    gf.he.copyFrom(df.he.internal);     gf.heBnd.copyFrom(flatBnd(df.he, fvp, dm.nBndFaces, 0.0));
-    gf.T.copyFrom(df.T.internal);       gf.TBnd.copyFrom(flatBnd(df.T, fvp, dm.nBndFaces, 0.0));
-    gf.rho.copyFrom(df.rho.internal);   gf.rhoBnd.copyFrom(flatBnd(df.rho, fvp, dm.nBndFaces, 1.0));
-    gf.psi.copyFrom(df.psi);            gf.psiBnd.copyFrom(flat(df.psiBnd, fvp, dm.nBndFaces, 0.0));
-    gf.phiInt.copyFrom(df.phi.internal);
-    gf.phiBnd.copyFrom(flat(df.phi.boundary, fvp, dm.nBndFaces, 0.0));
-    gf.initialMass = df.initialMass;
 
     // THE HOOKS. Both sides get the same thermo, for the reason in the header. Each pulls the device
     // state into df, runs the reference's own function, and pushes the result back -- so what is being
@@ -242,29 +215,11 @@ int main(int argc, char** argv)
         gf.psiBnd.copyFrom(flat(df.psiBnd, fvp, dm.nBndFaces, 0.0));
     };
 
-    // The two boundary masks the pressure predictor needs. They answer DIFFERENT questions:
-    // constrainHbyA asks `assignable`, adjustPhi asks `fixesValue() && !isInletOutlet()`. slip and
-    // inletOutlet are non-assignable WITHOUT fixing a value, so conflating them is a silent error --
-    // and both halves of adjustPhi's rule matter, because mixed's fixesValue() is TRUE and inletOutlet
-    // inherits it, so testing fixesValue alone marks an inletOutlet OUTLET as fixed outflow and leaves
-    // adjustPhi nothing to balance the inflow against.
-    std::vector<label> takeU, adjustable;
-    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-    {
-        for (label i = 0; i < fvp[pi].size; ++i)
-        {
-            takeU.push_back(df.U.boundary[pi]->assignable() ? 0 : 1);
-            const bool fixed = df.U.boundary[pi]->fixesValue() && !df.U.boundary[pi]->isInletOutlet();
-            adjustable.push_back(fixed ? 0 : 1);
-        }
-    }
-    takeU.resize(dm.nBndFaces, 0);
-    adjustable.resize(dm.nBndFaces, 0);
-    DeviceBuffer<label> dTakeU(takeU), dAdjust(adjustable);
-
     gpu::rhoSimple::RhoStepInput gin;
-    gin.takeUAtBoundary = &dTakeU;
-    gin.adjustable      = &dAdjust;
+    // constrainHbyA's mask and adjustPhi's mask, from the projection. They answer DIFFERENT questions
+    // and rhoCreateFields.cu is where that distinction is made once.
+    gin.takeUAtBoundary = &dev.takeUAtBoundary;
+    gin.adjustable      = &dev.adjustable;
     gin.consistent = hin.consistent;
     gin.transonic  = hin.transonic;
     gin.isE = (hf.heName == "e");

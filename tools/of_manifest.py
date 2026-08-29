@@ -1232,7 +1232,7 @@ COMPONENTS = {
              of_file="applications/solvers/compressible/rhoSimpleFoam/createFields.H",
              classification="HOST_ONLY", status="REIMPLEMENT",
              brae_reference="src/applications/solvers/rhoSimpleFoam/rhoCreateFields_cpp.cu",
-             brae_target="src/applications/solvers/rhoSimpleFoam/createFields.cu",
+             brae_target="src/applications/solvers/rhoSimpleFoam/rhoCreateFields.cu",
              validation="tests/rho_createfields_vs_openfoam.sh -- against OpenFOAM's OWN createFields.H, obtained by running rhoSimpleFoam -postProcess with writeObjects(phi,rho); postProcess.H builds the field set without solving. On a developed 112k-cell sbMatched state: rho 6.1e-16, phi 2.1e-15, initialMass 3.9e-16, psi exact, and a restart reads both fields byte-exact. THE CONTROL is the point: interpolate(rho)*flux(U), which is pEqn.H form and brae fvc::rhoFlux, reads 3.7e-04 against the same oracle -- 11 orders worse -- so the gate discriminates the two flux forms instead of passing either. It also asserts the fixture rho is non-uniform, because a uniform rho makes the two forms algebraically identical and the shipped 0.orig is uniform.",
              note="rho is READ_IF_PRESENT and falls back to thermo.rho() -- a restart reads it, a cold "
                   "start computes it, and getting that backwards was a past defect. p is a REFERENCE into "
@@ -1304,7 +1304,7 @@ COMPONENTS = {
              of_file="applications/solvers/compressible/rhoSimpleFoam/createFieldRefs.H",
              classification="HOST_ONLY", status="REIMPLEMENT",
              brae_reference="src/applications/solvers/rhoSimpleFoam/rhoCreateFields_cpp.cu",
-             brae_target="src/applications/solvers/rhoSimpleFoam/createFields.cu",
+             brae_target="src/applications/solvers/rhoSimpleFoam/rhoCreateFields.cu",
              validation="tests/rho_createfields_vs_openfoam.sh -- psi == 1/(R T) exactly, from the same T that rho came from.",
              note="One line: psi is a const reference to thermo.psi(). It matters because pEqn uses psi "
                   "AFTER thermo.correct() has moved it."),
