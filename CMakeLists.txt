@@ -108,6 +108,8 @@ add_library(brae_core STATIC
     src/applications/solvers/rhoSimpleFoam/rhoCreateFields_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoUEqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoUEqn.cu
+    src/applications/solvers/rhoSimpleFoam/rhoPEqn.cu
+    src/applications/solvers/rhoSimpleFoam/rhoEEqn.cu
     src/applications/solvers/rhoSimpleFoam/rhoEEqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoPEqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoPcEqn_cpp.cu
@@ -467,6 +469,39 @@ endforeach()
 # _cpp gates build their state by running real OpenFOAM. The gate SYNTHESIZES a non-uniform rho and
 # asserts it varies, which is the point: with a uniform rho, mu_eff is a constant multiple of nu_eff and a
 # kernel that dropped the rho weighting from one term would still agree on a rescaled matrix.
+# CUDA rhoPEqn against the _cpp reference, stage by stage and BOTH BRANCHES. simple.transonic() selects
+# two different equations -- the transonic one adds fvm::div(phid,p) and calls pEqn.relax(), the subsonic
+# one runs adjustPhi and neither -- so both are registered. Testing one would leave the other asserted by
+# nothing. rho and psi are synthesized non-uniform for the reason the gate's header gives.
+# CUDA rhoEEqn against the _cpp reference, stage by stage and BOTH ENERGY VARIABLES. EEqn.H builds the
+# kinetic-energy source as Ekp = 0.5|U|^2 + p/rho when he is `e` and as K = 0.5|U|^2 when he is `h` --
+# different conservation laws, so both are registered. he, rho and alphaEff are synthesized non-uniform;
+# alphaEff varies on the boundary INDEPENDENTLY of the cells so the patch-value rule is exercised.
+add_executable(test_rho_eeqn_cuda tests/test_rho_eeqn_cuda.cu)
+target_include_directories(test_rho_eeqn_cuda PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_eeqn_cuda PRIVATE brae_core)
+add_test(NAME rho_eeqn_cuda_e
+         COMMAND test_rho_eeqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym 282)
+add_test(NAME rho_eeqn_cuda_e_turbulent
+         COMMAND test_rho_eeqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+add_test(NAME rho_eeqn_cuda_h
+         COMMAND ${CMAKE_COMMAND} -E env BRAE_TEST_ENERGY=h
+                 $<TARGET_FILE:test_rho_eeqn_cuda> ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
+add_executable(test_rho_peqn_cuda tests/test_rho_peqn_cuda.cu)
+target_include_directories(test_rho_peqn_cuda PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_peqn_cuda PRIVATE brae_core)
+add_test(NAME rho_peqn_cuda_subsonic
+         COMMAND test_rho_peqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym 282 laminar)
+add_test(NAME rho_peqn_cuda_subsonic_turbulent
+         COMMAND test_rho_peqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+add_test(NAME rho_peqn_cuda_transonic
+         COMMAND ${CMAKE_COMMAND} -E env BRAE_TEST_TRANSONIC=1
+                 $<TARGET_FILE:test_rho_peqn_cuda> ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym 282 laminar)
+add_test(NAME rho_peqn_cuda_transonic_turbulent
+         COMMAND ${CMAKE_COMMAND} -E env BRAE_TEST_TRANSONIC=1
+                 $<TARGET_FILE:test_rho_peqn_cuda> ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
 add_executable(test_rho_ueqn_cuda tests/test_rho_ueqn_cuda.cu)
 target_include_directories(test_rho_ueqn_cuda PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_rho_ueqn_cuda PRIVATE brae_core)
