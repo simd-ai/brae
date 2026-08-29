@@ -516,6 +516,24 @@ Residuals rhoSimpleStep(
             return res;
         }
 
+        // REFUSE rather than silently substitute. Every model that is not kOmegaSST used to fall straight
+        // through into the kEpsilon path below, and turbulence_setup.cuh has ALREADY swapped in the
+        // SELECTED model's coefficient set by the time it arrives -- realizableKE takes C2 1.9,
+        // sigmaEps 1.2, A0 4; RNGkEpsilon takes Cmu 0.0845, C1 1.42, C2 1.68, C3 -0.33 and
+        // sigmak/sigmaEps 0.71942 (turbulence_setup.cuh:261-301). kEpsilonRef::correct reads
+        // Cmu/C1/C2/C3/sigmaK/sigmaEps and NONE of the model flags, so what ran was standard-kEpsilon
+        // arithmetic driven by another model's constants: a closure that exists in no source. No gate
+        // could catch it either, because both sides of a brae-vs-brae comparison would run the same
+        // fabrication. realizableKE has its own _cpp reference in the tree and is simply not wired here.
+        if (f.rasModel != "kEpsilon")
+        {
+            throw std::runtime_error(
+                "rhoSimpleFoam_cpp: RAS model '" + f.rasModel + "' is not ported on this path -- only "
+                "kEpsilon and kOmegaSST are. Refusing rather than running kEpsilon in its place: this "
+                "model's coefficients have already been substituted into the shared struct, so the "
+                "result would be neither model.");
+        }
+
         kEpsilonRef::Compressible comp;
         comp.rho      = &f.rho.internal;
         comp.rhoBnd   = &rhoBnd;

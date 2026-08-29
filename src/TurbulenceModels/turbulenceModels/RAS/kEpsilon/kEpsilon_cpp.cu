@@ -272,16 +272,22 @@ void correct(
 
     // epsilon equation
     {
-        std::vector<scalar> nutForD = nutF;
-        if (dropTerm == 4)
-        {
-            std::fill(nutForD.begin(), nutForD.end(), 0.0);
-        }
-        const SurfaceScalarField Df =
-            effectiveDiffusivity(nutForD, {}, nutField, co.sigmaEps, nu, m, g, patches,
+        SurfaceScalarField Df =
+            effectiveDiffusivity(nutF, {}, nutField, co.sigmaEps, nu, m, g, patches,
                                  comp ? comp->rho : nullptr, comp ? comp->rhoBnd : nullptr,
                                  comp ? comp->nu  : nullptr, comp ? comp->nuBnd  : nullptr,
                                  (res && res->captureStages) ? &res->DepsilonEff : nullptr);
+        // The DIAGNOSTIC drop, applied to the assembled diffusivity rather than to the cell nut it is
+        // built from. Zeroing `nutF` alone left the term standing: effectiveDiffusivity adds the LAMINAR
+        // nu to every cell coefficient and reads the untouched nut BOUNDARY field for every patch face,
+        // so the laplacian was still fully assembled and the sweep reported that dropping diffusion
+        // barely moved the answer -- a diagnostic that could not name the term it was named after.
+        if (dropTerm == 4)
+        {
+            std::fill(Df.internal.begin(), Df.internal.end(), 0.0);
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                std::fill(Df.boundary[pi].begin(), Df.boundary[pi].end(), 0.0);
+        }
 
         // fvMatrix's constructor calls psi.boundaryFieldRef().updateCoeffs() -- that is where OpenFOAM's
         // flux-conditional boundaries (inletOutlet, and the turbulentMixingLength/Intensity inlets derived
@@ -352,10 +358,25 @@ void correct(
         }
 
         if (res && res->captureStages) captureSystem(M, patches, res->epsD0, res->epsSrc0);
+        // kEpsilon.C:265-267 -- relax(), THEN fvOptions.constrain(), THEN boundaryManipulate(). These two
+        // were the other way round here, and the difference is not the constrained cell itself: both
+        // orders leave it at the fvOption's value, because setValues writes psi and OpenFOAM's
+        // boundaryManipulate re-reads patchInternalField() after the option has written it. What differs
+        // is the NEIGHBOURS. setValues does `source_[nei] -= coeff*value` and then zeroes that coeff
+        // (fvMatrix.C:259-291), so only the FIRST setValues touching a cell transfers anything -- with
+        // the wall first, a neighbour of a cell that is both wall-adjacent and fvOption-constrained
+        // received -coeff*epsilon0 where OpenFOAM gives it -coeff*(the option's value).
+        //
+        // UNMEASURED, and saying so is the point. No validation case carries an fvOption on k or epsilon
+        // -- sbMatched has no fvOptions file at all, and the three cases that do constrain momentum or
+        // temperature (simpleCar explicitPorositySource, turbineSiting actuationDiskSource, naca0012
+        // limitTemperature). So `fvOpts` is null on every fixture, this swap is a no-op on all of them,
+        // and rho_kepsilon_vs_openfoam passing across it is evidence of no harm, not of a fix. The
+        // discriminating fixture -- a wall-adjacent cell inside an fvOption cell set -- does not exist
+        // yet; until it does this order is asserted by OpenFOAM's source and by nothing that runs.
         relaxMatrix(M, epsilon, m, patches, relaxEps);
-        setValues(M, epsilon.internal, m, patches, wallCells, epsVals);
-        // fvOptions.constrain(epsEqn), kEpsilon.C -- after relax() and the wall manipulation.
         if (fvOpts) cpu::fvOptions::constrain(*fvOpts, M, epsilon.internal, "epsilon", m, patches);
+        setValues(M, epsilon.internal, m, patches, wallCells, epsVals);
         if (res)
         {
             // |b - A.psi| per cell, on the SAME assembled matrix the solve is about to use, before the
@@ -405,16 +426,22 @@ void correct(
 
     // k equation
     {
-        std::vector<scalar> nutForD = nutF;
-        if (dropTerm == 8)
-        {
-            std::fill(nutForD.begin(), nutForD.end(), 0.0);
-        }
-        const SurfaceScalarField Df =
-            effectiveDiffusivity(nutForD, {}, nutField, co.sigmaK, nu, m, g, patches,
+        SurfaceScalarField Df =
+            effectiveDiffusivity(nutF, {}, nutField, co.sigmaK, nu, m, g, patches,
                                  comp ? comp->rho : nullptr, comp ? comp->rhoBnd : nullptr,
                                  comp ? comp->nu  : nullptr, comp ? comp->nuBnd  : nullptr,
                                  (res && res->captureStages) ? &res->DkEff : nullptr);
+        // The DIAGNOSTIC drop, applied to the assembled diffusivity rather than to the cell nut it is
+        // built from. Zeroing `nutF` alone left the term standing: effectiveDiffusivity adds the LAMINAR
+        // nu to every cell coefficient and reads the untouched nut BOUNDARY field for every patch face,
+        // so the laplacian was still fully assembled and the sweep reported that dropping diffusion
+        // barely moved the answer -- a diagnostic that could not name the term it was named after.
+        if (dropTerm == 8)
+        {
+            std::fill(Df.internal.begin(), Df.internal.end(), 0.0);
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                std::fill(Df.boundary[pi].begin(), Df.boundary[pi].end(), 0.0);
+        }
 
         // fvMatrix's constructor calls psi.boundaryFieldRef().updateCoeffs() -- that is where OpenFOAM's
         // flux-conditional boundaries (inletOutlet, and the turbulentMixingLength/Intensity inlets derived
@@ -517,16 +544,6 @@ void correct(
                     return nutkWallFunction(patches[pi], yWall[pi], k.internal, nf,
                                             co.Cmu, co.kappa, co.E);
                 }());
-
-    // EddyDiffusivity::correctNut -- alphat = rho*nut/Prt. The momentum equation never asks for it; the
-    // ENERGY equation does, through alphaEff = CpByCpv*(alpha + alphat), so it is produced here where nut
-    // has just been corrected rather than derived again by the caller from a nut that may have moved.
-    if (comp && comp->alphat)
-    {
-        comp->alphat->resize(nC);
-        for (label c = 0; c < nC; ++c)
-            (*comp->alphat)[c] = rhoAt(c) * nutF[c] / comp->Prt;
-    }
             continue;
         }
 
@@ -538,6 +555,22 @@ void correct(
             nb[i] = co.Cmu * kb[i] * kb[i] / eb[i];
         }
         nutField.boundary[pi]->setValue(nb);
+    }
+
+    // EddyDiffusivity::correctNut -- alphat = rho*nut/Prt (EddyDiffusivity.C:36-38), unconditional and
+    // whole-field, after nut's boundary values are in place. The momentum equation never asks for alphat;
+    // the ENERGY equation does, through alphaEff = CpByCpv*(alpha + alphat), so it is produced here where
+    // nut has just been corrected rather than derived again by the caller from a nut that may have moved.
+    //
+    // OUTSIDE the patch loop, and that is the whole point. This block used to sit inside the
+    // `isTurbulenceWallFunction()` branch above, ahead of its `continue`, so it ran once per wall-function
+    // patch and NOT AT ALL on a case carrying no such patch -- leaving the energy equation to run on
+    // whatever alphat was read from disk, with nothing to catch it. OpenFOAM has no patch loop here.
+    if (comp && comp->alphat)
+    {
+        comp->alphat->resize(nC);
+        for (label c = 0; c < nC; ++c)
+            (*comp->alphat)[c] = rhoAt(c) * nutF[c] / comp->Prt;
     }
 }
 
