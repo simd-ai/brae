@@ -147,6 +147,15 @@ using Residuals = std::map<std::string, scalar>;
 // consumer downstream of that point -- pEqn's psi, the next iteration's mu and alpha -- reads the result.
 // Separated out because it is a thermo operation appearing inside an energy file, and because the gate
 // needs to be able to run it on its own.
+// rho = thermo.rho(), internal and boundary, from the CURRENT p and T. WHICH rho that is depends on the
+// thermo type: for hePsiThermo it is p*psi recomputed live, for heRhoThermo it is the STORED rho_ that
+// heRhoThermo::calculate() last filled inside thermo.correct() -- from the pressure BEFORE the pressure
+// equation ran. Exported because the CUDA driver takes it as a hook and its gate must give both sides
+// the same one.
+void updateRho(
+    RhoSimpleFields&            f,
+    const std::vector<FvPatch>& patches);
+
 void thermoCorrect(
     RhoSimpleFields&            f,
     const std::vector<FvPatch>& patches);

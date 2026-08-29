@@ -106,9 +106,12 @@ void effectiveTransport(
 }
 
 
-namespace {
-
 // rho = thermo.rho(), internal and boundary, from the CURRENT p and T.
+//
+// EXPORTED rather than file-local because the CUDA driver takes it as a hook -- `rho = thermo.rho()` is a
+// thermo operation and the device driver must not learn to be a thermodynamic model -- and the driver's
+// gate has to hand the SAME function to both sides, or it would be comparing two thermos as well as two
+// drivers.
 void updateRho(
     RhoSimpleFields&            f,
     const std::vector<FvPatch>& patches)
@@ -148,6 +151,8 @@ void updateRho(
         f.rho.boundary[pi]->setStoredValues(std::move(rb));
     }
 }
+
+namespace {
 
 // GeometricField::relax(alpha): x = xOld + alpha*(x - xOld).
 void relaxField(

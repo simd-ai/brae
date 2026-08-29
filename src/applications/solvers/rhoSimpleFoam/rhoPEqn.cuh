@@ -181,9 +181,17 @@ void assemblePEqn(
     const DeviceBuffer<scalar>& p,
     const RhoPressureInput&     in);
 
-// Stage 7 -- phi = phiHbyA - pEqn.flux() -- and stage 8 -- U -= rAU*grad(p) -- are gpu::correctFlux and
-// gpu::correctVelocity (pEqn.cuh), unchanged: both operate on the assembled matrix and the solved p, and
-// neither carries a rho weighting of its own. They are not redeclared here.
+// Stage 8 -- U = HbyA - rAU*grad(p) -- is gpu::correctVelocity (pEqn.cuh), unchanged: it operates on the
+// solved p and carries no rho weighting of its own.
+//
+// STAGE 7 IS NOT. This note used to say gpu::correctFlux was reusable here too. It is not, on two counts.
+// The sign: assemblePEqn above NEGATES the entire assembled matrix -- diag, off-diagonals, source, both
+// boundary coefficient arrays and the face-flux correction -- because rhoSimpleFoam writes its pressure
+// equation as `fvc::div(phiHbyA) - fvm::laplacian(...) == 0` where the incompressible solver writes
+// `fvm::laplacian(...) == fvc::div(phiHbyA)`. So the flux ADDS here and SUBTRACTS there, and the host
+// reference says so at rhoSimpleFoam_cpp.cu's flux block. The type: gpu::correctFlux takes the
+// incompressible PressureStages, not RhoPressureStages. rhoSimpleFoam.cu carries its own
+// correctFluxCompressible for both reasons.
 
 } // namespace rhoSimple
 } // namespace gpu

@@ -112,6 +112,7 @@ add_library(brae_core STATIC
     src/applications/solvers/rhoSimpleFoam/rhoPEqn.cu
     src/applications/solvers/rhoSimpleFoam/rhoEEqn.cu
     src/applications/solvers/rhoSimpleFoam/rhoPcEqn.cu
+    src/applications/solvers/rhoSimpleFoam/rhoSimpleFoam.cu
     src/applications/solvers/rhoSimpleFoam/rhoEEqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoPEqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoPcEqn_cpp.cu
@@ -493,6 +494,18 @@ endforeach()
 # boundary must be the PATCH value and not the owner cell's, and the production term must be load-bearing.
 # A fourth runs correct() TWICE in one process: DeviceBuffer::resize takes from a pool that does not zero,
 # and the first call is always right because the pool has nothing to hand back yet.
+# The CUDA rhoSimpleFoam DRIVER against the _cpp driver, over MULTIPLE ITERATIONS -- which is the whole
+# point. Every component it composes already has a per-stage gate at 1e-12 or better; what those cannot
+# see is what the driver feeds them on the SECOND pass. The incompressible twin's AMG-cache defect was
+# EXACT at iteration 1 and 1.3e-01 wrong at iteration 2 with every per-stage gate green, so a
+# one-iteration driver test would have certified it. Laminar on purpose: the closure has its own device
+# gate, and running it here would fold two more Krylov solves into a comparison about ORDER.
+add_executable(test_rho_simple_step_cuda tests/test_rho_simple_step_cuda.cu)
+target_include_directories(test_rho_simple_step_cuda PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_simple_step_cuda PRIVATE brae_core)
+add_test(NAME rho_simple_step_cuda
+         COMMAND test_rho_simple_step_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/rhoBox 0.orig 8)
+
 add_executable(test_rho_kepsilon_cuda tests/test_rho_kepsilon_cuda.cu)
 target_include_directories(test_rho_kepsilon_cuda PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_rho_kepsilon_cuda PRIVATE brae_core)
