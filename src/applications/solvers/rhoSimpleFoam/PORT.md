@@ -1269,8 +1269,15 @@ not converge:
 `h` recovers to 1.6e-05 and jumps straight back to 0.9998, and **p's initial residual never leaves
 ~1.0** -- the pressure equation is not converging at all. So these two boundary conditions were
 necessary and are not sufficient: the pressure-velocity coupling on a pressure-driven inlet has at least
-one further gap in this lineage. A second thread worth pulling: rhoTP declares `rhoMin 0.1; rhoMax 10;`
-and rho still reached +-1e300, so those bounds are not reaching the solver either.
+one further gap in this lineage.
+
+CORRECTION to an earlier draft of this section, which said rhoTP's `rhoMin 0.1; rhoMax 10;` were bounds
+"not reaching the solver". They are not density bounds at all. OpenFOAM's rhoSimpleFoam never clamps
+rho -- `pEqn.H:105-109` is `rho = thermo.rho();` then `rho.relax();` and nothing else -- and
+`rhoMin`/`rhoMax` are read by `pressureControl` purely as a BACKWARD-COMPATIBLE way to infer pMin/pMax
+(`pressureControl.C:119-121`, which even warns about it). brae mirrors that exactly
+(`rhoCreateFields_cpp.cu:153-167` and `:188-201`). rho reaching +-1e300 is a SYMPTOM of the divergence,
+not evidence of an unapplied bound.
 
 rhoTP is therefore NOT registered as a gate -- it would fail. It is recorded here as the fixture that
 will gate this work once the remaining gap is closed, and as the reason to distrust any claim that this
@@ -1279,3 +1286,47 @@ driver handles a pressure-driven inlet.
 Regression across both lineages after the change: 9/9, including `tp_vs_openfoam` on the legacy path.
 Neither sbMatched nor squareBend carries `inletOutlet` on p, and `updateFromPatchVelocity` is a no-op on
 every patch type except these two, so the blast radius is nil by construction as well as by measurement.
+
+## The case's closure coefficients and Prt never reached the solve
+
+`StepInput` carried its own `KEpsilonCoeffs keCoeffs{}` and `scalar Prt = 1.0`, and **nothing in the tree
+ever assigned either**. Meanwhile `createFields` parsed the case's `kEpsilonCoeffs` into a LOCAL, used it
+for the construction-time `correctNut`, and dropped it.
+
+So a case naming `kEpsilonCoeffs { Cmu 0.1; }` got 0.1 for the initial nut and 0.09 for every iteration
+after it, and one naming `Prt 0.85` got 0.85 for the initial alphat and 1.0 for the whole run.
+**Initialisation and the loop ran different constants** -- which is worse than either being wrong
+consistently, because the first iteration then disagrees with the second for a reason no residual
+explains.
+
+And `createFields` read only `Cmu`. OpenFOAM reads SIX (`kEpsilon.C:199-204`: `Cmu`, `C1`, `C2`, `C3`,
+`sigmak`, `sigmaEps`), each `readIfPresent` on the model's coeffDict, so the other five were the model
+defaults whatever the case asked for -- silently.
+
+### The fix
+
+All six are read, and `keCoeffs` and `Prt` are carried on `RhoSimpleFields` so the SOLVE sources them
+from the case. That deletes the second copy rather than synchronising it: an input struct with a
+plausible default is exactly the shape that invites this, since it compiles, runs, and produces a
+believable answer whether or not anyone assigns it.
+
+They are set where the turbulence dict is parsed and NOT inside the `validate()` guard, which also
+requires k and epsilon to be sized -- a case failing that guard would otherwise have carried the model
+defaults into the loop with nothing to say so.
+
+### Why no fixture could see it, and what the control does instead
+
+No compressible fixture in the tree declares `kEpsilonCoeffs` or `Prt`. That is precisely why this
+survived: every gate compared two runs that both used the defaults, so both sides of every comparison
+were wrong in the same way and agreed perfectly.
+
+A fixture comparison therefore cannot be the control. Instead the control perturbs the FIELD SET the
+solve now reads from and requires the answer to move -- doubling `Cmu` must move `nut` (it drives
+`nut = Cmu*k^2/eps` directly), and doubling `Prt` must move `alphat` (`alphat = rho*nut/Prt`). Separate
+knobs on separate fields, so the measurement says which one is plumbed.
+
+Measured on squareBend: **nut 1.7162e-01, alphat 4.1908e-01**. The arm also asserts the fixture declares
+no `kEpsilonCoeffs`, so the control cannot quietly become a different test than the one described.
+
+FAIL-PROOF, with the loop reverted to `in.keCoeffs` / `in.Prt`: both deltas collapse to zero and the two
+checks fail, because mutating the field set then changes nothing the solve reads.

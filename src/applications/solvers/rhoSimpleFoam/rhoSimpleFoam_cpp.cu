@@ -586,13 +586,22 @@ Residuals rhoSimpleStep(
                 "reads one when the turbulence model is constructed, and the energy equation's alphaEff "
                 "= CpByCpv*(alpha + alphat) needs it. Refusing rather than running with alphat = 0.");
         comp.alphat   = &f.alphat.internal;
-        comp.Prt      = in.Prt;
+        // THE CASE'S Prt, from the field set, not StepInput's. StepInput::Prt defaults to 1.0 and no
+        // caller in the tree ever assigned it, so alphat = rho*nut/Prt ran at 1.0 whatever the case
+        // asked for -- while createFields had already used the case's own value for the CONSTRUCTION
+        // alphat. Initialisation and the loop disagreed. EddyDiffusivity.C:36 reads it from the model's
+        // coeffDict with default 1.0, which is what readThermoCoeffs parsed into f.thermo.Prt.
+        comp.Prt      = f.Prt;
 
         // The case's laplacianScheme governs the turbulence diffusion terms too -- OF resolves
         // laplacian(DkEff,k) and laplacian(DepsilonEff,epsilon) against the same laplacianSchemes the
         // momentum, energy and pressure equations use, and every rhoSimpleFoam tutorial sets
         // `default Gauss linear corrected`.
-        KEpsilonCoeffs keco     = in.keCoeffs;
+        // THE CASE'S coefficients, same reason. StepInput::keCoeffs is a default-constructed
+        // KEpsilonCoeffs that nothing assigned, so a case naming `kEpsilonCoeffs { Cmu 0.1; C2 1.8; }`
+        // solved with 0.09 and 1.92. OpenFOAM reads six of them (kEpsilon.C:199-204) and createFields
+        // now reads all six.
+        KEpsilonCoeffs keco     = f.keCoeffs;
         keco.correctedLaplacian = in.correctedLaplacian;
         keco.snGradLimitCoeff   = in.snGradLimitCoeff;
 

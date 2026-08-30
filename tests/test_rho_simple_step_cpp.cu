@@ -702,6 +702,45 @@ int main(int argc, char** argv)
         std::printf("     %-34s %s\n", "unported-model fixture not supplied", "SKIP");
     }
 
+    // ---- CONTROL: the CASE'S closure coefficients and Prt reach the SOLVE ----------------------
+    // StepInput carried its own `KEpsilonCoeffs keCoeffs{}` and `scalar Prt = 1.0`, and no caller in the
+    // tree ever assigned either, so a case naming `kEpsilonCoeffs { Cmu 0.1; }` or `Prt 0.85` solved with
+    // 0.09 and 1.0. createFields had ALREADY read the case's values and used them for the
+    // construction-time correctNut, so initialisation and the loop ran different constants -- worse than
+    // either being wrong consistently. No compressible fixture declares either entry, which is exactly
+    // why it survived: every gate compared two runs that both used the defaults.
+    //
+    // The control cannot be a fixture comparison for that same reason, so it perturbs the FIELD SET the
+    // solve now reads from and requires the answer to move. If the loop still took StepInput's copy,
+    // mutating f.keCoeffs and f.Prt would change nothing and this fails.
+    if (f.turbulent && !f.k.internal.empty())
+    {
+        cpu::rhoSimple::RhoSimpleFields a =
+            cpu::rhoSimple::createFields(caseDir + "/" + startT, caseDir, simpleDict, &fvSolution,
+                                         m, g, patches);
+        cpu::rhoSimple::RhoSimpleFields b =
+            cpu::rhoSimple::createFields(caseDir + "/" + startT, caseDir, simpleDict, &fvSolution,
+                                         m, g, patches);
+        check("the fixture declares NO kEpsilonCoeffs (else this control is not the one described)",
+              std::fabs((double)a.keCoeffs.Cmu - 0.09) < 1e-12);
+
+        // Cmu drives nut = Cmu*k^2/eps directly, and Prt drives alphat = rho*nut/Prt, so each moves a
+        // DIFFERENT field: perturbing them separately says which one was plumbed.
+        b.keCoeffs.Cmu = a.keCoeffs.Cmu * 2.0;
+        b.Prt          = a.Prt * 2.0;
+
+        cpu::rhoSimple::StepInput sin2 = in;
+        (void)cpu::rhoSimple::rhoSimpleStep(a, sin2, m, g, patches);
+        (void)cpu::rhoSimple::rhoSimpleStep(b, sin2, m, g, patches);
+
+        const double dNut    = relL2(b.nut.internal,    a.nut.internal);
+        const double dAlphat = relL2(b.alphat.internal, a.alphat.internal);
+        std::printf("     %-34s nut %.4e   alphat %.4e\n",
+                    "control: case coeffs reach the solve", dNut, dAlphat);
+        check("Cmu from the CASE reaches the closure (control)", dNut > 1e-6);
+        check("Prt from the CASE reaches alphat (control)", dAlphat > 1e-6);
+    }
+
     if (failures == 0) std::printf("PASS\n");
     else               std::printf("FAIL (%d)\n", failures);
     return failures == 0 ? 0 : 1;

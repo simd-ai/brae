@@ -59,6 +59,7 @@
 #include "foam_dict.cuh"
 #include "thermo_types.cuh"
 #include "fvc.cuh"
+#include "kepsilon_coeffs.cuh"   // KEpsilonCoeffs: the case's own closure constants, carried on the field set
 #include <string>
 #include <vector>
 
@@ -144,6 +145,23 @@ struct RhoSimpleFields
     // and wall heat flux (gpuRhoSimpleFoam.cu:437-452). findPatchEntry does OpenFOAM's resolution.
     std::vector<char>   alphatWallFn;   // per patch, 1 = carries an alphat wall function
     std::vector<scalar> alphatPrt;      // per patch, that patch's own Prt (0.85 where unset)
+
+    // THE CASE'S OWN closure coefficients and turbulent Prandtl number, read where the turbulence dict
+    // is read and carried on the field set so the SOLVE uses them.
+    //
+    // They used to live in a local inside createFields that was used for the construction-time
+    // correctNut and then discarded, while StepInput carried its own `KEpsilonCoeffs keCoeffs{}` and
+    // `scalar Prt = 1.0` that NOTHING ever assigned. So a case naming `kEpsilonCoeffs { Cmu 0.1; }` got
+    // 0.1 for the initial nut and 0.09 for every iteration after it, and `Prt 0.85` reached the initial
+    // alphat and never the loop's. Initialisation and the loop disagreed -- which is worse than either
+    // being wrong consistently, and is the shape of defect an input struct with a plausible default
+    // invites. Sourcing both from the CASE removes the second copy that could drift.
+    //
+    // OpenFOAM reads SIX coefficients here (kEpsilon.C:199-204: Cmu, C1, C2, C3, sigmak, sigmaEps);
+    // createFields read only Cmu, so the other five were the model's defaults whatever the case said.
+    KEpsilonCoeffs keCoeffs{};
+    scalar         Prt = 1.0;           // EddyDiffusivity's, default 1.0 (EddyDiffusivity.C:36) -- and
+                                        // NOT alphatWallFunction's, whose default is 0.85. See alphatPrt.
     // kOmegaSST transports omega where kEpsilon transports epsilon. Which one is populated follows
     // rasModel, and the driver branches on the same name rather than on which field happens to exist.
     GeometricField<scalar> omega;

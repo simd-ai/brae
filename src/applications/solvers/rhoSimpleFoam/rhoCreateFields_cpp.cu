@@ -466,10 +466,25 @@ RhoSimpleFields createFields(
             const FoamDict* ras = mt2.subDict("RAS");
             f.turbulent = !ras || ras->wordOr("turbulence", "on") != "off";
             f.rasModel  = ras ? ras->wordOr("RASModel", "") : "";
+            // ALL SIX, as OpenFOAM reads them (kEpsilon.C:199-204 readIfPresent on Cmu, C1, C2, C3,
+            // sigmak, sigmaEps). Only Cmu was read here, so a case naming any of the other five got the
+            // model default and no warning. OF spells the diffusivity denominators `sigmak`/`sigmaEps`;
+            // brae's struct calls the first sigmaK, and the DICT KEY is OpenFOAM's.
             if (const FoamDict* kec = ras ? ras->subDict("kEpsilonCoeffs") : nullptr)
             {
-                keCase.Cmu = kec->scalarOr("Cmu", keCase.Cmu);
+                keCase.Cmu      = kec->scalarOr("Cmu",      keCase.Cmu);
+                keCase.C1       = kec->scalarOr("C1",       keCase.C1);
+                keCase.C2       = kec->scalarOr("C2",       keCase.C2);
+                keCase.C3       = kec->scalarOr("C3",       keCase.C3);
+                keCase.sigmaK   = kec->scalarOr("sigmak",   keCase.sigmaK);
+                keCase.sigmaEps = kec->scalarOr("sigmaEps", keCase.sigmaEps);
             }
+            // Onto the FIELD SET, here and unconditionally, because the SOLVE reads them every
+            // iteration and not just the construction-time correctNut below. Set outside the
+            // `validate()` guard on purpose: that guard also requires k and epsilon to be sized, and a
+            // case that failed it would have carried the model defaults into the loop silently.
+            f.keCoeffs = keCase;
+            f.Prt      = f.thermo.Prt;
             if (f.turbulent)
             {
                 if (f.rasModel != "kEpsilon" && f.rasModel != "kOmegaSST")
