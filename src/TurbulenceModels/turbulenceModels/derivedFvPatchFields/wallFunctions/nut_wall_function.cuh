@@ -127,7 +127,8 @@ BRAE_HD inline scalar blendedNutValue(scalar magUp, scalar magGradU, scalar y, s
 // It used to atomicAdd straight into G0[c]. It returns instead, so the caller -- which now owns a whole cell
 // and iterates that cell's wall faces in a fixed order -- accumulates in a register and writes once. Same
 // arithmetic, no atomics, and the result no longer depends on face scheduling order.
-// nutWall: 0 = nutkWallFunction (k-based), 1 = nutUSpalding, 2 = nutUBlended (velocity-based) -- MUST match the
+// nutWall: 0 = nutkWallFunction (k-based), 1 = nutUSpalding, 2 = nutUBlended (velocity-based),
+// 3 = nutUWallFunction, 4 = nutLowRe (exactly zero) -- MUST match the
 // momentum wall-shear choice (ctl.nutWall) so the near-wall production uses the same nutw OpenFOAM does.
 __device__ inline scalar wallProductionG0(
     int c,
@@ -154,7 +155,9 @@ __device__ inline scalar wallProductionG0(
     const scalar dux = (wux[wf]-Ux[c])*dc, duy = (wuy[wf]-Uy[c])*dc, duz = (wuz[wf]-Uz[c])*dc;
     const scalar magG = sqrt(dux*dux + duy*duy + duz*duz);   // |snGrad U| = magGradU
     scalar nutw;
-    if (nutWall == 0)                                        // k-based: nutk (smooth) or atmNutk (rough, z0>0)
+    if (nutWall == 4)                                        // nutLowReWallFunction: calcNut() is Zero,
+        nutw = scalar(0.0);                                  // unconditionally (OF .C:38-42)
+    else if (nutWall == 0)                                   // k-based: nutk (smooth) or atmNutk (rough, z0>0)
         nutw = kBasedWallNut(yPlusWall(Cmu25, y, kc, nu), y, atmZ0, atmBoundNut, nu, yplLam, kappa, E);
     else if (nutWall == 3)                                   // nutUWallFunction (log-law yPlus, stepwise)
     {

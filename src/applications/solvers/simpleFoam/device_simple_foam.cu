@@ -1171,10 +1171,29 @@ void amgFineCoeffKernel(
                                          gradUs, nC_, Uk_[0], Uk_[1], Uk_[2],
                                          nutCalcMask_, ctl_.ksstCoeffs, dnut_, nutBnd);
                 }
+                // nutLowReWallFunction: calcNut() is Zero UNCONDITIONALLY
+                // (nutLowReWallFunctionFvPatchScalarField.C:38-42 is the whole function). It differs from
+                // the k-based branch ONLY in the wall value, so the branch above runs in full -- the
+                // 'calculated' faces, the SST expression, all of it -- and the WALL faces alone are then
+                // zeroed. Writing zeros over the entire boundary array instead cost bump2D:kOmegaSST
+                // U 1.781e-03 against a 1.5e-03 bound and nut 2.444e-01 against 2.2e-01, because it
+                // destroyed the calculated inlet/outlet values this branch had just computed.
+                if (ctl_.nutWall == NutWall::LowRe && bndIsWall_.size() == nutBnd.size())
+                {
+                    DeviceBuffer<scalar> keep;
+                    deviceCopy(keep, nutBnd);
+                    cudaCheck(cudaMemsetAsync(nutBnd.data(), 0,
+                                              nutBnd.size() * sizeof(scalar), cudaStreamPerThread),
+                              "nutLowRe wall nut");
+                    // writes `keep` where the mask is 0, i.e. every NON-wall face keeps what the branch
+                    // above computed; wall faces stay at the zero OpenFOAM gives them.
+                    deviceSelectFixedFlux(bndIsWall_, keep, nutBnd);
+                }
                 // ...then pin the faces whose nut BC fixes a value to that value. Last, so it overrides
                 // whatever the wall/calculated evaluation left there.
                 if (hasNutFixed_ && nutBndFile_.size() == nutBnd.size())
                     deviceSelectFixedFlux(nutFixedMask_, nutBndFile_, nutBnd);
+                deviceCopy(dnutBndWall_, nutBnd);   // materialised: gpuSimpleFoam reads it for wallForces
                 addWallNutToMuEff(nutBnd, nuEffBnd);
             }
         }

@@ -17,7 +17,13 @@ namespace brae {
 // NOT from the turbulence model. nutk = k-based stepwise log law (nutkWallFunction); Spalding =
 // velocity-based Spalding blend (nutUSpaldingWallFunction); Blended = velocity-based binomial n=4
 // blend (nutUBlendedWallFunction). All three are honoured on any RAS model, exactly as OF does.
-enum class NutWall { Nutk, Spalding, Blended, NutU };   // NutU = nutUWallFunction (STEPWISE blender)
+enum class NutWall { Nutk, Spalding, Blended, NutU, LowRe };   // NutU = nutUWallFunction (STEPWISE
+// blender); LowRe = nutLowReWallFunction, whose calcNut() returns Zero UNCONDITIONALLY
+// (nutLowReWallFunctionFvPatchScalarField.C:38-42 is the whole function). It used to be mapped to
+// Nutk with a warning on stderr, on the argument that the two are identical on a resolved mesh --
+// which is false as stated, because nutk s yPlus is the K-BASED Cmu^0.25*y*sqrt(k)/nu, not
+// u_tau*y/nu, so a mesh resolved in friction units can still take nutk s log branch where OpenFOAM
+// returns exactly 0. A warning is not a refusal and a substitution is not a port.
 
 struct DeviceSimpleControls
 {

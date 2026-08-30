@@ -383,15 +383,29 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
                     printf("  nut wall function: atmNutkWallFunction (rough, z0=%g, boundNut=%s) on %s per the BC\n",
                            (double)ctl.atmZ0, ctl.atmBoundNut ? "true" : "false", ctl.sst ? "kOmegaSST" : "kEpsilon");
                 }
-                else if (pb.type == "nutLowReWallFunction")
-                    fprintf(stderr, "brae WARNING: nut boundary '%s' uses nutLowReWallFunction; brae applies "
-                        "nutkWallFunction (log law). Identical only where y+<yPlusLam (resolved mesh).\n", pb.name.c_str());
+                // nutLowReWallFunction: OF's calcNut() returns Zero UNCONDITIONALLY
+                // (nutLowReWallFunctionFvPatchScalarField.C:38-42 is the entire function). This used to
+                // warn on stderr and fall through to nutk, justified as identical on a resolved mesh --
+                // and that justification does not hold: nutk's yPlus is the K-BASED
+                // Cmu^0.25*y*sqrt(k)/nu, not u_tau*y/nu, so a mesh resolved in friction units can carry
+                // k-based y+ above yPlusLam and take the log branch where OpenFOAM returns 0. It is now
+                // selected rather than substituted; writing zero is exact and cheaper than the log law.
+                else if (pb.type == "nutLowReWallFunction") { ctl.nutWall = NutWall::LowRe; }
             }
             if (!ctl.sa && ctl.nutWall != NutWall::Nutk)
-                printf("  nut wall function: %s (velocity-based, honoured on %s per the BC)\n",
-                       ctl.nutWall == NutWall::Spalding ? "nutUSpaldingWallFunction"
-                       : ctl.nutWall == NutWall::NutU ? "nutUWallFunction" : "nutUBlendedWallFunction",
-                       ctl.sst ? "kOmegaSST" : "kEpsilon");
+            {
+                // LowRe is NOT velocity-based, so it cannot ride the ternary below -- labelling it
+                // `nutUBlendedWallFunction (velocity-based)` would misreport the one case this branch
+                // was just taught to handle.
+                if (ctl.nutWall == NutWall::LowRe)
+                    printf("  nut wall function: nutLowReWallFunction (nut = 0 at the wall, honoured on "
+                           "%s per the BC)\n", ctl.sst ? "kOmegaSST" : "kEpsilon");
+                else
+                    printf("  nut wall function: %s (velocity-based, honoured on %s per the BC)\n",
+                           ctl.nutWall == NutWall::Spalding ? "nutUSpaldingWallFunction"
+                           : ctl.nutWall == NutWall::NutU ? "nutUWallFunction" : "nutUBlendedWallFunction",
+                           ctl.sst ? "kOmegaSST" : "kEpsilon");
+            }
         };
         GeometricField<scalar> k, eps, nut, ReThetat, gammaInt;   // ReThetat/gammaInt: kOmegaSSTLM transition
         if (ctl.les)   // pure LES Smagorinsky: ONLY nut (algebraic sub-grid viscosity); no k/epsilon/omega/nuTilda transport.
