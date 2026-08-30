@@ -50,7 +50,9 @@
 #include "rhoSimpleFoam_cpp.cuh"
 #include "rhoSimpleFoam.cuh"
 #include "rhoCreateFields.cuh"
+#include "rhoThermoDevice.cuh"
 #include "thermo_model.cuh"
+#include "equation_of_state.cuh"   // perfectGasPsi -- the oracle for the device thermo control
 #include "device_fvoptions.cuh"   // DevicePorosity   // hConstTToHe -- the reference's OWN T->he conversion
 
 #include <algorithm>
@@ -109,11 +111,14 @@ int main(int argc, char** argv)
     }
     const std::string caseDir = argv[1], startT = argv[2];
     int  iters       = 8;
-    bool boundaryArm = false;
+    bool boundaryArm  = false;
+    bool deviceThermo = false;
     for (int a = 3; a < argc; ++a)
     {
-        if (std::string(argv[a]) == "--boundary") boundaryArm = true;
-        else                                      iters = std::atoi(argv[a]);
+        const std::string arg = argv[a];
+        if      (arg == "--boundary")      boundaryArm  = true;
+        else if (arg == "--device-thermo") deviceThermo = true;
+        else                               iters = std::atoi(argv[a]);
     }
 
     PrimitiveMesh m;
@@ -157,7 +162,7 @@ int main(int argc, char** argv)
     if (boundaryArm && iters == 8) iters = 1;
     std::printf("rhoSimpleFoam DRIVER: CUDA vs _cpp  (%d cells, %d iterations, %s%s)\n",
                 (int)nC, iters, hf.turbulent ? hf.rasModel.c_str() : "laminar",
-                boundaryArm ? ", BOUNDARY arm" : "");
+                boundaryArm ? ", BOUNDARY arm" : (deviceThermo ? ", DEVICE thermo" : ""));
     if (!boundaryArm) check("the fixture is LAMINAR (see the header)", !hf.turbulent);
     {
         label coupled = 0;
@@ -349,21 +354,43 @@ int main(int argc, char** argv)
     gin.boundedU = gin.boundedHe = gin.boundedKE = true;
     gin.correctedLaplacian = false;
     gin.nNonOrthogonalCorrectors = 0;   // see the note above: the reference solves p once
-    gin.thermoCorrect = [&]()
+    if (deviceThermo)
     {
-        pullPT();
-        cpu::rhoSimple::thermoCorrect(df, fvp);
-        pushThermo();
-    };
-    gin.updateRho = [&]()
+        // THE DEVICE-RESIDENT HOOKS. Same two operations, never leaving the GPU. This is the arm that
+        // makes the driver device-resident in the sense that matters: the hooks above are correct and
+        // are what the host-against-host comparison needs, but they copy p, he, T, psi and rho across
+        // PCIe twice per iteration, so a solver built on them would spend the run on transfers.
+        //
+        // The comparison is not two thermodynamic models. Both call the SAME BRAE_HD inline functions --
+        // hConstHeToT, perfectGasPsi, perfectGasRho -- so what is under test is the wiring: that the
+        // device hook writes every field the host hook writes, on the boundary as well as the cells, and
+        // that the driver sees no difference. A field the device hook forgot would show up here as the
+        // reference moving where the device did not.
+        gin.thermoCorrect = [&]() { gpu::rhoSimple::thermoCorrect(gf, dbT, hf.thermo); };
+        gin.updateRho     = [&]() { gpu::rhoSimple::updateRho(gf, hf.thermo); };
+    }
+    else
     {
-        pullPT();
-        df.T.internal = gf.T.host();
-        cpu::rhoSimple::updateRho(df, fvp);
-        gf.rho.copyFrom(df.rho.internal);
-        gf.rhoBnd.copyFrom(flatBnd(df.rho, fvp, dm.nBndFaces, 1.0));
-    };
+        gin.thermoCorrect = [&]()
+        {
+            pullPT();
+            cpu::rhoSimple::thermoCorrect(df, fvp);
+            pushThermo();
+        };
+        gin.updateRho = [&]()
+        {
+            pullPT();
+            df.T.internal = gf.T.host();
+            cpu::rhoSimple::updateRho(df, fvp);
+            gf.rho.copyFrom(df.rho.internal);
+            gf.rhoBnd.copyFrom(flatBnd(df.rho, fvp, dm.nBndFaces, 1.0));
+        };
+    }
     gin.correct = nullptr;   // laminar
+
+    // The energy the run STARTS from, for the device-thermo oracle control at the end of this file: it
+    // has to show that he actually moved, or T tracking he proves nothing.
+    const std::vector<scalar> heAtStart = gf.he.host();
 
     // ---- the loop ----------------------------------------------------------------------------
     std::printf("  per-iteration agreement (relL2, CUDA against _cpp)\n");
@@ -378,6 +405,15 @@ int main(int argc, char** argv)
         // from the same state, so both see the same transport.
         std::vector<scalar> muEff, alphaEff;
         std::vector<std::vector<scalar>> muEffBnd, alphaEffBnd;
+        DeviceBuffer<scalar> dMu, dAl, dMuB, dAlB;
+        if (deviceThermo)
+        {
+            // The THIRD round-trip, and the last one in the loop. muEff and alphaEff are the only place
+            // the closure and the thermo enter the momentum and energy equations, and computing them on
+            // the host means pulling U, p, T and rho down and pushing four arrays back, every iteration.
+            gpu::rhoSimple::effectiveTransport(gf, hf.thermo, hf.turbulent, dMu, dMuB, dAl, dAlB);
+        }
+        else
         {
             df.U.internal.resize(nC);
             const std::vector<scalar> ux = gf.Ux.host(), uy = gf.Uy.host(), uz = gf.Uz.host();
@@ -386,10 +422,11 @@ int main(int argc, char** argv)
             df.T.internal = gf.T.host();
             df.rho.internal = gf.rho.host();
             cpu::rhoSimple::effectiveTransport(df, fvp, muEff, muEffBnd, alphaEff, alphaEffBnd);
+            dMu.copyFrom(muEff);
+            dAl.copyFrom(alphaEff);
+            dMuB.copyFrom(flat(muEffBnd, fvp, dm.nBndFaces, 0.0));
+            dAlB.copyFrom(flat(alphaEffBnd, fvp, dm.nBndFaces, 0.0));
         }
-        DeviceBuffer<scalar> dMu(muEff), dAl(alphaEff);
-        DeviceBuffer<scalar> dMuB(flat(muEffBnd, fvp, dm.nBndFaces, 0.0));
-        DeviceBuffer<scalar> dAlB(flat(alphaEffBnd, fvp, dm.nBndFaces, 0.0));
         gin.muEffCell = &dMu;          gin.muEffBndFace = &dMuB;
         gin.alphaEffCell = &dAl;       gin.alphaEffBndFace = &dAlB;
 
@@ -555,6 +592,34 @@ int main(int argc, char** argv)
     // attach to a different fine matrix every time -- exact at iteration 1, wrong at iteration 2.
     if (!gin.transonic) check("the AMG hierarchy was built and kept (control)", w.amgBuilt);
     else                check("transonic: no hierarchy built (control)", !w.amgBuilt);
+
+    // ---- CONTROL: the DEVICE thermo computed the right numbers, against an independent oracle ----
+    // Not a comparison of the two hook implementations -- they agree, and that is what the bounds above
+    // already assert. This recomputes the thermo relations on the HOST from the device's OWN he and p
+    // after the loop has run, so what is checked is that the state the device carries actually satisfies
+    // them. A hook that silently did nothing would leave T at the value createFields wrote while he moved
+    // eight iterations away from it, and that is precisely what this catches: the residual is taken
+    // against a he the solve has changed, not against the seed.
+    if (deviceThermo)
+    {
+        const std::vector<scalar> he = gf.he.host(), T = gf.T.host(), psi = gf.psi.host();
+        double worstT = 0.0, worstPsi = 0.0, moved = 0.0;
+        for (label c = 0; c < nC; ++c)
+        {
+            const double tWant = hConstHeToT(he[c], hf.thermo);
+            const double pWant = perfectGasPsi((scalar)tWant, hf.thermo);
+            worstT   = std::max(worstT,   std::fabs((double)T[c]   - tWant) / std::fabs(tWant));
+            worstPsi = std::max(worstPsi, std::fabs((double)psi[c] - pWant) / std::fabs(pWant));
+            moved    = std::max(moved, std::fabs((double)he[c] - (double)heAtStart[c])
+                                       / std::max(1e-30, std::fabs((double)heAtStart[c])));
+        }
+        std::printf("     %-40s T %.3e  psi %.3e  (he moved %.3e)\n",
+                    "control: device thermo vs host oracle", worstT, worstPsi, moved);
+        // The energy must have MOVED, or T tracking he would be the agreement of two unchanged fields.
+        check("the energy field moved over the run (control)", moved > 1e-10);
+        check("device T is hConstHeToT(he) to round-off (control)", worstT < 1e-14);
+        check("device psi is perfectGasPsi(T) to round-off (control)", worstPsi < 1e-14);
+    }
 
     // ---- CONTROL: updateCoeffs() is WIRED, and does what OpenFOAM's does ------------------------
     // The driver grew an updateBoundaryCoeffs() call because it had none: every patch whose coefficients

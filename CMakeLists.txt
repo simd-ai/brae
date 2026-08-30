@@ -114,6 +114,7 @@ add_library(brae_core STATIC
     src/applications/solvers/rhoSimpleFoam/rhoPcEqn.cu
     src/applications/solvers/rhoSimpleFoam/rhoSimpleFoam.cu
     src/applications/solvers/rhoSimpleFoam/rhoCreateFields.cu
+    src/applications/solvers/rhoSimpleFoam/rhoThermoDevice.cu
     src/applications/solvers/rhoSimpleFoam/rhoEEqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoPEqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoPcEqn_cpp.cu
@@ -569,6 +570,17 @@ add_test(NAME rho_simple_step_cuda
 # updateBoundaryCoeffs call removed.
 add_test(NAME rho_simple_step_cuda_boundary
          COMMAND test_rho_simple_step_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/sbMatched 0.orig --boundary)
+# DEVICE-RESIDENT arms: the same driver with thermo.correct(), thermo.rho() and the effective transport
+# run on the GPU instead of round-tripping the field set to the _cpp reference and back. Two fixtures,
+# because between them they take BOTH branches of every switch in the device thermo:
+#   rhoBox     hePsiThermo  + const      + sensibleEnthalpy       -> rho = p*psi, alpha = mu/Pr, CpByCpv 1
+#   sbMatched  heRhoThermo  + sutherland + sensibleInternalEnergy -> rho = stored, Eucken kappa/Cp, gamma
+# Each carries an oracle control that recomputes the thermo relations on the host from the device's own
+# he and p, so the arm cannot pass by two implementations agreeing on nothing.
+add_test(NAME rho_simple_step_cuda_device_thermo
+         COMMAND test_rho_simple_step_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/rhoBox 0.orig 8 --device-thermo)
+add_test(NAME rho_simple_step_cuda_device_thermo_rho
+         COMMAND test_rho_simple_step_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/sbMatched 0.orig --boundary --device-thermo)
 
 add_executable(test_rho_kepsilon_cuda tests/test_rho_kepsilon_cuda.cu)
 target_include_directories(test_rho_kepsilon_cuda PRIVATE ${BRAE_HEADER_DIRS})

@@ -993,3 +993,79 @@ Two assert the ARITHMETIC of `updateBoundaryCoeffs` directly, so they need no bo
 
 Both still pass when the driver's CALL is removed, which is correct and is the point of having both: they
 test the function's contract, the trajectory tests that the driver invokes it.
+
+## Device residency: the hooks were already device-ready, the implementations were not
+
+`rhoSimpleStep` takes `thermoCorrect`, `updateRho` and `turbulence->correct()` as `std::function` hooks,
+and the argument for that stands: `rho = thermo.rho()` is a thermo operation, and a driver that hard-codes
+one has learned to be a thermodynamic model. Nothing in the hook SIGNATURE forces a host round-trip.
+
+What forced it was that the only implementations in the tree were the driver gate's, which copy the whole
+field set to the host, run the `_cpp` reference, and copy it back. That is correct, and it is what the
+gate needs -- both sides must share one thermo or it would be comparing two thermos as well as two
+drivers -- but it is p, he, T, psi and rho across PCIe twice per iteration, plus four arrays for the
+effective transport. A solver built on those hooks would spend the run on transfers.
+
+`rhoThermoDevice.cu` supplies the same three operations against the device state directly.
+
+### Not a second thermodynamic model
+
+Every one of them evaluates the SAME functions the host reference calls -- `hConstHeToT`, `perfectGasPsi`,
+`perfectGasRho`, `transportMu`, `transportAlpha`, `thermoCpByCpv` -- which are already `BRAE_HD`
+(`__host__ __device__`) in `thermophysicalModels/`. There is one equation of state in the tree and both
+paths call it; what differs is only where the loop runs. So a device/host disagreement here is a wiring
+defect, not a physics one, and the arms below read the SAME numbers as the host-hook arms rather than
+merely close ones -- rhoBox's worst Ux is 1.485748e-11 either way, and at iteration 1 he, T, rho and p are
+bit-identical.
+
+### Scope, and what is refused
+
+perfectGas + hConst + (const | sutherland), which is exactly what the reference implements and what
+`ThermoCoeffs` describes. `ThermoModel::liquidH2O` replaces Cp, mu, kappa and rho with per-cell NSRDS
+correlations and inverts he -> T by Newton; `device_thermo.cu` already carries that path for the legacy
+solver, but no compressible liquid fixture gates it through this driver, so wiring it would be the silent
+substitution this project exists to catch. `requirePerfectGas` throws and names itself, in one place
+rather than per kernel -- a partial refusal that corrects the temperature on the gas path and then
+evaluates a liquid's transport is the failure mode worth designing out.
+
+### The two arms, and why two
+
+Between them they take BOTH branches of every switch in the device thermo:
+
+| fixture | thermo | transport | energy | exercises |
+|---|---|---|---|---|
+| rhoBox | hePsiThermo | const | sensibleEnthalpy | `rho = p*psi`, `alpha = mu/Pr`, CpByCpv = 1 |
+| sbMatched | heRhoThermo | sutherland | sensibleInternalEnergy | stored `rho_`, Eucken `kappa/Cp`, CpByCpv = gamma |
+
+sbMatched additionally has the boundary `nut` and `alphat` a wall function writes, which is the case where
+taking the adjacent CELL value instead would silently drop the turbulent half of the diffusivity at the
+wall where it is largest. `alphatBnd` and `rhoThermo`/`rhoThermoBnd` joined `RhoSolverFields` for this;
+the last two are kept apart from the solver's `rho` for the reason `DeviceThermo` already documents -- on
+a heRhoThermo case the solver's density lags the pressure by one outer iteration, and conflating them let
+`calculate()` overwrite a RELAXED rho mid-iteration.
+
+### The control, and its fail-proof
+
+The arms cannot rest on the two implementations agreeing, because two hooks that both did nothing would
+also agree. So each recomputes the thermo relations on the HOST from the device's OWN he and p after the
+loop, and asserts the device state satisfies them:
+
+- `T == hConstHeToT(he)`: 3.656e-16 (rhoBox), 2.274e-16 (sbMatched)
+- `psi == perfectGasPsi(T)`: 4.536e-16, 4.878e-16
+- and `he` must have MOVED over the run -- 1.590e+01 and 4.987e-02 -- or T tracking he would be the
+  agreement of two unchanged fields.
+
+Fail-proof, with the device `thermoCorrect` made an early `return`: T 8.843e-02 and psi 9.701e-02, both
+FAIL, and the trajectory fails with it.
+
+### What is still on the host
+
+`closedVolumeCorrection` downloads p, psi and V, reduces, and uploads. It fires only on a case where no
+patch fixes p's value, which neither fixture is, so a device reduction would ship untested -- and the
+existing comment's reasoning (the scalar has to come back anyway) is half right: the scalar does, the
+three fields do not. Left as it is, recorded here, and it is the next thing to do on this file when a
+closed-volume compressible fixture exists to gate it.
+
+**The application still does not use any of this.** `gpuRhoSimpleFoam.cu:775` runs
+`DeviceSimpleSolver::rhoSimpleStep`, the legacy fused path -- same method name, different class. The
+modular driver is called by its gates and by nothing else.

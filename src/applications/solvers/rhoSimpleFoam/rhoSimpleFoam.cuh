@@ -92,6 +92,19 @@ struct RhoSolverFields
     // The closure's state. Owned here rather than by the turbulence hook so that the hook stays a
     // callback and does not need to reach back into the driver for its own fields.
     DeviceBuffer<scalar> k, epsilon, nut, nutBnd, alphat;
+    // alphat at boundary FACES. The energy equation's diffusivity on a patch is the WALL FUNCTION's,
+    // never the adjacent cell's -- at a fixed-temperature wall with compressible::alphatWallFunction the
+    // two differ by the whole of alphat, and falling back to the cell value silently removes it.
+    DeviceBuffer<scalar> alphatBnd;
+
+    // The THERMO's own density, cells and boundary. NOT the solver's rho above: heRhoThermo::calculate()
+    // rewrites this inside thermo.correct(), and rhoThermo::rho() then returns it -- so on a heRhoThermo
+    // case the density the solver carries lags the pressure by one outer iteration, which is the whole
+    // point of keeping the two apart. Conflating them let calculate() overwrite a RELAXED rho
+    // mid-iteration: measured on angledDuct at iteration 2, OpenFOAM's rho spread was 0.002 and brae's
+    // 0.94. Held here rather than inside a thermo object because the driver's thermo is a hook, and a
+    // device-resident hook and a host one must be able to write the same state.
+    DeviceBuffer<scalar> rhoThermo, rhoThermoBnd;
 
     // fvc::domainIntegrate(psi*p) at the start of the run, for the closed-volume correction.
     double initialMass = 0.0;

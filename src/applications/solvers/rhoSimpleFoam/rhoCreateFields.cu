@@ -194,6 +194,11 @@ RhoDeviceFields createDeviceFields(
     d.f.rhoBnd.copyFrom(flattenFieldBoundary(hf.rho, patches, d.nBndFaces, 1.0));
     d.f.psi.copyFrom(hf.psi);
     d.f.psiBnd.copyFrom(flattenBoundary(hf.psiBnd, patches, d.nBndFaces, 0.0));
+    // The thermo's OWN density, which is not the solver's rho -- see RhoSolverFields. basicThermo's
+    // constructor runs calculate() before any solving, so it starts equal to rho, which is exactly what
+    // the reference's createFields leaves in hf.rhoThermo.
+    d.f.rhoThermo.copyFrom(hf.rhoThermo);
+    d.f.rhoThermoBnd.copyFrom(flattenBoundary(hf.rhoThermoBnd, patches, d.nBndFaces, 1.0));
     d.f.phiInt.copyFrom(hf.phi.internal);
     d.f.phiBnd.copyFrom(flattenBoundary(hf.phi.boundary, patches, d.nBndFaces, 0.0));
     d.f.initialMass = hf.initialMass;
@@ -235,7 +240,15 @@ RhoDeviceFields createDeviceFields(
         d.f.epsilon.copyFrom(hf.epsilon.internal);
         d.f.nut.copyFrom(hf.nut.internal);
         d.f.nutBnd.copyFrom(flattenFieldBoundary(hf.nut, patches, d.nBndFaces, 0.0));
-        if (!hf.alphat.internal.empty()) d.f.alphat.copyFrom(hf.alphat.internal);
+        if (!hf.alphat.internal.empty())
+        {
+            d.f.alphat.copyFrom(hf.alphat.internal);
+            // The BOUNDARY alphat too. A device-resident alphaEff reads it on every patch face, and a
+            // wall carrying compressible::alphatWallFunction has a patch value the adjacent cell does
+            // not: leaving this unseeded would drop the turbulent half of the energy diffusivity at
+            // exactly the wall where it is largest.
+            d.f.alphatBnd.copyFrom(flattenFieldBoundary(hf.alphat, patches, d.nBndFaces, 0.0));
+        }
 
         // The predicate is the BC's, not the patch type's -- see the header.
         std::vector<char> wfPatch(patches.size(), 0);
