@@ -1207,3 +1207,75 @@ It cannot be gated as things stand, and not because of a fixture: `test_rho_simp
 `gin.correct = nullptr` in EVERY registered arm, so the device turbulence closure does not run in any
 gate at all. Fixing the device alphat boundary requires first wiring the turbulence hook into a gate arm
 that runs it. Recorded here rather than half-fixed.
+
+## totalPressure and pressureInletOutletVelocity: two more unhonoured contracts, and a case that still diverges
+
+`validation/rhoTP` is `rhoBox` with one patch swapped: `totalPressure p0 100200` on p and
+`pressureInletOutletVelocity` on U, against a `fixedValue 100000` outlet. It is the ONLY compressible
+fixture in the tree carrying either. Run through this lineage it DIVERGED -- T 3.79e+38, U 3.09e+20 --
+where OpenFOAM converges in 411 iterations and brae's own LEGACY path passes the same fixture
+(`tp_vs_openfoam`, 4.93 s, verified rather than assumed).
+
+Both boundary conditions were inert here:
+
+- `TotalPressurePatchField` (`fv_patch_field.cuh`) was `FixedValuePatchField` plus `bcCategory() = 7`.
+  p at the inlet stayed pinned at p0 = 100200 for the whole run.
+- `PressureInletOutletVelocityPatchField` was `ExtrapolatedValuePatchField` plus `bcCategory() = 6`.
+  Read-and-hold; the inlet velocity never moved.
+
+Each carries a comment saying THE DEVICE recomputes its value every step -- and the CUDA driver called
+neither `deviceUpdateTotalPressure` nor `deviceUpdatePressureInletOutletVelocity`, both of which have
+existed all along and are called by the incompressible driver (`device_simple_foam.cu:940`, `:992`).
+That makes four contracts of this shape found in this port: `rhoUEqn.cuh:64-83`, the alphat wall
+function, and these two.
+
+### What OpenFOAM actually does, and the branch that matters
+
+`totalPressureFvPatchScalarField.C` has THREE branches, and a compressible case takes the first:
+
+    psiName_ == "none"    p0 - 0.5*rho*neg(phi)*magSqr(Up)      <- rhoTP
+    psi named             p0/pow(1 + 0.5*psi*gM1ByG*neg(phi)*magSqr(Up), 1/gM1ByG)
+    p/rho dimensions      p0 - 0.5*neg(phi)*magSqr(Up)          (incompressible)
+
+`deviceUpdateTotalPressure` takes `rhoBnd` as an OPTIONAL pointer defaulting to null, and null silently
+selects the third form -- wrong by a factor of rho, ~1.2 here. It is passed explicitly.
+
+`pressureInletOutletVelocity` is directionMixed with `valueFraction = neg(phi)*(I - sqr(n))`: outflow
+extrapolates entirely, inflow fixes only the TANGENTIAL component to refValue (zero), leaving
+`U_b = n*(n & U_cell)`.
+
+### The fix, and its deliberate shape
+
+A new `updateFromPatchVelocity(Ub, Ucell, rhob)` virtual, ADDITIVE: it writes through
+`setStoredValues` rather than overriding `evaluate()`, so both classes behave exactly as before for any
+caller that does not invoke it. The incompressible lineage has four piov fixtures (`piov`, `piov_of`,
+`piov_cf`, `simpleCar`) whose device path already computes this; overriding `evaluate()` would have
+changed their host behaviour as a side effect of fixing a compressible bug.
+
+BOTH velocities are passed because OpenFOAM uses a different one for each: totalPressure's `Up` is U's
+PATCH field, piov's is `patchInternalField()`.
+
+### WHAT THIS DOES NOT DO: rhoTP STILL DIVERGES
+
+The velocity is now right -- brae reaches `|Ux| rms 1.8469e+01`, and OpenFOAM's converged
+p = 100002.84 against p0 = 100200 implies the same ~18.2 m/s total-pressure balance. But the case does
+not converge:
+
+    iter  8   U 7.662e-04   h 5.786e-01   p 9.986e-01
+    iter 11   U 6.212e-06   h 1.633e-05   p 9.999e-01
+    iter 12   U 4.883e-03   h 9.998e-01   p 9.999e-01
+    iter 30   U nan         h nan         p nan
+
+`h` recovers to 1.6e-05 and jumps straight back to 0.9998, and **p's initial residual never leaves
+~1.0** -- the pressure equation is not converging at all. So these two boundary conditions were
+necessary and are not sufficient: the pressure-velocity coupling on a pressure-driven inlet has at least
+one further gap in this lineage. A second thread worth pulling: rhoTP declares `rhoMin 0.1; rhoMax 10;`
+and rho still reached +-1e300, so those bounds are not reaching the solver either.
+
+rhoTP is therefore NOT registered as a gate -- it would fail. It is recorded here as the fixture that
+will gate this work once the remaining gap is closed, and as the reason to distrust any claim that this
+driver handles a pressure-driven inlet.
+
+Regression across both lineages after the change: 9/9, including `tp_vs_openfoam` on the legacy path.
+Neither sbMatched nor squareBend carries `inletOutlet` on p, and `updateFromPatchVelocity` is a no-op on
+every patch type except these two, so the blast radius is nil by construction as well as by measurement.

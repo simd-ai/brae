@@ -226,6 +226,36 @@ Residuals rhoSimpleStep(
         f.U.boundary[pi]->updateFromDensity(rhoBnd[pi]);
     }
 
+    // updateCoeffs() for the two patches whose value is a function of the patch VELOCITY: totalPressure
+    // on p, and pressureInletOutletVelocity on U. Both carried a comment saying the DEVICE recomputes
+    // them each step and nothing on the host ever did, so each sat at its seeded value for an entire run.
+    // validation/rhoTP carries both and DIVERGED through this driver -- T 3.79e+38, U 3.09e+20, against
+    // an OpenFOAM run that converges in 411 iterations -- because p's inlet was pinned at p0 = 100200
+    // against a fixedValue 100000 outlet while U's inlet never moved.
+    //
+    // AFTER flowRateInletVelocity and with THIS iteration's flux, matching the order OpenFOAM reaches
+    // them in: every one of these is an updateCoeffs() the fvMatrix constructor runs before reading a
+    // coefficient. totalPressure takes U's PATCH values and rho's; piov takes the FACE CELL velocity.
+    {
+        std::vector<vector> Ucell(patches.size() ? 0 : 0);
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const std::vector<vector>& Ub = f.U.boundary[pi]->value();
+            // patchInternalField: U at the cell each face belongs to, which is what OF's piov reads.
+            Ucell.assign(static_cast<std::size_t>(patches[pi].size), vector{});
+            for (label i = 0; i < patches[pi].size; ++i)
+            {
+                const label c = patches[pi].faceCells[i];
+                if (c >= 0 && c < (label)f.U.internal.size()) Ucell[i] = f.U.internal[c];
+            }
+            f.p.boundary[pi]->updateFromFlux(f.phi.boundary[pi]);
+            f.p.boundary[pi]->updateFromPatchVelocity(Ub, Ucell, rhoBnd[pi]);
+            f.U.boundary[pi]->updateFromPatchVelocity(Ub, Ucell, rhoBnd[pi]);
+        }
+        f.p.evaluateBoundary();
+        f.U.evaluateBoundary();
+    }
+
     // ---- UEqn.H ----
     RhoMomentumInput uin;
     uin.phi = &f.phi.internal;   uin.phiBnd = &f.phi.boundary;

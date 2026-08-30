@@ -62,6 +62,30 @@ public:
     // A patch that is not one does nothing here.
     virtual void updateFromDensity(const std::vector<scalar>& /*rhop*/) {}
 
+    // OF's updateCoeffs() for the two patches whose value is a function of the patch VELOCITY:
+    //   totalPressure                  p_b = p0 - 0.5*rho*neg(phi)*magSqr(U_b)
+    //                                  (totalPressureFvPatchScalarField.C, psiName_ == "none" branch)
+    //   pressureInletOutletVelocity    outflow extrapolates; inflow fixes only the TANGENTIAL component,
+    //                                  so U_b = n*(n & U_cell)
+    //
+    // Neither is reachable from the field's own evaluate(): a scalar p patch cannot see U at all, and
+    // piov needs the flux sign as well as the cell velocity. So the solver pushes them in, exactly where
+    // OpenFOAM's updateCoeffs would have looked them up in the object registry -- the same arrangement
+    // updateFromFlux and updateFromDensity already use.
+    //
+    // BOTH velocities are passed because OpenFOAM uses a DIFFERENT one for each: totalPressure's `Up` is
+    // U's PATCH field, while piov's is patchInternalField(). Passing one for both would be wrong on
+    // whichever it was not.
+    //
+    // This exists because both classes carried a comment saying the DEVICE recomputes their value each
+    // step (see them below) and nothing on the host ever did, so each behaved as a read-and-hold seed
+    // for an entire run. validation/rhoTP carries both, and diverged through the OF-mirror driver
+    // (T 3.79e+38, U 3.09e+20) where OpenFOAM converges in 411 iterations.
+    virtual void updateFromPatchVelocity(
+        const std::vector<vector>& /*Ub*/,
+        const std::vector<vector>& /*Ucell*/,
+        const std::vector<scalar>& /*rhob*/) {}
+
     // The CONSTRUCTION-time half of the same thing, and it is a different branch. OF's dict constructor
     // calls evaluate() -> updateCoeffs() only when the case supplies no `value`, so the inlet is already
     // at avgU*n before createFields.H builds phi from it. When the case DOES supply a `value` OF keeps it
@@ -229,8 +253,50 @@ public:
         bool uniform,
         T uval,
         std::vector<T> vals)
-        : FixedValuePatchField<T>(p, uniform, uval, std::move(vals)) {}
+        : FixedValuePatchField<T>(p, uniform, uval, std::move(vals))
+    {
+        // p0 is what the constructor was handed -- the reader puts totalPressure's p0 in the inletValue
+        // slot and makePatchField resolves it into `vals`. Kept because value() moves once the update
+        // below runs, and p0 is the fixed reference every iteration recomputes FROM.
+        p0_ = this->value();
+    }
     int bcCategory() const override { return 7; }                   // device: totalPressure (per-step refValue)
+
+    void updateFromFlux(const std::vector<scalar>& phip) override { phi_ = phip; }
+
+    // OF totalPressureFvPatchScalarField::updateCoeffs, the psiName_ == "none" branch, which is the one a
+    // compressible case takes unless it names psi:  operator==(p0p - 0.5*rho*(neg(phip))*magSqr(Up)).
+    // neg(phi) is 1 for INFLOW (phi < 0) and 0 otherwise, so an outflow face sits at p0 exactly.
+    void updateFromPatchVelocity(
+        const std::vector<vector>& Ub,
+        const std::vector<vector>& /*Ucell*/,
+        const std::vector<scalar>& rhob) override
+    {
+        if constexpr (std::is_same<T, scalar>::value)
+        {
+            const label n = this->patch_.size;
+            if (n == 0 || p0_.empty()) return;
+            std::vector<T> v(static_cast<std::size_t>(n));
+            for (label i = 0; i < n; ++i)
+            {
+                const scalar p0 = i < (label)p0_.size() ? p0_[i] : p0_.back();
+                const bool inflow = i < (label)phi_.size() && phi_[i] < scalar(0);
+                scalar u2 = 0;
+                if (inflow && i < (label)Ub.size())
+                    u2 = Ub[i].x*Ub[i].x + Ub[i].y*Ub[i].y + Ub[i].z*Ub[i].z;
+                // rho defaults to 1 when the caller supplies none, which is OF's INCOMPRESSIBLE form
+                // (dimensions p/rho). A compressible caller must pass rho: the two differ by a factor of
+                // rho, and on rhoTP that is ~1.2.
+                const scalar rw = i < (label)rhob.size() ? rhob[i] : scalar(1);
+                v[i] = p0 - scalar(0.5) * rw * (inflow ? scalar(1) : scalar(0)) * u2;
+            }
+            this->setStoredValues(std::move(v));
+        }
+    }
+
+private:
+    std::vector<T>      p0_;
+    std::vector<scalar> phi_;
 };
 
 // surfaceNormalFixedValue / uniformNormalFixedValue (velocity U only): U_b = refValue * face_normal
@@ -1123,6 +1189,43 @@ public:
     bool assignable() const override { return false; }   // OF: pressureInletOutletVelocity derives from directionMixed
     using ExtrapolatedValuePatchField<T>::ExtrapolatedValuePatchField;
     int bcCategory() const override { return 6; }                  // device: pressureInletOutletVelocity (outlet, adjustable flux)
+
+    void updateFromFlux(const std::vector<scalar>& phip) override { phi_ = phip; }
+
+    // OF pressureInletOutletVelocityFvPatchVectorField::updateCoeffs -- valueFraction = neg(phi)*(I - nn).
+    // OUTFLOW (phi >= 0) has valueFraction 0 and extrapolates entirely. INFLOW fixes only the TANGENTIAL
+    // part to refValue, which is zero unless the case gives a tangentialVelocity (refused at
+    // construction), so the value becomes the NORMAL projection of the cell velocity, n*(n & U_cell) --
+    // the pressure sets the inflow speed and the tangential component is dropped.
+    //
+    // Written through setStoredValues rather than by overriding evaluate(), so this class behaves
+    // EXACTLY as before for any caller that does not invoke the update. The incompressible lineage has
+    // four piov fixtures (validation/piov, piov_of, piov_cf, simpleCar) and its device path computes
+    // this itself; changing evaluate() would have altered their host behaviour as a side effect.
+    void updateFromPatchVelocity(
+        const std::vector<vector>& /*Ub*/,
+        const std::vector<vector>& Ucell,
+        const std::vector<scalar>& /*rhob*/) override
+    {
+        if constexpr (std::is_same<T, vector>::value)
+        {
+            const label n = this->patch_.size;
+            if (n == 0 || (label)Ucell.size() < n) return;
+            std::vector<T> v(static_cast<std::size_t>(n));
+            for (label i = 0; i < n; ++i)
+            {
+                const bool inflow = i < (label)phi_.size() && phi_[i] < scalar(0);
+                if (!inflow) { v[i] = Ucell[i]; continue; }        // outflow: zeroGradient
+                const vector& nf = this->patch_.nf[i];
+                const scalar nd = nf.x*Ucell[i].x + nf.y*Ucell[i].y + nf.z*Ucell[i].z;
+                v[i] = vector{ nd*nf.x, nd*nf.y, nd*nf.z };        // inflow: normal component only
+            }
+            this->setStoredValues(std::move(v));
+        }
+    }
+
+private:
+    std::vector<scalar> phi_;
 };
 
 // processor: rank<->rank coupled patch. The exchange receives the NEIGHBOUR cells' values (the

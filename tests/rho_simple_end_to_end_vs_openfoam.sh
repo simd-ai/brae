@@ -28,7 +28,11 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_rho_simple_step_cpp"
-SRC="$ROOT/validation/sbMatched"
+# The fixture, overridable so the same OpenFOAM-oracle machinery can be pointed at another compressible
+# case. sbMatched is the default and is what the registered gate runs; validation/rhoTP is the only other
+# compressible fixture carrying boundary conditions this driver has to recompute per iteration
+# (totalPressure + pressureInletOutletVelocity).
+SRC="${CASE:-$ROOT/validation/sbMatched}"
 OFBASHRC=${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
 ITERS=${ITERS:-400}
 
@@ -57,11 +61,14 @@ n = os.environ['ITERS']
 c = os.path.join(d, 'system/controlDict')
 s = open(c).read()
 s = re.sub(r'functions\s*\{.*?\n\}', 'functions\n{\n}', s, flags=re.S)
-s = re.sub(r'^writeFormat .*',    'writeFormat     ascii;',    s, flags=re.M)
-s = re.sub(r'^writePrecision .*', 'writePrecision  15;',       s, flags=re.M)
-s = re.sub(r'^endTime .*',        'endTime         %s;' % n,   s, flags=re.M)
-s = re.sub(r'^writeInterval .*',  'writeInterval   %s;' % n,   s, flags=re.M)
-s = re.sub(r'^writeControl .*',   'writeControl    timeStep;', s, flags=re.M)
+# Rewrite each entry up to its OWN semicolon, not to end of line. An OpenFOAM dictionary may put
+# several entries on one line -- validation/rhoTP's controlDict is three lines for twelve entries --
+# and the line-anchored form silently swallowed everything after the key it matched, leaving a dict
+# whose writeInterval and writeFormat had been deleted. OpenFOAM then failed on the FIRST missing
+# entry it happened to want, which read as `OpenFOAM did not run` rather than as a broken rewrite.
+for k, v in [('writeFormat', 'ascii'), ('writePrecision', '15'), ('endTime', n),
+             ('writeInterval', n), ('writeControl', 'timeStep')]:
+    s = re.sub(r'\b%s\s+[^;]*;' % k, '%s %s;' % (k, v), s)
 open(c, 'w').write(s)
 
 # residualControl is removed so BOTH codes run exactly ITERS iterations: the comparison is trajectory for
@@ -83,11 +90,19 @@ grep -q "^End" "$W/case/run.log" \
 # ported for the compressible lineage; the gate caught its own negative control going stale, which is what
 # a negative control is for. LaunderSharmaKE is a compressible RAS model brae does not have, and it must be
 # refused BY NAME rather than run as kEpsilon or as laminar.
+# Both refusal fixtures need a RAS case to mutate. A LAMINAR fixture (validation/rhoTP) has no RASModel
+# and no nut file, so they are built only where they mean something and the binary is handed fewer
+# arguments; it already treats argv[4] and argv[5] as optional and prints SKIP for each. Guarding on the
+# fixture rather than failing keeps the same script usable as an OpenFOAM oracle for a laminar case.
+UNPORTED=""
+UNPORTEDNUT=""
+if grep -q "RASModel" "$SRC/constant/turbulenceProperties" 2>/dev/null; then
 mkdir -p "$W/unported/constant"
 cp -r "$SRC/constant/." "$W/unported/constant/"
 sed -i 's/RASModel *kEpsilon;/RASModel        LaunderSharmaKE;/' "$W/unported/constant/turbulenceProperties"
 grep -q "LaunderSharmaKE" "$W/unported/constant/turbulenceProperties" \
     || { echo "FAIL: could not build the unported-model fixture"; exit 1; }
+UNPORTED="$W/unported"
 
 # ...and an unported NUT WALL FUNCTION, in a time directory of its own. The closure computes
 # nutkWallFunction unconditionally for both the wall nut and the near-wall production, so every other
@@ -98,5 +113,7 @@ cp "$W/case/0/"* "$W/unportednut/" 2>/dev/null || true
 sed -i 's/nutkWallFunction/nutUSpaldingWallFunction/' "$W/unportednut/nut"
 grep -q "nutUSpaldingWallFunction" "$W/unportednut/nut" \
     || { echo "FAIL: could not build the unported-nut fixture"; exit 1; }
+UNPORTEDNUT="$W/unportednut"
+fi
 
-"$BIN" "$W/case" 0 "$ITERS" "$W/unported" "$W/unportednut"
+"$BIN" "$W/case" 0 "$ITERS" $UNPORTED $UNPORTEDNUT

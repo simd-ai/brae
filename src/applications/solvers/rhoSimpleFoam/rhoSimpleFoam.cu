@@ -182,6 +182,28 @@ void updateBoundaryCoeffs(
         deviceBCValue(dbP, f.p, f.pBnd);
     }
 
+    // 2b. pressureInletOutletVelocity and totalPressure -- the two patches whose value is a function of
+    //     the patch VELOCITY. Both device kernels have existed and been called by the incompressible
+    //     driver all along (device_simple_foam.cu:940 and :992); this driver called neither, and the
+    //     host classes carried a comment saying the DEVICE recomputes them each step. validation/rhoTP
+    //     carries both, and DIVERGED through this lineage -- T 3.79e+38 -- while the legacy path, which
+    //     does compute them, converges against OpenFOAM.
+    //
+    //     THE COMPRESSIBLE FORM TAKES rho. OpenFOAM's totalPressure has three branches
+    //     (totalPressureFvPatchScalarField.C): p in Pa with psi unnamed is p0 - 0.5*rho*neg(phi)*|U|^2;
+    //     p in Pa with psi NAMED is the isentropic high-speed form; p/rho dimensions is the
+    //     incompressible p0 - 0.5*neg(phi)*|U|^2. This solver is always the first of those, so rhoBnd is
+    //     passed -- omitting it silently selects the incompressible form, wrong by a factor of rho.
+    {
+        DeviceBuffer<scalar> ubx, uby, ubz;
+        deviceBCValue(dbU.comp[0], f.Ux, ubx);
+        deviceBCValue(dbU.comp[1], f.Uy, uby);
+        deviceBCValue(dbU.comp[2], f.Uz, ubz);
+        deviceUpdatePressureInletOutletVelocity(dbU, f.phiBnd, f.Ux, f.Uy, f.Uz);
+        deviceUpdateTotalPressure(dbP, f.phiBnd, ubx, uby, ubz, &f.rhoBnd);
+        deviceBCValue(dbP, f.p, f.pBnd);
+    }
+
     // 3. flowRateInletVelocity, and WHICH rho matters: avgU = -mdot/gSum(rho*magSf) is held against the
     //    boundary density the flux is actually carrying -- the solver's relaxed rho, which is what
     //    f.rhoBnd holds here -- not thermo.rho(). Feeding it the other one is the angledDuct defect,
