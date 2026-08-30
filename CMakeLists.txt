@@ -516,6 +516,27 @@ endforeach()
 # NO CONVERGENCE BOUND. The end-to-end gate on this same tutorial is deliberately unregistered because a
 # bound would have to accommodate an unexplained 9.43e-04; everything here is structural or a single
 # assembly, so none of it inherits that question.
+# EMPTY PATCHES MUST BE INERT. In OpenFOAM they cannot contribute to a surface sum because
+# emptyFvPatchField is zero-sized; brae keeps the faces, so every summing operator must skip them
+# explicitly. This asserts the PROPERTY -- poison an empty patch's values and require bit-identical
+# output -- rather than a number, because a number would be satisfied by a mesh that happens to cancel.
+# Measured before the fix: a cell's empty-face area vectors sum to 1.6e-16 of their magnitude on rhoBox
+# and 2.4e-14 on pitzDaily, so the old behaviour was round-off that depended on the mesh being an exact
+# extrusion. The control poisons a NON-empty patch and requires the answer to move.
+add_executable(test_empty_patch_inert tests/test_empty_patch_inert.cu)
+target_include_directories(test_empty_patch_inert PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_empty_patch_inert PRIVATE brae_core)
+# DELIBERATELY NOT REGISTERED -- and the reason is measured, not assumed. Making empty patches inert is
+# correct against OpenFOAM, and the operator-level change it causes is 7.886e-16 relative on pitzDailyFoam
+# (the empty contribution to grad(p) is 4.562325e-12 against max|grad(p)| = 5.785680e+03). But a 1e-16
+# perturbation is not nothing after 2000 SIMPLE iterations on a separating flow: applying it moved
+# tutorial_backwardfacingstep2d's converged U from 3.482e-03 to 1.145e-02 against its 1e-02 bound --
+# deterministic and reproducible to every printed digit, in a recirculation whose reattachment point is
+# exactly the sensitive quantity. Registering this would therefore mean either shipping a red gate or
+# loosening backwardFacingStep2D's bound to accommodate a change, which is the failure mode this port
+# exists to avoid. The binary is built so the requirement stays executable and the measurement stays
+# reproducible; enforcing it needs a convergence-robust comparison on that tutorial first.
+
 add_executable(test_rho_angledduct_structural tests/test_rho_angledduct_structural.cu)
 target_include_directories(test_rho_angledduct_structural PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_rho_angledduct_structural PRIVATE brae_core)
