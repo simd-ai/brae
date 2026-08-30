@@ -365,7 +365,14 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
         // Pick the nut wall function from the 0/nut wall-patch BC TYPE (OpenFOAM does this per-BC, not by model):
         // nutUSpalding -> Spalding, nutUBlended -> Blended, else nutk. Warn once on nutLowRe (mapped to nutk: identical
         // only on a resolved y+<yPlusLam mesh). SA keeps its Spalding path regardless (ctl.sa short-circuits below).
+        // The nut wall-function family, in one place so the refusal below and guardWallFn cannot drift.
+        auto isNutWallFn = [](const std::string& t) {
+            return t == "nutkWallFunction"      || t == "nutUSpaldingWallFunction"
+                || t == "nutLowReWallFunction"  || t == "nutUBlendedWallFunction"
+                || t == "nutUWallFunction"      || t == "atmNutkWallFunction";
+        };
         auto setNutWall = [&](const FieldData<scalar>& fd) {
+            std::string wallFnSeen;   // the first wall function seen; a second, different one refuses
             for (const auto& pb : fd.boundary)
             {
                 const std::string gt = patchGeoType(pb.name);
@@ -391,6 +398,32 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
                 // k-based y+ above yPlusLam and take the log branch where OpenFOAM returns 0. It is now
                 // selected rather than substituted; writing zero is exact and cheaper than the log law.
                 else if (pb.type == "nutLowReWallFunction") { ctl.nutWall = NutWall::LowRe; }
+                // ONE SELECTOR, SO ONE FUNCTION. OpenFOAM dispatches per patch --
+                // nutWallFunctionFvPatchScalarField.C:181-184 is operator==(calcNut()) on each patch's own
+                // object -- so every wall may carry a different one and OpenFOAM honours each. ctl.nutWall
+                // is a single case-wide value, and the winner's kernel then rewrites EVERY wall face
+                // (device_kepsilon.cu spaldingNutKernel/blendedNutKernel/nutUWallKernel all write
+                // unconditionally where isWall). The per-face rescues are gated `type != wall`, so nothing
+                // spares the losing patch.
+                //
+                // Two ways that went wrong silently, both now refused rather than resolved by accident:
+                //   * LAST WINS. The loop assigns as it walks the boundary list, so the last matching
+                //     patch decided for all of them.
+                //   * nutk CANNOT WIN BACK. There is no `nutkWallFunction` branch here and no restoring
+                //     else, so once any patch selected a non-nutk function every wall got it -- including
+                //     the walls that explicitly asked for nutkWallFunction.
+                //
+                // Same shape as the z0 refusal this driver already carries for atmNutkWallFunction
+                // (simpleFoamV2.cu:942-952): brae holds one value, so two different ones must be refused
+                // rather than averaged into a case nobody described.
+                if (!wallFnSeen.empty() && wallFnSeen != pb.type && isNutWallFn(pb.type))
+                    throw std::runtime_error(
+                        "brae: 0/nut carries more than one nut wall function on wall patches ('"
+                        + wallFnSeen + "' and '" + pb.type + "'). This driver applies ONE wall function to "
+                        "every wall, so running would give a wall the function another patch asked for. "
+                        "OpenFOAM dispatches per patch and honours both. Refusing rather than silently "
+                        "picking whichever the boundary list happens to end on.");
+                if (isNutWallFn(pb.type)) wallFnSeen = pb.type;
             }
             if (!ctl.sa && ctl.nutWall != NutWall::Nutk)
             {
