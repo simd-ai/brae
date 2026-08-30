@@ -355,6 +355,12 @@ int main(int argc, char** argv)
             {"an unported fvOptions is refused",       1},
             {"a mesh with coupled patches is refused", 2},
             {"an unported div(phi,he) scheme is refused", 3},
+            // EEqn.H has TWO convection terms and fvSchemes gives them separate entries, so a case can
+            // name a ported scheme for one and an unported one for the other. div(phi,Ekp|K) used to
+            // fall through to upwind with no throw while div(phi,he) was refused -- the device being
+            // MORE permissive than the host reference that is its own oracle
+            // (rhoEEqn_cpp.cu:41-56 refuses on `!okKE || !okHe`).
+            {"an unported div(phi,Ekp|K) scheme is refused", 4},
         };
         for (const auto& cse : cases)
         {
@@ -363,11 +369,41 @@ int main(int argc, char** argv)
             if (cse.which == 1) bad.hasFvOptions = true;
             if (cse.which == 2) bad.hasCoupledPatches = true;
             if (cse.which == 3) bad.schemeHe = cpu::rhoSimple::DivScheme::LUST;
+            if (cse.which == 4) bad.schemeKE = cpu::rhoSimple::DivScheme::limitedLinear;
             gpu::PressureMatrix Eb;
             bool threw = false;
             try { gpu::rhoSimple::assembleEEqn(Eb, dm, dbHe, dHe, bad); }
             catch (const std::runtime_error&) { threw = true; }
             check(threw, cse.what);
+        }
+
+        // The KE scheme is APPLIED by kineticEnergyDivergence, which is a public entry point of its own
+        // and carried no guard at all -- a caller reaching it directly, as this gate does above,
+        // bypassed every check in the module. Asserted separately because assembleEEqn passing is not
+        // evidence about it.
+        {
+            gpu::rhoSimple::RhoEnergyInput bad = gin;
+            bad.schemeKE = cpu::rhoSimple::DivScheme::limitedLinear;
+            DeviceBuffer<scalar> outBad;
+            bool threw = false;
+            try { gpu::rhoSimple::kineticEnergyDivergence(outBad, dm, bad); }
+            catch (const std::runtime_error&) { threw = true; }
+            check(threw, "...and kineticEnergyDivergence refuses it too, on its own");
+        }
+
+        // THE NEGATIVE CONTROL. Without it every line above passes on a module that throws
+        // unconditionally, which is not a refusal -- it is a broken module.
+        {
+            gpu::PressureMatrix Eok;
+            DeviceBuffer<scalar> outOk;
+            bool threw = false;
+            try
+            {
+                gpu::rhoSimple::assembleEEqn(Eok, dm, dbHe, dHe, gin);
+                gpu::rhoSimple::kineticEnergyDivergence(outOk, dm, gin);
+            }
+            catch (const std::runtime_error&) { threw = true; }
+            check(!threw, "the supported configuration is ACCEPTED (negative control)");
         }
     }
 

@@ -112,8 +112,39 @@ void zeroed(DeviceBuffer<scalar>& b, int n)
                      "rhoEEqn zero");
 }
 
+// Only `Gauss upwind` and `Gauss linearUpwind <grad>` are ported, for EITHER convection term. The check
+// covers both because EEqn.H has two of them -- div(phi,he) and div(phi,Ekp|K) -- and they are separate
+// entries in fvSchemes, so a case can name a ported scheme for one and an unported one for the other.
+//
+// It used to cover only `he`. div(phi,Ekp|K) fell through to upwind with no throw, which is the silent
+// substitution this project exists to catch: a case saying `div(phi,K) Gauss limitedLinear` got upwind
+// and converged to a different kinetic energy, hence a different temperature. The host reference has
+// always refused both in one guard (rhoEEqn_cpp.cu:41-56, `if (!okKE || !okHe)`), so the DEVICE was the
+// more permissive of the two -- the wrong direction for a twin whose oracle is that reference.
+//
+// LATENT AS SHIPPED, and worth stating exactly. Reaching the hole needed a case naming a PORTED scheme
+// for he and an UNPORTED one for Ekp|K, because the he check ran first. No checked-in case separates
+// them: validation/rhoLU is the only one naming an unported energy scheme at all and it names
+// `bounded Gauss limitedLinear 1` for all four of div(phi,h), div(phi,e), div(phi,K) and div(phi,Ekp),
+// so it was already refused on he -- and no registered test drives it. What was wrong was the
+// PERMISSIVENESS, not an answer any fixture produced.
+bool schemePorted(cpu::rhoSimple::DivScheme s)
+{
+    return s == cpu::rhoSimple::DivScheme::upwind
+        || s == cpu::rhoSimple::DivScheme::linearUpwind;
+}
+
 void refuseUnsupported(const RhoEnergyInput& in)
 {
+    if (!schemePorted(in.schemeHe) || !schemePorted(in.schemeKE))
+    {
+        throw std::runtime_error(
+            "rhoSimpleFoam EEqn(cuda): only `Gauss upwind` and `Gauss linearUpwind <grad>` are ported for "
+            "the energy convection terms, and that applies to div(phi,Ekp|K) exactly as it does to "
+            "div(phi,he) -- they are separate fvSchemes entries. Refusing rather than substituting upwind "
+            "for the scheme the case named: a silently different convection term converges to a different "
+            "kinetic energy and therefore a different temperature.");
+    }
     if (in.hasMRF)
     {
         throw std::runtime_error(
@@ -185,6 +216,9 @@ void kineticEnergyDivergence(
     const DeviceMesh&     dm,
     const RhoEnergyInput& in)
 {
+    // This entry point APPLIES the KE scheme, so it carries the same refusal. It had none at all: a
+    // caller reaching it directly -- as the gate does -- bypassed every check in the module.
+    refuseUnsupported(in);
     DeviceBuffer<scalar> ke, keB;
     kineticEnergy(ke, keB, dm, in);
 
@@ -231,19 +265,8 @@ void assembleEEqn(
     const int nC = dm.nCells;
 
     // ---- fvm::div(phi, he) ------------------------------------------------------------------
-    switch (in.schemeHe)
-    {
-        case cpu::rhoSimple::DivScheme::limitedLinear:
-        case cpu::rhoSimple::DivScheme::limitedLinearV:
-        case cpu::rhoSimple::DivScheme::LUST:
-        case cpu::rhoSimple::DivScheme::linearUpwindV:
-            throw std::runtime_error(
-                "rhoSimpleFoam EEqn(cuda): only `upwind` and `linearUpwind` are ported for div(phi,he). "
-                "Refusing rather than substituting upwind for the scheme the case named -- a silently "
-                "different convection term converges to a different temperature.");
-        default:
-            break;
-    }
+    // The scheme refusal for BOTH convection terms is in refuseUnsupported above, where the host
+    // reference keeps it too (rhoEEqn_cpp.cu:41-56, one guard on okKE && okHe).
     deviceDivUpwindCoeffs(dm, *in.phiInt, E.diag, E.upper, E.lower);
     deviceBCDivCoeffs(dbHe, *in.phiBnd, E.iC, E.bC);
     zeroed(E.source, nC);
