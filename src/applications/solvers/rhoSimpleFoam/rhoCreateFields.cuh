@@ -68,6 +68,20 @@ struct RhoDeviceFields
     DeviceBuffer<scalar> wallYBndFace;   // nearWallDist y, per boundary face (0 off a wall-function patch)
     std::vector<label>   wfFaceOfBnd;    // wall-face order -> boundary-face index, for deviceGatherWallNu
 
+    // The TURBULENT INLETS, per boundary face. OpenFOAM recomputes these every updateCoeffs:
+    //   turbulentIntensityKineticEnergyInlet       k_b   = 1.5*I^2*magSqr(U_b)
+    //   turbulentMixingLengthDissipationRateInlet  eps_b = (Cmu^0.75/L)*k_b^1.5
+    // so they move with the solution and cannot be seeded once.
+    //
+    // Nothing in this lineage produced them. The device closure takes them as MASKS, and a null mask is
+    // NOT "this case has no turbulent inlet" -- it is silently no turbulent inlet at all, on a case whose
+    // 0/k and 0/epsilon ask for one. sbMatched and squareBend, the two main compressible fixtures, both
+    // carry the pair. Built here so the closure can be given them, and so a caller that cannot supply
+    // them can refuse rather than run a fabricated inlet.
+    DeviceBuffer<label>  turbInletKMask,   turbInletEpsMask;
+    DeviceBuffer<scalar> turbInletKInt,    turbInletEpsLen;
+    bool                 hasTurbulentInlet = false;
+
     // updateCoeffs() metadata for the boundary conditions whose coefficients move with the SOLUTION.
     // The device boundary objects are a pre-baked snapshot -- bcType, refValue and valueFraction are
     // fixed at build time -- so anything OpenFOAM recomputes inside updateCoeffs has to be recomputed

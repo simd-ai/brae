@@ -250,6 +250,42 @@ RhoDeviceFields createDeviceFields(
             d.f.alphatBnd.copyFrom(flattenFieldBoundary(hf.alphat, patches, d.nBndFaces, 0.0));
         }
 
+        // The TURBULENT INLETS, per boundary face. OF's turbulentIntensityKineticEnergyInlet and
+        // turbulentMixingLengthDissipationRateInlet recompute their value every updateCoeffs, so the
+        // closure needs the per-face intensity / mixing length rather than the seeded k and epsilon.
+        // The walk is flattenBoundary's -- every patch in order -- which is unambiguous here because
+        // this function has already refused any coupled patch.
+        {
+            std::vector<label>  km(static_cast<std::size_t>(d.nBndFaces), 0);
+            std::vector<label>  em(static_cast<std::size_t>(d.nBndFaces), 0);
+            std::vector<scalar> ki(static_cast<std::size_t>(d.nBndFaces), scalar(0));
+            std::vector<scalar> el(static_cast<std::size_t>(d.nBndFaces), scalar(0));
+            label bi = 0;
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                // Kind 0 is intensityK, 1 is mixingLengthEpsilon (TurbulentInletPatchField::Kind); -1 on
+                // every other patch type, which is what lets this tell "no such patch" from "a patch
+                // whose coefficient happens to be zero".
+                const int  kk = hf.k.boundary[pi]->turbulentInletKind();
+                const int  ek = hf.epsilon.boundary[pi]->turbulentInletKind();
+                const scalar kc = hf.k.boundary[pi]->turbulentInletCoefficient();
+                const scalar ec = hf.epsilon.boundary[pi]->turbulentInletCoefficient();
+                for (label i = 0; i < patches[pi].size; ++i, ++bi)
+                {
+                    if (bi >= d.nBndFaces) break;
+                    if (kk == 0) { km[bi] = 1; ki[bi] = kc; d.hasTurbulentInlet = true; }
+                    if (ek == 1) { em[bi] = 1; el[bi] = ec; d.hasTurbulentInlet = true; }
+                }
+            }
+            if (d.hasTurbulentInlet)
+            {
+                d.turbInletKMask.copyFrom(km);
+                d.turbInletEpsMask.copyFrom(em);
+                d.turbInletKInt.copyFrom(ki);
+                d.turbInletEpsLen.copyFrom(el);
+            }
+        }
+
         // The predicate is the BC's, not the patch type's -- see the header.
         std::vector<char> wfPatch(patches.size(), 0);
         for (std::size_t pi = 0; pi < patches.size(); ++pi)

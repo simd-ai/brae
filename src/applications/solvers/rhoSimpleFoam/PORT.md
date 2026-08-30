@@ -1379,3 +1379,58 @@ velocity is almost unconstrained. OpenFOAM converges it in 411 iterations with `
 
 rhoTP remains UNREGISTERED. It would fail, and registering a failing gate to mark a known defect is how a
 suite stops meaning anything.
+
+## The turbulent inlets had no producer, and a null mask is not "no inlet"
+
+OpenFOAM recomputes both at every `updateCoeffs`:
+
+    turbulentIntensityKineticEnergyInlet        k_b   = 1.5*I^2*magSqr(U_b)
+    turbulentMixingLengthDissipationRateInlet   eps_b = (Cmu^0.75/L)*k_b^1.5
+
+so they move with the solution and cannot be seeded once. The device closure takes them as per-face
+MASKS plus the intensity and mixing length, and **nothing in this lineage built them**.
+
+That is not a missing feature, it is a silent one. A null mask does not mean "this case has no turbulent
+inlet"; it means no turbulent inlet is applied at all. `TurbulentInletPatchField` held its `kind_` and
+`coefficient_` privately with no accessor, so the projection could not have built them and the driver
+could not have refused either -- a caller cannot distinguish "absent" from "zero" without asking the
+patch what it is.
+
+### Why it was reached now, and what the fixture survey says
+
+It surfaced as the blocker on wiring the device turbulence closure into a gate arm at all
+(`test_rho_simple_step_cuda.cu` sets `gin.correct = nullptr` in every registered arm). Surveying every
+compressible fixture for one that could host such an arm:
+
+| fixture | k / epsilon inlets | polyMesh |
+|---|---|---|
+| sbMatched | turbulentIntensity + turbulentMixingLength | yes |
+| squareBend | the same pair | yes |
+| rhoKE | plain fixedValue / zeroGradient | NO -- blockMeshDict only |
+
+So the one fixture that would not need the masks has no mesh, and both meshed compressible kEpsilon
+fixtures need them. There is no way to gate the device closure in-loop without building this first.
+
+### The fix
+
+`turbulentInletKind()` and `turbulentInletCoefficient()` are now base virtuals on `fvPatchField`,
+returning -1 and 0 for every patch that is not one -- the same shape as `flowRateValue()`. The -1 is the
+point: it separates "not a turbulent inlet" from "a turbulent inlet whose coefficient is zero", which is
+exactly the distinction a refusal needs.
+
+`createDeviceFields` builds four per-boundary-face arrays in flattenBoundary's walk, plus a
+`hasTurbulentInlet` flag.
+
+### The gate
+
+`rho_createfields_cuda_turbulent` now asserts them face by face against the host patch objects.
+Measured on sbMatched: **400 k faces and 400 epsilon faces**, every mask bit and every coefficient
+matching, with a non-vacuity check that the masks are non-empty on a fixture that has them.
+
+FAIL-PROOF, with the k branch disabled: the face-by-face check FAILS while `hasTurbulentInlet` and the
+non-emptiness check both still pass -- epsilon still sets the flag and the array is still allocated, just
+full of zeros. The three checks are not redundant and the face-by-face one is the load-bearing one.
+
+STILL OPEN: the masks now exist and nothing consumes them yet. Wiring `gin.correct` to the device closure
+is the next step, and the device `alphat` boundary -- the counterpart of the host fix already landed --
+remains ungated until it is.

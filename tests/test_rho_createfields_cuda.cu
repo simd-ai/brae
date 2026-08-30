@@ -260,6 +260,65 @@ int main(int argc, char** argv)
     // would lose it silently. The NEGATIVE CONTROL is that the unmodified patch list is accepted --
     // without it this passes whenever construction throws for any reason at all.
     std::printf("  5. refusal\n");
+    // ---- THE TURBULENT INLETS, per boundary face ------------------------------------------------
+    // OF's turbulentIntensityKineticEnergyInlet and turbulentMixingLengthDissipationRateInlet recompute
+    // their value at every updateCoeffs -- k_b = 1.5*I^2*magSqr(U_b), eps_b = (Cmu^0.75/L)*k_b^1.5 -- so
+    // the closure needs the per-face intensity and mixing length, not the seeded fields.
+    //
+    // Nothing in this lineage produced them. That is not a missing feature but a silent one: the device
+    // closure takes them as MASKS, and a null mask does not mean "this case has no turbulent inlet", it
+    // means no turbulent inlet is applied at all. sbMatched and squareBend both carry the pair, so any
+    // arm that wired the device closure without these would have run a fabricated inlet with nothing
+    // able to refuse -- the caller could not tell the two situations apart.
+    //
+    // Asserted against the HOST patch objects, face by face, in flattenBoundary's walk.
+    {
+        const std::vector<label>  km = dev.turbInletKMask.size()   ? dev.turbInletKMask.host()   : std::vector<label>();
+        const std::vector<label>  em = dev.turbInletEpsMask.size() ? dev.turbInletEpsMask.host() : std::vector<label>();
+        const std::vector<scalar> ki = dev.turbInletKInt.size()    ? dev.turbInletKInt.host()    : std::vector<scalar>();
+        const std::vector<scalar> el = dev.turbInletEpsLen.size()  ? dev.turbInletEpsLen.host()  : std::vector<scalar>();
+
+        label expectK = 0, expectE = 0, wrong = 0, bi = 0;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            const bool kIn = hf.k.internal.empty()
+                           ? false : hf.k.boundary[pi]->turbulentInletKind() == 0;
+            const bool eIn = hf.epsilon.internal.empty()
+                           ? false : hf.epsilon.boundary[pi]->turbulentInletKind() == 1;
+            const scalar kc = hf.k.internal.empty()
+                            ? scalar(0) : hf.k.boundary[pi]->turbulentInletCoefficient();
+            const scalar ec = hf.epsilon.internal.empty()
+                            ? scalar(0) : hf.epsilon.boundary[pi]->turbulentInletCoefficient();
+            for (label i = 0; i < fvp[pi].size; ++i, ++bi)
+            {
+                if (bi >= dev.nBndFaces) break;
+                if (kIn) ++expectK;
+                if (eIn) ++expectE;
+                if (!km.empty())
+                {
+                    if ((km[bi] != 0) != kIn) ++wrong;
+                    if ((em[bi] != 0) != eIn) ++wrong;
+                    if (kIn && std::fabs((double)ki[bi] - (double)kc) > 1e-15) ++wrong;
+                    if (eIn && std::fabs((double)el[bi] - (double)ec) > 1e-15) ++wrong;
+                }
+            }
+        }
+        std::printf("     %-46s k %d faces, epsilon %d faces\n",
+                    "turbulent-inlet faces found", (int)expectK, (int)expectE);
+        check("hasTurbulentInlet agrees with the host patch types",
+              dev.hasTurbulentInlet == (expectK > 0 || expectE > 0));
+        if (expectK > 0 || expectE > 0)
+        {
+            check("every turbulent-inlet face and coefficient matches the host", wrong == 0);
+            // NON-VACUOUS: a mask of all zeros would also give wrong == 0 against a case that has none.
+            check("the masks are non-empty on a fixture that HAS them", !km.empty() && expectK > 0);
+        }
+        else
+        {
+            std::printf("     %-46s %s\n", "no turbulent inlet on this fixture", "(mask correctly absent)");
+        }
+    }
+
     {
         std::vector<FvPatch> coupled = fvp;
         coupled[0].type = "cyclic";

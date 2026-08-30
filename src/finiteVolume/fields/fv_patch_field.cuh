@@ -140,6 +140,17 @@ public:
     // flowRateInletVelocity: the dict flow rate, so the solver can recompute avgU against the live rho.
     virtual scalar flowRateValue() const { return 0.0; }
 
+    // turbulentIntensityKineticEnergyInlet / turbulentMixingLengthDissipationRateInlet: which one, and
+    // its coefficient (the intensity, or the mixing length). Exposed for the same reason
+    // flowRateValue() is -- the DEVICE projection has to rebuild these per boundary face and cannot
+    // reach into the patch object otherwise.
+    //
+    // Returning -1 rather than a valid kind on every other patch type matters: the device closure takes
+    // these as MASKS, and a null mask is not "no such patch", it is silently no turbulent inlet at all
+    // (see the note on KEpsilonInput). A caller that cannot tell the two apart cannot refuse.
+    virtual int    turbulentInletKind() const { return -1; }
+    virtual scalar turbulentInletCoefficient() const { return 0.0; }
+
     // symmetryPlane/symmetry needs PER-COMPONENT device categories for vectors (the wall-normal component
     // is reflected = fixedValue 0, the tangential components are zeroGradient). The device builder keys on
     // this flag + the face normal; scalars are plain zeroGradient so it is a no-op for them.
@@ -1131,6 +1142,9 @@ public:
             (void)Cmu;
         }
     }
+
+    int    turbulentInletKind() const override { return static_cast<int>(kind_); }
+    scalar turbulentInletCoefficient() const override { return coefficient_; }
 
 private:
     Kind   kind_;
