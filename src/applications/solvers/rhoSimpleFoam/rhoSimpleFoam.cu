@@ -81,6 +81,39 @@ void correctFluxCompressible(
 }
 
 
+// fvOptions.correct(he) for limitTemperature: clamp he between he(p,Tmin) and he(p,Tmax). A CORRECTION,
+// so nothing in the assembly changes -- it acts on the solved field and then thermo.correct() turns it
+// into a temperature. The bounds arrive already in energy; see the note in RhoStepInput.
+__global__ void limitEnergyKernel(
+    int    nC,
+    scalar heMin,
+    scalar heMax,
+    scalar* __restrict__ he)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    he[c] = fmin(fmax(he[c], heMin), heMax);
+}
+
+
+// pressureControl::limit -- a clamp, applied in place. OpenFOAM returns true on `limitMaxP || limitMinP`
+// rather than on whether any value actually moved, and the caller re-evaluates p's boundary on that
+// return, so the boundary refresh below is keyed the same way.
+__global__ void limitPressureKernel(
+    int    nC,
+    int    doMax,
+    int    doMin,
+    scalar pMax,
+    scalar pMin,
+    scalar* __restrict__ p)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    if (doMax) p[c] = fmin(p[c], pMax);
+    if (doMin) p[c] = fmax(p[c], pMin);
+}
+
+
 // The closed-volume correction: p += (initialMass - domainIntegrate(psi*p))/domainIntegrate(psi).
 // Two reductions and a scalar add; done on the host because it is two numbers, and the alternative is a
 // device reduction whose result has to come back anyway.
@@ -166,6 +199,8 @@ Residuals rhoSimpleStep(
     uin.gradULimitK = in.gradULimitK;
     uin.correctedLaplacian = in.correctedLaplacian;
     uin.snGradLimitCoeff = in.snGradLimitCoeff;
+    // The porosity the momentum module has always been able to apply, and which the driver never passed.
+    uin.porosity = in.porosity;
     uin.hasMRF = in.hasMRF;
     uin.hasFvOptions = in.hasFvOptions;
     uin.hasCoupledPatches = in.hasCoupledPatches;
@@ -256,6 +291,16 @@ Residuals rhoSimpleStep(
         const DeviceSolverPerf perf =
             deviceJacobiBiCGStab(A, b, f.he, nf, in.tolHe, in.relTolHe, in.maxIter);
         res[in.isE ? "e" : "h"] = perf.initialResidual;
+
+        // fvOptions.correct(he), EEqn.H:27 -- AFTER the solve and BEFORE thermo.correct(), which is what
+        // makes it reach T at all. Applying it later would clamp an energy the thermo had already turned
+        // into a temperature, and applying it earlier would clamp the field the solve is about to
+        // overwrite.
+        if (in.limitHe)
+        {
+            limitEnergyKernel<<<(nC + 255) / 256, 256>>>(nC, in.heMin, in.heMax, f.he.data());
+            cudaCheck(cudaGetLastError(), "rhoSimpleFoam limitEnergy");
+        }
         deviceBCValue(dbHe, f.he, f.heBnd);
     }
 
@@ -387,12 +432,27 @@ Residuals rhoSimpleStep(
         correctVelocity(f.Ux, f.Uy, f.Uz, shim, gpx, gpy, gpz);
     }
 
+    // pressureControl.limit(p), HERE and not earlier: pEqn.H applies it after the velocity correction, so
+    // U is built from the unclipped pressure and only p carries the clip.
+    const bool pLimited = in.limitMaxP || in.limitMinP;
+    if (pLimited)
+    {
+        limitPressureKernel<<<(nC + 255) / 256, 256>>>(nC, in.limitMaxP ? 1 : 0, in.limitMinP ? 1 : 0,
+                                                       in.pMaxLimit, in.pMinLimit, f.p.data());
+        cudaCheck(cudaGetLastError(), "rhoSimpleFoam limitPressure");
+    }
+
     // The closed-volume mass correction. `closedVolume` is set by the predictor, on the same condition
     // adjustPhi and pRefCell are: no patch fixes a pressure value, so the level is undetermined and the
     // total mass is what pins it.
     if (closedVolume)
     {
         closedVolumeCorrection(f.p, f.psi, dm, f.initialMass);
+    }
+
+    // ONE refresh for both, keyed as OpenFOAM keys it: `if (pLimited || closedVolume)`.
+    if (pLimited || closedVolume)
+    {
         deviceBCValue(dbP, f.p, f.pBnd);
     }
 

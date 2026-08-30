@@ -63,6 +63,7 @@
 #include "rhoEEqn.cuh"
 #include "rhoPEqn.cuh"
 #include "rhoPcEqn.cuh"
+#include "device_fvoptions.cuh"   // DevicePorosity
 #include <functional>
 #include <map>
 #include <string>
@@ -146,10 +147,39 @@ struct RhoStepInput
 
     label  pRefCell  = -1;
     scalar pRefValue = 0.0;
+
+    // pressureControl::limit(p) -- pEqn.H/pcEqn.H apply it AFTER the velocity correction, and a clip
+    // requires p's boundary values to be re-evaluated afterwards. The CUDA driver used to drop this
+    // entirely and refuse nothing, so a case naming pMin/pMax in its SIMPLE dict got them on the host
+    // reference and not on the device -- the silent substitution this project exists to catch, in the
+    // driver rather than in a module. rhoBox names `pMin 1000`, which never binds there, which is
+    // exactly why the driver's own gate did not notice.
+    bool   limitMaxP  = false;
+    bool   limitMinP  = false;
+    scalar pMaxLimit  = 0.0;
+    scalar pMinLimit  = 0.0;
     label  nNonOrthogonalCorrectors = 0;
 
     const DeviceBuffer<label>* adjustable      = nullptr;   // adjustPhi mask     (!fixesValue)
     const DeviceBuffer<label>* takeUAtBoundary = nullptr;   // constrainHbyA mask (!assignable)
+
+    // --- the fvOptions this port DOES implement -------------------------------------------------
+    // explicitPorositySource (DarcyForchheimer / fixedCoeff). UEqn.H applies fvOptions(rho, U), and for a
+    // porosity that is `eqn -= porosityEqn` with the resistance the model builds. rhoUEqn.cu has taken
+    // this since it was written; the DRIVER had no field to carry it and never set uin.porosity, so a
+    // porous case ran with the porosity silently absent -- it drives the duct at the wrong speed and
+    // still converges. validation/angledDuct and OpenFOAM's own angledDuctExplicitFixedCoeff are exactly
+    // that case. Null means the case has none; `hasFvOptions` continues to mean an UNPORTED one.
+    const DevicePorosity* porosity = nullptr;
+
+    // limitTemperature (fvOptions/corrections/limitTemperature). A CORRECTION, not a source: it has no
+    // addSup and no constrain, so no assembly changes -- it acts only as fvOptions.correct(he) AFTER the
+    // energy solve and BEFORE thermo.correct(), which is what makes it show up in T at all. The bounds
+    // arrive already converted to ENERGY because the conversion needs the thermo, and the thermo is the
+    // caller's here for the same reason thermoCorrect and updateRho are hooks.
+    bool   limitHe = false;
+    scalar heMin   = 0.0;
+    scalar heMax   = 0.0;
 
     // --- refusals, each thrown by the component that owns the term ---
     bool hasMRF = false, hasFvOptions = false, hasFixedFluxPressure = false, hasCoupledPatches = false;

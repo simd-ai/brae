@@ -50,6 +50,8 @@
 #include "rhoSimpleFoam_cpp.cuh"
 #include "rhoSimpleFoam.cuh"
 #include "rhoCreateFields.cuh"
+#include "thermo_model.cuh"
+#include "device_fvoptions.cuh"   // DevicePorosity   // hConstTToHe -- the reference's OWN T->he conversion
 
 #include <cmath>
 #include <cstdio>
@@ -229,6 +231,63 @@ int main(int argc, char** argv)
     gin.maxIter = 2000;
     gin.pRefCell  = hf.pressureControl.refCell;
     gin.pRefValue = hf.pressureControl.refValue;
+
+    // pressureControl::limit, from the case -- AND made to bind, because the case's own limit does not.
+    // rhoBox names `pMin 1000` while p sits near 1e5, so the shipped limit never clips and a driver that
+    // dropped it entirely passed this gate for as long as it did. The bounds below are tightened around
+    // the field's own range so the clamp is exercised on both paths; the host reference is given exactly
+    // the same ones, so what is compared is still device-against-host and not one code's limiter against
+    // another's absence.
+    // The floor comes from a PRELIMINARY unlimited run, not from the initial field. p starts uniform at
+    // 1e5 here and RISES, so a floor taken from the start state clips nothing -- which the control below
+    // caught when this gate first tried exactly that.
+    std::vector<scalar> pUnlimited, heUnlimited, tUnlimited;
+    {
+        cpu::rhoSimple::RhoSimpleFields fn =
+            cpu::rhoSimple::createFields(caseDir + "/" + startT, caseDir, simpleDict, &fvSolution,
+                                         m, g, fvp);
+        for (int it = 1; it <= iters; ++it)
+            (void)cpu::rhoSimple::rhoSimpleStep(fn, hin, m, g, fvp);
+        pUnlimited = fn.p.internal;
+        heUnlimited = fn.he.internal;
+        tUnlimited  = fn.T.internal;
+    }
+    {
+        scalar pLo = 1e300, pHi = -1e300;
+        for (label c = 0; c < nC; ++c)
+        { pLo = std::fmin(pLo, pUnlimited[c]); pHi = std::fmax(pHi, pUnlimited[c]); }
+        const scalar mid = 0.5 * (pLo + pHi);
+        hf.pressureControl.limitMinP = true;
+        hf.pressureControl.pMin      = mid;          // clips the entire lower half of the field
+        df.pressureControl.limitMinP = true;
+        df.pressureControl.pMin      = mid;
+        gin.limitMinP  = true;
+        gin.pMinLimit  = mid;
+        hin.pMinProbe  = mid;
+
+        // ...and the same for the energy limiter. The floor is chosen in TEMPERATURE and converted with
+        // the reference's OWN hConstTToHe, because the host takes limitTmin/limitTmax in temperature
+        // while the device takes energy. Picking it in energy and inverting by hand would be a second
+        // implementation of the conversion, and the two clamping at slightly different energies is
+        // exactly the kind of difference that would read as a device defect.
+        scalar tLo = 1e300, tHi = -1e300;
+        for (label c = 0; c < nC; ++c)
+        { tLo = std::fmin(tLo, tUnlimited[c]); tHi = std::fmax(tHi, tUnlimited[c]); }
+        const scalar tMid = 0.5 * (tLo + tHi);
+        hin.limitT     = true;
+        hin.limitTmin  = tMid;
+        hin.limitTmax  = 1e30;
+        hin.heMinProbe = hConstTToHe(tMid, hf.thermo);
+        gin.limitHe = true;
+        gin.heMin   = hConstTToHe(tMid, hf.thermo);
+        gin.heMax   = hConstTToHe(1e30, hf.thermo);
+        std::printf("  limitTemperature: Tmin forced to %.6g K (range %.6g .. %.6g) -> he floor %.6g\n",
+                    (double)tMid, (double)tLo, (double)tHi, (double)gin.heMin);
+        gin.limitMaxP  = hf.pressureControl.limitMaxP;
+        gin.pMaxLimit  = hf.pressureControl.pMax;
+        std::printf("  pressureControl: pMin forced to %.6g (field range %.6g .. %.6g) so the clamp binds\n",
+                    (double)mid, (double)pLo, (double)pHi);
+    }
     // The SAME controls the host got. The sentinel is "the case NAMES a factor", not "the factor is
     // below 1": fvMatrix::relax early-returns only on alpha <= 0, so relax(1.0) still applies the
     // dominance clamp and moves the source.
@@ -330,6 +389,97 @@ int main(int argc, char** argv)
     report("T", worstT, 1e-11);
     report("rho", worstRho, 1e-11);
     check("no iteration diverged", firstBad < 0);
+
+    // ---- CONTROL: the POROSITY reaches the momentum equation -----------------------------------
+    // rhoUEqn.cu has been able to apply an explicitPorositySource since it was written, but the DRIVER
+    // had no field to carry one and never set uin.porosity -- so a porous case ran with the porosity
+    // silently absent, which drives the duct at the wrong speed and still converges. validation/angledDuct
+    // and OpenFOAM's own angledDuctExplicitFixedCoeff are exactly that case.
+    //
+    // This asserts the WIRING, not the physics: a synthetic Darcy resistance over half the cells must
+    // change the answer. The physics of the porosity model is rhoUEqn's own to gate; what could not be
+    // seen from inside that module is whether the driver ever hands it one.
+    {
+        DevicePorosity por;
+        por.active = true;
+        std::vector<label> pc;
+        for (label c = 0; c < nC / 2; ++c) pc.push_back(c);
+        por.cells.copyFrom(pc);
+        // fixedCoeff, NOT DarcyForchheimer -- and the module's own refusal is what said so: on a
+        // force-dimensioned momentum equation DarcyForchheimer needs the per-cell laminar mu and rho to
+        // build Cd, which this assembly is not given, so it throws rather than solving the kinematic
+        // form with nu = 0. fixedCoeff takes rhoRef from the dictionary and is the branch the
+        // compressible tutorials use (angledDuctExplicitFixedCoeff is one).
+        por.fixed  = true;
+        por.rhoRef = 1.0;
+        for (int i = 0; i < 9; ++i) { por.fa[i] = 0.0; por.fb[i] = 0.0; }
+        por.fa[0] = por.fa[4] = por.fa[8] = 5.0e2;   // diag(alpha), large enough to bite in one iteration
+
+        gpu::rhoSimple::RhoDeviceFields dv =
+            gpu::rhoSimple::createDeviceFields(df, m, g, fvp);
+        gpu::rhoSimple::RhoSolverWorkspace wp;
+        gpu::rhoSimple::RhoStepInput pin2 = gin;
+        pin2.porosity = &por;
+        pin2.takeUAtBoundary = &dv.takeUAtBoundary;
+        pin2.adjustable      = &dv.adjustable;
+        // The transport for iteration 1, from the same state the main run started from.
+        std::vector<scalar> mu2, al2;
+        std::vector<std::vector<scalar>> muB2, alB2;
+        cpu::rhoSimple::effectiveTransport(df, fvp, mu2, muB2, al2, alB2);
+        DeviceBuffer<scalar> dMu2(mu2), dAl2(al2);
+        DeviceBuffer<scalar> dMuB2(flat(muB2, fvp, dm.nBndFaces, 0.0));
+        DeviceBuffer<scalar> dAlB2(flat(alB2, fvp, dm.nBndFaces, 0.0));
+        pin2.muEffCell = &dMu2;       pin2.muEffBndFace = &dMuB2;
+        pin2.alphaEffCell = &dAl2;    pin2.alphaEffBndFace = &dAlB2;
+        pin2.thermoCorrect = [](){};  // the projection is fresh; one iteration needs no thermo round-trip
+        pin2.updateRho     = [](){};
+        gpu::rhoSimple::rhoSimpleStep(dv.f, wp, dv.dm, dv.dbU, dv.dbP, dv.dbHe, pin2);
+        const std::vector<scalar> withPor = dv.f.Ux.host();
+
+        gpu::rhoSimple::RhoDeviceFields dv0 =
+            gpu::rhoSimple::createDeviceFields(df, m, g, fvp);
+        gpu::rhoSimple::RhoSolverWorkspace w0;
+        gpu::rhoSimple::RhoStepInput pin0 = pin2;
+        pin0.porosity = nullptr;
+        pin0.takeUAtBoundary = &dv0.takeUAtBoundary;
+        pin0.adjustable      = &dv0.adjustable;
+        gpu::rhoSimple::rhoSimpleStep(dv0.f, w0, dv0.dm, dv0.dbU, dv0.dbP, dv0.dbHe, pin0);
+        const std::vector<scalar> noPor = dv0.f.Ux.host();
+
+        const double r = relL2(withPor, noPor);
+        std::printf("     %-58s rel=%.3e\n", "control: a porosity CHANGES the momentum answer", r);
+        check("the driver passes the porosity to the momentum equation", r > 1e-6);
+    }
+
+    // ---- CONTROL: the ENERGY limiter must actually BIND ----------------------------------------
+    // Same trap as the pressure limiter, and the same remedy. limitTemperature is a CORRECTION applied
+    // to he after the solve; the CUDA driver dropped it entirely and refused nothing, so a case naming
+    // it got the clamp on the host reference and not on the device. A bound taken from the start state
+    // would clip nothing, so the floor comes from the unlimited run's own he range and the control
+    // requires it to clip a substantial share.
+    {
+        std::size_t atFloor = 0;
+        for (label c = 0; c < nC; ++c)
+            if (hf.he.internal[c] <= hin.heMinProbe * (1.0 + 1e-12)) ++atFloor;
+        std::printf("     %-58s %zu of %d cells at the floor\n",
+                    "control: the energy limiter BINDS on this run", atFloor, (int)nC);
+        check("the energy limiter clips a substantial share", atFloor > (std::size_t)(nC / 10));
+    }
+
+    // ---- CONTROL: the pressure limiter must actually BIND --------------------------------------
+    // Forcing pMin only matters if it clips. If it does not, every agreement above is agreement about a
+    // no-op -- which is exactly how a driver missing the limiter entirely passed this gate until an audit
+    // found it. The unlimited run computed above is the comparison.
+    {
+        const double moved = relL2(pUnlimited, hf.p.internal);
+        std::size_t atFloor = 0;
+        for (label c = 0; c < nC; ++c)
+            if (hf.p.internal[c] <= hin.pMinProbe * (1.0 + 1e-12)) ++atFloor;
+        std::printf("     %-58s rel=%.3e   %zu of %d cells at the floor\n",
+                    "control: the pressure limiter BINDS on this run", moved, atFloor, (int)nC);
+        check("the limiter clips something (else the comparison is a no-op)", moved > 1e-12);
+        check("...and clips a substantial share of the field", atFloor > (std::size_t)(nC / 10));
+    }
 
     // ---- CONTROL: the trajectory must MOVE ---------------------------------------------------
     // If the case sat still, every agreement above would be the agreement of two codes that did nothing.

@@ -111,6 +111,10 @@ struct StepInput
     scalar relaxPEqn = 1.0;        // relaxationFactors/EQUATIONS p, for pEqn.relax()
     bool   relaxPEqnSpecified = false;
     scalar relaxRho = 1.0;         // rho.relax(), applied only when NOT transonic
+    // Diagnostic only: the pressure floor a GATE forced, so it can report how many cells sit on it.
+    // The solver reads pMin/pMax from PressureControl, never from here.
+    scalar pMinProbe = 0.0;
+    scalar heMinProbe = 0.0;   // likewise, for the energy floor a gate forced
 
     // --- linear solver ---
     scalar tolU = 1e-12, relTolU = 0.0;
