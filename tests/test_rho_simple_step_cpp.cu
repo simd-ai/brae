@@ -29,6 +29,7 @@
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
 #include "foam_field_reader.cuh"
+#include "patch_entry_lookup.cuh"   // findPatchEntry -- OF key resolution: exact name, then group, then regex
 #include "foam_dict.cuh"
 #include "rhoSimpleFoam_cpp.cuh"
 #include "scheme_parse.cuh"
@@ -544,6 +545,73 @@ int main(int argc, char** argv)
                 std::printf("       %s in zone '%s' %.4e   outside %.4e\n", fld, z.first.c_str(),
                             nin  > 0 ? std::sqrt(din/nin)   : 0.0,
                             nout > 0 ? std::sqrt(dout/nout) : 0.0);
+            }
+        }
+    }
+
+    // ---- alphat ON THE BOUNDARY, against OpenFOAM's own written patch values --------------------
+    // The internal comparison above says nothing about this. OpenFOAM's EddyDiffusivity::correctNut ends
+    // with `alphat_.correctBoundaryConditions()` (EddyDiffusivity.C:38), and on a wall carrying
+    // compressible::alphatWallFunction that evaluates to operator==(rhow*tnutw/Prt_)
+    // (alphatWallFunctionFvPatchScalarField.C:125) -- with the PATCH's own Prt_, whose default is 0.85
+    // (:76), NOT the turbulence model's, whose default is 1.0. Two different turbulent Prandtl numbers
+    // in one case.
+    //
+    // brae's OF-mirror lineage does neither. kEpsilon_cpp.cu:599-601 writes alphat over CELLS only, and
+    // the sole boundary evaluation is rhoCreateFields_cpp.cu:548, once at construction. So alphat's patch
+    // values are whatever 0/alphat shipped -- on sbMatched `value uniform 0` at the walls -- for the whole
+    // run, and alphaEff at the wall loses the entire turbulent contribution. The legacy solver does gather
+    // this (gpuRhoSimpleFoam.cu:432-457); this lineage never did.
+    //
+    // OpenFOAM's written field is the oracle, because the _cpp reference carries the same defect and
+    // cannot be one.
+    if (f.turbulent && !f.alphat.internal.empty())
+    {
+        const std::string apath = caseDir + "/" + endT + "/alphat";
+        if (std::ifstream(apath.c_str()).good())
+        {
+            const FieldData<scalar> aFd = readField<scalar>(apath);
+            double num = 0.0, den = 0.0, znum = 0.0;
+            label nWallFn = 0, nFaces = 0;
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                const PatchFieldData<scalar>* pb = findPatchEntry(aFd.boundary, patches[pi]);
+                if (!pb) continue;
+                const bool wallFn = (pb->type == "compressible::alphatWallFunction"
+                                  || pb->type == "alphatWallFunction");
+                if (!wallFn) continue;
+                ++nWallFn;
+                const std::vector<scalar>& bb = f.alphat.boundary[pi]->value();
+                const std::vector<scalar>& zb = z0.alphat.boundary[pi]->value();
+                for (label i = 0; i < patches[pi].size; ++i)
+                {
+                    const double ofv = pb->valueUniform
+                                     ? (double)pb->uniformValue
+                                     : (i < (label)pb->values.size() ? (double)pb->values[i] : 0.0);
+                    const double bv  = i < (label)bb.size() ? (double)bb[i] : 0.0;
+                    const double zv  = i < (label)zb.size() ? (double)zb[i] : 0.0;
+                    num  += (bv - ofv) * (bv - ofv);
+                    znum += (zv - ofv) * (zv - ofv);
+                    den  += ofv * ofv;
+                    ++nFaces;
+                }
+            }
+            if (nWallFn > 0)
+            {
+                const double rel  = den > 0.0 ? std::sqrt(num  / den) : std::sqrt(num);
+                const double zrel = den > 0.0 ? std::sqrt(znum / den) : std::sqrt(znum);
+                std::printf("       %-32s %d faces on %d alphatWallFunction patch(es)\n",
+                            "(alphat wall faces compared)", (int)nFaces, (int)nWallFn);
+                // The start state is the value 0/alphat ships at the wall -- `uniform 0` on both
+                // fixtures -- so its deviation from OpenFOAM's answer is exactly 1.0, and this bound is
+                // 1000x below it. That is also the number this gate read before the wall function was
+                // computed at all, which is what makes the bound a measurement rather than a hope.
+                gateIfItMoves("alphat BOUNDARY vs OpenFOAM", rel, zrel, 1.0e-3);
+            }
+            else
+            {
+                std::printf("     %-34s no alphatWallFunction patch on this fixture\n",
+                            "alphat BOUNDARY: SKIPPED");
             }
         }
     }

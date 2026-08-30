@@ -129,6 +129,21 @@ struct RhoSimpleFields
     bool                   turbulent = false;   // momentumTransport simulationType RAS
     std::string            rasModel;            // e.g. "kEpsilon"; empty when laminar
     GeometricField<scalar> k, epsilon, nut, alphat;
+    // Which alphat patches carry compressible::alphatWallFunction, and each one's OWN Prt.
+    //
+    // OpenFOAM ends every EddyDiffusivity::correctNut() with alphat_.correctBoundaryConditions()
+    // (EddyDiffusivity.C:38), and on such a patch that evaluates to operator==(rhow*tnutw/Prt_)
+    // (alphatWallFunctionFvPatchScalarField.C:125). That Prt_ defaults to 0.85 (:76) and is NOT the
+    // turbulence model's, which defaults to 1.0 -- one case carries two different turbulent Prandtl
+    // numbers and using either everywhere is wrong somewhere.
+    //
+    // Gathered here because this is where 0/alphat is read, and per patch rather than per face because
+    // the entry is a dictionary key. The key may be an exact name, a GROUP or a REGEX: squareBend keys
+    // it as `(?i).*walls` against a patch literally named `walls`, so an exact-name compare misses it and
+    // Prt silently reverts to the model's 1.0 -- the legacy solver records that as ~15% low wall alphat
+    // and wall heat flux (gpuRhoSimpleFoam.cu:437-452). findPatchEntry does OpenFOAM's resolution.
+    std::vector<char>   alphatWallFn;   // per patch, 1 = carries an alphat wall function
+    std::vector<scalar> alphatPrt;      // per patch, that patch's own Prt (0.85 where unset)
     // kOmegaSST transports omega where kEpsilon transports epsilon. Which one is populated follows
     // rasModel, and the driver branches on the same name rather than on which field happens to exist.
     GeometricField<scalar> omega;

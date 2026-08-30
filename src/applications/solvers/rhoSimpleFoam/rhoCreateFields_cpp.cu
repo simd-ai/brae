@@ -544,8 +544,25 @@ RhoSimpleFields createFields(
                 }
                 if (fileExists(timeDir + "/alphat"))
                 {
-                    f.alphat = buildField<scalar>(readField<scalar>(timeDir + "/alphat"), patches, nC);
+                    const FieldData<scalar> aFd = readField<scalar>(timeDir + "/alphat");
+                    f.alphat = buildField<scalar>(aFd, patches, nC);
                     f.alphat.evaluateBoundary();
+                    // Which patches carry compressible::alphatWallFunction, and each one's own Prt --
+                    // see the note on RhoSimpleFields. This is the ONLY place 0/alphat is read, so it is
+                    // the only place the patch types are still in hand.
+                    f.alphatWallFn.assign(patches.size(), 0);
+                    f.alphatPrt.assign(patches.size(), scalar(0.85));
+                    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                    {
+                        const PatchFieldData<scalar>* pb = findPatchEntry(aFd.boundary, patches[pi]);
+                        if (!pb) continue;
+                        if (pb->type == "compressible::alphatWallFunction"
+                         || pb->type == "alphatWallFunction")
+                        {
+                            f.alphatWallFn[pi] = 1;
+                            f.alphatPrt[pi]    = pb->Prt;
+                        }
+                    }
                 }
             }
         }

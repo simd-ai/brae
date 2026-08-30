@@ -1135,3 +1135,75 @@ eight fields. `--check` exits 1 on it.
 
 Regenerated, and registered as `manifest_rhosimplefoam_not_drifted`. A check that exists but that nothing
 runs is not a check, and this tree now has one fewer of those.
+
+## The wall's turbulent diffusivity was exactly zero for the whole run
+
+OpenFOAM ends every `EddyDiffusivity::correctNut()` with `alphat_.correctBoundaryConditions()`
+(EddyDiffusivity.C:38). On a patch carrying `compressible::alphatWallFunction` that evaluates to
+`operator==(rhow*tnutw/Prt_)` (alphatWallFunctionFvPatchScalarField.C:125).
+
+The OF-mirror lineage wrote alphat over CELLS only -- `kEpsilon_cpp.cu:601`, `(*comp->alphat)[c]` for
+`c < nC` -- and the device closure's `alphatKernel` does the same. The driver DID call
+`f.alphat.evaluateBoundary()` after every `correct()`, so this did not look like an omission.
+
+It was an UNHONOURED CONTRACT, which is a different thing and the more interesting one. The patch factory
+does not silently absorb unknown types -- `fv_patch_field.cuh:1637` throws on any it does not know. It
+maps this one deliberately, and says why: `compressible::alphatWallFunction` becomes a `CalculatedPatchField`
+"exactly like the nut wall functions -- THE MODEL WRITES THE VALUE" (`fv_patch_field.cuh:1496-1504`).
+That is the right mapping and the right reading of OpenFOAM: nothing is prescribed at such a patch.
+`calculated` means the model supplies it, and for nut the model does -- the closure writes `nutBnd`.
+For alphat, on this lineage, no model ever did. So `evaluateBoundary()` faithfully returned what
+`0/alphat` shipped, `value uniform 0` on both sbMatched and squareBend, for the whole run.
+
+This is the SECOND contract of that shape found in this port in one sitting; the first was
+`rhoUEqn.cuh:64-83`'s "WHAT THE CALLER MUST HAVE DONE BEFORE ENTERING", which the CUDA driver satisfied
+in none of its five clauses. A comment that says another component does the work is a claim about code
+that may not exist, and nothing in the build checks it.
+
+**Measured against OpenFOAM's own written `alphat` boundaryField: 1.000000e+00 relative, over 22400 wall
+faces.** A relative error of exactly one is not a discretisation gap -- it says brae's wall alphat was
+identically ZERO where OpenFOAM's is not. `alphaEff` at the wall therefore carried none of the turbulent
+diffusivity, which on a fixed-temperature wall is the whole of the turbulent heat flux.
+
+### The oracle had to be OpenFOAM, because the reference has the defect too
+
+The usual arrangement -- gate the CUDA path against the `_cpp` reference -- could not work here: both
+lineages compute alphat on cells alone, so they agree with each other perfectly and are both wrong. The
+whole-solver gate could not see it either, because it compared alphat's INTERNAL field only. OpenFOAM
+writes the patch values it computed, so its own field is the oracle.
+
+### Two things taken from OpenFOAM rather than assumed
+
+- `Prt_` is the PATCH's own, default **0.85** (alphatWallFunctionFvPatchScalarField.C:76), and NOT the
+  turbulence model's, whose default is 1.0 (EddyDiffusivity.C:36). One case carries two different
+  turbulent Prandtl numbers, and using either everywhere is wrong somewhere.
+- The boundaryField key may be an exact name, a GROUP, or a REGEX. squareBend keys this entry as
+  `(?i).*walls` against a patch literally named `walls`, so an exact-name compare misses it and Prt
+  silently reverts to 1.0. `findPatchEntry` does OpenFOAM's resolution. The legacy solver already had
+  this and records the trap as ~15% low wall alphat and wall heat flux
+  (gpuRhoSimpleFoam.cu:437-452) -- this lineage never gathered it at all.
+
+### Result
+
+| fixture | before | after | bound |
+|---|---|---|---|
+| squareBend | 1.000000e+00 | 2.254304e-04 | 1.0e-3 |
+| sbMatched | 1.000000e+00 | 5.530115e-05 | 1.0e-3 |
+
+The control is free and exact: the start state is the shipped `uniform 0`, so its deviation from
+OpenFOAM's answer is 1.0 -- a thousand times the bound, and literally the number this gate read before
+the wall function was computed. `gateIfItMoves` asserts the bound only against that.
+
+Applied ONLY where the case names the wall function; every other patch keeps the condition
+`evaluateBoundary()` applied, which is what OpenFOAM leaves to that patch's own `evaluate()`.
+
+### STILL OPEN: the device half, and why no gate can currently reach it
+
+`rhoCreateFields.cu:250` seeds the device `alphatBnd` by flattening the host field AT CONSTRUCTION, when
+it is still the file's `uniform 0`, and nothing refreshes it thereafter. The device closure has the same
+cells-only `alphatKernel`.
+
+It cannot be gated as things stand, and not because of a fixture: `test_rho_simple_step_cuda.cu:389` sets
+`gin.correct = nullptr` in EVERY registered arm, so the device turbulence closure does not run in any
+gate at all. Fixing the device alphat boundary requires first wiring the turbulence hook into a gate arm
+that runs it. Recorded here rather than half-fixed.
