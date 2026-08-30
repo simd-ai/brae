@@ -249,13 +249,52 @@ int main(int argc, char** argv)
             adjustable.push_back(fixed ? 0 : 1);
         }
     }
-    bool masksDiffer = false;
+    // THIS CONTROL USED TO ASSERT THE OPPOSITE OF WHAT IT CLAIMED, and could not fail.
+    //
+    // takeU = !assignable and adjustable = !(fixesValue && !isInletOutlet), so when the two RULES AGREE
+    // -- the ordinary case -- the masks are COMPLEMENTS and `takeU[i] != adjustable[i]` is true. The old
+    // form asserted exactly that, and broke out of the loop on the first ordinary patch, so it passed on
+    // every fixture whether or not the implementation conflated the two rules. What it named as the
+    // defect (one mask derived from the other) is the case where the masks are EQUAL on a face.
+    //
+    // The rules separate only on a patch that is non-assignable WITHOUT fixing a value, which is SLIP.
+    // Neither registered fixture here has one -- matrixDumpAsym and pitzDailyTurb are
+    // fixedValue/zeroGradient/noSlip/empty -- so this reports itself vacuous rather than asserting into
+    // the void. The discriminating fixture DOES exist: OpenFOAM's own
+    // compressible/rhoSimpleFoam/angledDuctExplicitFixedCoeff gives porosityWall `type slip` on U, and
+    // tests/rho_angledduct_structural.sh measures exactly this there (1600 faces separate the rules).
+    std::size_t sameFaces = 0;
+    bool separable = false;
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        const bool a  = U.boundary[pi]->assignable();
+        const bool fv = U.boundary[pi]->fixesValue();
+        const bool io = U.boundary[pi]->isInletOutlet();
+        if ((!a) != (fv && !io)) separable = true;
+    }
     for (std::size_t i = 0; i < takeU.size(); ++i)
-        if (takeU[i] != adjustable[i]) { masksDiffer = true; break; }
+        if (takeU[i] == adjustable[i]) ++sameFaces;   // NOT complements -> the two rules disagree here
     takeU.resize(dm.nBndFaces, 0);
     adjustable.resize(dm.nBndFaces, 0);
     DeviceBuffer<label> dTakeU(takeU), dAdjust(adjustable);
-    check(masksDiffer, "assignable and fixesValue masks DIFFER on this case (control)");
+    std::printf("    %-46s %zu faces\n", "(faces where the two rules disagree)", sameFaces);
+    if (separable) check(sameFaces > 0, "assignable and fixesValue masks DIFFER on this case (control)");
+    else           std::printf("    %-46s %s\n",
+                               "(no slip patch here -- this control is vacuous)", "noted");
+
+    // ...and whether adjustPhi RUNS at all, which decides whether `adjustable` is read on this fixture.
+    // OpenFOAM's adjustPhi returns immediately when any p patch fixes a value (rhoPEqn_cpp.cu:75-76),
+    // and both fixtures registered for this gate have a fixedValue p -- so the mask is inert on every
+    // one of the arms that pass here. Printed rather than asserted, because a fixture where it DOES run
+    // (a closed volume, no fixed-value p) is what would be needed and none is registered.
+    {
+        bool anyFixedP = false;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            if (p.boundary[pi]->fixesValue()) anyFixedP = true;
+        std::printf("    %-46s %s\n", "(adjustPhi runs on this fixture?)",
+                    anyFixedP ? "NO -- a p patch fixes a value, so `adjustable` is inert here"
+                              : "yes -- closed volume");
+    }
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         std::printf("    PATCH %-14s n=%5d assignable=%d fixesValue=%d inletOutlet=%d\n",
                     fvp[pi].name.c_str(), (int)fvp[pi].size,
