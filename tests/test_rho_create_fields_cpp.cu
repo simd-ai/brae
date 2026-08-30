@@ -176,6 +176,48 @@ int main(int argc, char** argv)
             check("and the refusal names the energy it found",
                   msg.find("absoluteEnthalpy") != std::string::npos);
         }
+
+        // ---- THE CASE'S OWN kEpsilon COEFFICIENTS REACH construction-time correctNut ----------
+        // createFields is where OpenFOAM's turbulence->validate() equivalent runs: correctNut writes
+        // nut = Cmu*k^2/eps and EddyDiffusivity follows with alphat = rho*nut/Prt, and those two fields
+        // are what the FIRST momentum and energy solves consume. brae used to default-construct the
+        // coefficients here and hardcode `const scalar Prt = 1.0;` -- discarding a Prt it had already
+        // parsed into f.thermo.Prt from the dict OpenFOAM reads it from.
+        //
+        // No shipped fixture declares either, which is exactly why it survived. argv[5] is the same case
+        // with `kEpsilonCoeffs { Cmu 0.05; Prt 0.5; }` added, so the two must produce DIFFERENT nut and
+        // alphat. Ratios rather than bounds, because the relationship is exact: nut scales with Cmu and
+        // alphat with Cmu/Prt, so a substitution shows up as a ratio of 1 instead.
+        if (argc > 5)
+        {
+            const cpu::rhoSimple::RhoSimpleFields fc =
+                cpu::rhoSimple::createFields(caseDir + "/0.orig", std::string(argv[5]), simpleDict,
+                                             &fvSolution, m, g, patches);
+            const cpu::rhoSimple::RhoSimpleFields fd =
+                cpu::rhoSimple::createFields(caseDir + "/0.orig", caseDir, simpleDict,
+                                             &fvSolution, m, g, patches);
+            double nutRatio = 0.0, alphatRatio = 0.0;
+            std::size_t nNut = 0, nAl = 0;
+            for (std::size_t c = 0; c < fd.nut.internal.size() && c < fc.nut.internal.size(); ++c)
+            {
+                if (std::fabs(fd.nut.internal[c]) > 0.0)
+                { nutRatio += (double)(fc.nut.internal[c] / fd.nut.internal[c]); ++nNut; }
+            }
+            for (std::size_t c = 0; c < fd.alphat.internal.size() && c < fc.alphat.internal.size(); ++c)
+            {
+                if (std::fabs(fd.alphat.internal[c]) > 0.0)
+                { alphatRatio += (double)(fc.alphat.internal[c] / fd.alphat.internal[c]); ++nAl; }
+            }
+            if (nNut) nutRatio /= (double)nNut;
+            if (nAl)  alphatRatio /= (double)nAl;
+            std::printf("     %-34s nut x%.4f (expect 0.5556)   alphat x%.4f (expect 1.1111)\n",
+                        "case coefficients reach correctNut", nutRatio, alphatRatio);
+            // Cmu 0.05/0.09 = 0.5556 on nut; alphat carries that over Prt 0.5/1.0, i.e. x2 -> 1.1111.
+            check("the case's Cmu reaches nut at construction",
+                  nNut > 0 && std::fabs(nutRatio - 0.05/0.09) < 1e-6);
+            check("the case's Prt reaches alphat at construction",
+                  nAl > 0 && std::fabs(alphatRatio - (0.05/0.09)/0.5) < 1e-6);
+        }
         else
         {
             std::printf("     %-46s %s\n", "unsupported-energy fixture not supplied", "SKIP");

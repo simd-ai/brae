@@ -437,6 +437,10 @@ RhoSimpleFields createFields(
         f.he.evaluateBoundary();
     }
 
+    // The case's own kEpsilon coefficients, read below and used by the construction-time correctNut
+    // further down -- declared here because the dictionary block that reads them closes before it.
+    KEpsilonCoeffs keCase;
+
     // compressible::turbulenceModel::New(rho, U, phi, thermo) -- the model is constructed here in
     // createFields.H, and constructing it is what reads k, epsilon, nut and alphat. A laminar case reads
     // none of them, which is why they are gated on the dictionary rather than on the files existing.
@@ -462,6 +466,10 @@ RhoSimpleFields createFields(
             const FoamDict* ras = mt2.subDict("RAS");
             f.turbulent = !ras || ras->wordOr("turbulence", "on") != "off";
             f.rasModel  = ras ? ras->wordOr("RASModel", "") : "";
+            if (const FoamDict* kec = ras ? ras->subDict("kEpsilonCoeffs") : nullptr)
+            {
+                keCase.Cmu = kec->scalarOr("Cmu", keCase.Cmu);
+            }
             if (f.turbulent)
             {
                 if (f.rasModel != "kEpsilon" && f.rasModel != "kOmegaSST")
@@ -563,13 +571,23 @@ RhoSimpleFields createFields(
         && static_cast<label>(f.k.internal.size()) == nC
         && static_cast<label>(f.epsilon.internal.size()) == nC)
     {
-        const KEpsilonCoeffs keco;
-        f.nut.internal = cpu::kEpsilonRef::correctNut(f.k.internal, f.epsilon.internal, keco);
+        // THE CASE'S OWN COEFFICIENTS, not the model defaults. This block used to default-construct
+        // KEpsilonCoeffs and then write `const scalar Prt = 1.0;`, so a case declaring
+        // `kEpsilonCoeffs { Cmu 0.1; Prt 0.85; }` had both silently replaced by 0.09 and 1.0 -- while
+        // the Prt it asked for was already sitting in f.thermo.Prt, parsed at readThermoCoeffs above
+        // from exactly the dict OpenFOAM reads it from (EddyDiffusivity::correctNut ->
+        // Prt_.readIfPresent(this->coeffDict())).
+        //
+        // It reaches the answer through turbulence->validate(): OpenFOAM's correctNut() at construction
+        // uses the MODEL's coefficients, and the nut and alphat it writes are what the first momentum
+        // and energy solves run on. Wrong here means iteration 1 is wrong on a case that names either.
+        // No compressible fixture declares them, so this was invisible -- which is why it survived.
+        f.nut.internal = cpu::kEpsilonRef::correctNut(f.k.internal, f.epsilon.internal, keCase);
         // EddyDiffusivity::correctNut runs straight after for the compressible instantiation:
         // alphat = rho*nut/Prt. The energy equation reads it through alphaEff on the very first pass.
         if (static_cast<label>(f.alphat.internal.size()) == nC)
         {
-            const scalar Prt = 1.0;
+            const scalar Prt = f.thermo.Prt;
             for (label c = 0; c < nC; ++c) f.alphat.internal[c] = f.rho.internal[c] * f.nut.internal[c] / Prt;
         }
     }

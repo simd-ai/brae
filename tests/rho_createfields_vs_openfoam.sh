@@ -110,4 +110,23 @@ sed -i 's/energy  *sensibleInternalEnergy;/energy          absoluteEnthalpy;/' \
 grep -q "absoluteEnthalpy" "$W/badenergy/constant/thermophysicalProperties" \
     || { echo "FAIL: could not build the unsupported-energy fixture"; exit 1; }
 
-"$BIN" "$W/case" "$W/cold" "$W/oracle/$ITERS" "$W/badenergy"
+# 5. The COEFFICIENT fixture: the same case declaring its own kEpsilonCoeffs. createFields runs
+#    OpenFOAM's turbulence->validate() equivalent at construction -- correctNut writes nut = Cmu*k^2/eps
+#    and alphat = rho*nut/Prt, and those are what the FIRST momentum and energy solves run on. brae used
+#    to default-construct the coefficients and hardcode Prt = 1.0 there, discarding a Prt it had already
+#    parsed. No shipped fixture declares either, so nothing could see it; this makes one that does.
+mkdir -p "$W/coeffs/constant"
+cp -r "$W/case/constant/." "$W/coeffs/constant/"
+TP="$W/coeffs/constant/turbulenceProperties"
+[ -f "$TP" ] || TP="$W/coeffs/constant/momentumTransport"
+python3 - "$TP" <<'PYADD'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+# Add a coeffs dict inside RAS { ... }, and a Prt beside it. Both differ from the defaults (0.09 / 1.0).
+s = re.sub(r'(RASModel\s+\w+\s*;)', r'\1\n    kEpsilonCoeffs { Cmu 0.05; Prt 0.5; }', s, count=1)
+open(p, 'w').write(s)
+PYADD
+grep -q "Cmu 0.05" "$TP" || { echo "FAIL: could not build the coefficient fixture"; exit 1; }
+
+"$BIN" "$W/case" "$W/cold" "$W/oracle/$ITERS" "$W/badenergy" "$W/coeffs"
