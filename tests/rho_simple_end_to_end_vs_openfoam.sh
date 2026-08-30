@@ -75,7 +75,11 @@ open(c, 'w').write(s)
 # trajectory, and a solver that stopped early would be compared at a different point.
 f = os.path.join(d, 'system/fvSolution')
 s = open(f).read()
-s = re.sub(r'residualControl\s*\{.*?\n\s*\}', 'residualControl\n    {\n    }', s, flags=re.S)
+# `[^{}]*` rather than `.*?\n\s*\}`: residualControl has no nested braces, and the old pattern required
+# a NEWLINE before the closing brace, so a fixture that puts the whole block on one line -- rhoBox and
+# rhoTP both do -- kept its residualControl and OpenFOAM stopped early on convergence instead of running
+# the requested count. The script then failed looking for a time directory OpenFOAM never wrote.
+s = re.sub(r'residualControl\s*\{[^{}]*\}', 'residualControl { }', s)
 open(f, 'w').write(s)
 PYEOF
 

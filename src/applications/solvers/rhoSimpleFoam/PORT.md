@@ -1330,3 +1330,52 @@ no `kEpsilonCoeffs`, so the control cannot quietly become a different test than 
 
 FAIL-PROOF, with the loop reverted to `in.keCoeffs` / `in.Prt`: both deltas collapse to zero and the two
 checks fail, because mutating the field set then changes nothing the solve reads.
+
+### rhoTP: where the divergence is localised to, and what has been ruled out
+
+The two boundary conditions are now implemented and the case still diverges. What follows is the bisect,
+so the next attempt does not repeat it.
+
+**The driver is not the problem.** `validation/rhoBox` is `validation/rhoTP` with exactly two boundary
+conditions changed -- `totalPressure` -> `zeroGradient` on p's inlet and `pressureInletOutletVelocity` ->
+`fixedValue` on U's inlet -- and NOTHING else: same mesh, same thermo, same fvSolution, same relaxation,
+same 1200 cells. Run through this driver against real OpenFOAM for 300 iterations, rhoBox reads
+
+    p 4.989295e-14    T 2.503363e-12    U 9.116201e-12    rho 2.211032e-12
+
+so the compressible path is essentially exact on this geometry and the instability belongs entirely to
+that pair of boundary conditions.
+
+**Ruled out, each with the measurement or the source that did it:**
+
+- *piov's `assignable()`*. brae returns false; OpenFOAM's `directionMixedFvPatchField::assignable()`
+  returns false too (`directionMixedFvPatchField.H:133`) -- against a base default of true and a
+  `transformFvPatchField` that overrides to true, so this was worth checking. brae is correct, and
+  `constrainHbyA` taking U at that patch is OpenFOAM's own behaviour.
+- *p's boundary not being relaxed*. Real (see the note at the relax site) and NOT the cause: relaxing
+  both halves is bit-identical on rhoBox and leaves rhoTP's iteration-by-iteration trace unchanged to
+  every printed digit, because totalPressure's value is overwritten by the next updateCoeffs anyway.
+- *piov alone*. rhoBox with ONLY the piov inlet swapped in is stable -- p 1.246566e-07, U 1.372174e-02,
+  rho 9.165351e-04 at 200 iterations, a real solution short of converged rather than a blow-up.
+
+**Not a valid test, recorded so it is not repeated:** rhoBox with only the *totalPressure* inlet swapped
+in diverges, but that case fixes U at the inlet AND pressure at both ends, which over-specifies the mass
+flow. Its divergence says nothing about the implementation. The two conditions are only meaningful as a
+pair, which is why rhoTP ships them together.
+
+**The trace.** Residuals oscillate from the second iteration and never settle:
+
+    iter  2   U 1.626e-01   h 2.522e-01   p 8.454e-01
+    iter  8   U 7.662e-04   h 5.786e-01   p 9.986e-01
+    iter 11   U 6.212e-06   h 1.633e-05   p 9.999e-01
+    iter 12   U 4.883e-03   h 9.998e-01   p 9.999e-01
+
+U and h reach 1e-05/1e-06 and are thrown back to O(1), while p's initial residual never leaves ~1.0 --
+the pressure equation is not converging at any point. The physics is a delicate one and worth stating,
+because it is what any fix has to respect: at the operating point the ENTIRE driving pressure is consumed
+by the dynamic head (p0 - p_outlet = 200 Pa, and 0.5*rho*U^2 at OpenFOAM's converged |Ux| rms of
+1.8469e+01 is ~198 Pa), so the inlet static pressure sits within a couple of Pa of the outlet's and the
+velocity is almost unconstrained. OpenFOAM converges it in 411 iterations with `p 0.3`; brae does not.
+
+rhoTP remains UNREGISTERED. It would fail, and registering a failing gate to mark a known defect is how a
+suite stops meaning anything.

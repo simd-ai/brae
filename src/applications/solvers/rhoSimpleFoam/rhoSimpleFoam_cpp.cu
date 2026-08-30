@@ -423,6 +423,16 @@ Residuals rhoSimpleStep(
 
     // p.relax() -- the FIELD factor, not the equation one. Both are named `p` in fvSolution and they live
     // in different sub-dictionaries; using the equation factor here relaxes the wrong thing.
+    //
+    // ONLY THE INTERNAL FIELD, and OpenFOAM relaxes BOTH halves: GeometricField::relax is
+    // operator==(prevIter() + alpha*(*this - prevIter())) (GeometricField.C) and operator== assigns the
+    // boundary too -- the same fact this driver relies on for rho below. Relaxing p's boundary here as
+    // well was written, measured, and REVERTED: it is bit-identical on rhoBox (4.989295e-14 either way)
+    // and does not move rhoTP's trace by a digit, because the only patch whose p value moves is
+    // totalPressure and the next iteration's updateCoeffs overwrites it with the raw
+    // p0 - 0.5*rho*|U_b|^2 before anything reads the relaxed one. So no fixture in the tree can see the
+    // difference, and shipping it would have been unverifiable churn. Recorded rather than applied; a
+    // case with a p patch whose value moves and ISN'T recomputed each iteration would need it.
     relaxField(f.p.internal, pOld, in.relaxP);
     f.p.evaluateBoundary();
 
