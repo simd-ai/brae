@@ -89,4 +89,14 @@ sed -i 's/RASModel *kEpsilon;/RASModel        LaunderSharmaKE;/' "$W/unported/co
 grep -q "LaunderSharmaKE" "$W/unported/constant/turbulenceProperties" \
     || { echo "FAIL: could not build the unported-model fixture"; exit 1; }
 
-"$BIN" "$W/case" 0 "$ITERS" "$W/unported"
+# ...and an unported NUT WALL FUNCTION, in a time directory of its own. The closure computes
+# nutkWallFunction unconditionally for both the wall nut and the near-wall production, so every other
+# member of the family must be refused BY NAME rather than run under nutk's. sbMatched's walls ship
+# nutkWallFunction, which is also what makes the negative control in the binary meaningful.
+mkdir -p "$W/unportednut"
+cp "$W/case/0/"* "$W/unportednut/" 2>/dev/null || true
+sed -i 's/nutkWallFunction/nutUSpaldingWallFunction/' "$W/unportednut/nut"
+grep -q "nutUSpaldingWallFunction" "$W/unportednut/nut" \
+    || { echo "FAIL: could not build the unported-nut fixture"; exit 1; }
+
+"$BIN" "$W/case" 0 "$ITERS" "$W/unported" "$W/unportednut"

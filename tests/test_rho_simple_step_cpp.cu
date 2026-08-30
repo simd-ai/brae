@@ -496,6 +496,46 @@ int main(int argc, char** argv)
         std::printf("     %-34s\n", "  p and T start INSIDE their bounds -> not gated, as above");
     }
 
+    // ---- THE REFUSAL: an unported NUT WALL FUNCTION ------------------------------------------
+    // The closure computes nutkWallFunction unconditionally -- for the wall nut AND, through
+    // deviceWallEpsG0's `nutWall` selector, for the near-wall production. OpenFOAM dispatches on nut's
+    // own patch field (nutWallFunctionFvPatchScalarField.C:181-184) and everything downstream READS the
+    // result (epsilonWallFunctionFvPatchScalarField.C:333-334 `turbModel.nut(patchi)`), so a case naming
+    // any other member of the family got nutk's value at both sites with nothing to say so.
+    //
+    // The refusal lives in createFields because that is the last place the dictionary TYPE exists: once
+    // buildField has run, the patch-field object no longer carries it, which is why neither closure could
+    // have checked. argv[5] is a time directory whose nut names a different wall function.
+    std::printf("  refusal -- an unported nut wall function\n");
+    if (argc > 5)
+    {
+        bool threw = false;
+        std::string msg;
+        try
+        {
+            (void)cpu::rhoSimple::createFields(std::string(argv[5]), caseDir,
+                                               simpleDict, &fvSolution, m, g, patches);
+        }
+        catch (const std::exception& e) { threw = true; msg = e.what(); }
+        check("an unported nut wall function is refused", threw);
+        if (threw) std::printf("     %s\n", msg.substr(0, 150).c_str());
+
+        // THE NEGATIVE CONTROL. The unmodified time directory must be ACCEPTED -- without it this passes
+        // on a createFields that throws for any reason at all, which is not a refusal but a broken read.
+        bool threw2 = false;
+        try
+        {
+            (void)cpu::rhoSimple::createFields(caseDir + "/" + startT, caseDir,
+                                               simpleDict, &fvSolution, m, g, patches);
+        }
+        catch (const std::exception&) { threw2 = true; }
+        check("the case's own nutkWallFunction is ACCEPTED (negative control)", !threw2);
+    }
+    else
+    {
+        std::printf("     %-34s %s\n", "unported-nut fixture not supplied", "SKIP");
+    }
+
     // ---- THE REFUSAL: a turbulent case must be refused BY NAME, not run as laminar. ----
     std::printf("  refusal -- an unported RAS model\n");
     if (argc > 4)

@@ -470,7 +470,55 @@ RhoSimpleFields createFields(
                         "compressible lineage (kEpsilon and kOmegaSST are). Refusing rather than running "
                         "a different closure, or none.");
                 f.k   = buildField<scalar>(readField<scalar>(timeDir + "/k"), patches, nC);
-                f.nut = buildField<scalar>(readField<scalar>(timeDir + "/nut"), patches, nC);
+
+                // THE NUT WALL FUNCTION IS PART OF THE MODEL, and only nutkWallFunction is ported here.
+                //
+                // OpenFOAM has exactly ONE dispatch point for it: nut's own patch field
+                // (nutWallFunctionFvPatchScalarField.C:181-184 `operator==(calcNut())`, a virtual call
+                // per patch), and everything downstream READS the result -- epsilonWallFunction's
+                // near-wall production is `const tmp<scalarField> tnutw = turbModel.nut(patchi);`
+                // (epsilonWallFunctionFvPatchScalarField.C:333-334), not a recomputation. brae's closure
+                // has no such dispatch: kEpsilon_cpp.cu and kEpsilon.cu both call nutkWallFunction
+                // unconditionally, and kEpsilon.cu additionally passes `/*nutWall=*/0` to deviceWallEpsG0
+                // for the production term. So a case naming any other member of the family got nutk's
+                // value at BOTH sites, silently.
+                //
+                // The types are genuinely different functions, not variants:
+                //   nutUSpaldingWallFunction   Newton on Spalding's law, a function of |U| -- nutk never
+                //                              reads U at all (nutkWallFunctionFvPatchScalarField.C:71).
+                //   nutUWallFunction /         likewise U-based; the in-tree claim that nutUBlended
+                //   nutUBlendedWallFunction    "is the same" as nutk is about the LEGACY device path's
+                //                              own approximation, not about OpenFOAM.
+                //   nutLowReWallFunction       calcNut() returns Zero UNCONDITIONALLY
+                //                              (nutLowReWallFunctionFvPatchScalarField.C:38-42). It is
+                //                              NOT "nutk on a resolved mesh": nutk's y+ is the k-based
+                //                              Cmu^.25*y*sqrt(k)/nu, and a mesh resolved in friction
+                //                              units can still carry k-based y+ > yPlusLam and take the
+                //                              log branch where OpenFOAM returns exactly 0.
+                //   atmNutkWallFunction        roughness z0, and OpenFOAM's z0 is a per-face,
+                //                              time-varying PatchFunction1 where brae carries one scalar.
+                //
+                // Refused HERE because this is the last place the dictionary TYPE still exists -- once
+                // buildField has run, the patch field object no longer carries it, which is why neither
+                // the host closure nor the device one could have checked.
+                {
+                    const FieldData<scalar> nutRaw = readField<scalar>(timeDir + "/nut");
+                    for (const auto& b : nutRaw.boundary)
+                    {
+                        if (b.type.rfind("nut", 0) != 0) continue;          // not a nut wall function
+                        if (b.type == "nutkWallFunction") continue;         // the one that is ported
+                        throw std::runtime_error(
+                            "brae: rhoSimpleFoam nut patch '" + b.name + "' carries '" + b.type +
+                            "', which the compressible kEpsilon closure does not implement -- it computes "
+                            "nutkWallFunction unconditionally, for the wall nut AND for the near-wall "
+                            "production. These are different functions of different inputs (the nutU "
+                            "family reads |U|, which nutk never does; nutLowRe is identically zero), so "
+                            "substituting nutk would converge to a different wall viscosity and a "
+                            "different epsilon. Refusing rather than running one wall function under "
+                            "another's name.");
+                    }
+                    f.nut = buildField<scalar>(nutRaw, patches, nC);
+                }
                 f.k.evaluateBoundary();
                 f.nut.evaluateBoundary();
                 // The second turbulence scalar is the model's, not the case directory's: reading
