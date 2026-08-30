@@ -67,6 +67,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <vector>
 
 namespace brae {
 namespace gpu {
@@ -181,6 +182,26 @@ struct RhoStepInput
     scalar heMin   = 0.0;
     scalar heMax   = 0.0;
 
+    // --- updateCoeffs() for the boundary conditions whose coefficients move with the solution ------
+    // OpenFOAM's fvMatrix constructor calls updateCoeffs() at every assembly, so a patch that switches
+    // on the flux, blends on the flow angle, or holds a mass flow against the live density is refreshed
+    // before any coefficient is read. The device boundary objects are a PRE-BAKED snapshot instead, so
+    // the driver has to do it explicitly -- rhoUEqn.cuh:64-83 spells the contract out and calls it "not
+    // advisory". The driver satisfied none of it: every such patch kept its seeded coefficients for the
+    // whole run. The driver's own gate could not see that, because rhoBox carries only fixedValue,
+    // zeroGradient, noSlip and empty -- not one patch of any of these three kinds. sbMatched carries
+    // four inletOutlet and one flowRateInletVelocity, and is what the gate's second arm runs on.
+    //
+    // Supplied by the caller rather than derived here because it is CASE geometry, gathered once by
+    // createFields; the driver is handed the same objects every iteration.
+    bool hasMixed = false;
+    // One magSf mask per flowRateInletVelocity patch, with the prescribed mass flows in the same order.
+    const std::vector<DeviceBuffer<scalar>>* frMagSf = nullptr;
+    const std::vector<scalar>*               frMdot  = nullptr;
+    const DeviceBuffer<scalar>*              frNx    = nullptr;
+    const DeviceBuffer<scalar>*              frNy    = nullptr;
+    const DeviceBuffer<scalar>*              frNz    = nullptr;
+
     // --- refusals, each thrown by the component that owns the term ---
     bool hasMRF = false, hasFvOptions = false, hasFixedFluxPressure = false, hasCoupledPatches = false;
     std::string fvOptionUnsupported;
@@ -215,13 +236,28 @@ struct RhoSolverWorkspace
 
 // ONE rhoSimpleFoam SIMPLE iteration, in place on `f`. Returns the INITIAL residual of each field's first
 // solve this iteration, which is what simpleControl's residualControl compares against.
+// updateCoeffs() for the boundary conditions whose coefficients are a function of the SOLUTION -- the
+// flux switch (inletOutlet/outletInlet), the freestream flow-angle blend, and flowRateInletVelocity's
+// velocity from the live boundary density. rhoSimpleStep calls this at the top of every iteration;
+// it is exposed because it has a contract testable on its own, and because the gate needs to withhold it.
+void updateBoundaryCoeffs(
+    RhoSolverFields&      f,
+    DeviceVectorBoundary& dbU,
+    DeviceBoundary&       dbP,
+    DeviceBoundary&       dbHe,
+    DeviceBoundary&       dbT,
+    const RhoStepInput&   in);
+
 Residuals rhoSimpleStep(
     RhoSolverFields&            f,
     RhoSolverWorkspace&         w,
     const DeviceMesh&           dm,
-    const DeviceVectorBoundary& dbU,
+    // NON-const: the updateCoeffs() block at the top of the step rewrites refValue and valueFraction on
+    // the patches that switch on the flux, blend on the flow angle, or carry a prescribed mass flow.
+    DeviceVectorBoundary&       dbU,
     DeviceBoundary&             dbP,
     DeviceBoundary&             dbHe,
+    DeviceBoundary&             dbT,
     const RhoStepInput&         in);
 
 } // namespace rhoSimple

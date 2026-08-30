@@ -561,6 +561,14 @@ target_include_directories(test_rho_simple_step_cuda PRIVATE ${BRAE_HEADER_DIRS}
 target_link_libraries(test_rho_simple_step_cuda PRIVATE brae_core)
 add_test(NAME rho_simple_step_cuda
          COMMAND test_rho_simple_step_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/rhoBox 0.orig 8)
+# The BOUNDARY arm. rhoBox carries only fixedValue, zeroGradient, noSlip and empty, so the whole
+# updateCoeffs() block at the top of the step is a no-op there and the arm above cannot see it at all --
+# which is exactly why the device driver went without one. sbMatched is the only compressible fixture
+# with four inletOutlet patches and a flowRateInletVelocity inlet. ONE iteration and no forced limiters;
+# the reasons are in the test's own header. Measured: Ux 4.496e-12, and 1.276e-02 with the driver's
+# updateBoundaryCoeffs call removed.
+add_test(NAME rho_simple_step_cuda_boundary
+         COMMAND test_rho_simple_step_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/sbMatched 0.orig --boundary)
 
 add_executable(test_rho_kepsilon_cuda tests/test_rho_kepsilon_cuda.cu)
 target_include_directories(test_rho_kepsilon_cuda PRIVATE ${BRAE_HEADER_DIRS})

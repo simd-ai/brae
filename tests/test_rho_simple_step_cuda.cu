@@ -53,6 +53,7 @@
 #include "thermo_model.cuh"
 #include "device_fvoptions.cuh"   // DevicePorosity   // hConstTToHe -- the reference's OWN T->he conversion
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -107,7 +108,13 @@ int main(int argc, char** argv)
         return 2;
     }
     const std::string caseDir = argv[1], startT = argv[2];
-    const int iters = (argc > 3) ? std::atoi(argv[3]) : 8;
+    int  iters       = 8;
+    bool boundaryArm = false;
+    for (int a = 3; a < argc; ++a)
+    {
+        if (std::string(argv[a]) == "--boundary") boundaryArm = true;
+        else                                      iters = std::atoi(argv[a]);
+    }
 
     PrimitiveMesh m;
     m.read(caseDir + "/constant/polyMesh");
@@ -128,9 +135,30 @@ int main(int argc, char** argv)
     cpu::rhoSimple::RhoSimpleFields df =
         cpu::rhoSimple::createFields(caseDir + "/" + startT, caseDir, simpleDict, &fvSolution, m, g, fvp);
 
-    std::printf("rhoSimpleFoam DRIVER: CUDA vs _cpp  (%d cells, %d iterations, %s)\n",
-                (int)nC, iters, hf.turbulent ? hf.rasModel.c_str() : "laminar");
-    check("the fixture is LAMINAR (see the header)", !hf.turbulent);
+    // THE BOUNDARY ARM. The updateCoeffs() block this driver grew can only be exercised by a fixture
+    // carrying patches whose coefficients move with the solution, and the only compressible one is
+    // sbMatched -- four inletOutlet patches and a flowRateInletVelocity inlet, and a kEpsilon case.
+    //
+    // ONE ITERATION, and turbulent. Both are forced by what this file is: the device driver takes
+    // turbulence->correct() as a hook and this gate leaves it null, so from iteration 2 the host is
+    // running a closure the device is not and the trajectories separate on that, not on the boundaries.
+    // Laminarising instead is worse -- sbMatched carries `transonic yes` and its nut is 30x the laminar
+    // viscosity, so removing the closure makes the case unstable and it drove rho negative by iteration
+    // 3 ("gSum(rho*magSf) is not positive"). Iteration 1 is where the boundary conditions are the ONLY
+    // difference, and it is where the measurement below was taken.
+    //
+    // WHAT IT CATCHES, measured by disabling updateBoundaryCoeffs and rerunning: Ux at iteration 1 goes
+    // from 4.496e-12 to 1.276e-02, nine orders. Disabling only the flowRate half leaves it at 4.607e-12,
+    // so on this fixture the whole of that is the INLETOUTLET SWITCH: sbMatched seeds
+    // `internalField uniform (0 0 0)`, so phi is zero on every boundary face at the start, the switch
+    // must read that as outflow and extrapolate, and the device seeds those faces fixedValue instead.
+    // The flowRate half moves nothing at iteration 1 -- rho has not moved yet -- which is exactly why it
+    // gets an arithmetic control of its own at the end of this file rather than a trajectory bound.
+    if (boundaryArm && iters == 8) iters = 1;
+    std::printf("rhoSimpleFoam DRIVER: CUDA vs _cpp  (%d cells, %d iterations, %s%s)\n",
+                (int)nC, iters, hf.turbulent ? hf.rasModel.c_str() : "laminar",
+                boundaryArm ? ", BOUNDARY arm" : "");
+    if (!boundaryArm) check("the fixture is LAMINAR (see the header)", !hf.turbulent);
     {
         label coupled = 0;
         for (const FvPatch& p : fvp)
@@ -185,6 +213,7 @@ int main(int argc, char** argv)
     DeviceVectorBoundary&       dbU  = dev.dbU;
     DeviceBoundary&             dbP  = dev.dbP;
     DeviceBoundary&             dbHe = dev.dbHe;
+    DeviceBoundary&             dbT  = dev.dbT;
     gpu::rhoSimple::RhoSolverFields& gf = dev.f;
 
     // The workspace lives ACROSS iterations, deliberately: allocating the pressure buffers fresh each
@@ -241,7 +270,14 @@ int main(int argc, char** argv)
     // The floor comes from a PRELIMINARY unlimited run, not from the initial field. p starts uniform at
     // 1e5 here and RISES, so a floor taken from the start state clips nothing -- which the control below
     // caught when this gate first tried exactly that.
+    // SKIPPED ON THE BOUNDARY ARM. Forcing the limiters to bind is calibrated for rhoBox, whose shipped
+    // `pMin 1000` never clips a field sitting near 1e5. The same forcing on sbMatched clamps 111600 of
+    // 112000 cells to the energy floor and 55600 to the pressure floor, moves U by 1.5e+05 relative in a
+    // single iteration, and leaves the two codes amplifying solver tolerance in a state neither case
+    // asked for -- Ux read 4.5e-04 there against 4.5e-12 with the case running as it ships. The boundary
+    // arm measures the BOUNDARY, so it needs the interior running normally.
     std::vector<scalar> pUnlimited, heUnlimited, tUnlimited;
+    if (!boundaryArm)
     {
         cpu::rhoSimple::RhoSimpleFields fn =
             cpu::rhoSimple::createFields(caseDir + "/" + startT, caseDir, simpleDict, &fvSolution,
@@ -252,6 +288,7 @@ int main(int argc, char** argv)
         heUnlimited = fn.he.internal;
         tUnlimited  = fn.T.internal;
     }
+    if (!boundaryArm)
     {
         scalar pLo = 1e300, pHi = -1e300;
         for (label c = 0; c < nC; ++c)
@@ -291,6 +328,16 @@ int main(int argc, char** argv)
     // The SAME controls the host got. The sentinel is "the case NAMES a factor", not "the factor is
     // below 1": fvMatrix::relax early-returns only on alpha <= 0, so relax(1.0) still applies the
     // dominance clamp and moves the source.
+    // The updateCoeffs() metadata the projection gathered. Passing it is not optional dressing: without
+    // it the device driver leaves every flux-switched, freestream and flowRate patch on its seeded
+    // coefficients, which is what this gate's sbMatched arm exists to catch.
+    gin.hasMixed = dev.hasMixed;
+    gin.frMagSf  = &dev.frMagSf;
+    gin.frMdot   = &dev.frMdot;
+    gin.frNx     = &dev.frNx;
+    gin.frNy     = &dev.frNy;
+    gin.frNz     = &dev.frNz;
+
     gin.relaxEquationU  = (req != nullptr) && req->found("U");
     gin.relaxU          = hin.relaxU;
     gin.relaxEquationHe = (req != nullptr) && req->found(hf.heName);
@@ -346,7 +393,7 @@ int main(int argc, char** argv)
         gin.muEffCell = &dMu;          gin.muEffBndFace = &dMuB;
         gin.alphaEffCell = &dAl;       gin.alphaEffBndFace = &dAlB;
 
-        gpu::rhoSimple::rhoSimpleStep(gf, w, dm, dbU, dbP, dbHe, gin);
+        gpu::rhoSimple::rhoSimpleStep(gf, w, dm, dbU, dbP, dbHe, dbT, gin);
 
         // Compare AFTER EVERY iteration, so the FIRST divergent one is named. A final-state-only
         // comparison reports where the two ended up, not where they parted.
@@ -433,7 +480,7 @@ int main(int argc, char** argv)
         pin2.alphaEffCell = &dAl2;    pin2.alphaEffBndFace = &dAlB2;
         pin2.thermoCorrect = [](){};  // the projection is fresh; one iteration needs no thermo round-trip
         pin2.updateRho     = [](){};
-        gpu::rhoSimple::rhoSimpleStep(dv.f, wp, dv.dm, dv.dbU, dv.dbP, dv.dbHe, pin2);
+        gpu::rhoSimple::rhoSimpleStep(dv.f, wp, dv.dm, dv.dbU, dv.dbP, dv.dbHe, dv.dbT, pin2);
         const std::vector<scalar> withPor = dv.f.Ux.host();
 
         gpu::rhoSimple::RhoDeviceFields dv0 =
@@ -443,7 +490,7 @@ int main(int argc, char** argv)
         pin0.porosity = nullptr;
         pin0.takeUAtBoundary = &dv0.takeUAtBoundary;
         pin0.adjustable      = &dv0.adjustable;
-        gpu::rhoSimple::rhoSimpleStep(dv0.f, w0, dv0.dm, dv0.dbU, dv0.dbP, dv0.dbHe, pin0);
+        gpu::rhoSimple::rhoSimpleStep(dv0.f, w0, dv0.dm, dv0.dbU, dv0.dbP, dv0.dbHe, dv0.dbT, pin0);
         const std::vector<scalar> noPor = dv0.f.Ux.host();
 
         const double r = relL2(withPor, noPor);
@@ -456,7 +503,9 @@ int main(int argc, char** argv)
     // to he after the solve; the CUDA driver dropped it entirely and refused nothing, so a case naming
     // it got the clamp on the host reference and not on the device. A bound taken from the start state
     // would clip nothing, so the floor comes from the unlimited run's own he range and the control
-    // requires it to clip a substantial share.
+    // requires it to clip a substantial share. Both limiter controls belong to the rhoBox arm: the
+    // boundary arm does not force the limiters at all (see above), so there is nothing there to assert.
+    if (!boundaryArm)
     {
         std::size_t atFloor = 0;
         for (label c = 0; c < nC; ++c)
@@ -470,6 +519,7 @@ int main(int argc, char** argv)
     // Forcing pMin only matters if it clips. If it does not, every agreement above is agreement about a
     // no-op -- which is exactly how a driver missing the limiter entirely passed this gate until an audit
     // found it. The unlimited run computed above is the comparison.
+    if (!boundaryArm)
     {
         const double moved = relL2(pUnlimited, hf.p.internal);
         std::size_t atFloor = 0;
@@ -498,13 +548,121 @@ int main(int argc, char** argv)
     // ---- CONTROL: iteration 2 onwards is REACHED, and is what discriminates -------------------
     // The defect this file exists for is invisible at iteration 1. Assert the loop actually ran past it,
     // so a fixture or an early return cannot make this gate vacuous.
-    check("more than one iteration ran (control)", iters > 1);
+    if (!boundaryArm) check("more than one iteration ran (control)", iters > 1);
 
     // ---- CONTROL: the AMG workspace persisted --------------------------------------------------
     // The hierarchy is built once and reused; if it were rebuilt each iteration the cached V-cycle would
     // attach to a different fine matrix every time -- exact at iteration 1, wrong at iteration 2.
     if (!gin.transonic) check("the AMG hierarchy was built and kept (control)", w.amgBuilt);
     else                check("transonic: no hierarchy built (control)", !w.amgBuilt);
+
+    // ---- CONTROL: updateCoeffs() is WIRED, and does what OpenFOAM's does ------------------------
+    // The driver grew an updateBoundaryCoeffs() call because it had none: every patch whose coefficients
+    // are a function of the solution -- the inletOutlet/outletInlet flux switch, the freestream flow-angle
+    // blend, flowRateInletVelocity's velocity from the live boundary density -- kept the coefficients it
+    // was seeded with for the whole run. rhoUEqn.cuh:64-83 states that contract and calls it "not
+    // advisory"; nothing satisfied it, and the rhoBox arm above cannot see it, because rhoBox carries
+    // only fixedValue, zeroGradient, noSlip and empty.
+    //
+    // Asserted against the ARITHMETIC rather than against a trajectory, so the control is exact and needs
+    // no bound of its own:
+    //   flowRateInletVelocity  avgU = -mdot/gSum(rho*magSf)  ->  DOUBLE the boundary density and the
+    //                          inlet velocity must HALVE, to round-off.
+    //   inletOutlet            bcType is the sign of phi     ->  REVERSE the flux and every io face must
+    //                          switch between fixedValue (1) and zeroGradient (0).
+    // A driver that never calls updateCoeffs leaves both unchanged, which is what makes them a control.
+    if (dev.hasFlowRate || dev.hasMixed)
+    {
+        gpu::rhoSimple::RhoDeviceFields dc =
+            gpu::rhoSimple::createDeviceFields(df, m, g, fvp);
+        gpu::rhoSimple::RhoStepInput cin = gin;
+        cin.hasMixed = dc.hasMixed;
+        cin.frMagSf  = &dc.frMagSf;
+        cin.frMdot   = &dc.frMdot;
+        cin.frNx     = &dc.frNx;
+        cin.frNy     = &dc.frNy;
+        cin.frNz     = &dc.frNz;
+
+        gpu::rhoSimple::updateBoundaryCoeffs(dc.f, dc.dbU, dc.dbP, dc.dbHe, dc.dbT, cin);
+        const std::vector<scalar> ref1 = dc.dbU.comp[0].refValue.host();
+        const std::vector<label>  io1  = dc.dbHe.bcType.host();
+
+        if (dev.hasFlowRate)
+        {
+            // rho_b *= 2 everywhere. gSum(rho*magSf) doubles on the flowRate patch, so avgU halves.
+            std::vector<scalar> rb = dc.f.rhoBnd.host();
+            for (std::size_t i = 0; i < rb.size(); ++i) rb[i] *= 2.0;
+            dc.f.rhoBnd.copyFrom(rb);
+            gpu::rhoSimple::updateBoundaryCoeffs(dc.f, dc.dbU, dc.dbP, dc.dbHe, dc.dbT, cin);
+            const std::vector<scalar> ref2 = dc.dbU.comp[0].refValue.host();
+
+            // Only the flowRate faces are asserted on: every other face's refValue is untouched by this
+            // update, and demanding a halving there would be asserting the wrong thing.
+            const std::vector<scalar> mask = dc.frMagSf.empty()
+                                           ? std::vector<scalar>()
+                                           : dc.frMagSf[0].host();
+            double worst = 0.0, biggest = 0.0;
+            label  nFaces = 0;
+            for (std::size_t i = 0; i < mask.size() && i < ref1.size() && i < ref2.size(); ++i)
+            {
+                if (mask[i] <= 0.0) continue;
+                ++nFaces;
+                const double want = 0.5 * (double)ref1[i];
+                const double den  = std::fabs(want) > 1e-30 ? std::fabs(want) : 1.0;
+                worst = std::max(worst, std::fabs((double)ref2[i] - want) / den);
+                biggest = std::max(biggest, std::fabs((double)ref1[i]));
+            }
+            // NON-VACUOUS: an inlet velocity that is zero halves to zero, and the check above would pass
+            // on a driver that never called updateCoeffs at all. The magnitude is asserted separately so
+            // the halving is a statement about a number that exists.
+            std::printf("     %-40s worst %.3e over %d faces, |U_in| %.4g\n",
+                        "control: 2x rho_b halves the inlet U", worst, (int)nFaces, biggest);
+            check("the flowRate inlet carries a velocity at all (control)", biggest > 1e-30);
+            check("flowRateInletVelocity reads the LIVE boundary density (control)",
+                  nFaces > 0 && worst < 1e-12);
+
+            std::vector<scalar> rb0 = dc.f.rhoBnd.host();
+            for (std::size_t i = 0; i < rb0.size(); ++i) rb0[i] *= 0.5;
+            dc.f.rhoBnd.copyFrom(rb0);
+        }
+
+        // The flux switch. phi is DRIVEN to a known sign here rather than taken from the fixture: this
+        // case seeds `internalField uniform (0 0 0)`, so the flux through every boundary face is exactly
+        // zero at the start, `phi < 0` is false whichever sign is written, and a control built on
+        // negating the fixture's own phi would have passed on a switch that never moved. Driving it makes
+        // the assertion the arithmetic one -- outflow is zeroGradient, inflow is fixedValue -- and
+        // independent of where in the trajectory the control happens to run.
+        {
+            const std::vector<scalar> phiSaved = dc.f.phiBnd.host();
+
+            dc.f.phiBnd.copyFrom(std::vector<scalar>(phiSaved.size(), scalar(+1)));
+            gpu::rhoSimple::updateBoundaryCoeffs(dc.f, dc.dbU, dc.dbP, dc.dbHe, dc.dbT, cin);
+            const std::vector<label> outflow = dc.dbHe.bcType.host();
+
+            dc.f.phiBnd.copyFrom(std::vector<scalar>(phiSaved.size(), scalar(-1)));
+            gpu::rhoSimple::updateBoundaryCoeffs(dc.f, dc.dbU, dc.dbP, dc.dbHe, dc.dbT, cin);
+            const std::vector<label> inflow = dc.dbHe.bcType.host();
+
+            dc.f.phiBnd.copyFrom(phiSaved);
+
+            const std::vector<label> mask = dc.dbHe.ioMask.host();
+            label nIo = 0, nRight = 0;
+            for (std::size_t i = 0; i < mask.size() && i < outflow.size() && i < inflow.size(); ++i)
+            {
+                if (!mask[i]) continue;
+                ++nIo;
+                // OF inletOutlet: inflow (phi < 0) takes inletValue as a fixedValue, outflow extrapolates.
+                if (outflow[i] == 0 && inflow[i] == 1) ++nRight;
+            }
+            std::printf("     %-40s %d of %d io faces switch both ways\n",
+                        "control: the flux sign drives the switch", (int)nRight, (int)nIo);
+            check("inletOutlet switches on the CURRENT flux (control)", nIo > 0 && nRight == nIo);
+        }
+    }
+    else
+    {
+        std::printf("     %-40s no such patch on this fixture\n", "updateCoeffs control: SKIPPED");
+    }
 
     std::printf("%s\n", g_fails ? "FAIL" : "PASS");
     return g_fails ? 1 : 0;

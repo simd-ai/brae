@@ -86,6 +86,70 @@ RhoDeviceFields createDeviceFields(
     d.dbHe = buildDeviceBoundary(hf.he, patches, g);
     d.dbT  = buildDeviceBoundary(hf.T, patches, g);
 
+    // ---- updateCoeffs() metadata, for the boundary conditions whose coefficients move with the
+    //      solution. See the block comment on RhoDeviceFields: the device boundary objects are a
+    //      snapshot, so the driver has to recompute per iteration what OpenFOAM recomputes inside
+    //      updateCoeffs(). This gathers what those updates need and cannot derive themselves.
+    {
+        // The freestream family. A wedge also reports category 5 and must NOT count -- its valueFraction
+        // is geometry, fixed for the run, not a flow angle -- so an axisymmetric case has nothing to
+        // update and should not pay for a kernel that would rewrite a geometric blend every iteration.
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if ((hf.U.boundary[pi]->bcCategory() == 5 && !hf.U.boundary[pi]->wedgeFaceT())
+             || hf.p.boundary[pi]->bcCategory() == 5)
+            {
+                d.hasMixed = true;
+                break;
+            }
+        }
+
+        // flowRateInletVelocity, mass form (category 9). The mask is magSf on this patch and 0 on every
+        // other face, so dot(rhoBnd, mask) is exactly OpenFOAM's gSum(rho*magSf) over the patch. The walk
+        // is the SAME one flattenBoundary uses -- every patch in order, no skipping -- which is
+        // unambiguous here only because this function has already refused any coupled patch above.
+        std::vector<scalar> nx, ny, nz;
+        nx.reserve(static_cast<std::size_t>(d.nBndFaces));
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            for (label i = 0; i < patches[pi].size; ++i)
+            {
+                nx.push_back(patches[pi].nf[i].x);
+                ny.push_back(patches[pi].nf[i].y);
+                nz.push_back(patches[pi].nf[i].z);
+            }
+        }
+        nx.resize(static_cast<std::size_t>(d.nBndFaces), 0.0);
+        ny.resize(static_cast<std::size_t>(d.nBndFaces), 0.0);
+        nz.resize(static_cast<std::size_t>(d.nBndFaces), 0.0);
+
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (hf.U.boundary[pi]->bcCategory() != 9) continue;
+            d.hasFlowRate = true;
+            std::vector<scalar> mask(static_cast<std::size_t>(d.nBndFaces), 0.0);
+            label bi = 0;
+            for (std::size_t pj = 0; pj < patches.size(); ++pj)
+            {
+                for (label i = 0; i < patches[pj].size; ++i, ++bi)
+                {
+                    if (pj == pi && bi < d.nBndFaces) mask[static_cast<std::size_t>(bi)] = patches[pj].magSf[i];
+                }
+            }
+            d.frMagSf.emplace_back();
+            d.frMagSf.back().copyFrom(mask);
+            // OpenFOAM re-reads flowRate_->value(t) at every updateCoeffs; steady with a constant entry
+            // makes that the seeded value, which the patch object already holds.
+            d.frMdot.push_back(hf.U.boundary[pi]->flowRateValue());
+        }
+        if (d.hasFlowRate)
+        {
+            d.frNx.copyFrom(nx);
+            d.frNy.copyFrom(ny);
+            d.frNz.copyFrom(nz);
+        }
+    }
+
     // ---- the solution state ------------------------------------------------------------------
     {
         std::vector<scalar> ux(nC), uy(nC), uz(nC);

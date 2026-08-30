@@ -140,13 +140,75 @@ void closedVolumeCorrection(
 } // namespace
 
 
+// updateCoeffs() for the boundary conditions whose coefficients are a function of the SOLUTION.
+//
+// A named function rather than a run of statements inside the step, because it has a contract of its own
+// that is worth testing on its own: given a flux and a boundary density, it must produce the patch
+// coefficients OpenFOAM's updateCoeffs() would. The driver's gate exercises it directly -- doubling the
+// boundary density must halve a flowRateInletVelocity's velocity, and reversing the flux must flip an
+// inletOutlet face between fixedValue and zeroGradient -- and neither of those is visible from a
+// whole-iteration comparison on a fixture whose patches have no coefficients that move.
+void updateBoundaryCoeffs(
+    RhoSolverFields&      f,
+    DeviceVectorBoundary& dbU,
+    DeviceBoundary&       dbP,
+    DeviceBoundary&       dbHe,
+    DeviceBoundary&       dbT,
+    const RhoStepInput&   in)
+{
+    // OpenFOAM runs this inside the fvMatrix constructor, so it has happened before any coefficient is
+    // read. Here the device boundary objects are a snapshot and the driver has to do it by hand; the
+    // order is the reference driver's, which is OpenFOAM's.
+    //
+    // 1. The FLUX SWITCH. inletOutlet/outletInlet pick fixedValue or zeroGradient per face from the sign
+    //    of phi, and OpenFOAM lags it: the flux used is the one this iteration STARTS with. U, he and T
+    //    are the fields that carry one on a compressible case.
+    //
+    //    dbT is refreshed even though nothing in THIS function reads it. T's boundary is consumed by
+    //    thermo.correct(), which is the caller's hook; a host thermo evaluates T's patches on its own
+    //    host field and will not notice, but a device-resident one reads dbT and would otherwise get a
+    //    flux switch frozen at its seeded state. Refreshing it here keeps the two thermo implementations
+    //    interchangeable, which is the whole point of the hook being a hook.
+    deviceUpdateInletOutlet(dbU, f.phiBnd);
+    deviceUpdateInletOutlet(dbHe, f.phiBnd);
+    deviceUpdateInletOutlet(dbT, f.phiBnd);
+
+    // 2. The FREESTREAM BLEND, a different rule from the switch above: valueFraction is rebuilt from the
+    //    current flow ANGLE, 0.5 - 0.5*(Up & nf)/mag(Up), and freestreamPressure follows the velocity
+    //    patch. Left alone, every far-field face keeps the half-and-half blend it was seeded with.
+    if (in.hasMixed)
+    {
+        deviceUpdateMixedFreestream(dbU, dbP, f.phiBnd, f.Ux, f.Uy, f.Uz, &f.rhoBnd);
+        deviceBCValue(dbP, f.p, f.pBnd);
+    }
+
+    // 3. flowRateInletVelocity, and WHICH rho matters: avgU = -mdot/gSum(rho*magSf) is held against the
+    //    boundary density the flux is actually carrying -- the solver's relaxed rho, which is what
+    //    f.rhoBnd holds here -- not thermo.rho(). Feeding it the other one is the angledDuct defect,
+    //    where the inlet quietly lost the prescribed mass flow. Last, because it reads that rho.
+    if (in.frMagSf && in.frMdot && in.frNx && in.frNy && in.frNz)
+    {
+        for (std::size_t k = 0; k < in.frMagSf->size() && k < in.frMdot->size(); ++k)
+        {
+            const scalar sumRhoA = deviceDot(f.rhoBnd, (*in.frMagSf)[k]);
+            if (sumRhoA <= scalar(0)) continue;
+            deviceUpdateFlowRateInlet(dbU, (*in.frMagSf)[k], -(*in.frMdot)[k] / sumRhoA,
+                                      *in.frNx, *in.frNy, *in.frNz);
+        }
+    }
+}
+
+
 Residuals rhoSimpleStep(
     RhoSolverFields&            f,
     RhoSolverWorkspace&         w,
     const DeviceMesh&           dm,
-    const DeviceVectorBoundary& dbU,
+    // NON-const: the updateCoeffs() block at the top of the step rewrites refValue and valueFraction on
+    // the patches that switch on the flux, blend on the flow angle, or carry a prescribed mass flow.
+    DeviceVectorBoundary&       dbU,
     DeviceBoundary&             dbP,
     DeviceBoundary&             dbHe,
+    DeviceBoundary&             dbT,
     const RhoStepInput&         in)
 {
     Residuals res;
@@ -179,6 +241,8 @@ Residuals rhoSimpleStep(
     // start of the pressure solve.
     DeviceBuffer<scalar> pPrev;
     deviceCopy(pPrev, f.p);
+
+    updateBoundaryCoeffs(f, dbU, dbP, dbHe, dbT, in);
 
     // ---- UEqn.H ------------------------------------------------------------------------------
     RhoMomentumInput uin;

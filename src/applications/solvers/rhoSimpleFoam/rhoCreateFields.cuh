@@ -68,6 +68,21 @@ struct RhoDeviceFields
     DeviceBuffer<scalar> wallYBndFace;   // nearWallDist y, per boundary face (0 off a wall-function patch)
     std::vector<label>   wfFaceOfBnd;    // wall-face order -> boundary-face index, for deviceGatherWallNu
 
+    // updateCoeffs() metadata for the boundary conditions whose coefficients move with the SOLUTION.
+    // The device boundary objects are a pre-baked snapshot -- bcType, refValue and valueFraction are
+    // fixed at build time -- so anything OpenFOAM recomputes inside updateCoeffs has to be recomputed
+    // here, per iteration, by the driver. rhoUEqn.cuh:64-83 states that contract; nothing satisfied it.
+    //
+    // hasMixed covers the freestream family (freestreamVelocity/freestreamPressure), whose valueFraction
+    // OpenFOAM rebuilds from the current flow ANGLE. hasFlowRate covers flowRateInletVelocity, which
+    // needs the per-patch magSf mask and the face normals to turn a prescribed mass flow into a velocity
+    // against the LIVE boundary density -- feeding it the wrong rho is the angledDuct defect.
+    bool                              hasMixed    = false;
+    bool                              hasFlowRate = false;
+    std::vector<DeviceBuffer<scalar>> frMagSf;      // one per flowRate patch: magSf there, 0 elsewhere
+    std::vector<scalar>               frMdot;       // matching prescribed mass flow, same order
+    DeviceBuffer<scalar>              frNx, frNy, frNz;   // boundary-face normals, all faces
+
     bool turbulent = false;
     int  nBndFaces = 0;
 };

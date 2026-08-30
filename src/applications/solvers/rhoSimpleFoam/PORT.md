@@ -924,3 +924,72 @@ via tools/dumpPEqn, runs brae's closure on OpenFOAM's exact inputs, and prints a
 wall/interior split. It is **not registered as a ctest** — the closure does not yet meet a bound worth
 asserting, and registering it against the numbers it currently produces would record a disagreement as a
 specification.
+
+## The CUDA driver had no `updateCoeffs()`, and rhoBox could not see it
+
+`rhoUEqn.cuh:64-83` states, under the heading "WHAT THE CALLER MUST HAVE DONE BEFORE ENTERING, and it is
+not advisory", that the momentum module is handed a PRE-BAKED `DeviceVectorBoundary` whose `bcType`,
+`refValue` and `valueFraction` are a snapshot, and that the caller must refresh them: the
+inletOutlet/outletInlet flux switch, the freestream flow-angle blend, and `flowRateInletVelocity`'s
+velocity from the live boundary density. OpenFOAM does all three inside the `fvMatrix` constructor, which
+calls `updateCoeffs()` before any coefficient is read.
+
+**The CUDA driver satisfied none of it.** `rhoSimpleFoam.cu` went straight from `storePrevIter` to
+`assembleUEqn`. Every patch whose coefficients are a function of the solution kept the ones it was seeded
+with, for the whole run. The `_cpp` reference does all three at the top of every iteration, so this was a
+divergence between the two drivers that their own comparison was not arranged to see.
+
+**Why the gate was blind.** `rho_simple_step_cuda` runs `validation/rhoBox`, whose `0.orig` carries only
+`fixedValue`, `zeroGradient`, `noSlip` and `empty`. Not one flux-conditional, freestream or flowRate
+patch, so all three updates are no-ops there and the arm reads the same number with the call present or
+absent. The device primitives had existed all along -- `deviceUpdateInletOutlet`,
+`deviceUpdateMixedFreestream`, `deviceUpdateFlowRateInlet`, all used by the incompressible driver -- so
+nothing had to be written. The driver simply never called them.
+
+### The fix, and what it is worth
+
+`updateBoundaryCoeffs()` is a named function rather than a run of statements inside the step, because it
+has a contract testable on its own. `rhoSimpleStep` calls it at the top of every iteration. `dbT` joined
+the signature and `dbU` lost its `const`.
+
+`rho_simple_step_cuda_boundary` runs `validation/sbMatched` -- the only compressible fixture with the
+patches, four `inletOutlet` and one `flowRateInletVelocity`. Measured at iteration 1:
+
+| driver | Ux | p |
+|---|---|---|
+| with `updateBoundaryCoeffs` | 4.496e-12 | 2.899e-14 |
+| with the call removed | **1.276e-02** | 1.355e-04 |
+| flowRate half removed, switch kept | 4.607e-12 | -- |
+
+The third row is the informative one: on this fixture the whole of that nine-order gap is the
+**inletOutlet switch**, not the flowRate inlet. sbMatched seeds `internalField uniform (0 0 0)`, so phi is
+exactly zero on every boundary face at the start; the switch must read that as outflow and extrapolate,
+while `buildDeviceBoundary` seeds those faces `fixedValue`. The flowRate half moves nothing at iteration
+1 because rho has not moved yet -- which is why it gets an arithmetic control instead of a bound.
+
+### Why one iteration, and why not laminar
+
+The device driver takes `turbulence->correct()` as a hook and this gate leaves it null, so from iteration
+2 the host is running a closure the device is not and the trajectories separate on that. Laminarising
+sbMatched instead is worse: it carries `transonic yes` and its nut is ~30x the laminar viscosity, so
+removing the closure destabilises the case and it drove rho negative by iteration 3
+(`gSum(rho*magSf) is not positive`). Iteration 1 is where the boundary conditions are the only
+difference. The gate also does NOT force the limiters to bind on this arm: that machinery is calibrated
+for rhoBox, and on sbMatched it clamps 111600 of 112000 cells and moves U by 1.5e+05 relative, which put
+Ux at 4.5e-04 for reasons that had nothing to do with boundaries.
+
+### The controls
+
+Two assert the ARITHMETIC of `updateBoundaryCoeffs` directly, so they need no bound:
+
+- doubling the boundary density must **halve** the flowRate inlet velocity, `avgU = -mdot/gSum(rho*magSf)`
+  -- worst 0.000e+00 over 400 faces, with `|U_in| 523.1` asserted separately so the halving is a
+  statement about a number that exists. A first version compared `ref2` against `0.5*ref1` alone and
+  would have passed on an inlet velocity of zero.
+- the flux SIGN must drive the switch: phi > 0 extrapolates, phi < 0 fixes the value -- 400 of 400 io
+  faces switch both ways. phi is DRIVEN to +-1 here rather than negated from the fixture, because the
+  fixture's phi is exactly zero and a control built on negating it flipped nothing (`0 of 400`) while
+  reporting success.
+
+Both still pass when the driver's CALL is removed, which is correct and is the point of having both: they
+test the function's contract, the trajectory tests that the driver invokes it.
