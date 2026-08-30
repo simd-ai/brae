@@ -582,6 +582,15 @@ add_test(NAME rho_simple_step_cuda_device_thermo
 add_test(NAME rho_simple_step_cuda_device_thermo_rho
          COMMAND test_rho_simple_step_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/sbMatched 0.orig --boundary --device-thermo)
 
+# THE MANIFEST MUST MATCH ITS GENERATOR. tools/of_manifest.py already had a --check mode that reports
+# drift, and nothing ran it -- so manifest/rhoSimpleFoam.yaml sat stale against the generator while
+# still being the file PORT.md calls authoritative. It was carrying `U 1.08e-04 (gated at 2e-3)` for a
+# gate whose bound is 5e-4 and which now holds eight fields. A check that exists but is registered
+# nowhere is not a check; this is the registration.
+add_test(NAME manifest_rhosimplefoam_not_drifted
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/of_manifest.py rhoSimpleFoam
+                 --check ${CMAKE_CURRENT_SOURCE_DIR}/manifest/rhoSimpleFoam.yaml)
+
 add_executable(test_rho_kepsilon_cuda tests/test_rho_kepsilon_cuda.cu)
 target_include_directories(test_rho_kepsilon_cuda PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_rho_kepsilon_cuda PRIVATE brae_core)

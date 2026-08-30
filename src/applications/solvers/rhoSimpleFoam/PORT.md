@@ -1069,3 +1069,69 @@ closed-volume compressible fixture exists to gate it.
 **The application still does not use any of this.** `gpuRhoSimpleFoam.cu:775` runs
 `DeviceSimpleSolver::rhoSimpleStep`, the legacy fused path -- same method name, different class. The
 modular driver is called by its gates and by nothing else.
+
+## The whole-solver gate held one field of eight, and the reason it gave had gone stale
+
+`tests/test_rho_simple_step_cpp.cu` is the only place this port compares a converged case against real
+OpenFOAM. Both `rho_squarebend_vs_openfoam` and `rho_simple_end_to_end_vs_openfoam` run it. It bounded
+**U alone**, at 5e-4. p, T, rho, k, epsilon, nut and alphat were computed, printed, and labelled
+`(reported, see the control)`.
+
+That was not negligence, and the file said why: on sbMatched p and T "barely move from their initial
+values (p stays within 3.1e-06 of uniform 110000), so no bound can both pass a correct solver and fail
+one that did nothing. Reporting a number the test cannot stand behind as if it were a gate is the
+failure mode this whole port exists to avoid." The principle is right and is the same one every control
+in this tree is built on.
+
+**The number behind it had gone stale.** Measured now, sbMatched's p starts 2.1698e-01 away from
+OpenFOAM's converged answer -- 434x the bound it is now held to -- and T starts 5.1090e-02 away, 102x.
+Whatever was true when that comment was written is not true of the fixture as it stands. An unenforced
+claim rots; this one had been rotting in the position of load-bearing justification for not testing
+seven fields.
+
+### gateIfItMoves: the decision is per field and per fixture, taken from data
+
+The fix is not to bound everything -- that would reintroduce exactly the vacuous gate the comment warned
+about. `gateIfItMoves(field, converged, startState, bound)` asserts the bound only when the START state
+misses OpenFOAM's answer by at least 10x it, and otherwise prints the field with the reason it is not
+held. A fixture where a field is frozen says so; a fixture where it moves gets a gate.
+
+Every bound below is therefore provably non-vacuous, with the ratio printed beside it:
+
+| field | squareBend | sbMatched | bound | start/bound (squareBend) |
+|---|---|---|---|---|
+| p | 4.850e-04 | 1.230e-05 | 1.0e-3 | 437x |
+| T | 1.096e-04 | 4.545e-06 | 3.0e-4 | 101x |
+| U | 4.411e-04 | 2.364e-05 | 5e-4 (unchanged) | 1.0 by construction |
+| rho | 4.341e-04 | 1.341e-05 | 1.0e-3 | 453x |
+| k | 1.358e-03 | 7.648e-05 | 3.0e-3 | 83x |
+| epsilon | 1.652e-03 | 1.373e-04 | 3.0e-3 | 83x |
+| nut | 1.166e-03 | 4.302e-05 | 3.0e-3 | 83x |
+| alphat | 9.666e-04 | 4.867e-05 | 3.0e-3 | 83x |
+
+U's own start-state ratio is 1.0 for any code state, because sbMatched/0.orig/U is `uniform (0 0 0)` --
+that control cannot fail and never could. The other seven are real measurements.
+
+FAIL-PROOF, run with the bounds tightened to `TURB_BOUND 1e-5` and p `1e-6`: p, k, epsilon, nut and
+alphat all FAIL, five of eight, while T, U and rho keep their real bounds and pass. The bounds bind.
+
+### What the widened gate says about the port
+
+It PASSES. The `_cpp` reference tracks OpenFOAM to ~1e-3 across the whole closure on the wider of the two
+fixtures, and to ~1e-4 on the other. The turbulence fields are the widest, and squareBend is where they
+are widest -- that case asks for `Gauss limitedLinear 1` on `div(phi,k)` and `div(phi,epsilon)` while the
+closure discretises both upwind regardless. `fvm::div` has two overloads, one taking scheme weights and
+one hardcoded upwind (`fvm.cuh:322` and `:369`); the closure calls the plain one, the incompressible path
+uses the weighted one, and `scheme_parse.cuh:565,574` already parses those two keys. ~1.6e-03 is what
+that difference is worth at convergence. OPEN FINDING, not a tolerance -- the bound is set where the code
+is and tightens when the scheme is honoured.
+
+### The manifest had drifted, and its drift check was registered nowhere
+
+`tools/of_manifest.py` has had a `--check` mode reporting drift since it was written. Nothing ran it.
+`manifest/rhoSimpleFoam.yaml` -- the file this document calls authoritative -- was stale: it carried
+`U 1.08e-04 (gated at 2e-3)` for a gate whose bound has been 5e-4 for some time and which now holds
+eight fields. `--check` exits 1 on it.
+
+Regenerated, and registered as `manifest_rhosimplefoam_not_drifted`. A check that exists but that nothing
+runs is not a check, and this tree now has one fewer of those.

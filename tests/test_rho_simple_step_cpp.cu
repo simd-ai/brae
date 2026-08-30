@@ -59,6 +59,42 @@ static void check(const std::string& what, bool ok)
     std::printf("     %-34s %s\n", what.c_str(), ok ? "ok" : "FAIL");
 }
 
+// Hold a field to a bound ONLY where that field MOVES on this fixture.
+//
+// The rule is the one the U bound already lives by, generalised. A bound the START state also passes
+// cannot separate a correct solver from one that did nothing, and reporting such a number as if it were
+// a gate is the failure mode this port exists to avoid -- which is exactly why p, T and rho were left as
+// reports here: on sbMatched they barely leave their initial values, so no bound could be honest.
+//
+// But that reasoning is per FIELD and per FIXTURE, and it was being applied to the whole set at once.
+// k, epsilon, nut and alphat move enormously on any turbulent case -- the closure's own comment two
+// hundred lines below says "Nothing above measures it, and it is not a spectator" -- so the same
+// argument that correctly declines to gate p on sbMatched positively requires gating them.
+//
+// So the decision is made per field, from the data: assert `bound` when the start state misses
+// OpenFOAM's answer by at least `margin` times it, and otherwise say plainly that the field is not held
+// here and why. A fixture where a field is frozen prints a reason; a fixture where it moves gets a gate.
+static void gateIfItMoves(
+    const std::string& what,
+    double             converged,    // relL2(brae's converged field, OpenFOAM's)
+    double             startState,   // relL2(the START field,        OpenFOAM's)
+    double             bound,
+    double             margin = 10.0)
+{
+    if (startState > margin * bound)
+    {
+        report(what, converged, bound);
+        std::printf("       %-32s start state %.4e = %.0fx the bound\n", "(non-vacuous)",
+                    startState, startState / bound);
+    }
+    else
+    {
+        std::printf("     %-34s %.6e   NOT GATED: the start state reads %.4e, inside %.0fx the bound,\n",
+                    what.c_str(), converged, startState, margin);
+        std::printf("       %-32s so no bound here separates a solver from one that did nothing\n", "");
+    }
+}
+
 static double relL2(const std::vector<scalar>& a, const std::vector<scalar>& b)
 {
     double num = 0.0, den = 0.0;
@@ -296,12 +332,33 @@ int main(int argc, char** argv)
     std::printf("  fields vs OpenFOAM at t=%s\n", endT.c_str());
     const std::vector<scalar> ofP = readInternal(caseDir + "/" + endT + "/p", nC);
     const std::vector<scalar> ofT = readInternal(caseDir + "/" + endT + "/T", nC);
-    // p, T and rho are REPORTED, not gated, and the control below is what decides that: on this fixture
-    // they barely move from their initial values (p stays within 3.1e-06 of uniform 110000), so no bound
-    // can both pass a correct solver and fail one that did nothing. Reporting a number the test cannot
-    // stand behind as if it were a gate is the failure mode this whole port exists to avoid.
-    std::printf("     %-34s %.6e   (reported, see the control)\n", "p", relL2(f.p.internal, ofP));
-    std::printf("     %-34s %.6e   (reported, see the control)\n", "T", relL2(f.T.internal, ofT));
+
+    // THE START STATE, from the same files the run began with. Every bound below is decided against it
+    // by gateIfItMoves, so a field that does not move on this fixture is reported with its reason rather
+    // than held to a number that would pass whatever the solver did. Built here rather than in the
+    // control block at the end because the decision it drives is taken here, field by field.
+    const cpu::rhoSimple::RhoSimpleFields z0 =
+        cpu::rhoSimple::createFields(caseDir + "/" + startT, caseDir, simpleDict, &fvSolution,
+                                     m, g, patches);
+
+    // BOUNDS FROM MEASUREMENT, worst across the two fixtures this binary runs, with ~2-3x headroom.
+    // They tighten as the port improves; they do not move to accommodate it.
+    //
+    //                squareBend    sbMatched      bound
+    //     p          4.850e-04     1.230e-05      1.0e-3
+    //     T          1.096e-04     4.545e-06      3.0e-4
+    //     rho        4.341e-04     1.341e-05      1.0e-3
+    //     k          1.358e-03     7.648e-05      3.0e-3  (TURB_BOUND)
+    //     epsilon    1.652e-03     1.373e-04        "
+    //     nut        1.166e-03     4.302e-05        "
+    //     alphat     9.666e-04     4.867e-05        "
+    //
+    // squareBend is the wider of the two on every field, and its k and epsilon are the widest of all --
+    // that case asks for `Gauss limitedLinear 1` on div(phi,k) and div(phi,epsilon) and the closure
+    // discretises them upwind regardless (fvm::div's plain overload, where the weighted one exists and
+    // the incompressible path uses it). ~1.6e-03 is what that difference is worth at convergence.
+    gateIfItMoves("p", relL2(f.p.internal, ofP), relL2(z0.p.internal, ofP), 1.0e-3);
+    gateIfItMoves("T", relL2(f.T.internal, ofT), relL2(z0.T.internal, ofT), 3.0e-4);
     {
         const FieldData<vector> uFd = readField<vector>(caseDir + "/" + endT + "/U");
         std::vector<scalar> a, b;
@@ -404,8 +461,7 @@ int main(int argc, char** argv)
     }
     {
         const std::vector<scalar> ofRho = readInternal(caseDir + "/" + endT + "/rho", nC);
-        std::printf("     %-34s %.6e   (reported, see the control)\n", "rho",
-                    relL2(f.rho.internal, ofRho));
+        gateIfItMoves("rho", relL2(f.rho.internal, ofRho), relL2(z0.rho.internal, ofRho), 1.0e-3);
         // rho's RANGE beside OpenFOAM's. rho.relax() with this case's 0.01 moves rho only 1% of the way
         // to thermo.rho() each iteration, so the min is a direct read on whether the relaxation ran at
         // all: an unrelaxed rho lands on thermo.rho() itself, a relaxed one a hundredth of the way there.
@@ -429,6 +485,12 @@ int main(int argc, char** argv)
                         (double)f.T.internal[am], (double)ofRho[am], (double)ofPf[am], (double)ofTf[am]);
         }
     }
+    // The turbulence fields' bound. Held apart from the momentum bound because the closure converges to a
+    // looser fixed point than U does and always has: k and epsilon are transported quantities driven by
+    // a production term built from grad(U), so they carry U's error amplified by the gradient. Set from
+    // measurement, and it TIGHTENS as the closure improves -- it does not move to accommodate it.
+    const double TURB_BOUND = 3.0e-03;
+
     // THE CLOSURE'S OWN FIXED POINT. Nothing above measures it, and it is not a spectator: nut feeds
     // muEff, which is a coefficient of the momentum equation this gate does bound. The closure gates
     // (rho_kepsilon, rho_komegasst) assemble ONE system from OpenFOAM's adopted k, epsilon and U and
@@ -450,9 +512,19 @@ int main(int argc, char** argv)
             else if (n == "nut")     bf = &f.nut;
             else if (n == "alphat")  bf = &f.alphat;
             if (!bf || static_cast<label>(bf->internal.size()) != nC) continue;
+            const GeometricField<scalar>* zf = nullptr;
+            if      (n == "k")       zf = &z0.k;
+            else if (n == "epsilon") zf = &z0.epsilon;
+            else if (n == "omega")   zf = &z0.omega;
+            else if (n == "nut")     zf = &z0.nut;
+            else if (n == "alphat")  zf = &z0.alphat;
             const std::vector<scalar> of = readInternal(path, nC);
-            std::printf("     %-34s %.6e   (reported, see the control)\n", fld,
-                        relL2(bf->internal, of));
+            // The closure's fields get the SAME treatment every other field now gets. They were the one
+            // group with an explicit argument for being measured -- the comment above says they are not
+            // spectators -- and no bound at all.
+            const double zStart = (zf && static_cast<label>(zf->internal.size()) == nC)
+                                ? relL2(zf->internal, of) : 0.0;
+            gateIfItMoves(fld, relL2(bf->internal, of), zStart, TURB_BOUND);
             // SPLIT BY CELLZONE. angledDuct's fvOptions pins k = 1, epsilon = 150 and T = 350 across the
             // 8000 porosity cells, and OpenFOAM's converged fields hold every one of them EXACTLY. So a
             // whole-field number here averages 8000 cells that must agree to the last bit with 20000 that
@@ -479,21 +551,24 @@ int main(int argc, char** argv)
     // ---- THE CONTROL: the initial field must NOT pass those bounds. ----
     std::printf("  control -- the initial field must not pass\n");
     {
-        cpu::rhoSimple::RhoSimpleFields z =
-            cpu::rhoSimple::createFields(caseDir + "/" + startT, caseDir, simpleDict, &fvSolution,
-                                         m, g, patches);
+        // z0, not a second field set built from the same files: every bound above was already decided
+        // against it, and building it twice invited the two copies to drift apart.
         const FieldData<vector> uFd2 = readField<vector>(caseDir + "/" + endT + "/U");
         std::vector<scalar> za, zb;
         for (label c = 0; c < nC; ++c)
         {
-            za.push_back(z.U.internal[c].x); za.push_back(z.U.internal[c].y); za.push_back(z.U.internal[c].z);
+            za.push_back(z0.U.internal[c].x); za.push_back(z0.U.internal[c].y); za.push_back(z0.U.internal[c].z);
             zb.push_back(uFd2.internalField[c].x); zb.push_back(uFd2.internalField[c].y); zb.push_back(uFd2.internalField[c].z);
         }
         const double zu = relL2(za, zb);
         check("the start state fails the U bound", zu > 5e-4);
-        std::printf("     %-34s U %.4e   p %.4e   T %.4e\n", "  (start-state errors)",
-                    zu, relL2(z.p.internal, ofP), relL2(z.T.internal, ofT));
-        std::printf("     %-34s\n", "  p and T start INSIDE their bounds -> not gated, as above");
+        // Every OTHER field's start state is printed beside its own bound above, by gateIfItMoves, which
+        // is also what decides whether that field is held at all. This line used to end with "p and T
+        // start INSIDE their bounds -> not gated", which was true of sbMatched and asserted of every
+        // fixture: on squareBend p starts 2.1841e-01 away from OpenFOAM's answer, 437x its bound, and is
+        // gated. The decision is per field and per fixture, so it is made there and not stated here.
+        std::printf("     %-34s U %.4e   (every other field: see its own line above)\n",
+                    "  (start-state error)", zu);
     }
 
     // ---- THE REFUSAL: an unported NUT WALL FUNCTION ------------------------------------------
