@@ -27,6 +27,8 @@
 #include "foam_field_reader.cuh"
 #include "foam_dict.cuh"
 #include "kEpsilon_cpp.cuh"
+#include "near_wall_dist.cuh"
+#include "nut_wall_function.cuh"
 #include "fvOptions_cpp.cuh"   // the case's fvOptions: kEpsilon.C constrains BOTH equations
 #include "linearViscousStress_cpp.cuh"
 
@@ -548,6 +550,60 @@ int main(int argc, char** argv)
             std::printf("       %-16s eps %.4e   k %.4e\n", names[dt],
                         relL2(eD, ofE), relL2(kD, ofK));
         }
+    }
+
+    // ---- THE WALL-NUT DEVIATION, measured against OpenFOAM's own stored value ------------------
+    // OpenFOAM's near-wall PRODUCTION reads the stored wall nut -- epsilonWallFunctionFvPatchScalarField.C
+    // :333-334 is `const tmp<scalarField> tnutw = turbModel.nut(patchi);`, consumed at :342 as
+    // (nutw + nuw)*magGradUw. brae RECOMPUTES it instead, from the current k and the current per-face nu
+    // (kEpsilon_cpp.cu:240, and kEpsilon.cu passes nutWall=0 to deviceWallEpsG0 for the same reason).
+    //
+    // For nutkWallFunction the k is the same at that point in the iteration, so the two differ only
+    // through nu_w = mu(T_w)/rho_w, which moves whenever the wall's T or p does -- sbMatched's walls are
+    // zeroGradient on both. stage_nutIn IS the field OpenFOAM's production reads, so the gap is
+    // measurable here without instrumenting anything further.
+    //
+    // MEASURED AT EXACTLY ZERO over all 22400 wall faces on this state -- abs 0.000000e+00. So the two
+    // conventions are not an arithmetic disagreement: handed the same k and the same per-face nu,
+    // recomputing nutkWallFunction reproduces OpenFOAM's stored value bit for bit, which is what the
+    // formula being shared (nut_wall_function.cuh, one BRAE_HD definition) predicts.
+    //
+    // WHAT THIS DOES NOT ESTABLISH, and the difference is the whole point of the deviation: this gate
+    // runs ONE correct() from OpenFOAM's own dumped inputs, so the stored nut and the nu brae recomputes
+    // from are drawn from the same consistent state. In a running solver they are not -- OpenFOAM's
+    // stored value was written by the PREVIOUS correctNut, and EEqn has moved T (hence nu_w = mu(T_w)/
+    // rho_w, zeroGradient on both here) in between. That staleness needs a multi-iteration comparison
+    // and no gate here provides one; dumpKEpsilon writes stage_G but no G0, so the production term has
+    // no OpenFOAM oracle at all.
+    //
+    // On this evidence the restructuring is NOT justified: it would change nothing measurable, and the
+    // last structurally-correct change made on that reasoning (skipping empty patches in fvc) moved a
+    // real gate's converged U by 3.3x. Reported, not gated -- a bound whose correct value is zero only
+    // in the limit would be asserting the wrong thing.
+    {
+        const KEpsilonCoeffs kw;
+        const std::vector<std::vector<scalar>> yW = brae::nearWallDist(m, g, patches);
+        double worst = 0.0, worstStored = 0.0;
+        std::size_t nWallFaces = 0;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (!eps.boundary[pi]->isTurbulenceWallFunction()) continue;
+            const std::vector<scalar>& stored = nut.boundary[pi]->value();
+            std::vector<scalar> nuFace(patches[pi].size);
+            for (label i = 0; i < patches[pi].size; ++i) nuFace[i] = nuBnd[pi][i];
+            const std::vector<scalar> recomputed =
+                brae::nutkWallFunction(patches[pi], yW[pi], k.internal, nuFace, kw.Cmu, kw.kappa, kw.E);
+            for (label i = 0; i < patches[pi].size; ++i, ++nWallFaces)
+            {
+                const double d = std::fabs((double)recomputed[i] - (double)stored[i]);
+                if (d > worst) { worst = d; worstStored = (double)stored[i]; }
+            }
+        }
+        const double rel = worstStored > 0.0 ? worst / worstStored : worst;
+        std::printf("     %-40s abs %.6e  rel %.6e  over %zu wall faces\n",
+                    "wall nut: recomputed vs OF's stored", worst, rel, nWallFaces);
+        std::printf("     %-40s %s\n", "  (reported -- see the note above)",
+                    "brae recomputes where OpenFOAM reads");
     }
 
     // ---- 2. THE CONTROL: divU from the MASS flux instead of the volumetric one. ----
