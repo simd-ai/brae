@@ -41,6 +41,9 @@ validation/*
 !validation/pitzDailyTurbBig/
 !validation/rhoBox/
 !validation/rhoBoxE/
+!validation/rhoBoxF/
+!validation/rhoBoxP/
+!validation/simpleBoxP/
 !validation/rhoSuth/
 !validation/rhoLU/
 !validation/rhoTP/
@@ -68,6 +71,9 @@ validation/*
 !validation/sa_vs_openfoam.sh
 !validation/io_vs_openfoam.sh
 !validation/ti_vs_openfoam.sh
+!validation/tf_vs_openfoam.sh
+!validation/ffp_vs_openfoam.sh
+!validation/ffpi_vs_openfoam.sh
 !validation/ke2_vs_openfoam.sh
 !validation/rx_vs_openfoam.sh
 !validation/pm_vs_openfoam.sh
