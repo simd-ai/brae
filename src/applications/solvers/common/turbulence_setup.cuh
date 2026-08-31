@@ -15,6 +15,7 @@
 #include "komega_sst_coeffs.cuh"
 #include "spalart_coeffs.cuh"
 #include "turbulent_inlet.cuh"
+#include "frozen_bc_guard.cuh"
 #include <cstdio>
 #include <string>
 #include <utility>
@@ -346,8 +347,19 @@ struct TurbulenceFields { GeometricField<scalar> k, eps, nut, ReThetat, gammaInt
 
 inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const std::vector<FvPatch>& fvp, label nC,
                                              DeviceSimpleControls& ctl, const std::string& secondName,
-                                             const GeometricField<vector>& U)
+                                             const GeometricField<vector>& U,
+                                             // Non-null: the calling driver does NOT maintain per-step
+                                             // boundaries on these fields, so refuse them by that name
+                                             // (frozen_bc_guard.cuh). gpuPimpleFoam maintains fixedMean
+                                             // on k/epsilon/omega/nuTilda/nut and passes null.
+                                             const char* frozenGuardDriver = nullptr,
+                                             bool frozenGuardCodedMaintained = false)
 {
+    auto guardFrozen = [&](const FieldData<scalar>& fd, const std::string& nm)
+    {
+        if (frozenGuardDriver)
+            refuseFrozenPerStepBC(fd, nm, frozenGuardDriver, frozenGuardCodedMaintained);
+    };
     TurbulentInletMasks masks;
         // Wall-function fidelity guard -- fail loud on a nut/epsilon/omega wall-function BC placed on a patch NOT typed
         // 'wall': brae gates the near-wall model on the geometric patch type, so the wall function would be SILENTLY
@@ -457,6 +469,7 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
         if (ctl.les)   // pure LES Smagorinsky: ONLY nut (algebraic sub-grid viscosity); no k/epsilon/omega/nuTilda transport.
         {
             const FieldData<scalar> nutFD = readField<scalar>(fieldDir + "/nut");
+            guardFrozen(nutFD, "nut");
             guardWallFn(nutFD, "nut");
             setNutWall(nutFD);   // honour a velocity-based nut wall function (nutUSpaldingWallFunction) if the case uses one
             nut = buildField<scalar>(nutFD, fvp, nC);
@@ -467,6 +480,7 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
             k   = buildField<scalar>(readField<scalar>(fieldDir + "/nuTilda"), fvp, nC);
             k.evaluateBoundary();
             const FieldData<scalar> nutFD = readField<scalar>(fieldDir + "/nut");
+            guardFrozen(nutFD, "nut");
             guardWallFn(nutFD, "nut");
             nut = buildField<scalar>(nutFD, fvp, nC);
             nut.evaluateBoundary();
@@ -474,12 +488,15 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
         else if (ctl.turbulent)
         {
             const FieldData<scalar> kFD = readField<scalar>(fieldDir + "/k");
+            guardFrozen(kFD, "k");
             const FieldData<scalar> sFD = readField<scalar>(fieldDir + "/" + secondName);
+            guardFrozen(sFD, secondName);
             k   = buildField<scalar>(kFD, fvp, nC);
             k.evaluateBoundary();
             eps = buildField<scalar>(sFD, fvp, nC);
             eps.evaluateBoundary();
             const FieldData<scalar> nutFD = readField<scalar>(fieldDir + "/nut");
+            guardFrozen(nutFD, "nut");
             guardWallFn(nutFD, "nut");
             guardWallFn(sFD, secondName);
             setNutWall(nutFD);   // honour the BC-specified velocity-based nut wall function (nutUSpalding/nutUBlended)

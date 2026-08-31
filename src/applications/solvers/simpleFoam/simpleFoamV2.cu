@@ -2,6 +2,7 @@
 #include "simpleFoamV2.cuh"
 #include "simpleFoam.cuh"
 #include "createFields_cpp.cuh"
+#include "frozen_bc_guard.cuh"
 #include "simpleControl_cpp.cuh"
 #include "linearViscousStress_cpp.cuh"
 #include "primitive_mesh.cuh"
@@ -930,10 +931,20 @@ int runSimpleFoamV2(const std::string& caseDir)
         // before the model ever ran.
         secondField = sstModel ? "omega" : "epsilon";
         const std::string firstField = saModel ? "nuTilda" : "k";
-        kF   = buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/" + firstField), fvp, nC);
+        // V2 maintains NO per-step boundary (fixedMean, fanPressure, coded) -- the legacy driver's
+        // NVRTC and collect* hooks live in DeviceSimpleSolver, which this path does not use. Check the
+        // types here, where they still exist; buildField erases them (frozen_bc_guard.cuh).
+        const FieldData<scalar> kFd = readField<scalar>(caseDir + "/" + startTime + "/" + firstField);
+        refuseFrozenPerStepBC(kFd, firstField, "simpleFoamV2", false);
+        kF   = buildField<scalar>(kFd, fvp, nC);
         if (!saModel)
-            epsF = buildField<scalar>(readField<scalar>(caseDir + "/" + startTime + "/" + secondField), fvp, nC);
+        {
+            const FieldData<scalar> eFd = readField<scalar>(caseDir + "/" + startTime + "/" + secondField);
+            refuseFrozenPerStepBC(eFd, secondField, "simpleFoamV2", false);
+            epsF = buildField<scalar>(eFd, fvp, nC);
+        }
         const FieldData<scalar> nutFd = readField<scalar>(caseDir + "/" + startTime + "/nut");
+        refuseFrozenPerStepBC(nutFd, "nut", "simpleFoamV2", false);
         nutF = buildField<scalar>(nutFd, fvp, nC);
         // atmNutkWallFunction: the ATMOSPHERIC rough-wall nut, nut = nu*(y+*kappa/log(max(Edash,1+1e-4)) - 1)
         // with Edash built from the surface roughness z0. Running it as the smooth nutkWallFunction is not a

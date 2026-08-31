@@ -1,5 +1,6 @@
 // _cpp REFERENCE implementation -- see createFields_cpp.cuh for the OpenFOAM provenance.
 #include "createFields_cpp.cuh"
+#include "frozen_bc_guard.cuh"
 #include "foam_field_reader.cuh"
 #include <filesystem>
 #include <stdexcept>
@@ -27,9 +28,16 @@ SimpleFields createFields(
     const label nC = m.nCells();
 
     // p, U: MUST_READ. A missing file is a hard error in OpenFOAM and stays one here.
-    f.p = buildField<scalar>(readField<scalar>(timeDir + "/p"), patches, nC);
+    // The read is split so the boundary TYPES can be checked before they are erased by buildField:
+    // no caller of this createFields maintains a per-step boundary (fixedMean, fanPressure, coded), so
+    // building one would freeze it at the file `value` -- see frozen_bc_guard.cuh.
+    const FieldData<scalar> pFd = readField<scalar>(timeDir + "/p");
+    refuseFrozenPerStepBC(pFd, "p", "simpleFoam (mirror createFields)", false);
+    f.p = buildField<scalar>(pFd, patches, nC);
     f.p.evaluateBoundary();
-    f.U = buildField<vector>(readField<vector>(timeDir + "/U"), patches, nC);
+    const FieldData<vector> UFd = readField<vector>(timeDir + "/U");
+    refuseFrozenPerStepBC(UFd, "U", "simpleFoam (mirror createFields)", false);
+    f.U = buildField<vector>(UFd, patches, nC);
     f.U.evaluateBoundary();
 
     // createPhi.H: READ_IF_PRESENT, else fvc::flux(U).
