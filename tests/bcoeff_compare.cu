@@ -105,6 +105,39 @@ int main(int argc, char** argv)
 
     const std::vector<scalar> braeIC = aIC.host(), braeBC = aBC.host();
 
+    // THE HOST ARM. Everything above builds a DeviceBoundary and asks the DEVICE kernels for the
+    // coefficients, so this gate has only ever tested the device path -- including for `fixedGradient`,
+    // which its own header names as defect B5 ("fixedGradient discretised as zeroGradient -- an adiabatic
+    // wall"). The HOST discretisation goes through the patch field's own four coefficient methods, and
+    // FixedGradientPatchField overrode none of the boundary two, so they fell through to the base's
+    // zeros: fvm::laplacian (fvm.cuh:96) and fvc::snGrad (fvc.cu:339) treated every prescribed gradient
+    // as zeroGradient while the device carried it correctly. Two lineages, one boundary condition, no
+    // gate able to see the difference.
+    //
+    // The formulas are fvm.cuh:6-9's, which is what the solver's own assembly uses:
+    //     laplacian   IC = gamma*magSf*gradIC          BC = -gamma*magSf*gradBC
+    //     div         IC = phi_pf*valueIC              BC = -phi_pf*valueBC
+    // and the same subtraction the device arm applies, so both arms face the same OpenFOAM dump.
+    std::vector<scalar> hostIC, hostBC;
+    {
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            const FvPatch& q = fvp[pi];
+            if (q.type == "cyclic" || q.type == "cyclicAMI") continue;
+            const std::vector<scalar> vIC = psi.boundary[pi]->valueInternalCoeffs();
+            const std::vector<scalar> vBC = psi.boundary[pi]->valueBoundaryCoeffs();
+            const std::vector<scalar> gIC = psi.boundary[pi]->gradientInternalCoeffs();
+            const std::vector<scalar> gBC = psi.boundary[pi]->gradientBoundaryCoeffs();
+            for (label i = 0; i < q.size; ++i)
+            {
+                const scalar phipf = phi.boundary[pi][i];
+                const scalar gmS   = gammaVal * q.magSf[i];
+                hostIC.push_back(phipf * vIC[i] - gmS * gIC[i]);
+                hostBC.push_back(-phipf * vBC[i] + gmS * gBC[i]);
+            }
+        }
+    }
+
     const FieldData<scalar> ofIC = readField<scalar>(caseDir + "/" + t + "/ICoeff");
     const FieldData<scalar> ofBC = readField<scalar>(caseDir + "/" + t + "/BCoeff");
 
@@ -143,10 +176,24 @@ int main(int argc, char** argv)
         // error is undefined there, and "brae also produced zero" is the whole claim.
         const scalar eI = (nrmI > 0) ? std::sqrt(dI / nrmI) : std::sqrt(dI);
         const scalar eB = (nrmB > 0) ? std::sqrt(dB / nrmB) : std::sqrt(dB);
-        const bool ok = (eI <= 1e-10) && (eB <= 1e-10);
+
+        // The HOST arm, against the SAME OpenFOAM dump.
+        scalar hdI = 0, hdB = 0;
+        for (std::size_t i = 0; i < n && off + i < hostIC.size(); ++i)
+        {
+            hdI += (oi[i] - hostIC[off + i]) * (oi[i] - hostIC[off + i]);
+            hdB += (ob[i] - hostBC[off + i]) * (ob[i] - hostBC[off + i]);
+        }
+        const scalar hI = (nrmI > 0) ? std::sqrt(hdI / nrmI) : std::sqrt(hdI);
+        const scalar hB = (nrmB > 0) ? std::sqrt(hdB / nrmB) : std::sqrt(hdB);
+        const bool hostOk = (hI <= 1e-10) && (hB <= 1e-10);
+
+        const bool ok = (eI <= 1e-10) && (eB <= 1e-10) && hostOk;
         std::printf("  %-10s %-15s %8zu   err %.3e (sum|OF| %.4g)  err %.3e (sum|OF| %.4g)  %s\n",
                     q.name.c_str(), psi.boundary[pi]->bcCategory() == 3 ? "inletOutlet" : q.type.c_str(),
                     n, (double)eI, (double)sumOfI, (double)eB, (double)sumOfB, ok ? "OK" : "FAIL");
+        std::printf("  %-10s %-15s %8s   host err %.3e                    host err %.3e            %s\n",
+                    "", "  (host arm)", "", (double)hI, (double)hB, hostOk ? "OK" : "FAIL");
         compared++;
         if (!ok) bad++;
         off += n;

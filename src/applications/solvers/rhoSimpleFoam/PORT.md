@@ -1597,3 +1597,36 @@ point. So the next thread is boundary EVALUATION -- not the closure, which repro
 NOTE, so it is not chased again: `rhoThermo` shows 1.78e-03 in that dump and is a FALSE POSITIVE. This
 arm runs the HOST thermo hooks, so `gf.rhoThermo` is neither written nor read; it is stale by
 construction and reaches nothing.
+
+## pressureInletOutletVelocity was non-assignable, and the base class is why
+
+`constrainHbyA.C:56-69` assigns `HbyA_b = U_b` on exactly the patches where U is NOT assignable:
+
+    if (!U.boundaryField()[patchi].assignable()
+     && !isA<fixedFluxExtrapolatedPressureFvPatchScalarField>(p.boundaryField()[patchi]))
+        HbyAbf[patchi] = U.boundaryField()[patchi];
+
+brae returned FALSE for `pressureInletOutletVelocity`, with the comment "OF: pressureInletOutletVelocity
+derives from directionMixed". The derivation is right and the conclusion is wrong:
+`directionMixedFvPatchField.H:133` does return false, and
+`pressureInletOutletVelocityFvPatchVectorField.H:162` OVERRIDES IT BACK TO TRUE -- "True: this patch
+field is altered by assignment". So brae was overwriting HbyA at every such patch: an outlet whose whole
+purpose is to let the pressure set its own inflow.
+
+**This file already carried the same lesson one class along.** `inletOutlet` is false in `mixed` and true
+in `inletOutletFvPatchField.H:164`, and the note at the InletOutlet class records what that cost when the
+pcEqn gate found it -- 1.3e-03 on HbyA's boundary and 3.5e-03 on phiHbyA. Nobody checked whether the
+sibling had the same problem. It did, and it was found only because a verification pass read the DERIVED
+class where an earlier pass in this same session had read the base, concluded brae was correct, and moved
+on. Reading a base class is not reading the type.
+
+Affects `validation/piov`, `piov_of`, `piov_cf`, `simpleCar` and `rhoTP` -- and both lineages, since
+`assignable()` feeds constrainHbyA on the host and `takeUAtBoundary` on the device.
+
+Full suite after the change: **338/338**. Not one case moved across a bound, which is worth stating
+plainly: the defect was real and verified against OpenFOAM's source, and no existing gate could see it.
+That is the same shape as the four unhonoured contracts above -- a fact about OpenFOAM written down
+wrongly, with nothing in the build able to contradict it.
+
+NOT the cause of the rhoTP divergence, which was the reason for looking: rhoTP still reaches T 5.38e+42
+(it was 3.79e+38, so the trajectory did move). Recorded so the next attempt does not re-run it.

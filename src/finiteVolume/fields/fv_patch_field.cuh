@@ -547,6 +547,29 @@ public:
     bool fixesValue() const override { return false; }          // the VALUE is not fixed; the gradient is
     const std::vector<T>* refGradPtr() const override { return &grad_; }
 
+    // THE BOUNDARY COEFFICIENTS, which this class described and did not implement. The comment above has
+    // named them since it was written -- valueBoundaryCoeffs = g/deltaCoeffs, gradientBoundaryCoeffs = g,
+    // citing fixedGradientFvPatchField.C -- while the class overrode only evaluate(), fixesValue() and
+    // refGradPtr(), so both fell through to the BASE, which returns zeros and documents itself as
+    // "Default (zeroGradient/empty/calculated) contributes nothing".
+    //
+    // The consequence was that on the HOST every fixedGradient patch was discretised as zeroGradient:
+    // fvm::laplacian and fvc::snGrad build their patch contribution from exactly these two, so a
+    // prescribed gradient reached the matrix nowhere. The DEVICE path has carried it correctly all along
+    // through DeviceBoundary::refGrad and is gated against OpenFOAM at 1.3e-15
+    // (validation/bc_vs_openfoam.sh), so the two lineages disagreed on the same boundary condition.
+    //
+    // OF: fixedGradientFvPatchField.C:216 and :232.
+    std::vector<T> valueBoundaryCoeffs() const override
+    {
+        std::vector<T> v(static_cast<std::size_t>(this->patch_.size));
+        for (label i = 0; i < this->patch_.size; ++i)
+            v[static_cast<std::size_t>(i)] =
+                grad_[static_cast<std::size_t>(i)] / this->patch_.deltaCoeffs[i];
+        return v;
+    }
+    std::vector<T> gradientBoundaryCoeffs() const override { return grad_; }
+
 private:
     bool uniform_;
     T gUniform_;
@@ -980,11 +1003,20 @@ public:
             r[i] = tUniform<T>(-vf_[i] * this->patch_.deltaCoeffs[i]);
         return r;
     }
-    std::vector<T> gradientBoundaryCoeffs() const override        // vf*deltaCoeffs*refValue
+    // OF mixedFvPatchField.C: lerp(refGrad, deltaCoeffs*refValue, vf) = (1-vf)*refGrad + vf*dc*refValue.
+    // The (1-vf)*refGrad half was missing here and from valueBoundaryCoeffs below, while evaluate() above
+    // DID carry it -- so the patch VALUE was right and the coefficients it hands the matrix were not.
+    // Measured against OpenFOAM's own dumped coefficients on validation/bcoeffBox's `mixed` patch:
+    // 1.822e-01 before, machine precision after. The device path was already correct, so this was the
+    // same host-only hole as FixedGradientPatchField's, in the class next door.
+    std::vector<T> gradientBoundaryCoeffs() const override        // (1-vf)*refGrad + vf*deltaCoeffs*refValue
     {
         std::vector<T> r(this->patch_.size);
         for (label i = 0; i < this->patch_.size; ++i)
+        {
             r[i] = this->refValue(i) * (vf_[i] * this->patch_.deltaCoeffs[i]);
+            if (!refGrad_.empty()) r[i] = r[i] + refGrad_[i] * (1.0 - vf_[i]);
+        }
         return r;
     }
     std::vector<T> valueInternalCoeffs() const override           // 1-vf
@@ -994,11 +1026,16 @@ public:
             r[i] = tUniform<T>(1.0 - vf_[i]);
         return r;
     }
-    std::vector<T> valueBoundaryCoeffs() const override           // vf*refValue
+    // OF: lerp(refGrad/deltaCoeffs, refValue, vf) = (1-vf)*refGrad/deltaCoeffs + vf*refValue.
+    std::vector<T> valueBoundaryCoeffs() const override           // (1-vf)*refGrad/dc + vf*refValue
     {
         std::vector<T> r(this->patch_.size);
         for (label i = 0; i < this->patch_.size; ++i)
+        {
             r[i] = this->refValue(i) * vf_[i];
+            if (!refGrad_.empty())
+                r[i] = r[i] + refGrad_[i] * ((1.0 - vf_[i]) / this->patch_.deltaCoeffs[i]);
+        }
         return r;
     }
 protected:
@@ -1200,7 +1237,18 @@ template <typename T>
 class PressureInletOutletVelocityPatchField : public ExtrapolatedValuePatchField<T>   // value() = written seed
 {
 public:
-    bool assignable() const override { return false; }   // OF: pressureInletOutletVelocity derives from directionMixed
+    // TRUE, and the derivation is a trap. pressureInletOutletVelocity derives from directionMixed, whose
+    // assignable() is false (directionMixedFvPatchField.H:133) -- but OpenFOAM OVERRIDES it back to true
+    // in the derived class (pressureInletOutletVelocityFvPatchVectorField.H:162, "True: this patch field
+    // is altered by assignment"). Reading only the base is how this was got wrong.
+    //
+    // It is the SAME defect this file already carries a note about for inletOutlet, which is false in
+    // `mixed` and true in inletOutletFvPatchField.H:164, and which cost 1.3e-03 on HbyA's boundary and
+    // 3.5e-03 on phiHbyA until the pcEqn gate found it. constrainHbyA.C:56-69 assigns
+    // HbyA_b = U_b only where !assignable(), so a wrong `false` here makes constrainHbyA overwrite HbyA
+    // at every pressureInletOutletVelocity patch -- an outlet that is supposed to let the pressure set
+    // its own inflow.
+    bool assignable() const override { return true; }
     using ExtrapolatedValuePatchField<T>::ExtrapolatedValuePatchField;
     int bcCategory() const override { return 6; }                  // device: pressureInletOutletVelocity (outlet, adjustable flux)
 
