@@ -118,6 +118,17 @@ sed -i 's/nutkWallFunction/nutUSpaldingWallFunction/' "$W/unportednut/nut"
 grep -q "nutUSpaldingWallFunction" "$W/unportednut/nut" \
     || { echo "FAIL: could not build the unported-nut fixture"; exit 1; }
 UNPORTEDNUT="$W/unportednut"
+
+# ...and the ATM member of the family, in a fixture of its own. atmNutkWallFunction does not start
+# with "nut", so a one-prefix guard let it fall through to CalculatedPatchField and run as the smooth
+# nutk with z0 unplumbed -- the refusal existed and could not fire. This arm FAILED before the
+# two-prefix guard landed, which is its fail-proof.
+mkdir -p "$W/unportedatm"
+cp "$W/case/0/"* "$W/unportedatm/" 2>/dev/null || true
+sed -i 's/nutkWallFunction/atmNutkWallFunction/' "$W/unportedatm/nut"
+grep -q "atmNutkWallFunction" "$W/unportedatm/nut" \
+    || { echo "FAIL: could not build the unported-atm fixture"; exit 1; }
+UNPORTEDATM="$W/unportedatm"
 fi
 
-"$BIN" "$W/case" 0 "$ITERS" $UNPORTED $UNPORTEDNUT
+"$BIN" "$W/case" 0 "$ITERS" $UNPORTED $UNPORTEDNUT $UNPORTEDATM

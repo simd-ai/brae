@@ -528,7 +528,12 @@ RhoSimpleFields createFields(
                     const FieldData<scalar> nutRaw = readField<scalar>(timeDir + "/nut");
                     for (const auto& b : nutRaw.boundary)
                     {
-                        if (b.type.rfind("nut", 0) != 0) continue;          // not a nut wall function
+                        // TWO prefixes, because the atm family does not start with "nut":
+                        // atmNutkWallFunction -- named in the comment above as refused -- passed a
+                        // one-prefix test and ran as the smooth nutk with z0 unplumbed, exactly the
+                        // substitution this throw exists to prevent.
+                        if (b.type.rfind("nut", 0) != 0
+                         && b.type.rfind("atmNut", 0) != 0) continue;        // not a nut wall function
                         if (b.type == "nutkWallFunction") continue;         // the one that is ported
                         throw std::runtime_error(
                             "brae: rhoSimpleFoam nut patch '" + b.name + "' carries '" + b.type +

@@ -679,6 +679,29 @@ int main(int argc, char** argv)
         std::printf("     %-34s %s\n", "unported-nut fixture not supplied", "SKIP");
     }
 
+    // ---- THE REFUSAL: the ATM member of the nut family, which does NOT start with "nut" -----------
+    // The guard above was a one-prefix test, so atmNutkWallFunction -- the one type its own block
+    // comment names as refused -- fell through to CalculatedPatchField and ran as the smooth nutk with
+    // z0 unplumbed. This arm fails against that guard, which is the fail-proof for the two-prefix one.
+    std::printf("  refusal -- atmNutkWallFunction (escapes a one-prefix guard)\n");
+    if (argc > 6)
+    {
+        bool threw = false;
+        std::string msg;
+        try
+        {
+            (void)cpu::rhoSimple::createFields(std::string(argv[6]), caseDir,
+                                               simpleDict, &fvSolution, m, g, patches);
+        }
+        catch (const std::exception& e) { threw = true; msg = e.what(); }
+        check("atmNutkWallFunction is refused", threw);
+        check("and the refusal names it", msg.find("atmNutkWallFunction") != std::string::npos);
+    }
+    else
+    {
+        std::printf("     %-34s %s\n", "unported-atm fixture not supplied", "SKIP");
+    }
+
     // ---- THE REFUSAL: a turbulent case must be refused BY NAME, not run as laminar. ----
     std::printf("  refusal -- an unported RAS model\n");
     if (argc > 4)
