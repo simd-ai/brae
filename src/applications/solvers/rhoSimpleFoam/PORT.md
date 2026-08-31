@@ -1810,3 +1810,11 @@ Both gates grew a MIRROR ARM (the same OF workdir through test_rho_simple_step_c
 check on the fixture's T type): hf T 3.85e-12 / U 4.85e-10, mx T 1.07e-12 / U 6.72e-10 at the matched
 iteration -- machine-level on the first run after the lift, because the host fixedGradient/mixed
 COEFFICIENTS were already in (the e917673 trio) and only the mapping was missing.
+
+## The refusal census, adjudicated
+
+The full census -- 120 surveyed refusals, 69 adjudicated disputes/missed items, the 22 entries this
+session closed, and the 21 HOLEs that form the next campaign -- lives in REFUSALS.md next to this
+file. Every verdict there was re-verified against the tree at 2ecfe0f, file by file; five of the
+adversarial checker's objections were themselves REJECTED on the code (the vocabulary and the counts
+are at the top of that file).
