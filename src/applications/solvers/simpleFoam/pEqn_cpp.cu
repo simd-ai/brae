@@ -121,7 +121,11 @@ PressureStages pressurePredictor(
 
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
-            if (U.boundary[pi]->fixesValue()) continue;
+            // THE SAME predicate as the sum loop above -- `fixesValue() && !isInletOutlet()`. This
+            // loop tested fixesValue alone, so an inletOutlet outflow was counted ADJUSTABLE in the
+            // sums and then skipped by the scaler: massCorr was computed for one face set and applied
+            // to another, and global continuity missed by exactly the inletOutlet share.
+            if (U.boundary[pi]->fixesValue() && !U.boundary[pi]->isInletOutlet()) continue;
             for (scalar& v : st.phiHbyA.boundary[pi])
                 if (v > 0.0) v *= massCorr;
         }

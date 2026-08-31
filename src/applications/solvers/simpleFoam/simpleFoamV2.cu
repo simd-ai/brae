@@ -721,7 +721,13 @@ int runSimpleFoamV2(const std::string& caseDir)
         for (label i = 0; i < fvp[pi].size; ++i)
         {
             takeU.push_back(f.U.boundary[pi]->assignable() ? 0 : 1);
-            adjustable.push_back(f.U.boundary[pi]->fixesValue() ? 0 : 1);
+            // adjustPhi's predicate needs BOTH halves (adjustPhi.C:59): mixed fixesValue() is TRUE
+            // and inletOutlet inherits it, so fixesValue alone marked an inletOutlet outlet as FIXED
+            // outflow -- deviceAdjustPhi then had nothing adjustable and refused a case OpenFOAM
+            // solves (measured on simpleBoxIO: "adjustable mass outflow 0.000000"). The rho mirror's
+            // mask builder (rhoCreateFields.cu) had it right; this one predates it.
+            adjustable.push_back(
+                (f.U.boundary[pi]->fixesValue() && !f.U.boundary[pi]->isInletOutlet()) ? 0 : 1);
         }
     takeU.resize(dm.nBndFaces, 0);
     adjustable.resize(dm.nBndFaces, 0);

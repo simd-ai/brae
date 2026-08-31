@@ -1858,3 +1858,26 @@ fixture that justified it.
 Found in passing, not fixed here: the harness SEGFAULTS when the comparison endT dir holds 0-style
 files (copied initial fields) and ABORTS on a missing endT dir -- both lose the buffered stdout.
 Small-iteration invocations only work against real OF output dirs. Worth its own look.
+
+## Holes 3 + "V2 adjustable mask": adjustPhi's two face sets are one set again
+
+pEqn_cpp classified an inletOutlet outflow ADJUSTABLE in its sum loop (`fixesValue && !isInletOutlet`,
+adjustPhi.C:59) and then SKIPPED it in its scale loop (`fixesValue` alone) -- massCorr computed for one
+face set, applied to another, and the net boundary flux off by the whole outflow. simpleFoamV2's device
+`adjustable` mask had the same missing half, where the earlier-ported deviceAdjustPhi guard turned it
+into a visible REFUSAL of a case OpenFOAM solves ("adjustable mass outflow 0.000000") -- the guard
+doing exactly what it was built for, against a defect upstream of it. The rho mirror's mask builder
+already carried both halves; the V2 one predates it.
+
+validation/simpleBoxIO is the discriminating fixture (the ONLY outflow is inletOutlet, no fixed-value
+p, adjustPhi live every iteration) -- and its README records the OF-side trap that shaped it: pairing
+that outlet with fixedFluxPressure makes OPENFOAM ITSELF fatal at startup; plain zeroGradient p runs.
+adjm_vs_openfoam gates both arms: the host binary asserts NET BOUNDARY FLUX = 1.7e-18 after iteration 1
+(the broken scaler reads -2.5e-05, the whole inletOutlet share) plus U vs OF converged; the V2 arm runs
+end-to-end at U 4.6e-11 / p 1.4e-08 where the broken mask refused outright.
+
+OPEN FINDING from calibrating the host bound: the HOST mirror converges to a fixed point 3.295e-06 from
+OpenFOAM's on this shape -- identical at 200, 600 and 1200 iterations, so it is a fixed-point offset,
+not convergence depth -- while the V2 device path reaches 4.6e-11 on the same case. Something in the
+host mirror's inletOutlet handling (valueFraction timing, or the outlet's role in assembly) differs
+from OpenFOAM at the 3e-06 level. Not chased here.
