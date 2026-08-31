@@ -1641,6 +1641,10 @@ add_test(NAME ffp_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/ffp_vs_openfoam.sh)
 set_tests_properties(ffp_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
 
+add_test(NAME df_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/df_vs_openfoam.sh)
+set_tests_properties(df_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
 add_test(NAME tf_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/tf_vs_openfoam.sh)
 set_tests_properties(tf_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)

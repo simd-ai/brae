@@ -220,7 +220,8 @@ FvVectorMatrix assembleUEqn(
     // fixedCoeff's rhoRef branch over the kinematic one.
     if (in.fvOpts && !in.fvOpts->empty())
     {
-        cpu::fvOptions::addSup(*in.fvOpts, M, U, /*nu=*/0.0, g, /*forceDimensions=*/true);
+        cpu::fvOptions::addSup(*in.fvOpts, M, U, /*nu (unused with muLaminar)=*/0.0, g,
+                               /*forceDimensions=*/true, in.rho, in.muLaminar);
     }
 
     // + MRF.DDt(rho, U), UEqn.H:8. MRFZoneList::DDt(rho,U) is rho*DDt(U), so the Coriolis acceleration is

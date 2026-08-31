@@ -273,6 +273,17 @@ Residuals rhoSimpleStep(
     uin.hasFvOptions       = in.hasFvOptions;
     uin.fvOpts             = in.fvOpts;
     uin.fvOptionUnsupported = in.fvOptionUnsupported;
+    // The LAMINAR mu(T), per cell, for DarcyForchheimer's Darcy term (OF resolves "thermo:mu",
+    // DarcyForchheimer.C:64) -- NOT muEff: the porosity resistance is a property of the medium and the
+    // molecular fluid, and feeding it the turbulent viscosity would grow the Darcy term with nut.
+    std::vector<scalar> muLam;
+    if (in.fvOpts && !in.fvOpts->empty())
+    {
+        muLam.resize(f.T.internal.size());
+        for (std::size_t c = 0; c < muLam.size(); ++c)
+            muLam[c] = transportMu(f.T.internal[c], f.thermo);
+        uin.muLaminar = &muLam;
+    }
     const FvVectorMatrix UEqn = assembleUEqn(f.U, uin, m, g, patches);
     {
         // solve(UEqn == -fvc::grad(p)) on a COPY: the pressure equation needs the ORIGINAL UEqn for

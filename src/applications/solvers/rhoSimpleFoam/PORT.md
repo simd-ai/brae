@@ -1818,3 +1818,20 @@ session closed, and the 21 HOLEs that form the next campaign -- lives in REFUSAL
 file. Every verdict there was re-verified against the tree at 2ecfe0f, file by file; five of the
 adversarial checker's objections were themselves REJECTED on the code (the vocabulary and the counts
 are at the top of that file).
+
+## Hole 1 of the adjudicated queue: DarcyForchheimer ran with nu = 0 on the host mirror
+
+The adjudication's severest finding, confirmed at the code: rhoUEqn_cpp handed fvOptions addSup
+`/*nu=*/0.0` on the force-dimensioned path, and the DarcyForchheimer branch computed the KINEMATIC
+form `nu*D + |U|*F` -- so the whole Darcy term was zero and the Forchheimer term ran without rho, on
+every admitted compressible porosity case. OF's form is per-cell: Cd = mu[celli]*D + (rho[celli]*|U|)*F
+(DarcyForchheimerTemplates.C:53), with mu the LAMINAR "thermo:mu" (DarcyForchheimer.C:64) -- not muEff;
+the resistance is a property of the medium and the molecular fluid.
+
+Why it survived: validation/ had NO porosity fixture -- the angledDuct porosity work of past sessions
+compared against OpenFOAM runs outside the tree. validation/rhoBoxDF now exists (240-cell topoSet plug,
+d 1e7 / f 40 sized so both halves matter, ~587 Pa drop) with df_vs_openfoam gating the mirror:
+U 3.4e-07 / T 2.6e-10 / p 4.5e-10 at the matched iteration. Fail-proof (old form restored): U 1.78e-02
+and T 8.8e-04 -- 50,000x on U. addSup now REFUSES a force-dimensioned DarcyForchheimer without the
+per-cell fields rather than defaulting; the incompressible kinematic callers are unchanged (null
+defaults reproduce rho = one, mu = nu).

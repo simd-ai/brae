@@ -137,6 +137,10 @@ struct RhoMomentumInput
     // The IMPLEMENTED ones. UEqn.H applies fvOptions(rho, U), and for explicitPorositySource that is
     // eqn -= porosityEqn with the resistance built by the porosity model. Null = no options to apply.
     const cpu::fvOptions::OptionList* fvOpts = nullptr;
+    // The LAMINAR dynamic viscosity per cell, for DarcyForchheimer's Darcy term -- OF resolves
+    // "thermo:mu" (DarcyForchheimer.C:64), NOT the effective viscosity. Required whenever fvOpts
+    // carries a porosity that is not fixedCoeff; addSup refuses without it.
+    const std::vector<scalar>*        muLaminar = nullptr;
 };
 
 // mu_eff = rho*nu_eff, cells and boundary. Exposed because pEqn.H needs the same product and two

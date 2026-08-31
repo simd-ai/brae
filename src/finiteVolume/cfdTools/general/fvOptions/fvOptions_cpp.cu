@@ -303,8 +303,22 @@ void addSup(
     const GeometricField<vector>& U,
     scalar                        nu,
     const FvGeometry&             g,
-    bool                          forceDimensions)
+    bool                          forceDimensions,
+    const std::vector<scalar>*    rhoCell,
+    const std::vector<scalar>*    muCell)
 {
+    // A force-dimensioned DarcyForchheimer without the per-cell fields cannot be computed -- the old
+    // path took nu = 0 and no rho, which zeroes the Darcy half and under-weights the Forchheimer half
+    // by the whole density, silently. Refuse by name instead.
+    if (forceDimensions && !muCell)
+        for (const Option& o : opts.options)
+            if (o.active && o.unsupported.empty() && !o.fixedCoeff
+                && o.constraint == Option::Constraint::none)
+                throw std::runtime_error(
+                    "fvOptions addSup: a DarcyForchheimer porosity on a force-dimensioned momentum "
+                    "equation needs the per-cell rho and laminar mu (Cd = mu*D + rho*|U|*F, "
+                    "DarcyForchheimerTemplates.C:53); the caller supplied neither.");
+
     const std::vector<scalar>& V = g.V();
     for (const Option& o : opts.options)
     {
@@ -336,7 +350,11 @@ void addSup(
             {
                 const scalar* dd = &o.D.xx;
                 const scalar* ff = &o.F.xx;
-                for (int k = 0; k < 9; ++k) cd[k] = nu * dd[k] + magU * ff[k];
+                // Cd = mu*D + (rho*|U|)*F (DarcyForchheimerTemplates.C:53). Incompressibly mu is the
+                // kinematic nu and rho is geometricOneField, which the null defaults reproduce.
+                const scalar muc  = muCell  ? (*muCell)[c]  : nu;
+                const scalar rhoc = rhoCell ? (*rhoCell)[c] : scalar(1);
+                for (int k = 0; k < 9; ++k) cd[k] = muc * dd[k] + rhoc * magU * ff[k];
             }
             const scalar isoCd = cd[0] + cd[4] + cd[8];
 

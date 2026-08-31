@@ -113,7 +113,15 @@ void addSup(
     // branch on UEqn.dimensions() in OpenFOAM: fixedCoeff::correct reads `rhoRef` from the dict when the
     // equation is in force units and uses 1 otherwise (fixedCoeff.C:202-207). Passing this rather than
     // inspecting dimensions keeps the _cpp reference free of a dimension set it does not carry.
-    bool                          forceDimensions = false);
+    bool                          forceDimensions = false,
+    // COMPRESSIBLE DarcyForchheimer takes PER-CELL fields, not the scalar nu:
+    //     Cd = mu[celli]*D + (rho[celli]*mag(U[celli]))*F     (DarcyForchheimerTemplates.C:53)
+    // with mu the LAMINAR dynamic viscosity ("thermo:mu", DarcyForchheimer.C:64) and rho the solver's.
+    // Null keeps the incompressible kinematic form (rho = geometricOneField, mu slot carrying nu).
+    // Passing forceDimensions=true with a DF option and NO muCell is refused -- the previous behaviour
+    // was nu = 0, which zeroed the whole Darcy term and ran the Forchheimer half without rho, silently.
+    const std::vector<scalar>*    rhoCell = nullptr,
+    const std::vector<scalar>*    muCell  = nullptr);
 
 // fvOptions.constrain(eqn) for a SCALAR equation. `field` is the name the equation solves ("e"/"h" for
 // energy, "k", "epsilon", ...); a constraint that does not name it does nothing. The energy equation
