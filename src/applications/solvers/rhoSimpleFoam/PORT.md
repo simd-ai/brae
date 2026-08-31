@@ -1835,3 +1835,26 @@ U 3.4e-07 / T 2.6e-10 / p 4.5e-10 at the matched iteration. Fail-proof (old form
 and T 8.8e-04 -- 50,000x on U. addSup now REFUSES a force-dimensioned DarcyForchheimer without the
 per-cell fields rather than defaulting; the incompressible kinematic callers are unchanged (null
 defaults reproduce rho = one, mu = nu).
+
+## Holes 2 and "device closure flag": the turbulence convection scheme now comes from the case
+
+Two adjudicated holes closed as one wiring unit. The harness hardcoded `in.boundedTurb = true` with a
+comment naming the fixture, so neither arm ever saw the case's own div(phi,k)/div(phi,epsilon|omega):
+the compressible closure assembled `bounded Gauss upwind` whatever fvSchemes said (squareBend names
+`Gauss limitedLinear 1` on both), and the device closure's non-upwind refusal (kEpsilon.cu,
+hasNonUpwindDivScheme) was reachable only from its own fail-proof. Both harnesses now run
+parseFieldDivScheme on k and the model's second variable ($-expanded, so sbMatched's `$turbulence`
+resolves), the step refuses limitedLinear/linearUpwind/mismatched-bounded BY NAME before the closure,
+and the device input gets the same verdict.
+
+Gate arms on the e2e script: a limitedLinear-mutated fvSchemes must refuse naming the scheme (the
+refusal's what() reaches stderr unbuffered, which is what the arm greps -- the binary's stdout is lost
+on abort), and an UNBOUNDED `Gauss upwind` mutation must still run (three line-buffered iterations via
+stdbuf; a supported scheme must not be refused with the unsupported ones). Fail-proof (hardcode
+restored): the limitedLinear arm fails on the missing name. The main gate re-passing is itself the
+parse's control -- boundedTurb now arrives from the case and reproduces the hardcode's value on the
+fixture that justified it.
+
+Found in passing, not fixed here: the harness SEGFAULTS when the comparison endT dir holds 0-style
+files (copied initial fields) and ABORTS on a missing endT dir -- both lose the buffered stdout.
+Small-iteration invocations only work against real OF output dirs. Worth its own look.

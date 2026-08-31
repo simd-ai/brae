@@ -164,4 +164,29 @@ sed -i '0,/type\s*zeroGradient;/s//type            fixedMean;\n        meanValue
 grep -q "fixedMean" "$UNMAINTAINED/p" \
     || { echo "FAIL: could not build the unmaintained-BC fixture"; exit 1; }
 
+# THE TURBULENCE-SCHEME ARMS. The step used to take `boundedTurb = true` as a harness hardcode, so
+# neither the case's bounded flag nor a non-upwind div(phi,k)/div(phi,epsilon) ever reached either
+# closure -- the refusals existed on both arms and only fail-proofs could set them. Now the schemes are
+# parsed from fvSchemes: a limitedLinear case must REFUSE by name, and an UNbounded upwind case must
+# still run (it is a supported scheme, just not this fixture's).
+TDIV="$W/turbdiv"
+rm -rf "$TDIV"; cp -r "$W/case" "$TDIV"
+sed -i 's/turbulence          bounded Gauss upwind;/turbulence          Gauss limitedLinear 1;/' "$TDIV/system/fvSchemes"
+grep -q "limitedLinear" "$TDIV/system/fvSchemes" || { echo "FAIL: turbdiv mutation did not apply"; exit 1; }
+tout=$("$BIN" "$TDIV" 0 3 2>&1) && { echo "FAIL: a limitedLinear turbulence scheme was not refused"; exit 1; }
+echo "$tout" | grep -q "limitedLinear" \
+    && echo "  turb-scheme arm: limitedLinear refused by name         ok" \
+    || { echo "$tout" | tail -5; echo "FAIL: the refusal does not name the scheme"; exit 1; }
+
+TDIV2="$W/turbdiv2"
+rm -rf "$TDIV2"; cp -r "$W/case" "$TDIV2"
+sed -i 's/turbulence          bounded Gauss upwind;/turbulence          Gauss upwind;/' "$TDIV2/system/fvSchemes"
+# three iterations, LINE-BUFFERED: the binary aborts at the (absent) comparison dir afterwards, which
+# is fine -- the claim is only that iteration 1 RAN and the refusal did not fire. Without stdbuf the
+# abort discards the fully-buffered stdout and the arm cannot see the iterations it paid for.
+tout2=$(stdbuf -oL "$BIN" "$TDIV2" 0 3 2>&1) || true
+echo "$tout2" | grep -q "iter    1" && ! echo "$tout2" | grep -q "does not assemble" \
+    && echo "  turb-scheme arm: unbounded Gauss upwind still runs     ok" \
+    || { echo "$tout2" | tail -5; echo "FAIL: plain Gauss upwind was refused or never ran"; exit 1; }
+
 "$BIN" "$W/case" 0 "$ITERS" $UNPORTED $UNPORTEDNUT $UNPORTEDATM $LIQUIDTHERMO $UNMAINTAINED

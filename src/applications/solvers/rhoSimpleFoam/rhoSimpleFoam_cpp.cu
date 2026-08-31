@@ -511,6 +511,16 @@ Residuals rhoSimpleStep(
     // run while the momentum and energy equations keep transporting rho*nut and alphat.
     if (f.turbulent && !f.turbulenceFrozen && !f.k.internal.empty())
     {
+        // div(phi,k)/div(phi,epsilon) come from the CASE. The closure below assembles Gauss upwind
+        // (with or without `bounded`) and nothing else, so any other named scheme must refuse here --
+        // running upwind under the case's limitedLinear is the substitution this project keeps finding
+        // (squareBend names `Gauss limitedLinear 1` on both).
+        if (!in.turbDivUnsupported.empty())
+            throw std::runtime_error(
+                "rhoSimpleFoam step: div(phi,k)/div(phi,epsilon) asks for `" + in.turbDivUnsupported +
+                "`, which the compressible closure does not assemble -- only Gauss upwind, with or "
+                "without `bounded`, is ported. Refusing rather than running upwind under the case's "
+                "scheme name.");
         // The compressible instantiation's inputs. nu is the LAMINAR kinematic viscosity mu(T)/rho, which
         // varies cell by cell here where the incompressible lineage has one number for the case.
         std::vector<scalar> nuLam(nC);

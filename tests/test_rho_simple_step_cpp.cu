@@ -277,7 +277,21 @@ int main(int argc, char** argv)
     in.relaxEquationHe  = (re != nullptr) && re->found(f.heName);
     in.relaxEquationK   = (re != nullptr) && re->found("k");
     in.relaxEquationEps = (re != nullptr) && re->found("epsilon");
-    in.boundedTurb  = true;   // the fixture's `div(phi,k)`/`div(phi,epsilon)` are `bounded Gauss upwind`
+    // div(phi,k) and div(phi,epsilon|omega) FROM THE CASE. This was `in.boundedTurb = true` with a
+    // comment naming the fixture -- a hardcode, so neither the bounded flag nor a non-upwind scheme
+    // ever reached the step from the case's own fvSchemes, and the closure's refusal was unreachable.
+    if (f.turbulent && !f.turbulenceFrozen && !f.k.internal.empty())
+    {
+        const char* secondT = (f.rasModel == "kOmegaSST") ? "omega" : "epsilon";
+        const FieldDivScheme dK = parseFieldDivScheme(caseDir, "k");
+        const FieldDivScheme dS = parseFieldDivScheme(caseDir, secondT);
+        in.boundedTurb = dK.bounded;
+        if (dK.bounded != dS.bounded)
+            in.turbDivUnsupported = "bounded on one of div(phi,k)/div(phi," + std::string(secondT)
+                                  + ") and not the other (brae carries one flag for both)";
+        if (dK.limited || dS.limited)           in.turbDivUnsupported = "Gauss limitedLinear";
+        if (dK.linearUpwind || dS.linearUpwind) in.turbDivUnsupported = "Gauss linearUpwind";
+    }
 
     // ---- THE FROZEN ARM (activates itself on a `RAS { turbulence off; }` fixture) -----------------
     // OpenFOAM constructs the model, validate()'s correctNut runs ONCE, and every correct() after that

@@ -51,7 +51,8 @@
 #include "rhoSimpleFoam.cuh"
 #include "rhoCreateFields.cuh"
 #include "rhoThermoDevice.cuh"
-#include "kEpsilon.cuh"          // gpu::kEpsilonRAS -- the device closure the turbulent arm drives
+#include "kEpsilon.cuh"
+#include "scheme_parse.cuh"     // parseFieldDivScheme -- div(phi,k|epsilon|omega) from the case          // gpu::kEpsilonRAS -- the device closure the turbulent arm drives
 #include "transport_model.cuh"   // transportMu: nu = mu(T)/rho for the closure inputs
 #include "linearViscousStress_cpp.cuh"   // effectiveFaceViscosity -- the host driver's own rho interpolation
 #include "thermo_model.cuh"
@@ -212,7 +213,18 @@ int main(int argc, char** argv)
         hin.relaxEquationEps= (req != nullptr) && req->found("epsilon");
         hin.tolTurb         = 1e-12;   // the case's own tolerance (fvSolution)
         hin.relTolTurb      = 0.0;
-        hin.boundedTurb     = true;   // both fixtures ship `bounded Gauss upwind` on k and epsilon
+        // FROM THE CASE, not hardcoded -- see the cpp harness. The device closure's own refusal
+        // (kEpsilon.cu hasNonUpwindDivScheme) becomes reachable through exactly this parse.
+        {
+            const char* secondT = (hf.rasModel == "kOmegaSST") ? "omega" : "epsilon";
+            const FieldDivScheme dK = parseFieldDivScheme(caseDir, "k");
+            const FieldDivScheme dS = parseFieldDivScheme(caseDir, secondT);
+            hin.boundedTurb = dK.bounded;
+            if (dK.limited || dS.limited)           hin.turbDivUnsupported = "Gauss limitedLinear";
+            if (dK.linearUpwind || dS.linearUpwind) hin.turbDivUnsupported = "Gauss linearUpwind";
+            if (dK.bounded != dS.bounded)
+                hin.turbDivUnsupported = "bounded on only one of the two turbulence entries";
+        }
     }
     hin.boundedU = hin.boundedHe = hin.boundedKE = true;   // `bounded Gauss upwind` on all three
     hin.correctedLaplacian = false;                        // `Gauss linear orthogonal`
@@ -522,6 +534,8 @@ int main(int argc, char** argv)
             kin.co = hf.keCoeffs;
             kin.Prt = hf.Prt;
             kin.boundedK = kin.boundedEps = hin.boundedTurb;
+            kin.hasNonUpwindDivScheme = !hin.turbDivUnsupported.empty();
+            kin.divSchemeUnsupported  = hin.turbDivUnsupported;
             kin.correctedLaplacian = gin.correctedLaplacian;
             kin.relaxEquationK   = hin.relaxEquationK;   kin.relaxK   = hin.relaxK;
             kin.relaxEquationEps = hin.relaxEquationEps; kin.relaxEps = hin.relaxEpsilon;

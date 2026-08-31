@@ -139,6 +139,12 @@ struct StepInput
     scalar relaxK = 1.0, relaxEpsilon = 1.0;
     scalar tolTurb = 1e-12, relTolTurb = 0.0;
     bool   boundedTurb = false;         // `bounded Gauss <scheme>` on div(phi,k) and div(phi,epsilon)
+    // Non-empty = the CASE names a convection scheme on div(phi,k)/div(phi,epsilon|omega) that the
+    // compressible closure does not assemble (only Gauss upwind, with or without `bounded`, is ported).
+    // The step REFUSES before the closure runs; the device twin carries the same refusal
+    // (kEpsilon.cu, hasNonUpwindDivScheme) and both used to be set only by fail-proofs -- the flag was
+    // hardcoded in the harness and the case's own fvSchemes never reached either arm.
+    std::string turbDivUnsupported;
     scalar Prt = 1.0;                   // EddyDiffusivity: alphat = rho*nut/Prt
 
     // --- refusals ---
