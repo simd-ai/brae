@@ -168,7 +168,7 @@ void pressurePredictor(
     {
         if (!in.adjustable)
             throw std::runtime_error("pEqn(cuda): adjustPhi needs the per-face `adjustable` mask.");
-        st.massCorr = deviceAdjustPhi(*in.adjustable, st.phiHbyABnd);
+        st.massCorr = deviceAdjustPhi(*in.adjustable, st.phiHbyABnd, &st.phiHbyAInt);
         st.phiAdjusted = (st.massCorr != 1.0);
     }
 

@@ -343,7 +343,7 @@ void consistentPressurePredictor(
                     "rhoSimpleFoam pcEqn(cuda): adjustPhi needs the per-face `adjustable` mask, and this "
                     "case needs adjustPhi -- p has no fixed-value patch.");
             }
-            st.massCorr = deviceAdjustPhi(*in.adjustable, st.phiHbyABnd);
+            st.massCorr = deviceAdjustPhi(*in.adjustable, st.phiHbyABnd, &st.phiHbyAInt);
             st.closedVolume = true;
         }
         deviceAxpy(1.0, corrInt, st.phiHbyAInt);

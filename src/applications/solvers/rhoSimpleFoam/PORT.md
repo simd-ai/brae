@@ -1434,3 +1434,63 @@ full of zeros. The three checks are not redundant and the face-by-face one is th
 STILL OPEN: the masks now exist and nothing consumes them yet. Wiring `gin.correct` to the device closure
 is the next step, and the device `alphat` boundary -- the counterpart of the host fix already landed --
 remains ungated until it is.
+
+## deviceAdjustPhi carried neither of OpenFOAM's two guards
+
+Found by re-verifying the audit findings whose verifiers had died on a rate limit -- 64 of them, of which
+nine were already closed by this session's commits, thirteen were already recorded open, most of the rest
+were refuted with citations, and exactly one survived: this.
+
+`adjustPhi.C:90-119` is three clauses, not one:
+
+    scalar totalFlux = VSMALL + sum(mag(phi)).value();          // the WHOLE surface field
+    if (magAdjustableMassOut > VSMALL && magAdjustableMassOut/totalFlux > SMALL)
+        massCorr = (massIn - fixedMassOut)/adjustableMassOut;
+    else if (mag(fixedMassOut - massIn)/totalFlux > 1e-8)
+        FatalErrorInFunction << "Continuity error cannot be removed by adjusting the outflow..."
+
+`deviceAdjustPhi` had `if (std::fabs(adjOut) > 1e-300) massCorr = (massIn - fixedOut)/adjOut;` and no
+else. Two divergences, and each is the kind this project exists to catch:
+
+1. **OpenFOAM's test is RELATIVE**, against `totalFlux`. An absolute 1e-300 admits an adjustable outflow
+   that is negligible beside the flux already in the domain, and then divides by it -- exactly the
+   uninitialised-outflow case whose remedy OpenFOAM's own message spells out. Measured in the gate: with
+   the old form, an adjustable outflow of 1e-20 against a total flux of 12.5 produced
+   **massCorr = 1.5e+20**.
+2. **OpenFOAM REFUSES** on the other branch. brae carried on with `massCorr = 1.0`, scaling nothing, and
+   handed the pressure equation a right-hand side that does not satisfy global continuity -- which
+   converges to something plausible.
+
+**Both HOST twins already had the full clause** -- `rhoPEqn_cpp.cu:99-122` and
+`simpleFoam/pEqn_cpp.cu:92-125`, the latter carrying OpenFOAM's own wording. The device kernel was the
+one of the three that did not, while being the one every device call site reaches: `rhoPEqn.cu:330`,
+`rhoPcEqn.cu:346`, `simpleFoam/pEqn.cu:171` and three in `device_simple_foam.cu` -- the SHIPPED
+incompressible solver as well as the OF-mirror one.
+
+### It could not have been written as it stood
+
+`totalFlux` is `sum(mag(phi))` over the whole surface field, and `deviceAdjustPhi` was handed only the
+boundary slice it scales. There was no way to form OpenFOAM's normaliser from its arguments. The
+signature now takes the internal flux as an optional third argument and all six call sites pass it.
+
+### The gate, and why it needs no fixture
+
+The guards are arithmetic on three flux sums, so `tests/test_adjust_phi_guards.cu` constructs the inputs
+exactly -- including the cases a real mesh reaches only by accident, which is why no fixture would be
+better. Five arms: the ordinary case still returns `(massIn - fixedMassOut)/adjustableMassOut`; a real
+continuity error with no adjustable outflow is REFUSED and the refusal names OpenFOAM's remedy; a
+negligible-but-nonzero adjustable outflow is refused rather than divided by; a BALANCED case with no
+adjustable outflow is not refused (the false positive to avoid); and the same boundary with two different
+interior fluxes must be decided differently, which is what proves `totalFlux` spans the internal faces.
+
+The ordinary-case arm uses `(3 - 0.5)/2 = 1.25` and asserts the answer is not 1. Its first version used
+numbers giving exactly 1.0 -- which is also `massCorr`'s untouched default, so it would have passed
+against a kernel that did no arithmetic at all.
+
+FAIL-PROOF, with the single-clause form restored: **five of eleven checks fail**, and the run prints the
+pathology itself -- `massCorr = 1.5e+20` -- while the two interior-flux arms both read `adjusted` because
+there is no `totalFlux` to tell them apart.
+
+Full suite after the change: **338/338**, which is the number that matters here, because three of the six
+call sites are in the shipped incompressible solver and the new refusal could have fired on a real case.
+It fires on none of them.

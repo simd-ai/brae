@@ -2127,7 +2127,7 @@ void amgFineCoeffKernel(
         if (mrf_.active) deviceMrfApplyFrameFlux(mrf_, +1.0, phiHi, phiHb);   // MRF.makeRelative(phiHbyA) before pressure
         // adjustPhi (OF order: after flux(HbyA), before the SIMPLEC correction): enforce global continuity by
         // scaling the adjustable outflow when there is no pressure reference (closed/all-velocity domains).
-        if (ctl_.needRef) deviceAdjustPhi(adjustMask_, phiHb);
+        if (ctl_.needRef) deviceAdjustPhi(adjustMask_, phiHb, &phiHi);
         // B1 + SIMPLEC: OF's pcEqn.H builds phid from the ORIGINAL phiHbyA and subtracts
         // interp(psi*p)*phiHbyA/interp(rho) using that ORIGINAL too -- the SIMPLEC term is ADDED beside it,
         // not folded in first:
@@ -2946,12 +2946,12 @@ void amgFineCoeffKernel(
         if (ctl_.needRef && meshPhiValid_ && !meshPhi_.empty())
         {
             applyMeshPhi(fvp, meshPhi_, scalar(-1), phiInt_, phiBnd_, cyc_.phi, ami_.phi);
-            deviceAdjustPhi(adjustMask_, phiBnd_);
+            deviceAdjustPhi(adjustMask_, phiBnd_, &phiInt_);
             applyMeshPhi(fvp, meshPhi_, scalar(+1), phiInt_, phiBnd_, cyc_.phi, ami_.phi);
         }
         else if (ctl_.needRef)
         {
-            deviceAdjustPhi(adjustMask_, phiBnd_);
+            deviceAdjustPhi(adjustMask_, phiBnd_, &phiInt_);
         }
 
         // ---- the pcorr Poisson: laplacian(1, pcorr) == div(phi) -------------------------------------

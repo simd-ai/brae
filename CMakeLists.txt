@@ -587,6 +587,13 @@ add_test(NAME rho_simple_step_cuda_device_thermo_rho
 # still being the file PORT.md calls authoritative. It was carrying `U 1.08e-04 (gated at 2e-3)` for a
 # gate whose bound is 5e-4 and which now holds eight fields. A check that exists but is registered
 # nowhere is not a check; this is the registration.
+# deviceAdjustPhi against OpenFOAM's own two guards. No fixture: the guards are arithmetic on three flux
+# sums, so the inputs are constructed exactly -- including the cases a real mesh reaches only by accident.
+add_executable(test_adjust_phi_guards tests/test_adjust_phi_guards.cu)
+target_include_directories(test_adjust_phi_guards PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_adjust_phi_guards PRIVATE brae_core)
+add_test(NAME adjust_phi_guards COMMAND test_adjust_phi_guards)
+
 add_test(NAME manifest_rhosimplefoam_not_drifted
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/of_manifest.py rhoSimpleFoam
                  --check ${CMAKE_CURRENT_SOURCE_DIR}/manifest/rhoSimpleFoam.yaml)

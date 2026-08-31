@@ -1,5 +1,7 @@
 // cf GPU offload (G7): SIMPLE coupling-glue kernels. matrixH and matrixFlux reuse the ownerStart/losort
 // gather; rAU / corrector are elementwise; the HbyA flux is a per-face vector interpolation dotted with Sf.
+#include <stdexcept>
+#include <string>
 #include "device_simple.cuh"
 #include <cmath>
 #include <cuda_runtime.h>
@@ -210,6 +212,19 @@ void adjustReduceKernel(
     if (f < 0.0) atomicAdd(&sums[0], -f);                 // massIn
     else if (adj[i]) atomicAdd(&sums[2], f);              // adjustableMassOut
     else atomicAdd(&sums[1], f);                          // fixedMassOut
+    atomicAdd(&sums[3], fabs(f));                         // |phi| over the boundary, for totalFlux
+}
+
+
+// sum|phi| over the INTERNAL faces. OF's normaliser is sum(mag(phi)) over the whole surface field
+// (adjustPhi.C:91), not over the boundary slice this function is otherwise handed, so the internal half
+// has to be reduced too or the relative test below is against the wrong denominator.
+__global__
+void absSumKernel(int n, const scalar* __restrict__ x, scalar* __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    atomicAdd(out, fabs(x[i]));
 }
 __global__
 void adjustScaleKernel(
@@ -223,18 +238,57 @@ void adjustScaleKernel(
     if (adj[i] && phiB[i] > 0.0) phiB[i] *= massCorr;     // scale only the adjustable OUTFLOW
 }
 } // namespace
-scalar deviceAdjustPhi(const DeviceBuffer<label>& adjustable, DeviceBuffer<scalar>& phiB)
+scalar deviceAdjustPhi(const DeviceBuffer<label>& adjustable,
+                       DeviceBuffer<scalar>& phiB,
+                       const DeviceBuffer<scalar>* phiInt)
 {
     const int n = static_cast<int>(phiB.size());
     if (n == 0) return 1.0;
-    DeviceBuffer<scalar> sums(3);
-    cudaCheck(cudaMemset(sums.data(), 0, 3 * sizeof(scalar)), "adjustPhi memset");
+    DeviceBuffer<scalar> sums(4);
+    cudaCheck(cudaMemset(sums.data(), 0, 4 * sizeof(scalar)), "adjustPhi memset");
     adjustReduceKernel<<<nBlocks(n), TPB>>>(n, adjustable.data(), phiB.data(), sums.data());
-    scalar h[3];
-    cudaCheck(cudaMemcpy(h, sums.data(), 3 * sizeof(scalar), cudaMemcpyDeviceToHost), "adjustPhi D2H");
+    if (phiInt && phiInt->size())
+    {
+        const int ni = static_cast<int>(phiInt->size());
+        absSumKernel<<<nBlocks(ni), TPB>>>(ni, phiInt->data(), sums.data() + 3);
+    }
+    scalar h[4];
+    cudaCheck(cudaMemcpy(h, sums.data(), 4 * sizeof(scalar), cudaMemcpyDeviceToHost), "adjustPhi D2H");
     const scalar massIn = h[0], fixedOut = h[1], adjOut = h[2];
+
+    // OF adjustPhi.C:90-119, both clauses. This used to be `if (fabs(adjOut) > 1e-300)` and nothing else,
+    // which differs from OpenFOAM twice over:
+    //
+    //   1. OF's test is RELATIVE -- magAdjustableMassOut/totalFlux > SMALL (1e-15) -- against
+    //      totalFlux = VSMALL + sum(mag(phi)) over the WHOLE surface field. An absolute 1e-300 admits an
+    //      adjustable outflow that is negligible beside the flux in the domain, and then divides by it:
+    //      exactly the uninitialised-outflow case OF's message tells you to fix with potentialFoam.
+    //   2. OF RAISES A FATAL ERROR on the other branch when the residual continuity error is more than
+    //      1e-8 of the total flux. brae carried on with massCorr = 1.0 and handed the pressure equation
+    //      an inconsistent right-hand side, which converges to something plausible.
+    //
+    // Both host twins already do this -- rhoPEqn_cpp.cu:99-122 and simpleFoam/pEqn_cpp.cu:92-125, the
+    // latter with OpenFOAM's own wording -- so the device kernel was the only one of the three that did
+    // not, while being the one all six device call sites reach.
+    const scalar kVSmall  = scalar(1e-300);
+    const scalar kSmall   = scalar(1e-15);
+    const scalar totalFlux = kVSmall + h[3];
     scalar massCorr = 1.0;
-    if (std::fabs(adjOut) > 1e-300) massCorr = (massIn - fixedOut) / adjOut;       // OF: (massIn-fixedMassOut)/adjustableMassOut
+    const scalar magAdj = std::fabs(adjOut);
+    if (magAdj > kVSmall && magAdj / totalFlux > kSmall)
+    {
+        massCorr = (massIn - fixedOut) / adjOut;
+    }
+    else if (std::fabs(fixedOut - massIn) / totalFlux > scalar(1e-8))
+    {
+        throw std::runtime_error(
+            "brae deviceAdjustPhi: continuity error cannot be removed by adjusting the outflow "
+            "(adjustPhi.C:108-119). Check the velocity boundary conditions, or run potentialFoam to "
+            "initialise the outflow. Specified mass inflow " + std::to_string((double)massIn)
+            + ", specified mass outflow " + std::to_string((double)fixedOut)
+            + ", adjustable mass outflow " + std::to_string((double)adjOut)
+            + ", total flux " + std::to_string((double)totalFlux) + ".");
+    }
     adjustScaleKernel<<<nBlocks(n), TPB>>>(n, adjustable.data(), massCorr, phiB.data());
     cudaCheck(cudaGetLastError(), "adjustPhi");
     return massCorr;

@@ -56,7 +56,13 @@ void deviceBoundaryFlux(const DeviceMesh& dm, const DeviceBuffer<scalar>& uxb, c
 // (global continuity). adjustable[i]=1 if the U patch does NOT fix the flux (zeroGradient/inletOutlet/calculated),
 // 0 if it does (fixedValue/noSlip). massCorr = (massIn - fixedMassOut)/adjustableMassOut. Returns massCorr; a no-op
 // (massCorr=1) for a closed domain (all fixed, no adjustable outflow). Operates on the boundary flux in place.
-scalar deviceAdjustPhi(const DeviceBuffer<label>& adjustable, DeviceBuffer<scalar>& phiB);
+// OF adjustPhi. phiInt is the INTERNAL flux and is needed for OF's normaliser
+// totalFlux = VSMALL + sum(mag(phi)), which is taken over the whole surface field and not just the
+// boundary slice being scaled. Null keeps the old behaviour of normalising on the boundary alone, which
+// makes the relative guard weaker than OpenFOAM's -- pass it wherever the internal flux is in hand.
+scalar deviceAdjustPhi(const DeviceBuffer<label>& adjustable,
+                       DeviceBuffer<scalar>& phiB,
+                       const DeviceBuffer<scalar>* phiInt = nullptr);
 
 // fvMatrix::setReference (no-pressure-reference cases): pin the singular pressure system at refCell.
 // OF: source[ref] += diag[ref]*refValue; diag[ref] += diag[ref]. Call BEFORE the AMG coarsening + normFactor.
