@@ -33,6 +33,18 @@ runArm() { # $1 = arm name, $2 = fvSolution mutation (sed expr or empty)
 }
 
 runArm simple ""
+
+# pRefValue is MANDATORY once the reference is used (findRefCell.C readEntry fatals; brae used to
+# default 0.0 silently, re-levelling the whole pressure field). The refusal fires in createFields, so
+# the arm reuses the simple arm's workdir and only mutates fvSolution.
+PRV="$WORK.simple.noprefvalue"
+rm -rf "$PRV"; cp -r "$WORK.simple" "$PRV"
+sed -i 's/pRefValue 100000;//' "$PRV/system/fvSolution"
+grep -q "pRefValue" "$PRV/system/fvSolution" && { echo "FAIL: pRefValue mutation did not apply"; exit 1; }
+pout=$("$BUILD/test_rho_simple_step_cpp" "$PRV" 0 5 2>&1) && { echo "FAIL: a missing pRefValue was not refused"; exit 1; }
+echo "$pout" | grep -q "pRefValue" \
+    && echo "PASS(noprefvalue)" \
+    || { echo "$pout" | tail -4; echo "FAIL: the refusal does not name pRefValue"; exit 1; }
 runArm simplec "s/SIMPLE { nNonOrthogonalCorrectors 0;/SIMPLE { nNonOrthogonalCorrectors 0; consistent yes;/"
 
 # THE CUDA ARM: the device constrainPressure kernel against the host one, on the SIMPLE workdir

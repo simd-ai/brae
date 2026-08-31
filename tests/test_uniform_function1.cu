@@ -295,6 +295,49 @@ int main()
         else { std::printf("  FAIL constrainPressure's dispatch would touch an ordinary patch\n"); failures++; }
     }
 
+    // 7. mixedEnergy keeps its refValue through the reader; ramp on the normal-velocity BCs refuses.
+    {
+        FvPatch p;
+        p.name = "wall";
+        p.type = "wall";
+        p.size = 1;
+        p.faceCells.assign(1, 0);
+        p.deltaCoeffs.assign(1, 1.0);
+        p.nf.assign(1, vector{1, 0, 0});
+        p.magSf.assign(1, 1.0);
+
+        // mixedEnergy is what OpenFOAM WRITES into an he file; a restart read it through a gate that
+        // only accepted `mixed` and lost refValue, rebuilding the patch around zero.
+        const FieldData<scalar> me = readField<scalar>(writeField(base + "/mixede",
+            "    wall { type mixedEnergy; refValue uniform 420000; refGradient uniform 0;\n"
+            "           valueFraction uniform 1; value uniform 420000; }"));
+        const PatchFieldData<scalar>& b = me.boundary.at(0);
+        if (b.hasRefValue && b.refValueUniformValue == 420000.0)
+            std::printf("  OK   mixedEnergy keeps its refValue (was dropped by the mixed-only gate)\n");
+        else
+        { std::printf("  FAIL mixedEnergy refValue lost (has=%d val=%g)\n",
+                      (int)b.hasRefValue, (double)b.refValueUniformValue); failures++; }
+
+        // ramp: a Function1 of time multiplying the value every updateCoeffs
+        // (surfaceNormalFixedValueFvPatchVectorField.C:63-65) -- refused by name, not dropped.
+        std::filesystem::create_directories(base + "/ramp");
+        {
+            std::ofstream f(base + "/ramp/U");
+            f << "FoamFile { version 2.0; format ascii; class volVectorField; object U; }\n"
+              << "dimensions [0 1 -1 0 0 0 0];\ninternalField uniform (0 0 0);\n"
+              << "boundaryField\n{\n"
+              << "    wall { type surfaceNormalFixedValue; refValue uniform -10;\n"
+              << "           ramp table ((0 0) (1 1)); value uniform (0 0 0); }\n}\n";
+        }
+        const FieldData<vector> rv = readField<vector>(base + "/ramp/U");
+        bool refused = false;
+        try { (void)makePatchField<vector>(p, rv.boundary.at(0)); }
+        catch (const std::exception& e)
+        { refused = std::string(e.what()).find("ramp") != std::string::npos; }
+        if (refused) std::printf("  OK   a ramp on surfaceNormalFixedValue is refused by name\n");
+        else { std::printf("  FAIL the ramp key was silently dropped -- a constant inlet where the case asked for a ramp\n"); failures++; }
+    }
+
     std::printf("uniform_function1: %d failures\n", failures);
     return failures == 0 ? 0 : 1;
 }

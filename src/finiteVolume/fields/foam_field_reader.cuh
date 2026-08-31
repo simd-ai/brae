@@ -504,6 +504,18 @@ inline FieldData<T> readField(const std::string& path)
                         if (key == "kappa") p.ablKappa = v;
                         else p.ablCmu = v;
                     }
+                    // `ramp` multiplies the normal-velocity BCs' value by a Function1 of time every
+                    // updateCoeffs (surfaceNormalFixedValueFvPatchVectorField.C:63-65). brae evaluates
+                    // no Function1 here, so the key is MARKED and the factory refuses by name -- it
+                    // used to fall into the unhandled-key skip, a constant inlet where the case asked
+                    // for a ramp.
+                    else if (key == "ramp" && (p.type == "surfaceNormalFixedValue"
+                                            || p.type == "uniformNormalFixedValue"))
+                    {
+                        p.unsupportedFunction1 = "ramp";
+                        skipToSemicolon(ts, 0);
+                        ts.expect(";");
+                    }
                     // surfaceNormalFixedValue refValue / uniformNormalFixedValue uniformValue: SCALAR (U_b = refValue * n).
                     else if ((key == "refValue" && p.type == "surfaceNormalFixedValue") ||
                              (key == "uniformValue" && p.type == "uniformNormalFixedValue"))
@@ -729,7 +741,11 @@ inline FieldData<T> readField(const std::string& path)
                         p.hasGradient = true;
                         ts.expect(";");
                     }
-                    else if (key == "refValue" && p.type == "mixed")
+                    // mixedEnergy is OpenFOAM's own spelling for a mixed he patch (basicThermo maps
+                    // T `mixed` onto it), and it is what OF WRITES into an he output file -- so a
+                    // restart that read `type mixedEnergy` through a mixed-only gate lost its refValue
+                    // and rebuilt the patch around zero.
+                    else if (key == "refValue" && (p.type == "mixed" || p.type == "mixedEnergy"))
                     {
                         readValueOrInternal(ts, fd, p.refValueUniform, p.refValueUniformValue, p.refValues);
                         p.hasRefValue = true;

@@ -73,6 +73,15 @@ bool setRefCell(
             "rhoSimpleFoam createFields: p needs a reference (no boundary patch fixes its value) but "
             "neither pRefCell nor pRefPoint is set in the SIMPLE dictionary (findRefCell.C).");
     }
+    // findRefCell.C:107 is dict.readEntry(refValueName, refValue) -- a FatalIOError when absent,
+    // not a default. scalarOr's silent 0.0 here re-levelled every all-Neumann case whose author
+    // forgot the entry, which converges happily at the wrong absolute pressure (and rho with it,
+    // compressibly).
+    if (!dict->found("pRefValue"))
+        throw std::runtime_error(
+            "rhoSimpleFoam createFields: p needs a reference and pRefCell/pRefPoint is set, but "
+            "`pRefValue` is missing from the SIMPLE dictionary. OpenFOAM refuses this too "
+            "(findRefCell.C readEntry).");
     refValue = dict->scalarOr("pRefValue", 0.0);
     return true;
 }
