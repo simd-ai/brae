@@ -599,6 +599,13 @@ target_include_directories(test_powerlaw_dict_guards PRIVATE ${BRAE_HEADER_DIRS}
 target_link_libraries(test_powerlaw_dict_guards PRIVATE brae_core)
 add_test(NAME powerlaw_dict_guards COMMAND test_powerlaw_dict_guards)
 
+add_executable(test_frozen_bc_guard tests/test_frozen_bc_guard.cu)
+target_include_directories(test_frozen_bc_guard PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_frozen_bc_guard PRIVATE brae_core)
+add_test(NAME frozen_bc_guard COMMAND test_frozen_bc_guard)
+add_test(NAME frozen_bc_refusals COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/frozen_bc_refusals.sh)
+set_tests_properties(frozen_bc_refusals PROPERTIES SKIP_RETURN_CODE 77)
+
 add_test(NAME manifest_rhosimplefoam_not_drifted
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/of_manifest.py rhoSimpleFoam
                  --check ${CMAKE_CURRENT_SOURCE_DIR}/manifest/rhoSimpleFoam.yaml)
@@ -1618,6 +1625,10 @@ set_tests_properties(rhotiming_vs_openfoam PROPERTIES
 # exercise only the fixedEnergy half of basicThermo::heBoundaryTypes(); a fixedGradient T was read and then
 # silently discretised as zeroGradient, i.e. an adiabatic wall that converged to a plausible wrong answer.
 # Also the only gate that asserts OpenFOAM can PARSE what brae writes.
+add_test(NAME tf_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/tf_vs_openfoam.sh)
+set_tests_properties(tf_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
 add_test(NAME hf_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/hf_vs_openfoam.sh)
 set_tests_properties(hf_vs_openfoam PROPERTIES

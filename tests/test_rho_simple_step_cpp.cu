@@ -279,6 +279,41 @@ int main(int argc, char** argv)
     in.relaxEquationEps = (re != nullptr) && re->found("epsilon");
     in.boundedTurb  = true;   // the fixture's `div(phi,k)`/`div(phi,epsilon)` are `bounded Gauss upwind`
 
+    // ---- THE FROZEN ARM (activates itself on a `RAS { turbulence off; }` fixture) -----------------
+    // OpenFOAM constructs the model, validate()'s correctNut runs ONCE, and every correct() after that
+    // returns on its first line (kEpsilon.C:216) -- so nut and alphat must LEAVE createFields at the
+    // validate values and come OUT of the loop bit-identical. rhoBoxF is the oracle: OF writes
+    // nut = Cmu*k^2/eps = 0.001265625 from a 1e-3 file seed, boundary included.
+    std::vector<scalar> frNut0, frAlphat0, frNutB0, frAlphatB0;
+    if (f.turbulenceFrozen)
+    {
+        std::printf("  frozen arm -- turbulence off: model constructed, validate() once, correct() skipped\n");
+        const FieldData<scalar> nutFile = readField<scalar>(caseDir + "/" + startT + "/nut");
+        double dModel = 0.0, dFile = 0.0;
+        for (label c = 0; c < nC; ++c)
+        {
+            const double want = (double)f.keCoeffs.Cmu
+                              * (double)f.k.internal[c] * (double)f.k.internal[c]
+                              / (double)f.epsilon.internal[c];
+            dModel = std::max(dModel, std::fabs((double)f.nut.internal[c] - want));
+            const double fileV = nutFile.internalUniform ? (double)nutFile.internalUniformValue
+                                                         : (double)nutFile.internalField[c];
+            dFile = std::max(dFile, std::fabs((double)f.nut.internal[c] - fileV));
+        }
+        check("createFields leaves nut at validate()'s Cmu*k^2/eps", dModel < 1e-15);
+        std::printf("       %-34s max|nut - file seed| = %.6e\n", "  (non-vacuous)", dFile);
+        check("...which DIFFERS from the file seed (else this arm proves nothing)", dFile > 1e-5);
+        frNut0 = f.nut.internal;
+        frAlphat0 = f.alphat.internal;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const std::vector<scalar> nb = f.nut.boundary[pi]->value();
+            frNutB0.insert(frNutB0.end(), nb.begin(), nb.end());
+            const std::vector<scalar> ab = f.alphat.boundary[pi]->value();
+            frAlphatB0.insert(frAlphatB0.end(), ab.begin(), ab.end());
+        }
+    }
+
     double lastUResidual = 1.0;   // the convergence the loop actually reached; bounds below scale with it
     for (int it = 1; it <= iters; ++it)
     {
@@ -298,6 +333,32 @@ int main(int argc, char** argv)
                 std::printf("     iter %4d   U %.3e   %s %.3e   p %.3e\n", it,
                             (double)r.at("U"), f.heName.c_str(), (double)r.at(f.heName), (double)r.at("p"));
         }
+    }
+
+    // ---- frozen arm, after the loop: the model fields did not move ----
+    if (f.turbulenceFrozen)
+    {
+        auto maxDiff = [](const std::vector<scalar>& a, const std::vector<scalar>& b)
+        {
+            double d = (a.size() == b.size()) ? 0.0 : 1e300;
+            for (std::size_t i = 0; i < a.size() && i < b.size(); ++i)
+                d = std::max(d, std::fabs((double)a[i] - (double)b[i]));
+            return d;
+        };
+        std::vector<scalar> nutB, alphatB;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const std::vector<scalar> nb = f.nut.boundary[pi]->value();
+            nutB.insert(nutB.end(), nb.begin(), nb.end());
+            const std::vector<scalar> ab = f.alphat.boundary[pi]->value();
+            alphatB.insert(alphatB.end(), ab.begin(), ab.end());
+        }
+        // BIT-identical, not close: nothing in the loop may touch them. A tolerance here would let a
+        // partially-running closure hide inside it.
+        check("nut came out of the loop bit-identical (correct() skipped)",
+              maxDiff(f.nut.internal, frNut0) == 0.0 && maxDiff(nutB, frNutB0) == 0.0);
+        check("alphat likewise",
+              maxDiff(f.alphat.internal, frAlphat0) == 0.0 && maxDiff(alphatB, frAlphatB0) == 0.0);
     }
 
     // ---- the fields, against OpenFOAM at the same iteration ----
@@ -760,7 +821,10 @@ int main(int argc, char** argv)
     // The control cannot be a fixture comparison for that same reason, so it perturbs the FIELD SET the
     // solve now reads from and requires the answer to move. If the loop still took StepInput's copy,
     // mutating f.keCoeffs and f.Prt would change nothing and this fails.
-    if (f.turbulent && !f.k.internal.empty())
+    // On a FROZEN fixture the loop deliberately never reads the coefficients -- OpenFOAM's correct()
+    // returns before touching them -- so "the coeffs reach the solve" is not a property the fixture can
+    // have, and the frozen arm above already asserted the half that does exist (Cmu reaches validate()).
+    if (f.turbulent && !f.turbulenceFrozen && !f.k.internal.empty())
     {
         cpu::rhoSimple::RhoSimpleFields a =
             cpu::rhoSimple::createFields(caseDir + "/" + startT, caseDir, simpleDict, &fvSolution,

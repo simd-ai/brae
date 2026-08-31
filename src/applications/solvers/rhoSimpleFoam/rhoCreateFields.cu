@@ -80,6 +80,7 @@ RhoDeviceFields createDeviceFields(
     d.dm = buildDeviceMesh(m, g, patches);
     d.nBndFaces = d.dm.nBndFaces;
     d.turbulent = hf.turbulent;
+    d.turbulenceFrozen = hf.turbulenceFrozen;
 
     d.dbU  = buildDeviceVectorBoundary(hf.U, patches, g);
     d.dbP  = buildDeviceBoundary(hf.p, patches, g);

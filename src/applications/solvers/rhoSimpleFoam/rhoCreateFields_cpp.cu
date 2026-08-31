@@ -480,7 +480,13 @@ RhoSimpleFields createFields(
         if (sim == "RAS")
         {
             const FoamDict* ras = mt2.subDict("RAS");
-            f.turbulent = !ras || ras->wordOr("turbulence", "on") != "off";
+            // `turbulence off` does NOT mean laminar: OpenFOAM constructs the model regardless (all
+            // four fields read) and validate() still runs correctNut() once -- only the per-iteration
+            // correct() is skipped (kEpsilon.C:216 `if (!this->turbulence_) return`). Treating off as
+            // laminar dropped rho*nut from every face; on the rhoBoxF oracle the frozen nut is
+            // Cmu*k^2/eps = 0.001265625 against mu/rho ~ 1.5e-5 -- eighty times the molecular value.
+            f.turbulent = true;
+            f.turbulenceFrozen = ras && ras->wordOr("turbulence", "on") == "off";
             f.rasModel  = ras ? ras->wordOr("RASModel", "") : "";
             // ALL SIX, as OpenFOAM reads them (kEpsilon.C:199-204 readIfPresent on Cmu, C1, C2, C3,
             // sigmak, sigmaEps). Only Cmu was read here, so a case naming any of the other five got the
@@ -508,6 +514,14 @@ RhoSimpleFields createFields(
                         "brae: rhoSimpleFoam RASModel '" + f.rasModel + "' is not ported for the "
                         "compressible lineage (kEpsilon and kOmegaSST are). Refusing rather than running "
                         "a different closure, or none.");
+                // Frozen kOmegaSST would need ITS validate() -- correctNut from k, omega and the strain
+                // rate -- which the kEpsilon-shaped block below cannot provide. Refusing rather than
+                // entering the loop with the file nut where OpenFOAM enters with the model's.
+                if (f.turbulenceFrozen && f.rasModel != "kEpsilon")
+                    throw std::runtime_error(
+                        "brae: rhoSimpleFoam `RAS { turbulence off; }` is implemented for kEpsilon only "
+                        "-- the one-shot validate() below is kEpsilon's correctNut. '" + f.rasModel +
+                        "' frozen would start from the wrong nut. Refusing.");
                 f.k   = buildField<scalar>(readField<scalar>(timeDir + "/k"), patches, nC);
 
                 // THE NUT WALL FUNCTION IS PART OF THE MODEL, and only nutkWallFunction is ported here.
@@ -550,7 +564,19 @@ RhoSimpleFields createFields(
                         // substitution this throw exists to prevent.
                         if (b.type.rfind("nut", 0) != 0
                          && b.type.rfind("atmNut", 0) != 0) continue;        // not a nut wall function
-                        if (b.type == "nutkWallFunction") continue;         // the one that is ported
+                        if (b.type == "nutkWallFunction")
+                        {
+                            // Ported for the LIVE closure, which recomputes the wall nut every
+                            // iteration. Frozen, OpenFOAM evaluates it exactly ONCE -- inside
+                            // validate()'s correctBoundaryConditions -- and brae has no wall-function
+                            // evaluation at createFields, so the wall would keep the file value.
+                            if (!f.turbulenceFrozen) continue;
+                            throw std::runtime_error(
+                                "brae: rhoSimpleFoam `RAS { turbulence off; }` with a nutkWallFunction "
+                                "patch ('" + b.name + "') is not implemented -- OpenFOAM wall-evaluates "
+                                "nut once at validate() and brae cannot yet do that outside the live "
+                                "closure. Use a calculated/zeroGradient nut boundary, or turbulence on.");
+                        }
                         throw std::runtime_error(
                             "brae: rhoSimpleFoam nut patch '" + b.name + "' carries '" + b.type +
                             "', which the compressible kEpsilon closure does not implement -- it computes "
@@ -642,6 +668,38 @@ RhoSimpleFields createFields(
         {
             const scalar Prt = f.thermo.Prt;
             for (label c = 0; c < nC; ++c) f.alphat.internal[c] = f.rho.internal[c] * f.nut.internal[c] / Prt;
+        }
+
+        // The BOUNDARY half of validate(), on the frozen path only, where nothing later provides it:
+        // OF's `nut_ = Cmu*sqr(k)/epsilon` assigns the boundary from k and epsilon's patch values and
+        // correctBoundaryConditions() lets each type re-evaluate -- calculated holds the assigned value
+        // (measured on rhoBoxF: every patch reads 0.001265625 from a 1e-3 seed), zeroGradient takes the
+        // owner cell. The LIVE closure recomputes the boundary every iteration, so adding this there
+        // would only shadow the gated path.
+        if (f.turbulenceFrozen)
+        {
+            f.k.evaluateBoundary();
+            f.epsilon.evaluateBoundary();
+            const bool haveAlphat = static_cast<label>(f.alphat.internal.size()) == nC;
+            const scalar Prt = f.thermo.Prt;
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                const std::vector<scalar> kB = f.k.boundary[pi]->value();
+                const std::vector<scalar> eB = f.epsilon.boundary[pi]->value();
+                std::vector<scalar> nB(kB.size());
+                for (std::size_t i = 0; i < kB.size(); ++i)
+                    nB[i] = keCase.Cmu * kB[i] * kB[i] / (eB[i] > scalar(1e-300) ? eB[i] : scalar(1e-300));
+                f.nut.boundary[pi]->setStoredValues(nB);
+                if (haveAlphat)
+                {
+                    const std::vector<scalar> rB = f.rho.boundary[pi]->value();
+                    std::vector<scalar> aB(nB.size());
+                    for (std::size_t i = 0; i < nB.size(); ++i) aB[i] = rB[i] * nB[i] / Prt;
+                    f.alphat.boundary[pi]->setStoredValues(aB);
+                }
+            }
+            f.nut.evaluateBoundary();
+            if (haveAlphat) f.alphat.evaluateBoundary();
         }
     }
 

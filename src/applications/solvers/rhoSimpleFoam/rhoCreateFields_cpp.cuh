@@ -128,6 +128,12 @@ struct RhoSimpleFields
     // alphat is the EddyDiffusivity's, and it is read rather than derived because a restart resumes from
     // the value OpenFOAM wrote.
     bool                   turbulent = false;   // momentumTransport simulationType RAS
+    // `RAS { turbulence off; }` -- OpenFOAM still CONSTRUCTS the model (k, epsilon, nut, alphat all
+    // read, alphat MUST_READ) and rhoSimpleFoam.C:64 still calls turbulence->validate(), which runs
+    // correctNut() ONCE; only the per-iteration correct() returns early (kEpsilon.C:216). So a frozen
+    // case transports the validate-time nut and alphat forever. Measured on the rhoBoxF oracle: OF
+    // writes nut = Cmu*k^2/eps = 0.001265625 from a 1e-3 file seed, and alphat = rho0*nut/Prt.
+    bool                   turbulenceFrozen = false;
     std::string            rasModel;            // e.g. "kEpsilon"; empty when laminar
     GeometricField<scalar> k, epsilon, nut, alphat;
     // Which alphat patches carry compressible::alphatWallFunction, and each one's OWN Prt.

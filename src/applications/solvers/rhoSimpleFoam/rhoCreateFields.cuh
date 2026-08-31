@@ -105,6 +105,7 @@ struct RhoDeviceFields
     DeviceBuffer<scalar>              frNx, frNy, frNz;   // boundary-face normals, all faces
 
     bool turbulent = false;
+    bool turbulenceFrozen = false;   // model constructed + validated once, per-iteration correct() skipped
     int  nBndFaces = 0;
 };
 

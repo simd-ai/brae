@@ -496,7 +496,10 @@ Residuals rhoSimpleStep(
     // turbulence->correct() -- LAST, after the pressure corrector, so the NEXT iteration's momentum
     // equation uses this iteration's closure. OpenFOAM's lagged coupling; correcting before UEqn instead
     // is a different algorithm that still converges to something plausible.
-    if (f.turbulent && !f.k.internal.empty())
+    // ...unless `turbulence off` froze the model: OpenFOAM's correct() returns on its first line then
+    // (kEpsilon.C:216), so k, epsilon, nut and alphat keep their validate()-time values for the whole
+    // run while the momentum and energy equations keep transporting rho*nut and alphat.
+    if (f.turbulent && !f.turbulenceFrozen && !f.k.internal.empty())
     {
         // The compressible instantiation's inputs. nu is the LAMINAR kinematic viscosity mu(T)/rho, which
         // varies cell by cell here where the incompressible lineage has one number for the case.
