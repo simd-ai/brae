@@ -157,7 +157,6 @@ struct StepInput
     bool   limitT    = false;
     scalar limitTmin = 0.0;
     scalar limitTmax = 0.0;
-    bool hasFixedFluxPressure = false;
 };
 
 // field name -> the INITIAL residual of its first solve this iteration, which is what simpleControl's

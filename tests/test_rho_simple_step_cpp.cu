@@ -361,6 +361,55 @@ int main(int argc, char** argv)
               maxDiff(f.alphat.internal, frAlphat0) == 0.0 && maxDiff(alphatB, frAlphatB0) == 0.0);
     }
 
+    // ---- THE FIXEDFLUXPRESSURE ARM (activates itself when a p patch updates its own snGrad) --------
+    // constrainPressure hands the patch snGrad = (phiHbyA_b - rho_b*(Sf_b & U_b))/(magSf_b*rhorAUf_b)
+    // every assembly, and OpenFOAM WRITES the final gradient into the output p file. Comparing that
+    // gradient directly is the sharpest gate this BC can have: the field norms above would pass a
+    // zeroGradient substitution wherever the converged boundary gradient is small, and the non-vacuity
+    // check below refuses a fixture where it is.
+    {
+        bool anyFfp = false;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            if (f.p.boundary[pi]->updateableSnGrad()) anyFfp = true;
+        if (anyFfp)
+        {
+            std::printf("  fixedFluxPressure arm -- the solver-set gradient vs the one OpenFOAM wrote\n");
+            const FieldData<scalar> pOF = readField<scalar>(caseDir + "/" + endT + "/p");
+            double dMax = 0.0, gMax = 0.0;
+            label nFaces = 0;
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                if (!f.p.boundary[pi]->updateableSnGrad()) continue;
+                const std::vector<scalar>* g = f.p.boundary[pi]->refGradPtr();
+                const PatchFieldData<scalar>* ob = nullptr;
+                for (const auto& b : pOF.boundary) if (b.name == patches[pi].name) ob = &b;
+                check("OpenFOAM wrote a gradient for patch " + patches[pi].name,
+                      g != nullptr && ob != nullptr && ob->hasGradient);
+                if (!g || !ob || !ob->hasGradient) continue;
+                for (label i = 0; i < patches[pi].size; ++i)
+                {
+                    const double og = ob->gradientUniform ? (double)ob->gradientUniformValue
+                                                          : (double)ob->gradientValues[i];
+                    dMax = std::max(dMax, std::fabs((double)(*g)[i] - og));
+                    gMax = std::max(gMax, std::fabs(og));
+                    ++nFaces;
+                }
+            }
+            std::printf("     %-34s max|brae - OF| %.4e over %d faces (max|OF| %.4g)\n",
+                        "  (boundary snGrad)", dMax, (int)nFaces, gMax);
+            // 1e-4 RELATIVE: measured 3.4e-06 on rhoBoxP (two independently-converged runs at
+            // residualControl 1e-6; the gradient is a p-difference over ~5mm, so it carries the
+            // convergence gap amplified by 1/dx). The zeroGradient substitution reads 1.0 here --
+            // four orders past the bound -- and is what this arm exists to catch.
+            check("the solver-set snGrad matches OpenFOAM's written gradient",
+                  nFaces > 0 && dMax < 1e-4 * std::max(gMax, 1.0));
+            // NON-VACUOUS: a fixture whose converged gradient is ~0 cannot tell fixedFluxPressure from
+            // zeroGradient -- the constrainHbyA cancellation makes that the DEFAULT at fixed-velocity
+            // patches, so it is asserted away rather than assumed away.
+            check("...and that gradient is NOT ~0 (else zeroGradient would pass too)", gMax > 0.1);
+        }
+    }
+
     // ---- the fields, against OpenFOAM at the same iteration ----
     // THE BOUNDARY CONDITION'S DEFINING PROPERTY, checked before any field comparison: a
     // flowRateInletVelocity inlet must deliver the mass flow the case prescribed. sum(phi) over the patch

@@ -85,7 +85,6 @@ struct PressureInput
     scalar snGradLimitCoeff     = 0.0;
     bool   hasMRF               = false;   // MRF.makeRelative -- refused
     bool   hasFvOptions         = false;   // refused
-    bool   hasFixedFluxPressure = false;   // constrainPressure not ported -- refused
 };
 
 // Every intermediate of pEqn.H, in the order OpenFOAM produces them.

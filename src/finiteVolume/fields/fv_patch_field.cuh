@@ -41,6 +41,14 @@ public:
     // constrainHbyA (simpleFoam/pEqn.H:3) branches on assignable(); adjustPhi (pEqn.H:6) branches on
     // fixesValue(). Using one for the other changes which patches keep U's boundary value in HbyA.
     virtual bool assignable() const { return true; }
+    // constrainPressure's dispatch (OF: isA<updateablePatchTypes::updateableSnGrad>, constrainPressure.C:62).
+    // Only fixedFluxPressure overrides; the setter on anything else is a wiring error, not a no-op.
+    virtual bool updateableSnGrad() const { return false; }
+    virtual void updateSnGrad(const std::vector<T>&)
+    {
+        throw std::runtime_error("brae: updateSnGrad called on patch '" + patch_.name +
+                                 "', which is not an updateable-snGrad boundary condition.");
+    }
 
     // Is this specifically an inletOutlet? adjustPhi (pEqn.H) branches on
     // `Up.fixesValue() && !isA<inletOutletFvPatchVectorField>(Up)` -- it needs BOTH questions, because
@@ -580,11 +588,58 @@ public:
     }
     std::vector<T> gradientBoundaryCoeffs() const override { return grad_; }
 
+protected:
+    std::vector<T> grad_;   // writable by fixedFluxPressure's updateSnGrad
+
 private:
     bool uniform_;
     T gUniform_;
     std::vector<T> gValues_;
-    std::vector<T> grad_;
+};
+
+// fixedFluxPressure (OF fixedFluxPressureFvPatchScalarField): a fixedGradient p whose gradient the
+// SOLVER sets every pressure assembly -- constrainPressure.C:60-77 computes
+//     snGrad = (phiHbyA_b - rho_b*MRF.relative(Sf_b & U_b)) / (magSf_b * rhorAU_b)
+// and hands it to updateSnGrad; the BC itself carries no formula. A driver that builds it and never
+// calls updateSnGrad runs a stale (usually zero) gradient under this name, which OpenFOAM makes a
+// FatalError ("updateSnGrad MUST be called before updateCoeffs()",
+// fixedFluxPressureFvPatchScalarField.C:150-163) -- and so does this class, at coefficient time.
+// It replaced a silent factory mapping to zeroGradient that the OF-mirror envelopes had to refuse
+// around by substring. evaluate() stays unguarded on purpose: OF evaluates the construction-time
+// gradient (the file's, or zero) before any solve, and so must brae's evaluateBoundary passes.
+class FixedFluxPressurePatchField : public FixedGradientPatchField<scalar>
+{
+public:
+    using FixedGradientPatchField<scalar>::FixedGradientPatchField;
+    bool updateableSnGrad() const override { return true; }
+    void updateSnGrad(const std::vector<scalar>& g) override
+    {
+        // OF guards re-entry with a per-timeIndex updated() flag; the mirror calls this exactly once
+        // per assembly, so only the never-called refusal below is reproduced -- that is the failure
+        // that actually occurs (a driver without constrainPressure).
+        grad_ = g;
+        everUpdated_ = true;
+    }
+    std::vector<scalar> valueInternalCoeffs() const override
+    { requireUpdated(); return FixedGradientPatchField<scalar>::valueInternalCoeffs(); }
+    std::vector<scalar> valueBoundaryCoeffs() const override
+    { requireUpdated(); return FixedGradientPatchField<scalar>::valueBoundaryCoeffs(); }
+    std::vector<scalar> gradientInternalCoeffs() const override
+    { requireUpdated(); return FixedGradientPatchField<scalar>::gradientInternalCoeffs(); }
+    std::vector<scalar> gradientBoundaryCoeffs() const override
+    { requireUpdated(); return FixedGradientPatchField<scalar>::gradientBoundaryCoeffs(); }
+
+private:
+    void requireUpdated() const
+    {
+        if (!everUpdated_)
+            throw std::runtime_error(
+                "brae: fixedFluxPressure patch '" + this->patch_.name + "' reached the pressure "
+                "assembly without updateSnGrad() -- this driver never ran constrainPressure, so the "
+                "prescribed-flux gradient would be stale or zero under the boundary's name. OpenFOAM "
+                "fatals identically (fixedFluxPressureFvPatchScalarField.C:150-163).");
+    }
+    bool everUpdated_ = false;
 };
 
 // noSlip: a fixedValue velocity wall whose value STARTS at zero -- which is not the same thing as a
@@ -1524,11 +1579,26 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
         return std::make_unique<MixedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values, false);
     if (d.type == "noSlip")          return std::make_unique<NoSlipPatchField<T>>(p);
     if (d.type == "zeroGradient")    return std::make_unique<ZeroGradientPatchField<T>>(p);
-    // fixedFluxPressure = fixedGradient p whose gradient constrainPressure sets to (phiHbyA - Sf&U)/(magSf*rAU).
-    // At a fixed-velocity patch constrainHbyA gives phiHbyA_b = Sf&U, so that gradient is exactly 0 == zeroGradient.
-    // That is its only standard usage (no-flux walls), so we map it to zeroGradient (exact there). See
-    // PORTING_PRESSURE_REFERENCE.md; a fixedFluxPressure on a non-fixed-velocity patch would need the gradient path.
-    if (d.type == "fixedFluxPressure") return std::make_unique<ZeroGradientPatchField<T>>(p);
+    // fixedFluxPressure. The old mapping to zeroGradient leaned on the constrainHbyA cancellation --
+    // at a NON-assignable-U patch phiHbyA_b == rho_b*(Sf&U_b) identically, so the gradient is exactly 0
+    // -- which is real, but only where it holds: at an assignable-U patch (inletOutlet,
+    // pressureInletOutletVelocity) the numerator does not cancel, and under MRF a wall's relative flux
+    // does not either. Those cases ran zeroGradient under fixedFluxPressure's name. The class now
+    // carries the gradient path and REFUSES at assembly on any driver that never runs constrainPressure.
+    if (d.type == "fixedFluxPressure")
+    {
+        // OF seeds the gradient from the file entry when present, else extrapolates with Zero
+        // (fixedFluxPressureFvPatchScalarField.C:55-63); either way the SOLVER overwrites it each
+        // assembly through constrainPressure. Scalar (pressure) only.
+        if constexpr (std::is_same_v<T, scalar>)
+            return std::make_unique<FixedFluxPressurePatchField>(
+                p,
+                d.hasGradient ? d.gradientUniform : true,
+                d.hasGradient ? d.gradientUniformValue : scalar(0),
+                d.hasGradient ? d.gradientValues : std::vector<scalar>{});
+        else
+            throw std::runtime_error("brae: fixedFluxPressure on patch " + p.name + " is a scalar (pressure) BC.");
+    }
     // uniformTotalPressure is totalPressure with a TIME-VARYING p0 -- OF's own class differs only in
     // that p0 comes from a Function1 (uniformTotalPressureFvPatchScalarField.C:149 samples it every
     // updateCoeffs). The face treatment is identical: p_b = p0 - 0.5*neg(phi)*magSqr(U). So it builds

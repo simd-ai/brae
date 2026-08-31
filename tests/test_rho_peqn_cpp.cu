@@ -484,15 +484,10 @@ int main(int argc, char** argv)
     // ---- 4. REFUSALS. ----
     std::printf("  4. refusals\n");
     {
-        cpu::rhoSimple::PressureInput bad = in;
-        bad.hasFixedFluxPressure = true;
-        bool threw = false;
-        std::string msg;
-        try { (void)cpu::rhoSimple::pressurePredictor(UEqn, f.U, f.p, bad, m, g, patches); }
-        catch (const std::exception& e) { threw = true; msg = e.what(); }
-        check("fixedFluxPressure is refused", threw);
-        check("and the refusal names constrainPressure",
-              msg.find("constrainPressure") != std::string::npos);
+        // fixedFluxPressure is no longer refused here: constrainPressure is PORTED (pEqn.H:12
+        // transcribed above the transonic branch), and the never-updated case now refuses from the
+        // patch itself (FixedFluxPressurePatchField::requireUpdated, gated in test_uniform_function1;
+        // the flux-consistency numbers are gated end-to-end by ffp_vs_openfoam).
     }
     {
         cpu::rhoSimple::PressureInput bad = in;

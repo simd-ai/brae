@@ -1682,3 +1682,45 @@ validate(); brae has no wall-function evaluation at createFields).
 - test_rho_simple_step_cpp's coefficient-reach control is skipped on frozen fixtures -- the loop
   deliberately never reads the coefficients there; the frozen arm asserts the half that exists (Cmu
   reaches validate()).
+
+## fixedFluxPressure / constrainPressure (ported)
+
+The refusal census called brae's fixedFluxPressure handling three different things in three places --
+a silent factory mapping to zeroGradient (shipped paths), an OVER-BROAD substring refusal (envelopes),
+and a DEAD `hasFixedFluxPressure` flag gating six pEqn refusals nothing ever set. All three are now one
+thing: a real port.
+
+What OpenFOAM does (read, not remembered): the BC is fixedGradient plus a solver contract.
+`constrainPressure` (constrainPressure.C:60-77) hands every updateable-snGrad p patch
+    snGrad = (phiHbyA_b - rho_b*MRF.relative(Sf_b & U_b)) / (magSf_b * rhorAU_b)
+once per assembly -- at pEqn.H:12 (rhoSimpleFoam, divisor rhorAUf, BEFORE adjustPhi), pcEqn.H:16
+(divisor the VOL field rhorAtU, before the SIMPLEC correction), and pEqn.H:21 (simpleFoam, divisor
+rAtU, AFTER adjustPhi and the SIMPLEC correction -- the two solvers order it differently). And OF's own
+updateCoeffs FATALS if updateSnGrad was not called this time index
+(fixedFluxPressureFvPatchScalarField.C:150-163): a driver that never runs constrainPressure is refused
+by the BC itself. FixedFluxPressurePatchField mirrors exactly that, at coefficient time -- which turns
+the old silent zeroGradient substitution on unwired drivers into a named refusal with no per-driver
+wiring at all.
+
+Why every ordinary fixture missed the substitution: at a NON-assignable-U patch constrainHbyA sets
+HbyA_b = U_b, so phiHbyA_b == rho_b*(Sf_b & U_b) IDENTICALLY and the numerator cancels X-minus-X --
+fixedFluxPressure degenerates to zeroGradient at every fixed-velocity boundary. The discriminating
+fixture (validation/rhoBoxP) pairs it with an ASSIGNABLE-U outlet (inletOutlet): the converged outlet
+gradient is -0.73 Pa/m and OpenFOAM WRITES it into the output p file, which is what the gate compares.
+The ffp arm asserts non-vacuity (max|OF gradient| > 0.1) rather than assuming it. Numbers
+(ffp_vs_openfoam.sh, two arms): snGrad 2.5e-06 of 0.7347 (SIMPLE) and 1.0e-08 of 0.1198 (SIMPLEC);
+p 2.8e-12, T 1.6e-11, U 4.1e-09 at the matched iteration. Fail-proof (old mapping restored): the arm
+never engages (script guard) and the field norms fail.
+
+Also found: OpenFOAM's pressureControl itself refuses `rhoMax` on a case with no fixed-value p patch
+("the corresponding reference density cannot be evaluated") -- the rhoBoxP fixture had to drop the rho
+bounds, which is the same backward-compat machinery the census flagged around gpuRhoSimpleFoam.
+
+Still open here:
+- DEVICE pressure equations refuse fixedFluxPressure (flag now actually SET, from the host patches, in
+  both cuda step harnesses and simpleFoam.cu) -- the device updateSnGrad kernel is the next CUDA unit.
+- The incompressible case-level envelope still refuses the substring; narrowing it is a follow-up now
+  that the mirror path supports the BC.
+- manifest/simpleFoam.yaml fails `of_manifest.py --check` at HEAD (pre-existing drift, not from this
+  edit): the tool now derives something different from ofscan/OpenFOAM than when the manifest was
+  generated. Needs a regenerate-and-read-the-diff pass of its own.

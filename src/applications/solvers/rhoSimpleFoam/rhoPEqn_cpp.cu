@@ -33,11 +33,6 @@ void refuseUnsupported(const PressureInput& in)
         throw std::runtime_error(
             "rhoSimpleFoam pEqn_cpp: the case declares fvOptions, which pEqn.H puts on the right-hand "
             "side as fvOptions(psi, p, rho.name()). Not implemented; refusing.");
-    if (in.hasFixedFluxPressure)
-        throw std::runtime_error(
-            "rhoSimpleFoam pEqn_cpp: a pressure patch is fixedFluxPressure, which pEqn.H reaches through "
-            "constrainPressure(p, rho, U, phiHbyA, rhorAUf, MRF) (pEqn.H:11). constrainPressure is not "
-            "ported; running without it leaves that patch's gradient stale, so this refuses instead.");
     if (in.snGradLimitCoeff != 0.0)
         throw std::runtime_error(
             "rhoSimpleFoam pEqn_cpp: a `limited <k> corrected` laplacian was asked for; brae implements "
@@ -207,6 +202,28 @@ PressureStages pressurePredictor(
             st.phiHbyA0.boundary[pi][i] = rhof.boundary[pi][i] * fluxHbyA.boundary[pi][i];
     }
     st.phiHbyA = st.phiHbyA0;
+
+    // constrainPressure(p, rho, U, phiHbyA, rhorAUf, MRF) -- pEqn.H:12, on the RAW phiHbyA, BEFORE
+    // either branch and before adjustPhi. Each p patch that updates its own snGrad (fixedFluxPressure)
+    // is handed
+    //     snGrad = (phiHbyA_b - rho_b*(Sf_b & U_b)) / (magSf_b * rhorAUf_b)
+    // (constrainPressure.C:60-77; MRF is refused above, so relative() is the identity). At a
+    // NON-assignable-U patch constrainHbyA above set HbyA_b = U_b, so the numerator cancels EXACTLY --
+    // X - X, not a small residual -- which is why the old zeroGradient substitution survived every
+    // fixed-velocity fixture and why the gate for this lives on an assignable-U (inletOutlet) outlet.
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (!p.boundary[pi]->updateableSnGrad()) continue;
+        const std::vector<vector> Ub = U.boundary[pi]->value();
+        std::vector<scalar> snGrad(static_cast<std::size_t>(patches[pi].size));
+        for (label i = 0; i < patches[pi].size; ++i)
+        {
+            const scalar sfU = patches[pi].magSf[i] * dot(patches[pi].nf[i], Ub[i]);
+            snGrad[i] = (st.phiHbyA.boundary[pi][i] - rhof.boundary[pi][i] * sfU)
+                      / (patches[pi].magSf[i] * st.rhorAUf.boundary[pi][i]);
+        }
+        p.boundary[pi]->updateSnGrad(snGrad);
+    }
 
     if (in.transonic)
     {

@@ -205,15 +205,15 @@ int main(int argc, char** argv)
 
     // --- refusals -------------------------------------------------------------------------
     std::printf("  -- refusals\n");
-    // `consistent` is no longer here: SIMPLEC is implemented (matrixH1 + fvc::snGrad). fixedFluxPressure
-    // takes its place -- pEqn.H reaches it through constrainPressure, which is not ported.
-    const char* names[3] = {"MRF", "fvOptions", "fixedFluxPressure"};
-    for (int which = 0; which < 3; ++which)
+    // `consistent` and fixedFluxPressure are no longer here: SIMPLEC is implemented, and so is
+    // constrainPressure (pEqn.H:21) -- the never-updated fixedFluxPressure case now refuses from the
+    // patch itself (FixedFluxPressurePatchField::requireUpdated, gated in test_uniform_function1).
+    const char* names[2] = {"MRF", "fvOptions"};
+    for (int which = 0; which < 2; ++which)
     {
         cpu::PressureInput bad = in;
         if (which == 0) bad.hasMRF = true;
-        else if (which == 1) bad.hasFvOptions = true;
-        else bad.hasFixedFluxPressure = true;
+        else bad.hasFvOptions = true;
         bool threw = false;
         try { cpu::pressurePredictor(UEqn, U, p, bad, m, g, patches); }
         catch (const std::runtime_error&) { threw = true; }

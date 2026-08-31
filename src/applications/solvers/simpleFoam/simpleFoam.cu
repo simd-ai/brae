@@ -132,6 +132,7 @@ Residuals simpleStep(
     pin.correctedLaplacian = in.correctedLaplacian;
     pin.snGradLimitCoeff   = in.snGradLimitCoeff;
     pin.hasMRF = in.hasMRF;       pin.hasFvOptions = in.hasFvOptions;
+    pin.hasFixedFluxPressure = in.hasFixedFluxPressure;
     pin.mrf = in.mrf;
     pin.adjustable = in.adjustable;
     pin.takeUAtBoundary = in.takeUAtBoundary;

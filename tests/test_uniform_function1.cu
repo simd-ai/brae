@@ -234,6 +234,67 @@ int main()
         else { std::printf("  FAIL a missing refValue built as a silent zero inlet\n"); failures++; }
     }
 
+    // 6. fixedFluxPressure: built REAL (no longer the silent zeroGradient mapping), refusing assembly
+    // until the solver has run constrainPressure, and honouring the gradient it is handed after.
+    // OpenFOAM's own updateCoeffs fatals the same way (fixedFluxPressureFvPatchScalarField.C:150-163).
+    {
+        auto writeP = [&](const std::string& dir, const std::string& body)
+        {
+            std::filesystem::create_directories(dir);
+            const std::string path = dir + "/p";
+            std::ofstream f(path);
+            f << "FoamFile { version 2.0; format ascii; class volScalarField; object p; }\n"
+              << "dimensions [1 -1 -2 0 0 0 0];\n"
+              << "internalField uniform 100000;\n"
+              << "boundaryField\n{\n" << body << "\n}\n";
+            return path;
+        };
+        FvPatch p;
+        p.name = "outlet";
+        p.type = "patch";
+        p.size = 1;
+        p.faceCells.assign(1, 0);
+        p.deltaCoeffs.assign(1, 1.0);
+        p.nf.assign(1, vector{1, 0, 0});
+        p.magSf.assign(1, 1.0);
+
+        const FieldData<scalar> fd = readField<scalar>(writeP(base + "/ffp",
+            "    outlet { type fixedFluxPressure; value uniform 100000; }"));
+        auto pf = makePatchField<scalar>(p, fd.boundary.at(0));
+        if (pf->updateableSnGrad()) std::printf("  OK   fixedFluxPressure is updateable-snGrad\n");
+        else { std::printf("  FAIL fixedFluxPressure not updateable -- constrainPressure cannot reach it\n"); failures++; }
+
+        bool refusedStale = false;
+        try { (void)pf->valueBoundaryCoeffs(); }
+        catch (const std::exception& e)
+        { refusedStale = std::string(e.what()).find("updateSnGrad") != std::string::npos; }
+        if (refusedStale) std::printf("  OK   assembly before updateSnGrad refuses (OF fatals identically)\n");
+        else { std::printf("  FAIL a never-updated fixedFluxPressure reached the matrix silently\n"); failures++; }
+
+        pf->updateSnGrad(std::vector<scalar>{-0.5});
+        bool ok = true;
+        try
+        {
+            // fixedGradient's own (gated) formulas: gBC = g, vBC = g/deltaCoeffs (= g here).
+            ok = std::fabs((double)pf->gradientBoundaryCoeffs().at(0) + 0.5) < 1e-15
+              && std::fabs((double)pf->valueBoundaryCoeffs().at(0) + 0.5) < 1e-15;
+        }
+        catch (const std::exception&) { ok = false; }
+        if (ok) std::printf("  OK   after updateSnGrad the coefficients carry the solver's gradient\n");
+        else { std::printf("  FAIL the updated gradient did not reach the coefficients\n"); failures++; }
+
+        // control: an ordinary p BC is NOT updateable, and updateSnGrad on it is a wiring error.
+        const FieldData<scalar> plain = readField<scalar>(writeP(base + "/ffp2",
+            "    outlet { type fixedValue; value uniform 100000; }"));
+        auto pf2 = makePatchField<scalar>(p, plain.boundary.at(0));
+        bool wrong = false;
+        try { pf2->updateSnGrad(std::vector<scalar>{1.0}); }
+        catch (const std::exception&) { wrong = true; }
+        if (!pf2->updateableSnGrad() && wrong)
+            std::printf("  OK   fixedValue is not updateable and updateSnGrad on it throws (control)\n");
+        else { std::printf("  FAIL constrainPressure's dispatch would touch an ordinary patch\n"); failures++; }
+    }
+
     std::printf("uniform_function1: %d failures\n", failures);
     return failures == 0 ? 0 : 1;
 }

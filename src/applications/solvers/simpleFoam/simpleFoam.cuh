@@ -122,6 +122,7 @@ struct StepInput
     const DeviceBuffer<label>* takeUAtBoundary = nullptr;   // constrainHbyA mask (!assignable)
 
     bool hasMRF = false, hasFvOptions = false, consistent = false;   // all refused downstream
+    bool hasFixedFluxPressure = false;   // device constrainPressure not ported -- pEqn.cu refuses it
 
     StepProbe* probe = nullptr;   // optional; see StepProbe
 

@@ -368,7 +368,6 @@ Residuals rhoSimpleStep(
     pin.snGradLimitCoeff     = in.snGradLimitCoeff;
     pin.hasMRF               = in.hasMRF;
     pin.hasFvOptions         = in.hasFvOptions;
-    pin.hasFixedFluxPressure = in.hasFixedFluxPressure;
 
     const std::vector<scalar> pOld = f.p.internal;
     std::vector<scalar>       rAUorAtU;      // whichever the velocity corrector uses

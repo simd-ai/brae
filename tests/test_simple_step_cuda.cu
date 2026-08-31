@@ -175,6 +175,10 @@ int main(int argc, char** argv)
     DeviceBuffer<label> dTakeU(takeU), dAdjust(adjustable);
 
     gpu::StepInput gin;
+    // The device pEqn has no constrainPressure yet, so a fixedFluxPressure p patch must reach its
+    // refusal -- detected here from the HOST patches, the last place the type exists.
+    for (std::size_t pi = 0; pi < f0.p.boundary.size(); ++pi)
+        if (f0.p.boundary[pi]->updateableSnGrad()) gin.hasFixedFluxPressure = true;
     gin.nuEffCell = &dNuCell; gin.nuEffFace = &dNuFace; gin.nuEffBndFace = &dNuBnd;
     gin.relaxU = relaxU; gin.relaxP = relaxP;
     gin.momentumPredictor = cd.momentumPredictor;

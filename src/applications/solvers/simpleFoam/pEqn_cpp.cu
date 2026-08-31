@@ -24,12 +24,6 @@ void refuseUnsupported(const PressureInput& in)
         throw std::runtime_error(
             "pEqn_cpp: the case declares fvOptions, which pEqn.H applies as fvOptions.correct(U) "
             "(pEqn.H:49). Refusing rather than solving a different equation.");
-    if (in.hasFixedFluxPressure)
-        throw std::runtime_error(
-            "pEqn_cpp: a pressure patch is fixedFluxPressure, which pEqn.H updates through "
-            "constrainPressure(p, U, phiHbyA, rAtU, MRF) (pEqn.H:21) so the patch gradient matches the "
-            "flux actually being imposed. Not ported; refusing rather than solving with a stale patch "
-            "gradient.");
 }
 
 } // namespace
@@ -176,6 +170,25 @@ PressureStages pressurePredictor(
             st.HbyA[c].y -= (st.rAU[c] - st.rAtU[c]) * gradP[c].y;
             st.HbyA[c].z -= (st.rAU[c] - st.rAtU[c]) * gradP[c].z;
         }
+    }
+
+    // constrainPressure(p, U, phiHbyA, rAtU(), MRF) -- pEqn.H:21, AFTER adjustPhi (:6) and the SIMPLEC
+    // correction (:8-16), so the snGrad is consistent with the flux the pressure equation actually
+    // sees. Incompressible: rho is geometricOneField, and rAtU's boundary is the owner cell's
+    // (calculated). MRF is refused above, so relative() is the identity. See rhoPEqn_cpp.cu for why
+    // the numerator cancels exactly at every non-assignable-U patch.
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (!p.boundary[pi]->updateableSnGrad()) continue;
+        const std::vector<vector> Ub = U.boundary[pi]->value();
+        std::vector<scalar> snGrad(static_cast<std::size_t>(patches[pi].size));
+        for (label i = 0; i < patches[pi].size; ++i)
+        {
+            const scalar sfU = patches[pi].magSf[i] * dot(patches[pi].nf[i], Ub[i]);
+            snGrad[i] = (st.phiHbyA.boundary[pi][i] - sfU)
+                      / (patches[pi].magSf[i] * st.rAtU[patches[pi].faceCells[i]]);
+        }
+        p.boundary[pi]->updateSnGrad(snGrad);
     }
 
     return st;

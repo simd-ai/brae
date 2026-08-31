@@ -274,6 +274,10 @@ int main(int argc, char** argv)
     };
 
     gpu::rhoSimple::RhoStepInput gin;
+    // The device rhoPEqn/rhoPcEqn have no constrainPressure yet, so a fixedFluxPressure p patch must
+    // reach their refusals -- detected from the HOST patches, the last place the type exists.
+    for (std::size_t pi = 0; pi < hf.p.boundary.size(); ++pi)
+        if (hf.p.boundary[pi]->updateableSnGrad()) gin.hasFixedFluxPressure = true;
     // constrainHbyA's mask and adjustPhi's mask, from the projection. They answer DIFFERENT questions
     // and rhoCreateFields.cu is where that distinction is made once.
     gin.takeUAtBoundary = &dev.takeUAtBoundary;

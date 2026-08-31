@@ -41,11 +41,6 @@ void refuseUnsupported(const PressureInput& in)
         throw std::runtime_error(
             "rhoSimpleFoam pcEqn_cpp: the case declares fvOptions, which pcEqn.H puts on the right-hand "
             "side as fvOptions(psi, p, rho.name()). Not implemented; refusing.");
-    if (in.hasFixedFluxPressure)
-        throw std::runtime_error(
-            "rhoSimpleFoam pcEqn_cpp: a pressure patch is fixedFluxPressure, reached through "
-            "constrainPressure(p, rho, U, phiHbyA, rhorAtU, MRF) (pcEqn.H:11). constrainPressure is not "
-            "ported; running without it leaves that patch's gradient stale, so this refuses instead.");
     if (in.snGradLimitCoeff != 0.0)
         throw std::runtime_error(
             "rhoSimpleFoam pcEqn_cpp: a `limited <k> corrected` laplacian was asked for; brae implements "
@@ -125,6 +120,25 @@ ConsistentPressureStages consistentPressurePredictor(
             st.phiHbyA0.boundary[pi][i] = rhof.boundary[pi][i] * fluxHbyA.boundary[pi][i];
     }
     st.phiHbyA = st.phiHbyA0;
+
+    // constrainPressure(p, rho, U, phiHbyA, rhorAtU, MRF) -- pcEqn.H:16 ("Update the pressure BCs to
+    // ensure flux consistency"), on the RAW phiHbyA before the SIMPLEC correction and both branches.
+    // rhorAtU is the VOL field rho*rAtU, so its boundary is rho's patch value times the owner cell's
+    // rAtU (calculated). See rhoPEqn_cpp.cu for the cancellation note.
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (!p.boundary[pi]->updateableSnGrad()) continue;
+        const std::vector<vector> Ub = U.boundary[pi]->value();
+        std::vector<scalar> snGrad(static_cast<std::size_t>(patches[pi].size));
+        for (label i = 0; i < patches[pi].size; ++i)
+        {
+            const scalar sfU = patches[pi].magSf[i] * dot(patches[pi].nf[i], Ub[i]);
+            const scalar rhorAtUb = rhof.boundary[pi][i] * st.rAtU[patches[pi].faceCells[i]];
+            snGrad[i] = (st.phiHbyA.boundary[pi][i] - rhof.boundary[pi][i] * sfU)
+                      / (patches[pi].magSf[i] * rhorAtUb);
+        }
+        p.boundary[pi]->updateSnGrad(snGrad);
+    }
 
     // The SIMPLEC flux correction, shared by both branches:
     //     fvc::interpolate(rho*(rAtU - rAU))*fvc::snGrad(p)*mesh.magSf()
