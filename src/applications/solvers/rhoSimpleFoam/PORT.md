@@ -1754,3 +1754,59 @@ Getting the gate green took three localizations, only the last of which was this
 Numbers: device-vs-host p ~1e-13 per iteration over 60 iterations on rhoBoxP (was 1.35e-02), refCell
 pinned at exactly 100000.0 on both arms. ffp_vs_openfoam now has three arms: SIMPLE, SIMPLEC, CUDA.
 Fail-proofs: kernel disabled -> cuda arm FAILs; closedVolume hardcode restored -> guards arm 6 FAILs.
+
+## The V2 envelope's substring refusal, lifted -- and simpleFoam's constrainPressure gated
+
+The census's OVER-BROAD entry -- "the incompressible case-level envelope refuses any case whose 0/p
+text merely contains the string fixedFluxPressure" (simpleFoamV2.cu) -- is gone: with both halves of
+the port landed, the blocker refused supported cases on a substring of the raw file text. Lifting it
+honestly required the one oracle the port still lacked: simpleFoam's OWN constrainPressure position
+(pEqn.H:21, AFTER adjustPhi and SIMPLEC, divisor rAtU) had never been end-to-end gated -- the
+compressible fixture cannot see that ordering.
+
+validation/simpleBoxP is that oracle, and its design records a trap: every all-Neumann incompressible
+variant dies inside OPENFOAM'S OWN adjustPhi at startup ("Adjustable mass outflow: 0" -- the outflow's
+initial flux is zero and there is nothing to scale; potentialFoam init just moves the same fatal into
+potentialFoam). The shape that works fixes p at the main outlet (adjustPhi never runs) and puts
+fixedFluxPressure on a SIDE VENT with zeroGradient U -- assignable, so the constrainHbyA cancellation
+does not kill the gradient. Converged vent gradient ~-0.08, written by OF into the output p file.
+
+ffpi_vs_openfoam (V2 driver vs real OF, converged-vs-converged): U 3.3e-09, p 4.9e-05, non-vacuity
+asserted on OF's written gradient. Fail-proof (factory mapped back to zeroGradient): U 2.9e-03 and
+p 3.1e+01 -- 58,000x and 62,000x past the bounds; the substitution is a different flow field.
+
+Guarded, not widened: V2 supports MRF, and MRF.relative belongs INSIDE constrainPressure
+(constrainPressure.C:70) where the device kernel does not carry it -- pEqn.cu now refuses the
+MRF + fixedFluxPressure combination by name at the call site (DeviceBoundary carries nSnGradFaces for
+exactly this kind of cheap has-any check).
+
+Open finding: the V2 writer emits the ffp patch as its file seed (`value uniform 0`), not the solved
+boundary state, and no `gradient` entry -- OF writes both. Harmless to a restart (the solver overwrites
+the gradient at the first assembly) but the written boundary understates the answer, and the gate had
+to compare internal fields for exactly that reason.
+
+## The two STALE lifts: T fixedGradient and mixed reach he on the mirror
+
+The census called both refusals STALE -- the capability existed (legacy binary, gated by
+hf_vs_openfoam and mx_vs_openfoam since they were written) while the mirror's T->he whitelist refused
+the types. Lifted, ~15 lines, and the mapping is worth stating exactly because the obvious version is
+wrong twice:
+
+- gradientEnergy's gradient is Cpv(pw,Tw)*Tw.snGrad() PLUS deltaCoeffs*(he(pw,Tw) - he(pw,Tw,cells))
+  (gradientEnergyFvPatchScalarField.C). The second term compares the PATCH's and the CELLS' mixtures at
+  the SAME p and T, so for any pureMixture it is IDENTICALLY zero -- an earlier comment in
+  rhoCreateFields credited he's p-independence, which is not the reason and would not survive a
+  multi-species port. mixedEnergy is the same statement on {vf unchanged, refValue -> he(refValue_T),
+  refGrad -> Cpv*refGrad_T}.
+- The gradient slots SCALE by Cpv; they must never go through heOf, which is affine -- an offset
+  applied to a slope. The fail-proof (raw copy, no Cpv) measures T 7.961e-03 on rhoBoxQ, within 0.1% of
+  the number the census predicted for exactly this control (7.97e-03).
+- Cpv is the constant Cp (Cv = Cp - R for sensibleInternalEnergy) under hConst, which is what makes the
+  static createFields-time mapping exact where OF re-evaluates per assembly. A varying-Cpv thermo stays
+  refused by the thermo envelope. Also fixed in passing: mixed's UNIFORM refValue slot was never run
+  through heOf (latent -- the type was refused; the loop only transformed the nonuniform list).
+
+Both gates grew a MIRROR ARM (the same OF workdir through test_rho_simple_step_cpp, with an engagement
+check on the fixture's T type): hf T 3.85e-12 / U 4.85e-10, mx T 1.07e-12 / U 6.72e-10 at the matched
+iteration -- machine-level on the first run after the lift, because the host fixedGradient/mixed
+COEFFICIENTS were already in (the e917673 trio) and only the mapping was missing.

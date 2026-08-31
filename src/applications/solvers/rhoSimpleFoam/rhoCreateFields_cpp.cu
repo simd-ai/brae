@@ -405,15 +405,32 @@ RhoSimpleFields createFields(
     //
     // What is done here is the mapping for the set where it is EXACT for this thermo, and a refusal by
     // name for anything else:
-    //     fixedValue    -> fixedValue   on he(T_b)          exact: fixedEnergy IS a fixedValue on he
-    //     zeroGradient  -> zeroGradient                     exact only because he is p-INDEPENDENT for
-    //                                                       perfectGas+hConst, so gradientEnergy's
-    //                                                       deltaCoeffs*(he(p_w,T_w) - he(p_c,T_c)) term
-    //                                                       vanishes when T's gradient does
-    //     inletOutlet   -> inletOutlet  on he(T_inletValue) exact: mixedEnergy is the same mixed BC with
-    //                                                       the energy refValue
-    // A janaf thermo, or a liquid whose he depends on p, breaks the second of those; the refusal below
-    // is what stops that from becoming a silent wrong answer.
+    //     fixedValue    -> fixedValue    on he(T_b)         exact: fixedEnergy IS a fixedValue on he
+    //     zeroGradient  -> zeroGradient                      gradientEnergy's second term is
+    //                                                        deltaCoeffs*(he(pw,Tw) - he(pw,Tw,cells))
+    //                                                        -- SAME p, SAME T, and for any pureMixture
+    //                                                        the same coefficients, so it is IDENTICALLY
+    //                                                        zero (an earlier version of this comment
+    //                                                        credited p-independence, which is not the
+    //                                                        reason: the term compares patch and cell
+    //                                                        MIXTURES, and pureMixture has one)
+    //     fixedGradient -> fixedGradient on Cpv*grad(T)      gradientEnergy with that zero second term:
+    //                                                        gradient() = Cpv(pw,Tw)*Tw.snGrad()
+    //                                                        (gradientEnergyFvPatchScalarField.C:99-105),
+    //                                                        and Cpv is the CONSTANT Cp (or Cv = Cp - R
+    //                                                        for sensibleInternalEnergy) under hConst --
+    //                                                        so the mapping is static and exact. The
+    //                                                        gradient SCALES by Cpv; it must not go
+    //                                                        through heOf, which is affine -- applying an
+    //                                                        offset to a slope is the trap the mx/hf
+    //                                                        controls measure (7.97e-03 on rhoBoxQ)
+    //     mixed         -> mixed         with vf unchanged,  mixedEnergy verbatim
+    //                      refValue -> he(refValue_T),       (mixedEnergyFvPatchScalarField.C:103-115):
+    //                      refGrad  -> Cpv*refGrad_T         same zero second term
+    //     inletOutlet   -> inletOutlet  on he(T_inletValue)  exact: mixedEnergy is the same mixed BC with
+    //                                                        the energy refValue
+    // A multi-species mixture revives the second term, and a thermo whose Cpv varies breaks the static
+    // scaling; the refusal below is what stops either from becoming a silent wrong answer.
     {
         auto heOf = [&](scalar T)
         {
@@ -445,6 +462,7 @@ RhoSimpleFields createFields(
             PatchFieldData<scalar> b = tb;          // type and structure carried over
             b.name = patches[pi].name;              // the PATCH's name, so buildField resolves it directly
             if (tb.type != "fixedValue" && tb.type != "zeroGradient" && tb.type != "inletOutlet"
+                && tb.type != "fixedGradient" && tb.type != "mixed"
                 && tb.type != "calculated" && tb.type != "empty" && tb.type != "symmetry"
                 && tb.type != "symmetryPlane" && tb.type != "wedge" && tb.type != "slip")
                 throw std::runtime_error(
@@ -455,10 +473,20 @@ RhoSimpleFields createFields(
                     "energy under a temperature's boundary condition.");
             b.uniformValue     = heOf(tb.uniformValue);
             for (auto& v : b.values)      v = heOf(v);
-            b.refValueUniform ? (void)0 : (void)0;
+            b.refValueUniformValue = heOf(tb.refValueUniformValue);   // mixed's refValue slot
             for (auto& v : b.refValues)   v = heOf(v);
             b.inletUniformValue = heOf(tb.inletUniformValue);
             for (auto& v : b.inletValues) v = heOf(v);
+            // The GRADIENT slots (fixedGradient's `gradient`, mixed's `refGradient`) SCALE by Cpv --
+            // never heOf, which is affine: an offset applied to a slope was worth 7.97e-03 on rhoBoxQ's
+            // T when the mx/hf controls first measured it. Cpv is constant under hConst, which is what
+            // makes this static mapping exact (gradientEnergy/mixedEnergy re-evaluate it live).
+            if (tb.hasGradient)
+            {
+                const scalar Cpv = (f.heName == "e") ? f.thermo.Cp - f.thermo.R : f.thermo.Cp;
+                b.gradientUniformValue = Cpv * tb.gradientUniformValue;
+                for (auto& g : b.gradientValues) g = Cpv * g;
+            }
             heFd.boundary.push_back(std::move(b));
         }
         f.he = buildField<scalar>(heFd, patches, nC);
