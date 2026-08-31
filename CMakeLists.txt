@@ -594,6 +594,11 @@ target_include_directories(test_adjust_phi_guards PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_adjust_phi_guards PRIVATE brae_core)
 add_test(NAME adjust_phi_guards COMMAND test_adjust_phi_guards)
 
+add_executable(test_powerlaw_dict_guards tests/test_powerlaw_dict_guards.cu)
+target_include_directories(test_powerlaw_dict_guards PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_powerlaw_dict_guards PRIVATE brae_core)
+add_test(NAME powerlaw_dict_guards COMMAND test_powerlaw_dict_guards)
+
 add_test(NAME manifest_rhosimplefoam_not_drifted
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/of_manifest.py rhoSimpleFoam
                  --check ${CMAKE_CURRENT_SOURCE_DIR}/manifest/rhoSimpleFoam.yaml)

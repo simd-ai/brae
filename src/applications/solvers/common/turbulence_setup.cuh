@@ -55,6 +55,19 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                     const FoamDict* co = lam->subDict("powerLawCoeffs");
                     const FoamDict& src = co ? *co : *lam;
                     ctl.gnPowerLaw = true;
+                    // ALL THREE are required: OF powerLaw.C:63-65 constructs n_, nuMin_ and nuMax_
+                    // straight from the dict with no default, and fatals on a missing entry. The old
+                    // guard tested only nuMax, so a case missing `n` silently got n = 1.0 -- which makes
+                    // nu = nu0 identically, the NEWTONIAN answer, on a case that asked for shear
+                    // thinning. squareBendLiqNoNewtonian records what that is worth: nu sits at nuMin
+                    // over essentially the whole field, ~1120x the Newtonian value (see above).
+                    if (!src.found("n") || !src.found("nuMin") || !src.found("nuMax"))
+                        throw std::runtime_error(
+                            "brae: generalizedNewtonian powerLaw needs all three of n, nuMin, nuMax "
+                            "(OpenFOAM powerLaw.C constructs each with no default and fatals without "
+                            "it); missing: " + std::string(!src.found("n") ? "n " : "")
+                            + (!src.found("nuMin") ? "nuMin " : "")
+                            + (!src.found("nuMax") ? "nuMax" : ""));
                     ctl.gnN     = src.scalarOr("n", 1.0);
                     ctl.gnNuMin = src.scalarOr("nuMin", 0.0);
                     ctl.gnNuMax = src.scalarOr("nuMax", 0.0);
