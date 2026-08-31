@@ -132,6 +132,14 @@ struct KEpsilonInput
     //     turbulentIntensityKineticEnergyInlet from U's. Freezing them at the case file's `value` is a
     //     silent no-turbulence inlet. A null mask means the case has no such patch; supplying one is the
     //     caller's job because the mask is a property of the case, not of the equation. ---
+    // compressible::alphatWallFunction, per boundary face. OF ends every EddyDiffusivity::correctNut with
+    // alphat_.correctBoundaryConditions(), and on such a patch that is operator==(rhow*tnutw/Prt_) with
+    // the PATCH's own Prt_ (default 0.85) -- not the model's `Prt` above, whose default is 1.0. Two
+    // different turbulent Prandtl numbers in one case, so the wall one is carried per face.
+    // Null => no alphat boundary is written, which is what every caller got until now.
+    const DeviceBuffer<label>*  alphatWallMask = nullptr;
+    const DeviceBuffer<scalar>* alphatPrtFace  = nullptr;
+
     const DeviceBuffer<label>*  turbInletEpsMask = nullptr;
     const DeviceBuffer<scalar>* turbInletEpsLen  = nullptr;   // mixing length, per boundary face
     const DeviceBuffer<label>*  turbInletKMask   = nullptr;
@@ -239,6 +247,7 @@ void correctNut(
     DeviceBuffer<scalar>&        nut,
     DeviceBuffer<scalar>&        nutBnd,
     DeviceBuffer<scalar>*        alphat,
+    DeviceBuffer<scalar>*        alphatBnd,      // null => the boundary is left alone (see alphatWallMask)
     const DeviceMesh&            dm,
     const DeviceBoundary&        dbK,
     const DeviceBoundary&        dbEps,
@@ -257,6 +266,7 @@ void correct(
     DeviceBuffer<scalar>&        nut,
     DeviceBuffer<scalar>&        nutBnd,
     DeviceBuffer<scalar>*        alphat,
+    DeviceBuffer<scalar>*        alphatBnd,      // null => the boundary is left alone (see alphatWallMask)
     KEpsilonStages&              st,
     const DeviceMesh&            dm,
     const DeviceVectorBoundary&  dbU,

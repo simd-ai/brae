@@ -248,6 +248,23 @@ RhoDeviceFields createDeviceFields(
             // not: leaving this unseeded would drop the turbulent half of the energy diffusivity at
             // exactly the wall where it is largest.
             d.f.alphatBnd.copyFrom(flattenFieldBoundary(hf.alphat, patches, d.nBndFaces, 0.0));
+
+            // ...and WHICH faces the closure must recompute, with that patch's own Prt. Same walk.
+            std::vector<label>  am(static_cast<std::size_t>(d.nBndFaces), 0);
+            std::vector<scalar> ap(static_cast<std::size_t>(d.nBndFaces), scalar(0.85));
+            label abi = 0;
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                const bool wf = pi < hf.alphatWallFn.size() && hf.alphatWallFn[pi] != 0;
+                const scalar pr = pi < hf.alphatPrt.size() ? hf.alphatPrt[pi] : scalar(0.85);
+                for (label i = 0; i < patches[pi].size; ++i, ++abi)
+                {
+                    if (abi >= d.nBndFaces) break;
+                    if (wf) { am[abi] = 1; ap[abi] = pr; }
+                }
+            }
+            d.alphatWallMask.copyFrom(am);
+            d.alphatPrtFace.copyFrom(ap);
         }
 
         // The TURBULENT INLETS, per boundary face. OF's turbulentIntensityKineticEnergyInlet and

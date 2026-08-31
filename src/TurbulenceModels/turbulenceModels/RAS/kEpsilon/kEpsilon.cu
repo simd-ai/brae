@@ -734,10 +734,29 @@ void boundField(
 }
 
 
+// alphat_.correctBoundaryConditions() for a compressible::alphatWallFunction face:
+// operator==(rhow*tnutw/Prt_) (alphatWallFunctionFvPatchScalarField.C:125), with the PATCH's own Prt_.
+// Only masked faces are written; every other face keeps whatever its own condition left there.
+__global__ void alphatBndKernel(
+    int           nB,
+    const label*  __restrict__ mask,
+    const scalar* __restrict__ rhoB,
+    const scalar* __restrict__ nutB,
+    const scalar* __restrict__ prt,
+    scalar*       __restrict__ alphatB)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nB || !mask[i]) return;
+    const scalar p = prt[i] > scalar(0) ? prt[i] : scalar(0.85);
+    alphatB[i] = rhoB[i] * nutB[i] / p;
+}
+
+
 void correctNut(
     DeviceBuffer<scalar>&       nut,
     DeviceBuffer<scalar>&       nutBnd,
     DeviceBuffer<scalar>*       alphat,
+    DeviceBuffer<scalar>*       alphatBnd,
     const DeviceMesh&           dm,
     const DeviceBoundary&       dbK,
     const DeviceBoundary&       dbEps,
@@ -777,6 +796,20 @@ void correctNut(
         alphat->resize(nC);
         alphatKernel<<<nBlk(nC), TPB>>>(nC, in.rhoCell->data(), nut.data(), in.Prt, alphat->data());
         cudaCheck(cudaGetLastError(), "kEpsilon alphat");
+    }
+
+    // ...and the BOUNDARY, which OF writes in the same call (EddyDiffusivity.C:38). Left out until now,
+    // so a device-resident alphaEff read whatever 0/alphat shipped -- `value uniform 0` at the walls on
+    // both compressible fixtures -- for the whole run, and the wall lost its entire turbulent
+    // diffusivity. The HOST path was fixed first (rhoSimpleFoam_cpp.cu, measured 1.0 -> 2.25e-04 against
+    // OpenFOAM's own written field); this is its device counterpart.
+    if (alphatBnd && in.alphatWallMask && in.alphatPrtFace && in.rhoBndFace)
+    {
+        const int nB = dbEps.n;
+        alphatBnd->resize(nB);
+        alphatBndKernel<<<nBlk(nB), TPB>>>(nB, in.alphatWallMask->data(), in.rhoBndFace->data(),
+                                           nutBnd.data(), in.alphatPrtFace->data(), alphatBnd->data());
+        cudaCheck(cudaGetLastError(), "kEpsilon alphat boundary");
     }
     (void)wall;
 }
@@ -876,6 +909,7 @@ void correct(
     DeviceBuffer<scalar>&       nut,
     DeviceBuffer<scalar>&       nutBnd,
     DeviceBuffer<scalar>*       alphat,
+    DeviceBuffer<scalar>*       alphatBnd,
     KEpsilonStages&             st,
     const DeviceMesh&           dm,
     const DeviceVectorBoundary& dbU,
@@ -916,7 +950,7 @@ void correct(
         boundField(k, dm, dbK, scalar(1e-15));
     }
 
-    correctNut(nut, nutBnd, alphat, dm, dbK, dbEps, wall, k, epsilon, in);
+    correctNut(nut, nutBnd, alphat, alphatBnd, dm, dbK, dbEps, wall, k, epsilon, in);
 }
 
 } // namespace kEpsilonRAS

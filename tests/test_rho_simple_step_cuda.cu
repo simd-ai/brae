@@ -51,6 +51,9 @@
 #include "rhoSimpleFoam.cuh"
 #include "rhoCreateFields.cuh"
 #include "rhoThermoDevice.cuh"
+#include "kEpsilon.cuh"          // gpu::kEpsilonRAS -- the device closure the turbulent arm drives
+#include "transport_model.cuh"   // transportMu: nu = mu(T)/rho for the closure inputs
+#include "linearViscousStress_cpp.cuh"   // effectiveFaceViscosity -- the host driver's own rho interpolation
 #include "thermo_model.cuh"
 #include "equation_of_state.cuh"   // perfectGasPsi -- the oracle for the device thermo control
 #include "device_fvoptions.cuh"   // DevicePorosity   // hConstTToHe -- the reference's OWN T->he conversion
@@ -113,11 +116,13 @@ int main(int argc, char** argv)
     int  iters       = 8;
     bool boundaryArm  = false;
     bool deviceThermo = false;
+    bool turbulentArm = false;
     for (int a = 3; a < argc; ++a)
     {
         const std::string arg = argv[a];
         if      (arg == "--boundary")      boundaryArm  = true;
         else if (arg == "--device-thermo") deviceThermo = true;
+        else if (arg == "--turbulent")     turbulentArm = true;
         else                               iters = std::atoi(argv[a]);
     }
 
@@ -163,7 +168,8 @@ int main(int argc, char** argv)
     std::printf("rhoSimpleFoam DRIVER: CUDA vs _cpp  (%d cells, %d iterations, %s%s)\n",
                 (int)nC, iters, hf.turbulent ? hf.rasModel.c_str() : "laminar",
                 boundaryArm ? ", BOUNDARY arm" : (deviceThermo ? ", DEVICE thermo" : ""));
-    if (!boundaryArm) check("the fixture is LAMINAR (see the header)", !hf.turbulent);
+    if (!boundaryArm && !turbulentArm) check("the fixture is LAMINAR (see the header)", !hf.turbulent);
+    if (turbulentArm) check("the TURBULENT arm was given a turbulent fixture", hf.turbulent);
     {
         label coupled = 0;
         for (const FvPatch& p : fvp)
@@ -194,6 +200,20 @@ int main(int argc, char** argv)
     hin.relaxRho = rfl ? rfl->scalarOr("rho", 1.0) : 1.0;
     hin.relaxPEqn = req ? req->scalarOr("p", 1.0) : 1.0;
     hin.relaxPEqnSpecified = (req != nullptr) && req->found("p");
+    // THE CLOSURE'S CONTROLS, on the turbulent arm. The gate set none of these, which was harmless while
+    // every arm ran laminar and is not once the closure runs: StepInput defaults relaxK/relaxEpsilon to
+    // 1.0 with relaxEquationK/Eps TRUE, so the host closure would apply the dominance clamp the case
+    // never asked for while the device side used whatever it was handed.
+    if (turbulentArm)
+    {
+        hin.relaxK          = req ? req->scalarOr("k", 1.0) : 1.0;
+        hin.relaxEpsilon    = req ? req->scalarOr("epsilon", 1.0) : 1.0;
+        hin.relaxEquationK  = (req != nullptr) && req->found("k");
+        hin.relaxEquationEps= (req != nullptr) && req->found("epsilon");
+        hin.tolTurb         = 1e-14;
+        hin.relTolTurb      = 0.0;
+        hin.boundedTurb     = true;   // both fixtures ship `bounded Gauss upwind` on k and epsilon
+    }
     hin.boundedU = hin.boundedHe = hin.boundedKE = true;   // `bounded Gauss upwind` on all three
     hin.correctedLaplacian = false;                        // `Gauss linear orthogonal`
 
@@ -266,6 +286,17 @@ int main(int argc, char** argv)
     gin.pRefCell  = hf.pressureControl.refCell;
     gin.pRefValue = hf.pressureControl.refValue;
 
+    // THE CASE'S OWN pressureControl, on every arm. The forced-limiter block below overrides these with
+    // bounds tightened to make the clamp bite, and it is SKIPPED on the boundary and turbulent arms --
+    // which left those arms giving the limits to the host (through hf.pressureControl, which
+    // rhoSimpleStep reads directly) and not to the device. sbMatched names `pMin 1000`, so the host
+    // clamped and the device did not: measured on the turbulent arm as p 1.790e-03 at iteration 2 while
+    // T, he and rho were all at 1e-12.
+    gin.limitMaxP = hf.pressureControl.limitMaxP;
+    gin.pMaxLimit = hf.pressureControl.pMax;
+    gin.limitMinP = hf.pressureControl.limitMinP;
+    gin.pMinLimit = hf.pressureControl.pMin;
+
     // pressureControl::limit, from the case -- AND made to bind, because the case's own limit does not.
     // rhoBox names `pMin 1000` while p sits near 1e5, so the shipped limit never clips and a driver that
     // dropped it entirely passed this gate for as long as it did. The bounds below are tightened around
@@ -282,7 +313,7 @@ int main(int argc, char** argv)
     // asked for -- Ux read 4.5e-04 there against 4.5e-12 with the case running as it ships. The boundary
     // arm measures the BOUNDARY, so it needs the interior running normally.
     std::vector<scalar> pUnlimited, heUnlimited, tUnlimited;
-    if (!boundaryArm)
+    if (!boundaryArm && !turbulentArm)
     {
         cpu::rhoSimple::RhoSimpleFields fn =
             cpu::rhoSimple::createFields(caseDir + "/" + startT, caseDir, simpleDict, &fvSolution,
@@ -293,7 +324,7 @@ int main(int argc, char** argv)
         heUnlimited = fn.he.internal;
         tUnlimited  = fn.T.internal;
     }
-    if (!boundaryArm)
+    if (!boundaryArm && !turbulentArm)
     {
         scalar pLo = 1e300, pHi = -1e300;
         for (label c = 0; c < nC; ++c)
@@ -386,7 +417,124 @@ int main(int argc, char** argv)
             gf.rhoBnd.copyFrom(flatBnd(df.rho, fvp, dm.nBndFaces, 1.0));
         };
     }
-    gin.correct = nullptr;   // laminar
+    // THE TURBULENCE HOOK. gin.correct was nullptr in EVERY registered arm, so the device kEpsilon
+    // closure ran in no gate at all -- its own standalone gate (test_rho_kepsilon_cuda) assembles ONE
+    // system from OpenFOAM's adopted fields, which says the arithmetic is right GIVEN that state and
+    // nothing about the closure's POSITION in the iteration or the nut/alphat -> muEff/alphaEff feedback.
+    //
+    // The host driver runs its own host closure inside rhoSimpleStep, and the two closures are already
+    // pinned against each other (test_rho_kepsilon_cuda) and against instrumented OpenFOAM
+    // (rho_kepsilon_vs_openfoam). So what this arm adds is exactly the part neither can see: whether the
+    // DRIVER composes them in the same order and on the same state.
+    //
+    // The inputs are built HOST-SIDE from the device state and uploaded, which is the same arrangement
+    // this file already uses for muEff/alphaEff. Two of them have no device producer yet -- the
+    // volumetric flux and the laminar nu -- so a device-resident version of this hook waits on those,
+    // exactly as the thermo hooks waited on rhoThermoDevice.cu.
+    // The stages struct lives ACROSS iterations for the same reason the pressure workspace does: it owns
+    // device buffers, and reallocating them every call would defeat any caching keyed on them.
+    if (turbulentArm)
+    {
+        const std::vector<label> am = dev.alphatWallMask.size() ? dev.alphatWallMask.host() : std::vector<label>();
+        label n = 0; for (std::size_t i = 0; i < am.size(); ++i) n += (am[i] != 0);
+        std::printf("  turbulent arm: alphat wall faces %d, turbInlet %s, closure inputs from device\n",
+                    (int)n, dev.hasTurbulentInlet ? "yes" : "no");
+    }
+    gpu::kEpsilonRAS::KEpsilonStages kst;
+    if (turbulentArm)
+    {
+        gin.correct = [&]()
+        {
+            const label nBF = dm.nBndFaces;
+            const std::vector<scalar> hT   = gf.T.host();
+            const std::vector<scalar> hRho = gf.rho.host();
+            const std::vector<scalar> hTB  = gf.TBnd.host();
+            const std::vector<scalar> hRhoB= gf.rhoBnd.host();
+
+            // nu = mu(T)/rho, cells and boundary faces. transportMu is the SAME function the reference
+            // uses -- one transport model in the tree, called from both sides.
+            std::vector<scalar> nuC(nC), nuB(nBF);
+            for (label c = 0; c < nC; ++c)  nuC[c] = transportMu(hT[c], hf.thermo) / hRho[c];
+            for (label i = 0; i < nBF; ++i) nuB[i] = transportMu(hTB[i], hf.thermo)
+                                                   / (hRhoB[i] > 0 ? hRhoB[i] : scalar(1));
+
+            // The wall-face gather: nu in WALL-face order, which is not boundary-face order.
+            std::vector<scalar> nuWall(dev.wfFaceOfBnd.size());
+            for (std::size_t i = 0; i < dev.wfFaceOfBnd.size(); ++i)
+                nuWall[i] = nuB[static_cast<std::size_t>(dev.wfFaceOfBnd[i])];
+
+            // compressibleTurbulenceModel::phi() -- the VOLUMETRIC flux, phi/fvc::interpolate(rho).
+            // divU is a dilatation and must come from this, not from the mass flux the div operator uses.
+            const std::vector<scalar> hPhiI = gf.phiInt.host(), hPhiB = gf.phiBnd.host();
+            //
+            // effectiveFaceViscosity, NOT fvc::interpolate, and the BOUNDARY divided by the interpolated
+            // FACE value rather than by the patch rho -- because that is what the host driver does
+            // (rhoSimpleFoam_cpp.cu:518-527). The two differ on boundary faces, and using the patch rho
+            // here put the device closure on a different volumetric flux from the host's, which showed
+            // up as the whole field separating at iteration 2 while iteration 1 stayed at 4.5e-12.
+            std::vector<scalar> pbrI(hPhiI.size()), pbrB(hPhiB.size());
+            {
+                std::vector<std::vector<scalar>> rbP(fvp.size());
+                label bi = 0;
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                {
+                    rbP[pi].resize(fvp[pi].size);
+                    for (label i = 0; i < fvp[pi].size; ++i, ++bi)
+                        rbP[pi][i] = (bi < (label)hRhoB.size()) ? hRhoB[bi] : scalar(1);
+                }
+                const SurfaceScalarField rhof = cpu::effectiveFaceViscosity(hRho, rbP, m, g, fvp);
+                for (std::size_t f = 0; f < hPhiI.size() && f < rhof.internal.size(); ++f)
+                    pbrI[f] = hPhiI[f] / rhof.internal[f];
+                bi = 0;
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                    for (label i = 0; i < fvp[pi].size; ++i, ++bi)
+                        if (bi < (label)pbrB.size())
+                            pbrB[bi] = hPhiB[bi] / rhof.boundary[pi][i];
+            }
+
+            DeviceBuffer<scalar> dNuC(nuC), dNuB(nuB), dNuW(nuWall), dPbrI(pbrI), dPbrB(pbrB);
+
+            gpu::kEpsilonRAS::KEpsilonInput kin;
+            kin.phiInt = &gf.phiInt;         kin.phiBnd = &gf.phiBnd;
+            kin.phiByRhoInt = &dPbrI;        kin.phiByRhoBnd = &dPbrB;
+            kin.rhoCell = &gf.rho;           kin.rhoBndFace = &gf.rhoBnd;
+            kin.nuCell = &dNuC;              kin.nuBndFace = &dNuB;
+            kin.nuWallFace = &dNuW;
+            // A SCRATCH COPY, not &gf.nutBnd itself. nutBndFace is the ENTERING wall viscosity the
+            // diffusivity is built from, and gf.nutBnd is also the OUTPUT correct() overwrites -- alias
+            // them and the closure reads a value it has already replaced partway through. The standalone
+            // gate keeps the two separate (gNutBnd vs dNutBnd) and this arm has to as well.
+            DeviceBuffer<scalar> nutBndIn(gf.nutBnd.host());
+            kin.nutBndFace = &nutBndIn;
+            kin.wfBndMask = &dev.wfBndMask;  kin.wallYBndFace = &dev.wallYBndFace;
+            kin.Ux = &gf.Ux; kin.Uy = &gf.Uy; kin.Uz = &gf.Uz;
+            // The masks built by createDeviceFields. Passing null here is NOT "no turbulent inlet" --
+            // it is silently no turbulent inlet at all, on a case whose 0/k asks for one.
+            if (dev.hasTurbulentInlet)
+            {
+                kin.turbInletKMask   = &dev.turbInletKMask;
+                kin.turbInletKInt    = &dev.turbInletKInt;
+                kin.turbInletEpsMask = &dev.turbInletEpsMask;
+                kin.turbInletEpsLen  = &dev.turbInletEpsLen;
+            }
+            kin.alphatWallMask = &dev.alphatWallMask;
+            kin.alphatPrtFace  = &dev.alphatPrtFace;
+            kin.co = hf.keCoeffs;
+            kin.Prt = hf.Prt;
+            kin.boundedK = kin.boundedEps = hin.boundedTurb;
+            kin.correctedLaplacian = gin.correctedLaplacian;
+            kin.relaxEquationK   = hin.relaxEquationK;   kin.relaxK   = hin.relaxK;
+            kin.relaxEquationEps = hin.relaxEquationEps; kin.relaxEps = hin.relaxEpsilon;
+            kin.tol = hin.tolTurb; kin.relTol = hin.relTolTurb; kin.maxIter = hin.maxIter;
+
+            gpu::kEpsilonRAS::correct(gf.k, gf.epsilon, gf.nut, gf.nutBnd, &gf.alphat, &gf.alphatBnd,
+                                      kst, dm, dbU, dev.dbK, dev.dbEps, dev.wall, kin);
+        };
+    }
+    else
+    {
+        gin.correct = nullptr;   // laminar
+    }
 
     // The energy the run STARTS from, for the device-thermo oracle control at the end of this file: it
     // has to show that he actually moved, or T tracking he proves nothing.
@@ -395,6 +543,7 @@ int main(int argc, char** argv)
     // ---- the loop ----------------------------------------------------------------------------
     std::printf("  per-iteration agreement (relL2, CUDA against _cpp)\n");
     double worstU = 0, worstP = 0, worstT = 0, worstRho = 0;
+    double worstAlphatB = 0; label alphatBFaces = 0;
     int firstBad = -1;
     for (int it = 1; it <= iters; ++it)
     {
@@ -406,7 +555,14 @@ int main(int argc, char** argv)
         std::vector<scalar> muEff, alphaEff;
         std::vector<std::vector<scalar>> muEffBnd, alphaEffBnd;
         DeviceBuffer<scalar> dMu, dAl, dMuB, dAlB;
-        if (deviceThermo)
+        // THE TURBULENT ARM MUST TAKE THE DEVICE TRANSPORT. muEff and alphaEff are the only route by
+        // which the closure reaches the momentum and energy equations, and the host-side branch below
+        // builds them from `df` -- the host mirror the THERMO hooks maintain. Nothing syncs df.nut or
+        // df.alphat from the device, so with the device closure wired the device driver would run on the
+        // nut createFields wrote and never see its own closure's output at all. That is what made the
+        // arm's numbers bit-identical across three different volumetric-flux constructions: the inputs
+        // were changing and nothing downstream was reading the result.
+        if (deviceThermo || turbulentArm)
         {
             // The THIRD round-trip, and the last one in the loop. muEff and alphaEff are the only place
             // the closure and the thermo enter the momentum and energy equations, and computing them on
@@ -431,6 +587,27 @@ int main(int argc, char** argv)
         gin.alphaEffCell = &dAl;       gin.alphaEffBndFace = &dAlB;
 
         gpu::rhoSimple::rhoSimpleStep(gf, w, dm, dbU, dbP, dbHe, dbT, gin);
+
+        // The alphat BOUNDARY, device against host, on the turbulent arm. Compared directly rather than
+        // through the trajectory: OF writes it inside every correctNut (EddyDiffusivity.C:38) as
+        // rho_b*nut_b/Prt_patch, the host driver now does, and the device closure now does -- but on this
+        // fixture the difference does not reach U or T at the level this arm resolves, so a trajectory
+        // bound would not test it. This does.
+        if (turbulentArm)
+        {
+            const std::vector<scalar> dAB = gf.alphatBnd.host();
+            const std::vector<scalar> hAB = flatBnd(hf.alphat, fvp, dm.nBndFaces, 0.0);
+            const std::vector<label>  am  = dev.alphatWallMask.host();
+            double num = 0.0, den = 0.0; label nf = 0;
+            for (std::size_t i = 0; i < am.size() && i < dAB.size() && i < hAB.size(); ++i)
+            {
+                if (!am[i]) continue;
+                const double d = (double)dAB[i] - (double)hAB[i];
+                num += d * d; den += (double)hAB[i] * (double)hAB[i]; ++nf;
+            }
+            worstAlphatB = std::max(worstAlphatB, den > 0 ? std::sqrt(num / den) : std::sqrt(num));
+            alphatBFaces = nf;
+        }
 
         // Compare AFTER EVERY iteration, so the FIRST divergent one is named. A final-state-only
         // comparison reports where the two ended up, not where they parted.
@@ -473,6 +650,20 @@ int main(int argc, char** argv)
     report("T", worstT, 1e-11);
     report("rho", worstRho, 1e-11);
     check("no iteration diverged", firstBad < 0);
+
+    if (turbulentArm)
+    {
+        // The device closure now writes alphat's boundary. Before it did, this read 1.0 exactly on every
+        // one of these faces -- brae's device wall alphat was identically zero where the host's (and
+        // OpenFOAM's) is not, so alphaEff at the wall carried none of the turbulent diffusivity.
+        std::printf("     %-40s over %d alphat wall faces\n", "alphat BOUNDARY: device vs host",
+                    (int)alphatBFaces);
+        check("the fixture HAS alphat wall faces (else this is vacuous)", alphatBFaces > 0);
+        // 1e-3, not machine precision: this inherits the closure drift the arm has not yet explained
+        // (see the header). It TIGHTENS when that is understood. Measured 1.143903e-04; with the device
+        // boundary write disabled it reads exactly 1.000000e+00, which is what it caught.
+        report("alphat boundary (device vs host)", worstAlphatB, 1e-3);
+    }
 
     // ---- CONTROL: the POROSITY reaches the momentum equation -----------------------------------
     // rhoUEqn.cu has been able to apply an explicitPorositySource since it was written, but the DRIVER
@@ -542,7 +733,7 @@ int main(int argc, char** argv)
     // would clip nothing, so the floor comes from the unlimited run's own he range and the control
     // requires it to clip a substantial share. Both limiter controls belong to the rhoBox arm: the
     // boundary arm does not force the limiters at all (see above), so there is nothing there to assert.
-    if (!boundaryArm)
+    if (!boundaryArm && !turbulentArm)
     {
         std::size_t atFloor = 0;
         for (label c = 0; c < nC; ++c)
@@ -556,7 +747,7 @@ int main(int argc, char** argv)
     // Forcing pMin only matters if it clips. If it does not, every agreement above is agreement about a
     // no-op -- which is exactly how a driver missing the limiter entirely passed this gate until an audit
     // found it. The unlimited run computed above is the comparison.
-    if (!boundaryArm)
+    if (!boundaryArm && !turbulentArm)
     {
         const double moved = relL2(pUnlimited, hf.p.internal);
         std::size_t atFloor = 0;

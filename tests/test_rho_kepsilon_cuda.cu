@@ -331,7 +331,7 @@ int main(int argc, char** argv)
     }
 
     gpu::kEpsilonRAS::KEpsilonStages st;
-    gpu::kEpsilonRAS::correct(gK, gE, gN, gNutBnd, &gAlphat, st, dm, dbU, dbK, dbEps, wall, gin);
+    gpu::kEpsilonRAS::correct(gK, gE, gN, gNutBnd, &gAlphat, nullptr, st, dm, dbU, dbK, dbEps, wall, gin);
 
     std::printf("kEpsilon CUDA vs _cpp   cells=%d  wall cells=%d/%d\n",
                 (int)nC, (int)st.wallCells, (int)res.wallCells);
@@ -457,7 +457,7 @@ int main(int argc, char** argv)
         DeviceBoundary db2K   = buildDeviceBoundary(dk, fvp, g);
         DeviceBoundary db2Eps = buildDeviceBoundary(de, fvp, g);
         gpu::kEpsilonRAS::KEpsilonStages st2;
-        gpu::kEpsilonRAS::correct(g2K, g2E, g2N, g2NutBnd, &g2A, st2, dm, dbU, db2K, db2Eps, wall, gin);
+        gpu::kEpsilonRAS::correct(g2K, g2E, g2N, g2NutBnd, &g2A, nullptr, st2, dm, dbU, db2K, db2Eps, wall, gin);
 
         cmp(g2E.host(), h2e.internal, "epsilon, SECOND correct() in-process", 1e-9);
         cmp(g2K.host(), h2k.internal, "k, SECOND correct() in-process",       1e-9);

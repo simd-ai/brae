@@ -82,6 +82,13 @@ struct RhoDeviceFields
     DeviceBuffer<scalar> turbInletKInt,    turbInletEpsLen;
     bool                 hasTurbulentInlet = false;
 
+    // compressible::alphatWallFunction, per boundary face, with that patch's OWN Prt (default 0.85 --
+    // NOT the model's 1.0). The closure writes alphat_b = rho_b*nut_b/Prt on these faces, which is
+    // EddyDiffusivity.C:38's alphat_.correctBoundaryConditions(). Projected from the per-patch
+    // hf.alphatWallFn / hf.alphatPrt the host reader already gathers.
+    DeviceBuffer<label>  alphatWallMask;
+    DeviceBuffer<scalar> alphatPrtFace;
+
     // updateCoeffs() metadata for the boundary conditions whose coefficients move with the SOLUTION.
     // The device boundary objects are a pre-baked snapshot -- bcType, refValue and valueFraction are
     // fixed at build time -- so anything OpenFOAM recomputes inside updateCoeffs has to be recomputed
