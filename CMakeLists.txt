@@ -610,6 +610,14 @@ add_test(NAME manifest_rhosimplefoam_not_drifted
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/of_manifest.py rhoSimpleFoam
                  --check ${CMAKE_CURRENT_SOURCE_DIR}/manifest/rhoSimpleFoam.yaml)
 
+# The simpleFoam twin existed only as a tool flag, and its manifest drifted for weeks: sixteen whole
+# entries and four long validation/note blocks were hand-added to the YAML while the tool's curated
+# table (where they are supposed to live) fell behind. Reconciled 2026-08-31; this test is what keeps
+# the two from diverging again.
+add_test(NAME manifest_simplefoam_not_drifted
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/of_manifest.py simpleFoam
+                 --check ${CMAKE_CURRENT_SOURCE_DIR}/manifest/simpleFoam.yaml)
+
 add_executable(test_rho_kepsilon_cuda tests/test_rho_kepsilon_cuda.cu)
 target_include_directories(test_rho_kepsilon_cuda PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_rho_kepsilon_cuda PRIVATE brae_core)
