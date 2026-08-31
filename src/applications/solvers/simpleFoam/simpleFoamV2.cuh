@@ -18,6 +18,7 @@
 // implementation runs, not on whether the answer is checked: when it is off nothing changes, and when it
 // is on the case either runs on the new path or stops.
 #include <string>
+#include "cf_types.cuh"   // scalar
 #include <vector>
 
 namespace brae {
@@ -60,6 +61,21 @@ bool simpleFoamV2Selected();
 // outside the envelope -- the caller must NOT catch it and fall back.
 // Returns the number of SIMPLE iterations performed.
 int runSimpleFoamV2(const std::string& caseDir);
+
+// What `laplacianSchemes` asked for: whether the non-orthogonal correction is on, and the name of a
+// scheme that is recognised but not ported (empty when there is none). Hoisted from the .cu so the
+// parse is unit-testable -- the `limited 0` conflation lived unseen while nothing could call it.
+struct LaplacianScheme
+{
+    bool        corrected = true;   // OpenFOAM's default when the word is absent
+    // `limited <k> corrected`: limitedSnGrad's coefficient. limitCoeff = 0 is this struct's OWN
+    // "no limiter" sentinel (what k = 1 reduces to) -- it is NOT what `limited 0` means: the limiter
+    // min(k*|orth|/((1-k)*|corr| + SMALL), 1) at k = 0 is identically zero, so `limited 0` suppresses
+    // the correction entirely and maps to corrected = false.
+    scalar      limitCoeff = 0.0;
+    std::string unsupported;
+};
+LaplacianScheme laplacianScheme(const std::string& caseDir);
 
 } // namespace gpu
 } // namespace brae

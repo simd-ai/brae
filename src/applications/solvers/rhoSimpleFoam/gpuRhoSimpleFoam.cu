@@ -339,6 +339,17 @@ int main(int argc, char** argv)
         // epsilon reaction is a DIFFERENT expression (deviceEpsReactionRealizable, strain-based) that has
         // NOT been rho-weighted -- accepting it here would run an unweighted reaction and converge wrong.
         const bool keStandard = !ctl.sst && !ctl.sa && !ctl.keCoeffs.realizable;
+        // kOmegaSSTLM sets ctl.sst=true (it IS kOmegaSST plus the gamma-ReThetat transition
+        // transport), so it sailed through the guard below and ran as PLAIN SST -- the transition
+        // equations exist only on the incompressible drivers (ctl.lm is consulted nowhere in this
+        // file). A laminar-turbulent transition case run fully turbulent converges to the wrong nut
+        // everywhere the flow should still be laminar.
+        if (ctl.turbulent && ctl.lm)
+            throw std::runtime_error(
+                "brae: rhoSimpleFoam does not port kOmegaSSTLM -- the gamma-ReThetat transition "
+                "equations are wired on the incompressible drivers only, and running the underlying "
+                "kOmegaSST without them is a different model. Refusing rather than ignoring the "
+                "transition.");
         if (ctl.turbulent && !ctl.sst && !keStandard)
             throw std::runtime_error(
                 "brae: rhoSimpleFoam supports kOmegaSST and kEpsilon so far. SpalartAllmaras and "

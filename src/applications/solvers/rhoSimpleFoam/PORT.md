@@ -1881,3 +1881,30 @@ OpenFOAM's on this shape -- identical at 200, 600 and 1200 iterations, so it is 
 not convergence depth -- while the V2 device path reaches 4.6e-11 on the same case. Something in the
 host mirror's inletOutlet handling (valueFraction timing, or the outlet's role in assembly) differs
 from OpenFOAM at the 3e-06 level. Not chased here.
+
+## Three small holes: mixedEnergy's refValue, the ramp key, and pRefValue's silent zero
+
+- The reader parsed `refValue` only under `type mixed`; **mixedEnergy** -- OpenFOAM's own spelling for
+  a mixed he patch, and what OF WRITES into an he output file -- lost it, so a restart rebuilt the
+  patch around refValue = 0. Gate arm: a mixedEnergy file keeps refValue 420000 (fail-proof: has=0
+  val=0). restart_vs_openfoam and io_vs_openfoam re-run green.
+- **`ramp`** on surfaceNormalFixedValue/uniformNormalFixedValue is a Function1 of time multiplying the
+  value every updateCoeffs (surfaceNormalFixedValueFvPatchVectorField.C:63-65); it fell into the
+  unhandled-key skip -- a constant inlet where the case asked for a ramp. Now marked and refused by
+  name through the existing Function1 machinery.
+- **`pRefValue`** was scalarOr(0.0) where findRefCell.C's readEntry FATALS -- a forgotten entry
+  re-levelled every all-Neumann case to absolute 0 (and rho with it, compressibly). Refused by name;
+  arm in ffp_vs_openfoam reuses the rhoBoxP workdir with the entry deleted.
+
+## Two more holes: `limited 0` ran the full correction, kOmegaSSTLM ran as plain SST compressibly
+
+- V2's laplacianSchemes parse mapped `limited 0` onto its OWN no-limiter sentinel (limitCoeff = 0
+  means "plain corrected" internally), so a case asking for a fully SUPPRESSED correction got the
+  FULL one -- while the parse's own doc comment stated the right algebra (limiter = min(k*|orth|/
+  ((1-k)*|corr|+SMALL),1), identically zero at k = 0). The parse was file-local and untestable; it is
+  hoisted into simpleFoamV2.cuh and gated by test_v2_laplacian_parse (six spellings, incl.
+  turbineSiting's `limited corrected 0.33`). Fail-proof: branch removed -> the `limited 0` check fails.
+- kOmegaSSTLM sets ctl.sst = true (it IS kOmegaSST plus gamma-ReThetat), so it sailed through
+  gpuRhoSimpleFoam's !ctl.sst guard and ran as PLAIN SST -- ctl.lm is consulted nowhere in that file;
+  the transition equations exist only on the incompressible drivers. Refused by name now, with an arm
+  on sst_vs_openfoam (mutated dict, refusal must name kOmegaSSTLM; the main SST run is the control).

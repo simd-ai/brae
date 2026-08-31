@@ -99,3 +99,16 @@ if checked < 5:
 print(f"sst_vs_openfoam: {bad} failures over {checked} fields")
 sys.exit(1 if bad else 0)
 PY
+
+# kOmegaSSTLM must be REFUSED compressibly, not run as the plain SST it sets ctl.sst for -- the
+# gamma-ReThetat transition equations are wired on the incompressible drivers only. The mutation only
+# touches the dict, so the refusal fires before any field is read.
+LMW=$(mktemp -d); trap 'rm -rf "$LMW"' EXIT
+cp -r "$WORK"/* "$LMW/"   # the main arm's workdir, mesh already built
+sed -i 's/kOmegaSST;/kOmegaSSTLM;/' "$LMW/constant/turbulenceProperties"
+grep -q "kOmegaSSTLM" "$LMW/constant/turbulenceProperties" || { echo "FAIL: LM mutation did not apply"; exit 1; }
+lmout=$("$BUILD/brae_rhoSimpleFoam" -case "$LMW" 2>&1) && { echo "FAIL: kOmegaSSTLM ran compressibly as plain SST"; exit 1; }
+echo "$lmout" | grep -q "kOmegaSSTLM" \
+    && echo "PASS(lm-refused)" \
+    || { echo "$lmout" | tail -4; echo "FAIL: the refusal does not name kOmegaSSTLM"; exit 1; }
+

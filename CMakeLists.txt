@@ -606,6 +606,11 @@ add_test(NAME frozen_bc_guard COMMAND test_frozen_bc_guard)
 add_test(NAME frozen_bc_refusals COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/frozen_bc_refusals.sh)
 set_tests_properties(frozen_bc_refusals PROPERTIES SKIP_RETURN_CODE 77)
 
+add_executable(test_v2_laplacian_parse tests/test_v2_laplacian_parse.cu)
+target_include_directories(test_v2_laplacian_parse PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_v2_laplacian_parse PRIVATE brae_core)
+add_test(NAME v2_laplacian_parse COMMAND test_v2_laplacian_parse)
+
 add_test(NAME manifest_rhosimplefoam_not_drifted
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/of_manifest.py rhoSimpleFoam
                  --check ${CMAKE_CURRENT_SOURCE_DIR}/manifest/rhoSimpleFoam.yaml)

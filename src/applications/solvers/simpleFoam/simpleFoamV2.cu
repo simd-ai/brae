@@ -300,16 +300,11 @@ bool divUBounded(const std::string& caseDir)
 // blocked on either block and so refused pitzDailyTurb, a case whose laplacian is orthogonal and which
 // the rebuilt path handles exactly.
 //
-// What `laplacianSchemes` asked for: whether the non-orthogonal correction is on, and the name of a
-// scheme that is recognised but not ported (empty when there is none).
-struct LaplacianScheme
-{
-    bool        corrected = true;   // OpenFOAM's default when the word is absent
-    // `limited <k> corrected`: limitedSnGrad's coefficient. 0 means no limiter (plain `corrected`),
-    // which is also what k >= 1 reduces to.
-    scalar      limitCoeff = 0.0;
-    std::string unsupported;
-};
+} // anonymous namespace (laplacianScheme has EXTERNAL linkage -- declared in simpleFoamV2.cuh)
+
+// LaplacianScheme is declared in simpleFoamV2.cuh -- hoisted so the parse is unit-testable
+// (tests/test_v2_laplacian_parse): the `limited 0` conflation below survived precisely because
+// nothing outside this file could call it.
 
 // Both halves of `corrected` are now implemented on both paths (fvm.cuh; UEqn.cu; pEqn.cu), so this READS
 // the scheme instead of refusing it. OpenFOAM's default when the word is absent IS corrected, so an absent
@@ -364,6 +359,8 @@ LaplacianScheme laplacianScheme(const std::string& caseDir)
         }
         if (!got || coeff < 0.0 || coeff > 1.0)
             r.unsupported = "limited";
+        else if (coeff <= 1e-12)
+            r.corrected = false;    // `limited 0`: the limiter is identically zero -- `uncorrected`
         else if (std::fabs(coeff - 1.0) > 1e-12)
             r.limitCoeff = coeff;   // `limited 1` needs no limiter at all
         return r;
@@ -373,6 +370,8 @@ LaplacianScheme laplacianScheme(const std::string& caseDir)
     { r.corrected = false; return r; }
     return r;   // `corrected` or unspecified
 }
+
+namespace {   // reopened
 
 bool switchOn(const FoamDict& d, const std::string& key, bool def)
 {
