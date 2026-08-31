@@ -154,4 +154,14 @@ mixture
 }
 EOF
 
-"$BIN" "$W/case" 0 "$ITERS" $UNPORTED $UNPORTEDNUT $UNPORTEDATM $LIQUIDTHERMO
+# ...and a PER-STEP boundary no rhoSimpleFoam mirror driver maintains: fixedMean freezes at the file
+# `value` on this path (the NVRTC/collect* hooks live in gpuPimpleFoam/gpuSimpleFoam), so createFields
+# must refuse it at the read site. Mutating p catches it on the FIRST field read.
+UNMAINTAINED="$W/unmaintained"
+mkdir -p "$UNMAINTAINED"
+cp "$W/case/0/"* "$UNMAINTAINED/" 2>/dev/null || true
+sed -i '0,/type\s*zeroGradient;/s//type            fixedMean;\n        meanValue       uniform 101325;\n        value           uniform 101325;/' "$UNMAINTAINED/p"
+grep -q "fixedMean" "$UNMAINTAINED/p" \
+    || { echo "FAIL: could not build the unmaintained-BC fixture"; exit 1; }
+
+"$BIN" "$W/case" 0 "$ITERS" $UNPORTED $UNPORTEDNUT $UNPORTEDATM $LIQUIDTHERMO $UNMAINTAINED

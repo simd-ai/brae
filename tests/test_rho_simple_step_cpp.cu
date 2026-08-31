@@ -787,6 +787,31 @@ int main(int argc, char** argv)
         std::printf("     %-34s %s\n", "liquid-thermo fixture not supplied", "SKIP");
     }
 
+    // ---- THE REFUSAL: a per-step boundary this driver cannot maintain --------------------------------
+    // The factory accepts fixedMean/fanPressure/coded because gpuPimpleFoam recomputes them every step;
+    // no rhoSimpleFoam mirror driver does, so a patch built here would freeze at the file `value`.
+    // argv[8] is a time directory whose p carries fixedMean; createFields must refuse it by name.
+    std::printf("  refusal -- a per-step boundary (fixedMean) the mirror cannot maintain\n");
+    if (argc > 8)
+    {
+        bool threw = false;
+        std::string msg;
+        try
+        {
+            (void)cpu::rhoSimple::createFields(std::string(argv[8]), caseDir,
+                                               simpleDict, &fvSolution, m, g, patches);
+        }
+        catch (const std::exception& e) { threw = true; msg = e.what(); }
+        check("a fixedMean patch is refused", threw);
+        check("and the refusal says the boundary would freeze",
+              msg.find("fixedMean") != std::string::npos
+           && msg.find("never updates") != std::string::npos);
+    }
+    else
+    {
+        std::printf("     %-34s %s\n", "unmaintained-BC fixture not supplied", "SKIP");
+    }
+
     // ---- THE REFUSAL: a turbulent case must be refused BY NAME, not run as laminar. ----
     std::printf("  refusal -- an unported RAS model\n");
     if (argc > 4)

@@ -1672,8 +1672,13 @@ validate(); brae has no wall-function evaluation at createFields).
 - The legacy gpuRhoSimpleFoam driver still accepts fixedMean/fanPressure/coded and freezes them at the
   file `value` (hole 6's guard is not wired there; the legacy path is frozen by policy). No validation
   case reaches it with those types today.
-- The rho mirror createFields does not yet call `refuseFrozenPerStepBC` (hole 6B): a fixedMean he/p on
-  the mirror path would still freeze. Next unit.
+- Hole 6B closed: every rho mirror field read goes through `guardRead` -> `refuseFrozenPerStepBC`
+  (one guard covers both arms -- the device structures are built from the host fields). The factory
+  comment that promised "the solver recomputes refValue every step" now names WHICH drivers do.
+- Found by the 6B fail-proof, as a segfault: a fixedValue-family patch whose `value` list is missing or
+  short read PAST the vector in evaluate(). The FixedValuePatchField constructor now refuses it by
+  name, as OpenFOAM does (readEntry fatals). The fail-proof fixture that exposed it shipped
+  `type fixedMean;` with no value entry.
 - test_rho_simple_step_cpp's coefficient-reach control is skipped on frozen fixtures -- the loop
   deliberately never reads the coefficients there; the frozen arm asserts the half that exists (Cmu
   reaches validate()).

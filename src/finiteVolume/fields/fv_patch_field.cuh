@@ -206,7 +206,17 @@ public:
         bool uniform,
         T uval,
         std::vector<T> vals)
-        : fvPatchField<T>(p), uniform_(uniform), uniformValue_(uval), values_(std::move(vals)) {}
+        : fvPatchField<T>(p), uniform_(uniform), uniformValue_(uval), values_(std::move(vals))
+    {
+        // A nonuniform patch whose list does not cover the patch used to read PAST the vector in
+        // evaluate() -- found as a segfault when a fixture's fixedMean patch shipped no `value` entry.
+        // OpenFOAM refuses the same file (fvPatchField reads "value" with readEntry, which fatals).
+        if (!uniform_ && static_cast<label>(values_.size()) != p.size)
+            throw std::runtime_error(
+                "brae: patch '" + p.name + "' (fixedValue family) has " +
+                std::to_string(values_.size()) + " values for " + std::to_string(p.size) +
+                " faces -- the file's `value` entry is missing or short. OpenFOAM refuses this too.");
+    }
     void evaluate(const std::vector<T>&) override
     {
         for (label i = 0; i < this->patch_.size; ++i)
@@ -1496,8 +1506,12 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
             "with a constant, or use codedFixedValue.");
     }
     // fixedMean: a fixedValue whose face values are the adjacent cell values, shifted or scaled so their
-    // area-weighted mean equals `meanValue` (OF fixedMeanFvPatchField). Seeded from `value`; the solver
-    // recomputes refValue every step, exactly as it does for codedFixedValue and fanPressure.
+    // area-weighted mean equals `meanValue` (OF fixedMeanFvPatchField). Seeded from `value`; ONLY
+    // gpuPimpleFoam recomputes it per step (collectFixedMean / collectFanPressure, and setupCodedBCs on
+    // gpuSimpleFoam too for the coded pair). Every driver without those hooks must refuse at its READ
+    // sites via frozen_bc_guard.cuh -- this factory cannot, because it does not know its caller, and
+    // the earlier version of this comment claimed "the solver" did it unconditionally: the
+    // unhonoured-contract pattern this tree keeps finding, with the freeze silent.
     if (d.type == "fixedMean")
         return std::make_unique<FixedValuePatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     if (d.type == "fixedValue" || d.type == "uniformFixedValue" || d.type == "codedFixedValue"

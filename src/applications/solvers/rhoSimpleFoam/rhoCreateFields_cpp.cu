@@ -1,5 +1,6 @@
 // _cpp REFERENCE implementation -- see createFields_cpp.cuh for the OpenFOAM provenance.
 #include "rhoCreateFields_cpp.cuh"
+#include "frozen_bc_guard.cuh"
 #include "kEpsilon_cpp.cuh"   // correctNut: turbulence->validate() before the first solve
 #include "patch_entry_lookup.cuh"   // findPatchEntry: OF patch/group/regex resolution
 #include "foam_field_reader.cuh"
@@ -273,11 +274,22 @@ RhoSimpleFields createFields(
                   " solving a different energy equation.");
     }
 
+    // NO rhoSimpleFoam mirror driver maintains a per-step boundary -- neither the _cpp loop nor the
+    // CUDA arm carries the NVRTC or collect* hooks the factory's fixedMean/fanPressure/coded acceptance
+    // is written against -- so every field read is checked here, the last place the dictionary type
+    // still exists (frozen_bc_guard.cuh). The device arm builds its structures FROM these host fields,
+    // so one guard covers both.
+    auto guardRead = [&](auto fd, const char* nm)
+    {
+        refuseFrozenPerStepBC(fd, nm, "rhoSimpleFoam (mirror)", false);
+        return fd;
+    };
+
     // p = thermo.p() and T: both read by the thermo, both MUST_READ. Read together so psi and rho below
     // are derived from the SAME state rather than from two fields that could be an iteration apart.
-    f.p = buildField<scalar>(readField<scalar>(timeDir + "/p"), patches, nC);
+    f.p = buildField<scalar>(guardRead(readField<scalar>(timeDir + "/p"), "p"), patches, nC);
     f.p.evaluateBoundary();
-    const FieldData<scalar> tFd = readField<scalar>(timeDir + "/T");
+    const FieldData<scalar> tFd = guardRead(readField<scalar>(timeDir + "/T"), "T");
     f.T = buildField<scalar>(tFd, patches, nC);
     f.T.evaluateBoundary();
 
@@ -287,7 +299,7 @@ RhoSimpleFields createFields(
     f.rhoWasRead = fileExists(rhoPath);
     if (f.rhoWasRead)
     {
-        f.rho = buildField<scalar>(readField<scalar>(rhoPath), patches, nC);
+        f.rho = buildField<scalar>(guardRead(readField<scalar>(rhoPath), "rho"), patches, nC);
         f.rho.evaluateBoundary();
     }
     else
@@ -316,7 +328,7 @@ RhoSimpleFields createFields(
     }
 
     // U: MUST_READ.
-    f.U = buildField<vector>(readField<vector>(timeDir + "/U"), patches, nC);
+    f.U = buildField<vector>(guardRead(readField<vector>(timeDir + "/U"), "U"), patches, nC);
 
     // createFields.H builds rho (line 22) BEFORE U (line 26), so when OpenFOAM constructs U's patches the
     // rho field is already registered and flowRateInletVelocity's constructor-time updateCoeffs takes the
@@ -522,7 +534,7 @@ RhoSimpleFields createFields(
                         "brae: rhoSimpleFoam `RAS { turbulence off; }` is implemented for kEpsilon only "
                         "-- the one-shot validate() below is kEpsilon's correctNut. '" + f.rasModel +
                         "' frozen would start from the wrong nut. Refusing.");
-                f.k   = buildField<scalar>(readField<scalar>(timeDir + "/k"), patches, nC);
+                f.k   = buildField<scalar>(guardRead(readField<scalar>(timeDir + "/k"), "k"), patches, nC);
 
                 // THE NUT WALL FUNCTION IS PART OF THE MODEL, and only nutkWallFunction is ported here.
                 //
@@ -555,7 +567,7 @@ RhoSimpleFields createFields(
                 // buildField has run, the patch field object no longer carries it, which is why neither
                 // the host closure nor the device one could have checked.
                 {
-                    const FieldData<scalar> nutRaw = readField<scalar>(timeDir + "/nut");
+                    const FieldData<scalar> nutRaw = guardRead(readField<scalar>(timeDir + "/nut"), "nut");
                     for (const auto& b : nutRaw.boundary)
                     {
                         // TWO prefixes, because the atm family does not start with "nut":
@@ -596,17 +608,17 @@ RhoSimpleFields createFields(
                 // kEpsilon run left behind.
                 if (f.rasModel == "kOmegaSST")
                 {
-                    f.omega = buildField<scalar>(readField<scalar>(timeDir + "/omega"), patches, nC);
+                    f.omega = buildField<scalar>(guardRead(readField<scalar>(timeDir + "/omega"), "omega"), patches, nC);
                     f.omega.evaluateBoundary();
                 }
                 else
                 {
-                    f.epsilon = buildField<scalar>(readField<scalar>(timeDir + "/epsilon"), patches, nC);
+                    f.epsilon = buildField<scalar>(guardRead(readField<scalar>(timeDir + "/epsilon"), "epsilon"), patches, nC);
                     f.epsilon.evaluateBoundary();
                 }
                 if (fileExists(timeDir + "/alphat"))
                 {
-                    const FieldData<scalar> aFd = readField<scalar>(timeDir + "/alphat");
+                    const FieldData<scalar> aFd = guardRead(readField<scalar>(timeDir + "/alphat"), "alphat");
                     f.alphat = buildField<scalar>(aFd, patches, nC);
                     f.alphat.evaluateBoundary();
                     // Which patches carry compressible::alphatWallFunction, and each one's own Prt --
