@@ -589,6 +589,51 @@ int main(int argc, char** argv)
 
         gpu::rhoSimple::rhoSimpleStep(gf, w, dm, dbU, dbP, dbHe, dbT, gin);
 
+        // DISSECTION: every field, not just the ones the summary line carries. The drift appears at
+        // iteration 2 while everything reported at iteration 1 agrees to ~1e-11, and an amplification of
+        // 3e5 inside one iteration is not what smooth arithmetic does -- so a field NOT being watched
+        // has almost certainly already parted at iteration 1 and is feeding forward. This looks at all
+        // of them, boundaries included, and names the first one that has.
+        if (turbulentArm)
+        {
+            auto bndOf = [&](const GeometricField<scalar>& f) { return flatBnd(f, fvp, dm.nBndFaces, 0.0); };
+            std::vector<scalar> hUxB(dm.nBndFaces, 0), hUyB(dm.nBndFaces, 0), hUzB(dm.nBndFaces, 0);
+            {
+                label bi = 0;
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                {
+                    const std::vector<vector>& b = hf.U.boundary[pi]->value();
+                    for (label i = 0; i < fvp[pi].size && bi < dm.nBndFaces; ++i, ++bi)
+                    { hUxB[bi] = b[i].x; hUyB[bi] = b[i].y; hUzB[bi] = b[i].z; }
+                }
+            }
+            std::vector<scalar> hPhiB(dm.nBndFaces, 0);
+            {
+                label bi = 0;
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                    for (label i = 0; i < fvp[pi].size && bi < dm.nBndFaces; ++i, ++bi)
+                        hPhiB[bi] = hf.phi.boundary[pi][i];
+            }
+            const struct { const char* n; double v; } row[] = {
+                { "psi",        relL2(gf.psi.host(),       hf.psi) },
+                { "psiBnd",     relL2(gf.psiBnd.host(),    flat(hf.psiBnd, fvp, dm.nBndFaces, 0.0)) },
+                { "rhoThermo",  relL2(gf.rhoThermo.host(), hf.rhoThermo) },
+                { "nutBnd",     relL2(gf.nutBnd.host(),    bndOf(hf.nut)) },
+                { "alphat",     relL2(gf.alphat.host(),    hf.alphat.internal) },
+                { "UxBnd",      relL2(gf.UxBnd.host(),     hUxB) },
+                { "UyBnd",      relL2(gf.UyBnd.host(),     hUyB) },
+                { "UzBnd",      relL2(gf.UzBnd.host(),     hUzB) },
+                { "pBnd",       relL2(gf.pBnd.host(),      bndOf(hf.p)) },
+                { "TBnd",       relL2(gf.TBnd.host(),      bndOf(hf.T)) },
+                { "heBnd",      relL2(gf.heBnd.host(),     bndOf(hf.he)) },
+                { "rhoBnd",     relL2(gf.rhoBnd.host(),    bndOf(hf.rho)) },
+                { "phiBnd",     relL2(gf.phiBnd.host(),    hPhiB) },
+            };
+            std::printf("       (unwatched)");
+            for (const auto& r : row) if (r.v > 1e-9) std::printf("  %s %.2e", r.n, r.v);
+            std::printf("   [only >1e-9 shown]\n");
+        }
+
         // THE CLOSURE'S OWN OUTPUTS, per iteration. The trajectory says the two drivers separate from
         // iteration 2 -- which is the first iteration whose inputs carry the closure's result -- but not
         // WHICH of k, epsilon or nut moved first. A whole-field U number cannot answer that; these can.

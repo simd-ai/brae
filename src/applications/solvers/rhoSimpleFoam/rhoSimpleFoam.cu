@@ -516,6 +516,21 @@ Residuals rhoSimpleStep(
             deviceCopy(shim.rAtU, st.rAU);
         }
         correctVelocity(f.Ux, f.Uy, f.Uz, shim, gpx, gpy, gpz);
+
+        // U.correctBoundaryConditions() -- pEqn.H:87 and pcEqn.H:100, on the line IMMEDIATELY after
+        // `U = HbyA - rAU*fvc::grad(p)`. The driver refreshed U's boundary once, before the energy
+        // equation, and never again: from the velocity correction onward f.UxBnd/UyBnd/UzBnd held the
+        // values U had BEFORE the pressure correction, for the rest of the iteration and into the next.
+        //
+        // Found by comparing every field against the host reference rather than the handful the driver
+        // gate reports. At the end of iteration 1 on sbMatched every reported field agreed to ~1e-12
+        // while UxBnd was out by 6.81e-01 and UyBnd/UzBnd by 1.00e+00 -- entirely different values, not
+        // a drift. It fed forward through everything that reads U's patch values: fvc::div(phi, Ekp)
+        // evaluates Ekp on boundary faces, the closure's production and its turbulentIntensity inlet
+        // both read U_b, and the next iteration's flux switch reads the boundary flux built from it.
+        deviceBCValue(dbU.comp[0], f.Ux, f.UxBnd);
+        deviceBCValue(dbU.comp[1], f.Uy, f.UyBnd);
+        deviceBCValue(dbU.comp[2], f.Uz, f.UzBnd);
     }
 
     // pressureControl.limit(p), HERE and not earlier: pEqn.H applies it after the velocity correction, so

@@ -1559,3 +1559,41 @@ a live cell rho and a stale boundary rho. OF's `compressibleTurbulenceModel::phi
 `phi_/fvc::interpolate(rho_)` on the model's own field, which the tail's `rho = thermo.rho(); rho.relax();`
 has already moved. Now live on both. Neutral on the OpenFOAM-oracle gates (3/3) and on the arm; kept
 because it removes an inconsistency inside one function rather than because anything measures it.
+
+### Dissection: comparing EVERY field, and what it found
+
+The drift resisted five hypotheses picked off one at a time. What worked was comparing every field the
+two drivers hold rather than the handful the gate reports -- boundaries included. At the end of
+iteration 1, with every reported field at ~1e-12:
+
+    UxBnd 6.81e-01    UyBnd 1.00e+00    UzBnd 1.00e+00
+
+A relative difference of exactly one is not drift; those were unrelated values.
+
+**U's boundary was never refreshed after the velocity correction.** `pEqn.H:86-87` and `pcEqn.H:99-100`
+are `U = HbyA - rAU*fvc::grad(p);` followed IMMEDIATELY by `U.correctBoundaryConditions();`, and the host
+reference calls `evaluateBoundary()` at four points including that one. The CUDA driver refreshed U's
+boundary once, at rhoSimpleFoam.cu:350 before the energy equation, and never again -- so from the
+velocity correction onward `f.UxBnd/UyBnd/UzBnd` held the values U had BEFORE the pressure correction,
+for the rest of the iteration and into the next. Fixed; the three now read <1e-09, 2.06e-09, 2.00e-09.
+
+**It is NOT the cause of the drift.** With it fixed the iteration-2 trajectory is bit-identical. The
+staleness was LATENT: the one consumer that reads `f.UxBnd` -- the energy equation, through
+fvc::div(phi, Ekp) on boundary faces -- re-evaluates it at :350 before use, so the stale value never
+reached anything. Correct, verified against OpenFOAM, and unobservable in this arm. Recorded as such
+rather than credited with a fix it did not make.
+
+### Where the drift is now localised
+
+The remaining divergence is concentrated in the BOUNDARY fields, an order above the cell fields:
+
+    iter 2   phiBnd 8.24e-05   TBnd 5.11e-05   psiBnd 5.12e-05   rhoBnd 4.94e-05   nutBnd 2.19e-05
+             against Ux 2.92e-06
+
+and the residual `UyBnd/UzBnd` 2.06e-09 at iteration 1 stands ~1000x above every other field at that
+point. So the next thread is boundary EVALUATION -- not the closure, which reproduces the host's call to
+4.4e-12, and not the cell arithmetic.
+
+NOTE, so it is not chased again: `rhoThermo` shows 1.78e-03 in that dump and is a FALSE POSITIVE. This
+arm runs the HOST thermo hooks, so `gf.rhoThermo` is neither written nor read; it is stale by
+construction and reaches nothing.
