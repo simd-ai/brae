@@ -407,7 +407,6 @@ Residuals rhoSimpleStep(
     pin.adjustable = in.adjustable;
     pin.hasMRF = in.hasMRF;
     pin.hasFvOptions = in.hasFvOptions;
-    pin.hasFixedFluxPressure = in.hasFixedFluxPressure;
     pin.hasCoupledPatches = in.hasCoupledPatches;
     pin.fvOptionUnsupported = in.fvOptionUnsupported;
 

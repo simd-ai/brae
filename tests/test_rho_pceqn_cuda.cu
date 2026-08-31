@@ -432,7 +432,7 @@ int main(int argc, char** argv)
         struct { const char* what; int which; } cases[] = {
             {"MRF is refused on the CUDA path",        0},
             {"an unported fvOptions is refused",       1},
-            {"fixedFluxPressure is refused",           2},
+            // fixedFluxPressure: no longer refused -- deviceConstrainPressure at pcEqn.H:16.
             {"a mesh with coupled patches is refused", 3},
         };
         for (const auto& cse : cases)
@@ -440,7 +440,6 @@ int main(int argc, char** argv)
             gpu::rhoSimple::RhoPressureInput bad = gpin;
             if (cse.which == 0) bad.hasMRF = true;
             if (cse.which == 1) bad.hasFvOptions = true;
-            if (cse.which == 2) bad.hasFixedFluxPressure = true;
             if (cse.which == 3) bad.hasCoupledPatches = true;
             gpu::rhoSimple::ConsistentPressureStages sb;
             bool threw = false;

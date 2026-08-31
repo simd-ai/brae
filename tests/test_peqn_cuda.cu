@@ -312,14 +312,14 @@ int main(int argc, char** argv)
     std::printf("  -- masks and refusals\n");
     check(masksDiffer, "assignable and fixesValue masks DIFFER on this case (control)");
     // `consistent` is no longer here: SIMPLEC is implemented and is exercised above. fixedFluxPressure
-    // takes its place -- pEqn.H reaches it through constrainPressure, which is not ported.
-    const char* names[3] = {"MRF", "fvOptions", "fixedFluxPressure"};
-    for (int which = 0; which < 3; ++which)
+    // takes its place. fixedFluxPressure left too: deviceConstrainPressure is wired at pEqn.H:21,
+    // and a never-updated patch refuses on the HOST at coefficient time (requireUpdated).
+    const char* names[2] = {"MRF", "fvOptions"};
+    for (int which = 0; which < 2; ++which)
     {
         gpu::PressureInput bad = gpin;
         if (which == 0) bad.hasMRF = true;
-        else if (which == 1) bad.hasFvOptions = true;
-        else bad.hasFixedFluxPressure = true;
+        else bad.hasFvOptions = true;
         gpu::PressureStages s2;
         bool threw = false;
         try { gpu::pressurePredictor(s2, dm, dbU, MU, dUx, dUy, dUz, bad, &dbP, &dP); }

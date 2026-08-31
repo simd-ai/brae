@@ -216,7 +216,7 @@ struct RhoStepInput
     const DeviceBuffer<scalar>*              frNz    = nullptr;
 
     // --- refusals, each thrown by the component that owns the term ---
-    bool hasMRF = false, hasFvOptions = false, hasFixedFluxPressure = false, hasCoupledPatches = false;
+    bool hasMRF = false, hasFvOptions = false, hasCoupledPatches = false;
     std::string fvOptionUnsupported;
 
     // thermo.correct(): recover T from he, then psi from that T. A hook because it is a THERMO operation

@@ -1,6 +1,7 @@
 // cf GPU offload (G7): SIMPLE coupling-glue kernels. matrixH and matrixFlux reuse the ownerStart/losort
 // gather; rAU / corrector are elementwise; the HbyA flux is a per-face vector interpolation dotted with Sf.
 #include <stdexcept>
+#include "device_boundary.cuh"
 #include <string>
 #include "device_simple.cuh"
 #include <cmath>
@@ -240,10 +241,11 @@ void adjustScaleKernel(
 } // namespace
 scalar deviceAdjustPhi(const DeviceBuffer<label>& adjustable,
                        DeviceBuffer<scalar>& phiB,
-                       const DeviceBuffer<scalar>* phiInt)
+                       const DeviceBuffer<scalar>* phiInt,
+                       bool* closedVolume)
 {
     const int n = static_cast<int>(phiB.size());
-    if (n == 0) return 1.0;
+    if (n == 0) { if (closedVolume) *closedVolume = true; return 1.0; }
     DeviceBuffer<scalar> sums(4);
     cudaCheck(cudaMemset(sums.data(), 0, 4 * sizeof(scalar)), "adjustPhi memset");
     adjustReduceKernel<<<nBlocks(n), TPB>>>(n, adjustable.data(), phiB.data(), sums.data());
@@ -291,6 +293,10 @@ scalar deviceAdjustPhi(const DeviceBuffer<label>& adjustable,
     }
     adjustScaleKernel<<<nBlocks(n), TPB>>>(n, adjustable.data(), massCorr, phiB.data());
     cudaCheck(cudaGetLastError(), "adjustPhi");
+    if (closedVolume)
+        *closedVolume = std::fabs(massIn)   / totalFlux < kSmall
+                     && std::fabs(fixedOut) / totalFlux < kSmall
+                     && std::fabs(adjOut)   / totalFlux < kSmall;
     return massCorr;
 }
 void deviceSetReference(DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& b, label refCell, scalar refValue)
@@ -373,6 +379,64 @@ void deviceBoundaryFlux(
     bndFluxKernel<<<nBlocks(dm.nBndFaces), TPB>>>(dm.nBndFaces, dm.bndGFace.data(), dm.Sfx.data(), dm.Sfy.data(),
                                                   dm.Sfz.data(), uxb.data(), uyb.data(), uzb.data(), phiB.data());
     cudaCheck(cudaGetLastError(), "bndFlux");
+}
+
+namespace
+{
+__global__ void constrainPressureKernel(
+    int                        n,
+    const label*  __restrict__ mask,
+    const scalar* __restrict__ phiHbyABnd,
+    const scalar* __restrict__ sfUBnd,
+    const scalar* __restrict__ rhoBnd,     // null = 1 (incompressible)
+    const scalar* __restrict__ denBnd,
+    const scalar* __restrict__ magSf,
+    scalar*       __restrict__ refGrad)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || !mask[i]) return;
+    const scalar rho = rhoBnd ? rhoBnd[i] : scalar(1);
+    refGrad[i] = (phiHbyABnd[i] - rho * sfUBnd[i]) / (magSf[i] * denBnd[i]);
+}
+
+__global__ void ownerGatherKernel(
+    int                        n,
+    const label*  __restrict__ bndCell,
+    const scalar* __restrict__ cellField,
+    scalar*       __restrict__ bnd)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    bnd[i] = cellField[bndCell[i]];
+}
+} // namespace
+
+void deviceConstrainPressure(
+    const DeviceBoundary&       dbP,
+    const DeviceBuffer<scalar>& phiHbyABnd,
+    const DeviceBuffer<scalar>& sfUBnd,
+    const scalar*               rhoBnd,
+    const DeviceBuffer<scalar>& denBnd)
+{
+    const int n = static_cast<int>(dbP.snGradMask.size());
+    if (n == 0) return;   // empty boundary; a mask of zeros makes the kernel itself a no-op
+    constrainPressureKernel<<<(n + 255) / 256, 256>>>(
+        n, dbP.snGradMask.data(), phiHbyABnd.data(), sfUBnd.data(), rhoBnd, denBnd.data(),
+        dbP.magSf.data(),
+        const_cast<DeviceBuffer<scalar>&>(dbP.refGrad).data());
+    cudaCheck(cudaGetLastError(), "deviceConstrainPressure");
+}
+
+void deviceOwnerGather(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& cellField,
+    DeviceBuffer<scalar>&       bnd)
+{
+    bnd.resize(dm.nBndFaces);
+    if (dm.nBndFaces == 0) return;
+    ownerGatherKernel<<<(dm.nBndFaces + 255) / 256, 256>>>(
+        dm.nBndFaces, dm.bndCell.data(), cellField.data(), bnd.data());
+    cudaCheck(cudaGetLastError(), "deviceOwnerGather");
 }
 void deviceRelaxDiag(
     const DeviceLduView& A,

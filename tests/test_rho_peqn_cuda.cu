@@ -496,7 +496,9 @@ int main(int argc, char** argv)
         struct { const char* what; int which; } cases[] = {
             {"MRF is refused on the CUDA path",                0},
             {"an unported fvOptions is refused",               1},
-            {"fixedFluxPressure is refused",                   2},
+            // fixedFluxPressure is no longer refused: deviceConstrainPressure is wired at pEqn.H:12,
+            // gated by ffp_vs_openfoam's cuda arm; a never-updated patch refuses on the HOST at read
+            // time via FixedFluxPressurePatchField::requireUpdated before the device is ever built.
             {"a mesh with coupled patches is refused",         3},
         };
         for (const auto& cse : cases)
@@ -504,7 +506,6 @@ int main(int argc, char** argv)
             gpu::rhoSimple::RhoPressureInput bad = gpin;
             if (cse.which == 0) bad.hasMRF = true;
             if (cse.which == 1) bad.hasFvOptions = true;
-            if (cse.which == 2) bad.hasFixedFluxPressure = true;
             if (cse.which == 3) bad.hasCoupledPatches = true;
             gpu::rhoSimple::RhoPressureStages sb;
             bool threw = false;

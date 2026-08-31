@@ -46,7 +46,7 @@ static void check(const std::string& what, bool ok)
 
 // One call, reporting whether it threw and what it returned. `adjOut` is placed on an adjustable face,
 // `fixedOut` on a non-adjustable one, and `massIn` as a negative (inflow) face.
-struct Result { bool threw = false; scalar massCorr = 0; std::string msg; };
+struct Result { bool threw = false; scalar massCorr = 0; bool closedVolume = true; std::string msg; };
 
 static Result run(scalar massIn, scalar fixedOut, scalar adjOut, scalar internalFlux)
 {
@@ -61,7 +61,7 @@ static Result run(scalar massIn, scalar fixedOut, scalar adjOut, scalar internal
     DeviceBuffer<scalar> dPhiInt(std::vector<scalar>{ internalFlux });
 
     Result r;
-    try { r.massCorr = deviceAdjustPhi(dAdj, dPhiB, &dPhiInt); }
+    try { r.massCorr = deviceAdjustPhi(dAdj, dPhiB, &dPhiInt, &r.closedVolume); }
     catch (const std::exception& e) { r.threw = true; r.msg = e.what(); }
     return r;
 }
@@ -138,6 +138,23 @@ int main()
                     small.threw ? "refused" : "adjusted", large.threw ? "refused" : "adjusted");
         check("totalFlux includes the INTERNAL faces (the two cases differ)",
               small.threw != large.threw);
+    }
+
+    // ---- 6. closedVolume is MEASURED, not implied by the call having run. ----
+    // OF adjustPhi.C:145-147 returns `closed` only when massIn, fixedMassOut AND adjustableMassOut are
+    // ALL negligible against totalFlux. The device drivers used to hardcode `closedVolume = true` after
+    // deviceAdjustPhi -- right on every genuinely closed fixture, and wrong on rhoBoxP (an OPEN case
+    // whose p is all-Neumann via an inletOutlet outlet), where the closed-volume mass correction then
+    // shifted p by a uniform +43 Pa per outer iteration while the residual sat at 8.6e-15.
+    std::printf("  6. closedVolume is measured from the fluxes\n");
+    {
+        const Result open   = run(3.0, 0.5, 2.0, 10.0);      // real through-flow
+        const Result closed = run(1e-20, 1e-20, 1e-20, 10.0); // every boundary flux negligible
+        check("a through-flow case is NOT closed", !open.threw && !open.closedVolume);
+        check("an all-negligible boundary IS closed", !closed.threw && closed.closedVolume);
+        // the two cases must DISAGREE, or a hardcoded value passes both
+        check("...and the two disagree (a hardcoded answer cannot)",
+              open.closedVolume != closed.closedVolume);
     }
 
     if (failures == 0) std::printf("PASS\n");

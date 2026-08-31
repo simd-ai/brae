@@ -129,12 +129,6 @@ void refuseUnsupported(const RhoPressureInput& in)
                                               : std::string(" (") + in.fvOptionUnsupported + ")")
             + ". pcEqn.H applies fvOptions(psi, p, rho.name()).");
     }
-    if (in.hasFixedFluxPressure)
-    {
-        throw std::runtime_error(
-            "rhoSimpleFoam pcEqn(cuda): the case uses fixedFluxPressure, whose boundary gradient is set "
-            "by constrainPressure -- not ported. Refusing rather than solving with a zeroGradient.");
-    }
     if (in.hasCoupledPatches)
     {
         throw std::runtime_error(
@@ -251,6 +245,16 @@ void consistentPressurePredictor(
     deviceCopy(st.phiHbyAInt, st.phiHbyA0Int);
     deviceCopy(st.phiHbyABnd, st.phiHbyA0Bnd);
 
+    // constrainPressure(p, rho, U, phiHbyA, rhorAtU, MRF) -- pcEqn.H:16, before the SIMPLEC correction
+    // and both branches. st.rhorAtUfBnd IS the vol field rho*rAtU's boundary (rho_b * owner rAtU),
+    // built above by rhorAtUBndKernel -- the same divisor rhoPcEqn_cpp.cu uses.
+    {
+        DeviceBuffer<scalar> ub[3], sfUBnd;
+        for (int k = 0; k < 3; ++k) deviceBCValue(dbU.comp[k], *U[k], ub[k]);
+        deviceBoundaryFlux(dm, ub[0], ub[1], ub[2], sfUBnd);
+        deviceConstrainPressure(dbP, st.phiHbyABnd, sfUBnd, in.rhoBndFace->data(), st.rhorAtUfBnd);
+    }
+
     // ---- the SIMPLEC flux correction, interpolate(rho*(rAtU - rAU))*snGrad(p)*magSf ---------
     // Built as the FLUX of a laplacian with that gamma, because gamma_f*snGrad(p)*magSf IS that flux.
     // One code path rather than a second snGrad, and it is the shape the incompressible twin uses.
@@ -343,8 +347,8 @@ void consistentPressurePredictor(
                     "rhoSimpleFoam pcEqn(cuda): adjustPhi needs the per-face `adjustable` mask, and this "
                     "case needs adjustPhi -- p has no fixed-value patch.");
             }
-            st.massCorr = deviceAdjustPhi(*in.adjustable, st.phiHbyABnd, &st.phiHbyAInt);
-            st.closedVolume = true;
+            st.massCorr = deviceAdjustPhi(*in.adjustable, st.phiHbyABnd, &st.phiHbyAInt, &st.closedVolume);
+            // closedVolume is MEASURED (adjustPhi.C:145-147), not implied by "adjustPhi ran" -- see device_simple.cuh.
         }
         deviceAxpy(1.0, corrInt, st.phiHbyAInt);
         deviceAxpy(1.0, corrBnd, st.phiHbyABnd);

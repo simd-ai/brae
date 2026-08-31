@@ -24,11 +24,6 @@ void refuseUnsupported(const PressureInput& in)
         throw std::runtime_error(
             "pEqn(cuda): the case declares fvOptions, which pEqn.H applies as fvOptions.correct(U) "
             "(pEqn.H:49). Not implemented on this path; refusing.");
-    if (in.hasFixedFluxPressure)
-        throw std::runtime_error(
-            "pEqn(cuda): a pressure patch is fixedFluxPressure, which pEqn.H updates through "
-            "constrainPressure(p, U, phiHbyA, rAtU, MRF) (pEqn.H:21) so the patch gradient matches the "
-            "flux being imposed. Not implemented; refusing rather than solving with a stale gradient.");
 }
 
 // constrainHbyA (constrainHbyA.C): on a patch whose U BC is NOT assignable, HbyA's boundary value is
@@ -243,6 +238,20 @@ void pressurePredictor(
                 deviceAxpy(1.0, t, st.HbyA[k]);
             }
         }
+    }
+
+    // constrainPressure(p, U, phiHbyA, rAtU(), MRF) -- pEqn.H:21, AFTER adjustPhi and the SIMPLEC
+    // correction, exactly where pEqn_cpp.cu puts it. Incompressible: rho is geometricOneField (null),
+    // and the divisor is rAtU's boundary value -- the owner cell's, rAtU being calculated. dbP can be
+    // null only on callers that predate the pressure-boundary plumbing; those carried no
+    // fixedFluxPressure face either (an empty mask makes the kernel a no-op regardless).
+    if (dbP)
+    {
+        DeviceBuffer<scalar> ub[3], sfUBnd, rAtUBnd;
+        for (int k = 0; k < 3; ++k) deviceBCValue(dbU.comp[k], *U[k], ub[k]);
+        deviceBoundaryFlux(dm, ub[0], ub[1], ub[2], sfUBnd);
+        deviceOwnerGather(dm, st.rAtU, rAtUBnd);
+        deviceConstrainPressure(*dbP, st.phiHbyABnd, sfUBnd, nullptr, rAtUBnd);
     }
 }
 

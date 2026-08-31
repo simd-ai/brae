@@ -143,13 +143,6 @@ void refuseUnsupported(const RhoPressureInput& in)
                                               : std::string(" (") + in.fvOptionUnsupported + ")")
             + ". pEqn.H applies fvOptions(psi, p, rho.name()) to the pressure equation.");
     }
-    if (in.hasFixedFluxPressure)
-    {
-        throw std::runtime_error(
-            "rhoSimpleFoam pEqn(cuda): the case uses fixedFluxPressure, whose boundary gradient is set by "
-            "constrainPressure(p, rho, U, phiHbyA, rhorAUf) -- not ported. Refusing rather than solving "
-            "with a zeroGradient in its place.");
-    }
     if (in.hasCoupledPatches)
     {
         throw std::runtime_error(
@@ -270,6 +263,16 @@ void pressurePredictor(
     deviceCopy(st.phiHbyAInt, st.phiHbyA0Int);
     deviceCopy(st.phiHbyABnd, st.phiHbyA0Bnd);
 
+    // constrainPressure(p, rho, U, phiHbyA, rhorAUf, MRF) -- pEqn.H:12, on the RAW phiHbyA before
+    // either branch, exactly where rhoPEqn_cpp.cu puts it. Sf&U_b is rebuilt from the CURRENT U
+    // boundary values (the constrainHbyA loop's Ub buffers are per-component temporaries).
+    {
+        DeviceBuffer<scalar> ub[3], sfUBnd;
+        for (int k = 0; k < 3; ++k) deviceBCValue(dbU.comp[k], *U[k], ub[k]);
+        deviceBoundaryFlux(dm, ub[0], ub[1], ub[2], sfUBnd);
+        deviceConstrainPressure(dbP, st.phiHbyABnd, sfUBnd, in.rhoBndFace->data(), st.rhorAUfBnd);
+    }
+
     st.closedVolume = false;
     st.massCorr = 1.0;
 
@@ -327,8 +330,10 @@ void pressurePredictor(
                     "rhoSimpleFoam pEqn(cuda): adjustPhi needs the per-face `adjustable` mask, and this "
                     "case needs adjustPhi -- p has no fixed-value patch.");
             }
-            st.massCorr = deviceAdjustPhi(*in.adjustable, st.phiHbyABnd, &st.phiHbyAInt);
-            st.closedVolume = true;
+            // closedVolume is MEASURED (adjustPhi.C:145-147), not implied by "adjustPhi ran": an
+            // open case can still need a pressure reference (all-Neumann p via inletOutlet), and
+            // hardcoding true here shifted its p by the closed-volume mass correction every iteration.
+            st.massCorr = deviceAdjustPhi(*in.adjustable, st.phiHbyABnd, &st.phiHbyAInt, &st.closedVolume);
         }
     }
 }

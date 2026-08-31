@@ -124,7 +124,6 @@ struct RhoPressureInput
 
     bool hasMRF               = false;   // MRF.makeRelative(phiHbyA) -- refused
     bool hasFvOptions         = false;   // refused
-    bool hasFixedFluxPressure = false;   // constrainPressure not ported -- refused
     bool hasCoupledPatches    = false;   // buildDeviceMesh keeps them out of the LDU -- refused
     std::string fvOptionUnsupported;
 };

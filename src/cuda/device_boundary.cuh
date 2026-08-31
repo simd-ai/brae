@@ -36,6 +36,10 @@ struct DeviceBoundary
     // fixedGradient's prescribed normal gradient, per face. ZERO for every other BC, which is what makes
     // one code path serve both: OF's fixedGradient IS zeroGradient plus a source proportional to g.
     DeviceBuffer<scalar> refGrad;
+    // 1 on a fixedFluxPressure face: the SOLVER overwrites refGrad there every pressure assembly
+    // (deviceConstrainPressure), exactly as constrainPressure.C hands updateSnGrad the flux-consistent
+    // gradient. Empty mask = no such faces, and the kernel is skipped entirely.
+    DeviceBuffer<label>  snGradMask;
     DeviceBuffer<scalar> refValue, p0, deltaCoeffs, magSf;   // p0 = totalPressure reference (constant; refValue = p0 - 0.5*neg(phi)|U|^2)
     DeviceBuffer<label>  faceCell;
 };
@@ -45,7 +49,7 @@ inline DeviceBoundary buildDeviceBoundary(
     const std::vector<FvPatch>& fvp,
     const FvGeometry& g)
 {
-    std::vector<label> ty, fc, io, oio, mx, pv, sm, tp;
+    std::vector<label> ty, fc, io, oio, mx, pv, sm, tp, sg;
     std::vector<scalar> ref, dc, ms, vf, p0, rg;   // rg = fixedGradient normal gradient (0 elsewhere)
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
@@ -62,6 +66,7 @@ inline DeviceBoundary buildDeviceBoundary(
         const std::vector<scalar> val = f.boundary[pi]->refValues();   // totalPressure: p0
         const std::vector<scalar>* vfp = f.boundary[pi]->valueFractionPtr();   // mixed (cat 5): per-face vf seed
         const std::vector<scalar>* rgp = f.boundary[pi]->refGradPtr();         // fixedGradient: per-face g
+        const label sgm = f.boundary[pi]->updateableSnGrad() ? 1 : 0;   // fixedFluxPressure
         for (label i = 0; i < fvp[pi].size; ++i)
         {
             // Categories whose VALUE is resolved per-step but whose TYPE is a plain fixedValue: inletOutlet,
@@ -77,6 +82,7 @@ inline DeviceBoundary buildDeviceBoundary(
             p0.push_back(cat == 7 ? val[i] : 0.0);   // totalPressure: mask + the reference p0
             vf.push_back((cat == 5 && vfp) ? (*vfp)[i] : 0.0);
             rg.push_back(rgp ? (*rgp)[i] : 0.0);
+            sg.push_back(sgm);
             ref.push_back(val[i]);
             dc.push_back(fvp[pi].deltaCoeffs[i]);
             ms.push_back(g.magSf()[fvp[pi].start + i]);
@@ -95,6 +101,7 @@ inline DeviceBoundary buildDeviceBoundary(
     db.p0.copyFrom(p0);
     db.valueFraction.copyFrom(vf);
     db.refGrad.copyFrom(rg);
+    db.snGradMask.copyFrom(sg);
     db.refValue.copyFrom(ref);
     db.deltaCoeffs.copyFrom(dc);
     db.magSf.copyFrom(ms);

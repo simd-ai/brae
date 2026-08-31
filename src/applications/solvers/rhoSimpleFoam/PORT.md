@@ -1724,3 +1724,33 @@ Still open here:
 - manifest/simpleFoam.yaml fails `of_manifest.py --check` at HEAD (pre-existing drift, not from this
   edit): the tool now derives something different from ofscan/OpenFOAM than when the manifest was
   generated. Needs a regenerate-and-read-the-diff pass of its own.
+
+## fixedFluxPressure, the CUDA half -- and the hardcoded closedVolume it flushed out
+
+The device unit is small by design: DeviceBoundary grows a `snGradMask` (1 on updateable-snGrad faces,
+built where the other per-step masks are built), and `deviceConstrainPressure` overwrites `refGrad` on
+masked faces with (phiHbyA_b - rho_b*sfU_b)/(magSf_b*den_b), the divisor prepared by each caller --
+st.rhorAUfBnd (pEqn.H:12), st.rhorAtUfBnd (pcEqn.H:16), owner-gathered rAtU (pEqn.H:21). The device
+fixedGradient machinery (assembly coefficients AND bcValue) already consumed refGrad live, so nothing
+else moved. The three device refusals and the `hasFixedFluxPressure` flags they hung on are gone.
+
+Getting the gate green took three localizations, only the last of which was this unit's code:
+
+1. The cuda harness's forced-limiter block (calibrated for rhoBox, its own comment says so) set
+   pMin = mid of a preliminary run's p range -- on rhoBoxP that clamps 1180 of 1200 cells. The ffp cuda
+   arm therefore runs --boundary, which skips the forcing.
+2. With the limiter out, the device still sat a PURE CONSTANT above the host (+43.47 Pa, spans equal to
+   1e-6) with the p solve converged at 8.6e-15 and the reference row verifiably in the solved matrix
+   (b[ref] = diag*1e5 exactly). A converged residual cannot coexist with that offset unless the
+   constant enters AFTER the solve.
+3. It did: rhoPEqn.cu and rhoPcEqn.cu hardcoded `st.closedVolume = true` after deviceAdjustPhi, where
+   OpenFOAM MEASURES it (adjustPhi.C:145-147: massIn, fixedMassOut and adjustableMassOut all negligible
+   against totalFlux) and the host mirrors the measurement. Every earlier all-Neumann device fixture
+   really was closed, so the hardcode was invisible; rhoBoxP is open (inletOutlet outlet), and the
+   closed-volume mass correction shifted p by a uniform +43 Pa every outer iteration. deviceAdjustPhi
+   now returns the measured verdict through an optional out-param; test_adjust_phi_guards grew arm 6
+   (open/closed/disagree -- a hardcoded answer cannot pass the third check).
+
+Numbers: device-vs-host p ~1e-13 per iteration over 60 iterations on rhoBoxP (was 1.35e-02), refCell
+pinned at exactly 100000.0 on both arms. ffp_vs_openfoam now has three arms: SIMPLE, SIMPLEC, CUDA.
+Fail-proofs: kernel disabled -> cuda arm FAILs; closedVolume hardcode restored -> guards arm 6 FAILs.
