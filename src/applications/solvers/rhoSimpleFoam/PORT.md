@@ -1630,3 +1630,50 @@ wrongly, with nothing in the build able to contradict it.
 
 NOT the cause of the rhoTP divergence, which was the reason for looking: rhoTP still reaches T 5.38e+42
 (it was 3.79e+38, so the trajectory did move). Recorded so the next attempt does not re-run it.
+
+## The six unwired guards (refusal census follow-up)
+
+A five-area census of every refusal on the rhoSimpleFoam paths (120 found) turned up six entries filed
+as DEAD that were not dead code but HOLES: a guard written and unreachable, or a substitution with no
+guard at all. Each is now closed, gated, and fail-proven (the gate was run against the reverted guard
+and failed on exactly its own arms).
+
+| # | Hole | Was | Now |
+|---|---|---|---|
+| 1 | `properties liquid` accepted by the parser, then run through perfectGas formulae with the liquid's scalar Cp left at its default (he = -48361 J/kg where Es(1e5,350) = -15641742) | no guard on the host mirror path (the device hooks had `requirePerfectGas`) | refused in createFields, named; end-to-end arm |
+| 2 | `atmNutkWallFunction` escaped the nut wall-function refusal that NAMES it -- the guard tested the prefix "nut" and the atm family starts with "atmNut"; it then ran as smooth nutk with z0 unplumbed | throw unreachable for exactly that type | two-prefix test; gate arm fails against the one-prefix guard |
+| 3 | `RAS { turbulence off; }` ran as laminar (mut = 0 everywhere) | fields never read | see below |
+| 4 | generalizedNewtonian powerLaw: only nuMax checked; a missing `n` silently became 1.0 -- the NEWTONIAN answer on a shear-thinning case (~1120x nu on squareBendLiqNoNewtonian's numbers) | `scalarOr` defaults where OF powerLaw.C:63-65 fatals | all three required, missing keys named |
+| 5 | surfaceNormalFixedValue/uniformNormalFixedValue with a Function1 refValue built an EMPTY value array: U_b = 0*n, a silent zero inlet ("any Function1 is ignored", said the class comment; nothing enforced it) | reader skipped without marking | reader marks, factory refuses by name; missing entry refused too |
+| 6 | fixedMean / fanPressure / coded BCs accepted by the factory on the strength of a per-step update only gpuPimpleFoam performs (gpuSimpleFoam: coded only) -- frozen at the file `value` everywhere else | collectFixedMean's refusal unreachable from the drivers that needed it | `frozen_bc_guard.cuh` called at the read sites of simpleFoamV2, the simpleFoam mirror createFields and gpuSimpleFoam |
+
+### `turbulence off` is FROZEN, not laminar, and not the file values either (hole 3)
+
+The rhoBoxF oracle (validation/rhoBoxF, real OF v2412) settled what `RAS { turbulence off; }` means:
+the model is still CONSTRUCTED (k, epsilon, nut, alphat all read; alphat MUST_READ), and
+rhoSimpleFoam.C:64 still calls `turbulence->validate()` = one `correctNut()`; only the per-iteration
+`correct()` returns early (kEpsilon.C:216). Measured: a 1e-3 file nut came out of OF as
+nut = Cmu*k^2/eps = 0.001265625 on every cell AND every (calculated) boundary face, with
+alphat = rho0*nut/Prt, Prt = 1.0 (EddyDiffusivity's coeffDict default -- not the wall function's 0.85).
+So three DIFFERENT wrong ports are distinguishable on this fixture: laminar (nut absent), frozen at the
+file seed (1e-3), and the correct validate value. The first candidate fixture (sbMatched + off) could
+not discriminate at all -- its 0/nut is uniform 0, and frozen-at-zero IS laminar.
+
+brae now: `f.turbulent` means "a RAS model is constructed", `f.turbulenceFrozen` gates only the
+per-iteration closure; createFields runs the validate equivalent (internal, and on the frozen path the
+boundary half too) and the step loop skips `correct()`. Gate: tf_vs_openfoam.sh -- U 4.06e-08,
+T 1.86e-08 vs OF converged, nut/alphat equal to OF's written fields to the bit and bit-identical
+through the loop; fail-proof (old laminar path restored): FAIL (8). Refused by name: frozen kOmegaSST
+(its validate is not kEpsilon's) and frozen + nutkWallFunction (OF wall-evaluates once inside
+validate(); brae has no wall-function evaluation at createFields).
+
+### Open findings
+
+- The legacy gpuRhoSimpleFoam driver still accepts fixedMean/fanPressure/coded and freezes them at the
+  file `value` (hole 6's guard is not wired there; the legacy path is frozen by policy). No validation
+  case reaches it with those types today.
+- The rho mirror createFields does not yet call `refuseFrozenPerStepBC` (hole 6B): a fixedMean he/p on
+  the mirror path would still freeze. Next unit.
+- test_rho_simple_step_cpp's coefficient-reach control is skipped on frozen fixtures -- the loop
+  deliberately never reads the coefficients there; the frozen arm asserts the half that exists (Cmu
+  reaches validate()).
