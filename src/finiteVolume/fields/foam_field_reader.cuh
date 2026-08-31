@@ -527,8 +527,13 @@ inline FieldData<T> readField(const std::string& path)
                             ts.expect(")");
                             p.hasNormalRef = true;
                         }
-                        else   // table/Function1 -> ramp handles it; treat as 0
+                        else   // table/expression/... -- a Function1 brae cannot evaluate
                         {
+                            // MARK it, so the factory refuses by name. This branch used to skip
+                            // silently ("ramp handles it"), which nothing did: the patch built with an
+                            // EMPTY value array and every face got U_b = 0*n -- a zero inlet where the
+                            // case prescribed a ramp.
+                            p.unsupportedFunction1 = (m == "(" ? "inline Function1" : m);
                             skipToSemicolon(ts, m == "(" ? 1 : 0);
                         }
                         ts.expect(";");

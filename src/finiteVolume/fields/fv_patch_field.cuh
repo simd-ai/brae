@@ -1557,6 +1557,25 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     }
     if (d.type == "surfaceNormalFixedValue" || d.type == "uniformNormalFixedValue")   // U_b = refValue(scalar) * n
     {
+        // OF takes a full PatchFunction1 here, sampled every updateCoeffs
+        // (surfaceNormalFixedValueFvPatchVectorField.C). The reader marks the forms brae cannot
+        // evaluate; building past the mark used an EMPTY value array, so every face got U_b = 0*n --
+        // a silent zero inlet. The class comment said "any Function1 is ignored" and nothing enforced
+        // it: the unhonoured-contract pattern this tree keeps finding.
+        if (!d.unsupportedFunction1.empty())
+            throw std::runtime_error(
+                "brae: patch " + p.name + " has " + d.type + " with a "
+                + (d.type == "surfaceNormalFixedValue" ? "refValue" : "uniformValue") + " brae cannot "
+                "evaluate ('" + d.unsupportedFunction1 + "'). Only uniform/constant/nonuniform forms "
+                "are implemented; running would set U_b = 0*n on every face where the case prescribed "
+                "a variation. Replace it with a constant.");
+        // OF refuses the missing entry too (PatchFunction1::New reads it unconditionally); without
+        // this the same zero-inlet substitution arrives through a typo instead of a table.
+        if (!d.hasNormalRef)
+            throw std::runtime_error(
+                "brae: patch " + p.name + " has " + d.type + " without the "
+                + (d.type == "surfaceNormalFixedValue" ? "refValue" : "uniformValue") + " entry "
+                "OpenFOAM requires. Building would silently run U_b = 0.");
         if constexpr (std::is_same_v<T, vector>)
             return std::make_unique<SurfaceNormalFixedValuePatchField>(p, d.normalRefUniform, d.normalRefUniformValue, d.normalRefValues);
         else throw std::runtime_error("brae: surfaceNormalFixedValue/uniformNormalFixedValue is a velocity (vector) BC");
