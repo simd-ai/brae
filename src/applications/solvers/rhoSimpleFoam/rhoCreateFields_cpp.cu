@@ -241,6 +241,22 @@ RhoSimpleFields createFields(
     // perfect gas.
     f.thermo = readThermoCoeffs(caseDir, fvSolution);
 
+    // ...but a SUPPORTED parse is not a supported path. The parser accepts `properties liquid` because
+    // the LEGACY binary carries the NSRDS path; everything below evaluates perfectGas + hConst directly
+    // (perfectGasRho for the rho seed, perfectGasPsi, heOf for the energy build), and on the liquid
+    // parse the scalar Cp/mu/kappa members STAY AT THEIR DEFAULTS (thermo_parse.cuh notes it at the
+    // liquid branch) -- so he would be built from a gas Cp the case never set. device_energy.cu:38-42
+    // records what that costs: squareBendLiq's 350 K walls carried he = -48361 J/kg where Es(1e5,350)
+    // is -15641742 J/kg. The device hooks have this guard (requirePerfectGas, rhoThermoDevice.cu);
+    // the host createFields, which runs FIRST on both arms, did not.
+    if (f.thermo.model != ThermoModel::perfectGas)
+        throw std::runtime_error(
+            "brae: rhoSimpleFoam (OF-mirror) createFields implements perfectGas + hConst only, and "
+            "this case selects `properties liquid`. The liquid path replaces Cp, mu, kappa and rho "
+            "with per-cell NSRDS correlations and inverts he -> T by Newton; the legacy "
+            "gpuRhoSimpleFoam binary carries that path. Refusing rather than running a gas equation "
+            "of state against a liquid's coefficients.");
+
     // thermo.validate(args.executable(), "h", "e") -- rhoSimpleFoam accepts exactly these two energy
     // variables, because EEqn.H's kinetic-energy source is written for both and for nothing else.
     {

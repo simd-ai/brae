@@ -702,6 +702,30 @@ int main(int argc, char** argv)
         std::printf("     %-34s %s\n", "unported-atm fixture not supplied", "SKIP");
     }
 
+    // ---- THE REFUSAL: `properties liquid` reaching a perfect-gas createFields ---------------------
+    // thermo_parse ACCEPTS the liquid thermo (the legacy binary carries the NSRDS path), so nothing
+    // upstream stops it, and before the guard nothing downstream checked f.thermo.model either: the
+    // rho seed, psi and he were all built from perfectGas formulae with the liquid's scalar Cp left at
+    // its default. The refusal must come from createFields itself and must name the liquid.
+    std::printf("  refusal -- properties liquid on the perfect-gas mirror path\n");
+    if (argc > 7)
+    {
+        bool threw = false;
+        std::string msg;
+        try
+        {
+            (void)cpu::rhoSimple::createFields(caseDir + "/" + startT, std::string(argv[7]),
+                                               simpleDict, &fvSolution, m, g, patches);
+        }
+        catch (const std::exception& e) { threw = true; msg = e.what(); }
+        check("a liquid thermo is refused", threw);
+        check("and the refusal names the liquid", msg.find("properties liquid") != std::string::npos);
+    }
+    else
+    {
+        std::printf("     %-34s %s\n", "liquid-thermo fixture not supplied", "SKIP");
+    }
+
     // ---- THE REFUSAL: a turbulent case must be refused BY NAME, not run as laminar. ----
     std::printf("  refusal -- an unported RAS model\n");
     if (argc > 4)

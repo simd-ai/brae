@@ -131,4 +131,27 @@ grep -q "atmNutkWallFunction" "$W/unportedatm/nut" \
 UNPORTEDATM="$W/unportedatm"
 fi
 
-"$BIN" "$W/case" 0 "$ITERS" $UNPORTED $UNPORTEDNUT $UNPORTEDATM
+# ...and a LIQUID thermo, which the parser ACCEPTS (the legacy binary carries the NSRDS path) and the
+# mirror createFields must therefore refuse itself -- everything downstream of it evaluates
+# perfectGas + hConst directly, and nothing else checks the model. Before the guard this ran a gas
+# equation of state against a liquid's (unset) coefficients.
+LIQUIDTHERMO="$W/liquidthermo"
+mkdir -p "$LIQUIDTHERMO/constant" "$LIQUIDTHERMO/system"
+cp -r "$SRC/constant/." "$LIQUIDTHERMO/constant/"
+cp -r "$SRC/system/." "$LIQUIDTHERMO/system/"
+cat > "$LIQUIDTHERMO/constant/thermophysicalProperties" <<'EOF'
+FoamFile { version 2.0; format ascii; class dictionary; object thermophysicalProperties; }
+thermoType
+{
+    type            heRhoThermo;
+    mixture         pureMixture;
+    properties      liquid;
+    energy          sensibleInternalEnergy;
+}
+mixture
+{
+    H2O;
+}
+EOF
+
+"$BIN" "$W/case" 0 "$ITERS" $UNPORTED $UNPORTEDNUT $UNPORTEDATM $LIQUIDTHERMO
