@@ -397,8 +397,9 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
     // --- things that change the equations and are not implemented ---------------------------
     // MRF is IMPLEMENTED: correctBoundaryVelocity (UEqn.H:3), DDt (UEqn.H:8) and makeRelative
     // (pEqn.H:5), on the same cpu::MRF::Zone the _cpp reference is gated on. update() is moving-mesh
-    // only and inert on a steady static mesh; constrainPressure (pEqn.H:21) needs a fixedFluxPressure
-    // patch, which is refused on its own below. What IS still refused is a zone naming a cellZone the
+    // only and inert on a steady static mesh; constrainPressure (pEqn.H:21) is ported, but WITHOUT the
+    // MRF.relative term -- pEqn.cu refuses the MRF + fixedFluxPressure combination by name at the call
+    // site. What IS still refused here is a zone naming a cellZone the
     // mesh does not carry -- silently applying no rotation there is the failure mode this guards.
     for (const cpu::MRF::ZoneSpec& sp : cpu::MRF::readMRFProperties(caseDir + "/constant"))
     {
@@ -434,9 +435,8 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
 
     if (const FoamDict* s = fvSolution.subDict("SIMPLE"))
     {
-        // SIMPLEC is implemented (matrixH1 + fvc::snGrad); it is READ here, not refused. What is still
-        // missing is constrainPressure, which pEqn.H calls with rAtU right after -- it only does anything
-        // on a fixedFluxPressure patch, so that patch type is what gets refused, below.
+        // SIMPLEC is implemented (matrixH1 + fvc::snGrad), and so is the constrainPressure pEqn.H
+        // calls with rAtU right after (deviceConstrainPressure, gated by ffpi_vs_openfoam).
         (void)s;
     }
 
@@ -561,23 +561,11 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
                                      "`; the rebuilt components handle no coupled interfaces.");
     }
 
-    // --- pressure BCs that pEqn.H reaches through constrainPressure ---------------------------
-    // fixedFluxPressure is a fixedGradient patch whose gradient constrainPressure RESETS every outer
-    // iteration to match the flux actually being imposed. brae's field builder maps it to zeroGradient,
-    // which is the right answer only when that flux is zero. Left unchecked the case would run and
-    // quietly impose a different boundary condition than it asked for.
-    {
-        const FoamDict cd0 = readDict(caseDir + "/system/controlDict");
-        const std::string st0 = cd0.wordOr("startFrom", "startTime") == "latestTime"
-                              ? std::string("0") : cd0.wordOr("startTime", "0");
-        std::string ptext;
-        try { ptext = readFileExpanded(caseDir + "/" + st0 + "/p"); } catch (...) { ptext.clear(); }
-        if (ptext.find("fixedFluxPressure") != std::string::npos)
-            r.blockers.push_back("a pressure patch is `fixedFluxPressure`; pEqn.H resets its gradient "
-                                 "every iteration through constrainPressure(p, U, phiHbyA, rAtU, MRF) "
-                                 "(pEqn.H:21), which is not ported. brae would substitute zeroGradient, "
-                                 "which is only the same boundary condition when the imposed flux is 0.");
-    }
+    // fixedFluxPressure is SUPPORTED here now: the factory builds the real FixedFluxPressurePatchField
+    // (which itself refuses any driver that never calls constrainPressure), pEqn.cu runs
+    // deviceConstrainPressure at pEqn.H:21, and ffpi_vs_openfoam gates this path against real OpenFOAM
+    // on validation/simpleBoxP. The envelope used to refuse the whole case on a raw substring of the
+    // 0/p text -- the OVER-BROAD refusal the census called it.
 
     // --- substitutions that are supported but must be SAID ------------------------------------
     if (const FoamDict* solvers = fvSolution.subDict("solvers"))

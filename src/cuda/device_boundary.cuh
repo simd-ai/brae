@@ -40,6 +40,7 @@ struct DeviceBoundary
     // (deviceConstrainPressure), exactly as constrainPressure.C hands updateSnGrad the flux-consistent
     // gradient. Empty mask = no such faces, and the kernel is skipped entirely.
     DeviceBuffer<label>  snGradMask;
+    label                nSnGradFaces = 0;   // host-side count, for cheap has-any checks at call sites
     DeviceBuffer<scalar> refValue, p0, deltaCoeffs, magSf;   // p0 = totalPressure reference (constant; refValue = p0 - 0.5*neg(phi)|U|^2)
     DeviceBuffer<label>  faceCell;
 };
@@ -102,6 +103,7 @@ inline DeviceBoundary buildDeviceBoundary(
     db.valueFraction.copyFrom(vf);
     db.refGrad.copyFrom(rg);
     db.snGradMask.copyFrom(sg);
+    for (label v : sg) db.nSnGradFaces += v;
     db.refValue.copyFrom(ref);
     db.deltaCoeffs.copyFrom(dc);
     db.magSf.copyFrom(ms);

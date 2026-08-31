@@ -247,6 +247,14 @@ void pressurePredictor(
     // fixedFluxPressure face either (an empty mask makes the kernel a no-op regardless).
     if (dbP)
     {
+        // MRF.relative belongs INSIDE constrainPressure (constrainPressure.C:70) and is not in the
+        // device kernel; on a rotating case the relative flux at a wall does not cancel, so running
+        // without it would set a wrong gradient under the boundary's own name.
+        if (in.mrf && dbP->nSnGradFaces > 0)
+            throw std::runtime_error(
+                "pEqn(cuda): fixedFluxPressure together with MRF needs MRF.relative inside "
+                "constrainPressure (constrainPressure.C:70), which is not ported. Refusing rather than "
+                "setting the gradient from the absolute flux.");
         DeviceBuffer<scalar> ub[3], sfUBnd, rAtUBnd;
         for (int k = 0; k < 3; ++k) deviceBCValue(dbU.comp[k], *U[k], ub[k]);
         deviceBoundaryFlux(dm, ub[0], ub[1], ub[2], sfUBnd);

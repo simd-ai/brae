@@ -1625,6 +1625,10 @@ set_tests_properties(rhotiming_vs_openfoam PROPERTIES
 # exercise only the fixedEnergy half of basicThermo::heBoundaryTypes(); a fixedGradient T was read and then
 # silently discretised as zeroGradient, i.e. an adiabatic wall that converged to a plausible wrong answer.
 # Also the only gate that asserts OpenFOAM can PARSE what brae writes.
+add_test(NAME ffpi_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/ffpi_vs_openfoam.sh)
+set_tests_properties(ffpi_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
 add_test(NAME ffp_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/ffp_vs_openfoam.sh)
 set_tests_properties(ffp_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
