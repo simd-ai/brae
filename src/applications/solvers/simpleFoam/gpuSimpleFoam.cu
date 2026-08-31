@@ -31,6 +31,7 @@
 #include "fvc.cuh"
 #include "device_simple_foam.cuh"
 #include "coded_bc_setup.cuh"         // CodedBCSpec + parseCodedBCs + setupCodedBCs (shared with gpuPimpleFoam)
+#include "frozen_bc_guard.cuh"
 #include "brae_time.cuh"
 #include "scalar_transport_fo.cuh"   // OF functionObjects::scalarTransport, on the device flux   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
 
@@ -396,9 +397,15 @@ int main(int argc, char** argv)
         timeRegistry.store("patches", &fvp);
         const label nC = m.nCells();
 
-        GeometricField<vector> U = buildField<vector>(readField<vector>(fieldDir + "/U"), fvp, nC);
+        // This driver maintains the coded pair per step (setupCodedBCs below) but NOT fixedMean or
+        // fanPressure -- collectFixedMean/collectFanPressure are wired in gpuPimpleFoam only -- so
+        // those two would freeze at the file `value`. Refuse them here, where the type still exists.
+        const FieldData<vector> UFd = readField<vector>(fieldDir + "/U");
+        refuseFrozenPerStepBC(UFd, "U", "gpuSimpleFoam", true);
+        GeometricField<vector> U = buildField<vector>(UFd, fvp, nC);
         U.evaluateBoundary();
         const FieldData<scalar> pFd = readField<scalar>(fieldDir + "/p");
+        refuseFrozenPerStepBC(pFd, "p", "gpuSimpleFoam", true);
         GeometricField<scalar> p = buildField<scalar>(pFd, fvp, nC);
         p.evaluateBoundary();
         // pressure needs a reference iff NO p patch fixes the value (singular all-Neumann system, e.g. closed
@@ -432,7 +439,8 @@ int main(int argc, char** argv)
                                                   fvc::flux(U, m, g, fvp), &phiWasRead);
 
         const std::string secondName = ctl.sst ? "omega" : "epsilon";   // the 2nd turbulence scalar
-        TurbulenceFields tf = readTurbulenceFields(fieldDir, fvp, nC, ctl, secondName, U);
+        TurbulenceFields tf = readTurbulenceFields(fieldDir, fvp, nC, ctl, secondName, U,
+                                                   "gpuSimpleFoam", true);
 
         // MRF rotating zone (constant/MRFProperties + polyMesh/cellZones), if present
         const MRFConfig mrfCfg = readMRFProperties(caseDir + "/constant");
