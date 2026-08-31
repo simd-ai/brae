@@ -1494,3 +1494,68 @@ there is no `totalFlux` to tell them apart.
 Full suite after the change: **338/338**, which is the number that matters here, because three of the six
 call sites are in the shipped incompressible solver and the new refusal could have fired on a real case.
 It fires on none of them.
+
+## The turbulent gate arm, and the drift it has not yet explained
+
+`test_rho_simple_step_cuda.cu` set `gin.correct = nullptr` in EVERY registered arm, so the device kEpsilon
+closure ran in no gate at all. Its own standalone gate assembles ONE system from OpenFOAM's adopted
+fields, which establishes the arithmetic GIVEN that state and says nothing about the closure's position
+in the iteration or the nut/alphat -> muEff/alphaEff feedback. `--turbulent` runs it in the loop.
+
+### What building it found
+
+Three real defects, none of which any registered gate could see:
+
+1. **The device driver ran on a STALE nut.** The gate builds muEff/alphaEff from `df`, the host mirror the
+   THERMO hooks maintain, and nothing syncs `df.nut` or `df.alphat` from the device. So with the closure
+   wired, the device driver never saw its own closure's output. The tell was that the arm's numbers were
+   BIT-IDENTICAL across three different volumetric-flux constructions -- inputs changing, nothing
+   downstream reading them. The turbulent arm now takes the device transport.
+2. **The device never got the case's pressureControl.** `gin.limitMaxP`/`pMinLimit` were set only inside
+   the forced-limiter block, which the boundary and turbulent arms skip, so the host clamped and the
+   device did not. Worth p 1.790e-03 -> 3.014e-07 at iteration 2.
+3. **The device alphat BOUNDARY was never written** -- the counterpart of the host fix. Gated directly
+   rather than through the trajectory, because on this fixture it does not reach U or T at the level the
+   arm resolves: 1.000000e+00 with the write disabled, **1.143903e-04** with it.
+
+### The residual drift, and four hypotheses ruled out
+
+Per-iteration closure outputs, device against host:
+
+    end of iter 1   k 4.36e-12   epsilon 9.00e-11   nut 3.56e-11     <- the closures agree
+    end of iter 2   k 2.17e-06   epsilon 2.04e-06   nut 1.81e-07     <- both jump together
+
+So the device closure and its input construction are RIGHT at iteration 1, and at iteration 2 the closure
+output and U move together at the same order -- a shared cause, not one driving the other. Growing to
+~5e-04 on U by iteration 6.
+
+RULED OUT, each by measurement rather than argument:
+
+- *Reused device state.* `KEpsilonStages` is held across iterations; making it fresh per call is
+  BIT-IDENTICAL. (This was the leading suspect: exact-at-1, wrong-from-2 is the signature the AMG-cache
+  defect left in the incompressible twin, and `DeviceBuffer::resize` takes from a pool that does not
+  zero.)
+- *Solver stagnation.* epsilon is ~200 and the arm was forcing an absolute tolerance of 1e-14, which is
+  ~5e-17 relative and below double precision -- two different BiCGStab implementations would simply
+  stagnate differently. But a 100x change (1e-10 against 1e-12) moves iteration 2 from 2.179e-06 to
+  2.173e-06. Iteration 1's output DOES move with tolerance (1.14e-10 -> 4.36e-12), which cleanly
+  separates solver noise from this.
+- *The stale rhoBnd fed to the closure.* Real and now fixed (see below), and it changes nothing here.
+- *A discrete bounding branch.* An amplification from ~1e-12 inputs to 2e-06 outputs in one iteration is
+  too large for smooth arithmetic and would be explained by a cell clamping on one side only. Both paths
+  call bound at the same two points with the same floor, 1e-15 (`kEpsilon.cu:937,950` against
+  `kEpsilon_cpp.cu:452,540`).
+
+THE ARM IS NOT REGISTERED. It fails, and registering a failing gate to mark a known defect is how a suite
+stops meaning anything. It is available behind `--turbulent` and is where the next attempt should start:
+the honest next step is to run BOTH sides through the HOST closure via the hook, which decides in one run
+whether the difference is the driver's composition or the device closure itself.
+
+### Fixed along the way: a live rho for the closure
+
+`rhoSimpleFoam_cpp.cu` built the volumetric flux from the `rhoBnd` SNAPSHOT taken before the momentum
+equation, while `nuLamBnd` four lines above read `f.rho.boundary` directly -- the same closure call handed
+a live cell rho and a stale boundary rho. OF's `compressibleTurbulenceModel::phi()` is
+`phi_/fvc::interpolate(rho_)` on the model's own field, which the tail's `rho = thermo.rho(); rho.relax();`
+has already moved. Now live on both. Neutral on the OpenFOAM-oracle gates (3/3) and on the arm; kept
+because it removes an inconsistency inside one function rather than because anything measures it.

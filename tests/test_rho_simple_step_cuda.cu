@@ -210,7 +210,7 @@ int main(int argc, char** argv)
         hin.relaxEpsilon    = req ? req->scalarOr("epsilon", 1.0) : 1.0;
         hin.relaxEquationK  = (req != nullptr) && req->found("k");
         hin.relaxEquationEps= (req != nullptr) && req->found("epsilon");
-        hin.tolTurb         = 1e-14;
+        hin.tolTurb         = 1e-12;   // the case's own tolerance (fvSolution)
         hin.relTolTurb      = 0.0;
         hin.boundedTurb     = true;   // both fixtures ship `bounded Gauss upwind` on k and epsilon
     }
@@ -544,6 +544,7 @@ int main(int argc, char** argv)
     std::printf("  per-iteration agreement (relL2, CUDA against _cpp)\n");
     double worstU = 0, worstP = 0, worstT = 0, worstRho = 0;
     double worstAlphatB = 0; label alphatBFaces = 0;
+    double worstK = 0, worstE = 0, worstN = 0;
     int firstBad = -1;
     for (int it = 1; it <= iters; ++it)
     {
@@ -587,6 +588,20 @@ int main(int argc, char** argv)
         gin.alphaEffCell = &dAl;       gin.alphaEffBndFace = &dAlB;
 
         gpu::rhoSimple::rhoSimpleStep(gf, w, dm, dbU, dbP, dbHe, dbT, gin);
+
+        // THE CLOSURE'S OWN OUTPUTS, per iteration. The trajectory says the two drivers separate from
+        // iteration 2 -- which is the first iteration whose inputs carry the closure's result -- but not
+        // WHICH of k, epsilon or nut moved first. A whole-field U number cannot answer that; these can.
+        if (turbulentArm)
+        {
+            const double rk = relL2(gf.k.host(),       hf.k.internal);
+            const double re = relL2(gf.epsilon.host(), hf.epsilon.internal);
+            const double rn = relL2(gf.nut.host(),     hf.nut.internal);
+            worstK = std::max(worstK, rk);
+            worstE = std::max(worstE, re);
+            worstN = std::max(worstN, rn);
+            std::printf("       %-30s k %.3e  epsilon %.3e  nut %.3e\n", "(closure output)", rk, re, rn);
+        }
 
         // The alphat BOUNDARY, device against host, on the turbulent arm. Compared directly rather than
         // through the trajectory: OF writes it inside every correctNut (EddyDiffusivity.C:38) as

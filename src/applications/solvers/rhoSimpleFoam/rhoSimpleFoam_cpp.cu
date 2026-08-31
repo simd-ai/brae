@@ -517,8 +517,17 @@ Residuals rhoSimpleStep(
         // dilatation and must come from this, not from the mass flux the div operator uses.
         SurfaceScalarField phiByRho = f.phi;
         {
+            // rho's LIVE patch values, not the `rhoBnd` snapshot taken before the momentum equation.
+            // OF's compressibleTurbulenceModel::phi() is phi_/fvc::interpolate(rho_) on the model's OWN
+            // rho, which is the solver's field as it stands when correct() runs -- and the tail's
+            // `rho = thermo.rho(); rho.relax();` has already moved it by then. The snapshot was also
+            // inconsistent with nuLamBnd four lines above, which reads f.rho.boundary directly: the same
+            // closure was being fed a live cell rho and a stale boundary rho.
+            std::vector<std::vector<scalar>> rhoBndLive(patches.size());
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                rhoBndLive[pi] = f.rho.boundary[pi]->value();
             const SurfaceScalarField rhof =
-                effectiveFaceViscosity(f.rho.internal, rhoBnd, m, g, patches);
+                effectiveFaceViscosity(f.rho.internal, rhoBndLive, m, g, patches);
             for (std::size_t fi = 0; fi < phiByRho.internal.size(); ++fi)
                 phiByRho.internal[fi] /= rhof.internal[fi];
             for (std::size_t pi = 0; pi < patches.size(); ++pi)
