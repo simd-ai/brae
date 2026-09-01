@@ -189,4 +189,5 @@ echo "$tout2" | grep -q "iter    1" && ! echo "$tout2" | grep -q "does not assem
     && echo "  turb-scheme arm: unbounded Gauss upwind still runs     ok" \
     || { echo "$tout2" | tail -5; echo "FAIL: plain Gauss upwind was refused or never ran"; exit 1; }
 
+BRAE_TURB_BOUND=5e-05 \
 "$BIN" "$W/case" 0 "$ITERS" $UNPORTED $UNPORTEDNUT $UNPORTEDATM $LIQUIDTHERMO $UNMAINTAINED

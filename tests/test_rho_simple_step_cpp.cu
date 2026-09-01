@@ -422,7 +422,12 @@ int main(int argc, char** argv)
     // path (2026-09-01) -- phi had been missing the whole non-orthogonal correction that the pressure
     // source carried. squareBend did NOT move (its gap is dominated by its own open convergence
     // issue), and the bounds are squareBend-limited, so they stay put.
-    //     k          1.358e-03     7.648e-05      3.0e-3  (TURB_BOUND)
+    //     k          1.358e-03     3.463e-06      3.0e-3  (TURB_BOUND)
+    //
+    // sbMatched's k reads 3.46e-06 (was 7.65e-05 in this table) -- the improvement rode in with the
+    // faceFluxCorrection fix, MIS-attributed at first to the boundary-rho snapshot refresh, whose
+    // fail-proof measured INERT here (see rhoSimpleFoam_cpp.cu at the refresh). BRAE_TURB_BOUND=5e-05
+    // from the e2e script pins today's number whichever fix earned it.
     //     epsilon    1.652e-03     1.373e-04        "
     //     nut        1.166e-03     4.302e-05        "
     //     alphat     9.666e-04     4.867e-05        "
@@ -563,7 +568,11 @@ int main(int argc, char** argv)
     // looser fixed point than U does and always has: k and epsilon are transported quantities driven by
     // a production term built from grad(U), so they carry U's error amplified by the gradient. Set from
     // measurement, and it TIGHTENS as the closure improves -- it does not move to accommodate it.
-    const double TURB_BOUND = 3.0e-03;
+    // Overridable PER FIXTURE: the default is squareBend-limited (its k sits at 1.4e-03), which
+    // cannot pin sbMatched's 3.46e-06 -- the e2e script exports the tight value for the fixture that
+    // earns it, so a closure regression (the stale boundary-rho snapshot read 7.65e-05) fails there.
+    const char* tbEnv = std::getenv("BRAE_TURB_BOUND");
+    const double TURB_BOUND = tbEnv ? std::atof(tbEnv) : 3.0e-03;
 
     // THE CLOSURE'S OWN FIXED POINT. Nothing above measures it, and it is not a spectator: nut feeds
     // muEff, which is a coefficient of the momentum equation this gate does bound. The closure gates

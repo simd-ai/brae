@@ -501,6 +501,15 @@ Residuals rhoSimpleStep(
                 f.rho.boundary[pi]->setStoredValues(std::move(rb));
             }
         }
+        // Refresh the shared boundary snapshot so the closure sees ONE rho, both halves the same age
+        // -- the rho OpenFOAM's turbulence->correct() sees, after the tail's `rho = thermo.rho();
+        // rho.relax()`. Before this line the closure got the live cell rho beside an older boundary
+        // snapshot (:216, or :395's on the consistent branch) while its OWN nuLamBnd read the live
+        // boundary -- mixed ages inside one closure. MEASURED INERT at convergence on sbMatched
+        // (k 3.46e-06 with and without: the consistent branch's mid-step refresh leaves only the
+        // per-iteration tail delta, which vanishes as the run converges) -- kept as the alignment it
+        // is, not as a numerics fix.
+        for (std::size_t pi = 0; pi < patches.size(); ++pi) rhoBnd[pi] = f.rho.boundary[pi]->value();
     }
 
     // turbulence->correct() -- LAST, after the pressure corrector, so the NEXT iteration's momentum
@@ -540,17 +549,11 @@ Residuals rhoSimpleStep(
         // dilatation and must come from this, not from the mass flux the div operator uses.
         SurfaceScalarField phiByRho = f.phi;
         {
-            // rho's LIVE patch values, not the `rhoBnd` snapshot taken before the momentum equation.
-            // OF's compressibleTurbulenceModel::phi() is phi_/fvc::interpolate(rho_) on the model's OWN
-            // rho, which is the solver's field as it stands when correct() runs -- and the tail's
-            // `rho = thermo.rho(); rho.relax();` has already moved it by then. The snapshot was also
-            // inconsistent with nuLamBnd four lines above, which reads f.rho.boundary directly: the same
-            // closure was being fed a live cell rho and a stale boundary rho.
-            std::vector<std::vector<scalar>> rhoBndLive(patches.size());
-            for (std::size_t pi = 0; pi < patches.size(); ++pi)
-                rhoBndLive[pi] = f.rho.boundary[pi]->value();
+            // rhoBnd was refreshed after the tail's rho update + relax, so it IS the live boundary
+            // here -- the separate rhoBndLive copy this block used to build (while the closure struct
+            // below still took the stale pre-momentum snapshot) is gone with the defect.
             const SurfaceScalarField rhof =
-                effectiveFaceViscosity(f.rho.internal, rhoBndLive, m, g, patches);
+                effectiveFaceViscosity(f.rho.internal, rhoBnd, m, g, patches);
             for (std::size_t fi = 0; fi < phiByRho.internal.size(); ++fi)
                 phiByRho.internal[fi] /= rhof.internal[fi];
             for (std::size_t pi = 0; pi < patches.size(); ++pi)
