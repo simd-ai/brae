@@ -2041,6 +2041,19 @@ set_tests_properties(rho_turb_limitedlinear_vs_openfoam PROPERTIES
                      SKIP_RETURN_CODE 77
                      DEPENDS test_rho_simple_step_cpp
                      TIMEOUT 2400)
+
+# The non-orthogonal corrector loop (`while (simple.correctNonOrthogonal())`), which the _cpp driver
+# used to skip entirely -- one pressure solve whatever the case named. Compared at a matched EARLY
+# iteration because the count is a trajectory feature: at convergence every extra pass re-solves an
+# unchanged system and no converged gate can see it. The fail-proof replays the old defect (one pass
+# against the 2-corrector oracle) and reads p 1.51e-01 where the arm reads 3.97e-04.
+add_test(NAME rho_nonorth_corrector_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_nonorth_corrector_vs_openfoam.sh)
+set_tests_properties(rho_nonorth_corrector_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_simple_step_cpp
+                     TIMEOUT 900)
 set_tests_properties(rho_kepsilon_vs_openfoam PROPERTIES
                      ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
                      SKIP_RETURN_CODE 77

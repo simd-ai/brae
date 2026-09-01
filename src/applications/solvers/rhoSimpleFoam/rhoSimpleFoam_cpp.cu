@@ -396,10 +396,21 @@ Residuals rhoSimpleStep(
 
         const ConsistentPressureStages st =
             consistentPressurePredictor(UEqn, f.U, f.p, pin, m, g, patches);
-        P = assemblePcEqn(st, f.p, pin, m, g, patches);
-        const SolverPerformance pp =
-            pbicgstab(P, f.p.internal, m, patches, in.tolP, in.relTolP, in.maxIter);
-        res["p"] = pp.initialResidual;
+        // `while (simple.correctNonOrthogonal())` -- pcEqn.H:67. Each pass re-assembles from the SAME
+        // stages (phiHbyA, rhorAtU are outside the loop in OF too) and re-solves; what changes between
+        // passes is the deferred non-orthogonal correction, recomputed from the just-solved p. The
+        // boundary refresh before re-assembly is fvMatrixSolve.C:242 -- every OF solve ends with
+        // psi.correctBoundaryConditions() -- placed so the nNonOrth=0 path stays bit-identical to the
+        // single-solve arithmetic every existing gate was measured on. res["p"] keeps the FIRST pass's
+        // initial residual, which is the one residualControl reads.
+        for (label corr = 0; corr <= in.nNonOrthogonalCorrectors; ++corr)
+        {
+            if (corr > 0) f.p.evaluateBoundary();
+            P = assemblePcEqn(st, f.p, pin, m, g, patches);
+            const SolverPerformance pp =
+                pbicgstab(P, f.p.internal, m, patches, in.tolP, in.relTolP, in.maxIter);
+            if (corr == 0) res["p"] = pp.initialResidual;
+        }
         rAUorAtU     = st.rAtU;
         HbyA         = st.HbyA;
         phiHbyA      = st.phiHbyA;
@@ -408,10 +419,15 @@ Residuals rhoSimpleStep(
     else
     {
         const PressureStages st = pressurePredictor(UEqn, f.U, f.p, pin, m, g, patches);
-        P = assemblePEqn(st, f.p, pin, m, g, patches);
-        const SolverPerformance pp =
-            pbicgstab(P, f.p.internal, m, patches, in.tolP, in.relTolP, in.maxIter);
-        res["p"] = pp.initialResidual;
+        // The same loop for pEqn.H:56 -- see the pcEqn branch above for why it is shaped this way.
+        for (label corr = 0; corr <= in.nNonOrthogonalCorrectors; ++corr)
+        {
+            if (corr > 0) f.p.evaluateBoundary();
+            P = assemblePEqn(st, f.p, pin, m, g, patches);
+            const SolverPerformance pp =
+                pbicgstab(P, f.p.internal, m, patches, in.tolP, in.relTolP, in.maxIter);
+            if (corr == 0) res["p"] = pp.initialResidual;
+        }
         rAUorAtU     = st.rAU;
         HbyA         = st.HbyA;
         phiHbyA      = st.phiHbyA;

@@ -168,6 +168,12 @@ int main(int argc, char** argv)
 
     in.consistent = simpleDict && simpleDict->wordOr("consistent", "no") == "yes";
     in.transonic  = simpleDict && simpleDict->wordOr("transonic",  "no") == "yes";
+    // getOrDefault<label>(..., 0) -- solutionControl.C:47. The step used to solve the pressure
+    // equation exactly once whatever the case named here, which on a corrected non-orthogonal case is
+    // a different trajectory than OpenFOAM's (the converged answer is the same, so only a matched-
+    // iteration gate can see it -- tests/rho_nonorth_corrector_vs_openfoam.sh).
+    in.nNonOrthogonalCorrectors =
+        simpleDict ? (label)simpleDict->scalarOr("nNonOrthogonalCorrectors", 0) : 0;
     // The fixture's schemes: `div(phi,*) bounded Gauss upwind`, `laplacianSchemes default Gauss linear
     // corrected`. Stated here rather than parsed, because a scheme brae read wrongly would otherwise be
     // invisible -- the gate would compare two solvers running two discretisations and blame the driver.

@@ -80,6 +80,13 @@ struct StepInput
     // --- algorithm ---
     bool consistent = false;   // simple.consistent() -> pcEqn.H rather than pEqn.H
     bool transonic  = false;   // simple.transonic()  -> the convective pressure branch
+    // `while (simple.correctNonOrthogonal())`: the pressure equation is re-assembled and re-solved
+    // nNonOrthogonalCorrectors + 1 times (solutionControlI.H:78-95), each pass recomputing the deferred
+    // non-orthogonal correction from the just-solved p; only the final pass's matrix feeds pEqn.flux().
+    // A trajectory feature, not a fixed-point one: at convergence every pass re-solves an unchanged
+    // system, so a converged comparison cannot see the count -- the gate compares at matched EARLY
+    // iterations. This step used to solve exactly once whatever the case named.
+    label nNonOrthogonalCorrectors = 0;
 
     // --- schemes ---
     DivScheme schemeU   = DivScheme::upwind;

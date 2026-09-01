@@ -242,15 +242,13 @@ int main(int argc, char** argv)
     hin.boundedU = hin.boundedHe = hin.boundedKE = true;   // `bounded Gauss upwind` on all three
     hin.correctedLaplacian = false;                        // `Gauss linear orthogonal`
 
-    // THE HOST REFERENCE HAS NO NON-ORTHOGONAL CORRECTOR LOOP -- cpu::rhoSimple::StepInput carries no
-    // nNonOrthogonalCorrectors at all and solves the pressure equation exactly once. The device driver
-    // does implement the loop (solutionControlI.H runs it nNonOrth+1 times), so this gate runs it with
-    // one pass and asserts the fixture asks for that, rather than comparing a one-pass reference against
-    // a multi-pass device and calling the difference a defect. A case with nNonOrthogonalCorrectors > 0
-    // is outside what this gate can compare until the reference grows the loop.
+    // Both arms carry the non-orthogonal corrector loop now (the host reference grew it for
+    // tests/rho_nonorth_corrector_vs_openfoam.sh), so the case's own count reaches both and this gate
+    // can compare any fixture. It used to assert caseNonOrth == 0 because the reference solved the
+    // pressure equation exactly once whatever the case named.
     const label caseNonOrth =
         simpleDict ? (label)simpleDict->scalarOr("nNonOrthogonalCorrectors", 0) : 0;
-    check("the case asks for 0 non-orthogonal correctors", caseNonOrth == 0);
+    hin.nNonOrthogonalCorrectors = caseNonOrth;
 
     // ---- the DEVICE side ---------------------------------------------------------------------
     // THE DEVICE PROJECTION, from the module that owns it. Every line this replaces was hand-rolled
@@ -415,7 +413,7 @@ int main(int argc, char** argv)
     gin.relaxPEqnSpecified = hin.relaxPEqnSpecified;
     gin.boundedU = gin.boundedHe = gin.boundedKE = true;
     gin.correctedLaplacian = false;
-    gin.nNonOrthogonalCorrectors = 0;   // see the note above: the reference solves p once
+    gin.nNonOrthogonalCorrectors = caseNonOrth;   // the same count on both arms -- see the note above
     if (deviceThermo)
     {
         // THE DEVICE-RESIDENT HOOKS. Same two operations, never leaving the GPU. This is the arm that
