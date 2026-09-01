@@ -210,4 +210,66 @@ echo "$bout" | grep -q "writeFormat is \`binary\`" \
     && say "a binary writeFormat is refused by name, and nothing is written" ok \
     || { echo "$bout" | tail -4; say "a binary writeFormat is refused by name, and nothing is written" FAIL; }
 
+
+# ---- arms 7-9: THE CUDA ARM. Same solver, device modules doing the arithmetic ---------------------
+# The two arms share the case parse, the loop, the write cadence and every refusal (only the equations
+# move), so what these check is that moving them changed no answer. Measured on rhoBox at 200
+# iterations -- CUDA vs OpenFOAM: p 3.00e-12, T 1.27e-09, U 4.45e-10, rho 1.19e-09; CUDA vs the host
+# mirror: p 2.83e-12, T 1.32e-09, U 4.62e-10, rho 1.24e-09. Looser than the host arm's 1e-11 by exactly
+# the linear solvers between them (AMG-PCG against the host's BiCGStab), which is why the bounds differ.
+# On the 112k-cell turbulent transonic sbMatched the two arms converge on the SAME iteration (123) and
+# their written fields agree to 3.9e-09 (p), 1.3e-08 (U), 6.2e-07 (nut).
+stage "$W/cuda" "$SRC" "$ITERS"
+if ( cd "$W/cuda" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BIN" -case "$W/cuda" > cuda.log 2>&1 ); then
+    BRAE_DIR="$W/cuda/$ITERS" OF_DIR="$W/of/$ITERS" HOST_DIR="$W/brae/$ITERS" \
+    python3 "$ROOT/tests/rho_mirror_compare.py" || fail=1
+    say "the CUDA mirror matches OpenFOAM and the host mirror" "$([ $fail = 0 ] && echo ok || echo FAIL)"
+else
+    tail -6 "$W/cuda/cuda.log"; say "the CUDA mirror solver runs" FAIL
+fi
+
+# OpenFOAM must restart from the CUDA arm's output too: the device write path materialises k and
+# epsilon's boundaries with deviceBCValue rather than echoing the start directory, and this is what
+# proves it wrote something OF's reader accepts.
+RC="$W/cudaread"; rm -rf "$RC"; cp -r "$W/cuda" "$RC"
+python3 "$ROOT/tests/rho_mirror_restart_dict.py" "$RC/system/controlDict" "$ITERS"
+( cd "$RC" && rhoSimpleFoam > cudaread.log 2>&1 ) && grep -q "^End" "$RC/cudaread.log" \
+    && grep -q "^Time = $((ITERS+1))$" "$RC/cudaread.log" \
+    && say "real OpenFOAM restarts from the CUDA mirror's written directory" ok \
+    || { tail -6 "$RC/cudaread.log"; say "real OpenFOAM restarts from the CUDA mirror's written directory" FAIL; }
+
+# The selector refuses a value it does not know rather than falling through to the PRE-MIRROR driver,
+# which would report the old path's answer under a mirror request.
+sout=$( cd "$W/cuda" && BRAE_RHOSIMPLEFOAM_MIRROR=gpu "$BIN" -case "$W/cuda" 2>&1 || true )
+echo "$sout" | grep -q "BRAE_RHOSIMPLEFOAM_MIRROR is 'gpu'" \
+    && say "an unknown mirror selector is refused by name" ok \
+    || { echo "$sout" | tail -3; say "an unknown mirror selector is refused by name" FAIL; }
+
+
+# ---- arm 10: kOmegaSST is REFUSED on the CUDA arm, and RUNS on the host arm -----------------------
+# The device projection gates its whole closure set-up on epsilon being present, and kOmegaSST leaves
+# epsilon empty (its second scalar is omega). That skipped the nut upload too, which lives inside the
+# same block -- so an SST case ran with muEff = the LAMINAR viscosity while reporting kOmegaSST. A
+# wrong run, not a missing feature, and invisible from the device side because every buffer it would
+# have filled is simply absent. The host arm carries kOmegaSST, which is what makes this arm
+# discriminating: the same case must refuse on one arm and RUN on the other.
+if [ -d "$ROOT/validation/sbMatched" ]; then
+    SST="$W/sst"; stage "$SST" "$ROOT/validation/sbMatched" 3
+    sed -i 's/RASModel *kEpsilon;/RASModel        kOmegaSST;/' "$SST/constant/turbulenceProperties"
+    cp "$SST/0/epsilon" "$SST/0/omega"
+    sed -i 's/object *epsilon;/object      omega;/' "$SST/0/omega"
+    sed -i 's|div(phi,epsilon)    $turbulence;|div(phi,epsilon)    $turbulence;\n    div(phi,omega)      $turbulence;|' "$SST/system/fvSchemes"
+    grep -q "kOmegaSST" "$SST/constant/turbulenceProperties" || { echo "FAIL: the SST mutation did not apply"; exit 1; }
+    cout=$( cd "$SST" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BIN" -case "$SST" 2>&1 || true )
+    echo "$cout" | grep -q "RASModel 'kOmegaSST'" && echo "$cout" | grep -q "laminar run under a turbulent model" \
+        && say "kOmegaSST is refused by name on the CUDA arm" ok \
+        || { echo "$cout" | tail -3; say "kOmegaSST is refused by name on the CUDA arm" FAIL; }
+    hout=$( cd "$SST" && BRAE_RHOSIMPLEFOAM_MIRROR=1 "$BIN" -case "$SST" 2>&1 || true )
+    echo "$hout" | grep -q "^Time = " \
+        && say "...and the SAME case runs on the host arm (the refusal is device-specific)" ok \
+        || { echo "$hout" | tail -3; say "...and the SAME case runs on the host arm (the refusal is device-specific)" FAIL; }
+else
+    say "sbMatched missing -- SST refusal arm skipped" SKIP
+fi
+
 [ $fail = 0 ] && echo PASS || { echo FAIL; exit 1; }

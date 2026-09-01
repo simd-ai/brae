@@ -53,6 +53,7 @@
 #include "rhoThermoDevice.cuh"
 #include "kEpsilon.cuh"
 #include "rhoCaseRefusals.cuh"
+#include "rhoTurbulenceHook.cuh"   // correctTurbulence: the device-resident closure hook the driver ships
 #include "scheme_parse.cuh"     // parseFieldDivScheme -- div(phi,k|epsilon|omega) from the case          // gpu::kEpsilonRAS -- the device closure the turbulent arm drives
 #include "transport_model.cuh"   // transportMu: nu = mu(T)/rho for the closure inputs
 #include "linearViscousStress_cpp.cuh"   // effectiveFaceViscosity -- the host driver's own rho interpolation
@@ -495,97 +496,28 @@ int main(int argc, char** argv)
         std::printf("  turbulent arm: alphat wall faces %d, turbInlet %s, closure inputs from device\n",
                     (int)n, dev.hasTurbulentInlet ? "yes" : "no");
     }
-    gpu::kEpsilonRAS::KEpsilonStages kst;
+    // THE CLOSURE HOOK, through the SHARED device-resident builder (rhoTurbulenceHook.cuh) that the
+    // runnable CUDA driver uses. This block used to build the closure's inputs HERE and on the HOST:
+    // seven device-to-host copies and six back, every iteration, on the arm whose whole claim is that
+    // the solve never leaves the GPU -- and a private copy of that construction meant the gate measured
+    // one set of closure inputs while a driver would run another.
+    static gpu::rhoSimple::TurbulenceHookBuffers turbBuf;
+    gpu::rhoSimple::TurbulenceHookOptions turbOpt;
     if (turbulentArm)
     {
+        turbOpt.co                    = hf.keCoeffs;
+        turbOpt.co.correctedLaplacian = gin.correctedLaplacian;
+        turbOpt.co.snGradLimitCoeff   = hin.snGradLimitCoeff;
+        turbOpt.Prt                   = hf.Prt;
+        turbOpt.bounded               = hin.boundedTurb;
+        turbOpt.correctedLaplacian    = gin.correctedLaplacian;
+        turbOpt.divSchemeUnsupported  = hin.turbDivUnsupported;
+        turbOpt.relaxEquationK   = hin.relaxEquationK;   turbOpt.relaxK   = hin.relaxK;
+        turbOpt.relaxEquationEps = hin.relaxEquationEps; turbOpt.relaxEps = hin.relaxEpsilon;
+        turbOpt.tol = hin.tolTurb; turbOpt.relTol = hin.relTolTurb; turbOpt.maxIter = hin.maxIter;
         gin.correct = [&]()
         {
-            const label nBF = dm.nBndFaces;
-            const std::vector<scalar> hT   = gf.T.host();
-            const std::vector<scalar> hRho = gf.rho.host();
-            const std::vector<scalar> hTB  = gf.TBnd.host();
-            const std::vector<scalar> hRhoB= gf.rhoBnd.host();
-
-            // nu = mu(T)/rho, cells and boundary faces. transportMu is the SAME function the reference
-            // uses -- one transport model in the tree, called from both sides.
-            std::vector<scalar> nuC(nC), nuB(nBF);
-            for (label c = 0; c < nC; ++c)  nuC[c] = transportMu(hT[c], hf.thermo) / hRho[c];
-            for (label i = 0; i < nBF; ++i) nuB[i] = transportMu(hTB[i], hf.thermo)
-                                                   / (hRhoB[i] > 0 ? hRhoB[i] : scalar(1));
-
-            // The wall-face gather: nu in WALL-face order, which is not boundary-face order.
-            std::vector<scalar> nuWall(dev.wfFaceOfBnd.size());
-            for (std::size_t i = 0; i < dev.wfFaceOfBnd.size(); ++i)
-                nuWall[i] = nuB[static_cast<std::size_t>(dev.wfFaceOfBnd[i])];
-
-            // compressibleTurbulenceModel::phi() -- the VOLUMETRIC flux, phi/fvc::interpolate(rho).
-            // divU is a dilatation and must come from this, not from the mass flux the div operator uses.
-            const std::vector<scalar> hPhiI = gf.phiInt.host(), hPhiB = gf.phiBnd.host();
-            //
-            // effectiveFaceViscosity, NOT fvc::interpolate, and the BOUNDARY divided by the interpolated
-            // FACE value rather than by the patch rho -- because that is what the host driver does
-            // (rhoSimpleFoam_cpp.cu:518-527). The two differ on boundary faces, and using the patch rho
-            // here put the device closure on a different volumetric flux from the host's, which showed
-            // up as the whole field separating at iteration 2 while iteration 1 stayed at 4.5e-12.
-            std::vector<scalar> pbrI(hPhiI.size()), pbrB(hPhiB.size());
-            {
-                std::vector<std::vector<scalar>> rbP(fvp.size());
-                label bi = 0;
-                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-                {
-                    rbP[pi].resize(fvp[pi].size);
-                    for (label i = 0; i < fvp[pi].size; ++i, ++bi)
-                        rbP[pi][i] = (bi < (label)hRhoB.size()) ? hRhoB[bi] : scalar(1);
-                }
-                const SurfaceScalarField rhof = cpu::effectiveFaceViscosity(hRho, rbP, m, g, fvp);
-                for (std::size_t f = 0; f < hPhiI.size() && f < rhof.internal.size(); ++f)
-                    pbrI[f] = hPhiI[f] / rhof.internal[f];
-                bi = 0;
-                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-                    for (label i = 0; i < fvp[pi].size; ++i, ++bi)
-                        if (bi < (label)pbrB.size())
-                            pbrB[bi] = hPhiB[bi] / rhof.boundary[pi][i];
-            }
-
-            DeviceBuffer<scalar> dNuC(nuC), dNuB(nuB), dNuW(nuWall), dPbrI(pbrI), dPbrB(pbrB);
-
-            gpu::kEpsilonRAS::KEpsilonInput kin;
-            kin.phiInt = &gf.phiInt;         kin.phiBnd = &gf.phiBnd;
-            kin.phiByRhoInt = &dPbrI;        kin.phiByRhoBnd = &dPbrB;
-            kin.rhoCell = &gf.rho;           kin.rhoBndFace = &gf.rhoBnd;
-            kin.nuCell = &dNuC;              kin.nuBndFace = &dNuB;
-            kin.nuWallFace = &dNuW;
-            // A SCRATCH COPY, not &gf.nutBnd itself. nutBndFace is the ENTERING wall viscosity the
-            // diffusivity is built from, and gf.nutBnd is also the OUTPUT correct() overwrites -- alias
-            // them and the closure reads a value it has already replaced partway through. The standalone
-            // gate keeps the two separate (gNutBnd vs dNutBnd) and this arm has to as well.
-            DeviceBuffer<scalar> nutBndIn(gf.nutBnd.host());
-            kin.nutBndFace = &nutBndIn;
-            kin.wfBndMask = &dev.wfBndMask;  kin.wallYBndFace = &dev.wallYBndFace;
-            kin.Ux = &gf.Ux; kin.Uy = &gf.Uy; kin.Uz = &gf.Uz;
-            // The masks built by createDeviceFields. Passing null here is NOT "no turbulent inlet" --
-            // it is silently no turbulent inlet at all, on a case whose 0/k asks for one.
-            if (dev.hasTurbulentInlet)
-            {
-                kin.turbInletKMask   = &dev.turbInletKMask;
-                kin.turbInletKInt    = &dev.turbInletKInt;
-                kin.turbInletEpsMask = &dev.turbInletEpsMask;
-                kin.turbInletEpsLen  = &dev.turbInletEpsLen;
-            }
-            kin.alphatWallMask = &dev.alphatWallMask;
-            kin.alphatPrtFace  = &dev.alphatPrtFace;
-            kin.co = hf.keCoeffs;
-            kin.Prt = hf.Prt;
-            kin.boundedK = kin.boundedEps = hin.boundedTurb;
-            kin.hasNonUpwindDivScheme = !hin.turbDivUnsupported.empty();
-            kin.divSchemeUnsupported  = hin.turbDivUnsupported;
-            kin.correctedLaplacian = gin.correctedLaplacian;
-            kin.relaxEquationK   = hin.relaxEquationK;   kin.relaxK   = hin.relaxK;
-            kin.relaxEquationEps = hin.relaxEquationEps; kin.relaxEps = hin.relaxEpsilon;
-            kin.tol = hin.tolTurb; kin.relTol = hin.relTolTurb; kin.maxIter = hin.maxIter;
-
-            gpu::kEpsilonRAS::correct(gf.k, gf.epsilon, gf.nut, gf.nutBnd, &gf.alphat, &gf.alphatBnd,
-                                      kst, dm, dbU, dev.dbK, dev.dbEps, dev.wall, kin);
+            gpu::rhoSimple::correctTurbulence(gf, dev, dm, dbU, hf.thermo, turbOpt, turbBuf);
         };
     }
     else

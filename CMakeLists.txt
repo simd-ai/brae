@@ -120,6 +120,8 @@ add_library(brae_core STATIC
     src/applications/solvers/rhoSimpleFoam/rhoPcEqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoSimpleFoam_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoSimpleFoamDriver_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/rhoTurbulenceHook.cu
+    src/applications/solvers/rhoSimpleFoam/rhoSimpleFoamDriver.cu
     src/applications/solvers/simpleFoam/simpleFoam_cpp.cu
     src/finiteVolume/cfdTools/general/solutionControl/simpleControl/simpleControl_cpp.cu
     src/matrices/lduMatrix/solvers/PCG/device_pcg.cu
@@ -2076,13 +2078,14 @@ set_tests_properties(rho_turb_limitedlinear_vs_openfoam PROPERTIES
 # DEVICE arm: the CUDA driver's loop vs the OF-gated host at iteration 1 on the same mutation (its
 # harness used to hardcode correctedLaplacian=false, under which the loop had nothing to correct);
 # forcing the device count to 0 reads Ux 1.85e-01 against the arm's 5.7e-12.
-# THE MIRROR AS A SOLVER, not as a step: `brae -case` end to end against real OpenFOAM -- the answer,
-# the OF-format output (real rhoSimpleFoam restarts from brae's written directory), the latestTime
-# restart with an ABSOLUTE endTime, the turbulent write payload, the residualControl stop, and the
-# binary-writeFormat refusal. Measured on rhoBox at 200 iterations: p 2.95e-12, U 2.93e-11 -- the
-# linear-solver floor, because the driver reads the case's own tolerances. Every other rhoSimpleFoam
-# gate drives the step through a harness that reads no controlDict and writes nothing, so none of this
-# was gated anywhere.
+# THE MIRROR AS A SOLVER, not as a step: `brae -case` end to end against real OpenFOAM, on BOTH arms --
+# the answer, the OF-format output (real rhoSimpleFoam restarts from brae's written directory), the
+# latestTime restart with an ABSOLUTE endTime, the turbulent write payload, the residualControl stop,
+# and the binary-writeFormat and unknown-selector refusals. Measured on rhoBox at 200 iterations: the
+# host arm p 2.95e-12 / U 2.93e-11 against OpenFOAM, the CUDA arm 3.00e-12 / 4.45e-10 against OpenFOAM
+# and 2.83e-12 / 4.62e-10 against the host arm -- the two differ by their linear solvers (AMG-PCG
+# against BiCGStab) and by nothing else. Every other rhoSimpleFoam gate drives the step through a
+# harness that reads no controlDict and writes nothing, so none of this was gated anywhere.
 add_test(NAME rho_mirror_solver_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_mirror_solver_vs_openfoam.sh)
 set_tests_properties(rho_mirror_solver_vs_openfoam PROPERTIES

@@ -38,7 +38,8 @@
 #include "write_control.cuh"   // OF writeControl/writeInterval/purgeWrite cadence (shared with simpleFoam)
 #include "brae_time.cuh"   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
 #include "scalar_transport_fo.cuh"   // OF functionObjects::scalarTransport, on the device flux
-#include "rhoSimpleFoamDriver_cpp.cuh"   // the OF-mirror path this binary hands over to on request
+#include "rhoSimpleFoamDriver_cpp.cuh"   // the OF-mirror host path this binary hands over to on request
+#include "rhoSimpleFoamDriver.cuh"       // ...and the same solver on the device modules
 #include "mrf_read.cuh"          // readCellZones (shared with the incompressible driver)
 #include "fv_options.cuh"       // OF fv::options: the SAME framework the incompressible driver uses
 #include "of_residual_log.cuh"   // BRAE_OF_LOG=1: OF-format per-solve residuals, for iteration-by-iteration diffing
@@ -94,10 +95,19 @@ int main(int argc, char** argv)
         // by name rather than falling back here -- a silent fallback would report the mirror's name
         // over the old path's answer. Repointing the registry at the mirror is the later, gate-earned
         // step.
+        // `1` runs the host reference (every module in C++, the gated ground truth); `cuda` runs the
+        // same solver with the device modules doing the arithmetic. Both share the case parse, the
+        // loop, the write cadence and the refusals -- only the equations move.
         if (const char* mirror = std::getenv("BRAE_RHOSIMPLEFOAM_MIRROR"))
         {
-            if (std::string(mirror) == "1")
-                return cpu::rhoSimple::runMirror(caseDir);
+            const std::string sel(mirror);
+            if (sel == "1" || sel == "cpu")  return cpu::rhoSimple::runMirror(caseDir);
+            if (sel == "cuda" || sel == "2") return gpu::rhoSimple::runMirrorCuda(caseDir);
+            if (!sel.empty())
+                throw std::runtime_error(
+                    "BRAE_RHOSIMPLEFOAM_MIRROR is '" + sel + "'; it selects which OF-mirror arm runs "
+                    "and takes `1`/`cpu` (the host reference) or `cuda` (the device modules). Refusing "
+                    "rather than falling through to the pre-mirror driver under a mirror request.");
         }
 
         const FoamDict controlDict = readDict(caseDir + "/system/controlDict");

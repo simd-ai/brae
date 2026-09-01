@@ -256,6 +256,24 @@ RhoDeviceFields createDeviceFields(
     }
 
     // ---- the closure's static geometry --------------------------------------------------------
+    // REFUSED BY NAME, because the block below is gated on epsilon being present and kOmegaSST leaves
+    // it EMPTY -- its second scalar is omega (rhoCreateFields_cpp.cu:665-669). So an SST case did not
+    // merely skip the closure: it skipped `d.f.nut.copyFrom(...)` too, which lives inside this block,
+    // and the device then ran the whole case with muEff = the LAMINAR viscosity while reporting
+    // kOmegaSST. That is a wrong run, not a missing feature, and it is invisible from the device side
+    // because every buffer it would have filled is simply absent.
+    //
+    // The device closure is the compressible kEpsilon (gpu::kEpsilonRAS) and nothing else. The frozen
+    // case refuses too: `turbulence off` still needs the nut this block uploads, so a frozen SST case
+    // would run laminar just as loudly.
+    if (hf.turbulent && !hf.rasModel.empty() && hf.rasModel != "kEpsilon")
+        throw std::runtime_error(
+            "brae rhoSimpleFoam (CUDA): RASModel '" + hf.rasModel + "' -- the device closure implements "
+            "the compressible kEpsilon and nothing else, and its second transported scalar is epsilon. "
+            "This case would otherwise run with NO turbulent viscosity at all (the nut upload lives "
+            "inside the closure's own set-up), which is a laminar run under a turbulent model's name. "
+            "The host arm (BRAE_RHOSIMPLEFOAM_MIRROR=1) carries kOmegaSST; refusing rather than "
+            "running this case without its closure.");
     if (hf.turbulent && !hf.epsilon.internal.empty())
     {
         d.dbK   = buildDeviceBoundary(hf.k, patches, g);
