@@ -470,9 +470,14 @@ int main(int argc, char** argv)
     // They tighten as the port improves; they do not move to accommodate it.
     //
     //                squareBend    sbMatched      bound
-    //     p          4.850e-04     1.230e-05      1.0e-3
-    //     T          1.096e-04     4.545e-06      3.0e-4
-    //     rho        4.341e-04     1.341e-05      1.0e-3
+    //     p          4.754e-04     2.879e-07      1.0e-3
+    //     T          1.108e-04     3.665e-06      3.0e-4
+    //     rho        4.341e-04     4.089e-06      1.0e-3
+    //
+    // sbMatched moved 10-60x TOWARD OpenFOAM when M.faceFluxCorrection was finally filled on the rho
+    // path (2026-09-01) -- phi had been missing the whole non-orthogonal correction that the pressure
+    // source carried. squareBend did NOT move (its gap is dominated by its own open convergence
+    // issue), and the bounds are squareBend-limited, so they stay put.
     //     k          1.358e-03     7.648e-05      3.0e-3  (TURB_BOUND)
     //     epsilon    1.652e-03     1.373e-04        "
     //     nut        1.166e-03     4.302e-05        "
@@ -873,6 +878,29 @@ int main(int argc, char** argv)
     else
     {
         std::printf("     %-34s %s\n", "unmaintained-BC fixture not supplied", "SKIP");
+    }
+
+    // ---- THE REFUSAL: a coupled patch on the HOST arm -----------------------------------------
+    // The factory builds cyclic/AMI/processor as zeroGradient PLACEHOLDERS for the device solvers;
+    // no mirror driver re-couples them, so the host arm must refuse on topology -- it used to rely on
+    // the T->he whitelist firing by accident five field reads later. Synthetic: the fixture's first
+    // patch retyped, no coupled mesh needed (the guard reads only the type).
+    {
+        std::vector<FvPatch> coupled = patches;
+        coupled[0].type = "cyclic";
+        bool threw = false;
+        std::string msg;
+        try
+        {
+            (void)cpu::rhoSimple::createFields(caseDir + "/" + startT, caseDir,
+                                               simpleDict, &fvSolution, m, g, coupled);
+        }
+        catch (const std::exception& e) { threw = true; msg = e.what(); }
+        check("a coupled patch is refused on the host arm", threw);
+        check("...naming the patch and the coupling",
+              msg.find("cyclic") != std::string::npos
+           && msg.find(coupled[0].name) != std::string::npos
+           && msg.find("wall") != std::string::npos);
     }
 
     // ---- THE REFUSAL: a turbulent case must be refused BY NAME, not run as laminar. ----

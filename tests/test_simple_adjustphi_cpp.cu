@@ -110,6 +110,19 @@ int main(int argc, char** argv)
     std::printf("     U vs OpenFOAM at its converged %s: %.6e\n", ofT.c_str(), dU);
     check("U matches OpenFOAM's converged state", dU < 1e-5);
 
+    // The simpleFoam mirror's coupled-patch refusal (same placeholder mechanism as the rho arm).
+    {
+        std::vector<FvPatch> coupled = patches;
+        coupled[0].type = "cyclicAMI";
+        bool threw = false;
+        std::string msg;
+        try { (void)cpu::createFields(caseDir + "/0", simpleDict, m, g, coupled); }
+        catch (const std::exception& e) { threw = true; msg = e.what(); }
+        check("a coupled patch is refused by the simpleFoam mirror", threw);
+        check("...naming the patch", msg.find("cyclicAMI") != std::string::npos
+                                  && msg.find(coupled[0].name) != std::string::npos);
+    }
+
     std::printf("%s\n", failures == 0 ? "PASS" : "FAIL");
     return failures == 0 ? 0 : 1;
 }

@@ -64,7 +64,10 @@ RhoDeviceFields createDeviceFields(
 {
     for (const FvPatch& p : patches)
     {
-        if (p.type == "cyclic" || p.type == "cyclicAMI" || p.type == "cyclicACMI" || p.type == "processor")
+        // The PREDICATE, not a hand list: buildPatches also accepts cyclicPeriodicAMI, which the
+        // four-name list let slip. isCoupledInterfaceType is the same test the V2 envelope and the
+        // host guard use; processor is outside it and named separately everywhere.
+        if (isCoupledInterfaceType(p.type) || p.type == "processor")
         {
             throw std::runtime_error(
                 "rhoSimpleFoam createFields(cuda): the mesh has a coupled patch ('" + p.name + "', type "

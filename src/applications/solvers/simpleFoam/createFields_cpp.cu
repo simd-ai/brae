@@ -27,6 +27,17 @@ SimpleFields createFields(
     SimpleFields f;
     const label nC = m.nCells();
 
+    // Same refusal as the rho mirror: the factory's coupled-type placeholders are for the DEVICE
+    // solvers. The cyclic reference path (cyclic_field.cuh buildCyclicField) and the device solver
+    // couple these interfaces; this serial mirror does not, and nothing accidental fires here.
+    for (const FvPatch& cp : patches)
+        if (isCoupledInterfaceType(cp.type) || cp.type == "processor")
+            throw std::runtime_error(
+                "simpleFoam createFields (mirror): the mesh has a coupled patch ('" + cp.name +
+                "', type " + cp.type + "). This serial mirror builds it as an uncoupled zeroGradient "
+                "placeholder, losing the interface entirely. Refusing rather than treating it as a "
+                "wall; the cyclic reference path and the device solver handle these.");
+
     // p, U: MUST_READ. A missing file is a hard error in OpenFOAM and stays one here.
     // The read is split so the boundary TYPES can be checked before they are erased by buildField:
     // no caller of this createFields maintains a per-step boundary (fixedMean, fanPressure, coded), so

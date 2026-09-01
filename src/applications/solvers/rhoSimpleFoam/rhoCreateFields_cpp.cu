@@ -246,6 +246,22 @@ RhoSimpleFields createFields(
     RhoSimpleFields f;
     const label nC = m.nCells();
 
+    // COUPLED PATCHES, refused on topology alone before any file is read. The patch-field factory
+    // builds cyclic/AMI/processor types as zeroGradient PLACEHOLDERS for the device solvers, whose
+    // DeviceMesh re-couples the faces -- no rhoSimpleFoam mirror driver does, so every equation this
+    // field set feeds would lose the interface's contribution silently, as if it were a wall. The
+    // CUDA arm has refused this from the start (rhoCreateFields.cu); the host arm relied on the T->he
+    // whitelist firing by ACCIDENT, five field reads later, with a message about energy boundary
+    // conditions.
+    for (const FvPatch& cp : patches)
+        if (isCoupledInterfaceType(cp.type) || cp.type == "processor")
+            throw std::runtime_error(
+                "rhoSimpleFoam createFields(cpp): the mesh has a coupled patch ('" + cp.name +
+                "', type " + cp.type + "). The host factory builds coupled types as zeroGradient "
+                "placeholders for the device solvers, and no mirror driver adds the interface "
+                "coupling those placeholders stand in for. Refusing rather than solving the case as "
+                "if the interface were a wall.");
+
     // fluidThermo::New(mesh). readThermoCoeffs refuses an unsupported thermo BY NAME rather than falling
     // back to a default, so an unhandled equation of state stops here instead of silently running as a
     // perfect gas.
