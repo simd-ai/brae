@@ -2086,6 +2086,19 @@ set_tests_properties(rho_turb_limitedlinear_vs_openfoam PROPERTIES
 # and 2.83e-12 / 4.62e-10 against the host arm -- the two differ by their linear solvers (AMG-PCG
 # against BiCGStab) and by nothing else. Every other rhoSimpleFoam gate drives the step through a
 # harness that reads no controlDict and writes nothing, so none of this was gated anywhere.
+# `brae -partition` + the warm reload it promises. The AMG cache serialises the agglomeration and
+# re-Galerkins the values, but its LOAD path never rebuilt the per-level Galerkin gather lists -- so
+# every warm run died in galDiagGatherK ("amul: an illegal memory access"). Nothing was gated on a
+# warm reload, on either the compressible or the incompressible path, so nothing caught it. Asserts
+# EQUALITY, not a tolerance: a cached hierarchy must reproduce a cold one exactly.
+add_test(NAME amg_cache_warm_start
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/amg_cache_warm_start.sh)
+set_tests_properties(amg_cache_warm_start PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae
+                     TIMEOUT 1200)
+
 add_test(NAME rho_mirror_solver_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_mirror_solver_vs_openfoam.sh)
 set_tests_properties(rho_mirror_solver_vs_openfoam PROPERTIES

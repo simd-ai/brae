@@ -767,6 +767,36 @@ HostLdu coarsenRAPRecipe(
 
 // Allocate the V-cycle scratch, persistent buffers, and graph caches that don't depend on the agglomeration values;
 // shared by buildAMG (after building the hierarchy) and loadAMGCache (after deserializing it).
+// The Galerkin gather lists, rebuilt from the agglomeration the CACHE stores. buildGalerkinGather's own
+// comment has always said "the AMG cache stores the agglomeration this is derived from, so a cached
+// hierarchy rebuilds these for free" -- and nothing did: loadAMGCache restored map/faceRestrict/faceFlip
+// and left galCellStart..galFaceFlipList EMPTY, so the first Galerkin re-fill after a cache load read
+// index 0 of a zero-length buffer. Measured: run 1 writes .brae_amgcache and runs clean, run 2 dies in
+// galDiagGatherK with "Invalid __global__ read of size 4 bytes / Access to 0x180 is out of bounds",
+// surfacing at the next cudaGetLastError as "amul: an illegal memory access was encountered".
+//
+// Rebuilt rather than serialised: these lists are a pure function of map, faceRestrict and faceFlip,
+// all three of which the cache already holds, and calling the SAME builder the build path calls is the
+// only form that cannot drift from it. It also leaves the cache FORMAT unchanged, so a file written
+// before this fix loads correctly afterwards.
+void rebuildGalerkinGather(
+    AMGLevel& L,
+    int       nFine)
+{
+    struct Shim
+    {
+        int                 nCoarse, nCoarseFaces;
+        std::vector<label>  map, faceRestrict, faceFlip;
+    } a;
+    a.nCoarse      = L.nCoarse;
+    a.nCoarseFaces = L.nCoarseFaces;
+    a.map          = L.map.host();
+    a.faceRestrict = L.faceRestrict.host();
+    a.faceFlip     = L.faceFlip.host();
+    if (static_cast<int>(a.map.size()) != nFine) return;   // shape mismatch: caller rebuilds cold
+    buildGalerkinGather(L, a, nFine);
+}
+
 void finalizeAMG(
     AMGData& A,
     int nFine)

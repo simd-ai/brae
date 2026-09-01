@@ -273,25 +273,53 @@ else
 fi
 
 
-# ---- arm 11: THE SAME CASE DIRECTORY, RUN TWICE -----------------------------------------------------
+# ---- arm 11: THE SAME CASE DIRECTORY, RUN TWICE -- and the second run must agree BIT FOR BIT --------
 # Every other arm stages a pristine copy, so nothing here ever ran a solver twice over its own leftovers
-# -- and that is precisely the hole that hid a crash. Enabling the AMG hierarchy cache
-# (RhoStepInput::amgCacheDir, which the compressible path has never used) makes run 1 write
-# .brae_amgcache and run 2 die in the linear solve with "amul: an illegal memory access was
-# encountered", on rhoBox and on angledDuct alike. The cache is left off for that reason
-# (rhoSimpleFoamDriver.cu says so at the line); this arm is what fails if it is switched back on before
-# the load path is fixed, and it also covers the ordinary case of a user re-running a case in place.
-RP="$W/repeat"; stage "$RP" "$SRC" 5
+# -- and that is precisely the hole that hid a crash. The driver caches the AMG hierarchy in
+# constant/polyMesh/.brae_amgcache, so run 2 LOADS what run 1 built; the loader did not rebuild the
+# Galerkin gather lists it needs, and run 2 died in galDiagGatherK reading index 0 of a zero-length
+# buffer ("amul: an illegal memory access was encountered"). Fixed in loadAMGCache.
+#
+# The bound is EQUALITY, not a tolerance: the cache stores the agglomeration STRUCTURE and the matrix
+# values are re-Galerkined every step, so a warm run must reproduce a cold one exactly. Anything else
+# means the cached hierarchy is not the built one, which a tolerance would hide.
+RP="$W/repeat"; stage "$RP" "$SRC" 30
+rm -f "$RP/constant/polyMesh/.brae_amgcache"
 for pass in 1 2; do
-    if ( cd "$RP" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BIN" -case "$RP" > "repeat$pass.log" 2>&1 ); then
-        grep -q "^End" "$RP/repeat$pass.log" \
-            && say "the CUDA arm runs a second time in the same directory (pass $pass)" ok \
-            || { tail -4 "$RP/repeat$pass.log"; say "the CUDA arm runs a second time in the same directory (pass $pass)" FAIL; }
+    if ( cd "$RP" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BIN" -case "$RP" > "repeat$pass.log" 2>&1 ) \
+       && grep -q "^End" "$RP/repeat$pass.log"; then
+        say "the CUDA arm runs in the same directory (pass $pass)" ok
     else
-        tail -4 "$RP/repeat$pass.log"
-        say "the CUDA arm runs a second time in the same directory (pass $pass)" FAIL
+        tail -4 "$RP/repeat$pass.log"; say "the CUDA arm runs in the same directory (pass $pass)" FAIL
     fi
+    [ "$pass" = 1 ] && { rm -rf "$W/cold"; cp -r "$RP/30" "$W/cold"; rm -rf "$RP/30"; }
 done
+[ -f "$RP/constant/polyMesh/.brae_amgcache" ] \
+    && say "...and the run actually wrote an AMG cache (else the arm is vacuous)" ok \
+    || say "...and the run actually wrote an AMG cache (else the arm is vacuous)" FAIL
+COLD="$W/cold" WARM="$RP/30" python3 - <<'PYEOF' || fail=1
+import os, re, sys
+import numpy as np
+def read(p):
+    try: s = open(p).read()
+    except OSError: return None
+    m = re.search(r'internalField\s+nonuniform\s+List<(scalar|vector)>\s*\n?(\d+)\s*\n\(\n(.*?)\n\)\s*;', s, re.S)
+    if not m: return None
+    if m.group(1) == 'scalar':
+        return np.array([float(x) for x in m.group(3).split()])
+    return np.array([[float(c) for c in v.split()] for v in re.findall(r'\(([^)]*)\)', m.group(3))])
+ok = True
+for fld in ('p', 'T', 'U', 'rho', 'phi'):
+    a = read(os.path.join(os.environ['COLD'], fld))
+    b = read(os.path.join(os.environ['WARM'], fld))
+    if a is None or b is None or a.shape != b.shape:
+        print('     cache %-4s MISSING or shape mismatch   FAIL' % fld); ok = False; continue
+    d = float(np.max(np.abs(a - b)))
+    print('     cache %-4s cold vs warm max|diff| %.3e   %s' % (fld, d, 'ok' if d == 0.0 else 'FAIL'))
+    ok = ok and d == 0.0
+sys.exit(0 if ok else 1)
+PYEOF
+say "a cache-loaded hierarchy reproduces a cold one bit for bit" "$([ $fail = 0 ] && echo ok || echo FAIL)"
 
 # ---- arm 12: the porous zone reaches the DEVICE momentum equation ----------------------------------
 # rhoUEqn.cu has applied a porous zone since it was written and nothing built a DevicePorosity for this

@@ -247,15 +247,15 @@ int runMirrorCuda(const std::string& caseDir)
     RhoDeviceFields dev = createDeviceFields(hf, m, g, patches);
     DevicePorosity porosity;   // outlives gin: RhoStepInput::porosity points into it
     RhoStepInput gin = buildDeviceStepInput(hin, hf, refusals, dev, patches, porosity);
-    // THE AMG HIERARCHY CACHE IS DELIBERATELY NOT ENABLED, and this is the measurement that decided it.
-    // Setting `gin.amgCacheDir = caseDir + "/constant/polyMesh"` is a one-line change and it does reach
-    // the cache the compressible path has never used -- but the SECOND run in the same case directory
-    // then dies in the linear solve with "amul: an illegal memory access was encountered", on rhoBox
-    // (1200 cells) and on angledDuctExplicitFixedCoeff (28000) alike: run 1 writes .brae_amgcache and
-    // runs clean, run 2 loads it and crashes. So the cache LOAD path is broken for this solver, and a
-    // cold hierarchy every run is the slower, correct behaviour until that is fixed and gated.
-    // The repeat-run arm in tests/rho_mirror_solver_vs_openfoam.sh is what would have caught it and is
-    // what will catch it again when someone re-enables this.
+    // The AMG hierarchy cache: built once per mesh, reloaded on every later run in the same case
+    // directory. The agglomeration is the AMG build cost and is static per mesh, so this is pure
+    // set-up time -- and it is now safe to use: the cache's load path did not rebuild the Galerkin
+    // gather lists, so run 1 wrote .brae_amgcache and run 2 died in galDiagGatherK reading index 0 of a
+    // zero-length buffer (surfacing as "amul: an illegal memory access"). Fixed in the loader
+    // (rebuildGalerkinGather), and a cache-loaded hierarchy now reproduces a cold one BIT-IDENTICALLY
+    // on p, T, U, rho and phi over 30 iterations -- which is the property that matters: this may cost
+    // nothing but time, and it must change no answer.
+    gin.amgCacheDir = caseDir + "/constant/polyMesh";
 
     RhoSolverWorkspace w;
 

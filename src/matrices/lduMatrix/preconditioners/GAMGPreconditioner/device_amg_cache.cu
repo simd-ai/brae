@@ -127,6 +127,10 @@ bool loadAMGCache(
         L.cDiag.resize(L.nCoarse);
         L.cUpper.resize(L.nCoarseFaces);
         L.cLower.resize(L.nCoarseFaces);   // VALUES via Galerkin
+        // ...and the gather lists the Galerkin re-fill indexes with. They are NOT in the file: they are
+        // a pure function of map/faceRestrict/faceFlip, which are, so they are rebuilt through the same
+        // builder the build path uses. Without this every cached run died on its first Galerkin.
+        rebuildGalerkinGather(L, L.nFine);
     }
     int nCol = 0;
     ok = ok && std::fread(&nCol,sizeof(nCol),1,f)==1;

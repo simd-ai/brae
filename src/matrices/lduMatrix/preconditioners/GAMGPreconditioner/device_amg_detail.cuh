@@ -28,6 +28,10 @@ namespace brae {
 struct AMGData;                              // fwd (full definition in device_amg.cuh)
 void finalizeAMG(AMGData& A, int nFine);
 
+// The per-level Galerkin gather lists, rebuilt from the agglomeration a cache load restores. Declared
+// here because loadAMGCache lives in its own translation unit and must call it for every level.
+void rebuildGalerkinGather(AMGLevel& L, int nFine);
+
 constexpr int TPB = 256;
 constexpr scalar OMEGA = 0.8;          // weighted-Jacobi relaxation
 constexpr int NPRE = 1, NPOST = 1, NCOARSE = 500;
