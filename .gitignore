@@ -41,6 +41,7 @@ validation/*
 !validation/pitzDailyTurbBig/
 !validation/rhoBox/
 !validation/rhoBoxE/
+!validation/ablBox/
 !validation/simpleBoxIO/
 !validation/rhoBoxDF/
 !validation/rhoBoxF/
@@ -73,6 +74,7 @@ validation/*
 !validation/sa_vs_openfoam.sh
 !validation/io_vs_openfoam.sh
 !validation/ti_vs_openfoam.sh
+!validation/abl_vs_openfoam.sh
 !validation/adjm_vs_openfoam.sh
 !validation/df_vs_openfoam.sh
 !validation/tf_vs_openfoam.sh
@@ -108,3 +110,5 @@ demo/delta/constant/polyMesh/
 demo/delta/constant/extendedFeatureEdgeMesh/
 demo/delta/constant/triSurface/*
 !demo/delta/constant/triSurface/README
+
+.claude/*

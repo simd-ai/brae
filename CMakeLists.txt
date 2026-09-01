@@ -1649,6 +1649,13 @@ set_tests_properties(ffp_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
 add_executable(test_simple_adjustphi_cpp tests/test_simple_adjustphi_cpp.cu)
 target_include_directories(test_simple_adjustphi_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_simple_adjustphi_cpp PRIVATE brae_core)
+add_executable(test_abl_profile tests/test_abl_profile.cu)
+target_include_directories(test_abl_profile PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_abl_profile PRIVATE brae_core)
+add_test(NAME abl_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/abl_vs_openfoam.sh)
+set_tests_properties(abl_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
 add_test(NAME adjm_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/adjm_vs_openfoam.sh)
 set_tests_properties(adjm_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)

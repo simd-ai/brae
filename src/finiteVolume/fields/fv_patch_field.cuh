@@ -1864,9 +1864,16 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
                 const vector& c = p.Cf[i];
                 scalar zr = c.x*zh.x + c.y*zh.y + c.z*zh.z - groundMin - d.ablD;
                 if (zr < 0) zr = 0;
-                vals[i] = isK   ? Ustar*Ustar / std::sqrt(Cmu)
-                        : isEps ? Ustar*Ustar*Ustar / (kap * (zr + z0))
-                                : Ustar / (std::sqrt(Cmu) * kap * (zr + z0));
+                // The YGCJ factor sqrt(C1*log((z+z0)/z0) + C2) rides on k (atmBoundaryLayer.C:238-240)
+                // and epsilon (:252-254) but NOT omega (:258-267). At the defaults C1=0, C2=1 it is
+                // IEEE-exactly 1; the ygcj guard skips the multiply entirely there so the five green
+                // turbineSiting gates stay bit-identical by construction.
+                const bool   ygcj = (d.ablC1 != 0.0 || d.ablC2 != 1.0);
+                const scalar fac  = ygcj ? std::sqrt(d.ablC1 * std::log((zr + z0) / z0) + d.ablC2)
+                                         : scalar(1);
+                vals[i] = isK   ? fac * Ustar*Ustar / std::sqrt(Cmu)
+                        : isEps ? fac * Ustar*Ustar*Ustar / (kap * (zr + z0))
+                                :       Ustar / (std::sqrt(Cmu) * kap * (zr + z0));
             }
             return std::make_unique<FixedValuePatchField<scalar>>(p, false, scalar{}, vals);
         }

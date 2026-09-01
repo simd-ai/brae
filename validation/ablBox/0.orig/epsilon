@@ -1,0 +1,8 @@
+FoamFile { version 2.0; format ascii; class volScalarField; object epsilon; }
+dimensions [0 2 -3 0 0 0 0];
+internalField uniform 0.01;
+boundaryField {
+  inlet  { type atmBoundaryLayerInletEpsilon; flowDir (1 0 0); zDir (0 1 0); Uref 10; Zref 20; z0 uniform 0.1; d uniform 0; kappa 0.41; Cmu 0.09; C1 0.17; C2 0.6; value uniform 0.01; }
+  outlet { type zeroGradient; } ground { type epsilonWallFunction; value uniform 0.01; }
+  top    { type zeroGradient; } frontBack { type empty; }
+}

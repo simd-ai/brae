@@ -301,6 +301,15 @@ FvScalarMatrix assemblePEqn(
         const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
             st.rhorAUf, p, gradP, m, g, patches, in.snGradLimitCoeff);
         for (label c = 0; c < nC; ++c) M.source[c] -= corr[c];
+        // ...and the SAME correction as a face flux, or `phi = phiHbyA + pEqn.flux()` drops what the
+        // source above put in and phi stops being conservative on a non-orthogonal mesh (OF stores it
+        // in gaussLaplacianScheme whenever corrected && fluxRequired(p), which createFields.H:43 sets
+        // unconditionally; fvMatrix::flux() adds it back at fvMatrix.C:1516-1518). This line existed
+        // on the incompressible twin (pEqn_cpp.cu) and NOT here -- the rho driver negated an empty
+        // vector for as long as the census took to notice. Identical function + identical arguments
+        // as the source term, so the two cannot drift.
+        M.faceFluxCorrection = fvm::laplacianCorrFlux<scalar, vector>(
+            st.rhorAUf, gradP, m, g, in.snGradLimitCoeff, &p);
     }
     for (label c = 0; c < nC; ++c)
     {

@@ -283,6 +283,10 @@ FvScalarMatrix assemblePcEqn(
         const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
             gammaf, p, gradP, m, g, patches, in.snGradLimitCoeff);
         for (label c = 0; c < nC; ++c) M.source[c] -= corr[c];
+        // The flux half of the same correction -- see rhoPEqn_cpp.cu; the negation loop below already
+        // covered faceFluxCorrection, negating an empty vector until this line existed.
+        M.faceFluxCorrection = fvm::laplacianCorrFlux<scalar, vector>(
+            gammaf, gradP, m, g, in.snGradLimitCoeff, &p);
     }
     for (label c = 0; c < nC; ++c)
     {

@@ -150,6 +150,10 @@ struct PatchFieldData
     // eps=u*^3/(kappa(z-d+z0)); omega=u*/(sqrt(Cmu)kappa(z-d+z0)); z = Cf.zDir.
     bool   hasABL = false;
     scalar ablUref = 0, ablZref = 0, ablZ0 = 0.1, ablD = 0, ablKappa = 0.41, ablCmu = 0.09;
+    // YGCJ curve-fit coefficients (atmBoundaryLayer.C:70-71 getOrDefault; .H:178-179). The DEFAULTS
+    // make sqrt(C1*log(..)+C2) exactly 1, which is the only profile brae computed before these were
+    // parsed -- a case setting either got the default silently.
+    scalar ablC1 = 0.0, ablC2 = 1.0;
     bool   atmBoundNut = true;   // atmNutkWallFunction boundNut option (clamp nut>=0); z0 is stored in ablZ0.
     // epsilonWallFunction `lowReCorrection` (epsilonWallFunctionFvPatchScalarField.C:414,
     // getOrDefault("lowReCorrection", false)). On a face with y+ < yPlusLam it switches epsilon from the
@@ -496,6 +500,15 @@ inline FieldData<T> readField(const std::string& path)
                             p.ablD = ts.nextScalar();
                             ts.expect(";");
                         }
+                    }
+                    else if ((key == "C1" || key == "C2") && p.hasABL)
+                    {
+                        // GATED on hasABL: bare C1/C2 are also kEpsilon coefficient names, and an
+                        // ungated parse would swallow an unrelated entry that today skips harmlessly.
+                        const scalar v = ts.nextScalar();
+                        if (key == "C1") p.ablC1 = v;
+                        else             p.ablC2 = v;
+                        ts.expect(";");
                     }
                     else if ((key == "kappa" || key == "Cmu") && p.hasABL)
                     {

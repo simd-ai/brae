@@ -117,7 +117,11 @@ inline void writePatchEntry(
            << "        z0              constant " << d.ablZ0   << ";\n"
            << "        d               constant " << d.ablD    << ";\n"
            << "        kappa           " << d.ablKappa << ";\n"
-           << "        Cmu             " << d.ablCmu   << ";\n";
+           << "        Cmu             " << d.ablCmu   << ";\n"
+           // OF always writes C1/C2 (atmBoundaryLayer.C write); losing a non-default pair on a
+           // roundtrip would silently reset the YGCJ profile to the flat one.
+           << "        C1              " << d.ablC1    << ";\n"
+           << "        C2              " << d.ablC2    << ";\n";
     }
     // atmNutkWallFunction takes its roughness length as a PatchFunction1 that OF REQUIRES, and z0 IS the
     // terrain: a field written without it cannot be read back, and a z0 quietly lost would turn a rough
