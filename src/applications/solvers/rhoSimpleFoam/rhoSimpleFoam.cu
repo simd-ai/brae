@@ -200,6 +200,14 @@ void updateBoundaryCoeffs(
         deviceBCValue(dbU.comp[1], f.Uy, uby);
         deviceBCValue(dbU.comp[2], f.Uz, ubz);
         deviceUpdatePressureInletOutletVelocity(dbU, f.phiBnd, f.Ux, f.Uy, f.Uz);
+        // symmetry/slip and wedge, against THIS iteration's cell velocity -- the header's caller
+        // contract has listed both since it was written (rhoUEqn.cuh, clause 3), and the incompressible
+        // driver has always run them (device_simple_foam.cu:955-956); this driver did not, which no
+        // axis-aligned fixture could see: with n along one axis the per-component vf=|n_k| decouples
+        // and the stale snapshot equals the fresh one. A TILTED symmetry plane (rhoBoxSym) couples the
+        // components and is where the missing calls measured.
+        deviceUpdateSymmetry(dbU, f.Ux, f.Uy, f.Uz);
+        deviceUpdateWedge(dbU, f.Ux, f.Uy, f.Uz);
         deviceUpdateTotalPressure(dbP, f.phiBnd, ubx, uby, ubz, &f.rhoBnd);
         deviceBCValue(dbP, f.p, f.pBnd);
     }

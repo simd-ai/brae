@@ -67,6 +67,27 @@ RhoDeviceFields createDeviceFields(
         // The PREDICATE, not a hand list: buildPatches also accepts cyclicPeriodicAMI, which the
         // four-name list let slip. isCoupledInterfaceType is the same test the V2 envelope and the
         // host guard use; processor is outside it and named separately everywhere.
+        // TILTED symmetry/slip: the device's segregated per-component treatment (vf=|n_k| with the
+        // ref rebuilt from the cell velocity) matches OpenFOAM only when the plane normal lies along
+        // one axis -- measured on rhoBoxSym (a symmetryPlane at ~4 degrees): the HOST mirror lands
+        // U 8.2e-06 from OpenFOAM while the device arm drifts from iteration 1 (Uy 2.8e-05 -> 9.5e-01
+        // by iteration 6) even with deviceUpdateSymmetry wired. Refusing the tilted case on this arm
+        // by name; the axis-aligned set stays admitted, and the host arm carries the tilted gate.
+        if (p.type == "symmetry" || p.type == "symmetryPlane" || p.type == "slip")
+        {
+            for (label i = 0; i < p.size; ++i)
+            {
+                const vector& nf = p.nf[i];
+                int big = (std::fabs(nf.x) > 1e-6) + (std::fabs(nf.y) > 1e-6) + (std::fabs(nf.z) > 1e-6);
+                if (big > 1)
+                    throw std::runtime_error(
+                        "rhoSimpleFoam createFields(cuda): patch '" + p.name + "' is " + p.type +
+                        " with a normal not aligned to a coordinate axis. The device's segregated "
+                        "symmetry treatment is exact only for axis-aligned planes; the host mirror "
+                        "handles the tilted case and is gated on it (sym_vs_openfoam). Refusing "
+                        "rather than drifting from the first iteration.");
+            }
+        }
         if (isCoupledInterfaceType(p.type) || p.type == "processor")
         {
             throw std::runtime_error(
