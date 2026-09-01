@@ -149,6 +149,15 @@ struct PatchFieldData
     // face from Cf). u* = kappa*|Uref|/ln((Zref+z0)/z0); U(z)=(u*/kappa)ln((z-d+z0)/z0)*flowDir; k=u*^2/sqrt(Cmu);
     // eps=u*^3/(kappa(z-d+z0)); omega=u*/(sqrt(Cmu)kappa(z-d+z0)); z = Cf.zDir.
     bool   hasABL = false;
+    // timeVaryingMappedFixedValue extras. mapMethod default is OF's PLANAR interpolation
+    // (pointToPointPlanarInterpolation); `nearest` selects the matchPoints copy brae used to run for
+    // EVERYTHING -- a silent substitution that staircased any profile coarser than the mesh. A key the
+    // steady scope cannot honour lands in mapUnsupported and the factory refuses by name.
+    bool        mapMethodNearest = false;
+    bool        hasMapOffset = false;
+    T           mapOffsetValue{};
+    std::string mapUnsupported;
+    scalar      mapFilterRadius = 0; label mapFilterSweeps = 0;   // refused only as the ENGAGED pair
     scalar ablUref = 0, ablZref = 0, ablZ0 = 0.1, ablD = 0, ablKappa = 0.41, ablCmu = 0.09;
     // YGCJ curve-fit coefficients (atmBoundaryLayer.C:70-71 getOrDefault; .H:178-179). The DEFAULTS
     // make sqrt(C1*log(..)+C2) exactly 1, which is the only profile brae computed before these were
@@ -345,6 +354,34 @@ inline void readTimeVaryingMapped(
         catch (...) {}
     }
     if (best.empty()) return;
+    // ALL numeric dirs are OF's sample times (MappedFile.C:520): more than one means the value
+    // interpolates linearly in t -- on a steady solver, in ITERATION COUNT -- and ends holding the
+    // LAST dir, while holding the smallest (what brae does) is exact only for a single dir. Refuse
+    // the multi-dir table by name rather than run a different profile per iteration count.
+    int nDirs = 0;
+    for (const auto& e : fs::directory_iterator(bd))
+    {
+        if (!e.is_directory()) continue;
+        try { (void)std::stod(e.path().filename().string()); ++nDirs; } catch (...) {}
+    }
+    if (nDirs > 1)
+        throw std::runtime_error(
+            "brae: timeVaryingMappedFixedValue on patch '" + patchName + "' has " +
+            std::to_string(nDirs) + " boundaryData time directories. A steady solver would "
+            "interpolate the profile in ITERATION COUNT (MappedFile.C value()); brae holds one "
+            "directory exactly and refuses a table. Keep a single time directory.");
+    // OF FATALS when the run time is below the smallest sample time (instant::findRange ->
+    // MappedFile.C:593-604); brae used to run silently there. The field's own time dir is t0.
+    {
+        double t0 = 0.0; bool haveT0 = false;
+        try { t0 = std::stod(timeP.substr(timeP.rfind('/') + 1)); haveT0 = true; } catch (...) {}
+        if (haveT0 && t0 < bestT - 1e-12)
+            throw std::runtime_error(
+                "brae: timeVaryingMappedFixedValue on patch '" + patchName + "': the run time " +
+                std::to_string(t0) + " is below the boundaryData sample time " + best +
+                ". OpenFOAM fatals here (MappedFile.C:593-604); brae will not silently run before "
+                "the table starts.");
+    }
     p.mapPoints = readBoundaryDataList<vector>(bd + "/points");
     p.mapValues = readBoundaryDataList<T>(bd + "/" + best + "/" + field);
     p.hasMapData = (p.mapPoints.size() == p.mapValues.size() && !p.mapPoints.empty());
@@ -380,7 +417,8 @@ inline FieldData<scalar> symmTensorComponent(const FieldData<symmTensor>& fd, in
     for (const PatchFieldData<symmTensor>& p : fd.boundary)
     {
         if (p.hasGradient || p.hasInletValue || p.hasRefValue || p.hasValueFraction || p.hasMapData
-         || p.hasNormalRef || p.hasFlowRate || !p.unsupportedFunction1.empty())
+         || p.hasNormalRef || p.hasFlowRate || !p.unsupportedFunction1.empty()
+         || p.hasMapOffset || !p.mapUnsupported.empty())
             throw std::runtime_error(
                 "brae: sigma patch '" + p.name + "' is a '" + p.type + "', whose data brae does not know "
                 "how to split into components. The Maxwell stress supports fixedValue, zeroGradient and "
@@ -526,6 +564,63 @@ inline FieldData<T> readField(const std::string& path)
                                             || p.type == "uniformNormalFixedValue"))
                     {
                         p.unsupportedFunction1 = "ramp";
+                        skipToSemicolon(ts, 0);
+                        ts.expect(";");
+                    }
+                    // timeVaryingMappedFixedValue keys -- parsed where the STEADY scope can honour
+                    // them, marked for refusal where it cannot (the factory throws on mapUnsupported).
+                    else if (key == "mapMethod" && p.type == "timeVaryingMappedFixedValue")
+                    {
+                        const std::string mm = ts.next();
+                        if (mm == "nearest") p.mapMethodNearest = true;
+                        else if (mm.rfind("planar", 0) != 0)
+                            p.mapUnsupported = "mapMethod " + mm;   // OF fatals too (MappedFile.C:117-130)
+                        ts.expect(";");
+                    }
+                    else if (key == "offset" && p.type == "timeVaryingMappedFixedValue")
+                    {
+                        // A Function1 added AFTER mapping (MappedFile.C:743-747). Constant forms are
+                        // exact at steady; any other form (table, csvFile, ...) is refused by name.
+                        const std::string m0 = ts.peek();
+                        if (m0 == "constant" || m0 == "uniform" || m0 == "(" 
+                         || (!m0.empty() && m0.find_first_not_of("+-.0123456789eE") == std::string::npos))
+                        {
+                            if (m0 == "constant" || m0 == "uniform") ts.next();
+                            p.mapOffsetValue = readFoamValue<T>(ts);
+                            p.hasMapOffset = true;
+                        }
+                        else
+                        {
+                            p.mapUnsupported = "offset " + m0;
+                            skipToSemicolon(ts, 0);
+                        }
+                        ts.expect(";");
+                    }
+                    else if (key == "setAverage" && p.type == "timeVaryingMappedFixedValue")
+                    {
+                        const std::string v = ts.next();
+                        if (v == "true" || v == "yes" || v == "on" || v == "1")
+                            p.mapUnsupported = "setAverage";   // rescales to the file average -- fully matters at steady
+                        ts.expect(";");
+                    }
+                    else if (key == "perturb" && p.type == "timeVaryingMappedFixedValue")
+                    {
+                        (void)ts.nextScalar();   // triangulation tie-break only; brae triangulates unperturbed
+                        ts.expect(";");
+                    }
+                    else if (key == "filterRadius" && p.type == "timeVaryingMappedFixedValue")
+                    { p.mapFilterRadius = ts.nextScalar(); ts.expect(";"); }
+                    else if (key == "filterSweeps" && p.type == "timeVaryingMappedFixedValue")
+                    { p.mapFilterSweeps = ts.nextLabel(); ts.expect(";"); }
+                    else if ((key == "sampleFormat" || key == "sampleFile" || key == "coordinateSystem"
+                           || key == "scale1" || key == "scale2" || key == "scale3"
+                           || key == "points" || key == "fieldTable")
+                          && p.type == "timeVaryingMappedFixedValue")
+                    {
+                        // fieldTable is DEAD on this BC in v2412 (the 5-arg MappedFile ctor never
+                        // reads it) -- accepted and skipped; everything else here changes the mapping
+                        // in ways the steady scope does not implement.
+                        if (key != "fieldTable") p.mapUnsupported = key;
                         skipToSemicolon(ts, 0);
                         ts.expect(";");
                     }
