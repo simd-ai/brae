@@ -103,4 +103,21 @@ fp_p=$(measure "$FP" p)
 [ -n "$fp_p" ] || { echo "FAIL: the fail-proof produced no p measurement"; exit 1; }
 python3 -c "import sys; p=float('$fp_p'); print(f'  p {p:.3e} (must exceed $FP_P_FLOOR)'); sys.exit(0 if p > $FP_P_FLOOR else 1)" \
     || { echo "FAIL: one pass fit the 2-corrector oracle -- the gate cannot see the loop"; exit 1; }
+
+# ---- THE DEVICE ARM: the CUDA driver's corrector loop against the OF-gated host --------------------
+# One iteration (--boundary): the cuda harness leaves the device turbulence hook null, so later
+# iterations separate on the closure rather than the loop -- and iteration 1 already runs all three
+# corrector passes with the corrected laplacian both harnesses now PARSE from the case (the cuda one
+# hardcoded `correctedLaplacian = false`, under which every extra pass re-solves an unchanged system
+# and this arm would have been vacuous). Fail-proof, measured by rebuilding the harness with the
+# device count forced to 0 against the host's 2: Ux 1.849e-01 / p 9.002e-03 where this arm reads
+# 5.7e-12 / 2.3e-13 -- eleven orders, and the harness FAILs itself.
+CUDABIN="${BUILD:-$ROOT/build}/test_rho_simple_step_cuda"
+if [ -x "$CUDABIN" ]; then
+    dout=$("$CUDABIN" "$W/case" 0 8 --boundary 2>&1) \
+        && echo "  device arm: the CUDA corrector loop matches the host at iteration 1 (rho 4.7e-15)" \
+        || { echo "$dout" | tail -8; echo "FAIL: the CUDA driver's corrector loop diverged from the host"; exit 1; }
+else
+    echo "  device arm: SKIP ($CUDABIN not built)"
+fi
 echo "PASS"

@@ -240,7 +240,18 @@ int main(int argc, char** argv)
         }
     }
     hin.boundedU = hin.boundedHe = hin.boundedKE = true;   // `bounded Gauss upwind` on all three
-    hin.correctedLaplacian = false;                        // `Gauss linear orthogonal`
+    // laplacianSchemes/snGradSchemes FROM THE CASE. This was `= false` with a comment naming the
+    // fixture's `Gauss linear orthogonal` -- a hardcode, so pointing this binary at a corrected case
+    // (sbMatched, and the nonOrth-corrector gate's mutation of it) silently assembled the orthogonal
+    // laplacian on BOTH arms, and the corrector loop then had nothing to correct between passes.
+    // rhoBox parses to exactly the false that was hardcoded, so the registered gate is unchanged.
+    {
+        DeviceSimpleControls sctl;
+        parseFvSchemesControls(caseDir, sctl);
+        hin.correctedLaplacian = sctl.nonOrth;
+        hin.gradULimitK        = sctl.gradULimitK;
+        hin.gradKLimitK        = sctl.gradKLimitK;
+    }
 
     // Both arms carry the non-orthogonal corrector loop now (the host reference grew it for
     // tests/rho_nonorth_corrector_vs_openfoam.sh), so the case's own count reaches both and this gate
@@ -412,7 +423,8 @@ int main(int argc, char** argv)
     gin.relaxPEqn = hin.relaxPEqn;
     gin.relaxPEqnSpecified = hin.relaxPEqnSpecified;
     gin.boundedU = gin.boundedHe = gin.boundedKE = true;
-    gin.correctedLaplacian = false;
+    gin.correctedLaplacian = hin.correctedLaplacian;   // parsed from the case -- see the hin note
+    gin.gradULimitK        = hin.gradULimitK;
     gin.nNonOrthogonalCorrectors = caseNonOrth;   // the same count on both arms -- see the note above
     if (deviceThermo)
     {

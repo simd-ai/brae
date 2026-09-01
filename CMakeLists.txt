@@ -2066,7 +2066,10 @@ set_tests_properties(rho_turb_limitedlinear_vs_openfoam PROPERTIES
 # used to skip entirely -- one pressure solve whatever the case named. Compared at a matched EARLY
 # iteration because the count is a trajectory feature: at convergence every extra pass re-solves an
 # unchanged system and no converged gate can see it. The fail-proof replays the old defect (one pass
-# against the 2-corrector oracle) and reads p 1.51e-01 where the arm reads 3.97e-04.
+# against the 2-corrector oracle) and reads p 1.51e-01 where the arm reads 3.97e-04. Also carries the
+# DEVICE arm: the CUDA driver's loop vs the OF-gated host at iteration 1 on the same mutation (its
+# harness used to hardcode correctedLaplacian=false, under which the loop had nothing to correct);
+# forcing the device count to 0 reads Ux 1.85e-01 against the arm's 5.7e-12.
 add_test(NAME rho_nonorth_corrector_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_nonorth_corrector_vs_openfoam.sh)
 set_tests_properties(rho_nonorth_corrector_vs_openfoam PROPERTIES
