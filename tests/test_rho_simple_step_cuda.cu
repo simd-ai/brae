@@ -54,6 +54,7 @@
 #include "kEpsilon.cuh"
 #include "rhoCaseRefusals.cuh"
 #include "rhoTurbulenceHook.cuh"   // correctTurbulence: the device-resident closure hook the driver ships
+#include "rhoSimpleFoamDriver.cuh"   // buildDeviceStepInput: the device input struct the driver ships
 #include "scheme_parse.cuh"     // parseFieldDivScheme -- div(phi,k|epsilon|omega) from the case          // gpu::kEpsilonRAS -- the device closure the turbulent arm drives
 #include "transport_model.cuh"   // transportMu: nu = mu(T)/rho for the closure inputs
 #include "linearViscousStress_cpp.cuh"   // effectiveFaceViscosity -- the host driver's own rho interpolation
@@ -320,24 +321,21 @@ int main(int argc, char** argv)
         gf.psiBnd.copyFrom(flat(df.psiBnd, fvp, dm.nBndFaces, 0.0));
     };
 
-    gpu::rhoSimple::RhoStepInput gin;
-    gin.hasMRF = cr.hasMRF;
-    gin.hasFvOptions = cr.hasFvOptions || !cr.opts.empty();   // no device fvOptions consumer exists
-    gin.fvOptionUnsupported = !cr.fvOptionUnsupported.empty() ? cr.fvOptionUnsupported
-                            : (!cr.opts.empty() ? std::string("implemented on the host arm only") : std::string());
-    for (const FvPatch& cpp_ : fvp)
-        if (isCoupledInterfaceType(cpp_.type) || cpp_.type == "processor") gin.hasCoupledPatches = true;
+    // THE DEVICE INPUT, through the SHARED builder the runnable CUDA driver uses
+    // (rhoSimpleFoamDriver.cuh). Every field below used to be filled here by hand, including a blanket
+    // `hasFvOptions = ... || !cr.opts.empty()` justified as "no device fvOptions consumer exists" --
+    // which was wrong: rhoUEqn.cu applies a porous zone and says so in its own refusal. The builder
+    // projects it (and refuses, per option, what has no device consumer); the harness then overrides
+    // only what a GATE needs differently, immediately below.
+    static DevicePorosity ginPorosity;   // outlives gin: gin.porosity points into it
+    gpu::rhoSimple::RhoStepInput gin =
+        gpu::rhoSimple::buildDeviceStepInput(hin, hf, cr, dev, fvp, ginPorosity);
     // constrainHbyA's mask and adjustPhi's mask, from the projection. They answer DIFFERENT questions
     // and rhoCreateFields.cu is where that distinction is made once.
-    gin.takeUAtBoundary = &dev.takeUAtBoundary;
-    gin.adjustable      = &dev.adjustable;
-    gin.consistent = hin.consistent;
-    gin.transonic  = hin.transonic;
-    gin.isE = (hf.heName == "e");
+    // A GATE pins the linear solve so it is out of the comparison; the SOLVER reads the case's own
+    // tolerances (rhoSimpleFoamDriver.cu). The one deliberate difference between the two, named here.
     gin.tolU = gin.tolHe = gin.tolP = 1e-14;
     gin.maxIter = 2000;
-    gin.pRefCell  = hf.pressureControl.refCell;
-    gin.pRefValue = hf.pressureControl.refValue;
 
     // THE CASE'S OWN pressureControl, on every arm. The forced-limiter block below overrides these with
     // bounds tightened to make the clamp bite, and it is SKIPPED on the boundary and turbulent arms --

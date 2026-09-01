@@ -9,6 +9,7 @@
 #include "residual_control.cuh"
 #include "rhoSimpleFoamDriver_cpp.cuh"   // buildStepInput: the SHARED case -> StepInput parse
 #include "rhoThermoDevice.cuh"           // effectiveTransport, device-resident
+#include "thermo_model.cuh"              // hConstTToHe: limitTemperature is a T limit, the device clamps he
 #include "rhoTurbulenceHook.cuh"         // correctTurbulence, device-resident
 #include "solver_controls.cuh"
 #include "write_control.cuh"
@@ -29,18 +30,102 @@ RhoStepInput buildDeviceStepInput(
     const cpu::rhoSimple::RhoSimpleFields& hf,
     const cpu::rhoSimple::CaseRefusals&    refusals,
     const RhoDeviceFields&                 dev,
-    const std::vector<FvPatch>&            patches)
+    const std::vector<FvPatch>&            patches,
+    DevicePorosity&                        porosity)
 {
     RhoStepInput in;
 
-    // The refusals, as the DEVICE arm must see them. fvOptions is the one that differs by construction:
-    // the host arm implements a set of them (refusals.opts) and there is no device consumer, so an
-    // implemented option is still an UNPORTED one here and says so rather than being dropped.
-    in.hasMRF       = refusals.hasMRF;
-    in.hasFvOptions = refusals.hasFvOptions || !refusals.opts.empty();
-    in.fvOptionUnsupported =
-        !refusals.fvOptionUnsupported.empty() ? refusals.fvOptionUnsupported
-      : (!refusals.opts.empty() ? std::string("implemented on the host arm only") : std::string());
+    in.hasMRF              = refusals.hasMRF;
+    in.hasFvOptions        = refusals.hasFvOptions;
+    in.fvOptionUnsupported = refusals.fvOptionUnsupported;
+
+    // THE POROUS ZONE, projected onto the device. rhoUEqn.cu applies it (in.porosity) and says so in
+    // its own refusal -- "explicitPorositySource (fixedCoeff) IS implemented" -- but nothing built a
+    // DevicePorosity for this driver, so every fvOption the host arm implements was reported here as
+    // "implemented on the host arm only" and the run refused. That turned OpenFOAM's own
+    // angledDuctExplicitFixedCoeff tutorial into a case the host arm ran and the device arm would not,
+    // for no reason but a missing projection.
+    //
+    // What is NOT projected still refuses, by name and per option: anything the host parse marked
+    // unsupported, and any implemented option that is not a porosity (there is no device consumer for
+    // the temperature/scalar constraints -- the host arm carries those).
+    for (const auto& o : refusals.opts.options)
+    {
+        if (!o.active) continue;
+        if (!o.unsupported.empty())
+        {
+            in.hasFvOptions = true;
+            if (in.fvOptionUnsupported.empty()) in.fvOptionUnsupported = o.unsupported;
+            continue;
+        }
+        if (o.type != "explicitPorositySource")
+        {
+            in.hasFvOptions = true;
+            if (in.fvOptionUnsupported.empty())
+                in.fvOptionUnsupported = o.type + " (implemented on the host arm only)";
+            continue;
+        }
+        // A ROTATED coordinate system is refused rather than silently flattened: the device kernel
+        // takes DIAGONAL Darcy coefficients, and dropping D's off-diagonals applies the resistance
+        // along the wrong axes. fixedCoeff carries FULL transformed tensors, so it has no such limit.
+        if (!o.fixedCoeff)
+        {
+            const scalar offD = std::fabs(o.D.xy) + std::fabs(o.D.xz) + std::fabs(o.D.yz)
+                              + std::fabs(o.D.yx) + std::fabs(o.D.zx) + std::fabs(o.D.zy);
+            const scalar offF = std::fabs(o.F.xy) + std::fabs(o.F.xz) + std::fabs(o.F.yz)
+                              + std::fabs(o.F.yx) + std::fabs(o.F.zx) + std::fabs(o.F.zy);
+            const scalar sc = std::fabs(o.D.xx) + std::fabs(o.D.yy) + std::fabs(o.D.zz) + 1.0;
+            if (offD + offF > scalar(1e-10) * sc)
+            {
+                in.hasFvOptions = true;
+                if (in.fvOptionUnsupported.empty())
+                    in.fvOptionUnsupported =
+                        "explicitPorositySource `" + o.name + "` with a ROTATED coordinateSystem (D and "
+                        "F carry off-diagonals); the device porosity kernel takes diagonal coefficients";
+                continue;
+            }
+        }
+        porosity.active = true;
+        porosity.cells.copyFrom(o.cells);
+        porosity.d = vector{o.D.xx, o.D.yy, o.D.zz};
+        // The kernel applies the 0.5 of OF's 0.5*rho*|U|*F itself, so the RAW F goes across.
+        porosity.f = vector{scalar(2) * o.F.xx, scalar(2) * o.F.yy, scalar(2) * o.F.zz};
+        porosity.fixed = o.fixedCoeff;
+        if (o.fixedCoeff)
+        {
+            // fixedCoeff's alpha and beta are FULL tensors: calcTransformModelData rotates diag(alpha)
+            // into the coordinate system's frame, so all nine components matter.
+            const scalar a[9] = {o.alpha.xx, o.alpha.xy, o.alpha.xz,
+                                 o.alpha.yx, o.alpha.yy, o.alpha.yz,
+                                 o.alpha.zx, o.alpha.zy, o.alpha.zz};
+            const scalar b[9] = {o.beta.xx, o.beta.xy, o.beta.xz,
+                                 o.beta.yx, o.beta.yy, o.beta.yz,
+                                 o.beta.zx, o.beta.zy, o.beta.zz};
+            for (int k = 0; k < 9; ++k) { porosity.fa[k] = a[k]; porosity.fb[k] = b[k]; }
+            // fixedCoeff::correct reads rhoRef only when the equation is in FORCE units, which the
+            // compressible momentum equation is.
+            porosity.rhoRef = o.rhoRef;
+        }
+        std::printf("  fvOptions `%s`: explicitPorositySource/%s on %d cells\n", o.name.c_str(),
+                    o.fixedCoeff ? "fixedCoeff" : "DarcyForchheimer", (int)o.cells.size());
+    }
+    in.porosity = porosity.active ? &porosity : nullptr;
+
+    // limitTemperature, projected onto the device's OWN form. deriveCaseRefusals resolves this option
+    // OUT of the option list (it sets limitT/limitTmin/limitTmax and fvOptions::read never lists it),
+    // so the loop above cannot see it -- and the device applies its limit to he, not T
+    // (rhoSimpleFoam.cu limitEnergyKernel), which is why it needs a conversion rather than a copy.
+    // Without this the host arm clamped the temperature and the device arm silently did not: an
+    // fvOption the case declares, honoured on one arm only, with nothing saying so.
+    if (refusals.limitT)
+    {
+        in.limitHe = true;
+        in.heMin   = hConstTToHe(refusals.limitTmin, hf.thermo);
+        in.heMax   = hConstTToHe(refusals.limitTmax, hf.thermo);
+        std::printf("  fvOption limitTemperature [%g, %g] K -> he [%g, %g]\n",
+                    (double)refusals.limitTmin, (double)refusals.limitTmax,
+                    (double)in.heMin, (double)in.heMax);
+    }
     for (const FvPatch& p : patches)
         if (isCoupledInterfaceType(p.type) || p.type == "processor") in.hasCoupledPatches = true;
 
@@ -160,10 +245,17 @@ int runMirrorCuda(const std::string& caseDir)
     }
 
     RhoDeviceFields dev = createDeviceFields(hf, m, g, patches);
-    RhoStepInput gin = buildDeviceStepInput(hin, hf, refusals, dev, patches);
-    // The AMG hierarchy cache, which the compressible path could never reach because nothing gave the
-    // driver a directory to keep it in -- so every run rebuilt the hierarchy from cold.
-    gin.amgCacheDir = caseDir + "/constant/polyMesh";
+    DevicePorosity porosity;   // outlives gin: RhoStepInput::porosity points into it
+    RhoStepInput gin = buildDeviceStepInput(hin, hf, refusals, dev, patches, porosity);
+    // THE AMG HIERARCHY CACHE IS DELIBERATELY NOT ENABLED, and this is the measurement that decided it.
+    // Setting `gin.amgCacheDir = caseDir + "/constant/polyMesh"` is a one-line change and it does reach
+    // the cache the compressible path has never used -- but the SECOND run in the same case directory
+    // then dies in the linear solve with "amul: an illegal memory access was encountered", on rhoBox
+    // (1200 cells) and on angledDuctExplicitFixedCoeff (28000) alike: run 1 writes .brae_amgcache and
+    // runs clean, run 2 loads it and crashes. So the cache LOAD path is broken for this solver, and a
+    // cold hierarchy every run is the slower, correct behaviour until that is fixed and gated.
+    // The repeat-run arm in tests/rho_mirror_solver_vs_openfoam.sh is what would have caught it and is
+    // what will catch it again when someone re-enables this.
 
     RhoSolverWorkspace w;
 

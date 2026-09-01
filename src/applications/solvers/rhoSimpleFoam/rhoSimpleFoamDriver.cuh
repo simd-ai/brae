@@ -28,12 +28,16 @@ namespace rhoSimple {
 
 // The host StepInput -> the device one, plus the device pointers createDeviceFields owns. Shared with
 // the CUDA harness so the gate and the solver drive the same input struct.
+//
+// `porosity` is CALLER-OWNED and must outlive the returned struct: RhoStepInput::porosity points into
+// it, and it is left inactive on a case with no porous zone.
 RhoStepInput buildDeviceStepInput(
     const cpu::rhoSimple::StepInput&        hin,
     const cpu::rhoSimple::RhoSimpleFields&  hf,
     const cpu::rhoSimple::CaseRefusals&     refusals,
     const RhoDeviceFields&                  dev,
-    const std::vector<FvPatch>&             patches);
+    const std::vector<FvPatch>&             patches,
+    DevicePorosity&                         porosity);
 
 // One whole run on the device: `brae -case <dir>` with BRAE_RHOSIMPLEFOAM_MIRROR=cuda.
 int runMirrorCuda(const std::string& caseDir);

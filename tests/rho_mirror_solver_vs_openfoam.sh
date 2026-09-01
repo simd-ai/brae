@@ -272,4 +272,47 @@ else
     say "sbMatched missing -- SST refusal arm skipped" SKIP
 fi
 
+
+# ---- arm 11: THE SAME CASE DIRECTORY, RUN TWICE -----------------------------------------------------
+# Every other arm stages a pristine copy, so nothing here ever ran a solver twice over its own leftovers
+# -- and that is precisely the hole that hid a crash. Enabling the AMG hierarchy cache
+# (RhoStepInput::amgCacheDir, which the compressible path has never used) makes run 1 write
+# .brae_amgcache and run 2 die in the linear solve with "amul: an illegal memory access was
+# encountered", on rhoBox and on angledDuct alike. The cache is left off for that reason
+# (rhoSimpleFoamDriver.cu says so at the line); this arm is what fails if it is switched back on before
+# the load path is fixed, and it also covers the ordinary case of a user re-running a case in place.
+RP="$W/repeat"; stage "$RP" "$SRC" 5
+for pass in 1 2; do
+    if ( cd "$RP" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BIN" -case "$RP" > "repeat$pass.log" 2>&1 ); then
+        grep -q "^End" "$RP/repeat$pass.log" \
+            && say "the CUDA arm runs a second time in the same directory (pass $pass)" ok \
+            || { tail -4 "$RP/repeat$pass.log"; say "the CUDA arm runs a second time in the same directory (pass $pass)" FAIL; }
+    else
+        tail -4 "$RP/repeat$pass.log"
+        say "the CUDA arm runs a second time in the same directory (pass $pass)" FAIL
+    fi
+done
+
+# ---- arm 12: the porous zone reaches the DEVICE momentum equation ----------------------------------
+# rhoUEqn.cu has applied a porous zone since it was written and nothing built a DevicePorosity for this
+# driver, so every fvOption the host arm implements was reported as "implemented on the host arm only"
+# and the run refused -- OpenFOAM's own angledDuctExplicitFixedCoeff among them. The projection is
+# shared with the harness (buildDeviceStepInput). fixedCoeff is the reachable model; DarcyForchheimer
+# on a force-dimensioned momentum equation is refused BY NAME by rhoUEqn (it is given neither the
+# per-cell mu nor rho that Cd = mu*D + rho|U|*F needs), which validation/rhoBoxDF pins here.
+if [ -d "$ROOT/validation/rhoBoxDF" ]; then
+    DFC="$W/dfcuda"; stage "$DFC" "$ROOT/validation/rhoBoxDF" 3
+    dout=$( cd "$DFC" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BIN" -case "$DFC" 2>&1 || true )
+    echo "$dout" | grep -q "explicitPorositySource/DarcyForchheimer on" \
+        && echo "$dout" | grep -q "DarcyForchheimerTemplates.C" \
+        && say "the porosity is projected, and DarcyForchheimer refuses by name on the device" ok \
+        || { echo "$dout" | tail -3; say "the porosity is projected, and DarcyForchheimer refuses by name on the device" FAIL; }
+    hout=$( cd "$DFC" && BRAE_RHOSIMPLEFOAM_MIRROR=1 "$BIN" -case "$DFC" 2>&1 || true )
+    echo "$hout" | grep -q "^End" \
+        && say "...and the SAME porous case runs on the host arm" ok \
+        || { echo "$hout" | tail -3; say "...and the SAME porous case runs on the host arm" FAIL; }
+else
+    say "rhoBoxDF missing -- porosity arm skipped" SKIP
+fi
+
 [ $fail = 0 ] && echo PASS || { echo FAIL; exit 1; }
