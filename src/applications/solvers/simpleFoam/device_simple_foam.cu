@@ -128,6 +128,20 @@ void amgFineCoeffKernel(
         for (const auto& a : amis)    amiRuns_.push_back({a.patch, (label)a.ownCell.size()});
         dbU_  = buildDeviceVectorBoundary(U, fvp, g);
         dbP_  = buildDeviceBoundary(p, fvp, g);
+        // fixedFluxPressure needs constrainPressure every assembly (constrainPressure.C:60-77), and
+        // this engine never runs it -- the patch would keep its construction-time gradient:
+        // zeroGradient under fixedFluxPressure's name, on every legacy driver built on this solver
+        // (brae non-V2, brae_pimpleFoam, brae_rhoSimpleFoam and its slice/legacy siblings). OpenFOAM
+        // fatals identically when the gradient is never set
+        // (fixedFluxPressureFvPatchScalarField.C:150-163). nSnGradFaces counts exactly the
+        // updateable-snGrad faces, so plain fixedGradient (legitimately construction-frozen) does
+        // not trip this.
+        if (dbP_.nSnGradFaces > 0)
+            throw std::runtime_error(
+                "brae: p carries a fixedFluxPressure patch, but this driver never runs "
+                "constrainPressure, so the patch would keep its construction-time gradient -- "
+                "zeroGradient under fixedFluxPressure's name. Run the case through the V2/mirror "
+                "path (BRAE_SIMPLEFOAM_V2=1) or change the boundary condition.");
         // pcorr's boundary, for CorrectPhi. OF builds it as zeroGradient EVERYWHERE except the patches
         // where p itself fixes a value, which become fixedValue 0 (CorrectPhi.C:56-70). It is p's
         // geometry with p's types thrown away, so it is built here beside dbP_ rather than derived at

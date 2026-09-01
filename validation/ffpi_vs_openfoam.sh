@@ -25,6 +25,14 @@ cp -r "$WORK" "$WORK.brae"; ( cd "$WORK.brae" && rm -rf [1-9]* log.simpleFoam )
 BRLAST=$(cd "$WORK.brae" && ls -d [0-9]* | grep -vx 0 | sort -g | tail -1)
 [ -n "$BRLAST" ] || { echo "FAIL: brae produced no output"; exit 1; }
 
+# LEGACY ARM: the DeviceSimpleSolver drivers never run constrainPressure, so they must REFUSE this
+# case by name rather than keep the construction-time gradient (zeroGradient under ffp's name). The
+# refusal fires in the solver constructor, before any iteration.
+lout=$(cd "$WORK.brae" && "$BUILD/brae" -case . 2>&1) && { echo "FAIL(legacy): ran with an unmaintained fixedFluxPressure"; exit 1; }
+echo "$lout" | grep -q "zeroGradient under fixedFluxPressure" \
+    && echo "PASS(legacy-refused)" \
+    || { echo "$lout" | tail -4; echo "FAIL(legacy): refusal does not name the substitution"; exit 1; }
+
 python3 - "$WORK/$OFLAST" "$WORK.brae/$BRLAST" <<'PYEOF'
 import re, math, sys
 of, br = sys.argv[1], sys.argv[2]

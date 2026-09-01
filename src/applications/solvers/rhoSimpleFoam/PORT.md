@@ -1908,3 +1908,40 @@ from OpenFOAM at the 3e-06 level. Not chased here.
   gpuRhoSimpleFoam's !ctl.sst guard and ran as PLAIN SST -- ctl.lm is consulted nowhere in that file;
   the transition equations exist only on the incompressible drivers. Refused by name now, with an arm
   on sst_vs_openfoam (mutated dict, refusal must name kOmegaSSTLM; the main SST run is the control).
+
+## Hole: the YGCJ atmospheric-profile factor (atmBoundaryLayerInlet C1/C2)
+
+OF's ABL k and epsilon inlets carry sqrt(C1*log((z+z0)/z0) + C2) (atmBoundaryLayer.C:238-254; omega
+carries no factor, :258-267) with defaults C1=0, C2=1 -- factor exactly 1. brae never parsed the keys
+(they fell into the reader's unknown-key skip), so a case setting either got the flat default profile
+silently. turbineSiting, the only other ABL case in validation/, runs at the defaults -- precisely why
+its five green gates never saw the hole. Implemented, not refused: the per-face z was already in the
+evaluation loop; a `ygcj` guard skips the multiply entirely at the defaults so those gates stay
+bit-identical by construction. The parse is gated on hasABL because bare C1/C2 are also kEpsilon
+coefficient names. The writer now emits both keys (OF does; a roundtrip losing a non-default pair
+would silently flatten the profile).
+
+Gate: validation/ablBox (200-cell box, C1 0.17 / C2 0.6) vs the per-face profile OF WRITES after one
+iteration (the BC evaluates in its constructor, so the oracle is solve-independent): k 1.8e-12,
+epsilon 3.7e-12, with a height-variation non-vacuity check. Fail-proof (parse removed): 2.2e-01 --
+the whole factor.
+
+## Two more holes: the host coupled-patch guard, and legacy drivers meeting fixedFluxPressure
+
+- BOTH host createFields (rho mirror and simpleFoam mirror) now refuse coupled patches on topology
+  alone, before any file is read -- the factory's cyclic/AMI/processor placeholders exist FOR the
+  device solvers, and no mirror driver re-couples them; the rho arm used to rely on the T->he
+  whitelist firing by accident five reads later, and the simpleFoam arm had nothing at all. The CUDA
+  arm's four-name hand list also became the isCoupledInterfaceType predicate (it was missing
+  cyclicPeriodicAMI, which buildPatches accepts). Census before landing: all 17 coupled fixtures in
+  validation/ are consumed only by the cyclic-reference or device binaries; no green test reaches
+  either host createFields with a coupled patch. Gate legs: synthetic patch-retype refusal arms on
+  both harnesses; fail-proof: guards removed -> legs fail.
+- DeviceSimpleSolver (every legacy driver: brae non-V2, brae_pimpleFoam, brae_rhoSimpleFoam and its
+  slice/legacy siblings) never runs constrainPressure and assembles p from device kernels, so the new
+  FixedFluxPressurePatchField's host-getter refusal was unreachable there -- the audit confirmed all
+  four take the device dispatch. One guard in the solver constructor on dbP_.nSnGradFaces now refuses
+  by name ("zeroGradient under fixedFluxPressure's name"), pointing at the V2/mirror path. Cost,
+  accepted and recorded: the pimple tutorial sweep's rotatingFanInRoom moves from silently-comparable
+  to refused -- its old pin relied on the invalid zeroGradient equivalence. Gate: legacy arm in
+  ffpi_vs_openfoam (must refuse; fail-proof: guard removed -> it ran).
