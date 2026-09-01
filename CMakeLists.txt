@@ -562,6 +562,9 @@ target_include_directories(test_rho_simple_step_cuda PRIVATE ${BRAE_HEADER_DIRS}
 target_link_libraries(test_rho_simple_step_cuda PRIVATE brae_core)
 add_test(NAME rho_simple_step_cuda
          COMMAND test_rho_simple_step_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/rhoBox 0.orig 8)
+add_test(NAME rho_step_cuda_refusals
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_step_cuda_refusals.sh)
+set_tests_properties(rho_step_cuda_refusals PROPERTIES SKIP_RETURN_CODE 77)
 # The BOUNDARY arm. rhoBox carries only fixedValue, zeroGradient, noSlip and empty, so the whole
 # updateCoeffs() block at the top of the step is a no-op there and the arm above cannot see it at all --
 # which is exactly why the device driver went without one. sbMatched is the only compressible fixture

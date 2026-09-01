@@ -25,6 +25,7 @@
 // agrees while the residuals diverge would mean the two are converging to the same place by different
 // routes, and that is worth seeing.
 #include "primitive_mesh.cuh"
+#include "rhoCaseRefusals.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
@@ -152,76 +153,19 @@ int main(int argc, char** argv)
                 simpleDict && simpleDict->wordOr("transonic", "no") == "yes" ? "yes" : "no");
 
     cpu::rhoSimple::StepInput in;
-    // fvOptions and MRF: the components already refuse them BY NAME, but nothing was setting these flags
-    // from the case, so a case carrying an fvOption ran with it silently ignored. aerofoilNACA0012's
-    // `limitTemperature` is exactly that -- a source term OpenFOAM applies and brae does not.
-    {
-        auto has = [&](const char* rel)
-        {
-            std::ifstream f2((caseDir + "/" + rel).c_str());
-            return f2.good();
-        };
-        // Walk the fvOptions dict rather than only noting that one exists: limitTemperature is
-        // implemented (it is a correction, not a source), any other type is refused BY NAME. Reading the
-        // file and finding nothing but limitTemperature is what lets aerofoilNACA0012 run; a case adding
-        // an explicitPorositySource beside it still refuses.
-        const std::string fvoPath = has("system/fvOptions") ? caseDir + "/system/fvOptions"
-                                  : (has("constant/fvOptions") ? caseDir + "/constant/fvOptions" : "");
-        if (!fvoPath.empty())
-        {
-            const FoamDict fvo = readDict(fvoPath);
-            bool anyOther = false;
-            for (const auto& entry : fvo.subs)
-            {
-                const FoamDict* o = &entry.second;
-                const std::string ty = o->wordOr("type", "");
-                if (ty == "limitTemperature")
-                {
-                    const std::string sel = o->wordOr("selectionMode", "all");
-                    if (sel != "all")
-                        throw std::runtime_error(
-                            "rhoSimpleFoam: limitTemperature with selectionMode '" + sel
-                            + "'. brae applies it over all cells; a cell subset is a different option. "
-                              "Refusing rather than limiting the wrong cells.");
-                    in.limitT    = true;
-                    in.limitTmin = o->scalarOr("min", 0.0);
-                    in.limitTmax = o->scalarOr("max", 0.0);
-                    std::printf("  fvOption limitTemperature [%g, %g]\n",
-                                (double)in.limitTmin, (double)in.limitTmax);
-                }
-                else if (!ty.empty())
-                {
-                    anyOther = true;
-                }
-            }
-            in.hasFvOptions = anyOther;
-        }
-        // The IMPLEMENTED options, read through the same reader the incompressible path uses. Its
-        // `unsupported` field carries the type name of anything it does not implement, so a case with an
-        // explicitPorositySource brae has AND an option it does not is still refused by name.
-        {
-            static cpu::fvOptions::OptionList opts;
-            opts = cpu::fvOptions::read(caseDir, m);
-            const std::string bad = opts.firstUnsupported();
-            if (!bad.empty())
-            {
-                in.hasFvOptions = true;
-                in.fvOptionUnsupported = bad;
-                std::printf("  fvOptions: '%s' is not implemented -- the case will be refused\n",
-                            bad.c_str());
-                std::fflush(stdout);   // the refusal aborts; an unflushed buffer loses this line
-            }
-            else if (!opts.empty())
-            {
-                in.fvOpts = &opts;
-                in.hasFvOptions = false;
-                std::printf("  fvOptions: %zu option(s), all implemented\n", opts.options.size());
-            }
-        }
-        in.hasMRF = has("constant/MRFProperties");
-        if (in.hasFvOptions) std::printf("  the case declares fvOptions\n");
-        if (in.hasMRF)       std::printf("  the case declares MRFProperties\n");
-    }
+    // fvOptions and MRF, derived by the SHARED helper (rhoCaseRefusals.cuh) so the CUDA harness gets
+    // the same flags -- the device-twin guards were reachable only from fail-proofs before it existed.
+    // cr is a function-local that outlives the loop; in.fvOpts points into it.
+    static cpu::rhoSimple::CaseRefusals cr;
+    cr = cpu::rhoSimple::deriveCaseRefusals(caseDir, m);
+    in.hasMRF              = cr.hasMRF;
+    in.hasFvOptions        = cr.hasFvOptions;
+    in.fvOptionUnsupported = cr.fvOptionUnsupported;
+    in.limitT              = cr.limitT;
+    in.limitTmin           = cr.limitTmin;
+    in.limitTmax           = cr.limitTmax;
+    if (!cr.hasFvOptions && !cr.opts.empty()) in.fvOpts = &cr.opts;
+
     in.consistent = simpleDict && simpleDict->wordOr("consistent", "no") == "yes";
     in.transonic  = simpleDict && simpleDict->wordOr("transonic",  "no") == "yes";
     // The fixture's schemes: `div(phi,*) bounded Gauss upwind`, `laplacianSchemes default Gauss linear

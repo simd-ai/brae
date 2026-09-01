@@ -52,6 +52,7 @@
 #include "rhoCreateFields.cuh"
 #include "rhoThermoDevice.cuh"
 #include "kEpsilon.cuh"
+#include "rhoCaseRefusals.cuh"
 #include "scheme_parse.cuh"     // parseFieldDivScheme -- div(phi,k|epsilon|omega) from the case          // gpu::kEpsilonRAS -- the device closure the turbulent arm drives
 #include "transport_model.cuh"   // transportMu: nu = mu(T)/rho for the closure inputs
 #include "linearViscousStress_cpp.cuh"   // effectiveFaceViscosity -- the host driver's own rho interpolation
@@ -189,6 +190,18 @@ int main(int argc, char** argv)
     const FoamDict* rfl = rf ? rf->subDict("fields") : nullptr;
 
     cpu::rhoSimple::StepInput hin;
+    // CASE-derived refusal flags, same helper as the cpp harness -- both sides get them. The DEVICE
+    // path has no fvOptions consumer at all, so even host-IMPLEMENTED options (a DarcyForchheimer,
+    // say) must refuse there rather than silently drop from the momentum equation.
+    static cpu::rhoSimple::CaseRefusals cr;
+    cr = cpu::rhoSimple::deriveCaseRefusals(caseDir, m);
+    hin.hasMRF              = cr.hasMRF;
+    hin.hasFvOptions        = cr.hasFvOptions;
+    hin.fvOptionUnsupported = cr.fvOptionUnsupported;
+    hin.limitT              = cr.limitT;
+    hin.limitTmin           = cr.limitTmin;
+    hin.limitTmax           = cr.limitTmax;
+    if (!cr.hasFvOptions && !cr.opts.empty()) hin.fvOpts = &cr.opts;
     hin.consistent = simpleDict && simpleDict->wordOr("consistent", "no") == "yes";
     hin.transonic  = simpleDict && simpleDict->wordOr("transonic", "no") == "yes";
     hin.tolU = hin.tolHe = hin.tolP = 1e-14;
@@ -286,6 +299,12 @@ int main(int argc, char** argv)
     };
 
     gpu::rhoSimple::RhoStepInput gin;
+    gin.hasMRF = cr.hasMRF;
+    gin.hasFvOptions = cr.hasFvOptions || !cr.opts.empty();   // no device fvOptions consumer exists
+    gin.fvOptionUnsupported = !cr.fvOptionUnsupported.empty() ? cr.fvOptionUnsupported
+                            : (!cr.opts.empty() ? std::string("implemented on the host arm only") : std::string());
+    for (const FvPatch& cpp_ : fvp)
+        if (isCoupledInterfaceType(cpp_.type) || cpp_.type == "processor") gin.hasCoupledPatches = true;
     // constrainHbyA's mask and adjustPhi's mask, from the projection. They answer DIFFERENT questions
     // and rhoCreateFields.cu is where that distinction is made once.
     gin.takeUAtBoundary = &dev.takeUAtBoundary;
