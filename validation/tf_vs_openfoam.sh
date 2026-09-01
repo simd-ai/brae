@@ -26,4 +26,17 @@ echo "$out" | grep -E "frozen arm|validate|bit-identical|file seed" | head -6
 # turn this into a second copy of the ordinary end-to-end gate and prove nothing about freezing
 echo "$out" | grep -q "frozen arm -- turbulence off" || { echo "FAIL: the frozen arm never engaged"; exit 1; }
 echo "$out" | tail -3
+# continuityErrs (pEqn.H:81, the INCOMPRESSIBLE file): brae now computes it at OpenFOAM's exact point.
+# Both solvers sit at their linear-tolerance floors here, so the gate bounds brae ABSOLUTELY (measured
+# 2.1e-09; a sign error in the boundary half of div(phi) reads ~1e-02) and only sanity-checks OF's.
+bcont=$(echo "$out" | grep "continuity errors" | tail -1 | grep -oE "sum local = [-0-9.e+]+" | grep -oE "[-0-9.e+]+$")
+ocont=$(grep "continuity errors" log.rhoSimpleFoam | tail -1 | grep -oE "sum local = [-0-9.e+]+" | grep -oE "[-0-9.e+]+$")
+python3 - "$bcont" "$ocont" <<'PYEOF'
+import sys
+b, o = float(sys.argv[1]), float(sys.argv[2])
+print(f"  continuity sum local: brae {b:.3e}  OF {o:.3e}")
+ok = abs(b) < 1e-7 and abs(o) < 1e-7
+print("  both at the converged floor" if ok else "FAIL: continuity error off the floor")
+sys.exit(0 if ok else 1)
+PYEOF
 echo "$out" | grep -q "^PASS" && echo PASS || { echo FAIL; exit 1; }

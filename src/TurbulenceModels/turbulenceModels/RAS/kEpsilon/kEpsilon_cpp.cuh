@@ -186,7 +186,14 @@ void correct(
     // wall-constrained and fvOption-constrained, because setValues transfers source_[nei] -= coeff*value
     // and then zeroes that coeff, so only the FIRST setValues touching a cell moves anything into its
     // neighbours -- see the note at the call site.
-    bool constrainBeforeWall = true);
+    bool constrainBeforeWall = true,
+    // `Gauss limitedLinear <k>` on div(phi,k) and div(phi,epsilon) -- what squareBend's fvSchemes
+    // names on both. Upwind is not a looser tolerance but a different matrix (the incompressible
+    // lineage measured 82x on k's initial residual for the same substitution); the coefficient is the
+    // RAW k, limitedLinearWeights computes twoByk itself. Appended LAST so every existing positional
+    // caller keeps the arithmetic it was gated with.
+    bool   limitedLinear = false,
+    scalar limiterCoeff  = 1.0);
 
 } // namespace kEpsilonRef
 } // namespace cpu

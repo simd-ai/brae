@@ -134,6 +134,12 @@ struct RhoSimpleFields
     // case transports the validate-time nut and alphat forever. Measured on the rhoBoxF oracle: OF
     // writes nut = Cmu*k^2/eps = 0.001265625 from a 1e-3 file seed, and alphat = rho0*nut/Prt.
     bool                   turbulenceFrozen = false;
+    // continuityErrs state: rhoSimpleFoam includes the INCOMPRESSIBLE continuityErrs.H (pEqn.H:81 --
+    // NOT compressibleContinuityErrs.H, which compares rho against thermo.rho and is a different
+    // number), scaled by runTime.deltaTValue(); cumulative accumulates across iterations
+    // (initContinuityErrs.H zeroes it once, rhoSimpleFoam.C:62).
+    scalar                 deltaT = 1;
+    scalar                 cumulativeContErr = 0;
     std::string            rasModel;            // e.g. "kEpsilon"; empty when laminar
     GeometricField<scalar> k, epsilon, nut, alphat;
     // Which alphat patches carry compressible::alphatWallFunction, and each one's OWN Prt.

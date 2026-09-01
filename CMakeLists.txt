@@ -2028,6 +2028,19 @@ set_tests_properties(rho_simple_end_to_end_vs_openfoam PROPERTIES
                      SKIP_RETURN_CODE 77
                      DEPENDS test_rho_simple_step_cpp
                      TIMEOUT 1800)
+
+# div(phi,k)/div(phi,epsilon) `Gauss limitedLinear 1` end to end: sbMatched mutated to the scheme
+# validation/squareBend actually ships, BOTH codes run under the mutation, so the oracle converges under
+# the scheme being gated. Separate from the e2e gate because it pays its own 400-iteration OpenFOAM run.
+# The fail-proof arm reverts only the scheme word and re-runs brae against the same limitedLinear
+# oracle: upwind must miss the k/epsilon bound, which is also the non-vacuity statement.
+add_test(NAME rho_turb_limitedlinear_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_turb_limitedlinear_vs_openfoam.sh)
+set_tests_properties(rho_turb_limitedlinear_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_simple_step_cpp
+                     TIMEOUT 2400)
 set_tests_properties(rho_kepsilon_vs_openfoam PROPERTIES
                      ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
                      SKIP_RETURN_CODE 77

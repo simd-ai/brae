@@ -922,7 +922,7 @@ int main(int argc, char** argv)
         in.scheme  = ds.linearUpwind ? cpu::rhoSimple::DivScheme::linearUpwind
                    : (ds.limited     ? cpu::rhoSimple::DivScheme::limitedLinear
                                      : cpu::rhoSimple::DivScheme::upwind);
-        in.schemeCoeff = ds.twoByk;
+        in.schemeCoeff = ds.coeff;   // RAW k: the weights functions compute twoByk themselves (scheme_parse.cuh)
         std::printf("  divSchemes: div(phi,U) bounded=%d linearUpwind=%d limitedLinear=%d\n",
                     (int)ds.bounded, (int)ds.linearUpwind, (int)ds.limited);
     }

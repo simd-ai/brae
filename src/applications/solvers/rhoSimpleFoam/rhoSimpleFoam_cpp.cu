@@ -431,6 +431,47 @@ Residuals rhoSimpleStep(
                 f.phi.boundary[pi][i] += fl.boundary[pi][i];
     }
 
+    // #include "incompressible/continuityErrs.H" -- pEqn.H:81, HERE, between the flux correction and
+    // p.relax(). NOT compressibleContinuityErrs.H: rhoSimpleFoam includes the INCOMPRESSIBLE one, and
+    // the compressible file (rho vs thermo.rho) is a different number entirely -- reading the solver
+    // caught what a from-memory transcription would have substituted. contErr = fvc::div(phi); the
+    // V-weighted average cancels the /V in the divergence, so sumLocal = dt*sum|netFlux_c|/sumV.
+    //
+    // WHAT A GATE MAY AND MAY NOT COMPARE: sumLocal/global sit at each solver's LINEAR-TOLERANCE
+    // floor once converged (measured rhoBoxF: brae 2.1e-09 vs OF 8.4e-09 -- different Krylov stacks,
+    // different floors), and `cumulative` INTEGRATES that floor over the whole trajectory (OF
+    // -9.6e-05 vs brae 1.7e-11 on the same case). Comparing cumulatives compares stopping criteria,
+    // not physics; the tf gate therefore bounds brae's own sumLocal absolutely and checks OF's is at
+    // a like floor, nothing more.
+    {
+        std::vector<scalar> net(nC, scalar(0));
+        const std::vector<label>& own = m.owner();
+        const std::vector<label>& nei = m.neighbour();
+        for (std::size_t fi = 0; fi < nei.size(); ++fi)
+        {
+            net[own[fi]] += f.phi.internal[fi];
+            net[nei[fi]] -= f.phi.internal[fi];
+        }
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            for (label i = 0; i < patches[pi].size; ++i)
+                net[patches[pi].faceCells[i]] += f.phi.boundary[pi][i];
+        scalar sumV = 0, sumLoc = 0, sumGlob = 0;
+        for (label c = 0; c < nC; ++c)
+        {
+            sumV    += g.V()[c];
+            sumLoc  += std::fabs(net[c]);
+            sumGlob += net[c];
+        }
+        const scalar sumLocalContErr = f.deltaT * sumLoc / sumV;
+        const scalar globalContErr   = f.deltaT * sumGlob / sumV;
+        f.cumulativeContErr += globalContErr;
+        res["contLocal"]      = sumLocalContErr;
+        res["contGlobal"]     = globalContErr;
+        res["contCumulative"] = f.cumulativeContErr;
+        std::printf("time step continuity errors : sum local = %g, global = %g, cumulative = %g\n",
+                    (double)sumLocalContErr, (double)globalContErr, (double)f.cumulativeContErr);
+    }
+
     // p.relax() -- the FIELD factor, not the equation one. Both are named `p` in fvSolution and they live
     // in different sub-dictionaries; using the equation factor here relaxes the wrong thing.
     //
@@ -520,16 +561,16 @@ Residuals rhoSimpleStep(
     // run while the momentum and energy equations keep transporting rho*nut and alphat.
     if (f.turbulent && !f.turbulenceFrozen && !f.k.internal.empty())
     {
-        // div(phi,k)/div(phi,epsilon) come from the CASE. The closure below assembles Gauss upwind
-        // (with or without `bounded`) and nothing else, so any other named scheme must refuse here --
-        // running upwind under the case's limitedLinear is the substitution this project keeps finding
-        // (squareBend names `Gauss limitedLinear 1` on both).
+        // div(phi,k)/div(phi,epsilon) come from the CASE. The closures below assemble Gauss upwind and
+        // Gauss limitedLinear (each with or without `bounded`) and nothing else, so any other named
+        // scheme must refuse here -- running upwind under the case's name is the substitution this
+        // project keeps finding.
         if (!in.turbDivUnsupported.empty())
             throw std::runtime_error(
                 "rhoSimpleFoam step: div(phi,k)/div(phi,epsilon) asks for `" + in.turbDivUnsupported +
-                "`, which the compressible closure does not assemble -- only Gauss upwind, with or "
-                "without `bounded`, is ported. Refusing rather than running upwind under the case's "
-                "scheme name.");
+                "`, which the compressible closure does not assemble -- only Gauss upwind and Gauss "
+                "limitedLinear, with or without `bounded`, are ported. Refusing rather than running "
+                "upwind under the case's scheme name.");
         // The compressible instantiation's inputs. nu is the LAMINAR kinematic viscosity mu(T)/rho, which
         // varies cell by cell here where the incompressible lineage has one number for the case.
         std::vector<scalar> nuLam(nC);
@@ -590,7 +631,7 @@ Residuals rhoSimpleStep(
             kOmegaSST::correct(f.U, f.k, f.omega, f.nut, f.phi, y, /*nu=*/0.0, m, g, patches,
                                in.relaxOmega, in.relaxK, in.tolTurb, in.relTolTurb, in.maxIter,
                                sco, &sres, in.boundedTurb,
-                               in.sstLimitedLinear, in.sstLimiterCoeff, in.sstLinearUpwind,
+                               in.limitedLinearTurb, in.turbLimiterCoeff, in.linearUpwindTurb,
                                in.correctedLaplacian, in.snGradLimitCoeff, /*lm=*/nullptr, &sc);
             res["omega"] = sres.omega;
             res["k"]     = sres.k;
@@ -654,7 +695,8 @@ Residuals rhoSimpleStep(
         kEpsilonRef::correct(f.U, f.k, f.epsilon, f.nut, f.phi, /*nu=*/0.0, m, g, patches,
                              in.relaxEpsilon, in.relaxK, in.tolTurb, in.relTolTurb, in.maxIter,
                              keco, &kres, in.boundedTurb, /*dropTerm=*/0, &comp, in.fvOpts,
-                             in.relaxEquationEps, in.relaxEquationK);
+                             in.relaxEquationEps, in.relaxEquationK, /*constrainBeforeWall=*/true,
+                             in.limitedLinearTurb, in.turbLimiterCoeff);
         res["epsilon"] = kres.epsilon;
         res["k"]       = kres.k;
         f.alphat.evaluateBoundary();

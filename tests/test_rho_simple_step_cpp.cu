@@ -195,7 +195,7 @@ int main(int argc, char** argv)
         in.boundedU      = dU.bounded;
         in.boundedHe     = dHe.bounded;
         in.boundedKE     = dHe.bounded;
-        in.schemeCoeffU  = dU.twoByk;
+        in.schemeCoeffU  = dU.coeff;  // RAW k: the weights functions compute twoByk themselves (scheme_parse.cuh)
 
         DeviceSimpleControls sctl;
         parseFvSchemesControls(caseDir, sctl);
@@ -233,7 +233,14 @@ int main(int argc, char** argv)
         if (dK.bounded != dS.bounded)
             in.turbDivUnsupported = "bounded on one of div(phi,k)/div(phi," + std::string(secondT)
                                   + ") and not the other (brae carries one flag for both)";
-        if (dK.limited || dS.limited)           in.turbDivUnsupported = "Gauss limitedLinear";
+        // limitedLinear is ASSEMBLED (both closures take the weights), but only as one scheme for both
+        // scalars -- the closures carry a single flag and coefficient, so entries that disagree refuse
+        // rather than run one of them under the other's name.
+        if (dK.limited != dS.limited || (dK.limited && dK.coeff != dS.coeff))
+            in.turbDivUnsupported = "limitedLinear on div(phi,k) and div(phi," + std::string(secondT)
+                                  + ") with different schemes or coefficients (brae carries one for both)";
+        in.limitedLinearTurb = dK.limited && dS.limited;
+        in.turbLimiterCoeff  = dK.coeff;   // RAW k of `limitedLinear k` -- see scheme_parse.cuh
         if (dK.linearUpwind || dS.linearUpwind) in.turbDivUnsupported = "Gauss linearUpwind";
     }
 
@@ -433,9 +440,10 @@ int main(int argc, char** argv)
     //     alphat     9.666e-04     4.867e-05        "
     //
     // squareBend is the wider of the two on every field, and its k and epsilon are the widest of all --
-    // that case asks for `Gauss limitedLinear 1` on div(phi,k) and div(phi,epsilon) and the closure
-    // discretises them upwind regardless (fvm::div's plain overload, where the weighted one exists and
-    // the incompressible path uses it). ~1.6e-03 is what that difference is worth at convergence.
+    // that fixture asks for `Gauss limitedLinear 1` on div(phi,k) and div(phi,epsilon), which the
+    // closure first discretised upwind regardless (~1.6e-03 at convergence was what that substitution
+    // was worth), then refused by name, and now assembles (the e2e script's turbdiv arm gates it
+    // against OpenFOAM run under the same mutation).
     gateIfItMoves("p", relL2(f.p.internal, ofP), relL2(z0.p.internal, ofP), 1.0e-3);
     gateIfItMoves("T", relL2(f.T.internal, ofT), relL2(z0.T.internal, ofT), 3.0e-4);
     {

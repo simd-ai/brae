@@ -252,7 +252,7 @@ int main(int argc, char** argv)
         uin.scheme  = dU.linearUpwind ? cpu::rhoSimple::DivScheme::linearUpwind
                     : (dU.limited     ? cpu::rhoSimple::DivScheme::limitedLinear
                                       : cpu::rhoSimple::DivScheme::upwind);
-        uin.schemeCoeff = dU.twoByk;
+        uin.schemeCoeff = dU.coeff;   // RAW k: the weights functions compute twoByk themselves (scheme_parse.cuh)
         DeviceSimpleControls sctl;
         parseFvSchemesControls(caseDir, sctl);
         uin.correctedLaplacian = sctl.nonOrth;

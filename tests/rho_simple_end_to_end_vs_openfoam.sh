@@ -167,16 +167,28 @@ grep -q "fixedMean" "$UNMAINTAINED/p" \
 # THE TURBULENCE-SCHEME ARMS. The step used to take `boundedTurb = true` as a harness hardcode, so
 # neither the case's bounded flag nor a non-upwind div(phi,k)/div(phi,epsilon) ever reached either
 # closure -- the refusals existed on both arms and only fail-proofs could set them. Now the schemes are
-# parsed from fvSchemes: a limitedLinear case must REFUSE by name, and an UNbounded upwind case must
-# still run (it is a supported scheme, just not this fixture's).
+# parsed from fvSchemes. limitedLinear moved from refused to ASSEMBLED and is gated end to end by
+# tests/rho_turb_limitedlinear_vs_openfoam.sh against OpenFOAM run under the same mutation; the arms
+# here cover what STILL refuses: linearUpwind by name, and k/epsilon entries that disagree (the
+# closures carry one flag and coefficient for both scalars). An UNbounded upwind case must still run.
 TDIV="$W/turbdiv"
 rm -rf "$TDIV"; cp -r "$W/case" "$TDIV"
-sed -i 's/turbulence          bounded Gauss upwind;/turbulence          Gauss limitedLinear 1;/' "$TDIV/system/fvSchemes"
-grep -q "limitedLinear" "$TDIV/system/fvSchemes" || { echo "FAIL: turbdiv mutation did not apply"; exit 1; }
-tout=$("$BIN" "$TDIV" 0 3 2>&1) && { echo "FAIL: a limitedLinear turbulence scheme was not refused"; exit 1; }
-echo "$tout" | grep -q "limitedLinear" \
-    && echo "  turb-scheme arm: limitedLinear refused by name         ok" \
+sed -i 's/turbulence          bounded Gauss upwind;/turbulence          Gauss linearUpwind grad(k);/' "$TDIV/system/fvSchemes"
+grep -q "linearUpwind" "$TDIV/system/fvSchemes" || { echo "FAIL: turbdiv mutation did not apply"; exit 1; }
+tout=$("$BIN" "$TDIV" 0 3 2>&1) && { echo "FAIL: a linearUpwind turbulence scheme was not refused"; exit 1; }
+echo "$tout" | grep -q "linearUpwind" \
+    && echo "  turb-scheme arm: linearUpwind refused by name          ok" \
     || { echo "$tout" | tail -5; echo "FAIL: the refusal does not name the scheme"; exit 1; }
+
+TDIV3="$W/turbdiv3"
+rm -rf "$TDIV3"; cp -r "$W/case" "$TDIV3"
+sed -i 's/div(phi,k)[[:space:]]*\$turbulence;/div(phi,k)          bounded Gauss limitedLinear 1;/' "$TDIV3/system/fvSchemes"
+grep -q "div(phi,k)          bounded Gauss limitedLinear 1;" "$TDIV3/system/fvSchemes" \
+    || { echo "FAIL: turbdiv3 mutation did not apply"; exit 1; }
+tout3=$("$BIN" "$TDIV3" 0 3 2>&1) && { echo "FAIL: disagreeing k/epsilon convection schemes were not refused"; exit 1; }
+echo "$tout3" | grep -q "different schemes or coefficients" \
+    && echo "  turb-scheme arm: disagreeing k/epsilon entries refused ok" \
+    || { echo "$tout3" | tail -5; echo "FAIL: the refusal does not name the disagreement"; exit 1; }
 
 TDIV2="$W/turbdiv2"
 rm -rf "$TDIV2"; cp -r "$W/case" "$TDIV2"

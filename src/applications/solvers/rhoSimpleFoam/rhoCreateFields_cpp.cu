@@ -266,6 +266,9 @@ RhoSimpleFields createFields(
     // back to a default, so an unhandled equation of state stops here instead of silently running as a
     // perfect gas.
     f.thermo = readThermoCoeffs(caseDir, fvSolution);
+    // runTime.deltaTValue() scales the continuity errors; steady SIMPLE cases carry deltaT 1 but the
+    // value is the CASE's, not an assumption.
+    try { f.deltaT = readDict(caseDir + "/system/controlDict").scalarOr("deltaT", 1.0); } catch (...) {}
 
     // ...but a SUPPORTED parse is not a supported path. The parser accepts `properties liquid` because
     // the LEGACY binary carries the NSRDS path; everything below evaluates perfectGas + hConst directly

@@ -1,6 +1,7 @@
 // _cpp REFERENCE implementation -- see kEpsilon_cpp.cuh for the OpenFOAM provenance and the wall note.
 #include "kEpsilon_cpp.cuh"
 #include "bound_cpp.cuh"
+#include "limitedSchemes_cpp.cuh"
 #include "nut_wall_function.cuh"
 #include "near_wall_dist.cuh"
 #include "pbicgstab.cuh"
@@ -36,6 +37,37 @@ void captureSystem(
             D[c] += M.internalCoeffs[pi][i];
             S[c] += M.boundaryCoeffs[pi][i];
         }
+}
+
+// The case's div(phi,k)/div(phi,epsilon) convection matrix. Same shape as kOmegaSST_cpp.cu's
+// divWithScheme: limitedLinear is a WEIGHT change, not a correction, so it goes through fvm::div's
+// weighted overload; the limiter's gradient is the field's own Gauss gradient, which is what
+// OpenFOAM's limitedSurfaceInterpolationScheme builds when the case names no gradScheme for it. The
+// flux handed in is the equation's own -- compressibly the MASS flux, exactly what kEpsilon.C:255/276
+// convect by, and the limiter reads its sign only.
+FvScalarMatrix divWithScheme(
+    const SurfaceScalarField&     phi,
+    const GeometricField<scalar>& vf,
+    bool                          limitedLinear,
+    scalar                        limiterCoeff,
+    const PrimitiveMesh&          m,
+    const FvGeometry&             g,
+    const std::vector<FvPatch>&   patches)
+{
+    if (!limitedLinear)
+    {
+        return fvm::div(phi.internal, phi.boundary, vf, m, patches);
+    }
+    std::vector<std::vector<scalar>> vfb(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        vfb[pi] = vf.boundary[pi]->value();
+    }
+    const std::vector<vector> gradVf = fvc::gaussGrad(vf.internal, vfb, m, g, patches);
+    return fvm::div(phi.internal, phi.boundary, vf,
+                    cpu::limitedSchemes::limitedLinearWeights(phi.internal, vf, gradVf,
+                                                              limiterCoeff, m, g),
+                    m, patches);
 }
 
 
@@ -167,7 +199,9 @@ void correct(
     const cpu::fvOptions::OptionList* fvOpts,
     bool relaxEquationEps,
     bool relaxEquationK,
-    bool constrainBeforeWall)
+    bool constrainBeforeWall,
+    bool   limitedLinear,
+    scalar limiterCoeff)
 {
     const label nC = m.nCells();
     const scalar Cmu25 = std::pow(co.Cmu, 0.25);
@@ -314,7 +348,7 @@ void correct(
             epsilon.boundary[pi]->updateFromFlux(phi.boundary[pi]);
         }
 
-        FvScalarMatrix M = fvm::div(phi.internal, phi.boundary, epsilon, m, patches);
+        FvScalarMatrix M = divWithScheme(phi, epsilon, limitedLinear, limiterCoeff, m, g, patches);
         if (res && res->captureStages)
         {
             captureSystem(M, patches, res->epsDivD, res->epsDivSrc, &res->epsDivUpper, &res->epsDivLower);
@@ -483,7 +517,7 @@ void correct(
             k.boundary[pi]->updateFromFlux(phi.boundary[pi]);
         }
 
-        FvScalarMatrix M = fvm::div(phi.internal, phi.boundary, k, m, patches);
+        FvScalarMatrix M = divWithScheme(phi, k, limitedLinear, limiterCoeff, m, g, patches);
         {
             // `Gauss linear corrected` changes TWO things, and kOmegaSST in this same directory already
             // does both: the implicit face coefficient becomes gamma*nonOrthDeltaCoeffs*magSf, and the

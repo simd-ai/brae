@@ -116,7 +116,14 @@ struct FieldDivScheme
     bool   bounded      = false;
     bool   limited      = false;   // limitedLinear
     bool   linearUpwind = false;
-    scalar twoByk       = 0;       // limitedLinear coefficient -> 2/max(k,SMALL)
+    // TWO currencies for the same `limitedLinear <k>` coefficient, because the two consumers transform
+    // it in different places: the device kernels take twoByk pre-computed (solvePassiveScalar,
+    // deviceSolveScalarTransport), while the host weights functions take the RAW k and compute
+    // 2/max(k,SMALL) themselves (limitedSchemes_cpp.cu:53). Handing twoByk where raw is expected runs
+    // limitedLinear 2 under the case's limitedLinear 1 -- the limiter becomes clamp01(1*r) instead of
+    // clamp01(2*r) -- which three rho harnesses did until the turbulence-scheme port made it visible.
+    scalar coeff        = 1.0;     // the raw k of `limitedLinear k` -- host weights functions
+    scalar twoByk       = 0;       // 2/max(k,SMALL)                 -- device kernels
     // laplacian(D<field>,<field>) -- OF scalarTransport.C:250, where Dname = "D" + field name.
     // `corrected`/`limited` -> non-orthogonal correction on; `orthogonal`/`uncorrected` -> off.
     // Unlike divSchemes, laplacianSchemes almost always carries a usable `default`, which OF resolves
@@ -185,6 +192,7 @@ inline FieldDivScheme parseFieldDivScheme(const std::string& caseDir, const std:
         double kc = 1.0;
         const std::size_t q = st.find("limitedLinear");
         std::sscanf(st.c_str() + q + 13, "%lf", &kc);
+        fs.coeff  = static_cast<scalar>(kc);
         fs.twoByk = static_cast<scalar>(2.0 / std::max(kc, 1e-30));
     }
 

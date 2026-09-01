@@ -133,14 +133,19 @@ struct StepInput
     KOmegaSSTCoeffs sstCoeffs{};
     scalar relaxOmega        = 1.0;
     scalar gradKLimitK       = 0.0;   // gradSchemes/grad(k) and grad(omega), for CDkOmega and F1
-    bool   sstLimitedLinear  = false;
-    scalar sstLimiterCoeff   = 1.0;
-    bool   sstLinearUpwind   = false;
+    // ONE scheme for div(phi,k) and div(phi,epsilon|omega), whichever model the case names -- the
+    // harness refuses a case whose two entries disagree. The coefficient is the RAW k of
+    // `limitedLinear k` (the weights functions compute twoByk themselves, scheme_parse.cuh).
+    bool   limitedLinearTurb = false;
+    scalar turbLimiterCoeff  = 1.0;
+    bool   linearUpwindTurb  = false; // kOmegaSST assembles it; kEpsilon does not -- refused upstream
     scalar relaxK = 1.0, relaxEpsilon = 1.0;
     scalar tolTurb = 1e-12, relTolTurb = 0.0;
     bool   boundedTurb = false;         // `bounded Gauss <scheme>` on div(phi,k) and div(phi,epsilon)
     // Non-empty = the CASE names a convection scheme on div(phi,k)/div(phi,epsilon|omega) that the
-    // compressible closure does not assemble (only Gauss upwind, with or without `bounded`, is ported).
+    // compressible closure does not assemble (Gauss upwind and Gauss limitedLinear, each with or
+    // without `bounded`, are ported; linearUpwind and entries that disagree between the two scalars
+    // are not).
     // The step REFUSES before the closure runs; the device twin carries the same refusal
     // (kEpsilon.cu, hasNonUpwindDivScheme) and both used to be set only by fail-proofs -- the flag was
     // hardcoded in the harness and the case's own fvSchemes never reached either arm.
