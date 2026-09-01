@@ -112,3 +112,4 @@ demo/delta/constant/triSurface/*
 !demo/delta/constant/triSurface/README
 
 .claude/*
+manifest/*
