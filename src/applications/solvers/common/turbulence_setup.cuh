@@ -365,14 +365,15 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
     TurbulentInletMasks masks;
         // Wall-function fidelity guard -- fail loud on a nut/epsilon/omega wall-function BC placed on a patch NOT typed
         // 'wall': brae gates the near-wall model on the geometric patch type, so the wall function would be SILENTLY
-        // inert. Conservative on the patch match -- only errors when the BC patch resolves to a concrete non-'wall'
-        // patch (group/regex names are skipped). NOTE: nutUSpalding/nutUBlended on a non-SA model are NO LONGER an
+        // inert. The entry resolves to its patches through the SAME machinery buildField uses
+        // (patchesResolvingTo: exact name, group, regex, last pattern wins), so a regex-keyed wall
+        // function -- `"(upperWall|lowerWall)"` is how backwardFacingStep2D writes every one of its wall
+        // BCs -- is checked like a concrete one. It used to be compared by exact name and silently
+        // skipped (audit finding #16), which disarmed this guard on exactly the cases that use it most.
+        // An entry that resolves to NO patch is dead text and stays skipped, as OpenFOAM ignores it.
+        // NOTE: nutUSpalding/nutUBlended on a non-SA model are NO LONGER an
         // error -- brae now honours the velocity-based nut wall function on any RAS model (see setNutWall + the
         // NutWall dispatch in device_simple_foam.cuh), matching OpenFOAM.
-        auto patchGeoType = [&](const std::string& nm) -> std::string {
-            for (const auto& q : fvp) if (q.name == nm) return q.type;
-            return "";
-        };
         auto guardWallFn = [&](const FieldData<scalar>& fd, const std::string& field) {
             auto isWF = [](const std::string& t) {
                 return t == "nutkWallFunction" || t == "nutUSpaldingWallFunction" || t == "nutLowReWallFunction"
@@ -381,12 +382,13 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
             for (const auto& pb : fd.boundary)
             {
                 if (!isWF(pb.type)) continue;
-                const std::string gt = patchGeoType(pb.name);
-                if (!gt.empty() && gt != "wall")
-                    throw std::runtime_error(field + " boundary '" + pb.name + "' uses " + pb.type + ", but the patch"
-                        " is type '" + gt + "' (not 'wall'). brae applies the near-wall model only on 'wall' patches, so"
-                        " it would be SILENTLY inert (no wall shear / near-wall constraint). Retype the patch as 'wall'"
-                        " in constant/polyMesh/boundary.");
+                for (const FvPatch* q : patchesResolvingTo(fd.boundary, pb, fvp))
+                    if (q->type != "wall")
+                        throw std::runtime_error(field + " boundaryField key '" + pb.name + "' (" + pb.type
+                            + ") resolves to patch '" + q->name + "', which is type '" + q->type + "' (not"
+                            " 'wall'). brae applies the near-wall model only on 'wall' patches, so"
+                            " it would be SILENTLY inert (no wall shear / near-wall constraint). Retype the patch as 'wall'"
+                            " in constant/polyMesh/boundary.");
             }
         };
         // Pick the nut wall function from the 0/nut wall-patch BC TYPE (OpenFOAM does this per-BC, not by model):
@@ -402,8 +404,15 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
             std::string wallFnSeen;   // the first wall function seen; a second, different one refuses
             for (const auto& pb : fd.boundary)
             {
-                const std::string gt = patchGeoType(pb.name);
-                if (!gt.empty() && gt != "wall") continue;                 // only wall patches drive the choice
+                // Only wall patches drive the choice -- resolved through the same machinery buildField
+                // uses, so a regex key covering the walls counts as the walls. An entry resolving to NO
+                // patch keeps participating (the old exact-name compare let it, and the refusal
+                // fixtures stage conflicts through exactly such entries).
+                const auto resolved = patchesResolvingTo(fd.boundary, pb, fvp);
+                bool onWall = resolved.empty();
+                for (const FvPatch* q : resolved)
+                    if (q->type == "wall") { onWall = true; break; }
+                if (!onWall) continue;
                 if (pb.type == "nutUSpaldingWallFunction") { ctl.nutWall = NutWall::Spalding; }
                 else if (pb.type == "nutUBlendedWallFunction") { ctl.nutWall = NutWall::Blended; }
                 // nutUWallFunction: OF's default blender is STEPWISE (nutUWallFunctionFvPatchScalarField.C:259,
@@ -516,7 +525,6 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
             std::string saWallFn;
             for (const auto& pb : nutFD.boundary)
             {
-                const std::string gt = patchGeoType(pb.name);
                 if (isNutWallFn(pb.type))
                 {
                     if (pb.type != "nutUSpaldingWallFunction" && pb.type != "nutLowReWallFunction")
@@ -534,12 +542,21 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
                             "silently picking one.");
                     saWallFn = pb.type;
                 }
-                else if (gt == "wall")
+            }
+            // The plain-BC-on-a-wall check runs PATCH-DRIVEN, resolving each wall patch's entry the way
+            // buildField does -- an entry keyed `"wal.*"` used to be invisible to the exact-name compare
+            // here (audit finding #16), so a regex-keyed plain fixedValue on the walls still got the
+            // Spalding hard-force. A wall patch with NO entry at all is left to buildField's own fatal.
+            for (const auto& q : fvp)
+            {
+                if (q.type != "wall") continue;
+                const auto* e = findPatchEntry(nutFD.boundary, q);
+                if (e && !isNutWallFn(e->type))
                     throw std::runtime_error(
-                        "brae: wall patch '" + pb.name + "' has nut type '" + pb.type + "' (no wall "
-                        "function) on SpalartAllmaras. The SA path writes its wall function on every "
-                        "wall face and would overwrite this BC; OpenFOAM evaluates it. Refusing "
-                        "rather than substituting Spalding.");
+                        "brae: wall patch '" + q.name + "' resolves its nut BC to key '" + e->name +
+                        "' of type '" + e->type + "' (no wall function) on SpalartAllmaras. The SA "
+                        "path writes its wall function on every wall face and would overwrite this "
+                        "BC; OpenFOAM evaluates it. Refusing rather than substituting Spalding.");
             }
             ctl.nutWall = (saWallFn == "nutLowReWallFunction") ? NutWall::LowRe : NutWall::Spalding;
             std::printf("  nut wall function: %s (honoured on %s per the BC)\n",
