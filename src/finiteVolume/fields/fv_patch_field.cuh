@@ -4,6 +4,7 @@
 // snGrad() is the surface-normal gradient. Matrix-coupling coefficients (valueInternalCoeffs
 // etc.) come with Phase 3 (assembly). Unsupported types throw, no silent fallback.
 #include "cf_types.cuh"
+#include "planar_interpolation.cuh"
 #include "fv_patch.cuh"
 #include "wedge_patch.cuh"   // the axisymmetric constraint patch's rotation tensors
 #include "foam_field_reader.cuh"
@@ -282,12 +283,18 @@ public:
         bool uniform,
         T uval,
         std::vector<T> vals)
-        : FixedValuePatchField<T>(p, uniform, uval, std::move(vals))
+        : FixedValuePatchField<T>(p, uniform, uval, vals)
     {
-        // p0 is what the constructor was handed -- the reader puts totalPressure's p0 in the inletValue
-        // slot and makePatchField resolves it into `vals`. Kept because value() moves once the update
-        // below runs, and p0 is the fixed reference every iteration recomputes FROM.
-        p0_ = this->value();
+        // p0 from the CONSTRUCTOR'S OWN DATA -- never this->value(): value_ is filled by evaluate(),
+        // which has not run at construction, so capturing it here stored an EMPTY p0 and every update
+        // ran p = 0 - 0.5*rho*|U|^2 (measured -14.52 Pa on a 100050 Pa totalPressure inlet at
+        // iteration 1 -- the whole rhoTP divergence, hidden because the DEVICE arm reads its own p0
+        // buffer and the only tp gate ran that arm).
+        p0_.resize(static_cast<std::size_t>(p.size));
+        for (label i = 0; i < p.size; ++i)
+            p0_[static_cast<std::size_t>(i)] =
+                uniform ? uval
+                        : (static_cast<std::size_t>(i) < vals.size() ? vals[static_cast<std::size_t>(i)] : T{});
     }
     int bcCategory() const override { return 7; }                   // device: totalPressure (per-step refValue)
 
@@ -470,10 +477,14 @@ private:
     }
 };
 
-// timeVaryingMappedFixedValue: a fixedValue whose per-face value is the external boundaryData profile MAPPED onto the
-// faces, NEAREST data point to each face centre (exact when the data is finer than the mesh, as in pitzDailyExptInlet's
-// 70-point inlet profile). Time interpolation / offset / setAverage not applied (steady; offset 0, setAverage off here).
-// bcCategory()=1. Works for scalar (k/epsilon) and vector (U).
+// timeVaryingMappedFixedValue: a fixedValue whose per-face value is the external boundaryData profile
+// MAPPED onto the faces. The DEFAULT mapping is OF's PLANAR Delaunay interpolation
+// (pointToPointPlanarInterpolation -- planar_interpolation.cuh carries the pipeline and its bounds);
+// `mapMethod nearest` selects the matchPoints copy this class used to run for EVERYTHING. That
+// substitution's old justification ("exact when the data is finer than the mesh") was FALSE on the
+// case it named: pitzDailyExptInlet's 70 points are 35 y-stations duplicated at two z, OF
+// interpolates linearly in y, nearest staircases to the closest station. A constant `offset` is added
+// after mapping (MappedFile.C:743-747). bcCategory()=1. Scalar (k/epsilon) and vector (U).
 template <typename T>
 class TimeVaryingMappedPatchField : public FixedValuePatchField<T>
 {
@@ -481,9 +492,38 @@ public:
     TimeVaryingMappedPatchField(
         const FvPatch& p,
         const std::vector<vector>& pts,
-        const std::vector<T>& vals)
-        : FixedValuePatchField<T>(p, false, T{}, mapNearest(p, pts, vals)) {}
+        const std::vector<T>& vals,
+        bool nearest,
+        bool hasOffset,
+        const T& offset)
+        : FixedValuePatchField<T>(p, false, T{},
+                                  applyOffset(nearest ? mapNearest(p, pts, vals)
+                                                      : mapPlanar(p, pts, vals),
+                                              hasOffset, offset)) {}
 private:
+    static std::vector<T> applyOffset(std::vector<T> v, bool has, const T& off)
+    {
+        if (has) for (T& x : v) x = x + off;
+        return v;
+    }
+    static std::vector<T> mapPlanar(
+        const FvPatch& p,
+        const std::vector<vector>& pts,
+        const std::vector<T>& vals)
+    {
+        const std::vector<vector> dst(p.Cf.begin(), p.Cf.begin() + p.size);
+        const std::vector<planarInterp::Weights> W = planarInterp::planarWeights(pts, dst);
+        std::vector<T> v(p.size);
+        for (label i = 0; i < p.size; ++i)
+        {
+            const planarInterp::Weights& w = W[static_cast<std::size_t>(i)];
+            T acc{};
+            for (int k = 0; k < 3; ++k)
+                acc = acc + vals[static_cast<std::size_t>(w.j[k])] * w.w[k];
+            v[static_cast<std::size_t>(i)] = acc;
+        }
+        return v;
+    }
     static std::vector<T> mapNearest(
         const FvPatch& p,
         const std::vector<vector>& pts,
@@ -1664,9 +1704,23 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
             return std::make_unique<SurfaceNormalFixedValuePatchField>(p, d.normalRefUniform, d.normalRefUniformValue, d.normalRefValues);
         else throw std::runtime_error("brae: surfaceNormalFixedValue/uniformNormalFixedValue is a velocity (vector) BC");
     }
-    if (d.type == "timeVaryingMappedFixedValue")   // boundaryData profile mapped (nearest) onto the faces -> fixedValue
+    if (d.type == "timeVaryingMappedFixedValue")   // boundaryData profile mapped (planar by default) -> fixedValue
     {
-        if (d.hasMapData) return std::make_unique<TimeVaryingMappedPatchField<T>>(p, d.mapPoints, d.mapValues);
+        // Keys the steady scope cannot honour were MARKED by the reader; refusing here names them.
+        if (!d.mapUnsupported.empty())
+            throw std::runtime_error(
+                "brae: timeVaryingMappedFixedValue on patch '" + p.name + "' uses `" +
+                d.mapUnsupported + "`, which brae's steady mapping does not implement "
+                "(MappedFile.C carries the semantics). Refusing rather than mapping a different "
+                "profile under the case's keys.");
+        // filter engages only as the PAIR (MappedFile.C:79-83); either key alone is inert in OF too.
+        if (d.mapFilterSweeps >= 1 && d.mapFilterRadius > 0.0)
+            throw std::runtime_error(
+                "brae: timeVaryingMappedFixedValue on patch '" + p.name + "' engages the "
+                "filterRadius/filterSweeps smoothing pair, which brae does not implement.");
+        if (d.hasMapData)
+            return std::make_unique<TimeVaryingMappedPatchField<T>>(
+                p, d.mapPoints, d.mapValues, d.mapMethodNearest, d.hasMapOffset, d.mapOffsetValue);
         // No mapped data: OF would FATAL here (the `value` entry is only the initial field, not a substitute for
         // boundaryData). Throw rather than silently degrade to fixedValue/zeroGradient -- masks a misconfigured case.
         throw std::runtime_error("brae: timeVaryingMappedFixedValue on patch '" + p.name +

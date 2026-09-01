@@ -614,6 +614,11 @@ target_include_directories(test_v2_laplacian_parse PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_v2_laplacian_parse PRIVATE brae_core)
 add_test(NAME v2_laplacian_parse COMMAND test_v2_laplacian_parse)
 
+add_executable(test_tvm_mapping tests/test_tvm_mapping.cu)
+target_include_directories(test_tvm_mapping PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_tvm_mapping PRIVATE brae_core)
+add_test(NAME tvm_mapping COMMAND test_tvm_mapping)
+
 add_test(NAME manifest_rhosimplefoam_not_drifted
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/of_manifest.py rhoSimpleFoam
                  --check ${CMAKE_CURRENT_SOURCE_DIR}/manifest/rhoSimpleFoam.yaml)
@@ -1104,7 +1109,7 @@ set_tests_properties(tutorial_motorbike PROPERTIES SKIP_RETURN_CODE 77 LABELS sl
 # U 1.155e-02 and p 1.540e-02. Gated as shipped, with the bounds that implies.
 add_test(NAME tutorial_pitzdailyexptinlet
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
-                 pitzDailyExptInlet U=5e-02,p=2.8e-01,k=1.3e-01,epsilon=1.2e-01,nut=2.0e-01)
+                 pitzDailyExptInlet U=4e-02,p=2.5e-01,k=1.2e-01,epsilon=1.0e-01,nut=1.8e-01)
 set_tests_properties(tutorial_pitzdailyexptinlet PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 2400)
 
 # squareBend, gated at 8000 rather than its shipped endTime of 500. That is not padding: at 500 the
@@ -1666,6 +1671,10 @@ set_tests_properties(adjm_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow
 add_test(NAME df_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/df_vs_openfoam.sh)
 set_tests_properties(df_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
+add_test(NAME tpm_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/tpm_vs_openfoam.sh)
+set_tests_properties(tpm_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
 
 add_test(NAME tf_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/tf_vs_openfoam.sh)

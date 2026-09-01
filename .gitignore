@@ -44,6 +44,7 @@ validation/*
 !validation/ablBox/
 !validation/simpleBoxIO/
 !validation/rhoBoxDF/
+!validation/rhoBoxTP/
 !validation/rhoBoxF/
 !validation/rhoBoxP/
 !validation/simpleBoxP/
@@ -77,6 +78,7 @@ validation/*
 !validation/abl_vs_openfoam.sh
 !validation/adjm_vs_openfoam.sh
 !validation/df_vs_openfoam.sh
+!validation/tpm_vs_openfoam.sh
 !validation/tf_vs_openfoam.sh
 !validation/ffp_vs_openfoam.sh
 !validation/ffpi_vs_openfoam.sh
