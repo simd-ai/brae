@@ -609,6 +609,12 @@ add_test(NAME frozen_bc_guard COMMAND test_frozen_bc_guard)
 add_test(NAME frozen_bc_refusals COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/frozen_bc_refusals.sh)
 set_tests_properties(frozen_bc_refusals PROPERTIES SKIP_RETURN_CODE 77)
 
+# Audit finding #14: the algebraic-LES path honoured only nutUSpalding while printing any other nut
+# wall function as honoured, labelled "kEpsilon" whatever the model. Non-Spalding wall functions on
+# LES now refuse by name, and every wall-fn print carries the model word the case names.
+add_test(NAME les_wallfunction_refusals COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/les_wallfunction_refusals.sh)
+set_tests_properties(les_wallfunction_refusals PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(test_v2_laplacian_parse tests/test_v2_laplacian_parse.cu)
 target_include_directories(test_v2_laplacian_parse PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_v2_laplacian_parse PRIVATE brae_core)

@@ -267,6 +267,11 @@ struct DeviceSimpleControls
     KEpsilonCoeffs keCoeffs;                       // k-eps model coeffs (default = OF); read from turbulenceProperties RAS.kEpsilonCoeffs.
     bool   sst = false;                            // RASModel kOmegaSST (the "second turbulence scalar" eps slot holds omega).
     bool   lm = false;                             // RASModel kOmegaSSTLM (sst + Langtry-Menter gamma-ReThetat transition).
+    // The model word AS THE CASE NAMES IT (RASModel / LESModel / "laminar"), for every print that talks
+    // about the model. The prints used to derive a label from the flags (`sst ? "kOmegaSST" :
+    // "kEpsilon"`), which labelled realizableKE, RNGkEpsilon, SpalartAllmaras and every LES model as
+    // "kEpsilon" -- a wrong statement in the run log about which equations are being solved.
+    std::string modelName = "laminar";
     KOmegaSSTCoeffs ksstCoeffs;                    // kOmegaSST coeffs (default = OF); read from RAS.kOmegaSSTCoeffs.
     bool   sa = false;                             // RASModel SpalartAllmaras (one-equation: the "k" slot holds nuTilda; no 2nd scalar).
     bool   des = false;                            // SpalartAllmarasDDES/kOmegaSSTDDES (simulationType LES): DES length-scale limiter; needs sa/sst=true.

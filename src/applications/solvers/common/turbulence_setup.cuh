@@ -122,6 +122,7 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                 if (!saDes && !sstDes && !smag && !wale)
                     throw std::runtime_error("brae: unsupported LESModel '" + model
                         + "' (Smagorinsky, WALE, SpalartAllmarasDDES/DES/IDDES or kOmegaSSTDDES/DES/IDDES)");
+                ctl.modelName = model;
                 const std::string delta = les->wordOr("delta", "cubeRootVol");
                 if (delta == "maxDeltaxyz")
                 {
@@ -253,6 +254,7 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
             const bool rng = (model == "RNGkEpsilon");
             if (model != "kEpsilon" && !rke && !rng && !ctl.sst && !ctl.sa)
                 throw std::runtime_error("brae: unsupported RASModel '" + model + "' (kEpsilon, RNGkEpsilon, realizableKE, kOmegaSST, kOmegaSSTLM or SpalartAllmaras)");
+            ctl.modelName = model;
             if (ctl.sa)
             {
                 // Spalart-Allmaras: OF defaults (coeffs read from RAS.SpalartAllmarasCoeffs would override; not needed here).
@@ -413,7 +415,7 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
                     ctl.atmZ0 = pb.ablZ0;               // roughness length (from `z0` / $z0 include)
                     ctl.atmBoundNut = pb.atmBoundNut;  // clamp nut>=0 option
                     printf("  nut wall function: atmNutkWallFunction (rough, z0=%g, boundNut=%s) on %s per the BC\n",
-                           (double)ctl.atmZ0, ctl.atmBoundNut ? "true" : "false", ctl.sst ? "kOmegaSST" : "kEpsilon");
+                           (double)ctl.atmZ0, ctl.atmBoundNut ? "true" : "false", ctl.modelName.c_str());
                 }
                 // nutLowReWallFunction: OF's calcNut() returns Zero UNCONDITIONALLY
                 // (nutLowReWallFunctionFvPatchScalarField.C:38-42 is the entire function). This used to
@@ -457,12 +459,12 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
                 // was just taught to handle.
                 if (ctl.nutWall == NutWall::LowRe)
                     printf("  nut wall function: nutLowReWallFunction (nut = 0 at the wall, honoured on "
-                           "%s per the BC)\n", ctl.sst ? "kOmegaSST" : "kEpsilon");
+                           "%s per the BC)\n", ctl.modelName.c_str());
                 else
                     printf("  nut wall function: %s (velocity-based, honoured on %s per the BC)\n",
                            ctl.nutWall == NutWall::Spalding ? "nutUSpaldingWallFunction"
                            : ctl.nutWall == NutWall::NutU ? "nutUWallFunction" : "nutUBlendedWallFunction",
-                           ctl.sst ? "kOmegaSST" : "kEpsilon");
+                           ctl.modelName.c_str());
             }
         };
         GeometricField<scalar> k, eps, nut, ReThetat, gammaInt;   // ReThetat/gammaInt: kOmegaSSTLM transition
@@ -471,6 +473,24 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
             const FieldData<scalar> nutFD = readField<scalar>(fieldDir + "/nut");
             guardFrozen(nutFD, "nut");
             guardWallFn(nutFD, "nut");
+            // The algebraic-LES device path honours EXACTLY ONE nut wall function -- nutUSpalding
+            // (device_simple_foam.cu, ctl_.nutWall == NutWall::Spalding on the ctl_.les arm); every
+            // other selection falls to plain cell-value extrapolation there, while setNutWall printed
+            // the case's function as honoured -- the audit's finding #14: an LES case with
+            // nutkWallFunction ran with no wall model at all and the log said otherwise. The k-based
+            // family is not portable here either way -- algebraic LES carries no k field, and OpenFOAM
+            // feeds those functions the model's own sgs k() estimate. BEFORE setNutWall, so the refused
+            // run never prints a wall function as honoured.
+            for (const auto& pb : nutFD.boundary)
+            {
+                if (isNutWallFn(pb.type) && pb.type != "nutUSpaldingWallFunction")
+                    throw std::runtime_error(
+                        "brae: 0/nut patch '" + pb.name + "' asks for " + pb.type + " on LESModel "
+                        + ctl.modelName + ". The algebraic-LES path honours only "
+                        "nutUSpaldingWallFunction (velocity-based); any other wall function would run "
+                        "as plain extrapolation under the case's name. Refusing rather than running "
+                        "without the wall model the case asked for.");
+            }
             setNutWall(nutFD);   // honour a velocity-based nut wall function (nutUSpaldingWallFunction) if the case uses one
             nut = buildField<scalar>(nutFD, fvp, nC);
             nut.evaluateBoundary();
