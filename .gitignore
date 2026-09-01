@@ -113,3 +113,6 @@ demo/delta/constant/triSurface/*
 
 .claude/*
 manifest/*
+
+src/applications/solvers/rhoSimpleFoam/PORT.md
+src/applications/solvers/rhoSimpleFoam/REFUSALS.md

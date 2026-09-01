@@ -2,6 +2,7 @@
   <img src="docs/images/brae-banner.png" alt="brae" width="100%">
 </p>
 
+
 <p align="center"><b>GPU-native computational fluid dynamics, OpenFOAM-compatible, fully resident on the GPU.</b></p>
 
 <p align="center">
