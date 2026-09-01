@@ -84,8 +84,9 @@ PressureStages pressurePredictor(
     if (in.pRefCell >= 0)
     {
         scalar massIn = 0.0, fixedMassOut = 0.0, adjustableMassOut = 0.0, totalFlux = VSMALL_;
-        for (const auto& b : st.phiHbyA.boundary)
-            for (scalar v : b) totalFlux += std::fabs(v);
+        // totalFlux = VSMALL + sum(mag(phi)), and Foam::sum() of a GeometricField is
+        // gSum(f1.primitiveField()) (GeometricFieldFunctions.C:470-497) -- INTERNAL faces only. The
+        // boundary loop that used to sit here inflated the normaliser behind every relative test below.
         for (const auto& v : st.phiHbyA.internal) totalFlux += std::fabs(v);
 
         for (std::size_t pi = 0; pi < patches.size(); ++pi)

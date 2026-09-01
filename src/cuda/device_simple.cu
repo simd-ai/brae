@@ -213,13 +213,15 @@ void adjustReduceKernel(
     if (f < 0.0) atomicAdd(&sums[0], -f);                 // massIn
     else if (adj[i]) atomicAdd(&sums[2], f);              // adjustableMassOut
     else atomicAdd(&sums[1], f);                          // fixedMassOut
-    atomicAdd(&sums[3], fabs(f));                         // |phi| over the boundary, for totalFlux
+    // NO |phi| into sums[3] here: OF's totalFlux = VSMALL + sum(mag(phi)) sums the INTERNAL faces only
+    // -- Foam::sum() of a GeometricField is gSum(f1.primitiveField()) (GeometricFieldFunctions.C:470-
+    // 497). This kernel used to add the boundary too, inflating the normaliser behind the massCorr
+    // threshold, the fatal and closedVolume; test_adjust_phi_guards arm 7 straddles exactly that gap
+    // (a 2e-8 relative continuity error that OF refuses and the inflated form waved through).
 }
 
 
-// sum|phi| over the INTERNAL faces. OF's normaliser is sum(mag(phi)) over the whole surface field
-// (adjustPhi.C:91), not over the boundary slice this function is otherwise handed, so the internal half
-// has to be reduced too or the relative test below is against the wrong denominator.
+// sum|phi| over the INTERNAL faces -- the whole of OF's normaliser (see the note above).
 __global__
 void absSumKernel(int n, const scalar* __restrict__ x, scalar* __restrict__ out)
 {
@@ -262,7 +264,8 @@ scalar deviceAdjustPhi(const DeviceBuffer<label>& adjustable,
     // which differs from OpenFOAM twice over:
     //
     //   1. OF's test is RELATIVE -- magAdjustableMassOut/totalFlux > SMALL (1e-15) -- against
-    //      totalFlux = VSMALL + sum(mag(phi)) over the WHOLE surface field. An absolute 1e-300 admits an
+    //      totalFlux = VSMALL + sum(mag(phi)), the INTERNAL faces (Foam::sum() of a GeometricField is
+    //      gSum of the primitive field). An absolute 1e-300 admits an
     //      adjustable outflow that is negligible beside the flux in the domain, and then divides by it:
     //      exactly the uninitialised-outflow case OF's message tells you to fix with potentialFoam.
     //   2. OF RAISES A FATAL ERROR on the other branch when the residual continuity error is more than

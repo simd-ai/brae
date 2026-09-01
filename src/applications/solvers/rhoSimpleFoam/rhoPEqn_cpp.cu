@@ -91,10 +91,14 @@ bool adjustPhi(
         }
     }
 
+    // totalFlux = VSMALL + sum(mag(phi)) -- and Foam::sum() of a GeometricField is
+    // gSum(f1.primitiveField()) (GeometricFieldFunctions.C:470-497), the INTERNAL faces only. This
+    // used to add the boundary faces too, inflating the normaliser and nudging all three relative
+    // tests that divide by it (the massCorr threshold, the fatal, the closedVolume clauses) by the
+    // boundary share of the flux. The device kernel (device_simple.cu deviceAdjustPhi) already summed
+    // internal-only; this host twin was the one that differed from both.
     scalar totalFlux = kVSmall;
     for (scalar v : phi.internal) totalFlux += std::fabs(v);
-    for (const auto& b : phi.boundary)
-        for (scalar v : b) totalFlux += std::fabs(v);
 
     scalar massCorr = 1.0;
     const scalar magAdj = std::fabs(adjustableMassOut);

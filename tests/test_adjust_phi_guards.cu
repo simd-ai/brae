@@ -2,7 +2,9 @@
 //
 // OF adjustPhi.C:90-119 is not one clause but three:
 //
-//     scalar totalFlux = VSMALL + sum(mag(phi)).value();          // the WHOLE surface field
+//     scalar totalFlux = VSMALL + sum(mag(phi)).value();          // INTERNAL faces only: Foam::sum()
+//                                    // of a GeometricField is gSum(f1.primitiveField())
+//                                    // (GeometricFieldFunctions.C:470-497), so the boundary is excluded
 //     if (magAdjustableMassOut > VSMALL && magAdjustableMassOut/totalFlux > SMALL)
 //         massCorr = (massIn - fixedMassOut)/adjustableMassOut;
 //     else if (mag(fixedMassOut - massIn)/totalFlux > 1e-8)
@@ -28,8 +30,16 @@
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 #include "device_simple.cuh"
+#include "primitive_mesh.cuh"
+#include "fv_geometry.cuh"
+#include "fv_patch.cuh"
+#include "fv_patch_field.cuh"
+#include "geometric_field.cuh"
+#include "rhoPEqn_cpp.cuh"
 #include <cmath>
 #include <cstdio>
+#include <fstream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -55,9 +65,10 @@ static Result run(scalar massIn, scalar fixedOut, scalar adjOut, scalar internal
     const std::vector<label>  adj  = { 0, 0, 1 };
     DeviceBuffer<scalar> dPhiB(phiB);
     DeviceBuffer<label>  dAdj(adj);
-    // The internal half of totalFlux. OF sums mag(phi) over the whole surface field, so a domain with a
-    // large interior flux makes a given adjustable outflow relatively smaller -- which is the entire
-    // point of the relative guard and cannot be expressed without this term.
+    // totalFlux. OF sums mag(phi) over the INTERNAL faces only (Foam::sum() of a GeometricField is
+    // gSum of the primitive field), so a domain with a large interior flux makes a given adjustable
+    // outflow relatively smaller -- which is the entire point of the relative guard and cannot be
+    // expressed without this term.
     DeviceBuffer<scalar> dPhiInt(std::vector<scalar>{ internalFlux });
 
     Result r;
@@ -125,7 +136,7 @@ int main()
         check("...and leaves massCorr at 1", !r.threw && std::fabs((double)r.massCorr - 1.0) < 1e-15);
     }
 
-    // ---- 5. THE NORMALISER IS THE WHOLE FIELD, not the boundary slice. ----
+    // ---- 5. THE NORMALISER INCLUDES THE INTERNAL FACES, not just the boundary slice. ----
     // Same three boundary faces both times; only the interior flux differs. With a small interior the
     // adjustable outflow is a large fraction of totalFlux and OF adjusts; with a large one it is below
     // SMALL and OF refuses. A kernel normalising on the boundary alone -- which is all deviceAdjustPhi
@@ -155,6 +166,77 @@ int main()
         // the two cases must DISAGREE, or a hardcoded value passes both
         check("...and the two disagree (a hardcoded answer cannot)",
               open.closedVolume != closed.closedVolume);
+    }
+
+    // ---- 7. THE NORMALISER EXCLUDES THE BOUNDARY FACES -- the straddle that proves it. ----
+    // massIn 1, fixedOut 1+2e-8, no adjustable outflow, interior flux 1. With OF's internal-only
+    // totalFlux the residual continuity error is 2e-8/1 > 1e-8 and the fatal fires; a normaliser that
+    // also summed the boundary (1 + 2 = 3) reads 6.7e-9 and sails past it. The companion at d = 5e-9
+    // sits below the threshold under EITHER normaliser, so the pair pins the throw to the threshold
+    // itself and not to a kernel that throws at anything.
+    std::printf("  7. totalFlux excludes the boundary faces (gSum of the primitive field)\n");
+    {
+        const Result hot  = run(1.0, 1.0 + 2.0e-8, 0.0, 1.0);
+        const Result cool = run(1.0, 1.0 + 5.0e-9, 0.0, 1.0);
+        check("a 2e-8 relative error against the INTERNAL flux refuses", hot.threw);
+        check("...and 5e-9 does not (the throw is the threshold, not noise)", !cool.threw);
+    }
+
+    // ---- 8. THE HOST TWIN agrees, through cpu::rhoSimple::adjustPhi on a real mesh. ----
+    // The host copies used to add the boundary faces into totalFlux (rhoPEqn_cpp.cu and
+    // simpleFoam/pEqn_cpp.cu both), which is exactly the case arm 7 straddles: on these inputs the
+    // inflated normaliser does NOT throw where OpenFOAM does. rhoBox's mesh carries the patch shapes;
+    // every flux is hand-set, so the arithmetic is the same exact straddle as arm 7.
+    std::printf("  8. the host twin normalises the same way\n");
+    {
+        std::string root = "validation/rhoBox";
+        if (!std::ifstream(root + "/constant/polyMesh/boundary").good()) root = "../" + root;
+        if (!std::ifstream(root + "/constant/polyMesh/boundary").good())
+        {
+            check("validation/rhoBox mesh reachable for the host arm", false);
+        }
+        else
+        {
+            PrimitiveMesh m;
+            m.read(root + "/constant/polyMesh");
+            FvGeometry g;
+            g.build(m);
+            const std::vector<FvPatch> fvp = buildPatches(m, g);
+
+            auto hostRun = [&](scalar d) -> bool
+            {
+                // inlet (patch 0, FixedValue U): face 0 carries the inflow, face 1 the fixed outflow;
+                // outlet (ZeroGradient U) is adjustable with zero flux, walls are fixed with zero flux.
+                GeometricField<vector> U;
+                GeometricField<scalar> p;
+                SurfaceScalarField     phi;
+                U.internal.assign(static_cast<std::size_t>(m.nCells()), vector{});
+                p.internal.assign(static_cast<std::size_t>(m.nCells()), 0.0);
+                phi.internal.assign(static_cast<std::size_t>(m.nInternalFaces()), 0.0);
+                phi.internal[0] = 1.0;   // totalFlux's internal half = 1
+                for (const auto& q : fvp)
+                {
+                    const bool adjustable = (q.name == "outlet");
+                    if (adjustable)
+                        U.boundary.push_back(std::make_unique<ZeroGradientPatchField<vector>>(q));
+                    else
+                        U.boundary.push_back(std::make_unique<FixedValuePatchField<vector>>(
+                            q, true, vector{}, std::vector<vector>{}));
+                    // all-Neumann p, so adjustPhi's needsRef gate lets the guards run
+                    p.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
+                    phi.boundary.emplace_back(static_cast<std::size_t>(q.size), 0.0);
+                }
+                phi.boundary[0][0] = -1.0;       // massIn = 1
+                phi.boundary[0][1] = 1.0 + d;    // fixedMassOut = 1 + d
+                bool threw = false;
+                try { cpu::rhoSimple::adjustPhi(phi, U, p, m, fvp); }
+                catch (const std::exception&) { threw = true; }
+                return threw;
+            };
+
+            check("host: a 2e-8 relative error against the INTERNAL flux refuses", hostRun(2.0e-8));
+            check("host: ...and 5e-9 does not", !hostRun(5.0e-9));
+        }
     }
 
     if (failures == 0) std::printf("PASS\n");
