@@ -615,6 +615,13 @@ set_tests_properties(frozen_bc_refusals PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME les_wallfunction_refusals COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/les_wallfunction_refusals.sh)
 set_tests_properties(les_wallfunction_refusals PROPERTIES SKIP_RETURN_CODE 77)
 
+# Audit finding #15: the SA device path hard-forced Spalding whatever 0/nut asked for --
+# bump2D:SpalartAllmaras ships nutLowReWallFunction (calcNut() = Zero on every model) and got a Newton
+# uTau inside a green gate. The BC selects now: Spalding/LowRe honoured, k-based family and plain wall
+# BCs refused by name, two different wall functions refused.
+add_test(NAME sa_wallfunction_refusals COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_wallfunction_refusals.sh)
+set_tests_properties(sa_wallfunction_refusals PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(test_v2_laplacian_parse tests/test_v2_laplacian_parse.cu)
 target_include_directories(test_v2_laplacian_parse PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_v2_laplacian_parse PRIVATE brae_core)

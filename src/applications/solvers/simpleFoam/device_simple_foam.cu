@@ -1117,7 +1117,30 @@ void amgFineCoeffKernel(
         {
             deviceCopy(nuEffBnd, nuBndConst_);
             // Wall nut chosen by the 0/nut BC TYPE (ctl_.nutWall), matching OpenFOAM, NOT the model.
-            if (ctl_.sa || ctl_.nutWall == NutWall::Spalding)   // nutUSpaldingWallFunction (velocity-based Newton uTau): SA always, or the BC on any model
+            if (ctl_.sa && ctl_.nutWall == NutWall::LowRe)
+            {
+                // nutLowReWallFunction on SA: calcNut() returns Zero UNCONDITIONALLY on every model
+                // (nutLowReWallFunctionFvPatchScalarField.C:38-42), so the wall faces carry NO
+                // turbulent viscosity and the wall shear is molecular -- the low-Re treatment
+                // bump2D:SpalartAllmaras asks for. This branch used to be unreachable: the `ctl_.sa ||`
+                // hard-force below ran Spalding's Newton uTau under this BC's name (audit finding #15).
+                // The SA `calculated` patches still carry nuTilda_b*fv1(chi_b), the same rescue as the
+                // Spalding branch runs.
+                const std::size_t nb = bndIsWall_.size();
+                if (dnutBndWall_.size() != nb) dnutBndWall_.resize(nb);
+                cudaCheck(cudaMemsetAsync(dnutBndWall_.data(), 0, nb * sizeof(scalar),
+                                          cudaStreamPerThread), "sa lowRe wall nut");
+                if (hasNutCalc_)
+                {
+                    DeviceBuffer<scalar> ntB, saNutB;
+                    deviceBCValue(dbK_, dk_, ntB);            // nuTilda's own patch values (dk_ is nuTilda for SA)
+                    deviceNutSABoundary(ntB, compressible_ ? &nuWallBnd_ : nullptr,
+                                        ctl_.nu, ctl_.saCoeffs.Cv1, saNutB);
+                    deviceSelectFixedFlux(nutCalcSel_, saNutB, dnutBndWall_);
+                }
+                addWallNutToMuEff(dnutBndWall_, nuEffBnd);
+            }
+            else if (ctl_.sa || ctl_.nutWall == NutWall::Spalding)   // nutUSpaldingWallFunction (velocity-based Newton uTau): SA when the BC selects it (or names none), or the BC on any model
             {
                 deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_,
                                           nullptr, nutBndFile_.size() ? &nutBndFile_ : nullptr);

@@ -502,6 +502,50 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
             const FieldData<scalar> nutFD = readField<scalar>(fieldDir + "/nut");
             guardFrozen(nutFD, "nut");
             guardWallFn(nutFD, "nut");
+            // The SA device path used to hard-force Spalding (`ctl_.sa || ...` in device_simple_foam.cu)
+            // whatever 0/nut asked for -- the audit's finding #15. bump2D:SpalartAllmaras ships
+            // nutLowReWallFunction, whose calcNut() returns Zero UNCONDITIONALLY on every model
+            // (nutLowReWallFunctionFvPatchScalarField.C:38-42), and got a Newton uTau instead. The BC
+            // selects now: Spalding and LowRe are honoured; the k-based family refuses -- OpenFOAM
+            // feeds it SpalartAllmarasBase::k(), the derived estimate
+            // cbrt(fv1)*nuTilda*sqrt(2/Cmu)*|symm(grad U)| (SpalartAllmarasBase.C:394-405), which brae
+            // does not carry; and a concrete wall patch whose nut names NO wall function refuses too,
+            // because the device writes the selected function on every wall face and has no
+            // evaluate-the-BC path to spare it. A case where no wall-typed patch names any nut wall
+            // function keeps the Spalding arithmetic every existing SA gate was measured on.
+            std::string saWallFn;
+            for (const auto& pb : nutFD.boundary)
+            {
+                const std::string gt = patchGeoType(pb.name);
+                if (isNutWallFn(pb.type))
+                {
+                    if (pb.type != "nutUSpaldingWallFunction" && pb.type != "nutLowReWallFunction")
+                        throw std::runtime_error(
+                            "brae: 0/nut patch '" + pb.name + "' asks for " + pb.type + " on "
+                            "SpalartAllmaras. The SA path honours nutUSpaldingWallFunction (Newton "
+                            "uTau) and nutLowReWallFunction (zero); OpenFOAM computes the k-based "
+                            "family from the model's derived k() estimate, which brae does not carry. "
+                            "Refusing rather than running Spalding under the case's name.");
+                    if (!saWallFn.empty() && saWallFn != pb.type)
+                        throw std::runtime_error(
+                            "brae: 0/nut carries both '" + saWallFn + "' and '" + pb.type + "' on "
+                            "SpalartAllmaras. This driver applies ONE wall function to every wall; "
+                            "OpenFOAM dispatches per patch and honours both. Refusing rather than "
+                            "silently picking one.");
+                    saWallFn = pb.type;
+                }
+                else if (gt == "wall")
+                    throw std::runtime_error(
+                        "brae: wall patch '" + pb.name + "' has nut type '" + pb.type + "' (no wall "
+                        "function) on SpalartAllmaras. The SA path writes its wall function on every "
+                        "wall face and would overwrite this BC; OpenFOAM evaluates it. Refusing "
+                        "rather than substituting Spalding.");
+            }
+            ctl.nutWall = (saWallFn == "nutLowReWallFunction") ? NutWall::LowRe : NutWall::Spalding;
+            std::printf("  nut wall function: %s (honoured on %s per the BC)\n",
+                        saWallFn.empty() ? "nutUSpaldingWallFunction (no wall BC named one; SA default)"
+                                         : saWallFn.c_str(),
+                        ctl.modelName.c_str());
             nut = buildField<scalar>(nutFD, fvp, nC);
             nut.evaluateBoundary();
         }
