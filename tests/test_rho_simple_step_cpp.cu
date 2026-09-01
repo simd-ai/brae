@@ -26,6 +26,7 @@
 // routes, and that is worth seeing.
 #include "primitive_mesh.cuh"
 #include "rhoCaseRefusals.cuh"
+#include "rhoSimpleFoamDriver_cpp.cuh"   // buildStepInput: the case -> StepInput translation the solver ships
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
@@ -152,103 +153,14 @@ int main(int argc, char** argv)
                 simpleDict && simpleDict->wordOr("consistent", "no") == "yes" ? "yes" : "no",
                 simpleDict && simpleDict->wordOr("transonic", "no") == "yes" ? "yes" : "no");
 
-    cpu::rhoSimple::StepInput in;
-    // fvOptions and MRF, derived by the SHARED helper (rhoCaseRefusals.cuh) so the CUDA harness gets
-    // the same flags -- the device-twin guards were reachable only from fail-proofs before it existed.
-    // cr is a function-local that outlives the loop; in.fvOpts points into it.
+    // THE CASE -> StepInput, through the SHARED translation the runnable driver uses
+    // (rhoSimpleFoamDriver_cpp.cu). This block used to be a private copy here: the gates then measured
+    // one translation of the case's schemes, relaxation, refusals and turbulence convection while
+    // `brae -case` ran another, and nothing compared the two. `cr` is function-local static because it
+    // must outlive the loop -- in.fvOpts points into it.
     static cpu::rhoSimple::CaseRefusals cr;
-    cr = cpu::rhoSimple::deriveCaseRefusals(caseDir, m);
-    in.hasMRF              = cr.hasMRF;
-    in.hasFvOptions        = cr.hasFvOptions;
-    in.fvOptionUnsupported = cr.fvOptionUnsupported;
-    in.limitT              = cr.limitT;
-    in.limitTmin           = cr.limitTmin;
-    in.limitTmax           = cr.limitTmax;
-    if (!cr.hasFvOptions && !cr.opts.empty()) in.fvOpts = &cr.opts;
-
-    in.consistent = simpleDict && simpleDict->wordOr("consistent", "no") == "yes";
-    in.transonic  = simpleDict && simpleDict->wordOr("transonic",  "no") == "yes";
-    // getOrDefault<label>(..., 0) -- solutionControl.C:47. The step used to solve the pressure
-    // equation exactly once whatever the case named here, which on a corrected non-orthogonal case is
-    // a different trajectory than OpenFOAM's (the converged answer is the same, so only a matched-
-    // iteration gate can see it -- tests/rho_nonorth_corrector_vs_openfoam.sh).
-    in.nNonOrthogonalCorrectors =
-        simpleDict ? (label)simpleDict->scalarOr("nNonOrthogonalCorrectors", 0) : 0;
-    // The fixture's schemes: `div(phi,*) bounded Gauss upwind`, `laplacianSchemes default Gauss linear
-    // corrected`. Stated here rather than parsed, because a scheme brae read wrongly would otherwise be
-    // invisible -- the gate would compare two solvers running two discretisations and blame the driver.
-    // PARSED from the case, not stated. Stating sbMatched's own schemes was safe while there was one
-    // fixture and became a silent substitution the moment this binary was pointed at a second case:
-    // aerofoilNACA0012 asks for `bounded Gauss linearUpwind limited` on div(phi,U) and
-    // `cellLimited Gauss linear 1` on grad(U), where sbMatched asks for plain upwind and an unlimited
-    // gradient. linearUpwind's deferred correction is a SOURCE term, and running upwind instead left the
-    // wall-cell momentum source at 2.4e-02 against OpenFOAM's 2.5e+00.
-    {
-        auto pick = [&](const char* field)
-        {
-            const FieldDivScheme ds = parseFieldDivScheme(caseDir, field);
-            return ds;
-        };
-        const FieldDivScheme dU  = pick("U");
-        const FieldDivScheme dHe = pick(f.heName.c_str());
-        in.schemeU  = dU.linearUpwind  ? cpu::rhoSimple::DivScheme::linearUpwind
-                    : (dU.limited      ? cpu::rhoSimple::DivScheme::limitedLinear
-                                       : cpu::rhoSimple::DivScheme::upwind);
-        in.schemeHe = dHe.linearUpwind ? cpu::rhoSimple::DivScheme::linearUpwind
-                    : (dHe.limited     ? cpu::rhoSimple::DivScheme::limitedLinear
-                                       : cpu::rhoSimple::DivScheme::upwind);
-        in.schemeKE      = in.schemeHe;   // div(phi,Ekp) follows the energy entry in every tutorial
-        in.boundedU      = dU.bounded;
-        in.boundedHe     = dHe.bounded;
-        in.boundedKE     = dHe.bounded;
-        in.schemeCoeffU  = dU.coeff;  // RAW k: the weights functions compute twoByk themselves (scheme_parse.cuh)
-
-        DeviceSimpleControls sctl;
-        parseFvSchemesControls(caseDir, sctl);
-        in.correctedLaplacian = sctl.nonOrth;
-        in.gradULimitK        = sctl.gradULimitK;
-        in.gradKLimitK        = sctl.gradKLimitK;
-        std::printf("  schemes: div(phi,U) lu=%d bounded=%d | grad(U) cellLimited k=%g | "
-                    "laplacian corrected=%d\n",
-                    (int)dU.linearUpwind, (int)dU.bounded, (double)in.gradULimitK,
-                    (int)in.correctedLaplacian);
-    }
-    in.relaxU   = re  ? re->scalarOr("U", 1.0) : 1.0;
-    in.relaxHe  = re  ? re->scalarOr(f.heName, 1.0) : 1.0;
-    in.relaxPEqn = re ? re->scalarOr("p", 1.0) : 1.0;
-    in.relaxPEqnSpecified = (re != nullptr) && re->found("p");
-    in.relaxP   = rfl ? rfl->scalarOr("p", 1.0) : 1.0;
-    in.relaxRho = rfl ? rfl->scalarOr("rho", 1.0) : 1.0;
-    in.relaxK       = re ? re->scalarOr("k", 1.0) : 1.0;
-    in.relaxEpsilon = re ? re->scalarOr("epsilon", 1.0) : 1.0;
-    // "the case NAMES a factor", not "the factor is below 1" -- fvMatrix::relax(1.0) still applies the
-    // dominance clamp, and OpenFOAM does not relax at all when fvSolution names nothing.
-    in.relaxEquationU   = (re != nullptr) && re->found("U");
-    in.relaxEquationHe  = (re != nullptr) && re->found(f.heName);
-    in.relaxEquationK   = (re != nullptr) && re->found("k");
-    in.relaxEquationEps = (re != nullptr) && re->found("epsilon");
-    // div(phi,k) and div(phi,epsilon|omega) FROM THE CASE. This was `in.boundedTurb = true` with a
-    // comment naming the fixture -- a hardcode, so neither the bounded flag nor a non-upwind scheme
-    // ever reached the step from the case's own fvSchemes, and the closure's refusal was unreachable.
-    if (f.turbulent && !f.turbulenceFrozen && !f.k.internal.empty())
-    {
-        const char* secondT = (f.rasModel == "kOmegaSST") ? "omega" : "epsilon";
-        const FieldDivScheme dK = parseFieldDivScheme(caseDir, "k");
-        const FieldDivScheme dS = parseFieldDivScheme(caseDir, secondT);
-        in.boundedTurb = dK.bounded;
-        if (dK.bounded != dS.bounded)
-            in.turbDivUnsupported = "bounded on one of div(phi,k)/div(phi," + std::string(secondT)
-                                  + ") and not the other (brae carries one flag for both)";
-        // limitedLinear is ASSEMBLED (both closures take the weights), but only as one scheme for both
-        // scalars -- the closures carry a single flag and coefficient, so entries that disagree refuse
-        // rather than run one of them under the other's name.
-        if (dK.limited != dS.limited || (dK.limited && dK.coeff != dS.coeff))
-            in.turbDivUnsupported = "limitedLinear on div(phi,k) and div(phi," + std::string(secondT)
-                                  + ") with different schemes or coefficients (brae carries one for both)";
-        in.limitedLinearTurb = dK.limited && dS.limited;
-        in.turbLimiterCoeff  = dK.coeff;   // RAW k of `limitedLinear k` -- see scheme_parse.cuh
-        if (dK.linearUpwind || dS.linearUpwind) in.turbDivUnsupported = "Gauss linearUpwind";
-    }
+    cpu::rhoSimple::StepInput in =
+        cpu::rhoSimple::buildStepInput(caseDir, f, fvSolution, m, cr);
 
     // ---- THE FROZEN ARM (activates itself on a `RAS { turbulence off; }` fixture) -----------------
     // OpenFOAM constructs the model, validate()'s correctNut runs ONCE, and every correct() after that

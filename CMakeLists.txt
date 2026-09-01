@@ -119,6 +119,7 @@ add_library(brae_core STATIC
     src/applications/solvers/rhoSimpleFoam/rhoPEqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoPcEqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoSimpleFoam_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/rhoSimpleFoamDriver_cpp.cu
     src/applications/solvers/simpleFoam/simpleFoam_cpp.cu
     src/finiteVolume/cfdTools/general/solutionControl/simpleControl/simpleControl_cpp.cu
     src/matrices/lduMatrix/solvers/PCG/device_pcg.cu
@@ -1385,6 +1386,11 @@ target_link_libraries(brae_pimpleFoam PRIVATE brae_core)
 # build, one command to run, and no way to end up with a brae that cannot solve half the cases it is handed.
 # Every solver added to the registry (solvers/common/solver_dispatch.cuh) belongs in this list.
 add_dependencies(brae brae_pimpleFoam)
+# ...and brae_rhoSimpleFoam, which the registry has routed to since it was added and this list never
+# named: `brae -case <compressible case>` on a fresh build execv'd a sibling that had not been built,
+# so the run died at the hand-over with the case fully parsed. The comment above already said every
+# registered solver belongs here; only the line was missing.
+add_dependencies(brae brae_rhoSimpleFoam)
 
 # End-to-end kOmegaSSTLM (Langtry-Menter transition) vs a SAVED OpenFOAM v2412 oracle (no OF needed at test time):
 # runs brae on a transition flat plate and checks U L2 < 3% and the gammaInt transition is captured.
@@ -2070,6 +2076,21 @@ set_tests_properties(rho_turb_limitedlinear_vs_openfoam PROPERTIES
 # DEVICE arm: the CUDA driver's loop vs the OF-gated host at iteration 1 on the same mutation (its
 # harness used to hardcode correctedLaplacian=false, under which the loop had nothing to correct);
 # forcing the device count to 0 reads Ux 1.85e-01 against the arm's 5.7e-12.
+# THE MIRROR AS A SOLVER, not as a step: `brae -case` end to end against real OpenFOAM -- the answer,
+# the OF-format output (real rhoSimpleFoam restarts from brae's written directory), the latestTime
+# restart with an ABSOLUTE endTime, the turbulent write payload, the residualControl stop, and the
+# binary-writeFormat refusal. Measured on rhoBox at 200 iterations: p 2.95e-12, U 2.93e-11 -- the
+# linear-solver floor, because the driver reads the case's own tolerances. Every other rhoSimpleFoam
+# gate drives the step through a harness that reads no controlDict and writes nothing, so none of this
+# was gated anywhere.
+add_test(NAME rho_mirror_solver_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_mirror_solver_vs_openfoam.sh)
+set_tests_properties(rho_mirror_solver_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 1800)
+
 add_test(NAME rho_nonorth_corrector_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_nonorth_corrector_vs_openfoam.sh)
 set_tests_properties(rho_nonorth_corrector_vs_openfoam PROPERTIES

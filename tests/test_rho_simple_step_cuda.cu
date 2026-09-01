@@ -239,7 +239,19 @@ int main(int argc, char** argv)
                 hin.turbDivUnsupported = "bounded on only one of the two turbulence entries";
         }
     }
-    hin.boundedU = hin.boundedHe = hin.boundedKE = true;   // `bounded Gauss upwind` on all three
+    // `bounded` FROM THE CASE, on both arms. This was `= true` with a comment naming rhoBox's own
+    // `bounded Gauss upwind` -- a hardcode of the same class as the laplacian one below it, and the
+    // last of the pair the register carried: pointing this binary at a case whose div schemes are not
+    // bounded would have run the bounded matrix on both arms under the case's name, agreeing with
+    // itself and with nothing else. rhoBox parses to exactly the true that was hardcoded, so the
+    // registered gates are unchanged.
+    {
+        const FieldDivScheme dU  = parseFieldDivScheme(caseDir, "U");
+        const FieldDivScheme dHe = parseFieldDivScheme(caseDir, hf.heName);
+        hin.boundedU  = dU.bounded;
+        hin.boundedHe = dHe.bounded;
+        hin.boundedKE = dHe.bounded;   // div(phi,Ekp) follows the energy entry in every tutorial
+    }
     // laplacianSchemes/snGradSchemes FROM THE CASE. This was `= false` with a comment naming the
     // fixture's `Gauss linear orthogonal` -- a hardcode, so pointing this binary at a corrected case
     // (sbMatched, and the nonOrth-corrector gate's mutation of it) silently assembled the orthogonal
@@ -422,7 +434,9 @@ int main(int argc, char** argv)
     gin.relaxRho  = hin.relaxRho;
     gin.relaxPEqn = hin.relaxPEqn;
     gin.relaxPEqnSpecified = hin.relaxPEqnSpecified;
-    gin.boundedU = gin.boundedHe = gin.boundedKE = true;
+    gin.boundedU  = hin.boundedU;   // parsed from the case -- see the hin block
+    gin.boundedHe = hin.boundedHe;
+    gin.boundedKE = hin.boundedKE;
     gin.correctedLaplacian = hin.correctedLaplacian;   // parsed from the case -- see the hin note
     gin.gradULimitK        = hin.gradULimitK;
     gin.nNonOrthogonalCorrectors = caseNonOrth;   // the same count on both arms -- see the note above

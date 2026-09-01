@@ -38,6 +38,7 @@
 #include "write_control.cuh"   // OF writeControl/writeInterval/purgeWrite cadence (shared with simpleFoam)
 #include "brae_time.cuh"   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
 #include "scalar_transport_fo.cuh"   // OF functionObjects::scalarTransport, on the device flux
+#include "rhoSimpleFoamDriver_cpp.cuh"   // the OF-mirror path this binary hands over to on request
 #include "mrf_read.cuh"          // readCellZones (shared with the incompressible driver)
 #include "fv_options.cuh"       // OF fv::options: the SAME framework the incompressible driver uses
 #include "of_residual_log.cuh"   // BRAE_OF_LOG=1: OF-format per-solve residuals, for iteration-by-iteration diffing
@@ -78,6 +79,25 @@ int main(int argc, char** argv)
         {
             const std::string a = argv[i];
             if (a == "-case" && i + 1 < argc) caseDir = argv[++i];
+            // A POSITIONAL case directory, which every other brae solver accepts (gpuSimpleFoam.cu,
+            // gpuPimpleFoam.cu) and this one did not: `brae myCase` dispatches here with argv forwarded
+            // verbatim, and the case name was then dropped and the run silently made in the CURRENT
+            // directory -- a different case, or a "no polyMesh" abort with the user's argument in hand.
+            else if (!a.empty() && a[0] != '-') caseDir = a;
+        }
+
+        // THE OF-MIRROR PATH, opt-in. `application rhoSimpleFoam` routes to this binary, whose body
+        // below is the PRE-MIRROR implementation; the mirror is the re-port under this directory that
+        // the gates measure (rhoCreateFields_cpp / rhoSimpleFoam_cpp, driven by
+        // rhoSimpleFoamDriver_cpp). Selected exactly as the incompressible rebuild is
+        // (BRAE_SIMPLEFOAM_V2, gpuSimpleFoam.cu), and like it, it REFUSES a case outside its envelope
+        // by name rather than falling back here -- a silent fallback would report the mirror's name
+        // over the old path's answer. Repointing the registry at the mirror is the later, gate-earned
+        // step.
+        if (const char* mirror = std::getenv("BRAE_RHOSIMPLEFOAM_MIRROR"))
+        {
+            if (std::string(mirror) == "1")
+                return cpu::rhoSimple::runMirror(caseDir);
         }
 
         const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
