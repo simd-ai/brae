@@ -210,11 +210,17 @@ scalar deviceSymGaussSeidel(
     scalar tol,
     scalar relTol,
     int maxIter,
-    DeviceSolverPerf* perf)
+    DeviceSolverPerf* perf,
+    int minIter)
 {
+    // minIter (fvSolution solvers/<field>/minIter) is OF's floor on the sweep count: smoothSolver.C
+    // enters the loop when minIter > 0 even if the initial residual already passes, and keeps sweeping
+    // until nIterations >= minIter. The three opt-in fast paths below bake the stop test without it, so
+    // a floor takes the host loop, which honours it exactly.
+    const bool floored = minIter > 0;
     // BRAE_TURB_FP32: solve in FP32 (half the bytes on the BW-bound sweeps; loose turbulence tol >> FP32 eps).
     static const bool turbF32 = std::getenv("BRAE_TURB_FP32") != nullptr;
-    if (turbF32)
+    if (turbF32 && !floored)
     {
         scalar r = deviceSymGaussSeidelF32(A, b, psi, normFactor, tol, relTol, maxIter);
         if (perf) *perf = {r, r, 1};
@@ -223,7 +229,7 @@ scalar deviceSymGaussSeidel(
     // BRAE_TURB_JACOBI: weighted-Jacobi solve (fully parallel, no colour sync). Experiment only -- Jacobi needs ~2x
     // the sweeps -> ~2x the bandwidth on this BW-bound path, so it is slower than the graphed GS. Same stop test as GS.
     static const bool turbJac = std::getenv("BRAE_TURB_JACOBI") != nullptr;
-    if (turbJac)
+    if (turbJac && !floored)
     {
         DeviceBuffer<scalar> Ax, r;
         deviceAmul(A, psi, Ax);
@@ -253,7 +259,7 @@ scalar deviceSymGaussSeidel(
     // zero per-sweep host D2H. EXACT (not batched): identical sweep count + bit-identical psi vs this host loop.
     static const bool useGraph = std::getenv("BRAE_GS_DEVICE") != nullptr;
 #ifdef BRAE_HAS_GS_DEVICE
-    if (useGraph)
+    if (useGraph && !floored)
     {
         scalar r = deviceSymGaussSeidelGraph(A, b, psi, normFactor, tol, relTol, maxIter);
         if (perf) *perf = {r, r, 1};
@@ -276,7 +282,7 @@ scalar deviceSymGaussSeidel(
     deviceCopy(r, b);
     deviceAxpy(-1.0, Ax, r);   // r = b - A*psi
     const scalar initRes = deviceSumMag(r) / normFactor;
-    if (initRes < tol)
+    if (initRes < tol && !floored)
     {
         if (std::getenv("BRAE_GS_DEBUG")) std::printf("    GS init=%.4e (skip)\n", initRes);
         if (perf) *perf = {initRes, initRes, 0};
@@ -292,7 +298,7 @@ scalar deviceSymGaussSeidel(
         deviceCopy(r, b);
         deviceAxpy(-1.0, Ax, r);
         finalRes = deviceSumMag(r) / normFactor;                        // exact per-sweep check (matches OF's loose smoothSolver stop)
-        if (finalRes < tol || finalRes < relTol*initRes) break;
+        if ((finalRes < tol || finalRes < relTol*initRes) && iter + 1 >= minIter) break;
     }
     if (std::getenv("BRAE_GS_DEBUG")) std::printf("    GS init=%.4e final=%.4e iters=%d (relTol=%.2g)\n", initRes, finalRes, iter+1, relTol);
     if (perf) *perf = {initRes, finalRes, iter + 1};   // default path: full OF-style init/final/nIter

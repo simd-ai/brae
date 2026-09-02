@@ -149,7 +149,9 @@ struct RhoStepInput
     scalar tolU = 1e-12, relTolU = 0.0;
     scalar tolHe = 1e-12, relTolHe = 0.0;
     scalar tolP = 1e-12, relTolP = 0.0;
-    int    maxIter = 2000;
+    // Per equation, as OF reads them (lduMatrixSolver.C:204-205) -- see StepInput in the host twin.
+    int    maxIterU = 2000, maxIterP = 2000, maxIterHe = 2000, maxIterTurb = 2000;
+    int    minIterU = 0,    minIterP = 0,    minIterHe = 0,    minIterTurb = 0;
     bool   uSymGaussSeidel = false;
     bool   captureVcycle = true;
     int    pcgCheckEvery = 1;

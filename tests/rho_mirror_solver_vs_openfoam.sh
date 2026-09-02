@@ -18,6 +18,7 @@
 #      at 20 with endTime 23 runs THREE steps, not twenty-three.
 #   4. THE REFUSALS a solver needs: `writeFormat binary` (the writer emits ascii only) by name.
 #   5. THE CRITERIA. residualControl on the CUDA arm reads the closure's residuals too (arm 13).
+#   6. THE SOLVER ENTRIES. tolerance/relTol/maxIter/minIter reach each equation from ITS entry (arm 14).
 #
 # The turbulent arm runs validation/rhoBoxF so the k/epsilon/nut/alphat write payload is exercised
 # cheaply -- that fixture's turbulence is frozen, which does not matter here: the question is whether
@@ -355,7 +356,8 @@ fi
 #
 # The oracle is that the criterion BINDS: with everything else at 1e-3, tightening the turbulence
 # criterion alone must move the stopping iteration. Measured on rhoKE (3200 cells, kEpsilon): 67 at
-# 1e-3, 94 at 1e-5, k and epsilon on every log line. Fail-proof (merge removed): 61 under BOTH, no k
+# 1e-3 and 83..94 at 1e-5 across runs (this solver is not run-to-run reproducible near a tight
+# criterion, which is why the arm asserts the ORDER and not the count), k and epsilon on every log line. Fail-proof (merge removed): 61 under BOTH, no k
 # printed. The third check is the strongest: with the case's linear solvers tightened to 1e-12/0 the
 # two arms must converge on the SAME iteration -- they read the same criteria, so they stop together
 # (67 = 67, residuals agreeing to five digits). Under the case's own tolerances they stop at 67 and 89:
@@ -406,6 +408,27 @@ PYEOF2
         || say "under tight linear solvers both arms stop on the same iteration (cuda ${nt:-none}, host ${nh:-none})" FAIL
 else
     say "rhoKE or blockMesh missing -- turbulence residualControl arm skipped" SKIP
+fi
+
+
+# ---- arm 14: every equation's fvSolution/solvers entry reaches ITS solve, both arms ------------------
+# Both drivers took the energy tolerance from the turbulence slot (which nothing filled: the reader's
+# k/epsilon block is gated on ctl.turbulent and neither driver set it, so 1e-8/0 whatever the case
+# said), every equation's maxIter from p's entry, and forwarded minIter nowhere. OF reads all four per
+# field from that field's own sub-dictionary (lduMatrixSolver.C:196-205). The oracle and its controls
+# are in tests/rho_solver_entries.py -- measured on rhoKE at 10 iterations, every mutated entry moves
+# its field by 2e-04 .. 2.8e-01 on both arms, and the fail-proof (old assignments restored) reads
+# 0.000e+00 on every energy and turbulence row while the p control still moves.
+if [ -d "$ROOT/validation/rhoKE" ] && command -v blockMesh > /dev/null 2>&1; then
+    stage "$W/ent" "$ROOT/validation/rhoKE" 10
+    ( cd "$W/ent" && blockMesh > log.blockMesh 2>&1 ) || { echo "FAIL: blockMesh on rhoKE"; exit 1; }
+    for arm in 1 cuda; do
+        python3 "$ROOT/tests/rho_solver_entries.py" "$W/ent" "$BIN" "$arm" "$W/ent_$arm" h \
+            && say "the case's solver entries reach every equation (arm $arm)" ok \
+            || say "the case's solver entries reach every equation (arm $arm)" FAIL
+    done
+else
+    say "rhoKE or blockMesh missing -- solver-entries arm skipped" SKIP
 fi
 
 [ $fail = 0 ] && echo PASS || { echo FAIL; exit 1; }

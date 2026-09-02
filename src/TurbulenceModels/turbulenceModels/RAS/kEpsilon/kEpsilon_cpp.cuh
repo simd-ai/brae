@@ -193,7 +193,10 @@ void correct(
     // RAW k, limitedLinearWeights computes twoByk itself. Appended LAST so every existing positional
     // caller keeps the arithmetic it was gated with.
     bool   limitedLinear = false,
-    scalar limiterCoeff  = 1.0);
+    scalar limiterCoeff  = 1.0,
+    // fvSolution solvers/<field>/minIter, OF's lduMatrix::solver floor on the iteration count
+    // (PBiCGStab.C:262-265: the loop continues while nIterations < minIter even when converged).
+    int    minIter       = 0);
 
 } // namespace kEpsilonRef
 } // namespace cpu

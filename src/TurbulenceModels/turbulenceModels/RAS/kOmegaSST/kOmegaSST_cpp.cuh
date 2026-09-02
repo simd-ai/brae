@@ -200,7 +200,9 @@ void correct(
     // LAST, and deliberately: every existing caller passes these positionally, and inserting a parameter
     // ahead of them silently rebinds their arguments. Null throughout is the incompressible reading and
     // reproduces the previous arithmetic exactly.
-    const Compressible*            comp = nullptr);
+    const Compressible*            comp = nullptr,
+    // fvSolution solvers/<field>/minIter -- see kEpsilon_cpp.cuh. Last, after comp, for the same reason.
+    int                            minIter = 0);
 
 } // namespace kOmegaSST
 } // namespace cpu

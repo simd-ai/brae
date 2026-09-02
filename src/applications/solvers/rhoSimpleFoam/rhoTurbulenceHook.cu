@@ -128,7 +128,7 @@ void correctTurbulence(
     kin.correctedLaplacian = opt.correctedLaplacian;
     kin.relaxEquationK   = opt.relaxEquationK;   kin.relaxK   = opt.relaxK;
     kin.relaxEquationEps = opt.relaxEquationEps; kin.relaxEps = opt.relaxEps;
-    kin.tol = opt.tol; kin.relTol = opt.relTol; kin.maxIter = opt.maxIter;
+    kin.tol = opt.tol; kin.relTol = opt.relTol; kin.maxIter = opt.maxIter; kin.minIter = opt.minIter;
     kin.fvoKMask   = opt.fvoKMask;    kin.fvoKVal   = opt.fvoKVal;
     kin.fvoEpsMask = opt.fvoEpsMask;  kin.fvoEpsVal = opt.fvoEpsVal;
 

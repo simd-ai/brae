@@ -185,6 +185,7 @@ void deviceCoarseJacobiLoop(const DeviceLduView& cv, const DeviceBuffer<scalar>&
 // near-wall instability. Coloring is built once per mesh (cached on A.owner), internal-face LDU only (no interface).
 scalar deviceSymGaussSeidel(const DeviceLduView& A, const DeviceBuffer<scalar>& b, DeviceBuffer<scalar>& psi,
                             scalar normFactor, scalar tol, scalar relTol, int maxIter,
-                            DeviceSolverPerf* perf = nullptr);   // returns the OF initialResidual; *perf (if given) gets init/final/nIter
+                            DeviceSolverPerf* perf = nullptr,
+                            int minIter = 0);   // OF's floor on the sweep count; > 0 takes the host loop   // returns the OF initialResidual; *perf (if given) gets init/final/nIter
 
 } // namespace brae

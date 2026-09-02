@@ -29,11 +29,33 @@
 #include "rhoCaseRefusals.cuh"
 #include "rhoCreateFields_cpp.cuh"
 #include "rhoSimpleFoam_cpp.cuh"
+#include <cstdio>
 #include <string>
 
 namespace brae {
 namespace cpu {
 namespace rhoSimple {
+
+// The linear-solver controls as the SOLVE will use them, one line per equation. Printed by both mirror
+// drivers so a gate can assert the case's own entries reached the solve (the old print showed p's cap
+// under every equation's name, which is what it was).
+inline void printLinearSolverControls(
+    const StepInput&   in,
+    const std::string& heName,
+    const std::string& secondName,
+    bool               turbulent)
+{
+    std::printf("  linear solver (from fvSolution): p tol %.1e relTol %.3g maxIter %d minIter %d\n",
+                (double)in.tolP, (double)in.relTolP, in.maxIterP, in.minIterP);
+    std::printf("  linear solver (from fvSolution): U tol %.1e relTol %.3g maxIter %d minIter %d\n",
+                (double)in.tolU, (double)in.relTolU, in.maxIterU, in.minIterU);
+    std::printf("  linear solver (from fvSolution): %s tol %.1e relTol %.3g maxIter %d minIter %d\n",
+                heName.c_str(), (double)in.tolHe, (double)in.relTolHe, in.maxIterHe, in.minIterHe);
+    if (turbulent)
+        std::printf("  linear solver (from fvSolution): k|%s tol %.1e relTol %.3g maxIter %d minIter %d\n",
+                    secondName.c_str(), (double)in.tolTurb, (double)in.relTolTurb, in.maxIterTurb,
+                    in.minIterTurb);
+}
 
 // The case's dictionaries -> StepInput: schemes, relaxation, refusals, turbulence convection.
 //

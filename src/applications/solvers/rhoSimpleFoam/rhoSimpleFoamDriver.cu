@@ -228,7 +228,9 @@ RhoStepInput buildDeviceStepInput(
     in.tolU = hin.tolU;  in.relTolU = hin.relTolU;
     in.tolHe = hin.tolHe; in.relTolHe = hin.relTolHe;
     in.tolP = hin.tolP;  in.relTolP = hin.relTolP;
-    in.maxIter = hin.maxIter;
+    in.maxIterU  = hin.maxIterU;  in.minIterU  = hin.minIterU;
+    in.maxIterP  = hin.maxIterP;  in.minIterP  = hin.minIterP;
+    in.maxIterHe = hin.maxIterHe; in.minIterHe = hin.minIterHe;
 
     return in;
 }
@@ -289,15 +291,14 @@ int runMirrorCuda(const std::string& caseDir)
     // pins them so the linear solve is out of the comparison, a SOLVER runs what the case asks for.
     {
         DeviceSimpleControls lctl;
+        lctl.turbulent = hf.turbulent;   // gates the reader's k/epsilon block -- see the host driver
         const std::string secondName = (hf.rasModel == "kOmegaSST") ? "omega" : "epsilon";
-        readLinearSolverControls(fvSolution, secondName, lctl, "SIMPLE");
-        hin.tolU    = lctl.tolU;    hin.relTolU  = lctl.relTolU;
-        hin.tolP    = lctl.tolP;    hin.relTolP  = lctl.relTolP;
-        hin.tolHe   = lctl.tolKE;   hin.relTolHe = lctl.relTolKE;
-        hin.tolTurb = lctl.tolKE;   hin.relTolTurb = lctl.relTolKE;
-        hin.maxIter = lctl.maxIterP;
-        std::printf("  linear solver (from fvSolution): p tol %.1e relTol %.3g maxIter %d\n",
-                    (double)hin.tolP, (double)hin.relTolP, hin.maxIter);
+        readLinearSolverControls(fvSolution, secondName, lctl, "SIMPLE", hf.heName);
+        hin.tolU    = lctl.tolU;    hin.relTolU    = lctl.relTolU;    hin.maxIterU    = lctl.maxIterU;    hin.minIterU    = lctl.minIterU;
+        hin.tolP    = lctl.tolP;    hin.relTolP    = lctl.relTolP;    hin.maxIterP    = lctl.maxIterP;    hin.minIterP    = lctl.minIterP;
+        hin.tolHe   = lctl.tolHe;   hin.relTolHe   = lctl.relTolHe;   hin.maxIterHe   = lctl.maxIterHe;   hin.minIterHe   = lctl.minIterHe;
+        hin.tolTurb = lctl.tolKE;   hin.relTolTurb = lctl.relTolKE;   hin.maxIterTurb = lctl.maxIterKE;   hin.minIterTurb = lctl.minIterKE;
+        cpu::rhoSimple::printLinearSolverControls(hin, hf.heName, secondName, hf.turbulent);
     }
 
     RhoDeviceFields dev = createDeviceFields(hf, m, g, patches);
@@ -345,7 +346,8 @@ int runMirrorCuda(const std::string& caseDir)
                                         : std::string());
         turbOpt.relaxEquationK   = hin.relaxEquationK;   turbOpt.relaxK   = hin.relaxK;
         turbOpt.relaxEquationEps = hin.relaxEquationEps; turbOpt.relaxEps = hin.relaxEpsilon;
-        turbOpt.tol = hin.tolTurb; turbOpt.relTol = hin.relTolTurb; turbOpt.maxIter = hin.maxIter;
+        turbOpt.tol = hin.tolTurb; turbOpt.relTol = hin.relTolTurb;
+        turbOpt.maxIter = hin.maxIterTurb; turbOpt.minIter = hin.minIterTurb;
         if (constraints.hasK)   { turbOpt.fvoKMask   = &constraints.kMask;   turbOpt.fvoKVal   = &constraints.kVal; }
         if (constraints.hasEps) { turbOpt.fvoEpsMask = &constraints.epsMask; turbOpt.fvoEpsVal = &constraints.epsVal; }
 

@@ -47,7 +47,9 @@ inline void readLinearSolverControls(
     const FoamDict& fvSolution,
     const std::string& secondName,
     DeviceSimpleControls& ctl,
-    const std::string& algorithmDict = "SIMPLE")
+    const std::string& algorithmDict = "SIMPLE",
+    // The energy field's name (h or e), for the compressible callers. Empty = no energy equation.
+    const std::string& heName = "")
 {
     const FoamDict* solvers = fvSolution.subDict("solvers");
 
@@ -172,6 +174,14 @@ inline void readLinearSolverControls(
     ctl.maxIterUFinal = solverMaxIter("UFinal", ctl.maxIterU);
     ctl.minIterPFinal = solverMinIter("pFinal", ctl.minIterP);
     ctl.minIterUFinal = solverMinIter("UFinal", ctl.minIterU);
+    if (!heName.empty())
+    {
+        ctl.tolHe     = solverTol(heName, 1e-6);
+        ctl.relTolHe  = solverRelTol(heName);
+        ctl.maxIterHe = solverMaxIter(heName, 1000);
+        ctl.minIterHe = solverMinIter(heName, 0);
+        noticeSolverChoice(heName, "Jacobi-BiCGStab", false);
+    }
     ctl.gsU = useSymGS("U");
     if (const char* gsuEnv = std::getenv("BRAE_GS_U"))
         ctl.gsU = (std::atoi(gsuEnv) != 0) && ctl.gsU;
@@ -196,6 +206,8 @@ inline void readLinearSolverControls(
         {
             ctl.tolKE = solverTol("nuTilda", 1e-8);
             ctl.relTolKE = solverRelTol("nuTilda");
+            ctl.maxIterKE = solverMaxIter("nuTilda", 1000);
+            ctl.minIterKE = solverMinIter("nuTilda", 0);
             ctl.tolKEFinal = solverTol("nuTildaFinal", ctl.tolKE);
             ctl.relTolKEFinal = solvers && solvers->subDict("nuTildaFinal") ? solverRelTol("nuTildaFinal") : ctl.relTolKE;
             ctl.gsK = useSymGS("nuTilda");
@@ -206,6 +218,16 @@ inline void readLinearSolverControls(
         {
             ctl.tolKE = std::fmin(solverTol("k", 1e-8), solverTol(secondName, 1e-8));
             ctl.relTolKE = std::fmin(solverRelTol("k"), solverRelTol(secondName));
+            // One cap for the pair, as one tolerance: the tighter maxIter and the larger minIter. A cap
+            // decides where a solve STOPS, so two entries that disagree are announced rather than one
+            // being taken silently. Neither was read before this; both sat at the struct defaults.
+            ctl.maxIterKE = std::min(solverMaxIter("k", 1000), solverMaxIter(secondName, 1000));
+            ctl.minIterKE = std::max(solverMinIter("k", 0), solverMinIter(secondName, 0));
+            if (solverMaxIter("k", 1000) != solverMaxIter(secondName, 1000)
+             || solverMinIter("k", 0) != solverMinIter(secondName, 0))
+                noticeApproximated("solvers/k and solvers/" + secondName + " maxIter/minIter",
+                                   "the pair is solved under ONE cap: the tighter maxIter and the larger"
+                                   " minIter of the two entries");
             ctl.tolKEFinal = std::fmin(solverTol("kFinal", solverTol("k", 1e-8)),
                                        solverTol(secondName + "Final", solverTol(secondName, 1e-8)));
             ctl.relTolKEFinal = std::fmin(

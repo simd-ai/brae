@@ -207,7 +207,7 @@ int main(int argc, char** argv)
     hin.consistent = simpleDict && simpleDict->wordOr("consistent", "no") == "yes";
     hin.transonic  = simpleDict && simpleDict->wordOr("transonic", "no") == "yes";
     hin.tolU = hin.tolHe = hin.tolP = 1e-14;
-    hin.maxIter = 2000;
+    hin.maxIterU = hin.maxIterP = hin.maxIterHe = hin.maxIterTurb = 2000;
     hin.relaxU  = req ? req->scalarOr("U", 1.0) : 1.0;
     hin.relaxHe = req ? req->scalarOr(hf.heName, 1.0) : 1.0;
     hin.relaxEquationU  = (req != nullptr) && req->found("U");
@@ -336,7 +336,7 @@ int main(int argc, char** argv)
     // A GATE pins the linear solve so it is out of the comparison; the SOLVER reads the case's own
     // tolerances (rhoSimpleFoamDriver.cu). The one deliberate difference between the two, named here.
     gin.tolU = gin.tolHe = gin.tolP = 1e-14;
-    gin.maxIter = 2000;
+    gin.maxIterU = gin.maxIterP = gin.maxIterHe = gin.maxIterTurb = 2000;
 
     // THE CASE'S OWN pressureControl, on every arm. The forced-limiter block below overrides these with
     // bounds tightened to make the clamp bite, and it is SKIPPED on the boundary and turbulent arms --
@@ -513,7 +513,7 @@ int main(int argc, char** argv)
         turbOpt.divSchemeUnsupported  = hin.turbDivUnsupported;
         turbOpt.relaxEquationK   = hin.relaxEquationK;   turbOpt.relaxK   = hin.relaxK;
         turbOpt.relaxEquationEps = hin.relaxEquationEps; turbOpt.relaxEps = hin.relaxEpsilon;
-        turbOpt.tol = hin.tolTurb; turbOpt.relTol = hin.relTolTurb; turbOpt.maxIter = hin.maxIter;
+        turbOpt.tol = hin.tolTurb; turbOpt.relTol = hin.relTolTurb; turbOpt.maxIter = hin.maxIterTurb;
         gin.correct = [&]()
         {
             gpu::rhoSimple::correctTurbulence(gf, dev, dm, dbU, hf.thermo, turbOpt, turbBuf);

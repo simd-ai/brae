@@ -259,7 +259,8 @@ void correct(
     bool                           correctedLaplacian,
     scalar                         snGradLimitCoeff,
     const LMHooks*                 lm,
-    const Compressible*            comp)
+    const Compressible*            comp,
+    int                            minIter)
 {
     if (co.F3)
         throw std::runtime_error(
@@ -498,7 +499,7 @@ void correct(
         setValues(M, omega.internal, m, patches, wallCells, omVals);
         if (res && res->captureStages)
             captureSSTSystem(M, patches, res->omD, res->omSrc, &res->omUpper, &res->omLower);
-        const SolverPerformance po = pbicgstab(M, omega.internal, m, patches, tol, relTol, maxIter);
+        const SolverPerformance po = pbicgstab(M, omega.internal, m, patches, tol, relTol, maxIter, minIter);
         if (res) res->omega = po.initialResidual;
         if (std::getenv("BRAE_SST_DEBUG"))
             std::printf("    [omega] init=%.3e final=%.3e nIter=%d\n",
@@ -602,7 +603,7 @@ void correct(
         relaxMatrix(M, k, m, patches, relaxK);
         if (res && res->captureStages)
             captureSSTSystem(M, patches, res->kD, res->kSrc, &res->kUpper, &res->kLower);
-        const SolverPerformance pk = pbicgstab(M, k.internal, m, patches, tol, relTol, maxIter);
+        const SolverPerformance pk = pbicgstab(M, k.internal, m, patches, tol, relTol, maxIter, minIter);
         if (res) res->k = pk.initialResidual;
         if (std::getenv("BRAE_SST_DEBUG"))
             std::printf("    [k] init=%.3e final=%.3e nIter=%d\n",

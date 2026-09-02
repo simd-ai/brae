@@ -34,6 +34,13 @@ struct DeviceSimpleControls
     vector bodyForce{0, 0, 0};                     // constant momentum source (drives periodic/cyclic channels). +V*g.
     scalar tolU = 1e-8, tolP = 1e-7, tolKE = 1e-8;
     scalar relTolU = 0.0, relTolP = 0.0, relTolKE = 0.0;   // solver relTol (fvSolution solvers.{U,p,k,epsilon}.relTol). 0 = abs tol.
+    // The ENERGY equation's own entry (solvers/h, /e, or a regex covering it), filled when the caller
+    // names the field. OF's lduMatrix::solver reads every field from its own sub-dictionary
+    // (lduMatrixSolver.C:196-205; defaults tolerance 1e-6, relTol 0, maxIter 1000, minIter 0). The rho
+    // mirror used to take the energy tolerance from tolKE -- the TURBULENCE slot, which no steady caller
+    // filled -- so he solved to 1e-8/0 whatever the case said.
+    scalar tolHe = 1e-6, relTolHe = 0.0;
+    int    maxIterHe = 1000, minIterHe = 0;
     // fvSolution's `Final` VARIANTS (solvers.pFinal / UFinal / kFinal ...). PIMPLE spends its early outer
     // correctors getting close and its last one getting the answer, so OF gives the last one its own,
     // tighter settings: pimpleControl::loop calls mesh.data().setFinalIteration(true) on the final outer

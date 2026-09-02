@@ -212,17 +212,17 @@ int runMirror(const std::string& caseDir)
     // in one place and named here rather than drifting apart silently.
     {
         DeviceSimpleControls lctl;
+        // The reader's k/epsilon block is gated on this flag and nothing set it, so tolKE/relTolKE sat at
+        // the struct defaults 1e-8/0 whatever fvSolution said -- and the ENERGY tolerance was then
+        // copied from that same turbulence slot. Every equation now reads its own entry, as OF does.
+        lctl.turbulent = f.turbulent;
         const std::string secondName = (f.rasModel == "kOmegaSST") ? "omega" : "epsilon";
-        readLinearSolverControls(fvSolution, secondName, lctl, "SIMPLE");
-        in.tolU    = lctl.tolU;    in.relTolU  = lctl.relTolU;
-        in.tolP    = lctl.tolP;    in.relTolP  = lctl.relTolP;
-        in.tolHe   = lctl.tolKE;   in.relTolHe = lctl.relTolKE;
-        in.tolTurb = lctl.tolKE;   in.relTolTurb = lctl.relTolKE;
-        in.maxIter = lctl.maxIterP;
-        std::printf("  linear solver (from fvSolution): p tol %.1e relTol %.3g maxIter %d | "
-                    "U tol %.1e | %s tol %.1e\n",
-                    (double)in.tolP, (double)in.relTolP, in.maxIter,
-                    (double)in.tolU, f.heName.c_str(), (double)in.tolHe);
+        readLinearSolverControls(fvSolution, secondName, lctl, "SIMPLE", f.heName);
+        in.tolU    = lctl.tolU;    in.relTolU    = lctl.relTolU;    in.maxIterU    = lctl.maxIterU;    in.minIterU    = lctl.minIterU;
+        in.tolP    = lctl.tolP;    in.relTolP    = lctl.relTolP;    in.maxIterP    = lctl.maxIterP;    in.minIterP    = lctl.minIterP;
+        in.tolHe   = lctl.tolHe;   in.relTolHe   = lctl.relTolHe;   in.maxIterHe   = lctl.maxIterHe;   in.minIterHe   = lctl.minIterHe;
+        in.tolTurb = lctl.tolKE;   in.relTolTurb = lctl.relTolKE;   in.maxIterTurb = lctl.maxIterKE;   in.minIterTurb = lctl.minIterKE;
+        printLinearSolverControls(in, f.heName, secondName, f.turbulent);
     }
 
     // SIMPLE residualControl. OF's rule -- an empty dict never converges, and `achieved && checked` --

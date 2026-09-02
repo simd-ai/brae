@@ -334,9 +334,9 @@ Residuals rhoSimpleStep(
             const scalar nf = deviceNormFactor(A, *U[k], b, w.ones);
             DeviceSolverPerf perf;
             if (in.uSymGaussSeidel)
-                deviceSymGaussSeidel(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIter, &perf);
+                deviceSymGaussSeidel(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIterU, &perf, in.minIterU);
             else
-                perf = deviceJacobiBiCGStab(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIter);
+                perf = deviceJacobiBiCGStab(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIterU, /*checkEvery=*/1, in.minIterU);
             // U is reported under the FIRST component's initial residual, NOT a cmptMax over three.
             // OF's cmptMax runs over a performance object whose skipped components were never solved
             // (fvMatrixSolve.C:157-164 continues on validComponents == -1) while this path solves all
@@ -406,7 +406,7 @@ Residuals rhoSimpleStep(
         const DeviceLduView A = foldedView(dm, E, diagC);
         const scalar nf = deviceNormFactor(A, f.he, b, w.ones);
         const DeviceSolverPerf perf =
-            deviceJacobiBiCGStab(A, b, f.he, nf, in.tolHe, in.relTolHe, in.maxIter);
+            deviceJacobiBiCGStab(A, b, f.he, nf, in.tolHe, in.relTolHe, in.maxIterHe, /*checkEvery=*/1, in.minIterHe);
         res[in.isE ? "e" : "h"] = perf.initialResidual;
 
         // fvOptions.correct(he), EEqn.H:27 -- AFTER the solve and BEFORE thermo.correct(), which is what
@@ -480,7 +480,7 @@ Residuals rhoSimpleStep(
             // fvm::div(phid, p) makes lower = -w*phi and upper = lower + phi, so upper != lower at every
             // face with flow through it. A symmetric solver on that matrix is not slow, it is wrong: CG
             // burned the full 3000-iteration cap and the case stalled before printing iteration 1.
-            perf = deviceJacobiBiCGStab(A, b, f.p, nf, in.tolP, in.relTolP, in.maxIter, in.pcgCheckEvery);
+            perf = deviceJacobiBiCGStab(A, b, f.p, nf, in.tolP, in.relTolP, in.maxIterP, in.pcgCheckEvery, in.minIterP);
         }
         else
         {
@@ -508,8 +508,8 @@ Residuals rhoSimpleStep(
                 w.amgBuilt = true;
             }
             amgGalerkin(w.amg, diagC, P.upper, P.lower);
-            perf = deviceAMGPCG(A, w.amg, b, f.p, nf, in.tolP, in.relTolP, in.maxIter,
-                                in.captureVcycle, in.pcgCheckEvery);
+            perf = deviceAMGPCG(A, w.amg, b, f.p, nf, in.tolP, in.relTolP, in.maxIterP,
+                                in.captureVcycle, in.pcgCheckEvery, /*corrScaling=*/false, in.minIterP);
         }
         // solutionControl.C:230-233 takes sp.first() -- the FIRST solve of the iteration, not the last.
         if (corr == 1) res["p"] = perf.initialResidual;

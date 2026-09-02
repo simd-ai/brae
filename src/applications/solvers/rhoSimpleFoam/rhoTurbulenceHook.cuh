@@ -67,6 +67,7 @@ struct TurbulenceHookOptions
     scalar         relaxK = 1.0, relaxEps = 1.0;
     scalar         tol = 1e-12, relTol = 0.0;
     int            maxIter = 2000;
+    int            minIter = 0;
     // fvOptions.constrain(kEqn)/(epsEqn) -- kEpsilon.C calls it on both. A scalarFixedValueConstraint
     // naming k or epsilon pins those cells with fvMatrix::setValues, which is NOT the same as writing
     // the field afterwards: setValues also removes the coupling from the neighbours' equations.

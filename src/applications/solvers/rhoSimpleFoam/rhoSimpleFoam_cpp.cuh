@@ -127,7 +127,10 @@ struct StepInput
     scalar tolU = 1e-12, relTolU = 0.0;
     scalar tolHe = 1e-12, relTolHe = 0.0;
     scalar tolP = 1e-12, relTolP = 0.0;
-    int    maxIter = 2000;
+    // Per equation, as OF reads them (lduMatrixSolver.C:204-205): a cap decides where a solve stops,
+    // and one cap for four equations meant p's cap on every one of them.
+    int    maxIterU = 2000, maxIterP = 2000, maxIterHe = 2000, maxIterTurb = 2000;
+    int    minIterU = 0,    minIterP = 0,    minIterHe = 0,    minIterTurb = 0;
 
     // --- turbulence ---
     // kEpsilon, the compressible instantiation. Anything else is refused in createFields by name. The

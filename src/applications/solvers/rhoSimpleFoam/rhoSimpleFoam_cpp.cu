@@ -290,7 +290,7 @@ Residuals rhoSimpleStep(
         // A(), H() and H1(), and addPressureGradient would otherwise leave the source carrying -grad(p).
         FvVectorMatrix Mp = UEqn;
         addPressureGradient(Mp, f.p, m, g, patches);
-        const SolverPerformance up = solveVector(Mp, f.U, m, patches, in.tolU, in.relTolU, in.maxIter);
+        const SolverPerformance up = solveVector(Mp, f.U, m, patches, in.tolU, in.relTolU, in.maxIterU, in.minIterU);
         res["U"] = up.initialResidual;
     }
     f.U.evaluateBoundary();
@@ -333,7 +333,7 @@ Residuals rhoSimpleStep(
                 });
         }
         const SolverPerformance ep =
-            pbicgstab(E, f.he.internal, m, patches, in.tolHe, in.relTolHe, in.maxIter);
+            pbicgstab(E, f.he.internal, m, patches, in.tolHe, in.relTolHe, in.maxIterHe, in.minIterHe);
         res[f.heName] = ep.initialResidual;
         f.he.evaluateBoundary();
     }
@@ -408,7 +408,7 @@ Residuals rhoSimpleStep(
             if (corr > 0) f.p.evaluateBoundary();
             P = assemblePcEqn(st, f.p, pin, m, g, patches);
             const SolverPerformance pp =
-                pbicgstab(P, f.p.internal, m, patches, in.tolP, in.relTolP, in.maxIter);
+                pbicgstab(P, f.p.internal, m, patches, in.tolP, in.relTolP, in.maxIterP, in.minIterP);
             if (corr == 0) res["p"] = pp.initialResidual;
         }
         rAUorAtU     = st.rAtU;
@@ -425,7 +425,7 @@ Residuals rhoSimpleStep(
             if (corr > 0) f.p.evaluateBoundary();
             P = assemblePEqn(st, f.p, pin, m, g, patches);
             const SolverPerformance pp =
-                pbicgstab(P, f.p.internal, m, patches, in.tolP, in.relTolP, in.maxIter);
+                pbicgstab(P, f.p.internal, m, patches, in.tolP, in.relTolP, in.maxIterP, in.minIterP);
             if (corr == 0) res["p"] = pp.initialResidual;
         }
         rAUorAtU     = st.rAU;
@@ -645,10 +645,11 @@ Residuals rhoSimpleStep(
             const std::vector<scalar> y = cellWallDist(m, g, patches);
             kOmegaSST::SSTResiduals sres;
             kOmegaSST::correct(f.U, f.k, f.omega, f.nut, f.phi, y, /*nu=*/0.0, m, g, patches,
-                               in.relaxOmega, in.relaxK, in.tolTurb, in.relTolTurb, in.maxIter,
+                               in.relaxOmega, in.relaxK, in.tolTurb, in.relTolTurb, in.maxIterTurb,
                                sco, &sres, in.boundedTurb,
                                in.limitedLinearTurb, in.turbLimiterCoeff, in.linearUpwindTurb,
-                               in.correctedLaplacian, in.snGradLimitCoeff, /*lm=*/nullptr, &sc);
+                               in.correctedLaplacian, in.snGradLimitCoeff, /*lm=*/nullptr, &sc,
+                               in.minIterTurb);
             res["omega"] = sres.omega;
             res["k"]     = sres.k;
             f.alphat.evaluateBoundary();
@@ -709,10 +710,10 @@ Residuals rhoSimpleStep(
 
         kEpsilonRef::KEResiduals kres;
         kEpsilonRef::correct(f.U, f.k, f.epsilon, f.nut, f.phi, /*nu=*/0.0, m, g, patches,
-                             in.relaxEpsilon, in.relaxK, in.tolTurb, in.relTolTurb, in.maxIter,
+                             in.relaxEpsilon, in.relaxK, in.tolTurb, in.relTolTurb, in.maxIterTurb,
                              keco, &kres, in.boundedTurb, /*dropTerm=*/0, &comp, in.fvOpts,
                              in.relaxEquationEps, in.relaxEquationK, /*constrainBeforeWall=*/true,
-                             in.limitedLinearTurb, in.turbLimiterCoeff);
+                             in.limitedLinearTurb, in.turbLimiterCoeff, in.minIterTurb);
         res["epsilon"] = kres.epsilon;
         res["k"]       = kres.k;
         f.alphat.evaluateBoundary();
