@@ -1728,6 +1728,13 @@ add_test(NAME rho_validate_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_validate_vs_openfoam.sh)
 set_tests_properties(rho_validate_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
+# The case's gradient limiters and laplacian limiter reach the mirror: grad(e|Ekp) cellLimited on both
+# arms, `limited <psi>` on the device (refused by name on the host), `limited 0` refused on both --
+# tests/rho_limiters_vs_openfoam.sh.
+add_test(NAME rho_limiters_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_limiters_vs_openfoam.sh)
+set_tests_properties(rho_limiters_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
 add_test(NAME tpm_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/tpm_vs_openfoam.sh)
 set_tests_properties(tpm_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)

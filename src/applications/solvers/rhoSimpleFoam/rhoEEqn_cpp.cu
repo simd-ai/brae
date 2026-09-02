@@ -104,10 +104,11 @@ std::vector<scalar> explicitConvectionDivExtensive(
     // validated helper computes it.
     if (scheme == DivScheme::linearUpwind)
     {
-        GeometricField<scalar> shim;
-        shim.internal = vf;
         std::vector<vector> gradVf = fvc::gaussGrad(vf, vfBnd, m, g, patches);
-        cellLimitGrad(gradVf, shim, gradLimitK, m, g, patches);
+        // The VALUES overload: this term's field lives in two vectors, and the boundary-less shim that
+        // used to go here dereferenced a null patch inside the limiter the first time a case named
+        // `grad(Ekp) cellLimited` -- hidden for as long as the coefficient was never forwarded.
+        cellLimitGrad(gradVf, vf, vfBnd, gradLimitK, m, g, patches);
         const std::vector<scalar> corr =
             fvm::linearUpwindCorrection<scalar, vector>(phi, gradVf, m, g);
         for (label c = 0; c < nC; ++c) d[c] += corr[c];

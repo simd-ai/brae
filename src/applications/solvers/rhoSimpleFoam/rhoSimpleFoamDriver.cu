@@ -223,6 +223,12 @@ RhoStepInput buildDeviceStepInput(
     in.schemeCoeffU = hin.schemeCoeffU;
     in.correctedLaplacian = hin.correctedLaplacian;
     in.snGradLimitCoeff   = hin.snGradLimitCoeff;
+    // The energy gradient limiters too: the device energy equation has honoured both since it was
+    // written (deviceCellLimitGrad on he and on K|Ekp), and this driver never handed them over -- on
+    // rhoKE2 with `grad(e|Ekp) cellLimited Gauss linear 1` the CUDA arm read T 2.35e-02 from OpenFOAM,
+    // the whole limited-vs-unlimited gap, while the host arm read 1.5e-12.
+    in.gradHeLimitK       = hin.gradHeLimitK;
+    in.gradKELimitK       = hin.gradKELimitK;
     in.gradULimitK        = hin.gradULimitK;
 
     in.tolU = hin.tolU;  in.relTolU = hin.relTolU;

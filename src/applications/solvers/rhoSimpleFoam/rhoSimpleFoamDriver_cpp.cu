@@ -87,16 +87,49 @@ StepInput buildStepInput(
 
         DeviceSimpleControls sctl;
         parseFvSchemesControls(caseDir, sctl);
+        // laplacianSchemes: `corrected` and `limited 1` are the uncapped non-orthogonal correction;
+        // `limited <psi>` with 0 < psi < 1 caps it per face (fv::limitedSnGrad, limiter =
+        // min(psi*|snGrad|/((1 - psi)*|corr| + SMALL), 1)); `limited 0` is NO correction at all -- the
+        // limiter is identically 0 -- which the incompressible V2 driver once mapped onto the full
+        // correction. The parser reports both as nonOrth with the coefficient in nonOrthLimit (1.0
+        // for `corrected`), so the three regimes are separated here. Until this landed the mirror
+        // forwarded nonOrth alone: `limited 0.5` ran the uncapped correction under the limited name.
+        // `limited 0` is a THIRD regime and not `orthogonal`: limitedSnGrad derives from correctedSnGrad,
+        // so its implicit coefficients stay nonOrthDeltaCoeffs while the explicit correction is zeroed.
+        // Measured, OpenFOAM's own answers on rhoBoxSym (4 degrees) at 20 iterations: `limited 0` is
+        // U 1.3e-04 from `orthogonal` and 1.9e-03 from `corrected`. brae's laplacian takes one flag for
+        // both halves and a limiter coefficient whose 0 means UNCAPPED, so this regime is not
+        // representable; refused by name rather than mapped onto either neighbour.
+        if (sctl.nonOrth && sctl.nonOrthLimit <= 0.0)
+            throw std::runtime_error(
+                "rhoSimpleFoam buildStepInput: laplacianSchemes asks for `limited 0`, which OpenFOAM's "
+                "limitedSnGrad makes nonOrthDeltaCoeffs WITHOUT the explicit correction -- neither "
+                "`orthogonal` nor `corrected` (U 1.3e-04 and 1.9e-03 from them on rhoBoxSym). The mirror "
+                "represents only those two and the capped `limited <psi>`; refusing rather than running "
+                "one of them under the case's name.");
         in.correctedLaplacian = sctl.nonOrth;
+        in.snGradLimitCoeff   = (sctl.nonOrth && sctl.nonOrthLimit < 1.0) ? sctl.nonOrthLimit : 0.0;
         in.gradULimitK        = sctl.gradULimitK;
         in.gradKLimitK        = sctl.gradKLimitK;
+        // The ENERGY gradient limiters, which the parser has carried all along and this never forwarded:
+        // gradHeLimitK is the cellLimited coefficient of the gradient the energy's linearUpwind NAMES
+        // (OF's linearUpwind takes mesh.gradScheme(gradSchemeName_), e.g. aerofoilNACA0012's
+        // `linearUpwind limited` -> `limited cellLimited Gauss linear 1`), else the grad(h|e) entry's;
+        // gradKinLimitK the same for div(phi,K|Ekp), falling back to the energy's. Without them the
+        // deferred correction ran an UNLIMITED gradient under a case that limits it -- on NACA that is
+        // a first-iteration T of [233.71, 301.64] against OpenFOAM's [297.95, 298.01].
+        in.gradHeLimitK       = sctl.gradHeLimitK;
+        in.gradKELimitK       = sctl.gradKinLimitK;
         if (verbose)
             std::printf("  schemes: div(phi,U) lu=%d bounded=%d | div(phi,%s) lu=%d bounded=%d | "
-                        "div(phi,%s) lu=%d bounded=%d | grad(U) cellLimited k=%g | laplacian corrected=%d\n",
+                        "div(phi,%s) lu=%d bounded=%d | grad(U) cellLimited k=%g | grad(%s) k=%g | grad(%s) k=%g"
+                        " | laplacian corrected=%d limited=%g\n",
                         (int)dU.linearUpwind, (int)dU.bounded,
                         f.heName.c_str(), (int)dHe.linearUpwind, (int)dHe.bounded,
                         keName.c_str(), (int)dKE.linearUpwind, (int)dKE.bounded,
-                        (double)in.gradULimitK, (int)in.correctedLaplacian);
+                        (double)in.gradULimitK, f.heName.c_str(), (double)in.gradHeLimitK,
+                        keName.c_str(), (double)in.gradKELimitK,
+                        (int)in.correctedLaplacian, (double)in.snGradLimitCoeff);
     }
 
     in.relaxU             = re  ? re->scalarOr("U", 1.0) : 1.0;
