@@ -1704,6 +1704,12 @@ add_test(NAME sym_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/sym_vs_openfoam.sh)
 set_tests_properties(sym_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
 
+# rho.relax() on the SIMPLEC branch relaxes against the iteration's starting density (rho.prevIter()),
+# both mirror arms vs real OpenFOAM mid-transient -- tests/rho_simplec_rhorelax_vs_openfoam.sh.
+add_test(NAME rho_simplec_rhorelax_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_simplec_rhorelax_vs_openfoam.sh)
+set_tests_properties(rho_simplec_rhorelax_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
 add_test(NAME tpm_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/tpm_vs_openfoam.sh)
 set_tests_properties(tpm_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)

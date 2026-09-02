@@ -245,6 +245,19 @@ Residuals rhoSimpleStep(
     Residuals res;
     const int nC = dm.nCells;
 
+    // rho.prevIter(), stored where OpenFOAM stores it. simpleControl::loop() calls storePrevIterFields()
+    // at the START of the iteration (simpleControl.C:157) and rho.relax() at the tail is
+    // prevIter + alpha*(rho - prevIter) (GeometricField.C:1089-1095); pcEqn.H:1's `rho = thermo.rho()`
+    // does not touch prevIter. This capture used to sit at the tail, one line before the tail's own
+    // updateRho -- exact on the pEqn branch, where rho does not move in between, and wrong on the
+    // SIMPLEC branch, whose pcEqn.H opens with rho = thermo.rho(): the relaxation then blended towards
+    // that mid-iteration density instead of the one the iteration started with. No fixture could see it
+    // (every consistent+subsonic one relaxes rho at 1.0); the gate is rhoBox with `consistent yes` and
+    // `rho 0.5`, both arms against OpenFOAM at a matched iteration count.
+    DeviceBuffer<scalar> rhoPrevIter, rhoBndPrevIter;
+    deviceCopy(rhoPrevIter, f.rho);
+    deviceCopy(rhoBndPrevIter, f.rhoBnd);
+
     if (!in.muEffCell || !in.muEffBndFace || !in.alphaEffCell || !in.alphaEffBndFace)
     {
         throw std::runtime_error(
@@ -601,14 +614,12 @@ Residuals rhoSimpleStep(
     // and it matters directly, because flowRateInletVelocity holds the prescribed mass flow against
     // rho's PATCH values, so an unrelaxed boundary sets a different inlet velocity every iteration.
     {
-        DeviceBuffer<scalar> rhoPrev, rhoBndPrev;
-        deviceCopy(rhoPrev, f.rho);
-        deviceCopy(rhoBndPrev, f.rhoBnd);
+        // Against rhoPrevIter, captured at the top of the step -- see the note there.
         in.updateRho();
         if (!in.transonic)
         {
-            relaxField(f.rho, rhoPrev, in.relaxRho);
-            relaxField(f.rhoBnd, rhoBndPrev, in.relaxRho);
+            relaxField(f.rho, rhoPrevIter, in.relaxRho);
+            relaxField(f.rhoBnd, rhoBndPrevIter, in.relaxRho);
         }
     }
 

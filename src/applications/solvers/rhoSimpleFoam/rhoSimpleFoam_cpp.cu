@@ -177,6 +177,19 @@ Residuals rhoSimpleStep(
     Residuals res;
     const label nC = m.nCells();
 
+    // rho.prevIter(), stored where OpenFOAM stores it. simpleControl::loop() calls storePrevIterFields()
+    // at the START of the iteration (simpleControl.C:157) and rho.relax() at the tail is
+    // prevIter + alpha*(rho - prevIter) (GeometricField.C:1089-1095); pcEqn.H:1's `rho = thermo.rho()`
+    // does not touch prevIter. This capture used to sit at the tail, one line before the tail's own
+    // updateRho -- exact on the pEqn branch, where rho does not move in between, and wrong on the
+    // SIMPLEC branch, whose pcEqn.H opens with rho = thermo.rho(): the relaxation then blended towards
+    // that mid-iteration density instead of the one the iteration started with. No fixture could see it
+    // (every consistent+subsonic one relaxes rho at 1.0); the gate is rhoBox with `consistent yes` and
+    // `rho 0.5`, both arms against OpenFOAM at a matched iteration count.
+    const std::vector<scalar> rhoPrevIter = f.rho.internal;
+    std::vector<std::vector<scalar>> rhoBndPrevIter(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi) rhoBndPrevIter[pi] = f.rho.boundary[pi]->value();
+
     // updateCoeffs() for the flux-conditional boundary conditions. OpenFOAM's inletOutlet reads phi from
     // the object registry inside updateCoeffs, which the matrix assembly calls before asking for any
     // coefficient; brae has no registry, so the flux is pushed in here instead -- once per iteration,
@@ -541,19 +554,17 @@ Residuals rhoSimpleStep(
     // It matters directly: flowRateInletVelocity holds the prescribed mass flow against rho's PATCH
     // values, so an unrelaxed boundary sets a different inlet velocity every iteration.
     {
-        const std::vector<scalar> rhoOld = f.rho.internal;
-        std::vector<std::vector<scalar>> rhoBndOld(patches.size());
-        for (std::size_t pi = 0; pi < patches.size(); ++pi) rhoBndOld[pi] = f.rho.boundary[pi]->value();
+        // Against rhoPrevIter, captured at the top of the step -- see the note there.
         updateRho(f, patches);
         if (!in.transonic)
         {
-            relaxField(f.rho.internal, rhoOld, in.relaxRho);
+            relaxField(f.rho.internal, rhoPrevIter, in.relaxRho);
             for (std::size_t pi = 0; pi < patches.size(); ++pi)
             {
                 std::vector<scalar> rb = f.rho.boundary[pi]->value();
-                for (std::size_t i = 0; i < rb.size() && i < rhoBndOld[pi].size(); ++i)
+                for (std::size_t i = 0; i < rb.size() && i < rhoBndPrevIter[pi].size(); ++i)
                 {
-                    rb[i] = rhoBndOld[pi][i] + in.relaxRho * (rb[i] - rhoBndOld[pi][i]);
+                    rb[i] = rhoBndPrevIter[pi][i] + in.relaxRho * (rb[i] - rhoBndPrevIter[pi][i]);
                 }
                 f.rho.boundary[pi]->setStoredValues(std::move(rb));
             }
