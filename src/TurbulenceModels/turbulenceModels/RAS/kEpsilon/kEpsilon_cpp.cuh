@@ -141,6 +141,22 @@ struct Compressible
     scalar                                  Prt      = 1.0;
 };
 
+// correctNut, boundary and EddyDiffusivity included: nut = Cmu*k^2/epsilon on cells and, as a FIELD
+// assignment writes it, on every patch from the patch k/epsilon; nut wall functions overwrite theirs;
+// alphat = rho*nut/Prt when comp carries one. Called at the end of correct() and, on its own, for
+// turbulence->validate() at construction -- which used to compute the interior only, so the first
+// momentum solve ran on the case file's wall nut (uniform 0 in every tutorial) where OpenFOAM's
+// nut.correctBoundaryConditions() had already evaluated nutkWallFunction from the initial k.
+void correctNutField(
+    const GeometricField<scalar>&           k,
+    const GeometricField<scalar>&           epsilon,
+    GeometricField<scalar>&                 nutField,
+    const std::vector<std::vector<scalar>>& yWall,
+    scalar                                  nu,
+    const std::vector<FvPatch>&             patches,
+    const KEpsilonCoeffs&                   co,
+    const Compressible*                     comp);
+
 // One kEpsilon::correct(). Updates k, epsilon and nut in place.
 void correct(
     const GeometricField<vector>& U,

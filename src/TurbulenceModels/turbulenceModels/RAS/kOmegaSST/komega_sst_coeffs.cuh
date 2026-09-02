@@ -26,7 +26,14 @@ struct KOmegaSSTCoeffs
     scalar betaStar = 0.09;                            // k destruction / Cmu             (:335)
     scalar a1 = 0.31, b1 = 1.0, c1 = 10.0;             // nut limiter (a1,b1) + Pk cap c1 (:344,353,362)
     bool   F3 = false;                                 // F3 near-wall correction switch  (:371)
-    scalar kappa = 0.41, E = 9.8;                      // wall-function coeffs (Cmu_wf == betaStar)
+    scalar kappa = 0.41, E = 9.8;                      // wall-function coeffs (kappa, E)
+    // THE WALL FUNCTIONS' OWN Cmu. OpenFOAM's nutkWallFunction, epsilonWallFunction and
+    // omegaWallFunction all read wallCoeffs_.Cmu() -- the nut wall function patch's coefficient, default
+    // 0.09 -- and never the model's (nutkWallFunctionFvPatchScalarField.C:43, epsilonWallFunction...C:192,
+    // omegaWallFunction...C:191). brae handed them the MODEL's betaStar, which is the same number at the
+    // defaults and a different one the moment a case changes it: rhoSST with betaStar 0.1 parted from
+    // OpenFOAM at iteration 1 by omega 2.5e-02, all of it in the wall rows.
+    scalar CmuWall = 0.09;
     scalar CDES1 = 0.78, CDES2 = 0.61;                 // kOmegaSST-DES/DDES C_DES blend (OF kOmegaSSTDES defaults)
     // kOmegaSST-IDDES (Gritskevich/Garbaruk/Schuetze/Menter 2012) blending constants. Exponents fixed per the reference
     // (f_dt cube, f_l ^10, f_t cube); only the multipliers are carried here (shared values with SA-IDDES).

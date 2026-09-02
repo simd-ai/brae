@@ -205,8 +205,8 @@ void correct(
     int    minIter)
 {
     const label nC = m.nCells();
-    const scalar Cmu25 = std::pow(co.Cmu, 0.25);
-    const scalar Cmu75 = std::pow(co.Cmu, 0.75);
+    const scalar Cmu25 = std::pow(co.CmuWall, 0.25);   // the WALL FUNCTIONS' Cmu, not the model's
+    const scalar Cmu75 = std::pow(co.CmuWall, 0.75);
     std::vector<scalar>& nutF = nutField.internal;
 
     const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
@@ -272,7 +272,7 @@ void correct(
         std::vector<scalar> nuFace(wp.size);
         for (label i = 0; i < wp.size; ++i) nuFace[i] = nuAtFace(i);
         const std::vector<scalar> nutw =
-            nutkWallFunction(wp, yw, k.internal, nuFace, co.Cmu, co.kappa, co.E);
+            nutkWallFunction(wp, yw, k.internal, nuFace, co.CmuWall, co.kappa, co.E);
         const std::vector<vector>& Uw = U.boundary[pi]->value();
 
         for (label i = 0; i < wp.size; ++i)
@@ -592,7 +592,24 @@ void correct(
         bound(k, 1e-15, m, g, patches);   // Foam::bound(k_, kMin_)
     }
 
-    // correctNut.
+    // correctNut, boundary and EddyDiffusivity included -- ONE implementation, shared with
+    // turbulence->validate() at construction (see correctNutField).
+    correctNutField(k, epsilon, nutField, yWall, nu, patches, co, comp);
+}
+
+void correctNutField(
+    const GeometricField<scalar>&           k,
+    const GeometricField<scalar>&           epsilon,
+    GeometricField<scalar>&                 nutField,
+    const std::vector<std::vector<scalar>>& yWall,
+    scalar                                  nu,
+    const std::vector<FvPatch>&             patches,
+    const KEpsilonCoeffs&                   co,
+    const Compressible*                     comp)
+{
+    const label nC = static_cast<label>(k.internal.size());
+    std::vector<scalar>& nutF = nutField.internal;
+    auto rhoAt = [&](label c) { return (comp && comp->rho) ? (*comp->rho)[c] : scalar(1); };
     //
     // OpenFOAM writes this as `nut_ = Cmu*sqr(k_)/epsilon_`, and that is a GeometricField assignment: it
     // sets the BOUNDARY field as well, from k and epsilon's own boundary values. A patch whose nut is
@@ -618,11 +635,11 @@ void correct(
                     // whole solve went non-finite inside the first iteration.
                     if (!(comp && comp->nuBnd))
                         return nutkWallFunction(patches[pi], yWall[pi], k.internal, nu,
-                                                co.Cmu, co.kappa, co.E);
+                                                co.CmuWall, co.kappa, co.E);
                     std::vector<scalar> nf(patches[pi].size);
                     for (label i = 0; i < patches[pi].size; ++i) nf[i] = (*comp->nuBnd)[pi][i];
                     return nutkWallFunction(patches[pi], yWall[pi], k.internal, nf,
-                                            co.Cmu, co.kappa, co.E);
+                                            co.CmuWall, co.kappa, co.E);
                 }());
             continue;
         }

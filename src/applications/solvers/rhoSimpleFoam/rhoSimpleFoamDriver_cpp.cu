@@ -112,6 +112,8 @@ StepInput buildStepInput(
     in.relaxEquationU   = (re != nullptr) && re->found("U");
     in.relaxEquationHe  = (re != nullptr) && re->found(f.heName);
     in.relaxEquationK   = (re != nullptr) && re->found("k");
+    in.relaxOmega          = re  ? re->scalarOr("omega", 1.0) : 1.0;
+    in.relaxEquationOmega  = (re != nullptr) && re->found("omega");   // kOmegaSST's second scalar
     in.relaxEquationEps = (re != nullptr) && re->found("epsilon");
 
     // div(phi,k) and div(phi,epsilon|omega) FROM THE CASE. This was a hardcode, so neither the bounded

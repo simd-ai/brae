@@ -699,7 +699,9 @@ void correctNut(
         deviceBCValue(dbK, k, kB);
         deviceBCValue(dbEps, epsilon, eB);
         nutBnd.resize(nB);
-        const scalar Cmu25  = std::pow(in.co.Cmu, scalar(0.25));
+        // The WALL FUNCTION's Cmu (nutkWallFunction's y+), not the model's -- the model's Cmu below is for
+        // the calculated patches' Cmu*k^2/epsilon, which IS the model's. See KEpsilonCoeffs::CmuWall.
+        const scalar Cmu25  = std::pow(in.co.CmuWall, scalar(0.25));
         const scalar yplLam = brae::yPlusLam(in.co.kappa, in.co.E);
         nutBoundaryKernel<<<nBlk(nB), TPB>>>(nB, in.wfBndMask->data(), dm.bndCell.data(),
                                              in.wallYBndFace ? in.wallYBndFace->data() : nullptr,

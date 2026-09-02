@@ -136,12 +136,13 @@ struct StepInput
     // kEpsilon, the compressible instantiation. Anything else is refused in createFields by name. The
     // model runs LAST in the iteration, so the momentum equation of iteration n uses the closure from
     // n-1 -- OpenFOAM's lagged coupling, and correcting before UEqn is a different algorithm.
-    KEpsilonCoeffs keCoeffs{};
     // kOmegaSST's, for a case whose RASModel names it. Its scheme flags are separate because kOmegaSST
     // takes them as arguments rather than in its coefficients, and the SST tutorials ask for
     // `bounded Gauss limitedLinear 1` on both scalars where the kEpsilon ones ask for plain upwind.
-    KOmegaSSTCoeffs sstCoeffs{};
     scalar relaxOmega        = 1.0;
+    // Whether fvSolution NAMES a factor for omega -- fvMatrix::relax() relaxes only then (fvMatrix.C:1250-
+    // 1263); relaxMatrix at 1.0 still applies the dominance clamp, which is a different matrix.
+    bool   relaxEquationOmega = true;
     scalar gradKLimitK       = 0.0;   // gradSchemes/grad(k) and grad(omega), for CDkOmega and F1
     // ONE scheme for div(phi,k) and div(phi,epsilon|omega), whichever model the case names -- the
     // harness refuses a case whose two entries disagree. The coefficient is the RAW k of
@@ -160,7 +161,6 @@ struct StepInput
     // (kEpsilon.cu, hasNonUpwindDivScheme) and both used to be set only by fail-proofs -- the flag was
     // hardcoded in the harness and the case's own fvSchemes never reached either arm.
     std::string turbDivUnsupported;
-    scalar Prt = 1.0;                   // EddyDiffusivity: alphat = rho*nut/Prt
 
     // --- refusals ---
     bool hasMRF              = false;

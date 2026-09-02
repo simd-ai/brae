@@ -1,7 +1,11 @@
 // _cpp REFERENCE implementation -- see createFields_cpp.cuh for the OpenFOAM provenance.
 #include "rhoCreateFields_cpp.cuh"
 #include "frozen_bc_guard.cuh"
-#include "kEpsilon_cpp.cuh"   // correctNut: turbulence->validate() before the first solve
+#include "kEpsilon_cpp.cuh"    // correctNutField: turbulence->validate() before the first solve
+#include "kOmegaSST_cpp.cuh"   // likewise, for the other closure
+#include "transport_model.cuh" // transportMu: the construction-time nu = mu(T)/rho
+#include "near_wall_dist.cuh"  // nearWallDist: the wall functions' y
+#include "cell_wall_dist.cuh"  // cellWallDist: kOmegaSST's F2
 #include "patch_entry_lookup.cuh"   // findPatchEntry: OF patch/group/regex resolution
 #include "foam_field_reader.cuh"
 #include "thermo_parse.cuh"
@@ -574,7 +578,12 @@ RhoSimpleFields createFields(
             // `validate()` guard on purpose: that guard also requires k and epsilon to be sized, and a
             // case that failed it would have carried the model defaults into the loop silently.
             f.keCoeffs = keCase;
+            readKOmegaSSTCoeffs(ras, f.sstCoeffs);   // OpenFOAM's defaults where the dict is absent
             f.Prt      = f.thermo.Prt;
+            if (ras && ras->wordOr("RASModel", "") == "kOmegaSST")
+                std::printf("  kOmegaSSTCoeffs (case): betaStar=%.4g a1=%.4g gamma1=%.4g beta1=%.4g Prt=%.4g\n",
+                            (double)f.sstCoeffs.betaStar, (double)f.sstCoeffs.a1, (double)f.sstCoeffs.gamma1,
+                            (double)f.sstCoeffs.beta1, (double)f.Prt);
             if (f.turbulent)
             {
                 if (f.rasModel != "kEpsilon" && f.rasModel != "kOmegaSST")
@@ -714,60 +723,63 @@ RhoSimpleFields createFields(
     // while brae's turbulent U was 1.5868e-01 from OpenFOAM's: the same number, because brae's
     // turbulent first iteration WAS the laminar answer. The transient that starts there had not decayed
     // by 8000 iterations.
-    if (f.turbulent && f.rasModel == "kEpsilon"
-        && static_cast<label>(f.k.internal.size()) == nC
-        && static_cast<label>(f.epsilon.internal.size()) == nC)
+    //
+    // BOTH MODELS, AND THE BOUNDARY HALF. This ran for kEpsilon only and computed the interior only:
+    // kOmegaSST entered its first momentum solve on the case file's nut and alphat (validate() skipped),
+    // and on either model the wall nut stayed at the file's `uniform 0` where OpenFOAM's
+    // nut.correctBoundaryConditions() had already evaluated nutkWallFunction from the initial k -- so
+    // the first momentum matrix carried mu at the wall instead of mu + rho*nut_w. Measured (host mirror
+    // vs OpenFOAM at iteration 1, linear solvers pinned): rhoKE U 2.1e-03 / nut 4.8e-04; rhoSST nut
+    // 1.6e-01 / omega 1.2e-01 / U 1.7e-03. Invisible at convergence, which is where every end-to-end
+    // gate compared. The closures' own correctNutField does the whole of it, so construction and the
+    // loop cannot drift apart again.
+    const bool secondSized = (f.rasModel == "kOmegaSST")
+        ? static_cast<label>(f.omega.internal.size()) == nC
+        : static_cast<label>(f.epsilon.internal.size()) == nC;
+    if (f.turbulent && static_cast<label>(f.k.internal.size()) == nC && secondSized)
     {
-        // THE CASE'S OWN COEFFICIENTS, not the model defaults. This block used to default-construct
-        // KEpsilonCoeffs and then write `const scalar Prt = 1.0;`, so a case declaring
-        // `kEpsilonCoeffs { Cmu 0.1; Prt 0.85; }` had both silently replaced by 0.09 and 1.0 -- while
-        // the Prt it asked for was already sitting in f.thermo.Prt, parsed at readThermoCoeffs above
-        // from exactly the dict OpenFOAM reads it from (EddyDiffusivity::correctNut ->
-        // Prt_.readIfPresent(this->coeffDict())).
-        //
-        // It reaches the answer through turbulence->validate(): OpenFOAM's correctNut() at construction
-        // uses the MODEL's coefficients, and the nut and alphat it writes are what the first momentum
-        // and energy solves run on. Wrong here means iteration 1 is wrong on a case that names either.
-        // No compressible fixture declares them, so this was invisible -- which is why it survived.
-        f.nut.internal = cpu::kEpsilonRef::correctNut(f.k.internal, f.epsilon.internal, keCase);
-        // EddyDiffusivity::correctNut runs straight after for the compressible instantiation:
-        // alphat = rho*nut/Prt. The energy equation reads it through alphaEff on the very first pass.
-        if (static_cast<label>(f.alphat.internal.size()) == nC)
+        // The compressible instantiation's inputs, exactly as the step builds them: nu is the LAMINAR
+        // mu(T)/rho, per cell and per boundary face.
+        std::vector<scalar> nuLam(nC);
+        for (label c = 0; c < nC; ++c)
+            nuLam[c] = transportMu(f.T.internal[c], f.thermo) / f.rho.internal[c];
+        std::vector<std::vector<scalar>> nuLamBnd(patches.size()), rhoBnd(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
-            const scalar Prt = f.thermo.Prt;
-            for (label c = 0; c < nC; ++c) f.alphat.internal[c] = f.rho.internal[c] * f.nut.internal[c] / Prt;
+            const std::vector<scalar>& tb = f.T.boundary[pi]->value();
+            const std::vector<scalar>& rb = f.rho.boundary[pi]->value();
+            rhoBnd[pi] = rb;
+            nuLamBnd[pi].resize(patches[pi].size);
+            for (label i = 0; i < patches[pi].size; ++i)
+                nuLamBnd[pi][i] = transportMu(tb[i], f.thermo) / rb[i];
         }
-
-        // The BOUNDARY half of validate(), on the frozen path only, where nothing later provides it:
-        // OF's `nut_ = Cmu*sqr(k)/epsilon` assigns the boundary from k and epsilon's patch values and
-        // correctBoundaryConditions() lets each type re-evaluate -- calculated holds the assigned value
-        // (measured on rhoBoxF: every patch reads 0.001265625 from a 1e-3 seed), zeroGradient takes the
-        // owner cell. The LIVE closure recomputes the boundary every iteration, so adding this there
-        // would only shadow the gated path.
-        if (f.turbulenceFrozen)
+        const std::vector<std::vector<scalar>> yWall = nearWallDist(m, g, patches);
+        const bool haveAlphat = static_cast<label>(f.alphat.internal.size()) == nC;
+        if (f.rasModel == "kEpsilon")
         {
-            f.k.evaluateBoundary();
-            f.epsilon.evaluateBoundary();
-            const bool haveAlphat = static_cast<label>(f.alphat.internal.size()) == nC;
-            const scalar Prt = f.thermo.Prt;
-            for (std::size_t pi = 0; pi < patches.size(); ++pi)
-            {
-                const std::vector<scalar> kB = f.k.boundary[pi]->value();
-                const std::vector<scalar> eB = f.epsilon.boundary[pi]->value();
-                std::vector<scalar> nB(kB.size());
-                for (std::size_t i = 0; i < kB.size(); ++i)
-                    nB[i] = keCase.Cmu * kB[i] * kB[i] / (eB[i] > scalar(1e-300) ? eB[i] : scalar(1e-300));
-                f.nut.boundary[pi]->setStoredValues(nB);
-                if (haveAlphat)
-                {
-                    const std::vector<scalar> rB = f.rho.boundary[pi]->value();
-                    std::vector<scalar> aB(nB.size());
-                    for (std::size_t i = 0; i < nB.size(); ++i) aB[i] = rB[i] * nB[i] / Prt;
-                    f.alphat.boundary[pi]->setStoredValues(aB);
-                }
-            }
-            f.nut.evaluateBoundary();
-            if (haveAlphat) f.alphat.evaluateBoundary();
+            cpu::kEpsilonRef::Compressible comp;
+            comp.rho = &f.rho.internal;  comp.rhoBnd = &rhoBnd;
+            comp.nu  = &nuLam;           comp.nuBnd  = &nuLamBnd;
+            comp.alphat = haveAlphat ? &f.alphat.internal : nullptr;
+            comp.Prt = f.thermo.Prt;
+            cpu::kEpsilonRef::correctNutField(f.k, f.epsilon, f.nut, yWall, /*nu=*/0.0, patches, keCase, &comp);
+        }
+        else
+        {
+            const std::vector<scalar> y     = cellWallDist(m, g, patches);
+            const std::vector<tensor> gradU = fvc::gaussGrad(f.U, m, g, patches);
+            cpu::kOmegaSST::Compressible comp;
+            comp.rho = &f.rho.internal;  comp.rhoBnd = &rhoBnd;
+            comp.nu  = &nuLam;           comp.nuBnd  = &nuLamBnd;
+            comp.alphat = haveAlphat ? &f.alphat.internal : nullptr;
+            comp.Prt = f.thermo.Prt;
+            cpu::kOmegaSST::correctNutField(f.U, f.k, f.omega, f.nut, gradU, y, yWall, /*nu=*/0.0,
+                                            m, g, patches, f.sstCoeffs, &comp);
+        }
+        if (haveAlphat)
+        {
+            f.alphat.evaluateBoundary();
+            correctAlphatBoundary(f, patches);
         }
     }
 

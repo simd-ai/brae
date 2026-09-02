@@ -13,6 +13,13 @@ struct KEpsilonCoeffs
     scalar Cmu = 0.09, C1 = 1.44, C2 = 1.92, C3 = 0.0;
     scalar sigmaK = 1.0, sigmaEps = 1.3;
     scalar kappa = 0.41, E = 9.8;
+    // THE WALL FUNCTIONS' OWN Cmu. OpenFOAM's nutkWallFunction, epsilonWallFunction and
+    // omegaWallFunction all read wallCoeffs_.Cmu() -- the nut wall function patch's coefficient, default
+    // 0.09 -- and never the model's (nutkWallFunctionFvPatchScalarField.C:43, epsilonWallFunction...C:192,
+    // omegaWallFunction...C:191). brae handed them the MODEL's Cmu, which is the same number at the
+    // defaults and a different one the moment a case changes it: rhoSST with betaStar 0.1 parted from
+    // OpenFOAM at iteration 1 by omega 2.5e-02, all of it in the wall rows.
+    scalar CmuWall = 0.09;
     // The case's laplacianSchemes, for the k and epsilon diffusion terms. `Gauss linear corrected` changes
     // the implicit face coefficient AND adds an explicit non-orthogonal source; kOmegaSST already takes
     // both. FALSE here is `orthogonal`/`uncorrected`, so a caller that does not set it keeps the

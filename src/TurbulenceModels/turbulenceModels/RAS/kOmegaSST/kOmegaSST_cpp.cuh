@@ -104,6 +104,29 @@ std::vector<scalar> correctNut(const std::vector<scalar>& k, const std::vector<s
 // about how far a solve happens to move a field. (The obvious test -- run one correct() and check the
 // field does not move -- is NOT valid here: OpenFOAM itself stops on a residual plateau, not at an exact
 // fixed point, so solving from its state to 1e-12 moves the field by however much that plateau is worth.)
+struct Compressible;   // defined below
+
+// correctNut(S2) as kOmegaSSTBase runs it, boundary and EddyDiffusivity included: nut =
+// a1*k/max(a1*omega, b1*F23*sqrt(S2)) on cells; nut.correctBoundaryConditions() -- wall patches through
+// nutkWallFunction, calculated patches from the boundary k/omega/S2/F2 (a field assignment writes the
+// boundary too); alphat = rho*nut/Prt when comp carries one. Called at the end of correct() and, on its
+// own, for turbulence->validate() at construction (eddyViscosity::validate -> correctNut()), which used
+// to be skipped on this model so the first momentum solve ran on the case file's nut.
+void correctNutField(
+    const GeometricField<vector>&           U,
+    const GeometricField<scalar>&           k,
+    const GeometricField<scalar>&           omega,
+    GeometricField<scalar>&                 nutField,
+    const std::vector<tensor>&              gradU,     // S2 = 2|symm(gradU)|^2, boundary S2 from its patch correction
+    const std::vector<scalar>&              y,         // cell wall distance (F2)
+    const std::vector<std::vector<scalar>>& yWall,     // near-wall distance per wall face (nutkWallFunction)
+    scalar                                  nu,        // the incompressible scalar; 0 with comp->nu/nuBnd set
+    const PrimitiveMesh&                    m,
+    const FvGeometry&                       g,
+    const std::vector<FvPatch>&             patches,
+    const KOmegaSSTCoeffs&                  co,
+    const Compressible*                     comp);
+
 struct SSTResiduals
 {
     scalar omega = 0, k = 0;
@@ -202,7 +225,13 @@ void correct(
     // reproduces the previous arithmetic exactly.
     const Compressible*            comp = nullptr,
     // fvSolution solvers/<field>/minIter -- see kEpsilon_cpp.cuh. Last, after comp, for the same reason.
-    int                            minIter = 0);
+    int                            minIter = 0,
+    // Whether fvSolution NAMES a factor for omega / k. OpenFOAM reaches relax() through fvMatrix::relax(),
+    // which does nothing unless relaxEquation(name) holds (fvMatrix.C:1250-1263); brae's relaxMatrix at
+    // 1.0 still applies the dominance clamp. Defaulted true so every positional caller keeps its
+    // arithmetic; the compressible driver passes what the case says. Same shape as kEpsilon_cpp.
+    bool                           relaxEquationOmega = true,
+    bool                           relaxEquationK = true);
 
 } // namespace kOmegaSST
 } // namespace cpu

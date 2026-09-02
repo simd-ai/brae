@@ -647,10 +647,10 @@ Residuals rhoSimpleStep(
                     "equation's alphaEff = CpByCpv*(alpha + alphat) needs it. Refusing rather than "
                     "running with alphat = 0.");
             sc.alphat   = &f.alphat.internal;
-            sc.Prt      = in.Prt;
+            sc.Prt      = f.Prt;   // the CASE's, from the field set -- see the kEpsilon branch
 
             // The case's gradSchemes for grad(k)/grad(omega), which CDkOmega and therefore F1 depend on.
-            KOmegaSSTCoeffs sco = in.sstCoeffs;
+            KOmegaSSTCoeffs sco = f.sstCoeffs;   // the CASE's, read with keCoeffs in createFields
             sco.gradKLimitK      = in.gradKLimitK;
 
             const std::vector<scalar> y = cellWallDist(m, g, patches);
@@ -660,10 +660,11 @@ Residuals rhoSimpleStep(
                                sco, &sres, in.boundedTurb,
                                in.limitedLinearTurb, in.turbLimiterCoeff, in.linearUpwindTurb,
                                in.correctedLaplacian, in.snGradLimitCoeff, /*lm=*/nullptr, &sc,
-                               in.minIterTurb);
+                               in.minIterTurb, in.relaxEquationOmega, in.relaxEquationK);
             res["omega"] = sres.omega;
             res["k"]     = sres.k;
             f.alphat.evaluateBoundary();
+            correctAlphatBoundary(f, patches);   // EddyDiffusivity's boundary half -- shared, see the header
             return res;
         }
 
@@ -729,34 +730,7 @@ Residuals rhoSimpleStep(
         res["k"]       = kres.k;
         f.alphat.evaluateBoundary();
 
-        // alphat_.correctBoundaryConditions() -- EddyDiffusivity.C:38, which OpenFOAM runs at the end of
-        // every correctNut(). The evaluateBoundary() above is NOT that: brae has no
-        // compressible::alphatWallFunction patch type, so such a patch is built as a plain calculated one
-        // and evaluating it returns whatever 0/alphat shipped -- `value uniform 0` on the walls of both
-        // sbMatched and squareBend, unchanged for the whole run.
-        //
-        // Measured against OpenFOAM's own written field before this loop existed: 1.000000e+00 relative
-        // over 22400 wall faces. A relative error of exactly one means brae's wall alphat was identically
-        // ZERO where OpenFOAM's is not, so alphaEff at the wall carried none of the turbulent
-        // diffusivity -- on a fixed-temperature wall that is the whole of the turbulent heat flux.
-        //
-        // OF's rule is operator==(rhow*tnutw/Prt_) (alphatWallFunctionFvPatchScalarField.C:125) with the
-        // PATCH's own Prt_, default 0.85 (:76) -- NOT the turbulence model's, default 1.0. Applied only
-        // where the case names that wall function; every other patch keeps the condition evaluateBoundary
-        // just applied, which is what OpenFOAM leaves to that patch's own evaluate().
-        for (std::size_t pi = 0; pi < patches.size() && pi < f.alphatWallFn.size(); ++pi)
-        {
-            if (!f.alphatWallFn[pi]) continue;
-            const std::vector<scalar>& rb = f.rho.boundary[pi]->value();
-            const std::vector<scalar>& nb = f.nut.boundary[pi]->value();
-            const scalar prt = f.alphatPrt[pi];
-            std::vector<scalar> ab(static_cast<std::size_t>(patches[pi].size), scalar(0));
-            for (label i = 0; i < patches[pi].size; ++i)
-            {
-                if (i < (label)rb.size() && i < (label)nb.size()) ab[i] = rb[i] * nb[i] / prt;
-            }
-            f.alphat.boundary[pi]->setValue(std::move(ab));
-        }
+        correctAlphatBoundary(f, patches);   // EddyDiffusivity's boundary half -- shared, see the header
     }
     return res;
 }

@@ -260,7 +260,9 @@ void correct(
     scalar                         snGradLimitCoeff,
     const LMHooks*                 lm,
     const Compressible*            comp,
-    int                            minIter)
+    int                            minIter,
+    bool                           relaxEquationOmega,
+    bool                           relaxEquationK)
 {
     if (co.F3)
         throw std::runtime_error(
@@ -269,7 +271,7 @@ void correct(
             "limiter. Not implemented; refusing rather than silently running with F3 off.");
 
     const label nC = m.nCells();
-    const scalar Cmu25 = std::pow(co.betaStar, 0.25);   // kOmegaSST's Cmu IS betaStar
+    const scalar Cmu25 = std::pow(co.CmuWall, 0.25);    // the WALL FUNCTIONS' Cmu, not the model's betaStar
     std::vector<scalar>& nutF = nutField.internal;
 
     // alpha()*rho() multiplies every source in both equations; alpha is 1 for a single-phase model, so
@@ -368,7 +370,7 @@ void correct(
         for (label i = 0; i < wp.size; ++i)
             nuFace[i] = (comp && comp->nuBnd) ? (*comp->nuBnd)[pi][i] : nu;
         const std::vector<scalar> nutw =
-            nutkWallFunction(wp, yw, k.internal, nuFace, co.betaStar, co.kappa, co.E);
+            nutkWallFunction(wp, yw, k.internal, nuFace, co.CmuWall, co.kappa, co.E);
         const std::vector<vector>& Uw = U.boundary[pi]->value();
         for (label i = 0; i < wp.size; ++i)
         {
@@ -495,7 +497,7 @@ void correct(
         }
         if (res && res->captureStages)
             captureSSTSystem(M, patches, res->omD0, res->omSrc0);
-        relaxMatrix(M, omega, m, patches, relaxOmega);
+        if (relaxEquationOmega) relaxMatrix(M, omega, m, patches, relaxOmega);
         setValues(M, omega.internal, m, patches, wallCells, omVals);
         if (res && res->captureStages)
             captureSSTSystem(M, patches, res->omD, res->omSrc, &res->omUpper, &res->omLower);
@@ -600,7 +602,7 @@ void correct(
         }
         if (res && res->captureStages)
             captureSSTSystem(M, patches, res->kD0, res->kSrc0);
-        relaxMatrix(M, k, m, patches, relaxK);
+        if (relaxEquationK) relaxMatrix(M, k, m, patches, relaxK);
         if (res && res->captureStages)
             captureSSTSystem(M, patches, res->kD, res->kSrc, &res->kUpper, &res->kLower);
         const SolverPerformance pk = pbicgstab(M, k.internal, m, patches, tol, relTol, maxIter, minIter);
@@ -612,13 +614,36 @@ void correct(
         bound(k, 1e-15, m, g, patches);   // Foam::bound(k_, kMin_)
     }
 
-    // ---- correctNut ------------------------------------------------------------------------------
-    // kOmegaSSTBase.C ends with correctNut(S2): S2 is the one computed at the TOP of correct() (still in
-    // scope, from the old U), but F23() inside it reads the MEMBER k_ and omega_, which the two solves
-    // above have just overwritten. So S2 is old and F23 is NEW. Reusing the pre-solve f23 here moved
-    // omega by 1.5e-01 and nut by 1.2e-01 off OpenFOAM's converged state.
+    // ---- correctNut(S2), boundary and EddyDiffusivity included -- ONE implementation, shared with
+    // turbulence->validate() at construction (see correctNutField). S2 is the one computed at the TOP of
+    // correct() from the old U, F23 inside reads the k and omega the two solves above have just written:
+    // kOmegaSSTBase.C ends with correctNut(S2) and F23() reads the members.
+    correctNutField(U, k, omega, nutField, gradU, y, yWall, nu, m, g, patches, co, comp);
+}
+
+void correctNutField(
+    const GeometricField<vector>&           U,
+    const GeometricField<scalar>&           k,
+    const GeometricField<scalar>&           omega,
+    GeometricField<scalar>&                 nutField,
+    const std::vector<tensor>&              gradU,
+    const std::vector<scalar>&              y,
+    const std::vector<std::vector<scalar>>& yWall,
+    scalar                                  nu,
+    const PrimitiveMesh&                    m,
+    const FvGeometry&                       g,
+    const std::vector<FvPatch>&             patches,
+    const KOmegaSSTCoeffs&                  co,
+    const Compressible*                     comp)
+{
+    (void)m; (void)g;
+    const label nC = m.nCells();
+    std::vector<scalar>& nutF = nutField.internal;
+    std::vector<scalar> nuCell(nC);
+    for (label c = 0; c < nC; ++c) nuCell[c] = (comp && comp->nu) ? (*comp->nu)[c] : nu;
+    const std::vector<scalar> s2 = S2(gradU);
     const std::vector<scalar> f23New = F2(k.internal, omega.internal, y, nuCell, co);
-    nutF = correctNut(k.internal, omega.internal, f23New, s2, co);
+    nutF = correctNut(k.internal, omega.internal, f23New, s2, co);   // a1*k/max(a1*omega, b1*F23*sqrt(S2))
 
     // EddyDiffusivity::correctNut, which the COMPRESSIBLE instantiation runs after the model's own:
     //     alphat = rho*nut/Prt
@@ -637,7 +662,7 @@ void correct(
             nutkWallFunction(patches[pi], yWall[pi], k.internal,
                              comp && comp->nuBnd ? (*comp->nuBnd)[pi]
                                                  : std::vector<scalar>(patches[pi].size, nu),
-                             co.betaStar, co.kappa, co.E));
+                             co.CmuWall, co.kappa, co.E));
     }
 
     // OpenFOAM assigns nut_ as a FIELD -- nut_ = a1*k/max(a1*omega, b1*F23*sqrt(S2)) -- and a field
@@ -700,8 +725,11 @@ void correct(
             }
             const scalar S2b = 2.0*ss;
 
+            // nu AT THE FACE: the compressible caller passes the scalar nu as 0 and carries mu(T)/rho per
+            // face in comp->nuBnd; the scalar was being used here, which zeroed F2's viscous term.
+            const scalar nuB = (comp && comp->nuBnd) ? (*comp->nuBnd)[pi][i] : nu;
             const scalar arg2 = std::fmax(2.0*std::sqrt(std::fmax(kb[i], 0.0))/(co.betaStar*ob[i]*y[c]),
-                                          500.0*nu/(y[c]*y[c]*ob[i]));
+                                          500.0*nuB/(y[c]*y[c]*ob[i]));
             const scalar F2b  = std::tanh(arg2*arg2);
             vals[i] = co.a1*kb[i] / std::fmax(co.a1*ob[i], co.b1*F2b*std::sqrt(std::fmax(S2b, 0.0)));
         }

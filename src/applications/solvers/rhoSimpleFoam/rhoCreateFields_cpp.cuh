@@ -59,7 +59,8 @@
 #include "foam_dict.cuh"
 #include "thermo_types.cuh"
 #include "fvc.cuh"
-#include "kepsilon_coeffs.cuh"   // KEpsilonCoeffs: the case's own closure constants, carried on the field set
+#include "kepsilon_coeffs.cuh"     // KEpsilonCoeffs: the case's own closure constants, carried on the field set
+#include "komega_sst_coeffs.cuh"   // KOmegaSSTCoeffs + readKOmegaSSTCoeffs, likewise
 #include <string>
 #include <vector>
 
@@ -172,6 +173,10 @@ struct RhoSimpleFields
     // OpenFOAM reads SIX coefficients here (kEpsilon.C:199-204: Cmu, C1, C2, C3, sigmak, sigmaEps);
     // createFields read only Cmu, so the other five were the model's defaults whatever the case said.
     KEpsilonCoeffs keCoeffs{};
+    // kOmegaSST's, read the same way (readKOmegaSSTCoeffs, RAS/kOmegaSSTCoeffs, OpenFOAM's defaults
+    // where absent -- kOmegaSSTBase.C:263-371). The SST branch of the step used to take these from a
+    // StepInput field nothing assigned, so a case naming any coefficient ran the model defaults.
+    KOmegaSSTCoeffs sstCoeffs{};
     scalar         Prt = 1.0;           // EddyDiffusivity's, default 1.0 (EddyDiffusivity.C:36) -- and
                                         // NOT alphatWallFunction's, whose default is 0.85. See alphatPrt.
     // kOmegaSST transports omega where kEpsilon transports epsilon. Which one is populated follows
@@ -201,6 +206,32 @@ RhoSimpleFields createFields(
     const PrimitiveMesh&        m,
     const FvGeometry&           g,
     const std::vector<FvPatch>& patches);
+
+// EddyDiffusivity::correctNut's BOUNDARY half, one implementation for construction and both step
+// branches. alphat = rho*nut/Prt is a FIELD assignment in OpenFOAM (EddyDiffusivity.C:38), so every
+// patch takes rho_b*nut_b/Prt with the MODEL's Prt -- the inlet's alphat used to stay at the case
+// file's 0 for the whole run -- and alphat.correctBoundaryConditions() then lets
+// compressible::alphatWallFunction overwrite its patches with rho_w*nut_w/Prt_w, the PATCH's own Prt
+// (default 0.85, alphatWallFunctionFvPatchScalarField.C:76,125). A patch that fixes its value keeps it.
+// The kOmegaSST branch of the step used to return before the wall-function pass the kEpsilon branch
+// carried inline, so its wall alphat was the file's 0 -- exactly 1.0 relative on rhoSST's 160 wall faces.
+inline void correctAlphatBoundary(RhoSimpleFields& f, const std::vector<FvPatch>& patches)
+{
+    for (std::size_t pi = 0; pi < patches.size() && pi < f.alphat.boundary.size(); ++pi)
+    {
+        if (f.alphat.boundary[pi]->fixesValue()) continue;
+        const std::vector<scalar>& rb = f.rho.boundary[pi]->value();
+        const std::vector<scalar>& nb = f.nut.boundary[pi]->value();
+        const bool   wf  = pi < f.alphatWallFn.size() && f.alphatWallFn[pi];
+        const scalar prt = wf ? f.alphatPrt[pi] : f.Prt;
+        std::vector<scalar> ab(static_cast<std::size_t>(patches[pi].size), scalar(0));
+        for (label i = 0; i < patches[pi].size; ++i)
+        {
+            if (i < static_cast<label>(rb.size()) && i < static_cast<label>(nb.size())) ab[i] = rb[i] * nb[i] / prt;
+        }
+        f.alphat.boundary[pi]->setValue(ab);
+    }
+}
 
 } // namespace rhoSimple
 } // namespace cpu
