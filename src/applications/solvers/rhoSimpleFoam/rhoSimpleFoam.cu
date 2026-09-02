@@ -242,6 +242,9 @@ Residuals rhoSimpleStep(
     DeviceBoundary&             dbT,
     const RhoStepInput&         in)
 {
+    // Refusals RECORDED at field construction land here, before anything is solved.
+    if (!in.tiltedSymmetryRefusal.empty()) throw std::runtime_error(in.tiltedSymmetryRefusal);
+
     Residuals res;
     const int nC = dm.nCells;
 

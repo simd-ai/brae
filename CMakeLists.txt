@@ -2112,6 +2112,21 @@ set_tests_properties(amg_cache_warm_start PROPERTIES
                      DEPENDS brae
                      TIMEOUT 1200)
 
+# angledDuctExplicitFixedCoeff, OpenFOAM's own tutorial, at OpenFOAM's own convergence (639 iterations)
+# -- porosity + a fixedTemperatureConstraint + a scalarFixedValueConstraint on k and epsilon. It was
+# never registered, so nothing ran it; its host comparison reads p 1.9e-06, T 1.6e-06, U 1.7e-05. The
+# CUDA arms check that the tutorial's TILTED SLIP wall is refused by name (mesh type `wall`, U BC
+# `slip`, plane at 45 degrees) and that with an axis-independent wall the device applies all three
+# fvOptions and pins the same cells as the host.
+add_test(NAME rho_angledduct_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_angledduct_vs_openfoam.sh)
+set_tests_properties(rho_angledduct_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     LABELS slow
+                     TIMEOUT 3600)
+
 add_test(NAME rho_mirror_solver_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_mirror_solver_vs_openfoam.sh)
 set_tests_properties(rho_mirror_solver_vs_openfoam PROPERTIES

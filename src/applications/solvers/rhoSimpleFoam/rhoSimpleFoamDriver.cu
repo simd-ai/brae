@@ -37,6 +37,7 @@ RhoStepInput buildDeviceStepInput(
 {
     RhoStepInput in;
 
+    in.tiltedSymmetryRefusal = dev.tiltedSymmetryRefusal;
     in.hasMRF              = refusals.hasMRF;
     in.hasFvOptions        = refusals.hasFvOptions;
     in.fvOptionUnsupported = refusals.fvOptionUnsupported;

@@ -125,15 +125,31 @@ for k, v in [('endTime', '5'), ('writeInterval', '5'), ('writeControl', 'timeSte
     s = re.sub(r'^%s .*' % k, '%-15s %s;' % (k, v), s, flags=re.M)
 open(c, 'w').write(s)
 PYEOF
-cuout=$( cd "$CU" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$MIRRORBIN" -case "$CU" 2>&1 )
+# AS THE TUTORIAL SHIPS, the device arm must REFUSE it: `porosityWall` is `type wall;` in the mesh and
+# `slip` in 0/U, on a plane at 45 degrees, and the device's segregated symmetry treatment is exact only
+# for axis-aligned planes. That refusal keyed on the MESH patch type and so never saw this patch --
+# measured at iteration 1, with the interiors still agreeing to 1e-11, the device put
+# (1.04804 1.04919 ...) on those faces where the host and OpenFOAM put (3.58007 3.58007 ...).
+cuout=$( cd "$CU" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$MIRRORBIN" -case "$CU" 2>&1 || true )
+echo "$cuout" | grep -q "porosityWall" && echo "$cuout" | grep -q "not aligned to a coordinate axis" \
+    && echo "  cuda arm: the tutorial's TILTED SLIP wall is refused by name   ok" \
+    || { echo "$cuout" | tail -4; echo "FAIL: the CUDA arm did not refuse the tilted slip patch"; exit 1; }
+
+# ...and with that patch made axis-independent (noSlip), the SAME case runs on the device and its three
+# fvOptions are applied. The mutation is one BC: everything the fvOptions machinery does is unchanged.
+CU2="$W/cuda2"; rm -rf "$CU2"; cp -r "$CU" "$CU2"; rm -rf "$CU2"/[1-9]*
+python3 "$ROOT/tests/rho_angledduct_noslip.py" "$CU2/0/U"
+grep -q "noSlip" "$CU2/0/U" || { echo "FAIL: the noSlip mutation did not apply"; exit 1; }
+cuout=$( cd "$CU2" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$MIRRORBIN" -case "$CU2" 2>&1 )
 echo "$cuout" | grep -q "^End" \
     && echo "$cuout" | grep -q "fixedTemperatureConstraint T=" \
     && echo "$cuout" | grep -q "scalarFixedValueConstraint k=" \
     && echo "$cuout" | grep -q "explicitPorositySource/fixedCoeff" \
-    && echo "  cuda arm: the tutorial runs with all three fvOptions applied   ok" \
-    || { echo "$cuout" | tail -4; echo "FAIL: the CUDA arm did not run the tutorial with its fvOptions"; exit 1; }
+    && echo "  cuda arm: with an axis-independent wall it runs, all three fvOptions applied   ok" \
+    || { echo "$cuout" | tail -4; echo "FAIL: the CUDA arm did not run the mutated tutorial with its fvOptions"; exit 1; }
+CU="$CU2"
 
-HO="$W/host"; rm -rf "$HO"; cp -r "$CU" "$HO"; rm -rf "$HO"/[1-9]*
+HO="$W/host"; rm -rf "$HO"; cp -r "$CU" "$HO"; rm -rf "$HO"/[1-9]*   # $CU is the mutated case
 ( cd "$HO" && BRAE_RHOSIMPLEFOAM_MIRROR=1 "$MIRRORBIN" -case "$HO" > host.log 2>&1 ) \
     || { tail -4 "$HO/host.log"; echo "FAIL: the host arm did not run the tutorial"; exit 1; }
 CUDA_K="$CU/5/k" HOST_K="$HO/5/k" python3 - <<'PYEOF' || exit 1

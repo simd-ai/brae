@@ -62,8 +62,10 @@ RhoDeviceFields createDeviceFields(
     const FvGeometry&                      g,
     const std::vector<FvPatch>&            patches)
 {
-    for (const FvPatch& p : patches)
+    std::string tiltedRefusal;   // recorded here, carried on RhoDeviceFields, thrown by the step
+    for (std::size_t pi_ = 0; pi_ < patches.size(); ++pi_)
     {
+        const FvPatch& p = patches[pi_];
         // The PREDICATE, not a hand list: buildPatches also accepts cyclicPeriodicAMI, which the
         // four-name list let slip. isCoupledInterfaceType is the same test the V2 envelope and the
         // host guard use; processor is outside it and named separately everywhere.
@@ -73,19 +75,36 @@ RhoDeviceFields createDeviceFields(
         // U 8.2e-06 from OpenFOAM while the device arm drifts from iteration 1 (Uy 2.8e-05 -> 9.5e-01
         // by iteration 6) even with deviceUpdateSymmetry wired. Refusing the tilted case on this arm
         // by name; the axis-aligned set stays admitted, and the host arm carries the tilted gate.
-        if (p.type == "symmetry" || p.type == "symmetryPlane" || p.type == "slip")
+        // THE FIELD'S BC, not the mesh patch type. `slip` and `symmetry` are BOUNDARY CONDITIONS: a
+        // mesh patch typed `wall` may carry either, and OpenFOAM's own
+        // angledDuctExplicitFixedCoeff does exactly that -- constant/polyMesh/boundary declares
+        // `porosityWall { type wall; }` while 0/U gives it `slip`, on a plane at 45 degrees. Keyed on
+        // p.type this refusal never looked at that patch, so the segregated per-component treatment ran
+        // on a tilted plane anyway: measured at iteration 1, with the interiors still agreeing to
+        // 1e-11, the device put (1.04804 1.04919 ...) on those faces where the host and OpenFOAM put
+        // (3.58007 3.58007 ...) -- relL2 5.000e-01, and the tangential projection's x == y is the
+        // signature of the 45-degree plane the device was not honouring.
+        //
+        // The factory maps slip/symmetry/symmetryPlane to one class, so isSymmetry() is the question to
+        // ask; p.type stays in the test for a mesh patch typed symmetry whose field entry is absent
+        // (buildField synthesises the constraint type in that case).
+        const bool symmetryBC =
+            (pi_ < hf.U.boundary.size() && hf.U.boundary[pi_] && hf.U.boundary[pi_]->isSymmetry());
+        if (symmetryBC || p.type == "symmetry" || p.type == "symmetryPlane" || p.type == "slip")
         {
             for (label i = 0; i < p.size; ++i)
             {
                 const vector& nf = p.nf[i];
                 int big = (std::fabs(nf.x) > 1e-6) + (std::fabs(nf.y) > 1e-6) + (std::fabs(nf.z) > 1e-6);
                 if (big > 1)
-                    throw std::runtime_error(
-                        "rhoSimpleFoam createFields(cuda): patch '" + p.name + "' is " + p.type +
-                        " with a normal not aligned to a coordinate axis. The device's segregated "
+                    tiltedRefusal = (
+                        "rhoSimpleFoam createFields(cuda): patch '" + p.name + "' (mesh type " + p.type +
+                        ", U boundary " + std::string(symmetryBC ? "slip/symmetry" : p.type) + ") has a normal" +
+                        " not aligned to a coordinate axis. The device's segregated "
                         "symmetry treatment is exact only for axis-aligned planes; the host mirror "
                         "handles the tilted case and is gated on it (sym_vs_openfoam). Refusing "
                         "rather than drifting from the first iteration.");
+                    break;
             }
         }
         if (isCoupledInterfaceType(p.type) || p.type == "processor")
@@ -99,6 +118,7 @@ RhoDeviceFields createDeviceFields(
     }
 
     RhoDeviceFields d;
+    d.tiltedSymmetryRefusal = tiltedRefusal;
     const label nC = m.nCells();
 
     d.dm = buildDeviceMesh(m, g, patches);

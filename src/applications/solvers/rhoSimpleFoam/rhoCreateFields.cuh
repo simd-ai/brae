@@ -64,6 +64,11 @@ struct RhoDeviceFields
 
     // The closure's static geometry. Empty on a laminar case.
     DeviceWallData       wall;
+    // A tilted symmetry/slip plane, RECORDED here and thrown by the step rather than at construction:
+    // the device's segregated per-component treatment is exact only for axis-aligned planes, but the
+    // masks and addressing this struct carries are still well-formed and a structural test builds them
+    // on exactly such a case. Non-empty means the step refuses before it solves anything.
+    std::string          tiltedSymmetryRefusal;
     DeviceBuffer<label>  wfBndMask;      // per BOUNDARY FACE: carries a turbulence wall function
     DeviceBuffer<scalar> wallYBndFace;   // nearWallDist y, per boundary face (0 off a wall-function patch)
     std::vector<label>   wfFaceOfBnd;    // wall-face order -> boundary-face index, for deviceGatherWallNu
