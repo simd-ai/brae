@@ -86,6 +86,12 @@ struct KEpsilonInput
     // nut's boundary as it stands ENTERING correct(): what DkEff(patchi)/DepsilonEff(patchi) are built
     // from. NOT the owner cell's nut -- see the header.
     const DeviceBuffer<scalar>* nutBndFace = nullptr;
+    // The same, gathered into WALL-face order, for the wall functions' G0: OpenFOAM's
+    // epsilonWallFunction reads nutw[facei] from the nut patch field as stored, not a fresh
+    // nutkWallFunction of the current k and nu_w -- the two differ wherever rho_b has moved since the
+    // value was stored (5.4e-05 on rhoKE at iteration 1, worth 1e-06 in k). Null = recompute (the
+    // old arithmetic), so a caller that cannot gather still runs; the rho hook gathers it.
+    const DeviceBuffer<scalar>* nutWallFace = nullptr;
 
     // Which BOUNDARY FACES carry a turbulence wall function, and the near-wall distance on each. The
     // predicate is per FACE and not per cell: a cell can touch a wall patch and an inlet at once, and

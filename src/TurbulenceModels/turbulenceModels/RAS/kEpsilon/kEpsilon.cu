@@ -466,7 +466,8 @@ void wallTreatment(
     zeroed(st.eps0, nC);
     zeroed(st.G0, nC);
     deviceWallEpsG0(wall, k, *in.Ux, *in.Uy, *in.Uz, /*nu=*/scalar(0.0), st.eps0, st.G0, in.co,
-                    /*nutWall=*/0, /*atmZ0=*/scalar(0.0), /*atmBoundNut=*/true, in.nuWallFace);
+                    /*nutWall=*/0, /*atmZ0=*/scalar(0.0), /*atmBoundNut=*/true, in.nuWallFace,
+                    in.nutWallFace);
 
     zeroedL(st.isWallCell, nC);
     copyMaskKernel<<<nBlk(nC), TPB>>>(nC, wall.isWallCell.data(), st.isWallCell.data());

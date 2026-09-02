@@ -15,15 +15,18 @@
 #
 # Measured, host mirror vs OpenFOAM at t=1 -- before: rhoKE U 2.1e-03 / p 4.6e-04 / nut 4.8e-04;
 # rhoSST nut 1.6e-01 / omega 1.2e-01 / U 1.7e-03 / alphat wall faces 1.0 (identically zero).
-# After: p 2.9e-12, T 7.4e-13, U 5.8e-13, epsilon 1.1e-12 / omega 7.3e-13 on both; k 1.3e-06 (KE) and
-# 2.0e-06 (SST), a residual concentrated in the wall rows and queued as its own lead. The k bound is
-# set at that residual's order, the rest at ~100x the floor; the fail-proof (the old kEpsilon-only,
-# interior-only block) fails every field on rhoSST and U/p on rhoKE by 1e3..1e8 x.
+# After: p 2.9e-12, T 7.4e-13, U 5.8e-13, epsilon 1.1e-12 / omega 7.3e-13 on both. k first read
+# 1.3e-06 (KE) / 2.0e-06 (SST), concentrated in the wall rows: the closures recomputed the wall nut
+# from the current k and nu_w for G0 where OpenFOAM's epsilon/omegaWallFunction read the STORED nut
+# patch value (nutw[facei], the previous correctNut's or validate()'s). With the stored value k reads
+# 7.6e-13 on both, and rhoKE stays at ~1e-12 on every field through iteration 10. Every bound is now
+# ~100x the floor; the fail-proof (the old kEpsilon-only, interior-only block) fails every field on
+# rhoSST and U/p on rhoKE by 1e3..1e8 x, and the recomputed wall nut alone fails k by 1e4 x.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/brae_rhoSimpleFoam"
 OFBASHRC=${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
-P_BOUND=1e-10; T_BOUND=1e-10; U_BOUND=1e-10; SECOND_BOUND=1e-10; K_BOUND=1e-05; NUT_BOUND=1e-05
+P_BOUND=1e-10; T_BOUND=1e-10; U_BOUND=1e-10; SECOND_BOUND=1e-10; K_BOUND=1e-10; NUT_BOUND=1e-10
 
 [ -x "$BIN" ]      || { echo "SKIP: $BIN not built"; exit 77; }
 [ -f "$OFBASHRC" ] || { echo "SKIP: real OpenFOAM not available"; exit 77; }

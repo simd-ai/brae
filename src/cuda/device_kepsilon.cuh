@@ -231,8 +231,12 @@ void deviceWallEpsG0(const DeviceWallData& w, const DeviceBuffer<scalar>& k, con
                      const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz, scalar nu,
                      DeviceBuffer<scalar>& eps0, DeviceBuffer<scalar>& G0, const KEpsilonCoeffs& co = {}, int nutWall = 0,
                      scalar atmZ0 = 0.0, bool atmBoundNut = true,   // z0>0 -> atmNutkWallFunction (rough) for the G0 wall nut
-                     const DeviceBuffer<scalar>* nuFace = nullptr,
-    const DeviceBuffer<scalar>* nutFile = nullptr);   // compressible: nu = mu_b/rho_b per WALL face
+                     const DeviceBuffer<scalar>* nuFace = nullptr,       // compressible: nu = mu_b/rho_b per WALL face
+                     // The STORED wall nut in WALL-face order (the nut boundary as it entered correct()).
+                     // OpenFOAM's epsilonWallFunction reads nutw[facei] from the nut patch field -- the
+                     // value the previous correctNut() or validate() left there -- not a fresh
+                     // nutkWallFunction of the current k and nu_w. Null keeps the recomputation.
+                     const DeviceBuffer<scalar>* nutwStored = nullptr);
 // (epsilonWallFunction's `lowReCorrection` rides on KEpsilonCoeffs::epsLowRe, so it reaches the kernel
 //  without threading a flag through every caller.)
 

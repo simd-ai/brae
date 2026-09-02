@@ -265,7 +265,7 @@ int main(int argc, char** argv)
     // the cell one: a cell can touch a wall and an inlet at once and those two faces get different nut.
     const std::vector<std::vector<scalar>> yW = nearWallDist(m, g, fvp);
     std::vector<label>  wfMaskH;
-    std::vector<scalar> yBndH, nuWallH;
+    std::vector<scalar> yBndH, nuWallH, nutWallH;   // nutWallH: the STORED wall nut, wall-face order
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         const bool isWF = isTurbWallPatch(fvp, pi, wfPatch);
@@ -274,6 +274,7 @@ int main(int argc, char** argv)
             wfMaskH.push_back(isWF ? 1 : 0);
             yBndH.push_back(isWF ? yW[pi][i] : 0.0);
             if (isWF) nuWallH.push_back(nuB[pi][i]);   // WALL-face order, matching DeviceWallData
+            if (isWF) nutWallH.push_back(dn.boundary[pi]->value()[i]);   // as the rho hook gathers it
         }
     }
     wfMaskH.resize(dm.nBndFaces, 0);
@@ -296,7 +297,7 @@ int main(int argc, char** argv)
     DeviceBuffer<scalar> dRhoC(rhoC), dNuC(nuC);
     DeviceBuffer<scalar> dRhoB(flatten(rhoB, fvp, dm.nBndFaces, 1.0));
     DeviceBuffer<scalar> dNuB(flatten(nuB, fvp, dm.nBndFaces, 1.5e-5));
-    DeviceBuffer<scalar> dNuWall(nuWallH), dNutBnd(nutBndH);
+    DeviceBuffer<scalar> dNuWall(nuWallH), dNutBnd(nutBndH), dNutWall(nutWallH);
     DeviceBuffer<label>  dWfMask(wfMaskH);
     DeviceBuffer<scalar> dYBnd(yBndH);
     DeviceBuffer<scalar> gK(dk.internal), gE(de.internal), gN(dn.internal), gAlphat;
@@ -309,6 +310,7 @@ int main(int argc, char** argv)
     gin.nuCell = &dNuC;              gin.nuBndFace = &dNuB;
     gin.nuWallFace = &dNuWall;
     gin.nutBndFace = &dNutBnd;
+    gin.nutWallFace = &dNutWall;   // the wall functions' nutw: the stored patch value, as OpenFOAM reads it
     gin.wfBndMask = &dWfMask;        gin.wallYBndFace = &dYBnd;
     gin.Ux = &dUx; gin.Uy = &dUy; gin.Uz = &dUz;
     gin.boundedK = true;             gin.boundedEps = true;

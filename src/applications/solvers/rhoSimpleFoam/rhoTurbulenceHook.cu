@@ -98,6 +98,13 @@ void correctTurbulence(
     // nutBnd is also the output correct() overwrites; aliasing the two makes the closure read a value
     // it has already replaced partway through.
     if (f.nutBnd.size() > 0) deviceCopy(buf.nutBndIn, f.nutBnd);
+    // ...and in WALL-face order, for the wall functions: OpenFOAM's G0 reads the STORED nut patch
+    // value (nutw[facei]), which is this snapshot, not a recomputation from the current k and nu_w.
+    if (nWF > 0 && buf.nutBndIn.size() > 0)
+    {
+        if (static_cast<int>(buf.nutWallIn.size()) != nWF) buf.nutWallIn.resize(nWF);
+        deviceGatherWallNu(buf.wallFaceOfBnd, buf.nutBndIn, buf.nutWallIn);
+    }
 
     // ---- the closure ------------------------------------------------------------------------------
     kEpsilonRAS::KEpsilonInput kin;
@@ -107,6 +114,7 @@ void correctTurbulence(
     kin.nuCell = &buf.nuCell;            kin.nuBndFace = &buf.nuBnd;
     kin.nuWallFace = &buf.nuWall;
     kin.nutBndFace = &buf.nutBndIn;
+    kin.nutWallFace = (nWF > 0) ? &buf.nutWallIn : nullptr;
     kin.wfBndMask = &dev.wfBndMask;      kin.wallYBndFace = &dev.wallYBndFace;
     kin.Ux = &f.Ux; kin.Uy = &f.Uy; kin.Uz = &f.Uz;
     // Passing null here is NOT "no turbulent inlet" -- it is silently no turbulent inlet at all, on a

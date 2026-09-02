@@ -245,7 +245,11 @@ int main(int argc, char** argv)
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         nuBnd[pi].resize(patches[pi].size);
-        for (label i = 0; i < patches[pi].size; ++i) nuBnd[pi][i] = muBnd[pi][i] / rhoBnd[pi][i];
+        // An EMPTY patch carries rho_b 0 in the dump (nothing is solved on it): its nu_b and phi/rho
+        // would be NaN and poison every reduction downstream -- which is what pointing this harness at a
+        // 2D fixture from 0/ (rhoKE) did the first time.
+        for (label i = 0; i < patches[pi].size; ++i)
+            nuBnd[pi][i] = (patches[pi].type == "empty" || !(rhoBnd[pi][i] > 0)) ? 0.0 : muBnd[pi][i] / rhoBnd[pi][i];
     }
 
     // compressibleTurbulenceModel::phi() -- the VOLUMETRIC flux.
@@ -256,7 +260,8 @@ int main(int argc, char** argv)
             phiByRho.internal[f] /= rhof.internal[f];
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
             for (label i = 0; i < patches[pi].size; ++i)
-                phiByRho.boundary[pi][i] /= rhof.boundary[pi][i];
+                phiByRho.boundary[pi][i] = (patches[pi].type == "empty" || !(rhof.boundary[pi][i] > 0))
+                    ? 0.0 : phiByRho.boundary[pi][i] / rhof.boundary[pi][i];
     }
 
     const FoamDict fvSolution = readDict(caseDir + "/system/fvSolution");

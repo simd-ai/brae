@@ -307,6 +307,72 @@ void correct(
         // it in wall-adjacent cells and that is the G both equations are built from.
     }
 
+    // ---- omegaWallFunction FIRST: OpenFOAM's order -----------------------------------------------
+    // kOmegaSSTBase::correct() calls omega_.boundaryFieldRef().updateCoeffs() (kOmegaSSTBase.C:541) --
+    // which writes omega0 into the wall cells and G0 into G -- BEFORE it builds CDkOmega from
+    // fvc::grad(k) & fvc::grad(omega) (:556-559), F1 (:560) and F23 (:561). This block used to sit
+    // after those, so grad(omega), CDkOmega and F1 were taken from the wall-cell omega of the PREVIOUS
+    // iteration. Invisible at iteration 1 (k is uniform, so grad(k) = 0 and CDkOmega = 0 whatever
+    // grad(omega) is) and on a converged state (the closure gate feeds one; the wall-cell omega no
+    // longer moves), which is why it survived: measured on rhoSST at iteration 2, CDkOmega 2.7e-09 off
+    // OpenFOAM's with gradU, S2, G, F1 and F23 all at 1e-15, feeding the omega cross-diffusion source
+    // and growing into k 1.3e-03 by iteration 10 while kEpsilon stayed at 1e-12.
+    // ---- omegaWallFunction: near-wall omega + the G override -------------------------------------
+    // omega = sqrt(omegaVis^2 + omegaLog^2)  -- OF's DEFAULT blender is binomial with n = 2
+    // (omegaWallFunctionFvPatchScalarField.C:445, wallFunctionBlenders(dict, BINOMIAL, 2)).
+    std::vector<label> nw(nC, 0);
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        if (patches[pi].type == "wall")
+            for (label i = 0; i < patches[pi].size; ++i) ++nw[patches[pi].faceCells[i]];
+
+    const std::vector<std::vector<scalar>> yWall = nearWallDist(m, g, patches);   // OF turbulence.y()
+    std::vector<scalar> om0(nC, 0.0), G0(nC, 0.0);
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (patches[pi].type != "wall") continue;
+        const FvPatch& wp = patches[pi];
+        const std::vector<scalar>& yw = yWall[pi];
+        // PER-FACE nu along the wall. nutkWallFunction and omegaVis are written in terms of nu_w, the
+        // value AT the face; the compressible lineage's nu is mu(T)/rho and varies face to face along a
+        // wall with a temperature gradient. Handing the k-epsilon port a single scalar here produced a
+        // NaN in the first turbulent iteration, so this takes the same overload.
+        std::vector<scalar> nuFace(wp.size);
+        for (label i = 0; i < wp.size; ++i)
+            nuFace[i] = (comp && comp->nuBnd) ? (*comp->nuBnd)[pi][i] : nu;
+        // THE STORED WALL nut, NOT A FRESH ONE. OpenFOAM's epsilon/omegaWallFunction::calculate takes
+        // nutw = refCast<nutWallFunctionFvPatchScalarField>(turbModel.nut().boundaryField()[patchi])
+        // and reads nutw[facei] -- the patch VALUES, last written by the previous correctNut() (or by
+        // validate() at construction) from THAT call's k and nu_w. This recomputed nutkWallFunction from
+        // the current k and nu_w instead: exact on a converged state (the closure gate feeds one, 1e-15)
+        // and 5.4e-05 off at iteration 1 on rhoKE, where rho_b along the wall has moved since
+        // construction -- OpenFOAM's stored value is uniform per wall there. That fed G0 in every wall
+        // cell and left k 1e-06 off while p, T, U and the second scalar sat at 1e-12; on kOmegaSST it
+        // compounded into a 1e-03 trajectory drift by iteration 10.
+        const std::vector<scalar>& nutw = nutField.boundary[pi]->value();
+        const std::vector<vector>& Uw = U.boundary[pi]->value();
+        for (label i = 0; i < wp.size; ++i)
+        {
+            const label c = wp.faceCells[i];
+            const scalar w = 1.0 / nw[c], kc = k.internal[c];
+            const scalar omegaVis = 6.0*nuFace[i]/(co.beta1*yw[i]*yw[i]);
+            const scalar omegaLog = std::sqrt(kc)/(Cmu25*co.kappa*yw[i]);
+            const scalar magGradUw = mag((Uw[i] - U.internal[c]) * wp.deltaCoeffs[i]);
+            om0[c] += w * std::sqrt(omegaVis*omegaVis + omegaLog*omegaLog);
+            G0[c]  += w * (nutw[i] + nuFace[i]) * magGradUw * Cmu25 * std::sqrt(kc) / (co.kappa * yw[i]);
+        }
+    }
+    std::vector<label> wallCells;
+    std::vector<scalar> omVals;
+    for (label c = 0; c < nC; ++c)
+        if (nw[c] > 0)
+        {
+            G[c] = G0[c];
+            omega.internal[c] = om0[c];
+            wallCells.push_back(c);
+            omVals.push_back(om0[c]);
+        }
+    if (res && res->captureStages) res->G = G;
+
     // ---- CDkOmega, F1, F2 ------------------------------------------------------------------------
     // The case's gradScheme on each, as OpenFOAM resolves grad(k) and grad(omega) separately.
     std::vector<vector> gradK  = fvc::gaussGrad(k, m, g, patches);
@@ -347,53 +413,6 @@ void correct(
                              (co.c1/co.a1)*co.betaStar*omega.internal[c]
                            * std::fmax(co.a1*omega.internal[c], co.b1*f23[c]*std::sqrt(s2[c])));
 
-    // ---- omegaWallFunction: near-wall omega + the G override -------------------------------------
-    // omega = sqrt(omegaVis^2 + omegaLog^2)  -- OF's DEFAULT blender is binomial with n = 2
-    // (omegaWallFunctionFvPatchScalarField.C:445, wallFunctionBlenders(dict, BINOMIAL, 2)).
-    std::vector<label> nw(nC, 0);
-    for (std::size_t pi = 0; pi < patches.size(); ++pi)
-        if (patches[pi].type == "wall")
-            for (label i = 0; i < patches[pi].size; ++i) ++nw[patches[pi].faceCells[i]];
-
-    const std::vector<std::vector<scalar>> yWall = nearWallDist(m, g, patches);   // OF turbulence.y()
-    std::vector<scalar> om0(nC, 0.0), G0(nC, 0.0);
-    for (std::size_t pi = 0; pi < patches.size(); ++pi)
-    {
-        if (patches[pi].type != "wall") continue;
-        const FvPatch& wp = patches[pi];
-        const std::vector<scalar>& yw = yWall[pi];
-        // PER-FACE nu along the wall. nutkWallFunction and omegaVis are written in terms of nu_w, the
-        // value AT the face; the compressible lineage's nu is mu(T)/rho and varies face to face along a
-        // wall with a temperature gradient. Handing the k-epsilon port a single scalar here produced a
-        // NaN in the first turbulent iteration, so this takes the same overload.
-        std::vector<scalar> nuFace(wp.size);
-        for (label i = 0; i < wp.size; ++i)
-            nuFace[i] = (comp && comp->nuBnd) ? (*comp->nuBnd)[pi][i] : nu;
-        const std::vector<scalar> nutw =
-            nutkWallFunction(wp, yw, k.internal, nuFace, co.CmuWall, co.kappa, co.E);
-        const std::vector<vector>& Uw = U.boundary[pi]->value();
-        for (label i = 0; i < wp.size; ++i)
-        {
-            const label c = wp.faceCells[i];
-            const scalar w = 1.0 / nw[c], kc = k.internal[c];
-            const scalar omegaVis = 6.0*nuFace[i]/(co.beta1*yw[i]*yw[i]);
-            const scalar omegaLog = std::sqrt(kc)/(Cmu25*co.kappa*yw[i]);
-            const scalar magGradUw = mag((Uw[i] - U.internal[c]) * wp.deltaCoeffs[i]);
-            om0[c] += w * std::sqrt(omegaVis*omegaVis + omegaLog*omegaLog);
-            G0[c]  += w * (nutw[i] + nuFace[i]) * magGradUw * Cmu25 * std::sqrt(kc) / (co.kappa * yw[i]);
-        }
-    }
-    std::vector<label> wallCells;
-    std::vector<scalar> omVals;
-    for (label c = 0; c < nC; ++c)
-        if (nw[c] > 0)
-        {
-            G[c] = G0[c];
-            omega.internal[c] = om0[c];
-            wallCells.push_back(c);
-            omVals.push_back(om0[c]);
-        }
-    if (res && res->captureStages) res->G = G;
 
     // ---- omega equation --------------------------------------------------------------------------
     {

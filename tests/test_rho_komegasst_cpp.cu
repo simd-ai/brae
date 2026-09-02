@@ -152,7 +152,9 @@ int main(int argc, char** argv)
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         nuBnd[pi].resize(patches[pi].size);
-        for (label i = 0; i < patches[pi].size; ++i) nuBnd[pi][i] = muBnd[pi][i] / rhoBnd[pi][i];
+        // An EMPTY patch carries rho_b 0 in the dump: guard as test_rho_kepsilon_cpp does, else NaN.
+        for (label i = 0; i < patches[pi].size; ++i)
+            nuBnd[pi][i] = (patches[pi].type == "empty" || !(rhoBnd[pi][i] > 0)) ? 0.0 : muBnd[pi][i] / rhoBnd[pi][i];
     }
 
     const FieldData<scalar> phiFd = readField<scalar>(D + "stage_phiTurb");
@@ -168,7 +170,8 @@ int main(int argc, char** argv)
             phiByRho.internal[f] /= rhof.internal[f];
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
             for (label i = 0; i < patches[pi].size; ++i)
-                phiByRho.boundary[pi][i] /= rhof.boundary[pi][i];
+                phiByRho.boundary[pi][i] = (patches[pi].type == "empty" || !(rhof.boundary[pi][i] > 0))
+                    ? 0.0 : phiByRho.boundary[pi][i] / rhof.boundary[pi][i];
     }
 
     // Wall distance, the same meshWave brae uses elsewhere. F1 and F2 are built from it.

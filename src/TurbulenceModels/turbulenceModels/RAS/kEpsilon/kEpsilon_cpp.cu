@@ -271,8 +271,16 @@ void correct(
         };
         std::vector<scalar> nuFace(wp.size);
         for (label i = 0; i < wp.size; ++i) nuFace[i] = nuAtFace(i);
-        const std::vector<scalar> nutw =
-            nutkWallFunction(wp, yw, k.internal, nuFace, co.CmuWall, co.kappa, co.E);
+        // THE STORED WALL nut, NOT A FRESH ONE. OpenFOAM's epsilon/omegaWallFunction::calculate takes
+        // nutw = refCast<nutWallFunctionFvPatchScalarField>(turbModel.nut().boundaryField()[patchi])
+        // and reads nutw[facei] -- the patch VALUES, last written by the previous correctNut() (or by
+        // validate() at construction) from THAT call's k and nu_w. This recomputed nutkWallFunction from
+        // the current k and nu_w instead: exact on a converged state (the closure gate feeds one, 1e-15)
+        // and 5.4e-05 off at iteration 1 on rhoKE, where rho_b along the wall has moved since
+        // construction -- OpenFOAM's stored value is uniform per wall there. That fed G0 in every wall
+        // cell and left k 1e-06 off while p, T, U and the second scalar sat at 1e-12; on kOmegaSST it
+        // compounded into a 1e-03 trajectory drift by iteration 10.
+        const std::vector<scalar>& nutw = nutField.boundary[pi]->value();
         const std::vector<vector>& Uw = U.boundary[pi]->value();
 
         for (label i = 0; i < wp.size; ++i)

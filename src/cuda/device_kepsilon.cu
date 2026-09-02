@@ -173,7 +173,8 @@ void wallFnKernel(
     bool   lowReCorrection,
     scalar* __restrict__ eps0,
     scalar* __restrict__ G0,
-    const scalar* __restrict__ nuFace)   // compressible: per-wall-face nu, null -> the scalar nu
+    const scalar* __restrict__ nuFace,   // compressible: per-wall-face nu, null -> the scalar nu
+    const scalar* __restrict__ nutwStored)   // the STORED wall nut, wall-face order; null -> recompute
 {
     // One thread per wall CELL, summing that cell's wall faces in ascending face index and writing once.
     // The per-face form needed atomicAdd here, and a cell with more than one wall face then depended on
@@ -198,8 +199,21 @@ void wallFnKernel(
         const scalar yPlus = Cmu25 * y * sqrt(kc) / nuw;
         const bool   resolved = lowReCorrection && (yPlus < yplLam);
         if (!resolved)
-            g0 += wallProductionG0(c, wf, y, dc, kc, iN, wux, wuy, wuz, Ux, Uy, Uz, nuw,
-                                   yplLam, Cmu25, kappa, E, atmZ0, atmBoundNut, nutWall);
+        {
+            if (nutwStored)
+            {
+                // G0 = w*(nutw + nuw)*|snGrad U|*Cmu25*sqrt(k)/(kappa*y) with nutw the STORED patch value,
+                // as epsilonWallFunctionFvPatchScalarField::calculate reads it (nutw[facei]); the
+                // recomputed form below is exact only when k and nu_w have not moved since the value
+                // was stored -- see the header.
+                const scalar gx = (wux[wf] - Ux[c]) * dc, gy = (wuy[wf] - Uy[c]) * dc, gz = (wuz[wf] - Uz[c]) * dc;
+                const scalar magGradUw = sqrt(gx*gx + gy*gy + gz*gz);
+                g0 += iN * (nutwStored[wf] + nuw) * magGradUw * Cmu25 * sqrt(kc) / (kappa * y);
+            }
+            else
+                g0 += wallProductionG0(c, wf, y, dc, kc, iN, wux, wuy, wuz, Ux, Uy, Uz, nuw,
+                                       yplLam, Cmu25, kappa, E, atmZ0, atmBoundNut, nutWall);
+        }
         e0 += resolved ? iN * 2.0 * kc * nuw / (y * y)                 // epsilonVis
                        : iN * Cmu75 * pow(kc, 1.5) / (kappa * y);      // epsilonLog
     }
@@ -526,20 +540,22 @@ void deviceWallEpsG0(
     scalar atmZ0,
     bool   atmBoundNut,
     const DeviceBuffer<scalar>* nuFace,
-    const DeviceBuffer<scalar>* nutFile)   // compressible: nu = mu_b/rho_b per WALL face (OF nu(patchi))
+    const DeviceBuffer<scalar>* nutwStored)   // see the header
 {
     const int nC = static_cast<int>(k.size());
     eps0.resize(nC);
     G0.resize(nC);   // zero on-device (memsetAsync) instead of a host-vector alloc + H2D every iter
     cudaCheck(cudaMemsetAsync(eps0.data(), 0, nC*sizeof(scalar), cudaStreamPerThread), "eps0 zero");
     cudaCheck(cudaMemsetAsync(G0.data(),   0, nC*sizeof(scalar), cudaStreamPerThread), "G0 zero");
-    const scalar Cmu25 = std::pow(co.Cmu, 0.25), Cmu75 = std::pow(co.Cmu, 0.75), yplLam = yPlusLamHost(co.kappa, co.E);
+    // The WALL FUNCTIONS' Cmu, not the model's (wallCoeffs_.Cmu() in OpenFOAM, default 0.09).
+    const scalar Cmu25 = std::pow(co.CmuWall, 0.25), Cmu75 = std::pow(co.CmuWall, 0.75), yplLam = yPlusLamHost(co.kappa, co.E);
     if (w.nWC > 0)
         wallFnKernel<<<nBlocks(w.nWC), TPB>>>(w.nWC, w.wcCell.data(), w.wcStart.data(), w.wcFace.data(),
                                               w.wfY.data(), w.wfDc.data(), w.wfUwx.data(),
                                               w.wfUwy.data(), w.wfUwz.data(), w.invNw.data(), k.data(), Ux.data(), Uy.data(),
                                               Uz.data(), nu, yplLam, Cmu25, Cmu75, co.kappa, co.E, atmZ0, atmBoundNut, nutWall, co.epsLowRe, eps0.data(), G0.data(),
-                                              (nuFace && nuFace->size()) ? nuFace->data() : nullptr);
+                                              (nuFace && nuFace->size()) ? nuFace->data() : nullptr,
+                                              (nutwStored && nutwStored->size()) ? nutwStored->data() : nullptr);
     cudaCheck(cudaGetLastError(), "wallFn");
 }
 

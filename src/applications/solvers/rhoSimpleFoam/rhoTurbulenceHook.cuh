@@ -49,6 +49,7 @@ struct TurbulenceHookBuffers
     DeviceBuffer<scalar> nuCell, nuBnd, nuWall;
     DeviceBuffer<scalar> phiByRhoInt, phiByRhoBnd;
     DeviceBuffer<scalar> nutBndIn;
+    DeviceBuffer<scalar> nutWallIn;      // the same, in WALL-face order (the wall functions' nutw)
     DeviceBuffer<scalar> rhoFace;        // fvc::interpolate(rho) on the internal faces
     DeviceBuffer<label>  wallFaceOfBnd;  // uploaded once, on the first call
     kEpsilonRAS::KEpsilonStages stages;

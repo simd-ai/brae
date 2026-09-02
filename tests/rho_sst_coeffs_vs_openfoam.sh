@@ -19,10 +19,11 @@
 #
 # TAKEN AT ONE ITERATION, on purpose. The closure runs last in the iteration, so every coefficient,
 # Prt (through validate()'s alphat) and the omega factor already decide the fields written at t=1 --
-# and at t=1 the host mirror sits on OpenFOAM at the floor (omega/T/U ~7e-13) except for a 2e-06
-# residual in k that is a separate, queued lead (wall rows, both models); by t=10 that residual has
-# grown into a 1e-03 trajectory drift on this model, which would swallow the arms. Measured at t=1:
-#   fixed       every arm: omega 5.5e-13..9.1e-13, T 7.4e-13, U 5.8e-13, k 1.9e-06 (the baseline)
+# and at t=1 the host mirror sits on OpenFOAM at the floor (omega/T/U ~7e-13, k ~8e-13 once the
+# wall functions read the STORED wall nut -- see rho_validate_vs_openfoam.sh). From t=2 an SST-only
+# residual (k/omega/nut ~2e-08) grows to 1e-03 by t=10 and would swallow the arms; it is queued.
+# Measured at t=1:
+#   fixed       every arm: omega 5.5e-13..9.1e-13, T 7.4e-13, U 5.8e-13, k ~8e-13
 #   controls    OpenFOAM's own answers move by 1e5..1e8 x the omega bound on each arm
 #   fail-proof  step plumbing reverted (model defaults, Prt 1.0, omega factor 1.0, clamp forced): arm 1
 #               omega 5.5e-01 / k 3.0e-02, arm 2 omega 6.1e-01 / k 3.5e-02. Arm 3 PASSED in that
@@ -39,7 +40,7 @@ BIN="${BUILD:-$ROOT/build}/brae_rhoSimpleFoam"
 SRC="$ROOT/validation/rhoSST"
 OFBASHRC=${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
 N=${N:-1}
-K_BOUND=${K_BOUND:-1e-05}; OMEGA_BOUND=${OMEGA_BOUND:-1e-10}; T_BOUND=${T_BOUND:-1e-10}; U_BOUND=${U_BOUND:-1e-10}
+K_BOUND=${K_BOUND:-1e-10}; OMEGA_BOUND=${OMEGA_BOUND:-1e-10}; T_BOUND=${T_BOUND:-1e-10}; U_BOUND=${U_BOUND:-1e-10}
 CONTROL_RATIO=100
 
 [ -x "$BIN" ]      || { echo "SKIP: $BIN not built"; exit 77; }
@@ -136,4 +137,46 @@ for arm, tag in (('co', 'coefficients + Prt'), ('om', 'omega 0.4'), ('none', 'no
 sys.exit(0 if ok else 1)
 PYEOF
 say "the SST coefficients, Prt and omega relaxation reach the closure from the case" "$([ $fail = 0 ] && echo ok || echo FAIL)"
+
+# ---- ARM 4: the closure's ORDER -- the default case at ten iterations ------------------------------
+# kOmegaSSTBase::correct() runs omega_.boundaryFieldRef().updateCoeffs() (kOmegaSSTBase.C:541), which
+# writes omega0 into the wall cells, BEFORE it builds CDkOmega from grad(k) & grad(omega), F1 and F23
+# (:556-561). brae built those first, from the previous iteration's wall-cell omega. Invisible at t=1
+# (k uniform, grad(k) = 0) and on a converged state (the closure gate feeds one), it grew from a
+# 2e-08 seed at t=2 into k 1.3e-03 / omega 1.9e-03 by t=10. With the wall update first: k 1.2e-07 /
+# omega 6.5e-08 / nut 2.1e-07 at t=10, p/T/U ~1e-11. The 2e-08 seed itself is a separate lead (the
+# diffusivity's boundary F1, queued as 13g), which is why the bounds here sit at 1e-06 and not the floor.
+N10=10
+stage "$W/br_def10" "" ""; stage "$W/of_def10" "" ""
+for d in br_def10 of_def10; do
+    sed -i "s/^endTime .*/endTime $N10;/; s/^writeInterval .*/writeInterval $N10;/" "$W/$d/system/controlDict"
+    python3 - "$W/$d/system/controlDict" "$N10" <<'PYEOF'
+import re, sys
+c, n = sys.argv[1], sys.argv[2]; s = open(c).read()
+s = re.sub(r'\bendTime\s+[^;]*;', 'endTime %s;' % n, s); s = re.sub(r'\bwriteInterval\s+[^;]*;', 'writeInterval %s;' % n, s)
+open(c, 'w').write(s)
+PYEOF
+done
+( cd "$W/of_def10" && rhoSimpleFoam > of.log 2>&1 ) || { tail -5 "$W/of_def10/of.log"; echo "FAIL: OpenFOAM did not run (t=10)"; exit 1; }
+( cd "$W/br_def10" && BRAE_RHOSIMPLEFOAM_MIRROR=1 "$BIN" -case "$W/br_def10" > run.log 2>&1 ) \
+    || { tail -5 "$W/br_def10/run.log"; echo "FAIL: the host mirror did not run (t=10)"; exit 1; }
+W="$W" N="$N10" python3 - <<'PYEOF' || fail=1
+import os, re, sys
+import numpy as np
+W, N = os.environ['W'], os.environ['N']
+def read(p):
+    s = open(p).read()
+    m = re.search(r'internalField\s+nonuniform\s+List<(scalar|vector)>\s*\n?(\d+)\s*\n\(\n(.*?)\n\)\s*;', s, re.S)
+    if m.group(1) == 'scalar':
+        return np.array([float(x) for x in m.group(3).split()])
+    return np.array([[float(c) for c in v.split()] for v in re.findall(r'\(([^)]*)\)', m.group(3))])
+ok = True
+for f, bnd in (('k', 1e-06), ('omega', 1e-06), ('nut', 1e-06), ('T', 1e-09), ('U', 1e-09), ('p', 1e-09)):
+    a = read(os.path.join(W, 'br_def10', N, f)); b = read(os.path.join(W, 'of_def10', N, f))
+    r = float(np.linalg.norm(a - b) / np.linalg.norm(b)); good = r < bnd
+    print('     default case at t=%s  %-5s brae vs OpenFOAM %.4e   (bound %.1e)   %s' % (N, f, r, bnd, 'ok' if good else 'FAIL'))
+    ok = ok and good
+sys.exit(0 if ok else 1)
+PYEOF
+say "the wall update precedes CDkOmega/F1/F23 (no trajectory drift at t=10)" "$([ $fail = 0 ] && echo ok || echo FAIL)"
 [ $fail = 0 ] && echo PASS || { echo FAIL; exit 1; }
