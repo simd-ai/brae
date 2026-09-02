@@ -2091,6 +2091,19 @@ set_tests_properties(rho_turb_limitedlinear_vs_openfoam PROPERTIES
 # every warm run died in galDiagGatherK ("amul: an illegal memory access"). Nothing was gated on a
 # warm reload, on either the compressible or the incompressible path, so nothing caught it. Asserts
 # EQUALITY, not a tolerance: a cached hierarchy must reproduce a cold one exactly.
+# simpleFoamV2 wrote every field's boundaryField by ECHOING the 0/ template it splices into -- so a V2
+# time directory carried the start state on every patch the solve had moved (pitzDailyTurb's wall nut
+# among them), and a restart from it restarted from the wrong state. Asserts the written boundary
+# DIFFERS from the template (a value list alone proves nothing -- the template has one too) and that
+# OpenFOAM still accepts the file.
+add_test(NAME v2_written_boundary
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/v2_written_boundary.sh)
+set_tests_properties(v2_written_boundary PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae
+                     TIMEOUT 1200)
+
 add_test(NAME amg_cache_warm_start
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/amg_cache_warm_start.sh)
 set_tests_properties(amg_cache_warm_start PROPERTIES

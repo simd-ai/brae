@@ -1565,16 +1565,44 @@ int runSimpleFoamV2(const std::string& caseDir)
         std::vector<vector> UOut(nC);
         for (label c = 0; c < nC; ++c) UOut[c] = {ux[c], uy[c], uz[c]};
 
-        writeVolField<scalar>(src + "/p", outDir + "/p", pOut, fvp);
-        writeVolField<vector>(src + "/U", outDir + "/U", UOut, fvp);
+        // THE SOLVED BOUNDARY VALUES, not the start directory's. Every call here used to omit
+        // writeVolField's `computedBoundary` argument, which makes it ECHO the template it read -- so a
+        // V2 time directory carried the 0/ boundary on every patch the solve had moved. Measured on
+        // backwardFacingStep2D: the walls' nut came out `value uniform 0` (the 0/ placeholder) where
+        // the legacy driver writes the solved `nonuniform List<scalar>`, i.e. the wall function's
+        // viscosity was absent from the output. A restart from such a directory restarts from the wrong
+        // state, and any wall post-processing reads a zero that was never the answer.
+        DeviceBuffer<scalar> pB, uxB, uyB, uzB;
+        deviceBCValue(dbP, gf.p, pB);
+        deviceBCValue(dbU.comp[0], gf.Ux, uxB);
+        deviceBCValue(dbU.comp[1], gf.Uy, uyB);
+        deviceBCValue(dbU.comp[2], gf.Uz, uzB);
+        const std::vector<scalar> hpB = pB.host();
+        const std::vector<scalar> hxB = uxB.host(), hyB = uyB.host(), hzB = uzB.host();
+        std::vector<vector> UB(hxB.size());
+        for (std::size_t i = 0; i < hxB.size(); ++i) UB[i] = vector{hxB[i], hyB[i], hzB[i]};
+
+        writeVolField<scalar>(src + "/p", outDir + "/p", pOut, fvp, 16, hpB);
+        writeVolField<vector>(src + "/U", outDir + "/U", UOut, fvp, 16, UB);
         if (ras)
         {
             // SpalartAllmaras transports nuTilda in the k slot and has no second field.
             const std::string first = saModel ? "nuTilda" : "k";
-            writeVolField<scalar>(src + "/" + first, outDir + "/" + first, dK.host(), fvp);
+            DeviceBuffer<scalar> kB;
+            deviceBCValue(dbK, dK, kB);
+            writeVolField<scalar>(src + "/" + first, outDir + "/" + first, dK.host(), fvp, 16, kB.host());
             if (!saModel)
-                writeVolField<scalar>(src + "/" + secondField, outDir + "/" + secondField, dEps.host(), fvp);
-            writeVolField<scalar>(src + "/nut",     outDir + "/nut",     dNut.host(), fvp);
+            {
+                DeviceBuffer<scalar> eB;
+                deviceBCValue(dbEps, dEps, eB);
+                writeVolField<scalar>(src + "/" + secondField, outDir + "/" + secondField,
+                                      dEps.host(), fvp, 16, eB.host());
+            }
+            // nut's boundary is NOT a BC evaluation: the wall faces carry what the wall function
+            // computed, which is exactly what `nb` holds (deviceBoundaryNut writes the whole boundary
+            // there). Evaluating dbNut instead would put the `calculated` placeholder back on the walls.
+            writeVolField<scalar>(src + "/nut", outDir + "/nut", dNut.host(), fvp, 16,
+                                  nb.size() ? nb.host() : std::vector<scalar>());
         }
         // The second field is `omega` under kOmegaSST; the file was always written under its right name,
         // but this line claimed `epsilon` for every model.
