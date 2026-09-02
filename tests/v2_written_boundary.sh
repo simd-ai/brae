@@ -129,4 +129,30 @@ else
     say "backwardFacingStep2D missing -- wall-function arm skipped" SKIP
 fi
 
+
+# ---- FIELD relaxation follows OpenFOAM's "only when named" rule -----------------------------------
+# GeometricField::relax() starts at `relaxCoeff = 1` and applies a factor only when
+# solution::relaxField finds one -- `found(name) || found("default")` (solution.C:320-327). V2 defaulted
+# to 0.3 for p instead, so a case with no `relaxationFactors/fields` entry (backwardFacingStep2D, as
+# most SIMPLEC cases are) had its pressure correction cut to a third of OpenFOAM's. Measured: p 8.47
+# after one iteration against OpenFOAM's 28.07 (ratio 3.31 = 1/0.3), the outer p residual stalled at
+# 1.33e-01 where OpenFOAM sits at 3.75e-02, and at 400 iterations U was 1.78e-01 from OpenFOAM against
+# the legacy path's 9.15e-02. With the rule honoured: p residual 3.66e-02 and U 8.78e-02.
+#
+# The arm is a PAIR, because either half alone would pass on a bug: the case that names NO factor must
+# report 1, and the case that names 0.3 must report 0.3.
+for pair in "$ROOT/validation/backwardFacingStep2D:1" "$ROOT/validation/pitzDailyTurb:0.3"; do
+    cdir="${pair%%:*}"; want="${pair##*:}"
+    [ -d "$cdir/constant" ] || { say "$(basename "$cdir") missing -- relaxation arm skipped" SKIP; continue; }
+    RX=$(mktemp -d)
+    cp -r "$cdir"/0 "$cdir"/constant "$cdir"/system "$RX/" 2>/dev/null || cp -r "$cdir"/* "$RX/"
+    sed -i "s/^endTime.*/endTime 1;/;s/^writeInterval.*/writeInterval 1;/" "$RX/system/controlDict"
+    rout=$( cd "$RX" && BRAE_SIMPLEFOAM_V2=1 "$BIN" -case "$RX" 2>&1 || true )
+    echo "$rout" | grep -qE "relaxation: U [0-9.]+ \(equations\), p $want \(fields\)" \
+        && say "$(basename "$cdir"): p field relaxation is $want, as OpenFOAM reads it" ok \
+        || { echo "$rout" | grep -i relaxation | head -1; \
+             say "$(basename "$cdir"): p field relaxation is $want, as OpenFOAM reads it" FAIL; }
+    rm -rf "$RX"
+done
+
 [ $fail = 0 ] && echo PASS || { echo FAIL; exit 1; }

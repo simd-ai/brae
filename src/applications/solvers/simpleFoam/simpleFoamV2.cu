@@ -629,12 +629,28 @@ int runSimpleFoamV2(const std::string& caseDir)
     cpu::SimpleControlDict cd = cpu::readSimpleControl(fvSolution);
     cpu::SimpleControl ctl(cd);
 
-    scalar relaxU = 0.7, relaxP = 0.3;
+    // OF relaxes a FIELD only when the case NAMES a factor: GeometricField::relax() starts at
+    // `scalar relaxCoeff = 1` and applies one only `if (mesh().relaxField(name, relaxCoeff))`, which is
+    // `found(name) || found("default")` (solution.C:320-327). These defaulted to 0.7/0.3 instead, so a
+    // case with no `relaxationFactors/fields` entry -- backwardFacingStep2D is one, as most SIMPLEC
+    // cases are -- had its pressure correction cut to 0.3 of what OpenFOAM applies. Measured: after one
+    // iteration that left p at 8.47 against OpenFOAM's 28.07 and |U| at 4.51 against 14.72, a ratio of
+    // 3.31 = 1/0.3, and it cost roughly 3x the iterations to converge (V2 needed 3000 to reach the
+    // agreement OpenFOAM has at ~1000). This is the same "the case NAMES a factor, not the factor is
+    // below 1" rule the tree already applies to EQUATION relaxation, on the field side.
+    scalar relaxU = 1.0, relaxP = 1.0;
     if (const FoamDict* rf = fvSolution.subDict("relaxationFactors"))
     {
-        if (const FoamDict* eq = rf->subDict("equations")) relaxU = eq->scalarOr("U", relaxU);
-        if (const FoamDict* fl = rf->subDict("fields"))    relaxP = fl->scalarOr("p", relaxP);
+        // `default` is part of the same lookup in OpenFOAM, so a case that names only a default gets it.
+        if (const FoamDict* eq = rf->subDict("equations"))
+            relaxU = eq->scalarOr("U", eq->scalarOr("default", relaxU));
+        if (const FoamDict* fl = rf->subDict("fields"))
+            relaxP = fl->scalarOr("p", fl->scalarOr("default", relaxP));
     }
+    // SAID, not assumed. The other drivers print their relaxation and this one printed nothing, so the
+    // 0.3 it was applying to a case that names no field factor was invisible in the log.
+    std::printf("  relaxation: U %g (equations), p %g (fields)%s\n", (double)relaxU, (double)relaxP,
+                relaxP == 1.0 ? "  -- the case names none, so OpenFOAM relaxes p not at all" : "");
 
     const label endTime = static_cast<label>(controlDict.scalarOr("endTime", 100));
 
