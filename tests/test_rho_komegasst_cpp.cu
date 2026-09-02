@@ -274,6 +274,19 @@ int main(int argc, char** argv)
         cmp("stage_sstG",        res.G,      "G      = nut*GbyNu0");
         cmp("stage_sstCDkOmega", res.CD,     "CDkOmega");
         cmp("stage_sstF1",       res.f1,     "F1 blend");
+        {
+            // F1 ON THE PATCH FACES against OpenFOAM's own boundary field: the diffusivities' boundary
+            // coefficients blend this value, and on the inlet it differs from the owner cell's.
+            const FieldData<scalar> fd = readField<scalar>(D + "stage_sstF1");
+            const std::vector<std::vector<scalar>> ofB = rawBoundary<scalar>(fd, patches);
+            std::vector<scalar> a, b;
+            for (std::size_t pi = 0; pi < patches.size() && pi < res.f1Bnd.size(); ++pi)
+            {
+                if (patches[pi].type == "empty") continue;
+                for (label i = 0; i < patches[pi].size; ++i) { a.push_back(res.f1Bnd[pi][i]); b.push_back(ofB[pi][i]); }
+            }
+            report("F1 on the boundary faces", relL2(a, b), 1e-10);
+        }
         cmp("stage_sstF23",      res.f23,    "F23 blend");
     }
 

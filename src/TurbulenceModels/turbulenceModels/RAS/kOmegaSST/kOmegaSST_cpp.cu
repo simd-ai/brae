@@ -31,8 +31,9 @@ inline scalar blend(scalar F1, scalar psi1, scalar psi2) { return F1 * (psi1 - p
 // at an inlet differs from the adjacent cell by more than 10x. Interpolating the cell value there is the
 // same defect that put 90% of the kEpsilon epsilon residual on pitzDaily's inlet.
 //
-// F1 is likewise a volScalarField with its own boundary; this uses the OWNER CELL's F1 for the blend and
-// nut's true boundary value, which is the part that measurably moves the residual.
+// F1 is likewise a volScalarField with its own boundary, and the blend on a patch face takes F1's PATCH
+// value (F1Boundary) -- the owner cell's F1 was used until the inlet's 1% blend difference was found
+// to seed kOmegaSST's iteration-2 residual on rhoSST.
 SurfaceScalarField effectiveDiffusivity(
     const std::vector<scalar>&       DCell,
     const GeometricField<scalar>&    nutField,
@@ -49,7 +50,9 @@ SurfaceScalarField effectiveDiffusivity(
     // fvc::interpolate(rho*D), not interpolate(rho)*interpolate(D), which differ on non-uniform fields.
     const std::vector<scalar>*              rho    = nullptr,
     const std::vector<std::vector<scalar>>* rhoBnd = nullptr,
-    const std::vector<std::vector<scalar>>* nuBnd  = nullptr)
+    const std::vector<std::vector<scalar>>* nuBnd  = nullptr,
+    // F1 evaluated ON the patch faces (F1Boundary); null blends the owner cell's, the old arithmetic.
+    const std::vector<std::vector<scalar>>* f1Bnd  = nullptr)
 {
     static const bool dbg = std::getenv("BRAE_SST_DIFF_DEBUG") != nullptr;
     std::vector<scalar> DRho(DCell.size());
@@ -64,7 +67,8 @@ SurfaceScalarField effectiveDiffusivity(
             const label c = patches[pi].faceCells[i];
             const scalar was = sf.boundary[pi][i];
             const scalar nuF = nuBnd ? (*nuBnd)[pi][i] : nu;
-            sf.boundary[pi][i] = (blend(f1[c], alpha1, alpha2) * nb[i] + nuF)
+            const scalar f1Face = f1Bnd ? (*f1Bnd)[pi][i] : f1[c];
+            sf.boundary[pi][i] = (blend(f1Face, alpha1, alpha2) * nb[i] + nuF)
                                * (rhoBnd ? (*rhoBnd)[pi][i] : scalar(1.0));
             if (dbg && i == 5)
                 std::printf("      [Deff] patch %-12s face %d: interp %.6e -> nut_b %.6e (nut_b=%.3e)\n",
@@ -173,6 +177,55 @@ std::vector<scalar> F1(const std::vector<scalar>& k, const std::vector<scalar>& 
         const scalar arg1 = std::fmin(std::fmin(a, b), 10.0);
         const scalar a4 = arg1*arg1*arg1*arg1;                 // pow4
         out[c] = std::tanh(a4);
+    }
+    return out;
+}
+
+
+std::vector<std::vector<scalar>> F1Boundary(
+    const GeometricField<scalar>&           k,
+    const GeometricField<scalar>&           omega,
+    const std::vector<scalar>&              y,
+    const std::vector<vector>&              gradK,
+    const std::vector<vector>&              gradOmega,
+    scalar                                  nu,
+    const std::vector<std::vector<scalar>>* nuBnd,
+    const std::vector<FvPatch>&             patches,
+    const KOmegaSSTCoeffs&                  co)
+{
+    std::vector<std::vector<scalar>> out(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& p = patches[pi];
+        out[pi].assign(static_cast<std::size_t>(p.size), scalar(1));
+        if (p.type == "wall" || p.type == "empty") continue;   // wall: y = 0 -> arg1 = 10 -> F1 = 1
+        const std::vector<scalar>& kb = k.boundary[pi]->value();
+        const std::vector<scalar>& ob = omega.boundary[pi]->value();
+        for (label i = 0; i < p.size; ++i)
+        {
+            const label c = p.faceCells[i];
+            if (!(ob[i] > 0.0) || !(y[c] > 0.0)) continue;
+            // The Gauss gradients' boundary values: gb = gc + n*(snGrad - n&gc), for k and omega.
+            const vector& n = p.nf[i];
+            const scalar snK = (kb[i] - k.internal[c]) * p.deltaCoeffs[i];
+            const scalar snO = (ob[i] - omega.internal[c]) * p.deltaCoeffs[i];
+            const vector& gKc = gradK[c];
+            const vector& gOc = gradOmega[c];
+            const scalar nK = n.x*gKc.x + n.y*gKc.y + n.z*gKc.z;
+            const scalar nO = n.x*gOc.x + n.y*gOc.y + n.z*gOc.z;
+            const scalar gKx = gKc.x + n.x*(snK - nK), gKy = gKc.y + n.y*(snK - nK), gKz = gKc.z + n.z*(snK - nK);
+            const scalar gOx = gOc.x + n.x*(snO - nO), gOy = gOc.y + n.y*(snO - nO), gOz = gOc.z + n.z*(snO - nO);
+            const scalar CDb  = (2.0*co.alphaOmega2) * (gKx*gOx + gKy*gOy + gKz*gOz) / ob[i];
+            const scalar CDp  = std::fmax(CDb, 1.0e-10);
+            const scalar nuB  = nuBnd ? (*nuBnd)[pi][i] : nu;
+            const scalar yb   = y[c];
+            const scalar a = std::fmax((1.0/co.betaStar)*std::sqrt(std::fmax(kb[i], 0.0))/(ob[i]*yb),
+                                       500.0*nuB/(yb*yb*ob[i]));
+            const scalar b = (4.0*co.alphaOmega2)*kb[i]/(CDp*yb*yb);
+            const scalar arg1 = std::fmin(std::fmin(a, b), 10.0);
+            const scalar a4 = arg1*arg1*arg1*arg1;
+            out[pi][i] = std::tanh(a4);
+        }
     }
     return out;
 }
@@ -388,6 +441,10 @@ void correct(
     for (label c = 0; c < nC; ++c) nuCell[c] = nuAt(c);
     std::vector<scalar> f1 = F1(k.internal, omega.internal, y, CD, nuCell, co);
     if (res && res->captureStages) { res->CD = CD; res->f1 = f1; }
+    // F1 on the boundary faces, for the two diffusivities' boundary coefficients (see the header).
+    std::vector<std::vector<scalar>> f1Bnd =
+        F1Boundary(k, omega, y, gradK, gradOm, nu, comp ? comp->nuBnd : nullptr, patches, co);
+    if (res && res->captureStages) res->f1Bnd = f1Bnd;
     if (lm)
     {
         // kOmegaSSTLM::F1 = max(kOmegaSST::F1, F3), F3 = exp(-(Ry/120)^8), Ry = y*sqrt(k)/nu
@@ -423,7 +480,7 @@ void correct(
             effectiveDiffusivity(DomegaEff, nutField, f1, co.alphaOmega1, co.alphaOmega2,
                                  nu, m, g, patches,
                                  comp ? comp->rho : nullptr, comp ? comp->rhoBnd : nullptr,
-                                 comp ? comp->nuBnd : nullptr);
+                                 comp ? comp->nuBnd : nullptr, &f1Bnd);
 
         // fvMatrix's constructor calls psi.boundaryFieldRef().updateCoeffs(), and that is where
         // OpenFOAM's flux-conditional boundaries read the flux and set their valueFraction, and where the
@@ -553,7 +610,7 @@ void correct(
             effectiveDiffusivity(DkEff, nutField, f1, co.alphaK1, co.alphaK2,
                                  nu, m, g, patches,
                                  comp ? comp->rho : nullptr, comp ? comp->rhoBnd : nullptr,
-                                 comp ? comp->nuBnd : nullptr);
+                                 comp ? comp->nuBnd : nullptr, &f1Bnd);
 
         // fvMatrix's constructor calls psi.boundaryFieldRef().updateCoeffs(), and that is where
         // OpenFOAM's flux-conditional boundaries read the flux and set their valueFraction, and where the

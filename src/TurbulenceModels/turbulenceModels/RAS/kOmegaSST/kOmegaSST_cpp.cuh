@@ -94,6 +94,27 @@ inline std::vector<scalar> F2(const std::vector<scalar>& k, const std::vector<sc
 }
 
 // nut = a1*k/max(a1*omega, b1*F23*sqrt(S2)).
+// F1 ON THE BOUNDARY FACES, as the field expression behind DkEff(F1) = alphaK(F1)*nut + nu and
+// DomegaEff(F1) evaluates it there (kOmegaSSTBase.H:342-358, F1 at kOmegaSSTBase.C): from the patch k,
+// omega and nu, the owner cell's y (wallDist's y is zeroGradient on every non-wall patch,
+// patchDistMethod::patchTypes) and CDkOmega's own boundary value -- the Gauss gradients' patch-corrected
+// boundary values, gb = gc + n*(snGrad - n&gc). On a wall y is 0, every term of arg1 is unbounded and
+// min(., 10) makes F1 exactly 1, which is what OpenFOAM's field carries there. The diffusivities used to
+// blend the OWNER CELL's F1 on every patch face: on rhoSST's inlet OpenFOAM's patch F1 is 0.5220 against
+// the cells' 0.5291 (the inlet's fixed k and omega evaluate a different blend), and that 1% of the blend
+// in the laplacian's boundary coefficient was the seed of a residual that kOmegaSST alone showed from
+// iteration 2 -- the first iteration at which k and omega differ between the patch and its cell.
+std::vector<std::vector<scalar>> F1Boundary(
+    const GeometricField<scalar>&           k,
+    const GeometricField<scalar>&           omega,
+    const std::vector<scalar>&              y,
+    const std::vector<vector>&              gradK,
+    const std::vector<vector>&              gradOmega,
+    scalar                                  nu,
+    const std::vector<std::vector<scalar>>* nuBnd,
+    const std::vector<FvPatch>&             patches,
+    const KOmegaSSTCoeffs&                  co);
+
 std::vector<scalar> correctNut(const std::vector<scalar>& k, const std::vector<scalar>& omega,
                                const std::vector<scalar>& F23, const std::vector<scalar>& S2,
                                const KOmegaSSTCoeffs& co);
@@ -135,6 +156,7 @@ struct SSTResiduals
     // the residuals every outer iteration and would otherwise pay to copy every intermediate with them.
     bool captureStages = false;
     std::vector<scalar> divU, s2, gbyNu0, G, CD, f1, f23;
+    std::vector<std::vector<scalar>> f1Bnd;   // F1 on the boundary faces, per patch
     std::vector<tensor> gradU;
     // the assembled systems, before relax and after, plus the off-diagonals a per-cell view misses
     std::vector<scalar> omD0, omSrc0, omD, omSrc, omUpper, omLower;

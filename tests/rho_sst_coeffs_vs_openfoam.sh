@@ -144,8 +144,11 @@ say "the SST coefficients, Prt and omega relaxation reach the closure from the c
 # (:556-561). brae built those first, from the previous iteration's wall-cell omega. Invisible at t=1
 # (k uniform, grad(k) = 0) and on a converged state (the closure gate feeds one), it grew from a
 # 2e-08 seed at t=2 into k 1.3e-03 / omega 1.9e-03 by t=10. With the wall update first: k 1.2e-07 /
-# omega 6.5e-08 / nut 2.1e-07 at t=10, p/T/U ~1e-11. The 2e-08 seed itself is a separate lead (the
-# diffusivity's boundary F1, queued as 13g), which is why the bounds here sit at 1e-06 and not the floor.
+# omega 6.5e-08 / nut 2.1e-07 at t=10, p/T/U ~1e-11. The 2e-08 seed that remained was the
+# diffusivities blending the OWNER CELL's F1 on patch faces where OpenFOAM's field expression takes F1
+# evaluated from the patch k/omega (0.5220 against 0.5291 on rhoSST's inlet); with F1Boundary the whole
+# solve sits at ~1e-12 on every field through t=10 (k 8.7e-13, omega 5.8e-13), so the bounds are at the
+# floor. Fail-proofs: the old order reads k 1.3e-03 here, the owner-cell F1 alone k 1.2e-07.
 N10=10
 stage "$W/br_def10" "" ""; stage "$W/of_def10" "" ""
 for d in br_def10 of_def10; do
@@ -171,7 +174,7 @@ def read(p):
         return np.array([float(x) for x in m.group(3).split()])
     return np.array([[float(c) for c in v.split()] for v in re.findall(r'\(([^)]*)\)', m.group(3))])
 ok = True
-for f, bnd in (('k', 1e-06), ('omega', 1e-06), ('nut', 1e-06), ('T', 1e-09), ('U', 1e-09), ('p', 1e-09)):
+for f, bnd in (('k', 1e-10), ('omega', 1e-10), ('nut', 1e-10), ('T', 1e-10), ('U', 1e-10), ('p', 1e-10)):
     a = read(os.path.join(W, 'br_def10', N, f)); b = read(os.path.join(W, 'of_def10', N, f))
     r = float(np.linalg.norm(a - b) / np.linalg.norm(b)); good = r < bnd
     print('     default case at t=%s  %-5s brae vs OpenFOAM %.4e   (bound %.1e)   %s' % (N, f, r, bnd, 'ok' if good else 'FAIL'))
