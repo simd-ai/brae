@@ -31,13 +31,24 @@ namespace rhoSimple {
 //
 // `porosity` is CALLER-OWNED and must outlive the returned struct: RhoStepInput::porosity points into
 // it, and it is left inactive on a case with no porous zone.
+// The fvOptions CONSTRAINT buffers a case declares, per constrained field. Caller-owned, because
+// RhoStepInput and the turbulence hook only hold pointers into them.
+struct DeviceConstraints
+{
+    DeviceBuffer<label>  heMask,  kMask,  epsMask;
+    DeviceBuffer<scalar> heVal,   kVal,   epsVal;
+    bool hasHe = false, hasK = false, hasEps = false;
+};
+
 RhoStepInput buildDeviceStepInput(
     const cpu::rhoSimple::StepInput&        hin,
     const cpu::rhoSimple::RhoSimpleFields&  hf,
     const cpu::rhoSimple::CaseRefusals&     refusals,
     const RhoDeviceFields&                  dev,
     const std::vector<FvPatch>&             patches,
-    DevicePorosity&                         porosity);
+    DevicePorosity&                         porosity,
+    DeviceConstraints&                      constraints,
+    label                                   nCells);
 
 // One whole run on the device: `brae -case <dir>` with BRAE_RHOSIMPLEFOAM_MIRROR=cuda.
 int runMirrorCuda(const std::string& caseDir);

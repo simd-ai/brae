@@ -31,7 +31,9 @@ RhoStepInput buildDeviceStepInput(
     const cpu::rhoSimple::CaseRefusals&    refusals,
     const RhoDeviceFields&                 dev,
     const std::vector<FvPatch>&            patches,
-    DevicePorosity&                        porosity)
+    DevicePorosity&                        porosity,
+    DeviceConstraints&                     constraints,
+    label                                  nCells)
 {
     RhoStepInput in;
 
@@ -56,6 +58,59 @@ RhoStepInput buildDeviceStepInput(
         {
             in.hasFvOptions = true;
             if (in.fvOptionUnsupported.empty()) in.fvOptionUnsupported = o.unsupported;
+            continue;
+        }
+        // THE CONSTRAINTS. Not source terms: OpenFOAM applies them with fvMatrix::setValues, which also
+        // strips the coupling out of the neighbours' equations, and the device equations now do the
+        // same (deviceSetValues). Both were refused here as "implemented on the host arm only", which
+        // is what kept OpenFOAM's own angledDuctExplicitFixedCoeff off this arm.
+        if (o.type == "fixedTemperatureConstraint" || o.type == "scalarFixedValueConstraint")
+        {
+            std::vector<label>  mask(static_cast<std::size_t>(nCells), 0);
+            if (o.allCells) std::fill(mask.begin(), mask.end(), 1);
+            else for (label c : o.cells) if (c >= 0 && c < nCells) mask[static_cast<std::size_t>(c)] = 1;
+
+            if (o.type == "fixedTemperatureConstraint")
+            {
+                // OpenFOAM pins he(p, Tuniform), NOT the temperature: setValues on the energy equation
+                // takes an energy, and putting a temperature there is a 400x error that still converges.
+                const scalar heVal = hConstTToHe(o.Tuniform, hf.thermo);
+                constraints.heMask.copyFrom(mask);
+                constraints.heVal.copyFrom(std::vector<scalar>(static_cast<std::size_t>(nCells), heVal));
+                constraints.hasHe = true;
+                std::printf("  fvOptions `%s`: fixedTemperatureConstraint T=%g K -> he=%g on %d cells\n",
+                            o.name.c_str(), (double)o.Tuniform, (double)heVal,
+                            o.allCells ? (int)nCells : (int)o.cells.size());
+                continue;
+            }
+            // scalarFixedValueConstraint: one entry per field it names. k and epsilon are the two the
+            // device closure can pin; any other field has no device consumer and refuses by name.
+            for (const auto& fv : o.fieldValues)
+            {
+                const std::vector<scalar> vals(static_cast<std::size_t>(nCells), fv.second);
+                if (fv.first == "k")
+                {
+                    constraints.kMask.copyFrom(mask); constraints.kVal.copyFrom(vals);
+                    constraints.hasK = true;
+                }
+                else if (fv.first == "epsilon")
+                {
+                    constraints.epsMask.copyFrom(mask); constraints.epsVal.copyFrom(vals);
+                    constraints.hasEps = true;
+                }
+                else
+                {
+                    in.hasFvOptions = true;
+                    if (in.fvOptionUnsupported.empty())
+                        in.fvOptionUnsupported =
+                            "scalarFixedValueConstraint on `" + fv.first + "` (the device equations "
+                            "constrain he, k and epsilon; this field has no device consumer)";
+                    continue;
+                }
+                std::printf("  fvOptions `%s`: scalarFixedValueConstraint %s=%g on %d cells\n",
+                            o.name.c_str(), fv.first.c_str(), (double)fv.second,
+                            o.allCells ? (int)nCells : (int)o.cells.size());
+            }
             continue;
         }
         if (o.type != "explicitPorositySource")
@@ -110,6 +165,7 @@ RhoStepInput buildDeviceStepInput(
                     o.fixedCoeff ? "fixedCoeff" : "DarcyForchheimer", (int)o.cells.size());
     }
     in.porosity = porosity.active ? &porosity : nullptr;
+    if (constraints.hasHe) { in.fvoHeMask = &constraints.heMask; in.fvoHeVal = &constraints.heVal; }
 
     // limitTemperature, projected onto the device's OWN form. deriveCaseRefusals resolves this option
     // OUT of the option list (it sets limitT/limitTmin/limitTmax and fvOptions::read never lists it),
@@ -245,8 +301,10 @@ int runMirrorCuda(const std::string& caseDir)
     }
 
     RhoDeviceFields dev = createDeviceFields(hf, m, g, patches);
-    DevicePorosity porosity;   // outlives gin: RhoStepInput::porosity points into it
-    RhoStepInput gin = buildDeviceStepInput(hin, hf, refusals, dev, patches, porosity);
+    DevicePorosity porosity;        // outlives gin: RhoStepInput::porosity points into it
+    DeviceConstraints constraints;  // ...and so do the fvOptions constraint masks
+    RhoStepInput gin =
+        buildDeviceStepInput(hin, hf, refusals, dev, patches, porosity, constraints, nC);
     // The AMG hierarchy cache: built once per mesh, reloaded on every later run in the same case
     // directory. The agglomeration is the AMG build cost and is static per mesh, so this is pure
     // set-up time -- and it is now safe to use: the cache's load path did not rebuild the Galerkin
@@ -288,6 +346,8 @@ int runMirrorCuda(const std::string& caseDir)
         turbOpt.relaxEquationK   = hin.relaxEquationK;   turbOpt.relaxK   = hin.relaxK;
         turbOpt.relaxEquationEps = hin.relaxEquationEps; turbOpt.relaxEps = hin.relaxEpsilon;
         turbOpt.tol = hin.tolTurb; turbOpt.relTol = hin.relTolTurb; turbOpt.maxIter = hin.maxIter;
+        if (constraints.hasK)   { turbOpt.fvoKMask   = &constraints.kMask;   turbOpt.fvoKVal   = &constraints.kVal; }
+        if (constraints.hasEps) { turbOpt.fvoEpsMask = &constraints.epsMask; turbOpt.fvoEpsVal = &constraints.epsVal; }
 
         gin.correct = [&]()
         {

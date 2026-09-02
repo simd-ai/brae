@@ -1,6 +1,7 @@
 // CUDA implementation -- see rhoEEqn.cuh for the provenance and the contract. Every term is transcribed
 // from rhoEEqn_cpp.cu in the order that file produces it.
 #include "rhoEEqn.cuh"
+#include "device_fvoptions.cuh"   // deviceSetValues: fvOptions.constrain(EEqn)
 #include "device_blas.cuh"
 #include "device_simple.cuh"
 #include <cuda_runtime.h>
@@ -347,6 +348,7 @@ void assembleEEqn(
         deviceHadamard(t, delta, he);
         deviceAxpy(1.0, t, E.source);
     }
+
     E.faceFluxCorr.resize(0);
 }
 

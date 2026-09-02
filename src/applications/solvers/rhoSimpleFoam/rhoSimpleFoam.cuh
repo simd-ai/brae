@@ -186,6 +186,13 @@ struct RhoStepInput
     // that case. Null means the case has none; `hasFvOptions` continues to mean an UNPORTED one.
     const DevicePorosity* porosity = nullptr;
 
+    // fvOptions CONSTRAINTS, which are not sources: OpenFOAM applies them with fvMatrix::setValues, so
+    // they also strip the coupling out of the neighbours' equations. Per-cell mask + the value pinned.
+    //   he:          fixedTemperatureConstraint, as the ENERGY he(p, Tuniform)
+    //   k / epsilon: scalarFixedValueConstraint naming that field
+    const DeviceBuffer<label>*  fvoHeMask  = nullptr;
+    const DeviceBuffer<scalar>* fvoHeVal   = nullptr;
+
     // limitTemperature (fvOptions/corrections/limitTemperature). A CORRECTION, not a source: it has no
     // addSup and no constrain, so no assembly changes -- it acts only as fvOptions.correct(he) AFTER the
     // energy solve and BEFORE thermo.correct(), which is what makes it show up in T at all. The bounds

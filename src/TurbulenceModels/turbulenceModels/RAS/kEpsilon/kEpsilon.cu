@@ -6,6 +6,7 @@
 // arithmetic it is reused; where the legacy kernel groups the arithmetic differently, or encodes a
 // substitution this module refuses, a new kernel is written and the reason is recorded above it.
 #include "kEpsilon.cuh"
+#include "device_fvoptions.cuh"   // deviceSetValues: fvMatrix::setValues, shared with the energy equation
 #include "device_pcg.cuh"
 #include "device_blas.cuh"      // deviceAxpy / deviceCopy / deviceHadamard
 #include "device_simple.cuh"    // deviceRelaxDiag -- fvMatrix::relax, already gated
@@ -192,88 +193,8 @@ __global__ void kReactionKernel(
 // transfers. This version transfers both. The difference lands ONLY in the source of a constrained cell,
 // and the fourth kernel overwrites exactly those with value*diag -- so the two agree everywhere the
 // result survives. Faces between a constrained and a free cell transfer once either way.
-__global__ void svGatherKernel(
-    int           nC,
-    const label*  mask,
-    const scalar* value,
-    const label*  ownerStart,
-    const label*  losort,
-    const label*  losortStart,
-    const label*  own,
-    const label*  nei,
-    const scalar* upper,
-    const scalar* lower,
-    scalar*       source)
-{
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= nC) return;
-    if (!mask[c]) return;
-    const scalar v = value[c];
-
-    for (label q = ownerStart[c]; q < ownerStart[c + 1]; ++q)         // c is the owner of face q
-    {
-        atomicAdd(&source[nei[q]], -lower[q] * v);
-    }
-    for (label s = losortStart[c]; s < losortStart[c + 1]; ++s)       // c is the neighbour
-    {
-        const label f = losort[s];
-        atomicAdd(&source[own[f]], -upper[f] * v);
-    }
-}
-
-
-__global__ void svZeroFaceKernel(
-    int          nIf,
-    const label* own,
-    const label* nei,
-    const label* mask,
-    scalar*      upper,
-    scalar*      lower)
-{
-    const int f = blockIdx.x * blockDim.x + threadIdx.x;
-    if (f >= nIf) return;
-    if (mask[own[f]] || mask[nei[f]])
-    {
-        upper[f] = scalar(0.0);
-        lower[f] = scalar(0.0);
-    }
-}
-
-
-// Every BOUNDARY face of a constrained cell loses its coefficients too -- including a face on a patch
-// that has nothing to do with the wall function. Without this an outlet div(phi) coefficient on a
-// wall/outlet corner cell is folded into the diagonal at solve time and pulls the pinned cell off its
-// value.
-__global__ void svBndKernel(
-    int          nB,
-    const label* bndCell,
-    const label* mask,
-    scalar*      iC,
-    scalar*      bC)
-{
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= nB) return;
-    if (!mask[bndCell[i]]) return;
-    iC[i] = scalar(0.0);
-    bC[i] = scalar(0.0);
-}
-
-
-// ...and only THEN psi and the source, so that adjacent constrained cells cannot corrupt each other's.
-__global__ void svCellKernel(
-    int           nC,
-    const label*  mask,
-    const scalar* value,
-    const scalar* diag,
-    scalar*       psi,
-    scalar*       source)
-{
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= nC) return;
-    if (!mask[c]) return;
-    psi[c]    = value[c];
-    source[c] = value[c] * diag[c];
-}
+// The four setValues kernels moved to device_fvoptions.cu: the energy equation applies the same
+// constraint, and one matrix manipulation this delicate should have one implementation.
 
 
 // Foam::bound, area-weighted. OF's fvc::average is surfaceSum(magSf*ssf)/surfaceSum(magSf)
@@ -856,21 +777,7 @@ void finishAndSolve(
     auto applySetValues = [&](const DeviceBuffer<label>* mask, const DeviceBuffer<scalar>* val)
     {
         if (!mask || !val) return;
-        svGatherKernel<<<nBlk(nC), TPB>>>(nC, mask->data(), val->data(), dm.ownerStart.data(),
-                                          dm.losort.data(), dm.losortStart.data(), dm.owner.data(),
-                                          dm.nei.data(), M.upper.data(), M.lower.data(), M.source.data());
-        cudaCheck(cudaGetLastError(), "kEpsilon setValues gather");
-        svZeroFaceKernel<<<nBlk(nIf), TPB>>>(nIf, dm.owner.data(), dm.nei.data(), mask->data(),
-                                             M.upper.data(), M.lower.data());
-        cudaCheck(cudaGetLastError(), "kEpsilon setValues zero faces");
-        if (nB)
-        {
-            svBndKernel<<<nBlk(nB), TPB>>>(nB, dm.bndCell.data(), mask->data(), M.iC.data(), M.bC.data());
-            cudaCheck(cudaGetLastError(), "kEpsilon setValues zero boundary");
-        }
-        svCellKernel<<<nBlk(nC), TPB>>>(nC, mask->data(), val->data(), M.diag.data(), field.data(),
-                                        M.source.data());
-        cudaCheck(cudaGetLastError(), "kEpsilon setValues cells");
+        deviceSetValues(dm, *mask, *val, M.diag, M.upper, M.lower, M.source, M.iC, M.bC, field);
     };
     applySetValues(fvoMask, fvoVal);
     applySetValues(wallMask, wallVal);

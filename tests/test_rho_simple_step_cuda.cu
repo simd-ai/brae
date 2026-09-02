@@ -327,9 +327,10 @@ int main(int argc, char** argv)
     // which was wrong: rhoUEqn.cu applies a porous zone and says so in its own refusal. The builder
     // projects it (and refuses, per option, what has no device consumer); the harness then overrides
     // only what a GATE needs differently, immediately below.
-    static DevicePorosity ginPorosity;   // outlives gin: gin.porosity points into it
+    static DevicePorosity ginPorosity;                       // outlives gin: gin.porosity points into it
+    static gpu::rhoSimple::DeviceConstraints ginConstraints;  // ...and the fvOptions constraint masks
     gpu::rhoSimple::RhoStepInput gin =
-        gpu::rhoSimple::buildDeviceStepInput(hin, hf, cr, dev, fvp, ginPorosity);
+        gpu::rhoSimple::buildDeviceStepInput(hin, hf, cr, dev, fvp, ginPorosity, ginConstraints, nC);
     // constrainHbyA's mask and adjustPhi's mask, from the projection. They answer DIFFERENT questions
     // and rhoCreateFields.cu is where that distinction is made once.
     // A GATE pins the linear solve so it is out of the comparison; the SOLVER reads the case's own

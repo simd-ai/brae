@@ -32,6 +32,7 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_rho_simple_step_cpp"
+MIRRORBIN="${BUILD:-$ROOT/build}/brae_rhoSimpleFoam"
 OFBASHRC=${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
 
 [ -x "$BIN" ]      || { echo "SKIP: $BIN not built"; exit 77; }
@@ -97,4 +98,63 @@ N=$(grep -oE "SIMPLE solution converged in [0-9]+ iterations" of.log | grep -oE 
 echo "  OpenFOAM converged in $N iterations"
 
 rm -rf 0 && cp -r 0.orig 0
+# The host end-to-end comparison's status is CAPTURED, not left as the script's exit code: the CUDA arm
+# below runs after it, and appending anything after the last command silently makes that command's
+# failure invisible. (This gate is not registered in CMakeLists, so nothing was watching it.)
 "$BIN" "$W/case" 0 "$N"
+hostrc=$?
+
+# ---- THE CUDA ARM: the same tutorial, with the device modules ------------------------------------
+# This case declares THREE fvOptions -- explicitPorositySource/fixedCoeff, fixedTemperatureConstraint
+# and scalarFixedValueConstraint(k, epsilon) -- and the CUDA arm used to refuse ALL of them ("the case
+# declares an fvOption this port does not implement"), even though rhoUEqn has applied a porous zone
+# since it was written. The porosity is projected now (buildDeviceStepInput) and the two CONSTRAINTS
+# are applied with fvMatrix::setValues on the device (deviceSetValues, shared with the kEpsilon
+# closure), so the tutorial runs on this arm at all.
+#
+# The check is the CONSTRAINT ITSELF, not just "it ran": k must come out pinned to 1 on every cell of
+# the porous zone, and on the SAME number of cells as the host arm -- which is the arm the end-to-end
+# gates measure against OpenFOAM. A run that quietly dropped the constraint would still finish.
+CU="$W/cuda"; rm -rf "$CU"; cp -r "$W/case" "$CU"
+rm -rf "$CU"/[1-9]* "$CU"/0; cp -r "$CU/0.orig" "$CU/0" 2>/dev/null || true
+python3 - "$CU/system/controlDict" <<'PYEOF'
+import re, sys
+c = sys.argv[1]; s = open(c).read()
+for k, v in [('endTime', '5'), ('writeInterval', '5'), ('writeControl', 'timeStep'),
+             ('writeFormat', 'ascii'), ('writePrecision', '15'), ('startFrom', 'startTime')]:
+    s = re.sub(r'^%s .*' % k, '%-15s %s;' % (k, v), s, flags=re.M)
+open(c, 'w').write(s)
+PYEOF
+cuout=$( cd "$CU" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$MIRRORBIN" -case "$CU" 2>&1 )
+echo "$cuout" | grep -q "^End" \
+    && echo "$cuout" | grep -q "fixedTemperatureConstraint T=" \
+    && echo "$cuout" | grep -q "scalarFixedValueConstraint k=" \
+    && echo "$cuout" | grep -q "explicitPorositySource/fixedCoeff" \
+    && echo "  cuda arm: the tutorial runs with all three fvOptions applied   ok" \
+    || { echo "$cuout" | tail -4; echo "FAIL: the CUDA arm did not run the tutorial with its fvOptions"; exit 1; }
+
+HO="$W/host"; rm -rf "$HO"; cp -r "$CU" "$HO"; rm -rf "$HO"/[1-9]*
+( cd "$HO" && BRAE_RHOSIMPLEFOAM_MIRROR=1 "$MIRRORBIN" -case "$HO" > host.log 2>&1 ) \
+    || { tail -4 "$HO/host.log"; echo "FAIL: the host arm did not run the tutorial"; exit 1; }
+CUDA_K="$CU/5/k" HOST_K="$HO/5/k" python3 - <<'PYEOF' || exit 1
+import os, re, sys
+import numpy as np
+def read(p):
+    s = open(p).read()
+    m = re.search(r'internalField\s+nonuniform\s+List<scalar>\s*\n?(\d+)\s*\n\((.*?)\n\)\s*;', s, re.S)
+    return None if not m else np.array([float(x) for x in m.group(2).split()])
+a, b = read(os.environ['CUDA_K']), read(os.environ['HOST_K'])
+if a is None or b is None or a.shape != b.shape:
+    print('  k missing or shape mismatch   FAIL'); sys.exit(1)
+na = int(np.sum(np.abs(a - 1.0) < 1e-9)); nb = int(np.sum(np.abs(b - 1.0) < 1e-9))
+print('  cells with k pinned to the constrained 1.0: cuda %d, host %d' % (na, nb))
+if na == 0:
+    print('  the CUDA arm pinned NOTHING -- the constraint was dropped   FAIL'); sys.exit(1)
+if na != nb:
+    print('  the two arms pin different cells   FAIL'); sys.exit(1)
+sys.exit(0)
+PYEOF
+echo "  cuda arm: the k constraint pins the same cells as the host arm   ok"
+
+[ "$hostrc" = 0 ] || { echo "FAIL: the host end-to-end comparison above did not pass (exit $hostrc)"; exit "$hostrc"; }
+echo PASS

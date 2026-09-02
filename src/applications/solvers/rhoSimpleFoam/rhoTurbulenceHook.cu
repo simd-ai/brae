@@ -129,6 +129,8 @@ void correctTurbulence(
     kin.relaxEquationK   = opt.relaxEquationK;   kin.relaxK   = opt.relaxK;
     kin.relaxEquationEps = opt.relaxEquationEps; kin.relaxEps = opt.relaxEps;
     kin.tol = opt.tol; kin.relTol = opt.relTol; kin.maxIter = opt.maxIter;
+    kin.fvoKMask   = opt.fvoKMask;    kin.fvoKVal   = opt.fvoKVal;
+    kin.fvoEpsMask = opt.fvoEpsMask;  kin.fvoEpsVal = opt.fvoEpsVal;
 
     kEpsilonRAS::correct(f.k, f.epsilon, f.nut, f.nutBnd, &f.alphat, &f.alphatBnd,
                          buf.stages, dm, dbU,

@@ -1,5 +1,6 @@
 // CUDA driver for rhoSimpleFoam. See rhoSimpleFoam.cuh for the provenance, the order and the contract.
 #include "rhoSimpleFoam.cuh"
+#include "device_fvoptions.cuh"   // deviceSetValues: fvOptions.constrain(EEqn)
 #include "pEqn.cuh"              // correctVelocity, relaxField -- the stages that ARE shared
 #include "device_pcg.cuh"
 #include "device_blas.cuh"
@@ -377,6 +378,17 @@ Residuals rhoSimpleStep(
 
         PressureMatrix E;
         assembleEEqn(E, dm, dbHe, f.he, ein);
+
+        // fvOptions.constrain(EEqn) -- EEqn.H:20, on the ASSEMBLED matrix and before the solve, which
+        // is where OpenFOAM applies it. fixedTemperatureConstraint is what lands here, and OpenFOAM
+        // pins he(p, Tuniform), not the temperature: setValues on the energy equation takes an ENERGY.
+        // The driver converts, because only it knows the thermo. Applied here rather than inside
+        // assembleEEqn because setValues writes psi as well as the matrix, and the assembly takes he
+        // by const reference -- the solve owns it.
+        if (in.fvoHeMask && in.fvoHeVal
+            && in.fvoHeMask->size() == static_cast<std::size_t>(dm.nCells))
+            deviceSetValues(dm, *in.fvoHeMask, *in.fvoHeVal, E.diag, E.upper, E.lower, E.source,
+                            E.iC, E.bC, f.he);
 
         DeviceBuffer<scalar> diagC, b;
         deviceFold(dm, E.diag, E.source, E.iC, E.bC, diagC, b);
