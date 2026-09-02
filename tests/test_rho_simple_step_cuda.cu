@@ -250,9 +250,12 @@ int main(int argc, char** argv)
     {
         const FieldDivScheme dU  = parseFieldDivScheme(caseDir, "U");
         const FieldDivScheme dHe = parseFieldDivScheme(caseDir, hf.heName);
+        // The kinetic-energy term's OWN entry (div(phi,Ekp) on e, div(phi,K) on h), as buildStepInput
+        // reads it -- this line used to copy the energy entry.
+        const FieldDivScheme dKE = parseFieldDivScheme(caseDir, hf.heName == "e" ? "Ekp" : "K");
         hin.boundedU  = dU.bounded;
         hin.boundedHe = dHe.bounded;
-        hin.boundedKE = dHe.bounded;   // div(phi,Ekp) follows the energy entry in every tutorial
+        hin.boundedKE = dKE.bounded;
     }
     // laplacianSchemes/snGradSchemes FROM THE CASE. This was `= false` with a comment naming the
     // fixture's `Gauss linear orthogonal` -- a hardcode, so pointing this binary at a corrected case

@@ -70,10 +70,19 @@ StepInput buildStepInput(
                     : (dU.limited      ? DivScheme::limitedLinear : DivScheme::upwind);
         in.schemeHe = dHe.linearUpwind ? DivScheme::linearUpwind
                     : (dHe.limited     ? DivScheme::limitedLinear : DivScheme::upwind);
-        in.schemeKE      = in.schemeHe;   // div(phi,Ekp) follows the energy entry in every tutorial
+        // THE KINETIC-ENERGY TERM'S OWN ENTRY. EEqn.H builds fvc::div(phi, Ekp) on an e-thermo and
+        // fvc::div(phi, K) on an h-thermo, and OpenFOAM resolves each under its own key, div(phi,Ekp) or
+        // div(phi,K). This used to copy the energy entry with the note "follows the energy entry in
+        // every tutorial" -- true of every tutorial and every fixture, which is exactly why a case that
+        // separates the two was never seen: it ran the energy scheme on K under the case's own name.
+        // Parsed like the others; a scheme the energy equation has not ported refuses there by name.
+        const std::string keName = (f.heName == "e") ? "Ekp" : "K";
+        const FieldDivScheme dKE = parseFieldDivScheme(caseDir, keName);
+        in.schemeKE = dKE.linearUpwind ? DivScheme::linearUpwind
+                    : (dKE.limited     ? DivScheme::limitedLinear : DivScheme::upwind);
         in.boundedU      = dU.bounded;
         in.boundedHe     = dHe.bounded;
-        in.boundedKE     = dHe.bounded;
+        in.boundedKE     = dKE.bounded;
         in.schemeCoeffU  = dU.coeff;      // RAW k: the weights functions compute twoByk (scheme_parse.cuh)
 
         DeviceSimpleControls sctl;
@@ -82,10 +91,12 @@ StepInput buildStepInput(
         in.gradULimitK        = sctl.gradULimitK;
         in.gradKLimitK        = sctl.gradKLimitK;
         if (verbose)
-            std::printf("  schemes: div(phi,U) lu=%d bounded=%d | grad(U) cellLimited k=%g | "
-                        "laplacian corrected=%d\n",
-                        (int)dU.linearUpwind, (int)dU.bounded, (double)in.gradULimitK,
-                        (int)in.correctedLaplacian);
+            std::printf("  schemes: div(phi,U) lu=%d bounded=%d | div(phi,%s) lu=%d bounded=%d | "
+                        "div(phi,%s) lu=%d bounded=%d | grad(U) cellLimited k=%g | laplacian corrected=%d\n",
+                        (int)dU.linearUpwind, (int)dU.bounded,
+                        f.heName.c_str(), (int)dHe.linearUpwind, (int)dHe.bounded,
+                        keName.c_str(), (int)dKE.linearUpwind, (int)dKE.bounded,
+                        (double)in.gradULimitK, (int)in.correctedLaplacian);
     }
 
     in.relaxU             = re  ? re->scalarOr("U", 1.0) : 1.0;

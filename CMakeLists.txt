@@ -1710,6 +1710,12 @@ add_test(NAME rho_simplec_rhorelax_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_simplec_rhorelax_vs_openfoam.sh)
 set_tests_properties(rho_simplec_rhorelax_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
+# div(phi,K)/div(phi,Ekp) is read from its OWN fvSchemes entry, not copied from the energy entry --
+# both mirror arms vs real OpenFOAM in both directions, plus the by-name refusal on K alone.
+add_test(NAME rho_ke_scheme_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_ke_scheme_vs_openfoam.sh)
+set_tests_properties(rho_ke_scheme_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
 add_test(NAME tpm_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/tpm_vs_openfoam.sh)
 set_tests_properties(tpm_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
