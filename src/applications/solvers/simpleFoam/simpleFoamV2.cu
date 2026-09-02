@@ -17,6 +17,8 @@
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
 #include "device_kepsilon.cuh"
+#include "device_blas.cuh"        // deviceCopy -- the nutLowRe wall zeroing keeps the other faces
+#include "turbulence_setup.cuh"   // selectNutWall: the nut wall function the 0/nut BC chooses
 #include "device_komega_sst.cuh"    // deviceKOmegaSSTCorrect building blocks + KOmegaSSTCoeffs
 #include "komega_sst_coeffs.cuh"
 #include "kOmegaSSTLM_cpp.cuh"   // the LM coefficient reader; the reference this port was gated against
@@ -747,6 +749,14 @@ int runSimpleFoamV2(const std::string& caseDir)
     DeviceBoundary dbK, dbEps, dbNut;
     DeviceBuffer<label> bndIsWall;
     DeviceBuffer<scalar> bndY;
+    // THE NUT WALL FUNCTION THE CASE ASKS FOR. This driver had no selector at all: refreshBoundaryNut
+    // ran the k-based deviceBoundaryNut whatever 0/nut said, and every turbulence correct() below was
+    // handed `nutWall = 0` (nutk) for its near-wall production. So a nutUBlendedWallFunction case got
+    // BOTH the wall viscosity and the near-wall G0 from the wrong formula -- measured on
+    // backwardFacingStep2D as a wall nut of 0.000e+00 where the dispatching path gives up to 1.5e-01.
+    // Derived through the SAME selectNutWall the other drivers use (turbulence_setup.cuh), so the two
+    // cannot disagree about what the case asked for.
+    NutWall v2NutWall = NutWall::Nutk;
     scalar relaxK = 0.7, relaxEps = 0.7;
     // k/epsilon linear-solver settings, read from fvSolution below. Declared here because the turbulence
     // hook is a lambda defined above that point and captures them by reference; it does not run until the
@@ -821,13 +831,40 @@ int runSimpleFoamV2(const std::string& caseDir)
         // Running deviceBoundaryNut first would overwrite nb with cell values, destroying the previous
         // WALL nut that Spalding's Newton warm-starts from -- OpenFOAM seeds it from nut_ itself, and
         // seeding from the adjacent cell instead leaves the wall 14% out at convergence.
-        if (!saModel)
+        // The BC's own function, not the k-based one for everything. Each kernel rewrites every WALL
+        // face and leaves the rest to the branch below, exactly as the dispatching driver does.
+        if (!saModel && v2NutWall == NutWall::Spalding)
+        {
+            SpalartAllmarasCoeffs dsp;
+            dsp.kappa = keCoeffs.kappa;
+            dsp.E     = keCoeffs.E;
+            deviceBoundaryNutSpalding(dbU, bndIsWall, bndY, gf.Ux, gf.Uy, gf.Uz,
+                                      dNut, nu, dsp, nb, nullptr, nullptr);
+        }
+        else if (!saModel && v2NutWall == NutWall::Blended)
+            deviceBoundaryNutBlended(dbU, bndIsWall, bndY, gf.Ux, gf.Uy, gf.Uz, dNut, nu,
+                                     keCoeffs.kappa, keCoeffs.E, nb, nullptr, nullptr);
+        else if (!saModel && v2NutWall == NutWall::NutU)
+            deviceBoundaryNutU(dbU, bndIsWall, bndY, gf.Ux, gf.Uy, gf.Uz, dNut, nu,
+                               keCoeffs.kappa, keCoeffs.E, nb, nullptr, nullptr);
+        else if (!saModel)
         deviceBoundaryNut(dbNut, bndIsWall, bndY, dK, dNut, nu, nb,
                           keCoeffs, atmZ0, atmBoundNut,
                           /*nuFace*/nullptr,
                           keNut ? &nutCalcMask : nullptr,
                           keNut ? &nutKb : nullptr,
                           keNut ? &nutEb : nullptr);
+        // nutLowReWallFunction: calcNut() is Zero UNCONDITIONALLY on every model. The k-based branch
+        // above still runs in full so the calculated/inlet faces keep their values; only the WALL faces
+        // are then zeroed, which is what OpenFOAM writes there.
+        if (!saModel && v2NutWall == NutWall::LowRe && bndIsWall.size() == nb.size())
+        {
+            DeviceBuffer<scalar> keepNb;
+            deviceCopy(keepNb, nb);
+            cudaCheck(cudaMemsetAsync(nb.data(), 0, nb.size()*sizeof(scalar), cudaStreamPerThread),
+                      "v2 nutLowRe wall nut");
+            deviceSelectFixedFlux(bndIsWall, keepNb, nb);   // non-wall faces keep what they had
+        }
 
         // SpalartAllmaras: nut_ = nuTilda*fv1 is a FIELD ASSIGNMENT, so EVERY boundary face takes
         // nuTilda's own patch value -- not the adjacent cell's, which is what deviceBoundaryNut leaves
@@ -959,6 +996,8 @@ int runSimpleFoamV2(const std::string& caseDir)
         if (atmZ0 > 0)
             std::printf("  nut wall function: atmNutkWallFunction (rough, z0=%g, boundNut=%s)\n",
                         (double)atmZ0, atmBoundNut ? "true" : "false");
+        selectNutWall(nutFd, fvp, saModel, saModel ? "SpalartAllmaras" : (sstModel ? "kOmegaSST" : "kEpsilon"),
+                      v2NutWall, atmZ0, atmBoundNut);
         kF.evaluateBoundary();
         if (!saModel) epsF.evaluateBoundary();
         nutF.evaluateBoundary();
@@ -1240,7 +1279,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                                        // kOmegaSSTLM: F1 = max(F1, F3), Pk *= gammaIntEff and
                                        // epsilonByk *= clamp(gammaIntEff, 0.1, 1). Null on plain SST.
                                        lmModel ? dGammaIntEff.data() : nullptr,
-                                       /*nutWall*/0, atmZ0, atmBoundNut,
+                                       static_cast<int>(v2NutWall), atmZ0, atmBoundNut,   // near-wall G0 uses the BC-chosen wall nut
                                        /*kDdt*/{}, /*sDdt*/{},
                                        /*des*/false, /*iddes*/false, /*hmax*/nullptr, /*hwn*/nullptr,
                                        /*rho*/nullptr, /*muLam*/nullptr,
@@ -1270,7 +1309,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                                   /*linearUpwindK*/false, /*linearUpwindEps*/false, /*nonOrth*/false,
                                   gsKE, gsKE,
                                   /*ami*/nullptr, /*cyc*/nullptr,
-                                  /*nutWall*/0, atmZ0, atmBoundNut,
+                                  static_cast<int>(v2NutWall), atmZ0, atmBoundNut,   // near-wall G0 uses the BC-chosen wall nut
                                   /*kDdt*/{}, /*eDdt*/{},
                                   /*rho*/nullptr, /*muLam*/nullptr,
                                   /*rhoBnd*/nullptr, /*nuWallFace*/nullptr,

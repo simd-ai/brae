@@ -101,4 +101,32 @@ else
     say "no OpenFOAM -- restart arm skipped" SKIP
 fi
 
+
+# ---- the nut WALL FUNCTION the case selects, honoured rather than substituted ---------------------
+# simpleFoamV2 had no selector at all: refreshBoundaryNut ran the k-based deviceBoundaryNut whatever
+# 0/nut asked for, and every turbulence correct() was handed `nutWall = 0` (nutk) for its near-wall
+# production. On backwardFacingStep2D (kOmegaSST + nutUBlendedWallFunction) that produced a wall nut of
+# exactly 0.000e+00; with the BC honoured it reads 3.07e-03. The selector is the SAME selectNutWall the
+# other drivers use, so the two cannot disagree about what the case asked for.
+BFS="$ROOT/validation/backwardFacingStep2D"
+if [ -d "$BFS/constant" ]; then
+    B2=$(mktemp -d)
+    cp -r "$BFS/0" "$BFS/constant" "$BFS/system" "$B2/"
+    sed -i "s/^endTime.*/endTime $ITERS;/;s/writeInterval.*/writeInterval $ITERS;/" "$B2/system/controlDict"
+    if ( cd "$B2" && BRAE_SIMPLEFOAM_V2=1 "$BIN" -case "$B2" > bfs.log 2>&1 ); then
+        grep -q "nutUBlendedWallFunction (velocity-based, honoured" "$B2/bfs.log" \
+            && say "V2 names the case's own nut wall function as honoured" ok \
+            || { grep -i "nut wall function" "$B2/bfs.log" | head -2; \
+                 say "V2 names the case's own nut wall function as honoured" FAIL; }
+        python3 "$ROOT/tests/v2_nut_wallfn_arm.py" "$B2/$ITERS/nut" nutUBlendedWallFunction \
+            && say "...and the wall nut it wrote is nonzero (it was exactly 0 before)" ok \
+            || say "...and the wall nut it wrote is nonzero (it was exactly 0 before)" FAIL
+    else
+        tail -4 "$B2/bfs.log"; say "V2 runs the nutUBlended fixture" FAIL
+    fi
+    rm -rf "$B2"
+else
+    say "backwardFacingStep2D missing -- wall-function arm skipped" SKIP
+fi
+
 [ $fail = 0 ] && echo PASS || { echo FAIL; exit 1; }

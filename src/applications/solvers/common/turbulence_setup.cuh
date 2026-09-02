@@ -24,6 +24,105 @@
 namespace brae {
 
 // constant/turbulenceProperties RASModel -> ctl turbulence flags + coeffs (ctl.turbulent must already be set).
+// The nut wall function the case's 0/nut SELECTS, and the refusals that go with it. Free rather than a
+// lambda inside readTurbulenceFields because simpleFoamV2 needs the same answer: it had no selector at
+// all and ran the k-based nutk under every BC, so a `nutUBlendedWallFunction` case got a wall viscosity
+// from the wrong formula -- measured on backwardFacingStep2D as a wall nut of 0 where the dispatching
+// path gives up to 1.5e-01. One implementation, because a second one is how the two paths disagree
+// about what the case asked for.
+inline bool isNutWallFnType(const std::string& t)
+{
+    return t == "nutkWallFunction"      || t == "nutUSpaldingWallFunction"
+        || t == "nutLowReWallFunction"  || t == "nutUBlendedWallFunction"
+        || t == "nutUWallFunction"      || t == "atmNutkWallFunction";
+}
+
+inline void selectNutWall(
+    const FieldData<scalar>&    nutFD,
+    const std::vector<FvPatch>& fvp,
+    bool                        sa,
+    const std::string&          modelName,
+    NutWall&                    nutWall,
+    scalar&                     atmZ0,
+    bool&                       atmBoundNut)
+{
+
+            std::string wallFnSeen;   // the first wall function seen; a second, different one refuses
+            for (const auto& pb : nutFD.boundary)
+            {
+                // Only wall patches drive the choice -- resolved through the same machinery buildField
+                // uses, so a regex key covering the walls counts as the walls. An entry resolving to NO
+                // patch keeps participating (the old exact-name compare let it, and the refusal
+                // fixtures stage conflicts through exactly such entries).
+                const auto resolved = patchesResolvingTo(nutFD.boundary, pb, fvp);
+                bool onWall = resolved.empty();
+                for (const FvPatch* q : resolved)
+                    if (q->type == "wall") { onWall = true; break; }
+                if (!onWall) continue;
+                if (pb.type == "nutUSpaldingWallFunction") { nutWall = NutWall::Spalding; }
+                else if (pb.type == "nutUBlendedWallFunction") { nutWall = NutWall::Blended; }
+                // nutUWallFunction: OF's default blender is STEPWISE (nutUWallFunctionFvPatchScalarField.C:259,
+                // wallFunctionBlenders(dict, blenderType::STEPWISE, 4)). Any other blender is a different
+                // formula, so it is refused rather than approximated by the stepwise one.
+                else if (pb.type == "nutUWallFunction") { nutWall = NutWall::NutU; }
+                else if (pb.type == "atmNutkWallFunction")   // atmospheric rough-wall nut (k-based path + roughness z0)
+                {
+                    atmZ0 = pb.ablZ0;               // roughness length (from `z0` / $z0 include)
+                    atmBoundNut = pb.atmBoundNut;  // clamp nut>=0 option
+                    printf("  nut wall function: atmNutkWallFunction (rough, z0=%g, boundNut=%s) on %s per the BC\n",
+                           (double)atmZ0, atmBoundNut ? "true" : "false", modelName.c_str());
+                }
+                // nutLowReWallFunction: OF's calcNut() returns Zero UNCONDITIONALLY
+                // (nutLowReWallFunctionFvPatchScalarField.C:38-42 is the entire function). This used to
+                // warn on stderr and fall through to nutk, justified as identical on a resolved mesh --
+                // and that justification does not hold: nutk's yPlus is the K-BASED
+                // Cmu^0.25*y*sqrt(k)/nu, not u_tau*y/nu, so a mesh resolved in friction units can carry
+                // k-based y+ above yPlusLam and take the log branch where OpenFOAM returns 0. It is now
+                // selected rather than substituted; writing zero is exact and cheaper than the log law.
+                else if (pb.type == "nutLowReWallFunction") { nutWall = NutWall::LowRe; }
+                // ONE SELECTOR, SO ONE FUNCTION. OpenFOAM dispatches per patch --
+                // nutWallFunctionFvPatchScalarField.C:181-184 is operator==(calcNut()) on each patch's own
+                // object -- so every wall may carry a different one and OpenFOAM honours each. nutWall
+                // is a single case-wide value, and the winner's kernel then rewrites EVERY wall face
+                // (device_kepsilon.cu spaldingNutKernel/blendedNutKernel/nutUWallKernel all write
+                // unconditionally where isWall). The per-face rescues are gated `type != wall`, so nothing
+                // spares the losing patch.
+                //
+                // Two ways that went wrong silently, both now refused rather than resolved by accident:
+                //   * LAST WINS. The loop assigns as it walks the boundary list, so the last matching
+                //     patch decided for all of them.
+                //   * nutk CANNOT WIN BACK. There is no `nutkWallFunction` branch here and no restoring
+                //     else, so once any patch selected a non-nutk function every wall got it -- including
+                //     the walls that explicitly asked for nutkWallFunction.
+                //
+                // Same shape as the z0 refusal this driver already carries for atmNutkWallFunction
+                // (simpleFoamV2.cu:942-952): brae holds one value, so two different ones must be refused
+                // rather than averaged into a case nobody described.
+                if (!wallFnSeen.empty() && wallFnSeen != pb.type && isNutWallFnType(pb.type))
+                    throw std::runtime_error(
+                        "brae: 0/nut carries more than one nut wall function on wall patches ('"
+                        + wallFnSeen + "' and '" + pb.type + "'). This driver applies ONE wall function to "
+                        "every wall, so running would give a wall the function another patch asked for. "
+                        "OpenFOAM dispatches per patch and honours both. Refusing rather than silently "
+                        "picking whichever the boundary list happens to end on.");
+                if (isNutWallFnType(pb.type)) wallFnSeen = pb.type;
+            }
+            if (!sa && nutWall != NutWall::Nutk)
+            {
+                // LowRe is NOT velocity-based, so it cannot ride the ternary below -- labelling it
+                // `nutUBlendedWallFunction (velocity-based)` would misreport the one case this branch
+                // was just taught to handle.
+                if (nutWall == NutWall::LowRe)
+                    printf("  nut wall function: nutLowReWallFunction (nut = 0 at the wall, honoured on "
+                           "%s per the BC)\n", modelName.c_str());
+                else
+                    printf("  nut wall function: %s (velocity-based, honoured on %s per the BC)\n",
+                           nutWall == NutWall::Spalding ? "nutUSpaldingWallFunction"
+                           : nutWall == NutWall::NutU ? "nutUWallFunction" : "nutUBlendedWallFunction",
+                           modelName.c_str());
+            }
+}
+
 inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls& ctl)
 {
         // `simulationType laminar` DOES NOT MEAN "no model". OF selects a laminarModel, and the default
@@ -395,86 +494,9 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
         // nutUSpalding -> Spalding, nutUBlended -> Blended, else nutk. Warn once on nutLowRe (mapped to nutk: identical
         // only on a resolved y+<yPlusLam mesh). SA keeps its Spalding path regardless (ctl.sa short-circuits below).
         // The nut wall-function family, in one place so the refusal below and guardWallFn cannot drift.
-        auto isNutWallFn = [](const std::string& t) {
-            return t == "nutkWallFunction"      || t == "nutUSpaldingWallFunction"
-                || t == "nutLowReWallFunction"  || t == "nutUBlendedWallFunction"
-                || t == "nutUWallFunction"      || t == "atmNutkWallFunction";
-        };
+        auto isNutWallFn = [](const std::string& t) { return isNutWallFnType(t); };
         auto setNutWall = [&](const FieldData<scalar>& fd) {
-            std::string wallFnSeen;   // the first wall function seen; a second, different one refuses
-            for (const auto& pb : fd.boundary)
-            {
-                // Only wall patches drive the choice -- resolved through the same machinery buildField
-                // uses, so a regex key covering the walls counts as the walls. An entry resolving to NO
-                // patch keeps participating (the old exact-name compare let it, and the refusal
-                // fixtures stage conflicts through exactly such entries).
-                const auto resolved = patchesResolvingTo(fd.boundary, pb, fvp);
-                bool onWall = resolved.empty();
-                for (const FvPatch* q : resolved)
-                    if (q->type == "wall") { onWall = true; break; }
-                if (!onWall) continue;
-                if (pb.type == "nutUSpaldingWallFunction") { ctl.nutWall = NutWall::Spalding; }
-                else if (pb.type == "nutUBlendedWallFunction") { ctl.nutWall = NutWall::Blended; }
-                // nutUWallFunction: OF's default blender is STEPWISE (nutUWallFunctionFvPatchScalarField.C:259,
-                // wallFunctionBlenders(dict, blenderType::STEPWISE, 4)). Any other blender is a different
-                // formula, so it is refused rather than approximated by the stepwise one.
-                else if (pb.type == "nutUWallFunction") { ctl.nutWall = NutWall::NutU; }
-                else if (pb.type == "atmNutkWallFunction")   // atmospheric rough-wall nut (k-based path + roughness z0)
-                {
-                    ctl.atmZ0 = pb.ablZ0;               // roughness length (from `z0` / $z0 include)
-                    ctl.atmBoundNut = pb.atmBoundNut;  // clamp nut>=0 option
-                    printf("  nut wall function: atmNutkWallFunction (rough, z0=%g, boundNut=%s) on %s per the BC\n",
-                           (double)ctl.atmZ0, ctl.atmBoundNut ? "true" : "false", ctl.modelName.c_str());
-                }
-                // nutLowReWallFunction: OF's calcNut() returns Zero UNCONDITIONALLY
-                // (nutLowReWallFunctionFvPatchScalarField.C:38-42 is the entire function). This used to
-                // warn on stderr and fall through to nutk, justified as identical on a resolved mesh --
-                // and that justification does not hold: nutk's yPlus is the K-BASED
-                // Cmu^0.25*y*sqrt(k)/nu, not u_tau*y/nu, so a mesh resolved in friction units can carry
-                // k-based y+ above yPlusLam and take the log branch where OpenFOAM returns 0. It is now
-                // selected rather than substituted; writing zero is exact and cheaper than the log law.
-                else if (pb.type == "nutLowReWallFunction") { ctl.nutWall = NutWall::LowRe; }
-                // ONE SELECTOR, SO ONE FUNCTION. OpenFOAM dispatches per patch --
-                // nutWallFunctionFvPatchScalarField.C:181-184 is operator==(calcNut()) on each patch's own
-                // object -- so every wall may carry a different one and OpenFOAM honours each. ctl.nutWall
-                // is a single case-wide value, and the winner's kernel then rewrites EVERY wall face
-                // (device_kepsilon.cu spaldingNutKernel/blendedNutKernel/nutUWallKernel all write
-                // unconditionally where isWall). The per-face rescues are gated `type != wall`, so nothing
-                // spares the losing patch.
-                //
-                // Two ways that went wrong silently, both now refused rather than resolved by accident:
-                //   * LAST WINS. The loop assigns as it walks the boundary list, so the last matching
-                //     patch decided for all of them.
-                //   * nutk CANNOT WIN BACK. There is no `nutkWallFunction` branch here and no restoring
-                //     else, so once any patch selected a non-nutk function every wall got it -- including
-                //     the walls that explicitly asked for nutkWallFunction.
-                //
-                // Same shape as the z0 refusal this driver already carries for atmNutkWallFunction
-                // (simpleFoamV2.cu:942-952): brae holds one value, so two different ones must be refused
-                // rather than averaged into a case nobody described.
-                if (!wallFnSeen.empty() && wallFnSeen != pb.type && isNutWallFn(pb.type))
-                    throw std::runtime_error(
-                        "brae: 0/nut carries more than one nut wall function on wall patches ('"
-                        + wallFnSeen + "' and '" + pb.type + "'). This driver applies ONE wall function to "
-                        "every wall, so running would give a wall the function another patch asked for. "
-                        "OpenFOAM dispatches per patch and honours both. Refusing rather than silently "
-                        "picking whichever the boundary list happens to end on.");
-                if (isNutWallFn(pb.type)) wallFnSeen = pb.type;
-            }
-            if (!ctl.sa && ctl.nutWall != NutWall::Nutk)
-            {
-                // LowRe is NOT velocity-based, so it cannot ride the ternary below -- labelling it
-                // `nutUBlendedWallFunction (velocity-based)` would misreport the one case this branch
-                // was just taught to handle.
-                if (ctl.nutWall == NutWall::LowRe)
-                    printf("  nut wall function: nutLowReWallFunction (nut = 0 at the wall, honoured on "
-                           "%s per the BC)\n", ctl.modelName.c_str());
-                else
-                    printf("  nut wall function: %s (velocity-based, honoured on %s per the BC)\n",
-                           ctl.nutWall == NutWall::Spalding ? "nutUSpaldingWallFunction"
-                           : ctl.nutWall == NutWall::NutU ? "nutUWallFunction" : "nutUBlendedWallFunction",
-                           ctl.modelName.c_str());
-            }
+            selectNutWall(fd, fvp, ctl.sa, ctl.modelName, ctl.nutWall, ctl.atmZ0, ctl.atmBoundNut);
         };
         GeometricField<scalar> k, eps, nut, ReThetat, gammaInt;   // ReThetat/gammaInt: kOmegaSSTLM transition
         if (ctl.les)   // pure LES Smagorinsky: ONLY nut (algebraic sub-grid viscosity); no k/epsilon/omega/nuTilda transport.
