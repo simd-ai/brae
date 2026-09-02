@@ -37,7 +37,6 @@ RhoStepInput buildDeviceStepInput(
 {
     RhoStepInput in;
 
-    in.tiltedSymmetryRefusal = dev.tiltedSymmetryRefusal;
     in.hasMRF              = refusals.hasMRF;
     in.hasFvOptions        = refusals.hasFvOptions;
     in.fvOptionUnsupported = refusals.fvOptionUnsupported;
@@ -430,7 +429,22 @@ int runMirrorCuda(const std::string& caseDir)
         gin.muEffCell = &dMu;       gin.muEffBndFace = &dMuB;
         gin.alphaEffCell = &dAl;    gin.alphaEffBndFace = &dAlB;
 
-        const Residuals r = rhoSimpleStep(dev.f, w, dev.dm, dev.dbU, dev.dbP, dev.dbHe, dev.dbT, gin);
+        Residuals r = rhoSimpleStep(dev.f, w, dev.dm, dev.dbU, dev.dbP, dev.dbHe, dev.dbT, gin);
+        // THE CLOSURE'S RESIDUALS, which the step cannot return: its turbulence hook is a
+        // std::function<void()>, so k and epsilon never reached `r` and the two residualControl
+        // branches below were dead code on this arm -- a case naming "(k|epsilon)" (angledDuct,
+        // squareBend) was declared converged on p, U and e alone, a strict subset of OpenFOAM's
+        // criteria (simpleControl::criteriaSatisfied walks every field solved this step,
+        // simpleControl.C:58-85), and so stopped no later than OpenFOAM and in practice earlier. The
+        // values were always computed: kEpsilon.cu writes them into the stages this driver owns, and
+        // the hook has run by the time the step returns. Measured on rhoKE with "(k|epsilon)" 1e-3 /
+        // 1e-5 alongside p/U/h 1e-3: the run stops at the same iteration either way with this block
+        // absent, and later under the tighter criterion with it present.
+        if (hf.turbulent)
+        {
+            r["k"]    = turbBuf.stages.kResidual;
+            r[second] = turbBuf.stages.epsResidual;
+        }
 
         auto res = [&](const char* k) { return r.count(k) ? (double)r.at(k) : 0.0; };
         std::printf("Time = %s   U %.4e   %s %.4e   p %.4e",

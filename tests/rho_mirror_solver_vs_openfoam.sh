@@ -17,6 +17,7 @@
 #   3. RESTART. `startFrom latestTime` finds brae's own directory, and endTime is ABSOLUTE: restarting
 #      at 20 with endTime 23 runs THREE steps, not twenty-three.
 #   4. THE REFUSALS a solver needs: `writeFormat binary` (the writer emits ascii only) by name.
+#   5. THE CRITERIA. residualControl on the CUDA arm reads the closure's residuals too (arm 13).
 #
 # The turbulent arm runs validation/rhoBoxF so the k/epsilon/nut/alphat write payload is exercised
 # cheaply -- that fixture's turbulence is frozen, which does not matter here: the question is whether
@@ -341,6 +342,70 @@ if [ -d "$ROOT/validation/rhoBoxDF" ]; then
         || { echo "$hout" | tail -3; say "...and the SAME porous case runs on the host arm" FAIL; }
 else
     say "rhoBoxDF missing -- porosity arm skipped" SKIP
+fi
+
+
+# ---- arm 13: residualControl on the CUDA arm SEES the turbulence criteria --------------------------
+# The device step returns U, e|h and p residuals and nothing else -- its closure hook is a
+# std::function<void()> -- so the driver's `if (r.count("k"))` branches were dead and a case naming
+# "(k|epsilon)" (angledDuct, squareBend among the stock tutorials) was declared converged on p, U and
+# e alone, a strict SUBSET of OpenFOAM's criteria (simpleControl::criteriaSatisfied walks every field
+# solved this step). The residuals were computed all along (kEpsilon.cu writes them into the stages the
+# driver owns); the driver now reads them after the step.
+#
+# The oracle is that the criterion BINDS: with everything else at 1e-3, tightening the turbulence
+# criterion alone must move the stopping iteration. Measured on rhoKE (3200 cells, kEpsilon): 67 at
+# 1e-3, 94 at 1e-5, k and epsilon on every log line. Fail-proof (merge removed): 61 under BOTH, no k
+# printed. The third check is the strongest: with the case's linear solvers tightened to 1e-12/0 the
+# two arms must converge on the SAME iteration -- they read the same criteria, so they stop together
+# (67 = 67, residuals agreeing to five digits). Under the case's own tolerances they stop at 67 and 89:
+# that spread is the linear solvers (AMG-PCG against BiCGStab), which is why it is not asserted.
+if [ -d "$ROOT/validation/rhoKE" ] && command -v blockMesh > /dev/null 2>&1; then
+    stageKE()   # $1 dst  $2 turbulence criterion  $3 tight|loose
+    {
+        stage "$1" "$ROOT/validation/rhoKE" 3000
+        ( cd "$1" && blockMesh > log.blockMesh 2>&1 ) || { echo "FAIL: blockMesh on rhoKE"; exit 1; }
+        TOL="$2" MODE="$3" python3 - "$1/system/fvSolution" <<'PYEOF2'
+import os, re, sys
+f = sys.argv[1]; s = open(f).read()
+s = re.sub(r'residualControl\s*\{[^{}]*\}',
+           'residualControl { p 1e-3; U 1e-3; h 1e-3; "(k|epsilon)" %s; }' % os.environ['TOL'], s)
+if os.environ['MODE'] == 'tight':
+    s = re.sub(r'tolerance\s+[0-9.eE+-]+;', 'tolerance 1e-12;', s)
+    s = re.sub(r'relTol\s+[0-9.eE+-]+;', 'relTol 0;', s)
+open(f, 'w').write(s)
+PYEOF2
+    }
+    nOf()   # the stopping iteration of a log, or empty
+    {
+        grep -oE "converged in [0-9]+ iterations" "$1" | grep -oE "[0-9]+" | head -1
+    }
+    stageKE "$W/ke3" 1e-3 loose
+    stageKE "$W/ke5" 1e-5 loose
+    ( cd "$W/ke3" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BIN" -case "$W/ke3" > run.log 2>&1 )
+    ( cd "$W/ke5" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BIN" -case "$W/ke5" > run.log 2>&1 )
+    n3=$(nOf "$W/ke3/run.log"); n5=$(nOf "$W/ke5/run.log")
+    if [ -z "$n3" ] || [ -z "$n5" ]; then
+        tail -3 "$W/ke3/run.log"; say "the CUDA arm converges on rhoKE under residualControl" FAIL
+    else
+        say "the CUDA arm converges on rhoKE under residualControl ($n3 / $n5 iterations)" ok
+        [ "$n5" -gt "$n3" ] \
+            && say "tightening the turbulence criterion alone moves the stop (the criterion BINDS)" ok \
+            || say "tightening the turbulence criterion alone moves the stop (the criterion BINDS)" FAIL
+        grep -qE "^Time = .* k [0-9.e+-]+ +epsilon [0-9.e+-]+" "$W/ke3/run.log" \
+            && say "k and epsilon residuals are on the CUDA arm's log line" ok \
+            || say "k and epsilon residuals are on the CUDA arm's log line" FAIL
+    fi
+    stageKE "$W/ket" 1e-3 tight
+    stageKE "$W/keh" 1e-3 tight
+    ( cd "$W/ket" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BIN" -case "$W/ket" > run.log 2>&1 )
+    ( cd "$W/keh" && BRAE_RHOSIMPLEFOAM_MIRROR=1    "$BIN" -case "$W/keh" > run.log 2>&1 )
+    nt=$(nOf "$W/ket/run.log"); nh=$(nOf "$W/keh/run.log")
+    [ -n "$nt" ] && [ "$nt" = "$nh" ] \
+        && say "under tight linear solvers both arms stop on the same iteration ($nt)" ok \
+        || say "under tight linear solvers both arms stop on the same iteration (cuda ${nt:-none}, host ${nh:-none})" FAIL
+else
+    say "rhoKE or blockMesh missing -- turbulence residualControl arm skipped" SKIP
 fi
 
 [ $fail = 0 ] && echo PASS || { echo FAIL; exit 1; }
