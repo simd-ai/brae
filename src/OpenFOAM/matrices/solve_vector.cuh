@@ -19,7 +19,8 @@ inline SolverPerformance solveVector(
     const std::vector<FvPatch>& patches,
     scalar tolerance,
     scalar relTol,
-    int maxIter)
+    int maxIter,
+    int minIter = 0)
 {
     const label nC = m.nCells();
     SolverPerformance perf;
@@ -45,7 +46,7 @@ inline SolverPerformance solveVector(
         }
         std::vector<scalar> psi(nC);
         for (label c = 0; c < nC; ++c) psi[c] = component(U.internal[c], cmpt);
-        const SolverPerformance p = pbicgstab(Mc, psi, m, patches, tolerance, relTol, maxIter);
+        const SolverPerformance p = pbicgstab(Mc, psi, m, patches, tolerance, relTol, maxIter, minIter);
         for (label c = 0; c < nC; ++c) setComponent(U.internal[c], cmpt, psi[c]);
         if (cmpt == 0) perf = p;
     }

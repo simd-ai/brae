@@ -201,7 +201,8 @@ void correct(
     bool relaxEquationK,
     bool constrainBeforeWall,
     bool   limitedLinear,
-    scalar limiterCoeff)
+    scalar limiterCoeff,
+    int    minIter)
 {
     const label nC = m.nCells();
     const scalar Cmu25 = std::pow(co.Cmu, 0.25);
@@ -493,7 +494,7 @@ void correct(
         {
             captureSystem(M, patches, res->epsD, res->epsSrc, &res->epsUpper, &res->epsLower);
         }
-        const SolverPerformance p = pbicgstab(M, epsilon.internal, m, patches, tol, relTol, maxIter);
+        const SolverPerformance p = pbicgstab(M, epsilon.internal, m, patches, tol, relTol, maxIter, minIter);
         if (res) res->epsilon = p.initialResidual;
 
         // Foam::bound(epsilon_, epsilonMin_): a cell that solved NEGATIVE takes its neighbours'
@@ -584,7 +585,7 @@ void correct(
         {
             captureSystem(M, patches, res->kD, res->kSrc, &res->kUpper, &res->kLower);
         }
-        const SolverPerformance p = pbicgstab(M, k.internal, m, patches, tol, relTol, maxIter);
+        const SolverPerformance p = pbicgstab(M, k.internal, m, patches, tol, relTol, maxIter, minIter);
         if (res) res->k = p.initialResidual;
 
         k.evaluateBoundary();

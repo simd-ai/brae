@@ -121,6 +121,7 @@ struct KEpsilonInput
     scalar tol     = 1e-12;
     scalar relTol  = 0.0;
     int    maxIter = 2000;
+    int    minIter = 0;      // fvSolution solvers/<field>/minIter, OF's floor on the iteration count
 
     KEpsilonCoeffs co{};
     scalar         Prt = 1.0;            // EddyDiffusivity: alphat = rho*nut/Prt

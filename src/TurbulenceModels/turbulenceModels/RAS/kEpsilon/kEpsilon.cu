@@ -803,7 +803,7 @@ void finishAndSolve(
     ones.copyFrom(std::vector<scalar>(nC, scalar(1.0)));
     const scalar normF = deviceNormFactor(A, field, b, ones);
     const DeviceSolverPerf perf =
-        deviceJacobiBiCGStab(A, b, field, normF, in.tol, in.relTol, in.maxIter);
+        deviceJacobiBiCGStab(A, b, field, normF, in.tol, in.relTol, in.maxIter, /*checkEvery=*/1, in.minIter);
     residualOut = perf.initialResidual;
 }
 
