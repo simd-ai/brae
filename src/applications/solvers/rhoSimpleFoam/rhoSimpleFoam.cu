@@ -242,9 +242,6 @@ Residuals rhoSimpleStep(
     DeviceBoundary&             dbT,
     const RhoStepInput&         in)
 {
-    // Refusals RECORDED at field construction land here, before anything is solved.
-    if (!in.tiltedSymmetryRefusal.empty()) throw std::runtime_error(in.tiltedSymmetryRefusal);
-
     Residuals res;
     const int nC = dm.nCells;
 
@@ -359,6 +356,17 @@ Residuals rhoSimpleStep(
         ein.pCell = &f.p; ein.rhoCell = &f.rho;
         // Refreshed here, from the just-solved U: EEqn.H's kinetic-energy source is evaluated on
         // boundary faces as well as cells, and the momentum solve above has moved every one of them.
+        //
+        // AND THE SYMMETRY/WEDGE refValue WITH THEM. deviceBCValue reproduces
+        // correctBoundaryConditions() only for a patch whose value is a function of (refValue, refGrad,
+        // internal). symmetry/slip and wedge are not those: OpenFOAM gives them no updateCoeffs at all
+        // -- symmetryPlaneFvPatchField::evaluate() is (iF + transform(I - 2*sqr(nHat), iF))/2 and
+        // wedgeFvPatchField::evaluate() is transform(cellT(), iF), both read at the moment of
+        // evaluation -- while brae carries them as a mixed refValue that some earlier kernel had to
+        // build FROM the internal field. Left unrefreshed, this call blends the new U_c towards a ref
+        // built from the U the iteration started with.
+        deviceUpdateSymmetry(dbU, f.Ux, f.Uy, f.Uz);
+        deviceUpdateWedge(dbU, f.Ux, f.Uy, f.Uz);
         deviceBCValue(dbU.comp[0], f.Ux, f.UxBnd);
         deviceBCValue(dbU.comp[1], f.Uy, f.UyBnd);
         deviceBCValue(dbU.comp[2], f.Uz, f.UzBnd);
@@ -550,6 +558,12 @@ Residuals rhoSimpleStep(
         // a drift. It fed forward through everything that reads U's patch values: fvc::div(phi, Ekp)
         // evaluates Ekp on boundary faces, the closure's production and its turbulentIntensity inlet
         // both read U_b, and the next iteration's flux switch reads the boundary flux built from it.
+        //
+        // The symmetry/wedge refValue is rebuilt first, for the reason given at the energy equation's
+        // refresh above: their value is a function of the CURRENT internal field, and the velocity
+        // correction has just moved it.
+        deviceUpdateSymmetry(dbU, f.Ux, f.Uy, f.Uz);
+        deviceUpdateWedge(dbU, f.Ux, f.Uy, f.Uz);
         deviceBCValue(dbU.comp[0], f.Ux, f.UxBnd);
         deviceBCValue(dbU.comp[1], f.Uy, f.UyBnd);
         deviceBCValue(dbU.comp[2], f.Uz, f.UzBnd);

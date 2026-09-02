@@ -190,10 +190,6 @@ struct RhoStepInput
     // they also strip the coupling out of the neighbours' equations. Per-cell mask + the value pinned.
     //   he:          fixedTemperatureConstraint, as the ENERGY he(p, Tuniform)
     //   k / epsilon: scalarFixedValueConstraint naming that field
-    // The tilted symmetry/slip refusal createDeviceFields recorded, carried to the step so the refusal
-    // lands before any physics while field construction stays usable.
-    std::string tiltedSymmetryRefusal;
-
     const DeviceBuffer<label>*  fvoHeMask  = nullptr;
     const DeviceBuffer<scalar>* fvoHeVal   = nullptr;
 
