@@ -120,36 +120,35 @@ rm -rf "$CU"/[1-9]* "$CU"/0; cp -r "$CU/0.orig" "$CU/0" 2>/dev/null || true
 python3 - "$CU/system/controlDict" <<'PYEOF'
 import re, sys
 c = sys.argv[1]; s = open(c).read()
-for k, v in [('endTime', '5'), ('writeInterval', '5'), ('writeControl', 'timeStep'),
+# writeInterval 1: the no-penetration arm below reads phi at iteration 1, where the boundary conditions
+# are the only thing that has acted yet.
+for k, v in [('endTime', '5'), ('writeInterval', '1'), ('writeControl', 'timeStep'),
              ('writeFormat', 'ascii'), ('writePrecision', '15'), ('startFrom', 'startTime')]:
     s = re.sub(r'^%s .*' % k, '%-15s %s;' % (k, v), s, flags=re.M)
 open(c, 'w').write(s)
 PYEOF
-# AS THE TUTORIAL SHIPS, the device arm must REFUSE it: `porosityWall` is `type wall;` in the mesh and
-# `slip` in 0/U, on a plane at 45 degrees, and the device's segregated symmetry treatment is exact only
-# for axis-aligned planes. That refusal keyed on the MESH patch type and so never saw this patch --
-# measured at iteration 1, with the interiors still agreeing to 1e-11, the device put
-# (1.04804 1.04919 ...) on those faces where the host and OpenFOAM put (3.58007 3.58007 ...).
-cuout=$( cd "$CU" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$MIRRORBIN" -case "$CU" 2>&1 || true )
-echo "$cuout" | grep -q "porosityWall" && echo "$cuout" | grep -q "not aligned to a coordinate axis" \
-    && echo "  cuda arm: the tutorial's TILTED SLIP wall is refused by name   ok" \
-    || { echo "$cuout" | tail -4; echo "FAIL: the CUDA arm did not refuse the tilted slip patch"; exit 1; }
-
-# ...and with that patch made axis-independent (noSlip), the SAME case runs on the device and its three
-# fvOptions are applied. The mutation is one BC: everything the fvOptions machinery does is unchanged.
-CU2="$W/cuda2"; rm -rf "$CU2"; cp -r "$CU" "$CU2"; rm -rf "$CU2"/[1-9]*
-python3 "$ROOT/tests/rho_angledduct_noslip.py" "$CU2/0/U"
-grep -q "noSlip" "$CU2/0/U" || { echo "FAIL: the noSlip mutation did not apply"; exit 1; }
-cuout=$( cd "$CU2" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$MIRRORBIN" -case "$CU2" 2>&1 )
+# THE TUTORIAL AS IT SHIPS, TILTED SLIP WALL AND ALL. `porosityWall` is `type wall;` in the mesh and
+# `slip` in 0/U, on a plane at 45 degrees. This arm used to assert a REFUSAL, because the device arm
+# drifted on such a plane -- and the drift was never the segregated symmetry model (which is exact for
+# any normal; OpenFOAM's own snGradTransformDiag is the component magnitudes too). It was the driver
+# refreshing U's boundary after the momentum solve and after the velocity correction without rebuilding
+# the symmetry refValue those refreshes blend towards. Fixed in rhoSimpleFoam.cu; the refusal is gone and
+# this arm now runs the real tutorial instead of a mutation of it.
+cuout=$( cd "$CU" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$MIRRORBIN" -case "$CU" 2>&1 )
 echo "$cuout" | grep -q "^End" \
     && echo "$cuout" | grep -q "fixedTemperatureConstraint T=" \
     && echo "$cuout" | grep -q "scalarFixedValueConstraint k=" \
     && echo "$cuout" | grep -q "explicitPorositySource/fixedCoeff" \
-    && echo "  cuda arm: with an axis-independent wall it runs, all three fvOptions applied   ok" \
-    || { echo "$cuout" | tail -4; echo "FAIL: the CUDA arm did not run the mutated tutorial with its fvOptions"; exit 1; }
-CU="$CU2"
+    && echo "  cuda arm: the tutorial runs as it ships, all three fvOptions applied   ok" \
+    || { echo "$cuout" | tail -6; echo "FAIL: the CUDA arm did not run the tutorial with its fvOptions"; exit 1; }
 
-HO="$W/host"; rm -rf "$HO"; cp -r "$CU" "$HO"; rm -rf "$HO"/[1-9]*   # $CU is the mutated case
+# NO PENETRATION through the 45-degree slip wall, the oracle that sees a stale symmetry ref while a
+# converged field comparison cannot -- see tests/sym_patch_flux.py. Measured here: 4.55e-35 at iteration
+# 1 and 9.03e-20 at iteration 5, against 7.13e-04 on rhoBoxSym with the refresh removed.
+python3 "$ROOT/tests/sym_patch_flux.py" "$CU" porosityWall 1e-15 1 5 \
+    || { echo "FAIL: the tilted slip wall is carrying flux"; exit 1; }
+
+HO="$W/host"; rm -rf "$HO"; cp -r "$CU" "$HO"; rm -rf "$HO"/[1-9]*
 ( cd "$HO" && BRAE_RHOSIMPLEFOAM_MIRROR=1 "$MIRRORBIN" -case "$HO" > host.log 2>&1 ) \
     || { tail -4 "$HO/host.log"; echo "FAIL: the host arm did not run the tutorial"; exit 1; }
 CUDA_K="$CU/5/k" HOST_K="$HO/5/k" python3 - <<'PYEOF' || exit 1

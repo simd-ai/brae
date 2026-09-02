@@ -16,7 +16,13 @@ import sys
 
 import numpy as np
 
-BOUNDS = {'p': 1e-10, 'T': 4e-08, 'U': 1.5e-08, 'rho': 4e-08}
+# The rhoBox defaults. A fixture whose own offset is different overrides them per field with
+# CUDA_<FIELD>_BOUND, and `--host-only` drops the OpenFOAM column for a case where the HOST mirror
+# carries an offset of its own -- the device arm's job there is to reproduce the host, not to beat it,
+# and a bound wide enough to cover the host's offset would stop measuring the device at all.
+DEFAULT_BOUNDS = {'p': 1e-10, 'T': 4e-08, 'U': 1.5e-08, 'rho': 4e-08}
+BOUNDS = {f: float(os.environ.get('CUDA_%s_BOUND' % f.upper(), b))
+          for f, b in DEFAULT_BOUNDS.items()}
 
 
 def read(path):
@@ -35,7 +41,10 @@ def read(path):
 
 def main():
     ok = True
-    for tag, env in (('OpenFOAM', 'OF_DIR'), ('the host mirror', 'HOST_DIR')):
+    columns = [('OpenFOAM', 'OF_DIR'), ('the host mirror', 'HOST_DIR')]
+    if '--host-only' in sys.argv:
+        columns = [c for c in columns if c[1] != 'OF_DIR']
+    for tag, env in columns:
         for field, bound in BOUNDS.items():
             a = read(os.path.join(os.environ['BRAE_DIR'], field))
             b = read(os.path.join(os.environ[env], field))
