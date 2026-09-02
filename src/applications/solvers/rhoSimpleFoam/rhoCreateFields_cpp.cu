@@ -319,7 +319,22 @@ RhoSimpleFields createFields(
 
     // p = thermo.p() and T: both read by the thermo, both MUST_READ. Read together so psi and rho below
     // are derived from the SAME state rather than from two fields that could be an iteration apart.
-    f.p = buildField<scalar>(guardRead(readField<scalar>(timeDir + "/p"), "p"), patches, nC);
+    const FieldData<scalar> pFd = guardRead(readField<scalar>(timeDir + "/p"), "p");
+    // A flux-switched PRESSURE patch is refreshed on neither arm: the flux switch (updateFromFlux on the
+    // host, deviceUpdateInletOutlet on the device) is pushed into U, he and T every iteration and never
+    // into p, so an inletOutlet/outletInlet p would keep the switch it was seeded with for the whole
+    // run -- OpenFOAM's inletOutlet reads phi in updateCoeffs each time (inletOutletFvPatchField.C:72).
+    // No fixture carries one (freestreamPressure is a different, refreshed path). Refused by name.
+    for (const auto& b : pFd.boundary)
+    {
+        if (b.type == "inletOutlet" || b.type == "outletInlet")
+            throw std::runtime_error(
+                "rhoSimpleFoam createFields: p's patch '" + b.name + "' is `" + b.type + "`, a flux-switched "
+                "condition whose valueFraction OpenFOAM recomputes from phi every updateCoeffs. The mirror "
+                "pushes the flux into U, he and T only, so this patch would keep its seeded switch for the "
+                "whole run on both arms. Refusing rather than running a frozen switch under the case's name.");
+    }
+    f.p = buildField<scalar>(pFd, patches, nC);
     f.p.evaluateBoundary();
     const FieldData<scalar> tFd = guardRead(readField<scalar>(timeDir + "/T"), "T");
     f.T = buildField<scalar>(tFd, patches, nC);
@@ -681,6 +696,17 @@ RhoSimpleFields createFields(
                     f.epsilon = buildField<scalar>(guardRead(readField<scalar>(timeDir + "/epsilon"), "epsilon"), patches, nC);
                     f.epsilon.evaluateBoundary();
                 }
+                // MUST_READ, as OpenFOAM's EddyDiffusivity constructs it (EddyDiffusivity.C:26): a
+                // turbulent compressible case without 0/alphat is a FATAL in OpenFOAM ("cannot find
+                // file"). The host step refused it late, at the first closure call; the CUDA arm did not
+                // refuse at all and ran the energy equation on the laminar diffusivity while reporting
+                // the model -- measured on rhoKE with the file removed, `Time = 1 ... k ... epsilon` and on.
+                if (!fileExists(timeDir + "/alphat"))
+                    throw std::runtime_error(
+                        "rhoSimpleFoam createFields: the case is RAS and " + timeDir + "/alphat does not "
+                        "exist. OpenFOAM's EddyDiffusivity reads alphat MUST_READ when the turbulence model "
+                        "is constructed and fatals without it; the energy equation's alphaEff = "
+                        "CpByCpv*(alpha + alphat) needs it. Refusing rather than running with alphat = 0.");
                 if (fileExists(timeDir + "/alphat"))
                 {
                     const FieldData<scalar> aFd = guardRead(readField<scalar>(timeDir + "/alphat"), "alphat");

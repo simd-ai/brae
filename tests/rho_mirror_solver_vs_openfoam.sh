@@ -19,6 +19,8 @@
 #   4. THE REFUSALS a solver needs: `writeFormat binary` (the writer emits ascii only) by name.
 #   5. THE CRITERIA. residualControl on the CUDA arm reads the closure's residuals too (arm 13).
 #   6. THE SOLVER ENTRIES. tolerance/relTol/maxIter/minIter reach each equation from ITS entry (arm 14).
+#   7. TWO REFUSALS OpenFOAM's construction would have made: no 0/alphat on a RAS case (arm 15) and a
+#      flux-switched pressure patch the mirror never refreshes (arm 16).
 #
 # The turbulent arm runs validation/rhoBoxF so the k/epsilon/nut/alphat write payload is exercised
 # cheaply -- that fixture's turbulence is frozen, which does not matter here: the question is whether
@@ -430,5 +432,46 @@ if [ -d "$ROOT/validation/rhoKE" ] && command -v blockMesh > /dev/null 2>&1; the
 else
     say "rhoKE or blockMesh missing -- solver-entries arm skipped" SKIP
 fi
+
+
+# ---- arm 15: a turbulent case without 0/alphat is refused by name, on BOTH arms ---------------------
+# OpenFOAM's EddyDiffusivity reads alphat MUST_READ at construction and fatals without it. The host arm
+# refused late (at the first closure call); the CUDA arm did not refuse at all and ran the energy
+# equation on the laminar diffusivity under the model's name (measured on rhoKE with the file removed:
+# `Time = 1 ... k ... epsilon` and on). createFields refuses now, before anything runs, on both arms.
+# The control is arm 13 above: the same fixture WITH the file runs to convergence on the CUDA arm.
+if [ -d "$ROOT/validation/rhoKE" ] && command -v blockMesh > /dev/null 2>&1; then
+    stage "$W/noalphat" "$ROOT/validation/rhoKE" 3
+    ( cd "$W/noalphat" && blockMesh > log.blockMesh 2>&1 ) || { echo "FAIL: blockMesh on rhoKE"; exit 1; }
+    rm -f "$W/noalphat/0/alphat"
+    for arm in 1 cuda; do
+        out=$( cd "$W/noalphat" && BRAE_RHOSIMPLEFOAM_MIRROR=$arm "$BIN" -case "$W/noalphat" 2>&1 || true )
+        echo "$out" | grep -q "alphat does not exist" && ! echo "$out" | grep -q "^Time = 1" \
+            && say "a RAS case without 0/alphat is refused by name before it runs (arm $arm)" ok \
+            || { echo "$out" | tail -3; say "a RAS case without 0/alphat is refused by name before it runs (arm $arm)" FAIL; }
+    done
+else
+    say "rhoKE or blockMesh missing -- alphat arm skipped" SKIP
+fi
+
+# ---- arm 16: a flux-switched p (inletOutlet / outletInlet) is refused by name, on BOTH arms ---------
+# The flux switch is pushed into U, he and T every iteration and never into p, so such a patch would
+# keep its seeded switch for the whole run. No fixture carries one; rhoBox's outlet is mutated here.
+for bc in outletInlet inletOutlet; do
+    stage "$W/pio_$bc" "$SRC" 3
+    python3 - "$W/pio_$bc/0/p" "$bc" <<'PYEOF'
+import re, sys
+p, bc = sys.argv[1], sys.argv[2]; s = open(p).read()
+s, n = re.subn(r'(outlet\s*\{)[^}]*\}', r'\1 type %s; %s uniform 100000; value uniform 100000; }' % (bc, 'outletValue' if bc == 'outletInlet' else 'inletValue'), s, count=1)
+assert n == 1
+open(p, 'w').write(s)
+PYEOF
+    for arm in 1 cuda; do
+        out=$( cd "$W/pio_$bc" && BRAE_RHOSIMPLEFOAM_MIRROR=$arm "$BIN" -case "$W/pio_$bc" 2>&1 || true )
+        echo "$out" | grep -q "flux-switched" && echo "$out" | grep -q "'outlet' is \`$bc\`" && ! echo "$out" | grep -q "^Time = 1" \
+            && say "a $bc pressure patch is refused by name (arm $arm)" ok \
+            || { echo "$out" | tail -3; say "a $bc pressure patch is refused by name (arm $arm)" FAIL; }
+    done
+done
 
 [ $fail = 0 ] && echo PASS || { echo FAIL; exit 1; }
