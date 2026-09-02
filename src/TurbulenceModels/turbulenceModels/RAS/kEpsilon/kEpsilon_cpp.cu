@@ -428,15 +428,32 @@ void correct(
         // it was simply not under validation/, and saying it did not exist is what kept the number at
         // 2.1e-01 unmeasured for as long as it was.
         if (relaxEquationEps) relaxMatrix(M, epsilon, m, patches, relaxEps);
+        // THE WALL VALUE IS READ FROM THE FIELD, at the moment the wall pass runs -- OpenFOAM's
+        // epsilonWallFunction::manipulateMatrix is
+        // `matrix.setValues(patch().faceCells(), patchInternalField())`
+        // (epsilonWallFunctionFvPatchScalarField.C:616). The note above already said so; the code
+        // passed the FROZEN epsVals instead, and the two differ exactly where an fvOption has just
+        // pinned the same cell, because setValues writes psi and the wall pass is supposed to read
+        // that back. Measured on the tutorial's 8000-cell porous zone: OpenFOAM ends with 8000 cells
+        // at the constrained 150 and this reference with 6480, the 1520 wall-adjacent ones left at the
+        // wall value 320.618. With no fvOption in play the field still holds eps0 at every wall cell
+        // (written above), so this reads exactly what epsVals held.
+        auto wallValsNow = [&]()
+        {
+            std::vector<scalar> v(wallCells.size());
+            for (std::size_t i = 0; i < wallCells.size(); ++i)
+                v[i] = epsilon.internal[static_cast<std::size_t>(wallCells[i])];
+            return v;
+        };
         if (constrainBeforeWall)
         {
             if (fvOpts) cpu::fvOptions::constrain(*fvOpts, M, epsilon.internal, "epsilon", m, patches);
-            setValues(M, epsilon.internal, m, patches, wallCells, epsVals);
+            setValues(M, epsilon.internal, m, patches, wallCells, wallValsNow());
         }
         else
         {
             // The order this reference used to have, kept ONLY so the difference can be measured.
-            setValues(M, epsilon.internal, m, patches, wallCells, epsVals);
+            setValues(M, epsilon.internal, m, patches, wallCells, wallValsNow());
             if (fvOpts) cpu::fvOptions::constrain(*fvOpts, M, epsilon.internal, "epsilon", m, patches);
         }
         if (res)

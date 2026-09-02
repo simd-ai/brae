@@ -835,11 +835,22 @@ void correct(
         PressureMatrix E;
         assembleEpsEqn(E, st, dm, dbEps, dbK, epsilon, k, nut, in);
 
-        // The wall constraint's VALUE is eps0, which wallTreatment has already written into epsilon --
-        // but the matrix needs it as a separate array because setValues overwrites psi as it goes.
+        // The wall constraint's VALUE IS THE CURRENT FIELD, not the eps0 array -- OpenFOAM's
+        // epsilonWallFunction::manipulateMatrix is
+        // `matrix.setValues(patch().faceCells(), patchInternalField())`
+        // (epsilonWallFunctionFvPatchScalarField.C:616), and patchInternalField() is epsilon as it
+        // stands when the wall pass runs. That matters exactly where an fvOptions constraint has just
+        // pinned the same cell: fvMatrix::setValues writes psi as well as the matrix, so OpenFOAM's
+        // wall pass READS BACK the constrained value and re-pins the cell to it. Passing the frozen
+        // eps0 instead overwrote the constraint -- measured on OpenFOAM's own angledDuct tutorial,
+        // whose porous zone pins epsilon to 150 on 8000 cells: OpenFOAM ends with 8000 cells at 150
+        // and brae with 6480, the 1520 wall-adjacent ones sitting at the wall value 320.618 instead.
+        //
+        // wallTreatment has already written eps0 into epsilon for every wall cell, so on a case with no
+        // constraint this reads exactly what it read before.
         finishAndSolve(E, epsilon, dm, in.relaxEquationEps, in.relaxEps,
                        in.fvoEpsMask, in.fvoEpsVal,
-                       &st.isWallCell, &st.eps0, in, st.epsResidual);
+                       &st.isWallCell, &epsilon, in, st.epsResidual);
 
         boundField(epsilon, dm, dbEps, scalar(1e-15));
     }

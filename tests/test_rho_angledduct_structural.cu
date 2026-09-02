@@ -271,10 +271,33 @@ int main(int argc, char** argv)
         const double dK   = relL2(kB, kA);
         std::printf("     %-64s eps %.6e  k %.6e\n",
                     "  (inverted order against OpenFOAM's)", dEps, dK);
-        // THE MEASUREMENT. If the two orders agreed, the ordering would be a comment rather than a
-        // decision, and the fix that introduced it would be unfalsifiable. This is the number that was
-        // missing when the reference's own note said no fixture could produce one.
-        check("the ORDER changes the answer -- it is load-bearing", dEps > 1e-12);
+        // This number USED TO BE 2.146540e-01 and is now ~4e-18, and the reason is a defect it was
+        // measuring rather than the ordering. The wall pass took its value from a FROZEN eps0 array
+        // instead of the field, where OpenFOAM's epsilonWallFunction::manipulateMatrix is
+        // `setValues(faceCells(), patchInternalField())` -- the CURRENT field, which fvOptions.constrain
+        // has just written. So with the OF order the wall pass was overwriting the option's value in the
+        // overlap, and the "order difference" was really constraint-value-vs-wall-value. With the value
+        // read from the field, both orders leave the overlap at the option's value, as OpenFOAM does,
+        // and what remains between them (the neighbour transfer) cancels on this fixture.
+        //
+        // So the assertion is no longer "the orders differ" -- that would now be asserting the defect.
+        // It is the ORACLE's own outcome instead: OpenFOAM ends this case with the fvOption's value on
+        // EVERY one of its constrained cells, and before the fix brae had it on 6480 of 8000.
+        std::size_t pinned = 0, constrained = 0;
+        {
+            scalar want = 0; bool haveWant = false;
+            for (const auto& o : keOpts.options)
+                for (const auto& fvv : o.fieldValues)
+                    if (fvv.first == "epsilon") { want = fvv.second; haveWant = true; }
+            for (label c = 0; c < nC; ++c) if (isOpt[c]) ++constrained;
+            if (haveWant)
+                for (label c = 0; c < nC; ++c)
+                    if (isOpt[c] && std::fabs(epsA[c] - want) < 1e-9) ++pinned;
+            std::printf("     %-64s %zu of %zu\n",
+                        "  (constrained cells left at the fvOption's epsilon)", pinned, constrained);
+        }
+        check("the fvOption's value survives on EVERY constrained cell, as in OpenFOAM",
+              constrained > 0 && pinned == constrained);
     }
 
     std::printf("%s\n", g_fails ? "FAIL" : "PASS");
