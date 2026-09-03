@@ -149,6 +149,11 @@ struct RhoStepInput
     scalar tolU = 1e-12, relTolU = 0.0;
     scalar tolHe = 1e-12, relTolHe = 0.0;
     scalar tolP = 1e-12, relTolP = 0.0;
+    // polyMesh::solutionD(), +1 / -1 per component: the momentum solve skips a knocked-out component
+    // and U's residual is the max over the rest (fvMatrixSolve.C:157-164). Filled by
+    // buildDeviceStepInput from the empty patches (solution_directions.cuh); the default solves all
+    // three, which is right only for a mesh with no empty patch.
+    int    solutionD[3] = {1, 1, 1};
     // Per equation, as OF reads them (lduMatrixSolver.C:204-205) -- see StepInput in the host twin.
     int    maxIterU = 2000, maxIterP = 2000, maxIterHe = 2000, maxIterTurb = 2000;
     int    minIterU = 0,    minIterP = 0,    minIterHe = 0,    minIterTurb = 0;

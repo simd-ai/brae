@@ -339,8 +339,23 @@ Residuals rhoSimpleStep(
         addPressureGradient(Mp, dm, gpx, gpy, gpz);
 
         DeviceBuffer<scalar>* U[3] = {&f.Ux, &f.Uy, &f.Uz};
+        // U's residual is cmptMax over the components OpenFOAM SOLVES: fvMatrix<vector>::solveSegregated
+        // `continue`s on every component polyMesh::solutionD() knocks out (fvMatrixSolve.C:157-164), that
+        // component's SolverPerformance stays Zero (SolverPerformance.H:117-121), and residualControl
+        // compares cmptMax over the stored vector (solutionControl.C:232, simpleControl.C:67-71).
+        //
+        // This loop reported component 0 -- wrong whenever Uy's initial residual exceeds Ux's, which
+        // on rhoBox is iterations 2, 3 and 8 (OpenFOAM at iteration 2: Ux 3.224e-01, Uy 6.042e-01; this
+        // arm printed 3.224e-01) -- and the reason it did not take a max over three is that it solved
+        // all three unconditionally: the empty direction's system has a ~0 right-hand side and a zero
+        // field, so its normFactor-scaled residual reads 1 on every iteration (measured on rhoBox: Uz
+        // 1.000e+00 at iterations 1..3), which would block convergence on every 2D case. The mask
+        // in.solutionD is derived from the empty patches exactly as calcDirections does
+        // (solution_directions.cuh) and the knocked-out component is not solved, as in OpenFOAM.
+        scalar uInitialResidual = 0.0;
         for (int k = 0; k < 3; ++k)
         {
+            if (in.solutionD[k] < 0) continue;
             DeviceBuffer<scalar> diagC, b;
             deviceFold(dm, Mp.relaxed ? Mp.relaxedDiag : Mp.diag, Mp.source[k], Mp.iC[k], Mp.bC[k], diagC, b);
             const DeviceLduView A = foldedViewM(dm, Mp, diagC);
@@ -350,13 +365,9 @@ Residuals rhoSimpleStep(
                 deviceSymGaussSeidel(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIterU, &perf, in.minIterU);
             else
                 perf = deviceJacobiBiCGStab(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIterU, /*checkEvery=*/1, in.minIterU);
-            // U is reported under the FIRST component's initial residual, NOT a cmptMax over three.
-            // OF's cmptMax runs over a performance object whose skipped components were never solved
-            // (fvMatrixSolve.C:157-164 continues on validComponents == -1) while this path solves all
-            // three unconditionally -- so a cmptMax here would include the degenerate empty/wedge
-            // direction and block convergence on every 2D case.
-            if (k == 0) res["U"] = perf.initialResidual;
+            uInitialResidual = std::max(uInitialResidual, perf.initialResidual);
         }
+        res["U"] = uInitialResidual;
     }
 
     // ---- EEqn.H ------------------------------------------------------------------------------

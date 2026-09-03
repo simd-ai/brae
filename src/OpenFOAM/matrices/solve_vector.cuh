@@ -8,10 +8,17 @@
 #include "ldu_matrix.cuh"
 #include "geometric_field.cuh"
 #include "pbicgstab.cuh"
+#include "solution_directions.cuh"
 #include <vector>
 
 namespace brae {
 
+// `solutionD` is fvMesh::validComponents<vector>() -- polyMesh::solutionD(): given, a component it
+// knocks out (-1) is NOT solved, exactly fvMatrixSolve.C:162-164's `continue`, and its entry in
+// `perfCmpt` stays default-constructed (initialResidual 0, SolverPerformance.H:117-121). Null solves
+// all three, which is what the simpleFoam callers still ask for. `perfCmpt`, when given, receives the
+// three per-component performances (fvMatrixSolve.C:235 `solverPerfVec.replace(cmpt, solverPerf)`);
+// the RETURN stays component 0's, for the callers that predate it.
 inline SolverPerformance solveVector(
     const FvVectorMatrix& M,
     GeometricField<vector>& U,
@@ -20,12 +27,16 @@ inline SolverPerformance solveVector(
     scalar tolerance,
     scalar relTol,
     int maxIter,
-    int minIter = 0)
+    int minIter = 0,
+    const SolutionDirections* solutionD = nullptr,
+    SolverPerformance* perfCmpt = nullptr)
 {
     const label nC = m.nCells();
     SolverPerformance perf;
     for (int cmpt = 0; cmpt < 3; ++cmpt)
     {
+        if (perfCmpt) perfCmpt[cmpt] = SolverPerformance();
+        if (solutionD && !solutionD->valid(cmpt)) continue;
         FvScalarMatrix Mc;
         Mc.diag = M.diag;
         Mc.upper = M.upper;
@@ -48,6 +59,7 @@ inline SolverPerformance solveVector(
         for (label c = 0; c < nC; ++c) psi[c] = component(U.internal[c], cmpt);
         const SolverPerformance p = pbicgstab(Mc, psi, m, patches, tolerance, relTol, maxIter, minIter);
         for (label c = 0; c < nC; ++c) setComponent(U.internal[c], cmpt, psi[c]);
+        if (perfCmpt) perfCmpt[cmpt] = p;
         if (cmpt == 0) perf = p;
     }
     U.evaluateBoundary();   // correctBoundaryConditions
