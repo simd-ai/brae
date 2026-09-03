@@ -9,6 +9,7 @@
 #include "transport_model.cuh"
 #include "equation_of_state.cuh"
 #include "linearViscousStress_cpp.cuh"   // effectiveFaceViscosity: interpolate with the field own boundary
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -164,6 +165,89 @@ void relaxField(
     for (std::size_t c = 0; c < x.size(); ++c) x[c] = xOld[c] + alpha * (x[c] - xOld[c]);
 }
 
+
+// The boundary half of GeometricField::relax. operator== assigns both halves (GeometricField.C:1094 and
+// :1420, GeometricBoundaryField.C operator== -> fvPatchField::operator== -> Field::operator=), so the
+// patch VALUE OpenFOAM carries out of p.relax() is prevIter_b + alpha*(p_b - prevIter_b) on every patch.
+// It is stored on every class whose value persists between evaluations -- the fixedValue family
+// (totalPressure is the one whose value moves), fixedGradient, zeroGradient, empty and symmetry, where
+// setStoredValues writes value_ -- and re-derived from the relaxed internal field on the
+// ExtrapolatedValue family (calculated, mixed, the flux switches, piov), whose setStoredValues writes
+// the REFERENCE value and would overwrite a freestream value with the blend. On a zeroGradient face the
+// two are the same arithmetic on the same operands; on the totalPressure inlet they are not, and that
+// is the face this exists for.
+void relaxBoundary(
+    GeometricField<scalar>&                 p,
+    const std::vector<std::vector<scalar>>& prevIter,
+    scalar                                  alpha)
+{
+    if (alpha <= 0.0 || alpha >= 1.0) return;
+    for (std::size_t pi = 0; pi < p.boundary.size(); ++pi)
+    {
+        const int cat = p.boundary[pi]->bcCategory();
+        if (cat == 2 || cat == 3 || cat == 4 || cat == 5 || cat == 6)
+        {
+            p.boundary[pi]->evaluate(p.internal);
+            continue;
+        }
+        std::vector<scalar> v = p.boundary[pi]->value();
+        const std::vector<scalar>& prev = prevIter[pi];
+        for (std::size_t i = 0; i < v.size() && i < prev.size(); ++i)
+        {
+            v[i] = prev[i] + alpha * (v[i] - prev[i]);
+        }
+        p.boundary[pi]->setStoredValues(std::move(v));
+    }
+}
+
+
+// pressureInletOutletVelocityFvPatchVectorField::updateCoeffs (its .C:170-184): valueFraction from the
+// flux the patch currently holds, then directionMixed::evaluate (directionMixedFvPatchField.C:157-175)
+// -- value = transform(vf, refValue) + transform(I - vf, patchInternalField()), i.e. n(n & U_cell) on an
+// inflow face and U_cell on an outflow one. OpenFOAM runs this wherever it reaches an updateCoeffs or
+// an evaluate on U: the momentum fvMatrix constructor, the solve's correctBoundaryConditions and the
+// velocity corrector's. Every other patch class ignores the call.
+void updatePressureInletOutletVelocity(
+    RhoSimpleFields&            f,
+    const std::vector<FvPatch>& patches)
+{
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        // patchInternalField: U at the cell each face belongs to.
+        std::vector<vector> Ucell(static_cast<std::size_t>(patches[pi].size), vector{});
+        for (label i = 0; i < patches[pi].size; ++i)
+        {
+            const label c = patches[pi].faceCells[i];
+            if (c >= 0 && c < static_cast<label>(f.U.internal.size())) Ucell[i] = f.U.internal[c];
+        }
+        f.U.boundary[pi]->updateFromPatchVelocity(
+            f.U.boundary[pi]->value(),
+            Ucell,
+            f.rho.boundary[pi]->value());
+    }
+}
+
+
+// totalPressureFvPatchScalarField::updateCoeffs (its .C:152-225, the psiName_ == "none" branch):
+// p_b = p0 - 0.5*rho_b*neg(phi_b)*|U_b|^2 from the patch fields AS THEY STAND -- U's patch value, the
+// registered phi and rho's patch value (lookupPatchField, :162-174). OpenFOAM reaches it inside the
+// pressure fvMatrix constructor and again from the correctBoundaryConditions pEqn.H:100-103 runs after
+// the limiter; nowhere else. Every other patch class ignores the call.
+void updateTotalPressure(
+    RhoSimpleFields&            f,
+    const std::vector<FvPatch>& patches)
+{
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        f.p.boundary[pi]->updateFromFlux(f.phi.boundary[pi]);
+        f.p.boundary[pi]->updateFromPatchVelocity(
+            f.U.boundary[pi]->value(),
+            f.U.boundary[pi]->value(),
+            f.rho.boundary[pi]->value());
+    }
+    f.p.evaluateBoundary();
+}
+
 } // namespace
 
 
@@ -189,6 +273,14 @@ Residuals rhoSimpleStep(
     const std::vector<scalar> rhoPrevIter = f.rho.internal;
     std::vector<std::vector<scalar>> rhoBndPrevIter(patches.size());
     for (std::size_t pi = 0; pi < patches.size(); ++pi) rhoBndPrevIter[pi] = f.rho.boundary[pi]->value();
+    // p.prevIter(), banked at the same place for the same reason (simpleControl.C:157), BOTH halves:
+    // p.relax() at the tail is the same operator== as rho's and assigns the boundary too
+    // (GeometricField.C:1094, :1420). The totalPressure inlet is a patch whose value MOVES between here
+    // and the tail -- it is recomputed before the pressure assembly -- so the blend the tail leaves has
+    // to be against the value this iteration started with, not against the recomputed one.
+    const std::vector<scalar> pPrevIter = f.p.internal;
+    std::vector<std::vector<scalar>> pBndPrevIter(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi) pBndPrevIter[pi] = f.p.boundary[pi]->value();
 
     // updateCoeffs() for the flux-conditional boundary conditions. OpenFOAM's inletOutlet reads phi from
     // the object registry inside updateCoeffs, which the matrix assembly calls before asking for any
@@ -239,35 +331,24 @@ Residuals rhoSimpleStep(
         f.U.boundary[pi]->updateFromDensity(rhoBnd[pi]);
     }
 
-    // updateCoeffs() for the two patches whose value is a function of the patch VELOCITY: totalPressure
-    // on p, and pressureInletOutletVelocity on U. Both carried a comment saying the DEVICE recomputes
-    // them each step and nothing on the host ever did, so each sat at its seeded value for an entire run.
-    // validation/rhoTP carries both and DIVERGED through this driver -- T 3.79e+38, U 3.09e+20, against
-    // an OpenFOAM run that converges in 411 iterations -- because p's inlet was pinned at p0 = 100200
-    // against a fixedValue 100000 outlet while U's inlet never moved.
+    // updateCoeffs() for pressureInletOutletVelocity, which OpenFOAM reaches inside the momentum
+    // fvMatrix constructor (fvMatrix.C:396). Its updateCoeffs is not a coefficient update alone: it sets
+    // valueFraction = neg(phi)*(I - nn) from the flux THIS iteration starts with and then calls
+    // directionMixed::evaluate itself (pressureInletOutletVelocityFvPatchVectorField.C:180-183), so the
+    // patch VALUE at the assembly is n(n & U_cell) on inflow faces and U_cell on outflow ones, from the
+    // cell velocity as it stands here. That is the number the previous iteration's post-correction
+    // evaluate left (same flux, same cells) -- and at iteration 1, where no evaluate has run, it is what
+    // OpenFOAM computes too, so the 0/U seed never reaches a momentum assembly on any iteration.
     //
-    // AFTER flowRateInletVelocity and with THIS iteration's flux, matching the order OpenFOAM reaches
-    // them in: every one of these is an updateCoeffs() the fvMatrix constructor runs before reading a
-    // coefficient. totalPressure takes U's PATCH values and rho's; piov takes the FACE CELL velocity.
-    {
-        std::vector<vector> Ucell(patches.size() ? 0 : 0);
-        for (std::size_t pi = 0; pi < patches.size(); ++pi)
-        {
-            const std::vector<vector>& Ub = f.U.boundary[pi]->value();
-            // patchInternalField: U at the cell each face belongs to, which is what OF's piov reads.
-            Ucell.assign(static_cast<std::size_t>(patches[pi].size), vector{});
-            for (label i = 0; i < patches[pi].size; ++i)
-            {
-                const label c = patches[pi].faceCells[i];
-                if (c >= 0 && c < (label)f.U.internal.size()) Ucell[i] = f.U.internal[c];
-            }
-            f.p.boundary[pi]->updateFromFlux(f.phi.boundary[pi]);
-            f.p.boundary[pi]->updateFromPatchVelocity(Ub, Ucell, rhoBnd[pi]);
-            f.U.boundary[pi]->updateFromPatchVelocity(Ub, Ucell, rhoBnd[pi]);
-        }
-        f.p.evaluateBoundary();
-        f.U.evaluateBoundary();
-    }
+    // totalPressure is NOT updated here any more. OpenFOAM reaches p's updateCoeffs only inside the
+    // PRESSURE equation's constructor (below, once the momentum solve has moved U's patch value), so
+    // what -fvc::grad(p) reads at the momentum assembly is the value the previous tail left: the relaxed
+    // blend from p.relax(), or the recompute pEqn.H:100-103 runs after the limiter. Updating it here from
+    // the pre-solve velocity and the tail's rho put a one-solve-old dynamic head into the pressure
+    // equation and a fresh value where OpenFOAM carries the blend: rhoTP at t=1 read U 2.15e-02 relL2
+    // against OpenFOAM with the written inlet still at the (5 0 0) seed, OpenFOAM's at (13.44 0 0).
+    updatePressureInletOutletVelocity(f, patches);
+    f.U.evaluateBoundary();
 
     // ---- UEqn.H ----
     RhoMomentumInput uin;
@@ -303,9 +384,35 @@ Residuals rhoSimpleStep(
         // A(), H() and H1(), and addPressureGradient would otherwise leave the source carrying -grad(p).
         FvVectorMatrix Mp = UEqn;
         addPressureGradient(Mp, f.p, m, g, patches);
-        const SolverPerformance up = solveVector(Mp, f.U, m, patches, in.tolU, in.relTolU, in.maxIterU, in.minIterU);
-        res["U"] = up.initialResidual;
+        // fvMatrix<vector>::solveSegregated solves only the components polyMesh::solutionD() leaves
+        // valid (fvMatrixSolve.C:157-164) -- on a 2D case the empty direction is never solved and its
+        // SolverPerformance stays at Zero -- and what residualControl compares is cmptMax over the
+        // per-component vector it stores (solutionControl.C:232, simpleControl.C:67-71).
+        //
+        // This step reported component 0. Wrong whenever Uy's initial residual exceeds Ux's, which on
+        // rhoBox is iterations 2, 3 and 8 (OpenFOAM at iteration 2: Ux 3.224e-01, Uy 6.042e-01; brae
+        // printed 3.224e-01), so a residualControl on U fired at a different iteration from OpenFOAM's.
+        // A max over three components SOLVED unconditionally would be the opposite error: the empty
+        // direction's system has a ~0 right-hand side and a zero field, and its normFactor-scaled
+        // residual reads 1 on every iteration (measured on rhoBox: Uz 1.000e+00 at iterations 1..3 on
+        // both arms), which would block convergence on every 2D case. Hence the mask, derived from the
+        // empty patches the way calcDirections does, and the skip.
+        const SolutionDirections solutionD = solutionDirections(patches);
+        SolverPerformance upCmpt[3];
+        solveVector(Mp, f.U, m, patches, in.tolU, in.relTolU, in.maxIterU, in.minIterU, &solutionD, upCmpt);
+        scalar uInitialResidual = 0.0;
+        for (int cmpt = 0; cmpt < 3; ++cmpt)
+        {
+            uInitialResidual = std::max(uInitialResidual, upCmpt[cmpt].initialResidual);
+        }
+        res["U"] = uInitialResidual;
     }
+    // fvMatrixSolve.C:242 -- every solve ends with psi.correctBoundaryConditions(). On the piov patch
+    // that is updateCoeffs -> evaluate again (fvPatchField.C:343 cleared the updated flag after the
+    // assembly's evaluate): the NEW cell velocity projected with the flux mask the iteration started
+    // with. The energy equation's boundary Ekp and the totalPressure update below both read this value,
+    // and a patch class whose evaluate() keeps its stored value needs the projection pushed in.
+    updatePressureInletOutletVelocity(f, patches);
     f.U.evaluateBoundary();
 
     // ---- EEqn.H ----
@@ -393,7 +500,6 @@ Residuals rhoSimpleStep(
     pin.hasMRF               = in.hasMRF;
     pin.hasFvOptions         = in.hasFvOptions;
 
-    const std::vector<scalar> pOld = f.p.internal;
     std::vector<scalar>       rAUorAtU;      // whichever the velocity corrector uses
     std::vector<vector>       HbyA;
     SurfaceScalarField        phiHbyA;
@@ -409,6 +515,10 @@ Residuals rhoSimpleStep(
 
         const ConsistentPressureStages st =
             consistentPressurePredictor(UEqn, f.U, f.p, pin, m, g, patches);
+        // totalPressure's updateCoeffs, where OpenFOAM runs it: inside the pressure fvMatrix's
+        // constructor (fvMatrix.C:396), from U's PATCH value as the momentum solve left it, the flux the
+        // iteration started with, and rho's patch value as pcEqn.H:1 just set it.
+        updateTotalPressure(f, patches);
         // `while (simple.correctNonOrthogonal())` -- pcEqn.H:67. Each pass re-assembles from the SAME
         // stages (phiHbyA, rhorAtU are outside the loop in OF too) and re-solves; what changes between
         // passes is the deferred non-orthogonal correction, recomputed from the just-solved p. The
@@ -432,6 +542,8 @@ Residuals rhoSimpleStep(
     else
     {
         const PressureStages st = pressurePredictor(UEqn, f.U, f.p, pin, m, g, patches);
+        // The same updateCoeffs on this branch, with rho's patch value as the previous tail left it.
+        updateTotalPressure(f, patches);
         // The same loop for pEqn.H:56 -- see the pcEqn branch above for why it is shaped this way.
         for (label corr = 0; corr <= in.nNonOrthogonalCorrectors; ++corr)
         {
@@ -504,17 +616,19 @@ Residuals rhoSimpleStep(
     // p.relax() -- the FIELD factor, not the equation one. Both are named `p` in fvSolution and they live
     // in different sub-dictionaries; using the equation factor here relaxes the wrong thing.
     //
-    // ONLY THE INTERNAL FIELD, and OpenFOAM relaxes BOTH halves: GeometricField::relax is
-    // operator==(prevIter() + alpha*(*this - prevIter())) (GeometricField.C) and operator== assigns the
-    // boundary too -- the same fact this driver relies on for rho below. Relaxing p's boundary here as
-    // well was written, measured, and REVERTED: it is bit-identical on rhoBox (4.989295e-14 either way)
-    // and does not move rhoTP's trace by a digit, because the only patch whose p value moves is
-    // totalPressure and the next iteration's updateCoeffs overwrites it with the raw
-    // p0 - 0.5*rho*|U_b|^2 before anything reads the relaxed one. So no fixture in the tree can see the
-    // difference, and shipping it would have been unverifiable churn. Recorded rather than applied; a
-    // case with a p patch whose value moves and ISN'T recomputed each iteration would need it.
-    relaxField(f.p.internal, pOld, in.relaxP);
+    // BOTH HALVES. GeometricField::relax is operator==(prevIter() + alpha*(*this - prevIter()))
+    // (GeometricField.C:1094) and operator== assigns the boundary too (:1420), after the solve's own
+    // correctBoundaryConditions (fvMatrixSolve.C:309) has put the solved cell value on every zeroGradient
+    // face. The blend is what U = HbyA - rAU*grad(p) reads on the next line and, on a case without a
+    // pressure limiter, what the next momentum assembly reads. On the totalPressure inlet it is a
+    // different number from both the fresh p0 - 0.5*rho*|U_b|^2 and the previous one -- rhoTP at t=1
+    // blends the 100200 seed towards 100095 at 0.3 -- where relaxing the internal field alone and
+    // re-evaluating had left the fresh value. That variant was measured bit-identical on rhoBox, whose p
+    // patches are all fixedValue or zeroGradient and for which the blend IS the re-evaluation; that is
+    // why an earlier note here called the boundary half unverifiable. rhoTP's inlet sees it.
     f.p.evaluateBoundary();
+    relaxField(f.p.internal, pPrevIter, in.relaxP);
+    relaxBoundary(f.p, pBndPrevIter, in.relaxP);
 
     // U = HbyA - rAtU*fvc::grad(p), with rAtU on the SIMPLEC path and rAU otherwise.
     {
@@ -525,6 +639,16 @@ Residuals rhoSimpleStep(
                                       HbyA[c].y - rAUorAtU[c]*gradP[c].y,
                                       HbyA[c].z - rAUorAtU[c]*gradP[c].z };
         }
+        // U.correctBoundaryConditions() -- pEqn.H:87 / pcEqn.H:100. Every flux-switched patch evaluates
+        // through its updateCoeffs again here (the updated flag was cleared by the solve's evaluate), and
+        // phi is the NEW flux by now (pEqn.H:73), so the piov mask and inletOutlet's valueFraction are
+        // rebuilt from it and the piov value from the corrected cells: what gets written, what the
+        // closure reads, and what the next momentum assembly finds.
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            f.U.boundary[pi]->updateFromFlux(f.phi.boundary[pi]);
+        }
+        updatePressureInletOutletVelocity(f, patches);
         f.U.evaluateBoundary();
     }
 
@@ -543,7 +667,12 @@ Residuals rhoSimpleStep(
         const scalar dp = (scalar)(((double)f.initialMass - num) / den);
         for (label c = 0; c < nC; ++c) f.p.internal[c] += dp;
     }
-    if (pLimited || closedVolume) f.p.evaluateBoundary();
+    // p.correctBoundaryConditions() -- pEqn.H:100-103, keyed on `limitMaxP_ || limitMinP_` (pressureControl.C
+    // limit(), true whenever a limit is CONFIGURED). On the totalPressure inlet this is an updateCoeffs
+    // (the flag was cleared by the solve's evaluate), i.e. a recompute from the NEW flux, the corrected
+    // U's patch value and rho's patch value as it stands -- BEFORE the tail's rho = thermo.rho() below.
+    // It is the value written to disk and the one the next momentum assembly reads through grad(p).
+    if (pLimited || closedVolume) updateTotalPressure(f, patches);
 
     // rho = thermo.rho(), and rho.relax() only when NOT transonic.
     //

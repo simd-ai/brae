@@ -87,8 +87,46 @@ void mixedUpdateKernel(
 }
 
 
-// pressureInletOutletVelocity updateCoeffs (directionMixed): per piov face, outflow -> zeroGradient (bcType 0),
-// inflow -> fixedValue (bcType 1) with refValue = n*(n.U_cell) (the normal projection; tangential refValue 0).
+// pressureInletOutletVelocity updateCoeffs (directionMixed,
+// pressureInletOutletVelocityFvPatchVectorField.C:170-184): per piov face, from the flux sign. Outflow
+// (phi >= 0): valueFraction 0, every component zeroGradient (bcType 0). Inflow (phi < 0): valueFraction
+// = I - nn, and the transform coefficients OpenFOAM derives
+// from it -- transformFvPatchField.C:95-135 with snGradTransformDiag_k = sqrt|vf_kk| = sqrt(1 - n_k^2)
+// (directionMixedFvPatchField.C:180-200): valueIC 1 - d_k, gradIC -dc*d_k, value n(n.U_cell) -- are the
+// mixed (cat 5) kernels' with
+//     vf_k  = d_k
+//     ref_k = (value_k - (1 - d_k)*U_c[k]) / d_k
+// so that the blend vf*ref + (1 - vf)*U_c reproduces the value exactly; the same construction the wedge
+// uses. A component with d_k = 0 (the normal axis of an axis-aligned face) is pure zeroGradient and is
+// typed 0 rather than divided by zero.
+//
+// This kernel used to type every inflow component fixedValue at n(n.U_cell): the normal component then
+// entered the momentum matrix as an explicit, lagged copy of the cell where OpenFOAM couples it as
+// zeroGradient, and the tangential ones as fixedValue 0 by accident of the same rule. With the patch
+// VALUES already OpenFOAM's, rhoTP at t=1 read device U 2.3e-01 relL2 against OpenFOAM before this.
+__device__ __forceinline__
+void piovComponent(
+    scalar  d,
+    scalar  value,
+    scalar  uc,
+    label*  ty,
+    scalar* vf,
+    scalar* ref)
+{
+    if (d > scalar(0))
+    {
+        *ty  = 5;
+        *vf  = d;
+        *ref = (value - (scalar(1) - d) * uc) / d;
+    }
+    else
+    {
+        *ty  = 0;
+        *vf  = scalar(0);
+        *ref = scalar(0);
+    }
+}
+
 __global__
 void piovUpdateKernel(
     int n,
@@ -104,26 +142,47 @@ void piovUpdateKernel(
     label* __restrict__ ty0,
     label* __restrict__ ty1,
     label* __restrict__ ty2,
+    scalar* __restrict__ vf0,
+    scalar* __restrict__ vf1,
+    scalar* __restrict__ vf2,
     scalar* __restrict__ r0,
     scalar* __restrict__ r1,
-    scalar* __restrict__ r2)
+    scalar* __restrict__ r2,
+    int     directionMixed)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n || !piov[i]) return;
 
-    if (phiB[i] >= 0.0)   // outflow -> zeroGradient
+    if (phiB[i] >= 0.0)   // outflow -> zeroGradient on every component
     {
         ty0[i] = ty1[i] = ty2[i] = 0;
+        vf0[i] = vf1[i] = vf2[i] = scalar(0);
+        return;
     }
-    else   // inflow -> fixedValue normal projection
+    const int c = fc[i];
+    const scalar Un = nx[i] * Ux[c] + ny[i] * Uy[c] + nz[i] * Uz[c];         // n . U_cell
+    if (!directionMixed)
     {
-        const int c = fc[i];
-        const scalar Un = nx[i] * Ux[c] + ny[i] * Uy[c] + nz[i] * Uz[c];         // n . U_cell
+        // The typing this kernel had before item 19: every inflow component fixedValue at n(n.U_cell).
+        // Kept for the FROZEN incompressible driver (device_simple_foam.cu), whose flux and matrix
+        // machinery grew up around it: with the directionMixed typing below, validation/piov moved
+        // from U 1.1459e-04 / p 1.0915e-03 against OpenFOAM's converged answer to 1.4911e-03 / 1.2878e-02
+        // (bisected 2026-09-03 with the host class held new: the kernel alone), while the rhoSimpleFoam
+        // mirror, which re-evaluates the patch where OpenFOAM does, went to 1e-12 with it. The mirror
+        // asks for the directionMixed form explicitly; the legacy call site does not.
         ty0[i] = ty1[i] = ty2[i] = 1;
+        vf0[i] = vf1[i] = vf2[i] = scalar(1);
         r0[i] = nx[i] * Un;
         r1[i] = ny[i] * Un;
         r2[i] = nz[i] * Un;
+        return;
     }
+    const scalar dx = sqrt(fmax(scalar(0), scalar(1) - nx[i] * nx[i]));
+    const scalar dy = sqrt(fmax(scalar(0), scalar(1) - ny[i] * ny[i]));
+    const scalar dz = sqrt(fmax(scalar(0), scalar(1) - nz[i] * nz[i]));
+    piovComponent(dx, nx[i] * Un, Ux[c], &ty0[i], &vf0[i], &r0[i]);
+    piovComponent(dy, ny[i] * Un, Uy[c], &ty1[i], &vf1[i], &r1[i]);
+    piovComponent(dz, nz[i] * Un, Uz[c], &ty2[i], &vf2[i], &r2[i]);
 }
 
 
@@ -342,14 +401,18 @@ void deviceUpdatePressureInletOutletVelocity(
     const DeviceBuffer<scalar>& phiBnd,
     const DeviceBuffer<scalar>& Ux,
     const DeviceBuffer<scalar>& Uy,
-    const DeviceBuffer<scalar>& Uz)
+    const DeviceBuffer<scalar>& Uz,
+    bool directionMixed)
 {
     const int n = dbU.n;
     if (n == 0) return;
     piovUpdateKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].piovMask.data(), dbU.comp[0].faceCell.data(), phiBnd.data(),
                                           dbU.nx.data(), dbU.ny.data(), dbU.nz.data(), Ux.data(), Uy.data(), Uz.data(),
                                           dbU.comp[0].bcType.data(), dbU.comp[1].bcType.data(), dbU.comp[2].bcType.data(),
-                                          dbU.comp[0].refValue.data(), dbU.comp[1].refValue.data(), dbU.comp[2].refValue.data());
+                                          dbU.comp[0].valueFraction.data(), dbU.comp[1].valueFraction.data(),
+                                          dbU.comp[2].valueFraction.data(),
+                                          dbU.comp[0].refValue.data(), dbU.comp[1].refValue.data(), dbU.comp[2].refValue.data(),
+                                          directionMixed ? 1 : 0);
     cudaCheck(cudaGetLastError(), "piovUpdate");
 }
 

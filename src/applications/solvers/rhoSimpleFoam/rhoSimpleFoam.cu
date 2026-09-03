@@ -138,6 +138,24 @@ void closedVolumeCorrection(
     p.copyFrom(out);
 }
 
+// p.relax() on the totalPressure faces. GeometricField::relax assigns BOTH halves through operator==
+// (GeometricField.C:1094, :1420), so the patch VALUE OpenFOAM carries out of p.relax() is the blend
+// prevIter_b + alpha*(p_b - prevIter_b). On the device that value lives in refValue -- deviceBCValue
+// reproduces a fixedValue face from it -- so the blended f.pBnd is written back there on the faces
+// tpMask marks. Every other fixedValue face is unchanged by the blend, and every zeroGradient face is
+// re-derived from the relaxed cell: the same function on the same operands, bit for bit.
+__global__
+void storeTotalPressureValueKernel(
+    int    n,
+    const label*  __restrict__ tpMask,
+    const scalar* __restrict__ pBnd,
+    scalar*       __restrict__ refValue)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || !tpMask[i]) return;
+    refValue[i] = pBnd[i];
+}
+
 } // namespace
 
 
@@ -183,24 +201,23 @@ void updateBoundaryCoeffs(
         deviceBCValue(dbP, f.p, f.pBnd);
     }
 
-    // 2b. pressureInletOutletVelocity and totalPressure -- the two patches whose value is a function of
-    //     the patch VELOCITY. Both device kernels have existed and been called by the incompressible
-    //     driver all along (device_simple_foam.cu:940 and :992); this driver called neither, and the
-    //     host classes carried a comment saying the DEVICE recomputes them each step. validation/rhoTP
-    //     carries both, and DIVERGED through this lineage -- T 3.79e+38 -- while the legacy path, which
-    //     does compute them, converges against OpenFOAM.
+    // 2b. pressureInletOutletVelocity, whose updateCoeffs OpenFOAM reaches inside the momentum fvMatrix
+    //     constructor (fvMatrix.C:396). It is not a coefficient update alone: it sets valueFraction =
+    //     neg(phi)*(I - nn) from the flux THIS iteration starts with and then calls directionMixed::evaluate
+    //     itself (pressureInletOutletVelocityFvPatchVectorField.C:180-183), so the patch VALUE at the
+    //     assembly is n(n & U_cell) on inflow faces from the cell velocity as it stands here -- the number
+    //     the previous iteration's post-correction evaluate left, and at iteration 1 what OpenFOAM computes
+    //     too, so the 0/U seed never reaches a momentum assembly.
     //
-    //     THE COMPRESSIBLE FORM TAKES rho. OpenFOAM's totalPressure has three branches
-    //     (totalPressureFvPatchScalarField.C): p in Pa with psi unnamed is p0 - 0.5*rho*neg(phi)*|U|^2;
-    //     p in Pa with psi NAMED is the isentropic high-speed form; p/rho dimensions is the
-    //     incompressible p0 - 0.5*neg(phi)*|U|^2. This solver is always the first of those, so rhoBnd is
-    //     passed -- omitting it silently selects the incompressible form, wrong by a factor of rho.
+    //     totalPressure is NOT updated here any more. OpenFOAM reaches p's updateCoeffs only inside the
+    //     PRESSURE equation's constructor (once the momentum solve has moved U's patch value), so what
+    //     -fvc::grad(p) reads at the momentum assembly is the value the previous tail left: the relaxed
+    //     blend from p.relax(), or the recompute pEqn.H:100-103 runs after the limiter. Updating it here
+    //     from the pre-solve velocity put a one-solve-old dynamic head into the pressure equation and a
+    //     fresh value where OpenFOAM carries the blend: rhoTP at t=1 read U 2.3e-01 relL2 against
+    //     OpenFOAM on this arm with the written inlet still at the (5 0 0) seed.
     {
-        DeviceBuffer<scalar> ubx, uby, ubz;
-        deviceBCValue(dbU.comp[0], f.Ux, ubx);
-        deviceBCValue(dbU.comp[1], f.Uy, uby);
-        deviceBCValue(dbU.comp[2], f.Uz, ubz);
-        deviceUpdatePressureInletOutletVelocity(dbU, f.phiBnd, f.Ux, f.Uy, f.Uz);
+        deviceUpdatePressureInletOutletVelocity(dbU, f.phiBnd, f.Ux, f.Uy, f.Uz, /*directionMixed=*/true);
         // symmetry/slip and wedge, against THIS iteration's cell velocity -- the header's caller
         // contract has listed both since it was written (rhoUEqn.cuh, clause 3), and the incompressible
         // driver has always run them (device_simple_foam.cu:955-956); this driver did not, which no
@@ -209,8 +226,6 @@ void updateBoundaryCoeffs(
         // components and is where the missing calls measured.
         deviceUpdateSymmetry(dbU, f.Ux, f.Uy, f.Uz);
         deviceUpdateWedge(dbU, f.Ux, f.Uy, f.Uz);
-        deviceUpdateTotalPressure(dbP, f.phiBnd, ubx, uby, ubz, &f.rhoBnd);
-        deviceBCValue(dbP, f.p, f.pBnd);
     }
 
     // 3. flowRateInletVelocity, and WHICH rho matters: avgU = -mdot/gSum(rho*magSf) is held against the
@@ -283,8 +298,12 @@ Residuals rhoSimpleStep(
     // storePrevIter(): OpenFOAM banks prevIter at the TOP of the iteration, so p.relax() below relaxes
     // against the value p had before this iteration touched it -- not against the value it had at the
     // start of the pressure solve.
-    DeviceBuffer<scalar> pPrev;
+    DeviceBuffer<scalar> pPrev, pBndPrev;
     deviceCopy(pPrev, f.p);
+    // BOTH halves: p.relax() assigns the boundary too (GeometricField.C:1094, :1420), and the
+    // totalPressure inlet is a patch whose value moves between here and the tail -- it is recomputed
+    // before the pressure assembly -- so the blend has to be against the value the iteration started with.
+    deviceCopy(pBndPrev, f.pBnd);
 
     updateBoundaryCoeffs(f, dbU, dbP, dbHe, dbT, in);
 
@@ -389,6 +408,11 @@ Residuals rhoSimpleStep(
         // evaluation -- while brae carries them as a mixed refValue that some earlier kernel had to
         // build FROM the internal field. Left unrefreshed, this call blends the new U_c towards a ref
         // built from the U the iteration started with.
+        //
+        // AND THE piov refValue: fvMatrixSolve.C:242 ends the solve with psi.correctBoundaryConditions(),
+        // which on that patch is updateCoeffs -> evaluate again -- the NEW cell velocity projected with
+        // the flux mask the iteration started with (f.phiBnd is still that flux here).
+        deviceUpdatePressureInletOutletVelocity(dbU, f.phiBnd, f.Ux, f.Uy, f.Uz, /*directionMixed=*/true);
         deviceUpdateSymmetry(dbU, f.Ux, f.Uy, f.Uz);
         deviceUpdateWedge(dbU, f.Ux, f.Uy, f.Uz);
         deviceBCValue(dbU.comp[0], f.Ux, f.UxBnd);
@@ -483,6 +507,14 @@ Residuals rhoSimpleStep(
         closedVolume = st.closedVolume;
     }
 
+    // totalPressure's updateCoeffs, where OpenFOAM runs it: inside the pressure fvMatrix's constructor
+    // (fvMatrix.C:396; totalPressureFvPatchScalarField.C:152-225, the psiName_ == "none" branch), from
+    // U's PATCH value as the momentum solve left it (f.UxBnd, refreshed above), the flux the iteration
+    // started with, and rho's patch value as it stands -- pcEqn.H:1's on the SIMPLEC branch, the previous
+    // tail's on the other.
+    deviceUpdateTotalPressure(dbP, f.phiBnd, f.UxBnd, f.UyBnd, f.UzBnd, &f.rhoBnd);
+    deviceBCValue(dbP, f.p, f.pBnd);
+
     // The non-orthogonal corrector loop. solutionControlI.H:78-95 runs it nNonOrth+1 times, and only the
     // FINAL pass writes phi (simple.finalNonOrthogonalIter()).
     const label nCorr = in.nNonOrthogonalCorrectors + 1;
@@ -551,8 +583,27 @@ Residuals rhoSimpleStep(
     // live in different sub-dictionaries; using the equation factor here relaxes the wrong thing.
     // AFTER the flux correction and BEFORE the velocity correction, so phi is built from the unrelaxed
     // pressure and U from the relaxed one.
-    relaxField(f.p, pPrev, in.relaxP);
+    //
+    // BOTH HALVES. GeometricField::relax is operator==(prevIter() + alpha*(*this - prevIter()))
+    // (GeometricField.C:1094) and operator== assigns the boundary too (:1420), after the solve's own
+    // correctBoundaryConditions (fvMatrixSolve.C:309) has put the solved cell value on every zeroGradient
+    // face -- hence the boundary evaluation BEFORE the cells are relaxed. The blend is what
+    // U = HbyA - rAU*grad(p) reads next and, without a pressure limiter, what the next momentum assembly
+    // reads. On the totalPressure inlet it is a different number from both the fresh p0 - 0.5*rho*|U_b|^2
+    // and the previous one (rhoTP at t=1 blends the 100200 seed towards 100095 at 0.3); everywhere else
+    // it is the same number the old evaluate-after-relax produced.
     deviceBCValue(dbP, f.p, f.pBnd);
+    relaxField(f.p, pPrev, in.relaxP);
+    relaxField(f.pBnd, pBndPrev, in.relaxP);
+    if (dbP.n > 0)
+    {
+        storeTotalPressureValueKernel<<<(dbP.n + 255) / 256, 256>>>(
+            dbP.n,
+            dbP.tpMask.data(),
+            f.pBnd.data(),
+            dbP.refValue.data());
+        cudaCheck(cudaGetLastError(), "rhoSimpleFoam storeTotalPressureValue");
+    }
 
     // U = HbyA - rAtU*fvc::grad(p), with rAtU on the SIMPLEC path and rAU otherwise.
     {
@@ -586,6 +637,13 @@ Residuals rhoSimpleStep(
         // The symmetry/wedge refValue is rebuilt first, for the reason given at the energy equation's
         // refresh above: their value is a function of the CURRENT internal field, and the velocity
         // correction has just moved it.
+        //
+        // And every flux-switched patch evaluates through its updateCoeffs again here (the updated flag
+        // was cleared by the solve's evaluate), with phi the NEW flux by now (pEqn.H:73): inletOutlet's
+        // valueFraction and the piov mask are rebuilt from it, the piov value from the corrected cells --
+        // what gets written, what the closure reads, and what the next momentum assembly finds.
+        deviceUpdateInletOutlet(dbU, f.phiBnd);
+        deviceUpdatePressureInletOutletVelocity(dbU, f.phiBnd, f.Ux, f.Uy, f.Uz, /*directionMixed=*/true);
         deviceUpdateSymmetry(dbU, f.Ux, f.Uy, f.Uz);
         deviceUpdateWedge(dbU, f.Ux, f.Uy, f.Uz);
         deviceBCValue(dbU.comp[0], f.Ux, f.UxBnd);
@@ -611,9 +669,14 @@ Residuals rhoSimpleStep(
         closedVolumeCorrection(f.p, f.psi, dm, f.initialMass);
     }
 
-    // ONE refresh for both, keyed as OpenFOAM keys it: `if (pLimited || closedVolume)`.
+    // ONE refresh for both, keyed as OpenFOAM keys it: `if (pLimited || closedVolume)` (pEqn.H:100-103).
+    // On the totalPressure inlet that correctBoundaryConditions is an updateCoeffs (the flag was cleared
+    // by the solve's evaluate): a recompute from the NEW flux, the corrected U's patch value and rho's
+    // patch value as it stands -- BEFORE the tail's rho = thermo.rho() below. It is the value written to
+    // disk and the one the next momentum assembly reads through grad(p).
     if (pLimited || closedVolume)
     {
+        deviceUpdateTotalPressure(dbP, f.phiBnd, f.UxBnd, f.UyBnd, f.UzBnd, &f.rhoBnd);
         deviceBCValue(dbP, f.p, f.pBnd);
     }
 

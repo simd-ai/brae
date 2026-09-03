@@ -175,12 +175,17 @@ void deviceConstrainSymmetryHbyA(const DeviceVectorBoundary& dbU, const DeviceBu
                                  DeviceBuffer<scalar>& hbx, DeviceBuffer<scalar>& hby, DeviceBuffer<scalar>& hbz);
 
 // pressureInletOutletVelocity updateCoeffs (directionMixed, valueFraction = neg(phi)*(I - n n)): per piov face by the
-// lagged boundary flux sign, set each component's bcType + refValue. Outflow (phi>=0) -> zeroGradient; inflow
-// (phi<0) -> fixedValue with refValue = n*(n.U_cell) (tangential 0). Call each step before assembly (after the io
-// switch), with the previous step's boundary flux + cell velocity (matches OF lagging).
+// boundary flux sign, set each component's bcType, valueFraction and refValue. Outflow (phi>=0) -> zeroGradient;
+// inflow (phi<0) -> the mixed (cat 5) form of OpenFOAM's transform coefficients, vf_k = sqrt(1 - n_k^2) with the
+// refValue chosen so the blend is n*(n.U_cell) -- see piovUpdateKernel. Call wherever OpenFOAM reaches an
+// updateCoeffs or an evaluate on U (the momentum assembly, after its solve, after the velocity correction), with
+// the flux registered at that moment and the cell velocity as it stands.
+// `directionMixed` selects that form; false keeps the kernel's earlier typing (every inflow component
+// fixedValue at n*(n.U_cell)) for the frozen incompressible driver, which reads 1.1459e-04 against
+// OpenFOAM on validation/piov with it and 1.4911e-03 with the directionMixed form (bisected 2026-09-03).
 void deviceUpdatePressureInletOutletVelocity(DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& phiBnd,
                                              const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy,
-                                             const DeviceBuffer<scalar>& Uz);
+                                             const DeviceBuffer<scalar>& Uz, bool directionMixed = false);
 
 // slip/symmetry updateCoeffs (OF basicSymmetry, GENERAL non-axis-aligned): reuses the mixed (cat 5) kernels with a
 // PER-COMPONENT valueFraction vf_k = |n_k| and ref_k = U_c[k] - sign(n_k)*(n.U_c). Then valueIC_k = 1-|n_k|,

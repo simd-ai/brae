@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <vector>
 #include <type_traits>
+#include <algorithm>
 #include <cmath>
 
 namespace brae {
@@ -1338,6 +1339,20 @@ public:
 // per-face inflow value each step (deviceUpdatePressureInletOutletVelocity); bcCategory()=6 marks it. Vector-only;
 // a non-zero `tangentialVelocity` field is NOT supported and is now REFUSED at construction (it was
 // only a comment before, so a case carrying one ran with the tangential component silently zeroed).
+//
+// THE MATRIX SIDE. directionMixed is a transform patch field, and its coefficients are not the
+// zeroGradient ones this class used to inherit for every component: with
+// snGradTransformDiag_k = sqrt|vf_kk| = neg(phi)*sqrt(1 - n_k^2) (directionMixedFvPatchField.C:180-200),
+// transformFvPatchField.C:95-135 gives
+//   valueInternalCoeffs_k    = 1 - d_k
+//   valueBoundaryCoeffs_k    = value_k - (1 - d_k)*pif_k
+//   gradientInternalCoeffs_k = -deltaCoeffs*d_k
+//   gradientBoundaryCoeffs_k = snGrad_k - gradientInternalCoeffs_k*pif_k,   snGrad = (value - pif)*deltaCoeffs
+// so on an axis-aligned inflow face the normal component is zeroGradient and each tangential one is a
+// fixedValue 0 -- the diffusive coupling that holds the inflow normal to the patch. Extrapolating every
+// component left the tangential momentum next to the inlet uncoupled from the patch; on rhoTP at t=1
+// with the patch VALUES already OpenFOAM's that alone read U 9.8e-03 / p 6.4e-05 relL2 against OpenFOAM
+// (host), and the inlet's written normal velocity 13.13 against 13.44.
 template <typename T>
 class PressureInletOutletVelocityPatchField : public ExtrapolatedValuePatchField<T>   // value() = written seed
 {
@@ -1358,6 +1373,97 @@ public:
     int bcCategory() const override { return 6; }                  // device: pressureInletOutletVelocity (outlet, adjustable flux)
 
     void updateFromFlux(const std::vector<scalar>& phip) override { phi_ = phip; }
+
+    // The value is still the stored one (see updateFromPatchVelocity); evaluate() only caches the patch
+    // internal field the transform coefficients below are built from, as SymmetryPlanePatchField does.
+    // setStoredValues() re-evaluates with an EMPTY internal field (the value does not depend on it), so
+    // the cache is refreshed only from a real one -- gathering from the empty one read past its end.
+    void evaluate(const std::vector<T>& internal) override
+    {
+        if (!internal.empty()) pif_ = this->patchInternalField(internal);
+        ExtrapolatedValuePatchField<T>::evaluate(internal);
+    }
+
+    std::vector<T> valueInternalCoeffs() const override           // 1 - d_k
+    {
+        if constexpr (!std::is_same<T, vector>::value)
+        {
+            return fvPatchField<T>::valueInternalCoeffs();
+        }
+        else
+        {
+            std::vector<T> r(this->patch_.size);
+            for (label i = 0; i < this->patch_.size; ++i)
+            {
+                const vector d = transformDiag(i);
+                r[i] = vector{ 1.0 - d.x, 1.0 - d.y, 1.0 - d.z };
+            }
+            return r;
+        }
+    }
+
+    std::vector<T> valueBoundaryCoeffs() const override           // value - (1 - d_k)*pif
+    {
+        if constexpr (!std::is_same<T, vector>::value)
+        {
+            return fvPatchField<T>::valueBoundaryCoeffs();
+        }
+        else
+        {
+            const std::vector<T> vic = valueInternalCoeffs();
+            std::vector<T> r(this->patch_.size);
+            for (label i = 0; i < this->patch_.size; ++i)
+            {
+                const T& p = pifAt(i);
+                r[i] = vector{ this->value_[i].x - vic[i].x*p.x,
+                               this->value_[i].y - vic[i].y*p.y,
+                               this->value_[i].z - vic[i].z*p.z };
+            }
+            return r;
+        }
+    }
+
+    std::vector<T> gradientInternalCoeffs() const override        // -deltaCoeffs*d_k
+    {
+        if constexpr (!std::is_same<T, vector>::value)
+        {
+            return fvPatchField<T>::gradientInternalCoeffs();
+        }
+        else
+        {
+            std::vector<T> r(this->patch_.size);
+            for (label i = 0; i < this->patch_.size; ++i)
+            {
+                const vector d = transformDiag(i);
+                const scalar dc = this->patch_.deltaCoeffs[i];
+                r[i] = vector{ -dc*d.x, -dc*d.y, -dc*d.z };
+            }
+            return r;
+        }
+    }
+
+    std::vector<T> gradientBoundaryCoeffs() const override        // snGrad - gic_k*pif
+    {
+        if constexpr (!std::is_same<T, vector>::value)
+        {
+            return fvPatchField<T>::gradientBoundaryCoeffs();
+        }
+        else
+        {
+            const std::vector<T> gic = gradientInternalCoeffs();
+            std::vector<T> r(this->patch_.size);
+            for (label i = 0; i < this->patch_.size; ++i)
+            {
+                const T& p = pifAt(i);
+                const scalar dc = this->patch_.deltaCoeffs[i];
+                const vector sn { (this->value_[i].x - p.x)*dc,
+                                  (this->value_[i].y - p.y)*dc,
+                                  (this->value_[i].z - p.z)*dc };
+                r[i] = vector{ sn.x - gic[i].x*p.x, sn.y - gic[i].y*p.y, sn.z - gic[i].z*p.z };
+            }
+            return r;
+        }
+    }
 
     // OF pressureInletOutletVelocityFvPatchVectorField::updateCoeffs -- valueFraction = neg(phi)*(I - nn).
     // OUTFLOW (phi >= 0) has valueFraction 0 and extrapolates entirely. INFLOW fixes only the TANGENTIAL
@@ -1393,6 +1499,25 @@ public:
 
 private:
     std::vector<scalar> phi_;
+    // The patch internal field, cached at evaluate() -- see SymmetryPlanePatchField for why.
+    std::vector<T>      pif_;
+    const T& pifAt(label i) const
+    {
+        static const T zero{};
+        return (i < static_cast<label>(pif_.size())) ? pif_[i] : zero;
+    }
+    // snGradTransformDiag: neg(phi)*sqrt(1 - n_k^2) per component. Zero on an outflow face (every
+    // component zeroGradient) and, on an axis-aligned inflow face, exactly 0 on the normal component
+    // and 1 on the tangential ones.
+    vector transformDiag(label i) const
+    {
+        const bool inflow = i < static_cast<label>(phi_.size()) && phi_[i] < scalar(0);
+        if (!inflow) return vector{ 0.0, 0.0, 0.0 };
+        const vector& n = this->patch_.nf[i];
+        return vector{ std::sqrt(std::max(scalar(0), scalar(1) - n.x*n.x)),
+                       std::sqrt(std::max(scalar(0), scalar(1) - n.y*n.y)),
+                       std::sqrt(std::max(scalar(0), scalar(1) - n.z*n.z)) };
+    }
 };
 
 // processor: rank<->rank coupled patch. The exchange receives the NEIGHBOUR cells' values (the
