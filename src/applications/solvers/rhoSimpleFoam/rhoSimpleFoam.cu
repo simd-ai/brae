@@ -1,6 +1,7 @@
 // CUDA driver for rhoSimpleFoam. See rhoSimpleFoam.cuh for the provenance, the order and the contract.
 #include "rhoSimpleFoam.cuh"
-#include "device_fvoptions.cuh"   // deviceSetValues: fvOptions.constrain(EEqn)
+#include "device_fvoptions.cuh"
+#include <string>   // deviceSetValues: fvOptions.constrain(EEqn)
 #include "pEqn.cuh"              // correctVelocity, relaxField -- the stages that ARE shared
 #include "device_pcg.cuh"
 #include "device_blas.cuh"
@@ -159,6 +160,78 @@ void storeTotalPressureValueKernel(
 } // namespace
 
 
+// Instrument: BRAE_STAGE_DUMP_DIR=<dir> (+ BRAE_STAGE_DUMP_ITER=n, default 1) writes this step's stages
+// at ONE iteration as plain columns, the device twin of the host step's StageDump (rhoSimpleFoam_cpp.cu):
+// same names, same layout (vectors as three columns; a surface field as the internal faces plus one
+// `_b` file holding every boundary face in patch order), so the two arms can be held against each
+// other stage by stage from the SAME in-memory trajectory. Costs nothing unless the variable is set.
+namespace
+{
+struct DeviceStageDump
+{
+    std::string dir;
+    bool        on = false;
+
+    void scalars(const char* name, const DeviceBuffer<scalar>& v) const
+    {
+        if (!on) return;
+        const std::vector<scalar> h = v.host();
+        std::FILE* fp = std::fopen((dir + "/" + name).c_str(), "w");
+        if (!fp) return;
+        for (scalar x : h) std::fprintf(fp, "%.17g\n", (double)x);
+        std::fclose(fp);
+    }
+    void vectors(const char* name, const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& z) const
+    {
+        if (!on) return;
+        const std::vector<scalar> hx = x.host(), hy = y.host(), hz = z.host();
+        std::FILE* fp = std::fopen((dir + "/" + name).c_str(), "w");
+        if (!fp) return;
+        for (std::size_t i = 0; i < hx.size(); ++i)
+            std::fprintf(fp, "%.17g %.17g %.17g\n", (double)hx[i], (double)hy[i], (double)hz[i]);
+        std::fclose(fp);
+    }
+    void surface(const char* name, const DeviceBuffer<scalar>& internal, const DeviceBuffer<scalar>& bnd) const
+    {
+        if (!on) return;
+        scalars(name, internal);
+        scalars((std::string(name) + "_b").c_str(), bnd);
+    }
+};
+
+DeviceStageDump deviceStageDump()
+{
+    DeviceStageDump d;
+    const char* dd = std::getenv("BRAE_STAGE_DUMP_DIR");
+    if (!dd) return d;
+    static int calls = 0;
+    const char* it = std::getenv("BRAE_STAGE_DUMP_ITER");
+    d.dir = dd;
+    d.on  = (++calls == (it ? std::atoi(it) : 1));
+    return d;
+}
+} // namespace
+
+// flowRateInletVelocity's updateCoeffs: avgU = -mdot/gSum(rho*magSf) against rho's PATCH value as it
+// stands (flowRateInletVelocityFvPatchVectorField.C:210-220, lookupPatchField(rhoName_)). Called where
+// OpenFOAM reaches that updateCoeffs: the momentum assembly, and the velocity correction's
+// correctBoundaryConditions, where rho's patch value has moved since the assembly (the host step carries
+// the sbMatched measurement, queue item 26).
+static void updateFlowRateInlets(
+    RhoSolverFields&       f,
+    const RhoStepInput&    in,
+    DeviceVectorBoundary&  dbU)
+{
+    if (!(in.frMagSf && in.frMdot && in.frNx && in.frNy && in.frNz)) return;
+    for (std::size_t k = 0; k < in.frMagSf->size() && k < in.frMdot->size(); ++k)
+    {
+        const scalar sumRhoA = deviceDot(f.rhoBnd, (*in.frMagSf)[k]);
+        if (sumRhoA <= scalar(0)) continue;
+        deviceUpdateFlowRateInlet(dbU, (*in.frMagSf)[k], -(*in.frMdot)[k] / sumRhoA,
+                                  *in.frNx, *in.frNy, *in.frNz);
+    }
+}
+
 // updateCoeffs() for the boundary conditions whose coefficients are a function of the SOLUTION.
 //
 // A named function rather than a run of statements inside the step, because it has a contract of its own
@@ -195,10 +268,12 @@ void updateBoundaryCoeffs(
     // 2. The FREESTREAM BLEND, a different rule from the switch above: valueFraction is rebuilt from the
     //    current flow ANGLE, 0.5 - 0.5*(Up & nf)/mag(Up), and freestreamPressure follows the velocity
     //    patch. Left alone, every far-field face keeps the half-and-half blend it was seeded with.
+    //    U only here: freestreamPressure's valueFraction is rebuilt inside the pressure fvMatrix constructor
+    //    (below, before the assembly) and under the limiter, and p's boundary is read AS IT STANDS by the
+    //    momentum gradient -- the relaxed blend, or the limiter's re-evaluation (queue items 23 and 25).
     if (in.hasMixed)
     {
-        deviceUpdateMixedFreestream(dbU, dbP, f.phiBnd, f.Ux, f.Uy, f.Uz, &f.rhoBnd);
-        deviceBCValue(dbP, f.p, f.pBnd);
+        deviceUpdateMixedFreestream(dbU, dbP, f.phiBnd, f.Ux, f.Uy, f.Uz, &f.rhoBnd, /*which=*/1);
     }
 
     // 2b. pressureInletOutletVelocity, whose updateCoeffs OpenFOAM reaches inside the momentum fvMatrix
@@ -232,16 +307,7 @@ void updateBoundaryCoeffs(
     //    boundary density the flux is actually carrying -- the solver's relaxed rho, which is what
     //    f.rhoBnd holds here -- not thermo.rho(). Feeding it the other one is the angledDuct defect,
     //    where the inlet quietly lost the prescribed mass flow. Last, because it reads that rho.
-    if (in.frMagSf && in.frMdot && in.frNx && in.frNy && in.frNz)
-    {
-        for (std::size_t k = 0; k < in.frMagSf->size() && k < in.frMdot->size(); ++k)
-        {
-            const scalar sumRhoA = deviceDot(f.rhoBnd, (*in.frMagSf)[k]);
-            if (sumRhoA <= scalar(0)) continue;
-            deviceUpdateFlowRateInlet(dbU, (*in.frMagSf)[k], -(*in.frMdot)[k] / sumRhoA,
-                                      *in.frNx, *in.frNy, *in.frNz);
-        }
-    }
+    updateFlowRateInlets(f, in, dbU);
 }
 
 
@@ -333,6 +399,11 @@ Residuals rhoSimpleStep(
     uin.hasCoupledPatches = in.hasCoupledPatches;
     uin.fvOptionUnsupported = in.fvOptionUnsupported;
 
+    const DeviceStageDump sd = deviceStageDump();
+    sd.vectors("Uass", f.Ux, f.Uy, f.Uz);
+    sd.scalars("rhoU", f.rho);
+    sd.surface("phiU", f.phiInt, f.phiBnd);
+    sd.scalars("nutU", f.nut);
     MomentumMatrix UEqn;
     assembleUEqn(UEqn, dm, dbU, f.Ux, f.Uy, f.Uz, uin);
 
@@ -353,7 +424,7 @@ Residuals rhoSimpleStep(
         }
 
         DeviceBuffer<scalar> gpx, gpy, gpz;
-        deviceBCValue(dbP, f.p, f.pBnd);
+        // f.pBnd as it stands: the relaxed blend, or the limiter's re-evaluation, never re-derived here.
         deviceGaussGrad(dm, f.p, f.pBnd, gpx, gpy, gpz);
         addPressureGradient(Mp, dm, gpx, gpy, gpz);
 
@@ -388,6 +459,7 @@ Residuals rhoSimpleStep(
         }
         res["U"] = uInitialResidual;
     }
+    sd.vectors("Upred", f.Ux, f.Uy, f.Uz);
 
     // ---- EEqn.H ------------------------------------------------------------------------------
     {
@@ -436,6 +508,12 @@ Residuals rhoSimpleStep(
         ein.hasCoupledPatches = in.hasCoupledPatches;
 
         PressureMatrix E;
+        // Tw.evaluate() -- every energy condition's updateCoeffs evaluates T's patch from the cells as
+        // they stand at the energy assembly (fixedEnergy .C:108, gradientEnergy .C:109, mixedEnergy .C:97).
+        // The ONLY evaluate T's boundary gets in an iteration: thermo.correct() keeps it on fixesValue
+        // faces and inverts he_b on the rest (rhoThermoDevice.cu), so the outlet T_b -- and the rho_b,
+        // mu_b, alphaEff_b built from it -- lag the cells by one iteration exactly as OpenFOAM's do.
+        deviceBCValue(dbT, f.T, f.TBnd);
         assembleEEqn(E, dm, dbHe, f.he, ein);
 
         // fvOptions.constrain(EEqn) -- EEqn.H:20, on the ASSEMBLED matrix and before the solve, which
@@ -471,6 +549,9 @@ Residuals rhoSimpleStep(
 
     // EEqn.H ends with thermo.correct(): T, and therefore psi, move HERE and everything below sees them.
     in.thermoCorrect();
+    sd.scalars("he", f.he);
+    sd.scalars("T", f.T);
+    sd.scalars("psi", f.psi);
 
     // ---- pEqn.H or pcEqn.H -------------------------------------------------------------------
     RhoPressureInput pin;
@@ -499,6 +580,15 @@ Residuals rhoSimpleStep(
         // built from a density that already reflects the just-solved T and the plain SIMPLE one is not.
         in.updateRho();
         consistentPressurePredictor(cst, dm, dbU, dbP, UEqn, f.Ux, f.Uy, f.Uz, f.p, pin);
+        sd.scalars("rAU", cst.rAU);
+        sd.scalars("rAtU", cst.rAtU);
+        sd.scalars("rhorAtU", cst.rhorAtU);
+        sd.vectors("HbyA", cst.HbyA0[0], cst.HbyA0[1], cst.HbyA0[2]);
+        sd.vectors("HbyAc", cst.HbyA[0], cst.HbyA[1], cst.HbyA[2]);
+        sd.surface("phiHbyA0", cst.phiHbyA0Int, cst.phiHbyA0Bnd);
+        sd.surface("phiHbyAc", cst.phiHbyAInt, cst.phiHbyABnd);
+        sd.surface("phid", cst.phidInt, cst.phidBnd);
+        sd.scalars("rhoP", f.rho);
         closedVolume = cst.closedVolume;
     }
     else
@@ -512,6 +602,8 @@ Residuals rhoSimpleStep(
     // U's PATCH value as the momentum solve left it (f.UxBnd, refreshed above), the flux the iteration
     // started with, and rho's patch value as it stands -- pcEqn.H:1's on the SIMPLEC branch, the previous
     // tail's on the other.
+    // ...and freestreamPressure's valueFraction, from U's patch value as the momentum solve left it.
+    if (in.hasMixed) deviceUpdateMixedFreestream(dbU, dbP, f.phiBnd, f.Ux, f.Uy, f.Uz, &f.rhoBnd, /*which=*/2);
     deviceUpdateTotalPressure(dbP, f.phiBnd, f.UxBnd, f.UyBnd, f.UzBnd, &f.rhoBnd);
     deviceBCValue(dbP, f.p, f.pBnd);
 
@@ -595,6 +687,8 @@ Residuals rhoSimpleStep(
     deviceBCValue(dbP, f.p, f.pBnd);
     relaxField(f.p, pPrev, in.relaxP);
     relaxField(f.pBnd, pBndPrev, in.relaxP);
+    sd.scalars("pRel", f.p);
+    sd.surface("phi", f.phiInt, f.phiBnd);
     if (dbP.n > 0)
     {
         storeTotalPressureValueKernel<<<(dbP.n + 255) / 256, 256>>>(
@@ -644,12 +738,19 @@ Residuals rhoSimpleStep(
         // what gets written, what the closure reads, and what the next momentum assembly finds.
         deviceUpdateInletOutlet(dbU, f.phiBnd);
         deviceUpdatePressureInletOutletVelocity(dbU, f.phiBnd, f.Ux, f.Uy, f.Uz, /*directionMixed=*/true);
+        // flowRateInletVelocity recomputed from rho's patch value as it stands here (see updateFlowRateInlets).
+        updateFlowRateInlets(f, in, dbU);
+        // freestreamVelocity's valueFraction rebuilt from the patch's current value, as OpenFOAM's evaluate
+        // does here (freestreamVelocityFvPatchVectorField.C:106; the host step carries the measurement).
+        if (in.hasMixed) deviceUpdateMixedFreestream(dbU, dbP, f.phiBnd, f.Ux, f.Uy, f.Uz, &f.rhoBnd, /*which=*/1);
         deviceUpdateSymmetry(dbU, f.Ux, f.Uy, f.Uz);
         deviceUpdateWedge(dbU, f.Ux, f.Uy, f.Uz);
         deviceBCValue(dbU.comp[0], f.Ux, f.UxBnd);
         deviceBCValue(dbU.comp[1], f.Uy, f.UyBnd);
         deviceBCValue(dbU.comp[2], f.Uz, f.UzBnd);
     }
+
+    sd.vectors("Upost", f.Ux, f.Uy, f.Uz);
 
     // pressureControl.limit(p), HERE and not earlier: pEqn.H applies it after the velocity correction, so
     // U is built from the unclipped pressure and only p carries the clip.
@@ -676,6 +777,7 @@ Residuals rhoSimpleStep(
     // disk and the one the next momentum assembly reads through grad(p).
     if (pLimited || closedVolume)
     {
+        if (in.hasMixed) deviceUpdateMixedFreestream(dbU, dbP, f.phiBnd, f.Ux, f.Uy, f.Uz, &f.rhoBnd, /*which=*/2);
         deviceUpdateTotalPressure(dbP, f.phiBnd, f.UxBnd, f.UyBnd, f.UzBnd, &f.rhoBnd);
         deviceBCValue(dbP, f.p, f.pBnd);
     }
@@ -697,9 +799,18 @@ Residuals rhoSimpleStep(
         }
     }
 
+    sd.scalars("p", f.p);
+    sd.scalars("rhoTail", f.rho);
+    sd.scalars("kIn", f.k);
+    sd.scalars("epsIn", f.epsilon);
+    sd.scalars("nutIn", f.nut);
+
     // turbulence->correct() -- LAST, so the NEXT iteration's momentum equation uses this iteration's
     // closure. OpenFOAM's lagged coupling.
     if (in.correct) in.correct();
+    sd.scalars("kOut", f.k);
+    sd.scalars("epsOut", f.epsilon);
+    sd.scalars("nutOut", f.nut);
 
     return res;
 }
@@ -707,3 +818,5 @@ Residuals rhoSimpleStep(
 } // namespace rhoSimple
 } // namespace gpu
 } // namespace brae
+
+

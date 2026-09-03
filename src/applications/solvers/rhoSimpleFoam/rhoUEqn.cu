@@ -459,12 +459,16 @@ void assembleUEqn(
     // OpenFOAM on shearedChannel, 1.69e-01 corrected vs 8.47e-02 uncorrected. That asymmetry is what
     // identified it, on the host side, by measurement.
     //
-    // The gradient is a plain UNLIMITED Gauss gradient, deliberately different from the dev2 term's above,
-    // even when gradULimitK > 0. That is OpenFOAM's own behaviour: correctedSnGrad<Type>::correction calls
-    // fullGradCorrection per COMPONENT, which resolves `grad(U.component(0))` in gradSchemes; no case names
-    // a component entry, so it falls back to `default` -- plain Gauss linear on aerofoilNACA0012 while
-    // grad(U) itself is `cellLimited Gauss linear 1`. Making the two agree is tidier and is a different
-    // discretisation (linearViscousStress_cpp.cu:103-110).
+    // THE SAME gradient as the dev2 term's: grad(U) through the case's gradSchemes entry, per component
+    // (cellLimitedGrad<vector> limits each component by its own bounds, which is what the per-component
+    // scalar limiter below computes). An earlier version kept this one unlimited on the reading that
+    // correctedSnGrad<Type>::correction goes per COMPONENT through `grad(U.component(0))`, which falls to
+    // `default`. That is the generic template; OpenFOAM instantiates the VECTOR specialisation
+    // (correctedSnGrads.C:48, correction(vvf) { return fullGradCorrection(vvf); }) and fullGradCorrection
+    // resolves mesh.gradScheme("grad(U)") (correctedSnGrad.C:52-55): cellLimited Gauss linear 1 on
+    // aerofoilNACA0012. Measured on the host at iteration 1 there with the unlimited gradient: the momentum
+    // source on the aerofoil-adjacent cells 2.36e-05 against OpenFOAM's with everything else exact
+    // (queue item 25). The host reference is linearViscousStress_cpp.cu.
     if (in.correctedLaplacian)
     {
         const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
@@ -474,6 +478,10 @@ void assembleUEqn(
             DeviceBuffer<scalar> ub;
             deviceBCValue(dbU.comp[k], *U[k], ub);
             deviceGaussGrad(dm, *U[k], ub, gxc[k], gyc[k], gzc[k]);
+            if (in.gradULimitK > 0.0)
+            {
+                deviceCellLimitGrad(dm, *U[k], ub, gxc[k], gyc[k], gzc[k], in.gradULimitK);
+            }
         }
         if (in.snGradLimitCoeff > 0.0)
         {

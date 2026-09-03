@@ -102,13 +102,17 @@ void addDivDevReff(
     // does carry the laplacian's own sign -- improved. That asymmetry is what identified it.
     if (correctedLaplacian)
     {
-        // A DIFFERENT gradient from the dev2 term's, and deliberately so -- this is OpenFOAM's own
-        // behaviour, not an inconsistency. correctedSnGrad<Type>::correction calls fullGradCorrection on
-        // each COMPONENT, and that looks its scheme up as `grad(U.component(0))` rather than `grad(U)`
-        // (correctedSnGrad.C). No case names a component entry, so it falls back to `default`, which on
-        // aerofoilNACA0012 is plain `Gauss linear` while grad(U) itself is `cellLimited Gauss linear 1`.
-        // Limiting this one to match the dev2 term looks tidier and is a different discretisation.
-        const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+        // THE SAME gradient as the dev2 term's: grad(U) through the case's gradSchemes entry. An earlier
+        // version of this block kept it unlimited on the reading that correctedSnGrad<Type>::correction
+        // goes per COMPONENT and looks up `grad(U.component(0))`, which falls to `default`. That is the
+        // generic template; OpenFOAM instantiates the VECTOR specialisation, correctedSnGrads.C:48,
+        //     correctedSnGrad<vector>::correction(vvf) { return fullGradCorrection(vvf); }
+        // and fullGradCorrection resolves mesh.gradScheme("grad(U)") (correctedSnGrad.C:52-55) -- cellLimited
+        // Gauss linear 1 on aerofoilNACA0012. Measured there at iteration 1 with the unlimited gradient:
+        // the momentum source on the 120 aerofoil-adjacent cells 2.36e-05 against OpenFOAM's, with the
+        // gradient, the dev2 term, the diagonal and the off-diagonals all exact (queue item 25).
+        std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+        if (gradULimitK > 0.0) cellLimitGrad(gradU, U, gradULimitK, m, g, patches);
         const std::vector<vector> corr =
             fvm::laplacianNonOrthSource<vector, tensor>(gammaf, U, gradU, m, g, patches,
                                                         snGradLimitCoeff);

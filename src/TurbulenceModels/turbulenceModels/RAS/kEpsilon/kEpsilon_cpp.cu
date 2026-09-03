@@ -318,6 +318,11 @@ void correct(
         wallCells.push_back(c);
         epsVals.push_back(eps0[c]);
     }
+    // The wall PATCH takes the fresh cell value here, as OpenFOAM's calculateTurbulenceFields does
+    // (`epf == scalarField(epsilon0, epf.patch().faceCells())`, epsilonWallFunctionFvPatchScalarField.C:
+    // 168-175) inside updateCoeffs, before the assembly: grad(epsilon) at the wall cells feeds the
+    // corrected laplacian's deferred correction. The omega twin measured it on naca0012 (queue item 25).
+    epsilon.evaluateBoundary();
     if (res) res->wallCells = static_cast<label>(wallCells.size());
     if (res && res->captureStages)
     {

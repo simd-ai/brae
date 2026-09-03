@@ -21,6 +21,7 @@
 #include "cell_wall_dist.cuh"
 #include "fvc.cuh"
 #include "linearViscousStress_cpp.cuh"
+#include "scheme_parse.cuh"   // parseFvSchemesControls: the case's grad limiters and laplacian scheme
 
 #include <algorithm>
 #include <cmath>
@@ -215,14 +216,30 @@ int main(int argc, char** argv)
 
         // kOmegaSST takes the laplacian scheme as a function argument, not in its coefficients --
         // sbMatched sets `laplacianSchemes default Gauss linear corrected`, passed below.
+        // THE CASE'S GRADIENT LIMITERS, as the drivers hand them to the closure (queue item 24): OpenFOAM's
+        // fvc::grad(U) and the laplacian corrections go through gradSchemes' own entries. With `co`
+        // default-constructed this harness ran unlimited gradients whatever the case named, and on
+        // naca0012 (`grad(U|k|omega) cellLimited Gauss linear 1`) that read gradU 6.76e+00 against
+        // OpenFOAM's -- all of it in boundary-adjacent cells, zero away from them -- and reproduced the
+        // pre-item-24 closure gap (omega 9.8e-04, nut 1.1e-03) instead of the mirror's current state.
         KOmegaSSTCoeffs co;
+        // The closure's linear-solver controls: 1e-16 / 20000 by default (the closure, not the solver,
+        // under test); BRAE_SST_TOL / BRAE_SST_MAXITER override them to run the mirror's own settings.
+        const scalar sstTol     = std::getenv("BRAE_SST_TOL")     ? (scalar)std::atof(std::getenv("BRAE_SST_TOL"))     : (scalar)1e-16;
+        const int    sstMaxIter = std::getenv("BRAE_SST_MAXITER") ? std::atoi(std::getenv("BRAE_SST_MAXITER")) : 20000;
+        DeviceSimpleControls sctl;
+        parseFvSchemesControls(caseDir, sctl);
+        co.gradULimitK = sctl.gradULimitK;
+        co.gradKLimitK = sctl.gradKLimitK;
+        std::printf("  from the case: grad(U) cellLimited k=%g, grad(k|omega) k=%g, laplacian corrected=%d\n",
+                    (double)co.gradULimitK, (double)co.gradKLimitK, (int)sctl.nonOrth);
 
         cpu::kOmegaSST::SSTResiduals res;
         res.captureStages = (resOut != nullptr);
         cpu::kOmegaSST::correct(U, k, om, nut, phi, y, /*nu=*/0.0, m, g, patches,
-                                relaxOmega, relaxK, 1e-16, 0.0, 20000, co, &res,
+                                relaxOmega, relaxK, sstTol, 0.0, sstMaxIter, co, &res,
                                 /*bounded=*/true, /*limitedLinear=*/false, 1.0,
-                                /*linearUpwind=*/false, /*correctedLaplacian=*/true, 0.0,
+                                /*linearUpwind=*/false, /*correctedLaplacian=*/sctl.nonOrth, 0.0,
                                 /*lm=*/nullptr, &comp);
         kO = k.internal; omO = om.internal; nO = nut.internal; aO = at;
         if (resOut) *resOut = res;

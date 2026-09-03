@@ -151,9 +151,16 @@ inline void deviceUpdateInletOutlet(DeviceVectorBoundary& db, const DeviceBuffer
 // flux U.n = phi_b/|Sf| is exact (lagged like OF + the inletOutlet switch); |U| is the local adjacent-cell speed.
 // Writes vf to the 3 U components (velocity sign 0.5-0.5c) and to p (pressure sign 0.5+0.5c); non-mixed faces
 // untouched. Call at the start of each step (before assembly), after the io switch.
+// `which`: 1 = the velocity patches only, 2 = the pressure patches only, 3 = both. OpenFOAM rebuilds
+// freestreamVelocity's valueFraction at every evaluate on U (the momentum assembly and the velocity
+// correction's correctBoundaryConditions) and freestreamPressure's inside the pressure fvMatrix
+// constructor and under the limiter, so the two move at different points of the iteration; the
+// incompressible driver keeps rebuilding both together (3).
 void deviceUpdateMixedFreestream(DeviceVectorBoundary& dbU, DeviceBoundary& dbP, const DeviceBuffer<scalar>& phiBnd,
-                                 const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
-                                 const DeviceBuffer<scalar>* rhoBnd = nullptr);   // compressible: rho at boundary faces
+                                 const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy,
+                                 const DeviceBuffer<scalar>& Uz,
+                                 const DeviceBuffer<scalar>* rhoBnd = nullptr,   // compressible: rho at boundary faces
+                                 int which = 3);
 // constrainHbyA at mixed velocity faces: OF resets phiHbyA_b = U_b.Sf at fixesValue patches (mixed fixesValue=true).
 // cf's HbyA boundary value uses HbyA_cell in the (1-vf) part; at mixed faces replace hb[k] with the boundary value
 // of U itself (U_b = (1-vf) U_cell + vf U_freestream) so the boundary flux uses U_b, not HbyA_b. Non-mixed faces

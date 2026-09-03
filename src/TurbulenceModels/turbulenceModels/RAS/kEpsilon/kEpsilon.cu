@@ -6,6 +6,9 @@
 // arithmetic it is reused; where the legacy kernel groups the arithmetic differently, or encodes a
 // substitution this module refuses, a new kernel is written and the reason is recorded above it.
 #include "kEpsilon.cuh"
+#include <string>
+#include <cstdlib>
+#include <cstdio>
 #include "device_fvoptions.cuh"   // deviceSetValues: fvMatrix::setValues, shared with the energy equation
 #include "device_pcg.cuh"
 #include "device_blas.cuh"      // deviceAxpy / deviceCopy / deviceHadamard
@@ -767,7 +770,8 @@ void finishAndSolve(
     const DeviceBuffer<label>*  wallMask,
     const DeviceBuffer<scalar>* wallVal,
     const KEpsilonInput&        in,
-    scalar&                     residualOut)
+    scalar&                     residualOut,
+    const std::string&          dumpPrefix)   // "" = no dump; else <dir>/<name> path prefix
 {
     const int nC  = dm.nCells;
     const int nIf = dm.nInternalFaces;
@@ -814,11 +818,32 @@ void finishAndSolve(
     A.losort = dm.losort.data();
     A.losortStart = dm.losortStart.data();
 
+    // Instrument (BRAE_STAGE_DUMP_DIR, see correct()): the FOLDED system as the solver sees it -- diag
+    // with the boundary diagonal folded in, source with the boundary source folded in, the two
+    // off-diagonals (<prefix>D/Src/Upper/Lower), and the field before and after the solve
+    // (<prefix>SolveIn/SolveOut) -- the same convention the host's
+    // captureSystem uses (kEpsilon_cpp.cu), so the two arms' assembled systems diff directly.
+    auto dump = [&](const char* what, const DeviceBuffer<scalar>& v)
+    {
+        if (dumpPrefix.empty()) return;
+        const std::vector<scalar> h = v.host();
+        std::FILE* fp = std::fopen((dumpPrefix + what).c_str(), "w");
+        if (!fp) return;
+        for (scalar x : h) std::fprintf(fp, "%.17g\n", (double)x);
+        std::fclose(fp);
+    };
+    dump("D", diagC);
+    dump("Src", b);
+    dump("Upper", M.upper);
+    dump("Lower", M.lower);
+    dump("SolveIn", field);
+
     ones.copyFrom(std::vector<scalar>(nC, scalar(1.0)));
     const scalar normF = deviceNormFactor(A, field, b, ones);
     const DeviceSolverPerf perf =
         deviceJacobiBiCGStab(A, b, field, normF, in.tol, in.relTol, in.maxIter, /*checkEvery=*/1, in.minIter);
     residualOut = perf.initialResidual;
+    dump("SolveOut", field);
 }
 
 } // namespace
@@ -839,6 +864,17 @@ void correct(
     const DeviceWallData&       wall,
     const KEpsilonInput&        in)
 {
+    // Instrument: BRAE_STAGE_DUMP_DIR=<dir> (+ BRAE_STAGE_DUMP_ITER=n, default 1) writes this call's
+    // as-solved epsilon and k systems as plain columns (finishAndSolve), the device twin of the host's
+    // captureStages dump in rhoSimpleFoam_cpp.cu. Off unless the variable is set.
+    std::string dumpDir;
+    if (const char* dd = std::getenv("BRAE_STAGE_DUMP_DIR"))
+    {
+        static int calls = 0;
+        const char* it = std::getenv("BRAE_STAGE_DUMP_ITER");
+        if (++calls == (it ? std::atoi(it) : 1)) dumpDir = std::string(dd) + "/";
+    }
+
     production(st, dm, dbU, nut, in);
     wallTreatment(st, epsilon, dm, wall, k, in);
 
@@ -864,7 +900,8 @@ void correct(
         // constraint this reads exactly what it read before.
         finishAndSolve(E, epsilon, dm, in.relaxEquationEps, in.relaxEps,
                        in.fvoEpsMask, in.fvoEpsVal,
-                       &st.isWallCell, &epsilon, in, st.epsResidual);
+                       &st.isWallCell, &epsilon, in, st.epsResidual,
+                       dumpDir.empty() ? std::string() : dumpDir + "eps");
 
         boundField(epsilon, dm, dbEps, scalar(1e-15));
     }
@@ -877,7 +914,8 @@ void correct(
         // No wall mask: see finishAndSolve.
         finishAndSolve(K, k, dm, in.relaxEquationK, in.relaxK,
                        in.fvoKMask, in.fvoKVal,
-                       nullptr, nullptr, in, st.kResidual);
+                       nullptr, nullptr, in, st.kResidual,
+                       dumpDir.empty() ? std::string() : dumpDir + "k");
 
         boundField(k, dm, dbK, scalar(1e-15));
     }

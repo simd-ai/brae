@@ -427,6 +427,15 @@ void correct(
             wallCells.push_back(c);
             omVals.push_back(om0[c]);
         }
+    // ...and the wall PATCH takes the fresh cell value here, not after the solve: OpenFOAM's
+    // calculateTurbulenceFields ends with `opf == scalarField(omega0, opf.patch().faceCells())`
+    // (omegaWallFunctionFvPatchScalarField.C:167-174), inside updateCoeffs, before the equation is
+    // assembled. brae wrote the cells and left the patch's stored value at the previous evaluate -- the
+    // file seed at iteration 1 -- so grad(omega) at the wall cells, which the corrected laplacian's
+    // deferred correction interpolates onto the wall cells' inner faces, saw 10 where OpenFOAM saw 1598 on
+    // naca0012, and the second ring of cells read omega 1.4e-04 off at t=1 (queue item 25). Invisible with
+    // an orthogonal laplacian (5e-12 on the same case), which is what every SST fixture had.
+    omega.evaluateBoundary();
     if (res && res->captureStages) res->G = G;
 
     // ---- CDkOmega, F1, F2 ------------------------------------------------------------------------

@@ -55,12 +55,14 @@ void mixedUpdateKernel(
     scalar* __restrict__ vfU0,
     scalar* __restrict__ vfU1,
     scalar* __restrict__ vfU2,
-    scalar* __restrict__ vfP)
+    scalar* __restrict__ vfP,
+    int doU,
+    int doP)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
-    const bool mu = maskU[i], mp = maskP[i];
+    const bool mu = maskU[i] && doU, mp = maskP[i] && doP;
     if (!mu && !mp) return;
     // OF, exactly:
     //   freestreamVelocity  valueFraction = 0.5 - 0.5*(Up & nf)/mag(Up)   (…VelocityFvPatchVectorField.C:106)
@@ -374,7 +376,8 @@ void deviceUpdateMixedFreestream(
     const DeviceBuffer<scalar>& Ux,
     const DeviceBuffer<scalar>& Uy,
     const DeviceBuffer<scalar>& Uz,
-    const DeviceBuffer<scalar>* rhoBnd)
+    const DeviceBuffer<scalar>* rhoBnd,
+    int which)
 {
     const int n = dbP.n;
     if (n == 0) return;
@@ -391,7 +394,8 @@ void deviceUpdateMixedFreestream(
                                            ub0.data(), ub1.data(), ub2.data(),
                                            dbU.nx.data(), dbU.ny.data(), dbU.nz.data(),
                                            dbU.comp[0].valueFraction.data(), dbU.comp[1].valueFraction.data(),
-                                           dbU.comp[2].valueFraction.data(), dbP.valueFraction.data());
+                                           dbU.comp[2].valueFraction.data(), dbP.valueFraction.data(),
+                                           (which & 1) ? 1 : 0, (which & 2) ? 1 : 0);
     cudaCheck(cudaGetLastError(), "mixedUpdate");
 }
 

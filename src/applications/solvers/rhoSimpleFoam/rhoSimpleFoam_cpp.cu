@@ -10,8 +10,11 @@
 #include "equation_of_state.cuh"
 #include "linearViscousStress_cpp.cuh"   // effectiveFaceViscosity: interpolate with the field own boundary
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <stdexcept>
+#include <string>
 
 namespace brae {
 namespace cpu {
@@ -34,14 +37,34 @@ void thermoCorrect(
         // pressure equation has not run yet.
         f.rhoThermo[c]    = perfectGasRho(f.p.internal[c], f.T.internal[c], f.thermo);
     }
-    // The boundary temperature is NOT recomputed from he here: T's patch values come from T's own
-    // boundary conditions, which is what basicThermo::correct() leaves in place -- it recalculates the
-    // INTERNAL field and lets the boundary conditions stand. psi's patch values follow that T.
-    f.T.evaluateBoundary();
+    // The boundary half is heRhoThermo::calculate()'s patch loop (heRhoThermo.C:102-142; hePsiThermo.C
+    // :106-132 has the same shape), NOT an evaluate of T's own boundary conditions. A patch whose T
+    // fixesValue() -- fixedValue, and every mixed one (mixedFvPatchField.H:197; inletOutlet inherits it)
+    // -- KEEPS the T it has and gets he_b = HE(p_b, T_b) written into he; every other patch inverts,
+    // T_b = THE(he_b, p_b). psi_b and rho_b follow that T_b on both branches. The only place OpenFOAM
+    // evaluates a mixed T patch from the cells is Tw.evaluate() inside the energy conditions' own
+    // updateCoeffs (mixedEnergyFvPatchScalarField.C:97, gradientEnergy... .C:109, fixedEnergy... .C:108)
+    // -- at the energy ASSEMBLY, from the cells as they stood before this correct() -- which the step
+    // mirrors just before assembleEEqn. The evaluate that used to sit here put the NEW cell temperature
+    // on sbMatched's inletOutlet outlet (1000.82 K against OpenFOAM's 1000.00 at iteration 2) and, through
+    // rho_b, on the pressure flux that patch carries (0.38203 vs 0.38235): phiHbyA on the outlet 8e-4
+    // off while every internal face was at 2e-11, k 1.2e-2 in the outlet cells at t=2 (item 26).
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
-        const std::vector<scalar>& tb = f.T.boundary[pi]->value();
         const std::vector<scalar>& pb = f.p.boundary[pi]->value();
+        std::vector<scalar> tb = f.T.boundary[pi]->value();
+        if (f.T.boundary[pi]->fixesValue())
+        {
+            std::vector<scalar> hb(patches[pi].size);
+            for (label i = 0; i < patches[pi].size; ++i) hb[i] = hConstTToHe(tb[i], f.thermo);
+            f.he.boundary[pi]->assignValue(std::move(hb));
+        }
+        else
+        {
+            const std::vector<scalar>& hb = f.he.boundary[pi]->value();
+            for (label i = 0; i < patches[pi].size; ++i) tb[i] = hConstHeToT(hb[i], f.thermo);
+            f.T.boundary[pi]->assignValue(tb);
+        }
         for (label i = 0; i < patches[pi].size; ++i)
         {
             f.psiBnd[pi][i]        = perfectGasPsi(tb[i], f.thermo);
@@ -257,6 +280,64 @@ void updateTotalPressure(
 } // namespace
 
 
+// Instrument: BRAE_STAGE_DUMP_DIR=<dir> (+ BRAE_STAGE_DUMP_ITER=n, default 1) writes this step's stages
+// at ONE iteration as plain columns (%.17g per line; vectors as three columns; surface fields as the
+// internal faces plus one file per patch), named after the stage_* fields tools/dumpPEqn writes. The
+// file-restart harnesses (test_rho_ueqn_cpp, test_rho_peqn_cpp) rebuild an iteration from OpenFOAM's
+// WRITTEN state and cannot see a defect that lives only in the mirror's own in-memory trajectory: on
+// sbMatched the momentum matrix rebuilt from OpenFOAM's t=1 files is exact to 8e-15 while the continuous
+// run's outlet cells are 1e-2 off on k at t=2 (item 26). This dumps the continuous run's stages instead.
+namespace
+{
+struct StageDump
+{
+    std::string dir;
+    bool        on = false;
+
+    std::FILE* open(const char* name) const
+    {
+        return std::fopen((dir + "/" + name).c_str(), "w");
+    }
+    void scalars(const char* name, const std::vector<scalar>& v) const
+    {
+        if (!on) return;
+        std::FILE* fp = open(name);
+        if (!fp) return;
+        for (scalar x : v) std::fprintf(fp, "%.17g\n", (double)x);
+        std::fclose(fp);
+    }
+    void vectors(const char* name, const std::vector<vector>& v) const
+    {
+        if (!on) return;
+        std::FILE* fp = open(name);
+        if (!fp) return;
+        for (const vector& x : v) std::fprintf(fp, "%.17g %.17g %.17g\n", (double)x.x, (double)x.y, (double)x.z);
+        std::fclose(fp);
+    }
+    void surface(const char* name, const SurfaceScalarField& sf) const
+    {
+        if (!on) return;
+        scalars(name, sf.internal);
+        for (std::size_t pi = 0; pi < sf.boundary.size(); ++pi)
+        {
+            scalars((std::string(name) + "_b" + std::to_string(pi)).c_str(), sf.boundary[pi]);
+        }
+    }
+};
+
+StageDump stageDump()
+{
+    StageDump d;
+    const char* dd = std::getenv("BRAE_STAGE_DUMP_DIR");
+    if (!dd) return d;
+    static int calls = 0;
+    const char* it = std::getenv("BRAE_STAGE_DUMP_ITER");
+    d.dir = dd;
+    d.on  = (++calls == (it ? std::atoi(it) : 1));
+    return d;
+}
+} // namespace
+
 Residuals rhoSimpleStep(
     RhoSimpleFields&            f,
     const StepInput&            in,
@@ -279,6 +360,7 @@ Residuals rhoSimpleStep(
     const std::vector<scalar> rhoPrevIter = f.rho.internal;
     std::vector<std::vector<scalar>> rhoBndPrevIter(patches.size());
     for (std::size_t pi = 0; pi < patches.size(); ++pi) rhoBndPrevIter[pi] = f.rho.boundary[pi]->value();
+    const StageDump sd = stageDump();
     // p.prevIter(), banked at the same place for the same reason (simpleControl.C:157), BOTH halves:
     // p.relax() at the tail is the same operator== as rho's and assigns the boundary too
     // (GeometricField.C:1094, :1420). The totalPressure inlet is a patch whose value MOVES between here
@@ -316,8 +398,13 @@ Residuals rhoSimpleStep(
         // here from the corrected U and re-evaluating was what kept naca0012 at 3.4e-05 (queue item 23).
     }
     f.U.evaluateBoundary();
-    f.he.evaluateBoundary();
-    f.T.evaluateBoundary();
+    // NOT he and NOT T. Nothing in OpenFOAM's iteration evaluates either before the energy equation:
+    // he's patch values stand as the previous solve's correctBoundaryConditions and thermo.correct()
+    // left them (fixesValue patches carry HE(p_b, T_b), heRhoThermo.C:119), and T's are evaluated only
+    // inside the energy conditions' updateCoeffs, at the assembly below. Evaluating both here re-derived
+    // the mixed outlet's he_b and T_b from the CURRENT cells one stage early -- the transport this
+    // momentum assembly reads on that patch (mu_b, alphaEff_b) is thermo.correct()'s, from the T_b it
+    // computed with, not from a fresher one (item 26).
 
     std::vector<scalar>              muEff, alphaEff;
     std::vector<std::vector<scalar>> muEffBnd, alphaEffBnd;
@@ -359,6 +446,10 @@ Residuals rhoSimpleStep(
     // ---- UEqn.H ----
     RhoMomentumInput uin;
     uin.phi = &f.phi.internal;   uin.phiBnd = &f.phi.boundary;
+    sd.vectors("Uass", f.U.internal);
+    sd.scalars("rhoU", f.rho.internal);
+    sd.surface("phiU", f.phi);
+    sd.scalars("nutU", f.nut.internal);
     uin.rho = &f.rho.internal;   uin.rhoBnd = &rhoBnd;
     uin.muEff = &muEff;          uin.muEffBnd = &muEffBnd;
     uin.relaxU             = in.relaxU;
@@ -421,6 +512,8 @@ Residuals rhoSimpleStep(
     updatePressureInletOutletVelocity(f, patches);
     f.U.evaluateBoundary();
 
+    sd.vectors("Upred", f.U.internal);
+
     // ---- EEqn.H ----
     {
 
@@ -440,6 +533,11 @@ Residuals rhoSimpleStep(
         ein.snGradLimitCoeff  = in.snGradLimitCoeff;
         ein.hasMRF            = in.hasMRF;
         ein.hasFvOptions      = in.hasFvOptions;
+        // Tw.evaluate() -- every energy condition's updateCoeffs evaluates T's patch from the cells as
+        // they stand at the energy assembly (fixedEnergy .C:108, gradientEnergy .C:109, mixedEnergy .C:97)
+        // and builds its refValue/refGrad/value from that T. This is the ONLY evaluate T's boundary
+        // gets in an iteration; thermo.correct() below then keeps it on fixesValue patches.
+        f.T.evaluateBoundary();
         FvScalarMatrix E = assembleEEqn(f.he, f.U, f.p, f.rho, ein, m, g, patches);
         // fvOptions.constrain(EEqn), EEqn.H:24. A fixedTemperatureConstraint sets he(p, Tuniform) on its
         // cells -- an ENERGY, not a temperature. The thermo conversion is supplied here because the
@@ -491,6 +589,9 @@ Residuals rhoSimpleStep(
 
     // EEqn.H ends with thermo.correct(): T, and therefore psi, move here and everything below sees them.
     thermoCorrect(f, patches);
+    sd.scalars("he", f.he.internal);
+    sd.scalars("T", f.T.internal);
+    sd.scalars("psi", f.psi);
 
     // ---- pEqn.H or pcEqn.H ----
     PressureInput pin;
@@ -521,6 +622,15 @@ Residuals rhoSimpleStep(
 
         const ConsistentPressureStages st =
             consistentPressurePredictor(UEqn, f.U, f.p, pin, m, g, patches);
+        sd.scalars("rAU", st.rAU);
+        sd.scalars("rAtU", st.rAtU);
+        sd.scalars("rhorAtU", st.rhorAtU);
+        sd.vectors("HbyA", st.HbyA0);
+        sd.vectors("HbyAc", st.HbyA);
+        sd.surface("phiHbyA0", st.phiHbyA0);
+        sd.surface("phiHbyAc", st.phiHbyA);
+        sd.surface("phid", st.phid);
+        sd.scalars("rhoP", f.rho.internal);
         // totalPressure's updateCoeffs, where OpenFOAM runs it: inside the pressure fvMatrix's
         // constructor (fvMatrix.C:396), from U's PATCH value as the momentum solve left it, the flux the
         // iteration started with, and rho's patch value as pcEqn.H:1 just set it.
@@ -536,10 +646,12 @@ Residuals rhoSimpleStep(
         {
             if (corr > 0) f.p.evaluateBoundary();
             P = assemblePcEqn(st, f.p, pin, m, g, patches);
+            if (corr == 0) { sd.scalars("pD", P.diag); sd.scalars("pSrc", P.source); }
             const SolverPerformance pp =
                 pbicgstab(P, f.p.internal, m, patches, in.tolP, in.relTolP, in.maxIterP, in.minIterP);
             if (corr == 0) res["p"] = pp.initialResidual;
         }
+        sd.scalars("pSolved", f.p.internal);
         rAUorAtU     = st.rAtU;
         HbyA         = st.HbyA;
         phiHbyA      = st.phiHbyA;
@@ -635,6 +747,8 @@ Residuals rhoSimpleStep(
     f.p.evaluateBoundary();
     relaxField(f.p.internal, pPrevIter, in.relaxP);
     relaxBoundary(f.p, pBndPrevIter, in.relaxP);
+    sd.scalars("pRel", f.p.internal);
+    sd.surface("phi", f.phi);
 
     // U = HbyA - rAtU*fvc::grad(p), with rAtU on the SIMPLEC path and rAU otherwise.
     {
@@ -655,8 +769,33 @@ Residuals rhoSimpleStep(
             f.U.boundary[pi]->updateFromFlux(f.phi.boundary[pi]);
         }
         updatePressureInletOutletVelocity(f, patches);
+        // flowRateInletVelocity too: its updateCoeffs reads rho's patch value every time it runs
+        // (flowRateInletVelocityFvPatchVectorField.C:210-220, lookupPatchField(rhoName_)), and it runs
+        // again inside this evaluate. On sbMatched (heRhoThermo, SIMPLEC) rho's patch value moved from
+        // 0.3823 to 0.4097 between the momentum assembly and this point, so OpenFOAM's inlet reads 488.17
+        // here where the mirror kept the assembly's 523.09 -- and the turbulent-intensity inlet, which
+        // squares |U_b|, turned that 7% into k 1.8e-02 at t=2 (queue item 26). Recomputed here from the
+        // rho patch value AS IT STANDS, which is what OpenFOAM's lookup returns.
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            f.U.boundary[pi]->updateFromDensity(f.rho.boundary[pi]->value());
+        }
+        // freestreamVelocity too: its updateCoeffs reads `Up = *this`, the patch's CURRENT value
+        // (freestreamVelocityFvPatchVectorField.C:106), and runs again inside this evaluate because the
+        // solve's evaluate cleared the flag -- so OpenFOAM rebuilds the valueFraction TWICE per iteration,
+        // here and at the momentum assembly, each time from the value the previous evaluate left. Rebuilt
+        // at the top only, the closure read an inlet U 3.9e-04 off on 250 at naca0012's second iteration
+        // (5.1e-07 relL2, every other closure input at 1e-10), which fed k 3.7e-06 and p 1.7e-05 by t=3
+        // (queue item 25).
+        {
+            std::vector<std::vector<vector>> Ub(patches.size());
+            for (std::size_t pi = 0; pi < patches.size(); ++pi) Ub[pi] = f.U.boundary[pi]->value();
+            updateMixedFreestream(f.U.boundary, Ub, patches);
+        }
         f.U.evaluateBoundary();
     }
+
+    sd.vectors("Upost", f.U.internal);
 
     // pressureControl.limit(p), then the closed-volume mass correction, then the boundary re-evaluation
     // that either of them requires.
@@ -714,6 +853,9 @@ Residuals rhoSimpleStep(
         // is, not as a numerics fix.
         for (std::size_t pi = 0; pi < patches.size(); ++pi) rhoBnd[pi] = f.rho.boundary[pi]->value();
     }
+
+    sd.scalars("p", f.p.internal);
+    sd.scalars("rhoTail", f.rho.internal);
 
     // turbulence->correct() -- LAST, after the pressure corrector, so the NEXT iteration's momentum
     // equation uses this iteration's closure. OpenFOAM's lagged coupling; correcting before UEqn instead
@@ -791,12 +933,80 @@ Residuals rhoSimpleStep(
 
             const std::vector<scalar> y = cellWallDist(m, g, patches);
             kOmegaSST::SSTResiduals sres;
+            // Instrument: BRAE_SST_DUMP_IN=<dir> writes the closure's INPUTS at the first iteration as plain
+            // columns, so they can be held against OpenFOAM's stage_sst*In dumps (tools/dumpKOmegaSST)
+            // when the closure itself is exact on OpenFOAM's inputs but the mirror's omega is not (item 25).
+            if (const char* dd = std::getenv("BRAE_SST_DUMP_IN"))
+            {
+                static int calls = 0;
+                const char* it = std::getenv("BRAE_SST_DUMP_ITER");   // which call to dump (default 1)
+                if (++calls == (it ? std::atoi(it) : 1))
+                {
+                    auto dump = [&](const char* name, const std::vector<scalar>& v)
+                    {
+                        std::FILE* fp = std::fopen((std::string(dd) + "/" + name).c_str(), "w");
+                        if (!fp) return;
+                        for (scalar x : v) std::fprintf(fp, "%.17g\n", (double)x);
+                        std::fclose(fp);
+                    };
+                    std::vector<scalar> ux(f.U.internal.size()), uy(ux.size()), uz(ux.size());
+                    for (std::size_t c = 0; c < ux.size(); ++c)
+                    {
+                        ux[c] = f.U.internal[c].x;
+                        uy[c] = f.U.internal[c].y;
+                        uz[c] = f.U.internal[c].z;
+                    }
+                    dump("nutIn", f.nut.internal);
+                    dump("kIn", f.k.internal);
+                    dump("omegaIn", f.omega.internal);
+                    dump("Ux", ux);
+                    dump("Uy", uy);
+                    dump("Uz", uz);
+                    dump("rho", f.rho.internal);
+                    dump("phi", f.phi.internal);
+                    dump("nu", nuLam);
+                    dump("y", y);
+                    // ...and the boundary values the closure reads, per patch: OpenFOAM's freestream
+                    // and flux-switched patches re-evaluate at every correctBoundaryConditions.
+                    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                    {
+                        const std::vector<vector>& ub = f.U.boundary[pi]->value();
+                        std::vector<scalar> bx(ub.size()), by(ub.size());
+                        for (std::size_t i = 0; i < ub.size(); ++i) { bx[i] = ub[i].x; by[i] = ub[i].y; }
+                        dump(("Ubx_" + patches[pi].name).c_str(), bx);
+                        dump(("Uby_" + patches[pi].name).c_str(), by);
+                        dump(("kb_" + patches[pi].name).c_str(), f.k.boundary[pi]->value());
+                        dump(("omegab_" + patches[pi].name).c_str(), f.omega.boundary[pi]->value());
+                        dump(("nutb_" + patches[pi].name).c_str(), f.nut.boundary[pi]->value());
+                        dump(("phib_" + patches[pi].name).c_str(), f.phi.boundary[pi]);
+                        dump(("rhob_" + patches[pi].name).c_str(), f.rho.boundary[pi]->value());
+                    }
+                    sres.captureStages = true;
+                }
+            }
             kOmegaSST::correct(f.U, f.k, f.omega, f.nut, f.phi, y, /*nu=*/0.0, m, g, patches,
                                in.relaxOmega, in.relaxK, in.tolTurb, in.relTolTurb, in.maxIterTurb,
                                sco, &sres, in.boundedTurb,
                                in.limitedLinearTurb, in.turbLimiterCoeff, in.linearUpwindTurb,
                                in.correctedLaplacian, in.snGradLimitCoeff, /*lm=*/nullptr, &sc,
                                in.minIterTurb, in.relaxEquationOmega, in.relaxEquationK);
+            if (sres.captureStages)
+            {
+                // ...and the closure's own intermediates after the call, against OpenFOAM's stage_sst*.
+                const std::string dd = std::getenv("BRAE_SST_DUMP_IN");
+                auto dump = [&](const char* name, const std::vector<scalar>& v)
+                {
+                    std::FILE* fp = std::fopen((dd + "/" + name).c_str(), "w");
+                    if (!fp) return;
+                    for (scalar x : v) std::fprintf(fp, "%.17g\n", (double)x);
+                    std::fclose(fp);
+                };
+                dump("divU", sres.divU);   dump("S2", sres.s2);       dump("GbyNu0", sres.gbyNu0); dump("G", sres.G);
+                dump("CDkOmega", sres.CD); dump("F1", sres.f1);       dump("F23", sres.f23);
+                dump("omD0", sres.omD0);   dump("omSrc0", sres.omSrc0); dump("omD", sres.omD);   dump("omSrc", sres.omSrc);
+                dump("kD0", sres.kD0);     dump("kSrc0", sres.kSrc0);   dump("kD", sres.kD);     dump("kSrc", sres.kSrc);
+                dump("omegaOut", f.omega.internal); dump("kOut", f.k.internal); dump("nutOut", f.nut.internal);
+            }
             res["omega"] = sres.omega;
             res["k"]     = sres.k;
             f.alphat.evaluateBoundary();
@@ -858,7 +1068,11 @@ Residuals rhoSimpleStep(
         keco.gradULimitK        = in.gradULimitK;   // grad(U) for the production
         keco.gradKLimitK        = in.gradKLimitK;   // grad(k)/grad(epsilon) for the laplacian corrections
 
+        sd.scalars("kIn", f.k.internal);
+        sd.scalars("epsIn", f.epsilon.internal);
+        sd.scalars("nutIn", f.nut.internal);
         kEpsilonRef::KEResiduals kres;
+        kres.captureStages = sd.on;   // the as-solved systems, for the device twin's dump to diff against
         kEpsilonRef::correct(f.U, f.k, f.epsilon, f.nut, f.phi, /*nu=*/0.0, m, g, patches,
                              in.relaxEpsilon, in.relaxK, in.tolTurb, in.relTolTurb, in.maxIterTurb,
                              keco, &kres, in.boundedTurb, /*dropTerm=*/0, &comp, in.fvOpts,
@@ -866,6 +1080,24 @@ Residuals rhoSimpleStep(
                              in.limitedLinearTurb, in.turbLimiterCoeff, in.minIterTurb);
         res["epsilon"] = kres.epsilon;
         res["k"]       = kres.k;
+        sd.scalars("kOut", f.k.internal);
+        sd.scalars("epsD", kres.epsD);
+        sd.scalars("epsSrc", kres.epsSrc);
+        sd.scalars("epsUpper", kres.epsUpper);
+        sd.scalars("epsLower", kres.epsLower);
+        sd.scalars("kD", kres.kD);
+        sd.scalars("kSrc", kres.kSrc);
+        sd.scalars("kUpper", kres.kUpper);
+        sd.scalars("kLower", kres.kLower);
+        sd.scalars("G", kres.G);
+        sd.scalars("Gwall", kres.Gwall);
+        sd.scalars("eps0", kres.eps0);
+        sd.scalars("gByNu", kres.gByNu);
+        sd.scalars("divU", kres.divU);
+        sd.scalars("DkEff", kres.DkEff);
+        sd.scalars("DepsilonEff", kres.DepsilonEff);
+        sd.scalars("epsOut", f.epsilon.internal);
+        sd.scalars("nutOut", f.nut.internal);
         f.alphat.evaluateBoundary();
 
         correctAlphatBoundary(f, patches);   // EddyDiffusivity's boundary half -- shared, see the header

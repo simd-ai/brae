@@ -53,16 +53,34 @@ __global__ void thermoCorrectCellKernel(
     rhoThermo[i] = perfectGasRho(p[i], t, c);
 }
 
+// heRhoThermo::calculate()'s patch loop (heRhoThermo.C:102-142), per face. A face whose T fixesValue()
+// -- fixedValue (bcType 1) and every mixed-derived one (inletOutlet, outletInlet, mixed: their masks;
+// mixedFvPatchField::fixesValue() is true whatever the flux sign, mixedFvPatchField.H:197) -- KEEPS its
+// T and gets he_b = HE(p_b, T_b); every other face inverts T_b = THE(he_b, p_b). psi_b and rho_b follow.
+// The evaluate this replaced (deviceBCValue on dbT, from the just-corrected cells) is what OpenFOAM does
+// NOT do here: a mixed T patch is evaluated only inside the energy conditions' updateCoeffs, at the
+// energy assembly -- see the step's deviceBCValue(dbT) before assembleEEqn (item 26).
 __global__ void thermoCorrectBndKernel(
     int                   n,
-    const scalar* __restrict__ TBnd,
+    const label* __restrict__ bcType,
+    const label* __restrict__ ioMask,
+    const label* __restrict__ oioMask,
+    const label* __restrict__ mixedMask,
     const scalar* __restrict__ pBnd,
     ThermoCoeffs          c,
+    scalar* __restrict__  heBnd,
+    scalar* __restrict__  TBnd,
     scalar* __restrict__  psiBnd,
     scalar* __restrict__  rhoThermoBnd)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    const bool fixes = bcType[i] == 1
+                    || (ioMask    && ioMask[i])
+                    || (oioMask   && oioMask[i])
+                    || (mixedMask && mixedMask[i]);
+    if (fixes) heBnd[i] = hConstTToHe(TBnd[i], c);
+    else       TBnd[i]  = hConstHeToT(heBnd[i], c);
     psiBnd[i]       = perfectGasPsi(TBnd[i], c);
     rhoThermoBnd[i] = perfectGasRho(pBnd[i], TBnd[i], c);
 }
@@ -125,16 +143,24 @@ void thermoCorrect(
         nC, f.he.data(), f.p.data(), c, f.T.data(), f.psi.data(), f.rhoThermo.data());
     cudaCheck(cudaGetLastError(), "rhoThermoCorrectCell");
 
-    // T's patch values come from T's OWN boundary conditions -- basicThermo::correct() recalculates the
-    // internal field and leaves the conditions standing -- so this is an evaluate, not an inversion.
-    deviceBCValue(dbT, f.T, f.TBnd);
-
+    // The boundary half: calculate()'s patch loop, NOT an evaluate of T's own conditions -- see the
+    // kernel. T's boundary was evaluated at the energy assembly and stands; he_b is written on the
+    // fixesValue faces, T_b on the others.
     const int nB = static_cast<int>(f.TBnd.size());
     if (nB == 0) return;
+    if (f.heBnd.size() != static_cast<std::size_t>(nB) || dbT.n != nB)
+    {
+        throw std::runtime_error("rhoThermoDevice: thermo.correct() needs he's and T's boundary values on "
+                                 "every boundary face -- the energy solve's evaluate has not run.");
+    }
     f.psiBnd.resize(nB);
     f.rhoThermoBnd.resize(nB);
     thermoCorrectBndKernel<<<nBlocks(nB), TPB>>>(
-        nB, f.TBnd.data(), f.pBnd.data(), c, f.psiBnd.data(), f.rhoThermoBnd.data());
+        nB, dbT.bcType.data(),
+        dbT.ioMask.size()    ? dbT.ioMask.data()    : nullptr,
+        dbT.oioMask.size()   ? dbT.oioMask.data()   : nullptr,
+        dbT.mixedMask.size() ? dbT.mixedMask.data() : nullptr,
+        f.pBnd.data(), c, f.heBnd.data(), f.TBnd.data(), f.psiBnd.data(), f.rhoThermoBnd.data());
     cudaCheck(cudaGetLastError(), "rhoThermoCorrectBnd");
 }
 

@@ -173,8 +173,12 @@ int main(int argc, char** argv)
         std::vector<std::vector<vector>> Ub(patches.size());
         for (std::size_t pi = 0; pi < patches.size(); ++pi) Ub[pi] = f.U.boundary[pi]->value();
         updateMixedFreestream(f.U.boundary, Ub, patches);
-        updateMixedFreestream(f.p.boundary, Ub, patches);
-        f.p.evaluateBoundary();
+        // NOT p here. freestreamPressure's updateCoeffs runs inside the pressure fvMatrix constructor
+        // from U's patch value AS THE MOMENTUM SOLVE LEFT IT (freestreamPressureFvPatchScalarField.C:
+        // 109-121), which is stage_Upred's boundary below, and it does not evaluate p: the boundary
+        // value the assembly reads is the one the previous iteration's tail wrote. Rebuilding p's
+        // valueFraction from the START-of-iteration U and evaluating read pEqn.D() 5.9e-06 and its source
+        // 1.07e-03 on the inlet at naca0012's second iteration, where both are 1e-15 with the right one.
     }
 
     // Rebuild UEqn from OpenFOAM's own inputs: rAU and HbyA both come from it.
@@ -291,6 +295,13 @@ int main(int argc, char** argv)
     // (stage_Upred). Using the assembly-time U for H() leaves HbyA wrong by the whole momentum
     // predictor, which then propagates into phiHbyA, phid and the pressure source.
     const FieldData<vector> upFd = readField<vector>(caseDir + "/" + dumpT + "/stage_Upred");
+    {
+        // freestreamPressure's valueFraction from the post-solve U patch values (see the note above).
+        GeometricField<vector> Upred = buildField<vector>(upFd, patches, nC);
+        std::vector<std::vector<vector>> Ubp(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi) Ubp[pi] = Upred.boundary[pi]->value();
+        updateMixedFreestream(f.p.boundary, Ubp, patches);
+    }
     const std::vector<std::vector<vector>> upBnd = rawBoundary<vector>(upFd, patches);
     if (!upFd.internalUniform && static_cast<label>(upFd.internalField.size()) == nC)
         f.U.internal = upFd.internalField;
