@@ -1,5 +1,7 @@
 // _cpp REFERENCE implementation -- see createFields_cpp.cuh for the OpenFOAM provenance.
 #include "rhoCreateFields_cpp.cuh"
+#include "scheme_parse.cuh"   // parseFvSchemesControls: grad(U)'s cellLimited coefficient for validate()
+#include "cellLimitedGrad_cpp.cuh"
 #include "frozen_bc_guard.cuh"
 #include "kEpsilon_cpp.cuh"    // correctNutField: turbulence->validate() before the first solve
 #include "kOmegaSST_cpp.cuh"   // likewise, for the other closure
@@ -821,7 +823,13 @@ RhoSimpleFields createFields(
         else
         {
             const std::vector<scalar> y     = cellWallDist(m, g, patches);
-            const std::vector<tensor> gradU = fvc::gaussGrad(f.U, m, g, patches);
+            // validate()'s correctNut takes fvc::grad(U) through the case's grad(U) scheme (kOmegaSSTBase.C:132).
+            std::vector<tensor> gradU = fvc::gaussGrad(f.U, m, g, patches);
+            {
+                DeviceSimpleControls sctl;
+                parseFvSchemesControls(caseDir, sctl);
+                if (sctl.gradULimitK > 0.0) cpu::cellLimitGrad(gradU, f.U, sctl.gradULimitK, m, g, patches);
+            }
             cpu::kOmegaSST::Compressible comp;
             comp.rho = &f.rho.internal;  comp.rhoBnd = &rhoBnd;
             comp.nu  = &nuLam;           comp.nuBnd  = &nuLamBnd;

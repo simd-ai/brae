@@ -437,6 +437,8 @@ void production(
     // fvc::grad(U), then GbyNu = gradU && devTwoSymm(gradU). Both reused: the legacy kernels compute
     // exactly these and are already gated.
     deviceGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU);
+    // ...through the case's grad(U) scheme (kEpsilon.C:237): cellLimited where fvSchemes says so.
+    if (in.co.gradULimitK > scalar(0)) deviceCellLimitGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU, in.co.gradULimitK);
     deviceGByNuFromGradU(st.gradU, nC, st.gByNu);
 
     // divU is the DILATATION and comes from the VOLUMETRIC flux; divPhi is the EQUATION's own mass-flux
@@ -539,6 +541,8 @@ void assembleTransport(
             DeviceBuffer<scalar> bval, gx, gy, gz, ffc, corr;
             deviceBCValue(db, field, bval);
             deviceGaussGrad(dm, field, bval, gx, gy, gz);
+            // correctedSnGrad's correction takes the field's OWN grad scheme (correctedSnGrad.C:52-55).
+            if (in.co.gradKLimitK > scalar(0)) deviceCellLimitGrad(dm, field, bval, gx, gy, gz, in.co.gradKLimitK);
             if (in.snGradLimitCoeff > scalar(0.0))
             {
                 deviceLaplacianCorrFluxLimited(dm, gammaFace, field, gx, gy, gz, in.snGradLimitCoeff, ffc);

@@ -5,6 +5,7 @@
 #include "nut_wall_function.cuh"
 #include "near_wall_dist.cuh"
 #include "pbicgstab.cuh"
+#include "cellLimitedGrad_cpp.cuh"
 #include <cmath>
 #include <algorithm>
 #include <vector>
@@ -209,7 +210,9 @@ void correct(
     const scalar Cmu75 = std::pow(co.CmuWall, 0.75);
     std::vector<scalar>& nutF = nutField.internal;
 
-    const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+    // fvc::grad(U) through the case's grad(U) scheme (kEpsilon.C:237): cellLimited where fvSchemes says so.
+    std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+    if (co.gradULimitK > 0.0) cellLimitGrad(gradU, U, co.gradULimitK, m, g, patches);
     const std::vector<scalar> gByNu = GbyNu(gradU);
     // divU is the DILATATION, so it comes from the VOLUMETRIC flux -- which for the compressible lineage
     // is phi/interpolate(rho) and not the mass flux the div operator uses. `bounded` instead subtracts
@@ -385,7 +388,9 @@ void correct(
             {
                 std::vector<std::vector<scalar>> vb(patches.size());
                 for (std::size_t pi = 0; pi < patches.size(); ++pi) vb[pi] = epsilon.boundary[pi]->value();
-                const std::vector<vector> gradVf = fvc::gaussGrad(epsilon.internal, vb, m, g, patches);
+                // correctedSnGrad's correction takes grad(epsilon)'s own scheme (correctedSnGrad.C:52-55).
+                std::vector<vector> gradVf = fvc::gaussGrad(epsilon.internal, vb, m, g, patches);
+                if (co.gradKLimitK > 0.0) cellLimitGrad(gradVf, epsilon.internal, vb, co.gradKLimitK, m, g, patches);
                 const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
                     Df, epsilon, gradVf, m, g, patches, co.snGradLimitCoeff);
                 for (label c = 0; c < nC; ++c) L.source[c] -= corr[c];
@@ -560,7 +565,8 @@ void correct(
             {
                 std::vector<std::vector<scalar>> vb(patches.size());
                 for (std::size_t pi = 0; pi < patches.size(); ++pi) vb[pi] = k.boundary[pi]->value();
-                const std::vector<vector> gradVf = fvc::gaussGrad(k.internal, vb, m, g, patches);
+                std::vector<vector> gradVf = fvc::gaussGrad(k.internal, vb, m, g, patches);
+                if (co.gradKLimitK > 0.0) cellLimitGrad(gradVf, k.internal, vb, co.gradKLimitK, m, g, patches);
                 const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
                     Df, k, gradVf, m, g, patches, co.snGradLimitCoeff);
                 for (label c = 0; c < nC; ++c) L.source[c] -= corr[c];

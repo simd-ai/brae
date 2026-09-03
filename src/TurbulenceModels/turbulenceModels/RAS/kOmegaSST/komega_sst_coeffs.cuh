@@ -18,6 +18,7 @@ struct KOmegaSSTCoeffs
     // `cellLimited Gauss linear 1` for both while squareBend leaves them at the unlimited default, so a
     // fixture with only the latter cannot tell the two apart. 0 = unlimited.
     scalar gradKLimitK = 0.0;
+    scalar gradULimitK = 0.0;   // grad(U) cellLimited <k>: fvc::grad(U) in S2/GbyNu0 (kOmegaSSTBase.C:522) and correctNut (:132)
 
     scalar alphaK1 = 0.85,     alphaK2 = 1.0;          // k diffusivity blend  (kOmegaSSTBase.C:263,272)
     scalar alphaOmega1 = 0.5,  alphaOmega2 = 0.856;    // omega diffusivity blend         (:281,290)

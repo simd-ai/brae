@@ -787,6 +787,7 @@ Residuals rhoSimpleStep(
             // The case's gradSchemes for grad(k)/grad(omega), which CDkOmega and therefore F1 depend on.
             KOmegaSSTCoeffs sco = f.sstCoeffs;   // the CASE's, read with keCoeffs in createFields
             sco.gradKLimitK      = in.gradKLimitK;
+            sco.gradULimitK      = in.gradULimitK;   // grad(U) for S2/GbyNu0
 
             const std::vector<scalar> y = cellWallDist(m, g, patches);
             kOmegaSST::SSTResiduals sres;
@@ -854,6 +855,8 @@ Residuals rhoSimpleStep(
         KEpsilonCoeffs keco     = f.keCoeffs;
         keco.correctedLaplacian = in.correctedLaplacian;
         keco.snGradLimitCoeff   = in.snGradLimitCoeff;
+        keco.gradULimitK        = in.gradULimitK;   // grad(U) for the production
+        keco.gradKLimitK        = in.gradKLimitK;   // grad(k)/grad(epsilon) for the laplacian corrections
 
         kEpsilonRef::KEResiduals kres;
         kEpsilonRef::correct(f.U, f.k, f.epsilon, f.nut, f.phi, /*nu=*/0.0, m, g, patches,

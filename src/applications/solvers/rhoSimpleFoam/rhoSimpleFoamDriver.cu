@@ -260,6 +260,8 @@ TurbulenceHookOptions buildTurbulenceHookOptions(
     opt.co                    = hf.keCoeffs;
     opt.co.correctedLaplacian = hin.correctedLaplacian;
     opt.co.snGradLimitCoeff   = hin.snGradLimitCoeff;
+    opt.co.gradULimitK        = hin.gradULimitK;
+    opt.co.gradKLimitK        = hin.gradKLimitK;
     opt.Prt                   = hf.Prt;
     opt.bounded               = hin.boundedTurb;
     opt.correctedLaplacian    = hin.correctedLaplacian;

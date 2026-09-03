@@ -2222,6 +2222,22 @@ set_tests_properties(rho_p0_written_table_vs_openfoam PROPERTIES
                      DEPENDS brae_rhoSimpleFoam
                      TIMEOUT 1800)
 
+add_test(NAME rho_closure_gradlimit_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_closure_gradlimit_vs_openfoam.sh)
+set_tests_properties(rho_closure_gradlimit_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 1800)
+
+add_test(NAME rho_p_unlimited_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_p_unlimited_vs_openfoam.sh)
+set_tests_properties(rho_p_unlimited_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 1800)
+
 add_test(NAME rho_step_cuda_schemes
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_step_cuda_schemes.sh)
 set_tests_properties(rho_step_cuda_schemes PROPERTIES

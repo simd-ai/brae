@@ -25,6 +25,13 @@ struct KEpsilonCoeffs
     // both. FALSE here is `orthogonal`/`uncorrected`, so a caller that does not set it keeps the
     // arithmetic it had -- but a case whose fvSchemes says `corrected` must set it, or the closure is
     // solving a different discretisation from the one the case asked for.
+    // The case's gradSchemes coefficients: `grad(U) cellLimited Gauss linear <k>` for fvc::grad(U) in the
+    // production (kEpsilon.C:237) and in the momentum laplacian's correction, `grad(k)`/`grad(epsilon)` for
+    // the k and epsilon laplacians' non-orthogonal corrections (correctedSnGrad.C:52-55 takes each field's
+    // OWN grad scheme). 0 = unlimited. Measured on naca0012 (`limited cellLimited Gauss linear 1` on all
+    // three) with these unlimited: k 3.3e-04, omega 5.4e-03, nut 1.2e-03 against OpenFOAM at t = 1.
+    scalar gradULimitK = 0.0;
+    scalar gradKLimitK = 0.0;
     bool   correctedLaplacian = false;
     scalar snGradLimitCoeff   = 0.0;    // `limited <k> corrected`; 0 = unlimited
     // realizableKE (OF RAS/realizableKE): variable Cmu (rCmu from strain invariants), strain-based eps production

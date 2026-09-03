@@ -335,7 +335,10 @@ void correct(
     auto nuAt = [&](label cc) { return (comp && comp->nu) ? (*comp->nu)[cc] : nu; };
 
     // ---- production, from the CURRENT nut (the previous outer iteration's correctNut) -------------
-    const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+    // fvc::grad(U) through the case's grad(U) scheme (kOmegaSSTBase.C:522): cellLimited where fvSchemes
+    // says so. Unlimited here, naca0012 read omega 5.4e-03 / nut 1.2e-03 against OpenFOAM at t = 1.
+    std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+    if (co.gradULimitK > 0.0) cellLimitGrad(gradU, U, co.gradULimitK, m, g, patches);
     const std::vector<scalar> s2  = S2(gradU);
     const std::vector<scalar> gb0 = GbyNu0(gradU);
     std::vector<scalar> G(nC);
@@ -510,7 +513,8 @@ void correct(
             {
                 std::vector<std::vector<scalar>> vb(patches.size());
                 for (std::size_t pi = 0; pi < patches.size(); ++pi) vb[pi] = omega.boundary[pi]->value();
-                const std::vector<vector> gradVf = fvc::gaussGrad(omega.internal, vb, m, g, patches);
+                std::vector<vector> gradVf = fvc::gaussGrad(omega.internal, vb, m, g, patches);   // grad(omega)'s own scheme
+                if (co.gradKLimitK > 0.0) cellLimitGrad(gradVf, omega.internal, vb, co.gradKLimitK, m, g, patches);
                 const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
                     Df, omega, gradVf, m, g, patches, snGradLimitCoeff);
                 for (label c = 0; c < nC; ++c) L.source[c] -= corr[c];
@@ -546,7 +550,8 @@ void correct(
             // returns -- see the sign note in fvm.cuh.
             std::vector<std::vector<scalar>> ob(patches.size());
             for (std::size_t pi = 0; pi < patches.size(); ++pi) ob[pi] = omega.boundary[pi]->value();
-            const std::vector<vector> gradVf = fvc::gaussGrad(omega.internal, ob, m, g, patches);
+            std::vector<vector> gradVf = fvc::gaussGrad(omega.internal, ob, m, g, patches);
+            if (co.gradKLimitK > 0.0) cellLimitGrad(gradVf, omega.internal, ob, co.gradKLimitK, m, g, patches);
             const std::vector<scalar> corr =
                 fvm::linearUpwindCorrection<scalar, vector>(phi.internal, gradVf, m, g);
             for (label c = 0; c < nC; ++c) M.source[c] -= corr[c];
@@ -639,7 +644,8 @@ void correct(
             {
                 std::vector<std::vector<scalar>> vb(patches.size());
                 for (std::size_t pi = 0; pi < patches.size(); ++pi) vb[pi] = k.boundary[pi]->value();
-                const std::vector<vector> gradVf = fvc::gaussGrad(k.internal, vb, m, g, patches);
+                std::vector<vector> gradVf = fvc::gaussGrad(k.internal, vb, m, g, patches);   // grad(k)'s own scheme
+                if (co.gradKLimitK > 0.0) cellLimitGrad(gradVf, k.internal, vb, co.gradKLimitK, m, g, patches);
                 const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
                     Df, k, gradVf, m, g, patches, snGradLimitCoeff);
                 for (label c = 0; c < nC; ++c) L.source[c] -= corr[c];
@@ -676,7 +682,8 @@ void correct(
         {
             std::vector<std::vector<scalar>> kb(patches.size());
             for (std::size_t pi = 0; pi < patches.size(); ++pi) kb[pi] = k.boundary[pi]->value();
-            const std::vector<vector> gradVf = fvc::gaussGrad(k.internal, kb, m, g, patches);
+            std::vector<vector> gradVf = fvc::gaussGrad(k.internal, kb, m, g, patches);
+            if (co.gradKLimitK > 0.0) cellLimitGrad(gradVf, k.internal, kb, co.gradKLimitK, m, g, patches);
             const std::vector<scalar> corr =
                 fvm::linearUpwindCorrection<scalar, vector>(phi.internal, gradVf, m, g);
             for (label c = 0; c < nC; ++c) M.source[c] -= corr[c];
