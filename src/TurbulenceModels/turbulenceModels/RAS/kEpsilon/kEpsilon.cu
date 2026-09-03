@@ -656,9 +656,11 @@ void boundField(
 }
 
 
-// alphat_.correctBoundaryConditions() for a compressible::alphatWallFunction face:
-// operator==(rhow*tnutw/Prt_) (alphatWallFunctionFvPatchScalarField.C:125), with the PATCH's own Prt_.
-// Only masked faces are written; every other face keeps whatever its own condition left there.
+// alphat's boundary after EddyDiffusivity::correctNut: rho_b*nut_b/Prt on every face the caller's mask
+// marks -- the wall-function faces with the PATCH's own Prt_ (alphatWallFunctionFvPatchScalarField.C:125,
+// operator==(rhow*tnutw/Prt_)) and the assignable (calculated) faces with the model's, which is what
+// OpenFOAM's whole-field `alphat_ = rho*nut/Prt_` (EddyDiffusivity.C:38) lands on them. An unmasked face
+// (fixedValue) keeps whatever its own condition left there. The mask is built in rhoCreateFields.cu.
 __global__ void alphatBndKernel(
     int           nB,
     const label*  __restrict__ mask,

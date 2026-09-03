@@ -55,6 +55,7 @@
 #include "rhoCaseRefusals.cuh"
 #include "rhoTurbulenceHook.cuh"   // correctTurbulence: the device-resident closure hook the driver ships
 #include "rhoSimpleFoamDriver.cuh"   // buildDeviceStepInput: the device input struct the driver ships
+#include "rhoSimpleFoamDriver_cpp.cuh"   // buildStepInput: the case -> StepInput translation the solver ships
 #include "scheme_parse.cuh"     // parseFieldDivScheme -- div(phi,k|epsilon|omega) from the case          // gpu::kEpsilonRAS -- the device closure the turbulent arm drives
 #include "transport_model.cuh"   // transportMu: nu = mu(T)/rho for the closure inputs
 #include "linearViscousStress_cpp.cuh"   // effectiveFaceViscosity -- the host driver's own rho interpolation
@@ -97,6 +98,21 @@ static void check(const char* what, bool ok)
 {
     if (!ok) ++g_fails;
     std::printf("     %-40s %s\n", what, ok ? "ok" : "FAIL");
+}
+
+// The div scheme as fvSchemes spells it, for the resolved-schemes line a registered test greps.
+static const char* schemeName(cpu::rhoSimple::DivScheme s)
+{
+    switch (s)
+    {
+        case cpu::rhoSimple::DivScheme::upwind:         return "upwind";
+        case cpu::rhoSimple::DivScheme::linearUpwind:   return "linearUpwind";
+        case cpu::rhoSimple::DivScheme::limitedLinear:  return "limitedLinear";
+        case cpu::rhoSimple::DivScheme::limitedLinearV: return "limitedLinearV";
+        case cpu::rhoSimple::DivScheme::LUST:           return "LUST";
+        case cpu::rhoSimple::DivScheme::linearUpwindV:  return "linearUpwindV";
+    }
+    return "unknown";
 }
 
 // The flattening is rhoCreateFields.cu's, not a fourth private copy of it -- the padding convention is
@@ -181,102 +197,51 @@ int main(int argc, char** argv)
         check("no coupled patches (the driver refuses them)", coupled == 0);
     }
 
-    // THE CASE'S OWN CONTROLS, on both sides. Running SIMPLE unrelaxed is not a neutral simplification:
-    // with relaxU = 1 and relaxP = 1 this fixture diverges to NaN by iteration 7 -- on the HOST as much
-    // as on the device -- and a gate comparing two divergent trajectories measures nothing. The
-    // relaxation factors, the `bounded` div schemes and the ORTHOGONAL laplacian all come from the case
-    // file, because a driver gate that silently substitutes its own numerics is testing something the
-    // solver never runs.
-    const FoamDict* rf  = fvSolution.subDict("relaxationFactors");
-    const FoamDict* req = rf ? rf->subDict("equations") : nullptr;
-    const FoamDict* rfl = rf ? rf->subDict("fields") : nullptr;
-
-    cpu::rhoSimple::StepInput hin;
-    // CASE-derived refusal flags, same helper as the cpp harness -- both sides get them. The DEVICE
-    // path has no fvOptions consumer at all, so even host-IMPLEMENTED options (a DarcyForchheimer,
-    // say) must refuse there rather than silently drop from the momentum equation.
+    // THE CASE -> StepInput, through the SHARED translation both runnable drivers use
+    // (cpu::rhoSimple::buildStepInput, rhoSimpleFoamDriver_cpp.cu; the CUDA driver takes the same one
+    // and projects it, rhoSimpleFoamDriver.cu). This block used to be a hand-built partial copy of that
+    // parse, and a partial copy drifts: it carried the `bounded` flags and the laplacian from the case
+    // but never schemeU/schemeHe/schemeKE, so every arm assembled UPWIND on U, he and K whatever
+    // fvSchemes named. Invisible on rhoBox and sbMatched, which are upwind throughout, and wrong on
+    // rhoKE2 (`bounded Gauss linearUpwind grad(e)` on div(phi,e) and div(phi,Ekp)): there the copy
+    // resolved schemeHe and schemeKE to upwind against the parse's linearUpwind. BOTH arms take hin, so
+    // the device-against-host comparison stayed green while neither ran the case's scheme -- which is
+    // why tests/rho_step_cuda_schemes.sh holds the resolved line printed below against fvSchemes
+    // itself rather than trusting this comparison. The other fields the copy got wrong, measured field
+    // by field against buildStepInput on 2026-09-02: relaxEquationK/Eps/Omega TRUE where the case
+    // names no factor (rhoBox, rhoKE2); relaxK/relaxEpsilon 1.0 and boundedTurb false on the
+    // sbMatched boundary arm against the case's 0.9/0.9/bounded (the host closure runs inside that
+    // arm's one iteration on those values).
+    //
+    // `cr` is function-local static because hin.fvOpts points into it, and gin is built from it below.
     static cpu::rhoSimple::CaseRefusals cr;
-    cr = cpu::rhoSimple::deriveCaseRefusals(caseDir, m);
-    hin.hasMRF              = cr.hasMRF;
-    hin.hasFvOptions        = cr.hasFvOptions;
-    hin.fvOptionUnsupported = cr.fvOptionUnsupported;
-    hin.limitT              = cr.limitT;
-    hin.limitTmin           = cr.limitTmin;
-    hin.limitTmax           = cr.limitTmax;
-    if (!cr.hasFvOptions && !cr.opts.empty()) hin.fvOpts = &cr.opts;
-    hin.consistent = simpleDict && simpleDict->wordOr("consistent", "no") == "yes";
-    hin.transonic  = simpleDict && simpleDict->wordOr("transonic", "no") == "yes";
-    hin.tolU = hin.tolHe = hin.tolP = 1e-14;
-    hin.maxIterU = hin.maxIterP = hin.maxIterHe = hin.maxIterTurb = 2000;
-    hin.relaxU  = req ? req->scalarOr("U", 1.0) : 1.0;
-    hin.relaxHe = req ? req->scalarOr(hf.heName, 1.0) : 1.0;
-    hin.relaxEquationU  = (req != nullptr) && req->found("U");
-    hin.relaxEquationHe = (req != nullptr) && req->found(hf.heName);
-    hin.relaxP  = rfl ? rfl->scalarOr("p", 1.0) : 1.0;
-    hin.relaxRho = rfl ? rfl->scalarOr("rho", 1.0) : 1.0;
-    hin.relaxPEqn = req ? req->scalarOr("p", 1.0) : 1.0;
-    hin.relaxPEqnSpecified = (req != nullptr) && req->found("p");
-    // THE CLOSURE'S CONTROLS, on the turbulent arm. The gate set none of these, which was harmless while
-    // every arm ran laminar and is not once the closure runs: StepInput defaults relaxK/relaxEpsilon to
-    // 1.0 with relaxEquationK/Eps TRUE, so the host closure would apply the dominance clamp the case
-    // never asked for while the device side used whatever it was handed.
-    if (turbulentArm)
-    {
-        hin.relaxK          = req ? req->scalarOr("k", 1.0) : 1.0;
-        hin.relaxEpsilon    = req ? req->scalarOr("epsilon", 1.0) : 1.0;
-        hin.relaxEquationK  = (req != nullptr) && req->found("k");
-        hin.relaxEquationEps= (req != nullptr) && req->found("epsilon");
-        hin.tolTurb         = 1e-12;   // the case's own tolerance (fvSolution)
-        hin.relTolTurb      = 0.0;
-        // FROM THE CASE, not hardcoded -- see the cpp harness. The device closure's own refusal
-        // (kEpsilon.cu hasNonUpwindDivScheme) becomes reachable through exactly this parse.
-        {
-            const char* secondT = (hf.rasModel == "kOmegaSST") ? "omega" : "epsilon";
-            const FieldDivScheme dK = parseFieldDivScheme(caseDir, "k");
-            const FieldDivScheme dS = parseFieldDivScheme(caseDir, secondT);
-            hin.boundedTurb = dK.bounded;
-            if (dK.limited || dS.limited)           hin.turbDivUnsupported = "Gauss limitedLinear";
-            if (dK.linearUpwind || dS.linearUpwind) hin.turbDivUnsupported = "Gauss linearUpwind";
-            if (dK.bounded != dS.bounded)
-                hin.turbDivUnsupported = "bounded on only one of the two turbulence entries";
-        }
-    }
-    // `bounded` FROM THE CASE, on both arms. This was `= true` with a comment naming rhoBox's own
-    // `bounded Gauss upwind` -- a hardcode of the same class as the laplacian one below it, and the
-    // last of the pair the register carried: pointing this binary at a case whose div schemes are not
-    // bounded would have run the bounded matrix on both arms under the case's name, agreeing with
-    // itself and with nothing else. rhoBox parses to exactly the true that was hardcoded, so the
-    // registered gates are unchanged.
-    {
-        const FieldDivScheme dU  = parseFieldDivScheme(caseDir, "U");
-        const FieldDivScheme dHe = parseFieldDivScheme(caseDir, hf.heName);
-        // The kinetic-energy term's OWN entry (div(phi,Ekp) on e, div(phi,K) on h), as buildStepInput
-        // reads it -- this line used to copy the energy entry.
-        const FieldDivScheme dKE = parseFieldDivScheme(caseDir, hf.heName == "e" ? "Ekp" : "K");
-        hin.boundedU  = dU.bounded;
-        hin.boundedHe = dHe.bounded;
-        hin.boundedKE = dKE.bounded;
-    }
-    // laplacianSchemes/snGradSchemes FROM THE CASE. This was `= false` with a comment naming the
-    // fixture's `Gauss linear orthogonal` -- a hardcode, so pointing this binary at a corrected case
-    // (sbMatched, and the nonOrth-corrector gate's mutation of it) silently assembled the orthogonal
-    // laplacian on BOTH arms, and the corrector loop then had nothing to correct between passes.
-    // rhoBox parses to exactly the false that was hardcoded, so the registered gate is unchanged.
-    {
-        DeviceSimpleControls sctl;
-        parseFvSchemesControls(caseDir, sctl);
-        hin.correctedLaplacian = sctl.nonOrth;
-        hin.gradULimitK        = sctl.gradULimitK;
-        hin.gradKLimitK        = sctl.gradKLimitK;
-    }
+    cpu::rhoSimple::StepInput hin =
+        cpu::rhoSimple::buildStepInput(caseDir, hf, fvSolution, m, cr);
 
-    // Both arms carry the non-orthogonal corrector loop now (the host reference grew it for
-    // tests/rho_nonorth_corrector_vs_openfoam.sh), so the case's own count reaches both and this gate
-    // can compare any fixture. It used to assert caseNonOrth == 0 because the reference solved the
-    // pressure equation exactly once whatever the case named.
-    const label caseNonOrth =
-        simpleDict ? (label)simpleDict->scalarOr("nNonOrthogonalCorrectors", 0) : 0;
-    hin.nNonOrthogonalCorrectors = caseNonOrth;
+    // HARNESS PINS, applied AFTER the shared parse, each named. buildStepInput reads no linear-solver
+    // entry -- the runnable drivers read fvSolution's separately, because a SOLVER must run what the
+    // case asks for -- while a GATE pins them so that the two Krylov implementations between the arms
+    // (host pbicgstab, device BiCGStab) meet at the floor rather than at the case's relTol. 1e-14 on
+    // U/he/p: the header's 5.406e-04 momentum defect was insensitive to this (identical at 1e-16,
+    // 1e-14 and 1e-10), which is what made it attributable to the assembly.
+    hin.tolU = 1e-14;
+    hin.tolHe = 1e-14;
+    hin.tolP = 1e-14;
+    hin.maxIterU = 2000;
+    hin.maxIterP = 2000;
+    hin.maxIterHe = 2000;
+    hin.maxIterTurb = 2000;
+    // The closure's own solves too: host pbicgstab against device BiCGStab on k and epsilon, pinned so
+    // the closure comparison on the turbulent arm is about the closure and not about where each
+    // stops. Set on every arm -- a laminar one never reads them.
+    hin.tolTurb = 1e-12;
+    hin.relTolTurb = 0.0;
+
+    // What BOTH arms will assemble, printed so a registered test can hold it against the fixture's own
+    // fvSchemes (tests/rho_step_cuda_schemes.sh) -- see the note above on why device == host cannot.
+    std::printf("  resolved schemes: div(phi,U)=%s div(phi,%s)=%s div(phi,%s)=%s\n",
+                schemeName(hin.schemeU), hf.heName.c_str(), schemeName(hin.schemeHe),
+                hf.heName == "e" ? "Ekp" : "K", schemeName(hin.schemeKE));
 
     // ---- the DEVICE side ---------------------------------------------------------------------
     // THE DEVICE PROJECTION, from the module that owns it. Every line this replaces was hand-rolled
@@ -336,10 +301,8 @@ int main(int argc, char** argv)
         gpu::rhoSimple::buildDeviceStepInput(hin, hf, cr, dev, fvp, ginPorosity, ginConstraints, nC);
     // constrainHbyA's mask and adjustPhi's mask, from the projection. They answer DIFFERENT questions
     // and rhoCreateFields.cu is where that distinction is made once.
-    // A GATE pins the linear solve so it is out of the comparison; the SOLVER reads the case's own
-    // tolerances (rhoSimpleFoamDriver.cu). The one deliberate difference between the two, named here.
-    gin.tolU = gin.tolHe = gin.tolP = 1e-14;
-    gin.maxIterU = gin.maxIterP = gin.maxIterHe = gin.maxIterTurb = 2000;
+    // The linear-solver pins arrive here from hin through the builder (tolU/tolHe/tolP 1e-14, maxIter
+    // 2000 -- see the HARNESS PINS block), so the two arms are pinned from ONE place.
 
     // THE CASE'S OWN pressureControl, on every arm. The forced-limiter block below overrides these with
     // bounds tightened to make the clamp bite, and it is SKIPPED on the boundary and turbulent arms --
@@ -429,20 +392,10 @@ int main(int argc, char** argv)
     gin.frNy     = &dev.frNy;
     gin.frNz     = &dev.frNz;
 
-    gin.relaxEquationU  = (req != nullptr) && req->found("U");
-    gin.relaxU          = hin.relaxU;
-    gin.relaxEquationHe = (req != nullptr) && req->found(hf.heName);
-    gin.relaxHe         = hin.relaxHe;
-    gin.relaxP    = hin.relaxP;
-    gin.relaxRho  = hin.relaxRho;
-    gin.relaxPEqn = hin.relaxPEqn;
-    gin.relaxPEqnSpecified = hin.relaxPEqnSpecified;
-    gin.boundedU  = hin.boundedU;   // parsed from the case -- see the hin block
-    gin.boundedHe = hin.boundedHe;
-    gin.boundedKE = hin.boundedKE;
-    gin.correctedLaplacian = hin.correctedLaplacian;   // parsed from the case -- see the hin note
-    gin.gradULimitK        = hin.gradULimitK;
-    gin.nNonOrthogonalCorrectors = caseNonOrth;   // the same count on both arms -- see the note above
+    // Relaxation, `bounded`, the div schemes, the laplacian, the gradient limiters and the corrector
+    // count all reach gin THROUGH buildDeviceStepInput from hin. Nothing is re-derived here: the lines
+    // that used to re-parse relaxationFactors and copy the scheme flags one by one were the same
+    // partial copy as the old hin block, and forwarded no schemeU/schemeHe/schemeKE either.
     if (deviceThermo)
     {
         // THE DEVICE-RESIDENT HOOKS. Same two operations, never leaving the GPU. This is the arm that
@@ -507,16 +460,12 @@ int main(int argc, char** argv)
     gpu::rhoSimple::TurbulenceHookOptions turbOpt;
     if (turbulentArm)
     {
-        turbOpt.co                    = hf.keCoeffs;
-        turbOpt.co.correctedLaplacian = gin.correctedLaplacian;
-        turbOpt.co.snGradLimitCoeff   = hin.snGradLimitCoeff;
-        turbOpt.Prt                   = hf.Prt;
-        turbOpt.bounded               = hin.boundedTurb;
-        turbOpt.correctedLaplacian    = gin.correctedLaplacian;
-        turbOpt.divSchemeUnsupported  = hin.turbDivUnsupported;
-        turbOpt.relaxEquationK   = hin.relaxEquationK;   turbOpt.relaxK   = hin.relaxK;
-        turbOpt.relaxEquationEps = hin.relaxEquationEps; turbOpt.relaxEps = hin.relaxEpsilon;
-        turbOpt.tol = hin.tolTurb; turbOpt.relTol = hin.relTolTurb; turbOpt.maxIter = hin.maxIterTurb;
+        // Through the SHARED options builder the runnable CUDA driver uses (rhoSimpleFoamDriver.cu).
+        // The hand-built copy this replaces carried neither the fvOptions k/epsilon constraint masks
+        // nor minIter, and mapped limitedLinear to a refusal string of its own -- three ways the
+        // closure this gate drove could differ from the one `brae -case` runs on a case naming any of
+        // them (OpenFOAM's angledDuct tutorial names the first).
+        turbOpt = gpu::rhoSimple::buildTurbulenceHookOptions(hin, hf, ginConstraints);
         gin.correct = [&]()
         {
             gpu::rhoSimple::correctTurbulence(gf, dev, dm, dbU, hf.thermo, turbOpt, turbBuf);
@@ -611,6 +560,10 @@ int main(int argc, char** argv)
                 { "rhoThermo",  relL2(gf.rhoThermo.host(), hf.rhoThermo) },
                 { "nutBnd",     relL2(gf.nutBnd.host(),    bndOf(hf.nut)) },
                 { "alphat",     relL2(gf.alphat.host(),    hf.alphat.internal) },
+                // EVERY alphat face, not only the wall-function ones the bound below covers: the
+                // calculated inlet/outlet faces are where EddyDiffusivity's whole-field assignment
+                // (EddyDiffusivity.C:38) lands and where a wall-masked kernel would leave the seed.
+                { "alphatBnd",  relL2(gf.alphatBnd.host(), bndOf(hf.alphat)) },
                 { "UxBnd",      relL2(gf.UxBnd.host(),     hUxB) },
                 { "UyBnd",      relL2(gf.UyBnd.host(),     hUyB) },
                 { "UzBnd",      relL2(gf.UzBnd.host(),     hUzB) },
@@ -707,13 +660,16 @@ int main(int argc, char** argv)
         // The device closure now writes alphat's boundary. Before it did, this read 1.0 exactly on every
         // one of these faces -- brae's device wall alphat was identically zero where the host's (and
         // OpenFOAM's) is not, so alphaEff at the wall carried none of the turbulent diffusivity.
-        std::printf("     %-40s over %d alphat wall faces\n", "alphat BOUNDARY: device vs host",
-                    (int)alphatBFaces);
-        check("the fixture HAS alphat wall faces (else this is vacuous)", alphatBFaces > 0);
-        // 1e-3, not machine precision: this inherits the closure drift the arm has not yet explained
-        // (see the header). It TIGHTENS when that is understood. Measured 1.143903e-04; with the device
-        // boundary write disabled it reads exactly 1.000000e+00, which is what it caught.
-        report("alphat boundary (device vs host)", worstAlphatB, 1e-3);
+        std::printf("     %-40s over %d alphat faces (wall-function and calculated)\n",
+                    "alphat BOUNDARY: device vs host", (int)alphatBFaces);
+        check("the fixture HAS assignable alphat faces (else this is vacuous)", alphatBFaces > 0);
+        // The 1.143903e-04 this arm used to read (against a 1e-3 placeholder) was the CALCULATED inlet
+        // and outlet faces: the device mask covered the wall-function faces only, so those kept the
+        // 0/alphat seed while the host and OpenFOAM's whole-field `alphat = rho*nut/Prt`
+        // (EddyDiffusivity.C:38) moved them. With the mask extended to every assignable face
+        // (rhoCreateFields.cu) it reads 1.717e-11 on rhoKE at 3 iterations; bound ~60x. With the device
+        // boundary write disabled it reads exactly 1.000000e+00, and with the old wall-only mask 1.1e-04.
+        report("alphat boundary (device vs host)", worstAlphatB, 1e-9);
     }
 
     // ---- CONTROL: the POROSITY reaches the momentum equation -----------------------------------
