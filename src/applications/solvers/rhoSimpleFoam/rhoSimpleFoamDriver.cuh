@@ -11,7 +11,10 @@
 //   cpu::rhoSimple::buildStepInput   the case -> StepInput parse. The device input struct is filled FROM
 //                                    it (buildDeviceStepInput below), so a scheme, a relaxation factor
 //                                    or a refusal the case names cannot reach one arm and not the other.
-//   gpu::rhoSimple::correctTurbulence the closure hook, device-resident (rhoTurbulenceHook.cuh).
+//   gpu::rhoSimple::correctTurbulence the closure hook, device-resident (rhoTurbulenceHook.cuh), and
+//                                    its OPTIONS (buildTurbulenceHookOptions below) -- the CUDA harness
+//                                    used to fill those by hand and dropped the fvOptions k/epsilon
+//                                    constraints and minIter on the way.
 //   the host field set               createDeviceFields projects the device state FROM the host's, so
 //                                    the host createFields -- with every refusal it carries -- runs
 //                                    first here exactly as it does in the harness.
@@ -20,6 +23,7 @@
 #include "rhoSimpleFoam.cuh"
 #include "rhoCaseRefusals.cuh"
 #include "rhoSimpleFoam_cpp.cuh"
+#include "rhoTurbulenceHook.cuh"
 #include <string>
 
 namespace brae {
@@ -49,6 +53,15 @@ RhoStepInput buildDeviceStepInput(
     DevicePorosity&                         porosity,
     DeviceConstraints&                      constraints,
     label                                   nCells);
+
+// The closure hook's options FROM the shared StepInput: coefficients, Prt, the div/laplacian scheme
+// flags, relaxation, the k/epsilon solver controls and the fvOptions constraint masks. Shared with the
+// CUDA harness so the closure the gate drives is configured exactly as the one `brae -case` runs.
+// `constraints` is caller-owned: the returned options point into its k/epsilon buffers.
+TurbulenceHookOptions buildTurbulenceHookOptions(
+    const cpu::rhoSimple::StepInput&        hin,
+    const cpu::rhoSimple::RhoSimpleFields&  hf,
+    const DeviceConstraints&                constraints);
 
 // One whole run on the device: `brae -case <dir>` with BRAE_RHOSIMPLEFOAM_MIRROR=cuda.
 int runMirrorCuda(const std::string& caseDir);

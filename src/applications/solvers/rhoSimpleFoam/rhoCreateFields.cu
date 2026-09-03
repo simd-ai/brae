@@ -280,18 +280,28 @@ RhoDeviceFields createDeviceFields(
             // exactly the wall where it is largest.
             d.f.alphatBnd.copyFrom(flattenFieldBoundary(hf.alphat, patches, d.nBndFaces, 0.0));
 
-            // ...and WHICH faces the closure must recompute, with that patch's own Prt. Same walk.
+            // ...and WHICH faces the closure must recompute, with which Prt. OpenFOAM's
+            // EddyDiffusivity::correctNut is a whole-field assignment, `alphat_ = rho*nut/Prt_`
+            // (EddyDiffusivity.C:38): every ASSIGNABLE patch -- `calculated` on an inlet or outlet --
+            // takes rho_b*nut_b/Prt with the MODEL's Prt, a fixedValue patch ignores the assignment
+            // (fixedValueFvPatchField::operator= is a no-op), and compressible::alphatWallFunction
+            // recomputes rho_w*nut_w/Prt_ with its OWN Prt in updateCoeffs. This mask used to cover the
+            // wall-function faces only, so the calculated faces kept the 0/alphat seed for the whole run
+            // on the device while the host (correctAlphatBoundary) and OpenFOAM moved them: measured on
+            // rhoKE at iteration 3 with the closure solvers pinned, he 1.3e-06 / T 1.2e-08 device against
+            // host from that alone. Same predicate as the host's: skip fixesValue, wall Prt else model Prt.
             std::vector<label>  am(static_cast<std::size_t>(d.nBndFaces), 0);
             std::vector<scalar> ap(static_cast<std::size_t>(d.nBndFaces), scalar(0.85));
             label abi = 0;
             for (std::size_t pi = 0; pi < patches.size(); ++pi)
             {
                 const bool wf = pi < hf.alphatWallFn.size() && hf.alphatWallFn[pi] != 0;
-                const scalar pr = pi < hf.alphatPrt.size() ? hf.alphatPrt[pi] : scalar(0.85);
+                const bool fixes = pi < hf.alphat.boundary.size() && hf.alphat.boundary[pi]->fixesValue();
+                const scalar pr = wf ? (pi < hf.alphatPrt.size() ? hf.alphatPrt[pi] : scalar(0.85)) : hf.Prt;
                 for (label i = 0; i < patches[pi].size; ++i, ++abi)
                 {
                     if (abi >= d.nBndFaces) break;
-                    if (wf) { am[abi] = 1; ap[abi] = pr; }
+                    if (wf || !fixes) { am[abi] = 1; ap[abi] = pr; }
                 }
             }
             d.alphatWallMask.copyFrom(am);

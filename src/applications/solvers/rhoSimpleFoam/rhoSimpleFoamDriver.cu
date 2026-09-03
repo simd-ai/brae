@@ -11,6 +11,7 @@
 #include "rhoThermoDevice.cuh"           // effectiveTransport, device-resident
 #include "thermo_model.cuh"              // hConstTToHe: limitTemperature is a T limit, the device clamps he
 #include "rhoTurbulenceHook.cuh"         // correctTurbulence, device-resident
+#include "solution_directions.cuh"       // polyMesh::solutionD(): which U components are solved
 #include "solver_controls.cuh"
 #include "write_control.cuh"
 
@@ -238,7 +239,57 @@ RhoStepInput buildDeviceStepInput(
     in.maxIterP  = hin.maxIterP;  in.minIterP  = hin.minIterP;
     in.maxIterHe = hin.maxIterHe; in.minIterHe = hin.minIterHe;
 
+    // The momentum components OpenFOAM solves, from the same empty patches polyMesh::calcDirections
+    // reads. Derived here rather than in the host StepInput so the harness, which builds its host
+    // input by hand, cannot leave it unset: this function is the one path every device input takes.
+    const SolutionDirections solutionD = solutionDirections(patches);
+    for (int cmpt = 0; cmpt < 3; ++cmpt)
+    {
+        in.solutionD[cmpt] = solutionD.d[cmpt];
+    }
+
     return in;
+}
+
+TurbulenceHookOptions buildTurbulenceHookOptions(
+    const cpu::rhoSimple::StepInput&       hin,
+    const cpu::rhoSimple::RhoSimpleFields& hf,
+    const DeviceConstraints&               constraints)
+{
+    TurbulenceHookOptions opt;
+    opt.co                    = hf.keCoeffs;
+    opt.co.correctedLaplacian = hin.correctedLaplacian;
+    opt.co.snGradLimitCoeff   = hin.snGradLimitCoeff;
+    opt.Prt                   = hf.Prt;
+    opt.bounded               = hin.boundedTurb;
+    opt.correctedLaplacian    = hin.correctedLaplacian;
+    // limitedLinear is assembled on the HOST closure and not on the device one, so the device arm
+    // must keep refusing it by name: the flag the host parse produces is carried through unchanged,
+    // plus the device's own scheme limit.
+    opt.divSchemeUnsupported = !hin.turbDivUnsupported.empty()
+                             ? hin.turbDivUnsupported
+                             : (hin.limitedLinearTurb
+                                ? std::string("Gauss limitedLinear (device closure is upwind-only)")
+                                : std::string());
+    opt.relaxEquationK   = hin.relaxEquationK;
+    opt.relaxK           = hin.relaxK;
+    opt.relaxEquationEps = hin.relaxEquationEps;
+    opt.relaxEps         = hin.relaxEpsilon;
+    opt.tol              = hin.tolTurb;
+    opt.relTol           = hin.relTolTurb;
+    opt.maxIter          = hin.maxIterTurb;
+    opt.minIter          = hin.minIterTurb;
+    if (constraints.hasK)
+    {
+        opt.fvoKMask = &constraints.kMask;
+        opt.fvoKVal  = &constraints.kVal;
+    }
+    if (constraints.hasEps)
+    {
+        opt.fvoEpsMask = &constraints.epsMask;
+        opt.fvoEpsVal  = &constraints.epsVal;
+    }
+    return opt;
 }
 
 namespace {
@@ -336,26 +387,8 @@ int runMirrorCuda(const std::string& caseDir)
     TurbulenceHookOptions turbOpt;
     if (hf.turbulent && !hf.turbulenceFrozen && !hf.k.internal.empty())
     {
-        turbOpt.co                   = hf.keCoeffs;
-        turbOpt.co.correctedLaplacian = hin.correctedLaplacian;
-        turbOpt.co.snGradLimitCoeff   = hin.snGradLimitCoeff;
-        turbOpt.Prt                  = hf.Prt;
-        turbOpt.bounded              = hin.boundedTurb;
-        turbOpt.correctedLaplacian   = hin.correctedLaplacian;
-        // limitedLinear is assembled on the HOST closure and not on the device one, so the device arm
-        // must keep refusing it by name: the flag the host parse produces is carried through unchanged,
-        // plus the device's own scheme limit.
-        turbOpt.divSchemeUnsupported = !hin.turbDivUnsupported.empty()
-                                     ? hin.turbDivUnsupported
-                                     : (hin.limitedLinearTurb
-                                        ? std::string("Gauss limitedLinear (device closure is upwind-only)")
-                                        : std::string());
-        turbOpt.relaxEquationK   = hin.relaxEquationK;   turbOpt.relaxK   = hin.relaxK;
-        turbOpt.relaxEquationEps = hin.relaxEquationEps; turbOpt.relaxEps = hin.relaxEpsilon;
-        turbOpt.tol = hin.tolTurb; turbOpt.relTol = hin.relTolTurb;
-        turbOpt.maxIter = hin.maxIterTurb; turbOpt.minIter = hin.minIterTurb;
-        if (constraints.hasK)   { turbOpt.fvoKMask   = &constraints.kMask;   turbOpt.fvoKVal   = &constraints.kVal; }
-        if (constraints.hasEps) { turbOpt.fvoEpsMask = &constraints.epsMask; turbOpt.fvoEpsVal = &constraints.epsVal; }
+        // The SAME options the CUDA harness's turbulent arm drives (buildTurbulenceHookOptions above).
+        turbOpt = buildTurbulenceHookOptions(hin, hf, constraints);
 
         gin.correct = [&]()
         {

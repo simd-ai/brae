@@ -2166,6 +2166,38 @@ set_tests_properties(rho_mirror_solver_vs_openfoam PROPERTIES
                      DEPENDS brae_rhoSimpleFoam
                      TIMEOUT 1800)
 
+add_test(NAME rho_relax_default_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_relax_default_vs_openfoam.sh)
+set_tests_properties(rho_relax_default_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 1800)
+
+add_test(NAME rho_uresidual_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_uresidual_vs_openfoam.sh)
+set_tests_properties(rho_uresidual_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 1800)
+
+add_test(NAME rho_step_cuda_schemes
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_step_cuda_schemes.sh)
+set_tests_properties(rho_step_cuda_schemes PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_simple_step_cuda
+                     TIMEOUT 1800)
+
+add_test(NAME rho_step_cuda_turbulent
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_step_cuda_turbulent.sh)
+set_tests_properties(rho_step_cuda_turbulent PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_simple_step_cuda
+                     TIMEOUT 1800)
+
 add_test(NAME rho_nonorth_corrector_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_nonorth_corrector_vs_openfoam.sh)
 set_tests_properties(rho_nonorth_corrector_vs_openfoam PROPERTIES
