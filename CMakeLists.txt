@@ -1678,6 +1678,17 @@ add_test(NAME ffpi_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/ffpi_vs_openfoam.sh)
 set_tests_properties(ffpi_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
 
+# The other half of that boundary condition's envelope: fixedFluxPressure TOGETHER WITH MRF is refused,
+# because constrainPressure.C:70 makes the flux relative and deviceConstrainPressure does not. Needs a
+# fixture with a REAL rotating cellZone -- see the script's header for why pitzDaily cannot host it.
+add_test(NAME v2_mrf_fixedfluxpressure_refusal
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/v2_mrf_fixedfluxpressure_refusal.sh)
+set_tests_properties(v2_mrf_fixedfluxpressure_refusal PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae
+                     TIMEOUT 900)
+
 add_test(NAME ffp_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/ffp_vs_openfoam.sh)
 set_tests_properties(ffp_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
