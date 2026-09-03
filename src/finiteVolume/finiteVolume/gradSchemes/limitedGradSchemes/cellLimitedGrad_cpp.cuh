@@ -35,6 +35,21 @@ namespace brae {
 namespace cpu {
 
 // Limits a gradient that has ALREADY been computed by the base scheme, in place.
+// The same limiter on a field given as VALUES -- the internal field and the patch values -- for a
+// caller that has no GeometricField: the energy equation's kinetic-energy term builds K = 0.5|U|^2 (or
+// Ekp) on the fly with its boundary values in a separate vector. The GeometricField overload below
+// delegates here. It used to be the other way round, and the caller handed a boundary-less shim: the
+// first case that named `grad(Ekp) cellLimited` dereferenced a null patch inside limitPass (SIGSEGV),
+// which the never-forwarded limiter coefficient had hidden -- see rhoSimpleFoamDriver_cpp.cu.
+void cellLimitGrad(
+    std::vector<vector>&                    grad,
+    const std::vector<scalar>&              vsf,
+    const std::vector<std::vector<scalar>>& vsfBnd,
+    scalar                                  k,
+    const PrimitiveMesh&                    m,
+    const FvGeometry&                       g,
+    const std::vector<FvPatch>&             patches);
+
 void cellLimitGrad(
     std::vector<vector>&          grad,   // in/out, per cell
     const GeometricField<scalar>& vsf,
