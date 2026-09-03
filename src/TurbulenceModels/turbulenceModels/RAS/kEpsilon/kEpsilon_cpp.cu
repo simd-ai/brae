@@ -352,8 +352,12 @@ void correct(
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
             // OF kEpsilon.C: epsilon_.boundaryFieldRef().updateCoeffs() immediately before the equation.
-            // turbulentMixingLengthDissipationRateInlet reads k's CURRENT patch values there.
-            epsilon.boundary[pi]->updateTurbulentInlet({}, k.boundary[pi]->value(), co.Cmu);
+            // turbulentMixingLengthDissipationRateInlet reads k's CURRENT patch values there, and the
+            // MODEL's Cmu: its :149 takes coeffDict().getOrDefault("Cmu", <patch Cmu>), and kEpsilon's
+            // constructor has already written Cmu into that dict whether or not the case named one
+            // (kEpsilon.C:102-108 getOrAddToDict; dimensionedType.C:389 adds the default). So the dict
+            // always has it, and a patch `Cmu` entry is dead under this model.
+            epsilon.boundary[pi]->updateTurbulentInlet({}, k.boundary[pi]->value(), co.Cmu, true);
             epsilon.boundary[pi]->updateFromFlux(phi.boundary[pi]);
         }
 
@@ -538,8 +542,8 @@ void correct(
         // carries. The flux is the one this equation is convected by, which is the field the BC names.
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
-            // turbulentIntensityKineticEnergyInlet reads U's patch values.
-            k.boundary[pi]->updateTurbulentInlet(U.boundary[pi]->value(), {}, co.Cmu);
+            // turbulentIntensityKineticEnergyInlet reads U's patch values (and no Cmu at all).
+            k.boundary[pi]->updateTurbulentInlet(U.boundary[pi]->value(), {}, co.Cmu, true);
             k.boundary[pi]->updateFromFlux(phi.boundary[pi]);
         }
 

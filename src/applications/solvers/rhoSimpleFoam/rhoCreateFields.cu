@@ -311,6 +311,9 @@ RhoDeviceFields createDeviceFields(
         // The TURBULENT INLETS, per boundary face. OF's turbulentIntensityKineticEnergyInlet and
         // turbulentMixingLengthDissipationRateInlet recompute their value every updateCoeffs, so the
         // closure needs the per-face intensity / mixing length rather than the seeded k and epsilon.
+        // No per-face Cmu: under kEpsilon the inlet's Cmu is the model's on every face (the patch's own
+        // entry is overridden at ...DissipationRateInlet...C:149 by a coeffDict entry kEpsilon always
+        // adds, kEpsilon.C:102-108), which the closure takes from KEpsilonInput::co.
         // The walk is flattenBoundary's -- every patch in order -- which is unambiguous here because
         // this function has already refused any coupled patch.
         {

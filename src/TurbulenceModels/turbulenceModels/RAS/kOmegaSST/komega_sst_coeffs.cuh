@@ -2,7 +2,7 @@
 // k-omega SST model coefficients, shared by the device (device_komega_sst) and CPU paths. Defaults = OpenFOAM
 // v2412 kOmegaSST defaults (kOmegaSSTBase.C constructor, getOrAddToDict values). Read from turbulenceProperties
 // RAS.kOmegaSSTCoeffs (absent keys keep OF defaults). kappa/E are the wall-function coeffs (the omega/nut wall
-// functions; OF reads them from the BC dicts, default 0.41/9.8); the wall-function Cmu == betaStar. A
+// functions; OF reads them from the BC dicts, default 0.41/9.8); the wall functions' Cmu is CmuWall below. A
 // default-constructed struct reproduces the OF defaults exactly, so callers that don't read a dict stay faithful.
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
@@ -34,6 +34,16 @@ struct KOmegaSSTCoeffs
     // defaults and a different one the moment a case changes it: rhoSST with betaStar 0.1 parted from
     // OpenFOAM at iteration 1 by omega 2.5e-02, all of it in the wall rows.
     scalar CmuWall = 0.09;
+    // THE MIXING-LENGTH INLET's Cmu, which is a THIRD number. turbulentMixingLengthFrequencyInlet takes
+    // `turbModel.coeffDict().getOrDefault<scalar>("Cmu", 0.09)` (turbulentMixingLengthFrequencyInlet-
+    // FvPatchScalarField.C:137-138), and kOmegaSST's coeffDict carries a `Cmu` only when the case writes
+    // one into kOmegaSSTCoeffs -- kOmegaSSTBase.C adds none; betaStar is a different key that the inlet
+    // never reads. brae handed the inlet betaStar: equal at the defaults, and on rhoSST with
+    // kOmegaSSTCoeffs { Cmu 0.12; } the inlet omega read 399.30 where OpenFOAM writes 371.59 (the field
+    // 1.73e-03 at t=1), with { betaStar 0.11; } 379.76 against 399.30 (1.21e-03). CmuInDict records
+    // whether the dict named it, which is what :137-138's getOrDefault asks.
+    scalar Cmu = 0.09;
+    bool   CmuInDict = false;
     scalar CDES1 = 0.78, CDES2 = 0.61;                 // kOmegaSST-DES/DDES C_DES blend (OF kOmegaSSTDES defaults)
     // kOmegaSST-IDDES (Gritskevich/Garbaruk/Schuetze/Menter 2012) blending constants. Exponents fixed per the reference
     // (f_dt cube, f_l ^10, f_t cube); only the multipliers are carried here (shared values with SA-IDDES).
@@ -61,6 +71,8 @@ inline void readKOmegaSSTCoeffs(const FoamDict* ras, KOmegaSSTCoeffs& c)
     c.F3 = (f3 == "true" || f3 == "on" || f3 == "yes" || f3 == "1");
     c.kappa = kc->scalarOr("kappa", c.kappa);
     c.E = kc->scalarOr("E", c.E);
+    c.CmuInDict = kc->found("Cmu");
+    c.Cmu = kc->scalarOr("Cmu", c.Cmu);
 }
 
 } // namespace brae

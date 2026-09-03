@@ -109,11 +109,14 @@ public:
     //   turbulentIntensityKineticEnergyInlet:      refValue = 1.5*intensity^2*magSqr(Up)
     //   turbulentMixingLengthDissipationRateInlet: refValue = (Cmu^0.75/mixingLength)*kp^1.5
     //   turbulentMixingLengthFrequencyInlet:       refValue = sqrt(kp)/(Cmu^0.25*mixingLength)
-    // Any other patch does nothing here.
+    // Any other patch does nothing here. `coeffDictCmu` is the turbulence model's coeffDict `Cmu` and
+    // `coeffDictHasCmu` whether that dict carries one at all -- both inlets ask the MODEL first and fall
+    // back to their own default only when it has no entry (see TurbulentInletPatchField).
     virtual void updateTurbulentInlet(
         const std::vector<vector>& /*Up*/,
         const std::vector<scalar>& /*kp*/,
-        scalar                     /*Cmu*/) {}
+        scalar                     /*coeffDictCmu*/,
+        bool                       /*coeffDictHasCmu*/) {}
 
     // Laplacian/gradient matrix coupling: snGrad = gradientInternalCoeffs * phi_P
     // + gradientBoundaryCoeffs. Default (zeroGradient/empty/calculated) contributes nothing.
@@ -1222,6 +1225,20 @@ public:
 //   turbulentIntensityKineticEnergyInletFvPatchScalarField.C:      refValue = 1.5*sqr(intensity)*magSqr(Up)
 //   turbulentMixingLengthDissipationRateInletFvPatchScalarField.C: refValue = (Cmu^0.75/L)*pow(kp, 1.5)
 //   turbulentMixingLengthFrequencyInletFvPatchScalarField.C:       refValue = sqrt(kp)/(Cmu^0.25*L)
+//
+// WHOSE Cmu. Queue item 13d read these as taking their own patch `Cmu`; the source says the model's
+// comes first. The dissipation inlet reads a patch `Cmu` (default 0.09) at construction
+// (...DissipationRateInlet...C:91) and then, every updateCoeffs, replaces it with the turbulence
+// model's coeffDict entry when there is one (:149, `coeffDict().getOrDefault("Cmu", Cmu_)`; the header
+// spells the precedence out at .H:84-85). The frequency inlet never reads a patch entry:
+// `coeffDict().getOrDefault("Cmu", 0.09)` (...FrequencyInlet...C:137-138). Neither reads betaStar.
+// kEpsilon's constructor ADDS Cmu to its coeffDict (kEpsilon.C:102-108 getOrAddToDict, which writes the
+// default into the dict when absent, dimensionedType.C:389), so under kEpsilon the patch entry is dead
+// and the inlet's Cmu is the model's; kOmegaSST adds none, so the omega inlet takes kOmegaSSTCoeffs
+// { Cmu } or 0.09 -- brae handed it betaStar, which is 0.09 at the defaults and not otherwise. Measured
+// on rhoSST at t=1 with kOmegaSSTCoeffs { Cmu 0.12; }: the inlet omega 399.30 where OpenFOAM writes
+// 371.59 (7.5e-02), the field 1.73e-03; with { betaStar 0.11; }: 379.76 against 399.30 (4.9e-02), the
+// field 1.21e-03 (tests/rho_turbinlet_cmu_vs_openfoam.sh).
 template <typename T>
 class TurbulentInletPatchField : public InletOutletPatchField<T>
 {
@@ -1234,19 +1251,33 @@ public:
         T              uval,
         std::vector<T> vals,
         Kind           kind,
-        scalar         coefficient)
+        scalar         coefficient,
+        scalar         patchCmu)
         : InletOutletPatchField<T>(p, uniform, uval, std::move(vals)),
           kind_(kind),
-          coefficient_(coefficient)
+          coefficient_(coefficient),
+          patchCmu_(patchCmu)
     {}
+
+    // OpenFOAM's precedence, per inlet: the model's coeffDict entry when it has one, else the patch's
+    // own (dissipation, :91/:149) or the literal 0.09 (frequency, :137-138).
+    scalar effectiveCmu(
+        scalar coeffDictCmu,
+        bool   coeffDictHasCmu) const
+    {
+        if (coeffDictHasCmu) return coeffDictCmu;
+        return (kind_ == mixingLengthEpsilon) ? patchCmu_ : scalar(0.09);
+    }
 
     void updateTurbulentInlet(
         const std::vector<vector>& Up,
         const std::vector<scalar>& kp,
-        scalar                     Cmu) override
+        scalar                     coeffDictCmu,
+        bool                       coeffDictHasCmu) override
     {
         if constexpr (std::is_same<T, scalar>::value)
         {
+            const scalar Cmu = effectiveCmu(coeffDictCmu, coeffDictHasCmu);
             const bool fromU = (kind_ == intensityK);
             const std::size_t have = fromU ? Up.size() : kp.size();
             // REFUSE rather than fill what is missing with zeros. A short source array here would leave
@@ -1282,7 +1313,8 @@ public:
         {
             (void)Up;
             (void)kp;
-            (void)Cmu;
+            (void)coeffDictCmu;
+            (void)coeffDictHasCmu;
         }
     }
 
@@ -1292,6 +1324,7 @@ public:
 private:
     Kind   kind_;
     scalar coefficient_;      // intensity, or mixingLength
+    scalar patchCmu_;         // the dissipation inlet's own `Cmu` entry (default 0.09); see effectiveCmu
 };
 
 
@@ -1876,8 +1909,21 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
                              : (d.type == "turbulentMixingLengthDissipationRateInlet"
                                 ? TurbulentInletPatchField<T>::mixingLengthEpsilon
                                 : TurbulentInletPatchField<T>::mixingLengthOmega);
+        // OpenFOAM's own construction checks on the dissipation inlet: mixingLength >= SMALL (:89,
+        // getCheck ge(SMALL)) and Cmu >= SMALL (:91, getCheckOrDefault) are FatalIOErrors there.
+        if (kind == TurbulentInletPatchField<T>::mixingLengthEpsilon)
+        {
+            if (!(d.mixingLength >= 1e-15))
+                throw std::runtime_error(
+                    "brae: turbulentMixingLengthDissipationRateInlet on patch '" + d.name
+                    + "': mixingLength must be >= SMALL (OpenFOAM refuses it at construction).");
+            if (!(d.Cmu >= 1e-15))
+                throw std::runtime_error(
+                    "brae: turbulentMixingLengthDissipationRateInlet on patch '" + d.name
+                    + "': Cmu must be >= SMALL (OpenFOAM refuses it at construction).");
+        }
         return std::make_unique<TurbulentInletPatchField<T>>(
-            p, d.valueUniform, d.uniformValue, d.values, kind, ki ? d.intensity : d.mixingLength);
+            p, d.valueUniform, d.uniformValue, d.values, kind, ki ? d.intensity : d.mixingLength, d.Cmu);
     }
     // base `freestream` (e.g. k/omega) derives from inletOutlet in OF -> BINARY flux switch (kept).
     if (d.type == "freestream")

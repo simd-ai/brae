@@ -577,6 +577,11 @@ void assembleEpsEqn(
     // BEFORE the matrix is built, because fvMatrix's constructor is where OpenFOAM does it.
     // ORDER: the turbulent inlet recomputes refValue FIRST, then the flux switch resolves which faces
     // are fixedValue at all. Reversed, the switch would act on the previous iteration's refValue.
+    // The Cmu is the MODEL's, and that is OpenFOAM's: the inlet's :149 takes coeffDict().getOrDefault
+    // ("Cmu", <patch Cmu>) and kEpsilon's constructor has written Cmu into that dict whether or not the
+    // case named one (kEpsilon.C:102-108 getOrAddToDict; dimensionedType.C:389), so the patch's own
+    // entry never reaches the inlet under this model -- measured on rhoKE with a patch `Cmu 0.12;`:
+    // OpenFOAM's output is bit-identical to the run without it (rho_turbinlet_cmu_vs_openfoam).
     if (in.turbInletEpsMask && in.turbInletEpsLen)
     {
         deviceUpdateTurbulentInletSecond(dbK, *in.turbInletEpsMask, *in.turbInletEpsLen,

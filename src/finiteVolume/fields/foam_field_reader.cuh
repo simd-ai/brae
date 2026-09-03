@@ -136,6 +136,13 @@ struct PatchFieldData
     scalar         rhoInlet     = -1.0;   // OF default -VGREAT ("not given")
     bool           extrapolateProfile = false;
     scalar         mixingLength = 0;
+    // turbulentMixingLengthDissipationRateInlet's OWN `Cmu` (turbulentMixingLengthDissipationRateInlet-
+    // FvPatchScalarField.C:91, getCheckOrDefault 0.09). It is the inlet's Cmu only when the turbulence
+    // model's coeffDict carries none (:149 takes the model's first), which kEpsilon's constructor rules
+    // out by adding one (kEpsilon.C:102-108, dimensionedType.C:389). turbulentMixingLengthFrequencyInlet
+    // reads no such entry at all (...FrequencyInlet...C:137-138). Parsed so the precedence lives in the
+    // patch class rather than in an unhandled-key skip.
+    scalar         Cmu          = 0.09;
     // surfaceNormalFixedValue / uniformNormalFixedValue: SCALAR refValue; the BC builds U_b = refValue * face_normal.
     bool                hasNormalRef     = false;
     bool                normalRefUniform = false;
@@ -828,6 +835,13 @@ inline FieldData<T> readField(const std::string& path)
                     else if (key == "mixingLength")   // turbulentMixingLength*Inlet
                     {
                         p.mixingLength = ts.nextScalar();
+                        ts.expect(";");
+                    }
+                    // The non-ABL `Cmu`: the ABL branch above is gated on hasABL, so this is the
+                    // turbulent inlet's own entry (dead under kEpsilon, see PatchFieldData::Cmu).
+                    else if (key == "Cmu")
+                    {
+                        p.Cmu = ts.nextScalar();
                         ts.expect(";");
                     }
                     else if (key == "freestreamValue")   // freestream/freestreamPressure farfield value (may be $internalField)

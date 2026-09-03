@@ -490,8 +490,13 @@ void correct(
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
             // turbulentMixingLengthFrequencyInlet: refValue = sqrt(kp)/(Cmu^0.25*L), from k's CURRENT
-            // patch values. kOmegaSST's Cmu IS betaStar.
-            omega.boundary[pi]->updateTurbulentInlet({}, k.boundary[pi]->value(), co.betaStar);
+            // patch values. Its Cmu is `coeffDict().getOrDefault("Cmu", 0.09)`
+            // (turbulentMixingLengthFrequencyInletFvPatchScalarField.C:137-138) -- kOmegaSSTCoeffs
+            // { Cmu } when the case names one, else 0.09, and NOT betaStar, which this passed: with
+            // kOmegaSSTCoeffs { betaStar 0.11; } the inlet omega read 379.76 where OpenFOAM writes
+            // 399.30 (the field 1.21e-03 at t=1), with { Cmu 0.12; } 399.30 against 371.59 (1.73e-03)
+            // (rho_turbinlet_cmu_vs_openfoam).
+            omega.boundary[pi]->updateTurbulentInlet({}, k.boundary[pi]->value(), co.Cmu, co.CmuInDict);
             omega.boundary[pi]->updateFromFlux(phi.boundary[pi]);
         }
 
@@ -619,8 +624,8 @@ void correct(
         // carries -- which is two of the four defects the kEpsilon port turned up, found the same way.
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
-            // turbulentIntensityKineticEnergyInlet reads U's patch values.
-            k.boundary[pi]->updateTurbulentInlet(U.boundary[pi]->value(), {}, co.betaStar);
+            // turbulentIntensityKineticEnergyInlet reads U's patch values (and no Cmu at all).
+            k.boundary[pi]->updateTurbulentInlet(U.boundary[pi]->value(), {}, co.Cmu, co.CmuInDict);
             k.boundary[pi]->updateFromFlux(phi.boundary[pi]);
         }
 

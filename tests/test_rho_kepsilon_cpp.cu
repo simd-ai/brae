@@ -647,13 +647,13 @@ int main(int argc, char** argv)
     {
         const FvPatch& fp = patches[0];
         TurbulentInletPatchField<scalar> t(
-            fp, true, scalar{1}, {}, TurbulentInletPatchField<scalar>::mixingLengthEpsilon, 0.005);
+            fp, true, scalar{1}, {}, TurbulentInletPatchField<scalar>::mixingLengthEpsilon, 0.005, 0.09);
 
         bool threw = false;
         bool named = false;
         try
         {
-            t.updateTurbulentInlet({}, std::vector<scalar>(fp.size > 0 ? fp.size - 1 : 0, 1.0), 0.09);
+            t.updateTurbulentInlet({}, std::vector<scalar>(fp.size > 0 ? fp.size - 1 : 0, 1.0), 0.09, true);
         }
         catch (const std::exception& e)
         {
@@ -666,7 +666,7 @@ int main(int argc, char** argv)
         bool controlThrew = false;
         try
         {
-            t.updateTurbulentInlet({}, std::vector<scalar>(fp.size, 1.0), 0.09);
+            t.updateTurbulentInlet({}, std::vector<scalar>(fp.size, 1.0), 0.09, true);
         }
         catch (const std::exception&)
         {

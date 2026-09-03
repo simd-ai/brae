@@ -2182,6 +2182,30 @@ set_tests_properties(rho_uresidual_vs_openfoam PROPERTIES
                      DEPENDS brae_rhoSimpleFoam
                      TIMEOUT 1800)
 
+add_test(NAME rho_tp_transient_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_tp_transient_vs_openfoam.sh)
+set_tests_properties(rho_tp_transient_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 1800)
+
+add_test(NAME rho_turbinlet_cmu_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_turbinlet_cmu_vs_openfoam.sh)
+set_tests_properties(rho_turbinlet_cmu_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 1800)
+
+add_test(NAME simple_piov_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_piov_vs_openfoam.sh)
+set_tests_properties(simple_piov_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae
+                     TIMEOUT 1800)
+
 add_test(NAME rho_step_cuda_schemes
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_step_cuda_schemes.sh)
 set_tests_properties(rho_step_cuda_schemes PROPERTIES
