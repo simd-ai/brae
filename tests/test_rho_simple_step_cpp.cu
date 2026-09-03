@@ -827,13 +827,23 @@ int main(int argc, char** argv)
         cpu::rhoSimple::RhoSimpleFields b =
             cpu::rhoSimple::createFields(caseDir + "/" + startT, caseDir, simpleDict, &fvSolution,
                                          m, g, patches);
-        check("the fixture declares NO kEpsilonCoeffs (else this control is not the one described)",
-              std::fabs((double)a.keCoeffs.Cmu - 0.09) < 1e-12);
+        // MODEL-AWARE (queue 13e): this control mutated keCoeffs.Cmu whatever the fixture's model, so on
+        // an SST fixture it read nut 0.0000e+00 and FAILED (measured on rhoSST, 2026-09-03) -- and no
+        // registered gate had ever pointed this harness at one, which is why it never showed. kOmegaSST
+        // never reads Cmu; its coefficient of the same rank is betaStar, which drives k's destruction
+        // (betaStar*rho*omega*k, kOmegaSSTBase.C) and through k the nut this control watches.
+        const bool sst = (f.rasModel == "kOmegaSST");
+        check(sst ? "the fixture declares NO kOmegaSSTCoeffs (else this control is not the one described)"
+                  : "the fixture declares NO kEpsilonCoeffs (else this control is not the one described)",
+              sst ? std::fabs((double)a.sstCoeffs.betaStar - 0.09) < 1e-12
+                  : std::fabs((double)a.keCoeffs.Cmu - 0.09) < 1e-12);
 
-        // Cmu drives nut = Cmu*k^2/eps directly, and Prt drives alphat = rho*nut/Prt, so each moves a
-        // DIFFERENT field: perturbing them separately says which one was plumbed.
-        b.keCoeffs.Cmu = a.keCoeffs.Cmu * 2.0;
-        b.Prt          = a.Prt * 2.0;
+        // Cmu drives nut = Cmu*k^2/eps directly (betaStar drives k, and nut = a1*k/... follows), and
+        // Prt drives alphat = rho*nut/Prt, so each moves a DIFFERENT field: perturbing them separately
+        // says which one was plumbed.
+        if (sst) b.sstCoeffs.betaStar = a.sstCoeffs.betaStar * 2.0;
+        else     b.keCoeffs.Cmu       = a.keCoeffs.Cmu * 2.0;
+        b.Prt = a.Prt * 2.0;
 
         cpu::rhoSimple::StepInput sin2 = in;
         (void)cpu::rhoSimple::rhoSimpleStep(a, sin2, m, g, patches);
@@ -843,7 +853,8 @@ int main(int argc, char** argv)
         const double dAlphat = relL2(b.alphat.internal, a.alphat.internal);
         std::printf("     %-34s nut %.4e   alphat %.4e\n",
                     "control: case coeffs reach the solve", dNut, dAlphat);
-        check("Cmu from the CASE reaches the closure (control)", dNut > 1e-6);
+        check(sst ? "betaStar from the CASE reaches the closure (control)"
+                  : "Cmu from the CASE reaches the closure (control)", dNut > 1e-6);
         check("Prt from the CASE reaches alphat (control)", dAlphat > 1e-6);
     }
 
