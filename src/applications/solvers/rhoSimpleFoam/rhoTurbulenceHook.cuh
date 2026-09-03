@@ -76,6 +76,10 @@ struct TurbulenceHookOptions
     const DeviceBuffer<scalar>* fvoKVal    = nullptr;
     const DeviceBuffer<label>*  fvoEpsMask = nullptr;
     const DeviceBuffer<scalar>* fvoEpsVal  = nullptr;
+    // fvSolution's preconditioner for the k/epsilon solves; null keeps Jacobi. Owned by the caller (the
+    // driver holds one in RhoSolverWorkspace: the level schedule depends only on the mesh, so one
+    // instance serves every field and diluUpdate refreshes it from whichever matrix is being solved).
+    const DeviceDilu*           precon     = nullptr;
 };
 
 // One turbulence correction, inputs and all, without leaving the device.

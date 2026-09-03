@@ -49,7 +49,13 @@ inline void readLinearSolverControls(
     DeviceSimpleControls& ctl,
     const std::string& algorithmDict = "SIMPLE",
     // The energy field's name (h or e), for the compressible callers. Empty = no energy equation.
-    const std::string& heName = "")
+    const std::string& heName = "",
+    // Does the CALLER precondition its energy solve with DILU when the case asks? The notice below has
+    // to describe the driver that is running, not a capability of the tree: a notice claiming brae
+    // approximates something it actually runs hides the next real substitution just as well as silence
+    // does. Every driver wires U and the turbulence pair; only the OF-mirror driver wires the energy
+    // solve, so it passes true and the legacy drivers keep the default.
+    bool diluOnEnergy = false)
 {
     const FoamDict* solvers = fvSolution.subDict("solvers");
 
@@ -131,7 +137,9 @@ inline void readLinearSolverControls(
         // than 10x -- while Jacobi stops at 0.0726. That gap left k and epsilon mutually inconsistent
         // every outer iteration and the case DIVERGED at iteration 171. A preconditioner substitution
         // can change whether a case runs at all.
-        const bool diluWired = (prec == "DILU") && (f == "U" || f == "k" || f == secondName || f == "nuTilda");
+        const bool diluWired = (prec == "DILU")
+                            && (f == "U" || f == "k" || f == secondName || f == "nuTilda"
+                                || (diluOnEnergy && !heName.empty() && f == heName));
         if (!prec.empty() && !gs && prec != "diagonal" && prec != "none" && !diluWired)
             noticeApproximated("solvers/" + f + " preconditioner",
                                "case asks '" + prec + "', brae preconditions with Jacobi (diagonal). Both reach the"
@@ -191,6 +199,13 @@ inline void readLinearSolverControls(
         ctl.diluU = !ctl.gsU && su && su->wordOr("preconditioner", "") == "DILU";
         if (const char* e = std::getenv("BRAE_DILU"))   // attribution escape hatch, both directions
             ctl.diluU = (std::atoi(e) != 0) && !ctl.gsU;
+    }
+    // DILU on the energy solve, read from the energy field's own block. Same shape as diluU above, and
+    // like it, only meaningful on the BiCGStab path.
+    if (!heName.empty())
+    {
+        const FoamDict* sh = solvers ? solvers->subDict(heName) : nullptr;
+        ctl.diluHe = sh && sh->wordOr("preconditioner", "") == "DILU";
     }
     // p is never the case's choice: brae runs AMG-PCG (Jacobi-PCG on an interface-coupled mesh, where the
     // Galerkin coarse operator cannot represent the interface edges) whatever the dict says.

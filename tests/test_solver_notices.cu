@@ -216,6 +216,55 @@ int main()
               has(out, "iteration count and cost differ") && !has(out, "DIFFERENT residuals"), out);
     }
 
+    // ---- WHICH DRIVER IS RUNNING decides whether a preconditioner notice is true ----
+    //
+    // The energy solve is preconditioned with DILU by the OF-mirror driver and with Jacobi by the legacy
+    // ones, off the SAME fvSolution entry, so the notice cannot be a property of the dict alone. Before
+    // the diluOnEnergy argument the reader reported a substitution the mirror was not making, which is
+    // the same defect as a silent substitution pointing the other way: it teaches the reader to discount
+    // the notices. Both directions are asserted here, because a parameter that is never false in a test
+    // and a parameter that is never true are equally untested.
+    {
+        const std::string dir = writeFvSolution(tmp + "/heprec",
+            "    \"(U|e|k|epsilon)\" { solver PBiCGStab; preconditioner DILU; tolerance 1e-12; relTol 0; }\n");
+        const FoamDict fv = readDict(dir + "/system/fvSolution");
+        const std::string legacy = captureStderr(tmp + "/heprec_legacy.err", [&]
+        {
+            DeviceSimpleControls ctl;
+            ctl.turbulent = false;
+            readLinearSolverControls(fv, "epsilon", ctl, "SIMPLE", "e");
+        });
+        check("a driver that does NOT precondition the energy solve says so",
+              has(legacy, "solvers/e preconditioner") && has(legacy, "DILU"), legacy);
+        const std::string mirror = captureStderr(tmp + "/heprec_mirror.err", [&]
+        {
+            DeviceSimpleControls ctl;
+            ctl.turbulent = false;
+            readLinearSolverControls(fv, "epsilon", ctl, "SIMPLE", "e", /*diluOnEnergy=*/true);
+        });
+        check("a driver that DOES precondition the energy solve is silent about it",
+              !has(mirror, "solvers/e preconditioner"), mirror);
+        // ...and the flag must not silence the OTHER fields' notices, which is what a blanket exemption
+        // would have done -- p asks DILU here too and nothing preconditions it.
+        DeviceSimpleControls ctl;
+        ctl.turbulent = false;
+        readLinearSolverControls(fv, "epsilon", ctl, "SIMPLE", "e", /*diluOnEnergy=*/true);
+        check("the energy preconditioner is read off the case's own entry",
+              ctl.diluHe, std::string("diluHe=") + (ctl.diluHe ? "1" : "0"));
+    }
+    {
+        // Negative control on the read: an energy entry naming a preconditioner brae does not run must
+        // leave diluHe false, or the driver would build a DILU the case never asked for.
+        const std::string dir = writeFvSolution(tmp + "/heprec_none",
+            "    \"(U|e|k|epsilon)\" { solver PBiCGStab; preconditioner diagonal; tolerance 1e-12; relTol 0; }\n");
+        const FoamDict fv = readDict(dir + "/system/fvSolution");
+        DeviceSimpleControls ctl;
+        ctl.turbulent = false;
+        readLinearSolverControls(fv, "epsilon", ctl, "SIMPLE", "e", /*diluOnEnergy=*/true);
+        check("a non-DILU energy preconditioner leaves diluHe false",
+              !ctl.diluHe, std::string("diluHe=") + (ctl.diluHe ? "1" : "0"));
+    }
+
     std::printf("solver_notices: %d failures\n", failures);
     return failures ? 1 : 0;
 }

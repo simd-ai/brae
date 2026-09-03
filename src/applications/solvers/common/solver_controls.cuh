@@ -203,6 +203,11 @@ struct DeviceSimpleControls
     // two fields mutually inconsistent every outer iteration and the case DIVERGES; solving them to
     // 1e-3 instead makes the same code converge to U 1.04e-05 of OpenFOAM.
     bool   diluKE = false;
+    // DILU on the ENERGY solve (h or e), when the case asks for it. A third entry because it is a third
+    // fvSolution block: every compressible tutorial writes `"(U|e|k|epsilon)" { preconditioner DILU; }`,
+    // so a driver honouring two of the three still substitutes Jacobi on the energy equation. Only the
+    // OF-mirror driver consumes this; the legacy compressible drivers keep Jacobi there and say so.
+    bool   diluHe = false;
     scalar twoBykK = 2.0, twoBykEps = 2.0;         // 2/max(k_,SMALL) from the limitedLinear coefficient (k_=1 -> 2).
     // div(phi,h|e) and div(phi,K|Ekp) -- the ENERGY equation's convection scheme (rhoSimpleFoam). Read from
     // fvSchemes like every other div scheme; brae used to hardcode upwind here and silently ignore what the

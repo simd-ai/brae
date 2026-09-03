@@ -454,7 +454,8 @@ Residuals rhoSimpleStep(
             if (in.uSymGaussSeidel)
                 deviceSymGaussSeidel(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIterU, &perf, in.minIterU);
             else
-                perf = deviceJacobiBiCGStab(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIterU, /*checkEvery=*/1, in.minIterU);
+                perf = deviceJacobiBiCGStab(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIterU, /*checkEvery=*/1, in.minIterU,
+                                            in.preconU);
             uInitialResidual = std::max(uInitialResidual, perf.initialResidual);
         }
         res["U"] = uInitialResidual;
@@ -532,7 +533,8 @@ Residuals rhoSimpleStep(
         const DeviceLduView A = foldedView(dm, E, diagC);
         const scalar nf = deviceNormFactor(A, f.he, b, w.ones);
         const DeviceSolverPerf perf =
-            deviceJacobiBiCGStab(A, b, f.he, nf, in.tolHe, in.relTolHe, in.maxIterHe, /*checkEvery=*/1, in.minIterHe);
+            deviceJacobiBiCGStab(A, b, f.he, nf, in.tolHe, in.relTolHe, in.maxIterHe, /*checkEvery=*/1, in.minIterHe,
+                                 in.preconHe);
         res[in.isE ? "e" : "h"] = perf.initialResidual;
 
         // fvOptions.correct(he), EEqn.H:27 -- AFTER the solve and BEFORE thermo.correct(), which is what

@@ -34,6 +34,8 @@
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
 #include "device_kepsilon.cuh"
+#include "device_dilu.cuh"      // the host reference solves with DILU; so must the device, or this
+                                // instrument measures the preconditioner instead of the closure
 #include "kEpsilon_cpp.cuh"
 #include "kEpsilon.cuh"
 
@@ -318,6 +320,25 @@ int main(int argc, char** argv)
     gin.relaxEquationEps = true;     gin.relaxEps = relaxEps;
     gin.relaxEquationK = true;       gin.relaxK = relaxK;
     gin.tol = tol; gin.relTol = relTol; gin.maxIter = maxIter;
+    // THE SAME PRECONDITIONER AS THE REFERENCE. kEpsilonRef::correct solves through pbicgstab.cuh, which
+    // is DILU-preconditioned. Leaving the device on Jacobi made this file compare two SOLVERS as well as
+    // two closures, and the solved rows measured that difference rather than the closure: on this fixture
+    // the k row read 2.06e-12 with Jacobi and reads 1.01e-15 with DILU, nut 1.33e-12 against 2.48e-15,
+    // while every production and wall stage was already exact to 1e-15 either way. Three orders of the
+    // headroom the solved rows appeared to need was the preconditioner, and it was hiding whatever else
+    // might drift into that band (queue item 27). Level-scheduled, so it is OF's DILU exactly, not a
+    // parallel approximation of it (device_dilu.cuh).
+    DeviceDilu dilu = buildDeviceDilu(m.owner(), m.neighbour(), m.nCells());
+    gin.precon = dilu.valid ? &dilu : nullptr;
+    // The same escape hatch linear_solver_setup.cuh carries, so the control measurement above can be
+    // reproduced from a shipped binary rather than a hand-edited one.
+    if (const char* e = std::getenv("BRAE_DILU_KE"))
+    {
+        if (std::atoi(e) == 0) gin.precon = nullptr;
+    }
+    std::printf("  preconditioner: %s (%d levels)\n",
+                gin.precon ? "DILU, as the _cpp reference solves" : "Jacobi",
+                gin.precon ? dilu.levels() : 0);
     gin.co = co;
     gin.Prt = 0.85;
 
@@ -361,16 +382,43 @@ int main(int argc, char** argv)
         cmp(gm, rm, "the constrained cell set", 0.0);
     }
 
+    // BOUND 1e-13, tightened from 1e-9 when the device took the reference's DILU (queue item 27).
+    // Measured on this fixture, bit-reproducible over three runs: epsilon 4.74e-16, k 1.01e-15,
+    // nut 2.48e-15, alphat 2.49e-15 -- 40x to 210x of headroom, and the two arms now differ only in the
+    // order their reductions sum. THE BOUND IS ITS OWN CONTROL: BRAE_DILU_KE=0 puts the device back on
+    // Jacobi and k (2.06e-12) and nut (1.33e-12) MISS it by 21x and 13x, so a build that stopped
+    // honouring the case's preconditioner could not pass this file.
     std::printf("  3. the solved fields\n");
-    cmp(gE.host(), he.internal, "epsilon", 1e-9);
-    cmp(gK.host(), hk.internal, "k",       1e-9);
-    // nut = Cmu*k^2/epsilon, so its relative error is 2*relerr(k) + relerr(epsilon) -- measured here as
-    // 2*2.46e-11 + 8.99e-11 = 1.39e-10 against an observed 1.36e-10, which is the propagation and
-    // nothing else. Bounding nut BELOW the fields it is computed from would assert an accuracy the
-    // inputs cannot supply; it carries k and epsilon's own bound. What pins the ARITHMETIC is the stage
-    // block above, at 1e-12 to 1e-17, where no Krylov solver sits between the two paths.
-    cmp(gN.host(), hn.internal, "nut = Cmu k^2/eps", 1e-9);
-    cmp(gAlphat.host(), hAlphat, "alphat = rho*nut/Prt", 1e-9);
+    cmp(gE.host(), he.internal, "epsilon", 1e-13);
+    cmp(gK.host(), hk.internal, "k",       1e-13);
+    // nut = Cmu*k^2/epsilon, so its relative error is 2*relerr(k) + relerr(epsilon): 2*1.01e-15 +
+    // 4.74e-16 = 2.49e-15 against an observed 2.48e-15, which is the propagation and nothing else.
+    // Bounding nut BELOW the fields it is computed from would assert an accuracy the inputs cannot
+    // supply; it carries k and epsilon's own bound. What pins the ARITHMETIC is the stage block above,
+    // at 1e-12 to 1e-17, where no Krylov solver sits between the two paths.
+    cmp(gN.host(), hn.internal, "nut = Cmu k^2/eps", 1e-13);
+    cmp(gAlphat.host(), hAlphat, "alphat = rho*nut/Prt", 1e-13);
+
+    // ---- CONTROL: the solved rows must NEED the reference's preconditioner --------------------
+    // The bound above is 1e-13 because both arms now run OpenFOAM's DILU. If the device fell back to
+    // Jacobi the two would still solve the SAME system to the same tolerance and disagree only in where
+    // they stopped -- which is exactly the error that hid for as long as this file bounded the solved
+    // rows at 1e-9. So the fallback is run here and must MISS the bound, or 1e-13 would be an accuracy
+    // nothing is enforcing. (BRAE_DILU_KE=0 reproduces it from a shipped binary; the driver's own arm of
+    // this control is rho_sbmatched_transient_vs_openfoam.)
+    {
+        gpu::kEpsilonRAS::KEpsilonInput cin = gin;
+        cin.precon = nullptr;
+        DeviceBuffer<scalar> cK(dk.internal), cE(de.internal), cN(dn.internal), cA;
+        DeviceBuffer<scalar> cNutBnd(nutBndH);
+        DeviceBoundary dbcK   = buildDeviceBoundary(dk, fvp, g);
+        DeviceBoundary dbcEps = buildDeviceBoundary(de, fvp, g);
+        gpu::kEpsilonRAS::KEpsilonStages stc;
+        gpu::kEpsilonRAS::correct(cK, cE, cN, cNutBnd, &cA, nullptr, stc, dm, dbU, dbcK, dbcEps, wall, cin);
+        const scalar r = relDiff(hk.internal, cK.host());
+        std::printf("     %-58s rel=%.3e\n", "control: Jacobi misses the k bound", (double)r);
+        check(r > 1e-13, "the solved rows need the case's DILU (control)");
+    }
 
     // ---- CONTROL: the mass flux must NOT serve as divU ----------------------------------------
     // divU is a dilatation and takes the volumetric flux; the div operator takes the mass flux. They
@@ -461,8 +509,8 @@ int main(int argc, char** argv)
         gpu::kEpsilonRAS::KEpsilonStages st2;
         gpu::kEpsilonRAS::correct(g2K, g2E, g2N, g2NutBnd, &g2A, nullptr, st2, dm, dbU, db2K, db2Eps, wall, gin);
 
-        cmp(g2E.host(), h2e.internal, "epsilon, SECOND correct() in-process", 1e-9);
-        cmp(g2K.host(), h2k.internal, "k, SECOND correct() in-process",       1e-9);
+        cmp(g2E.host(), h2e.internal, "epsilon, SECOND correct() in-process", 1e-13);
+        cmp(g2K.host(), h2k.internal, "k, SECOND correct() in-process",       1e-13);
         cmp(g2E.host(), gE.host(),    "epsilon, run 2 against run 1",         1e-14);
         cmp(g2K.host(), gK.host(),    "k, run 2 against run 1",               1e-14);
     }

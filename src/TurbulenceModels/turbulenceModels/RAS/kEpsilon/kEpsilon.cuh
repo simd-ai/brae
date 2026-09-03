@@ -59,6 +59,7 @@
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
 #include "device_kepsilon.cuh"    // DeviceWallData, deviceGradU, deviceGByNuFromGradU, deviceWallEpsG0
+#include "device_dilu.cuh"        // the case's DILU preconditioner for the k and epsilon solves
 #include "kepsilon_coeffs.cuh"
 #include "pEqn.cuh"               // PressureMatrix -- the assembled scalar object, shared not redefined
 #include <string>
@@ -128,6 +129,17 @@ struct KEpsilonInput
     scalar relTol  = 0.0;
     int    maxIter = 2000;
     int    minIter = 0;      // fvSolution solvers/<field>/minIter, OF's floor on the iteration count
+    // fvSolution's `preconditioner DILU` on k and epsilon, which is what every compressible fixture in
+    // the tree names and what the host reference has always run (pbicgstab.cuh is DILU-preconditioned).
+    // Null keeps Jacobi.
+    //
+    // NOT A COST KNOB, and the k equation is where it shows. On sbMatched at iteration 2 the two arms'
+    // assembled k systems agree to 1e-11 and both solutions satisfy their own system to
+    // sum|Ax-b|/sum|b| ~ 1e-12, yet the solved k differed by 3.6e-06 per entry in the wall cells: the
+    // device's Jacobi BiCGStab stalls about ten times short of the host's DILU on that ill-conditioned
+    // system, and neither tolerance 1e-15 nor maxIter 40000 moves it. OpenFOAM converges along the DILU
+    // path, so the arm that substitutes Jacobi lands somewhere else -- queue item 27.
+    const DeviceDilu* precon = nullptr;
 
     KEpsilonCoeffs co{};
     scalar         Prt = 1.0;            // EddyDiffusivity: alphat = rho*nut/Prt

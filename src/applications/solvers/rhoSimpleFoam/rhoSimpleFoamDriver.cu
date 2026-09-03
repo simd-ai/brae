@@ -346,17 +346,27 @@ int runMirrorCuda(const std::string& caseDir)
     cpu::rhoSimple::StepInput hin =
         cpu::rhoSimple::buildStepInput(caseDir, hf, fvSolution, m, refusals);
 
+    // fvSolution's `preconditioner` on the three fields this driver solves with BiCGStab. Hoisted out of
+    // the block below because the preconditioner they select is built once, from the mesh, and lives as
+    // long as the run.
+    bool diluU = false, diluHe = false, diluKE = false;
+
     // The case's own linear-solver tolerances, for the same reason the host driver reads them: a gate
     // pins them so the linear solve is out of the comparison, a SOLVER runs what the case asks for.
     {
         DeviceSimpleControls lctl;
         lctl.turbulent = hf.turbulent;   // gates the reader's k/epsilon block -- see the host driver
         const std::string secondName = (hf.rasModel == "kOmegaSST") ? "omega" : "epsilon";
-        readLinearSolverControls(fvSolution, secondName, lctl, "SIMPLE", hf.heName);
+        // ...and this driver DOES precondition its energy solve with DILU, unlike the legacy ones, so the
+        // reader must not report a substitution that is not happening.
+        readLinearSolverControls(fvSolution, secondName, lctl, "SIMPLE", hf.heName, /*diluOnEnergy=*/true);
         hin.tolU    = lctl.tolU;    hin.relTolU    = lctl.relTolU;    hin.maxIterU    = lctl.maxIterU;    hin.minIterU    = lctl.minIterU;
         hin.tolP    = lctl.tolP;    hin.relTolP    = lctl.relTolP;    hin.maxIterP    = lctl.maxIterP;    hin.minIterP    = lctl.minIterP;
         hin.tolHe   = lctl.tolHe;   hin.relTolHe   = lctl.relTolHe;   hin.maxIterHe   = lctl.maxIterHe;   hin.minIterHe   = lctl.minIterHe;
         hin.tolTurb = lctl.tolKE;   hin.relTolTurb = lctl.relTolKE;   hin.maxIterTurb = lctl.maxIterKE;   hin.minIterTurb = lctl.minIterKE;
+        diluU  = lctl.diluU;
+        diluHe = lctl.diluHe;
+        diluKE = lctl.diluKE;
         cpu::rhoSimple::printLinearSolverControls(hin, hf.heName, secondName, hf.turbulent);
     }
 
@@ -376,6 +386,17 @@ int runMirrorCuda(const std::string& caseDir)
     gin.amgCacheDir = caseDir + "/constant/polyMesh";
 
     RhoSolverWorkspace w;
+    // OpenFOAM preconditions k and epsilon with DILU wherever the case says so, and the host reference
+    // always has (pbicgstab.cuh). The device closure ran Jacobi: on sbMatched that left k 5.4e-09 from
+    // OpenFOAM where the host arm sat at 8.4e-12, with both arms' assembled systems agreeing to 1e-11 --
+    // the gap was the solver's stopping point, not the discretisation (queue item 27). buildDeviceDilu is
+    // a level schedule over the mesh, so it is built once here and refreshed per solve inside the solver.
+    if (diluU || diluHe || diluKE)
+    {
+        w.dilu = buildDeviceDilu(m.owner(), m.neighbour(), nC);
+    }
+    gin.preconU  = (diluU  && w.dilu.valid) ? &w.dilu : nullptr;
+    gin.preconHe = (diluHe && w.dilu.valid) ? &w.dilu : nullptr;
 
     // THE THERMO HOOKS, device-resident. The step takes them as hooks because EEqn.H ends in
     // thermo.correct() -- which moves T and therefore psi, and every consumer below that point reads
@@ -391,6 +412,7 @@ int runMirrorCuda(const std::string& caseDir)
     {
         // The SAME options the CUDA harness's turbulent arm drives (buildTurbulenceHookOptions above).
         turbOpt = buildTurbulenceHookOptions(hin, hf, constraints);
+        turbOpt.precon = (diluKE && w.dilu.valid) ? &w.dilu : nullptr;
 
         gin.correct = [&]()
         {

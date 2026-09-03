@@ -56,6 +56,7 @@
 // agglomeration it never uses.
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
+#include "device_dilu.cuh"   // RhoSolverWorkspace::dilu -- the case's preconditioner, built once
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
 #include "device_amg.cuh"
@@ -156,6 +157,12 @@ struct RhoStepInput
     int    solutionD[3] = {1, 1, 1};
     // Per equation, as OF reads them (lduMatrixSolver.C:204-205) -- see StepInput in the host twin.
     int    maxIterU = 2000, maxIterP = 2000, maxIterHe = 2000, maxIterTurb = 2000;
+    // fvSolution's `preconditioner DILU` on the momentum and energy solves; null keeps Jacobi. The host
+    // reference has always preconditioned both with DILU (pbicgstab.cuh is DILU throughout), so an arm
+    // running Jacobi here is not only substituting for the case, it disagrees with the reference it is
+    // gated against. Both point at the ONE DeviceDilu the driver builds -- see RhoSolverWorkspace::dilu.
+    const DeviceDilu* preconU  = nullptr;
+    const DeviceDilu* preconHe = nullptr;
     int    minIterU = 0,    minIterP = 0,    minIterHe = 0,    minIterTurb = 0;
     bool   uSymGaussSeidel = false;
     bool   captureVcycle = true;
@@ -256,6 +263,10 @@ struct RhoSolverWorkspace
 {
     AMGData amg;
     bool    amgBuilt = false;
+    // The case's DILU preconditioner. Built ONCE (the level schedule is a property of the mesh alone) and
+    // shared by every field: diluUpdate recomputes rD from whichever matrix is being solved. Left invalid
+    // when the case names no DILU, in which case every solve keeps Jacobi. See device_dilu.cuh.
+    DeviceDilu dilu;
     DeviceBuffer<scalar> ones;
     PressureMatrix       P;
     DeviceBuffer<scalar> diagC, b;
