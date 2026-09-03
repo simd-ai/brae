@@ -192,6 +192,10 @@ public:
     // seed, at a measured 24% of the case's prescribed mass flow. Use this whenever the new value has to
     // survive an evaluateBoundary().
     virtual void setStoredValues(std::vector<T> v) { value_ = std::move(v); }
+    // fvPatchField::operator== -- the VALUE assigned on any class, bypassing whatever setStoredValues means
+    // for it (the reference on the mixed and extrapolated families). GeometricField::relax reaches every
+    // patch this way (GeometricField.C:1420); the next evaluate() recomputes the value as OpenFOAM's does.
+    virtual void assignValue(std::vector<T> v) { value_ = std::move(v); }
     // Coupled-patch neighbour (halo) values for the matrix; non-coupled patches return value().
     virtual const std::vector<T>& patchNeighbourField() const { return value_; }
     const FvPatch&        patch() const { return patch_; }

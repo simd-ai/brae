@@ -169,13 +169,8 @@ void relaxField(
 // The boundary half of GeometricField::relax. operator== assigns both halves (GeometricField.C:1094 and
 // :1420, GeometricBoundaryField.C operator== -> fvPatchField::operator== -> Field::operator=), so the
 // patch VALUE OpenFOAM carries out of p.relax() is prevIter_b + alpha*(p_b - prevIter_b) on every patch.
-// It is stored on every class whose value persists between evaluations -- the fixedValue family
-// (totalPressure is the one whose value moves), fixedGradient, zeroGradient, empty and symmetry, where
-// setStoredValues writes value_ -- and re-derived from the relaxed internal field on the
-// ExtrapolatedValue family (calculated, mixed, the flux switches, piov), whose setStoredValues writes
-// the REFERENCE value and would overwrite a freestream value with the blend. On a zeroGradient face the
-// two are the same arithmetic on the same operands; on the totalPressure inlet they are not, and that
-// is the face this exists for.
+// Stored on EVERY class through assignValue (OpenFOAM's operator==), and read as it stands by the
+// velocity corrector's grad(p) and, without a pressure limiter, by the next momentum assembly.
 void relaxBoundary(
     GeometricField<scalar>&                 p,
     const std::vector<std::vector<scalar>>& prevIter,
@@ -184,19 +179,17 @@ void relaxBoundary(
     if (alpha <= 0.0 || alpha >= 1.0) return;
     for (std::size_t pi = 0; pi < p.boundary.size(); ++pi)
     {
-        const int cat = p.boundary[pi]->bcCategory();
-        if (cat == 2 || cat == 3 || cat == 4 || cat == 5 || cat == 6)
-        {
-            p.boundary[pi]->evaluate(p.internal);
-            continue;
-        }
         std::vector<scalar> v = p.boundary[pi]->value();
         const std::vector<scalar>& prev = prevIter[pi];
         for (std::size_t i = 0; i < v.size() && i < prev.size(); ++i)
         {
             v[i] = prev[i] + alpha * (v[i] - prev[i]);
         }
-        p.boundary[pi]->setStoredValues(std::move(v));
+        // assignValue is fvPatchField::operator==: the VALUE, on every class, whatever setStoredValues
+        // means for it (the reference on the mixed and extrapolated families). The mixed family used to be
+        // re-evaluated here instead, which on a freestreamPressure patch is a different number from the
+        // blend (queue item 23); on a zeroGradient face the two are the same arithmetic on the same operands.
+        p.boundary[pi]->assignValue(std::move(v));
     }
 }
 
@@ -235,8 +228,18 @@ void updatePressureInletOutletVelocity(
 // the limiter; nowhere else. Every other patch class ignores the call.
 void updateTotalPressure(
     RhoSimpleFields&            f,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    bool                        evaluateAll)
 {
+    // freestreamPressure's updateCoeffs runs in the same two places (the pressure fvMatrix constructor and
+    // the limiter's correctBoundaryConditions): valueFraction = 0.5 + 0.5*(Up & nf)/mag(Up) from U's
+    // PATCH value as it stands (freestreamPressureFvPatchScalarField.C:109-121). It used to be rebuilt at
+    // the TOP of the iteration, from the corrected U of the previous one, and p's boundary re-evaluated
+    // there: on naca0012 the host read p 3.4e-05 / U 6.5e-05 against OpenFOAM over t=1..10 with the
+    // limiter and 9.8e-05 without it (queue item 23).
+    std::vector<std::vector<vector>> Ub(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi) Ub[pi] = f.U.boundary[pi]->value();
+    updateMixedFreestream(f.p.boundary, Ub, patches);
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         f.p.boundary[pi]->updateFromFlux(f.phi.boundary[pi]);
@@ -245,7 +248,10 @@ void updateTotalPressure(
             f.U.boundary[pi]->value(),
             f.rho.boundary[pi]->value());
     }
-    f.p.evaluateBoundary();
+    // updateCoeffs alone changes no other patch's VALUE (totalPressure's operator== is inside its own
+    // updateCoeffs, done above); the evaluate is OpenFOAM's correctBoundaryConditions, which follows only
+    // under the limiter (pEqn.H:100-103) -- a mixed or zeroGradient face keeps the relaxed blend until then.
+    if (evaluateAll) f.p.evaluateBoundary();
 }
 
 } // namespace
@@ -304,10 +310,10 @@ Residuals rhoSimpleStep(
         std::vector<std::vector<vector>> Ub(patches.size());
         for (std::size_t pi = 0; pi < patches.size(); ++pi) Ub[pi] = f.U.boundary[pi]->value();
         updateMixedFreestream(f.U.boundary, Ub, patches);
-        // p as well: the momentum equation reads p's boundary VALUE through -fvc::grad(p), and in
-        // OpenFOAM that value is the blend the previous iteration's updateCoeffs left behind.
-        updateMixedFreestream(f.p.boundary, Ub, patches);
-        f.p.evaluateBoundary();
+        // NOT p. freestreamPressure's updateCoeffs runs inside the pressure fvMatrix constructor
+        // (updateTotalPressure below), and -fvc::grad(p) in the momentum equation reads p's boundary AS IT
+        // STANDS: the blend p.relax() left, or the limiter's re-evaluation. Rebuilding p's valueFraction
+        // here from the corrected U and re-evaluating was what kept naca0012 at 3.4e-05 (queue item 23).
     }
     f.U.evaluateBoundary();
     f.he.evaluateBoundary();
@@ -518,7 +524,7 @@ Residuals rhoSimpleStep(
         // totalPressure's updateCoeffs, where OpenFOAM runs it: inside the pressure fvMatrix's
         // constructor (fvMatrix.C:396), from U's PATCH value as the momentum solve left it, the flux the
         // iteration started with, and rho's patch value as pcEqn.H:1 just set it.
-        updateTotalPressure(f, patches);
+        updateTotalPressure(f, patches, /*evaluateAll=*/false);
         // `while (simple.correctNonOrthogonal())` -- pcEqn.H:67. Each pass re-assembles from the SAME
         // stages (phiHbyA, rhorAtU are outside the loop in OF too) and re-solves; what changes between
         // passes is the deferred non-orthogonal correction, recomputed from the just-solved p. The
@@ -543,7 +549,7 @@ Residuals rhoSimpleStep(
     {
         const PressureStages st = pressurePredictor(UEqn, f.U, f.p, pin, m, g, patches);
         // The same updateCoeffs on this branch, with rho's patch value as the previous tail left it.
-        updateTotalPressure(f, patches);
+        updateTotalPressure(f, patches, /*evaluateAll=*/false);
         // The same loop for pEqn.H:56 -- see the pcEqn branch above for why it is shaped this way.
         for (label corr = 0; corr <= in.nNonOrthogonalCorrectors; ++corr)
         {
@@ -672,7 +678,7 @@ Residuals rhoSimpleStep(
     // (the flag was cleared by the solve's evaluate), i.e. a recompute from the NEW flux, the corrected
     // U's patch value and rho's patch value as it stands -- BEFORE the tail's rho = thermo.rho() below.
     // It is the value written to disk and the one the next momentum assembly reads through grad(p).
-    if (pLimited || closedVolume) updateTotalPressure(f, patches);
+    if (pLimited || closedVolume) updateTotalPressure(f, patches, /*evaluateAll=*/true);
 
     // rho = thermo.rho(), and rho.relax() only when NOT transonic.
     //
