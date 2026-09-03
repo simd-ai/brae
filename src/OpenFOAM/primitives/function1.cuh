@@ -54,6 +54,18 @@ public:
 
     bool empty() const { return entries_.empty(); }
 
+    // True when every entry carries the same value, so value(t) is the same at every t. A driver that
+    // samples the table once (the rhoSimpleFoam mirror seeds p0 at t = 0 and never refreshes it) can run
+    // such a table exactly; anything else it must refuse rather than freeze at the first value.
+    bool isConstant() const
+    {
+        for (const auto& e : entries_)
+        {
+            if (e.second != entries_.front().second) return false;
+        }
+        return true;
+    }
+
     // OF TableBase::value(x): linear between brackets, clamped outside.
     scalar value(scalar t) const
     {

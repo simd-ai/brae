@@ -333,6 +333,32 @@ RhoSimpleFields createFields(
                 "condition whose valueFraction OpenFOAM recomputes from phi every updateCoeffs. The mirror "
                 "pushes the flux into U, he and T only, so this patch would keep its seeded switch for the "
                 "whole run on both arms. Refusing rather than running a frozen switch under the case's name.");
+        if (!b.hasP0Function1) continue;
+        // A p0 TABLE. OpenFOAM's uniformTotalPressure samples its p0 Function1 at the current time in
+        // every updateCoeffs (uniformTotalPressureFvPatchScalarField.C:149) and at construction (:72-73);
+        // the reader seeds the patch with the table's value at t = 0 and neither mirror arm refreshes it,
+        // so a ramp would run frozen at its first value under the case's name. Measured on rhoTP with
+        // p0 table ((0 100200) (10 100400)) and the solvers pinned: OpenFOAM's inlet reads p 100302 (mean)
+        // at t = 10, the host arm 100140 and the device arm 100090, p0 still 100200 on both. A
+        // constant-valued table and `constant` run, because value(0) IS the value at every time. The
+        // legacy device driver refreshes p0 per step (gpuRhoSimpleFoam.cu); the mirror does not, yet.
+        if (b.type == "uniformTotalPressure" && !b.p0Function1.isConstant())
+            throw std::runtime_error(
+                "rhoSimpleFoam createFields: p's patch '" + b.name + "' is `uniformTotalPressure` with a "
+                "time-varying p0 table. OpenFOAM samples p0(t) every updateCoeffs "
+                "(uniformTotalPressureFvPatchScalarField.C:149); the mirror seeds p0 once at t = 0 and never "
+                "refreshes it on either arm, so the ramp would run frozen at its first value. Refusing "
+                "rather than running a constant p0 under the case's name. A constant p0 (`constant`, a "
+                "bare value, or a single-valued table) runs.");
+        // totalPressure reads p0 as a FIELD (totalPressureFvPatchScalarField.C:67, `p0_("p0", dict,
+        // p.size())`), so a Function1 table there is an OpenFOAM read error that the reader used to seed
+        // at t = 0 instead. Refused: OpenFOAM would not have run this case at all.
+        if (b.type == "totalPressure")
+            throw std::runtime_error(
+                "rhoSimpleFoam createFields: p's patch '" + b.name + "' is `totalPressure` with a p0 "
+                "table. OpenFOAM's totalPressure reads p0 as a field (totalPressureFvPatchScalarField.C:67) "
+                "and would fail to read this entry; a Function1 p0 belongs to `uniformTotalPressure`. "
+                "Refusing rather than seeding p0 from the table's first value.");
     }
     f.p = buildField<scalar>(pFd, patches, nC);
     f.p.evaluateBoundary();

@@ -21,6 +21,8 @@
 #   6. THE SOLVER ENTRIES. tolerance/relTol/maxIter/minIter reach each equation from ITS entry (arm 14).
 #   7. TWO REFUSALS OpenFOAM's construction would have made: no 0/alphat on a RAS case (arm 15) and a
 #      flux-switched pressure patch the mirror never refreshes (arm 16).
+#   8. uniformTotalPressure's p0 TABLE: a ramp the mirror would freeze at t = 0 is refused, a
+#      constant-valued table and `constant` run (arm 17).
 #
 # The turbulent arm runs validation/rhoBoxF so the k/epsilon/nut/alphat write payload is exercised
 # cheaply -- that fixture's turbulence is frozen, which does not matter here: the question is whether
@@ -473,5 +475,49 @@ PYEOF
             || { echo "$out" | tail -3; say "a $bc pressure patch is refused by name (arm $arm)" FAIL; }
     done
 done
+
+# ---- arm 17: uniformTotalPressure's p0 table: a ramp is refused, a constant one runs, on BOTH arms ---
+# OpenFOAM samples p0(t) every updateCoeffs (uniformTotalPressureFvPatchScalarField.C:149); the mirror
+# seeds p0 once at t = 0 and never refreshes it. Measured on rhoTP before the refusal, p0 table
+# ((0 100200) (10 100400)) with the solvers pinned to 1e-12/0: OpenFOAM's inlet reads p 100302 (mean) at
+# t = 10, the host arm 100140 and the device arm 100090, p0 still 100200 on both. totalPressure reads p0
+# as a FIELD (totalPressureFvPatchScalarField.C:67), so a table there is refused as an OpenFOAM read
+# error. Controls: a constant-valued table and `constant` run to Time = 3 on both arms, no refusal.
+if [ -d "$ROOT/validation/rhoTP" ]; then
+    tp_inlet()   # $1 dst  $2 the inlet's dictionary body
+    {
+        stage "$1" "$ROOT/validation/rhoTP" 3
+        INLET="$2" python3 - "$1/0/p" <<'PY17'
+import os, re, sys
+p = sys.argv[1]; s = open(p).read()
+s, n = re.subn(r'inlet\s*\{[^}]*\}', 'inlet { %s }' % os.environ['INLET'], s, count=1)
+assert n == 1
+open(p, 'w').write(s)
+PY17
+    }
+    tp_inlet "$W/tp_ramp"  'type uniformTotalPressure; p0 table ((0 100200) (10 100400)); value uniform 100200;'
+    tp_inlet "$W/tp_field" 'type totalPressure; p0 table ((0 100200) (10 100200)); value uniform 100200;'
+    tp_inlet "$W/tp_ctab"  'type uniformTotalPressure; p0 table ((0 100200) (10 100200)); value uniform 100200;'
+    tp_inlet "$W/tp_const" 'type uniformTotalPressure; p0 constant 100200; value uniform 100200;'
+    for arm in 1 cuda; do
+        out=$( cd "$W/tp_ramp" && BRAE_RHOSIMPLEFOAM_MIRROR=$arm "$BIN" -case "$W/tp_ramp" 2>&1 || true )
+        echo "$out" | grep -q "time-varying p0 table" && echo "$out" | grep -q "'inlet' is \`uniformTotalPressure\`" \
+            && ! echo "$out" | grep -q "^Time = 1" \
+            && say "a ramped uniformTotalPressure p0 is refused by name (arm $arm)" ok \
+            || { echo "$out" | tail -3; say "a ramped uniformTotalPressure p0 is refused by name (arm $arm)" FAIL; }
+        out=$( cd "$W/tp_field" && BRAE_RHOSIMPLEFOAM_MIRROR=$arm "$BIN" -case "$W/tp_field" 2>&1 || true )
+        echo "$out" | grep -q "reads p0 as a field" && ! echo "$out" | grep -q "^Time = 1" \
+            && say "a p0 table on totalPressure is refused as OpenFOAM's read error (arm $arm)" ok \
+            || { echo "$out" | tail -3; say "a p0 table on totalPressure is refused as OpenFOAM's read error (arm $arm)" FAIL; }
+        for c in tp_ctab tp_const; do
+            out=$( cd "$W/$c" && BRAE_RHOSIMPLEFOAM_MIRROR=$arm "$BIN" -case "$W/$c" 2>&1 || true )
+            echo "$out" | grep -q "^Time = 3" && [ -d "$W/$c/3" ] && ! echo "$out" | grep -qi "refus" \
+                && say "control: $c (constant p0) runs to Time = 3 (arm $arm)" ok \
+                || { echo "$out" | tail -3; say "control: $c (constant p0) runs to Time = 3 (arm $arm)" FAIL; }
+        done
+    done
+else
+    say "rhoTP missing -- uniformTotalPressure arm skipped" SKIP
+fi
 
 [ $fail = 0 ] && echo PASS || { echo FAIL; exit 1; }
