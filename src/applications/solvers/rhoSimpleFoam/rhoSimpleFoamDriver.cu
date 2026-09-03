@@ -357,9 +357,18 @@ int runMirrorCuda(const std::string& caseDir)
         DeviceSimpleControls lctl;
         lctl.turbulent = hf.turbulent;   // gates the reader's k/epsilon block -- see the host driver
         const std::string secondName = (hf.rasModel == "kOmegaSST") ? "omega" : "epsilon";
-        // ...and this driver DOES precondition its energy solve with DILU, unlike the legacy ones, so the
-        // reader must not report a substitution that is not happening.
-        readLinearSolverControls(fvSolution, secondName, lctl, "SIMPLE", hf.heName, /*diluOnEnergy=*/true);
+        // What THIS driver runs, so the substitution notices describe it rather than the legacy one.
+        // It wires DILU on the energy solve as well as on U and the turbulence pair; and its pressure
+        // solve is the case's own PBiCGStab on the transonic branch (pcEqn.H's phid matrix is asymmetric,
+        // so there is no CG to run there) and the AMG-preconditioned CG otherwise.
+        SolverRunsAs runsAs;
+        runsAs.diluOnEnergy = true;
+        if (hin.transonic)
+        {
+            runsAs.pSolver = "PBiCGStab";
+            runsAs.pPrecon = "diagonal";
+        }
+        readLinearSolverControls(fvSolution, secondName, lctl, "SIMPLE", hf.heName, runsAs);
         hin.tolU    = lctl.tolU;    hin.relTolU    = lctl.relTolU;    hin.maxIterU    = lctl.maxIterU;    hin.minIterU    = lctl.minIterU;
         hin.tolP    = lctl.tolP;    hin.relTolP    = lctl.relTolP;    hin.maxIterP    = lctl.maxIterP;    hin.minIterP    = lctl.minIterP;
         hin.tolHe   = lctl.tolHe;   hin.relTolHe   = lctl.relTolHe;   hin.maxIterHe   = lctl.maxIterHe;   hin.minIterHe   = lctl.minIterHe;

@@ -321,7 +321,16 @@ int runMirror(const std::string& caseDir)
         // copied from that same turbulence slot. Every equation now reads its own entry, as OF does.
         lctl.turbulent = f.turbulent;
         const std::string secondName = (f.rasModel == "kOmegaSST") ? "omega" : "epsilon";
-        readLinearSolverControls(fvSolution, secondName, lctl, "SIMPLE", f.heName);
+        // The HOST arm solves every field through pbicgstab.cuh, which is a DILU-preconditioned
+        // BiCGStab whatever the dict says -- pressure included, where the device arm runs an
+        // AMG-preconditioned CG. So a case naming `diagonal` or `none` here IS being substituted, in the
+        // opposite direction from the usual one, and the reader can only know that if it is told.
+        SolverRunsAs runsAs;
+        runsAs.alwaysDilu = true;
+        runsAs.diluOnEnergy = true;
+        runsAs.pSolver = "PBiCGStab";
+        runsAs.pPrecon = "DILU";
+        readLinearSolverControls(fvSolution, secondName, lctl, "SIMPLE", f.heName, runsAs);
         in.tolU    = lctl.tolU;    in.relTolU    = lctl.relTolU;    in.maxIterU    = lctl.maxIterU;    in.minIterU    = lctl.minIterU;
         in.tolP    = lctl.tolP;    in.relTolP    = lctl.relTolP;    in.maxIterP    = lctl.maxIterP;    in.minIterP    = lctl.minIterP;
         in.tolHe   = lctl.tolHe;   in.relTolHe   = lctl.relTolHe;   in.maxIterHe   = lctl.maxIterHe;   in.minIterHe   = lctl.minIterHe;

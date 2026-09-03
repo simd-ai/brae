@@ -152,12 +152,23 @@ $2
 }
 try_supported emptyfvoptions "open(d+'/constant/fvOptions','w').write('// no options\\n')"
 
-# SIMPLEC is no longer a refusal -- it is implemented, and section 4d below asserts it RUNS. What IS
-# still refused on that path is constrainPressure, i.e. a fixedFluxPressure pressure patch: brae maps
-# that type to zeroGradient, which is the same boundary condition only when the imposed flux is zero.
-try_refusal fixedfluxp \
-  "import re,glob,os;f=[x for x in glob.glob(d+'/0/p')][0];s=open(f).read();s=re.sub(r'(upperWall\s*\{[^}]*?type\s+)\w+;', r'\\1fixedFluxPressure;', s, count=1, flags=re.S);open(f,'w').write(s)" \
-  "fixedFluxPressure"
+# SIMPLEC is no longer a refusal -- it is implemented, and section 4d below asserts it RUNS. Neither is
+# fixedFluxPressure: commit c2ff3e4 (2026-08-31) lifted the envelope's substring refusal of it once both
+# halves were ported -- the factory builds the real FixedFluxPressurePatchField and pEqn.cu runs
+# deviceConstrainPressure at pEqn.H:21 -- and gated the result against real OpenFOAM in
+# validation/ffpi_vs_openfoam.sh. This block went on asserting the REFUSAL, so from that commit it
+# demanded that brae reject a case it supports and validates, and it has been red ever since. Asserting
+# the support instead is what the shipped behaviour actually is; the refusal that is STILL live on this
+# path is the MRF combination, and it is asserted below rather than left untested.
+try_supported fixedfluxp \
+  "import re,glob;f=[x for x in glob.glob(d+'/0/p')][0];s=open(f).read();s=re.sub(r'(upperWall\s*\{[^}]*?type\s+)\w+;', r'\\1fixedFluxPressure;', s, count=1, flags=re.S);open(f,'w').write(s)"
+
+# The refusal that IS still live on this path -- fixedFluxPressure together with MRF, because MRF.relative
+# belongs inside constrainPressure (constrainPressure.C:70) and is not in the device kernel -- is NOT
+# asserted here, and deliberately so. It was written and then removed: pitzDaily carries no cellZones, so
+# any MRFProperties added to it refuses for the MISSING ZONE instead (the mrf_missing_zone case above),
+# and the block passed on the wrong reason. It needs a fixture with a real rotating zone AND a
+# fixedFluxPressure wall. Queue item 29.
 
 # `bounded` is SUPPORTED: -fvm::Sp(fvc::div(phi),U) is implemented on both paths and matched to 2.9e-16.
 # It used to be a refusal; assert it RUNS, since the term vanishes at convergence and a converged field

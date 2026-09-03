@@ -91,16 +91,27 @@ int main()
             readEnergySolverControls(fv, /*internalEnergy=*/true);
         });
 
-        check("p solver substitution is reported", has(out, "solvers/p solver") && has(out, "GAMG") && has(out, "AMG-PCG"), out);
+        // brae's AMG-PCG is OF's PCG with a GAMG preconditioner, so the notice names both -- `GAMG` as
+        // what the case asked for and `PCG preconditioned with GAMG` as what runs. OF's GAMG is
+        // multigrid AS the solver, which brae does not run, so this substitution is real.
+        check("p solver substitution is reported",
+              has(out, "solvers/p solver") && has(out, "GAMG") && has(out, "PCG preconditioned with GAMG"), out);
         check("p smoother is reported ignored", has(out, "solvers/p smoother") && has(out, "DICGaussSeidel"), out);
-        check("U solver substitution is reported", has(out, "solvers/U solver") && has(out, "PBiCGStab"), out);
-        // U's DILU is now IMPLEMENTED (device_dilu.cuh), so it must NOT be reported as a substitution --
-        // a notice that brae approximates something it actually runs is as misleading as a silent
-        // substitution, and it is what would hide the next real one. The energy check below is the
-        // other half: DILU is wired for the momentum path only, and `e` must still say so.
+        // NOTHING about U. This block used to assert the OPPOSITE -- that asking `PBiCGStab` on U was
+        // reported as a substitution -- which was the defect, not the contract: PBiCGStab IS a
+        // preconditioned BiCGStab with a run-time selectable preconditioner (PBiCGStab.H), so brae
+        // running BiCGStab with the DILU this entry names is running exactly what the case asked for.
+        // The old assertion made every stock tutorial announce a substitution on U that was not
+        // happening, and a notice that brae approximates something it actually runs hides the next real
+        // one just as well as silence does (queue item 28).
+        check("U solver is NOT reported: PBiCGStab with the case's DILU is what brae runs",
+              !has(out, "solvers/U solver"), out);
         check("U preconditioner is NOT reported: DILU is implemented for the momentum solves",
               !has(out, "solvers/U preconditioner"), out);
+        // The energy half: this driver does NOT wire DILU there, so the preconditioner IS substituted and
+        // must say so -- while the SOLVER is the one the case named and must not.
         check("energy preconditioner is reported", has(out, "solvers/e preconditioner") && has(out, "DILU"), out);
+        check("energy solver is NOT reported", !has(out, "solvers/e solver"), out);
         // The wording must carry the reason, not just the fact -- a bare "ignored" would read as a bug.
         check("the notice explains the consequence", has(out, "iteration count and cost differ"), out);
     }
@@ -188,8 +199,11 @@ int main()
         // ...and the substitution notice must SAY when a cap is what makes the fields differ.
         // U, not p, and with a solver name no earlier block used: notice() de-duplicates on the whole
         // (kind, subject, detail) triple, so reusing either would test the de-dup, not the wording.
+        // PBiCG, not PBiCGStab: the stabilized one is what brae runs, so naming it here would produce no
+        // notice at all and this block would assert nothing (queue item 28). PBiCG is a different Krylov
+        // method (PBiCG.H: bi-conjugate gradient, not the stabilized variant), so it is a real one.
         const std::string dir = writeFvSolution(tmp + "/capped",
-            "    U { solver PBiCGStab; tolerance 1e-6; relTol 0.05; maxIter 10; }\n");
+            "    U { solver PBiCG; tolerance 1e-6; relTol 0.05; maxIter 10; }\n");
         const FoamDict fv = readDict(dir + "/system/fvSolution");
         const std::string out = captureStderr(tmp + "/capped.err", [&]
         {
@@ -240,7 +254,9 @@ int main()
         {
             DeviceSimpleControls ctl;
             ctl.turbulent = false;
-            readLinearSolverControls(fv, "epsilon", ctl, "SIMPLE", "e", /*diluOnEnergy=*/true);
+            SolverRunsAs mirrorRuns;
+            mirrorRuns.diluOnEnergy = true;
+            readLinearSolverControls(fv, "epsilon", ctl, "SIMPLE", "e", mirrorRuns);
         });
         check("a driver that DOES precondition the energy solve is silent about it",
               !has(mirror, "solvers/e preconditioner"), mirror);
@@ -248,7 +264,9 @@ int main()
         // would have done -- p asks DILU here too and nothing preconditions it.
         DeviceSimpleControls ctl;
         ctl.turbulent = false;
-        readLinearSolverControls(fv, "epsilon", ctl, "SIMPLE", "e", /*diluOnEnergy=*/true);
+        SolverRunsAs mirrorRuns;
+        mirrorRuns.diluOnEnergy = true;
+        readLinearSolverControls(fv, "epsilon", ctl, "SIMPLE", "e", mirrorRuns);
         check("the energy preconditioner is read off the case's own entry",
               ctl.diluHe, std::string("diluHe=") + (ctl.diluHe ? "1" : "0"));
     }
@@ -260,9 +278,124 @@ int main()
         const FoamDict fv = readDict(dir + "/system/fvSolution");
         DeviceSimpleControls ctl;
         ctl.turbulent = false;
-        readLinearSolverControls(fv, "epsilon", ctl, "SIMPLE", "e", /*diluOnEnergy=*/true);
+        SolverRunsAs mirrorRuns;
+        mirrorRuns.diluOnEnergy = true;
+        readLinearSolverControls(fv, "epsilon", ctl, "SIMPLE", "e", mirrorRuns);
         check("a non-DILU energy preconditioner leaves diluHe false",
               !ctl.diluHe, std::string("diluHe=") + (ctl.diluHe ? "1" : "0"));
+    }
+
+    // ---- ITEM 28: A CASE THAT NAMES WHAT BRAE RUNS MUST BE MET WITH SILENCE ----
+    //
+    // The headline of the fix. Every field here names the solver AND the preconditioner brae actually
+    // runs, in OpenFOAM's own vocabulary, so there is nothing to report. Before this the same dictionary
+    // produced a solver notice on all four fields, because the comparison held the dict's `PBiCGStab`
+    // against a display string of "Jacobi-BiCGStab" and the dict's `PCG` against "AMG-PCG".
+    //
+    // The field names and values differ from every block above: notice() de-duplicates on the whole
+    // (kind, subject, detail) triple, and a silence assertion is the one kind that a de-dup could pass
+    // for the wrong reason.
+    {
+        const std::string dir = writeFvSolution(tmp + "/asksexactly",
+            "    p { solver PCG; preconditioner GAMG; tolerance 1e-7; relTol 0.02; }\n"
+            "    U { solver PBiCGStab; preconditioner DILU; tolerance 1e-7; relTol 0.02; }\n"
+            "    k { solver PBiCGStab; preconditioner DILU; tolerance 1e-7; relTol 0.02; }\n"
+            "    omega { solver PBiCGStab; preconditioner DILU; tolerance 1e-7; relTol 0.02; }\n");
+        const FoamDict fv = readDict(dir + "/system/fvSolution");
+        const std::string out = captureStderr(tmp + "/asksexactly.err", [&]
+        {
+            DeviceSimpleControls ctl;
+            ctl.turbulent = true;
+            ctl.sa = false;
+            readLinearSolverControls(fv, "omega", ctl);
+        });
+        check("a case naming exactly what brae runs is met with silence", !has(out, "NOTICE"), out);
+    }
+    {
+        // The control for that silence: the SAME dictionary with exactly one field changed to a solver
+        // brae does not run. If the block above passed because the reader had gone quiet altogether,
+        // this one fails.
+        //
+        // On `k`, and not on U as first written: notice() de-duplicates on the whole (kind, subject,
+        // detail) triple, and an earlier block in this file already emits `solvers/U solver: case asks
+        // 'PBiCG', brae runs PBiCGStab preconditioned with DILU`. The duplicate was suppressed and this
+        // control read an empty capture -- a false FAIL, which is the safe direction, but the same trap
+        // pointed the other way is what makes a silence assertion pass for the wrong reason.
+        const std::string dir = writeFvSolution(tmp + "/asksexactly2",
+            "    p { solver PCG; preconditioner GAMG; tolerance 1e-7; relTol 0.02; }\n"
+            "    U { solver PBiCGStab; preconditioner DILU; tolerance 1e-7; relTol 0.02; }\n"
+            "    k { solver PBiCG; preconditioner DILU; tolerance 1e-7; relTol 0.02; }\n"
+            "    omega { solver PBiCGStab; preconditioner DILU; tolerance 1e-7; relTol 0.02; }\n");
+        const FoamDict fv = readDict(dir + "/system/fvSolution");
+        const std::string out = captureStderr(tmp + "/asksexactly2.err", [&]
+        {
+            DeviceSimpleControls ctl;
+            ctl.turbulent = true;
+            ctl.sa = false;
+            readLinearSolverControls(fv, "omega", ctl);
+        });
+        check("...and the same block with one solver changed is NOT silent",
+              has(out, "solvers/k solver") && has(out, "PBiCG"), out);
+        check("...and only that field is reported",
+              !has(out, "solvers/U solver") && !has(out, "solvers/omega solver") && !has(out, "solvers/p solver"), out);
+    }
+
+    // ---- `none` IS NOT `diagonal`, and was exempted as though it were ----
+    //
+    // OF's noPreconditioner is wA = rA and its diagonalPreconditioner is wA = rA/diag (their .C files).
+    // The old exemption list skipped both words, so a case asking for NO preconditioner was answered
+    // with Jacobi and told nothing. Comparing against what the driver runs removes the list and the hole
+    // with it.
+    {
+        const std::string dir = writeFvSolution(tmp + "/nonecon",
+            "    U { solver PBiCGStab; preconditioner none; tolerance 1e-9; relTol 0.03; }\n");
+        const FoamDict fv = readDict(dir + "/system/fvSolution");
+        const std::string out = captureStderr(tmp + "/nonecon.err", [&]
+        {
+            DeviceSimpleControls ctl;
+            ctl.turbulent = false;
+            readLinearSolverControls(fv, "epsilon", ctl);
+        });
+        check("asking for no preconditioner at all is reported",
+              has(out, "solvers/U preconditioner") && has(out, "'none'") && has(out, "diagonal"), out);
+    }
+    {
+        // Control: `diagonal` IS what brae runs there, so it stays silent.
+        const std::string dir = writeFvSolution(tmp + "/diagcon",
+            "    U { solver PBiCGStab; preconditioner diagonal; tolerance 1e-9; relTol 0.03; }\n");
+        const FoamDict fv = readDict(dir + "/system/fvSolution");
+        const std::string out = captureStderr(tmp + "/diagcon.err", [&]
+        {
+            DeviceSimpleControls ctl;
+            ctl.turbulent = false;
+            readLinearSolverControls(fv, "epsilon", ctl);
+        });
+        check("asking for the diagonal preconditioner brae runs is silent",
+              !has(out, "solvers/U preconditioner"), out);
+    }
+
+    // ---- THE SUBSTITUTION CAN POINT THE OTHER WAY ----
+    //
+    // The OF-mirror's HOST arm solves everything through pbicgstab.cuh, which is DILU whatever the dict
+    // says. A case asking `diagonal` there is being substituted just as surely as one asking DILU on a
+    // driver that runs Jacobi, and nothing reported it because the old rule only ever looked for the
+    // word DILU in the DICT.
+    {
+        const std::string dir = writeFvSolution(tmp + "/alwaysdilu",
+            "    U { solver PBiCGStab; preconditioner diagonal; tolerance 1e-11; relTol 0.04; }\n");
+        const FoamDict fv = readDict(dir + "/system/fvSolution");
+        const std::string out = captureStderr(tmp + "/alwaysdilu.err", [&]
+        {
+            DeviceSimpleControls ctl;
+            ctl.turbulent = false;
+            SolverRunsAs hostArm;
+            hostArm.alwaysDilu = true;
+            hostArm.pSolver = "PBiCGStab";
+            hostArm.pPrecon = "DILU";
+            readLinearSolverControls(fv, "epsilon", ctl, "SIMPLE", "", hostArm);
+        });
+        check("a driver that always runs DILU reports the case that asked for diagonal",
+              has(out, "solvers/U preconditioner") && has(out, "brae preconditions with DILU"), out);
     }
 
     std::printf("solver_notices: %d failures\n", failures);
