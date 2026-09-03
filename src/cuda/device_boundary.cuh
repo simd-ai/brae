@@ -65,6 +65,9 @@ inline DeviceBoundary buildDeviceBoundary(
         // a restarted field carries the value OpenFOAM wrote in value() -- which is a blend, not a
         // reference. refValues() is value() for every BC that does not distinguish them.
         const std::vector<scalar> val = f.boundary[pi]->refValues();   // totalPressure: p0
+        // totalPressure's initial device VALUE is the patch value -- the written `value` on a restart from
+        // OpenFOAM's output, p0 on a cold start -- while its p0 buffer takes the reference (queue 20).
+        const std::vector<scalar> cur = (cat == 7) ? f.boundary[pi]->value() : std::vector<scalar>{};
         const std::vector<scalar>* vfp = f.boundary[pi]->valueFractionPtr();   // mixed (cat 5): per-face vf seed
         const std::vector<scalar>* rgp = f.boundary[pi]->refGradPtr();         // fixedGradient: per-face g
         const label sgm = f.boundary[pi]->updateableSnGrad() ? 1 : 0;   // fixedFluxPressure
@@ -84,7 +87,7 @@ inline DeviceBoundary buildDeviceBoundary(
             vf.push_back((cat == 5 && vfp) ? (*vfp)[i] : 0.0);
             rg.push_back(rgp ? (*rgp)[i] : 0.0);
             sg.push_back(sgm);
-            ref.push_back(val[i]);
+            ref.push_back((cat == 7 && i < (label)cur.size()) ? cur[i] : val[i]);
             dc.push_back(fvp[pi].deltaCoeffs[i]);
             ms.push_back(g.magSf()[fvp[pi].start + i]);
             fc.push_back(fvp[pi].faceCells[i]);

@@ -445,6 +445,23 @@ inline FieldData<scalar> symmTensorComponent(const FieldData<symmTensor>& fd, in
     return out;
 }
 
+// A p0 table onto the patch data, from either spelling: the Function1 itself, and the constant slot
+// seeded at t = 0 so a solver that never advances time still has a defined p0 rather than zero. p0 is a
+// PRESSURE: scalar only -- the reader is templated on T, so guard rather than cast; a vector field has no
+// p0 and must not silently get one.
+template <typename T>
+inline void setP0Table(PatchFieldData<T>& p, std::vector<std::pair<scalar, scalar>> pts)
+{
+    p.p0Function1 = Function1::table(std::move(pts));
+    p.hasP0Function1 = true;
+    if constexpr (std::is_same_v<T, scalar>)
+    {
+        p.inletUniformValue = p.p0Function1.value(0);
+        p.inletUniform = true;
+        p.hasInletValue = true;
+    }
+}
+
 template <typename T>
 inline FieldData<T> readField(const std::string& path)
 {
@@ -704,29 +721,31 @@ inline FieldData<T> readField(const std::string& path)
                             // OF Function1 `table ((t v) (t v) ...)`: linear between entries, CLAMPed
                             // outside (TableBase.C:76). pimpleFoam/RAS/TJunction ramps p0 this way.
                             ts.next();                       // "table"
-                            ts.expect("(");
-                            std::vector<std::pair<scalar, scalar>> pts;
-                            while (!ts.eof() && ts.peek() != ")")
+                            if (ts.peek() == ";")
+                            {
+                                // The form OpenFOAM WRITES (Function1::writeData, TableBase::writeEntries):
+                                // `p0 table;` with the points in a `p0Coeffs { values ... }` entry that
+                                // follows -- what every restart from OpenFOAM's own output carries. The
+                                // reader expected `table (` here and fell over the ';' with a raw
+                                // tokeniser error (queue item 20). Provisionally unsupported until the
+                                // p0Coeffs entry below is parsed, so a `table;` with no coefficients is
+                                // still refused by name rather than run at zero.
+                                if (!p.hasP0Function1) p.unsupportedFunction1 = "table (no p0Coeffs entry)";
+                            }
+                            else
                             {
                                 ts.expect("(");
-                                const scalar tt = ts.nextScalar();
-                                const scalar vv = ts.nextScalar();
+                                std::vector<std::pair<scalar, scalar>> pts;
+                                while (!ts.eof() && ts.peek() != ")")
+                                {
+                                    ts.expect("(");
+                                    const scalar tt = ts.nextScalar();
+                                    const scalar vv = ts.nextScalar();
+                                    ts.expect(")");
+                                    pts.emplace_back(tt, vv);
+                                }
                                 ts.expect(")");
-                                pts.emplace_back(tt, vv);
-                            }
-                            ts.expect(")");
-                            p.p0Function1 = Function1::table(std::move(pts));
-                            p.hasP0Function1 = true;
-
-                            // Seed the constant slot with t = 0 so a solver that never advances time
-                            // still has a defined p0 rather than zero.
-                            // p0 is a PRESSURE: scalar only. The reader is templated on T, so guard
-                            // rather than cast -- a vector field has no p0 and must not silently get one.
-                            if constexpr (std::is_same_v<T, scalar>)
-                            {
-                                p.inletUniformValue = p.p0Function1.value(0);
-                                p.inletUniform = true;
-                                p.hasInletValue = true;
+                                setP0Table(p, std::move(pts));
                             }
                         }
                         else
@@ -736,6 +755,59 @@ inline FieldData<T> readField(const std::string& path)
                             skipToSemicolon(ts, 0);
                         }
                         ts.expect(";");
+                    }
+                    else if (key == "p0Coeffs")   // the written table: `p0 table;` + this sub-dictionary
+                    {
+                        // Function1New.C reads a table's coefficients from dict.optionalSubDict(name +
+                        // "Coeffs"): `values` (a List of (t v), written with its size), and optionally
+                        // `interpolationScheme` (linear is TableBase's default) and `outOfBounds`
+                        // (clamp is the default, TableBase.C:76). brae evaluates linear + clamp only, so
+                        // anything else is named and refused rather than run as the default.
+                        ts.expect("{");
+                        std::vector<std::pair<scalar, scalar>> pts;
+                        bool haveValues = false;
+                        std::string bad;
+                        while (!ts.eof() && ts.peek() != "}")
+                        {
+                            const std::string ck = ts.next();
+                            if (ck == "values")
+                            {
+                                if (isFoamNumber(ts.peek())) ts.next();   // the list size OpenFOAM writes
+                                ts.expect("(");
+                                while (!ts.eof() && ts.peek() != ")")
+                                {
+                                    ts.expect("(");
+                                    const scalar tt = ts.nextScalar();
+                                    const scalar vv = ts.nextScalar();
+                                    ts.expect(")");
+                                    pts.emplace_back(tt, vv);
+                                }
+                                ts.expect(")");
+                                ts.expect(";");
+                                haveValues = true;
+                            }
+                            else if (ck == "interpolationScheme" || ck == "outOfBounds")
+                            {
+                                const std::string v = ts.next();
+                                ts.expect(";");
+                                const bool okv = (ck == "interpolationScheme") ? (v == "linear") : (v == "clamp");
+                                if (!okv) bad = "table " + ck + " " + v;
+                            }
+                            else
+                            {
+                                if (!skipToSemicolon(ts)) ts.expect(";");
+                            }
+                        }
+                        ts.expect("}");
+                        if (!bad.empty())
+                        {
+                            p.unsupportedFunction1 = bad;
+                        }
+                        else if (haveValues)
+                        {
+                            if (p.unsupportedFunction1 == "table (no p0Coeffs entry)") p.unsupportedFunction1.clear();
+                            setP0Table(p, std::move(pts));
+                        }
                     }
                     else if (key == "uniformValue")   // uniformFixedValue: steady PatchFunction1 "constant <v>"
                     {

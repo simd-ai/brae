@@ -282,12 +282,22 @@ template <typename T>
 class TotalPressurePatchField : public FixedValuePatchField<T>
 {
 public:
+    // The VALUE and p0 arrive separately, as OpenFOAM's dictionary constructor keeps them: the patch
+    // value is the `value` entry when the file carries one and p0 otherwise
+    // (totalPressureFvPatchScalarField.C:69-73 readValueEntry, else operator=(p0_);
+    // uniformTotalPressureFvPatchScalarField.C:70-75 the same). One slot used to serve both, seeded from
+    // p0, so a RESTART from OpenFOAM's written directory started the inlet at p0 (100200 on rhoTP) where
+    // OpenFOAM's continuation reads the written value (100094.86): the first momentum assembly after the
+    // restart saw a different grad(p) and both arms read U 1.1e-01 against OpenFOAM at t = 2 (queue 20).
     TotalPressurePatchField(
         const FvPatch& p,
-        bool uniform,
-        T uval,
-        std::vector<T> vals)
-        : FixedValuePatchField<T>(p, uniform, uval, vals)
+        bool valueUniform,
+        T valueUval,
+        std::vector<T> valueVals,
+        bool p0Uniform,
+        T p0Uval,
+        std::vector<T> p0Vals)
+        : FixedValuePatchField<T>(p, valueUniform, valueUval, valueVals)
     {
         // p0 from the CONSTRUCTOR'S OWN DATA -- never this->value(): value_ is filled by evaluate(),
         // which has not run at construction, so capturing it here stored an EMPTY p0 and every update
@@ -297,10 +307,13 @@ public:
         p0_.resize(static_cast<std::size_t>(p.size));
         for (label i = 0; i < p.size; ++i)
             p0_[static_cast<std::size_t>(i)] =
-                uniform ? uval
-                        : (static_cast<std::size_t>(i) < vals.size() ? vals[static_cast<std::size_t>(i)] : T{});
+                p0Uniform ? p0Uval
+                          : (static_cast<std::size_t>(i) < p0Vals.size() ? p0Vals[static_cast<std::size_t>(i)] : T{});
     }
     int bcCategory() const override { return 7; }                   // device: totalPressure (per-step refValue)
+    // The REFERENCE this patch blends from is p0, not its current value: the device projection reads
+    // refValues() into its p0 buffer (device_boundary.cuh), and value() is the written value on a restart.
+    std::vector<T> refValues() const override { return p0_; }
 
     void updateFromFlux(const std::vector<scalar>& phip) override { phi_ = phip; }
 
@@ -1818,8 +1831,14 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
                 "which is not implemented. Remove the psi entry to use the low-speed form, which brae "
                 "reproduces exactly.");
         }
-        const auto v = inletOrValue(d);
-        return std::make_unique<TotalPressurePatchField<T>>(p, v.uniform, v.uniformValue, v.values);
+        // p0 from its own slot; the VALUE from the `value` entry when the file has one (a restart from
+        // OpenFOAM's output always does), else from p0 -- totalPressureFvPatchScalarField.C:69-73.
+        const auto p0 = inletOrValue(d);
+        if (d.hasValue)
+            return std::make_unique<TotalPressurePatchField<T>>(
+                p, d.valueUniform, d.uniformValue, d.values, p0.uniform, p0.uniformValue, p0.values);
+        return std::make_unique<TotalPressurePatchField<T>>(
+            p, p0.uniform, p0.uniformValue, p0.values, p0.uniform, p0.uniformValue, p0.values);
     }
     if (d.type == "flowRateInletVelocity")
     {
