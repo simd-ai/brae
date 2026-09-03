@@ -132,22 +132,80 @@ StepInput buildStepInput(
                         (int)in.correctedLaplacian, (double)in.snGradLimitCoeff);
     }
 
-    in.relaxU             = re  ? re->scalarOr("U", 1.0) : 1.0;
-    in.relaxHe            = re  ? re->scalarOr(f.heName, 1.0) : 1.0;
-    in.relaxPEqn          = re  ? re->scalarOr("p", 1.0) : 1.0;
-    in.relaxPEqnSpecified = (re != nullptr) && re->found("p");
-    in.relaxP             = rfl ? rfl->scalarOr("p", 1.0) : 1.0;
-    in.relaxRho           = rfl ? rfl->scalarOr("rho", 1.0) : 1.0;
-    in.relaxK             = re  ? re->scalarOr("k", 1.0) : 1.0;
-    in.relaxEpsilon       = re  ? re->scalarOr("epsilon", 1.0) : 1.0;
-    // "the case NAMES a factor", not "the factor is below 1" -- fvMatrix::relax(1.0) still applies the
-    // dominance clamp, and OpenFOAM does not relax at all when fvSolution names nothing.
-    in.relaxEquationU   = (re != nullptr) && re->found("U");
-    in.relaxEquationHe  = (re != nullptr) && re->found(f.heName);
-    in.relaxEquationK   = (re != nullptr) && re->found("k");
-    in.relaxOmega          = re  ? re->scalarOr("omega", 1.0) : 1.0;
-    in.relaxEquationOmega  = (re != nullptr) && re->found("omega");   // kOmegaSST's second scalar
-    in.relaxEquationEps = (re != nullptr) && re->found("epsilon");
+    // RELAXATION: "the case NAMES a factor" is OpenFOAM's predicate, and a `default` entry counts as
+    // naming it. solution::relaxEquation(name) is eqnRelaxDict_.found(name) || found("default")
+    // (solution.C:330-334) and relaxField(name) the same on fieldRelaxDict_ (solution.C:320-327);
+    // fvMatrix::relax() (fvMatrix.C:1250-1263) and GeometricField::relax() (GeometricField.C:1099-1114)
+    // relax if and only if that predicate holds, with the NAMED entry first (regex keys included --
+    // dictionary.H:545-549 matches keyType::REGEX) and the default otherwise (solution.C:337-375,
+    // :379-416). This read only the name, so a case relaxing through `default 0.7;` ran UNRELAXED on
+    // both arms; the tutorials' `".*" 0.7;` idiom is a regex the dict already matched, which is why no
+    // fixture saw it. A factor of 1 is still "named" (fvMatrix::relax(1) applies the dominance clamp).
+    struct RelaxEntry
+    {
+        scalar factor     = 1.0;
+        bool   named      = false;   // the OpenFOAM predicate: an entry for the name, or a default
+        bool   viaDefault = false;
+    };
+    const auto relaxEntry = [](const FoamDict* d, const std::string& name) -> RelaxEntry
+    {
+        RelaxEntry e;
+        if (d == nullptr) return e;
+        if (d->found(name))
+        {
+            e.named  = true;
+            e.factor = d->scalarOr(name, 1.0);
+        }
+        else if (d->found("default"))
+        {
+            e.named      = true;
+            e.viaDefault = true;
+            e.factor     = d->scalarOr("default", 1.0);
+        }
+        return e;
+    };
+    const RelaxEntry eU    = relaxEntry(re,  "U");
+    const RelaxEntry eHe   = relaxEntry(re,  f.heName);
+    const RelaxEntry ePEqn = relaxEntry(re,  "p");
+    const RelaxEntry eK    = relaxEntry(re,  "k");
+    const RelaxEntry eEps  = relaxEntry(re,  "epsilon");
+    const RelaxEntry eOm   = relaxEntry(re,  "omega");   // kOmegaSST's second scalar
+    const RelaxEntry fP    = relaxEntry(rfl, "p");
+    const RelaxEntry fRho  = relaxEntry(rfl, "rho");
+
+    in.relaxU             = eU.factor;
+    in.relaxHe            = eHe.factor;
+    in.relaxPEqn          = ePEqn.factor;
+    in.relaxPEqnSpecified = ePEqn.named;
+    // The field helpers treat a factor of 1 as "do nothing", which is what OpenFOAM does when the
+    // predicate is false (p.relax() is never entered); so an unnamed field factor stays at 1.
+    in.relaxP             = fP.factor;
+    in.relaxRho           = fRho.factor;
+    in.relaxK             = eK.factor;
+    in.relaxEpsilon       = eEps.factor;
+    in.relaxOmega         = eOm.factor;
+    in.relaxEquationU     = eU.named;
+    in.relaxEquationHe    = eHe.named;
+    in.relaxEquationK     = eK.named;
+    in.relaxEquationOmega = eOm.named;
+    in.relaxEquationEps   = eEps.named;
+    // SAID, not assumed (the V2 precedent): the factor each arm APPLIES, with where it came from, so a
+    // default that silently stood in -- or one that silently did not -- is visible in the log.
+    if (verbose)
+    {
+        const auto show = [](const RelaxEntry& e) -> std::string
+        {
+            if (!e.named) return "none";
+            char buf[48];
+            std::snprintf(buf, sizeof(buf), "%g%s", (double)e.factor, e.viaDefault ? " (default)" : "");
+            return buf;
+        };
+        std::printf("  relaxation: equations U %s | %s %s | p %s | k %s | epsilon %s | omega %s ;"
+                    " fields p %s | rho %s\n",
+                    show(eU).c_str(), f.heName.c_str(), show(eHe).c_str(), show(ePEqn).c_str(),
+                    show(eK).c_str(), show(eEps).c_str(), show(eOm).c_str(),
+                    show(fP).c_str(), show(fRho).c_str());
+    }
 
     // div(phi,k) and div(phi,epsilon|omega) FROM THE CASE. This was a hardcode, so neither the bounded
     // flag nor a non-upwind scheme ever reached the step from the case's own fvSchemes.
