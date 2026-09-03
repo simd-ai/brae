@@ -87,6 +87,16 @@ struct FoamDict
         }
         return hit;
     }
+    // OpenFOAM's dictionary::optionalSubDict (dictionary.C:566-591): the sub-dictionary when there is one,
+    // else THIS dictionary. RASModel.C:72 builds every model's coeffDict_ with it, so a coefficient
+    // written flat inside `RAS { ... }` without a `<model>Coeffs` sub-dictionary reaches the model --
+    // kEpsilon's Cmu, kOmegaSST's betaStar, EddyDiffusivity's Prt (EddyDiffusivity.C:37) alike. brae read
+    // the sub-dictionary only, so such a case ran the defaults (queue item 21).
+    const FoamDict* optionalSubDict(const std::string& key) const
+    {
+        const FoamDict* sd = subDict(key);
+        return sd ? sd : this;
+    }
     // Regex-aware leaf lookup: literal first, else last matching wildcard key (OF semantics).
     const std::vector<std::string>* find(const std::string& name) const
     {

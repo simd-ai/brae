@@ -238,7 +238,9 @@ inline ThermoCoeffs readThermoCoeffs(const std::string& caseDir, const FoamDict*
             const FoamDict* d = turbProps.subDict(sub);
             if (!d) continue;
             const std::string model = d->wordOr(std::string(sub) + "Model", "");
-            const FoamDict* coeffs = model.empty() ? nullptr : d->subDict(model + "Coeffs");
+            // optionalSubDict (RASModel.C:72, LESModel likewise): without a `<model>Coeffs` sub-dictionary
+            // OpenFOAM's coeffDict() IS the RAS/LES dictionary, so a flat `Prt 0.7;` reaches it.
+            const FoamDict* coeffs = model.empty() ? nullptr : d->optionalSubDict(model + "Coeffs");
             if (coeffs) c.Prt = coeffs->scalarOr("Prt", c.Prt);
         }
     }

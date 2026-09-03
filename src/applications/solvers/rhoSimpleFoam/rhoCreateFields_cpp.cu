@@ -605,7 +605,9 @@ RhoSimpleFields createFields(
             // sigmak, sigmaEps). Only Cmu was read here, so a case naming any of the other five got the
             // model default and no warning. OF spells the diffusivity denominators `sigmak`/`sigmaEps`;
             // brae's struct calls the first sigmaK, and the DICT KEY is OpenFOAM's.
-            if (const FoamDict* kec = ras ? ras->subDict("kEpsilonCoeffs") : nullptr)
+            // optionalSubDict, as RASModel.C:72: a flat `RAS { Cmu 0.12; }` without kEpsilonCoeffs reaches
+            // OpenFOAM's model, and reached brae's defaults until it did here (queue item 21).
+            if (const FoamDict* kec = ras ? ras->optionalSubDict("kEpsilonCoeffs") : nullptr)
             {
                 keCase.Cmu      = kec->scalarOr("Cmu",      keCase.Cmu);
                 keCase.C1       = kec->scalarOr("C1",       keCase.C1);
