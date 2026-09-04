@@ -1093,6 +1093,14 @@ add_test(NAME gs_smoother_notice
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A)
 set_tests_properties(gs_smoother_notice PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 
+add_executable(gs_ladder tests/gs_ladder.cu)
+target_include_directories(gs_ladder PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(gs_ladder PRIVATE brae_core)
+add_test(NAME gs_ladder_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/gs_ladder_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A)
+set_tests_properties(gs_ladder_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
 add_test(NAME uresidual_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/uresidual_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO

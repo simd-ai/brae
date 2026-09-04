@@ -246,11 +246,94 @@
         }
     }
 
+    // The ladder's matrix and starting field, captured HERE (where they are correct) and used AFTER the
+    // real solve (where the logging is harmless). autoPtr so a non-dump iteration copies nothing.
+    autoPtr<fvVectorMatrix> ladderEqn;
+    autoPtr<volVectorField> ladderPsi0;
+
+    // THE SMOOTHER LADDER. A COPY of the system the momentum predictor is about to solve -- the pressure
+    // gradient included, which stage_USrc above does not carry -- written in the FOLDED form the linear
+    // solver actually sees (fvMatrixSolve.C adds boundaryCoeffs into the source and internalCoeffs into
+    // the diagonal before lduMatrix::solver::New), plus OpenFOAM's OWN residual after exactly n sweeps
+    // for n = 1..LADDER_N.
+    //
+    // `tolerance 0; relTol 0; maxIter n` makes checkConvergence false forever (SolverPerformance.C), so
+    // smoothSolver.C's do-while runs exactly n sweeps and still reports its own normFactor-scaled
+    // residuals. Every number here is OpenFOAM's: its matrix, its fold, its normFactor, its smoother.
+    // The real solve below is untouched -- the copy carries its own matrix and U is restored each rung.
+    if (runTime.timeIndex() == braeDumpIter())
+    {
+        fvVectorMatrix UEqnP(UEqn == -fvc::grad(p));
+
+        volScalarField sD
+        (
+            IOobject("stage_UsolveDiag", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+            mesh, dimensionedScalar(dimless, Zero), zeroGradientFvPatchScalarField::typeName
+        );
+        volScalarField sS(sD); sS.rename("stage_UsolveSrc");
+        volScalarField s0(sD); s0.rename("stage_Usolve0");
+        scalarField d(UEqnP.diag());
+        scalarField b(UEqnP.source().component(0));
+        forAll(mesh.boundary(), pj)
+        {
+            const labelUList& fc = mesh.boundary()[pj].faceCells();
+            forAll(fc, i)
+            {
+                d[fc[i]] += UEqnP.internalCoeffs()[pj][i].x();
+                b[fc[i]] += UEqnP.boundaryCoeffs()[pj][i].x();
+            }
+        }
+        sD.primitiveFieldRef() = d;
+        sS.primitiveFieldRef() = b;
+        s0.primitiveFieldRef() = U.component(0)();
+        sD.write(); sS.write(); s0.write();
+
+        surfaceScalarField sU
+        (
+            IOobject("stage_UsolveUpper", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+            mesh, dimensionedScalar(dimless, Zero)
+        );
+        surfaceScalarField sL(sU); sL.rename("stage_UsolveLower");
+        if (UEqnP.hasUpper()) sU.primitiveFieldRef() = UEqnP.upper();
+        if (UEqnP.hasLower()) sL.primitiveFieldRef() = UEqnP.lower();
+        else if (UEqnP.hasUpper()) sL.primitiveFieldRef() = UEqnP.upper();
+        sU.write(); sL.write();
+
+        ladderEqn.reset(new fvVectorMatrix(UEqnP));
+        ladderPsi0.reset(new volVectorField("stage_ladderPsi0", U));
+    }
+
     if (simple.momentumPredictor())
     {
         solve(UEqn == -fvc::grad(p));
 
         fvOptions.correct(U);
+    }
+
+    // The ladder runs HERE, after the real solve, and not where its matrix was built: fvMatrixSolve.C
+    // prints every solve unconditionally, and eleven gates parse this log -- several of them by FIRST
+    // occurrence. Running the rungs after the predictor leaves the real solve's line first. Each rung
+    // starts from the psi0 dumped as stage_Usolve0, so the ladder and that field correspond, and U is
+    // put back afterwards so nothing downstream can tell this happened.
+    if (runTime.timeIndex() == braeDumpIter() && ladderEqn)
+    {
+        const volVectorField Usolved("stage_ladderUsolved", U);
+        OFstream os(runTime.path()/"stage_UsmoothLadder.dat");
+        os.precision(16);
+        for (label n = 1; n <= 10; ++n)
+        {
+            U == ladderPsi0();
+            fvVectorMatrix Urung(ladderEqn());
+            dictionary dct;
+            dct.add("solver",    word("smoothSolver"));
+            dct.add("smoother",  word("symGaussSeidel"));
+            dct.add("tolerance", scalar(0));
+            dct.add("relTol",    scalar(0));
+            dct.add("maxIter",   n);
+            const SolverPerformance<vector> sp = Urung.solve(dct);
+            os << n << ' ' << sp.initialResidual().x() << ' ' << sp.finalResidual().x() << nl;
+        }
+        U == Usolved;
     }
 
     // U straight out of the momentum predictor. UEqn.H() below is built from THIS U, not the field the
