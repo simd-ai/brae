@@ -1190,7 +1190,50 @@ int runSimpleFoamV2(const std::string& caseDir)
                             te.bounded ? "bounded " : "", te.scheme.empty() ? "upwind" : te.scheme.c_str());
         }
 
-        // Seed nuEff from the nut just read, so iteration 1 already uses it.
+        // turbulence->validate() (simpleFoam.C:92), which is NOT a no-op: eddyViscosity::validate() is
+        // correctNut(), so OpenFOAM enters its FIRST momentum assembly with nut rebuilt from the initial
+        // k and omega rather than with whatever 0/nut holds. The tutorials ship `nut uniform 0`; on T3A
+        // correctNut gives 1.8e-04 against nu 1.5e-05, so reading the file left brae's first momentum
+        // equation THIRTEEN TIMES less viscous than OpenFOAM's -- a laminar first iteration under a
+        // turbulent name. Measured against tools/dumpSimpleFoam at iteration 1: nuEff 9.2e-01, the
+        // momentum diagonal 3.6e-01, rAU 3.8e-01, HbyA 4.9e-02. With this in place all four read 1e-13,
+        // and one whole SIMPLEC step from OpenFOAM's converged field agrees to 8e-09 on the velocity
+        // increment and 2.7e-07 on the pressure increment.
+        //
+        // The strain takes the UNLIMITED grad(U), which is what the per-iteration correct() below passes
+        // as well. A case naming `grad(U) cellLimited` is already not honoured by the closure, and
+        // limiting only here would make the startup and the loop disagree with each other.
+        if (ras)
+        {
+            if (sstModel)
+            {
+                // correctNut(2*magSqr(symm(grad(U)))): nut = a1*k/max(a1*omega, b1*F23*sqrt(S2)),
+                // kOmegaSSTBase.C. dEps carries omega on this model.
+                DeviceBuffer<scalar> gradU, S2, F2;
+                deviceGradU(dm, dbU, gf.Ux, gf.Uy, gf.Uz, gradU);
+                deviceS2(gradU, static_cast<int>(nC), S2);
+                deviceF2(dK, dEps, dY, nu, sstCoeffs, F2);
+                deviceNutSST(dK, dEps, F2, S2, sstCoeffs, dNut);
+            }
+            else if (saModel)
+            {
+                // SpalartAllmaras::correctNut: nut = nuTilda*fv1(nuTilda/nu). nuTilda rides dK.
+                deviceNutSA(dK, nu, saCoeffs.Cv1, dNut);
+            }
+            else if (keCoeffs.realizable)
+            {
+                DeviceBuffer<scalar> gradU, rCmu, magS;
+                deviceGradU(dm, dbU, gf.Ux, gf.Uy, gf.Uz, gradU);
+                deviceRealizableStrain(gradU, dK, dEps, keCoeffs.A0, static_cast<int>(nC), rCmu, magS);
+                deviceRealizableNut(rCmu, dK, dEps, dNut);
+            }
+            else
+            {
+                deviceNut(dK, dEps, dNut, keCoeffs);   // kEpsilon: nut = Cmu*k^2/epsilon
+            }
+        }
+
+        // Seed nuEff from the nut validate() has just rebuilt, so iteration 1 already uses it.
         {
             refreshBoundaryNut();
             const std::vector<scalar> nutC = dNut.host(), nutB = nb.host();

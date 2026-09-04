@@ -1030,6 +1030,15 @@ add_test(NAME lm_cuda_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A 269)
 set_tests_properties(lm_cuda_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
 
+# turbulence->validate() (simpleFoam.C:92) is correctNut(), so OpenFOAM's FIRST momentum assembly runs on
+# nut rebuilt from the initial k and omega and not on the case's `nut uniform 0`. Oracle: dumpSimpleFoam's
+# stage_nuEff/stage_UDiag0/stage_rAU at iteration 1. Control: the file's own nut, which must disagree --
+# it is the laminar first iteration this used to run.
+add_test(NAME validate_nut_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_nut_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A)
+set_tests_properties(validate_nut_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
 # The cyclicAMI CUDA path against the _cpp REFERENCE, stage by stage: interpolation (scalar and rotated
 # vector), face value, both matrix assemblies with their diagonals, the matrix action, the interface
 # flux, UEqn.H()'s interface term and the interface's share of div(phi). Twelve checks at 1e-12; they
