@@ -250,15 +250,20 @@ std::vector<std::vector<tensor>> gradUBoundary(
         const FvPatch& fp = patches[pi];
         gb[pi].assign(fp.size, tensor{0,0,0,0,0,0,0,0,0});
         if (fp.type == "empty") continue;   // empty patches contribute nothing to fvc operations
-        const std::vector<vector>& uv = U.boundary[pi]->value();
+        // THE PATCH'S OWN snGrad(), as OF's gaussGrad::correctBoundaryConditions asks for it
+        // (gaussGrad.C: `gGradbf[patchi] += n*(vsf.boundaryField()[patchi].snGrad() - (n & gGradbf))`).
+        // This used to inline (U_b - U_c)*deltaCoeffs, which is the BASE class's formula and wrong on
+        // every class that overrides it -- zeroGradient (exactly zero), fixedGradient (the prescribed
+        // gradient) and the mixed family, whose snGrad uses the CURRENT valueFraction while value() still
+        // carries the blend of the previous one. See fv_patch_field.cuh's snGrad for the measurement.
+        const std::vector<vector> sn = U.boundary[pi]->snGrad(U.internal);
         for (label i = 0; i < fp.size; ++i)
         {
             const label c  = fp.faceCells[i];
             const label gf = fp.start + i;
             const vector n = (1.0 / magSf[gf]) * Sf[gf];                       // unit normal
-            const vector snGrad = (uv[i] - U.internal[c]) * fp.deltaCoeffs[i]; // (U_b - U_c)/d
             const tensor& gc = gradUcell[c];                                   // extrapolated cell grad
-            gb[pi][i] = gc + outer(n, snGrad - dot(n, gc));                    // normal comp -> snGrad
+            gb[pi][i] = gc + outer(n, sn[i] - dot(n, gc));                     // normal comp -> snGrad
         }
     }
     return gb;

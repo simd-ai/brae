@@ -123,6 +123,48 @@ public:
     virtual std::vector<T> gradientInternalCoeffs() const { return std::vector<T>(patch_.size, T{}); }
     virtual std::vector<T> gradientBoundaryCoeffs() const { return std::vector<T>(patch_.size, T{}); }
 
+    // OF fvPatchField::snGrad() -- deltaCoeffs*(value - patchInternalField) on the base class
+    // (fvPatchField.C), and a DIFFERENT expression on several derived ones, which is why this is a
+    // virtual and not a formula at the call site.
+    //
+    // WHY IT CANNOT BE (value - patchInternalField)*deltaCoeffs EVERYWHERE. Those agree only while
+    // `value` is the evaluate() of the coefficients the patch currently holds. OpenFOAM runs updateCoeffs
+    // inside the fvMatrix constructor and evaluates only later, at the solve's correctBoundaryConditions,
+    // so during an assembly a mixed patch holds a NEW valueFraction beside a value blended with the OLD
+    // one -- and gaussGrad::correctBoundaryConditions (gaussGrad.C) asks for snGrad() right there,
+    // mid-assembly. Rebuilt from OpenFOAM's own state, naca0012's freestreamVelocity inlet read a
+    // boundary grad(U) 6.4e-04 out under the inline formula, the dev2 tensor with it, and fvc::div of
+    // that tensor -- the explicit half of divDevRhoReff -- 3.0e-07 out, while the diagonal,
+    // off-diagonals, internalCoeffs and boundaryCoeffs were all exact to 1e-15 (queue item 25).
+    virtual std::vector<T> snGrad(const std::vector<T>& internal) const
+    {
+        const std::vector<T> pif = patchInternalField(internal);
+        std::vector<T> r(static_cast<std::size_t>(patch_.size), T{});
+        for (label i = 0; i < patch_.size; ++i)
+            r[i] = patch_.deltaCoeffs[i] * (value_[i] - pif[i]);
+        return r;
+    }
+
+protected:
+    // snGrad rebuilt from the matrix coefficients, for the classes where OpenFOAM defines them to satisfy
+    //     snGrad == gradientInternalCoeffs*patchInternalField + gradientBoundaryCoeffs
+    // (mixed: gic = -vf*deltaCoeffs, gbc = vf*deltaCoeffs*refValue + (1-vf)*refGrad, so the sum is
+    // mixedFvPatchField::snGrad's lerp exactly; directionMixed the same by construction). Reusing them
+    // keeps ONE expression per class instead of a second copy free to drift from the one the laplacian is
+    // gated on. NOT valid on the base/calculated family, whose coefficients are zero while their snGrad
+    // is not -- hence a helper the classes opt into, not the default.
+    std::vector<T> snGradFromCoeffs(const std::vector<T>& internal) const
+    {
+        const std::vector<T> pif = patchInternalField(internal);
+        const std::vector<T> gic = gradientInternalCoeffs();
+        const std::vector<T> gbc = gradientBoundaryCoeffs();
+        std::vector<T> r(static_cast<std::size_t>(patch_.size), T{});
+        for (label i = 0; i < patch_.size; ++i) r[i] = cmptMul(gic[i], pif[i]) + gbc[i];
+        return r;
+    }
+
+public:
+
     // BC category for the on-device evaluator: 0 = extrapolated (zeroGradient/empty: value tracks the
     // internal cell, valueIC=1, gradIC=0); 1 = fixedValue (fixedValue/noSlip: value=ref, valueIC=0,
     // gradIC=-deltaCoeffs); 2 = calculated (value=ref but extrapolated coeffs).
@@ -583,6 +625,12 @@ public:
         this->value_ = this->patchInternalField(internal);
     }
     bool fixesValue() const override { return false; }
+    // OF zeroGradientFvPatchField::snGrad() returns a ZERO field (its .H), not a difference between a
+    // stored value and the cell: identically zero even when the cell has moved since the last evaluate.
+    std::vector<T> snGrad(const std::vector<T>&) const override
+    {
+        return std::vector<T>(static_cast<std::size_t>(this->patch_.size), T{});
+    }
 };
 
 // epsilonWallFunction: a zeroGradient boundary value, with the near-wall CELL constrained separately by
@@ -624,6 +672,10 @@ public:
             this->value_[i] = pif[i] + grad_[i] / this->patch_.deltaCoeffs[i];
     }
     bool fixesValue() const override { return false; }          // the VALUE is not fixed; the gradient is
+    // OF fixedGradientFvPatchField::snGrad() returns gradient_ (its .H) -- the prescribed gradient, not
+    // one re-derived from a value that may predate the last time the solver set it. fixedFluxPressure
+    // derives from this and has its gradient overwritten by constrainPressure every assembly.
+    std::vector<T> snGrad(const std::vector<T>&) const override { return grad_; }
     const std::vector<T>* refGradPtr() const override { return &grad_; }
 
     // THE BOUNDARY COEFFICIENTS, which this class described and did not implement. The comment above has
@@ -1122,6 +1174,14 @@ public:
     }
     bool mixedVelocitySign() const override { return velocitySign_; }
     // OF mixed coeffs with refGrad = 0 (host correctness; the device blends the same way in its kernels):
+    // OF mixedFvPatchField::snGrad() = lerp(refGrad, (refValue - patchInternalField)*deltaCoeffs,
+    // valueFraction) -- built here from the coefficients, which OF defines to sum to exactly that. THE
+    // valueFraction IS THE CURRENT ONE, which is the whole point: value() still carries the blend of the
+    // previous one until the next evaluate. See fvPatchField::snGrad above for what that cost on naca0012.
+    std::vector<T> snGrad(const std::vector<T>& internal) const override
+    {
+        return this->snGradFromCoeffs(internal);
+    }
     std::vector<T> gradientInternalCoeffs() const override        // -vf*deltaCoeffs
     {
         std::vector<T> r(this->patch_.size);
@@ -1492,6 +1552,13 @@ public:
         }
     }
 
+    // OF directionMixedFvPatchField::snGrad() =
+    //     (transform(vf, refValue) + transform(I - vf, pif + refGrad/deltaCoeffs) - pif)*deltaCoeffs,
+    // which this class's own coefficients are built to satisfy (see gradientBoundaryCoeffs below).
+    std::vector<T> snGrad(const std::vector<T>& internal) const override
+    {
+        return this->snGradFromCoeffs(internal);
+    }
     std::vector<T> gradientBoundaryCoeffs() const override        // snGrad - gic_k*pif
     {
         if constexpr (!std::is_same<T, vector>::value)

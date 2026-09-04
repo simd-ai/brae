@@ -467,6 +467,20 @@ Residuals rhoSimpleStep(
     // ---- UEqn.H ----
     RhoMomentumInput uin;
     uin.phi = &f.phi.internal;   uin.phiBnd = &f.phi.boundary;
+    // WHICH OpenFOAM STAGE THIS CORRESPONDS TO. dumpPEqn writes U TWICE -- stage_Uass before the matrix
+    // is built, stage_Upost after fvMatrix's constructor has run updateCoeffs on the boundaries -- and
+    // its header warns that a brae-side boundary which RECOMPUTES itself belongs against the second.
+    // This write sits after brae's own updateCoeffs equivalents (the flux switch, the freestream blend,
+    // flowRateInletVelocity, piov), so stage_Upost is the one to hold a BOUNDARY against.
+    //
+    // MEASURED 2026-09-03, and the distinction turned out not to bite on either fixture that has one of
+    // those patches: at iteration 2 the two stages are bit-identical on naca0012's freestreamVelocity
+    // inlet and on sbMatched's flowRateInletVelocity inlet (max|stage_Uass - stage_Upost| = 0.0). Both
+    // patches recompute from state that has not moved since the previous iteration's own updateCoeffs, so
+    // the recompute reproduces the stored value. The internal field is identical in both stages by
+    // construction. Recorded because the reasoning says they CAN differ and the measurement says they do
+    // not here -- so use stage_Upost for a boundary, but do not read a difference into a comparison that
+    // was made against stage_Uass on these two.
     sd.vectors("Uass", f.U.internal);
     {
         std::vector<std::vector<vector>> ub(patches.size());

@@ -99,6 +99,11 @@ BRAE_HD inline tensor outer(const vector& a, const vector& b)   // a (x) b : [i]
 {
     return {a.x*b.x, a.x*b.y, a.x*b.z, a.y*b.x, a.y*b.y, a.y*b.z, a.z*b.x, a.z*b.y, a.z*b.z};
 }
+// OF cmptMultiply: the componentwise product. A vector boundary coefficient is per COMPONENT (a mixed
+// patch can fix one direction and leave another free -- directionMixed does exactly that), so combining
+// a coefficient with a field is not a scalar multiply.
+BRAE_HD inline scalar cmptMul(scalar a, scalar b) { return a * b; }
+BRAE_HD inline vector cmptMul(const vector& a, const vector& b) { return {a.x*b.x, a.y*b.y, a.z*b.z}; }
 BRAE_HD inline scalar tr(const tensor& t)     { return t.xx + t.yy + t.zz; }
 BRAE_HD inline tensor transpose(const tensor& t) { return {t.xx, t.yx, t.zx, t.xy, t.yy, t.zy, t.xz, t.yz, t.zz}; }
 BRAE_HD inline scalar doubleDot(const tensor& a, const tensor& b)   // a && b

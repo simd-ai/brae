@@ -80,4 +80,54 @@ for f in stage_rAU stage_UIC stage_UBC stage_muEff stage_Uass; do
         || { echo "FAIL: dumpPEqn wrote no 1/$f"; tail -20 "$W/case/dump.log"; exit 1; }
 done
 
-"$BIN" "$W/case" 0 1
+"$BIN" "$W/case" 0 1 || exit 1
+
+# ---- ARM 2: naca0012, whose freestream U patch is the one the boundary gradient needs ------------
+#
+# WHY A SECOND FIXTURE. sbMatched's U patches are a flowRateInletVelocity (fixedValue) and an inletOutlet
+# whose valueFraction is 0 or 1 per face, and on all three of those OF's snGrad() IS the base class's
+# (value - patchInternalField)*deltaCoeffs -- so the arm above cannot tell that formula from the patch's
+# own. naca0012's freestreamVelocity carries a CONTINUOUS valueFraction, where the two part company:
+# OF's gaussGrad boundary correction asks the patch for snGrad() (gaussGrad.C), and a mixed patch answers
+# with the CURRENT valueFraction while value() still holds the blend of the previous one. brae inlined the
+# base formula and read a boundary grad(U) 6.4e-04 out on this inlet, the dev2 tensor with it, and
+# fvc::div of that tensor -- the explicit half of divDevRhoReff -- 3.0e-07 out, with the diagonal,
+# off-diagonals, internalCoeffs and boundaryCoeffs all exact to 1e-15 (queue item 25). The harness's own
+# `div of that tensor` row is what fails there, so this arm needs no bound of its own.
+#
+# Fail-proof, 2026-09-03, measured through this gate: with fvc::gradUBoundary back on the inline formula
+# the naca arm exits 1 -- `gradU BOUNDARY on inlet 6.4e-04`, `div of that tensor 3.0e-07 FAIL` -- while
+# the sbMatched arm above stays green at 8.3e-15 and 1.1e-14, which is the point: that fixture cannot
+# tell the two formulas apart.
+[ -f "${FOAM_TUTORIALS:-}/resources/geometry/NACA0012.obj.gz" ] \
+    || { echo "  (naca arm SKIPPED: the NACA0012 geometry is not in this OpenFOAM install)"; exit 0; }
+[ -d "$ROOT/validation/naca0012" ] || { echo "  (naca arm SKIPPED: fixture missing)"; exit 0; }
+cp -r "$ROOT/validation/naca0012" "$W/naca" || exit 1
+rm -rf "$W"/naca/[1-9]* "$W"/naca/0 "$W"/naca/log.*
+cp -r "$W/naca/0.orig" "$W/naca/0"
+# brae refuses an fvOptions file rather than dropping the constraint; the naca gates remove it on both
+# sides, and this arm compares the momentum assembly, which the limitTemperature constraint does not touch.
+rm -f "$W/naca/system/fvOptions"
+( cd "$W/naca" && mkdir -p constant/geometry \
+    && cp -f "$FOAM_TUTORIALS/resources/geometry/NACA0012.obj.gz" constant/geometry/ \
+    && blockMesh > log.blockMesh 2>&1 && transformPoints -scale '(1 0 1)' > log.transformPoints 2>&1 \
+    && extrudeMesh > log.extrudeMesh 2>&1 && topoSet > log.topoSet 2>&1 ) \
+    || { echo "FAIL: naca mesh"; exit 1; }
+python3 - "$W/naca" <<'PYNACA'
+import os, re, sys
+c = os.path.join(sys.argv[1], 'system/controlDict')
+s = open(c).read()
+s = re.sub(r'functions\s*\{.*?\n\}', 'functions\n{\n}', s, flags=re.S)
+for k, v in [('writeFormat', 'ascii'), ('writePrecision', '15'), ('endTime', '2'),
+             ('writeInterval', '1'), ('writeControl', 'timeStep'), ('startFrom', 'startTime'),
+             ('startTime', '0'), ('deltaT', '1')]:
+    s = re.sub(r'\b%s\s+[^;]*;' % k, '%s %s;' % (k, v), s)
+open(c, 'w').write(s)
+PYNACA
+# Iteration 2, not 1: at iteration 1 the freestream valueFraction is still the 0.5 both sides seed, so
+# value and valueFraction agree and the two snGrad formulas coincide -- the arm would pass either way.
+( cd "$W/naca" && BRAE_DUMP_STAGE_ITER=2 "$DUMP" > dump.log 2>&1 ) \
+    || { echo "FAIL: dumpPEqn did not run on naca"; tail -20 "$W/naca/dump.log"; exit 1; }
+[ -f "$W/naca/2/stage_UgradU" ] || { echo "FAIL: dumpPEqn wrote no naca 2/stage_UgradU"; exit 1; }
+echo "  ---- naca0012, iteration 2 (the freestreamVelocity boundary gradient) ----"
+"$BIN" "$W/naca" 1 2
