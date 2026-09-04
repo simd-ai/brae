@@ -112,7 +112,7 @@ Residuals simpleStep(
         // exactly zero, then both arms can skip the solve as fvMatrixSolve.C:164 does.
         const SolutionDirections solutionD = solutionDirections(patches);
         SolverPerformance upCmpt[3];
-        solveVector(Mp, f.U, m, patches, in.tolU, in.relTolU, in.maxIter, /*minIter*/0,
+        solveVector(Mp, f.U, m, patches, in.tolU, in.relTolU, in.maxIterU, in.minIterU,
                     /*solutionD*/nullptr, upCmpt);
         scalar uInitialResidual = 0.0;
         for (int cmpt = 0; cmpt < 3; ++cmpt)
@@ -152,7 +152,7 @@ Residuals simpleStep(
     {
         const FvScalarMatrix pEqn = assemblePEqn(st, f.p, pi, m, g, patches);
         const SolverPerformance pp =
-            gamg(pEqn, f.p.internal, m, g, patches, in.tolP, in.relTolP, in.maxIter);
+            gamg(pEqn, f.p.internal, m, g, patches, in.tolP, in.relTolP, in.maxIterP);
         if (res.find("p") == res.end()) res["p"] = pp.initialResidual;   // the FIRST solve's residual
         f.p.evaluateBoundary();
 

@@ -92,7 +92,15 @@ struct StepInput
     // step cannot derive it -- it sees a DeviceMesh, from which a patch TYPE cannot be recovered.
     int    solutionD[3] = {1, 1, 1};
     scalar tolP = 1e-10, relTolP = 0.0;
-    int    maxIter = 2000;
+    // PER FIELD, because lduMatrix::solver::readControls (lduMatrixSolver.C:190-208) reads minIter and
+    // maxIter out of THAT field's own solver sub-dictionary, defaulting to 0 and
+    // lduMatrix::defaultMaxIter = 1000 (lduMatrix.H:125). There used to be ONE maxIter here, read from
+    // the `p` entry and handed to the momentum solve as well: validation/T3A caps
+    // `"(U|k|omega|gammaInt|ReThetat)"` at 10 and says nothing about p, so brae ran U at 1000 where
+    // OpenFOAM stops at 10. A cap is a statement about the ANSWER, not a performance hint -- two solvers
+    // stopped by a cap hold two different residuals.
+    int    maxIterU = 1000, minIterU = 0;
+    int    maxIterP = 1000, minIterP = 0;
     // V-cycle graph replay and PCG residual-read cadence. NOTE: on CUDA >= 13 deviceAMGPCG dispatches
     // first to its DEVICE-RESIDENT conditional-graph PCG (BRAE_PCG_DEVICE, default on), which captures
     // the whole Krylov loop and ignores both of these -- measured A/B: 17.9 s on vs 18.7 s off at 440k.

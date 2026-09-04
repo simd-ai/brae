@@ -255,7 +255,7 @@ int main(int argc, char** argv)
             {
                 FvVectorMatrix rMp = rU;
                 cpu::addPressureGradient(rMp, fPre.p, m, g, fvp);
-                solveVector(rMp, fPre.U, m, fvp, cin.tolU, cin.relTolU, cin.maxIter);
+                solveVector(rMp, fPre.U, m, fvp, cin.tolU, cin.relTolU, cin.maxIterU);
             }
             cpu::PressureInput rpin;
             rpin.pRefCell = fPre.pRefCell; rpin.pRefValue = fPre.pRefValue;

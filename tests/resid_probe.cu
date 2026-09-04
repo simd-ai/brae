@@ -133,7 +133,7 @@ int main(int argc, char** argv)
         in.relaxU = 0.7; in.relaxP = 0.3;
         in.tolU = 1e-8; in.relTolU = 0.1;
         in.tolP = 1e-6; in.relTolP = 0.1;
-        in.maxIter = 1000;
+        in.maxIterU = 1000;  in.maxIterP = 1000;
         for (int i = 0; i < iters; ++i) cpu::simpleStep(f, ctl, in, m, g, fvp);
         scalar du = 0, mu = 0, dp = 0, mp = 0;
         for (label c = 0; c < nC; ++c)

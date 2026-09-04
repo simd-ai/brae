@@ -1042,6 +1042,14 @@ set_tests_properties(lm_cuda_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS s
 # brae routes `smoothSolver` + `symGaussSeidel` to a MULTICOLOUR Gauss-Seidel sweep where
 # symGaussSeidelSmoother.C sweeps in index order -- same stopping rule, less smoothing per sweep. It was
 # announced nowhere and the run log said "as the case asks". Positive + two controls, no GPU and no OF.
+# lduMatrix::solver::readControls reads minIter and maxIter from EACH FIELD'S own entry
+# (lduMatrixSolver.C:190-208). The V2 driver read one maxIter from `p` and gave it to U as well, and
+# minIter reached no solver at all. Oracle: OpenFOAM's own iteration counts under the same cap and floor.
+add_test(NAME solver_iterbounds_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/solver_iterbounds_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO)
+set_tests_properties(solver_iterbounds_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
 add_test(NAME gs_smoother_notice
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/gs_smoother_notice.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A)

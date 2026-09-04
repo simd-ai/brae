@@ -217,9 +217,11 @@ Residuals simpleStep(
             // Internal-face LDU only -- no coupled interfaces, which this path refuses anyway.
             DeviceSolverPerf perf;
             if (in.uSymGaussSeidel)
-                deviceSymGaussSeidel(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIter, &perf);
+                deviceSymGaussSeidel(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIterU, &perf,
+                                     in.minIterU);
             else
-                perf = deviceJacobiBiCGStab(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIter);
+                perf = deviceJacobiBiCGStab(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIterU,
+                                            /*checkEvery*/1, in.minIterU);
             // The REPORT is masked even where the solve is not: the empty direction's system has a ~0
             // right-hand side and a ~0 field, so its normFactor-scaled residual never leaves O(0.1)
             // (measured on simpleBoxIO: Uz 7.945e-01 at iteration 1, still 9.724e-02 at 15) and a max
@@ -315,8 +317,8 @@ Residuals simpleStep(
 
         const scalar nf = deviceNormFactor(A, f.p, b, w.ones);
         const DeviceSolverPerf perf =
-            deviceAMGPCG(A, w.amg, b, f.p, nf, in.tolP, in.relTolP, in.maxIter,
-                         in.captureVcycle, in.pcgCheckEvery);
+            deviceAMGPCG(A, w.amg, b, f.p, nf, in.tolP, in.relTolP, in.maxIterP,
+                         in.captureVcycle, in.pcgCheckEvery, /*corrScaling*/false, in.minIterP);
         if (corr == 1) res["p"] = perf.initialResidual;   // the FIRST solve's residual, as OpenFOAM reports
         // Solver-iteration counts, on demand. The wall-clock question on this path turned out to be "how
         // many Krylov iterations", not "how fast is a kernel": every iteration ends in a scalar

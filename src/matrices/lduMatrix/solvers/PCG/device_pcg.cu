@@ -165,7 +165,12 @@ DeviceSolverPerf deviceJacobiBiCGStab(
             {
                 deviceSumMagInto(sA, s.sNorm.data());
                 perf.finalResidual = deviceReadScalar(s.sNorm.data()) / normFactor;
-                if (converged(perf.finalResidual))
+                // OF guards this mid-iteration return with the minIter floor as well as the convergence
+                // test (PBiCGStab.C:222-224, `solverPerf.nIterations() >= minIter_ && checkConvergence`).
+                // Unguarded, a case asking `minIter 5` got 1: the do-while below honoured the floor but
+                // this exit left before it ever came round. Measured on validation/simpleBoxIO with
+                // `minIter 5` on U -- OpenFOAM 5 sweeps, brae 1.
+                if (nIter >= minIter && converged(perf.finalResidual))
                 {
                     deviceAxpyDev(s.alpha.data(), yA, psi);
                     ++nIter;

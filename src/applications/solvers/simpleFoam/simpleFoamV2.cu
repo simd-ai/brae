@@ -1467,16 +1467,25 @@ int runSimpleFoamV2(const std::string& caseDir)
     // does not give a wrong answer, it gives the right answer for roughly ten times the linear-algebra
     // work: measured 614 fine-grid SpMV per SIMPLE iteration against the existing solver's 62.
     //
-    // maxIter follows OpenFOAM's lduMatrix::solver default of 1000, and is READ, because an `maxIter 10`
-    // in a case is a cap on the answer and not a performance hint.
+    // maxIter and minIter follow OpenFOAM's lduMatrix::solver defaults (1000 and 0) and are READ FROM
+    // EACH FIELD'S OWN ENTRY, because lduMatrix::solver::readControls does (lduMatrixSolver.C:190-208)
+    // and because an `maxIter 10` in a case is a cap on the ANSWER, not a performance hint: two solvers
+    // stopped by a cap hold two different residuals. This used to read maxIter from the `p` entry alone
+    // and hand it to the momentum solve as well: validation/T3A caps
+    // `"(U|k|omega|gammaInt|ReThetat)"` at 10 and says nothing about p, so brae ran U at 1000 against
+    // OpenFOAM's 10. Honouring it does NOT change T3A's fate -- measured cold, iteration 100 reads
+    // 2.53e-02 against 2.58e-02 before, and the case still leaves its basin by 200. The 5.2e-04 that an
+    // earlier experiment saw came from capping `p` at 10, which OpenFOAM does not do; that is a lead
+    // about brae's pressure step, not a fidelity fix, and it is not applied here.
     if (const FoamDict* solvers = fvSolution.subDict("solvers"))
     {
         // subDict resolves OpenFOAM regex keys, so `"(U|k|epsilon|omega|f|v2)"` is found by "U".
         if (const FoamDict* sp = solvers->subDict("p"))
         {
-            in.tolP    = sp->scalarOr("tolerance", in.tolP);
-            in.relTolP = sp->scalarOr("relTol", 0.0);
-            in.maxIter = static_cast<int>(sp->scalarOr("maxIter", 1000));
+            in.tolP     = sp->scalarOr("tolerance", in.tolP);
+            in.relTolP  = sp->scalarOr("relTol", 0.0);
+            in.maxIterP = static_cast<int>(sp->scalarOr("maxIter", 1000));
+            in.minIterP = static_cast<int>(sp->scalarOr("minIter", 0));
         }
         // k and epsilon take their own entry, which in most tutorials is the same regex key as U's.
         if (const FoamDict* sk = solvers->subDict("k"))
@@ -1496,8 +1505,10 @@ int runSimpleFoamV2(const std::string& caseDir)
         }
         if (const FoamDict* su = solvers->subDict("U"))
         {
-            in.tolU    = su->scalarOr("tolerance", in.tolU);
-            in.relTolU = su->scalarOr("relTol", 0.0);
+            in.tolU     = su->scalarOr("tolerance", in.tolU);
+            in.relTolU  = su->scalarOr("relTol", 0.0);
+            in.maxIterU = static_cast<int>(su->scalarOr("maxIter", 1000));
+            in.minIterU = static_cast<int>(su->scalarOr("minIter", 0));
             // OpenFOAM's SELECTION, exactly: `solver smoothSolver` + a GaussSeidel-family smoother.
             // The selection is matched; the ALGORITHM is not -- brae's sweep is multicolour where
             // OpenFOAM's is index order (see the envelope notice above, and device_amg.cuh). Anything
@@ -1513,8 +1524,13 @@ int runSimpleFoamV2(const std::string& caseDir)
                             "method and iteration count.\n", usolv.c_str());
         }
     }
-    std::printf("  linear solves: p tol=%.1e relTol=%.3g   U tol=%.1e relTol=%.3g   maxIter=%d\n",
-                in.tolP, in.relTolP, in.tolU, in.relTolU, in.maxIter);
+    // minIter is printed beside maxIter because it is the same kind of statement: a floor on how far the
+    // solve runs, read from the field's own entry, and a case that sets one has said something about the
+    // answer it wants.
+    std::printf("  linear solves: p tol=%.1e relTol=%.3g maxIter=%d minIter=%d   "
+                "U tol=%.1e relTol=%.3g maxIter=%d minIter=%d\n",
+                in.tolP, in.relTolP, in.maxIterP, in.minIterP,
+                in.tolU, in.relTolU, in.maxIterU, in.minIterU);
     // Both are pure execution strategy -- same matrix, same stopping criterion -- so they are on by
     // default and env-overridable for A/B measurement rather than being case settings.
     // The AMG hierarchy is already reused across ITERATIONS (SolverWorkspace::amgBuilt); this reuses it

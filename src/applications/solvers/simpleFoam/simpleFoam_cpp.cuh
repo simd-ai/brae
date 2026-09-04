@@ -111,7 +111,12 @@ struct StepInput
     scalar relaxP = 0.3;                         // relaxationFactors/fields p
     scalar tolU = 1e-10, relTolU = 0.0;
     scalar tolP = 1e-10, relTolP = 0.0;
-    int    maxIter = 2000;
+    // PER FIELD -- lduMatrix::solver::readControls (lduMatrixSolver.C:190-208) reads minIter and maxIter
+    // from that field's OWN entry (defaults 0 and lduMatrix::defaultMaxIter = 1000). See the device
+    // twin's note: one shared maxIter, read from `p`, ran T3A's momentum solve at 1000 against
+    // OpenFOAM's 10.
+    int    maxIterU = 1000, minIterU = 0;
+    int    maxIterP = 1000, minIterP = 0;
     bool   correctedLaplacian = false;           // `corrected` laplacianSchemes
     scalar snGradLimitCoeff = 0.0;               // `limited <k> corrected` (OF limitedSnGrad)
     bool   bounded = false;                      // div(phi,U) `bounded`
