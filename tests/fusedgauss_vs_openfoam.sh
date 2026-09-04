@@ -154,7 +154,13 @@ print("  3. brae fusedGauss vs OpenFOAM fusedGauss")
 # Set just above where brae lands (U 1.0e-04, p 3.6e-04, k 7.8e-04, epsilon 9.6e-04,
 # nut 1.3e-03) -- which is TIGHTER than OpenFOAM's own two spellings differ from each other,
 # because brae runs identical code for both and has no reordered summation of its own.
-BOUND = {'U': 3e-04, 'p': 1e-03, 'k': 2e-03, 'epsilon': 3e-03, 'nut': 4e-03}
+# TIGHTENED 2026-09-04, and the reason is the whole of queue item 42. brae's residual turbulence error on
+# this fixture WAS the k/epsilon laplacian's non-orthogonal correction, which the V2 driver hardcoded off:
+# the k error read 7.759e-04 against an OpenFOAM-vs-OpenFOAM measurement of what that correction is worth
+# on pitzDaily, 7.759e-04 -- the same number to four significant figures. With the case's own scheme
+# forwarded the five errors fell to U 4.224e-05, p 8.145e-05, k 1.261e-04, epsilon 6.893e-04,
+# nut 6.182e-04, so the bounds come down with them (about 4x the measured value, epsilon already there).
+BOUND = {'U': 2e-04, 'p': 4e-04, 'k': 6e-04, 'epsilon': 3e-03, 'nut': 3e-03}
 errOn = {}
 for f in FIELDS:
     e = rel(read(dirs['brae_fused'], f), read(dirs['of_fused'], f))

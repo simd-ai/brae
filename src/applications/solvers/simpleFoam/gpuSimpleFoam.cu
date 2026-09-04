@@ -655,17 +655,32 @@ int main(int argc, char** argv)
                 const double _et = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - _runStart).count();
                 const double cl = (double)deltaT * r.contLocal, cg = (double)deltaT * r.contGlobal;
                 _cumCont += cg;
+                // The SOLVER NAME in this line is brae's own, not OpenFOAM's, and that is deliberate.
+                // The line is otherwise OpenFOAM's format so a log can be diffed against one, but the
+                // prefix used to read `smoothSolver:` and `GAMG:` whatever brae actually ran -- a log
+                // asserting a capability the code does not have, which is the defect class this repo has
+                // already paid for once. brae's symGaussSeidel is a MULTICOLOUR sweep (device_amg.cuh)
+                // and its p solver is an AMG-preconditioned PCG; both are announced as substitutions by
+                // the shared reader (solvers/common/linear_solver_setup.cuh). Every gate that parses
+                // this log matches on `Solving for <field>, Initial residual = ...` and none anchors on
+                // the prefix, so naming it honestly costs nothing.
+                const char* uSolv = ctl.gsU ? "smoothSolver[multicolour symGaussSeidel]" : "Jacobi-BiCGStab";
                 std::printf("Time = %d\n\n"
-                            "smoothSolver:  Solving for Ux, Initial residual = %g, Final residual = %g, No Iterations %d\n"
-                            "smoothSolver:  Solving for Uy, Initial residual = %g, Final residual = %g, No Iterations %d\n"
-                            "smoothSolver:  Solving for Uz, Initial residual = %g, Final residual = %g, No Iterations %d\n"
-                            "GAMG:  Solving for p, Initial residual = %g, Final residual = %g, No Iterations %d\n"
+                            "%s:  Solving for Ux, Initial residual = %g, Final residual = %g, No Iterations %d\n"
+                            "%s:  Solving for Uy, Initial residual = %g, Final residual = %g, No Iterations %d\n"
+                            "%s:  Solving for Uz, Initial residual = %g, Final residual = %g, No Iterations %d\n"
+                            "AMG-PCG:  Solving for p, Initial residual = %g, Final residual = %g, No Iterations %d\n"
                             "time step continuity errors : sum local = %g, global = %g, cumulative = %g\n",
-                            iter, r.Ux, r.UxFinal, r.UxIters, r.Uy, r.UyFinal, r.UyIters, r.Uz, r.UzFinal, r.UzIters,
+                            iter,
+                            uSolv, r.Ux, r.UxFinal, r.UxIters,
+                            uSolv, r.Uy, r.UyFinal, r.UyIters,
+                            uSolv, r.Uz, r.UzFinal, r.UzIters,
                             r.p, r.pFinal, r.pIters, cl, cg, _cumCont);
+                const char* kSolv = ctl.gsK ? "smoothSolver[multicolour symGaussSeidel]" : "Jacobi-BiCGStab";
                 for (const auto& e : turbulenceReport())   // Solving for omega/k/epsilon/... in solve order, like OF
-                    std::printf("smoothSolver:  Solving for %s, Initial residual = %g, Final residual = %g, No Iterations %d\n",
-                                e.field.c_str(), e.perf.initialResidual, e.perf.finalResidual, e.perf.nIterations);
+                    std::printf("%s:  Solving for %s, Initial residual = %g, Final residual = %g, No Iterations %d\n",
+                                kSolv, e.field.c_str(), e.perf.initialResidual, e.perf.finalResidual,
+                                e.perf.nIterations);
                 std::printf("ExecutionTime = %.2f s  ClockTime = %.0f s\n\n", _et, _et);
             }
             // NaN/divergence guard: a non-finite momentum/pressure residual means the solve blew up (FP32 overflow,

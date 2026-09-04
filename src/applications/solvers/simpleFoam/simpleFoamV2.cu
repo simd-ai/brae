@@ -69,26 +69,34 @@ bool fileExists(const std::string& p)
 // conservative. The rebuilt UEqn does not implement it.
 bool divUBounded(const std::string& caseDir);
 
-std::string divUScheme(const std::string& caseDir)
+// The div(phi,U) ENTRY, as OpenFOAM's schemesLookup resolves it: the explicit entry when the dictionary
+// has one, else `default` (schemesLookupDetail.C:76-88). Shared by the scheme lookup and the gradient
+// lookup below so the two cannot drift apart -- the gradient lookup used to search the WHOLE divSchemes
+// block for `linearUpwind <name>`, which takes whichever statement comes first: a case with
+// `div(phi,k) bounded Gauss linearUpwind grad(k)` written ABOVE `div(phi,U) bounded Gauss linearUpwind
+// grad(U)` was measured reporting grad(k)'s coefficient for div(phi,U).
+std::string divUEntry(const std::string& text)
 {
-    std::string text;
-    try { text = readFvSchemesText(caseDir); } catch (...) { return ""; }
     const std::size_t blk = text.find("divSchemes");
     if (blk == std::string::npos) return "";
     const std::size_t open = text.find('{', blk);
     const std::size_t close = text.find('}', open == std::string::npos ? blk : open);
     if (open == std::string::npos) return "";
-    // Prefer the explicit div(phi,U) entry; fall back to `default`.
+    const std::string blkText = text.substr(open, (close == std::string::npos ? text.size() : close) - open);
     static const std::regex re(R"(div\(phi,U\)\s*([^;]*);)");
     std::smatch mm;
-    std::string blkText = text.substr(open, (close == std::string::npos ? text.size() : close) - open);
-    std::string entry;
-    if (std::regex_search(blkText, mm, re)) entry = mm[1].str();
-    else
-    {
-        static const std::regex rd(R"(default\s+([^;]*);)");
-        if (std::regex_search(blkText, mm, rd)) entry = mm[1].str();
-    }
+    if (std::regex_search(blkText, mm, re)) return mm[1].str();
+    static const std::regex rd(R"(default\s+([^;]*);)");
+    if (std::regex_search(blkText, mm, rd)) return mm[1].str();
+    return "";
+}
+
+
+std::string divUScheme(const std::string& caseDir)
+{
+    std::string text;
+    try { text = readFvSchemesText(caseDir); } catch (...) { return ""; }
+    const std::string entry = divUEntry(text);
     std::string last;
     std::regex tok(R"([^\s]+)");
     for (std::sregex_iterator it(entry.begin(), entry.end(), tok), e; it != e; ++it)
@@ -180,23 +188,39 @@ std::string linearUpwindGradUnsupported(const std::string& caseDir, scalar* limi
     std::string text;
     try { text = readFvSchemesText(caseDir); } catch (...) { return ""; }
 
-    // 1. the name linearUpwind gives -- the word immediately after it in the div(phi,U) entry.
-    std::string gradName = "default";
+    // 1. the gradient the SCHEME names -- the word straight after it on div(phi,U)'s own stream.
+    //
+    // This was `std::regex(R"(linearUpwind\s+([^\s;]+))")` searched over the whole divSchemes block, and
+    // it had three holes. It cannot match `linearUpwindV grad(U)` (the next character is `V`, not
+    // whitespace) or `LUST grad(U)` at all, so both fell back to `default`: measured on staged pitzDaily
+    // copies sharing `grad(U) cellLimited Gauss linear 1`, the linearUpwind copy reported the case's
+    // coefficient and the linearUpwindV and LUST copies reported nothing, character-for-character
+    // identical to a case with no entry. And searching the block rather than the entry takes whichever
+    // statement comes first. All three schemes read the name the same way -- linearUpwind.H:105/:117,
+    // linearUpwindV.H:117-135, and LUST.H, whose ctor hands the stream straight to linearUpwind -- and
+    // no other scheme brae implements reads one at all, so anything else stops here with no gradient
+    // rather than reporting `default` under a scheme name that never asked for one.
+    std::string gradName;
     {
-        const std::size_t blk = text.find("divSchemes");
-        if (blk != std::string::npos)
+        const std::string entry = divUEntry(text);
+        static const std::regex tokRe(R"([^\s]+)");
+        static const std::regex numRe(R"([-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?)");
+        std::string scheme;
+        for (std::sregex_iterator it(entry.begin(), entry.end(), tokRe), e; it != e; ++it)
         {
-            const std::size_t open = text.find('{', blk);
-            const std::size_t close = text.find('}', open == std::string::npos ? blk : open);
-            if (open != std::string::npos)
+            const std::string w = it->str();
+            if (scheme.empty())
             {
-                const std::string b =
-                    text.substr(open, (close == std::string::npos ? text.size() : close) - open);
-                static const std::regex re(R"(linearUpwind\s+([^\s;]+))");
-                std::smatch mm;
-                if (std::regex_search(b, mm, re)) gradName = mm[1].str();
+                if (w == "Gauss" || w == "bounded" || w == "none") continue;
+                if (std::regex_match(w, numRe)) continue;
+                scheme = w;
+                continue;
             }
+            gradName = w;      // the word straight after the scheme is its gradSchemeName_
+            break;
         }
+        if (scheme != "linearUpwind" && scheme != "linearUpwindV" && scheme != "LUST") return "";
+        if (gradName.empty()) gradName = "default";
     }
 
     // 2-3. that name's entry, classified. Shared with gradUSchemeUnsupported below.
@@ -518,11 +542,13 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
                                  "`linearUpwind`, `linearUpwindV`, `limitedLinear`, `limitedLinearV` and "
                                  "`LUST`. Running it "
                                  "anyway would solve a different discretisation than the case specifies.");
-        if (sc == "linearUpwind" || sc == "linearUpwindV")
+        // LUST reads a gradient name too -- its ctor hands the stream straight to linearUpwind (LUST.H) --
+        // so a LUST case naming a gradient brae cannot compute was RUN rather than refused.
+        if (sc == "linearUpwind" || sc == "linearUpwindV" || sc == "LUST")
         {
             const std::string bad = linearUpwindGradUnsupported(caseDir, nullptr);
             if (!bad.empty())
-                r.blockers.push_back("div(phi,U) is `linearUpwind`, whose named gradient resolves to `" +
+                r.blockers.push_back("div(phi,U) is `" + sc + "`, whose named gradient resolves to `" +
                                      bad + "` in gradSchemes; brae computes a plain Gauss linear gradient. "
                                      "This correction does not vanish at convergence, so running it would "
                                      "be wrong rather than merely slower to converge.");
@@ -1520,7 +1546,13 @@ int runSimpleFoamV2(const std::string& caseDir)
                                              nu, relaxK, tolKE,
                                              boundedK, limitedK, twoBykK,
                                              dsa, relTolKE, /*checkEvery*/1,
-                                             linearUpwindK, /*nonOrth*/false, gsKE,
+                                             // SpalartAllmaras's own laplacian takes the case's scheme
+                                             // too. validation/airFoil2D names
+                                             // `div(phi,nuTilda) bounded Gauss linearUpwind grad(nuTilda)`
+                                             // beside `laplacianSchemes default Gauss linear corrected`,
+                                             // and sa_cuda_vs_openfoam bounds nuTilda at 3e-02 with U at
+                                             // 3e-04 -- so this false was live on a gated fixture.
+                                             linearUpwindK, nonOrthLaplacian, gsKE,
                                              /*ami*/nullptr, /*cyc*/nullptr, /*ntDdt*/{},
                                              /*des*/false, /*iddes*/false, /*hmax*/nullptr,
                                              /*hwn*/nullptr, /*lesDelta*/nullptr, /*wallN*/nullptr,
@@ -1584,7 +1616,17 @@ int runSimpleFoamV2(const std::string& caseDir)
                                   boundedK, boundedEps,
                                   limitedK, limitedEps, twoBykK, twoBykEps,
                                   keCoeffs, relTolKE, /*keCheckEvery*/1,
-                                  /*linearUpwindK*/false, /*linearUpwindEps*/false, /*nonOrth*/false,
+                                  // The case's OWN turbulence div and laplacian schemes. These were three
+                                  // hardcoded `false`s while the SST call forty lines above forwarded the
+                                  // very same variables, and while the driver printed what the case asked
+                                  // for. Measured on validation/pitzDaily at 1000 iterations with every
+                                  // linear solve pinned: brae reproduced the SUBSTITUTED equations to
+                                  // eleven digits (U 1.29e-11, k 3.01e-11 against OpenFOAM run with
+                                  // upwind + orthogonal) while sitting U 5.98e-03 / k 2.08e-02 from
+                                  // OpenFOAM running the case's own dictionary -- a ratio of 4.6e+08. The
+                                  // written k, epsilon, nut, U and p were BYTE-IDENTICAL with
+                                  // `linearUpwind` and with `upwind` on div(phi,k), 5 iterations of 5.
+                                  linearUpwindK, linearUpwindEps, nonOrthLaplacian,
                                   gsKE, gsKE,
                                   /*ami*/nullptr, /*cyc*/nullptr,
                                   static_cast<int>(v2NutWall), atmZ0, atmBoundNut,   // near-wall G0 uses the BC-chosen wall nut
@@ -1856,8 +1898,8 @@ int runSimpleFoamV2(const std::string& caseDir)
         // OpenFOAM's own instead of 1.4x -- the correction does not vanish at convergence.
         linearUpwindGradUnsupported(caseDir, &in.gradULimitK);
         if (in.gradULimitK > 0.0)
-            std::printf("  div(phi,U) linearUpwind's named gradient: cellLimited Gauss linear %g\n",
-                        in.gradULimitK);
+            std::printf("  div(phi,U) %s's named gradient: cellLimited Gauss linear %g\n",
+                        sc.empty() ? "linearUpwind" : sc.c_str(), in.gradULimitK);
         std::printf("  div(phi,U) scheme: %s", sc.empty() ? "upwind" : sc.c_str());
         if (in.scheme == cpu::DivScheme::limitedLinear || in.scheme == cpu::DivScheme::limitedLinearV)
             std::printf(" %g", in.schemeCoeff);

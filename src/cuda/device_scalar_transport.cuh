@@ -485,6 +485,10 @@ void deviceSolveScalarTransport(
         stageDump(std::string("stage_resid_") + fieldName, r);
         stageDump(std::string("stage_resid_") + fieldName + "_normFactor", std::vector<scalar>(1, normF));
     }
+    // The smoothSolver SELECTION and stopping rule the case asked for; the SWEEP is brae's multicolour
+    // one, not symGaussSeidelSmoother's index order (device_amg.cuh). Announced by
+    // linear_solver_setup.cuh. nSweeps is not threaded here yet -- queue item 47 -- so this runs one
+    // sweep per residual evaluation whatever the case says, which the V2 envelope also announces.
     if (gs) deviceSymGaussSeidel(sv, B, field, normF, tol, relTolKE, 3000, &perf);
     // DILU when the case asks for it, Jacobi otherwise. NOT a cost choice: both reach the requested
     // relTol, but they stop in different places -- on turbulentFlatPlate:kEpsilon OpenFOAM's DILU solve

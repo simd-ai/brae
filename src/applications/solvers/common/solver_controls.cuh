@@ -187,8 +187,13 @@ struct DeviceSimpleControls
     scalar gradULimitK = 0.0;    // grad(U) "cellLimited Gauss linear <k>" coeff (OF cellLimitedGrad<minmod>); 0 = unlimited. Set from fvSchemes.
     bool   limitedK = false, limitedEps = false;  // div(phi,k|epsilon) "limitedLinear": implicit limited weight. Set from fvSchemes.
     bool   luK = false, luEps = false;             // div(phi,k|epsilon|nuTilda) "linearUpwind": deferred gradient correction. Set from fvSchemes.
-    bool   gsK = false, gsEps = false;             // scalar linear solver = smoothSolver+symGaussSeidel (read from fvSolution solvers.{k|nuTilda} / {epsilon|omega}).
-    bool   gsU = false;                            // momentum linear solver = smoothSolver+(sym)GaussSeidel (read from fvSolution solvers.U).
+    // "the case ASKED for smoothSolver + a GaussSeidel smoother", read from fvSolution
+    // solvers.{k|nuTilda} / {epsilon|omega} / U. It does NOT say brae runs OpenFOAM's smoother: brae's
+    // sweep is MULTICOLOUR where symGaussSeidelSmoother.C walks cells in index order, which is the same
+    // algorithm under a permutation and therefore a different iterate after n sweeps (device_amg.cuh
+    // carries the measurement). The substitution is announced by linear_solver_setup.cuh.
+    bool   gsK = false, gsEps = false;
+    bool   gsU = false;
     // fvSolution asked for `preconditioner DILU` on U (OF's default for the momentum equations, and the
     // entry brae used to substitute Jacobi for). Only meaningful on the BiCGStab path -- a smoothSolver
     // has no preconditioner in OF either.

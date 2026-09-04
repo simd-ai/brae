@@ -60,6 +60,47 @@ grep -q "AMG-preconditioned PCG" "$W/gs.out" && grep -q "AMG-preconditioned PCG"
     && say "CONTROL 2 the GAMG notice still fires in both, so the envelope is reporting" ok \
     || say "CONTROL 2 the GAMG notice still fires in both, so the envelope is reporting" FAIL
 
+# ARM 4 -- THE RUN LOG ITSELF. The legacy driver prints an OpenFOAM-FORMAT per-iteration report so a log
+# can be diffed against one, and its solver prefixes used to read `smoothSolver:` and `GAMG:` whatever
+# brae actually ran: a log asserting a capability the code does not have. Every gate that parses this log
+# matches on `Solving for <field>, Initial residual = ...` and none anchors on the prefix, so the prefix
+# now names what brae runs. Needs a GPU because it is a real solve; the three arms above do not.
+if command -v nvidia-smi > /dev/null 2>&1 && [ -d "$SRC/0.orig" ]; then
+    cp -r "$SRC" "$W/legacy"; rm -rf "$W"/legacy/[1-9]* "$W"/legacy/0 "$W"/legacy/log.*
+    cp -r "$W/legacy/0.orig" "$W/legacy/0"
+    python3 - "$W/legacy" <<'PYEOF'
+import re, sys
+c = sys.argv[1] + '/system/controlDict'; s = open(c).read()
+s = re.sub(r'endTime\s+\S+;', 'endTime         2;', s)
+s = re.sub(r'functions\s*\{.*\n\}', 'functions\n{\n}', s, flags=re.S)
+open(c, 'w').write(s)
+PYEOF
+    ( cd "$W/legacy" && "${BRAE_BIN:-$ROOT/build/brae}" "$W/legacy" > log.out 2> log.err ) \
+        || { echo "FAIL: the legacy driver crashed"; tail -8 "$W/legacy/log.err"; exit 1; }
+    if grep -q "Solving for Ux, Initial residual = " "$W/legacy/log.out"; then
+        say "ARM 4    the OpenFOAM-format report still parses (Solving for Ux, ...)" ok
+    else
+        say "ARM 4    the OpenFOAM-format report still parses (Solving for Ux, ...)" FAIL
+    fi
+    if grep -qE '^GAMG: *Solving for p' "$W/legacy/log.out"; then
+        say "ARM 4    the p line does NOT claim GAMG (brae runs AMG-PCG)" FAIL
+    else
+        say "ARM 4    the p line does NOT claim GAMG (brae runs AMG-PCG)" ok
+    fi
+    if grep -qE '^smoothSolver: *Solving' "$W/legacy/log.out"; then
+        say "ARM 4    no line claims OpenFOAM's bare smoothSolver" FAIL
+    else
+        say "ARM 4    no line claims OpenFOAM's bare smoothSolver" ok
+    fi
+    if grep -q "approximated. solvers/U smoother" "$W/legacy/log.err"; then
+        say "ARM 4    the legacy driver announces the sweep substitution too" ok
+    else
+        say "ARM 4    the legacy driver announces the sweep substitution too" FAIL
+    fi
+else
+    echo "  ARM 4    skipped: no GPU or no 0.orig in the fixture"
+fi
+
 [ $fail -eq 0 ] || { echo; echo "--- fixture ---"; cat "$W/gs.out"; echo "--- control ---"; cat "$W/krylov.out"; }
 [ $fail -eq 0 ] && echo "PASS: brae announces the Gauss-Seidel sweep substitution"
 exit $fail

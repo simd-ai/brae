@@ -1058,6 +1058,16 @@ set_tests_properties(lm_cuda_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS s
 # OpenFOAM advances its iteration count by nSweeps (:205), so every count it reports is a multiple.
 # brae read the entry nowhere -- airFoil2D ships nSweeps 2 and brae reported odd counts. The negative
 # fixed-sweep mode (:96-119) is refused: it deletes the convergence test and reports a residual of zero.
+# linearUpwind, linearUpwindV and LUST all read the gradient name off div(phi,U)'''s own stream
+# (linearUpwind.H:105, linearUpwindV.H:117-135, LUST.H). brae'''s regex demanded whitespace after
+# `linearUpwind`, so V and LUST silently fell back to gradSchemes default, and it searched the whole
+# divSchemes block rather than div(phi,U)'''s entry.
+add_test(NAME linearupwindv_grad_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/linearupwindv_grad_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/windAroundBuildingsBox)
+set_tests_properties(linearupwindv_grad_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1200)
+
 add_test(NAME solver_nsweeps_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/solver_nsweeps_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO)

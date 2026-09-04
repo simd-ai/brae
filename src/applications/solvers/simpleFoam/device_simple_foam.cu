@@ -1758,9 +1758,13 @@ void amgFineCoeffKernel(
                     stageDump(std::string("stage_") + mrTag + "_normFactor", std::vector<scalar>(1, nf));
                 }
             }
-            // OF fvVectorMatrix::solveSegregated solves each U component with the `U` lduMatrix solver (smoothSolver
-            // /GaussSeidel for motorBike). Route through deviceSymGaussSeidel when fvSolution asks for it (robust on
-            // anisotropic snappy cells where Jacobi-BiCGStab under-solves the loose relTol); interface LDUs keep BiCGStab.
+            // OF fvVectorMatrix::solveSegregated solves each U component with the `U` lduMatrix solver
+            // (smoothSolver/GaussSeidel for motorBike). Route through deviceSymGaussSeidel when
+            // fvSolution asks for it -- that honours the SELECTION and the stopping rule, and
+            // substitutes the SWEEP: brae's is multicolour where symGaussSeidelSmoother.C is index
+            // order (see device_amg.cuh for the measurement; announced by linear_solver_setup.cuh).
+            // Robust on anisotropic snappy cells where Jacobi-BiCGStab under-solves the loose relTol;
+            // interface LDUs keep BiCGStab.
             scalar ur;
             DeviceSolverPerf uperf;
             if (ctl_.gsU && !hasCyclic_ && !hasAMI_)
