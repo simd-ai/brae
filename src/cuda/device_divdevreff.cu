@@ -281,6 +281,7 @@ void deviceDivDevReff(
     const DeviceCyclic* cyc,
     const DeviceAMI* ami,
     const DeviceProcStress* proc,
+    const DeviceBuffer<scalar>* const* UbStored,
     scalar gradULimitK)
 {
     const int nC = dm.nCells, nB = dm.nBndFaces;
@@ -300,8 +301,14 @@ void deviceDivDevReff(
     // gaussGrad(U_i) = (dUi/dx, dUi/dy, dUi/dz) = COLUMN i of G (OF convention G_ij = dU_j/dx_i, via outer(Sf,U)).
     for (int i = 0; i < 3; ++i)
     {
+        // U's boundary as OF's fvc::grad(U) reads it: the STORED value when the caller keeps one, and a
+        // re-derivation only when it does not. The two agree only while the caller evaluates U's boundary
+        // before every assembly, which OpenFOAM does not -- see the header (queue items 25, 30).
         DeviceBuffer<scalar> bval;
-        deviceBCValue(dbU.comp[i], *Uc[i], bval);
+        if (UbStored && UbStored[i] && UbStored[i]->size() == static_cast<std::size_t>(nB))
+            deviceCopy(bval, *UbStored[i]);
+        else
+            deviceBCValue(dbU.comp[i], *Uc[i], bval);
         if (proc)   // processor faces are bcType 8: deviceBCValue leaves them, the halo supplies the value
         {
             proc->halo->exchange(Uc[i]->data());

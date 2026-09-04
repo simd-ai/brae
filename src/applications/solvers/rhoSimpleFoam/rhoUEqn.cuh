@@ -131,6 +131,13 @@ struct RhoMomentumInput
     // way -- the same escape hatch, for the same reason, as the host reference's muEff/muEffBnd.
     const DeviceBuffer<scalar>* muEffCell    = nullptr;  // nCells
     const DeviceBuffer<scalar>* muEffBndFace = nullptr;  // boundary faces
+    // U's STORED boundary values. fvc::grad(U) reads U.boundaryField(), not a re-evaluation of it, and
+    // this driver does not evaluate U's boundary before the assembly because OpenFOAM does not either
+    // (fvMatrix.C:396 calls updateCoeffs and nothing else). Handing these to deviceDivDevReff is what
+    // keeps the device reading the same field the host reference does -- see queue item 30.
+    const DeviceBuffer<scalar>* UxBndFace = nullptr;
+    const DeviceBuffer<scalar>* UyBndFace = nullptr;
+    const DeviceBuffer<scalar>* UzBndFace = nullptr;
 
     // UEqn.relax(). TWO fields, because OpenFOAM's guard is on the PRESENCE of the entry, not its value:
     // fvMatrix::relax() runs `if (relaxEquation(name, relaxCoeff)) relax(relaxCoeff)` (fvMatrix.C:1250-1263)

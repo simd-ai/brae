@@ -433,6 +433,11 @@ void assembleUEqn(
     // processor patch would contribute nothing to gradU and nothing to the tensor divergence, silently.
     // Nothing here can detect one -- DeviceMesh does not carry the interface list -- so it is stated
     // rather than guarded.
+    // U's stored boundary, when the caller supplied it -- see RhoMomentumInput. All three or none: a
+    // partial set would mix a stored component with a re-derived one inside the same gradient.
+    const DeviceBuffer<scalar>* ubArr[3] = { in.UxBndFace, in.UyBndFace, in.UzBndFace };
+    const DeviceBuffer<scalar>* const* ubStored =
+        (in.UxBndFace && in.UyBndFace && in.UzBndFace) ? ubArr : nullptr;
     deviceDivDevReff(
         dm,
         dbU,
@@ -447,6 +452,7 @@ void assembleUEqn(
         nullptr,
         nullptr,
         nullptr,
+        ubStored,
         in.gradULimitK);
 
     // The explicit half of `corrected`: the non-orthogonal deferred source. AFTER divDevRhoReff, which

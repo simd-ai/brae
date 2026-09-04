@@ -1260,7 +1260,10 @@ void amgFineCoeffKernel(
         if (ctl_.maxwell) deviceBCValue(dbExtrap_, nuConst_, ddrNuBnd);
         deviceDivDevReff(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], ddrNuCell, ctl_.maxwell ? ddrNuBnd : nuEffBnd,
                          ddrX, ddrY, ddrZ,
-                         hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr, nullptr, ctl_.gradULimitK);
+                         hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr, nullptr,
+                         // null: this driver evaluates U's boundary before the assembly, so re-deriving
+                         // it here is the same number. See the header (queue item 30).
+                         nullptr, ctl_.gradULimitK);
         // ...and the two terms only Maxwell has. Both are V*fvc::div of a tensor, added to the same
         // source the dev2 term feeds, with the same sign OF gives them (divDevRhoReff is subtracted from
         // the momentum equation, and brae's ddr carries that sign already -- see the loop below).

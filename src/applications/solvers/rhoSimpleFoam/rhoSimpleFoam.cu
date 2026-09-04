@@ -384,6 +384,7 @@ Residuals rhoSimpleStep(
     // exactly p/(R*T) = 100000/(287.1*300) there, and it reached the converged velocity as a drift of
     // 5.4e-04 at iteration 1 growing to 3.9e-03 by iteration 8 while p, T and he all stayed at ~1e-7.
     uin.muEffCell = in.muEffCell;    uin.muEffBndFace = in.muEffBndFace;
+    uin.UxBndFace = &f.UxBnd;        uin.UyBndFace = &f.UyBnd;        uin.UzBndFace = &f.UzBnd;
     uin.relaxU = in.relaxU;
     uin.relaxEquationU = in.relaxEquationU;
     uin.bounded = in.boundedU;
@@ -409,6 +410,12 @@ Residuals rhoSimpleStep(
     sd.scalars("nutU", f.nut);
     MomentumMatrix UEqn;
     assembleUEqn(UEqn, dm, dbU, f.Ux, f.Uy, f.Uz, uin);
+    sd.scalars("UDiag", UEqn.diag);
+    sd.scalars("UUpper", UEqn.upper);
+    sd.scalars("USrcX", UEqn.source[0]);
+    sd.scalars("USrcY", UEqn.source[1]);
+    sd.scalars("USrcZ", UEqn.source[2]);
+    sd.scalars("muEffAss", *in.muEffCell);
 
     {
         // solve(UEqn == -fvc::grad(p)) on a COPY. The pressure equation needs the ORIGINAL for A(), H()

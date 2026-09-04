@@ -40,6 +40,15 @@ void deviceDivDevReff(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                       DeviceBuffer<scalar>& srcX, DeviceBuffer<scalar>& srcY, DeviceBuffer<scalar>& srcZ,
                       const DeviceCyclic* cyc = nullptr, const DeviceAMI* ami = nullptr,
                       const DeviceProcStress* proc = nullptr,
+                      // U's STORED boundary values, one per component, when the caller keeps them. OF's
+                      // fvc::grad(U) reads U.boundaryField() -- the value the last evaluate left -- and
+                      // does NOT re-derive it: updateCoeffs sets a flag and the fvMatrix constructor calls
+                      // nothing else (fvPatchField.C, fvMatrix.C:396). Passing null makes this re-derive
+                      // with deviceBCValue, which is the same number only while the caller evaluates U's
+                      // boundary before every assembly. The OF-mirror does not (queue items 25, 30), so it
+                      // passes its stored values; the drivers that do evaluate leave this null and are
+                      // unchanged.
+                      const DeviceBuffer<scalar>* const* UbStored = nullptr,
                       // grad(U) "cellLimited Gauss linear <k>" coefficient; 0 = unlimited.
                       //
                       // OF's linearViscousStress::divDevReff calls fvc::grad(U), which resolves the
