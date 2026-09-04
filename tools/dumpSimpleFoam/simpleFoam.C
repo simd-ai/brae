@@ -74,6 +74,18 @@ Description
 
 // Stage harness: which SIMPLE iteration to dump (BRAE_DUMP_STAGE_ITER, default 1). The twin of
 // tools/dumpPEqn's, so a compressible and an incompressible dump are driven by the same variable.
+// The transported turbulence fields a dump names one by one. turbulence->k() and ->nut() are on the
+// model's own interface; omega, epsilon, nuTilda, gammaInt and ReThetat are not, so they are looked up
+// in the registry by name and skipped when the case's model does not carry them.
+static const Foam::wordList TURBFIELDS
+({
+    "omega",
+    "epsilon",
+    "nuTilda",
+    "gammaInt",
+    "ReThetat"
+});
+
 static int braeDumpIter()
 {
     const char* e = ::getenv("BRAE_DUMP_STAGE_ITER");
@@ -124,8 +136,40 @@ int main(int argc, char *argv[])
             #include "pEqn.H"
         }
 
+        // The closure's INPUTS, exactly as turbulence->correct() reads them: phi is the CONSERVATIVE
+        // flux the pressure step just left, not the one the momentum equation was convected by, and nut
+        // is whatever the previous correct() (or validate()) put there. Held separately from the outputs
+        // below so a closure comparison cannot be blamed on an input the two codes disagree about.
+        if (runTime.timeIndex() == braeDumpIter())
+        {
+            volScalarField("stage_nutIn", turbulence->nut()()).write();
+            volScalarField("stage_kIn",   turbulence->k()()).write();
+            surfaceScalarField("stage_phiIn", phi).write();
+            forAll(TURBFIELDS, i)
+            {
+                const volScalarField* f = mesh.findObject<volScalarField>(TURBFIELDS[i]);
+                if (f) volScalarField("stage_" + TURBFIELDS[i] + "In", *f).write();
+            }
+        }
+
         laminarTransport.correct();
         turbulence->correct();
+
+        // The closure's OUTPUTS. Every transported turbulence field the case registers, by name, so a
+        // model with more than two of them (kOmegaSSTLM carries gammaInt and ReThetat as well) is dumped
+        // whole rather than through the two the solver happens to hold a handle on. runTime.write()
+        // below writes k, omega and nut anyway, but not at a name a comparison can key on when the case
+        // writes at a different interval -- and never gammaInt/ReThetat on the brae side.
+        if (runTime.timeIndex() == braeDumpIter())
+        {
+            volScalarField("stage_nutPost", turbulence->nut()()).write();
+            volScalarField("stage_kPost",   turbulence->k()()).write();
+            forAll(TURBFIELDS, i)
+            {
+                const volScalarField* f = mesh.findObject<volScalarField>(TURBFIELDS[i]);
+                if (f) volScalarField("stage_" + TURBFIELDS[i] + "Post", *f).write();
+            }
+        }
 
         runTime.write();
 
