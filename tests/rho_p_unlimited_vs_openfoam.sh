@@ -31,11 +31,17 @@
 # Measured floors on rhoBox and rhoTP unlimited (max over t=1..10, both arms, 2026-09-03): p 3.0e-12,
 # T 1.0e-12, U 1.6e-11, rho 2.6e-12. Bounds ~30x.
 #
-# THE NACA ARMS ARE REPORTED, NOT ASSERTED (queue item 25). After items 23 and 24 they read p 1.8e-05 /
-# U 8.9e-06 (limited, t=1..10) and p 4.0e-07 / U 1.2e-06 (unlimited, t=1..2), down from 3.4e-05 / 6.5e-05
-# and 9.8e-05 / 8.2e-05, with the largest omega gap on a symmetric cell pair near the aerofoil at t=1
-# (1.75e-02 on 153.8). That residual is a separate defect the instrument has to localise; asserting a
-# bound above the floor here would be a gate that lies. They become asserted when item 25 closes.
+# THE NACA ARMS ARE ASSERTED, under the SAME bounds as the box and totalPressure ones -- item 25 closed
+# 2026-09-03. They were reported-only through items 23, 24, 26, 27 and 28, reading p 1.8e-05 / U 8.9e-06
+# at worst and still p 1.1e-09 / U 9.9e-10 after 26. What closed them was two things OpenFOAM does that
+# brae did not: gaussGrad's boundary correction asks the PATCH for snGrad() rather than using the base
+# class's (value - patchInternalField)*deltaCoeffs, and updateCoeffs is NOT an evaluate -- OF's
+# fvPatchField::updateCoeffs sets a flag and the fvMatrix constructor calls nothing else (fvMatrix.C:396),
+# so a mixed patch assembles holding the NEW valueFraction beside the value its last evaluate left. brae
+# evaluated U's boundary before the assembly and collapsed that lag: the freestreamVelocity inlet read
+# 3.2e-06 from OpenFOAM's at iteration 2 while every internal input was exact to 1e-14. Measured now,
+# t=1..10 limited: p 1.8e-11, T 1.1e-12, U 1.2e-12, rho 2.8e-12 -- the write-precision floor this fixture
+# writes at, and the same floor the other two arms sit on.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILDDIR="${BUILD:-$ROOT/build}"
@@ -167,13 +173,11 @@ for fx in ('tp', 'naca'):
 for arm, ref in (('box_host_unl', 'box_of_unl'), ('box_cuda_unl', 'box_of_unl'), ('tp_host_unl', 'tp_of_unl'), ('tp_cuda_unl', 'tp_of_unl'),
                  ('naca_host_lim', 'naca_of_lim'), ('naca_host_unl', 'naca_of_unl')):
     tn = N_UNL if arm == 'naca_host_unl' else N
-    asserted = not arm.startswith('naca')   # queue item 25: reported until the NACA residual is localised
     for f, b in bounds.items():
         worst = max(rel(arm, ref, t, f) for t in range(1, tn + 1))
         good = worst < b
-        tag = ('ok' if good else 'FAIL') if asserted else ('ok' if good else 'REPORTED (open item 25, not asserted)')
-        print('     %-14s %-4s max over t=1..%d vs OpenFOAM %.4e   (bound %.1e)   %s' % (arm, f, tn, worst, b, tag))
-        if asserted: ok = ok and good
+        print('     %-14s %-4s max over t=1..%d vs OpenFOAM %.4e   (bound %.1e)   %s' % (arm, f, tn, worst, b, 'ok' if good else 'FAIL'))
+        ok = ok and good
 sys.exit(0 if ok else 1)
 PUCMP
 say "p's relaxed boundary and the freestream pressure's valueFraction track OpenFOAM without a limiter" "$([ $fail = 0 ] && echo ok || echo FAIL)"

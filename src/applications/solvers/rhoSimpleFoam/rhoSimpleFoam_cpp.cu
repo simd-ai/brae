@@ -419,7 +419,11 @@ Residuals rhoSimpleStep(
     // naca0012 t=2 from U 5.9e-10 to 1.2e-12 -- and it was measured and then reverted, because it
     // separates this arm from the DEVICE by 1.32e-06 on rhoBoxP, which carries the same lag. Queue item
     // 30: both halves land together or neither does.
-    f.U.evaluateBoundary();
+    // ...AND NOT U. updateCoeffs is not an evaluate: OF fvPatchField::updateCoeffs sets a flag
+    // (fvPatchField.C) and the momentum fvMatrix constructor calls updateCoeffs and NOTHING else
+    // (fvMatrix.C:396), so a mixed patch enters the assembly holding the NEW valueFraction beside the
+    // value its last evaluate left -- the blend of the PREVIOUS one -- and only the solve's
+    // correctBoundaryConditions reunites them. Evaluating here collapsed that lag (queue items 25, 30).
     // NOT he and NOT T either. Nothing in OpenFOAM's iteration evaluates them before the energy equation:
     // he's patch values stand as the previous solve's correctBoundaryConditions and thermo.correct()
     // left them (fixesValue patches carry HE(p_b, T_b), heRhoThermo.C:119), and T's are evaluated only
@@ -463,7 +467,10 @@ Residuals rhoSimpleStep(
     // equation and a fresh value where OpenFOAM carries the blend: rhoTP at t=1 read U 2.15e-02 relL2
     // against OpenFOAM with the written inlet still at the (5 0 0) seed, OpenFOAM's at (13.44 0 0).
     updatePressureInletOutletVelocity(f, patches);
-    f.U.evaluateBoundary();   // ...and its twin -- see the note at the first one (queue item 30).
+    // ...and its twin. Only pressureInletOutletVelocity evaluates inside its own updateCoeffs
+    // (its .C:180-183), and updateFromPatchVelocity above already sets its value;
+    // flowRateInletVelocity assigns its value outright, as OpenFOAM's does. Nothing else is
+    // evaluated at an assembly.
     // ---- UEqn.H ----
     RhoMomentumInput uin;
     uin.phi = &f.phi.internal;   uin.phiBnd = &f.phi.boundary;
@@ -517,6 +524,18 @@ Residuals rhoSimpleStep(
         uin.muLaminar = &muLam;
     }
     const FvVectorMatrix UEqn = assembleUEqn(f.U, uin, m, g, patches);
+    {
+        std::vector<scalar> sx(UEqn.source.size()), sy(sx.size()), sz(sx.size());
+        for (std::size_t c = 0; c < sx.size(); ++c)
+        {
+            sx[c] = UEqn.source[c].x; sy[c] = UEqn.source[c].y; sz[c] = UEqn.source[c].z;
+        }
+        sd.scalars("UDiag", UEqn.diag);
+        sd.scalars("UUpper", UEqn.upper);
+        sd.scalars("USrcX", sx);
+        sd.scalars("USrcY", sy);
+        sd.scalars("USrcZ", sz);
+    }
     {
         // solve(UEqn == -fvc::grad(p)) on a COPY: the pressure equation needs the ORIGINAL UEqn for
         // A(), H() and H1(), and addPressureGradient would otherwise leave the source carrying -grad(p).
