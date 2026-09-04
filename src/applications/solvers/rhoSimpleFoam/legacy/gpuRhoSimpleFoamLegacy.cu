@@ -691,8 +691,15 @@ int main(int argc, char** argv)
             printOfResidualLog(iter, r, cumulativeCont);   // no-op unless BRAE_OF_LOG=1
             if (iter % 50 == 0 || iter == 1)
             {
-                std::printf("Time = %d   Ux %.4e  p %.4e  contGlobal %.4e\n",
-                            iter, r.Ux, r.p, r.contGlobal);
+                // OF prints the TIME NAME (runTime.timeName()), not the iteration index. They coincide
+                // only at startTime 0 with deltaT 1, which every fixture in validation/ is -- the blind
+                // spot that hid the same thing on the V2 driver until queue item 39. This driver keeps
+                // no Time object, so the value is built the way Time::operator++ builds it: startTime
+                // plus iter steps of deltaT (Time.C:1067), named by WriteControl::timeName.
+                std::printf("Time = %s   Ux %.4e  p %.4e  contGlobal %.4e\n",
+                            WriteControl::timeName(static_cast<scalar>(tStart)
+                                                   + static_cast<scalar>(iter) * wc.deltaT()).c_str(),
+                            r.Ux, r.p, r.contGlobal);
             }
             resControl.beginIteration();
             // U is gated on Ux alone, matching gpuSimpleFoam: brae tracks no solved-directions mask, so the

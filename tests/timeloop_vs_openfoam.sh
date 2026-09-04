@@ -148,6 +148,13 @@ PYEOF
         brn=$(grep -c '^Time = ' "$W/br_l/run.log")
         say "ARM 5  legacy driver takes $brn steps, OpenFOAM takes $ofn (start 0, end 1, dt 0.4)" \
             "$([ "$ofn" = "$brn" ] && echo ok || echo FAIL)"
+        # ARM 6 (queue item 48): the legacy driver printed the iteration INDEX where OpenFOAM prints the
+        # time NAME. On this shape the two differ outright -- OpenFOAM says "0.4 0.8" and an index says
+        # "1 2" -- which is exactly why a deltaT != 1 shape is the one that can see it.
+        ofl_t=$(grep -oP '^Time = \S+' "$W/of_l/run.log" | sed 's/Time = //' | tr '\n' ' ')
+        brl_t=$(grep -oP '^Time = \S+' "$W/br_l/run.log" | sed 's/Time = //' | tr '\n' ' ')
+        say "ARM 6  legacy times [$brl_t] == OpenFOAM [$ofl_t]" \
+            "$([ "$ofl_t" = "$brl_t" ] && echo ok || echo FAIL)"
         # C++ std::lround rounds HALF AWAY FROM ZERO; python round() is banker's and would give 2 here,
         # which would make this control silently agree with OpenFOAM and gate nothing.
         lr=$(python3 -c "import math; print(int(math.floor((1-0)/0.4 + 0.5)))")

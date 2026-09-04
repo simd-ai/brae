@@ -670,13 +670,18 @@ int main(int argc, char** argv)
                 // this log matches on `Solving for <field>, Initial residual = ...` and none anchors on
                 // the prefix, so naming it honestly costs nothing.
                 const char* uSolv = ctl.gsU ? "smoothSolver[multicolour symGaussSeidel]" : "Jacobi-BiCGStab";
-                std::printf("Time = %d\n\n"
+                // OF prints the TIME NAME (simpleFoam.C:100, runTime.timeName()), not the iteration
+                // index. The two coincide only at startTime 0 with deltaT 1, which every fixture in
+                // validation/ happens to be -- the same blind spot that hid it on the V2 driver until
+                // queue item 39. brae::Time already carries the name, and this driver already NAMES its
+                // output directory with it; only the log line was still counting.
+                std::printf("Time = %s\n\n"
                             "%s:  Solving for Ux, Initial residual = %g, Final residual = %g, No Iterations %d\n"
                             "%s:  Solving for Uy, Initial residual = %g, Final residual = %g, No Iterations %d\n"
                             "%s:  Solving for Uz, Initial residual = %g, Final residual = %g, No Iterations %d\n"
                             "AMG-PCG:  Solving for p, Initial residual = %g, Final residual = %g, No Iterations %d\n"
                             "time step continuity errors : sum local = %g, global = %g, cumulative = %g\n",
-                            iter,
+                            time.timeName().c_str(),
                             uSolv, r.Ux, r.UxFinal, r.UxIters,
                             uSolv, r.Uy, r.UyFinal, r.UyIters,
                             uSolv, r.Uz, r.UzFinal, r.UzIters,
