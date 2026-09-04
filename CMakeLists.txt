@@ -1034,6 +1034,25 @@ set_tests_properties(lm_cuda_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS s
 # nut rebuilt from the initial k and omega and not on the case's `nut uniform 0`. Oracle: dumpSimpleFoam's
 # stage_nuEff/stage_UDiag0/stage_rAU at iteration 1. Control: the file's own nut, which must disagree --
 # it is the laminar first iteration this used to run.
+# fvMatrix<vector>::solveSegregated skips the components polyMesh::solutionD() knocks out
+# (fvMatrixSolve.C:164) and residualControl compares cmptMax over what it stored (solutionControl.C:232).
+# The V2 step solved all three and reported component 0. Oracle: OpenFOAM's own log, one iteration from
+# its own field; control: that fixture's Uy/Ux = 1.910, so component 0 reads 47.7% low; 3D arm proves the
+# mask is derived and not hardcoded off.
+# brae routes `smoothSolver` + `symGaussSeidel` to a MULTICOLOUR Gauss-Seidel sweep where
+# symGaussSeidelSmoother.C sweeps in index order -- same stopping rule, less smoothing per sweep. It was
+# announced nowhere and the run log said "as the case asks". Positive + two controls, no GPU and no OF.
+add_test(NAME gs_smoother_notice
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/gs_smoother_notice.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A)
+set_tests_properties(gs_smoother_notice PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+
+add_test(NAME uresidual_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/uresidual_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/cav3d_of)
+set_tests_properties(uresidual_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
 add_test(NAME validate_nut_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_nut_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A)

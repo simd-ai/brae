@@ -7,6 +7,7 @@
 #include "k_epsilon.cuh"
 #include "kOmegaSST_cpp.cuh"
 #include "SpalartAllmaras_cpp.cuh"
+#include <algorithm>
 
 namespace brae {
 namespace cpu {
@@ -92,9 +93,32 @@ Residuals simpleStep(
         // solve(UEqn == -fvc::grad(p)) on a COPY: pEqn.H needs the original UEqn for A() and H().
         FvVectorMatrix Mp = UEqn;
         addPressureGradient(Mp, f.p, m, g, patches);
-        const SolverPerformance up =
-            solveVector(Mp, f.U, m, patches, in.tolU, in.relTolU, in.maxIter);
-        res["U"] = up.initialResidual;
+        // fvMatrix<vector>::solveSegregated solves only the components polyMesh::solutionD() leaves
+        // valid (fvMatrixSolve.C:164) -- on a 2D case the empty direction is never solved and its
+        // SolverPerformance stays Zero -- and what residualControl compares is cmptMax over the
+        // per-component vector it stores (solutionControl.C:232, simpleControl.C:67-71).
+        //
+        // This step reported component 0, which is wrong whenever Uy's initial residual exceeds Ux's:
+        // on validation/simpleBoxIO that is every iteration from the second (OpenFOAM at iteration 2:
+        // Ux 3.226738e-01, Uy 6.040719e-01). A max over three components SOLVED unconditionally is the
+        // opposite error, because the empty direction's normFactor-scaled residual never leaves O(0.1).
+        // Hence the mask and the max together. solveVector has carried both parameters since the
+        // compressible mirror needed them; this caller passed neither, so they were inert.
+        // solutionD is passed to solveVector as a nullptr on purpose: it would SKIP the knocked-out
+        // component's solve, and on this driver the z solve is what holds Uz down. brae's z quantities
+        // are round-off nonzero where OpenFOAM's are bit-exactly zero (emptyFvPatch::size() is 0), and
+        // the z map amplifies -- on pitzDaily, dropping the device twin's z solve took Uz to 13% of |U|
+        // by iteration 200. Only the REPORT is masked here. Queued: make the knocked-out direction
+        // exactly zero, then both arms can skip the solve as fvMatrixSolve.C:164 does.
+        const SolutionDirections solutionD = solutionDirections(patches);
+        SolverPerformance upCmpt[3];
+        solveVector(Mp, f.U, m, patches, in.tolU, in.relTolU, in.maxIter, /*minIter*/0,
+                    /*solutionD*/nullptr, upCmpt);
+        scalar uInitialResidual = 0.0;
+        for (int cmpt = 0; cmpt < 3; ++cmpt)
+            if (solutionD.valid(cmpt))
+                uInitialResidual = std::max(uInitialResidual, upCmpt[cmpt].initialResidual);
+        res["U"] = uInitialResidual;
     }
 
     // ---- pEqn.H ----------------------------------------------------------------------------

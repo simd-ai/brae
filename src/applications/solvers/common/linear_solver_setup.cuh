@@ -140,8 +140,14 @@ inline void readLinearSolverControls(
     // right to know the solver is not the one they asked for.
     //
     // dict_audit found these unread: solvers/p/solver, solvers/p/smoother, solvers/(U|h|e)/preconditioner.
-    // `gs` says brae took the smoothSolver path for this field, i.e. it HONOURED the request -- in which
-    // case there is nothing to report. Passed explicitly rather than inferred from the label: comparing the
+    // `gs` says brae took the smoothSolver path for this field. That honours the SELECTION and the
+    // STOPPING RULE, and substitutes the SWEEP: brae's is multicolour where symGaussSeidelSmoother.C
+    // walks cells in index order. It is the same algorithm under a permutation, but Gauss-Seidel is
+    // order-dependent, so at the loose relTol a SIMPLE step asks for the two stop in different places --
+    // measured on validation/T3A, OpenFOAM reached relTol 0.1 on Ux in ONE sweep (1.6186e-05 ->
+    // 6.940e-07) where brae took SEVEN (-> 1.278e-06). This used to read "it HONOURED the request -- in
+    // which case there is nothing to report", and that premise made every driver that includes this
+    // reader silent about the substitution. Passed explicitly rather than inferred from the label: comparing the
     // dict's "smoothSolver" against a display string of "smoothSolver(symGaussSeidel)" made brae announce a
     // substitution on every field it was in fact running exactly as asked. The negative control in
     // tests/test_solver_notices.cu is what caught that, and it is the reason the test has one.
@@ -175,6 +181,13 @@ inline void readLinearSolverControls(
         if (!smoo.empty() && !gs)
             noticeIgnored("solvers/" + f + " smoother",
                           "'" + smoo + "' -- brae is not running a smoothSolver on this field");
+        // ...and when it DID take that path, the sweep is still not OpenFOAM's. Announced on the same
+        // subject as the `ignored` arm above so the two cannot both be silent for a field.
+        if (!smoo.empty() && gs)
+            noticeApproximated("solvers/" + f + " smoother",
+                               "case asks '" + smoo + "', brae runs that smoothSolver around a MULTICOLOUR "
+                               "Gauss-Seidel sweep where OpenFOAM sweeps in index order -- same stopping "
+                               "rule, less smoothing per sweep, so a loose solve stops elsewhere");
         // Against what THIS DRIVER preconditions with, not against a fixed exemption list. The old test
         // was `prec != "diagonal" && prec != "none" && !diluWired`, which had two holes: the wired list
         // named the fields a DIFFERENT driver wires (queue item 27), and `none` is not `diagonal` --

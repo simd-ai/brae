@@ -83,6 +83,14 @@ struct StepInput
     // Jacobi-BiCGStab is a silent solver substitution AND the dominant cost: measured ~42 BiCGStab
     // iterations per component per outer step, ~90% of all linear-algebra time on this path.
     bool   uSymGaussSeidel = false;
+    // fvMesh::validComponents<vector>() -- which IS polyMesh::solutionD() (fvMeshTemplates.C:33-44,
+    // VectorSpaceI.H:435-446): +1 solved, -1 knocked out by an EMPTY patch.
+    // fvMatrix<vector>::solveSegregated `continue`s on every -1 (fvMatrixSolve.C:164), so on a 2D case
+    // OpenFOAM never solves the empty direction and that component's SolverPerformance stays
+    // default-constructed at Zero (SolverPerformance.H:127-133). Filled by the driver from the mesh's
+    // empty patches; the default solves all three, which is right only for a mesh that has none. The
+    // step cannot derive it -- it sees a DeviceMesh, from which a patch TYPE cannot be recovered.
+    int    solutionD[3] = {1, 1, 1};
     scalar tolP = 1e-10, relTolP = 0.0;
     int    maxIter = 2000;
     // V-cycle graph replay and PCG residual-read cadence. NOTE: on CUDA >= 13 deviceAMGPCG dispatches

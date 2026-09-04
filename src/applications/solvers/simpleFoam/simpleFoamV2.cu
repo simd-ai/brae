@@ -8,6 +8,7 @@
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
+#include "solution_directions.cuh"   // polyMesh::solutionD(): which U components OpenFOAM solves
 #include "geometric_field.cuh"
 #include "foam_field_reader.cuh"
 #include "foam_field_writer.cuh"
@@ -578,6 +579,34 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
                                     "AMG-preconditioned PCG instead. Same operator, different Krylov "
                                     "method and iteration count.");
         }
+    // The SMOOTHER substitution, which had no notice anywhere. brae routes a `smoothSolver` with a
+    // GaussSeidel-family smoother to deviceSymGaussSeidel, which is OpenFOAM's smoothSolver STOPPING RULE
+    // around a MULTICOLOUR sweep where symGaussSeidelSmoother.C sweeps in index order. Same algorithm
+    // under a permutation, but Gauss-Seidel is order-dependent, so at the loose relTol a SIMPLE step asks
+    // for the two stop in different places: measured on validation/T3A, OpenFOAM cut Ux 1.6186e-05 ->
+    // 6.940e-07 in ONE sweep where brae took SEVEN to reach 1.278e-06, both on the case's own relTol 0.1.
+    // It was announced nowhere -- the shared reader suppresses the smoother notice precisely when brae
+    // takes this path (linear_solver_setup.cuh), and the run log said "as the case asks".
+    if (const FoamDict* solvers = fvSolution.subDict("solvers"))
+    {
+        std::string fields;
+        for (const char* f : {"U", "k", "epsilon", "omega", "nuTilda"})
+        {
+            const FoamDict* fs = solvers->subDict(f);
+            if (!fs) continue;
+            const std::string sm = fs->wordOr("smoother", "");
+            if (fs->wordOr("solver", "") != "smoothSolver") continue;
+            if (sm != "symGaussSeidel" && sm != "GaussSeidel") continue;
+            if (!fields.empty()) fields += ", ";
+            fields += f;
+        }
+        if (!fields.empty())
+            r.notices.push_back("system/fvSolution asks for `smoothSolver` with a symGaussSeidel smoother "
+                                "on " + fields + "; brae runs that smoothSolver around a MULTICOLOUR "
+                                "Gauss-Seidel sweep, which SMOOTHS LESS per sweep than OpenFOAM's "
+                                "index-order sweep. Same stopping rule, more sweeps, and a loose solve "
+                                "stops somewhere else.");
+    }
 
     r.supported = r.blockers.empty();
     return r;
@@ -947,6 +976,19 @@ int runSimpleFoamV2(const std::string& caseDir)
 
     StepInput in;
     in.mrf = dMrf.empty() ? nullptr : &dMrf;
+    // The momentum components OpenFOAM SOLVES, from the same EMPTY patches polyMesh::calcDirections
+    // reads (polyMesh.C:75-118). Derived here, where the patches are, because gpu::simpleStep sees only
+    // the DeviceMesh and cannot recover a patch type from it. Wedge patches are deliberately not
+    // consulted: they knock out geometricD_ only (polyMesh.C:128-141), so an axisymmetric case still
+    // solves all three.
+    {
+        const SolutionDirections sd = solutionDirections(fvp);
+        for (int cmpt = 0; cmpt < 3; ++cmpt) in.solutionD[cmpt] = sd.d[cmpt];
+        if (!sd.valid(0) || !sd.valid(1) || !sd.valid(2))
+            std::printf("  empty patches knock out a solution direction: U is solved in (%s%s%s) only, "
+                        "as fvMatrix<vector>::solveSegregated does\n",
+                        sd.valid(0) ? "x" : "", sd.valid(1) ? "y" : "", sd.valid(2) ? "z" : "");
+    }
     if (ras)
     {
         // kOmegaSST's second transport variable is omega, and brae holds it in the same slot epsilon
@@ -1448,15 +1490,19 @@ int runSimpleFoamV2(const std::string& caseDir)
             std::printf("  RASModel realizableKE: variable Cmu (A0=%g C2=%g sigmaEps=%g)\n",
                         keCoeffs.A0, keCoeffs.C2, keCoeffs.sigmaEps);
         std::printf("  k/epsilon solves: tol=%.1e relTol=%.3g  solver=%s\n",
-                        tolKE, relTolKE, gsKE ? "smoothSolver/symGaussSeidel" : "Jacobi-BiCGStab");
+                    tolKE, relTolKE,
+                    gsKE ? "smoothSolver + MULTICOLOUR symGaussSeidel (OpenFOAM sweeps in index order)"
+                         : "Jacobi-BiCGStab");
         }
         if (const FoamDict* su = solvers->subDict("U"))
         {
             in.tolU    = su->scalarOr("tolerance", in.tolU);
             in.relTolU = su->scalarOr("relTol", 0.0);
-            // OpenFOAM's selection, exactly: `solver smoothSolver` + a GaussSeidel-family smoother.
-            // Anything else (PBiCG[Stab], GAMG, ...) keeps Jacobi-BiCGStab, which is announced below as
-            // the substitution it is.
+            // OpenFOAM's SELECTION, exactly: `solver smoothSolver` + a GaussSeidel-family smoother.
+            // The selection is matched; the ALGORITHM is not -- brae's sweep is multicolour where
+            // OpenFOAM's is index order (see the envelope notice above, and device_amg.cuh). Anything
+            // else (PBiCG[Stab], GAMG, ...) keeps Jacobi-BiCGStab, announced below as the substitution
+            // it is.
             const std::string usolv = su->wordOr("solver", "");
             const std::string usm   = su->wordOr("smoother", "");
             in.uSymGaussSeidel = (usolv == "smoothSolver" &&
@@ -1558,7 +1604,9 @@ int runSimpleFoamV2(const std::string& caseDir)
     in.nuLaminar = nu;
 
     std::printf("  U solver: %s\n",
-                in.uSymGaussSeidel ? "smoothSolver/symGaussSeidel (as the case asks)"
+                // "as the case asks" was the display string this line used to carry, and it was the
+                // shared-capability-notice defect: the SELECTION is the case's, the sweep order is not.
+                in.uSymGaussSeidel ? "smoothSolver + MULTICOLOUR symGaussSeidel (OpenFOAM sweeps in index order)"
                                    : "Jacobi-BiCGStab");
     in.momentumPredictor = cd.momentumPredictor;
     in.nNonOrthogonalCorrectors = cd.nNonOrthogonalCorrectors;

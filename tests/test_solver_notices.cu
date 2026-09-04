@@ -134,8 +134,17 @@ int main()
             readLinearSolverControls(fv, "omega", ctl);
         });
 
-        check("smoothSolver+symGaussSeidel on k produces no notice", !has(out, "solvers/k"), out);
-        check("smoothSolver+symGaussSeidel on omega produces no notice", !has(out, "solvers/omega"), out);
+        // TIGHTENED 2026-09-04: this used to assert SILENCE on both, and the silence was the defect.
+        // Taking the smoothSolver path honours the selection and the stopping rule and substitutes the
+        // SWEEP -- brae's is multicolour where symGaussSeidelSmoother.C walks cells in index order, and
+        // on validation/T3A that is one sweep to relTol 0.1 against seven. The `solver` half must still
+        // be silent (brae really is running a smoothSolver), so the two halves are asserted separately.
+        check("smoothSolver+symGaussSeidel on k announces the multicolour sweep",
+              has(out, "solvers/k smoother") && has(out, "MULTICOLOUR"), out);
+        check("smoothSolver+symGaussSeidel on omega announces the multicolour sweep",
+              has(out, "solvers/omega smoother") && has(out, "MULTICOLOUR"), out);
+        check("...and neither reports a SOLVER substitution, because there is none",
+              !has(out, "solvers/k solver") && !has(out, "solvers/omega solver"), out);
     }
 
     // ---- NEGATIVE CONTROL 2: no `solvers` entries at all -> nothing to report ----

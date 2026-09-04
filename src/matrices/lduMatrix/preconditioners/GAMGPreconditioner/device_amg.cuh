@@ -180,7 +180,12 @@ void deviceCoarseJacobiFused(const DeviceLduView& cv, const DeviceBuffer<scalar>
 // Reference: the unfused coarse Jacobi (deviceAmul + smooth, nSweeps launches each), for validation/timing.
 void deviceCoarseJacobiLoop(const DeviceLduView& cv, const DeviceBuffer<scalar>& rc, DeviceBuffer<scalar>& xc, int nSweeps);
 
-// symGaussSeidel scalar solver (OpenFOAM smoothSolver + symGaussSeidelSmoother, byte-faithful via multicolor GS).
+// symGaussSeidel scalar solver: OpenFOAM's smoothSolver STOPPING RULE (smoothSolver.C:135-209) around a
+// MULTICOLOUR Gauss-Seidel sweep. It is NOT byte-faithful to symGaussSeidelSmoother.C, which visits cells in
+// strict index order (:147 forward, :176 reverse); this visits them in COLOUR order, and a Gauss-Seidel sweep
+// is order-dependent, so the per-sweep iterate is a different one. Measured on validation/T3A restarted from
+// its 269 fixture, same matrix and the case's own relTol 0.1: OpenFOAM cut Ux 1.6186e-05 -> 6.940e-07 in ONE
+// sweep (23.3x), this took SEVEN to reach 1.278e-06 (12.7x). Callers must ANNOUNCE the substitution.
 // For the stiff near-wall k/omega/epsilon transport on low-Re (y+~1) meshes where Jacobi-BiCGStab amplifies the
 // near-wall instability. Coloring is built once per mesh (cached on A.owner), internal-face LDU only (no interface).
 scalar deviceSymGaussSeidel(const DeviceLduView& A, const DeviceBuffer<scalar>& b, DeviceBuffer<scalar>& psi,

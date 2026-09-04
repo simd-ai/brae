@@ -1,4 +1,5 @@
-// Standalone symGaussSeidel LINEAR SOLVER (OpenFOAM smoothSolver + symGaussSeidelSmoother): the FP64 host loop,
+// Standalone symGaussSeidel LINEAR SOLVER (OpenFOAM smoothSolver's stopping rule around a MULTICOLOUR
+// Gauss-Seidel sweep -- not symGaussSeidelSmoother's index order; see device_amg.cuh): the FP64 host loop,
 // the device-resident conditional-graph variant (BRAE_GS_DEVICE, CUDA>=13), and the FP32 twin (BRAE_TURB_FP32).
 // Used for the momentum/turbulence GaussSeidel solver option -- it is NOT part of the AMG V-cycle (it only reuses
 // the multicolor sweep gsSweep + the FP32 SpMV amulF, both from headers). Verbatim split of device_amg.cu -- no
@@ -186,14 +187,24 @@ static scalar deviceSymGaussSeidelGraph(
 }
 #endif // CUDART_VERSION >= 13000
 
-// symGaussSeidel scalar solver, a port of OpenFOAM smoothSolver + symGaussSeidelSmoother. OF updates each cell
-// psi[c] = (b[c] - sum_{j!=c} A[c][j]*psi[j]) / diag[c] (the gsColorT gather), forward sweep then reverse. Here the
-// sweep is parallelised by greedy multicolouring (one color = non-adjacent cells, so writes never race and off-diagonal
-// reads see already-swept colors == true GS), converging to the same solution as OF's lexicographic order. One symGS
-// sweep = gsSweep(forward) + gsSweep(reverse); the outer loop mirrors smoothSolver::solve (initial residual + normFactor,
-// then {smooth; recompute r; finalRes = sumMag(r)/normFactor} until finalRes<tol || finalRes<relTol*initRes || maxIter).
-// The coloring depends only on the graph (owner/nei), fixed per mesh, so it is built once and cached. Robust on the
-// stiff near-wall k/omega system where Jacobi-BiCGStab amplifies the y+~1 instability.
+// symGaussSeidel scalar solver. Each cell is updated psi[c] = (b[c] - sum_{j!=c} A[c][j]*psi[j]) / diag[c] (the
+// gsColorT gather), forward then reverse, and the outer loop IS smoothSolver::solve (initial residual + normFactor,
+// then {smooth; recompute r; finalRes = sumMag(r)/normFactor} until finalRes<tol || finalRes<relTol*initRes ||
+// maxIter). What is NOT OpenFOAM's is the ORDER: symGaussSeidelSmoother.C walks cells in strict index order
+// (:147 forward, :176 reverse) while this walks them in COLOUR order. That is the same algorithm under a
+// permutation -- verified, a sequential transcription visiting cells in the colour permutation reproduces this
+// sweep to 0.0 -- but Gauss-Seidel is order-dependent, so the ITERATE after n sweeps is not OpenFOAM's, and at
+// the loose relTol a SIMPLE step asks for the two solvers stop in different places.
+//
+// The gap is not small. On validation/T3A (26820 cells; brae's greedy colouring gives 3 colours of
+// 13390/13390/40, so the first colour is 49.93% of the mesh updated entirely from old values -- a Jacobi step)
+// OpenFOAM cut Ux's residual 1.6186e-05 -> 6.940e-07 in ONE sweep against this solver's SEVEN to 1.278e-06,
+// both stopping on the case's own relTol 0.1.
+//
+// The exact alternative is level scheduling -- device_dilu.cu already builds the identical DAG -- but T3A's
+// schedule is 465 levels deep with a median of 74 cells per level, i.e. 930 kernel launches per sweep against
+// the 6 here, so it is not run. One symGS sweep = gsSweep(forward) + gsSweep(reverse); the colouring depends
+// only on the graph (owner/nei) and is built once per mesh and cached.
 static scalar deviceSymGaussSeidelF32(
     const DeviceLduView&,
     const DeviceBuffer<scalar>&,

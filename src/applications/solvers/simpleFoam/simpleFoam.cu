@@ -3,6 +3,7 @@
 #include "device_blas.cuh"
 #include "device_pcg.cuh"
 #include "device_simple.cuh"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -178,27 +179,61 @@ Residuals simpleStep(
         addPressureGradient(Mp, dm, gpx, gpy, gpz);
 
         DeviceBuffer<scalar>* U[3] = {&f.Ux, &f.Uy, &f.Uz};
+        // U's residual is cmptMax over the components OpenFOAM SOLVES, and the components it solves are
+        // the ones polyMesh::solutionD() leaves valid: solveSegregated skips every -1
+        // (fvMatrixSolve.C:164) and solutionControl compares cmptMax over the per-component vector it
+        // stores (solutionControl.C:232, simpleControl.C:67-71), where a skipped component is Zero.
+        //
+        // This loop solved all three and reported component 0, and the two errors hid each other.
+        // Reporting component 0 is wrong whenever Uy's initial residual exceeds Ux's -- on
+        // validation/simpleBoxIO that is every iteration from the second (OpenFOAM at iteration 2:
+        // Ux 3.226738e-01, Uy 6.040719e-01) -- so residualControl fires at a different iteration from
+        // OpenFOAM's. A max over three components SOLVED unconditionally is the opposite error: the
+        // empty direction's system has a ~0 right-hand side and a ~0 field, so its normFactor-scaled
+        // residual never leaves O(0.1) and would block convergence on every 2D case. Hence the mask AND
+        // the max, not either alone. The skipped solve was also 26% of this fixture's momentum
+        // linear algebra (497 of 1912 BiCGStab iterations over 15 outer steps) for an answer of 4.9e-17.
+        // THE SOLVE IS NOT SKIPPED, and that is a KNOWN DEVIATION, not an oversight. OpenFOAM's Uz on a
+        // 2D case is BIT-EXACTLY zero -- emptyFvPatch::size() is 0, so no z quantity is ever formed --
+        // and `U = HbyA - rAtU*grad(p)` therefore reproduces zero forever without the solve. brae's z
+        // quantities are round-off nonzero instead (measured on pitzDaily at iteration 1: the momentum
+        // source's z norm is 3.5e-21 against 6.1e-04 in x), and the z map amplifies at ~1.15 per
+        // iteration, so dropping the solve let Uz reach 13% of |U| by iteration 200 and turned seven
+        // end-to-end gates red. Today the z solve is what holds Uz down. Removing it needs the knocked-
+        // out direction to be exactly zero first; that is queued, and until then this loop solves a
+        // component OpenFOAM does not.
+        scalar uInitialResidual = 0.0;
         for (int k = 0; k < 3; ++k)
         {
             DeviceBuffer<scalar> diagC, b;
             deviceFold(dm, Mp.relaxed ? Mp.relaxedDiag : Mp.diag, Mp.source[k], Mp.iC[k], Mp.bC[k], diagC, b);
             const DeviceLduView A = foldedView(dm, Mp, diagC);
             const scalar nf = deviceNormFactor(A, *U[k], b, w.ones);
-            // The solver the CASE asked for. deviceSymGaussSeidel is OpenFOAM's smoothSolver +
-            // symGaussSeidelSmoother (multicolor, internal-face LDU only -- no coupled interfaces, which
-            // this path refuses anyway).
+            // The solver SELECTION the case asked for, not the algorithm: deviceSymGaussSeidel is
+            // OpenFOAM's smoothSolver stopping rule around a MULTICOLOUR Gauss-Seidel sweep, where
+            // symGaussSeidelSmoother.C sweeps in index order. Same algorithm under a permutation, and
+            // Gauss-Seidel is order-dependent, so the iterate after n sweeps differs -- measured on T3A,
+            // OpenFOAM reaches relTol 0.1 in one sweep where this takes seven. The driver announces it.
+            // Internal-face LDU only -- no coupled interfaces, which this path refuses anyway.
             DeviceSolverPerf perf;
             if (in.uSymGaussSeidel)
                 deviceSymGaussSeidel(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIter, &perf);
             else
                 perf = deviceJacobiBiCGStab(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIter);
-            // OpenFOAM's residualControl watches the FIRST component's initial residual under the field
-            // name; keep that convention so simpleControl's criteria mean the same thing here.
-            if (k == 0) res["U"] = perf.initialResidual;
+            // The REPORT is masked even where the solve is not: the empty direction's system has a ~0
+            // right-hand side and a ~0 field, so its normFactor-scaled residual never leaves O(0.1)
+            // (measured on simpleBoxIO: Uz 7.945e-01 at iteration 1, still 9.724e-02 at 15) and a max
+            // over three would block residualControl on every 2D case. OpenFOAM's own max is over the
+            // components it solved, with the rest at Zero -- which is this.
+            if (in.solutionD[k] > 0)
+                uInitialResidual = std::max(uInitialResidual, perf.initialResidual);
+            // Inside the masked loop deliberately: OpenFOAM prints no `Solving for Uz` line for a
+            // component it did not solve, so a skipped k must leave no [Uk] line either.
             if (std::getenv("BRAE_SOLVER_ITERS"))
                 std::printf("    [U%d] nIter=%d init=%.3e final=%.3e\n",
                             k, perf.nIterations, perf.initialResidual, perf.finalResidual);
         }
+        res["U"] = uInitialResidual;
     }
 
     // U out of the momentum predictor. UEqn.H() below is built from THIS field, so it sits between
