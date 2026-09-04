@@ -875,6 +875,16 @@ add_test(NAME kepsilon_correct
 # SKIP_RETURN_CODE 77 lets it skip cleanly when no GPU binary is present.
 # DISPATCH GATE for the rebuilt simpleFoam: off changes nothing, on+supported runs, on+unsupported
 # REFUSES with the reason. A path that quietly degrades is indistinguishable from a correct one.
+# A regex-keyed turbulence residualControl must actually bind -- see the script for why this exists and
+# for what it is not (the defect it was written to chase turned out to be a symptom of T3A diverging).
+add_test(NAME simple_residualcontrol_regex
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_residualcontrol_regex.sh)
+set_tests_properties(simple_residualcontrol_regex PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae
+                     TIMEOUT 1800)
+
 add_test(NAME simplefoam_v2_dispatch
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simplefoam_v2_dispatch.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
