@@ -51,6 +51,38 @@ STEADY="${3:-1e-04}"
 # the same 2.5e-05 residual plateau -- it reads 1.773e-03, a factor of 16 from nothing but where it was
 # taken. Gating the shipped number would record the stopping point as if it were a property of the solver.
 ENDTIME="${4:-}"
+# Optional residualControl override, substituted into the SIMPLE dict on BOTH sides. A tutorial's own
+# residualControl is a stopping point, not a converged state, and where the two differ the comparison
+# measures the stopping point: backwardFacingStep2D ships `p 1e-4; U 1e-6; "(k|epsilon|omega|f|v2)" 1e-5`
+# and stops there, on a separating flow whose reattachment point is the sensitive quantity. The result is
+# a gate that moves with any perturbation, however small -- a 1e-16 change to grad(p) moved its U from
+# 3.482e-03 to 1.145e-02 against a 1e-02 bound, deterministic to every printed digit, and CMakeLists
+# recorded that as a reason not to ship a correctness fix. Both codes converge much further than the
+# tutorial asks; taking the comparison there is what makes it a property of the discretisation instead of
+# a property of where each code happened to stop.
+RESCONTROL="${5:-}"
+# Optional WINDOW MEAN: compare the average of the last N written times instead of the last one.
+#
+# WHY A MEAN IS SOMETIMES THE ONLY WELL-DEFINED THING TO COMPARE. A steady solver on a flow that has no
+# steady state does not converge; it settles into a limit cycle, and then a single iterate is a lottery.
+# backwardFacingStep2D is that case, measured 2026-09-03: OpenFOAM's own p residual sits at ~2.1e-02 for
+# all 20000 iterations and oscillates between 1.79e-02 and 2.48e-02 instead of falling, never reaching
+# even the tutorial's own `p 1e-4`. Against ITSELF, 250 to 1000 iterations apart, OpenFOAM moves by
+# U 1.66e-02 / p 1.20e-02 / k 2.50e-02 -- MORE, on U, than the 1e-02 bound brae was being held to. So the
+# old single-iterate comparison was not measuring agreement between two codes, it was measuring where two
+# points on an oscillation happened to land, and it passed only because at endTime 2000 they land close.
+# That is why a 1e-16 perturbation to grad(p) once moved it from 3.482e-03 to 1.145e-02 and why a genuine
+# momentum fix did the same: neither amplified an error, both landed elsewhere on the same cycle.
+#
+# Averaging kills it. Over a 2000-iteration window OpenFOAM's own window-to-window variation is U 6.05e-04
+# / p 5.60e-04 / k 2.92e-03 -- a 27x reduction on U -- and the mean is STATIONARY: the window at
+# 4000..6000 agrees with the one at 20000..29000 to U 5.25e-04 / p 1.24e-03, which is what lets this gate
+# take its window early instead of running to 29000. The comparison then resolves a real difference
+# between the codes (brae vs OpenFOAM 2.68e-03 on U) well clear of that 6.05e-04 noise floor.
+#
+# Use it ONLY with that evidence. A case that does converge should be compared at its converged state;
+# averaging there would hide a defect inside a mean that is dominated by iterates nobody is testing.
+WINDOW="${6:-}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
 TUT=/usr/lib/openfoam/openfoam2412/tutorials/incompressible/simpleFoam
@@ -90,7 +122,7 @@ then
 else
     cp -r "$TUT/$CASE" "$W/of" || exit 1
 fi
-GATE_ENDTIME="$ENDTIME" python3 - "$W/of" <<'PY'
+GATE_ENDTIME="$ENDTIME" GATE_RESCONTROL="$RESCONTROL" python3 - "$W/of" <<'PY'
 import re, sys, os
 c = os.path.join(sys.argv[1], 'system/controlDict')
 s = open(c).read()
@@ -99,9 +131,30 @@ s = re.sub(r'^writeFormat .*',    'writeFormat     ascii;', s, flags=re.M)
 s = re.sub(r'^writePrecision .*', 'writePrecision  15;', s, flags=re.M)
 et = os.environ.get('GATE_ENDTIME', '')
 if et:
-    s = re.sub(r'^endTime .*',       'endTime         %s;' % et, s, flags=re.M)
-    s = re.sub(r'^writeInterval .*', 'writeInterval   %s;' % et, s, flags=re.M)
+    # `<endTime>` writes once at the end; `<endTime>/<writeInterval>` writes repeatedly, which is what a
+    # WINDOW mean needs -- there is nothing to average if the run writes a single time directory.
+    end, _, every = et.partition('/')
+    s = re.sub(r'^endTime .*',       'endTime         %s;' % end, s, flags=re.M)
+    s = re.sub(r'^writeInterval .*', 'writeInterval   %s;' % (every or end), s, flags=re.M)
+    s = re.sub(r'^purgeWrite .*',    'purgeWrite      0;', s, flags=re.M)
 open(c, 'w').write(s)
+# ...and the residualControl both codes stop on, when the caller asks for a deeper one. Substituted into
+# the SIMPLE dict of the case OpenFOAM runs; brae's copy is taken from it afterwards, so both stop on the
+# same criterion. A case whose fvSolution has no residualControl block gets one inserted.
+rcb = os.environ.get('GATE_RESCONTROL', '')
+# EMPTY strips the criteria: on a case being compared by a window mean the run must reach the end of the
+# window, and a residualControl that fired inside it would leave too few times to average.
+if rcb == 'EMPTY':
+    rcb = ' '
+if rcb:
+    f = os.path.join(sys.argv[1], 'system/fvSolution')
+    s = open(f).read()
+    s, n = re.subn(r'residualControl\s*\{[^{}]*\}', 'residualControl { %s }' % rcb, s)
+    if not n:
+        s, n = re.subn(r'(SIMPLE\s*\{)', r'\1\n    residualControl { %s }' % rcb, s, count=1)
+        if not n:
+            raise SystemExit('the case has no SIMPLE dict to put a residualControl in')
+    open(f, 'w').write(s)
 PY
 # Allrun's EXIT STATUS is not the test -- rotatingCylinders ends with a `./plot` step that fails when
 # gnuplot is absent, long after simpleFoam has run and written its result. What matters is whether
@@ -164,7 +217,7 @@ esac
 ( cd "$W/brae" && timeout 2400 "$BRAE" . > run.log 2>&1 ) \
     || { echo "FAIL: brae refused or crashed on $CASE"; grep -viE 'NOTICE' "$W/brae/run.log" | tail -8; exit 1; }
 
-GATE_BOUNDS="$BOUNDS" GATE_CASE="$SPEC" GATE_STEADY="$STEADY" python3 - "$W" <<'PY'
+GATE_BOUNDS="$BOUNDS" GATE_CASE="$SPEC" GATE_STEADY="$STEADY" GATE_WINDOW="$WINDOW" python3 - "$W" <<'PY'
 import os, re, sys
 import numpy as np
 W = sys.argv[1]
@@ -173,6 +226,12 @@ BOUND = {k: float(v) for k, v in (kv.split('=') for kv in os.environ['GATE_BOUND
 def lastTime(d):
     ts = [x for x in os.listdir(d) if re.fullmatch(r'[0-9]+(\.[0-9]+)?', x) and x != '0']
     return None if not ts else max(ts, key=float)
+
+# The last N written times, oldest first -- the averaging window. See WINDOW at the top of this file for
+# why a mean is the only well-defined comparison on a case that limit-cycles.
+def lastTimes(d, n):
+    ts = [x for x in os.listdir(d) if re.fullmatch(r'[0-9]+(\.[0-9]+)?', x) and x != '0']
+    return sorted(ts, key=float)[-n:]
 
 def read(d, f):
     b = open(os.path.join(d, f), 'rb').read()
@@ -200,7 +259,12 @@ print("  %s: OpenFOAM t=%s, brae t=%s" % (os.environ['GATE_CASE'], to, tb))
 
 # 1. Both must have arrived, or everything below compares trajectories. A run that satisfied the case's
 #    own residualControl counts as arrived; one that hit endTime must be at a residual worth comparing.
-print("  1. both codes reached a steady state")
+# On a windowed case this is NOT a steadiness claim -- see WINDOW at the top. The residual is still read,
+# because a run that DIVERGED must fail, but a limit cycle has no steady state to reach and saying it does
+# would be the gate asserting something the measurement contradicts.
+WINDOWED = int(os.environ.get('GATE_WINDOW') or 0) >= 2
+print("  1. " + ("neither code diverged (this case limit-cycles; a window mean is compared below)"
+                 if WINDOWED else "both codes reached a steady state"))
 for k, log in (('OpenFOAM', os.path.join(W, 'of', 'log.simpleFoam')),
                ('brae',     os.path.join(W, 'brae', 'run.log'))):
     if not os.path.exists(log):
@@ -213,16 +277,42 @@ for k, log in (('OpenFOAM', os.path.join(W, 'of', 'log.simpleFoam')),
     v = float(res[-1])
     ok = stopped or v < float(os.environ.get('GATE_STEADY', '1e-04'))
     print("     %-9s Ux %.3e  (%s)   %s" % (k, v, "residualControl" if stopped else "ran to endTime",
-                                            "ok" if ok else "FAIL: still moving"))
+                                            "ok" if ok else ("FAIL: diverging" if WINDOWED else "FAIL: still moving")))
     if not ok: rc = 1
 
 # 2. The fields.
-print("  2. brae vs OpenFOAM")
+NWIN = int(os.environ.get('GATE_WINDOW') or 0)
+print("  2. brae vs OpenFOAM" + ("" if NWIN < 2 else "  (mean of the last %d written times)" % NWIN))
 fields = [f for f in BOUND if os.path.exists(os.path.join(od, f)) and os.path.exists(os.path.join(bd, f))]
 if not fields:
     print("     FAIL: none of the named fields exist in both results"); sys.exit(1)
+
+def windowMean(root, n, f):
+    ts = lastTimes(root, n)
+    xs = []
+    for t in ts:
+        p = os.path.join(root, t, f)
+        if os.path.exists(p):
+            v = read(os.path.join(root, t), f)
+            if v is not None: xs.append(v)
+    return (np.mean(xs, axis=0), len(xs)) if xs else (None, 0)
+
+if NWIN >= 2:
+    # BOTH sides must actually HAVE the window, or a mean over one iterate would pass as a mean.
+    for k, root in (('OpenFOAM', os.path.join(W, 'of')), ('brae', os.path.join(W, 'brae'))):
+        got = len(lastTimes(root, NWIN))
+        if got < NWIN:
+            print("     FAIL: %s wrote %d of the %d times the window needs -- set writeInterval so it does"
+                  % (k, got, NWIN)); rc = 1
 for f in fields:
-    e = rel(read(bd, f), read(od, f))
+    if NWIN >= 2:
+        a, na = windowMean(os.path.join(W, 'brae'), NWIN, f)
+        b, nb = windowMean(os.path.join(W, 'of'), NWIN, f)
+        if a is None or b is None or na != nb:
+            print("     %-8s FAIL: window of %d/%d times" % (f, na, nb)); rc = 1; continue
+    else:
+        a, b = read(bd, f), read(od, f)
+    e = rel(a, b)
     ok = e < BOUND[f]
     print("     %-8s L2 rel %.3e   %s" % (f, e, "ok" if ok else "FAIL (> %.0e)" % BOUND[f]))
     if not ok: rc = 1

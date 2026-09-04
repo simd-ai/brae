@@ -540,6 +540,12 @@ target_link_libraries(test_empty_patch_inert PRIVATE brae_core)
 # loosening backwardFacingStep2D's bound to accommodate a change, which is the failure mode this port
 # exists to avoid. The binary is built so the requirement stays executable and the measurement stays
 # reproducible; enforcing it needs a convergence-robust comparison on that tutorial first.
+#
+# THAT COMPARISON NOW EXISTS (2026-09-03): backwardFacingStep2D is gated on a WINDOW MEAN, because the
+# case limit-cycles and a single iterate was never a comparable quantity -- OpenFOAM moves U by 1.66e-02
+# between two of its own iterates. A perturbation that shifts the phase moves the mean by ~5e-04, inside
+# OpenFOAM's own noise floor. So this blocker is lifted in principle; registering the test still needs its
+# own measurement through the windowed gate, which nothing here has done.
 
 add_executable(test_rho_angledduct_structural tests/test_rho_angledduct_structural.cu)
 target_include_directories(test_rho_angledduct_structural PRIVATE ${BRAE_HEADER_DIRS})
@@ -1071,9 +1077,18 @@ add_test(NAME tutorial_rotatingcylinders
                  rotatingCylinders U=2e-03,p=3e-03)
 set_tests_properties(tutorial_rotatingcylinders PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
 
+# COMPARED AS A WINDOW MEAN, and the bounds below are ~2x what the mean actually achieves. This case has
+# no steady state: OpenFOAM's own p residual sits at ~2.1e-02 for 20000 iterations and oscillates rather
+# than falling, and against ITSELF 250 iterations apart it moves U by 1.66e-02 -- more than the 1e-02
+# bound brae used to be held to at a single iterate. Averaging the last 21 writes (4000..6000) cuts
+# OpenFOAM's own window-to-window variation to 6.05e-04 on U, and that mean is stationary (the window at
+# 4000..6000 matches the one at 20000..29000 to 5.25e-04), which is why the window can be taken this
+# early. Measured brae vs OpenFOAM: U 2.650e-03, p 3.363e-03, k 8.316e-03, omega 6.537e-04, nut 6.550e-03
+# -- every one of them tighter than the single-iterate bound it replaces. See WINDOW in the script.
 add_test(NAME tutorial_backwardfacingstep2d
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
-                 backwardFacingStep2D U=1e-02,p=2e-02,k=3e-02,omega=5e-03,nut=2e-02)
+                 backwardFacingStep2D U=6e-03,p=8e-03,k=2e-02,omega=2e-03,nut=1.5e-02
+                 1e-04 6000/100 EMPTY 21)
 set_tests_properties(tutorial_backwardfacingstep2d PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
 
 # The MULTI-SETUP tutorials. bump2D and turbulentFlatPlate are not single cases: each ships a
