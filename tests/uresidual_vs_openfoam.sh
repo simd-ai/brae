@@ -128,14 +128,16 @@ def say(msg, ok):
     print('  %-70s %s' % (msg, 'ok' if ok else 'FAIL'))
     if not ok: fail = 1
 
-# ARM 1 -- the report is the max over the components OpenFOAM solved, and excludes the empty direction.
+# ARM 1 -- the component SET, now that brae actually skips what OpenFOAM skips. This arm used to assert
+# only that the REPORT excluded the empty direction, because the solve could not be dropped: brae's H_z
+# was live where OpenFOAM's is identically zero (fvMatrix<Type>::H()'s validComponents block, ported
+# under queue item 45), so without the z solve Uz grew to 13% of |U| by iteration 200 on pitzDaily. With
+# H_z zeroed it stays at 1.1e-16 relative and the solve goes.
 ofset = set(re.findall(r'Solving for U([xyz]),', ofl))
-per = dict((int(k), float(v)) for k, v in re.findall(r'\[U(\d)\] nIter=\d+ init=([0-9.eE+-]+)', brl))
+brset = set('xyz'[int(k)] for k in re.findall(r'\[U(\d)\]', brl))
 br = float(re.search(r'U initial residual = ([0-9.eE+-]+)', brl).group(1))
-say('ARM 1  OpenFOAM solved {%s}; brae reports max over its x,y and not z (z = %.3e)'
-    % (','.join(sorted(ofset)), per.get(2, float('nan'))),
-    ofset == {'x', 'y'} and 2 in per and abs(br - max(per[0], per[1])) <= 2e-3 * max(per[0], per[1])
-    and per[2] > max(per[0], per[1]))
+say('ARM 1  OpenFOAM solved {%s}, brae solved {%s}'
+    % (','.join(sorted(ofset)), ','.join(sorted(brset))), ofset == brset and ofset == {'x', 'y'})
 say('ARM 1  brae names the knocked-out direction in its log',
     'empty patches knock out a solution direction' in brl)
 
@@ -153,10 +155,8 @@ say('CONTROL  Uy/Ux = %.3f >= %.2f, so component 0 would read %.1f%% low'
 p3 = os.path.join(W, 'br3d', 'run.log')
 if os.path.exists(p3):
     b3 = open(p3).read()
-    p3v = dict((int(k), float(v)) for k, v in re.findall(r'\[U(\d)\] nIter=\d+ init=([0-9.eE+-]+)', b3))
-    b3r = float(re.search(r'U initial residual = ([0-9.eE+-]+)', b3).group(1))
-    say('ARM 3  3D fixture: brae reports the max over ALL THREE (no direction masked)',
-        len(p3v) == 3 and abs(b3r - max(p3v.values())) <= 2e-3 * max(p3v.values()))
+    s3 = set('xyz'[int(k)] for k in re.findall(r'\[U(\d)\]', b3))
+    say('ARM 3  3D fixture: brae solves all three', s3 == {'x', 'y', 'z'})
     say('ARM 3  3D fixture: no direction is knocked out',
         'empty patches knock out a solution direction' not in b3)
 else:

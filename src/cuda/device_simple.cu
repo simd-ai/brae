@@ -174,10 +174,23 @@ void deviceMatrixH(
     const DeviceBuffer<scalar>& sourceK,
     const DeviceBuffer<scalar>& bdDiagK,
     const DeviceBuffer<scalar>& bdSrcK,
-    DeviceBuffer<scalar>& Hk)
+    DeviceBuffer<scalar>& Hk,
+    bool valid)
 {
     const int nC = dm.nCells;
     Hk.resize(nC);
+    // fvMatrix<Type>::H()'s closing block: a component polyMesh::solutionD() knocks out comes back
+    // identically zero (fvMatrix.C, the validComponents loop after correctBoundaryConditions). Done
+    // here rather than at the call sites so the device and the host twin brae::matrixH stay the SAME
+    // function -- tests/test_gpu_vs_cpp compares them component by component, and zeroing only one arm
+    // would turn its relative check into an absolute one on a reference that is identically zero.
+    if (!valid)
+    {
+        cudaCheck(cudaMemsetAsync(Hk.data(), 0, static_cast<std::size_t>(nC) * sizeof(scalar),
+                                  cudaStreamPerThread),
+                  "matrixH knocked-out component");
+        return;
+    }
     matrixHKernel<<<nBlocks(nC), TPB>>>(nC, A.ownerStart, A.losort, A.losortStart, A.upper, A.lower, A.owner, A.nei,
                                         psiK.data(), sourceK.data(), dm.V.data(), dm.bndCellStart.data(), dm.bndPerm.data(),
                                         bdDiagK.data(), bdSrcK.data(), Hk.data());

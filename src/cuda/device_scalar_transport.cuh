@@ -233,7 +233,14 @@ void deviceSolveScalarTransport(
     // OF DILU preconditioner for this field's BiCGStab; null keeps Jacobi. LAST in the list so every
     // existing positional call is untouched. The level schedule depends only on the mesh, so ONE
     // instance serves every field -- diluUpdate recomputes rD from the current matrix per solve.
-    const DeviceDilu* precon = nullptr)
+    const DeviceDilu* precon = nullptr,
+    // fvSolution solvers/<field>/nSweeps (smoothSolver.C:78, default 1): smoothing sweeps between
+    // residual EVALUATIONS, so the stop test is consulted only on a multiple of it and the solve
+    // overshoots its relTol by whatever the extra sweeps buy. Trailing, like `precon`, so every existing
+    // positional call keeps its behaviour exactly. Meaningful only on the smoothSolver path -- the
+    // BiCGStab branch below has no such control, which is OpenFOAM's rule too (nSweeps lives on
+    // smoothSolver alone).
+    int nSweeps = 1)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> Df;
@@ -489,7 +496,7 @@ void deviceSolveScalarTransport(
     // one, not symGaussSeidelSmoother's index order (device_amg.cuh). Announced by
     // linear_solver_setup.cuh. nSweeps is not threaded here yet -- queue item 47 -- so this runs one
     // sweep per residual evaluation whatever the case says, which the V2 envelope also announces.
-    if (gs) deviceSymGaussSeidel(sv, B, field, normF, tol, relTolKE, 3000, &perf);
+    if (gs) deviceSymGaussSeidel(sv, B, field, normF, tol, relTolKE, 3000, &perf, /*minIter*/0, nSweeps);
     // DILU when the case asks for it, Jacobi otherwise. NOT a cost choice: both reach the requested
     // relTol, but they stop in different places -- on turbulentFlatPlate:kEpsilon OpenFOAM's DILU solve
     // lands at a median 0.0064 of the initial residual against brae's Jacobi 0.0726, and that gap leaves

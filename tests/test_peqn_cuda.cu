@@ -11,6 +11,7 @@
 //
 // Run: test_peqn_cuda <caseDir> <timeDir> [laminar]
 #include "primitive_mesh.cuh"
+#include "solution_directions.cuh"   // fvMatrix<Type>::H()'s validComponents mask
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
@@ -184,6 +185,14 @@ int main(int argc, char** argv)
     gpin.consistent = true;
     gpin.takeUAtBoundary = &dTakeU;
     gpin.adjustable = &dAdjust;
+    // The SAME validComponents mask the host reference derives inside matrixH from the patch list
+    // (fvMatrix<Type>::H()'s closing block). This input is built BY HAND, which is exactly the harness
+    // hazard the driver's own comment warns about: without this the device arm leaves H_z live where the
+    // reference zeroes it, and `HbyA z` reads 6.885e-03 against a reference of identically zero.
+    {
+        const SolutionDirections sd = solutionDirections(fvp);
+        for (int cmpt = 0; cmpt < 3; ++cmpt) gpin.solutionD[cmpt] = sd.d[cmpt];
+    }
 
     gpu::PressureStages gst;
     gpu::pressurePredictor(gst, dm, dbU, MU, dUx, dUy, dUz, gpin, &dbP, &dP);

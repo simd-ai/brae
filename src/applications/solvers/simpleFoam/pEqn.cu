@@ -124,7 +124,8 @@ void pressurePredictor(
         deviceAxpy(-1.0, UEqn.iC[k], bdDiagK);
 
         DeviceBuffer<scalar> Hk;
-        deviceMatrixH(A, dm, *U[k], UEqn.source[k], bdDiagK, UEqn.bC[k], Hk);
+        deviceMatrixH(A, dm, *U[k], UEqn.source[k], bdDiagK, UEqn.bC[k], Hk,
+                      in.solutionD[k] > 0);
         deviceHadamard(st.HbyA[k], st.rAU, Hk);
     }
 

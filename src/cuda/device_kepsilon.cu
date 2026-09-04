@@ -707,7 +707,8 @@ void deviceKEpsilonCorrect(
                             const DeviceBuffer<label>*  fvoKMask,
                             const DeviceBuffer<scalar>* fvoKVal,
                             const DeviceBuffer<label>*  fvoEMask,
-                            const DeviceBuffer<scalar>* fvoEVal)        // compressible: mu at boundary faces (the +mu of rho*D+mu)
+                            const DeviceBuffer<scalar>* fvoEVal,       // compressible: mu at boundary faces (the +mu of rho*D+mu)
+                            int nSweeps)                              // solvers/<field>/nSweeps; see the declaration
 {
     const int nC = dm.nCells;
     // production + divU, wall functions + near-wall override.
@@ -832,7 +833,11 @@ void deviceKEpsilonCorrect(
                                    if (co.realizable) deviceEpsReactionRealizable(dm, eps, k, magS, nu, co.C2, diag, src);
                                    else               deviceEpsReaction(dm, eps, k, gByNu, divU, diag, src, co, rho); },
                                &wall, &eps0, ami, cyc, eDdt, DepsB.size() ? &DepsB : nullptr, gradScalarLimitK,
-                               true, fvoEMask, fvoEVal);
+                               true, fvoEMask, fvoEVal,
+                               // limField/limGrad* null (a scalar builds its own limiter), precon null
+                               // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
+                               /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
+                               /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps);
 
     // k equation (loose solve)
     DeviceBuffer<scalar> Dk(static_cast<std::size_t>(nC));
@@ -842,7 +847,11 @@ void deviceKEpsilonCorrect(
                                relaxK, tol, relTolKE, keCheckEvery, gsK,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceKReaction(dm, k, eps, G, divU, diag, src, rho); },
                                nullptr, nullptr, ami, cyc, kDdt, DkB.size() ? &DkB : nullptr, gradScalarLimitK,
-                               true, fvoKMask, fvoKVal);
+                               true, fvoKMask, fvoKVal,
+                               // limField/limGrad* null (a scalar builds its own limiter), precon null
+                               // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
+                               /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
+                               /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps);
 
     // correctNut (cell): nut = Cmu k^2 / eps (realizableKE: rCmu k^2 / eps with the variable Cmu).
     if (co.realizable) deviceRealizableNut(rCmu, k, eps, nut);

@@ -37,6 +37,11 @@ struct PressureInput
     scalar snGradLimitCoeff = 0.0;   // `limited <k> corrected` (OF limitedSnGrad)   // `corrected` laplacianSchemes
     bool   hasMRF = false;       // refused
     bool   hasFvOptions = false; // refused
+    // polyMesh::solutionD(): +1 solved, -1 knocked out by an EMPTY patch. fvMatrix<Type>::H() zeroes
+    // every knocked-out component before returning (fvMatrix.C's validComponents block), which is what
+    // keeps OpenFOAM's empty direction from feeding back through HbyA. The step cannot derive it from a
+    // DeviceMesh, so the driver supplies it; all-solved is right only for a mesh with no empty patch.
+    int    solutionD[3] = {1, 1, 1};
     // adjustPhi's per-boundary-face mask: 1 where the U patch does NOT fix a value, i.e. where the flux
     // may be scaled. Built host-side from !U.boundary[pi]->fixesValue(), matching adjustPhi.C -- which
     // branches on fixesValue(), NOT on assignable(). constrainHbyA below branches on the other one.

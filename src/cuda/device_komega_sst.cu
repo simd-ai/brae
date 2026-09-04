@@ -932,7 +932,8 @@ void deviceKOmegaSSTCorrect(
     const DeviceBuffer<scalar>* fvoKVal,
     const DeviceBuffer<label>*  fvoEMask,
     const DeviceBuffer<scalar>* fvoEVal,     // compressible: mu at boundary faces (the +mu of rho*D+mu)
-    const DeviceBuffer<scalar>* lesDelta)    // case `delta` (maxDeltaxyz); null = OF's cubeRootVol
+    const DeviceBuffer<scalar>* lesDelta,    // case `delta` (maxDeltaxyz); null = OF's cubeRootVol
+    int nSweeps)                             // solvers/<field>/nSweeps; see the declaration
 {
     const int nC = dm.nCells;
     // production (raw GbyNu0) + G = nut*GbyNu0, divU, S2 (shared gradU = OF tgradU = grad(U) scheme).
@@ -1071,7 +1072,11 @@ void deviceKOmegaSSTCorrect(
                                relaxOmega, tol, relTolKE, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceOmegaReaction(dm.V, gamma, beta, GbyNu0lim, F1, CD, omega, divU, diag, src, rho); },
                                &wall, &omega0, ami, cyc, sDdt, DomB.size() ? &DomB : nullptr, gradScalarLimitK,
-                               true, fvoEMask, fvoEVal);
+                               true, fvoEMask, fvoEVal,
+                               // limField/limGrad* null (a scalar builds its own limiter), precon null
+                               // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
+                               /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
+                               /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps);
     deviceBoundField(dm, omega, 1e-15);   // OF bound(omega_, omegaMin_)
 
     // k equation (loose solve)
@@ -1082,7 +1087,11 @@ void deviceKOmegaSSTCorrect(
                                relaxK, tol, relTolKE, keCheckEvery, gsK,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceKReactionSST(dm.V, k, omega, G, divU, co, diag, src, gammaIntEff, des ? &FDES : nullptr, rho); },
                                nullptr, nullptr, ami, cyc, kDdt, DkB.size() ? &DkB : nullptr, gradScalarLimitK,
-                               true, fvoKMask, fvoKVal);
+                               true, fvoKMask, fvoKVal,
+                               // limField/limGrad* null (a scalar builds its own limiter), precon null
+                               // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
+                               /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
+                               /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps);
     deviceBoundField(dm, k, 1e-15);   // OF bound(k_, kMin_)
 
     // correctNut (Bradshaw): nut = a1*k / max(a1*omega, b1*F2*sqrt(S2)).

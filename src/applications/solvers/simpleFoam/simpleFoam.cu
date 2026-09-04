@@ -206,6 +206,7 @@ Residuals simpleStep(
         scalar uInitialResidual = 0.0;
         for (int k = 0; k < 3; ++k)
         {
+            if (in.solutionD[k] < 0) continue;   // TRIAL: item 35's skip
             DeviceBuffer<scalar> diagC, b;
             deviceFold(dm, Mp.relaxed ? Mp.relaxedDiag : Mp.diag, Mp.source[k], Mp.iC[k], Mp.bC[k], diagC, b);
             const DeviceLduView A = foldedView(dm, Mp, diagC);
@@ -254,6 +255,7 @@ Residuals simpleStep(
     pin.mrf = in.mrf;
     pin.adjustable = in.adjustable;
     pin.takeUAtBoundary = in.takeUAtBoundary;
+    for (int cmpt = 0; cmpt < 3; ++cmpt) pin.solutionD[cmpt] = in.solutionD[cmpt];
 
     PressureStages st;
     pressurePredictor(st, dm, dbU, MU, f.Ux, f.Uy, f.Uz, pin, &dbP, &f.p);

@@ -36,6 +36,7 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include "solution_directions.cuh"   // fvMatrix<Type>::H()'s validComponents mask
 
 using namespace brae;
 
@@ -264,6 +265,8 @@ int main(int argc, char** argv)
         A.ownerStart = dm.ownerStart.data();
         A.losort = dm.losort.data(); A.losortStart = dm.losortStart.data();
 
+        // The same directions matrixH applies inside itself, so the device arm can be given them too.
+        const SolutionDirections solutionD = solutionDirections(fvp);
         const std::vector<vector> Href = matrixH(UEqn, U, m, g, fvp);
         const char* nm[3] = {"H(U) x", "H(U) y", "H(U) z"};
         for (int k = 0; k < 3; ++k)
@@ -283,7 +286,12 @@ int main(int argc, char** argv)
                     bdSrcK.push_back(component(UEqn.boundaryCoeffs[pi][i], k));
                 }
             DeviceBuffer<scalar> dPsi(psiK), dSrc(srcK), dBd(bdDiagK), dBs(bdSrcK), dH;
-            deviceMatrixH(A, dm, dPsi, dSrc, dBd, dBs, dH);
+            // The SAME validComponents mask the host matrixH derives from the patch list
+            // (fvMatrix<Type>::H()'s closing block). Both arms must apply it or this comparison stops
+            // being between two implementations of one function: on a 2D fixture the reference would be
+            // identically zero, and cmp's relative check would degenerate to an absolute one on the
+            // device's own round-off (measured 3.99e-11 on matrixDumpAsym against a 1e-11 tolerance).
+            deviceMatrixH(A, dm, dPsi, dSrc, dBd, dBs, dH, solutionD.valid(k));
             cmp(dH.host(), ref, nm[k], 1e-11);
         }
     }

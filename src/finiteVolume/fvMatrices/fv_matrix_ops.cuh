@@ -12,6 +12,7 @@
 #include "fvc.cuh"   // SurfaceScalarField
 #include <cmath>
 #include <vector>
+#include "solution_directions.cuh"   // fvMatrix<Type>::H()'s validComponents block
 
 namespace brae {
 
@@ -244,6 +245,23 @@ inline std::vector<vector> matrixH(
             H[patches[pi].faceCells[i]] += M.boundaryCoeffs[pi][i];
     for (label c = 0; c < nC; ++c)
         H[c] = H[c] / g.V()[c];
+    // fvMatrix<Type>::H() ENDS by zeroing every component polyMesh::solutionD() knocks out
+    // (fvMatrix.C, the validComponents block after Hphi.correctBoundaryConditions(); the replace
+    // zeroes the internal AND the boundary field, GeometricField.C). brae never ported it, and it is
+    // what makes OpenFOAM's empty direction a dead end rather than a channel: pEqn.H's
+    // `U = HbyA - rAtU*grad(p)` rewrites all three components every iteration, so with H_z identically
+    // zero no Uz can feed back, whatever round-off the mesh carries. OpenFOAM's own Uz is NOT bit-exact
+    // zero -- measured 2.617306e-11 on pitzDaily at iteration 1, because 5018 of 24170 internal faces
+    // have a nonzero Sf_z -- so the premise that this could be left to exact arithmetic was wrong.
+    // A() and H1() carry no such block and are deliberately untouched.
+    {
+        const SolutionDirections solutionD = solutionDirections(patches);
+        for (int cmpt = 0; cmpt < 3; ++cmpt)
+        {
+            if (solutionD.valid(cmpt)) continue;
+            for (label c = 0; c < nC; ++c) setComponent(H[c], cmpt, scalar(0));
+        }
+    }
     return H;
 }
 

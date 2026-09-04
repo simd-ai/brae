@@ -116,6 +116,48 @@ done
 say "CONTROL  $nontrivial shapes have a time sequence that is not 1..N" \
     "$([ "$nontrivial" -ge 2 ] && echo ok || echo FAIL)"
 
+# ARM 5 -- THE LEGACY DRIVER'S STEP COUNT (queue item 46). Seven drivers derived it as
+# `std::lround((endTime - startTime)/deltaT)`, which disagrees with OpenFOAM's `value() < endTime -
+# 0.5*deltaT` whenever that ratio lands on n + 0.5. No fixture in validation/ can tell them apart -- all
+# 159 have an integer ratio -- which is why the rounding survived in seven places at once. Only the COUNT
+# is asserted: the legacy driver prints an iteration INDEX rather than OpenFOAM's time name, a separate
+# hole that is not what this arm is about. Its own fixture, because the legacy driver refuses
+# simpleBoxIO outright (a deviceAdjustPhi refusal, nothing to do with the step count).
+LEGACY_SRC="${LEGACY_SRC:-$ROOT/validation/pitzDaily}"
+if [ -d "$LEGACY_SRC" ]; then
+    for side in of_l br_l; do
+        rm -rf "$W/$side"; cp -r "$LEGACY_SRC" "$W/$side"
+        rm -rf "$W/$side"/[1-9]* "$W/$side"/log.* "$W/$side"/postProcessing
+        [ -d "$W/$side/0.orig" ] && { rm -rf "$W/$side/0"; cp -r "$W/$side/0.orig" "$W/$side/0"; }
+        python3 - "$W/$side" <<'PYEOF'
+import re, sys
+c = sys.argv[1] + '/system/controlDict'; s = open(c).read()
+s = re.sub(r'startFrom\s+\S+;',  'startFrom       startTime;', s)
+s = re.sub(r'startTime\s+\S+;',  'startTime       0;',   s)
+s = re.sub(r'endTime\s+\S+;',    'endTime         1;',   s)
+s = re.sub(r'deltaT\s+\S+;',     'deltaT          0.4;', s)
+s = re.sub(r'functions\s*\{.*\n\}', 'functions\n{\n}', s, flags=re.S)
+open(c, 'w').write(s)
+f = sys.argv[1] + '/system/fvSolution'; s = open(f).read()
+open(f, 'w').write(re.sub(r'residualControl\s*\{[^}]*\}', 'residualControl { }', s, flags=re.S))
+PYEOF
+    done
+    ( cd "$W/of_l" && simpleFoam > run.log 2>&1 ) || { echo "FAIL: OpenFOAM on the ratio-2.5 shape"; exit 1; }
+    if ( cd "$W/br_l" && "$BRAE" "$W/br_l" > run.log 2>&1 ); then
+        ofn=$(grep -c '^Time = ' "$W/of_l/run.log")
+        brn=$(grep -c '^Time = ' "$W/br_l/run.log")
+        say "ARM 5  legacy driver takes $brn steps, OpenFOAM takes $ofn (start 0, end 1, dt 0.4)" \
+            "$([ "$ofn" = "$brn" ] && echo ok || echo FAIL)"
+        # C++ std::lround rounds HALF AWAY FROM ZERO; python round() is banker's and would give 2 here,
+        # which would make this control silently agree with OpenFOAM and gate nothing.
+        lr=$(python3 -c "import math; print(int(math.floor((1-0)/0.4 + 0.5)))")
+        say "CONTROL  a rounded quotient would give $lr here, not $ofn" \
+            "$([ "$lr" != "$ofn" ] && echo ok || echo FAIL)"
+    else
+        echo "  ARM 5    skipped: the legacy driver refuses $LEGACY_SRC"
+    fi
+fi
+
 # The refusal: endTime not beyond startTime.
 stage "$W/ref" 0 5 1
 ( cd "$W/ref" && simpleFoam > seed.log 2>&1 ) || { echo "FAIL: seeding the refusal arm"; exit 1; }

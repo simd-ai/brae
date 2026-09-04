@@ -13,7 +13,14 @@ namespace brae {
 // bdDiagK = (cmptAv(ic)-ic_k) per boundary face; bdSrcK = boundaryCoeffs_k per boundary face (host-flattened).
 void deviceMatrixH(const DeviceLduView& A, const DeviceMesh& dm, const DeviceBuffer<scalar>& psiK,
                    const DeviceBuffer<scalar>& sourceK, const DeviceBuffer<scalar>& bdDiagK,
-                   const DeviceBuffer<scalar>& bdSrcK, DeviceBuffer<scalar>& Hk);
+                   const DeviceBuffer<scalar>& bdSrcK, DeviceBuffer<scalar>& Hk,
+                   // fvMatrix<Type>::H() ends by zeroing every component polyMesh::solutionD() knocks
+                   // out (fvMatrix.C's validComponents block). This parameter is that block: false for a
+                   // direction an EMPTY patch removed, and Hk comes back identically zero. The host twin
+                   // brae::matrixH derives it from the patch list; here the caller must supply it,
+                   // because a DeviceMesh cannot recover a patch type. Default true = a mesh with no
+                   // empty patch, which is the only case where solving all three is right.
+                   bool valid = true);
 
 // rAU = V/diagC  (A = diagC/V, rAU = 1/A). diagC already folded (= diag + internalCoeffs cmptAv).
 void deviceReciprocalV(const DeviceMesh& dm, const DeviceBuffer<scalar>& diagC, DeviceBuffer<scalar>& rAU);

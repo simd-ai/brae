@@ -330,7 +330,15 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
                             const DeviceBuffer<label>*  fvoKMask = nullptr,
                             const DeviceBuffer<scalar>* fvoKVal  = nullptr,
                             const DeviceBuffer<label>*  fvoEMask = nullptr,
-                            const DeviceBuffer<scalar>* fvoEVal  = nullptr);
+                            const DeviceBuffer<scalar>* fvoEVal  = nullptr,
+                            // fvSolution solvers/<field>/nSweeps (smoothSolver.C:78, default 1):
+                            // smoothing sweeps between residual EVALUATIONS, so the stop test is
+                            // consulted only on a multiple of it. Read from the TRANSPORTED field's own
+                            // entry; meaningful only on the smoothSolver path. brae ran one sweep per
+                            // evaluation whatever the case said -- validation/airFoil2D ships
+                            // `nSweeps 2` on nuTilda and brae's counts were ODD where OpenFOAM's were
+                            // even in all 50 of its solves.
+                            int nSweeps = 1);
 
 // Closed device kOmegaSST::correct(): production (raw GbyNu0 + omega-wall G0 override) -> F1/F2/CDkOmega/S2 ->
 // omega eqn (loose solve, omega-wall setValues) -> bound -> k eqn (loose solve) -> bound -> correctNut (Bradshaw
@@ -375,7 +383,12 @@ void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, co
                             const DeviceBuffer<scalar>* fvoEVal  = nullptr,
                             // The case's LES filter width (`delta maxDeltaxyz`); null keeps OF's
                             // cubeRootVol. Must match what the convection scheme uses.
-                            const DeviceBuffer<scalar>* lesDelta = nullptr);
+                            const DeviceBuffer<scalar>* lesDelta = nullptr,
+                            // fvSolution solvers/<field>/nSweeps (smoothSolver.C:78, default 1):
+                            // smoothing sweeps between residual EVALUATIONS, so the stop test is
+                            // consulted only on a multiple of it. Read from the TRANSPORTED field's own
+                            // entry; meaningful only on the smoothSolver path.
+                            int nSweeps = 1);
 
 // nuWall[i] = nuBnd[wfBndIdx[i]] -- OF nu(patchi) re-indexed from boundary-face into wall-face ordering.
 void deviceGatherWallNu(const DeviceBuffer<label>& wfBndIdx, const DeviceBuffer<scalar>& nuBnd,
@@ -425,7 +438,8 @@ void deviceSpalartAllmarasCorrect(const DeviceMesh& dm, const DeviceVectorBounda
                                   // gradSchemes entry. There was no such parameter, so SA's Omega ran
                                   // unlimited on every driver: measured on windAroundBuildingsBox at
                                   // t=400, Omega peaks at 7.14e-01 unlimited against 3.24e-02 limited.
-                                  scalar gradULimitK = 0.0);
+                                  scalar gradULimitK = 0.0,
+                                  int nSweeps = 1);   // solvers/nuTilda/nSweeps; see deviceKEpsilonCorrect
 
 // Standalone SA correctNut (nut = nuTilda*fv1(nuTilda)) for the solver startup validate().
 void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, DeviceBuffer<scalar>& nut);

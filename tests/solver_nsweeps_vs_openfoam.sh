@@ -30,6 +30,7 @@ BRAE="${BRAE_BIN:-$ROOT/build/brae}"
 SRC="${1:-$ROOT/validation/simpleBoxIO}"
 OFBASHRC=${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
 CONTROL_RATIO=${CONTROL_RATIO:-10}
+SA_SRC="${2:-$ROOT/validation/airFoil2D}"
 
 [ -x "$BRAE" ]     || { echo "SKIP: no brae at $BRAE"; exit 77; }
 [ -d "$SRC" ]      || { echo "SKIP: fixture $SRC missing"; exit 77; }
@@ -104,6 +105,42 @@ rc |= say('ARM 2  brae at nSweeps 2 is %.1fx further down than at 1' % (b1 / b2)
 sys.exit(rc)
 PY
 [ $? -eq 0 ] || fail=1
+
+# ARM 5 -- THE TRANSPORTED TURBULENCE SCALAR. Item 40 wired nSweeps into the momentum solve only, and the
+# turbulence half was announced instead. validation/airFoil2D really does ship `nSweeps 2` on nuTilda
+# beside `solver smoothSolver`, and brae ran it on Jacobi-BiCGStab at brae's own tolerance -- because the
+# whole turbulence solver-control block was guarded on the literal `solvers/k`, which a SpalartAllmaras
+# case does not have. Measured before: nuTilda counts 31, 29, 31 (odd, and not even a smoothSolver).
+# OpenFOAM's own counts on that fixture at nSweeps 2 were EVEN in all 50 of its solves.
+if [ -d "$SA_SRC" ]; then
+    rm -rf "$W/sa"; cp -r "$SA_SRC" "$W/sa"; rm -rf "$W"/sa/[1-9]* "$W"/sa/log.*
+    python3 - "$W/sa" <<'PYEOF'
+import re, sys
+c = sys.argv[1] + '/system/controlDict'; s = open(c).read()
+s = re.sub(r'endTime\s+\S+;', 'endTime         3;', s)
+s = re.sub(r'functions\s*\{.*\n\}', 'functions\n{\n}', s, flags=re.S)
+open(c, 'w').write(s)
+PYEOF
+    ( cd "$W/sa" && BRAE_SIMPLEFOAM_V2=1 BRAE_TURB_RESID=1 "$BRAE" "$W/sa" > run.log 2>&1 ) \
+        || { echo "FAIL: brae crashed on the SA arm"; tail -8 "$W/sa/run.log"; exit 1; }
+    nsw=$(python3 -c "
+import re,sys
+s=open('$SA_SRC/system/fvSolution').read()
+m=re.search(r'nuTilda\s*\{[^}]*\}', s, re.S)
+n=re.search(r'nSweeps\s+(\d+)\s*;', m.group(0)) if m else None
+print(n.group(1) if n else 1)")
+    cnt=$(grep -oP 'Solving for nuTilda,.*No Iterations \K[0-9]+' "$W/sa/run.log" | head -3 | tr '\n' ' ')
+    bad=$(python3 -c "
+ns=int('$nsw'); c='$cnt'.split()
+print(0 if c and all(int(x)%ns==0 and int(x)>=ns for x in c) else 1)")
+    say "ARM 5  nuTilda counts [$cnt] are multiples of its own nSweeps $nsw" \
+        "$([ "$bad" = "0" ] && echo ok || echo FAIL)"
+    grep -q "solver=smoothSolver" "$W/sa/run.log" \
+        && say "ARM 5  the SA case's own smoothSolver selection is read (it has no solvers/k)" ok \
+        || say "ARM 5  the SA case's own smoothSolver selection is read (it has no solvers/k)" FAIL
+    say "CONTROL  that fixture's nuTilda really does set nSweeps > 1" \
+        "$([ "$nsw" -gt 1 ] && echo ok || echo FAIL)"
+fi
 
 # The refusal.
 stage "$W/neg" -3

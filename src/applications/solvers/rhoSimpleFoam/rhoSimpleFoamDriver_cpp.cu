@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "start_time.cuh"   // openFoamNSteps: OF Time::run's own step count
 
 namespace brae {
 namespace cpu {
@@ -350,8 +351,12 @@ int runMirror(const std::string& caseDir)
     // count, the write times, and any comparison of a restarted run against a continuous one.
     const scalar endTime = controlDict.scalarOr("endTime", 0.0);
     const scalar tStart  = wc.startTime();
-    const long nSteps = std::lround((static_cast<double>(endTime) - static_cast<double>(tStart))
-                                    / static_cast<double>(wc.deltaT()));
+    // OF Time::run tests `value() < endTime - 0.5*deltaT` and operator++ ACCUMULATES the value
+    // (Time.C:785, :1067). std::lround on the quotient disagrees at ratio n + 0.5: measured, real
+    // OpenFOAM runs 2 steps at startTime 0 / endTime 1 / deltaT 0.4 where lround gives 3.
+    const long nSteps = openFoamNSteps(static_cast<double>(tStart),
+                                       static_cast<double>(endTime),
+                                       static_cast<double>(wc.deltaT()));
     if (nSteps < 1)
         throw std::runtime_error(
             "brae rhoSimpleFoam (mirror): controlDict endTime (" + std::to_string((double)endTime)

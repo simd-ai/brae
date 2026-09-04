@@ -668,8 +668,12 @@ int main(int argc, char** argv)
         // `iter <= endTime` from 1, which on that restart ran TWENTY steps and finished at 30 -- silently
         // changing the iteration count, the write times, and any comparison of a restarted run against a
         // continuous one. Only correct when startTime is 0, which is why every fresh-start case hid it.
-        const long nSteps = std::lround((static_cast<double>(endTime) - static_cast<double>(tStart))
-                                        / static_cast<double>(wc.deltaT()));
+        // OF Time::run tests `value() < endTime - 0.5*deltaT` and operator++ ACCUMULATES the value
+        // (Time.C:785, :1067). std::lround on the quotient disagrees at ratio n + 0.5: measured, real
+        // OpenFOAM runs 2 steps at startTime 0 / endTime 1 / deltaT 0.4 where lround gives 3.
+        const long nSteps = openFoamNSteps(static_cast<double>(tStart),
+                                           static_cast<double>(endTime),
+                                           static_cast<double>(wc.deltaT()));
         if (nSteps < 1)
             throw std::runtime_error(
                 "controlDict endTime (" + std::to_string(endTime) + ") is not beyond the start time ("
