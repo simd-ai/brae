@@ -3,6 +3,9 @@
 #include "device_blas.cuh"
 #include "device_pcg.cuh"
 #include "device_simple.cuh"
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 
 namespace brae {
 namespace gpu {
@@ -32,6 +35,53 @@ DeviceLduView foldedView(const DeviceMesh& dm, const PressureMatrix& P, const De
     A.ownerStart = dm.ownerStart.data();
     A.losort = dm.losort.data(); A.losortStart = dm.losortStart.data();
     return A;
+}
+
+// Instrument: BRAE_STAGE_DUMP_DIR=<dir> (+ BRAE_STAGE_DUMP_ITER=n, default 1) writes this step's
+// stages as plain columns, under the SAME names tools/dumpSimpleFoam writes as OpenFOAM fields, so the
+// two can be held against each other coefficient by coefficient at one iteration. Cell fields and
+// INTERNAL faces only: both read the same polyMesh, so those two orderings are OpenFOAM's by
+// construction, while the flattened boundary array is brae's own and would need a patch map first.
+// Costs nothing unless the variable is set.
+struct DeviceStageDump
+{
+    std::string dir;
+    bool        on = false;
+
+    void scalars(const char* name, const DeviceBuffer<scalar>& v) const
+    {
+        if (!on) return;
+        const std::vector<scalar> h = v.host();
+        std::FILE* fp = std::fopen((dir + "/" + name).c_str(), "w");
+        if (!fp) return;
+        for (scalar x : h) std::fprintf(fp, "%.17g\n", (double)x);
+        std::fclose(fp);
+    }
+    void vectors(const char* name,
+                 const DeviceBuffer<scalar>& x,
+                 const DeviceBuffer<scalar>& y,
+                 const DeviceBuffer<scalar>& z) const
+    {
+        if (!on) return;
+        const std::vector<scalar> hx = x.host(), hy = y.host(), hz = z.host();
+        std::FILE* fp = std::fopen((dir + "/" + name).c_str(), "w");
+        if (!fp) return;
+        for (std::size_t i = 0; i < hx.size(); ++i)
+            std::fprintf(fp, "%.17g %.17g %.17g\n", (double)hx[i], (double)hy[i], (double)hz[i]);
+        std::fclose(fp);
+    }
+};
+
+DeviceStageDump deviceStageDump()
+{
+    DeviceStageDump d;
+    const char* dd = std::getenv("BRAE_STAGE_DUMP_DIR");
+    if (!dd) return d;
+    static int calls = 0;
+    const char* it = std::getenv("BRAE_STAGE_DUMP_ITER");
+    d.dir = dd;
+    d.on  = (++calls == (it ? std::atoi(it) : 1));
+    return d;
 }
 
 } // namespace
@@ -76,8 +126,35 @@ Residuals simpleStep(
     mi.correctedLaplacian = in.correctedLaplacian;
     mi.hasMRF = in.hasMRF;          mi.hasFvOptions = in.hasFvOptions;
 
+    const DeviceStageDump sd = deviceStageDump();
+    sd.vectors("stage_Uass", f.Ux, f.Uy, f.Uz);
+    sd.scalars("stage_phiU", f.phiInt);
+    sd.scalars("stage_V", dm.V);
+    if (in.nuEffCell) sd.scalars("stage_nuEff", *in.nuEffCell);
+
     MomentumMatrix MU;
     assembleUEqn(MU, dm, dbU, f.Ux, f.Uy, f.Uz, mi);
+
+    // The momentum system as assembled and relaxed. MU.diag is OpenFOAM's PRE-relax diagonal (relax()
+    // writes MU.relaxedDiag beside it rather than over it) and MU.source is its POST-relax source, so
+    // these line up with dumpSimpleFoam's stage_UDiag0 and stage_USrc respectively.
+    if (sd.on)
+    {
+        sd.scalars("stage_UDiag0", MU.diag);
+        sd.scalars("stage_UDiag", MU.relaxed ? MU.relaxedDiag : MU.diag);
+        sd.scalars("stage_UUpper", MU.upper);
+        sd.scalars("stage_ULower", MU.lower.size() ? MU.lower : MU.upper);
+        // The source with boundaryCoeffs folded into their face cells -- dumpSimpleFoam's stage_USrc is
+        // defined the same way, and a capture that folded differently would measure the capture.
+        DeviceBuffer<scalar> fs[3];
+        for (int k = 0; k < 3; ++k)
+        {
+            DeviceBuffer<scalar> diagC;
+            deviceFold(dm, MU.relaxed ? MU.relaxedDiag : MU.diag, MU.source[k], MU.iC[k], MU.bC[k],
+                       diagC, fs[k]);
+        }
+        sd.vectors("stage_USrc", fs[0], fs[1], fs[2]);
+    }
 
     if (in.momentumPredictor)
     {
@@ -124,6 +201,10 @@ Residuals simpleStep(
         }
     }
 
+    // U out of the momentum predictor. UEqn.H() below is built from THIS field, so it sits between
+    // the matrix and HbyA and separates a solver difference from an assembly one.
+    sd.vectors("stage_Upred", f.Ux, f.Uy, f.Uz);
+
     // ---- pEqn.H ------------------------------------------------------------------------------
     PressureInput pin;
     pin.relaxP = in.relaxP;
@@ -138,6 +219,14 @@ Residuals simpleStep(
 
     PressureStages st;
     pressurePredictor(st, dm, dbU, MU, f.Ux, f.Uy, f.Uz, pin, &dbP, &f.p);
+
+    // rAU and rAtU, the pair the whole SIMPLEC question is about. dumpSimpleFoam writes the reciprocal
+    // of rAtU as stage_rowSum -- 1/rAU - H1, which is the relaxed matrix row sum over V -- so H1 needs no
+    // separate capture here: V/rAtU is the same quantity and is what pEqn.cu actually inverts.
+    sd.scalars("stage_rAU", st.rAU);
+    sd.scalars("stage_rAtU", st.rAtU);
+    sd.vectors("stage_HbyA", st.HbyA[0], st.HbyA[1], st.HbyA[2]);
+    sd.scalars("stage_phiHbyA", st.phiHbyAInt);
 
     DeviceBuffer<scalar> rAUface;
     // rAtU, not rAU: they are the same buffer unless SIMPLEC is on, and pEqn.H's laplacian takes rAtU
@@ -225,6 +314,12 @@ Residuals simpleStep(
         deviceGaussGrad(dm, f.p, pb, gpx, gpy, gpz);
         correctVelocity(f.Ux, f.Uy, f.Uz, st, gpx, gpy, gpz);
     }
+
+    // The end of the step, before turbulence->correct() moves nut: p and U after the corrector and the
+    // conservative flux the next assembly convects by.
+    sd.scalars("stage_pOut", f.p);
+    sd.vectors("stage_Uout", f.Ux, f.Uy, f.Uz);
+    sd.scalars("stage_phiOut", f.phiInt);
 
     // simpleFoam.C:93-94 -- laminarTransport.correct(); turbulence->correct().
     if (in.correct) in.correct();
