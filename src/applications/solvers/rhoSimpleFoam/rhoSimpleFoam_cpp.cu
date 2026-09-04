@@ -314,6 +314,22 @@ struct StageDump
         for (const vector& x : v) std::fprintf(fp, "%.17g %.17g %.17g\n", (double)x.x, (double)x.y, (double)x.z);
         std::fclose(fp);
     }
+    // A vector field's BOUNDARY values, one file per patch. The mixed family's patch VALUE is a stage in
+    // its own right: OpenFOAM updates a mixed valueFraction inside the fvMatrix constructor and does not
+    // evaluate until the solve's correctBoundaryConditions, so its value at an assembly is the blend of
+    // the PREVIOUS valueFraction -- a lag a mirror that evaluates eagerly does not reproduce.
+    void vectorsBnd(const char* name, const std::vector<std::vector<vector>>& vb) const
+    {
+        if (!on) return;
+        for (std::size_t pi = 0; pi < vb.size(); ++pi)
+        {
+            std::FILE* fp = open((std::string(name) + "_b" + std::to_string(pi)).c_str());
+            if (!fp) continue;
+            for (const vector& x : vb[pi])
+                std::fprintf(fp, "%.17g %.17g %.17g\n", (double)x.x, (double)x.y, (double)x.z);
+            std::fclose(fp);
+        }
+    }
     void surface(const char* name, const SurfaceScalarField& sf) const
     {
         if (!on) return;
@@ -397,8 +413,14 @@ Residuals rhoSimpleStep(
         // STANDS: the blend p.relax() left, or the limiter's re-evaluation. Rebuilding p's valueFraction
         // here from the corrected U and re-evaluating was what kept naca0012 at 3.4e-05 (queue item 23).
     }
+    // KEPT, and it should not be: OF's fvPatchField::updateCoeffs sets a flag and the momentum fvMatrix
+    // constructor calls nothing else (fvMatrix.C:396), so a mixed patch assembles holding the NEW
+    // valueFraction beside the value its last evaluate left. Removing this line and its twin below takes
+    // naca0012 t=2 from U 5.9e-10 to 1.2e-12 -- and it was measured and then reverted, because it
+    // separates this arm from the DEVICE by 1.32e-06 on rhoBoxP, which carries the same lag. Queue item
+    // 30: both halves land together or neither does.
     f.U.evaluateBoundary();
-    // NOT he and NOT T. Nothing in OpenFOAM's iteration evaluates either before the energy equation:
+    // NOT he and NOT T either. Nothing in OpenFOAM's iteration evaluates them before the energy equation:
     // he's patch values stand as the previous solve's correctBoundaryConditions and thermo.correct()
     // left them (fixesValue patches carry HE(p_b, T_b), heRhoThermo.C:119), and T's are evaluated only
     // inside the energy conditions' updateCoeffs, at the assembly below. Evaluating both here re-derived
@@ -441,12 +463,17 @@ Residuals rhoSimpleStep(
     // equation and a fresh value where OpenFOAM carries the blend: rhoTP at t=1 read U 2.15e-02 relL2
     // against OpenFOAM with the written inlet still at the (5 0 0) seed, OpenFOAM's at (13.44 0 0).
     updatePressureInletOutletVelocity(f, patches);
-    f.U.evaluateBoundary();
-
+    f.U.evaluateBoundary();   // ...and its twin -- see the note at the first one (queue item 30).
     // ---- UEqn.H ----
     RhoMomentumInput uin;
     uin.phi = &f.phi.internal;   uin.phiBnd = &f.phi.boundary;
     sd.vectors("Uass", f.U.internal);
+    {
+        std::vector<std::vector<vector>> ub(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi) ub[pi] = f.U.boundary[pi]->value();
+        sd.vectorsBnd("Uass", ub);
+    }
+    sd.scalars("muEffAss", muEff);
     sd.scalars("rhoU", f.rho.internal);
     sd.surface("phiU", f.phi);
     sd.scalars("nutU", f.nut.internal);

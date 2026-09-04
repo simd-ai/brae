@@ -733,6 +733,31 @@ int main(int argc, char** argv)
                                 pb.push_back(reinterpret_cast<const scalar*>(&ofTb[i])[kk]);
                             }
                         }
+                        // grad(U)'s BOUNDARY, before muEff multiplies it. The dev2 row below cannot
+                        // separate the two, and it was the gradient: OF's gaussGrad boundary correction
+                        // asks the patch for snGrad() (gaussGrad.C), which on a mixed patch uses the
+                        // CURRENT valueFraction while value() still carries the blend of the previous
+                        // one. brae inlined (U_b - U_c)*deltaCoeffs -- the BASE class's formula -- and on
+                        // this fixture's freestreamVelocity inlet that read 6.5e-04, against 5.8e-13 with
+                        // the patch's own snGrad (queue item 25).
+                        {
+                            const std::vector<tensor> ofGb = readTensorPatch(
+                                caseDir + "/" + dumpT + "/stage_UgradU", patches[pi].name, patches[pi].size);
+                            if (!ofGb.empty())
+                            {
+                                std::vector<scalar> ga, gbv;
+                                for (label i = 0; i < patches[pi].size; ++i)
+                                    for (int kk = 0; kk < 9; ++kk)
+                                    {
+                                        ga.push_back(reinterpret_cast<const scalar*>(&mineTb[pi][i])[kk]);
+                                        gbv.push_back(reinterpret_cast<const scalar*>(&ofGb[i])[kk]);
+                                    }
+                                double num = 0, den = 0;
+                                for (std::size_t q = 0; q < ga.size(); ++q) { num += (ga[q]-gbv[q])*(ga[q]-gbv[q]); den += gbv[q]*gbv[q]; }
+                                std::printf("         gradU BOUNDARY on %-11s %.6e\n", patches[pi].name.c_str(),
+                                            den > 0 ? std::sqrt(num/den) : 0.0);
+                            }
+                        }
                         std::printf("         dev2 tensor on %-14s %.6e   (%ld faces)\n",
                                     patches[pi].name.c_str(), relL2(pa, pb), (long)patches[pi].size);
                     }

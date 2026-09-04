@@ -401,6 +401,9 @@ Residuals rhoSimpleStep(
 
     const DeviceStageDump sd = deviceStageDump();
     sd.vectors("Uass", f.Ux, f.Uy, f.Uz);
+    sd.scalars("UassBx", f.UxBnd);
+    sd.scalars("UassBy", f.UyBnd);
+    sd.scalars("UassBz", f.UzBnd);
     sd.scalars("rhoU", f.rho);
     sd.surface("phiU", f.phiInt, f.phiBnd);
     sd.scalars("nutU", f.nut);
