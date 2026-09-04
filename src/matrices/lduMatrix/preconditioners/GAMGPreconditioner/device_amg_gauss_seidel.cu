@@ -222,16 +222,31 @@ scalar deviceSymGaussSeidel(
     scalar relTol,
     int maxIter,
     DeviceSolverPerf* perf,
-    int minIter)
+    int minIter,
+    int nSweeps)
 {
     // minIter (fvSolution solvers/<field>/minIter) is OF's floor on the sweep count: smoothSolver.C
     // enters the loop when minIter > 0 even if the initial residual already passes, and keeps sweeping
     // until nIterations >= minIter. The three opt-in fast paths below bake the stop test without it, so
     // a floor takes the host loop, which honours it exactly.
     const bool floored = minIter > 0;
+    // nSweeps (fvSolution solvers/<field>/nSweeps, smoothSolver.C:78, default 1) is how many smoothing
+    // sweeps run between residual EVALUATIONS: smoothSolver.C:186 smooths nSweeps_ times per pass of the
+    // do-while and :205 then advances nIterations by nSweeps_, so the stop test is consulted only on a
+    // multiple of it and the solve OVERSHOOTS its relTol by whatever the extra sweeps buy. Measured on
+    // validation/simpleBoxIO (U smoothSolver/symGaussSeidel, tolerance 1e-10, relTol 0.1), first Ux
+    // solve: OpenFOAM leaves at 9.04154904498e-04 with nSweeps 1 and at 1.40100300931e-06 with
+    // nSweeps 2 -- 645x lower under the same relTol. brae read the entry nowhere, so validation/airFoil2D,
+    // whose own fvSolution says `nSweeps 2` on U and nuTilda, ran one sweep per evaluation and reported
+    // ODD counts where OpenFOAM's were even in all 600 of its solves.
+    //
+    // The three opt-in fast paths below bake a PER-SWEEP stop test, so a case asking for more than one
+    // sweep takes the host loop.
+    const int  sweepsPer = (nSweeps > 1) ? nSweeps : 1;
+    const bool batched   = sweepsPer > 1;
     // BRAE_TURB_FP32: solve in FP32 (half the bytes on the BW-bound sweeps; loose turbulence tol >> FP32 eps).
     static const bool turbF32 = std::getenv("BRAE_TURB_FP32") != nullptr;
-    if (turbF32 && !floored)
+    if (turbF32 && !floored && !batched)
     {
         scalar r = deviceSymGaussSeidelF32(A, b, psi, normFactor, tol, relTol, maxIter);
         if (perf) *perf = {r, r, 1};
@@ -240,7 +255,7 @@ scalar deviceSymGaussSeidel(
     // BRAE_TURB_JACOBI: weighted-Jacobi solve (fully parallel, no colour sync). Experiment only -- Jacobi needs ~2x
     // the sweeps -> ~2x the bandwidth on this BW-bound path, so it is slower than the graphed GS. Same stop test as GS.
     static const bool turbJac = std::getenv("BRAE_TURB_JACOBI") != nullptr;
-    if (turbJac && !floored)
+    if (turbJac && !floored && !batched)
     {
         DeviceBuffer<scalar> Ax, r;
         deviceAmul(A, psi, Ax);
@@ -270,7 +285,7 @@ scalar deviceSymGaussSeidel(
     // zero per-sweep host D2H. EXACT (not batched): identical sweep count + bit-identical psi vs this host loop.
     static const bool useGraph = std::getenv("BRAE_GS_DEVICE") != nullptr;
 #ifdef BRAE_HAS_GS_DEVICE
-    if (useGraph && !floored)
+    if (useGraph && !floored && !batched)
     {
         scalar r = deviceSymGaussSeidelGraph(A, b, psi, normFactor, tol, relTol, maxIter);
         if (perf) *perf = {r, r, 1};
@@ -299,20 +314,27 @@ scalar deviceSymGaussSeidel(
         if (perf) *perf = {initRes, initRes, 0};
         return initRes;
     }
-    int iter = 0;
+    // OpenFOAM counts SWEEPS, not residual evaluations -- `solverPerf.nIterations() += nSweeps_`
+    // (smoothSolver.C:205) -- so every count it reports is a multiple of nSweeps, and maxIter bounds
+    // that same accumulator rather than the number of evaluations.
+    int sweeps = 0;
     scalar finalRes = initRes;
-    for (; iter < maxIter; ++iter)
+    while (sweeps < maxIter)
     {
-        gsSweep(A, b, psi, gc, true);                                    // forward color sweep
-        gsSweep(A, b, psi, gc, false);                                   // reverse color sweep
+        for (int s = 0; s < sweepsPer; ++s)
+        {
+            gsSweep(A, b, psi, gc, true);                                // forward color sweep
+            gsSweep(A, b, psi, gc, false);                               // reverse color sweep
+        }
+        sweeps += sweepsPer;
         deviceAmul(A, psi, Ax);
         deviceCopy(r, b);
         deviceAxpy(-1.0, Ax, r);
-        finalRes = deviceSumMag(r) / normFactor;                        // exact per-sweep check (matches OF's loose smoothSolver stop)
-        if ((finalRes < tol || finalRes < relTol*initRes) && iter + 1 >= minIter) break;
+        finalRes = deviceSumMag(r) / normFactor;
+        if ((finalRes < tol || finalRes < relTol*initRes) && sweeps >= minIter) break;
     }
-    if (std::getenv("BRAE_GS_DEBUG")) std::printf("    GS init=%.4e final=%.4e iters=%d (relTol=%.2g)\n", initRes, finalRes, iter+1, relTol);
-    if (perf) *perf = {initRes, finalRes, iter + 1};   // default path: full OF-style init/final/nIter
+    if (std::getenv("BRAE_GS_DEBUG")) std::printf("    GS init=%.4e final=%.4e sweeps=%d (relTol=%.2g nSweeps=%d)\n", initRes, finalRes, sweeps, relTol, sweepsPer);
+    if (perf) *perf = {initRes, finalRes, sweeps};   // default path: full OF-style init/final/nIter
     return initRes;
 }
 

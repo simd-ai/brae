@@ -82,6 +82,13 @@ struct MomentumInput
     // gradient under a limited name is a different equation: measured on windAroundBuildings, it puts
     // the momentum residual 272x OpenFOAM's instead of 1.4x.
     scalar gradULimitK = 0.0;
+    // The `k` of the gradSchemes `grad(U)` ENTRY -- a DIFFERENT lookup from the one above, which
+    // resolves the word linearUpwind names. On validation/rotorDisk they differ (`linearUpwind
+    // unlimited` beside `grad(U) $limited`), so one field cannot serve both. This one is what
+    // fvc::grad(U) takes, and divDevReff's explicit dev2 term is built from it
+    // (linearViscousStress.C:114); it was left at the parameter's default, so the dev2 term ran the
+    // plain Gauss gradient on every case that named a limiter.
+    scalar gradUSchemeLimitK = 0.0;
     // The div(phi,U) scheme, shared with the reference (cpu::DivScheme). Each scheme is weights only, a
     // deferred correction only, or both; the assembly branches on that, not on a name.
     cpu::DivScheme scheme = cpu::DivScheme::upwind;

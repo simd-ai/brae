@@ -86,15 +86,15 @@ for side in of br; do
     cp -r "$W/seed/constant" "$W/seed/system" "$W/$side/"
     cp "$W/seed/$SEED"/[A-Za-z]* "$W/$side/$SEED/" 2>/dev/null || true
     rm -rf "$W/$side/$SEED/uniform"
-    # brae's V2 driver counts ITERATIONS in endTime where OpenFOAM steps from startTime to endTime, so
-    # `one iteration` is spelt differently on the two sides. That is itself a divergence and is queued;
-    # writing it out here keeps this gate measuring the residual rule and not that.
+    # BOTH sides now take the IDENTICAL dictionary: endTime is an absolute time on both since queue
+    # item 39, so `one iteration` is startTime + deltaT on either. This used to spell it `endTime 1` on
+    # the brae side, which the item-39 fix correctly refuses.
     python3 - "$W/$side" "$SEED" "$side" <<'PY'
 import re, sys
 d, n, side = sys.argv[1], sys.argv[2], sys.argv[3]
 c = d + '/system/controlDict'; s = open(c).read()
 s = re.sub(r'startTime\s+\S+;', 'startTime       %s;' % n, s)
-s = re.sub(r'endTime\s+\S+;',   'endTime         %s;' % (str(int(n) + 1) if side == 'of' else '1'), s)
+s = re.sub(r'endTime\s+\S+;',   'endTime         %s;' % (int(n) + 1), s)
 open(c, 'w').write(s)
 PY
 done

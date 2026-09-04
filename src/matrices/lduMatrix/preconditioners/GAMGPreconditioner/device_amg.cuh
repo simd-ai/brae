@@ -191,6 +191,10 @@ void deviceCoarseJacobiLoop(const DeviceLduView& cv, const DeviceBuffer<scalar>&
 scalar deviceSymGaussSeidel(const DeviceLduView& A, const DeviceBuffer<scalar>& b, DeviceBuffer<scalar>& psi,
                             scalar normFactor, scalar tol, scalar relTol, int maxIter,
                             DeviceSolverPerf* perf = nullptr,
-                            int minIter = 0);   // OF's floor on the sweep count; > 0 takes the host loop   // returns the OF initialResidual; *perf (if given) gets init/final/nIter
+                            int minIter = 0,   // OF's floor on the sweep count; > 0 takes the host loop
+                            // fvSolution solvers/<field>/nSweeps (smoothSolver.C:78, default 1): the
+                            // number of smoothing sweeps between residual EVALUATIONS. > 1 takes the
+                            // host loop, which evaluates where OpenFOAM evaluates.
+                            int nSweeps = 1);   // returns the OF initialResidual; *perf (if given) gets init/final/nIter
 
 } // namespace brae

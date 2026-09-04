@@ -418,7 +418,14 @@ void deviceSpalartAllmarasCorrect(const DeviceMesh& dm, const DeviceVectorBounda
                                   // The OUTWARD unit normal of the nearest wall face, packed 3 x nC (OF
                                   // wallDist::n()). Only ZDES2020 shielding reads it; nullptr (or the
                                   // wrong size) leaves the standard DDES fd in place.
-                                  const DeviceBuffer<scalar>* wallN = nullptr);
+                                  const DeviceBuffer<scalar>* wallN = nullptr,
+                                  // OF `grad(U)` cellLimited coefficient. SpalartAllmarasBase::correct
+                                  // builds Omega and Stilda from fvc::grad(U) (SpalartAllmarasBase.C:461,
+                                  // Omega = sqrt(2)*mag(skew(gradU)) at :103), which resolves the case's
+                                  // gradSchemes entry. There was no such parameter, so SA's Omega ran
+                                  // unlimited on every driver: measured on windAroundBuildingsBox at
+                                  // t=400, Omega peaks at 7.14e-01 unlimited against 3.24e-02 limited.
+                                  scalar gradULimitK = 0.0);
 
 // Standalone SA correctNut (nut = nuTilda*fv1(nuTilda)) for the solver startup validate().
 void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, DeviceBuffer<scalar>& nut);

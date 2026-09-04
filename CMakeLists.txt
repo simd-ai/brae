@@ -1045,6 +1045,34 @@ set_tests_properties(lm_cuda_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS s
 # lduMatrix::solver::readControls reads minIter and maxIter from EACH FIELD'S own entry
 # (lduMatrixSolver.C:190-208). The V2 driver read one maxIter from `p` and gave it to U as well, and
 # minIter reached no solver at all. Oracle: OpenFOAM's own iteration counts under the same cap and floor.
+# fvc::grad(U) resolves the gradSchemes `grad(U)` entry, and divDevReff (linearViscousStress.C:114) and
+# every closure's strain and production are built from it. The V2 driver passed a literal 0.0 to the SST,
+# let kEpsilon's and divDevReff's arguments default, and SA had no such parameter at all. Proximity gate:
+# brae must land nearer OpenFOAM's LIMITED answer than its unlimited one, on the fields where brae is
+# inside the two oracles' separation.
+# endTime is an ABSOLUTE time (Time.C:785), deltaT is the step (Time.C:1067) and a time directory is
+# named by the VALUE (Time.C:721-728). The V2 driver read endTime as an iteration count and never read
+# deltaT. Oracle: OpenFOAM's own ordered list of time names on four shapes, one of them ratio 2.5 where a
+# rounded quotient gives the wrong count.
+# nSweeps (smoothSolver.C:78) is the number of smoothing sweeps between residual EVALUATIONS, and
+# OpenFOAM advances its iteration count by nSweeps (:205), so every count it reports is a multiple.
+# brae read the entry nowhere -- airFoil2D ships nSweeps 2 and brae reported odd counts. The negative
+# fixed-sweep mode (:96-119) is refused: it deletes the convergence test and reports a residual of zero.
+add_test(NAME solver_nsweeps_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/solver_nsweeps_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO)
+set_tests_properties(solver_nsweeps_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+add_test(NAME timeloop_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/timeloop_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO)
+set_tests_properties(timeloop_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+add_test(NAME closure_gradlimit_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/closure_gradlimit_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/windAroundBuildingsBox)
+set_tests_properties(closure_gradlimit_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1200)
+
 add_test(NAME solver_iterbounds_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/solver_iterbounds_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO)

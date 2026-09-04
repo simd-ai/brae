@@ -120,6 +120,7 @@ Residuals simpleStep(
     mi.porosity     = in.porosity;
     mi.mrf          = in.mrf;
     mi.gradULimitK  = in.gradULimitK;
+    mi.gradUSchemeLimitK = in.gradUSchemeLimitK;
     mi.snGradLimitCoeff = in.snGradLimitCoeff;
     mi.rotor        = in.rotor;
     mi.actuationDisk = in.actuationDisk;
@@ -218,7 +219,7 @@ Residuals simpleStep(
             DeviceSolverPerf perf;
             if (in.uSymGaussSeidel)
                 deviceSymGaussSeidel(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIterU, &perf,
-                                     in.minIterU);
+                                     in.minIterU, in.nSweepsU);
             else
                 perf = deviceJacobiBiCGStab(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIterU,
                                             /*checkEvery*/1, in.minIterU);

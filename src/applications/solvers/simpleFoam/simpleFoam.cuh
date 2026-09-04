@@ -100,6 +100,10 @@ struct StepInput
     // OpenFOAM stops at 10. A cap is a statement about the ANSWER, not a performance hint -- two solvers
     // stopped by a cap hold two different residuals.
     int    maxIterU = 1000, minIterU = 0;
+    // fvSolution solvers/U/nSweeps (smoothSolver.C:78, default 1): smoothing sweeps between residual
+    // EVALUATIONS, so the stop test is only consulted on a multiple of it. Read from U's own entry, like
+    // maxIter and minIter beside it. Meaningful only on the smoothSolver path.
+    int    nSweepsU = 1;
     int    maxIterP = 1000, minIterP = 0;
     // V-cycle graph replay and PCG residual-read cadence. NOTE: on CUDA >= 13 deviceAMGPCG dispatches
     // first to its DEVICE-RESIDENT conditional-graph PCG (BRAE_PCG_DEVICE, default on), which captures
@@ -115,7 +119,10 @@ struct StepInput
     bool   momentumPredictor = true;
     bool   bounded = false;              // div(phi,U) `bounded`
     bool   linearUpwind = false;         // div(phi,U) `linearUpwind`: deferred correction, upwind matrix
-    scalar gradULimitK = 0.0;            // `grad(U) cellLimited Gauss linear <k>` (0 = plain Gauss)
+    scalar gradULimitK = 0.0;            // the gradient `linearUpwind` NAMES (0 = plain Gauss)
+    // The gradSchemes `grad(U)` ENTRY, which is a different lookup and reaches divDevReff and every
+    // turbulence closure. See MomentumInput in UEqn.cuh.
+    scalar gradUSchemeLimitK = 0.0;
     cpu::DivScheme scheme = cpu::DivScheme::upwind;   // the div(phi,U) scheme, shared with the reference
     scalar         schemeCoeff = 1.0;                 // the `k` of `limitedLinear k`
     const DevicePorosity* porosity = nullptr;         // explicitPorositySource/DarcyForchheimer

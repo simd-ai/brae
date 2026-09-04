@@ -8,7 +8,9 @@
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
-#include "solution_directions.cuh"   // polyMesh::solutionD(): which U components OpenFOAM solves
+#include "solution_directions.cuh"
+#include "start_time.cuh"     // OF Time::setControls startFrom (Time.C:146-193)
+#include "write_control.cuh"  // OF Time::timeName (Time.C:721-728)   // polyMesh::solutionD(): which U components OpenFOAM solves
 #include "geometric_field.cuh"
 #include "foam_field_reader.cuh"
 #include "foam_field_writer.cuh"
@@ -169,6 +171,9 @@ TurbDivScheme divTurbScheme(const std::string& caseDir, const std::string& key)
 // Returns the offending scheme word, or empty when the resolved scheme is one brae computes: `Gauss
 // linear`, or `cellLimited Gauss linear <k>` -- the limited form is now implemented on both paths
 // (cellLimitedGrad_cpp.cu, deviceCellLimitGrad), and `limitK` receives its k when it is.
+std::string gradSchemeUnsupported(const std::string& text, const std::string& gradName,
+                                 scalar* limitK);   // defined below, shared by both lookups
+
 std::string linearUpwindGradUnsupported(const std::string& caseDir, scalar* limitK)
 {
     if (limitK) *limitK = 0.0;
@@ -194,7 +199,18 @@ std::string linearUpwindGradUnsupported(const std::string& caseDir, scalar* limi
         }
     }
 
-    // 2. that name's entry in gradSchemes, falling back to `default`.
+    // 2-3. that name's entry, classified. Shared with gradUSchemeUnsupported below.
+    return gradSchemeUnsupported(text, gradName, limitK);
+}
+
+
+// Steps 2 and 3 of the lookup above, on their own so the `grad(U)` entry can be resolved by the same
+// code: OpenFOAM's schemesLookup returns the named entry if the dictionary has it and falls back to
+// `default` otherwise (schemesLookupDetail.C:76-88), and the accepted forms are `Gauss linear` and
+// `cellLimited Gauss linear <k>`.
+std::string gradSchemeUnsupported(const std::string& text, const std::string& gradName, scalar* limitK)
+{
+    if (limitK) *limitK = 0.0;
     const std::size_t gblk = text.find("gradSchemes");
     if (gblk == std::string::npos) return "";          // no block -> OpenFOAM's default is Gauss linear
     const std::size_t open = text.find('{', gblk);
@@ -243,6 +259,26 @@ std::string linearUpwindGradUnsupported(const std::string& caseDir, scalar* limi
     // `cellLimited Gauss linear` with no number is k = 1 in OpenFOAM's stream reading.
     if (limited && limitK && *limitK == 0.0) *limitK = 1.0;
     return "";
+}
+
+
+// The `grad(U)` ENTRY's own limiter -- a DIFFERENT lookup from linearUpwindGradUnsupported's, which
+// resolves the word linearUpwind names. On validation/rotorDisk the two differ (`div(phi,U) ...
+// linearUpwind unlimited` beside `grad(U) $limited`), so neither can stand in for the other.
+//
+// This is the gradient every fvc::grad(U) in the solver takes: the closures' strain and production
+// (kOmegaSSTBase.C:522 tgradU, kEpsilon.C:237, SpalartAllmarasBase.C:461) and divDevReff's explicit
+// dev2 term (linearViscousStress.C:114). All four were running the UNLIMITED Gauss gradient while the
+// driver printed the case's cellLimited coefficient. Measured on validation/windAroundBuildingsBox at
+// its own converged t=400, limited against unlimited through OpenFOAM's own postProcess grad(U):
+// |gradU| relative L2 3.21e+01, the SST/kEpsilon production term GbyNu peak 1.05e-03 against 5.10e-01
+// (487x), SpalartAllmaras's Omega 22x, and 34% of the cells carry a clipped gradient.
+std::string gradUSchemeUnsupported(const std::string& caseDir, scalar* limitK)
+{
+    if (limitK) *limitK = 0.0;
+    std::string text;
+    try { text = readFvSchemesText(caseDir); } catch (...) { return ""; }
+    return gradSchemeUnsupported(text, "grad(U)", limitK);
 }
 
 // The numeric coefficient a limited scheme carries: the `1` of `limitedLinear 1`. OpenFOAM reads it off
@@ -493,6 +529,20 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
         }
     }
 
+    // The `grad(U)` ENTRY, which is a different lookup from linearUpwind's named gradient and reaches
+    // more of the solver: divDevReff's dev2 term and every closure's strain and production all take
+    // fvc::grad(U). Blocked on the same terms -- `Gauss linear` and `cellLimited Gauss linear <k>` are
+    // computed, anything else would be run as plain Gauss under another limiter's name.
+    {
+        const std::string bad = gradUSchemeUnsupported(caseDir, nullptr);
+        if (!bad.empty())
+            r.blockers.push_back("gradSchemes resolves `grad(U)` to `" + bad + "`; brae computes `Gauss "
+                                 "linear` and `cellLimited Gauss linear <k>` only. fvc::grad(U) feeds "
+                                 "divDevReff's explicit dev2 term and the turbulence closures' strain "
+                                 "and production, so running it as plain Gauss would be a different "
+                                 "model, not a slower one.");
+    }
+
     // --- turbulence ---------------------------------------------------------------------------
     {
         const std::string simType = turbProps.wordOr("simulationType", "laminar");
@@ -600,6 +650,25 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
             if (!fields.empty()) fields += ", ";
             fields += f;
         }
+        // nSweeps on a TURBULENCE field is read by nobody: brae's scalar transport takes no such
+        // parameter, so it runs one sweep per residual evaluation whatever the case says. Announced on
+        // its own subject rather than folded into the smoother notice below, because a notice that can
+        // be satisfied by a different block's text is how this repo lost the last one.
+        std::string nsw;
+        for (const char* f : {"k", "epsilon", "omega", "nuTilda"})
+        {
+            const FoamDict* fs = solvers->subDict(f);
+            if (!fs) continue;
+            const int n = static_cast<int>(fs->scalarOr("nSweeps", 1));
+            if (n == 1) continue;
+            if (!nsw.empty()) nsw += ", ";
+            nsw += std::string(f) + " (" + std::to_string(n) + ")";
+        }
+        if (!nsw.empty())
+            r.notices.push_back("system/fvSolution asks for a non-default `nSweeps` on " + nsw +
+                                "; brae's turbulence transport runs ONE sweep per residual evaluation "
+                                "whatever that entry says, so those solves stop earlier than OpenFOAM's. "
+                                "The U entry IS honoured.");
         if (!fields.empty())
             r.notices.push_back("system/fvSolution asks for `smoothSolver` with a symGaussSeidel smoother "
                                 "on " + fields + "; brae runs that smoothSolver around a MULTICOLOUR "
@@ -651,8 +720,16 @@ int runSimpleFoamV2(const std::string& caseDir)
     const scalar nu = transport.scalarOr("nu", 1e-5);
     const FoamDict* simpleDict = fvSolution.subDict("SIMPLE");
 
-    const std::string startTime = controlDict.wordOr("startFrom", "startTime") == "latestTime"
-                                ? std::string("0") : controlDict.wordOr("startTime", "0");
+    // OF Time::setControls (Time.C:146-193): only `startFrom startTime` reads the dict entry;
+    // `latestTime` scans the case's own numeric time directories and starts from the LAST. This returned
+    // the literal "0", so a case restarted that way silently reread the initial field -- measured on
+    // simpleBoxIO staged with 0/ and 7/ and endTime 10, real OpenFOAM starts at 7 and takes 3 steps
+    // while this took 10 from 0. resolveStartTime is the helper the legacy driver already uses, so the
+    // two paths cannot disagree about which directory a case restarts from.
+    const std::string startTime = resolveStartTime(caseDir,
+                                                   controlDict.wordOr("startFrom", "startTime"),
+                                                   controlDict.wordOr("startTime", "0"));
+    const scalar startTimeVal = static_cast<scalar>(std::strtod(startTime.c_str(), nullptr));
     cpu::SimpleFields f = cpu::createFields(caseDir + "/" + startTime, simpleDict, m, g, fvp);
 
     cpu::SimpleControlDict cd = cpu::readSimpleControl(fvSolution);
@@ -681,7 +758,37 @@ int runSimpleFoamV2(const std::string& caseDir)
     std::printf("  relaxation: U %g (equations), p %g (fields)%s\n", (double)relaxU, (double)relaxP,
                 relaxP == 1.0 ? "  -- the case names none, so OpenFOAM relaxes p not at all" : "");
 
-    const label endTime = static_cast<label>(controlDict.scalarOr("endTime", 100));
+    // endTime is an ABSOLUTE TIME and deltaT is the step between iterations -- not a run length and not
+    // a count. Time::run() tests `value() < endTime_ - 0.5*deltaT_` (Time.C:785) and Time::operator++
+    // advances the value by deltaT (Time.C:1067). This read endTime as the iteration COUNT and never
+    // read deltaT at all: a restart at 269 with `endTime 1000` ran 1000 iterations where OpenFOAM runs
+    // 731, and it invalidated a whole afternoon of restart measurements before anyone noticed
+    // (REFUSALS.md item 39). Measured against real OpenFOAM on simpleBoxIO with residualControl emptied:
+    // startTime 5 / endTime 8 / deltaT 1 -> OpenFOAM 3 iterations (Time = 6, 7, 8) against this driver's
+    // 8; startTime 0 / endTime 2.5 / deltaT 0.5 -> OpenFOAM 5 ending at 2.5/ against 2 ending at 2/.
+    const scalar endTimeVal = controlDict.scalarOr("endTime", 100);
+    const scalar deltaT     = controlDict.scalarOr("deltaT", 1.0);
+    if (deltaT <= 0.0)
+        throw std::runtime_error(
+            "controlDict deltaT = " + std::to_string(static_cast<double>(deltaT))
+            + ". OpenFOAM advances the time by deltaT every iteration (Time.C:1067), so a non-positive "
+              "step never reaches endTime.");
+    // OF's own inequality, stepped OF's own way, rather than a rounded quotient: the two disagree at
+    // (endTime - startTime)/deltaT = n + 0.5. Measured with startTime 0 / endTime 1 / deltaT 0.4 (ratio
+    // exactly 2.5): OpenFOAM runs 2 iterations where std::lround gives 3. Accumulating deltaT rather
+    // than multiplying it also reproduces OpenFOAM's own rounding drift.
+    label nSteps = 0;
+    for (scalar t = startTimeVal; t < endTimeVal - 0.5 * deltaT; t += deltaT) ++nSteps;
+    if (nSteps < 1)
+        throw std::runtime_error(
+            "controlDict endTime (" + WriteControl::timeName(endTimeVal) + ") is not beyond the start "
+            "time (" + startTime + "): there is nothing to run. endTime is an ABSOLUTE time, not a "
+            "number of iterations -- on a restart set it past the time you are restarting from.");
+    // SAID, not assumed. The driver printed nothing about how long it was going to run, which is how an
+    // 8-iteration run of a 3-iteration case went unnoticed.
+    std::printf("  time: startTime %s, endTime %s, deltaT %g -> %d iterations\n",
+                startTime.c_str(), WriteControl::timeName(endTimeVal).c_str(),
+                static_cast<double>(deltaT), static_cast<int>(nSteps));
 
     // ---- MRF ---------------------------------------------------------------------------------
     // HOOK 1, UEqn.H:3 -- MRF.correctBoundaryVelocity(U). It runs HERE, before the device boundary is
@@ -824,6 +931,24 @@ int runSimpleFoamV2(const std::string& caseDir)
         nonOrthLaplacian = lapS.corrected;
         snGradLimitK     = lapS.limitCoeff;
     }
+    // The `grad(U)` ENTRY's limiter coefficient, read once here because everything that takes
+    // fvc::grad(U) needs it: divDevReff's explicit dev2 term (linearViscousStress.C:114), the closures'
+    // strain and production (kOmegaSSTBase.C:522, kEpsilon.C:237, SpalartAllmarasBase.C:461), the
+    // startup correctNut, and the SST's `calculated` nut boundary. Every one of them ran the UNLIMITED
+    // gradient while the driver printed the case's coefficient. NOT the same lookup as
+    // linearUpwindGradUnsupported's, which resolves the word linearUpwind names -- on rotorDisk they
+    // differ. Any unsupported form is refused by the envelope above, so a nonzero here is a coefficient
+    // brae computes.
+    scalar gradUSchemeLimit = 0.0;
+    gradUSchemeUnsupported(caseDir, &gradUSchemeLimit);
+    // The TRANSPORTED scalars' own `grad(<var>)` entries, which feed their limitedLinear weight, their
+    // linearUpwind correction and the non-orthogonal laplacian correction. brae carries ONE coefficient
+    // for the pair, so a case that limits them differently is refused by name rather than run with
+    // whichever one was read first. windAroundBuildingsBox limits all three at 1.
+    // Declared here so the turbulence hook can capture it; RESOLVED below, once the model is known --
+    // the two entries to compare are the two variables the model actually transports, and `grad(omega)`
+    // means nothing to a kEpsilon case.
+    scalar gradScalarSchemeLimit = 0.0;
     scalar twoBykK = 2.0, twoBykEps = 2.0;
     bool   sstModel = false;
     // SpalartAllmaras transports ONE scalar, nuTilda, and rides the k slot; the epsilon slot is unused.
@@ -968,6 +1093,12 @@ int runSimpleFoamV2(const std::string& caseDir)
             deviceBCValue(dbK, dK, nutKb);
             deviceBCValue(dbEps, dEps, nutEb);
             deviceGradU(dm, dbU, gf.Ux, gf.Uy, gf.Uz, sstGradU);
+            // cellLimitedGrad limits the INTERIOR and rebuilds the boundary from it
+            // (cellLimitedGrad.C:224-226), so a limited interior against an unlimited boundary would be
+            // neither scheme. backwardFacingStep2D ships `calculated` nut on two patches, which is
+            // exactly where that would show.
+            if (gradUSchemeLimit > 0.0)
+                deviceCellLimitGradU(dm, dbU, gf.Ux, gf.Uy, gf.Uz, sstGradU, gradUSchemeLimit);
             deviceSSTNutBoundary(dbU, nutKb, nutEb, dY, nullptr, nu,
                                  sstGradU, static_cast<int>(nC), gf.Ux, gf.Uy, gf.Uz,
                                  nutCalcMask, sstCoeffs, dNut, nb);
@@ -1019,6 +1150,34 @@ int runSimpleFoamV2(const std::string& caseDir)
         // before the model ever ran.
         secondField = sstModel ? "omega" : "epsilon";
         const std::string firstField = saModel ? "nuTilda" : "k";
+        // The transported scalars' own `grad(<var>)` entries, resolved for the variables THIS model
+        // carries. brae holds ONE coefficient for the pair, so a case that limits them differently is
+        // refused by name rather than run with whichever was read first. Resolved here and not with
+        // grad(U) above because `grad(omega)` is not a question a kEpsilon case answers.
+        {
+            std::string txt;
+            try { txt = readFvSchemesText(caseDir); } catch (...) { txt.clear(); }
+            if (!txt.empty())
+            {
+                gradSchemeUnsupported(txt, "grad(" + firstField + ")", &gradScalarSchemeLimit);
+                if (!saModel)
+                {
+                    scalar k2 = 0.0;
+                    gradSchemeUnsupported(txt, "grad(" + secondField + ")", &k2);
+                    if (std::fabs(k2 - gradScalarSchemeLimit) > 1e-12)
+                        throw std::runtime_error(
+                            "brae: gradSchemes resolves `grad(" + firstField + ")` and `grad("
+                            + secondField + ")` to different cellLimited coefficients ("
+                            + std::to_string((double)gradScalarSchemeLimit) + " and "
+                            + std::to_string((double)k2) + "). This driver carries one coefficient for "
+                            "the transported pair, so running would apply one variable's limiter under "
+                            "the other's name.");
+                }
+                if (gradScalarSchemeLimit > 0.0)
+                    std::printf("  gradSchemes grad(%s)/grad(%s): cellLimited Gauss linear %g\n",
+                                firstField.c_str(), secondField.c_str(), (double)gradScalarSchemeLimit);
+            }
+        }
         // V2 maintains NO per-step boundary (fixedMean, fanPressure, coded) -- the legacy driver's
         // NVRTC and collect* hooks live in DeviceSimpleSolver, which this path does not use. Check the
         // types here, where they still exist; buildField erases them (frozen_bc_guard.cuh).
@@ -1242,9 +1401,9 @@ int runSimpleFoamV2(const std::string& caseDir)
         // and one whole SIMPLEC step from OpenFOAM's converged field agrees to 8e-09 on the velocity
         // increment and 2.7e-07 on the pressure increment.
         //
-        // The strain takes the UNLIMITED grad(U), which is what the per-iteration correct() below passes
-        // as well. A case naming `grad(U) cellLimited` is already not honoured by the closure, and
-        // limiting only here would make the startup and the loop disagree with each other.
+        // The strain takes the case's own `grad(U)` scheme, exactly as the per-iteration correct() below
+        // now does -- kOmegaSSTBase.C:132 is correctNut(2*magSqr(symm(fvc::grad(U)))), and fvc::grad
+        // resolves the gradSchemes entry. Startup and the loop have to agree, so these move together.
         if (ras)
         {
             if (sstModel)
@@ -1253,6 +1412,8 @@ int runSimpleFoamV2(const std::string& caseDir)
                 // kOmegaSSTBase.C. dEps carries omega on this model.
                 DeviceBuffer<scalar> gradU, S2, F2;
                 deviceGradU(dm, dbU, gf.Ux, gf.Uy, gf.Uz, gradU);
+                if (gradUSchemeLimit > 0.0)
+                    deviceCellLimitGradU(dm, dbU, gf.Ux, gf.Uy, gf.Uz, gradU, gradUSchemeLimit);
                 deviceS2(gradU, static_cast<int>(nC), S2);
                 deviceF2(dK, dEps, dY, nu, sstCoeffs, F2);
                 deviceNutSST(dK, dEps, F2, S2, sstCoeffs, dNut);
@@ -1266,6 +1427,8 @@ int runSimpleFoamV2(const std::string& caseDir)
             {
                 DeviceBuffer<scalar> gradU, rCmu, magS;
                 deviceGradU(dm, dbU, gf.Ux, gf.Uy, gf.Uz, gradU);
+                if (gradUSchemeLimit > 0.0)
+                    deviceCellLimitGradU(dm, dbU, gf.Ux, gf.Uy, gf.Uz, gradU, gradUSchemeLimit);
                 deviceRealizableStrain(gradU, dK, dEps, keCoeffs.A0, static_cast<int>(nC), rCmu, magS);
                 deviceRealizableNut(rCmu, dK, dEps, dNut);
             }
@@ -1357,7 +1520,13 @@ int runSimpleFoamV2(const std::string& caseDir)
                                              nu, relaxK, tolKE,
                                              boundedK, limitedK, twoBykK,
                                              dsa, relTolKE, /*checkEvery*/1,
-                                             linearUpwindK, /*nonOrth*/false, gsKE);
+                                             linearUpwindK, /*nonOrth*/false, gsKE,
+                                             /*ami*/nullptr, /*cyc*/nullptr, /*ntDdt*/{},
+                                             /*des*/false, /*iddes*/false, /*hmax*/nullptr,
+                                             /*hwn*/nullptr, /*lesDelta*/nullptr, /*wallN*/nullptr,
+                                             // fvc::grad(U) through the case's own scheme, which SA's
+                                             // Omega is built from (SpalartAllmarasBase.C:103, :461).
+                                             gradUSchemeLimit);
             }
             else if (sstModel)
             {
@@ -1375,7 +1544,12 @@ int runSimpleFoamV2(const std::string& caseDir)
                                        // upwind and orthogonal. On the _cpp reference honouring
                                        // linearUpwind was worth a factor of 12 on T3A's end-to-end error.
                                        linearUpwindK, linearUpwindEps,
-                                       nonOrthLaplacian, /*gradULimitK*/0.0, gsKE, gsKE,
+                                       // The case's own `grad(U)` scheme, which OpenFOAM's tgradU
+                                       // takes (kOmegaSSTBase.C:522). This was a hardcoded 0.0 while
+                                       // the driver printed the case's coefficient: on
+                                       // windAroundBuildingsBox the production term GbyNu peaks at
+                                       // 5.10e-01 unlimited against 1.05e-03 limited, a factor 487.
+                                       nonOrthLaplacian, gradUSchemeLimit, gsKE, gsKE,
                                        /*ami*/nullptr, /*cyc*/nullptr,
                                        // kOmegaSSTLM: F1 = max(F1, F3), Pk *= gammaIntEff and
                                        // epsilonByk *= clamp(gammaIntEff, 0.1, 1). Null on plain SST.
@@ -1387,7 +1561,10 @@ int runSimpleFoamV2(const std::string& caseDir)
                                        /*nuWallFace*/nullptr, /*rhoBnd*/nullptr,
                                        // DkEff(patchi)/DomegaEff(patchi) = alphaK(F1)*nut_b + nu, from
                                        // nut's OWN boundary rather than the interpolated cell value.
-                                       &nb);
+                                       &nb,
+                                       /*muBnd*/nullptr,
+                                       // `grad(k)`/`grad(omega)`, the transported scalars' own entries.
+                                       gradScalarSchemeLimit);
 
             // OF kOmegaSSTLM::correct() runs kOmegaSST::correct() FIRST and the transition transport
             // SECOND, so k and omega always advance on the PREVIOUS iteration's gammaIntEff. Reversing
@@ -1415,7 +1592,14 @@ int runSimpleFoamV2(const std::string& caseDir)
                                   /*rho*/nullptr, /*muLam*/nullptr,
                                   /*rhoBnd*/nullptr, /*nuWallFace*/nullptr,
                                   // DkEff(patchi)/DepsilonEff(patchi) from nut's OWN boundary.
-                                  &nb);
+                                  &nb,
+                                  /*muBnd*/nullptr,
+                                  gradScalarSchemeLimit,
+                                  // kEpsilon::correct builds GbyNu from fvc::grad(U) (kEpsilon.C:237),
+                                  // which resolves the case's `grad(U)` entry. These three arguments
+                                  // used to fall through to their defaults, so the limiter never
+                                  // reached the production term at all.
+                                  gradUSchemeLimit);
 
             // OpenFOAM prints an Initial residual for every turbulence solve, and comparing those against
             // its log is how this path is checked against the oracle. Off unless asked for, so that the
@@ -1509,6 +1693,21 @@ int runSimpleFoamV2(const std::string& caseDir)
             in.relTolU  = su->scalarOr("relTol", 0.0);
             in.maxIterU = static_cast<int>(su->scalarOr("maxIter", 1000));
             in.minIterU = static_cast<int>(su->scalarOr("minIter", 0));
+            // nSweeps (smoothSolver.C:78, default 1). A NEGATIVE value is a different solver, not a
+            // tuning of this one: smoothSolver.C:96-119 smooths -nSweeps times with no normFactor, no
+            // residual and no convergence test, and reports a residual of ZERO -- which residualControl
+            // then reads as converged (measured on validation/airFoil2D: "SIMPLE solution converged in
+            // 1 iterations"). Substituting a convergence-tested loop there would change how many outer
+            // iterations the whole run takes, i.e. the answer, so it is refused rather than approximated.
+            const int nSweepsU = static_cast<int>(su->scalarOr("nSweeps", 1));
+            if (nSweepsU < 0)
+                throw std::runtime_error(
+                    "system/fvSolution asks for `nSweeps " + std::to_string(nSweepsU) + "` on U. A "
+                    "negative nSweeps is OpenFOAM's FIXED-SWEEP mode (smoothSolver.C:96-119): it deletes "
+                    "the convergence test and reports a residual of zero, which residualControl reads as "
+                    "converged. brae has no such mode, and running its convergence-tested loop instead "
+                    "would change how many SIMPLE iterations the case takes.");
+            in.nSweepsU = (nSweepsU > 0) ? nSweepsU : 1;
             // OpenFOAM's SELECTION, exactly: `solver smoothSolver` + a GaussSeidel-family smoother.
             // The selection is matched; the ALGORITHM is not -- brae's sweep is multicolour where
             // OpenFOAM's is index order (see the envelope notice above, and device_amg.cuh). Anything
@@ -1618,6 +1817,14 @@ int runSimpleFoamV2(const std::string& caseDir)
     in.actuationDisk = actuationDisk.active ? &actuationDisk : nullptr;
 
     in.nuLaminar = nu;
+    // The gradSchemes `grad(U)` entry, a SEPARATE lookup from linearUpwind's named gradient above. It is
+    // printed on its own line because the two can differ (validation/rotorDisk) and because the single
+    // line this replaced named the SCHEME while carrying linearUpwind's value -- the display string
+    // asserting a capability the code did not have.
+    in.gradUSchemeLimitK = gradUSchemeLimit;
+    if (gradUSchemeLimit > 0.0)
+        std::printf("  gradSchemes grad(U): cellLimited Gauss linear %g "
+                    "(fvc::grad(U): divDevReff + the closures)\n", gradUSchemeLimit);
 
     std::printf("  U solver: %s\n",
                 // "as the case asks" was the display string this line used to carry, and it was the
@@ -1649,7 +1856,8 @@ int runSimpleFoamV2(const std::string& caseDir)
         // OpenFOAM's own instead of 1.4x -- the correction does not vanish at convergence.
         linearUpwindGradUnsupported(caseDir, &in.gradULimitK);
         if (in.gradULimitK > 0.0)
-            std::printf("  grad(U): cellLimited Gauss linear %g\n", in.gradULimitK);
+            std::printf("  div(phi,U) linearUpwind's named gradient: cellLimited Gauss linear %g\n",
+                        in.gradULimitK);
         std::printf("  div(phi,U) scheme: %s", sc.empty() ? "upwind" : sc.c_str());
         if (in.scheme == cpu::DivScheme::limitedLinear || in.scheme == cpu::DivScheme::limitedLinearV)
             std::printf(" %g", in.schemeCoeff);
@@ -1676,9 +1884,11 @@ int runSimpleFoamV2(const std::string& caseDir)
     SolverWorkspace ws;
     std::map<std::string, scalar> residuals;
     label iter = 0;
-    while (ctl.loop(iter + 1, endTime, residuals))
+    scalar timeValue = startTimeVal;
+    while (ctl.loop(iter + 1, nSteps, residuals))
     {
         ++iter;
+        timeValue += deltaT;   // Time::operator++ ACCUMULATES the value, it does not multiply (Time.C:1067)
         // inletOutlet: resolve each face to fixedValue|zeroGradient from the PREVIOUS iteration's
         // boundary flux, as OF's updateCoeffs does. The rebuilt driver did NONE of this -- the mask was
         // built once and never consulted -- so an inletOutlet outlet stayed pinned at its inletValue with
@@ -1702,8 +1912,11 @@ int runSimpleFoamV2(const std::string& caseDir)
             deviceUpdateMixedFreestream(dbU, dbP, gf.phiBnd, gf.Ux, gf.Uy, gf.Uz, nullptr);
 
         residuals = simpleStep(gf, ws, dm, dbU, dbP, in);
-        std::printf("Time = %d   U initial residual = %.6e   p initial residual = %.6e\n",
-                    static_cast<int>(iter),
+        // OF prints the TIME NAME (simpleFoam.C:100, runTime.timeName()), not the iteration index. The
+        // two coincide only at startTime 0 with deltaT 1 -- which every fixture in validation/ happens
+        // to be, so no gate could see this.
+        std::printf("Time = %s   U initial residual = %.6e   p initial residual = %.6e\n",
+                    WriteControl::timeName(timeValue).c_str(),
                     residuals.count("U") ? residuals.at("U") : 0.0,
                     residuals.count("p") ? residuals.at("p") : 0.0);
     }
@@ -1718,7 +1931,10 @@ int runSimpleFoamV2(const std::string& caseDir)
 
     // ---- write -------------------------------------------------------------------------------
     {
-        const std::string outDir = caseDir + "/" + std::to_string(static_cast<int>(iter));
+        // OF names a time directory by its TIME VALUE (Time::timeName, Time.C:721-728), not by an
+        // iteration index. Measured: startTime 0 / endTime 2.5 / deltaT 0.5 -- OpenFOAM writes 2.5/,
+        // this driver wrote 2/.
+        const std::string outDir = caseDir + "/" + WriteControl::timeName(startTimeVal + iter * deltaT);
         std::filesystem::create_directories(outDir);
         const std::string src = caseDir + "/" + startTime;
 

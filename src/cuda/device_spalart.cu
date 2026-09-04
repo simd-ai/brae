@@ -352,11 +352,16 @@ void deviceSpalartAllmarasCorrect(
     const DeviceBuffer<scalar>* hmax,
     const DeviceBuffer<scalar>* hwn,
     const DeviceBuffer<scalar>* lesDelta,
-    const DeviceBuffer<scalar>* wallN)
+    const DeviceBuffer<scalar>* wallN,
+    scalar gradULimitK)   // OF `grad(U)` cellLimited coefficient; see the declaration
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> gradU;
     deviceGradU(dm, dbU, Ux, Uy, Uz, gradU, ami, cyc);   // interface-aware grad(U) for vorticity/production
+    // The case's own `grad(U)` scheme, which fvc::grad(U) resolves (SpalartAllmarasBase.C:461). Applied
+    // to the TENSOR, as cellLimitedGrad does, so Omega, Stilda and the DES/IDDES length scales all see
+    // the same gradient OpenFOAM built them from.
+    if (gradULimitK > scalar(0)) deviceCellLimitGradU(dm, dbU, Ux, Uy, Uz, gradU, gradULimitK);
     // SA-DDES/IDDES: replace the wall distance y with the DES length scale dTilda in the SA length-scale terms (Stilda,
     // fw, destruction). des==false (RANS) -> dScale aliases y, so the model is byte-for-byte the standard SA. iddes uses
     // the improved (WMLES) length scale (needs hmax = maxDeltaxyz); otherwise the plain DDES cubeRootVol limiter.
