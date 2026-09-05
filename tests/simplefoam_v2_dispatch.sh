@@ -33,6 +33,10 @@ mkcase() {   # mkcase <dir> ; copies SRC and strips time dirs
 import re, sys
 p = sys.argv[1]; s = open(p).read()
 s = re.sub(r'^endTime\s+\S+;', 'endTime         3;', s, flags=re.M)
+# The state at 3 is what this gate reads, so 3 has to BE a write time: brae now writes when OpenFOAM
+# writes (Time::operator++), not unconditionally at the end.
+s = re.sub(r'^writeInterval\s+\S+;', 'writeInterval   3;', s, flags=re.M)
+if not re.search(r'^writeInterval', s, flags=re.M): s += '\nwriteInterval   3;\n'
 open(p, 'w').write(s)
 PY
 }

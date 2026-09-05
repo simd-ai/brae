@@ -67,8 +67,10 @@ public:
     // Foam::Time::operator++ write switch. Not const: the runTime branch latches the interval index.
     bool isWriteTime(int iter, scalar tval)
     {
+        // OF's absent-entry default is GREAT; casting that to long is undefined, and it means "never"
+        // (Time.C: !(timeIndex % writeInterval) with an interval no index reaches).
         if (control_ == "timeStep")
-            return interval_ >= 1 && (iter % static_cast<long>(interval_)) == 0;   // Time.C: !(timeIndex % writeInterval)
+            return interval_ >= 1 && interval_ < 1e18 && (iter % static_cast<long>(interval_)) == 0;
         if (control_ == "runTime" || control_ == "adjustable" || control_ == "adjustableRunTime")
         {
             const long wi = static_cast<long>(((tval - startTime_) + 0.5 * deltaT_) / interval_);

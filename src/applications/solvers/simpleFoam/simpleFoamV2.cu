@@ -1987,6 +1987,96 @@ int runSimpleFoamV2(const std::string& caseDir)
     std::printf("  laplacianSchemes: non-orthogonal correction %s\n",
                 in.correctedLaplacian ? "ON (`corrected`)" : "OFF (`uncorrected`/`orthogonal`)");
 
+    // ONE TIME DIRECTORY, written the way OpenFOAM writes one. Called wherever Time::operator++ would
+    // have set writeTime (see wc below) and on residualControl convergence, where simpleControl::loop
+    // calls runTime.writeAndEnd() (simpleControl.C:152). It used to run exactly once, after the loop,
+    // whatever controlDict said: a 1000-iteration T3A run with `writeInterval 500` wrote 1000/ and
+    // nothing else where OpenFOAM writes 500 and 1000 -- and a run that stopped at an endTime that is
+    // NOT a write time wrote that time, which OpenFOAM does not (Time::run() has no end-of-run write;
+    // only writeTime_ and writeAndEnd write). Both halves are gated by tests/write_cadence_vs_openfoam.
+    auto writeTimeDir = [&](const std::string& tname)
+    {
+        const std::string outDir = caseDir + "/" + tname;
+        std::filesystem::create_directories(outDir);
+        const std::string src = caseDir + "/" + startTime;
+
+        const std::vector<scalar> pOut = gf.p.host();
+        const std::vector<scalar> ux = gf.Ux.host(), uy = gf.Uy.host(), uz = gf.Uz.host();
+        std::vector<vector> UOut(nC);
+        for (label c = 0; c < nC; ++c) UOut[c] = {ux[c], uy[c], uz[c]};
+
+        // THE SOLVED BOUNDARY VALUES, not the start directory's. Every call here used to omit
+        // writeVolField's `computedBoundary` argument, which makes it ECHO the template it read -- so a
+        // V2 time directory carried the 0/ boundary on every patch the solve had moved. Measured on
+        // backwardFacingStep2D: the walls' nut came out `value uniform 0` (the 0/ placeholder) where
+        // the legacy driver writes the solved `nonuniform List<scalar>`, i.e. the wall function's
+        // viscosity was absent from the output. A restart from such a directory restarts from the wrong
+        // state, and any wall post-processing reads a zero that was never the answer.
+        DeviceBuffer<scalar> pB, uxB, uyB, uzB;
+        deviceBCValue(dbP, gf.p, pB);
+        deviceBCValue(dbU.comp[0], gf.Ux, uxB);
+        deviceBCValue(dbU.comp[1], gf.Uy, uyB);
+        deviceBCValue(dbU.comp[2], gf.Uz, uzB);
+        const std::vector<scalar> hpB = pB.host();
+        const std::vector<scalar> hxB = uxB.host(), hyB = uyB.host(), hzB = uzB.host();
+        std::vector<vector> UB(hxB.size());
+        for (std::size_t i = 0; i < hxB.size(); ++i) UB[i] = vector{hxB[i], hyB[i], hzB[i]};
+
+        writeVolField<scalar>(src + "/p", outDir + "/p", pOut, fvp, 16, hpB);
+        writeVolField<vector>(src + "/U", outDir + "/U", UOut, fvp, 16, UB);
+        // phi: createPhi.H registers it AUTO_WRITE, so every OpenFOAM time directory carries the
+        // continuity-satisfying flux and a restart resumes from it (createPhi reads it READ_IF_PRESENT).
+        // Without this a brae time directory could not be restarted from -- by OpenFOAM or by brae --
+        // without recomputing phi from U, which is the fresh-start fallback, not the corrected flux.
+        // DeviceBoundary skips coupled patches, which is exactly the layout writeSurfaceField takes.
+        writeSurfaceField(outDir + "/phi", gf.phiInt.host(), gf.phiBnd.host(), fvp, 16);
+        if (ras)
+        {
+            // SpalartAllmaras transports nuTilda in the k slot and has no second field.
+            const std::string first = saModel ? "nuTilda" : "k";
+            DeviceBuffer<scalar> kB;
+            deviceBCValue(dbK, dK, kB);
+            writeVolField<scalar>(src + "/" + first, outDir + "/" + first, dK.host(), fvp, 16, kB.host());
+            if (!saModel)
+            {
+                DeviceBuffer<scalar> eB;
+                deviceBCValue(dbEps, dEps, eB);
+                writeVolField<scalar>(src + "/" + secondField, outDir + "/" + secondField,
+                                      dEps.host(), fvp, 16, eB.host());
+            }
+            // nut's boundary is NOT a BC evaluation: the wall faces carry what the wall function
+            // computed, which is exactly what `nb` holds (deviceBoundaryNut writes the whole boundary
+            // there). Evaluating dbNut instead would put the `calculated` placeholder back on the walls.
+            writeVolField<scalar>(src + "/nut", outDir + "/nut", dNut.host(), fvp, 16,
+                                  nb.size() ? nb.host() : std::vector<scalar>());
+            // kOmegaSSTLM's two transported scalars are AUTO_WRITE too (kOmegaSSTLM.C:439, :453). They
+            // were solved every iteration and never written, so no LM case could be restarted from
+            // brae's output and no gate could compare them -- and OpenFOAM's own gammaInt carries the
+            // clearest period-2 signature of any field in T3A's transient.
+            if (lmModel)
+            {
+                DeviceBuffer<scalar> rB, gB;
+                deviceBCValue(dbReThetat, dReThetat, rB);
+                deviceBCValue(dbGammaInt, dGammaInt, gB);
+                writeVolField<scalar>(src + "/ReThetat", outDir + "/ReThetat", dReThetat.host(), fvp, 16, rB.host());
+                writeVolField<scalar>(src + "/gammaInt", outDir + "/gammaInt", dGammaInt.host(), fvp, 16, gB.host());
+            }
+        }
+        // The second field is `omega` under kOmegaSST; the file was always written under its right name,
+        // but this line claimed `epsilon` for every model.
+        const std::string turbFields =
+            ras ? (saModel ? std::string(",nuTilda,nut")
+                           : ",k," + secondField + ",nut" + (lmModel ? std::string(",ReThetat,gammaInt") : std::string()))
+                : std::string();
+        std::printf("written %s/{U,p,phi%s}\n", outDir.c_str(), turbFields.c_str());
+    };
+    // The case's own cadence, exactly the object the legacy driver reads: writeControl / writeInterval /
+    // purgeWrite from controlDict (Foam::Time::operator++, TimeIO.C purgeWrite), measured from the
+    // RESOLVED start so a `startFrom latestTime` restart names its output from where it restarted.
+    WriteControl wc(controlDict);
+    wc.setStartTime(startTimeVal);
+    std::string lastWritten;
+
     // ---- the SIMPLE loop ---------------------------------------------------------------------
     SolverWorkspace ws;
     std::map<std::string, scalar> residuals;
@@ -2043,9 +2133,36 @@ int runSimpleFoamV2(const std::string& caseDir)
                             r.field == "p" ? "AMG-PCG" : uSolv, r.field.c_str(),
                             r.initial, r.final, r.nIterations);
         }
+        // runTime.write() (simpleFoam.C:106): a time directory whenever Time::operator++ set writeTime.
+        if (wc.isWriteTime(static_cast<int>(iter), timeValue))
+        {
+            const std::string tname = WriteControl::timeName(timeValue);
+            writeTimeDir(tname);
+            wc.recordWritten(caseDir, tname);
+            lastWritten = tname;
+        }
     }
     if (ctl.converged())
+    {
         std::printf("SIMPLE solution converged in %d iterations\n", static_cast<int>(iter));
+        // runTime.writeAndEnd() -- the converged state is written whether or not it is a write time.
+        const std::string tname = WriteControl::timeName(timeValue);
+        if (tname != lastWritten)
+        {
+            writeTimeDir(tname);
+            wc.recordWritten(caseDir, tname);
+            lastWritten = tname;
+        }
+    }
+    else if (lastWritten != WriteControl::timeName(timeValue))
+    {
+        // OpenFOAM writes nothing here -- Time::run() has no end-of-run write, so an endTime that is not
+        // a multiple of the write interval leaves no directory. brae used to write it anyway. Said
+        // plainly so a missing directory reads as the case's own setting and not as a crash.
+        std::printf("endTime %s is not a write time under the case's writeControl/writeInterval: no "
+                    "time directory written, as OpenFOAM writes none\n",
+                    WriteControl::timeName(timeValue).c_str());
+    }
     if (std::getenv("BRAE_PHASE_TIME"))
         std::printf("  [phase] turbulence hook %.3f s (%.1f ms/iter), of which the nuEff host "
                     "round-trip %.3f s (%.1f ms/iter), over %d iterations\n",
@@ -2054,64 +2171,6 @@ int runSimpleFoamV2(const std::string& caseDir)
                     static_cast<int>(iter));
 
     // ---- write -------------------------------------------------------------------------------
-    {
-        // OF names a time directory by its TIME VALUE (Time::timeName, Time.C:721-728), not by an
-        // iteration index. Measured: startTime 0 / endTime 2.5 / deltaT 0.5 -- OpenFOAM writes 2.5/,
-        // this driver wrote 2/.
-        const std::string outDir = caseDir + "/" + WriteControl::timeName(startTimeVal + iter * deltaT);
-        std::filesystem::create_directories(outDir);
-        const std::string src = caseDir + "/" + startTime;
-
-        const std::vector<scalar> pOut = gf.p.host();
-        const std::vector<scalar> ux = gf.Ux.host(), uy = gf.Uy.host(), uz = gf.Uz.host();
-        std::vector<vector> UOut(nC);
-        for (label c = 0; c < nC; ++c) UOut[c] = {ux[c], uy[c], uz[c]};
-
-        // THE SOLVED BOUNDARY VALUES, not the start directory's. Every call here used to omit
-        // writeVolField's `computedBoundary` argument, which makes it ECHO the template it read -- so a
-        // V2 time directory carried the 0/ boundary on every patch the solve had moved. Measured on
-        // backwardFacingStep2D: the walls' nut came out `value uniform 0` (the 0/ placeholder) where
-        // the legacy driver writes the solved `nonuniform List<scalar>`, i.e. the wall function's
-        // viscosity was absent from the output. A restart from such a directory restarts from the wrong
-        // state, and any wall post-processing reads a zero that was never the answer.
-        DeviceBuffer<scalar> pB, uxB, uyB, uzB;
-        deviceBCValue(dbP, gf.p, pB);
-        deviceBCValue(dbU.comp[0], gf.Ux, uxB);
-        deviceBCValue(dbU.comp[1], gf.Uy, uyB);
-        deviceBCValue(dbU.comp[2], gf.Uz, uzB);
-        const std::vector<scalar> hpB = pB.host();
-        const std::vector<scalar> hxB = uxB.host(), hyB = uyB.host(), hzB = uzB.host();
-        std::vector<vector> UB(hxB.size());
-        for (std::size_t i = 0; i < hxB.size(); ++i) UB[i] = vector{hxB[i], hyB[i], hzB[i]};
-
-        writeVolField<scalar>(src + "/p", outDir + "/p", pOut, fvp, 16, hpB);
-        writeVolField<vector>(src + "/U", outDir + "/U", UOut, fvp, 16, UB);
-        if (ras)
-        {
-            // SpalartAllmaras transports nuTilda in the k slot and has no second field.
-            const std::string first = saModel ? "nuTilda" : "k";
-            DeviceBuffer<scalar> kB;
-            deviceBCValue(dbK, dK, kB);
-            writeVolField<scalar>(src + "/" + first, outDir + "/" + first, dK.host(), fvp, 16, kB.host());
-            if (!saModel)
-            {
-                DeviceBuffer<scalar> eB;
-                deviceBCValue(dbEps, dEps, eB);
-                writeVolField<scalar>(src + "/" + secondField, outDir + "/" + secondField,
-                                      dEps.host(), fvp, 16, eB.host());
-            }
-            // nut's boundary is NOT a BC evaluation: the wall faces carry what the wall function
-            // computed, which is exactly what `nb` holds (deviceBoundaryNut writes the whole boundary
-            // there). Evaluating dbNut instead would put the `calculated` placeholder back on the walls.
-            writeVolField<scalar>(src + "/nut", outDir + "/nut", dNut.host(), fvp, 16,
-                                  nb.size() ? nb.host() : std::vector<scalar>());
-        }
-        // The second field is `omega` under kOmegaSST; the file was always written under its right name,
-        // but this line claimed `epsilon` for every model.
-        const std::string turbFields =
-            ras ? (saModel ? std::string(",nuTilda,nut") : ",k," + secondField + ",nut") : std::string();
-        std::printf("written %s/{U,p%s}\n", outDir.c_str(), turbFields.c_str());
-    }
     return static_cast<int>(iter);
 }
 
