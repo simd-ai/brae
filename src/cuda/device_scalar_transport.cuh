@@ -468,8 +468,8 @@ void deviceSolveScalarTransport(
     const scalar normF = [&]{
         const int n = static_cast<int>(field.size());
         if (n == 0) return scalar(1);
-        DeviceBuffer<scalar> ones, sumA, Apsi, t, w;
-        ones.copyFrom(std::vector<scalar>(static_cast<std::size_t>(n), scalar(1)));
+        DeviceBuffer<scalar> sumA, Apsi, t, w;
+        const DeviceBuffer<scalar>& ones = deviceOnes(n);   // kept across calls; a pageable upload before
         deviceAmul(sv, ones, sumA);                     // sumA = A * 1 = row sums
         deviceAmul(sv, field, Apsi);                    // A.psi
         const scalar xRef = deviceDot(field, ones) / static_cast<scalar>(n);

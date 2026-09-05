@@ -182,9 +182,8 @@ void pressurePredictor(
         // rAtU = V/rowSum. That IS 1/(1/rAU - H1) and not an approximation of it: A = D/V and
         // H1 = -sum(offdiag)/V (lduMatrixATmul.C), so V*(A - H1) = D + sum(offdiag) = the row sum of the
         // folded matrix. D is the diagonal folded above, reused rather than rebuilt.
-        DeviceBuffer<scalar> ones, rowSum;
-        ones.copyFrom(std::vector<scalar>(static_cast<std::size_t>(dm.nCells), scalar(1)));
-        deviceAmul(deviceLduView(dm, D, UEqn.upper, UEqn.lower), ones, rowSum);
+        DeviceBuffer<scalar> rowSum;
+        deviceAmul(deviceLduView(dm, D, UEqn.upper, UEqn.lower), deviceOnes(dm.nCells), rowSum);
         deviceSimplecRAtU(dm, rowSum, D, st.rAtU);
 
         DeviceBuffer<scalar> drAtU;

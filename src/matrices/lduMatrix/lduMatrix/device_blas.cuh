@@ -30,6 +30,11 @@ void   deviceFusedScaleAxpy(DeviceBuffer<scalar>& p, const scalar* b, const Devi
 // the recurrence arithmetic on-device. Same kernels/arithmetic as the host-scalar path -> bit-identical results.
 void   deviceDotInto(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y, scalar* dResult);  // *dResult = x.y
 void   deviceSumMagInto(const DeviceBuffer<scalar>& x, scalar* dResult);                              // *dResult = sum|x|
+// A device vector of ones of length n, built once per length and kept. normFactor (lduMatrixSolver.C's
+// sumA = A*1) and SIMPLEC's row sum both need one; rebuilding it on the host and uploading it from
+// pageable memory on every call was a stream sync each time -- three per outer iteration on the flat
+// plate, 4.4 ms. A vector of ones is a vector of ones, so sharing it changes no number.
+const DeviceBuffer<scalar>& deviceOnes(int n);
 void   deviceAxpyDev(const scalar* dA, const DeviceBuffer<scalar>& x, DeviceBuffer<scalar>& y);       // y += (*dA)*x
 void   deviceScaleDev(const scalar* dA, DeviceBuffer<scalar>& x);                                     // x *= (*dA)
 void   deviceScalarDiv(const scalar* num, const scalar* den, scalar* out);                            // *out = *num / *den

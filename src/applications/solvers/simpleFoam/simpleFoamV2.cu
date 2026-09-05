@@ -49,6 +49,20 @@
 #include <sstream>
 #include <stdexcept>
 
+// nuEff refresh kernels (see the turbulence hook): the same arithmetic the host loop did, on the device.
+constexpr int NUEFF_TPB = 256;
+inline int nuEffBlocks(int n) { return (n + NUEFF_TPB - 1) / NUEFF_TPB; }
+__global__ void nuEffCellK(int n, brae::scalar nu, const brae::scalar* __restrict__ nut, brae::scalar* __restrict__ out)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c < n) out[c] = nu + nut[c];
+}
+__global__ void nuEffBndK(int nBnd, int nHave, brae::scalar nu, const brae::scalar* __restrict__ nutB, brae::scalar* __restrict__ out)
+{
+    const int j = blockIdx.x*blockDim.x + threadIdx.x;
+    if (j < nBnd) out[j] = (j < nHave) ? nu + nutB[j] : nu;
+}
+
 namespace brae {
 namespace gpu {
 
@@ -1677,22 +1691,21 @@ int runSimpleFoamV2(const std::string& caseDir)
             // 2000x too small; deviceBoundaryNut is what applies the wall function per face.
             refreshBoundaryNut();
 
-            const std::vector<scalar> nutC = dNut.host(), nutB = nb.host();
-            for (label c = 0; c < nC; ++c) nuEffC[c] = nu + nutC[c];
-            std::size_t j = 0;
-            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-            {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
-                for (label i = 0; i < fvp[pi].size; ++i, ++j)
-                    if (j < nutB.size()) nuEffB[pi][i] = nu + nutB[j];
-            }
-            const SurfaceScalarField nf2 = cpu::effectiveFaceViscosity(nuEffC, nuEffB, m, g, fvp);
-            dNuCell.copyFrom(nuEffC);
-            dNuFace.copyFrom(nf2.internal);
-            std::vector<scalar> flat;
-            for (const auto& v : nuEffB) for (scalar x : v) flat.push_back(x);
-            flat.resize(dm.nBndFaces, nu);
-            dNuBnd.copyFrom(flat);
+            // nuEff = nu + nut on the DEVICE, where nut already lives. This used to pull nut and its
+            // boundary to the host, add nu in a CPU loop, interpolate to the faces on the host and
+            // upload three whole fields back -- 3.6-6.6 ms of every outer iteration on the flat plate,
+            // most of it the three pageable uploads (each a stream sync). Every number is the same:
+            // the cell value is `nu + nut[c]` in that order; the face value is fvc::interpolate's
+            // `w*own + (1-w)*nei` (fvc.cu:203), which is the expression device_fvc.cu:24 evaluates in
+            // the same order; the boundary value is `nu + nut_b` over the non-coupled boundary faces
+            // in patch order -- the layout nb already has -- and `nu` beyond it, exactly as the host
+            // `flat.resize(nBndFaces, nu)` padded. Gated by the momentum matrix to the bit.
+            nuEffCellK<<<nuEffBlocks(nC), NUEFF_TPB>>>(nC, nu, dNut.data(), dNuCell.data());
+            deviceInterpolate(dm, dNuCell, dNuFace);
+            dNuBnd.resize(dm.nBndFaces);
+            nuEffBndK<<<nuEffBlocks(dm.nBndFaces), NUEFF_TPB>>>(dm.nBndFaces, static_cast<int>(nb.size()), nu,
+                                                    nb.data(), dNuBnd.data());
+            cudaCheck(cudaGetLastError(), "nuEff refresh");
             const auto tNow = std::chrono::steady_clock::now();
             g_hookSeconds    += std::chrono::duration<double>(tNow - tHook0).count();
             g_refreshSeconds += std::chrono::duration<double>(tNow - tRefresh0).count();

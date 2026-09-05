@@ -19,6 +19,7 @@
 // This does NOT make brae bit-reproducible on its own. There are ~68 other atomicAdd sites, most of them
 // scatter-accumulates into per-cell arrays (out[own[f]] += ...), which are order-dependent for the same reason.
 // What this fixes is the reduction that the convergence test reads.
+#include <map>
 #include "device_blas.cuh"
 #include <cuda_runtime.h>
 #include <cstddef>
@@ -186,6 +187,21 @@ void deviceDotInto(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y,
     cudaCheck(cudaGetLastError(), "dotInto");
 }
 
+
+const DeviceBuffer<scalar>& deviceOnes(int n)
+{
+    // Leaked on purpose, like the other device caches: no static destructor may run after the CUDA
+    // context is torn down.
+    static auto& cache = *new std::map<int, DeviceBuffer<scalar>>();
+    auto it = cache.find(n);
+    if (it == cache.end())
+    {
+        DeviceBuffer<scalar> ones;
+        ones.copyFrom(std::vector<scalar>(static_cast<std::size_t>(n), scalar(1)));
+        it = cache.emplace(n, std::move(ones)).first;
+    }
+    return it->second;
+}
 
 void deviceSumMagInto(const DeviceBuffer<scalar>& x, scalar* dResult)
 {
