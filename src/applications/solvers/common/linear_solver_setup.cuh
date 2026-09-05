@@ -181,13 +181,11 @@ inline void readLinearSolverControls(
         if (!smoo.empty() && !gs)
             noticeIgnored("solvers/" + f + " smoother",
                           "'" + smoo + "' -- brae is not running a smoothSolver on this field");
-        // ...and when it DID take that path, the sweep is still not OpenFOAM's. Announced on the same
-        // subject as the `ignored` arm above so the two cannot both be silent for a field.
-        if (!smoo.empty() && gs)
-            noticeApproximated("solvers/" + f + " smoother",
-                               "case asks '" + smoo + "', brae runs that smoothSolver around a MULTICOLOUR "
-                               "Gauss-Seidel sweep where OpenFOAM sweeps in index order -- same stopping "
-                               "rule, less smoothing per sweep, so a loose solve stops elsewhere");
+        // ...and when it DID take that path there is nothing left to announce: device_sym_gauss_seidel.cuh
+        // runs OpenFOAM's own sweep, level-scheduled, in whichever of the two variants the case named --
+        // symGaussSeidelSmoother.C's up-then-down or GaussSeidelSmoother.C's up-only. tests/gs_ladder
+        // holds both to OpenFOAM's own per-sweep residual. The `ignored` arm above still fires for a
+        // smoother brae does not run at all, so the two cannot both be silent for a field.
         // Against what THIS DRIVER preconditions with, not against a fixed exemption list. The old test
         // was `prec != "diagonal" && prec != "none" && !diluWired`, which had two holes: the wired list
         // named the fields a DIFFERENT driver wires (queue item 27), and `none` is not `diagonal` --
@@ -216,6 +214,15 @@ inline void readLinearSolverControls(
         if (!s || s->wordOr("solver", "") != "smoothSolver") return false;
         const std::string sm = s->wordOr("smoother", "");
         return sm == "symGaussSeidel" || sm == "GaussSeidel";
+    };
+    // ...and WHICH of the two OF smoothers it named. They are different algorithms, not settings:
+    // symGaussSeidelSmoother.C walks the cells up then back down, GaussSeidelSmoother.C walks them up
+    // ONLY. Anything other than a bare `GaussSeidel` is the symmetric one (the field either did not take
+    // this path at all, in which case the flag is unused, or it named symGaussSeidel).
+    auto gsIsSymmetric = [&](const std::string& f)
+    {
+        const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
+        return !(s && s->wordOr("smoother", "") == "GaussSeidel");
     };
 
     ctl.tolP = solverTol("p", 1e-6);
@@ -252,6 +259,7 @@ inline void readLinearSolverControls(
         noticeSolverChoice(heName, "PBiCGStab", krylovPrecon(heName), false);
     }
     ctl.gsU = useSymGS("U");
+    ctl.gsUSym = gsIsSymmetric("U");
     if (const char* gsuEnv = std::getenv("BRAE_GS_U"))
         ctl.gsU = (std::atoi(gsuEnv) != 0) && ctl.gsU;
     // DILU on the momentum equations, when the case asks for it and brae is on the BiCGStab path.
@@ -310,6 +318,18 @@ inline void readLinearSolverControls(
                 solvers && solvers->subDict(secondName + "Final") ? solverRelTol(secondName + "Final") : solverRelTol(secondName));
             ctl.gsK = useSymGS("k");
             ctl.gsEps = useSymGS(secondName);
+            // ONE smoother variant for the transported pair, as nSweeps is: the model solves both
+            // scalars through one call. A case that names symGaussSeidel on one and GaussSeidel on the
+            // other is refused rather than run with whichever entry was read first -- running would
+            // apply one field's smoother under the other's name.
+            ctl.gsKESym = gsIsSymmetric("k");
+            if ((ctl.gsK || ctl.gsEps) && gsIsSymmetric(secondName) != ctl.gsKESym)
+                throw std::runtime_error(
+                    "system/fvSolution names a `GaussSeidel` smoother on one of k / " + secondName
+                    + " and `symGaussSeidel` on the other. Those are different OpenFOAM smoothers "
+                      "(GaussSeidelSmoother.C sweeps ascending only; symGaussSeidelSmoother.C also "
+                      "sweeps back), and this driver carries one smoother for the transported pair, so "
+                      "running would apply one field's setting under the other's name.");
             noticeSolverChoice("k", "PBiCGStab", krylovPrecon("k"), ctl.gsK);
             noticeSolverChoice(secondName, "PBiCGStab", krylovPrecon(secondName), ctl.gsEps);
             // DILU on whichever of the pair runs BiCGStab. subDict is regex-aware (literal first, then

@@ -211,16 +211,17 @@ Residuals simpleStep(
             deviceFold(dm, Mp.relaxed ? Mp.relaxedDiag : Mp.diag, Mp.source[k], Mp.iC[k], Mp.bC[k], diagC, b);
             const DeviceLduView A = foldedView(dm, Mp, diagC);
             const scalar nf = deviceNormFactor(A, *U[k], b, w.ones);
-            // The solver SELECTION the case asked for, not the algorithm: deviceSymGaussSeidel is
-            // OpenFOAM's smoothSolver stopping rule around a MULTICOLOUR Gauss-Seidel sweep, where
-            // symGaussSeidelSmoother.C sweeps in index order. Same algorithm under a permutation, and
-            // Gauss-Seidel is order-dependent, so the iterate after n sweeps differs -- measured on T3A,
-            // OpenFOAM reaches relTol 0.1 in one sweep where this takes seven. The driver announces it.
+            // The solver the case asked for, algorithm included: deviceSymGaussSeidel is OpenFOAM's
+            // smoothSolver stopping rule around symGaussSeidelSmoother.C's own index-order sweep,
+            // level-scheduled onto the device (device_sym_gauss_seidel.cuh), and tests/gs_ladder holds
+            // it to OpenFOAM's per-sweep residual at 2.8e-12. It used to be a MULTICOLOUR sweep, which
+            // reached T3A's relTol 0.1 in 9-10 sweeps against OpenFOAM's 4-5 and made the case
+            // limit-cycle. Only `GaussSeidel` (ascending only in OF) is still substituted, and announced.
             // Internal-face LDU only -- no coupled interfaces, which this path refuses anyway.
             DeviceSolverPerf perf;
             if (in.uSymGaussSeidel)
                 deviceSymGaussSeidel(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIterU, &perf,
-                                     in.minIterU, in.nSweepsU);
+                                     in.minIterU, in.nSweepsU, in.uGaussSeidelSymmetric);
             else
                 perf = deviceJacobiBiCGStab(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIterU,
                                             /*checkEvery*/1, in.minIterU);

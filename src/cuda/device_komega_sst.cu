@@ -933,7 +933,8 @@ void deviceKOmegaSSTCorrect(
     const DeviceBuffer<label>*  fvoEMask,
     const DeviceBuffer<scalar>* fvoEVal,     // compressible: mu at boundary faces (the +mu of rho*D+mu)
     const DeviceBuffer<scalar>* lesDelta,    // case `delta` (maxDeltaxyz); null = OF's cubeRootVol
-    int nSweeps)                             // solvers/<field>/nSweeps; see the declaration
+    int nSweeps,                             // solvers/<field>/nSweeps; see the declaration
+    bool gsSymmetric)
 {
     const int nC = dm.nCells;
     // production (raw GbyNu0) + G = nut*GbyNu0, divU, S2 (shared gradU = OF tgradU = grad(U) scheme).
@@ -1076,7 +1077,7 @@ void deviceKOmegaSSTCorrect(
                                // limField/limGrad* null (a scalar builds its own limiter), precon null
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
-                               /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps);
+                               /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric);
     deviceBoundField(dm, omega, 1e-15);   // OF bound(omega_, omegaMin_)
 
     // k equation (loose solve)
@@ -1091,7 +1092,7 @@ void deviceKOmegaSSTCorrect(
                                // limField/limGrad* null (a scalar builds its own limiter), precon null
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
-                               /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps);
+                               /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric);
     deviceBoundField(dm, k, 1e-15);   // OF bound(k_, kMin_)
 
     // correctNut (Bradshaw): nut = a1*k / max(a1*omega, b1*F2*sqrt(S2)).
@@ -1444,7 +1445,8 @@ void deviceKOmegaSSTLMCorrect(
     // source. Running upwind under the case's own scheme name was worth a factor of 12 on the _cpp
     // reference's end-to-end error, so it is threaded through rather than assumed.
     bool limitedLinear,
-    bool linearUpwind)
+    bool linearUpwind,
+    bool gsSymmetric)
 {
     const int nC = dm.nCells;
     const LMCoeffs lm;
@@ -1463,7 +1465,10 @@ void deviceKOmegaSSTLMCorrect(
     deviceSolveScalarTransport(dm, dbReThetat, ReThetat, "ReThetat", DRe, phiInt, phiBnd, divU, bounded, limitedLinear, linearUpwind, nonOrth, 2.0,
                                relax, tol, relTolKE, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ lmAddReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), spR.data(), suR.data(), diag.data(), src.data()); },
-                               nullptr, nullptr, ami, cyc, reDdt);
+                               nullptr, nullptr, ami, cyc, reDdt, /*DBnd*/nullptr, /*gradLimitK*/0.0,
+                               /*bound*/true, /*fvoMask*/nullptr, /*fvoVal*/nullptr,
+                               /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
+                               /*limGradZ*/nullptr, /*precon*/nullptr, /*nSweeps*/1, gsSymmetric);
     deviceBoundField(dm, ReThetat, 0.0);
 
     // gammaInt: DgammaIntEff = nut+nu; reaction = Pgamma+Egamma - Sp(ce1*Pgamma+ce2*Egamma).
@@ -1476,7 +1481,10 @@ void deviceKOmegaSSTLMCorrect(
     deviceSolveScalarTransport(dm, dbGammaInt, gammaInt, "gammaInt", DgI, phiInt, phiBnd, divU, bounded, limitedLinear, linearUpwind, nonOrth, 2.0,
                                relax, tol, relTolKE, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ lmAddReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), spG.data(), suG.data(), diag.data(), src.data()); },
-                               nullptr, nullptr, ami, cyc, giDdt);
+                               nullptr, nullptr, ami, cyc, giDdt, /*DBnd*/nullptr, /*gradLimitK*/0.0,
+                               /*bound*/true, /*fvoMask*/nullptr, /*fvoVal*/nullptr,
+                               /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
+                               /*limGradZ*/nullptr, /*precon*/nullptr, /*nSweeps*/1, gsSymmetric);
     deviceBoundField(dm, gammaInt, 0.0);
     gammaIntEff.resize(nC);
     lmGammaEffKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),

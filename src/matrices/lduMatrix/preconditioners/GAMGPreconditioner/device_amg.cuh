@@ -180,12 +180,14 @@ void deviceCoarseJacobiFused(const DeviceLduView& cv, const DeviceBuffer<scalar>
 // Reference: the unfused coarse Jacobi (deviceAmul + smooth, nSweeps launches each), for validation/timing.
 void deviceCoarseJacobiLoop(const DeviceLduView& cv, const DeviceBuffer<scalar>& rc, DeviceBuffer<scalar>& xc, int nSweeps);
 
-// symGaussSeidel scalar solver: OpenFOAM's smoothSolver STOPPING RULE (smoothSolver.C:135-209) around a
-// MULTICOLOUR Gauss-Seidel sweep. It is NOT byte-faithful to symGaussSeidelSmoother.C, which visits cells in
-// strict index order (:147 forward, :176 reverse); this visits them in COLOUR order, and a Gauss-Seidel sweep
-// is order-dependent, so the per-sweep iterate is a different one. Measured on validation/T3A restarted from
-// its 269 fixture, same matrix and the case's own relTol 0.1: OpenFOAM cut Ux 1.6186e-05 -> 6.940e-07 in ONE
-// sweep (23.3x), this took SEVEN to reach 1.278e-06 (12.7x). Callers must ANNOUNCE the substitution.
+// symGaussSeidel scalar solver: OpenFOAM's smoothSolver STOPPING RULE (smoothSolver.C:135-209) around
+// symGaussSeidelSmoother.C's own sweep, level-scheduled so it runs on the device without changing a
+// single operation (device_sym_gauss_seidel.cuh). It USED to be a multicolour sweep, which visits the
+// same cells in a different order and is therefore a different smoother: tests/gs_ladder measured it
+// 1.36x behind OpenFOAM after one sweep and 6.88x after ten on T3A's own momentum system, and on that
+// case the two orders stop on opposite sides of `relTol 0.1; maxIter 10`. There is no substitution here
+// any more; the opt-in BRAE_TURB_FP32 / BRAE_TURB_JACOBI / BRAE_GS_DEVICE paths below still take the
+// colour order and are experiments, not the solver the case asked for.
 // For the stiff near-wall k/omega/epsilon transport on low-Re (y+~1) meshes where Jacobi-BiCGStab amplifies the
 // near-wall instability. Coloring is built once per mesh (cached on A.owner), internal-face LDU only (no interface).
 scalar deviceSymGaussSeidel(const DeviceLduView& A, const DeviceBuffer<scalar>& b, DeviceBuffer<scalar>& psi,
@@ -195,6 +197,11 @@ scalar deviceSymGaussSeidel(const DeviceLduView& A, const DeviceBuffer<scalar>& 
                             // fvSolution solvers/<field>/nSweeps (smoothSolver.C:78, default 1): the
                             // number of smoothing sweeps between residual EVALUATIONS. > 1 takes the
                             // host loop, which evaluates where OpenFOAM evaluates.
-                            int nSweeps = 1);   // returns the OF initialResidual; *perf (if given) gets init/final/nIter
+                            int nSweeps = 1,
+                            // WHICH OpenFOAM smoother: true = symGaussSeidel (ascending then
+                            // descending), false = GaussSeidel (ascending ONLY, GaussSeidelSmoother.C
+                            // has no reverse half). Read from the case's `smoother` entry; they are
+                            // different solvers and a loose solve stops in different places.
+                            bool symmetric = true);   // returns the OF initialResidual; *perf (if given) gets init/final/nIter
 
 } // namespace brae

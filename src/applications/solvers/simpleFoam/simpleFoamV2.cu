@@ -655,37 +655,22 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
                                     "AMG-preconditioned PCG instead. Same operator, different Krylov "
                                     "method and iteration count.");
         }
-    // The SMOOTHER substitution, which had no notice anywhere. brae routes a `smoothSolver` with a
-    // GaussSeidel-family smoother to deviceSymGaussSeidel, which is OpenFOAM's smoothSolver STOPPING RULE
-    // around a MULTICOLOUR sweep where symGaussSeidelSmoother.C sweeps in index order. Same algorithm
-    // under a permutation, but Gauss-Seidel is order-dependent, so at the loose relTol a SIMPLE step asks
-    // for the two stop in different places: measured on validation/T3A, OpenFOAM cut Ux 1.6186e-05 ->
-    // 6.940e-07 in ONE sweep where brae took SEVEN to reach 1.278e-06, both on the case's own relTol 0.1.
-    // It was announced nowhere -- the shared reader suppresses the smoother notice precisely when brae
-    // takes this path (linear_solver_setup.cuh), and the run log said "as the case asks".
-    if (const FoamDict* solvers = fvSolution.subDict("solvers"))
-    {
-        std::string fields;
-        for (const char* f : {"U", "k", "epsilon", "omega", "nuTilda"})
-        {
-            const FoamDict* fs = solvers->subDict(f);
-            if (!fs) continue;
-            const std::string sm = fs->wordOr("smoother", "");
-            if (fs->wordOr("solver", "") != "smoothSolver") continue;
-            if (sm != "symGaussSeidel" && sm != "GaussSeidel") continue;
-            if (!fields.empty()) fields += ", ";
-            fields += f;
-        }
-        // The turbulence nSweeps notice that stood here is GONE, not silenced: solvers/<field>/nSweeps
-        // now reaches the transported scalars' solve (queue item 47), and a case that sets it
-        // differently on the two fields a model carries is refused by name rather than announced.
-        if (!fields.empty())
-            r.notices.push_back("system/fvSolution asks for `smoothSolver` with a symGaussSeidel smoother "
-                                "on " + fields + "; brae runs that smoothSolver around a MULTICOLOUR "
-                                "Gauss-Seidel sweep, which SMOOTHS LESS per sweep than OpenFOAM's "
-                                "index-order sweep. Same stopping rule, more sweeps, and a loose solve "
-                                "stops somewhere else.");
-    }
+    // THE SMOOTHER: nothing to announce any more. brae runs a `smoothSolver` with a GaussSeidel-family
+    // smoother through deviceSymGaussSeidel, which is OpenFOAM's smoothSolver STOPPING RULE around
+    // OpenFOAM's OWN sweep, level-scheduled onto the device (device_sym_gauss_seidel.cuh) -- in whichever
+    // of the two variants the case named: symGaussSeidelSmoother.C's ascending-then-descending walk, or
+    // GaussSeidelSmoother.C's ascending-only one. tests/gs_ladder holds BOTH to OpenFOAM's own per-sweep
+    // residual, at 2.8e-12 and its own ladder respectively.
+    //
+    // It used to be a MULTICOLOUR sweep for both names, and that was not a difference in cost: on
+    // validation/T3A the colour order and the index order stop on opposite sides of the case's own
+    // `relTol 0.1; maxIter 10` -- OpenFOAM reaches relTol 0.1 in 4-5 sweeps, the colour order needed 9-10
+    // and so always took the cap, and brae limit-cycled at U 3.83e-01 where it now converges in 406
+    // iterations at U 6.7e-05 against OpenFOAM's own answer.
+    //
+    // The turbulence nSweeps notice that stood here is GONE, not silenced: solvers/<field>/nSweeps now
+    // reaches the transported scalars' solve (queue item 47), and a case that sets it -- or the smoother
+    // variant -- differently on the two fields a model carries is refused by name rather than announced.
 
     r.supported = r.blockers.empty();
     return r;
@@ -964,8 +949,14 @@ int runSimpleFoamV2(const std::string& caseDir)
     // for the pair the model carries, so a case that sets them differently is refused rather than run
     // with whichever was read first.
     int nSweepsKE = 1;
+    // ...and WHICH of OF's two GaussSeidel smoothers the pair named. symGaussSeidelSmoother.C sweeps up
+    // then back down; GaussSeidelSmoother.C sweeps up ONLY. Different smoothers, one value for the pair.
+    bool gsKESym = true;
     scalar twoBykK = 2.0, twoBykEps = 2.0;
     bool   sstModel = false;
+    // OF RAS/turbulence: false freezes the model (correct() returns immediately). Declared here so the
+    // turbulence hook can capture it; read below, once the RAS dictionary is in hand.
+    bool   turbulenceOn = true;
     // SpalartAllmaras transports ONE scalar, nuTilda, and rides the k slot; the epsilon slot is unused.
     bool   saModel = false;
     // kOmegaSSTLM rides the kOmegaSST slots (omega in the `epsilon` slot) and adds two transported
@@ -1141,6 +1132,26 @@ int runSimpleFoamV2(const std::string& caseDir)
         // uses -- the fused device correct() for each model takes that slot and knows what it means.
         // `ras` here is the simulationType switch, not the dict -- the RAS sub-dictionary is re-fetched.
         const FoamDict* rasDict = turbProps.subDict("RAS");
+        // OF's RAS `turbulence` switch (RASModel.C:70, getOrDefault<Switch>("turbulence", true)). `off`
+        // does NOT mean laminar: every model's correct() returns immediately on it (kEpsilon.C:216,
+        // kOmegaSSTBase.C:502, kOmegaSSTLM.C:602, SpalartAllmarasBase.C:442) while the model still
+        // exists, so k / epsilon|omega / nuTilda and the transition scalars keep the values they were
+        // constructed with, and nut is whatever validate() -- which simpleFoam.C:92 calls BEFORE the
+        // loop, and which is correctNut() -- made of them. The momentum equation then runs on that
+        // frozen eddy viscosity for the whole run.
+        //
+        // This was read by turbulence_setup.cuh and announced there as "the model is FROZEN", but the
+        // only consumer of that flag was the LEGACY driver (device_simple_foam.cu). This driver corrected
+        // the turbulence anyway, so the notice asserted the opposite of what ran.
+        {
+            const std::string sw = rasDict ? rasDict->wordOr("turbulence", "true") : "true";
+            turbulenceOn = !(sw == "off" || sw == "no" || sw == "false" || sw == "0");
+            if (!turbulenceOn)
+                std::printf("  RAS turbulence %s: the model is FROZEN -- correct() is not run, so k, "
+                            "epsilon|omega|nuTilda keep their initial values and momentum uses the nut "
+                            "validate() built from them. This is NOT simulationType laminar.\n",
+                            sw.c_str());
+        }
         lmModel  = rasDict && rasDict->wordOr("RASModel", "") == "kOmegaSSTLM";
         // The LM model IS kOmegaSST plus the transition transport, so every kOmegaSST path below is
         // taken as well -- the two flags are deliberately not exclusive.
@@ -1510,6 +1521,10 @@ int runSimpleFoamV2(const std::string& caseDir)
             // iteration is the turbulence hook (which round-trips nut to the host) versus the solve.
             const auto tHook0 = std::chrono::steady_clock::now();
             clearTurbulenceReport();
+            // OF: every model's correct() opens with `if (!turbulence_) return;`. Not a shortcut -- the
+            // frozen fields and the nut validate() built from them are what the momentum equation is
+            // supposed to see for the whole run.
+            if (!turbulenceOn) return;
             // Solver settings from the CASE, exactly as for U and p. This was hardcoded to tol=1e-10
             // with relTol 0 and BiCGStab, so k and epsilon were driven to near machine precision every
             // outer iteration while the case asks for 1e-05 / relTol 0.1 / symGaussSeidel. Measured: the
@@ -1550,7 +1565,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                                              gradUSchemeLimit,
                                              // solvers/nuTilda/nSweeps -- validation/airFoil2D really
                                              // does ship `nSweeps 2` here.
-                                             nSweepsKE);
+                                             nSweepsKE, gsKESym);
             }
             else if (sstModel)
             {
@@ -1593,7 +1608,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                                        /*fvoEMask*/nullptr, /*fvoEVal*/nullptr,
                                        /*lesDelta*/nullptr,
                                        // solvers/k|omega/nSweeps -- the case's own sweep count.
-                                       nSweepsKE);
+                                       nSweepsKE, gsKESym);
 
             // OF kOmegaSSTLM::correct() runs kOmegaSST::correct() FIRST and the transition transport
             // SECOND, so k and omega always advance on the PREVIOUS iteration's gammaIntEff. Reversing
@@ -1604,7 +1619,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                                          gf.phiInt, gf.phiBnd, nu, relaxEps, tolKE, relTolKE,
                                          /*keCheckEvery*/1, boundedEps, nonOrthLaplacian, gsKE,
                                          /*ami*/nullptr, /*cyc*/nullptr, /*reDdt*/{}, /*giDdt*/{},
-                                         limitedEps, linearUpwindEps);
+                                         limitedEps, linearUpwindEps, gsKESym);
             }
             else
             deviceKEpsilonCorrect(dm, wall, dbEps, dbK, dbU, gf.Ux, gf.Uy, gf.Uz,
@@ -1642,7 +1657,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                                   /*fvoKMask*/nullptr, /*fvoKVal*/nullptr,
                                   /*fvoEMask*/nullptr, /*fvoEVal*/nullptr,
                                   // solvers/k|epsilon/nSweeps -- the case's own sweep count.
-                                  nSweepsKE);
+                                  nSweepsKE, gsKESym);
 
             // OpenFOAM prints an Initial residual for every turbulence solve, and comparing those against
             // its log is how this path is checked against the oracle. Off unless asked for, so that the
@@ -1737,6 +1752,7 @@ int runSimpleFoamV2(const std::string& caseDir)
             // as converged.
             const std::string firstFld  = saModel ? "nuTilda" : "k";
             const std::string secondFld = sstModel ? "omega" : "epsilon";
+            gsKESym = (sk->wordOr("smoother", "") != "GaussSeidel");
             nSweepsKE = static_cast<int>(sk->scalarOr("nSweeps", 1));
             if (nSweepsKE < 0)
                 throw std::runtime_error(
@@ -1748,6 +1764,14 @@ int runSimpleFoamV2(const std::string& caseDir)
             if (!saModel)
                 if (const FoamDict* ss = solvers->subDict(secondFld))
                 {
+                    if (gsKE && (ss->wordOr("smoother", "") != "GaussSeidel") != gsKESym)
+                        throw std::runtime_error(
+                            "system/fvSolution names a `GaussSeidel` smoother on one of " + firstFld
+                            + " / " + secondFld + " and `symGaussSeidel` on the other. Those are "
+                              "different OpenFOAM smoothers -- GaussSeidelSmoother.C sweeps ascending "
+                              "only, symGaussSeidelSmoother.C also sweeps back -- and this driver "
+                              "carries one smoother for the transported pair, so running would apply "
+                              "one field's setting under the other's name.");
                     const int n2 = static_cast<int>(ss->scalarOr("nSweeps", 1));
                     if (n2 != nSweepsKE)
                         throw std::runtime_error(
@@ -1762,7 +1786,8 @@ int runSimpleFoamV2(const std::string& caseDir)
                         keCoeffs.A0, keCoeffs.C2, keCoeffs.sigmaEps);
         std::printf("  k/epsilon solves: tol=%.1e relTol=%.3g  solver=%s\n",
                     tolKE, relTolKE,
-                    gsKE ? "smoothSolver + MULTICOLOUR symGaussSeidel (OpenFOAM sweeps in index order)"
+                    gsKE ? (gsKESym ? "smoothSolver + symGaussSeidel (OpenFOAM's own sweep, level-scheduled)"
+                                    : "smoothSolver + GaussSeidel (ascending only, OpenFOAM's own sweep)")
                          : "Jacobi-BiCGStab");
         }
         if (const FoamDict* su = solvers->subDict("U"))
@@ -1795,6 +1820,8 @@ int runSimpleFoamV2(const std::string& caseDir)
             const std::string usm   = su->wordOr("smoother", "");
             in.uSymGaussSeidel = (usolv == "smoothSolver" &&
                                   (usm == "symGaussSeidel" || usm == "GaussSeidel"));
+            // WHICH of the two: GaussSeidelSmoother.C sweeps ascending only.
+            in.uGaussSeidelSymmetric = (usm != "GaussSeidel");
             if (!in.uSymGaussSeidel && !usolv.empty())
                 std::printf("NOTICE (simpleFoam v2): system/fvSolution asks for `%s` on U; brae runs a "
                             "Jacobi-preconditioned BiCGStab instead. Same matrix, different Krylov "
@@ -1907,7 +1934,9 @@ int runSimpleFoamV2(const std::string& caseDir)
     std::printf("  U solver: %s\n",
                 // "as the case asks" was the display string this line used to carry, and it was the
                 // shared-capability-notice defect: the SELECTION is the case's, the sweep order is not.
-                in.uSymGaussSeidel ? "smoothSolver + MULTICOLOUR symGaussSeidel (OpenFOAM sweeps in index order)"
+                in.uSymGaussSeidel ? (in.uGaussSeidelSymmetric
+                                        ? "smoothSolver + symGaussSeidel (OpenFOAM's own sweep, level-scheduled)"
+                                        : "smoothSolver + GaussSeidel (ascending only, OpenFOAM's own sweep)")
                                    : "Jacobi-BiCGStab");
     in.momentumPredictor = cd.momentumPredictor;
     in.nNonOrthogonalCorrectors = cd.nNonOrthogonalCorrectors;

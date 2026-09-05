@@ -318,20 +318,33 @@
     if (runTime.timeIndex() == braeDumpIter() && ladderEqn)
     {
         const volVectorField Usolved("stage_ladderUsolved", U);
-        OFstream os(runTime.path()/"stage_UsmoothLadder.dat");
-        os.precision(16);
-        for (label n = 1; n <= 10; ++n)
+        // Both smoothers in the GaussSeidel family, because they are NOT settings of one another:
+        // symGaussSeidelSmoother.C walks the cells up then back down, GaussSeidelSmoother.C walks them
+        // up ONLY -- its sweep loop has no second half. A case naming one and being answered with the
+        // other gets a different amount of smoothing per sweep and stops somewhere else.
+        const word smoothers[2] = {word("symGaussSeidel"), word("GaussSeidel")};
+        const fileName ladderFiles[2] =
         {
-            U == ladderPsi0();
-            fvVectorMatrix Urung(ladderEqn());
-            dictionary dct;
-            dct.add("solver",    word("smoothSolver"));
-            dct.add("smoother",  word("symGaussSeidel"));
-            dct.add("tolerance", scalar(0));
-            dct.add("relTol",    scalar(0));
-            dct.add("maxIter",   n);
-            const SolverPerformance<vector> sp = Urung.solve(dct);
-            os << n << ' ' << sp.initialResidual().x() << ' ' << sp.finalResidual().x() << nl;
+            runTime.path()/"stage_UsmoothLadder.dat",
+            runTime.path()/"stage_UgsLadder.dat"
+        };
+        for (label sm = 0; sm < 2; ++sm)
+        {
+            OFstream os(ladderFiles[sm]);
+            os.precision(16);
+            for (label n = 1; n <= 10; ++n)
+            {
+                U == ladderPsi0();
+                fvVectorMatrix Urung(ladderEqn());
+                dictionary dct;
+                dct.add("solver",    word("smoothSolver"));
+                dct.add("smoother",  smoothers[sm]);
+                dct.add("tolerance", scalar(0));
+                dct.add("relTol",    scalar(0));
+                dct.add("maxIter",   n);
+                const SolverPerformance<vector> sp = Urung.solve(dct);
+                os << n << ' ' << sp.initialResidual().x() << ' ' << sp.finalResidual().x() << nl;
+            }
         }
         U == Usolved;
     }

@@ -153,6 +153,7 @@ add_library(brae_core STATIC
     src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_coarse.cu
     src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_smoothers.cu
     src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_gauss_seidel.cu
+    src/matrices/lduMatrix/smoothers/symGaussSeidel/device_sym_gauss_seidel.cu
     src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_vcycle.cu
     src/matrices/lduMatrix/solvers/PCG/device_amg_pcg.cu
     src/cuda/device_cluster.cu
@@ -1100,6 +1101,11 @@ add_test(NAME gs_ladder_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/gs_ladder_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A)
 set_tests_properties(gs_ladder_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+add_test(NAME turbulence_off_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/turbulence_off_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A)
+set_tests_properties(turbulence_off_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1200)
 
 add_test(NAME uresidual_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/uresidual_vs_openfoam.sh

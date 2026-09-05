@@ -134,17 +134,66 @@ int main()
             readLinearSolverControls(fv, "omega", ctl);
         });
 
-        // TIGHTENED 2026-09-04: this used to assert SILENCE on both, and the silence was the defect.
-        // Taking the smoothSolver path honours the selection and the stopping rule and substitutes the
-        // SWEEP -- brae's is multicolour where symGaussSeidelSmoother.C walks cells in index order, and
-        // on validation/T3A that is one sweep to relTol 0.1 against seven. The `solver` half must still
-        // be silent (brae really is running a smoothSolver), so the two halves are asserted separately.
-        check("smoothSolver+symGaussSeidel on k announces the multicolour sweep",
-              has(out, "solvers/k smoother") && has(out, "MULTICOLOUR"), out);
-        check("smoothSolver+symGaussSeidel on omega announces the multicolour sweep",
-              has(out, "solvers/omega smoother") && has(out, "MULTICOLOUR"), out);
+        // 2026-09-04: this asserted SILENCE, then the multicolour NOTICE, and now silence again -- for
+        // a different reason each time, so the assertion is only worth anything beside its counterpart.
+        // brae takes the smoothSolver path, honours the stopping rule, and now runs
+        // symGaussSeidelSmoother.C's own index-order sweep (device_sym_gauss_seidel.cuh, held to
+        // OpenFOAM's per-sweep residual at 2.8e-12 by tests/gs_ladder). Nothing is substituted, so
+        // nothing may be announced -- and the GaussSeidel block below proves the reader still speaks.
+        check("smoothSolver+symGaussSeidel on k announces no sweep substitution",
+              !has(out, "solvers/k smoother"), out);
+        check("smoothSolver+symGaussSeidel on omega announces no sweep substitution",
+              !has(out, "solvers/omega smoother"), out);
         check("...and neither reports a SOLVER substitution, because there is none",
               !has(out, "solvers/k solver") && !has(out, "solvers/omega solver"), out);
+    }
+
+    // ---- `GaussSeidel` is exact too, so it is silent too ----
+    // GaussSeidelSmoother.C's sweep loop is the ascending walk only, and brae now runs exactly that when
+    // the case names it (device_sym_gauss_seidel.cuh, held to OpenFOAM's own ladder by tests/gs_ladder
+    // at 5.2e-13). It also sets the FLAG the drivers pass down, which is asserted here rather than left
+    // to the end-to-end gate.
+    {
+        const std::string dir = writeFvSolution(tmp + "/gsfwd",
+            "    k { solver smoothSolver; smoother GaussSeidel; tolerance 1e-8; relTol 0.1; }\n"
+            "    omega { solver smoothSolver; smoother GaussSeidel; tolerance 1e-8; relTol 0.1; }\n");
+        const FoamDict fv = readDict(dir + "/system/fvSolution");
+        DeviceSimpleControls ctl;
+        const std::string out = captureStderr(tmp + "/gsfwd.err", [&]
+        {
+            ctl.turbulent = true;
+            ctl.sa = false;
+            readLinearSolverControls(fv, "omega", ctl);
+        });
+        check("smoothSolver+GaussSeidel on k announces no smoother substitution",
+              !has(out, "solvers/k smoother"), out);
+        check("smoothSolver+GaussSeidel on omega announces no smoother substitution",
+              !has(out, "solvers/omega smoother"), out);
+        check("...and the pair is marked ASCENDING-ONLY for the solve", !ctl.gsKESym, out);
+        check("...while the smoothSolver path itself is taken", ctl.gsK && ctl.gsEps, out);
+    }
+
+    // ---- THE POSITIVE: a real OpenFOAM smoother brae does NOT run ----
+    // DILUGaussSeidel is a genuine asymmetric-matrix smoother (OF's smoothers/ directory). brae has no
+    // such sweep, so it falls to BiCGStab and MUST say the smoother was ignored. This is what makes the
+    // two silences above mean "there is nothing to say" and not "the reader has gone quiet".
+    {
+        const std::string dir = writeFvSolution(tmp + "/gsdilu",
+            "    k { solver smoothSolver; smoother DILUGaussSeidel; tolerance 1e-8; relTol 0.1; }\n"
+            "    omega { solver smoothSolver; smoother DILUGaussSeidel; tolerance 1e-8; relTol 0.1; }\n");
+        const FoamDict fv = readDict(dir + "/system/fvSolution");
+        DeviceSimpleControls ctl;
+        const std::string out = captureStderr(tmp + "/gsdilu.err", [&]
+        {
+            ctl.turbulent = true;
+            ctl.sa = false;
+            readLinearSolverControls(fv, "omega", ctl);
+        });
+        check("smoothSolver+DILUGaussSeidel on k says the smoother is not run",
+              has(out, "solvers/k smoother") && has(out, "not running a smoothSolver"), out);
+        check("smoothSolver+DILUGaussSeidel on omega says the smoother is not run",
+              has(out, "solvers/omega smoother") && has(out, "not running a smoothSolver"), out);
+        check("...and the smoothSolver path is NOT taken for it", !ctl.gsK && !ctl.gsEps, out);
     }
 
     // ---- NEGATIVE CONTROL 2: no `solvers` entries at all -> nothing to report ----

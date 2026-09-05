@@ -188,12 +188,19 @@ struct DeviceSimpleControls
     bool   limitedK = false, limitedEps = false;  // div(phi,k|epsilon) "limitedLinear": implicit limited weight. Set from fvSchemes.
     bool   luK = false, luEps = false;             // div(phi,k|epsilon|nuTilda) "linearUpwind": deferred gradient correction. Set from fvSchemes.
     // "the case ASKED for smoothSolver + a GaussSeidel smoother", read from fvSolution
-    // solvers.{k|nuTilda} / {epsilon|omega} / U. It does NOT say brae runs OpenFOAM's smoother: brae's
-    // sweep is MULTICOLOUR where symGaussSeidelSmoother.C walks cells in index order, which is the same
-    // algorithm under a permutation and therefore a different iterate after n sweeps (device_amg.cuh
-    // carries the measurement). The substitution is announced by linear_solver_setup.cuh.
+    // solvers.{k|nuTilda} / {epsilon|omega} / U. For `symGaussSeidel` brae now runs OpenFOAM's own
+    // sweep (device_sym_gauss_seidel.cuh level-schedules symGaussSeidelSmoother.C without changing an
+    // operation). For `GaussSeidel` it does not -- OF's is the ascending walk only -- and that one
+    // substitution is announced by linear_solver_setup.cuh.
     bool   gsK = false, gsEps = false;
     bool   gsU = false;
+    // ...and WHICH GaussSeidel it asked for. OF has two smoothers under that family and they are not
+    // settings of one another: symGaussSeidelSmoother.C walks the cells up then back down,
+    // GaussSeidelSmoother.C walks them up ONLY -- its sweep loop has no second half. brae runs whichever
+    // the case named (device_sym_gauss_seidel.cuh). One flag for the transported turbulence pair, as
+    // nSweeps is, so a case naming different smoothers on k and epsilon|omega is refused rather than run
+    // with whichever entry was read first.
+    bool   gsUSym = true, gsKESym = true;
     // fvSolution asked for `preconditioner DILU` on U (OF's default for the momentum equations, and the
     // entry brae used to substitute Jacobi for). Only meaningful on the BiCGStab path -- a smoothSolver
     // has no preconditioner in OF either.

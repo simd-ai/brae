@@ -2,44 +2,48 @@
 //
 // Run: gs_ladder <caseDir> <timeDir>
 //
-// brae routes a case's `smoothSolver` + a GaussSeidel-family smoother to deviceSymGaussSeidel, which is
-// OpenFOAM's smoothSolver STOPPING RULE (smoothSolver.C:135-209) around a MULTICOLOUR sweep, where
-// symGaussSeidelSmoother.C walks cells in strict index order (:145 forward, :175 reverse). Same algorithm
-// under a permutation -- and Gauss-Seidel is order-dependent, so the iterate after n sweeps is not
-// OpenFOAM's. Until now that substitution was asserted only as a NOTICE the driver must print
-// (tests/gs_smoother_notice.sh). This measures what it costs.
+// brae runs a case's `smoothSolver` + a GaussSeidel-family smoother through deviceSymGaussSeidel, which
+// is OpenFOAM's smoothSolver STOPPING RULE (smoothSolver.C:135-209) around symGaussSeidelSmoother.C's own
+// sweep, level-scheduled onto the device (device_sym_gauss_seidel.cuh). This gate is what says the sweep
+// really is OpenFOAM's and not merely called that.
+//
+// IT WAS NOT, until this measured it. brae ran a MULTICOLOUR sweep, which visits the same cells in a
+// different order; Gauss-Seidel is order-dependent, so that was a different smoother wearing the same
+// name, and the driver announced it as a substitution. What the substitution cost is the CONTROL below.
 //
 // THE ORACLE is tools/dumpSimpleFoam, which writes the momentum system in the FOLDED form the linear
-// solver actually sees (fvMatrixSolve.C:149 addBoundarySource, :169 addBoundaryDiag), the field the solve
-// starts from, and OpenFOAM's own initial/final residual after exactly n sweeps for n = 1..10 -- obtained
-// by solving a COPY with `tolerance 0; relTol 0; maxIter n`, which makes checkConvergence false forever so
-// smoothSolver.C's do-while runs exactly n. Every number in stage_UsmoothLadder.dat is OpenFOAM's: its
-// matrix, its fold, its normFactor, its smoother. The ladder is self-validating -- the case's own
-// relTol-0.1 solve stopped after 5 sweeps at 0.0711018500747468, which is the n=5 rung to the last digit.
+// solver actually sees (fvMatrixSolve.C:149 `addBoundarySource`, :169 `addBoundaryDiag`), the field the
+// solve starts from, and OpenFOAM's own initial/final residual after exactly n sweeps for n = 1..10 --
+// obtained by solving a COPY with `tolerance 0; relTol 0; maxIter n`, which makes checkConvergence false
+// forever so smoothSolver.C's do-while runs exactly n. Every number in stage_UsmoothLadder.dat is
+// OpenFOAM's: its matrix, its fold, its normFactor, its smoother. The ladder is self-validating -- the
+// case's own relTol-0.1 solve stopped after 5 sweeps at 0.0711018500747468, which is the n=5 rung to the
+// last digit, and the gate script asserts that before this binary runs.
 //
 //   LEG 0  brae's initial residual on that system equals OpenFOAM's. This is the harness control: it
 //          proves the matrix, the boundary fold and the normFactor are all faithful, so what LEG 2 finds
 //          is the sweep and not the setup.
-//   LEG 1  a transcription of symGaussSeidelSmoother.C:116-198 -- bPrime = source once per sweep, a
+//   LEG 1  a transcription of symGaussSeidelSmoother.C:145-190 -- bPrime = source once per sweep, a
 //          forward cell walk that gathers the upper and distributes the lower, a reverse walk that
 //          re-reads the bPrime the forward half left -- reproduces OpenFOAM's ladder at every rung. This
-//          is what lets LEG 2 be read as "the visiting order", and not as "something in this harness".
+//          is what lets LEG 2 be read as "the sweep", and not as "something in this harness".
 //   LEG 2  deviceSymGaussSeidel with tol and relTol both 0 and maxIter n, so it too runs exactly n sweeps
-//          from the same psi0, against the same normFactor.
+//          from the same psi0, must EQUAL OpenFOAM at every rung.
+//   CONTROL the multicolour sweep brae used to run, through the identical harness. It must MISS LEG 2's
+//          bound by a wide margin, or that bound is not measuring the order.
 //
 // Measured on validation/T3A's first momentum solve from its own 0.orig, 26820 cells (the bounds below
 // are this run, and tighten from here):
-//   n     OpenFOAM       brae       ratio
-//   1    4.130e-01    5.628e-01     1.36
-//   5    7.110e-02    1.960e-01     2.76
-//  10    8.593e-03    5.913e-02     6.88
-// The gap GROWS with the sweep count, which is the shape a reordering has rather than a one-off offset:
-// every rung leaves more of the residual behind, so the deficit compounds. That is the cost of the
-// substitution -- ten colour-order sweeps buy what OpenFOAM buys in about four.
-//
-// LEG 2 asserts two things about that: that brae is BEHIND OpenFOAM at every rung (a sweep that silently
-// started matching index order is an improvement to record, not to pass over in silence), and that it
-// stays within LADDER_MAX (a sweep that got worse is caught).
+//   n     OpenFOAM      level-scheduled       colour order    colour/OpenFOAM
+//   1    4.130e-01     4.130e-01              5.628e-01           1.36
+//   5    7.110e-02     7.110e-02              1.960e-01           2.76
+//  10    8.593e-03     8.593e-03              5.913e-02           6.88
+// The colour order's gap GROWS with the sweep count, which is the shape a reordering has rather than a
+// one-off offset: ten colour sweeps bought what OpenFOAM buys in about four. On T3A that is the
+// difference between converging and not -- the case asks `relTol 0.1; maxIter 10`, OpenFOAM reaches
+// relTol 0.1 after 5 sweeps, the colour order needs 9-10 and so always took the cap, and with the
+// pressure solve tight in both codes real simpleFoam CONVERGES at 5 sweeps and DIVERGES when forced to
+// take all ten (Ux 2.997e-01 at iteration 400).
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -49,6 +53,7 @@
 #include "device_buffer.cuh"
 #include "device_ldu.cuh"
 #include "device_amg.cuh"
+#include "device_amg_internal.cuh"   // gsSweep + greedyColor: the colour order, as the CONTROL
 
 #include <cmath>
 #include <cstdio>
@@ -58,8 +63,17 @@
 
 using namespace brae;
 
-// The measured ratios above, with headroom for the multicolour sweep's own reduction order.
-static const scalar LADDER_MAX = 7.5;    // brae's residual after n sweeps over OpenFOAM's (worst 6.88)
+// greedyColor has external linkage and no public declaration (device_amg_gauss_seidel.cu:23 declares it
+// the same way); the CONTROL needs the colouring the old default path built.
+namespace brae { Coloring greedyColor(const std::vector<label>& owner, const std::vector<label>& nei, int nC); }
+
+// LEG 2 is an EQUALITY: the level-scheduled sweep performs OpenFOAM's operations in OpenFOAM's order, so
+// only the residual sum's own round-off separates them. Set from the first green run (worst 2.9e-12).
+static const scalar LADDER_TOL = 1e-11;
+// The control must miss that by a wide margin. The colour order's worst rung is 6.88x OpenFOAM's
+// residual; requiring 1.2x asserts the bound discriminates without pinning the greedy colouring's
+// exact output, which is a mesh-ordering artefact and not a promise.
+static const scalar CONTROL_MIN = 1.2;
 // LEG 0 and LEG 1 both compare a 26820-term sum against gSumMag's, over a b - A.psi that cancels heavily;
 // 1.2e-12 and 8.0e-13 are that round-off, and are the same floor from two independent directions.
 static const scalar LEG0_TOL   = 1e-11;  // the folded system and normFactor are OpenFOAM's, to round-off
@@ -72,14 +86,19 @@ int main(int argc, char** argv)
     const std::string tdir    = argv[2];
 
     std::vector<int> ln;
-    std::vector<scalar> lInit, lFinal;
+    std::vector<scalar> lInit, lFinal, gFinal;
     {
         std::ifstream lad(caseDir + "/stage_UsmoothLadder.dat");
         if (!lad) { std::printf("SKIP: no %s/stage_UsmoothLadder.dat\n", caseDir.c_str()); return 77; }
         int n; double a, b;
         while (lad >> n >> a >> b) { ln.push_back(n); lInit.push_back(a); lFinal.push_back(b); }
+        // The ascending-only ladder, OpenFOAM's GaussSeidelSmoother under the same harness.
+        std::ifstream gl(caseDir + "/stage_UgsLadder.dat");
+        if (!gl) { std::printf("SKIP: no %s/stage_UgsLadder.dat\n", caseDir.c_str()); return 77; }
+        while (gl >> n >> a >> b) gFinal.push_back(b);
     }
     if (ln.empty()) { std::printf("SKIP: the ladder file is empty\n"); return 77; }
+    if (gFinal.size() != ln.size()) { std::printf("SKIP: the two ladders differ in length\n"); return 77; }
 
     PrimitiveMesh m;  m.read(caseDir + "/constant/polyMesh");
     FvGeometry g;     g.build(m);
@@ -170,7 +189,7 @@ int main(int argc, char** argv)
     std::vector<label> ownStart(static_cast<std::size_t>(nC) + 1, 0);
     for (label f = 0; f < nIf; ++f) ++ownStart[own[f] + 1];
     for (label c = 0; c < nC; ++c) ownStart[c + 1] += ownStart[c];
-    auto sequentialSweeps = [&](int nSweeps)
+    auto sequentialSweeps = [&](int nSweeps, bool symmetric)
     {
         std::vector<scalar> psi(psi0), bPrime(static_cast<std::size_t>(nC));
         for (int s = 0; s < nSweeps; ++s)
@@ -184,6 +203,10 @@ int main(int argc, char** argv)
                 for (label f = ownStart[c]; f < ownStart[c + 1]; ++f) bPrime[nei[f]] -= lower[f] * psii;
                 psi[c] = psii;
             }
+            // GaussSeidelSmoother.C:145-176 stops after the ascending walk; symGaussSeidelSmoother.C
+            // adds this descending one, which re-reads the bPrime the forward half left (:191 does not
+            // distribute again).
+            if (!symmetric) continue;
             for (label c = nC - 1; c >= 0; --c)
             {
                 scalar psii = bPrime[c];
@@ -195,48 +218,112 @@ int main(int argc, char** argv)
         return residual(psi);
     };
 
-    // ---- LEG 2: brae's multicolour sweep ------------------------------------------------------------
+    // ---- LEG 2: brae's own sweep, and the colour order it replaced --------------------------------
     DeviceMesh dm = buildDeviceMesh(m, g, patches);
     DeviceBuffer<scalar> dDiag, dUp, dLo, dB;
     dDiag.copyFrom(diag); dUp.copyFrom(upper); dLo.copyFrom(lower); dB.copyFrom(src);
     const DeviceLduView A = deviceLduView(dm, dDiag, dUp, dLo);
 
-    std::printf("  %-3s %-22s %-22s %-22s %s\n", "n", "OpenFOAM", "index order (LEG 1)",
-                "brae multicolour", "ratio");
-    scalar worstSeq = 0, worstRatio = 0, bestRatio = 1e30;
+    // The CONTROL's colouring, built exactly as the old default path built it.
+    GridColoring gc;
+    {
+        // owner() spans the boundary faces too; the colouring, like the LDU, sees only the internal ones.
+        const std::vector<label> ownIn(own.begin(), own.begin() + nIf);
+        const Coloring c = greedyColor(ownIn, nei, (int)nC);
+        gc.nColors = c.nColors;
+        gc.cells.copyFrom(c.cells);
+        gc.start.copyFrom(c.start);
+        gc.startH = c.start;
+    }
+
+    std::printf("  symGaussSeidel -- OpenFOAM's ascending-then-descending sweep\n");
+    std::printf("  %-3s %-22s %-22s %-22s %-22s\n", "n", "OpenFOAM", "index order (LEG 1)",
+                "brae (level-scheduled)", "colour order (CONTROL)");
+    scalar worstSeq = 0, worstBrae = 0, worstControl = 0;
     for (std::size_t i = 0; i < ln.size(); ++i)
     {
         const int n = ln[i];
-        const scalar seq = sequentialSweeps(n);
+        const scalar seq = sequentialSweeps(n, true);
+
         DeviceBuffer<scalar> dPsi;
         dPsi.copyFrom(psi0);
         DeviceSolverPerf perf;
         deviceSymGaussSeidel(A, dB, dPsi, normFactor, 0.0, 0.0, n, &perf);
-        const scalar ratio = perf.finalResidual / lFinal[i];
-        std::printf("  %-3d %-22.15g %-22.15g %-22.15g %.3f\n",
-                    n, (double)lFinal[i], (double)seq, (double)perf.finalResidual, (double)ratio);
-        worstSeq   = std::fmax(worstSeq, std::fabs(seq - lFinal[i]) / std::fabs(lFinal[i]));
-        worstRatio = std::fmax(worstRatio, ratio);
-        bestRatio  = std::fmin(bestRatio, ratio);
+
+        DeviceBuffer<scalar> cPsi;
+        cPsi.copyFrom(psi0);
+        for (int s = 0; s < n; ++s)
+        {
+            gsSweep(A, dB, cPsi, gc, true);
+            gsSweep(A, dB, cPsi, gc, false);
+        }
+        std::vector<scalar> cH;
+        cPsi.copyTo(cH);
+        const scalar ctl = residual(cH);
+
+        std::printf("  %-3d %-22.15g %-22.15g %-22.15g %-22.15g\n",
+                    n, (double)lFinal[i], (double)seq, (double)perf.finalResidual, (double)ctl);
+        worstSeq     = std::fmax(worstSeq,     std::fabs(seq - lFinal[i]) / std::fabs(lFinal[i]));
+        worstBrae    = std::fmax(worstBrae,    std::fabs(perf.finalResidual - lFinal[i]) / std::fabs(lFinal[i]));
+        worstControl = std::fmax(worstControl, ctl / lFinal[i]);
     }
 
-    char buf[200];
+    // The OTHER smoother in the family. GaussSeidelSmoother.C's sweep loop is the ascending walk and
+    // nothing else, so at every rung it leaves MORE residual than symGaussSeidel -- and answering a case
+    // that named it with the symmetric sweep gives it about twice the smoothing it asked for. The
+    // symmetric sweep is therefore this leg's control, exactly as the colour order is LEG 2's.
+    std::printf("  GaussSeidel -- OpenFOAM's ascending-only sweep\n");
+    std::printf("  %-3s %-22s %-22s %-22s %-22s\n", "n", "OpenFOAM", "index order (LEG 1)",
+                "brae (level-scheduled)", "symmetric (CONTROL)");
+    scalar worstSeqG = 0, worstBraeG = 0, worstControlG = 1e30;
+    for (std::size_t i = 0; i < ln.size(); ++i)
+    {
+        const int n = ln[i];
+        const scalar seq = sequentialSweeps(n, false);
+
+        DeviceBuffer<scalar> dPsi;
+        dPsi.copyFrom(psi0);
+        DeviceSolverPerf perf;
+        deviceSymGaussSeidel(A, dB, dPsi, normFactor, 0.0, 0.0, n, &perf,
+                             /*minIter*/0, /*nSweeps*/1, /*symmetric*/false);
+
+        std::printf("  %-3d %-22.15g %-22.15g %-22.15g %-22.15g\n",
+                    n, (double)gFinal[i], (double)seq, (double)perf.finalResidual, (double)lFinal[i]);
+        worstSeqG     = std::fmax(worstSeqG,  std::fabs(seq - gFinal[i]) / std::fabs(gFinal[i]));
+        worstBraeG    = std::fmax(worstBraeG, std::fabs(perf.finalResidual - gFinal[i]) / std::fabs(gFinal[i]));
+        worstControlG = std::fmin(worstControlG, gFinal[i] / lFinal[i]);
+    }
+
+    char buf[220];
     std::snprintf(buf, sizeof buf,
-                  "LEG 1  the index-order transcription IS OpenFOAM's smoother (worst rel %.3e)",
+                  "LEG 1  the index-order transcription IS symGaussSeidelSmoother.C (worst rel %.3e)",
                   (double)worstSeq);
     say(buf, worstSeq < LEG1_TOL);
 
     std::snprintf(buf, sizeof buf,
-                  "LEG 2  the colour order costs at most %.2fx the residual (worst %.2fx)",
-                  (double)LADDER_MAX, (double)worstRatio);
-    say(buf, worstRatio < LADDER_MAX);
+                  "LEG 2  brae's symGaussSeidel IS OpenFOAM's, at every rung (worst rel %.3e)",
+                  (double)worstBrae);
+    say(buf, worstBrae < LADDER_TOL);
 
-    // The substitution's direction. A ratio below 1 would mean the multicolour sweep BEAT index order on
-    // this system -- possible in principle, and a fact this gate must not report as a pass in silence.
     std::snprintf(buf, sizeof buf,
-                  "LEG 2  it is behind OpenFOAM at every rung, as a reordering is (best %.2fx)",
-                  (double)bestRatio);
-    say(buf, bestRatio > 1.0);
+                  "CONTROL  the colour order misses that bound by %.2fx (need >= %.2fx)",
+                  (double)worstControl, (double)CONTROL_MIN);
+    say(buf, worstControl >= CONTROL_MIN);
+
+    std::snprintf(buf, sizeof buf,
+                  "LEG 3  the ascending-only transcription IS GaussSeidelSmoother.C (worst rel %.3e)",
+                  (double)worstSeqG);
+    say(buf, worstSeqG < LEG1_TOL);
+
+    std::snprintf(buf, sizeof buf,
+                  "LEG 4  brae's GaussSeidel IS OpenFOAM's, at every rung (worst rel %.3e)",
+                  (double)worstBraeG);
+    say(buf, worstBraeG < LADDER_TOL);
+
+    std::snprintf(buf, sizeof buf,
+                  "CONTROL  the symmetric sweep leaves %.2fx less residual (need >= %.2fx)",
+                  (double)worstControlG, (double)CONTROL_MIN);
+    say(buf, worstControlG >= CONTROL_MIN);
 
     std::printf("%s\n", fails == 0 ? "PASS" : "FAIL");
     return fails == 0 ? 0 : 1;

@@ -83,6 +83,11 @@ struct StepInput
     // Jacobi-BiCGStab is a silent solver substitution AND the dominant cost: measured ~42 BiCGStab
     // iterations per component per outer step, ~90% of all linear-algebra time on this path.
     bool   uSymGaussSeidel = false;
+    // WHICH GaussSeidel smoother the case's U entry named: true = symGaussSeidel (ascending then
+    // descending), false = GaussSeidel, whose sweep loop in GaussSeidelSmoother.C is the ascending walk
+    // ONLY. Different smoothers -- the same relTol stops in a different place, and on validation/T3A a
+    // smoother that stops elsewhere is the difference between converging and limit-cycling.
+    bool   uGaussSeidelSymmetric = true;
     // fvMesh::validComponents<vector>() -- which IS polyMesh::solutionD() (fvMeshTemplates.C:33-44,
     // VectorSpaceI.H:435-446): +1 solved, -1 knocked out by an EMPTY patch.
     // fvMatrix<vector>::solveSegregated `continue`s on every -1 (fvMatrixSolve.C:164), so on a 2D case

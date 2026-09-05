@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# The multicolour Gauss-Seidel sweep, measured against OpenFOAM's own residual after exactly n sweeps.
+# Both of OpenFOAM's GaussSeidel smoothers, measured against its own residual after exactly n sweeps.
 #
-# brae routes `smoothSolver` + a GaussSeidel-family smoother to deviceSymGaussSeidel, whose sweep visits
-# cells in COLOUR order where symGaussSeidelSmoother.C visits them in index order. tests/gs_smoother_notice.sh
-# asserts the driver ANNOUNCES that substitution; this measures what it costs, on OpenFOAM's own matrix.
+# brae routes `smoothSolver` + a GaussSeidel-family smoother to deviceSymGaussSeidel. That used to be a
+# COLOUR-order sweep for both smoother names -- a different smoother wearing each name. It is now
+# OpenFOAM's own index-order sweep, level-scheduled onto the device, in whichever of the two variants the
+# case asked for: symGaussSeidelSmoother.C walks the cells up then back down, GaussSeidelSmoother.C walks
+# them up ONLY. This gate is what says brae is each of them, rather than one of them twice.
 #
 # THE ORACLE is tools/dumpSimpleFoam, run for one iteration on the fixture: it writes the momentum system
 # in the folded form the linear solver sees, the field the solve starts from, and OpenFOAM's residual after
-# exactly n sweeps for n = 1..10 (a COPY of the system solved with `tolerance 0; relTol 0; maxIter n`).
+# exactly n sweeps for n = 1..10 (a COPY of the system solved with `tolerance 0; relTol 0; maxIter n`) --
+# once for `symGaussSeidel` and once for `GaussSeidel`, because those are two different smoothers and brae
+# has to be each of them, not one of them twice.
 # tests/gs_ladder.cu reads all of it and runs both a transcription of OpenFOAM's smoother and brae's own.
 #
 # This gate needs no brae binary: the case never runs through brae. It is the sweep alone.
@@ -52,8 +56,9 @@ PY
 for f in stage_UsolveDiag stage_UsolveSrc stage_Usolve0 stage_UsolveUpper stage_UsolveLower; do
     [ -f "$W/of/1/$f" ] || { echo "FAIL: dumpSimpleFoam wrote no 1/$f"; tail -20 "$W/of/dump.log"; exit 1; }
 done
-[ -f "$W/of/stage_UsmoothLadder.dat" ] \
-    || { echo "FAIL: dumpSimpleFoam wrote no stage_UsmoothLadder.dat"; tail -20 "$W/of/dump.log"; exit 1; }
+for f in stage_UsmoothLadder.dat stage_UgsLadder.dat; do
+    [ -f "$W/of/$f" ] || { echo "FAIL: dumpSimpleFoam wrote no $f"; tail -20 "$W/of/dump.log"; exit 1; }
+done
 
 # THE ORACLE'S OWN CONTROL: the ladder must agree with the case's real solve, which the same run logged.
 # `Solving for Ux ... Final residual = R, No Iterations N` has to be rung N of the ladder, or the ladder is
@@ -83,5 +88,5 @@ PY
 
 "$BIN" "$W/of" 1
 rc=$?
-[ $rc -eq 0 ] && echo "PASS: the multicolour sweep is measured against OpenFOAM's index-order smoother"
+[ $rc -eq 0 ] && echo "PASS: both of OpenFOAM's GaussSeidel smoothers are brae's, sweep for sweep"
 exit $rc

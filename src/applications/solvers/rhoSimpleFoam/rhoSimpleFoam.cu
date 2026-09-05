@@ -462,7 +462,8 @@ Residuals rhoSimpleStep(
             const scalar nf = deviceNormFactor(A, *U[k], b, w.ones);
             DeviceSolverPerf perf;
             if (in.uSymGaussSeidel)
-                deviceSymGaussSeidel(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIterU, &perf, in.minIterU);
+                deviceSymGaussSeidel(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIterU, &perf, in.minIterU,
+                                     /*nSweeps*/1, in.uGaussSeidelSymmetric);
             else
                 perf = deviceJacobiBiCGStab(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIterU, /*checkEvery=*/1, in.minIterU,
                                             in.preconU);

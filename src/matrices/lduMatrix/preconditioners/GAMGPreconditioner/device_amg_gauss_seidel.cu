@@ -7,6 +7,7 @@
 #include "device_amg.cuh"          // AMGData / GridColoring / DeviceSolverPerf / deviceSymGaussSeidel decl
 #include "device_amg_detail.cuh"   // safeDiag / nBlocks / TPB / BRAE_HAS_GS_DEVICE
 #include "device_amg_internal.cuh" // Coloring, gsSweep, gsScaleInvK, LduF/lduF/cast_, amulF
+#include "device_sym_gauss_seidel.cuh"  // the level-scheduled sweep the default path runs
 #include "amg_kernels.cuh"         // gsColorT<> (the multicolor GS kernel)
 #include "device_ldu.cuh"          // DeviceLduView / deviceAmul
 #include "device_blas.cuh"         // deviceCopy / deviceAxpy / deviceSumMagInto
@@ -223,7 +224,8 @@ scalar deviceSymGaussSeidel(
     int maxIter,
     DeviceSolverPerf* perf,
     int minIter,
-    int nSweeps)
+    int nSweeps,
+    bool symmetric)
 {
     // minIter (fvSolution solvers/<field>/minIter) is OF's floor on the sweep count: smoothSolver.C
     // enters the loop when minIter > 0 even if the initial residual already passes, and keeps sweeping
@@ -246,7 +248,7 @@ scalar deviceSymGaussSeidel(
     const bool batched   = sweepsPer > 1;
     // BRAE_TURB_FP32: solve in FP32 (half the bytes on the BW-bound sweeps; loose turbulence tol >> FP32 eps).
     static const bool turbF32 = std::getenv("BRAE_TURB_FP32") != nullptr;
-    if (turbF32 && !floored && !batched)
+    if (turbF32 && !floored && !batched && symmetric)
     {
         scalar r = deviceSymGaussSeidelF32(A, b, psi, normFactor, tol, relTol, maxIter);
         if (perf) *perf = {r, r, 1};
@@ -255,7 +257,7 @@ scalar deviceSymGaussSeidel(
     // BRAE_TURB_JACOBI: weighted-Jacobi solve (fully parallel, no colour sync). Experiment only -- Jacobi needs ~2x
     // the sweeps -> ~2x the bandwidth on this BW-bound path, so it is slower than the graphed GS. Same stop test as GS.
     static const bool turbJac = std::getenv("BRAE_TURB_JACOBI") != nullptr;
-    if (turbJac && !floored && !batched)
+    if (turbJac && !floored && !batched && symmetric)
     {
         DeviceBuffer<scalar> Ax, r;
         deviceAmul(A, psi, Ax);
@@ -285,7 +287,7 @@ scalar deviceSymGaussSeidel(
     // zero per-sweep host D2H. EXACT (not batched): identical sweep count + bit-identical psi vs this host loop.
     static const bool useGraph = std::getenv("BRAE_GS_DEVICE") != nullptr;
 #ifdef BRAE_HAS_GS_DEVICE
-    if (useGraph && !floored && !batched)
+    if (useGraph && !floored && !batched && symmetric)
     {
         scalar r = deviceSymGaussSeidelGraph(A, b, psi, normFactor, tol, relTol, maxIter);
         if (perf) *perf = {r, r, 1};
@@ -302,7 +304,7 @@ scalar deviceSymGaussSeidel(
         }
     }
 #endif
-    const GridColoring& gc = gsColoringFor(A);
+    const DeviceGaussSeidelLevels& lv = gsLevelsFor(A);
     DeviceBuffer<scalar> Ax, r;
     deviceAmul(A, psi, Ax);
     deviceCopy(r, b);
@@ -321,11 +323,10 @@ scalar deviceSymGaussSeidel(
     scalar finalRes = initRes;
     while (sweeps < maxIter)
     {
-        for (int s = 0; s < sweepsPer; ++s)
-        {
-            gsSweep(A, b, psi, gc, true);                                // forward color sweep
-            gsSweep(A, b, psi, gc, false);                               // reverse color sweep
-        }
+        // OpenFOAM's own sweep, level-scheduled: forward then reverse in strict cell-index order.
+        // This used to be two multicolour half-sweeps, which is a DIFFERENT smoother wearing the same
+        // name -- see device_sym_gauss_seidel.cuh, and tests/gs_ladder for the 1.36x-to-6.88x it cost.
+        for (int s = 0; s < sweepsPer; ++s) deviceSymGaussSeidelSweepExact(A, b, psi, lv, symmetric);
         sweeps += sweepsPer;
         deviceAmul(A, psi, Ax);
         deviceCopy(r, b);

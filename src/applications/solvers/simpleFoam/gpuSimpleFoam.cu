@@ -664,12 +664,18 @@ int main(int argc, char** argv)
                 // The line is otherwise OpenFOAM's format so a log can be diffed against one, but the
                 // prefix used to read `smoothSolver:` and `GAMG:` whatever brae actually ran -- a log
                 // asserting a capability the code does not have, which is the defect class this repo has
-                // already paid for once. brae's symGaussSeidel is a MULTICOLOUR sweep (device_amg.cuh)
-                // and its p solver is an AMG-preconditioned PCG; both are announced as substitutions by
-                // the shared reader (solvers/common/linear_solver_setup.cuh). Every gate that parses
+                // already paid for once. brae's symGaussSeidel IS OpenFOAM's sweep now
+                // (device_sym_gauss_seidel.cuh), so the name is honest; its p solver is still an
+                // AMG-preconditioned PCG, announced as a substitution by the shared reader
+                // (solvers/common/linear_solver_setup.cuh). Every gate that parses
                 // this log matches on `Solving for <field>, Initial residual = ...` and none anchors on
                 // the prefix, so naming it honestly costs nothing.
-                const char* uSolv = ctl.gsU ? "smoothSolver[multicolour symGaussSeidel]" : "Jacobi-BiCGStab";
+                // Naming WHICH GaussSeidel, because OF has two in that family and they are different
+                // solvers: GaussSeidelSmoother.C sweeps ascending only. A log that said
+                // "symGaussSeidel" for both would be asserting a capability again.
+                const char* uSolv = ctl.gsU ? (ctl.gsUSym ? "smoothSolver[symGaussSeidel]"
+                                                          : "smoothSolver[GaussSeidel]")
+                                            : "Jacobi-BiCGStab";
                 // OF prints the TIME NAME (simpleFoam.C:100, runTime.timeName()), not the iteration
                 // index. The two coincide only at startTime 0 with deltaT 1, which every fixture in
                 // validation/ happens to be -- the same blind spot that hid it on the V2 driver until
@@ -686,7 +692,9 @@ int main(int argc, char** argv)
                             uSolv, r.Uy, r.UyFinal, r.UyIters,
                             uSolv, r.Uz, r.UzFinal, r.UzIters,
                             r.p, r.pFinal, r.pIters, cl, cg, _cumCont);
-                const char* kSolv = ctl.gsK ? "smoothSolver[multicolour symGaussSeidel]" : "Jacobi-BiCGStab";
+                const char* kSolv = ctl.gsK ? (ctl.gsKESym ? "smoothSolver[symGaussSeidel]"
+                                                           : "smoothSolver[GaussSeidel]")
+                                            : "Jacobi-BiCGStab";
                 for (const auto& e : turbulenceReport())   // Solving for omega/k/epsilon/... in solve order, like OF
                     std::printf("%s:  Solving for %s, Initial residual = %g, Final residual = %g, No Iterations %d\n",
                                 kSolv, e.field.c_str(), e.perf.initialResidual, e.perf.finalResidual,

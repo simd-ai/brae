@@ -338,7 +338,12 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
                             // evaluation whatever the case said -- validation/airFoil2D ships
                             // `nSweeps 2` on nuTilda and brae's counts were ODD where OpenFOAM's were
                             // even in all 50 of its solves.
-                            int nSweeps = 1);
+                            int nSweeps = 1,
+                            // WHICH GaussSeidel smoother the case named: true = symGaussSeidel
+                            // (ascending then descending), false = GaussSeidel, whose sweep loop in
+                            // GaussSeidelSmoother.C is the ascending walk ONLY. Different smoothers,
+                            // so the same relTol stops in a different place.
+                            bool gsSymmetric = true);
 
 // Closed device kOmegaSST::correct(): production (raw GbyNu0 + omega-wall G0 override) -> F1/F2/CDkOmega/S2 ->
 // omega eqn (loose solve, omega-wall setValues) -> bound -> k eqn (loose solve) -> bound -> correctNut (Bradshaw
@@ -388,7 +393,12 @@ void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, co
                             // smoothing sweeps between residual EVALUATIONS, so the stop test is
                             // consulted only on a multiple of it. Read from the TRANSPORTED field's own
                             // entry; meaningful only on the smoothSolver path.
-                            int nSweeps = 1);
+                            int nSweeps = 1,
+                            // WHICH GaussSeidel smoother the case named: true = symGaussSeidel
+                            // (ascending then descending), false = GaussSeidel, whose sweep loop in
+                            // GaussSeidelSmoother.C is the ascending walk ONLY. Different smoothers,
+                            // so the same relTol stops in a different place.
+                            bool gsSymmetric = true);
 
 // nuWall[i] = nuBnd[wfBndIdx[i]] -- OF nu(patchi) re-indexed from boundary-face into wall-face ordering.
 void deviceGatherWallNu(const DeviceBuffer<label>& wfBndIdx, const DeviceBuffer<scalar>& nuBnd,
@@ -406,7 +416,10 @@ void deviceKOmegaSSTLMCorrect(const DeviceMesh& dm, const DeviceVectorBoundary& 
                               bool gsEps = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
                               const ScalarDdt& reDdt = {}, const ScalarDdt& giDdt = {},   // transient fvm::ddt(ReThetat)/ddt(gammaInt)
                               // div(phi,ReThetat) / div(phi,gammaInt) scheme, from the case's fvSchemes.
-                              bool limitedLinear = false, bool linearUpwind = false);
+                              bool limitedLinear = false, bool linearUpwind = false,
+                              // WHICH GaussSeidel smoother the case named on the transported pair; see
+                              // deviceKOmegaSSTCorrect. The two transition scalars ride the same entry.
+                              bool gsSymmetric = true);
 
 // Spalart-Allmaras (one-equation): solve the nuTilda transport (div - laplacian(DnuTildaEff) + Sp(destruction) ==
 // production + Cb2 grad^2) via the shared scaffold, then nut = nuTilda*fv1. Mirrors SpalartAllmarasBase::correct()
@@ -439,7 +452,12 @@ void deviceSpalartAllmarasCorrect(const DeviceMesh& dm, const DeviceVectorBounda
                                   // unlimited on every driver: measured on windAroundBuildingsBox at
                                   // t=400, Omega peaks at 7.14e-01 unlimited against 3.24e-02 limited.
                                   scalar gradULimitK = 0.0,
-                                  int nSweeps = 1);   // solvers/nuTilda/nSweeps; see deviceKEpsilonCorrect
+                                  int nSweeps = 1,   // solvers/nuTilda/nSweeps; see deviceKEpsilonCorrect
+                                  // WHICH GaussSeidel smoother the case named: true = symGaussSeidel
+                                  // (ascending then descending), false = GaussSeidel, whose sweep loop in
+                                  // GaussSeidelSmoother.C is the ascending walk ONLY. Different smoothers,
+                                  // so the same relTol stops in a different place.
+                                  bool gsSymmetric = true);
 
 // Standalone SA correctNut (nut = nuTilda*fv1(nuTilda)) for the solver startup validate().
 void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, DeviceBuffer<scalar>& nut);

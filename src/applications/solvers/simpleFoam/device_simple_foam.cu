@@ -857,7 +857,11 @@ void amgFineCoeffKernel(
                                              ctl_.saCoeffs, ctl_.keRelTol(), ctl_.bicgCheckEvery, ctl_.luK, ctl_.nonOrth,
                                              ctl_.gsK, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, kDdt,   // nuTilda ddt (kOld_)
                                              ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr, ctl_.iddes ? &hwn_ : nullptr, &lesDelta_,
-                                             wallN_.size() ? &wallN_ : nullptr);   // SA-DDES/IDDES length-scale limiter (no-op for plain SA-RANS)
+                                             wallN_.size() ? &wallN_ : nullptr,   // SA-DDES/IDDES length-scale limiter (no-op for plain SA-RANS)
+                                             /*gradULimitK*/0.0, /*nSweeps*/1, ctl_.gsKESym);   // ...and WHICH GaussSeidel the case named: OF has two in that family and
+                                             // GaussSeidelSmoother.C sweeps ascending ONLY. Passing this is what
+                                             // keeps the legacy arm from answering a `GaussSeidel` case with the
+                                             // symmetric sweep in silence, now that the substitution notice is gone.
             else if (ctl_.sst)   // de_ slot holds omega; relaxEps/limitedEps/twoBykEps carry the omega-equation settings
             {
                 deviceKOmegaSSTCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
@@ -880,12 +884,19 @@ void amgFineCoeffKernel(
                                        // fvOptions scalarFixedValueConstraint (k / omega)
                                        fixScaK_ ? &fixScaMask_ : nullptr, fixScaK_ ? &fixScaKVal_ : nullptr,
                                        fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr,   // grad(k)/grad(omega) cellLimited (C2)
-                                       &lesDelta_);   // the case's `delta` for the DDES length scale (empty -> cubeRootVol)
+                                       &lesDelta_,   // the case's `delta` for the DDES length scale (empty -> cubeRootVol)
+                                       /*nSweeps*/1, ctl_.gsKESym);   // ...and WHICH GaussSeidel the case named
                 if (ctl_.lm)   // Langtry-Menter: transport ReThetat + gammaInt, update gammaIntEff for next iter
                     deviceKOmegaSSTLMCorrect(dm, dbU_, dbReThetat_, dbGammaInt_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
                                              ReThetat_, gammaInt_, gammaIntEff_, phiInt_, phiBnd_, ctl_.nu, ctl_.epsRelax(),
                                              ctl_.keTol(), ctl_.keRelTol(), ctl_.bicgCheckEvery, ctl_.bounded, ctl_.nonOrth,
-                                             ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, reDdt, giDdt);   // LM transition ddt
+                                             ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, reDdt, giDdt,   // LM transition ddt
+                                             // limitedLinear/linearUpwind were already defaulting off on
+                                             // this arm -- passing them explicitly changes nothing and is
+                                             // only here to reach gsSymmetric. That the LEGACY driver does
+                                             // not forward the case's div scheme to the two transition
+                                             // scalars is a separate gap, not one this line introduces.
+                                             /*limitedLinear*/false, /*linearUpwind*/false, ctl_.gsKESym);
             }
             else
                 deviceKEpsilonCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_,
@@ -905,7 +916,8 @@ void amgFineCoeffKernel(
                                       ctl_.gradULimitK,     // kEpsilon::correct()'s own fvc::grad(U) -> gradSchemes grad(U)
                                       // fvOptions scalarFixedValueConstraint (OF eqn.setValues per field)
                                       fixScaK_ ? &fixScaMask_ : nullptr, fixScaK_ ? &fixScaKVal_ : nullptr,
-                                      fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr);
+                                      fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr,
+                                      /*nSweeps*/1, ctl_.gsKESym);   // ...and WHICH GaussSeidel the case named
         }
     }
 
@@ -1768,7 +1780,8 @@ void amgFineCoeffKernel(
             scalar ur;
             DeviceSolverPerf uperf;
             if (ctl_.gsU && !hasCyclic_ && !hasAMI_)
-                ur = deviceSymGaussSeidel(mv, b, Uk_[kk], nf, tol, ctl_.uRelTol(), 5000, &uperf);
+                ur = deviceSymGaussSeidel(mv, b, Uk_[kk], nf, tol, ctl_.uRelTol(), 5000, &uperf,
+                                          /*minIter*/0, /*nSweeps*/1, ctl_.gsUSym);
             else
             {
                 // DILU when the case asked for it. It matters most exactly where Jacobi is weakest: on a

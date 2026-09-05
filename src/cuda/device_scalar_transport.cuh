@@ -240,7 +240,11 @@ void deviceSolveScalarTransport(
     // positional call keeps its behaviour exactly. Meaningful only on the smoothSolver path -- the
     // BiCGStab branch below has no such control, which is OpenFOAM's rule too (nSweeps lives on
     // smoothSolver alone).
-    int nSweeps = 1)
+    int nSweeps = 1,
+    // WHICH GaussSeidel smoother the case named. true = symGaussSeidel (ascending then descending);
+    // false = GaussSeidel, whose sweep loop in GaussSeidelSmoother.C is the ascending walk ONLY. They
+    // are different smoothers, so the same relTol stops in a different place. Trailing, like nSweeps.
+    bool gsSymmetric = true)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> Df;
@@ -492,11 +496,10 @@ void deviceSolveScalarTransport(
         stageDump(std::string("stage_resid_") + fieldName, r);
         stageDump(std::string("stage_resid_") + fieldName + "_normFactor", std::vector<scalar>(1, normF));
     }
-    // The smoothSolver SELECTION and stopping rule the case asked for; the SWEEP is brae's multicolour
-    // one, not symGaussSeidelSmoother's index order (device_amg.cuh). Announced by
-    // linear_solver_setup.cuh. nSweeps is not threaded here yet -- queue item 47 -- so this runs one
-    // sweep per residual evaluation whatever the case says, which the V2 envelope also announces.
-    if (gs) deviceSymGaussSeidel(sv, B, field, normF, tol, relTolKE, 3000, &perf, /*minIter*/0, nSweeps);
+    // The smoothSolver the case asked for, algorithm included: OpenFOAM's own sweep, level-scheduled
+    // (device_sym_gauss_seidel.cuh), symmetric or ascending-only as the `smoother` entry names.
+    if (gs) deviceSymGaussSeidel(sv, B, field, normF, tol, relTolKE, 3000, &perf, /*minIter*/0, nSweeps,
+                                 gsSymmetric);
     // DILU when the case asks for it, Jacobi otherwise. NOT a cost choice: both reach the requested
     // relTol, but they stop in different places -- on turbulentFlatPlate:kEpsilon OpenFOAM's DILU solve
     // lands at a median 0.0064 of the initial residual against brae's Jacobi 0.0726, and that gap leaves

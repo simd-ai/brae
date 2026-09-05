@@ -165,6 +165,11 @@ struct RhoStepInput
     const DeviceDilu* preconHe = nullptr;
     int    minIterU = 0,    minIterP = 0,    minIterHe = 0,    minIterTurb = 0;
     bool   uSymGaussSeidel = false;
+    // WHICH GaussSeidel smoother the case's U entry named: true = symGaussSeidel (ascending then
+    // descending), false = GaussSeidel, whose sweep loop in GaussSeidelSmoother.C is the ascending walk
+    // ONLY. Different smoothers -- the same relTol stops in a different place, and on validation/T3A a
+    // smoother that stops elsewhere is the difference between converging and limit-cycling.
+    bool   uGaussSeidelSymmetric = true;
     bool   captureVcycle = true;
     int    pcgCheckEvery = 1;
     // Reuse the AMG hierarchy STRUCTURE across runs. The agglomeration is the build cost and depends only
