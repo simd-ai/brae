@@ -59,6 +59,9 @@ static const GridColoring& gsColoringFor(const DeviceLduView& A)
 // epsilon get independent graph instances. normFactor is a device-resident scalar; tol/relTol/maxIter are baked in at
 // capture. WHILE nodes require CUDA >= 13; on older toolkits this path compiles out and the host loop below is used.
 #if CUDART_VERSION >= 13000
+// The host loop's stop test, run on the device: `sweeps += nSweeps` (smoothSolver.C:205 counts sweeps,
+// not evaluations), then `(finalRes < tol || finalRes < relTol*initRes) && sweeps >= minIter`, or the
+// cap. One thread; the handle is the WHILE node's condition.
 __global__
 void gsSetCondK(
     cudaGraphConditionalHandle h,
@@ -67,12 +70,15 @@ void gsSetCondK(
     const scalar* init,
     scalar relTol,
     int* iter,
-    int maxIter)
+    int maxIter,
+    int minIter,
+    int sweepsPer)
 {
     if (threadIdx.x || blockIdx.x) return;
-    const int it = ++(*iter);
+    const int it = (*iter += sweepsPer);
     const scalar r = *res;
-    const bool stop = (r < tol) || (r < relTol * (*init)) || (it >= maxIter);
+    const bool converged = ((r < tol) || (r < relTol * (*init))) && (it >= minIter);
+    const bool stop = converged || (it >= maxIter);
     cudaGraphSetConditional(h, stop ? 0u : 1u);
 }
 struct GSGraphCache
@@ -81,6 +87,12 @@ struct GSGraphCache
     cudaGraph_t graph = nullptr;
     cudaGraphConditionalHandle handle{};
     const void* key = nullptr;
+    // tol/relTol/maxIter/minIter/nSweeps/symmetric are ARGUMENTS of the captured kernels, so a solve
+    // that changes any of them on the same field (kFinal after k, a tightened arm in a gate) must
+    // re-capture. Keying on psi alone replayed the previous solve's rule.
+    scalar tol = -1, relTol = -1;
+    int    maxIter = -1, minIter = -1, sweepsPer = -1;
+    bool   symmetric = true;
     DeviceBuffer<scalar> gsDiag, gsUpper, gsLower, gsB, Ax, r;        // stable, graph-referenced
     DeviceBuffer<scalar> gNormF, gInit, gRes;
     DeviceBuffer<int> gIter;
@@ -90,16 +102,27 @@ struct GSGraphCache
         if (graph) cudaGraphDestroy(graph);
     }
 };
-static scalar deviceSymGaussSeidelGraph(
+// OpenFOAM's smoothSolver loop, on the device: sweep, residual, stop test, all inside a conditional-graph
+// WHILE node, replayed with one launch. The host loop below reads the residual back once per sweep and
+// blocks on it; measured on T3A (item 55), those reads were 31 of the turbulence hook's ~43 ms per outer
+// iteration against 11.5 ms of kernels -- the CPU and GPU never overlapped. This path syncs TWICE per
+// solve: the initial residual (OpenFOAM's `Initial residual`, which the report needs first) and the
+// final residual + count after the loop (item 52's report line). Same sweeps, same residual, same stop,
+// so tests/gs_ladder and tests/solve_report_vs_openfoam hold it to OpenFOAM exactly as the host loop.
+static void deviceSymGaussSeidelGraph(
     const DeviceLduView& A,
     const DeviceBuffer<scalar>& b,
     DeviceBuffer<scalar>& psi,
     scalar normFactor,
     scalar tol,
     scalar relTol,
-    int maxIter)
+    int maxIter,
+    int minIter,
+    int sweepsPer,
+    bool symmetric,
+    DeviceSolverPerf& perf)
 {
-    const GridColoring& gc = gsColoringFor(A);
+    const DeviceGaussSeidelLevels& lv = gsLevelsFor(A);
     static auto& cache = *new std::map<const void*, GSGraphCache>();  // leaked (no static-dtor-after-context-teardown hazard)
     GSGraphCache& c = cache[psi.data()];
     const int nC = A.nCells, nF = A.nInternalFaces;
@@ -123,7 +146,7 @@ static scalar deviceSymGaussSeidelGraph(
     sA.diag = c.gsDiag.data();
     sA.upper = c.gsUpper.data();
     sA.lower = c.gsLower.data();  // stable values + mesh topology
-    // initial residual (also PRE-SIZES Ax/r so the capture below allocates nothing): r = b - A*psi
+    // initial residual (also PRE-SIZES Ax/r and the reduction scratch, so the capture allocates nothing)
     deviceAmul(sA, psi, c.Ax);
     deviceCopy(c.r, c.gsB);
     deviceAxpy(-1.0, c.Ax, c.r);
@@ -131,14 +154,17 @@ static scalar deviceSymGaussSeidelGraph(
     gsScaleInvK<<<1,1,0,cudaStreamPerThread>>>(c.gInit.data(), c.gNormF.data());     // gInit = sum|r| / normFactor
     scalar initRes;
     cudaCheck(cudaMemcpyAsync(&initRes, c.gInit.data(), sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "gs init D2H");
-    cudaStreamSynchronize(cudaStreamPerThread);                                       // the ONE host sync / solve (OF initialResidual)
-    if (initRes < tol)
+    cudaStreamSynchronize(cudaStreamPerThread);                                       // sync 1 of 2: OF initialResidual
+    if (initRes < tol && minIter <= 0)
     {
-        if (std::getenv("BRAE_GS_DEBUG")) std::printf("    GS[dev] init=%.4e (skip)\n", initRes);
-        return initRes;
+        perf = {initRes, initRes, 0};
+        return;
     }
     cudaMemsetAsync(c.gIter.data(), 0, sizeof(int), cudaStreamPerThread);
-    if (!c.exec || c.key != psi.data())                                            // (re)capture the WHILE-graph
+    const bool recapture = !c.exec || c.key != psi.data() || c.tol != tol || c.relTol != relTol
+                        || c.maxIter != maxIter || c.minIter != minIter || c.sweepsPer != sweepsPer
+                        || c.symmetric != symmetric;
+    if (recapture)
     {
         if (c.exec)
         {
@@ -161,30 +187,32 @@ static scalar deviceSymGaussSeidelGraph(
         cudaCheck(cudaGraphAddNode(&cnode, c.graph, nullptr, nullptr, 0, &cp), "gs cond node");
         cudaGraph_t body = cp.conditional.phGraph_out[0];
         cudaCheck(cudaStreamBeginCaptureToGraph(cudaStreamPerThread, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal), "gs capture begin");
-        gsSweep(sA, c.gsB, psi, gc, true);                                           // forward color sweep
-        gsSweep(sA, c.gsB, psi, gc, false);                                          // reverse color sweep
+        // smoothSolver.C:186: nSweeps sweeps, THEN one residual evaluation
+        for (int sw = 0; sw < sweepsPer; ++sw) deviceSymGaussSeidelSweepExact(sA, c.gsB, psi, lv, symmetric);
         deviceAmul(sA, psi, c.Ax);
         deviceCopy(c.r, c.gsB);
         deviceAxpy(-1.0, c.Ax, c.r);  // r = b - A*psi
         deviceSumMagInto(c.r, c.gRes.data());
         gsScaleInvK<<<1,1,0,cudaStreamPerThread>>>(c.gRes.data(), c.gNormF.data());      // finalRes = sum|r| / normFactor
-        gsSetCondK<<<1,1,0,cudaStreamPerThread>>>(c.handle, c.gRes.data(), tol, c.gInit.data(), relTol, c.gIter.data(), maxIter);
+        gsSetCondK<<<1,1,0,cudaStreamPerThread>>>(c.handle, c.gRes.data(), tol, c.gInit.data(), relTol,
+                                                  c.gIter.data(), maxIter, minIter, sweepsPer);
         cudaGraph_t tmp;
         cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &tmp), "gs capture end");
         cudaCheck(cudaGraphInstantiate(&c.exec, c.graph, 0), "gs graph instantiate");
         c.key = psi.data();
+        c.tol = tol; c.relTol = relTol; c.maxIter = maxIter; c.minIter = minIter;
+        c.sweepsPer = sweepsPer; c.symmetric = symmetric;
     }
-    cudaCheck(cudaGraphLaunch(c.exec, cudaStreamPerThread), "gs graph launch");       // replay: loop runs to convergence on-device
+    cudaCheck(cudaGraphLaunch(c.exec, cudaStreamPerThread), "gs graph launch");       // replay: loop runs to its stop on-device
+    // sync 2 of 2: the report. The host loop paid this once per sweep.
+    scalar finalRes;
+    int nIter;
+    cudaCheck(cudaMemcpyAsync(&finalRes, c.gRes.data(), sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "gs final D2H");
+    cudaCheck(cudaMemcpyAsync(&nIter,    c.gIter.data(), sizeof(int),   cudaMemcpyDeviceToHost, cudaStreamPerThread), "gs iter D2H");
+    cudaStreamSynchronize(cudaStreamPerThread);
+    perf = {initRes, finalRes, nIter};
     if (std::getenv("BRAE_GS_DEBUG"))
-    {
-        cudaStreamSynchronize(cudaStreamPerThread);
-        scalar fr;
-        int ni;
-        cudaMemcpy(&fr, c.gRes.data(), sizeof(scalar), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&ni, c.gIter.data(), sizeof(int), cudaMemcpyDeviceToHost);
-        std::printf("    GS[dev] init=%.4e final=%.4e iters=%d (relTol=%.2g)\n", initRes, fr, ni, relTol);
-    }
-    return initRes;
+        std::printf("    GS[dev] init=%.4e final=%.4e sweeps=%d (relTol=%.2g nSweeps=%d)\n", initRes, finalRes, nIter, relTol, sweepsPer);
 }
 #endif // CUDART_VERSION >= 13000
 
@@ -283,25 +311,19 @@ scalar deviceSymGaussSeidel(
         if (perf) *perf = {initRes, initRes, 1};   // opt-in path: report init only
         return initRes;
     }
-    // BRAE_GS_DEVICE: run the convergence loop ON-DEVICE (conditional-graph WHILE node), same per-sweep stop decision,
-    // zero per-sweep host D2H. EXACT (not batched): identical sweep count + bit-identical psi vs this host loop.
-    static const bool useGraph = std::getenv("BRAE_GS_DEVICE") != nullptr;
+    // THE DEFAULT: the whole smoothSolver loop on the device (deviceSymGaussSeidelGraph above), which
+    // syncs twice per solve where the host loop below syncs once per sweep. Same sweeps, same residual,
+    // same stop -- tests/gs_device_loop_identity holds the two paths' logs byte-identical over 50 T3A
+    // iterations. BRAE_GS_HOST_LOOP=1 forces the host loop (identity checks and measurement); a toolkit
+    // without conditional graph nodes (CUDA < 13) takes it unconditionally.
 #ifdef BRAE_HAS_GS_DEVICE
-    if (useGraph && !floored && !batched && symmetric)
+    static const bool hostLoop = std::getenv("BRAE_GS_HOST_LOOP") != nullptr;
+    if (!hostLoop)
     {
-        scalar r = deviceSymGaussSeidelGraph(A, b, psi, normFactor, tol, relTol, maxIter);
-        if (perf) *perf = {r, r, 1};
-        return r;
-    }   // opt-in path: report init only
-#else
-    if (useGraph)
-    {
-        static bool warned = false;
-        if (!warned)
-        {
-            warned = true;
-            std::fprintf(stderr, "brae: BRAE_GS_DEVICE needs CUDA >= 13.0; falling back to host-loop GS\n");
-        }
+        DeviceSolverPerf p;
+        deviceSymGaussSeidelGraph(A, b, psi, normFactor, tol, relTol, maxIter, minIter, sweepsPer, symmetric, p);
+        if (perf) *perf = p;
+        return p.initialResidual;
     }
 #endif
     const DeviceGaussSeidelLevels& lv = gsLevelsFor(A);

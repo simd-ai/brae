@@ -34,6 +34,19 @@ inline const char* foamClassName(scalar) { return "volScalarField"; }
 inline const char* foamClassName(const vector&) { return "volVectorField"; }
 
 // Write "uniform <v>;" or "nonuniform List<...> N (...);" for a boundary entry field.
+// OpenFOAM's FoamFile `location` is the TIME DIRECTORY NAME -- `location "269";` -- never a path. brae's
+// surface writer put the whole output path there, so two otherwise identical runs in different
+// directories wrote different phi files (tests/gs_device_loop_identity caught it as a byte diff), and
+// the vol writer echoed its 0/ template's `location "0"` into every later time. Both now write what
+// OpenFOAM writes. Readers ignore the entry; a diff does not.
+inline std::string timeDirName(const std::string& outPath)
+{
+    const std::size_t slash = outPath.find_last_of('/');
+    const std::string dir = (slash == std::string::npos) ? std::string(".") : outPath.substr(0, slash);
+    const std::size_t s2 = dir.find_last_of('/');
+    return (s2 == std::string::npos) ? dir : dir.substr(s2 + 1);
+}
+
 template <typename T>
 inline void writeFieldValue(
     std::ostream& os,
@@ -202,7 +215,8 @@ inline void writeVolField(
         throw std::runtime_error("writeVolField: cannot read " + origPath + " (nor " + origPath + ".gz)");
     }
 
-    // FoamFile header block (verbatim, it holds no directives) + the dimensions line.
+    // FoamFile header block (verbatim but for `location`, rewritten below to the output time as
+    // OpenFOAM writes it, and `object` for a derived field) + the dimensions line.
     const std::size_t ff = text.find("FoamFile");
     const std::size_t hb = text.find('{', ff);
     int depth = 0;
@@ -226,6 +240,10 @@ inline void writeVolField(
     {
         const std::regex fmtRe("format\\s+binary\\s*;");
         header = std::regex_replace(header, fmtRe, std::string("format      ascii;"));
+    }
+    {
+        static const std::regex locRe("location\\s+\"[^\"]*\";");
+        header = std::regex_replace(header, locRe, std::string("location    \"") + timeDirName(outPath) + "\";");
     }
     if (derived && derived->object)
     {
@@ -346,7 +364,7 @@ inline void writeSurfaceField(
     if (!out) throw std::runtime_error("writeSurfaceField: cannot write " + outPath);
     out << std::setprecision(precision);
     out << "FoamFile\n{\n    version     2.0;\n    format      ascii;\n    class       surfaceScalarField;\n"
-           "    location    \"" << outPath << "\";\n    object      phi;\n}\n\n";
+           "    location    \"" << timeDirName(outPath) << "\";\n    object      phi;\n}\n\n";
     out << "dimensions      " << dimensions << ";\n\n";
     out << "internalField   nonuniform List<scalar> \n" << phiInternal.size() << "\n(\n";
     for (scalar v : phiInternal) out << v << '\n';

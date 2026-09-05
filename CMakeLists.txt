@@ -1122,6 +1122,11 @@ add_test(NAME tightp_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A)
 set_tests_properties(tightp_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1500)
 
+add_test(NAME gs_device_loop_identity
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/gs_device_loop_identity.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A)
+set_tests_properties(gs_device_loop_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
 add_test(NAME uresidual_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/uresidual_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO
