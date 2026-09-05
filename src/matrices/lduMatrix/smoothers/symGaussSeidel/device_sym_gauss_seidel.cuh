@@ -43,19 +43,21 @@
 //     a LOWER-numbered cell, which the reverse walk has not reached yet and which therefore still holds
 //     exactly the forward value OF's bPrime captured.
 //
-// THE COST IS REAL AND IS PAID DELIBERATELY: nLevels kernel launches per half-sweep, the same price
-// device_dilu.cuh pays for the same reason. On validation/T3A (26820 cells, 53213 internal faces) the
-// forward DAG has 465 levels averaging 57.7 cells -- every one of them under a single 128-thread block --
-// so the sweep is launch-bound and the GPU is mostly idle inside it. Measured end to end on that case,
-// 43.1 s for the 406 outer iterations this takes to converge against 21.3 s for the 1000 the colour
-// order ran without converging: about 5x per outer iteration, and that is with FEWER sweeps per solve
-// (the colour order needed 9-10 to reach the case's relTol 0.1 where this needs 4-5), so the gap is
-// launch overhead rather than arithmetic.
+// THE COST, and how it is paid. Level scheduling as nLevels kernel launches per half-sweep was
+// launch-bound: on validation/T3A (26820 cells, 53213 internal faces) the forward DAG has 465 levels
+// averaging 57.7 cells -- every one under a single thread block -- so each of the ~930 launches per
+// sweep did a few microseconds of work and the GPU sat idle between them. Measured end to end, 43.1 s
+// for the 406 outer iterations the case takes to converge, against 21.3 s for 1000 iterations of the
+// colour order that never converged: about 5x per outer iteration, with FEWER sweeps per solve.
 //
-// A wrong-but-parallel smoother is not a cheaper version of this; it is a different solver, and on T3A
-// it is the difference between converging and not. The launches are worth attacking on their own terms
-// -- one kernel with a grid-wide barrier per level, or a captured CUDA graph -- and neither changes an
-// operation, so neither is a substitution.
+// So when NO level is wider than one block, the whole half-sweep is ONE launch: a single block walks
+// the levels in order with __syncthreads() between them. Every cell's gather is the same code as
+// before, so the result is bit-identical -- tests/gs_ladder holds it to OpenFOAM at 2.8e-12 either way
+// -- and the only thing that changed is that 465 launches became one barrier each. Meshes whose levels
+// outgrow a block (a 1M-cell mesh has levels of thousands of cells) keep the per-level launches, where
+// each launch carries enough work for the overhead not to dominate. A wrong-but-parallel smoother would
+// still not be a cheaper version of either: it is a different solver, and on T3A the difference between
+// converging and not.
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 #include "device_ldu.cuh"
@@ -72,6 +74,10 @@ struct DeviceGaussSeidelLevels
     // launch loop. fwd = the ascending-index sweep, bwd = the descending one.
     DeviceBuffer<label> fwdCells, bwdCells;
     std::vector<int>    fwdOff, bwdOff;
+    // ...and on the device too, for the single-block walk (the host copies drive the per-level loop).
+    DeviceBuffer<label> fwdOffD, bwdOffD;
+    // The widest level, which picks the execution strategy (see deviceSymGaussSeidelSweepExact).
+    int maxLevelWidth = 0;
 
     int levels() const { return (int)fwdOff.size() - 1; }
 };

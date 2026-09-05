@@ -3,6 +3,7 @@
 #include "device_sym_gauss_seidel.cuh"
 #include "device_blas.cuh"
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 
 namespace brae
@@ -13,6 +14,51 @@ namespace
 
 constexpr int TPB_G = 128;
 inline int nBlkG(int n) { return (n + TPB_G - 1) / TPB_G; }
+
+// The same update, factored so the two walks cannot drift apart.
+__device__ __forceinline__ void gsCellUpdate(
+    label c,
+    const label* __restrict__ owner, const label* __restrict__ nei,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ losort, const label* __restrict__ losortStart,
+    const scalar* __restrict__ upper, const scalar* __restrict__ lower,
+    const scalar* __restrict__ diag, const scalar* __restrict__ b,
+    scalar* __restrict__ psi)
+{
+    scalar psii = b[c];
+    for (label k = losortStart[c]; k < losortStart[c+1]; ++k)
+    {
+        const label f = losort[k];
+        psii -= lower[f]*psi[owner[f]];
+    }
+    for (label f = ownerStart[c]; f < ownerStart[c+1]; ++f) psii -= upper[f]*psi[nei[f]];
+    psi[c] = psii/diag[c];
+}
+
+// One half-sweep in ONE launch: a single block walks every level, its threads striding over the
+// level's cells, with __syncthreads() as the level barrier. Correct because cells at one level share
+// no face (so no thread reads what another writes inside a level) and the barrier orders the levels
+// exactly as the per-level launches did. The thread-to-cell assignment differs from the per-level
+// kernel; the per-cell arithmetic does not, so the numbers are bit-identical.
+__global__ void gsSingleBlockK(
+    const label* __restrict__ off, int nLevels,
+    const label* __restrict__ cells,
+    const label* __restrict__ owner, const label* __restrict__ nei,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ losort, const label* __restrict__ losortStart,
+    const scalar* __restrict__ upper, const scalar* __restrict__ lower,
+    const scalar* __restrict__ diag, const scalar* __restrict__ b,
+    scalar* __restrict__ psi)
+{
+    for (int L = 0; L < nLevels; ++L)
+    {
+        const label lo = off[L], hi = off[L+1];
+        for (label i = lo + (label)threadIdx.x; i < hi; i += (label)blockDim.x)
+            gsCellUpdate(cells[i], owner, nei, ownerStart, losort, losortStart, upper, lower, diag, b, psi);
+        __syncthreads();
+    }
+}
+constexpr int TPB_SINGLE = 1024;   // a level up to this wide is walked by one block in one pass
 
 // One level of a symGaussSeidel half-sweep, as a gather:
 //
@@ -37,15 +83,7 @@ __global__ void gsLevelK(
 {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const label c = cells[i];
-    scalar psii = b[c];
-    for (label k = losortStart[c]; k < losortStart[c+1]; ++k)
-    {
-        const label f = losort[k];
-        psii -= lower[f]*psi[owner[f]];
-    }
-    for (label f = ownerStart[c]; f < ownerStart[c+1]; ++f) psii -= upper[f]*psi[nei[f]];
-    psi[c] = psii/diag[c];
+    gsCellUpdate(cells[i], owner, nei, ownerStart, losort, losortStart, upper, lower, diag, b, psi);
 }
 
 // Group cells by DAG depth and flatten into (cells, offsets). `deps[c]` holds the cells c must follow,
@@ -91,6 +129,7 @@ DeviceGaussSeidelLevels buildDeviceGaussSeidelLevels(const std::vector<label>& o
         bwd[(std::size_t)owner[f]].push_back(nei[f]);
     }
     schedule(fwd, nCells, lv.fwdCells, lv.fwdOff);
+    lv.fwdOffD.copyFrom(std::vector<label>(lv.fwdOff.begin(), lv.fwdOff.end()));
     {
         std::vector<std::vector<label>> rev((std::size_t)nCells);
         for (label c = 0; c < nCells; ++c)
@@ -101,7 +140,11 @@ DeviceGaussSeidelLevels buildDeviceGaussSeidelLevels(const std::vector<label>& o
         std::vector<label> h; tmp.copyTo(h);
         for (label& c : h) c = nCells - 1 - c;
         lv.bwdCells.copyFrom(h);
+        lv.bwdOffD.copyFrom(std::vector<label>(lv.bwdOff.begin(), lv.bwdOff.end()));
     }
+    for (const std::vector<int>* off : {&lv.fwdOff, &lv.bwdOff})
+        for (std::size_t L = 0; L + 1 < off->size(); ++L)
+            lv.maxLevelWidth = std::max(lv.maxLevelWidth, (*off)[L+1] - (*off)[L]);
     lv.valid = true;
     return lv;
 }
@@ -130,9 +173,23 @@ void deviceSymGaussSeidelSweepExact(const DeviceLduView& A,
                                     const DeviceGaussSeidelLevels& lv,
                                     bool symmetric)
 {
-    auto half = [&](const DeviceBuffer<label>& cells, const std::vector<int>& off)
+    // BRAE_GS_PER_LEVEL=1 forces the per-level launches on a mesh that would take the single-block
+    // walk. Measurement only -- tests/gs_ladder times both -- the numbers are identical either way.
+    static const bool forcePerLevel = std::getenv("BRAE_GS_PER_LEVEL") != nullptr;
+    const bool singleBlock = lv.maxLevelWidth <= TPB_SINGLE && !forcePerLevel;
+    auto half = [&](const DeviceBuffer<label>& cells, const std::vector<int>& off,
+                    const DeviceBuffer<label>& offD)
     {
-        for (int L = 0; L + 1 < (int)off.size(); ++L)
+        const int nLevels = (int)off.size() - 1;
+        if (singleBlock)
+        {
+            gsSingleBlockK<<<1, TPB_SINGLE>>>(offD.data(), nLevels, cells.data(),
+                                               A.owner, A.nei, A.ownerStart,
+                                               A.losort, A.losortStart,
+                                               A.upper, A.lower, A.diag, b.data(), psi.data());
+            return;
+        }
+        for (int L = 0; L < nLevels; ++L)
         {
             const int lo = off[(std::size_t)L], hi = off[(std::size_t)L+1];
             if (hi <= lo) continue;
@@ -142,9 +199,9 @@ void deviceSymGaussSeidelSweepExact(const DeviceLduView& A,
                                               A.upper, A.lower, A.diag, b.data(), psi.data());
         }
     };
-    half(lv.fwdCells, lv.fwdOff);
+    half(lv.fwdCells, lv.fwdOff, lv.fwdOffD);
     // GaussSeidelSmoother.C stops here: its sweep loop is the ascending walk and nothing else.
-    if (symmetric) half(lv.bwdCells, lv.bwdOff);
+    if (symmetric) half(lv.bwdCells, lv.bwdOff, lv.bwdOffD);
     cudaCheck(cudaGetLastError(), "GaussSeidel sweep");
 }
 

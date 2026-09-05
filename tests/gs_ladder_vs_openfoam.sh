@@ -88,5 +88,8 @@ PY
 
 "$BIN" "$W/of" 1
 rc=$?
+# The same binary once more with the per-level launches forced, for the timing line only: the
+# assertions above already passed on the single-block walk, and the numbers are identical either way.
+[ $rc -eq 0 ] && BRAE_GS_PER_LEVEL=1 "$BIN" "$W/of" 1 | grep "TIMING"
 [ $rc -eq 0 ] && echo "PASS: both of OpenFOAM's GaussSeidel smoothers are brae's, sweep for sweep"
 exit $rc

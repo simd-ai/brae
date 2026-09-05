@@ -53,8 +53,10 @@
 #include "device_buffer.cuh"
 #include "device_ldu.cuh"
 #include "device_amg.cuh"
+#include "device_sym_gauss_seidel.cuh"   // gsLevelsFor + the sweep, for the timing line
 #include "device_amg_internal.cuh"   // gsSweep + greedyColor: the colour order, as the CONTROL
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -292,6 +294,25 @@ int main(int argc, char** argv)
         worstSeqG     = std::fmax(worstSeqG,  std::fabs(seq - gFinal[i]) / std::fabs(gFinal[i]));
         worstBraeG    = std::fmax(worstBraeG, std::fabs(perf.finalResidual - gFinal[i]) / std::fabs(gFinal[i]));
         worstControlG = std::fmin(worstControlG, gFinal[i] / lFinal[i]);
+    }
+
+    // WALL-CLOCK, reported and not asserted: ten symmetric sweeps of this system, so the gate script
+    // can print the single-block walk against the forced per-level launches (BRAE_GS_PER_LEVEL=1)
+    // side by side. The numbers above are the same either way; this is what the choice costs.
+    {
+        DeviceBuffer<scalar> tPsi;
+        tPsi.copyFrom(psi0);
+        const DeviceGaussSeidelLevels& lv = gsLevelsFor(A);
+        deviceSymGaussSeidelSweepExact(A, dB, tPsi, lv);   // warm the levels and the kernel
+        cudaDeviceSynchronize();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int s = 0; s < 10; ++s) deviceSymGaussSeidelSweepExact(A, dB, tPsi, lv);
+        cudaDeviceSynchronize();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::printf("  TIMING  10 symmetric sweeps, %d levels (widest %d cells), %s: %.2f ms  (%.1f us per half-sweep)\n",
+                    lv.levels(), lv.maxLevelWidth,
+                    std::getenv("BRAE_GS_PER_LEVEL") ? "per-level launches" : "single-block walk",
+                    ms, 1000.0 * ms / 20.0);
     }
 
     char buf[220];
