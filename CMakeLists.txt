@@ -1107,6 +1107,11 @@ add_test(NAME turbulence_off_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A)
 set_tests_properties(turbulence_off_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1200)
 
+add_test(NAME solve_report_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/solve_report_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A)
+set_tests_properties(solve_report_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+
 add_test(NAME uresidual_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/uresidual_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO

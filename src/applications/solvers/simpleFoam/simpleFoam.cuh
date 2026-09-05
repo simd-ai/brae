@@ -176,6 +176,22 @@ struct SolverWorkspace
     // works and removes a whole class of stale-pointer question.
     PressureMatrix       P;
     DeviceBuffer<scalar> diagC, b;
+
+    // What every linear solve of the LAST step reported, in the order it ran, so the driver can print
+    // OpenFOAM's own three numbers per solve -- `Initial residual`, `Final residual`, `No Iterations`
+    // (SolverPerformance.C:99-117) -- and a brae log can be diffed against an OpenFOAM one. This lives
+    // HERE and not in the Residuals map on purpose: SimpleControl::criteriaSatisfied walks every key of
+    // that map against the case's residualControl regexes, so a `".*"` entry would test an iteration
+    // count against 1e-5 and the run would never converge. One entry per component OpenFOAM would print
+    // a line for (a knocked-out direction leaves none), and one per pressure corrector.
+    struct SolveReport
+    {
+        std::string field;         // "Ux", "Uy", "Uz", "p"
+        scalar      initial = 0;
+        scalar      final   = 0;
+        int         nIterations = 0;
+    };
+    std::vector<SolveReport> report;
 };
 
 // One SIMPLE iteration, in place on `f`.

@@ -2026,6 +2026,23 @@ int runSimpleFoamV2(const std::string& caseDir)
                     WriteControl::timeName(timeValue).c_str(),
                     residuals.count("U") ? residuals.at("U") : 0.0,
                     residuals.count("p") ? residuals.at("p") : 0.0);
+        // ...and then OpenFOAM's own line per solve (SolverPerformance.C:99-117): `<solver>:  Solving
+        // for <field>, Initial residual = a, Final residual = b, No Iterations n`, at its default six
+        // significant figures, so a brae log diffs against an OpenFOAM one. The final residual is the
+        // number the compact line above cannot give: where the solve STOPPED, which item 32 showed is
+        // what decides whether this case converges. The solver name is brae's own, as on the legacy
+        // driver -- a log that said `smoothSolver:` or `GAMG:` would be asserting a capability.
+        {
+            const char* uSolv = in.uSymGaussSeidel
+                              ? (in.uGaussSeidelSymmetric ? "smoothSolver[symGaussSeidel]"
+                                                          : "smoothSolver[GaussSeidel]")
+                              : "Jacobi-BiCGStab";
+            for (const auto& r : ws.report)
+                std::printf("%s:  Solving for %s, Initial residual = %g, Final residual = %g, "
+                            "No Iterations %d\n",
+                            r.field == "p" ? "AMG-PCG" : uSolv, r.field.c_str(),
+                            r.initial, r.final, r.nIterations);
+        }
     }
     if (ctl.converged())
         std::printf("SIMPLE solution converged in %d iterations\n", static_cast<int>(iter));

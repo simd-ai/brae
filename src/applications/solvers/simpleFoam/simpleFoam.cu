@@ -96,6 +96,8 @@ Residuals simpleStep(
     const DeviceBoundary&        dbP,
     const StepInput&             in)
 {
+    w.report.clear();   // this step's solves, reported below in the order they run
+
     Residuals res;
     if (w.ones.size() != static_cast<std::size_t>(dm.nCells))
     {
@@ -237,6 +239,8 @@ Residuals simpleStep(
             if (std::getenv("BRAE_SOLVER_ITERS"))
                 std::printf("    [U%d] nIter=%d init=%.3e final=%.3e\n",
                             k, perf.nIterations, perf.initialResidual, perf.finalResidual);
+            w.report.push_back({std::string("U") + "xyz"[k], perf.initialResidual, perf.finalResidual,
+                                perf.nIterations});
         }
         res["U"] = uInitialResidual;
     }
@@ -324,6 +328,7 @@ Residuals simpleStep(
             deviceAMGPCG(A, w.amg, b, f.p, nf, in.tolP, in.relTolP, in.maxIterP,
                          in.captureVcycle, in.pcgCheckEvery, /*corrScaling*/false, in.minIterP);
         if (corr == 1) res["p"] = perf.initialResidual;   // the FIRST solve's residual, as OpenFOAM reports
+        w.report.push_back({"p", perf.initialResidual, perf.finalResidual, perf.nIterations});
         // Solver-iteration counts, on demand. The wall-clock question on this path turned out to be "how
         // many Krylov iterations", not "how fast is a kernel": every iteration ends in a scalar
         // device-to-host read to test convergence, and those reads are blocking.
