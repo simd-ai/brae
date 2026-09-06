@@ -255,7 +255,7 @@ Residuals simpleStep(
             {
                 const int k = solved[i];
                 perfs[k] = deviceJacobiBiCGStab(A[k], b[k], *U[k], dnf[k].data(), in.tolU, in.relTolU, in.maxIterU,
-                                                /*checkEvery*/1, in.minIterU);
+                                                /*checkEvery*/1, in.minIterU, in.preconU);
             }
         }
         for (int i = 0; i < nSolved; ++i)

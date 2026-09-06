@@ -35,6 +35,7 @@
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
 #include "device_amg.cuh"
+#include "device_dilu.cuh"   // DeviceDilu: the case's `preconditioner DILU`, honoured on the momentum solve
 #include "UEqn.cuh"
 #include "actuation_disk.cuh"
 #include "device_MRF.cuh"
@@ -88,6 +89,12 @@ struct StepInput
     // ONLY. Different smoothers -- the same relTol stops in a different place, and on validation/T3A a
     // smoother that stops elsewhere is the difference between converging and limit-cycling.
     bool   uGaussSeidelSymmetric = true;
+    // fvSolution solvers/U/preconditioner. OpenFOAM's PBiCGStab is a PRECONDITIONED BiCGStab, and DILU is
+    // what essentially every incompressible tutorial asks for; this driver ran Jacobi and announced it.
+    // Both reach the requested relTol, but they stop at different residuals -- the compressible mirror
+    // measured k landing at 5.4e-09 from OpenFOAM under Jacobi against 8.4e-12 under DILU, on systems
+    // agreeing to 1e-11 (queue item 27). Owned by the driver, which builds one schedule per mesh.
+    const DeviceDilu* preconU = nullptr;
     // fvMesh::validComponents<vector>() -- which IS polyMesh::solutionD() (fvMeshTemplates.C:33-44,
     // VectorSpaceI.H:435-446): +1 solved, -1 knocked out by an EMPTY patch.
     // fvMatrix<vector>::solveSegregated `continue`s on every -1 (fvMatrixSolve.C:164), so on a 2D case

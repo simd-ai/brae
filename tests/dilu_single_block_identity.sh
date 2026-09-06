@@ -22,17 +22,18 @@
 #   ARM 1   validation/sbMatched through the rho mirror, 20 iterations: U, e, k and epsilon all solve on
 #           PBiCGStab + DILU at 1e-12, so every one of them walks this preconditioner hundreds of times.
 #   ARM 2   validation/rhoBox through the rho mirror, 50 iterations.
-# There is no incompressible arm, and the reason is worth recording: the V2 driver announces a
-# substitution on pitzDailyTurb's `preconditioner DILU` and runs Jacobi, so it builds no DILU at all. An
-# arm there would have compared two runs that never entered this code -- it did, and passed vacuously,
-# until each arm was made to prove from the log which walk it took.
+#   ARM 3   validation/pitzDailyTurb under the V2 driver, 30 iterations. This arm did not exist when the
+#           gate was written: the driver announced a substitution on that case's `preconditioner DILU`
+#           and ran the diagonal, so it built no DILU at all and the arm passed VACUOUSLY -- which is
+#           what made each arm prove from the log which walk it took. Item 74 honours the entry, so the
+#           incompressible path exercises this code and the arm is real.
 #   CONTROL a run with p's tolerance loosened must differ from ARM 1, so the comparison can fail.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
 [ -x "$BRAE" ] || { echo "SKIP: no brae at $BRAE"; exit 77; }
 command -v nvidia-smi >/dev/null 2>&1 || { echo "SKIP: no GPU"; exit 77; }
-for f in sbMatched rhoBox; do [ -d "$ROOT/validation/$f" ] || { echo "SKIP: fixture $f missing"; exit 77; }; done
+for f in sbMatched rhoBox pitzDailyTurb; do [ -d "$ROOT/validation/$f" ] || { echo "SKIP: fixture $f missing"; exit 77; }; done
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 fail=0
 say() { printf '  %-76s %s\n' "$1" "$2"; [ "$2" = FAIL ] && fail=1 || true; }
@@ -81,6 +82,7 @@ arm() {   # arm <label> <fixture> <endTime> <env> <flag> <fields...>
 }
 arm "ARM 1" sbMatched     20 "BRAE_RHOSIMPLEFOAM_MIRROR=cuda" "-case" U p T rho phi k epsilon
 arm "ARM 2" rhoBox        50 "BRAE_RHOSIMPLEFOAM_MIRROR=cuda" "-case" U p T rho phi
+arm "ARM 3" pitzDailyTurb 30 "BRAE_SIMPLEFOAM_V2=1"           ""      U p k epsilon nut phi
 prep "$W/ctl" sbMatched 20 loose; run "$W/ctl" "BRAE_DILU_SINGLE=1 BRAE_RHOSIMPLEFOAM_MIRROR=cuda" "-case"
 diff <(lines "$W/sbMatched_s") <(lines "$W/ctl") > /dev/null \
     && say "CONTROL  a changed momentum relaxation changes the run (so the arms can fail)" FAIL \

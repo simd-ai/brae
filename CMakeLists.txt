@@ -1174,6 +1174,10 @@ add_test(NAME pcg_device_loop_identity
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/pcg_device_loop_identity.sh)
 set_tests_properties(pcg_device_loop_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
 
+add_test(NAME dilu_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/dilu_vs_openfoam.sh)
+set_tests_properties(dilu_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
 add_test(NAME uresidual_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/uresidual_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO

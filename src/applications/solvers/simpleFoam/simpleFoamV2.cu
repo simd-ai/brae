@@ -18,6 +18,8 @@
 #include "scheme_parse.cuh"   // readFvSchemesText: fusedGauss -> Gauss
 #include "fvc.cuh"
 #include "device_mesh.cuh"
+#include "device_dilu.cuh"
+#include "device_scalar_transport.cuh"   // turbPrecon(): the transported scalars' preconditioner
 #include "device_boundary.cuh"
 #include "device_kepsilon.cuh"
 #include "device_blas.cuh"        // deviceCopy -- the nutLowRe wall zeroing keeps the other faces
@@ -963,6 +965,9 @@ int runSimpleFoamV2(const std::string& caseDir)
     // for the pair the model carries, so a case that sets them differently is refused rather than run
     // with whichever was read first.
     int nSweepsKE = 1;
+    // fvSolution's `preconditioner DILU` on U and on the transported pair (item 74). One level schedule
+    // per mesh serves both; null keeps the diagonal, which is what this driver always ran.
+    bool diluU = false, diluKE = false;
     // ...and WHICH of OF's two GaussSeidel smoothers the pair named. symGaussSeidelSmoother.C sweeps up
     // then back down; GaussSeidelSmoother.C sweeps up ONLY. Different smoothers, one value for the pair.
     bool gsKESym = true;
@@ -1766,6 +1771,8 @@ int runSimpleFoamV2(const std::string& caseDir)
             const std::string firstFld  = saModel ? "nuTilda" : "k";
             const std::string secondFld = sstModel ? "omega" : "epsilon";
             gsKESym = (sk->wordOr("smoother", "") != "GaussSeidel");
+            diluKE = sk->wordOr("preconditioner", "") == "DILU";
+            if (const char* e = std::getenv("BRAE_DILU")) diluKE = std::atoi(e) != 0;
             nSweepsKE = static_cast<int>(sk->scalarOr("nSweeps", 1));
             if (nSweepsKE < 0)
                 throw std::runtime_error(
@@ -1801,7 +1808,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                     tolKE, relTolKE,
                     gsKE ? (gsKESym ? "smoothSolver + symGaussSeidel (OpenFOAM's own sweep, level-scheduled)"
                                     : "smoothSolver + GaussSeidel (ascending only, OpenFOAM's own sweep)")
-                         : "Jacobi-BiCGStab");
+                         : (diluKE ? "DILUPBiCGStab" : "diagonalPBiCGStab"));
         }
         if (const FoamDict* su = solvers->subDict("U"))
         {
@@ -1831,14 +1838,28 @@ int runSimpleFoamV2(const std::string& caseDir)
             // it is.
             const std::string usolv = su->wordOr("solver", "");
             const std::string usm   = su->wordOr("smoother", "");
+            // fvSolution solvers/U/preconditioner. OpenFOAM's PBiCGStab is a preconditioned BiCGStab and
+            // the tutorials ask for DILU; this driver ran Jacobi and announced it, while the compressible
+            // mirror has honoured the entry since queue item 27 (it measured k at 5.4e-09 from OpenFOAM
+            // under Jacobi against 8.4e-12 under DILU, on assembled systems agreeing to 1e-11 -- the gap
+            // was the stopping point, not the discretisation). BRAE_DILU=0/1 overrides in both directions.
+            diluU = su->wordOr("preconditioner", "") == "DILU";
+            if (const char* e = std::getenv("BRAE_DILU")) diluU = std::atoi(e) != 0;
             in.uSymGaussSeidel = (usolv == "smoothSolver" &&
                                   (usm == "symGaussSeidel" || usm == "GaussSeidel"));
             // WHICH of the two: GaussSeidelSmoother.C sweeps ascending only.
             in.uGaussSeidelSymmetric = (usm != "GaussSeidel");
             if (!in.uSymGaussSeidel && !usolv.empty())
-                std::printf("NOTICE (simpleFoam v2): system/fvSolution asks for `%s` on U; brae runs a "
-                            "Jacobi-preconditioned BiCGStab instead. Same matrix, different Krylov "
-                            "method and iteration count.\n", usolv.c_str());
+            {
+                const std::string want = su->wordOr("preconditioner", "");
+                if (usolv == "PBiCGStab" && diluU && (want.empty() || want == "DILU"))
+                    std::printf("  U: PBiCGStab preconditioned with DILU, as system/fvSolution asks\n");
+                else
+                    std::printf("NOTICE (simpleFoam v2): system/fvSolution asks for `%s`%s on U; brae runs "
+                                "a BiCGStab preconditioned with %s instead. Same matrix, different Krylov "
+                                "method and iteration count.\n", usolv.c_str(),
+                                want.empty() ? "" : (" + `" + want + "`").c_str(), diluU ? "DILU" : "the diagonal");
+            }
         }
     }
     // minIter is printed beside maxIter because it is the same kind of statement: a floor on how far the
@@ -2090,6 +2111,15 @@ int runSimpleFoamV2(const std::string& caseDir)
     wc.setStartTime(startTimeVal);
     std::string lastWritten;
 
+    // The DILU factorisation's level schedule: built once per mesh (it depends only on the addressing),
+    // refreshed per solve inside the solver. Held here so it outlives every step that references it.
+    DeviceDilu dilu;
+    if (diluU || diluKE) dilu = buildDeviceDilu(m.owner(), m.neighbour(), m.nCells());
+    in.preconU = (diluU && dilu.valid) ? &dilu : nullptr;
+    // turbPrecon() is process-wide and the legacy driver sets it too, so write it EITHER WAY: what this
+    // run means, not what some earlier construction left behind.
+    turbPrecon() = (diluKE && dilu.valid) ? &dilu : nullptr;
+
     // ---- the SIMPLE loop ---------------------------------------------------------------------
     SolverWorkspace ws;
     std::map<std::string, scalar> residuals;
@@ -2136,10 +2166,15 @@ int runSimpleFoamV2(const std::string& caseDir)
         // what decides whether this case converges. The solver name is brae's own, as on the legacy
         // driver -- a log that said `smoothSolver:` or `GAMG:` would be asserting a capability.
         {
+            // The name says what RAN. With the case's `preconditioner DILU` honoured (item 74) the
+            // momentum solve IS OpenFOAM's PBiCGStab, and OpenFOAM spells that line `DILUPBiCGStab:`
+            // (lduMatrix::solver::New composes preconditioner + solver), so brae spells it the same and
+            // the two logs diff line for line. Without DILU it is a diagonal-preconditioned BiCGStab and
+            // says so -- still brae's own name for brae's own solver, never a capability it lacks.
             const char* uSolv = in.uSymGaussSeidel
                               ? (in.uGaussSeidelSymmetric ? "smoothSolver[symGaussSeidel]"
                                                           : "smoothSolver[GaussSeidel]")
-                              : "Jacobi-BiCGStab";
+                              : (in.preconU ? "DILUPBiCGStab" : "diagonalPBiCGStab");
             for (const auto& r : ws.report)
                 std::printf("%s:  Solving for %s, Initial residual = %g, Final residual = %g, "
                             "No Iterations %d\n",
