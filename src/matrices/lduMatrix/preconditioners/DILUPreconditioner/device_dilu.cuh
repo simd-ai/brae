@@ -61,6 +61,10 @@ struct DeviceDilu
     // launch loop). fwd = forward sweep order, bwd = backward.
     DeviceBuffer<label> fwdCells, bwdCells;
     std::vector<int>    fwdOff, bwdOff;
+    // ...and on the device, for the single-block walk (item 70): when no level outgrows one block the
+    // whole sweep is ONE launch with __syncthreads between levels, instead of a launch per level.
+    DeviceBuffer<label> fwdOffD, bwdOffD;
+    int maxLevelWidth = 0;
 
     int levels() const { return (int)fwdOff.size() - 1; }
 };

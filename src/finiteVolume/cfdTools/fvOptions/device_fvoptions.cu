@@ -14,6 +14,15 @@ namespace {
 // Hoisted here from the kEpsilon closure, which had the only copy. The energy equation needs the same
 // four kernels for fixedTemperatureConstraint, and two copies of a matrix manipulation this delicate
 // is how the two constraints stop agreeing about what OpenFOAM does.
+// A GATHER, and it has to be one (queue items 59/69). This ran as a scatter -- one thread per PINNED
+// cell, atomicAdd into each neighbour's source -- so a cell next to two or more pinned cells summed its
+// contributions in whatever order the blocks happened to finish, and the last bit of its source moved
+// from run to run. That is where the compressible mirror's nondeterminism entered: on sbMatched two
+// identical runs agreed through every stage of iteration 1 and diverged first in the epsilon SOURCE at
+// iteration 2, which is this kernel under the epsilon wall constraint (every wall-adjacent cell is
+// pinned, so cells beside two of them are common). Same terms, one per face, now summed by the
+// RECEIVING cell in face order -- the losort side then the owner side, the order gsCellUpdate and
+// gaussGrad already use -- so the result is fixed and the run is reproducible.
 __global__ void svGatherKernel(
     int           nC,
     const label*  mask,
@@ -29,18 +38,22 @@ __global__ void svGatherKernel(
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
-    if (!mask[c]) return;
-    const scalar v = value[c];
 
-    for (label q = ownerStart[c]; q < ownerStart[c + 1]; ++q)         // c is the owner of face q
-    {
-        atomicAdd(&source[nei[q]], -lower[q] * v);
-    }
-    for (label s = losortStart[c]; s < losortStart[c + 1]; ++s)       // c is the neighbour
+    // c RECEIVES from every face whose other cell is pinned. The face's coefficient is the one the
+    // scatter used: `lower` when the pinned cell owns the face, `upper` when it is the neighbour.
+    scalar acc = source[c];
+    for (label s = losortStart[c]; s < losortStart[c + 1]; ++s)       // c is the neighbour of face f
     {
         const label f = losort[s];
-        atomicAdd(&source[own[f]], -upper[f] * v);
+        const label o = own[f];
+        if (mask[o]) acc -= lower[f] * value[o];
     }
+    for (label f = ownerStart[c]; f < ownerStart[c + 1]; ++f)         // c is the owner of face f
+    {
+        const label n = nei[f];
+        if (mask[n]) acc -= upper[f] * value[n];
+    }
+    source[c] = acc;
 }
 
 
