@@ -220,6 +220,7 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
     if (nC <= 0) return false;
     static auto& cache = *new std::map<const void*, BiCGGraphCache>();   // leaked: no static dtor after context teardown
     BiCGGraphCache& c = cache[psi.data()];
+    cacheStat("bicg-graph", cache.size());
     for (auto* v : {&c.gDiag, &c.rA, &c.rA0, &c.pA, &c.yA, &c.AyA, &c.sA, &c.zA, &c.tA, &c.Ax, &c.gB}) v->resize(nC);
     c.gUpper.resize(nF); c.gLower.resize(nF);
     for (auto* v : {&c.gNormF, &c.gInit, &c.gSN, &c.gRN, &c.gFinal}) v->resize(1);

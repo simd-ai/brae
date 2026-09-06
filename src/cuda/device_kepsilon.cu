@@ -402,7 +402,7 @@ namespace
 // raises a flag the value and gradient kernels test on entry -- no host read, so the launch queue
 // never drains. The first version read the fingerprint back and synchronised at every request; on T3A
 // that cost 4-5 ms per outer iteration, more than the gradients it saved.
-constexpr int FP_MAX = 16;
+constexpr int FP_MAX = 24;   // 3 U components + V + 4 arrays per component boundary, with room to spare
 struct FpList
 {
     int n = 0;
@@ -478,8 +478,16 @@ const GradUMemo& deviceGradUShared(
     const DeviceBuffer<scalar>& Uy,
     const DeviceBuffer<scalar>& Uz)
 {
+    // Keyed on the MESH, never on the field. What makes a reuse legal is the device fingerprint below,
+    // not the key; and the legacy driver hands this a U whose address MOVES every outer iteration, so a
+    // key on Ux.data() added an entry per iteration -- nine gradient buffers plus the boundary values,
+    // 28 MiB per iteration on the 209,825-cell flat plate, 17.8 GiB of device memory by iteration 596
+    // (item 76, the device twin of item 75). dm.owner is the mesh's own addressing and lives as long as
+    // the mesh; the device pool can hand a freed mesh's block back, so the entry is rebuilt whenever the
+    // cell count disagrees and the fingerprint carries V to witness the rest.
     static auto& cache = *new std::map<const void*, GradUMemo>();
-    GradUMemo& m = cache[Ux.data()];
+    GradUMemo& m = cache[dm.owner.data()];
+    cacheStat("gradu-memo", cache.size());
     const int nC = dm.nCells;
     const DeviceBuffer<scalar>* Uc[3] = { &Ux, &Uy, &Uz };
     const int mode = gradUMemoMode();
@@ -505,14 +513,20 @@ const GradUMemo& deviceGradUShared(
         int* valid = reinterpret_cast<int*>(w + 2);
         int* hit   = reinterpret_cast<int*>(w + 3);
         FpList L;
+        bool full = false;
         auto add = [&](const void* p, int n, int isLabel)
         {
-            if (!p || n <= 0 || L.n >= FP_MAX) return;
-            L.ptr[L.n] = p; L.len[L.n] = n; L.isLabel[L.n] = isLabel;
-            L.start[L.n + 1] = L.start[L.n] + n;
-            ++L.n;
+            if (!p || n <= 0) return;
+            if (L.n >= FP_MAX) { full = true; return; }   // an input left out of the fingerprint is a
+            L.ptr[L.n] = p; L.len[L.n] = n; L.isLabel[L.n] = isLabel;   // STALE HIT; the memo stands down
+            L.start[L.n + 1] = L.start[L.n] + n;                        // instead (recomputing is the
+            ++L.n;                                                      // reference behaviour)
         };
         for (int k = 0; k < 3; ++k) add(Uc[k]->data(), nC, 0);
+        // The memo now spans outer iterations on every driver (it is keyed on the mesh), so the geometry
+        // has to be in the fingerprint: a mesh move changes gaussGrad without touching U, and V is the
+        // cheapest witness of OF's primitiveMesh::clearGeom.
+        add(dm.V.data(), nC, 0);
         for (int k = 0; k < 3; ++k)
         {
             const DeviceBoundary& db = dbU.comp[k];
@@ -523,10 +537,13 @@ const GradUMemo& deviceGradUShared(
             if (db.refGrad.size())       add(db.refGrad.data(), db.n, 0);
         }
         const int total = L.start[L.n];
-        cudaMemsetAsync(acc, 0, sizeof(unsigned long long), cudaStreamPerThread);
-        fpAllK<<<(total + 255) / 256, 256, 0, cudaStreamPerThread>>>(L, total, acc);
-        fpDecideK<<<1, 1, 0, cudaStreamPerThread>>>(acc, stored, valid, hit, mode, w + 4, w + 5);
-        skip = hit;
+        if (!full)
+        {
+            cudaMemsetAsync(acc, 0, sizeof(unsigned long long), cudaStreamPerThread);
+            fpAllK<<<(total + 255) / 256, 256, 0, cudaStreamPerThread>>>(L, total, acc);
+            fpDecideK<<<1, 1, 0, cudaStreamPerThread>>>(acc, stored, valid, hit, mode, w + 4, w + 5);
+            skip = hit;
+        }
         if (std::getenv("BRAE_GRADU_MEMO_STATS"))
         {
             unsigned long long cnt[2];

@@ -31,6 +31,7 @@ Coloring greedyColor(const std::vector<label>& owner, const std::vector<label>& 
 static const GridColoring& gsColoringFor(const DeviceLduView& A)
 {
     static std::map<const label*, GridColoring> colorCache;
+    cacheStat("gs-coloring", colorCache.size());
     auto it = colorCache.find(A.owner);
     if (it == colorCache.end())
     {
@@ -134,6 +135,7 @@ static void deviceSymGaussSeidelGraph(
     const DeviceGaussSeidelLevels& lv = gsLevelsFor(A);
     static auto& cache = *new std::map<const void*, GSGraphCache>();  // leaked (no static-dtor-after-context-teardown hazard)
     GSGraphCache& c = cache[psi.data()];
+    cacheStat("gs-graph", cache.size());
     const int nC = A.nCells, nF = A.nInternalFaces;
     c.gsDiag.resize(nC);
     c.gsUpper.resize(nF);
@@ -322,6 +324,7 @@ static void deviceSymGaussSeidelGraphFused(
     const DeviceGaussSeidelLevels& lv = gsLevelsFor(A0);
     static auto& cache = *new std::map<const void*, GSFusedGraphCache>();
     GSFusedGraphCache& c = cache[comps[0].psi->data()];
+    cacheStat("gs-fused-graph", cache.size());
     const int nC = A0.nCells, nF = A0.nInternalFaces;
     c.gsUpper.resize(nF);
     c.gsLower.resize(nF);
@@ -471,6 +474,7 @@ struct HostGSTopo
 const HostGSTopo& hostGsTopoFor(const DeviceLduView& A)
 {
     static auto& cache = *new std::map<const void*, HostGSTopo>();
+    cacheStat("host-gs-topo", cache.size());
     auto it = cache.find(A.owner);
     if (it != cache.end() && (it->second.nC != A.nCells || it->second.nF != A.nInternalFaces))
     {
@@ -561,8 +565,18 @@ void hostSymGaussSeidelFused(
 {
     const DeviceLduView& A0 = *comps[0].A;
     const HostGSTopo& topo = hostGsTopoFor(A0);
-    static auto& cache = *new std::map<const void*, HostGSCache>();
-    HostGSCache& c = cache[comps[0].psi->data()];
+    // ONE SCRATCH, not a cache keyed on the field. Everything below is working storage for THIS call --
+    // the matrix and field copied down, the sweep's bPrime, the residual vectors -- and nothing survives
+    // it, so there is nothing to key. Keyed on psi.data() (which is what the GRAPH caches must do,
+    // because a graph bakes pointers) it leaked: the legacy driver hands this a psi whose address moves
+    // between iterations, so every iteration added an entry holding ~27 MB of PINNED host memory that is
+    // never freed -- 29 MB/iteration measured on the composed flat plate, 6.2 GB by iteration 200, and
+    // the tutorial gate's run reached 54 GB before it was stopped. Pinned memory makes it worse than an
+    // ordinary leak: it is page-locked and comes out of the machine, not the process's swap.
+    // NOT thread_local: the sweep below runs in worker threads, and a thread_local is never captured by
+    // a lambda -- each thread performs its own TLS lookup, finds an uninitialised object and dereferences
+    // it. That segfaulted on the first solve. One leaked instance, as the file's other caches are.
+    static auto& c = *new HostGSCache();
     const int nC = A0.nCells, nF = A0.nInternalFaces;
     if (c.nC != nC || c.nF != nF)
     {
@@ -626,13 +640,18 @@ void hostSymGaussSeidelFused(
     {
         // the sweeps: one thread per active component (pure CPU; nothing here touches the device)
         std::vector<std::thread> pool;
+        const scalar* up = c.upper;
+        const scalar* lo = c.lower;
         for (int k = 0; k < nComp; ++k)
         {
             if (!active[k]) continue;
-            pool.emplace_back([&, k]()
+            const scalar* dg = c.diag[k];
+            const scalar* bb = c.b[k];
+            scalar* ps = c.psi[k];
+            scalar* bp = c.bPrime[k].data();
+            pool.emplace_back([=, &topo]()
             {
-                for (int sw = 0; sw < sweepsPer; ++sw)
-                    hostSweep(topo, c.upper, c.lower, c.diag[k], c.b[k], c.psi[k], c.bPrime[k].data(), symmetric);
+                for (int sw = 0; sw < sweepsPer; ++sw) hostSweep(topo, up, lo, dg, bb, ps, bp, symmetric);
             });
         }
         for (auto& th : pool) th.join();
@@ -951,6 +970,7 @@ static scalar deviceSymGaussSeidelF32(
     const GridColoring& gc = gsColoringFor(A);
     static auto& cache = *new std::map<const void*, GSFP32Cache>();
     GSFP32Cache& c = cache[psi.data()];
+    cacheStat("gs-fp32", cache.size());
     const int nC = A.nCells, nF = A.nInternalFaces;
     c.dF.resize(nC);
     c.uF.resize(nF);

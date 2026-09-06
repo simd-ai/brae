@@ -466,6 +466,7 @@ const DeviceGaussSeidelLevels& gsLevelsFor(const DeviceLduView& A)
     // matrix whose values are reassembled every outer iteration reuses them. Leaked deliberately, as the
     // colouring cache is, so no static destructor runs after the CUDA context is torn down.
     static auto& cache = *new std::map<const label*, DeviceGaussSeidelLevels>();
+    cacheStat("gs-levels", cache.size());
     auto it = cache.find(A.owner);
     // A recycled owner pointer (the device pool hands equal-sized blocks back) must not replay another
     // mesh's levels: the entry has to match the view's sizes, or it is rebuilt.

@@ -1178,6 +1178,14 @@ add_test(NAME dilu_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/dilu_vs_openfoam.sh)
 set_tests_properties(dilu_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 
+add_test(NAME host_smoother_memory
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/host_smoother_memory.sh)
+set_tests_properties(host_smoother_memory PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
+
+add_test(NAME device_memory_flat
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/device_memory_flat.sh)
+set_tests_properties(device_memory_flat PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
+
 add_test(NAME uresidual_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/uresidual_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO
