@@ -22,10 +22,12 @@ void bcValueKernel(
     const scalar* __restrict__ internal,
     const scalar* __restrict__ rgr,     // fixedGradient g (null/zero elsewhere)
     const scalar* __restrict__ dcv,
-    scalar* __restrict__ value)
+    scalar* __restrict__ value,
+    const int* __restrict__ skipIf)     // device flag: when set, this launch is a no-op (the grad(U) memo hit)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    if (skipIf && *skipIf) return;
 
     if (type[i] == 8)      return;                                                       // coupled (processor): the
                                                                                          // face value is the halo-
@@ -161,13 +163,13 @@ void bcMatrixFluxKernel(
 } // namespace
 
 
-void deviceBCValue(const DeviceBoundary& db, const DeviceBuffer<scalar>& internal, DeviceBuffer<scalar>& value)
+void deviceBCValue(const DeviceBoundary& db, const DeviceBuffer<scalar>& internal, DeviceBuffer<scalar>& value, const int* skipIf)
 {
     value.resize(db.n);
     bcValueKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.refValue.data(), db.valueFraction.data(),
                                           db.faceCell.data(), internal.data(),
                                           db.refGrad.size() ? db.refGrad.data() : nullptr,
-                                          db.deltaCoeffs.data(), value.data());
+                                          db.deltaCoeffs.data(), value.data(), skipIf);
     cudaCheck(cudaGetLastError(), "bcValue");
 }
 

@@ -118,7 +118,8 @@ inline DeviceBoundary buildDeviceBoundary(
 // inflow phiBnd<0 -> fixedValue(1, =inletValue), outflow phiBnd>=0 -> zeroGradient(0). Only ioMask=1 faces change.
 // Call at the start of each SIMPLE step (before assembly), with the previous step's boundary flux (matches OF).
 void deviceUpdateInletOutlet(DeviceBoundary& db, const DeviceBuffer<scalar>& phiBnd);
-void deviceBCValue(const DeviceBoundary& db, const DeviceBuffer<scalar>& internal, DeviceBuffer<scalar>& value);
+void deviceBCValue(const DeviceBoundary& db, const DeviceBuffer<scalar>& internal, DeviceBuffer<scalar>& value,
+                   const int* skipIf = nullptr);   // skipIf: device flag, the launch is a no-op when set
 void deviceBCLaplacianCoeffs(const DeviceBoundary& db, const DeviceBuffer<scalar>& gammaCell,
                              DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC);
 // variant taking gamma per BOUNDARY FACE (for nuEff with the true wall nut, not the cell value).

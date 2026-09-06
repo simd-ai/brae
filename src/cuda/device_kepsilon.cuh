@@ -42,6 +42,31 @@ void deviceGbyNu(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                  const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                  DeviceBuffer<scalar>& gByNu, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr);
 
+// THE grad(U) MEMO (item 65). OpenFOAM computes fvc::grad(U) once per U state when fvSolution caches it
+// (gradScheme.C: the cached field is reused while the field's event number is unchanged); brae's V2
+// iteration asked for it at four sites -- twice on the predictor's U, twice on the corrected U -- and
+// computed it four times (12 gradKernel launches, ~4.7 ms of the composed flat plate's 60 ms/it). Every
+// site evaluates U's boundary values through the same deviceBCValue on the same dbU, so at one U state
+// the four are the same bits. This shares them: the Gauss gradient of each component and the boundary
+// values it used, keyed on a FINGERPRINT of everything the computation reads that can move between
+// sites -- the three internal fields and, per component, the boundary type, refValue, valueFraction and
+// refGrad arrays -- so reuse never rests on knowing every place U is written. A hit hands back the same
+// bits a fresh computation would; interface (cyclic/AMI) contributions are added by the caller on a
+// copy, as before. BRAE_GRADU_MEMO=0 recomputes at every site (the identity arm); =stale never
+// recomputes after the first (the gate's fail-proof: it must change the run).
+struct GradUMemo
+{
+    int nC = 0;
+    bool valid = false;
+    unsigned long long fp = 0;
+    DeviceBuffer<scalar> gx[3], gy[3], gz[3];     // gaussGrad(U_k), unlimited, interior + boundary faces
+    DeviceBuffer<scalar> ub[3];                   // the boundary values it used (deviceBCValue per component)
+    DeviceBuffer<unsigned long long> dev;         // device state: acc, stored fingerprint, valid, hit, nHit, nMiss
+    unsigned long long computed = 0, reused = 0;  // read only under BRAE_GRADU_MEMO_STATS
+};
+const GradUMemo& deviceGradUShared(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
+                                   const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz);
+
 // gradU tensor (9*nC, OF convention column i = gaussGrad(U_i)) + GbyNu from a prebuilt gradU. Shared by k-eps
 // (GbyNu) and kOmegaSST (which also needs gradU for S2 = 2 magSqr(symm(gradU))).
 void deviceGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,

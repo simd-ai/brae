@@ -1097,6 +1097,13 @@ set_tests_properties(gs_smoother_notice PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3
 add_executable(gs_ladder tests/gs_ladder.cu)
 target_include_directories(gs_ladder PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(gs_ladder PRIVATE brae_core)
+
+# Isolated side-by-side experiment: the target is opt-in and never replaces the production smoother.
+add_executable(factory_sym_gauss_seidel_bench EXCLUDE_FROM_ALL
+    factory/benchmark_sym_gauss_seidel.cu)
+target_include_directories(factory_sym_gauss_seidel_bench PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(factory_sym_gauss_seidel_bench PRIVATE brae_core)
+
 add_test(NAME gs_ladder_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/gs_ladder_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A)
@@ -1138,6 +1145,14 @@ set_tests_properties(gs_fused_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90
 add_test(NAME gs_level_gather_identity
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/gs_level_gather_identity.sh)
 set_tests_properties(gs_level_gather_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+add_test(NAME gs_host_smoother_identity
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/gs_host_smoother_identity.sh)
+set_tests_properties(gs_host_smoother_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+add_test(NAME gradu_memo_identity
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/gradu_memo_identity.sh)
+set_tests_properties(gradu_memo_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 
 add_test(NAME uresidual_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/uresidual_vs_openfoam.sh

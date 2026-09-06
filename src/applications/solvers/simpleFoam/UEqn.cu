@@ -2,6 +2,7 @@
 #include "UEqn.cuh"
 #include "device_blas.cuh"
 #include "device_divdevreff.cuh"
+#include "device_kepsilon.cuh"   // deviceGradUShared: grad(U) once per U state (item 65)
 #include "device_simple.cuh"
 #include <cmath>
 #include <stdexcept>
@@ -55,12 +56,14 @@ void assembleUEqn(
             // the components are gathered into one. Three device copies per assembly; the alternative is
             // a second kernel signature.
             const DeviceBuffer<scalar>* Usrc[3] = {&Ux, &Uy, &Uz};
-            DeviceBuffer<scalar> Uarr[3], gx[3], gy[3], gz[3], ub;
+            DeviceBuffer<scalar> Uarr[3], gx[3], gy[3], gz[3];
+            const GradUMemo& gm = deviceGradUShared(dm, dbU, Ux, Uy, Uz);   // grad(U) at this U, once (item 65)
             for (int k = 0; k < 3; ++k)
             {
                 deviceCopy(Uarr[k], *Usrc[k]);
-                deviceBCValue(dbU.comp[k], *Usrc[k], ub);
-                deviceGaussGrad(dm, *Usrc[k], ub, gx[k], gy[k], gz[k]);
+                deviceCopy(gx[k], gm.gx[k]);
+                deviceCopy(gy[k], gm.gy[k]);
+                deviceCopy(gz[k], gm.gz[k]);
             }
             deviceDivLimitedVCoeffs(dm, *in.phiInt, Uarr, gx, gy, gz,
                                     2.0 / std::fmax(in.schemeCoeff, 1e-15),
@@ -169,11 +172,12 @@ void assembleUEqn(
     {
         const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
         DeviceBuffer<scalar> gxc[3], gyc[3], gzc[3];
+        const GradUMemo& gm = deviceGradUShared(dm, dbU, Ux, Uy, Uz);       // the same grad(U) as the sites below
         for (int k = 0; k < 3; ++k)
         {
-            DeviceBuffer<scalar> ub;
-            deviceBCValue(dbU.comp[k], *U[k], ub);
-            deviceGaussGrad(dm, *U[k], ub, gxc[k], gyc[k], gzc[k]);
+            deviceCopy(gxc[k], gm.gx[k]);
+            deviceCopy(gyc[k], gm.gy[k]);
+            deviceCopy(gzc[k], gm.gz[k]);
         }
         if (in.snGradLimitCoeff > 0.0)
         {
@@ -219,13 +223,15 @@ void assembleUEqn(
     if (in.scheme == cpu::DivScheme::linearUpwindV)
     {
         const DeviceBuffer<scalar>* Usrc[3] = {&Ux, &Uy, &Uz};
-        DeviceBuffer<scalar> gx[3], gy[3], gz[3], ub, cx, cy, cz;
+        DeviceBuffer<scalar> gx[3], gy[3], gz[3], cx, cy, cz;
+        const GradUMemo& gm = deviceGradUShared(dm, dbU, Ux, Uy, Uz);
         for (int k = 0; k < 3; ++k)
         {
-            deviceBCValue(dbU.comp[k], *Usrc[k], ub);
-            deviceGaussGrad(dm, *Usrc[k], ub, gx[k], gy[k], gz[k]);
+            deviceCopy(gx[k], gm.gx[k]);
+            deviceCopy(gy[k], gm.gy[k]);
+            deviceCopy(gz[k], gm.gz[k]);
             if (in.gradULimitK > 0.0)
-                deviceCellLimitGrad(dm, *Usrc[k], ub, gx[k], gy[k], gz[k], in.gradULimitK);
+                deviceCellLimitGrad(dm, *Usrc[k], gm.ub[k], gx[k], gy[k], gz[k], in.gradULimitK);
         }
         deviceLinearUpwindVCorr(dm, *in.phiInt, gx, gy, gz, Ux, Uy, Uz, cx, cy, cz);
         const DeviceBuffer<scalar>* cc[3] = {&cx, &cy, &cz};
@@ -238,14 +244,16 @@ void assembleUEqn(
     if (corrFac != 0.0)
     {
         const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
+        const GradUMemo& gm = deviceGradUShared(dm, dbU, Ux, Uy, Uz);
         for (int k = 0; k < 3; ++k)
         {
-            DeviceBuffer<scalar> ub, gx, gy, gz, lu;
-            deviceBCValue(dbU.comp[k], *U[k], ub);
-            deviceGaussGrad(dm, *U[k], ub, gx, gy, gz);
+            DeviceBuffer<scalar> gx, gy, gz, lu;
+            deviceCopy(gx, gm.gx[k]);
+            deviceCopy(gy, gm.gy[k]);
+            deviceCopy(gz, gm.gz[k]);
             // `linearUpwind <name>` where <name> resolves to `cellLimited Gauss linear <k>`.
             if (in.gradULimitK > 0.0)
-                deviceCellLimitGrad(dm, *U[k], ub, gx, gy, gz, in.gradULimitK);
+                deviceCellLimitGrad(dm, *U[k], gm.ub[k], gx, gy, gz, in.gradULimitK);
             deviceLinearUpwindCorr(dm, *in.phiInt, gx, gy, gz, lu);
             deviceAxpy(-corrFac, lu, M.source[k]);
         }

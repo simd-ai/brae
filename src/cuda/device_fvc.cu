@@ -72,10 +72,12 @@ void gradKernel(
     const scalar* __restrict__ V,
     scalar* __restrict__ gx,
     scalar* __restrict__ gy,
-    scalar* __restrict__ gz)
+    scalar* __restrict__ gz,
+    const int* __restrict__ skipIf)     // device flag: when set, this launch is a no-op (the grad(U) memo hit)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
+    if (skipIf && *skipIf) return;
 
     scalar sx = 0.0, sy = 0.0, sz = 0.0;
     for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)   // +owner internal
@@ -132,7 +134,8 @@ void deviceGaussGrad(
     const DeviceBuffer<scalar>& bval,
     DeviceBuffer<scalar>& gx,
     DeviceBuffer<scalar>& gy,
-    DeviceBuffer<scalar>& gz)
+    DeviceBuffer<scalar>& gz,
+    const int* skipIf)
 {
     gx.resize(dm.nCells);
     gy.resize(dm.nCells);
@@ -141,7 +144,7 @@ void deviceGaussGrad(
                                             dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(), vol.data(),
                                             dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
                                             dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndGFace.data(), bval.data(),
-                                            dm.V.data(), gx.data(), gy.data(), gz.data());
+                                            dm.V.data(), gx.data(), gy.data(), gz.data(), skipIf);
     cudaCheck(cudaGetLastError(), "gaussGrad");
 }
 
