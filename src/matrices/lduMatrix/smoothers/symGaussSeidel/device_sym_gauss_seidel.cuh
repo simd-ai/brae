@@ -107,4 +107,28 @@ void deviceSymGaussSeidelSweepExact(const DeviceLduView& A,
                                     const DeviceGaussSeidelLevels& lv,
                                     bool symmetric = true);
 
+// THE FUSED WALK (item 60a). A vector fvMatrix's components share the topology and the upper/lower
+// coefficients; only the folded diagonal (fvMatrix::addBoundaryDiag per component) and the source are per
+// component, and OpenFOAM solves them one after another with nothing in between (fvMatrixSolve.C,
+// solveSegregated). One component's sweep reads only its own psi, diag and source, so walking the levels
+// ONCE and updating every component at each level performs the same per-cell arithmetic in the same
+// level order as walking them once per component -- bit-identical -- while paying the per-level
+// dependent-launch latency (measured ~2.7 us; 929 levels x 2 halves on the composed flat plate) once
+// instead of once per component. `active[k]` (device) lets a component that has already met its own
+// stopping rule sit out the remaining sweeps, which is what keeps each component's sweep count its own.
+constexpr int GS_FUSED_MAX = 3;
+struct GSFusedOperands
+{
+    int nComp = 0;
+    const scalar* diag[GS_FUSED_MAX] = {};
+    const scalar* b[GS_FUSED_MAX] = {};
+    scalar*       psi[GS_FUSED_MAX] = {};
+    const int*    active = nullptr;     // one flag per component; nullptr = all active
+};
+// `A` supplies the topology and the SHARED upper/lower; the per-component diag/b/psi come from `ops`.
+void deviceSymGaussSeidelSweepExactFused(const DeviceLduView& A,
+                                         const GSFusedOperands& ops,
+                                         const DeviceGaussSeidelLevels& lv,
+                                         bool symmetric = true);
+
 }   // namespace brae

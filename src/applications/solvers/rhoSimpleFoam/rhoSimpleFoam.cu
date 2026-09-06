@@ -453,22 +453,48 @@ Residuals rhoSimpleStep(
         // in.solutionD is derived from the empty patches exactly as calcDirections does
         // (solution_directions.cuh) and the knocked-out component is not solved, as in OpenFOAM.
         scalar uInitialResidual = 0.0;
+        // Every solved component's system first (its own folded diagonal and source, the shared
+        // upper/lower, its normFactor -- none reads another component's psi), then the solves: the
+        // Gauss-Seidel walks FUSED into one level walk per sweep (item 60a, byte-identical to one walk
+        // per component, tests/gs_fused_identity; BRAE_GS_FUSED=0 restores those), BiCGStab per
+        // component as before.
+        DeviceBuffer<scalar> diagC[3], b[3];
+        DeviceLduView A[3];
+        scalar nf[3] = {0.0, 0.0, 0.0};
+        int solved[3];
+        int nSolved = 0;
         for (int k = 0; k < 3; ++k)
         {
             if (in.solutionD[k] < 0) continue;
-            DeviceBuffer<scalar> diagC, b;
-            deviceFold(dm, Mp.relaxed ? Mp.relaxedDiag : Mp.diag, Mp.source[k], Mp.iC[k], Mp.bC[k], diagC, b);
-            const DeviceLduView A = foldedViewM(dm, Mp, diagC);
-            const scalar nf = deviceNormFactor(A, *U[k], b, w.ones);
-            DeviceSolverPerf perf;
-            if (in.uSymGaussSeidel)
-                deviceSymGaussSeidel(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIterU, &perf, in.minIterU,
-                                     /*nSweeps*/1, in.uGaussSeidelSymmetric);
-            else
-                perf = deviceJacobiBiCGStab(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIterU, /*checkEvery=*/1, in.minIterU,
-                                            in.preconU);
-            uInitialResidual = std::max(uInitialResidual, perf.initialResidual);
+            deviceFold(dm, Mp.relaxed ? Mp.relaxedDiag : Mp.diag, Mp.source[k], Mp.iC[k], Mp.bC[k], diagC[k], b[k]);
+            A[k] = foldedViewM(dm, Mp, diagC[k]);
+            nf[k] = deviceNormFactor(A[k], *U[k], b[k], w.ones);
+            solved[nSolved++] = k;
         }
+        DeviceSolverPerf perfs[3];
+        if (in.uSymGaussSeidel)
+        {
+            GSFusedComponent comps[3];
+            DeviceSolverPerf fp[3];
+            for (int i = 0; i < nSolved; ++i)
+            {
+                const int k = solved[i];
+                comps[i] = {&A[k], &b[k], U[k], nf[k]};
+            }
+            deviceSymGaussSeidelFused(nSolved, comps, in.tolU, in.relTolU, in.maxIterU, in.minIterU, /*nSweeps*/1,
+                                      in.uGaussSeidelSymmetric, fp);
+            for (int i = 0; i < nSolved; ++i) perfs[solved[i]] = fp[i];
+        }
+        else
+        {
+            for (int i = 0; i < nSolved; ++i)
+            {
+                const int k = solved[i];
+                perfs[k] = deviceJacobiBiCGStab(A[k], b[k], *U[k], nf[k], in.tolU, in.relTolU, in.maxIterU, /*checkEvery=*/1,
+                                                in.minIterU, in.preconU);
+            }
+        }
+        for (int i = 0; i < nSolved; ++i) uInitialResidual = std::max(uInitialResidual, perfs[solved[i]].initialResidual);
         res["U"] = uInitialResidual;
     }
     sd.vectors("Upred", f.Ux, f.Uy, f.Uz);

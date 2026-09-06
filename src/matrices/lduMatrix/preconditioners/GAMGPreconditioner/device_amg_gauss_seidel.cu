@@ -13,6 +13,7 @@
 #include "device_blas.cuh"         // deviceCopy / deviceAxpy / deviceSumMagInto
 #include <cuda_runtime.h>
 #include <map>
+#include <string>
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
@@ -87,6 +88,7 @@ struct GSGraphCache
     cudaGraph_t graph = nullptr;
     cudaGraphConditionalHandle handle{};
     const void* key = nullptr;
+    int scratchEpoch = -1;        // deviceReductionScratchEpoch() at capture
     // tol/relTol/maxIter/minIter/nSweeps/symmetric are ARGUMENTS of the captured kernels, so a solve
     // that changes any of them on the same field (kFinal after k, a tightened arm in a gate) must
     // re-capture. Keying on psi alone replayed the previous solve's rule.
@@ -161,9 +163,11 @@ static void deviceSymGaussSeidelGraph(
         return;
     }
     cudaMemsetAsync(c.gIter.data(), 0, sizeof(int), cudaStreamPerThread);
+    // the reduction scratch is freed and regrown on demand; a graph holding the old pointer must rebuild
+    const int epoch = deviceReductionScratchEpoch();
     const bool recapture = !c.exec || c.key != psi.data() || c.tol != tol || c.relTol != relTol
                         || c.maxIter != maxIter || c.minIter != minIter || c.sweepsPer != sweepsPer
-                        || c.symmetric != symmetric;
+                        || c.symmetric != symmetric || c.scratchEpoch != epoch;
     if (recapture)
     {
         if (c.exec)
@@ -199,7 +203,7 @@ static void deviceSymGaussSeidelGraph(
         cudaGraph_t tmp;
         cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &tmp), "gs capture end");
         cudaCheck(cudaGraphInstantiate(&c.exec, c.graph, 0), "gs graph instantiate");
-        c.key = psi.data();
+        c.key = psi.data(); c.scratchEpoch = epoch;
         c.tol = tol; c.relTol = relTol; c.maxIter = maxIter; c.minIter = minIter;
         c.sweepsPer = sweepsPer; c.symmetric = symmetric;
     }
@@ -214,7 +218,247 @@ static void deviceSymGaussSeidelGraph(
     if (std::getenv("BRAE_GS_DEBUG"))
         std::printf("    GS[dev] init=%.4e final=%.4e sweeps=%d (relTol=%.2g nSweeps=%d)\n", initRes, finalRes, nIter, relTol, sweepsPer);
 }
+
+// ---------------------------------------------------------------------------------------------------
+// The FUSED loop (item 60a): the components of one vector matrix in one WHILE graph. Per iteration of the
+// body: nSweeps fused sweeps over the still-active components, then every component's residual
+// (the same amul / copy / axpy / sumMag on its own diag, source and psi as the scalar graph runs), then
+// ONE stop kernel that applies gsSetCondK's test to each active component -- counting its sweeps,
+// recording its final residual, retiring it when it stops -- and keeps the loop alive while any remains.
+// A component's sequence of sweeps, residual evaluations and its stopping point are therefore exactly
+// what the scalar graph gives it; the only thing shared is the launch.
+__global__
+void gsFusedCondK(
+    cudaGraphConditionalHandle h,
+    int nComp,
+    const scalar* res,
+    scalar tol,
+    const scalar* init,
+    scalar relTol,
+    int* iter,
+    int maxIter,
+    int minIter,
+    int sweepsPer,
+    int* active,
+    scalar* fin)
+{
+    if (threadIdx.x || blockIdx.x) return;
+    unsigned any = 0u;
+    for (int k = 0; k < nComp; ++k)
+    {
+        if (!active[k]) continue;
+        const int it = (iter[k] += sweepsPer);
+        const scalar r = res[k];
+        fin[k] = r;
+        const bool converged = ((r < tol) || (r < relTol * init[k])) && (it >= minIter);
+        const bool stop = converged || (it >= maxIter);
+        if (stop) active[k] = 0;
+        else      any = 1u;
+    }
+    cudaGraphSetConditional(h, any);
+}
+__global__
+void gsScaleInvNK(int n, scalar* x, const scalar* nf)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) x[i] = x[i] / nf[i];
+}
+struct GSFusedGraphCache
+{
+    cudaGraphExec_t exec = nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphConditionalHandle handle{};
+    int nComp = 0;
+    const void* psiKey[GS_FUSED_MAX] = {};
+    const void* owner = nullptr;
+    int nC = -1, scratchEpoch = -1;
+    scalar tol = -1, relTol = -1;
+    int    maxIter = -1, minIter = -1, sweepsPer = -1;
+    bool   symmetric = true;
+    DeviceBuffer<scalar> gsUpper, gsLower;                                     // shared, stable
+    DeviceBuffer<scalar> gsDiag[GS_FUSED_MAX], gsB[GS_FUSED_MAX], Ax[GS_FUSED_MAX], r[GS_FUSED_MAX];
+    DeviceBuffer<scalar> gNormF, gInit, gRes, gFinal;                          // [nComp]
+    DeviceBuffer<int>    gIter, gActive;                                       // [nComp]
+    ~GSFusedGraphCache()
+    {
+        if (exec) cudaGraphExecDestroy(exec);
+        if (graph) cudaGraphDestroy(graph);
+    }
+};
+static void deviceSymGaussSeidelGraphFused(
+    int nComp,
+    const GSFusedComponent* comps,
+    scalar tol,
+    scalar relTol,
+    int maxIter,
+    int minIter,
+    int sweepsPer,
+    bool symmetric,
+    DeviceSolverPerf* perf)
+{
+    const DeviceLduView& A0 = *comps[0].A;
+    const DeviceGaussSeidelLevels& lv = gsLevelsFor(A0);
+    static auto& cache = *new std::map<const void*, GSFusedGraphCache>();
+    GSFusedGraphCache& c = cache[comps[0].psi->data()];
+    const int nC = A0.nCells, nF = A0.nInternalFaces;
+    c.gsUpper.resize(nF);
+    c.gsLower.resize(nF);
+    for (auto* v : {&c.gNormF, &c.gInit, &c.gRes, &c.gFinal}) v->resize(nComp);
+    c.gIter.resize(nComp);
+    c.gActive.resize(nComp);
+    cudaMemcpyAsync(c.gsUpper.data(), A0.upper, nF*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    cudaMemcpyAsync(c.gsLower.data(), A0.lower, nF*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    scalar nfH[GS_FUSED_MAX];
+    DeviceLduView sA[GS_FUSED_MAX];
+    GSFusedOperands ops;
+    ops.nComp = nComp;
+    ops.active = c.gActive.data();
+    for (int k = 0; k < nComp; ++k)
+    {
+        c.gsDiag[k].resize(nC);
+        c.gsB[k].resize(nC);
+        c.Ax[k].resize(nC);
+        c.r[k].resize(nC);
+        cudaMemcpyAsync(c.gsDiag[k].data(), comps[k].A->diag,   nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        cudaMemcpyAsync(c.gsB[k].data(),    comps[k].b->data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        nfH[k] = comps[k].normFactor;
+        sA[k] = *comps[k].A;
+        sA[k].diag  = c.gsDiag[k].data();
+        sA[k].upper = c.gsUpper.data();
+        sA[k].lower = c.gsLower.data();
+        ops.diag[k] = c.gsDiag[k].data();
+        ops.b[k]    = c.gsB[k].data();
+        ops.psi[k]  = comps[k].psi->data();
+    }
+    cudaMemcpyAsync(c.gNormF.data(), nfH, nComp*sizeof(scalar), cudaMemcpyHostToDevice, cudaStreamPerThread);
+    // every component's initial residual, one read (sync 1 of 2); this also pre-sizes the scratch
+    for (int k = 0; k < nComp; ++k)
+    {
+        deviceAmul(sA[k], *comps[k].psi, c.Ax[k]);
+        deviceCopy(c.r[k], c.gsB[k]);
+        deviceAxpy(-1.0, c.Ax[k], c.r[k]);
+        deviceSumMagInto(c.r[k], c.gInit.data() + k);
+    }
+    gsScaleInvNK<<<1, 32, 0, cudaStreamPerThread>>>(nComp, c.gInit.data(), c.gNormF.data());
+    scalar initH[GS_FUSED_MAX];
+    cudaCheck(cudaMemcpyAsync(initH, c.gInit.data(), nComp*sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "gs fused init D2H");
+    cudaStreamSynchronize(cudaStreamPerThread);
+    int activeH[GS_FUSED_MAX];
+    int nActive = 0;
+    for (int k = 0; k < nComp; ++k)
+    {
+        perf[k] = {initH[k], initH[k], 0};
+        activeH[k] = (initH[k] < tol && minIter <= 0) ? 0 : 1;      // the scalar graph's early-out, per component
+        nActive += activeH[k];
+    }
+    if (nActive == 0) return;
+    cudaMemcpyAsync(c.gActive.data(), activeH, nComp*sizeof(int), cudaMemcpyHostToDevice, cudaStreamPerThread);
+    cudaMemsetAsync(c.gIter.data(), 0, nComp*sizeof(int), cudaStreamPerThread);
+    cudaMemcpyAsync(c.gFinal.data(), c.gInit.data(), nComp*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    const int epoch = deviceReductionScratchEpoch();
+    bool same = c.exec && c.nComp == nComp && c.tol == tol && c.relTol == relTol && c.maxIter == maxIter
+             && c.minIter == minIter && c.sweepsPer == sweepsPer && c.symmetric == symmetric
+             && c.scratchEpoch == epoch && c.owner == (const void*)A0.owner && c.nC == nC;
+    for (int k = 0; k < nComp; ++k) same = same && c.psiKey[k] == (const void*)comps[k].psi->data();
+    if (!same)
+    {
+        if (c.exec)
+        {
+            cudaGraphExecDestroy(c.exec);
+            c.exec = nullptr;
+        }
+        if (c.graph)
+        {
+            cudaGraphDestroy(c.graph);
+            c.graph = nullptr;
+        }
+        cudaCheck(cudaGraphCreate(&c.graph, 0), "gs fused graph create");
+        cudaCheck(cudaGraphConditionalHandleCreate(&c.handle, c.graph, 1, cudaGraphCondAssignDefault), "gs fused cond handle");
+        cudaGraphNodeParams cp = {};
+        cp.type = cudaGraphNodeTypeConditional;
+        cp.conditional.handle = c.handle;
+        cp.conditional.type = cudaGraphCondTypeWhile;
+        cp.conditional.size = 1;
+        cudaGraphNode_t cnode;
+        cudaCheck(cudaGraphAddNode(&cnode, c.graph, nullptr, nullptr, 0, &cp), "gs fused cond node");
+        cudaGraph_t body = cp.conditional.phGraph_out[0];
+        cudaCheck(cudaStreamBeginCaptureToGraph(cudaStreamPerThread, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal), "gs fused capture begin");
+        for (int sw = 0; sw < sweepsPer; ++sw) deviceSymGaussSeidelSweepExactFused(sA[0], ops, lv, symmetric);
+        for (int k = 0; k < nComp; ++k)
+        {
+            deviceAmul(sA[k], *comps[k].psi, c.Ax[k]);
+            deviceCopy(c.r[k], c.gsB[k]);
+            deviceAxpy(-1.0, c.Ax[k], c.r[k]);
+            deviceSumMagInto(c.r[k], c.gRes.data() + k);
+        }
+        gsScaleInvNK<<<1, 32, 0, cudaStreamPerThread>>>(nComp, c.gRes.data(), c.gNormF.data());
+        gsFusedCondK<<<1, 1, 0, cudaStreamPerThread>>>(c.handle, nComp, c.gRes.data(), tol, c.gInit.data(), relTol,
+                                                       c.gIter.data(), maxIter, minIter, sweepsPer,
+                                                       c.gActive.data(), c.gFinal.data());
+        cudaGraph_t tmp;
+        cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &tmp), "gs fused capture end");
+        cudaCheck(cudaGraphInstantiate(&c.exec, c.graph, 0), "gs fused graph instantiate");
+        c.nComp = nComp;
+        for (int k = 0; k < nComp; ++k) c.psiKey[k] = comps[k].psi->data();
+        c.owner = A0.owner; c.nC = nC; c.scratchEpoch = epoch;
+        c.tol = tol; c.relTol = relTol; c.maxIter = maxIter; c.minIter = minIter;
+        c.sweepsPer = sweepsPer; c.symmetric = symmetric;
+    }
+    cudaCheck(cudaGraphLaunch(c.exec, cudaStreamPerThread), "gs fused graph launch");
+    scalar finH[GS_FUSED_MAX];
+    int iterH[GS_FUSED_MAX];
+    cudaCheck(cudaMemcpyAsync(finH,  c.gFinal.data(), nComp*sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "gs fused final D2H");
+    cudaCheck(cudaMemcpyAsync(iterH, c.gIter.data(),  nComp*sizeof(int),    cudaMemcpyDeviceToHost, cudaStreamPerThread), "gs fused iter D2H");
+    cudaStreamSynchronize(cudaStreamPerThread);                                        // sync 2 of 2
+    for (int k = 0; k < nComp; ++k)
+        if (activeH[k]) perf[k] = {initH[k], finH[k], iterH[k]};
+}
 #endif // CUDART_VERSION >= 13000
+
+void deviceSymGaussSeidelFused(
+    int nComp,
+    const GSFusedComponent* comps,
+    scalar tol,
+    scalar relTol,
+    int maxIter,
+    int minIter,
+    int nSweeps,
+    bool symmetric,
+    DeviceSolverPerf* perf)
+{
+    // BRAE_GS_FUSED=0 restores the per-component walks (the identity gate's other arm). The scalar
+    // path's own opt-ins and its host loop are honoured by falling back to it.
+    static const bool fusedOff = []()
+    {
+        const char* e = std::getenv("BRAE_GS_FUSED");
+        return e && std::string(e) == "0";
+    }();
+    bool shared = nComp >= 2 && nComp <= GS_FUSED_MAX && !fusedOff;
+    for (int k = 1; k < nComp && shared; ++k)
+        shared = comps[k].A->upper == comps[0].A->upper && comps[k].A->lower == comps[0].A->lower
+              && comps[k].A->owner == comps[0].A->owner && comps[k].A->nCells == comps[0].A->nCells;
+#ifdef BRAE_HAS_GS_DEVICE
+    static const bool hostLoop = std::getenv("BRAE_GS_HOST_LOOP") != nullptr;
+    static const bool optIn = std::getenv("BRAE_TURB_FP32") != nullptr || std::getenv("BRAE_TURB_JACOBI") != nullptr;
+    if (shared && !hostLoop && !optIn)
+    {
+        static bool announced = false;
+        if (!announced)
+        {
+            announced = true;
+            // which walk the mesh takes (device_sym_gauss_seidel.cu: one block when no level outgrows it)
+            const DeviceGaussSeidelLevels& lv = gsLevelsFor(*comps[0].A);
+            std::printf("  symGaussSeidel: fused walk (%d components per level, %d levels, widest %d: %s); BRAE_GS_FUSED=0 restores one walk per component\n",
+                        nComp, lv.levels(), lv.maxLevelWidth, lv.maxLevelWidth <= 1024 ? "single-block" : "per-level launches");
+        }
+        deviceSymGaussSeidelGraphFused(nComp, comps, tol, relTol, maxIter, minIter, (nSweeps > 1) ? nSweeps : 1, symmetric, perf);
+        return;
+    }
+#endif
+    for (int k = 0; k < nComp; ++k)
+        deviceSymGaussSeidel(*comps[k].A, *comps[k].b, *comps[k].psi, comps[k].normFactor, tol, relTol, maxIter,
+                             &perf[k], minIter, nSweeps, symmetric);
+}
 
 // symGaussSeidel scalar solver. Each cell is updated psi[c] = (b[c] - sum_{j!=c} A[c][j]*psi[j]) / diag[c] (the
 // gsColorT gather), forward then reverse, and the outer loop IS smoothSolver::solve (initial residual + normFactor,

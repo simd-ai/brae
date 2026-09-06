@@ -42,6 +42,9 @@ void   deviceScalarDivNeg(const scalar* num, const scalar* den, scalar* out, sca
 void   deviceScalarDivConst(const scalar* num, scalar denom, scalar* out);                            // *out = *num / denom (host const)
 void   deviceScalarAdd2(const scalar* a, const scalar* b, scalar c, scalar* out);                     // *out = *a + *b + c
 void   deviceScalarCopy(const scalar* src, scalar* dst);                                              // *dst = *src
-scalar deviceReadScalar(const scalar* dSrc);                                                          // pinned D2H (1 sync)
+scalar deviceReadScalar(const scalar* dSrc);
+// The stage-1 partials buffer behind every reduction is grown on demand and the old one FREED. A graph that
+// captured a reduction holds that pointer; compare this before replaying and recapture when it changed.
+int deviceReductionScratchEpoch();                                                          // pinned D2H (1 sync)
 
 } // namespace brae

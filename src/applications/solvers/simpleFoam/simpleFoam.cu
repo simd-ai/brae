@@ -206,27 +206,63 @@ Residuals simpleStep(
         // out direction to be exactly zero first; that is queued, and until then this loop solves a
         // component OpenFOAM does not.
         scalar uInitialResidual = 0.0;
+        // Every solved component's system first: the fold (fvMatrixSolve.C's addBoundaryDiag per
+        // component into its own diagonal, its own source), the view over the SHARED upper/lower, and
+        // its normFactor -- none of which reads another component's psi, so building them all before
+        // any solve is the same arithmetic as building each just before its own.
+        DeviceBuffer<scalar> diagC[3], b[3];
+        DeviceLduView A[3];
+        scalar nf[3] = {0.0, 0.0, 0.0};
+        int solved[3];
+        int nSolved = 0;
         for (int k = 0; k < 3; ++k)
         {
             if (in.solutionD[k] < 0) continue;   // TRIAL: item 35's skip
-            DeviceBuffer<scalar> diagC, b;
-            deviceFold(dm, Mp.relaxed ? Mp.relaxedDiag : Mp.diag, Mp.source[k], Mp.iC[k], Mp.bC[k], diagC, b);
-            const DeviceLduView A = foldedView(dm, Mp, diagC);
-            const scalar nf = deviceNormFactor(A, *U[k], b, w.ones);
-            // The solver the case asked for, algorithm included: deviceSymGaussSeidel is OpenFOAM's
-            // smoothSolver stopping rule around symGaussSeidelSmoother.C's own index-order sweep,
-            // level-scheduled onto the device (device_sym_gauss_seidel.cuh), and tests/gs_ladder holds
-            // it to OpenFOAM's per-sweep residual at 2.8e-12. It used to be a MULTICOLOUR sweep, which
-            // reached T3A's relTol 0.1 in 9-10 sweeps against OpenFOAM's 4-5 and made the case
-            // limit-cycle. Only `GaussSeidel` (ascending only in OF) is still substituted, and announced.
-            // Internal-face LDU only -- no coupled interfaces, which this path refuses anyway.
-            DeviceSolverPerf perf;
-            if (in.uSymGaussSeidel)
-                deviceSymGaussSeidel(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIterU, &perf,
-                                     in.minIterU, in.nSweepsU, in.uGaussSeidelSymmetric);
-            else
-                perf = deviceJacobiBiCGStab(A, b, *U[k], nf, in.tolU, in.relTolU, in.maxIterU,
-                                            /*checkEvery*/1, in.minIterU);
+            deviceFold(dm, Mp.relaxed ? Mp.relaxedDiag : Mp.diag, Mp.source[k], Mp.iC[k], Mp.bC[k], diagC[k], b[k]);
+            A[k] = foldedView(dm, Mp, diagC[k]);
+            nf[k] = deviceNormFactor(A[k], *U[k], b[k], w.ones);
+            solved[nSolved++] = k;
+        }
+        // The solver the case asked for, algorithm included: deviceSymGaussSeidel is OpenFOAM's
+        // smoothSolver stopping rule around symGaussSeidelSmoother.C's own index-order sweep,
+        // level-scheduled onto the device (device_sym_gauss_seidel.cuh), and tests/gs_ladder holds
+        // it to OpenFOAM's per-sweep residual at 2.8e-12. It used to be a MULTICOLOUR sweep, which
+        // reached T3A's relTol 0.1 in 9-10 sweeps against OpenFOAM's 4-5 and made the case
+        // limit-cycle. Only `GaussSeidel` (ascending only in OF) is still substituted, and announced.
+        // Internal-face LDU only -- no coupled interfaces, which this path refuses anyway.
+        //
+        // The components' walks are FUSED (item 60a): one level walk updates every still-active
+        // component at each level, so the per-level latency is paid once per sweep instead of once
+        // per component. Each keeps its own diagonal, source, normFactor, residual and stop, so the
+        // result is the per-component solves' to the bit (tests/gs_fused_identity); BRAE_GS_FUSED=0
+        // restores those.
+        DeviceSolverPerf perfs[3];
+        if (in.uSymGaussSeidel)
+        {
+            GSFusedComponent comps[3];
+            DeviceSolverPerf fp[3];
+            for (int i = 0; i < nSolved; ++i)
+            {
+                const int k = solved[i];
+                comps[i] = {&A[k], &b[k], U[k], nf[k]};
+            }
+            deviceSymGaussSeidelFused(nSolved, comps, in.tolU, in.relTolU, in.maxIterU, in.minIterU, in.nSweepsU,
+                                      in.uGaussSeidelSymmetric, fp);
+            for (int i = 0; i < nSolved; ++i) perfs[solved[i]] = fp[i];
+        }
+        else
+        {
+            for (int i = 0; i < nSolved; ++i)
+            {
+                const int k = solved[i];
+                perfs[k] = deviceJacobiBiCGStab(A[k], b[k], *U[k], nf[k], in.tolU, in.relTolU, in.maxIterU,
+                                                /*checkEvery*/1, in.minIterU);
+            }
+        }
+        for (int i = 0; i < nSolved; ++i)
+        {
+            const int k = solved[i];
+            const DeviceSolverPerf perf = perfs[k];
             // The REPORT is masked even where the solve is not: the empty direction's system has a ~0
             // right-hand side and a ~0 field, so its normFactor-scaled residual never leaves O(0.1)
             // (measured on simpleBoxIO: Uz 7.945e-01 at iteration 1, still 9.724e-02 at 15) and a max

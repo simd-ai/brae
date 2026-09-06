@@ -39,6 +39,7 @@ scalar* g_redPinned = nullptr;    // pinned host mirror (1 scalar)
 scalar* g_readPinned = nullptr;   // pinned host mirror for deviceReadScalar (separate so it never clobbers g_redPinned)
 scalar* g_partials = nullptr;     // stage-1 block partials; grown on demand, never shrunk
 int     g_partialsCap = 0;
+int     g_partialsEpoch = 0;      // bumped on every regrow: a captured graph holding the old pointer must rebuild
 inline scalar* ensurePartials(int nb)
 {
     if (nb > g_partialsCap)
@@ -46,6 +47,7 @@ inline scalar* ensurePartials(int nb)
         if (g_partials) cudaCheck(cudaFree(g_partials), "partials free");
         cudaCheck(cudaMalloc(reinterpret_cast<void**>(&g_partials), (std::size_t)nb*sizeof(scalar)), "partials alloc");
         g_partialsCap = nb;
+        ++g_partialsEpoch;
     }
     return g_partials;
 }
@@ -208,6 +210,12 @@ void deviceSumMagInto(const DeviceBuffer<scalar>& x, scalar* dResult)
     const int n = static_cast<int>(x.size());
     reduceInto([&](int nb, scalar* part){ sumMagKernel<<<nb, TPB>>>(x.data(), part, n); }, n, dResult);
     cudaCheck(cudaGetLastError(), "summagInto");
+}
+
+
+int deviceReductionScratchEpoch()
+{
+    return g_partialsEpoch;
 }
 
 

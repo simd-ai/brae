@@ -86,6 +86,57 @@ __global__ void gsLevelK(
     gsCellUpdate(cells[i], owner, nei, ownerStart, losort, losortStart, upper, lower, diag, b, psi);
 }
 
+// The fused kernels: thread i of a level covers (component k = i / n, cell j = i - k*n), so consecutive
+// threads still take consecutive cells of one component (the same coalescing as the scalar kernels) and
+// every (cell, component) pair is updated by exactly one thread with gsCellUpdate -- the same arithmetic
+// on that component's own diag/b/psi and the shared upper/lower.
+__global__ void gsLevelFusedK(
+    const label* __restrict__ cells, int n,
+    const label* __restrict__ owner, const label* __restrict__ nei,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ losort, const label* __restrict__ losortStart,
+    const scalar* __restrict__ upper, const scalar* __restrict__ lower,
+    GSFusedOperands ops)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n*ops.nComp) return;
+    const int k = i / n;
+    const int j = i - k*n;
+    if (ops.active && !ops.active[k]) return;
+    gsCellUpdate(cells[j], owner, nei, ownerStart, losort, losortStart, upper, lower, ops.diag[k], ops.b[k], ops.psi[k]);
+}
+
+// One block PER COMPONENT, in one launch: block k walks component k's levels exactly as gsSingleBlockK
+// walks a scalar's -- same threads-over-cells striding, same block-local barrier -- so the per-level work
+// on one SM is unchanged while the components run concurrently on separate SMs and the launches are
+// shared. Measured on the composed 209,825-cell flat plate (929 levels, widest 385): the first fused
+// version put both components' cells through ONE block, and at that width a level is throughput-bound
+// on its SM, so the outer iteration went 84 -> 92 ms/it; on T3A (465 levels, widest 80, latency-bound)
+// the same version went 53 -> 40. A block per component keeps the second gain without the first loss.
+__global__ void gsSingleBlockFusedK(
+    const label* __restrict__ off, int nLevels,
+    const label* __restrict__ cells,
+    const label* __restrict__ owner, const label* __restrict__ nei,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ losort, const label* __restrict__ losortStart,
+    const scalar* __restrict__ upper, const scalar* __restrict__ lower,
+    GSFusedOperands ops)
+{
+    const int k = blockIdx.x;
+    if (k >= ops.nComp) return;
+    if (ops.active && !ops.active[k]) return;
+    const scalar* __restrict__ diag = ops.diag[k];
+    const scalar* __restrict__ b    = ops.b[k];
+    scalar* __restrict__ psi        = ops.psi[k];
+    for (int L = 0; L < nLevels; ++L)
+    {
+        const label lo = off[L], hi = off[L+1];
+        for (label i = lo + (label)threadIdx.x; i < hi; i += (label)blockDim.x)
+            gsCellUpdate(cells[i], owner, nei, ownerStart, losort, losortStart, upper, lower, diag, b, psi);
+        __syncthreads();
+    }
+}
+
 // Group cells by DAG depth and flatten into (cells, offsets). `deps[c]` holds the cells c must follow,
 // and every one of them comes earlier in the sweep, so one pass in sweep order fixes every level.
 void schedule(const std::vector<std::vector<label>>& deps, label nCells,
@@ -203,6 +254,40 @@ void deviceSymGaussSeidelSweepExact(const DeviceLduView& A,
     // GaussSeidelSmoother.C stops here: its sweep loop is the ascending walk and nothing else.
     if (symmetric) half(lv.bwdCells, lv.bwdOff, lv.bwdOffD);
     cudaCheck(cudaGetLastError(), "GaussSeidel sweep");
+}
+
+void deviceSymGaussSeidelSweepExactFused(const DeviceLduView& A,
+                                         const GSFusedOperands& ops,
+                                         const DeviceGaussSeidelLevels& lv,
+                                         bool symmetric)
+{
+    static const bool forcePerLevel = std::getenv("BRAE_GS_PER_LEVEL") != nullptr;
+    const bool singleBlock = lv.maxLevelWidth <= TPB_SINGLE && !forcePerLevel;
+    auto half = [&](const DeviceBuffer<label>& cells, const std::vector<int>& off,
+                    const DeviceBuffer<label>& offD)
+    {
+        const int nLevels = (int)off.size() - 1;
+        if (singleBlock)
+        {
+            gsSingleBlockFusedK<<<ops.nComp, TPB_SINGLE>>>(offD.data(), nLevels, cells.data(),
+                                                    A.owner, A.nei, A.ownerStart,
+                                                    A.losort, A.losortStart,
+                                                    A.upper, A.lower, ops);
+            return;
+        }
+        for (int L = 0; L < nLevels; ++L)
+        {
+            const int lo = off[(std::size_t)L], hi = off[(std::size_t)L+1];
+            if (hi <= lo) continue;
+            gsLevelFusedK<<<nBlkG((hi-lo)*ops.nComp), TPB_G>>>(cells.data() + lo, hi - lo,
+                                                               A.owner, A.nei, A.ownerStart,
+                                                               A.losort, A.losortStart,
+                                                               A.upper, A.lower, ops);
+        }
+    };
+    half(lv.fwdCells, lv.fwdOff, lv.fwdOffD);
+    if (symmetric) half(lv.bwdCells, lv.bwdOff, lv.bwdOffD);
+    cudaCheck(cudaGetLastError(), "GaussSeidel fused sweep");
 }
 
 }   // namespace brae

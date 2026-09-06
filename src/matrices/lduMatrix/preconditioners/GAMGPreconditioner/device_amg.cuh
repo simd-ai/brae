@@ -19,6 +19,7 @@ namespace brae {
 // pointer (key) is unchanged. Owned via unique_ptr so AMGData stays movable and the graph is freed on destruct.
 struct AMGGraphCache {
     cudaGraphExec_t exec = nullptr; cudaGraph_t graph = nullptr; const void* key = nullptr;
+    int keyEpoch = -1;   // deviceReductionScratchEpoch() at capture: the V-cycle captures reductions, whose scratch is regrown by freeing
     ~AMGGraphCache();
 };
 
@@ -35,6 +36,7 @@ struct PCGGraphCache {
     // including them in the key only guards the case where a caller reuses this cache with new
     // controls. Sentinels chosen so the first solve always misses.
     scalar keyTol = -1.0; scalar keyRelTol = -1.0; int keyMaxIter = -1; int keyMinIter = -1;
+    int keyEpoch = -1;   // deviceReductionScratchEpoch() at capture (same hazard as AMGGraphCache)
     DeviceBuffer<scalar> pA, Ax, sNormF, sInit, sRes; DeviceBuffer<int> sIter;   // persistent (graph-referenced)
     ~PCGGraphCache();
 };
@@ -203,5 +205,28 @@ scalar deviceSymGaussSeidel(const DeviceLduView& A, const DeviceBuffer<scalar>& 
                             // has no reverse half). Read from the case's `smoother` entry; they are
                             // different solvers and a loose solve stops in different places.
                             bool symmetric = true);   // returns the OF initialResidual; *perf (if given) gets init/final/nIter
+
+// The components of ONE vector matrix, solved together (item 60a): their systems share topology, upper
+// and lower; each has its own folded diagonal, source, normFactor, residual, sweep count and stop. One
+// level walk per sweep updates every still-active component, so the per-level latency is paid once.
+// Byte-identical to nComp calls of deviceSymGaussSeidel in order (tests/gs_fused_identity); the fallbacks
+// (BRAE_GS_FUSED=0, BRAE_GS_HOST_LOOP, the FP32/Jacobi opt-ins, unshared coefficients, nComp 1) ARE those
+// calls. perf[k] receives the k-th component's OpenFOAM report.
+struct GSFusedComponent
+{
+    const DeviceLduView* A = nullptr;
+    const DeviceBuffer<scalar>* b = nullptr;
+    DeviceBuffer<scalar>* psi = nullptr;
+    scalar normFactor = 1.0;
+};
+void deviceSymGaussSeidelFused(int nComp,
+                               const GSFusedComponent* comps,
+                               scalar tol,
+                               scalar relTol,
+                               int maxIter,
+                               int minIter,
+                               int nSweeps,
+                               bool symmetric,
+                               DeviceSolverPerf* perf);
 
 } // namespace brae
