@@ -89,6 +89,8 @@ struct GSGraphCache
     cudaGraphConditionalHandle handle{};
     const void* key = nullptr;
     int scratchEpoch = -1;        // deviceReductionScratchEpoch() at capture
+    const void* owner = nullptr;  // the mesh the baked levels, CSR and buffer sizes belong to
+    int nC = -1, nF = -1;
     // tol/relTol/maxIter/minIter/nSweeps/symmetric are ARGUMENTS of the captured kernels, so a solve
     // that changes any of them on the same field (kFinal after k, a tightened arm in a gate) must
     // re-capture. Keying on psi alone replayed the previous solve's rule.
@@ -96,6 +98,8 @@ struct GSGraphCache
     int    maxIter = -1, minIter = -1, sweepsPer = -1;
     bool   symmetric = true;
     DeviceBuffer<scalar> gsDiag, gsUpper, gsLower, gsB, Ax, r;        // stable, graph-referenced
+    GSLevelCoefs lc;                                                   // the level-ordered operands (item 60b),
+    GSLevelCells cc;                                                   // refreshed per solve, baked by pointer
     DeviceBuffer<scalar> gNormF, gInit, gRes;
     DeviceBuffer<int> gIter;
     ~GSGraphCache()
@@ -148,6 +152,17 @@ static void deviceSymGaussSeidelGraph(
     sA.diag = c.gsDiag.data();
     sA.upper = c.gsUpper.data();
     sA.lower = c.gsLower.data();  // stable values + mesh topology
+    // this solve's operands in walk order (item 60b): permuted once here, read by every captured sweep
+    gsLevelCoefsRefresh(sA, lv, c.lc);
+    gsLevelCellsRefresh(sA, c.gsB, lv, c.cc);
+    static bool announced = false;
+    if (!announced)
+    {
+        announced = true;
+        std::printf("  smoothSolver: device loop, %s gather (%d levels, widest %d: %s)\n",
+                    gsLevelGatherEnabled(lv) ? "level-ordered" : "index", lv.levels(), lv.maxLevelWidth,
+                    gsSingleBlockWalk(lv) ? "single-block" : "per-level launches");
+    }
     // initial residual (also PRE-SIZES Ax/r and the reduction scratch, so the capture allocates nothing)
     deviceAmul(sA, psi, c.Ax);
     deviceCopy(c.r, c.gsB);
@@ -167,7 +182,8 @@ static void deviceSymGaussSeidelGraph(
     const int epoch = deviceReductionScratchEpoch();
     const bool recapture = !c.exec || c.key != psi.data() || c.tol != tol || c.relTol != relTol
                         || c.maxIter != maxIter || c.minIter != minIter || c.sweepsPer != sweepsPer
-                        || c.symmetric != symmetric || c.scratchEpoch != epoch;
+                        || c.symmetric != symmetric || c.scratchEpoch != epoch
+                        || c.owner != (const void*)A.owner || c.nC != nC || c.nF != nF;
     if (recapture)
     {
         if (c.exec)
@@ -192,7 +208,7 @@ static void deviceSymGaussSeidelGraph(
         cudaGraph_t body = cp.conditional.phGraph_out[0];
         cudaCheck(cudaStreamBeginCaptureToGraph(cudaStreamPerThread, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal), "gs capture begin");
         // smoothSolver.C:186: nSweeps sweeps, THEN one residual evaluation
-        for (int sw = 0; sw < sweepsPer; ++sw) deviceSymGaussSeidelSweepExact(sA, c.gsB, psi, lv, symmetric);
+        for (int sw = 0; sw < sweepsPer; ++sw) deviceSymGaussSeidelSweepExact(sA, c.gsB, psi, lv, symmetric, &c.lc, &c.cc);
         deviceAmul(sA, psi, c.Ax);
         deviceCopy(c.r, c.gsB);
         deviceAxpy(-1.0, c.Ax, c.r);  // r = b - A*psi
@@ -204,6 +220,7 @@ static void deviceSymGaussSeidelGraph(
         cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &tmp), "gs capture end");
         cudaCheck(cudaGraphInstantiate(&c.exec, c.graph, 0), "gs graph instantiate");
         c.key = psi.data(); c.scratchEpoch = epoch;
+        c.owner = A.owner; c.nC = nC; c.nF = nF;
         c.tol = tol; c.relTol = relTol; c.maxIter = maxIter; c.minIter = minIter;
         c.sweepsPer = sweepsPer; c.symmetric = symmetric;
     }
@@ -271,12 +288,14 @@ struct GSFusedGraphCache
     int nComp = 0;
     const void* psiKey[GS_FUSED_MAX] = {};
     const void* owner = nullptr;
-    int nC = -1, scratchEpoch = -1;
+    int nC = -1, nF = -1, scratchEpoch = -1;
     scalar tol = -1, relTol = -1;
     int    maxIter = -1, minIter = -1, sweepsPer = -1;
     bool   symmetric = true;
     DeviceBuffer<scalar> gsUpper, gsLower;                                     // shared, stable
     DeviceBuffer<scalar> gsDiag[GS_FUSED_MAX], gsB[GS_FUSED_MAX], Ax[GS_FUSED_MAX], r[GS_FUSED_MAX];
+    GSLevelCoefs lc;                                                           // level-ordered operands (item 60b):
+    GSLevelCells cc[GS_FUSED_MAX];                                             // coefficients shared, cells per component
     DeviceBuffer<scalar> gNormF, gInit, gRes, gFinal;                          // [nComp]
     DeviceBuffer<int>    gIter, gActive;                                       // [nComp]
     ~GSFusedGraphCache()
@@ -331,6 +350,14 @@ static void deviceSymGaussSeidelGraphFused(
         ops.psi[k]  = comps[k].psi->data();
     }
     cudaMemcpyAsync(c.gNormF.data(), nfH, nComp*sizeof(scalar), cudaMemcpyHostToDevice, cudaStreamPerThread);
+    // this solve's operands in walk order (item 60b): the shared coefficients once, the cells per component
+    gsLevelCoefsRefresh(sA[0], lv, c.lc);
+    const GSLevelCells* ccp[GS_FUSED_MAX] = {};
+    for (int k = 0; k < nComp; ++k)
+    {
+        gsLevelCellsRefresh(sA[k], c.gsB[k], lv, c.cc[k]);
+        ccp[k] = &c.cc[k];
+    }
     // every component's initial residual, one read (sync 1 of 2); this also pre-sizes the scratch
     for (int k = 0; k < nComp; ++k)
     {
@@ -358,7 +385,7 @@ static void deviceSymGaussSeidelGraphFused(
     const int epoch = deviceReductionScratchEpoch();
     bool same = c.exec && c.nComp == nComp && c.tol == tol && c.relTol == relTol && c.maxIter == maxIter
              && c.minIter == minIter && c.sweepsPer == sweepsPer && c.symmetric == symmetric
-             && c.scratchEpoch == epoch && c.owner == (const void*)A0.owner && c.nC == nC;
+             && c.scratchEpoch == epoch && c.owner == (const void*)A0.owner && c.nC == nC && c.nF == nF;
     for (int k = 0; k < nComp; ++k) same = same && c.psiKey[k] == (const void*)comps[k].psi->data();
     if (!same)
     {
@@ -383,7 +410,7 @@ static void deviceSymGaussSeidelGraphFused(
         cudaCheck(cudaGraphAddNode(&cnode, c.graph, nullptr, nullptr, 0, &cp), "gs fused cond node");
         cudaGraph_t body = cp.conditional.phGraph_out[0];
         cudaCheck(cudaStreamBeginCaptureToGraph(cudaStreamPerThread, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal), "gs fused capture begin");
-        for (int sw = 0; sw < sweepsPer; ++sw) deviceSymGaussSeidelSweepExactFused(sA[0], ops, lv, symmetric);
+        for (int sw = 0; sw < sweepsPer; ++sw) deviceSymGaussSeidelSweepExactFused(sA[0], ops, lv, symmetric, &c.lc, ccp);
         for (int k = 0; k < nComp; ++k)
         {
             deviceAmul(sA[k], *comps[k].psi, c.Ax[k]);
@@ -400,7 +427,7 @@ static void deviceSymGaussSeidelGraphFused(
         cudaCheck(cudaGraphInstantiate(&c.exec, c.graph, 0), "gs fused graph instantiate");
         c.nComp = nComp;
         for (int k = 0; k < nComp; ++k) c.psiKey[k] = comps[k].psi->data();
-        c.owner = A0.owner; c.nC = nC; c.scratchEpoch = epoch;
+        c.owner = A0.owner; c.nC = nC; c.nF = nF; c.scratchEpoch = epoch;
         c.tol = tol; c.relTol = relTol; c.maxIter = maxIter; c.minIter = minIter;
         c.sweepsPer = sweepsPer; c.symmetric = symmetric;
     }
@@ -448,8 +475,9 @@ void deviceSymGaussSeidelFused(
             announced = true;
             // which walk the mesh takes (device_sym_gauss_seidel.cu: one block when no level outgrows it)
             const DeviceGaussSeidelLevels& lv = gsLevelsFor(*comps[0].A);
-            std::printf("  symGaussSeidel: fused walk (%d components per level, %d levels, widest %d: %s); BRAE_GS_FUSED=0 restores one walk per component\n",
-                        nComp, lv.levels(), lv.maxLevelWidth, lv.maxLevelWidth <= 1024 ? "single-block" : "per-level launches");
+            std::printf("  symGaussSeidel: fused walk (%d components per level, %d levels, widest %d: %s, %s gather); BRAE_GS_FUSED=0 restores one walk per component\n",
+                        nComp, lv.levels(), lv.maxLevelWidth, gsSingleBlockWalk(lv) ? "single-block" : "per-level launches",
+                        gsLevelGatherEnabled(lv) ? "level-ordered" : "index");
         }
         deviceSymGaussSeidelGraphFused(nComp, comps, tol, relTol, maxIter, minIter, (nSweeps > 1) ? nSweeps : 1, symmetric, perf);
         return;
@@ -571,6 +599,11 @@ scalar deviceSymGaussSeidel(
     }
 #endif
     const DeviceGaussSeidelLevels& lv = gsLevelsFor(A);
+    // this solve's operands in walk order (item 60b), once here rather than once per sweep
+    GSLevelCoefs lc;
+    GSLevelCells cc;
+    gsLevelCoefsRefresh(A, lv, lc);
+    gsLevelCellsRefresh(A, b, lv, cc);
     DeviceBuffer<scalar> Ax, r;
     deviceAmul(A, psi, Ax);
     deviceCopy(r, b);
@@ -592,7 +625,7 @@ scalar deviceSymGaussSeidel(
         // OpenFOAM's own sweep, level-scheduled: forward then reverse in strict cell-index order.
         // This used to be two multicolour half-sweeps, which is a DIFFERENT smoother wearing the same
         // name -- see device_sym_gauss_seidel.cuh, and tests/gs_ladder for the 1.36x-to-6.88x it cost.
-        for (int s = 0; s < sweepsPer; ++s) deviceSymGaussSeidelSweepExact(A, b, psi, lv, symmetric);
+        for (int s = 0; s < sweepsPer; ++s) deviceSymGaussSeidelSweepExact(A, b, psi, lv, symmetric, &lc, &cc);
         sweeps += sweepsPer;
         deviceAmul(A, psi, Ax);
         deviceCopy(r, b);

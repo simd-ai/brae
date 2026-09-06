@@ -79,12 +79,49 @@ struct DeviceGaussSeidelLevels
     // The widest level, which picks the execution strategy (see deviceSymGaussSeidelSweepExact).
     int maxLevelWidth = 0;
 
+    // THE LEVEL-ORDERED GATHER (item 60b). For walk position i of each half, the cell's terms as a CSR in
+    // EXACTLY gsCellUpdate's order -- its losort (lower) terms in losort order, then its owner (upper)
+    // terms in face order -- built by replaying that gather's loops on the view's own losort/ownerStart.
+    // entNbr is the cell whose psi the term multiplies; entSrc names the coefficient: f for lower[f],
+    // f + nInternalFaces for upper[f]. Per level the walk then chases three dependent loads (its offsets,
+    // its entries, psi) where the index gather chased five (the cell, its offsets, losort, the face's
+    // coefficient and owner, psi), and the topology reads stream instead of scatter. Same terms, same
+    // order, same arithmetic: bit-identical to the index gather (tests/gs_level_gather_identity).
+    DeviceBuffer<label> fwdEntStart, fwdEntNbr, fwdEntSrc;
+    DeviceBuffer<label> bwdEntStart, bwdEntNbr, bwdEntSrc;
+    int nEntries = 0;                      // 2 * nInternalFaces when the CSR is built, 0 when not
+
     int levels() const { return (int)fwdOff.size() - 1; }
 };
 
+// The sweep's per-solve operands in walk order, refreshed once per solve (the values change every solve,
+// the order never): the coefficients, shared by a vector matrix's components, and the per-component
+// diagonal and source. The refreshes are plain kernels, capturable, and run once per solve.
+struct GSLevelCoefs
+{
+    DeviceBuffer<scalar> fwd, bwd;
+};
+struct GSLevelCells
+{
+    DeviceBuffer<scalar> fwdDiag, bwdDiag, fwdB, bwdB;
+};
+void gsLevelCoefsRefresh(const DeviceLduView& A, const DeviceGaussSeidelLevels& lv, GSLevelCoefs& lc);
+void gsLevelCellsRefresh(const DeviceLduView& A, const DeviceBuffer<scalar>& b, const DeviceGaussSeidelLevels& lv, GSLevelCells& cc);
+// Whether the sweeps take the level-ordered gather (default when the CSR exists; BRAE_GS_LEVEL_GATHER=0
+// restores the index gather for the identity gate).
+bool gsLevelGatherEnabled(const DeviceGaussSeidelLevels& lv);
+// Whether the sweeps walk every level in one block (no level outgrows it and BRAE_GS_PER_LEVEL is unset)
+// or launch per level; the announces report this, so they say what actually ran.
+bool gsSingleBlockWalk(const DeviceGaussSeidelLevels& lv);
+
+// losort/losortStart/ownerStart are the VIEW's own (downloaded), so the CSR replays gsCellUpdate's loops
+// on the same arrays it reads; pass them empty to build the levels without the CSR.
 DeviceGaussSeidelLevels buildDeviceGaussSeidelLevels(const std::vector<label>& owner,
                                                      const std::vector<label>& nei,
-                                                     label nCells);
+                                                     label nCells,
+                                                     const std::vector<label>& losort = {},
+                                                     const std::vector<label>& losortStart = {},
+                                                     const std::vector<label>& ownerStart = {});
 
 // The level-scheduled sweeps, cached per matrix (keyed on A.owner, as the colouring was).
 const DeviceGaussSeidelLevels& gsLevelsFor(const DeviceLduView& A);
@@ -101,11 +138,15 @@ const DeviceGaussSeidelLevels& gsLevelsFor(const DeviceLduView& A);
 //          symmetric sweep gets about twice the smoothing per sweep it asked for, reaches its relTol in
 //          fewer sweeps, and therefore stops somewhere else -- which on validation/T3A is the difference
 //          between converging and limit-cycling (see the header note above).
+// `lc`/`cc` are the level-ordered operands refreshed for THIS solve; null means the sweep refreshes a
+// scratch of its own before walking (the host loop and tests/gs_ladder pay that per sweep).
 void deviceSymGaussSeidelSweepExact(const DeviceLduView& A,
                                     const DeviceBuffer<scalar>& b,
                                     DeviceBuffer<scalar>& psi,
                                     const DeviceGaussSeidelLevels& lv,
-                                    bool symmetric = true);
+                                    bool symmetric = true,
+                                    const GSLevelCoefs* lc = nullptr,
+                                    const GSLevelCells* cc = nullptr);
 
 // THE FUSED WALK (item 60a). A vector fvMatrix's components share the topology and the upper/lower
 // coefficients; only the folded diagonal (fvMatrix::addBoundaryDiag per component) and the source are per
@@ -126,9 +167,12 @@ struct GSFusedOperands
     const int*    active = nullptr;     // one flag per component; nullptr = all active
 };
 // `A` supplies the topology and the SHARED upper/lower; the per-component diag/b/psi come from `ops`.
+// `cc[k]` is component k's level-ordered diagonal/source for this solve (all or none).
 void deviceSymGaussSeidelSweepExactFused(const DeviceLduView& A,
                                          const GSFusedOperands& ops,
                                          const DeviceGaussSeidelLevels& lv,
-                                         bool symmetric = true);
+                                         bool symmetric = true,
+                                         const GSLevelCoefs* lc = nullptr,
+                                         const GSLevelCells* const* cc = nullptr);
 
 }   // namespace brae

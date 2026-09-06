@@ -1135,6 +1135,10 @@ add_test(NAME gs_fused_identity
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/gs_fused_identity.sh)
 set_tests_properties(gs_fused_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 
+add_test(NAME gs_level_gather_identity
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/gs_level_gather_identity.sh)
+set_tests_properties(gs_level_gather_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
 add_test(NAME uresidual_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/uresidual_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO
