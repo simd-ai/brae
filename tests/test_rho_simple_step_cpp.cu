@@ -1,0 +1,864 @@
+// rhoSimpleFoam END TO END in _cpp, against real OpenFOAM.
+//
+// This is the gate PORT.md requires before any .cu is written for this solver: the whole case, run by the
+// host reference, compared against OpenFOAM's own rhoSimpleFoam on the same mesh and dictionaries.
+//
+// TURBULENT, AND WITH THE FIXTURE'S OWN INLET. This block used to say the opposite -- "LAMINAR, and that
+// is a refusal", and "THE INLET IS NEUTRALISED" -- and both were true when written and are not now. The
+// driving script says so plainly (rho_simple_end_to_end_vs_openfoam.sh:5 "TURBULENT: the fixture's own
+// kEpsilon, as it ships"; :15 "THE FIXTURE'S OWN INLET ... flowRateInletVelocity, not a substitute"), and
+// the binary's turbulent branch is live below. The closure is ported and gated separately; the
+// flowRateInletVelocity defect the neutralisation existed for is RETIRED (PORT.md: rAU 4.58e-05 ->
+// 6.13e-15, momentum boundaryCoeffs 4.15e-01 -> 4.89e-16).
+//
+// Getting this wrong in a header is not cosmetic: it is the only whole-solver comparison against real
+// OpenFOAM, so a stale "laminar, inlet neutralised" note rules out, for the next reader, the two things
+// the run actually exercises -- the kEpsilon closure and a real inlet at |U| ~ 523 m/s -- and any residual
+// disagreement then gets attributed anywhere but there.
+//
+// What IS still asserted as a boundary: an UNPORTED RAS model is refused BY NAME. The script builds a
+// separate copy with `RASModel LaunderSharmaKE` for exactly that check (:85-88).
+//
+// WHAT IS COMPARED. Both codes start from the same fields and run the same number of iterations, so this
+// compares trajectories -- which is only meaningful because they are meant to be the SAME trajectory,
+// iteration for iteration. The residual history is printed alongside, because a field comparison that
+// agrees while the residuals diverge would mean the two are converging to the same place by different
+// routes, and that is worth seeing.
+#include "primitive_mesh.cuh"
+#include "rhoCaseRefusals.cuh"
+#include "rhoSimpleFoamDriver_cpp.cuh"   // buildStepInput: the case -> StepInput translation the solver ships
+#include "fv_geometry.cuh"
+#include "fv_patch.cuh"
+#include "geometric_field.cuh"
+#include "foam_field_reader.cuh"
+#include "patch_entry_lookup.cuh"   // findPatchEntry -- OF key resolution: exact name, then group, then regex
+#include "foam_dict.cuh"
+#include "rhoSimpleFoam_cpp.cuh"
+#include "scheme_parse.cuh"
+#include "fvOptions_cpp.cuh"   // parseFieldDivScheme / parseFvSchemesControls: the CASE's schemes
+
+#include "mrf_read.cuh"   // readCellZones: the porosity zone this case constrains
+#include <cmath>
+#include <fstream>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+using namespace brae;
+
+static int failures = 0;
+
+static void report(const std::string& what, double got, double bound)
+{
+    const bool ok = got < bound;
+    if (!ok) ++failures;
+    std::printf("     %-34s %.6e   %s\n", what.c_str(), got, ok ? "ok" : "FAIL");
+}
+
+static void check(const std::string& what, bool ok)
+{
+    if (!ok) ++failures;
+    std::printf("     %-34s %s\n", what.c_str(), ok ? "ok" : "FAIL");
+}
+
+// Hold a field to a bound ONLY where that field MOVES on this fixture.
+//
+// The rule is the one the U bound already lives by, generalised. A bound the START state also passes
+// cannot separate a correct solver from one that did nothing, and reporting such a number as if it were
+// a gate is the failure mode this port exists to avoid -- which is exactly why p, T and rho were left as
+// reports here: on sbMatched they barely leave their initial values, so no bound could be honest.
+//
+// But that reasoning is per FIELD and per FIXTURE, and it was being applied to the whole set at once.
+// k, epsilon, nut and alphat move enormously on any turbulent case -- the closure's own comment two
+// hundred lines below says "Nothing above measures it, and it is not a spectator" -- so the same
+// argument that correctly declines to gate p on sbMatched positively requires gating them.
+//
+// So the decision is made per field, from the data: assert `bound` when the start state misses
+// OpenFOAM's answer by at least `margin` times it, and otherwise say plainly that the field is not held
+// here and why. A fixture where a field is frozen prints a reason; a fixture where it moves gets a gate.
+static void gateIfItMoves(
+    const std::string& what,
+    double             converged,    // relL2(brae's converged field, OpenFOAM's)
+    double             startState,   // relL2(the START field,        OpenFOAM's)
+    double             bound,
+    double             margin = 10.0)
+{
+    if (startState > margin * bound)
+    {
+        report(what, converged, bound);
+        std::printf("       %-32s start state %.4e = %.0fx the bound\n", "(non-vacuous)",
+                    startState, startState / bound);
+    }
+    else
+    {
+        std::printf("     %-34s %.6e   NOT GATED: the start state reads %.4e, inside %.0fx the bound,\n",
+                    what.c_str(), converged, startState, margin);
+        std::printf("       %-32s so no bound here separates a solver from one that did nothing\n", "");
+    }
+}
+
+static double relL2(const std::vector<scalar>& a, const std::vector<scalar>& b)
+{
+    double num = 0.0, den = 0.0;
+    const std::size_t n = std::min(a.size(), b.size());
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        const double d = (double)a[i] - (double)b[i];
+        num += d * d;
+        den += (double)b[i] * (double)b[i];
+    }
+    return den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+}
+
+static std::vector<scalar> readInternal(const std::string& path, label nC)
+{
+    const FieldData<scalar> fd = readField<scalar>(path);
+    if (fd.internalUniform) return std::vector<scalar>(nC, fd.internalUniformValue);
+    return fd.internalField;
+}
+
+int main(int argc, char** argv)
+{
+    if (argc < 4)
+    {
+        std::printf("usage: %s <caseDir> <startTime> <endTime> [turbulentCaseDir]\n", argv[0]);
+        return 2;
+    }
+    const std::string caseDir = argv[1];
+    const std::string startT  = argv[2];
+    const std::string endT    = argv[3];
+    const int iters = std::atoi(endT.c_str()) - std::atoi(startT.c_str());
+
+    PrimitiveMesh m;
+    m.read(caseDir + "/constant/polyMesh");
+    FvGeometry g;
+    g.build(m);
+    const std::vector<FvPatch> patches = buildPatches(m, g);
+    const label nC = m.nCells();
+
+    const FoamDict fvSolution = readDict(caseDir + "/system/fvSolution");
+    const FoamDict* simpleDict = fvSolution.subDict("SIMPLE");
+    const FoamDict* rf = fvSolution.subDict("relaxationFactors");
+    const FoamDict* re = rf ? rf->subDict("equations") : nullptr;
+    const FoamDict* rfl = rf ? rf->subDict("fields") : nullptr;
+
+    std::printf("rhoSimpleFoam END TO END vs OpenFOAM (%d cells, %d iterations)\n", (int)nC, iters);
+
+    cpu::rhoSimple::RhoSimpleFields f =
+        cpu::rhoSimple::createFields(caseDir + "/" + startT, caseDir, simpleDict, &fvSolution,
+                                     m, g, patches);
+    std::printf("  turbulence: %s\n", f.turbulent ? f.rasModel.c_str() : "laminar");
+    std::printf("  energy '%s', consistent %s, transonic %s\n", f.heName.c_str(),
+                simpleDict && simpleDict->wordOr("consistent", "no") == "yes" ? "yes" : "no",
+                simpleDict && simpleDict->wordOr("transonic", "no") == "yes" ? "yes" : "no");
+
+    // THE CASE -> StepInput, through the SHARED translation the runnable driver uses
+    // (rhoSimpleFoamDriver_cpp.cu). This block used to be a private copy here: the gates then measured
+    // one translation of the case's schemes, relaxation, refusals and turbulence convection while
+    // `brae -case` ran another, and nothing compared the two. `cr` is function-local static because it
+    // must outlive the loop -- in.fvOpts points into it.
+    static cpu::rhoSimple::CaseRefusals cr;
+    cpu::rhoSimple::StepInput in =
+        cpu::rhoSimple::buildStepInput(caseDir, f, fvSolution, m, cr);
+
+    // ---- THE FROZEN ARM (activates itself on a `RAS { turbulence off; }` fixture) -----------------
+    // OpenFOAM constructs the model, validate()'s correctNut runs ONCE, and every correct() after that
+    // returns on its first line (kEpsilon.C:216) -- so nut and alphat must LEAVE createFields at the
+    // validate values and come OUT of the loop bit-identical. rhoBoxF is the oracle: OF writes
+    // nut = Cmu*k^2/eps = 0.001265625 from a 1e-3 file seed, boundary included.
+    std::vector<scalar> frNut0, frAlphat0, frNutB0, frAlphatB0;
+    if (f.turbulenceFrozen)
+    {
+        std::printf("  frozen arm -- turbulence off: model constructed, validate() once, correct() skipped\n");
+        const FieldData<scalar> nutFile = readField<scalar>(caseDir + "/" + startT + "/nut");
+        double dModel = 0.0, dFile = 0.0;
+        for (label c = 0; c < nC; ++c)
+        {
+            const double want = (double)f.keCoeffs.Cmu
+                              * (double)f.k.internal[c] * (double)f.k.internal[c]
+                              / (double)f.epsilon.internal[c];
+            dModel = std::max(dModel, std::fabs((double)f.nut.internal[c] - want));
+            const double fileV = nutFile.internalUniform ? (double)nutFile.internalUniformValue
+                                                         : (double)nutFile.internalField[c];
+            dFile = std::max(dFile, std::fabs((double)f.nut.internal[c] - fileV));
+        }
+        check("createFields leaves nut at validate()'s Cmu*k^2/eps", dModel < 1e-15);
+        std::printf("       %-34s max|nut - file seed| = %.6e\n", "  (non-vacuous)", dFile);
+        check("...which DIFFERS from the file seed (else this arm proves nothing)", dFile > 1e-5);
+        frNut0 = f.nut.internal;
+        frAlphat0 = f.alphat.internal;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const std::vector<scalar> nb = f.nut.boundary[pi]->value();
+            frNutB0.insert(frNutB0.end(), nb.begin(), nb.end());
+            const std::vector<scalar> ab = f.alphat.boundary[pi]->value();
+            frAlphatB0.insert(frAlphatB0.end(), ab.begin(), ab.end());
+        }
+    }
+
+    double lastUResidual = 1.0;   // the convergence the loop actually reached; bounds below scale with it
+    for (int it = 1; it <= iters; ++it)
+    {
+        const cpu::rhoSimple::Residuals r = cpu::rhoSimple::rhoSimpleStep(f, in, m, g, patches);
+        if (r.count("U")) lastUResidual = (double)r.at("U");
+        if (it <= 12 || it == iters || it % 50 == 0)
+        {
+            // The second turbulence scalar is the MODEL's: kEpsilon reports epsilon, kOmegaSST omega.
+            // Looking up "epsilon" unconditionally threw std::out_of_range on an SST case -- a crash
+            // where the solver had actually run.
+            const char* second = r.count("epsilon") ? "epsilon" : (r.count("omega") ? "omega" : nullptr);
+            if (r.count("k") && second)
+                std::printf("     iter %4d   U %.3e   %s %.3e   p %.3e   k %.3e   %s %.3e\n", it,
+                            (double)r.at("U"), f.heName.c_str(), (double)r.at(f.heName),
+                            (double)r.at("p"), (double)r.at("k"), second, (double)r.at(second));
+            else
+                std::printf("     iter %4d   U %.3e   %s %.3e   p %.3e\n", it,
+                            (double)r.at("U"), f.heName.c_str(), (double)r.at(f.heName), (double)r.at("p"));
+        }
+    }
+
+    // ---- frozen arm, after the loop: the model fields did not move ----
+    if (f.turbulenceFrozen)
+    {
+        auto maxDiff = [](const std::vector<scalar>& a, const std::vector<scalar>& b)
+        {
+            double d = (a.size() == b.size()) ? 0.0 : 1e300;
+            for (std::size_t i = 0; i < a.size() && i < b.size(); ++i)
+                d = std::max(d, std::fabs((double)a[i] - (double)b[i]));
+            return d;
+        };
+        std::vector<scalar> nutB, alphatB;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const std::vector<scalar> nb = f.nut.boundary[pi]->value();
+            nutB.insert(nutB.end(), nb.begin(), nb.end());
+            const std::vector<scalar> ab = f.alphat.boundary[pi]->value();
+            alphatB.insert(alphatB.end(), ab.begin(), ab.end());
+        }
+        // BIT-identical, not close: nothing in the loop may touch them. A tolerance here would let a
+        // partially-running closure hide inside it.
+        check("nut came out of the loop bit-identical (correct() skipped)",
+              maxDiff(f.nut.internal, frNut0) == 0.0 && maxDiff(nutB, frNutB0) == 0.0);
+        check("alphat likewise",
+              maxDiff(f.alphat.internal, frAlphat0) == 0.0 && maxDiff(alphatB, frAlphatB0) == 0.0);
+    }
+
+    // ---- THE FIXEDFLUXPRESSURE ARM (activates itself when a p patch updates its own snGrad) --------
+    // constrainPressure hands the patch snGrad = (phiHbyA_b - rho_b*(Sf_b & U_b))/(magSf_b*rhorAUf_b)
+    // every assembly, and OpenFOAM WRITES the final gradient into the output p file. Comparing that
+    // gradient directly is the sharpest gate this BC can have: the field norms above would pass a
+    // zeroGradient substitution wherever the converged boundary gradient is small, and the non-vacuity
+    // check below refuses a fixture where it is.
+    {
+        bool anyFfp = false;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            if (f.p.boundary[pi]->updateableSnGrad()) anyFfp = true;
+        if (anyFfp)
+        {
+            std::printf("  fixedFluxPressure arm -- the solver-set gradient vs the one OpenFOAM wrote\n");
+            const FieldData<scalar> pOF = readField<scalar>(caseDir + "/" + endT + "/p");
+            double dMax = 0.0, gMax = 0.0;
+            label nFaces = 0;
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                if (!f.p.boundary[pi]->updateableSnGrad()) continue;
+                const std::vector<scalar>* g = f.p.boundary[pi]->refGradPtr();
+                const PatchFieldData<scalar>* ob = nullptr;
+                for (const auto& b : pOF.boundary) if (b.name == patches[pi].name) ob = &b;
+                check("OpenFOAM wrote a gradient for patch " + patches[pi].name,
+                      g != nullptr && ob != nullptr && ob->hasGradient);
+                if (!g || !ob || !ob->hasGradient) continue;
+                for (label i = 0; i < patches[pi].size; ++i)
+                {
+                    const double og = ob->gradientUniform ? (double)ob->gradientUniformValue
+                                                          : (double)ob->gradientValues[i];
+                    dMax = std::max(dMax, std::fabs((double)(*g)[i] - og));
+                    gMax = std::max(gMax, std::fabs(og));
+                    ++nFaces;
+                }
+            }
+            std::printf("     %-34s max|brae - OF| %.4e over %d faces (max|OF| %.4g)\n",
+                        "  (boundary snGrad)", dMax, (int)nFaces, gMax);
+            // 1e-4 RELATIVE: measured 3.4e-06 on rhoBoxP (two independently-converged runs at
+            // residualControl 1e-6; the gradient is a p-difference over ~5mm, so it carries the
+            // convergence gap amplified by 1/dx). The zeroGradient substitution reads 1.0 here --
+            // four orders past the bound -- and is what this arm exists to catch.
+            check("the solver-set snGrad matches OpenFOAM's written gradient",
+                  nFaces > 0 && dMax < 1e-4 * std::max(gMax, 1.0));
+            // NON-VACUOUS: a fixture whose converged gradient is ~0 cannot tell fixedFluxPressure from
+            // zeroGradient -- the constrainHbyA cancellation makes that the DEFAULT at fixed-velocity
+            // patches, so it is asserted away rather than assumed away.
+            check("...and that gradient is NOT ~0 (else zeroGradient would pass too)", gMax > 0.1);
+        }
+    }
+
+    // ---- the fields, against OpenFOAM at the same iteration ----
+    // THE BOUNDARY CONDITION'S DEFINING PROPERTY, checked before any field comparison: a
+    // flowRateInletVelocity inlet must deliver the mass flow the case prescribed. sum(phi) over the patch
+    // is exactly -massFlowRate when the velocity is held against the same rho the flux carries, and drifts
+    // by whatever factor separates the two when it is not -- 24% on this fixture when the inlet stayed at
+    // its `rhoInlet` seed. This is the invariant, so it is asserted rather than inferred from a field norm.
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (f.U.boundary[pi]->bcCategory() != 9) continue;
+        const scalar mdot = f.U.boundary[pi]->flowRateValue();
+        scalar sumPhi = 0.0;
+        for (label i = 0; i < patches[pi].size; ++i) sumPhi += f.phi.boundary[pi][i];
+        const double rel = std::fabs(sumPhi + mdot) / std::fabs(mdot);
+        char what[128];
+        std::snprintf(what, sizeof(what), "%s delivers its prescribed mass flow", patches[pi].name.c_str());
+        // AT THE CONVERGENCE THE LOOP REACHED, expressed against the U residual rather than as a fixed
+        // number. The inlet flux can only be as exact as the solution: on sbMatched brae reaches 8.8e-09
+        // and delivers the flux to 1.4e-08, while squareBend stops at OpenFOAM's own residualControl
+        // (U 1e-04) and delivers it to 5.5e-05. A fixed 1e-6 asserted the first case's convergence on the
+        // second and failed a solver that was doing exactly the right thing. The absolute floor keeps the
+        // assertion meaningful when the residual is tiny; the machine-precision form of this same
+        // invariant lives in rho_ueqn_vs_openfoam, on a single assembly, at 2.2e-15.
+        const double massFlowBound = std::max(1e-9, 10.0 * lastUResidual);
+        report(what, rel, massFlowBound);
+        std::printf("     %-40s bound %.3e (10x the U residual %.3e)\n", "  (what it is held to)",
+                    massFlowBound, lastUResidual);
+        std::printf("     %-40s sum(phi) %+.9e   prescribed %+.9e\n", "  (the flux it carries)",
+                    sumPhi, -mdot);
+    }
+
+    std::printf("  fields vs OpenFOAM at t=%s\n", endT.c_str());
+    const std::vector<scalar> ofP = readInternal(caseDir + "/" + endT + "/p", nC);
+    const std::vector<scalar> ofT = readInternal(caseDir + "/" + endT + "/T", nC);
+
+    // THE START STATE, from the same files the run began with. Every bound below is decided against it
+    // by gateIfItMoves, so a field that does not move on this fixture is reported with its reason rather
+    // than held to a number that would pass whatever the solver did. Built here rather than in the
+    // control block at the end because the decision it drives is taken here, field by field.
+    const cpu::rhoSimple::RhoSimpleFields z0 =
+        cpu::rhoSimple::createFields(caseDir + "/" + startT, caseDir, simpleDict, &fvSolution,
+                                     m, g, patches);
+
+    // BOUNDS FROM MEASUREMENT, worst across the two fixtures this binary runs, with ~2-3x headroom.
+    // They tighten as the port improves; they do not move to accommodate it.
+    //
+    //                squareBend    sbMatched      bound
+    //     p          4.754e-04     2.879e-07      1.0e-3
+    //     T          1.108e-04     3.665e-06      3.0e-4
+    //     rho        4.341e-04     4.089e-06      1.0e-3
+    //
+    // sbMatched moved 10-60x TOWARD OpenFOAM when M.faceFluxCorrection was finally filled on the rho
+    // path (2026-09-01) -- phi had been missing the whole non-orthogonal correction that the pressure
+    // source carried. squareBend did NOT move (its gap is dominated by its own open convergence
+    // issue), and the bounds are squareBend-limited, so they stay put.
+    //     k          1.358e-03     3.463e-06      3.0e-3  (TURB_BOUND)
+    //
+    // sbMatched's k reads 3.46e-06 (was 7.65e-05 in this table) -- the improvement rode in with the
+    // faceFluxCorrection fix, MIS-attributed at first to the boundary-rho snapshot refresh, whose
+    // fail-proof measured INERT here (see rhoSimpleFoam_cpp.cu at the refresh). BRAE_TURB_BOUND=5e-05
+    // from the e2e script pins today's number whichever fix earned it.
+    //     epsilon    1.652e-03     1.373e-04        "
+    //     nut        1.166e-03     4.302e-05        "
+    //     alphat     9.666e-04     4.867e-05        "
+    //
+    // squareBend is the wider of the two on every field, and its k and epsilon are the widest of all --
+    // that fixture asks for `Gauss limitedLinear 1` on div(phi,k) and div(phi,epsilon), which the
+    // closure first discretised upwind regardless (~1.6e-03 at convergence was what that substitution
+    // was worth), then refused by name, and now assembles (the e2e script's turbdiv arm gates it
+    // against OpenFOAM run under the same mutation).
+    gateIfItMoves("p", relL2(f.p.internal, ofP), relL2(z0.p.internal, ofP), 1.0e-3);
+    gateIfItMoves("T", relL2(f.T.internal, ofT), relL2(z0.T.internal, ofT), 3.0e-4);
+    {
+        const FieldData<vector> uFd = readField<vector>(caseDir + "/" + endT + "/U");
+        std::vector<scalar> a, b;
+        for (label c = 0; c < nC; ++c)
+        {
+            a.push_back(f.U.internal[c].x); a.push_back(f.U.internal[c].y); a.push_back(f.U.internal[c].z);
+            b.push_back(uFd.internalField[c].x); b.push_back(uFd.internalField[c].y); b.push_back(uFd.internalField[c].z);
+        }
+        // U IS the gate: it starts at (0,0,0) and ends at the solution, so the control below fails it by
+        // a factor of ~7e3 and the bound means something.
+        //
+        // 5e-4. This was 2e-3 while brae's host path had no inletOutlet flux switch and the error sat
+        // almost entirely on the outlet -- 1.5e-02 there against 2.6e-06 at the inlet. With the mixed
+        // boundary condition implemented (fv_patch_field.cuh, valueFraction = neg(phi)) the outlet reads
+        // 9.9e-06 and the whole field 1.5e-04, so the slack that was being held open for a known gap is
+        // no longer there to hold. The per-patch confinement below is asserted for EVERY patch now,
+        // including the outlet.
+        report("U", relL2(a, b), 5e-4);
+        // Where does it live? Every localisation this port has needed started here.
+        std::vector<char> isB(nC, 0);
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            for (label i = 0; i < patches[pi].size; ++i) isB[patches[pi].faceCells[i]] = 1;
+        double db = 0.0, nb2 = 0.0, di = 0.0, ni = 0.0;
+        for (label c = 0; c < nC; ++c)
+        {
+            const double dx = (double)f.U.internal[c].x - (double)uFd.internalField[c].x;
+            const double dy = (double)f.U.internal[c].y - (double)uFd.internalField[c].y;
+            const double dz = (double)f.U.internal[c].z - (double)uFd.internalField[c].z;
+            const double q = dx*dx + dy*dy + dz*dz;
+            const double r = (double)uFd.internalField[c].x*(double)uFd.internalField[c].x
+                           + (double)uFd.internalField[c].y*(double)uFd.internalField[c].y
+                           + (double)uFd.internalField[c].z*(double)uFd.internalField[c].z;
+            if (isB[c]) { db += q; nb2 += r; } else { di += q; ni += r; }
+        }
+        // PER COMPONENT. A uniform whole-field number cannot tell "every component is a little off" from
+        // "one component is badly off and the others are exact" -- and on a duct the cross-stream
+        // component is both the smallest and the last to converge (OpenFOAM's own Uz residual floors at
+        // 8.7e-07 here while Ux reaches 1.1e-08), so it can carry the whole disagreement while
+        // contributing almost nothing to |U|.
+        {
+            const char* cn[3] = {"Ux", "Uy", "Uz"};
+            for (int k2 = 0; k2 < 3; ++k2)
+            {
+                double dc = 0.0, nc = 0.0;
+                for (label c = 0; c < nC; ++c)
+                {
+                    const double a2 = (double)reinterpret_cast<const scalar*>(&f.U.internal[c])[k2];
+                    const double b2 = (double)reinterpret_cast<const scalar*>(&uFd.internalField[c])[k2];
+                    dc += (a2 - b2)*(a2 - b2); nc += b2*b2;
+                }
+                std::printf("       %s rel %.4e   (|%s| rms %.4e)\n", cn[k2],
+                            nc > 0 ? std::sqrt(dc/nc) : 0.0, cn[k2], std::sqrt(nc/nC));
+            }
+        }
+        std::printf("       U rel: boundary cells %.4e   interior %.4e\n",
+                    nb2 > 0 ? std::sqrt(db/nb2) : 0.0, ni > 0 ? std::sqrt(di/ni) : 0.0);
+        // AND BY CELLZONE, because the per-patch figures below cannot separate two different causes on
+        // this case: porosityWall's face cells are INSIDE the porous block, so "the slip patch disagrees"
+        // and "the porosity disagrees" produce the same number there. The zone split does separate them.
+        for (const auto& z : readCellZones(caseDir + "/constant/polyMesh"))
+        {
+            double din = 0.0, nin = 0.0, dout = 0.0, nout = 0.0;
+            std::vector<char> inz(nC, 0);
+            for (label c : z.second) if (c >= 0 && c < nC) inz[c] = 1;
+            for (label c = 0; c < nC; ++c)
+            {
+                const double dx = (double)f.U.internal[c].x - (double)uFd.internalField[c].x;
+                const double dy = (double)f.U.internal[c].y - (double)uFd.internalField[c].y;
+                const double dz = (double)f.U.internal[c].z - (double)uFd.internalField[c].z;
+                const double q = dx*dx + dy*dy + dz*dz;
+                const double r = (double)uFd.internalField[c].x*(double)uFd.internalField[c].x
+                               + (double)uFd.internalField[c].y*(double)uFd.internalField[c].y
+                               + (double)uFd.internalField[c].z*(double)uFd.internalField[c].z;
+                if (inz[c]) { din += q; nin += r; } else { dout += q; nout += r; }
+            }
+            std::printf("       U in zone '%s' %.4e   outside %.4e\n", z.first.c_str(),
+                        nin > 0 ? std::sqrt(din/nin) : 0.0, nout > 0 ? std::sqrt(dout/nout) : 0.0);
+        }
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (!patches[pi].size) continue;
+            double dp = 0.0, np = 0.0;
+            for (label i = 0; i < patches[pi].size; ++i)
+            {
+                const label c = patches[pi].faceCells[i];
+                const double dx = (double)f.U.internal[c].x - (double)uFd.internalField[c].x;
+                const double dy = (double)f.U.internal[c].y - (double)uFd.internalField[c].y;
+                const double dz = (double)f.U.internal[c].z - (double)uFd.internalField[c].z;
+                dp += dx*dx + dy*dy + dz*dz;
+                np += (double)uFd.internalField[c].x*(double)uFd.internalField[c].x
+                    + (double)uFd.internalField[c].y*(double)uFd.internalField[c].y
+                    + (double)uFd.internalField[c].z*(double)uFd.internalField[c].z;
+            }
+            std::printf("         %-14s %.4e\n", patches[pi].name.c_str(),
+                        np > 0 ? std::sqrt(dp/np) : 0.0);
+            check(std::string("U confined: ") + patches[pi].name,
+                  (np > 0 ? std::sqrt(dp/np) : 0.0) < 5e-4);
+        }
+        check("U interior is not where it lives", (ni > 0 ? std::sqrt(di/ni) : 0.0) < 5e-4);
+    }
+    {
+        const std::vector<scalar> ofRho = readInternal(caseDir + "/" + endT + "/rho", nC);
+        gateIfItMoves("rho", relL2(f.rho.internal, ofRho), relL2(z0.rho.internal, ofRho), 1.0e-3);
+        // rho's RANGE beside OpenFOAM's. rho.relax() with this case's 0.01 moves rho only 1% of the way
+        // to thermo.rho() each iteration, so the min is a direct read on whether the relaxation ran at
+        // all: an unrelaxed rho lands on thermo.rho() itself, a relaxed one a hundredth of the way there.
+        {
+            double bmin = 1e300, bmax = -1e300, omin = 1e300, omax = -1e300;
+            for (label c = 0; c < nC; ++c)
+            {
+                bmin = std::min(bmin, (double)f.rho.internal[c]);
+                bmax = std::max(bmax, (double)f.rho.internal[c]);
+                omin = std::min(omin, (double)ofRho[c]);
+                omax = std::max(omax, (double)ofRho[c]);
+            }
+            std::printf("       rho brae [%.8g .. %.8g]   OF [%.8g .. %.8g]   relaxRho %g\n",
+                        bmin, bmax, omin, omax, (double)in.relaxRho);
+            label am = 0;
+            for (label c = 0; c < nC; ++c) if ((double)f.rho.internal[c] >= bmax) { am = c; break; }
+            const std::vector<scalar> ofPf = readInternal(caseDir + "/" + endT + "/p", nC);
+            const std::vector<scalar> ofTf = readInternal(caseDir + "/" + endT + "/T", nC);
+            std::printf("       argmax cell %d: brae rho %.8g p %.8g T %.8g | OF rho %.8g p %.8g T %.8g\n",
+                        (int)am, (double)f.rho.internal[am], (double)f.p.internal[am],
+                        (double)f.T.internal[am], (double)ofRho[am], (double)ofPf[am], (double)ofTf[am]);
+        }
+    }
+    // The turbulence fields' bound. Held apart from the momentum bound because the closure converges to a
+    // looser fixed point than U does and always has: k and epsilon are transported quantities driven by
+    // a production term built from grad(U), so they carry U's error amplified by the gradient. Set from
+    // measurement, and it TIGHTENS as the closure improves -- it does not move to accommodate it.
+    // Overridable PER FIXTURE: the default is squareBend-limited (its k sits at 1.4e-03), which
+    // cannot pin sbMatched's 3.46e-06 -- the e2e script exports the tight value for the fixture that
+    // earns it, so a closure regression (the stale boundary-rho snapshot read 7.65e-05) fails there.
+    const char* tbEnv = std::getenv("BRAE_TURB_BOUND");
+    const double TURB_BOUND = tbEnv ? std::atof(tbEnv) : 3.0e-03;
+
+    // THE CLOSURE'S OWN FIXED POINT. Nothing above measures it, and it is not a spectator: nut feeds
+    // muEff, which is a coefficient of the momentum equation this gate does bound. The closure gates
+    // (rho_kepsilon, rho_komegasst) assemble ONE system from OpenFOAM's adopted k, epsilon and U and
+    // read machine precision -- which says the assembly is right GIVEN OpenFOAM's state, and says
+    // nothing about where brae's own k and epsilon converge to over 8000 iterations of their own.
+    // angledDuct is where that mattered: momentum coefficients exact to 2.6e-15 at iteration 200, and
+    // U still 9.4e-04 out at convergence with p, T and rho an order of magnitude better.
+    if (f.turbulent)
+    {
+        for (const char* fld : {"k", "epsilon", "omega", "nut", "alphat"})
+        {
+            const std::string path = caseDir + "/" + endT + "/" + fld;
+            if (!std::ifstream(path.c_str()).good()) continue;
+            const GeometricField<scalar>* bf = nullptr;
+            const std::string n(fld);
+            if      (n == "k")       bf = &f.k;
+            else if (n == "epsilon") bf = &f.epsilon;
+            else if (n == "omega")   bf = &f.omega;
+            else if (n == "nut")     bf = &f.nut;
+            else if (n == "alphat")  bf = &f.alphat;
+            if (!bf || static_cast<label>(bf->internal.size()) != nC) continue;
+            const GeometricField<scalar>* zf = nullptr;
+            if      (n == "k")       zf = &z0.k;
+            else if (n == "epsilon") zf = &z0.epsilon;
+            else if (n == "omega")   zf = &z0.omega;
+            else if (n == "nut")     zf = &z0.nut;
+            else if (n == "alphat")  zf = &z0.alphat;
+            const std::vector<scalar> of = readInternal(path, nC);
+            // The closure's fields get the SAME treatment every other field now gets. They were the one
+            // group with an explicit argument for being measured -- the comment above says they are not
+            // spectators -- and no bound at all.
+            const double zStart = (zf && static_cast<label>(zf->internal.size()) == nC)
+                                ? relL2(zf->internal, of) : 0.0;
+            gateIfItMoves(fld, relL2(bf->internal, of), zStart, TURB_BOUND);
+            // SPLIT BY CELLZONE. angledDuct's fvOptions pins k = 1, epsilon = 150 and T = 350 across the
+            // 8000 porosity cells, and OpenFOAM's converged fields hold every one of them EXACTLY. So a
+            // whole-field number here averages 8000 cells that must agree to the last bit with 20000 that
+            // are free -- and if brae ever stopped applying the constraint, the in-zone figure is the only
+            // place it would show. Printed separately for exactly that reason.
+            for (const auto& z : readCellZones(caseDir + "/constant/polyMesh"))
+            {
+                double din = 0.0, nin = 0.0, dout = 0.0, nout = 0.0;
+                std::vector<char> inz(nC, 0);
+                for (label c : z.second) if (c >= 0 && c < nC) inz[c] = 1;
+                for (label c = 0; c < nC; ++c)
+                {
+                    const double d = (double)bf->internal[c] - (double)of[c];
+                    if (inz[c]) { din += d*d; nin += (double)of[c]*(double)of[c]; }
+                    else        { dout += d*d; nout += (double)of[c]*(double)of[c]; }
+                }
+                std::printf("       %s in zone '%s' %.4e   outside %.4e\n", fld, z.first.c_str(),
+                            nin  > 0 ? std::sqrt(din/nin)   : 0.0,
+                            nout > 0 ? std::sqrt(dout/nout) : 0.0);
+            }
+        }
+    }
+
+    // ---- alphat ON THE BOUNDARY, against OpenFOAM's own written patch values --------------------
+    // The internal comparison above says nothing about this. OpenFOAM's EddyDiffusivity::correctNut ends
+    // with `alphat_.correctBoundaryConditions()` (EddyDiffusivity.C:38), and on a wall carrying
+    // compressible::alphatWallFunction that evaluates to operator==(rhow*tnutw/Prt_)
+    // (alphatWallFunctionFvPatchScalarField.C:125) -- with the PATCH's own Prt_, whose default is 0.85
+    // (:76), NOT the turbulence model's, whose default is 1.0. Two different turbulent Prandtl numbers
+    // in one case.
+    //
+    // brae's OF-mirror lineage does neither. kEpsilon_cpp.cu:599-601 writes alphat over CELLS only, and
+    // the sole boundary evaluation is rhoCreateFields_cpp.cu:548, once at construction. So alphat's patch
+    // values are whatever 0/alphat shipped -- on sbMatched `value uniform 0` at the walls -- for the whole
+    // run, and alphaEff at the wall loses the entire turbulent contribution. The legacy solver does gather
+    // this (gpuRhoSimpleFoam.cu:432-457); this lineage never did.
+    //
+    // OpenFOAM's written field is the oracle, because the _cpp reference carries the same defect and
+    // cannot be one.
+    if (f.turbulent && !f.alphat.internal.empty())
+    {
+        const std::string apath = caseDir + "/" + endT + "/alphat";
+        if (std::ifstream(apath.c_str()).good())
+        {
+            const FieldData<scalar> aFd = readField<scalar>(apath);
+            double num = 0.0, den = 0.0, znum = 0.0;
+            label nWallFn = 0, nFaces = 0;
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                const PatchFieldData<scalar>* pb = findPatchEntry(aFd.boundary, patches[pi]);
+                if (!pb) continue;
+                const bool wallFn = (pb->type == "compressible::alphatWallFunction"
+                                  || pb->type == "alphatWallFunction");
+                if (!wallFn) continue;
+                ++nWallFn;
+                const std::vector<scalar>& bb = f.alphat.boundary[pi]->value();
+                const std::vector<scalar>& zb = z0.alphat.boundary[pi]->value();
+                for (label i = 0; i < patches[pi].size; ++i)
+                {
+                    const double ofv = pb->valueUniform
+                                     ? (double)pb->uniformValue
+                                     : (i < (label)pb->values.size() ? (double)pb->values[i] : 0.0);
+                    const double bv  = i < (label)bb.size() ? (double)bb[i] : 0.0;
+                    const double zv  = i < (label)zb.size() ? (double)zb[i] : 0.0;
+                    num  += (bv - ofv) * (bv - ofv);
+                    znum += (zv - ofv) * (zv - ofv);
+                    den  += ofv * ofv;
+                    ++nFaces;
+                }
+            }
+            if (nWallFn > 0)
+            {
+                const double rel  = den > 0.0 ? std::sqrt(num  / den) : std::sqrt(num);
+                const double zrel = den > 0.0 ? std::sqrt(znum / den) : std::sqrt(znum);
+                std::printf("       %-32s %d faces on %d alphatWallFunction patch(es)\n",
+                            "(alphat wall faces compared)", (int)nFaces, (int)nWallFn);
+                // The start state is the value 0/alphat ships at the wall -- `uniform 0` on both
+                // fixtures -- so its deviation from OpenFOAM's answer is exactly 1.0, and this bound is
+                // 1000x below it. That is also the number this gate read before the wall function was
+                // computed at all, which is what makes the bound a measurement rather than a hope.
+                gateIfItMoves("alphat BOUNDARY vs OpenFOAM", rel, zrel, 1.0e-3);
+            }
+            else
+            {
+                std::printf("     %-34s no alphatWallFunction patch on this fixture\n",
+                            "alphat BOUNDARY: SKIPPED");
+            }
+        }
+    }
+
+    // ---- THE CONTROL: the initial field must NOT pass those bounds. ----
+    std::printf("  control -- the initial field must not pass\n");
+    {
+        // z0, not a second field set built from the same files: every bound above was already decided
+        // against it, and building it twice invited the two copies to drift apart.
+        const FieldData<vector> uFd2 = readField<vector>(caseDir + "/" + endT + "/U");
+        std::vector<scalar> za, zb;
+        for (label c = 0; c < nC; ++c)
+        {
+            za.push_back(z0.U.internal[c].x); za.push_back(z0.U.internal[c].y); za.push_back(z0.U.internal[c].z);
+            zb.push_back(uFd2.internalField[c].x); zb.push_back(uFd2.internalField[c].y); zb.push_back(uFd2.internalField[c].z);
+        }
+        const double zu = relL2(za, zb);
+        check("the start state fails the U bound", zu > 5e-4);
+        // Every OTHER field's start state is printed beside its own bound above, by gateIfItMoves, which
+        // is also what decides whether that field is held at all. This line used to end with "p and T
+        // start INSIDE their bounds -> not gated", which was true of sbMatched and asserted of every
+        // fixture: on squareBend p starts 2.1841e-01 away from OpenFOAM's answer, 437x its bound, and is
+        // gated. The decision is per field and per fixture, so it is made there and not stated here.
+        std::printf("     %-34s U %.4e   (every other field: see its own line above)\n",
+                    "  (start-state error)", zu);
+    }
+
+    // ---- THE REFUSAL: an unported NUT WALL FUNCTION ------------------------------------------
+    // The closure computes nutkWallFunction unconditionally -- for the wall nut AND, through
+    // deviceWallEpsG0's `nutWall` selector, for the near-wall production. OpenFOAM dispatches on nut's
+    // own patch field (nutWallFunctionFvPatchScalarField.C:181-184) and everything downstream READS the
+    // result (epsilonWallFunctionFvPatchScalarField.C:333-334 `turbModel.nut(patchi)`), so a case naming
+    // any other member of the family got nutk's value at both sites with nothing to say so.
+    //
+    // The refusal lives in createFields because that is the last place the dictionary TYPE exists: once
+    // buildField has run, the patch-field object no longer carries it, which is why neither closure could
+    // have checked. argv[5] is a time directory whose nut names a different wall function.
+    std::printf("  refusal -- an unported nut wall function\n");
+    if (argc > 5)
+    {
+        bool threw = false;
+        std::string msg;
+        try
+        {
+            (void)cpu::rhoSimple::createFields(std::string(argv[5]), caseDir,
+                                               simpleDict, &fvSolution, m, g, patches);
+        }
+        catch (const std::exception& e) { threw = true; msg = e.what(); }
+        check("an unported nut wall function is refused", threw);
+        if (threw) std::printf("     %s\n", msg.substr(0, 150).c_str());
+
+        // THE NEGATIVE CONTROL. The unmodified time directory must be ACCEPTED -- without it this passes
+        // on a createFields that throws for any reason at all, which is not a refusal but a broken read.
+        bool threw2 = false;
+        try
+        {
+            (void)cpu::rhoSimple::createFields(caseDir + "/" + startT, caseDir,
+                                               simpleDict, &fvSolution, m, g, patches);
+        }
+        catch (const std::exception&) { threw2 = true; }
+        check("the case's own nutkWallFunction is ACCEPTED (negative control)", !threw2);
+    }
+    else
+    {
+        std::printf("     %-34s %s\n", "unported-nut fixture not supplied", "SKIP");
+    }
+
+    // ---- THE REFUSAL: the ATM member of the nut family, which does NOT start with "nut" -----------
+    // The guard above was a one-prefix test, so atmNutkWallFunction -- the one type its own block
+    // comment names as refused -- fell through to CalculatedPatchField and ran as the smooth nutk with
+    // z0 unplumbed. This arm fails against that guard, which is the fail-proof for the two-prefix one.
+    std::printf("  refusal -- atmNutkWallFunction (escapes a one-prefix guard)\n");
+    if (argc > 6)
+    {
+        bool threw = false;
+        std::string msg;
+        try
+        {
+            (void)cpu::rhoSimple::createFields(std::string(argv[6]), caseDir,
+                                               simpleDict, &fvSolution, m, g, patches);
+        }
+        catch (const std::exception& e) { threw = true; msg = e.what(); }
+        check("atmNutkWallFunction is refused", threw);
+        check("and the refusal names it", msg.find("atmNutkWallFunction") != std::string::npos);
+    }
+    else
+    {
+        std::printf("     %-34s %s\n", "unported-atm fixture not supplied", "SKIP");
+    }
+
+    // ---- THE REFUSAL: `properties liquid` reaching a perfect-gas createFields ---------------------
+    // thermo_parse ACCEPTS the liquid thermo (the legacy binary carries the NSRDS path), so nothing
+    // upstream stops it, and before the guard nothing downstream checked f.thermo.model either: the
+    // rho seed, psi and he were all built from perfectGas formulae with the liquid's scalar Cp left at
+    // its default. The refusal must come from createFields itself and must name the liquid.
+    std::printf("  refusal -- properties liquid on the perfect-gas mirror path\n");
+    if (argc > 7)
+    {
+        bool threw = false;
+        std::string msg;
+        try
+        {
+            (void)cpu::rhoSimple::createFields(caseDir + "/" + startT, std::string(argv[7]),
+                                               simpleDict, &fvSolution, m, g, patches);
+        }
+        catch (const std::exception& e) { threw = true; msg = e.what(); }
+        check("a liquid thermo is refused", threw);
+        check("and the refusal names the liquid", msg.find("properties liquid") != std::string::npos);
+    }
+    else
+    {
+        std::printf("     %-34s %s\n", "liquid-thermo fixture not supplied", "SKIP");
+    }
+
+    // ---- THE REFUSAL: a per-step boundary this driver cannot maintain --------------------------------
+    // The factory accepts fixedMean/fanPressure/coded because gpuPimpleFoam recomputes them every step;
+    // no rhoSimpleFoam mirror driver does, so a patch built here would freeze at the file `value`.
+    // argv[8] is a time directory whose p carries fixedMean; createFields must refuse it by name.
+    std::printf("  refusal -- a per-step boundary (fixedMean) the mirror cannot maintain\n");
+    if (argc > 8)
+    {
+        bool threw = false;
+        std::string msg;
+        try
+        {
+            (void)cpu::rhoSimple::createFields(std::string(argv[8]), caseDir,
+                                               simpleDict, &fvSolution, m, g, patches);
+        }
+        catch (const std::exception& e) { threw = true; msg = e.what(); }
+        check("a fixedMean patch is refused", threw);
+        check("and the refusal says the boundary would freeze",
+              msg.find("fixedMean") != std::string::npos
+           && msg.find("never updates") != std::string::npos);
+    }
+    else
+    {
+        std::printf("     %-34s %s\n", "unmaintained-BC fixture not supplied", "SKIP");
+    }
+
+    // ---- THE REFUSAL: a coupled patch on the HOST arm -----------------------------------------
+    // The factory builds cyclic/AMI/processor as zeroGradient PLACEHOLDERS for the device solvers;
+    // no mirror driver re-couples them, so the host arm must refuse on topology -- it used to rely on
+    // the T->he whitelist firing by accident five field reads later. Synthetic: the fixture's first
+    // patch retyped, no coupled mesh needed (the guard reads only the type).
+    {
+        std::vector<FvPatch> coupled = patches;
+        coupled[0].type = "cyclic";
+        bool threw = false;
+        std::string msg;
+        try
+        {
+            (void)cpu::rhoSimple::createFields(caseDir + "/" + startT, caseDir,
+                                               simpleDict, &fvSolution, m, g, coupled);
+        }
+        catch (const std::exception& e) { threw = true; msg = e.what(); }
+        check("a coupled patch is refused on the host arm", threw);
+        check("...naming the patch and the coupling",
+              msg.find("cyclic") != std::string::npos
+           && msg.find(coupled[0].name) != std::string::npos
+           && msg.find("wall") != std::string::npos);
+    }
+
+    // ---- THE REFUSAL: a turbulent case must be refused BY NAME, not run as laminar. ----
+    std::printf("  refusal -- an unported RAS model\n");
+    if (argc > 4)
+    {
+        // LaunderSharmaKE is a compressible RAS model brae does not have. It must be refused BY NAME, not run
+        // as the kEpsilon it does have and not quietly as laminar -- either would converge to a smooth,
+        // plausible, wrong field. The refusal lives in createFields, where OpenFOAM constructs the model.
+        bool threw = false;
+        std::string msg;
+        try
+        {
+            (void)cpu::rhoSimple::createFields(caseDir + "/" + startT, std::string(argv[4]),
+                                               simpleDict, &fvSolution, m, g, patches);
+        }
+        catch (const std::exception& e) { threw = true; msg = e.what(); }
+        check("an unported RAS model is refused", threw);
+        check("and the refusal names it", msg.find("LaunderSharmaKE") != std::string::npos);
+    }
+    else
+    {
+        std::printf("     %-34s %s\n", "unported-model fixture not supplied", "SKIP");
+    }
+
+    // ---- CONTROL: the CASE'S closure coefficients and Prt reach the SOLVE ----------------------
+    // StepInput carried its own `KEpsilonCoeffs keCoeffs{}` and `scalar Prt = 1.0`, and no caller in the
+    // tree ever assigned either, so a case naming `kEpsilonCoeffs { Cmu 0.1; }` or `Prt 0.85` solved with
+    // 0.09 and 1.0. createFields had ALREADY read the case's values and used them for the
+    // construction-time correctNut, so initialisation and the loop ran different constants -- worse than
+    // either being wrong consistently. No compressible fixture declares either entry, which is exactly
+    // why it survived: every gate compared two runs that both used the defaults.
+    //
+    // The control cannot be a fixture comparison for that same reason, so it perturbs the FIELD SET the
+    // solve now reads from and requires the answer to move. If the loop still took StepInput's copy,
+    // mutating f.keCoeffs and f.Prt would change nothing and this fails.
+    // On a FROZEN fixture the loop deliberately never reads the coefficients -- OpenFOAM's correct()
+    // returns before touching them -- so "the coeffs reach the solve" is not a property the fixture can
+    // have, and the frozen arm above already asserted the half that does exist (Cmu reaches validate()).
+    if (f.turbulent && !f.turbulenceFrozen && !f.k.internal.empty())
+    {
+        cpu::rhoSimple::RhoSimpleFields a =
+            cpu::rhoSimple::createFields(caseDir + "/" + startT, caseDir, simpleDict, &fvSolution,
+                                         m, g, patches);
+        cpu::rhoSimple::RhoSimpleFields b =
+            cpu::rhoSimple::createFields(caseDir + "/" + startT, caseDir, simpleDict, &fvSolution,
+                                         m, g, patches);
+        // MODEL-AWARE (queue 13e): this control mutated keCoeffs.Cmu whatever the fixture's model, so on
+        // an SST fixture it read nut 0.0000e+00 and FAILED (measured on rhoSST, 2026-09-03) -- and no
+        // registered gate had ever pointed this harness at one, which is why it never showed. kOmegaSST
+        // never reads Cmu; its coefficient of the same rank is betaStar, which drives k's destruction
+        // (betaStar*rho*omega*k, kOmegaSSTBase.C) and through k the nut this control watches.
+        const bool sst = (f.rasModel == "kOmegaSST");
+        check(sst ? "the fixture declares NO kOmegaSSTCoeffs (else this control is not the one described)"
+                  : "the fixture declares NO kEpsilonCoeffs (else this control is not the one described)",
+              sst ? std::fabs((double)a.sstCoeffs.betaStar - 0.09) < 1e-12
+                  : std::fabs((double)a.keCoeffs.Cmu - 0.09) < 1e-12);
+
+        // Cmu drives nut = Cmu*k^2/eps directly (betaStar drives k, and nut = a1*k/... follows), and
+        // Prt drives alphat = rho*nut/Prt, so each moves a DIFFERENT field: perturbing them separately
+        // says which one was plumbed.
+        if (sst) b.sstCoeffs.betaStar = a.sstCoeffs.betaStar * 2.0;
+        else     b.keCoeffs.Cmu       = a.keCoeffs.Cmu * 2.0;
+        b.Prt = a.Prt * 2.0;
+
+        cpu::rhoSimple::StepInput sin2 = in;
+        (void)cpu::rhoSimple::rhoSimpleStep(a, sin2, m, g, patches);
+        (void)cpu::rhoSimple::rhoSimpleStep(b, sin2, m, g, patches);
+
+        const double dNut    = relL2(b.nut.internal,    a.nut.internal);
+        const double dAlphat = relL2(b.alphat.internal, a.alphat.internal);
+        std::printf("     %-34s nut %.4e   alphat %.4e\n",
+                    "control: case coeffs reach the solve", dNut, dAlphat);
+        check(sst ? "betaStar from the CASE reaches the closure (control)"
+                  : "Cmu from the CASE reaches the closure (control)", dNut > 1e-6);
+        check("Prt from the CASE reaches alphat (control)", dAlphat > 1e-6);
+    }
+
+    if (failures == 0) std::printf("PASS\n");
+    else               std::printf("FAIL (%d)\n", failures);
+    return failures == 0 ? 0 : 1;
+}

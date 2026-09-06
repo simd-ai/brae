@@ -35,12 +35,17 @@ inline void interfaceAssembleLaplacian(DeviceAMI& ami, const DeviceBuffer<scalar
                                        DeviceBuffer<scalar>& diag, bool addToDiag = true)
 { deviceAmiAssembleLaplacian(ami, gammaCell, diag, addToDiag); }
 
+// `wsch`: the div scheme's face interpolation weight per interface face. Null (the default) means
+// upwind, w = pos0(phi), which is what both assemblies hardcoded for every case regardless of what the
+// case's div(phi,U) actually asked for -- see amiMomKernel for the OpenFOAM derivation.
 inline void interfaceAssembleMomentum(DeviceCyclic& cyc, const DeviceBuffer<scalar>& nuEffCell,
-                                      DeviceBuffer<scalar>& diag)
-{ deviceCyclicAssembleMomentum(cyc, nuEffCell, diag); }
+                                      DeviceBuffer<scalar>& diag,
+                                      const DeviceBuffer<scalar>* wsch = nullptr)
+{ deviceCyclicAssembleMomentum(cyc, nuEffCell, diag, wsch); }
 inline void interfaceAssembleMomentum(DeviceAMI& ami, const DeviceBuffer<scalar>& nuEffCell,
-                                      DeviceBuffer<scalar>& diag)
-{ deviceAmiAssembleMomentum(ami, nuEffCell, diag); }
+                                      DeviceBuffer<scalar>& diag,
+                                      const DeviceBuffer<scalar>* wsch = nullptr)
+{ deviceAmiAssembleMomentum(ami, nuEffCell, diag, wsch); }
 
 inline void interfaceOffDiagSum(const DeviceCyclic& cyc, DeviceBuffer<scalar>& sumOff)
 { deviceCyclicOffDiagSum(cyc, sumOff); }

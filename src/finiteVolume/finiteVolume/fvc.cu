@@ -4,6 +4,44 @@ namespace brae {
 namespace fvc {
 
 std::vector<vector> gaussGrad(
+    const std::vector<scalar>& internal,
+    const std::vector<std::vector<scalar>>& boundary,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    const label nC  = m.nCells();
+    const label nIf = m.nInternalFaces();
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    const std::vector<scalar>& w  = g.weights();
+    const std::vector<vector>& Sf = g.Sf();
+
+    std::vector<vector> grad(nC, vector{0, 0, 0});
+    for (label f = 0; f < nIf; ++f)
+    {
+        const label o = own[f], n = nei[f];
+        const scalar pf = w[f] * internal[o] + (1.0 - w[f]) * internal[n];
+        const vector Sfssf = Sf[f] * pf;
+        grad[o] += Sfssf;
+        grad[n] = grad[n] - Sfssf;
+    }
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& fp = patches[pi];
+        if (pi >= boundary.size()) continue;
+        for (label i = 0; i < fp.size && i < (label)boundary[pi].size(); ++i)
+            grad[fp.faceCells[i]] += Sf[fp.start + i] * boundary[pi][i];
+    }
+    for (label c = 0; c < nC; ++c)
+    {
+        const scalar iv = 1.0 / g.V()[c];
+        grad[c] = grad[c] * iv;
+    }
+    return grad;
+}
+
+std::vector<vector> gaussGrad(
     const GeometricField<scalar>& p,
     const PrimitiveMesh& m,
     const FvGeometry& g,
@@ -74,8 +112,13 @@ std::vector<tensor> gaussGrad(
     return grad;
 }
 
+// Array form. HbyA in pEqn.H is not a GeometricField in the _cpp reference -- it is an internal field
+// plus a boundary field that constrainHbyA has partly overwritten from U -- so the flux operator is
+// expressed over plain arrays and the GeometricField overload delegates to it. One implementation, so the
+// solver path and the field path cannot drift apart.
 SurfaceScalarField flux(
-    const GeometricField<vector>& U,
+    const std::vector<vector>& internal,
+    const std::vector<std::vector<vector>>& boundary,
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& patches)
@@ -90,19 +133,29 @@ SurfaceScalarField flux(
     phi.internal.resize(nIf);
     for (label f = 0; f < nIf; ++f)
     {
-        const vector Uf = w[f] * U.internal[own[f]] + (1.0 - w[f]) * U.internal[nei[f]];
+        const vector Uf = w[f] * internal[own[f]] + (1.0 - w[f]) * internal[nei[f]];
         phi.internal[f] = dot(Uf, Sf[f]);
     }
     phi.boundary.resize(patches.size());
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const FvPatch& fp = patches[pi];
-        const std::vector<vector>& uv = U.boundary[pi]->value();
         phi.boundary[pi].resize(fp.size);
         for (label i = 0; i < fp.size; ++i)
-            phi.boundary[pi][i] = dot(uv[i], Sf[fp.start + i]);
+            phi.boundary[pi][i] = dot(boundary[pi][i], Sf[fp.start + i]);
     }
     return phi;
+}
+
+SurfaceScalarField flux(
+    const GeometricField<vector>& U,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    std::vector<std::vector<vector>> bnd(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi) bnd[pi] = U.boundary[pi]->value();
+    return flux(U.internal, bnd, m, g, patches);
 }
 
 SurfaceScalarField rhoFlux(
@@ -197,15 +250,20 @@ std::vector<std::vector<tensor>> gradUBoundary(
         const FvPatch& fp = patches[pi];
         gb[pi].assign(fp.size, tensor{0,0,0,0,0,0,0,0,0});
         if (fp.type == "empty") continue;   // empty patches contribute nothing to fvc operations
-        const std::vector<vector>& uv = U.boundary[pi]->value();
+        // THE PATCH'S OWN snGrad(), as OF's gaussGrad::correctBoundaryConditions asks for it
+        // (gaussGrad.C: `gGradbf[patchi] += n*(vsf.boundaryField()[patchi].snGrad() - (n & gGradbf))`).
+        // This used to inline (U_b - U_c)*deltaCoeffs, which is the BASE class's formula and wrong on
+        // every class that overrides it -- zeroGradient (exactly zero), fixedGradient (the prescribed
+        // gradient) and the mixed family, whose snGrad uses the CURRENT valueFraction while value() still
+        // carries the blend of the previous one. See fv_patch_field.cuh's snGrad for the measurement.
+        const std::vector<vector> sn = U.boundary[pi]->snGrad(U.internal);
         for (label i = 0; i < fp.size; ++i)
         {
             const label c  = fp.faceCells[i];
             const label gf = fp.start + i;
             const vector n = (1.0 / magSf[gf]) * Sf[gf];                       // unit normal
-            const vector snGrad = (uv[i] - U.internal[c]) * fp.deltaCoeffs[i]; // (U_b - U_c)/d
             const tensor& gc = gradUcell[c];                                   // extrapolated cell grad
-            gb[pi][i] = gc + outer(n, snGrad - dot(n, gc));                    // normal comp -> snGrad
+            gb[pi][i] = gc + outer(n, sn[i] - dot(n, gc));                     // normal comp -> snGrad
         }
     }
     return gb;
@@ -241,6 +299,54 @@ std::vector<vector> div(
     for (label c = 0; c < nC; ++c)
         d[c] = d[c] / g.V()[c];
     return d;
+}
+
+SurfaceScalarField snGrad(
+    const GeometricField<scalar>& vf,
+    const PrimitiveMesh&          m,
+    const FvGeometry&             g,
+    const std::vector<FvPatch>&   patches,
+    bool                          corrected)
+{
+    const label nIf = m.nInternalFaces();
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    const std::vector<scalar>& dc = corrected ? g.nonOrthDeltaCoeffs() : g.deltaCoeffs();
+
+    SurfaceScalarField sf;
+    sf.internal.resize(nIf);
+    for (label f = 0; f < nIf; ++f)
+        sf.internal[f] = dc[f] * (vf.internal[nei[f]] - vf.internal[own[f]]);
+
+    // correctedSnGrad::fullGradCorrection -- linear interpolation of grad(vf) dotted with the correction
+    // vectors, which are zero on boundary faces.
+    if (corrected)
+    {
+        const std::vector<vector>  gradVf   = gaussGrad(vf, m, g, patches);
+        const std::vector<vector>& corrVecs = g.nonOrthCorrectionVectors();
+        const std::vector<scalar>& w        = g.weights();
+        for (label f = 0; f < nIf; ++f)
+        {
+            const vector& go = gradVf[own[f]];
+            const vector& gn = gradVf[nei[f]];
+            const vector  gf { w[f] * go.x + (1.0 - w[f]) * gn.x,
+                               w[f] * go.y + (1.0 - w[f]) * gn.y,
+                               w[f] * go.z + (1.0 - w[f]) * gn.z };
+            sf.internal[f] += corrVecs[f].x * gf.x + corrVecs[f].y * gf.y + corrVecs[f].z * gf.z;
+        }
+    }
+
+    sf.boundary.resize(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& fp = patches[pi];
+        const std::vector<scalar> gIC = vf.boundary[pi]->gradientInternalCoeffs();
+        const std::vector<scalar> gBC = vf.boundary[pi]->gradientBoundaryCoeffs();
+        sf.boundary[pi].resize(fp.size);
+        for (label i = 0; i < fp.size; ++i)
+            sf.boundary[pi][i] = gIC[i] * vf.internal[fp.faceCells[i]] + gBC[i];
+    }
+    return sf;
 }
 
 } // namespace fvc

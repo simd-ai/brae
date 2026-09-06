@@ -6,6 +6,7 @@
 // omega/nuTilda today and by energy/species/compressible transport later. Extracted verbatim from device_kepsilon.cu.
 #include "device_kepsilon.cuh"    // deviceBoundField + DeviceMesh/DeviceBoundary/DeviceWallData
 #include "device_ldu.cuh"
+#include "device_dilu.cuh"      // OF DILU preconditioner (null -> Jacobi)
 #include "device_pcg.cuh"         // deviceJacobiBiCGStab
 #include "device_simple.cuh"      // deviceFold/deviceRelaxDiag/deviceDiv*Coeffs/deviceLinearUpwindCorr/...
 #include "device_blas.cuh"
@@ -30,27 +31,78 @@ inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 // OF-style turbulence residual report store; clearTurbulenceReport/turbulenceReport (device_kepsilon.cu) wrap this.
 inline std::vector<ScalarSolveEntry>& turbStore() { static std::vector<ScalarSolveEntry> s; return s; }
 
+// The DILU preconditioner every turbulence solve uses, or null for Jacobi. Held here, in the same
+// file-scope idiom as turbStore above, rather than threaded through deviceKEpsilonCorrect,
+// deviceKOmegaSSTCorrect, deviceSpalartCorrect and deviceEnergyCorrect: it is one object shared by all of
+// them (the level schedule depends only on the mesh, and diluUpdate recomputes rD from whichever matrix
+// is being solved), so a parameter on four signatures would carry the same pointer four times.
+//
+// The solver sets it once at construction and it stays put; nothing else writes it.
+inline const DeviceDilu*& turbPrecon() { static const DeviceDilu* p = nullptr; return p; }
+
 namespace {
 // setValues (eps wall constraint): zero wall-cell off-diagonals + move the known eps0 to the neighbour RHS.
+//
+// DETERMINISM. This was one kernel, one thread per internal FACE, moving the contribution with
+//     if (ow) atomicAdd(&source[n], -lower[f]*eps0[o]);
+//     if (nw) atomicAdd(&source[o], -upper[f]*eps0[n]);
+// A cell receives one such contribution per constrained face it touches, so the summation order followed
+// face scheduling. It is rare -- it only bites a cell in the near-wall band with more than one constrained
+// face -- which is exactly what made it hard to see: pitzDaily/kEpsilon came out bit-identical at 1, 5, 8,
+// 10 and 15 iterations and differed at 12.
+//
+// Split into a GATHER over cells (fixed order, no atomics) and a separate zeroing pass over faces. The
+// split is required, not cosmetic: the gather must read the ORIGINAL upper/lower, and a single kernel
+// cannot order "everyone reads" before "everyone zeroes". Two launches give that ordering for free.
+//
+// Per cell c the contributions are, in this order:
+//   faces where c is OWNER      f in [ownerStart[c], ownerStart[c+1])   ->  -upper[f]*eps0[nei[f]]
+//   faces where c is NEIGHBOUR  f = losort[k], k in [losortStart[c], losortStart[c+1])
+//                                                                      ->  -lower[f]*eps0[own[f]]
+// which is the same set of terms the scatter produced, just accumulated in a fixed sequence.
 __global__
-void svFaceKernel(
+void svGatherKernel(
+    int nC,
+    const label* __restrict__ own,
+    const label* __restrict__ nei,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ losort,
+    const label* __restrict__ losortStart,
+    const label* __restrict__ isW,
+    const scalar* __restrict__ eps0,
+    const scalar* __restrict__ upper,
+    const scalar* __restrict__ lower,
+    scalar* __restrict__ source)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    scalar s = 0.0;
+    for (label f = ownerStart[c]; f < ownerStart[c+1]; ++f)
+    {
+        const int n = nei[f];
+        if (isW[n]) s -= upper[f] * eps0[n];
+    }
+    for (label k = losortStart[c]; k < losortStart[c+1]; ++k)
+    {
+        const label f = losort[k];
+        const int o = own[f];
+        if (isW[o]) s -= lower[f] * eps0[o];
+    }
+    if (s != 0.0) source[c] += s;
+}
+// Zeroing pass: independent per face, no accumulation, so it needs no ordering guarantee of its own.
+__global__
+void svZeroFaceKernel(
     int nIf,
     const label* __restrict__ own,
     const label* __restrict__ nei,
     const label* __restrict__ isW,
-    const scalar* __restrict__ eps0,
     scalar* __restrict__ upper,
-    scalar* __restrict__ lower,
-    scalar* __restrict__ source)
+    scalar* __restrict__ lower)
 {
     const int f = blockIdx.x * blockDim.x + threadIdx.x;
     if (f >= nIf) return;
-
-    const int o = own[f], n = nei[f];
-    const bool ow = isW[o], nw = isW[n];
-    if (ow) atomicAdd(&source[n], -lower[f] * eps0[o]);
-    if (nw) atomicAdd(&source[o], -upper[f] * eps0[n]);
-    if (ow || nw) { upper[f] = 0.0; lower[f] = 0.0; }
+    if (isW[own[f]] || isW[nei[f]]) { upper[f] = 0.0; lower[f] = 0.0; }
 }
 
 
@@ -177,7 +229,22 @@ void deviceSolveScalarTransport(
     const DeviceBuffer<scalar>* limField = nullptr,
     const DeviceBuffer<scalar>* limGradX = nullptr,
     const DeviceBuffer<scalar>* limGradY = nullptr,
-    const DeviceBuffer<scalar>* limGradZ = nullptr)
+    const DeviceBuffer<scalar>* limGradZ = nullptr,
+    // OF DILU preconditioner for this field's BiCGStab; null keeps Jacobi. LAST in the list so every
+    // existing positional call is untouched. The level schedule depends only on the mesh, so ONE
+    // instance serves every field -- diluUpdate recomputes rD from the current matrix per solve.
+    const DeviceDilu* precon = nullptr,
+    // fvSolution solvers/<field>/nSweeps (smoothSolver.C:78, default 1): smoothing sweeps between
+    // residual EVALUATIONS, so the stop test is consulted only on a multiple of it and the solve
+    // overshoots its relTol by whatever the extra sweeps buy. Trailing, like `precon`, so every existing
+    // positional call keeps its behaviour exactly. Meaningful only on the smoothSolver path -- the
+    // BiCGStab branch below has no such control, which is OpenFOAM's rule too (nSweeps lives on
+    // smoothSolver alone).
+    int nSweeps = 1,
+    // WHICH GaussSeidel smoother the case named. true = symGaussSeidel (ascending then descending);
+    // false = GaussSeidel, whose sweep loop in GaussSeidelSmoother.C is the ascending walk ONLY. They
+    // are different smoothers, so the same relTol stops in a different place. Trailing, like nSweeps.
+    bool gsSymmetric = true)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> Df;
@@ -228,9 +295,9 @@ void deviceSolveScalarTransport(
             deviceCellLimitGrad(dm, field, bv, lgx, lgy, lgz, gradLimitK, ifs, nIfs);
         }
     }
+    const bool sharedLim = limField && limGradX && limGradY && limGradZ;
     if (limited)
     {
-        const bool sharedLim = limField && limGradX && limGradY && limGradZ;
         deviceDivLimitedCoeffs(dm, phiInt,
                                sharedLim ? *limField  : field,
                                sharedLim ? *limGradX  : gx,
@@ -308,10 +375,28 @@ void deviceSolveScalarTransport(
     // interface (cyclic/cyclicAMI) coupling: fold div(phi,f) - laplacian(D,f) at the interface into the diagonal and
     // set the off-diagonal ifCoeff. A scalar is invariant under the cyclic transform (no rotation of the value), so the
     // translational momentum assembly + a plain weighted off-diagonal apply even for a ROTATIONAL interface.
+    //
+    // ...WITH THE SCHEME'S OWN FACE WEIGHT, not upwind's. `limited` means the case named a TVD scheme for
+    // div(phi,f) -- the SST and pipeCyclic tutorials all say `bounded Gauss limitedLinear 1` on k,
+    // epsilon, omega and nuTilda -- and OpenFOAM limits a coupled face exactly as it limits an internal
+    // one. Assembling the interface upwind regardless is the same defect the momentum predictor carried,
+    // reaching every turbulence scalar through this one call. Null for upwind and linearUpwind, whose
+    // matrix IS upwind's.
+    DeviceBuffer<scalar> ifWsch;
+    if (limited)
+    {
+        const DeviceBuffer<scalar>& lf = sharedLim ? *limField : field;
+        const DeviceBuffer<scalar>& lx = sharedLim ? *limGradX : gx;
+        const DeviceBuffer<scalar>& ly = sharedLim ? *limGradY : gy;
+        const DeviceBuffer<scalar>& lz = sharedLim ? *limGradZ : gz;
+        if (ami && ami->n)      deviceAmiLimitedWeights(*ami, lf, lx, ly, lz, twoByk, ifWsch);
+        else if (cyc && cyc->n) deviceCyclicLimitedWeights(*cyc, lf, lx, ly, lz, twoByk, ifWsch);
+    }
+    const DeviceBuffer<scalar>* ifW = ifWsch.size() ? &ifWsch : nullptr;
     DeviceBuffer<scalar> ifSumOff;
-    if (ami && ami->n) { interfaceAssembleMomentum(*ami, D, aD);
+    if (ami && ami->n) { interfaceAssembleMomentum(*ami, D, aD, ifW);
         ifSumOff.copyFrom(std::vector<scalar>(nC, 0.0)); interfaceOffDiagSum(*ami, ifSumOff); }
-    else if (cyc && cyc->n) { interfaceAssembleMomentum(*cyc, D, aD);
+    else if (cyc && cyc->n) { interfaceAssembleMomentum(*cyc, D, aD, ifW);
         ifSumOff.copyFrom(std::vector<scalar>(nC, 0.0)); interfaceOffDiagSum(*cyc, ifSumOff); }
     // implicit fvm::ddt(f) (URANS transient turbulence): the diagonal into the assembled aD (BEFORE relax = OF assembles
     // ddt into the eqn then relaxes), the source (old-time) into src. steady (ddt.c.active==false) -> exact no-op, so this
@@ -323,14 +408,20 @@ void deviceSolveScalarTransport(
     { DeviceBuffer<scalar> t; deviceHadamard(t, aDelta, field); deviceAxpy(1.0, t, src); }
     if (fvoSetMask && fvoSetVal)   // fvOptions scalarFixedValueConstraint (OF: before boundaryManipulate)
     {
-        svFaceKernel<<<nBlocks(dm.nInternalFaces), TPB>>>(dm.nInternalFaces, dm.owner.data(), dm.nei.data(), fvoSetMask->data(), fvoSetVal->data(), aU.data(), aL.data(), src.data());
+        svGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.owner.data(), dm.nei.data(), dm.ownerStart.data(),
+                                            dm.losort.data(), dm.losortStart.data(), fvoSetMask->data(), fvoSetVal->data(),
+                                            aU.data(), aL.data(), src.data());
+        svZeroFaceKernel<<<nBlocks(dm.nInternalFaces), TPB>>>(dm.nInternalFaces, dm.owner.data(), dm.nei.data(), fvoSetMask->data(), aU.data(), aL.data());
         svBndKernel<<<nBlocks(dm.nBndFaces), TPB>>>(dm.nBndFaces, dm.bndCell.data(), fvoSetMask->data(), aIC.data(), aBC.data());
         svCellKernel<<<nBlocks(nC), TPB>>>(nC, fvoSetMask->data(), aRD.data(), fvoSetVal->data(), src.data());
         cudaCheck(cudaGetLastError(), "fvOptionsSetValues");
     }
         if (wall && eps0)   // eps near-wall setValues constraint (k has none)
     {
-        svFaceKernel<<<nBlocks(dm.nInternalFaces), TPB>>>(dm.nInternalFaces, dm.owner.data(), dm.nei.data(), wall->isWallCell.data(), eps0->data(), aU.data(), aL.data(), src.data());
+        svGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.owner.data(), dm.nei.data(), dm.ownerStart.data(),
+                                            dm.losort.data(), dm.losortStart.data(), wall->isWallCell.data(), eps0->data(),
+                                            aU.data(), aL.data(), src.data());
+        svZeroFaceKernel<<<nBlocks(dm.nInternalFaces), TPB>>>(dm.nInternalFaces, dm.owner.data(), dm.nei.data(), wall->isWallCell.data(), aU.data(), aL.data());
         svBndKernel<<<nBlocks(dm.nBndFaces), TPB>>>(dm.nBndFaces, dm.bndCell.data(), wall->isWallCell.data(), aIC.data(), aBC.data());
         svCellKernel<<<nBlocks(nC), TPB>>>(nC, wall->isWallCell.data(), aRD.data(), eps0->data(), src.data());
         if (ami && ami->n) interfaceZeroWallIfCoeff(*ami, wall->isWallCell);   // wall/interface cells: don't perturb the fixed eps
@@ -374,25 +465,67 @@ void deviceSolveScalarTransport(
     // sumA comes from A applied to a field of ones, which is the row sum by definition, so the interface
     // off-diagonals are included exactly as deviceAmul accounts for them -- no second traversal to keep
     // in step with the LDU layout.
-    const scalar normF = [&]{
-        const int n = static_cast<int>(field.size());
-        if (n == 0) return scalar(1);
-        DeviceBuffer<scalar> ones, sumA, Apsi, t, w;
-        ones.copyFrom(std::vector<scalar>(static_cast<std::size_t>(n), scalar(1)));
-        deviceAmul(sv, ones, sumA);                     // sumA = A * 1 = row sums
-        deviceAmul(sv, field, Apsi);                    // A.psi
-        const scalar xRef = deviceDot(field, ones) / static_cast<scalar>(n);
-        deviceCopy(t, sumA);
-        deviceScale(t, xRef);                           // t = sumA*xRef
-        deviceCopy(w, Apsi); deviceAxpy(-1.0, t, w);    // w = A.psi - t
-        scalar nf = deviceSumMag(w);
-        deviceCopy(w, B);    deviceAxpy(-1.0, t, w);    // w = b - t
-        nf += deviceSumMag(w);                          // sum|..| + sum|..| == sum(|..|+|..|)
-        return nf + scalar(1e-20);                      // solverPerformance::small_
-    }();
+    // Item 66: the same three reductions and the same operations (the divide by n, the sumA*xRef scale,
+    // the two sums, (n1 + n2) + 1e-20) stay on the device in deviceNormFactorInto, and the solvers
+    // divide by the result there; the host never reads it. BRAE_NORMFACTOR_HOST=1 keeps the previous
+    // host arithmetic below, the identity gate's other arm.
+    DeviceBuffer<scalar> dnf;
+    scalar normF = scalar(1);
+    if (normFactorOnHost())
+    {
+        normF = [&]{
+            const int n = static_cast<int>(field.size());
+            if (n == 0) return scalar(1);
+            DeviceBuffer<scalar> sumA, Apsi, t, w;
+            const DeviceBuffer<scalar>& ones = deviceOnes(n);
+            deviceAmul(sv, ones, sumA);                     // sumA = A * 1 = row sums
+            deviceAmul(sv, field, Apsi);                    // A.psi
+            const scalar xRef = deviceDot(field, ones) / static_cast<scalar>(n);
+            deviceCopy(t, sumA);
+            deviceScale(t, xRef);                           // t = sumA*xRef
+            deviceCopy(w, Apsi); deviceAxpy(-1.0, t, w);    // w = A.psi - t
+            scalar nf = deviceSumMag(w);
+            deviceCopy(w, B);    deviceAxpy(-1.0, t, w);    // w = b - t
+            nf += deviceSumMag(w);                          // sum|..| + sum|..| == sum(|..|+|..|)
+            return nf + scalar(1e-20);                      // solverPerformance::small_
+        }();
+        dnf.resize(1);
+        cudaMemcpyAsync(dnf.data(), &normF, sizeof(scalar), cudaMemcpyHostToDevice, cudaStreamPerThread);
+    }
+    else
+    {
+        deviceNormFactorInto(sv, field, B, deviceOnes(static_cast<int>(field.size())), dnf);
+    }
     DeviceSolverPerf perf;                                        // OF-style report: init/final/nIter for this scalar
-    if (gs) deviceSymGaussSeidel(sv, B, field, normF, tol, relTolKE, 3000, &perf);
-    else    perf = deviceJacobiBiCGStab(sv, B, field, normF, tol, relTolKE, 3000, keCheckEvery);  // loose (relTol); interface in the Amul
+    // The PER-CELL residual of this transport equation, r = B - A*psi, before the solve moves anything.
+    // Same instrument as the momentum one: a global initial residual says a scalar equation disagrees
+    // with OpenFOAM's converged state but never WHERE, and every defect found in this port was found by
+    // splitting a residual by region. Named by field so k, epsilon, omega, nuTilda, ReThetat and
+    // gammaInt each get their own.
+    if (stageDumpActive() && stageDumpFirstOnly((std::string("resid_") + fieldName).c_str()))
+    {
+        DeviceBuffer<scalar> Apsi, r;
+        deviceAmul(sv, field, Apsi);
+        deviceCopy(r, B);
+        deviceAxpy(-1.0, Apsi, r);
+        stageDump(std::string("stage_resid_") + fieldName, r);
+        stageDump(std::string("stage_resid_") + fieldName + "_normFactor",
+                  std::vector<scalar>(1, normFactorOnHost() ? normF : deviceReadScalar(dnf.data())));
+    }
+    // The smoothSolver the case asked for, algorithm included: OpenFOAM's own sweep, level-scheduled
+    // (device_sym_gauss_seidel.cuh), symmetric or ascending-only as the `smoother` entry names.
+    if (gs) deviceSymGaussSeidel(sv, B, field, dnf.data(), tol, relTolKE, 3000, &perf, /*minIter*/0, nSweeps,
+                                 gsSymmetric);
+    // DILU when the case asks for it, Jacobi otherwise. NOT a cost choice: both reach the requested
+    // relTol, but they stop in different places -- on turbulentFlatPlate:kEpsilon OpenFOAM's DILU solve
+    // lands at a median 0.0064 of the initial residual against brae's Jacobi 0.0726, and that gap leaves
+    // k and epsilon mutually inconsistent enough to diverge. See DeviceSimpleControls::diluKE.
+    else
+    {
+        const DeviceDilu* pc = precon ? precon : turbPrecon();
+        perf = deviceJacobiBiCGStab(sv, B, field, dnf.data(), tol, relTolKE, 3000, keCheckEvery, 0,
+                                    (pc && pc->valid) ? pc : nullptr);
+    }
     turbStore().push_back({fieldName, perf});                    // record for the "Solving for <field>" line
     if (boundPositive) deviceBoundField(dm, field, 1e-15);        // OF bound(field): neg -> local avg, not floor
 }

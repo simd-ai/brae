@@ -13,6 +13,45 @@
 
 namespace brae {
 
+namespace {
+// The level-0 fine coefficients over the EXTENDED edge list the AMG hierarchy was built from:
+// [internal faces | cyclic entries | AMI stencil entries].
+//
+// THE SIGN, and it is the whole subtlety. brae's lduMatrix edge means
+//     Ax[nei] += lower*x[own] ;  Ax[own] += upper*x[nei]
+// while an interface entry means only  Apsi[own] += ifCoeff*psi[nbr]  -- ONE direction. The reverse
+// direction is a SEPARATE appended edge, contributed by the matching entry on the other patch. So each
+// edge carries upper = ifCoeff and lower = ZERO; writing ifCoeff into both would count every periodic
+// connection twice.
+//
+// It still comes out symmetric on the coarse grid, which is what the V-cycle needs: the two edges (A,B)
+// and (B,A) agglomerate to the same coarse face with opposite orientation, and agglomerate()'s faceFlip
+// sends the reversed one's upper into cLower. Where both cells land in the same aggregate the pair goes
+// into the coarse diagonal instead, which is equally right.
+__global__
+void amgFineCoeffKernel(
+    int nIf, int nCyc, int nAmi,
+    const scalar* __restrict__ pU,
+    const scalar* __restrict__ pL,
+    const scalar* __restrict__ cycIf,
+    const scalar* __restrict__ amiIf,
+    const label*  __restrict__ amiSrc,
+    const scalar* __restrict__ amiW,
+    scalar* __restrict__ up,
+    scalar* __restrict__ lo)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nIf + nCyc + nAmi) return;
+    if (i < nIf)              { up[i] = pU[i];  lo[i] = pL[i]; return; }
+    if (i < nIf + nCyc)       { up[i] = cycIf[i - nIf];                    lo[i] = 0; return; }
+    const int j = i - nIf - nCyc;
+    up[i] = amiIf[amiSrc[j]] * amiW[j];
+    lo[i] = 0;
+}
+}   // namespace
+
+
+
     // BRAE_SETUP_TIMING: same milestone trace as the driver, inside the constructor. The ctor is the
     // longest silent stretch of set-up (mesh upload, AMG hierarchy, wall distance, validate) and a hang
     // in it looks identical to a hang in the driver from the outside.
@@ -37,7 +76,8 @@ namespace brae {
         const GeometricField<scalar>* eps,
         const GeometricField<scalar>* nut,
         const GeometricField<scalar>* ReThetat,
-        const GeometricField<scalar>* gammaInt)
+        const GeometricField<scalar>* gammaInt,
+    bool                          phiWasRead)
         : fvp_(fvp), ctl_(ctl), nC_(m.nCells()), nIf_(m.nInternalFaces())
     {
         // cyclic (periodic) interfaces: a SEPARATE lduInterface (OF cyclicFvPatchField::updateInterfaceMatrix),
@@ -73,7 +113,12 @@ namespace brae {
         if (hasCyclic_ || hasAMI_) ctl_.useGraph = false;   // V-cycle graph replay not interface-safe; minor perf only.
         // The DILU level schedule: mesh addressing only, so once per solver. Skipped entirely when the
         // case did not ask for DILU, so no case pays for it unasked.
-        if (ctl_.diluU) diluU_ = buildDeviceDilu(m.owner(), m.neighbour(), nC_);
+        // ONE level schedule for every DILU-preconditioned solve on this mesh -- momentum and the
+        // turbulence pair alike. The schedule is a property of the addressing, not of the matrix, and
+        // diluUpdate recomputes rD from whichever matrix is being solved, so building it twice would
+        // duplicate the DAG for nothing.
+        if (ctl_.diluU || ctl_.diluKE) dilu_ = buildDeviceDilu(m.owner(), m.neighbour(), nC_);
+        turbPrecon() = (ctl_.diluKE && dilu_.valid) ? &dilu_ : nullptr;
         ctorMark("enter");
         dm_   = buildDeviceMesh(m, g, fvp);
         ctorMark("deviceMesh built");
@@ -83,6 +128,20 @@ namespace brae {
         for (const auto& a : amis)    amiRuns_.push_back({a.patch, (label)a.ownCell.size()});
         dbU_  = buildDeviceVectorBoundary(U, fvp, g);
         dbP_  = buildDeviceBoundary(p, fvp, g);
+        // fixedFluxPressure needs constrainPressure every assembly (constrainPressure.C:60-77), and
+        // this engine never runs it -- the patch would keep its construction-time gradient:
+        // zeroGradient under fixedFluxPressure's name, on every legacy driver built on this solver
+        // (brae non-V2, brae_pimpleFoam, brae_rhoSimpleFoam and its slice/legacy siblings). OpenFOAM
+        // fatals identically when the gradient is never set
+        // (fixedFluxPressureFvPatchScalarField.C:150-163). nSnGradFaces counts exactly the
+        // updateable-snGrad faces, so plain fixedGradient (legitimately construction-frozen) does
+        // not trip this.
+        if (dbP_.nSnGradFaces > 0)
+            throw std::runtime_error(
+                "brae: p carries a fixedFluxPressure patch, but this driver never runs "
+                "constrainPressure, so the patch would keep its construction-time gradient -- "
+                "zeroGradient under fixedFluxPressure's name. Run the case through the V2/mirror "
+                "path (BRAE_SIMPLEFOAM_V2=1) or change the boundary condition.");
         // pcorr's boundary, for CorrectPhi. OF builds it as zeroGradient EVERYWHERE except the patches
         // where p itself fixes a value, which become fixedValue 0 (CorrectPhi.C:56-70). It is p's
         // geometry with p's types thrown away, so it is built here beside dbP_ rather than derived at
@@ -102,7 +161,7 @@ namespace brae {
             pc.evaluateBoundary();
             dbPcorr_ = buildDeviceBoundary(pc, fvp, g);
         }
-        wall_ = buildDeviceWallData(m, g, fvp, U);
+        wall_ = buildDeviceWallData(m, g, fvp, U, ctl_.turbWallPatch);
         {   // DeviceBoundary face offset of each patch, for setPatchVelocity
             label st = 0;
             patchStart_.assign(fvp.size(), 0);
@@ -152,16 +211,18 @@ namespace brae {
             nutBndFile_.copyFrom(nb);
         }
         {
-            // Wall-face -> boundary-face index. buildDeviceWallData walks fvp keeping type=="wall" patches;
-            // DeviceBoundary walks the same fvp skipping cyclic/cyclicAMI (a wall is neither), so the wall
-            // faces are a subsequence of the boundary faces and this map is just the running count.
+            // Wall-face -> boundary-face index. buildDeviceWallData walks fvp keeping the TURBULENCE WALL
+            // patches (isTurbWallPatch: type=="wall" AND named by the epsilon/omega BC); DeviceBoundary
+            // walks the same fvp skipping cyclic/cyclicAMI (a wall is neither), so the wall faces are a
+            // subsequence of the boundary faces and this map is just the running count. The two MUST use
+            // the same predicate or the map silently points at the wrong faces.
             std::vector<label> wfb;
             label bi = 0;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
                 if (isCoupledInterfaceType(fvp[pi].type)) continue;
                 for (label i = 0; i < fvp[pi].size; ++i, ++bi)
-                    if (fvp[pi].type == "wall") wfb.push_back(bi);
+                    if (isTurbWallPatch(fvp, pi, ctl_.turbWallPatch)) wfb.push_back(bi);
             }
             if (!wfb.empty()) wfBndIdx_.copyFrom(wfb);
         }
@@ -331,13 +392,30 @@ namespace brae {
             ddtCorrBndMask_.copyFrom(mask);
         }
         nuBndConst_.copyFrom(std::vector<scalar>(dbExtrap_.n, ctl.nu));
-        // AMG hierarchy for the pressure Laplacian (static: faceWeights = |Sf|), built from the mesh internal faces.
-        // The cyclic interface is NOT in the AMG: a Galerkin coarse operator built from the internal-face restriction
-        // cannot represent the long-range periodic edges (the V-cycle diverges, OF handles this with a dedicated
-        // cyclicGAMGInterface agglomerated at every level). Instead, when cyclic is present the pressure is solved with
-        // Jacobi-PCG over the interface-coupled fine operator (deviceLduViewCyclic), the device analog of the validated
-        // host cyclicPCG. cyclicGAMGInterface is the deferred perf path; for now AMG is only used on non-cyclic cases.
-        const std::vector<label> ownerInt(m.owner().begin(), m.owner().begin() + nIf_), neiInt(m.neighbour());
+        // AMG hierarchy for the pressure Laplacian (static: faceWeights = |Sf|), built from the mesh internal faces
+        // PLUS the coupled-interface edges.
+        //
+        // The interface edges used to be left out, and the whole AMG with them: a cyclic or AMI mesh fell back to
+        // Jacobi-PCG over the interface-coupled fine operator. That is a diagonal preconditioner on a Poisson
+        // problem, and it costs what one costs -- measured on pipeCyclic, 1250 cells with a periodic pair, brae
+        // took 153/118/130 pressure iterations where OpenFOAM's GAMG took 5/5/2, while brae on the 10x LARGER
+        // interface-free pitzDaily took 18. A mesh ten times smaller needing eight times the iterations is the
+        // O(sqrt(N)) signature of losing the multigrid, not a property of the mesh.
+        //
+        // Nothing about a periodic edge actually resists agglomeration: buildAMG takes a plain edge list, and an
+        // interface entry IS an edge -- (ownCell, nbrCell) for a conformal 1:1 pair, and (ownCell[i], nbrCell[k])
+        // per stencil entry with the AMI weight folded into the face weight for a non-conformal one. The
+        // agglomeration is symmetric in owner/nei and carries a faceFlip per fine face, so an edge whose coarse
+        // orientation comes out reversed scatters into cLower instead of cUpper by itself.
+        //
+        // Each physical periodic connection appears TWICE, once from each side's own patch entry, and that is
+        // exactly right: the two carry the two directions of one lduMatrix edge. Coarsening sees the pair as one
+        // strong connection, which is what it is.
+        //
+        // OpenFOAM does the same thing by a different route -- a dedicated cyclicGAMGInterface agglomerated at
+        // every level -- and the point of both is the same: the coarse grid has to be able to move the periodic
+        // mode, or the outer Krylov has to do it one iteration at a time.
+        std::vector<label> ownerInt(m.owner().begin(), m.owner().begin() + nIf_), neiInt(m.neighbour());
         std::vector<scalar> fwAMG(g.magSf().begin(), g.magSf().begin() + nIf_);   // default: geometric face area (bit-identical)
         if (std::getenv("BRAE_AMG_SOC"))   // SoC ON: weight = LAPLACIAN coupling magSf*deltaCoeffs (the real matrix strength,
         {
@@ -345,8 +423,58 @@ namespace brae {
             for (label f = 0; f < nIf_; ++f)
                 fwAMG[f] *= dcg[f];                  // strong-face filter sees the true anisotropy
         }
+        // The interface edges, appended after the internal faces so a fine coefficient array is simply
+        // [internal faces | interface entries] and level-0 Galerkin reads them with no extra addressing.
+        // nAmgIfEdges_ records how many were added; zero on a mesh without interfaces, which leaves the
+        // hierarchy and every existing case bit-identical.
+        nAmgIfEdges_ = 0;
+        amgIfOwn_.clear();
+        amgIfNbr_.clear();
+        if (hasCyclic_ || hasAMI_)
+        {
+            const std::vector<AMIInterface> amis = buildAMIInterfaces(m, g, fvp);
+            for (const CyclicInterface& c : cyclics)
+                for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+                {
+                    amgIfOwn_.push_back(c.faceCells[i]);
+                    amgIfNbr_.push_back(c.nbrFaceCells[i]);
+                    // |Sf| of this patch face, the same geometric weight the internal faces carry.
+                    fwAMG.push_back(fvp[c.patch].magSf[i]);
+                }
+            for (const AMIInterface& a : amis)
+                for (std::size_t i = 0; i < a.ownCell.size(); ++i)
+                    for (label k = a.srcOffset[i]; k < a.srcOffset[i+1]; ++k)
+                    {
+                        amgIfOwn_.push_back(a.ownCell[i]);
+                        amgIfNbr_.push_back(a.nbrCell[k]);
+                        fwAMG.push_back(a.magSf[i] * a.weight[k]);   // the AMI weight IS the edge's share
+                    }
+            {
+                std::vector<label>  aSrc;
+                std::vector<scalar> aW;
+                for (const AMIInterface& a : amis)
+                    for (std::size_t i = 0; i < a.ownCell.size(); ++i)
+                        for (label k = a.srcOffset[i]; k < a.srcOffset[i+1]; ++k)
+                        {
+                            aSrc.push_back(static_cast<label>(i));
+                            aW.push_back(a.weight[k]);
+                        }
+                nAmgAmiEdges_ = static_cast<label>(aSrc.size());
+                if (nAmgAmiEdges_) { amgIfAmiSrc_.copyFrom(aSrc); amgIfAmiW_.copyFrom(aW); }
+            }
+            ownerInt.insert(ownerInt.end(), amgIfOwn_.begin(), amgIfOwn_.end());
+            neiInt.insert(neiInt.end(), amgIfNbr_.begin(), amgIfNbr_.end());
+            nAmgIfEdges_  = static_cast<label>(amgIfOwn_.size());
+            nAmgCycEdges_ = nAmgIfEdges_ - nAmgAmiEdges_;
+            std::printf("  AMG: %d interface edge(s) agglomerated alongside %d internal faces\n",
+                        (int)nAmgIfEdges_, (int)nIf_);
+        }
         ctorMark("pre-AMG");
-        amg_ = buildOrLoadAMG(ownerInt, neiInt, fwAMG, nC_, ctl_.caseDir + "/constant/polyMesh", ctl_.writeCache);
+        // The hierarchy CACHE keys on the mesh only, so a run that adds interface edges must not reload a
+        // hierarchy built without them (or vice versa). Interface meshes therefore build fresh.
+        amg_ = nAmgIfEdges_
+             ? buildAMG(ownerInt, neiInt, fwAMG, nC_)
+             : buildOrLoadAMG(ownerInt, neiInt, fwAMG, nC_, ctl_.caseDir + "/constant/polyMesh", ctl_.writeCache);
 
         // initial device state.
         {
@@ -373,11 +501,50 @@ namespace brae {
             if (cyc_.rotational) deviceCyclicFluxRot(cyc_, Uk_[0], Uk_[1], Uk_[2]);
             else                 interfaceFlux(cyc_, Uk_[0], Uk_[1], Uk_[2]);
         }
-        if (hasAMI_) interfaceFlux(ami_, Uk_[0], Uk_[1], Uk_[2]);   // conservative initial AMI flux from U_init
+        // The AMI interface flux. Rebuilding it from U is right for a COLD start -- the host phi carries a
+        // zeroGradient placeholder on a coupled patch, so its boundary value is neither coupled nor
+        // rotated -- but it is wrong on a RESTART, and wrong in a way that hides.
+        //
+        // A written phi DOES carry the interface flux: OpenFOAM writes it per patch (pipeCyclic's
+        // side1/side2 hold 400 and 250 values), and createFields copies those straight into
+        // phi.boundary, past the patch-field layer that would otherwise have replaced them. That flux is
+        // the CONSERVATIVE one the previous run ended with; fvc::flux(U) is not, because U alone does not
+        // know what the pressure correction did. Measured on pipeCyclic restarted from OpenFOAM's own
+        // converged state, the two differ by 4.98e-03 relative on side1.
+        //
+        // It matters most for the residual ORACLE this port leans on. Restart brae at OpenFOAM's
+        // converged fields and every internal face gets OpenFOAM's phi (read from file) while every
+        // interface face got a rebuilt one -- so the momentum residual came out exactly zero in the
+        // interior and enormous on the interface cells, which reads exactly like an interface
+        // discretisation defect and is not one.
+        if (hasAMI_)
+        {
+            bool loaded = false;
+            if (phiWasRead)
+            {
+                std::vector<scalar> ifPhi;
+                ifPhi.reserve(ami_.n);
+                for (const auto& r : amiRuns_)
+                {
+                    const label pi = r.first;
+                    if (pi < 0 || (std::size_t)pi >= phi.boundary.size()
+                        || (label)phi.boundary[pi].size() != r.second) { ifPhi.clear(); break; }
+                    ifPhi.insert(ifPhi.end(), phi.boundary[pi].begin(), phi.boundary[pi].end());
+                }
+                if ((label)ifPhi.size() == ami_.n)
+                {
+                    ami_.phi.copyFrom(ifPhi);
+                    loaded = true;
+                    std::printf("  AMI: interface flux restored from the written phi (%d faces); "
+                                "fvc::flux(U) would not be the conservative one\n", (int)ami_.n);
+                }
+            }
+            if (!loaded) interfaceFlux(ami_, Uk_[0], Uk_[1], Uk_[2]);   // cold start: rebuild from U_init
         // Stage harness: fvc::flux(U) ON the interface, from the U just read off disk. The one interface
         // quantity that can be compared against OpenFOAM with NO circularity -- restart both codes from
         // the same time directory and this is the same function of the same input on both sides, before
         // either has taken a step. Everything downstream (HbyA, p) is contaminated by the other's answer.
+        }
         if (hasAMI_ && stageDumpActive()) stageDump("stage_ami_fluxU_init", ami_.phi);
         {
             std::vector<scalar> o;
@@ -690,7 +857,11 @@ namespace brae {
                                              ctl_.saCoeffs, ctl_.keRelTol(), ctl_.bicgCheckEvery, ctl_.luK, ctl_.nonOrth,
                                              ctl_.gsK, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, kDdt,   // nuTilda ddt (kOld_)
                                              ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr, ctl_.iddes ? &hwn_ : nullptr, &lesDelta_,
-                                             wallN_.size() ? &wallN_ : nullptr);   // SA-DDES/IDDES length-scale limiter (no-op for plain SA-RANS)
+                                             wallN_.size() ? &wallN_ : nullptr,   // SA-DDES/IDDES length-scale limiter (no-op for plain SA-RANS)
+                                             /*gradULimitK*/0.0, /*nSweeps*/1, ctl_.gsKESym);   // ...and WHICH GaussSeidel the case named: OF has two in that family and
+                                             // GaussSeidelSmoother.C sweeps ascending ONLY. Passing this is what
+                                             // keeps the legacy arm from answering a `GaussSeidel` case with the
+                                             // symmetric sweep in silence, now that the substitution notice is gone.
             else if (ctl_.sst)   // de_ slot holds omega; relaxEps/limitedEps/twoBykEps carry the omega-equation settings
             {
                 deviceKOmegaSSTCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
@@ -713,12 +884,19 @@ namespace brae {
                                        // fvOptions scalarFixedValueConstraint (k / omega)
                                        fixScaK_ ? &fixScaMask_ : nullptr, fixScaK_ ? &fixScaKVal_ : nullptr,
                                        fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr,   // grad(k)/grad(omega) cellLimited (C2)
-                                       &lesDelta_);   // the case's `delta` for the DDES length scale (empty -> cubeRootVol)
+                                       &lesDelta_,   // the case's `delta` for the DDES length scale (empty -> cubeRootVol)
+                                       /*nSweeps*/1, ctl_.gsKESym);   // ...and WHICH GaussSeidel the case named
                 if (ctl_.lm)   // Langtry-Menter: transport ReThetat + gammaInt, update gammaIntEff for next iter
                     deviceKOmegaSSTLMCorrect(dm, dbU_, dbReThetat_, dbGammaInt_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
                                              ReThetat_, gammaInt_, gammaIntEff_, phiInt_, phiBnd_, ctl_.nu, ctl_.epsRelax(),
                                              ctl_.keTol(), ctl_.keRelTol(), ctl_.bicgCheckEvery, ctl_.bounded, ctl_.nonOrth,
-                                             ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, reDdt, giDdt);   // LM transition ddt
+                                             ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, reDdt, giDdt,   // LM transition ddt
+                                             // limitedLinear/linearUpwind were already defaulting off on
+                                             // this arm -- passing them explicitly changes nothing and is
+                                             // only here to reach gsSymmetric. That the LEGACY driver does
+                                             // not forward the case's div scheme to the two transition
+                                             // scalars is a separate gap, not one this line introduces.
+                                             /*limitedLinear*/false, /*linearUpwind*/false, ctl_.gsKESym);
             }
             else
                 deviceKEpsilonCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_,
@@ -738,7 +916,8 @@ namespace brae {
                                       ctl_.gradULimitK,     // kEpsilon::correct()'s own fvc::grad(U) -> gradSchemes grad(U)
                                       // fvOptions scalarFixedValueConstraint (OF eqn.setValues per field)
                                       fixScaK_ ? &fixScaMask_ : nullptr, fixScaK_ ? &fixScaKVal_ : nullptr,
-                                      fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr);
+                                      fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr,
+                                      /*nSweeps*/1, ctl_.gsKESym);   // ...and WHICH GaussSeidel the case named
         }
     }
 
@@ -950,7 +1129,30 @@ namespace brae {
         {
             deviceCopy(nuEffBnd, nuBndConst_);
             // Wall nut chosen by the 0/nut BC TYPE (ctl_.nutWall), matching OpenFOAM, NOT the model.
-            if (ctl_.sa || ctl_.nutWall == NutWall::Spalding)   // nutUSpaldingWallFunction (velocity-based Newton uTau): SA always, or the BC on any model
+            if (ctl_.sa && ctl_.nutWall == NutWall::LowRe)
+            {
+                // nutLowReWallFunction on SA: calcNut() returns Zero UNCONDITIONALLY on every model
+                // (nutLowReWallFunctionFvPatchScalarField.C:38-42), so the wall faces carry NO
+                // turbulent viscosity and the wall shear is molecular -- the low-Re treatment
+                // bump2D:SpalartAllmaras asks for. This branch used to be unreachable: the `ctl_.sa ||`
+                // hard-force below ran Spalding's Newton uTau under this BC's name (audit finding #15).
+                // The SA `calculated` patches still carry nuTilda_b*fv1(chi_b), the same rescue as the
+                // Spalding branch runs.
+                const std::size_t nb = bndIsWall_.size();
+                if (dnutBndWall_.size() != nb) dnutBndWall_.resize(nb);
+                cudaCheck(cudaMemsetAsync(dnutBndWall_.data(), 0, nb * sizeof(scalar),
+                                          cudaStreamPerThread), "sa lowRe wall nut");
+                if (hasNutCalc_)
+                {
+                    DeviceBuffer<scalar> ntB, saNutB;
+                    deviceBCValue(dbK_, dk_, ntB);            // nuTilda's own patch values (dk_ is nuTilda for SA)
+                    deviceNutSABoundary(ntB, compressible_ ? &nuWallBnd_ : nullptr,
+                                        ctl_.nu, ctl_.saCoeffs.Cv1, saNutB);
+                    deviceSelectFixedFlux(nutCalcSel_, saNutB, dnutBndWall_);
+                }
+                addWallNutToMuEff(dnutBndWall_, nuEffBnd);
+            }
+            else if (ctl_.sa || ctl_.nutWall == NutWall::Spalding)   // nutUSpaldingWallFunction (velocity-based Newton uTau): SA when the BC selects it (or names none), or the BC on any model
             {
                 deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_,
                                           nullptr, nutBndFile_.size() ? &nutBndFile_ : nullptr);
@@ -1018,10 +1220,29 @@ namespace brae {
                                          gradUs, nC_, Uk_[0], Uk_[1], Uk_[2],
                                          nutCalcMask_, ctl_.ksstCoeffs, dnut_, nutBnd);
                 }
+                // nutLowReWallFunction: calcNut() is Zero UNCONDITIONALLY
+                // (nutLowReWallFunctionFvPatchScalarField.C:38-42 is the whole function). It differs from
+                // the k-based branch ONLY in the wall value, so the branch above runs in full -- the
+                // 'calculated' faces, the SST expression, all of it -- and the WALL faces alone are then
+                // zeroed. Writing zeros over the entire boundary array instead cost bump2D:kOmegaSST
+                // U 1.781e-03 against a 1.5e-03 bound and nut 2.444e-01 against 2.2e-01, because it
+                // destroyed the calculated inlet/outlet values this branch had just computed.
+                if (ctl_.nutWall == NutWall::LowRe && bndIsWall_.size() == nutBnd.size())
+                {
+                    DeviceBuffer<scalar> keep;
+                    deviceCopy(keep, nutBnd);
+                    cudaCheck(cudaMemsetAsync(nutBnd.data(), 0,
+                                              nutBnd.size() * sizeof(scalar), cudaStreamPerThread),
+                              "nutLowRe wall nut");
+                    // writes `keep` where the mask is 0, i.e. every NON-wall face keeps what the branch
+                    // above computed; wall faces stay at the zero OpenFOAM gives them.
+                    deviceSelectFixedFlux(bndIsWall_, keep, nutBnd);
+                }
                 // ...then pin the faces whose nut BC fixes a value to that value. Last, so it overrides
                 // whatever the wall/calculated evaluation left there.
                 if (hasNutFixed_ && nutBndFile_.size() == nutBnd.size())
                     deviceSelectFixedFlux(nutFixedMask_, nutBndFile_, nutBnd);
+                deviceCopy(dnutBndWall_, nutBnd);   // materialised: gpuSimpleFoam reads it for wallForces
                 addWallNutToMuEff(nutBnd, nuEffBnd);
             }
         }
@@ -1051,7 +1272,10 @@ namespace brae {
         if (ctl_.maxwell) deviceBCValue(dbExtrap_, nuConst_, ddrNuBnd);
         deviceDivDevReff(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], ddrNuCell, ctl_.maxwell ? ddrNuBnd : nuEffBnd,
                          ddrX, ddrY, ddrZ,
-                         hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr, nullptr, ctl_.gradULimitK);
+                         hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr, nullptr,
+                         // null: this driver evaluates U's boundary before the assembly, so re-deriving
+                         // it here is the same number. See the header (queue item 30).
+                         nullptr, ctl_.gradULimitK);
         // ...and the two terms only Maxwell has. Both are V*fvc::div of a tensor, added to the same
         // source the dev2 term feeds, with the same sign OF gives them (divDevRhoReff is subtracted from
         // the momentum equation, and brae's ddr carries that sign already -- see the loop below).
@@ -1097,10 +1321,13 @@ namespace brae {
         // fvc::grad(lPhi) inside calcLimiter -- hence the same cellLimited treatment the other
         // grad(U) consumers get. Uk_ still holds the old velocity here (nothing is solved until the kk
         // loop below), which is what OF interpolates too.
+        // Hoisted out of the branch below: the interface assembly further down needs the SAME gradient
+        // to build its own limiter, because a coupled face is limited by OF exactly as an internal one is
+        // (LimitedScheme::calcLimiter has a coupled() branch; only an UNCOUPLED patch gets limiter 1).
+        DeviceBuffer<scalar> gradUlv;
         if (ctl_.divULinear) deviceDivCentralCoeffs(dm, phiInt_, mDiag, mUp, mLo);
         else if (ctl_.divULimitedV)
         {
-            DeviceBuffer<scalar> gradUlv;
             deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradUlv, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
             if (ctl_.gradULimitK > 0.0)
                 deviceCellLimitGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradUlv, ctl_.gradULimitK,
@@ -1159,18 +1386,55 @@ namespace brae {
         }
         // cyclic (periodic) momentum coupling M = div(phi,U) - laplacian(nuEff,U): folds the interface diagonal into
         // mDiag + builds cyc_.ifCoeff (off-diag) from the current cyclic flux; cycSumOff feeds the relax dominance.
+        //
+        // THE INTERFACE'S OWN DIV-SCHEME WEIGHT. Both assemblies below used to split the convective term
+        // upwind -- ifCoeff = -lap + min(phi,0), diag += lap + max(phi,0) -- for EVERY case, because
+        // that is what w = pos0(phi) is. OpenFOAM instead builds a coupled patch with the weights of the
+        // scheme the case NAMED, so on pipeCyclic (`bounded Gauss limitedLinearV 1`) brae's interface
+        // off-diagonal never changed sign where OpenFOAM's did: L2 6.86e-01 against OF's own
+        // boundaryCoeffs, with the gap equal to phi*(1-w) face by face.
+        //
+        // LUST is the one blend still assembled upwind at a coupled face (w = 0.75*cd + 0.25*pos0). No
+        // simpleFoam tutorial names it -- the fourteen that do are fireFoam and pimpleFoam LES -- so it
+        // has no case to be gated on here; see the manifest entry.
+        DeviceBuffer<scalar> cycWsch, amiWsch;
+        if (ctl_.divULimitedV)
+        {
+            if (hasCyclic_)
+                deviceCyclicLimitedVWeights(cyc_, Uk_[0], Uk_[1], Uk_[2], gradUlv, nC_, ctl_.divUTwoBykV, cycWsch);
+            if (hasAMI_)
+                deviceAmiLimitedVWeights(ami_, Uk_[0], Uk_[1], Uk_[2], gradUlv, nC_, ctl_.divUTwoBykV, amiWsch);
+        }
+        // `Gauss linear` -- CENTRAL differencing, and at a coupled face there is nothing to compute: OF's
+        // linear scheme returns mesh.surfaceInterpolation::weights() (linear.H:106), whose boundary field
+        // on a coupled patch IS the patch's own interpolation weight, which both interface structs already
+        // carry and already use for every face value they form. So the weight is a pointer, not a kernel.
+        //
+        // This is the widest of the three gaps in absolute terms: w = wCD is ~0.5, the furthest a weight
+        // can get from upwind's 0 or 1, so a case that asks for `Gauss linear` and is given upwind at its
+        // interface is not slightly off there, it is running a different scheme at half strength.
+        else if (ctl_.divULinear)
+        {
+            if (hasCyclic_) deviceCopy(cycWsch, cyc_.weights);
+            if (hasAMI_)    deviceCopy(amiWsch, ami_.weights);
+        }
         DeviceBuffer<scalar> cycSumOff;
         if (hasCyclic_)
         {
-            interfaceAssembleMomentum(cyc_, nuEff, mDiag);
+            interfaceAssembleMomentum(cyc_, nuEff, mDiag, cycWsch.size() ? &cycWsch : nullptr);
             cycSumOff.copyFrom(std::vector<scalar>(nC_, 0.0));
             interfaceOffDiagSum(cyc_, cycSumOff);
             if (cyc_.rotational) interfaceScaleImplicit(cyc_);   // per-component ifCoeffC[kk] = ifCoeff*forwardT[kk][kk]
+            // The cyclic MOMENTUM off-diagonal, dumped so a conformal cyclicAMI run can be diffed
+            // against a cyclic run of the same mesh face for face -- at weight 1 and a 1:1 stencil the
+            // two must agree exactly, so any difference localises which path is wrong.
+            if (stageDumpActive() && stageDumpFirstOnly("cycIfCoeffMom"))
+                stageDump("stage_cyc_ifCoeffMom", cyc_.ifCoeff);
         }
         DeviceBuffer<scalar> amiSumOff;                              // cyclicAMI momentum coupling (translational)
         if (hasAMI_)
         {
-            interfaceAssembleMomentum(ami_, nuEff, mDiag);
+            interfaceAssembleMomentum(ami_, nuEff, mDiag, amiWsch.size() ? &amiWsch : nullptr);
             if (stageDumpActive() && stageDumpFirstOnly("amiNuEff"))
             {   // the interface diffusivity the momentum laplacian uses: fvc::interpolate(nuEff) there
                 DeviceBuffer<scalar> tmpF, tmpN;
@@ -1487,13 +1751,37 @@ namespace brae {
             // the case asked for.
             if (!ctl_.momentumPredictor) continue;
             const scalar nf = deviceNormFactor(mv, Uk_[kk], b, ones_);          // OF residualControl normalisation
-            // OF fvVectorMatrix::solveSegregated solves each U component with the `U` lduMatrix solver (smoothSolver
-            // /GaussSeidel for motorBike). Route through deviceSymGaussSeidel when fvSolution asks for it (robust on
-            // anisotropic snappy cells where Jacobi-BiCGStab under-solves the loose relTol); interface LDUs keep BiCGStab.
+            // The PER-CELL momentum residual, r = b - A*psi, before the solve moves anything.
+            //
+            // The global initial residual is one number for the whole field, so it can say that brae's
+            // momentum equation disagrees with OpenFOAM's converged state but never WHERE. Every defect
+            // found in this port was found by splitting a residual by region -- the pitzDaily inlet, the
+            // Spalding wall, turbineSiting's ground -- and on pipeCyclic the disagreement is 777x on Uy
+            // against 17x on Ux, which is a shape worth being able to look at rather than infer.
+            {
+                const char* mrTag = (kk == 0) ? "mResid0" : (kk == 1) ? "mResid1" : "mResid2";
+                if (stageDumpActive() && stageDumpFirstOnly(mrTag))
+                {
+                    DeviceBuffer<scalar> Apsi, r;
+                    deviceAmul(mv, Uk_[kk], Apsi);
+                    deviceCopy(r, b);
+                    deviceAxpy(-1.0, Apsi, r);
+                    stageDump(std::string("stage_") + mrTag, r);
+                    stageDump(std::string("stage_") + mrTag + "_normFactor", std::vector<scalar>(1, nf));
+                }
+            }
+            // OF fvVectorMatrix::solveSegregated solves each U component with the `U` lduMatrix solver
+            // (smoothSolver/GaussSeidel for motorBike). Route through deviceSymGaussSeidel when
+            // fvSolution asks for it -- that honours the SELECTION and the stopping rule, and
+            // substitutes the SWEEP: brae's is multicolour where symGaussSeidelSmoother.C is index
+            // order (see device_amg.cuh for the measurement; announced by linear_solver_setup.cuh).
+            // Robust on anisotropic snappy cells where Jacobi-BiCGStab under-solves the loose relTol;
+            // interface LDUs keep BiCGStab.
             scalar ur;
             DeviceSolverPerf uperf;
             if (ctl_.gsU && !hasCyclic_ && !hasAMI_)
-                ur = deviceSymGaussSeidel(mv, b, Uk_[kk], nf, tol, ctl_.uRelTol(), 5000, &uperf);
+                ur = deviceSymGaussSeidel(mv, b, Uk_[kk], nf, tol, ctl_.uRelTol(), 5000, &uperf,
+                                          /*minIter*/0, /*nSweeps*/1, ctl_.gsUSym);
             else
             {
                 // DILU when the case asked for it. It matters most exactly where Jacobi is weakest: on a
@@ -1501,7 +1789,7 @@ namespace brae {
                 // diagonal preconditioner leaves the residual error in that direction for the PIMPLE
                 // outer loop to amplify (see device_dilu.cuh).
                 uperf = deviceJacobiBiCGStab(mv, b, Uk_[kk], nf, tol, ctl_.uRelTol(), ctl_.uMaxIter(), ctl_.bicgCheckEvery, ctl_.uMinIter(),
-                                             (ctl_.diluU && diluU_.valid) ? &diluU_ : nullptr);
+                                             (ctl_.diluU && dilu_.valid) ? &dilu_ : nullptr);
                 ur = uperf.initialResidual;
             }
             // keep all 3 components + their final residual / nIter (OF prints Solving for Ux/Uy/Uz each iteration)
@@ -1575,6 +1863,26 @@ namespace brae {
             deviceAmul(hasCyclic_
                 ? deviceLduViewCyclic(dm, diagA, mUp, mLo, cyc_.n, cyc_.ownCell.data(), cyc_.nbrCell.data(), cyc_.ifCoeff.data())
                 : deviceLduView(dm, diagA, mUp, mLo), ones_, rowSum);
+            // ...AND THE cyclicAMI INTERFACE. OF fvMatrix::H1() adds boundaryCoeffs for EVERY coupled patch:
+            //     H1_ = lduMatrix::H1();  forAll(psi_.boundaryField(), patchi)
+            //         if (ptf.coupled() && ptf.size()) addToInternalField(..., boundaryCoeffs_[patchi].component(0), H1_);
+            // so an AMI face belongs in the row sum exactly as a cyclic face does. The line above took the
+            // cyclic interface and stopped there, so on a mesh coupled ONLY by an AMI the row sum was the
+            // internal faces alone and rAtU = V/max(A*1, 0.1*diagA) came out too large at every interface
+            // cell -- and rAtU sets both the pressure Laplacian coefficient and the SIMPLEC flux correction,
+            // so the error lands on the pressure equation, not the momentum one.
+            //
+            // MEASURED on the basic/simpleFoam/implicitAMI tutorial, brae seeded with OpenFOAM's own
+            // converged fields: the momentum residual was 2.8e-07 -- brae's UEqn agrees, and its interface
+            // off-diagonal matches OpenFOAM's boundaryCoeffs to every digit -- while the pressure residual
+            // was 3.4e-02 with a continuity error of 0.128. Converged, U was 8.3e-02 from OpenFOAM with
+            // SIMPLEC on and 1.8e-03 with it off, which is what named the term.
+            //
+            // ifCoeff, not ifCoeffC: OF takes boundaryCoeffs.component(0), and a rotational interface
+            // carries its transform in updateInterfaceMatrix rather than in the coefficient, so the scalar
+            // coefficient is the one H1 sums. deviceAmiAmul contributes ifCoeff[i]*sum_k w_k -- the
+            // coverage-weighted row sum, which is the AMI's `1` -- matching the cyclic view's ifCoeff*1.
+            if (hasAMI_) deviceAmiAmul(ami_, ones_, rowSum);
             deviceSimplecRAtU(dm, rowSum, diagA, rAtU);
             deviceCopy(drAtU, rAtU);
             deviceAxpy(-1.0, rAU, drAtU);
@@ -1646,9 +1954,14 @@ namespace brae {
         if (hasAMI_) interfaceFlux(ami_, HbyA[0], HbyA[1], HbyA[2]);   // AMI-face phiHbyA = (w*HbyA[own]+(1-w)*interp(HbyA[nbr])).Sf
         // Stage harness: phiHbyA ON the interface. This is the one quantity neither code writes per face, and
         // it is where a coupling defect shows up as a number rather than as a downstream symptom.
-        if (hasAMI_ && stageDumpActive() && stageDumpFirstOnly("amiPhiHbyA"))
+        if ((hasAMI_ || hasCyclic_) && stageDumpActive() && stageDumpFirstOnly("amiPhiHbyA"))
         {
-            stageDump("stage_ami_phiHbyA", ami_.phi);
+            if (hasAMI_)
+            {
+                stageDump("stage_ami_phiHbyA", ami_.phi);
+                stageDump("stage_ami_ifCoeffP", ami_.ifCoeff);   // the PRESSURE (laplacian) off-diagonal
+            }
+            if (hasCyclic_) stageDump("stage_cyc_ifCoeffP", cyc_.ifCoeff);
             // ...and the CYCLIC faces. These live outside both the internal-face array and the
             // DeviceBoundary, so neither existing dump sees them -- which is exactly why a stage
             // comparison showed div(phiHbyA) wrong on the interface cells while every dumped input
@@ -1657,6 +1970,7 @@ namespace brae {
             stageDump("stage_ami_HbyAx", HbyA[0]);
             stageDump("stage_ami_HbyAy", HbyA[1]);
             stageDump("stage_ami_rAU", rAU);
+            if (hasCyclic_) stageDump("stage_cyc_phi", cyc_.phi);
         }
         // OF's U.correctBoundaryConditions() -- which solve() runs at the end of the momentum predictor
         // and pEqn.H runs again after the velocity correction. It matters for a WEDGE because its value
@@ -1870,7 +2184,7 @@ namespace brae {
         if (mrf_.active) deviceMrfApplyFrameFlux(mrf_, +1.0, phiHi, phiHb);   // MRF.makeRelative(phiHbyA) before pressure
         // adjustPhi (OF order: after flux(HbyA), before the SIMPLEC correction): enforce global continuity by
         // scaling the adjustable outflow when there is no pressure reference (closed/all-velocity domains).
-        if (ctl_.needRef) deviceAdjustPhi(adjustMask_, phiHb);
+        if (ctl_.needRef) deviceAdjustPhi(adjustMask_, phiHb, &phiHi);
         // B1 + SIMPLEC: OF's pcEqn.H builds phid from the ORIGINAL phiHbyA and subtracts
         // interp(psi*p)*phiHbyA/interp(rho) using that ORIGINAL too -- the SIMPLEC term is ADDED beside it,
         // not folded in first:
@@ -1904,6 +2218,61 @@ namespace brae {
             DeviceBuffer<scalar> fBnd;
             deviceMatrixFluxBoundary(dbP_, dIC, dBC, dp_, fBnd);
             deviceAxpy(1.0, fBnd, phiHb);
+            // ...AND ON THE COUPLED INTERFACE FACES, which neither call above reaches:
+            // deviceMatrixFluxInternal walks the internal faces and deviceMatrixFluxBoundary the
+            // NON-coupled patches, and a cyclic or cyclicAMI face is in neither list. OpenFOAM has no such
+            // gap -- `fvc::interpolate(rAtU - rAU)*fvc::snGrad(p)*mesh.magSf()` is a surfaceScalarField
+            // whose COUPLED boundary values are evaluated like every other patch's, so the SIMPLEC
+            // correction reaches the interface flux there.
+            //
+            // Without it the interface flux is inconsistent with the pressure equation about to be
+            // assembled from the same rAtU, and it shows up as a continuity error on exactly the interface
+            // cells. Measured on the basic/simpleFoam/implicitAMI tutorial with brae seeded at OpenFOAM's
+            // own converged fields -- where the true divergence is zero -- the continuity error was 0.128
+            // while the momentum residual was 2.8e-07, which is what pointed at the pressure side.
+            //
+            // THE DIFFUSIVITY IS NEGATED because the primitive reused here subtracts: interfaceCorrectFlux
+            // is `phi -= ifCoeff*(interp(p) - p[own])`, the POST-solve pressure correction, whereas OF's
+            // SIMPLEC term ADDS that same laplacian flux. Passing -drAtU turns the one into the other
+            // exactly, and reuses a coefficient path that is already gated instead of adding a second one.
+            if (hasCyclic_ || hasAMI_)
+            {
+                DeviceBuffer<scalar> negDrAtU;
+                deviceCopy(negDrAtU, drAtUFlux_);
+                deviceScale(negDrAtU, -1.0);
+                DeviceBuffer<scalar> scratch;
+                scratch.copyFrom(std::vector<scalar>(nC_, 0.0));
+                // ifCoeff is ONE buffer shared by the momentum and pressure assemblies (see the note where
+                // cycIfCoeffMom_/amiIfCoeffMom_ are taken), so borrow it and put it back.
+                if (hasCyclic_)
+                {
+                    DeviceBuffer<scalar> keep;
+                    deviceCopy(keep, cyc_.ifCoeff);
+                    interfaceAssembleLaplacian(cyc_, negDrAtU, scratch, false);
+                    interfaceCorrectFlux(cyc_, dp_);
+                    if (ctl_.nonOrth)   // snGrad(p) is the CORRECTED snGrad; add its non-orth half too
+                    {
+                        DeviceBuffer<scalar> ffcS;
+                        interfaceLapCorrP(cyc_, negDrAtU, gx, gy, gz, scratch, ffcS);
+                        deviceAxpy(-1.0, ffcS, cyc_.phi);
+                    }
+                    deviceCopy(cyc_.ifCoeff, keep);
+                }
+                if (hasAMI_)
+                {
+                    DeviceBuffer<scalar> keep;
+                    deviceCopy(keep, ami_.ifCoeff);
+                    interfaceAssembleLaplacian(ami_, negDrAtU, scratch, false);
+                    interfaceCorrectFlux(ami_, dp_);
+                    if (ctl_.nonOrth)
+                    {
+                        DeviceBuffer<scalar> ffcS;
+                        interfaceLapCorrP(ami_, negDrAtU, gx, gy, gz, scratch, ffcS);
+                        deviceAxpy(-1.0, ffcS, ami_.phi);
+                    }
+                    deviceCopy(ami_.ifCoeff, keep);
+                }
+            }
             // HbyA adjustment AFTER the flux (feeds the velocity corrector only): HbyA -= (rAU-rAtU)*grad(p)
             for (int kk = 0; kk < 3; ++kk)
             {
@@ -2201,9 +2570,36 @@ namespace brae {
                 // requires symmetry. Conforming interfaces -- every plain cyclic, and an AMI whose two
                 // sides happen to match 1:1 -- stay on PCG, which is both faster and the path all the
                 // existing cyclic cases are validated on.
+                // The interface edges are now IN the agglomeration, so the coarse grids can move the
+                // periodic mode and the V-cycle is a valid preconditioner here. Galerkin needs the fine
+                // coefficients over the SAME extended edge list the hierarchy was built from:
+                // [internal faces | interface entries], the second half gathered from the interface
+                // off-diagonals. The pressure matrix is symmetric, so upper and lower agree.
+                // A NON-CONFORMING AMI keeps BiCGStab (the operator is not self-adjoint), so it does not
+                // use the V-cycle -- and must not pay for a Galerkin re-coarsening it will never read.
+                const bool amgHere = nAmgIfEdges_ && !amiNonConforming_;
+                if (amgHere)
+                {
+                    const int nE = static_cast<int>(nIf_ + nAmgIfEdges_);
+                    amgFineUpper_.resize(nE);
+                    amgFineLower_.resize(nE);
+                    amgFineCoeffKernel<<<nBlocks(nE), TPB>>>(
+                        (int)nIf_, (int)nAmgCycEdges_, (int)nAmgAmiEdges_,
+                        pU_.data(), pL_.data(),
+                        hasCyclic_ ? cyc_.ifCoeff.data() : nullptr,
+                        hasAMI_    ? ami_.ifCoeff.data() : nullptr,
+                        nAmgAmiEdges_ ? amgIfAmiSrc_.data() : nullptr,
+                        nAmgAmiEdges_ ? amgIfAmiW_.data()   : nullptr,
+                        amgFineUpper_.data(), amgFineLower_.data());
+                    cudaCheck(cudaGetLastError(), "amgFineCoeff");
+                    amgGalerkin(amg_, diagCp_, amgFineUpper_, amgFineLower_);
+                }
                 pp = amiNonConforming_
                    ? deviceJacobiBiCGStab(pvc, bp_, dp_, nfp, ctl_.pTol(), ctl_.pRelTol(), ctl_.pMaxIter(),
                                           ctl_.pcgCheckEvery, ctl_.pMinIter())
+                   : amgHere
+                   ? deviceAMGPCG(pvc, amg_, bp_, dp_, nfp, ctl_.pTol(), ctl_.pRelTol(), ctl_.pMaxIter(),
+                                  /*captureVcycle*/false, ctl_.pcgCheckEvery, /*corrScaling*/false, ctl_.pMinIter())
                    : deviceJacobiPCG(pvc, bp_, dp_, nfp, ctl_.pTol(), ctl_.pRelTol(), ctl_.pMaxIter(), ctl_.pMinIter());
             }
             else if (compressible_ && ctl_.transonic)
@@ -2607,12 +3003,12 @@ namespace brae {
         if (ctl_.needRef && meshPhiValid_ && !meshPhi_.empty())
         {
             applyMeshPhi(fvp, meshPhi_, scalar(-1), phiInt_, phiBnd_, cyc_.phi, ami_.phi);
-            deviceAdjustPhi(adjustMask_, phiBnd_);
+            deviceAdjustPhi(adjustMask_, phiBnd_, &phiInt_);
             applyMeshPhi(fvp, meshPhi_, scalar(+1), phiInt_, phiBnd_, cyc_.phi, ami_.phi);
         }
         else if (ctl_.needRef)
         {
-            deviceAdjustPhi(adjustMask_, phiBnd_);
+            deviceAdjustPhi(adjustMask_, phiBnd_, &phiInt_);
         }
 
         // ---- the pcorr Poisson: laplacian(1, pcorr) == div(phi) -------------------------------------
@@ -2811,7 +3207,7 @@ namespace brae {
                 if (f < rvx.size()) wallU[pi][i] = vector{rvx[f], rvy[f], rvz[f]};
             }
         }
-        wall_ = buildDeviceWallData(m, g, fvp, wallU);
+        wall_ = buildDeviceWallData(m, g, fvp, wallU, ctl_.turbWallPatch);
     }
 
     void DeviceSimpleSolver::advanceTime(scalar deltaT)

@@ -36,6 +36,11 @@ struct DeviceBoundary
     // fixedGradient's prescribed normal gradient, per face. ZERO for every other BC, which is what makes
     // one code path serve both: OF's fixedGradient IS zeroGradient plus a source proportional to g.
     DeviceBuffer<scalar> refGrad;
+    // 1 on a fixedFluxPressure face: the SOLVER overwrites refGrad there every pressure assembly
+    // (deviceConstrainPressure), exactly as constrainPressure.C hands updateSnGrad the flux-consistent
+    // gradient. Empty mask = no such faces, and the kernel is skipped entirely.
+    DeviceBuffer<label>  snGradMask;
+    label                nSnGradFaces = 0;   // host-side count, for cheap has-any checks at call sites
     DeviceBuffer<scalar> refValue, p0, deltaCoeffs, magSf;   // p0 = totalPressure reference (constant; refValue = p0 - 0.5*neg(phi)|U|^2)
     DeviceBuffer<label>  faceCell;
 };
@@ -45,7 +50,7 @@ inline DeviceBoundary buildDeviceBoundary(
     const std::vector<FvPatch>& fvp,
     const FvGeometry& g)
 {
-    std::vector<label> ty, fc, io, oio, mx, pv, sm, tp;
+    std::vector<label> ty, fc, io, oio, mx, pv, sm, tp, sg;
     std::vector<scalar> ref, dc, ms, vf, p0, rg;   // rg = fixedGradient normal gradient (0 elsewhere)
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
@@ -56,9 +61,16 @@ inline DeviceBoundary buildDeviceBoundary(
         // overridden on ProcessorFvPatchField, so it would otherwise report 0 (= zeroGradient) whose
         // valueInternalCoeffs is 1, DOUBLE-COUNTING the interface diagonal.
         const int cat = (fvp[pi].type == "processor") ? 8 : f.boundary[pi]->bcCategory();
-        const std::vector<scalar>& val = f.boundary[pi]->value();   // inletOutlet/outletInlet/mixed: value() = refValue; totalPressure: p0
+        // The REFERENCE value, not the current one: the mixed/inletOutlet evaluators blend towards it, and
+        // a restarted field carries the value OpenFOAM wrote in value() -- which is a blend, not a
+        // reference. refValues() is value() for every BC that does not distinguish them.
+        const std::vector<scalar> val = f.boundary[pi]->refValues();   // totalPressure: p0
+        // totalPressure's initial device VALUE is the patch value -- the written `value` on a restart from
+        // OpenFOAM's output, p0 on a cold start -- while its p0 buffer takes the reference (queue 20).
+        const std::vector<scalar> cur = (cat == 7) ? f.boundary[pi]->value() : std::vector<scalar>{};
         const std::vector<scalar>* vfp = f.boundary[pi]->valueFractionPtr();   // mixed (cat 5): per-face vf seed
         const std::vector<scalar>* rgp = f.boundary[pi]->refGradPtr();         // fixedGradient: per-face g
+        const label sgm = f.boundary[pi]->updateableSnGrad() ? 1 : 0;   // fixedFluxPressure
         for (label i = 0; i < fvp[pi].size; ++i)
         {
             // Categories whose VALUE is resolved per-step but whose TYPE is a plain fixedValue: inletOutlet,
@@ -74,7 +86,8 @@ inline DeviceBoundary buildDeviceBoundary(
             p0.push_back(cat == 7 ? val[i] : 0.0);   // totalPressure: mask + the reference p0
             vf.push_back((cat == 5 && vfp) ? (*vfp)[i] : 0.0);
             rg.push_back(rgp ? (*rgp)[i] : 0.0);
-            ref.push_back(val[i]);
+            sg.push_back(sgm);
+            ref.push_back((cat == 7 && i < (label)cur.size()) ? cur[i] : val[i]);
             dc.push_back(fvp[pi].deltaCoeffs[i]);
             ms.push_back(g.magSf()[fvp[pi].start + i]);
             fc.push_back(fvp[pi].faceCells[i]);
@@ -92,6 +105,8 @@ inline DeviceBoundary buildDeviceBoundary(
     db.p0.copyFrom(p0);
     db.valueFraction.copyFrom(vf);
     db.refGrad.copyFrom(rg);
+    db.snGradMask.copyFrom(sg);
+    for (label v : sg) db.nSnGradFaces += v;
     db.refValue.copyFrom(ref);
     db.deltaCoeffs.copyFrom(dc);
     db.magSf.copyFrom(ms);
@@ -103,7 +118,8 @@ inline DeviceBoundary buildDeviceBoundary(
 // inflow phiBnd<0 -> fixedValue(1, =inletValue), outflow phiBnd>=0 -> zeroGradient(0). Only ioMask=1 faces change.
 // Call at the start of each SIMPLE step (before assembly), with the previous step's boundary flux (matches OF).
 void deviceUpdateInletOutlet(DeviceBoundary& db, const DeviceBuffer<scalar>& phiBnd);
-void deviceBCValue(const DeviceBoundary& db, const DeviceBuffer<scalar>& internal, DeviceBuffer<scalar>& value);
+void deviceBCValue(const DeviceBoundary& db, const DeviceBuffer<scalar>& internal, DeviceBuffer<scalar>& value,
+                   const int* skipIf = nullptr);   // skipIf: device flag, the launch is a no-op when set
 void deviceBCLaplacianCoeffs(const DeviceBoundary& db, const DeviceBuffer<scalar>& gammaCell,
                              DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC);
 // variant taking gamma per BOUNDARY FACE (for nuEff with the true wall nut, not the cell value).
@@ -136,9 +152,16 @@ inline void deviceUpdateInletOutlet(DeviceVectorBoundary& db, const DeviceBuffer
 // flux U.n = phi_b/|Sf| is exact (lagged like OF + the inletOutlet switch); |U| is the local adjacent-cell speed.
 // Writes vf to the 3 U components (velocity sign 0.5-0.5c) and to p (pressure sign 0.5+0.5c); non-mixed faces
 // untouched. Call at the start of each step (before assembly), after the io switch.
+// `which`: 1 = the velocity patches only, 2 = the pressure patches only, 3 = both. OpenFOAM rebuilds
+// freestreamVelocity's valueFraction at every evaluate on U (the momentum assembly and the velocity
+// correction's correctBoundaryConditions) and freestreamPressure's inside the pressure fvMatrix
+// constructor and under the limiter, so the two move at different points of the iteration; the
+// incompressible driver keeps rebuilding both together (3).
 void deviceUpdateMixedFreestream(DeviceVectorBoundary& dbU, DeviceBoundary& dbP, const DeviceBuffer<scalar>& phiBnd,
-                                 const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
-                                 const DeviceBuffer<scalar>* rhoBnd = nullptr);   // compressible: rho at boundary faces
+                                 const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy,
+                                 const DeviceBuffer<scalar>& Uz,
+                                 const DeviceBuffer<scalar>* rhoBnd = nullptr,   // compressible: rho at boundary faces
+                                 int which = 3);
 // constrainHbyA at mixed velocity faces: OF resets phiHbyA_b = U_b.Sf at fixesValue patches (mixed fixesValue=true).
 // cf's HbyA boundary value uses HbyA_cell in the (1-vf) part; at mixed faces replace hb[k] with the boundary value
 // of U itself (U_b = (1-vf) U_cell + vf U_freestream) so the boundary flux uses U_b, not HbyA_b. Non-mixed faces
@@ -163,12 +186,17 @@ void deviceConstrainSymmetryHbyA(const DeviceVectorBoundary& dbU, const DeviceBu
                                  DeviceBuffer<scalar>& hbx, DeviceBuffer<scalar>& hby, DeviceBuffer<scalar>& hbz);
 
 // pressureInletOutletVelocity updateCoeffs (directionMixed, valueFraction = neg(phi)*(I - n n)): per piov face by the
-// lagged boundary flux sign, set each component's bcType + refValue. Outflow (phi>=0) -> zeroGradient; inflow
-// (phi<0) -> fixedValue with refValue = n*(n.U_cell) (tangential 0). Call each step before assembly (after the io
-// switch), with the previous step's boundary flux + cell velocity (matches OF lagging).
+// boundary flux sign, set each component's bcType, valueFraction and refValue. Outflow (phi>=0) -> zeroGradient;
+// inflow (phi<0) -> the mixed (cat 5) form of OpenFOAM's transform coefficients, vf_k = sqrt(1 - n_k^2) with the
+// refValue chosen so the blend is n*(n.U_cell) -- see piovUpdateKernel. Call wherever OpenFOAM reaches an
+// updateCoeffs or an evaluate on U (the momentum assembly, after its solve, after the velocity correction), with
+// the flux registered at that moment and the cell velocity as it stands.
+// `directionMixed` selects that form; false keeps the kernel's earlier typing (every inflow component
+// fixedValue at n*(n.U_cell)) for the frozen incompressible driver, which reads 1.1459e-04 against
+// OpenFOAM on validation/piov with it and 1.4911e-03 with the directionMixed form (bisected 2026-09-03).
 void deviceUpdatePressureInletOutletVelocity(DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& phiBnd,
                                              const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy,
-                                             const DeviceBuffer<scalar>& Uz);
+                                             const DeviceBuffer<scalar>& Uz, bool directionMixed = false);
 
 // slip/symmetry updateCoeffs (OF basicSymmetry, GENERAL non-axis-aligned): reuses the mixed (cat 5) kernels with a
 // PER-COMPONENT valueFraction vf_k = |n_k| and ref_k = U_c[k] - sign(n_k)*(n.U_c). Then valueIC_k = 1-|n_k|,
@@ -246,7 +274,8 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
         const scalar wdgVf[3] = { wedge ? scalar(0.5)*(scalar(1) - wcT->xx) : scalar(0),
                                   wedge ? scalar(0.5)*(scalar(1) - wcT->yy) : scalar(0),
                                   wedge ? scalar(0.5)*(scalar(1) - wcT->zz) : scalar(0) };
-        const std::vector<vector>& val = f.boundary[pi]->value();   // inletOutlet/mixed: value() = freestreamValue (= refValue)
+        // The REFERENCE value, not the current one -- see the scalar builder above.
+        const std::vector<vector> val = f.boundary[pi]->refValues();
         const std::vector<scalar>* vfp = f.boundary[pi]->valueFractionPtr();   // mixed (cat 5): per-face vf seed
         // fixedGradient on a VECTOR field: the gradient is a vector, so it splits per component -- each
         // DeviceBoundary in comp[] carries its own refGrad, exactly as each carries its own refValue.

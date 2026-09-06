@@ -43,11 +43,56 @@ namespace brae {
 // and the name is a constructor argument defaulting to "SIMPLE" in simpleControl.H:100 and "PIMPLE" in
 // pimpleControl.H:135. Hardcoding "SIMPLE" here would read nNonOrthogonalCorrectors as 0 on every
 // transient case, so this is required, not cosmetic.
+// WHAT THE CALLING DRIVER ACTUALLY RUNS, in OpenFOAM's own vocabulary, so the notices below compare like
+// with like. It cannot be derived from the dictionary: two drivers reading the same fvSolution wire
+// different things, and a notice describing the wrong one is as misleading as no notice at all -- it
+// teaches the reader to discount them all.
+//
+// THE NAMES ARE OPENFOAM'S, and that is the whole point. PBiCGStab is "preconditioned bi-conjugate
+// gradient stabilized ... using a run-time selectable preconditioner" (PBiCGStab.H), so brae's BiCGStab
+// with a diagonal preconditioner IS `solver PBiCGStab; preconditioner diagonal;` and its DILU form IS
+// `solver PBiCGStab; preconditioner DILU;`. Calling either "Jacobi-BiCGStab" and comparing that string
+// against the dict's `PBiCGStab` announced a substitution on every field brae was running exactly as
+// asked -- on essentially every tutorial in existence, since PBiCGStab is what they all name. Likewise
+// brae's AMG-PCG is an AMG-preconditioned CG (device_amg.cuh), which is OF's `PCG` +
+// `preconditioner GAMG`, NOT OF's `GAMG` -- that is multigrid as the solver, a different algorithm.
+struct SolverRunsAs
+{
+    // The pressure equation. The default is what every driver but the OF-mirror runs. Those drivers fall
+    // back to a Jacobi-preconditioned CG on an interface-coupled mesh (cyclic/AMI, where the Galerkin
+    // coarse operator cannot represent the interface edges), which this description does not carry: the
+    // caller knows at run time, the reader does not.
+    std::string pSolver = "PCG";
+    std::string pPrecon = "GAMG";
+    // Does this driver precondition the ENERGY solve with DILU when the case asks? Only the OF-mirror
+    // does; every compressible tutorial writes the energy field into the same regex block as U and k, so
+    // a driver honouring two of the three still substitutes on the third.
+    bool diluOnEnergy = false;
+    // ...and does it honour `solver smoothSolver` on the ENERGY equation? Only the OF-mirror's CUDA arm
+    // does. The flag exists because the notice is shared: a driver that substitutes must still say so,
+    // and one that honours must not claim a substitution it no longer makes.
+    bool smoothSolverOnEnergy = false;
+    // ...and on momentum / the turbulence pair. Default true: every other driver has run OpenFOAM's own
+    // sweep on those since the level-scheduled smoother landed. The OF-mirror sets all three from one
+    // switch so the gate can compare the honoured path against the substituted one with the notices
+    // truthful in BOTH modes.
+    bool smoothSolverOnMomentum = true;
+    bool smoothSolverOnTurbulence = true;
+    // ...and does it run DILU whatever the dict says? The OF-mirror's HOST arm does -- pbicgstab.cuh is
+    // DILU throughout -- so a case asking `none` or `diagonal` there gets DILU and has a right to be told.
+    bool alwaysDilu = false;
+};
+
 inline void readLinearSolverControls(
     const FoamDict& fvSolution,
     const std::string& secondName,
     DeviceSimpleControls& ctl,
-    const std::string& algorithmDict = "SIMPLE")
+    const std::string& algorithmDict = "SIMPLE",
+    // The energy field's name (h or e), for the compressible callers. Empty = no energy equation.
+    const std::string& heName = "",
+    // What the CALLER actually runs -- see SolverRunsAs. Defaulted to the legacy/incompressible drivers,
+    // so every existing call site keeps describing itself correctly.
+    const SolverRunsAs& runsAs = SolverRunsAs{})
 {
     const FoamDict* solvers = fvSolution.subDict("solvers");
 
@@ -74,6 +119,27 @@ inline void readLinearSolverControls(
         const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
         return s ? static_cast<int>(s->scalarOr("minIter", def)) : def;
     };
+    // Does this driver precondition field f with DILU? Not a property of the dictionary -- see
+    // SolverRunsAs -- and the BRAE_DILU / BRAE_DILU_KE hatches move it again, so the notices consult the
+    // same answer the solve will use rather than a second copy of the rule.
+    auto diluHere = [&](const std::string& f) -> bool
+    {
+        if (runsAs.alwaysDilu) return true;
+        const bool wires = (f == "U" || f == "k" || f == secondName || f == "nuTilda")
+                        || (runsAs.diluOnEnergy && !heName.empty() && f == heName);
+        const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
+        bool on = wires && s && s->wordOr("preconditioner", "") == "DILU";
+        const char* e = nullptr;
+        if (f == "U") e = std::getenv("BRAE_DILU");
+        else if (f == "k" || f == secondName || f == "nuTilda") e = std::getenv("BRAE_DILU_KE");
+        if (e) on = wires && (std::atoi(e) != 0);
+        return on;
+    };
+    auto krylovPrecon = [&](const std::string& f) -> std::string
+    {
+        return diluHere(f) ? "DILU" : "diagonal";
+    };
+
     // E2/E3 (dict_audit): SAY what brae runs when it is not what the case asked for.
     //
     // A substituted linear solver is not a wrong answer -- it solves the same linear system to the same
@@ -84,19 +150,26 @@ inline void readLinearSolverControls(
     // right to know the solver is not the one they asked for.
     //
     // dict_audit found these unread: solvers/p/solver, solvers/p/smoother, solvers/(U|h|e)/preconditioner.
-    // `gs` says brae took the smoothSolver path for this field, i.e. it HONOURED the request -- in which
-    // case there is nothing to report. Passed explicitly rather than inferred from the label: comparing the
+    // `gs` says brae took the smoothSolver path for this field. That honours the SELECTION and the
+    // STOPPING RULE, and substitutes the SWEEP: brae's is multicolour where symGaussSeidelSmoother.C
+    // walks cells in index order. It is the same algorithm under a permutation, but Gauss-Seidel is
+    // order-dependent, so at the loose relTol a SIMPLE step asks for the two stop in different places --
+    // measured on validation/T3A, OpenFOAM reached relTol 0.1 on Ux in ONE sweep (1.6186e-05 ->
+    // 6.940e-07) where brae took SEVEN (-> 1.278e-06). This used to read "it HONOURED the request -- in
+    // which case there is nothing to report", and that premise made every driver that includes this
+    // reader silent about the substitution. Passed explicitly rather than inferred from the label: comparing the
     // dict's "smoothSolver" against a display string of "smoothSolver(symGaussSeidel)" made brae announce a
     // substitution on every field it was in fact running exactly as asked. The negative control in
     // tests/test_solver_notices.cu is what caught that, and it is the reason the test has one.
-    auto noticeSolverChoice = [&](const std::string& f, const char* braeRuns, bool gs)
+    auto noticeSolverChoice = [&](const std::string& f, const std::string& braeSolver,
+                                  const std::string& braePrecon, bool gs)
     {
         const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
         if (!s) return;
         const std::string want = s->wordOr("solver", "");
         const std::string smoo = s->wordOr("smoother", "");
         const std::string prec = s->wordOr("preconditioner", "");
-        if (!want.empty() && !gs && want != braeRuns)
+        if (!want.empty() && !gs && want != braeSolver)
         {
             // The usual case: same system, same tolerance, so the CONVERGED answer is the same and only
             // the iteration count differs. An iteration CAP breaks that premise -- both solvers then stop
@@ -106,7 +179,8 @@ inline void readLinearSolverControls(
             // against an initial 1 while brae's leaves at 2.55. Neither is converged; they cannot agree.
             const bool capped = s->found("maxIter") && s->scalarOr("maxIter", 1000.0) < 1000.0;
             noticeApproximated("solvers/" + f + " solver",
-                               "case asks '" + want + "', brae runs " + braeRuns +
+                               "case asks '" + want + "', brae runs " + braeSolver
+                             + " preconditioned with " + braePrecon +
                                (capped
                                 ? " AND this entry caps the solve at maxIter " + std::to_string((int)s->scalarOr("maxIter", 1000.0))
                                   + " -- with a cap the two solvers stop at DIFFERENT residuals, so the fields differ"
@@ -117,11 +191,29 @@ inline void readLinearSolverControls(
         if (!smoo.empty() && !gs)
             noticeIgnored("solvers/" + f + " smoother",
                           "'" + smoo + "' -- brae is not running a smoothSolver on this field");
-        // DILU is now implemented (device_dilu.cuh), so only the preconditioners brae still substitutes
-        // are reported. A smoothSolver has no preconditioner in OF either, so the entry is inert there.
-        if (!prec.empty() && !gs && prec != "diagonal" && prec != "none" && prec != "DILU")
+        // ...and when it DID take that path there is nothing left to announce: device_sym_gauss_seidel.cuh
+        // runs OpenFOAM's own sweep, level-scheduled, in whichever of the two variants the case named --
+        // symGaussSeidelSmoother.C's up-then-down or GaussSeidelSmoother.C's up-only. tests/gs_ladder
+        // holds both to OpenFOAM's own per-sweep residual. The `ignored` arm above still fires for a
+        // smoother brae does not run at all, so the two cannot both be silent for a field.
+        // Against what THIS DRIVER preconditions with, not against a fixed exemption list. The old test
+        // was `prec != "diagonal" && prec != "none" && !diluWired`, which had two holes: the wired list
+        // named the fields a DIFFERENT driver wires (queue item 27), and `none` is not `diagonal` --
+        // noPreconditioner is wA = rA and diagonalPreconditioner is wA = rA/diag (their .C files), so a
+        // case asking for no preconditioner at all was answered with Jacobi and told nothing.
+        //
+        // AND THE SUBSTITUTION IS NOT COST-ONLY, which is what the wording used to imply. Both
+        // preconditioners reach the requested relTol; they stop in different places. On
+        // turbulentFlatPlate:kEpsilon, over 60 consecutive k solves, OpenFOAM's DILU lands at a median
+        // 0.0064 of the initial residual -- one iteration overshooting the case's relTol of 0.1 by more
+        // than 10x -- while Jacobi stops at 0.0726. That gap left k and epsilon mutually inconsistent
+        // every outer iteration and the case DIVERGED at iteration 171. A preconditioner substitution
+        // can change whether a case runs at all.
+        if (!prec.empty() && !gs && prec != braePrecon)
             noticeApproximated("solvers/" + f + " preconditioner",
-                               "case asks '" + prec + "', brae preconditions with Jacobi (diagonal)");
+                               "case asks '" + prec + "', brae preconditions with " + braePrecon + ". Both reach the"
+                               " requested relTol but stop at DIFFERENT residuals, which can change stability, not"
+                               " just cost");
     };
 
     // OF's selection, exactly: solver smoothSolver + a GaussSeidel-family smoother -> brae's symmetric
@@ -133,7 +225,26 @@ inline void readLinearSolverControls(
         const std::string sm = s->wordOr("smoother", "");
         return sm == "symGaussSeidel" || sm == "GaussSeidel";
     };
+    // ...and WHICH of the two OF smoothers it named. They are different algorithms, not settings:
+    // symGaussSeidelSmoother.C walks the cells up then back down, GaussSeidelSmoother.C walks them up
+    // ONLY. Anything other than a bare `GaussSeidel` is the symmetric one (the field either did not take
+    // this path at all, in which case the flag is unused, or it named symGaussSeidel).
+    auto gsIsSymmetric = [&](const std::string& f)
+    {
+        const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
+        return !(s && s->wordOr("smoother", "") == "GaussSeidel");
+    };
 
+    // fvSolution solvers/<field>/nSweeps (smoothSolver.C:78, default 1). Read for every field that can
+    // take the smoothSolver path: OpenFOAM smooths nSweeps times BETWEEN residual evaluations and counts
+    // sweeps, not evaluations (:205), so a case asking 2 and answered with 1 stops somewhere else.
+    auto solverNSweeps = [&](const std::string& f, int dflt)
+    {
+        const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
+        if (!s || !s->found("nSweeps")) return dflt;
+        const int n = static_cast<int>(s->scalarOr("nSweeps", (scalar)dflt));
+        return (n > 0) ? n : dflt;
+    };
     ctl.tolP = solverTol("p", 1e-6);
     ctl.tolU = solverTol("U", 1e-8);
     ctl.relTolP = solverRelTol("p");
@@ -159,7 +270,22 @@ inline void readLinearSolverControls(
     ctl.maxIterUFinal = solverMaxIter("UFinal", ctl.maxIterU);
     ctl.minIterPFinal = solverMinIter("pFinal", ctl.minIterP);
     ctl.minIterUFinal = solverMinIter("UFinal", ctl.minIterU);
-    ctl.gsU = useSymGS("U");
+    if (!heName.empty())
+    {
+        ctl.tolHe     = solverTol(heName, 1e-6);
+        ctl.relTolHe  = solverRelTol(heName);
+        ctl.maxIterHe = solverMaxIter(heName, 1000);
+        ctl.minIterHe = solverMinIter(heName, 0);
+        ctl.nSweepsHe = solverNSweeps(heName, 1);
+        // The energy field takes OpenFOAM's own smoother only where the CALLER runs it; every other
+        // driver keeps BiCGStab and must keep announcing the substitution.
+        ctl.gsHe    = useSymGS(heName) && runsAs.smoothSolverOnEnergy;
+        ctl.gsHeSym = gsIsSymmetric(heName);
+        noticeSolverChoice(heName, "PBiCGStab", krylovPrecon(heName), ctl.gsHe);
+    }
+    ctl.gsU = useSymGS("U") && runsAs.smoothSolverOnMomentum;
+    ctl.gsUSym = gsIsSymmetric("U");
+    ctl.nSweepsU = solverNSweeps("U", 1);
     if (const char* gsuEnv = std::getenv("BRAE_GS_U"))
         ctl.gsU = (std::atoi(gsuEnv) != 0) && ctl.gsU;
     // DILU on the momentum equations, when the case asks for it and brae is on the BiCGStab path.
@@ -169,10 +295,16 @@ inline void readLinearSolverControls(
         if (const char* e = std::getenv("BRAE_DILU"))   // attribution escape hatch, both directions
             ctl.diluU = (std::atoi(e) != 0) && !ctl.gsU;
     }
-    // p is never the case's choice: brae runs AMG-PCG (Jacobi-PCG on an interface-coupled mesh, where the
-    // Galerkin coarse operator cannot represent the interface edges) whatever the dict says.
-    noticeSolverChoice("p", "AMG-PCG", false);   // p never takes the smoothSolver path
-    noticeSolverChoice("U", "Jacobi-BiCGStab", ctl.gsU);
+    // DILU on the energy solve, read from the energy field's own block. Same shape as diluU above, and
+    // like it, only meaningful on the BiCGStab path.
+    if (!heName.empty())
+    {
+        const FoamDict* sh = solvers ? solvers->subDict(heName) : nullptr;
+        ctl.diluHe = sh && sh->wordOr("preconditioner", "") == "DILU";
+    }
+    // p is never the case's choice: this driver runs what SolverRunsAs says whatever the dict asks.
+    noticeSolverChoice("p", runsAs.pSolver, runsAs.pPrecon, false);   // p never takes the smoothSolver path
+    noticeSolverChoice("U", "PBiCGStab", krylovPrecon("U"), ctl.gsU);
 
     if (ctl.turbulent)
     {
@@ -183,25 +315,73 @@ inline void readLinearSolverControls(
         {
             ctl.tolKE = solverTol("nuTilda", 1e-8);
             ctl.relTolKE = solverRelTol("nuTilda");
+            ctl.maxIterKE = solverMaxIter("nuTilda", 1000);
+            ctl.minIterKE = solverMinIter("nuTilda", 0);
             ctl.tolKEFinal = solverTol("nuTildaFinal", ctl.tolKE);
             ctl.relTolKEFinal = solvers && solvers->subDict("nuTildaFinal") ? solverRelTol("nuTildaFinal") : ctl.relTolKE;
-            ctl.gsK = useSymGS("nuTilda");
+            ctl.gsK = useSymGS("nuTilda") && runsAs.smoothSolverOnTurbulence;
             ctl.gsEps = false;
-            noticeSolverChoice("nuTilda", "Jacobi-BiCGStab", ctl.gsK);
+            noticeSolverChoice("nuTilda", "PBiCGStab", krylovPrecon("nuTilda"), ctl.gsK);
         }
         else
         {
             ctl.tolKE = std::fmin(solverTol("k", 1e-8), solverTol(secondName, 1e-8));
             ctl.relTolKE = std::fmin(solverRelTol("k"), solverRelTol(secondName));
+            // One cap for the pair, as one tolerance: the tighter maxIter and the larger minIter. A cap
+            // decides where a solve STOPS, so two entries that disagree are announced rather than one
+            // being taken silently. Neither was read before this; both sat at the struct defaults.
+            ctl.maxIterKE = std::min(solverMaxIter("k", 1000), solverMaxIter(secondName, 1000));
+            ctl.minIterKE = std::max(solverMinIter("k", 0), solverMinIter(secondName, 0));
+            if (solverMaxIter("k", 1000) != solverMaxIter(secondName, 1000)
+             || solverMinIter("k", 0) != solverMinIter(secondName, 0))
+                noticeApproximated("solvers/k and solvers/" + secondName + " maxIter/minIter",
+                                   "the pair is solved under ONE cap: the tighter maxIter and the larger"
+                                   " minIter of the two entries");
             ctl.tolKEFinal = std::fmin(solverTol("kFinal", solverTol("k", 1e-8)),
                                        solverTol(secondName + "Final", solverTol(secondName, 1e-8)));
             ctl.relTolKEFinal = std::fmin(
                 solvers && solvers->subDict("kFinal") ? solverRelTol("kFinal") : solverRelTol("k"),
                 solvers && solvers->subDict(secondName + "Final") ? solverRelTol(secondName + "Final") : solverRelTol(secondName));
-            ctl.gsK = useSymGS("k");
-            ctl.gsEps = useSymGS(secondName);
-            noticeSolverChoice("k", "Jacobi-BiCGStab", ctl.gsK);
-            noticeSolverChoice(secondName, "Jacobi-BiCGStab", ctl.gsEps);
+            ctl.gsK = useSymGS("k") && runsAs.smoothSolverOnTurbulence;
+            ctl.gsEps = useSymGS(secondName) && runsAs.smoothSolverOnTurbulence;
+            // ONE smoother variant for the transported pair, as nSweeps is: the model solves both
+            // scalars through one call. A case that names symGaussSeidel on one and GaussSeidel on the
+            // other is refused rather than run with whichever entry was read first -- running would
+            // apply one field's smoother under the other's name.
+            ctl.gsKESym = gsIsSymmetric("k");
+            // ONE nSweeps for the pair, for the reason the smoother variant is one: k and epsilon are
+            // solved through one model call. Two different counts would run one field's setting under
+            // the other's name, so they are refused rather than resolved by order.
+            ctl.nSweepsKE = solverNSweeps("k", 1);
+            if ((ctl.gsK || ctl.gsEps) && solverNSweeps(secondName, 1) != ctl.nSweepsKE)
+                throw std::runtime_error(
+                    "system/fvSolution gives k and " + secondName + " different `nSweeps` on a "
+                    "smoothSolver. OpenFOAM smooths nSweeps times between residual evaluations and "
+                    "counts sweeps, so the two entries stop the solves in different places, and this "
+                    "driver carries one count for the transported pair.");
+            if ((ctl.gsK || ctl.gsEps) && gsIsSymmetric(secondName) != ctl.gsKESym)
+                throw std::runtime_error(
+                    "system/fvSolution names a `GaussSeidel` smoother on one of k / " + secondName
+                    + " and `symGaussSeidel` on the other. Those are different OpenFOAM smoothers "
+                      "(GaussSeidelSmoother.C sweeps ascending only; symGaussSeidelSmoother.C also "
+                      "sweeps back), and this driver carries one smoother for the transported pair, so "
+                      "running would apply one field's setting under the other's name.");
+            noticeSolverChoice("k", "PBiCGStab", krylovPrecon("k"), ctl.gsK);
+            noticeSolverChoice(secondName, "PBiCGStab", krylovPrecon(secondName), ctl.gsEps);
+            // DILU on whichever of the pair runs BiCGStab. subDict is regex-aware (literal first, then
+            // last wildcard match, OF semantics), so a case writing its solver block as
+            // "(omega|epsilon|k)" -- which is how essentially every tutorial writes it -- resolves here
+            // without a special case. Read AFTER gsK/gsEps, since a smoothSolver field has no
+            // preconditioner to honour.
+            {
+                const FoamDict* sk = solvers ? solvers->subDict("k") : nullptr;
+                const FoamDict* ss = solvers ? solvers->subDict(secondName) : nullptr;
+                const bool kDilu = sk && sk->wordOr("preconditioner", "") == "DILU";
+                const bool sDilu = ss && ss->wordOr("preconditioner", "") == "DILU";
+                ctl.diluKE = (kDilu && !ctl.gsK) || (sDilu && !ctl.gsEps);
+                if (const char* e = std::getenv("BRAE_DILU_KE"))   // attribution escape hatch
+                    ctl.diluKE = (std::atoi(e) != 0) && !(ctl.gsK && ctl.gsEps);
+            }
         }
     }
 
@@ -380,15 +560,20 @@ inline EnergySolverControls readEnergySolverControls(
         const std::string smoo = s->wordOr("smoother", "");
         const std::string prec = s->wordOr("preconditioner", "");
         const std::string field = std::string("solvers/") + primary;
-        if (!want.empty() && !e.useGS && want != "Jacobi-BiCGStab")
+        // The same OpenFOAM vocabulary as readLinearSolverControls above: this reader's callers (the
+        // legacy compressible drivers) run a diagonal-preconditioned BiCGStab on the energy field, which
+        // IS `PBiCGStab` + `preconditioner diagonal`. The OF-mirror does not call this function -- it
+        // reads the energy entry through readLinearSolverControls, where SolverRunsAs::diluOnEnergy says
+        // that it wires DILU there.
+        if (!want.empty() && !e.useGS && want != "PBiCGStab")
             noticeApproximated(field + " solver",
-                               "case asks '" + want + "', brae runs Jacobi-BiCGStab"
+                               "case asks '" + want + "', brae runs PBiCGStab preconditioned with diagonal"
                                " (same linear system and tolerance -- iteration count and cost differ)");
         if (!smoo.empty() && !e.useGS)
             noticeIgnored(field + " smoother", "'" + smoo + "' -- brae is not running a smoothSolver on this field");
-        if (!prec.empty() && !e.useGS && prec != "diagonal" && prec != "none")
+        if (!prec.empty() && !e.useGS && prec != "diagonal")
             noticeApproximated(field + " preconditioner",
-                               "case asks '" + prec + "', brae preconditions with Jacobi (diagonal)");
+                               "case asks '" + prec + "', brae preconditions with diagonal (Jacobi)");
     }
     return e;
 }

@@ -31,7 +31,10 @@ jobs:
         run: cmake -B build -DCMAKE_CUDA_ARCHITECTURES=native
 
       - name: Build
-        run: cmake --build build -j        # all targets: brae + the ctest unit-test executables (test_spmv, test_pcg, ...)
+        # -j WITH A NUMBER, for the reason ci.yml spells out: a bare `-j` is unbounded and each nvcc
+        # peaks at ~0.5 GB. This job builds ALL targets, so it has more TUs in flight than the
+        # compile-check does, and the same OOM is one busy runner away.
+        run: cmake --build build -j "$(nproc)"   # all targets: brae + the ctest unit-test executables
 
       - name: Test (ctest)
         run: ctest --test-dir build --output-on-failure -j4

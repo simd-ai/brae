@@ -21,6 +21,60 @@
 
 namespace brae {
 
+// system/fvSchemes, $-expanded, with OpenFOAM's `fusedGauss` family rewritten to `Gauss`.
+//
+// fusedGauss is NOT a different discretisation. src/fused/finiteVolume/ holds fusedGaussConvectionScheme,
+// fusedGaussDivScheme, fusedGaussGrad and fusedGaussLaplacianScheme, and each is the plain Gauss scheme
+// with the field-expression temporaries replaced by fused loops -- OpenFOAM even leaves the original
+// lines in as comments right above the fused calls:
+//     //fvm.lower() = -weights.primitiveField()*faceFlux.primitiveField();
+//     multiplySubtract(fvm.lower(), weights.primitiveField(), faceFlux.primitiveField());
+// fvmDiv, fvcDiv, calcGrad and fvmLaplacian all compute the same numbers as their Gauss counterparts;
+// fusedGaussLaplacianScheme::fvmLaplacian is line-for-line identical to gaussLaplacianScheme's.
+// pitzDaily_fused is stock pitzDaily with `libs (fusedFiniteVolume)` and the schemes renamed.
+//
+// So this is a rename, not an approximation -- but it is ANNOUNCED rather than silently aliased, because
+// "brae ran a scheme the case did not name" is exactly the class of substitution this codebase refuses.
+// Only the leading scheme word is rewritten; whatever interpolation follows is parsed as it always was,
+// so `fusedGauss <something brae cannot do>` is still refused by name.
+inline std::string readFvSchemesText(const std::string& caseDir)
+{
+    std::string text = readFileExpanded(caseDir + "/system/fvSchemes");
+    if (text.find("fusedGauss") == std::string::npos) return text;
+
+    static bool announced = false;
+    if (!announced)
+    {
+        announced = true;
+        noticeEquivalent("system/fvSchemes",
+                   "the case names OpenFOAM's `fusedGauss` schemes; brae runs `Gauss`. fusedGauss is the "
+                   "same discretisation written without field temporaries (src/fused/finiteVolume), so "
+                   "the matrices are identical -- it is a performance variant, not a numerical one.");
+    }
+    std::string out;
+    out.reserve(text.size());
+    for (std::size_t i = 0; i < text.size(); )
+    {
+        // Only a WHOLE token: a key like `div(fusedGaussThing)` must not be rewritten underneath us.
+        const bool boundaryBefore = (i == 0) || !(std::isalnum(static_cast<unsigned char>(text[i-1]))
+                                                 || text[i-1] == '_');
+        if (boundaryBefore && text.compare(i, 10, "fusedGauss") == 0)
+        {
+            const std::size_t j = i + 10;
+            const bool boundaryAfter = (j >= text.size())
+                                    || !(std::isalnum(static_cast<unsigned char>(text[j])) || text[j] == '_');
+            if (boundaryAfter)
+            {
+                out += "Gauss";
+                i = j;
+                continue;
+            }
+        }
+        out += text[i++];
+    }
+    return out;
+}
+
 // Fill ctl's convection/laplacian/grad scheme flags from caseDir/system/fvSchemes.
 // Every div(...) statement brae actually CONSUMED, recorded at the point of consumption rather than
 // from a hand-written list. That distinction is the whole point: a maintained list drifts, and a stale
@@ -62,7 +116,14 @@ struct FieldDivScheme
     bool   bounded      = false;
     bool   limited      = false;   // limitedLinear
     bool   linearUpwind = false;
-    scalar twoByk       = 0;       // limitedLinear coefficient -> 2/max(k,SMALL)
+    // TWO currencies for the same `limitedLinear <k>` coefficient, because the two consumers transform
+    // it in different places: the device kernels take twoByk pre-computed (solvePassiveScalar,
+    // deviceSolveScalarTransport), while the host weights functions take the RAW k and compute
+    // 2/max(k,SMALL) themselves (limitedSchemes_cpp.cu:53). Handing twoByk where raw is expected runs
+    // limitedLinear 2 under the case's limitedLinear 1 -- the limiter becomes clamp01(1*r) instead of
+    // clamp01(2*r) -- which three rho harnesses did until the turbulence-scheme port made it visible.
+    scalar coeff        = 1.0;     // the raw k of `limitedLinear k` -- host weights functions
+    scalar twoByk       = 0;       // 2/max(k,SMALL)                 -- device kernels
     // laplacian(D<field>,<field>) -- OF scalarTransport.C:250, where Dname = "D" + field name.
     // `corrected`/`limited` -> non-orthogonal correction on; `orthogonal`/`uncorrected` -> off.
     // Unlike divSchemes, laplacianSchemes almost always carries a usable `default`, which OF resolves
@@ -92,7 +153,7 @@ inline std::string fvSchemesBlock(const std::string& all, const std::string& nam
 inline FieldDivScheme parseFieldDivScheme(const std::string& caseDir, const std::string& field)
 {
     // Same source as parseFvSchemesControls: $-expanded, so `div(phi,tracer0) $turbulence;` resolves.
-    const std::string all = readFileExpanded(caseDir + "/system/fvSchemes");
+    const std::string all = readFvSchemesText(caseDir);
 
     // Scope to the divSchemes BLOCK. Searching the whole file for `default` finds ddtSchemes' entry
     // first and misreports why a lookup failed -- every fvSchemes has several `default` lines.
@@ -131,6 +192,7 @@ inline FieldDivScheme parseFieldDivScheme(const std::string& caseDir, const std:
         double kc = 1.0;
         const std::size_t q = st.find("limitedLinear");
         std::sscanf(st.c_str() + q + 13, "%lf", &kc);
+        fs.coeff  = static_cast<scalar>(kc);
         fs.twoByk = static_cast<scalar>(2.0 / std::max(kc, 1e-30));
     }
 
@@ -178,7 +240,7 @@ inline FieldDivScheme parseFieldDivScheme(const std::string& caseDir, const std:
 // is OF's own default.
 inline void checkWallDistMethod(const std::string& caseDir, DeviceSimpleControls& ctl)
 {
-    const std::string all = readFileExpanded(caseDir + "/system/fvSchemes");
+    const std::string all = readFvSchemesText(caseDir);
     const std::string blk = fvSchemesBlock(all, "wallDist");
     if (blk.empty()) return;                       // no entry -> OF's default, which is what brae runs
     const std::size_t m = blk.find("method");

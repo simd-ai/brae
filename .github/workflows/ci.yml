@@ -39,4 +39,11 @@ jobs:
         run: cmake -B build -DCMAKE_CUDA_ARCHITECTURES="80;90"   # quoted: the ; must not be seen by the shell
 
       - name: Build (compile-check)
-        run: cmake --build build -j --target brae
+        # -j WITH A NUMBER. A bare `-j` is UNBOUNDED: make starts every target the dependency graph has
+        # ready, which here is most of the 101 .cu translation units at once. Each one peaks at 450-610 MB
+        # of RSS under `CMAKE_CUDA_ARCHITECTURES=80;90` (measured: device_simple_foam.cu 566 MB / 10.2 s,
+        # simpleFoamV2.cu 608 MB / 12.3 s, device_komega_sst.cu 462 MB), and this runner has 4 vCPU and
+        # 16 GB -- so ~26 concurrent compiles exhaust it and the OOM killer SIGTERMs them. That is the
+        # `nvcc: Terminated` / `Compilation terminated.` storm with NO compiler diagnostic and exit 143
+        # (128 + SIGTERM): a resource failure wearing a build failure's clothes.
+        run: cmake --build build -j "$(nproc)" --target brae

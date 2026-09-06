@@ -5,6 +5,111 @@
 
 namespace brae {
 namespace {
+
+// fvMatrix::setValues -- what OpenFOAM's fvOptions CONSTRAINTS do, and what a wall function's
+// manipulateMatrix does. NOT the same as overwriting the field after the solve: setValues also
+// TRANSFERS the pinned value into every neighbour's source and then zeroes the coefficient it
+// transferred through, so the constraint reaches the cells around it exactly once.
+//
+// Hoisted here from the kEpsilon closure, which had the only copy. The energy equation needs the same
+// four kernels for fixedTemperatureConstraint, and two copies of a matrix manipulation this delicate
+// is how the two constraints stop agreeing about what OpenFOAM does.
+// A GATHER, and it has to be one (queue items 59/69). This ran as a scatter -- one thread per PINNED
+// cell, atomicAdd into each neighbour's source -- so a cell next to two or more pinned cells summed its
+// contributions in whatever order the blocks happened to finish, and the last bit of its source moved
+// from run to run. That is where the compressible mirror's nondeterminism entered: on sbMatched two
+// identical runs agreed through every stage of iteration 1 and diverged first in the epsilon SOURCE at
+// iteration 2, which is this kernel under the epsilon wall constraint (every wall-adjacent cell is
+// pinned, so cells beside two of them are common). Same terms, one per face, now summed by the
+// RECEIVING cell in face order -- the losort side then the owner side, the order gsCellUpdate and
+// gaussGrad already use -- so the result is fixed and the run is reproducible.
+__global__ void svGatherKernel(
+    int           nC,
+    const label*  mask,
+    const scalar* value,
+    const label*  ownerStart,
+    const label*  losort,
+    const label*  losortStart,
+    const label*  own,
+    const label*  nei,
+    const scalar* upper,
+    const scalar* lower,
+    scalar*       source)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+
+    // c RECEIVES from every face whose other cell is pinned. The face's coefficient is the one the
+    // scatter used: `lower` when the pinned cell owns the face, `upper` when it is the neighbour.
+    scalar acc = source[c];
+    for (label s = losortStart[c]; s < losortStart[c + 1]; ++s)       // c is the neighbour of face f
+    {
+        const label f = losort[s];
+        const label o = own[f];
+        if (mask[o]) acc -= lower[f] * value[o];
+    }
+    for (label f = ownerStart[c]; f < ownerStart[c + 1]; ++f)         // c is the owner of face f
+    {
+        const label n = nei[f];
+        if (mask[n]) acc -= upper[f] * value[n];
+    }
+    source[c] = acc;
+}
+
+
+__global__ void svZeroFaceKernel(
+    int          nIf,
+    const label* own,
+    const label* nei,
+    const label* mask,
+    scalar*      upper,
+    scalar*      lower)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= nIf) return;
+    if (mask[own[f]] || mask[nei[f]])
+    {
+        upper[f] = scalar(0.0);
+        lower[f] = scalar(0.0);
+    }
+}
+
+
+// Every BOUNDARY face of a constrained cell loses its coefficients too -- including a face on a patch
+// that has nothing to do with the wall function. Without this an outlet div(phi) coefficient on a
+// wall/outlet corner cell is folded into the diagonal at solve time and pulls the pinned cell off its
+// value.
+__global__ void svBndKernel(
+    int          nB,
+    const label* bndCell,
+    const label* mask,
+    scalar*      iC,
+    scalar*      bC)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nB) return;
+    if (!mask[bndCell[i]]) return;
+    iC[i] = scalar(0.0);
+    bC[i] = scalar(0.0);
+}
+
+
+// ...and only THEN psi and the source, so that adjacent constrained cells cannot corrupt each other's.
+__global__ void svCellKernel(
+    int           nC,
+    const label*  mask,
+    const scalar* value,
+    const scalar* diag,
+    scalar*       psi,
+    scalar*       source)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    if (!mask[c]) return;
+    psi[c]    = value[c];
+    source[c] = value[c] * diag[c];
+}
+
 constexpr int TPB = 256;
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 
@@ -328,6 +433,47 @@ void deviceFvoVelocityDamping(
     if (!n) return;
     velDampKernel<<<nBlocks(n), TPB>>>(n, cells.data(), UMax, C, V.data(), Ux.data(), Uy.data(), Uz.data(), diag.data());
     cudaCheck(cudaGetLastError(), "velocityDampingConstraint");
+}
+
+// One constraint, applied to an assembled matrix in OpenFOAM's order (relax -> constrain). `mask` is
+// per CELL (non-zero = pinned) and `value` per cell; both are the caller's, because what is pinned and
+// to what is the option's business, not the matrix's.
+void deviceSetValues(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<label>&  mask,
+    const DeviceBuffer<scalar>& value,
+    DeviceBuffer<scalar>&       diag,
+    DeviceBuffer<scalar>&       upper,
+    DeviceBuffer<scalar>&       lower,
+    DeviceBuffer<scalar>&       source,
+    DeviceBuffer<scalar>&       internalCoeffs,
+    DeviceBuffer<scalar>&       boundaryCoeffs,
+    DeviceBuffer<scalar>&       psi)
+{
+    const int nC  = dm.nCells;
+    const int nIf = dm.nInternalFaces;
+    const int nB  = dm.nBndFaces;
+    if (nC == 0 || static_cast<int>(mask.size()) != nC) return;
+
+    svGatherKernel<<<nBlocks(nC), TPB>>>(nC, mask.data(), value.data(), dm.ownerStart.data(),
+                                         dm.losort.data(), dm.losortStart.data(), dm.owner.data(),
+                                         dm.nei.data(), upper.data(), lower.data(), source.data());
+    cudaCheck(cudaGetLastError(), "fvOptions setValues gather");
+    if (nIf > 0)
+    {
+        svZeroFaceKernel<<<nBlocks(nIf), TPB>>>(nIf, dm.owner.data(), dm.nei.data(), mask.data(),
+                                                upper.data(), lower.data());
+        cudaCheck(cudaGetLastError(), "fvOptions setValues zero faces");
+    }
+    if (nB > 0 && internalCoeffs.size() && boundaryCoeffs.size())
+    {
+        svBndKernel<<<nBlocks(nB), TPB>>>(nB, dm.bndCell.data(), mask.data(),
+                                          internalCoeffs.data(), boundaryCoeffs.data());
+        cudaCheck(cudaGetLastError(), "fvOptions setValues zero boundary");
+    }
+    svCellKernel<<<nBlocks(nC), TPB>>>(nC, mask.data(), value.data(), diag.data(), psi.data(),
+                                       source.data());
+    cudaCheck(cudaGetLastError(), "fvOptions setValues cells");
 }
 
 } // namespace brae

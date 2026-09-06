@@ -71,6 +71,37 @@ int main(int argc, char** argv) {
     std::printf("test_fvc_ops:\n");
     cmpS(A, Aof, "A");
     cmpS(Hcf, Hofx, "H");
+    // H's KNOCKED-OUT COMPONENT, asserted ON ITS OWN, because the flattened compare above cannot see it.
+    // fvMatrix<Type>::H() ends by zeroing every component polyMesh::solutionD() knocks out (fvMatrix.C,
+    // the validComponents loop after correctBoundaryConditions), and OpenFOAM's own dump here has H_z
+    // identically zero in all 12225 cells. brae never ported that block, and on this fixture max|H_x| is
+    // 2.0e+05, so a live H_z of order 1e-05 is 1e-10 of the flattened norm and passed unnoticed. What it
+    // cost: with the z channel open, dropping the momentum solve OpenFOAM also drops took Uz to 13% of
+    // |U| by iteration 200 on pitzDaily; with the block ported it stays at 1.1e-16 relative.
+    {
+        label ofNz = 0, brNz = 0;
+        scalar ofMax = 0.0, brMax = 0.0;
+        for (label c = 0; c < nC; ++c)
+        {
+            if (Hof[c].z != 0.0) ++ofNz;
+            if (H[c].z != 0.0)   ++brNz;
+            ofMax = std::max(ofMax, std::fabs(Hof[c].z));
+            brMax = std::max(brMax, std::fabs(H[c].z));
+        }
+        std::printf("  %-16s OpenFOAM max %.6e in %d cells | brae max %.6e in %d cells\n",
+                    "H z-component", (double)ofMax, (int)ofNz, (double)brMax, (int)brNz);
+        if (ofNz != 0)
+        {
+            std::printf("  SKIP: this fixture is not 2D -- OpenFOAM's own H_z is nonzero, so the arm "
+                        "has no knocked-out direction to check\n");
+        }
+        else if (brNz != 0)
+        {
+            ++g_fails;
+            std::printf("  FAIL H z-component: OpenFOAM zeroes it in every cell (fvMatrix.C's "
+                        "validComponents block) and brae leaves it live in %d\n", (int)brNz);
+        }
+    }
     cmpS(divPhi, divOf, "div(phi)");
     cmpS(fluxU.internal, fluxIntOf, "flux:internal");
     for (label p = 0; p < np; ++p) {

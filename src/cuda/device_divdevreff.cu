@@ -40,7 +40,31 @@ void sigmaKernel(
 }
 
 
-// boundary gradient: gradB = gradC + n (x) (snGrad - n & gradC). snGrad = (U_b - U_cell)*deltaCoeffs.
+// One component's boundary coefficients, as the patch classes carry them. Passed by value so the kernel
+// can ask each component separately: a directionMixed patch (pressureInletOutletVelocity) fixes one
+// direction and leaves another free, so its valueFraction is per COMPONENT.
+struct BndSnGradView
+{
+    const label*  type;
+    const scalar* vf;
+    const scalar* ref;
+    const scalar* rgr;   // may be null: no fixedGradient face on this component
+};
+
+// boundary gradient: gradB = gradC + n (x) (snGrad - n & gradC), OF gaussGrad::correctBoundaryConditions.
+//
+// snGrad IS THE PATCH'S OWN, not (U_b - U_cell)*deltaCoeffs. That inline formula is only
+// fvPatchField::snGrad -- the BASE class's -- and OF overrides it on the classes that matter here:
+// zeroGradient returns exactly zero (its .H), fixedGradient the prescribed gradient (its .H), and mixed
+// lerp(refGrad, (refValue - pif)*deltaCoeffs, valueFraction) using the CURRENT valueFraction while
+// value() still carries the blend of the previous one. The host reference made the same mistake and it
+// cost naca0012 3.0e-07 on div(dev2(T(grad(U)))) -- see fv_patch_field.cuh's snGrad (queue item 25).
+//
+// The device's type codes carry the class: 0 = extrapolated, which is zeroGradient when refGrad is zero
+// and fixedGradient when it is not -- so snGrad = refGrad serves both, exactly as OF's two overrides do.
+// 1/2 (fixedValue/calculated) keep the base formula, which is what OF uses for them. 5 is mixed. 8 is
+// COUPLED, and OF's correction skips coupled patches outright (`if (!coupled())`), so the face keeps the
+// extrapolated cell gradient.
 __global__
 void gradBKernel(
     int nB,
@@ -58,6 +82,9 @@ void gradBKernel(
     const scalar* __restrict__ Uy,
     const scalar* __restrict__ Uz,
     const scalar* __restrict__ dc,
+    BndSnGradView bx,
+    BndSnGradView by,
+    BndSnGradView bz,
     scalar* __restrict__ gradB)
 {
     const int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -75,8 +102,27 @@ void gradBKernel(
     for (int q = 0; q < 9; ++q)
         gc[q] = gradU[q * nC + c];
 
+    // A coupled face keeps the extrapolated cell gradient: OF's correction runs only on !coupled().
+    if (bx.type[bi] == 8)
+    {
+        for (int q = 0; q < 9; ++q) gradB[q * nB + bi] = gc[q];
+        return;
+    }
+
     const scalar nv[3] = { nx, ny, nz };
-    const scalar sn[3] = { (uxb[bi]-Ux[c])*dc[bi], (uyb[bi]-Uy[c])*dc[bi], (uzb[bi]-Uz[c])*dc[bi] };
+    const scalar ub[3] = { uxb[bi], uyb[bi], uzb[bi] };
+    const scalar uc[3] = { Ux[c], Uy[c], Uz[c] };
+    const BndSnGradView bv[3] = { bx, by, bz };
+    scalar sn[3];
+    for (int k = 0; k < 3; ++k)
+    {
+        const label t = bv[k].type[bi];
+        const scalar rg = bv[k].rgr ? bv[k].rgr[bi] : scalar(0);
+        if (t == 1 || t == 2)   sn[k] = (ub[k] - uc[k]) * dc[bi];                          // fvPatchField
+        else if (t == 5)        sn[k] = bv[k].vf[bi] * (bv[k].ref[bi] - uc[k]) * dc[bi]     // mixed
+                                      + (scalar(1) - bv[k].vf[bi]) * rg;
+        else                    sn[k] = rg;                       // zeroGradient (0) / fixedGradient
+    }
 
     // (n & gradC)_j = sum_i n_i gc[i][j]
     scalar ngc[3];
@@ -86,6 +132,16 @@ void gradBKernel(
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 3; ++j)
             gradB[(i*3+j)*nB + bi] = gc[i*3+j] + nv[i] * (sn[j] - ngc[j]);
+}
+
+inline BndSnGradView snGradView(const DeviceBoundary& db)
+{
+    BndSnGradView v{};
+    v.type = db.bcType.data();
+    v.vf   = db.valueFraction.data();
+    v.ref  = db.refValue.data();
+    v.rgr  = db.refGrad.size() ? db.refGrad.data() : nullptr;
+    return v;
 }
 
 
@@ -186,7 +242,9 @@ void deviceBoundaryGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
     gradB.resize(static_cast<std::size_t>(9) * nB);
     gradBKernel<<<nBlocks(nB), TPB>>>(nB, dm.bndCell.data(), dm.bndGFace.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
                                       gradU.data(), nC, uxb.data(), uyb.data(), uzb.data(), Ux.data(), Uy.data(), Uz.data(),
-                                      dbU.comp[0].deltaCoeffs.data(), gradB.data());
+                                      dbU.comp[0].deltaCoeffs.data(),
+                                      snGradView(dbU.comp[0]), snGradView(dbU.comp[1]), snGradView(dbU.comp[2]),
+                                      gradB.data());
     cudaCheck(cudaGetLastError(), "boundaryGradU");
 }
 
@@ -223,6 +281,7 @@ void deviceDivDevReff(
     const DeviceCyclic* cyc,
     const DeviceAMI* ami,
     const DeviceProcStress* proc,
+    const DeviceBuffer<scalar>* const* UbStored,
     scalar gradULimitK)
 {
     const int nC = dm.nCells, nB = dm.nBndFaces;
@@ -242,8 +301,14 @@ void deviceDivDevReff(
     // gaussGrad(U_i) = (dUi/dx, dUi/dy, dUi/dz) = COLUMN i of G (OF convention G_ij = dU_j/dx_i, via outer(Sf,U)).
     for (int i = 0; i < 3; ++i)
     {
+        // U's boundary as OF's fvc::grad(U) reads it: the STORED value when the caller keeps one, and a
+        // re-derivation only when it does not. The two agree only while the caller evaluates U's boundary
+        // before every assembly, which OpenFOAM does not -- see the header (queue items 25, 30).
         DeviceBuffer<scalar> bval;
-        deviceBCValue(dbU.comp[i], *Uc[i], bval);
+        if (UbStored && UbStored[i] && UbStored[i]->size() == static_cast<std::size_t>(nB))
+            deviceCopy(bval, *UbStored[i]);
+        else
+            deviceBCValue(dbU.comp[i], *Uc[i], bval);
         if (proc)   // processor faces are bcType 8: deviceBCValue leaves them, the halo supplies the value
         {
             proc->halo->exchange(Uc[i]->data());
@@ -283,7 +348,9 @@ void deviceDivDevReff(
     DeviceBuffer<scalar> gradB(static_cast<std::size_t>(9) * nB);
     gradBKernel<<<nBlocks(nB), TPB>>>(nB, dm.bndCell.data(), dm.bndGFace.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
                                       gradU.data(), nC, uxb.data(), uyb.data(), uzb.data(), Ux.data(), Uy.data(), Uz.data(),
-                                      /* bnd deltaCoeffs */ dbU.comp[0].deltaCoeffs.data(), gradB.data());
+                                      /* bnd deltaCoeffs */ dbU.comp[0].deltaCoeffs.data(),
+                                      snGradView(dbU.comp[0]), snGradView(dbU.comp[1]), snGradView(dbU.comp[2]),
+                                      gradB.data());
     cudaCheck(cudaGetLastError(), "ddr gradB");
     DeviceBuffer<scalar> sigmaB(static_cast<std::size_t>(9) * nB);
     sigmaKernel<<<nBlocks(nB), TPB>>>(nB, gradB.data(), nuBnd.data(), sigmaB.data());

@@ -1,0 +1,97 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2412                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+FoamFile
+{
+    version         2;
+    format          ascii;
+    class           dictionary;
+    object          controlDict;
+}
+
+application     simpleFoam;
+
+startFrom       startTime;
+
+startTime       0;
+
+stopAt          endTime;
+
+endTime         1000;
+
+deltaT          1;
+
+writeControl    timeStep;
+
+writeInterval   100;
+
+purgeWrite      0;
+
+writeFormat     ascii;
+
+writePrecision  16;
+
+writeCompression off;
+
+timeFormat      general;
+
+timePrecision   6;
+
+runTimeModifiable true;
+
+functions
+{
+    coordinateTransform
+    {
+        type            fieldCoordinateSystemTransform;
+        libs            ( fieldFunctionObjects );
+        log             true;
+        fields          ( U );
+        writeControl    writeTime;
+        coordinateSystem
+        {
+            type            cylindrical;
+            origin          ( 0 0 0 );
+            rotation
+            {
+                type            cylindrical;
+                axis            ( 1 0 0 );
+            }
+        }
+    }
+    momentum
+    {
+        type            momentum;
+        libs            ( fieldFunctionObjects );
+        log             true;
+        useNamePrefix   true;
+        executeInterval 10;
+        writeControl    writeTime;
+        writeMomentum   true;
+        writePosition   true;
+        writeVelocity   true;
+        regionType      all;
+        cylindrical     true;
+        origin          ( 0 0 0 );
+        rotation
+        {
+            type            cylindrical;
+            axis            ( 1 0 0 );
+        }
+    }
+    time
+    {
+        type            timeInfo;
+        libs            ( utilityFunctionObjects );
+        log             true;
+        perTimeStep     true;
+    }
+}
+
+
+// ************************************************************************* //

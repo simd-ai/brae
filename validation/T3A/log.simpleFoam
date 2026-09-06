@@ -1,0 +1,93 @@
+/*---------------------------------------------------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2412                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+Build  : _e5c6ccc3-20250814 OPENFOAM=2412 patch=250814 version=2412
+Arch   : "LSB;label=32;scalar=64"
+Exec   : simpleFoam -case /tmp/claude-1001/-home-ghost-cudafoam-brae/a1a0eb0f-4b0f-4397-be59-d8786504c350/scratchpad/t3a_of
+Date   : Aug 20 2026
+Time   : 21:40:29
+Host   : gx10-8ac0
+PID    : 440929
+I/O    : uncollated
+Case   : /tmp/claude-1001/-home-ghost-cudafoam-brae/a1a0eb0f-4b0f-4397-be59-d8786504c350/scratchpad/t3a_of
+nProcs : 1
+trapFpe: Floating point exception trapping enabled (FOAM_SIGFPE).
+fileModificationChecking : Monitoring run-time modified files using timeStampMaster (fileModificationSkew 5, maxFileModificationPolls 20)
+allowSystemOperations : Allowing user-supplied system call operations
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+Create time
+
+Create mesh for time = 0
+
+
+SIMPLE: convergence criteria
+    field p	 tolerance 1e-05
+    field U	 tolerance 1e-06
+    field "(k|omega|gammaInt|ReThetat)"	 tolerance 0.0001
+
+Reading field p
+
+Reading field U
+
+Reading/calculating face flux field phi
+
+Selecting incompressible transport model Newtonian
+Selecting turbulence model type RAS
+Selecting RAS turbulence model kOmegaSSTLM
+Selecting patchDistMethod meshWave
+bounding k, min: 0 max: 0.047633 average: 0.047633
+RAS
+{
+    RASModel        kOmegaSSTLM;
+    turbulence      on;
+    printCoeffs     on;
+    alphaK1         0.85;
+    alphaK2         1;
+    alphaOmega1     0.5;
+    alphaOmega2     0.856;
+    gamma1          0.555556;
+    gamma2          0.44;
+    beta1           0.075;
+    beta2           0.0828;
+    betaStar        0.09;
+    a1              0.31;
+    b1              1;
+    c1              10;
+
+... [trimmed: 269 iterations to the case's own residualControl] ...
+
+
+smoothSolver:  Solving for Ux, Initial residual = 7.35243e-07, Final residual = 4.97789e-08, No Iterations 6
+smoothSolver:  Solving for Uy, Initial residual = 1.0009e-06, Final residual = 9.07525e-08, No Iterations 2
+GAMG:  Solving for p, Initial residual = 4.67014e-06, Final residual = 6.50079e-07, No Iterations 6
+time step continuity errors : sum local = 2.51177e-07, global = -4.58338e-08, cumulative = 0.000145884
+smoothSolver:  Solving for omega, Initial residual = 7.17e-09, Final residual = 7.17e-09, No Iterations 0
+smoothSolver:  Solving for k, Initial residual = 3.58883e-06, Final residual = 2.43706e-07, No Iterations 5
+bounding k, min: 0 max: 0.187325 average: 0.0413974
+smoothSolver:  Solving for ReThetat, Initial residual = 1.30322e-05, Final residual = 1.13279e-06, No Iterations 6
+smoothSolver:  Solving for gammaInt, Initial residual = 6.17051e-06, Final residual = 2.23923e-07, No Iterations 1
+ExecutionTime = 9.29 s  ClockTime = 10 s
+
+Time = 269
+
+smoothSolver:  Solving for Ux, Initial residual = 7.10838e-07, Final residual = 4.80789e-08, No Iterations 6
+smoothSolver:  Solving for Uy, Initial residual = 9.66724e-07, Final residual = 8.78225e-08, No Iterations 2
+GAMG:  Solving for p, Initial residual = 4.61127e-06, Final residual = 9.83838e-07, No Iterations 4
+time step continuity errors : sum local = 3.80143e-07, global = -8.68792e-08, cumulative = 0.000145797
+smoothSolver:  Solving for omega, Initial residual = 7.97243e-09, Final residual = 7.97243e-09, No Iterations 0
+smoothSolver:  Solving for k, Initial residual = 3.50999e-06, Final residual = 2.35625e-07, No Iterations 5
+bounding k, min: 0 max: 0.187326 average: 0.0413972
+smoothSolver:  Solving for ReThetat, Initial residual = 1.29889e-05, Final residual = 1.12451e-06, No Iterations 6
+smoothSolver:  Solving for gammaInt, Initial residual = 6.09067e-06, Final residual = 2.22702e-07, No Iterations 1
+ExecutionTime = 9.32 s  ClockTime = 10 s
+
+
+SIMPLE solution converged in 269 iterations
+
+End
+

@@ -17,11 +17,13 @@
 #include "mrf_read.cuh"
 #include "fv_options.cuh"
 #include "turbulent_inlet.cuh"
+#include "turb_blowup.cuh"
 #include "foam_dict.cuh"
 #include "dict_audit.cuh"
 #include "scheme_parse.cuh"
 #include "linear_solver_setup.cuh"   // readLinearSolverControls (shared with gpuRhoSimpleFoam)   // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse (steady + transient)
 #include "solver_dispatch.cuh"   // dispatchSolver + execSibling: route to the solver / component that owns the work
+#include "simpleFoamV2.cuh"      // the rebuilt path + its envelope guard (BRAE_SIMPLEFOAM_V2)
 #include "benchmark.cuh"         // brae benchmark [sample]: the standard workload, pulled from the template repo
 #include "turbulence_setup.cuh"   // readTurbulenceModel + readTurbulenceFields (shared with pimpleFoam)
 #include "sweep_cases.cuh"   // brae -cases c1 c2 ...: multi-GPU mesh/parameter study (orchestrator mode)
@@ -29,6 +31,7 @@
 #include "fvc.cuh"
 #include "device_simple_foam.cuh"
 #include "coded_bc_setup.cuh"         // CodedBCSpec + parseCodedBCs + setupCodedBCs (shared with gpuPimpleFoam)
+#include "frozen_bc_guard.cuh"
 #include "brae_time.cuh"
 #include "scalar_transport_fo.cuh"   // OF functionObjects::scalarTransport, on the device flux   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
 
@@ -45,6 +48,7 @@
 #include <fstream>
 #include <sstream>
 #include <vector>
+#include "start_time.cuh"   // openFoamNSteps: OF Time::run's own step count
 
 using namespace brae;
 
@@ -162,6 +166,18 @@ int main(int argc, char** argv)
         // read or CUDA init. -partition is solver-agnostic prep (mesh + AMG cache) and always runs here.
         // Registry + rules: solvers/common/solver_dispatch.cuh.
         if (!partition) dispatchSolver(caseDir, argc, argv);
+
+        // The REBUILT simpleFoam (UEqn.cu + pEqn.cu + simpleFoam.cu), selected with BRAE_SIMPLEFOAM_V2=1.
+        // It covers a strict subset of what the code below runs, so it is opt-in -- but once selected it
+        // either runs the case or REFUSES with the reason. It must never quietly fall through to the old
+        // solver: a user who asked for the new path and silently got the old one cannot tell from the
+        // output which algorithm produced their answer, and that is the failure mode this rebuild exists
+        // to remove. Hence no try/catch here.
+        if (!partition && gpu::simpleFoamV2Selected())
+        {
+            gpu::runSimpleFoamV2(caseDir);
+            return 0;
+        }
 
         // -partition is cf's analogue of OF decomposePar: do the one-time prep (parse mesh + build AMG hierarchy) and
         // persist it to constant/polyMesh/.brae_mesh|amgcache, so the actual run reloads it warm. Forces the cache write.
@@ -382,9 +398,15 @@ int main(int argc, char** argv)
         timeRegistry.store("patches", &fvp);
         const label nC = m.nCells();
 
-        GeometricField<vector> U = buildField<vector>(readField<vector>(fieldDir + "/U"), fvp, nC);
+        // This driver maintains the coded pair per step (setupCodedBCs below) but NOT fixedMean or
+        // fanPressure -- collectFixedMean/collectFanPressure are wired in gpuPimpleFoam only -- so
+        // those two would freeze at the file `value`. Refuse them here, where the type still exists.
+        const FieldData<vector> UFd = readField<vector>(fieldDir + "/U");
+        refuseFrozenPerStepBC(UFd, "U", "gpuSimpleFoam", true);
+        GeometricField<vector> U = buildField<vector>(UFd, fvp, nC);
         U.evaluateBoundary();
         const FieldData<scalar> pFd = readField<scalar>(fieldDir + "/p");
+        refuseFrozenPerStepBC(pFd, "p", "gpuSimpleFoam", true);
         GeometricField<scalar> p = buildField<scalar>(pFd, fvp, nC);
         p.evaluateBoundary();
         // pressure needs a reference iff NO p patch fixes the value (singular all-Neumann system, e.g. closed
@@ -413,11 +435,13 @@ int main(int argc, char** argv)
         //
         // Identical to the defect already fixed for the compressible driver; this driver simply never
         // received it, which is what carrying three copies of the same behaviour costs.
+        bool phiWasRead = false;
         SurfaceScalarField phi = readPhiIfPresent(fieldDir, fvp, m.nInternalFaces(),
-                                                  fvc::flux(U, m, g, fvp));
+                                                  fvc::flux(U, m, g, fvp), &phiWasRead);
 
         const std::string secondName = ctl.sst ? "omega" : "epsilon";   // the 2nd turbulence scalar
-        TurbulenceFields tf = readTurbulenceFields(fieldDir, fvp, nC, ctl, secondName, U);
+        TurbulenceFields tf = readTurbulenceFields(fieldDir, fvp, nC, ctl, secondName, U,
+                                                   "gpuSimpleFoam", true);
 
         // MRF rotating zone (constant/MRFProperties + polyMesh/cellZones), if present
         const MRFConfig mrfCfg = readMRFProperties(caseDir + "/constant");
@@ -463,7 +487,8 @@ int main(int argc, char** argv)
         _tsLap("fields + patches");
         DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
                                   ctl.turbulent ? &tf.k : nullptr, (ctl.turbulent && !ctl.sa) ? &tf.eps : nullptr, ctl.turbulent ? &tf.nut : nullptr,
-                                  ctl.lm ? &tf.ReThetat : nullptr, ctl.lm ? &tf.gammaInt : nullptr);
+                                  ctl.lm ? &tf.ReThetat : nullptr, ctl.lm ? &tf.gammaInt : nullptr,
+                                  phiWasRead);
         // uniformTotalPressure p0(t). OF samples p0_->value(t) at construction with the CURRENT
         // time and again in every updateCoeffs (uniformTotalPressureFvPatchScalarField.C:73,149),
         // so the tables are handed over before the first step and re-evaluated per step inside the
@@ -505,12 +530,19 @@ int main(int argc, char** argv)
                    " actuationDiskSource[Froude], rotorDisk, velocityDampingConstraint; selectionMode all|cellZone.";
             throw std::runtime_error(msg);
         }
+        // OF re-evaluates the turbulent-inlet BCs every updateCoeffs; give the solver the per-face masks
+        // so it refreshes them each iteration instead of freezing the set-up value.
+        //
+        // THIS IS NOT AN fvOptions CONCERN, and sitting inside the `if (!fvo.empty())` below meant a case
+        // with no fvOptions never got it -- the intensity-based k inlet and the mixing-length
+        // epsilon/omega inlet stayed at whatever the file's `value` entry said for the whole run. The
+        // OpenFOAM tutorials write `value $internalField` there, so on pipeCyclic that was k = 1 against
+        // the 0.0038-0.0067 the 5% intensity implies: a 200x inlet that fed the entrance region and
+        // decayed only by the pipe exit (wall-cell k 31x OpenFOAM's at x<1.3, 1.02x at x>8.7).
+        solver.setTurbulentInlets(tf.turbInletMasks.tiMask, tf.turbInletMasks.tiIntensity,
+                                  tf.turbInletMasks.mlMask, tf.turbInletMasks.mlLength);
         if (!fvo.empty())
         {
-            // OF re-evaluates the turbulent-inlet BCs every updateCoeffs; give the solver the per-face
-            // masks so it refreshes them each iteration instead of freezing the set-up value.
-            solver.setTurbulentInlets(tf.turbInletMasks.tiMask, tf.turbInletMasks.tiIntensity,
-                                      tf.turbInletMasks.mlMask, tf.turbInletMasks.mlLength);
             solver.setFvOptions(fvo);
             if (fvo.rotor.active)   // build the BEM rotor geometry from the mesh (cell centres + face areas) and hand it over
                 solver.setRotorDisk(buildDeviceRotorDisk(fvo.rotor, g.C(), g.Sf(), m.owner(), m.neighbour(), m.nInternalFaces()));
@@ -527,7 +559,7 @@ int main(int argc, char** argv)
         // OF simpleControl::criteriaSatisfied: an unlisted field is not a criterion, and a run only
         // converges if at least one criterion was ACTUALLY checked (see solvers/common/residual_control.cuh).
         int rcChecked = 0;
-        scalar turbMag0 = 0;   // sum|turb| at iteration 1; baseline for the blow-up tripwire
+        TurbBlowup turbBlowup;   // sum|turb| tripwire; see solvers/common/turb_blowup.cuh
         auto ok = [&](scalar res, scalar ctlv) { if (ctlv < 0) return true; ++rcChecked; return res < ctlv; };
         // OF controlDict write cadence: writeControl / writeInterval / purgeWrite (ported from Foam::Time)
         const std::string writeControl = controlDict.wordOr("writeControl", "timeStep");
@@ -603,8 +635,12 @@ int main(int argc, char** argv)
         // `iter <= endTime` from 1 ran TWENTY and finished at 30 -- silently changing the iteration
         // count, the write times, and any comparison of a restarted run against a continuous one. Only
         // correct when startTime is 0, which is why every fresh-start case hid it.
-        const long nSteps = std::lround((static_cast<double>(endTime) - static_cast<double>(startTimeVal))
-                                        / static_cast<double>(deltaT));
+        // OF Time::run tests `value() < endTime - 0.5*deltaT` and operator++ ACCUMULATES the value
+        // (Time.C:785, :1067). std::lround on the quotient disagrees at ratio n + 0.5 -- measured, real
+        // OpenFOAM runs 2 steps at startTime 0 / endTime 1 / deltaT 0.4 where lround gives 3.
+        const long nSteps = openFoamNSteps(static_cast<double>(startTimeVal),
+                                           static_cast<double>(endTime),
+                                           static_cast<double>(deltaT));
         if (nSteps < 1)
             throw std::runtime_error(
                 "controlDict endTime (" + std::to_string(endTime) + ") is not beyond the start time ("
@@ -624,17 +660,45 @@ int main(int argc, char** argv)
                 const double _et = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - _runStart).count();
                 const double cl = (double)deltaT * r.contLocal, cg = (double)deltaT * r.contGlobal;
                 _cumCont += cg;
-                std::printf("Time = %d\n\n"
-                            "smoothSolver:  Solving for Ux, Initial residual = %g, Final residual = %g, No Iterations %d\n"
-                            "smoothSolver:  Solving for Uy, Initial residual = %g, Final residual = %g, No Iterations %d\n"
-                            "smoothSolver:  Solving for Uz, Initial residual = %g, Final residual = %g, No Iterations %d\n"
-                            "GAMG:  Solving for p, Initial residual = %g, Final residual = %g, No Iterations %d\n"
+                // The SOLVER NAME in this line is brae's own, not OpenFOAM's, and that is deliberate.
+                // The line is otherwise OpenFOAM's format so a log can be diffed against one, but the
+                // prefix used to read `smoothSolver:` and `GAMG:` whatever brae actually ran -- a log
+                // asserting a capability the code does not have, which is the defect class this repo has
+                // already paid for once. brae's symGaussSeidel IS OpenFOAM's sweep now
+                // (device_sym_gauss_seidel.cuh), so the name is honest; its p solver is still an
+                // AMG-preconditioned PCG, announced as a substitution by the shared reader
+                // (solvers/common/linear_solver_setup.cuh). Every gate that parses
+                // this log matches on `Solving for <field>, Initial residual = ...` and none anchors on
+                // the prefix, so naming it honestly costs nothing.
+                // Naming WHICH GaussSeidel, because OF has two in that family and they are different
+                // solvers: GaussSeidelSmoother.C sweeps ascending only. A log that said
+                // "symGaussSeidel" for both would be asserting a capability again.
+                const char* uSolv = ctl.gsU ? (ctl.gsUSym ? "smoothSolver[symGaussSeidel]"
+                                                          : "smoothSolver[GaussSeidel]")
+                                            : "Jacobi-BiCGStab";
+                // OF prints the TIME NAME (simpleFoam.C:100, runTime.timeName()), not the iteration
+                // index. The two coincide only at startTime 0 with deltaT 1, which every fixture in
+                // validation/ happens to be -- the same blind spot that hid it on the V2 driver until
+                // queue item 39. brae::Time already carries the name, and this driver already NAMES its
+                // output directory with it; only the log line was still counting.
+                std::printf("Time = %s\n\n"
+                            "%s:  Solving for Ux, Initial residual = %g, Final residual = %g, No Iterations %d\n"
+                            "%s:  Solving for Uy, Initial residual = %g, Final residual = %g, No Iterations %d\n"
+                            "%s:  Solving for Uz, Initial residual = %g, Final residual = %g, No Iterations %d\n"
+                            "AMG-PCG:  Solving for p, Initial residual = %g, Final residual = %g, No Iterations %d\n"
                             "time step continuity errors : sum local = %g, global = %g, cumulative = %g\n",
-                            iter, r.Ux, r.UxFinal, r.UxIters, r.Uy, r.UyFinal, r.UyIters, r.Uz, r.UzFinal, r.UzIters,
+                            time.timeName().c_str(),
+                            uSolv, r.Ux, r.UxFinal, r.UxIters,
+                            uSolv, r.Uy, r.UyFinal, r.UyIters,
+                            uSolv, r.Uz, r.UzFinal, r.UzIters,
                             r.p, r.pFinal, r.pIters, cl, cg, _cumCont);
+                const char* kSolv = ctl.gsK ? (ctl.gsKESym ? "smoothSolver[symGaussSeidel]"
+                                                           : "smoothSolver[GaussSeidel]")
+                                            : "Jacobi-BiCGStab";
                 for (const auto& e : turbulenceReport())   // Solving for omega/k/epsilon/... in solve order, like OF
-                    std::printf("smoothSolver:  Solving for %s, Initial residual = %g, Final residual = %g, No Iterations %d\n",
-                                e.field.c_str(), e.perf.initialResidual, e.perf.finalResidual, e.perf.nIterations);
+                    std::printf("%s:  Solving for %s, Initial residual = %g, Final residual = %g, No Iterations %d\n",
+                                kSolv, e.field.c_str(), e.perf.initialResidual, e.perf.finalResidual,
+                                e.perf.nIterations);
                 std::printf("ExecutionTime = %.2f s  ClockTime = %.0f s\n\n", _et, _et);
             }
             // NaN/divergence guard: a non-finite momentum/pressure residual means the solve blew up (FP32 overflow,
@@ -655,20 +719,15 @@ int main(int argc, char** argv)
             // flow just goes near-laminar), every residual stayed finite, and the run marched to endTime and
             // WROTE the fields reporting success. That is worse than a crash -- the output looks plausible.
             //
-            // Trip on growth relative to the first iteration rather than an absolute value, so the bar is
-            // independent of mesh size and of the case's units. 1e12 is a tripwire, not a convergence
-            // criterion: a healthy cold start grows sum|turb| by ~1e2, so this cannot fire on a real solve.
+            // Growth is measured against the first iteration rather than an absolute value, so the bar is
+            // independent of mesh size and of the case's units -- but crossing the bar is NOT on its own
+            // divergence. A violent start-up transient crosses it and recovers, and real OpenFOAM goes
+            // through the same excursion on the case that exposed this. The tripwire therefore requires the
+            // excursion to PERSIST; see solvers/common/turb_blowup.cuh for the measurements behind that.
             if (!std::getenv("BRAE_ALLOW_NONFINITE") && ctl.turbulent)
             {
-                const scalar tm = solver.turbSumMag();
-                if (iter == 1) turbMag0 = tm;
-                if (!std::isfinite(tm) || (turbMag0 > 0 && tm > 1e12 * turbMag0))
-                    throw std::runtime_error(
-                        "solution diverged: turbulence blow-up at iteration " + std::to_string(iter)
-                        + " (sum|k|+sum|eps/omega| grew from " + std::to_string((double)turbMag0) + " to "
-                        + std::to_string((double)tm) + "). The momentum residuals can stay finite while this"
-                        + " happens, so the run would otherwise write a plausible-looking but wrong field."
-                        + " No field written. Set BRAE_ALLOW_NONFINITE=1 to continue anyway.");
+                if (turbBlowup.update(solver.turbSumMag(), (int)iter))
+                    throw std::runtime_error(turbBlowup.message((int)iter));
             }
             // OF residualControl: also gate on every turbulence field (k/epsilon/omega/nuTilda) that lists a target.
             // Previously ONLY p and Ux were checked, so a turbulent case could report "converged" with k/epsilon

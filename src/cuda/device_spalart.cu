@@ -352,11 +352,18 @@ void deviceSpalartAllmarasCorrect(
     const DeviceBuffer<scalar>* hmax,
     const DeviceBuffer<scalar>* hwn,
     const DeviceBuffer<scalar>* lesDelta,
-    const DeviceBuffer<scalar>* wallN)
+    const DeviceBuffer<scalar>* wallN,
+    scalar gradULimitK,   // OF `grad(U)` cellLimited coefficient; see the declaration
+    int nSweeps,          // solvers/nuTilda/nSweeps; see the declaration
+    bool gsSymmetric)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> gradU;
     deviceGradU(dm, dbU, Ux, Uy, Uz, gradU, ami, cyc);   // interface-aware grad(U) for vorticity/production
+    // The case's own `grad(U)` scheme, which fvc::grad(U) resolves (SpalartAllmarasBase.C:461). Applied
+    // to the TENSOR, as cellLimitedGrad does, so Omega, Stilda and the DES/IDDES length scales all see
+    // the same gradient OpenFOAM built them from.
+    if (gradULimitK > scalar(0)) deviceCellLimitGradU(dm, dbU, Ux, Uy, Uz, gradU, gradULimitK);
     // SA-DDES/IDDES: replace the wall distance y with the DES length scale dTilda in the SA length-scale terms (Stilda,
     // fw, destruction). des==false (RANS) -> dScale aliases y, so the model is byte-for-byte the standard SA. iddes uses
     // the improved (WMLES) length scale (needs hmax = maxDeltaxyz); otherwise the plain DDES cubeRootVol limiter.
@@ -472,7 +479,14 @@ void deviceSpalartAllmarasCorrect(
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){
                                    saReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), nuTilda.data(), Stilda.data(),
                                        fw.data(), dScale.data(), gradNt2.data(), co, diag.data(), src.data()); },
-                               nullptr, nullptr, ami, cyc, ntDdt, DB.size() ? &DB : nullptr);
+                               nullptr, nullptr, ami, cyc, ntDdt, DB.size() ? &DB : nullptr,
+                               // gradLimitK 0, boundPositive true (nuTilda is positive-definite), no
+                               // fvOptions set-values, no limiter override, Jacobi, then the case's own
+                               // smoothSolver sweep count.
+                               /*gradLimitK*/0.0, /*boundPositive*/true,
+                               /*fvoSetMask*/nullptr, /*fvoSetVal*/nullptr,
+                               /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
+                               /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric);
     // deviceSolveScalarTransport already bounds to 1e-15 (~ bound(nuTilda, 0)). correctNut: nut = nuTilda*fv1(new).
     saNutKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), nu, co.Cv1, nut.data());
     cudaCheck(cudaGetLastError(), "SA correctNut");

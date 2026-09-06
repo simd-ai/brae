@@ -27,6 +27,16 @@ if (runTime.timeIndex() == braeDumpIter())
 // Update the pressure BCs to ensure flux consistency
 constrainPressure(p, rho, U, phiHbyA, rhorAtU, MRF);
 
+// Stage harness: the SIMPLEC inputs, before either branch touches them. stage_HbyA above is dumped BEFORE
+// `HbyA -= (rAU - rAtU)*fvc::grad(p)`, so the corrected HbyA is dumped separately in each branch.
+if (runTime.timeIndex() == braeDumpIter())
+{
+    surfaceScalarField("stage_phiHbyA0", phiHbyA).write();
+    volScalarField("stage_rhorAtU", rhorAtU).write();
+    volScalarField("stage_psi", psi).write();
+    volScalarField("stage_rhoP", rho).write();
+}
+
 if (simple.transonic())
 {
     if (runTime.timeIndex() == braeDumpIter()) surfaceScalarField("phiHbyA0", phiHbyA).write();
@@ -37,11 +47,24 @@ if (simple.transonic())
         (fvc::interpolate(psi)/fvc::interpolate(rho))*phiHbyA
     );
 
+    if (runTime.timeIndex() == braeDumpIter())
+    {
+        surfaceScalarField("stage_phid", phid).write();
+    }
     phiHbyA +=
         fvc::interpolate(rho*(rAtU - rAU))*fvc::snGrad(p)*mesh.magSf()
       - fvc::interpolate(psi*p)*phiHbyA/fvc::interpolate(rho);
 
     HbyA -= (rAU - rAtU)*fvc::grad(p);
+
+    // Stage harness: phiHbyA AFTER the SIMPLEC (rAtU - rAU) flux correction, and HbyA after its own
+    // correction. Both branches apply both; only the transonic one also subtracts the psi*p term, and it
+    // does so in the SAME statement, so a single "phiHbyA after" is the only well-defined comparison point.
+    if (runTime.timeIndex() == braeDumpIter())
+    {
+        surfaceScalarField("stage_phiHbyAc", phiHbyA).write();
+        volVectorField("stage_HbyAc", HbyA).write();
+    }
 
     if (runTime.timeIndex() == braeDumpIter())
     {
@@ -171,6 +194,15 @@ else
     phiHbyA += fvc::interpolate(rho*(rAtU - rAU))*fvc::snGrad(p)*mesh.magSf();
     HbyA -= (rAU - rAtU)*fvc::grad(p);
 
+    // Stage harness: phiHbyA AFTER the SIMPLEC (rAtU - rAU) flux correction, and HbyA after its own
+    // correction. Both branches apply both; only the transonic one also subtracts the psi*p term, and it
+    // does so in the SAME statement, so a single "phiHbyA after" is the only well-defined comparison point.
+    if (runTime.timeIndex() == braeDumpIter())
+    {
+        surfaceScalarField("stage_phiHbyAc", phiHbyA).write();
+        volVectorField("stage_HbyAc", HbyA).write();
+    }
+
     while (simple.correctNonOrthogonal())
     {
         fvScalarMatrix pEqn
@@ -180,6 +212,50 @@ else
           ==
             fvOptions(psi, p, rho.name())
         );
+
+        // Stage harness: the SUBSONIC pcEqn's assembled system. This branch had no dump at all, so the
+        // SIMPLEC pressure equation could only ever be compared in its transonic form.
+        if (runTime.timeIndex() == braeDumpIter() && !dumpedPCoeffs)
+        {
+            dumpedPCoeffs = true;
+            volScalarField pICs
+            (
+                IOobject("stage_pIC", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+                mesh, dimensionedScalar(dimless, Zero), calculatedFvPatchScalarField::typeName
+            );
+            volScalarField pBCs
+            (
+                IOobject("stage_pBC", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+                mesh, dimensionedScalar(dimless, Zero), calculatedFvPatchScalarField::typeName
+            );
+            forAll(mesh.boundary(), pi)
+            {
+                pICs.boundaryFieldRef()[pi] = pEqn.internalCoeffs()[pi];
+                pBCs.boundaryFieldRef()[pi] = pEqn.boundaryCoeffs()[pi];
+            }
+            pICs.write(); pBCs.write();
+            volScalarField pDs
+            (
+                IOobject("stage_pD", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+                mesh, dimensionedScalar(dimless, Zero), zeroGradientFvPatchScalarField::typeName
+            );
+            volScalarField pSrcs
+            (
+                IOobject("stage_pSrc", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+                mesh, dimensionedScalar(dimless, Zero), zeroGradientFvPatchScalarField::typeName
+            );
+            pDs.primitiveFieldRef() = pEqn.D();
+            scalarField rhss(pEqn.source());
+            forAll(mesh.boundary(), pj)
+            {
+                const labelUList& fc = mesh.boundary()[pj].faceCells();
+                const scalarField& bcp = pEqn.boundaryCoeffs()[pj];
+                forAll(fc, i) rhss[fc[i]] += bcp[i];
+            }
+            pSrcs.primitiveFieldRef() = rhss;
+            pDs.write(); pSrcs.write();
+            Info<< "  pcEqn subsonic closedVolume = " << closedVolume << endl;
+        }
 
         pEqn.setReference
         (

@@ -38,6 +38,8 @@
 #include "write_control.cuh"   // OF writeControl/writeInterval/purgeWrite cadence (shared with simpleFoam)
 #include "brae_time.cuh"   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
 #include "scalar_transport_fo.cuh"   // OF functionObjects::scalarTransport, on the device flux
+#include "rhoSimpleFoamDriver_cpp.cuh"   // the OF-mirror host path this binary hands over to on request
+#include "rhoSimpleFoamDriver.cuh"       // ...and the same solver on the device modules
 #include "mrf_read.cuh"          // readCellZones (shared with the incompressible driver)
 #include "fv_options.cuh"       // OF fv::options: the SAME framework the incompressible driver uses
 #include "of_residual_log.cuh"   // BRAE_OF_LOG=1: OF-format per-solve residuals, for iteration-by-iteration diffing
@@ -78,6 +80,34 @@ int main(int argc, char** argv)
         {
             const std::string a = argv[i];
             if (a == "-case" && i + 1 < argc) caseDir = argv[++i];
+            // A POSITIONAL case directory, which every other brae solver accepts (gpuSimpleFoam.cu,
+            // gpuPimpleFoam.cu) and this one did not: `brae myCase` dispatches here with argv forwarded
+            // verbatim, and the case name was then dropped and the run silently made in the CURRENT
+            // directory -- a different case, or a "no polyMesh" abort with the user's argument in hand.
+            else if (!a.empty() && a[0] != '-') caseDir = a;
+        }
+
+        // THE OF-MIRROR PATH, opt-in. `application rhoSimpleFoam` routes to this binary, whose body
+        // below is the PRE-MIRROR implementation; the mirror is the re-port under this directory that
+        // the gates measure (rhoCreateFields_cpp / rhoSimpleFoam_cpp, driven by
+        // rhoSimpleFoamDriver_cpp). Selected exactly as the incompressible rebuild is
+        // (BRAE_SIMPLEFOAM_V2, gpuSimpleFoam.cu), and like it, it REFUSES a case outside its envelope
+        // by name rather than falling back here -- a silent fallback would report the mirror's name
+        // over the old path's answer. Repointing the registry at the mirror is the later, gate-earned
+        // step.
+        // `1` runs the host reference (every module in C++, the gated ground truth); `cuda` runs the
+        // same solver with the device modules doing the arithmetic. Both share the case parse, the
+        // loop, the write cadence and the refusals -- only the equations move.
+        if (const char* mirror = std::getenv("BRAE_RHOSIMPLEFOAM_MIRROR"))
+        {
+            const std::string sel(mirror);
+            if (sel == "1" || sel == "cpu")  return cpu::rhoSimple::runMirror(caseDir);
+            if (sel == "cuda" || sel == "2") return gpu::rhoSimple::runMirrorCuda(caseDir);
+            if (!sel.empty())
+                throw std::runtime_error(
+                    "BRAE_RHOSIMPLEFOAM_MIRROR is '" + sel + "'; it selects which OF-mirror arm runs "
+                    "and takes `1`/`cpu` (the host reference) or `cuda` (the device modules). Refusing "
+                    "rather than falling through to the pre-mirror driver under a mirror request.");
         }
 
         const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
@@ -339,6 +369,17 @@ int main(int argc, char** argv)
         // epsilon reaction is a DIFFERENT expression (deviceEpsReactionRealizable, strain-based) that has
         // NOT been rho-weighted -- accepting it here would run an unweighted reaction and converge wrong.
         const bool keStandard = !ctl.sst && !ctl.sa && !ctl.keCoeffs.realizable;
+        // kOmegaSSTLM sets ctl.sst=true (it IS kOmegaSST plus the gamma-ReThetat transition
+        // transport), so it sailed through the guard below and ran as PLAIN SST -- the transition
+        // equations exist only on the incompressible drivers (ctl.lm is consulted nowhere in this
+        // file). A laminar-turbulent transition case run fully turbulent converges to the wrong nut
+        // everywhere the flow should still be laminar.
+        if (ctl.turbulent && ctl.lm)
+            throw std::runtime_error(
+                "brae: rhoSimpleFoam does not port kOmegaSSTLM -- the gamma-ReThetat transition "
+                "equations are wired on the incompressible drivers only, and running the underlying "
+                "kOmegaSST without them is a different model. Refusing rather than ignoring the "
+                "transition.");
         if (ctl.turbulent && !ctl.sst && !keStandard)
             throw std::runtime_error(
                 "brae: rhoSimpleFoam supports kOmegaSST and kEpsilon so far. SpalartAllmaras and "
@@ -394,6 +435,28 @@ int main(int argc, char** argv)
                    "selectionMode all|cellZone.";
             throw std::runtime_error(msg);
         }
+
+        // MRF: REFUSED on this solver, because it is not merely unimplemented -- it was invisible.
+        //
+        // The compressible driver includes mrf_read.cuh only for readCellZones and never opens
+        // constant/MRFProperties, so a case with an active rotating zone ran with NO rotation at all and
+        // said nothing. That is the same shape as the defects this port keeps turning up: an input read
+        // off disk by nobody, producing a converged and plausible field.
+        //
+        // Implementing it is not a copy of the incompressible path either. OF's UEqn.H here is
+        // `MRF.DDt(rho, U)` -- MRFZoneList.C:210, the DENSITY-WEIGHTED overload -- while brae's
+        // deviceMrfCoriolis takes no rho at all. Reusing the incompressible term would silently drop that
+        // weighting, which on a compressible rotating case is wrong in proportion to the density ratio.
+        //
+        // No rhoSimpleFoam tutorial ships MRFProperties, so nothing regresses by refusing; the point is
+        // that the next case to try it gets an error instead of a wrong answer.
+        if (readMRFProperties(caseDir + "/constant").active)
+            throw std::runtime_error(
+                "brae: constant/MRFProperties has an active zone, and brae's COMPRESSIBLE solver does not "
+                "apply MRF yet. OpenFOAM's rhoSimpleFoam UEqn.H uses the density-weighted MRF.DDt(rho, U) "
+                "(MRFZoneList.C:210); brae's Coriolis term is not density-weighted, so running this case "
+                "would silently drop both the rotation and its rho weighting. Refused rather than solved "
+                "with the wrong physics.");
 
         const std::string second = ctl.sst ? "omega" : "epsilon";
         readRelaxationFactors(fvSolution, ctl);   // shared; adds the alpha<=0 guard this copy lacked
@@ -734,8 +797,12 @@ int main(int argc, char** argv)
         // `iter <= endTime` from 1, which on that restart ran TWENTY steps and finished at 30 -- silently
         // changing the iteration count, the write times, and any comparison of a restarted run against a
         // continuous one. Only correct when startTime is 0, which is why every fresh-start case hid it.
-        const long nSteps = std::lround((static_cast<double>(endTime) - static_cast<double>(tStart))
-                                        / static_cast<double>(wc.deltaT()));
+        // OF Time::run tests `value() < endTime - 0.5*deltaT` and operator++ ACCUMULATES the value
+        // (Time.C:785, :1067). std::lround on the quotient disagrees at ratio n + 0.5: measured, real
+        // OpenFOAM runs 2 steps at startTime 0 / endTime 1 / deltaT 0.4 where lround gives 3.
+        const long nSteps = openFoamNSteps(static_cast<double>(tStart),
+                                           static_cast<double>(endTime),
+                                           static_cast<double>(wc.deltaT()));
         if (nSteps < 1)
             throw std::runtime_error(
                 "controlDict endTime (" + std::to_string(endTime) + ") is not beyond the start time ("
@@ -756,8 +823,12 @@ int main(int argc, char** argv)
             printOfResidualLog(iter, r, cumulativeCont);   // no-op unless BRAE_OF_LOG=1
             if (iter % 50 == 0 || iter == 1)
             {
-                std::printf("Time = %d   Ux %.4e  p %.4e  contGlobal %.4e\n",
-                            iter, r.Ux, r.p, r.contGlobal);
+                // OF prints the TIME NAME (rhoSimpleFoam.C's runTime.timeName()), not the iteration
+                // index. They coincide only at startTime 0 with deltaT 1, which every fixture in
+                // validation/ is -- the blind spot that hid the same thing on the V2 driver until
+                // queue item 39. brae::Time already carries the name.
+                std::printf("Time = %s   Ux %.4e  p %.4e  contGlobal %.4e\n",
+                            time.timeName().c_str(), r.Ux, r.p, r.contGlobal);
             }
             resControl.beginIteration();
             // U is gated on Ux alone, matching gpuSimpleFoam: brae tracks no solved-directions mask, so the

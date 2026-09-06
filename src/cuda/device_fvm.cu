@@ -400,6 +400,87 @@ void deviceLaplacianCorrFluxLimited(
     cudaCheck(cudaGetLastError(), "lapCorrFaceLimited");
 }
 
+namespace {
+// The VECTOR form. OF's limitedSnGrad<Type> takes mag() of the whole snGrad and of the whole correction,
+// so a vector field gets ONE limiter per face shared by all three components -- not three independent
+// ones. Limiting per component is a different scheme: it lets one component's correction survive where
+// the vector's own magnitude says the face should be capped, and on airFoil2D the two differ by 0.6%.
+__global__
+void lapCorrFaceLimitedVecKernel(
+    int nIf,
+    const label*  __restrict__ own,
+    const label*  __restrict__ nei,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ gammaf,
+    const scalar* __restrict__ magSf,
+    const scalar* __restrict__ cvx,
+    const scalar* __restrict__ cvy,
+    const scalar* __restrict__ cvz,
+    const scalar* __restrict__ nonOrthDc,
+    const scalar* __restrict__ p0,
+    const scalar* __restrict__ p1,
+    const scalar* __restrict__ p2,
+    const scalar* __restrict__ g0x, const scalar* __restrict__ g0y, const scalar* __restrict__ g0z,
+    const scalar* __restrict__ g1x, const scalar* __restrict__ g1y, const scalar* __restrict__ g1z,
+    const scalar* __restrict__ g2x, const scalar* __restrict__ g2y, const scalar* __restrict__ g2z,
+    scalar psi,
+    scalar* __restrict__ f0,
+    scalar* __restrict__ f1,
+    scalar* __restrict__ f2)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= nIf) return;
+    const int o = own[f], n = nei[f];
+    const scalar wf = w[f], wn = 1.0 - wf;
+
+    const scalar c0 = cvx[f]*(wf*g0x[o] + wn*g0x[n]) + cvy[f]*(wf*g0y[o] + wn*g0y[n])
+                    + cvz[f]*(wf*g0z[o] + wn*g0z[n]);
+    const scalar c1 = cvx[f]*(wf*g1x[o] + wn*g1x[n]) + cvy[f]*(wf*g1y[o] + wn*g1y[n])
+                    + cvz[f]*(wf*g1z[o] + wn*g1z[n]);
+    const scalar c2 = cvx[f]*(wf*g2x[o] + wn*g2x[n]) + cvy[f]*(wf*g2y[o] + wn*g2y[n])
+                    + cvz[f]*(wf*g2z[o] + wn*g2z[n]);
+
+    const scalar d0 = nonOrthDc[f]*(p0[n] - p0[o]);
+    const scalar d1 = nonOrthDc[f]*(p1[n] - p1[o]);
+    const scalar d2 = nonOrthDc[f]*(p2[n] - p2[o]);
+
+    const scalar magOrth = sqrt(d0*d0 + d1*d1 + d2*d2);
+    const scalar magCorr = sqrt(c0*c0 + c1*c1 + c2*c2);
+    scalar limiter = (psi * magOrth) / ((1.0 - psi) * magCorr + 1.0e-15);
+    if (limiter > 1.0) limiter = 1.0;
+
+    const scalar s = gammaf[f] * magSf[f] * limiter;
+    f0[f] = s * c0;
+    f1[f] = s * c1;
+    f2[f] = s * c2;
+}
+} // namespace
+
+void deviceLaplacianCorrFluxLimitedVec(
+    const DeviceMesh& dm,
+    const DeviceBuffer<scalar>& gammafInt,
+    const DeviceBuffer<scalar>& p0,
+    const DeviceBuffer<scalar>& p1,
+    const DeviceBuffer<scalar>& p2,
+    const DeviceBuffer<scalar>* gxc,     // [3]
+    const DeviceBuffer<scalar>* gyc,
+    const DeviceBuffer<scalar>* gzc,
+    scalar psi,
+    DeviceBuffer<scalar>* ffc)           // [3], resized here
+{
+    const int nIf = dm.nInternalFaces;
+    for (int k = 0; k < 3; ++k) ffc[k].resize(nIf);
+    lapCorrFaceLimitedVecKernel<<<nBlocks(nIf), TPB>>>(
+        nIf, dm.owner.data(), dm.nei.data(), dm.w.data(), gammafInt.data(), dm.magSf.data(),
+        dm.corrVecX.data(), dm.corrVecY.data(), dm.corrVecZ.data(), dm.nonOrthDc.data(),
+        p0.data(), p1.data(), p2.data(),
+        gxc[0].data(), gyc[0].data(), gzc[0].data(),
+        gxc[1].data(), gyc[1].data(), gzc[1].data(),
+        gxc[2].data(), gyc[2].data(), gzc[2].data(),
+        psi, ffc[0].data(), ffc[1].data(), ffc[2].data());
+    cudaCheck(cudaGetLastError(), "lapCorrFaceLimitedVec");
+}
+
 
 // src = -V*fvc::div(ffc) (the integrated face-flux divergence, = fvm::laplacian.source()'s correction term).
 void deviceFaceDivSource(const DeviceMesh& dm, const DeviceBuffer<scalar>& ffc, DeviceBuffer<scalar>& src)

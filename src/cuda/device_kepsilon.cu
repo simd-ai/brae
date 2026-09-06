@@ -1,6 +1,10 @@
 // cf GPU offload: k-epsilon production + eddy viscosity. gradU is the OF-convention tensor (column i =
 // gaussGrad(U_i), as in divDevReff); GbyNu = sum_ij g_ij*(g_ij + g_ji - (2/3)tr d_ij).
 #include "device_kepsilon.cuh"
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <map>
 #include "device_komega_sst.cuh"
 #include "device_scalar_transport.cuh"  // generic scalar-transport scaffold (deviceSolveScalarTransport)
 #include "spalart_coeffs.cuh"
@@ -147,8 +151,10 @@ void rkeEpsReactionKernel(
 
 __global__
 void wallFnKernel(
-    int nWF,
-    const label* __restrict__ wfCell,
+    int nWC,
+    const label* __restrict__ wcCell,
+    const label* __restrict__ wcStart,
+    const label* __restrict__ wcFace,
     const scalar* __restrict__ wfY,
     const scalar* __restrict__ wfDc,
     const scalar* __restrict__ wux,
@@ -168,20 +174,55 @@ void wallFnKernel(
     scalar atmZ0,
     bool   atmBoundNut,
     int nutWall,
+    bool   lowReCorrection,
     scalar* __restrict__ eps0,
     scalar* __restrict__ G0,
-    const scalar* __restrict__ nuFace)   // compressible: per-wall-face nu, null -> the scalar nu
+    const scalar* __restrict__ nuFace,   // compressible: per-wall-face nu, null -> the scalar nu
+    const scalar* __restrict__ nutwStored)   // the STORED wall nut, wall-face order; null -> recompute
 {
-    const int wf = blockIdx.x * blockDim.x + threadIdx.x;
-    if (wf >= nWF) return;
+    // One thread per wall CELL, summing that cell's wall faces in ascending face index and writing once.
+    // The per-face form needed atomicAdd here, and a cell with more than one wall face then depended on
+    // scheduling order -- rare, intermittent, and amplified by the SIMPLE loop. See buildDeviceWallData.
+    const int wc = blockIdx.x * blockDim.x + threadIdx.x;
+    if (wc >= nWC) return;
 
-    const int c = wfCell[wf];
-    const scalar y = wfY[wf], dc = wfDc[wf], kc = k[c];
-    // OF epsilonWallFunction reads turbulenceModel::nu(patchi) = mu_b/rho_b, a per-FACE field. The scalar
-    // fallback is only right for constant-property incompressible flow.
-    const scalar nuw = nuFace ? nuFace[wf] : nu;
-    wallProductionG0(c, wf, y, dc, kc, invNw[c], wux, wuy, wuz, Ux, Uy, Uz, nuw, yplLam, Cmu25, kappa, E, atmZ0, atmBoundNut, nutWall, G0);
-    atomicAdd(&eps0[c], invNw[c] * Cmu75 * pow(kc, 1.5) / (kappa * y));   // kEpsilon: distinct eps wall value
+    const int c = wcCell[wc];
+    const scalar kc = k[c], iN = invNw[c];
+    scalar g0 = 0.0, e0 = 0.0;
+    for (label j = wcStart[wc]; j < wcStart[wc+1]; ++j)
+    {
+        const label wf = wcFace[j];
+        const scalar y = wfY[wf], dc = wfDc[wf];
+        // OF epsilonWallFunction reads turbulenceModel::nu(patchi) = mu_b/rho_b, a per-FACE field. The
+        // scalar fallback is only right for constant-property incompressible flow.
+        const scalar nuw = nuFace ? nuFace[wf] : nu;
+        // epsilonWallFunction, STEPWISE blender (its default). `lowReCorrection` switches a face whose
+        // y+ is below yPlusLam to the VISCOUS epsilon and drops its wall production ENTIRELY --
+        // epsilonWallFunctionFvPatchScalarField.C:242 and :338, where the G guard is
+        // `if (!lowReCorrection_ || (yPlus > yPlusLam))`. Mirrors kEpsilon_cpp's reference branch.
+        const scalar yPlus = Cmu25 * y * sqrt(kc) / nuw;
+        const bool   resolved = lowReCorrection && (yPlus < yplLam);
+        if (!resolved)
+        {
+            if (nutwStored)
+            {
+                // G0 = w*(nutw + nuw)*|snGrad U|*Cmu25*sqrt(k)/(kappa*y) with nutw the STORED patch value,
+                // as epsilonWallFunctionFvPatchScalarField::calculate reads it (nutw[facei]); the
+                // recomputed form below is exact only when k and nu_w have not moved since the value
+                // was stored -- see the header.
+                const scalar gx = (wux[wf] - Ux[c]) * dc, gy = (wuy[wf] - Uy[c]) * dc, gz = (wuz[wf] - Uz[c]) * dc;
+                const scalar magGradUw = sqrt(gx*gx + gy*gy + gz*gz);
+                g0 += iN * (nutwStored[wf] + nuw) * magGradUw * Cmu25 * sqrt(kc) / (kappa * y);
+            }
+            else
+                g0 += wallProductionG0(c, wf, y, dc, kc, iN, wux, wuy, wuz, Ux, Uy, Uz, nuw,
+                                       yplLam, Cmu25, kappa, E, atmZ0, atmBoundNut, nutWall);
+        }
+        e0 += resolved ? iN * 2.0 * kc * nuw / (y * y)                 // epsilonVis
+                       : iN * Cmu75 * pow(kc, 1.5) / (kappa * y);      // epsilonLog
+    }
+    G0[c]   = g0;
+    eps0[c] = e0;
 }
 
 
@@ -352,6 +393,165 @@ void boundApplyKernel(int nC, scalar floor, const scalar* __restrict__ avg, scal
 
 
 // Build the OF-convention gradU tensor (9*nC, column i = gaussGrad(U_i)). Shared by GbyNu (k-eps) and S2 (SST).
+namespace
+{
+// The fingerprint: a position-salted integer hash of each word of every array the computation reads,
+// summed per block in shared memory and once per block into one accumulator. Integer sums are
+// associative, so the result does not depend on the order the blocks arrive in. ONE launch covers all
+// the arrays (a descriptor list), and the decision is taken ON THE DEVICE by a one-thread kernel that
+// raises a flag the value and gradient kernels test on entry -- no host read, so the launch queue
+// never drains. The first version read the fingerprint back and synchronised at every request; on T3A
+// that cost 4-5 ms per outer iteration, more than the gradients it saved.
+constexpr int FP_MAX = 16;
+struct FpList
+{
+    int n = 0;
+    const void* ptr[FP_MAX] = {};
+    int len[FP_MAX] = {};
+    int isLabel[FP_MAX] = {};
+    int start[FP_MAX + 1] = {};      // prefix over len: the virtual index space
+};
+__device__ __forceinline__ unsigned long long fpMix(unsigned long long v, unsigned long long i, unsigned long long salt)
+{
+    unsigned long long h = v ^ (salt * 0x9E3779B97F4A7C15ULL) ^ ((i + 1ULL) * 0xD6E8FEB86659FD93ULL);
+    h ^= h >> 31;
+    h *= 0x94D049BB133111EBULL;
+    h ^= h >> 29;
+    return h;
+}
+__global__ void fpAllK(FpList L, int total, unsigned long long* __restrict__ acc)
+{
+    __shared__ unsigned long long sh[256];
+    const int g = blockIdx.x*blockDim.x + threadIdx.x;
+    unsigned long long h = 0ULL;
+    if (g < total)
+    {
+        int a = 0;
+        while (a + 1 < L.n && g >= L.start[a + 1]) ++a;
+        const int i = g - L.start[a];
+        unsigned long long v;
+        if (L.isLabel[a]) v = (unsigned long long)(long long)static_cast<const label*>(L.ptr[a])[i];
+        else              v = *reinterpret_cast<const unsigned long long*>(static_cast<const scalar*>(L.ptr[a]) + i);
+        h = fpMix(v, (unsigned long long)i, (unsigned long long)(a + 1));
+    }
+    sh[threadIdx.x] = h;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1)
+    {
+        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicAdd(acc, sh[0]);
+}
+// mode 1: hit when the fingerprint is the stored one; mode 2 (stale, the gate's fail-proof): hit whenever
+// a gradient exists. Counts the outcomes for BRAE_GRADU_MEMO_STATS.
+__global__ void fpDecideK(const unsigned long long* __restrict__ acc, unsigned long long* __restrict__ stored,
+                          int* __restrict__ valid, int* __restrict__ hit, int mode,
+                          unsigned long long* __restrict__ nHit, unsigned long long* __restrict__ nMiss)
+{
+    if (threadIdx.x || blockIdx.x) return;
+    const bool h = (*valid != 0) && (mode == 2 || *acc == *stored);
+    *hit = h ? 1 : 0;
+    *stored = *acc;
+    *valid = 1;
+    if (h) ++(*nHit); else ++(*nMiss);
+}
+int gradUMemoMode()
+{
+    static const int mode = []()
+    {
+        const char* e = std::getenv("BRAE_GRADU_MEMO");
+        if (!e) return 1;
+        const std::string v(e);
+        if (v == "0") return 0;
+        if (v == "stale") return 2;
+        return 1;
+    }();
+    return mode;
+}
+}   // namespace
+
+const GradUMemo& deviceGradUShared(
+    const DeviceMesh& dm,
+    const DeviceVectorBoundary& dbU,
+    const DeviceBuffer<scalar>& Ux,
+    const DeviceBuffer<scalar>& Uy,
+    const DeviceBuffer<scalar>& Uz)
+{
+    static auto& cache = *new std::map<const void*, GradUMemo>();
+    GradUMemo& m = cache[Ux.data()];
+    const int nC = dm.nCells;
+    const DeviceBuffer<scalar>* Uc[3] = { &Ux, &Uy, &Uz };
+    const int mode = gradUMemoMode();
+    static bool announced = false;
+    if (!announced && mode != 0)
+    {
+        announced = true;
+        std::printf("  grad(U): shared across the sites of an iteration that see the same U (fingerprinted inputs); BRAE_GRADU_MEMO=0 recomputes at every site\n");
+    }
+    const int* skip = nullptr;
+    if (mode != 0)
+    {
+        if (m.nC != nC)
+        {
+            // a new mesh (or the first call): the device state starts invalid
+            m.dev.resize(6);                       // acc, stored, valid, hit, nHit, nMiss (as 64-bit words)
+            cudaMemsetAsync(m.dev.data(), 0, 6*sizeof(unsigned long long), cudaStreamPerThread);
+            m.nC = nC;
+        }
+        unsigned long long* w = m.dev.data();
+        unsigned long long* acc = w;
+        unsigned long long* stored = w + 1;
+        int* valid = reinterpret_cast<int*>(w + 2);
+        int* hit   = reinterpret_cast<int*>(w + 3);
+        FpList L;
+        auto add = [&](const void* p, int n, int isLabel)
+        {
+            if (!p || n <= 0 || L.n >= FP_MAX) return;
+            L.ptr[L.n] = p; L.len[L.n] = n; L.isLabel[L.n] = isLabel;
+            L.start[L.n + 1] = L.start[L.n] + n;
+            ++L.n;
+        };
+        for (int k = 0; k < 3; ++k) add(Uc[k]->data(), nC, 0);
+        for (int k = 0; k < 3; ++k)
+        {
+            const DeviceBoundary& db = dbU.comp[k];
+            if (db.n <= 0) continue;
+            add(db.bcType.data(), db.n, 1);
+            if (db.refValue.size())      add(db.refValue.data(), db.n, 0);
+            if (db.valueFraction.size()) add(db.valueFraction.data(), db.n, 0);
+            if (db.refGrad.size())       add(db.refGrad.data(), db.n, 0);
+        }
+        const int total = L.start[L.n];
+        cudaMemsetAsync(acc, 0, sizeof(unsigned long long), cudaStreamPerThread);
+        fpAllK<<<(total + 255) / 256, 256, 0, cudaStreamPerThread>>>(L, total, acc);
+        fpDecideK<<<1, 1, 0, cudaStreamPerThread>>>(acc, stored, valid, hit, mode, w + 4, w + 5);
+        skip = hit;
+        if (std::getenv("BRAE_GRADU_MEMO_STATS"))
+        {
+            unsigned long long cnt[2];
+            cudaMemcpy(cnt, w + 4, 2*sizeof(unsigned long long), cudaMemcpyDeviceToHost);   // stats mode only: a sync
+            m.reused = cnt[0];
+            m.computed = cnt[1];
+            static unsigned long long lastPrint = 0;
+            if (cnt[0] + cnt[1] >= lastPrint + 50)
+            {
+                lastPrint = cnt[0] + cnt[1];
+                std::printf("  grad(U) memo: %llu computed, %llu reused\n", m.computed, m.reused);
+            }
+        }
+    }
+    // the value and gradient kernels run as before; on a hit each returns at entry and the memo's
+    // buffers keep the bits the last computation left there
+    for (int k = 0; k < 3; ++k)
+    {
+        deviceBCValue(dbU.comp[k], *Uc[k], m.ub[k], skip);
+        deviceGaussGrad(dm, *Uc[k], m.ub[k], m.gx[k], m.gy[k], m.gz[k], skip);
+    }
+    m.valid = true;
+    return m;
+}
+
 void deviceGradU(
     const DeviceMesh& dm,
     const DeviceVectorBoundary& dbU,
@@ -365,27 +565,37 @@ void deviceGradU(
     const int nC = dm.nCells;
     const DeviceBuffer<scalar>* Uc[3] = { &Ux, &Uy, &Uz };
     gradU.resize(static_cast<std::size_t>(9) * nC);
+    const GradUMemo& memo = deviceGradUShared(dm, dbU, Ux, Uy, Uz);
 
     // interface (cyclic/cyclicAMI) face contribution to grad(U): without it the gradient at interface cells is
     // ONE-SIDED -> wrong turbulence production G=nut*(gradU&&devTwoSymm(gradU)) there (the divDevReff x-invariance
     // bug, in the production term). For a ROTATIONAL interface the neighbour vector rotates (forwardT).
     DeviceBuffer<scalar> amiURot[3];
     if (ami && ami->n && ami->rotational) deviceAmiInterpolateVec(*ami, Ux, Uy, Uz, amiURot[0], amiURot[1], amiURot[2]);
+    const bool hasIfc = (ami && ami->n) || (cyc && cyc->n);
     for (int i = 0; i < 3; ++i)
     {
-        DeviceBuffer<scalar> bval;
-        deviceBCValue(dbU.comp[i], *Uc[i], bval);
-        DeviceBuffer<scalar> gx, gy, gz;
-        deviceGaussGrad(dm, *Uc[i], bval, gx, gy, gz);
-        if (ami && ami->n) { if (ami->rotational) deviceAmiAddGradRot(*ami, *Uc[i], amiURot[i], dm.V, gx, gy, gz);
-                             else interfaceAddGrad(*ami, *Uc[i], dm.V, gx, gy, gz); }
-        if (cyc && cyc->n) { if (cyc->rotational) deviceCyclicAddGradRot(*cyc, Ux, Uy, Uz, i, dm.V, gx, gy, gz);
-                             else interfaceAddGrad(*cyc, *Uc[i], dm.V, gx, gy, gz); }
+        const DeviceBuffer<scalar>* gx = &memo.gx[i];
+        const DeviceBuffer<scalar>* gy = &memo.gy[i];
+        const DeviceBuffer<scalar>* gz = &memo.gz[i];
+        DeviceBuffer<scalar> cx, cy, cz;
+        if (hasIfc)
+        {
+            // the interface terms are added on a COPY: the memo holds the plain Gauss gradient every site shares
+            deviceCopy(cx, memo.gx[i]);
+            deviceCopy(cy, memo.gy[i]);
+            deviceCopy(cz, memo.gz[i]);
+            if (ami && ami->n) { if (ami->rotational) deviceAmiAddGradRot(*ami, *Uc[i], amiURot[i], dm.V, cx, cy, cz);
+                                 else interfaceAddGrad(*ami, *Uc[i], dm.V, cx, cy, cz); }
+            if (cyc && cyc->n) { if (cyc->rotational) deviceCyclicAddGradRot(*cyc, Ux, Uy, Uz, i, dm.V, cx, cy, cz);
+                                 else interfaceAddGrad(*cyc, *Uc[i], dm.V, cx, cy, cz); }
+            gx = &cx; gy = &cy; gz = &cz;
+        }
         // async D2D on the per-thread stream (ordered before the consumer kernel): a plain cudaMemcpy here would
         // drain the GPU pipeline every turbulence iteration.
-        cudaCheck(cudaMemcpyAsync(gradU.data() + (0*3+i)*nC, gx.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "gradU g");
-        cudaCheck(cudaMemcpyAsync(gradU.data() + (1*3+i)*nC, gy.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "gradU g");
-        cudaCheck(cudaMemcpyAsync(gradU.data() + (2*3+i)*nC, gz.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "gradU g");
+        cudaCheck(cudaMemcpyAsync(gradU.data() + (0*3+i)*nC, gx->data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "gradU g");
+        cudaCheck(cudaMemcpyAsync(gradU.data() + (1*3+i)*nC, gy->data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "gradU g");
+        cudaCheck(cudaMemcpyAsync(gradU.data() + (2*3+i)*nC, gz->data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "gradU g");
     }
 }
 
@@ -503,19 +713,22 @@ void deviceWallEpsG0(
     scalar atmZ0,
     bool   atmBoundNut,
     const DeviceBuffer<scalar>* nuFace,
-    const DeviceBuffer<scalar>* nutFile)   // compressible: nu = mu_b/rho_b per WALL face (OF nu(patchi))
+    const DeviceBuffer<scalar>* nutwStored)   // see the header
 {
     const int nC = static_cast<int>(k.size());
     eps0.resize(nC);
     G0.resize(nC);   // zero on-device (memsetAsync) instead of a host-vector alloc + H2D every iter
     cudaCheck(cudaMemsetAsync(eps0.data(), 0, nC*sizeof(scalar), cudaStreamPerThread), "eps0 zero");
     cudaCheck(cudaMemsetAsync(G0.data(),   0, nC*sizeof(scalar), cudaStreamPerThread), "G0 zero");
-    const scalar Cmu25 = std::pow(co.Cmu, 0.25), Cmu75 = std::pow(co.Cmu, 0.75), yplLam = yPlusLamHost(co.kappa, co.E);
-    if (w.nWF > 0)
-        wallFnKernel<<<nBlocks(w.nWF), TPB>>>(w.nWF, w.wfCell.data(), w.wfY.data(), w.wfDc.data(), w.wfUwx.data(),
+    // The WALL FUNCTIONS' Cmu, not the model's (wallCoeffs_.Cmu() in OpenFOAM, default 0.09).
+    const scalar Cmu25 = std::pow(co.CmuWall, 0.25), Cmu75 = std::pow(co.CmuWall, 0.75), yplLam = yPlusLamHost(co.kappa, co.E);
+    if (w.nWC > 0)
+        wallFnKernel<<<nBlocks(w.nWC), TPB>>>(w.nWC, w.wcCell.data(), w.wcStart.data(), w.wcFace.data(),
+                                              w.wfY.data(), w.wfDc.data(), w.wfUwx.data(),
                                               w.wfUwy.data(), w.wfUwz.data(), w.invNw.data(), k.data(), Ux.data(), Uy.data(),
-                                              Uz.data(), nu, yplLam, Cmu25, Cmu75, co.kappa, co.E, atmZ0, atmBoundNut, nutWall, eps0.data(), G0.data(),
-                                              (nuFace && nuFace->size()) ? nuFace->data() : nullptr);
+                                              Uz.data(), nu, yplLam, Cmu25, Cmu75, co.kappa, co.E, atmZ0, atmBoundNut, nutWall, co.epsLowRe, eps0.data(), G0.data(),
+                                              (nuFace && nuFace->size()) ? nuFace->data() : nullptr,
+                                              (nutwStored && nutwStored->size()) ? nutwStored->data() : nullptr);
     cudaCheck(cudaGetLastError(), "wallFn");
 }
 
@@ -667,7 +880,9 @@ void deviceKEpsilonCorrect(
                             const DeviceBuffer<label>*  fvoKMask,
                             const DeviceBuffer<scalar>* fvoKVal,
                             const DeviceBuffer<label>*  fvoEMask,
-                            const DeviceBuffer<scalar>* fvoEVal)        // compressible: mu at boundary faces (the +mu of rho*D+mu)
+                            const DeviceBuffer<scalar>* fvoEVal,       // compressible: mu at boundary faces (the +mu of rho*D+mu)
+                            int nSweeps,                              // solvers/<field>/nSweeps; see the declaration
+                            bool gsSymmetric)
 {
     const int nC = dm.nCells;
     // production + divU, wall functions + near-wall override.
@@ -792,7 +1007,11 @@ void deviceKEpsilonCorrect(
                                    if (co.realizable) deviceEpsReactionRealizable(dm, eps, k, magS, nu, co.C2, diag, src);
                                    else               deviceEpsReaction(dm, eps, k, gByNu, divU, diag, src, co, rho); },
                                &wall, &eps0, ami, cyc, eDdt, DepsB.size() ? &DepsB : nullptr, gradScalarLimitK,
-                               true, fvoEMask, fvoEVal);
+                               true, fvoEMask, fvoEVal,
+                               // limField/limGrad* null (a scalar builds its own limiter), precon null
+                               // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
+                               /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
+                               /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric);
 
     // k equation (loose solve)
     DeviceBuffer<scalar> Dk(static_cast<std::size_t>(nC));
@@ -802,7 +1021,11 @@ void deviceKEpsilonCorrect(
                                relaxK, tol, relTolKE, keCheckEvery, gsK,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceKReaction(dm, k, eps, G, divU, diag, src, rho); },
                                nullptr, nullptr, ami, cyc, kDdt, DkB.size() ? &DkB : nullptr, gradScalarLimitK,
-                               true, fvoKMask, fvoKVal);
+                               true, fvoKMask, fvoKVal,
+                               // limField/limGrad* null (a scalar builds its own limiter), precon null
+                               // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
+                               /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
+                               /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric);
 
     // correctNut (cell): nut = Cmu k^2 / eps (realizableKE: rCmu k^2 / eps with the variable Cmu).
     if (co.realizable) deviceRealizableNut(rCmu, k, eps, nut);

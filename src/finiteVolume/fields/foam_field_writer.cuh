@@ -34,6 +34,19 @@ inline const char* foamClassName(scalar) { return "volScalarField"; }
 inline const char* foamClassName(const vector&) { return "volVectorField"; }
 
 // Write "uniform <v>;" or "nonuniform List<...> N (...);" for a boundary entry field.
+// OpenFOAM's FoamFile `location` is the TIME DIRECTORY NAME -- `location "269";` -- never a path. brae's
+// surface writer put the whole output path there, so two otherwise identical runs in different
+// directories wrote different phi files (tests/gs_device_loop_identity caught it as a byte diff), and
+// the vol writer echoed its 0/ template's `location "0"` into every later time. Both now write what
+// OpenFOAM writes. Readers ignore the entry; a diff does not.
+inline std::string timeDirName(const std::string& outPath)
+{
+    const std::size_t slash = outPath.find_last_of('/');
+    const std::string dir = (slash == std::string::npos) ? std::string(".") : outPath.substr(0, slash);
+    const std::size_t s2 = dir.find_last_of('/');
+    return (s2 == std::string::npos) ? dir : dir.substr(s2 + 1);
+}
+
 template <typename T>
 inline void writeFieldValue(
     std::ostream& os,
@@ -91,6 +104,46 @@ inline void writePatchEntry(
     // writing phi and a brae->brae restart was attempted at all. Same class as the `gradient` entry
     // above: an INPUT the solve does not change, so echo what was read. OF's own output writes the
     // Function1 in its "constant <v>" form.
+    // uniformFixedValue's `uniformValue` is a PatchFunction1 that OF's reader REQUIRES, exactly like the
+    // gradient above: without it PatchFunction1::New aborts with "Missing or invalid PatchFunction1
+    // entry: uniformValue", so brae's own output could be read back by neither OpenFOAM nor brae. It is
+    // an INPUT the solve does not change, so echo what was read, in the `constant <v>` form OF writes.
+    if (d.hasUniformFn1)
+    {
+        os << "        uniformValue    constant ";
+        formatFoamValue(os, d.uniformFn1Value);
+        os << ";\n";
+    }
+    // atmBoundaryLayerInlet{Velocity,K,Epsilon,Omega}: OF builds flowDir, zDir, Uref, Zref, z0 and d as
+    // Function1/PatchFunction1 and REQUIRES every one of them -- reading a field back without them aborts
+    // with "Missing or invalid Function1 entry: flowDir". The tutorial keeps them in an #include that the
+    // written field cannot refer to, so they are echoed inline, in the `constant <v>` form OF writes.
+    if (d.hasABL)
+    {
+        os << "        flowDir         constant ";
+        formatFoamValue(os, d.ablFlowDir);
+        os << ";\n        zDir            constant ";
+        formatFoamValue(os, d.ablZDir);
+        os << ";\n"
+           << "        Uref            constant " << d.ablUref << ";\n"
+           << "        Zref            constant " << d.ablZref << ";\n"
+           << "        z0              constant " << d.ablZ0   << ";\n"
+           << "        d               constant " << d.ablD    << ";\n"
+           << "        kappa           " << d.ablKappa << ";\n"
+           << "        Cmu             " << d.ablCmu   << ";\n"
+           // OF always writes C1/C2 (atmBoundaryLayer.C write); losing a non-default pair on a
+           // roundtrip would silently reset the YGCJ profile to the flat one.
+           << "        C1              " << d.ablC1    << ";\n"
+           << "        C2              " << d.ablC2    << ";\n";
+    }
+    // atmNutkWallFunction takes its roughness length as a PatchFunction1 that OF REQUIRES, and z0 IS the
+    // terrain: a field written without it cannot be read back, and a z0 quietly lost would turn a rough
+    // wall into a smooth one. `boundNut` is echoed because its default (true) is not what every case asks.
+    if (d.type == "atmNutkWallFunction")
+    {
+        os << "        z0              constant " << d.ablZ0 << ";\n"
+           << "        boundNut        " << (d.atmBoundNut ? "true" : "false") << ";\n";
+    }
     if (d.hasFlowRate)
     {
         os << "        " << (d.flowRateIsMass ? "massFlowRate" : "volumetricFlowRate")
@@ -162,7 +215,8 @@ inline void writeVolField(
         throw std::runtime_error("writeVolField: cannot read " + origPath + " (nor " + origPath + ".gz)");
     }
 
-    // FoamFile header block (verbatim, it holds no directives) + the dimensions line.
+    // FoamFile header block (verbatim but for `location`, rewritten below to the output time as
+    // OpenFOAM writes it, and `object` for a derived field) + the dimensions line.
     const std::size_t ff = text.find("FoamFile");
     const std::size_t hb = text.find('{', ff);
     int depth = 0;
@@ -186,6 +240,10 @@ inline void writeVolField(
     {
         const std::regex fmtRe("format\\s+binary\\s*;");
         header = std::regex_replace(header, fmtRe, std::string("format      ascii;"));
+    }
+    {
+        static const std::regex locRe("location\\s+\"[^\"]*\";");
+        header = std::regex_replace(header, locRe, std::string("location    \"") + timeDirName(outPath) + "\";");
     }
     if (derived && derived->object)
     {
@@ -306,7 +364,7 @@ inline void writeSurfaceField(
     if (!out) throw std::runtime_error("writeSurfaceField: cannot write " + outPath);
     out << std::setprecision(precision);
     out << "FoamFile\n{\n    version     2.0;\n    format      ascii;\n    class       surfaceScalarField;\n"
-           "    location    \"" << outPath << "\";\n    object      phi;\n}\n\n";
+           "    location    \"" << timeDirName(outPath) << "\";\n    object      phi;\n}\n\n";
     out << "dimensions      " << dimensions << ";\n\n";
     out << "internalField   nonuniform List<scalar> \n" << phiInternal.size() << "\n(\n";
     for (scalar v : phiInternal) out << v << '\n';

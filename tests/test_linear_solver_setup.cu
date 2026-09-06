@@ -153,6 +153,54 @@ int main()
         eqScalar("laminar tolP still read", ctl.tolP, 1e-07);
     }
 
+    // ---- 4b. the ENERGY slot and the turbulence CAPS, from their own entries ----
+    // The rho mirror drivers took the energy tolerance from tolKE -- the turbulence slot -- and every
+    // equation's maxIter from p's; maxIterKE/minIterKE were never read at all. Distinct values per
+    // entry are the test, and the two negatives (no heName -> untouched; laminar -> caps untouched)
+    // are what stop a reader that fills every slot from one entry passing it.
+    {
+        const std::string d = base + "/energy";
+        std::filesystem::create_directories(d + "/system");
+        {
+            std::ofstream f(d + "/system/fvSolution");
+            f << "FoamFile { version 2.0; format ascii; class dictionary; object fvSolution; }\n"
+              << "solvers\n{\n"
+              << "    p         { solver GAMG;      tolerance 1e-07; relTol 0.05; maxIter 13; minIter 1; }\n"
+              << "    U         { solver PBiCGStab; tolerance 1e-09; relTol 0.02; maxIter 17; minIter 2; }\n"
+              << "    \"(h|e)\"   { solver PBiCGStab; tolerance 1e-03; relTol 0.21; maxIter 7;  minIter 3; }\n"
+              << "    k         { solver PBiCGStab; tolerance 1e-11; relTol 0.03; maxIter 9;  minIter 1; }\n"
+              << "    epsilon   { solver PBiCGStab; tolerance 1e-10; relTol 0.04; maxIter 9;  minIter 1; }\n"
+              << "}\n"
+              << "SIMPLE { }\n";
+        }
+        const FoamDict fv = readDict(d + "/system/fvSolution");
+        const DeviceSimpleControls dflt;
+
+        DeviceSimpleControls ctl;   ctl.turbulent = true;
+        readLinearSolverControls(fv, "epsilon", ctl, "SIMPLE", "e");
+        eqScalar("tolHe from the (h|e) entry",     ctl.tolHe,     1e-03);
+        eqScalar("relTolHe from the (h|e) entry",  ctl.relTolHe,  0.21);
+        eqInt   ("maxIterHe from the (h|e) entry", ctl.maxIterHe, 7);
+        eqInt   ("minIterHe from the (h|e) entry", ctl.minIterHe, 3);
+        eqInt   ("maxIterP is p's own",            ctl.maxIterP,  13);
+        eqInt   ("maxIterU is U's own",            ctl.maxIterU,  17);
+        eqInt   ("minIterU is U's own",            ctl.minIterU,  2);
+        eqInt   ("maxIterKE from the k/epsilon entries", ctl.maxIterKE, 9);
+        eqInt   ("minIterKE from the k/epsilon entries", ctl.minIterKE, 1);
+        eqScalar("tolKE = min(tol k, tol epsilon)", ctl.tolKE, 1e-11);
+
+        DeviceSimpleControls noHe;  noHe.turbulent = true;
+        readLinearSolverControls(fv, "epsilon", noHe, "SIMPLE");   // no energy field named
+        eqScalar("no heName -> tolHe untouched",   noHe.tolHe,     dflt.tolHe);
+        eqInt   ("no heName -> maxIterHe untouched", noHe.maxIterHe, dflt.maxIterHe);
+
+        DeviceSimpleControls lam;   // turbulent = false
+        readLinearSolverControls(fv, "epsilon", lam, "SIMPLE", "e");
+        eqInt   ("laminar -> maxIterKE untouched", lam.maxIterKE, dflt.maxIterKE);
+        eqScalar("laminar -> tolHe still read",    lam.tolHe,     1e-03);
+        if (failures == 0) std::printf("  OK   energy slot and turbulence caps read from their own entries\n");
+    }
+
     // ---- 5. relaxationFactors: modern nested form, per-FIELD keys ----
     // The transient driver took epsilon/omega's factor from "k", so distinct values here are the test.
     {

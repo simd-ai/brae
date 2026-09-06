@@ -787,7 +787,12 @@ try
     // A Courant-adapted run has no fixed step count, so cap the loop generously and let `t <= tEnd`
     // end it; with a fixed dt this is the exact count as before.
     {
-        const long nSteps = std::lround((tEnd - (startTime + deltaT)) / deltaT) + 1;
+        // OF Time::run tests `value() < endTime - 0.5*deltaT` and operator++ ACCUMULATES the value
+        // (Time.C:785, :1067). The rounded quotient disagrees at ratio n + 0.5: at startTime 0 /
+        // endTime 1 / deltaT 0.4 real OpenFOAM runs 2 steps and this spelling gave 3.
+        const long nSteps = openFoamNSteps(static_cast<double>(startTime),
+                                           static_cast<double>(tEnd),
+                                           static_cast<double>(deltaT));
         time.setSteps(static_cast<int>(timeControls.adjustTimeStep ? std::max(nSteps, 1L)*1000 : nSteps));
     }
     // OF setInitialDeltaT: start AT the requested Courant number rather than ramping to it.

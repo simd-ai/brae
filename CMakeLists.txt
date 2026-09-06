@@ -73,18 +73,58 @@ add_library(brae_core STATIC
     src/finiteVolume/fvMesh/fv_patch.cu
     src/OpenFOAM/decompose/scotch_decomposition.cu
     src/OpenFOAM/decompose/domain_decomposition.cu
-    src/TurbulenceModels/wallFunctions/nut_wall_function.cu
+    src/TurbulenceModels/turbulenceModels/derivedFvPatchFields/wallFunctions/nut_wall_function.cu
     src/finiteVolume/finiteVolume/fvc.cu
     src/finiteVolume/finiteVolume/fvm.cu
     src/OpenFOAM/matrices/ldu_spmv.cu
     src/OpenFOAM/matrices/pcg.cu
     src/OpenFOAM/matrices/gamg.cu
     src/OpenFOAM/matrices/pbicgstab.cu
-    src/cuda/blas1.cu
-    src/cuda/reductions.cu
-    src/cuda/device_spmv.cu
-    src/cuda/device_dilu.cu
-    src/cuda/device_pcg.cu
+    src/matrices/lduMatrix/lduMatrix/blas1.cu
+    src/matrices/lduMatrix/lduMatrix/reductions.cu
+    src/matrices/lduMatrix/lduMatrix/device_spmv.cu
+    src/matrices/lduMatrix/preconditioners/DILUPreconditioner/device_dilu.cu
+    src/TurbulenceModels/turbulenceModels/linearViscousStress/linearViscousStress_cpp.cu
+    src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/kOmegaSST_cpp.cu
+    src/TurbulenceModels/turbulenceModels/RAS/kOmegaSSTLM/kOmegaSSTLM_cpp.cu
+    src/TurbulenceModels/turbulenceModels/RAS/realizableKE/realizableKE_cpp.cu
+    src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon_cpp.cu
+    src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon.cu
+    src/TurbulenceModels/turbulenceModels/RAS/SpalartAllmaras/SpalartAllmaras_cpp.cu
+    src/finiteVolume/cfdTools/general/fvOptions/fvOptions_cpp.cu
+    src/finiteVolume/cfdTools/general/fvOptions/rotorDiskSource_cpp.cu
+    src/finiteVolume/cfdTools/general/fvOptions/actuationDiskSource_cpp.cu
+    src/finiteVolume/cfdTools/general/bound/bound_cpp.cu
+    src/finiteVolume/cfdTools/general/MRF/MRF_cpp.cu
+    src/finiteVolume/cfdTools/general/MRF/device_MRF.cu
+    src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedSchemes_cpp.cu
+    src/finiteVolume/finiteVolume/gradSchemes/limitedGradSchemes/cellLimitedGrad_cpp.cu
+    src/applications/solvers/simpleFoam/UEqn_cpp.cu
+    src/applications/solvers/simpleFoam/UEqn.cu
+    src/applications/solvers/simpleFoam/pEqn.cu
+    src/applications/solvers/simpleFoam/simpleFoam.cu
+    src/applications/solvers/simpleFoam/simpleFoamV2.cu
+    src/applications/solvers/simpleFoam/pEqn_cpp.cu
+    src/applications/solvers/simpleFoam/createFields_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/rhoCreateFields_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/rhoUEqn_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/rhoUEqn.cu
+    src/applications/solvers/rhoSimpleFoam/rhoPEqn.cu
+    src/applications/solvers/rhoSimpleFoam/rhoEEqn.cu
+    src/applications/solvers/rhoSimpleFoam/rhoPcEqn.cu
+    src/applications/solvers/rhoSimpleFoam/rhoSimpleFoam.cu
+    src/applications/solvers/rhoSimpleFoam/rhoCreateFields.cu
+    src/applications/solvers/rhoSimpleFoam/rhoThermoDevice.cu
+    src/applications/solvers/rhoSimpleFoam/rhoEEqn_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/rhoPEqn_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/rhoPcEqn_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/rhoSimpleFoam_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/rhoSimpleFoamDriver_cpp.cu
+    src/applications/solvers/rhoSimpleFoam/rhoTurbulenceHook.cu
+    src/applications/solvers/rhoSimpleFoam/rhoSimpleFoamDriver.cu
+    src/applications/solvers/simpleFoam/simpleFoam_cpp.cu
+    src/finiteVolume/cfdTools/general/solutionControl/simpleControl/simpleControl_cpp.cu
+    src/matrices/lduMatrix/solvers/PCG/device_pcg.cu
     src/cuda/device_fvc.cu
     src/cuda/device_fvm.cu
     src/cuda/device_simple.cu
@@ -106,13 +146,16 @@ add_library(brae_core STATIC
     src/finiteVolume/cfdTools/MRF/device_mrf.cu
     src/finiteVolume/cfdTools/fvOptions/device_fvoptions.cu
     src/finiteVolume/cfdTools/fvOptions/rotor_disk.cu
-    src/cuda/device_amg.cu
-    src/cuda/device_amg_cache.cu
-    src/cuda/device_amg_coarse.cu
-    src/cuda/device_amg_smoothers.cu
-    src/cuda/device_amg_gauss_seidel.cu
-    src/cuda/device_amg_vcycle.cu
-    src/cuda/device_amg_pcg.cu
+    src/finiteVolume/cfdTools/fvOptions/actuation_disk.cu
+    src/finiteVolume/fvMatrices/cyclicAMI/cyclicAMI_cpp.cu
+    src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg.cu
+    src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_cache.cu
+    src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_coarse.cu
+    src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_smoothers.cu
+    src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_gauss_seidel.cu
+    src/matrices/lduMatrix/smoothers/symGaussSeidel/device_sym_gauss_seidel.cu
+    src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_vcycle.cu
+    src/matrices/lduMatrix/solvers/PCG/device_amg_pcg.cu
     src/cuda/device_cluster.cu
     src/cuda/device_cyclic.cu
     src/cuda/device_ami.cu
@@ -405,6 +448,319 @@ target_link_libraries(test_pbicgstab PRIVATE brae_core)
 add_test(NAME pbicgstab
          COMMAND test_pbicgstab ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym)
 
+# The _cpp reference for UEqn.H, validated by decomposition against the same OpenFOAM momentum dump:
+# core vs OpenFOAM, then the dev2 term's effect isolated, then relaxation, then the MRF/fvOptions refusals.
+# The CUDA UEqn against the _cpp reference, field by field (decomposed: diag/upper/lower, the three
+# sources, and every boundary coefficient on every patch). Laminar and turbulent, because with constant
+# nuEff a per-face-diffusivity error cannot show up.
+add_executable(test_ueqn_cuda tests/test_ueqn_cuda.cu)
+target_include_directories(test_ueqn_cuda PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_ueqn_cuda PRIVATE brae_core)
+add_test(NAME ueqn_cuda
+         COMMAND test_ueqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym 282 laminar)
+add_test(NAME ueqn_cuda_turbulent
+         COMMAND test_ueqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
+# One binary, one scheme each: CUDA against the _cpp reference at MATRIX granularity for every ported
+# div(phi,U) scheme. The tolerances differ by scheme on purpose -- the r-ratio limiters divide by a face
+# difference that approaches zero and land at 1e-12/1e-13, while linearUpwindV and LUST hit 1e-16.
+foreach(_sch limitedLinear limitedLinearV LUST linearUpwindV)
+    add_test(NAME ueqn_cuda_scheme_${_sch}
+             COMMAND ${CMAKE_COMMAND} -E env BRAE_TEST_SCHEME=${_sch}
+                     $<TARGET_FILE:test_ueqn_cuda> ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+endforeach()
+
+# CUDA rhoUEqn against the _cpp reference at MATRIX granularity -- diag, upper, lower, the three
+# sources and every boundary coefficient, not a folded single number. The reference is itself gated
+# against OpenFOAM's own dump by tests/rho_ueqn_vs_openfoam.sh, so this closes OpenFOAM -> _cpp -> CUDA.
+#
+# The fixtures are the incompressible ones because no committed case ships a rho field -- the compressible
+# _cpp gates build their state by running real OpenFOAM. The gate SYNTHESIZES a non-uniform rho and
+# asserts it varies, which is the point: with a uniform rho, mu_eff is a constant multiple of nu_eff and a
+# kernel that dropped the rho weighting from one term would still agree on a rescaled matrix.
+# CUDA rhoPEqn against the _cpp reference, stage by stage and BOTH BRANCHES. simple.transonic() selects
+# two different equations -- the transonic one adds fvm::div(phid,p) and calls pEqn.relax(), the subsonic
+# one runs adjustPhi and neither -- so both are registered. Testing one would leave the other asserted by
+# nothing. rho and psi are synthesized non-uniform for the reason the gate's header gives.
+# CUDA rhoEEqn against the _cpp reference, stage by stage and BOTH ENERGY VARIABLES. EEqn.H builds the
+# kinetic-energy source as Ekp = 0.5|U|^2 + p/rho when he is `e` and as K = 0.5|U|^2 when he is `h` --
+# different conservation laws, so both are registered. he, rho and alphaEff are synthesized non-uniform;
+# alphaEff varies on the boundary INDEPENDENTLY of the cells so the patch-value rule is exercised.
+# CUDA rhoPcEqn (SIMPLEC) against the _cpp reference, BOTH BRANCHES. It needs its own gate rather than
+# riding on rho_peqn_cuda: rAtU = 1/(1/rAU - H1) is compared separately from rAU with a control asserting
+# they differ, because if H1 came back zero every downstream number would still agree and the equation
+# would be SIMPLE wearing SIMPLEC's name. The flux correction and the HbyA correction are asserted to move
+# their fields independently -- they are one change, and keeping one without the other is worse than
+# neither.
+# The CUDA kEpsilon closure against the _cpp reference, stage by stage. The closure folds a production
+# term, a wall treatment, two transport operators, a relaxation and two solves into k and epsilon, so one
+# number over the solved fields cannot say which of them moved -- eps0/G0/isWallCell are compared on their
+# own for exactly that reason. Three controls carry it: the MASS flux must not serve as divU (they differ
+# only because rho varies here, which is why rho is synthesized varying rather than uniform), nut's
+# boundary must be the PATCH value and not the owner cell's, and the production term must be load-bearing.
+# A fourth runs correct() TWICE in one process: DeviceBuffer::resize takes from a pool that does not zero,
+# and the first call is always right because the pool has nothing to hand back yet.
+# The CUDA rhoSimpleFoam DRIVER against the _cpp driver, over MULTIPLE ITERATIONS -- which is the whole
+# point. Every component it composes already has a per-stage gate at 1e-12 or better; what those cannot
+# see is what the driver feeds them on the SECOND pass. The incompressible twin's AMG-cache defect was
+# EXACT at iteration 1 and 1.3e-01 wrong at iteration 2 with every per-stage gate green, so a
+# one-iteration driver test would have certified it. Laminar on purpose: the closure has its own device
+# gate, and running it here would fold two more Krylov solves into a comparison about ORDER.
+# The device projection of createFields against the host field set it projects. An upload is a copy, so
+# the field checks assert EXACT equality -- a tolerance on a memcpy admits a defect rather than measuring
+# one. What is actually at risk is the boundary-face ORDER, the padding of the faces DeviceMesh skips,
+# which of the two masks answers which question, and whether the wall set is chosen by the BC or by the
+# patch type; each has its own check, and the two a fixture can make vacuous say so instead of passing.
+# STRUCTURAL measurements on OpenFOAM's angledDuctExplicitFixedCoeff tutorial -- the only case reachable
+# from here that can measure two things this port had correct-by-construction and gated by nothing: the
+# two boundary masks (it gives porosityWall `type slip` on U, and slip is the only patch class where
+# `assignable` and `fixesValue && !inletOutlet` disagree), and the relax -> constrain -> setValues order
+# (its fvOptions constrains k and epsilon on the porosity cellZone, whose own wall carries an
+# epsilonWallFunction, so the two constraints overlap on every cell of that patch).
+#
+# NO CONVERGENCE BOUND. The end-to-end gate on this same tutorial is deliberately unregistered because a
+# bound would have to accommodate an unexplained 9.43e-04; everything here is structural or a single
+# assembly, so none of it inherits that question.
+# EMPTY PATCHES MUST BE INERT. In OpenFOAM they cannot contribute to a surface sum because
+# emptyFvPatchField is zero-sized; brae keeps the faces, so every summing operator must skip them
+# explicitly. This asserts the PROPERTY -- poison an empty patch's values and require bit-identical
+# output -- rather than a number, because a number would be satisfied by a mesh that happens to cancel.
+# Measured before the fix: a cell's empty-face area vectors sum to 1.6e-16 of their magnitude on rhoBox
+# and 2.4e-14 on pitzDaily, so the old behaviour was round-off that depended on the mesh being an exact
+# extrusion. The control poisons a NON-empty patch and requires the answer to move.
+add_executable(test_empty_patch_inert tests/test_empty_patch_inert.cu)
+target_include_directories(test_empty_patch_inert PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_empty_patch_inert PRIVATE brae_core)
+# DELIBERATELY NOT REGISTERED -- and the reason is measured, not assumed. Making empty patches inert is
+# correct against OpenFOAM, and the operator-level change it causes is 7.886e-16 relative on pitzDailyFoam
+# (the empty contribution to grad(p) is 4.562325e-12 against max|grad(p)| = 5.785680e+03). But a 1e-16
+# perturbation is not nothing after 2000 SIMPLE iterations on a separating flow: applying it moved
+# tutorial_backwardfacingstep2d's converged U from 3.482e-03 to 1.145e-02 against its 1e-02 bound --
+# deterministic and reproducible to every printed digit, in a recirculation whose reattachment point is
+# exactly the sensitive quantity. Registering this would therefore mean either shipping a red gate or
+# loosening backwardFacingStep2D's bound to accommodate a change, which is the failure mode this port
+# exists to avoid. The binary is built so the requirement stays executable and the measurement stays
+# reproducible; enforcing it needs a convergence-robust comparison on that tutorial first.
+#
+# THAT COMPARISON NOW EXISTS (2026-09-03): backwardFacingStep2D is gated on a WINDOW MEAN, because the
+# case limit-cycles and a single iterate was never a comparable quantity -- OpenFOAM moves U by 1.66e-02
+# between two of its own iterates. A perturbation that shifts the phase moves the mean by ~5e-04, inside
+# OpenFOAM's own noise floor. So this blocker is lifted in principle; registering the test still needs its
+# own measurement through the windowed gate, which nothing here has done.
+
+add_executable(test_rho_angledduct_structural tests/test_rho_angledduct_structural.cu)
+target_include_directories(test_rho_angledduct_structural PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_angledduct_structural PRIVATE brae_core)
+add_test(NAME rho_angledduct_structural
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_angledduct_structural.sh)
+set_tests_properties(rho_angledduct_structural PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77)
+
+add_executable(test_rho_createfields_cuda tests/test_rho_createfields_cuda.cu)
+target_include_directories(test_rho_createfields_cuda PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_createfields_cuda PRIVATE brae_core)
+# rhoBox is laminar and has neither inletOutlet nor a wall function; sbMatched has both, so between them
+# every control below is exercised rather than reported vacuous.
+add_test(NAME rho_createfields_cuda_laminar
+         COMMAND test_rho_createfields_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/rhoBox 0.orig)
+add_test(NAME rho_createfields_cuda_turbulent
+         COMMAND test_rho_createfields_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/sbMatched 0.orig)
+
+add_executable(test_rho_simple_step_cuda tests/test_rho_simple_step_cuda.cu)
+target_include_directories(test_rho_simple_step_cuda PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_simple_step_cuda PRIVATE brae_core)
+add_test(NAME rho_simple_step_cuda
+         COMMAND test_rho_simple_step_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/rhoBox 0.orig 8)
+add_test(NAME rho_step_cuda_refusals
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_step_cuda_refusals.sh)
+set_tests_properties(rho_step_cuda_refusals PROPERTIES SKIP_RETURN_CODE 77)
+# The BOUNDARY arm. rhoBox carries only fixedValue, zeroGradient, noSlip and empty, so the whole
+# updateCoeffs() block at the top of the step is a no-op there and the arm above cannot see it at all --
+# which is exactly why the device driver went without one. sbMatched is the only compressible fixture
+# with four inletOutlet patches and a flowRateInletVelocity inlet. ONE iteration and no forced limiters;
+# the reasons are in the test's own header. Measured: Ux 4.496e-12, and 1.276e-02 with the driver's
+# updateBoundaryCoeffs call removed.
+add_test(NAME rho_simple_step_cuda_boundary
+         COMMAND test_rho_simple_step_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/sbMatched 0.orig --boundary)
+# DEVICE-RESIDENT arms: the same driver with thermo.correct(), thermo.rho() and the effective transport
+# run on the GPU instead of round-tripping the field set to the _cpp reference and back. Two fixtures,
+# because between them they take BOTH branches of every switch in the device thermo:
+#   rhoBox     hePsiThermo  + const      + sensibleEnthalpy       -> rho = p*psi, alpha = mu/Pr, CpByCpv 1
+#   sbMatched  heRhoThermo  + sutherland + sensibleInternalEnergy -> rho = stored, Eucken kappa/Cp, gamma
+# Each carries an oracle control that recomputes the thermo relations on the host from the device's own
+# he and p, so the arm cannot pass by two implementations agreeing on nothing.
+add_test(NAME rho_simple_step_cuda_device_thermo
+         COMMAND test_rho_simple_step_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/rhoBox 0.orig 8 --device-thermo)
+add_test(NAME rho_simple_step_cuda_device_thermo_rho
+         COMMAND test_rho_simple_step_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/sbMatched 0.orig --boundary --device-thermo)
+
+# THE MANIFEST MUST MATCH ITS GENERATOR. tools/of_manifest.py already had a --check mode that reports
+# drift, and nothing ran it -- so manifest/rhoSimpleFoam.yaml sat stale against the generator while
+# still being the file PORT.md calls authoritative. It was carrying `U 1.08e-04 (gated at 2e-3)` for a
+# gate whose bound is 5e-4 and which now holds eight fields. A check that exists but is registered
+# nowhere is not a check; this is the registration.
+# deviceAdjustPhi against OpenFOAM's own two guards. No fixture: the guards are arithmetic on three flux
+# sums, so the inputs are constructed exactly -- including the cases a real mesh reaches only by accident.
+add_executable(test_adjust_phi_guards tests/test_adjust_phi_guards.cu)
+target_include_directories(test_adjust_phi_guards PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_adjust_phi_guards PRIVATE brae_core)
+add_test(NAME adjust_phi_guards COMMAND test_adjust_phi_guards)
+
+add_executable(test_powerlaw_dict_guards tests/test_powerlaw_dict_guards.cu)
+target_include_directories(test_powerlaw_dict_guards PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_powerlaw_dict_guards PRIVATE brae_core)
+add_test(NAME powerlaw_dict_guards COMMAND test_powerlaw_dict_guards)
+
+add_executable(test_frozen_bc_guard tests/test_frozen_bc_guard.cu)
+target_include_directories(test_frozen_bc_guard PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_frozen_bc_guard PRIVATE brae_core)
+add_test(NAME frozen_bc_guard COMMAND test_frozen_bc_guard)
+add_test(NAME frozen_bc_refusals COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/frozen_bc_refusals.sh)
+set_tests_properties(frozen_bc_refusals PROPERTIES SKIP_RETURN_CODE 77)
+
+# Audit finding #14: the algebraic-LES path honoured only nutUSpalding while printing any other nut
+# wall function as honoured, labelled "kEpsilon" whatever the model. Non-Spalding wall functions on
+# LES now refuse by name, and every wall-fn print carries the model word the case names.
+add_test(NAME les_wallfunction_refusals COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/les_wallfunction_refusals.sh)
+set_tests_properties(les_wallfunction_refusals PROPERTIES SKIP_RETURN_CODE 77)
+
+# Audit finding #15: the SA device path hard-forced Spalding whatever 0/nut asked for --
+# bump2D:SpalartAllmaras ships nutLowReWallFunction (calcNut() = Zero on every model) and got a Newton
+# uTau inside a green gate. The BC selects now: Spalding/LowRe honoured, k-based family and plain wall
+# BCs refused by name, two different wall functions refused.
+add_test(NAME sa_wallfunction_refusals COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_wallfunction_refusals.sh)
+set_tests_properties(sa_wallfunction_refusals PROPERTIES SKIP_RETURN_CODE 77)
+
+# Audit finding #16: the turbulence-setup guards compared boundaryField keys to patch names exactly, so
+# regex/group keys (bfs2D writes every wall BC as "(upperWall|lowerWall)") disarmed them silently while
+# buildField resolved the same keys correctly. The guards resolve through patchesResolvingTo now; two
+# arms are discriminating (they ran silently before the fix).
+add_test(NAME regex_patchkey_guards COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/regex_patchkey_guards.sh)
+set_tests_properties(regex_patchkey_guards PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_v2_laplacian_parse tests/test_v2_laplacian_parse.cu)
+target_include_directories(test_v2_laplacian_parse PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_v2_laplacian_parse PRIVATE brae_core)
+add_test(NAME v2_laplacian_parse COMMAND test_v2_laplacian_parse)
+
+add_executable(test_tvm_mapping tests/test_tvm_mapping.cu)
+target_include_directories(test_tvm_mapping PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_tvm_mapping PRIVATE brae_core)
+add_test(NAME tvm_mapping COMMAND test_tvm_mapping)
+
+add_test(NAME manifest_rhosimplefoam_not_drifted
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/of_manifest.py rhoSimpleFoam
+                 --check ${CMAKE_CURRENT_SOURCE_DIR}/manifest/rhoSimpleFoam.yaml)
+
+# The simpleFoam twin existed only as a tool flag, and its manifest drifted for weeks: sixteen whole
+# entries and four long validation/note blocks were hand-added to the YAML while the tool's curated
+# table (where they are supposed to live) fell behind. Reconciled 2026-08-31; this test is what keeps
+# the two from diverging again.
+add_test(NAME manifest_simplefoam_not_drifted
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/of_manifest.py simpleFoam
+                 --check ${CMAKE_CURRENT_SOURCE_DIR}/manifest/simpleFoam.yaml)
+
+add_executable(test_rho_kepsilon_cuda tests/test_rho_kepsilon_cuda.cu)
+target_include_directories(test_rho_kepsilon_cuda PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_kepsilon_cuda PRIVATE brae_core)
+add_test(NAME rho_kepsilon_cuda
+         COMMAND test_rho_kepsilon_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
+add_executable(test_rho_pceqn_cuda tests/test_rho_pceqn_cuda.cu)
+target_include_directories(test_rho_pceqn_cuda PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_pceqn_cuda PRIVATE brae_core)
+add_test(NAME rho_pceqn_cuda_subsonic
+         COMMAND test_rho_pceqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym 282 laminar)
+add_test(NAME rho_pceqn_cuda_subsonic_turbulent
+         COMMAND test_rho_pceqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+add_test(NAME rho_pceqn_cuda_transonic
+         COMMAND ${CMAKE_COMMAND} -E env BRAE_TEST_TRANSONIC=1
+                 $<TARGET_FILE:test_rho_pceqn_cuda> ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym 282 laminar)
+add_test(NAME rho_pceqn_cuda_transonic_turbulent
+         COMMAND ${CMAKE_COMMAND} -E env BRAE_TEST_TRANSONIC=1
+                 $<TARGET_FILE:test_rho_pceqn_cuda> ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
+add_executable(test_rho_eeqn_cuda tests/test_rho_eeqn_cuda.cu)
+target_include_directories(test_rho_eeqn_cuda PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_eeqn_cuda PRIVATE brae_core)
+add_test(NAME rho_eeqn_cuda_e
+         COMMAND test_rho_eeqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym 282)
+add_test(NAME rho_eeqn_cuda_e_turbulent
+         COMMAND test_rho_eeqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+add_test(NAME rho_eeqn_cuda_h
+         COMMAND ${CMAKE_COMMAND} -E env BRAE_TEST_ENERGY=h
+                 $<TARGET_FILE:test_rho_eeqn_cuda> ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
+add_executable(test_rho_peqn_cuda tests/test_rho_peqn_cuda.cu)
+target_include_directories(test_rho_peqn_cuda PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_peqn_cuda PRIVATE brae_core)
+add_test(NAME rho_peqn_cuda_subsonic
+         COMMAND test_rho_peqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym 282 laminar)
+add_test(NAME rho_peqn_cuda_subsonic_turbulent
+         COMMAND test_rho_peqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+add_test(NAME rho_peqn_cuda_transonic
+         COMMAND ${CMAKE_COMMAND} -E env BRAE_TEST_TRANSONIC=1
+                 $<TARGET_FILE:test_rho_peqn_cuda> ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym 282 laminar)
+add_test(NAME rho_peqn_cuda_transonic_turbulent
+         COMMAND ${CMAKE_COMMAND} -E env BRAE_TEST_TRANSONIC=1
+                 $<TARGET_FILE:test_rho_peqn_cuda> ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
+add_executable(test_rho_ueqn_cuda tests/test_rho_ueqn_cuda.cu)
+target_include_directories(test_rho_ueqn_cuda PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_ueqn_cuda PRIVATE brae_core)
+add_test(NAME rho_ueqn_cuda
+         COMMAND test_rho_ueqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym 282 laminar)
+add_test(NAME rho_ueqn_cuda_turbulent
+         COMMAND test_rho_ueqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
+# One binary, one scheme each. The tolerances differ by scheme on purpose -- the r-ratio limiters divide
+# by a face difference that approaches zero, while linearUpwindV and LUST reach 1e-16.
+# `grad(U) cellLimited Gauss linear 1` on the 2D pitzDailyTurb, which is the ONLY registered arm that
+# makes the EMPTY-patch question visible. emptyFvPatchField is zero-sized in OpenFOAM so those faces do
+# not exist there; brae keeps them and must skip them in both the limiter's range and its face loop, and
+# in the face loop it is not harmless -- Cf - C points out of the 2D plane, so the extrapolate is
+# round-off and the ratio against maxDelta can clamp the limiter below what any real face asks for.
+add_test(NAME rho_ueqn_cuda_cell_limited
+         COMMAND ${CMAKE_COMMAND} -E env BRAE_TEST_GRADLIMIT=1.0
+                 $<TARGET_FILE:test_rho_ueqn_cuda> ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
+foreach(_sch upwind limitedLinear limitedLinearV LUST linearUpwindV)
+    add_test(NAME rho_ueqn_cuda_scheme_${_sch}
+             COMMAND ${CMAKE_COMMAND} -E env BRAE_TEST_SCHEME=${_sch}
+                     $<TARGET_FILE:test_rho_ueqn_cuda> ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+endforeach()
+
+add_executable(test_ueqn_cpp tests/test_ueqn_cpp.cu)
+target_include_directories(test_ueqn_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_ueqn_cpp PRIVATE brae_core)
+
+add_executable(test_komegasst_cpp tests/test_komegasst_cpp.cu)
+target_include_directories(test_komegasst_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_komegasst_cpp PRIVATE brae_core)
+
+add_executable(test_realizablke_cpp tests/test_realizablke_cpp.cu)
+target_include_directories(test_realizablke_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_realizablke_cpp PRIVATE brae_core)
+
+add_executable(kepsilon_probe tests/kepsilon_probe.cu)
+target_include_directories(kepsilon_probe PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(kepsilon_probe PRIVATE brae_core)
+
+add_executable(resid_probe tests/resid_probe.cu)
+target_include_directories(resid_probe PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(resid_probe PRIVATE brae_core)
+
+add_executable(test_fvoptions_cpp tests/test_fvoptions_cpp.cu)
+target_include_directories(test_fvoptions_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_fvoptions_cpp PRIVATE brae_core)
+
+add_executable(test_limitedschemes_cpp tests/test_limitedschemes_cpp.cu)
+target_include_directories(test_limitedschemes_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_limitedschemes_cpp PRIVATE brae_core)
+add_test(NAME ueqn_cpp
+         COMMAND test_ueqn_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym)
+
 add_executable(test_momentum_matrix tests/test_momentum_matrix.cu)
 target_include_directories(test_momentum_matrix PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_momentum_matrix PRIVATE brae_core)
@@ -423,11 +779,55 @@ target_link_libraries(test_vector_solve PRIVATE brae_core)
 add_test(NAME vector_solve
          COMMAND test_vector_solve ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym)
 
+# The _cpp reference for pEqn.H, stage by stage: rAU/HbyA vs OpenFOAM's A()/H() (ops.dat), the pressure
+# Laplacian vs peqn.dat, then setReference / correctFlux / relax asserted analytically, plus the refusals.
+# The CUDA pEqn against the _cpp reference, stage by stage. Laminar and turbulent.
+add_executable(test_peqn_cuda tests/test_peqn_cuda.cu)
+target_include_directories(test_peqn_cuda PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_peqn_cuda PRIVATE brae_core)
+add_test(NAME peqn_cuda
+         COMMAND test_peqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym 282 laminar)
+add_test(NAME peqn_cuda_turbulent
+         COMMAND test_peqn_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
+add_executable(test_peqn_cpp tests/test_peqn_cpp.cu)
+target_include_directories(test_peqn_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_peqn_cpp PRIVATE brae_core)
+add_test(NAME peqn_cpp
+         COMMAND test_peqn_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym)
+
 add_executable(test_peqn_matrix tests/test_peqn_matrix.cu)
 target_include_directories(test_peqn_matrix PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_peqn_matrix PRIVATE brae_core)
 add_test(NAME peqn_matrix
          COMMAND test_peqn_matrix ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym)
+
+# END-TO-END gate for the rebuilt simpleFoam: one SIMPLE iteration composed of the _cpp components,
+# against OpenFOAM's own dumpSimpleStep output. Proves the composition, not just the parts.
+# END-TO-END: the CUDA driver against the _cpp driver, one iteration.
+# Diagnostic (not a ctest): both drivers, N iterations, side-by-side residuals + divergence trace.
+add_executable(diag_simple_loop tests/diag_simple_loop.cu)
+target_include_directories(diag_simple_loop PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(diag_simple_loop PRIVATE brae_core)
+
+add_executable(test_simple_step_cuda tests/test_simple_step_cuda.cu)
+target_include_directories(test_simple_step_cuda PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_simple_step_cuda PRIVATE brae_core)
+add_test(NAME simple_step_cuda
+         COMMAND test_simple_step_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpSimple 282 laminar)
+# 10 iterations: the CUDA driver must still track the _cpp driver. Pins the AMG-hierarchy-vs-transient-
+# pressure-buffer bug, which was exact at iteration 1 and wrong by 1.3e-01 at iteration 2.
+add_test(NAME simple_step_cuda_loop
+         COMMAND test_simple_step_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpSimple 282 laminar 10)
+
+add_test(NAME simple_step_cuda_turbulent
+         COMMAND test_simple_step_cuda ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
+add_executable(test_simple_step_cpp tests/test_simple_step_cpp.cu)
+target_include_directories(test_simple_step_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_simple_step_cpp PRIVATE brae_core)
+add_test(NAME simple_step_cpp
+         COMMAND test_simple_step_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpSimple)
 
 add_executable(test_simple_step tests/test_simple_step.cu)
 target_include_directories(test_simple_step PRIVATE ${BRAE_HEADER_DIRS})
@@ -469,11 +869,626 @@ target_link_libraries(test_kepsilon_correct PRIVATE brae_core)
 add_test(NAME kepsilon_correct
          COMMAND test_kepsilon_correct ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
 
+# DETERMINISM GATE. Two runs of the same binary on the same case must agree bit for bit. This is a
+# prerequisite for the whole _cpp-vs-CUDA validation plan: a defect smaller than the run-to-run noise floor
+# cannot be detected, and the floor here used to be 3.6e-02 after 20 iterations. Two cases, because the
+# turbulence wall functions were one of the three scatter sites and kEpsilon/kOmegaSST take different ones.
+# SKIP_RETURN_CODE 77 lets it skip cleanly when no GPU binary is present.
+# DISPATCH GATE for the rebuilt simpleFoam: off changes nothing, on+supported runs, on+unsupported
+# REFUSES with the reason. A path that quietly degrades is indistinguishable from a correct one.
+# A regex-keyed turbulence residualControl must actually bind -- see the script for why this exists and
+# for what it is not (the defect it was written to chase turned out to be a symptom of T3A diverging).
+add_test(NAME simple_residualcontrol_regex
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_residualcontrol_regex.sh)
+set_tests_properties(simple_residualcontrol_regex PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae
+                     TIMEOUT 1800)
+
+add_test(NAME simplefoam_v2_dispatch
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simplefoam_v2_dispatch.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+set_tests_properties(simplefoam_v2_dispatch PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
+# CONVERGENCE GATE: run the rebuilt path to convergence and compare with OpenFOAM's own converged fields
+# (validation/pitzDailyTurb/1576, genuine simpleFoam v2412 output). The bounds are what brae's established
+# solver achieves against the same reference in simple_turbulent_full. ~90 s.
+add_test(NAME simplefoam_v2_convergence
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simplefoam_v2_convergence.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+set_tests_properties(simplefoam_v2_convergence PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 600)
+
+# NON-ORTHOGONAL CORRECTION vs real OpenFOAM on a genuinely non-orthogonal mesh, with a control requiring
+# that omitting the term is clearly worse -- on a near-orthogonal mesh this gate would pass with the term
+# deleted. Skips (77) where OpenFOAM is not installed.
+# STOCK pitzDaily end to end: SIMPLEC + linearUpwind + bounded + corrected + kEpsilon, unmodified, vs
+# real OpenFOAM. Also asserts SIMPLEC and plain SIMPLE reach the SAME fixed point -- the control that
+# exposed the missing fvMatrix::faceFluxCorrection.
+add_test(NAME stock_pitzdaily_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/stock_pitzdaily_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+set_tests_properties(stock_pitzdaily_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
+# The k/epsilon PATCH diffusivity: OF's `calculated` nut patches carry Cmu*k_b^2/eps_b, not the cell value,
+# and DkEff(patchi)/DepsilonEff(patchi) are built from it. Started from OpenFOAM's own converged fields so
+# the initial residual measures the discretisation directly; needs no OpenFOAM install, only its log.
+add_test(NAME boundary_nut_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/boundary_nut_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb)
+set_tests_properties(boundary_nut_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# kOmegaSST on the _cpp path vs real OpenFOAM. The fast entry probes one iteration from OpenFOAM's own
+# converged state and carries its own upwind negative control; the slow one runs the case end to end from
+# 0/, which is what exposed the omega blow-up that the probe could not see.
+add_test(NAME sst_cpp_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sst_cpp_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailySST)
+set_tests_properties(sst_cpp_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(NAME sst_cpp_full
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sst_cpp_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailySST full)
+set_tests_properties(sst_cpp_full PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1200)
+
+# The SAME case through the CUDA V2 driver, ported onto the _cpp path one module at a time. The fast entry
+# also asserts brae RESOLVES div(phi,k) to `bounded limitedLinear` rather than silently running upwind, and
+# is what catches the wall mask: keying it on epsilonWallFunction left every kOmegaSST case with no wall
+# faces at all, measuring U 48x and omega 6.8x off OpenFOAM.
+add_test(NAME sst_cuda_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sst_cuda_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailySST)
+set_tests_properties(sst_cuda_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(NAME sst_cuda_full
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sst_cuda_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailySST full)
+set_tests_properties(sst_cuda_full PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
+# MRF end to end on the _cpp path vs real OpenFOAM, with the control that makes it mean something: with
+# the zones dropped this case has no driving force at all and every field reads 1.000 against OpenFOAM.
+add_test(NAME mrf_cpp_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mrf_cpp_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/mixerVessel2D)
+set_tests_properties(mrf_cpp_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# The SAME case through the CUDA V2 driver, ported onto the _cpp path one hook at a time. Its control
+# removes constant/MRFProperties, which exercises the real dictionary path rather than a debug switch.
+add_test(NAME mrf_cuda_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mrf_cuda_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/mixerVessel2D)
+set_tests_properties(mrf_cuda_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 900)
+
+# SpalartAllmaras end to end on the _cpp path vs real OpenFOAM, with a laminar control. This is the case
+# that exposed nut's wall value being taken from the nut_ = nuTilda*fv1 assignment instead of
+# nutUSpaldingWallFunction -- see the script header for the three defects it cost.
+add_test(NAME sa_cpp_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_cpp_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/airFoil2D)
+set_tests_properties(sa_cpp_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 900)
+
+# The SAME case through the CUDA V2 driver, ported onto the _cpp path one module at a time. Its cold start
+# is what the fixed-point comparison could not see: the two momentum assemblies are bit-identical, and the
+# whole gap was the Spalding wall Newton being cold-started instead of seeded from nut_ -- see the header.
+add_test(NAME sa_cuda_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_cuda_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/airFoil2D)
+set_tests_properties(sa_cuda_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
+# cellLimited Gauss linear <k> vs real OpenFOAM, on BOTH paths, with an unlimited control that must be
+# markedly worse. This is what windAroundBuildings was refused for: linearUpwind's correction is built
+# from the gradient the scheme NAMES, and it does not vanish at convergence.
+add_test(NAME celllimited_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/celllimited_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/windAroundBuildingsBox)
+set_tests_properties(celllimited_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# rotorDiskSource vs OpenFOAM's OWN reported drag/lift/AOA on the real 71734-cell tutorial mesh, plus a
+# device-vs-_cpp check. The device implementation predated any test; this is the first thing to check it.
+add_test(NAME rotordisk_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rotordisk_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/rotorDisk)
+set_tests_properties(rotordisk_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# fv::actuationDiskSource (Froude) against the Uref/a/thrust OpenFOAM writes for itself, evaluated at the
+# field OpenFOAM computed that row FROM -- which makes it exact to 13 digits rather than approximate.
+add_test(NAME actuationdisk_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/actuationdisk_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/turbineSiting 600)
+set_tests_properties(actuationdisk_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# The SAME case through the CUDA V2 driver, end to end against real OpenFOAM at DEEP convergence. This is
+# what pins the SIGN the thrust is applied with, which the .dat oracle above cannot see: it compares
+# numbers computed from a given velocity, and those are identical whichever way the disk pushes. Its
+# control is the same run with the turbines removed.
+add_test(NAME turbinesiting_cuda_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/turbinesiting_cuda_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/turbineSiting)
+set_tests_properties(turbinesiting_cuda_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 900)
+
+# OpenFOAM's fusedGauss scheme family (pitzDaily_fused). It is Gauss written without field temporaries,
+# so brae reads it AS Gauss and announces that; this gate measures the equivalence from OpenFOAM ITSELF
+# (its own two spellings of the same case), asserts brae's rewrite is bit-for-bit a rename, and runs the
+# case end to end. Its control forces div(phi,U) to upwind.
+add_test(NAME fusedgauss_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/fusedgauss_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+set_tests_properties(fusedgauss_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
+# kOmegaSSTLM (Langtry-Menter transition) on the _cpp REFERENCE, run END TO END on the real T3A tutorial
+# against real OpenFOAM. Its control is the same case with the transition model removed -- 167x on U and
+# 437x on k -- which is what makes the bounds above mean something.
+add_test(NAME lm_cpp_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/lm_cpp_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A 269 500)
+set_tests_properties(lm_cpp_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
+# The SAME case through the CUDA V2 driver, ported onto the _cpp path one module at a time. The module
+# comparison (lm_cuda_probe: Fthetat, both reaction preps and gammaIntEff to 1e-12) runs FIRST inside the
+# gate, so an end-to-end agreement that came from cancellation cannot pass it. Control: plain kOmegaSST.
+add_test(NAME lm_cuda_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/lm_cuda_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A 269)
+set_tests_properties(lm_cuda_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
+# turbulence->validate() (simpleFoam.C:92) is correctNut(), so OpenFOAM's FIRST momentum assembly runs on
+# nut rebuilt from the initial k and omega and not on the case's `nut uniform 0`. Oracle: dumpSimpleFoam's
+# stage_nuEff/stage_UDiag0/stage_rAU at iteration 1. Control: the file's own nut, which must disagree --
+# it is the laminar first iteration this used to run.
+# fvMatrix<vector>::solveSegregated skips the components polyMesh::solutionD() knocks out
+# (fvMatrixSolve.C:164) and residualControl compares cmptMax over what it stored (solutionControl.C:232).
+# The V2 step solved all three and reported component 0. Oracle: OpenFOAM's own log, one iteration from
+# its own field; control: that fixture's Uy/Ux = 1.910, so component 0 reads 47.7% low; 3D arm proves the
+# mask is derived and not hardcoded off.
+# brae routes `smoothSolver` + `symGaussSeidel` to a MULTICOLOUR Gauss-Seidel sweep where
+# symGaussSeidelSmoother.C sweeps in index order -- same stopping rule, less smoothing per sweep. It was
+# announced nowhere and the run log said "as the case asks". Positive + two controls, no GPU and no OF.
+# lduMatrix::solver::readControls reads minIter and maxIter from EACH FIELD'S own entry
+# (lduMatrixSolver.C:190-208). The V2 driver read one maxIter from `p` and gave it to U as well, and
+# minIter reached no solver at all. Oracle: OpenFOAM's own iteration counts under the same cap and floor.
+# fvc::grad(U) resolves the gradSchemes `grad(U)` entry, and divDevReff (linearViscousStress.C:114) and
+# every closure's strain and production are built from it. The V2 driver passed a literal 0.0 to the SST,
+# let kEpsilon's and divDevReff's arguments default, and SA had no such parameter at all. Proximity gate:
+# brae must land nearer OpenFOAM's LIMITED answer than its unlimited one, on the fields where brae is
+# inside the two oracles' separation.
+# endTime is an ABSOLUTE time (Time.C:785), deltaT is the step (Time.C:1067) and a time directory is
+# named by the VALUE (Time.C:721-728). The V2 driver read endTime as an iteration count and never read
+# deltaT. Oracle: OpenFOAM's own ordered list of time names on four shapes, one of them ratio 2.5 where a
+# rounded quotient gives the wrong count.
+# nSweeps (smoothSolver.C:78) is the number of smoothing sweeps between residual EVALUATIONS, and
+# OpenFOAM advances its iteration count by nSweeps (:205), so every count it reports is a multiple.
+# brae read the entry nowhere -- airFoil2D ships nSweeps 2 and brae reported odd counts. The negative
+# fixed-sweep mode (:96-119) is refused: it deletes the convergence test and reports a residual of zero.
+# linearUpwind, linearUpwindV and LUST all read the gradient name off div(phi,U)'''s own stream
+# (linearUpwind.H:105, linearUpwindV.H:117-135, LUST.H). brae'''s regex demanded whitespace after
+# `linearUpwind`, so V and LUST silently fell back to gradSchemes default, and it searched the whole
+# divSchemes block rather than div(phi,U)'''s entry.
+add_test(NAME linearupwindv_grad_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/linearupwindv_grad_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/windAroundBuildingsBox)
+set_tests_properties(linearupwindv_grad_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1200)
+
+add_test(NAME solver_nsweeps_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/solver_nsweeps_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO)
+set_tests_properties(solver_nsweeps_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+add_test(NAME timeloop_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/timeloop_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO)
+set_tests_properties(timeloop_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+add_test(NAME closure_gradlimit_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/closure_gradlimit_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/windAroundBuildingsBox)
+set_tests_properties(closure_gradlimit_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1200)
+
+add_test(NAME solver_iterbounds_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/solver_iterbounds_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO)
+set_tests_properties(solver_iterbounds_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+add_test(NAME gs_smoother_notice
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/gs_smoother_notice.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A)
+set_tests_properties(gs_smoother_notice PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+
+add_executable(gs_ladder tests/gs_ladder.cu)
+target_include_directories(gs_ladder PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(gs_ladder PRIVATE brae_core)
+
+# Isolated side-by-side experiment: the target is opt-in and never replaces the production smoother.
+add_executable(factory_sym_gauss_seidel_bench EXCLUDE_FROM_ALL
+    factory/benchmark_sym_gauss_seidel.cu)
+target_include_directories(factory_sym_gauss_seidel_bench PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(factory_sym_gauss_seidel_bench PRIVATE brae_core)
+
+add_test(NAME gs_ladder_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/gs_ladder_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A)
+set_tests_properties(gs_ladder_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+add_test(NAME turbulence_off_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/turbulence_off_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A)
+set_tests_properties(turbulence_off_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1200)
+
+add_test(NAME solve_report_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/solve_report_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A)
+set_tests_properties(solve_report_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+
+add_test(NAME write_cadence_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/write_cadence_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A)
+set_tests_properties(write_cadence_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+add_test(NAME tightp_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tightp_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A)
+set_tests_properties(tightp_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1500)
+
+add_test(NAME gs_device_loop_identity
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/gs_device_loop_identity.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A)
+set_tests_properties(gs_device_loop_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+add_test(NAME bicg_device_loop_identity
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/bicg_device_loop_identity.sh)
+set_tests_properties(bicg_device_loop_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+add_test(NAME gs_fused_identity
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/gs_fused_identity.sh)
+set_tests_properties(gs_fused_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+add_test(NAME gs_level_gather_identity
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/gs_level_gather_identity.sh)
+set_tests_properties(gs_level_gather_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+add_test(NAME gs_host_smoother_identity
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/gs_host_smoother_identity.sh)
+set_tests_properties(gs_host_smoother_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+add_test(NAME gradu_memo_identity
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/gradu_memo_identity.sh)
+set_tests_properties(gradu_memo_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+add_test(NAME normfactor_device_identity
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/normfactor_device_identity.sh)
+set_tests_properties(normfactor_device_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+add_test(NAME rho_smoothsolver_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_smoothsolver_vs_openfoam.sh)
+set_tests_properties(rho_smoothsolver_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
+add_test(NAME rho_reproducible
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_reproducible.sh)
+set_tests_properties(rho_reproducible PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
+
+add_test(NAME dilu_single_block_identity
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/dilu_single_block_identity.sh)
+set_tests_properties(dilu_single_block_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
+
+add_test(NAME uresidual_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/uresidual_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/cav3d_of)
+set_tests_properties(uresidual_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+add_test(NAME validate_nut_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_nut_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/T3A)
+set_tests_properties(validate_nut_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+# The cyclicAMI CUDA path against the _cpp REFERENCE, stage by stage: interpolation (scalar and rotated
+# vector), face value, both matrix assemblies with their diagonals, the matrix action, the interface
+# flux, UEqn.H()'s interface term and the interface's share of div(phi). Twelve checks at 1e-12; they
+# pass bit-identically. It caught the reference's own assembleLaplacian sign on its first run.
+add_test(NAME ami_cpp_vs_device
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/ami_cpp_vs_device.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pipeCyclicAMI 100
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pipeCyclicAMIConformal)
+set_tests_properties(ami_cpp_vs_device PROPERTIES SKIP_RETURN_CODE 77)
+
+# The DIV SCHEME's face weight at a coupled interface, on the real pipeCyclic tutorial against real
+# OpenFOAM. brae assembled every cyclic and cyclicAMI face UPWIND whatever the case named -- a defect
+# invisible to ami_cpp_vs_device above, because brae's device and its reference implemented the same wrong
+# scheme and agreed to 1e-16 on it. Four runs, not one: brae and OpenFOAM under BOTH the limited and the
+# upwind scheme, so matching OpenFOAM is checked against a case proven to discriminate the two. Plus a
+# symmetry check that needs no reference at all -- the sector's transverse pressure force must vanish, and
+# the upwind interface put it at 2.2e-02 of the axial force against 2.1e-06 now.
+add_test(NAME coupledinterfacescheme_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/coupledinterfacescheme_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pipeCyclic)
+set_tests_properties(coupledinterfacescheme_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
+# The SAME gate on the other blend, `bounded Gauss linear`, which at a coupled face is the patch's own
+# interpolation weight -- w ~ 0.5, the furthest a weight can get from upwind's 0 or 1, so this is the widest
+# of the three gaps and the one a wrong interface assembly distorts most. OpenFOAM's implicitAMI is the only
+# tutorial anywhere that pairs a coupled patch with `Gauss linear` on div(phi,U); it is laminar, so its
+# bounds name only U and p and the gate checks the fields the case actually wrote.
+add_test(NAME linearinterfacescheme_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/coupledinterfacescheme_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/implicitAMI U=4e-02,p=8e-02)
+set_tests_properties(linearinterfacescheme_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
+# SIMPLEC (`consistent true`) across a coupled interface, on OpenFOAM's basic/simpleFoam/implicitAMI.
+# fvMatrix::H1() sums boundaryCoeffs over every coupled patch and the SIMPLEC flux term is evaluated on
+# coupled boundary faces like any other; brae did neither, so on a mesh coupled only by a cyclicAMI the
+# whole SIMPLEC correction stopped at the interface. Nothing in validation/ combined SIMPLEC with a
+# coupled interface before this case, which is why the path was unreachable. The sharp check seeds brae
+# with OpenFOAM's own converged U, p and phi: at that state the true divergence is zero, so brae's
+# continuity error measures its own inconsistency directly -- 1.3e-01 before, 1.7e-03 after, with the
+# momentum residual at 2.8e-07 throughout to show the UEqn was never the term at fault.
+add_test(NAME simplec_interface_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simplec_interface_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/implicitAMI)
+set_tests_properties(simplec_interface_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
+# Two stock simpleFoam tutorials that had no gate at all: they were run once, agreed, and nothing kept
+# them agreeing. Both are read straight from the OpenFOAM installation, so neither needs a committed case.
+# backwardFacingStep2D is the ONLY simpleFoam tutorial that names LUST, so it is the one thing standing
+# behind brae's internal LUST weights. Each asserts that both codes reached a steady state before
+# comparing -- squareBend reads U 2.759e-02 at its tutorial endTime and 1.773e-03 once both codes are on
+# the same residual plateau, a factor of 16 from nothing but where the comparison was taken -- and each
+# carries a control requiring the INITIAL field to fail the same bounds.
+add_test(NAME tutorial_rotatingcylinders
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
+                 rotatingCylinders U=2e-03,p=3e-03)
+set_tests_properties(tutorial_rotatingcylinders PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
+# COMPARED AS A WINDOW MEAN, and the bounds below are ~2x what the mean actually achieves. This case has
+# no steady state: OpenFOAM's own p residual sits at ~2.1e-02 for 20000 iterations and oscillates rather
+# than falling, and against ITSELF 250 iterations apart it moves U by 1.66e-02 -- more than the 1e-02
+# bound brae used to be held to at a single iterate. Averaging the last 21 writes (4000..6000) cuts
+# OpenFOAM's own window-to-window variation to 6.05e-04 on U, and that mean is stationary (the window at
+# 4000..6000 matches the one at 20000..29000 to 5.25e-04), which is why the window can be taken this
+# early. Measured brae vs OpenFOAM: U 2.650e-03, p 3.363e-03, k 8.316e-03, omega 6.537e-04, nut 6.550e-03
+# -- every one of them tighter than the single-iterate bound it replaces. See WINDOW in the script.
+add_test(NAME tutorial_backwardfacingstep2d
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
+                 backwardFacingStep2D U=6e-03,p=8e-03,k=2e-02,omega=2e-03,nut=1.5e-02
+                 1e-04 6000/100 EMPTY 21)
+set_tests_properties(tutorial_backwardfacingstep2d PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
+# The MULTI-SETUP tutorials. bump2D and turbulentFlatPlate are not single cases: each ships a
+# `setups.orig/` tree of one common skeleton plus a per-turbulence-model overlay, and turbulentFlatPlate
+# additionally builds its mesh from a blockMeshDict.template expanded with a per-y+ grading -- so it is a
+# matrix of (model x near-wall grading), not a list of cases. tests/tutorial_vs_openfoam.sh composes them
+# exactly as their own Allrun does and names one as tutorial:setup[:grading].
+#
+# turbulentFlatPlate at y+ 1 is the tightest agreement of any tutorial gated here (U 1.9e-05, nut 3.8e-03),
+# which is worth having precisely because bump2D at its own residualControl of 1e-05 is the loosest.
+add_test(NAME tutorial_turbulentflatplate_komegasst
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
+                 turbulentFlatPlate:kOmegaSST:2200 U=2e-04,p=3e-02,k=1e-03,omega=5e-04,nut=2e-02)
+set_tests_properties(tutorial_turbulentflatplate_komegasst PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 2400)
+
+add_test(NAME tutorial_bump2d_spalartallmaras
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
+                 bump2D:SpalartAllmaras U=5e-03,p=5e-03,nut=1e-01,nuTilda=1e-01)
+set_tests_properties(tutorial_bump2d_spalartallmaras PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 2400)
+
+# ...and the setup brae must REFUSE. bump2D's third model is kEpsilonPhitF, which brae does not implement;
+# running it as the kEpsilon it does have would be a wrong answer wearing the right label. The gate asserts
+# brae exits nonzero AND names the model, so a refusal that says nothing useful fails too.
+add_test(NAME tutorial_bump2d_kepsilonphitf_refused
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
+                 bump2D:kEpsilonPhitF REFUSE:kEpsilonPhitF)
+set_tests_properties(tutorial_bump2d_kepsilonphitf_refused PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
+# turbulentFlatPlate:kEpsilon at y+ ~ 1 -- the case that DIVERGED until the turbulence solve got the DILU
+# preconditioner the case asks for. It is gated tightly on purpose: the failure it guards was not a wrong
+# term but a preconditioner substitution, and the symptom of that returning is the run not finishing at
+# all, so bounds near the measured 1.8e-05 on U cost nothing and say exactly what is expected.
+add_test(NAME tutorial_turbulentflatplate_kepsilon
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
+                 turbulentFlatPlate:kEpsilon:2200 U=2e-04,p=2e-03,k=3e-03,epsilon=2e-02,nut=2e-03)
+set_tests_properties(tutorial_turbulentflatplate_kepsilon PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 3600)
+
+# The two tutorials that had never been compared to OpenFOAM at all.
+#
+# motorBike is the big one -- 353700 cells from snappyHexMesh, kOmegaSST -- and the only tutorial here
+# whose OpenFOAM side runs IN PARALLEL (decomposePar, snappyHexMesh and simpleFoam on 6 processors, then
+# reconstructPar). Its ~5% on U is the LOOSEST agreement of any gated tutorial, and it is not a
+# convergence artefact: run both codes 5x longer, to 2500, and the comparison is the same (U 5.58e-02
+# against 5.00e-02, nut 9.56e-03 against 1.06e-02) while OpenFOAM's residual falls to 6.0e-05 and brae's
+# to 1.4e-04. That is why the steady-state threshold is passed as 3e-04 here -- the extra iterations move
+# the residual and not the answer -- and why the case is gated AS SHIPPED at its own endTime of 500.
+# OpenFOAM's run is also potentialFoam-initialised and brae's is not, which is in the bounds too.
+add_test(NAME tutorial_motorbike
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
+                 motorBike U=8e-02,p=9e-02,k=1.7e-01,omega=1.0e-01,nut=2e-02 3e-04)
+set_tests_properties(tutorial_motorbike PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 5400)
+
+# pitzDailyExptInlet ships no Allrun at all (blockMesh + simpleFoam) and its residualControl is very loose
+# -- p 1e-2, U 1e-3. That looseness is most of the gap: at the case's own settings brae reads U 2.866e-02
+# and p 1.630e-01 against OpenFOAM, and with both codes driven to ~1e-9 the same comparison reads
+# U 1.155e-02 and p 1.540e-02. Gated as shipped, with the bounds that implies.
+add_test(NAME tutorial_pitzdailyexptinlet
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
+                 pitzDailyExptInlet U=4e-02,p=2.5e-01,k=1.2e-01,epsilon=1.0e-01,nut=1.8e-01)
+set_tests_properties(tutorial_pitzdailyexptinlet PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 2400)
+
+# squareBend, gated at 8000 rather than its shipped endTime of 500. That is not padding: at 500 the
+# comparison reads U 2.759e-02 and at 8000 -- where both codes sit on the same 2.5e-05 residual plateau --
+# it reads 1.773e-03. Gating the shipped number would record where the run stopped as if it were a
+# property of the solver. 112000 cells, kEpsilon, SIMPLEC, `Gauss limitedLinearV 1`.
+add_test(NAME tutorial_squarebend
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
+                 squareBend U=5e-03,p=5e-03,k=1.2e-02,epsilon=3e-02,nut=5e-03 1e-04 8000)
+set_tests_properties(tutorial_squarebend PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 3600)
+
+# bump2D:kOmegaSST. U, p, k and omega agree to 5.3e-04, 5.2e-04, 9.4e-03 and 1.1e-05; nut alone sits at
+# 1.1e-01, and that is the case's own residualControl of 1e-05 rather than the closure -- drive both codes
+# to 1e-08 and the same comparison reads U 1.495e-05 and nut 9.905e-03, a factor of 11 on nut from nothing
+# but the stopping point. Gated as shipped, since 40000 iterations is not a routine gate, with a nut bound
+# that says so.
+add_test(NAME tutorial_bump2d_komegasst
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
+                 bump2D:kOmegaSST U=1.5e-03,p=1.5e-03,k=2.5e-02,omega=4e-05,nut=2.2e-01)
+set_tests_properties(tutorial_bump2d_komegasst PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 2400)
+
+# `limited <k> corrected` (OF limitedSnGrad) on both paths. Asserts `limited 1` == `corrected` bit-for-bit,
+# that 0.33 actually bites, and that host and device agree -- the last of which caught the device limiting
+# each velocity component independently where OpenFOAM shares one limiter across the vector.
+add_test(NAME limitedsngrad_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/limitedsngrad_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/airFoil2D)
+set_tests_properties(limitedsngrad_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# fvOptions explicitPorositySource/DarcyForchheimer end to end. The case is BUILT here (pitzDaily plus a
+# topoSet cellZone) rather than using simpleCar, because brae disagrees with OpenFOAM on simpleCar by ~50%
+# with fvOptions removed from both -- see the manifest. The control is a no-porosity run.
+add_test(NAME fvoptions_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/fvoptions_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+set_tests_properties(fvoptions_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
+# fvOptions framework + porosity, unit level: the dictionary, the cellZone selection and the resistance
+# expression, asserted against OpenFOAM's source and against what the case says.
+add_test(NAME fvoptions_cpp
+         COMMAND test_fvoptions_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleCarPorous 0)
+set_tests_properties(fvoptions_cpp PROPERTIES SKIP_RETURN_CODE 77)
+
+# limitedLinear / limitedLinearV / LUST end to end vs real OpenFOAM, each with a plain-upwind control
+# run against the same oracle. The control asserts on k, not U: every one of these schemes lands within
+# ~5.5e-03 of OpenFOAM on U and so does upwind, so U cannot discriminate.
+add_test(NAME divschemes_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/divschemes_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+set_tests_properties(divschemes_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
+# linearUpwind vs real OpenFOAM on pitzDaily's own discretisation. Generates the oracle by running
+# simpleFoam itself, and CONTROLS with a plain-upwind run: the deferred correction leaves the matrix
+# untouched, so a port that dropped it converges and looks fine -- only the comparison can see it.
+add_test(NAME linearupwind_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/linearupwind_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+set_tests_properties(linearupwind_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
+# kOmegaSST _cpp reference vs real OpenFOAM. The oracle is the RESIDUAL of our assembled equations at
+# OpenFOAM's converged fields -- a statement about the discretisation -- with a perturbation control.
+# The reference field set is generated by komegasst_vs_openfoam.sh; this test consumes it.
+# limited/blended convection schemes: LUST, limitedLinear and its V variant. Asserted against exact
+# properties from OpenFOAM's source (the TVD bound, both limiter limits, LUST's blend identity) with a
+# control proving the V form couples the components rather than limiting them independently.
+add_test(NAME limitedschemes_cpp
+         COMMAND test_limitedschemes_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
+# realizableKE _cpp reference vs real OpenFOAM. Same residual oracle as kOmegaSST, plus the two controls
+# that say WHICH model was ported: rCmu must genuinely vary (a constant 0.09 is standard k-epsilon, which
+# would still work), and S2 must use devSymm rather than the symm that kOmegaSST uses.
+add_test(NAME realizablke_cpp
+         COMMAND test_realizablke_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyRKE 2000)
+set_tests_properties(realizablke_cpp PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(NAME komegasst_cpp
+         COMMAND test_komegasst_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailySST 2000)
+set_tests_properties(komegasst_cpp PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(NAME nonorth_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/nonorth_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/shearedChannel)
+set_tests_properties(nonorth_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 900)
+
+add_test(NAME determinism_kepsilon
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/determinism_gate.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily 20)
+set_tests_properties(determinism_kepsilon PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+add_test(NAME determinism_komega
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/determinism_gate.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyKOmega 20)
+set_tests_properties(determinism_komega PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
+# The _cpp reference for divDevReff, proven against the SAME OpenFOAM dump as the inline test above,
+# with a wrong-sign check and a wall-nuEff negative control so the test is known to be able to fail.
+add_executable(test_divdevreff_cpp tests/test_divdevreff_cpp.cu)
+target_include_directories(test_divdevreff_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_divdevreff_cpp PRIVATE brae_core)
+add_test(NAME divdevreff_cpp
+         COMMAND test_divdevreff_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
+
 add_executable(test_divdevreff tests/test_divdevreff.cu)
 target_include_directories(test_divdevreff PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_divdevreff PRIVATE brae_core)
 add_test(NAME divdevreff
          COMMAND test_divdevreff ${CMAKE_CURRENT_SOURCE_DIR}/validation/kEpsCorrect)
+
+# TURBULENT gate for the rebuilt loop: one k-epsilon SIMPLE iteration from OpenFOAM's CONVERGED solution
+# must leave it there, with a laminar control proving nut really reaches the momentum equation.
+add_executable(test_simple_turbulent_cpp tests/test_simple_turbulent_cpp.cu)
+target_include_directories(test_simple_turbulent_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_simple_turbulent_cpp PRIVATE brae_core)
+
+add_executable(test_simple_sst_cpp tests/test_simple_sst_cpp.cu)
+target_include_directories(test_simple_sst_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_simple_sst_cpp PRIVATE brae_core)
+
+add_executable(test_simple_lm_cpp tests/test_simple_lm_cpp.cu)
+target_include_directories(test_simple_lm_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_simple_lm_cpp PRIVATE brae_core)
+
+add_executable(lm_probe tests/lm_probe.cu)
+target_include_directories(lm_probe PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(lm_probe PRIVATE brae_core)
+
+add_executable(lm_cuda_probe tests/lm_cuda_probe.cu)
+target_include_directories(lm_cuda_probe PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(lm_cuda_probe PRIVATE brae_core)
+
+add_executable(ami_probe tests/ami_probe.cu)
+target_include_directories(ami_probe PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(ami_probe PRIVATE brae_core)
+
+add_executable(ami_cpp_vs_device tests/ami_cpp_vs_device.cu)
+target_include_directories(ami_cpp_vs_device PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(ami_cpp_vs_device PRIVATE brae_core)
+
+add_executable(ke_localize_probe tests/ke_localize_probe.cu)
+target_include_directories(ke_localize_probe PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(ke_localize_probe PRIVATE brae_core)
+
+add_executable(v2_envelope tests/v2_envelope.cu)
+target_include_directories(v2_envelope PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(v2_envelope PRIVATE brae_core)
+
+add_executable(gradu_probe tests/gradu_probe.cu)
+target_include_directories(gradu_probe PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(gradu_probe PRIVATE brae_core)
+
+add_executable(ueqn_localize tests/ueqn_localize.cu)
+target_include_directories(ueqn_localize PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(ueqn_localize PRIVATE brae_core)
+
+add_executable(test_celllimited_cpp tests/test_celllimited_cpp.cu)
+target_include_directories(test_celllimited_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_celllimited_cpp PRIVATE brae_core)
+
+add_executable(rotordisk_probe tests/rotordisk_probe.cu)
+target_include_directories(rotordisk_probe PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(rotordisk_probe PRIVATE brae_core)
+
+add_executable(actuationdisk_probe tests/actuationdisk_probe.cu)
+target_include_directories(actuationdisk_probe PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(actuationdisk_probe PRIVATE brae_core)
+add_test(NAME celllimited_cpp
+         COMMAND test_celllimited_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
+add_executable(test_simple_mrf_cpp tests/test_simple_mrf_cpp.cu)
+target_include_directories(test_simple_mrf_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_simple_mrf_cpp PRIVATE brae_core)
+
+add_executable(test_simple_sa_cpp tests/test_simple_sa_cpp.cu)
+target_include_directories(test_simple_sa_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_simple_sa_cpp PRIVATE brae_core)
+
+add_executable(mrf_probe tests/mrf_probe.cu)
+target_include_directories(mrf_probe PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(mrf_probe PRIVATE brae_core)
+add_test(NAME simple_turbulent_cpp
+         COMMAND test_simple_turbulent_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
 
 add_executable(test_simple_turbulent tests/test_simple_turbulent.cu)
 target_include_directories(test_simple_turbulent PRIVATE ${BRAE_HEADER_DIRS})
@@ -549,6 +1564,11 @@ target_link_libraries(brae_pimpleFoam PRIVATE brae_core)
 # build, one command to run, and no way to end up with a brae that cannot solve half the cases it is handed.
 # Every solver added to the registry (solvers/common/solver_dispatch.cuh) belongs in this list.
 add_dependencies(brae brae_pimpleFoam)
+# ...and brae_rhoSimpleFoam, which the registry has routed to since it was added and this list never
+# named: `brae -case <compressible case>` on a fresh build execv'd a sibling that had not been built,
+# so the run died at the hand-over with the case fully parsed. The comment above already said every
+# registered solver belongs here; only the line was missing.
+add_dependencies(brae brae_rhoSimpleFoam)
 
 # End-to-end kOmegaSSTLM (Langtry-Menter transition) vs a SAVED OpenFOAM v2412 oracle (no OF needed at test time):
 # runs brae on a transition flat plate and checks U L2 < 3% and the gammaInt transition is captured.
@@ -603,6 +1623,19 @@ add_test(NAME cyclic_fvc COMMAND test_cyclic_fvc ${CMAKE_CURRENT_SOURCE_DIR}/val
 add_executable(brae_rhoSimpleFoam src/applications/solvers/rhoSimpleFoam/gpuRhoSimpleFoam.cu)
 target_include_directories(brae_rhoSimpleFoam PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(brae_rhoSimpleFoam PRIVATE brae_core)
+
+# brae_rhoSimpleFoam_slice: the vertical-slice port (src/applications/solvers/rhoSimpleFoam/slice).
+#
+# SLICE 0 is a byte-faithful COPY of the shared driver, so this target exists to prove the seam -- that the
+# slice folder builds on its own, links the Tier-A infrastructure it shares rather than re-porting it, and
+# reproduces brae_rhoSimpleFoam's output exactly on a real tutorial. See slice/README.md for the tier
+# split and why the pimpleFoam port's defects motivate it.
+add_executable(brae_rhoSimpleFoam_slice
+               src/applications/solvers/rhoSimpleFoam/slice/solver/rho_simple_foam_slice.cu)
+target_include_directories(brae_rhoSimpleFoam_slice PRIVATE ${BRAE_HEADER_DIRS}
+                           src/applications/solvers/rhoSimpleFoam
+                           src/applications/solvers/rhoSimpleFoam/slice/solver)
+target_link_libraries(brae_rhoSimpleFoam_slice PRIVATE brae_core)
 
 # brae_rhoSimpleFoam_legacy: frozen snapshot of the GPU-first solver, kept runnable so the CPU-first
 # ground-truth rewrite always has a reference to diff against. See rhosimplefoam-ground-truth-port.md.
@@ -817,6 +1850,86 @@ set_tests_properties(rhotiming_vs_openfoam PROPERTIES
 # exercise only the fixedEnergy half of basicThermo::heBoundaryTypes(); a fixedGradient T was read and then
 # silently discretised as zeroGradient, i.e. an adiabatic wall that converged to a plausible wrong answer.
 # Also the only gate that asserts OpenFOAM can PARSE what brae writes.
+add_test(NAME ffpi_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/ffpi_vs_openfoam.sh)
+set_tests_properties(ffpi_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
+# The other half of that boundary condition's envelope: fixedFluxPressure TOGETHER WITH MRF is refused,
+# because constrainPressure.C:70 makes the flux relative and deviceConstrainPressure does not. Needs a
+# fixture with a REAL rotating cellZone -- see the script's header for why pitzDaily cannot host it.
+add_test(NAME v2_mrf_fixedfluxpressure_refusal
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/v2_mrf_fixedfluxpressure_refusal.sh)
+set_tests_properties(v2_mrf_fixedfluxpressure_refusal PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae
+                     TIMEOUT 900)
+
+add_test(NAME ffp_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/ffp_vs_openfoam.sh)
+set_tests_properties(ffp_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
+add_executable(test_simple_adjustphi_cpp tests/test_simple_adjustphi_cpp.cu)
+target_include_directories(test_simple_adjustphi_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_simple_adjustphi_cpp PRIVATE brae_core)
+add_executable(test_abl_profile tests/test_abl_profile.cu)
+target_include_directories(test_abl_profile PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_abl_profile PRIVATE brae_core)
+add_test(NAME abl_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/abl_vs_openfoam.sh)
+set_tests_properties(abl_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(NAME adjm_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/adjm_vs_openfoam.sh)
+set_tests_properties(adjm_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
+add_test(NAME df_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/df_vs_openfoam.sh)
+set_tests_properties(df_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
+add_test(NAME sym_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/sym_vs_openfoam.sh)
+set_tests_properties(sym_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
+# rho.relax() on the SIMPLEC branch relaxes against the iteration's starting density (rho.prevIter()),
+# both mirror arms vs real OpenFOAM mid-transient -- tests/rho_simplec_rhorelax_vs_openfoam.sh.
+add_test(NAME rho_simplec_rhorelax_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_simplec_rhorelax_vs_openfoam.sh)
+set_tests_properties(rho_simplec_rhorelax_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# div(phi,K)/div(phi,Ekp) is read from its OWN fvSchemes entry, not copied from the energy entry --
+# both mirror arms vs real OpenFOAM in both directions, plus the by-name refusal on K alone.
+add_test(NAME rho_ke_scheme_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_ke_scheme_vs_openfoam.sh)
+set_tests_properties(rho_ke_scheme_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# kOmegaSST on the host mirror takes its coefficients, Prt and omega relaxation from the case, and the
+# wall functions keep their own Cmu -- tests/rho_sst_coeffs_vs_openfoam.sh, at iteration 1.
+add_test(NAME rho_sst_coeffs_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_sst_coeffs_vs_openfoam.sh)
+set_tests_properties(rho_sst_coeffs_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# turbulence->validate() at construction, both models, both arms where the device runs the model:
+# the first iteration must sit on OpenFOAM's -- tests/rho_validate_vs_openfoam.sh.
+add_test(NAME rho_validate_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_validate_vs_openfoam.sh)
+set_tests_properties(rho_validate_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# The case's gradient limiters and laplacian limiter reach the mirror: grad(e|Ekp) cellLimited on both
+# arms, `limited <psi>` on the device (refused by name on the host), `limited 0` refused on both --
+# tests/rho_limiters_vs_openfoam.sh.
+add_test(NAME rho_limiters_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_limiters_vs_openfoam.sh)
+set_tests_properties(rho_limiters_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(NAME tpm_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/tpm_vs_openfoam.sh)
+set_tests_properties(tpm_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
+add_test(NAME tf_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/tf_vs_openfoam.sh)
+set_tests_properties(tf_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow)
+
 add_test(NAME hf_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/validation/hf_vs_openfoam.sh)
 set_tests_properties(hf_vs_openfoam PROPERTIES
@@ -1036,6 +2149,342 @@ add_executable(test_thermo_perfect_gas tests/test_thermo_perfect_gas.cu)
 target_include_directories(test_thermo_perfect_gas PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_thermo_perfect_gas PRIVATE brae_core)
 add_test(NAME thermo_perfect_gas COMMAND test_thermo_perfect_gas)
+
+# The turbulence blow-up tripwire's DECISION, tested on the two measured sequences it has to tell apart:
+# a start-up transient that crosses the ratio bar and recovers (a 5.96M-cell car case both brae and real
+# OpenFOAM solve), and a run that genuinely diverges. Carries its own control -- a bar-only detector must
+# stop the transient, otherwise the sequences prove nothing.
+add_executable(test_turb_blowup tests/test_turb_blowup.cu)
+target_include_directories(test_turb_blowup PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_turb_blowup PRIVATE brae_core)
+add_test(NAME turb_blowup COMMAND test_turb_blowup)
+
+# rhoSimpleFoam's createFields.H against real OpenFOAM. The oracle is OpenFOAM's own
+# `rhoSimpleFoam -postProcess -func "writeObjects(phi,rho)"`, which builds createFields.H's field set and
+# writes it without solving -- no instrumented OpenFOAM build required. Carries the control that
+# distinguishes compressibleCreatePhi.H's interpolate(rho*U) from pEqn.H's interpolate(rho)*flux(U).
+add_executable(test_rho_create_fields_cpp tests/test_rho_create_fields_cpp.cu)
+target_include_directories(test_rho_create_fields_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_create_fields_cpp PRIVATE brae_core)
+add_test(NAME rho_createfields_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_createfields_vs_openfoam.sh)
+
+# rhoSimpleFoam's UEqn.H against OpenFOAM's own assembled momentum matrix (tools/dumpPEqn stage harness:
+# rAU, internalCoeffs, boundaryCoeffs). OpenFOAM's muEff is injected so this measures the ASSEMBLY and not
+# the unported compressible turbulence closure. Carries the control that distinguishes the compressible
+# divDevRhoReff (dynamic mu_eff) from the incompressible divDevReff (kinematic nu_eff).
+add_executable(test_rho_ueqn_cpp tests/test_rho_ueqn_cpp.cu)
+target_include_directories(test_rho_ueqn_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_ueqn_cpp PRIVATE brae_core)
+add_test(NAME rho_ueqn_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_ueqn_vs_openfoam.sh)
+
+# rhoSimpleFoam's EEqn.H against OpenFOAM's own assembled energy equation (dumpPEqn stage harness:
+# stage_Ekp, stage_he, stage_eD, stage_eSrc, stage_alphaEff). OpenFOAM's alphaEff is injected so this
+# measures the ASSEMBLY. Carries the control that distinguishes the two he.name() arms --
+# Ekp = 0.5|U|^2 + p/rho for `e` against K = 0.5|U|^2 for `h`.
+add_executable(test_rho_eeqn_cpp tests/test_rho_eeqn_cpp.cu)
+target_include_directories(test_rho_eeqn_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_eeqn_cpp PRIVATE brae_core)
+add_test(NAME rho_eeqn_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_eeqn_vs_openfoam.sh)
+
+# rhoSimpleFoam's pEqn.H against OpenFOAM -- BOTH branches, by running OpenFOAM twice on the same fixture
+# with `transonic no` and `transonic yes` (and `consistent no`, so the driver reaches pEqn.H rather than
+# pcEqn.H). The transonic branch had no stage harness at all until this gate; one was added to
+# tools/dumpPEqn. Each run's control is the OTHER branch, which must not reproduce it.
+add_executable(test_rho_peqn_cpp tests/test_rho_peqn_cpp.cu)
+target_include_directories(test_rho_peqn_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_peqn_cpp PRIVATE brae_core)
+add_test(NAME rho_peqn_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_peqn_vs_openfoam.sh)
+
+# rhoSimpleFoam's pcEqn.H -- the SIMPLEC pressure equation -- against OpenFOAM, BOTH branches, with
+# `consistent yes` so the driver reaches pcEqn.H. Its subsonic branch had no stage harness until this
+# gate. Controls: plain SIMPLE must not reproduce the SIMPLEC matrix, and the other transonic branch
+# must not either.
+add_executable(test_rho_pceqn_cpp tests/test_rho_pceqn_cpp.cu)
+target_include_directories(test_rho_pceqn_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_pceqn_cpp PRIVATE brae_core)
+add_test(NAME rho_pceqn_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_pceqn_vs_openfoam.sh)
+
+# rhoSimpleFoam END TO END: the _cpp driver runs the whole case and is compared against real OpenFOAM.
+# This is the gate PORT.md requires BEFORE any .cu is written for this solver. Laminar, because the
+# compressible turbulence closure is not ported -- and the binary asserts a turbulent case is REFUSED.
+add_executable(test_rho_simple_step_cpp tests/test_rho_simple_step_cpp.cu)
+target_include_directories(test_rho_simple_step_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_simple_step_cpp PRIVATE brae_core)
+add_test(NAME rho_simple_end_to_end_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_simple_end_to_end_vs_openfoam.sh)
+
+# The COMPRESSIBLE kEpsilon closure against OpenFOAM's own turbulence->correct(), which tools/dumpPEqn
+# brackets so every input it reads and every field it writes can be compared. Carries the control that
+# distinguishes the two fluxes: divU is the VOLUMETRIC one, the div operator takes the MASS one.
+# The COMPRESSIBLE kOmegaSST closure against OpenFOAM's OWN kOmegaSST, instrumented. tools/dumpKOmegaSST
+# is kOmegaSSTBase.C with writes added and its equations untouched, run under tools/dumpPEqn so the
+# model's inputs come from the same iteration. Carries the divU flux control: the compressible reading
+# takes the VOLUMETRIC flux there and the MASS flux in fvm::div, and substituting one for the other must
+# be measurably worse.
+add_executable(test_rho_komegasst_cpp tests/test_rho_komegasst_cpp.cu)
+target_include_directories(test_rho_komegasst_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_komegasst_cpp PRIVATE brae_core)
+# squareBend: OpenFOAM's OWN tutorial, UNMODIFIED, through the _cpp driver. Every other rhoSimpleFoam
+# gate runs validation/sbMatched, which is derived from this case -- so this is the one that measures
+# whether the port generalises past the fixture it was developed on. Compared at OpenFOAM's own
+# residualControl convergence (156 iterations), not at the shipped endTime.
+add_test(NAME rho_squarebend_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_squarebend_vs_openfoam.sh)
+set_tests_properties(rho_squarebend_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_simple_step_cpp
+                     LABELS slow
+                     TIMEOUT 1800)
+
+add_test(NAME rho_komegasst_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_komegasst_vs_openfoam.sh)
+set_tests_properties(rho_komegasst_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_komegasst_cpp
+                     TIMEOUT 1800)
+
+add_executable(test_rho_kepsilon_cpp tests/test_rho_kepsilon_cpp.cu)
+target_include_directories(test_rho_kepsilon_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_rho_kepsilon_cpp PRIVATE brae_core)
+# REGISTERED NOW: the closure agrees with OpenFOAM at machine precision -- epsilon 5.0e-15, k 8.9e-16,
+# nut 1.7e-15, wall and interior alike -- and so does every intermediate the gate can see, because
+# tools/dumpKEpsilon is OpenFOAM's own kEpsilon with writes added and its equations untouched. gradU,
+# GbyNu, G, divU, both diffusivities, the mesh factors, both off-diagonal sets and both assembled systems
+# each have an oracle rather than an argument. What that instrument found, in order:
+#   - the closure was never given the flux, so U's inletOutlet outlet evaluated on a seeded valueFraction
+#     and fvc::grad(U) read the wrong face value there (gradU exact in the interior, 1.5e-01 at the
+#     boundary -- the split is what named it);
+#   - k and epsilon never had updateCoeffs called on them either, so every flux-conditional patch
+#     contributed nothing to its system whatever value it carried;
+#   - the turbulent inlets were frozen at the case file's `value`. OpenFOAM RECOMPUTES refValue on every
+#     updateCoeffs, epsilon's from k's patch values and k's from U's;
+#   - the diffusion terms were assembled with `Gauss linear orthogonal` while the case asked for
+#     `corrected` -- a silent scheme substitution, and the last 5e-06.
+add_test(NAME rho_kepsilon_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_kepsilon_vs_openfoam.sh)
+set_tests_properties(rho_simple_end_to_end_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_simple_step_cpp
+                     TIMEOUT 1800)
+
+# div(phi,k)/div(phi,epsilon) `Gauss limitedLinear 1` end to end: sbMatched mutated to the scheme
+# validation/squareBend actually ships, BOTH codes run under the mutation, so the oracle converges under
+# the scheme being gated. Separate from the e2e gate because it pays its own 400-iteration OpenFOAM run.
+# The fail-proof arm reverts only the scheme word and re-runs brae against the same limitedLinear
+# oracle: upwind must miss the k/epsilon bound, which is also the non-vacuity statement.
+add_test(NAME rho_turb_limitedlinear_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_turb_limitedlinear_vs_openfoam.sh)
+set_tests_properties(rho_turb_limitedlinear_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_simple_step_cpp
+                     TIMEOUT 2400)
+
+# The non-orthogonal corrector loop (`while (simple.correctNonOrthogonal())`), which the _cpp driver
+# used to skip entirely -- one pressure solve whatever the case named. Compared at a matched EARLY
+# iteration because the count is a trajectory feature: at convergence every extra pass re-solves an
+# unchanged system and no converged gate can see it. The fail-proof replays the old defect (one pass
+# against the 2-corrector oracle) and reads p 1.51e-01 where the arm reads 3.97e-04. Also carries the
+# DEVICE arm: the CUDA driver's loop vs the OF-gated host at iteration 1 on the same mutation (its
+# harness used to hardcode correctedLaplacian=false, under which the loop had nothing to correct);
+# forcing the device count to 0 reads Ux 1.85e-01 against the arm's 5.7e-12.
+# THE MIRROR AS A SOLVER, not as a step: `brae -case` end to end against real OpenFOAM, on BOTH arms --
+# the answer, the OF-format output (real rhoSimpleFoam restarts from brae's written directory), the
+# latestTime restart with an ABSOLUTE endTime, the turbulent write payload, the residualControl stop,
+# and the binary-writeFormat and unknown-selector refusals. Measured on rhoBox at 200 iterations: the
+# host arm p 2.95e-12 / U 2.93e-11 against OpenFOAM, the CUDA arm 3.00e-12 / 4.45e-10 against OpenFOAM
+# and 2.83e-12 / 4.62e-10 against the host arm -- the two differ by their linear solvers (AMG-PCG
+# against BiCGStab) and by nothing else. Every other rhoSimpleFoam gate drives the step through a
+# harness that reads no controlDict and writes nothing, so none of this was gated anywhere.
+# `brae -partition` + the warm reload it promises. The AMG cache serialises the agglomeration and
+# re-Galerkins the values, but its LOAD path never rebuilt the per-level Galerkin gather lists -- so
+# every warm run died in galDiagGatherK ("amul: an illegal memory access"). Nothing was gated on a
+# warm reload, on either the compressible or the incompressible path, so nothing caught it. Asserts
+# EQUALITY, not a tolerance: a cached hierarchy must reproduce a cold one exactly.
+# simpleFoamV2 wrote every field's boundaryField by ECHOING the 0/ template it splices into -- so a V2
+# time directory carried the start state on every patch the solve had moved (pitzDailyTurb's wall nut
+# among them), and a restart from it restarted from the wrong state. Asserts the written boundary
+# DIFFERS from the template (a value list alone proves nothing -- the template has one too) and that
+# OpenFOAM still accepts the file.
+add_test(NAME v2_written_boundary
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/v2_written_boundary.sh)
+set_tests_properties(v2_written_boundary PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae
+                     TIMEOUT 1200)
+
+add_test(NAME amg_cache_warm_start
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/amg_cache_warm_start.sh)
+set_tests_properties(amg_cache_warm_start PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae
+                     TIMEOUT 1200)
+
+# angledDuctExplicitFixedCoeff, OpenFOAM's own tutorial, at OpenFOAM's own convergence (639 iterations)
+# -- porosity + a fixedTemperatureConstraint + a scalarFixedValueConstraint on k and epsilon. It was
+# never registered, so nothing ran it; its host comparison reads p 1.9e-06, T 1.6e-06, U 1.7e-05. The
+# CUDA arms check that the tutorial's TILTED SLIP wall is refused by name (mesh type `wall`, U BC
+# `slip`, plane at 45 degrees) and that with an axis-independent wall the device applies all three
+# fvOptions and pins the same cells as the host.
+add_test(NAME rho_angledduct_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_angledduct_vs_openfoam.sh)
+set_tests_properties(rho_angledduct_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     LABELS slow
+                     TIMEOUT 3600)
+
+add_test(NAME rho_mirror_solver_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_mirror_solver_vs_openfoam.sh)
+set_tests_properties(rho_mirror_solver_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 1800)
+
+add_test(NAME rho_relax_default_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_relax_default_vs_openfoam.sh)
+set_tests_properties(rho_relax_default_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 1800)
+
+add_test(NAME rho_uresidual_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_uresidual_vs_openfoam.sh)
+set_tests_properties(rho_uresidual_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 1800)
+
+add_test(NAME rho_tp_transient_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_tp_transient_vs_openfoam.sh)
+set_tests_properties(rho_tp_transient_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 1800)
+
+add_test(NAME rho_turbinlet_cmu_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_turbinlet_cmu_vs_openfoam.sh)
+set_tests_properties(rho_turbinlet_cmu_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 1800)
+
+add_test(NAME simple_piov_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_piov_vs_openfoam.sh)
+set_tests_properties(simple_piov_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae
+                     TIMEOUT 1800)
+
+add_test(NAME rho_coeffdict_fallback_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_coeffdict_fallback_vs_openfoam.sh)
+set_tests_properties(rho_coeffdict_fallback_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 1800)
+
+add_test(NAME rho_p0_written_table_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_p0_written_table_vs_openfoam.sh)
+set_tests_properties(rho_p0_written_table_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 1800)
+
+add_test(NAME rho_closure_gradlimit_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_closure_gradlimit_vs_openfoam.sh)
+set_tests_properties(rho_closure_gradlimit_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 1800)
+
+add_test(NAME rho_p_unlimited_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_p_unlimited_vs_openfoam.sh)
+set_tests_properties(rho_p_unlimited_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 1800)
+add_test(NAME rho_sbmatched_transient_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_sbmatched_transient_vs_openfoam.sh)
+set_tests_properties(rho_sbmatched_transient_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     TIMEOUT 1800)
+
+add_test(NAME rho_step_cuda_schemes
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_step_cuda_schemes.sh)
+set_tests_properties(rho_step_cuda_schemes PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_simple_step_cuda
+                     TIMEOUT 1800)
+
+add_test(NAME rho_step_cuda_turbulent
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_step_cuda_turbulent.sh)
+set_tests_properties(rho_step_cuda_turbulent PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_simple_step_cuda
+                     TIMEOUT 1800)
+
+add_test(NAME rho_nonorth_corrector_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_nonorth_corrector_vs_openfoam.sh)
+set_tests_properties(rho_nonorth_corrector_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_simple_step_cpp
+                     TIMEOUT 900)
+set_tests_properties(rho_kepsilon_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_kepsilon_cpp
+                     TIMEOUT 1800)
+set_tests_properties(rho_pceqn_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_pceqn_cpp
+                     TIMEOUT 900)
+set_tests_properties(rho_peqn_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_peqn_cpp
+                     TIMEOUT 900)
+set_tests_properties(rho_eeqn_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_eeqn_cpp
+                     TIMEOUT 900)
+set_tests_properties(rho_ueqn_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_ueqn_cpp
+                     TIMEOUT 900)
+set_tests_properties(rho_createfields_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_create_fields_cpp
+                     TIMEOUT 900)
 
 # heRhoThermo/perfectGas must parse identically to hePsiThermo, and heRhoThermo with any OTHER
 # equationOfState must be refused. Asserted at the PARSE level because brae is not run-to-run
@@ -1486,6 +2935,20 @@ target_link_libraries(test_gpu_momentum PRIVATE brae_core)
 add_test(NAME gpu_momentum COMMAND test_gpu_momentum ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
 
 # GPU offload G7: SIMPLE coupling glue on device (H/rAU/phiHbyA/matrixFlux/corrector)
+# CUDA vs the _cpp REFERENCE at stage granularity. Closes the chain OpenFOAM -> _cpp -> CUDA: every other
+# GPU test compares the device against CPU code written inline in that same test, which proves consistency
+# but not correctness.
+add_executable(test_gpu_vs_cpp tests/test_gpu_vs_cpp.cu)
+target_include_directories(test_gpu_vs_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_gpu_vs_cpp PRIVATE brae_core)
+add_test(NAME gpu_vs_cpp
+         COMMAND test_gpu_vs_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/matrixDumpAsym 282)
+# ...and again on a TURBULENT case, where nuEff varies per cell and per boundary face. On the laminar case
+# above nuEff is constant, so a kernel that mishandles a per-face diffusivity -- or reads the owner cell's
+# value on a wall instead of the patch value -- would still agree perfectly.
+add_test(NAME gpu_vs_cpp_turbulent
+         COMMAND test_gpu_vs_cpp ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
+
 add_executable(test_gpu_simple tests/test_gpu_simple.cu)
 target_include_directories(test_gpu_simple PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_gpu_simple PRIVATE brae_core)

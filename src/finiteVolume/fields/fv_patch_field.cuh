@@ -4,6 +4,7 @@
 // snGrad() is the surface-normal gradient. Matrix-coupling coefficients (valueInternalCoeffs
 // etc.) come with Phase 3 (assembly). Unsupported types throw, no silent fallback.
 #include "cf_types.cuh"
+#include "planar_interpolation.cuh"
 #include "fv_patch.cuh"
 #include "wedge_patch.cuh"   // the axisymmetric constraint patch's rotation tensors
 #include "foam_field_reader.cuh"
@@ -13,6 +14,7 @@
 #include <stdexcept>
 #include <vector>
 #include <type_traits>
+#include <algorithm>
 #include <cmath>
 
 namespace brae {
@@ -30,15 +32,161 @@ public:
     virtual void evaluate(const std::vector<T>& internal) = 0;
     virtual bool fixesValue() const = 0;
 
+    // OpenFOAM fvPatchField::assignable() -- "may this patch's value be OVERWRITTEN by an assignment to
+    // the field?". Defaults true; false for the fixedValue, mixed and transform families
+    // (fvPatchField.H, fixedValueFvPatchField.H:169, mixed/, transform/).
+    //
+    // This is NOT the same question as fixesValue(), and conflating them is a silent error:
+    //   * slip / partialSlip are NOT assignable but do NOT fix a value;
+    //   * inletOutlet derives from mixed but OVERRIDES assignable() back to TRUE
+    //     (inletOutletFvPatchField.H:164); outletInlet derives from the same base and does not.
+    // constrainHbyA (simpleFoam/pEqn.H:3) branches on assignable(); adjustPhi (pEqn.H:6) branches on
+    // fixesValue(). Using one for the other changes which patches keep U's boundary value in HbyA.
+    virtual bool assignable() const { return true; }
+    // constrainPressure's dispatch (OF: isA<updateablePatchTypes::updateableSnGrad>, constrainPressure.C:62).
+    // Only fixedFluxPressure overrides; the setter on anything else is a wiring error, not a no-op.
+    virtual bool updateableSnGrad() const { return false; }
+    virtual void updateSnGrad(const std::vector<T>&)
+    {
+        throw std::runtime_error("brae: updateSnGrad called on patch '" + patch_.name +
+                                 "', which is not an updateable-snGrad boundary condition.");
+    }
+
+    // Is this specifically an inletOutlet? adjustPhi (pEqn.H) branches on
+    // `Up.fixesValue() && !isA<inletOutletFvPatchVectorField>(Up)` -- it needs BOTH questions, because
+    // mixedFvPatchField::fixesValue() is TRUE (mixedFvPatchField.H:197) and inletOutlet inherits it, so
+    // without the exclusion an inletOutlet outlet would be counted as a FIXED outflow and adjustPhi would
+    // have nothing adjustable left to balance against.
+    virtual bool isInletOutlet() const { return false; }
+
+    // OpenFOAM's updateCoeffs() for a flux-conditional BC. inletOutlet sets valueFraction = neg(phi) from
+    // the patch flux (inletOutletFvPatchField.C), which it reaches through the object registry; brae's
+    // host path has no registry, so the SOLVER pushes the flux in once per iteration, exactly where
+    // OpenFOAM would have looked it up. A no-op on every other patch type.
+    virtual void updateFromFlux(const std::vector<scalar>& /*phip*/) {}
+
+    // OF's flowRateInletVelocity RECOMPUTES its value in updateCoeffs, from the registered rho's PATCH
+    // field -- not from the face cells, and not from `rhoInlet`, which is only the fallback for a solver
+    // that registers no rho (flowRateInletVelocityFvPatchVectorField.C:updateCoeffs/updateValues):
+    //     avgU = -flowRate/gSum(rho*magSf);   value = avgU*n      n = patch().nf(), OUTWARD
+    // A patch that is not one does nothing here.
+    virtual void updateFromDensity(const std::vector<scalar>& /*rhop*/) {}
+
+    // OF's updateCoeffs() for the two patches whose value is a function of the patch VELOCITY:
+    //   totalPressure                  p_b = p0 - 0.5*rho*neg(phi)*magSqr(U_b)
+    //                                  (totalPressureFvPatchScalarField.C, psiName_ == "none" branch)
+    //   pressureInletOutletVelocity    outflow extrapolates; inflow fixes only the TANGENTIAL component,
+    //                                  so U_b = n*(n & U_cell)
+    //
+    // Neither is reachable from the field's own evaluate(): a scalar p patch cannot see U at all, and
+    // piov needs the flux sign as well as the cell velocity. So the solver pushes them in, exactly where
+    // OpenFOAM's updateCoeffs would have looked them up in the object registry -- the same arrangement
+    // updateFromFlux and updateFromDensity already use.
+    //
+    // BOTH velocities are passed because OpenFOAM uses a DIFFERENT one for each: totalPressure's `Up` is
+    // U's PATCH field, while piov's is patchInternalField(). Passing one for both would be wrong on
+    // whichever it was not.
+    //
+    // This exists because both classes carried a comment saying the DEVICE recomputes their value each
+    // step (see them below) and nothing on the host ever did, so each behaved as a read-and-hold seed
+    // for an entire run. validation/rhoTP carries both, and diverged through the OF-mirror driver
+    // (T 3.79e+38, U 3.09e+20) where OpenFOAM converges in 411 iterations.
+    virtual void updateFromPatchVelocity(
+        const std::vector<vector>& /*Ub*/,
+        const std::vector<vector>& /*Ucell*/,
+        const std::vector<scalar>& /*rhob*/) {}
+
+    // The CONSTRUCTION-time half of the same thing, and it is a different branch. OF's dict constructor
+    // calls evaluate() -> updateCoeffs() only when the case supplies no `value`, so the inlet is already
+    // at avgU*n before createFields.H builds phi from it. When the case DOES supply a `value` OF keeps it
+    // verbatim and replaces it at the first momentum assembly instead. sbMatched gives no value;
+    // angledDuct gives `uniform (0 0 0)`, which makes OF's first inlet mass flux exactly zero. Taking
+    // either branch for both was measured at 303x on the convective boundaryCoeffs.
+    virtual void updateAtConstruction(const std::vector<scalar>& /*rhop*/) {}
+
+    // OF's turbulent inlets RECOMPUTE their refValue in updateCoeffs, from the patch fields as they stand
+    // at that moment -- they do not carry the value the case file was written with:
+    //   turbulentIntensityKineticEnergyInlet:      refValue = 1.5*intensity^2*magSqr(Up)
+    //   turbulentMixingLengthDissipationRateInlet: refValue = (Cmu^0.75/mixingLength)*kp^1.5
+    //   turbulentMixingLengthFrequencyInlet:       refValue = sqrt(kp)/(Cmu^0.25*mixingLength)
+    // Any other patch does nothing here. `coeffDictCmu` is the turbulence model's coeffDict `Cmu` and
+    // `coeffDictHasCmu` whether that dict carries one at all -- both inlets ask the MODEL first and fall
+    // back to their own default only when it has no entry (see TurbulentInletPatchField).
+    virtual void updateTurbulentInlet(
+        const std::vector<vector>& /*Up*/,
+        const std::vector<scalar>& /*kp*/,
+        scalar                     /*coeffDictCmu*/,
+        bool                       /*coeffDictHasCmu*/) {}
+
     // Laplacian/gradient matrix coupling: snGrad = gradientInternalCoeffs * phi_P
     // + gradientBoundaryCoeffs. Default (zeroGradient/empty/calculated) contributes nothing.
     virtual std::vector<T> gradientInternalCoeffs() const { return std::vector<T>(patch_.size, T{}); }
     virtual std::vector<T> gradientBoundaryCoeffs() const { return std::vector<T>(patch_.size, T{}); }
 
+    // OF fvPatchField::snGrad() -- deltaCoeffs*(value - patchInternalField) on the base class
+    // (fvPatchField.C), and a DIFFERENT expression on several derived ones, which is why this is a
+    // virtual and not a formula at the call site.
+    //
+    // WHY IT CANNOT BE (value - patchInternalField)*deltaCoeffs EVERYWHERE. Those agree only while
+    // `value` is the evaluate() of the coefficients the patch currently holds. OpenFOAM runs updateCoeffs
+    // inside the fvMatrix constructor and evaluates only later, at the solve's correctBoundaryConditions,
+    // so during an assembly a mixed patch holds a NEW valueFraction beside a value blended with the OLD
+    // one -- and gaussGrad::correctBoundaryConditions (gaussGrad.C) asks for snGrad() right there,
+    // mid-assembly. Rebuilt from OpenFOAM's own state, naca0012's freestreamVelocity inlet read a
+    // boundary grad(U) 6.4e-04 out under the inline formula, the dev2 tensor with it, and fvc::div of
+    // that tensor -- the explicit half of divDevRhoReff -- 3.0e-07 out, while the diagonal,
+    // off-diagonals, internalCoeffs and boundaryCoeffs were all exact to 1e-15 (queue item 25).
+    virtual std::vector<T> snGrad(const std::vector<T>& internal) const
+    {
+        const std::vector<T> pif = patchInternalField(internal);
+        std::vector<T> r(static_cast<std::size_t>(patch_.size), T{});
+        for (label i = 0; i < patch_.size; ++i)
+            r[i] = patch_.deltaCoeffs[i] * (value_[i] - pif[i]);
+        return r;
+    }
+
+protected:
+    // snGrad rebuilt from the matrix coefficients, for the classes where OpenFOAM defines them to satisfy
+    //     snGrad == gradientInternalCoeffs*patchInternalField + gradientBoundaryCoeffs
+    // (mixed: gic = -vf*deltaCoeffs, gbc = vf*deltaCoeffs*refValue + (1-vf)*refGrad, so the sum is
+    // mixedFvPatchField::snGrad's lerp exactly; directionMixed the same by construction). Reusing them
+    // keeps ONE expression per class instead of a second copy free to drift from the one the laplacian is
+    // gated on. NOT valid on the base/calculated family, whose coefficients are zero while their snGrad
+    // is not -- hence a helper the classes opt into, not the default.
+    std::vector<T> snGradFromCoeffs(const std::vector<T>& internal) const
+    {
+        const std::vector<T> pif = patchInternalField(internal);
+        const std::vector<T> gic = gradientInternalCoeffs();
+        const std::vector<T> gbc = gradientBoundaryCoeffs();
+        std::vector<T> r(static_cast<std::size_t>(patch_.size), T{});
+        for (label i = 0; i < patch_.size; ++i) r[i] = cmptMul(gic[i], pif[i]) + gbc[i];
+        return r;
+    }
+
+public:
+
     // BC category for the on-device evaluator: 0 = extrapolated (zeroGradient/empty: value tracks the
     // internal cell, valueIC=1, gradIC=0); 1 = fixedValue (fixedValue/noSlip: value=ref, valueIC=0,
     // gradIC=-deltaCoeffs); 2 = calculated (value=ref but extrapolated coeffs).
     virtual int bcCategory() const { return 0; }
+    // Is this an epsilonWallFunction? OpenFOAM's epsilon wall treatment keys on the BC TYPE, not on the
+    // patch type: createAveragingWeights counts the adjacent faces whose epsilon field carries an
+    // epsilonWallFunction, so a `wall` patch with a plain fixedValue or zeroGradient epsilon must NOT
+    // contribute a wall constraint or an averaging weight. brae otherwise maps the type to zeroGradient
+    // and would lose that distinction.
+    virtual bool isTurbulenceWallFunction() const { return false; }
+    // Is this nut patch a nutUSpaldingWallFunction? It reads as `calculated` to the matrix -- the value is
+    // supplied, not derived from a gradient -- but a model's correctNut must NOT overwrite it with the
+    // nut_ = f(nuTilda) field assignment: correctBoundaryConditions() lets the wall function recompute it
+    // from Spalding's law, and for SpalartAllmaras (nuTilda fixedValue 0 at a wall) the assignment would
+    // otherwise leave the wall with NO eddy viscosity at all.
+    virtual bool isNutUSpalding() const { return false; }
+    // The patch's REFERENCE value -- inletValue / outletValue / freestreamValue / refValue -- as opposed
+    // to its current value(). For most BCs the two are the same object and this returns value(); the
+    // read-and-hold family below overrides it. The device boundary builder needs the reference, because
+    // that is what its mixed/inletOutlet evaluators blend TOWARDS; handing it value() only worked while
+    // the two were kept identical, and stops working the moment a field carries the value OF wrote.
+    virtual std::vector<T> refValues() const { return value_; }
     // wedge (axisymmetric constraint): the HALF-angle and FULL-angle rotation tensors, or null on every
     // other patch type. The device builder reads them to set the per-component valueFraction and to
     // recompute the rotated value each step.
@@ -46,6 +194,17 @@ public:
     virtual const tensor* wedgeCellT() const { return nullptr; }
     // flowRateInletVelocity: the dict flow rate, so the solver can recompute avgU against the live rho.
     virtual scalar flowRateValue() const { return 0.0; }
+
+    // turbulentIntensityKineticEnergyInlet / turbulentMixingLengthDissipationRateInlet: which one, and
+    // its coefficient (the intensity, or the mixing length). Exposed for the same reason
+    // flowRateValue() is -- the DEVICE projection has to rebuild these per boundary face and cannot
+    // reach into the patch object otherwise.
+    //
+    // Returning -1 rather than a valid kind on every other patch type matters: the device closure takes
+    // these as MASKS, and a null mask is not "no such patch", it is silently no turbulent inlet at all
+    // (see the note on KEpsilonInput). A caller that cannot tell the two apart cannot refuse.
+    virtual int    turbulentInletKind() const { return -1; }
+    virtual scalar turbulentInletCoefficient() const { return 0.0; }
 
     // symmetryPlane/symmetry needs PER-COMPONENT device categories for vectors (the wall-normal component
     // is reflected = fixedValue 0, the tangential components are zeroGradient). The device builder keys on
@@ -67,6 +226,18 @@ public:
 
     const std::vector<T>& value() const { return value_; }
     void setValue(const std::vector<T>& v) { value_ = v; }   // e.g. nutkWallFunction writing nut at walls
+
+    // Replace the value the patch HOLDS, not merely the one it currently exposes. OF's operator==(...)
+    // on a fixedValue or calculated patch replaces the stored value, so a later evaluate() reproduces it.
+    // setValue writes value_ ALONE, and both families rebuild value_ from their stored copy on the next
+    // evaluate() -- which silently reverted a corrected flowRateInletVelocity inlet to the `rhoInlet`
+    // seed, at a measured 24% of the case's prescribed mass flow. Use this whenever the new value has to
+    // survive an evaluateBoundary().
+    virtual void setStoredValues(std::vector<T> v) { value_ = std::move(v); }
+    // fvPatchField::operator== -- the VALUE assigned on any class, bypassing whatever setStoredValues means
+    // for it (the reference on the mixed and extrapolated families). GeometricField::relax reaches every
+    // patch this way (GeometricField.C:1420); the next evaluate() recomputes the value as OpenFOAM's does.
+    virtual void assignValue(std::vector<T> v) { value_ = std::move(v); }
     // Coupled-patch neighbour (halo) values for the matrix; non-coupled patches return value().
     virtual const std::vector<T>& patchNeighbourField() const { return value_; }
     const FvPatch&        patch() const { return patch_; }
@@ -94,13 +265,30 @@ public:
         bool uniform,
         T uval,
         std::vector<T> vals)
-        : fvPatchField<T>(p), uniform_(uniform), uniformValue_(uval), values_(std::move(vals)) {}
+        : fvPatchField<T>(p), uniform_(uniform), uniformValue_(uval), values_(std::move(vals))
+    {
+        // A nonuniform patch whose list does not cover the patch used to read PAST the vector in
+        // evaluate() -- found as a segfault when a fixture's fixedMean patch shipped no `value` entry.
+        // OpenFOAM refuses the same file (fvPatchField reads "value" with readEntry, which fatals).
+        if (!uniform_ && static_cast<label>(values_.size()) != p.size)
+            throw std::runtime_error(
+                "brae: patch '" + p.name + "' (fixedValue family) has " +
+                std::to_string(values_.size()) + " values for " + std::to_string(p.size) +
+                " faces -- the file's `value` entry is missing or short. OpenFOAM refuses this too.");
+    }
     void evaluate(const std::vector<T>&) override
     {
         for (label i = 0; i < this->patch_.size; ++i)
             this->value_[i] = uniform_ ? uniformValue_ : values_[i];
     }
+    void setStoredValues(std::vector<T> v) override
+    {
+        uniform_ = false;
+        values_  = std::move(v);
+        evaluate({});
+    }
     bool fixesValue() const override { return true; }
+    bool assignable() const override { return false; }   // OF fixedValueFvPatchField.H:169
     int  bcCategory() const override { return 1; }
 
     std::vector<T> gradientInternalCoeffs() const override        // -deltaCoeffs
@@ -140,13 +328,74 @@ template <typename T>
 class TotalPressurePatchField : public FixedValuePatchField<T>
 {
 public:
+    // The VALUE and p0 arrive separately, as OpenFOAM's dictionary constructor keeps them: the patch
+    // value is the `value` entry when the file carries one and p0 otherwise
+    // (totalPressureFvPatchScalarField.C:69-73 readValueEntry, else operator=(p0_);
+    // uniformTotalPressureFvPatchScalarField.C:70-75 the same). One slot used to serve both, seeded from
+    // p0, so a RESTART from OpenFOAM's written directory started the inlet at p0 (100200 on rhoTP) where
+    // OpenFOAM's continuation reads the written value (100094.86): the first momentum assembly after the
+    // restart saw a different grad(p) and both arms read U 1.1e-01 against OpenFOAM at t = 2 (queue 20).
     TotalPressurePatchField(
         const FvPatch& p,
-        bool uniform,
-        T uval,
-        std::vector<T> vals)
-        : FixedValuePatchField<T>(p, uniform, uval, std::move(vals)) {}
+        bool valueUniform,
+        T valueUval,
+        std::vector<T> valueVals,
+        bool p0Uniform,
+        T p0Uval,
+        std::vector<T> p0Vals)
+        : FixedValuePatchField<T>(p, valueUniform, valueUval, valueVals)
+    {
+        // p0 from the CONSTRUCTOR'S OWN DATA -- never this->value(): value_ is filled by evaluate(),
+        // which has not run at construction, so capturing it here stored an EMPTY p0 and every update
+        // ran p = 0 - 0.5*rho*|U|^2 (measured -14.52 Pa on a 100050 Pa totalPressure inlet at
+        // iteration 1 -- the whole rhoTP divergence, hidden because the DEVICE arm reads its own p0
+        // buffer and the only tp gate ran that arm).
+        p0_.resize(static_cast<std::size_t>(p.size));
+        for (label i = 0; i < p.size; ++i)
+            p0_[static_cast<std::size_t>(i)] =
+                p0Uniform ? p0Uval
+                          : (static_cast<std::size_t>(i) < p0Vals.size() ? p0Vals[static_cast<std::size_t>(i)] : T{});
+    }
     int bcCategory() const override { return 7; }                   // device: totalPressure (per-step refValue)
+    // The REFERENCE this patch blends from is p0, not its current value: the device projection reads
+    // refValues() into its p0 buffer (device_boundary.cuh), and value() is the written value on a restart.
+    std::vector<T> refValues() const override { return p0_; }
+
+    void updateFromFlux(const std::vector<scalar>& phip) override { phi_ = phip; }
+
+    // OF totalPressureFvPatchScalarField::updateCoeffs, the psiName_ == "none" branch, which is the one a
+    // compressible case takes unless it names psi:  operator==(p0p - 0.5*rho*(neg(phip))*magSqr(Up)).
+    // neg(phi) is 1 for INFLOW (phi < 0) and 0 otherwise, so an outflow face sits at p0 exactly.
+    void updateFromPatchVelocity(
+        const std::vector<vector>& Ub,
+        const std::vector<vector>& /*Ucell*/,
+        const std::vector<scalar>& rhob) override
+    {
+        if constexpr (std::is_same<T, scalar>::value)
+        {
+            const label n = this->patch_.size;
+            if (n == 0 || p0_.empty()) return;
+            std::vector<T> v(static_cast<std::size_t>(n));
+            for (label i = 0; i < n; ++i)
+            {
+                const scalar p0 = i < (label)p0_.size() ? p0_[i] : p0_.back();
+                const bool inflow = i < (label)phi_.size() && phi_[i] < scalar(0);
+                scalar u2 = 0;
+                if (inflow && i < (label)Ub.size())
+                    u2 = Ub[i].x*Ub[i].x + Ub[i].y*Ub[i].y + Ub[i].z*Ub[i].z;
+                // rho defaults to 1 when the caller supplies none, which is OF's INCOMPRESSIBLE form
+                // (dimensions p/rho). A compressible caller must pass rho: the two differ by a factor of
+                // rho, and on rhoTP that is ~1.2.
+                const scalar rw = i < (label)rhob.size() ? rhob[i] : scalar(1);
+                v[i] = p0 - scalar(0.5) * rw * (inflow ? scalar(1) : scalar(0)) * u2;
+            }
+            this->setStoredValues(std::move(v));
+        }
+    }
+
+private:
+    std::vector<T>      p0_;
+    std::vector<scalar> phi_;
 };
 
 // surfaceNormalFixedValue / uniformNormalFixedValue (velocity U only): U_b = refValue * face_normal
@@ -219,15 +468,59 @@ public:
               (valueUniform || !values.empty()) ? valueUniform : false,
               uniformValue,
               (valueUniform || !values.empty()) ? values : build(p, flowRate, isMass, rhoInlet)),
-          isMass_(isMass), flowRate_(flowRate)
+          isMass_(isMass),
+          flowRate_(flowRate),
+          hadValue_(valueUniform || !values.empty())
     {}
+
+    void updateAtConstruction(const std::vector<scalar>& rhop) override
+    {
+        if (hadValue_) return;      // OF keeps the case's `value` until the first momentum assembly
+        updateFromDensity(rhop);
+    }
     // 9 = flowRateInletVelocity: refValue recomputed per step from the live boundary rho (mass form only).
     int bcCategory() const override { return isMass_ ? 9 : 1; }
     scalar flowRateValue() const override { return flowRate_; }
 
+    // OF updateValues(rho), verbatim. Called where OpenFOAM calls updateCoeffs -- when the momentum
+    // equation is assembled -- so the inlet moves with the solution instead of staying at the seed the
+    // constructor built. The VOLUMETRIC branch is recomputed too: OF passes one{} rather than skipping,
+    // which matters when a case supplies both `volumetricFlowRate` and a `value` that disagrees with it.
+    void updateFromDensity(const std::vector<scalar>& rhop) override
+    {
+        const label n = this->patch_.size;
+        if (n == 0) return;
+        // REFUSE rather than treat a missing density as 1. Silently using the volumetric form for a
+        // massFlowRate inlet rescales the whole inlet by rho, which is the shape of the angledDuct defect.
+        if (isMass_ && rhop.size() < static_cast<std::size_t>(n))
+        {
+            throw std::runtime_error(
+                std::string("flowRateInletVelocity on patch '") + this->patch_.name
+                + "': massFlowRate needs rho on every face of the patch, and was given fewer. "
+                  "Refusing rather than falling back to a density this case did not ask for.");
+        }
+        scalar sumRhoA = 0.0;
+        for (label i = 0; i < n; ++i)
+        {
+            sumRhoA += (isMass_ ? rhop[i] : scalar(1)) * this->patch_.magSf[i];
+        }
+        if (!(sumRhoA > 0.0))
+        {
+            throw std::runtime_error(
+                std::string("flowRateInletVelocity on patch '") + this->patch_.name
+                + "': gSum(rho*magSf) is not positive, so no inlet velocity can be formed from the "
+                  "prescribed flow rate.");
+        }
+        const scalar avgU = -flowRate_ / sumRhoA;
+        std::vector<vector> v(n);
+        for (label i = 0; i < n; ++i) v[i] = avgU * this->patch_.nf[i];
+        this->setStoredValues(std::move(v));
+    }
+
 private:
     bool   isMass_;
     scalar flowRate_ = 0.0;
+    bool   hadValue_ = false;
 
     static std::vector<vector> build(
         const FvPatch& p,
@@ -247,10 +540,14 @@ private:
     }
 };
 
-// timeVaryingMappedFixedValue: a fixedValue whose per-face value is the external boundaryData profile MAPPED onto the
-// faces, NEAREST data point to each face centre (exact when the data is finer than the mesh, as in pitzDailyExptInlet's
-// 70-point inlet profile). Time interpolation / offset / setAverage not applied (steady; offset 0, setAverage off here).
-// bcCategory()=1. Works for scalar (k/epsilon) and vector (U).
+// timeVaryingMappedFixedValue: a fixedValue whose per-face value is the external boundaryData profile
+// MAPPED onto the faces. The DEFAULT mapping is OF's PLANAR Delaunay interpolation
+// (pointToPointPlanarInterpolation -- planar_interpolation.cuh carries the pipeline and its bounds);
+// `mapMethod nearest` selects the matchPoints copy this class used to run for EVERYTHING. That
+// substitution's old justification ("exact when the data is finer than the mesh") was FALSE on the
+// case it named: pitzDailyExptInlet's 70 points are 35 y-stations duplicated at two z, OF
+// interpolates linearly in y, nearest staircases to the closest station. A constant `offset` is added
+// after mapping (MappedFile.C:743-747). bcCategory()=1. Scalar (k/epsilon) and vector (U).
 template <typename T>
 class TimeVaryingMappedPatchField : public FixedValuePatchField<T>
 {
@@ -258,9 +555,38 @@ public:
     TimeVaryingMappedPatchField(
         const FvPatch& p,
         const std::vector<vector>& pts,
-        const std::vector<T>& vals)
-        : FixedValuePatchField<T>(p, false, T{}, mapNearest(p, pts, vals)) {}
+        const std::vector<T>& vals,
+        bool nearest,
+        bool hasOffset,
+        const T& offset)
+        : FixedValuePatchField<T>(p, false, T{},
+                                  applyOffset(nearest ? mapNearest(p, pts, vals)
+                                                      : mapPlanar(p, pts, vals),
+                                              hasOffset, offset)) {}
 private:
+    static std::vector<T> applyOffset(std::vector<T> v, bool has, const T& off)
+    {
+        if (has) for (T& x : v) x = x + off;
+        return v;
+    }
+    static std::vector<T> mapPlanar(
+        const FvPatch& p,
+        const std::vector<vector>& pts,
+        const std::vector<T>& vals)
+    {
+        const std::vector<vector> dst(p.Cf.begin(), p.Cf.begin() + p.size);
+        const std::vector<planarInterp::Weights> W = planarInterp::planarWeights(pts, dst);
+        std::vector<T> v(p.size);
+        for (label i = 0; i < p.size; ++i)
+        {
+            const planarInterp::Weights& w = W[static_cast<std::size_t>(i)];
+            T acc{};
+            for (int k = 0; k < 3; ++k)
+                acc = acc + vals[static_cast<std::size_t>(w.j[k])] * w.w[k];
+            v[static_cast<std::size_t>(i)] = acc;
+        }
+        return v;
+    }
     static std::vector<T> mapNearest(
         const FvPatch& p,
         const std::vector<vector>& pts,
@@ -299,6 +625,23 @@ public:
         this->value_ = this->patchInternalField(internal);
     }
     bool fixesValue() const override { return false; }
+    // OF zeroGradientFvPatchField::snGrad() returns a ZERO field (its .H), not a difference between a
+    // stored value and the cell: identically zero even when the cell has moved since the last evaluate.
+    std::vector<T> snGrad(const std::vector<T>&) const override
+    {
+        return std::vector<T>(static_cast<std::size_t>(this->patch_.size), T{});
+    }
+};
+
+// epsilonWallFunction: a zeroGradient boundary value, with the near-wall CELL constrained separately by
+// the turbulence model (setValues) and the production there replaced. The class exists only so the model
+// can tell which patches carry it -- see isTurbulenceWallFunction above. omegaWallFunction maps here too.
+template <typename T>
+class EpsilonWallFunctionPatchField : public ZeroGradientPatchField<T>
+{
+public:
+    explicit EpsilonWallFunctionPatchField(const FvPatch& p) : ZeroGradientPatchField<T>(p) {}
+    bool isTurbulenceWallFunction() const override { return true; }
 };
 
 // fixedGradient: the normal gradient is prescribed, the value follows.
@@ -329,37 +672,131 @@ public:
             this->value_[i] = pif[i] + grad_[i] / this->patch_.deltaCoeffs[i];
     }
     bool fixesValue() const override { return false; }          // the VALUE is not fixed; the gradient is
+    // OF fixedGradientFvPatchField::snGrad() returns gradient_ (its .H) -- the prescribed gradient, not
+    // one re-derived from a value that may predate the last time the solver set it. fixedFluxPressure
+    // derives from this and has its gradient overwritten by constrainPressure every assembly.
+    std::vector<T> snGrad(const std::vector<T>&) const override { return grad_; }
     const std::vector<T>* refGradPtr() const override { return &grad_; }
+
+    // THE BOUNDARY COEFFICIENTS, which this class described and did not implement. The comment above has
+    // named them since it was written -- valueBoundaryCoeffs = g/deltaCoeffs, gradientBoundaryCoeffs = g,
+    // citing fixedGradientFvPatchField.C -- while the class overrode only evaluate(), fixesValue() and
+    // refGradPtr(), so both fell through to the BASE, which returns zeros and documents itself as
+    // "Default (zeroGradient/empty/calculated) contributes nothing".
+    //
+    // The consequence was that on the HOST every fixedGradient patch was discretised as zeroGradient:
+    // fvm::laplacian and fvc::snGrad build their patch contribution from exactly these two, so a
+    // prescribed gradient reached the matrix nowhere. The DEVICE path has carried it correctly all along
+    // through DeviceBoundary::refGrad and is gated against OpenFOAM at 1.3e-15
+    // (validation/bc_vs_openfoam.sh), so the two lineages disagreed on the same boundary condition.
+    //
+    // OF: fixedGradientFvPatchField.C:216 and :232.
+    std::vector<T> valueBoundaryCoeffs() const override
+    {
+        std::vector<T> v(static_cast<std::size_t>(this->patch_.size));
+        for (label i = 0; i < this->patch_.size; ++i)
+            v[static_cast<std::size_t>(i)] =
+                grad_[static_cast<std::size_t>(i)] / this->patch_.deltaCoeffs[i];
+        return v;
+    }
+    std::vector<T> gradientBoundaryCoeffs() const override { return grad_; }
+
+protected:
+    std::vector<T> grad_;   // writable by fixedFluxPressure's updateSnGrad
 
 private:
     bool uniform_;
     T gUniform_;
     std::vector<T> gValues_;
-    std::vector<T> grad_;
 };
 
-// noSlip: fixed zero (velocity wall).
+// fixedFluxPressure (OF fixedFluxPressureFvPatchScalarField): a fixedGradient p whose gradient the
+// SOLVER sets every pressure assembly -- constrainPressure.C:60-77 computes
+//     snGrad = (phiHbyA_b - rho_b*MRF.relative(Sf_b & U_b)) / (magSf_b * rhorAU_b)
+// and hands it to updateSnGrad; the BC itself carries no formula. A driver that builds it and never
+// calls updateSnGrad runs a stale (usually zero) gradient under this name, which OpenFOAM makes a
+// FatalError ("updateSnGrad MUST be called before updateCoeffs()",
+// fixedFluxPressureFvPatchScalarField.C:150-163) -- and so does this class, at coefficient time.
+// It replaced a silent factory mapping to zeroGradient that the OF-mirror envelopes had to refuse
+// around by substring. evaluate() stays unguarded on purpose: OF evaluates the construction-time
+// gradient (the file's, or zero) before any solve, and so must brae's evaluateBoundary passes.
+class FixedFluxPressurePatchField : public FixedGradientPatchField<scalar>
+{
+public:
+    using FixedGradientPatchField<scalar>::FixedGradientPatchField;
+    bool updateableSnGrad() const override { return true; }
+    void updateSnGrad(const std::vector<scalar>& g) override
+    {
+        // OF guards re-entry with a per-timeIndex updated() flag; the mirror calls this exactly once
+        // per assembly, so only the never-called refusal below is reproduced -- that is the failure
+        // that actually occurs (a driver without constrainPressure).
+        grad_ = g;
+        everUpdated_ = true;
+    }
+    std::vector<scalar> valueInternalCoeffs() const override
+    { requireUpdated(); return FixedGradientPatchField<scalar>::valueInternalCoeffs(); }
+    std::vector<scalar> valueBoundaryCoeffs() const override
+    { requireUpdated(); return FixedGradientPatchField<scalar>::valueBoundaryCoeffs(); }
+    std::vector<scalar> gradientInternalCoeffs() const override
+    { requireUpdated(); return FixedGradientPatchField<scalar>::gradientInternalCoeffs(); }
+    std::vector<scalar> gradientBoundaryCoeffs() const override
+    { requireUpdated(); return FixedGradientPatchField<scalar>::gradientBoundaryCoeffs(); }
+
+private:
+    void requireUpdated() const
+    {
+        if (!everUpdated_)
+            throw std::runtime_error(
+                "brae: fixedFluxPressure patch '" + this->patch_.name + "' reached the pressure "
+                "assembly without updateSnGrad() -- this driver never ran constrainPressure, so the "
+                "prescribed-flux gradient would be stale or zero under the boundary's name. OpenFOAM "
+                "fatals identically (fixedFluxPressureFvPatchScalarField.C:150-163).");
+    }
+    bool everUpdated_ = false;
+};
+
+// noSlip: a fixedValue velocity wall whose value STARTS at zero -- which is not the same thing as a
+// wall whose value IS zero, and the difference is not academic.
+//
+// OpenFOAM's noSlipFvPatchVectorField derives from fixedValueFvPatchVectorField with no updateCoeffs
+// override, and fixedValue's coefficients are built from *this -- the LIVE patch value. MRFZone::
+// correctBoundaryVelocity then writes Omega x (Cf - origin) onto exactly such patches with
+// `Ubf[patchi] == pfld`, and operator== assigns the underlying Field whatever assignable() says (that
+// is why OpenFOAM uses == there and not =). So under MRF the rotor wall genuinely MOVES.
+//
+// This class used to return a hardcoded zero from the base valueBoundaryCoeffs and re-zero value_ on
+// every evaluate(), i.e. it baked in "this wall is stationary". Correct for every case that does not
+// rotate, and wrong for every case that does: on mixerVessel2D it put 93.8% of the whole momentum
+// residual on the rotor patch. For a wall that never gets assigned, value_ stays zero and every
+// coefficient below is identical to what the hardcoded version produced.
 template <typename T>
 class NoSlipPatchField : public fvPatchField<T>
 {
 public:
+    bool assignable() const override { return false; }   // OF fixedValueFvPatchField.H:169
     explicit NoSlipPatchField(const FvPatch& p) : fvPatchField<T>(p) {}
-    void evaluate(const std::vector<T>&) override
-    {
-        for (label i = 0; i < this->patch_.size; ++i)
-            this->value_[i] = T{};
-    }
+    // fixedValue's evaluate does NOT re-establish the value -- the field IS the value. Zeroing here
+    // would discard whatever correctBoundaryVelocity just wrote.
+    void evaluate(const std::vector<T>&) override {}
     bool fixesValue() const override { return true; }
     int  bcCategory() const override { return 1; }
 
-    std::vector<T> gradientInternalCoeffs() const override        // -deltaCoeffs (refValue 0)
+    std::vector<T> gradientInternalCoeffs() const override        // -deltaCoeffs
     {
         std::vector<T> r(this->patch_.size);
         for (label i = 0; i < this->patch_.size; ++i)
             r[i] = tUniform<T>(-this->patch_.deltaCoeffs[i]);
         return r;
     }
+    std::vector<T> gradientBoundaryCoeffs() const override        // deltaCoeffs * the LIVE value
+    {
+        std::vector<T> r(this->patch_.size);
+        for (label i = 0; i < this->patch_.size; ++i)
+            r[i] = this->value_[i] * this->patch_.deltaCoeffs[i];
+        return r;
+    }
     std::vector<T> valueInternalCoeffs() const override { return std::vector<T>(this->patch_.size, T{}); } // 0
+    std::vector<T> valueBoundaryCoeffs() const override { return this->value_; }
 };
 
 // empty: 2D front/back. Value tracks the internal field (the out-of-plane component is zero,
@@ -387,25 +824,151 @@ template <typename T>
 class SymmetryPlanePatchField : public fvPatchField<T>
 {
 public:
+    bool assignable() const override { return false; }   // OF: symmetry is a transform patch field
     explicit SymmetryPlanePatchField(const FvPatch& p) : fvPatchField<T>(p) {}
+
+    // OF basicSymmetryFvPatchField. For a SCALAR the normal gradient is zero and this is zeroGradient,
+    // which is what the base coefficients already give. For a VECTOR it is a TRANSFORM patch field and
+    // neither the value nor the coefficients are the scalar ones:
+    //
+    //   evaluate:  value = (iF + transform(I - 2*sqr(n), iF))/2 = iF - (n & iF)*n   (the TANGENTIAL part)
+    //   snGrad  =  (transform(I - 2*sqr(n), iF) - iF)*deltaCoeffs/2 = -(n & iF)*n*deltaCoeffs
+    //
+    // and, from transformFvPatchField.C with snGradTransformDiag = cmptMag(nf)
+    // (basicSymmetryFvPatchField.C:121-126):
+    //
+    //   valueInternalCoeffs    =  1 - cmptMag(n)
+    //   valueBoundaryCoeffs    =  value - cmptMultiply(valueInternalCoeffs, iF)
+    //   gradientInternalCoeffs = -deltaCoeffs*cmptMag(n)
+    //   gradientBoundaryCoeffs =  snGrad - cmptMultiply(gradientInternalCoeffs, iF)
+    //
+    // This class used to return the scalar value for every type and the BASE coefficients (1, 0, 0, 0),
+    // so a slip patch on a vector field got the full internal velocity and a matrix contribution that
+    // ignored the plane entirely. It is invisible to any gate that compares FIELDS, because OpenFOAM
+    // writes no `value` for a transform patch; angledDuct's momentum coefficients found it at exactly
+    // 1.0 on the slip patch with every other patch at 1e-14.
     void evaluate(const std::vector<T>& internal) override
     {
-        this->value_ = this->patchInternalField(internal);     // scalar: zeroGradient
+        pif_ = this->patchInternalField(internal);
+        if constexpr (std::is_same<T, vector>::value)
+        {
+            this->value_.resize(this->patch_.size);
+            for (label i = 0; i < this->patch_.size; ++i)
+            {
+                const vector& n = this->patch_.nf[i];
+                const scalar nd = n.x*pif_[i].x + n.y*pif_[i].y + n.z*pif_[i].z;
+                this->value_[i] = vector{ pif_[i].x - nd*n.x,
+                                          pif_[i].y - nd*n.y,
+                                          pif_[i].z - nd*n.z };
+            }
+        }
+        else
+        {
+            this->value_ = pif_;                               // scalar: zeroGradient
+        }
     }
+
+    std::vector<T> valueInternalCoeffs() const override
+    {
+        if constexpr (!std::is_same<T, vector>::value)
+        {
+            return fvPatchField<T>::valueInternalCoeffs();
+        }
+        else
+        {
+        std::vector<T> r(this->patch_.size);
+        for (label i = 0; i < this->patch_.size; ++i)
+        {
+            const vector& n = this->patch_.nf[i];
+            r[i] = vector{ 1.0 - std::fabs(n.x), 1.0 - std::fabs(n.y), 1.0 - std::fabs(n.z) };
+        }
+        return r;
+        }
+    }
+
+    std::vector<T> valueBoundaryCoeffs() const override
+    {
+        if constexpr (!std::is_same<T, vector>::value)
+        {
+            return fvPatchField<T>::valueBoundaryCoeffs();
+        }
+        else
+        {
+        const std::vector<T> vic = valueInternalCoeffs();
+        std::vector<T> r(this->patch_.size);
+        for (label i = 0; i < this->patch_.size; ++i)
+        {
+            const T& p = pifAt(i);
+            r[i] = vector{ this->value_[i].x - vic[i].x*p.x,
+                           this->value_[i].y - vic[i].y*p.y,
+                           this->value_[i].z - vic[i].z*p.z };
+        }
+        return r;
+        }
+    }
+
+    std::vector<T> gradientInternalCoeffs() const override
+    {
+        if constexpr (!std::is_same<T, vector>::value)
+        {
+            return fvPatchField<T>::gradientInternalCoeffs();
+        }
+        else
+        {
+        std::vector<T> r(this->patch_.size);
+        for (label i = 0; i < this->patch_.size; ++i)
+        {
+            const vector& n = this->patch_.nf[i];
+            const scalar dc = this->patch_.deltaCoeffs[i];
+            r[i] = vector{ -dc*std::fabs(n.x), -dc*std::fabs(n.y), -dc*std::fabs(n.z) };
+        }
+        return r;
+        }
+    }
+
+    std::vector<T> gradientBoundaryCoeffs() const override
+    {
+        if constexpr (!std::is_same<T, vector>::value)
+        {
+            return fvPatchField<T>::gradientBoundaryCoeffs();
+        }
+        else
+        {
+        const std::vector<T> gic = gradientInternalCoeffs();
+        std::vector<T> r(this->patch_.size);
+        for (label i = 0; i < this->patch_.size; ++i)
+        {
+            const vector& n = this->patch_.nf[i];
+            const T& p = pifAt(i);
+            const scalar dc = this->patch_.deltaCoeffs[i];
+            const scalar nd = n.x*p.x + n.y*p.y + n.z*p.z;
+            const vector sn { -nd*n.x*dc, -nd*n.y*dc, -nd*n.z*dc };   // snGrad
+            r[i] = vector{ sn.x - gic[i].x*p.x, sn.y - gic[i].y*p.y, sn.z - gic[i].z*p.z };
+        }
+        return r;
+        }
+    }
+
     bool fixesValue() const override { return false; }
     bool isSymmetry() const override { return true; }
+
+private:
+    // The patch internal field, cached at evaluate(). OpenFOAM's coefficient methods call
+    // patchInternalField() directly; brae's take no arguments, so it is kept here instead.
+    std::vector<T> pif_;
+    const T& pifAt(label i) const
+    {
+        static const T zero{};
+        return (i < static_cast<label>(pif_.size())) ? pif_[i] : zero;
+    }
 };
 
-// vector: remove the wall-normal component (value = v - n (n.v)).
-template <> inline void SymmetryPlanePatchField<vector>::evaluate(const std::vector<vector>& internal)
-{
-    for (label i = 0; i < this->patch_.size; ++i)
-    {
-        const vector v = internal[this->patch_.faceCells[i]];
-        const vector n = this->patch_.nf[i];
-        this->value_[i] = v - n * dot(n, v);
-    }
-}
+// The vector case used to live here as an explicit specialization. It computed the right VALUE
+// (v - n(n.v)) but nothing else, so it silently shadowed the in-class evaluate above -- which is the one
+// that caches the patch internal field the four transform coefficients are built from. The value agreed
+// with OpenFOAM while every coefficient was computed against a zero internal field: valueBoundaryCoeffs
+// came out equal to value_ and gradientBoundaryCoeffs came out exactly zero. Kept as a comment because
+// "the value is right so evaluate() is right" is what made this take a while to find.
 
 // wedge (OF wedgeFvPatchField) -- the AXISYMMETRIC constraint patch. The mesh is one cell thick in the
 // azimuthal direction and the two bounding planes are related by a rotation about the symmetry axis, so
@@ -425,6 +988,7 @@ template <typename T>
 class WedgePatchField : public fvPatchField<T>
 {
 public:
+    bool assignable() const override { return false; }   // OF: wedge is a transform patch field
     WedgePatchField(const FvPatch& p, const tensor& faceT, const tensor& cellT)
         : fvPatchField<T>(p), faceT_(faceT), cellT_(cellT) {}
     void evaluate(const std::vector<T>& internal) override
@@ -475,9 +1039,26 @@ public:
         for (label i = 0; i < this->patch_.size; ++i)
             this->value_[i] = refValue(i);
     }
+    std::vector<T> refValues() const override
+    {
+        std::vector<T> r(this->patch_.size);
+        for (label i = 0; i < this->patch_.size; ++i) r[i] = refValue(i);
+        return r;
+    }
     bool fixesValue() const override { return false; }
 protected:
     T refValue(label i) const { return uniform_ ? uniformValue_ : (values_.empty() ? T{} : values_[i]); }
+
+public:
+    // OF writes `this->refValue() = ...`; the turbulent inlets do it every updateCoeffs.
+    void setRefValues(std::vector<T> v) { uniform_ = false; values_ = std::move(v); }
+    void setStoredValues(std::vector<T> v) override
+    {
+        setRefValues(std::move(v));
+        evaluate({});
+    }
+
+protected:
     bool           uniform_;
     T              uniformValue_;
     std::vector<T> values_;
@@ -492,6 +1073,174 @@ public:
     int bcCategory() const override { return 2; }
 };
 
+// nutUSpaldingWallFunction: a `calculated` value as far as the matrix is concerned, but one the turbulence
+// model has to recompute from the velocity every correctNut rather than overwrite. Same shape as the
+// device's deviceBoundaryNutSpalding; this only makes the patch identifiable on the host.
+template <typename T>
+class NutUSpaldingPatchField : public CalculatedPatchField<T>
+{
+public:
+    using CalculatedPatchField<T>::CalculatedPatchField;
+    bool isNutUSpalding() const override { return true; }
+};
+
+// mixed (Robin) BC, OF mixedFvPatchField (refGrad = 0). value = (1-vf)*internal + vf*refValue; the per-face
+// valueFraction vf blends linearly between zeroGradient (vf=0) and fixedValue (vf=1) in BOTH the value and the
+// matrix coeffs (gradientInternalCoeffs = -vf*dc, valueInternalCoeffs = 1-vf, etc.). freestreamVelocity /
+// freestreamPressure are mixed with vf = 0.5 -/+ 0.5*(U.n)/|U| (continuous flow-angle blend, NOT the binary
+// inletOutlet switch). OF mixedFvPatchField::fixesValue() == true -> references the pressure (needReference false).
+// The valueFraction is NOT a constant for the freestream family: OF recomputes it every updateCoeffs from
+// the flow angle, and updateMixedFreestream below is the host form of that (the device has
+// deviceUpdateMixedFreestream). Leaving it at the seed 0.5 makes every far-field face a half-and-half
+// blend regardless of whether it is inflow or outflow, which on a case whose whole far field is
+// freestream -- airFoil2D -- measured 665x on the momentum residual and 3551x on pressure against
+// OpenFOAM's own converged state.
+template <typename T>
+class MixedPatchField : public ExtrapolatedValuePatchField<T>     // value() = refValue (freestreamValue); base evaluate() sets it
+{
+public:
+    bool assignable() const override { return false; }   // OF: mixed
+    MixedPatchField(
+        const FvPatch& p,
+        bool uniform,
+        T uval,
+        std::vector<T> vals,
+        bool velocitySign,
+        // The freestream family (freestreamVelocity/freestreamPressure) is the one whose valueFraction
+        // brae actually maintains -- see evaluate() for why that gates the blend.
+        bool freestream = false,
+        // The file's own `value` entry, per face, when it had one. OF's mixed constructor READS it and
+        // does not re-evaluate, so a restart resumes with the field OpenFOAM wrote rather than with a
+        // blend of a valueFraction no iteration has computed yet. refValue stays freestreamValue; only
+        // value() carries this, which is why the device builder had to be taught to ask for the
+        // reference explicitly (refValues()) instead of reading value().
+        std::vector<T> readValue = {})
+        : ExtrapolatedValuePatchField<T>(p, uniform, uval, std::move(vals)),
+          velocitySign_(velocitySign), freestream_(freestream), vf_(p.size, 0.5)
+    {
+        if (readValue.size() == static_cast<std::size_t>(p.size)) this->value_ = std::move(readValue);
+    }
+    bool fixesValue() const override { return true; }               // OF mixedFvPatchField::fixesValue() == true
+    int  bcCategory() const override { return 5; }                  // device: mixed (per-face valueFraction blend)
+
+    // OF mixedFvPatchField::evaluate -- a BLEND, not the refValue:
+    //     value = lerp(patchInternalField + refGrad/deltaCoeffs, refValue, valueFraction)
+    // Taking refValue outright puts a far-field patch at freestreamValue everywhere instead of the field
+    // OpenFOAM converges to; on airFoil2D its inlet p runs 0.74 to -1.77 across the patch, and the
+    // pressure residual at OpenFOAM's own converged state was 17x worse without this.
+    //
+    // GATED ON `freestream_`, and the reason is not caution. OF's evaluate calls updateCoeffs() FIRST, and
+    // the other shape this class serves -- the `mixed` T patch basicThermo maps onto mixedEnergy --
+    // overrides updateCoeffs to rebuild refValue/refGrad/valueFraction in ENERGY space from the thermo.
+    // brae carries no such conversion, so its seeded valueFraction is not the one OF blends with, and
+    // blending on it measurably disagrees (mx_vs_openfoam, hotWall: OF 467.8 against a blended 367.9).
+    // The freestream family is maintained -- updateMixedFreestream rewrites vf from the flow angle every
+    // iteration -- so the blend runs exactly where its inputs are real.
+    void evaluate(const std::vector<T>& internal) override
+    {
+        // OF's evaluate calls updateCoeffs() FIRST, and for this family updateCoeffs IS the flow-angle
+        // valueFraction -- so a blend is only defined once that has run. Until then (construction, and the
+        // evaluateBoundary that follows a field read) the value stands as read: on a restart the file's
+        // `value` is already OpenFOAM's converged blend, and re-blending it against the 0.5 seed threw it
+        // away (restart_vs_openfoam, p L2rel 4.8e-03 against a 1e-03 bound).
+        // The gate is `vfUpdated_`, NOT the family. What makes the blend defined is whether a REAL
+        // valueFraction has been computed for these faces: the freestream family gets one from
+        // updateMixedFreestream, and inletOutlet/outletInlet get one from updateFromFlux. The plain
+        // `mixed`/mixedEnergy shape sets neither -- brae carries no thermo conversion for it -- so it
+        // still falls through here and keeps the value as read, exactly as before.
+        (void)freestream_;
+        if (!vfUpdated_ || internal.empty()) return;
+
+        const std::vector<T> pif = this->patchInternalField(internal);
+        for (label i = 0; i < this->patch_.size; ++i)
+        {
+            T inner = pif[i];
+            if (!refGrad_.empty()) inner = inner + refGrad_[i] * (1.0 / this->patch_.deltaCoeffs[i]);
+            this->value_[i] = inner * (1.0 - vf_[i]) + this->refValue(i) * vf_[i];
+        }
+    }
+    const std::vector<scalar>* valueFractionPtr() const override { return &vf_; }
+    // mixedEnergy / an external-convection wall carries refGradient beside refValue. Stored per face and
+    // handed to DeviceBoundary::refGrad through the same hook fixedGradient uses (B5); the kernels apply
+    // OF's (1-vf) weight, so a mixed patch with refGradient 0 stays bit-identical to before.
+    const std::vector<T>* refGradPtr() const override { return refGrad_.empty() ? nullptr : &refGrad_; }
+    void setRefGrad(std::vector<T> g) { refGrad_ = std::move(g); }
+    // A plain `mixed` patch STATES its valueFraction; only the freestream family recomputes it per step.
+    // Recording that it HAS been recomputed is what licenses evaluate() to blend -- see there.
+    void setValueFraction(std::vector<scalar> f)
+    {
+        vf_ = std::move(f);
+        vfUpdated_ = true;
+    }
+    bool mixedVelocitySign() const override { return velocitySign_; }
+    // OF mixed coeffs with refGrad = 0 (host correctness; the device blends the same way in its kernels):
+    // OF mixedFvPatchField::snGrad() = lerp(refGrad, (refValue - patchInternalField)*deltaCoeffs,
+    // valueFraction) -- built here from the coefficients, which OF defines to sum to exactly that. THE
+    // valueFraction IS THE CURRENT ONE, which is the whole point: value() still carries the blend of the
+    // previous one until the next evaluate. See fvPatchField::snGrad above for what that cost on naca0012.
+    std::vector<T> snGrad(const std::vector<T>& internal) const override
+    {
+        return this->snGradFromCoeffs(internal);
+    }
+    std::vector<T> gradientInternalCoeffs() const override        // -vf*deltaCoeffs
+    {
+        std::vector<T> r(this->patch_.size);
+        for (label i = 0; i < this->patch_.size; ++i)
+            r[i] = tUniform<T>(-vf_[i] * this->patch_.deltaCoeffs[i]);
+        return r;
+    }
+    // OF mixedFvPatchField.C: lerp(refGrad, deltaCoeffs*refValue, vf) = (1-vf)*refGrad + vf*dc*refValue.
+    // The (1-vf)*refGrad half was missing here and from valueBoundaryCoeffs below, while evaluate() above
+    // DID carry it -- so the patch VALUE was right and the coefficients it hands the matrix were not.
+    // Measured against OpenFOAM's own dumped coefficients on validation/bcoeffBox's `mixed` patch:
+    // 1.822e-01 before, machine precision after. The device path was already correct, so this was the
+    // same host-only hole as FixedGradientPatchField's, in the class next door.
+    std::vector<T> gradientBoundaryCoeffs() const override        // (1-vf)*refGrad + vf*deltaCoeffs*refValue
+    {
+        std::vector<T> r(this->patch_.size);
+        for (label i = 0; i < this->patch_.size; ++i)
+        {
+            r[i] = this->refValue(i) * (vf_[i] * this->patch_.deltaCoeffs[i]);
+            if (!refGrad_.empty()) r[i] = r[i] + refGrad_[i] * (1.0 - vf_[i]);
+        }
+        return r;
+    }
+    std::vector<T> valueInternalCoeffs() const override           // 1-vf
+    {
+        std::vector<T> r(this->patch_.size);
+        for (label i = 0; i < this->patch_.size; ++i)
+            r[i] = tUniform<T>(1.0 - vf_[i]);
+        return r;
+    }
+    // OF: lerp(refGrad/deltaCoeffs, refValue, vf) = (1-vf)*refGrad/deltaCoeffs + vf*refValue.
+    std::vector<T> valueBoundaryCoeffs() const override           // (1-vf)*refGrad/dc + vf*refValue
+    {
+        std::vector<T> r(this->patch_.size);
+        for (label i = 0; i < this->patch_.size; ++i)
+        {
+            r[i] = this->refValue(i) * vf_[i];
+            if (!refGrad_.empty())
+                r[i] = r[i] + refGrad_[i] * ((1.0 - vf_[i]) / this->patch_.deltaCoeffs[i]);
+        }
+        return r;
+    }
+protected:
+    // PROTECTED, not private, so a derived flux-conditional patch can SEED the valueFraction without
+    // going through setValueFraction() -- which also sets vfUpdated_, and that flag is what tells
+    // evaluate() a real blend is available. Seeding through it would make the first evaluateBoundary()
+    // after a field read blend against a fraction no iteration has computed, throwing away the value
+    // OpenFOAM wrote on a restart. The seed is a starting point; vfUpdated_ is a statement about
+    // whether the flow has been consulted, and the two are not the same thing.
+    std::vector<scalar> vf_;            // per-face valueFraction (freestream seed 0.5; flux-conditional 0)
+
+private:
+    bool                velocitySign_;  // true: vf=0.5-0.5 U.n/|U| (velocity); false: 0.5+0.5 ... (pressure)
+    bool                freestream_;    // this class also serves the plain `mixed`/mixedEnergy shape
+    bool                vfUpdated_ = false;   // has a real valueFraction been computed yet?
+
+    std::vector<T> refGrad_;
+};
+
 // inletOutlet: flux-conditional mix (OF mixed, valueFraction = neg(phi), refValue = inletValue, refGrad = 0).
 // Per face: inflow (phi<0) -> fixedValue = inletValue; outflow (phi>=0) -> zeroGradient. The host evaluate()
 // does not see the flux; the DEVICE recomputes the per-face fixedValue|zeroGradient choice every iteration from
@@ -499,20 +1248,197 @@ public:
 // bcCategory()=3 marks the face inletOutlet for the device builder. (Device-resident solver path; the host CPU
 // assembly path treats category 3 as its zeroGradient base default, see scope in PORTING_INLETOUTLET_BC.md.)
 template <typename T>
-class InletOutletPatchField : public ExtrapolatedValuePatchField<T>   // value()/refValue = inletValue
+class InletOutletPatchField : public MixedPatchField<T>   // value()/refValue = inletValue
 {
 public:
-    using ExtrapolatedValuePatchField<T>::ExtrapolatedValuePatchField;
+    // TRUE, and this is NOT an oversight in OpenFOAM. mixedFvPatchField::assignable() is false
+    // (mixedFvPatchField.H:200), but inletOutletFvPatchField OVERRIDES it back to true
+    // (inletOutletFvPatchField.H:163-164) -- "True: this patch field is altered by assignment".
+    // outletInlet, which also derives from mixed, does NOT override and so really is false; the two
+    // differ on purpose. Inferring this from the base class instead of reading the derived one made
+    // constrainHbyA take U at every inletOutlet patch, which OpenFOAM does not do: measured on
+    // rhoSimpleFoam's pcEqn, HbyA's boundary was 1.3e-03 out and the resulting phiHbyA 3.5e-03, while the
+    // internal field was exact to 1.4e-15.
+    bool assignable() const override { return true; }    // OF inletOutletFvPatchField.H:164
+    bool isInletOutlet() const override { return true; }
+    // The mixed base takes a velocity-sign flag and a freestream flag for the far-field family; neither
+    // applies here, so the flux-conditional families get their own four-argument constructor and the
+    // valueFraction comes from updateFromFlux instead.
+    InletOutletPatchField(
+        const FvPatch& p,
+        bool uniform,
+        T uval,
+        std::vector<T> vals)
+        : MixedPatchField<T>(p, uniform, uval, std::move(vals), /*velocitySign=*/true)
+    {
+        // SEED THE VALUE FRACTION AT ZERO, not at the mixed base's 0.5. That 0.5 is the FREESTREAM
+        // seed -- a half-and-half flow-angle blend waiting for updateMixedFreestream -- and it is
+        // meaningless for a flux-conditional patch, which is either fully zeroGradient or fully
+        // fixedValue per face and never in between. Zero is the outflow branch, which is what this
+        // patch behaved as before it became mixed, so a field whose flux has not been pushed in yet is
+        // unchanged rather than half-fixed. Getting this wrong reports valueInternalCoeffs = 0.5 where
+        // OpenFOAM has 1, which measured 2.8e-01 on the momentum internalCoeffs.
+        this->vf_.assign(p.size, 0.0);
+    }
+
+    // inletOutletFvPatchField::updateCoeffs -- valueFraction = neg(phi): 1 where the flux ENTERS the
+    // domain (fixedValue on inletValue), 0 where it leaves (zeroGradient). `neg`, not `1 - pos0`: they
+    // agree everywhere except at phi exactly 0, where OpenFOAM takes the outflow branch.
+    void updateFromFlux(const std::vector<scalar>& phip) override
+    {
+        std::vector<scalar> vf(this->patch_.size, 0.0);
+        for (label i = 0; i < this->patch_.size && i < (label)phip.size(); ++i)
+            vf[i] = (phip[i] < 0.0) ? 1.0 : 0.0;
+        this->setValueFraction(std::move(vf));
+    }
     int bcCategory() const override { return 3; }                  // inletOutlet (device: per-face fixedValue|zeroGradient)
 };
+
+// The two RAS inlets that derive from inletOutlet in OpenFOAM and recompute their refValue every
+// updateCoeffs. They differ from a plain inletOutlet in exactly that: the flux switch is the base's, the
+// inflow VALUE is not read from the case file but computed from the current U (for k) or the current k
+// (for epsilon/omega). Reading the file's `value` and keeping it is what a solver does when it never calls
+// updateCoeffs, and it leaves the inlet frozen at whatever state the case was written in.
+//   turbulentIntensityKineticEnergyInletFvPatchScalarField.C:      refValue = 1.5*sqr(intensity)*magSqr(Up)
+//   turbulentMixingLengthDissipationRateInletFvPatchScalarField.C: refValue = (Cmu^0.75/L)*pow(kp, 1.5)
+//   turbulentMixingLengthFrequencyInletFvPatchScalarField.C:       refValue = sqrt(kp)/(Cmu^0.25*L)
+//
+// WHOSE Cmu. Queue item 13d read these as taking their own patch `Cmu`; the source says the model's
+// comes first. The dissipation inlet reads a patch `Cmu` (default 0.09) at construction
+// (...DissipationRateInlet...C:91) and then, every updateCoeffs, replaces it with the turbulence
+// model's coeffDict entry when there is one (:149, `coeffDict().getOrDefault("Cmu", Cmu_)`; the header
+// spells the precedence out at .H:84-85). The frequency inlet never reads a patch entry:
+// `coeffDict().getOrDefault("Cmu", 0.09)` (...FrequencyInlet...C:137-138). Neither reads betaStar.
+// kEpsilon's constructor ADDS Cmu to its coeffDict (kEpsilon.C:102-108 getOrAddToDict, which writes the
+// default into the dict when absent, dimensionedType.C:389), so under kEpsilon the patch entry is dead
+// and the inlet's Cmu is the model's; kOmegaSST adds none, so the omega inlet takes kOmegaSSTCoeffs
+// { Cmu } or 0.09 -- brae handed it betaStar, which is 0.09 at the defaults and not otherwise. Measured
+// on rhoSST at t=1 with kOmegaSSTCoeffs { Cmu 0.12; }: the inlet omega 399.30 where OpenFOAM writes
+// 371.59 (7.5e-02), the field 1.73e-03; with { betaStar 0.11; }: 379.76 against 399.30 (4.9e-02), the
+// field 1.21e-03 (tests/rho_turbinlet_cmu_vs_openfoam.sh).
+template <typename T>
+class TurbulentInletPatchField : public InletOutletPatchField<T>
+{
+public:
+    enum Kind { intensityK, mixingLengthEpsilon, mixingLengthOmega };
+
+    TurbulentInletPatchField(
+        const FvPatch& p,
+        bool           uniform,
+        T              uval,
+        std::vector<T> vals,
+        Kind           kind,
+        scalar         coefficient,
+        scalar         patchCmu)
+        : InletOutletPatchField<T>(p, uniform, uval, std::move(vals)),
+          kind_(kind),
+          coefficient_(coefficient),
+          patchCmu_(patchCmu)
+    {}
+
+    // OpenFOAM's precedence, per inlet: the model's coeffDict entry when it has one, else the patch's
+    // own (dissipation, :91/:149) or the literal 0.09 (frequency, :137-138).
+    scalar effectiveCmu(
+        scalar coeffDictCmu,
+        bool   coeffDictHasCmu) const
+    {
+        if (coeffDictHasCmu) return coeffDictCmu;
+        return (kind_ == mixingLengthEpsilon) ? patchCmu_ : scalar(0.09);
+    }
+
+    void updateTurbulentInlet(
+        const std::vector<vector>& Up,
+        const std::vector<scalar>& kp,
+        scalar                     coeffDictCmu,
+        bool                       coeffDictHasCmu) override
+    {
+        if constexpr (std::is_same<T, scalar>::value)
+        {
+            const scalar Cmu = effectiveCmu(coeffDictCmu, coeffDictHasCmu);
+            const bool fromU = (kind_ == intensityK);
+            const std::size_t have = fromU ? Up.size() : kp.size();
+            // REFUSE rather than fill what is missing with zeros. A short source array here would leave
+            // part of the inlet at refValue = 0 -- a silent no-turbulence inlet, which is exactly the
+            // kind of substitution that took four measurements to find the last time it happened.
+            if (have < static_cast<std::size_t>(this->patch_.size))
+            {
+                throw std::runtime_error(
+                    std::string("turbulent inlet on patch '") + this->patch_.name
+                    + "': updateCoeffs needs " + (fromU ? "U" : "k")
+                    + " on every face of the patch, and was given fewer. Refusing rather than "
+                      "computing an inlet value from a field that is not there.");
+            }
+            std::vector<scalar> r(this->patch_.size, scalar{0});
+            for (label i = 0; i < this->patch_.size; ++i)
+            {
+                if (fromU)
+                {
+                    r[i] = 1.5 * (coefficient_ * coefficient_) * magSqr(Up[i]);
+                }
+                else if (kind_ == mixingLengthEpsilon)
+                {
+                    r[i] = (std::pow(Cmu, 0.75) / coefficient_) * std::pow(kp[i], 1.5);
+                }
+                else
+                {
+                    r[i] = std::sqrt(kp[i]) / (std::pow(Cmu, 0.25) * coefficient_);
+                }
+            }
+            this->setRefValues(std::move(r));
+        }
+        else
+        {
+            (void)Up;
+            (void)kp;
+            (void)coeffDictCmu;
+            (void)coeffDictHasCmu;
+        }
+    }
+
+    int    turbulentInletKind() const override { return static_cast<int>(kind_); }
+    scalar turbulentInletCoefficient() const override { return coefficient_; }
+
+private:
+    Kind   kind_;
+    scalar coefficient_;      // intensity, or mixingLength
+    scalar patchCmu_;         // the dissipation inlet's own `Cmu` entry (default 0.09); see effectiveCmu
+};
+
 
 // outletInlet (freestreamPressure base): the flux-OPPOSITE of inletOutlet, outflow phi>=0 -> fixedValue(outletValue),
 // inflow phi<0 -> zeroGradient. Device category 4 (oioMask). value() = outletValue (= refValue).
 template <typename T>
-class OutletInletPatchField : public ExtrapolatedValuePatchField<T>   // value()/refValue = outletValue (= freestreamValue)
+class OutletInletPatchField : public MixedPatchField<T>   // value()/refValue = outletValue (= freestreamValue)
 {
 public:
-    using ExtrapolatedValuePatchField<T>::ExtrapolatedValuePatchField;
+    // FALSE, and unlike inletOutlet this one really does inherit it: outletInletFvPatchField declares no
+    // assignable() of its own, so mixedFvPatchField's false stands (mixedFvPatchField.H:200).
+    bool assignable() const override { return false; }   // OF: outletInlet does NOT override mixed
+    OutletInletPatchField(
+        const FvPatch& p,
+        bool uniform,
+        T uval,
+        std::vector<T> vals)
+        : MixedPatchField<T>(p, uniform, uval, std::move(vals), /*velocitySign=*/true)
+    {
+        // SEED THE VALUE FRACTION AT ZERO, not at the mixed base's 0.5. That 0.5 is the FREESTREAM
+        // seed -- a half-and-half flow-angle blend waiting for updateMixedFreestream -- and it is
+        // meaningless for a flux-conditional patch, which is either fully zeroGradient or fully
+        // fixedValue per face and never in between. Zero is the outflow branch, which is what this
+        // patch behaved as before it became mixed, so a field whose flux has not been pushed in yet is
+        // unchanged rather than half-fixed. Getting this wrong reports valueInternalCoeffs = 0.5 where
+        // OpenFOAM has 1, which measured 2.8e-01 on the momentum internalCoeffs.
+        this->vf_.assign(p.size, 0.0);
+    }
+
+    // outletInletFvPatchField::updateCoeffs -- valueFraction = pos0(phi), the exact opposite switch.
+    void updateFromFlux(const std::vector<scalar>& phip) override
+    {
+        std::vector<scalar> vf(this->patch_.size, 0.0);
+        for (label i = 0; i < this->patch_.size && i < (label)phip.size(); ++i)
+            vf[i] = (phip[i] >= 0.0) ? 1.0 : 0.0;
+        this->setValueFraction(std::move(vf));
+    }
     int bcCategory() const override { return 4; }                  // outletInlet (device: per-face fixedValue|zeroGradient, opposite switch)
 };
 
@@ -523,79 +1449,192 @@ public:
 // per-face inflow value each step (deviceUpdatePressureInletOutletVelocity); bcCategory()=6 marks it. Vector-only;
 // a non-zero `tangentialVelocity` field is NOT supported and is now REFUSED at construction (it was
 // only a comment before, so a case carrying one ran with the tangential component silently zeroed).
+//
+// THE MATRIX SIDE. directionMixed is a transform patch field, and its coefficients are not the
+// zeroGradient ones this class used to inherit for every component: with
+// snGradTransformDiag_k = sqrt|vf_kk| = neg(phi)*sqrt(1 - n_k^2) (directionMixedFvPatchField.C:180-200),
+// transformFvPatchField.C:95-135 gives
+//   valueInternalCoeffs_k    = 1 - d_k
+//   valueBoundaryCoeffs_k    = value_k - (1 - d_k)*pif_k
+//   gradientInternalCoeffs_k = -deltaCoeffs*d_k
+//   gradientBoundaryCoeffs_k = snGrad_k - gradientInternalCoeffs_k*pif_k,   snGrad = (value - pif)*deltaCoeffs
+// so on an axis-aligned inflow face the normal component is zeroGradient and each tangential one is a
+// fixedValue 0 -- the diffusive coupling that holds the inflow normal to the patch. Extrapolating every
+// component left the tangential momentum next to the inlet uncoupled from the patch; on rhoTP at t=1
+// with the patch VALUES already OpenFOAM's that alone read U 9.8e-03 / p 6.4e-05 relL2 against OpenFOAM
+// (host), and the inlet's written normal velocity 13.13 against 13.44.
 template <typename T>
 class PressureInletOutletVelocityPatchField : public ExtrapolatedValuePatchField<T>   // value() = written seed
 {
 public:
+    // TRUE, and the derivation is a trap. pressureInletOutletVelocity derives from directionMixed, whose
+    // assignable() is false (directionMixedFvPatchField.H:133) -- but OpenFOAM OVERRIDES it back to true
+    // in the derived class (pressureInletOutletVelocityFvPatchVectorField.H:162, "True: this patch field
+    // is altered by assignment"). Reading only the base is how this was got wrong.
+    //
+    // It is the SAME defect this file already carries a note about for inletOutlet, which is false in
+    // `mixed` and true in inletOutletFvPatchField.H:164, and which cost 1.3e-03 on HbyA's boundary and
+    // 3.5e-03 on phiHbyA until the pcEqn gate found it. constrainHbyA.C:56-69 assigns
+    // HbyA_b = U_b only where !assignable(), so a wrong `false` here makes constrainHbyA overwrite HbyA
+    // at every pressureInletOutletVelocity patch -- an outlet that is supposed to let the pressure set
+    // its own inflow.
+    bool assignable() const override { return true; }
     using ExtrapolatedValuePatchField<T>::ExtrapolatedValuePatchField;
     int bcCategory() const override { return 6; }                  // device: pressureInletOutletVelocity (outlet, adjustable flux)
-};
 
-// mixed (Robin) BC, OF mixedFvPatchField (refGrad = 0). value = (1-vf)*internal + vf*refValue; the per-face
-// valueFraction vf blends linearly between zeroGradient (vf=0) and fixedValue (vf=1) in BOTH the value and the
-// matrix coeffs (gradientInternalCoeffs = -vf*dc, valueInternalCoeffs = 1-vf, etc.). freestreamVelocity /
-// freestreamPressure are mixed with vf = 0.5 -/+ 0.5*(U.n)/|U| (continuous flow-angle blend, NOT the binary
-// inletOutlet switch). OF mixedFvPatchField::fixesValue() == true -> references the pressure (needReference false).
-// The DEVICE recomputes vf each step from the boundary flux (deviceUpdateMixedFreestream); the host evaluate()
-// keeps the seed vf (=0.5) -> host CPU path is approximate for mixed (the device-resident solver is the target),
-// matching the InletOutlet host-path scope.
-template <typename T>
-class MixedPatchField : public ExtrapolatedValuePatchField<T>     // value() = refValue (freestreamValue); base evaluate() sets it
-{
-public:
-    MixedPatchField(
-        const FvPatch& p,
-        bool uniform,
-        T uval,
-        std::vector<T> vals,
-        bool velocitySign)
-        : ExtrapolatedValuePatchField<T>(p, uniform, uval, std::move(vals)),
-          velocitySign_(velocitySign), vf_(p.size, 0.5) {}
-    bool fixesValue() const override { return true; }               // OF mixedFvPatchField::fixesValue() == true
-    int  bcCategory() const override { return 5; }                  // device: mixed (per-face valueFraction blend)
-    const std::vector<scalar>* valueFractionPtr() const override { return &vf_; }
-    // mixedEnergy / an external-convection wall carries refGradient beside refValue. Stored per face and
-    // handed to DeviceBoundary::refGrad through the same hook fixedGradient uses (B5); the kernels apply
-    // OF's (1-vf) weight, so a mixed patch with refGradient 0 stays bit-identical to before.
-    const std::vector<T>* refGradPtr() const override { return refGrad_.empty() ? nullptr : &refGrad_; }
-    void setRefGrad(std::vector<T> g) { refGrad_ = std::move(g); }
-    // A plain `mixed` patch STATES its valueFraction; only the freestream family recomputes it per step.
-    void setValueFraction(std::vector<scalar> f) { vf_ = std::move(f); }
-    bool mixedVelocitySign() const override { return velocitySign_; }
-    // OF mixed coeffs with refGrad = 0 (host correctness; the device blends the same way in its kernels):
-    std::vector<T> gradientInternalCoeffs() const override        // -vf*deltaCoeffs
+    void updateFromFlux(const std::vector<scalar>& phip) override { phi_ = phip; }
+
+    // The value is still the stored one (see updateFromPatchVelocity); evaluate() only caches the patch
+    // internal field the transform coefficients below are built from, as SymmetryPlanePatchField does.
+    // setStoredValues() re-evaluates with an EMPTY internal field (the value does not depend on it), so
+    // the cache is refreshed only from a real one -- gathering from the empty one read past its end.
+    void evaluate(const std::vector<T>& internal) override
     {
-        std::vector<T> r(this->patch_.size);
-        for (label i = 0; i < this->patch_.size; ++i)
-            r[i] = tUniform<T>(-vf_[i] * this->patch_.deltaCoeffs[i]);
-        return r;
+        if (!internal.empty()) pif_ = this->patchInternalField(internal);
+        ExtrapolatedValuePatchField<T>::evaluate(internal);
     }
-    std::vector<T> gradientBoundaryCoeffs() const override        // vf*deltaCoeffs*refValue
+
+    std::vector<T> valueInternalCoeffs() const override           // 1 - d_k
     {
-        std::vector<T> r(this->patch_.size);
-        for (label i = 0; i < this->patch_.size; ++i)
-            r[i] = this->refValue(i) * (vf_[i] * this->patch_.deltaCoeffs[i]);
-        return r;
+        if constexpr (!std::is_same<T, vector>::value)
+        {
+            return fvPatchField<T>::valueInternalCoeffs();
+        }
+        else
+        {
+            std::vector<T> r(this->patch_.size);
+            for (label i = 0; i < this->patch_.size; ++i)
+            {
+                const vector d = transformDiag(i);
+                r[i] = vector{ 1.0 - d.x, 1.0 - d.y, 1.0 - d.z };
+            }
+            return r;
+        }
     }
-    std::vector<T> valueInternalCoeffs() const override           // 1-vf
+
+    std::vector<T> valueBoundaryCoeffs() const override           // value - (1 - d_k)*pif
     {
-        std::vector<T> r(this->patch_.size);
-        for (label i = 0; i < this->patch_.size; ++i)
-            r[i] = tUniform<T>(1.0 - vf_[i]);
-        return r;
+        if constexpr (!std::is_same<T, vector>::value)
+        {
+            return fvPatchField<T>::valueBoundaryCoeffs();
+        }
+        else
+        {
+            const std::vector<T> vic = valueInternalCoeffs();
+            std::vector<T> r(this->patch_.size);
+            for (label i = 0; i < this->patch_.size; ++i)
+            {
+                const T& p = pifAt(i);
+                r[i] = vector{ this->value_[i].x - vic[i].x*p.x,
+                               this->value_[i].y - vic[i].y*p.y,
+                               this->value_[i].z - vic[i].z*p.z };
+            }
+            return r;
+        }
     }
-    std::vector<T> valueBoundaryCoeffs() const override           // vf*refValue
+
+    std::vector<T> gradientInternalCoeffs() const override        // -deltaCoeffs*d_k
     {
-        std::vector<T> r(this->patch_.size);
-        for (label i = 0; i < this->patch_.size; ++i)
-            r[i] = this->refValue(i) * vf_[i];
-        return r;
+        if constexpr (!std::is_same<T, vector>::value)
+        {
+            return fvPatchField<T>::gradientInternalCoeffs();
+        }
+        else
+        {
+            std::vector<T> r(this->patch_.size);
+            for (label i = 0; i < this->patch_.size; ++i)
+            {
+                const vector d = transformDiag(i);
+                const scalar dc = this->patch_.deltaCoeffs[i];
+                r[i] = vector{ -dc*d.x, -dc*d.y, -dc*d.z };
+            }
+            return r;
+        }
     }
+
+    // OF directionMixedFvPatchField::snGrad() =
+    //     (transform(vf, refValue) + transform(I - vf, pif + refGrad/deltaCoeffs) - pif)*deltaCoeffs,
+    // which this class's own coefficients are built to satisfy (see gradientBoundaryCoeffs below).
+    std::vector<T> snGrad(const std::vector<T>& internal) const override
+    {
+        return this->snGradFromCoeffs(internal);
+    }
+    std::vector<T> gradientBoundaryCoeffs() const override        // snGrad - gic_k*pif
+    {
+        if constexpr (!std::is_same<T, vector>::value)
+        {
+            return fvPatchField<T>::gradientBoundaryCoeffs();
+        }
+        else
+        {
+            const std::vector<T> gic = gradientInternalCoeffs();
+            std::vector<T> r(this->patch_.size);
+            for (label i = 0; i < this->patch_.size; ++i)
+            {
+                const T& p = pifAt(i);
+                const scalar dc = this->patch_.deltaCoeffs[i];
+                const vector sn { (this->value_[i].x - p.x)*dc,
+                                  (this->value_[i].y - p.y)*dc,
+                                  (this->value_[i].z - p.z)*dc };
+                r[i] = vector{ sn.x - gic[i].x*p.x, sn.y - gic[i].y*p.y, sn.z - gic[i].z*p.z };
+            }
+            return r;
+        }
+    }
+
+    // OF pressureInletOutletVelocityFvPatchVectorField::updateCoeffs -- valueFraction = neg(phi)*(I - nn).
+    // OUTFLOW (phi >= 0) has valueFraction 0 and extrapolates entirely. INFLOW fixes only the TANGENTIAL
+    // part to refValue, which is zero unless the case gives a tangentialVelocity (refused at
+    // construction), so the value becomes the NORMAL projection of the cell velocity, n*(n & U_cell) --
+    // the pressure sets the inflow speed and the tangential component is dropped.
+    //
+    // Written through setStoredValues rather than by overriding evaluate(), so this class behaves
+    // EXACTLY as before for any caller that does not invoke the update. The incompressible lineage has
+    // four piov fixtures (validation/piov, piov_of, piov_cf, simpleCar) and its device path computes
+    // this itself; changing evaluate() would have altered their host behaviour as a side effect.
+    void updateFromPatchVelocity(
+        const std::vector<vector>& /*Ub*/,
+        const std::vector<vector>& Ucell,
+        const std::vector<scalar>& /*rhob*/) override
+    {
+        if constexpr (std::is_same<T, vector>::value)
+        {
+            const label n = this->patch_.size;
+            if (n == 0 || (label)Ucell.size() < n) return;
+            std::vector<T> v(static_cast<std::size_t>(n));
+            for (label i = 0; i < n; ++i)
+            {
+                const bool inflow = i < (label)phi_.size() && phi_[i] < scalar(0);
+                if (!inflow) { v[i] = Ucell[i]; continue; }        // outflow: zeroGradient
+                const vector& nf = this->patch_.nf[i];
+                const scalar nd = nf.x*Ucell[i].x + nf.y*Ucell[i].y + nf.z*Ucell[i].z;
+                v[i] = vector{ nd*nf.x, nd*nf.y, nd*nf.z };        // inflow: normal component only
+            }
+            this->setStoredValues(std::move(v));
+        }
+    }
+
 private:
-    bool                velocitySign_;  // true: vf=0.5-0.5 U.n/|U| (velocity); false: 0.5+0.5 ... (pressure)
-    std::vector<scalar> vf_;            // per-face valueFraction (seed 0.5; device recomputes from the flow angle)
-
-    std::vector<T> refGrad_;
+    std::vector<scalar> phi_;
+    // The patch internal field, cached at evaluate() -- see SymmetryPlanePatchField for why.
+    std::vector<T>      pif_;
+    const T& pifAt(label i) const
+    {
+        static const T zero{};
+        return (i < static_cast<label>(pif_.size())) ? pif_[i] : zero;
+    }
+    // snGradTransformDiag: neg(phi)*sqrt(1 - n_k^2) per component. Zero on an outflow face (every
+    // component zeroGradient) and, on an axis-aligned inflow face, exactly 0 on the normal component
+    // and 1 on the tangential ones.
+    vector transformDiag(label i) const
+    {
+        const bool inflow = i < static_cast<label>(phi_.size()) && phi_[i] < scalar(0);
+        if (!inflow) return vector{ 0.0, 0.0, 0.0 };
+        const vector& n = this->patch_.nf[i];
+        return vector{ std::sqrt(std::max(scalar(0), scalar(1) - n.x*n.x)),
+                       std::sqrt(std::max(scalar(0), scalar(1) - n.y*n.y)),
+                       std::sqrt(std::max(scalar(0), scalar(1) - n.z*n.z)) };
+    }
 };
 
 // processor: rank<->rank coupled patch. The exchange receives the NEIGHBOUR cells' values (the
@@ -737,7 +1776,23 @@ inline InletOrValue<T> inletOrValue(const PatchFieldData<T>& d)
 template <typename T>
 std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFieldData<T>& d)
 {
-    if (d.type == "fixedGradient")
+    // THE ENERGY BOUNDARY FAMILY -- fixedEnergy, gradientEnergy, mixedEnergy -- handled by the three
+    // branches they derive from. This is NOT a substitution. OpenFOAM's energy patch fields ARE their
+    // base classes as far as the matrix is concerned:
+    //     fixedEnergyFvPatchScalarField    : public fixedValueFvPatchScalarField
+    //     gradientEnergyFvPatchScalarField : public fixedGradientFvPatchScalarField
+    //     mixedEnergyFvPatchScalarField    : public mixedFvPatchScalarField
+    // What each adds is an updateCoeffs() that recomputes its value, gradient or refValue from T through
+    // the thermo -- so the COEFFICIENTS are the base class's, unchanged, and the numbers those coeffs are
+    // built from are written to the file. OpenFOAM writes exactly the entries each base needs: `value`
+    // for fixedEnergy, `gradient` for gradientEnergy, and refValue/refGradient/valueFraction for
+    // mixedEnergy. Reading them is reading what OpenFOAM used.
+    //
+    // The solver does not reach this path: it derives he's boundary conditions from T's, which is the
+    // same relation from the other side. This exists so a gate can read the `he` OpenFOAM WROTE --
+    // test_rho_eeqn_cpp refused angledDuct with `unsupported BC type 'fixedEnergy'` and could not run on
+    // any case whose inlet fixes a temperature, which is most of them.
+    if (d.type == "fixedGradient" || d.type == "gradientEnergy")
     {
         if (!d.hasGradient)
             throw std::runtime_error("brae: patch " + p.name + " is fixedGradient but has no 'gradient' entry.");
@@ -768,6 +1823,15 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
             "so the prescribed time variation would be lost. Replace p0 with a constant, or drive the "
             "case at fixed total pressure.");
     }
+    if (d.hasABL && !d.unsupportedFunction1.empty())
+    {
+        // A time-varying atmBoundaryLayer entry (a wind rose, a ramped Uref). Reading past it would leave
+        // brae on the DEFAULT for that parameter -- a silently different inlet profile, not a failure.
+        throw std::runtime_error(
+            "brae: patch " + p.name + " has " + d.type + " with a non-constant Function1 entry ('"
+            + d.unsupportedFunction1 + "'). brae evaluates only `constant`/`uniform` Function1 entries, "
+            "so the prescribed variation would be lost. Replace it with a constant.");
+    }
     if (d.type == "uniformFixedValue" && !d.unsupportedFunction1.empty())
     {
         // A non-constant uniformValue. Refusing rather than falling back to whatever `value` happens to
@@ -779,11 +1843,16 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
             "with a constant, or use codedFixedValue.");
     }
     // fixedMean: a fixedValue whose face values are the adjacent cell values, shifted or scaled so their
-    // area-weighted mean equals `meanValue` (OF fixedMeanFvPatchField). Seeded from `value`; the solver
-    // recomputes refValue every step, exactly as it does for codedFixedValue and fanPressure.
+    // area-weighted mean equals `meanValue` (OF fixedMeanFvPatchField). Seeded from `value`; ONLY
+    // gpuPimpleFoam recomputes it per step (collectFixedMean / collectFanPressure, and setupCodedBCs on
+    // gpuSimpleFoam too for the coded pair). Every driver without those hooks must refuse at its READ
+    // sites via frozen_bc_guard.cuh -- this factory cannot, because it does not know its caller, and
+    // the earlier version of this comment claimed "the solver" did it unconditionally: the
+    // unhonoured-contract pattern this tree keeps finding, with the freeze silent.
     if (d.type == "fixedMean")
         return std::make_unique<FixedValuePatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
-    if (d.type == "fixedValue" || d.type == "uniformFixedValue" || d.type == "codedFixedValue")
+    if (d.type == "fixedValue" || d.type == "uniformFixedValue" || d.type == "codedFixedValue"
+     || d.type == "fixedEnergy")   // fixedEnergy: fixedValue on he -- see the energy-family note above
         // uniformFixedValue: steady constant = fixedValue. codedFixedValue: seed with `value`; the NVRTC device kernel
         // (device_coded_bc) OVERWRITES this patch's refValue each step from the compiled `code` snippet (the driver
         // parses the code + wires the solver's coded-BC apply). Building it as fixedValue makes buildField/buildDeviceBoundary succeed.
@@ -792,11 +1861,26 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
         return std::make_unique<MixedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values, false);
     if (d.type == "noSlip")          return std::make_unique<NoSlipPatchField<T>>(p);
     if (d.type == "zeroGradient")    return std::make_unique<ZeroGradientPatchField<T>>(p);
-    // fixedFluxPressure = fixedGradient p whose gradient constrainPressure sets to (phiHbyA - Sf&U)/(magSf*rAU).
-    // At a fixed-velocity patch constrainHbyA gives phiHbyA_b = Sf&U, so that gradient is exactly 0 == zeroGradient.
-    // That is its only standard usage (no-flux walls), so we map it to zeroGradient (exact there). See
-    // PORTING_PRESSURE_REFERENCE.md; a fixedFluxPressure on a non-fixed-velocity patch would need the gradient path.
-    if (d.type == "fixedFluxPressure") return std::make_unique<ZeroGradientPatchField<T>>(p);
+    // fixedFluxPressure. The old mapping to zeroGradient leaned on the constrainHbyA cancellation --
+    // at a NON-assignable-U patch phiHbyA_b == rho_b*(Sf&U_b) identically, so the gradient is exactly 0
+    // -- which is real, but only where it holds: at an assignable-U patch (inletOutlet,
+    // pressureInletOutletVelocity) the numerator does not cancel, and under MRF a wall's relative flux
+    // does not either. Those cases ran zeroGradient under fixedFluxPressure's name. The class now
+    // carries the gradient path and REFUSES at assembly on any driver that never runs constrainPressure.
+    if (d.type == "fixedFluxPressure")
+    {
+        // OF seeds the gradient from the file entry when present, else extrapolates with Zero
+        // (fixedFluxPressureFvPatchScalarField.C:55-63); either way the SOLVER overwrites it each
+        // assembly through constrainPressure. Scalar (pressure) only.
+        if constexpr (std::is_same_v<T, scalar>)
+            return std::make_unique<FixedFluxPressurePatchField>(
+                p,
+                d.hasGradient ? d.gradientUniform : true,
+                d.hasGradient ? d.gradientUniformValue : scalar(0),
+                d.hasGradient ? d.gradientValues : std::vector<scalar>{});
+        else
+            throw std::runtime_error("brae: fixedFluxPressure on patch " + p.name + " is a scalar (pressure) BC.");
+    }
     // uniformTotalPressure is totalPressure with a TIME-VARYING p0 -- OF's own class differs only in
     // that p0 comes from a Function1 (uniformTotalPressureFvPatchScalarField.C:149 samples it every
     // updateCoeffs). The face treatment is identical: p_b = p0 - 0.5*neg(phi)*magSqr(U). So it builds
@@ -818,8 +1902,14 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
                 "which is not implemented. Remove the psi entry to use the low-speed form, which brae "
                 "reproduces exactly.");
         }
-        const auto v = inletOrValue(d);
-        return std::make_unique<TotalPressurePatchField<T>>(p, v.uniform, v.uniformValue, v.values);
+        // p0 from its own slot; the VALUE from the `value` entry when the file has one (a restart from
+        // OpenFOAM's output always does), else from p0 -- totalPressureFvPatchScalarField.C:69-73.
+        const auto p0 = inletOrValue(d);
+        if (d.hasValue)
+            return std::make_unique<TotalPressurePatchField<T>>(
+                p, d.valueUniform, d.uniformValue, d.values, p0.uniform, p0.uniformValue, p0.values);
+        return std::make_unique<TotalPressurePatchField<T>>(
+            p, p0.uniform, p0.uniformValue, p0.values, p0.uniform, p0.uniformValue, p0.values);
     }
     if (d.type == "flowRateInletVelocity")
     {
@@ -839,13 +1929,46 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     }
     if (d.type == "surfaceNormalFixedValue" || d.type == "uniformNormalFixedValue")   // U_b = refValue(scalar) * n
     {
+        // OF takes a full PatchFunction1 here, sampled every updateCoeffs
+        // (surfaceNormalFixedValueFvPatchVectorField.C). The reader marks the forms brae cannot
+        // evaluate; building past the mark used an EMPTY value array, so every face got U_b = 0*n --
+        // a silent zero inlet. The class comment said "any Function1 is ignored" and nothing enforced
+        // it: the unhonoured-contract pattern this tree keeps finding.
+        if (!d.unsupportedFunction1.empty())
+            throw std::runtime_error(
+                "brae: patch " + p.name + " has " + d.type + " with a "
+                + (d.type == "surfaceNormalFixedValue" ? "refValue" : "uniformValue") + " brae cannot "
+                "evaluate ('" + d.unsupportedFunction1 + "'). Only uniform/constant/nonuniform forms "
+                "are implemented; running would set U_b = 0*n on every face where the case prescribed "
+                "a variation. Replace it with a constant.");
+        // OF refuses the missing entry too (PatchFunction1::New reads it unconditionally); without
+        // this the same zero-inlet substitution arrives through a typo instead of a table.
+        if (!d.hasNormalRef)
+            throw std::runtime_error(
+                "brae: patch " + p.name + " has " + d.type + " without the "
+                + (d.type == "surfaceNormalFixedValue" ? "refValue" : "uniformValue") + " entry "
+                "OpenFOAM requires. Building would silently run U_b = 0.");
         if constexpr (std::is_same_v<T, vector>)
             return std::make_unique<SurfaceNormalFixedValuePatchField>(p, d.normalRefUniform, d.normalRefUniformValue, d.normalRefValues);
         else throw std::runtime_error("brae: surfaceNormalFixedValue/uniformNormalFixedValue is a velocity (vector) BC");
     }
-    if (d.type == "timeVaryingMappedFixedValue")   // boundaryData profile mapped (nearest) onto the faces -> fixedValue
+    if (d.type == "timeVaryingMappedFixedValue")   // boundaryData profile mapped (planar by default) -> fixedValue
     {
-        if (d.hasMapData) return std::make_unique<TimeVaryingMappedPatchField<T>>(p, d.mapPoints, d.mapValues);
+        // Keys the steady scope cannot honour were MARKED by the reader; refusing here names them.
+        if (!d.mapUnsupported.empty())
+            throw std::runtime_error(
+                "brae: timeVaryingMappedFixedValue on patch '" + p.name + "' uses `" +
+                d.mapUnsupported + "`, which brae's steady mapping does not implement "
+                "(MappedFile.C carries the semantics). Refusing rather than mapping a different "
+                "profile under the case's keys.");
+        // filter engages only as the PAIR (MappedFile.C:79-83); either key alone is inert in OF too.
+        if (d.mapFilterSweeps >= 1 && d.mapFilterRadius > 0.0)
+            throw std::runtime_error(
+                "brae: timeVaryingMappedFixedValue on patch '" + p.name + "' engages the "
+                "filterRadius/filterSweeps smoothing pair, which brae does not implement.");
+        if (d.hasMapData)
+            return std::make_unique<TimeVaryingMappedPatchField<T>>(
+                p, d.mapPoints, d.mapValues, d.mapMethodNearest, d.hasMapOffset, d.mapOffsetValue);
         // No mapped data: OF would FATAL here (the `value` entry is only the initial field, not a substitute for
         // boundaryData). Throw rather than silently degrade to fixedValue/zeroGradient -- masks a misconfigured case.
         throw std::runtime_error("brae: timeVaryingMappedFixedValue on patch '" + p.name +
@@ -868,21 +1991,54 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     // here we build an inletOutlet placeholder from the written `value` so buildField succeeds.
     if (d.type == "turbulentIntensityKineticEnergyInlet" || d.type == "turbulentMixingLengthDissipationRateInlet"
         || d.type == "turbulentMixingLengthFrequencyInlet")
-        return std::make_unique<InletOutletPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
+    {
+        // The file's `value` is the SEED only. OF recomputes refValue in updateCoeffs from the current U
+        // or k, so the patch carries the rule and its coefficient rather than the written number.
+        const bool ki = (d.type == "turbulentIntensityKineticEnergyInlet");
+        const auto kind = ki ? TurbulentInletPatchField<T>::intensityK
+                             : (d.type == "turbulentMixingLengthDissipationRateInlet"
+                                ? TurbulentInletPatchField<T>::mixingLengthEpsilon
+                                : TurbulentInletPatchField<T>::mixingLengthOmega);
+        // OpenFOAM's own construction checks on the dissipation inlet: mixingLength >= SMALL (:89,
+        // getCheck ge(SMALL)) and Cmu >= SMALL (:91, getCheckOrDefault) are FatalIOErrors there.
+        if (kind == TurbulentInletPatchField<T>::mixingLengthEpsilon)
+        {
+            if (!(d.mixingLength >= 1e-15))
+                throw std::runtime_error(
+                    "brae: turbulentMixingLengthDissipationRateInlet on patch '" + d.name
+                    + "': mixingLength must be >= SMALL (OpenFOAM refuses it at construction).");
+            if (!(d.Cmu >= 1e-15))
+                throw std::runtime_error(
+                    "brae: turbulentMixingLengthDissipationRateInlet on patch '" + d.name
+                    + "': Cmu must be >= SMALL (OpenFOAM refuses it at construction).");
+        }
+        return std::make_unique<TurbulentInletPatchField<T>>(
+            p, d.valueUniform, d.uniformValue, d.values, kind, ki ? d.intensity : d.mixingLength, d.Cmu);
+    }
     // base `freestream` (e.g. k/omega) derives from inletOutlet in OF -> BINARY flux switch (kept).
     if (d.type == "freestream")
         return std::make_unique<InletOutletPatchField<T>>(p, d.inletUniform, d.inletUniformValue, d.inletValues);
     // freestreamVelocity / freestreamPressure derive from mixedFvPatchField in OF -> CONTINUOUS Robin blend
     // vf = 0.5 -/+ 0.5*(U.n)/|U| (flow-angle, not the binary switch). The device recomputes vf each step.
+    // The file's own `value`, expanded per face. OF's mixed constructor keeps it verbatim on read.
+    auto readValueOf = [&]() -> std::vector<T>
+    {
+        if (!d.hasValue) return {};
+        if (d.valueUniform) return std::vector<T>(p.size, d.uniformValue);
+        if (d.values.size() == static_cast<std::size_t>(p.size)) return d.values;
+        return {};
+    };
     if (d.type == "freestreamVelocity")   // mixed, velocity sign (0.5 - 0.5 U.n/|U|)
-        return std::make_unique<MixedPatchField<T>>(p, d.inletUniform, d.inletUniformValue, d.inletValues, true);
+        return std::make_unique<MixedPatchField<T>>(p, d.inletUniform, d.inletUniformValue, d.inletValues,
+                                                    true, /*freestream*/true, readValueOf());
     if (d.type == "freestreamPressure")   // mixed, pressure sign (0.5 + 0.5 U.n/|U|)
-        return std::make_unique<MixedPatchField<T>>(p, d.inletUniform, d.inletUniformValue, d.inletValues, false);
+        return std::make_unique<MixedPatchField<T>>(p, d.inletUniform, d.inletUniformValue, d.inletValues,
+                                                    false, /*freestream*/true, readValueOf());
     // Plain `mixed` (Robin): refValue + refGradient + valueFraction, all given by the case. Unlike
     // freestream*/inletOutlet the valueFraction is FIXED, not recomputed from the flux, so the device does
     // not need a per-step update -- the seeded vf is the answer. This is the shape basicThermo maps a
     // `mixed` T patch onto (-> mixedEnergy), which is how an external-convection wall is written.
-    if (d.type == "mixed")
+    if (d.type == "mixed" || d.type == "mixedEnergy")
     {
         if (!d.hasValueFraction)
             throw std::runtime_error(
@@ -911,8 +2067,14 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     if (d.type == "pressureInletOutletVelocity")
         return std::make_unique<PressureInletOutletVelocityPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     if (d.type == "kqRWallFunction")      return std::make_unique<ZeroGradientPatchField<T>>(p); // zeroGradient wrapper
-    if (d.type == "epsilonWallFunction")  return std::make_unique<ZeroGradientPatchField<T>>(p); // boundary face = cell value; near-wall constraint applied separately
-    if (d.type == "omegaWallFunction")    return std::make_unique<ZeroGradientPatchField<T>>(p); // kOmegaSST: same as epsilon, wall value set by deviceWallOmegaG0 + setValues
+    // boundary face = cell value; the near-wall constraint is applied by the turbulence model
+    if (d.type == "epsilonWallFunction")  return std::make_unique<EpsilonWallFunctionPatchField<T>>(p);
+    // omegaWallFunction: the same shape as epsilonWallFunction -- a zeroGradient boundary VALUE with the
+    // near-wall cell constrained separately (deviceWallOmegaG0 + setValues). It must answer the wall-
+    // function predicate for the same reason epsilon's does: the solver keys its wall treatment on the BC
+    // TYPE, and mapping this to a bare ZeroGradientPatchField left every kOmegaSST case with NO wall
+    // faces at all -- no wall nut, so the wall shear and everything downstream of it were wrong.
+    if (d.type == "omegaWallFunction")    return std::make_unique<EpsilonWallFunctionPatchField<T>>(p);
     if (d.type == "nutkWallFunction")     return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     // alphatWallFunction: alphat_w = rho_w*nut_w/Prt, i.e. the SAME expression deviceAlphat applies in the
     // cells. Nothing is prescribed at the patch, so it is `calculated` exactly like the nut wall functions
@@ -936,7 +2098,10 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
               "for the Jayatilleke port.");
     }
     if (d.type == "atmNutkWallFunction")  return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values); // atmospheric rough-wall nut (z0); device wall nut from deviceBoundaryNut with atmZ0>0
-    if (d.type == "nutUSpaldingWallFunction") return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values); // SA wall nut (value set by deviceBoundaryNutSpalding)
+    // SA wall nut. Device: deviceBoundaryNutSpalding. Host: the model's correctNut recomputes it -- see
+    // isNutUSpalding, and SpalartAllmaras_cpp.cu for what taking the field assignment there costs.
+    if (d.type == "nutUSpaldingWallFunction")
+        return std::make_unique<NutUSpaldingPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     // nutLowReWallFunction: OF calcNut()=0 (resolved viscous sublayer). cf's nutkWallFunction already yields nut=0 for
     // yPlus<yPlusLam, so on the low-Re mesh this BC is used on it is the same; nutUBlendedWallFunction is the same
     // log-law wall-nut family as nutk. Both -> Calculated (device wall nut from deviceBoundaryNut). Validated vs OF.
@@ -979,11 +2144,17 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
                 fh.z /= fm;
             }
             const vector zh = d.ablZDir;
+            // OF measures the profile from the PATCH's own lowest point, not from z = 0:
+            //   Un = (Ustar/kappa)*log(((zDir & Cf) - groundMin - d + z0)/z0),  groundMin = zDir & ppMin
+            // (atmBoundaryLayer.C:218-224). turbineSiting's terrain sits near z = 1000 m, so leaving
+            // groundMin out replaces the boundary layer with the logarithm of the altitude -- a ~40%
+            // error in the inlet velocity that still converges to a plausible-looking wind field.
+            const scalar groundMin = p.ppMin.x*zh.x + p.ppMin.y*zh.y + p.ppMin.z*zh.z;
             std::vector<vector> vals(p.size);
             for (label i = 0; i < p.size; ++i)
             {
                 const vector& c = p.Cf[i];
-                scalar zr = c.x*zh.x + c.y*zh.y + c.z*zh.z - d.ablD;
+                scalar zr = c.x*zh.x + c.y*zh.y + c.z*zh.z - groundMin - d.ablD;
                 if (zr < 0) zr = 0;
                 const scalar Um = (Ustar / kap) * std::log((zr + z0) / z0);
                 vals[i] = vector{fh.x*Um, fh.y*Um, fh.z*Um};
@@ -1000,15 +2171,24 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
             const scalar Ustar = kap * std::fabs(d.ablUref) / std::log((d.ablZref + z0) / z0);
             const vector zh = d.ablZDir;
             const bool isK = (d.type == "atmBoundaryLayerInletK"), isEps = (d.type == "atmBoundaryLayerInletEpsilon");
+            // Same origin as the velocity above: zDir & boundBox(patch points).min().
+            const scalar groundMin = p.ppMin.x*zh.x + p.ppMin.y*zh.y + p.ppMin.z*zh.z;
             std::vector<scalar> vals(p.size);
             for (label i = 0; i < p.size; ++i)
             {
                 const vector& c = p.Cf[i];
-                scalar zr = c.x*zh.x + c.y*zh.y + c.z*zh.z - d.ablD;
+                scalar zr = c.x*zh.x + c.y*zh.y + c.z*zh.z - groundMin - d.ablD;
                 if (zr < 0) zr = 0;
-                vals[i] = isK   ? Ustar*Ustar / std::sqrt(Cmu)
-                        : isEps ? Ustar*Ustar*Ustar / (kap * (zr + z0))
-                                : Ustar / (std::sqrt(Cmu) * kap * (zr + z0));
+                // The YGCJ factor sqrt(C1*log((z+z0)/z0) + C2) rides on k (atmBoundaryLayer.C:238-240)
+                // and epsilon (:252-254) but NOT omega (:258-267). At the defaults C1=0, C2=1 it is
+                // IEEE-exactly 1; the ygcj guard skips the multiply entirely there so the five green
+                // turbineSiting gates stay bit-identical by construction.
+                const bool   ygcj = (d.ablC1 != 0.0 || d.ablC2 != 1.0);
+                const scalar fac  = ygcj ? std::sqrt(d.ablC1 * std::log((zr + z0) / z0) + d.ablC2)
+                                         : scalar(1);
+                vals[i] = isK   ? fac * Ustar*Ustar / std::sqrt(Cmu)
+                        : isEps ? fac * Ustar*Ustar*Ustar / (kap * (zr + z0))
+                                :       Ustar / (std::sqrt(Cmu) * kap * (zr + z0));
             }
             return std::make_unique<FixedValuePatchField<scalar>>(p, false, scalar{}, vals);
         }
@@ -1045,6 +2225,48 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
         return std::make_unique<FixedValuePatchField<T>>(p, v.uniform, v.uniformValue, v.values);
     }
     throw std::runtime_error("brae: unsupported BC type '" + d.type + "' on patch " + p.name);
+}
+
+// OF freestreamVelocity::updateCoeffs / freestreamPressure::updateCoeffs -- the host form.
+//
+//   velocity: valueFraction = 0.5 - 0.5*(Up & nf)/mag(Up)
+//   pressure: valueFraction = 0.5 + 0.5*(Up & nf)/mag(Up)
+//
+// `Up` is the patch's CURRENT velocity, i.e. whatever the previous evaluate left there, so calling this
+// before the field is re-evaluated reproduces OpenFOAM's own one-iteration lag. A face with no flow
+// (mag(Up) == 0) has no flow angle to blend on and keeps 0.5, which is what the seed already is.
+//
+// Only patches that ARE mixed are touched; everything else is left alone.
+template <typename T>
+void updateMixedFreestream(
+    std::vector<std::unique_ptr<fvPatchField<T>>>& boundary,
+    const std::vector<std::vector<vector>>&        Ubnd,
+    const std::vector<FvPatch>&                    patches)
+{
+    for (std::size_t pi = 0; pi < patches.size() && pi < boundary.size(); ++pi)
+    {
+        MixedPatchField<T>* mp = dynamic_cast<MixedPatchField<T>*>(boundary[pi].get());
+        if (!mp) continue;
+        // ONLY the freestream family, which is bcCategory 5. This used to be implied by the dynamic_cast
+        // -- freestreamVelocity/freestreamPressure were the only mixed patches brae had -- and stopped
+        // being implied when inletOutlet and outletInlet were reparented onto MixedPatchField to give
+        // them the Robin coefficients. They are governed by the FLUX SIGN, a binary switch, not by the
+        // continuous flow-angle blend below; applying this to them overwrites the valueFraction their own
+        // updateFromFlux just set. Measured on sbMatched, whose outlet is inletOutlet: rAU 1.24e-02 and
+        // the momentum internalCoeffs 2.76e-01 against OpenFOAM.
+        if (mp->bcCategory() != 5) continue;
+        if (pi >= Ubnd.size() || Ubnd[pi].size() != static_cast<std::size_t>(patches[pi].size)) continue;
+
+        const scalar sign = mp->mixedVelocitySign() ? -1.0 : 1.0;
+        std::vector<scalar> vf(patches[pi].size, 0.5);
+        for (label i = 0; i < patches[pi].size; ++i)
+        {
+            const vector& Up = Ubnd[pi][i];
+            const scalar mu = mag(Up);
+            if (mu > 0.0) vf[i] = 0.5 + sign * 0.5 * dot(Up, patches[pi].nf[i]) / mu;
+        }
+        mp->setValueFraction(std::move(vf));
+    }
 }
 
 } // namespace brae

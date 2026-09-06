@@ -22,6 +22,12 @@ struct FvPatch {
     std::vector<vector> nf;           // unit face normal Sf/|Sf| (for slip/symmetry projection)
     std::vector<scalar> magSf;        // |Sf| face area (flowRateInletVelocity: gSum(rho*magSf))
     std::vector<vector> Cf;           // face centre (timeVaryingMapped boundaryData -> face mapping)
+    // boundBox(patch.localPoints()).min() -- the componentwise minimum of the patch's OWN points. OF's
+    // atmBoundaryLayer measures its profile height from `zDir & ppMin`, not from z = 0, so on a case
+    // whose terrain sits at a real elevation this is the difference between a boundary layer and a
+    // logarithm of the altitude. It is the patch POINTS, not the face centres: the lowest point of a
+    // patch is below the lowest face centre on it.
+    vector              ppMin{0, 0, 0};
 };
 
 std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g);

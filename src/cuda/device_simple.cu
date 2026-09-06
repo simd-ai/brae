@@ -1,5 +1,8 @@
 // cf GPU offload (G7): SIMPLE coupling-glue kernels. matrixH and matrixFlux reuse the ownerStart/losort
 // gather; rAU / corrector are elementwise; the HbyA flux is a per-face vector interpolation dotted with Sf.
+#include <stdexcept>
+#include "device_boundary.cuh"
+#include <string>
 #include "device_simple.cuh"
 #include <cmath>
 #include <cuda_runtime.h>
@@ -171,10 +174,23 @@ void deviceMatrixH(
     const DeviceBuffer<scalar>& sourceK,
     const DeviceBuffer<scalar>& bdDiagK,
     const DeviceBuffer<scalar>& bdSrcK,
-    DeviceBuffer<scalar>& Hk)
+    DeviceBuffer<scalar>& Hk,
+    bool valid)
 {
     const int nC = dm.nCells;
     Hk.resize(nC);
+    // fvMatrix<Type>::H()'s closing block: a component polyMesh::solutionD() knocks out comes back
+    // identically zero (fvMatrix.C, the validComponents loop after correctBoundaryConditions). Done
+    // here rather than at the call sites so the device and the host twin brae::matrixH stay the SAME
+    // function -- tests/test_gpu_vs_cpp compares them component by component, and zeroing only one arm
+    // would turn its relative check into an absolute one on a reference that is identically zero.
+    if (!valid)
+    {
+        cudaCheck(cudaMemsetAsync(Hk.data(), 0, static_cast<std::size_t>(nC) * sizeof(scalar),
+                                  cudaStreamPerThread),
+                  "matrixH knocked-out component");
+        return;
+    }
     matrixHKernel<<<nBlocks(nC), TPB>>>(nC, A.ownerStart, A.losort, A.losortStart, A.upper, A.lower, A.owner, A.nei,
                                         psiK.data(), sourceK.data(), dm.V.data(), dm.bndCellStart.data(), dm.bndPerm.data(),
                                         bdDiagK.data(), bdSrcK.data(), Hk.data());
@@ -210,6 +226,21 @@ void adjustReduceKernel(
     if (f < 0.0) atomicAdd(&sums[0], -f);                 // massIn
     else if (adj[i]) atomicAdd(&sums[2], f);              // adjustableMassOut
     else atomicAdd(&sums[1], f);                          // fixedMassOut
+    // NO |phi| into sums[3] here: OF's totalFlux = VSMALL + sum(mag(phi)) sums the INTERNAL faces only
+    // -- Foam::sum() of a GeometricField is gSum(f1.primitiveField()) (GeometricFieldFunctions.C:470-
+    // 497). This kernel used to add the boundary too, inflating the normaliser behind the massCorr
+    // threshold, the fatal and closedVolume; test_adjust_phi_guards arm 7 straddles exactly that gap
+    // (a 2e-8 relative continuity error that OF refuses and the inflated form waved through).
+}
+
+
+// sum|phi| over the INTERNAL faces -- the whole of OF's normaliser (see the note above).
+__global__
+void absSumKernel(int n, const scalar* __restrict__ x, scalar* __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    atomicAdd(out, fabs(x[i]));
 }
 __global__
 void adjustScaleKernel(
@@ -223,20 +254,65 @@ void adjustScaleKernel(
     if (adj[i] && phiB[i] > 0.0) phiB[i] *= massCorr;     // scale only the adjustable OUTFLOW
 }
 } // namespace
-scalar deviceAdjustPhi(const DeviceBuffer<label>& adjustable, DeviceBuffer<scalar>& phiB)
+scalar deviceAdjustPhi(const DeviceBuffer<label>& adjustable,
+                       DeviceBuffer<scalar>& phiB,
+                       const DeviceBuffer<scalar>* phiInt,
+                       bool* closedVolume)
 {
     const int n = static_cast<int>(phiB.size());
-    if (n == 0) return 1.0;
-    DeviceBuffer<scalar> sums(3);
-    cudaCheck(cudaMemset(sums.data(), 0, 3 * sizeof(scalar)), "adjustPhi memset");
+    if (n == 0) { if (closedVolume) *closedVolume = true; return 1.0; }
+    DeviceBuffer<scalar> sums(4);
+    cudaCheck(cudaMemset(sums.data(), 0, 4 * sizeof(scalar)), "adjustPhi memset");
     adjustReduceKernel<<<nBlocks(n), TPB>>>(n, adjustable.data(), phiB.data(), sums.data());
-    scalar h[3];
-    cudaCheck(cudaMemcpy(h, sums.data(), 3 * sizeof(scalar), cudaMemcpyDeviceToHost), "adjustPhi D2H");
+    if (phiInt && phiInt->size())
+    {
+        const int ni = static_cast<int>(phiInt->size());
+        absSumKernel<<<nBlocks(ni), TPB>>>(ni, phiInt->data(), sums.data() + 3);
+    }
+    scalar h[4];
+    cudaCheck(cudaMemcpy(h, sums.data(), 4 * sizeof(scalar), cudaMemcpyDeviceToHost), "adjustPhi D2H");
     const scalar massIn = h[0], fixedOut = h[1], adjOut = h[2];
+
+    // OF adjustPhi.C:90-119, both clauses. This used to be `if (fabs(adjOut) > 1e-300)` and nothing else,
+    // which differs from OpenFOAM twice over:
+    //
+    //   1. OF's test is RELATIVE -- magAdjustableMassOut/totalFlux > SMALL (1e-15) -- against
+    //      totalFlux = VSMALL + sum(mag(phi)), the INTERNAL faces (Foam::sum() of a GeometricField is
+    //      gSum of the primitive field). An absolute 1e-300 admits an
+    //      adjustable outflow that is negligible beside the flux in the domain, and then divides by it:
+    //      exactly the uninitialised-outflow case OF's message tells you to fix with potentialFoam.
+    //   2. OF RAISES A FATAL ERROR on the other branch when the residual continuity error is more than
+    //      1e-8 of the total flux. brae carried on with massCorr = 1.0 and handed the pressure equation
+    //      an inconsistent right-hand side, which converges to something plausible.
+    //
+    // Both host twins already do this -- rhoPEqn_cpp.cu:99-122 and simpleFoam/pEqn_cpp.cu:92-125, the
+    // latter with OpenFOAM's own wording -- so the device kernel was the only one of the three that did
+    // not, while being the one all six device call sites reach.
+    const scalar kVSmall  = scalar(1e-300);
+    const scalar kSmall   = scalar(1e-15);
+    const scalar totalFlux = kVSmall + h[3];
     scalar massCorr = 1.0;
-    if (std::fabs(adjOut) > 1e-300) massCorr = (massIn - fixedOut) / adjOut;       // OF: (massIn-fixedMassOut)/adjustableMassOut
+    const scalar magAdj = std::fabs(adjOut);
+    if (magAdj > kVSmall && magAdj / totalFlux > kSmall)
+    {
+        massCorr = (massIn - fixedOut) / adjOut;
+    }
+    else if (std::fabs(fixedOut - massIn) / totalFlux > scalar(1e-8))
+    {
+        throw std::runtime_error(
+            "brae deviceAdjustPhi: continuity error cannot be removed by adjusting the outflow "
+            "(adjustPhi.C:108-119). Check the velocity boundary conditions, or run potentialFoam to "
+            "initialise the outflow. Specified mass inflow " + std::to_string((double)massIn)
+            + ", specified mass outflow " + std::to_string((double)fixedOut)
+            + ", adjustable mass outflow " + std::to_string((double)adjOut)
+            + ", total flux " + std::to_string((double)totalFlux) + ".");
+    }
     adjustScaleKernel<<<nBlocks(n), TPB>>>(n, adjustable.data(), massCorr, phiB.data());
     cudaCheck(cudaGetLastError(), "adjustPhi");
+    if (closedVolume)
+        *closedVolume = std::fabs(massIn)   / totalFlux < kSmall
+                     && std::fabs(fixedOut) / totalFlux < kSmall
+                     && std::fabs(adjOut)   / totalFlux < kSmall;
     return massCorr;
 }
 void deviceSetReference(DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& b, label refCell, scalar refValue)
@@ -319,6 +395,64 @@ void deviceBoundaryFlux(
     bndFluxKernel<<<nBlocks(dm.nBndFaces), TPB>>>(dm.nBndFaces, dm.bndGFace.data(), dm.Sfx.data(), dm.Sfy.data(),
                                                   dm.Sfz.data(), uxb.data(), uyb.data(), uzb.data(), phiB.data());
     cudaCheck(cudaGetLastError(), "bndFlux");
+}
+
+namespace
+{
+__global__ void constrainPressureKernel(
+    int                        n,
+    const label*  __restrict__ mask,
+    const scalar* __restrict__ phiHbyABnd,
+    const scalar* __restrict__ sfUBnd,
+    const scalar* __restrict__ rhoBnd,     // null = 1 (incompressible)
+    const scalar* __restrict__ denBnd,
+    const scalar* __restrict__ magSf,
+    scalar*       __restrict__ refGrad)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || !mask[i]) return;
+    const scalar rho = rhoBnd ? rhoBnd[i] : scalar(1);
+    refGrad[i] = (phiHbyABnd[i] - rho * sfUBnd[i]) / (magSf[i] * denBnd[i]);
+}
+
+__global__ void ownerGatherKernel(
+    int                        n,
+    const label*  __restrict__ bndCell,
+    const scalar* __restrict__ cellField,
+    scalar*       __restrict__ bnd)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    bnd[i] = cellField[bndCell[i]];
+}
+} // namespace
+
+void deviceConstrainPressure(
+    const DeviceBoundary&       dbP,
+    const DeviceBuffer<scalar>& phiHbyABnd,
+    const DeviceBuffer<scalar>& sfUBnd,
+    const scalar*               rhoBnd,
+    const DeviceBuffer<scalar>& denBnd)
+{
+    const int n = static_cast<int>(dbP.snGradMask.size());
+    if (n == 0) return;   // empty boundary; a mask of zeros makes the kernel itself a no-op
+    constrainPressureKernel<<<(n + 255) / 256, 256>>>(
+        n, dbP.snGradMask.data(), phiHbyABnd.data(), sfUBnd.data(), rhoBnd, denBnd.data(),
+        dbP.magSf.data(),
+        const_cast<DeviceBuffer<scalar>&>(dbP.refGrad).data());
+    cudaCheck(cudaGetLastError(), "deviceConstrainPressure");
+}
+
+void deviceOwnerGather(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& cellField,
+    DeviceBuffer<scalar>&       bnd)
+{
+    bnd.resize(dm.nBndFaces);
+    if (dm.nBndFaces == 0) return;
+    ownerGatherKernel<<<(dm.nBndFaces + 255) / 256, 256>>>(
+        dm.nBndFaces, dm.bndCell.data(), cellField.data(), bnd.data());
+    cudaCheck(cudaGetLastError(), "deviceOwnerGather");
 }
 void deviceRelaxDiag(
     const DeviceLduView& A,

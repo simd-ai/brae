@@ -74,7 +74,10 @@ public:
         const GeometricField<scalar>* eps = nullptr,
         const GeometricField<scalar>* nut = nullptr,
         const GeometricField<scalar>* ReThetat = nullptr,
-        const GeometricField<scalar>* gammaInt = nullptr);
+        const GeometricField<scalar>* gammaInt = nullptr,
+        // Whether `phi` came off disk. On a coupled patch that decides whether its boundary values are
+        // the previous run's CONSERVATIVE interface flux or an un-coupled placeholder.
+        bool                          phiWasRead = false);
 
     // OF turbulence-model load sequence, ported byte-for-byte (do NOT skip, this is why OF never blows up on a
     // case cf does): (1) the model ctor bounds the read fields  [kEpsilon.C:105-106 bound(k_,kMin_); bound(epsilon_,...);
@@ -360,10 +363,17 @@ public:
     void setTurbulentInlets(const std::vector<label>& tiMask, const std::vector<scalar>& tiIntensity,
                             const std::vector<label>& mlMask, const std::vector<scalar>& mlLength)
     {
-        bool any = false;
-        for (label m : tiMask) if (m) { any = true; break; }
-        if (!any) for (label m : mlMask) if (m) { any = true; break; }
-        if (!any) return;
+        label nTi = 0, nMl = 0;
+        for (label m : tiMask) if (m) ++nTi;
+        for (label m : mlMask) if (m) ++nMl;
+        // Positive confirmation, because the failure mode here is SILENT and expensive: a
+        // turbulentIntensityKineticEnergyInlet that is never refreshed sits at whatever the file's
+        // `value` entry says, and OpenFOAM tutorials routinely write `value $internalField` there. On
+        // pipeCyclic that is k = 1, against the 0.0038-0.0067 the intensity actually implies -- a 200x
+        // inlet that feeds the whole entrance region and decays only by the pipe exit.
+        std::printf("  turbulent inlets: %d face(s) intensity-based k, %d face(s) mixing-length "
+                    "epsilon/omega, refreshed every iteration\n", (int)nTi, (int)nMl);
+        if (!nTi && !nMl) return;
         tiMask_.copyFrom(tiMask); tiIntensity_.copyFrom(tiIntensity);
         mlMask_.copyFrom(mlMask); mlLength_.copyFrom(mlLength);
         hasTurbInlet_ = true;
@@ -865,10 +875,18 @@ private:
     bool   ufActive_ = false;            // set once the mesh-motion path has run: OF's mesh.dynamic()
     bool   meshPhiValid_ = false;
     DeviceBuffer<scalar> cycIfCoeffMom_, amiIfCoeffMom_;
+    // Coupled-interface edges added to the AMG agglomeration, in the order they were appended to the
+    // fine edge list (internal faces first). The level-0 Galerkin needs a fine coefficient array of the
+    // same extended length, so the interface coefficients are gathered into these positions each step.
+    label                nAmgIfEdges_ = 0, nAmgCycEdges_ = 0, nAmgAmiEdges_ = 0;
+    DeviceBuffer<label>  amgIfAmiSrc_;   // per appended AMI edge: its source face (index into ami_.ifCoeff)
+    DeviceBuffer<scalar> amgIfAmiW_;     // per appended AMI edge: its stencil weight
+    std::vector<label>   amgIfOwn_, amgIfNbr_;
+    DeviceBuffer<scalar> amgFineUpper_, amgFineLower_;   // [internal faces | interface entries]
     std::vector<std::pair<label, label>> cycRuns_, amiRuns_;
     // DILU for the momentum solves (OF's `preconditioner DILU`). The level schedule depends only on the
     // mesh addressing, so it is built once; rD is refactorised inside every solve.
-    DeviceDilu diluU_;
+    DeviceDilu dilu_;   // shared by the momentum and turbulence BiCGStab (schedule depends only on the mesh)
     bool   hasAMI_ = false;                                     // any cyclicAMI interface -> Jacobi-PCG pressure (no AMG)
     bool   amiNonConforming_ = false;                           // ...and a face with >1 partner -> BiCGStab (see below)
     DeviceAMI    ami_;                                          // cyclicAMI weighted-stencil coupling (translational path)

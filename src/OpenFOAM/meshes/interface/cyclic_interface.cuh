@@ -28,6 +28,10 @@ struct CyclicInterface
     std::vector<scalar> weights;            // this-side interp weight: face = w*own + (1-w)*nbr
     std::vector<vector> dOwn;               // Cf - C[own] (this-side face delta, for linearUpwind reconstruction)
     std::vector<vector> dNbr;               // Cf_nbr - C[nbr] (neighbour-side face delta, UN-rotated)
+    // fvPatch::delta() -- dOwn minus the TRANSFORMED neighbour delta, which is what deltaCoeffs and
+    // corrVec are already built from. Stored rather than left for each consumer to re-derive: the TVD
+    // limiter at a coupled face needs the same vector, and re-deriving it means re-deriving the rotation.
+    std::vector<vector> delta;
     std::vector<vector> corrVec;            // non-orth correction vector nf - delta*deltaCoeffs (laplacian "corrected")
     bool                translational = true;
     vector              separation{0, 0, 0};   // translational: period vector Cf_nbr - Cf_own
@@ -76,6 +80,7 @@ inline std::vector<CyclicInterface> buildCyclicInterfaces(
         ci.weights.resize(P.size);
         ci.dOwn.resize(P.size);
         ci.dNbr.resize(P.size);
+        ci.delta.resize(P.size);
         ci.corrVec.resize(P.size);
 
         // Rotational: the nbr->own rotation tensor forwardT, angle from a matched face pair about the axis.
@@ -103,6 +108,7 @@ inline std::vector<CyclicInterface> buildCyclicInterfaces(
             ci.corrVec[i] = nfo - delta * ci.deltaCoeffs[i];   // laplacian non-orth correction vector (k = nf - delta*dc)
             ci.dOwn[i] = patchD;
             ci.dNbr[i] = nbrD;   // linearUpwind face deltas (Cf-C_own ; Cf_nbr-C_nbr, un-rotated)
+            ci.delta[i] = delta;
             if (i == 0) ci.separation = g.Cf()[N.start + i] - g.Cf()[P.start + i];
         }
         out.push_back(std::move(ci));
