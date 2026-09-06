@@ -11,6 +11,7 @@
 #include "amg_kernels.cuh"         // gsColorT<> (the multicolor GS kernel)
 #include "device_ldu.cuh"          // DeviceLduView / deviceAmul
 #include "device_blas.cuh"         // deviceCopy / deviceAxpy / deviceSumMagInto
+#include "device_pcg.cuh"          // normFactorOnHost / announceNormFactorMode / deviceReadScalar
 #include <cuda_runtime.h>
 #include <map>
 #include <cstring>
@@ -121,7 +122,7 @@ static void deviceSymGaussSeidelGraph(
     const DeviceLduView& A,
     const DeviceBuffer<scalar>& b,
     DeviceBuffer<scalar>& psi,
-    scalar normFactor,
+    const scalar* dNormFactor,
     scalar tol,
     scalar relTol,
     int maxIter,
@@ -149,7 +150,7 @@ static void deviceSymGaussSeidelGraph(
     cudaMemcpyAsync(c.gsUpper.data(), A.upper, nF*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
     cudaMemcpyAsync(c.gsLower.data(), A.lower, nF*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
     cudaMemcpyAsync(c.gsB.data(),     b.data(),nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
-    cudaMemcpyAsync(c.gNormF.data(), &normFactor, sizeof(scalar), cudaMemcpyHostToDevice,   cudaStreamPerThread);
+    cudaMemcpyAsync(c.gNormF.data(), dNormFactor, sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
     DeviceLduView sA = A;
     sA.diag = c.gsDiag.data();
     sA.upper = c.gsUpper.data();
@@ -343,6 +344,8 @@ static void deviceSymGaussSeidelGraphFused(
         cudaMemcpyAsync(c.gsDiag[k].data(), comps[k].A->diag,   nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
         cudaMemcpyAsync(c.gsB[k].data(),    comps[k].b->data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
         nfH[k] = comps[k].normFactor;
+        if (comps[k].dNormFactor)
+            cudaMemcpyAsync(c.gNormF.data() + k, comps[k].dNormFactor, sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
         sA[k] = *comps[k].A;
         sA[k].diag  = c.gsDiag[k].data();
         sA[k].upper = c.gsUpper.data();
@@ -351,7 +354,9 @@ static void deviceSymGaussSeidelGraphFused(
         ops.b[k]    = c.gsB[k].data();
         ops.psi[k]  = comps[k].psi->data();
     }
-    cudaMemcpyAsync(c.gNormF.data(), nfH, nComp*sizeof(scalar), cudaMemcpyHostToDevice, cudaStreamPerThread);
+    for (int k = 0; k < nComp; ++k)
+        if (!comps[k].dNormFactor)
+            cudaMemcpyAsync(c.gNormF.data() + k, nfH + k, sizeof(scalar), cudaMemcpyHostToDevice, cudaStreamPerThread);
     // this solve's operands in walk order (item 60b): the shared coefficients once, the cells per component
     gsLevelCoefsRefresh(sA[0], lv, c.lc);
     const GSLevelCells* ccp[GS_FUSED_MAX] = {};
@@ -495,9 +500,14 @@ struct HostGSCache
     scalar* psi[GS_FUSED_MAX] = {};
     std::vector<scalar> bPrime[GS_FUSED_MAX];
     DeviceBuffer<scalar> Ax[GS_FUSED_MAX], r[GS_FUSED_MAX];
-    DeviceBuffer<scalar> gRes;
+    DeviceBuffer<scalar> gRes, gNf;                       // sum|r| per component; the normFactors (device)
     scalar* hRes = nullptr;                               // pinned, GS_FUSED_MAX
 };
+__global__ void hostGsNormK(int n, const scalar* __restrict__ sum, const scalar* __restrict__ nf, scalar* __restrict__ out)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) out[i] = sum[i] / nf[i];
+}
 void pinnedResize(scalar*& p, std::size_t n)
 {
     if (p) cudaFreeHost(p);
@@ -566,9 +576,18 @@ void hostSymGaussSeidelFused(
             c.bPrime[k].resize((std::size_t)nC);
         }
         pinnedResize(c.hRes, GS_FUSED_MAX);
-        c.gRes.resize(GS_FUSED_MAX);
+        c.gRes.resize(2*GS_FUSED_MAX);                   // [0,3): sum|r|; [3,6): sum|r|/nf, what the host reads
+        c.gNf.resize(GS_FUSED_MAX);
         c.nC = nC;
         c.nF = nF;
+    }
+    // the normFactors, on the device: from the caller's device scalar, or uploaded from its host value
+    for (int k = 0; k < nComp; ++k)
+    {
+        if (comps[k].dNormFactor)
+            cudaMemcpyAsync(c.gNf.data() + k, comps[k].dNormFactor, sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        else
+            cudaMemcpyAsync(c.gNf.data() + k, &comps[k].normFactor, sizeof(scalar), cudaMemcpyHostToDevice, cudaStreamPerThread);
     }
     // the folded system and the field, down (one sync); the initial residuals on the device meanwhile
     cudaMemcpyAsync(c.upper, A0.upper, (std::size_t)nF*sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread);
@@ -589,12 +608,13 @@ void hostSymGaussSeidelFused(
         deviceSumMagInto(c.r[k], c.gRes.data() + k);
         nf[k] = comps[k].normFactor;
     }
-    cudaMemcpyAsync(c.hRes, c.gRes.data(), (std::size_t)nComp*sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread);
+    hostGsNormK<<<1, 32, 0, cudaStreamPerThread>>>(nComp, c.gRes.data(), c.gNf.data(), c.gRes.data() + GS_FUSED_MAX);
+    cudaMemcpyAsync(c.hRes, c.gRes.data() + GS_FUSED_MAX, (std::size_t)nComp*sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread);
     cudaStreamSynchronize(cudaStreamPerThread);
     int nActive = 0;
     for (int k = 0; k < nComp; ++k)
     {
-        init[k] = c.hRes[k] / nf[k];                 // the graph's gsScaleInvNK, on the host: the same division
+        init[k] = c.hRes[k];                         // sum|r|/nf, divided on the device (the same division)
         fin[k]  = init[k];
         iter[k] = 0;
         active[k] = (init[k] < tol && minIter <= 0) ? 0 : 1;
@@ -626,14 +646,15 @@ void hostSymGaussSeidelFused(
             deviceAxpy(-1.0, c.Ax[k], c.r[k]);
             deviceSumMagInto(c.r[k], c.gRes.data() + k);
         }
-        cudaMemcpyAsync(c.hRes, c.gRes.data(), (std::size_t)nComp*sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread);
+        hostGsNormK<<<1, 32, 0, cudaStreamPerThread>>>(nComp, c.gRes.data(), c.gNf.data(), c.gRes.data() + GS_FUSED_MAX);
+        cudaMemcpyAsync(c.hRes, c.gRes.data() + GS_FUSED_MAX, (std::size_t)nComp*sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread);
         cudaStreamSynchronize(cudaStreamPerThread);
         // gsSetCondK / gsFusedCondK, on the host, on the same doubles
         for (int k = 0; k < nComp; ++k)
         {
             if (!active[k]) continue;
             const int it = (iter[k] += sweepsPer);
-            const scalar r = c.hRes[k] / nf[k];
+            const scalar r = c.hRes[k];
             fin[k] = r;
             const bool converged = ((r < tol) || (r < relTol * init[k])) && (it >= minIter);
             const bool stop = converged || (it >= maxIter);
@@ -718,8 +739,14 @@ void deviceSymGaussSeidelFused(
     }
 #endif
     for (int k = 0; k < nComp; ++k)
-        deviceSymGaussSeidel(*comps[k].A, *comps[k].b, *comps[k].psi, comps[k].normFactor, tol, relTol, maxIter,
-                             &perf[k], minIter, nSweeps, symmetric);
+    {
+        if (comps[k].dNormFactor)
+            deviceSymGaussSeidel(*comps[k].A, *comps[k].b, *comps[k].psi, comps[k].dNormFactor, tol, relTol, maxIter,
+                                 &perf[k], minIter, nSweeps, symmetric);
+        else
+            deviceSymGaussSeidel(*comps[k].A, *comps[k].b, *comps[k].psi, comps[k].normFactor, tol, relTol, maxIter,
+                                 &perf[k], minIter, nSweeps, symmetric);
+    }
 }
 
 // symGaussSeidel scalar solver. Each cell is updated psi[c] = (b[c] - sum_{j!=c} A[c][j]*psi[j]) / diag[c] (the
@@ -838,7 +865,9 @@ scalar deviceSymGaussSeidel(
     if (!hostLoop)
     {
         DeviceSolverPerf p;
-        deviceSymGaussSeidelGraph(A, b, psi, normFactor, tol, relTol, maxIter, minIter, sweepsPer, symmetric, p);
+        static thread_local auto& dNf = *new DeviceBuffer<scalar>(1);
+        cudaMemcpyAsync(dNf.data(), &normFactor, sizeof(scalar), cudaMemcpyHostToDevice, cudaStreamPerThread);
+        deviceSymGaussSeidelGraph(A, b, psi, dNf.data(), tol, relTol, maxIter, minIter, sweepsPer, symmetric, p);
         if (perf) *perf = p;
         return p.initialResidual;
     }
@@ -963,6 +992,49 @@ static scalar deviceSymGaussSeidelF32(
     }
     cast_<float,scalar><<<nBlocks(nC),TPB>>>(nC, c.xF.data(), psi.data());         // FP32 field -> FP64
     return initRes;
+}
+
+
+scalar deviceSymGaussSeidel(
+    const DeviceLduView& A,
+    const DeviceBuffer<scalar>& b,
+    DeviceBuffer<scalar>& psi,
+    const scalar* dNormFactor,
+    scalar tol,
+    scalar relTol,
+    int maxIter,
+    DeviceSolverPerf* perf,
+    int minIter,
+    int nSweeps,
+    bool symmetric)
+{
+    announceNormFactorMode();
+    if (normFactorOnHost())
+        return deviceSymGaussSeidel(A, b, psi, deviceReadScalar(dNormFactor), tol, relTol, maxIter, perf, minIter, nSweeps, symmetric);
+    const int  sweepsPer = (nSweeps > 1) ? nSweeps : 1;
+    static const bool optIn = std::getenv("BRAE_TURB_FP32") != nullptr || std::getenv("BRAE_TURB_JACOBI") != nullptr;
+    static const bool hostLoopArm = std::getenv("BRAE_GS_HOST_LOOP") != nullptr;
+    if (!optIn && !hostLoopArm && hostSmootherSelected())
+    {
+        announceHostSmoother(1);
+        GSFusedComponent one;
+        one.A = &A; one.b = &b; one.psi = &psi; one.dNormFactor = dNormFactor;
+        DeviceSolverPerf p;
+        hostSymGaussSeidelFused(1, &one, tol, relTol, maxIter, minIter, sweepsPer, symmetric, &p);
+        if (perf) *perf = p;
+        return p.initialResidual;
+    }
+#ifdef BRAE_HAS_GS_DEVICE
+    if (!optIn && !hostLoopArm)
+    {
+        DeviceSolverPerf p;
+        deviceSymGaussSeidelGraph(A, b, psi, dNormFactor, tol, relTol, maxIter, minIter, sweepsPer, symmetric, p);
+        if (perf) *perf = p;
+        return p.initialResidual;
+    }
+#endif
+    // the host loop and the opt-in paths need the number on the host: one read, on those paths only
+    return deviceSymGaussSeidel(A, b, psi, deviceReadScalar(dNormFactor), tol, relTol, maxIter, perf, minIter, nSweeps, symmetric);
 }
 
 } // namespace brae

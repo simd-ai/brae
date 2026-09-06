@@ -73,18 +73,20 @@ DeviceSolverPerf deviceJacobiPCG(
     return perf;
 }
 
-scalar deviceNormFactor(
+void deviceNormFactorInto(
     const DeviceLduView& A,
     const DeviceBuffer<scalar>& psi,
     const DeviceBuffer<scalar>& b,
-    const DeviceBuffer<scalar>& ones)
+    const DeviceBuffer<scalar>& ones,
+    DeviceBuffer<scalar>& dNorm)
 {
+    dNorm.resize(1);
     const int nC = A.nCells;
     DeviceBuffer<scalar> Apsi(nC), sumA(nC), tmp(nC), t(nC);
     // Device-resident: the 3 reductions (avgPsi, n1, n2) stay on the device; only the final normFactor is read to
     // the host (it scales the residual for the convergence check). Same kernels + same IEEE ops (the divide by nC,
     // the avg-multiply, and the (n1+n2)+1e-20 add are reproduced exactly) -> bit-identical, 3 D2H syncs -> 1.
-    DeviceBuffer<scalar> dAvg(1), dN1(1), dN2(1), dNorm(1);
+    DeviceBuffer<scalar> dAvg(1), dN1(1), dN2(1);
     deviceAmul(A, psi, Apsi);                                // A*psi
     deviceAmul(A, ones, sumA);                               // sumA = rowSum(A) = A*1
     deviceDotInto(psi, ones, dAvg.data());                  // psi.ones
@@ -98,7 +100,32 @@ scalar deviceNormFactor(
     deviceAxpy(-1.0, tmp, t);
     deviceSumMagInto(t, dN2.data());   // n2 = |b - tmp|
     deviceScalarAdd2(dN1.data(), dN2.data(), 1e-20, dNorm.data());                    // n1 + n2 + 1e-20
+}
+
+scalar deviceNormFactor(
+    const DeviceLduView& A,
+    const DeviceBuffer<scalar>& psi,
+    const DeviceBuffer<scalar>& b,
+    const DeviceBuffer<scalar>& ones)
+{
+    DeviceBuffer<scalar> dNorm;
+    deviceNormFactorInto(A, psi, b, ones, dNorm);
     return deviceReadScalar(dNorm.data());                                            // the only host sync
+}
+
+bool normFactorOnHost()
+{
+    static const bool on = std::getenv("BRAE_NORMFACTOR_HOST") != nullptr;
+    return on;
+}
+
+void announceNormFactorMode()
+{
+    static bool announced = false;
+    if (announced) return;
+    announced = true;
+    std::printf(normFactorOnHost() ? "  normFactor: read to the host per solve (BRAE_NORMFACTOR_HOST)\n"
+                                   : "  normFactor: device-resident, never read by the host; BRAE_NORMFACTOR_HOST=1 restores the read\n");
 }
 
 #ifdef BRAE_HAS_GS_DEVICE
@@ -186,7 +213,7 @@ struct BiCGGraphCache
 
 // Returns false when this path does not apply (the caller then runs the host loop).
 bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar>& b, DeviceBuffer<scalar>& psi,
-                               scalar normFactor, scalar tol, scalar relTol, int maxIter, int minIter,
+                               const scalar* dNormFactor, scalar tol, scalar relTol, int maxIter, int minIter,
                                const DeviceDilu* precon, DeviceSolverPerf& perf)
 {
     const int nC = A.nCells, nF = A.nInternalFaces;
@@ -202,7 +229,7 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
     cudaMemcpyAsync(c.gUpper.data(), A.upper, nF*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
     cudaMemcpyAsync(c.gLower.data(), A.lower, nF*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
     cudaMemcpyAsync(c.gB.data(),     b.data(),nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
-    cudaMemcpyAsync(c.gNormF.data(), &normFactor, sizeof(scalar), cudaMemcpyHostToDevice,   cudaStreamPerThread);
+    cudaMemcpyAsync(c.gNormF.data(), dNormFactor, sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
     DeviceLduView sA = A;
     sA.diag = c.gDiag.data(); sA.upper = c.gUpper.data(); sA.lower = c.gLower.data();
     const bool useDilu = precon && precon->valid;
@@ -241,7 +268,8 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
     bicgAlphaK<<<1,1>>>(s.rr.data(), s.r0Ay.data(), s.alpha.data(), s.negAlpha.data(), s.bd.data());
     deviceFusedSxpy(c.sA, c.rA, s.negAlpha.data(), c.AyA);
     deviceSumMagInto(c.sA, s.sNorm.data());
-    perf.finalResidual = deviceReadScalar(s.sNorm.data()) / normFactor;
+    bicgNormK<<<1,1>>>(s.sNorm.data(), c.gNormF.data(), c.gSN.data());              // |s|/nf on the device
+    perf.finalResidual = deviceReadScalar(c.gSN.data());
     if (0 >= minIter && converged(perf.finalResidual))
     {
         deviceAxpyDev(s.alpha.data(), c.yA, psi);
@@ -256,11 +284,12 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
     deviceFusedAxpy2(psi, s.alpha.data(), c.yA, s.omega.data(), c.zA);
     deviceFusedSxpy(c.rA, c.sA, s.negOmega.data(), c.tA);
     deviceSumMagInto(c.rA, s.rNorm.data());
+    bicgNormK<<<1,1>>>(s.rNorm.data(), c.gNormF.data(), c.gRN.data());              // |r|/nf on the device
     scalar rn, bdv;
-    cudaCheck(cudaMemcpyAsync(&rn,  s.rNorm.data(), sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "bicg r0 D2H");
+    cudaCheck(cudaMemcpyAsync(&rn,  c.gRN.data(),  sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "bicg r0 D2H");
     cudaCheck(cudaMemcpyAsync(&bdv, s.bd.data(),    sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "bicg bd D2H");
     cudaStreamSynchronize(cudaStreamPerThread);
-    perf.finalResidual = rn / normFactor;
+    perf.finalResidual = rn;
     int nIter = 1;
     if (bdv != 0.0 || !((nIter < maxIter && !converged(perf.finalResidual)) || nIter < minIter))
     {
@@ -398,8 +427,10 @@ DeviceSolverPerf deviceJacobiBiCGStab(
     }
     if (checkEvery <= 1 && !hostLoop)
     {
+        static thread_local auto& dNf = *new DeviceBuffer<scalar>(1);
+        cudaMemcpyAsync(dNf.data(), &normFactor, sizeof(scalar), cudaMemcpyHostToDevice, cudaStreamPerThread);
         DeviceSolverPerf gp;
-        if (deviceJacobiBiCGStabGraph(A, b, psi, normFactor, tol, relTol, maxIter, minIter, precon, gp)) return gp;
+        if (deviceJacobiBiCGStabGraph(A, b, psi, dNf.data(), tol, relTol, maxIter, minIter, precon, gp)) return gp;
     }
 #endif
     // rD depends on the matrix, which changes every solve (the momentum diagonal moves every outer
@@ -494,5 +525,31 @@ DeviceSolverPerf deviceJacobiBiCGStab(
 // ---- distributed (multi-GPU) Jacobi-PCG ------------------------------------------------------------------
 // The device counterpart of host parallelPCG: same recurrence as deviceJacobiPCG, but A*x uses the
 // interface-coupled deviceParallelAmul and every reduction is global (Pstream::allReduce, tier-1).
+
+
+DeviceSolverPerf deviceJacobiBiCGStab(
+    const DeviceLduView& A,
+    const DeviceBuffer<scalar>& b,
+    DeviceBuffer<scalar>& psi,
+    const scalar* dNormFactor,
+    scalar tol,
+    scalar relTol,
+    int maxIter,
+    int checkEvery,
+    int minIter,
+    const DeviceDilu* precon)
+{
+    announceNormFactorMode();
+#ifdef BRAE_HAS_GS_DEVICE
+    static const bool hostLoop = std::getenv("BRAE_GS_HOST_LOOP") != nullptr || std::getenv("BRAE_BICG_HOST_LOOP") != nullptr;
+    if (checkEvery <= 1 && !hostLoop && !normFactorOnHost())
+    {
+        DeviceSolverPerf gp;
+        if (deviceJacobiBiCGStabGraph(A, b, psi, dNormFactor, tol, relTol, maxIter, minIter, precon, gp)) return gp;
+    }
+#endif
+    // the host loop needs the number on the host: one read, on this path only
+    return deviceJacobiBiCGStab(A, b, psi, deviceReadScalar(dNormFactor), tol, relTol, maxIter, checkEvery, minIter, precon);
+}
 
 } // namespace brae

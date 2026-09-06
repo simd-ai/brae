@@ -210,9 +210,8 @@ Residuals simpleStep(
         // component into its own diagonal, its own source), the view over the SHARED upper/lower, and
         // its normFactor -- none of which reads another component's psi, so building them all before
         // any solve is the same arithmetic as building each just before its own.
-        DeviceBuffer<scalar> diagC[3], b[3];
+        DeviceBuffer<scalar> diagC[3], b[3], dnf[3];
         DeviceLduView A[3];
-        scalar nf[3] = {0.0, 0.0, 0.0};
         int solved[3];
         int nSolved = 0;
         for (int k = 0; k < 3; ++k)
@@ -220,7 +219,7 @@ Residuals simpleStep(
             if (in.solutionD[k] < 0) continue;   // TRIAL: item 35's skip
             deviceFold(dm, Mp.relaxed ? Mp.relaxedDiag : Mp.diag, Mp.source[k], Mp.iC[k], Mp.bC[k], diagC[k], b[k]);
             A[k] = foldedView(dm, Mp, diagC[k]);
-            nf[k] = deviceNormFactor(A[k], *U[k], b[k], w.ones);
+            deviceNormFactorInto(A[k], *U[k], b[k], w.ones, dnf[k]);   // stays on the device (item 66)
             solved[nSolved++] = k;
         }
         // The solver the case asked for, algorithm included: deviceSymGaussSeidel is OpenFOAM's
@@ -244,7 +243,7 @@ Residuals simpleStep(
             for (int i = 0; i < nSolved; ++i)
             {
                 const int k = solved[i];
-                comps[i] = {&A[k], &b[k], U[k], nf[k]};
+                comps[i] = {&A[k], &b[k], U[k], 1.0, dnf[k].data()};
             }
             deviceSymGaussSeidelFused(nSolved, comps, in.tolU, in.relTolU, in.maxIterU, in.minIterU, in.nSweepsU,
                                       in.uGaussSeidelSymmetric, fp);
@@ -255,7 +254,7 @@ Residuals simpleStep(
             for (int i = 0; i < nSolved; ++i)
             {
                 const int k = solved[i];
-                perfs[k] = deviceJacobiBiCGStab(A[k], b[k], *U[k], nf[k], in.tolU, in.relTolU, in.maxIterU,
+                perfs[k] = deviceJacobiBiCGStab(A[k], b[k], *U[k], dnf[k].data(), in.tolU, in.relTolU, in.maxIterU,
                                                 /*checkEvery*/1, in.minIterU);
             }
         }
@@ -359,9 +358,10 @@ Residuals simpleStep(
         }
         amgGalerkin(w.amg, diagC, P.upper, P.lower);
 
-        const scalar nf = deviceNormFactor(A, f.p, b, w.ones);
+        DeviceBuffer<scalar> dnf;
+        deviceNormFactorInto(A, f.p, b, w.ones, dnf);                 // stays on the device (item 66)
         const DeviceSolverPerf perf =
-            deviceAMGPCG(A, w.amg, b, f.p, nf, in.tolP, in.relTolP, in.maxIterP,
+            deviceAMGPCG(A, w.amg, b, f.p, dnf.data(), in.tolP, in.relTolP, in.maxIterP,
                          in.captureVcycle, in.pcgCheckEvery, /*corrScaling*/false, in.minIterP);
         if (corr == 1) res["p"] = perf.initialResidual;   // the FIRST solve's residual, as OpenFOAM reports
         w.report.push_back({"p", perf.initialResidual, perf.finalResidual, perf.nIterations});

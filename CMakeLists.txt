@@ -1154,6 +1154,10 @@ add_test(NAME gradu_memo_identity
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/gradu_memo_identity.sh)
 set_tests_properties(gradu_memo_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 
+add_test(NAME normfactor_device_identity
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/normfactor_device_identity.sh)
+set_tests_properties(normfactor_device_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
 add_test(NAME uresidual_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/uresidual_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO

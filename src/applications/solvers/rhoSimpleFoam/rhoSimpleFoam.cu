@@ -458,9 +458,8 @@ Residuals rhoSimpleStep(
         // Gauss-Seidel walks FUSED into one level walk per sweep (item 60a, byte-identical to one walk
         // per component, tests/gs_fused_identity; BRAE_GS_FUSED=0 restores those), BiCGStab per
         // component as before.
-        DeviceBuffer<scalar> diagC[3], b[3];
+        DeviceBuffer<scalar> diagC[3], b[3], dnf[3];
         DeviceLduView A[3];
-        scalar nf[3] = {0.0, 0.0, 0.0};
         int solved[3];
         int nSolved = 0;
         for (int k = 0; k < 3; ++k)
@@ -468,7 +467,7 @@ Residuals rhoSimpleStep(
             if (in.solutionD[k] < 0) continue;
             deviceFold(dm, Mp.relaxed ? Mp.relaxedDiag : Mp.diag, Mp.source[k], Mp.iC[k], Mp.bC[k], diagC[k], b[k]);
             A[k] = foldedViewM(dm, Mp, diagC[k]);
-            nf[k] = deviceNormFactor(A[k], *U[k], b[k], w.ones);
+            deviceNormFactorInto(A[k], *U[k], b[k], w.ones, dnf[k]);   // stays on the device (item 66)
             solved[nSolved++] = k;
         }
         DeviceSolverPerf perfs[3];
@@ -479,7 +478,7 @@ Residuals rhoSimpleStep(
             for (int i = 0; i < nSolved; ++i)
             {
                 const int k = solved[i];
-                comps[i] = {&A[k], &b[k], U[k], nf[k]};
+                comps[i] = {&A[k], &b[k], U[k], 1.0, dnf[k].data()};
             }
             deviceSymGaussSeidelFused(nSolved, comps, in.tolU, in.relTolU, in.maxIterU, in.minIterU, /*nSweeps*/1,
                                       in.uGaussSeidelSymmetric, fp);
@@ -490,7 +489,7 @@ Residuals rhoSimpleStep(
             for (int i = 0; i < nSolved; ++i)
             {
                 const int k = solved[i];
-                perfs[k] = deviceJacobiBiCGStab(A[k], b[k], *U[k], nf[k], in.tolU, in.relTolU, in.maxIterU, /*checkEvery=*/1,
+                perfs[k] = deviceJacobiBiCGStab(A[k], b[k], *U[k], dnf[k].data(), in.tolU, in.relTolU, in.maxIterU, /*checkEvery=*/1,
                                                 in.minIterU, in.preconU);
             }
         }
@@ -568,9 +567,10 @@ Residuals rhoSimpleStep(
         DeviceBuffer<scalar> diagC, b;
         deviceFold(dm, E.diag, E.source, E.iC, E.bC, diagC, b);
         const DeviceLduView A = foldedView(dm, E, diagC);
-        const scalar nf = deviceNormFactor(A, f.he, b, w.ones);
+        DeviceBuffer<scalar> dnf;
+        deviceNormFactorInto(A, f.he, b, w.ones, dnf);                // stays on the device (item 66)
         const DeviceSolverPerf perf =
-            deviceJacobiBiCGStab(A, b, f.he, nf, in.tolHe, in.relTolHe, in.maxIterHe, /*checkEvery=*/1, in.minIterHe,
+            deviceJacobiBiCGStab(A, b, f.he, dnf.data(), in.tolHe, in.relTolHe, in.maxIterHe, /*checkEvery=*/1, in.minIterHe,
                                  in.preconHe);
         res[in.isE ? "e" : "h"] = perf.initialResidual;
 
@@ -659,7 +659,8 @@ Residuals rhoSimpleStep(
         DeviceBuffer<scalar>& b     = w.b;
         deviceFold(dm, P.diag, P.source, P.iC, P.bC, diagC, b);
         const DeviceLduView A = foldedView(dm, P, diagC);
-        const scalar nf = deviceNormFactor(A, f.p, b, w.ones);
+        DeviceBuffer<scalar> dnf;
+        deviceNormFactorInto(A, f.p, b, w.ones, dnf);                 // stays on the device (item 66)
 
         DeviceSolverPerf perf;
         if (in.transonic)
@@ -667,7 +668,7 @@ Residuals rhoSimpleStep(
             // fvm::div(phid, p) makes lower = -w*phi and upper = lower + phi, so upper != lower at every
             // face with flow through it. A symmetric solver on that matrix is not slow, it is wrong: CG
             // burned the full 3000-iteration cap and the case stalled before printing iteration 1.
-            perf = deviceJacobiBiCGStab(A, b, f.p, nf, in.tolP, in.relTolP, in.maxIterP, in.pcgCheckEvery, in.minIterP);
+            perf = deviceJacobiBiCGStab(A, b, f.p, dnf.data(), in.tolP, in.relTolP, in.maxIterP, in.pcgCheckEvery, in.minIterP);
         }
         else
         {
@@ -695,7 +696,7 @@ Residuals rhoSimpleStep(
                 w.amgBuilt = true;
             }
             amgGalerkin(w.amg, diagC, P.upper, P.lower);
-            perf = deviceAMGPCG(A, w.amg, b, f.p, nf, in.tolP, in.relTolP, in.maxIterP,
+            perf = deviceAMGPCG(A, w.amg, b, f.p, dnf.data(), in.tolP, in.relTolP, in.maxIterP,
                                 in.captureVcycle, in.pcgCheckEvery, /*corrScaling=*/false, in.minIterP);
         }
         // solutionControl.C:230-233 takes sp.first() -- the FIRST solve of the iteration, not the last.

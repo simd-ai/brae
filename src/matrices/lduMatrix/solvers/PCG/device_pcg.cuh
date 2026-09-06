@@ -35,6 +35,17 @@ struct BiCGGraphCache {
 // (and the tolerance test) match OF's residualControl convention. ones is a cached unit vector (length nCells).
 scalar deviceNormFactor(const DeviceLduView& A, const DeviceBuffer<scalar>& psi,
                         const DeviceBuffer<scalar>& b, const DeviceBuffer<scalar>& ones);
+// THE NORMFACTOR STAYS ON THE DEVICE (item 66). Every solver divides by it on the device already (the graph
+// loops upload it and scale there), so reading it to the host was a queue drain per solve for a number the
+// host never used -- 15 of the ~36 drains per T3A iteration. This writes it into `dNf` (one scalar) and the
+// pointer-taking solver entries below consume it in place. Same kernels, same operations: the value and every
+// quotient are bit-identical to the host-read path, which BRAE_NORMFACTOR_HOST=1 restores for the gate.
+void deviceNormFactorInto(const DeviceLduView& A, const DeviceBuffer<scalar>& psi,
+                          const DeviceBuffer<scalar>& b, const DeviceBuffer<scalar>& ones,
+                          DeviceBuffer<scalar>& dNf);
+bool normFactorOnHost();                    // BRAE_NORMFACTOR_HOST=1: the pointer entries read it and take the scalar path
+void announceNormFactorMode();              // once per process, from every pointer-taking solver entry
+
 
 DeviceSolverPerf deviceJacobiPCG(const DeviceLduView& A, const DeviceBuffer<scalar>& b,
                                  DeviceBuffer<scalar>& psi, scalar normFactor,
@@ -54,6 +65,12 @@ DeviceSolverPerf deviceJacobiBiCGStab(const DeviceLduView& A, const DeviceBuffer
                                       DeviceBuffer<scalar>& psi, scalar normFactor,
                                       scalar tol, scalar relTol, int maxIter, int checkEvery = 1, int minIter = 0,
                                       const DeviceDilu* precon = nullptr);
+// the same solve with the normFactor on the device (item 66)
+DeviceSolverPerf deviceJacobiBiCGStab(const DeviceLduView& A, const DeviceBuffer<scalar>& b,
+                                      DeviceBuffer<scalar>& psi, const scalar* dNormFactor,
+                                      scalar tol, scalar relTol, int maxIter, int checkEvery = 1, int minIter = 0,
+                                      const DeviceDilu* precon = nullptr);
+
 
 class DeviceHalo;   // forward (parallel/pstream/device_halo.cuh)
 

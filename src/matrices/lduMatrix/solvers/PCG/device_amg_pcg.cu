@@ -9,7 +9,8 @@
 #include "device_blas.cuh"          // dot / axpy / reductions
 #include "device_ldu.cuh"           // DeviceLduView / deviceAmul / deviceParallelAmul (distributed matvec)
 #include "device_halo.cuh"          // DeviceHalo + DeviceReducer (on-stream NVSHMEM reduce) for the distributed PCG
-#include "device_amg_detail.cuh"    // BRAE_HAS_GS_DEVICE, gsScaleInvK-adjacent constants + env flags + nBlocks/TPB
+#include "device_amg_detail.cuh"
+#include "device_pcg.cuh"         // normFactorOnHost, deviceReadScalar    // BRAE_HAS_GS_DEVICE, gsScaleInvK-adjacent constants + env flags + nBlocks/TPB
 #include "amg_kernels.cuh"          // zeroT<> etc. (if referenced)
 #include "device_amg_internal.cuh"  // LduF/cast_/amulF, gsScaleInvK, ensureSpectrum decl
 #include <cuda_runtime.h>
@@ -79,7 +80,7 @@ static DeviceSolverPerf deviceAMGPCGGraph(
     AMGData& amg,
     const DeviceBuffer<scalar>& b,
     DeviceBuffer<scalar>& psi,
-    scalar normFactor,
+    const scalar* dNormFactor,
     scalar tol,
     scalar relTol,
     int maxIter,
@@ -97,7 +98,7 @@ static DeviceSolverPerf deviceAMGPCGGraph(
     c.sInit.resize(1);
     c.sRes.resize(1);
     c.sIter.resize(1);
-    cudaMemcpyAsync(c.sNormF.data(), &normFactor, sizeof(scalar), cudaMemcpyHostToDevice, cudaStreamPerThread);
+    cudaMemcpyAsync(c.sNormF.data(), dNormFactor, sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
     scalar* dWArA = amg.sWArA.data();
     scalar* dWArAold = amg.sWArAold.data();
     scalar* dPap  = amg.sPap.data();
@@ -236,7 +237,7 @@ DeviceSolverPerf deviceParallelAMGPCGGraph(
     const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
     const DeviceBuffer<scalar>& b,
     DeviceBuffer<scalar>& psi,
-    scalar normFactor,
+    const scalar* dNormFactor,
     scalar tol,
     scalar relTol,
     int maxIter)
@@ -249,7 +250,7 @@ DeviceSolverPerf deviceParallelAMGPCGGraph(
     if (!amg.pcgCache) amg.pcgCache = std::make_unique<PCGGraphCache>();
     PCGGraphCache& c = *amg.pcgCache;
     c.pA.resize(nC); c.Ax.resize(nC); c.sNormF.resize(1); c.sInit.resize(1); c.sRes.resize(1); c.sIter.resize(1);
-    cudaMemcpyAsync(c.sNormF.data(), &normFactor, sizeof(scalar), cudaMemcpyHostToDevice, strm);
+    cudaMemcpyAsync(c.sNormF.data(), dNormFactor, sizeof(scalar), cudaMemcpyDeviceToDevice, strm);
     scalar* dWArA = amg.sWArA.data();  scalar* dWArAold = amg.sWArAold.data();
     scalar* dPap  = amg.sPap.data();   scalar* dAlpha = amg.sAlpha.data();
     scalar* dNegAlpha = amg.sNegAlpha.data(); scalar* dBeta = amg.sBeta.data();
@@ -388,7 +389,12 @@ DeviceSolverPerf deviceAMGPCG(
 #ifdef BRAE_HAS_GS_DEVICE
     {
         static const bool pcgDev = envFlag("BRAE_PCG_DEVICE", true);                 // device-resident pressure solve (default ON; opt out BRAE_PCG_DEVICE=0)
-        if (pcgDev && !corrScaling) return deviceAMGPCGGraph(A, amg, b, psi, normFactor, tol, relTol, maxIter, minIter);
+        if (pcgDev && !corrScaling)
+        {
+            static thread_local auto& dNf = *new DeviceBuffer<scalar>(1);
+            cudaMemcpyAsync(dNf.data(), &normFactor, sizeof(scalar), cudaMemcpyHostToDevice, cudaStreamPerThread);
+            return deviceAMGPCGGraph(A, amg, b, psi, dNf.data(), tol, relTol, maxIter, minIter);
+        }
     }
 #endif
     const int nC = A.nCells;
@@ -544,5 +550,27 @@ DeviceSolverPerf deviceAMGPCG(
 // Cast the fine + coarse matrices to their FP32 mirrors for this solve's V-cycles. Call ONCE per solve, AFTER
 // amgGalerkin has updated the FP64 operators (the coarse matrices change every SIMPLE step). No-op unless FP32
 // mixed precision applies (BRAE_AMG_FP32 default on; the SA/GS/Chebyshev paths stay FP64). After this,
+
+
+DeviceSolverPerf deviceAMGPCG(
+    const DeviceLduView& A,
+    AMGData& amg,
+    const DeviceBuffer<scalar>& b,
+    DeviceBuffer<scalar>& psi,
+    const scalar* dNormFactor,
+    scalar tol,
+    scalar relTol,
+    int maxIter,
+    bool captureVcycle,
+    int checkEvery,
+    bool corrScaling,
+    int minIter)
+{
+    announceNormFactorMode();
+    static const bool pcgDev = std::getenv("BRAE_PCG_DEVICE") == nullptr || std::string(std::getenv("BRAE_PCG_DEVICE")) != "0";
+    if (pcgDev && !corrScaling && !normFactorOnHost())
+        return deviceAMGPCGGraph(A, amg, b, psi, dNormFactor, tol, relTol, maxIter, minIter);
+    return deviceAMGPCG(A, amg, b, psi, deviceReadScalar(dNormFactor), tol, relTol, maxIter, captureVcycle, checkEvery, corrScaling, minIter);
+}
 
 } // namespace brae

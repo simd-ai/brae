@@ -146,6 +146,12 @@ DeviceSolverPerf deviceAMGPCG(const DeviceLduView& Afine, AMGData& amg, const De
                               DeviceBuffer<scalar>& psi, scalar normFactor, scalar tol, scalar relTol, int maxIter,
                               bool captureVcycle = false, int checkEvery = 1, bool corrScaling = false,
                               int minIter = 0);
+// the same solve with the normFactor on the device (item 66)
+DeviceSolverPerf deviceAMGPCG(const DeviceLduView& Afine, AMGData& amg, const DeviceBuffer<scalar>& b,
+                              DeviceBuffer<scalar>& psi, const scalar* dNormFactor, scalar tol, scalar relTol, int maxIter,
+                              bool captureVcycle = false, int checkEvery = 1, bool corrScaling = false,
+                              int minIter = 0);
+
 
 // z = M^-1 r : one symmetric AMG V-cycle applied as a PRECONDITIONER (the V-cycle factored out of deviceAMGPCG).
 // Used by the distributed Krylov (deviceParallelAMGPCG) to precondition each rank's LOCAL block with AMG -- the
@@ -205,6 +211,11 @@ scalar deviceSymGaussSeidel(const DeviceLduView& A, const DeviceBuffer<scalar>& 
                             // has no reverse half). Read from the case's `smoother` entry; they are
                             // different solvers and a loose solve stops in different places.
                             bool symmetric = true);   // returns the OF initialResidual; *perf (if given) gets init/final/nIter
+// The same solve with the normFactor on the device (item 66): the graph and host-smoother paths divide
+// by it there and the host never reads it; the host loop and the opt-in paths read it once.
+scalar deviceSymGaussSeidel(const DeviceLduView& A, const DeviceBuffer<scalar>& b, DeviceBuffer<scalar>& psi,
+                            const scalar* dNormFactor, scalar tol, scalar relTol, int maxIter,
+                            DeviceSolverPerf* perf = nullptr, int minIter = 0, int nSweeps = 1, bool symmetric = true);
 
 // The components of ONE vector matrix, solved together (item 60a): their systems share topology, upper
 // and lower; each has its own folded diagonal, source, normFactor, residual, sweep count and stop. One
@@ -218,6 +229,7 @@ struct GSFusedComponent
     const DeviceBuffer<scalar>* b = nullptr;
     DeviceBuffer<scalar>* psi = nullptr;
     scalar normFactor = 1.0;
+    const scalar* dNormFactor = nullptr;      // when set, the normFactor lives on the device and wins (item 66)
 };
 void deviceSymGaussSeidelFused(int nComp,
                                const GSFusedComponent* comps,

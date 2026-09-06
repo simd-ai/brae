@@ -465,22 +465,37 @@ void deviceSolveScalarTransport(
     // sumA comes from A applied to a field of ones, which is the row sum by definition, so the interface
     // off-diagonals are included exactly as deviceAmul accounts for them -- no second traversal to keep
     // in step with the LDU layout.
-    const scalar normF = [&]{
-        const int n = static_cast<int>(field.size());
-        if (n == 0) return scalar(1);
-        DeviceBuffer<scalar> sumA, Apsi, t, w;
-        const DeviceBuffer<scalar>& ones = deviceOnes(n);   // kept across calls; a pageable upload before
-        deviceAmul(sv, ones, sumA);                     // sumA = A * 1 = row sums
-        deviceAmul(sv, field, Apsi);                    // A.psi
-        const scalar xRef = deviceDot(field, ones) / static_cast<scalar>(n);
-        deviceCopy(t, sumA);
-        deviceScale(t, xRef);                           // t = sumA*xRef
-        deviceCopy(w, Apsi); deviceAxpy(-1.0, t, w);    // w = A.psi - t
-        scalar nf = deviceSumMag(w);
-        deviceCopy(w, B);    deviceAxpy(-1.0, t, w);    // w = b - t
-        nf += deviceSumMag(w);                          // sum|..| + sum|..| == sum(|..|+|..|)
-        return nf + scalar(1e-20);                      // solverPerformance::small_
-    }();
+    // Item 66: the same three reductions and the same operations (the divide by n, the sumA*xRef scale,
+    // the two sums, (n1 + n2) + 1e-20) stay on the device in deviceNormFactorInto, and the solvers
+    // divide by the result there; the host never reads it. BRAE_NORMFACTOR_HOST=1 keeps the previous
+    // host arithmetic below, the identity gate's other arm.
+    DeviceBuffer<scalar> dnf;
+    scalar normF = scalar(1);
+    if (normFactorOnHost())
+    {
+        normF = [&]{
+            const int n = static_cast<int>(field.size());
+            if (n == 0) return scalar(1);
+            DeviceBuffer<scalar> sumA, Apsi, t, w;
+            const DeviceBuffer<scalar>& ones = deviceOnes(n);
+            deviceAmul(sv, ones, sumA);                     // sumA = A * 1 = row sums
+            deviceAmul(sv, field, Apsi);                    // A.psi
+            const scalar xRef = deviceDot(field, ones) / static_cast<scalar>(n);
+            deviceCopy(t, sumA);
+            deviceScale(t, xRef);                           // t = sumA*xRef
+            deviceCopy(w, Apsi); deviceAxpy(-1.0, t, w);    // w = A.psi - t
+            scalar nf = deviceSumMag(w);
+            deviceCopy(w, B);    deviceAxpy(-1.0, t, w);    // w = b - t
+            nf += deviceSumMag(w);                          // sum|..| + sum|..| == sum(|..|+|..|)
+            return nf + scalar(1e-20);                      // solverPerformance::small_
+        }();
+        dnf.resize(1);
+        cudaMemcpyAsync(dnf.data(), &normF, sizeof(scalar), cudaMemcpyHostToDevice, cudaStreamPerThread);
+    }
+    else
+    {
+        deviceNormFactorInto(sv, field, B, deviceOnes(static_cast<int>(field.size())), dnf);
+    }
     DeviceSolverPerf perf;                                        // OF-style report: init/final/nIter for this scalar
     // The PER-CELL residual of this transport equation, r = B - A*psi, before the solve moves anything.
     // Same instrument as the momentum one: a global initial residual says a scalar equation disagrees
@@ -494,11 +509,12 @@ void deviceSolveScalarTransport(
         deviceCopy(r, B);
         deviceAxpy(-1.0, Apsi, r);
         stageDump(std::string("stage_resid_") + fieldName, r);
-        stageDump(std::string("stage_resid_") + fieldName + "_normFactor", std::vector<scalar>(1, normF));
+        stageDump(std::string("stage_resid_") + fieldName + "_normFactor",
+                  std::vector<scalar>(1, normFactorOnHost() ? normF : deviceReadScalar(dnf.data())));
     }
     // The smoothSolver the case asked for, algorithm included: OpenFOAM's own sweep, level-scheduled
     // (device_sym_gauss_seidel.cuh), symmetric or ascending-only as the `smoother` entry names.
-    if (gs) deviceSymGaussSeidel(sv, B, field, normF, tol, relTolKE, 3000, &perf, /*minIter*/0, nSweeps,
+    if (gs) deviceSymGaussSeidel(sv, B, field, dnf.data(), tol, relTolKE, 3000, &perf, /*minIter*/0, nSweeps,
                                  gsSymmetric);
     // DILU when the case asks for it, Jacobi otherwise. NOT a cost choice: both reach the requested
     // relTol, but they stop in different places -- on turbulentFlatPlate:kEpsilon OpenFOAM's DILU solve
@@ -507,7 +523,7 @@ void deviceSolveScalarTransport(
     else
     {
         const DeviceDilu* pc = precon ? precon : turbPrecon();
-        perf = deviceJacobiBiCGStab(sv, B, field, normF, tol, relTolKE, 3000, keCheckEvery, 0,
+        perf = deviceJacobiBiCGStab(sv, B, field, dnf.data(), tol, relTolKE, 3000, keCheckEvery, 0,
                                     (pc && pc->valid) ? pc : nullptr);
     }
     turbStore().push_back({fieldName, perf});                    // record for the "Solving for <field>" line
