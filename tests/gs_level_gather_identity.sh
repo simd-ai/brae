@@ -15,6 +15,9 @@
 #   ARM 3   validation/duct3d_cf (72,000 cells, three components, GaussSeidel), 20 iterations.
 #   ARMS    the announces name the gather each arm ran ("level-ordered gather" / "index gather").
 #   CONTROL T3A at relTol 0.01 on U under the index gather must differ from ARM 1's index arm.
+# Since item 68 the DEFAULT smoother runs on the host; BRAE_GS_HOST_SMOOTHER=0 pins the device loop this
+# gate is about (its announce assertions would fail loudly otherwise -- the arms would compare the host
+# smoother with itself).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
@@ -48,8 +51,8 @@ arm() {   # arm <label> <fixture> <endTime> <extraEnv> <minLines> <fields...>
     local label=$1 fx=$2 n=$3 extra=$4 minl=$5; shift 5
     local dl="$W/${label// /_}_${fx}_l" di="$W/${label// /_}_${fx}_i"
     prep "$dl" "$fx" "$n"; prep "$di" "$fx" "$n"
-    run "$dl" "BRAE_SIMPLEFOAM_V2=1 $extra"
-    run "$di" "BRAE_GS_LEVEL_GATHER=0 BRAE_SIMPLEFOAM_V2=1 $extra"
+    run "$dl" "BRAE_GS_HOST_SMOOTHER=0 BRAE_SIMPLEFOAM_V2=1 $extra"
+    run "$di" "BRAE_GS_HOST_SMOOTHER=0 BRAE_GS_LEVEL_GATHER=0 BRAE_SIMPLEFOAM_V2=1 $extra"
     grep -qE "level-ordered gather" "$dl/log" && ! grep -qE "index gather" "$dl/log" && say "$label  the gather arm announces the level-ordered gather only" ok || say "$label  the gather arm announces the level-ordered gather only" FAIL
     grep -qE "index gather" "$di/log" && ! grep -qE "level-ordered gather" "$di/log" && say "$label  the BRAE_GS_LEVEL_GATHER=0 arm announces the index gather only" ok || say "$label  the BRAE_GS_LEVEL_GATHER=0 arm announces the index gather only" FAIL
     local nl; nl=$(lines "$dl" | wc -l); echo "  $label  $fx: $nl log lines compared"
@@ -64,7 +67,7 @@ arm "ARM 1" T3A 50 "" 200 U p k omega nut ReThetat gammaInt phi
 arm "ARM 2" T3A 20 "BRAE_GS_PER_LEVEL=1" 80 U p k omega nut phi
 grep -q "per-level launches" "$W/ARM_2_T3A_l/log" && say "ARM 2  ...and that arm walked per-level launches" ok || say "ARM 2  ...and that arm walked per-level launches" FAIL
 arm "ARM 3" duct3d_cf 20 "" 100 U p phi
-prep "$W/T3A_c" T3A 50 0.01; run "$W/T3A_c" "BRAE_GS_LEVEL_GATHER=0 BRAE_SIMPLEFOAM_V2=1"
+prep "$W/T3A_c" T3A 50 0.01; run "$W/T3A_c" "BRAE_GS_HOST_SMOOTHER=0 BRAE_GS_LEVEL_GATHER=0 BRAE_SIMPLEFOAM_V2=1"
 if diff <(lines "$W/ARM_1_T3A_i") <(lines "$W/T3A_c") > /dev/null; then say "CONTROL  relTol 0.01 on U changes the Solving-for lines (so ARM 1 can fail)" FAIL
 else say "CONTROL  relTol 0.01 on U changes the Solving-for lines (so ARM 1 can fail)" ok; fi
 [ $fail -eq 0 ] && echo "PASS: the level-ordered Gauss-Seidel gather is the index gather, byte for byte"

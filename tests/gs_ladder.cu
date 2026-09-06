@@ -303,16 +303,88 @@ int main(int argc, char** argv)
         DeviceBuffer<scalar> tPsi;
         tPsi.copyFrom(psi0);
         const DeviceGaussSeidelLevels& lv = gsLevelsFor(A);
-        deviceSymGaussSeidelSweepExact(A, dB, tPsi, lv);   // warm the levels and the kernel
+        // the walk-order operands once, as the solver refreshes them once per solve (a null hands the
+        // sweep a scratch it re-permutes every call, which would time the permutation, not the walk)
+        GSLevelCoefs lc;
+        GSLevelCells cc;
+        gsLevelCoefsRefresh(A, lv, lc);
+        gsLevelCellsRefresh(A, dB, lv, cc);
+        deviceSymGaussSeidelSweepExact(A, dB, tPsi, lv, true, &lc, &cc);   // warm the levels and the kernel
         cudaDeviceSynchronize();
         const auto t0 = std::chrono::steady_clock::now();
-        for (int s = 0; s < 10; ++s) deviceSymGaussSeidelSweepExact(A, dB, tPsi, lv);
+        for (int s = 0; s < 10; ++s) deviceSymGaussSeidelSweepExact(A, dB, tPsi, lv, true, &lc, &cc);
         cudaDeviceSynchronize();
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         std::printf("  TIMING  10 symmetric sweeps, %d levels (widest %d cells), %s: %.2f ms  (%.1f us per half-sweep)\n",
                     lv.levels(), lv.maxLevelWidth,
                     std::getenv("BRAE_GS_PER_LEVEL") ? "per-level launches" : "single-block walk",
                     ms, 1000.0 * ms / 20.0);
+    }
+    // ...and the same ten sweeps on the HOST (item 68's question): the transcription above IS the exact
+    // sweep, so a host momentum smoother would cost this plus, per solve, the download of the folded
+    // system and the field and the upload of the result. Reported beside the device number so the
+    // choice is a measurement; single-threaded, because the sweep is a recurrence.
+    {
+        std::vector<scalar> psi(psi0), bPrime(static_cast<std::size_t>(nC));
+        double msHost = 1e30;
+        for (int rep = 0; rep < 3; ++rep)   // best of three: the host number moved 2x between runs once
+        {
+        psi = psi0;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int s = 0; s < 10; ++s)
+        {
+            bPrime = src;
+            for (label c = 0; c < nC; ++c)
+            {
+                scalar psii = bPrime[c];
+                for (label f = ownStart[c]; f < ownStart[c + 1]; ++f) psii -= upper[f] * psi[nei[f]];
+                psii /= diag[c];
+                for (label f = ownStart[c]; f < ownStart[c + 1]; ++f) bPrime[nei[f]] -= lower[f] * psii;
+                psi[c] = psii;
+            }
+            for (label c = nC - 1; c >= 0; --c)
+            {
+                scalar psii = bPrime[c];
+                for (label f = ownStart[c]; f < ownStart[c + 1]; ++f) psii -= upper[f] * psi[nei[f]];
+                psii /= diag[c];
+                psi[c] = psii;
+            }
+        }
+        msHost = std::fmin(msHost, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        }
+        // Is the host transcription's psi the device walk's, BIT FOR BIT? Both subtract the same terms
+        // in the same order and both contract to a fused multiply-add, so they should be; the residual
+        // rows above cannot say (their norms are summed in different orders). Reported, not asserted:
+        // this is item 68's admissibility question.
+        {
+            DeviceBuffer<scalar> dPsiH;
+            dPsiH.copyFrom(psi0);
+            const DeviceGaussSeidelLevels& lvH = gsLevelsFor(A);
+            for (int s = 0; s < 10; ++s) deviceSymGaussSeidelSweepExact(A, dB, dPsiH, lvH);
+            std::vector<scalar> devPsi;
+            dPsiH.copyTo(devPsi);
+            std::size_t nDiff = 0;
+            double maxRel = 0;
+            for (label c = 0; c < nC; ++c)
+            {
+                if (devPsi[c] != psi[c]) ++nDiff;
+                maxRel = std::fmax(maxRel, std::fabs(devPsi[c] - psi[c]) / std::fmax(std::fabs(psi[c]), 1e-300));
+            }
+            std::printf("  HOST-VS-DEVICE  psi after 10 symmetric sweeps: %zu of %d cells differ, max rel %.3e\n", nDiff, (int)nC, maxRel);
+        }
+        // the per-solve traffic: diag, upper, lower, source and psi down, psi back up (pageable, as the
+        // solver's own reads are)
+        std::vector<scalar> hDiag(nC), hUp(nIf), hLo(nIf), hSrc(nC), hPsi(nC);
+        DeviceBuffer<scalar> dPsiT;
+        dPsiT.copyFrom(psi0);
+        cudaDeviceSynchronize();
+        const auto t1 = std::chrono::steady_clock::now();
+        dDiag.copyTo(hDiag); dUp.copyTo(hUp); dLo.copyTo(hLo); dB.copyTo(hSrc); dPsiT.copyTo(hPsi);
+        dPsiT.copyFrom(hPsi);
+        cudaDeviceSynchronize();
+        const double msXfer = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+        std::printf("  TIMING  host: 10 symmetric sweeps %.2f ms (%.1f us per half-sweep); per-solve transfers %.2f ms (%d cells, %d faces)\n",
+                    msHost, 1000.0 * msHost / 20.0, msXfer, (int)nC, (int)nIf);
     }
 
     char buf[220];

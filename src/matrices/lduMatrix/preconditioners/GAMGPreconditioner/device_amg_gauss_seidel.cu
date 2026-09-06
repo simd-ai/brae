@@ -13,6 +13,8 @@
 #include "device_blas.cuh"         // deviceCopy / deviceAxpy / deviceSumMagInto
 #include <cuda_runtime.h>
 #include <map>
+#include <cstring>
+#include <thread>
 #include <string>
 #include <vector>
 #include <cstdio>
@@ -442,6 +444,231 @@ static void deviceSymGaussSeidelGraphFused(
 }
 #endif // CUDART_VERSION >= 13000
 
+// ---------------------------------------------------------------------------------------------------
+// THE HOST SMOOTHER (item 68). OpenFOAM's sweep is a recurrence; on the device it is level-scheduled and
+// pays a dependent-load latency plus a barrier per level (~1.5 us on the composed flat plate's 929
+// levels after items 60a/60b), while one CPU core walks the same cells in the same order at ~3 ns each.
+// Measured by tests/gs_ladder (best of three): a symmetric sweep of the 209,825-cell flat plate is
+// 2.98 ms on the device and 1.22 ms on the host; of T3A 0.88 against 0.33. And the host transcription's
+// psi is the device walk's TO THE BIT (gs_ladder HOST-VS-DEVICE: 0 of 209,825 cells differ after ten
+// sweeps) -- same terms, same order, both contracted to a fused multiply-add. So the sweeps run here,
+// one thread per component, and EVERYTHING THAT DECIDES stays on the device: after each batch of
+// sweeps the field is uploaded and the residual is the same amul/copy/axpy/sumMag the graph path runs,
+// the stop test is gsSetCondK's on the same doubles, and the report is the same numbers. Byte-identical
+// to the device loop (tests/gs_host_smoother_identity); BRAE_GS_HOST_SMOOTHER=1 selects it.
+namespace
+{
+struct HostGSTopo
+{
+    int nC = 0, nF = 0;
+    std::vector<label> ownStart, nei;
+};
+const HostGSTopo& hostGsTopoFor(const DeviceLduView& A)
+{
+    static auto& cache = *new std::map<const void*, HostGSTopo>();
+    auto it = cache.find(A.owner);
+    if (it != cache.end() && (it->second.nC != A.nCells || it->second.nF != A.nInternalFaces))
+    {
+        cache.erase(it);
+        it = cache.end();
+    }
+    if (it == cache.end())
+    {
+        HostGSTopo t;
+        t.nC = A.nCells;
+        t.nF = A.nInternalFaces;
+        t.ownStart.resize((std::size_t)t.nC + 1);
+        t.nei.resize((std::size_t)t.nF);
+        cudaCheck(cudaMemcpy(t.ownStart.data(), A.ownerStart, ((std::size_t)t.nC + 1)*sizeof(label), cudaMemcpyDeviceToHost), "gs host ownerStart");
+        cudaCheck(cudaMemcpy(t.nei.data(),      A.nei,       (std::size_t)t.nF*sizeof(label),        cudaMemcpyDeviceToHost), "gs host nei");
+        it = cache.emplace(A.owner, std::move(t)).first;
+    }
+    return it->second;
+}
+struct HostGSCache
+{
+    int nC = 0, nF = 0;
+    scalar* upper = nullptr;                              // pinned, nF
+    scalar* lower = nullptr;
+    scalar* diag[GS_FUSED_MAX] = {};                      // pinned, nC each
+    scalar* b[GS_FUSED_MAX] = {};
+    scalar* psi[GS_FUSED_MAX] = {};
+    std::vector<scalar> bPrime[GS_FUSED_MAX];
+    DeviceBuffer<scalar> Ax[GS_FUSED_MAX], r[GS_FUSED_MAX];
+    DeviceBuffer<scalar> gRes;
+    scalar* hRes = nullptr;                               // pinned, GS_FUSED_MAX
+};
+void pinnedResize(scalar*& p, std::size_t n)
+{
+    if (p) cudaFreeHost(p);
+    p = nullptr;
+    if (n) cudaCheck(cudaMallocHost(reinterpret_cast<void**>(&p), n*sizeof(scalar)), "gs host pinned");
+}
+// symGaussSeidelSmoother.C:143-198 / GaussSeidelSmoother.C:143-172, verbatim: bPrime = source, the
+// ascending walk gathering the upper side and distributing the lower, the descending walk re-reading
+// the bPrime the ascending one left. tests/gs_ladder LEG 1 holds this to OpenFOAM's residual ladder.
+void hostSweep(
+    const HostGSTopo& t,
+    const scalar* __restrict__ upper,
+    const scalar* __restrict__ lower,
+    const scalar* __restrict__ diag,
+    const scalar* __restrict__ b,
+    scalar* __restrict__ psi,
+    scalar* __restrict__ bPrime,
+    bool symmetric)
+{
+    const label nC = t.nC;
+    const label* __restrict__ ownStart = t.ownStart.data();
+    const label* __restrict__ nei      = t.nei.data();
+    std::memcpy(bPrime, b, (std::size_t)nC*sizeof(scalar));
+    for (label c = 0; c < nC; ++c)
+    {
+        scalar psii = bPrime[c];
+        for (label f = ownStart[c]; f < ownStart[c + 1]; ++f) psii -= upper[f]*psi[nei[f]];
+        psii /= diag[c];
+        for (label f = ownStart[c]; f < ownStart[c + 1]; ++f) bPrime[nei[f]] -= lower[f]*psii;
+        psi[c] = psii;
+    }
+    if (!symmetric) return;
+    for (label c = nC - 1; c >= 0; --c)
+    {
+        scalar psii = bPrime[c];
+        for (label f = ownStart[c]; f < ownStart[c + 1]; ++f) psii -= upper[f]*psi[nei[f]];
+        psii /= diag[c];
+        psi[c] = psii;
+    }
+}
+void hostSymGaussSeidelFused(
+    int nComp,
+    const GSFusedComponent* comps,
+    scalar tol,
+    scalar relTol,
+    int maxIter,
+    int minIter,
+    int sweepsPer,
+    bool symmetric,
+    DeviceSolverPerf* perf)
+{
+    const DeviceLduView& A0 = *comps[0].A;
+    const HostGSTopo& topo = hostGsTopoFor(A0);
+    static auto& cache = *new std::map<const void*, HostGSCache>();
+    HostGSCache& c = cache[comps[0].psi->data()];
+    const int nC = A0.nCells, nF = A0.nInternalFaces;
+    if (c.nC != nC || c.nF != nF)
+    {
+        pinnedResize(c.upper, nF);
+        pinnedResize(c.lower, nF);
+        for (int k = 0; k < GS_FUSED_MAX; ++k)
+        {
+            pinnedResize(c.diag[k], nC);
+            pinnedResize(c.b[k], nC);
+            pinnedResize(c.psi[k], nC);
+            c.bPrime[k].resize((std::size_t)nC);
+        }
+        pinnedResize(c.hRes, GS_FUSED_MAX);
+        c.gRes.resize(GS_FUSED_MAX);
+        c.nC = nC;
+        c.nF = nF;
+    }
+    // the folded system and the field, down (one sync); the initial residuals on the device meanwhile
+    cudaMemcpyAsync(c.upper, A0.upper, (std::size_t)nF*sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread);
+    cudaMemcpyAsync(c.lower, A0.lower, (std::size_t)nF*sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread);
+    scalar nf[GS_FUSED_MAX], init[GS_FUSED_MAX], fin[GS_FUSED_MAX];
+    int iter[GS_FUSED_MAX], active[GS_FUSED_MAX], startedActive[GS_FUSED_MAX];
+    for (int k = 0; k < nComp; ++k)
+    {
+        const DeviceLduView& Ak = *comps[k].A;
+        cudaMemcpyAsync(c.diag[k], Ak.diag,               (std::size_t)nC*sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread);
+        cudaMemcpyAsync(c.b[k],    comps[k].b->data(),    (std::size_t)nC*sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread);
+        cudaMemcpyAsync(c.psi[k],  comps[k].psi->data(),  (std::size_t)nC*sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread);
+        c.Ax[k].resize(nC);
+        c.r[k].resize(nC);
+        deviceAmul(Ak, *comps[k].psi, c.Ax[k]);
+        deviceCopy(c.r[k], *comps[k].b);
+        deviceAxpy(-1.0, c.Ax[k], c.r[k]);
+        deviceSumMagInto(c.r[k], c.gRes.data() + k);
+        nf[k] = comps[k].normFactor;
+    }
+    cudaMemcpyAsync(c.hRes, c.gRes.data(), (std::size_t)nComp*sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread);
+    cudaStreamSynchronize(cudaStreamPerThread);
+    int nActive = 0;
+    for (int k = 0; k < nComp; ++k)
+    {
+        init[k] = c.hRes[k] / nf[k];                 // the graph's gsScaleInvNK, on the host: the same division
+        fin[k]  = init[k];
+        iter[k] = 0;
+        active[k] = (init[k] < tol && minIter <= 0) ? 0 : 1;
+        startedActive[k] = active[k];
+        nActive += active[k];
+        perf[k] = {init[k], init[k], 0};
+    }
+    while (nActive > 0)
+    {
+        // the sweeps: one thread per active component (pure CPU; nothing here touches the device)
+        std::vector<std::thread> pool;
+        for (int k = 0; k < nComp; ++k)
+        {
+            if (!active[k]) continue;
+            pool.emplace_back([&, k]()
+            {
+                for (int sw = 0; sw < sweepsPer; ++sw)
+                    hostSweep(topo, c.upper, c.lower, c.diag[k], c.b[k], c.psi[k], c.bPrime[k].data(), symmetric);
+            });
+        }
+        for (auto& th : pool) th.join();
+        // the residual, exactly as the graph evaluates it, on the uploaded field
+        for (int k = 0; k < nComp; ++k)
+        {
+            if (!active[k]) continue;
+            cudaMemcpyAsync(comps[k].psi->data(), c.psi[k], (std::size_t)nC*sizeof(scalar), cudaMemcpyHostToDevice, cudaStreamPerThread);
+            deviceAmul(*comps[k].A, *comps[k].psi, c.Ax[k]);
+            deviceCopy(c.r[k], *comps[k].b);
+            deviceAxpy(-1.0, c.Ax[k], c.r[k]);
+            deviceSumMagInto(c.r[k], c.gRes.data() + k);
+        }
+        cudaMemcpyAsync(c.hRes, c.gRes.data(), (std::size_t)nComp*sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread);
+        cudaStreamSynchronize(cudaStreamPerThread);
+        // gsSetCondK / gsFusedCondK, on the host, on the same doubles
+        for (int k = 0; k < nComp; ++k)
+        {
+            if (!active[k]) continue;
+            const int it = (iter[k] += sweepsPer);
+            const scalar r = c.hRes[k] / nf[k];
+            fin[k] = r;
+            const bool converged = ((r < tol) || (r < relTol * init[k])) && (it >= minIter);
+            const bool stop = converged || (it >= maxIter);
+            if (stop)
+            {
+                active[k] = 0;
+                --nActive;
+            }
+        }
+    }
+    for (int k = 0; k < nComp; ++k)
+        if (startedActive[k]) perf[k] = {init[k], fin[k], iter[k]};
+}
+// THE DEFAULT, from measurement (warm 40-minus-20, two repeats, V2): T3A 27-29 -> 16.5 ms per outer
+// iteration, the composed flat plate 68-69 -> 60, every solve line and field identical. The device loop
+// stays one switch away for the identity gates and for a machine whose host-device link makes the
+// per-solve download dear; the announce says which ran.
+bool hostSmootherSelected()
+{
+    static const bool on = []()
+    {
+        const char* e = std::getenv("BRAE_GS_HOST_SMOOTHER");
+        return !(e && std::string(e) == "0");
+    }();
+    return on;
+}
+void announceHostSmoother(int nComp)
+{
+    static bool announced = false;
+    if (announced) return;
+    announced = true;
+    std::printf("  smoothSolver: host smoother (OpenFOAM's sweep on the CPU, %d thread(s); residual, stop and report on the device); BRAE_GS_HOST_SMOOTHER=0 restores the device loop\n", nComp);
+}
+}   // namespace
+
 void deviceSymGaussSeidelFused(
     int nComp,
     const GSFusedComponent* comps,
@@ -464,9 +691,16 @@ void deviceSymGaussSeidelFused(
     for (int k = 1; k < nComp && shared; ++k)
         shared = comps[k].A->upper == comps[0].A->upper && comps[k].A->lower == comps[0].A->lower
               && comps[k].A->owner == comps[0].A->owner && comps[k].A->nCells == comps[0].A->nCells;
+    static const bool optIn = std::getenv("BRAE_TURB_FP32") != nullptr || std::getenv("BRAE_TURB_JACOBI") != nullptr;
+    static const bool hostLoopArm = std::getenv("BRAE_GS_HOST_LOOP") != nullptr;
+    if (shared && !optIn && !hostLoopArm && hostSmootherSelected())
+    {
+        announceHostSmoother(nComp);
+        hostSymGaussSeidelFused(nComp, comps, tol, relTol, maxIter, minIter, (nSweeps > 1) ? nSweeps : 1, symmetric, perf);
+        return;
+    }
 #ifdef BRAE_HAS_GS_DEVICE
     static const bool hostLoop = std::getenv("BRAE_GS_HOST_LOOP") != nullptr;
-    static const bool optIn = std::getenv("BRAE_TURB_FP32") != nullptr || std::getenv("BRAE_TURB_JACOBI") != nullptr;
     if (shared && !hostLoop && !optIn)
     {
         static bool announced = false;
@@ -588,6 +822,17 @@ scalar deviceSymGaussSeidel(
     // same stop -- tests/gs_device_loop_identity holds the two paths' logs byte-identical over 50 T3A
     // iterations. BRAE_GS_HOST_LOOP=1 forces the host loop (identity checks and measurement); a toolkit
     // without conditional graph nodes (CUDA < 13) takes it unconditionally.
+    static const bool hostLoopArm = std::getenv("BRAE_GS_HOST_LOOP") != nullptr;   // the device graph's identity arm keeps its loop
+    if (hostSmootherSelected() && !hostLoopArm)
+    {
+        announceHostSmoother(1);
+        GSFusedComponent one;
+        one.A = &A; one.b = &b; one.psi = &psi; one.normFactor = normFactor;
+        DeviceSolverPerf p;
+        hostSymGaussSeidelFused(1, &one, tol, relTol, maxIter, minIter, sweepsPer, symmetric, &p);
+        if (perf) *perf = p;
+        return p.initialResidual;
+    }
 #ifdef BRAE_HAS_GS_DEVICE
     static const bool hostLoop = std::getenv("BRAE_GS_HOST_LOOP") != nullptr;
     if (!hostLoop)

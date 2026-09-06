@@ -13,6 +13,9 @@
 #   ARM 2  the two runs differ in nothing else either: the written fields at 50 are identical files.
 #   CONTROL the comparison can fail: the host-loop run against a third run at a different relTol on U
 #          must DIFFER in its Solving-for lines, so "identical" is not "the diff never looked".
+# Since item 68 the DEFAULT smoother runs on the host; BRAE_GS_HOST_SMOOTHER=0 pins the device loop this
+# gate is about (its announce assertions would fail loudly otherwise -- the arms would compare the host
+# smoother with itself).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
@@ -41,7 +44,7 @@ if rt:
 PY
 }
 prep "$W/dev"; prep "$W/host"; prep "$W/ctl" 0.01
-( cd "$W/dev"  && BRAE_SIMPLEFOAM_V2=1 "$BRAE" "$W/dev"  > log 2>&1 ) || { echo "FAIL: device-loop run crashed"; tail -5 "$W/dev/log"; exit 1; }
+( cd "$W/dev"  && BRAE_GS_HOST_SMOOTHER=0 BRAE_SIMPLEFOAM_V2=1 "$BRAE" "$W/dev"  > log 2>&1 ) || { echo "FAIL: device-loop run crashed"; tail -5 "$W/dev/log"; exit 1; }
 ( cd "$W/host" && BRAE_GS_HOST_LOOP=1 BRAE_SIMPLEFOAM_V2=1 "$BRAE" "$W/host" > log 2>&1 ) || { echo "FAIL: host-loop run crashed"; tail -5 "$W/host/log"; exit 1; }
 ( cd "$W/ctl"  && BRAE_GS_HOST_LOOP=1 BRAE_SIMPLEFOAM_V2=1 "$BRAE" "$W/ctl"  > log 2>&1 ) || { echo "FAIL: control run crashed"; tail -5 "$W/ctl/log"; exit 1; }
 lines() { grep -E "^Time = |Solving for" "$1/log"; }

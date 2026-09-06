@@ -23,6 +23,9 @@
 #           not the per-component walk compared with itself.
 #   CONTROL T3A at relTol 0.01 on U under BRAE_GS_FUSED=0 must DIFFER from ARM 1's unfused run in its
 #           Solving-for lines, so the line comparison has resolution.
+# Since item 68 the DEFAULT smoother runs on the host; BRAE_GS_HOST_SMOOTHER=0 pins the device loop this
+# gate is about (its announce assertions would fail loudly otherwise -- the arms would compare the host
+# smoother with itself).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
@@ -56,8 +59,8 @@ run() { ( cd "$1" && env $2 "$BRAE" "$1" > log 2>&1 ) || { echo "FAIL: brae cras
 arm() {   # arm <label> <fixture> <endTime> <minLines> <fields...>
     local label=$1 fx=$2 n=$3 minl=$4; shift 4
     prep "$W/${fx}_f" "$fx" "$n"; prep "$W/${fx}_u" "$fx" "$n"
-    run "$W/${fx}_f" "BRAE_SIMPLEFOAM_V2=1"
-    run "$W/${fx}_u" "BRAE_GS_FUSED=0 BRAE_SIMPLEFOAM_V2=1"
+    run "$W/${fx}_f" "BRAE_GS_HOST_SMOOTHER=0 BRAE_SIMPLEFOAM_V2=1"
+    run "$W/${fx}_u" "BRAE_GS_HOST_SMOOTHER=0 BRAE_GS_FUSED=0 BRAE_SIMPLEFOAM_V2=1"
     local ann; ann=$(grep -m1 "symGaussSeidel: fused walk" "$W/${fx}_f/log" | sed 's/^ *//')
     [ -n "$ann" ] && say "$label  fused arm announces: ${ann:0:60}" ok || say "$label  the fused arm announces the fused walk" FAIL
     grep -q "symGaussSeidel: fused walk" "$W/${fx}_u/log" && say "$label  the BRAE_GS_FUSED=0 arm does not announce it" FAIL || say "$label  the BRAE_GS_FUSED=0 arm does not announce it" ok
@@ -73,7 +76,7 @@ arm "ARM 1" T3A 50 200 U p k omega nut phi     # Time + Ux + Uy + p per iteratio
 arm "ARM 2" cav3d_cf 30 120 U p phi
 arm "ARM 3" duct3d_cf 20 80 U p phi
 # CONTROL
-prep "$W/T3A_c" T3A 50 0.01; run "$W/T3A_c" "BRAE_GS_FUSED=0 BRAE_SIMPLEFOAM_V2=1"
+prep "$W/T3A_c" T3A 50 0.01; run "$W/T3A_c" "BRAE_GS_HOST_SMOOTHER=0 BRAE_GS_FUSED=0 BRAE_SIMPLEFOAM_V2=1"
 if diff <(lines "$W/T3A_u") <(lines "$W/T3A_c") > /dev/null; then say "CONTROL  relTol 0.01 on U changes the Solving-for lines (so ARM 1 can fail)" FAIL
 else say "CONTROL  relTol 0.01 on U changes the Solving-for lines (so ARM 1 can fail)" ok; fi
 [ $fail -eq 0 ] && echo "PASS: the fused Gauss-Seidel walk is the per-component walk, byte for byte"

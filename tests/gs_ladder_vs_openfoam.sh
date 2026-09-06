@@ -15,6 +15,8 @@
 # tests/gs_ladder.cu reads all of it and runs both a transcription of OpenFOAM's smoother and brae's own.
 #
 # This gate needs no brae binary: the case never runs through brae. It is the sweep alone.
+# LEG 2 and LEG 4 are about the DEVICE sweep; since item 68 the default smoother runs on the host, so the
+# device loop is pinned here (the host smoother's own identity to it is tests/gs_host_smoother_identity).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${GS_LADDER_BIN:-$ROOT/build/gs_ladder}"
@@ -86,10 +88,10 @@ if di > 1e-12 or df > 1e-12:
     print("FAIL: the ladder does not reproduce the solve OpenFOAM actually ran"); sys.exit(1)
 PY
 
-"$BIN" "$W/of" 1
+BRAE_GS_HOST_SMOOTHER=0 "$BIN" "$W/of" 1
 rc=$?
 # The same binary once more with the per-level launches forced, for the timing line only: the
 # assertions above already passed on the single-block walk, and the numbers are identical either way.
-[ $rc -eq 0 ] && BRAE_GS_PER_LEVEL=1 "$BIN" "$W/of" 1 | grep "TIMING"
+[ $rc -eq 0 ] && BRAE_GS_HOST_SMOOTHER=0 BRAE_GS_PER_LEVEL=1 "$BIN" "$W/of" 1 | grep "TIMING"
 [ $rc -eq 0 ] && echo "PASS: both of OpenFOAM's GaussSeidel smoothers are brae's, sweep for sweep"
 exit $rc
