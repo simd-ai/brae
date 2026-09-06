@@ -37,7 +37,13 @@ struct PCGGraphCache {
     // controls. Sentinels chosen so the first solve always misses.
     scalar keyTol = -1.0; scalar keyRelTol = -1.0; int keyMaxIter = -1; int keyMinIter = -1;
     int keyEpoch = -1;   // deviceReductionScratchEpoch() at capture (same hazard as AMGGraphCache)
+    // The whole solve is captured now (item 72), so the graph also holds the MESH pointers and the sizes
+    // it was built for; a different matrix on the same psi must rebuild rather than replay.
+    const void* keyOwner = nullptr; int keyNC = -1; int keyNF = -1;
     DeviceBuffer<scalar> pA, Ax, sNormF, sInit, sRes; DeviceBuffer<int> sIter;   // persistent (graph-referenced)
+    // ...and the right-hand side and the fine matrix, copied in per solve, because a captured prologue
+    // bakes their pointers and the callers hand in fresh buffers each time.
+    DeviceBuffer<scalar> gB, gDiag, gUpper, gLower;
     ~PCGGraphCache();
 };
 

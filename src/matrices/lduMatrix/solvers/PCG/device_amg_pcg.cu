@@ -15,6 +15,7 @@
 #include "device_amg_internal.cuh"  // LduF/cast_/amulF, gsScaleInvK, ensureSpectrum decl
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <vector>
 #include <cstdlib>
 #include <map>
 #include <string>
@@ -51,12 +52,56 @@ void flexBetaK(
 // iteration (V-cycle precond -> dot -> beta -> p-update -> SpMV -> dot -> alpha -> axpy x -> axpy r -> residual ->
 // stop-test) is captured once into a conditional WHILE graph and replayed on-device, with a 1-thread pcgSetCondK
 // driving cudaGraphSetConditional() from the same per-iter predicate (res<tol || res<relTol*init || iter>=maxIter).
-// So the whole pressure solve is one graph launch, zero per-iter D2H, exact (same iteration count and psi as the host
-// PCG). Iteration 0 differs (p=w, no beta) so it runs explicitly first (one residual read for the rare converge-in-1
-// early-out); the WHILE body is the uniform iter-1+ recurrence. The pressure matrix is stable across SIMPLE steps
-// (the V-cycle graph already keys on A.diag), so no matrix copy is needed; the graph references A, psi, amg.rA/wA and
-// the cache's persistent pA/Ax directly. Non-corrScaling only (flexible-CG falls back to the host loop); normFactor
-// is a device-resident scalar.
+// So the whole pressure solve is ONE graph launch and ONE host read (item 72), exact (same iteration count and psi
+// as the host PCG). It used to read three times: the initial residual, the end of iteration 0, and the report -- and
+// each read drains a launch queue the driver runs about a millisecond ahead of the GPU (item 65's lesson). Iteration
+// 0 differs from the rest only in the search direction (p = w, no beta), so it is no longer a separate host-driven
+// step: it is the WHILE body's first execution, with pcgSearchDirK taking the p = w branch on the iteration counter,
+// and the initial early-out is the WHILE handle's own start value, set on the device by pcgStartCondK. Both branches
+// are the arithmetic the host path ran, statement for statement. The right-hand side and the fine matrix are copied
+// into cache-owned buffers because a captured prologue bakes their pointers and the callers hand in fresh ones.
+// Non-corrScaling only (flexible-CG falls back to the host loop); normFactor is a device-resident scalar.
+// The search direction, with iteration 0's branch on the device. beta is scalarDivK's expression, guard
+// included, so a replayed iteration is the host path's iteration to the bit; iteration 0 assigns p = w
+// exactly as its deviceCopy did.
+__global__
+void pcgSearchDirK(
+    scalar* __restrict__ p,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ num,     // wArA
+    const scalar* __restrict__ den,     // wArAold
+    const int* __restrict__ iter,
+    int n)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (*iter == 0) { p[i] = w[i]; return; }
+    const scalar d = *den;
+    const scalar beta = (fabs(d) > scalar(1e-300)) ? (*num) / d : scalar(0);
+    p[i] = __dmul_rn(beta, p[i]) + w[i];
+}
+
+// The loop's START value: the host used to read the initial residual and decide here. The test is the
+// one it applied -- OF's `minIter > 0 || !converged(initialResidual)` -- and it also seeds the report so
+// that a solve which runs no iteration at all reports its initial residual as its final one.
+__global__
+void pcgStartCondK(
+    cudaGraphConditionalHandle h,
+    const scalar* __restrict__ init,
+    scalar tol,
+    scalar relTol,
+    int minIter,
+    int* __restrict__ iter,
+    scalar* __restrict__ res)
+{
+    if (threadIdx.x || blockIdx.x) return;
+    *iter = 0;
+    const scalar ir = *init;
+    *res = ir;
+    const bool conv = (ir < tol) || (relTol > 0.0 && ir < relTol * ir);
+    cudaGraphSetConditional(h, (minIter > 0 || !conv) ? 1u : 0u);
+}
+
 __global__
 void pcgSetCondK(
     cudaGraphConditionalHandle h,
@@ -98,72 +143,60 @@ static DeviceSolverPerf deviceAMGPCGGraph(
     c.sInit.resize(1);
     c.sRes.resize(1);
     c.sIter.resize(1);
+    const int nF = A.nInternalFaces;
+    c.gB.resize(nC);
+    c.gDiag.resize(nC);
+    c.gUpper.resize(nF);
+    c.gLower.resize(nF);
     cudaMemcpyAsync(c.sNormF.data(), dNormFactor, sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    // this solve's right-hand side and fine matrix into the graph-referenced buffers (async D2D, no sync)
+    cudaMemcpyAsync(c.gB.data(),     b.data(), (std::size_t)nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    cudaMemcpyAsync(c.gDiag.data(),  A.diag,   (std::size_t)nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    if (nF > 0)
+    {
+        cudaMemcpyAsync(c.gUpper.data(), A.upper, (std::size_t)nF*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        cudaMemcpyAsync(c.gLower.data(), A.lower, (std::size_t)nF*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    }
+    DeviceLduView sA = A;
+    sA.diag  = c.gDiag.data();
+    sA.upper = c.gUpper.data();
+    sA.lower = c.gLower.data();
     scalar* dWArA = amg.sWArA.data();
     scalar* dWArAold = amg.sWArAold.data();
     scalar* dPap  = amg.sPap.data();
     scalar* dAlpha   = amg.sAlpha.data();
     scalar* dNegAlpha = amg.sNegAlpha.data();
-    scalar* dBeta = amg.sBeta.data();
     ensureSpectrum(amg, A);                                                       // one-time Chebyshev spectrum (pre-capture)
     // FP32 V-cycle inside the device-resident PCG: cast matrices once per solve; the WHILE body captures the FP32
     // vcycleAtF automatically (host-scalar-free). Outer Krylov + residual stay FP64 (accuracy preserved).
     const bool fp32 = useFP32() && !amg.saSmooth && !amg.gsSmooth && !useChebyshev();
     if (fp32) amgCastFP32(amg, A);
-    const LduF A0 = fp32 ? lduF(A, amg.fDiag[0], amg.fUpper[0], amg.fLower[0]) : LduF{};
+    const LduF A0 = fp32 ? lduF(sA, amg.fDiag[0], amg.fUpper[0], amg.fLower[0]) : LduF{};
     auto applyPrec = [&]()
     {
         if (fp32)
         {
             cast_<scalar,float><<<nBlocks(nC),TPB>>>(nC, rA.data(), amg.vBF[0].data());
-            vcycleAtF(0, amg, A, A0, amg.vBF[0].data(), amg.vXF[0].data());
+            vcycleAtF(0, amg, sA, A0, amg.vBF[0].data(), amg.vXF[0].data());
             cast_<float,scalar><<<nBlocks(nC),TPB>>>(nC, amg.vXF[0].data(), wA.data());
         }
-        else vcycleAt(0, amg, A, rA, wA);
+        else vcycleAt(0, amg, sA, rA, wA);
     };
-    // initial residual r = b - A psi  (also PRE-SIZES the V-cycle scratch + pA/Ax so the capture allocates nothing)
-    deviceAmul(A, psi, c.Ax);
-    deviceCopy(rA, b);
-    deviceAxpy(-1.0, c.Ax, rA);
     DeviceSolverPerf perf;
-    deviceSumMagInto(rA, c.sInit.data());
-    gsScaleInvK<<<1,1,0,cudaStreamPerThread>>>(c.sInit.data(), c.sNormF.data());
-    scalar initRes;
-    cudaCheck(cudaMemcpyAsync(&initRes, c.sInit.data(), sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "pcg init D2H");
-    cudaStreamSynchronize(cudaStreamPerThread);
-    perf.initialResidual = initRes;
-    perf.finalResidual = initRes;
-    auto convergedHost = [&](scalar fr){ return (fr < tol) || (relTol > 0.0 && fr < relTol*initRes); };
-    if (convergedHost(initRes) && minIter <= 0)
+    const int epoch = deviceReductionScratchEpoch();
+    if (!c.exec || c.key != psi.data() || c.keyTol != tol || c.keyRelTol != relTol || c.keyMaxIter != maxIter
+        || c.keyMinIter != minIter || c.keyEpoch != epoch
+        || c.keyOwner != (const void*)A.owner || c.keyNC != nC || c.keyNF != nF)
     {
-        perf.nIterations = 0;
-        return perf;
-    }
-    // iteration 0 (explicit: p = w, no beta)
-    applyPrec();                                         // wA = M^-1 rA
-    deviceDotInto(wA, rA, dWArA);
-    deviceCopy(c.pA, wA);
-    deviceAmul(A, c.pA, wA);
-    deviceDotInto(wA, c.pA, dPap);
-    deviceScalarDivNeg(dWArA, dPap, dAlpha, dNegAlpha);
-    deviceAxpyDev(dAlpha, c.pA, psi);
-    deviceAxpyDev(dNegAlpha, wA, rA);
-    deviceSumMagInto(rA, c.sRes.data());
-    gsScaleInvK<<<1,1,0,cudaStreamPerThread>>>(c.sRes.data(), c.sNormF.data());
-    scalar res1;
-    cudaCheck(cudaMemcpyAsync(&res1, c.sRes.data(), sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "pcg it0 D2H");
-    cudaStreamSynchronize(cudaStreamPerThread);
-    if ((convergedHost(res1) || maxIter <= 1) && minIter <= 1)
-    {
-        perf.finalResidual = res1;
-        perf.nIterations = 1;
-        return perf;
-    }
-    cudaMemsetAsync(c.sIter.data(), 0, sizeof(int), cudaStreamPerThread);   // WHILE-body counter (0 = iter-1)
-    // WHILE body = steady-state iteration 1+ (captured once, replayed on-device)
-    if (!c.exec || c.key != psi.data() || c.keyTol != tol || c.keyRelTol != relTol || c.keyMaxIter != maxIter || c.keyMinIter != minIter
-        || c.keyEpoch != deviceReductionScratchEpoch())          // the body captures reductions; the scratch may have been regrown
-    {
+        // PRE-SIZE everything the capture will touch (the V-cycle scratch, pA/Ax, the reduction
+        // partials): a capture must allocate nothing. ON THE CAPTURE ONLY -- doing it per solve, as the
+        // first version of this did, repeats the prologue and a whole V-cycle whose result is thrown
+        // away, and cost more than the two reads it saved (T3A 15.0 -> 17.4 ms/iter, measured).
+        deviceAmul(sA, psi, c.Ax);
+        deviceCopy(rA, c.gB);
+        deviceAxpy(-1.0, c.Ax, rA);
+        deviceSumMagInto(rA, c.sInit.data());
+        applyPrec();
         if (c.exec)
         {
             cudaGraphExecDestroy(c.exec);
@@ -175,30 +208,49 @@ static DeviceSolverPerf deviceAMGPCGGraph(
             c.graph = nullptr;
         }
         cudaCheck(cudaGraphCreate(&c.graph, 0), "pcg graph create");
-        cudaCheck(cudaGraphConditionalHandleCreate(&c.handle, c.graph, 1, cudaGraphCondAssignDefault), "pcg cond handle");
+        // the loop's start value is set on the device by pcgStartCondK below, so the handle defaults to
+        // "do not run" -- a solve whose initial residual already passes runs no iteration at all
+        cudaCheck(cudaGraphConditionalHandleCreate(&c.handle, c.graph, 0, cudaGraphCondAssignDefault), "pcg cond handle");
+        cudaCheck(cudaStreamBeginCaptureToGraph(cudaStreamPerThread, c.graph, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal), "pcg prologue capture");
+        // the prologue: r = b - A psi, the initial residual, and the loop's start decision
+        deviceAmul(sA, psi, c.Ax);
+        deviceCopy(rA, c.gB);
+        deviceAxpy(-1.0, c.Ax, rA);
+        deviceSumMagInto(rA, c.sInit.data());
+        gsScaleInvK<<<1,1,0,cudaStreamPerThread>>>(c.sInit.data(), c.sNormF.data());
+        pcgStartCondK<<<1,1,0,cudaStreamPerThread>>>(c.handle, c.sInit.data(), tol, relTol, minIter,
+                                                     c.sIter.data(), c.sRes.data());
+        cudaStreamCaptureStatus st;
+        const cudaGraphNode_t* deps = nullptr;
+        std::size_t nDeps = 0;
+        cudaCheck(cudaStreamGetCaptureInfo(cudaStreamPerThread, &st, nullptr, nullptr, &deps, nullptr, &nDeps), "pcg capture info");
+        std::vector<cudaGraphNode_t> depv(deps, deps + nDeps);
+        cudaGraph_t tmp;
+        cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &tmp), "pcg prologue capture end");
         cudaGraphNodeParams cp = {};
         cp.type = cudaGraphNodeTypeConditional;
         cp.conditional.handle = c.handle;
         cp.conditional.type = cudaGraphCondTypeWhile;
         cp.conditional.size = 1;
         cudaGraphNode_t cnode;
-        cudaCheck(cudaGraphAddNode(&cnode, c.graph, nullptr, nullptr, 0, &cp), "pcg cond node");
+        cudaCheck(cudaGraphAddNode(&cnode, c.graph, depv.data(), nullptr, depv.size(), &cp), "pcg cond node");
         cudaGraph_t body = cp.conditional.phGraph_out[0];
         cudaCheck(cudaStreamBeginCaptureToGraph(cudaStreamPerThread, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal), "pcg capture begin");
+        // ONE body for every iteration: iteration 0 takes pcgSearchDirK's p = w branch.
         deviceScalarCopy(dWArA, dWArAold);
         applyPrec();                                     // wA = M^-1 rA
         deviceDotInto(wA, rA, dWArA);
-        deviceScalarDiv(dWArA, dWArAold, dBeta);          // Fletcher-Reeves beta
-        deviceFusedScaleAxpy(c.pA, dBeta, wA);            // p = beta*p + w  [fused]
-        deviceAmul(A, c.pA, wA);
+        pcgSearchDirK<<<nBlocks(nC),TPB,0,cudaStreamPerThread>>>(c.pA.data(), wA.data(), dWArA, dWArAold,
+                                                                 c.sIter.data(), nC);
+        deviceAmul(sA, c.pA, wA);
         deviceDotInto(wA, c.pA, dPap);
         deviceScalarDivNeg(dWArA, dPap, dAlpha, dNegAlpha);
         deviceAxpyDev(dAlpha, c.pA, psi);
         deviceAxpyDev(dNegAlpha, wA, rA);
         deviceSumMagInto(rA, c.sRes.data());
         gsScaleInvK<<<1,1,0,cudaStreamPerThread>>>(c.sRes.data(), c.sNormF.data());   // normalized residual
-        pcgSetCondK<<<1,1,0,cudaStreamPerThread>>>(c.handle, c.sRes.data(), tol, c.sInit.data(), relTol, c.sIter.data(), maxIter-1, minIter-1);   // -1: iteration 0 ran outside the loop
-        cudaGraph_t tmp;
+        pcgSetCondK<<<1,1,0,cudaStreamPerThread>>>(c.handle, c.sRes.data(), tol, c.sInit.data(), relTol,
+                                                   c.sIter.data(), maxIter, minIter);
         cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &tmp), "pcg capture end");
         cudaCheck(cudaGraphInstantiate(&c.exec, c.graph, 0), "pcg graph instantiate");
         c.key = psi.data();
@@ -206,16 +258,22 @@ static DeviceSolverPerf deviceAMGPCGGraph(
         c.keyRelTol = relTol;
         c.keyMaxIter = maxIter;
         c.keyMinIter = minIter;
-        c.keyEpoch = deviceReductionScratchEpoch();
+        c.keyEpoch = epoch;
+        c.keyOwner = A.owner;
+        c.keyNC = nC;
+        c.keyNF = nF;
     }
     cudaCheck(cudaGraphLaunch(c.exec, cudaStreamPerThread), "pcg graph launch");
-    scalar finalRes;
-    int whileIters;
-    cudaCheck(cudaMemcpyAsync(&finalRes, c.sRes.data(), sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "pcg final D2H");
-    cudaCheck(cudaMemcpyAsync(&whileIters, c.sIter.data(), sizeof(int), cudaMemcpyDeviceToHost, cudaStreamPerThread), "pcg iters D2H");
+    // the ONE read: the report OpenFOAM prints, after the whole solve has run on the device
+    scalar hRes[2];
+    int nIter;
+    cudaCheck(cudaMemcpyAsync(&hRes[0], c.sInit.data(), sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "pcg init D2H");
+    cudaCheck(cudaMemcpyAsync(&hRes[1], c.sRes.data(),  sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "pcg final D2H");
+    cudaCheck(cudaMemcpyAsync(&nIter,   c.sIter.data(), sizeof(int),    cudaMemcpyDeviceToHost, cudaStreamPerThread), "pcg iters D2H");
     cudaStreamSynchronize(cudaStreamPerThread);
-    perf.finalResidual = finalRes;
-    perf.nIterations = 1 + whileIters;
+    perf.initialResidual = hRes[0];
+    perf.finalResidual   = hRes[1];
+    perf.nIterations     = nIter;
     static const bool dbgCyc = std::getenv("BRAE_AMG_CYCLES") != nullptr;
     if (dbgCyc) std::fprintf(stderr, "[AMG] p cycles=%d finalRes=%.3e (device)\n", perf.nIterations, perf.finalResidual);
     return perf;
