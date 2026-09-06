@@ -312,13 +312,36 @@ inline std::string expandDictVariables(const std::string& rawIn)
             if (!(std::isalnum((unsigned char)c) || c == '_' || c == '-' || c == '.')) return false;
         return true;
     };
+    // TWO maps, and the second is what makes `$name` mean what OpenFOAM means by it. `vars` is the flat
+    // one this has always built -- every entry under its own bare name, last definition winning -- and
+    // `scoped` holds the same values under their FULL PATH ("solvers/U", "relaxationFactors/equations/U").
+    // A flat map alone resolves by position in the file rather than by scope, and OpenFOAM's tutorials
+    // rely on the difference: angledDuctExplicitFixedCoeff writes
+    //     solvers { U { solver smoothSolver; smoother GaussSeidel; nSweeps 2; ... }
+    //               "(k|epsilon)" { $U; tolerance 1e-07; relTol 0.1; } }
+    //     relaxationFactors { equations { U 0.7; ... } }
+    // and the later leaf clobbered the sub-dictionary, so `$U` expanded to `0.7`. k and epsilon then
+    // named no solver at all, fell back to BiCGStab, and no notice fired -- the notice keys on `solver`
+    // being present and different. Measured, with the block spelled out instead, k lands at 1.00x of
+    // OpenFOAM's residual and epsilon at 0.90x; with the shipped `$U;` they sat at 2.56x and 3.16x.
     std::map<std::string, std::string> vars;
+    std::map<std::string, std::string> scoped;
+    std::vector<std::string> path;          // the enclosing block names, innermost last
+    auto record = [&](const std::string& name, const std::string& val)
+    {
+        vars[name] = val;
+        std::string full;
+        for (const std::string& p : path) { full += p; full += '/'; }
+        full += name;
+        scoped[full] = val;
+    };
     bool atKey = true;
     for (std::size_t i = 0; i < toks.size(); )
     {
         const std::string& tk = toks[i];
         if (tk == "{" || tk == "}" || tk == ";")
         {
+            if (tk == "}" && !path.empty()) path.pop_back();
             atKey = true;
             ++i;
             continue;
@@ -340,9 +363,10 @@ inline std::string expandDictVariables(const std::string& rawIn)
                 if (depth > 0) { if (!val.empty()) val += ' '; val += toks[j]; }
                 ++j;
             }
-            if (isIdent(tk)) vars[tk] = val;
+            if (isIdent(tk)) record(tk, val);
             // DESCEND into the block (step past name + "{") rather than skip it, so sibling entries DEFINED inside
             // (e.g. `turbulence ...;` inside divSchemes, referenced as $turbulence by div(phi,k)) also register as vars.
+            path.push_back(tk);
             i += 2;
             atKey = true;
             continue;
@@ -386,7 +410,7 @@ inline std::string expandDictVariables(const std::string& rawIn)
         // Skip a self-reference like `z0 $z0;` (an inner-scope entry that pulls from an outer variable of the SAME
         // name -- OF scoping). In brae's flat var map this would overwrite the real outer value with an unresolvable
         // self-ref, so keep the outer definition (e.g. `z0 uniform 0.1;` from an #include'd ABLConditions).
-        if (isIdent(tk) && val != "$" + tk && val != "${" + tk + "}") vars[tk] = val;
+        if (isIdent(tk) && val != "$" + tk && val != "${" + tk + "}") record(tk, val);
         i = j;
         atKey = true;
     }
@@ -397,9 +421,32 @@ inline std::string expandDictVariables(const std::string& rawIn)
         std::string out;
         out.reserve(text.size());
         bool changed = false;
+        // The USE site's scope, tracked the same way the definitions were: the identifier before each
+        // '{' names the block it opens. `$name` then resolves in the current dictionary first and walks
+        // up its ancestors, which is dictionary::lookupScopedEntryPtr's order, before falling back to
+        // the flat map (a name defined somewhere else entirely -- an #include'd fragment, say).
+        std::vector<std::string> useScope;
+        std::string lastWord;
         for (std::size_t i = 0; i < text.size(); )
         {
-            if (text[i] == '$')
+            if (text[i] == '{')      { useScope.push_back(lastWord); lastWord.clear(); out += text[i++]; continue; }
+            if (text[i] == '}')      { if (!useScope.empty()) useScope.pop_back(); lastWord.clear(); out += text[i++]; continue; }
+            if (text[i] == ';')      { lastWord.clear(); out += text[i++]; continue; }
+            if (std::isspace((unsigned char)text[i]))
+            {
+                // a run of whitespace ends the current word only if something follows on this line;
+                // `lastWord` is simply the most recent word token, which is what precedes a '{'
+                out += text[i++];
+                continue;
+            }
+            if (text[i] != '$')
+            {
+                const std::size_t w0 = i;
+                while (i < text.size() && !std::isspace((unsigned char)text[i])
+                       && text[i] != '{' && text[i] != '}' && text[i] != ';') { out += text[i]; ++i; }
+                lastWord = text.substr(w0, i - w0);
+                continue;
+            }
             {
                 std::size_t j = i + 1;
                 bool brace = false;
@@ -435,16 +482,34 @@ inline std::string expandDictVariables(const std::string& rawIn)
                            || text[j] == '-' || text[j] == '.')) ++j;
                 const std::string name = text.substr(s, j - s);
                 if (brace && j < text.size() && text[j] == '}') ++j;
-                const auto it = vars.find(name);
-                if (!name.empty() && it != vars.end())
+                const std::string* hit = nullptr;
+                if (!name.empty())
                 {
-                    out += it->second;
+                    // the current dictionary, then each ancestor, then the flat map
+                    for (std::size_t depth = useScope.size(); depth > 0 && !hit; --depth)
+                    {
+                        std::string full;
+                        for (std::size_t k = 0; k < depth; ++k) { full += useScope[k]; full += '/'; }
+                        full += name;
+                        const auto sit = scoped.find(full);
+                        if (sit != scoped.end()) hit = &sit->second;
+                    }
+                    if (!hit)
+                    {
+                        const auto it = vars.find(name);
+                        if (it != vars.end()) hit = &it->second;
+                    }
+                }
+                if (hit)
+                {
+                    out += *hit;
                     i = j;
                     changed = true;
                     continue;
                 }
             }
             out += text[i++];
+            lastWord.clear();
         }
         text = std::move(out);
         if (!changed) break;

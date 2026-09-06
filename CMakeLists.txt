@@ -2634,6 +2634,11 @@ target_include_directories(test_boundary_subdict_skip PRIVATE ${BRAE_HEADER_DIRS
 target_link_libraries(test_boundary_subdict_skip PRIVATE brae_core)
 add_test(NAME boundary_subdict_skip COMMAND test_boundary_subdict_skip)
 
+add_executable(test_dict_scoped_macro tests/test_dict_scoped_macro.cu)
+target_include_directories(test_dict_scoped_macro PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_dict_scoped_macro PRIVATE brae_core)
+add_test(NAME dict_scoped_macro COMMAND test_dict_scoped_macro)
+
 add_executable(test_fvoptions_sources_key tests/test_fvoptions_sources_key.cu)
 target_include_directories(test_fvoptions_sources_key PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_fvoptions_sources_key PRIVATE brae_core)

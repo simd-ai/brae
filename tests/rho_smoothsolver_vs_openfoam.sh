@@ -24,12 +24,12 @@
 #            substitutions and lands >= 2x from OpenFOAM on k and epsilon (measured 2.37x and 3.05x).
 #            It is the fail-proof: run ARM 3 against that binary and it fails on both fields.
 #
-# NOTE on the fixture: the tutorial writes the pair's block as `"(k|epsilon)" { $U; ... }`, an OpenFOAM
-# dictionary MERGE of U's entries. brae's parser reads the block's own keys but does not merge the
-# referenced sub-dict, so on the shipped file k and epsilon name no solver at all and fall back to
-# BiCGStab silently -- a second defect, of the same class and with a different cause, filed as queue
-# item 73. This gate spells the pair's block out so that what it measures is the solver SELECTION and
-# not the parser; item 73 gets its own gate.
+# THE FIXTURE IS THE TUTORIAL AS IT SHIPS, `$U;` included. That merge is a second defect this gate
+# uncovered and item 73 fixed: brae resolved `$U` against a FLAT variable map, so the `U 0.7;` in
+# relaxationFactors -- later in the same file -- won, `$U` expanded to `0.7`, and k and epsilon named no
+# solver at all. A `$name` now resolves in the dictionary it is written in and then in its ancestors, as
+# dictionary::lookupScopedEntryPtr does (unit-tested in tests/test_dict_scoped_macro). If either defect
+# regresses, ARM 3's k and epsilon move from 1.00x and 0.90x to the CONTROL's 2.56x and 3.16x.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
@@ -59,24 +59,8 @@ s = re.sub(r'\bendTime\s+[^;]*;', 'endTime 30;', s)
 s = re.sub(r'\bwriteInterval\s+[^;]*;', 'writeInterval 30;', s)
 s = re.sub(r'\bwritePrecision\s+[^;]*;', 'writePrecision 15;', s)
 open(c, 'w').write(s)
-# the pair's block, spelled out (see the note above)
-f = d + '/system/fvSolution'; s = open(f).read()
-old = '''    "(k|epsilon)"
-    {
-        $U;
-        tolerance       1e-07;
-        relTol          0.1;
-    }'''
-new = '''    "(k|epsilon)"
-    {
-        solver          smoothSolver;
-        smoother        GaussSeidel;
-        nSweeps         2;
-        tolerance       1e-07;
-        relTol          0.1;
-    }'''
-assert old in s, 'the tutorial no longer writes the pair as `$U;` -- re-read the note in this gate'
-open(f, 'w').write(s.replace(old, new))
+# the pair's block is left EXACTLY as the tutorial writes it: `$U;`, the dictionary merge item 73 fixed
+assert '$U;' in open(d + '/system/fvSolution').read(), 'the tutorial no longer writes the pair as `$U;`'
 PY
 [ $? -eq 0 ] || { echo "FAIL: the fixture could not be prepared"; exit 1; }
 ( cd "$W/case" && ./Allrun.pre > pre.log 2>&1 ) || ( cd "$W/case" && blockMesh > bm.log 2>&1 && topoSet > ts.log 2>&1 ) || true
