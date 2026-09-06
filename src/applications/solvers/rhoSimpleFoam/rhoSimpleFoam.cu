@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include <chrono>
 namespace brae {
 namespace gpu {
 namespace rhoSimple {
@@ -311,6 +312,47 @@ void updateBoundaryCoeffs(
 }
 
 
+// ---------------------------------------------------------------------------------------------------
+// BRAE_PHASE_TIME (item 67): where the mirror's outer iteration goes. Off unless the variable is set --
+// attributing device work needs a synchronise at each boundary, and that is itself a cost, so the
+// instrument must not be part of a measured run. The V2 driver has carried a hook split since item 54;
+// the mirror had none, so its per-iteration cost could not be attributed at all. The marks are the
+// step's own section boundaries, so what falls between pEqn and turbulence->correct() (the closing
+// stage dumps) is charged to the pressure phase.
+namespace
+{
+double g_tU = 0.0, g_tE = 0.0, g_tP = 0.0, g_tTurb = 0.0;
+std::chrono::steady_clock::time_point g_phaseMark;
+bool phaseTimeOn()
+{
+    static const bool on = std::getenv("BRAE_PHASE_TIME") != nullptr;
+    return on;
+}
+// charge the time since the last mark to `slot` (null = start the clock), then restart it
+void phaseMark(double* slot)
+{
+    if (!phaseTimeOn()) return;
+    cudaDeviceSynchronize();
+    const auto now = std::chrono::steady_clock::now();
+    if (slot) *slot += std::chrono::duration<double>(now - g_phaseMark).count();
+    g_phaseMark = now;
+}
+}   // namespace
+
+void rhoPhaseTimeReport(int iterations)
+{
+    if (!phaseTimeOn() || iterations <= 0) return;
+    const double tot = g_tU + g_tE + g_tP + g_tTurb;
+    std::printf("  [phase] over %d iterations: UEqn %.3f s (%.1f ms/it), EEqn %.3f s (%.1f ms/it), "
+                "pEqn %.3f s (%.1f ms/it), turbulence %.3f s (%.1f ms/it); the four total %.3f s (%.1f ms/it)\n",
+                iterations,
+                g_tU,    1e3 * g_tU    / iterations,
+                g_tE,    1e3 * g_tE    / iterations,
+                g_tP,    1e3 * g_tP    / iterations,
+                g_tTurb, 1e3 * g_tTurb / iterations,
+                tot,     1e3 * tot     / iterations);
+}
+
 Residuals rhoSimpleStep(
     RhoSolverFields&            f,
     RhoSolverWorkspace&         w,
@@ -374,6 +416,7 @@ Residuals rhoSimpleStep(
     updateBoundaryCoeffs(f, dbU, dbP, dbHe, dbT, in);
 
     // ---- UEqn.H ------------------------------------------------------------------------------
+    phaseMark(nullptr);
     RhoMomentumInput uin;
     uin.phiInt = &f.phiInt;          uin.phiBnd = &f.phiBnd;
     uin.rhoCell = &f.rho;            uin.rhoBndFace = &f.rhoBnd;
@@ -480,7 +523,7 @@ Residuals rhoSimpleStep(
                 const int k = solved[i];
                 comps[i] = {&A[k], &b[k], U[k], 1.0, dnf[k].data()};
             }
-            deviceSymGaussSeidelFused(nSolved, comps, in.tolU, in.relTolU, in.maxIterU, in.minIterU, /*nSweeps*/1,
+            deviceSymGaussSeidelFused(nSolved, comps, in.tolU, in.relTolU, in.maxIterU, in.minIterU, in.nSweepsU,
                                       in.uGaussSeidelSymmetric, fp);
             for (int i = 0; i < nSolved; ++i) perfs[solved[i]] = fp[i];
         }
@@ -499,6 +542,7 @@ Residuals rhoSimpleStep(
     sd.vectors("Upred", f.Ux, f.Uy, f.Uz);
 
     // ---- EEqn.H ------------------------------------------------------------------------------
+    phaseMark(&g_tU);
     {
         RhoEnergyInput ein;
         ein.phiInt = &f.phiInt;           ein.phiBnd = &f.phiBnd;
@@ -569,9 +613,16 @@ Residuals rhoSimpleStep(
         const DeviceLduView A = foldedView(dm, E, diagC);
         DeviceBuffer<scalar> dnf;
         deviceNormFactorInto(A, f.he, b, w.ones, dnf);                // stays on the device (item 66)
-        const DeviceSolverPerf perf =
-            deviceJacobiBiCGStab(A, b, f.he, dnf.data(), in.tolHe, in.relTolHe, in.maxIterHe, /*checkEvery=*/1, in.minIterHe,
-                                 in.preconHe);
+        // The solver the case asked for (item 58): `smoothSolver` + a GaussSeidel-family smoother runs
+        // OpenFOAM's own sweep, level-scheduled, under its stopping rule and its nSweeps; anything else
+        // keeps BiCGStab and is announced. squareBend and angledDuct both name a smoothSolver here.
+        DeviceSolverPerf perf;
+        if (in.heSymGaussSeidel)
+            deviceSymGaussSeidel(A, b, f.he, dnf.data(), in.tolHe, in.relTolHe, in.maxIterHe, &perf, in.minIterHe,
+                                 in.nSweepsHe, in.heGaussSeidelSymmetric);
+        else
+            perf = deviceJacobiBiCGStab(A, b, f.he, dnf.data(), in.tolHe, in.relTolHe, in.maxIterHe, /*checkEvery=*/1, in.minIterHe,
+                                        in.preconHe);
         res[in.isE ? "e" : "h"] = perf.initialResidual;
 
         // fvOptions.correct(he), EEqn.H:27 -- AFTER the solve and BEFORE thermo.correct(), which is what
@@ -593,6 +644,7 @@ Residuals rhoSimpleStep(
     sd.scalars("psi", f.psi);
 
     // ---- pEqn.H or pcEqn.H -------------------------------------------------------------------
+    phaseMark(&g_tE);
     RhoPressureInput pin;
     pin.rhoCell = &f.rho;            pin.rhoBndFace = &f.rhoBnd;
     pin.psiCell = &f.psi;            pin.psiBndFace = &f.psiBnd;
@@ -847,7 +899,9 @@ Residuals rhoSimpleStep(
 
     // turbulence->correct() -- LAST, so the NEXT iteration's momentum equation uses this iteration's
     // closure. OpenFOAM's lagged coupling.
+    phaseMark(&g_tP);
     if (in.correct) in.correct();
+    phaseMark(&g_tTurb);
     sd.scalars("kOut", f.k);
     sd.scalars("epsOut", f.epsilon);
     sd.scalars("nutOut", f.nut);

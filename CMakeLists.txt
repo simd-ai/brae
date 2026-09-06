@@ -1158,6 +1158,10 @@ add_test(NAME normfactor_device_identity
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/normfactor_device_identity.sh)
 set_tests_properties(normfactor_device_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 
+add_test(NAME rho_smoothsolver_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_smoothsolver_vs_openfoam.sh)
+set_tests_properties(rho_smoothsolver_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
 add_test(NAME uresidual_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/uresidual_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO

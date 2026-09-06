@@ -201,6 +201,14 @@ struct DeviceSimpleControls
     // nSweeps is, so a case naming different smoothers on k and epsilon|omega is refused rather than run
     // with whichever entry was read first.
     bool   gsUSym = true, gsKESym = true;
+    // fvSolution solvers/<field>/nSweeps (smoothSolver.C:78, default 1): the sweeps between residual
+    // EVALUATIONS, so it decides where a solve stops, not merely how fast it gets there.
+    int    nSweepsU = 1, nSweepsHe = 1, nSweepsKE = 1;
+    // The ENERGY equation on a smoothSolver + GaussSeidel-family smoother, and which of the two OF
+    // smoothers. True only when the case asks AND the calling driver honours it (SolverRunsAs::
+    // smoothSolverOnEnergy) -- a shared flag that assumed the caller is how the mirror came to run
+    // BiCGStab under a notice that said nothing.
+    bool   gsHe = false, gsHeSym = true;
     // fvSolution asked for `preconditioner DILU` on U (OF's default for the momentum equations, and the
     // entry brae used to substitute Jacobi for). Only meaningful on the BiCGStab path -- a smoothSolver
     // has no preconditioner in OF either.

@@ -69,6 +69,10 @@ struct TurbulenceHookOptions
     scalar         tol = 1e-12, relTol = 0.0;
     int            maxIter = 2000;
     int            minIter = 0;
+    // The solver the case named for k and epsilon (item 58): smoothSolver + a GaussSeidel-family
+    // smoother, per field, with one smoother variant and one nSweeps for the pair.
+    bool           gsK = false, gsEps = false, gsSymmetric = true;
+    int            nSweepsKE = 1;
     // fvOptions.constrain(kEqn)/(epsEqn) -- kEpsilon.C calls it on both. A scalarFixedValueConstraint
     // naming k or epsilon pins those cells with fvMatrix::setValues, which is NOT the same as writing
     // the field afterwards: setValues also removes the coupling from the neighbours' equations.

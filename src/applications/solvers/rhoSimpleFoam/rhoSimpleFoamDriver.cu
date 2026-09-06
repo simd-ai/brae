@@ -351,6 +351,11 @@ int runMirrorCuda(const std::string& caseDir)
     // the block below because the preconditioner they select is built once, from the mesh, and lives as
     // long as the run.
     bool diluU = false, diluHe = false, diluKE = false;
+    // The case's smoothSolver selection per field, read below and carried into the step and the
+    // turbulence hook (item 58).
+    bool gsU = false, gsUSym = true, gsHe = false, gsHeSym = true;
+    bool gsK = false, gsEps = false, gsKESym = true;
+    int  nSweepsU = 1, nSweepsHe = 1, nSweepsKE = 1;
 
     // The case's own linear-solver tolerances, for the same reason the host driver reads them: a gate
     // pins them so the linear solve is out of the comparison, a SOLVER runs what the case asks for.
@@ -364,6 +369,16 @@ int runMirrorCuda(const std::string& caseDir)
         // so there is no CG to run there) and the AMG-preconditioned CG otherwise.
         SolverRunsAs runsAs;
         runsAs.diluOnEnergy = true;
+        // This arm runs OpenFOAM's own sweep wherever the case names a smoothSolver (item 58).
+        // BRAE_RHO_SMOOTHSOLVER=0 restores the previous behaviour -- BiCGStab on every field -- with the
+        // notices then announcing each substitution, which is the identity gate's control arm.
+        {
+            const char* e = std::getenv("BRAE_RHO_SMOOTHSOLVER");
+            const bool honour = !(e && std::string(e) == "0");
+            runsAs.smoothSolverOnEnergy     = honour;
+            runsAs.smoothSolverOnMomentum   = honour;
+            runsAs.smoothSolverOnTurbulence = honour;
+        }
         if (hin.transonic)
         {
             runsAs.pSolver = "PBiCGStab";
@@ -377,6 +392,13 @@ int runMirrorCuda(const std::string& caseDir)
         diluU  = lctl.diluU;
         diluHe = lctl.diluHe;
         diluKE = lctl.diluKE;
+        // The case's own smoothSolver selection, carried into the step (item 58). Without these the
+        // driver ran BiCGStab on U, he, k and epsilon while the shared notice -- which takes the flag as
+        // proof the caller honours the dict -- announced nothing for U and the pair.
+        gsU = lctl.gsU;       gsUSym = lctl.gsUSym;     nSweepsU  = lctl.nSweepsU;
+        gsHe = lctl.gsHe;     gsHeSym = lctl.gsHeSym;   nSweepsHe = lctl.nSweepsHe;
+        gsK = lctl.gsK;       gsEps = lctl.gsEps;
+        gsKESym = lctl.gsKESym;                          nSweepsKE = lctl.nSweepsKE;
         cpu::rhoSimple::printLinearSolverControls(hin, hf.heName, secondName, hf.turbulent);
     }
 
@@ -394,6 +416,9 @@ int runMirrorCuda(const std::string& caseDir)
     // on p, T, U, rho and phi over 30 iterations -- which is the property that matters: this may cost
     // nothing but time, and it must change no answer.
     gin.amgCacheDir = caseDir + "/constant/polyMesh";
+    // The momentum and energy solvers the case named (item 58).
+    gin.uSymGaussSeidel  = gsU;   gin.uGaussSeidelSymmetric  = gsUSym;   gin.nSweepsU  = nSweepsU;
+    gin.heSymGaussSeidel = gsHe;  gin.heGaussSeidelSymmetric = gsHeSym;  gin.nSweepsHe = nSweepsHe;
 
     RhoSolverWorkspace w;
     // OpenFOAM preconditions k and epsilon with DILU wherever the case says so, and the host reference
@@ -423,6 +448,7 @@ int runMirrorCuda(const std::string& caseDir)
         // The SAME options the CUDA harness's turbulent arm drives (buildTurbulenceHookOptions above).
         turbOpt = buildTurbulenceHookOptions(hin, hf, constraints);
         turbOpt.precon = (diluKE && w.dilu.valid) ? &w.dilu : nullptr;
+        turbOpt.gsK = gsK;  turbOpt.gsEps = gsEps;  turbOpt.gsSymmetric = gsKESym;  turbOpt.nSweepsKE = nSweepsKE;
 
         gin.correct = [&]()
         {
@@ -545,6 +571,7 @@ int runMirrorCuda(const std::string& caseDir)
     time.end();
     std::printf(converged ? "SIMPLE solution converged in %d iterations\n"
                           : "SIMPLE reached endTime (%d iterations)\n", nIter);
+    rhoPhaseTimeReport(nIter);   // BRAE_PHASE_TIME (item 67); silent otherwise
 
     writeTimeDir(WriteControl::timeName(wc.timeValue(nIter)));
     std::printf("End\n");

@@ -11,6 +11,7 @@
 #include <cstdio>
 #include "device_fvoptions.cuh"   // deviceSetValues: fvMatrix::setValues, shared with the energy equation
 #include "device_pcg.cuh"
+#include "device_amg.cuh"      // deviceSymGaussSeidel: OpenFOAM's own sweep, when the case names a smoothSolver
 #include "device_blas.cuh"      // deviceAxpy / deviceCopy / deviceHadamard
 #include "device_simple.cuh"    // deviceRelaxDiag -- fvMatrix::relax, already gated
 #include "nut_wall_function.cuh"    // nutkWallFunctionValue / yPlusWall are BRAE_HD -- one definition
@@ -771,7 +772,8 @@ void finishAndSolve(
     const DeviceBuffer<scalar>* wallVal,
     const KEpsilonInput&        in,
     scalar&                     residualOut,
-    const std::string&          dumpPrefix)   // "" = no dump; else <dir>/<name> path prefix
+    const std::string&          dumpPrefix,   // "" = no dump; else <dir>/<name> path prefix
+    bool                        gs)           // this field's own solver: the case's smoothSolver, or BiCGStab
 {
     const int nC  = dm.nCells;
     const int nIf = dm.nInternalFaces;
@@ -841,9 +843,15 @@ void finishAndSolve(
     // the ones vector kept across calls (item 63) and the normFactor kept on the device (item 66)
     DeviceBuffer<scalar> dnf;
     deviceNormFactorInto(A, field, b, deviceOnes(nC), dnf);
-    const DeviceSolverPerf perf =
-        deviceJacobiBiCGStab(A, b, field, dnf.data(), in.tol, in.relTol, in.maxIter, /*checkEvery=*/1, in.minIter,
-                             in.precon);
+    // The solver the case asked for (item 58). The view above is internal-face only, which is what the
+    // level-scheduled sweep needs; there is no interface to drop silently.
+    DeviceSolverPerf perf;
+    if (gs)
+        deviceSymGaussSeidel(A, b, field, dnf.data(), in.tol, in.relTol, in.maxIter, &perf, in.minIter,
+                             in.nSweepsKE, in.gsSymmetric);
+    else
+        perf = deviceJacobiBiCGStab(A, b, field, dnf.data(), in.tol, in.relTol, in.maxIter, /*checkEvery=*/1, in.minIter,
+                                    in.precon);
     residualOut = perf.initialResidual;
     dump("SolveOut", field);
 }
@@ -903,7 +911,7 @@ void correct(
         finishAndSolve(E, epsilon, dm, in.relaxEquationEps, in.relaxEps,
                        in.fvoEpsMask, in.fvoEpsVal,
                        &st.isWallCell, &epsilon, in, st.epsResidual,
-                       dumpDir.empty() ? std::string() : dumpDir + "eps");
+                       dumpDir.empty() ? std::string() : dumpDir + "eps", in.gsEps);
 
         boundField(epsilon, dm, dbEps, scalar(1e-15));
     }
@@ -917,7 +925,7 @@ void correct(
         finishAndSolve(K, k, dm, in.relaxEquationK, in.relaxK,
                        in.fvoKMask, in.fvoKVal,
                        nullptr, nullptr, in, st.kResidual,
-                       dumpDir.empty() ? std::string() : dumpDir + "k");
+                       dumpDir.empty() ? std::string() : dumpDir + "k", in.gsK);
 
         boundField(k, dm, dbK, scalar(1e-15));
     }

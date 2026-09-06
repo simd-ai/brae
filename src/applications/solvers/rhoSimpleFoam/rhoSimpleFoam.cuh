@@ -165,6 +165,12 @@ struct RhoStepInput
     const DeviceDilu* preconHe = nullptr;
     int    minIterU = 0,    minIterP = 0,    minIterHe = 0,    minIterTurb = 0;
     bool   uSymGaussSeidel = false;
+    // fvSolution solvers/<field>/nSweeps for the smoothSolver path (default 1), and the energy field's
+    // own smoothSolver selection. Unset, this driver ran BiCGStab on every field while the shared
+    // notice, believing the caller honoured the dict, said nothing (queue item 58).
+    int    nSweepsU = 1, nSweepsHe = 1;
+    bool   heSymGaussSeidel = false;
+    bool   heGaussSeidelSymmetric = true;
     // WHICH GaussSeidel smoother the case's U entry named: true = symGaussSeidel (ascending then
     // descending), false = GaussSeidel, whose sweep loop in GaussSeidelSmoother.C is the ascending walk
     // ONLY. Different smoothers -- the same relTol stops in a different place, and on validation/T3A a
@@ -290,6 +296,10 @@ void updateBoundaryCoeffs(
     DeviceBoundary&       dbHe,
     DeviceBoundary&       dbT,
     const RhoStepInput&   in);
+
+// BRAE_PHASE_TIME (item 67): the per-phase split of the mirror's outer iteration, printed once at the
+// end of the run. Silent unless the variable is set.
+void rhoPhaseTimeReport(int iterations);
 
 Residuals rhoSimpleStep(
     RhoSolverFields&            f,

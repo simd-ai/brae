@@ -68,6 +68,16 @@ struct SolverRunsAs
     // does; every compressible tutorial writes the energy field into the same regex block as U and k, so
     // a driver honouring two of the three still substitutes on the third.
     bool diluOnEnergy = false;
+    // ...and does it honour `solver smoothSolver` on the ENERGY equation? Only the OF-mirror's CUDA arm
+    // does. The flag exists because the notice is shared: a driver that substitutes must still say so,
+    // and one that honours must not claim a substitution it no longer makes.
+    bool smoothSolverOnEnergy = false;
+    // ...and on momentum / the turbulence pair. Default true: every other driver has run OpenFOAM's own
+    // sweep on those since the level-scheduled smoother landed. The OF-mirror sets all three from one
+    // switch so the gate can compare the honoured path against the substituted one with the notices
+    // truthful in BOTH modes.
+    bool smoothSolverOnMomentum = true;
+    bool smoothSolverOnTurbulence = true;
     // ...and does it run DILU whatever the dict says? The OF-mirror's HOST arm does -- pbicgstab.cuh is
     // DILU throughout -- so a case asking `none` or `diagonal` there gets DILU and has a right to be told.
     bool alwaysDilu = false;
@@ -225,6 +235,16 @@ inline void readLinearSolverControls(
         return !(s && s->wordOr("smoother", "") == "GaussSeidel");
     };
 
+    // fvSolution solvers/<field>/nSweeps (smoothSolver.C:78, default 1). Read for every field that can
+    // take the smoothSolver path: OpenFOAM smooths nSweeps times BETWEEN residual evaluations and counts
+    // sweeps, not evaluations (:205), so a case asking 2 and answered with 1 stops somewhere else.
+    auto solverNSweeps = [&](const std::string& f, int dflt)
+    {
+        const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
+        if (!s || !s->found("nSweeps")) return dflt;
+        const int n = static_cast<int>(s->scalarOr("nSweeps", (scalar)dflt));
+        return (n > 0) ? n : dflt;
+    };
     ctl.tolP = solverTol("p", 1e-6);
     ctl.tolU = solverTol("U", 1e-8);
     ctl.relTolP = solverRelTol("p");
@@ -256,10 +276,16 @@ inline void readLinearSolverControls(
         ctl.relTolHe  = solverRelTol(heName);
         ctl.maxIterHe = solverMaxIter(heName, 1000);
         ctl.minIterHe = solverMinIter(heName, 0);
-        noticeSolverChoice(heName, "PBiCGStab", krylovPrecon(heName), false);
+        ctl.nSweepsHe = solverNSweeps(heName, 1);
+        // The energy field takes OpenFOAM's own smoother only where the CALLER runs it; every other
+        // driver keeps BiCGStab and must keep announcing the substitution.
+        ctl.gsHe    = useSymGS(heName) && runsAs.smoothSolverOnEnergy;
+        ctl.gsHeSym = gsIsSymmetric(heName);
+        noticeSolverChoice(heName, "PBiCGStab", krylovPrecon(heName), ctl.gsHe);
     }
-    ctl.gsU = useSymGS("U");
+    ctl.gsU = useSymGS("U") && runsAs.smoothSolverOnMomentum;
     ctl.gsUSym = gsIsSymmetric("U");
+    ctl.nSweepsU = solverNSweeps("U", 1);
     if (const char* gsuEnv = std::getenv("BRAE_GS_U"))
         ctl.gsU = (std::atoi(gsuEnv) != 0) && ctl.gsU;
     // DILU on the momentum equations, when the case asks for it and brae is on the BiCGStab path.
@@ -293,7 +319,7 @@ inline void readLinearSolverControls(
             ctl.minIterKE = solverMinIter("nuTilda", 0);
             ctl.tolKEFinal = solverTol("nuTildaFinal", ctl.tolKE);
             ctl.relTolKEFinal = solvers && solvers->subDict("nuTildaFinal") ? solverRelTol("nuTildaFinal") : ctl.relTolKE;
-            ctl.gsK = useSymGS("nuTilda");
+            ctl.gsK = useSymGS("nuTilda") && runsAs.smoothSolverOnTurbulence;
             ctl.gsEps = false;
             noticeSolverChoice("nuTilda", "PBiCGStab", krylovPrecon("nuTilda"), ctl.gsK);
         }
@@ -316,13 +342,23 @@ inline void readLinearSolverControls(
             ctl.relTolKEFinal = std::fmin(
                 solvers && solvers->subDict("kFinal") ? solverRelTol("kFinal") : solverRelTol("k"),
                 solvers && solvers->subDict(secondName + "Final") ? solverRelTol(secondName + "Final") : solverRelTol(secondName));
-            ctl.gsK = useSymGS("k");
-            ctl.gsEps = useSymGS(secondName);
+            ctl.gsK = useSymGS("k") && runsAs.smoothSolverOnTurbulence;
+            ctl.gsEps = useSymGS(secondName) && runsAs.smoothSolverOnTurbulence;
             // ONE smoother variant for the transported pair, as nSweeps is: the model solves both
             // scalars through one call. A case that names symGaussSeidel on one and GaussSeidel on the
             // other is refused rather than run with whichever entry was read first -- running would
             // apply one field's smoother under the other's name.
             ctl.gsKESym = gsIsSymmetric("k");
+            // ONE nSweeps for the pair, for the reason the smoother variant is one: k and epsilon are
+            // solved through one model call. Two different counts would run one field's setting under
+            // the other's name, so they are refused rather than resolved by order.
+            ctl.nSweepsKE = solverNSweeps("k", 1);
+            if ((ctl.gsK || ctl.gsEps) && solverNSweeps(secondName, 1) != ctl.nSweepsKE)
+                throw std::runtime_error(
+                    "system/fvSolution gives k and " + secondName + " different `nSweeps` on a "
+                    "smoothSolver. OpenFOAM smooths nSweeps times between residual evaluations and "
+                    "counts sweeps, so the two entries stop the solves in different places, and this "
+                    "driver carries one count for the transported pair.");
             if ((ctl.gsK || ctl.gsEps) && gsIsSymmetric(secondName) != ctl.gsKESym)
                 throw std::runtime_error(
                     "system/fvSolution names a `GaussSeidel` smoother on one of k / " + secondName

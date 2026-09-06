@@ -109,6 +109,12 @@ struct KEpsilonInput
     // --- schemes ---
     // Only `Gauss upwind` (with or without `bounded`) is ported, because that is all the reference
     // assembles: its two div terms are plain fvm::div with no scheme argument. Anything else refuses.
+    // The solver the case named for each transported scalar (item 58): `smoothSolver` + a
+    // GaussSeidel-family smoother runs OpenFOAM's own sweep under its stopping rule; anything else keeps
+    // BiCGStab. Per field, because fvSolution can name one for k and another for epsilon; ONE smoother
+    // variant and ONE nSweeps for the pair, which linear_solver_setup refuses to resolve when they differ.
+    bool   gsK = false, gsEps = false, gsSymmetric = true;
+    int    nSweepsKE = 1;
     bool   boundedK   = false;
     bool   boundedEps = false;    // separate fvSchemes entries; the reference carries ONE bool for both,
                                   // so a case that bounds one and not the other is refused here rather
