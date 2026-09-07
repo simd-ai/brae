@@ -93,6 +93,14 @@ struct RhoPressureInput
     const DeviceBuffer<scalar>* psiCell    = nullptr;   // nCells
     const DeviceBuffer<scalar>* psiBndFace = nullptr;   // boundary faces
 
+    // polyMesh::solutionD(), +1 / -1 per component, as the step's own StepInput carries it. The
+    // momentum solve already skips a knocked-out component (rhoSimpleFoam.cu, fvMatrixSolve.C:157-164);
+    // fvMatrix<Type>::H() has to zero the same one, because H is where the skipped direction would
+    // otherwise re-enter -- HbyA_z is round-off nonzero and nothing downstream holds it at zero once
+    // the solve is gone. This path refuses coupled patches (rhoCreateFields.cu:65-74), so zeroing
+    // inside deviceMatrixH is the end of H() here.
+    int    solutionD[3] = {1, 1, 1};
+
     // simple.transonic(). Selects the whole branch, not a term -- and, per the header, which linear
     // solver the driver may legally use on the result.
     bool   transonic = false;

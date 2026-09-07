@@ -38,6 +38,7 @@
 #include "rhoUEqn.cuh"
 #include "rhoPEqn_cpp.cuh"
 #include "rhoPEqn.cuh"
+#include "solution_directions.cuh"   // polyMesh::solutionD(): the mask the host reference applies inside matrixH
 
 #include <cmath>
 #include <cstdio>
@@ -68,10 +69,15 @@ static void cmp(const std::vector<scalar>& gpu,
         mx = std::fmax(mx, std::fabs(gpu[i] - ref[i]));
         mg = std::fmax(mg, std::fabs(ref[i]));
     }
+    // ABSOLUTE when the reference is identically zero, relative otherwise -- and the line says which,
+    // with both numbers, because a reference that is exactly zero on one line and round-off on the
+    // next turns the same absolute residue from "passes by 5 decades" into a FAIL by 8: that is how
+    // a device arm computing a different function in the knocked-out direction hid here.
     const scalar rel = mg > 0 ? mx / mg : mx;
     const bool ok = rel <= tol;
     if (!ok) ++g_fails;
-    std::printf("  %-34s n=%6zu rel=%.3e  %s\n", nm, ref.size(), rel, ok ? "OK" : "FAIL");
+    std::printf("  %-34s n=%6zu rel=%.3e  %s   (max|diff| %.3e, max|ref| %.3e%s)\n", nm, ref.size(), rel,
+                ok ? "OK" : "FAIL", mx, mg, mg > 0 ? "" : ", absolute");
 }
 
 static void check(bool ok, const char* what)
@@ -338,6 +344,19 @@ int main(int argc, char** argv)
     gpin.correctedLaplacian = true;
     gpin.takeUAtBoundary = &dTakeU;
     gpin.adjustable = &dAdjust;
+    // The SAME validComponents mask the host reference derives inside matrixH from the patch list
+    // (fvMatrix<Type>::H()'s closing block, fv_matrix_ops.cuh). Production feeds it on every device
+    // input (rhoSimpleFoamDriver.cu buildDeviceStepInput -> rhoSimpleFoam.cu pin.solutionD); this
+    // harness builds its input BY HAND and left it at the default {1,1,1}, so the device arm formed
+    // H_z on a 2D mesh where the reference zeroes it. The residue is only 1.8e-16 and passed the
+    // `HbyA0 z` line because cmp falls back to an ABSOLUTE comparison when the reference is identically
+    // zero -- then SIMPLEC's `HbyA -= (rAU - rAtU)*grad(p)` gave the reference a round-off z of ~3e-14
+    // and the same 1.8e-16 became a RATIO of 5.773e-03 (matrixDumpAsym) / 1.623e-02 (pitzDailyTurb),
+    // red for weeks against a bound of 1e-11. Same wiring as tests/test_peqn_cuda.cu.
+    {
+        const SolutionDirections sd = solutionDirections(fvp);
+        for (int cmpt = 0; cmpt < 3; ++cmpt) gpin.solutionD[cmpt] = sd.d[cmpt];
+    }
 
     gpu::rhoSimple::RhoPressureStages gst;
     gpu::rhoSimple::pressurePredictor(gst, dm, dbU, dbP, MU, dUx, dUy, dUz, dP, gpin);

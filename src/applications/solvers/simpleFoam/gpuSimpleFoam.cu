@@ -681,16 +681,20 @@ int main(int argc, char** argv)
                 // validation/ happens to be -- the same blind spot that hid it on the V2 driver until
                 // queue item 39. brae::Time already carries the name, and this driver already NAMES its
                 // output directory with it; only the log line was still counting.
-                std::printf("Time = %s\n\n"
-                            "%s:  Solving for Ux, Initial residual = %g, Final residual = %g, No Iterations %d\n"
-                            "%s:  Solving for Uy, Initial residual = %g, Final residual = %g, No Iterations %d\n"
-                            "%s:  Solving for Uz, Initial residual = %g, Final residual = %g, No Iterations %d\n"
-                            "AMG-PCG:  Solving for p, Initial residual = %g, Final residual = %g, No Iterations %d\n"
+                std::printf("Time = %s\n\n", time.timeName().c_str());
+                // One line per component OpenFOAM SOLVED, in order. A component polyMesh::solutionD()
+                // knocked out is never solved (fvMatrixSolve.C:164) and OpenFOAM's log carries no line
+                // for it, so neither does this one -- a 2D case now prints Ux and Uy and stops, and a
+                // log diff against OpenFOAM lines up.
+                const scalar uInit[3]  = {r.Ux, r.Uy, r.Uz};
+                const scalar uFinal[3] = {r.UxFinal, r.UyFinal, r.UzFinal};
+                const int    uIters[3] = {r.UxIters, r.UyIters, r.UzIters};
+                for (int kk = 0; kk < 3; ++kk)
+                    if (r.solvedU[kk] > 0)
+                        std::printf("%s:  Solving for U%c, Initial residual = %g, Final residual = %g, No Iterations %d\n",
+                                    uSolv, "xyz"[kk], uInit[kk], uFinal[kk], uIters[kk]);
+                std::printf("AMG-PCG:  Solving for p, Initial residual = %g, Final residual = %g, No Iterations %d\n"
                             "time step continuity errors : sum local = %g, global = %g, cumulative = %g\n",
-                            time.timeName().c_str(),
-                            uSolv, r.Ux, r.UxFinal, r.UxIters,
-                            uSolv, r.Uy, r.UyFinal, r.UyIters,
-                            uSolv, r.Uz, r.UzFinal, r.UzIters,
                             r.p, r.pFinal, r.pIters, cl, cg, _cumCont);
                 const char* kSolv = ctl.gsK ? (ctl.gsKESym ? "smoothSolver[symGaussSeidel]"
                                                            : "smoothSolver[GaussSeidel]")
@@ -732,11 +736,23 @@ int main(int argc, char** argv)
             // OF residualControl: also gate on every turbulence field (k/epsilon/omega/nuTilda) that lists a target.
             // Previously ONLY p and Ux were checked, so a turbulent case could report "converged" with k/epsilon
             // still far from tol -- the substantive bug this fixes. Unlisted fields have target -1 -> ok() ignores
-            // them (OF). U stays gated on Ux alone: brae tracks no valid/solved directions, so the out-of-plane
-            // component of a 2D/empty or wedge case has a DEGENERATE residual (stuck ~0.1, never reaching tol) that
-            // would wrongly block convergence on every 2D case -- gating all U components needs that infra first.
+            // them (OF).
+            //
+            // U is gated on cmptMax over the components OpenFOAM SOLVED, which is what
+            // solutionControl::maxTypeResidual compares (solutionControl.C:230-232) with a skipped
+            // component's SolverPerformance left default-constructed at Zero. Gating on Ux alone was
+            // wrong whenever Uy's initial residual is the larger -- it stops at a different iteration
+            // from OpenFOAM -- and gating on all three unconditionally is the opposite error, because a
+            // knocked-out direction's residual is degenerate (T3A's Uz sat at 6.8e-01 forever). The mask
+            // is what makes the max the right one.
             rcChecked = 0;
-            converged = hasRC && ok(r.p, rcP) && ok(r.Ux, rcU);
+            scalar uMax = 0.0;
+            {
+                const scalar uInit[3] = {r.Ux, r.Uy, r.Uz};
+                for (int kk = 0; kk < 3; ++kk)
+                    if (r.solvedU[kk] > 0) uMax = std::max(uMax, uInit[kk]);
+            }
+            converged = hasRC && ok(r.p, rcP) && ok(uMax, rcU);
             if (converged)
                 for (const auto& e : turbulenceReport())
                     if (!ok(e.perf.initialResidual, resCtl->scalarOr(e.field, -1))) { converged = false; break; }

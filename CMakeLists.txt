@@ -1186,6 +1186,10 @@ add_test(NAME device_memory_flat
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/device_memory_flat.sh)
 set_tests_properties(device_memory_flat PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
 
+add_test(NAME empty_direction_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/empty_direction_vs_openfoam.sh)
+set_tests_properties(empty_direction_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
 add_test(NAME uresidual_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/uresidual_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO

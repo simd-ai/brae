@@ -196,15 +196,16 @@ Residuals simpleStep(
         // residual never leaves O(0.1) and would block convergence on every 2D case. Hence the mask AND
         // the max, not either alone. The skipped solve was also 26% of this fixture's momentum
         // linear algebra (497 of 1912 BiCGStab iterations over 15 outer steps) for an answer of 4.9e-17.
-        // THE SOLVE IS NOT SKIPPED, and that is a KNOWN DEVIATION, not an oversight. OpenFOAM's Uz on a
-        // 2D case is BIT-EXACTLY zero -- emptyFvPatch::size() is 0, so no z quantity is ever formed --
-        // and `U = HbyA - rAtU*grad(p)` therefore reproduces zero forever without the solve. brae's z
-        // quantities are round-off nonzero instead (measured on pitzDaily at iteration 1: the momentum
-        // source's z norm is 3.5e-21 against 6.1e-04 in x), and the z map amplifies at ~1.15 per
-        // iteration, so dropping the solve let Uz reach 13% of |U| by iteration 200 and turned seven
-        // end-to-end gates red. Today the z solve is what holds Uz down. Removing it needs the knocked-
-        // out direction to be exactly zero first; that is queued, and until then this loop solves a
-        // component OpenFOAM does not.
+        //
+        // The solve IS skipped, and what made that safe was porting H()'s own closing block: OpenFOAM's
+        // Uz on a 2D case is bit-exactly zero (emptyFvPatch::size() is 0, so no z quantity is ever
+        // formed), while brae's z quantities are round-off nonzero -- and the z map amplifies at ~1.15
+        // per iteration, so an early attempt at this skip let Uz reach 13% of |U| by iteration 200 and
+        // turned seven end-to-end gates red. fvMatrix<Type>::H() replaces every knocked-out component
+        // with Zero as its last act (fvMatrix.C's validComponents loop); with that ported, HbyA_z is
+        // identically zero, `U = HbyA - rAtU*grad(p)` leaves only the round-off of grad(p)_z, and T3A's
+        // written max|Uz| reads 5.9e-18 against max|Ux| 6.59. Gate:
+        // tests/empty_direction_vs_openfoam.sh, whose oracle is OpenFOAM's own log for these fixtures.
         scalar uInitialResidual = 0.0;
         // Every solved component's system first: the fold (fvMatrixSolve.C's addBoundaryDiag per
         // component into its own diagonal, its own source), the view over the SHARED upper/lower, and
@@ -216,7 +217,7 @@ Residuals simpleStep(
         int nSolved = 0;
         for (int k = 0; k < 3; ++k)
         {
-            if (in.solutionD[k] < 0) continue;   // TRIAL: item 35's skip
+            if (in.solutionD[k] < 0) continue;   // the component OpenFOAM's solveSegregated skips
             deviceFold(dm, Mp.relaxed ? Mp.relaxedDiag : Mp.diag, Mp.source[k], Mp.iC[k], Mp.bC[k], diagC[k], b[k]);
             A[k] = foldedView(dm, Mp, diagC[k]);
             deviceNormFactorInto(A[k], *U[k], b[k], w.ones, dnf[k]);   // stays on the device (item 66)

@@ -26,6 +26,7 @@
 #include "device_pcg.cuh"
 #include "device_dilu.cuh"   // OF DILU preconditioner for the momentum BiCGStab
 #include "device_simple.cuh"
+#include "solution_directions.cuh"   // polyMesh::solutionD(): which U components OpenFOAM solves
 #include "device_boundary.cuh"
 #include "thermo_types.cuh"
 #include "device_thermo.cuh"
@@ -181,8 +182,15 @@ public:
     long turbCorrections()  const { return turbCorrections_; }
     long outerIterations()  const { return outerIterations_; }
     void resetLoopCounters() { turbCorrections_ = 0; outerIterations_ = 0; }
+    // The momentum components OpenFOAM SOLVES on this mesh, from the EMPTY patches alone
+    // (polyMesh::calcDirections, polyMesh.C:75-118). The driver reads it to print OpenFOAM's lines and
+    // no others, and to take its residualControl max over the same components OpenFOAM's cmptMax sees.
+    const SolutionDirections& solutionD() const { return sd_; }
 private:
     long turbCorrections_ = 0, outerIterations_ = 0;
+    // Built once in the constructor, where the patch list is: a DeviceMesh cannot recover a patch type,
+    // and polyMesh::calcDirections needs the EMPTY patches' face areas.
+    SolutionDirections sd_;
     // PIMPLE residualControl state: outer-loop convergence flag and iteration-2 reference residuals.
     bool outerConverged_ = false;
     std::map<std::string, scalar> outerInitialResidual_;

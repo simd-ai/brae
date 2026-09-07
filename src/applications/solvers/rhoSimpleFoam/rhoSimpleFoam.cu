@@ -660,6 +660,7 @@ Residuals rhoSimpleStep(
     pin.hasFvOptions = in.hasFvOptions;
     pin.hasCoupledPatches = in.hasCoupledPatches;
     pin.fvOptionUnsupported = in.fvOptionUnsupported;
+    for (int cmpt = 0; cmpt < 3; ++cmpt) pin.solutionD[cmpt] = in.solutionD[cmpt];
 
     RhoPressureStages        st;
     ConsistentPressureStages cst;

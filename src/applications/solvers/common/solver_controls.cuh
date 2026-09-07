@@ -355,6 +355,12 @@ struct DeviceSimpleResidual
     scalar he = 0, heFinal = 0;
     int    heIters = 0;
     scalar contLocal = 0, contGlobal = 0;          // time step continuity errors, raw (driver applies deltaT + cumulative)
+    // polyMesh::solutionD(): +1 solved, -1 knocked out by an EMPTY patch. fvMatrix<vector>::solveSegregated
+    // `continue`s on every -1 (fvMatrixSolve.C:157-164), so OpenFOAM prints no `Solving for U<cmpt>` line
+    // for it and stores a default SolverPerformance whose initialResidual is Zero -- which is what the
+    // cmptMax in solutionControl.C:232 then compares. The driver needs both facts to report and to
+    // converge the way OpenFOAM does, so the step hands them back with the residuals.
+    int solvedU[3] = {1, 1, 1};
 };
 
 } // namespace brae

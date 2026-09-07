@@ -80,6 +80,14 @@ void amgFineCoeffKernel(
     bool                          phiWasRead)
         : fvp_(fvp), ctl_(ctl), nC_(m.nCells()), nIf_(m.nInternalFaces())
     {
+        // Which momentum components OpenFOAM solves on this mesh. polyMesh::calcDirections knocks out
+        // only the directions normal to a non-empty EMPTY patch (polyMesh.C:75-118); a wedge knocks out
+        // geometricD_ alone, so an axisymmetric case still solves all three.
+        sd_ = solutionDirections(fvp);
+        if (!sd_.valid(0) || !sd_.valid(1) || !sd_.valid(2))
+            std::printf("  empty patches knock out a solution direction: U is solved in (%s%s%s) only, "
+                        "as fvMatrix<vector>::solveSegregated does\n",
+                        sd_.valid(0) ? "x" : "", sd_.valid(1) ? "y" : "", sd_.valid(2) ? "z" : "");
         // cyclic (periodic) interfaces: a SEPARATE lduInterface (OF cyclicFvPatchField::updateInterfaceMatrix),
         // NOT merged into the owner-sorted LDU. Both sides of each pair are stored (symmetric coupling).
         const std::vector<CyclicInterface> cyclics = buildCyclicInterfaces(m, g, fvp);
@@ -923,6 +931,14 @@ void amgFineCoeffKernel(
 
     void DeviceSimpleSolver::solveMomentumPredictor(DeviceSimpleResidual& res)
     {
+        // Which components this step ACTUALLY SOLVED, so the driver prints OpenFOAM's lines and no
+        // others and takes its residualControl max over the same set OpenFOAM's cmptMax sees. Set where
+        // the solve happens rather than copied from solutionD here, so that the log is a witness of the
+        // solve and not a second opinion about it: a report mask fed from the same flag as the skip
+        // cannot tell a skipped solve from an unreported one, which is precisely what this gate's
+        // fail-proof has to be able to see. It also matches OpenFOAM when the momentum predictor is off
+        // -- solve() is never called, so there are no `Solving for U` lines at all.
+        for (int kk = 0; kk < 3; ++kk) res.solvedU[kk] = 0;
         // The flux this outer iteration INHERITS. OF's dumpPEqn writes the same quantity at the top of
         // pEqn.H, and the momentum predictor does not touch phi, so the two are directly comparable.
         if (stageDumpActive() && stageDumpFirstOnly("phiIn")) stageDump("stage_phiIn", phiInt_);
@@ -1750,6 +1766,14 @@ void amgFineCoeffKernel(
             // conditional. Skipping it leaves U exactly as the previous corrector left it, which is what
             // the case asked for.
             if (!ctl_.momentumPredictor) continue;
+            // ...and neither is a component polyMesh::solutionD() knocked out: fvMatrix<vector>::
+            // solveSegregated `continue`s on every validComponents == -1 (fvMatrixSolve.C:157-164). The
+            // ASSEMBLY above still runs for it, exactly as OpenFOAM's does -- H() and rAU are built from
+            // the whole matrix -- and only the solve, the report line and the residual are skipped. The
+            // skipped system's residual is meaningless anyway: its source and its field are both ~0, so
+            // the normFactor-scaled number never leaves O(0.1) (T3A read 6.83e-01 for Uz every single
+            // iteration, against 5.7e-07 for Ux at convergence).
+            if (!sd_.valid(kk)) continue;
             const scalar nf = deviceNormFactor(mv, Uk_[kk], b, ones_);          // OF residualControl normalisation
             // The PER-CELL momentum residual, r = b - A*psi, before the solve moves anything.
             //
@@ -1796,6 +1820,7 @@ void amgFineCoeffKernel(
             if (kk == 0)      { res.Ux = ur; res.UxFinal = uperf.finalResidual; res.UxIters = uperf.nIterations; }
             else if (kk == 1) { res.Uy = ur; res.UyFinal = uperf.finalResidual; res.UyIters = uperf.nIterations; }
             else              { res.Uz = ur; res.UzFinal = uperf.finalResidual; res.UzIters = uperf.nIterations; }
+            res.solvedU[kk] = 1;
         }
         // meanVelocityForce CONSTRAIN -- OF meanVelocityForce::constrain (meanVelocityForce.C:246-247):
         //     gradP0_ += dGradP_;  dGradP_ = 0.0;
@@ -1932,6 +1957,18 @@ void amgFineCoeffKernel(
             // deferred mixing fed only the PREDICTOR; H is the exact full-rotation explicit coupling, consistent across
             // components, so HbyA/phiHbyA carry the true rotated neighbour momentum, not a per-component-stale value.
             if (hasCyclic_ && cyc_.rotational) deviceCyclicAddHRot(cyc_, Uk_[0], Uk_[1], Uk_[2], dm.V, Hk[0], Hk[1], Hk[2]);
+            // fvMatrix<Type>::H() ends by replacing every knocked-out component with Zero (fvMatrix.C,
+            // the validComponents loop) -- AFTER lduMatrix::H, the boundary source and
+            // correctBoundaryConditions. Here that means after the coupled-interface contributions too:
+            // a 2D case may carry cyclic or AMI patches, and zeroing inside deviceMatrixH (which is
+            // where the V2 step does it, having no interfaces) would let interfaceAddH put the
+            // component back. Without this HbyA_z is round-off nonzero and, once the z solve stops
+            // holding it down, the z map amplifies it ~1.15 per iteration.
+            for (int kk = 0; kk < 3; ++kk)
+                if (!sd_.valid(kk))
+                    cudaCheck(cudaMemsetAsync(Hk[kk].data(), 0, static_cast<std::size_t>(nC_) * sizeof(scalar),
+                                              cudaStreamPerThread),
+                              "H knocked-out component");
             for (int kk = 0; kk < 3; ++kk)
                 deviceHadamard(HbyA[kk], rAU, Hk[kk]);
         }
@@ -3682,9 +3719,20 @@ void amgFineCoeffKernel(
         // corr_ == 3 onward uses its LAST, the previous iteration's final residual. Two different halves
         // of the pair; using the initial residual for both makes the relative test compare an iteration
         // against itself and converge on step one.
+        // `U` is the FIELD, and OF's maxResidual takes cmptMax over its components with a component
+        // solveSegregated skipped left at Zero (solutionControl.C:230-232) -- so the max runs over the
+        // solved ones only. `Ux`/`Uy`/`Uz` are brae's own per-component aliases and stay literal.
+        auto maxSolved = [&](const scalar (&v)[3]) -> scalar
+        {
+            scalar m = 0;
+            for (int kk = 0; kk < 3; ++kk) if (res.solvedU[kk] > 0) m = std::max(m, v[kk]);
+            return m;
+        };
         auto initialOf = [&](const std::string& f) -> scalar
         {
-            if (f == "U" || f == "Ux") return res.Ux;
+            const scalar u[3] = {res.Ux, res.Uy, res.Uz};
+            if (f == "U")  return maxSolved(u);
+            if (f == "Ux") return res.Ux;
             if (f == "Uy") return res.Uy;
             if (f == "Uz") return res.Uz;
             if (f == "p")  return res.p;
@@ -3692,7 +3740,9 @@ void amgFineCoeffKernel(
         };
         auto residualOf = [&](const std::string& f) -> scalar
         {
-            if (f == "U" || f == "Ux") return res.UxFinal;
+            const scalar uf[3] = {res.UxFinal, res.UyFinal, res.UzFinal};
+            if (f == "U")  return maxSolved(uf);
+            if (f == "Ux") return res.UxFinal;
             if (f == "Uy") return res.UyFinal;
             if (f == "Uz") return res.UzFinal;
             if (f == "p")  return res.pFinal;
