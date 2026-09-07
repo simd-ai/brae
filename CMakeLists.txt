@@ -412,6 +412,12 @@ target_link_libraries(test_fvc_grad PRIVATE brae_core)
 add_test(NAME fvc_grad
          COMMAND test_fvc_grad ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily282)
 
+add_executable(test_empty_face_grad tests/test_empty_face_grad.cu)
+target_include_directories(test_empty_face_grad PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_empty_face_grad PRIVATE brae_core)
+add_test(NAME empty_face_grad_vs_openfoam
+         COMMAND test_empty_face_grad ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily282 282)
+
 add_executable(test_fvm_laplacian tests/test_fvm_laplacian.cu)
 target_include_directories(test_fvm_laplacian PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_fvm_laplacian PRIVATE brae_core)

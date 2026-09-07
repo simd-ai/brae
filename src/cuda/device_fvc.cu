@@ -68,6 +68,7 @@ void gradKernel(
     const label* __restrict__ bndCellStart,
     const label* __restrict__ bndPerm,
     const label* __restrict__ bndGFace,
+    const label* __restrict__ bndIsEmpty,   // emptyFvPatch::size() == 0: an empty face is never in OpenFOAM's sum
     const scalar* __restrict__ bval,
     const scalar* __restrict__ V,
     scalar* __restrict__ gx,
@@ -98,6 +99,11 @@ void gradKernel(
     for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)   // +boundary
     {
         const int kk = bndPerm[k];
+        // Skipped as the cellLimited kernel below skips them, and for the same reason: OpenFOAM
+        // cannot sum a face of a zero-sized patch. Sf_x and Sf_y of an extruded empty face are
+        // bitwise zero, so this changes nothing in-plane; g_z goes from the cancellation of two
+        // opposite 1e+00-scale terms to internal-face round-off, which is what OpenFOAM has (item 36c).
+        if (bndIsEmpty[kk]) continue;
         const int f = bndGFace[kk];
         const scalar pv = bval[kk];
         sx += Sfx[f] * pv;
@@ -143,7 +149,7 @@ void deviceGaussGrad(
     gradKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.owner.data(), dm.nei.data(), dm.w.data(),
                                             dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(), vol.data(),
                                             dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
-                                            dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndGFace.data(), bval.data(),
+                                            dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndGFace.data(), dm.bndIsEmpty.data(), bval.data(),
                                             dm.V.data(), gx.data(), gy.data(), gz.data(), skipIf);
     cudaCheck(cudaGetLastError(), "gaussGrad");
 }

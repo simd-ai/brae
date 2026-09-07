@@ -29,15 +29,21 @@ std::vector<vector> gaussGrad(
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const FvPatch& fp = patches[pi];
+        // An EMPTY patch contributes nothing: emptyFvPatch::size() is 0 (emptyFvPatch.H:79), so
+        // gaussGrad::gradf's boundary loop never visits one. brae keeps those faces in its addressing
+        // and skips them here, as div and the boundary gradient below already do. On an extruded mesh
+        // their Sf_x and Sf_y are bitwise zero, so only the out-of-plane component ever saw them: as
+        // the cancellation of two large opposite terms, which is round-off (item 36c).
+        if (fp.type == "empty") continue;
         if (pi >= boundary.size()) continue;
         for (label i = 0; i < fp.size && i < (label)boundary[pi].size(); ++i)
             grad[fp.faceCells[i]] += Sf[fp.start + i] * boundary[pi][i];
     }
+    // Divided, as gaussGrad::gradf does (`gGrad.primitiveFieldRef() /= mesh.V()`) and as the other
+    // overloads and the device kernel do. This one multiplied by a reciprocal, which is not the same
+    // number in the last bit -- tests/test_empty_face_grad caught the two host overloads disagreeing.
     for (label c = 0; c < nC; ++c)
-    {
-        const scalar iv = 1.0 / g.V()[c];
-        grad[c] = grad[c] * iv;
-    }
+        grad[c] = grad[c] / g.V()[c];
     return grad;
 }
 
@@ -70,6 +76,7 @@ std::vector<vector> gaussGrad(
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const FvPatch& fp = patches[pi];
+        if (fp.type == "empty") continue;   // emptyFvPatch::size() == 0: never in OpenFOAM's sum (item 36c)
         const std::vector<scalar>& pv = p.boundary[pi]->value();
         for (label i = 0; i < fp.size; ++i)
             grad[fp.faceCells[i]] += Sf[fp.start + i] * pv[i];
@@ -103,6 +110,7 @@ std::vector<tensor> gaussGrad(
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const FvPatch& fp = patches[pi];
+        if (fp.type == "empty") continue;   // emptyFvPatch::size() == 0: never in OpenFOAM's sum (item 36c)
         const std::vector<vector>& uv = U.boundary[pi]->value();
         for (label i = 0; i < fp.size; ++i)
             grad[fp.faceCells[i]] += outer(Sf[fp.start + i], uv[i]);
