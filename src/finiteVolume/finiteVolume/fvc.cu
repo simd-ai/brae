@@ -149,6 +149,11 @@ SurfaceScalarField flux(
     {
         const FvPatch& fp = patches[pi];
         phi.boundary[pi].resize(fp.size);
+        // An empty patch has no faces in OpenFOAM (emptyFvPatch::size() == 0), so its flux does not
+        // exist; brae keeps the faces in its addressing and stores ZERO there, so a consumer that does
+        // not skip them adds nothing. It used to store U_c . Sf, which on an extruded mesh is U_z*Sf_z
+        // -- round-off, but round-off that reached div, adjustPhi and the continuity error (item 36d).
+        if (fp.type == "empty") continue;
         for (label i = 0; i < fp.size; ++i)
             phi.boundary[pi][i] = dot(boundary[pi][i], Sf[fp.start + i]);
     }
@@ -236,8 +241,11 @@ std::vector<scalar> div(
         d[nei[f]] -= phi.internal[f];
     }
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (patches[pi].type == "empty") continue;   // emptyFvPatch::size() == 0: never in OpenFOAM's sum (item 36d)
         for (label i = 0; i < patches[pi].size; ++i)
             d[patches[pi].faceCells[i]] += phi.boundary[pi][i];
+    }
     for (label c = 0; c < nC; ++c)
         d[c] /= g.V()[c];
     return d;

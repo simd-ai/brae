@@ -34,6 +34,7 @@ void divKernel(
     const scalar* __restrict__ phiInt,
     const label* __restrict__ bndCellStart,
     const label* __restrict__ bndPerm,
+    const label* __restrict__ bndIsEmpty,   // emptyFvPatch::size() == 0: never in OpenFOAM's surfaceIntegrate
     const scalar* __restrict__ bval,
     const scalar* __restrict__ V,
     scalar* __restrict__ d)
@@ -47,7 +48,11 @@ void divKernel(
     for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
         s -= phiInt[losort[k]];    // -neighbour internal
     for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)
-        s += bval[bndPerm[k]];   // +boundary
+    {
+        const int bk = bndPerm[k];
+        if (bndIsEmpty[bk]) continue;   // whatever bval holds there -- a flux is zero now, an interpolate is not (item 36d)
+        s += bval[bk];   // +boundary
+    }
     d[c] = s / V[c];
 }
 
@@ -129,7 +134,7 @@ void deviceDiv(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const D
 {
     d.resize(dm.nCells);
     divKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
-                                           phiInt.data(), dm.bndCellStart.data(), dm.bndPerm.data(), bval.data(), dm.V.data(), d.data());
+                                           phiInt.data(), dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), bval.data(), dm.V.data(), d.data());
     cudaCheck(cudaGetLastError(), "div");
 }
 

@@ -117,6 +117,7 @@ demo/delta/constant/triSurface/*
 
 .claude/*
 manifest/*
-
+CLAUDE.md
 src/applications/solvers/rhoSimpleFoam/PORT.md
 src/applications/solvers/rhoSimpleFoam/REFUSALS.md
+!validation/slipTurb

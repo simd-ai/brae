@@ -2,6 +2,7 @@
 #include "rhoSimpleFoamDriver.cuh"
 
 #include "brae_time.cuh"
+#include "dict_audit.cuh"   // DictAuditScope: every dictionary entry read off disk and never applied, reported on every exit
 #include "foam_field_writer.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -311,6 +312,17 @@ int runMirrorCuda(const std::string& caseDir)
 {
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
     const FoamDict fvSolution  = readDict(caseDir + "/system/fvSolution");
+    // The unread-entry safety net the legacy drivers have had since item E5, absent on the mirror until
+    // queue item 15: an input this arm parses and never applies is reported at scope exit, on the
+    // normal return AND on a refusal (marked PARTIAL there, since an entry may simply not have been
+    // reached). Declared AFTER the dicts it points at, so it is destroyed first. fvSchemes is audited
+    // through the shared consumption choke point, so it needs no instance here. What this cannot see:
+    // thermophysicalProperties and turbulenceProperties are read as private copies inside createFields
+    // (rhoCreateFields_cpp.cu), and an audit holds pointers -- queued as 15b.
+    DictAuditScope audit;
+    audit.add(controlDict, "system/controlDict");
+    audit.add(fvSolution,  "system/fvSolution");
+    audit.addFvSchemes(caseDir);
     const FoamDict* simpleDict = fvSolution.subDict("SIMPLE");
 
     if (controlDict.wordOr("writeFormat", "ascii") == "binary")

@@ -418,6 +418,12 @@ target_link_libraries(test_empty_face_grad PRIVATE brae_core)
 add_test(NAME empty_face_grad_vs_openfoam
          COMMAND test_empty_face_grad ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily282 282)
 
+add_executable(test_empty_face_flux tests/test_empty_face_flux.cu)
+target_include_directories(test_empty_face_flux PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_empty_face_flux PRIVATE brae_core)
+add_test(NAME empty_face_flux
+         COMMAND test_empty_face_flux ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily282 282)
+
 add_executable(test_fvm_laplacian tests/test_fvm_laplacian.cu)
 target_include_directories(test_fvm_laplacian PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_fvm_laplacian PRIVATE brae_core)
@@ -1195,6 +1201,14 @@ set_tests_properties(device_memory_flat PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1
 add_test(NAME empty_direction_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/empty_direction_vs_openfoam.sh)
 set_tests_properties(empty_direction_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+add_test(NAME legacy_symmetry_refresh
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/legacy_symmetry_refresh.sh)
+set_tests_properties(legacy_symmetry_refresh PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+
+add_test(NAME mirror_dict_audit
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mirror_dict_audit.sh)
+set_tests_properties(mirror_dict_audit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 
 add_test(NAME uresidual_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/uresidual_vs_openfoam.sh

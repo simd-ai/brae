@@ -806,6 +806,14 @@ void amgFineCoeffKernel(
         }
     }
 
+    // BRAE_SYM_CHECK=1: print the no-penetration oracle on the boundary velocity correctTurbulence
+    // hands the closures. Off by default; it reads three boundary arrays back to the host per call.
+    static bool symCheckOn()
+    {
+        static const bool on = std::getenv("BRAE_SYM_CHECK") != nullptr;
+        return on;
+    }
+
     void DeviceSimpleSolver::correctTurbulence()
     {
         const DeviceMesh& dm = dm_;
@@ -841,6 +849,34 @@ void amgFineCoeffKernel(
             deviceUpdateTurbulentInletK(dbU_, tiMask_, tiIntensity_, dbK_);
             deviceUpdateTurbulentInletSecond(dbK_, mlMask_, mlLength_,
                                              ctl_.sst ? ctl_.ksstCoeffs.betaStar : ctl_.keCoeffs.Cmu, dbEps_);
+        }
+        // The no-penetration oracle on the boundary velocity THIS function hands the closures.
+        // OpenFOAM's basicSymmetry evaluate() gives U_b = U_c - n(n.U_c), so n.U_b == 0 at every call.
+        // brae holds a symmetry patch as a mixed refValue rebuilt from U_c (symUpdateKernel), and a
+        // refValue built before the momentum solve, blended with the corrected U_c, is a value for the
+        // wrong velocity on any plane whose normal is not an axis -- an axis-aligned plane's normal
+        // refValue is identically zero and cannot go stale. Printed, not asserted:
+        // tests/legacy_symmetry_refresh.sh reads it. Before the refreshes below the momentum solve
+        // and the corrector existed it printed 1.01e-01 against |U_b| = 0.266 at iteration 1 of
+        // validation/slipTurb from rest (38% penetration), 2.3e-02 at iteration 8; with them, 1e-16.
+        if (hasSym_ && symCheckOn())
+        {
+            DeviceBuffer<scalar> ub[3];
+            for (int k = 0; k < 3; ++k) deviceBCValue(dbU_.comp[k], Uk_[k], ub[k]);
+            const std::vector<scalar> bx = ub[0].host(), by = ub[1].host(), bz = ub[2].host();
+            const std::vector<scalar> nx = dbU_.nx.host(), ny = dbU_.ny.host(), nz = dbU_.nz.host();
+            const std::vector<label> sym = dbU_.comp[0].symMask.host();
+            scalar maxPen = 0.0, maxU = 0.0;
+            int nSym = 0;
+            for (int i = 0; i < dbU_.n; ++i)
+            {
+                if (!sym[i]) continue;
+                ++nSym;
+                maxPen = std::fmax(maxPen, std::fabs(nx[i] * bx[i] + ny[i] * by[i] + nz[i] * bz[i]));
+                maxU   = std::fmax(maxU, std::sqrt(bx[i] * bx[i] + by[i] * by[i] + bz[i] * bz[i]));
+            }
+            std::printf("symmetry closure check: max|n.U_b| = %.6e  max|U_b| = %.6e  (%d symmetry faces)\n",
+                        maxPen, maxU, nSym);
         }
         if (ctl_.les)   // pure LES Smagorinsky: algebraic sub-grid nut = Ck*delta*sqrt(k_sgs) from the current U. No
         {              // transport solve (report stays empty -> no "Solving for k/omega" lines), so no ddt(k/omega) either.
@@ -2017,6 +2053,13 @@ void amgFineCoeffKernel(
         // starting from zero) put a spurious 4e-11 through every one of the 1900 wedge faces -- summing
         // to a leak the pressure equation answered with an equal, entirely fictitious inflow at `left`.
         if (hasWedge_) deviceUpdateWedge(dbU_, Uk_[0], Uk_[1], Uk_[2]);
+        // ...and a SYMMETRY patch for the same reason: its mixed refValue is the slip projection of
+        // the cell velocity at the time it was built, and it was built at the top of the momentum
+        // predictor. On a plane whose normal is not an axis the blend with the solved U_c is a value
+        // for the wrong velocity: n.U_b = sum_k n_k(1-|n_k|) dU_k instead of OpenFOAM's exact zero.
+        // Nothing in the pressure stage reads it (HbyA_b is projected afresh below), but the closures
+        // do, after the corrector -- item 13; tests/legacy_symmetry_refresh.sh.
+        if (hasSym_) deviceUpdateSymmetry(dbU_, Uk_[0], Uk_[1], Uk_[2]);
         DeviceBuffer<scalar> hxb,hyb,hzb;
         deviceBCValue(dbU_.comp[0],HbyA[0],hxb);
         deviceBCValue(dbU_.comp[1],HbyA[1],hyb);
@@ -2716,6 +2759,7 @@ void amgFineCoeffKernel(
             Uk_[kk]=std::move(Un);
         }
         if (hasWedge_) deviceUpdateWedge(dbU_, Uk_[0], Uk_[1], Uk_[2]);   // pEqn.H's U.correctBoundaryConditions()
+        if (hasSym_)   deviceUpdateSymmetry(dbU_, Uk_[0], Uk_[1], Uk_[2]); // ...for the symmetry patches too (item 13)
         // limitVelocity (fvOptions.correct): clamp |U| <= max on the corrected (output) velocity. OF clamps after the
         // momentum predictor; cf clamps the post-corrector U so the WRITTEN field is bounded (matches OF's output).
         if (limUActive_) deviceFvoLimitVelocity(limUCells_, limUMax_, Uk_[0], Uk_[1], Uk_[2]);

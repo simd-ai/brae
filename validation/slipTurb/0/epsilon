@@ -1,0 +1,11 @@
+FoamFile { version 2.0; format ascii; class volScalarField; object epsilon; }
+dimensions [0 2 -3 0 0 0 0];
+internalField uniform 3.8e-4;
+boundaryField
+{
+    inlet  { type fixedValue; value uniform 3.8e-4; }
+    outlet { type inletOutlet; inletValue uniform 3.8e-4; value uniform 3.8e-4; }
+    bottom { type slip; }
+    top    { type slip; }
+    frontAndBack { type empty; }
+}

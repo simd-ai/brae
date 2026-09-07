@@ -119,10 +119,12 @@ void bndFluxKernel(
     const scalar* __restrict__ uxb,
     const scalar* __restrict__ uyb,
     const scalar* __restrict__ uzb,
+    const label* __restrict__ bndIsEmpty,   // emptyFvPatch::size() == 0: the face has no flux in OpenFOAM
     scalar* __restrict__ phiB)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= nB) return;
+    if (bndIsEmpty[i]) { phiB[i] = 0.0; return; }   // stored as zero, as the host flux stores it (item 36d)
     const int f = bndGFace[i];
     phiB[i] = uxb[i] * Sfx[f] + uyb[i] * Sfy[f] + uzb[i] * Sfz[f];
 }
@@ -393,7 +395,7 @@ void deviceBoundaryFlux(
 {
     phiB.resize(dm.nBndFaces);
     bndFluxKernel<<<nBlocks(dm.nBndFaces), TPB>>>(dm.nBndFaces, dm.bndGFace.data(), dm.Sfx.data(), dm.Sfy.data(),
-                                                  dm.Sfz.data(), uxb.data(), uyb.data(), uzb.data(), phiB.data());
+                                                  dm.Sfz.data(), uxb.data(), uyb.data(), uzb.data(), dm.bndIsEmpty.data(), phiB.data());
     cudaCheck(cudaGetLastError(), "bndFlux");
 }
 
