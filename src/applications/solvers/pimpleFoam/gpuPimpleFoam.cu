@@ -780,6 +780,7 @@ try
     // ---- transient time loop ----
     const scalar tEnd = endTime + 0.5 * deltaT;
     long timeIndex = 0;
+    scalar lastSolvedTime = startTime;
     std::string lastWritten;
     // Time drives the functionObject lifecycle; the transient loop keeps its own time-valued
     // advancement, which is a genuinely different shape from the steady solvers' iteration index and is
@@ -891,6 +892,7 @@ try
         const bool anyMotion = meshMotion.active || vclMotion.active || acmiTimeScale;
         const DeviceSimpleResidual r =
             solver.pimpleStep(deltaT, nOuter, nCorr, anyMotion ? meshUpdate : std::function<void(int)>());
+        lastSolvedTime = t;
         // OF order: the Courant number is evaluated on the flux the step just produced, and deltaT for
         // the NEXT step follows from it (CourantNo.H then setDeltaT.H, both at the top of the loop).
         if (timeControls.adjustTimeStep)
@@ -913,8 +915,8 @@ try
     }
     time.end();   // OF Time.C:790-802: a final execute() so the last step is seen, then end()
     {
-        const std::string tn = timeName(startTime + deltaT * (scalar)timeIndex);
-        if (tn != lastWritten) { writeTimeDir(tn); sampleForces(startTime + deltaT * (scalar)timeIndex); }
+        const std::string tn = timeName(lastSolvedTime);
+        if (tn != lastWritten) { writeTimeDir(tn); sampleForces(lastSolvedTime); }
     }
     return 0;
 }
