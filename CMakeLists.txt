@@ -1210,6 +1210,30 @@ add_test(NAME mirror_dict_audit
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mirror_dict_audit.sh)
 set_tests_properties(mirror_dict_audit PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 
+add_executable(test_case_dict_refusals tests/test_case_dict_refusals.cu)
+target_include_directories(test_case_dict_refusals PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_case_dict_refusals PRIVATE brae_core)
+add_test(NAME case_dict_refusals COMMAND test_case_dict_refusals)
+
+add_executable(test_continuity_from_phi tests/test_continuity_from_phi.cu)
+target_include_directories(test_continuity_from_phi PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_continuity_from_phi PRIVATE brae_core)
+add_test(NAME mirror_continuity
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mirror_continuity.sh)
+set_tests_properties(mirror_continuity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+add_test(NAME sa_coeffs_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_coeffs_vs_openfoam.sh)
+set_tests_properties(sa_coeffs_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+add_test(NAME mirror_scalar_transport_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mirror_scalar_transport_vs_openfoam.sh)
+set_tests_properties(mirror_scalar_transport_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+add_test(NAME transonic_p_dilu
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/transonic_p_dilu.sh)
+set_tests_properties(transonic_p_dilu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
 add_test(NAME uresidual_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/uresidual_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO

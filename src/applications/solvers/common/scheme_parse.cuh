@@ -113,9 +113,15 @@ inline std::string divKeyOf(const std::string& ln)
 // plausible wrong answer, which is worse than refusing.
 struct FieldDivScheme
 {
-    bool   bounded      = false;
-    bool   limited      = false;   // limitedLinear
-    bool   linearUpwind = false;
+    bool   bounded        = false;
+    bool   limited        = false;   // limitedLinear
+    bool   linearUpwind   = false;
+    // The three schemes this parser used to fold into the flags above by SUBSTRING match, so that
+    // `linearUpwindV` and `limitedLinearV` ran as their unlimited-direction cousins and `LUST` ran as
+    // UPWIND, all in silence (queue item 16i). Each is its own flag now, matched on the exact token.
+    bool   limitedLinearV = false;
+    bool   linearUpwindV  = false;
+    bool   lust           = false;
     // TWO currencies for the same `limitedLinear <k>` coefficient, because the two consumers transform
     // it in different places: the device kernels take twoByk pre-computed (solvePassiveScalar,
     // deviceSolveScalarTransport), while the host weights functions take the RAW k and compute
@@ -150,7 +156,10 @@ inline std::string fvSchemesBlock(const std::string& all, const std::string& nam
     return all.substr(o, (i < all.size() ? i - o : std::string::npos));
 }
 
-inline FieldDivScheme parseFieldDivScheme(const std::string& caseDir, const std::string& field)
+// `vectorField`: the V forms exist only for vectors in OpenFOAM (limitedLinearV/linearUpwindV are
+// instantiated for vector fields alone), and brae's scalar transports have not ported LUST -- so on a
+// scalar equation those three names are refused, by name, rather than run as something else.
+inline FieldDivScheme parseFieldDivScheme(const std::string& caseDir, const std::string& field, bool vectorField = false)
 {
     // Same source as parseFvSchemesControls: $-expanded, so `div(phi,tracer0) $turbulence;` resolves.
     const std::string all = readFvSchemesText(caseDir);
@@ -184,14 +193,40 @@ inline FieldDivScheme parseFieldDivScheme(const std::string& caseDir, const std:
 
     FieldDivScheme fs;
     divSchemesConsumed().insert(key);   // recorded here too: the tracer's own div(phi,<field>)
-    fs.bounded      = st.find("bounded")       != std::string::npos;
-    fs.limited      = st.find("limitedLinear") != std::string::npos;
-    fs.linearUpwind = st.find("linearUpwind")  != std::string::npos;
-    if (fs.limited)
+    fs.bounded = st.find("bounded") != std::string::npos;
+    // The scheme word is the token after `Gauss`, matched EXACTLY. A substring match let
+    // `linearUpwindV` pass as linearUpwind, `limitedLinearV` as limitedLinear and `LUST` as nothing at
+    // all -- i.e. upwind -- and every one of those ran without a word. Anything outside the ported set
+    // is refused by name (OpenFOAM's own reaction to an unknown scheme is a FatalIOError).
+    std::string tok;
+    {
+        const std::size_t gpos = st.find("Gauss");
+        if (gpos == std::string::npos)
+            throw std::runtime_error("brae: fvSchemes `" + key + "` is `" + st +
+                                     "`, which names no Gauss scheme; brae has ported Gauss schemes only.");
+        std::size_t i = gpos + 5;
+        while (i < st.size() && std::isspace(static_cast<unsigned char>(st[i]))) ++i;
+        while (i < st.size() && !std::isspace(static_cast<unsigned char>(st[i])) && st[i] != ';') tok += st[i++];
+    }
+    if      (tok == "upwind")         {}
+    else if (tok == "linearUpwind")   fs.linearUpwind = true;
+    else if (tok == "linearUpwindV")  fs.linearUpwindV = true;
+    else if (tok == "limitedLinear")  fs.limited = true;
+    else if (tok == "limitedLinearV") fs.limitedLinearV = true;
+    else if (tok == "LUST")           fs.lust = true;
+    else
+        throw std::runtime_error("brae: fvSchemes `" + key + "` names `" + tok + "`, which brae has not ported "
+                                 "for this equation (upwind, linearUpwind, linearUpwindV, limitedLinear, "
+                                 "limitedLinearV, LUST). Refusing rather than running a substituted scheme.");
+    if (!vectorField && (fs.linearUpwindV || fs.limitedLinearV || fs.lust))
+        throw std::runtime_error("brae: fvSchemes `" + key + "` names `" + tok + "` on a SCALAR equation. "
+                                 "OpenFOAM instantiates the V forms for vector fields only, and brae's scalar "
+                                 "transports have not ported LUST; refusing rather than running another scheme.");
+    if (fs.limited || fs.limitedLinearV)
     {
         double kc = 1.0;
-        const std::size_t q = st.find("limitedLinear");
-        std::sscanf(st.c_str() + q + 13, "%lf", &kc);
+        const std::size_t q = st.find(tok);
+        std::sscanf(st.c_str() + q + tok.size(), "%lf", &kc);
         fs.coeff  = static_cast<scalar>(kc);
         fs.twoByk = static_cast<scalar>(2.0 / std::max(kc, 1e-30));
     }

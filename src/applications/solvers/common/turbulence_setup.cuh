@@ -230,7 +230,10 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                         ctl.lesDeltaCoeff = mc->scalarOr("deltaCoeff", ctl.lesDeltaCoeff);
                 }
                 else if (!saIddes && !sstIddes && delta != "cubeRootVol")   // IDDES computes its own (maxDeltaxyz-based) length scale internally
-                    std::fprintf(stderr, "brae WARNING: LES delta '%s' not supported; using cubeRootVol (V^(1/3)).\n", delta.c_str());
+                    // Refused, not substituted: the filter width IS the model on an LES, and this used to
+                    // print a warning and run cubeRootVol under the case's own `delta` (item 16e).
+                    throw std::runtime_error("brae: LES delta '" + delta + "' is not ported (cubeRootVol, "
+                                             "maxDeltaxyz); refusing rather than running cubeRootVol under it.");
                 const FoamDict* dc = les->subDict(model + "Coeffs");
                 if (wale)   // WALE: the other ALGEBRAIC sub-grid nut. Same slot as Smagorinsky -- no transport
                 {           // scalar, no DES limiter -- only the velocity scale differs (see WaleCoeffs).
@@ -356,9 +359,31 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
             ctl.modelName = model;
             if (ctl.sa)
             {
-                // Spalart-Allmaras: OF defaults (coeffs read from RAS.SpalartAllmarasCoeffs would override; not needed here).
-                const SpalartAllmarasCoeffs& c = ctl.saCoeffs;
-                std::printf("  SpalartAllmaras (OF defaults): sigmaNut=%.4g kappa=%.4g Cb1=%.4g Cb2=%.4g Cw1=%.4g Cw2=%.3g Cw3=%.3g Cv1=%.3g Cs=%.3g\n",
+                // Every coefficient from the model's coeffDict, as SpalartAllmarasBase.C:205-312 reads
+                // them (getOrAddToDict on optionalSubDict("SpalartAllmarasCoeffs"), i.e. the RAS dict
+                // itself when the sub-dictionary is absent). This block took the defaults whatever the
+                // case wrote (item 16d). ft2's term (ck, Ct3, Ct4) is not implemented, so a case that
+                // switches it on is refused rather than run without it.
+                const FoamDict* sc = ras ? ras->optionalSubDict("SpalartAllmarasCoeffs") : nullptr;
+                SpalartAllmarasCoeffs& c = ctl.saCoeffs;
+                if (sc)
+                {
+                    c.sigmaNut = sc->scalarOr("sigmaNut", c.sigmaNut);
+                    c.kappa    = sc->scalarOr("kappa",    c.kappa);
+                    c.Cb1      = sc->scalarOr("Cb1",      c.Cb1);
+                    c.Cb2      = sc->scalarOr("Cb2",      c.Cb2);
+                    c.Cw2      = sc->scalarOr("Cw2",      c.Cw2);
+                    c.Cw3      = sc->scalarOr("Cw3",      c.Cw3);
+                    c.Cv1      = sc->scalarOr("Cv1",      c.Cv1);
+                    c.Cs       = sc->scalarOr("Cs",       c.Cs);
+                    const std::string ft2 = sc->wordOr("ft2", "false");
+                    if (ft2 == "true" || ft2 == "yes" || ft2 == "on" || ft2 == "1")
+                        throw std::runtime_error("brae: SpalartAllmarasCoeffs ft2 is on; the ft2 laminar-suppression "
+                                                 "term (ck, Ct3, Ct4 in SpalartAllmarasBase.C) is not implemented. "
+                                                 "Refusing rather than running the model without it.");
+                }
+                std::printf("  SpalartAllmaras%s: sigmaNut=%.4g kappa=%.4g Cb1=%.4g Cb2=%.4g Cw1=%.4g Cw2=%.3g Cw3=%.3g Cv1=%.3g Cs=%.3g\n",
+                            sc ? " (coeffDict)" : " (OF defaults)",
                             c.sigmaNut, c.kappa, c.Cb1, c.Cb2, c.Cw1(), c.Cw2, c.Cw3, c.Cv1, c.Cs);
             }
             else if (ctl.sst)

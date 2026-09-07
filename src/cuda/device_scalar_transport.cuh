@@ -403,9 +403,24 @@ void deviceSolveScalarTransport(
     // stays byte-for-byte the steady scalar transport. rho=1 (incompressible). Matches the momentum ddt wiring.
     deviceFvmDdtDiag(dm.V, ddt.c, 1.0, aD);
     if (ddt.old) { DeviceBuffer<scalar> e2; deviceFvmDdtSource(dm.V, ddt.c, 1.0, *ddt.old, ddt.old2 ? *ddt.old2 : e2, src, ddt.ddt0); }
-    DeviceBuffer<scalar> aRD, aDelta; deviceRelaxDiag(deviceLduView(dm, aD, aU, aL), dm, aIC, relax, aRD, aDelta,
-                                                      ifSumOff.size() ? ifSumOff.data() : nullptr);
-    { DeviceBuffer<scalar> t; deviceHadamard(t, aDelta, field); deviceAxpy(1.0, t, src); }
+    DeviceBuffer<scalar> aRD, aDelta;
+    if (relax > scalar(0))
+    {
+        deviceRelaxDiag(deviceLduView(dm, aD, aU, aL), dm, aIC, relax, aRD, aDelta,
+                        ifSumOff.size() ? ifSumOff.data() : nullptr);
+        DeviceBuffer<scalar> t;
+        deviceHadamard(t, aDelta, field);
+        deviceAxpy(1.0, t, src);
+    }
+    else
+    {
+        // fvMatrix::relax(alpha) returns without touching the matrix for alpha <= 0 (fvMatrix.C:
+        // `if (alpha <= 0) return;`) -- the case named no factor for this equation, which is what
+        // scalarTransport's relaxEquation() yields for an unnamed tracer. relaxKernel divides by
+        // alpha, so it must not run at all; the diagonal is used as assembled (item 15c). No caller
+        // passed alpha <= 0 before this branch existed, so nothing else moves.
+        deviceCopy(aRD, aD);
+    }
     if (fvoSetMask && fvoSetVal)   // fvOptions scalarFixedValueConstraint (OF: before boundaryManipulate)
     {
         svGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.owner.data(), dm.nei.data(), dm.ownerStart.data(),

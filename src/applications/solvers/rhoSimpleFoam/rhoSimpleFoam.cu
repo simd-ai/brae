@@ -721,7 +721,8 @@ Residuals rhoSimpleStep(
             // fvm::div(phid, p) makes lower = -w*phi and upper = lower + phi, so upper != lower at every
             // face with flow through it. A symmetric solver on that matrix is not slow, it is wrong: CG
             // burned the full 3000-iteration cap and the case stalled before printing iteration 1.
-            perf = deviceJacobiBiCGStab(A, b, f.p, dnf.data(), in.tolP, in.relTolP, in.maxIterP, in.pcgCheckEvery, in.minIterP);
+            perf = deviceJacobiBiCGStab(A, b, f.p, dnf.data(), in.tolP, in.relTolP, in.maxIterP, in.pcgCheckEvery, in.minIterP,
+                                        in.preconP);   // DILU when the driver built one; null keeps Jacobi
         }
         else
         {
@@ -754,6 +755,9 @@ Residuals rhoSimpleStep(
         }
         // solutionControl.C:230-233 takes sp.first() -- the FIRST solve of the iteration, not the last.
         if (corr == 1) res["p"] = perf.initialResidual;
+        // The work behind the number: how many solver iterations the first p solve took. Printed on
+        // the summary line, so a benchmark log says what the pressure cost, not only where it stopped.
+        if (corr == 1) res["pIters"] = static_cast<scalar>(perf.nIterations);
 
         if (corr == nCorr)
         {

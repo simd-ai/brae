@@ -2,7 +2,9 @@
 #include "rhoSimpleFoamDriver.cuh"
 
 #include "brae_time.cuh"
-#include "dict_audit.cuh"   // DictAuditScope: every dictionary entry read off disk and never applied, reported on every exit
+#include "rhoScalarTransportFO.cuh"   // functionObjects::scalarTransport on this arm (item 15c)
+#include "dict_audit.cuh"
+#include <memory>   // DictAuditScope: every dictionary entry read off disk and never applied, reported on every exit
 #include "foam_field_writer.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -13,6 +15,8 @@
 #include "thermo_model.cuh"              // hConstTToHe: limitTemperature is a T limit, the device clamps he
 #include "rhoTurbulenceHook.cuh"         // correctTurbulence, device-resident
 #include "solution_directions.cuh"       // polyMesh::solutionD(): which U components are solved
+#include "device_mesh.cuh"               // deviceDiv: continuityErrs.H on the device arm
+#include "device_blas.cuh"               // deviceHadamard / deviceDot / deviceSumMag / deviceOnes
 #include "solver_controls.cuh"
 #include "write_control.cuh"
 
@@ -319,9 +323,19 @@ int runMirrorCuda(const std::string& caseDir)
     // through the shared consumption choke point, so it needs no instance here. What this cannot see:
     // thermophysicalProperties and turbulenceProperties are read as private copies inside createFields
     // (rhoCreateFields_cpp.cu), and an audit holds pointers -- queued as 15b.
+    // thermophysicalProperties and the turbulence dictionary are read HERE and handed to createFields
+    // (item 15b): FoamDict records the keys its consumers query, so the audit can only report on the
+    // instance the reads happen on. turbulenceDictPath is createFields' own resolution of OpenFOAM's
+    // two names for that dictionary; "" is a case with neither, which createFields refuses.
+    const FoamDict thermoProps = readDict(caseDir + "/constant/thermophysicalProperties");
+    const std::string turbPath = cpu::rhoSimple::turbulenceDictPath(caseDir);
+    std::unique_ptr<FoamDict> turbProps;
+    if (!turbPath.empty()) turbProps = std::make_unique<FoamDict>(readDict(turbPath));
     DictAuditScope audit;
     audit.add(controlDict, "system/controlDict");
     audit.add(fvSolution,  "system/fvSolution");
+    audit.add(thermoProps, "constant/thermophysicalProperties");
+    if (turbProps) audit.add(*turbProps, turbPath.substr(caseDir.size() + 1));
     audit.addFvSchemes(caseDir);
     const FoamDict* simpleDict = fvSolution.subDict("SIMPLE");
 
@@ -338,16 +352,23 @@ int runMirrorCuda(const std::string& caseDir)
     const std::vector<FvPatch> patches = buildPatches(m, g);
     const label nC = m.nCells();
 
-    Time time(caseDir, controlDict);
+    // The scalarTransport factory, as on the host arm: built by Time, fields resolved from `tracerCtx`
+    // at the first execute(), after the device fields exist (item 15c).
+    brae::tracer::TracerCudaContext tracerCtx;
+    std::vector<brae::tracer::RhoTracerCudaFO*> tracers;
+    std::vector<std::pair<std::string, FunctionObjectList::Factory>> foTypes;
+    foTypes.emplace_back("scalarTransport", brae::tracer::rhoTracerCudaFactory(caseDir, fvSolution, tracerCtx, tracers));
+    Time time(caseDir, controlDict, foTypes);
     const std::string startName = time.startName();
     WriteControl& wc = time.writeControl();
+    tracerCtx.fieldDir = caseDir + "/" + startName;
 
     // The HOST field set first, exactly as the harness does: createDeviceFields projects the device
     // state from it, and every refusal createFields carries (thermo, RAS model, boundary conditions,
     // coupled patches) fires here before a single byte reaches the GPU.
     cpu::rhoSimple::RhoSimpleFields hf =
         cpu::rhoSimple::createFields(caseDir + "/" + startName, caseDir, simpleDict, &fvSolution,
-                                     m, g, patches);
+                                     m, g, patches, &thermoProps, turbProps.get());
 
     std::printf("brae rhoSimpleFoam (OF-mirror, CUDA): %ld cells, start %s, %s\n",
                 (long)nC, startName.c_str(),
@@ -363,6 +384,20 @@ int runMirrorCuda(const std::string& caseDir)
     // the block below because the preconditioner they select is built once, from the mesh, and lives as
     // long as the run.
     bool diluU = false, diluHe = false, diluKE = false;
+    // DILU on the transonic pressure's BiCGStab (see RhoStepInput::preconP) is OPT-IN, BRAE_DILU_P=1,
+    // and only where the case's own p entry names it (`solver PBiCGStab; preconditioner DILU;`, as
+    // sbMatched does). The default keeps the diagonal and announces the substitution, because the
+    // value is the same and the diagonal is faster: on sbMatched (112k cells, tolerance 1e-12 relTol 0,
+    // so both solves converge fully and the p residual trajectories agree to the printed digits) DILU
+    // took the p solve from 668 to 202 BiCGStab iterations and the phase from 68 to 474 ms per
+    // iteration; on the squareBend tutorial at 896k cells from ~700 to ~300 iterations and from 315 to
+    // 567 ms. The level-scheduled apply (item 70's per-level floor) costs more than the iterations it
+    // saves; the lever is a faster apply, not the default. tests/transonic_p_dilu.sh holds both arms.
+    const FoamDict* solversDict = fvSolution.subDict("solvers");
+    const FoamDict* pEntry = solversDict ? solversDict->subDict("p") : nullptr;
+    const bool caseAsksDiluP = pEntry && pEntry->wordOr("preconditioner", "") == "DILU";
+    const bool diluP = hin.transonic && caseAsksDiluP
+                    && std::getenv("BRAE_DILU_P") && std::string(std::getenv("BRAE_DILU_P")) == "1";
     // The case's smoothSolver selection per field, read below and carried into the step and the
     // turbulence hook (item 58).
     bool gsU = false, gsUSym = true, gsHe = false, gsHeSym = true;
@@ -393,8 +428,11 @@ int runMirrorCuda(const std::string& caseDir)
         }
         if (hin.transonic)
         {
+            // The notice must say what RUNS: the case's DILU when BRAE_DILU_P=1 opted in, the diagonal
+            // otherwise. One decision, read here and used at the wiring below, so the two cannot
+            // disagree (tests/transonic_p_dilu.sh holds both arms to their words).
             runsAs.pSolver = "PBiCGStab";
-            runsAs.pPrecon = "diagonal";
+            runsAs.pPrecon = diluP ? "DILU" : "diagonal";
         }
         readLinearSolverControls(fvSolution, secondName, lctl, "SIMPLE", hf.heName, runsAs);
         hin.tolU    = lctl.tolU;    hin.relTolU    = lctl.relTolU;    hin.maxIterU    = lctl.maxIterU;    hin.minIterU    = lctl.minIterU;
@@ -415,6 +453,10 @@ int runMirrorCuda(const std::string& caseDir)
     }
 
     RhoDeviceFields dev = createDeviceFields(hf, m, g, patches);
+    tracerCtx.dev = &dev;
+    tracerCtx.m = &m;
+    tracerCtx.g = &g;
+    tracerCtx.patches = &patches;
     DevicePorosity porosity;        // outlives gin: RhoStepInput::porosity points into it
     DeviceConstraints constraints;  // ...and so do the fvOptions constraint masks
     RhoStepInput gin =
@@ -438,12 +480,20 @@ int runMirrorCuda(const std::string& caseDir)
     // OpenFOAM where the host arm sat at 8.4e-12, with both arms' assembled systems agreeing to 1e-11 --
     // the gap was the solver's stopping point, not the discretisation (queue item 27). buildDeviceDilu is
     // a level schedule over the mesh, so it is built once here and refreshed per solve inside the solver.
-    if (diluU || diluHe || diluKE)
+    if (diluU || diluHe || diluKE || diluP)
     {
         w.dilu = buildDeviceDilu(m.owner(), m.neighbour(), nC);
     }
     gin.preconU  = (diluU  && w.dilu.valid) ? &w.dilu : nullptr;
     gin.preconHe = (diluHe && w.dilu.valid) ? &w.dilu : nullptr;
+    // The transonic pressure's BiCGStab takes the same DILU when BRAE_DILU_P=1 opted in (see diluP).
+    // The notice above already said DILU, so a schedule that failed to build is refused, not
+    // silently replaced by the diagonal it just denied.
+    if (diluP && !w.dilu.valid)
+        throw std::runtime_error("brae rhoSimpleFoam (mirror): the DILU level schedule for the transonic pressure "
+                                 "could not be built; refusing rather than running the diagonal the notice "
+                                 "denied. BRAE_DILU=0 selects the diagonal explicitly.");
+    gin.preconP  = diluP ? &w.dilu : nullptr;
 
     // THE THERMO HOOKS, device-resident. The step takes them as hooks because EEqn.H ends in
     // thermo.correct() -- which moves T and therefore psi, and every consumer below that point reads
@@ -504,6 +554,12 @@ int runMirrorCuda(const std::string& caseDir)
         writeVolField(wsrc + "U", outDir + "/U", U, patches, 12, UB);
         writeVolField(wsrc + "p", outDir + "/p", host(dev.f.p), patches, 12, host(dev.f.pBnd));
         writeVolField(wsrc + "T", outDir + "/T", host(dev.f.T), patches, 12, host(dev.f.TBnd));
+        // scalarTransport's transportedField(), written beside the solved fields on the same cadence;
+        // its boundary is evaluated from the device field here, as k's is below.
+        for (const brae::tracer::RhoTracerCudaFO* st : tracers)
+            if (st->ready())
+                writeVolField(wsrc + st->fieldName(), outDir + "/" + st->fieldName(), st->hostField(), patches, 12,
+                              st->boundaryFlat());
         {
             static const DerivedFieldSpec rhoSpec{"rho", "dimensions      [1 -3 0 0 0 0 0];"};
             writeVolField(wsrc + "T", outDir + "/rho", host(dev.f.rho), patches, 12,
@@ -534,6 +590,7 @@ int runMirrorCuda(const std::string& caseDir)
 
     int  nIter = static_cast<int>(nSteps);
     bool converged = false;
+    scalar cumulativeContErr = 0.0;   // continuityErrs.H: summed over the run
     while (time.loop())
     {
         const int iter = time.timeIndex();
@@ -568,7 +625,27 @@ int runMirrorCuda(const std::string& caseDir)
                     WriteControl::timeName(wc.timeValue(iter)).c_str(),
                     res("U"), hf.heName.c_str(), res(hf.heName.c_str()), res("p"));
         if (r.count("k")) std::printf("   k %.4e   %s %.4e", res("k"), second.c_str(), res(second.c_str()));
+        if (r.count("pIters")) std::printf("   pIters %.0f", res("pIters"));
         std::printf("\n");
+        // OpenFOAM's continuityErrs.H (rhoSimpleFoam's pEqn.H:81 / pcEqn.H:94 include it every
+        // iteration): contErr = fvc::div(phi) on the corrected MASS flux, sum local = deltaT * the
+        // volume-weighted average of |contErr|, global = the same of contErr, cumulative summed over
+        // the run. The host step prints it (rhoSimpleFoam_cpp.cu); this arm printed nothing (item 16a).
+        // Two reductions per iteration, beside the residual reads the summary line above already makes;
+        // tests/mirror_continuity.sh holds the line to the host arm and to a recomputation from the
+        // written phi.
+        {
+            DeviceBuffer<scalar> contErr, R;
+            deviceDiv(dev.dm, dev.f.phiInt, dev.f.phiBnd, contErr);
+            deviceHadamard(R, contErr, dev.dm.V);
+            const DeviceBuffer<scalar>& ones = deviceOnes(dev.dm.nCells);
+            const scalar sumV     = deviceDot(dev.dm.V, ones);
+            const scalar sumLocal = hf.deltaT * deviceSumMag(R) / sumV;
+            const scalar global   = hf.deltaT * deviceDot(R, ones) / sumV;
+            cumulativeContErr += global;
+            std::printf("time step continuity errors : sum local = %g, global = %g, cumulative = %g\n",
+                        sumLocal, global, cumulativeContErr);
+        }
 
         resControl.beginIteration();
         bool achieved = resControl.ok(r.count("p") ? r.at("p") : scalar(0), "p");

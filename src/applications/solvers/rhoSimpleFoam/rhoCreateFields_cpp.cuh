@@ -198,6 +198,16 @@ struct RhoSimpleFields
 //   timeDir     the time directory to read from (e.g. <case>/0 or <case>/282)
 //   caseDir     the case root, for constant/thermophysicalProperties
 //   simpleDict  the SIMPLE sub-dictionary of fvSolution, where the reference and limit keys live
+// The turbulence dictionary under whichever of OpenFOAM's two names the case carries
+// (momentumTransport, the newer, wins when both exist), or "" when neither does -- createFields
+// refuses that case rather than assuming laminar. One definition, so the drivers that read the
+// dictionary for the audit and createFields that consumes it cannot pick different files.
+std::string turbulenceDictPath(const std::string& caseDir);
+
+// `thermoDict` / `turbDict`: the caller's already-read instances of constant/thermophysicalProperties
+// and the turbulence dictionary. FoamDict records which keys were queried, so DictAuditScope can only
+// report on the instance the consumers actually read from; with private copies inside here the
+// mirror's audit saw no read of either (queue item 15b). Null keeps the private reads.
 RhoSimpleFields createFields(
     const std::string&          timeDir,
     const std::string&          caseDir,
@@ -205,7 +215,9 @@ RhoSimpleFields createFields(
     const FoamDict*             fvSolution,
     const PrimitiveMesh&        m,
     const FvGeometry&           g,
-    const std::vector<FvPatch>& patches);
+    const std::vector<FvPatch>& patches,
+    const FoamDict*             thermoDict = nullptr,
+    const FoamDict*             turbDict = nullptr);
 
 // EddyDiffusivity::correctNut's BOUNDARY half, one implementation for construction and both step
 // branches. alphat = rho*nut/Prt is a FIELD assignment in OpenFOAM (EddyDiffusivity.C:38), so every

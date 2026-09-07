@@ -11,6 +11,7 @@
 #include "patch_entry_lookup.cuh"   // findPatchEntry: OF patch/group/regex resolution
 #include "foam_field_reader.cuh"
 #include "thermo_parse.cuh"
+#include <memory>
 #include "equation_of_state.cuh"
 #include <algorithm>
 #include <filesystem>
@@ -240,6 +241,15 @@ bool PressureControl::limit(std::vector<scalar>& p) const
 }
 
 
+std::string turbulenceDictPath(const std::string& caseDir)
+{
+    const std::string mtPath = caseDir + "/constant/momentumTransport";
+    const std::string tpPath = caseDir + "/constant/turbulenceProperties";
+    if (fileExists(mtPath)) return mtPath;
+    if (fileExists(tpPath)) return tpPath;
+    return "";
+}
+
 RhoSimpleFields createFields(
     const std::string&          timeDir,
     const std::string&          caseDir,
@@ -247,7 +257,9 @@ RhoSimpleFields createFields(
     const FoamDict*             fvSolution,
     const PrimitiveMesh&        m,
     const FvGeometry&           g,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    const FoamDict*             thermoDict,
+    const FoamDict*             turbDict)
 {
     RhoSimpleFields f;
     const label nC = m.nCells();
@@ -271,7 +283,7 @@ RhoSimpleFields createFields(
     // fluidThermo::New(mesh). readThermoCoeffs refuses an unsupported thermo BY NAME rather than falling
     // back to a default, so an unhandled equation of state stops here instead of silently running as a
     // perfect gas.
-    f.thermo = readThermoCoeffs(caseDir, fvSolution);
+    f.thermo = readThermoCoeffs(caseDir, fvSolution, thermoDict, turbDict);
     // runTime.deltaTValue() scales the continuity errors; steady SIMPLE cases carry deltaT 1 but the
     // value is the CASE's, not an assumption.
     try { f.deltaT = readDict(caseDir + "/system/controlDict").scalarOr("deltaT", 1.0); } catch (...) {}
@@ -295,7 +307,9 @@ RhoSimpleFields createFields(
     // thermo.validate(args.executable(), "h", "e") -- rhoSimpleFoam accepts exactly these two energy
     // variables, because EEqn.H's kinetic-energy source is written for both and for nothing else.
     {
-        const FoamDict tp = readDict(caseDir + "/constant/thermophysicalProperties");
+        std::unique_ptr<FoamDict> ownTp;
+        if (!thermoDict) ownTp = std::make_unique<FoamDict>(readDict(caseDir + "/constant/thermophysicalProperties"));
+        const FoamDict& tp = thermoDict ? *thermoDict : *ownTp;
         const FoamDict* tt = tp.subDict("thermoType");
         const std::string energy = tt ? tt->wordOr("energy", "") : "";
         if (energy == "sensibleEnthalpy")            f.heName = "h";
@@ -580,17 +594,15 @@ RhoSimpleFields createFields(
         // case carries exactly one. Neither present is a real case too -- rhoSimpleFoam constructs the
         // model unconditionally, so a case with no dictionary at all is refused rather than assumed
         // laminar, which would run a turbulent case with no closure and report nothing.
-        const std::string mtPath = caseDir + "/constant/momentumTransport";
-        const std::string tpPath = caseDir + "/constant/turbulenceProperties";
-        std::string dictPath;
-        if (fileExists(mtPath))      dictPath = mtPath;
-        else if (fileExists(tpPath)) dictPath = tpPath;
-        else
+        const std::string dictPath = turbulenceDictPath(caseDir);
+        if (dictPath.empty())
             throw std::runtime_error(
                 "brae: rhoSimpleFoam found neither constant/momentumTransport nor "
                 "constant/turbulenceProperties. OpenFOAM constructs the turbulence model from one of "
                 "them in createFields.H; refusing rather than assuming the case is laminar.");
-        const FoamDict mt2 = readDict(dictPath);
+        std::unique_ptr<FoamDict> ownMt;
+        if (!turbDict) ownMt = std::make_unique<FoamDict>(readDict(dictPath));
+        const FoamDict& mt2 = turbDict ? *turbDict : *ownMt;
         const std::string sim = mt2.wordOr("simulationType", "laminar");
         if (sim == "RAS")
         {

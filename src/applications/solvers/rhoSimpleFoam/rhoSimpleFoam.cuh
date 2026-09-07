@@ -163,6 +163,13 @@ struct RhoStepInput
     // gated against. Both point at the ONE DeviceDilu the driver builds -- see RhoSolverWorkspace::dilu.
     const DeviceDilu* preconU  = nullptr;
     const DeviceDilu* preconHe = nullptr;
+    // The TRANSONIC pressure: fvm::div(phid, p) makes the matrix asymmetric, PCG is invalid on it, and
+    // the step runs BiCGStab. DILU here only when the driver opted in (BRAE_DILU_P=1 on a case whose
+    // p entry names it); null keeps the diagonal, the default, because DILU's level-scheduled apply
+    // costs more than the iterations it saves: 3x fewer BiCGStab iterations and 7x MORE time on the
+    // p phase at 112k cells, 1.8x more at 896k (bench/results/rhoSimpleFoam_squareBend_gb10.md). The
+    // notice names whichever runs.
+    const DeviceDilu* preconP  = nullptr;
     int    minIterU = 0,    minIterP = 0,    minIterHe = 0,    minIterTurb = 0;
     bool   uSymGaussSeidel = false;
     // fvSolution solvers/<field>/nSweeps for the smoothSolver path (default 1), and the energy field's

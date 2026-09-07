@@ -5,6 +5,7 @@
 #include "cf_types.cuh"
 #include "function1.cuh"   // OF Function1: constant / table
 #include "foam_token_reader.cuh"
+#include "brae_notice.cuh"   // noticeApproximated: a per-patch wall-function coefficient brae applies model-wide
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -94,6 +95,12 @@ struct PatchFieldData
     T              refValueUniformValue{};
     std::vector<T> refValues;
     bool           hasValueFraction = false;
+    // Wall-function coefficients written ON THE PATCH. OpenFOAM's wall functions read Cmu/kappa/E from
+    // the patch dictionary (wallFunctionCoefficients.C:73-78; defaults 0.09 / 0.41 / 9.8) and each patch
+    // may differ; brae applies one model-wide value per closure. Parsed so a per-patch value can be
+    // ANNOUNCED instead of skipped (item 16h); honouring it per patch is queued as 16h-port.
+    scalar         wfCmu = 0.09, wfKappa = 0.41, wfE = 9.8;
+    bool           hasWfCmu = false, hasWfKappa = false, hasWfE = false;
     bool           vfUniform        = false;
     scalar         vfUniformValue   = 0;
     std::vector<scalar> vfValues;
@@ -579,6 +586,18 @@ inline FieldData<T> readField(const std::string& path)
                         if (key == "kappa") p.ablKappa = v;
                         else p.ablCmu = v;
                     }
+                    else if ((key == "kappa" || key == "Cmu" || key == "E") && !p.hasABL)
+                    {
+                        // A wall function's own coefficients (see PatchFieldData). Stored on every
+                        // non-ABL entry that carries them; whether the entry IS a wall function is
+                        // decided at the end of the patch, once its type is known, because the keys
+                        // may precede `type` in the file.
+                        const scalar v = ts.nextScalar();
+                        ts.expect(";");
+                        if      (key == "kappa") { p.wfKappa = v; p.hasWfKappa = true; }
+                        else if (key == "Cmu")   { p.wfCmu   = v; p.hasWfCmu   = true; }
+                        else                     { p.wfE     = v; p.hasWfE     = true; }
+                    }
                     // `ramp` multiplies the normal-velocity BCs' value by a Function1 of time every
                     // updateCoeffs (surfaceNormalFixedValueFvPatchVectorField.C:63-65). brae evaluates
                     // no Function1 here, so the key is MARKED and the factory refuses by name -- it
@@ -995,6 +1014,23 @@ inline FieldData<T> readField(const std::string& path)
                         throw std::runtime_error("brae: timeVaryingMappedFixedValue on patch '" + p.name +
                             "' requires constant/boundaryData/" + p.name + " (points + a time dir); read failed: " + e.what());
                     }
+                }
+                // A per-patch wall-function coefficient brae will NOT apply per patch: said so, with
+                // the value the case wrote and the one brae runs (item 16h). Silence here is what let
+                // turbineSiting's `kappa 0.4` on its terrain epsilonWallFunction run at 0.41.
+                if (p.type.find("WallFunction") != std::string::npos)
+                {
+                    auto announce = [&](const char* key, bool has, scalar v, scalar def)
+                    {
+                        if (!has || v == def) return;
+                        noticeApproximated("boundaryField/" + p.name + "/" + key,
+                            "the " + p.type + " patch writes " + key + " " + std::to_string(v) +
+                            "; brae applies its model-wide value (OpenFOAM: wallFunctionCoefficients.C reads it "
+                            "per patch, default " + std::to_string(def) + ") -- not honoured per patch");
+                    };
+                    announce("Cmu",   p.hasWfCmu,   p.wfCmu,   0.09);
+                    announce("kappa", p.hasWfKappa, p.wfKappa, 0.41);
+                    announce("E",     p.hasWfE,     p.wfE,     9.8);
                 }
                 fd.boundary.push_back(std::move(p));
             }

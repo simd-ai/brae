@@ -13,7 +13,9 @@
 #   CONTROL  the same run without the plant must NOT name it (the audit reports what is unread, not
 #            what exists); and the planted run must still complete its iterations.
 #
-# FAIL-PROOF, RUN against the pre-item-15 binary: neither arm printed a single `NOTICE [unread]` line.
+# FAIL-PROOFS, RUN: (15) with the audit removed, both arms failed the fvSolution plant, exit 1.
+# (15b) against the item-15 binary, before the thermo/turbulence instances were threaded through
+# createFields: both arms named the fvSolution plant and NEITHER named the thermo or turbulence plant.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
@@ -43,6 +45,18 @@ if plant:
     assert m, 'no solvers/p block to plant in'
     s = s[:m.end()] + '\n        bogusUnreadEntry 1;' + s[m.end():]
     open(f, 'w').write(s)
+    # item 15b: the two dicts createFields used to read privately. Top-level plants, after the header.
+    import os
+    for fn, key in (('constant/thermophysicalProperties', 'bogusThermoEntry'),
+                    ('constant/momentumTransport', 'bogusTurbEntry'),
+                    ('constant/turbulenceProperties', 'bogusTurbEntry')):
+        path = os.path.join(d, fn)
+        if not os.path.exists(path): continue
+        s = open(path).read()
+        m = re.search(r'FoamFile\s*\{[^{}]*\}', s, re.S)
+        assert m, 'no FoamFile header in ' + fn
+        s = s[:m.end()] + '\n' + key + ' 1;' + s[m.end():]
+        open(path, 'w').write(s)
 PY
 }
 for arm in "1 host" "cuda cuda"; do
@@ -59,6 +73,16 @@ for arm in "1 host" "cuda cuda"; do
     grep -q 'bogusUnreadEntry' "$C/log" \
         && say "$label  CONTROL: the clean run does not name it" FAIL \
         || say "$label  CONTROL: the clean run does not name it" ok
+    # item 15b: the dictionaries createFields reads are audited on the instance it reads from
+    grep -q 'NOTICE \[unread\] *bogusThermoEntry' "$P/log" \
+        && say "$label  the audit names the planted thermophysicalProperties entry" ok \
+        || say "$label  the audit names the planted thermophysicalProperties entry" FAIL
+    grep -q 'NOTICE \[unread\] *bogusTurbEntry' "$P/log" \
+        && say "$label  the audit names the planted turbulence-dictionary entry" ok \
+        || say "$label  the audit names the planted turbulence-dictionary entry" FAIL
+    grep -q 'bogusThermoEntry\|bogusTurbEntry' "$C/log" \
+        && say "$label  CONTROL: the clean run names neither" FAIL \
+        || say "$label  CONTROL: the clean run names neither" ok
 done
 [ $fail -eq 0 ] && echo "PASS: both mirror arms report what they read and never applied"
 exit $fail

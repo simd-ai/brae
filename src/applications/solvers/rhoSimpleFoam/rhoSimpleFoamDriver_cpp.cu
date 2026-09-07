@@ -3,7 +3,9 @@
 
 #include "brae_notice.cuh"
 #include "brae_time.cuh"
-#include "dict_audit.cuh"   // DictAuditScope: every dictionary entry read off disk and never applied, reported on every exit
+#include "rhoScalarTransportFO.cuh"   // functionObjects::scalarTransport on this arm (item 15c)
+#include "dict_audit.cuh"
+#include <memory>   // DictAuditScope: every dictionary entry read off disk and never applied, reported on every exit
 #include "foam_field_writer.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -66,12 +68,24 @@ StepInput buildStepInput(
     // linearUpwind's deferred correction is a SOURCE term -- running upwind instead left the wall-cell
     // momentum source at 2.4e-02 against OpenFOAM's 2.5e+00.
     {
-        const FieldDivScheme dU  = parseFieldDivScheme(caseDir, "U");
+        // U is a VECTOR: the V forms and LUST are legal on it, and the step assembles all six
+        // (rhoUEqn_cpp.cu / rhoUEqn.cu switch on every DivScheme). This mapping used to know only
+        // linearUpwind / limitedLinear / upwind, so squareBend's `Gauss limitedLinearV 1` ran as plain
+        // limitedLinear -- the direction limiter dropped, in silence (item 16i). The scalars are parsed as
+        // scalars, where the parser refuses the V forms and LUST by name.
+        const FieldDivScheme dU  = parseFieldDivScheme(caseDir, "U", /*vectorField=*/true);
         const FieldDivScheme dHe = parseFieldDivScheme(caseDir, f.heName);
-        in.schemeU  = dU.linearUpwind  ? DivScheme::linearUpwind
-                    : (dU.limited      ? DivScheme::limitedLinear : DivScheme::upwind);
-        in.schemeHe = dHe.linearUpwind ? DivScheme::linearUpwind
-                    : (dHe.limited     ? DivScheme::limitedLinear : DivScheme::upwind);
+        auto toScheme = [](const FieldDivScheme& d)
+        {
+            if (d.limitedLinearV) return DivScheme::limitedLinearV;
+            if (d.lust)           return DivScheme::LUST;
+            if (d.linearUpwindV)  return DivScheme::linearUpwindV;
+            if (d.linearUpwind)   return DivScheme::linearUpwind;
+            if (d.limited)        return DivScheme::limitedLinear;
+            return DivScheme::upwind;
+        };
+        in.schemeU  = toScheme(dU);
+        in.schemeHe = toScheme(dHe);
         // THE KINETIC-ENERGY TERM'S OWN ENTRY. EEqn.H builds fvc::div(phi, Ekp) on an e-thermo and
         // fvc::div(phi, K) on an h-thermo, and OpenFOAM resolves each under its own key, div(phi,Ekp) or
         // div(phi,K). This used to copy the energy entry with the note "follows the energy entry in
@@ -80,8 +94,7 @@ StepInput buildStepInput(
         // Parsed like the others; a scheme the energy equation has not ported refuses there by name.
         const std::string keName = (f.heName == "e") ? "Ekp" : "K";
         const FieldDivScheme dKE = parseFieldDivScheme(caseDir, keName);
-        in.schemeKE = dKE.linearUpwind ? DivScheme::linearUpwind
-                    : (dKE.limited     ? DivScheme::limitedLinear : DivScheme::upwind);
+        in.schemeKE = toScheme(dKE);
         in.boundedU      = dU.bounded;
         in.boundedHe     = dHe.bounded;
         in.boundedKE     = dKE.bounded;
@@ -277,9 +290,19 @@ int runMirror(const std::string& caseDir)
     // through the shared consumption choke point, so it needs no instance here. What this cannot see:
     // thermophysicalProperties and turbulenceProperties are read as private copies inside createFields
     // (rhoCreateFields_cpp.cu), and an audit holds pointers -- queued as 15b.
+    // thermophysicalProperties and the turbulence dictionary are read HERE and handed to createFields
+    // (item 15b): FoamDict records the keys its consumers query, so the audit can only report on the
+    // instance the reads happen on. turbulenceDictPath is createFields' own resolution of OpenFOAM's
+    // two names for that dictionary; "" is a case with neither, which createFields refuses.
+    const FoamDict thermoProps = readDict(caseDir + "/constant/thermophysicalProperties");
+    const std::string turbPath = cpu::rhoSimple::turbulenceDictPath(caseDir);
+    std::unique_ptr<FoamDict> turbProps;
+    if (!turbPath.empty()) turbProps = std::make_unique<FoamDict>(readDict(turbPath));
     DictAuditScope audit;
     audit.add(controlDict, "system/controlDict");
     audit.add(fvSolution,  "system/fvSolution");
+    audit.add(thermoProps, "constant/thermophysicalProperties");
+    if (turbProps) audit.add(*turbProps, turbPath.substr(caseDir.size() + 1));
     audit.addFvSchemes(caseDir);
     const FoamDict* simpleDict = fvSolution.subDict("SIMPLE");
 
@@ -302,12 +325,24 @@ int runMirror(const std::string& caseDir)
 
     // Time owns startFrom/latestTime resolution, the write cadence and the functionObjects, exactly as
     // OF's Time does -- none of it is a solver's business (OF's rhoSimpleFoam.C mentions none of it).
-    Time time(caseDir, controlDict);
+    // The scalarTransport factory is handed in here (OF's runtime selection table); the objects it
+    // builds resolve the fields from `tracerCtx` at their first execute(), after createFields has
+    // filled it -- Time has to come first, because the start directory is its to resolve.
+    brae::tracer::TracerHostContext tracerCtx;
+    std::vector<brae::tracer::RhoTracerHostFO*> tracers;
+    std::vector<std::pair<std::string, FunctionObjectList::Factory>> foTypes;
+    foTypes.emplace_back("scalarTransport", brae::tracer::rhoTracerHostFactory(caseDir, fvSolution, tracerCtx, tracers));
+    Time time(caseDir, controlDict, foTypes);
     const std::string startName = time.startName();
     WriteControl& wc = time.writeControl();
+    tracerCtx.fieldDir = caseDir + "/" + startName;
 
     RhoSimpleFields f = createFields(caseDir + "/" + startName, caseDir, simpleDict, &fvSolution,
-                                     m, g, patches);
+                                     m, g, patches, &thermoProps, turbProps.get());
+    tracerCtx.f = &f;
+    tracerCtx.m = &m;
+    tracerCtx.g = &g;
+    tracerCtx.patches = &patches;
 
     std::printf("brae rhoSimpleFoam (OF-mirror): %ld cells, start %s, %s\n",
                 (long)nC, startName.c_str(),
@@ -394,6 +429,11 @@ int runMirror(const std::string& caseDir)
                       flatBoundary(f.p, patches));
         writeVolField(wsrc + "T", outDir + "/T", f.T.internal, patches, 12,
                       flatBoundary(f.T, patches));
+        // scalarTransport's transportedField(), written beside the solved fields on the same cadence.
+        for (const brae::tracer::RhoTracerHostFO* st : tracers)
+            if (st->ready())
+                writeVolField(wsrc + st->fieldName(), outDir + "/" + st->fieldName(), st->hostField(), patches, 12,
+                              st->boundaryFlat());
         {
             // rho off the T template: 0/T supplies the FoamFile header shape only -- the identity, the
             // dimensions and every boundary entry are declared here, not inherited, or rho comes out as
