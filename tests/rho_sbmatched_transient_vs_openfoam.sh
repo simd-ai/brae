@@ -68,6 +68,11 @@ N=${N:-3}
 K_BOUND=${K_BOUND:-3e-10}; E_BOUND=${E_BOUND:-6e-10}; U_BOUND=${U_BOUND:-2e-10}; P_BOUND=${P_BOUND:-7e-10}; T_BOUND=${T_BOUND:-8e-11}
 # device arm (the same floors as the host now, epsilon apart -- see the header)
 KC_BOUND=${KC_BOUND:-6e-10}; EC_BOUND=${EC_BOUND:-3e-9}; UC_BOUND=${UC_BOUND:-2e-10}; PC_BOUND=${PC_BOUND:-6e-10}; TC_BOUND=${TC_BOUND:-8e-11}
+# The DEFAULT arm's own bounds (the colour Gauss-Seidel momentum solver, brae's default since
+# 2026-09-08): the same equations as the arms above, solved by a momentum solver that stops in a
+# different place inside the same tolerance. Set from measurement, ~4x the values this arm reads, and
+# NOT by loosening the arms above -- those keep the tight bounds on the ofOrder path that can hold them.
+KD_BOUND=${KD_BOUND:-3e-9}; ED_BOUND=${ED_BOUND:-3e-9}; UD_BOUND=${UD_BOUND:-3e-9}; PD_BOUND=${PD_BOUND:-3e-9}; TD_BOUND=${TD_BOUND:-3e-10}
 
 [ -x "$BIN" ]      || { echo "SKIP: $BIN not built"; exit 77; }
 [ -d "$SRC/constant/polyMesh" ] || { echo "SKIP: sbMatched ships no mesh"; exit 77; }
@@ -102,18 +107,30 @@ SBSTAGE
 grep -q "corrected" "$W/of/system/fvSchemes" || { echo "FAIL: sbMatched no longer names a corrected laplacian"; exit 1; }
 grep -q "epsilonWallFunction" "$W/of/0/epsilon" || { echo "FAIL: sbMatched lost its epsilon wall function"; exit 1; }
 ( cd "$W/of" && rhoSimpleFoam > run.log 2>&1 ) || { tail -5 "$W/of/run.log"; echo "FAIL: OpenFOAM did not run"; exit 1; }
+# Arms 1 and cuda take BRAE_U_SOLVER=ofOrder: the case's own PBiCGStab on the momentum, which is what
+# isolates the ASSEMBLY -- with both codes running the same algorithm to 1e-12 what is left is the
+# equations, which is how items 26a, 26b and 27 were found and what the tight bounds measure. The third
+# arm is brae's DEFAULT path (the colour Gauss-Seidel momentum solver) at bounds of its own.
 for arm in 1 cuda; do
     rm -rf "$W/b$arm"; cp -r "$W/of" "$W/b$arm"; rm -rf "$W/b$arm"/[1-9]* "$W/b$arm/run.log"
-    ( cd "$W/b$arm" && BRAE_RHOSIMPLEFOAM_MIRROR=$arm "$BIN" -case "$W/b$arm" > run.log 2>&1 ) || { tail -5 "$W/b$arm/run.log"; echo "FAIL: arm $arm did not run"; exit 1; }
+    ( cd "$W/b$arm" && BRAE_U_SOLVER=ofOrder BRAE_RHOSIMPLEFOAM_MIRROR=$arm "$BIN" -case "$W/b$arm" > run.log 2>&1 ) || { tail -5 "$W/b$arm/run.log"; echo "FAIL: arm $arm did not run"; exit 1; }
     [ -d "$W/b$arm/$N" ] || { echo "FAIL: arm $arm wrote no $N/"; exit 1; }
 done
+rm -rf "$W/bdef"; cp -r "$W/of" "$W/bdef"; rm -rf "$W"/bdef/[1-9]* "$W/bdef/run.log"
+( cd "$W/bdef" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BIN" -case "$W/bdef" > run.log 2>&1 ) \
+    || { tail -5 "$W/bdef/run.log"; echo "FAIL: the default-path arm did not run"; exit 1; }
+[ -d "$W/bdef/$N" ] || { echo "FAIL: the default-path arm wrote no $N/"; exit 1; }
+# ...and each arm must have run the path it names, or both would be the same measurement twice.
+grep -q "momentum: multicolour" "$W/bdef/run.log" || { echo "FAIL: the default arm did not run the colour momentum solver"; exit 1; }
+if grep -q "momentum: multicolour" "$W/bcuda/run.log"; then echo "FAIL: the ofOrder arm ran the colour momentum solver"; exit 1; fi
 # The DILU control arm -- see the header. The same device run with the case's preconditioner forced off.
 rm -rf "$W/bjac"; cp -r "$W/of" "$W/bjac"; rm -rf "$W"/bjac/[1-9]* "$W/bjac/run.log"
 ( cd "$W/bjac" && BRAE_DILU=0 BRAE_DILU_KE=0 BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BIN" -case "$W/bjac" > run.log 2>&1 ) \
     || { tail -5 "$W/bjac/run.log"; echo "FAIL: the Jacobi control arm did not run"; exit 1; }
 [ -d "$W/bjac/$N" ] || { echo "FAIL: the Jacobi control arm wrote no $N/"; exit 1; }
 W="$W" N="$N" K_BOUND="$K_BOUND" E_BOUND="$E_BOUND" U_BOUND="$U_BOUND" P_BOUND="$P_BOUND" T_BOUND="$T_BOUND" \
-KC_BOUND="$KC_BOUND" EC_BOUND="$EC_BOUND" UC_BOUND="$UC_BOUND" PC_BOUND="$PC_BOUND" TC_BOUND="$TC_BOUND" python3 - <<'SBCMP' || fail=1
+KC_BOUND="$KC_BOUND" EC_BOUND="$EC_BOUND" UC_BOUND="$UC_BOUND" PC_BOUND="$PC_BOUND" TC_BOUND="$TC_BOUND" \
+KD_BOUND="$KD_BOUND" ED_BOUND="$ED_BOUND" UD_BOUND="$UD_BOUND" PD_BOUND="$PD_BOUND" TD_BOUND="$TD_BOUND" python3 - <<'SBCMP' || fail=1
 import os, re, sys
 import numpy as np
 W, N = os.environ['W'], int(os.environ['N'])
@@ -127,9 +144,10 @@ def read(p):
     u = re.search(r'internalField\s+uniform\s+\(?([^);]+)\)?;', s)
     return np.array([float(x) for x in u.group(1).split()])
 bounds = {'1':    {'k': float(os.environ['K_BOUND']),  'epsilon': float(os.environ['E_BOUND']),  'U': float(os.environ['U_BOUND']),  'p': float(os.environ['P_BOUND']),  'T': float(os.environ['T_BOUND'])},
-          'cuda': {'k': float(os.environ['KC_BOUND']), 'epsilon': float(os.environ['EC_BOUND']), 'U': float(os.environ['UC_BOUND']), 'p': float(os.environ['PC_BOUND']), 'T': float(os.environ['TC_BOUND'])}}
+          'cuda': {'k': float(os.environ['KC_BOUND']), 'epsilon': float(os.environ['EC_BOUND']), 'U': float(os.environ['UC_BOUND']), 'p': float(os.environ['PC_BOUND']), 'T': float(os.environ['TC_BOUND'])},
+          'def':  {'k': float(os.environ['KD_BOUND']), 'epsilon': float(os.environ['ED_BOUND']), 'U': float(os.environ['UD_BOUND']), 'p': float(os.environ['PD_BOUND']), 'T': float(os.environ['TD_BOUND'])}}
 ok = True
-for arm in ('1', 'cuda'):
+for arm in ('1', 'cuda', 'def'):
     for f, b in bounds[arm].items():
         worst = 0.0
         for t in range(1, N + 1):
