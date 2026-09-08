@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <stdexcept>
 #include <unistd.h>
 
 using namespace brae;
@@ -456,6 +457,139 @@ int main()
               has(out, "solvers/U preconditioner") && has(out, "brae preconditions with DILU"), out);
     }
 
+    // ---- DEFAULTS AND nSweeps (item 79 review) ----
+    //
+    // lduMatrix::solver::readControls (lduMatrixSolver.C:199) defaults tolerance to
+    // lduMatrix::defaultTolerance = 1e-6 (lduMatrix.C:45) for EVERY field; this reader defaulted U to
+    // 1e-8. And smoothSolver.C:78 reads nSweeps with no clamp: a negative value is the fixed-count branch
+    // (:95-119), 0 never terminates (:202-209); this reader used to clamp both to 1 in silence.
+    {
+        const std::string dir = writeFvSolution(tmp + "/defaults",
+            "    U { solver PBiCGStab; preconditioner DILU; }\n"
+            "    \"(h|e)\" { solver PBiCGStab; preconditioner DILU; tolerance 1e-10; relTol 0.1; }\n");
+        const FoamDict fv = readDict(dir + "/system/fvSolution");
+        DeviceSimpleControls ctl;
+        ctl.turbulent = false;
+        captureStderr(tmp + "/defaults.err", [&] { readLinearSolverControls(fv, "epsilon", ctl); });
+        check("a U entry without tolerance takes OpenFOAM's 1e-6, not 1e-8", ctl.tolU == 1e-6,
+              std::to_string(ctl.tolU));
+        check("a U entry without nSweeps takes OpenFOAM's 1", ctl.nSweepsU == 1, std::to_string(ctl.nSweepsU));
+    }
+    {
+        const std::string dir = writeFvSolution(tmp + "/fixedsweeps",
+            "    U { solver smoothSolver; smoother GaussSeidel; nSweeps -2; tolerance 1e-6; relTol 0.1; }\n"
+            "    \"(h|e)\" { solver PBiCGStab; preconditioner DILU; tolerance 1e-10; relTol 0.1; }\n");
+        const FoamDict fv = readDict(dir + "/system/fvSolution");
+        bool refused = false;
+        std::string why;
+        captureStderr(tmp + "/fixedsweeps.err", [&]
+        {
+            try
+            {
+                DeviceSimpleControls ctl;
+                ctl.turbulent = false;
+                readLinearSolverControls(fv, "epsilon", ctl);
+            }
+            catch (const std::runtime_error& e)
+            {
+                refused = true;
+                why = e.what();
+            }
+        });
+        check("nSweeps -2 is REFUSED by name on a path that does not run the fixed-count branch",
+              refused && has(why, "solvers/U nSweeps -2") && has(why, "smoothSolver.C:95-119"), why);
+        DeviceSimpleControls ctl;
+        ctl.turbulent = false;
+        SolverRunsAs runsAs;
+        runsAs.fixedSweepsField = "U";
+        captureStderr(tmp + "/fixedsweeps2.err", [&] { readLinearSolverControls(fv, "epsilon", ctl, "SIMPLE", "e", runsAs); });
+        check("...and handed through raw to the path that does run it", ctl.nSweepsU == -2, std::to_string(ctl.nSweepsU));
+        // ...but not on a field the flag does not name: k's own negative nSweeps is still refused.
+        {
+            const std::string dir2 = writeFvSolution(tmp + "/fixedsweeps_k",
+                "    U { solver smoothSolver; smoother GaussSeidel; nSweeps -2; tolerance 1e-6; relTol 0.1; }\n"
+                "    k { solver smoothSolver; smoother GaussSeidel; nSweeps -2; tolerance 1e-6; relTol 0.1; }\n"
+                "    epsilon { solver smoothSolver; smoother GaussSeidel; tolerance 1e-6; relTol 0.1; }\n"
+                "    \"(h|e)\" { solver PBiCGStab; preconditioner DILU; tolerance 1e-10; relTol 0.1; }\n");
+            const FoamDict fv2 = readDict(dir2 + "/system/fvSolution");
+            bool refusedK = false;
+            std::string whyK;
+            captureStderr(tmp + "/fixedsweeps_k.err", [&]
+            {
+                try
+                {
+                    DeviceSimpleControls c2;
+                    c2.turbulent = true;
+                    readLinearSolverControls(fv2, "epsilon", c2, "SIMPLE", "e", runsAs);
+                }
+                catch (const std::runtime_error& e)
+                {
+                    refusedK = true;
+                    whyK = e.what();
+                }
+            });
+            check("fixedSweepsField = U does not admit a negative nSweeps on k", refusedK && has(whyK, "solvers/k nSweeps -2"), whyK);
+        }
+    }
+    {
+        // nSweeps 0 never terminates OpenFOAM's loop: refused on EVERY path, the fixed-count one included.
+        const std::string dir = writeFvSolution(tmp + "/zerosweeps",
+            "    U { solver smoothSolver; smoother GaussSeidel; nSweeps 0; tolerance 1e-6; relTol 0.1; }\n"
+            "    \"(h|e)\" { solver PBiCGStab; preconditioner DILU; tolerance 1e-10; relTol 0.1; }\n");
+        const FoamDict fv = readDict(dir + "/system/fvSolution");
+        bool refused = false;
+        std::string why;
+        captureStderr(tmp + "/zerosweeps.err", [&]
+        {
+            try
+            {
+                DeviceSimpleControls ctl;
+                ctl.turbulent = false;
+                SolverRunsAs runsAs;
+                runsAs.fixedSweepsField = "U";
+                readLinearSolverControls(fv, "epsilon", ctl, "SIMPLE", "e", runsAs);
+            }
+            catch (const std::runtime_error& e)
+            {
+                refused = true;
+                why = e.what();
+            }
+        });
+        check("nSweeps 0 is refused even on the fixed-count path (it never terminates)", refused && has(why, "solvers/U nSweeps 0") && has(why, "202-209"), why);
+    }
+    {
+        // A Krylov entry with a stray nSweeps: OpenFOAM never reads the key there (smoothSolver.C:78 is
+        // its only reader), so the case runs and the reader must answer the default, not refuse.
+        const std::string dir = writeFvSolution(tmp + "/deadkey",
+            "    U { solver PBiCGStab; preconditioner DILU; nSweeps 0; tolerance 1e-10; relTol 0.1; }\n"
+            "    k { solver PBiCGStab; preconditioner DILU; tolerance 1e-10; relTol 0.1; }\n"
+            "    epsilon { solver PBiCGStab; preconditioner DILU; tolerance 1e-10; relTol 0.1; }\n"
+            "    nuTilda { solver PBiCGStab; preconditioner DILU; relTol 0.1; }\n"
+            "    \"(h|e)\" { solver PBiCGStab; preconditioner DILU; tolerance 1e-10; relTol 0.1; }\n");
+        const FoamDict fv = readDict(dir + "/system/fvSolution");
+        bool refused = false;
+        DeviceSimpleControls ctl;
+        ctl.turbulent = true;
+        captureStderr(tmp + "/deadkey.err", [&]
+        {
+            try { readLinearSolverControls(fv, "epsilon", ctl); }
+            catch (const std::runtime_error&) { refused = true; }
+        });
+        check("nSweeps 0 on a PBiCGStab entry is a dead key: not refused, default 1", !refused && ctl.nSweepsU == 1, std::to_string(ctl.nSweepsU));
+        // ...and the turbulence pair without `tolerance` takes OpenFOAM's 1e-6 like U does.
+        const std::string dir2 = writeFvSolution(tmp + "/turbdefaults",
+            "    U { solver PBiCGStab; preconditioner DILU; tolerance 1e-10; relTol 0.1; }\n"
+            "    k { solver PBiCGStab; preconditioner DILU; relTol 0.1; }\n"
+            "    epsilon { solver PBiCGStab; preconditioner DILU; relTol 0.1; }\n"
+            "    \"(h|e)\" { solver PBiCGStab; preconditioner DILU; tolerance 1e-10; relTol 0.1; }\n");
+        const FoamDict fv2 = readDict(dir2 + "/system/fvSolution");
+        DeviceSimpleControls c2;
+        c2.turbulent = true;
+        captureStderr(tmp + "/turbdefaults.err", [&] { readLinearSolverControls(fv2, "epsilon", c2); });
+        check("k / epsilon entries without tolerance take OpenFOAM's 1e-6, not 1e-8", c2.tolKE == 1e-6, std::to_string(c2.tolKE));
+    }
+
     std::printf("solver_notices: %d failures\n", failures);
+
     return failures ? 1 : 0;
 }

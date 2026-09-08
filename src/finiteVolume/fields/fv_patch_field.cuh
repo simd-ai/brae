@@ -19,6 +19,28 @@
 
 namespace brae {
 
+// OpenFOAM's wallFunctionCoefficients (wallFunctionCoefficients.C:60-79): Cmu, kappa, E and the yPlusLam
+// they imply, read by EVERY wall-function patch field from ITS OWN dictionary entry -- nut's entry for
+// the nut wall function, epsilon's entry for epsilonWallFunction, omega's for omegaWallFunction. A
+// model-wide value is not what OpenFOAM runs: turbineSiting writes `kappa 0.4` on its terrain patches
+// and 0.41 everywhere else. Item 16h-port. Defaults are OpenFOAM's when the entry writes none.
+struct WallFunctionCoeffs
+{
+    scalar Cmu   = 0.09;
+    scalar kappa = 0.41;
+    scalar E     = 9.8;
+    // wallFunctionCoefficients.C:40-52: ten fixed-point iterations of ypl = log(max(E ypl, 1))/kappa from 11.
+    scalar yPlusLam() const
+    {
+        scalar ypl = 11.0;
+        for (int i = 0; i < 10; ++i)
+        {
+            ypl = std::log(std::max(E * ypl, scalar(1))) / kappa;
+        }
+        return ypl;
+    }
+};
+
 template <typename T>
 class fvPatchField
 {
@@ -181,6 +203,10 @@ public:
     // from Spalding's law, and for SpalartAllmaras (nuTilda fixedValue 0 at a wall) the assignment would
     // otherwise leave the wall with NO eddy viscosity at all.
     virtual bool isNutUSpalding() const { return false; }
+    // The wall-function coefficients THIS patch carries (see WallFunctionCoeffs): set from the patch's
+    // own dictionary by makePatchField, read by the model's wall treatment for the field it belongs to.
+    const WallFunctionCoeffs& wallCoeffs() const { return wallCoeffs_; }
+    void setWallCoeffs(const WallFunctionCoeffs& c) { wallCoeffs_ = c; }
     // The patch's REFERENCE value -- inletValue / outletValue / freestreamValue / refValue -- as opposed
     // to its current value(). For most BCs the two are the same object and this returns value(); the
     // read-and-hold family below overrides it. The device boundary builder needs the reference, because
@@ -253,6 +279,7 @@ public:
 protected:
     const FvPatch& patch_;
     std::vector<T> value_;
+    WallFunctionCoeffs wallCoeffs_;
 };
 
 // fixedValue: value is prescribed (uniform or per-face).
@@ -1774,7 +1801,24 @@ inline InletOrValue<T> inletOrValue(const PatchFieldData<T>& d)
 }
 
 template <typename T>
+std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const PatchFieldData<T>& d);
+
+// Every patch field leaves here carrying the wall-function coefficients its own entry wrote (or
+// OpenFOAM's defaults), whatever its type: only the wall treatments read them, and they read them from
+// the field they belong to.
+template <typename T>
 std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFieldData<T>& d)
+{
+    std::unique_ptr<fvPatchField<T>> f = makePatchFieldImpl<T>(p, d);
+    if (f)
+    {
+        f->setWallCoeffs(WallFunctionCoeffs{d.wfCmu, d.wfKappa, d.wfE});
+    }
+    return f;
+}
+
+template <typename T>
+std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const PatchFieldData<T>& d)
 {
     // THE ENERGY BOUNDARY FAMILY -- fixedEnergy, gradientEnergy, mixedEnergy -- handled by the three
     // branches they derive from. This is NOT a substitution. OpenFOAM's energy patch fields ARE their

@@ -337,6 +337,9 @@ int runMirror(const std::string& caseDir)
     WriteControl& wc = time.writeControl();
     tracerCtx.fieldDir = caseDir + "/" + startName;
 
+    // This driver's wall treatments read Cmu/kappa/E per patch (item 16h-port): the reader must not
+    // announce those entries as unhonoured.
+    brae::perPatchWallCoeffsHonoured() = true;
     RhoSimpleFields f = createFields(caseDir + "/" + startName, caseDir, simpleDict, &fvSolution,
                                      m, g, patches, &thermoProps, turbProps.get());
     tracerCtx.f = &f;

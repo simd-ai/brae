@@ -261,13 +261,15 @@ void correct(
         {
             const std::vector<scalar>& seed = nutField.boundary[pi]->value();
             const std::vector<vector>& uw = U.boundary[pi]->value();
+            // nutUSpaldingWallFunction's OWN kappa and E (.C:132-133), from the nut patch's entry.
+            const WallFunctionCoeffs& nc = nutField.boundary[pi]->wallCoeffs();
             for (label i = 0; i < patches[pi].size; ++i)
             {
                 const label c = patches[pi].faceCells[i];
                 const scalar magUp = mag(U.internal[c] - uw[i]);
                 const scalar magGradU = magUp * patches[pi].deltaCoeffs[i];
                 const scalar yw = (patches[pi].deltaCoeffs[i] > 0.0) ? 1.0 / patches[pi].deltaCoeffs[i] : 0.0;
-                vals[i] = spaldingNutValue(magUp, magGradU, yw, nu, co.nutKappa, co.E,
+                vals[i] = spaldingNutValue(magUp, magGradU, yw, nu, nc.kappa, nc.E,
                                            i < static_cast<label>(seed.size()) ? seed[i] : 0.0);
             }
         }

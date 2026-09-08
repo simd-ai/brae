@@ -107,6 +107,10 @@ struct DeviceWallData
     // switches, G[c] = (1-w)*G[c] + w*G0[c] and the same for epsilon (epsilonWallFunction.C:592).
     DeviceBuffer<scalar> wallW;
     DeviceBuffer<scalar> wfY, wfDc, wfUwx, wfUwy, wfUwz, invNw;
+    // epsilonWallFunction's OWN Cmu^0.25, Cmu^0.75, kappa, E and yPlusLam per WALL face (from the
+    // epsilon patch's entry, WallFunctionCoeffs; item 16h-port). Empty -> the kernels use the
+    // model-wide KEpsilonCoeffs values, which is what the legacy drivers still hand them.
+    DeviceBuffer<scalar> wfCmu25, wfCmu75, wfKappa, wfE, wfYplLam;
 };
 // The predicate the wall set is built on, in one place so the DeviceWallData faces and the wall-face ->
 // boundary-face map below cannot drift apart.

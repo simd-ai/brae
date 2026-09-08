@@ -591,11 +591,15 @@ inline FieldData<T> readField(const std::string& path)
                         // A wall function's own coefficients (see PatchFieldData). Stored on every
                         // non-ABL entry that carries them; whether the entry IS a wall function is
                         // decided at the end of the patch, once its type is known, because the keys
-                        // may precede `type` in the file.
+                        // may precede `type` in the file. `Cmu` is ALSO the turbulent mixing-length
+                        // inlet's own entry (PatchFieldData::Cmu, the branch further down that this
+                        // one shadows): it is recorded in both slots and the consumer picks -- the
+                        // first version kept it here only, and `Cmu 0` on a dissipation inlet went
+                        // unrefused (rho_turbinlet_cmu_vs_openfoam caught it).
                         const scalar v = ts.nextScalar();
                         ts.expect(";");
                         if      (key == "kappa") { p.wfKappa = v; p.hasWfKappa = true; }
-                        else if (key == "Cmu")   { p.wfCmu   = v; p.hasWfCmu   = true; }
+                        else if (key == "Cmu")   { p.wfCmu   = v; p.hasWfCmu   = true; p.Cmu = v; }
                         else                     { p.wfE     = v; p.hasWfE     = true; }
                     }
                     // `ramp` multiplies the normal-velocity BCs' value by a Function1 of time every
@@ -1015,10 +1019,11 @@ inline FieldData<T> readField(const std::string& path)
                             "' requires constant/boundaryData/" + p.name + " (points + a time dir); read failed: " + e.what());
                     }
                 }
-                // A per-patch wall-function coefficient brae will NOT apply per patch: said so, with
-                // the value the case wrote and the one brae runs (item 16h). Silence here is what let
-                // turbineSiting's `kappa 0.4` on its terrain epsilonWallFunction run at 0.41.
-                if (p.type.find("WallFunction") != std::string::npos)
+                // A per-patch wall-function coefficient the LEGACY drivers will NOT apply per patch:
+                // said so, with the value the case wrote and the one they run (item 16h). Silence here
+                // is what let turbineSiting's `kappa 0.4` on its terrain epsilonWallFunction run at
+                // 0.41. The rhoSimpleFoam mirror honours them (16h-port) and says so before reading.
+                if (p.type.find("WallFunction") != std::string::npos && !brae::perPatchWallCoeffsHonoured())
                 {
                     auto announce = [&](const char* key, bool has, scalar v, scalar def)
                     {

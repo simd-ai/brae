@@ -116,6 +116,8 @@ void correctTurbulence(
     kin.nutBndFace = &buf.nutBndIn;
     kin.nutWallFace = (nWF > 0) ? &buf.nutWallIn : nullptr;
     kin.wfBndMask = &dev.wfBndMask;      kin.wallYBndFace = &dev.wallYBndFace;
+    kin.nutWfCmu25Bnd = &dev.nutWfCmu25Bnd;   kin.nutWfKappaBnd  = &dev.nutWfKappaBnd;
+    kin.nutWfEBnd     = &dev.nutWfEBnd;       kin.nutWfYplLamBnd = &dev.nutWfYplLamBnd;
     kin.Ux = &f.Ux; kin.Uy = &f.Uy; kin.Uz = &f.Uz;
     // Passing null here is NOT "no turbulent inlet" -- it is silently no turbulent inlet at all, on a
     // case whose 0/k asks for one.

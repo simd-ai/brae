@@ -81,6 +81,16 @@ struct SolverRunsAs
     // ...and does it run DILU whatever the dict says? The OF-mirror's HOST arm does -- pbicgstab.cuh is
     // DILU throughout -- so a case asking `none` or `diagonal` there gets DILU and has a right to be told.
     bool alwaysDilu = false;
+    // ...and does the CALLER announce the momentum solve itself? The OF-mirror's colour Gauss-Seidel
+    // experiment runs a solver this reader has no name for -- a multicolour Gauss-Seidel smoothSolver,
+    // which is neither OpenFOAM's own sweep (what gsU = true asserts, and what silences the U notice)
+    // nor the PBiCGStab the gsU = false notice would announce. With this set the reader still reads U's
+    // tolerance, relTol, maxIter, minIter and nSweeps exactly as before and prints NO U notice; the
+    // driver prints the one that is true. Default false: every other caller keeps the reader's lines.
+    bool momentumNoticedByCaller = false;
+    // The ONE field whose solver path runs OpenFOAM's fixed-count nSweeps branch (a negative nSweeps,
+    // smoothSolver.C:95-119); the reader hands that field its raw value and refuses it on every other.
+    std::string fixedSweepsField;
 };
 
 inline void readLinearSolverControls(
@@ -235,18 +245,41 @@ inline void readLinearSolverControls(
         return !(s && s->wordOr("smoother", "") == "GaussSeidel");
     };
 
-    // fvSolution solvers/<field>/nSweeps (smoothSolver.C:78, default 1). Read for every field that can
-    // take the smoothSolver path: OpenFOAM smooths nSweeps times BETWEEN residual evaluations and counts
-    // sweeps, not evaluations (:205), so a case asking 2 and answered with 1 stops somewhere else.
+    // fvSolution solvers/<field>/nSweeps (smoothSolver.C:78, default 1, NO clamp). Read for every field
+    // that can take the smoothSolver path: OpenFOAM smooths nSweeps times BETWEEN residual evaluations
+    // and counts sweeps, not evaluations (:205), so a case asking 2 and answered with 1 stops somewhere
+    // else. A NEGATIVE nSweeps is OpenFOAM's fixed-count branch (:95-119: exactly -nSweeps sweeps, no
+    // residual evaluated, nIterations = -nSweeps) and nSweeps 0 never advances its do-while (:202-209).
+    // The first version clamped both to the default and said nothing; now the raw value goes to the one
+    // path that runs the fixed-count branch (SolverRunsAs::fixedSweepsField) and every other path refuses
+    // it by name rather than running a different solve under the case's own words.
     auto solverNSweeps = [&](const std::string& f, int dflt)
     {
         const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
         if (!s || !s->found("nSweeps")) return dflt;
+        // Only smoothSolver reads the key (smoothSolver.C:78 is its one reader in the tree); on a
+        // PBiCGStab or GAMG entry the key is dead and OpenFOAM runs as if it were absent, so the
+        // default is what runs there -- refusing it would abort a case OpenFOAM accepts.
+        if (s->wordOr("solver", "") != "smoothSolver") return dflt;
         const int n = static_cast<int>(s->scalarOr("nSweeps", (scalar)dflt));
-        return (n > 0) ? n : dflt;
+        if (n == 0)
+        {
+            throw std::runtime_error("solvers/" + f + " nSweeps 0: OpenFOAM's smoothSolver never advances "
+                                     "nIterations with it and its do-while never terminates "
+                                     "(smoothSolver.C:202-209); no solver path runs that. Write a positive nSweeps.");
+        }
+        if (n > 0 || runsAs.fixedSweepsField == f) return n;
+        throw std::runtime_error("solvers/" + f + " nSweeps " + std::to_string(n) + ": a negative nSweeps is "
+                                 "OpenFOAM's fixed-count branch (smoothSolver.C:95-119: exactly -nSweeps sweeps, "
+                                 "no residual evaluated), which the solver path this driver runs on " + f +
+                                 " does not have. Write a positive nSweeps for this field.");
     };
-    ctl.tolP = solverTol("p", 1e-6);
-    ctl.tolU = solverTol("U", 1e-8);
+    // lduMatrix::solver::readControls (lduMatrixSolver.C:199): tolerance_ = lduMatrix::defaultTolerance,
+    // 1e-6 (lduMatrix.C:45), for EVERY field. U and the turbulence pair defaulted to 1e-8 here, 100x
+    // tighter than OpenFOAM on an entry that omits `tolerance` (item 79 review, both rounds).
+    constexpr scalar kOpenFoamDefaultTolerance = 1e-6;
+    ctl.tolP = solverTol("p", kOpenFoamDefaultTolerance);
+    ctl.tolU = solverTol("U", kOpenFoamDefaultTolerance);
     ctl.relTolP = solverRelTol("p");
     ctl.relTolU = solverRelTol("U");
     // The `Final` variants, defaulting to the base entry when the case does not define one (see the
@@ -262,7 +295,7 @@ inline void readLinearSolverControls(
     // pcorr (CorrectPhi). The tutorials spell the key as the regex "pcorr.*"; FoamDict already does OF's
     // regex-keyword lookup, so this finds it either way. Defaults are OF's lduMatrix ones, not p's --
     // a case that asks for correctPhi without a pcorr entry gets a converged projection, not p's relTol.
-    ctl.tolPcorr = solverTol("pcorr", 1e-6);
+    ctl.tolPcorr = solverTol("pcorr", kOpenFoamDefaultTolerance);
     ctl.relTolPcorr = solverRelTol("pcorr");
     ctl.maxIterPcorr = solverMaxIter("pcorr", 1000);
     ctl.minIterU = solverMinIter("U", 0);
@@ -272,7 +305,7 @@ inline void readLinearSolverControls(
     ctl.minIterUFinal = solverMinIter("UFinal", ctl.minIterU);
     if (!heName.empty())
     {
-        ctl.tolHe     = solverTol(heName, 1e-6);
+        ctl.tolHe     = solverTol(heName, kOpenFoamDefaultTolerance);
         ctl.relTolHe  = solverRelTol(heName);
         ctl.maxIterHe = solverMaxIter(heName, 1000);
         ctl.minIterHe = solverMinIter(heName, 0);
@@ -304,7 +337,10 @@ inline void readLinearSolverControls(
     }
     // p is never the case's choice: this driver runs what SolverRunsAs says whatever the dict asks.
     noticeSolverChoice("p", runsAs.pSolver, runsAs.pPrecon, false);   // p never takes the smoothSolver path
-    noticeSolverChoice("U", "PBiCGStab", krylovPrecon("U"), ctl.gsU);
+    // ...unless the caller owns the momentum notice (SolverRunsAs::momentumNoticedByCaller): every line
+    // this call could print describes PBiCGStab or OpenFOAM's sweep, and that caller runs neither.
+    if (!runsAs.momentumNoticedByCaller)
+        noticeSolverChoice("U", "PBiCGStab", krylovPrecon("U"), ctl.gsU);
 
     if (ctl.turbulent)
     {
@@ -313,7 +349,7 @@ inline void readLinearSolverControls(
         // only one of them (kFinal but no epsilonFinal) from tightening the pair on the strength of it.
         if (ctl.sa)
         {
-            ctl.tolKE = solverTol("nuTilda", 1e-8);
+            ctl.tolKE = solverTol("nuTilda", kOpenFoamDefaultTolerance);
             ctl.relTolKE = solverRelTol("nuTilda");
             ctl.maxIterKE = solverMaxIter("nuTilda", 1000);
             ctl.minIterKE = solverMinIter("nuTilda", 0);
@@ -325,7 +361,7 @@ inline void readLinearSolverControls(
         }
         else
         {
-            ctl.tolKE = std::fmin(solverTol("k", 1e-8), solverTol(secondName, 1e-8));
+            ctl.tolKE = std::fmin(solverTol("k", kOpenFoamDefaultTolerance), solverTol(secondName, kOpenFoamDefaultTolerance));
             ctl.relTolKE = std::fmin(solverRelTol("k"), solverRelTol(secondName));
             // One cap for the pair, as one tolerance: the tighter maxIter and the larger minIter. A cap
             // decides where a solve STOPS, so two entries that disagree are announced rather than one
@@ -337,8 +373,8 @@ inline void readLinearSolverControls(
                 noticeApproximated("solvers/k and solvers/" + secondName + " maxIter/minIter",
                                    "the pair is solved under ONE cap: the tighter maxIter and the larger"
                                    " minIter of the two entries");
-            ctl.tolKEFinal = std::fmin(solverTol("kFinal", solverTol("k", 1e-8)),
-                                       solverTol(secondName + "Final", solverTol(secondName, 1e-8)));
+            ctl.tolKEFinal = std::fmin(solverTol("kFinal", solverTol("k", kOpenFoamDefaultTolerance)),
+                                       solverTol(secondName + "Final", solverTol(secondName, kOpenFoamDefaultTolerance)));
             ctl.relTolKEFinal = std::fmin(
                 solvers && solvers->subDict("kFinal") ? solverRelTol("kFinal") : solverRelTol("k"),
                 solvers && solvers->subDict(secondName + "Final") ? solverRelTol(secondName + "Final") : solverRelTol(secondName));

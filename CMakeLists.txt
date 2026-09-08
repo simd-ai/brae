@@ -154,6 +154,7 @@ add_library(brae_core STATIC
     src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_smoothers.cu
     src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_gauss_seidel.cu
     src/matrices/lduMatrix/smoothers/symGaussSeidel/device_sym_gauss_seidel.cu
+    src/matrices/lduMatrix/smoothers/GaussSeidel/device_colour_gauss_seidel.cu
     src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_vcycle.cu
     src/matrices/lduMatrix/solvers/PCG/device_amg_pcg.cu
     src/cuda/device_cluster.cu
@@ -1233,6 +1234,18 @@ set_tests_properties(mirror_scalar_transport_vs_openfoam PROPERTIES SKIP_RETURN_
 add_test(NAME transonic_p_dilu
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/transonic_p_dilu.sh)
 set_tests_properties(transonic_p_dilu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+add_test(NAME p_limit_boundary_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/p_limit_boundary_vs_openfoam.sh)
+set_tests_properties(p_limit_boundary_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+add_test(NAME wall_coeffs_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/wall_coeffs_vs_openfoam.sh)
+set_tests_properties(wall_coeffs_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+add_test(NAME u_colour_gs_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/u_colour_gs_vs_openfoam.sh)
+set_tests_properties(u_colour_gs_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
 add_test(NAME uresidual_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/uresidual_vs_openfoam.sh
@@ -3371,3 +3384,7 @@ foreach(exe IN ITEMS brae brae-agent brae_pimpleFoam)
         install(TARGETS ${exe} RUNTIME DESTINATION bin)
     endif()
 endforeach()
+add_executable(test_colour_gs_fused tests/test_colour_gs_fused.cu)
+target_include_directories(test_colour_gs_fused PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_colour_gs_fused PRIVATE brae_core)
+add_test(NAME colour_gs_fused COMMAND test_colour_gs_fused)

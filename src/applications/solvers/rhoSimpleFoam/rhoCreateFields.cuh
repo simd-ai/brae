@@ -66,6 +66,9 @@ struct RhoDeviceFields
     DeviceWallData       wall;
     DeviceBuffer<label>  wfBndMask;      // per BOUNDARY FACE: carries a turbulence wall function
     DeviceBuffer<scalar> wallYBndFace;   // nearWallDist y, per boundary face (0 off a wall-function patch)
+    // nutkWallFunction's own Cmu^0.25 / kappa / E / yPlusLam per boundary face (the nut patch's entry,
+    // WallFunctionCoeffs); the epsilon patch's ride in wall.wf* (item 16h-port).
+    DeviceBuffer<scalar> nutWfCmu25Bnd, nutWfKappaBnd, nutWfEBnd, nutWfYplLamBnd;
     std::vector<label>   wfFaceOfBnd;    // wall-face order -> boundary-face index, for deviceGatherWallNu
 
     // The TURBULENT INLETS, per boundary face. OpenFOAM recomputes these every updateCoeffs:

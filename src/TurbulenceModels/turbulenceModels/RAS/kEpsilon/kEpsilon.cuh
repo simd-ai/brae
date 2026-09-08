@@ -100,6 +100,12 @@ struct KEpsilonInput
     // which is the one the epsilon constraint needs; this is the other one.
     const DeviceBuffer<label>*  wfBndMask    = nullptr;
     const DeviceBuffer<scalar>* wallYBndFace = nullptr;   // nearWallDist y, per boundary face
+    // nutkWallFunction's OWN Cmu^0.25, kappa, E and yPlusLam per boundary face, from the NUT patch's
+    // entry (WallFunctionCoeffs; item 16h-port). Null -> the model-wide KEpsilonCoeffs values.
+    const DeviceBuffer<scalar>* nutWfCmu25Bnd  = nullptr;
+    const DeviceBuffer<scalar>* nutWfKappaBnd  = nullptr;
+    const DeviceBuffer<scalar>* nutWfEBnd      = nullptr;
+    const DeviceBuffer<scalar>* nutWfYplLamBnd = nullptr;
 
     // --- velocity, for the production term and the wall functions ---
     const DeviceBuffer<scalar>* Ux = nullptr;

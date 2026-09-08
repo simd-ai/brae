@@ -21,14 +21,22 @@
 namespace brae {
 
 // ---- multicolor greedy coloring (graph-fixed per mesh; feeds the multicolor Gauss-Seidel smoother) ----
-// Coloring struct lives here so the (to-be-split) coloring builder + GS smoother share one definition. greedyColor
-// and gsSweep keep their definitions in device_amg.cu for now (only called within it); their declarations move here
-// when gsColoringFor/the GS solver split into amg_smoothers.cu.
+// Coloring struct lives here so the coloring builder and every GS smoother share one definition. greedyColor keeps
+// its definition in device_amg.cu (external linkage) and is declared ONCE here for its three callers: device_amg.cu,
+// device_amg_gauss_seidel.cu and the colour-ordered smoother in device_colour_gauss_seidel.cu. The local prototype
+// device_amg_gauss_seidel.cu still carries is a duplicate of this one, which is legal.
 struct Coloring
 {
     int nColors = 0;
     std::vector<label> cells, start;
 };
+
+// Each cell takes the smallest colour unused by any of its face-neighbours (owner/nei are the internal faces, both
+// indexing [0, nC) unchecked); the cells come back grouped by colour as a CSR, start[k] .. start[k+1] being colour k.
+Coloring greedyColor(
+    const std::vector<label>& owner,
+    const std::vector<label>& nei,
+    int nC);
 
 // ---- V-cycle smoother interface (definitions in device_amg_smoothers.cu). The V-cycle (vcycleAt) and the PCG
 //      drivers (ensureSpectrum) call these across TUs; the standalone symGaussSeidel solver also reuses gsSweep. ----

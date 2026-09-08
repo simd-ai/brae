@@ -288,10 +288,14 @@ __global__ void nutBoundaryKernel(
     const scalar* epsBnd,
     const scalar* nuFace,
     scalar        Cmu,
-    scalar        Cmu25,
-    scalar        kappa,
-    scalar        E,
-    scalar        yplLam,
+    scalar        Cmu25D,
+    scalar        kappaD,
+    scalar        ED,
+    scalar        yplLamD,
+    const scalar* wfCmu25,    // the NUT patch's own coefficients per boundary face; null -> the scalars
+    const scalar* wfKappa,
+    const scalar* wfE,
+    const scalar* wfYplLam,
     scalar*       nutBnd)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -300,6 +304,10 @@ __global__ void nutBoundaryKernel(
     {
         // The wall function reads the NEAR-WALL CELL's k, and nu AT THE FACE.
         const scalar kc = kCell[bndCell[i]];
+        const scalar Cmu25  = wfCmu25  ? wfCmu25[i]  : Cmu25D;
+        const scalar kappa  = wfKappa  ? wfKappa[i]  : kappaD;
+        const scalar E      = wfE      ? wfE[i]      : ED;
+        const scalar yplLam = wfYplLam ? wfYplLam[i] : yplLamD;
         const scalar yp = yPlusWall(Cmu25, y[i], kc, nuFace[i]);
         nutBnd[i] = nutkWallFunctionValue(yp, nuFace[i], yplLam, kappa, E);
         return;
@@ -723,6 +731,10 @@ void correctNut(
                                              in.wallYBndFace ? in.wallYBndFace->data() : nullptr,
                                              k.data(), kB.data(), eB.data(), in.nuBndFace->data(),
                                              in.co.Cmu, Cmu25, in.co.kappa, in.co.E, yplLam,
+                                             in.nutWfCmu25Bnd  ? in.nutWfCmu25Bnd->data()  : nullptr,
+                                             in.nutWfKappaBnd  ? in.nutWfKappaBnd->data()  : nullptr,
+                                             in.nutWfEBnd      ? in.nutWfEBnd->data()      : nullptr,
+                                             in.nutWfYplLamBnd ? in.nutWfYplLamBnd->data() : nullptr,
                                              nutBnd.data());
         cudaCheck(cudaGetLastError(), "kEpsilon nut boundary");
     }

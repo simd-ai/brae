@@ -109,7 +109,6 @@ void correct(
     RKEResiduals*                  res)
 {
     const label nC = m.nCells();
-    const scalar Cmu25 = std::pow(co.Cmu, 0.25), Cmu75 = std::pow(co.Cmu, 0.75);
     std::vector<scalar>& nutF = nutField.internal;
 
     const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
@@ -146,15 +145,20 @@ void correct(
         if (patches[pi].type != "wall") continue;
         const FvPatch& wp = patches[pi];
         const std::vector<scalar>& yw = yWall[pi];
-        const std::vector<scalar> nutw = nutkWallFunction(wp, yw, k.internal, nu, co.Cmu, co.kappa, co.E);
+        // Per patch, from each field's own entry: the nut patch's for nutw, the epsilon patch's for
+        // eps0/G0 (WallFunctionCoeffs, item 16h-port).
+        const WallFunctionCoeffs& nc = nutField.boundary[pi]->wallCoeffs();
+        const WallFunctionCoeffs& ec = eps.boundary[pi]->wallCoeffs();
+        const scalar Cmu25 = std::pow(ec.Cmu, 0.25), Cmu75 = std::pow(ec.Cmu, 0.75);
+        const std::vector<scalar> nutw = nutkWallFunction(wp, yw, k.internal, nu, nc.Cmu, nc.kappa, nc.E);
         const std::vector<vector>& Uw = U.boundary[pi]->value();
         for (label i = 0; i < wp.size; ++i)
         {
             const label c = wp.faceCells[i];
             const scalar w = 1.0/nw[c], kc = k.internal[c];
             const scalar magGradUw = mag((Uw[i] - U.internal[c]) * wp.deltaCoeffs[i]);
-            eps0[c] += w * Cmu75 * std::pow(kc, 1.5) / (co.kappa * yw[i]);
-            G0[c]   += w * (nutw[i] + nu) * magGradUw * Cmu25 * std::sqrt(kc) / (co.kappa * yw[i]);
+            eps0[c] += w * Cmu75 * std::pow(kc, 1.5) / (ec.kappa * yw[i]);
+            G0[c]   += w * (nutw[i] + nu) * magGradUw * Cmu25 * std::sqrt(kc) / (ec.kappa * yw[i]);
         }
     }
     std::vector<label> wallCells;
@@ -228,8 +232,9 @@ void correct(
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         if (patches[pi].type != "wall") continue;
+        const WallFunctionCoeffs& nc = nutField.boundary[pi]->wallCoeffs();
         nutField.boundary[pi]->setValue(
-            nutkWallFunction(patches[pi], yWall[pi], k.internal, nu, co.Cmu, co.kappa, co.E));
+            nutkWallFunction(patches[pi], yWall[pi], k.internal, nu, nc.Cmu, nc.kappa, nc.E));
     }
 }
 

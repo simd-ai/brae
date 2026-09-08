@@ -60,6 +60,8 @@
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
 #include "device_amg.cuh"
+// After device_amg.cuh: the colour sweep takes the GSFusedComponent declared there.
+#include "device_colour_gauss_seidel.cuh"   // RhoSolverWorkspace::uColouring -- the default momentum solver
 #include "rhoUEqn.cuh"
 #include "rhoEEqn.cuh"
 #include "rhoPEqn.cuh"
@@ -183,6 +185,22 @@ struct RhoStepInput
     // ONLY. Different smoothers -- the same relTol stops in a different place, and on validation/T3A a
     // smoother that stops elsewhere is the difference between converging and limit-cycling.
     bool   uGaussSeidelSymmetric = true;
+    // The DEFAULT momentum solver since 2026-09-08 (BRAE_U_SOLVER=ofOrder opts out): the
+    // momentum solve runs a MULTICOLOUR Gauss-Seidel smoothSolver -- smoothSolver::solve's stop rule
+    // (smoothSolver.C:159-209: smooth nSweeps, a separate residual pass, nIterations counted in sweeps
+    // and tested against maxIter/minIter, checkConvergence strict '<' in SolverPerformance.C:79-86)
+    // over GaussSeidelSmoother.C:104-173's cell update, but visiting the cells in COLOUR order rather
+    // than OpenFOAM's index order. Gauss-Seidel is order-dependent, so the iterate after n sweeps is
+    // not OpenFOAM's (tests/gs_ladder: 1.36x / 2.76x / 6.88x behind after 1 / 5 / 10 sweeps on T3A);
+    // the linear solution both converge to is. The ORDER is therefore an approximation, and the DRIVER
+    // announces it (noticeApproximated, rhoSimpleFoamDriver.cu) -- this step only refuses to run it
+    // without a colouring. Mutually exclusive with uSymGaussSeidel: the driver clears that flag when
+    // it sets this one, so the two sweeps can never both run on one system.
+    bool   uColourGaussSeidel = false;
+    // The colouring that order comes from. A property of the mesh alone, so it is built once by the
+    // driver and lives in RhoSolverWorkspace::uColouring beside w.dilu; null or !valid with the flag
+    // set is refused, never replaced by the BiCGStab the notice just said is not running.
+    const DeviceCellColouring* uColouring = nullptr;
     bool   captureVcycle = true;
     int    pcgCheckEvery = 1;
     // Reuse the AMG hierarchy STRUCTURE across runs. The agglomeration is the build cost and depends only
@@ -285,6 +303,10 @@ struct RhoSolverWorkspace
     // shared by every field: diluUpdate recomputes rD from whichever matrix is being solved. Left invalid
     // when the case names no DILU, in which case every solve keeps Jacobi. See device_dilu.cuh.
     DeviceDilu dilu;
+    // The cell colouring the default momentum solve sweeps in (RhoStepInput::uColourGaussSeidel). Built ONCE per
+    // mesh, like dilu, from the internal owner/neighbour lists; left invalid unless that experiment is
+    // on, and the step refuses to run the colour sweep against an invalid one.
+    DeviceCellColouring uColouring;
     DeviceBuffer<scalar> ones;
     PressureMatrix       P;
     DeviceBuffer<scalar> diagC, b;

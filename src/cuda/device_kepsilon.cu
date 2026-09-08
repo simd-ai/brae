@@ -166,11 +166,11 @@ void wallFnKernel(
     const scalar* __restrict__ Uy,
     const scalar* __restrict__ Uz,
     scalar nu,
-    scalar yplLam,
-    scalar Cmu25,
-    scalar Cmu75,
-    scalar kappa,
-    scalar E,
+    scalar yplLamD,
+    scalar Cmu25D,
+    scalar Cmu75D,
+    scalar kappaD,
+    scalar ED,
     scalar atmZ0,
     bool   atmBoundNut,
     int nutWall,
@@ -178,7 +178,13 @@ void wallFnKernel(
     scalar* __restrict__ eps0,
     scalar* __restrict__ G0,
     const scalar* __restrict__ nuFace,   // compressible: per-wall-face nu, null -> the scalar nu
-    const scalar* __restrict__ nutwStored)   // the STORED wall nut, wall-face order; null -> recompute
+    const scalar* __restrict__ nutwStored,   // the STORED wall nut, wall-face order; null -> recompute
+    // epsilonWallFunction's OWN coefficients per wall face (DeviceWallData::wf*); null -> the scalars
+    const scalar* __restrict__ wfCmu25,
+    const scalar* __restrict__ wfCmu75,
+    const scalar* __restrict__ wfKappa,
+    const scalar* __restrict__ wfE,
+    const scalar* __restrict__ wfYplLam)
 {
     // One thread per wall CELL, summing that cell's wall faces in ascending face index and writing once.
     // The per-face form needed atomicAdd here, and a cell with more than one wall face then depended on
@@ -196,6 +202,11 @@ void wallFnKernel(
         // OF epsilonWallFunction reads turbulenceModel::nu(patchi) = mu_b/rho_b, a per-FACE field. The
         // scalar fallback is only right for constant-property incompressible flow.
         const scalar nuw = nuFace ? nuFace[wf] : nu;
+        const scalar Cmu25  = wfCmu25  ? wfCmu25[wf]  : Cmu25D;
+        const scalar Cmu75  = wfCmu75  ? wfCmu75[wf]  : Cmu75D;
+        const scalar kappa  = wfKappa  ? wfKappa[wf]  : kappaD;
+        const scalar E      = wfE      ? wfE[wf]      : ED;
+        const scalar yplLam = wfYplLam ? wfYplLam[wf] : yplLamD;
         // epsilonWallFunction, STEPWISE blender (its default). `lowReCorrection` switches a face whose
         // y+ is below yPlusLam to the VISCOUS epsilon and drops its wall production ENTIRELY --
         // epsilonWallFunctionFvPatchScalarField.C:242 and :338, where the G guard is
@@ -745,7 +756,12 @@ void deviceWallEpsG0(
                                               w.wfUwy.data(), w.wfUwz.data(), w.invNw.data(), k.data(), Ux.data(), Uy.data(),
                                               Uz.data(), nu, yplLam, Cmu25, Cmu75, co.kappa, co.E, atmZ0, atmBoundNut, nutWall, co.epsLowRe, eps0.data(), G0.data(),
                                               (nuFace && nuFace->size()) ? nuFace->data() : nullptr,
-                                              (nutwStored && nutwStored->size()) ? nutwStored->data() : nullptr);
+                                              (nutwStored && nutwStored->size()) ? nutwStored->data() : nullptr,
+                                              w.wfCmu25.size()  ? w.wfCmu25.data()  : nullptr,
+                                              w.wfCmu75.size()  ? w.wfCmu75.data()  : nullptr,
+                                              w.wfKappa.size()  ? w.wfKappa.data()  : nullptr,
+                                              w.wfE.size()      ? w.wfE.data()      : nullptr,
+                                              w.wfYplLam.size() ? w.wfYplLam.data() : nullptr);
     cudaCheck(cudaGetLastError(), "wallFn");
 }
 

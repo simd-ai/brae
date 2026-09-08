@@ -32,7 +32,9 @@ struct DeviceSimpleControls
     // factor so a case without Final entries behaves exactly as before.
     scalar relaxUFinal = 0.7, relaxPFinal = 0.3, relaxKFinal = 0.7, relaxEpsFinal = 0.7;
     vector bodyForce{0, 0, 0};                     // constant momentum source (drives periodic/cyclic channels). +V*g.
-    scalar tolU = 1e-8, tolP = 1e-7, tolKE = 1e-8;
+    // lduMatrix::defaultTolerance is 1e-6 for every field (lduMatrix.C:45, read at lduMatrixSolver.C:199);
+    // these were 1e-8 / 1e-7 / 1e-8, which a driver bypassing the reader would have run in silence.
+    scalar tolU = 1e-6, tolP = 1e-6, tolKE = 1e-6;
     scalar relTolU = 0.0, relTolP = 0.0, relTolKE = 0.0;   // solver relTol (fvSolution solvers.{U,p,k,epsilon}.relTol). 0 = abs tol.
     // The ENERGY equation's own entry (solvers/h, /e, or a regex covering it), filled when the caller
     // names the field. OF's lduMatrix::solver reads every field from its own sub-dictionary
@@ -66,7 +68,7 @@ struct DeviceSimpleControls
     int    minIterU = 0,    minIterP = 0,    minIterKE = 0;
     int    maxIterUFinal = 1000, maxIterPFinal = 1000, maxIterKEFinal = 1000;
     int    minIterUFinal = 0,    minIterPFinal = 0,    minIterKEFinal = 0;
-    scalar tolUFinal = 1e-8, tolPFinal = 1e-7, tolKEFinal = 1e-8;
+    scalar tolUFinal = 1e-6, tolPFinal = 1e-6, tolKEFinal = 1e-6;
     scalar relTolUFinal = 0.0, relTolPFinal = 0.0, relTolKEFinal = 0.0;
     // TWO flags, because OF selects the Final entry two different ways and the difference is visible in
     // its log on any PISO-mode case (nOuterCorrectors 1, two pressure correctors):

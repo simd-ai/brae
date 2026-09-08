@@ -360,14 +360,34 @@ RhoDeviceFields createDeviceFields(
         const std::vector<std::vector<scalar>> yW = nearWallDist(m, g, patches);
         std::vector<label>  mask;
         std::vector<scalar> yBnd;
+        // Each wall function's OWN coefficients, per face: the NUT patch's entry for nutkWallFunction
+        // (boundary-face order), the EPSILON patch's for epsilonWallFunction (wall-face order, the one
+        // buildDeviceWallData built). OpenFOAM reads them per patch field (wallFunctionCoefficients);
+        // the model-wide value the kernels fall back to is the legacy drivers' approximation.
+        std::vector<scalar> nCmu25, nKappa, nE, nYpl;
+        std::vector<scalar> eCmu25, eCmu75, eKappa, eE, eYpl;
         label bndIdx = 0;
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
             const bool isWF = isTurbWallPatch(patches, pi, wfPatch);
+            const WallFunctionCoeffs& nc = hf.nut.boundary[pi]->wallCoeffs();
+            const WallFunctionCoeffs& ec = hf.epsilon.boundary[pi]->wallCoeffs();
             for (label i = 0; i < patches[pi].size; ++i, ++bndIdx)
             {
                 mask.push_back(isWF ? 1 : 0);
                 yBnd.push_back(isWF ? yW[pi][i] : scalar(0.0));
+                nCmu25.push_back(std::pow(nc.Cmu, 0.25));
+                nKappa.push_back(nc.kappa);
+                nE.push_back(nc.E);
+                nYpl.push_back(nc.yPlusLam());
+                if (isWF)
+                {
+                    eCmu25.push_back(std::pow(ec.Cmu, 0.25));
+                    eCmu75.push_back(std::pow(ec.Cmu, 0.75));
+                    eKappa.push_back(ec.kappa);
+                    eE.push_back(ec.E);
+                    eYpl.push_back(ec.yPlusLam());
+                }
                 // The wall-face ORDER has to be the one buildDeviceWallData built, because
                 // deviceGatherWallNu indexes into it -- so it is recorded here, where that order is
                 // decided, rather than reconstructed by a caller walking the patches again.
@@ -378,6 +398,25 @@ RhoDeviceFields createDeviceFields(
         yBnd.resize(static_cast<std::size_t>(d.nBndFaces), scalar(0.0));
         d.wfBndMask.copyFrom(mask);
         d.wallYBndFace.copyFrom(yBnd);
+        nCmu25.resize(static_cast<std::size_t>(d.nBndFaces), std::pow(scalar(0.09), 0.25));
+        nKappa.resize(static_cast<std::size_t>(d.nBndFaces), scalar(0.41));
+        nE.resize(static_cast<std::size_t>(d.nBndFaces), scalar(9.8));
+        nYpl.resize(static_cast<std::size_t>(d.nBndFaces), WallFunctionCoeffs{}.yPlusLam());
+        d.nutWfCmu25Bnd.copyFrom(nCmu25);
+        d.nutWfKappaBnd.copyFrom(nKappa);
+        d.nutWfEBnd.copyFrom(nE);
+        d.nutWfYplLamBnd.copyFrom(nYpl);
+        if (static_cast<int>(eCmu25.size()) != d.wall.nWF)
+        {
+            throw std::runtime_error("rhoSimpleFoam createFields: the epsilon wall-function coefficient list ("
+                                     + std::to_string(eCmu25.size()) + " faces) does not match the wall-face set ("
+                                     + std::to_string(d.wall.nWF) + "); the two walks disagree on what a wall is");
+        }
+        d.wall.wfCmu25.copyFrom(eCmu25);
+        d.wall.wfCmu75.copyFrom(eCmu75);
+        d.wall.wfKappa.copyFrom(eKappa);
+        d.wall.wfE.copyFrom(eE);
+        d.wall.wfYplLam.copyFrom(eYpl);
     }
 
     return d;

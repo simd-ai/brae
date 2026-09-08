@@ -1,4 +1,5 @@
 // rhoSimpleFoamDriver.cu -- see the header for what is shared with the host driver and why.
+#include "brae_notice.cuh"
 #include "rhoSimpleFoamDriver.cuh"
 
 #include "brae_time.cuh"
@@ -9,6 +10,7 @@
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "linear_solver_setup.cuh"
+#include "of_residual_log.cuh"           // momentumSolverName / printOfSolveLine: the OpenFOAM-format momentum lines
 #include "residual_control.cuh"
 #include "rhoSimpleFoamDriver_cpp.cuh"   // buildStepInput: the SHARED case -> StepInput parse
 #include "rhoThermoDevice.cuh"           // effectiveTransport, device-resident
@@ -366,6 +368,9 @@ int runMirrorCuda(const std::string& caseDir)
     // The HOST field set first, exactly as the harness does: createDeviceFields projects the device
     // state from it, and every refusal createFields carries (thermo, RAS model, boundary conditions,
     // coupled patches) fires here before a single byte reaches the GPU.
+    // This driver's wall treatments read Cmu/kappa/E per patch (item 16h-port): the reader must not
+    // announce those entries as unhonoured.
+    brae::perPatchWallCoeffsHonoured() = true;
     cpu::rhoSimple::RhoSimpleFields hf =
         cpu::rhoSimple::createFields(caseDir + "/" + startName, caseDir, simpleDict, &fvSolution,
                                      m, g, patches, &thermoProps, turbProps.get());
@@ -404,6 +409,45 @@ int runMirrorCuda(const std::string& caseDir)
     bool gsK = false, gsEps = false, gsKESym = true;
     int  nSweepsU = 1, nSweepsHe = 1, nSweepsKE = 1;
 
+    // BRAE_U_SOLVER, the momentum solver, read ONCE here. Every consumer below -- the shared reader's
+    // notice routing, this driver's own notices, the workspace colouring, the step input and the
+    // residual-log name -- takes this one decision, so none of them can disagree.
+    //   colourGS  (THE DEFAULT) a multicolour Gauss-Seidel smoothSolver whatever the entry names,
+    //             under the stop rule the entry names. Measured on the squareBend tutorial at 305,760
+    //             cells, momentum ms per outer iteration: 10.9 against 26.0 for the diagonal BiCGStab
+    //             this driver ran before, 58.5 for a DILU one, 57.2 for OpenFOAM's own index-ordered
+    //             sweep on the host and 36.2 for it level-scheduled on the device
+    //             (bench/results/rhoSimpleFoam_squareBend_gb10.md).
+    //   ofOrder   OpenFOAM's OWN index order on a case that names a GaussSeidel smoothSolver (the
+    //             level-scheduled sweep), and the diagonal BiCGStab on any other entry: what this
+    //             driver ran before. EXACT where colourGS approximates, and the opt-out for a case
+    //             whose momentum must reproduce OpenFOAM's iterate under a loose relTol, not only its
+    //             converged answer.
+    // Both run the case's tolerance, relTol, maxIter, minIter and nSweeps. The difference colourGS
+    // makes is the ORDER of the sweep, which changes where a solve stopped short of convergence stops
+    // -- announced below, per entry, and gated by tests/u_colour_gs_vs_openfoam.sh.
+    bool uColourGS = true;
+    if (const char* e = std::getenv("BRAE_U_SOLVER"))
+    {
+        const std::string sel(e);
+        if (sel == "colourGS")
+        {
+            uColourGS = true;
+        }
+        else if (sel == "ofOrder")
+        {
+            uColourGS = false;
+        }
+        else if (!sel.empty())
+        {
+            throw std::runtime_error(
+                "brae rhoSimpleFoam (mirror): BRAE_U_SOLVER='" + sel + "' names no momentum solver this "
+                "driver runs. Accepted values: `colourGS` (the default: a multicolour Gauss-Seidel "
+                "smoothSolver) or `ofOrder` (OpenFOAM's own index order where the case names a "
+                "GaussSeidel smoothSolver, the diagonal BiCGStab otherwise).");
+        }
+    }
+
     // The case's own linear-solver tolerances, for the same reason the host driver reads them: a gate
     // pins them so the linear solve is out of the comparison, a SOLVER runs what the case asks for.
     {
@@ -423,7 +467,23 @@ int runMirrorCuda(const std::string& caseDir)
             const char* e = std::getenv("BRAE_RHO_SMOOTHSOLVER");
             const bool honour = !(e && std::string(e) == "0");
             runsAs.smoothSolverOnEnergy     = honour;
-            runsAs.smoothSolverOnMomentum   = honour;
+            // ...except on momentum under BRAE_U_SOLVER=colourGS, where OpenFOAM's sweep does NOT run.
+            // The reader's U notice is driven by ctl.gsU = useSymGS("U") && smoothSolverOnMomentum:
+            // true means "OpenFOAM's own sweep runs, nothing to say" and silences it, false makes it
+            // announce `brae runs PBiCGStab preconditioned with ...` against any other entry, an
+            // `ignored` line for the smoother and a preconditioner substitution. In colourGS mode
+            // neither is true -- the colour sweep is not OpenFOAM's and no BiCGStab runs -- so gsU is
+            // kept honest (false) rather than borrowed as a silencer, and the reader is told the caller
+            // owns the U notice. The driver prints exactly one truthful set of lines below, after the
+            // read; tests/u_colour_gs_vs_openfoam.sh asserts both that presence and the reader's silence.
+            runsAs.smoothSolverOnMomentum   = honour && !uColourGS;
+            runsAs.momentumNoticedByCaller  = uColourGS;
+            // ...and it is the one path that runs OpenFOAM's fixed-count nSweeps branch on U, so the
+            // reader hands it a negative nSweeps raw instead of refusing it (linear_solver_setup.cuh).
+            if (uColourGS)
+            {
+                runsAs.fixedSweepsField = "U";
+            }
             runsAs.smoothSolverOnTurbulence = honour;
         }
         if (hin.transonic)
@@ -439,7 +499,9 @@ int runMirrorCuda(const std::string& caseDir)
         hin.tolP    = lctl.tolP;    hin.relTolP    = lctl.relTolP;    hin.maxIterP    = lctl.maxIterP;    hin.minIterP    = lctl.minIterP;
         hin.tolHe   = lctl.tolHe;   hin.relTolHe   = lctl.relTolHe;   hin.maxIterHe   = lctl.maxIterHe;   hin.minIterHe   = lctl.minIterHe;
         hin.tolTurb = lctl.tolKE;   hin.relTolTurb = lctl.relTolKE;   hin.maxIterTurb = lctl.maxIterKE;   hin.minIterTurb = lctl.minIterKE;
-        diluU  = lctl.diluU;
+        // Under BRAE_U_SOLVER=colourGS the momentum branch never reads preconU, so a DILU entry must
+        // not make the driver build the level schedule for it (review, round 2).
+        diluU  = lctl.diluU && !uColourGS;
         diluHe = lctl.diluHe;
         diluKE = lctl.diluKE;
         // The case's own smoothSolver selection, carried into the step (item 58). Without these the
@@ -450,6 +512,54 @@ int runMirrorCuda(const std::string& caseDir)
         gsK = lctl.gsK;       gsEps = lctl.gsEps;
         gsKESym = lctl.gsKESym;                          nSweepsKE = lctl.nSweepsKE;
         cpu::rhoSimple::printLinearSolverControls(hin, hf.heName, secondName, hf.turbulent);
+    }
+
+    if (uColourGS)
+    {
+        // The U notice for the colour-order momentum solve (the default), from the driver and AFTER the read, since the reader
+        // was told to leave U to the caller (runsAs.momentumNoticedByCaller above). Two cases, one line
+        // each: the case asked for a Gauss-Seidel smoothSolver and gets it in a different ORDER, or it
+        // asked for anything else and gets a different SOLVER. Both run under the stop rule the entry
+        // names (tolerance, relTol, maxIter, minIter, nSweeps); neither leaves the iterate under a
+        // loose relTol where OpenFOAM's would, which is what makes this `approximated` and not
+        // `equivalent`.
+        const FoamDict* uEntry = solversDict ? solversDict->subDict("U") : nullptr;
+        const std::string want = uEntry ? uEntry->wordOr("solver", "") : "";
+        const std::string smoo = uEntry ? uEntry->wordOr("smoother", "") : "";
+        const std::string prec = uEntry ? uEntry->wordOr("preconditioner", "") : "";
+        const bool asksGaussSeidel = want == "smoothSolver"
+                                  && (smoo == "GaussSeidel" || smoo == "symGaussSeidel");
+        if (asksGaussSeidel)
+        {
+            noticeApproximated("solvers/U smoother",
+                               "case asks '" + smoo + "' in OpenFOAM's index order; brae sweeps in COLOUR "
+                               "order -- same stop rule, a different iterate after n sweeps (tests/gs_ladder "
+                               "measured 1.36x/2.76x/6.88x behind after 1/5/10 sweeps on T3A), 5x faster "
+                               "(10.9 against 57.2 ms per iteration at 306k cells). BRAE_U_SOLVER=ofOrder "
+                               "runs OpenFOAM's own order instead");
+        }
+        else
+        {
+            std::string asked = want.empty() ? std::string("no solver") : "'" + want + "'";
+            if (!smoo.empty())
+            {
+                asked += " with smoother '" + smoo + "'";
+            }
+            if (!prec.empty())
+            {
+                asked += " with preconditioner '" + prec + "'";
+            }
+            // Name the VARIANT that runs: with no smoother in the entry gsIsSymmetric() answers true, so
+            // the sweep is the symmetric one (device_sym_gauss_seidel.cuh: symGaussSeidel and GaussSeidel
+            // are different smoothers, not settings of one), and the start-up line says the same.
+            const std::string variant = gsUSym ? "symGaussSeidel" : "GaussSeidel";
+            noticeApproximated("solvers/U solver",
+                               "case asks " + asked + ", brae runs a multicolour " + variant + " smoothSolver "
+                               "to the same tolerance, relTol, maxIter and minIter, nSweeps "
+                             + std::to_string(nSweepsU) + " -- a different solver: the converged answer is "
+                               "the same, the iterate under relTol is not. BRAE_U_SOLVER=ofOrder runs the "
+                               "diagonal-preconditioned BiCGStab this driver ran before");
+        }
     }
 
     RhoDeviceFields dev = createDeviceFields(hf, m, g, patches);
@@ -494,6 +604,54 @@ int runMirrorCuda(const std::string& caseDir)
                                  "could not be built; refusing rather than running the diagonal the notice "
                                  "denied. BRAE_DILU=0 selects the diagonal explicitly.");
     gin.preconP  = diluP ? &w.dilu : nullptr;
+
+    if (uColourGS)
+    {
+        // The colouring the colour-order sweep visits the cells in, once per mesh like w.dilu.
+        // PrimitiveMesh::owner() spans the boundary faces as well while neighbour() stops at the
+        // internal ones (primitive_mesh.cuh:99, and the slice buildDeviceDilu takes for the same
+        // reason), so owner is cut to neighbour().size() before the two are paired face by face.
+        const std::vector<label>& ownerAll = m.owner();
+        const std::vector<label>& nei = m.neighbour();
+        const std::vector<label> ownerInternal(
+            ownerAll.begin(),
+            ownerAll.begin() + static_cast<std::ptrdiff_t>(nei.size()));
+        w.uColouring = buildDeviceCellColouring(ownerInternal, nei, static_cast<int>(nC));
+        // The notice above already named the colour sweep, so a colouring that failed to build is
+        // refused, not silently replaced by the BiCGStab the notice just denied.
+        if (!w.uColouring.valid)
+            throw std::runtime_error(
+                "brae rhoSimpleFoam (mirror): the multicolour Gauss-Seidel momentum solve (the default) "
+                "needs a cell colouring and it could not be built; refusing rather than running the solver "
+                "the notice denied. BRAE_U_SOLVER=ofOrder runs OpenFOAM's own order instead.");
+        gin.uColourGaussSeidel = true;
+        // Never both: the step branches `if (uSymGaussSeidel) ... else if (uColourGaussSeidel)`, and
+        // clearing the first here is what keeps it from shadowing the second on a smoothSolver entry.
+        gin.uSymGaussSeidel = false;
+        gin.uColouring = &w.uColouring;
+        std::string sizes;
+        for (int c = 0; c + 1 < static_cast<int>(w.uColouring.startH.size()); ++c)
+        {
+            if (!sizes.empty()) sizes += ' ';
+            sizes += std::to_string(w.uColouring.startH[static_cast<std::size_t>(c) + 1]
+                                  - w.uColouring.startH[static_cast<std::size_t>(c)]);
+        }
+        std::printf("  momentum: multicolour Gauss-Seidel smoothSolver, %d colours (sizes %s), "
+                    "tolerance/relTol/maxIter/minIter/nSweeps from the case's U entry, %s sweeps\n",
+                    w.uColouring.nColours,
+                    sizes.c_str(),
+                    gin.uGaussSeidelSymmetric ? "symGaussSeidel (ascending then descending)"
+                                              : "GaussSeidel (ascending only)");
+    }
+
+    // The name on the OpenFOAM-format `Solving for Ux` line (of_residual_log.cuh, BRAE_OF_LOG=1): what
+    // RUNS, decided from the same flags the step branches on, so the line cannot name a solver the
+    // step did not run. The legacy drivers never set this and keep printing JacobiBiCGStab.
+    momentumSolverName() = gin.uColourGaussSeidel ? "colourGaussSeidel"
+                         : gin.uSymGaussSeidel    ? (gin.uGaussSeidelSymmetric ? "symGaussSeidel"
+                                                                               : "GaussSeidel")
+                         : gin.preconU            ? "DILUPBiCGStab"
+                                                  : "JacobiBiCGStab";
 
     // THE THERMO HOOKS, device-resident. The step takes them as hooks because EEqn.H ends in
     // thermo.correct() -- which moves T and therefore psi, and every consumer below that point reads
@@ -620,12 +778,29 @@ int runMirrorCuda(const std::string& caseDir)
             r[second] = turbBuf.stages.epsResidual;
         }
 
+        // OpenFOAM's own `Solving for Ux` line per SOLVED component (BRAE_OF_LOG=1), named for the
+        // solver that ran (momentumSolverName()). The knocked-out component has no entry in `r`, as
+        // OpenFOAM prints no line for it (fvMatrixSolve.C:164). Only the momentum lines: they are the
+        // ones whose final residual and iteration count this arm's step returns.
+        if (ofResidualLog())
+        {
+            for (const char* c : {"Ux", "Uy", "Uz"})
+            {
+                if (!r.count(c)) continue;
+                printOfSolveLine(momentumSolverName(),
+                                 c,
+                                 r.at(c),
+                                 r.at(std::string(c) + "Final"),
+                                 static_cast<int>(r.at(std::string(c) + "Iters")));
+            }
+        }
         auto res = [&](const char* k) { return r.count(k) ? (double)r.at(k) : 0.0; };
         std::printf("Time = %s   U %.4e   %s %.4e   p %.4e",
                     WriteControl::timeName(wc.timeValue(iter)).c_str(),
                     res("U"), hf.heName.c_str(), res(hf.heName.c_str()), res("p"));
         if (r.count("k")) std::printf("   k %.4e   %s %.4e", res("k"), second.c_str(), res(second.c_str()));
         if (r.count("pIters")) std::printf("   pIters %.0f", res("pIters"));
+        if (r.count("uIters")) std::printf("   uIters %.0f", res("uIters"));
         std::printf("\n");
         // OpenFOAM's continuityErrs.H (rhoSimpleFoam's pEqn.H:81 / pcEqn.H:94 include it every
         // iteration): contErr = fvc::div(phi) on the corrected MASS flux, sum local = deltaT * the

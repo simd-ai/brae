@@ -206,8 +206,8 @@ void correct(
     int    minIter)
 {
     const label nC = m.nCells();
-    const scalar Cmu25 = std::pow(co.CmuWall, 0.25);   // the WALL FUNCTIONS' Cmu, not the model's
-    const scalar Cmu75 = std::pow(co.CmuWall, 0.75);
+    // The wall functions' Cmu/kappa/E are PER PATCH, from each field's own entry (WallFunctionCoeffs),
+    // not the model's -- taken inside the patch loops below.
     std::vector<scalar>& nutF = nutField.internal;
 
     // fvc::grad(U) through the case's grad(U) scheme (kEpsilon.C:237): cellLimited where fvSchemes says so.
@@ -285,6 +285,12 @@ void correct(
         // compounded into a 1e-03 trajectory drift by iteration 10.
         const std::vector<scalar>& nutw = nutField.boundary[pi]->value();
         const std::vector<vector>& Uw = U.boundary[pi]->value();
+        // epsilonWallFunction's OWN coefficients (wallCoeffs_, epsilonWallFunctionFvPatchScalarField.C:192-195).
+        const WallFunctionCoeffs& wc = epsilon.boundary[pi]->wallCoeffs();
+        const scalar Cmu25 = std::pow(wc.Cmu, 0.25);
+        const scalar Cmu75 = std::pow(wc.Cmu, 0.75);
+        const scalar kappa = wc.kappa;
+        const scalar yPlusLam = wc.yPlusLam();
 
         for (label i = 0; i < wp.size; ++i)
         {
@@ -297,14 +303,13 @@ void correct(
             // blenderType::STEPWISE, 2)). Without lowReCorrection the log branch is taken on every face,
             // which is what this did unconditionally before.
             const scalar yPlus = Cmu25 * yw[i] * std::sqrt(kc) / nuAtFace(i);
-            const scalar yPlusLam = brae::yPlusLam(co.kappa, co.E);
             const bool   resolved = co.epsLowRe && (yPlus < yPlusLam);
             eps0[c] += resolved ? w * 2.0 * kc * nuAtFace(i) / (yw[i] * yw[i])               // epsilonVis
-                                : w * Cmu75 * std::pow(kc, 1.5) / (co.kappa * yw[i]);        // epsilonLog
+                                : w * Cmu75 * std::pow(kc, 1.5) / (kappa * yw[i]);           // epsilonLog
             // ...and the production override is SKIPPED ENTIRELY on a resolved face -- OF's guard is
             // `if (!lowReCorrection_ || (yPlus > yPlusLam))`, not a scaling of the same term.
             if (!resolved)
-                G0[c] += w * (nutw[i] + nuAtFace(i)) * magGradUw * Cmu25 * std::sqrt(kc) / (co.kappa * yw[i]);
+                G0[c] += w * (nutw[i] + nuAtFace(i)) * magGradUw * Cmu25 * std::sqrt(kc) / (kappa * yw[i]);
         }
     }
 
@@ -656,13 +661,16 @@ void correctNutField(
                     // the one call site still reading the case-constant nu -- which the compressible
                     // lineage does not have. Passing the scalar there put a 0 into a divisor and the
                     // whole solve went non-finite inside the first iteration.
+                    // nutkWallFunction's OWN coefficients: the NUT patch's entry, not epsilon's and
+                    // not the model's (nutkWallFunctionFvPatchScalarField.C:43-46).
+                    const WallFunctionCoeffs& nc = nutField.boundary[pi]->wallCoeffs();
                     if (!(comp && comp->nuBnd))
                         return nutkWallFunction(patches[pi], yWall[pi], k.internal, nu,
-                                                co.CmuWall, co.kappa, co.E);
+                                                nc.Cmu, nc.kappa, nc.E);
                     std::vector<scalar> nf(patches[pi].size);
                     for (label i = 0; i < patches[pi].size; ++i) nf[i] = (*comp->nuBnd)[pi][i];
                     return nutkWallFunction(patches[pi], yWall[pi], k.internal, nf,
-                                            co.CmuWall, co.kappa, co.E);
+                                            nc.Cmu, nc.kappa, nc.E);
                 }());
             continue;
         }

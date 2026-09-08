@@ -91,4 +91,13 @@ inline void noticeApplied(const std::string& subject, const std::string& detail)
     if (std::getenv("BRAE_NOTICE_APPLIED")) detail::notice("applied", subject, detail);
 }
 
+// Set by a driver whose wall treatments read Cmu/kappa/E per patch (the rhoSimpleFoam mirror, both
+// arms, item 16h-port) BEFORE it reads its fields: the reader then stays silent on those entries. The
+// legacy drivers leave it false and are told, per patch, what they do not honour.
+inline bool& perPatchWallCoeffsHonoured()
+{
+    static bool honoured = false;
+    return honoured;
+}
+
 }   // namespace brae

@@ -322,7 +322,10 @@ void updateBoundaryCoeffs(
 namespace
 {
 double g_tU = 0.0, g_tE = 0.0, g_tP = 0.0, g_tTurb = 0.0;
-std::chrono::steady_clock::time_point g_phaseMark;
+// ...and, inside three of them, the linear SOLVE alone (the call returns after the residual readback,
+// so wall time here is the solve's). What a phase spends outside its solve is assembly and corrections.
+double g_tUsol = 0.0, g_tEsol = 0.0, g_tPsol = 0.0;
+std::chrono::steady_clock::time_point g_phaseMark, g_solveMark;
 bool phaseTimeOn()
 {
     static const bool on = std::getenv("BRAE_PHASE_TIME") != nullptr;
@@ -339,6 +342,15 @@ void phaseMark(double* slot)
 }
 }   // namespace
 
+void solveMarkBegin()
+{
+    if (phaseTimeOn()) g_solveMark = std::chrono::steady_clock::now();
+}
+void solveMarkEnd(double* slot)
+{
+    if (!phaseTimeOn()) return;
+    *slot += std::chrono::duration<double>(std::chrono::steady_clock::now() - g_solveMark).count();
+}
 void rhoPhaseTimeReport(int iterations)
 {
     if (!phaseTimeOn() || iterations <= 0) return;
@@ -351,6 +363,9 @@ void rhoPhaseTimeReport(int iterations)
                 g_tP,    1e3 * g_tP    / iterations,
                 g_tTurb, 1e3 * g_tTurb / iterations,
                 tot,     1e3 * tot     / iterations);
+    const double n = static_cast<double>(iterations);
+    std::printf("  [phase] of which the linear solves: U %.3f s (%.1f ms/it), he %.3f s (%.1f ms/it), p %.3f s (%.1f ms/it)\n",
+                g_tUsol, 1e3 * g_tUsol / n, g_tEsol, 1e3 * g_tEsol / n, g_tPsol, 1e3 * g_tPsol / n);
 }
 
 Residuals rhoSimpleStep(
@@ -455,6 +470,7 @@ Residuals rhoSimpleStep(
     assembleUEqn(UEqn, dm, dbU, f.Ux, f.Uy, f.Uz, uin);
     sd.scalars("UDiag", UEqn.diag);
     sd.scalars("UUpper", UEqn.upper);
+    sd.scalars("ULower", UEqn.lower);   // the convection makes it differ from upper; the solver experiments need both
     sd.scalars("USrcX", UEqn.source[0]);
     sd.scalars("USrcY", UEqn.source[1]);
     sd.scalars("USrcZ", UEqn.source[2]);
@@ -511,6 +527,10 @@ Residuals rhoSimpleStep(
             deviceFold(dm, Mp.relaxed ? Mp.relaxedDiag : Mp.diag, Mp.source[k], Mp.iC[k], Mp.bC[k], diagC[k], b[k]);
             A[k] = foldedViewM(dm, Mp, diagC[k]);
             deviceNormFactorInto(A[k], *U[k], b[k], w.ones, dnf[k]);   // stays on the device (item 66)
+            // The SOLVED system per component (folded, relaxed diagonal and rhs), for the offline
+            // momentum-solver experiments (bench/rhoSimpleFoam/u_precond_experiment.py). Dump only.
+            sd.scalars((std::string("UsolveDiag") + "XYZ"[k]).c_str(), diagC[k]);
+            sd.scalars((std::string("UsolveB") + "XYZ"[k]).c_str(), b[k]);
             solved[nSolved++] = k;
         }
         DeviceSolverPerf perfs[3];
@@ -527,17 +547,73 @@ Residuals rhoSimpleStep(
                                       in.uGaussSeidelSymmetric, fp);
             for (int i = 0; i < nSolved; ++i) perfs[solved[i]] = fp[i];
         }
+        else if (in.uColourGaussSeidel)
+        {
+            // the default momentum solver (see RhoStepInput::uColourGaussSeidel): the same fused components
+            // as the branch above, swept in COLOUR order under smoothSolver::solve's stop rule. The
+            // driver has already announced the order as an approximation; what this branch must not
+            // do is run anything else when the colouring it was promised is missing.
+            if (!in.uColouring || !in.uColouring->valid)
+                throw std::runtime_error(
+                    "brae rhoSimpleFoam (mirror): the default momentum solver selected the multicolour "
+                    "Gauss-Seidel momentum solve but RhoStepInput::uColouring is null or invalid; "
+                    "refusing rather than running a solver the notice did not name");
+            GSFusedComponent comps[3];
+            DeviceSolverPerf fp[3];
+            for (int i = 0; i < nSolved; ++i)
+            {
+                const int k = solved[i];
+                comps[i] = {&A[k], &b[k], U[k], 1.0, dnf[k].data()};
+            }
+            solveMarkBegin();
+            deviceColourGaussSeidelFused(
+                nSolved,
+                comps,
+                *in.uColouring,
+                in.tolU,
+                in.relTolU,
+                in.maxIterU,
+                in.minIterU,
+                in.nSweepsU,
+                in.uGaussSeidelSymmetric,
+                fp);
+            solveMarkEnd(&g_tUsol);
+            for (int i = 0; i < nSolved; ++i) perfs[solved[i]] = fp[i];
+        }
         else
         {
             for (int i = 0; i < nSolved; ++i)
             {
                 const int k = solved[i];
+                solveMarkBegin();
                 perfs[k] = deviceJacobiBiCGStab(A[k], b[k], *U[k], dnf[k].data(), in.tolU, in.relTolU, in.maxIterU, /*checkEvery=*/1,
                                                 in.minIterU, in.preconU);
+                solveMarkEnd(&g_tUsol);
             }
         }
         for (int i = 0; i < nSolved; ++i) uInitialResidual = std::max(uInitialResidual, perfs[solved[i]].initialResidual);
         res["U"] = uInitialResidual;
+        // Each SOLVED component's own report, for the driver's OpenFOAM-format `Solving for Ux` line
+        // (of_residual_log.cuh, BRAE_OF_LOG=1). Only the solved ones: fvMatrix<vector>::solveSegregated
+        // `continue`s on a knocked-out component (fvMatrixSolve.C:164) and OpenFOAM prints no line for
+        // it, so its absence from the map is the signal. The numbers are already on the host -- the
+        // max above read them -- so this adds map entries, not a device readback.
+        for (int i = 0; i < nSolved; ++i)
+        {
+            const int k = solved[i];
+            const std::string cmpt = std::string("U") + "xyz"[k];
+            res[cmpt] = perfs[k].initialResidual;
+            res[cmpt + "Final"] = perfs[k].finalResidual;
+            res[cmpt + "Iters"] = static_cast<scalar>(perfs[k].nIterations);
+        }
+        // The work behind the momentum number: BiCGStab iterations summed over the solved components,
+        // printed on the summary line when BRAE_PHASE_TIME is set (the block-by-block investigation).
+        if (phaseTimeOn())
+        {
+            scalar n = 0;
+            for (int i = 0; i < nSolved; ++i) n += static_cast<scalar>(perfs[solved[i]].nIterations);
+            res["uIters"] = n;
+        }
     }
     sd.vectors("Upred", f.Ux, f.Uy, f.Uz);
 
@@ -617,12 +693,14 @@ Residuals rhoSimpleStep(
         // OpenFOAM's own sweep, level-scheduled, under its stopping rule and its nSweeps; anything else
         // keeps BiCGStab and is announced. squareBend and angledDuct both name a smoothSolver here.
         DeviceSolverPerf perf;
+        solveMarkBegin();
         if (in.heSymGaussSeidel)
             deviceSymGaussSeidel(A, b, f.he, dnf.data(), in.tolHe, in.relTolHe, in.maxIterHe, &perf, in.minIterHe,
                                  in.nSweepsHe, in.heGaussSeidelSymmetric);
         else
             perf = deviceJacobiBiCGStab(A, b, f.he, dnf.data(), in.tolHe, in.relTolHe, in.maxIterHe, /*checkEvery=*/1, in.minIterHe,
                                         in.preconHe);
+        solveMarkEnd(&g_tEsol);
         res[in.isE ? "e" : "h"] = perf.initialResidual;
 
         // fvOptions.correct(he), EEqn.H:27 -- AFTER the solve and BEFORE thermo.correct(), which is what
@@ -721,8 +799,10 @@ Residuals rhoSimpleStep(
             // fvm::div(phid, p) makes lower = -w*phi and upper = lower + phi, so upper != lower at every
             // face with flow through it. A symmetric solver on that matrix is not slow, it is wrong: CG
             // burned the full 3000-iteration cap and the case stalled before printing iteration 1.
+            solveMarkBegin();
             perf = deviceJacobiBiCGStab(A, b, f.p, dnf.data(), in.tolP, in.relTolP, in.maxIterP, in.pcgCheckEvery, in.minIterP,
                                         in.preconP);   // DILU when the driver built one; null keeps Jacobi
+            solveMarkEnd(&g_tPsol);
         }
         else
         {
@@ -750,8 +830,10 @@ Residuals rhoSimpleStep(
                 w.amgBuilt = true;
             }
             amgGalerkin(w.amg, diagC, P.upper, P.lower);
+            solveMarkBegin();
             perf = deviceAMGPCG(A, w.amg, b, f.p, dnf.data(), in.tolP, in.relTolP, in.maxIterP,
                                 in.captureVcycle, in.pcgCheckEvery, /*corrScaling=*/false, in.minIterP);
+            solveMarkEnd(&g_tPsol);
         }
         // solutionControl.C:230-233 takes sp.first() -- the FIRST solve of the iteration, not the last.
         if (corr == 1) res["p"] = perf.initialResidual;
