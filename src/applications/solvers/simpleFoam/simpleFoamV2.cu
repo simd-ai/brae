@@ -1,4 +1,5 @@
 // DISPATCH for the rebuilt simpleFoam -- see simpleFoamV2.cuh for why the guard exists.
+#include "linear_solver_setup.cuh"   // turbPreconFor: the ONE rule for the turbulence preconditioner
 #include "simpleFoamV2.cuh"
 #include "simpleFoam.cuh"
 #include "createFields_cpp.cuh"
@@ -968,6 +969,7 @@ int runSimpleFoamV2(const std::string& caseDir)
     // fvSolution's `preconditioner DILU` on U and on the transported pair (item 74). One level schedule
     // per mesh serves both; null keeps the diagonal, which is what this driver always ran.
     bool diluU = false, diluKE = false;
+    int  polyDegKE = 1;                 // the Neumann series' degree; 1 == plain Jacobi
     // ...and WHICH of OF's two GaussSeidel smoothers the pair named. symGaussSeidelSmoother.C sweeps up
     // then back down; GaussSeidelSmoother.C sweeps up ONLY. Different smoothers, one value for the pair.
     bool gsKESym = true;
@@ -1771,8 +1773,17 @@ int runSimpleFoamV2(const std::string& caseDir)
             const std::string firstFld  = saModel ? "nuTilda" : "k";
             const std::string secondFld = sstModel ? "omega" : "epsilon";
             gsKESym = (sk->wordOr("smoother", "") != "GaussSeidel");
-            diluKE = sk->wordOr("preconditioner", "") == "DILU";
-            if (const char* e = std::getenv("BRAE_DILU")) diluKE = std::atoi(e) != 0;
+            // THE SHARED RULE (solvers/common/linear_solver_setup.cuh, turbPreconFor). This driver used
+            // to decide here: `preconditioner == "DILU"`, hatched on BRAE_DILU rather than the
+            // BRAE_DILU_KE every other driver reads, and with no notion of the Neumann series -- so a V2
+            // case naming GAMG on the pair kept the bare diagonal that item 78 removed everywhere else,
+            // and the two copies of the policy had already drifted apart in three ways. One function,
+            // two callers.
+            {
+                const TurbPreconChoice ch = turbPreconFor(solvers, fvSolution, firstFld, gsKE);
+                diluKE = ch.dilu;
+                polyDegKE = ch.polyDeg;
+            }
             nSweepsKE = static_cast<int>(sk->scalarOr("nSweeps", 1));
             if (nSweepsKE < 0)
                 throw std::runtime_error(
@@ -1808,7 +1819,12 @@ int runSimpleFoamV2(const std::string& caseDir)
                     tolKE, relTolKE,
                     gsKE ? (gsKESym ? "smoothSolver + symGaussSeidel (OpenFOAM's own sweep, level-scheduled)"
                                     : "smoothSolver + GaussSeidel (ascending only, OpenFOAM's own sweep)")
-                         : (diluKE ? "DILUPBiCGStab" : "diagonalPBiCGStab"));
+                         : (diluKE ? "DILUPBiCGStab"
+                                   : polyDegKE > 1
+                                        ? ("PBiCGStab preconditioned with a degree-"
+                                           + std::to_string(polyDegKE)
+                                           + " truncated Neumann series (the case names none)").c_str()
+                                        : "diagonalPBiCGStab"));
         }
         if (const FoamDict* su = solvers->subDict("U"))
         {
@@ -2119,6 +2135,7 @@ int runSimpleFoamV2(const std::string& caseDir)
     // turbPrecon() is process-wide and the legacy driver sets it too, so write it EITHER WAY: what this
     // run means, not what some earlier construction left behind.
     turbPrecon() = (diluKE && dilu.valid) ? &dilu : nullptr;
+    turbPolyDeg() = (diluKE && dilu.valid) ? 1 : polyDegKE;     // same reason: write it either way
 
     // ---- the SIMPLE loop ---------------------------------------------------------------------
     SolverWorkspace ws;

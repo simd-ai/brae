@@ -39,6 +39,11 @@ inline std::vector<ScalarSolveEntry>& turbStore() { static std::vector<ScalarSol
 //
 // The solver sets it once at construction and it stays put; nothing else writes it.
 inline const DeviceDilu*& turbPrecon() { static const DeviceDilu* p = nullptr; return p; }
+// ...and the Neumann series' degree when there is no factorisation to carry, set by the same driver at
+// the same point (device_pcg.cuh has what it is and why). 1 is plain Jacobi, so an unset driver is
+// unchanged. Process-wide for the same reason turbPrecon is: this scaffold is called from closures that
+// do not carry the solver controls.
+inline int& turbPolyDeg() { static int d = 1; return d; }
 
 namespace {
 // setValues (eps wall constraint): zero wall-cell off-diagonals + move the known eps0 to the neighbour RHS.
@@ -539,7 +544,8 @@ void deviceSolveScalarTransport(
     {
         const DeviceDilu* pc = precon ? precon : turbPrecon();
         perf = deviceJacobiBiCGStab(sv, B, field, dnf.data(), tol, relTolKE, 3000, keCheckEvery, 0,
-                                    (pc && pc->valid) ? pc : nullptr);
+                                    (pc && pc->valid) ? pc : nullptr, /*amg=*/nullptr,
+                                    (pc && pc->valid) ? 1 : turbPolyDeg());
     }
     turbStore().push_back({fieldName, perf});                    // record for the "Solving for <field>" line
     if (boundPositive) deviceBoundField(dm, field, 1e-15);        // OF bound(field): neg -> local avg, not floor

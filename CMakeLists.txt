@@ -1247,6 +1247,9 @@ add_test(NAME u_colour_gs_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/u_colour_gs_vs_openfoam.sh)
 set_tests_properties(u_colour_gs_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
+add_test(NAME precon_policy_one_rule
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/precon_policy_one_rule.sh)
+set_tests_properties(precon_policy_one_rule PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 add_test(NAME sa_precon_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_precon_vs_openfoam.sh)
 set_tests_properties(sa_precon_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)

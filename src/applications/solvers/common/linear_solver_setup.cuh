@@ -111,6 +111,61 @@ struct SolverRunsAs
 // at a comparable iterate, for 6 more SpMVs).
 constexpr int POLY_DEG_KE_DEFAULT = 10;
 
+// THE ONE RULE for what preconditions a substituted PBiCGStab on a transported turbulence scalar, as a
+// free function because there are TWO callers and they used to decide separately: readLinearSolverControls
+// below, and the V2 simpleFoam driver, whose copy read `preconditioner` itself, keyed its escape hatch on
+// BRAE_DILU rather than BRAE_DILU_KE, and had no Neumann series at all -- so a V2 case naming GAMG on the
+// pair still got the bare diagonal that item 78 removed everywhere else. Sharing the decision is the point;
+// a second copy is how the two drift.
+//
+//   the case NAMES a preconditioner   -> honour it (DILU, or the diagonal it asked for)
+//   it names none, and the field is relaxed by alpha < 1
+//                                     -> the degree-10 Neumann series, whose convergence ratio
+//                                        fvMatrix::relax then bounds by alpha (see turbRelaxBound)
+//   it names none and there is no such bound
+//                                     -> DILU, which needs none
+//   the field runs as a smoothSolver  -> neither; there is no preconditioner in that path
+struct TurbPreconChoice
+{
+    bool dilu = false;
+    int  polyDeg = 1;                                  // 1 == plain Jacobi (the series' first term)
+};
+inline TurbPreconChoice turbPreconFor(const FoamDict* solvers,
+                                      const FoamDict& fvSolution,
+                                      const std::string& field,
+                                      bool gs)
+{
+    TurbPreconChoice c;
+    if (gs) return c;                                  // a smoothSolver carries no preconditioner
+    const FoamDict* sd = solvers ? solvers->subDict(field) : nullptr;
+    const std::string prec = sd ? sd->wordOr("preconditioner", "") : std::string();
+    if (prec == "DILU") c.dilu = true;
+    if (const char* e = std::getenv("BRAE_DILU_KE")) c.dilu = (std::atoi(e) != 0);
+    if (c.dilu) return c;
+    if (!prec.empty()) return c;                       // a named non-DILU preconditioner is the case's own
+    // The blank a substitution leaves. fvMatrix::relax forces D >= sum|offdiag| and THEN divides by the
+    // factor (fvMatrix.C:105-113), so a relaxed equation has sum|offdiag|/|a_ii| <= alpha and the series'
+    // ratio is bounded by alpha, mesh-independently. Take the LARGEST factor that will be applied: a
+    // `".*Final" 1.0` corrector has no bound even where the ordinary factor does.
+    const FoamDict* rf = fvSolution.subDict("relaxationFactors");
+    const FoamDict* eqs = rf ? rf->subDict("equations") : nullptr;
+    const FoamDict* src = eqs ? eqs : rf;
+    scalar alpha = 1.0;
+    if (src)
+    {
+        const scalar a0 = src->scalarOr(field, scalar(1));
+        alpha = std::fmax(a0, src->found(field + "Final") ? src->scalarOr(field + "Final", a0) : a0);
+    }
+    if (alpha < scalar(1)) c.polyDeg = POLY_DEG_KE_DEFAULT;
+    else                   c.dilu = true;              // no bound -> the factorisation, which needs none
+    if (const char* e = std::getenv("BRAE_POLY_KE"))
+    {
+        c.polyDeg = std::max(1, std::atoi(e));
+        if (c.polyDeg > 1) c.dilu = false;
+    }
+    return c;
+}
+
 inline void readLinearSolverControls(
     const FoamDict& fvSolution,
     const std::string& secondName,
@@ -218,20 +273,25 @@ inline void readLinearSolverControls(
         const FoamDict* sd = solvers ? solvers->subDict(f) : nullptr;
         return !sd || sd->wordOr("preconditioner", "").empty();
     };
+    // The notices name what RUNS, by asking turbPreconFor -- the same function the policy below assigns
+    // from. A notice that said `diagonal` over a Neumann-preconditioned solve, or stayed silent over a
+    // DILU the caller never applied, is the defect this pair of readings exists to prevent.
     auto krylovPreconGs = [&](const std::string& f, bool gs) -> std::string
     {
-        if (diluHere(f)) return "DILU";
-        const int deg = polyHere(f, gs);
-        if (deg > 1)
+        if (gs) return std::string("diagonal");            // unused: a smoothSolver has no preconditioner
+        const FoamDict* sd = solvers ? solvers->subDict(f) : nullptr;
+        const bool named = sd && !sd->wordOr("preconditioner", "").empty();
+        const TurbPreconChoice c = turbPreconFor(solvers, fvSolution, f, gs);
+        if (c.polyDeg > 1)
         {
-            return "a degree-" + std::to_string(deg) + " truncated Neumann series (the case names none)";
+            return "a degree-" + std::to_string(c.polyDeg) + " truncated Neumann series (the case names none)";
         }
-        if (blankHere(f, gs))
+        if (c.dilu && !named)
         {
             return "DILU (the case names none, and relaxes " + f + " by 1 or not at all, which leaves the "
                    "cheaper polynomial preconditioner without a convergence bound)";
         }
-        return std::string("diagonal");
+        return c.dilu ? std::string("DILU") : std::string("diagonal");
     };
     auto krylovPrecon = [&](const std::string& f) -> std::string
     {
@@ -457,13 +517,11 @@ inline void readLinearSolverControls(
             // doing it. A capability the shared reader reports and this branch never applied -- the same
             // shape as item 58. Measured on validation/airFoil2D with its nuTilda entry rewritten to
             // PBiCGStab/DILU: brae printed `Jacobi-BiCGStab: Solving for nuTilda`.
-            ctl.diluKE = diluHere("nuTilda") && !ctl.gsK;
-            ctl.polyDegKE = ctl.diluKE ? 1 : polyHere("nuTilda", ctl.gsK);
-            // ...and the same blank rule the pair takes: a solver that carries no preconditioner gets the
-            // Neumann series where fvMatrix::relax bounds it, DILU where it does not.
-            if (!ctl.diluKE && ctl.polyDegKE == 1 && blankHere("nuTilda", ctl.gsK)) ctl.diluKE = true;
-            if (const char* e = std::getenv("BRAE_DILU_KE")) ctl.diluKE = (std::atoi(e) != 0) && !ctl.gsK;
-            if (const char* e = std::getenv("BRAE_POLY_KE")) ctl.polyDegKE = std::max(1, std::atoi(e));
+            {
+                const TurbPreconChoice ch = turbPreconFor(solvers, fvSolution, "nuTilda", ctl.gsK);
+                ctl.diluKE = ch.dilu;
+                ctl.polyDegKE = ch.polyDeg;
+            }
         }
         else
         {
@@ -520,41 +578,13 @@ inline void readLinearSolverControls(
                 const FoamDict* ss = solvers ? solvers->subDict(secondName) : nullptr;
                 // diluHere is the ONE rule (it is what the notices printed above consulted). gsK/gsEps
                 // subtract the fields running as smoothSolvers, which have no preconditioner to carry.
-                const bool kDilu = diluHere("k");
-                const bool sDilu = diluHere(secondName);
-                ctl.diluKE = (kDilu && !ctl.gsK) || (sDilu && !ctl.gsEps);
-                // THE BLANK A SUBSTITUTION LEAVES (item 78). OpenFOAM's PBiCGStab and PCG both require a
-                // `preconditioner` entry (lduMatrix::preconditioner::New throws without one), so a field
-                // whose entry names none is one whose solver is not a P-solver at all -- GAMG, or a
-                // smoothSolver brae is not running as one -- and brae is substituting its BiCGStab for
-                // it. Filling that blank with `diagonal` picks OpenFOAM's WEAKEST preconditioner where
-                // the case asked for its strongest solver, and it does not merely converge slower: the
-                // iterate it stops at under the case's relTol systematically undershoots, and that
-                // compounds over the outer iterations into epsilon at the bound floor and nut = Cmu
-                // k^2/epsilon exploding (measured to 8.6e+15 on squareBend at 307k, and OpenFOAM does
-                // the same thing with the same preconditioner -- this is a bad CHOICE, not a defect).
-                //
-                // It is filled with the TRUNCATED NEUMANN SERIES rather than with DILU. Both fix it;
-                // DILU costs a kernel launch per dependency level (376 at 307k), the series costs
-                // deg-1 SpMVs and nothing else. Measured on the epsilon system brae solves
-                // (bench/rhoSimpleFoam/eps_precond_experiment.py, the iterate at OpenFOAM's own
-                // stopping rule, outer iteration 6 of 112k): Jacobi leaves min(epsilon) 73.9, a
-                // multicolour DILU 117.3, this at degree 10 leaves 180.5, and natural-order DILU 182.6.
-                // A case that NAMES its preconditioner keeps it, `diagonal` included: this fills a
-                // blank, it does not override a choice.
-                // polyHere and blankHere are the ONE rule, and they are the ones the notices above
-                // printed: a notice that said `diagonal` over a Neumann-preconditioned solve is exactly
-                // the defect this project keeps finding, so the two read the same functions.
-                ctl.polyDegKE = ctl.diluKE ? 1 : std::max(polyHere("k", ctl.gsK), polyHere(secondName, ctl.gsEps));
-                // ...and a blank the series cannot fill (an unrelaxed pair, see turbRelaxBound) falls to
-                // DILU rather than to the bare diagonal, which is the choice that fails.
-                if (!ctl.diluKE && ctl.polyDegKE == 1
-                    && (blankHere("k", ctl.gsK) || blankHere(secondName, ctl.gsEps)))
-                {
-                    ctl.diluKE = true;
-                }
-                if (const char* e = std::getenv("BRAE_DILU_KE"))   // attribution escape hatch
-                    ctl.diluKE = (std::atoi(e) != 0) && !(ctl.gsK && ctl.gsEps);
+                const TurbPreconChoice kc = turbPreconFor(solvers, fvSolution, "k", ctl.gsK);
+                const TurbPreconChoice sc = turbPreconFor(solvers, fvSolution, secondName, ctl.gsEps);
+                // The pair is solved through ONE model call and carries one preconditioner, so the two
+                // fields' answers are merged: DILU if either asks for it (it is the stronger operator),
+                // and otherwise the larger degree.
+                ctl.diluKE = kc.dilu || sc.dilu;
+                ctl.polyDegKE = ctl.diluKE ? 1 : std::max(kc.polyDeg, sc.polyDeg);
             }
         }
     }
