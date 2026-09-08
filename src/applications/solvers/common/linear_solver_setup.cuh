@@ -104,30 +104,40 @@ struct SolverRunsAs
     std::string fixedSweepsField;
 };
 
-// The degree the substituted PBiCGStab's Neumann series runs at on the transported turbulence scalars.
+// THE DEGREE IS DERIVED, not chosen. fvMatrix::relax bounds the series' convergence ratio by the
+// relaxation factor (see turbPreconFor), so a degree-d truncation leaves at most alpha^d of the error:
 //
-// 10 IS A MARGIN, NOT AN OPTIMUM, and the difference matters. Swept end to end on squareBend, cells at
-// the bound floor at outer iteration 8:
+//     d = ceil( ln(POLY_TAU) / ln(alpha) )
 //
-//     degree     112k        307k        896k
-//        2    FAIL 287    FAIL 133    FAIL 908
-//        3      ok          ok          ok
-//        4      ok          ok        FAIL 2351
-//        6      ok          ok          ok
-//       10      ok          ok          ok
+// POLY_TAU is what the preconditioner alone is asked to remove -- 0.1, a tenfold reduction, the same
+// order as the relTol a SIMPLE step asks of the whole solve. At alpha 0.9 that is degree 22; at 0.8, 11;
+// at 0.7, 7; at 0.5, 4.
 //
-// The failure is NON-MONOTONE in the degree, and reproducibly so: degree 4 fails at 896k twice with
-// identical numbers while degree 3 -- weaker -- is clean at all three. There is no knee to trim to. A
-// stronger preconditioner stops the BiCGStab at a different iterate, and on this transient a slightly
-// different iterate at outer iteration 2 is enough to put the run on a path where epsilon collapses; the
-// same chaotic sensitivity the bare diagonal shows across sizes. So the defence is distance from any
-// degree observed to fail, not proximity to the cheapest one that works.
+// THIS IS WHAT THE MEASURED FAILURES SAY, once alpha^d is the variable rather than d. Swept end to end
+// on squareBend, cells at the bound floor at outer iteration 8, all at alpha = 0.9:
 //
-// It is not bought at much: measured at 307k, the turbulence block reads 11.5 ms per outer iteration at
-// degree 4, 11.3 at 6, 13.4 at 10 and 12.6 with the plain diagonal -- every degree in that range is at
-// or below the diagonal's cost, because a stronger preconditioner saves more BiCGStab iterations than
-// its extra SpMVs cost. Trimming 10 to 6 would buy 2 ms/it and sit one degree above a value that fails.
-constexpr int POLY_DEG_KE_DEFAULT = 10;
+//     degree   alpha^d      112k        307k        896k
+//        2      0.81     FAIL 287    FAIL 133    FAIL 908
+//        3      0.729      ok*         ok          ok        (*epsilon min 89.6 against 173 higher up)
+//        4      0.656      ok          ok        FAIL 2351
+//        6      0.531      ok          ok          ok
+//       10      0.349      ok          ok          ok
+//       22      0.098      ok          ok          ok
+//
+// The apparent non-monotonicity -- degree 4 failing where the WEAKER degree 3 does not, reproducibly --
+// is chaos on top of a preconditioner that barely preconditions: at alpha 0.9 degree 4 removes 34% of
+// the error. Everything that failed sits above alpha^d = 0.65; everything comfortable sits below 0.35.
+// A hardcoded 10 was a margin picked off that table and could not say why 4 was worse than 3; the
+// truncation target can, and it moves with the case's own relaxation instead of being fixed to one.
+//
+// Cost, turbulence block at 307k, ms per outer iteration: diagonal 12.2 (and broken), degree 10 13.5,
+// degree 22 15.2, degree 45 22.8, DILU 33.6. The derived degree costs 1.7 ms/it more than the magic
+// number and 18.4 less than the factorisation.
+constexpr scalar POLY_TAU = 0.1;
+// ...and the cap. Above it the series is asked for more terms than have been validated (22 and 24 are
+// the largest measured clean at 112k, 307k and 896k), and the honest answer there is the operator that
+// needs no tuning at all: DILU. alpha 0.91 derives 24; 0.92 derives 27 and falls back.
+constexpr int POLY_DEG_KE_MAX = 24;
 
 // THE ONE RULE for what preconditions a substituted PBiCGStab on a transported turbulence scalar, as a
 // free function because there are TWO callers and they used to decide separately: readLinearSolverControls
@@ -139,7 +149,7 @@ constexpr int POLY_DEG_KE_DEFAULT = 10;
 //   the case NAMES a preconditioner   -> honour it (DILU, or the diagonal it asked for)
 //   it names none, and the field is relaxed by alpha < 1
 //                                     -> the degree-10 Neumann series, whose convergence ratio
-//                                        fvMatrix::relax then bounds by alpha (see turbRelaxBound)
+//                                        fvMatrix::relax then bounds by alpha (see turbPreconFor)
 //   it names none and there is no such bound
 //                                     -> DILU, which needs none
 //   the field runs as a smoothSolver  -> neither; there is no preconditioner in that path
@@ -174,7 +184,12 @@ inline TurbPreconChoice turbPreconFor(const FoamDict* solvers,
         const scalar a0 = src->scalarOr(field, scalar(1));
         alpha = std::fmax(a0, src->found(field + "Final") ? src->scalarOr(field + "Final", a0) : a0);
     }
-    if (alpha < scalar(1)) c.polyDeg = POLY_DEG_KE_DEFAULT;
+    if (alpha < scalar(1))
+    {
+        const int d = static_cast<int>(std::ceil(std::log(POLY_TAU) / std::log(static_cast<double>(alpha))));
+        if (d <= POLY_DEG_KE_MAX) c.polyDeg = std::max(2, d);
+        else                      c.dilu = true;       // more terms than are validated -> the factorisation
+    }
     else                   c.dilu = true;              // no bound -> the factorisation, which needs none
     if (const char* e = std::getenv("BRAE_POLY_KE"))
     {
@@ -240,57 +255,6 @@ inline void readLinearSolverControls(
     // is filled by a truncated Neumann series rather than by the bare diagonal (see the block that sets
     // ctl.polyDegKE). The notices below have to name what RUNS, so they ask the same question here
     // rather than printing "diagonal" over a solve that is not one.
-    // THE BOUND THE SERIES STANDS ON. fvMatrix::relax does two things in this order (fvMatrix.C:105-113):
-    // it forces D[c] = max(|D[c]|, sum|offdiag|), and THEN divides D by the relaxation factor. So on a
-    // relaxed equation sum|offdiag|/|a_ii| <= alpha for every row, which bounds the series' convergence
-    // ratio by the RELAXATION FACTOR and not by the mesh. Measured on squareBend, the row bound
-    // max(sum|offdiag|/|a_ii|) of the epsilon system brae solves:
-    //     24k   112k   307k   896k   1.75M   3.02M     alpha
-    //   0.9000 0.9000 0.9000 0.9000  0.9000  0.9000     0.9    -- and rho(I - D^-1 A) 0.86 to 0.89
-    // flat across two orders of magnitude in cell count, because it is alpha that pins it.
-    //
-    // With NO factor, or with a factor of 1 (fvMatrix::relax early-returns only on alpha <= 0, so
-    // relax(1.0) still clamps but divides by nothing), the clamp alone gives a bound of exactly 1 and
-    // the series has nothing to stand on: measured 0.9986 at 112k -- 0.9986^10 = 0.986, so degree 10
-    // does nothing at all -- and 1.0010 at 3.02M, where it amplifies instead of preconditioning. A
-    // truncated series is a polynomial in A, so it stays a bounded fixed linear operator either way and
-    // cannot produce Inf; it just stops being a preconditioner, silently, which is the substitution this
-    // project refuses. So an unrelaxed pair takes DILU instead, and the notice says which.
-    //
-    // The lookup mirrors readRelaxationFactors' own (`eqs ? eqs : rf`, OF's modern-then-legacy fallback),
-    // and takes the LARGEST factor that will be applied -- a `".*Final" 1.0` corrector has no bound even
-    // when the ordinary factor does.
-    auto turbRelaxBound = [&](const std::string& f) -> scalar
-    {
-        const FoamDict* rf = fvSolution.subDict("relaxationFactors");
-        const FoamDict* eqs = rf ? rf->subDict("equations") : nullptr;
-        const FoamDict* src = eqs ? eqs : rf;
-        if (!src) return scalar(1);
-        const scalar a0 = src->scalarOr(f, scalar(1));
-        const scalar a1 = src->subDict(f + "Final") || src->found(f + "Final")
-                        ? src->scalarOr(f + "Final", a0) : a0;
-        return std::fmax(a0, a1);
-    };
-    auto polyHere = [&](const std::string& f, bool gs) -> int
-    {
-        if (gs || diluHere(f)) return 1;
-        if (!(turbRelaxBound(f) < scalar(1))) return 1;    // no bound -> no series (see above)
-        if (!(f == "k" || f == secondName || f == "nuTilda")) return 1;
-        const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
-        int deg = (!s || s->wordOr("preconditioner", "").empty()) ? POLY_DEG_KE_DEFAULT : 1;
-        if (const char* e = std::getenv("BRAE_POLY_KE")) deg = std::max(1, std::atoi(e));
-        return deg;
-    };
-    // Is this field's blank `preconditioner` one brae has to fill? OpenFOAM's PBiCGStab and PCG both
-    // require the entry (lduMatrix::preconditioner::New throws without one), so a field whose entry names
-    // none is one whose solver is not a P-solver at all -- and that is exactly when brae is substituting.
-    auto blankHere = [&](const std::string& f, bool gs) -> bool
-    {
-        if (gs || diluHere(f)) return false;
-        if (!(f == "k" || f == secondName || f == "nuTilda")) return false;
-        const FoamDict* sd = solvers ? solvers->subDict(f) : nullptr;
-        return !sd || sd->wordOr("preconditioner", "").empty();
-    };
     // The notices name what RUNS, by asking turbPreconFor -- the same function the policy below assigns
     // from. A notice that said `diagonal` over a Neumann-preconditioned solve, or stayed silent over a
     // DILU the caller never applied, is the defect this pair of readings exists to prevent.
@@ -594,8 +558,6 @@ inline void readLinearSolverControls(
             {
                 const FoamDict* sk = solvers ? solvers->subDict("k") : nullptr;
                 const FoamDict* ss = solvers ? solvers->subDict(secondName) : nullptr;
-                // diluHere is the ONE rule (it is what the notices printed above consulted). gsK/gsEps
-                // subtract the fields running as smoothSolvers, which have no preconditioner to carry.
                 const TurbPreconChoice kc = turbPreconFor(solvers, fvSolution, "k", ctl.gsK);
                 const TurbPreconChoice sc = turbPreconFor(solvers, fvSolution, secondName, ctl.gsEps);
                 // The pair is solved through ONE model call and carries one preconditioner, so the two

@@ -8,10 +8,11 @@
 # nut = Cmu k^2/epsilon explodes. Reported k residuals then collapse to ~1e-14 and climb 10x per
 # iteration, because normFactor is inflated by the same runaway cells.
 #
-# The blank is now filled by a degree-10 TRUNCATED NEUMANN SERIES, not by DILU: both fix it, and the
-# series costs 9 SpMVs against DILU's launch-per-dependency-level walk (measured on squareBend at 307k,
-# turbulence block: diagonal 12.2 ms/it, this 13.4, DILU 33.5). BRAE_POLY_KE=1 restores the bare
-# diagonal and is this gate's fail-proof; BRAE_DILU_KE=1 selects DILU.
+# The blank is now filled by a TRUNCATED NEUMANN SERIES, not by DILU: both fix it, and the series costs
+# d-1 SpMVs against DILU's launch-per-dependency-level walk (measured on squareBend at 307k, turbulence
+# block: diagonal 12.2 ms/it, the series 15.2, DILU 33.6). The degree is DERIVED from the case's own
+# relaxation factor, d = ceil(ln(0.1)/ln(alpha)) -- this fixture relaxes k and epsilon by 0.9, so 22.
+# BRAE_POLY_KE=1 restores the bare diagonal and is this gate's fail-proof; BRAE_DILU_KE=1 selects DILU.
 #
 # The gate is against REAL OpenFOAM on the same case at the same iteration, because "epsilon looks small"
 # is not a criterion -- what epsilon should be at outer iteration 12 is a number only OpenFOAM has.
@@ -144,10 +145,13 @@ printf '        (nut cells <= 1e-14: series %s, diagonal %s, OpenFOAM %s)\n' "$B
 # ---- arm 4: the notice says what it runs ----------------------------------------------------------
 # The notice has to name what RUNS. Printing `diagonal` over a Neumann-preconditioned solve would be
 # the shared-capability-notice-lies defect, so the notice and the policy read the same function.
-grep -q "solvers/k solver: case asks 'GAMG', brae runs PBiCGStab preconditioned with a degree-10 truncated Neumann series" "$W/dilu/log" \
-    && grep -q "solvers/epsilon solver: case asks 'GAMG', brae runs PBiCGStab preconditioned with a degree-10 truncated Neumann series" "$W/dilu/log" \
-    && say "the notice names the Neumann series for both k and epsilon" ok \
-    || { grep -m2 "solvers/k solver\|solvers/epsilon solver" "$W/dilu/log"; say "the notice names the Neumann series for both k and epsilon" FAIL; }
+# The DERIVED degree, not a constant: the fixture relaxes the pair by 0.9, so ceil(ln(0.1)/ln(0.9)) = 22.
+# Pinning the number is the point -- it is what makes this an assertion about the rule rather than about
+# whatever the code happens to do.
+grep -q "solvers/k solver: case asks 'GAMG', brae runs PBiCGStab preconditioned with a degree-22 truncated Neumann series" "$W/dilu/log" \
+    && grep -q "solvers/epsilon solver: case asks 'GAMG', brae runs PBiCGStab preconditioned with a degree-22 truncated Neumann series" "$W/dilu/log" \
+    && say "the notice names the degree-22 series (derived from the fixture's alpha 0.9)" ok \
+    || { grep -m2 "solvers/k solver\|solvers/epsilon solver" "$W/dilu/log"; say "the notice names the degree-22 series (derived from the fixture's alpha 0.9)" FAIL; }
 
 # ---- arm 5: an UNRELAXED pair falls to DILU, not to the bare diagonal -----------------------------
 # The series' convergence ratio is bounded by the RELAXATION FACTOR, because fvMatrix::relax clamps
@@ -169,7 +173,7 @@ grep -q "solvers/k solver: case asks 'GAMG', brae runs PBiCGStab preconditioned 
     && say "an unrelaxed pair takes DILU, and the notice says why" ok \
     || { grep -m1 "solvers/k solver" "$W/norelax/log"; say "an unrelaxed pair takes DILU, and the notice says why" FAIL; }
 # ...and the RELAXED fixture must not, or the arm above proves nothing about relaxation
-grep -q "preconditioned with a degree-10 truncated Neumann series" "$W/dilu/log" \
+grep -q "preconditioned with a degree-22 truncated Neumann series" "$W/dilu/log" \
     && say "...and the relaxed fixture keeps the series (control)" ok \
     || say "...and the relaxed fixture keeps the series (control)" FAIL
 

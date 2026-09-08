@@ -127,9 +127,12 @@ stage "$W/gamg" '        solver          GAMG;
         tolerance       1e-08;
         relTol          0.1;'
 ( cd "$W/gamg" && "$BRAE" -case "$W/gamg" > run.log 2>&1 ) || true
-grep -q "^Neumann10-BiCGStab:  Solving for nuTilda" "$W/gamg/run.log" \
-    && say "a GAMG entry on nuTilda takes the degree-10 Neumann series" ok \
-    || { grep -m1 "Solving for nuTilda" "$W/gamg/run.log"; say "a GAMG entry on nuTilda takes the degree-10 Neumann series" FAIL; }
+# The degree is DERIVED from the case's own relaxation, d = ceil(ln(0.1)/ln(alpha)); airFoil2D relaxes
+# nuTilda by 0.7, so 7 -- a different number from the 22 the alpha-0.9 fixtures derive, which is the
+# point: pinning it here asserts the rule rather than a constant.
+grep -q "^Neumann7-BiCGStab:  Solving for nuTilda" "$W/gamg/run.log" \
+    && say "a GAMG entry on nuTilda takes the degree-7 series (derived from alpha 0.7)" ok \
+    || { grep -m1 "Solving for nuTilda" "$W/gamg/run.log"; say "a GAMG entry on nuTilda takes the degree-7 series (derived from alpha 0.7)" FAIL; }
 
 [ "$fail" = 0 ] && echo "== PASSED ==" || echo "== FAILED =="
 exit "$fail"
