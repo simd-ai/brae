@@ -696,9 +696,30 @@ int main(int argc, char** argv)
                 std::printf("AMG-PCG:  Solving for p, Initial residual = %g, Final residual = %g, No Iterations %d\n"
                             "time step continuity errors : sum local = %g, global = %g, cumulative = %g\n",
                             r.p, r.pFinal, r.pIters, cl, cg, _cumCont);
-                const char* kSolv = ctl.gsK ? (ctl.gsKESym ? "smoothSolver[symGaussSeidel]"
-                                                           : "smoothSolver[GaussSeidel]")
-                                            : "Jacobi-BiCGStab";
+                // The PRECONDITIONER is part of the name here, for the reason the smoother variant is:
+                // "Jacobi-BiCGStab" over a DILU- or Neumann-preconditioned solve asserts a capability
+                // the solve does not have, and this line is what a reader compares against OpenFOAM's
+                // own `DILUPBiCGStab: Solving for ...`. ctl.diluKE / ctl.polyDegKE are the same fields
+                // the solve reads, so the label cannot drift from it.
+                char kSolvBuf[64];
+                const char* kSolv;
+                if (ctl.gsK)
+                {
+                    kSolv = ctl.gsKESym ? "smoothSolver[symGaussSeidel]" : "smoothSolver[GaussSeidel]";
+                }
+                else if (ctl.diluKE)
+                {
+                    kSolv = "DILUPBiCGStab";
+                }
+                else if (ctl.polyDegKE > 1)
+                {
+                    std::snprintf(kSolvBuf, sizeof(kSolvBuf), "Neumann%d-BiCGStab", ctl.polyDegKE);
+                    kSolv = kSolvBuf;
+                }
+                else
+                {
+                    kSolv = "Jacobi-BiCGStab";
+                }
                 for (const auto& e : turbulenceReport())   // Solving for omega/k/epsilon/... in solve order, like OF
                     std::printf("%s:  Solving for %s, Initial residual = %g, Final residual = %g, No Iterations %d\n",
                                 kSolv, e.field.c_str(), e.perf.initialResidual, e.perf.finalResidual,

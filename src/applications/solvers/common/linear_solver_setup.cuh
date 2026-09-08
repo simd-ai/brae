@@ -202,12 +202,7 @@ inline void readLinearSolverControls(
     {
         if (gs || diluHere(f)) return 1;
         if (!(turbRelaxBound(f) < scalar(1))) return 1;    // no bound -> no series (see above)
-        // k and the pair's second scalar only. nuTilda takes the same substitution and would very likely
-        // take the same answer, but the Spalart-Allmaras branch below never sets ctl.polyDegKE, and a
-        // helper that claimed a field the policy does not wire would make this notice say one thing
-        // while the solve did another -- which is the defect it exists to prevent. Measuring SA is its
-        // own unit.
-        if (!(f == "k" || f == secondName)) return 1;
+        if (!(f == "k" || f == secondName || f == "nuTilda")) return 1;
         const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
         int deg = (!s || s->wordOr("preconditioner", "").empty()) ? POLY_DEG_KE_DEFAULT : 1;
         if (const char* e = std::getenv("BRAE_POLY_KE")) deg = std::max(1, std::atoi(e));
@@ -219,7 +214,7 @@ inline void readLinearSolverControls(
     auto blankHere = [&](const std::string& f, bool gs) -> bool
     {
         if (gs || diluHere(f)) return false;
-        if (!(f == "k" || f == secondName)) return false;
+        if (!(f == "k" || f == secondName || f == "nuTilda")) return false;
         const FoamDict* sd = solvers ? solvers->subDict(f) : nullptr;
         return !sd || sd->wordOr("preconditioner", "").empty();
     };
@@ -450,7 +445,25 @@ inline void readLinearSolverControls(
             ctl.relTolKEFinal = solvers && solvers->subDict("nuTildaFinal") ? solverRelTol("nuTildaFinal") : ctl.relTolKE;
             ctl.gsK = useSymGS("nuTilda") && runsAs.smoothSolverOnTurbulence;
             ctl.gsEps = false;
-            noticeSolverChoice("nuTilda", "PBiCGStab", krylovPrecon("nuTilda"), ctl.gsK);
+            noticeSolverChoice("nuTilda", "PBiCGStab", krylovPreconGs("nuTilda", ctl.gsK), ctl.gsK);
+            // THIS BRANCH NEVER SET THE PRECONDITIONER. ctl.diluKE was assigned only in the k/epsilon
+            // branch below, so it stayed false here and a case naming `preconditioner DILU` on nuTilda --
+            // which 37 of the 43 SpalartAllmaras tutorials in OpenFOAM do (4 name smoothSolver, 2 PBiCG,
+            // none GAMG) -- had its entry read and then ignored, and the solve ran the DIAGONAL.
+            //
+            // It said nothing, and the reason it said nothing is the point: noticeSolverChoice compares
+            // the case's `preconditioner` against what diluHere() answers, diluHere() wires "nuTilda" and
+            // answered DILU, so prec == braePrecon and the notice stayed silent over a solve that was not
+            // doing it. A capability the shared reader reports and this branch never applied -- the same
+            // shape as item 58. Measured on validation/airFoil2D with its nuTilda entry rewritten to
+            // PBiCGStab/DILU: brae printed `Jacobi-BiCGStab: Solving for nuTilda`.
+            ctl.diluKE = diluHere("nuTilda") && !ctl.gsK;
+            ctl.polyDegKE = ctl.diluKE ? 1 : polyHere("nuTilda", ctl.gsK);
+            // ...and the same blank rule the pair takes: a solver that carries no preconditioner gets the
+            // Neumann series where fvMatrix::relax bounds it, DILU where it does not.
+            if (!ctl.diluKE && ctl.polyDegKE == 1 && blankHere("nuTilda", ctl.gsK)) ctl.diluKE = true;
+            if (const char* e = std::getenv("BRAE_DILU_KE")) ctl.diluKE = (std::atoi(e) != 0) && !ctl.gsK;
+            if (const char* e = std::getenv("BRAE_POLY_KE")) ctl.polyDegKE = std::max(1, std::atoi(e));
         }
         else
         {
