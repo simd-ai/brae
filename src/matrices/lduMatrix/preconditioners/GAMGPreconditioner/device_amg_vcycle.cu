@@ -14,8 +14,51 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 
 namespace brae {
+
+// The V-cycle options that are only valid for a SYMMETRIC operator. Each names itself and what to set
+// instead, and each throws on its own so a message never has to be read as a list. Called by vcycleAt on
+// every asymmetric entry with (useChebyshev(), amg.corrScaling, amg.saSmooth).
+void amgRefuseAsymmetric(
+    bool chebyshev,
+    bool corrScaling,
+    bool smoothedAggregation)
+{
+    if (chebyshev)
+    {
+        // chebyshevSmooth runs the polynomial over [lambdaMax/CHEB_EIGRATIO, CHEB_UPPER_SAFETY*lambdaMax]
+        // (device_amg_smoothers.cu:153-190), an interval estimated by a power iteration that converges to a
+        // dominant REAL eigenvalue. An asymmetric operator's spectrum is complex, so the interval does not
+        // cover it, and an under-covered Chebyshev polynomial AMPLIFIES the modes it misses.
+        throw std::runtime_error(
+            "brae AMG V-cycle: the Chebyshev smoother (BRAE_CHEBYSHEV) is not valid for an ASYMMETRIC "
+            "matrix -- its spectral interval comes from a power iteration that presumes a dominant real "
+            "eigenvalue, and an interval that under-covers the spectrum amplifies the modes it misses. "
+            "Unset BRAE_CHEBYSHEV (weighted Jacobi, the default) or use BRAE_AMG_GS / BRAE_AMG_TSGS, "
+            "which are asymmetric-safe.");
+    }
+    if (corrScaling)
+    {
+        // OpenFOAM makes the same refusal by construction: GAMGSolver.C:82 sets
+        // scaleCorrection_(matrix.symmetric()), so the scaled correction is off for an asymmetric matrix.
+        throw std::runtime_error(
+            "brae AMG V-cycle: coarse-correction scaling is not valid for an ASYMMETRIC matrix -- the "
+            "line search alpha = (r.c)/(c.Ac) rests on c.Ac being the A-norm of c, which needs a "
+            "symmetric A. OpenFOAM disables it the same way (GAMGSolver.C:82, "
+            "scaleCorrection_(matrix.symmetric())). Pass corrScaling = false.");
+    }
+    if (smoothedAggregation)
+    {
+        throw std::runtime_error(
+            "brae AMG V-cycle: smoothed aggregation (BRAE_AMG_SA) is not supported for an ASYMMETRIC "
+            "matrix -- its prolongator is smoothed with a SYMMETRIC proxy Laplacian built from the face "
+            "weights (device_amg.cu:442-467), and its restriction scatters atomically, so the result is "
+            "not reproducible (device_amg.cu:1036-1038). It is untested on an asymmetric operator. "
+            "Unset BRAE_AMG_SA (pairwise agglomeration with injection, the default).");
+    }
+}
 
 namespace {
 __global__
@@ -103,15 +146,25 @@ void vcycleAt(
     AMGData& amg,
     const DeviceLduView& Ag,
     const DeviceBuffer<scalar>& bg,
-    DeviceBuffer<scalar>& xg)
+    DeviceBuffer<scalar>& xg,
+    bool asymmetric)
 {
     const int n = Ag.nCells;
+    if (asymmetric) amgRefuseAsymmetric(useChebyshev(), amg.corrScaling, amg.saSmooth);
     zeroT<scalar><<<nBlocks(n),TPB>>>(n, xg.data());
     if (g == amg.nLevels())                                    // coarsest: approximate solve
     {
         // BRAE_NCOARSE_CG overrides the coarsest PCG iteration count.
         static const int ncoarseCG = [](){ const char* e = std::getenv("BRAE_NCOARSE_CG"); return (e && std::atoi(e) > 0) ? std::atoi(e) : NCOARSE_CG; }();
-        if (n <= SB_CG_MAX) deviceCoarsePCG(Ag, bg, xg, ncoarseCG);            // tiny coarsest: single-block Jacobi-PCG (cheap+accurate)
+        // The asymmetric coarsest solve iterates to COARSE_REL_TOL and this is only its CAP -- see the
+        // constant's note: a fixed count there breaks the outer Krylov method.
+        static const int ncoarseAsymCap = [](){ const char* e = std::getenv("BRAE_NCOARSE_CG"); return (e && std::atoi(e) > 0) ? std::atoi(e) : NCOARSE_ASYM_CAP; }();
+        // The coarsest solve is the ONE part of the V-cycle that a nonsymmetric operator invalidates:
+        // deviceCoarsePCG is a conjugate gradient, whose step length presumes p.Ap is an A-norm. Its
+        // asymmetric twin is a BiCGStab, which is what OpenFOAM builds for an asymmetric coarsest level
+        // (GAMGSolver.C:299-328). Every other branch below is weighted Jacobi and needs no distinction.
+        if (n <= SB_CG_MAX && asymmetric) deviceCoarseBiCGStab(Ag, bg, xg, ncoarseAsymCap);
+        else if (n <= SB_CG_MAX) deviceCoarsePCG(Ag, bg, xg, ncoarseCG);            // tiny coarsest: single-block Jacobi-PCG (cheap+accurate)
         else if (n <= SB_MAX) deviceCoarseJacobiSingleBlock(Ag, bg, xg, NCOARSE);   // larger: single-block many-sweep Jacobi
         else if (deviceCoarseFitsCluster(n) && n <= COARSE_FUSE_MAX) deviceCoarseJacobiFused(Ag, bg, xg, NCOARSE);
         else for (int s = 0; s < NCOARSE; ++s)
@@ -142,7 +195,7 @@ void vcycleAt(
     else                                          // fixed-order gather; writes rc, so no pre-zero needed
         restrictGatherT<scalar><<<nBlocks(nc),TPB>>>(
             nc, Lg.galCellStart.data(), Lg.galCellList.data(), amg.vR[g].data(), amg.vB[g+1].data());
-    vcycleAt(g+1, amg, amg.level[g].coarseView(), amg.vB[g+1], amg.vX[g+1]);   // recurse to the next coarser grid
+    vcycleAt(g+1, amg, amg.level[g].coarseView(), amg.vB[g+1], amg.vX[g+1], asymmetric);   // recurse to the next coarser grid
     if (amg.corrScaling)
     {
         // OF-GAMG-style scaled coarse correction: alpha = (r . A pc)/(A pc . A pc); xg += alpha*pc. The single
@@ -168,6 +221,19 @@ void vcycleAt(
         deviceAmul(Ag, xg, amg.vAx[g]);
         smoothT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
     }
+}
+
+// The SYMMETRIC entry point, unchanged for every existing caller (device_amg.cu and device_amg_pcg.cu
+// declare this 5-argument form themselves). It is a separate overload rather than a default argument on
+// the function above because those local declarations would otherwise make their calls ambiguous.
+void vcycleAt(
+    int g,
+    AMGData& amg,
+    const DeviceLduView& Ag,
+    const DeviceBuffer<scalar>& bg,
+    DeviceBuffer<scalar>& xg)
+{
+    vcycleAt(g, amg, Ag, bg, xg, false);
 }
 
 // Mixed-precision (FP32) V-cycle: a mirror of the default V-cycle (weighted-Jacobi + map restrict/prolong) with the
@@ -223,15 +289,21 @@ void vcycleAtF(
     const DeviceLduView& topoG,
     const LduF& Ag,
     const float* bg,
-    float* xg)
+    float* xg,
+    bool asymmetric)
 {
     const int n = Ag.nCells;
+    if (asymmetric) amgRefuseAsymmetric(useChebyshev(), amg.corrScaling, amg.saSmooth);
     zeroT<float><<<nBlocks(n),TPB>>>(n, xg);
     if (g == amg.nLevels())                                    // coarsest: cast to FP64, exact FP64 solve, cast back
     {
         cast_<float,scalar><<<nBlocks(n),TPB>>>(n, bg, amg.vB[g].data());
         static const int ncoarseCG = [](){ const char* e=std::getenv("BRAE_NCOARSE_CG"); return (e&&std::atoi(e)>0)?std::atoi(e):NCOARSE_CG; }();
-        if (n <= SB_CG_MAX) deviceCoarsePCG(topoG, amg.vB[g], amg.vX[g], ncoarseCG);
+        // The asymmetric coarsest solve iterates to COARSE_REL_TOL and this is only its CAP.
+        static const int ncoarseAsymCap = [](){ const char* e=std::getenv("BRAE_NCOARSE_CG"); return (e&&std::atoi(e)>0)?std::atoi(e):NCOARSE_ASYM_CAP; }();
+        // Same coarsest split as the FP64 V-cycle: CG is not a solve on a nonsymmetric operator.
+        if (n <= SB_CG_MAX && asymmetric) deviceCoarseBiCGStab(topoG, amg.vB[g], amg.vX[g], ncoarseAsymCap);
+        else if (n <= SB_CG_MAX) deviceCoarsePCG(topoG, amg.vB[g], amg.vX[g], ncoarseCG);
         else
         {
             zeroT<scalar><<<nBlocks(n),TPB>>>(n, amg.vX[g].data());
@@ -257,13 +329,26 @@ void vcycleAtF(
         nc, Lg.galCellStart.data(), Lg.galCellList.data(), amg.vRF[g].data(), amg.vBF[g+1].data());
     const DeviceLduView topoC = Lg.coarseView();
     const LduF Ac = lduF(topoC, amg.fDiag[g+1], amg.fUpper[g+1], amg.fLower[g+1]);
-    vcycleAtF(g+1, amg, topoC, Ac, amg.vBF[g+1].data(), amg.vXF[g+1].data());
+    vcycleAtF(g+1, amg, topoC, Ac, amg.vBF[g+1].data(), amg.vXF[g+1].data(), asymmetric);
     prolongT<float><<<nBlocks(n),TPB>>>(n, Lg.map.data(), amg.vXF[g+1].data(), xg);
     for (int s=0; s<NPOST; ++s)
     {
         amulF(Ag, xg, amg.vAxF[g].data());
         smoothT<float><<<nBlocks(n),TPB>>>(n, bg, amg.vAxF[g].data(), Ag.diag, xg);
     }
+}
+
+// The SYMMETRIC FP32 entry point, unchanged for its existing callers (same overload-not-default reason
+// as vcycleAt above).
+void vcycleAtF(
+    int g,
+    AMGData& amg,
+    const DeviceLduView& topoG,
+    const LduF& Ag,
+    const float* bg,
+    float* xg)
+{
+    vcycleAtF(g, amg, topoG, Ag, bg, xg, false);
 }
 
 // amgVCycleApply runs the FP32 V-cycle automatically -- the same mixed-precision path the single-GPU deviceAMGPCG

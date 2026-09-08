@@ -44,7 +44,20 @@ constexpr int CCL = 8;                   // cluster-fused coarse solve: blocks p
 constexpr int COARSE_FUSE_MAX = 4096;    // cluster-fused single-cluster cap (measured crossover ~6k)
 constexpr int SB_MAX = 2048;             // single-block coarsest Jacobi cap (2*SB_MAX doubles shared = 32KB)
 constexpr int SB_CG_MAX = 1024;          // single-block coarsest PCG cap ((5*nC+TPB) doubles shared <= 48KB at nC=1024)
+                                         // The asymmetric twin (coarseBiCGStabKernel) is held to the SAME 5*nC+32
+                                         // footprint -- sA overwrites rA and the Jacobi-preconditioned yA/zA are
+                                         // re-derived where used -- so this one cap covers both and neither needs
+                                         // the >48KB shared-memory opt-in (a non-stream runtime call, and the
+                                         // coarsest solve is reachable from a stream-captured V-cycle).
 constexpr int NCOARSE_CG = 16;           // coarsest PCG iterations (dispatch default; override with BRAE_NCOARSE_CG).
+// The ASYMMETRIC coarsest solve (coarseBiCGStabKernel) iterates to a relative residual instead of a
+// fixed count, because an unconverged coarsest level makes the V-cycle input-dependent and the outer
+// Krylov method breaks on it -- measured on validation/sbMatched (transonic p, tolerance 1e-12): a
+// fixed 16 gave outer iteration counts 187 / 1000 (the cap, unconverged) / 89 on three consecutive
+// outer iterations, converging the coarsest gives 50 / 50 / 43. COARSE_REL_TOL is what it converges
+// to; NCOARSE_ASYM_CAP is the iteration cap it will not exceed (BRAE_NCOARSE_CG overrides the cap).
+constexpr scalar COARSE_REL_TOL = 1e-12;
+constexpr int    NCOARSE_ASYM_CAP = 512;
 
 // Feature flags (env vars), documented here once. The two default-ON flags preserve accuracy and opt out with
 // =0; the rest are experimental smoother/coarsening levers, off unless set.

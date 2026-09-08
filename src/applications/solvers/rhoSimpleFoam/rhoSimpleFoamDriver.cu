@@ -403,6 +403,57 @@ int runMirrorCuda(const std::string& caseDir)
     const bool caseAsksDiluP = pEntry && pEntry->wordOr("preconditioner", "") == "DILU";
     const bool diluP = hin.transonic && caseAsksDiluP
                     && std::getenv("BRAE_DILU_P") && std::string(std::getenv("BRAE_DILU_P")) == "1";
+
+    // BRAE_P_SOLVER, the TRANSONIC pressure's preconditioner, read ONCE here. Every consumer below --
+    // the shared reader's notice (SolverRunsAs::pPrecon), this driver's own lines and the step input --
+    // takes this one decision, so none of them can name a preconditioner another one runs.
+    //   amg       (THE DEFAULT) the case's PBiCGStab preconditioned with brae's AMG V-cycle. OpenFOAM
+    //             registers GAMGPreconditioner in the ASYMMETRIC constructor table as well as the
+    //             symmetric one (GAMGPreconditioner.C:37-42), so `solver PBiCGStab; preconditioner
+    //             GAMG;` is a legal OpenFOAM setting on this matrix -- the like-for-like pair, not a
+    //             substituted solver class. Measured on the squareBend tutorial at 305,760 cells with
+    //             OpenFOAM's OWN PBiCGStab on the same transonic p: diagonal 380.8 solver iterations
+    //             mean and 278.1 ms per outer iteration, DILU 135.3 and 143.9, GAMG 3.8 (max 6) and
+    //             33.8. brae's diagonal arm on the same case ran 2234 BiCGStab iterations over 20 outer
+    //             iterations, 65.9 ms of a 69.5 ms pressure phase.
+    //   diagonal  the diagonal-preconditioned BiCGStab this driver ran before: the opt-out, and the
+    //             control arm of tests/p_amg_bicgstab_vs_openfoam.sh.
+    // BRAE_DILU_P=1 (item 77's opt-in) still selects the case's DILU and therefore turns the AMG off:
+    // a BiCGStab has one preconditioner. Said out loud at the wiring below.
+    const char* pSolverEnv = std::getenv("BRAE_P_SOLVER");
+    const std::string pSolverSel = pSolverEnv ? std::string(pSolverEnv) : std::string("amg");
+    if (pSolverSel != "amg" && pSolverSel != "diagonal")
+    {
+        throw std::runtime_error(
+            "brae rhoSimpleFoam (mirror): BRAE_P_SOLVER='" + pSolverSel + "' names no pressure "
+            "preconditioner this driver runs. Accepted values: `amg` (the case's PBiCGStab "
+            "preconditioned with brae's AMG V-cycle on the transonic pressure, the default) or "
+            "`diagonal` (the diagonal-preconditioned BiCGStab this driver ran before).");
+    }
+    // `diagonal` names the TRANSONIC branch's preconditioner, and there is no diagonal path on the
+    // subsonic one: that matrix is symmetric and the step runs the AMG-preconditioned CG whatever this
+    // says. Refused rather than accepted and ignored -- a gate arm that believed it had selected the
+    // diagonal here would compare one path against itself and call the result a control.
+    if (pSolverSel == "diagonal" && !hin.transonic)
+    {
+        throw std::runtime_error(
+            "brae rhoSimpleFoam (mirror): BRAE_P_SOLVER=diagonal selects the TRANSONIC pressure's "
+            "preconditioner and this case is not transonic (SIMPLE/transonic is not `yes`). The subsonic "
+            "pressure matrix is symmetric and this driver solves it with the AMG-preconditioned CG; "
+            "there is no diagonal path to select here.");
+    }
+    // Two EXPLICIT and contradicting requests. Unset, BRAE_P_SOLVER defaults to `amg` and BRAE_DILU_P=1
+    // simply wins (announced below); spelled out, both name a preconditioner and only one can run, so
+    // this refuses rather than picking one and leaving the other's env var looking honoured.
+    if (diluP && pSolverEnv && pSolverSel == "amg")
+    {
+        throw std::runtime_error(
+            "brae rhoSimpleFoam (mirror): BRAE_P_SOLVER=amg and BRAE_DILU_P=1 both name a preconditioner "
+            "for the transonic pressure's BiCGStab, which takes one. Unset BRAE_P_SOLVER to run the "
+            "case's DILU, or unset BRAE_DILU_P to run the AMG V-cycle.");
+    }
+    const bool pAmgPrecon = hin.transonic && pSolverSel == "amg" && !diluP;
+
     // The case's smoothSolver selection per field, read below and carried into the step and the
     // turbulence hook (item 58).
     bool gsU = false, gsUSym = true, gsHe = false, gsHeSym = true;
@@ -426,6 +477,19 @@ int runMirrorCuda(const std::string& caseDir)
     // Both run the case's tolerance, relTol, maxIter, minIter and nSweeps. The difference colourGS
     // makes is the ORDER of the sweep, which changes where a solve stopped short of convergence stops
     // -- announced below, per entry, and gated by tests/u_colour_gs_vs_openfoam.sh.
+    // On EVERY entry, including one naming a Krylov solver this driver has. Measured on the same case
+    // at 306k with the U entry pinned, momentum SOLVE ms per outer iteration, brae against OpenFOAM on
+    // 20 cores: PBiCGStab+DILU 60.7 against 14.6 (DILU's forward-backward walk is sequential -- 300
+    // levels on this mesh -- while 20 cores get 20 local factorisations for almost nothing and 5x fewer
+    // iterations), PBiCGStab+diagonal 25.4 against 29.0, and the colour sweep 10.6 to 11.0 on either.
+    // It is the fastest momentum solver this driver has on every entry OpenFOAM's asymmetric smoother
+    // and solver tables allow.
+    // WHAT IT COSTS, because it is not free: on such an entry brae ran the case's own algorithm and so
+    // reproduced OpenFOAM's ITERATE, not only its converged answer. rho_sbmatched_transient_vs_openfoam
+    // reads 4.8e-12 on U that way and 7.7e-10 with the sweep. That gate now runs BOTH: its arms 1 and
+    // cuda take BRAE_U_SOLVER=ofOrder and keep the tight bounds, which is what detects an assembly or
+    // boundary defect (its own items 26a, 26b and 27), and a third arm covers this default at bounds
+    // measured for it. BRAE_U_SOLVER=ofOrder is the opt-out for a case that needs the iterate.
     bool uColourGS = true;
     if (const char* e = std::getenv("BRAE_U_SOLVER"))
     {
@@ -442,9 +506,10 @@ int runMirrorCuda(const std::string& caseDir)
         {
             throw std::runtime_error(
                 "brae rhoSimpleFoam (mirror): BRAE_U_SOLVER='" + sel + "' names no momentum solver this "
-                "driver runs. Accepted values: `colourGS` (the default: a multicolour Gauss-Seidel "
-                "smoothSolver) or `ofOrder` (OpenFOAM's own index order where the case names a "
-                "GaussSeidel smoothSolver, the diagonal BiCGStab otherwise).");
+                "driver runs. Accepted values: `colourGS` (a multicolour Gauss-Seidel smoothSolver on "
+                "every entry, the default) or "
+                "`ofOrder` (OpenFOAM's own index order where the case names a GaussSeidel smoothSolver, "
+                "the case's own Krylov solver otherwise).");
         }
     }
 
@@ -488,11 +553,19 @@ int runMirrorCuda(const std::string& caseDir)
         }
         if (hin.transonic)
         {
-            // The notice must say what RUNS: the case's DILU when BRAE_DILU_P=1 opted in, the diagonal
-            // otherwise. One decision, read here and used at the wiring below, so the two cannot
-            // disagree (tests/transonic_p_dilu.sh holds both arms to their words).
+            // The notice must say what RUNS: brae's AMG V-cycle by default, the case's DILU when
+            // BRAE_DILU_P=1 opted in, the diagonal under BRAE_P_SOLVER=diagonal. ONE decision
+            // (pAmgPrecon / diluP above), read here and used at the wiring below, so the two cannot
+            // disagree (tests/transonic_p_dilu.sh and tests/p_amg_bicgstab_vs_openfoam.sh hold the arms
+            // to their words).
+            //
+            // `GAMG` is the name of what runs, in OpenFOAM's vocabulary: brae's V-cycle preconditioning
+            // a PBiCGStab is OF's `preconditioner GAMG`, not OF's `solver GAMG` (multigrid AS the
+            // solver, a different algorithm). That makes the shared reader SILENT on a case naming the
+            // pair -- and brae's V-cycle is not OpenFOAM's GAMG, so the driver prints the difference
+            // itself below rather than letting that silence stand.
             runsAs.pSolver = "PBiCGStab";
-            runsAs.pPrecon = diluP ? "DILU" : "diagonal";
+            runsAs.pPrecon = pAmgPrecon ? "GAMG" : diluP ? "DILU" : "diagonal";
         }
         readLinearSolverControls(fvSolution, secondName, lctl, "SIMPLE", hf.heName, runsAs);
         hin.tolU    = lctl.tolU;    hin.relTolU    = lctl.relTolU;    hin.maxIterU    = lctl.maxIterU;    hin.minIterU    = lctl.minIterU;
@@ -540,6 +613,14 @@ int runMirrorCuda(const std::string& caseDir)
         }
         else
         {
+            // A DILU-family smoother is STRONGER per sweep than Gauss-Seidel, and a case names one
+            // because plain Gauss-Seidel converges slowly on its mesh (high aspect ratio, strong
+            // anisotropy). The colour sweep will need more sweeps there and, under a maxIter cap, can
+            // stop short of the tolerance the entry asks for. Say so: OpenFOAM's asymmetric smoother
+            // table is GaussSeidel, symGaussSeidel, nonBlockingGaussSeidel, DILU and DILUGaussSeidel
+            // (their .C files' addasymMatrixConstructorToTable), so this is the only family brae
+            // substitutes a weaker smoother for.
+            const bool asksDiluSmoother = smoo.rfind("DILU", 0) == 0;
             std::string asked = want.empty() ? std::string("no solver") : "'" + want + "'";
             if (!smoo.empty())
             {
@@ -557,8 +638,13 @@ int runMirrorCuda(const std::string& caseDir)
                                "case asks " + asked + ", brae runs a multicolour " + variant + " smoothSolver "
                                "to the same tolerance, relTol, maxIter and minIter, nSweeps "
                              + std::to_string(nSweepsU) + " -- a different solver: the converged answer is "
-                               "the same, the iterate under relTol is not. BRAE_U_SOLVER=ofOrder runs the "
-                               "diagonal-preconditioned BiCGStab this driver ran before");
+                               "the same, the iterate under relTol is not"
+                             + (asksDiluSmoother
+                                ? std::string(", AND Gauss-Seidel is the WEAKER smoother per sweep: this "
+                                              "entry names a DILU-family one, so the solve may need more "
+                                              "sweeps and, under a maxIter cap, stop short of its tolerance")
+                                : std::string())
+                             + ". BRAE_U_SOLVER=ofOrder runs the case's own solver instead");
         }
     }
 
@@ -604,6 +690,46 @@ int runMirrorCuda(const std::string& caseDir)
                                  "could not be built; refusing rather than running the diagonal the notice "
                                  "denied. BRAE_DILU=0 selects the diagonal explicitly.");
     gin.preconP  = diluP ? &w.dilu : nullptr;
+    // ...and the AMG V-cycle instead, from the same one decision. Mutually exclusive with the line
+    // above: the step throws if both arrive (rhoSimpleFoam.cu).
+    gin.pAmgPrecon = pAmgPrecon;
+
+    if (hin.transonic)
+    {
+        // WHAT THE TRANSONIC PRESSURE RUNS, printed in every mode, from the one decision above. A log
+        // that names the momentum solver and not the pressure one sends the reader to the dictionary,
+        // and the dictionary is not what decides this.
+        std::printf("  transonic pressure: PBiCGStab preconditioned with %s\n",
+                    pAmgPrecon ? "brae's AMG V-cycle (BRAE_P_SOLVER=diagonal opts out)"
+                  : diluP      ? "the case's DILU (BRAE_DILU_P=1; the AMG V-cycle is OFF -- a BiCGStab takes one preconditioner)"
+                               : "the diagonal (BRAE_P_SOLVER=diagonal)");
+        if (pAmgPrecon)
+        {
+            // The reader above was told brae preconditions p with GAMG, which is the honest name for a
+            // V-cycle preconditioning a PBiCGStab -- and it makes the reader go SILENT on a case that
+            // asks for that pair. That silence would be a lie: brae's V-cycle is not OpenFOAM's GAMG.
+            // So the difference is stated here, once, whatever the case's p entry says.
+            noticeApproximated(
+                "transonic p preconditioner",
+                "brae runs the case's PBiCGStab preconditioned with ITS OWN AMG V-cycle. OpenFOAM "
+                "registers GAMGPreconditioner in the asymmetric table too (GAMGPreconditioner.C:37-42), "
+                "so the PAIR is OpenFOAM's; the V-cycle inside it is not. It agglomerates greedily in "
+                "pairs on |Sf| and diverges from faceAreaPair at level 1; it smooths by default with "
+                "weighted Jacobi (omega 0.8, one pre- and one post-sweep) rather than the case's "
+                "smoother (BRAE_AMG_GS / BRAE_AMG_TSGS select the other asymmetric-safe ones); its "
+                "coarsest level is neither OpenFOAM's PBiCGStab nor its direct LU (GAMGSolver.C:270-278, "
+                ":299-328); it applies ONE V-cycle where GAMGPreconditioner defaults to nVcycles 2 "
+                "(GAMGPreconditioner.C:65); and the V-cycle itself runs in FP32 by default with the "
+                "outer BiCGStab and its residual in FP64 (BRAE_AMG_FP32=0 opts out). So `smoother`, "
+                "`nPreSweeps`, `nPostSweeps`, `nCellsInCoarsestLevel`, `agglomerator` and `mergeLevels` "
+                "in the case's p entry are NOT read. Same linear system and the same stopping rule, so "
+                "the converged answer is the case's; the iterate under a loose relTol is not OpenFOAM's. "
+                "Measured on the squareBend tutorial at 305,760 cells, OpenFOAM's own PBiCGStab on this "
+                "matrix: diagonal 380.8 solver iterations mean and 278.1 ms per outer iteration, DILU "
+                "135.3 and 143.9, GAMG 3.8 and 33.8. BRAE_P_SOLVER=diagonal runs the "
+                "diagonal-preconditioned BiCGStab instead");
+        }
+    }
 
     if (uColourGS)
     {

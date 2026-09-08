@@ -794,17 +794,35 @@ Residuals rhoSimpleStep(
         deviceNormFactorInto(A, f.p, b, w.ones, dnf);                 // stays on the device (item 66)
 
         DeviceSolverPerf perf;
-        if (in.transonic)
+        // A BiCGStab has ONE preconditioner. The driver decides between them from BRAE_P_SOLVER and
+        // BRAE_DILU_P and announces what it chose, so two arriving here means the notice already
+        // named one of them and the solve would run the other.
+        if (in.pAmgPrecon && in.preconP)
         {
-            // fvm::div(phid, p) makes lower = -w*phi and upper = lower + phi, so upper != lower at every
-            // face with flow through it. A symmetric solver on that matrix is not slow, it is wrong: CG
-            // burned the full 3000-iteration cap and the case stalled before printing iteration 1.
-            solveMarkBegin();
-            perf = deviceJacobiBiCGStab(A, b, f.p, dnf.data(), in.tolP, in.relTolP, in.maxIterP, in.pcgCheckEvery, in.minIterP,
-                                        in.preconP);   // DILU when the driver built one; null keeps Jacobi
-            solveMarkEnd(&g_tPsol);
+            throw std::runtime_error(
+                "brae rhoSimpleFoam (mirror): the transonic pressure was handed BOTH an AMG hierarchy and "
+                "a DILU preconditioner. A BiCGStab takes one; the driver picks between them "
+                "(BRAE_P_SOLVER, BRAE_DILU_P) and announces the choice, so running either here would "
+                "contradict the notice.");
         }
-        else
+        // The AMG hierarchy, for BOTH pressure equations. It is a function of the MESH ALONE:
+        // agglomerate() is greedy pairwise on the face weights (device_amg.cu:212-355), buildAMG never
+        // sees the matrix (:865-1005), and the weights handed in are |Sf| -- OpenFOAM's own
+        // faceAreaPairGAMGAgglomeration.C:108,162 choice. So the transonic hierarchy IS the subsonic one
+        // on this mesh, and only the Galerkin VALUES change per outer iteration (:1007-1054, OpenFOAM's
+        // asymmetric branch verbatim -- GAMGSolverAgglomerateMatrix.C:135-170's `hasLower()` path, both
+        // cUpper and cLower with the owner/neighbour flip).
+        //
+        // HOISTED ABOVE THE BRANCH. Until it was, the transonic path never entered this block, so the
+        // binary cache below was unreachable on the compressible path and every run started cold
+        // (REFUSALS item 61: "on the rho mirror it is still unreachable (every run cold)").
+        //
+        // Skipped only where no solve will use it: BRAE_P_SOLVER=diagonal or BRAE_DILU_P=1 on a
+        // transonic case. Building it there would pay the agglomeration and a per-iteration Galerkin
+        // for a hierarchy nothing reads -- and the control arm of tests/p_amg_bicgstab_vs_openfoam.sh
+        // is meant to measure what this driver ran BEFORE the AMG, not that plus a dead build.
+        const bool amgOnP = !in.transonic || in.pAmgPrecon;
+        if (amgOnP)
         {
             if (!w.amgBuilt)
             {
@@ -830,6 +848,23 @@ Residuals rhoSimpleStep(
                 w.amgBuilt = true;
             }
             amgGalerkin(w.amg, diagC, P.upper, P.lower);
+        }
+
+        if (in.transonic)
+        {
+            // fvm::div(phid, p) makes lower = -w*phi and upper = lower + phi, so upper != lower at every
+            // face with flow through it. A symmetric solver on that matrix is not slow, it is wrong: CG
+            // burned the full 3000-iteration cap and the case stalled before printing iteration 1.
+            // The V-cycle itself is asymmetric-safe -- the coarse operator carries both cUpper and
+            // cLower (above) and the solver is asked for an asymmetric-valid coarsest solve.
+            solveMarkBegin();
+            perf = deviceJacobiBiCGStab(A, b, f.p, dnf.data(), in.tolP, in.relTolP, in.maxIterP, in.pcgCheckEvery, in.minIterP,
+                                        in.preconP,                              // DILU when BRAE_DILU_P=1 opted in
+                                        in.pAmgPrecon ? &w.amg : nullptr);       // the V-cycle (the default); both null keeps Jacobi
+            solveMarkEnd(&g_tPsol);
+        }
+        else
+        {
             solveMarkBegin();
             perf = deviceAMGPCG(A, w.amg, b, f.p, dnf.data(), in.tolP, in.relTolP, in.maxIterP,
                                 in.captureVcycle, in.pcgCheckEvery, /*corrScaling=*/false, in.minIterP);

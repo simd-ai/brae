@@ -371,3 +371,92 @@ Progress on the momentum block at 306k, all with the same stop rule and the same
 | + no-op launches skipped, normFactors in the mailbox|       13.5 |
 | + residual taken from the sweeps                    |       11.7 |
 | + reductions folded into the launches               |       10.9 |
+
+### What a case's own smoother entry gets (2026-09-08, 306k, 20 iterations)
+
+OpenFOAM's ASYMMETRIC smoother table -- the momentum matrix is asymmetric -- holds exactly five names
+(each smoother's .C and its addasymMatrixConstructorToTable): GaussSeidel, symGaussSeidel,
+nonBlockingGaussSeidel, DILU, DILUGaussSeidel. brae ported the two Gauss-Seidel forms exactly and has
+none of the others. What the mirror's CUDA arm runs on U now, measured on the same case:
+
+| the case's solvers/U entry            | what runs            | UEqn ms/it | before the default |
+|---------------------------------------|----------------------|-----------:|-------------------:|
+| GAMG                                  | colour Gauss-Seidel  |       11.1 | 27.9 (diagonal BiCGStab) |
+| smoothSolver, smoother GaussSeidel    | colour Gauss-Seidel  |       10.9 | 58.0 host / 36.4 device, OpenFOAM's own order |
+| smoothSolver, smoother DILUGaussSeidel| colour Gauss-Seidel  |       11.0 | 27.9 (diagonal BiCGStab: brae has no DILU smoother) |
+| smoothSolver, smoother nonBlockingGaussSeidel | colour Gauss-Seidel |  10.9 | 27.9 (same) |
+| PBiCGStab / PBiCG / PCG               | the case's own solver|       27.9 | unchanged: brae has that solver |
+
+No entry is slower than it was. Each is announced by name, and a DILU-family smoother additionally gets
+"Gauss-Seidel is the WEAKER smoother per sweep ... may need more sweeps and, under a maxIter cap, stop
+short of its tolerance", because that is the one family where the substitute is weaker than what the
+case asked for. Sweep counts over 20 iterations were 460 (DILUGaussSeidel entry), 461
+(nonBlockingGaussSeidel) and 502 (GaussSeidel) -- the same solver in all three, the entry only changes
+the stop rule it is given.
+
+### brae's Krylov port against OpenFOAM's, on the entry that names it (2026-09-08, 306k, 20 iterations)
+
+The table above compared brae to OpenFOAM on the tutorial's GAMG entry. This is the other comparison:
+the velocity pinned to `PBiCGStab` in BOTH codes, so each runs its own port of the same algorithm.
+
+| solvers/U                        | OpenFOAM-20c UEqn | of which the solve | brae UEqn | of which the solve | brae forced to colourGS |
+|----------------------------------|------------------:|-------------------:|----------:|-------------------:|------------------------:|
+| PBiCGStab, preconditioner DILU   |              22.6 |               14.6 |      62.4 |               60.7 |                    11.0 |
+| PBiCGStab, preconditioner diagonal |            37.7 |               29.0 |      27.1 |               25.4 |                    10.6 |
+
+Read it the other way round from the GAMG table: with the DIAGONAL preconditioner brae's BiCGStab beats
+20 cores (25.4 against 29.0 on the solve); with DILU it loses badly (60.7 against 14.6), because DILU's
+forward-backward walk is sequential by construction -- 300 levels on this mesh -- while on 20 cores it
+is 20 independent local factorisations that cost almost nothing extra and cut the iteration count. That
+is the same finding as the transonic pressure's (BRAE_DILU_P): DILU is a CPU preconditioner. Note also
+that OpenFOAM is FASTER with DILU and brae is faster WITHOUT it, so the two codes disagree about which
+setting is better for the same case.
+
+And the colour sweep beats every one of those four numbers by 2.3x to 5.7x. It is not the default on
+these entries because the case named a solver brae implements and substituting it costs agreement with
+OpenFOAM (rho_sbmatched_transient: 4.8e-12 becomes 7.7e-10); BRAE_U_SOLVER=colourGS forces it for
+anyone who wants the speed on such a case.
+
+### The OpenFOAM reference at 306k is decomposition-sensitive (2026-09-08)
+
+Running the same staged case twice, OpenFOAM finished 100 iterations once and aborted at iteration 4 the
+other time: `Maximum number of iterations exceeded: 100 when starting from T0:1001.63 old T:-1.26348e+15`
+from the thermo's Newton solve, with every residual back at 1.0 the iteration before. It is the
+DECOMPOSITION, not the run: three reruns on one fixed scotch partition all converged, three fresh
+`simple` decompositions all converged, and 2 of 4 fresh scotch decompositions diverged. scotch
+re-partitions differently every time, the partition changes the reduction order, and this case from a
+cold start (transonic, consistent yes, pMinFactor 0.1 / pMaxFactor 2) is marginal enough at its first
+iterations for that to decide it. run_benchmark.sh now writes `method simple; n (5 2 2)` so the
+reference number comes from a reproducible run. Nothing here is brae's: its own arm ran 100 iterations
+in every one of those runs.
+
+## The transonic pressure, preconditioned with the AMG V-cycle (2026-09-08)
+
+The pressure equation was three quarters of the compressible iteration: an asymmetric matrix, a
+diagonal-preconditioned BiCGStab, and an iteration count that grows with the mesh where OpenFOAM's GAMG
+does not. brae's AMG hierarchy turned out to be asymmetric-correct already (it agglomerates on face
+areas, and its coarse operator is OpenFOAM's own asymmetric branch); what it lacked was a valid coarsest
+solve and a seam to hang it on a BiCGStab.
+
+| 306k, 20 iterations           | p iterations (first / mean) | p solve ms/it | p phase ms/it |
+|-------------------------------|----------------------------:|--------------:|--------------:|
+| diagonal (what it was)        |                 680 / 110.7 |          65.7 |          69.4 |
+| AMG V-cycle (the default now) |                    20 / 3.5 |          23.6 |          29.4 |
+
+OpenFOAM's own PBiCGStab on the same matrix, 20 cores, for scale: diagonal 380.8 iterations / 278.1 ms,
+DILU 135.3 / 143.9, GAMG 3.8 / 33.8. brae's 3.5 sits on OpenFOAM's 3.8.
+
+The whole iteration at 306k, against OpenFOAM-20c's 82.5 ms measured block by block earlier:
+
+| block          | OF-20c | brae before this round | brae now |
+|----------------|-------:|-----------------------:|---------:|
+| UEqn           |   26.1 |                   29.1 |     11.0 |
+| EEqn           |    9.8 |                    7.1 |      7.0 |
+| pEqn           |   24.0 |                   77.8 |     29.4 |
+| turbulence     |   22.9 |                   18.0 |     14.2 |
+| whole iteration|   82.5 |                  134.2 |     ~62  |
+
+Over the SAME range OpenFOAM's column was averaged on (100 iterations, not 20), brae reads: UEqn 10.8,
+EEqn 7.0, pEqn 25.5 (solve 20.5), turbulence 17.9 -- p iterations first 20, mean 2.9. So the pressure is
+the ONE block where 20 CPU cores are still ahead of one GPU, 24.0 against 25.5, and everything else is
+2.4x, 1.4x and 1.3x the other way. The whole iteration is 61.2 against 82.5.

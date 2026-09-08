@@ -120,7 +120,14 @@ for M in $SIZES; do
   iB=$(grep -c '^Time = ' "$BW/log.brae"); tLastB=$(ls -d "$BW"/[1-9]* 2>/dev/null | sed 's|.*/||' | sort -n | tail -1)
   # --- OpenFOAM, N cores ---
   OW="$WORK/of_$M"; rm -rf "$OW"; cp -r "$SRC" "$OW"
-  printf 'FoamFile{version 2.0;format ascii;class dictionary;object decomposeParDict;}\nnumberOfSubdomains %d;method scotch;\n' "$CORES" > "$OW/system/decomposeParDict"
+  # `simple` and not `scotch`: scotch re-partitions differently on every decomposePar, and on this case
+  # from a cold start about half of those partitions DIVERGE -- OpenFOAM aborts at iteration 4 with
+  # `Maximum number of iterations exceeded: 100 when starting from T0:1001 old T:-1.26e+15` out of the
+  # thermo's Newton solve, while another partition of the same case runs 100 iterations. Measured
+  # 2026-09-08: 2 of 4 scotch runs diverged, 3 of 3 reruns on ONE fixed scotch partition converged, and
+  # 3 of 3 fresh `simple` decompositions converged. The reference number has to come from a run that
+  # finished, so the decomposition is fixed here.
+  printf 'FoamFile{version 2.0;format ascii;class dictionary;object decomposeParDict;}\nnumberOfSubdomains %d;method simple;coeffs{n (5 2 2);}\n' "$CORES" > "$OW/system/decomposeParDict"
   ( cd "$OW"; decomposePar -force > log.decomposePar 2>&1 )                       # decompose (EXCLUDED)
   tO=$(wall "( cd '$OW'; mpirun -np $CORES rhoSimpleFoam -parallel > log.of 2>&1 )")
   ( cd "$OW"; reconstructPar -latestTime > log.reconstructPar 2>&1 )              # for the comparison (EXCLUDED)

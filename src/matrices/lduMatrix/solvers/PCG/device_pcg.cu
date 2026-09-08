@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <algorithm>
+#include <stdexcept>
 #include <vector>
 
 
@@ -200,6 +201,12 @@ struct BiCGGraphCache
     const void* owner = nullptr;
     int nC = -1, diluLevels = -1, scratchEpoch = -1;
     const void* diluRD = nullptr;
+    // ...and, when the preconditioner is an AMG V-cycle, the hierarchy: the captured body references its
+    // per-level matrices and work vectors by address, so a replay after the hierarchy was rebuilt or freed
+    // would read freed memory. The object address alone is not enough (a new AMGData can land on the old
+    // one's address), so the level-0 coarse diagonal -- reallocated by every rebuild -- keys it too.
+    const void* amg = nullptr;
+    const void* amgCoarseDiag = nullptr;
     DeviceBuffer<scalar> gDiag, gUpper, gLower, gB;                    // stable, graph-referenced
     DeviceBuffer<scalar> rA, rA0, pA, yA, AyA, sA, zA, tA, Ax;
     DeviceBuffer<scalar> gNormF, gInit, gSN, gRN, gFinal;
@@ -214,7 +221,7 @@ struct BiCGGraphCache
 // Returns false when this path does not apply (the caller then runs the host loop).
 bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar>& b, DeviceBuffer<scalar>& psi,
                                const scalar* dNormFactor, scalar tol, scalar relTol, int maxIter, int minIter,
-                               const DeviceDilu* precon, DeviceSolverPerf& perf)
+                               const DeviceDilu* precon, AMGData* amg, DeviceSolverPerf& perf)
 {
     const int nC = A.nCells, nF = A.nInternalFaces;
     if (nC <= 0) return false;
@@ -237,8 +244,13 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
     if (useDilu) diluUpdate(sA, *const_cast<DeviceDilu*>(precon));
     auto applyPrecon = [&](DeviceBuffer<scalar>& out, const DeviceBuffer<scalar>& in)
     {
-        if (useDilu) diluApply(sA, *precon, in, out);
-        else         deviceJacobi(out, in, sA.diag);
+        // The V-cycle launches kernels only -- no host read, no allocation, every bound a host constant --
+        // which is what makes it capturable; deviceAMGPCGGraph captures the same call today
+        // (device_amg_pcg.cu:238-254). asymmetric = true: this solver exists for the matrix with
+        // upper != lower, so the coarsest level must not be solved by a conjugate gradient.
+        if (amg)          vcycleAt(0, *amg, sA, in, out, true);
+        else if (useDilu) diluApply(sA, *precon, in, out);
+        else              deviceJacobi(out, in, sA.diag);
     };
     BiCGScalars& s = bicgScalars();
     auto converged = [&](scalar fr) { return (fr < tol) || (relTol > 0.0 && fr < relTol * perf.initialResidual); };
@@ -305,10 +317,11 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
     const void* diluRD   = useDilu ? (const void*)precon->rD.data() : nullptr;
     const int   diluLv   = useDilu ? precon->levels() : -1;
     const int   epoch    = deviceReductionScratchEpoch();
+    const void* amgCD    = (amg && !amg->level.empty()) ? (const void*)amg->level.front().cDiag.data() : nullptr;
     const bool recapture = !c.exec || c.key != psi.data() || c.tol != tol || c.relTol != relTol
                         || c.maxIter != maxIter || c.minIter != minIter || c.precon != (useDilu ? (const void*)precon : nullptr)
                         || c.owner != (const void*)A.owner || c.nC != nC || c.diluRD != diluRD || c.diluLevels != diluLv
-                        || c.scratchEpoch != epoch;
+                        || c.scratchEpoch != epoch || c.amg != (const void*)amg || c.amgCoarseDiag != amgCD;
     if (recapture)
     {
         if (c.exec)  { cudaGraphExecDestroy(c.exec);  c.exec = nullptr; }
@@ -378,6 +391,7 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
         c.key = psi.data(); c.tol = tol; c.relTol = relTol; c.maxIter = maxIter; c.minIter = minIter;
         c.precon = useDilu ? (const void*)precon : nullptr;
         c.owner = A.owner; c.nC = nC; c.diluRD = diluRD; c.diluLevels = diluLv; c.scratchEpoch = epoch;
+        c.amg = amg; c.amgCoarseDiag = amgCD;
     }
     static bool announced = false;
     if (!announced)
@@ -409,9 +423,19 @@ DeviceSolverPerf deviceJacobiBiCGStab(
     int maxIter,
     int checkEvery,
     int minIter,
-    const DeviceDilu* precon)
+    const DeviceDilu* precon,
+    AMGData* amg)
 {
     const int nC = A.nCells;
+    // One preconditioner per solve. Silently preferring one of the two would be the substitution this
+    // project keeps finding: the caller asked for a preconditioner and would get a different one.
+    if (amg && precon && precon->valid)
+    {
+        throw std::runtime_error(
+            "brae deviceJacobiBiCGStab: both a DILU factorisation and an AMG hierarchy were passed as the "
+            "preconditioner. They are mutually exclusive -- pass exactly one (or neither, for the "
+            "diagonal).");
+    }
 #ifdef BRAE_HAS_GS_DEVICE
     // THE DEFAULT at the exact per-iteration cadence: the same loop on the device (above), four host
     // syncs per solve where this loop pays 2*nIter+1. BRAE_BICG_HOST_LOOP=1 forces this loop
@@ -431,7 +455,7 @@ DeviceSolverPerf deviceJacobiBiCGStab(
         static thread_local auto& dNf = *new DeviceBuffer<scalar>(1);
         cudaMemcpyAsync(dNf.data(), &normFactor, sizeof(scalar), cudaMemcpyHostToDevice, cudaStreamPerThread);
         DeviceSolverPerf gp;
-        if (deviceJacobiBiCGStabGraph(A, b, psi, dNf.data(), tol, relTol, maxIter, minIter, precon, gp)) return gp;
+        if (deviceJacobiBiCGStabGraph(A, b, psi, dNf.data(), tol, relTol, maxIter, minIter, precon, amg, gp)) return gp;
     }
 #endif
     // rD depends on the matrix, which changes every solve (the momentum diagonal moves every outer
@@ -439,8 +463,11 @@ DeviceSolverPerf deviceJacobiBiCGStab(
     if (precon && precon->valid) diluUpdate(A, *const_cast<DeviceDilu*>(precon));
     auto applyPrecon = [&](DeviceBuffer<scalar>& out, const DeviceBuffer<scalar>& in)
     {
-        if (precon && precon->valid) diluApply(A, *precon, in, out);
-        else                         deviceJacobi(out, in, A.diag);
+        // asymmetric = true: this solver is the one the asymmetric matrix takes, so the V-cycle's coarsest
+        // level gets an asymmetric-valid solve rather than a conjugate gradient (device_amg.cuh's overload).
+        if (amg)                          vcycleAt(0, *amg, A, in, out, true);
+        else if (precon && precon->valid) diluApply(A, *precon, in, out);
+        else                              deviceJacobi(out, in, A.diag);
     };
     const int K = (checkEvery > 1) ? checkEvery : 1;             // convergence-read cadence (1 = exact per-iter)
     DeviceBuffer<scalar> rA(nC), rA0(nC), pA(nC), yA(nC), AyA(nC), sA(nC), zA(nC), tA(nC), Ax(nC);
@@ -538,19 +565,27 @@ DeviceSolverPerf deviceJacobiBiCGStab(
     int maxIter,
     int checkEvery,
     int minIter,
-    const DeviceDilu* precon)
+    const DeviceDilu* precon,
+    AMGData* amg)
 {
     announceNormFactorMode();
+    if (amg && precon && precon->valid)
+    {
+        throw std::runtime_error(
+            "brae deviceJacobiBiCGStab: both a DILU factorisation and an AMG hierarchy were passed as the "
+            "preconditioner. They are mutually exclusive -- pass exactly one (or neither, for the "
+            "diagonal).");
+    }
 #ifdef BRAE_HAS_GS_DEVICE
     static const bool hostLoop = std::getenv("BRAE_GS_HOST_LOOP") != nullptr || std::getenv("BRAE_BICG_HOST_LOOP") != nullptr;
     if (checkEvery <= 1 && !hostLoop && !normFactorOnHost())
     {
         DeviceSolverPerf gp;
-        if (deviceJacobiBiCGStabGraph(A, b, psi, dNormFactor, tol, relTol, maxIter, minIter, precon, gp)) return gp;
+        if (deviceJacobiBiCGStabGraph(A, b, psi, dNormFactor, tol, relTol, maxIter, minIter, precon, amg, gp)) return gp;
     }
 #endif
     // the host loop needs the number on the host: one read, on this path only
-    return deviceJacobiBiCGStab(A, b, psi, deviceReadScalar(dNormFactor), tol, relTol, maxIter, checkEvery, minIter, precon);
+    return deviceJacobiBiCGStab(A, b, psi, deviceReadScalar(dNormFactor), tol, relTol, maxIter, checkEvery, minIter, precon, amg);
 }
 
 } // namespace brae

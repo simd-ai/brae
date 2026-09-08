@@ -172,6 +172,18 @@ struct RhoStepInput
     // p phase at 112k cells, 1.8x more at 896k (bench/results/rhoSimpleFoam_squareBend_gb10.md). The
     // notice names whichever runs.
     const DeviceDilu* preconP  = nullptr;
+    // ...and whether that BiCGStab is preconditioned with brae's AMG V-cycle instead. OpenFOAM registers
+    // GAMGPreconditioner in the ASYMMETRIC constructor table as well as the symmetric one
+    // (GAMGPreconditioner.C:37-42), so `solver PBiCGStab; preconditioner GAMG;` is a legal OpenFOAM
+    // setting on this matrix and the like-for-like pair, not a substituted solver class. Measured on the
+    // squareBend tutorial at 305,760 cells with OpenFOAM's OWN PBiCGStab on the same transonic p:
+    // diagonal 380.8 solver iterations mean and 278.1 ms per outer iteration, DILU 135.3 and 143.9, GAMG
+    // 3.8 (max 6) and 33.8 -- a hundredfold cut in iterations for a roughly fourfold heavier apply.
+    // brae's diagonal arm ran 2234 BiCGStab iterations over 20 outer iterations, 65.9 ms of a 69.5 ms
+    // pressure phase. MUTUALLY EXCLUSIVE with preconP: a BiCGStab has one preconditioner, and the step
+    // throws rather than picking one of two the driver asked for. The DRIVER decides (BRAE_P_SOLVER,
+    // BRAE_DILU_P) so the notice it prints and the wiring here cannot disagree.
+    bool   pAmgPrecon = false;
     int    minIterU = 0,    minIterP = 0,    minIterHe = 0,    minIterTurb = 0;
     bool   uSymGaussSeidel = false;
     // fvSolution solvers/<field>/nSweeps for the smoothSolver path (default 1), and the energy field's

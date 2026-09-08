@@ -62,6 +62,17 @@ struct SolverRunsAs
     // back to a Jacobi-preconditioned CG on an interface-coupled mesh (cyclic/AMI, where the Galerkin
     // coarse operator cannot represent the interface edges), which this description does not carry: the
     // caller knows at run time, the reader does not.
+    //
+    // `GAMG` here names OpenFOAM's PRECONDITIONER, and it is the honest name for brae's V-cycle in both
+    // places one runs: preconditioning a PCG on the symmetric pressure, and (since 2026-09-08, on the
+    // OF-mirror's transonic branch) preconditioning a PBiCGStab on the asymmetric one -- OpenFOAM
+    // registers GAMGPreconditioner in the asymmetric constructor table as well
+    // (GAMGPreconditioner.C:37-42), so `solver PBiCGStab; preconditioner GAMG;` is a legal setting there.
+    // A CALLER THAT SETS THIS PAIR MUST PRINT ITS OWN LINE: noticeSolverChoice below is silent whenever
+    // the case names exactly what the caller runs, and brae's V-cycle is not OpenFOAM's GAMG (its own
+    // agglomeration, a weighted-Jacobi smoother, one V-cycle where GAMGPreconditioner defaults to
+    // nVcycles 2, an FP32 cycle by default), so that silence is a lie unless the caller breaks it.
+    // rhoSimpleFoamDriver.cu's `transonic p preconditioner` notice is the worked example.
     std::string pSolver = "PCG";
     std::string pPrecon = "GAMG";
     // Does this driver precondition the ENERGY solve with DILU when the case asks? Only the OF-mirror

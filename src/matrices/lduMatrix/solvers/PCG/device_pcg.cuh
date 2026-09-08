@@ -61,15 +61,23 @@ DeviceSolverPerf deviceJacobiPCG(const DeviceLduView& A, const DeviceBuffer<scal
 // checkEvery: read the |s|/|r| convergence norms (the 2 of 4 D2H reads/iter that aren't breakdown guards) only every
 // K iters -> batched convergence, like deviceAMGPCG's checkEvery. Breakdown guards (rA0rA, omega) stay per-iter for
 // safety. K=1 = exact (bit-identical); K>1 overshoots convergence by < K iters. Default 1.
+//
+// `amg`: when non-null the preconditioner is one AMG V-cycle of that hierarchy, run with asymmetric = true --
+// this solver exists for the asymmetric matrix, so an asymmetric-valid coarsest solve is the only correct one
+// (device_amg.cuh's vcycleAt overload). `precon` and `amg` are mutually exclusive; passing both throws. This is
+// OpenFOAM's `p { solver PBiCGStab; preconditioner GAMG; }`: GAMGPreconditioner registers itself in the
+// ASYMMETRIC table as well as the symmetric one (GAMGPreconditioner.C:38-42). The hierarchy must be built
+// (buildAMG) and current for this matrix (amgGalerkin), exactly as deviceAMGPCG requires.
+struct AMGData;   // fwd (device_amg.cuh); the hierarchy is passed by pointer so this header need not include it
 DeviceSolverPerf deviceJacobiBiCGStab(const DeviceLduView& A, const DeviceBuffer<scalar>& b,
                                       DeviceBuffer<scalar>& psi, scalar normFactor,
                                       scalar tol, scalar relTol, int maxIter, int checkEvery = 1, int minIter = 0,
-                                      const DeviceDilu* precon = nullptr);
+                                      const DeviceDilu* precon = nullptr, AMGData* amg = nullptr);
 // the same solve with the normFactor on the device (item 66)
 DeviceSolverPerf deviceJacobiBiCGStab(const DeviceLduView& A, const DeviceBuffer<scalar>& b,
                                       DeviceBuffer<scalar>& psi, const scalar* dNormFactor,
                                       scalar tol, scalar relTol, int maxIter, int checkEvery = 1, int minIter = 0,
-                                      const DeviceDilu* precon = nullptr);
+                                      const DeviceDilu* precon = nullptr, AMGData* amg = nullptr);
 
 
 class DeviceHalo;   // forward (parallel/pstream/device_halo.cuh)

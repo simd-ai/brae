@@ -1247,6 +1247,10 @@ add_test(NAME u_colour_gs_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/u_colour_gs_vs_openfoam.sh)
 set_tests_properties(u_colour_gs_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
+add_test(NAME p_amg_bicgstab_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/p_amg_bicgstab_vs_openfoam.sh)
+set_tests_properties(p_amg_bicgstab_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
 add_test(NAME uresidual_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/uresidual_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO
@@ -2741,6 +2745,14 @@ add_executable(test_dilu tests/test_dilu.cu)
 target_include_directories(test_dilu PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_dilu PRIVATE brae_core)
 add_test(NAME dilu COMMAND test_dilu)
+
+# AMG as the preconditioner of the ASYMMETRIC BiCGStab (OpenFOAM's `solver PBiCGStab; preconditioner GAMG`):
+# the answer must not depend on the preconditioner, it must take fewer iterations, and the coarsest solve --
+# a CG on a nonsymmetric operator until now -- is held to a host direct solve with that CG as the fail-proof.
+add_executable(test_amg_bicgstab tests/test_amg_bicgstab.cu)
+target_include_directories(test_amg_bicgstab PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_amg_bicgstab PRIVATE brae_core)
+add_test(NAME amg_bicgstab COMMAND test_amg_bicgstab)
 add_executable(test_relaxation_final tests/test_relaxation_final.cu)
 target_include_directories(test_relaxation_final PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_relaxation_final PRIVATE brae_core)

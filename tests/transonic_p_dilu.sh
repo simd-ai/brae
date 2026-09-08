@@ -19,6 +19,10 @@
 # MEASURED: pIters 202 / 163 / 163 (DILU) against 612-668 / 498-517 / 494-503 (diagonal, which varies
 # run to run with the reductions it sums); p initial residuals
 # identical to the printed digits at iterations 2 and 3.
+# THE COMPARISON ARM PINS BRAE_P_SOLVER=diagonal because the DEFAULT transonic preconditioner is no
+# longer the diagonal but brae's AMG V-cycle (2026-09-08, item 77b): unpinned, this arm would measure
+# the AMG and the gate would compare DILU against a preconditioner it is not about (measured then:
+# "diagonal" 53/50/43 iterations, which is the AMG, against DILU's 202/161/163).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
@@ -31,7 +35,7 @@ W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 fail=0
 say() { printf '  %-74s %s\n' "$1" "$2"; [ "$2" = FAIL ] && fail=1 || true; }
 N=3
-for arm in "dilu BRAE_DILU_P=1" "diag "; do
+for arm in "dilu BRAE_DILU_P=1" "diag BRAE_P_SOLVER=diagonal"; do
     set -- $arm; label=$1; envs=${2:-}
     d="$W/$label"; rm -rf "$d"; cp -r "$SRC" "$d"; rm -rf "$d"/[1-9]* 2>/dev/null; [ -d "$d/0" ] || cp -r "$d/0.orig" "$d/0"
     python3 - "$d" "$N" <<'PY'

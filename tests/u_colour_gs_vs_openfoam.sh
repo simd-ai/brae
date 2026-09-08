@@ -25,9 +25,12 @@
 #               for Ux` line (BRAE_OF_LOG=1) named colourGaussSeidel; the REF arm's log carries none of
 #               those and names its own sweep. Neither carries the shared reader's `brae runs PBiCGStab`
 #               or `not running a smoothSolver` lines for U: exactly one truthful set of lines.
-#   ARM KRYLOV  brae-only: the fixture's ORIGINAL "(U|h|e)" PBiCGStab/DILU entry (pinned tight) under
-#               colourGS must announce `solvers/U solver: case asks 'PBiCGStab'` and nothing
-#               contradictory about U's preconditioner or smoother.
+#   ARM KRYLOV  brae-only: the fixture's ORIGINAL "(U|h|e)" PBiCGStab/DILU entry (pinned tight). That
+#               entry names a solver brae implements, so the colour sweep is NOT the default there and
+#               the arm forces it with BRAE_U_SOLVER=colourGS; forced, it must announce
+#               `solvers/U solver: case asks 'PBiCGStab'` and nothing contradictory about U's
+#               preconditioner or smoother. (The default on such an entry is the case's own solver,
+#               which rho_sbmatched_transient_vs_openfoam holds to OpenFOAM at 1e-12.)
 #   CONTROL     relTol 0.1 on U in BOTH codes: the two orders stop at different iterates, so the fields
 #               at 5 must differ by MORE than BOUND. This proves the comparison can see a solver
 #               difference at all, and documents the approximation the notice announces.
@@ -100,11 +103,11 @@ stage "$W/brae_exact"  gs 0 5000;   run "$W/brae_exact"  brae || { tail -5 "$W/b
 stage "$W/brae_ref"    gs 0 5000;   run "$W/brae_ref"    brae BRAE_U_SOLVER=ofOrder || { tail -5 "$W/brae_ref/run.log";    say "REF         today's path finished" FAIL; }
 stage "$W/brae_ctrl"   gs 0.1 5000; run "$W/brae_ctrl"   brae || { tail -5 "$W/brae_ctrl/run.log";   say "CONTROL     the colourGS relTol 0.1 run finished" FAIL; }
 stage "$W/brae_fp"     gs 0 1;      run "$W/brae_fp"     brae || { tail -5 "$W/brae_fp/run.log";     say "FAIL-PROOF  the colourGS maxIter 1 run finished" FAIL; }
-stage "$W/brae_krylov" krylov;      run "$W/brae_krylov" brae || { tail -5 "$W/brae_krylov/run.log"; say "KRYLOV      the colourGS run on the PBiCGStab entry finished" FAIL; }
+stage "$W/brae_krylov" krylov;      run "$W/brae_krylov" brae BRAE_U_SOLVER=colourGS || { tail -5 "$W/brae_krylov/run.log"; say "KRYLOV      the colourGS run on the PBiCGStab entry finished" FAIL; }
 # SUBST: the GaussSeidel entry with the smoothSolver path switched OFF (BRAE_RHO_SMOOTHSOLVER=0) and no
 # colourGS: the shared reader must print exactly the substitution lines the SAID arms assert ABSENT,
 # so those absence checks are shown able to match (review, round 2).
-stage "$W/brae_subst"  gs 0 5000;   run "$W/brae_subst"  brae BRAE_RHO_SMOOTHSOLVER=0 || { tail -5 "$W/brae_subst/run.log";  say "SUBST       the substituted run finished" FAIL; }
+stage "$W/brae_subst"  gs 0 5000;   run "$W/brae_subst"  brae BRAE_U_SOLVER=ofOrder BRAE_RHO_SMOOTHSOLVER=0 || { tail -5 "$W/brae_subst/run.log";  say "SUBST       the substituted run finished" FAIL; }
 # DEFAULT: the EXACT arm above already runs with no BRAE_U_SOLVER at all, so its colour lines prove the
 # default; this arm proves the opt-out is real -- the same case under ofOrder must run OpenFOAM's order.
 

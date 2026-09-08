@@ -168,6 +168,27 @@ DeviceSolverPerf deviceAMGPCG(const DeviceLduView& Afine, AMGData& amg, const De
 void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
                     const DeviceBuffer<scalar>& r, DeviceBuffer<scalar>& z, bool captureVcycle = false);
 
+// THE ASYMMETRIC V-CYCLE (upper != lower: the transonic pressure equation's fvm::div(phid, p)).
+//
+// The HIERARCHY needs nothing: buildAMG agglomerates on the face weights alone and never sees the matrix,
+// and amgGalerkin already takes OpenFOAM's asymmetric branch, producing both cUpper and cLower with the
+// owner/neighbour flip (GAMGSolverAgglomerateMatrix.C:135-170's `if (fineMatrix.hasLower())` path). What is
+// NOT valid for an asymmetric operator is the coarsest SOLVE -- deviceCoarsePCG is a conjugate gradient,
+// whose step length presumes p.Ap is an A-norm -- and three of the V-cycle's options. So `asymmetric` is a
+// SOLVE-TIME argument, not a property of the built hierarchy: the same cached hierarchy serves both.
+//
+// vcycleAt keeps its 5-argument symmetric entry point (the callers in device_amg.cu / device_amg_pcg.cu
+// declare it themselves and are unchanged); this 6-argument overload is the one to call with
+// asymmetric = true. It is an OVERLOAD rather than a defaulted parameter because those local declarations
+// would otherwise make every existing 5-argument call ambiguous.
+void vcycleAt(int g, AMGData& amg, const DeviceLduView& Ag, const DeviceBuffer<scalar>& bg,
+              DeviceBuffer<scalar>& xg, bool asymmetric);
+
+// The refusals the asymmetric V-cycle makes, one std::runtime_error per option, each naming itself and
+// what to set instead. Exposed (rather than left inside vcycleAt) so a test can exercise each one; vcycleAt
+// calls exactly this with (useChebyshev(), amg.corrScaling, amg.saSmooth). A no-op when nothing is set.
+void amgRefuseAsymmetric(bool chebyshev, bool corrScaling, bool smoothedAggregation);
+
 // Prepare the FP32 mixed-precision V-cycle for this solve: cast the (Galerkin-updated) matrices to FP32 mirrors.
 // Call ONCE per solve before the amgVCycleApply loop; after it, amgVCycleApply runs FP32 automatically. No-op
 // unless BRAE_AMG_FP32 (default on) and the default smoother/aggregation (SA/GS/Chebyshev stay FP64).

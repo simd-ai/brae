@@ -206,6 +206,137 @@ void coarsePCGKernel(
     for (int i = tid; i < nC; i += blockDim.x)
         xc[i] = x[i];
 }
+
+// Single-block coarsest solve by Jacobi-preconditioned BiCGStab: the ASYMMETRIC twin of coarsePCGKernel.
+// CG is not a solve on an operator with upper != lower -- its alpha = (r.z)/(p.Ap) is only a step length
+// when p.Ap is the A-norm of p, i.e. when A is symmetric -- and its guards (coarsePCGKernel's alpha/beta
+// tests) make it return finite garbage rather than fail. OpenFOAM's own coarsest level for an asymmetric
+// matrix is a PBiCGStab (GAMGSolver.C:299-328), so this is that recurrence (PBiCGStab.C:160-249), in one
+// block, with the same fixed iteration count and the same divide-by-zero guards as coarsePCGKernel.
+//
+// FIVE shared vectors, exactly coarsePCGKernel's footprint (5*nC + 32 doubles), so SB_CG_MAX needs no
+// change and no >48KB shared-memory opt-in (which is a non-stream runtime call and this kernel is
+// reachable from a stream-captured V-cycle). Two of BiCGStab's nine vectors are elided rather than
+// stored: sA overwrites rA (OF never reads the old rA once sA exists -- PBiCGStab.C:209 is the last use,
+// and pA's next update at :192 reads the NEW rA), and the preconditioned yA / zA are re-derived where
+// they are used, which for the Jacobi preconditioner is one division (y = p/diag, z = s/diag).
+__global__
+void coarseBiCGStabKernel(
+    int nC,
+    int nIters,
+    const scalar* __restrict__ rc,
+    const scalar* __restrict__ diag,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ nei,
+    const scalar* __restrict__ upper,
+    const label* __restrict__ losortStart,
+    const label* __restrict__ losort,
+    const label* __restrict__ owner,
+    const scalar* __restrict__ lower,
+    scalar* __restrict__ xc)
+{
+    extern __shared__ scalar sh[];
+    scalar* r = sh;                                              // rA, and sA after the half step
+    scalar* r0 = sh + nC;
+    scalar* p = sh + 2*nC;
+    scalar* Ay = sh + 3*nC;
+    scalar* t = sh + 4*nC;
+    scalar* red = sh + 5*nC;                                     // TPB scratch for the block reduction
+    const int tid = threadIdx.x;
+    for (int i = tid; i < nC; i += blockDim.x)   // x0 = 0 -> rA = b, and OF's iteration-0 pA = rA
+    {
+        xc[i] = 0.0;
+        r[i] = rc[i];
+        r0[i] = rc[i];
+        p[i] = rc[i];
+    }
+    __syncthreads();
+    // The coarsest solve must be CONVERGED, not merely cheap: a fixed count leaves an approximation
+    // whose error depends on the right-hand side, so the V-cycle stops being a fixed linear operator
+    // and the OUTER Krylov method breaks on it. Measured on validation/sbMatched (112k, transonic p,
+    // tolerance 1e-12) with this kernel at a fixed 16 iterations: the outer BiCGStab took 187, then
+    // 1000 (its cap, unconverged), then 89 iterations on three consecutive outer iterations. At 64 it
+    // takes 50, 50, 43, and at 256 the same 50, 50, 43 -- i.e. 64 is where the coarsest converges and
+    // the outer method becomes well behaved. So this iterates to a RELATIVE RESIDUAL, as OpenFOAM's
+    // own coarsest solver does (GAMGSolver.C:299-328 constructs a PBiCGStab with the GAMG dict's
+    // tolerance), and `nIters` is now the CAP rather than the count.
+    const scalar tol0 = blockDot(r, r, nC, red);
+    const scalar stop = COARSE_REL_TOL*COARSE_REL_TOL*tol0;
+    scalar alpha = 0.0, omega = 0.0, rr = 0.0;
+    for (int it = 0; it < nIters; ++it)
+    {
+        if (it > 0)
+        {
+            // r is the current residual (the recurrence keeps it): stop once it is small enough that
+            // the correction this returns is the coarse inverse to COARSE_REL_TOL.
+            const scalar rn = blockDot(r, r, nC, red);
+            if (rn <= stop)
+            {
+                break;
+            }
+        }
+        const scalar rrOld = rr;
+        rr = blockDot(r0, r, nC, red);                           // rA0rA (PBiCGStab.C:166)
+        if (it > 0)
+        {
+            // beta = (rA0rA/rA0rAold)*(alpha/omega) (PBiCGStab.C:190). OF instead BREAKS the loop when
+            // mag(rA0rA) or mag(omega) is singular; a fixed-count kernel cannot break, so a singular
+            // denominator restarts the direction (beta = 0, pA = rA) rather than producing a NaN.
+            const bool ok = (rrOld > 1e-300 || rrOld < -1e-300) && (omega > 1e-300 || omega < -1e-300);
+            const scalar beta = ok ? (rr/rrOld)*(alpha/omega) : 0.0;
+            for (int c = tid; c < nC; c += blockDim.x)
+                p[c] = r[c] + beta*(p[c] - omega*Ay[c]);
+            __syncthreads();
+        }
+        for (int c = tid; c < nC; c += blockDim.x)   // AyA = A yA, yA = M^-1 pA (PBiCGStab.C:198-201)
+        {
+            scalar a = diag[c]*(p[c]/safeDiag(diag[c]));
+            for (int f = ownerStart[c]; f < ownerStart[c+1]; ++f)
+            {
+                const int g = nei[f];
+                a += upper[f]*(p[g]/safeDiag(diag[g]));
+            }
+            for (int k = losortStart[c]; k < losortStart[c+1]; ++k)
+            {
+                const int f = losort[k], g = owner[f];
+                a += lower[f]*(p[g]/safeDiag(diag[g]));
+            }
+            Ay[c] = a;
+        }
+        __syncthreads();
+        const scalar r0Ay = blockDot(r0, Ay, nC, red);           // rA0AyA (PBiCGStab.C:203)
+        alpha = (r0Ay > 1e-300 || r0Ay < -1e-300) ? rr/r0Ay : 0.0;
+        for (int c = tid; c < nC; c += blockDim.x)
+            r[c] -= alpha*Ay[c];                                 // sA = rA - alpha*AyA (PBiCGStab.C:209), in rA's slot
+        __syncthreads();
+        for (int c = tid; c < nC; c += blockDim.x)   // tA = A zA, zA = M^-1 sA (PBiCGStab.C:232-235)
+        {
+            scalar a = diag[c]*(r[c]/safeDiag(diag[c]));
+            for (int f = ownerStart[c]; f < ownerStart[c+1]; ++f)
+            {
+                const int g = nei[f];
+                a += upper[f]*(r[g]/safeDiag(diag[g]));
+            }
+            for (int k = losortStart[c]; k < losortStart[c+1]; ++k)
+            {
+                const int f = losort[k], g = owner[f];
+                a += lower[f]*(r[g]/safeDiag(diag[g]));
+            }
+            t[c] = a;
+        }
+        __syncthreads();
+        const scalar tt = blockDot(t, t, nC, red);               // tAtA (PBiCGStab.C:237)
+        const scalar ts = blockDot(t, r, nC, red);               // gSumProd(tA, sA) (PBiCGStab.C:241)
+        omega = (tt > 1e-300) ? ts/tt : 0.0;
+        for (int c = tid; c < nC; c += blockDim.x)
+        {
+            const scalar d = safeDiag(diag[c]);
+            xc[c] += alpha*(p[c]/d) + omega*(r[c]/d);            // psi += alpha*yA + omega*zA (PBiCGStab.C:246)
+            r[c] -= omega*t[c];                                  // rA = sA - omega*tA (PBiCGStab.C:247)
+        }
+        __syncthreads();
+    }
+}
 } // anon
 
 bool deviceCoarseFitsCluster(int nCoarse)
@@ -286,6 +417,22 @@ void deviceCoarsePCG(
     coarsePCGKernel<<<1, bs, shBytes, cudaStreamPerThread>>>(nC, nIters,
         rc.data(), cv.diag, cv.ownerStart, cv.nei, cv.upper, cv.losortStart, cv.losort, cv.owner, cv.lower, xc.data());
     cudaCheck(cudaGetLastError(), "coarsePCG launch");
+}
+
+// Single-block ASYMMETRIC coarsest solve (nC <= SB_CG_MAX) by Jacobi-preconditioned BiCGStab, nIters
+// iterations, one launch. Same block sizing and the same 5*nC+32 shared footprint as deviceCoarsePCG.
+void deviceCoarseBiCGStab(
+    const DeviceLduView& cv,
+    const DeviceBuffer<scalar>& rc,
+    DeviceBuffer<scalar>& xc,
+    int nIters)
+{
+    const int nC = cv.nCells;
+    const int bs = nC >= TPB ? TPB : ((nC + 31) / 32) * 32;     // warp-rounded, in [32, TPB]
+    const std::size_t shBytes = (5 * static_cast<std::size_t>(nC) + 32) * sizeof(scalar);   // red[] needs <= bs/32 slots
+    coarseBiCGStabKernel<<<1, bs, shBytes, cudaStreamPerThread>>>(nC, nIters,
+        rc.data(), cv.diag, cv.ownerStart, cv.nei, cv.upper, cv.losortStart, cv.losort, cv.owner, cv.lower, xc.data());
+    cudaCheck(cudaGetLastError(), "coarseBiCGStab launch");
 }
 
 
