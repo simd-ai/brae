@@ -31,7 +31,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
 SRC="${1:-$ROOT/validation/simpleBoxIO}"
 OFBASHRC=${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
-CAP=${CAP:-3}
+# The U cap has to BIND: on this fixture the uncapped DILU-PBiCGStab reaches tolerance 1e-14 in three
+# iterations in BOTH codes (OpenFOAM 4.03659670418e-15 in 3, brae 4.037e-15 in 3), so a cap of 3 stops
+# nothing and the CONTROL below cannot fail. Two binds. The cap is TIGHTENED, never raised.
+CAP=${CAP:-2}
 PCAP=${PCAP:-37}
 FLOOR=${FLOOR:-5}
 

@@ -69,9 +69,15 @@ PY
 cp -r "$W/case" "$W/of"; rm -rf "$W/of"/[1-9]*
 ( cd "$W/of" && rhoSimpleFoam > of.log 2>&1 ) || { echo "FAIL: OpenFOAM did not run"; tail -20 "$W/of/of.log"; exit 1; }
 run() { ( cd "$1" && rm -rf [1-9]* && env $2 BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BRAE" -case "$1" > "$3" 2>&1 ); }
-cp -r "$W/case" "$W/hon"; cp -r "$W/case" "$W/ctl"
-run "$W/hon" "" "$W/hon/run.log" || { echo "FAIL: the honoured run crashed"; tail -10 "$W/hon/run.log"; exit 1; }
-run "$W/ctl" "BRAE_RHO_SMOOTHSOLVER=0" "$W/ctl/run.log" || { echo "FAIL: the control run crashed"; tail -10 "$W/ctl/run.log"; exit 1; }
+cp -r "$W/case" "$W/hon"; cp -r "$W/case" "$W/ctl"; cp -r "$W/case" "$W/def"
+# The honoured and control runs pin BRAE_U_SOLVER=ofOrder. This gate is about brae running the solver the
+# CASE names, and since 2026-09-08 the momentum default is a multicolour Gauss-Seidel sweep, which is not
+# one -- OpenFOAM's GaussSeidelSmoother walks cells in index order. Pinning keeps these two arms measuring
+# what they were written to measure; the DEFAULT gets its own arm below, at bounds measured for it. Same
+# split as rho_sbmatched_transient_vs_openfoam, and for the same reason: no bound here is loosened.
+run "$W/hon" "BRAE_U_SOLVER=ofOrder" "$W/hon/run.log" || { echo "FAIL: the honoured run crashed"; tail -10 "$W/hon/run.log"; exit 1; }
+run "$W/ctl" "BRAE_U_SOLVER=ofOrder BRAE_RHO_SMOOTHSOLVER=0" "$W/ctl/run.log" || { echo "FAIL: the control run crashed"; tail -10 "$W/ctl/run.log"; exit 1; }
+run "$W/def" "" "$W/def/run.log" || { echo "FAIL: the default run crashed"; tail -10 "$W/def/run.log"; exit 1; }
 
 # ARM 1 / ARM 2 -- what each run says it did
 for f in U e k epsilon; do
@@ -86,6 +92,16 @@ grep -q "smoothSolver: " "$W/hon/run.log" && say "ARM 2  the honoured run announ
                                           || say "ARM 2  the honoured run announces the smoothSolver path it took" FAIL
 grep -q "smoothSolver: " "$W/ctl/run.log" && say "CONTROL  ...and the substituted run never enters it" FAIL \
                                           || say "CONTROL  ...and the substituted run never enters it" ok
+
+# ARM 4 -- the DEFAULT momentum solver. It is a substitution (colour order, not OpenFOAM's index order)
+# and it has to say so, under `solvers/U smoother`. The pinned run above must NOT say it: that pair is
+# what proves the notice tracks the solver actually running rather than the dictionary.
+grep -q "solvers/U smoother: case asks 'GaussSeidel' in OpenFOAM's index order; brae sweeps in COLOUR order" "$W/def/run.log" \
+    && say "ARM 4  the default run announces the COLOUR-order momentum sweep" ok \
+    || { grep -m1 "solvers/U smoother" "$W/def/run.log"; say "ARM 4  the default run announces the COLOUR-order momentum sweep" FAIL; }
+grep -q "solvers/U smoother:" "$W/hon/run.log" \
+    && say "CONTROL  ...and the ofOrder run does not (it runs the case's own order)" FAIL \
+    || say "CONTROL  ...and the ofOrder run does not (it runs the case's own order)" ok
 
 # ARM 3 / CONTROL -- the trajectory against OpenFOAM
 python3 - "$W" <<'PY' || fail=1
@@ -105,8 +121,8 @@ def brae(p):
         if not m: continue
         d[int(m.group(1))] = {f: float(v) for f, v in re.findall(r'(\w+) ([\d.eE+-]+)', m.group(2))}
     return d
-hon, ctl = brae(W + '/hon/run.log'), brae(W + '/ctl/run.log')
-if IT not in of or IT not in hon or IT not in ctl:
+hon, ctl, dft = brae(W + '/hon/run.log'), brae(W + '/ctl/run.log'), brae(W + '/def/run.log')
+if IT not in of or IT not in hon or IT not in ctl or IT not in dft:
     print("  the runs did not all reach iteration %d" % IT); sys.exit(1)
 ofv = {'U': max(of[IT].get('Ux', 0), of[IT].get('Uy', 0), of[IT].get('Uz', 0)),
        'e': of[IT].get('e'), 'k': of[IT].get('k'), 'epsilon': of[IT].get('epsilon')}
@@ -126,6 +142,21 @@ for f in ('U', 'e', 'k', 'epsilon'):
         print("  CONTROL  %-8s substituted %.4e (%.2fx OpenFOAM; must be >= 2.0x)                   %s"
               % (f, c, rc, "ok" if okc else "FAIL"))
         if not okc: bad = 1
+# ARM 4 -- the same trajectory under the DEFAULT momentum solver, at bounds measured for IT. The colour
+# sweep reaches the same relTol as OpenFOAM's index-order one and leaves a different iterate, so U sits
+# further out (measured 2.15x) while the three fields it does not touch stay where ARM 3 has them
+# (measured e 1.00x, k 1.11x, epsilon 1.17x). The tight momentum bound stays on ARM 3, which is the arm
+# that detects an assembly or boundary defect; this one exists so the default is covered at all.
+DEF = {'U': (0.6, 2.8), 'e': (0.6, 1.6), 'k': (0.6, 1.6), 'epsilon': (0.6, 1.6)}
+for f in ('U', 'e', 'k', 'epsilon'):
+    o, d = ofv[f], dft[IT].get(f)
+    if o is None or d is None: print("  %s missing in the default run" % f); bad = 1; continue
+    lo, hi = DEF[f]
+    r = d / o
+    ok = lo <= r <= hi
+    print("  ARM 4    %-8s iteration %d: OpenFOAM %.4e   brae %.4e (%.2fx, bound %.1f-%.1f)   %s"
+          % (f, IT, o, d, r, lo, hi, "ok" if ok else "FAIL"))
+    if not ok: bad = 1
 sys.exit(bad)
 PY
 [ $fail -eq 0 ] && echo "PASS: the rho mirror runs the case's own linear solvers, and its trajectory is OpenFOAM's"

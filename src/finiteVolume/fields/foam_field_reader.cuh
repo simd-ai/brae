@@ -101,6 +101,14 @@ struct PatchFieldData
     // ANNOUNCED instead of skipped (item 16h); honouring it per patch is queued as 16h-port.
     scalar         wfCmu = 0.09, wfKappa = 0.41, wfE = 9.8;
     bool           hasWfCmu = false, hasWfKappa = false, hasWfE = false;
+    // ...and the VISCOUS/INERTIAL SUBLAYER BLENDING those four wall functions also read from the patch
+    // dictionary (wallFunctionBlenders.C:59-82: `blending`, one of stepwise/max/binomial/exponential/
+    // tanh, and `n`, the binomial exponent). The default is per wall function, not global -- STEPWISE
+    // for nutk/nutU/epsilon, BINOMIAL with n = 2 for omega -- and brae implements each one's default
+    // and nothing else, so anything else on the patch is REFUSED by name at the end of the entry.
+    std::string    wfBlending;                 // the `blending` word as written, empty when absent
+    scalar         wfBlendN = 0.0;
+    bool           hasWfBlendN = false;
     bool           vfUniform        = false;
     scalar         vfUniformValue   = 0;
     std::vector<scalar> vfValues;
@@ -602,6 +610,20 @@ inline FieldData<T> readField(const std::string& path)
                         else if (key == "Cmu")   { p.wfCmu   = v; p.hasWfCmu   = true; p.Cmu = v; }
                         else                     { p.wfE     = v; p.hasWfE     = true; }
                     }
+                    else if (key == "blending")
+                    {
+                        p.wfBlending = ts.next();
+                        ts.expect(";");
+                    }
+                    // The binomial exponent. Gated on the value being a NUMBER because `n` is also a
+                    // vector entry elsewhere in a boundary dictionary (fixedNormalSlip's normal, for
+                    // one), and those must keep falling through to the unhandled-key skip.
+                    else if (key == "n" && isFoamNumber(ts.peek()))
+                    {
+                        p.wfBlendN = ts.nextScalar();
+                        p.hasWfBlendN = true;
+                        ts.expect(";");
+                    }
                     // `ramp` multiplies the normal-velocity BCs' value by a Function1 of time every
                     // updateCoeffs (surfaceNormalFixedValueFvPatchVectorField.C:63-65). brae evaluates
                     // no Function1 here, so the key is MARKED and the factory refuses by name -- it
@@ -1017,6 +1039,48 @@ inline FieldData<T> readField(const std::string& path)
                     {
                         throw std::runtime_error("brae: timeVaryingMappedFixedValue on patch '" + p.name +
                             "' requires constant/boundaryData/" + p.name + " (points + a time dir); read failed: " + e.what());
+                    }
+                }
+                // THE VISCOUS/INERTIAL SUBLAYER BLENDING (wallFunctionBlenders). Only four wall
+                // functions read it -- epsilonWallFunction, omegaWallFunction, nutkWallFunction and
+                // nutUWallFunction are the only classes in OpenFOAM that reference blender_ -- and each
+                // carries its OWN default: STEPWISE for the three, BINOMIAL with n = 2 for omega
+                // (epsilonWallFunctionFvPatchScalarField.C:413, nutUWallFunctionFvPatchScalarField.C:259,
+                // nutkWallFunctionFvPatchScalarField.C:216, omegaWallFunctionFvPatchScalarField.C:405).
+                // brae implements each one's default and nothing else, so a patch that names a different
+                // blender is refused BY NAME rather than run with the default: the alternatives are not
+                // small corrections -- `max`, `exponential` and `tanh` change nut and omega across the
+                // whole buffer layer, and under any blender but stepwise omega's G is added on EVERY
+                // face rather than only above yPlusLam (omegaWallFunctionFvPatchScalarField.C:604).
+                // The derived rough/lowRe wall functions override calcNut and never consult the blender,
+                // so they are deliberately not matched here.
+                {
+                    const bool omegaWf = (p.type == "omegaWallFunction");
+                    const bool blendedWf = omegaWf || p.type == "epsilonWallFunction"
+                                        || p.type == "nutkWallFunction" || p.type == "nutUWallFunction";
+                    const std::string own = omegaWf ? "binomial" : "stepwise";
+                    if (blendedWf && !p.wfBlending.empty() && p.wfBlending != own)
+                    {
+                        throw std::runtime_error("brae: boundaryField/" + p.name + " (" + p.type +
+                            ") sets `blending " + p.wfBlending + "` -- brae implements only OpenFOAM's own "
+                            "default for this wall function (" + own + "), and running " + own +
+                            " where the case asked for " + p.wfBlending + " would change nut and omega "
+                            "through the buffer layer (wallFunctionBlenders.H). Remove the entry to run "
+                            + own + ", or port the blender");
+                    }
+                    // `n` only reaches the answer under the binomial blender. omega's blender IS
+                    // binomial unless the patch says otherwise, so an `n` there is live even with no
+                    // `blending` entry; under stepwise OpenFOAM reads it and never uses it, and brae
+                    // is silent for the same reason.
+                    const bool binomialHere = blendedWf
+                        && (p.wfBlending == "binomial" || (omegaWf && p.wfBlending.empty()));
+                    if (binomialHere && p.hasWfBlendN && p.wfBlendN != 2.0)
+                    {
+                        throw std::runtime_error("brae: boundaryField/" + p.name + " (" + p.type +
+                            ") sets `n " + std::to_string(p.wfBlendN) + "` -- brae's binomial blend is "
+                            "fixed at OpenFOAM's default exponent 2 for this wall function "
+                            "(omegaWallFunctionFvPatchScalarField.C:405), and a different exponent is a "
+                            "different omega through the buffer layer. Remove the entry to run 2");
                     }
                 }
                 // A per-patch wall-function coefficient the LEGACY drivers will NOT apply per patch:

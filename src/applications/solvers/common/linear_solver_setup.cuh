@@ -150,6 +150,24 @@ inline void readLinearSolverControls(
                         || (runsAs.diluOnEnergy && !heName.empty() && f == heName);
         const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
         bool on = wires && s && s->wordOr("preconditioner", "") == "DILU";
+        // ...and DILU is also what a SUBSTITUTED PBiCGStab gets on the transported scalars. OpenFOAM's
+        // PBiCGStab and PCG both require a `preconditioner` entry (lduMatrix::preconditioner::New throws
+        // without one), so a field whose entry names none is a field whose solver is not a P-solver at
+        // all -- GAMG, or a smoothSolver brae is not running as one -- and brae is substituting its
+        // BiCGStab for it. Preconditioning that substitute with `diagonal` picks the WEAKEST operator
+        // OpenFOAM has where the case asked for the strongest, and at a loose relTol the two stop in
+        // very different places. Measured on the 305,760-cell squareBend bench case (GAMG on
+        // (U|e|k|epsilon), relTol 0.1) at outer iteration 8: with diagonal, 201 interior cells have
+        // epsilon driven to the bound floor 1e-15 and nut = Cmu k^2/epsilon reaches 1.50e+17; with
+        // DILU, none do and nut peaks at 3.12. Real OpenFOAM on the same case reaches nut 1.69 with its
+        // GAMG and 3.05 when its own solver is swapped to PBiCGStab/DILU -- so the collapse is brae's
+        // preconditioner, not the substitution. A case that NAMES its preconditioner keeps it, diagonal
+        // included: this only fills the blank the substitution creates.
+        // Scoped to the TRANSPORTED SCALARS, which is where it was measured. U and the energy
+        // field take the same substitution, but neither has been shown to need this and the
+        // momentum equation runs a multicolour Gauss-Seidel smoothSolver by default in any case.
+        const bool scalarPair = (f == "k" || f == secondName || f == "nuTilda");
+        if (scalarPair && !on && (!s || s->wordOr("preconditioner", "").empty())) on = true;
         const char* e = nullptr;
         if (f == "U") e = std::getenv("BRAE_DILU");
         else if (f == "k" || f == secondName || f == "nuTilda") e = std::getenv("BRAE_DILU_KE");
@@ -423,8 +441,11 @@ inline void readLinearSolverControls(
             {
                 const FoamDict* sk = solvers ? solvers->subDict("k") : nullptr;
                 const FoamDict* ss = solvers ? solvers->subDict(secondName) : nullptr;
-                const bool kDilu = sk && sk->wordOr("preconditioner", "") == "DILU";
-                const bool sDilu = ss && ss->wordOr("preconditioner", "") == "DILU";
+                // diluHere is the ONE rule (it is what the notices printed above consulted): the
+                // case's own DILU, or the blank a substituted PBiCGStab leaves. gsK/gsEps subtract the
+                // fields running as smoothSolvers, which have no preconditioner to carry.
+                const bool kDilu = diluHere("k");
+                const bool sDilu = diluHere(secondName);
                 ctl.diluKE = (kDilu && !ctl.gsK) || (sDilu && !ctl.gsEps);
                 if (const char* e = std::getenv("BRAE_DILU_KE"))   // attribution escape hatch
                     ctl.diluKE = (std::atoi(e) != 0) && !(ctl.gsK && ctl.gsEps);

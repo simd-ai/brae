@@ -1247,6 +1247,12 @@ add_test(NAME u_colour_gs_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/u_colour_gs_vs_openfoam.sh)
 set_tests_properties(u_colour_gs_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
+add_test(NAME turb_precon_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/turb_precon_vs_openfoam.sh)
+set_tests_properties(turb_precon_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+add_test(NAME wall_blending_refusals
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/wall_blending_refusals.sh)
+set_tests_properties(wall_blending_refusals PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 add_test(NAME p_amg_bicgstab_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/p_amg_bicgstab_vs_openfoam.sh)
 set_tests_properties(p_amg_bicgstab_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
