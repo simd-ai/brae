@@ -245,6 +245,16 @@ void deviceDiv(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const D
 void deviceGaussGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol, const DeviceBuffer<scalar>& bval,
                      DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz,
                      const int* skipIf = nullptr);
+// The same gradient for n = 1..3 fields in ONE launch, reading the mesh addressing and geometry once
+// instead of n times. gx/gy/gz are arrays of n buffers, resized here; vol/bval are arrays of n pointers.
+// BIT-IDENTICAL, per field, to n separate deviceGaussGrad calls -- same faces, same order, same
+// expressions, one register set per field (tests/test_grad_fused.cu asserts it with memcmp). skipIf
+// behaves exactly as it does above. Measured motive: gradKernel was 4.5 ms of a 30 ms iteration at 306k
+// cells, 16 launches of which nine were velocity components in threes.
+void deviceGaussGradFused(const DeviceMesh& dm, int n,
+                          const DeviceBuffer<scalar>* const* vol, const DeviceBuffer<scalar>* const* bval,
+                          DeviceBuffer<scalar>* gx, DeviceBuffer<scalar>* gy, DeviceBuffer<scalar>* gz,
+                          const int* skipIf = nullptr);
 
 // The COUPLED-PATCH half of cellLimitedGrad, which brae's addressing cannot see on its own.
 //

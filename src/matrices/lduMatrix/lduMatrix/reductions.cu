@@ -22,7 +22,11 @@
 #include <map>
 #include "device_blas.cuh"
 #include <cuda_runtime.h>
+#include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <cstring>
+#include <string>
 
 namespace brae {
 
@@ -36,7 +40,6 @@ inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 // solve at a time (cf is one host thread per solve), so a function-local static accumulator is safe.
 scalar* g_redDev = nullptr;       // device accumulator (1 scalar)
 scalar* g_redPinned = nullptr;    // pinned host mirror (1 scalar)
-scalar* g_readPinned = nullptr;   // pinned host mirror for deviceReadScalar (separate so it never clobbers g_redPinned)
 scalar* g_partials = nullptr;     // stage-1 block partials; grown on demand, never shrunk
 int     g_partialsCap = 0;
 int     g_partialsEpoch = 0;      // bumped on every regrow: a captured graph holding the old pointer must rebuild
@@ -219,12 +222,284 @@ int deviceReductionScratchEpoch()
 }
 
 
+namespace {
+
+// THE READ-BACK MAILBOX. deviceReadScalar was a blocking cudaMemcpy, and the driver returned from it only
+// after it had walked the whole queue. nsys on the 306k compressible case (steady-state iterations, the
+// cold one excluded) put 306 of the 425 device-to-host copies in one outer iteration on single scalars
+// like this one -- convergence checks -- and every GPU-idle gap over 5 us ended at one of them: 17 gaps
+// totalling 7.19 ms in the pressure phase, 22 totalling 6.26 ms in turbulence, out of a 50.1 ms iteration
+// that was 38% idle. The momentum phase was the outlier at 10 gaps totalling 0.06 ms BECAUSE its per-pass
+// read had already been replaced by the mailbox in device_colour_gauss_seidel.cu (18.2 -> 14.1 ms per
+// outer iteration). This is that mailbox generalised, so every solver's read gets it and not just the
+// momentum one.
+//
+// A one-thread kernel copies the value into mapped pinned host memory, fences it system-wide, then
+// publishes an incrementing sequence number; the host spins on the number. The kernel is enqueued on
+// cudaStreamPerThread at exactly the point in the stream the cudaMemcpy occupied, so it snapshots the
+// same value the copy would have copied and NO CALLER CHANGES:
+//   * whatever produced the value was enqueued earlier on this stream, so the publish runs after it;
+//   * whatever overwrites the value later is enqueued after the publish, so it cannot reach the value
+//     the publish already read;
+//   * the host does not return until the publish has run, so a read is never in flight across a call --
+//     one host thread has at most one outstanding publish, and the mailbox is per host thread anyway.
+// Every kernel in brae is launched on the per-thread stream (there is no cudaStreamCreate in src/), and
+// the whole tree compiles with --default-stream per-thread, so "ordered on this stream" is the same
+// ordering the blocking copy had. Measured on this box: a producer on an unrelated stream is NOT waited
+// on by the blocking copy either, so the mailbox is stale exactly where the copy was stale
+// (tests/test_scalar_mailbox holds both modes to the same answer there).
+//
+// Measured here, 179 timed reads of a 305,760-cell reduction on GB10: with nothing else queued the
+// mailbox takes 21.3 us mean / 20.6 us best against the blocking copy's 269.4 us mean / 20.8 us best --
+// the same GPU work, and the whole difference is the driver's return. Behind 40 queued 305k kernels:
+// 205.4 us mean against 522.1 us.
+//
+// It carries a GROUP of values, not one: the graph solvers report a residual AND an iteration count, and
+// the fused Gauss-Seidel one of each per component, and each group was a run of async D2H copies with a
+// single cudaStreamSynchronize behind it. One publish reads the whole group in one thread at the point
+// the first copy occupied. That is the same snapshot the copies took: no stream work ran between them
+// either, so no source could change between the first value and the last in either scheme.
+struct ValueMailbox
+{
+    unsigned long long value[DEVICE_READ_MAX_VALUES];
+    unsigned long long seq;
+};
+
+static_assert(sizeof(scalar) == sizeof(unsigned long long), "the mailbox publishes a scalar as raw bits");
+static_assert(sizeof(int) == 4, "the mailbox publishes an int as its low 32 bits");
+
+// The sources travel in the kernel's parameter block rather than a device array: a device array would be
+// one more allocation to keep alive for the length of a solve, and eight pointers plus eight flags is 96
+// bytes against the 4 KB a launch may carry.
+struct PublishSources
+{
+    const void* p[DEVICE_READ_MAX_VALUES];
+    int isInt[DEVICE_READ_MAX_VALUES];
+};
+
+__global__
+void publishValuesKernel(
+    PublishSources src,
+    int n,
+    ValueMailbox* box,
+    unsigned long long seq)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+    {
+        return;
+    }
+    // Copied as raw bits. A double load/store preserves them too, but the bit copy leaves no room for a
+    // signalling NaN to be canonicalised on its way through a register: the contract is that this returns
+    // exactly what the memcpy would have returned, for any producer. An int rides in the low 32 bits.
+    for (int i = 0; i < n; ++i)
+    {
+        box->value[i] = src.isInt[i]
+            ? (unsigned long long)(*reinterpret_cast<const unsigned int*>(src.p[i]))
+            : *reinterpret_cast<const unsigned long long*>(src.p[i]);
+    }
+    __threadfence_system();
+    *reinterpret_cast<volatile unsigned long long*>(&box->seq) = seq;
+}
+
+// Allocated once and never freed: no static destructor may run after the CUDA context is torn down (the
+// same rule the other device caches here follow). thread_local rather than one global because the stream
+// it publishes on is cudaStreamPerThread -- one mailbox per stream is what keeps two host threads' reads
+// from overwriting each other's values and sequence number.
+ValueMailbox* valueMailbox(ValueMailbox** devPtr)
+{
+    thread_local ValueMailbox* box = nullptr;
+    thread_local ValueMailbox* boxDev = nullptr;
+    if (!boxDev)
+    {
+        ValueMailbox* h = nullptr;
+        ValueMailbox* d = nullptr;
+        cudaCheck(cudaHostAlloc(reinterpret_cast<void**>(&h), sizeof(ValueMailbox), cudaHostAllocMapped),
+                  "read mailbox alloc");
+        std::memset(h, 0, sizeof(ValueMailbox));
+        cudaCheck(cudaHostGetDevicePointer(reinterpret_cast<void**>(&d), h, 0),
+                  "read mailbox device pointer");
+        box = h;                                  // both set only once BOTH calls succeeded, so a partial
+        boxDev = d;                               // failure retries rather than handing back a null device pointer
+    }
+    *devPtr = boxDev;
+    return box;
+}
+
+// The spin, bounded. Past two seconds it falls back to the stream sync and, if the number still has not
+// arrived, throws: a wedge is reported, never waited on forever. Same bound as the momentum mailbox.
+// `what` names the caller, so the message says which read gave up.
+void waitForMailboxSequence(
+    const ValueMailbox* box,
+    unsigned long long seq,
+    const char* what)
+{
+    const volatile unsigned long long* p = reinterpret_cast<const volatile unsigned long long*>(&box->seq);
+    const auto t0 = std::chrono::steady_clock::now();
+    while (*p != seq)
+    {
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(2))
+        {
+            cudaCheck(cudaStreamSynchronize(cudaStreamPerThread), "read mailbox fallback sync");
+            if (*p != seq)
+            {
+                throw std::runtime_error(std::string("brae ") + what + ": the read-back mailbox never "
+                                         "carried this read's sequence number, even after a stream sync");
+            }
+            break;
+        }
+    }
+    // The values were written before the number on the device side; the acquire fence keeps this side's
+    // reads of value[] after its read of seq (the host is an aarch64 here, which reorders loads).
+    std::atomic_thread_fence(std::memory_order_acquire);
+}
+
+// BRAE_READ_SCALAR_SYNC=1 restores the blocking copies: an escape hatch for measuring the two against
+// each other and for a machine whose host spin behaves badly. Both paths return the same bits.
+bool readScalarSync()
+{
+    static const bool on = std::getenv("BRAE_READ_SCALAR_SYNC") != nullptr;
+    return on;
+}
+
+// The mailbox lives in MAPPED pinned memory, so a device that cannot map host memory has nothing to spin
+// on. That machine takes the blocking copy and is told why, rather than failing to allocate.
+bool readScalarUsesMailbox()
+{
+    static const bool on = []()
+    {
+        if (readScalarSync()) return false;
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return false;
+        int canMap = 0;
+        if (cudaDeviceGetAttribute(&canMap, cudaDevAttrCanMapHostMemory, dev) != cudaSuccess) return false;
+        return canMap != 0;
+    }();
+    return on;
+}
+
+void announceReadScalarMode()
+{
+    static bool announced = false;
+    if (announced) return;
+    announced = true;
+    std::printf(readScalarUsesMailbox()
+        ? "  scalar read-back: mailbox, host spins on a published sequence number; BRAE_READ_SCALAR_SYNC=1 restores the blocking copy\n"
+        : "  scalar read-back: blocking cudaMemcpy (BRAE_READ_SCALAR_SYNC, or this device cannot map host memory)\n");
+}
+
+// The one read-back, for one value or several. Every caller's group used to be a run of async D2H copies
+// with one cudaStreamSynchronize behind it; the mailbox replaces the whole group with one publish and one
+// wait, at the point in the stream the first copy occupied.
+void readValues(
+    const DeviceReadValue* values,
+    int n,
+    const char* what)
+{
+    announceReadScalarMode();
+    if (!values || n <= 0 || n > DEVICE_READ_MAX_VALUES)
+    {
+        throw std::runtime_error(std::string("brae ") + what + ": asked to read " + std::to_string(n)
+                                 + " device values in one wait; the mailbox carries 1 to "
+                                 + std::to_string(DEVICE_READ_MAX_VALUES));
+    }
+    for (int i = 0; i < n; ++i)
+    {
+        if (!values[i].dSrc || !values[i].hDst)
+        {
+            // The blocking copy returned an invalid-argument error here; the publish kernel would instead
+            // fault and poison the context, so name it before launching anything.
+            throw std::runtime_error(std::string("brae ") + what + ": asked to read a null device value");
+        }
+    }
+    if (!readScalarUsesMailbox())
+    {
+        // Exactly the copies and the single sync the converted sites used to write out themselves: same
+        // stream, same order, so this mode is the mailbox's oracle rather than a different read.
+        for (int i = 0; i < n; ++i)
+        {
+            cudaCheck(cudaMemcpyAsync(values[i].hDst,
+                                      values[i].dSrc,
+                                      values[i].isInt ? sizeof(int) : sizeof(scalar),
+                                      cudaMemcpyDeviceToHost,
+                                      cudaStreamPerThread),
+                      "readValues D2H");
+        }
+        cudaCheck(cudaStreamSynchronize(cudaStreamPerThread), "readValues sync");
+        return;
+    }
+    // A capture cannot be spun on: the publish kernel would be recorded into the graph instead of run, so
+    // the host would wait out the two seconds for a number nobody is going to write. The blocking copy
+    // this replaced failed outright under capture, so naming the situation here loses nothing.
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    cudaCheck(cudaStreamIsCapturing(cudaStreamPerThread, &cap), "readValues capture query");
+    if (cap != cudaStreamCaptureStatusNone)
+    {
+        throw std::runtime_error(std::string("brae ") + what + ": called while cudaStreamPerThread is "
+                                 "capturing a graph. A value cannot be read to the host from inside a "
+                                 "capture -- keep it device-resident, or read it outside the capture.");
+    }
+    PublishSources src;
+    for (int i = 0; i < DEVICE_READ_MAX_VALUES; ++i)
+    {
+        src.p[i] = (i < n) ? values[i].dSrc : nullptr;
+        src.isInt[i] = (i < n && values[i].isInt) ? 1 : 0;
+    }
+    ValueMailbox* boxDev = nullptr;
+    ValueMailbox* box = valueMailbox(&boxDev);
+    // 64-bit and per-thread, so it cannot wrap and cannot be shared: one read per nanosecond would take
+    // 584 years to come back to a number the host is still waiting for. Read as one aligned 8-byte word,
+    // so it cannot be observed torn either.
+    thread_local unsigned long long seqCounter = 0;
+    const unsigned long long seq = ++seqCounter;
+    publishValuesKernel<<<1, 1, 0, cudaStreamPerThread>>>(src, n, boxDev, seq);
+    cudaCheck(cudaGetLastError(), "readValues publish");
+    waitForMailboxSequence(box, seq, what);
+    for (int i = 0; i < n; ++i)
+    {
+        const unsigned long long bits = reinterpret_cast<const volatile unsigned long long*>(box->value)[i];
+        if (values[i].isInt)
+        {
+            const unsigned int lo = static_cast<unsigned int>(bits);
+            std::memcpy(values[i].hDst, &lo, sizeof(int));
+        }
+        else
+        {
+            std::memcpy(values[i].hDst, &bits, sizeof(scalar));
+        }
+    }
+}
+
+} // namespace
+
+
+void deviceReadValues(
+    const DeviceReadValue* values,
+    int n)
+{
+    readValues(values, n, "deviceReadValues");
+}
+
+
 scalar deviceReadScalar(const scalar* dSrc)
 {
-    ensureRedScratch();
-    if (!g_readPinned) cudaCheck(cudaMallocHost(reinterpret_cast<void**>(&g_readPinned), sizeof(scalar)), "read pinned alloc");
-    cudaCheck(cudaMemcpy(g_readPinned, dSrc, sizeof(scalar), cudaMemcpyDeviceToHost), "readScalar");
-    return *g_readPinned;
+    scalar v = 0;
+    DeviceReadValue one;
+    one.dSrc = dSrc;
+    one.hDst = &v;
+    one.isInt = false;
+    readValues(&one, 1, "deviceReadScalar");
+    return v;
+}
+
+
+void deviceReadScalarWaitProbe()
+{
+    ValueMailbox* boxDev = nullptr;
+    ValueMailbox* box = valueMailbox(&boxDev);
+    (void)boxDev;
+    // A number no publish kernel will ever carry, and none is launched: the wait has to give up on the
+    // clock, not on the queue. The read counter is untouched, so reads after this one still work.
+    waitForMailboxSequence(box, ~0ull, "deviceReadScalar");
 }
 
 } // namespace brae

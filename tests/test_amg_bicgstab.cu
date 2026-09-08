@@ -344,6 +344,16 @@ int main(int argc, char** argv)
         AMGData amg2 = buildAMG(internalOwner(sm), sm.neighbour(), internalFaceWeights(sm, sg), sm.nCells());
         amgGalerkin(amg2, aD, aU, aL);
 
+        // Leg F is about the CG-vs-BiCGStab coarsest DISPATCH. The DIRECT solve (Leg G below) now sits
+        // in front of both of those branches and is exact for either, so with it live this leg would
+        // compare a solve against itself. Drop the factorisation while the iterative branches are the
+        // ones under test -- they are still what runs whenever the coarsest level is larger than
+        // DENSE_COARSE_MAX or BRAE_AMG_COARSE_LU is off -- and Leg G restores it.
+        const int savedLUn = amg2.coarseLUn;
+        check(savedLUn == amg2.level.back().nCoarse,
+              "amgGalerkin factorised the coarsest level (the premise Leg G tests)");
+        amg2.coarseLUn = 0;
+
         // The premise of the whole leg: the operator the coarsest solver is handed is itself asymmetric.
         // It is Galerkin-built, so this is not implied by the fine matrix being asymmetric -- an asymmetry
         // that alternates sign face by face cancels in the agglomerated sum.
@@ -382,6 +392,53 @@ int main(int argc, char** argv)
         check(symLeft > 100.0 * asymLeft, "the same V-cycle with the CG coarsest solve is at least 100x worse");
         std::printf("        (|b-Ax|/|b| after 10 stationary V-cycles: asymmetric coarsest %.4e, CG coarsest %.4e)\n",
                     static_cast<double>(asymLeft), static_cast<double>(symLeft));
+
+        // ---- Leg G: the DIRECT coarsest solve ---------------------------------------------------
+        // amgGalerkin factorises the coarsest matrix (dense LU, partial pivoting) whenever it is small
+        // enough and the V-cycle dispatch prefers it. Two things have to hold. It must actually invert
+        // the coarsest operator -- an approximate coarsest solve is the failure COARSE_REL_TOL exists
+        // to avoid, and a factorisation only earns its place by being exact. And being exact for a
+        // nonsymmetric operator as well, it must make the asymmetric/symmetric dispatch above moot.
+        amg2.coarseLUn = savedLUn;
+        {
+            const int nc = amg2.level.back().nCoarse;
+            const DeviceLduView cv = amg2.level.back().coarseView();
+            std::vector<scalar> rh(static_cast<std::size_t>(nc));
+            for (int i = 0; i < nc; ++i) rh[i] = std::sin(0.7*i) + 1.3;   // no structure for the LU to exploit
+            DeviceBuffer<scalar> rc(rh), xc(static_cast<std::size_t>(nc)), Axc(static_cast<std::size_t>(nc)), res(static_cast<std::size_t>(nc));
+            auto relResidual = [&]()
+            {
+                deviceCoarseLUSolve(nc, amg2.coarseLU, amg2.coarsePiv, rc, xc);
+                deviceAmul(cv, xc, Axc);
+                deviceCopy(res, rc);
+                deviceAxpy(-1.0, Axc, res);
+                return deviceSumMag(res) / deviceSumMag(rc);
+            };
+            const scalar exact = relResidual();
+            check(exact < 1e-12, "the dense LU inverts the coarsest operator to round-off");
+            // FAIL-PROOF. The bound above is only worth something if a factorisation that is WRONG
+            // cannot clear it: perturb one stored factor entry by 1% and the same check must fail.
+            std::vector<scalar> luH;
+            amg2.coarseLU.copyTo(luH);
+            std::vector<scalar> bad = luH;
+            bad[0] *= 1.01;
+            amg2.coarseLU.copyFrom(bad);
+            const scalar broken = relResidual();
+            check(broken > 1e-12, "...and a 1% perturbation of one factor entry FAILS it (fail-proof)");
+            amg2.coarseLU.copyFrom(luH);
+            std::printf("        (coarsest %d cells: |A_c x - b|/|b| exact %.3e, perturbed %.3e)\n",
+                        nc, static_cast<double>(exact), static_cast<double>(broken));
+
+            // ...and in the V-cycle it is not a DIFFERENT preconditioner, it is the limit the iterative
+            // one is asking COARSE_REL_TOL (1e-12) to reach: the same ten stationary cycles must leave
+            // the same fine residual. (Only the coarsest arm is held fixed here -- `asymmetric` also
+            // selects the smoother, so the symmetric branch is not a comparison of coarsest solves.)
+            const scalar direct = stationary(true, 10);
+            check(std::fabs(direct - asymLeft) <= 1e-6*asymLeft,
+                  "10 V-cycles on the direct coarsest solve land where converging the iterative one lands");
+            std::printf("        (|b-Ax|/|b| after 10 stationary V-cycles: direct %.6e vs iterative asymmetric %.6e)\n",
+                        static_cast<double>(direct), static_cast<double>(asymLeft));
+        }
     }
 
     // ---- Leg D: the refusals ------------------------------------------------------------------------

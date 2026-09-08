@@ -80,6 +80,127 @@ void gsColorT(
     x[c] = (b[c] - off) / safeDiag(diag[c]);   // safeDiag: floor the (FP32) diagonal, never divide by ~0
 }
 
+// THE SAME SWEEP ON A COLOUR-MAJOR PERMUTED LAYOUT (device_amg_smoothers.cu, THE LAYOUT, has the
+// measurement). gsColorT above reads its row through cells[] over the NATURAL numbering, so a colour
+// launch touches every cache line of every per-cell and per-face array and uses only the fraction
+// belonging to its colour. The four kernels below run the identical arithmetic over a numbering that
+// puts each colour's rows CONTIGUOUS: one gather per Galerkin update (coefficients + diagonal), one
+// gather per sweep (source + field), then one launch per colour with no indirection at all.
+
+// dst[i] = src[idx[i]]. The permuted diagonal, gathered where the diagonal changes (amgGalerkin).
+template <typename T>
+__global__
+void gatherByIndexT(
+    int n,
+    const label* __restrict__ idx,
+    const T* __restrict__ src,
+    T* __restrict__ dst)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[idx[i]];
+}
+
+// The source and the field into the permuted order, one read of cells[] serving both. Paid per SWEEP,
+// not per Galerkin: b and x are produced and consumed by the V-cycle's natural-layout kernels (zeroT,
+// deviceAmul, the restriction and the prolongation) between one smooth and the next.
+template <typename T>
+__global__
+void gsPermGatherT(
+    int n,
+    const label* __restrict__ cells,
+    const T* __restrict__ b,
+    const T* __restrict__ x,
+    T* __restrict__ bP,
+    T* __restrict__ xP)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const label c = cells[i];
+    bP[i] = b[c];
+    xP[i] = x[c];
+}
+
+// The per-entry coefficient: upper[f] where the row's cell OWNS face f (src >= 0), lower[-1-src] where
+// it is that face's neighbour. O(nCells + nFaces) per level, paid once per Galerkin update.
+template <typename T>
+__global__
+void gsPermCoeffT(
+    int nE,
+    const label* __restrict__ src,
+    const T* __restrict__ upper,
+    const T* __restrict__ lower,
+    T* __restrict__ coeff)
+{
+    const int e = blockIdx.x*blockDim.x + threadIdx.x;
+    if (e >= nE) return;
+    const label s = src[e];
+    coeff[e] = (s >= 0) ? upper[s] : lower[-1 - s];
+}
+
+// One colour of in-place Gauss-Seidel on the permuted layout. Rows [lo, hi) are one contiguous block,
+// so the launch reads only its own colour's rowStart/b/diag/x and only its own entries.
+//
+// The arithmetic is gsColorT's, operand for operand: the row's entries are laid out in gsColorT's own
+// accumulation sequence -- the owned faces' upper terms in face order, then the neighboured faces'
+// lower terms in losort order -- accumulated into the same `off`, and the update is the same
+// (b - off)/safeDiag(diag), with the division left unguarded-by-OpenFOAM's-standard exactly as
+// gsColorT leaves it. So the two sweeps produce the same bits (tests/test_gpu_amg.cu arm (a)).
+//
+// xNat is the scatter back to the natural numbering, FUSED into the sweep rather than run as a pass of
+// its own: a separate pass would re-read xP and cells[] for the same scattered stores. x (permuted) and
+// xNat therefore hold the same value for every cell at every point of the sweep, which is why a
+// colour's reads of x[nbr] -- always cells of OTHER colours -- see exactly what gsColorT's psi[nei[f]]
+// would have seen.
+template <typename T>
+__global__
+void gsColorPermT(
+    int lo,
+    int hi,
+    const label* __restrict__ rowStart,
+    const label* __restrict__ nbr,
+    const T* __restrict__ coeff,
+    const T* __restrict__ b,
+    const T* __restrict__ diag,
+    const label* __restrict__ cells,
+    T* __restrict__ x,
+    T* __restrict__ xNat)
+{
+    const int i = lo + blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= hi) return;
+    T off = T(0);
+    const label e1 = rowStart[i+1];
+    for (label e = rowStart[i]; e < e1; ++e)
+        off += coeff[e] * x[nbr[e]];
+    const T xi = (b[i] - off) / safeDiag(diag[i]);   // safeDiag: gsColorT's guard, unchanged
+    x[i] = xi;
+    xNat[cells[i]] = xi;
+}
+
+// Apsi = A psi through the permuted layout, written straight back to the natural numbering. The
+// diagonal term FIRST, then the row's entries in their layout order, which is amulKernel's order
+// (device_spmv.cu:31-40) -- so on a sound layout this is deviceAmul's bits, and a disagreement is an
+// addressing fault. The diagnostic behind test arm (b); the V-cycle never calls it.
+template <typename T>
+__global__
+void permLayoutAmulT(
+    int n,
+    const label* __restrict__ cells,
+    const label* __restrict__ rowStart,
+    const label* __restrict__ nbr,
+    const T* __restrict__ coeff,
+    const T* __restrict__ diag,
+    const T* __restrict__ x,
+    T* __restrict__ Apsi)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    T s = diag[i] * x[i];
+    const label e1 = rowStart[i+1];
+    for (label e = rowStart[i]; e < e1; ++e)
+        s += coeff[e] * x[nbr[e]];
+    Apsi[cells[i]] = s;
+}
+
 // RESTRICTION, fine residual -> coarse right-hand side.
 //
 // This is the hottest nondeterminism site in the solver: it runs on every level of every V-cycle of every

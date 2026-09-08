@@ -2746,6 +2746,12 @@ target_include_directories(test_dilu PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT
 target_link_libraries(test_dilu PRIVATE brae_core)
 add_test(NAME dilu COMMAND test_dilu)
 
+# The fused Gauss gradient (N fields, one launch) is bit-identical to N separate gradKernel launches.
+add_executable(test_grad_fused tests/test_grad_fused.cu)
+target_include_directories(test_grad_fused PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_grad_fused PRIVATE brae_core)
+add_test(NAME grad_fused COMMAND test_grad_fused)
+
 # AMG as the preconditioner of the ASYMMETRIC BiCGStab (OpenFOAM's `solver PBiCGStab; preconditioner GAMG`):
 # the answer must not depend on the preconditioner, it must take fewer iterations, and the coarsest solve --
 # a CG on a nonsymmetric operator until now -- is held to a host direct solve with that CG as the fail-proof.
@@ -2991,6 +2997,13 @@ add_executable(test_gpu_blas tests/test_gpu_blas.cu)
 target_include_directories(test_gpu_blas PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_gpu_blas PRIVATE brae_core)
 add_test(NAME gpu_blas COMMAND test_gpu_blas)
+
+# deviceReadScalar's mailbox: the published value must be bit-for-bit the blocking copy's, in both modes,
+# with the unordered-producer control and the bounded wait's throw.
+add_executable(test_scalar_mailbox tests/test_scalar_mailbox.cu)
+target_include_directories(test_scalar_mailbox PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_scalar_mailbox PRIVATE brae_core)
+add_test(NAME scalar_mailbox COMMAND test_scalar_mailbox)
 
 # GPU offload G1: device lduMatrix SpMV (Amul)
 add_executable(test_gpu_spmv tests/test_gpu_spmv.cu)

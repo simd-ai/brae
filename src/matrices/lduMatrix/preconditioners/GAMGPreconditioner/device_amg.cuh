@@ -87,6 +87,37 @@ struct GridColoring {
     DeviceBuffer<label> cells;   // grid cells reordered by color (size = grid nCells)
     DeviceBuffer<label> start;   // color offsets into cells[] (size nColors+1, host-readable copy below)
     std::vector<label>  startH;  // host copy of start (the smoother loops colors on the host, launching per color)
+
+    // THE COLOUR-MAJOR PERMUTED LAYOUT of this grid (device_amg_smoothers.cu has the measurement).
+    // gsColorT walks cells[] over the NATURAL cell numbering, so every colour launch touches every
+    // cache line of every per-cell and per-face array and uses only the fraction belonging to its
+    // colour. The layout below numbers the cells COLOUR-MAJOR -- colour k is rows
+    // [startH[k], startH[k+1]) and cells[new] is the original index of the cell at that position --
+    // and lays each row's entries out in gsColorT's own accumulation order, so a colour launch is one
+    // contiguous block with no indirection.
+    //
+    // Lifetime. The permutation and rowStart/rowNbr/rowSrc are a function of this grid's GRAPH only,
+    // so they are built once per grid per mesh (amgEnsurePermutedGSLayout) and survive the AMG binary
+    // cache: the cache stores the colouring and the addressing, and this is derived from them exactly
+    // as the Galerkin gather lists are, with no format change. coeff and diagP are VALUES: they are
+    // re-gathered by amgGalerkin, which is where they change. bP/psiP are re-gathered by every sweep,
+    // because the V-cycle's natural-layout kernels (zeroT, deviceAmul, restrict, prolong) produce and
+    // consume b and x between one smooth and the next. Mutable because gsSweep takes the colouring by
+    // const reference; none of it carries state between sweeps.
+    mutable bool permBuilt = false;
+    mutable int permCells = 0;
+    mutable int permFaces = 0;
+    mutable const void* permOwner = nullptr;   // the addressing the layout was built for (see above)
+    mutable const void* permNei = nullptr;
+    mutable DeviceBuffer<label> rowStart;      // nCells+1: row i's entries are [rowStart[i], rowStart[i+1])
+    mutable DeviceBuffer<label> rowNbr;        // 2*nInternalFaces: the neighbour's NEW index
+    // ...and where the entry's coefficient comes from: f >= 0 is upper[f] (the row's cell OWNS face f),
+    // a negative v is lower[-1 - v] (the row's cell is that face's NEIGHBOUR). One array rather than a
+    // face index plus a side byte, so the per-Galerkin gather reads 4 bytes per entry instead of 5.
+    mutable DeviceBuffer<label> rowSrc;
+    mutable DeviceBuffer<scalar> coeff;        // 2*nInternalFaces: gathered per Galerkin update
+    mutable DeviceBuffer<scalar> diagP;        // nCells: gathered per Galerkin update
+    mutable DeviceBuffer<scalar> bP, psiP;     // nCells: gathered per sweep
 };
 
 struct AMGData {
@@ -111,6 +142,15 @@ struct AMGData {
     std::unique_ptr<AMGGraphCache> gcache;                      // cached V-cycle graph (capture once, replay)
     std::unique_ptr<AMGGraphCache> gcacheF;                     // cached FP32 V-cycle graph (#7 mixed precision)
     std::unique_ptr<PCGGraphCache> pcgCache;                    // cached device-resident PCG WHILE-body graph (#6); per-solver lifetime
+    // DIRECT COARSEST SOLVE (BRAE_AMG_COARSE_LU, on by default; device_amg_detail.cuh has the design).
+    // The dense LU of the coarsest matrix, refreshed by amgGalerkin -- the one point where the coarse
+    // coefficients change, and, as with the permuted GS coefficients, the one point outside every graph
+    // capture. coarseLUn is the level size it was factorised for, and 0 when there is no factorisation
+    // (level too big, flag off, or amgGalerkin not yet run): the V-cycle dispatch tests it against the
+    // grid it is about to solve and falls through to the iterative coarsest solvers when they differ.
+    DeviceBuffer<scalar> coarseLU;                              // n*n row-major, L (unit diagonal) and U in place
+    DeviceBuffer<int>    coarsePiv;                             // n row interchanges, in factorisation order
+    int coarseLUn = 0;
     int nCoarse = 0, nCoarseFaces = 0;                          // back-compat: the FIRST coarse level (level[0])
     int nLevels() const { return static_cast<int>(level.size()); }
     DeviceLduView coarseView() const { return level.front().coarseView(); }   // first coarse level (for #7b tests)
@@ -132,6 +172,54 @@ AMGData buildOrLoadAMG(const std::vector<label>& fineOwner, const std::vector<la
 // Galerkin: rebuild the coarse matrix coefficients from the current fine matrix (diag/upper/lower).
 void amgGalerkin(AMGData& A, const DeviceBuffer<scalar>& fineDiag, const DeviceBuffer<scalar>& fineUpper,
                  const DeviceBuffer<scalar>& fineLower);
+
+// THE COLOUR-MAJOR PERMUTED GAUSS-SEIDEL LAYOUT (GridColoring above; device_amg_smoothers.cu has the
+// build, the sweep and the measurement). Public because tests/test_gpu_amg.cu holds the two sweeps
+// together, checks the addressing against the level's own matvec, and corrupts a layout to prove the
+// checker sees it; the V-cycle itself only ever calls gsSweep.
+
+// Build grid g's permuted layout from the matrix it will be swept with, and gather its coefficients
+// once, if it is not already current for that addressing. Cheap (two pointer compares) when warm.
+// Throws, naming itself, when the colouring's sizes are not the matrix's -- a colouring swept over a
+// grid it was not built for is a data race that no residual can see. Returns false, without building,
+// when called with a stream capture in progress and no layout yet: the build reads the addressing back
+// to the host, which a capture cannot record, so the caller falls back to the indirection sweep (the
+// same bits, see below) rather than baking a half-built layout into a graph.
+bool amgEnsurePermutedGSLayout(const GridColoring& gc, const DeviceLduView& A);
+
+// The permuted coefficients (coeff) and diagonal (diagP) of one grid, from the matrix values that grid
+// was just Galerkin-updated to. A no-op when the layout is not built. Called once per outer iteration
+// from amgGalerkin -- the one point where the coefficients change, and the one point outside every
+// graph capture: a "have I gathered this solve" host test evaluated INSIDE a captured V-cycle bakes its
+// answer into the graph, and every replay would then smooth with the coefficients of the iteration the
+// graph was captured in.
+void amgGatherPermutedGSCoeffs(const GridColoring& gc, const scalar* diag, const scalar* upper, const scalar* lower);
+
+// One multicolour Gauss-Seidel sweep, the two layouts. Same operands in the same order per row, so the
+// same bits (test arm (a)); gsSweep picks between them on BRAE_AMG_GS_PERM. The permuted one refuses
+// (throws) a layout that is not current for A.
+void amgGSSweepPermuted(const DeviceLduView& A, const DeviceBuffer<scalar>& b, DeviceBuffer<scalar>& x,
+                        const GridColoring& gc, bool forward);
+void amgGSSweepIndirect(const DeviceLduView& A, const DeviceBuffer<scalar>& b, DeviceBuffer<scalar>& x,
+                        const GridColoring& gc, bool forward);
+
+// Apsi = A psi computed THROUGH the permuted layout (the gathered coefficients and row entries the
+// sweep reads), written back to the natural numbering. Its per-row summation is amulKernel's
+// (device_spmv.cu:31-40: the diagonal, then the owned faces' upper terms in face order, then the
+// neighboured faces' lower terms in losort order), so it is the same bits as deviceAmul on a sound
+// layout -- which is what makes it a test of the ADDRESSING. Throws as the sweep does. It writes the
+// colouring's per-sweep scratch (bP/psiP), which every sweep rewrites anyway, so it must not be called
+// between a sweep's gather and its colour launches -- a diagnostic, not a solver call.
+void amgPermutedLayoutAmul(const GridColoring& gc, const DeviceLduView& A,
+                           const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi);
+
+// The layout's own fail-proof, run on the built layout read back from the device: cells[] is a
+// bijection of [0, nCells), the colour ranges tile it, each row carries exactly the entries its cell
+// owns and neighbours in gsColorT's order, every entry names the right face and side, and no entry
+// names a cell of the row's own colour. Returns "" when the layout is sound, else what is wrong,
+// naming the offending row or entry. The builder runs the same check on its host arrays before it
+// uploads anything.
+std::string amgCheckPermutedGSLayout(const GridColoring& gc, const DeviceLduView& A);
 
 // AMG-preconditioned CG (the V-cycle replaces the Jacobi preconditioner). Same solution as deviceJacobiPCG.
 // captureVcycle: record the (host-scalar-free) V-cycle into a CUDA graph and replay it each PCG iteration, same

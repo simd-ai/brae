@@ -267,10 +267,16 @@ static DeviceSolverPerf deviceAMGPCGGraph(
     // the ONE read: the report OpenFOAM prints, after the whole solve has run on the device
     scalar hRes[2];
     int nIter;
-    cudaCheck(cudaMemcpyAsync(&hRes[0], c.sInit.data(), sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "pcg init D2H");
-    cudaCheck(cudaMemcpyAsync(&hRes[1], c.sRes.data(),  sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "pcg final D2H");
-    cudaCheck(cudaMemcpyAsync(&nIter,   c.sIter.data(), sizeof(int),    cudaMemcpyDeviceToHost, cudaStreamPerThread), "pcg iters D2H");
-    cudaStreamSynchronize(cudaStreamPerThread);
+    // The whole report in ONE publish and ONE wait, in the order the three copies had. The capture ended
+    // above and the graph was LAUNCHED here, so this read is outside any capture (the mailbox refuses one
+    // by name). BRAE_READ_SCALAR_SYNC=1 restores the three copies and the sync.
+    const DeviceReadValue repV[3] =
+    {
+        {c.sInit.data(), &hRes[0], false},
+        {c.sRes.data(), &hRes[1], false},
+        {c.sIter.data(), &nIter, true}
+    };
+    deviceReadValues(repV, 3);
     perf.initialResidual = hRes[0];
     perf.finalResidual   = hRes[1];
     perf.nIterations     = nIter;
@@ -343,8 +349,12 @@ DeviceSolverPerf deviceParallelAMGPCGGraph(
     gsum(rA, c.sInit.data());
     gsScaleInvK<<<1,1,0,strm>>>(c.sInit.data(), c.sNormF.data());
     scalar initRes;
-    cudaCheck(cudaMemcpyAsync(&initRes, c.sInit.data(), sizeof(scalar), cudaMemcpyDeviceToHost, strm), "pgraph init D2H");
-    cudaStreamSynchronize(strm);
+    // strm IS cudaStreamPerThread (above), which is the stream the mailbox publishes on.
+    const DeviceReadValue initV[1] =
+    {
+        {c.sInit.data(), &initRes, false}
+    };
+    deviceReadValues(initV, 1);
     perf.initialResidual = initRes; perf.finalResidual = initRes;
     auto convergedHost = [&](scalar fr){ return (fr < tol) || (relTol > 0.0 && fr < relTol*initRes); };
     if (convergedHost(initRes)) { perf.nIterations = 0; return perf; }
@@ -360,8 +370,11 @@ DeviceSolverPerf deviceParallelAMGPCGGraph(
     gsum(rA, c.sRes.data());
     gsScaleInvK<<<1,1,0,strm>>>(c.sRes.data(), c.sNormF.data());
     scalar res1;
-    cudaCheck(cudaMemcpyAsync(&res1, c.sRes.data(), sizeof(scalar), cudaMemcpyDeviceToHost, strm), "pgraph it0 D2H");
-    cudaStreamSynchronize(strm);
+    const DeviceReadValue it0V[1] =
+    {
+        {c.sRes.data(), &res1, false}
+    };
+    deviceReadValues(it0V, 1);
     if (convergedHost(res1) || maxIter <= 1) { perf.finalResidual = res1; perf.nIterations = 1; return perf; }
     cudaMemsetAsync(c.sIter.data(), 0, sizeof(int), strm);
 
@@ -406,10 +419,15 @@ DeviceSolverPerf deviceParallelAMGPCGGraph(
         c.keyEpoch = deviceReductionScratchEpoch();
     }
     cudaCheck(cudaGraphLaunch(c.exec, strm), "pgraph launch");
-    scalar finalRes; int whileIters;
-    cudaCheck(cudaMemcpyAsync(&finalRes, c.sRes.data(), sizeof(scalar), cudaMemcpyDeviceToHost, strm), "pgraph final D2H");
-    cudaCheck(cudaMemcpyAsync(&whileIters, c.sIter.data(), sizeof(int), cudaMemcpyDeviceToHost, strm), "pgraph iters D2H");
-    cudaStreamSynchronize(strm);
+    scalar finalRes;
+    int whileIters;
+    // The residual and the WHILE node's count in one wait, after the launch (not inside the capture).
+    const DeviceReadValue repV[2] =
+    {
+        {c.sRes.data(), &finalRes, false},
+        {c.sIter.data(), &whileIters, true}
+    };
+    deviceReadValues(repV, 2);
     perf.finalResidual = finalRes;
     perf.nIterations = 1 + whileIters;
     return perf;

@@ -151,7 +151,8 @@ void announceNormFactorMode()
 //     !converged) || n < minIter), with n already incremented -- the host's `++nIter` then `while`.
 // Same kernels, same order, same operands, so psi and the iteration count are bit-identical to the host
 // loop; tests/bicg_device_loop_identity holds two cases' solve reports and written fields to that.
-// Four host syncs per solve where the host loop paid 2*nIter+1.
+// Four host READS per solve where the host loop paid 2*nIter+1, and each of the four is now a mailbox
+// wait rather than a queue-draining cudaStreamSynchronize (reductions.cu).
 namespace
 {
 __global__ void bicgNormK(const scalar* __restrict__ sum, const scalar* __restrict__ nf, scalar* __restrict__ out)
@@ -263,8 +264,13 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
     deviceSumMagInto(c.rA, s.rNorm.data());
     bicgNormK<<<1,1>>>(s.rNorm.data(), c.gNormF.data(), c.gInit.data());
     scalar initRes;
-    cudaCheck(cudaMemcpyAsync(&initRes, c.gInit.data(), sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "bicg init D2H");
-    cudaStreamSynchronize(cudaStreamPerThread);
+    // Read through the mailbox: one publish kernel enqueued where the D2H copy sat, one host spin, no
+    // queue drain. BRAE_READ_SCALAR_SYNC=1 restores the copy and the sync at this and every other site.
+    const DeviceReadValue initV[1] =
+    {
+        {c.gInit.data(), &initRes, false}
+    };
+    deviceReadValues(initV, 1);
     perf.initialResidual = initRes;
     perf.finalResidual   = initRes;
     perf.nIterations     = 0;
@@ -299,9 +305,14 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
     deviceSumMagInto(c.rA, s.rNorm.data());
     bicgNormK<<<1,1>>>(s.rNorm.data(), c.gNormF.data(), c.gRN.data());              // |r|/nf on the device
     scalar rn, bdv;
-    cudaCheck(cudaMemcpyAsync(&rn,  c.gRN.data(),  sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "bicg r0 D2H");
-    cudaCheck(cudaMemcpyAsync(&bdv, s.bd.data(),    sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "bicg bd D2H");
-    cudaStreamSynchronize(cudaStreamPerThread);
+    // Both in ONE publish and ONE wait, in the order the two copies had. Nothing on the stream writes
+    // either between them, so the pair is the same snapshot the two copies took.
+    const DeviceReadValue it0V[2] =
+    {
+        {c.gRN.data(), &rn, false},
+        {s.bd.data(), &bdv, false}
+    };
+    deviceReadValues(it0V, 2);
     perf.finalResidual = rn;
     int nIter = 1;
     if (bdv != 0.0 || !((nIter < maxIter && !converged(perf.finalResidual)) || nIter < minIter))
@@ -397,15 +408,20 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
     if (!announced)
     {
         announced = true;
-        std::printf("  BiCGStab: device loop (conditional graph, 4 host syncs per solve); BRAE_BICG_HOST_LOOP=1 restores the host loop\n");
+        std::printf("  BiCGStab: device loop (conditional graph, 4 host reads per solve, mailbox); BRAE_BICG_HOST_LOOP=1 restores the host loop\n");
     }
     cudaCheck(cudaGraphLaunch(c.exec, cudaStreamPerThread), "bicg graph launch");
     // sync 4 of 4: the report
     scalar fr;
     int ni;
-    cudaCheck(cudaMemcpyAsync(&fr, c.gFinal.data(), sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "bicg final D2H");
-    cudaCheck(cudaMemcpyAsync(&ni, c.gIter.data(),  sizeof(int),    cudaMemcpyDeviceToHost, cudaStreamPerThread), "bicg iter D2H");
-    cudaStreamSynchronize(cudaStreamPerThread);
+    // The residual and the iteration count in one wait. The capture ended above and the graph was
+    // LAUNCHED, not captured, so this read is outside any capture -- the mailbox refuses one by name.
+    const DeviceReadValue repV[2] =
+    {
+        {c.gFinal.data(), &fr, false},
+        {c.gIter.data(), &ni, true}
+    };
+    deviceReadValues(repV, 2);
     perf.finalResidual = fr;      // already |s|/nf or |r|/nf: bicgNormK divides on the device
     perf.nIterations   = ni;
     return true;

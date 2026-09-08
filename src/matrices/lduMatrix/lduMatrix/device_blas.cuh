@@ -42,9 +42,38 @@ void   deviceScalarDivNeg(const scalar* num, const scalar* den, scalar* out, sca
 void   deviceScalarDivConst(const scalar* num, scalar denom, scalar* out);                            // *out = *num / denom (host const)
 void   deviceScalarAdd2(const scalar* a, const scalar* b, scalar c, scalar* out);                     // *out = *a + *b + c
 void   deviceScalarCopy(const scalar* src, scalar* dst);                                              // *dst = *src
+// One value of a multi-value read-back: where it lives on the device, what it is, and where it lands on
+// the host. The int case is the iteration count the graph solvers report; the scalar case is a residual.
+struct DeviceReadValue
+{
+    const void* dSrc = nullptr;    // device address to read
+    void*       hDst = nullptr;    // host address to write (any storage -- pinned or a plain local)
+    bool        isInt = false;     // a 4-byte int; otherwise an 8-byte scalar
+};
+
+// The widest read converted is the fused Gauss-Seidel report: GS_FUSED_MAX (3) residuals and their three
+// sweep counts, so six. Eight leaves headroom without making the publish kernel's parameter block large.
+constexpr int DEVICE_READ_MAX_VALUES = 8;
+
+// Up to DEVICE_READ_MAX_VALUES device values to the host through ONE publish kernel and ONE wait. The
+// solvers' reads come in groups -- a residual AND a sweep count, a residual per component -- and every
+// group was a run of cudaMemcpyAsync D2H followed by one cudaStreamSynchronize, which is a queue drain
+// each. One publish kernel enqueued where the first of those copies sat reads the whole group in one
+// thread, so the group observes exactly the device state the copies would have (nothing on the stream
+// runs between them either way). BRAE_READ_SCALAR_SYNC=1 restores the copies and the sync.
+void deviceReadValues(const DeviceReadValue* values, int n);
+// One device scalar, on the host. A one-thread kernel publishes it into mapped pinned memory behind a
+// sequence number the host spins on, ordered on cudaStreamPerThread exactly where the blocking cudaMemcpy
+// this replaced sat -- same value, same ordering, no caller changes -- so the read costs the kernel's own
+// latency instead of a queue drain (7.19 ms of the pressure phase's 20.8 ms was idle ahead of reads like
+// this one at 306k cells). BRAE_READ_SCALAR_SYNC=1 restores the blocking copy; both return the same bits.
+// The one-value case of deviceReadValues, through the same mailbox and the same wait.
 scalar deviceReadScalar(const scalar* dSrc);
+// Test-only: spin on a sequence number the device never publishes, so tests/test_scalar_mailbox covers the
+// two-second bound and the throw that ends it. Blocks for two seconds, then throws.
+void deviceReadScalarWaitProbe();
 // The stage-1 partials buffer behind every reduction is grown on demand and the old one FREED. A graph that
 // captured a reduction holds that pointer; compare this before replaying and recapture when it changed.
-int deviceReductionScratchEpoch();                                                          // pinned D2H (1 sync)
+int deviceReductionScratchEpoch();
 
 } // namespace brae

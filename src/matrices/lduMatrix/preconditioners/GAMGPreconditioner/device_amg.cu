@@ -1053,12 +1053,61 @@ void amgGalerkin(
         }
     }
     cudaCheck(cudaGetLastError(), "galerkin");
+    // THE MULTICOLOUR GAUSS-SEIDEL SMOOTHER'S PERMUTED COEFFICIENTS (BRAE_AMG_GS + BRAE_AMG_GS_PERM;
+    // device_amg_smoothers.cu, THE LAYOUT, has the design and the measurement). The coefficients are
+    // what just changed on every smoothed grid, so this is where they are re-gathered into the
+    // colour-major order the sweep reads: once per outer iteration, against the ~5 sweeps per level an
+    // outer iteration runs, and -- the part that is not an optimisation -- OUTSIDE every graph capture.
+    // A gather made conditional on "have I done this solve" and evaluated inside a captured V-cycle
+    // bakes its answer into the graph, and every replay would then smooth with the coefficients of the
+    // iteration the graph was captured in.
+    //
+    // Grid 0's come from THIS call's fineDiag/fineUpper/fineLower -- the same arrays the coarse
+    // operators below were built from, so the smoother is exactly as current as they are. The gather is
+    // a no-op on a grid whose layout is not built yet; the first V-cycle builds it and gathers once
+    // (amgEnsurePermutedGSLayout), and from the next Galerkin on this owns it.
+    if (A.gsSmooth)
+    {
+        for (int g = 0; g < A.nLevels() && g < static_cast<int>(A.coloring.size()); ++g)
+        {
+            if (g == 0)
+            {
+                amgGatherPermutedGSCoeffs(A.coloring[0], fineDiag.data(), fineUpper.data(), fineLower.data());
+            }
+            else
+            {
+                const AMGLevel& Lg = A.level[g-1];
+                amgGatherPermutedGSCoeffs(A.coloring[g], Lg.cDiag.data(), Lg.cUpper.data(), Lg.cLower.data());
+            }
+        }
+    }
     // The coarse operators just changed, so any Chebyshev spectrum estimate keyed to the old
     // operator is stale. Across SIMPLE steps the pressure matrix is re-weighted non-uniformly
     // (face fluxes / Ap evolve with the velocity field), which shifts the spectrum of D^-1 A,
     // not just its diagonal scale -- a frozen interval eventually fails to cover the top modes
     // and the Chebyshev smoother stops damping them. Re-estimate on the next solve. No cost
     // unless BRAE_CHEBYSHEV is on (ensureSpectrum early-returns otherwise).
+    // THE DIRECT COARSEST SOLVE'S FACTORISATION (BRAE_AMG_COARSE_LU; device_amg_detail.cuh has the
+    // design). The coarsest coefficients are what just changed, so this is where the dense LU is
+    // refreshed: once per outer iteration against the V-cycles that outer iteration runs, and -- the
+    // part that is not an optimisation -- OUTSIDE every graph capture, for the same reason the permuted
+    // GS coefficients are gathered here. A factorisation made conditional inside a captured V-cycle
+    // would bake the coefficients of the iteration the graph was captured in into every replay.
+    if (useDenseCoarse() && A.nLevels() > 0 && A.level.back().nCoarse <= DENSE_COARSE_MAX)
+    {
+        const int n = A.level.back().nCoarse;
+        if (A.coarseLUn != n)
+        {
+            A.coarseLU.resize(static_cast<std::size_t>(n)*n);
+            A.coarsePiv.resize(n);
+            A.coarseLUn = n;
+        }
+        deviceCoarseLUFactor(A.level.back().coarseView(), A.coarseLU, A.coarsePiv);
+    }
+    else
+    {
+        A.coarseLUn = 0;
+    }
     A.spectrumReady = false;
     static bool saDbgOnce = false;                             // report the SA coarse-operator health just once
     if (A.saSmooth && std::getenv("BRAE_AMG_DEBUG") && !saDbgOnce)   // diag sign + dominance + coarsest definiteness

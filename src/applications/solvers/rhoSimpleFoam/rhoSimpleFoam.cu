@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <chrono>
+#include <nvtx3/nvToolsExt.h>
 namespace brae {
 namespace gpu {
 namespace rhoSimple {
@@ -331,6 +332,30 @@ bool phaseTimeOn()
     static const bool on = std::getenv("BRAE_PHASE_TIME") != nullptr;
     return on;
 }
+// ...and the same boundaries as NVTX ranges, so a profiler can attribute kernels and GAPS to a phase.
+// Without them the timeline says what ran and not which equation it belonged to, and after the solver
+// work the question that matters is where the IDLE sits: at 306k the four phases are ~55 ms per outer
+// iteration of wall against ~29 ms of GPU-busy time spread over ~910 launches.
+bool phaseNvtxOn()
+{
+    static const bool on = std::getenv("BRAE_PHASE_NVTX") != nullptr;
+    return on;
+}
+int g_nvtxDepth = 0;
+void phaseRange(const char* name)
+{
+    if (!phaseNvtxOn()) return;
+    if (g_nvtxDepth > 0)
+    {
+        nvtxRangePop();
+        --g_nvtxDepth;
+    }
+    if (name)
+    {
+        nvtxRangePushA(name);
+        ++g_nvtxDepth;
+    }
+}
 // charge the time since the last mark to `slot` (null = start the clock), then restart it
 void phaseMark(double* slot)
 {
@@ -432,6 +457,7 @@ Residuals rhoSimpleStep(
 
     // ---- UEqn.H ------------------------------------------------------------------------------
     phaseMark(nullptr);
+    phaseRange("UEqn");
     RhoMomentumInput uin;
     uin.phiInt = &f.phiInt;          uin.phiBnd = &f.phiBnd;
     uin.rhoCell = &f.rho;            uin.rhoBndFace = &f.rhoBnd;
@@ -619,6 +645,7 @@ Residuals rhoSimpleStep(
 
     // ---- EEqn.H ------------------------------------------------------------------------------
     phaseMark(&g_tU);
+    phaseRange("EEqn");
     {
         RhoEnergyInput ein;
         ein.phiInt = &f.phiInt;           ein.phiBnd = &f.phiBnd;
@@ -723,6 +750,7 @@ Residuals rhoSimpleStep(
 
     // ---- pEqn.H or pcEqn.H -------------------------------------------------------------------
     phaseMark(&g_tE);
+    phaseRange("pEqn");
     RhoPressureInput pin;
     pin.rhoCell = &f.rho;            pin.rhoBndFace = &f.rhoBnd;
     pin.psiCell = &f.psi;            pin.psiBndFace = &f.psiBnd;
@@ -1022,8 +1050,10 @@ Residuals rhoSimpleStep(
     // turbulence->correct() -- LAST, so the NEXT iteration's momentum equation uses this iteration's
     // closure. OpenFOAM's lagged coupling.
     phaseMark(&g_tP);
+    phaseRange("turbulence");
     if (in.correct) in.correct();
     phaseMark(&g_tTurb);
+    phaseRange(nullptr);
     sd.scalars("kOut", f.k);
     sd.scalars("epsOut", f.epsilon);
     sd.scalars("nutOut", f.nut);

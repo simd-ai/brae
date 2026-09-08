@@ -574,7 +574,17 @@ const GradUMemo& deviceGradUShared(
     for (int k = 0; k < 3; ++k)
     {
         deviceBCValue(dbU.comp[k], *Uc[k], m.ub[k], skip);
-        deviceGaussGrad(dm, *Uc[k], m.ub[k], m.gx[k], m.gy[k], m.gz[k], skip);
+    }
+    // ONE pass for the three components: the gradient kernel re-reads the whole mesh addressing and
+    // geometry per launch and the field it differentiates is a small part of that traffic, so three
+    // launches move it three times. Profiled at 305,760 cells: gradKernel was 16 launches and 4.5 ms
+    // of a 30 ms GPU-busy iteration, the largest assembly item after the matrix-vector product.
+    // Bit-identical per field (tests/test_grad_fused.cu holds the fused kernel to three separate
+    // deviceGaussGrad calls by memcmp), and `skip` behaves exactly as it did per launch.
+    {
+        const DeviceBuffer<scalar>* vol[3] = {Uc[0], Uc[1], Uc[2]};
+        const DeviceBuffer<scalar>* bv[3]  = {&m.ub[0], &m.ub[1], &m.ub[2]};
+        deviceGaussGradFused(dm, 3, vol, bv, m.gx, m.gy, m.gz, skip);
     }
     m.valid = true;
     return m;

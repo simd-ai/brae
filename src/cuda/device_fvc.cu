@@ -3,6 +3,8 @@
 // bndCellStart), race-free, deterministic, matching the CPU fvc to machine precision.
 #include "device_mesh.cuh"
 #include <cuda_runtime.h>
+#include <stdexcept>
+#include <string>
 
 namespace brae {
 
@@ -157,6 +159,192 @@ void deviceGaussGrad(
                                             dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndGFace.data(), dm.bndIsEmpty.data(), bval.data(),
                                             dm.V.data(), gx.data(), gy.data(), gz.data(), skipIf);
     cudaCheck(cudaGetLastError(), "gaussGrad");
+}
+
+
+namespace {
+// THE SAME GRADIENT, N FIELDS AT A TIME, IN ONE LAUNCH.
+//
+// WHY. nsys on the compressible iteration at 305,760 cells (12 outer iterations): gradKernel ran 16
+// times per outer iteration at 281 us each -- 4.5 ms/it, 15% of all GPU work and second only to the
+// matrix-vector product, in an iteration that is launch- and bandwidth-bound (about 30 ms of GPU-busy
+// time in 914 launches). Nine of the sixteen are velocity components in groups of three, and each of
+// those three re-reads the WHOLE of the addressing and geometry -- owner, nei, w, Sf*, ownerStart,
+// losort, losortStart, bndCellStart, bndPerm, bndGFace, bndIsEmpty, V -- to carry one field, which is a
+// small fraction of the traffic. Reading the row once is what took the colour Gauss-Seidel sweep from
+// 524 to 231 us at 306k (device_colour_gauss_seidel.cu); this is the same lever on the assembly side.
+//
+// WHY IT IS BIT-IDENTICAL TO gradKernel, per field. Fusing N independent fields is a loop interchange
+// and nothing else: the same three loops, in the same order, over the same faces, with the same
+// expressions, each field accumulated into its own registers in the same sequence. Nothing is
+// reassociated and nothing is shared but the operands that are read. tests/test_grad_fused.cu holds
+// that to memcmp against N separate gradKernel launches, and its one-ulp control proves the per-field
+// registers are not crossed -- which is the failure mode a fused kernel actually has.
+template<int N>
+struct GradFusedFields
+{
+    const scalar* vol[N];
+    const scalar* bval[N];
+    scalar* gx[N];
+    scalar* gy[N];
+    scalar* gz[N];
+};
+
+
+template<int N>
+__global__
+void gradFusedKernel(
+    int nC,
+    const label* __restrict__ own,
+    const label* __restrict__ nei,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ Sfx,
+    const scalar* __restrict__ Sfy,
+    const scalar* __restrict__ Sfz,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ losort,
+    const label* __restrict__ losortStart,
+    const label* __restrict__ bndCellStart,
+    const label* __restrict__ bndPerm,
+    const label* __restrict__ bndGFace,
+    const label* __restrict__ bndIsEmpty,   // emptyFvPatch::size() == 0: an empty face is never in OpenFOAM's sum
+    const scalar* __restrict__ V,
+    GradFusedFields<N> fld,
+    const int* __restrict__ skipIf)     // device flag: when set, this launch is a no-op (the grad(U) memo hit)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    if (skipIf && *skipIf) return;
+
+    scalar sx[N], sy[N], sz[N];
+#pragma unroll
+    for (int i = 0; i < N; ++i)
+    {
+        sx[i] = 0.0;
+        sy[i] = 0.0;
+        sz[i] = 0.0;
+    }
+    for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)   // +owner internal
+    {
+        const scalar wf = w[f];
+        const label o = own[f], n = nei[f];
+        const scalar sfx = Sfx[f], sfy = Sfy[f], sfz = Sfz[f];
+#pragma unroll
+        for (int i = 0; i < N; ++i)
+        {
+            const scalar pf = wf * fld.vol[i][o] + (1.0 - wf) * fld.vol[i][n];
+            sx[i] += sfx * pf;
+            sy[i] += sfy * pf;
+            sz[i] += sfz * pf;
+        }
+    }
+    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)   // -neighbour internal
+    {
+        const int f = losort[k];
+        const scalar wf = w[f];
+        const label o = own[f], n = nei[f];
+        const scalar sfx = Sfx[f], sfy = Sfy[f], sfz = Sfz[f];
+#pragma unroll
+        for (int i = 0; i < N; ++i)
+        {
+            const scalar pf = wf * fld.vol[i][o] + (1.0 - wf) * fld.vol[i][n];
+            sx[i] -= sfx * pf;
+            sy[i] -= sfy * pf;
+            sz[i] -= sfz * pf;
+        }
+    }
+    for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)   // +boundary
+    {
+        const int kk = bndPerm[k];
+        // The same skip as gradKernel's, for the same reason: OpenFOAM cannot sum a face of a
+        // zero-sized patch, so an empty face is in no surface sum (item 36c).
+        if (bndIsEmpty[kk]) continue;
+        const int f = bndGFace[kk];
+        const scalar sfx = Sfx[f], sfy = Sfy[f], sfz = Sfz[f];
+#pragma unroll
+        for (int i = 0; i < N; ++i)
+        {
+            const scalar pv = fld.bval[i][kk];
+            sx[i] += sfx * pv;
+            sy[i] += sfy * pv;
+            sz[i] += sfz * pv;
+        }
+    }
+    const scalar Vc = V[c];
+#pragma unroll
+    for (int i = 0; i < N; ++i)
+    {
+        fld.gx[i][c] = sx[i] / Vc;
+        fld.gy[i][c] = sy[i] / Vc;
+        fld.gz[i][c] = sz[i] / Vc;
+    }
+}
+
+
+template<int N>
+void launchGradFused(
+    const DeviceMesh& dm,
+    const DeviceBuffer<scalar>* const* vol,
+    const DeviceBuffer<scalar>* const* bval,
+    DeviceBuffer<scalar>* gx,
+    DeviceBuffer<scalar>* gy,
+    DeviceBuffer<scalar>* gz,
+    const int* skipIf)
+{
+    GradFusedFields<N> fld;
+    for (int i = 0; i < N; ++i)
+    {
+        fld.vol[i]  = vol[i]->data();
+        fld.bval[i] = bval[i]->data();
+        fld.gx[i]   = gx[i].data();
+        fld.gy[i]   = gy[i].data();
+        fld.gz[i]   = gz[i].data();
+    }
+    gradFusedKernel<N><<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.owner.data(), dm.nei.data(), dm.w.data(),
+                                                    dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
+                                                    dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
+                                                    dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndGFace.data(), dm.bndIsEmpty.data(),
+                                                    dm.V.data(), fld, skipIf);
+    cudaCheck(cudaGetLastError(), "gaussGradFused");
+}
+} // namespace
+
+
+void deviceGaussGradFused(
+    const DeviceMesh& dm,
+    int n,
+    const DeviceBuffer<scalar>* const* vol,
+    const DeviceBuffer<scalar>* const* bval,
+    DeviceBuffer<scalar>* gx,
+    DeviceBuffer<scalar>* gy,
+    DeviceBuffer<scalar>* gz,
+    const int* skipIf)
+{
+    // Refuse rather than truncate: silently gradient-ing the first three of four fields is exactly the
+    // class of quiet substitution this project keeps finding.
+    if (n < 1 || n > 3)
+    {
+        throw std::runtime_error("brae: deviceGaussGradFused takes 1, 2 or 3 fields, asked for "
+                                 + std::to_string(n) + ".");
+    }
+    for (int i = 0; i < n; ++i)
+    {
+        gx[i].resize(dm.nCells);
+        gy[i].resize(dm.nCells);
+        gz[i].resize(dm.nCells);
+    }
+    switch (n)
+    {
+        case 1:
+            launchGradFused<1>(dm, vol, bval, gx, gy, gz, skipIf);
+            break;
+        case 2:
+            launchGradFused<2>(dm, vol, bval, gx, gy, gz, skipIf);
+            break;
+        default:
+            launchGradFused<3>(dm, vol, bval, gx, gy, gz, skipIf);
+            break;
+    }
 }
 
 

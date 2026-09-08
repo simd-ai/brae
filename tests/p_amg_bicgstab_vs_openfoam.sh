@@ -225,6 +225,12 @@ stage "$W/b_amg"  gamgprecon 0   2000 "$N"
 run   "$W/b_amg"  brae || { tail -20 "$W/b_amg/run.log";  say "EXACT       the AMG run finished" FAIL; }
 stage "$W/b_diag" gamgprecon 0   2000 "$N"
 run   "$W/b_diag" brae BRAE_P_SOLVER=diagonal || { tail -20 "$W/b_diag/run.log"; say "REF         the diagonal run finished" FAIL; }
+# The V-cycle's SMOOTHER on this path is the two-stage Gauss-Seidel, chosen across three mesh sizes
+# (the numbers are at useTSGSAsym() in device_amg_detail.cuh). BRAE_AMG_TSGS=0 restores the weighted
+# Jacobi: a smoother changes the cost and the iterate under a loose relTol, never the converged answer,
+# so this arm must meet the same bound as the default one.
+stage "$W/b_jac"  gamgprecon 0   2000 "$N"
+run   "$W/b_jac"  brae BRAE_AMG_TSGS=0 || { tail -20 "$W/b_jac/run.log"; say "SMOOTHER    the weighted-Jacobi run finished" FAIL; }
 stage "$W/b_ctrl" gamgprecon 0.1 2000 "$N"
 run   "$W/b_ctrl" brae || { tail -20 "$W/b_ctrl/run.log"; say "CONTROL     the loose AMG run finished" FAIL; }
 stage "$W/b_fp"   gamgprecon 0   1    "$N"
@@ -404,6 +410,8 @@ e = worst(load('b_amg', N), of, 'EXACT AMG vs OF')
 say(e <= BOUND, 'EXACT       the AMG-preconditioned BiCGStab tracks OpenFOAM at N=%d (bound %.0e)' % (N, BOUND))
 e = worst(load('b_diag', N), of, 'REF diagonal vs OF')
 say(e <= BOUND, 'REF         the diagonal opt-out also meets the bound (the bound is meetable here)')
+e = worst(load('b_jac', N), of, 'SMOOTHER Jacobi vs OF')
+say(e <= BOUND, 'SMOOTHER    the weighted-Jacobi V-cycle meets the same bound (the smoother is a cost, not an answer)')
 # The CONTROL must have RUN to mean anything: a missing field reads as `inf`, which would sail past a
 # `> BOUND` test while proving nothing about whether the comparison can see a preconditioner difference.
 bc = load('b_ctrl', N)

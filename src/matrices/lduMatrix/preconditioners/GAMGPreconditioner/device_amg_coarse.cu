@@ -337,6 +337,186 @@ void coarseBiCGStabKernel(
         __syncthreads();
     }
 }
+
+// ---------------------------------------------------------------------------------------------------
+// DIRECT COARSEST SOLVE: dense LU with partial pivoting (device_amg_detail.cuh, DENSE_COARSE_MAX).
+// OpenFOAM's own `directSolveCoarsest` alternative at this level (GAMGSolver.C:266-278 -> LUscalarMatrix).
+// Factorisation runs once per Galerkin update (amgGalerkin), the substitutions once per V-cycle.
+// ---------------------------------------------------------------------------------------------------
+
+// A_c -> P A_c = L U, in ONE block, lu[] row-major in global memory (n <= DENSE_COARSE_MAX, so
+// n*n doubles is at most 512 KB and stays in L2). Right-looking, one k at a time: the pivot search and
+// the row swap are serial in k, the multipliers and the trailing rank-1 update are spread over the block.
+__global__
+void coarseLUFactorKernel(
+    int n,
+    const scalar* __restrict__ diag,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ nei,
+    const scalar* __restrict__ upper,
+    const label* __restrict__ losortStart,
+    const label* __restrict__ losort,
+    const label* __restrict__ owner,
+    const scalar* __restrict__ lower,
+    scalar* __restrict__ lu,
+    int* __restrict__ piv,
+    bool inShared)
+{
+    const int tid = threadIdx.x;
+    __shared__ scalar shPiv;      // the chosen pivot's value, and the scale below
+    __shared__ int shRow;         // the chosen pivot's row
+    __shared__ scalar shScale;    // max|diag| of this level: the floor DENSE_LU_EPS is relative to
+    // The factorisation is n sequential k-steps of very little arithmetic each, so it is latency
+    // bound, not bandwidth bound: run it in SHARED memory whenever n*n doubles fit (the caller sets
+    // inShared and the launch's dynamic size together) and write the factors out once at the end.
+    // Measured on squareBend at 305,760 cells, whose coarsest level is 64 cells: 336 us per outer
+    // iteration through global memory, 31 us through shared.
+    extern __shared__ scalar sh[];
+    scalar* __restrict__ A = inShared ? sh : lu;
+    for (int i = tid; i < n*n; i += blockDim.x) A[i] = 0.0;
+    __syncthreads();
+    // Dense fill from the LDU addressing, one row per thread. lduMatrix::Amul is
+    // Apsi[owner] += upper[f]*psi[nei], Apsi[nei] += lower[f]*psi[owner], so row c holds upper[f] in
+    // column nei[f] for the faces c owns and lower[f] in column owner[f] for the faces c neighbours --
+    // exactly the two gathers coarseBiCGStabKernel's SpMV runs above.
+    for (int c = tid; c < n; c += blockDim.x)
+    {
+        A[c*n + c] = diag[c];
+        for (int f = ownerStart[c]; f < ownerStart[c+1]; ++f) A[c*n + nei[f]] = upper[f];
+        for (int k = losortStart[c]; k < losortStart[c+1]; ++k)
+        {
+            const int f = losort[k];
+            A[c*n + owner[f]] = lower[f];
+        }
+    }
+    __syncthreads();
+    if (tid == 0)
+    {
+        scalar m = 0.0;
+        for (int c = 0; c < n; ++c) m = fmax(m, fabs(diag[c]));
+        shScale = (m > 0.0) ? m : 1.0;
+    }
+    __syncthreads();
+    for (int k = 0; k < n; ++k)
+    {
+        if (tid < 32)   // partial pivot: the largest |a_ik| at or below the diagonal, one warp
+        {
+            // One warp rather than one thread: a serial scan of column k costs a shared-memory
+            // latency per row, and there are n of these steps, which is where the whole factorisation
+            // was spending its time (measured: 246 us per outer iteration at n = 64, 63 us with this).
+            scalar bv = -1.0;
+            int bi = k;
+            for (int i = k + tid; i < n; i += 32)
+            {
+                const scalar v = fabs(A[i*n + k]);
+                if (v > bv) { bv = v; bi = i; }
+            }
+            for (int off = 16; off > 0; off >>= 1)
+            {
+                const scalar ov = __shfl_down_sync(0xffffffffu, bv, off);
+                const int oi = __shfl_down_sync(0xffffffffu, bi, off);
+                if (ov > bv) { bv = ov; bi = oi; }
+            }
+            if (tid == 0)
+            {
+                shRow = bi;
+                piv[k] = bi;
+            }
+        }
+        __syncthreads();
+        if (shRow != k)
+        {
+            for (int j = tid; j < n; j += blockDim.x)
+            {
+                const scalar t = A[k*n + j];
+                A[k*n + j] = A[shRow*n + j];
+                A[shRow*n + j] = t;
+            }
+            __syncthreads();
+        }
+        if (tid == 0)
+        {
+            // A singular level (an all-Neumann pressure whose reference cell never reached this grid)
+            // leaves a zero pivot here. Dividing by it would put Inf into the correction and take the
+            // outer solve to maxIter on garbage, so the pivot is floored at DENSE_LU_EPS*max|diag|
+            // instead: the factorisation stays a FIXED linear operator (which is all the outer Krylov
+            // method needs of a preconditioner), it just stops being the exact inverse in that
+            // direction. There is no fallback to the iterative twin because there is nothing to fall
+            // back to -- the same singular direction stalls it as well.
+            scalar d = A[k*n + k];
+            const scalar floor_ = DENSE_LU_EPS*shScale;
+            if (!(fabs(d) > floor_)) d = (d < 0.0) ? -floor_ : floor_;
+            A[k*n + k] = d;
+            shPiv = d;
+        }
+        __syncthreads();
+        const scalar rp = 1.0/shPiv;
+        for (int i = k+1+tid; i < n; i += blockDim.x) A[i*n + k] *= rp;   // multipliers, kept in L's slot
+        __syncthreads();
+        const int m = n - k - 1;
+        for (int idx = tid; idx < m*m; idx += blockDim.x)                  // trailing rank-1 update
+        {
+            const int i = k + 1 + idx/m;
+            const int j = k + 1 + idx%m;
+            A[i*n + j] -= A[i*n + k]*A[k*n + j];
+        }
+        __syncthreads();
+    }
+    if (inShared) for (int i = tid; i < n*n; i += blockDim.x) lu[i] = A[i];
+}
+
+// x = U^-1 L^-1 P b, in ONE block. Column-oriented substitutions (the row-oriented form is serial in i);
+// 2n barriers at n <= 256 is a few microseconds against the 706 us the iterative coarsest solve measured
+// on squareBend at 305,760 cells.
+__global__
+void coarseLUSolveKernel(
+    int n,
+    const scalar* __restrict__ lu,
+    const int* __restrict__ piv,
+    const scalar* __restrict__ rc,
+    scalar* __restrict__ xc,
+    bool inShared)
+{
+    // sh holds y (n), and the factors too when they fit: both substitutions are n sequential steps
+    // whose scalar reads sit on the critical path, so reading them from global memory costs a device
+    // latency per step (measured: 50 us per call at n = 64, 9 us with the factors in shared).
+    extern __shared__ scalar sh[];
+    scalar* y = sh;
+    const scalar* __restrict__ A = inShared ? sh + n : lu;
+    const int tid = threadIdx.x;
+    if (inShared)
+    {
+        for (int i = tid; i < n*n; i += blockDim.x) sh[n + i] = lu[i];
+        __syncthreads();
+    }
+    for (int i = tid; i < n; i += blockDim.x) y[i] = rc[i];
+    __syncthreads();
+    if (tid == 0)                                   // apply the row interchanges in factorisation order
+    {
+        for (int k = 0; k < n; ++k)
+        {
+            const int r = piv[k];
+            if (r != k) { const scalar t = y[k]; y[k] = y[r]; y[r] = t; }
+        }
+    }
+    __syncthreads();
+    for (int k = 0; k < n; ++k)                     // forward: L has a unit diagonal
+    {
+        const scalar yk = y[k];
+        for (int i = k+1+tid; i < n; i += blockDim.x) y[i] -= A[i*n + k]*yk;
+        __syncthreads();
+    }
+    for (int k = n-1; k >= 0; --k)                  // backward
+    {
+        if (tid == 0) y[k] /= A[k*n + k];
+        __syncthreads();
+        const scalar yk = y[k];
+        for (int i = tid; i < k; i += blockDim.x) y[i] -= A[i*n + k]*yk;
+        __syncthreads();
+    }
+    for (int i = tid; i < n; i += blockDim.x) xc[i] = y[i];
+}
+
 } // anon
 
 bool deviceCoarseFitsCluster(int nCoarse)
@@ -433,6 +613,48 @@ void deviceCoarseBiCGStab(
     coarseBiCGStabKernel<<<1, bs, shBytes, cudaStreamPerThread>>>(nC, nIters,
         rc.data(), cv.diag, cv.ownerStart, cv.nei, cv.upper, cv.losortStart, cv.losort, cv.owner, cv.lower, xc.data());
     cudaCheck(cudaGetLastError(), "coarseBiCGStab launch");
+}
+
+
+// Factorise the coarsest matrix. lu is sized n*n and piv n by the caller's DeviceBuffer; one block, and
+// blockDim is warp-rounded to the level's size exactly as the iterative twins are.
+void deviceCoarseLUFactor(
+    const DeviceLduView& cv,
+    DeviceBuffer<scalar>& lu,
+    DeviceBuffer<int>& piv)
+{
+    const int nC = cv.nCells;
+    // The trailing update is (n-k)^2 elements wide at the top of the loop, so take the whole block
+    // rather than warp-rounding to nC as the iterative twins do -- their shared vectors are nC long,
+    // this one's work is nC^2.
+    const int bs = TPB;
+    // Dynamic shared for the working matrix when n*n doubles clear the 48KB a block gets without the
+    // opt-in (a non-stream runtime call; amgGalerkin is outside graph capture but the opt-in would
+    // still be a per-launch surprise, and DENSE_COARSE_MAX levels above this are rare enough to run
+    // through global memory).
+    const std::size_t shBytes = static_cast<std::size_t>(nC)*nC*sizeof(scalar);
+    const bool inShared = shBytes <= 48u*1024u;
+    coarseLUFactorKernel<<<1, bs, inShared ? shBytes : 0, cudaStreamPerThread>>>(nC,
+        cv.diag, cv.ownerStart, cv.nei, cv.upper, cv.losortStart, cv.losort, cv.owner, cv.lower,
+        lu.data(), piv.data(), inShared);
+    cudaCheck(cudaGetLastError(), "coarseLUFactor launch");
+}
+
+// Apply that factorisation: xc = A_c^-1 rc, exactly (to round-off), in one launch and with no host sync.
+void deviceCoarseLUSolve(
+    int nC,
+    const DeviceBuffer<scalar>& lu,
+    const DeviceBuffer<int>& piv,
+    const DeviceBuffer<scalar>& rc,
+    DeviceBuffer<scalar>& xc)
+{
+    const int bs = TPB;
+    // y always; the factors as well when n*(n+1) doubles clear the 48KB a block gets without the opt-in.
+    const std::size_t both = static_cast<std::size_t>(nC)*(nC + 1)*sizeof(scalar);
+    const bool inShared = both <= 48u*1024u;
+    coarseLUSolveKernel<<<1, bs, inShared ? both : nC*sizeof(scalar), cudaStreamPerThread>>>(
+        nC, lu.data(), piv.data(), rc.data(), xc.data(), inShared);
+    cudaCheck(cudaGetLastError(), "coarseLUSolve launch");
 }
 
 

@@ -460,3 +460,209 @@ Over the SAME range OpenFOAM's column was averaged on (100 iterations, not 20), 
 EEqn 7.0, pEqn 25.5 (solve 20.5), turbulence 17.9 -- p iterations first 20, mean 2.9. So the pressure is
 the ONE block where 20 CPU cores are still ahead of one GPU, 24.0 against 25.5, and everything else is
 2.4x, 1.4x and 1.3x the other way. The whole iteration is 61.2 against 82.5.
+
+## The size sweep after the momentum and pressure work (2026-09-08)
+
+The same campaign that opened this file, re-run with the colour Gauss-Seidel momentum solver and the
+AMG-preconditioned transonic pressure in place. 100 iterations, prep excluded, OpenFOAM on 20 cores with
+the deterministic decomposition:
+
+| cells   | brae (s) | OF-20c (s) | brae is |
+|--------:|---------:|-----------:|--------:|
+|  38,416 |      2.1 |        2.2 |   1.05x |
+| 112,000 |      3.8 |        4.0 |   1.05x |
+| 305,760 |      8.0 |        9.1 |   1.14x |
+| 896,000 |     21.9 |       31.1 |   1.42x |
+
+Against the same table at the start of the session -- 112k 4.5 against 3.6, 504k 25.9 against 15.0,
+896k 54.7 against 27.2, i.e. brae 1.25x to 2.0x SLOWER and getting worse with size. It is now faster at
+every size and the margin GROWS with the mesh, which is the shape the hardware should give: the CPU
+side is bandwidth-starved sooner. The crossover the earlier entry looked for and did not find (`the
+compressible crossover is not a mesh size to wait for; it appears only when item 77b is built`) is
+below the smallest mesh here.
+
+The rel L2 columns are trajectory at a fixed 100 iterations, not destination -- both codes solve the
+same equations and the converged states agree (see the converged table above); the k and epsilon
+columns grow with the mesh because the two codes take different paths through the same transient.
+
+## Choosing the V-cycle's smoother -- ACROSS THREE MESHES, because one was misleading (2026-09-08)
+
+The transonic pressure's V-cycle smoother, p SOLVE ms per outer iteration and V-cycles per solve, on the
+same case at three sizes (20 iterations each):
+
+| smoother, pre/post sweeps        |     112k |     306k |     896k |
+|----------------------------------|---------:|---------:|---------:|
+| weighted Jacobi 1/1 (what ran)   | 9.6 /2.6 | 23.0/3.5 | 67.1/4.8 |
+| weighted Jacobi 0/2              | 9.4 /2.6 | 20.0/2.9 | 68.0/5.0 |
+| two-stage Gauss-Seidel 1/1       | 9.6 /2.1 | 19.9/2.7 | 64.2/3.6 |
+| two-stage Gauss-Seidel 1/2       | 8.9 /1.6 | 19.6/2.0 | 68.5/3.1 |
+| multicolour Gauss-Seidel 0/2     |        - | 25.1/2.5 |        - |
+| strength-of-connection filter    |        - |     1885 |        - |
+
+Two of these win on ONE mesh and lose on another. Jacobi with OpenFOAM's own 0-pre/2-post shape is 13%
+better than the baseline at 306k and WORSE than it at 896k; two-stage with two post-sweeps is the best of
+all at 112k and 306k and the worst at 896k. Tuned on 306k alone, either would have shipped. The default
+is two-stage 1/1, the only one at least as good as the baseline at every size and the best at the size
+where the time hurts, and at tight tolerance (sbMatched, 1e-12) it takes 45/39/36 outer iterations
+against Jacobi's 53/50/43. It is the default on the ASYMMETRIC path only (useTSGSAsym), so the subsonic
+AMG-PCG and its gates are untouched; BRAE_AMG_TSGS=0 restores the Jacobi and the gate holds that arm to
+the same bound. The multicolour smoother needs the fewest cycles of the Gauss-Seidel family and loses on
+apply cost for the reason the momentum solver already met: its sweep walks a cells[] indirection instead
+of a colour-major layout. Porting that layout into the AMG smoother is the next lever on this block.
+
+## The colour-major layout in the AMG's multicolour smoother: it works, and it still loses (2026-09-08)
+
+The multicolour Gauss-Seidel smoother inside the V-cycle walked a cells[] indirection over the natural
+numbering, the same layout tax the momentum solver shed. It now has the colour-major permuted layout:
+the permutation built once per grid (it is a function of that grid's graph), the coefficients gathered
+once per outer iteration inside amgGalerkin, the sweep over contiguous colour blocks, and the scatter
+fused into the sweep. Bit-identical to the old sweep by memcmp on every grid, forward and backward,
+with both fail-proofs run (a mathematically identical but differently rounded division, and a frozen
+coefficient gather).
+
+p solve ms per outer iteration and V-cycles per solve, transonic pressure, three sizes:
+
+| smoother                              |     112k |     306k |     896k |
+|---------------------------------------|---------:|---------:|---------:|
+| two-stage Gauss-Seidel (the default)  | 9.2 /2.1 | 20.2/2.7 | 65.0/3.6 |
+| multicolour GS, colour-major (new)    | 14.6/2.3 | 25.3/2.6 | 73.2/3.6 |
+| multicolour GS, old indirection       | 13.6/2.3 | 25.3/2.6 | 82.6/3.6 |
+
+The layout does what it was built for -- 82.6 to 73.2 at 896k, 11%, with the cycle counts unchanged,
+which is the field-level evidence that the sweeps really are the same solver. But multicolour GS is not
+competitive with the two-stage smoother at any size, and the reason is structural rather than a layout
+one: a colour sweep costs ONE KERNEL LAUNCH PER COLOUR PER LEVEL, and on a twelve-level hierarchy whose
+lower levels hold a few hundred cells those launches cost more than the arithmetic they carry, while the
+two-stage smoother needs two passes per level whatever the colouring. The default stays two-stage; the
+layout stays as a strict improvement to the opt-in path (BRAE_AMG_GS), which the incompressible AMG
+shares. BRAE_AMG_GS_PERM=0 restores the indirection sweep.
+
+LESSON, the general form: a colour-ordered smoother is a poor fit for a DEEP hierarchy even after its
+layout is fixed, because its launch count scales with colours times levels. Fixing the layout was still
+worth doing -- it is the same 2x traffic saving as everywhere else -- it simply cannot outrun that.
+
+## Fusing the vector gradient (2026-09-08)
+
+With the solvers done the iteration is launch- and bandwidth-bound, not arithmetic-bound: at 305,760
+cells it is about 30 ms of GPU-busy time inside about 61-65 ms of wall over ~914 kernel launches. The
+largest ASSEMBLY item was the gradient -- 16 launches per outer iteration at 288 us each, 4.5 ms/it,
+second only to the matrix-vector product's 5.9 ms over 98 calls.
+
+deviceGaussGrad differentiates ONE scalar, so a velocity gradient was three launches, each re-reading
+the entire mesh addressing and geometry (owner, nei, w, the three Sf components, ownerStart, losort,
+losortStart, the boundary permutation, V) while the field itself is a small part of that traffic.
+deviceGaussGradFused carries up to three fields through one pass, bit-identical per field by memcmp
+(tests/test_grad_fused.cu, 28 arms including a one-ulp cross-contamination control on both the interior
+and the boundary values, and an empty-patch fixture; fail-proof run: feeding field 0's boundary values
+to all three fails 10 arms).
+
+| gradient work per outer iteration | launches | ms/it |
+|-----------------------------------|---------:|------:|
+| before                            |       16 |  4.50 |
+| after (momentum + turbulence memo)|  10 + 2  |  3.66 |
+| after (+ the viscous stress term) |   7 + 3  |  3.31 |
+
+One fused call costs 397 us where three separate ones cost 864 -- 2.2x, the mesh read once instead of
+three times. Whole-iteration GPU-busy 30.5 -> 29.1 ms/it. The wall figure moves inside run-to-run noise
+(64-67 ms/it over three runs either way), which is the honest reading: this is a 5% cut in GPU work on a
+path where half the iteration is idle, so the launch overhead is what stands between it and the wall.
+Seven single-field gradient launches remain, and three of the fused sites are div-scheme branches that
+this case does not select -- a case naming limitedLinearV or linearUpwindV gets more of it.
+
+## Where the iteration's time actually goes, and a measurement error worth recording (2026-09-08)
+
+NVTX phase ranges (BRAE_PHASE_NVTX=1, the boundaries the phase timer already had) put GPU work and idle
+against an equation. AND THEY MUST BE READ WITH --cuda-graph-trace=node: without it, kernels executed
+inside a CUDA graph do not appear in the timeline at all, and since the pressure, energy and turbulence
+solvers run in captured graphs while the momentum one runs a host loop, the first reading made the
+graphed phases look 42-52% idle and the momentum phase look uniquely efficient. It was an artefact.
+Corrected, per outer iteration at 306k, steady state:
+
+| phase       | wall ms | GPU-busy ms | gaps ms | idle | GPU ops |
+|-------------|--------:|------------:|--------:|-----:|--------:|
+| pressure    |    21.1 |        15.8 |    4.07 |  25% |     816 |
+| turbulence  |    14.2 |         9.6 |    4.18 |  32% |     354 |
+| energy      |     6.8 |         4.4 |    2.27 |  36% |     170 |
+| momentum    |     9.1 |         8.6 |    0.14 |   5% |     175 |
+| iteration   |    51.2 |        38.4 |   ~10.5 |  25% |    1515 |
+
+The iteration is 25% idle, not the 59% the first reading claimed. What survived the correction is the
+CAUSE and the ranking: every gap over 5 microseconds is spanned by a blocking device-to-host copy --
+9.5 ms per iteration over 48 of them -- and the momentum phase is at 5% because its readback is already
+a mailbox (a one-thread kernel publishes into mapped host memory behind a sequence number and the host
+spins on it, with a bounded fallback).
+
+deviceReadScalar, the shared readback all eleven solver call sites use, is now that mailbox
+(reductions.cu; BRAE_READ_SCALAR_SYNC=1 restores the blocking copy). Microbenchmark on a 306k reduction:
+21.3 us against 269.4 with an idle queue, 205 against 522 behind 40 queued kernels. On the real case it
+is worth about 2.9 ms per iteration (pressure 33.1 -> 31.4, turbulence 13.6 -> 13.0, energy 7.2 -> 6.7
+over 20 iterations including the cold one). The remaining 9.5 ms of gaps are the explicit
+cudaMemcpyAsync-and-synchronise pairs INSIDE the solver loops -- the BiCGStab graph path's four host
+syncs per solve and the Gauss-Seidel solvers' own readbacks -- which the shared helper does not reach.
+That is the next piece of work, and the momentum phase is the proof of what it is worth.
+
+## Every solver-loop readback through the mailbox (2026-09-08)
+
+The shared deviceReadScalar became a mailbox first, worth 2.9 ms per iteration. The rest of the idle was
+in readbacks written INLINE in the solver loops -- an explicit cudaMemcpyAsync to host followed by a
+cudaStreamSynchronize, twelve of them across the BiCGStab graph path, the AMG-PCG path and the
+Gauss-Seidel solvers, several reading a residual AND an iteration count. They now publish a group of up
+to eight values through one mailbox behind one sequence number and wait once (deviceReadValues). One
+site is deliberately still blocking: the host smoother's once-per-solve sync also makes its bulk
+device-to-host downloads visible to the CPU sweeps, which a mailbox wait does not guarantee.
+
+100 iterations at 306k, the same range OpenFOAM's block table was averaged over, with and without
+BRAE_READ_SCALAR_SYNC=1 (which restores the blocking copies at every site):
+
+| block           | OF-20c | brae, blocking readbacks | brae, mailbox |
+|-----------------|-------:|-------------------------:|--------------:|
+| momentum        |   26.1 |                     10.1 |          10.2 |
+| energy          |    9.8 |                      6.7 |           4.7 |
+| pressure        |   24.0 |                     22.6 |          21.0 |
+| turbulence      |   22.9 |                     16.5 |          12.5 |
+| the four phases |   82.8 |                     55.9 |          48.4 |
+
+7.5 ms per iteration, and it lands where the profile said it would: energy 30%, turbulence 24%,
+pressure 7%, momentum nothing (its readback was already a mailbox). brae is now ahead of 20 cores on
+every block of the compressible iteration, the pressure included, and the whole iteration is 48.4
+against 82.8 -- 1.7x.
+
+## A direct coarsest solve in the AMG V-cycle (2026-09-08)
+
+With every readback through the mailbox the pressure phase's largest remaining GPU item was the
+COARSEST-GRID SOLVE: `coarseBiCGStabKernel`, 706 us per call and three calls per outer iteration, 2.1 ms
+of a 15-16 ms phase. It is expensive for a reason -- it has to iterate to COARSE_REL_TOL (1e-12) because
+an unconverged coarsest level makes the V-cycle input-dependent and the outer Krylov method breaks on it
+(the 187 / 1000 / 89 measurement recorded next to that constant) -- and on 64 cells it typically runs to
+its 512-iteration cap trying to reach 1e-12 on a BiCGStab that has already stagnated.
+
+A factorisation removes the question. OpenFOAM offers exactly this at the same level: `directSolveCoarsest`
+builds an `LUscalarMatrix` -- a dense LU of the coarsest matrix -- instead of the PBiCGStab/PCG
+(GAMGSolver.C:266-278 against :299-328). brae now does the same by default when the coarsest grid is at
+most `DENSE_COARSE_MAX` cells, which with the default `BRAE_AMG_TARGET` of 64 it always is:
+`amgGalerkin` factorises (dense LU, partial pivoting, one block, in shared memory) at the one point where
+the coarse coefficients change and outside every graph capture, and each V-cycle pays only the two
+substitutions. `BRAE_AMG_COARSE_LU=0` restores the iterative solvers.
+
+100 iterations at 306k, BRAE_PHASE_TIME, one interleaved pair:
+
+| block            | OF-20c | brae, iterative coarsest | brae, direct coarsest |
+|------------------|-------:|-------------------------:|----------------------:|
+| momentum         |   26.1 |                     10.3 |                  10.2 |
+| energy           |    9.8 |                      4.8 |                   4.8 |
+| pressure         |   24.0 |                     19.8 |                  17.1 |
+| turbulence       |   22.9 |                     12.5 |                  12.6 |
+| the four phases  |   82.8 |                     47.4 |                  44.7 |
+| the p SOLVE only |      - |                     16.2 |                  13.3 |
+
+The pressure solve is 18% cheaper. It is not a different preconditioner: the outer BiCGStab takes the
+same number of iterations (2.13 against 2.17 mean over the 100), and in the unit gate ten stationary
+V-cycles land on the same fine residual to seven figures (6.033179e-06 both) -- the direct solve is the
+limit the iterative one was being asked to reach, at a fixed cost that no longer depends on the
+right-hand side. Four interleaved end-to-end pairs: 0.367 / 0.180 / 0.267 / 0.226 s saved over the
+100 iterations, always in the same direction.
+
+Kernel cost at n = 64, from the graph-node profile: the factorisation is 114 us once per outer iteration
+(246 us before the pivot search was given a warp instead of a thread, 336 us before the working matrix
+moved into shared memory) and each substitution 44 us, against 3 x 706 us. What is left of the pressure
+phase is the SpMV -- 106 `amulKernel` launches per iteration, 3.65 ms -- and 3.0 ms of idle.

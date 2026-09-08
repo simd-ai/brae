@@ -163,7 +163,12 @@ void vcycleAt(
         // deviceCoarsePCG is a conjugate gradient, whose step length presumes p.Ap is an A-norm. Its
         // asymmetric twin is a BiCGStab, which is what OpenFOAM builds for an asymmetric coarsest level
         // (GAMGSolver.C:299-328). Every other branch below is weighted Jacobi and needs no distinction.
-        if (n <= SB_CG_MAX && asymmetric) deviceCoarseBiCGStab(Ag, bg, xg, ncoarseAsymCap);
+        // The DIRECT coarsest solve, when amgGalerkin factorised this grid (BRAE_AMG_COARSE_LU; the
+        // test is against the grid size so a hierarchy whose coarsest changed, or a caller that never
+        // ran a Galerkin update, falls through to the iterative solvers below). Exact for both the
+        // symmetric and the asymmetric operator, so it precedes the CG/BiCGStab split.
+        if (amg.coarseLUn == n) deviceCoarseLUSolve(n, amg.coarseLU, amg.coarsePiv, bg, xg);
+        else if (n <= SB_CG_MAX && asymmetric) deviceCoarseBiCGStab(Ag, bg, xg, ncoarseAsymCap);
         else if (n <= SB_CG_MAX) deviceCoarsePCG(Ag, bg, xg, ncoarseCG);            // tiny coarsest: single-block Jacobi-PCG (cheap+accurate)
         else if (n <= SB_MAX) deviceCoarseJacobiSingleBlock(Ag, bg, xg, NCOARSE);   // larger: single-block many-sweep Jacobi
         else if (deviceCoarseFitsCluster(n) && n <= COARSE_FUSE_MAX) deviceCoarseJacobiFused(Ag, bg, xg, NCOARSE);
@@ -175,9 +180,9 @@ void vcycleAt(
         return;
     }
     if (useChebyshev()) chebyshevSmooth(Ag, bg, xg, amg.vD[g], amg.vAx[g], amg.lambdaMax[g], chebDeg());  // pre-smooth (x=0)
-    else if (useTSGS()) twoStageGSSmooth(Ag, bg, xg, amg.vD[g], amg.vAx[g], NPRE, tsgsOrder(), true);     // OF v2606 twoStageGaussSeidel (fwd)
-    else if (amg.gsSmooth) for (int s = 0; s < NPRE; ++s) gsSweep(Ag, bg, xg, amg.coloring[g], true);    // forward GS
-    else for (int s = 0; s < NPRE; ++s)
+    else if (asymmetric ? useTSGSAsym() : useTSGS()) twoStageGSSmooth(Ag, bg, xg, amg.vD[g], amg.vAx[g], nPreSweeps(), tsgsOrder(), true);     // OF v2606 twoStageGaussSeidel (fwd)
+    else if (amg.gsSmooth) for (int s = 0; s < nPreSweeps(); ++s) gsSweep(Ag, bg, xg, amg.coloring[g], true);    // forward GS
+    else for (int s = 0; s < nPreSweeps(); ++s)
     {
         deviceAmul(Ag, xg, amg.vAx[g]);
         smoothT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
@@ -214,9 +219,9 @@ void vcycleAt(
     else
         prolongT<scalar><<<nBlocks(n),TPB>>>(n, Lg.map.data(), amg.vX[g+1].data(), xg.data());
     if (useChebyshev()) chebyshevSmooth(Ag, bg, xg, amg.vD[g], amg.vAx[g], amg.lambdaMax[g], chebDeg());  // post-smooth
-    else if (useTSGS()) twoStageGSSmooth(Ag, bg, xg, amg.vD[g], amg.vAx[g], NPOST, tsgsOrder(), false);  // twoStageGaussSeidel (bwd -> symmetric)
-    else if (amg.gsSmooth) for (int s = 0; s < NPOST; ++s) gsSweep(Ag, bg, xg, amg.coloring[g], false);  // backward GS (symmetric V-cycle)
-    else for (int s = 0; s < NPOST; ++s)
+    else if (asymmetric ? useTSGSAsym() : useTSGS()) twoStageGSSmooth(Ag, bg, xg, amg.vD[g], amg.vAx[g], nPostSweeps(), tsgsOrder(), false);  // twoStageGaussSeidel (bwd -> symmetric)
+    else if (amg.gsSmooth) for (int s = 0; s < nPostSweeps(); ++s) gsSweep(Ag, bg, xg, amg.coloring[g], false);  // backward GS (symmetric V-cycle)
+    else for (int s = 0; s < nPostSweeps(); ++s)
     {
         deviceAmul(Ag, xg, amg.vAx[g]);
         smoothT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
@@ -302,7 +307,8 @@ void vcycleAtF(
         // The asymmetric coarsest solve iterates to COARSE_REL_TOL and this is only its CAP.
         static const int ncoarseAsymCap = [](){ const char* e=std::getenv("BRAE_NCOARSE_CG"); return (e&&std::atoi(e)>0)?std::atoi(e):NCOARSE_ASYM_CAP; }();
         // Same coarsest split as the FP64 V-cycle: CG is not a solve on a nonsymmetric operator.
-        if (n <= SB_CG_MAX && asymmetric) deviceCoarseBiCGStab(topoG, amg.vB[g], amg.vX[g], ncoarseAsymCap);
+        if (amg.coarseLUn == n) deviceCoarseLUSolve(n, amg.coarseLU, amg.coarsePiv, amg.vB[g], amg.vX[g]);
+        else if (n <= SB_CG_MAX && asymmetric) deviceCoarseBiCGStab(topoG, amg.vB[g], amg.vX[g], ncoarseAsymCap);
         else if (n <= SB_CG_MAX) deviceCoarsePCG(topoG, amg.vB[g], amg.vX[g], ncoarseCG);
         else
         {

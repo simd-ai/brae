@@ -175,8 +175,13 @@ static void deviceSymGaussSeidelGraph(
     deviceSumMagInto(c.r, c.gInit.data());
     gsScaleInvK<<<1,1,0,cudaStreamPerThread>>>(c.gInit.data(), c.gNormF.data());     // gInit = sum|r| / normFactor
     scalar initRes;
-    cudaCheck(cudaMemcpyAsync(&initRes, c.gInit.data(), sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "gs init D2H");
-    cudaStreamSynchronize(cudaStreamPerThread);                                       // sync 1 of 2: OF initialResidual
+    // read 1 of 2: OF initialResidual. A mailbox publish where the D2H copy sat, and a host spin instead
+    // of a queue drain; BRAE_READ_SCALAR_SYNC=1 restores the copy and the sync here and everywhere else.
+    const DeviceReadValue initV[1] =
+    {
+        {c.gInit.data(), &initRes, false}
+    };
+    deviceReadValues(initV, 1);
     if (initRes < tol && minIter <= 0)
     {
         perf = {initRes, initRes, 0};
@@ -230,12 +235,17 @@ static void deviceSymGaussSeidelGraph(
         c.sweepsPer = sweepsPer; c.symmetric = symmetric;
     }
     cudaCheck(cudaGraphLaunch(c.exec, cudaStreamPerThread), "gs graph launch");       // replay: loop runs to its stop on-device
-    // sync 2 of 2: the report. The host loop paid this once per sweep.
+    // read 2 of 2: the report. The host loop paid a blocking read once per sweep.
     scalar finalRes;
     int nIter;
-    cudaCheck(cudaMemcpyAsync(&finalRes, c.gRes.data(), sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "gs final D2H");
-    cudaCheck(cudaMemcpyAsync(&nIter,    c.gIter.data(), sizeof(int),   cudaMemcpyDeviceToHost, cudaStreamPerThread), "gs iter D2H");
-    cudaStreamSynchronize(cudaStreamPerThread);
+    // The residual and the sweep count in ONE publish and ONE wait, in the order the two copies had. The
+    // graph was LAUNCHED here, not captured, so this read is outside any capture.
+    const DeviceReadValue repV[2] =
+    {
+        {c.gRes.data(), &finalRes, false},
+        {c.gIter.data(), &nIter, true}
+    };
+    deviceReadValues(repV, 2);
     perf = {initRes, finalRes, nIter};
     if (std::getenv("BRAE_GS_DEBUG"))
         std::printf("    GS[dev] init=%.4e final=%.4e sweeps=%d (relTol=%.2g nSweeps=%d)\n", initRes, finalRes, nIter, relTol, sweepsPer);
@@ -378,8 +388,14 @@ static void deviceSymGaussSeidelGraphFused(
     }
     gsScaleInvNK<<<1, 32, 0, cudaStreamPerThread>>>(nComp, c.gInit.data(), c.gNormF.data());
     scalar initH[GS_FUSED_MAX];
-    cudaCheck(cudaMemcpyAsync(initH, c.gInit.data(), nComp*sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "gs fused init D2H");
-    cudaStreamSynchronize(cudaStreamPerThread);
+    // The nComp initial residuals in one wait. They are contiguous, so the copy was one; the mailbox
+    // carries them as nComp values read by the one publish thread, which is the same snapshot.
+    DeviceReadValue initV[GS_FUSED_MAX];
+    for (int k = 0; k < nComp; ++k)
+    {
+        initV[k] = {c.gInit.data() + k, initH + k, false};
+    }
+    deviceReadValues(initV, nComp);
     int activeH[GS_FUSED_MAX];
     int nActive = 0;
     for (int k = 0; k < nComp; ++k)
@@ -444,9 +460,16 @@ static void deviceSymGaussSeidelGraphFused(
     cudaCheck(cudaGraphLaunch(c.exec, cudaStreamPerThread), "gs fused graph launch");
     scalar finH[GS_FUSED_MAX];
     int iterH[GS_FUSED_MAX];
-    cudaCheck(cudaMemcpyAsync(finH,  c.gFinal.data(), nComp*sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "gs fused final D2H");
-    cudaCheck(cudaMemcpyAsync(iterH, c.gIter.data(),  nComp*sizeof(int),    cudaMemcpyDeviceToHost, cudaStreamPerThread), "gs fused iter D2H");
-    cudaStreamSynchronize(cudaStreamPerThread);                                        // sync 2 of 2
+    // read 2 of 2: every component's residual and sweep count in ONE wait -- the widest read in brae at
+    // 2*GS_FUSED_MAX = 6 values, which is what sized DEVICE_READ_MAX_VALUES. Residuals first, then the
+    // counts, the order the two copies had.
+    DeviceReadValue repV[2*GS_FUSED_MAX];
+    for (int k = 0; k < nComp; ++k)
+    {
+        repV[k] = {c.gFinal.data() + k, finH + k, false};
+        repV[nComp + k] = {c.gIter.data() + k, iterH + k, true};
+    }
+    deviceReadValues(repV, 2*nComp);
     for (int k = 0; k < nComp; ++k)
         if (activeH[k]) perf[k] = {initH[k], finH[k], iterH[k]};
 }
@@ -624,6 +647,13 @@ void hostSymGaussSeidelFused(
     }
     hostGsNormK<<<1, 32, 0, cudaStreamPerThread>>>(nComp, c.gRes.data(), c.gNf.data(), c.gRes.data() + GS_FUSED_MAX);
     cudaMemcpyAsync(c.hRes, c.gRes.data() + GS_FUSED_MAX, (std::size_t)nComp*sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread);
+    // STILL A BLOCKING SYNC, deliberately, and the only read in this file that is. This sync does not
+    // only deliver the residuals: it is also what makes the bulk D2H downloads above (upper, lower, and
+    // each component's diag, b and psi) visible to the CPU sweeps below. A mailbox wait would tell us
+    // only that a kernel enqueued behind those copies has finished; CUDA documents host visibility of a
+    // D2H copy at a synchronisation, not at a later kernel's completion, so spinning here would rest the
+    // CPU's view of the whole matrix on an ordering guarantee that is not written down. It is one sync
+    // per solve; the per-sweep read inside the loop below, which is the one that pays, is the mailbox.
     cudaStreamSynchronize(cudaStreamPerThread);
     int nActive = 0;
     for (int k = 0; k < nComp; ++k)
@@ -666,8 +696,17 @@ void hostSymGaussSeidelFused(
             deviceSumMagInto(c.r[k], c.gRes.data() + k);
         }
         hostGsNormK<<<1, 32, 0, cudaStreamPerThread>>>(nComp, c.gRes.data(), c.gNf.data(), c.gRes.data() + GS_FUSED_MAX);
-        cudaMemcpyAsync(c.hRes, c.gRes.data() + GS_FUSED_MAX, (std::size_t)nComp*sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread);
-        cudaStreamSynchronize(cudaStreamPerThread);
+        // The per-sweep read, and the one this loop pays for: nComp residuals in one publish and one wait
+        // where the copy plus the sync drained the queue every pass. Nothing on the stream writes gRes
+        // between the norm kernel above and this read, so it is the same snapshot the copy took, and the
+        // only host memory it depends on is what the publish itself writes -- the H2D psi uploads above
+        // are the device READING host memory, which stream order has already completed.
+        DeviceReadValue resV[GS_FUSED_MAX];
+        for (int k = 0; k < nComp; ++k)
+        {
+            resV[k] = {c.gRes.data() + GS_FUSED_MAX + k, c.hRes + k, false};
+        }
+        deviceReadValues(resV, nComp);
         // gsSetCondK / gsFusedCondK, on the host, on the same doubles
         for (int k = 0; k < nComp; ++k)
         {

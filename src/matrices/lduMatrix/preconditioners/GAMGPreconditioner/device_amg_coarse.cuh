@@ -14,5 +14,13 @@ void deviceCoarsePCG(const DeviceLduView& cv, const DeviceBuffer<scalar>& rc, De
 // PBiCGStab for `matrixLevels_[coarsestLevel].asymmetric()`). Same single-launch shape as
 // deviceCoarsePCG: one block, shared-memory vectors, a fixed iteration count, no host sync.
 void deviceCoarseBiCGStab(const DeviceLduView& cv, const DeviceBuffer<scalar>& rc, DeviceBuffer<scalar>& xc, int nIters);
+// DIRECT coarsest solve: dense LU with partial pivoting, OpenFOAM's own `directSolveCoarsest`
+// alternative at this level (GAMGSolver.C:266-278 -> LUscalarMatrix). The factorisation is done once per
+// Galerkin update (amgGalerkin, the one point where the coarse coefficients change) and each V-cycle then
+// pays only the two substitutions. Being exact, it makes the V-cycle a fixed linear operator by
+// construction -- the property the iterative twins have to reach COARSE_REL_TOL to earn.
+void deviceCoarseLUFactor(const DeviceLduView& cv, DeviceBuffer<scalar>& lu, DeviceBuffer<int>& piv);
+void deviceCoarseLUSolve(int nC, const DeviceBuffer<scalar>& lu, const DeviceBuffer<int>& piv,
+                         const DeviceBuffer<scalar>& rc, DeviceBuffer<scalar>& xc);
 void deviceCoarseJacobiSingleBlock(const DeviceLduView& cv, const DeviceBuffer<scalar>& rc, DeviceBuffer<scalar>& xc, int nSweeps);
 } // namespace brae

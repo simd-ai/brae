@@ -299,24 +299,45 @@ void deviceDivDevReff(
     DeviceBuffer<scalar>* amiUN[3] = { &amiUNx, &amiUNy, &amiUNz };
 
     // gaussGrad(U_i) = (dUi/dx, dUi/dy, dUi/dz) = COLUMN i of G (OF convention G_ij = dU_j/dx_i, via outer(Sf,U)).
+    //
+    // The three boundary values are built FIRST, in the same per-component order and with the same halo
+    // exchange (whose receive buffer one component reuses from the next, so the exchanges must stay
+    // sequential), and the three gradients then come from ONE fused launch. The gradient kernel re-reads
+    // the whole mesh addressing and geometry per launch while the field it differentiates is a small
+    // part of that traffic, so three launches moved it three times: measured at 305,760 cells, three
+    // separate calls cost 864 us against the fused one's 389. Bit-identical per component
+    // (tests/test_grad_fused.cu holds the fused kernel to three separate deviceGaussGrad calls by
+    // memcmp). The per-component work AFTER the gradient -- the cyclic and AMI contributions, which
+    // OpenFOAM adds to the base Gauss gradient before any limiting -- is unchanged and still per i.
+    DeviceBuffer<scalar> bvals[3];
     for (int i = 0; i < 3; ++i)
     {
         // U's boundary as OF's fvc::grad(U) reads it: the STORED value when the caller keeps one, and a
         // re-derivation only when it does not. The two agree only while the caller evaluates U's boundary
         // before every assembly, which OpenFOAM does not -- see the header (queue items 25, 30).
-        DeviceBuffer<scalar> bval;
         if (UbStored && UbStored[i] && UbStored[i]->size() == static_cast<std::size_t>(nB))
-            deviceCopy(bval, *UbStored[i]);
+            deviceCopy(bvals[i], *UbStored[i]);
         else
-            deviceBCValue(dbU.comp[i], *Uc[i], bval);
+            deviceBCValue(dbU.comp[i], *Uc[i], bvals[i]);
         if (proc)   // processor faces are bcType 8: deviceBCValue leaves them, the halo supplies the value
         {
             proc->halo->exchange(Uc[i]->data());
-            proc->halo->scatterBoundaryValues(Uc[i]->data(), *proc->weights, *proc->procStart, bval.data());
+            proc->halo->scatterBoundaryValues(Uc[i]->data(), *proc->weights, *proc->procStart, bvals[i].data());
             proc->halo->waitExchange();   // recv buffer is reused by the next component -- see device_halo.cuh
         }
-        DeviceBuffer<scalar> gx, gy, gz;
-        deviceGaussGrad(dm, *Uc[i], bval, gx, gy, gz);
+    }
+    DeviceBuffer<scalar> gxs[3], gys[3], gzs[3];
+    {
+        const DeviceBuffer<scalar>* vol[3] = {Uc[0], Uc[1], Uc[2]};
+        const DeviceBuffer<scalar>* bv[3]  = {&bvals[0], &bvals[1], &bvals[2]};
+        deviceGaussGradFused(dm, 3, vol, bv, gxs, gys, gzs);
+    }
+    for (int i = 0; i < 3; ++i)
+    {
+        DeviceBuffer<scalar>& bval = bvals[i];
+        DeviceBuffer<scalar>& gx = gxs[i];
+        DeviceBuffer<scalar>& gy = gys[i];
+        DeviceBuffer<scalar>& gz = gzs[i];
 
         if (cyc)   // + cyclic faces in gradU (periodic consistency)
         {

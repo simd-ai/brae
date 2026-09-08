@@ -282,16 +282,27 @@ void assembleUEqn(
             // rhoUEqn_cpp.cu:34-37 still builds this limiter from fvc::gaussGrad, i.e. unlimited. Until
             // that is corrected the two disagree on a case that is both limitedLinearV and cellLimited;
             // OpenFOAM's source is the authority for which of them is right.
+            //
+            // THE THREE GRADIENTS ARE ONE LAUNCH (deviceGaussGradFused), not three. Same faces, same
+            // order, same expressions, bit-identical per component -- tests/test_grad_fused.cu holds
+            // that to memcmp. The only reordering is that all three boundary values are computed first,
+            // because the fused launch needs the three bval arrays live at once; deviceCopy and the
+            // limiter stay per component and compute exactly what they did. Measured motive: gradKernel
+            // was 4.5 ms of a 30 ms iteration at 306k cells (nsys, 16 launches per outer iteration).
             const DeviceBuffer<scalar>* Usrc[3] = {&Ux, &Uy, &Uz};
-            DeviceBuffer<scalar> Uarr[3], gx[3], gy[3], gz[3], ub;
+            DeviceBuffer<scalar> Uarr[3], gx[3], gy[3], gz[3], ub[3];
             for (int k = 0; k < 3; ++k)
             {
                 deviceCopy(Uarr[k], *Usrc[k]);
-                deviceBCValue(dbU.comp[k], *Usrc[k], ub);
-                deviceGaussGrad(dm, *Usrc[k], ub, gx[k], gy[k], gz[k]);
-                if (in.gradULimitK > 0.0)
+                deviceBCValue(dbU.comp[k], *Usrc[k], ub[k]);
+            }
+            const DeviceBuffer<scalar>* ubp[3] = {&ub[0], &ub[1], &ub[2]};
+            deviceGaussGradFused(dm, 3, Usrc, ubp, gx, gy, gz);
+            if (in.gradULimitK > 0.0)
+            {
+                for (int k = 0; k < 3; ++k)
                 {
-                    deviceCellLimitGrad(dm, *Usrc[k], ub, gx[k], gy[k], gz[k], in.gradULimitK);
+                    deviceCellLimitGrad(dm, *Usrc[k], ub[k], gx[k], gy[k], gz[k], in.gradULimitK);
                 }
             }
             deviceDivLimitedVCoeffs(
@@ -477,16 +488,21 @@ void assembleUEqn(
     // (queue item 25). The host reference is linearViscousStress_cpp.cu.
     if (in.correctedLaplacian)
     {
+        // One fused launch for the three components (see the limitedLinearV branch above for why): the
+        // boundary values first, then one gradient, then the limiter per component as before.
         const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
-        DeviceBuffer<scalar> gxc[3], gyc[3], gzc[3];
+        DeviceBuffer<scalar> gxc[3], gyc[3], gzc[3], ub[3];
         for (int k = 0; k < 3; ++k)
         {
-            DeviceBuffer<scalar> ub;
-            deviceBCValue(dbU.comp[k], *U[k], ub);
-            deviceGaussGrad(dm, *U[k], ub, gxc[k], gyc[k], gzc[k]);
-            if (in.gradULimitK > 0.0)
+            deviceBCValue(dbU.comp[k], *U[k], ub[k]);
+        }
+        const DeviceBuffer<scalar>* ubp[3] = {&ub[0], &ub[1], &ub[2]};
+        deviceGaussGradFused(dm, 3, U, ubp, gxc, gyc, gzc);
+        if (in.gradULimitK > 0.0)
+        {
+            for (int k = 0; k < 3; ++k)
             {
-                deviceCellLimitGrad(dm, *U[k], ub, gxc[k], gyc[k], gzc[k], in.gradULimitK);
+                deviceCellLimitGrad(dm, *U[k], ub[k], gxc[k], gyc[k], gzc[k], in.gradULimitK);
             }
         }
         if (in.snGradLimitCoeff > 0.0)
@@ -535,14 +551,18 @@ void assembleUEqn(
     if (in.scheme == cpu::rhoSimple::DivScheme::linearUpwindV)
     {
         const DeviceBuffer<scalar>* Usrc[3] = {&Ux, &Uy, &Uz};
-        DeviceBuffer<scalar> gx[3], gy[3], gz[3], ub, cx, cy, cz;
+        DeviceBuffer<scalar> gx[3], gy[3], gz[3], ub[3], cx, cy, cz;
         for (int k = 0; k < 3; ++k)
         {
-            deviceBCValue(dbU.comp[k], *Usrc[k], ub);
-            deviceGaussGrad(dm, *Usrc[k], ub, gx[k], gy[k], gz[k]);
-            if (in.gradULimitK > 0.0)
+            deviceBCValue(dbU.comp[k], *Usrc[k], ub[k]);
+        }
+        const DeviceBuffer<scalar>* ubp[3] = {&ub[0], &ub[1], &ub[2]};
+        deviceGaussGradFused(dm, 3, Usrc, ubp, gx, gy, gz);   // one launch, not three
+        if (in.gradULimitK > 0.0)
+        {
+            for (int k = 0; k < 3; ++k)
             {
-                deviceCellLimitGrad(dm, *Usrc[k], ub, gx[k], gy[k], gz[k], in.gradULimitK);
+                deviceCellLimitGrad(dm, *Usrc[k], ub[k], gx[k], gy[k], gz[k], in.gradULimitK);
             }
         }
         deviceLinearUpwindVCorr(dm, *in.phiInt, gx, gy, gz, Ux, Uy, Uz, cx, cy, cz);
@@ -563,19 +583,24 @@ void assembleUEqn(
     if (corrFac != 0.0)
     {
         const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
+        DeviceBuffer<scalar> ub[3], gx[3], gy[3], gz[3];
         for (int k = 0; k < 3; ++k)
         {
-            DeviceBuffer<scalar> ub, gx, gy, gz, lu;
-            deviceBCValue(dbU.comp[k], *U[k], ub);
-            deviceGaussGrad(dm, *U[k], ub, gx, gy, gz);
+            deviceBCValue(dbU.comp[k], *U[k], ub[k]);
+        }
+        const DeviceBuffer<scalar>* ubp[3] = {&ub[0], &ub[1], &ub[2]};
+        deviceGaussGradFused(dm, 3, U, ubp, gx, gy, gz);   // one launch, not three
+        for (int k = 0; k < 3; ++k)
+        {
+            DeviceBuffer<scalar> lu;
             // `linearUpwind <name>`, where <name> resolves to `cellLimited Gauss linear <k>`. This
             // correction does NOT vanish at convergence, so an unlimited gradient under a limited name is a
             // different equation, not a transient difference.
             if (in.gradULimitK > 0.0)
             {
-                deviceCellLimitGrad(dm, *U[k], ub, gx, gy, gz, in.gradULimitK);
+                deviceCellLimitGrad(dm, *U[k], ub[k], gx[k], gy[k], gz[k], in.gradULimitK);
             }
-            deviceLinearUpwindCorr(dm, *in.phiInt, gx, gy, gz, lu);
+            deviceLinearUpwindCorr(dm, *in.phiInt, gx[k], gy[k], gz[k], lu);
             deviceAxpy(-corrFac, lu, M.source[k]);
         }
     }

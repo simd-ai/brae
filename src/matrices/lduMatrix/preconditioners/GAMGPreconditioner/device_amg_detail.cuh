@@ -59,12 +59,25 @@ constexpr int NCOARSE_CG = 16;           // coarsest PCG iterations (dispatch de
 constexpr scalar COARSE_REL_TOL = 1e-12;
 constexpr int    NCOARSE_ASYM_CAP = 512;
 
+// DIRECT COARSEST SOLVE (dense LU with partial pivoting), the default when the coarsest grid is small
+// enough. It is OpenFOAM's own alternative at that level: GAMGSolver.C:266-278 builds an LUscalarMatrix
+// -- a dense LU factorisation of the coarsest matrix -- when `directSolveCoarsest` is set, in place of
+// the PBiCGStab/PCG of :299-328. The iterative twin above has to run to COARSE_REL_TOL because an
+// unconverged coarsest level makes the V-cycle input-dependent; a factorisation removes that question
+// entirely -- it is the exact inverse, so the V-cycle is a fixed linear operator by construction, and
+// it costs the same on every call regardless of the right-hand side. With the default TARGET of 64
+// cells the factorisation is 64^3/3 = 87 kFLOP once per outer iteration and each apply is 64^2.
+constexpr int DENSE_COARSE_MAX = 256;    // n*n doubles held in global memory; n^3/3 in ONE block above this is not worth it
+constexpr scalar DENSE_LU_EPS = 1e-14;   // pivot floor, relative to max|diag|: below it the level is singular (see below)
+
 // Feature flags (env vars), documented here once. The two default-ON flags preserve accuracy and opt out with
 // =0; the rest are experimental smoother/coarsening levers, off unless set.
 //   BRAE_AMG_FP32   (on)  FP32 V-cycle preconditioner; outer Krylov + residual stay FP64
+//   BRAE_AMG_COARSE_LU (on)  direct dense-LU coarsest solve; =0 restores the iterative PCG/BiCGStab there
 //   BRAE_PCG_DEVICE (on)  run the whole pressure PCG on-device (conditional-graph WHILE), see deviceAMGPCGGraph
 //   BRAE_CHEBYSHEV, BRAE_CHEB_DEG    Chebyshev polynomial smoother (and its degree) vs weighted-Jacobi
 //   BRAE_AMG_GS                      multicolor Gauss-Seidel smoother (off-diagonal coupling fixes anisotropy)
+//   BRAE_AMG_GS_PERM (on)   colour-major PERMUTED layout for that smoother; =0 restores the cells[] indirection sweep
 //   BRAE_AMG_TSGS, BRAE_TSGS_ORDER   OpenFOAM v2606 twoStageGaussSeidel polynomial smoother (order 0 == Jacobi)
 //   BRAE_AMG_SA                      smoothed aggregation: smoothed prolongator + general Galerkin A_c = P^T A P
 //   BRAE_AMG_SOC                     strength-of-connection filter beta for aggregation (0 = off)
@@ -83,6 +96,19 @@ inline bool envFlag(
     };
     return !(ieq(e,"0") || ieq(e,"false") || ieq(e,"off") || ieq(e,"no"));
 }
+// ...and the pre/post sweep counts as MEASURABLE knobs. OpenFOAM's own GAMG defaults to nPreSweeps 0 and
+// nPostSweeps 2 (GAMGSolver.C reads both from the solver dict), brae has always run 1 and 1, and nobody
+// had measured which is better here. BRAE_NPRE / BRAE_NPOST override them; the defaults are unchanged.
+inline int nPreSweeps()
+{
+    static const int n = [](){ const char* e = std::getenv("BRAE_NPRE"); return (e && std::atoi(e) >= 0) ? std::atoi(e) : NPRE; }();
+    return n;
+}
+inline int nPostSweeps()
+{
+    static const int n = [](){ const char* e = std::getenv("BRAE_NPOST"); return (e && std::atoi(e) >= 0) ? std::atoi(e) : NPOST; }();
+    return n;
+}
 inline bool useChebyshev()
 {
     static const bool b = std::getenv("BRAE_CHEBYSHEV") != nullptr;
@@ -98,10 +124,42 @@ inline bool useGS()
     static bool g = (std::getenv("BRAE_AMG_GS") != nullptr);
     return g;
 }
+// ...and WHICH layout that smoother sweeps. gsColorT walks a cells[] indirection over the NATURAL cell
+// numbering, so each colour launch touches every cache line of every per-cell and per-face array and
+// uses only the fraction belonging to its colour; the permuted sweep runs each colour as one contiguous
+// block of a colour-major numbering (device_amg_smoothers.cu, THE LAYOUT). The two sweeps accumulate the
+// same operands in the same order and produce the same BITS (tests/test_gpu_amg.cu arm (a)), so this is a
+// layout switch, not a solver switch: BRAE_AMG_GS_PERM=0 restores the indirection sweep, which is what
+// the before/after timing is measured against.
+inline bool useGSPermuted()
+{
+    static const bool b = envFlag("BRAE_AMG_GS_PERM", true);
+    return b;
+}
 inline bool useTSGS()
 {
     static bool t = (std::getenv("BRAE_AMG_TSGS") != nullptr);
     return t;
+}
+// ...and on an ASYMMETRIC matrix it is the DEFAULT, because it was measured to be. squareBend, the
+// transonic pressure, p solve ms per outer iteration and V-cycles per solve, at three mesh sizes:
+//                       112k         306k         896k
+//   weighted Jacobi   9.6 / 2.6   23.0 / 3.5   67.1 / 4.8      (what ran before)
+//   two-stage GS      9.6 / 2.1   19.9 / 2.7   64.2 / 3.6      (this default)
+// Two other configurations beat it on ONE mesh and lost on another, which is why the choice was made
+// across three: Jacobi with OpenFOAM's own 0-pre/2-post shape reads 9.4 / 20.0 / 68.0 -- an 18% win at
+// 306k and WORSE than the baseline at 896k -- and two-stage with 2 post-sweeps reads 8.9 / 19.6 / 68.5,
+// the best of all at the two smaller sizes and the worst at the largest. At tight tolerance
+// (sbMatched, 1e-12) two-stage takes 45 / 39 / 36 outer iterations against Jacobi's 53 / 50 / 43.
+// BRAE_AMG_TSGS=0 restores the weighted Jacobi on this path too.
+inline bool useTSGSAsym()
+{
+    const char* e = std::getenv("BRAE_AMG_TSGS");
+    if (e && *e)
+    {
+        return !(e[0] == '0' && e[1] == '\0');
+    }
+    return true;
 }
 inline int  tsgsOrder()
 {
@@ -116,6 +174,12 @@ inline bool useSA()
 inline bool useFP32()
 {
     static bool b = envFlag("BRAE_AMG_FP32", true);
+    return b;
+}
+// The direct (dense LU) coarsest solve; see DENSE_COARSE_MAX above.
+inline bool useDenseCoarse()
+{
+    static bool b = envFlag("BRAE_AMG_COARSE_LU", true);
     return b;
 }
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
