@@ -105,10 +105,28 @@ struct SolverRunsAs
 };
 
 // The degree the substituted PBiCGStab's Neumann series runs at on the transported turbulence scalars.
-// 10 from the sweep in bench/rhoSimpleFoam/eps_precond_experiment.py: degree 3 leaves min(epsilon) at
-// 169.3 where DILU leaves 182.6, degree 6 at 179.1, degree 10 at 180.5, and degree 16 does not improve
-// on 10 (it converges the preconditioned residual faster and so stops after fewer BiCGStab iterations,
-// at a comparable iterate, for 6 more SpMVs).
+//
+// 10 IS A MARGIN, NOT AN OPTIMUM, and the difference matters. Swept end to end on squareBend, cells at
+// the bound floor at outer iteration 8:
+//
+//     degree     112k        307k        896k
+//        2    FAIL 287    FAIL 133    FAIL 908
+//        3      ok          ok          ok
+//        4      ok          ok        FAIL 2351
+//        6      ok          ok          ok
+//       10      ok          ok          ok
+//
+// The failure is NON-MONOTONE in the degree, and reproducibly so: degree 4 fails at 896k twice with
+// identical numbers while degree 3 -- weaker -- is clean at all three. There is no knee to trim to. A
+// stronger preconditioner stops the BiCGStab at a different iterate, and on this transient a slightly
+// different iterate at outer iteration 2 is enough to put the run on a path where epsilon collapses; the
+// same chaotic sensitivity the bare diagonal shows across sizes. So the defence is distance from any
+// degree observed to fail, not proximity to the cheapest one that works.
+//
+// It is not bought at much: measured at 307k, the turbulence block reads 11.5 ms per outer iteration at
+// degree 4, 11.3 at 6, 13.4 at 10 and 12.6 with the plain diagonal -- every degree in that range is at
+// or below the diagonal's cost, because a stronger preconditioner saves more BiCGStab iterations than
+// its extra SpMVs cost. Trimming 10 to 6 would buy 2 ms/it and sit one degree above a value that fails.
 constexpr int POLY_DEG_KE_DEFAULT = 10;
 
 // THE ONE RULE for what preconditions a substituted PBiCGStab on a transported turbulence scalar, as a

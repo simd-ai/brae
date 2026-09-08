@@ -826,3 +826,51 @@ So the rule brae runs: a blank `preconditioner` on the transported pair takes th
 relaxed by a factor below 1, and DILU when it is not. The notice names which and says why. The largest
 factor that will be applied decides it, so a `".*Final" 1.0` corrector disqualifies the series even when
 the ordinary factor would allow it.
+
+## The degree is a margin, not an optimum (2026-09-08)
+
+Degree 10 was chosen from a sweep on the EPSILON system at 112k, which leaves two questions a default has
+to answer: does the k equation want the same degree, and is 10 anywhere near the cheapest that works?
+
+**k is not epsilon.** Same dump, same outer iteration, the iterate where OpenFOAM's relTol stops the solve:
+
+| preconditioner | epsilon: min | epsilon: err | k: min      | k: err   |
+|----------------|-------------:|-------------:|------------:|---------:|
+| Jacobi         |         73.9 |     1.33e-02 |   **-7.91** | 5.05e-02 |
+| Neumann 3      |        169.3 |     1.07e-02 |       0.465 | 3.05e-02 |
+| Neumann 6      |        179.1 |     4.62e-03 |       0.289 | 1.15e-02 |
+| Neumann 10     |        180.5 |     4.55e-03 |       0.729 | 1.34e-02 |
+| Neumann 16     |        181.5 |     1.17e-02 |       0.849 | 3.21e-03 |
+| DILU           |        182.6 |     9.93e-03 |       0.875 | 7.71e-03 |
+
+Jacobi drives k NEGATIVE, and the error metric is non-monotone in the degree because a stronger
+preconditioner stops the BiCGStab earlier, at a different iterate. min(field) is the monotone one, and it
+is also the quantity that compounds.
+
+**And the degree is not a smooth knob.** Swept end to end, cells at the bound floor at outer iteration 8:
+
+| degree |     112k |     307k |      896k |
+|-------:|---------:|---------:|----------:|
+|      2 | FAIL 287 | FAIL 133 |  FAIL 908 |
+|      3 |       ok |       ok |        ok |
+|      4 |       ok |       ok | FAIL 2351 |
+|      6 |       ok |       ok |        ok |
+|     10 |       ok |       ok |        ok |
+
+Degree 4 fails at 896k -- twice, with identical numbers, so it is deterministic and not noise -- while
+degree 3, which is WEAKER, is clean at all three sizes. There is no knee. The same chaotic sensitivity the
+bare diagonal shows across mesh sizes applies to the degree: a slightly different iterate at outer
+iteration 2 is enough to put the run on a path where epsilon collapses.
+
+The cost of the margin is small, and at low degrees it is negative. Turbulence block at 307k, ms per outer
+iteration: diagonal 12.6, degree 3 11.9, degree 4 11.5, degree 6 11.3, degree 10 13.4, degree 16 13.2,
+DILU 33.6. Every degree in that range is at or below the plain diagonal's cost, because a stronger
+preconditioner saves more BiCGStab iterations than its extra SpMVs cost. Trimming 10 to 6 would buy
+2 ms/it and sit one degree above a value measured to fail.
+
+`tests/turb_precon_vs_openfoam.sh` pins this with a degree-2 arm: it must FAIL the same bounds the default
+clears, so the degree cannot be trimmed to anything that merely passes on one mesh.
+
+**Still open on this**: brae does not print OpenFOAM's `bounding <field>, min: ... max: ... average: ...`
+(bound.C:41-46), which is the diagnostic that makes every failure in the table above visible on the first
+run instead of at a field dump. Adding it needs min/max/mean reductions the shared BLAS does not carry.

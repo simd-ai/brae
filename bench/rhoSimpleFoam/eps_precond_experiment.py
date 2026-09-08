@@ -21,8 +21,9 @@ WHAT IS REPORTED is not the iteration count. It is where the solve STOPS under O
 min(x), because the failure being chased is epsilon going non-positive and being floored at 1e-15 by
 bound(), after which nut = Cmu k^2/epsilon explodes.
 
-Usage: eps_precond_experiment.py <dump dir> <polyMesh dir> [relTol]
-Files: epsD, epsSrc, epsUpper, epsLower, epsSolveIn (the folded system and the initial guess).
+Usage: eps_precond_experiment.py <dump dir> <polyMesh dir> [relTol] [field prefix, default eps]
+Files: <prefix>D, <prefix>Src, <prefix>Upper, <prefix>Lower, <prefix>SolveIn (the folded system and the
+initial guess). The prefix is what kEpsilon.cu's dump() writes: `eps` and `k`.
 """
 import re, sys, time
 import numpy as np
@@ -30,6 +31,7 @@ import scipy.sparse as sp
 
 dump, mesh = sys.argv[1], sys.argv[2]
 relTol = float(sys.argv[3]) if len(sys.argv) > 3 else 0.1
+FLD = sys.argv[4] if len(sys.argv) > 4 else 'eps'
 MAXIT = 400
 
 def readlist(fn):
@@ -41,9 +43,9 @@ def readlist(fn):
 
 own = readlist(mesh + '/owner'); nei = readlist(mesh + '/neighbour'); nF = len(nei); own = own[:nF]
 nC = int(max(own.max(), nei.max())) + 1
-diag = np.loadtxt(dump + '/epsD'); b = np.loadtxt(dump + '/epsSrc')
-upper = np.loadtxt(dump + '/epsUpper'); lower = np.loadtxt(dump + '/epsLower')
-x0 = np.loadtxt(dump + '/epsSolveIn')
+diag = np.loadtxt(dump + '/' + FLD + 'D'); b = np.loadtxt(dump + '/' + FLD + 'Src')
+upper = np.loadtxt(dump + '/' + FLD + 'Upper'); lower = np.loadtxt(dump + '/' + FLD + 'Lower')
+x0 = np.loadtxt(dump + '/' + FLD + 'SolveIn')
 assert upper.size == nF and lower.size == nF and diag.size == nC, (upper.size, lower.size, nF, diag.size)
 
 # OpenFOAM lduMatrix::Amul: Apsi[nei] += lower[f]*psi[own], Apsi[own] += upper[f]*psi[nei]
@@ -59,7 +61,7 @@ while frontier.size:
 bip = not np.any(colour[own] == colour[nei]) and not np.any(colour < 0)
 red = np.where(colour == 0)[0]; black = np.where(colour == 1)[0]
 print('cells %d, faces %d, bipartite %s (red %d, black %d)' % (nC, nF, bip, red.size, black.size))
-print('initial epsilon: min %.4e  max %.4e' % (x0.min(), x0.max()))
+print('initial %s: min %.4e  max %.4e' % (FLD, x0.min(), x0.max()))
 
 def normFactor(x):
     xRef = x.mean(); A1 = A @ np.ones(nC)
@@ -186,8 +188,8 @@ def bicgstab(prec, nf, label, cost):
         x = x + omega * z; r = s - omega * t
         res = np.sum(np.abs(r)) / nf; rho_old = rho
     err = np.linalg.norm(x - xExact) / np.linalg.norm(xExact) if xExact is not None else float('nan')
-    print('  %-24s %3d it  res %.3e -> %.3e   |x-x*|/|x*| %.3e   min(eps) %10.4e   [%s, %.1fs]'
-          % (label, n, res0, res, err, x.min(), cost, time.time() - t0))
+    print('  %-24s %3d it  res %.3e -> %.3e   |x-x*|/|x*| %.3e   min(%s) %10.4e   [%s, %.1fs]'
+          % (label, n, res0, res, err, FLD, x.min(), cost, time.time() - t0))
     return x
 
 nf = normFactor(x0)

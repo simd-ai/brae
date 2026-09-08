@@ -120,7 +120,20 @@ IFS='|' read -r verdict detail <<< "$(check diag "$D_E_MIN" "$D_N_MIN" "$D_N_MAX
 say "...and the bare diagonal FAILS them (fail-proof)" "$verdict"
 printf '        (%s)\n' "$detail"
 
-# ---- arm 3: nut collapses to the floor under diagonal and not under DILU --------------------------
+# ---- arm 3 (FAIL-PROOF on the DEGREE): a degree the sweep found failing must fail here ------------
+# The degree is load-bearing, not decorative, and it is NOT a smooth knob: swept end to end on this mesh
+# family, degrees 2 (all three sizes) and 4 (896k, reproducibly) drive cells to the bound floor while 3, 6
+# and 10 do not. Degree 2 is the one that fails at every size, so it is the one this arm can pin. Without
+# it, the default could be trimmed to anything that still passed arm 1 on one mesh.
+stage "$W/deg2"
+( cd "$W/deg2" && BRAE_POLY_KE=2 BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BRAE" -case "$W/deg2" > log 2>&1 ) || true
+read G_E_MIN G_E_MAX G_E_FLOOR <<< "$(minmax "$W/deg2/12/epsilon")"
+read G_N_MIN G_N_MAX G_N_FLOOR <<< "$(minmax "$W/deg2/12/nut")"
+IFS='|' read -r verdict detail <<< "$(check deg2 "$G_E_MIN" "$G_N_MIN" "$G_N_MAX" fail)"
+say "a degree-2 series FAILS the same bounds (the degree is load-bearing)" "$verdict"
+printf '        (%s)\n' "$detail"
+
+# ---- arm 4: nut collapses to the floor under diagonal and not under DILU --------------------------
 # The mechanism, stated as its own number: epsilon goes non-positive, bound() floors it at 1e-15, and
 # nut = Cmu k^2/epsilon loses every significant digit in those cells.
 [ "$B_N_FLOOR" = 0 ] && [ "$D_N_FLOOR" -gt 0 ] \
