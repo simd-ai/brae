@@ -666,3 +666,125 @@ Kernel cost at n = 64, from the graph-node profile: the factorisation is 114 us 
 (246 us before the pivot search was given a warp instead of a thread, 336 us before the working matrix
 moved into shared memory) and each substitution 44 us, against 3 x 706 us. What is left of the pressure
 phase is the SpMV -- 106 `amulKernel` launches per iteration, 3.65 ms -- and 3.0 ms of idle.
+
+## Which preconditioner a substituted PBiCGStab carries on k and epsilon (2026-09-08)
+
+A case that names `solver GAMG` on the turbulence pair names no `preconditioner` -- GAMG takes none --
+so brae must choose one for the PBiCGStab it substitutes. It chose `diagonal`, OpenFOAM's weakest. The
+alternative is `DILU`, OpenFOAM's default for an asymmetric matrix, whose apply is a level-scheduled
+sequential walk: one kernel launch per dependency level, and the level count grows with the mesh. That
+is why this was measured against SIZE and against MODEL rather than argued from one case.
+`bench/rhoSimpleFoam/turb_precon_scan.sh` and `bench/turb_precon_models.sh` produce both tables.
+
+### Speed -- the compressible squareBend, turbulence block, ms per outer iteration
+
+| cells   | DILU levels | diagonal | DILU | ratio | four phases, DILU |
+|--------:|------------:|---------:|-----:|------:|------------------:|
+|  24,192 |         160 |      2.0 |  8.8 | 4.40x |              14.4 |
+| 112,000 |         268 |      4.1 | 16.0 | 3.90x |              29.4 |
+| 307,328 |         376 |     12.5 | 33.3 | 2.66x |              67.7 |
+| 896,000 |         538 |     32.2 | 61.5 | 1.91x |             183.2 |
+
+The RELATIVE cost falls as the mesh grows -- 4.40x to 1.91x -- because the per-level launch is amortised
+over more cells. At 896,000 the whole of DILU is 29.3 ms of a 183.2 ms iteration, 16%.
+
+### Health -- nut at outer iteration 8, against real OpenFOAM on the same mesh
+
+nut = Cmu k^2/epsilon, so it is what shows a dissipation scalar driven non-positive and floored at 1e-15
+by `bound()`. In parentheses: cells whose nut is at or below 1e-14.
+
+| cells   | brae diagonal   | OF diagonal   | brae DILU  | OF DILU    | OF GAMG (the case) |
+|--------:|----------------:|--------------:|-----------:|-----------:|-------------------:|
+|  24,192 |    5.90e+01 (0) |  7.99e+00 (10)| 1.278 (0)  | 1.130 (0)  |          0.921 (0) |
+| 112,000 |    3.76e+01 (16)|  1.37e+01 (2) | 4.445 (0)  | 4.068 (0)  |          1.859 (0) |
+| 307,328 |    8.61e+15 (58)|  2.00e+01 (4) | 3.134 (0)  | 3.021 (0)  |          1.709 (0) |
+| 896,000 |    1.04e+01 (0) |  9.55e+00 (78)| 1.803 (0)  | 1.760 (0)  |          0.576 (0) |
+
+Two things this says that one mesh could not.
+
+**brae's arithmetic is faithful.** brae-DILU tracks OpenFOAM-DILU to 13%, 9%, 3.7% and 2.4% across the
+four sizes, and brae-diagonal degrades exactly as OpenFOAM-diagonal does. There is no defect in the
+solve; the preconditioner is the only variable.
+
+**diagonal is unpredictable in BOTH codes, not merely worse.** brae explodes to 8.6e+15 at 307k and is
+clean at 896k; OpenFOAM floors 4 cells at 307k and 78 at 896k. There is no monotone trend a bound could
+be set against -- which is the argument for not shipping it, more than any single number here is.
+
+### Models -- the incompressible driver, the same loose GAMG condition on the pair
+
+The compressible mirror's CUDA arm is kEpsilon-only (it refuses kOmegaSST by name), so the model axis is
+measured on the incompressible driver, which reads the same policy. Whole-run wall for 60 iterations;
+these meshes are small enough that start-up is a large part of it, so read the ratio as an upper bound on
+the per-iteration difference, not as it.
+
+| case             | model        | cells  | diagonal | DILU | nut max: diagonal / DILU / OpenFOAM |
+|------------------|--------------|-------:|---------:|-----:|-------------------------------------|
+| pitzDailyTurb    | kEpsilon     | 12,225 |    1.37s |1.46s | 1.84e-2 / 1.71e-2 / 6.32e-3         |
+| pitzDailyTurbBig | kEpsilon     | 48,900 |    2.51s |2.81s | 1.04e-2 / 9.98e-3 / 3.47e-3         |
+| pitzDailySST     | kOmegaSST    | 12,225 |    0.72s |0.92s | 2.46e-3 / 2.32e-3 / 2.37e-3         |
+| pitzDailyRKE     | realizableKE | 12,225 |    0.74s |0.90s | 7.50e-3 / 5.16e-3 / 7.57e-3         |
+| lmFlatPlate      | kOmegaSSTLM  | 17,200 |    0.90s |1.29s | 1.80e-4 / 1.80e-4 / 1.80e-4         |
+
+No model collapses under either preconditioner at these sizes, and no cell is floored anywhere. That is
+the honest reading: the effect needs SCALE, and every fixture available per model is at or below 49,000
+cells -- below where the compressible scan first sees it. The model axis therefore separates nothing,
+and the mesh axis is what decides this.
+
+## ...and what actually fills that blank: a truncated Neumann series (2026-09-08)
+
+DILU fixes the collapse and costs a kernel launch per dependency level. The question the tables above left
+open is whether a FULLY PARALLEL preconditioner reaches the same place. Two families were tried, both on
+the epsilon system brae actually solves (`bench/rhoSimpleFoam/eps_precond_experiment.py` dumps it with
+BRAE_STAGE_DUMP_DIR and re-solves it offline), ranked not by iteration count but by WHERE the solve stops
+under OpenFOAM's own relTol -- because that iterate is what the next outer iteration inherits, and it is
+what compounds. At 112k, outer iteration 6:
+
+| preconditioner            | \|x-x*\|/\|x*\| at the stop | min(epsilon) | cost per apply     |
+|---------------------------|---------------------------:|-------------:|--------------------|
+| Jacobi (the failure)      |                   1.33e-02 |         73.9 | 0 SpMV             |
+| red-black (multicolour) DILU |                1.18e-02 |        117.3 | 4 launches         |
+| Neumann series, degree 3  |                   1.07e-02 |        169.3 | 2 SpMV             |
+| Neumann series, degree 6  |                   4.62e-03 |        179.1 | 5 SpMV             |
+| **Neumann series, degree 10** |               4.55e-03 |    **180.5** | **9 SpMV**         |
+| DILU, natural order       |                   9.93e-03 |        182.6 | 376 launches       |
+
+**The multicolour reordering the GPU literature points at does not work here.** It is what OPM and AmgX
+do, and a two-colour DILU lands barely better than Jacobi (117.3 against 73.9, where natural-order DILU
+reaches 182.6): the reordering destroys most of what makes the factorisation work.
+
+**The polynomial does.** M^-1 = sum_{j<k} (I - D^-1 A)^j D^-1 converges iff rho(I - D^-1 A) < 1, i.e. iff
+the matrix is diagonally dominant -- and the epsilon equation is strongly so, because of the Sp reaction
+term OpenFOAM makes implicit. The equation that was failing is exactly the equation the series is
+guaranteed on. Chebyshev matched it on error at the same degree and was REJECTED: at degree 10 it returned
+min(epsilon) = -2.8e+04, because a min-max optimal polynomial is not a positive one and can undershoot
+through zero, which is the precise failure being chased.
+
+### End to end, the turbulence block, ms per outer iteration
+
+| cells   | diagonal | series | DILU | series against diagonal | DILU against diagonal |
+|--------:|---------:|-------:|-----:|------------------------:|----------------------:|
+|  24,192 |      1.9 |    1.7 |  9.1 |                    -11% |                 +379% |
+| 112,000 |      4.1 |    4.1 | 16.3 |                      0% |                 +298% |
+| 307,328 |     12.0 |   13.4 | 33.3 |                    +12% |                 +178% |
+| 896,000 |     33.2 |   41.0 | 61.7 |                    +23% |                  +86% |
+
+At the two smaller meshes it is FREE: it needs fewer BiCGStab iterations than Jacobi, and the extra SpMVs
+pay for themselves.
+
+### ...and nut at outer iteration 8, against real OpenFOAM (cells at the floor in parentheses)
+
+| cells   | diagonal        | series       | DILU      | OF GAMG   |
+|--------:|----------------:|-------------:|----------:|----------:|
+|  24,192 |    5.90e+01 (0) | **1.155** (0)| 1.278 (0) | 0.921 (0) |
+| 112,000 |   3.76e+01 (16) |    5.461 (0) | 4.445 (0) | 1.859 (0) |
+| 307,328 |   8.61e+15 (58) | **2.024** (0)| 3.134 (0) | 1.709 (0) |
+| 896,000 |    1.04e+01 (0) | **1.048** (0)| 1.803 (0) | 0.576 (0) |
+
+Zero cells at the floor at every size, and at three of the four it is CLOSER to OpenFOAM's own GAMG than
+DILU is. It is not a compromise between diagonal and DILU; on the quantity that matters it is the better
+of the two, at a fraction of DILU's cost.
+
+`BRAE_POLY_KE=<n>` sets the degree (1 = the bare diagonal, the fail-proof arm of
+tests/turb_precon_vs_openfoam.sh); `BRAE_DILU_KE=1` selects DILU instead. A case that NAMES a
+preconditioner keeps it. nuTilda takes the same substitution and is deliberately NOT wired: the
+Spalart-Allmaras branch never sets the degree, and it has not been measured.

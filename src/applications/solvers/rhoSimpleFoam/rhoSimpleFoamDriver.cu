@@ -389,6 +389,7 @@ int runMirrorCuda(const std::string& caseDir)
     // the block below because the preconditioner they select is built once, from the mesh, and lives as
     // long as the run.
     bool diluU = false, diluHe = false, diluKE = false;
+    int  polyDegKE = 1;                    // the Neumann series' degree on the turbulence pair
     // DILU on the transonic pressure's BiCGStab (see RhoStepInput::preconP) is OPT-IN, BRAE_DILU_P=1,
     // and only where the case's own p entry names it (`solver PBiCGStab; preconditioner DILU;`, as
     // sbMatched does). The default keeps the diagonal and announces the substitution, because the
@@ -577,6 +578,7 @@ int runMirrorCuda(const std::string& caseDir)
         diluU  = lctl.diluU && !uColourGS;
         diluHe = lctl.diluHe;
         diluKE = lctl.diluKE;
+        polyDegKE = lctl.polyDegKE;
         // The case's own smoothSolver selection, carried into the step (item 58). Without these the
         // driver ran BiCGStab on U, he, k and epsilon while the shared notice -- which takes the flag as
         // proof the caller honours the dict -- announced nothing for U and the pair.
@@ -717,8 +719,10 @@ int runMirrorCuda(const std::string& caseDir)
                 "pairs on |Sf| and diverges from faceAreaPair at level 1; it smooths by default with "
                 "weighted Jacobi (omega 0.8, one pre- and one post-sweep) rather than the case's "
                 "smoother (BRAE_AMG_GS / BRAE_AMG_TSGS select the other asymmetric-safe ones); its "
-                "coarsest level is neither OpenFOAM's PBiCGStab nor its direct LU (GAMGSolver.C:270-278, "
-                ":299-328); it applies ONE V-cycle where GAMGPreconditioner defaults to nVcycles 2 "
+                "coarsest level is a dense LU with partial pivoting, which is OpenFOAM's own "
+                "`directSolveCoarsest` option (GAMGSolver.C:266-278 -> LUscalarMatrix) rather than the "
+                "PBiCGStab it builds by default (:299-328), and it falls back to an iterative solve "
+                "above 96 coarsest cells; it applies ONE V-cycle where GAMGPreconditioner defaults to nVcycles 2 "
                 "(GAMGPreconditioner.C:65); and the V-cycle itself runs in FP32 by default with the "
                 "outer BiCGStab and its residual in FP64 (BRAE_AMG_FP32=0 opts out). So `smoother`, "
                 "`nPreSweeps`, `nPostSweeps`, `nCellsInCoarsestLevel`, `agglomerator` and `mergeLevels` "
@@ -794,6 +798,7 @@ int runMirrorCuda(const std::string& caseDir)
         // The SAME options the CUDA harness's turbulent arm drives (buildTurbulenceHookOptions above).
         turbOpt = buildTurbulenceHookOptions(hin, hf, constraints);
         turbOpt.precon = (diluKE && w.dilu.valid) ? &w.dilu : nullptr;
+        turbOpt.polyDegKE = polyDegKE;
         turbOpt.gsK = gsK;  turbOpt.gsEps = gsEps;  turbOpt.gsSymmetric = gsKESym;  turbOpt.nSweepsKE = nSweepsKE;
 
         gin.correct = [&]()

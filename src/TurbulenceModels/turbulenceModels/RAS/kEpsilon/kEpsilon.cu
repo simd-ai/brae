@@ -863,7 +863,7 @@ void finishAndSolve(
                              in.nSweepsKE, in.gsSymmetric);
     else
         perf = deviceJacobiBiCGStab(A, b, field, dnf.data(), in.tol, in.relTol, in.maxIter, /*checkEvery=*/1, in.minIter,
-                                    in.precon);
+                                    in.precon, /*amg=*/nullptr, in.polyDeg);
     residualOut = perf.initialResidual;
     dump("SolveOut", field);
 }

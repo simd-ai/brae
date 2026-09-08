@@ -139,7 +139,13 @@ void coarseJacobiSingleBlockKernel(
 // Single-block coarsest solve by Jacobi-preconditioned CG (z = r/diag). CG converges as O(sqrt(kappa)) vs Jacobi's
 // O(kappa), so a handful of iterations solve the tiny coarsest as well as hundreds of Jacobi sweeps. The whole CG
 // (vectors + dot reductions) lives in shared memory in one block -> no host sync, capturable in the V-cycle graph.
-// Fixed iteration count (deterministic, graph-safe); alpha/beta guarded so an early-converged solve can't NaN.
+// alpha/beta guarded so an early-converged solve can't NaN.
+//
+// It stops on a RELATIVE RESIDUAL, not a count, for the reason its asymmetric twin does and which was
+// measured there (see COARSE_REL_TOL in device_amg_detail.cuh): a fixed count leaves an approximation
+// whose error depends on the right-hand side, so M^-1 is no longer a fixed linear operator and the outer
+// Krylov method loses the premise it is built on. That the twin was converged and this one still counted
+// was the remainder of item 80. `nIters` is the CAP.
 __global__
 void coarsePCGKernel(
     int nC,
@@ -172,8 +178,15 @@ void coarsePCGKernel(
     }
     __syncthreads();
     scalar rz = blockDot(r, z, nC, red);                         // r . z
+    // The same measure the asymmetric twin stops on -- r.r, not CG's own r.z -- so the two coarsest
+    // solves return an inverse of the same accuracy and the V-cycle behaves the same on either operator.
+    const scalar stop = COARSE_REL_TOL*COARSE_REL_TOL*blockDot(r, r, nC, red);
     for (int it = 0; it < nIters; ++it)
     {
+        if (it > 0 && blockDot(r, r, nC, red) <= stop)
+        {
+            break;
+        }
         for (int c = tid; c < nC; c += blockDim.x)   // Ap = A p
         {
             scalar a = diag[c]*p[c];
@@ -344,8 +357,8 @@ void coarseBiCGStabKernel(
 // Factorisation runs once per Galerkin update (amgGalerkin), the substitutions once per V-cycle.
 // ---------------------------------------------------------------------------------------------------
 
-// A_c -> P A_c = L U, in ONE block, lu[] row-major in global memory (n <= DENSE_COARSE_MAX, so
-// n*n doubles is at most 512 KB and stays in L2). Right-looking, one k at a time: the pivot search and
+// A_c -> P A_c = L U, in ONE block, lu[] row-major (n <= DENSE_COARSE_MAX, so n*n doubles is at most
+// 72 KB and the working copy fits in shared). Right-looking, one k at a time: the pivot search and
 // the row swap are serial in k, the multipliers and the trailing rank-1 update are spread over the block.
 __global__
 void coarseLUFactorKernel(
@@ -630,8 +643,8 @@ void deviceCoarseLUFactor(
     const int bs = TPB;
     // Dynamic shared for the working matrix when n*n doubles clear the 48KB a block gets without the
     // opt-in (a non-stream runtime call; amgGalerkin is outside graph capture but the opt-in would
-    // still be a per-launch surprise, and DENSE_COARSE_MAX levels above this are rare enough to run
-    // through global memory).
+    // still be a per-launch surprise). At DENSE_COARSE_MAX = 96 that is 72 KB, so a level near the cap
+    // falls back to global memory rather than asking for the opt-in.
     const std::size_t shBytes = static_cast<std::size_t>(nC)*nC*sizeof(scalar);
     const bool inShared = shBytes <= 48u*1024u;
     coarseLUFactorKernel<<<1, bs, inShared ? shBytes : 0, cudaStreamPerThread>>>(nC,

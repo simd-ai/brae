@@ -14,6 +14,12 @@
 // asymmetric = true and with false, so a coarsest branch that went back to calling the CG fails there even
 // though both kernels still exist.
 //
+// The file has since become where the COARSEST SOLVE is tested, both branches of it. Leg G is the direct
+// dense LU that now runs by default under DENSE_COARSE_MAX cells -- OpenFOAM's own `directSolveCoarsest`
+// (GAMGSolver.C:266-278) -- and Leg H is the symmetric iterative twin, held to the property that matters
+// for all three: the coarsest solve must be a fixed LINEAR operator in the right-hand side, which a fixed
+// iteration count is not.
+//
 // Every system here is DIAGONALLY DOMINANT by construction (diag = (1+delta)*sum|off-diagonals|), so the
 // host Gaussian elimination in Leg C is an oracle and not another iterative guess.
 #include "box_mesh.cuh"
@@ -439,6 +445,69 @@ int main(int argc, char** argv)
             std::printf("        (|b-Ax|/|b| after 10 stationary V-cycles: direct %.6e vs iterative asymmetric %.6e)\n",
                         static_cast<double>(direct), static_cast<double>(asymLeft));
         }
+    }
+
+    // ---- Leg H: the SYMMETRIC coarsest solve converges too (item 80) ---------------------------------
+    // deviceCoarsePCG ran a FIXED count long after its asymmetric twin had been made to converge -- the
+    // same defect, on the branch a symmetric pressure matrix takes. What a fixed count costs is not
+    // accuracy, it is LINEARITY: CG's alpha and beta are functions of the right-hand side, so a solve
+    // stopped after n steps gives an operator with M^-1(b1 + b2) != M^-1(b1) + M^-1(b2). The outer Krylov
+    // method is built on the preconditioner being a fixed linear operator, so that is the property to
+    // test, and it is sharper than any iteration count.
+    {
+        const PrimitiveMesh ym = boxtest::boxMesh(6, 5, 4);
+        FvGeometry yg;
+        yg.build(ym);
+        const std::vector<FvPatch> yfvp = buildPatches(ym, yg);
+        DeviceMesh ydm = buildDeviceMesh(ym, yg, yfvp);
+        const std::size_t yn = static_cast<std::size_t>(ym.nCells());
+        std::vector<scalar> yDiag, yUp, yLo, yB;
+        buildSystem(ym, yg, /*asym=*/0.0, 0.05, yDiag, yUp, yLo, yB);
+        scalar skew = 0.0;
+        for (std::size_t f = 0; f < yUp.size(); ++f) skew = std::fmax(skew, std::fabs(yUp[f] - yLo[f]));
+        check(skew == 0.0, "the leg's system is SYMMETRIC (the premise: this is the CG's branch)");
+        DeviceBuffer<scalar> yD(yDiag), yU(yUp), yL(yLo);
+        const DeviceLduView yA = deviceLduView(ydm, yD, yU, yL);
+
+        // Two unrelated right-hand sides and their sum. b1 is the assembled source; b2 is something the
+        // solve has no reason to like, so a count that happens to suit b1 cannot also suit b2.
+        std::vector<scalar> h2(yn);
+        for (std::size_t i = 0; i < yn; ++i) h2[i] = std::sin(1.7*i) - 0.4*std::cos(0.3*i);
+        DeviceBuffer<scalar> b1(yB), b2(h2), b12(yn);
+        deviceCopy(b12, b1);
+        deviceAxpy(1.0, b2, b12);
+
+        DeviceBuffer<scalar> x1(yn), x2(yn), x12(yn), Ax(yn), r(yn), d(yn);
+        auto relResidual = [&](int cap)
+        {
+            deviceCoarsePCG(yA, b1, x1, cap);
+            deviceAmul(yA, x1, Ax);
+            deviceCopy(r, b1);
+            deviceAxpy(-1.0, Ax, r);
+            return deviceSumMag(r) / deviceSumMag(b1);
+        };
+        auto linearityDefect = [&](int cap)
+        {
+            deviceCoarsePCG(yA, b1, x1, cap);
+            deviceCoarsePCG(yA, b2, x2, cap);
+            deviceCoarsePCG(yA, b12, x12, cap);
+            deviceCopy(d, x12);
+            deviceAxpy(-1.0, x1, d);
+            deviceAxpy(-1.0, x2, d);
+            return deviceSumMag(d) / deviceSumMag(x12);
+        };
+        const scalar resConverged = relResidual(NCOARSE_CG);
+        const scalar resCounted   = relResidual(4);
+        check(resConverged < 1e-11, "the coarsest CG converges on its own within the cap");
+        check(resCounted > 1e-6, "...and a 4-iteration CAP does not (the fail-proof for that bound)");
+        const scalar linConverged = linearityDefect(NCOARSE_CG);
+        const scalar linCounted   = linearityDefect(4);
+        check(linConverged < 1e-9, "the converged coarsest solve is a LINEAR operator in b");
+        check(linCounted > 1e-3, "...and the fixed-count one is not (the control: this is what a count costs)");
+        std::printf("        (%zu cells: |Ax-b|/|b| converged %.3e vs 4 iterations %.3e;"
+                    " |M(b1+b2) - M(b1) - M(b2)|/|M(b1+b2)| %.3e vs %.3e)\n",
+                    yn, static_cast<double>(resConverged), static_cast<double>(resCounted),
+                    static_cast<double>(linConverged), static_cast<double>(linCounted));
     }
 
     // ---- Leg D: the refusals ------------------------------------------------------------------------

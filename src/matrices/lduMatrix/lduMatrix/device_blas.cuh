@@ -11,6 +11,9 @@ void   deviceScale(DeviceBuffer<scalar>& x, scalar a);                          
 scalar deviceDot(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y);       // x . y  (reduction)
 void   deviceCopy(DeviceBuffer<scalar>& dst, const DeviceBuffer<scalar>& src);        // dst = src (D2D)
 void   deviceJacobi(DeviceBuffer<scalar>& z, const DeviceBuffer<scalar>& r, const scalar* diag);  // z = r/diag
+// one term of the truncated Neumann series preconditioner: t <- t - D^-1 (A t), w += t (device_pcg.cuh)
+void   deviceNeumannStep(DeviceBuffer<scalar>& t, const DeviceBuffer<scalar>& At, const scalar* diag,
+                         DeviceBuffer<scalar>& w);
 scalar deviceSumMag(const DeviceBuffer<scalar>& x);                                   // sum |x|  (reduction)
 // max over i of x[i]/y[i], skipping y[i] <= 0. The Courant number is a MAXIMUM, which cannot be built
 // from the sum/dot reductions above; this keeps it a single device pass returning one scalar.

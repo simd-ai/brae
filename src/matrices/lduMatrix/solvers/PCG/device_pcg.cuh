@@ -68,16 +68,36 @@ DeviceSolverPerf deviceJacobiPCG(const DeviceLduView& A, const DeviceBuffer<scal
 // OpenFOAM's `p { solver PBiCGStab; preconditioner GAMG; }`: GAMGPreconditioner registers itself in the
 // ASYMMETRIC table as well as the symmetric one (GAMGPreconditioner.C:38-42). The hierarchy must be built
 // (buildAMG) and current for this matrix (amgGalerkin), exactly as deviceAMGPCG requires.
+//
+// `polyDeg`: the TRUNCATED NEUMANN SERIES preconditioner, M^-1 = sum_{j<polyDeg} (I - D^-1 A)^j D^-1, in
+// place of the plain Jacobi. polyDeg 1 IS plain Jacobi (the series' first term), so the default changes
+// nothing. It costs polyDeg-1 sparse matrix-vector products per apply and NOTHING else -- no
+// factorisation, no ordering, no dependency between cells -- which is why it exists: DILU is the
+// preconditioner strong enough for the transported turbulence scalars and its apply is a sequential
+// level walk, one kernel launch per dependency level (376 at 307k cells). The series converges iff
+// rho(I - D^-1 A) < 1, i.e. iff the matrix is diagonally dominant, which the epsilon equation is
+// strongly -- its Sp reaction term is exactly what guarantees it on the equation that needed it.
+//
+// Measured on the epsilon system brae solves at 112k (bench/rhoSimpleFoam/eps_precond_experiment.py,
+// five consecutive outer iterations), the iterate where OpenFOAM's relTol 0.1 stops the solve:
+//     Jacobi          min(epsilon) 73.9   -- and this is the collapse: it undershoots, and it compounds
+//     red-black DILU              117.3   -- a two-colour reordering is too weak a factorisation
+//     Neumann deg 10              180.5   -- 9 SpMV
+//     DILU natural                182.6   -- 376 launches
+// `precon`, `amg` and polyDeg > 1 are mutually exclusive preconditioners; the first one set wins in the
+// order amg, precon, polynomial, Jacobi.
 struct AMGData;   // fwd (device_amg.cuh); the hierarchy is passed by pointer so this header need not include it
 DeviceSolverPerf deviceJacobiBiCGStab(const DeviceLduView& A, const DeviceBuffer<scalar>& b,
                                       DeviceBuffer<scalar>& psi, scalar normFactor,
                                       scalar tol, scalar relTol, int maxIter, int checkEvery = 1, int minIter = 0,
-                                      const DeviceDilu* precon = nullptr, AMGData* amg = nullptr);
+                                      const DeviceDilu* precon = nullptr, AMGData* amg = nullptr,
+                                      int polyDeg = 1);
 // the same solve with the normFactor on the device (item 66)
 DeviceSolverPerf deviceJacobiBiCGStab(const DeviceLduView& A, const DeviceBuffer<scalar>& b,
                                       DeviceBuffer<scalar>& psi, const scalar* dNormFactor,
                                       scalar tol, scalar relTol, int maxIter, int checkEvery = 1, int minIter = 0,
-                                      const DeviceDilu* precon = nullptr, AMGData* amg = nullptr);
+                                      const DeviceDilu* precon = nullptr, AMGData* amg = nullptr,
+                                      int polyDeg = 1);
 
 
 class DeviceHalo;   // forward (parallel/pstream/device_halo.cuh)

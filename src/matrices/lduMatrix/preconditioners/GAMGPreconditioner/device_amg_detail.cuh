@@ -49,7 +49,10 @@ constexpr int SB_CG_MAX = 1024;          // single-block coarsest PCG cap ((5*nC
                                          // re-derived where used -- so this one cap covers both and neither needs
                                          // the >48KB shared-memory opt-in (a non-stream runtime call, and the
                                          // coarsest solve is reachable from a stream-captured V-cycle).
-constexpr int NCOARSE_CG = 16;           // coarsest PCG iterations (dispatch default; override with BRAE_NCOARSE_CG).
+// The SYMMETRIC coarsest solve's iteration CAP. It was a fixed count of 16 until item 80: a fixed count
+// there has exactly the defect measured on the asymmetric side below, and 16 is not a cap, it is a
+// guarantee of stopping early. Same 512 as its twin (BRAE_NCOARSE_CG overrides both).
+constexpr int NCOARSE_CG = 512;          // coarsest PCG iteration CAP (dispatch default; override with BRAE_NCOARSE_CG).
 // The ASYMMETRIC coarsest solve (coarseBiCGStabKernel) iterates to a relative residual instead of a
 // fixed count, because an unconverged coarsest level makes the V-cycle input-dependent and the outer
 // Krylov method breaks on it -- measured on validation/sbMatched (transonic p, tolerance 1e-12): a
@@ -67,7 +70,24 @@ constexpr int    NCOARSE_ASYM_CAP = 512;
 // entirely -- it is the exact inverse, so the V-cycle is a fixed linear operator by construction, and
 // it costs the same on every call regardless of the right-hand side. With the default TARGET of 64
 // cells the factorisation is 64^3/3 = 87 kFLOP once per outer iteration and each apply is 64^2.
-constexpr int DENSE_COARSE_MAX = 256;    // n*n doubles held in global memory; n^3/3 in ONE block above this is not worth it
+// WHERE IT STOPS PAYING. The factorisation is n^3/3 in ONE block and it is paid once per Galerkin
+// update, against v applies of n^2; the iterative twin pays its whole cost v times. Measured on a
+// 64,000-cell box hierarchy (BRAE_AMG_TARGET swept so the coarsest lands at each size), microseconds
+// per call on GB10:
+//
+//     n     LU factor   LU solve   PCG    BiCGStab      break-even v = F/(I-S)
+//     62        103         38      74       186              0.7
+//    125        506         99      77       146             10.8
+//    250       4676        192     132       273             58
+//    500      35959        470     225       544            290
+//
+// At the three V-cycles per outer iteration the transonic pressure runs, the direct solve wins at 62
+// (217 us against 559) and LOSES at 125 (803 against 439). The cap is set between them, above the 64
+// cells the default BRAE_AMG_TARGET actually produces (measured on squareBend at 305,760 cells:
+// 12 levels, coarsest 64) so a hierarchy that stalls slightly above the target still gets the direct
+// solve, and below the size where the cubic term takes over. It was 256 when this was first written,
+// on the reasoning that n^3/3 was small in absolute terms; the table is what that reasoning missed.
+constexpr int DENSE_COARSE_MAX = 96;     // n*n doubles held in global memory; above this the n^3 factorisation loses
 constexpr scalar DENSE_LU_EPS = 1e-14;   // pivot floor, relative to max|diag|: below it the level is singular (see below)
 
 // Feature flags (env vars), documented here once. The two default-ON flags preserve accuracy and opt out with
@@ -81,7 +101,7 @@ constexpr scalar DENSE_LU_EPS = 1e-14;   // pivot floor, relative to max|diag|: 
 //   BRAE_AMG_TSGS, BRAE_TSGS_ORDER   OpenFOAM v2606 twoStageGaussSeidel polynomial smoother (order 0 == Jacobi)
 //   BRAE_AMG_SA                      smoothed aggregation: smoothed prolongator + general Galerkin A_c = P^T A P
 //   BRAE_AMG_SOC                     strength-of-connection filter beta for aggregation (0 = off)
-//   BRAE_NCOARSE_CG                  coarsest-grid PCG iteration count
+//   BRAE_NCOARSE_CG                  coarsest-grid iteration CAP, both the PCG and the BiCGStab
 inline bool envFlag(
     const char* name,
     bool def)

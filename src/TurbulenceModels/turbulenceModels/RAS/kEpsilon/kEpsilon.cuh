@@ -152,6 +152,10 @@ struct KEpsilonInput
     // system, and neither tolerance 1e-15 nor maxIter 40000 moves it. OpenFOAM converges along the DILU
     // path, so the arm that substitutes Jacobi lands somewhere else -- queue item 27.
     const DeviceDilu* precon = nullptr;
+    // ...or, when the case names no preconditioner at all because its solver is not a P-solver, the
+    // TRUNCATED NEUMANN SERIES in its place: deg-1 SpMVs, no factorisation, no ordering (device_pcg.cuh
+    // carries the measurement that chose it over DILU and over a multicolour DILU). 1 is plain Jacobi.
+    int polyDeg = 1;
 
     KEpsilonCoeffs co{};
     scalar         Prt = 1.0;            // EddyDiffusivity: alphat = rho*nut/Prt

@@ -154,7 +154,7 @@ void vcycleAt(
     zeroT<scalar><<<nBlocks(n),TPB>>>(n, xg.data());
     if (g == amg.nLevels())                                    // coarsest: approximate solve
     {
-        // BRAE_NCOARSE_CG overrides the coarsest PCG iteration count.
+        // BRAE_NCOARSE_CG overrides the coarsest PCG iteration CAP (item 80: it converges, it does not count).
         static const int ncoarseCG = [](){ const char* e = std::getenv("BRAE_NCOARSE_CG"); return (e && std::atoi(e) > 0) ? std::atoi(e) : NCOARSE_CG; }();
         // The asymmetric coarsest solve iterates to COARSE_REL_TOL and this is only its CAP -- see the
         // constant's note: a fixed count there breaks the outer Krylov method.

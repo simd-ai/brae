@@ -104,6 +104,13 @@ struct SolverRunsAs
     std::string fixedSweepsField;
 };
 
+// The degree the substituted PBiCGStab's Neumann series runs at on the transported turbulence scalars.
+// 10 from the sweep in bench/rhoSimpleFoam/eps_precond_experiment.py: degree 3 leaves min(epsilon) at
+// 169.3 where DILU leaves 182.6, degree 6 at 179.1, degree 10 at 180.5, and degree 16 does not improve
+// on 10 (it converges the preconditioned residual faster and so stops after fewer BiCGStab iterations,
+// at a comparable iterate, for 6 more SpMVs).
+constexpr int POLY_DEG_KE_DEFAULT = 10;
+
 inline void readLinearSolverControls(
     const FoamDict& fvSolution,
     const std::string& secondName,
@@ -150,29 +157,36 @@ inline void readLinearSolverControls(
                         || (runsAs.diluOnEnergy && !heName.empty() && f == heName);
         const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
         bool on = wires && s && s->wordOr("preconditioner", "") == "DILU";
-        // ...and DILU is also what a SUBSTITUTED PBiCGStab gets on the transported scalars. OpenFOAM's
-        // PBiCGStab and PCG both require a `preconditioner` entry (lduMatrix::preconditioner::New throws
-        // without one), so a field whose entry names none is a field whose solver is not a P-solver at
-        // all -- GAMG, or a smoothSolver brae is not running as one -- and brae is substituting its
-        // BiCGStab for it. Preconditioning that substitute with `diagonal` picks the WEAKEST operator
-        // OpenFOAM has where the case asked for the strongest, and at a loose relTol the two stop in
-        // very different places. Measured on the 305,760-cell squareBend bench case (GAMG on
-        // (U|e|k|epsilon), relTol 0.1) at outer iteration 8: with diagonal, 201 interior cells have
-        // epsilon driven to the bound floor 1e-15 and nut = Cmu k^2/epsilon reaches 1.50e+17; with
-        // DILU, none do and nut peaks at 3.12. Real OpenFOAM on the same case reaches nut 1.69 with its
-        // GAMG and 3.05 when its own solver is swapped to PBiCGStab/DILU -- so the collapse is brae's
-        // preconditioner, not the substitution. A case that NAMES its preconditioner keeps it, diagonal
-        // included: this only fills the blank the substitution creates.
-        // Scoped to the TRANSPORTED SCALARS, which is where it was measured. U and the energy
-        // field take the same substitution, but neither has been shown to need this and the
-        // momentum equation runs a multicolour Gauss-Seidel smoothSolver by default in any case.
-        const bool scalarPair = (f == "k" || f == secondName || f == "nuTilda");
-        if (scalarPair && !on && (!s || s->wordOr("preconditioner", "").empty())) on = true;
         const char* e = nullptr;
         if (f == "U") e = std::getenv("BRAE_DILU");
         else if (f == "k" || f == secondName || f == "nuTilda") e = std::getenv("BRAE_DILU_KE");
         if (e) on = wires && (std::atoi(e) != 0);
         return on;
+    };
+    // ...and the same question for the polynomial: on the transported scalars, a blank `preconditioner`
+    // is filled by a truncated Neumann series rather than by the bare diagonal (see the block that sets
+    // ctl.polyDegKE). The notices below have to name what RUNS, so they ask the same question here
+    // rather than printing "diagonal" over a solve that is not one.
+    auto polyHere = [&](const std::string& f, bool gs) -> int
+    {
+        if (gs || diluHere(f)) return 1;
+        // k and the pair's second scalar only. nuTilda takes the same substitution and would very likely
+        // take the same answer, but the Spalart-Allmaras branch below never sets ctl.polyDegKE, and a
+        // helper that claimed a field the policy does not wire would make this notice say one thing
+        // while the solve did another -- which is the defect it exists to prevent. Measuring SA is its
+        // own unit.
+        if (!(f == "k" || f == secondName)) return 1;
+        const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
+        int deg = (!s || s->wordOr("preconditioner", "").empty()) ? POLY_DEG_KE_DEFAULT : 1;
+        if (const char* e = std::getenv("BRAE_POLY_KE")) deg = std::max(1, std::atoi(e));
+        return deg;
+    };
+    auto krylovPreconGs = [&](const std::string& f, bool gs) -> std::string
+    {
+        if (diluHere(f)) return "DILU";
+        const int deg = polyHere(f, gs);
+        return deg > 1 ? ("a degree-" + std::to_string(deg) + " truncated Neumann series (the case names none)")
+                       : std::string("diagonal");
     };
     auto krylovPrecon = [&](const std::string& f) -> std::string
     {
@@ -431,8 +445,8 @@ inline void readLinearSolverControls(
                       "(GaussSeidelSmoother.C sweeps ascending only; symGaussSeidelSmoother.C also "
                       "sweeps back), and this driver carries one smoother for the transported pair, so "
                       "running would apply one field's setting under the other's name.");
-            noticeSolverChoice("k", "PBiCGStab", krylovPrecon("k"), ctl.gsK);
-            noticeSolverChoice(secondName, "PBiCGStab", krylovPrecon(secondName), ctl.gsEps);
+            noticeSolverChoice("k", "PBiCGStab", krylovPreconGs("k", ctl.gsK), ctl.gsK);
+            noticeSolverChoice(secondName, "PBiCGStab", krylovPreconGs(secondName, ctl.gsEps), ctl.gsEps);
             // DILU on whichever of the pair runs BiCGStab. subDict is regex-aware (literal first, then
             // last wildcard match, OF semantics), so a case writing its solver block as
             // "(omega|epsilon|k)" -- which is how essentially every tutorial writes it -- resolves here
@@ -441,12 +455,34 @@ inline void readLinearSolverControls(
             {
                 const FoamDict* sk = solvers ? solvers->subDict("k") : nullptr;
                 const FoamDict* ss = solvers ? solvers->subDict(secondName) : nullptr;
-                // diluHere is the ONE rule (it is what the notices printed above consulted): the
-                // case's own DILU, or the blank a substituted PBiCGStab leaves. gsK/gsEps subtract the
-                // fields running as smoothSolvers, which have no preconditioner to carry.
+                // diluHere is the ONE rule (it is what the notices printed above consulted). gsK/gsEps
+                // subtract the fields running as smoothSolvers, which have no preconditioner to carry.
                 const bool kDilu = diluHere("k");
                 const bool sDilu = diluHere(secondName);
                 ctl.diluKE = (kDilu && !ctl.gsK) || (sDilu && !ctl.gsEps);
+                // THE BLANK A SUBSTITUTION LEAVES (item 78). OpenFOAM's PBiCGStab and PCG both require a
+                // `preconditioner` entry (lduMatrix::preconditioner::New throws without one), so a field
+                // whose entry names none is one whose solver is not a P-solver at all -- GAMG, or a
+                // smoothSolver brae is not running as one -- and brae is substituting its BiCGStab for
+                // it. Filling that blank with `diagonal` picks OpenFOAM's WEAKEST preconditioner where
+                // the case asked for its strongest solver, and it does not merely converge slower: the
+                // iterate it stops at under the case's relTol systematically undershoots, and that
+                // compounds over the outer iterations into epsilon at the bound floor and nut = Cmu
+                // k^2/epsilon exploding (measured to 8.6e+15 on squareBend at 307k, and OpenFOAM does
+                // the same thing with the same preconditioner -- this is a bad CHOICE, not a defect).
+                //
+                // It is filled with the TRUNCATED NEUMANN SERIES rather than with DILU. Both fix it;
+                // DILU costs a kernel launch per dependency level (376 at 307k), the series costs
+                // deg-1 SpMVs and nothing else. Measured on the epsilon system brae solves
+                // (bench/rhoSimpleFoam/eps_precond_experiment.py, the iterate at OpenFOAM's own
+                // stopping rule, outer iteration 6 of 112k): Jacobi leaves min(epsilon) 73.9, a
+                // multicolour DILU 117.3, this at degree 10 leaves 180.5, and natural-order DILU 182.6.
+                // A case that NAMES its preconditioner keeps it, `diagonal` included: this fills a
+                // blank, it does not override a choice.
+                // polyHere is the ONE rule, and it is the one the notices above printed: a notice that
+                // said `diagonal` over a Neumann-preconditioned solve is exactly the defect this
+                // project keeps finding, so the two read the same function.
+                ctl.polyDegKE = ctl.diluKE ? 1 : std::max(polyHere("k", ctl.gsK), polyHere(secondName, ctl.gsEps));
                 if (const char* e = std::getenv("BRAE_DILU_KE"))   // attribution escape hatch
                     ctl.diluKE = (std::atoi(e) != 0) && !(ctl.gsK && ctl.gsEps);
             }

@@ -35,6 +35,22 @@ void jacobiKernel(const scalar* __restrict__ r, const scalar* __restrict__ diag,
 }
 
 
+// One step of the truncated Neumann series (device_pcg.cuh): t <- t - D^-1 (A t), and w += the new t.
+// Fused because the two statements share t and would otherwise be two passes over the same three arrays.
+__global__
+void neumannStepKernel(scalar* __restrict__ t, const scalar* __restrict__ At,
+                       const scalar* __restrict__ diag, scalar* __restrict__ w, int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+    {
+        const scalar tn = t[i] - At[i] / diag[i];
+        t[i] = tn;
+        w[i] += tn;
+    }
+}
+
+
 __global__
 void hadamardKernel(const scalar* __restrict__ a, const scalar* __restrict__ b, scalar* __restrict__ out, int n)
 {
@@ -194,6 +210,18 @@ void deviceJacobi(DeviceBuffer<scalar>& z, const DeviceBuffer<scalar>& r, const 
     z.resize(n);
     jacobiKernel<<<nBlocks(n), TPB>>>(r.data(), diag, z.data(), n);
     cudaCheck(cudaGetLastError(), "jacobi");
+}
+
+
+// t <- t - D^-1 (A t) and w += t, one term of the Neumann series. No resize: both buffers are the
+// caller's and already sized, because this runs inside a captured graph where an allocation would bake
+// a freed address into every replay.
+void deviceNeumannStep(DeviceBuffer<scalar>& t, const DeviceBuffer<scalar>& At, const scalar* diag,
+                       DeviceBuffer<scalar>& w)
+{
+    const int n = static_cast<int>(t.size());
+    neumannStepKernel<<<nBlocks(n), TPB>>>(t.data(), At.data(), diag, w.data(), n);
+    cudaCheck(cudaGetLastError(), "neumann step");
 }
 
 

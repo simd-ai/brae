@@ -84,6 +84,8 @@ struct TurbulenceHookOptions
     // driver holds one in RhoSolverWorkspace: the level schedule depends only on the mesh, so one
     // instance serves every field and diluUpdate refreshes it from whichever matrix is being solved).
     const DeviceDilu*           precon     = nullptr;
+    // the Neumann series' degree when the case names no preconditioner (device_pcg.cuh); 1 = Jacobi
+    int                         polyDegKE  = 1;
 };
 
 // One turbulence correction, inputs and all, without leaving the device.

@@ -208,8 +208,12 @@ struct BiCGGraphCache
     // one's address), so the level-0 coarse diagonal -- reallocated by every rebuild -- keys it too.
     const void* amg = nullptr;
     const void* amgCoarseDiag = nullptr;
+    // ...and the Neumann series' degree, because the captured body unrolls it: a replay under a
+    // different degree would run the degree it was captured with, silently.
+    int polyDeg = -1;
     DeviceBuffer<scalar> gDiag, gUpper, gLower, gB;                    // stable, graph-referenced
     DeviceBuffer<scalar> rA, rA0, pA, yA, AyA, sA, zA, tA, Ax;
+    DeviceBuffer<scalar> polyT, polyAt;                                // the Neumann series' work vectors
     DeviceBuffer<scalar> gNormF, gInit, gSN, gRN, gFinal;
     DeviceBuffer<int>    gIter;
     ~BiCGGraphCache()
@@ -220,9 +224,38 @@ struct BiCGGraphCache
 };
 
 // Returns false when this path does not apply (the caller then runs the host loop).
+// THE TRUNCATED NEUMANN SERIES PRECONDITIONER (device_pcg.cuh has the measurement that chose it).
+//
+//     M^-1 r = sum_{j<deg} (I - D^-1 A)^j D^-1 r
+//
+// evaluated by the Horner-free recurrence the series is: t_0 = D^-1 r, w = t_0, and then
+// t_{j+1} = (I - D^-1 A) t_j with w += t_{j+1}. deg-1 sparse matrix-vector products, and every other
+// operation is per-cell. Nothing is ordered, nothing is factorised, nothing depends on another cell --
+// which is the entire point against DILU, whose apply is a launch per dependency level.
+//
+// t and At are the caller's, not local, so the whole thing is capturable in the BiCGStab conditional
+// graph: a buffer allocated inside a captured region would bake a freed address into every replay.
+void neumannPrecon(
+    const DeviceLduView& A,
+    int deg,
+    const DeviceBuffer<scalar>& in,
+    DeviceBuffer<scalar>& out,
+    DeviceBuffer<scalar>& t,
+    DeviceBuffer<scalar>& At)
+{
+    deviceJacobi(out, in, A.diag);                 // t_0 = D^-1 r, and the series' first term
+    if (deg <= 1) return;
+    deviceCopy(t, out);
+    for (int j = 1; j < deg; ++j)
+    {
+        deviceAmul(A, t, At);                      // t <- t - D^-1 A t, then w += t
+        deviceNeumannStep(t, At, A.diag, out);
+    }
+}
+
 bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar>& b, DeviceBuffer<scalar>& psi,
                                const scalar* dNormFactor, scalar tol, scalar relTol, int maxIter, int minIter,
-                               const DeviceDilu* precon, AMGData* amg, DeviceSolverPerf& perf)
+                               const DeviceDilu* precon, AMGData* amg, int polyDeg, DeviceSolverPerf& perf)
 {
     const int nC = A.nCells, nF = A.nInternalFaces;
     if (nC <= 0) return false;
@@ -230,6 +263,7 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
     BiCGGraphCache& c = cache[psi.data()];
     cacheStat("bicg-graph", cache.size());
     for (auto* v : {&c.gDiag, &c.rA, &c.rA0, &c.pA, &c.yA, &c.AyA, &c.sA, &c.zA, &c.tA, &c.Ax, &c.gB}) v->resize(nC);
+    if (polyDeg > 1) { c.polyT.resize(nC); c.polyAt.resize(nC); }
     c.gUpper.resize(nF); c.gLower.resize(nF);
     for (auto* v : {&c.gNormF, &c.gInit, &c.gSN, &c.gRN, &c.gFinal}) v->resize(1);
     c.gIter.resize(1);
@@ -249,9 +283,10 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
         // which is what makes it capturable; deviceAMGPCGGraph captures the same call today
         // (device_amg_pcg.cu:238-254). asymmetric = true: this solver exists for the matrix with
         // upper != lower, so the coarsest level must not be solved by a conjugate gradient.
-        if (amg)          vcycleAt(0, *amg, sA, in, out, true);
-        else if (useDilu) diluApply(sA, *precon, in, out);
-        else              deviceJacobi(out, in, sA.diag);
+        if (amg)              vcycleAt(0, *amg, sA, in, out, true);
+        else if (useDilu)     diluApply(sA, *precon, in, out);
+        else if (polyDeg > 1) neumannPrecon(sA, polyDeg, in, out, c.polyT, c.polyAt);
+        else                  deviceJacobi(out, in, sA.diag);
     };
     BiCGScalars& s = bicgScalars();
     auto converged = [&](scalar fr) { return (fr < tol) || (relTol > 0.0 && fr < relTol * perf.initialResidual); };
@@ -331,6 +366,7 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
     const void* amgCD    = (amg && !amg->level.empty()) ? (const void*)amg->level.front().cDiag.data() : nullptr;
     const bool recapture = !c.exec || c.key != psi.data() || c.tol != tol || c.relTol != relTol
                         || c.maxIter != maxIter || c.minIter != minIter || c.precon != (useDilu ? (const void*)precon : nullptr)
+                        || c.polyDeg != polyDeg
                         || c.owner != (const void*)A.owner || c.nC != nC || c.diluRD != diluRD || c.diluLevels != diluLv
                         || c.scratchEpoch != epoch || c.amg != (const void*)amg || c.amgCoarseDiag != amgCD;
     if (recapture)
@@ -401,6 +437,7 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
         cudaCheck(cudaGraphInstantiate(&c.exec, c.graph, 0), "bicg graph instantiate");
         c.key = psi.data(); c.tol = tol; c.relTol = relTol; c.maxIter = maxIter; c.minIter = minIter;
         c.precon = useDilu ? (const void*)precon : nullptr;
+        c.polyDeg = polyDeg;
         c.owner = A.owner; c.nC = nC; c.diluRD = diluRD; c.diluLevels = diluLv; c.scratchEpoch = epoch;
         c.amg = amg; c.amgCoarseDiag = amgCD;
     }
@@ -440,7 +477,8 @@ DeviceSolverPerf deviceJacobiBiCGStab(
     int checkEvery,
     int minIter,
     const DeviceDilu* precon,
-    AMGData* amg)
+    AMGData* amg,
+    int polyDeg)
 {
     const int nC = A.nCells;
     // One preconditioner per solve. Silently preferring one of the two would be the substitution this
@@ -471,18 +509,21 @@ DeviceSolverPerf deviceJacobiBiCGStab(
         static thread_local auto& dNf = *new DeviceBuffer<scalar>(1);
         cudaMemcpyAsync(dNf.data(), &normFactor, sizeof(scalar), cudaMemcpyHostToDevice, cudaStreamPerThread);
         DeviceSolverPerf gp;
-        if (deviceJacobiBiCGStabGraph(A, b, psi, dNf.data(), tol, relTol, maxIter, minIter, precon, amg, gp)) return gp;
+        if (deviceJacobiBiCGStabGraph(A, b, psi, dNf.data(), tol, relTol, maxIter, minIter, precon, amg, polyDeg, gp)) return gp;
     }
 #endif
     // rD depends on the matrix, which changes every solve (the momentum diagonal moves every outer
     // corrector), so the factorisation is rebuilt here rather than cached with the schedule.
     if (precon && precon->valid) diluUpdate(A, *const_cast<DeviceDilu*>(precon));
+    DeviceBuffer<scalar> polyT, polyAt;                          // the Neumann series' two work vectors
+    if (polyDeg > 1) { polyT.resize(nC); polyAt.resize(nC); }
     auto applyPrecon = [&](DeviceBuffer<scalar>& out, const DeviceBuffer<scalar>& in)
     {
         // asymmetric = true: this solver is the one the asymmetric matrix takes, so the V-cycle's coarsest
         // level gets an asymmetric-valid solve rather than a conjugate gradient (device_amg.cuh's overload).
         if (amg)                          vcycleAt(0, *amg, A, in, out, true);
         else if (precon && precon->valid) diluApply(A, *precon, in, out);
+        else if (polyDeg > 1)             neumannPrecon(A, polyDeg, in, out, polyT, polyAt);
         else                              deviceJacobi(out, in, A.diag);
     };
     const int K = (checkEvery > 1) ? checkEvery : 1;             // convergence-read cadence (1 = exact per-iter)
@@ -582,7 +623,8 @@ DeviceSolverPerf deviceJacobiBiCGStab(
     int checkEvery,
     int minIter,
     const DeviceDilu* precon,
-    AMGData* amg)
+    AMGData* amg,
+    int polyDeg)
 {
     announceNormFactorMode();
     if (amg && precon && precon->valid)
@@ -597,7 +639,7 @@ DeviceSolverPerf deviceJacobiBiCGStab(
     if (checkEvery <= 1 && !hostLoop && !normFactorOnHost())
     {
         DeviceSolverPerf gp;
-        if (deviceJacobiBiCGStabGraph(A, b, psi, dNormFactor, tol, relTol, maxIter, minIter, precon, amg, gp)) return gp;
+        if (deviceJacobiBiCGStabGraph(A, b, psi, dNormFactor, tol, relTol, maxIter, minIter, precon, amg, polyDeg, gp)) return gp;
     }
 #endif
     // the host loop needs the number on the host: one read, on this path only

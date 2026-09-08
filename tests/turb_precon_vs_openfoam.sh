@@ -8,6 +8,11 @@
 # nut = Cmu k^2/epsilon explodes. Reported k residuals then collapse to ~1e-14 and climb 10x per
 # iteration, because normFactor is inflated by the same runaway cells.
 #
+# The blank is now filled by a degree-10 TRUNCATED NEUMANN SERIES, not by DILU: both fix it, and the
+# series costs 9 SpMVs against DILU's launch-per-dependency-level walk (measured on squareBend at 307k,
+# turbulence block: diagonal 12.2 ms/it, this 13.4, DILU 33.5). BRAE_POLY_KE=1 restores the bare
+# diagonal and is this gate's fail-proof; BRAE_DILU_KE=1 selects DILU.
+#
 # The gate is against REAL OpenFOAM on the same case at the same iteration, because "epsilon looks small"
 # is not a criterion -- what epsilon should be at outer iteration 12 is a number only OpenFOAM has.
 #
@@ -100,34 +105,36 @@ stage "$W/dilu"
     || { tail -3 "$W/dilu/log"; say "brae runs the case" FAIL; }
 read B_E_MIN B_E_MAX B_E_FLOOR <<< "$(minmax "$W/dilu/12/epsilon")"
 read B_N_MIN B_N_MAX B_N_FLOOR <<< "$(minmax "$W/dilu/12/nut")"
-IFS='|' read -r verdict detail <<< "$(check dilu "$B_E_MIN" "$B_N_MIN" "$B_N_MAX" pass)"
+IFS='|' read -r verdict detail <<< "$(check poly "$B_E_MIN" "$B_N_MIN" "$B_N_MAX" pass)"
 say "brae's k/epsilon extremes track OpenFOAM's at outer iteration 12" "$verdict"
 printf '        (%s)\n' "$detail"
 
 # ---- arm 2 (FAIL-PROOF): the old default must NOT clear those bounds ------------------------------
 # Without this the bounds above could be anything: a gate that no wrong answer fails is not a gate.
 stage "$W/diag"
-( cd "$W/diag" && BRAE_DILU_KE=0 BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BRAE" -case "$W/diag" > log 2>&1 ) \
-    || { tail -3 "$W/diag/log"; say "brae runs the case with BRAE_DILU_KE=0" FAIL; }
+( cd "$W/diag" && BRAE_POLY_KE=1 BRAE_DILU_KE=0 BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BRAE" -case "$W/diag" > log 2>&1 ) \
+    || { tail -3 "$W/diag/log"; say "brae runs the case with the bare diagonal" FAIL; }
 read D_E_MIN D_E_MAX D_E_FLOOR <<< "$(minmax "$W/diag/12/epsilon")"
 read D_N_MIN D_N_MAX D_N_FLOOR <<< "$(minmax "$W/diag/12/nut")"
 IFS='|' read -r verdict detail <<< "$(check diag "$D_E_MIN" "$D_N_MIN" "$D_N_MAX" fail)"
-say "...and the diagonal-preconditioned substitute FAILS them (fail-proof)" "$verdict"
+say "...and the bare diagonal FAILS them (fail-proof)" "$verdict"
 printf '        (%s)\n' "$detail"
 
 # ---- arm 3: nut collapses to the floor under diagonal and not under DILU --------------------------
 # The mechanism, stated as its own number: epsilon goes non-positive, bound() floors it at 1e-15, and
 # nut = Cmu k^2/epsilon loses every significant digit in those cells.
 [ "$B_N_FLOOR" = 0 ] && [ "$D_N_FLOOR" -gt 0 ] \
-    && say "no nut cell is at the floor under DILU, and some are under diagonal" ok \
-    || say "no nut cell is at the floor under DILU, and some are under diagonal" FAIL
-printf '        (nut cells <= 1e-14: DILU %s, diagonal %s, OpenFOAM %s)\n' "$B_N_FLOOR" "$D_N_FLOOR" "$OF_N_FLOOR"
+    && say "no nut cell is at the floor under the series, and some are under diagonal" ok \
+    || say "no nut cell is at the floor under the series, and some are under diagonal" FAIL
+printf '        (nut cells <= 1e-14: series %s, diagonal %s, OpenFOAM %s)\n' "$B_N_FLOOR" "$D_N_FLOOR" "$OF_N_FLOOR"
 
 # ---- arm 4: the notice says what it runs ----------------------------------------------------------
-grep -q "solvers/k solver: case asks 'GAMG', brae runs PBiCGStab preconditioned with DILU" "$W/dilu/log" \
-    && grep -q "solvers/epsilon solver: case asks 'GAMG', brae runs PBiCGStab preconditioned with DILU" "$W/dilu/log" \
-    && say "the notice names DILU for both k and epsilon" ok \
-    || { grep -m2 "solvers/k solver\|solvers/epsilon solver" "$W/dilu/log"; say "the notice names DILU for both k and epsilon" FAIL; }
+# The notice has to name what RUNS. Printing `diagonal` over a Neumann-preconditioned solve would be
+# the shared-capability-notice-lies defect, so the notice and the policy read the same function.
+grep -q "solvers/k solver: case asks 'GAMG', brae runs PBiCGStab preconditioned with a degree-10 truncated Neumann series" "$W/dilu/log" \
+    && grep -q "solvers/epsilon solver: case asks 'GAMG', brae runs PBiCGStab preconditioned with a degree-10 truncated Neumann series" "$W/dilu/log" \
+    && say "the notice names the Neumann series for both k and epsilon" ok \
+    || { grep -m2 "solvers/k solver\|solvers/epsilon solver" "$W/dilu/log"; say "the notice names the Neumann series for both k and epsilon" FAIL; }
 
 # ---- arm 5 (control): a NAMED preconditioner is still honoured ------------------------------------
 # The rule fills the blank a substitution leaves; it does not override a case that states its choice.

@@ -141,6 +141,7 @@ void correctTurbulence(
     kin.tol = opt.tol; kin.relTol = opt.relTol; kin.maxIter = opt.maxIter; kin.minIter = opt.minIter;
     kin.gsK = opt.gsK; kin.gsEps = opt.gsEps; kin.gsSymmetric = opt.gsSymmetric; kin.nSweepsKE = opt.nSweepsKE;
     kin.precon     = opt.precon;
+    kin.polyDeg    = opt.polyDegKE;
     kin.fvoKMask   = opt.fvoKMask;    kin.fvoKVal   = opt.fvoKVal;
     kin.fvoEpsMask = opt.fvoEpsMask;  kin.fvoEpsVal = opt.fvoEpsVal;
 
