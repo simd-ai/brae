@@ -788,3 +788,41 @@ of the two, at a fraction of DILU's cost.
 tests/turb_precon_vs_openfoam.sh); `BRAE_DILU_KE=1` selects DILU instead. A case that NAMES a
 preconditioner keeps it. nuTilda takes the same substitution and is deliberately NOT wired: the
 Spalart-Allmaras branch never sets the degree, and it has not been measured.
+
+## Is the series stable on bigger meshes? The bound is the relaxation factor, not the mesh (2026-09-08)
+
+The truncated Neumann series converges iff rho(I - D^-1 A) < 1, so the question a default has to answer is
+whether that holds as the mesh grows. It does, and for a reason that has nothing to do with the mesh.
+`fvMatrix::relax` does two things, in this order (fvMatrix.C:105-113):
+
+    D[celli] = max(mag(D[celli]), sumOff[celli]);   // force D >= sum|offdiag|
+    D /= alpha;                                     // then divide by the relaxation factor
+
+so on a relaxed equation every row has sum|offdiag|/|a_ii| <= alpha, which bounds the convergence ratio
+by ALPHA. Measured on the epsilon and k systems brae actually solves (dumped with BRAE_STAGE_DUMP_DIR at
+outer iteration 4 and analysed offline), squareBend at six sizes:
+
+| cells     | relaxed (alpha 0.9) rho / row bound | unrelaxed rho / row bound |
+|----------:|------------------------------------:|--------------------------:|
+|    24,192 |                    0.8908 / 0.9000  |          0.9637 / 1.0000  |
+|   112,000 |                    0.8597 / 0.9000  |      **0.9986** / 1.0000  |
+|   307,328 |                    0.8887 / 0.9000  |          0.9641 / 1.0000  |
+|   896,000 |                    0.8929 / 0.9000  |          0.8979 / 1.0000  |
+| 1,750,000 |                    0.8935 / 0.9000  |                  (n/a)    |
+| 3,024,000 |                    0.8934 / 0.9000  |      **1.0010** / 1.0000  |
+
+The row bound is EXACTLY the relaxation factor at every size, and rho sits at 0.86-0.89 across two orders
+of magnitude in cell count. Flat. That is the answer to "does it hold on bigger meshes": it holds because
+alpha pins it, and alpha does not change with refinement.
+
+**The unrelaxed column is why this is a guard and not a footnote.** With no factor -- or with a factor of
+1, since fvMatrix::relax early-returns only on alpha <= 0, so relax(1.0) still clamps but divides by
+nothing -- the clamp alone gives a bound of exactly 1. At 112k rho is 0.9986, so 0.9986^10 = 0.986 and
+degree 10 does nothing whatever; at 3.02M it is 1.0010, above one, where the series amplifies. A truncated
+series is a polynomial in A, so it stays a bounded fixed linear operator either way and can never produce
+Inf -- it simply stops being a preconditioner, silently, which is the substitution this project refuses.
+
+So the rule brae runs: a blank `preconditioner` on the transported pair takes the series when the pair is
+relaxed by a factor below 1, and DILU when it is not. The notice names which and says why. The largest
+factor that will be applied decides it, so a `".*Final" 1.0` corrector disqualifies the series even when
+the ordinary factor would allow it.

@@ -136,7 +136,31 @@ grep -q "solvers/k solver: case asks 'GAMG', brae runs PBiCGStab preconditioned 
     && say "the notice names the Neumann series for both k and epsilon" ok \
     || { grep -m2 "solvers/k solver\|solvers/epsilon solver" "$W/dilu/log"; say "the notice names the Neumann series for both k and epsilon" FAIL; }
 
-# ---- arm 5 (control): a NAMED preconditioner is still honoured ------------------------------------
+# ---- arm 5: an UNRELAXED pair falls to DILU, not to the bare diagonal -----------------------------
+# The series' convergence ratio is bounded by the RELAXATION FACTOR, because fvMatrix::relax clamps
+# D >= sum|offdiag| and then divides by alpha (fvMatrix.C:105-113). Measured on this mesh family, the row
+# bound is exactly alpha at 24k, 112k, 307k, 896k, 1.75M and 3.02M cells -- flat, because it is alpha and
+# not the mesh that pins it. Strip the factor and the bound becomes 1 (measured rho 0.9986 at 112k,
+# 1.0010 at 3.02M): the series stops preconditioning, silently. So that case takes DILU instead.
+stage "$W/norelax"
+python3 - "$W/norelax/system/fvSolution" <<'PYEOF'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+s2 = re.sub(r'^\s*(k|epsilon)\s+[0-9.]+\s*;\s*$', '', s, flags=re.M)
+assert s2 != s, 'the fixture no longer relaxes k/epsilon, so this arm tests nothing'
+open(p, 'w').write(s2)
+PYEOF
+( cd "$W/norelax" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BRAE" -case "$W/norelax" > log 2>&1 ) || true
+grep -q "solvers/k solver: case asks 'GAMG', brae runs PBiCGStab preconditioned with DILU (the case names none, and relaxes k by 1 or not at all" "$W/norelax/log" \
+    && say "an unrelaxed pair takes DILU, and the notice says why" ok \
+    || { grep -m1 "solvers/k solver" "$W/norelax/log"; say "an unrelaxed pair takes DILU, and the notice says why" FAIL; }
+# ...and the RELAXED fixture must not, or the arm above proves nothing about relaxation
+grep -q "preconditioned with a degree-10 truncated Neumann series" "$W/dilu/log" \
+    && say "...and the relaxed fixture keeps the series (control)" ok \
+    || say "...and the relaxed fixture keeps the series (control)" FAIL
+
+# ---- arm 6 (control): a NAMED preconditioner is still honoured ------------------------------------
 # The rule fills the blank a substitution leaves; it does not override a case that states its choice.
 # (`preconditioner diagonal` beside `solver GAMG` is unread by OpenFOAM, which is what makes it a clean
 # way to state the choice without changing what the oracle would do.)

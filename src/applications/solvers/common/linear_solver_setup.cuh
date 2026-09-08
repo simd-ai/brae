@@ -167,9 +167,41 @@ inline void readLinearSolverControls(
     // is filled by a truncated Neumann series rather than by the bare diagonal (see the block that sets
     // ctl.polyDegKE). The notices below have to name what RUNS, so they ask the same question here
     // rather than printing "diagonal" over a solve that is not one.
+    // THE BOUND THE SERIES STANDS ON. fvMatrix::relax does two things in this order (fvMatrix.C:105-113):
+    // it forces D[c] = max(|D[c]|, sum|offdiag|), and THEN divides D by the relaxation factor. So on a
+    // relaxed equation sum|offdiag|/|a_ii| <= alpha for every row, which bounds the series' convergence
+    // ratio by the RELAXATION FACTOR and not by the mesh. Measured on squareBend, the row bound
+    // max(sum|offdiag|/|a_ii|) of the epsilon system brae solves:
+    //     24k   112k   307k   896k   1.75M   3.02M     alpha
+    //   0.9000 0.9000 0.9000 0.9000  0.9000  0.9000     0.9    -- and rho(I - D^-1 A) 0.86 to 0.89
+    // flat across two orders of magnitude in cell count, because it is alpha that pins it.
+    //
+    // With NO factor, or with a factor of 1 (fvMatrix::relax early-returns only on alpha <= 0, so
+    // relax(1.0) still clamps but divides by nothing), the clamp alone gives a bound of exactly 1 and
+    // the series has nothing to stand on: measured 0.9986 at 112k -- 0.9986^10 = 0.986, so degree 10
+    // does nothing at all -- and 1.0010 at 3.02M, where it amplifies instead of preconditioning. A
+    // truncated series is a polynomial in A, so it stays a bounded fixed linear operator either way and
+    // cannot produce Inf; it just stops being a preconditioner, silently, which is the substitution this
+    // project refuses. So an unrelaxed pair takes DILU instead, and the notice says which.
+    //
+    // The lookup mirrors readRelaxationFactors' own (`eqs ? eqs : rf`, OF's modern-then-legacy fallback),
+    // and takes the LARGEST factor that will be applied -- a `".*Final" 1.0` corrector has no bound even
+    // when the ordinary factor does.
+    auto turbRelaxBound = [&](const std::string& f) -> scalar
+    {
+        const FoamDict* rf = fvSolution.subDict("relaxationFactors");
+        const FoamDict* eqs = rf ? rf->subDict("equations") : nullptr;
+        const FoamDict* src = eqs ? eqs : rf;
+        if (!src) return scalar(1);
+        const scalar a0 = src->scalarOr(f, scalar(1));
+        const scalar a1 = src->subDict(f + "Final") || src->found(f + "Final")
+                        ? src->scalarOr(f + "Final", a0) : a0;
+        return std::fmax(a0, a1);
+    };
     auto polyHere = [&](const std::string& f, bool gs) -> int
     {
         if (gs || diluHere(f)) return 1;
+        if (!(turbRelaxBound(f) < scalar(1))) return 1;    // no bound -> no series (see above)
         // k and the pair's second scalar only. nuTilda takes the same substitution and would very likely
         // take the same answer, but the Spalart-Allmaras branch below never sets ctl.polyDegKE, and a
         // helper that claimed a field the policy does not wire would make this notice say one thing
@@ -181,12 +213,30 @@ inline void readLinearSolverControls(
         if (const char* e = std::getenv("BRAE_POLY_KE")) deg = std::max(1, std::atoi(e));
         return deg;
     };
+    // Is this field's blank `preconditioner` one brae has to fill? OpenFOAM's PBiCGStab and PCG both
+    // require the entry (lduMatrix::preconditioner::New throws without one), so a field whose entry names
+    // none is one whose solver is not a P-solver at all -- and that is exactly when brae is substituting.
+    auto blankHere = [&](const std::string& f, bool gs) -> bool
+    {
+        if (gs || diluHere(f)) return false;
+        if (!(f == "k" || f == secondName)) return false;
+        const FoamDict* sd = solvers ? solvers->subDict(f) : nullptr;
+        return !sd || sd->wordOr("preconditioner", "").empty();
+    };
     auto krylovPreconGs = [&](const std::string& f, bool gs) -> std::string
     {
         if (diluHere(f)) return "DILU";
         const int deg = polyHere(f, gs);
-        return deg > 1 ? ("a degree-" + std::to_string(deg) + " truncated Neumann series (the case names none)")
-                       : std::string("diagonal");
+        if (deg > 1)
+        {
+            return "a degree-" + std::to_string(deg) + " truncated Neumann series (the case names none)";
+        }
+        if (blankHere(f, gs))
+        {
+            return "DILU (the case names none, and relaxes " + f + " by 1 or not at all, which leaves the "
+                   "cheaper polynomial preconditioner without a convergence bound)";
+        }
+        return std::string("diagonal");
     };
     auto krylovPrecon = [&](const std::string& f) -> std::string
     {
@@ -479,10 +529,17 @@ inline void readLinearSolverControls(
                 // multicolour DILU 117.3, this at degree 10 leaves 180.5, and natural-order DILU 182.6.
                 // A case that NAMES its preconditioner keeps it, `diagonal` included: this fills a
                 // blank, it does not override a choice.
-                // polyHere is the ONE rule, and it is the one the notices above printed: a notice that
-                // said `diagonal` over a Neumann-preconditioned solve is exactly the defect this
-                // project keeps finding, so the two read the same function.
+                // polyHere and blankHere are the ONE rule, and they are the ones the notices above
+                // printed: a notice that said `diagonal` over a Neumann-preconditioned solve is exactly
+                // the defect this project keeps finding, so the two read the same functions.
                 ctl.polyDegKE = ctl.diluKE ? 1 : std::max(polyHere("k", ctl.gsK), polyHere(secondName, ctl.gsEps));
+                // ...and a blank the series cannot fill (an unrelaxed pair, see turbRelaxBound) falls to
+                // DILU rather than to the bare diagonal, which is the choice that fails.
+                if (!ctl.diluKE && ctl.polyDegKE == 1
+                    && (blankHere("k", ctl.gsK) || blankHere(secondName, ctl.gsEps)))
+                {
+                    ctl.diluKE = true;
+                }
                 if (const char* e = std::getenv("BRAE_DILU_KE"))   // attribution escape hatch
                     ctl.diluKE = (std::atoi(e) != 0) && !(ctl.gsK && ctl.gsEps);
             }
