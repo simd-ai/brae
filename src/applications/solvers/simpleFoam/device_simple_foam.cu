@@ -1027,12 +1027,16 @@ void amgFineCoeffKernel(
             }
             else
             {
-                // OpenFOAM FatalErrors here (.C:225-231) rather than assuming a density, and so must this:
-                // silently taking rho = 1 is a wrong inlet velocity with no message.
+                // No usable density: OpenFOAM FatalErrors when `rhoInlet` is absent (.C:225-231), and
+                // with `rhoInlet 0` it passes that guard, divides by zero and writes inf/nan while
+                // exiting 0 -- checked on validation/incFR. Neither is a run worth producing, and
+                // silently taking rho = 1 instead would be a wrong inlet velocity with no message.
                 throw std::runtime_error(
-                    "brae: flowRateInletVelocity on patch '" + fp.name + "' gives a massFlowRate on a "
-                    "solver that registers no density field, and no 'rhoInlet' to divide by. OpenFOAM "
-                    "fails the same way (flowRateInletVelocityFvPatchVectorField.C:225-231).");
+                    "brae: flowRateInletVelocity on patch '" + fp.name + "' gives a massFlowRate, and "
+                    "this solver registers no density field to divide it by. OpenFOAM needs a positive "
+                    "`rhoInlet` here and fails without one (flowRateInletVelocityFvPatchVectorField.C:"
+                    "225-231); with `rhoInlet 0` it divides by zero and writes inf. Supply a positive "
+                    "rhoInlet, or use volumetricFlowRate.");
             }
             if (sumRhoA <= 0.0) continue;
             deviceUpdateFlowRateInlet(dbU_, frMagSf_[k], -fp.mdot / sumRhoA, frNx_, frNy_, frNz_);

@@ -586,8 +586,18 @@ private:
         bool isMass,
         scalar rhoInlet)
     {
-        // gSum(rho*magSf). Volumetric -> rho = 1. Mass -> the seed rho (rhoInlet if the case gave one,
-        // else 1); the per-step update replaces it with the real patch rho before it matters.
+        // gSum(rho*magSf). Volumetric -> rho = 1, which is what OpenFOAM uses too (one{}, .C:208-210),
+        // so that branch is exact. Mass -> a PLACEHOLDER (rhoInlet if the case gave one, else 1),
+        // because this runs while U is being read and no solver has registered a density yet, whereas
+        // OpenFOAM's constructor evaluates against the rho createFields.H built before U.
+        //
+        // THE INVARIANT EVERY CONSUMER OWES: a mass-form placeholder must be REPLACED before it can
+        // reach an answer, or the case must be REFUSED. The compressible drivers replace it (their
+        // construction re-seed, and updateFlowRateInlets at every momentum assembly); the incompressible
+        // ones refuse when there is no positive rhoInlet, which is exactly where OpenFOAM FatalErrors.
+        // simpleFoam v2 did neither for a while -- no flow-rate code and no refusal -- and ran
+        // validation/incFR at the file's seed, 3.28e-02 off OpenFOAM. Do not add a consumer that only
+        // reads this.
         const scalar rhoSeed = (!isMass) ? scalar(1) : (rhoInlet > 0.0 ? rhoInlet : scalar(1));
         scalar sumRhoA = 0.0;
         for (label i = 0; i < p.size; ++i) sumRhoA += rhoSeed * p.magSf[i];
