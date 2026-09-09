@@ -23,13 +23,9 @@
 
 namespace brae {
 
-// OpenFOAM's Info precision, which is NOT fixed at 6: Time::readDict calls
-// IOstream::defaultPrecision(controlDict writePrecision) and re-points Sout at it (TimeIO.C:375-383),
-// and Info writes through Sout. So a case with `writePrecision 16` -- pitzDaily's own controlDict, and
-// every fixture derived from it -- makes OpenFOAM print `average: 14.85500000000195` where a hardcoded
-// %g prints `14.855`, and the line stops being diff-able against OpenFOAM's log for exactly the cases
-// this diagnostic was built to compare. Default 6, which is IOstream's own (IOstream.H precision_).
-void setBoundReportPrecision(int writePrecision);
+// The Info precision this line is written at is NOT fixed at 6 and is NOT this header's to own: it is
+// the case's `writePrecision`, shared with every other OpenFOAM-comparable diagnostic brae emits. See
+// io_precision.cuh, whose setIOPrecision the drivers call where they read controlDict.
 
 // ONE formatter for both arms. The host reference and the device path must not drift on a diagnostic
 // whose entire value is being line-comparable with OpenFOAM's own log, so neither writes its own

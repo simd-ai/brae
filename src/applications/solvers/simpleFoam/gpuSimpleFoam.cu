@@ -6,6 +6,7 @@
 // dev2(T(grad U))); the pressure uses the device AMG-PCG. Mirrors the host brae_simpleFoam control flow.
 //
 //   brae -case <caseDir>
+#include "io_precision.cuh"   // setIOPrecision: OF ties every Info line to writePrecision
 #include "bound_report.cuh"   // printBounding: Foam::bound's message, one formatter for both arms
 #include "primitive_mesh.cuh"
 #include "acmi_area_scaling.cuh"
@@ -186,7 +187,7 @@ int main(int argc, char** argv)
 
         // controls from the case dictionaries
         const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
-        setBoundReportPrecision(controlDict.intOr("writePrecision", 6));   // OF TimeIO.C:375-383
+        setIOPrecision(controlDict.intOr("writePrecision", 6));   // OF TimeIO.C:375-383
 
         const FoamDict fvSolution  = readDict(caseDir + "/system/fvSolution");
         const FoamDict transport   = readDict(caseDir + "/constant/transportProperties");
@@ -310,7 +311,11 @@ int main(int argc, char** argv)
         ctl.turbulent = (simType == "RAS");
         if (simType != "RAS" && simType != "laminar")
             throw std::runtime_error("brae: unsupported simulationType '" + simType + "' (RAS or laminar)");
-        readTurbulenceModel(turbProps, ctl);
+        // INCOMPRESSIBLE: gnPowerLaw is consumed only by rhoSimpleStep and by the `compressible_`
+        // branch of the boundary muEff (device_simple_foam.cu:3540, :1319), neither of which this arm
+        // reaches -- so it read the model, printed its coefficients and ran Stokes. Maxwell it does run
+        // (:841 correctMaxwell, :1150, :1340-1352, none of them compressibility-guarded).
+        readTurbulenceModel(turbProps, ctl, {"simpleFoam (legacy)", false, true});
 
         // Scalar linearUpwind is gated OFF here as a COLD-START STABILITY guard, not for accuracy. The
         // original comment claimed it "degrades turbulence accuracy vs OF"; that was measured with the old
