@@ -288,6 +288,11 @@ TurbulenceHookOptions buildTurbulenceHookOptions(
     opt.co.snGradLimitCoeff   = hin.snGradLimitCoeff;
     opt.co.gradULimitK        = hin.gradULimitK;
     opt.co.gradKLimitK        = hin.gradKLimitK;
+    // kOmegaSST: the model flag and its own coefficients, from the same host parse the host arm reads.
+    // The second-scalar buffers carry omega when this is set -- see createFields.
+    opt.sst   = (hf.rasModel == "kOmegaSST");
+    opt.sstCo = hf.sstCoeffs;
+    opt.sstCo.gradKLimitK = hin.gradKLimitK;
     opt.Prt                   = hf.Prt;
     opt.bounded               = hin.boundedTurb;
     opt.correctedLaplacian    = hin.correctedLaplacian;

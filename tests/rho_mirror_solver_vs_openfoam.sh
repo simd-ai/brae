@@ -276,9 +276,20 @@ if [ -d "$ROOT/validation/sbMatched" ]; then
     sed -i 's|div(phi,epsilon)    $turbulence;|div(phi,epsilon)    $turbulence;\n    div(phi,omega)      $turbulence;|' "$SST/system/fvSchemes"
     grep -q "kOmegaSST" "$SST/constant/turbulenceProperties" || { echo "FAIL: the SST mutation did not apply"; exit 1; }
     cout=$( cd "$SST" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BIN" -case "$SST" 2>&1 || true )
-    echo "$cout" | grep -q "RASModel 'kOmegaSST'" && echo "$cout" | grep -q "laminar run under a turbulent model" \
+    # The reason moved: the device closure now EXISTS (kOmegaSST.cu) but is not validated, so the
+    # refusal names that rather than "no closure at all". What must hold is unchanged -- the arm refuses
+    # by model name and writes nothing -- so the assertion is on the model and on the absence of output,
+    # not on a sentence that is free to be corrected.
+    echo "$cout" | grep -q "RASModel 'kOmegaSST'" && ! [ -d "$SST/3" ] \
         && say "kOmegaSST is refused by name on the CUDA arm" ok \
         || { echo "$cout" | tail -3; say "kOmegaSST is refused by name on the CUDA arm" FAIL; }
+    # ...and the opt-in really does reach the closure, so the refusal is a POLICY and not the absence of
+    # an implementation. If this ran nothing, the arm above would be passing for the wrong reason.
+    oout=$( cd "$SST" && BRAE_SST_DEVICE=1 BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BIN" -case "$SST" 2>&1 || true )
+    echo "$oout" | grep -q "^Time = " \
+        && say "...and BRAE_SST_DEVICE=1 reaches the unvalidated closure (the refusal is a policy)" ok \
+        || { echo "$oout" | tail -3; say "...and BRAE_SST_DEVICE=1 reaches the unvalidated closure (the refusal is a policy)" FAIL; }
+    rm -rf "$SST/3"
     hout=$( cd "$SST" && BRAE_RHOSIMPLEFOAM_MIRROR=1 "$BIN" -case "$SST" 2>&1 || true )
     echo "$hout" | grep -q "^Time = " \
         && say "...and the SAME case runs on the host arm (the refusal is device-specific)" ok \

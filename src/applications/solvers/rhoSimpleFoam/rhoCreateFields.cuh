@@ -72,6 +72,10 @@ struct RhoDeviceFields
     // ...and WHICH member of the family each face carries, as a NutWall code. OpenFOAM dispatches per
     // patch through nut's own virtual calcNut(); this is that dispatch, projected onto faces.
     DeviceBuffer<label>  nutWfKindBnd;
+    // kOmegaSST only: the wall distance per CELL (F1/F2's arg1/arg2), and which boundary faces nut's
+    // own patch fills. Empty on the kEpsilon path, which needs neither.
+    DeviceBuffer<scalar> yCell;
+    DeviceBuffer<label>  nutCalcMask;
     std::vector<label>   wfFaceOfBnd;    // wall-face order -> boundary-face index, for deviceGatherWallNu
 
     // The TURBULENT INLETS, per boundary face. OpenFOAM recomputes these every updateCoeffs:

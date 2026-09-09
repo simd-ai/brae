@@ -3,6 +3,7 @@
 #include "nut_wall_function.cuh"   // enum class NutWall: which member each nut patch carries
 #include "rhoCreateFields.cuh"
 #include "near_wall_dist.cuh"
+#include "cell_wall_dist.cuh"   // cellWallDist: F1/F2 read y per CELL
 #include <stdexcept>
 
 namespace brae {
@@ -255,26 +256,72 @@ RhoDeviceFields createDeviceFields(
     // The device closure is the compressible kEpsilon (gpu::kEpsilonRAS) and nothing else. The frozen
     // case refuses too: `turbulence off` still needs the nut this block uploads, so a frozen SST case
     // would run laminar just as loudly.
-    if (hf.turbulent && !hf.rasModel.empty() && hf.rasModel != "kEpsilon")
+    // The device closure carries the compressible kEpsilon AND kOmegaSST now, each in the OF-MIRROR
+    // lineage (kEpsilon.cu, kOmegaSST.cu) rather than the legacy whole-closure entry points. Any other
+    // RAS model still refuses: the nut upload lives inside the closure's own set-up, so running one
+    // would be a laminar run wearing a turbulent model's name.
+    // The mirror device kOmegaSST closure EXISTS (kOmegaSST.cu) but is NOT VALIDATED, so it is not
+    // reachable by default. Measured on validation/rhoSST, one iteration restarted from OpenFOAM's own
+    // state: the host arm lands at k 9.3e-06 / omega 5.0e-06 / nut 1.5e-06, this closure at
+    // k 3.1e-03 / omega 3.0e-02 / nut 2.8e-01. k is right; omega comes out TOO LOW in 1156 of 3200
+    // cells (162.7 against OpenFOAM's 281.4 at the worst), and nut = a1*k/max(a1*omega, ...) follows it
+    // up. So the defect is a term in the OMEGA equation, and the k equation and the transport machinery
+    // are not implicated.
+    //
+    // BRAE_SST_DEVICE=1 reaches it anyway, for that debugging. Until a gate is green the default is the
+    // refusal, because a turbulence closure that runs and is quietly wrong is the defect this project
+    // exists to catch -- and the host arm carries kOmegaSST today.
+    const bool sstDeviceOptIn = std::getenv("BRAE_SST_DEVICE")
+                             && std::string(std::getenv("BRAE_SST_DEVICE")) == "1";
+    if (hf.turbulent && !hf.rasModel.empty() && hf.rasModel != "kEpsilon"
+     && !(hf.rasModel == "kOmegaSST" && sstDeviceOptIn))
         throw std::runtime_error(
             "brae rhoSimpleFoam (CUDA): RASModel '" + hf.rasModel + "' -- the device closure implements "
-            "the compressible kEpsilon and nothing else, and its second transported scalar is epsilon. "
-            "This case would otherwise run with NO turbulent viscosity at all (the nut upload lives "
-            "inside the closure's own set-up), which is a laminar run under a turbulent model's name. "
-            "The host arm (BRAE_RHOSIMPLEFOAM_MIRROR=1) carries kOmegaSST; refusing rather than "
-            "running this case without its closure.");
+            "the compressible kEpsilon, and its kOmegaSST is written but not yet validated (see "
+            "kOmegaSST.cu; BRAE_SST_DEVICE=1 opts in for debugging). This case would otherwise run with "
+            "NO turbulent viscosity at all, or with one that is measurably wrong. The host arm "
+            "(BRAE_RHOSIMPLEFOAM_MIRROR=1) carries kOmegaSST; refusing rather than running this case "
+            "without a validated closure.");
     // The device closure used to compute nutkWallFunction for EVERY wall-function face, so this arm
     // refused nutU and nutLowRe by name. It dispatches on the face's own NutWall code now, from the
     // per-face array built below, exactly as the host arm dispatches on the patch's. What is still
     // outside the ported set (nutUSpalding, nutUBlended, the atm family) is refused by createFields on
     // both arms, where the dictionary type still exists.
-    if (hf.turbulent && !hf.epsilon.internal.empty())
+    // THE SECOND SCALAR rides the `epsilon` slot whichever model is running -- omega under kOmegaSST.
+    // Naming it once, here, is what lets the hook and the closures take one pair of buffers instead of
+    // branching on the model at every use; the closure that reads them knows which it is.
+    const bool sstModel = (hf.rasModel == "kOmegaSST");
+    // Every question below about "the second scalar's patch" -- its turbulent-inlet kind, whether it
+    // carries a wall function, that function's coefficients -- is asked of THIS field. Asking hf.epsilon
+    // walked off an empty vector under kOmegaSST, where only hf.omega is ever built.
+    const GeometricField<scalar>& second = sstModel ? hf.omega : hf.epsilon;
+    if (hf.turbulent && !second.internal.empty())
     {
         d.dbK   = buildDeviceBoundary(hf.k, patches, g);
-        d.dbEps = buildDeviceBoundary(hf.epsilon, patches, g);
+        d.dbEps = buildDeviceBoundary(second, patches, g);
+
+        // F1 and F2 read the wall distance per CELL (arg1/arg2 in kOmegaSSTBase.C), which is a
+        // different field from the per-boundary-face nearWallDist the wall functions take.
+        if (sstModel) d.yCell.copyFrom(cellWallDist(m, g, patches));
+
+        // WHICH boundary faces nut's own patch FILLS. OpenFOAM's correctNut is a field assignment, so a
+        // `calculated` nut takes the expression and a fixedValue one ignores it
+        // (fixedValueFvPatchField::operator= is a no-op). deviceSSTNutBoundary needs that mask; the
+        // kEpsilon closure derives the same thing from its wall-function mask.
+        {
+            std::vector<label> cm(static_cast<std::size_t>(d.nBndFaces), 0);
+            label b = 0;
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                if (isCoupledInterfaceType(patches[pi].type)) continue;
+                for (label i = 0; i < patches[pi].size; ++i, ++b)
+                    if (b < d.nBndFaces && hf.nut.boundary[pi]->bcCategory() == 2) cm[b] = 1;
+            }
+            d.nutCalcMask.copyFrom(cm);
+        }
 
         d.f.k.copyFrom(hf.k.internal);
-        d.f.epsilon.copyFrom(hf.epsilon.internal);
+        d.f.epsilon.copyFrom(second.internal);
         d.f.nut.copyFrom(hf.nut.internal);
         d.f.nutBnd.copyFrom(flattenFieldBoundary(hf.nut, patches, d.nBndFaces, 0.0));
         if (!hf.alphat.internal.empty())
@@ -334,9 +381,9 @@ RhoDeviceFields createDeviceFields(
                 // every other patch type, which is what lets this tell "no such patch" from "a patch
                 // whose coefficient happens to be zero".
                 const int  kk = hf.k.boundary[pi]->turbulentInletKind();
-                const int  ek = hf.epsilon.boundary[pi]->turbulentInletKind();
+                const int  ek = second.boundary[pi]->turbulentInletKind();
                 const scalar kc = hf.k.boundary[pi]->turbulentInletCoefficient();
-                const scalar ec = hf.epsilon.boundary[pi]->turbulentInletCoefficient();
+                const scalar ec = second.boundary[pi]->turbulentInletCoefficient();
                 for (label i = 0; i < patches[pi].size; ++i, ++bi)
                 {
                     if (bi >= d.nBndFaces) break;
@@ -357,7 +404,7 @@ RhoDeviceFields createDeviceFields(
         std::vector<char> wfPatch(patches.size(), 0);
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
-            wfPatch[pi] = hf.epsilon.boundary[pi]->isTurbulenceWallFunction() ? 1 : 0;
+            wfPatch[pi] = second.boundary[pi]->isTurbulenceWallFunction() ? 1 : 0;
         }
         d.wall = buildDeviceWallData(m, g, patches, hf.U, wfPatch);
 
@@ -378,7 +425,7 @@ RhoDeviceFields createDeviceFields(
         {
             const bool isWF = isTurbWallPatch(patches, pi, wfPatch);
             const WallFunctionCoeffs& nc = hf.nut.boundary[pi]->wallCoeffs();
-            const WallFunctionCoeffs& ec = hf.epsilon.boundary[pi]->wallCoeffs();
+            const WallFunctionCoeffs& ec = second.boundary[pi]->wallCoeffs();
             for (label i = 0; i < patches[pi].size; ++i, ++bndIdx)
             {
                 mask.push_back(isWF ? 1 : 0);

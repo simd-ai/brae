@@ -27,6 +27,7 @@
 //   nutBndIn                    a SNAPSHOT of the entering wall viscosity. Not nutBnd itself: nutBnd is
 //                               also the output correct() overwrites, so aliasing them makes the closure
 //                               read a value it has already replaced partway through.
+#include "komega_sst_coeffs.cuh"
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 #include "device_boundary.cuh"
@@ -67,6 +68,11 @@ struct TurbulenceHookOptions
     // `Gauss limitedLinear <k>` on div(phi,k) and div(phi,epsilon|omega). ONE flag and ONE coefficient
     // for both, matching the closures; limGradK is the cellLimited coefficient of the case's
     // grad(<field>), which limits the LIMITER's gradient. See KEpsilonInput.
+    // Which model the closure is: the hook dispatches on it, and the second-scalar buffers carry omega
+    // rather than epsilon when it is set. Both closures read the SAME parse, so the two arms cannot
+    // disagree about the case.
+    bool           sst = false;
+    KOmegaSSTCoeffs sstCo;
     bool           limitedLinear = false;
     scalar         limiterCoeff  = 1.0;
     scalar         limGradK      = 0.0;

@@ -1,4 +1,5 @@
 // rhoTurbulenceHook.cu -- see the header for what this replaces and why it is shared.
+#include "kOmegaSST.cuh"   // the MIRROR device SST, not the legacy deviceKOmegaSSTCorrect
 #include "rhoTurbulenceHook.cuh"
 
 #include "device_blas.cuh"        // deviceDivide, deviceCopy -- already gated, not re-written here
@@ -149,6 +150,52 @@ void correctTurbulence(
     kin.fvoKMask   = opt.fvoKMask;    kin.fvoKVal   = opt.fvoKVal;
     kin.fvoEpsMask = opt.fvoEpsMask;  kin.fvoEpsVal = opt.fvoEpsVal;
 
+    if (opt.sst)
+    {
+        // The mirror's own SST closure -- NOT deviceKOmegaSSTCorrect, which is the legacy lineage and
+        // disagrees with this arm's HOST reference on bound(), the nut boundary and the wall-function
+        // family. kOmegaSST.cuh has the measurement.
+        kOmegaSSTRAS::KOmegaSSTInput sstIn;
+        sstIn.phiInt = kin.phiInt;   sstIn.phiBnd = kin.phiBnd;
+        sstIn.phiByRhoInt = kin.phiByRhoInt;   sstIn.phiByRhoBnd = kin.phiByRhoBnd;
+        sstIn.rhoCell = kin.rhoCell;           sstIn.rhoBndFace = kin.rhoBndFace;
+        sstIn.nuCell  = kin.nuCell;            sstIn.nuBndFace  = kin.nuBndFace;
+        sstIn.nuWallFace = kin.nuWallFace;     sstIn.nutBndFace = kin.nutBndFace;
+        sstIn.wfBndMask    = kin.wfBndMask;    sstIn.wallYBndFace = kin.wallYBndFace;
+        sstIn.nutWfCmu25Bnd = kin.nutWfCmu25Bnd;  sstIn.nutWfKappaBnd = kin.nutWfKappaBnd;
+        sstIn.nutWfEBnd     = kin.nutWfEBnd;      sstIn.nutWfYplLamBnd = kin.nutWfYplLamBnd;
+        sstIn.nutWfKindBnd  = kin.nutWfKindBnd;   sstIn.nutCalcMask    = &dev.nutCalcMask;
+        sstIn.Ux = kin.Ux;  sstIn.Uy = kin.Uy;  sstIn.Uz = kin.Uz;
+        sstIn.yCell = &dev.yCell;
+        sstIn.boundedK = kin.boundedK;   sstIn.boundedOmega = kin.boundedEps;
+        sstIn.limitedLinear = kin.limitedLinear;  sstIn.limiterCoeff = kin.limiterCoeff;
+        sstIn.limGradK = kin.limGradK;
+        sstIn.correctedLaplacian = kin.correctedLaplacian;
+        sstIn.snGradLimitCoeff   = kin.snGradLimitCoeff;
+        sstIn.gradULimitK        = opt.co.gradULimitK;
+        sstIn.relaxEquationOmega = kin.relaxEquationEps;  sstIn.relaxOmega = kin.relaxEps;
+        sstIn.relaxEquationK     = kin.relaxEquationK;    sstIn.relaxK     = kin.relaxK;
+        sstIn.tol = kin.tol;  sstIn.relTol = kin.relTol;  sstIn.maxIter = kin.maxIter;  sstIn.minIter = kin.minIter;
+        sstIn.precon = kin.precon;  sstIn.polyDeg = kin.polyDeg;
+        sstIn.gsK = kin.gsK;  sstIn.gsOmega = kin.gsEps;  sstIn.gsSymmetric = kin.gsSymmetric;
+        sstIn.nSweepsKE = kin.nSweepsKE;
+        sstIn.fvoKMask = kin.fvoKMask;  sstIn.fvoKVal = kin.fvoKVal;
+        sstIn.fvoOmegaMask = kin.fvoEpsMask;  sstIn.fvoOmegaVal = kin.fvoEpsVal;
+        sstIn.co  = opt.sstCo;
+        sstIn.Prt = kin.Prt;
+        sstIn.hasCoupledPatches   = kin.hasCoupledPatches;
+        sstIn.hasUnportedFvOption = kin.hasUnportedFvOption;
+        sstIn.hasNonUpwindDivScheme = kin.hasNonUpwindDivScheme;
+        sstIn.hasNonWallTurbWallFunc = kin.hasNonWallTurbWallFunc;
+        sstIn.fvOptionUnsupported   = kin.fvOptionUnsupported;
+        sstIn.divSchemeUnsupported  = kin.divSchemeUnsupported;
+        kOmegaSSTRAS::KOmegaSSTResiduals sres;
+        kOmegaSSTRAS::correct(f.k, f.epsilon, f.nut, f.nutBnd, &f.alphat, &f.alphatBnd, sres, dm, dbU,
+                              const_cast<DeviceBoundary&>(dev.dbK),
+                              const_cast<DeviceBoundary&>(dev.dbEps),
+                              const_cast<DeviceWallData&>(dev.wall), sstIn);
+        return;
+    }
     kEpsilonRAS::correct(f.k, f.epsilon, f.nut, f.nutBnd, &f.alphat, &f.alphatBnd,
                          buf.stages, dm, dbU,
                          const_cast<DeviceBoundary&>(dev.dbK),
