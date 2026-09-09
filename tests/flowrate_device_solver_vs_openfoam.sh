@@ -30,10 +30,22 @@
 #          field by far more than the bound, or ARMs 1-3 prove nothing.
 #   ARM 6  REFUSAL: massFlowRate on an incompressible solver with no `rhoInlet` -- OpenFOAM FatalErrors
 #          (.C:225-231) and so must brae, by name, rather than assuming a density.
+#   ARM 7  SEED INDEPENDENCE on the legacy compressible arm. OpenFOAM's dict constructor keeps the case
+#          file's `value` and only evaluates when it is absent (.C:93-97), so the seed reaches the
+#          INITIAL phi -- compressibleCreatePhi.H builds it before any updateCoeffs runs. The three
+#          drivers re-seeded that patch UNCONDITIONALLY, overwriting a `value` OpenFOAM keeps. Each arm
+#          is compared against its OWN OpenFOAM run, because OpenFOAM's answer legitimately moves with
+#          the seed; what must hold is that brae tracks it whatever the seed is.
 #
 # FAIL-PROOF, measured in-session on the binary before the fix (relative L2 vs real OpenFOAM, every
 # solver pinned at tolerance 1e-14 relTol 0), inlet frozen at the seed 5 against OpenFOAM's 5.166:
 #   rhoFRvol legacy      U 1.1049e-02 (t=1)  3.2652e-02 (t=20)
+#   ARM 7, validation/rhoFR on the legacy arm, by the seed in 0/U alone:
+#     no `value` (OpenFOAM evaluates too)  U 4.8372e-12  1.0548e-11   <- this driver's floor, always passed
+#     `value uniform (5 0 0)` (shipped)    U 6.5461e-06  1.5415e-06
+#     `value uniform (0 0 0)` (OF tutorial) U 2.7276e-02  6.4649e-03
+#   and OpenFOAM's OWN seeded-vs-unseeded answers differ by exactly 6.5461e-06 / 1.5415e-06, i.e. brae
+#   with a seed was reproducing OpenFOAM without one. After the fix: 4.9e-12, 4.8e-10, 5.2e-11.
 #   incFR volumetric     U 1.1049e-02 (t=1)  3.2770e-02 (t=20)
 #   incFR mass rhoInlet 2  U 1.5466e-01 (t=1)  7.0180e-01 (t=20)   <- the worst of them
 #   pimFR both forms     U 3.1951e-02        3.1984e-02
@@ -191,6 +203,61 @@ d = float(np.linalg.norm(ofU - seed) / np.linalg.norm(ofU)) / FLOOR
 good = d > RATIO
 print('     control: OpenFOAM\'s answer is %.0e x the bound away from the seeded field   %s'
       % (d, 'ok' if good else 'FAIL (the seed is inert; nothing above proves anything)'))
+ok = ok and good
+sys.exit(0 if ok else 1)
+PYEOF
+
+# ---- ARM 7: the answer must not depend on 0/U's `value` seed, which OpenFOAM keeps ---------------
+S5='s|value uniform (5 0 0)|value uniform (5 0 0)|'
+S0='s|value uniform (5 0 0)|value uniform (0 0 0)|'
+SNV='s|; value uniform (5 0 0)||'
+for sd in s5 s0 snv; do
+    case $sd in s5) EXPR="$S5" ;; s0) EXPR="$S0" ;; snv) EXPR="$SNV" ;; esac
+    stage "seed_${sd}_of" rhoFR "$EXPR" 20 1
+    ( cd "$W/seed_${sd}_of" && rhoSimpleFoam > log 2>&1 ) \
+        || { tail -5 "$W/seed_${sd}_of/log"; echo "FAIL: OF on rhoFR seed $sd"; exit 1; }
+    stage "seed_${sd}_br" rhoFR "$EXPR" 20 1
+    ( cd "$W/seed_${sd}_br" && BRAE_U_SOLVER=ofOrder "$BUILDD/brae_rhoSimpleFoam" \
+        -case "$W/seed_${sd}_br" > log 2>&1 ) \
+        || { tail -5 "$W/seed_${sd}_br/log"; echo "FAIL: brae on rhoFR seed $sd"; exit 1; }
+done
+
+W="$W" SEED_FLOOR="${SEED_FLOOR:-1e-8}" CONTROL_RATIO="$CONTROL_RATIO" python3 - <<'PYEOF' || fail=1
+import os, re, sys
+import numpy as np
+W = os.environ['W']; FLOOR = float(os.environ['SEED_FLOOR']); RATIO = float(os.environ['CONTROL_RATIO'])
+
+def read(p):
+    s = open(p).read()
+    m = re.search(r'internalField\s+nonuniform\s+List<(scalar|vector)>\s*\n?(\d+)\s*\n\(\n(.*?)\n\)\s*;', s, re.S)
+    if not m:
+        u = re.search(r'internalField\s+uniform\s+(\(.*?\)|[-+0-9.eE]+)\s*;', s); v = u.group(1)
+        return np.array([float(x) for x in v.strip('()').split()]) if v.startswith('(') else np.array([float(v)])
+    if m.group(1) == 'scalar':
+        return np.array([float(x) for x in m.group(3).split()])
+    return np.array([[float(c) for c in v.split()] for v in re.findall(r'\(([^)]*)\)', m.group(3))])
+
+def rel(a, b, t, f):
+    return float(np.linalg.norm(read(os.path.join(W, a, t, f)) - read(os.path.join(W, b, t, f)))
+                 / np.linalg.norm(read(os.path.join(W, b, t, f))))
+
+ok = True
+for sd, note in (('s5',  '`value uniform (5 0 0)`  the shipped fixture '),
+                 ('s0',  '`value uniform (0 0 0)`  OpenFOAM\'s tutorial'),
+                 ('snv', 'no `value`  CONTROL: brae always passed here')):
+    for t in ('1', '20'):
+        worst, wf = max(((rel('seed_%s_br' % sd, 'seed_%s_of' % sd, t, f), f) for f in ('U', 'p', 'T')))
+        good = worst < FLOOR
+        print('     rhoFR seed %s t=%-3s worst %-2s %.4e  (bound %.1e)  %s'
+              % (note, t, wf, worst, FLOOR, 'ok' if good else 'FAIL'))
+        ok = ok and good
+
+# CONTROL: the seed is a live variable in OpenFOAM's OWN answer, so the three arms above are genuinely
+# different measurements and not the same run compared three times.
+d = rel('seed_s0_of', 'seed_s5_of', '1', 'U') / FLOOR
+good = d > RATIO
+print('     control: OpenFOAM\'s own seed-(0 0 0) and seed-(5 0 0) answers differ by %.0e x the bound  %s'
+      % (d, 'ok' if good else 'FAIL (the seed is inert; the arms above prove nothing)'))
 ok = ok and good
 sys.exit(0 if ok else 1)
 PYEOF
