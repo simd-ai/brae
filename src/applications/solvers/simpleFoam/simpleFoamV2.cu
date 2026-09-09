@@ -858,6 +858,69 @@ int runSimpleFoamV2(const std::string& caseDir)
         if (f.U.boundary[pi]->bcCategory() == 5 || f.p.boundary[pi]->bcCategory() == 5) hasMixedBC = true;
     }
 
+    // ---- flowRateInletVelocity ---------------------------------------------------------------
+    // OpenFOAM recomputes this inlet inside every momentum matrix constructor and ASSIGNS the patch
+    // value there (flowRateInletVelocityFvPatchVectorField.C:195-196), so the case file's `value` is a
+    // seed that survives only until the first assembly. V2 had no flowRate code AT ALL and no refusal
+    // either, so such an inlet stayed at that seed for the whole run: measured on validation/incFR
+    // against real simpleFoam, seed (5 0 0) against OpenFOAM's 5.166, U 1.10e-02 at iteration 1 growing
+    // to 3.28e-02 -- a case simply running at the wrong flow rate, silently.
+    //
+    // THE DIVISOR. simpleFoam registers no volScalarField `rho`, so OpenFOAM's updateCoeffs takes either
+    // the volumetric branch (:208-210, rho is literally one{}) or the rhoInlet constant (:233); the live
+    // density branch (:215-220) is unreachable here. Both are constant over the run, which is why one
+    // scalar per patch is enough -- but it is still applied every iteration, where OpenFOAM applies it.
+    std::vector<DeviceBuffer<scalar>> frMask;
+    std::vector<scalar>               frAvgU;
+    DeviceBuffer<scalar>              frNx, frNy, frNz;
+    {
+        std::vector<scalar> nx, ny, nz;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                nx.push_back(fvp[pi].nf[i].x);
+                ny.push_back(fvp[pi].nf[i].y);
+                nz.push_back(fvp[pi].nf[i].z);
+            }
+        }
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (!f.U.boundary[pi]->isFlowRateInlet()) continue;
+            const bool   isMass   = f.U.boundary[pi]->flowRateIsMass();
+            const scalar rhoInlet = f.U.boundary[pi]->flowRateRhoInlet();
+            // OpenFOAM FatalErrors on a mass rate it cannot divide (.C:225-231), and with `rhoInlet 0`
+            // it divides by zero and writes inf/nan while exiting 0 -- checked on this fixture. Neither
+            // is a run worth producing, so both are refused by name.
+            if (isMass && !(rhoInlet > 0.0))
+                throw std::runtime_error(
+                    std::string("brae (simpleFoam v2): flowRateInletVelocity on patch '") + fvp[pi].name
+                    + "' gives a massFlowRate, and simpleFoam registers no density field to divide it by. "
+                      "OpenFOAM needs a positive `rhoInlet` here and fails without one "
+                      "(flowRateInletVelocityFvPatchVectorField.C:225-231); with `rhoInlet 0` it divides "
+                      "by zero and writes inf. Supply a positive rhoInlet, or use volumetricFlowRate.");
+            std::vector<scalar> mask(nx.size(), scalar(0));
+            scalar sumRhoA = 0.0;
+            label bi = 0;
+            for (std::size_t pj = 0; pj < fvp.size(); ++pj)
+            {
+                if (isCoupledInterfaceType(fvp[pj].type)) continue;
+                for (label i = 0; i < fvp[pj].size; ++i, ++bi)
+                    if (pj == pi)
+                    {
+                        mask[static_cast<std::size_t>(bi)] = fvp[pj].magSf[i];
+                        sumRhoA += (isMass ? rhoInlet : scalar(1)) * fvp[pj].magSf[i];
+                    }
+            }
+            if (!(sumRhoA > 0.0)) continue;
+            frMask.emplace_back();
+            frMask.back().copyFrom(mask);
+            frAvgU.push_back(-f.U.boundary[pi]->flowRateValue() / sumRhoA);
+        }
+        if (!frMask.empty()) { frNx.copyFrom(nx); frNy.copyFrom(ny); frNz.copyFrom(nz); }
+    }
+
     SolverFields gf;
     {
         std::vector<scalar> ux(nC), uy(nC), uz(nC);
@@ -2207,6 +2270,9 @@ int runSimpleFoamV2(const std::string& caseDir)
         // run diverged to nuTilda ~1e+36 while residualControl still reported convergence.
         deviceUpdateInletOutlet(dbU, gf.phiBnd);
         deviceUpdateInletOutlet(dbP, gf.phiBnd);
+        // flowRateInletVelocity's updateCoeffs, at OpenFOAM's point for it -- see the set-up above.
+        for (std::size_t k = 0; k < frMask.size(); ++k)
+            deviceUpdateFlowRateInlet(dbU, frMask[k], frAvgU[k], frNx, frNy, frNz);
         if (ras)
         {
             deviceUpdateInletOutlet(dbK, gf.phiBnd);
