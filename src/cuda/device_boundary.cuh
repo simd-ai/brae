@@ -21,6 +21,14 @@ struct DeviceBoundary
     DeviceBuffer<label>  bcType;            // 0 extrapolated, 1 fixedValue, 2 calculated (3=inletOutlet -> resolved
                                             // to 0|1 per face each step by deviceUpdateInletOutlet; 5=mixed/Robin;
                                             // 8=COUPLED (processor): zero matrix coeffs, value injected by the halo)
+    // fvPatchField::assignable() per face -- may an ASSIGNMENT to the field overwrite this patch's value?
+    // False for the fixedValue, mixed and transform families; inletOutlet overrides it back to TRUE
+    // (fv_patch_field.cuh:57-67). Carried explicitly rather than derived from bcType, because bcType
+    // resolves an inletOutlet to fixedValue on an inflow face and that is exactly the case the two
+    // questions disagree on. Foam::bound's boundary half (bound.C:59) is an assignment, so it is the
+    // consumer: without this the device arms clamped nothing there, and clamping everything would move
+    // wall-function faces OpenFOAM leaves alone.
+    DeviceBuffer<label>  assignableMask;
     DeviceBuffer<label>  ioMask;            // 1 if the face is inletOutlet (bcType recomputed from the flux sign)
     DeviceBuffer<label>  oioMask;           // 1 if the face is outletInlet (freestreamPressure): opposite flux switch
     DeviceBuffer<label>  mixedMask;         // 1 if the face is mixed/Robin (freestreamVelocity/Pressure): vf recomputed
@@ -50,7 +58,7 @@ inline DeviceBoundary buildDeviceBoundary(
     const std::vector<FvPatch>& fvp,
     const FvGeometry& g)
 {
-    std::vector<label> ty, fc, io, oio, mx, pv, sm, tp, sg;
+    std::vector<label> ty, fc, io, oio, mx, pv, sm, tp, sg, asg;
     std::vector<scalar> ref, dc, ms, vf, p0, rg;   // rg = fixedGradient normal gradient (0 elsewhere)
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
@@ -77,6 +85,7 @@ inline DeviceBoundary buildDeviceBoundary(
             // outletInlet, totalPressure and flowRateInletVelocity(mass). They must map to 1 here -- pushing
             // the category through as a device bcType leaves an unknown type that no evaluator handles.
             ty.push_back((cat == 3 || cat == 4 || cat == 7 || cat == 9) ? 1 : cat);   // 5 stays mixed
+            asg.push_back(f.boundary[pi]->assignable() ? 1 : 0);
             io.push_back(cat == 3 ? 1 : 0);
             oio.push_back(cat == 4 ? 1 : 0);
             mx.push_back(cat == 5 ? 1 : 0);
@@ -96,6 +105,7 @@ inline DeviceBoundary buildDeviceBoundary(
     DeviceBoundary db;
     db.n = static_cast<int>(ty.size());
     db.bcType.copyFrom(ty);
+    db.assignableMask.copyFrom(asg);
     db.ioMask.copyFrom(io);
     db.oioMask.copyFrom(oio);
     db.mixedMask.copyFrom(mx);

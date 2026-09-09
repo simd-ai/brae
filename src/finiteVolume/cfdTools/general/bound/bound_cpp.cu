@@ -93,9 +93,18 @@ scalar bound(
         vsf.internal[c] = std::fmax(std::fmax(vsf.internal[c], cand), lowerBound);
     }
 
-    // vsf.boundaryFieldRef() = max(vsf.boundaryField(), lowerBound)
+    // vsf.boundaryFieldRef() = max(vsf.boundaryField(), lowerBound)  -- bound.C:59
+    //
+    // ...which is an ASSIGNMENT, and in OpenFOAM that dispatches virtually to fvPatchField::operator=,
+    // overridden to do NOTHING on the fixedValue, mixed and transform families. So it does not touch an
+    // epsilonWallFunction, an omegaWallFunction, a kLowReWallFunction or a plain fixedValue -- it only
+    // reaches the patches whose value may be overwritten. This clamped EVERY patch, which is the mirror
+    // image of the device arms omitting the clamp entirely, and it moved wall-function faces OpenFOAM
+    // leaves alone. assignable() is brae's model of that predicate and carries the inletOutlet subtlety
+    // (fv_patch_field.cuh:57-67); it is deliberately NOT fixesValue(), which answers a different question.
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
+        if (!vsf.boundary[pi]->assignable()) continue;
         std::vector<scalar> b = vsf.boundary[pi]->value();
         for (label i = 0; i < patches[pi].size; ++i)
         {

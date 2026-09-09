@@ -267,12 +267,28 @@ __global__ void boundApplyKernel(
 }
 
 
-__global__ void boundBndKernel(int nB, scalar floorV, scalar* bval)
-{
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= nB) return;
-    bval[i] = fmax(bval[i], floorV);
-}
+// bound.C:59 -- vsf.boundaryFieldRef() = max(vsf.boundaryField(), lowerBound) -- HAS NO DEVICE EQUIVALENT
+// HERE, and a kernel that clamped boundary values would be wrong rather than incomplete. Three facts
+// decide it, and they are worth writing down because the naive version looks right:
+//
+//   1. That line is an ASSIGNMENT, so fvPatchField::operator= dispatches it, and that is overridden to do
+//      NOTHING on the fixedValue, mixed and transform families. It does not touch an epsilonWallFunction,
+//      an omegaWallFunction or a plain fixedValue -- only patches whose value may be overwritten
+//      (assignable(); DeviceBoundary::assignableMask carries it per face, and the host arm's bound_cpp.cu
+//      now honours it -- it used to clamp every patch, which moved faces OpenFOAM leaves alone).
+//   2. brae's device boundary is DERIVED, not stored: bcValueKernel rebuilds each face from the
+//      descriptor every evaluate (device_boundary_assembly.cu:16-47). A zeroGradient face is
+//      internal[cell], so once the internal half has run it already satisfies the bound with nothing to
+//      clamp; a coupled face is the halo value, which OF re-derives at bound.C:62 anyway.
+//   3. What is left is the faces that DO store a value and ARE assignable: `calculated`, and an
+//      inletOutlet resolved to fixedValue on an inflow face. Clamping those means clamping refValue --
+//      and refValue is the DESCRIPTOR, so the clamp would persist into every later iteration, where
+//      OpenFOAM's is transient and the patch's own evaluate() overwrites it on the next pass.
+//
+// So the honest state is: the internal half is faithful, the fixedValue family is faithfully untouched,
+// and a `calculated` k/epsilon patch whose stored value sits below the floor is not clamped where
+// OpenFOAM would clamp it. Invisible at the 1e-15 default; reachable now that a case can raise kMin.
+// Closing it needs a stored boundary-value array, which is a change to DeviceBoundary, not to bound().
 
 
 // correctNut's BOUNDARY half. A turbulence-wall-function face takes nutkWallFunction; every other face
