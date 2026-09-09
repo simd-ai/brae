@@ -9,6 +9,14 @@
 
 namespace brae {
 
+// WHICH member of the family a patch carries. OpenFOAM keeps this on the nut PATCH FIELD and
+// dispatches through the virtual calcNut() (nutWallFunctionFvPatchScalarField.C:182); brae reads the
+// type at createFields, where the dictionary still has it, and carries this code. It lives here rather
+// than in solver_controls.cuh so the turbulence closures can dispatch without pulling in a solver
+// header -- and so the host closure, the device kernel and the legacy drivers cannot drift apart about
+// what a case asked for. The integer values match wallProductionG0's existing `nutWall` codes.
+enum class NutWall { Nutk = 0, Spalding = 1, Blended = 2, NutU = 3, LowRe = 4 };
+
 // Single source of truth for the OF nutkWallFunction value (the log-law wall viscosity, 0 in the viscous sublayer).
 // Shared by the host nutkWallFunction below AND the device wall kernels (kEpsilon wallFnKernel/boundaryNutKernel,
 // kOmegaSST wallOmegaG0Kernel) so the wall-nut physics has ONE definition, not four copies. BRAE_HD (__host__

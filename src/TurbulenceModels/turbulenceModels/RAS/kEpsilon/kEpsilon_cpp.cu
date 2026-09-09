@@ -203,7 +203,8 @@ void correct(
     bool constrainBeforeWall,
     bool   limitedLinear,
     scalar limiterCoeff,
-    int    minIter)
+    int    minIter,
+    const NutWallSelection* nutSel)
 {
     const label nC = m.nCells();
     // The wall functions' Cmu/kappa/E are PER PATCH, from each field's own entry (WallFunctionCoeffs),
@@ -622,7 +623,7 @@ void correct(
 
     // correctNut, boundary and EddyDiffusivity included -- ONE implementation, shared with
     // turbulence->validate() at construction (see correctNutField).
-    correctNutField(k, epsilon, nutField, yWall, nu, patches, co, comp);
+    correctNutField(k, epsilon, nutField, yWall, nu, patches, co, comp, nutSel);
 }
 
 void correctNutField(
@@ -633,7 +634,8 @@ void correctNutField(
     scalar                                  nu,
     const std::vector<FvPatch>&             patches,
     const KEpsilonCoeffs&                   co,
-    const Compressible*                     comp)
+    const Compressible*                     comp,
+    const NutWallSelection*                 nutSel)
 {
     const label nC = static_cast<label>(k.internal.size());
     std::vector<scalar>& nutF = nutField.internal;
@@ -654,6 +656,48 @@ void correctNutField(
     {
         if (epsilon.boundary[pi]->isTurbulenceWallFunction())
         {
+            // THE DISPATCH, at OpenFOAM's one place. Absent a selection every patch is nutk, which is
+            // what this loop did unconditionally; with one, the patch's own type decides. The members
+            // are genuinely different functions of different inputs, not variants of one -- nutk's
+            // yPlus is k-based and never reads U at all (nutkWallFunctionFvPatchScalarField.C:71),
+            // nutU's comes from a fixed-point iteration on the log law driven by |U_cell - U_wall|
+            // (nutUWallFunctionFvPatchScalarField.C:55-59), and nutLowRe's calcNut() returns Zero
+            // unconditionally (nutLowReWallFunctionFvPatchScalarField.C:38-42).
+            const int kind = (nutSel && nutSel->kind && pi < nutSel->kind->size())
+                           ? (*nutSel->kind)[pi]
+                           : static_cast<int>(NutWall::Nutk);
+            if (kind == static_cast<int>(NutWall::LowRe))
+            {
+                // calcNut() returns Zero, so the whole patch is zero. NOT "nutk on a resolved mesh":
+                // nutk's k-based yPlus can exceed yPlusLam on a mesh that is resolved in friction
+                // units, and take the log branch where OpenFOAM returns exactly 0.
+                nutField.boundary[pi]->setValue(std::vector<scalar>(patches[pi].size, scalar(0)));
+                continue;
+            }
+            if (kind == static_cast<int>(NutWall::NutU))
+            {
+                const WallFunctionCoeffs& nc = nutField.boundary[pi]->wallCoeffs();
+                const std::vector<vector>& Uw = nutSel && nutSel->U
+                                              ? nutSel->U->boundary[pi]->value()
+                                              : std::vector<vector>();
+                std::vector<scalar> nb(patches[pi].size, scalar(0));
+                const scalar yplLam = nc.yPlusLam();
+                for (label i = 0; i < patches[pi].size; ++i)
+                {
+                    const label c = patches[pi].faceCells[i];
+                    // magUp = mag(Uw.patchInternalField() - Uw): the CELL value minus the wall's own,
+                    // so a moving wall is honoured (nutUWallFunctionFvPatchScalarField.C).
+                    const vector& Uc = nutSel->U->internal[c];
+                    const vector  d  = i < static_cast<label>(Uw.size())
+                                     ? vector{Uc.x - Uw[i].x, Uc.y - Uw[i].y, Uc.z - Uw[i].z}
+                                     : Uc;
+                    const scalar magUp = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+                    const scalar nuF = (comp && comp->nuBnd) ? (*comp->nuBnd)[pi][i] : nu;
+                    nb[i] = nutUWallValue(magUp, yWall[pi][i], nuF, nc.kappa, nc.E, yplLam);
+                }
+                nutField.boundary[pi]->setValue(nb);
+                continue;
+            }
             nutField.boundary[pi]->setValue(
                 [&]
                 {
