@@ -825,6 +825,9 @@ namespace {
 // equation passes a null wall mask, because kEpsilon.C:286-288 has no boundaryManipulate for it --
 // kqRWallFunction is zeroGradient, and constraining k in wall cells the way epsilon is constrained is a
 // different equation.
+// relax() -> fvOptions.constrain() -> setValues(wall) -> solve, in OpenFOAM's order. The body is
+// shared with every other transported scalar (turbulence_transport.cuh); what stays here is reading
+// this closure's own solver settings out of KEpsilonInput.
 void finishAndSolve(
     PressureMatrix&             M,
     DeviceBuffer<scalar>&       field,
@@ -837,88 +840,20 @@ void finishAndSolve(
     const DeviceBuffer<scalar>* wallVal,
     const KEpsilonInput&        in,
     scalar&                     residualOut,
-    const std::string&          dumpPrefix,   // "" = no dump; else <dir>/<name> path prefix
-    bool                        gs)           // this field's own solver: the case's smoothSolver, or BiCGStab
+    const std::string&          dumpPrefix,
+    bool                        gs)
 {
-    const int nC  = dm.nCells;
-    const int nIf = dm.nInternalFaces;
-    const int nB  = dm.nBndFaces;
-
-    // The guard is "the case NAMES a factor", not "the factor is below 1": fvMatrix::relax early-returns
-    // only on alpha <= 0, so relax(1.0) still applies the dominance clamp and adds (D - D0)*psi.
-    if (relaxEquation && alpha > scalar(0.0))
-    {
-        DeviceBuffer<scalar> relaxedDiag, delta, t;
-        deviceRelaxDiag(M.view(dm), dm, M.iC, alpha, relaxedDiag, delta);
-        deviceCopy(M.diag, relaxedDiag);
-        deviceHadamard(t, delta, field);
-        deviceAxpy(1.0, t, M.source);
-    }
-
-    // Both constraints go through the SAME four kernels, because in OpenFOAM they are the same call --
-    // FixedValueConstraint::constrain and epsilonWallFunction::manipulateMatrix both end in
-    // fvMatrix::setValues. Order matters and is OpenFOAM's: whichever runs first is the one whose value
-    // reaches the neighbours, since setValues zeroes the coefficient it just transferred through.
-    auto applySetValues = [&](const DeviceBuffer<label>* mask, const DeviceBuffer<scalar>* val)
-    {
-        if (!mask || !val) return;
-        deviceSetValues(dm, *mask, *val, M.diag, M.upper, M.lower, M.source, M.iC, M.bC, field);
-    };
-    applySetValues(fvoMask, fvoVal);
-    applySetValues(wallMask, wallVal);
-
-    // Fold the boundary coefficients in exactly as fvMatrix::solve does, then solve. BiCGStab, not PCG:
-    // upwind convection makes upper != lower, so the matrix is asymmetric and a symmetric solver would
-    // be solving a different system.
-    DeviceBuffer<scalar> diagC, b, ones;
-    deviceFold(dm, M.diag, M.source, M.iC, M.bC, diagC, b);
-
-    DeviceLduView A{};
-    A.nCells = dm.nCells;
-    A.nInternalFaces = dm.nInternalFaces;
-    A.diag = diagC.data();
-    A.upper = M.upper.data();
-    A.lower = M.lower.data();
-    A.owner = dm.owner.data();
-    A.nei = dm.nei.data();
-    A.ownerStart = dm.ownerStart.data();
-    A.losort = dm.losort.data();
-    A.losortStart = dm.losortStart.data();
-
-    // Instrument (BRAE_STAGE_DUMP_DIR, see correct()): the FOLDED system as the solver sees it -- diag
-    // with the boundary diagonal folded in, source with the boundary source folded in, the two
-    // off-diagonals (<prefix>D/Src/Upper/Lower), and the field before and after the solve
-    // (<prefix>SolveIn/SolveOut) -- the same convention the host's
-    // captureSystem uses (kEpsilon_cpp.cu), so the two arms' assembled systems diff directly.
-    auto dump = [&](const char* what, const DeviceBuffer<scalar>& v)
-    {
-        if (dumpPrefix.empty()) return;
-        const std::vector<scalar> h = v.host();
-        std::FILE* fp = std::fopen((dumpPrefix + what).c_str(), "w");
-        if (!fp) return;
-        for (scalar x : h) std::fprintf(fp, "%.17g\n", (double)x);
-        std::fclose(fp);
-    };
-    dump("D", diagC);
-    dump("Src", b);
-    dump("Upper", M.upper);
-    dump("Lower", M.lower);
-    dump("SolveIn", field);
-
-    // the ones vector kept across calls (item 63) and the normFactor kept on the device (item 66)
-    DeviceBuffer<scalar> dnf;
-    deviceNormFactorInto(A, field, b, deviceOnes(nC), dnf);
-    // The solver the case asked for (item 58). The view above is internal-face only, which is what the
-    // level-scheduled sweep needs; there is no interface to drop silently.
-    DeviceSolverPerf perf;
-    if (gs)
-        deviceSymGaussSeidel(A, b, field, dnf.data(), in.tol, in.relTol, in.maxIter, &perf, in.minIter,
-                             in.nSweepsKE, in.gsSymmetric);
-    else
-        perf = deviceJacobiBiCGStab(A, b, field, dnf.data(), in.tol, in.relTol, in.maxIter, /*checkEvery=*/1, in.minIter,
-                                    in.precon, /*amg=*/nullptr, in.polyDeg);
-    residualOut = perf.initialResidual;
-    dump("SolveOut", field);
+    turbulence::SolveControls sv;
+    sv.tol         = in.tol;
+    sv.relTol      = in.relTol;
+    sv.maxIter     = in.maxIter;
+    sv.minIter     = in.minIter;
+    sv.nSweeps     = in.nSweepsKE;
+    sv.gsSymmetric = in.gsSymmetric;
+    sv.precon      = in.precon;
+    sv.polyDeg     = in.polyDeg;
+    turbulence::solveScalarEqn(M, field, dm, relaxEquation, alpha, fvoMask, fvoVal, wallMask, wallVal,
+                               sv, residualOut, dumpPrefix, gs);
 }
 
 } // namespace

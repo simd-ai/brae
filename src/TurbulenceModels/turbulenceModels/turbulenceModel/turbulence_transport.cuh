@@ -19,6 +19,8 @@
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
+#include <string>
+#include "device_dilu.cuh"    // DeviceDilu -- the case's preconditioner for these solves
 #include "pEqn.cuh"               // PressureMatrix -- the assembled scalar object, shared not redefined
 
 namespace brae {
@@ -53,6 +55,43 @@ struct TransportScheme
     // `limited <psi> corrected`: caps the non-orthogonal correction per face. Zero => uncapped.
     scalar snGradLimitCoeff   = 0.0;
 };
+
+// The linear solve for ONE transported scalar: relax() -> fvOptions.constrain() -> setValues(wall), in
+// OpenFOAM's order (kEpsilon.C:265-267), then the solver the CASE asked for. Every model's second half
+// looks like this and differs only in whether it has a wall constraint.
+struct SolveControls
+{
+    scalar tol      = 1e-10;
+    scalar relTol   = 0.0;
+    int    maxIter  = 1000;
+    int    minIter  = 0;
+    // The case's own smoothSolver, when it named one: OpenFOAM's sweep under OpenFOAM's stopping rule.
+    int    nSweeps     = 1;
+    bool   gsSymmetric = true;
+    // ...otherwise BiCGStab with the preconditioner the shared policy resolved (turbPreconFor), and
+    // the Neumann series' degree that policy derived from the case's relaxation factor.
+    const DeviceDilu* precon = nullptr;
+    int    polyDeg  = 0;
+};
+
+// relax -> constrain -> wall setValues -> solve, writing the initial residual out. `wallMask`/`wallVal`
+// null means the field has no wall constraint (kEpsilon.C:286-288 has no boundaryManipulate for k --
+// kqRWallFunction is zeroGradient, and constraining k the way epsilon is constrained is a different
+// equation). `dumpPrefix` empty disables the stage dump.
+void solveScalarEqn(
+    PressureMatrix&             M,
+    DeviceBuffer<scalar>&       field,
+    const DeviceMesh&           dm,
+    bool                        relaxEquation,
+    scalar                      alpha,
+    const DeviceBuffer<label>*  fvoMask,
+    const DeviceBuffer<scalar>* fvoVal,
+    const DeviceBuffer<label>*  wallMask,
+    const DeviceBuffer<scalar>* wallVal,
+    const SolveControls&        sv,
+    scalar&                     residualOut,
+    const std::string&          dumpPrefix,
+    bool                        gs);
 
 // M = fvm::div(phi, field) - fvm::laplacian(gamma, field), with M's source zeroed and its boundary
 // coefficients set. The caller adds the model's reaction terms afterwards.
