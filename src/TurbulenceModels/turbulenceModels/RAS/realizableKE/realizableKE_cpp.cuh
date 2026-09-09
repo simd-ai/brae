@@ -56,6 +56,9 @@ namespace brae {
 // is variable.
 struct RealizableKECoeffs
 {
+    // Foam::bound's floors, from the top level of the case's RAS sub-dict (RASModel.C:73-99). See
+    // KEpsilonCoeffs for why they ride the coefficient struct rather than a base-class one.
+    scalar kMin = 1e-15, epsilonMin = 1e-15;
     scalar A0 = 4.0;          // realizableKE.C:151
     scalar C2 = 1.9;          // :160
     scalar sigmak = 1.0;      // :169
@@ -65,6 +68,13 @@ struct RealizableKECoeffs
 
 inline void readRealizableKECoeffs(const FoamDict* ras, RealizableKECoeffs& c)
 {
+    // The floors come from the RAS TOP LEVEL, not from realizableKECoeffs (RASModel.C:73-99), so they
+    // are read here from `ras` itself rather than from the sub-dict below.
+    if (ras)
+    {
+        c.kMin       = ras->scalarOr("kMin", c.kMin);
+        c.epsilonMin = ras->scalarOr("epsilonMin", c.epsilonMin);
+    }
     const FoamDict* d = ras ? ras->subDict("realizableKECoeffs") : nullptr;
     if (!d) return;
     c.A0 = d->scalarOr("A0", c.A0);

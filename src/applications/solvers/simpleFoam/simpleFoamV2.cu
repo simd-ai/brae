@@ -1153,6 +1153,11 @@ int runSimpleFoamV2(const std::string& caseDir)
         // uses -- the fused device correct() for each model takes that slot and knows what it means.
         // `ras` here is the simulationType switch, not the dict -- the RAS sub-dictionary is re-fetched.
         const FoamDict* rasDict = turbProps.subDict("RAS");
+    // The same three floors the shared reader takes, through the same function -- this driver parses
+    // turbulenceProperties itself, and a key read only by the shared parser is a key this driver
+    // silently ignores (turbulence_setup.cuh, readTurbulenceMinima has why that is one function).
+    readTurbulenceMinima(rasDict, keCoeffs.kMin, keCoeffs.epsilonMin, sstCoeffs.omegaMin);
+    sstCoeffs.kMin = keCoeffs.kMin;
         // OF's RAS `turbulence` switch (RASModel.C:70, getOrDefault<Switch>("turbulence", true)). `off`
         // does NOT mean laminar: every model's correct() returns immediately on it (kEpsilon.C:216,
         // kOmegaSSTBase.C:502, kOmegaSSTLM.C:602, SpalartAllmarasBase.C:442) while the model still

@@ -1,4 +1,5 @@
 // _cpp REFERENCE implementation -- see realizableKE_cpp.cuh for the OpenFOAM provenance.
+#include "bound_cpp.cuh"   // Foam::bound -- realizableKE.C:307,:329 call it; this clamped instead
 #include "realizableKE_cpp.cuh"
 #include "nut_wall_function.cuh"
 #include "near_wall_dist.cuh"
@@ -196,8 +197,15 @@ void correct(
         setValues(M, eps.internal, m, patches, wallCells, epsVals);
         const SolverPerformance pe = pbicgstab(M, eps.internal, m, patches, tol, relTol, maxIter);
         if (res) res->epsilon = pe.initialResidual;
-        for (label c = 0; c < nC; ++c) eps.internal[c] = std::fmax(eps.internal[c], 1e-15);
+        // Foam::bound(epsilon_, epsilonMin_) -- realizableKE.C:307. This was a HARD CLAMP over cells,
+        // `fmax(eps, 1e-15)`, which is not what OpenFOAM does and not what the other three models here
+        // do: bound() gives a cell that solved NEGATIVE its neighbours' area-weighted average, and a
+        // floor gives it 1e-15. bound_cpp.cuh has why that difference is not cosmetic -- 1e-15 in the
+        // denominator of the next iteration's reaction term. The clamp also touched no patch value and
+        // announced nothing. Boundary evaluated BEFORE, as the other models do: OF's guard is min over
+        // the internal field AND the patch fields, so it has to see the evaluated ones.
         eps.evaluateBoundary();
+        bound(eps, co.epsilonMin, m, g, patches, "epsilon");
     }
 
     // ---- k equation: kEpsilon's shape -----------------------------------------------------------
@@ -220,8 +228,8 @@ void correct(
         relaxMatrix(M, k, m, patches, relaxK);
         const SolverPerformance pk = pbicgstab(M, k.internal, m, patches, tol, relTol, maxIter);
         if (res) res->k = pk.initialResidual;
-        for (label c = 0; c < nC; ++c) k.internal[c] = std::fmax(k.internal[c], 1e-15);
         k.evaluateBoundary();
+        bound(k, co.kMin, m, g, patches, "k");   // Foam::bound(k_, kMin_) -- realizableKE.C:329
     }
 
     // ---- correctNut with the VARIABLE Cmu, from the NEW k/epsilon and the OLD gradU ---------------

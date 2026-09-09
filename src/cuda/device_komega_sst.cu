@@ -1077,8 +1077,9 @@ void deviceKOmegaSSTCorrect(
                                // limField/limGrad* null (a scalar builds its own limiter), precon null
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
-                               /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric);
-    deviceBoundField(dm, omega, 1e-15, "omega", &dbOmega);   // OF bound(omega_, omegaMin_)
+                               /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
+                               /*boundFloor*/co.omegaMin);
+    deviceBoundField(dm, omega, co.omegaMin, "omega", &dbOmega);   // OF bound(omega_, omegaMin_)
 
     // k equation (loose solve)
     DeviceBuffer<scalar> DkEff;
@@ -1092,8 +1093,9 @@ void deviceKOmegaSSTCorrect(
                                // limField/limGrad* null (a scalar builds its own limiter), precon null
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
-                               /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric);
-    deviceBoundField(dm, k, 1e-15, "k", &dbK);   // OF bound(k_, kMin_)
+                               /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
+                               /*boundFloor*/co.kMin);
+    deviceBoundField(dm, k, co.kMin, "k", &dbK);   // OF bound(k_, kMin_)
 
     // correctNut (Bradshaw): nut = a1*k / max(a1*omega, b1*F2*sqrt(S2)).
     //

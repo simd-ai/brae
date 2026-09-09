@@ -30,6 +30,28 @@ namespace brae {
 // from the wrong formula -- measured on backwardFacingStep2D as a wall nut of 0 where the dispatching
 // path gives up to 1.5e-01. One implementation, because a second one is how the two paths disagree
 // about what the case asked for.
+// Foam::bound's lower bounds, read from the TOP LEVEL of a RAS or LES sub-dict exactly as OpenFOAM
+// does: RASModel.C:73-99 and LESModel.C:82-111 both call getOrAddToDict("kMin"/"epsilonMin"/"omegaMin",
+// <the sub-dict>, ..., SMALL). A free function with three callers rather than three parses, because
+// brae has THREE independent readers of constant/turbulenceProperties -- this one, simpleFoamV2's own,
+// and the rhoSimpleFoam mirror's -- and a key added to one of them is a key silently ignored on the
+// other two. That is the shape the turbulence preconditioner policy was in until it was made one rule.
+//
+// `dict` is the RAS or the LES sub-dict; null leaves every default alone. nuTilda, ReThetat and gammaInt
+// are NOT plumbed: OpenFOAM bounds those at a literal Zero (SpalartAllmarasBase.C:487, kOmegaSSTLM.C:548
+// and :585), not at kMin, so brae's 0.0 there is already right.
+inline void readTurbulenceMinima(
+    const FoamDict* dict,
+    scalar&         kMin,
+    scalar&         epsilonMin,
+    scalar&         omegaMin)
+{
+    if (!dict) return;
+    kMin       = dict->scalarOr("kMin", kMin);
+    epsilonMin = dict->scalarOr("epsilonMin", epsilonMin);
+    omegaMin   = dict->scalarOr("omegaMin", omegaMin);
+}
+
 inline bool isNutWallFnType(const std::string& t)
 {
     return t == "nutkWallFunction"      || t == "nutUSpaldingWallFunction"
@@ -334,6 +356,11 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                         std::printf("  %s (kOmegaSST-DES, delta=%s): CDES1=%.4g CDES2=%.4g betaStar=%.4g a1=%.4g\n",
                                     model.c_str(), ctl.lesDeltaMax ? "maxDeltaxyz" : "cubeRootVol", ctl.ksstCoeffs.CDES1, ctl.ksstCoeffs.CDES2, ctl.ksstCoeffs.betaStar, ctl.ksstCoeffs.a1);
                 }
+                // The DES arms reuse the kOmegaSST/SA transport and bound with it, and their floors
+                // come from LES{} rather than RAS{} (LESModel.C:82-111). This return is why a RAS-only
+                // read would never have reached them.
+                readTurbulenceMinima(les, ctl.ksstCoeffs.kMin, ctl.keCoeffs.epsilonMin, ctl.ksstCoeffs.omegaMin);
+                ctl.keCoeffs.kMin = ctl.ksstCoeffs.kMin;
                 return;
             }
             const FoamDict* ras = turbProps.subDict("RAS");
@@ -342,6 +369,11 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
             {
                 const std::string sw = ras->wordOr("turbulence", "true");
                 ctl.turbulenceOn = !(sw == "off" || sw == "no" || sw == "false" || sw == "0");
+                // Read BEFORE the turbulence-off early exit below: OpenFOAM constructs kMin_ and bounds
+                // in the model constructor whether or not `turbulence` is on (RASModel.C:73 runs
+                // regardless of :70), so a frozen case still carries the case's floors.
+                readTurbulenceMinima(ras, ctl.keCoeffs.kMin, ctl.keCoeffs.epsilonMin, ctl.ksstCoeffs.omegaMin);
+                ctl.ksstCoeffs.kMin = ctl.keCoeffs.kMin;
                 if (!ctl.turbulenceOn)
                     noticeApplied("turbulenceProperties RAS/turbulence",
                                   "'" + sw + "' -- the model is FROZEN: k/epsilon|omega/nut keep their initial "

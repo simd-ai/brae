@@ -1,5 +1,6 @@
 // _cpp REFERENCE implementation -- see createFields_cpp.cuh for the OpenFOAM provenance.
 #include "rhoCreateFields_cpp.cuh"
+#include "turbulence_setup.cuh"   // readTurbulenceMinima: the ONE reader of kMin/epsilonMin/omegaMin
 #include "scheme_parse.cuh"   // parseFvSchemesControls: grad(U)'s cellLimited coefficient for validate()
 #include "cellLimitedGrad_cpp.cuh"
 #include "frozen_bc_guard.cuh"
@@ -634,8 +635,12 @@ RhoSimpleFields createFields(
             // iteration and not just the construction-time correctNut below. Set outside the
             // `validate()` guard on purpose: that guard also requires k and epsilon to be sized, and a
             // case that failed it would have carried the model defaults into the loop silently.
+            // Foam::bound's floors, from the RAS TOP LEVEL, through the one reader all three of brae's
+            // turbulenceProperties parsers call (turbulence_setup.cuh, readTurbulenceMinima).
+            readTurbulenceMinima(ras, keCase.kMin, keCase.epsilonMin, f.sstCoeffs.omegaMin);
             f.keCoeffs = keCase;
             readKOmegaSSTCoeffs(ras, f.sstCoeffs);   // OpenFOAM's defaults where the dict is absent
+            f.sstCoeffs.kMin = keCase.kMin;          // ...after, so the SST reader cannot overwrite it
             f.Prt      = f.thermo.Prt;
             if (ras && ras->wordOr("RASModel", "") == "kOmegaSST")
                 std::printf("  kOmegaSSTCoeffs (case): betaStar=%.4g a1=%.4g gamma1=%.4g beta1=%.4g Prt=%.4g\n",

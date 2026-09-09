@@ -11,6 +11,13 @@ namespace brae {
 struct KEpsilonCoeffs
 {
     scalar Cmu = 0.09, C1 = 1.44, C2 = 1.92, C3 = 0.0;
+    // Foam::bound's lower bounds, from the TOP LEVEL of the case's RAS (or LES) sub-dict, not from a
+    // ...Coeffs one: RASModel.C:73-99 getOrAddToDict("kMin", RASDict_, ..., SMALL), re-read at :180-182,
+    // and LESModel.C:82-111 carries the same three keys for the DES arms. They are not coefficients of
+    // this model -- they live on the base class -- but they ride here because this struct is what
+    // already reaches every bound site on both arms (epsLowRe below is the same precedent), and brae
+    // hardcoded 1e-15 at all eighteen of them. SMALL is 1e-15 in double precision.
+    scalar kMin = 1e-15, epsilonMin = 1e-15;
     scalar sigmaK = 1.0, sigmaEps = 1.3;
     scalar kappa = 0.41, E = 9.8;
     // THE WALL FUNCTIONS' OWN Cmu. OpenFOAM's nutkWallFunction, epsilonWallFunction and

@@ -12,6 +12,9 @@ namespace brae {
 
 struct KOmegaSSTCoeffs
 {
+    // Foam::bound's lower bounds for k and omega, from the top level of the case's RAS or LES sub-dict
+    // (RASModel.C:73-99, LESModel.C:82-111). See KEpsilonCoeffs for why they ride the coefficient struct.
+    scalar kMin = 1e-15, omegaMin = 1e-15;
     // gradSchemes/grad(k) and grad(omega). CDkOmega is (2*alphaOmega2/omega)*(grad(k) & grad(omega)) and
     // F1 is built from it, so the blend between the k-omega and k-epsilon branches is only as right as
     // these gradients. OpenFOAM resolves each against its own gradSchemes entry -- aerofoilNACA0012 names

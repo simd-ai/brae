@@ -945,7 +945,7 @@ void correct(
                        &st.isWallCell, &epsilon, in, st.epsResidual,
                        dumpDir.empty() ? std::string() : dumpDir + "eps", in.gsEps);
 
-        boundField(epsilon, dm, dbEps, scalar(1e-15), "epsilon");
+        boundField(epsilon, dm, dbEps, in.co.epsilonMin, "epsilon");
     }
 
     // ---- the k equation ----------------------------------------------------------------------
@@ -959,7 +959,7 @@ void correct(
                        nullptr, nullptr, in, st.kResidual,
                        dumpDir.empty() ? std::string() : dumpDir + "k", in.gsK);
 
-        boundField(k, dm, dbK, scalar(1e-15), "k");
+        boundField(k, dm, dbK, in.co.kMin, "k");
     }
 
     correctNut(nut, nutBnd, alphat, alphatBnd, dm, dbK, dbEps, wall, k, epsilon, in);
