@@ -30,6 +30,11 @@
 #          field by far more than the bound, or ARMs 1-3 prove nothing.
 #   ARM 6  REFUSAL: massFlowRate on an incompressible solver with no `rhoInlet` -- OpenFOAM FatalErrors
 #          (.C:225-231) and so must brae, by name, rather than assuming a density.
+#   ARM 8  the REBUILT simpleFoam (BRAE_SIMPLEFOAM_V2=1), which had no flowRate code and no refusal
+#          either, against the SAME OpenFOAM oracle ARM 2 uses.
+#   ARM 9  REFUSAL, both incompressible arms x both unusable densities: `massFlowRate` with no
+#          `rhoInlet`, where OpenFOAM FatalErrors (.C:225-231), and with `rhoInlet 0`, where OpenFOAM
+#          passes its own guard, divides by zero and writes inf/nan while exiting 0. brae names both.
 #   ARM 7  SEED INDEPENDENCE on the legacy compressible arm. OpenFOAM's dict constructor keeps the case
 #          file's `value` and only evaluates when it is absent (.C:93-97), so the seed reaches the
 #          INITIAL phi -- compressibleCreatePhi.H builds it before any updateCoeffs runs. The three
@@ -49,6 +54,8 @@
 #   incFR volumetric     U 1.1049e-02 (t=1)  3.2770e-02 (t=20)
 #   incFR mass rhoInlet 2  U 1.5466e-01 (t=1)  7.0180e-01 (t=20)   <- the worst of them
 #   pimFR both forms     U 3.1951e-02        3.1984e-02
+#   ARM 8, simpleFoam v2  U 1.1049e-02 (t=1)  3.2770e-02 (t=20), inlet frozen at 5.000 -- and V2 had no
+#                         refusal either, so it was silent. After the fix: 2.4e-15 / 7.6e-16.
 # and after the fix every one of those is at 1e-11 or below.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -137,6 +144,14 @@ for fx in incFR pimFR; do
     done
 done
 
+# ---- ARM 8: the rebuilt simpleFoam, same fixture and the same OpenFOAM runs ARM 2 already made ----
+for v in vol mass noval; do
+    case $v in vol) EXPR='' ;; mass) EXPR="$MASS" ;; noval) EXPR="$NOVAL" ;; esac
+    stage "v2FR_${v}_br" incFR "$EXPR" 20 1
+    ( cd "$W/v2FR_${v}_br" && BRAE_SIMPLEFOAM_V2=1 "$BUILDD/brae" -case "$W/v2FR_${v}_br" > log 2>&1 ) \
+        || { tail -5 "$W/v2FR_${v}_br/log"; echo "FAIL: simpleFoam v2 did not run on incFR $v"; exit 1; }
+done
+
 W="$W" FLOOR="$FLOOR" CONTROL_RATIO="$CONTROL_RATIO" python3 - <<'PYEOF' || fail=1
 import os, re, sys
 import numpy as np
@@ -183,10 +198,11 @@ for a, label in (('fr_drv', 'legacy driver '), ('fr_bin', 'legacy binary '),
         if not g2: print('        inlet Ux %.9f != OpenFOAM 5.166  FAIL' % inletUx(a, t)); ok = False
 
 # ARMs 2-4 -- incompressible and PIMPLE, volumetric / mass / the no-value control.
-for fx, label in (('incFR', 'simpleFoam'), ('pimFR', 'pimpleFoam')):
+for fx, ofx, label in (('incFR', 'incFR', 'simpleFoam   '), ('pimFR', 'pimFR', 'pimpleFoam   '),
+                       ('v2FR',  'incFR', 'simpleFoam v2')):
     for v, note in (('vol', 'volumetric      '), ('mass', 'mass + rhoInlet 2'),
                     ('noval', 'no `value` CTRL ')):
-        br, of = '%s_%s_br' % (fx, v), '%s_%s_of' % (fx, v)
+        br, of = '%s_%s_br' % (fx, v), '%s_%s_of' % (ofx, v)
         ts = [t for t in times(br) if t in times(of)]
         for t in (ts[0], ts[-1]):
             flds = [f for f in ('U', 'p') if os.path.exists(os.path.join(W, of, t, f))]
@@ -262,12 +278,26 @@ ok = ok and good
 sys.exit(0 if ok else 1)
 PYEOF
 
-# ---- ARM 6: massFlowRate with no rhoInlet on an incompressible solver must REFUSE by name ---------
-stage norhoi incFR "$NORHOI" 20 1
-out=$( cd "$W/norhoi" && "$BUILDD/brae" -case "$W/norhoi" 2>&1 || true )
-echo "$out" | grep -qi "rhoInlet" && ! [ -d "$W/norhoi/1" ] \
-    && say "massFlowRate with no rhoInlet on an incompressible solver is refused by name" ok \
-    || { echo "$out" | tail -3; say "massFlowRate with no rhoInlet on an incompressible solver is refused by name" FAIL; }
+# ---- ARMs 6 and 9: an unusable density must REFUSE by name, on both incompressible arms -----------
+# `rhoInlet 0` is not the same case as an absent one: OpenFOAM's guard is `rhoInlet_ < 0`, so 0 passes
+# it, gSum(rho*magSf) is zero, and OpenFOAM writes inf/nan and exits 0 rather than failing. brae names
+# both rather than producing a wrong number or a NaN field.
+RHOI0='s|volumetricFlowRate constant 0.05166|massFlowRate constant 0.05166; rhoInlet 0|'
+for cfg in norhoi rhoi0; do
+    case $cfg in norhoi) EXPR="$NORHOI"; WHAT="no rhoInlet" ;; rhoi0) EXPR="$RHOI0"; WHAT="rhoInlet 0 " ;; esac
+    for arm in legacy v2; do
+        stage "ref_${cfg}_${arm}" incFR "$EXPR" 20 1
+        if [ "$arm" = v2 ]; then
+            out=$( cd "$W/ref_${cfg}_${arm}" && BRAE_SIMPLEFOAM_V2=1 "$BUILDD/brae" \
+                     -case "$W/ref_${cfg}_${arm}" 2>&1 || true )
+        else
+            out=$( cd "$W/ref_${cfg}_${arm}" && "$BUILDD/brae" -case "$W/ref_${cfg}_${arm}" 2>&1 || true )
+        fi
+        echo "$out" | grep -qi "rhoInlet" && ! [ -d "$W/ref_${cfg}_${arm}/1" ] \
+            && say "massFlowRate with $WHAT is refused by name ($arm arm)" ok \
+            || { echo "$out" | tail -3; say "massFlowRate with $WHAT is refused by name ($arm arm)" FAIL; }
+    done
+done
 
 say "flowRateInletVelocity reaches every DeviceSimpleSolver step, in both forms" "$([ $fail = 0 ] && echo ok || echo FAIL)"
 exit $fail
