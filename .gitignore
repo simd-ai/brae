@@ -21,6 +21,8 @@ validation/*
 !validation/implicitAMI/
 !validation/windAroundBuildingsBox/
 !validation/kEpsCase/
+!validation/incFR/
+!validation/pimFR/
 !validation/mixerVessel2D/
 !validation/kEpsCorrect/
 !validation/komegaCoeffs/

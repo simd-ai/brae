@@ -1869,9 +1869,15 @@ set_tests_properties(ke_vs_openfoam PROPERTIES
 
 # rhoSimpleFoam BC gate: flowRateInletVelocity. OF sets U_b = avgU*n with
 #   avgU = -flowRate/gSum(rho*magSf)   (flowRateInletVelocityFvPatchVectorField::updateValues)
-# using the OUTWARD normal, so a positive rate is inflow. The gate runs the massFlowRate form, whose sum
-# is rho-weighted and therefore recomputed every outer iteration -- the volumetric form (validation/
-# rhoFRvol) is the easy half, since its sum is pure area and never changes.
+# using the OUTWARD normal, so a positive rate is inflow. This gate runs the massFlowRate form on
+# validation/rhoFR; the volumetric form and the incompressible/PIMPLE lineages are covered by
+# flowrate_device_solver_vs_openfoam.
+#
+# This comment used to say the volumetric form "is the easy half, since its sum is pure area and never
+# changes". The sum never changes -- and the device never computed it at all, because the flow-rate mask
+# was keyed on bcCategory()==9, which is the MASS form only. validation/rhoFRvol sat in the tree
+# ungated, running at the wrong flow rate (U 3.27e-02 against real OpenFOAM), for exactly as long as
+# that sentence stood. An argument for why something cannot be wrong is not coverage.
 #
 # It also pins the bug that took the longest to find: buildDeviceVectorBoundary mapped bcCategory 9 to
 # device bcType 9, an UNKNOWN type, because only the scalar buildDeviceBoundary had been taught about it.
@@ -2051,6 +2057,15 @@ set_tests_properties(rho_sst_device_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 L
 add_test(NAME rho_flowrate_inlet_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_flowrate_inlet_vs_openfoam.sh)
 set_tests_properties(rho_flowrate_inlet_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
+# flowRateInletVelocity on the DeviceSimpleSolver lineage -- both forms, and all three of its step()
+# variants (incompressible SIMPLE, compressible rhoSimpleStep, PIMPLE), which between them cover five
+# drivers -- tests/flowrate_device_solver_vs_openfoam.sh.
+add_test(NAME flowrate_device_solver_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/flowrate_device_solver_vs_openfoam.sh)
+set_tests_properties(flowrate_device_solver_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
 
 # turbulence->validate() at construction, both models, both arms where the device runs the model:
 # the first iteration must sit on OpenFOAM's -- tests/rho_validate_vs_openfoam.sh.

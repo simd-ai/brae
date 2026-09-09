@@ -1,0 +1,14 @@
+FoamFile { version 2.0; format ascii; class volVectorField; object U; }
+// flowRateInletVelocity on an INCOMPRESSIBLE solver, which registers no rho field: OpenFOAM's
+// updateCoeffs then takes either the volumetric branch or the rhoInlet constant, never the live
+// density (flowRateInletVelocityFvPatchVectorField.C:208-233). `value` is the SEED OpenFOAM keeps
+// only until the first momentum assembly, and it is deliberately NOT the answer (0.05166/0.01 =
+// 5.166), so a solver that never runs updateCoeffs is visible.
+dimensions [0 1 -1 0 0 0 0]; internalField uniform (5 0 0);
+boundaryField {
+  inlet    { type flowRateInletVelocity; volumetricFlowRate constant 0.05166; value uniform (5 0 0); }
+  outlet   { type zeroGradient; }
+  hotWall  { type noSlip; }
+  coldWall { type noSlip; }
+  frontBack { type empty; }
+}

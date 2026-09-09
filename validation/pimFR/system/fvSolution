@@ -1,0 +1,5 @@
+FoamFile { version 2.0; format ascii; class dictionary; object fvSolution; }
+solvers { p { solver PBiCGStab; preconditioner DIC; tolerance 1e-14; relTol 0; }
+          pFinal { solver PBiCGStab; preconditioner DIC; tolerance 1e-14; relTol 0; }
+          "(U|UFinal)" { solver PBiCGStab; preconditioner DILU; tolerance 1e-14; relTol 0; } }
+PIMPLE { nOuterCorrectors 2; nCorrectors 2; nNonOrthogonalCorrectors 0; }
