@@ -697,16 +697,22 @@ void amgFineCoeffKernel(
         // The names are what let Foam::bound's message name the right field: the "k" slot holds nuTilda
         // under Spalart-Allmaras (see the dbK_ construction), and the second slot is omega or epsilon by
         // model, so a fixed string here would print a line about a field the case does not have.
-        deviceBoundField(dm, dk_,
-                         ctl_.sa ? scalar(0.0) : (ctl_.sst ? ctl_.ksstCoeffs.kMin : ctl_.keCoeffs.kMin),
-                         ctl_.sa ? "nuTilda" : "k",
-                         &dbK_);                                       // bound(k_, kMin_)  [SA: bound(nuTilda_, 0)]
-        if (!ctl_.sa)
+        // BRAE_CTOR_BOUND=0 skips the pair -- the fail-proof for
+        // tests/bound_at_construction_vs_openfoam.sh, which needs every arm to be switchable off.
+        const char* ctorBoundEnv = std::getenv("BRAE_CTOR_BOUND");
+        if (!(ctorBoundEnv && std::string(ctorBoundEnv) == "0"))
         {
-            deviceBoundField(dm, de_,
-                             ctl_.sst ? ctl_.ksstCoeffs.omegaMin : ctl_.keCoeffs.epsilonMin,
-                             ctl_.sst ? "omega" : "epsilon",
-                             &dbEps_);                                 // bound(omega_|epsilon_, ...Min_)
+            deviceBoundField(dm, dk_,
+                             ctl_.sa ? scalar(0.0) : (ctl_.sst ? ctl_.ksstCoeffs.kMin : ctl_.keCoeffs.kMin),
+                             ctl_.sa ? "nuTilda" : "k",
+                             &dbK_);                                   // bound(k_, kMin_)  [SA: bound(nuTilda_, 0)]
+            if (!ctl_.sa)
+            {
+                deviceBoundField(dm, de_,
+                                 ctl_.sst ? ctl_.ksstCoeffs.omegaMin : ctl_.keCoeffs.epsilonMin,
+                                 ctl_.sst ? "omega" : "epsilon",
+                                 &dbEps_);                             // bound(omega_|epsilon_, ...Min_)
+            }
         }
         // validate() -> correctNut(): recompute internal nut from the bounded fields + the initial U.
         if (ctl_.sa)

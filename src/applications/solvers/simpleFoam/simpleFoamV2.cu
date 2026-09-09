@@ -1,4 +1,5 @@
 // DISPATCH for the rebuilt simpleFoam -- see simpleFoamV2.cuh for why the guard exists.
+#include "bound_report.cuh"   // printBounding: Foam::bound's message, shared with the other drivers
 #include "linear_solver_setup.cuh"   // turbPreconFor: the ONE rule for the turbulence preconditioner
 #include "simpleFoamV2.cuh"
 #include "simpleFoam.cuh"
@@ -726,6 +727,8 @@ int runSimpleFoamV2(const std::string& caseDir)
     const label nC = m.nCells();
 
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
+    setBoundReportPrecision(controlDict.intOr("writePrecision", 6));   // OF TimeIO.C:375-383
+
     const FoamDict fvSolution  = readDict(caseDir + "/system/fvSolution");
     const FoamDict transport   = readDict(caseDir + "/constant/transportProperties");
 
@@ -1456,6 +1459,39 @@ int runSimpleFoamV2(const std::string& caseDir)
         // The strain takes the case's own `grad(U)` scheme, exactly as the per-iteration correct() below
         // now does -- kOmegaSSTBase.C:132 is correctNut(2*magSqr(symm(fvc::grad(U)))), and fvc::grad
         // resolves the gradSchemes entry. Startup and the loop have to agree, so these move together.
+        //
+        // BEFORE validate(), because OpenFOAM bounds in the MODEL CONSTRUCTOR and validate() is a
+        // separate later call: kEpsilon.C:182-183, kOmegaSSTBase.C:438-439, realizableKE.C:211-212,
+        // kOmega.C:151-152, all `bound(k_, kMin_)` then `bound(<second>_, <second>Min_)`. So OpenFOAM's
+        // correctNut below already sees bounded fields, and its first momentum matrix carries a nut
+        // built from them. brae bounded only inside correct(), so a case whose 0/k or 0/epsilon sits
+        // under the floor built nut from the file's value and entered iteration 1 on it.
+        //
+        // ORDER IS OpenFOAM'S -- k first. bound() replaces a NEGATIVE cell with its neighbours' average
+        // rather than clamping it, so bounding the second scalar first would hand the k pass a
+        // different field. SpalartAllmaras is excluded on purpose: its bound(nuTilda_, 0) exists only
+        // in correct() (SpalartAllmarasBase.C:487), the constructor has none. kOmegaSSTLM likewise
+        // bounds ReThetat and gammaInt only in correct() (kOmegaSSTLM.C:548, :585); the k and omega it
+        // does bound here come from its kOmegaSST base.
+        // BRAE_CTOR_BOUND=0 skips it -- the fail-proof for
+        // tests/bound_at_construction_vs_openfoam.sh. Without a switch the gate's control needs a
+        // rebuild, and a gate whose control is never run is a gate nobody has seen fail.
+        if (ras && !saModel && !(std::getenv("BRAE_CTOR_BOUND") && std::string(std::getenv("BRAE_CTOR_BOUND")) == "0"))
+        {
+            deviceBoundField(dm, dK, keCoeffs.kMin, "k", &dbK);
+            deviceBoundField(dm, dEps,
+                             sstModel ? sstCoeffs.omegaMin : keCoeffs.epsilonMin,
+                             sstModel ? "omega" : "epsilon",
+                             &dbEps);
+            // Printed HERE rather than queued: OpenFOAM emits the constructor's line before its first
+            // "Time =" line, and the loop's drain below pairs each report with that field's own
+            // "Solving for" line -- a construction-time report has none to pair with, so leaving it in
+            // the store would have printed it under iteration 1's k solve, an iteration too late.
+            for (const auto& b : boundingReports())
+                printBounding(b.field.c_str(), b.minValue, b.maxValue, b.average);
+            clearBoundingReports();
+        }
+
         if (ras)
         {
             if (sstModel)
@@ -1688,14 +1724,25 @@ int runSimpleFoamV2(const std::string& caseDir)
             // OpenFOAM prints an Initial residual for every turbulence solve, and comparing those against
             // its log is how this path is checked against the oracle. Off unless asked for, so that the
             // gates that parse this log keep seeing the output they were written against.
-            if (printTurbResid)
+            for (const ScalarSolveEntry& e : turbulenceReport())
             {
-                for (const ScalarSolveEntry& e : turbulenceReport())
+                if (printTurbResid)
                 {
                     std::printf("    Solving for %s, Initial residual = %.9e, No Iterations %d\n",
                                 e.field.c_str(), e.perf.initialResidual, e.perf.nIterations);
                 }
+                // Foam::bound's own line, immediately after that field's solve line -- where OpenFOAM
+                // emits it, since bound() runs between the two solves in the model's correct(). NOT
+                // under printTurbResid: that switch hides brae's residual lines so the gates parsing
+                // this log keep seeing what they were written against, while `bounding <field>` is a
+                // diagnostic OpenFOAM prints unconditionally and only when the guard actually fires.
+                for (const auto& b : boundingReports())
+                    if (b.field == e.field)
+                        printBounding(b.field.c_str(), b.minValue, b.maxValue, b.average);
             }
+            // Emptied by whoever DRAINED it. This driver never drained at all, so every report the
+            // closures pushed accumulated for the whole run and none of them was ever printed.
+            clearBoundingReports();
 
             const auto tRefresh0 = std::chrono::steady_clock::now();
             // nuEff for the NEXT iteration: nu + nut, with the boundary value from the wall function --

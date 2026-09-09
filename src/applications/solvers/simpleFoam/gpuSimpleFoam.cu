@@ -186,6 +186,8 @@ int main(int argc, char** argv)
 
         // controls from the case dictionaries
         const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
+        setBoundReportPrecision(controlDict.intOr("writePrecision", 6));   // OF TimeIO.C:375-383
+
         const FoamDict fvSolution  = readDict(caseDir + "/system/fvSolution");
         const FoamDict transport   = readDict(caseDir + "/constant/transportProperties");
         const FoamDict turbProps   = readDict(caseDir + "/constant/turbulenceProperties");
@@ -496,6 +498,14 @@ int main(int argc, char** argv)
         // solver. Without this the parsed table sat unused and p0 stayed frozen at its seed --
         // measured on pimpleFoam/RAS/TJunction as inlet p FALLING 9.32 -> 8.62 where the table asks
         // for 13.09 -> 15.11, i.e. a case that runs and silently ignores the prescribed ramp.
+        // The solver's constructor ran validateTurbulence(), which is OpenFOAM's model-constructor
+        // bound(k_, kMin_) / bound(<second>_, <second>Min_). Drain it HERE: OpenFOAM emits that line
+        // before its first "Time =" line, while the loop's drain below pairs each report with the
+        // field's own "Solving for" line -- a construction-time report has none, so it sat in the store
+        // and printed under iteration 1's k solve, one iteration late.
+        for (const auto& b : boundingReports())
+            printBounding(b.field.c_str(), b.minValue, b.maxValue, b.average);
+        clearBoundingReports();
         solver.setTimeVaryingP0(DeviceSimpleSolver::collectTimeVaryingP0(pFd, fvp));
         solver.setTime(static_cast<scalar>(std::strtod(startStr.c_str(), nullptr)));   // seed p0 at the START time, as OF's constructor does
         timeRegistry.store("solver", &solver);   // from here the functionObjects can resolve

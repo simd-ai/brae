@@ -5,6 +5,7 @@
 #include "cellLimitedGrad_cpp.cuh"
 #include "frozen_bc_guard.cuh"
 #include "kEpsilon_cpp.cuh"    // correctNutField: turbulence->validate() before the first solve
+#include "bound_cpp.cuh"       // Foam::bound, which every model constructor applies to its two scalars
 #include "kOmegaSST_cpp.cuh"   // likewise, for the other closure
 #include "transport_model.cuh" // transportMu: the construction-time nu = mu(T)/rho
 #include "near_wall_dist.cuh"  // nearWallDist: the wall functions' y
@@ -782,6 +783,38 @@ RhoSimpleFields createFields(
         {
             throw std::runtime_error(
                 "brae: rhoSimpleFoam simulationType '" + sim + "' is neither laminar nor RAS. Refusing.");
+        }
+    }
+
+    // Foam::bound(k_, kMin_) and bound(<second>, <second>Min_), from the MODEL CONSTRUCTOR --
+    // kEpsilon.C:182-183, kOmegaSSTBase.C:438-439, realizableKE.C:211-212. OpenFOAM bounds the two
+    // transported scalars the instant it has read them, so validate()'s correctNut below already sees
+    // bounded fields and the first momentum matrix carries a nut built from them. brae bounded only
+    // inside correct(), so a case whose 0/k or 0/epsilon dips under the floor entered iteration 1 with
+    // the file's value: at `RAS { epsilonMin 5000; }` on rhoKE OpenFOAM reports `bounding epsilon` before
+    // its first "Time =" line and brae reported nothing, because the first bound() it ran was after the
+    // first epsilon solve had already been assembled from the sub-floor field.
+    //
+    // ORDER IS OpenFOAM'S: k first, then the second scalar. bound() takes an area-weighted neighbour
+    // average for a NEGATIVE cell, so bounding epsilon first would feed the k pass a different field.
+    // SpalartAllmaras is deliberately absent -- its bound(nuTilda_, 0) lives only in correct()
+    // (SpalartAllmarasBase.C:487), there is none in the constructor.
+    // BRAE_CTOR_BOUND=0 skips it -- the fail-proof for
+    // tests/bound_at_construction_vs_openfoam.sh, on both mirror arms at once since the CUDA arm
+    // uploads the field set this function returns.
+    const char* ctorBoundEnv = std::getenv("BRAE_CTOR_BOUND");
+    const bool  ctorBound    = !(ctorBoundEnv && std::string(ctorBoundEnv) == "0");
+    if (ctorBound && f.turbulent && static_cast<label>(f.k.internal.size()) == nC)
+    {
+        cpu::bound(f.k, keCase.kMin, m, g, patches, "k");
+        if (f.rasModel == "kOmegaSST")
+        {
+            if (static_cast<label>(f.omega.internal.size()) == nC)
+                cpu::bound(f.omega, f.sstCoeffs.omegaMin, m, g, patches, "omega");
+        }
+        else if (static_cast<label>(f.epsilon.internal.size()) == nC)
+        {
+            cpu::bound(f.epsilon, keCase.epsilonMin, m, g, patches, "epsilon");
         }
     }
 
