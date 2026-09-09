@@ -296,7 +296,7 @@ void amgFineCoeffKernel(
                 hasSym_ = true;
                 break;
             }
-        // flowRateInletVelocity (massFlowRate): one masked-magSf buffer per such patch, plus the outward
+        // flowRateInletVelocity, EITHER form: one masked-magSf buffer per such patch, plus the outward
         // normals over all boundary faces. Both are geometric and built once.
         {
             std::vector<scalar> nx, ny, nz;
@@ -312,7 +312,13 @@ void amgFineCoeffKernel(
             }
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (U.boundary[pi]->bcCategory() != 9) continue;
+                // isFlowRateInlet(), not bcCategory() == 9. bcCategory reports 9 for the MASS form and a
+                // plain fixedValue 1 for the VOLUMETRIC one, so keying on 9 built no mask for a
+                // volumetricFlowRate inlet and it was never updated at all: measured on
+                // validation/rhoFRvol as an inlet frozen at the file's seed 5 against OpenFOAM's 5.166,
+                // U 1.10e-02 at iteration 1 and 3.27e-02 at 20 -- it locks in rather than washing out,
+                // because the case simply runs at the wrong flow rate forever.
+                if (!U.boundary[pi]->isFlowRateInlet()) continue;
                 hasFlowRate_ = true;
                 std::vector<scalar> mask(nx.size(), 0.0);
                 label bi = 0;
@@ -326,7 +332,10 @@ void amgFineCoeffKernel(
                 frMagSf_.back().copyFrom(mask);
                 // OF re-reads flowRate_->value(t) each call; steady + constant -> the seeded value. It is
                 // recovered from the seeded BC rather than re-parsed: avgU*sum(rho_seed*magSf) = -mdot.
-                frPatches_.push_back(FlowRatePatch{U.boundary[pi]->flowRateValue()});
+                frPatches_.push_back(FlowRatePatch{U.boundary[pi]->flowRateValue(),
+                                                   U.boundary[pi]->flowRateIsMass(),
+                                                   U.boundary[pi]->flowRateRhoInlet(),
+                                                   U.boundary[pi]->patchName()});
             }
             if (hasFlowRate_) { frNx_.copyFrom(nx); frNy_.copyFrom(ny); frNz_.copyFrom(nz); }
         }
@@ -672,12 +681,7 @@ void amgFineCoeffKernel(
         // Same density rule as the per-iteration update in rhoSimpleStep (see the long note there): OF's
         // flowRateInletVelocity looks up the REGISTERED rho, which createFields.H has already built by the
         // time U's patches evaluate, so seed avgU from the solver rho -- rhoBndP_, just set above.
-        for (std::size_t k = 0; k < frPatches_.size(); ++k)
-        {
-            const scalar sumRhoA = deviceDot(rhoBndP_, frMagSf_[k]);
-            if (sumRhoA <= 0.0) continue;
-            deviceUpdateFlowRateInlet(dbU_, frMagSf_[k], -frPatches_[k].mdot / sumRhoA, frNx_, frNy_, frNz_);
-        }
+        updateFlowRateInlets();
         validateTurbulence();
     }
 
@@ -983,6 +987,58 @@ void amgFineCoeffKernel(
         }
     }
 
+    // flowRateInletVelocity's updateCoeffs. OpenFOAM runs it inside the momentum matrix constructor
+    // (fvMatrix.C:396 -> flowRateInletVelocityFvPatchVectorField.C:201-238), where it ASSIGNS the patch
+    // value outright -- `operator==(avgU*n)` at .C:195-196 -- so the case file's `value` survives only
+    // until the first assembly. This lives here, in the one method all three steps enter
+    // (step / rhoSimpleStep / pimpleStep), beside the other updateCoeffs equivalents.
+    //
+    // It used to be called ONLY from rhoSimpleStep and from revalidateAfterThermo, both compressible: on
+    // the incompressible and PIMPLE lineages frMagSf_ was built and never read, so a flowRateInletVelocity
+    // inlet of EITHER form stayed at the file's seed for the whole run. Measured on a laminar duct against
+    // real simpleFoam, seed (5 0 0) against OpenFOAM's 5.166: U 1.10e-02 at iteration 1 growing to
+    // 3.28e-02, and 7.02e-01 on a mass-form case whose rhoInlet is not 1.
+    void DeviceSimpleSolver::updateFlowRateInlets()
+    {
+        if (frPatches_.empty()) return;
+        // The registered rho, when there is one. rhoBndP_ is the solver's RELAXED boundary density and is
+        // what OF's lookupPatchField returns; rhoBnd_ is the thermo one. Feeding the thermo density where
+        // the flux uses the relaxed one is the angledDuct defect -- see the note in rhoSimpleStep.
+        const DeviceBuffer<scalar>& frRho =
+            (rhoBndP_.size() == static_cast<std::size_t>(dbP_.n)) ? rhoBndP_ : rhoBnd_;
+        const bool rhoRegistered = compressible_ && frRho.size() == static_cast<std::size_t>(dbP_.n);
+        for (std::size_t k = 0; k < frPatches_.size(); ++k)
+        {
+            const FlowRatePatch& fp = frPatches_[k];
+            scalar sumRhoA = 0.0;
+            if (!fp.isMass)
+            {
+                // The volumetric branch: rho is literally one{} (.C:208-210), so the divisor is pure area.
+                // deviceSumMag and a plain sum coincide -- the mask is magSf on the patch, 0 elsewhere.
+                sumRhoA = deviceSumMag(frMagSf_[k]);
+            }
+            else if (rhoRegistered)
+            {
+                sumRhoA = deviceDot(frRho, frMagSf_[k]);              // .C:215-220
+            }
+            else if (fp.rhoInlet > 0.0)
+            {
+                sumRhoA = fp.rhoInlet * deviceSumMag(frMagSf_[k]);    // .C:233
+            }
+            else
+            {
+                // OpenFOAM FatalErrors here (.C:225-231) rather than assuming a density, and so must this:
+                // silently taking rho = 1 is a wrong inlet velocity with no message.
+                throw std::runtime_error(
+                    "brae: flowRateInletVelocity on patch '" + fp.name + "' gives a massFlowRate on a "
+                    "solver that registers no density field, and no 'rhoInlet' to divide by. OpenFOAM "
+                    "fails the same way (flowRateInletVelocityFvPatchVectorField.C:225-231).");
+            }
+            if (sumRhoA <= 0.0) continue;
+            deviceUpdateFlowRateInlet(dbU_, frMagSf_[k], -fp.mdot / sumRhoA, frNx_, frNy_, frNz_);
+        }
+    }
+
     void DeviceSimpleSolver::solveMomentumPredictor(DeviceSimpleResidual& res)
     {
         // Which components this step ACTUALLY SOLVED, so the driver prints OpenFOAM's lines and no
@@ -1010,6 +1066,8 @@ void amgFineCoeffKernel(
         // (OF updateCoeffs uses the prior corrector's phi). No-op when a boundary has no inletOutlet faces.
         deviceUpdateInletOutlet(dbU_, phiBnd_);
         deviceUpdateInletOutlet(dbP_, phiBnd_);
+        // flowRateInletVelocity, at OpenFOAM's own point for it -- see updateFlowRateInlets.
+        updateFlowRateInlets();
         // The ENERGY boundary too. dbHe_ inherits T's BC types, so an `inletOutlet` T outlet -- which
         // every stock rhoSimpleFoam tutorial has -- arrives here masked as inletOutlet and MUST be
         // resolved per iteration like the others. It was omitted: the mask was set at build time and
@@ -3587,14 +3645,8 @@ void amgFineCoeffKernel(
         // Invisible on every other compressible case in validation/: they all set rho 1.0, where the
         // relaxed and thermo densities are identical. angledDuct is the one case with BOTH a relaxed rho
         // and a flowRateInletVelocity inlet.
-        const DeviceBuffer<scalar>& frRho =
-            (rhoBndP_.size() == static_cast<std::size_t>(dbP_.n)) ? rhoBndP_ : rhoBnd_;
-        for (std::size_t k = 0; k < frPatches_.size(); ++k)
-        {
-            const scalar sumRhoA = deviceDot(frRho, frMagSf_[k]);
-            if (sumRhoA <= 0.0) continue;
-            deviceUpdateFlowRateInlet(dbU_, frMagSf_[k], -frPatches_[k].mdot / sumRhoA, frNx_, frNy_, frNz_);
-        }
+        // (the flow-rate inlets are updated inside solveMomentumPredictor now, which is the next
+        //  statement and is also where the incompressible and PIMPLE steps reach them)
 
         solveMomentumPredictor(res);
         // Stage harness: U straight out of the MOMENTUM PREDICTOR. OF's UEqn.H() uses THIS U (not the

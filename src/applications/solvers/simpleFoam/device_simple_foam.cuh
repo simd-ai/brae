@@ -808,10 +808,16 @@ private:
     // pEqn.relax() source (D - D0)*p. Absolute, so it is added to bp_ AFTER deviceFoldPressure (which
     // multiplies divPhi by the cell volume); a member so the fold site can see it.
     DeviceBuffer<scalar> pRelaxSrc_;
-    // flowRateInletVelocity, massFlowRate form: OF recomputes avgU = -mdot/gSum(rho*magSf) every call, so
-    // it moves with the solution. frMagSf_ is magSf masked to the flowRate patches (0 elsewhere), making
+    // flowRateInletVelocity, BOTH forms: OF recomputes avgU = -flowRate/gSum(rho*magSf) every updateCoeffs,
+    // so it moves with the solution. frMagSf_ is magSf masked to the flowRate patches (0 elsewhere), making
     // the patch sum a single dot product against the live boundary rho; frN_ holds the outward normals.
-    struct FlowRatePatch { scalar mdot; };
+    // The DIVISOR depends on the form and on whether a rho field is registered
+    // (flowRateInletVelocityFvPatchVectorField.C:201-238), so each patch carries which it is:
+    //   volumetric, or `rho none`      -> gSum(magSf)                 (.C:208-210, rho is literally one{})
+    //   mass, rho registered           -> gSum(rho_b*magSf)           (.C:215-220) -- the compressible arms
+    //   mass, no rho, rhoInlet given   -> rhoInlet*gSum(magSf)        (.C:233)     -- the incompressible arms
+    //   mass, no rho, no rhoInlet      -> OpenFOAM FatalErrors        (.C:225-231)
+    struct FlowRatePatch { scalar mdot; bool isMass; scalar rhoInlet; std::string name; };
     std::vector<FlowRatePatch> frPatches_;
     std::vector<DeviceBuffer<scalar>> frMagSf_;
     DeviceBuffer<scalar> frNx_, frNy_, frNz_;
@@ -824,6 +830,8 @@ private:
     DeviceBuffer<scalar> mlLength_;
     bool hasTurbInlet_ = false;
     bool hasFlowRate_ = false;
+    // flowRateInletVelocity's updateCoeffs, at OpenFOAM's point for it: the momentum assembly.
+    void updateFlowRateInlets();
     DeviceBuffer<label>  wfBndIdx_;   // wall-face -> boundary-face index (built once)
     DeviceBuffer<scalar> wfNu_;       // nu = mu_b/rho_b gathered onto wall faces, for omegaWallFunction/G0
     DeviceBuffer<scalar> nutBndAll_;  // nut at boundary faces (wall-function value on walls), for alphat_b

@@ -230,6 +230,15 @@ public:
     // gSum(magSf) for a volumetric one.
     virtual bool isFlowRateInlet() const { return false; }
     virtual bool flowRateIsMass()  const { return true; }
+    // OF's `rhoInlet`, default -VGREAT meaning "not given" (flowRateInletVelocityFvPatchVectorField.C:64).
+    // It is the divisor ONLY where no rho field is registered -- i.e. on the incompressible solvers, where
+    // updateCoeffs takes the .C:233 branch; with rho registered (rhoSimpleFoam) OpenFOAM ignores it, and
+    // with neither it is a FatalError (.C:225-231).
+    virtual scalar flowRateRhoInlet() const { return -1.0; }
+    // Did the case file supply a `value`? OF's dict constructor keeps it when present and only evaluates
+    // when absent (.C:93-97), so this says whether the patch is still carrying the file's seed.
+    virtual bool flowRateHadValue() const { return false; }
+    virtual const char* patchName() const { return ""; }
 
     // turbulentIntensityKineticEnergyInlet / turbulentMixingLengthDissipationRateInlet: which one, and
     // its coefficient (the intensity, or the mixing length). Exposed for the same reason
@@ -507,6 +516,7 @@ public:
               (valueUniform || !values.empty()) ? values : build(p, flowRate, isMass, rhoInlet)),
           isMass_(isMass),
           flowRate_(flowRate),
+          rhoInlet_(rhoInlet),
           hadValue_(valueUniform || !values.empty())
     {}
 
@@ -523,6 +533,9 @@ public:
     scalar flowRateValue() const override { return flowRate_; }
     bool isFlowRateInlet() const override { return true; }
     bool flowRateIsMass()  const override { return isMass_; }
+    scalar flowRateRhoInlet() const override { return rhoInlet_; }
+    bool flowRateHadValue()   const override { return hadValue_; }
+    const char* patchName()   const override { return this->patch_.name.c_str(); }
 
     // OF updateValues(rho), verbatim. Called where OpenFOAM calls updateCoeffs -- when the momentum
     // equation is assembled -- so the inlet moves with the solution instead of staying at the seed the
@@ -562,6 +575,9 @@ public:
 private:
     bool   isMass_;
     scalar flowRate_ = 0.0;
+    // Kept, not just forwarded to build(): the DEVICE drivers need it, because on an incompressible solver
+    // no rho field is registered and rhoInlet IS OpenFOAM's divisor (.C:233).
+    scalar rhoInlet_ = -1.0;
     bool   hadValue_ = false;
 
     static std::vector<vector> build(
