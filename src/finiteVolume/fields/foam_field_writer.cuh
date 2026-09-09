@@ -148,8 +148,33 @@ inline void writePatchEntry(
     {
         os << "        " << (d.flowRateIsMass ? "massFlowRate" : "volumetricFlowRate")
            << "    constant " << d.flowRate << ";\n";
-        if (d.rhoInlet >= 0) os << "        rhoInlet        " << d.rhoInlet << ";\n";
+        // OF guards both of these with `if (!volumetric_)` (flowRateInletVelocityFvPatchVectorField.C:
+        // 245-249) -- i.e. on the MASS form -- and writes `rho` only when it is not the default, through
+        // writeEntryIfDifferent. `rho none` is not cosmetic: it selects OpenFOAM's VOLUMETRIC branch for
+        // a massFlowRate (.C:208), so losing it on a round-trip changes the prescribed inlet with no
+        // message on either side. Measured on validation/rhoFR with `rho none`: brae runs the inlet at
+        // 6.000 m/s, wrote the patch without it, and real OpenFOAM restarted from that file computed
+        // 5.160413015 -- 14% of the flow rate.
+        if (d.flowRateIsMass)
+        {
+            if (d.flowRateRhoName != "rho")
+                os << "        rho             " << d.flowRateRhoName << ";\n";
+            if (d.rhoInlet >= 0) os << "        rhoInlet        " << d.rhoInlet << ";\n";
+        }
     }
+    // turbulentIntensityKineticEnergyInlet and turbulentMixingLength{DissipationRate,Frequency}Inlet take
+    // their coefficient with dict.get<scalar>(), which THROWS when the key is absent
+    // (turbulentIntensityKineticEnergyInletFvPatchScalarField.C:76), and OpenFOAM's own write() emits it
+    // unconditionally (.C:154-158). Dropping it made brae's output unreadable by OpenFOAM outright --
+    // `--> FOAM FATAL IO ERROR: Entry 'intensity' not found in dictionary ".../k/boundaryField/inlet"`,
+    // measured by restarting real rhoSimpleFoam from brae's own t=2 write of validation/rhoTI. brae could
+    // read it back only because ITS reader defaults intensity to 0, which is a silently laminar inlet.
+    // OF's `U`, `phi` and `k` entries beside these are getOrDefault, so their absence is not an error.
+    if (d.type == "turbulentIntensityKineticEnergyInlet")
+        os << "        intensity       " << d.intensity << ";\n";
+    if (d.type == "turbulentMixingLengthDissipationRateInlet"
+     || d.type == "turbulentMixingLengthFrequencyInlet")
+        os << "        mixingLength    " << d.mixingLength << ";\n";
     if (computed && nComputed)
     {
         // The SOLVED boundary values, not the ones the case was started from. Echoing the input made
