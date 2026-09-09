@@ -96,6 +96,8 @@ add_library(brae_core STATIC
     src/finiteVolume/cfdTools/general/fvOptions/actuationDiskSource_cpp.cu
     src/finiteVolume/cfdTools/general/bound/bound_cpp.cu
     src/finiteVolume/cfdTools/general/bound/bound_report.cu
+    src/OpenFOAM/db/IOstreams/io_precision.cu
+    src/finiteVolume/cfdTools/general/fvOptions/limit_temperature_report.cu
     src/finiteVolume/cfdTools/general/MRF/MRF_cpp.cu
     src/finiteVolume/cfdTools/general/MRF/device_MRF.cu
     src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedSchemes_cpp.cu
@@ -1267,6 +1269,18 @@ set_tests_properties(bound_message_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TI
 add_test(NAME bound_at_construction_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/bound_at_construction_vs_openfoam.sh)
 set_tests_properties(bound_at_construction_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+add_test(NAME limit_temperature_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/limit_temperature_vs_openfoam.sh)
+set_tests_properties(limit_temperature_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800 LABELS slow)
+add_test(NAME write_format_binary_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/write_format_binary_vs_openfoam.sh)
+set_tests_properties(write_format_binary_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800 LABELS slow)
+add_test(NAME laminar_model_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/laminar_model_vs_openfoam.sh)
+set_tests_properties(laminar_model_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 2400 LABELS slow)
+add_test(NAME nut_wall_function_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/nut_wall_function_vs_openfoam.sh)
+set_tests_properties(nut_wall_function_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 2400 LABELS slow)
 add_test(NAME turb_precon_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/turb_precon_vs_openfoam.sh)
 set_tests_properties(turb_precon_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)

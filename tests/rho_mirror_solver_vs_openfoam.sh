@@ -206,15 +206,21 @@ else
     echo "$cout" | tail -4; say "residualControl stops the run before endTime" FAIL
 fi
 
-# ---- arm 6: writeFormat binary is refused by name (the writer emits ascii only) -------------------
+# ---- arm 6: writeFormat binary RUNS and is announced (it used to be refused) ----------------------
+# This arm asserted the refusal until that refusal was measured to protect nothing: OpenFOAM's
+# writeFormat is a WRITE option (TimeIO.C:370-372) and a file's format is read from its OWN header
+# (IOobjectReadHeader.C:51), so real OpenFOAM restarts from brae's ascii output with binary still set.
+# The full round trip -- including the control where a MISLABELLED header makes OpenFOAM abort -- is
+# tests/write_format_binary_vs_openfoam.sh; what belongs here is that this driver runs it and says so.
 BF="$W/bin"; stage "$BF" "$SRC" 5
 sed -i 's/writeFormat ascii;/writeFormat binary;/' "$BF/system/controlDict"
 grep -q "writeFormat binary" "$BF/system/controlDict" || { echo "FAIL: the binary mutation did not apply"; exit 1; }
 bout=$( cd "$BF" && BRAE_RHOSIMPLEFOAM_MIRROR=1 "$BIN" -case "$BF" 2>&1 )
-echo "$bout" | grep -q "writeFormat is \`binary\`" \
-    && [ ! -d "$BF/5" ] \
-    && say "a binary writeFormat is refused by name, and nothing is written" ok \
-    || { echo "$bout" | tail -4; say "a binary writeFormat is refused by name, and nothing is written" FAIL; }
+echo "$bout" | grep -q "controlDict writeFormat" \
+    && [ -d "$BF/5" ] \
+    && grep -aq 'format *ascii;' "$BF/5/T" \
+    && say "a binary writeFormat runs, is announced, and writes honestly-labelled ascii" ok \
+    || { echo "$bout" | tail -4; say "a binary writeFormat runs, is announced, and writes honestly-labelled ascii" FAIL; }
 
 
 # ---- arms 7-9: THE CUDA ARM. Same solver, device modules doing the arithmetic ---------------------
@@ -227,9 +233,12 @@ echo "$bout" | grep -q "writeFormat is \`binary\`" \
 # their written fields agree to 3.9e-09 (p), 1.3e-08 (U), 6.2e-07 (nut).
 stage "$W/cuda" "$SRC" "$ITERS"
 if ( cd "$W/cuda" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BIN" -case "$W/cuda" > cuda.log 2>&1 ); then
+    # A LOCAL flag. `fail` accumulates across the whole script, so reporting this arm through it made
+    # any earlier failure reappear here as a CUDA mismatch that never happened.
+    cudaFail=0
     BRAE_DIR="$W/cuda/$ITERS" OF_DIR="$W/of/$ITERS" HOST_DIR="$W/brae/$ITERS" \
-    python3 "$ROOT/tests/rho_mirror_compare.py" || fail=1
-    say "the CUDA mirror matches OpenFOAM and the host mirror" "$([ $fail = 0 ] && echo ok || echo FAIL)"
+    python3 "$ROOT/tests/rho_mirror_compare.py" || cudaFail=1
+    say "the CUDA mirror matches OpenFOAM and the host mirror" "$([ $cudaFail = 0 ] && echo ok || echo FAIL)"
 else
     tail -6 "$W/cuda/cuda.log"; say "the CUDA mirror solver runs" FAIL
 fi
@@ -303,7 +312,9 @@ done
 [ -f "$RP/constant/polyMesh/.brae_amgcache" ] \
     && say "...and the run actually wrote an AMG cache (else the arm is vacuous)" ok \
     || say "...and the run actually wrote an AMG cache (else the arm is vacuous)" FAIL
-COLD="$W/cold" WARM="$RP/30" python3 - <<'PYEOF' || fail=1
+# A LOCAL flag, for the same reason the CUDA arm above has one.
+cacheFail=0
+COLD="$W/cold" WARM="$RP/30" python3 - <<'PYEOF' || cacheFail=1
 import os, re, sys
 import numpy as np
 def read(p):
@@ -325,7 +336,7 @@ for fld in ('p', 'T', 'U', 'rho', 'phi'):
     ok = ok and d == 0.0
 sys.exit(0 if ok else 1)
 PYEOF
-say "a cache-loaded hierarchy reproduces a cold one bit for bit" "$([ $fail = 0 ] && echo ok || echo FAIL)"
+say "a cache-loaded hierarchy reproduces a cold one bit for bit" "$([ $cacheFail = 0 ] && echo ok || echo FAIL)"
 
 # ---- arm 12: the porous zone reaches the DEVICE momentum equation ----------------------------------
 # rhoUEqn.cu has applied a porous zone since it was written and nothing built a DevicePorosity for this
