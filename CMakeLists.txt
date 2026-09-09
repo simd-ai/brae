@@ -2067,6 +2067,16 @@ set_tests_properties(flowrate_device_solver_vs_openfoam PROPERTIES
                      ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
                      SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
 
+# brae's OWN output must be readable by real OpenFOAM and mean the same thing: the writer has to echo
+# the INPUT entries OpenFOAM's own write() emits and its reader requires (`intensity`, `mixingLength`,
+# `rho`). A field-vs-field gate cannot see this, because it compares a file nothing reads back --
+# tests/written_bc_roundtrip_vs_openfoam.sh.
+add_test(NAME written_bc_roundtrip_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/written_bc_roundtrip_vs_openfoam.sh)
+set_tests_properties(written_bc_roundtrip_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
 # turbulence->validate() at construction, both models, both arms where the device runs the model:
 # the first iteration must sit on OpenFOAM's -- tests/rho_validate_vs_openfoam.sh.
 add_test(NAME rho_validate_vs_openfoam
