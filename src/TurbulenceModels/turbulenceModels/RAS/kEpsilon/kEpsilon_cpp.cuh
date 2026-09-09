@@ -147,6 +147,22 @@ struct Compressible
 // turbulence->validate() at construction -- which used to compute the interior only, so the first
 // momentum solve ran on the case file's wall nut (uniform 0 in every tutorial) where OpenFOAM's
 // nut.correctBoundaryConditions() had already evaluated nutkWallFunction from the initial k.
+// WHICH nut wall function each patch carries. OpenFOAM has exactly ONE dispatch point for this -- the
+// nut patch field's own virtual calcNut() (nutWallFunctionFvPatchScalarField.C:182) -- and everything
+// downstream READS the result rather than recomputing it (epsilonWallFunctionFvPatchScalarField.C:
+// 333-334 takes turbModel.nut(patchi) into G). This closure called nutkWallFunction unconditionally, so
+// a case naming any other member of the family got nutk's value under that member's name.
+//
+// The kind is captured at createFields, which is the last place the dictionary TYPE still exists, and
+// carried here rather than re-derived: once buildField has run the patch object no longer knows it.
+// A null selection means every wall-function patch is nutk -- what this closure did before -- so the
+// incompressible callers are unchanged.
+struct NutWallSelection
+{
+    const std::vector<int>*       kind = nullptr;   // per patch, a NutWall value; -1 => not a wall fn
+    const GeometricField<vector>* U    = nullptr;   // the U-based members read |U_cell - U_wall|
+};
+
 void correctNutField(
     const GeometricField<scalar>&           k,
     const GeometricField<scalar>&           epsilon,
@@ -155,7 +171,8 @@ void correctNutField(
     scalar                                  nu,
     const std::vector<FvPatch>&             patches,
     const KEpsilonCoeffs&                   co,
-    const Compressible*                     comp);
+    const Compressible*                     comp,
+    const NutWallSelection*                 nutSel = nullptr);
 
 // One kEpsilon::correct(). Updates k, epsilon and nut in place.
 void correct(
@@ -212,7 +229,10 @@ void correct(
     scalar limiterCoeff  = 1.0,
     // fvSolution solvers/<field>/minIter, OF's lduMatrix::solver floor on the iteration count
     // (PBiCGStab.C:262-265: the loop continues while nIterations < minIter even when converged).
-    int    minIter       = 0);
+    int    minIter       = 0,
+    // Which nut wall function each patch carries -- forwarded straight to correctNutField, which is
+    // where OpenFOAM's single dispatch point lives. Last, so no positional caller moves.
+    const NutWallSelection* nutSel = nullptr);
 
 } // namespace kEpsilonRef
 } // namespace cpu

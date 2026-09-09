@@ -331,7 +331,7 @@ int main(int argc, char** argv)
         if (simType != "RAS" && simType != "laminar")
             throw std::runtime_error("brae: unsupported simulationType '" + simType + "' for rhoSimpleFoam (RAS or laminar)");
         ctl.turbulent = (simType == "RAS");
-        readTurbulenceModel(turbProps, ctl);
+        readTurbulenceModel(turbProps, ctl, {"rhoSimpleFoam (legacy, frozen)", true, true});
         // kOmegaSST and kEpsilon are both rho-weighted (every RHS term, the diffusivity, the volumetric
         // divU and the per-face wall nu). SA and the kOmegaSST variants are not, so they stay refused:
         // running one down the incompressible path converges to a wrong answer rather than failing.

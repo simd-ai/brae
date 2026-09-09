@@ -1,5 +1,5 @@
 // rhoSimpleFoamDriver_cpp.cu -- see the header for what this is and why the parse is shared.
-#include "bound_report.cuh"   // setBoundReportPrecision: OF ties Info precision to writePrecision
+#include "io_precision.cuh"   // setIOPrecision: OF ties every Info line to writePrecision
 #include "rhoSimpleFoamDriver_cpp.cuh"
 
 #include "brae_notice.cuh"
@@ -53,6 +53,10 @@ StepInput buildStepInput(
     in.limitT              = refusals.limitT;
     in.limitTmin           = refusals.limitTmin;
     in.limitTmax           = refusals.limitTmax;
+    in.limitTname          = refusals.limitTname;
+    // The per-patch nut wall function, read from 0/nut's boundaryField types by createFields. The
+    // caller owns `f` for the whole run, so the pointer outlives the loop.
+    in.nutWallKind         = &f.nutWallKind;
     if (!refusals.hasFvOptions && !refusals.opts.empty()) in.fvOpts = &refusals.opts;
 
     in.consistent = simpleDict && simpleDict->wordOr("consistent", "no") == "yes";
@@ -283,7 +287,7 @@ std::vector<scalar> flatSurfaceBoundary(const SurfaceScalarField& sf,
 int runMirror(const std::string& caseDir)
 {
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
-    setBoundReportPrecision(controlDict.intOr("writePrecision", 6));   // OF TimeIO.C:375-383
+    setIOPrecision(controlDict.intOr("writePrecision", 6));   // OF TimeIO.C:375-383
 
     const FoamDict fvSolution  = readDict(caseDir + "/system/fvSolution");
     // The unread-entry safety net the legacy drivers have had since item E5, absent on the mirror until
@@ -309,15 +313,10 @@ int runMirror(const std::string& caseDir)
     audit.addFvSchemes(caseDir);
     const FoamDict* simpleDict = fvSolution.subDict("SIMPLE");
 
-    // REFUSED, not silently downgraded: every writer in the tree emits ASCII and force-rewrites a binary
-    // template header to `format ascii` (foam_field_writer.cuh). A case asking for binary output would
-    // get ascii under its own setting -- readable by OpenFOAM, but not what the case asked for, and
-    // silently larger and slower on the big meshes that ask for binary in the first place.
-    if (controlDict.wordOr("writeFormat", "ascii") == "binary")
-        throw std::runtime_error(
-            "brae rhoSimpleFoam (mirror): controlDict writeFormat is `binary`, which brae's field "
-            "writer does not emit -- it writes ASCII only. Refusing rather than writing ascii under a "
-            "binary setting. Set `writeFormat ascii;` to run this case.");
+    // `writeFormat binary` used to be refused here. It is a NOTICE now, emitted once from WriteControl
+    // for every driver -- see the note there. The refusal claimed the output would not be what the case
+    // asked for; measured, real OpenFOAM restarts from brae's ascii output with binary still set,
+    // because the format is read from each FILE's header and never from controlDict.
 
     PrimitiveMesh m;
     m.read(caseDir + "/constant/polyMesh");

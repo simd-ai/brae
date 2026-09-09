@@ -1,4 +1,5 @@
 // rhoSimpleFoamDriver.cu -- see the header for what is shared with the host driver and why.
+#include "io_precision.cuh"   // setIOPrecision: OF ties every Info line to writePrecision
 #include "bound_report.cuh"   // printBounding: Foam::bound's message, one formatter for both arms
 #include "brae_notice.cuh"
 #include "rhoSimpleFoamDriver.cuh"
@@ -66,6 +67,13 @@ RhoStepInput buildDeviceStepInput(
         if (!o.active) continue;
         if (!o.unsupported.empty())
         {
+            // limitTemperature is IMPLEMENTED on this arm too -- it is projected into in.limitHe below
+            // and applied by limitEnergyKernel after the energy solve. deriveCaseRefusals resolves it
+            // out of the option list, so fvOptions::read's catch-all marks it unsupported, and this
+            // loop then refused it a SECOND time, independently of the exemption the host arm takes in
+            // firstUnsupported(). Two refusal paths for one option is how the CUDA arm kept refusing
+            // aerofoilNACA0012 after the host arm was fixed; the condition here is the same one.
+            if (o.unsupported == "limitTemperature" && refusals.limitT) continue;
             in.hasFvOptions = true;
             if (in.fvOptionUnsupported.empty()) in.fvOptionUnsupported = o.unsupported;
             continue;
@@ -185,9 +193,12 @@ RhoStepInput buildDeviceStepInput(
     // fvOption the case declares, honoured on one arm only, with nothing saying so.
     if (refusals.limitT)
     {
-        in.limitHe = true;
-        in.heMin   = hConstTToHe(refusals.limitTmin, hf.thermo);
-        in.heMax   = hConstTToHe(refusals.limitTmax, hf.thermo);
+        in.limitHe    = true;
+        in.limitTmin  = refusals.limitTmin;
+        in.limitTmax  = refusals.limitTmax;
+        in.limitTname = refusals.limitTname;
+        in.heMin      = hConstTToHe(refusals.limitTmin, hf.thermo);
+        in.heMax      = hConstTToHe(refusals.limitTmax, hf.thermo);
         std::printf("  fvOption limitTemperature [%g, %g] K -> he [%g, %g]\n",
                     (double)refusals.limitTmin, (double)refusals.limitTmax,
                     (double)in.heMin, (double)in.heMax);
@@ -318,7 +329,7 @@ std::vector<scalar> host(const DeviceBuffer<scalar>& b)
 int runMirrorCuda(const std::string& caseDir)
 {
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
-    setBoundReportPrecision(controlDict.intOr("writePrecision", 6));   // OF TimeIO.C:375-383
+    setIOPrecision(controlDict.intOr("writePrecision", 6));   // OF TimeIO.C:375-383
 
     const FoamDict fvSolution  = readDict(caseDir + "/system/fvSolution");
     // The unread-entry safety net the legacy drivers have had since item E5, absent on the mirror until
@@ -344,11 +355,7 @@ int runMirrorCuda(const std::string& caseDir)
     audit.addFvSchemes(caseDir);
     const FoamDict* simpleDict = fvSolution.subDict("SIMPLE");
 
-    if (controlDict.wordOr("writeFormat", "ascii") == "binary")
-        throw std::runtime_error(
-            "brae rhoSimpleFoam (mirror, CUDA): controlDict writeFormat is `binary`, which brae's field "
-            "writer does not emit -- it writes ASCII only. Refusing rather than writing ascii under a "
-            "binary setting. Set `writeFormat ascii;` to run this case.");
+    // writeFormat: a NOTICE from WriteControl now, on this arm as on the host one. See write_control.cuh.
 
     PrimitiveMesh m;
     m.read(caseDir + "/constant/polyMesh");

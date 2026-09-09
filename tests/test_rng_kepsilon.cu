@@ -76,7 +76,7 @@ int main()
             "RAS { RASModel RNGkEpsilon; turbulence on; printCoeffs on; }\n");
         DeviceSimpleControls ctl;
         ctl.turbulent = true;
-        readTurbulenceModel(d, ctl);
+        readTurbulenceModel(d, ctl, {"test", true, true});
         const KEpsilonCoeffs& c = ctl.keCoeffs;
         check(c.rng, "parser: RASModel RNGkEpsilon selects the RNG path");
         check(std::fabs(c.Cmu - 0.0845) < 1e-14, "Cmu = 0.0845 (NOT kEpsilon's 0.09 -- it feeds nut and the wall functions)");
@@ -94,7 +94,7 @@ int main()
             "      RNGkEpsilonCoeffs { Cmu 0.1; eta0 5.5; beta 0.02; sigmak 0.9; } }\n");
         DeviceSimpleControls ctl;
         ctl.turbulent = true;
-        readTurbulenceModel(d, ctl);
+        readTurbulenceModel(d, ctl, {"test", true, true});
         const KEpsilonCoeffs& c = ctl.keCoeffs;
         check(std::fabs(c.Cmu - 0.1) < 1e-14 && std::fabs(c.eta0 - 5.5) < 1e-14
            && std::fabs(c.beta - 0.02) < 1e-14 && std::fabs(c.sigmaK - 0.9) < 1e-14,
@@ -108,7 +108,7 @@ int main()
             "RAS { RASModel kEpsilon; turbulence on; }\n");
         DeviceSimpleControls ctl;
         ctl.turbulent = true;
-        readTurbulenceModel(d, ctl);
+        readTurbulenceModel(d, ctl, {"test", true, true});
         check(!ctl.keCoeffs.rng && std::fabs(ctl.keCoeffs.Cmu - 0.09) < 1e-14
            && std::fabs(ctl.keCoeffs.C1 - 1.44) < 1e-14,
               "negative control: plain kEpsilon still gets Cmu 0.09 / C1 1.44 and no R term");
@@ -119,7 +119,7 @@ int main()
         {
             const FoamDict d = dictFromString("simulationType RAS;\nRAS { RASModel RNGkOmega; turbulence on; }\n");
             DeviceSimpleControls ctl; ctl.turbulent = true;
-            readTurbulenceModel(d, ctl);
+            readTurbulenceModel(d, ctl, {"test", true, true});
         }
         catch (const std::exception&) { threw = true; }
         check(threw, "refusal: an unimplemented RASModel is still rejected, not silently run as kEpsilon");

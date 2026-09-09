@@ -242,7 +242,9 @@ try
         if (simType != "RAS" && simType != "laminar" && simType != "LES")
             throw std::runtime_error("pimpleFoam: unsupported simulationType '" + simType + "' (RAS, LES or laminar).");
         ctl.turbulent = (simType == "RAS" || simType == "LES");   // LES here == SA-DDES (a URANS-based hybrid); readTurbulenceModel sets ctl.des
-        readTurbulenceModel(turbProps, ctl);
+        // Maxwell is applied here (gpuPimpleFoam.cu:377, :657); the generalized-Newtonian viscosity
+        // has no consumer on the transient path.
+        readTurbulenceModel(turbProps, ctl, {"pimpleFoam", false, true});
         secondName = ctl.sst ? "omega" : "epsilon";
     }
 

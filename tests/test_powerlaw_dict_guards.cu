@@ -40,7 +40,7 @@ static Result run(const std::string& coeffs)
 
     Result r;
     r.ctl.turbulent = false;   // the powerLaw branch is the laminar one
-    try { readTurbulenceModel(readDict(dir + "/turbulenceProperties"), r.ctl); }
+    try { readTurbulenceModel(readDict(dir + "/turbulenceProperties"), r.ctl, {"test", true, true}); }
     catch (const std::exception& e) { r.threw = true; r.msg = e.what(); }
     return r;
 }

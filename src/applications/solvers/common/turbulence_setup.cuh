@@ -145,7 +145,32 @@ inline void selectNutWall(
             }
 }
 
-inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls& ctl)
+// What the CALLING DRIVER can actually RUN. OpenFOAM's laminarModel::New selects from a table of
+// three -- Stokes, generalizedNewtonian and Maxwell (turbulentFluidThermoModels.C compressible,
+// turbulentTransportModels.C incompressible) -- but which of them a given brae driver APPLIES is a
+// property of the driver, not of OpenFOAM, and this reader is shared by six of them.
+//
+// There is NO DEFAULT, deliberately: a permissive default is exactly how a shared reader comes to
+// promise a capability on behalf of a driver that has none. That already happened here. `ctl.gnPowerLaw`
+// is consumed ONLY on the compressible legacy path (device_simple_foam.cu:1319, guarded by
+// `compressible_`, and :3540 inside rhoSimpleStep), so incompressible simpleFoam read the model,
+// PRINTED "laminar generalizedNewtonian/powerLaw: n=..." and then ran Stokes -- a case told, in its own
+// log, that a viscosity model it never got was in force. Omitting the default makes the compiler list
+// every call site so each one states the truth about itself.
+struct LaminarEnvelope
+{
+    const char* driver;                    // named in the refusal, so the message says WHICH arm
+    bool        generalizedNewtonianPowerLaw;
+    bool        maxwell;
+};
+
+
+// OF laminarModel::New. `simulationType laminar` DOES NOT MEAN "no model": Stokes is one entry in that
+// table and the only one that leaves the molecular viscosity alone.
+inline void readLaminarModel(
+    const FoamDict&        turbProps,
+    DeviceSimpleControls&  ctl,
+    const LaminarEnvelope& env)
 {
         // `simulationType laminar` DOES NOT MEAN "no model". OF selects a laminarModel, and the default
         // (Stokes) is the only one that leaves the molecular viscosity alone. A
@@ -160,13 +185,32 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
         // produced a confident non-converged answer (Ux 1.9e-2, p 3.4e-1 still oscillating at iteration
         // 500). The dict audit did flag `laminar/` as unread, which is what a notice is for; a viscosity
         // model is not a notice-level omission.
-        if (!ctl.turbulent)
         {
             if (const FoamDict* lam = turbProps.subDict("laminar"))
             {
-                const std::string lmodel = lam->wordOr("model", "Stokes");
+                // laminarModel.C reads `model`, with the pre-v2006 spelling `laminarModel` as an alias.
+                // A case using the old key got Stokes silently.
+                const std::string lmodel = lam->found("model") ? lam->wordOr("model", "Stokes")
+                                                               : lam->wordOr("laminarModel", "Stokes");
                 if (lmodel == "generalizedNewtonian")
                 {
+                    // THE ENVELOPE, before anything is parsed: a driver that does not apply the model
+                    // must refuse the case, not read the coefficients and announce them. nuEff() RETURNS
+                    // nu_ (generalizedNewtonian.C:139-146) -- the model REPLACES the molecular viscosity
+                    // rather than adding to it -- so ignoring it is a different momentum equation, not a
+                    // small error. Measured on OpenFOAM's own squareBendLiqNoNewtonian: nu sits at nuMin
+                    // = 1e-3 over the whole field against a molecular mu/rho of 3.9e-7..9.1e-7, which is
+                    // 1101x to 2532x. Measured on validation/rhoBox with that same laminar block: brae
+                    // ignoring it differs from OpenFOAM by 5.74e-01 relative on U.
+                    if (!env.generalizedNewtonianPowerLaw)
+                        throw std::runtime_error(
+                            std::string("brae: ") + env.driver + " -- constant/turbulenceProperties asks "
+                            "for `laminar { model generalizedNewtonian; }`, which this arm does not apply. "
+                            "OpenFOAM's generalizedNewtonian nuEff() RETURNS the model's nu rather than "
+                            "adding to the molecular one, so running without it is a different momentum "
+                            "equation: on OpenFOAM's own squareBendLiqNoNewtonian the model's nu is 1101x "
+                            "to 2532x the molecular value. Refusing rather than running Stokes under "
+                            "another model's name.");
                     // OF reads the coefficients from powerLawCoeffs{} if present, else from the enclosing
                     // dictionary (dictionary::optionalSubDict), which is how this tutorial writes them.
                     const std::string vm = lam->wordOr("viscosityModel", "");
@@ -200,6 +244,12 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                 }
                 else if (lmodel == "Maxwell")
                 {
+                    if (!env.maxwell)
+                        throw std::runtime_error(
+                            std::string("brae: ") + env.driver + " -- constant/turbulenceProperties asks "
+                            "for `laminar { model Maxwell; }`, a viscoelastic stress transport this arm "
+                            "does not run. Refusing rather than solving the Newtonian momentum equation "
+                            "under a viscoelastic model's name.");
                     // OF laminarModels::Maxwell. dimensionedScalar(name, dims, coeffDict_) THROWS when the
                     // entry is absent, and coeffDict_ is dictionary::optionalSubDict("MaxwellCoeffs") --
                     // so both spellings the tutorials use are valid: planarPoiseuille writes the
@@ -227,6 +277,17 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                         "running without it is a different momentum equation, not an approximation.");
             }
         }
+}
+
+
+// RAS/LES selection, plus the laminar table above when the case is not turbulent. The envelope is
+// carried through rather than defaulted -- see LaminarEnvelope.
+inline void readTurbulenceModel(
+    const FoamDict&        turbProps,
+    DeviceSimpleControls&  ctl,
+    const LaminarEnvelope& env)
+{
+        if (!ctl.turbulent) readLaminarModel(turbProps, ctl, env);
         if (ctl.turbulent)
         {
             // simulationType LES: DES/LES models live under an LES{} sub-dict (OF convention). SA-DDES reuses the SA

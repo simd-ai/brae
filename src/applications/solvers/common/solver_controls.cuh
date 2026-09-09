@@ -2,6 +2,7 @@
 // SIMPLE solver configuration + per-step residual report -- the PODs that parameterise DeviceSimpleSolver.
 // Split out of device_simple_foam.cuh so the solver interface, PIMPLE, rhoSimple etc. can share the controls
 // without pulling in the full solver implementation. Pure data (+ the model-coeff PODs); no device code.
+#include "nut_wall_function.cuh"   // enum class NutWall, beside the formulas it selects
 #include "cf_types.cuh"
 #include "kepsilon_coeffs.cuh"
 #include "komega_sst_coeffs.cuh"
@@ -17,7 +18,10 @@ namespace brae {
 // NOT from the turbulence model. nutk = k-based stepwise log law (nutkWallFunction); Spalding =
 // velocity-based Spalding blend (nutUSpaldingWallFunction); Blended = velocity-based binomial n=4
 // blend (nutUBlendedWallFunction). All three are honoured on any RAS model, exactly as OF does.
-enum class NutWall { Nutk, Spalding, Blended, NutU, LowRe };   // NutU = nutUWallFunction (STEPWISE
+// The enum itself lives in nut_wall_function.cuh, beside the formulas it selects between, so the
+// turbulence closures can dispatch on it without including this solver-level header. Everything below
+// still reads NutWall::..., unqualified, because it stays in namespace brae.
+// enum class NutWall { Nutk, Spalding, Blended, NutU, LowRe };   // NutU = nutUWallFunction (STEPWISE
 // blender); LowRe = nutLowReWallFunction, whose calcNut() returns Zero UNCONDITIONALLY
 // (nutLowReWallFunctionFvPatchScalarField.C:38-42 is the whole function). It used to be mapped to
 // Nutk with a warning on stderr, on the argument that the two are identical on a resolved mesh --

@@ -1,4 +1,5 @@
 // DISPATCH for the rebuilt simpleFoam -- see simpleFoamV2.cuh for why the guard exists.
+#include "io_precision.cuh"   // setIOPrecision: OF ties every Info line to writePrecision
 #include "bound_report.cuh"   // printBounding: Foam::bound's message, shared with the other drivers
 #include "linear_solver_setup.cuh"   // turbPreconFor: the ONE rule for the turbulence preconditioner
 #include "simpleFoamV2.cuh"
@@ -727,7 +728,7 @@ int runSimpleFoamV2(const std::string& caseDir)
     const label nC = m.nCells();
 
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
-    setBoundReportPrecision(controlDict.intOr("writePrecision", 6));   // OF TimeIO.C:375-383
+    setIOPrecision(controlDict.intOr("writePrecision", 6));   // OF TimeIO.C:375-383
 
     const FoamDict fvSolution  = readDict(caseDir + "/system/fvSolution");
     const FoamDict transport   = readDict(caseDir + "/constant/transportProperties");

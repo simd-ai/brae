@@ -102,11 +102,11 @@ int main()
             return readDict(dir + "/constant/turbulenceProperties");
         };
         std::string msg;
-        say(throws([&] { DeviceSimpleControls ctl; ctl.turbulent = true; readTurbulenceModel(turb(base + "/e1", "vanDriest"), ctl); }, &msg)
+        say(throws([&] { DeviceSimpleControls ctl; ctl.turbulent = true; readTurbulenceModel(turb(base + "/e1", "vanDriest"), ctl, {"test", true, true}); }, &msg)
             && msg.find("vanDriest") != std::string::npos, "LES `delta vanDriest` is refused by name");
-        say(!throws([&] { DeviceSimpleControls ctl; ctl.turbulent = true; readTurbulenceModel(turb(base + "/e2", "cubeRootVol"), ctl); }),
+        say(!throws([&] { DeviceSimpleControls ctl; ctl.turbulent = true; readTurbulenceModel(turb(base + "/e2", "cubeRootVol"), ctl, {"test", true, true}); }),
             "LES `delta cubeRootVol` still accepted");
-        say(!throws([&] { DeviceSimpleControls ctl; ctl.turbulent = true; readTurbulenceModel(turb(base + "/e3", "maxDeltaxyz"), ctl); }),
+        say(!throws([&] { DeviceSimpleControls ctl; ctl.turbulent = true; readTurbulenceModel(turb(base + "/e3", "maxDeltaxyz"), ctl, {"test", true, true}); }),
             "LES `delta maxDeltaxyz` still accepted");
     }
 
@@ -119,15 +119,15 @@ int main()
                   "simulationType RAS;\nRAS\n{\n    RASModel SpalartAllmaras;\n    turbulence on;\n" + coeffs + "}\n");
             return readDict(dir + "/constant/turbulenceProperties");
         };
-        DeviceSimpleControls a; a.turbulent = true; readTurbulenceModel(turb(base + "/d1", ""), a);
+        DeviceSimpleControls a; a.turbulent = true; readTurbulenceModel(turb(base + "/d1", ""), a, {"test", true, true});
         say(a.sa && a.saCoeffs.Cb1 == scalar(0.1355) && a.saCoeffs.sigmaNut == scalar(0.66666), "no coeffDict: OpenFOAM's defaults");
-        DeviceSimpleControls b; b.turbulent = true; readTurbulenceModel(turb(base + "/d2", "    SpalartAllmarasCoeffs { Cb1 0.2; sigmaNut 0.8; Cw2 0.35; }\n"), b);
+        DeviceSimpleControls b; b.turbulent = true; readTurbulenceModel(turb(base + "/d2", "    SpalartAllmarasCoeffs { Cb1 0.2; sigmaNut 0.8; Cw2 0.35; }\n"), b, {"test", true, true});
         say(b.saCoeffs.Cb1 == scalar(0.2) && b.saCoeffs.sigmaNut == scalar(0.8) && b.saCoeffs.Cw2 == scalar(0.35)
             && b.saCoeffs.Cb2 == scalar(0.622), "SpalartAllmarasCoeffs { Cb1 sigmaNut Cw2 } are read; the rest keep their defaults");
-        DeviceSimpleControls d; d.turbulent = true; readTurbulenceModel(turb(base + "/d4", "    Cb1 0.19;\n"), d);
+        DeviceSimpleControls d; d.turbulent = true; readTurbulenceModel(turb(base + "/d4", "    Cb1 0.19;\n"), d, {"test", true, true});
         say(d.saCoeffs.Cb1 == scalar(0.19), "a coefficient at the RAS level reaches the model (optionalSubDict fallback, as OpenFOAM)");
         std::string msg;
-        say(throws([&] { DeviceSimpleControls c; c.turbulent = true; readTurbulenceModel(turb(base + "/d3", "    SpalartAllmarasCoeffs { ft2 true; }\n"), c); }, &msg)
+        say(throws([&] { DeviceSimpleControls c; c.turbulent = true; readTurbulenceModel(turb(base + "/d3", "    SpalartAllmarasCoeffs { ft2 true; }\n"), c, {"test", true, true}); }, &msg)
             && msg.find("ft2") != std::string::npos, "`ft2 true` is refused by name (term not implemented)");
     }
 

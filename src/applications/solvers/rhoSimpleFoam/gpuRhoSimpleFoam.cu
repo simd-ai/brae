@@ -361,7 +361,9 @@ int main(int argc, char** argv)
         if (simType != "RAS" && simType != "laminar")
             throw std::runtime_error("brae: unsupported simulationType '" + simType + "' for rhoSimpleFoam (RAS or laminar)");
         ctl.turbulent = (simType == "RAS");
-        readTurbulenceModel(turbProps, ctl);
+        // COMPRESSIBLE legacy: rhoSimpleStep applies the generalized-Newtonian nu
+        // (device_simple_foam.cu:3540) and the boundary muEff arm at :1319 is its compressible half.
+        readTurbulenceModel(turbProps, ctl, {"rhoSimpleFoam (legacy)", true, true});
         // kOmegaSST and kEpsilon are both rho-weighted (every RHS term, the diffusivity, the volumetric
         // divU and the per-face wall nu). SA and the kOmegaSST variants are not, so they stay refused:
         // running one down the incompressible path converges to a wrong answer rather than failing.

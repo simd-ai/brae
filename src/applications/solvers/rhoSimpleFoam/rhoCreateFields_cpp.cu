@@ -695,6 +695,12 @@ RhoSimpleFields createFields(
                 // buildField has run, the patch field object no longer carries it, which is why neither
                 // the host closure nor the device one could have checked.
                 {
+                    // Default Nutk for every patch: a patch with no wall function never reaches the
+                    // dispatch (the loop is gated on the epsilon patch being a wall function), and a
+                    // wall-function patch whose type is unrecognised throws below rather than falling
+                    // through to a default -- a permissive default here is how nutk gets run under
+                    // another name, which is the whole defect.
+                    f.nutWallKind.assign(patches.size(), static_cast<int>(NutWall::Nutk));
                     const FieldData<scalar> nutRaw = guardRead(readField<scalar>(timeDir + "/nut"), "nut");
                     for (const auto& b : nutRaw.boundary)
                     {
@@ -704,28 +710,48 @@ RhoSimpleFields createFields(
                         // substitution this throw exists to prevent.
                         if (b.type.rfind("nut", 0) != 0
                          && b.type.rfind("atmNut", 0) != 0) continue;        // not a nut wall function
-                        if (b.type == "nutkWallFunction")
+                        // THE FAMILY brae now dispatches, captured HERE because this is the last
+                        // place the dictionary TYPE exists -- once buildField has run the patch object
+                        // no longer carries it, which is why neither closure could have checked. The
+                        // three are different functions of different inputs, and OpenFOAM picks between
+                        // them at one virtual call (nutWallFunctionFvPatchScalarField.C:182).
+                        int kind = -1;
+                        if      (b.type == "nutkWallFunction")     kind = static_cast<int>(NutWall::Nutk);
+                        else if (b.type == "nutUWallFunction")     kind = static_cast<int>(NutWall::NutU);
+                        else if (b.type == "nutLowReWallFunction") kind = static_cast<int>(NutWall::LowRe);
+                        if (kind >= 0)
                         {
                             // Ported for the LIVE closure, which recomputes the wall nut every
                             // iteration. Frozen, OpenFOAM evaluates it exactly ONCE -- inside
                             // validate()'s correctBoundaryConditions -- and brae has no wall-function
                             // evaluation at createFields, so the wall would keep the file value.
-                            if (!f.turbulenceFrozen) continue;
+                            if (!f.turbulenceFrozen)
+                            {
+                                for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                                    if (patches[pi].name == b.name) f.nutWallKind[pi] = kind;
+                                continue;
+                            }
                             throw std::runtime_error(
-                                "brae: rhoSimpleFoam `RAS { turbulence off; }` with a nutkWallFunction "
+                                "brae: rhoSimpleFoam `RAS { turbulence off; }` with a '" + b.type + "' "
                                 "patch ('" + b.name + "') is not implemented -- OpenFOAM wall-evaluates "
                                 "nut once at validate() and brae cannot yet do that outside the live "
                                 "closure. Use a calculated/zeroGradient nut boundary, or turbulence on.");
                         }
+                        // Still refused, and by name: nutUSpalding and nutUBlended have shared
+                        // kernels but both carry known defects against OpenFOAM (the blended form takes
+                        // the full |U_cell - U_wall| where OpenFOAM projects out the normal component,
+                        // and both seed the iteration from 0 where OpenFOAM seeds from the stored nut),
+                        // and atmNutk's z0 is a per-face PatchFunction1 where brae carries one scalar.
+                        // A shared kernel is not a port until it agrees.
                         throw std::runtime_error(
                             "brae: rhoSimpleFoam nut patch '" + b.name + "' carries '" + b.type +
-                            "', which the compressible kEpsilon closure does not implement -- it computes "
-                            "nutkWallFunction unconditionally, for the wall nut AND for the near-wall "
-                            "production. These are different functions of different inputs (the nutU "
-                            "family reads |U|, which nutk never does; nutLowRe is identically zero), so "
-                            "substituting nutk would converge to a different wall viscosity and a "
-                            "different epsilon. Refusing rather than running one wall function under "
-                            "another's name.");
+                            "', which the compressible kEpsilon closure does not implement. It has "
+                            "nutkWallFunction, nutUWallFunction and nutLowReWallFunction; the rest of "
+                            "the family are different functions of different inputs (nutUSpalding and "
+                            "nutUBlended iterate on |U| with a warm start brae does not carry; atm's z0 "
+                            "is a per-face field where brae has one scalar), so substituting one would "
+                            "converge to a different wall viscosity and a different epsilon. Refusing "
+                            "rather than running one wall function under another's name.");
                     }
                     f.nut = buildField<scalar>(nutRaw, patches, nC);
                 }
@@ -779,7 +805,25 @@ RhoSimpleFields createFields(
                 }
             }
         }
-        else if (sim != "laminar")
+        else if (sim == "laminar")
+        {
+            // THE laminar{} SUB-DICTIONARY, which this function never opened. `simulationType laminar`
+            // was accepted by falling through, so a case selecting a generalizedNewtonian or Maxwell
+            // viscosity ran with the molecular one -- silently, and on both mirror arms, since the CUDA
+            // arm builds its fields from this same function. OpenFOAM's generalizedNewtonian nuEff()
+            // RETURNS the model's nu instead of adding to it, so the mirror was not approximating the
+            // model; it was solving a different momentum equation. Measured on validation/rhoBox with
+            // squareBendLiqNoNewtonian's own laminar block: 5.74e-01 relative on U against OpenFOAM.
+            //
+            // The mirror applies NEITHER model, so its envelope is {false, false} and the shared reader
+            // refuses both by name. This has to land BEFORE the liquid-thermo blocker is cleared: today
+            // squareBendLiqNoNewtonian is stopped by the thermo, and lifting that without this would
+            // turn a correct refusal into a confident 1101x-to-2532x-wrong answer.
+            DeviceSimpleControls lctl;
+            lctl.turbulent = false;
+            readLaminarModel(mt2, lctl, {"rhoSimpleFoam (OF-mirror)", false, false});
+        }
+        else
         {
             throw std::runtime_error(
                 "brae: rhoSimpleFoam simulationType '" + sim + "' is neither laminar nor RAS. Refusing.");
@@ -868,7 +912,11 @@ RhoSimpleFields createFields(
             comp.nu  = &nuLam;           comp.nuBnd  = &nuLamBnd;
             comp.alphat = haveAlphat ? &f.alphat.internal : nullptr;
             comp.Prt = f.thermo.Prt;
-            cpu::kEpsilonRef::correctNutField(f.k, f.epsilon, f.nut, yWall, /*nu=*/0.0, patches, keCase, &comp);
+            cpu::kEpsilonRef::NutWallSelection nsel;
+            nsel.kind = &f.nutWallKind;
+            nsel.U    = &f.U;
+            cpu::kEpsilonRef::correctNutField(f.k, f.epsilon, f.nut, yWall, /*nu=*/0.0, patches, keCase,
+                                              &comp, &nsel);
         }
         else
         {

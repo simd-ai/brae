@@ -1,5 +1,6 @@
 // The device projection of rhoSimpleFoam's createFields.H. See rhoCreateFields.cuh for the contract and
 // for what deliberately stays on the host.
+#include "nut_wall_function.cuh"   // enum class NutWall: which member each nut patch carries
 #include "rhoCreateFields.cuh"
 #include "near_wall_dist.cuh"
 #include <stdexcept>
@@ -262,6 +263,27 @@ RhoDeviceFields createDeviceFields(
             "inside the closure's own set-up), which is a laminar run under a turbulent model's name. "
             "The host arm (BRAE_RHOSIMPLEFOAM_MIRROR=1) carries kOmegaSST; refusing rather than "
             "running this case without its closure.");
+    // THE DEVICE CLOSURE COMPUTES nutkWallFunction UNCONDITIONALLY. Narrowing the host refusal so the
+    // host arm can dispatch the family let this arm through too -- both arms read the same
+    // createFields -- and it then ran nutk under the other members' names. Measured on rhoKE at 5
+    // iterations against real OpenFOAM: epsilon 2.20e-01 for nutU and 2.49e+00 for nutLowRe, against
+    // 1.9e-03 for the nutk case it does implement. That is the exact defect the host dispatch was
+    // written to remove, reappearing on the other arm, so it is refused by name until the device
+    // kernel dispatches too.
+    for (std::size_t pi = 0; pi < hf.nutWallKind.size(); ++pi)
+    {
+        if (hf.nutWallKind[pi] == static_cast<int>(NutWall::Nutk)) continue;
+        const char* nm = hf.nutWallKind[pi] == static_cast<int>(NutWall::NutU)  ? "nutUWallFunction"
+                       : hf.nutWallKind[pi] == static_cast<int>(NutWall::LowRe) ? "nutLowReWallFunction"
+                                                                                : "a nut wall function";
+        throw std::runtime_error(
+            std::string("brae rhoSimpleFoam (CUDA): patch '") + patches[pi].name + "' carries '" + nm +
+            "', which the DEVICE kEpsilon closure does not compute -- it evaluates nutkWallFunction for "
+            "every wall-function patch. The host arm (BRAE_RHOSIMPLEFOAM_MIRROR=1) dispatches the "
+            "family; measured against OpenFOAM on rhoKE, running nutk here instead would put epsilon "
+            "2.2e-01 out for nutU and 2.5e+00 out for nutLowRe. Refusing rather than running one wall "
+            "function under another's name.");
+    }
     if (hf.turbulent && !hf.epsilon.internal.empty())
     {
         d.dbK   = buildDeviceBoundary(hf.k, patches, g);

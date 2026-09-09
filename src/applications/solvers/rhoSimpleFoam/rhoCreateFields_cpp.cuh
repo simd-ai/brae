@@ -156,6 +156,10 @@ struct RhoSimpleFields
     // it as `(?i).*walls` against a patch literally named `walls`, so an exact-name compare misses it and
     // Prt silently reverts to the model's 1.0 -- the legacy solver records that as ~15% low wall alphat
     // and wall heat flux (gpuRhoSimpleFoam.cu:437-452). findPatchEntry does OpenFOAM's resolution.
+    // Which nut wall function each patch carries, as a NutWall code -- read from 0/nut's boundaryField
+    // TYPE, the only place it exists, and consumed by the closure's dispatch. Once buildField has run
+    // the patch object no longer knows its own type, which is why neither closure could have checked.
+    std::vector<int>    nutWallKind;
     std::vector<char>   alphatWallFn;   // per patch, 1 = carries an alphat wall function
     std::vector<scalar> alphatPrt;      // per patch, that patch's own Prt (0.85 where unset)
 
