@@ -1,7 +1,16 @@
 #pragma once
 // Reads an OpenFOAM field file: dimensions / internalField (uniform|nonuniform) /
 // boundaryField { patch { type; value; ... } }. Templated on the value type (scalar/vector).
-// ASCII for now; binary field values land with the binary field reader (later increment).
+// ASCII AND BINARY. This line used to say "ASCII for now; binary field values land with the binary
+// field reader (later increment)" and had said so since the init commit, two weeks after the binary
+// reader landed -- long enough for an audit of this port to read it and conclude, wrongly, that brae
+// could not restart from an OpenFOAM binary write. Every read here goes through TokenStream, whose
+// readWhole transcodes a binary buffer first (foam_token_reader.cu:170-175, foamBinaryToAscii at :75).
+// Measured: brae restarting from OpenFOAM's own binary time directory writes values IDENTICAL to the
+// same restart from a 17-digit ascii conversion of it.
+// NOT YET honoured on that path: the file's `arch "LSB;label=32;scalar=64"` header. foamBinaryToAscii
+// hardcodes 4-byte labels and 8-byte scalars, so a file from an OpenFOAM built WM_LABEL_SIZE=64 or
+// WM_PRECISION_OPTION=SP decodes at the wrong stride -- see the note there.
 #include "cf_types.cuh"
 #include "function1.cuh"   // OF Function1: constant / table
 #include "foam_token_reader.cuh"
