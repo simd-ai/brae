@@ -306,8 +306,14 @@ TurbulenceHookOptions buildTurbulenceHookOptions(
     opt.limGradK             = hin.turbLimGradK;
     opt.relaxEquationK   = hin.relaxEquationK;
     opt.relaxK           = hin.relaxK;
-    opt.relaxEquationEps = hin.relaxEquationEps;
-    opt.relaxEps         = hin.relaxEpsilon;
+    // THE SECOND SCALAR'S OWN relaxation key -- `omega` under kOmegaSST, `epsilon` otherwise. The driver
+    // reads both (relaxEntry(re,"epsilon") and relaxEntry(re,"omega")); taking epsilon's for an SST case
+    // reads a key the case does not name, so relaxEquation comes back false and the omega equation is
+    // solved UNRELAXED. Measured on validation/rhoSST: the unrelaxed solve overshoots omega low in 944
+    // of 3200 cells (min 162.7 against OpenFOAM's 280.2) while the assembled system itself matches the
+    // legacy closure to 1e-4 on every coefficient -- so it looked like an assembly defect and was not.
+    opt.relaxEquationEps = opt.sst ? hin.relaxEquationOmega : hin.relaxEquationEps;
+    opt.relaxEps         = opt.sst ? hin.relaxOmega         : hin.relaxEpsilon;
     opt.tol              = hin.tolTurb;
     opt.relTol           = hin.relTolTurb;
     opt.maxIter          = hin.maxIterTurb;

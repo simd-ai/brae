@@ -733,6 +733,25 @@ __global__ void alphatBndKernel(
 }
 
 
+// EddyDiffusivity::correctNut's BOUNDARY half, as a named entry point so the kOmegaSST closure applies
+// the SAME mask and the SAME per-face Prt rather than carrying a second copy of the rule.
+void alphatBoundary(
+    DeviceBuffer<scalar>&       alphatBnd,
+    int                         nB,
+    const DeviceBuffer<label>&  wallMask,
+    const DeviceBuffer<scalar>& rhoBnd,
+    const DeviceBuffer<scalar>& nutBnd,
+    const DeviceBuffer<scalar>& prtFace)
+{
+    if (nB <= 0) return;
+    alphatBnd.resize(static_cast<std::size_t>(nB));
+    alphatBndKernel<<<nBlk(nB), TPB>>>(nB, wallMask.data(), rhoBnd.data(), nutBnd.data(),
+                                       prtFace.data(), alphatBnd.data());
+    cudaCheck(cudaGetLastError(), "alphat boundary");
+}
+
+
+
 void correctNut(
     DeviceBuffer<scalar>&       nut,
     DeviceBuffer<scalar>&       nutBnd,
@@ -808,13 +827,8 @@ void correctNut(
     // diffusivity. The HOST path was fixed first (rhoSimpleFoam_cpp.cu, measured 1.0 -> 2.25e-04 against
     // OpenFOAM's own written field); this is its device counterpart.
     if (alphatBnd && in.alphatWallMask && in.alphatPrtFace && in.rhoBndFace)
-    {
-        const int nB = dbEps.n;
-        alphatBnd->resize(nB);
-        alphatBndKernel<<<nBlk(nB), TPB>>>(nB, in.alphatWallMask->data(), in.rhoBndFace->data(),
-                                           nutBnd.data(), in.alphatPrtFace->data(), alphatBnd->data());
-        cudaCheck(cudaGetLastError(), "kEpsilon alphat boundary");
-    }
+        alphatBoundary(*alphatBnd, dbEps.n, *in.alphatWallMask, *in.rhoBndFace, nutBnd,
+                       *in.alphatPrtFace);
     (void)wall;
 }
 

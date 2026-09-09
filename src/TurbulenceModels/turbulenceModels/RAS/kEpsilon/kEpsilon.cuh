@@ -285,6 +285,17 @@ void assembleKEqn(
 // `fieldName` makes it emit OpenFOAM's `bounding <field>` line (bound.C:38-46) into boundStore, for the
 // driver to print next to that field's own solve line. It is not optional here: this overload is the one
 // the mirror closure calls, and every one of its call sites has the name.
+// EddyDiffusivity::correctNut's boundary half -- shared with the kOmegaSST closure so the mask and the
+// per-face Prt have ONE implementation. A wall-function face carries its own Prt_, an assignable
+// `calculated` face the model's, and a fixedValue face is left alone.
+void alphatBoundary(
+    DeviceBuffer<scalar>&        alphatBnd,
+    int                          nB,
+    const DeviceBuffer<label>&   wallMask,
+    const DeviceBuffer<scalar>&  rhoBnd,
+    const DeviceBuffer<scalar>&  nutBnd,
+    const DeviceBuffer<scalar>&  prtFace);
+
 void boundField(
     DeviceBuffer<scalar>&        x,
     const DeviceMesh&            dm,

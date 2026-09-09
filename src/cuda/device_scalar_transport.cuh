@@ -381,6 +381,22 @@ void deviceSolveScalarTransport(
     if (DBnd && DBnd->size()) deviceBCLaplacianCoeffsFace(db, *DBnd, lIC, lBC);
     else                      deviceBCLaplacianCoeffs(db, D, lIC, lBC);
     deviceAxpy(-1.0, lIC, aIC); deviceAxpy(-1.0, lBC, aBC);
+    // ...and the OFF-DIAGONALS and BOUNDARY coefficients, which the per-cell columns do not carry.
+    // internalCoeffs never enters the diagonal here -- it is folded in at solve time -- so a wrong
+    // boundary diffusivity leaves every column above intact. Added when the mirror SST closure
+    // matched this one on all of them and still solved to a different omega.
+    {
+        auto l2 = [](const DeviceBuffer<scalar>& b)
+        {
+            if (!b.size()) return double(0);
+            const std::vector<scalar> h = b.host();
+            double s2 = 0; for (scalar v : h) s2 += double(v) * double(v);
+            return std::sqrt(s2);
+        };
+        std::printf("  [legacy] %-5s |upper| %.10g  |lower| %.10g  |iC| %.10g  |bC| %.10g\n",
+                    fieldName, l2(aU), l2(aL), l2(aIC), l2(aBC));
+    }
+
     // interface (cyclic/cyclicAMI) coupling: fold div(phi,f) - laplacian(D,f) at the interface into the diagonal and
     // set the off-diagonal ifCoeff. A scalar is invariant under the cyclic transform (no rotation of the value), so the
     // translational momentum assembly + a plain weighted off-diagonal apply even for a ROTATIONAL interface.
