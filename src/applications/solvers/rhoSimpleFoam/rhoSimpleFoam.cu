@@ -151,7 +151,23 @@ void closedVolumeCorrection(
         num += (double)hpsi[c] * (double)hp[c] * (double)V[c];
         den += (double)hpsi[c] * (double)V[c];
     }
-    if (!(den > 0.0)) return;
+    // SILENTLY SKIPPED before, which is a third answer: OpenFOAM divides by zero and puts a NaN in p,
+    // the host arm now refuses, and this arm quietly dropped the correction and carried on. Every
+    // OpenFOAM liquid returns psi = 0 outright (liquidPropertiesI.H:100-103), so this is the closed-
+    // volume liquid case, and dropping the mass correction there is not an approximation of it -- the
+    // whole point of the term is that a closed volume has no other way to set p's level.
+    //
+    // The test is on `den`, not on the thermo's name, so it is a property of the equation. See the same
+    // guard and the same wording in the host arm (rhoSimpleFoam_cpp.cu).
+    if (den == 0.0)
+        throw std::runtime_error(
+            "rhoSimpleFoam pEqn (CUDA): the case is a CLOSED VOLUME (adjustPhi found no adjustable "
+            "outflow, so p needs a reference) and the thermo's compressibility psi is identically zero. "
+            "OpenFOAM's own correction, p += (initialMass - domainIntegrate(psi*p))/domainIntegrate(psi) "
+            "(pEqn.H:94-98), divides by zero here and puts a NaN in p. Refusing rather than reproducing "
+            "that -- or, as this arm used to, silently dropping the correction that sets p's level. Give "
+            "p a boundary that fixes its value, or use a thermo with a non-zero psi.");
+    if (den < 0.0) return;
     const scalar dp = (scalar)((initialMass - num) / den);
     std::vector<scalar> out(hp);
     for (int c = 0; c < dm.nCells; ++c) out[c] += dp;
