@@ -2045,6 +2045,13 @@ add_test(NAME rho_sst_device_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_sst_device_vs_openfoam.sh)
 set_tests_properties(rho_sst_device_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
 
+# flowRateInletVelocity's value must reach the MOMENTUM ASSEMBLY, in both the mass and the volumetric
+# form, and `rho none` must take OpenFOAM's volumetric branch --
+# tests/rho_flowrate_inlet_vs_openfoam.sh.
+add_test(NAME rho_flowrate_inlet_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_flowrate_inlet_vs_openfoam.sh)
+set_tests_properties(rho_flowrate_inlet_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
 # turbulence->validate() at construction, both models, both arms where the device runs the model:
 # the first iteration must sit on OpenFOAM's -- tests/rho_validate_vs_openfoam.sh.
 add_test(NAME rho_validate_vs_openfoam
