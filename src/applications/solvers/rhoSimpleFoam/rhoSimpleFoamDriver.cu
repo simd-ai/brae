@@ -318,6 +318,8 @@ std::vector<scalar> host(const DeviceBuffer<scalar>& b)
 int runMirrorCuda(const std::string& caseDir)
 {
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
+    setBoundReportPrecision(controlDict.intOr("writePrecision", 6));   // OF TimeIO.C:375-383
+
     const FoamDict fvSolution  = readDict(caseDir + "/system/fvSolution");
     // The unread-entry safety net the legacy drivers have had since item E5, absent on the mirror until
     // queue item 15: an input this arm parses and never applies is reported at scope exit, on the

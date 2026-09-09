@@ -1,4 +1,5 @@
 // rhoSimpleFoamDriver_cpp.cu -- see the header for what this is and why the parse is shared.
+#include "bound_report.cuh"   // setBoundReportPrecision: OF ties Info precision to writePrecision
 #include "rhoSimpleFoamDriver_cpp.cuh"
 
 #include "brae_notice.cuh"
@@ -282,6 +283,8 @@ std::vector<scalar> flatSurfaceBoundary(const SurfaceScalarField& sf,
 int runMirror(const std::string& caseDir)
 {
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
+    setBoundReportPrecision(controlDict.intOr("writePrecision", 6));   // OF TimeIO.C:375-383
+
     const FoamDict fvSolution  = readDict(caseDir + "/system/fvSolution");
     // The unread-entry safety net the legacy drivers have had since item E5, absent on the mirror until
     // queue item 15: an input this arm parses and never applies is reported at scope exit, on the

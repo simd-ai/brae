@@ -1,4 +1,5 @@
 #pragma once
+#include "bound_report.cuh"   // setBoundReportPrecision: OF ties Info precision to writePrecision
 #include "brae_notice.cuh"
 // Which brae solver owns a case -- the one place that maps an OpenFOAM case to a brae executable.
 //
@@ -149,6 +150,10 @@ inline std::string braeSolverList()
 inline void dispatchSolver(const std::string& caseDir, int argc, char** argv)
 {
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
+    // OF: Time::readDict -> IOstream::defaultPrecision(writePrecision) -> Sout, which is what Info
+    // writes through (TimeIO.C:375-383). Set here because every driver reaches the case through this
+    // function, so the one entry cannot be honoured by one arm and dropped by another.
+    setBoundReportPrecision(controlDict.intOr("writePrecision", 6));
     const std::string application = controlDict.wordOr("application", "");
     const std::string ddt = readDdtSchemeWord(caseDir + "/system/fvSchemes");
     const bool transientCase = !ddt.empty() && ddt != "steadyState";
