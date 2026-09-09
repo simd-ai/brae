@@ -252,6 +252,15 @@ DeviceStageDump deviceStageDump()
 // OpenFOAM reaches that updateCoeffs: the momentum assembly, and the velocity correction's
 // correctBoundaryConditions, where rho's patch value has moved since the assembly (the host step carries
 // the sbMatched measurement, queue item 26).
+//
+// f.U*Bnd GO WITH IT. updateCoeffs here ends in `operator==(avgU*n)` -- an assignment to the patch
+// VALUE, not to a refValue that a later evaluate turns into one -- and this driver keeps its own
+// boundary-value arrays which the momentum assembly hands to deviceDivDevReff as UbStored, so
+// fvc::grad(U) inside dev2(T(grad(U))) reads them directly. Updating the refValue alone left that
+// gradient differentiating against 0/U's file seed until the post-solve refresh: on validation/rhoTI the
+// assembly saw 50 where OpenFOAM had 50.687834607787899, worth USrcX 7.3e-06 in the two inlet columns
+// and U 8.945e-06 over the field at iteration 1, decaying as the seed's influence washed out. Invisible
+// in every written field, because the correction's deviceBCValue refreshes the arrays before the write.
 static void updateFlowRateInlets(
     RhoSolverFields&       f,
     const RhoStepInput&    in,
@@ -260,10 +269,17 @@ static void updateFlowRateInlets(
     if (!(in.frMagSf && in.frMdot && in.frNx && in.frNy && in.frNz)) return;
     for (std::size_t k = 0; k < in.frMagSf->size() && k < in.frMdot->size(); ++k)
     {
-        const scalar sumRhoA = deviceDot(f.rhoBnd, (*in.frMagSf)[k]);
+        // OF's divisor: gSum(rho*magSf) for a mass rate, gSum(magSf) for a volumetric one
+        // (flowRateInletVelocityFvPatchVectorField.C:201-237 -- the volumetric branch passes one{}).
+        const bool isMass = !in.frIsMass || k >= in.frIsMass->size() || (*in.frIsMass)[k] != 0;
+        // deviceSumMag, not a plain sum: the mask holds magSf on the patch and 0 elsewhere, both
+        // non-negative, so |.| is the identity here and there is no separate sum reduction to add.
+        const scalar sumRhoA = isMass ? deviceDot(f.rhoBnd, (*in.frMagSf)[k])
+                                      : deviceSumMag((*in.frMagSf)[k]);
         if (sumRhoA <= scalar(0)) continue;
         deviceUpdateFlowRateInlet(dbU, (*in.frMagSf)[k], -(*in.frMdot)[k] / sumRhoA,
-                                  *in.frNx, *in.frNy, *in.frNz);
+                                  *in.frNx, *in.frNy, *in.frNz,
+                                  &f.UxBnd, &f.UyBnd, &f.UzBnd);
     }
 }
 

@@ -220,6 +220,16 @@ public:
     virtual const tensor* wedgeCellT() const { return nullptr; }
     // flowRateInletVelocity: the dict flow rate, so the solver can recompute avgU against the live rho.
     virtual scalar flowRateValue() const { return 0.0; }
+    // Is this a flowRateInletVelocity at all, and is its rate a MASS rate? bcCategory() answers neither:
+    // it reports 9 for the mass form and a plain fixedValue 1 for the volumetric one, so a driver keying
+    // on 9 builds no flow-rate mask for a volumetric inlet and never updates it -- measured on a
+    // rhoSimpleFoam fixture as U 4.33e-03 against real OpenFOAM at iteration 1, with the inlet frozen at
+    // 0/U's seed 50 where OpenFOAM computes 50.687834608. OpenFOAM recomputes BOTH forms every
+    // updateCoeffs (flowRateInletVelocityFvPatchVectorField.C:201-237; the volumetric branch passes
+    // one{} rather than skipping). The divisor is the only difference: gSum(rho*magSf) for a mass rate,
+    // gSum(magSf) for a volumetric one.
+    virtual bool isFlowRateInlet() const { return false; }
+    virtual bool flowRateIsMass()  const { return true; }
 
     // turbulentIntensityKineticEnergyInlet / turbulentMixingLengthDissipationRateInlet: which one, and
     // its coefficient (the intensity, or the mixing length). Exposed for the same reason
@@ -506,8 +516,13 @@ public:
         updateFromDensity(rhop);
     }
     // 9 = flowRateInletVelocity: refValue recomputed per step from the live boundary rho (mass form only).
+    // 9 stays the MASS form's category, because five drivers key on it to mean exactly that and only
+    // the OF-mirror device path has been taught the volumetric divisor. isFlowRateInlet() is the
+    // question a driver should ask; see the base class.
     int bcCategory() const override { return isMass_ ? 9 : 1; }
     scalar flowRateValue() const override { return flowRate_; }
+    bool isFlowRateInlet() const override { return true; }
+    bool flowRateIsMass()  const override { return isMass_; }
 
     // OF updateValues(rho), verbatim. Called where OpenFOAM calls updateCoeffs -- when the momentum
     // equation is assembled -- so the inlet moves with the solution instead of staying at the seed the
@@ -1966,8 +1981,17 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
                 throw std::runtime_error("brae: flowRateInletVelocity 'extrapolateProfile true' on patch " +
                     p.name + " is not implemented (it rescales the extrapolated internal profile rather "
                     "than applying a uniform normal velocity). Remove it to use the uniform form.");
+            // `rho none;` takes OpenFOAM's volumetric branch whatever the rate was called
+            // (flowRateInletVelocityFvPatchVectorField.C:205-207: `volumetric_ || rhoName_ == "none"`
+            // -> updateValues(one{})). Any OTHER non-default rho name would have this patch divide by a
+            // field brae does not look up, so it is refused by name rather than run against rho.
+            if (d.flowRateRhoName != "rho" && d.flowRateRhoName != "none")
+                throw std::runtime_error("brae: flowRateInletVelocity on patch " + p.name + " asks for "
+                    "density field '" + d.flowRateRhoName + "'; only the default 'rho' and 'none' are "
+                    "implemented. OpenFOAM would divide the flow rate by that field's patch values.");
+            const bool isMass = d.flowRateIsMass && d.flowRateRhoName != "none";
             return std::make_unique<FlowRateInletVelocityPatchField>(
-                p, d.flowRate, d.flowRateIsMass, d.rhoInlet, d.valueUniform, d.uniformValue, d.values);
+                p, d.flowRate, isMass, d.rhoInlet, d.valueUniform, d.uniformValue, d.values);
         }
         else throw std::runtime_error("brae: flowRateInletVelocity is a velocity (vector) BC");
     }

@@ -245,9 +245,18 @@ void deviceUpdateTurbulentInletK(const DeviceVectorBoundary& dbU, const DeviceBu
 void deviceUpdateTurbulentInletSecond(const DeviceBoundary& dbK, const DeviceBuffer<label>& mask,
                                       const DeviceBuffer<scalar>& len, scalar Cmu, DeviceBoundary& dbSecond);
 
+// The last three are the caller's STORED boundary-value arrays, written on the masked faces alongside
+// the refValue. OpenFOAM's flowRateInletVelocity assigns its patch VALUE inside updateCoeffs
+// (flowRateInletVelocityFvPatchVectorField.C:194-196, operator==(avgU*n)), so a caller that keeps its
+// own U boundary arrays and assembles against them must be given the new value here -- refreshing only
+// the refValue left rhoTI's momentum assembly differentiating against 0/U's seed (50) where OpenFOAM
+// had 50.687834607787899, worth U 8.9e-06 at iteration 1. Null where the caller re-derives from dbU.
 void deviceUpdateFlowRateInlet(DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& maskMagSf, scalar avgU,
                                const DeviceBuffer<scalar>& nx, const DeviceBuffer<scalar>& ny,
-                               const DeviceBuffer<scalar>& nz);
+                               const DeviceBuffer<scalar>& nz,
+                               DeviceBuffer<scalar>* UxBnd = nullptr,
+                               DeviceBuffer<scalar>* UyBnd = nullptr,
+                               DeviceBuffer<scalar>* UzBnd = nullptr);
 
 // patchInternalField for every boundary face (out[i] = cellField[faceCell[i]]), for BCs whose value is a
 // patch-wide functional of the adjacent cells -- fixedMean is one.

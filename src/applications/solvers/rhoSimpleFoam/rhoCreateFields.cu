@@ -140,7 +140,9 @@ RhoDeviceFields createDeviceFields(
 
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
-            if (hf.U.boundary[pi]->bcCategory() != 9) continue;
+            // isFlowRateInlet(), not bcCategory()==9: the latter is the MASS form alone, and a
+            // volumetric flowRateInletVelocity then got no mask and no update at all.
+            if (!hf.U.boundary[pi]->isFlowRateInlet()) continue;
             d.hasFlowRate = true;
             std::vector<scalar> mask(static_cast<std::size_t>(d.nBndFaces), 0.0);
             label bi = 0;
@@ -156,6 +158,7 @@ RhoDeviceFields createDeviceFields(
             // OpenFOAM re-reads flowRate_->value(t) at every updateCoeffs; steady with a constant entry
             // makes that the seeded value, which the patch object already holds.
             d.frMdot.push_back(hf.U.boundary[pi]->flowRateValue());
+            d.frIsMass.push_back(hf.U.boundary[pi]->flowRateIsMass() ? 1 : 0);
         }
         if (d.hasFlowRate)
         {

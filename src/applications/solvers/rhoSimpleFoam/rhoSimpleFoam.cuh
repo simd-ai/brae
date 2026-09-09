@@ -291,6 +291,9 @@ struct RhoStepInput
     // One magSf mask per flowRateInletVelocity patch, with the prescribed mass flows in the same order.
     const std::vector<DeviceBuffer<scalar>>* frMagSf = nullptr;
     const std::vector<scalar>*               frMdot  = nullptr;
+    // 1 = mass rate (divide by gSum(rho*magSf)), 0 = volumetric (divide by gSum(magSf)). Null or short
+    // means mass, which is what every caller meant before the volumetric form was carried.
+    const std::vector<int>*                  frIsMass = nullptr;
     const DeviceBuffer<scalar>*              frNx    = nullptr;
     const DeviceBuffer<scalar>*              frNy    = nullptr;
     const DeviceBuffer<scalar>*              frNz    = nullptr;

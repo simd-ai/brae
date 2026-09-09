@@ -116,7 +116,11 @@ struct RhoDeviceFields
     bool                              hasMixed    = false;
     bool                              hasFlowRate = false;
     std::vector<DeviceBuffer<scalar>> frMagSf;      // one per flowRate patch: magSf there, 0 elsewhere
-    std::vector<scalar>               frMdot;       // matching prescribed mass flow, same order
+    std::vector<scalar>               frMdot;       // matching prescribed flow rate, same order
+    // 1 where that rate is a MASS rate (divisor gSum(rho*magSf)), 0 where it is VOLUMETRIC
+    // (divisor gSum(magSf)). OpenFOAM recomputes both every updateCoeffs; keying the mask on
+    // bcCategory()==9 built none for the volumetric form and left it frozen at 0/U's seed.
+    std::vector<int>                  frIsMass;
     DeviceBuffer<scalar>              frNx, frNy, frNz;   // boundary-face normals, all faces
 
     bool turbulent = false;

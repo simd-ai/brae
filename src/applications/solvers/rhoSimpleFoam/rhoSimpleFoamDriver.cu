@@ -224,6 +224,7 @@ RhoStepInput buildDeviceStepInput(
     in.hasMixed = dev.hasMixed;
     in.frMagSf  = &dev.frMagSf;
     in.frMdot   = &dev.frMdot;
+    in.frIsMass = &dev.frIsMass;
     in.frNx     = &dev.frNx;
     in.frNy     = &dev.frNy;
     in.frNz     = &dev.frNz;

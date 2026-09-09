@@ -156,6 +156,11 @@ struct PatchFieldData
     // rhoSimpleFoam it is, so the real patch rho is used and rhoInlet is ignored, exactly as OF does.
     bool           hasFlowRate  = false;
     bool           flowRateIsMass = false;
+    // flowRateInletVelocity's `rho` entry (rhoName_, default "rho"). `rho none;` selects OpenFOAM's
+    // volumetric branch even for a massFlowRate (flowRateInletVelocityFvPatchVectorField.C:205-207,
+    // `volumetric_ || rhoName_ == "none"`). Unparsed, the entry was silently dropped and the mass form
+    // ran: brae's inlet read 50.687834608 where OpenFOAM writes 58.85, on BOTH arms.
+    std::string    flowRateRhoName = "rho";
     scalar         flowRate     = 0.0;
     scalar         rhoInlet     = -1.0;   // OF default -VGREAT ("not given")
     bool           extrapolateProfile = false;
@@ -930,6 +935,11 @@ inline FieldData<T> readField(const std::string& path)
                                 "brae: flowRateInletVelocity '" + key + "' given as a Function1 dictionary on patch "
                                 + p.name + "; only 'constant <value>' (or a bare value) is supported.");
                         p.flowRate = std::stod(w);
+                        ts.expect(";");
+                    }
+                    else if (key == "rho")
+                    {
+                        p.flowRateRhoName = ts.next();
                         ts.expect(";");
                     }
                     else if (key == "rhoInlet")

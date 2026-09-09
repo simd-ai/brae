@@ -335,13 +335,22 @@ void frUpdateKernel(
     const scalar* __restrict__ nz,
     scalar* __restrict__ refX,
     scalar* __restrict__ refY,
-    scalar* __restrict__ refZ)
+    scalar* __restrict__ refZ,
+    // The patch VALUE, where the caller keeps one. flowRateInletVelocity::updateValues ends with
+    // `operator==(avgU*n)` (flowRateInletVelocityFvPatchVectorField.C:194-196), and fvPatchField's
+    // operator== is Field::operator=, an outright assignment of the value -- not a refValue that some
+    // later evaluate turns into one. Writing only the coefficient side leaves every consumer that reads
+    // the STORED boundary value differentiating against the file's seed. See deviceUpdateFlowRateInlet.
+    scalar* __restrict__ valX,
+    scalar* __restrict__ valY,
+    scalar* __restrict__ valZ)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n || mask[i] <= scalar(0)) return;
     refX[i] = avgU * nx[i];
     refY[i] = avgU * ny[i];
     refZ[i] = avgU * nz[i];
+    if (valX) { valX[i] = refX[i]; valY[i] = refY[i]; valZ[i] = refZ[i]; }
 }
 
 void deviceUpdateFlowRateInlet(
@@ -350,14 +359,26 @@ void deviceUpdateFlowRateInlet(
     scalar avgU,
     const DeviceBuffer<scalar>& nx,
     const DeviceBuffer<scalar>& ny,
-    const DeviceBuffer<scalar>& nz)
+    const DeviceBuffer<scalar>& nz,
+    DeviceBuffer<scalar>* UxBnd,
+    DeviceBuffer<scalar>* UyBnd,
+    DeviceBuffer<scalar>* UzBnd)
 {
     const int n = dbU.comp[0].n;
     if (n == 0) return;
+    // All three or none: a caller that kept one stale component inside one gradient would be worse than
+    // a caller that kept all three, because the error would not even be a velocity.
+    const bool haveVal = UxBnd && UyBnd && UzBnd
+                      && static_cast<int>(UxBnd->size()) == n
+                      && static_cast<int>(UyBnd->size()) == n
+                      && static_cast<int>(UzBnd->size()) == n;
     frUpdateKernel<<<nBlocks(n), TPB>>>(n, maskMagSf.data(), avgU, nx.data(), ny.data(), nz.data(),
                                         dbU.comp[0].refValue.data(),
                                         dbU.comp[1].refValue.data(),
-                                        dbU.comp[2].refValue.data());
+                                        dbU.comp[2].refValue.data(),
+                                        haveVal ? UxBnd->data() : nullptr,
+                                        haveVal ? UyBnd->data() : nullptr,
+                                        haveVal ? UzBnd->data() : nullptr);
     cudaCheck(cudaGetLastError(), "frUpdate");
 }
 

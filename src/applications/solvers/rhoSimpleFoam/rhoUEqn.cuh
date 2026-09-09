@@ -135,6 +135,10 @@ struct RhoMomentumInput
     // this driver does not evaluate U's boundary before the assembly because OpenFOAM does not either
     // (fvMatrix.C:396 calls updateCoeffs and nothing else). Handing these to deviceDivDevReff is what
     // keeps the device reading the same field the host reference does -- see queue item 30.
+    // BUT updateCoeffs is not nothing: a BC of the fixedValue-derived family ASSIGNS its patch value
+    // there (operator==), so these arrays must be updated by that BC's own updater before the assembly.
+    // The caller owns that; see updateFlowRateInlets in rhoSimpleFoam.cu and the note on
+    // deviceDivDevReff's UbStored parameter.
     const DeviceBuffer<scalar>* UxBndFace = nullptr;
     const DeviceBuffer<scalar>* UyBndFace = nullptr;
     const DeviceBuffer<scalar>* UzBndFace = nullptr;

@@ -48,6 +48,16 @@ void deviceDivDevReff(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                       // boundary before every assembly. The OF-mirror does not (queue items 25, 30), so it
                       // passes its stored values; the drivers that do evaluate leave this null and are
                       // unchanged.
+                      //
+                      // THE EXCEPTION, and it is not a small one: "the value the last evaluate left" is
+                      // true of the mixed family, whose updateCoeffs only sets coefficients, and FALSE of
+                      // the fixedValue-derived family whose updateCoeffs assigns its own value with
+                      // operator== -- flowRateInletVelocity (flowRateInletVelocityFvPatchVectorField.C:
+                      // 194-196) and pressureInletOutletVelocity among them. For those, OpenFOAM's
+                      // grad(U) at the assembly sees the value updateCoeffs JUST wrote. A caller that
+                      // keeps stored arrays must therefore have its per-BC updaters write the value too,
+                      // not only the refValue; deviceUpdateFlowRateInlet takes the arrays for exactly
+                      // this. Missed, it cost U 8.9e-06 at iteration 1 on validation/rhoTI.
                       const DeviceBuffer<scalar>* const* UbStored = nullptr,
                       // grad(U) "cellLimited Gauss linear <k>" coefficient; 0 = unlimited.
                       //
