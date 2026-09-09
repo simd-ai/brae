@@ -110,6 +110,16 @@ struct EnergyInput
     // The `k` of the gradient each linearUpwind statement NAMES.
     scalar    gradHeLimitK       = 0.0;
     scalar    gradKELimitK       = 0.0;
+    // limitedLinear's own `k`, raw as the case writes it -- limitedLinearWeights computes 2/max(k,SMALL)
+    // itself, so handing it a pre-divided twoByk runs `limitedLinear 2` under the case's own 1.
+    scalar    schemeCoeffHe      = 1.0;
+    scalar    schemeCoeffKE      = 1.0;
+    // ...and the cellLimited k of the LIMITER's gradient, which is a DIFFERENT lookup from the two
+    // above: OpenFOAM builds the limiter from fvc::grad(lPhi) (LimitedScheme.C:56-59), resolved under
+    // `grad(e)` / `grad(Ekp)` through the case's gradSchemes, while gradHeLimitK holds the gradient
+    // that linearUpwind names in its own div entry. They coincide only until a case names both.
+    scalar    limGradHeK         = 0.0;
+    scalar    limGradKEK         = 0.0;
     bool      correctedLaplacian = false;
     scalar    snGradLimitCoeff   = 0.0;
     bool      hasMRF             = false;

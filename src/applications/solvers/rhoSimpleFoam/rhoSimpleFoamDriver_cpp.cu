@@ -104,6 +104,37 @@ StepInput buildStepInput(
         in.boundedHe     = dHe.bounded;
         in.boundedKE     = dKE.bounded;
         in.schemeCoeffU  = dU.coeff;      // RAW k: the weights functions compute twoByk (scheme_parse.cuh)
+        in.schemeCoeffHe = dHe.coeff;     // ...and so do the energy pair's; raw, for the same reason
+        in.schemeCoeffKE = dKE.coeff;
+
+        // THE LIMITER'S GRADIENT, resolved and CHECKED. OpenFOAM builds limitedLinear's limiter from
+        // fvc::grad(lPhi) (LimitedScheme.C:56-59), which goes through the case's own gradSchemes under
+        // `grad(e)` / `grad(Ekp)`. brae computes Gauss linear gradients and nothing else, so a case
+        // resolving that key to anything else would get a limiter built from a different gradient --
+        // and the scheme would carry the case's name while computing something else.
+        //
+        // Measured on validation/rhoLU at a developed state: swapping the limiter gradient from Gauss
+        // linear to leastSquares moves the assembled energy diagonal by 9.1e-03 and its source by
+        // 2.8e-03. That is a different discretisation, not an approximation, so it refuses. gasMixing
+        // is the case this stops: it says `gradSchemes { default leastSquares; }`, and without this
+        // check clearing the div-scheme blocker would have made it run and be quietly wrong.
+        auto resolveLimiterGrad = [&](DivScheme sc, const std::string& fld, scalar& out)
+        {
+            if (sc != DivScheme::limitedLinear) return;
+            const FieldGradScheme gs = parseFieldGradScheme(caseDir, fld);
+            if (!gs.gaussLinear)
+                throw std::runtime_error(
+                    "rhoSimpleFoam buildStepInput: div(phi," + fld + ") is `Gauss limitedLinear`, whose "
+                    "limiter OpenFOAM builds from fvc::grad(" + fld + ") through the case's gradSchemes "
+                    "(LimitedScheme.C:56-59). This case resolves grad(" + fld + ") to `" + gs.raw +
+                    "`, and brae computes Gauss linear gradients only. Measured on validation/rhoLU at a "
+                    "developed state, swapping that gradient moves the assembled energy diagonal by "
+                    "9.1e-03 and its source by 2.8e-03 -- a different discretisation, not an "
+                    "approximation. Refusing rather than running the limiter off the wrong gradient.");
+            out = gs.cellLimitK;
+        };
+        resolveLimiterGrad(in.schemeHe, f.heName, in.limGradHeK);
+        resolveLimiterGrad(in.schemeKE, keName,   in.limGradKEK);
 
         DeviceSimpleControls sctl;
         parseFvSchemesControls(caseDir, sctl);

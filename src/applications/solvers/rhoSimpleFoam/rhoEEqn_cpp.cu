@@ -40,8 +40,10 @@ void refuseUnsupported(const EnergyInput& in)
             "Not implemented; refusing rather than silently solving a different equation.");
     const bool luKE = (in.schemeKE == DivScheme::linearUpwind);
     const bool luHe = (in.schemeHe == DivScheme::linearUpwind);
-    const bool okKE = (in.schemeKE == DivScheme::upwind) || luKE;
-    const bool okHe = (in.schemeHe == DivScheme::upwind) || luHe;
+    const bool llKE = (in.schemeKE == DivScheme::limitedLinear);
+    const bool llHe = (in.schemeHe == DivScheme::limitedLinear);
+    const bool okKE = (in.schemeKE == DivScheme::upwind) || luKE || llKE;
+    const bool okHe = (in.schemeHe == DivScheme::upwind) || luHe || llHe;
     if (in.snGradLimitCoeff != 0.0)
         throw std::runtime_error(
             "rhoSimpleFoam EEqn_cpp: a `limited <k> corrected` laplacian was asked for. brae's laplacian "
@@ -50,10 +52,12 @@ void refuseUnsupported(const EnergyInput& in)
             "running the uncapped form under the limited name.");
     if (!okKE || !okHe)
         throw std::runtime_error(
-            "rhoSimpleFoam EEqn_cpp: only `Gauss upwind` and `Gauss linearUpwind <grad>` are ported for "
-            "the energy convection terms -- those are what every rhoSimpleFoam tutorial that names "
-            "div(phi,e|h) and div(phi,Ekp|K) asks for. A different scheme would be a different "
-            "discretisation; refusing rather than substituting one brae does have.");
+            "rhoSimpleFoam EEqn_cpp: only `Gauss upwind`, `Gauss linearUpwind <grad>` and `Gauss "
+            "limitedLinear <k>` are ported for the energy convection terms. div(phi,e|h) and "
+            "div(phi,Ekp|K) are SEPARATE fvSchemes entries and each is checked on its own. A different "
+            "scheme would be a different discretisation; refusing rather than substituting one brae "
+            "does have. Note that limitedLinear's limiter is built from the case's own grad(<field>) "
+            "scheme, which buildStepInput resolves and refuses when it is not Gauss linear.");
 }
 
 // gaussConvectionScheme::fvcDiv, plus boundedConvectionScheme::fvcDiv when `bounded`.
@@ -65,6 +69,25 @@ void refuseUnsupported(const EnergyInput& in)
 //     internal faces:  sum_f phi_f * vf_f      with the scheme's face value, owner +, neighbour -
 //     boundary faces:  phi_b * vf_b            the patch value, as OpenFOAM's surfaceIntegrate does
 //     bounded:        -(sum_f phi_f) * vf[c]   boundedConvectionScheme.C, the fvcDiv form
+// THE LIMITER'S GRADIENT, in ONE place so the implicit and explicit terms cannot drift about it.
+// OpenFOAM's LimitedScheme::calcLimiter takes fvc::grad(lPhi) (LimitedScheme.C:56-59); for a scalar
+// limitedLinear the LimitFunc is the identity (LimitFuncs.C:32-50), so lPhi is the field itself and the
+// gradient is the case's grad(<field>) scheme -- resolved and refused in buildStepInput, and its
+// cellLimited coefficient arrives here as `cellLimitK`.
+std::vector<vector> limiterGrad(
+    const std::vector<scalar>&              vf,
+    const std::vector<std::vector<scalar>>& vfBnd,
+    scalar                                  cellLimitK,
+    const PrimitiveMesh&                    m,
+    const FvGeometry&                       g,
+    const std::vector<FvPatch>&             patches)
+{
+    std::vector<vector> gr = fvc::gaussGrad(vf, vfBnd, m, g, patches);
+    if (cellLimitK > 0.0) cpu::cellLimitGrad(gr, vf, vfBnd, cellLimitK, m, g, patches);
+    return gr;
+}
+
+
 std::vector<scalar> explicitConvectionDivExtensive(
     const std::vector<scalar>&              phi,
     const std::vector<std::vector<scalar>>& phiBnd,
@@ -72,6 +95,8 @@ std::vector<scalar> explicitConvectionDivExtensive(
     const std::vector<std::vector<scalar>>& vfBnd,
     DivScheme                               scheme,
     scalar                                  gradLimitK,
+    scalar                                  schemeCoeff,
+    scalar                                  limGradK,
     bool                                    bounded,
     const PrimitiveMesh&                    m,
     const FvGeometry&                       g,
@@ -84,12 +109,25 @@ std::vector<scalar> explicitConvectionDivExtensive(
 
     std::vector<scalar> d(nC, 0.0);
 
-    // upwind face value: pos0(phi) -- OpenFOAM's `>= 0` convention, owner on a zero flux.
+    // The face WEIGHT, from the scheme. Empty means pos0(phi) -- OpenFOAM's `>= 0` convention, owner on
+    // a zero flux -- which is upwind, and is also what linearUpwind's base weight is before its
+    // deferred correction is added below.
+    std::vector<scalar> w;
+    if (scheme == DivScheme::limitedLinear)
+    {
+        const std::vector<vector> gradVf = limiterGrad(vf, vfBnd, limGradK, m, g, patches);
+        // limitedLinearWeights reads only .internal (rhoUEqn_cpp.cu uses the same shim), and takes the
+        // RAW k -- it computes 2/max(k,SMALL) itself.
+        GeometricField<scalar> shim;
+        shim.internal = vf;
+        w = cpu::limitedSchemes::limitedLinearWeights(phi, shim, gradVf, schemeCoeff, m, g);
+    }
     for (label f = 0; f < nIf; ++f)
     {
         const scalar pf = phi[f];
-        const scalar vfF = (pf >= 0.0) ? vf[own[f]] : vf[nei[f]];
-        const scalar flux = pf * vfF;
+        const scalar wf = w.empty() ? ((pf >= 0.0) ? scalar(1) : scalar(0)) : w[f];
+        // surfaceInterpolationScheme::dotInterpolate -- w*own + (1-w)*nei.
+        const scalar flux = pf * (wf * vf[own[f]] + (scalar(1) - wf) * vf[nei[f]]);
         d[own[f]] += flux;
         d[nei[f]] -= flux;
     }
@@ -191,7 +229,8 @@ std::vector<scalar> kineticEnergyDivergence(
     const std::vector<scalar>              ke    = kineticEnergy(in.heName, U, p, rho);
     const std::vector<std::vector<scalar>> keBnd = kineticEnergyBoundary(in.heName, U, p, rho, patches);
     return explicitConvectionDivExtensive(
-        *in.phi, *in.phiBnd, ke, keBnd, in.schemeKE, in.gradKELimitK, in.boundedKE, m, g, patches);
+        *in.phi, *in.phiBnd, ke, keBnd, in.schemeKE, in.gradKELimitK,
+        in.schemeCoeffKE, in.limGradKEK, in.boundedKE, m, g, patches);
 }
 
 
@@ -209,7 +248,25 @@ FvScalarMatrix assembleEEqn(
     const label nC = m.nCells();
 
     // fvm::div(phi, he) -- implicit convection of the energy variable by the MASS flux.
-    FvScalarMatrix M = fvm::div(*in.phi, *in.phiBnd, he, m, patches);
+    //
+    // limitedLinear is a WEIGHT change, not a correction, so it goes through fvm::div's weighted
+    // overload rather than being added to the source afterwards -- the same shape the turbulence
+    // closure's divWithScheme uses, and the same one rhoUEqn_cpp takes for the momentum equation.
+    FvScalarMatrix M;
+    if (in.schemeHe == DivScheme::limitedLinear)
+    {
+        std::vector<std::vector<scalar>> heB(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi) heB[pi] = he.boundary[pi]->value();
+        const std::vector<vector> gradHe = limiterGrad(he.internal, heB, in.limGradHeK, m, g, patches);
+        M = fvm::div(*in.phi, *in.phiBnd, he,
+                     cpu::limitedSchemes::limitedLinearWeights(*in.phi, he, gradHe,
+                                                               in.schemeCoeffHe, m, g),
+                     m, patches);
+    }
+    else
+    {
+        M = fvm::div(*in.phi, *in.phiBnd, he, m, patches);
+    }
 
     // linearUpwind's deferred correction on the IMPLICIT term, subtracted into the source exactly as in
     // the momentum equation (`fvm += ...` means `source -= ...`).

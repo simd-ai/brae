@@ -589,6 +589,10 @@ Residuals rhoSimpleStep(
         ein.schemeHe          = in.schemeHe;
         ein.schemeKE          = in.schemeKE;
         ein.gradHeLimitK      = in.gradHeLimitK;
+        ein.schemeCoeffHe     = in.schemeCoeffHe;
+        ein.schemeCoeffKE     = in.schemeCoeffKE;
+        ein.limGradHeK        = in.limGradHeK;
+        ein.limGradKEK        = in.limGradKEK;
         ein.gradKELimitK      = in.gradKELimitK;
         ein.correctedLaplacian = in.correctedLaplacian;
         ein.snGradLimitCoeff  = in.snGradLimitCoeff;
@@ -893,6 +897,24 @@ Residuals rhoSimpleStep(
             num += (double)f.psi[c] * (double)f.p.internal[c] * (double)g.V()[c];
             den += (double)f.psi[c] * (double)g.V()[c];
         }
+        // A psi-FREE thermo divides by zero here. Every OpenFOAM liquid returns psi = 0 outright
+        // (liquidPropertiesI.H:100-103, `psi(scalar, scalar) { return 0; }` -- verified on a real run:
+        // squareBendLiq's thermo:psi is `internalField uniform 0`), so on a closed volume this
+        // correction is (initialMass - 0)/0. OpenFOAM computes the NaN and carries it into p.
+        //
+        // The test is on `den`, NOT on the thermo model's name: it is a property of the EQUATION, so a
+        // rhoConst or perfectFluid thermo gets the same guard without anyone remembering to add it.
+        // Refusing rather than reproducing OpenFOAM's NaN -- brae's contract is to say what it cannot
+        // do, and "p has no reference and psi cannot supply one" is a case with no answer, not a case
+        // brae solves differently.
+        if (den == 0.0)
+            throw std::runtime_error(
+                "rhoSimpleFoam pEqn: the case is a CLOSED VOLUME (adjustPhi found no adjustable outflow, "
+                "so p needs a reference) and the thermo's compressibility psi is identically zero. "
+                "OpenFOAM's own correction, p += (initialMass - domainIntegrate(psi*p))/domainIntegrate("
+                "psi) (pEqn.H:94-98), divides by zero here and puts a NaN in p. Refusing rather than "
+                "reproducing that: give p a boundary that fixes its value, or use a thermo with a "
+                "non-zero psi.");
         const scalar dp = (scalar)(((double)f.initialMass - num) / den);
         for (label c = 0; c < nC; ++c) f.p.internal[c] += dp;
     }

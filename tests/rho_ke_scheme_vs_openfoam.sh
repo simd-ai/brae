@@ -115,9 +115,20 @@ sys.exit(0 if ok else 1)
 PYEOF
 say "div(phi,K) is read from its own entry, both directions, both arms" "$([ $fail = 0 ] && echo ok || echo FAIL)"
 
-# ARM C: an unported scheme on K alone must refuse BY NAME on both arms, with the energy entry ported.
+# ARM C: an UNPORTED scheme on K alone must still refuse BY NAME, per arm.
+#
+# limitedLinear used to be that scheme on both arms. The HOST now assembles it -- the two entries stay
+# independent, which tests/eeqn_limitedlinear_vs_openfoam.sh checks against OpenFOAM at a developed
+# state -- so what belongs here is that the host RUNS it while the CUDA arm, whose closure still
+# assembles upwind only, refuses it by name. An arm that cannot compute a scheme must say so; an arm
+# that can must not be refused for it.
 stage "$W/C" "$UP" 'bounded Gauss limitedLinear 1'
-for arm in 1 cuda; do
+out=$( cd "$W/C" && BRAE_RHOSIMPLEFOAM_MIRROR=1 "$BIN" -case "$W/C" 2>&1 || true )
+[ -d "$W/C/$N" ] \
+    && say "limitedLinear on div(phi,K) alone RUNS on the host arm, which assembles it" ok \
+    || { echo "$out" | tail -3; say "limitedLinear on div(phi,K) alone RUNS on the host arm, which assembles it" FAIL; }
+rm -rf "$W/C/$N"
+for arm in cuda; do
     out=$( cd "$W/C" && BRAE_RHOSIMPLEFOAM_MIRROR=$arm "$BIN" -case "$W/C" 2>&1 || true )
     echo "$out" | grep -q "div(phi,Ekp|K)" && ! [ -d "$W/C/$N" ] \
         && say "limitedLinear on div(phi,K) alone refuses by name (arm $arm)" ok \

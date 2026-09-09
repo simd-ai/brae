@@ -96,6 +96,12 @@ struct StepInput
     bool      boundedHe = false;
     bool      boundedKE = false;
     scalar    schemeCoeffU     = 1.0;
+    // The energy pair's own limitedLinear coefficients and limiter-gradient limiters -- see EnergyInput,
+    // which documents why the limiter's gradient is a different lookup from linearUpwind's.
+    scalar    schemeCoeffHe    = 1.0;
+    scalar    schemeCoeffKE    = 1.0;
+    scalar    limGradHeK       = 0.0;
+    scalar    limGradKEK       = 0.0;
     scalar    gradULimitK      = 0.0;
     scalar    gradHeLimitK     = 0.0;
     scalar    gradKELimitK     = 0.0;
