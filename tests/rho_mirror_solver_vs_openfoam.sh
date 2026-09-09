@@ -261,13 +261,16 @@ echo "$sout" | grep -q "BRAE_RHOSIMPLEFOAM_MIRROR is 'gpu'" \
     || { echo "$sout" | tail -3; say "an unknown mirror selector is refused by name" FAIL; }
 
 
-# ---- arm 10: kOmegaSST is REFUSED on the CUDA arm, and RUNS on the host arm -----------------------
-# The device projection gates its whole closure set-up on epsilon being present, and kOmegaSST leaves
-# epsilon empty (its second scalar is omega). That skipped the nut upload too, which lives inside the
-# same block -- so an SST case ran with muEff = the LAMINAR viscosity while reporting kOmegaSST. A
-# wrong run, not a missing feature, and invisible from the device side because every buffer it would
-# have filled is simply absent. The host arm carries kOmegaSST, which is what makes this arm
-# discriminating: the same case must refuse on one arm and RUN on the other.
+# ---- arm 10: kOmegaSST RUNS on BOTH arms, and an unimplemented RAS model still refuses -----------
+# History, because the assertion inverted: the device projection used to gate its whole closure set-up
+# on epsilon being present, and kOmegaSST leaves epsilon empty (its second scalar is omega). That
+# skipped the nut upload too, so an SST case ran with muEff = the LAMINAR viscosity while reporting
+# kOmegaSST -- a wrong run, not a missing feature. The arm then asserted a REFUSAL while the mirror
+# device closure was written but unvalidated. It is validated now
+# (tests/rho_sst_device_vs_openfoam.sh: rhoSST every field <= 1.3e-12 against real OpenFOAM, rhoTI
+# k/omega/nut <= 5.3e-04, with the legacy closure through the same harness failing the bound by 3e+07),
+# so what this arm holds is the opposite: the same case must RUN on both arms and produce a turbulent
+# run, while a model neither arm implements must still refuse BY NAME.
 if [ -d "$ROOT/validation/sbMatched" ]; then
     SST="$W/sst"; stage "$SST" "$ROOT/validation/sbMatched" 3
     sed -i 's/RASModel *kEpsilon;/RASModel        kOmegaSST;/' "$SST/constant/turbulenceProperties"
@@ -276,26 +279,31 @@ if [ -d "$ROOT/validation/sbMatched" ]; then
     sed -i 's|div(phi,epsilon)    $turbulence;|div(phi,epsilon)    $turbulence;\n    div(phi,omega)      $turbulence;|' "$SST/system/fvSchemes"
     grep -q "kOmegaSST" "$SST/constant/turbulenceProperties" || { echo "FAIL: the SST mutation did not apply"; exit 1; }
     cout=$( cd "$SST" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BIN" -case "$SST" 2>&1 || true )
-    # The reason moved: the device closure now EXISTS (kOmegaSST.cu) but is not validated, so the
-    # refusal names that rather than "no closure at all". What must hold is unchanged -- the arm refuses
-    # by model name and writes nothing -- so the assertion is on the model and on the absence of output,
-    # not on a sentence that is free to be corrected.
-    echo "$cout" | grep -q "RASModel 'kOmegaSST'" && ! [ -d "$SST/3" ] \
-        && say "kOmegaSST is refused by name on the CUDA arm" ok \
-        || { echo "$cout" | tail -3; say "kOmegaSST is refused by name on the CUDA arm" FAIL; }
-    # ...and the opt-in really does reach the closure, so the refusal is a POLICY and not the absence of
-    # an implementation. If this ran nothing, the arm above would be passing for the wrong reason.
-    oout=$( cd "$SST" && BRAE_SST_DEVICE=1 BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BIN" -case "$SST" 2>&1 || true )
-    echo "$oout" | grep -q "^Time = " \
-        && say "...and BRAE_SST_DEVICE=1 reaches the unvalidated closure (the refusal is a policy)" ok \
-        || { echo "$oout" | tail -3; say "...and BRAE_SST_DEVICE=1 reaches the unvalidated closure (the refusal is a policy)" FAIL; }
+    echo "$cout" | grep -q "^Time = " && [ -d "$SST/3" ] \
+        && say "kOmegaSST runs on the CUDA arm by default (no opt-in)" ok \
+        || { echo "$cout" | tail -3; say "kOmegaSST runs on the CUDA arm by default (no opt-in)" FAIL; }
+    # ...and it is a TURBULENT run, not the laminar one this arm was written for. nut must have moved
+    # off its initial field: a closure that never ran leaves it exactly where createFields put it.
+    echo "$cout" | grep -q "kOmegaSST" \
+        && [ -f "$SST/3/nut" ] && ! cmp -s "$SST/0/nut" "$SST/3/nut" \
+        && say "...and it is a turbulent run: nut is written and has moved" ok \
+        || say "...and it is a turbulent run: nut is written and has moved" FAIL
     rm -rf "$SST/3"
     hout=$( cd "$SST" && BRAE_RHOSIMPLEFOAM_MIRROR=1 "$BIN" -case "$SST" 2>&1 || true )
     echo "$hout" | grep -q "^Time = " \
-        && say "...and the SAME case runs on the host arm (the refusal is device-specific)" ok \
-        || { echo "$hout" | tail -3; say "...and the SAME case runs on the host arm (the refusal is device-specific)" FAIL; }
+        && say "...and the SAME case runs on the host arm" ok \
+        || { echo "$hout" | tail -3; say "...and the SAME case runs on the host arm" FAIL; }
+    # THE CONTROL that the refusal still exists at all: a RAS model neither arm implements must refuse
+    # BY NAME and write nothing. Without it the two arms above would pass equally well against a
+    # createFields that had simply stopped checking the model.
+    rm -rf "$SST/3"
+    sed -i 's/RASModel *kOmegaSST;/RASModel        realizableKE;/' "$SST/constant/turbulenceProperties"
+    rout=$( cd "$SST" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BIN" -case "$SST" 2>&1 || true )
+    echo "$rout" | grep -q "RASModel 'realizableKE'" && ! [ -d "$SST/3" ] \
+        && say "control: an unimplemented RAS model is still refused by name" ok \
+        || { echo "$rout" | tail -3; say "control: an unimplemented RAS model is still refused by name" FAIL; }
 else
-    say "sbMatched missing -- SST refusal arm skipped" SKIP
+    say "sbMatched missing -- SST arm skipped" SKIP
 fi
 
 

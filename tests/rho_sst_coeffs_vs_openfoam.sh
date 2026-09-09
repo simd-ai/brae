@@ -8,9 +8,11 @@
 # changes nothing. And where the case names NO omega factor OpenFOAM's fvMatrix::relax() does nothing
 # (fvMatrix.C:1250-1263), while brae's relaxMatrix at 1.0 still applied the dominance clamp.
 #
-# Host arm only: the device refuses kOmegaSST by name (rho_mirror_solver_vs_openfoam arm 10). Every
-# linear solver is pinned to 1e-12/0 on every run so the TRAJECTORIES are comparable, and the comparison
-# is taken at N iterations, mid-transient -- the relaxation arms have no converged signature at all.
+# Host arm only, because these arms are about the READING path -- which dictionary entries reach the
+# closure -- and the host is where the SST coefficients, Prt and the omega factor are parsed. The device
+# arm carries its own gate (rho_sst_device_vs_openfoam). Every linear solver is pinned to 1e-12/0 on
+# every run so the TRAJECTORIES are comparable, and the comparison is taken at N iterations,
+# mid-transient -- the relaxation arms have no converged signature at all.
 #
 #   ARM 1  kOmegaSSTCoeffs { betaStar 0.1; a1 0.4; gamma1 0.6; Prt 0.85; }  -> brae matches OpenFOAM
 #   ARM 2  equations { omega 0.4; }                                          -> brae matches OpenFOAM
@@ -20,8 +22,10 @@
 # TAKEN AT ONE ITERATION, on purpose. The closure runs last in the iteration, so every coefficient,
 # Prt (through validate()'s alphat) and the omega factor already decide the fields written at t=1 --
 # and at t=1 the host mirror sits on OpenFOAM at the floor (omega/T/U ~7e-13, k ~8e-13 once the
-# wall functions read the STORED wall nut -- see rho_validate_vs_openfoam.sh). From t=2 an SST-only
-# residual (k/omega/nut ~2e-08) grows to 1e-03 by t=10 and would swallow the arms; it is queued.
+# wall functions read the STORED wall nut -- see rho_validate_vs_openfoam.sh). The SST-only residual
+# that used to grow from t=2 (k/omega/nut ~2e-08 at t=2, 1e-03 by t=10) was the DEVICE arm's F1 taken on
+# the owner cell instead of on the patch face; it is fixed and gated in rho_sst_device_vs_openfoam.
+# N stays at 1 because these arms only need the reading path, which is decided before the first write.
 # Measured at t=1:
 #   fixed       every arm: omega 5.5e-13..9.1e-13, T 7.4e-13, U 5.8e-13, k ~8e-13
 #   controls    OpenFOAM's own answers move by 1e5..1e8 x the omega bound on each arm
