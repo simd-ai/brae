@@ -372,7 +372,8 @@ void wallOmegaG0Kernel(
     int nutWall,
     scalar* __restrict__ omega0,
     scalar* __restrict__ G0,
-    const scalar* __restrict__ nuFace)   // compressible: per-wall-face nu, null -> the scalar nu
+    const scalar* __restrict__ nuFace,   // compressible: per-wall-face nu, null -> the scalar nu
+    const scalar* __restrict__ nutwStored)   // the STORED wall nut, wall-face order; null -> recompute
 {
     // One thread per wall CELL, fixed face order, single write -- the kEpsilon twin. See buildDeviceWallData.
     const int wc = blockIdx.x * blockDim.x + threadIdx.x;
@@ -389,8 +390,20 @@ void wallOmegaG0Kernel(
         // with a hot wall that is several times the freestream value, so the scalar fallback is only for the
         // constant-property incompressible case.
         const scalar nuw = nuFace ? nuFace[wf] : nu;
-        g0 += wallProductionG0(c, wf, y, dc, kc, iN, wux, wuy, wuz, Ux, Uy, Uz, nuw,
-                               yplLam, Cmu25, kappa, E, atmZ0, atmBoundNut, nutWall);
+        if (nutwStored)
+        {
+            // G0 = w*(nutw + nuw)*|snGrad U|*Cmu25*sqrt(k)/(kappa*y) with nutw the STORED patch value,
+            // as omegaWallFunctionFvPatchScalarField::calculate reads it (.C:199-200, used at :335-340).
+            // The recomputed form below is exact only when k and nu_w have not moved since that value
+            // was written -- and in rhoSimpleFoam p and h are solved BEFORE turbulence.correct(), so
+            // nu_w = mu*R*T_w/p_w has always moved. The kEpsilon twin carries the same branch.
+            const scalar gx = (wux[wf] - Ux[c]) * dc, gy = (wuy[wf] - Uy[c]) * dc, gz = (wuz[wf] - Uz[c]) * dc;
+            const scalar magGradUw = sqrt(gx*gx + gy*gy + gz*gz);
+            g0 += iN * (nutwStored[wf] + nuw) * magGradUw * Cmu25 * sqrt(kc) / (kappa * y);
+        }
+        else
+            g0 += wallProductionG0(c, wf, y, dc, kc, iN, wux, wuy, wuz, Ux, Uy, Uz, nuw,
+                                   yplLam, Cmu25, kappa, E, atmZ0, atmBoundNut, nutWall);
         const scalar omegaVis = 6.0 * nuw / (beta1 * y * y);
         const scalar omegaLog = sqrt(kc) / (Cmu25 * kappa * y);
         w0 += iN * sqrt(omegaVis*omegaVis + omegaLog*omegaLog);   // BINOMIAL n=2 (distinct omega wall value)
@@ -716,7 +729,8 @@ void deviceWallOmegaG0(
     int nutWall,
     scalar atmZ0,
     bool   atmBoundNut,
-    const DeviceBuffer<scalar>* nuFace)   // compressible: nu = mu_b/rho_b per WALL face (OF nu(patchi))
+    const DeviceBuffer<scalar>* nuFace,   // compressible: nu = mu_b/rho_b per WALL face (OF nu(patchi))
+    const DeviceBuffer<scalar>* nutwStored)   // the STORED wall nut, wall-face order; null -> recompute
 {
     const int nC = static_cast<int>(k.size());
     omega0.resize(nC); G0.resize(nC);
@@ -729,7 +743,8 @@ void deviceWallOmegaG0(
                                                    w.wfUwy.data(), w.wfUwz.data(), w.invNw.data(), k.data(), Ux.data(),
                                                    Uy.data(), Uz.data(), nu, yplLam, Cmu25, co.kappa, co.E, atmZ0, atmBoundNut, co.beta1,
                                                    nutWall, omega0.data(), G0.data(),
-                                                   (nuFace && nuFace->size()) ? nuFace->data() : nullptr);
+                                                   (nuFace && nuFace->size()) ? nuFace->data() : nullptr,
+                                                   (nutwStored && nutwStored->size()) ? nutwStored->data() : nullptr);
     cudaCheck(cudaGetLastError(), "wallOmegaG0");
 }
 

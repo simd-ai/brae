@@ -72,7 +72,11 @@ void deviceWallOmegaG0(const DeviceWallData& w, const DeviceBuffer<scalar>& k, c
                        const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz, scalar nu,
                        DeviceBuffer<scalar>& omega0, DeviceBuffer<scalar>& G0, const KOmegaSSTCoeffs& co, int nutWall = 0,
                        scalar atmZ0 = 0.0, bool atmBoundNut = true,   // z0>0 -> atmNutkWallFunction (rough) for the G0 wall nut
-                       const DeviceBuffer<scalar>* nuFace = nullptr);   // compressible: nu = mu_b/rho_b per WALL face
+                       const DeviceBuffer<scalar>* nuFace = nullptr,   // compressible: nu = mu_b/rho_b per WALL face
+                       // The STORED wall nut in WALL-face order, as omegaWallFunction reads it
+                       // (omegaWallFunctionFvPatchScalarField.C:199-200). Null keeps the
+                       // recomputed nutkWallFunction -- the kEpsilon twin has the same argument.
+                       const DeviceBuffer<scalar>* nutwStored = nullptr);
 
 // nut at boundary faces for the SST, evaluated as OF's field assignment fills it (see the .cu).
 void deviceSSTNutBoundary(const DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& kBnd,
