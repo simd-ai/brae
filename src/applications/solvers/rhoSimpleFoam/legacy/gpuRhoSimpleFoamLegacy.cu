@@ -197,9 +197,33 @@ int main(int argc, char** argv)
         // brae reads U before p and T, so at construction it had no density and fell back to rhoInlet.
         // Measured on squareBend: avgU 467.9 against OF's 611.7, ratio 1.3074, and the inlet momentum
         // boundaryCoeffs 0.765x OF's while every internalCoeff matched to 8 s.f.
+        //
+        // ONLY WHERE THE CASE GAVE NO `value`. OpenFOAM's dict constructor is
+        //     if (!this->readValueEntry(dict)) { evaluate(...); }
+        // (flowRateInletVelocityFvPatchVectorField.C:93-97) -- the file's `value` wins outright, and the
+        // computed avgU replaces it only at the first updateCoeffs, which is INSIDE the momentum matrix
+        // constructor and therefore AFTER compressibleCreatePhi.H has already built phi from the seeded U.
+        // Re-seeding unconditionally moved brae's initial flux away from OpenFOAM's. Measured on
+        // validation/rhoFR against real OpenFOAM at tolerance 1e-14 / relTol 0, by the seed alone:
+        //     no `value` (OF evaluates too)     U 4.8e-12 at t=1,  1.1e-11 at t=20   <- this driver's floor
+        //     `value uniform (5 0 0)` (shipped) U 6.5e-06,         1.5e-06
+        //     `value uniform (0 0 0)`           U 2.7e-02,         6.5e-03
+        // the last being OpenFOAM's own angledDuctExplicitFixedCoeff tutorial's entry, so it is a live
+        // configuration and not a synthetic seed. OpenFOAM's own seeded and unseeded answers differ by
+        // exactly 6.5e-06 too, so what brae was computing with a `value` was OpenFOAM's answer WITHOUT one.
+        //
+        // The rho below is the adjacent CELL's, where OpenFOAM's updateValues sums the PATCH field
+        // (.C:217-220). That is inert, and provably so rather than merely unmeasured: the seeded U_b
+        // reaches the solution only through the initial phi, which weights it by a density again, so the
+        // product rho*U_b is the prescribed mdot/A whichever density either side divides by, and U_b
+        // itself is overwritten by updateCoeffs before the first momentum assembly. Checked with T's
+        // inlet at 600 K against a 300 K interior, where rho_b is half rho_cell: brae seeds 5.168 and
+        // OpenFOAM 10.336, and every field still agrees to 2.7e-12. It stops being inert the moment the
+        // initial flux below is built with a DIFFERENT density from the one used here -- keep them paired.
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
             if (U.boundary[pi]->bcCategory() != 9) continue;          // 9 = mass-form flowRateInletVelocity
+            if (U.boundary[pi]->flowRateHadValue()) continue;         // the case's `value` is OF's answer here
             const scalar mdot = U.boundary[pi]->flowRateValue();
             scalar sumRhoA = 0.0;
             for (label i = 0; i < fvp[pi].size; ++i)
