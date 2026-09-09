@@ -106,6 +106,10 @@ struct KEpsilonInput
     const DeviceBuffer<scalar>* nutWfKappaBnd  = nullptr;
     const DeviceBuffer<scalar>* nutWfEBnd      = nullptr;
     const DeviceBuffer<scalar>* nutWfYplLamBnd = nullptr;
+    // WHICH member of the nut wall-function family each BOUNDARY FACE carries, as a NutWall code, from
+    // 0/nut's boundaryField types. Null -> all nutk, which is what this closure computed for every
+    // wall-function face regardless of what the case named.
+    const DeviceBuffer<label>*  nutWfKindBnd   = nullptr;
 
     // --- velocity, for the production term and the wall functions ---
     const DeviceBuffer<scalar>* Ux = nullptr;
@@ -303,7 +307,10 @@ void correctNut(
     const DeviceWallData&        wall,
     const DeviceBuffer<scalar>&  k,
     const DeviceBuffer<scalar>&  epsilon,
-    const KEpsilonInput&         in);
+    const KEpsilonInput&         in,
+    // U's boundary, for the U-based members of the nut wall-function family. Null (or a null
+    // nutWfKindBnd) means every wall-function face takes nutk.
+    const DeviceVectorBoundary*  dbU = nullptr);
 
 // One kEpsilon::correct(): production -> wall -> epsilon eqn -> solve -> bound -> k eqn -> solve ->
 // bound -> correctNut. Updates k, epsilon, nut and alphat in place.

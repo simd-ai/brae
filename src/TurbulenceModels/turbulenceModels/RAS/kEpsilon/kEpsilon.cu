@@ -313,6 +313,14 @@ __global__ void nutBoundaryKernel(
     const scalar* wfKappa,
     const scalar* wfE,
     const scalar* wfYplLam,
+    // WHICH member of the family this face carries (a NutWall code), and the velocity the U-based ones
+    // read. Null -> every wall-function face is nutk, which is what this kernel computed
+    // unconditionally. OpenFOAM dispatches per patch through nut's own virtual calcNut()
+    // (nutWallFunctionFvPatchScalarField.C:182); brae captured the type at createFields, where the
+    // dictionary still had it, and this is that dispatch.
+    const label*  wfKind,
+    const scalar* Ucx, const scalar* Ucy, const scalar* Ucz,
+    const scalar* Ubx, const scalar* Uby, const scalar* Ubz,
     scalar*       nutBnd)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -325,6 +333,25 @@ __global__ void nutBoundaryKernel(
         const scalar kappa  = wfKappa  ? wfKappa[i]  : kappaD;
         const scalar E      = wfE      ? wfE[i]      : ED;
         const scalar yplLam = wfYplLam ? wfYplLam[i] : yplLamD;
+        const int kind = wfKind ? static_cast<int>(wfKind[i]) : static_cast<int>(NutWall::Nutk);
+        if (kind == static_cast<int>(NutWall::LowRe))
+        {
+            // nutLowReWallFunction::calcNut() returns Zero unconditionally
+            // (nutLowReWallFunctionFvPatchScalarField.C:38-42 is the whole function).
+            nutBnd[i] = scalar(0);
+            return;
+        }
+        if (kind == static_cast<int>(NutWall::NutU) && Ucx && Ubx)
+        {
+            // magUp = mag(Uw.patchInternalField() - Uw): the CELL value minus the wall's own, so a
+            // moving wall is honoured. nutk never reads U at all -- these are different functions of
+            // different inputs, not variants.
+            const int c = bndCell[i];
+            const scalar dx = Ucx[c] - Ubx[i], dy = Ucy[c] - Uby[i], dz = Ucz[c] - Ubz[i];
+            const scalar magUp = sqrt(dx*dx + dy*dy + dz*dz);
+            nutBnd[i] = nutUWallValue(magUp, y[i], nuFace[i], kappa, E, yplLam);
+            return;
+        }
         const scalar yp = yPlusWall(Cmu25, y[i], kc, nuFace[i]);
         nutBnd[i] = nutkWallFunctionValue(yp, nuFace[i], yplLam, kappa, E);
         return;
@@ -765,7 +792,8 @@ void correctNut(
     const DeviceWallData&       wall,
     const DeviceBuffer<scalar>& k,
     const DeviceBuffer<scalar>& epsilon,
-    const KEpsilonInput&        in)
+    const KEpsilonInput&        in,
+    const DeviceVectorBoundary* dbU)
 {
     const int nC = dm.nCells;
 
@@ -784,6 +812,15 @@ void correctNut(
         // the calculated patches' Cmu*k^2/epsilon, which IS the model's. See KEpsilonCoeffs::CmuWall.
         const scalar Cmu25  = std::pow(in.co.CmuWall, scalar(0.25));
         const scalar yplLam = brae::yPlusLam(in.co.kappa, in.co.E);
+        // U at each boundary FACE, for the U-based members of the nut family. Built only when a face
+        // actually asks for one -- nutk never reads U, so an all-nutk case pays nothing.
+        DeviceBuffer<scalar> uBx, uBy, uBz;
+        if (in.nutWfKindBnd && dbU && in.Ux)
+        {
+            deviceBCValue(dbU->comp[0], *in.Ux, uBx);
+            deviceBCValue(dbU->comp[1], *in.Uy, uBy);
+            deviceBCValue(dbU->comp[2], *in.Uz, uBz);
+        }
         nutBoundaryKernel<<<nBlk(nB), TPB>>>(nB, in.wfBndMask->data(), dm.bndCell.data(),
                                              in.wallYBndFace ? in.wallYBndFace->data() : nullptr,
                                              k.data(), kB.data(), eB.data(), in.nuBndFace->data(),
@@ -792,6 +829,13 @@ void correctNut(
                                              in.nutWfKappaBnd  ? in.nutWfKappaBnd->data()  : nullptr,
                                              in.nutWfEBnd      ? in.nutWfEBnd->data()      : nullptr,
                                              in.nutWfYplLamBnd ? in.nutWfYplLamBnd->data() : nullptr,
+                                             in.nutWfKindBnd ? in.nutWfKindBnd->data() : nullptr,
+                                             in.Ux ? in.Ux->data() : nullptr,
+                                             in.Uy ? in.Uy->data() : nullptr,
+                                             in.Uz ? in.Uz->data() : nullptr,
+                                             uBx.size() ? uBx.data() : nullptr,
+                                             uBy.size() ? uBy.data() : nullptr,
+                                             uBz.size() ? uBz.data() : nullptr,
                                              nutBnd.data());
         cudaCheck(cudaGetLastError(), "kEpsilon nut boundary");
     }
@@ -999,7 +1043,7 @@ void correct(
         boundField(k, dm, dbK, in.co.kMin, "k");
     }
 
-    correctNut(nut, nutBnd, alphat, alphatBnd, dm, dbK, dbEps, wall, k, epsilon, in);
+    correctNut(nut, nutBnd, alphat, alphatBnd, dm, dbK, dbEps, wall, k, epsilon, in, &dbU);
 }
 
 } // namespace kEpsilonRAS

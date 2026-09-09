@@ -69,6 +69,9 @@ struct RhoDeviceFields
     // nutkWallFunction's own Cmu^0.25 / kappa / E / yPlusLam per boundary face (the nut patch's entry,
     // WallFunctionCoeffs); the epsilon patch's ride in wall.wf* (item 16h-port).
     DeviceBuffer<scalar> nutWfCmu25Bnd, nutWfKappaBnd, nutWfEBnd, nutWfYplLamBnd;
+    // ...and WHICH member of the family each face carries, as a NutWall code. OpenFOAM dispatches per
+    // patch through nut's own virtual calcNut(); this is that dispatch, projected onto faces.
+    DeviceBuffer<label>  nutWfKindBnd;
     std::vector<label>   wfFaceOfBnd;    // wall-face order -> boundary-face index, for deviceGatherWallNu
 
     // The TURBULENT INLETS, per boundary face. OpenFOAM recomputes these every updateCoeffs:

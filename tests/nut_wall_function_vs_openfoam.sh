@@ -129,19 +129,40 @@ sys.exit(0 if o > 0 and abs(b - o) / o < 0.25 else 1)" "$db" "$do_" \
     printf '        (brae spread %s vs OpenFOAM spread %s)\n' "$db" "$do_"
 done
 
-# ---- ARM 4: the CUDA arm REFUSES what its device closure cannot compute ---------------------------
-# Both arms read the same createFields, so narrowing the host refusal let this arm through running nutk
-# under every name (measured: epsilon 2.20e-01 for nutU, 2.49e+00 for nutLowRe). It refuses by name
-# until the device kernel dispatches too -- an arm that cannot do it must say so, not approximate it.
-stage "$W/cu_nutk" nutkWallFunction; runBrae cuda "$W/cu_nutk"
-[ "$(its "$W/cu_nutk")" = "$IT" ] \
-    && say "CUDA arm: still runs nutkWallFunction, which its closure does compute" ok \
-    || { tail -2 "$W/cu_nutk/run.log"; say "CUDA arm: still runs nutkWallFunction, which its closure does compute" FAIL; }
-for t in nutUWallFunction nutLowReWallFunction; do
+# ---- ARM 4: the CUDA arm dispatches the family too -------------------------------------------------
+# Its closure computed nutkWallFunction for EVERY wall-function face, so it refused nutU and nutLowRe by
+# name. It dispatches on the face's own NutWall code now -- the per-face projection of the same patch
+# types the host arm reads -- so each member is checked against ITS OWN oracle, the way the host is.
+# The bound is looser than the host's because this arm's linear solvers already put it ~4e-03 from
+# OpenFOAM on the nutk case it always computed; what matters is that each member lands at that baseline
+# rather than 100x away, which is where running nutk under another name would sit (ARM 5).
+CUBOUND=2e-2
+for t in $TYPES; do
     stage "$W/cu_$t" "$t"; runBrae cuda "$W/cu_$t"
-    [ "$(its "$W/cu_$t")" = 0 ] && grep -q "$t" "$W/cu_$t/run.log" \
-        && say "CUDA arm: refuses $t by name rather than running nutk under it" ok \
-        || say "CUDA arm: refuses $t by name rather than running nutk under it" FAIL
+    [ "$(its "$W/cu_$t")" = "$IT" ] \
+        || { tail -2 "$W/cu_$t/run.log"; say "CUDA arm: runs $t" FAIL; continue; }
+    ok=1; det=""
+    for fld in nut k epsilon; do
+        d=$(rel "$W/cu_$t" "$W/of_$t" "$fld"); det="$det $fld $d"
+        le "$d" "$CUBOUND" || ok=0
+    done
+    [ "$ok" = 1 ] \
+        && say "CUDA arm: $t matches OpenFOAM's own $t run" ok \
+        || say "CUDA arm: $t matches OpenFOAM's own $t run" FAIL
+    printf '        (%s)\n' "$det"
+done
+# ...and the CUDA arm must reproduce OpenFOAM's SPREAD too, which is what rules out one wall function
+# being computed under all three names. Its spread is 100x the per-member agreement above.
+for t in nutUWallFunction nutLowReWallFunction; do
+    dc=$(rel "$W/cu_$t" "$W/cu_nutkWallFunction" epsilon)
+    do_=$(rel "$W/of_$t" "$W/of_nutkWallFunction" epsilon)
+    python3 -c "
+import sys
+b, o = float(sys.argv[1]), float(sys.argv[2])
+sys.exit(0 if o > 0 and abs(b - o) / o < 0.25 else 1)" "$dc" "$do_" \
+        && say "fail-proof (CUDA): its $t-vs-nutk spread reproduces OpenFOAM's" ok \
+        || say "fail-proof (CUDA): its $t-vs-nutk spread reproduces OpenFOAM's" FAIL
+    printf '        (CUDA spread %s vs OpenFOAM %s)\n' "$dc" "$do_"
 done
 
 # ---- ARM 5: anything still outside the ported set refuses, on BOTH arms ---------------------------

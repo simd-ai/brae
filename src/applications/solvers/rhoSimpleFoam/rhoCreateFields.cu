@@ -263,27 +263,11 @@ RhoDeviceFields createDeviceFields(
             "inside the closure's own set-up), which is a laminar run under a turbulent model's name. "
             "The host arm (BRAE_RHOSIMPLEFOAM_MIRROR=1) carries kOmegaSST; refusing rather than "
             "running this case without its closure.");
-    // THE DEVICE CLOSURE COMPUTES nutkWallFunction UNCONDITIONALLY. Narrowing the host refusal so the
-    // host arm can dispatch the family let this arm through too -- both arms read the same
-    // createFields -- and it then ran nutk under the other members' names. Measured on rhoKE at 5
-    // iterations against real OpenFOAM: epsilon 2.20e-01 for nutU and 2.49e+00 for nutLowRe, against
-    // 1.9e-03 for the nutk case it does implement. That is the exact defect the host dispatch was
-    // written to remove, reappearing on the other arm, so it is refused by name until the device
-    // kernel dispatches too.
-    for (std::size_t pi = 0; pi < hf.nutWallKind.size(); ++pi)
-    {
-        if (hf.nutWallKind[pi] == static_cast<int>(NutWall::Nutk)) continue;
-        const char* nm = hf.nutWallKind[pi] == static_cast<int>(NutWall::NutU)  ? "nutUWallFunction"
-                       : hf.nutWallKind[pi] == static_cast<int>(NutWall::LowRe) ? "nutLowReWallFunction"
-                                                                                : "a nut wall function";
-        throw std::runtime_error(
-            std::string("brae rhoSimpleFoam (CUDA): patch '") + patches[pi].name + "' carries '" + nm +
-            "', which the DEVICE kEpsilon closure does not compute -- it evaluates nutkWallFunction for "
-            "every wall-function patch. The host arm (BRAE_RHOSIMPLEFOAM_MIRROR=1) dispatches the "
-            "family; measured against OpenFOAM on rhoKE, running nutk here instead would put epsilon "
-            "2.2e-01 out for nutU and 2.5e+00 out for nutLowRe. Refusing rather than running one wall "
-            "function under another's name.");
-    }
+    // The device closure used to compute nutkWallFunction for EVERY wall-function face, so this arm
+    // refused nutU and nutLowRe by name. It dispatches on the face's own NutWall code now, from the
+    // per-face array built below, exactly as the host arm dispatches on the patch's. What is still
+    // outside the ported set (nutUSpalding, nutUBlended, the atm family) is refused by createFields on
+    // both arms, where the dictionary type still exists.
     if (hf.turbulent && !hf.epsilon.internal.empty())
     {
         d.dbK   = buildDeviceBoundary(hf.k, patches, g);
@@ -387,6 +371,7 @@ RhoDeviceFields createDeviceFields(
         // buildDeviceWallData built). OpenFOAM reads them per patch field (wallFunctionCoefficients);
         // the model-wide value the kernels fall back to is the legacy drivers' approximation.
         std::vector<scalar> nCmu25, nKappa, nE, nYpl;
+        std::vector<label>  nKind;   // per boundary face: which nut wall function (a NutWall code)
         std::vector<scalar> eCmu25, eCmu75, eKappa, eE, eYpl;
         label bndIdx = 0;
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
@@ -402,6 +387,11 @@ RhoDeviceFields createDeviceFields(
                 nKappa.push_back(nc.kappa);
                 nE.push_back(nc.E);
                 nYpl.push_back(nc.yPlusLam());
+                // WHICH member of the family this face carries, from 0/nut's boundaryField type -- read
+                // by createFields, the last place the dictionary type exists. Per FACE because that is
+                // how the kernel is indexed; the source is per PATCH.
+                nKind.push_back(pi < hf.nutWallKind.size() ? hf.nutWallKind[pi]
+                                                          : static_cast<int>(NutWall::Nutk));
                 if (isWF)
                 {
                     eCmu25.push_back(std::pow(ec.Cmu, 0.25));
@@ -428,6 +418,8 @@ RhoDeviceFields createDeviceFields(
         d.nutWfKappaBnd.copyFrom(nKappa);
         d.nutWfEBnd.copyFrom(nE);
         d.nutWfYplLamBnd.copyFrom(nYpl);
+        nKind.resize(static_cast<std::size_t>(d.nBndFaces), static_cast<int>(NutWall::Nutk));
+        d.nutWfKindBnd.copyFrom(nKind);
         if (static_cast<int>(eCmu25.size()) != d.wall.nWF)
         {
             throw std::runtime_error("rhoSimpleFoam createFields: the epsilon wall-function coefficient list ("
