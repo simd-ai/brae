@@ -5,6 +5,7 @@
 // kEpsilon.C produces them. Where a legacy kernel in src/cuda already computes a stage with the same
 // arithmetic it is reused; where the legacy kernel groups the arithmetic differently, or encodes a
 // substitution this module refuses, a new kernel is written and the reason is recorded above it.
+#include "turbulence_transport.cuh"   // assembleScalarTransport: shared by every transported scalar
 #include "kEpsilon.cuh"
 #include <string>
 #include <cstdlib>
@@ -574,67 +575,18 @@ void assembleTransport(
                                         in.rhoBndFace->data(), sigma, gammaBnd.data());
     cudaCheck(cudaGetLastError(), "kEpsilon DEff boundary");
 
-    // fvm::div(phi, field). The boundary half carries the flux-conditional switch the caller has
-    // already applied to db.
-    //
-    // limitedLinear is a WEIGHT change, not a correction, so it replaces the upwind coefficients rather
-    // than adding to the source -- the same shape the host closure's divWithScheme takes. The limiter's
-    // gradient is the field's own Gauss gradient, limited by the case's grad(<field>) cellLimited
-    // coefficient when it names one; the corrected-laplacian block below builds the same three buffers
-    // the same way, and this is deliberately the identical call sequence so the two cannot drift.
-    if (in.limitedLinear)
-    {
-        DeviceBuffer<scalar> bval, gx, gy, gz;
-        deviceBCValue(db, field, bval);
-        deviceGaussGrad(dm, field, bval, gx, gy, gz);
-        if (in.limGradK > scalar(0)) deviceCellLimitGrad(dm, field, bval, gx, gy, gz, in.limGradK);
-        deviceDivLimitedCoeffs(dm, *in.phiInt, field, gx, gy, gz,
-                               scalar(2) / std::fmax(in.limiterCoeff, scalar(1e-15)),
-                               M.diag, M.upper, M.lower);
-    }
-    else
-    {
-        deviceDivUpwindCoeffs(dm, *in.phiInt, M.diag, M.upper, M.lower);
-    }
-    zeroed(M.source, nC);
-    deviceBCDivCoeffs(db, *in.phiBnd, M.iC, M.bC);
-
-    // - fvm::laplacian(gamma, field). `corrected` is TWO changes and this module makes both: the
-    // implicit coefficient takes nonOrthDeltaCoeffs, and the non-orthogonal part enters as an explicit
-    // source. Implementing only the implicit half moves the SOURCE while leaving the DIAGONAL exact,
-    // which no gate comparing D() can see.
-    {
-        DeviceBuffer<scalar> lDiag, lUp, lLo, lIC, lBC;
-        deviceLaplacianCoeffs(dm, gammaFace, lDiag, lUp, lLo, in.correctedLaplacian);
-        deviceBCLaplacianCoeffsFace(db, gammaBnd, lIC, lBC);
-        deviceAxpy(-1.0, lDiag, M.diag);
-        deviceAxpy(-1.0, lUp, M.upper);
-        deviceAxpy(-1.0, lLo, M.lower);
-        deviceAxpy(-1.0, lIC, M.iC);
-        deviceAxpy(-1.0, lBC, M.bC);
-
-        if (in.correctedLaplacian)
-        {
-            DeviceBuffer<scalar> bval, gx, gy, gz, ffc, corr;
-            deviceBCValue(db, field, bval);
-            deviceGaussGrad(dm, field, bval, gx, gy, gz);
-            // correctedSnGrad's correction takes the field's OWN grad scheme (correctedSnGrad.C:52-55).
-            if (in.co.gradKLimitK > scalar(0)) deviceCellLimitGrad(dm, field, bval, gx, gy, gz, in.co.gradKLimitK);
-            if (in.snGradLimitCoeff > scalar(0.0))
-            {
-                deviceLaplacianCorrFluxLimited(dm, gammaFace, field, gx, gy, gz, in.snGradLimitCoeff, ffc);
-                deviceFaceDivSource(dm, ffc, corr);
-            }
-            else
-            {
-                deviceLaplacianCorr(dm, gammaFace, gx, gy, gz, corr);
-            }
-            // deviceLaplacianCorr returns -V*div(faceFluxCorr) -- already negated -- and the laplacian
-            // itself enters this equation with -1, so its explicit source does too. The two signs
-            // compose to the reference's `L.source -= corr` followed by `M -= L`.
-            deviceAxpy(-1.0, corr, M.source);
-        }
-    }
+    // The convection and diffusion half, in ONE place for every transported turbulence scalar --
+    // see turbulence_transport.cuh. What stays here is the DIFFUSIVITY, which is kEpsilon's own.
+    turbulence::TransportScheme sc;
+    sc.phiInt             = in.phiInt;
+    sc.phiBnd             = in.phiBnd;
+    sc.limitedLinear      = in.limitedLinear;
+    sc.limiterCoeff       = in.limiterCoeff;
+    sc.limGradK           = in.limGradK;
+    sc.correctedLaplacian = in.correctedLaplacian;
+    sc.gradFieldLimitK    = in.co.gradKLimitK;
+    sc.snGradLimitCoeff   = in.snGradLimitCoeff;
+    turbulence::assembleScalarTransport(M, dm, db, field, gammaFace, gammaBnd, sc);
 }
 
 } // namespace

@@ -98,6 +98,7 @@ add_library(brae_core STATIC
     src/finiteVolume/cfdTools/general/bound/bound_report.cu
     src/OpenFOAM/db/IOstreams/io_precision.cu
     src/finiteVolume/cfdTools/general/fvOptions/limit_temperature_report.cu
+    src/TurbulenceModels/turbulenceModels/turbulenceModel/turbulence_transport.cu
     src/finiteVolume/cfdTools/general/MRF/MRF_cpp.cu
     src/finiteVolume/cfdTools/general/MRF/device_MRF.cu
     src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedSchemes_cpp.cu

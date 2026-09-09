@@ -1,0 +1,70 @@
+#pragma once
+// The convection + diffusion half of ONE transported turbulence scalar, on the device.
+//
+// provenance:
+//   openfoam: fvm::div(phi, vf) - fvm::laplacian(DEff, vf), as every RAS model's correct() writes it
+//   brae:     src/TurbulenceModels/turbulenceModels/turbulenceModel/turbulence_transport.cu
+//   tests:    every gate covering the mirror device closures -- it is the same code they already ran
+//
+// This lived inside the kEpsilon device closure, in an anonymous namespace, taking a KEpsilonInput. It
+// is not kEpsilon-specific: k, epsilon, omega, nuTilda and the Langtry-Menter pair all transport the
+// same way and differ only in their DIFFUSIVITY and their SOURCE. Keeping one copy is what stops the
+// closures drifting on the things that have bitten here before -- the `corrected` laplacian's explicit
+// half, limitedLinear's weights, and the limiter's own gradient.
+//
+// What is NOT here is the diffusivity itself. kEpsilon's is nut/sigma + nu with a constant sigma; the
+// SST's is a blended alpha(F1)*nut + nu. Each closure builds gammaFace/gammaBnd its own way and hands
+// them in, so this function has no opinion about the model.
+#include "cf_types.cuh"
+#include "device_buffer.cuh"
+#include "device_mesh.cuh"
+#include "device_boundary.cuh"
+#include "pEqn.cuh"               // PressureMatrix -- the assembled scalar object, shared not redefined
+
+namespace brae {
+namespace gpu {
+namespace turbulence {
+
+// The case's schemes for this one field. Every member is read from the case, never defaulted into a
+// substitution: a closure that leaves `limitedLinear` false when the case named it runs upwind under
+// the case's own name, which is the defect this project keeps finding.
+struct TransportScheme
+{
+    const DeviceBuffer<scalar>* phiInt = nullptr;   // the equation's own flux (compressibly, the MASS flux)
+    const DeviceBuffer<scalar>* phiBnd = nullptr;
+
+    // `Gauss limitedLinear <k>`: a WEIGHT change, so it replaces the upwind coefficients rather than
+    // adding to the source. `limiterCoeff` is the RAW k the case wrote -- the conversion to
+    // 2/max(k,SMALL) happens here, once, so no caller can hand the wrong currency.
+    bool   limitedLinear   = false;
+    scalar limiterCoeff    = 1.0;
+    // cellLimited k of the case's grad(<field>), which limits the LIMITER's gradient
+    // (LimitedScheme.C:56-59). Zero means unlimited.
+    scalar limGradK        = 0.0;
+
+    // `corrected` is TWO changes and this makes both: the implicit coefficient takes
+    // nonOrthDeltaCoeffs, and the non-orthogonal part enters as an explicit source. Implementing only
+    // the implicit half moves the SOURCE while leaving the DIAGONAL exact, which no gate comparing D()
+    // can see.
+    bool   correctedLaplacian = false;
+    // The field's OWN grad scheme, which correctedSnGrad's correction takes (correctedSnGrad.C:52-55).
+    // A DIFFERENT lookup from limGradK above, even though both come from gradSchemes.
+    scalar gradFieldLimitK    = 0.0;
+    // `limited <psi> corrected`: caps the non-orthogonal correction per face. Zero => uncapped.
+    scalar snGradLimitCoeff   = 0.0;
+};
+
+// M = fvm::div(phi, field) - fvm::laplacian(gamma, field), with M's source zeroed and its boundary
+// coefficients set. The caller adds the model's reaction terms afterwards.
+void assembleScalarTransport(
+    PressureMatrix&             M,
+    const DeviceMesh&           dm,
+    const DeviceBoundary&       db,
+    const DeviceBuffer<scalar>& field,
+    const DeviceBuffer<scalar>& gammaFace,   // DEff interpolated to internal faces
+    const DeviceBuffer<scalar>& gammaBnd,    // ...and built from the patch values on boundary faces
+    const TransportScheme&      sc);
+
+} // namespace turbulence
+} // namespace gpu
+} // namespace brae
