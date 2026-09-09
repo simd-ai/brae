@@ -694,8 +694,18 @@ void amgFineCoeffKernel(
             deviceAlphat(th_, dnut_, tc_);                                    // EddyDiffusivity::correctNut() tail
             return;
         }
-        deviceBoundField(dm, dk_, 1e-15);                              // bound(k_, kMin_)  [SA: bound(nuTilda_, 0)]
-        if (!ctl_.sa) deviceBoundField(dm, de_, 1e-15);               // bound(omega_|epsilon_, ...Min_)
+        // The names are what let Foam::bound's message name the right field: the "k" slot holds nuTilda
+        // under Spalart-Allmaras (see the dbK_ construction), and the second slot is omega or epsilon by
+        // model, so a fixed string here would print a line about a field the case does not have.
+        deviceBoundField(dm, dk_, 1e-15,
+                         ctl_.sa ? "nuTilda" : "k",
+                         &dbK_);                                       // bound(k_, kMin_)  [SA: bound(nuTilda_, 0)]
+        if (!ctl_.sa)
+        {
+            deviceBoundField(dm, de_, 1e-15,
+                             ctl_.sst ? "omega" : "epsilon",
+                             &dbEps_);                                 // bound(omega_|epsilon_, ...Min_)
+        }
         // validate() -> correctNut(): recompute internal nut from the bounded fields + the initial U.
         if (ctl_.sa)
         {

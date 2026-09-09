@@ -1,5 +1,6 @@
 // cf GPU offload: k-epsilon production + eddy viscosity. gradU is the OF-convention tensor (column i =
 // gaussGrad(U_i), as in divDevReff); GbyNu = sum_ij g_ij*(g_ij + g_ji - (2/3)tr d_ij).
+#include <cmath>           // fmin/fmax: folding the boundary into min/max
 #include "device_kepsilon.cuh"
 #include <cstdio>
 #include <cstdlib>
@@ -25,6 +26,8 @@ namespace brae {
 // OF-style turbulence residual report (see device_kepsilon.cuh). Single-threaded per solve; the SIMPLE driver
 // clears it before turbulence->correct() and reads it after, to print the "Solving for k/omega/..." lines.
 void clearTurbulenceReport() { turbStore().clear(); }
+void clearBoundingReports() { boundStore().clear(); }
+const std::vector<BoundingReport>& boundingReports() { return boundStore(); }
 const std::vector<ScalarSolveEntry>& turbulenceReport() { return turbStore(); }
 
 namespace {
@@ -722,8 +725,76 @@ void deviceEpsReactionRealizable(
 
 
 // OF Foam::bound(field, floor): negative cells -> fvc::average(max(field,floor)); positive -> max(field,floor).
-void deviceBoundField(const DeviceMesh& dm, DeviceBuffer<scalar>& x, scalar floor)
+// Foam::bound's guard and its three numbers, over the field as it stands. OpenFOAM computes min(vsf)
+// unconditionally (bound.C:38) because it IS the guard, so this is not an optional extra: the branch
+// needs it either way. min, max and the arithmetic mean over the INTERNAL field only -- gAverage there
+// is over primitiveField(), not the boundary and not volume-weighted.
+bool deviceBoundingReport(
+    const DeviceBuffer<scalar>& x,
+    const DeviceBuffer<scalar>* xBnd,
+    scalar                      lowerBound,
+    scalar&                     minOut,
+    scalar&                     maxOut,
+    scalar&                     avgOut)
 {
+    static const bool on = [](){ const char* e = std::getenv("BRAE_BOUND_REPORT"); return !(e && std::atoi(e) == 0); }();
+    if (!on || x.size() == 0) return false;
+    DeviceBuffer<scalar> mmm(3);
+    deviceMinMaxMeanInto(x, mmm.data());
+    const bool haveBnd = xBnd && xBnd->size() > 0;
+    DeviceBuffer<scalar> bmm;
+    if (haveBnd)
+    {
+        bmm.resize(3);
+        deviceMinMaxMeanInto(*xBnd, bmm.data());   // its mean is discarded: gAverage is internal-only
+    }
+    // ONE mailbox publish and ONE wait for the whole group (device_blas.cuh, DEVICE_READ_MAX_VALUES = 8),
+    // so folding the boundary in costs a second reduction but not a second queue drain.
+    scalar bMin = 0;
+    scalar bMax = 0;
+    scalar bAvg = 0;
+    DeviceReadValue v[6];
+    int n = 0;
+    v[n].dSrc = mmm.data();     v[n].hDst = &minOut; v[n].isInt = false; ++n;
+    v[n].dSrc = mmm.data() + 1; v[n].hDst = &maxOut; v[n].isInt = false; ++n;
+    v[n].dSrc = mmm.data() + 2; v[n].hDst = &avgOut; v[n].isInt = false; ++n;
+    if (haveBnd)
+    {
+        v[n].dSrc = bmm.data();     v[n].hDst = &bMin; v[n].isInt = false; ++n;
+        v[n].dSrc = bmm.data() + 1; v[n].hDst = &bMax; v[n].isInt = false; ++n;
+        v[n].dSrc = bmm.data() + 2; v[n].hDst = &bAvg; v[n].isInt = false; ++n;
+    }
+    deviceReadValues(v, n);
+    if (haveBnd)
+    {
+        minOut = std::fmin(minOut, bMin);
+        maxOut = std::fmax(maxOut, bMax);
+    }
+    (void)bAvg;                                    // read only to keep the group contiguous; see above
+    return minOut < lowerBound;                    // bound.C:40, a STRICT less-than
+}
+
+
+void deviceBoundField(
+    const DeviceMesh&     dm,
+    DeviceBuffer<scalar>& x,
+    scalar                floor,
+    const char*           fieldName,
+    const DeviceBoundary* db)
+{
+    // BEFORE the clamp, as OpenFOAM does (bound.C:42 precedes bound.C:48).
+    if (fieldName)
+    {
+        DeviceBuffer<scalar> bvalReport;
+        if (db && db->n) deviceBCValue(*db, x, bvalReport);
+        scalar bMin = 0;
+        scalar bMax = 0;
+        scalar bAvg = 0;
+        if (deviceBoundingReport(x, (db && db->n) ? &bvalReport : nullptr, floor, bMin, bMax, bAvg))
+        {
+            boundStore().push_back({fieldName, bMin, bMax, bAvg});
+        }
+    }
     const int nC = dm.nCells;
     DeviceBuffer<scalar> cl(static_cast<std::size_t>(nC));
     boundClampKernel<<<nBlocks(nC), TPB>>>(nC, floor, x.data(), cl.data());

@@ -33,6 +33,9 @@ void   deviceFusedScaleAxpy(DeviceBuffer<scalar>& p, const scalar* b, const Devi
 // the recurrence arithmetic on-device. Same kernels/arithmetic as the host-scalar path -> bit-identical results.
 void   deviceDotInto(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y, scalar* dResult);  // *dResult = x.y
 void   deviceSumMagInto(const DeviceBuffer<scalar>& x, scalar* dResult);                              // *dResult = sum|x|
+// min, max and arithmetic mean of x into dOut3[0..2], in ONE pass. The three numbers OpenFOAM's bound()
+// needs (bound.C:38-46), and the mean is over the internal field as gAverage there is.
+void   deviceMinMaxMeanInto(const DeviceBuffer<scalar>& x, scalar* dOut3);
 // A device vector of ones of length n, built once per length and kept. normFactor (lduMatrixSolver.C's
 // sumA = A*1) and SIMPLEC's row sum both need one; rebuilding it on the host and uploading it from
 // pageable memory on every call was a stream sync each time -- three per outer iteration on the flat

@@ -1078,7 +1078,7 @@ void deviceKOmegaSSTCorrect(
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric);
-    deviceBoundField(dm, omega, 1e-15);   // OF bound(omega_, omegaMin_)
+    deviceBoundField(dm, omega, 1e-15, "omega", &dbOmega);   // OF bound(omega_, omegaMin_)
 
     // k equation (loose solve)
     DeviceBuffer<scalar> DkEff;
@@ -1093,7 +1093,7 @@ void deviceKOmegaSSTCorrect(
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric);
-    deviceBoundField(dm, k, 1e-15);   // OF bound(k_, kMin_)
+    deviceBoundField(dm, k, 1e-15, "k", &dbK);   // OF bound(k_, kMin_)
 
     // correctNut (Bradshaw): nut = a1*k / max(a1*omega, b1*F2*sqrt(S2)).
     //
@@ -1468,8 +1468,9 @@ void deviceKOmegaSSTLMCorrect(
                                nullptr, nullptr, ami, cyc, reDdt, /*DBnd*/nullptr, /*gradLimitK*/0.0,
                                /*bound*/true, /*fvoMask*/nullptr, /*fvoVal*/nullptr,
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
-                               /*limGradZ*/nullptr, /*precon*/nullptr, /*nSweeps*/1, gsSymmetric);
-    deviceBoundField(dm, ReThetat, 0.0);
+                               /*limGradZ*/nullptr, /*precon*/nullptr, /*nSweeps*/1, gsSymmetric,
+                               /*boundFloor*/scalar(0.0));
+    deviceBoundField(dm, ReThetat, 0.0, "ReThetat", &dbReThetat);
 
     // gammaInt: DgammaIntEff = nut+nu; reaction = Pgamma+Egamma - Sp(ce1*Pgamma+ce2*Egamma).
     DeviceBuffer<scalar> spG(nC), suG(nC);
@@ -1484,8 +1485,9 @@ void deviceKOmegaSSTLMCorrect(
                                nullptr, nullptr, ami, cyc, giDdt, /*DBnd*/nullptr, /*gradLimitK*/0.0,
                                /*bound*/true, /*fvoMask*/nullptr, /*fvoVal*/nullptr,
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
-                               /*limGradZ*/nullptr, /*precon*/nullptr, /*nSweeps*/1, gsSymmetric);
-    deviceBoundField(dm, gammaInt, 0.0);
+                               /*limGradZ*/nullptr, /*precon*/nullptr, /*nSweeps*/1, gsSymmetric,
+                               /*boundFloor*/scalar(0.0));
+    deviceBoundField(dm, gammaInt, 0.0, "gammaInt", &dbGammaInt);
     gammaIntEff.resize(nC);
     lmGammaEffKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
         y.data(), ReThetat.data(), gammaInt.data(), Fth.data(), nu, LM_SMALL, gammaIntEff.data());

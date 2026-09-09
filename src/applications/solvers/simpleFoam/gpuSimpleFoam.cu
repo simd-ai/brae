@@ -6,6 +6,7 @@
 // dev2(T(grad U))); the pressure uses the device AMG-PCG. Mirrors the host brae_simpleFoam control flow.
 //
 //   brae -case <caseDir>
+#include "bound_report.cuh"   // printBounding: Foam::bound's message, one formatter for both arms
 #include "primitive_mesh.cuh"
 #include "acmi_area_scaling.cuh"
 #include "fv_geometry.cuh"
@@ -721,9 +722,23 @@ int main(int argc, char** argv)
                     kSolv = "Jacobi-BiCGStab";
                 }
                 for (const auto& e : turbulenceReport())   // Solving for omega/k/epsilon/... in solve order, like OF
+                {
                     std::printf("%s:  Solving for %s, Initial residual = %g, Final residual = %g, No Iterations %d\n",
                                 kSolv, e.field.c_str(), e.perf.initialResidual, e.perf.finalResidual,
                                 e.perf.nIterations);
+                    // ...and Foam::bound's line immediately after that field's own solve line, which is
+                    // where OpenFOAM emits it: bound() is called between the two solves in the model's
+                    // correct(), so a real OF log reads "Solving for epsilon" / "bounding epsilon" /
+                    // "Solving for k" / "bounding k". Nothing is printed when the guard did not fire.
+                    for (const auto& b : boundingReports())
+                        if (b.field == e.field)
+                            printBounding(b.field.c_str(), b.minValue, b.maxValue, b.average);
+                }
+                // Emptied by whoever DRAINED it, which is the one rule that holds for every driver: a
+                // clear inside a model's correct() reached only the closure that has one, so this path
+                // -- which is what the tutorial gates run -- accumulated and reprinted every prior line
+                // on every iteration.
+                clearBoundingReports();
                 std::printf("ExecutionTime = %.2f s  ClockTime = %.0f s\n\n", _et, _et);
             }
             // NaN/divergence guard: a non-finite momentum/pressure residual means the solve blew up (FP32 overflow,

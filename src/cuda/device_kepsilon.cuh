@@ -36,6 +36,21 @@ struct ScalarSolveEntry
 void clearTurbulenceReport();
 const std::vector<ScalarSolveEntry>& turbulenceReport();
 
+// Foam::bound's message, for the fields whose guard fired this iteration. A store of its own rather than
+// a field on ScalarSolveEntry: the OF-mirror closure reports its residuals through its own path and
+// never fills turbStore, so a report hung off that entry reached one driver and silently not the other.
+// Keyed by field name so a driver that prints per-field solve lines can interleave it exactly where
+// OpenFOAM does, and one that prints a compact summary can emit them after it.
+struct BoundingReport
+{
+    std::string field;
+    scalar      minValue = 0;
+    scalar      maxValue = 0;
+    scalar      average  = 0;
+};
+void clearBoundingReports();
+const std::vector<BoundingReport>& boundingReports();
+
 // k-epsilon model coefficients (shared CPU/device definition).
 // GbyNu = gradU && devTwoSymm(gradU), devTwoSymm(g) = g + g^T - (2/3)tr(g) I.  G = nut*GbyNu.
 void deviceGbyNu(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
@@ -86,7 +101,38 @@ void deviceNut(const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& eps, D
 
 // OF Foam::bound(vsf, lowerBound): where a cell falls below the floor, replace it with the bounded
 // neighbour-average (fvc::average(max(vsf,floor))*pos0(-vsf)), NOT a hard clamp; floor elsewhere.
-void deviceBoundField(const DeviceMesh& dm, DeviceBuffer<scalar>& x, scalar floor);
+// Foam::bound's min/max/average over the field as it stands, and whether the guard fires -- computed
+// BEFORE the clamp, as OpenFOAM does. Returns true when min < lowerBound, i.e. when OpenFOAM would
+// print. One reduction and ONE mailbox read (the three values ride a single publish, so this costs what
+// reading one scalar costs); measured at 306k it is ~50 us per field against a turbulence block of
+// 12-15 ms. BRAE_BOUND_REPORT=0 skips it for a measurement run.
+//
+// THE MIN AND MAX INCLUDE THE BOUNDARY; THE AVERAGE DOES NOT. OpenFOAM's guard is min(vsf), and
+// min/max on a GeometricField are UNARY_REDUCTION_FUNCTION_WITH_BOUNDARY (GeometricFieldFunctions.C:427)
+// -- internal field AND every patch field. So a case whose cells are all above the bound but whose one
+// patch face is below it still trips the guard and still prints. The `average:` in the same line is
+// gAverage(vsf.primitiveField()) (FieldFunctions.C:647): the INTERNAL field only, arithmetic, not
+// volume-weighted. Getting that asymmetry backwards changes both the number printed and whether it
+// prints at all. xBnd is the evaluated patch values (deviceBCValue); null means no boundary to fold in.
+bool deviceBoundingReport(
+    const DeviceBuffer<scalar>& x,
+    const DeviceBuffer<scalar>* xBnd,
+    scalar                      lowerBound,
+    scalar&                     minOut,
+    scalar&                     maxOut,
+    scalar&                     avgOut);
+
+// `fieldName` and `db` are what makes this emit Foam::bound's message (bound.C:38-46). Both default to
+// off so a caller that has neither stays silent rather than printing a line with the wrong name or a
+// guard that misses a boundary-only trigger; a site left unwired is a missing diagnostic, not a wrong
+// one. Pass the field's DeviceBoundary wherever the caller has it: OpenFOAM's guard mins over the patch
+// values too, so without it the message is emitted on a narrower condition than OpenFOAM's.
+void deviceBoundField(
+    const DeviceMesh&     dm,
+    DeviceBuffer<scalar>& x,
+    scalar                floor,
+    const char*           fieldName = nullptr,
+    const DeviceBoundary* db = nullptr);
 
 // Static wall geometry for the wall functions (nearWallDist y, wall-face cell/deltaCoeffs/velocity, 1/nWallFaces).
 struct DeviceWallData

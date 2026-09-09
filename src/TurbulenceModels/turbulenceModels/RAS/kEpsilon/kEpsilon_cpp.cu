@@ -528,7 +528,7 @@ void correct(
         // average, not a floor. Inert under upwind convection, which does not produce one -- see
         // bound_cpp.cuh for where a floor is fatal.
         epsilon.evaluateBoundary();
-        bound(epsilon, 1e-15, m, g, patches);
+        bound(epsilon, 1e-15, m, g, patches, "epsilon");
     }
 
     // k equation
@@ -617,7 +617,7 @@ void correct(
         if (res) res->k = p.initialResidual;
 
         k.evaluateBoundary();
-        bound(k, 1e-15, m, g, patches);   // Foam::bound(k_, kMin_)
+        bound(k, 1e-15, m, g, patches, "k");   // Foam::bound(k_, kMin_)
     }
 
     // correctNut, boundary and EddyDiffusivity included -- ONE implementation, shared with

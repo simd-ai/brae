@@ -95,6 +95,79 @@ void sumMagKernel(const scalar* __restrict__ x, scalar* result, int n)
 }
 
 
+// MIN, MAX AND SUM IN ONE PASS, the three numbers OpenFOAM's bound() needs (bound.C:38-46: it computes
+// min unconditionally as its guard and prints all three when the guard fires). One kernel rather than
+// three because bound() runs on every turbulence solve and the field is read once either way; the
+// partials are interleaved [min|max|sum] so the second stage sees three contiguous blocks.
+__global__
+void minMaxSumKernel(const scalar* __restrict__ x, scalar* result, int n, int nb)
+{
+    __shared__ scalar smin[TPB];
+    __shared__ scalar smax[TPB];
+    __shared__ scalar ssum[TPB];
+    const int tid = threadIdx.x;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool in = (i < n);
+    smin[tid] = in ? x[i] :  1e300;
+    smax[tid] = in ? x[i] : -1e300;
+    ssum[tid] = in ? x[i] :  0.0;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            smin[tid] = fmin(smin[tid], smin[tid + s]);
+            smax[tid] = fmax(smax[tid], smax[tid + s]);
+            ssum[tid] += ssum[tid + s];
+        }
+        __syncthreads();
+    }
+    if (tid == 0)
+    {
+        result[blockIdx.x]          = smin[0];      // fixed slots, not atomics -- see the note at the top
+        result[nb + blockIdx.x]     = smax[0];
+        result[2 * nb + blockIdx.x] = ssum[0];
+    }
+}
+
+
+// ...and the sum becomes the mean, on the device, so the host reads three finished numbers.
+__global__
+void scaleMeanKernel(scalar* out, int n)
+{
+    if (threadIdx.x == 0 && blockIdx.x == 0) out[2] /= static_cast<scalar>(n);
+}
+
+
+// Stage 2 for that one: the same single-block, fixed-order walk, three times over its own third.
+__global__
+void finalMinMaxSumKernel(const scalar* __restrict__ partials, scalar* out, int nb)
+{
+    __shared__ scalar sd[TPB];
+    const int tid = threadIdx.x;
+    const int which = blockIdx.x;                   // 0 = min, 1 = max, 2 = sum
+    const scalar ident = (which == 0) ? 1e300 : (which == 1) ? -1e300 : 0.0;
+    scalar acc = ident;
+    for (int i = tid; i < nb; i += blockDim.x)
+    {
+        const scalar v = partials[which * nb + i];
+        acc = (which == 0) ? fmin(acc, v) : (which == 1) ? fmax(acc, v) : acc + v;
+    }
+    sd[tid] = acc;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            const scalar v = sd[tid + s];
+            sd[tid] = (which == 0) ? fmin(sd[tid], v) : (which == 1) ? fmax(sd[tid], v) : sd[tid] + v;
+        }
+        __syncthreads();
+    }
+    if (tid == 0) out[which] = sd[0];
+}
+
+
 // Stage 2: sum `partials[0..nb)` in ONE block, in index order. A single block with a fixed grid-stride walk and a
 // fixed shared-memory tree visits the values in the same order on every launch, which is what makes the whole
 // reduction bit-reproducible.
@@ -207,6 +280,22 @@ const DeviceBuffer<scalar>& deviceOnes(int n)
     }
     return it->second;
 }
+
+// min, max and MEAN of x, into three consecutive device scalars. The mean is the arithmetic one over the
+// internal field, which is what OpenFOAM's bound() prints (gAverage(vsf.primitiveField()), not a
+// volume-weighted average).
+void deviceMinMaxMeanInto(const DeviceBuffer<scalar>& x, scalar* dOut3)
+{
+    const int n = static_cast<int>(x.size());
+    if (n <= 0) { cudaCheck(cudaMemsetAsync(dOut3, 0, 3*sizeof(scalar), cudaStreamPerThread), "minmax zero"); return; }
+    const int nb = nBlocks(n);
+    scalar* part = ensurePartials(3 * nb);
+    minMaxSumKernel<<<nb, TPB>>>(x.data(), part, n, nb);
+    finalMinMaxSumKernel<<<3, TPB>>>(part, dOut3, nb);
+    scaleMeanKernel<<<1, 1>>>(dOut3, n);
+    cudaCheck(cudaGetLastError(), "minMaxMeanInto");
+}
+
 
 void deviceSumMagInto(const DeviceBuffer<scalar>& x, scalar* dResult)
 {

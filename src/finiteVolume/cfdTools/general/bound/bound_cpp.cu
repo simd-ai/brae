@@ -1,4 +1,5 @@
 #include "bound_cpp.cuh"
+#include "bound_report.cuh"   // printBounding: one formatter for both arms
 #include <cmath>
 
 namespace brae {
@@ -9,17 +10,46 @@ scalar bound(
     scalar                      lowerBound,
     const PrimitiveMesh&        m,
     const FvGeometry&           g,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    const char*                 fieldName)
 {
     const label nC = m.nCells();
     if (nC == 0) return 0.0;
 
+    // THE GUARD IS OpenFOAM'S min(vsf), WHICH INCLUDES THE BOUNDARY. min/max on a GeometricField are
+    // UNARY_REDUCTION_FUNCTION_WITH_BOUNDARY (GeometricFieldFunctions.C:427): internal field AND every
+    // patch field. This mined the cells only, so a field whose cells were all above the bound but whose
+    // one patch face was below it did not trip the guard at all -- OpenFOAM bounds and prints there.
+    // The `average:` in the message is the other way round: gAverage(vsf.primitiveField())
+    // (FieldFunctions.C:647), internal cells only, arithmetic, not volume-weighted.
     scalar minVsf = vsf.internal[0];
+    scalar maxVsf = vsf.internal[0];
+    long double sumVsf = 0.0L;
     for (label c = 0; c < nC; ++c)
     {
         minVsf = std::fmin(minVsf, vsf.internal[c]);
+        maxVsf = std::fmax(maxVsf, vsf.internal[c]);
+        sumVsf += vsf.internal[c];
     }
-    if (minVsf >= lowerBound) return minVsf;
+    const scalar avgVsf = static_cast<scalar>(sumVsf / static_cast<long double>(nC));
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const std::vector<scalar> pv = vsf.boundary[pi]->value();
+        for (label i = 0; i < patches[pi].size && i < static_cast<label>(pv.size()); ++i)
+        {
+            minVsf = std::fmin(minVsf, pv[i]);
+            maxVsf = std::fmax(maxVsf, pv[i]);
+        }
+    }
+    if (minVsf >= lowerBound) return minVsf;   // bound.C:40, a STRICT less-than
+
+    // The message, BEFORE the field is touched (bound.C:42 precedes bound.C:48) -- printing after the
+    // clamp would report min == lowerBound every time. Shared with the device arm so the two cannot
+    // drift on a line whose whole value is being comparable with OpenFOAM's own log.
+    if (fieldName)
+    {
+        printBounding(fieldName, minVsf, maxVsf, avgVsf);
+    }
 
     // average(max(vsf, lowerBound)): linear interpolation to the faces, then the area-weighted mean
     // over each cell's faces -- fvc::average is surfaceSum(magSf*ssf)/surfaceSum(magSf).

@@ -617,7 +617,7 @@ void correct(
         // the next iteration divides CDkOmega by this, so a floored cell contributes ~1e15. See
         // bound_cpp.cuh for the measurement.
         omega.evaluateBoundary();
-        bound(omega, 1e-15, m, g, patches);
+        bound(omega, 1e-15, m, g, patches, "omega");
     }
 
     // ---- k equation ------------------------------------------------------------------------------
@@ -708,7 +708,7 @@ void correct(
             std::printf("    [k] init=%.3e final=%.3e nIter=%d\n",
                         pk.initialResidual, pk.finalResidual, pk.nIterations);
         k.evaluateBoundary();
-        bound(k, 1e-15, m, g, patches);   // Foam::bound(k_, kMin_)
+        bound(k, 1e-15, m, g, patches, "k");   // Foam::bound(k_, kMin_)
     }
 
     // ---- correctNut(S2), boundary and EddyDiffusivity included -- ONE implementation, shared with

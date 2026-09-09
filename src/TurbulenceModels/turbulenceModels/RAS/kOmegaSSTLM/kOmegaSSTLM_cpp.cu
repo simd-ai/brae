@@ -468,7 +468,7 @@ void correctReThetatGammaInt(
             pbicgstab(M, ReThetat.internal, m, patches, tol, relTol, maxIter);
         if (res) res->ReThetat = p.initialResidual;
         ReThetat.evaluateBoundary();
-        bound(ReThetat, 0.0, m, g, patches);
+        bound(ReThetat, 0.0, m, g, patches, "ReThetat");
     }
 
     // The gamma prep is formed AFTER the ReThetat solve, so ReThetac, Flength and Fonset all see the NEW
@@ -515,7 +515,7 @@ void correctReThetatGammaInt(
             pbicgstab(M, gammaInt.internal, m, patches, tol, relTol, maxIter);
         if (res) res->gammaInt = p.initialResidual;
         gammaInt.evaluateBoundary();
-        bound(gammaInt, 0.0, m, g, patches);
+        bound(gammaInt, 0.0, m, g, patches, "gammaInt");
     }
 
     // ---- separation-induced transition -----------------------------------------------------------

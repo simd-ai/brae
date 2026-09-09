@@ -30,6 +30,8 @@ constexpr int TPB = 256;
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 // OF-style turbulence residual report store; clearTurbulenceReport/turbulenceReport (device_kepsilon.cu) wrap this.
 inline std::vector<ScalarSolveEntry>& turbStore() { static std::vector<ScalarSolveEntry> s; return s; }
+// ...and the same idiom for Foam::bound's message; see BoundingReport in device_kepsilon.cuh.
+inline std::vector<BoundingReport>& boundStore() { static std::vector<BoundingReport> s; return s; }
 
 // The DILU preconditioner every turbulence solve uses, or null for Jacobi. Held here, in the same
 // file-scope idiom as turbStore above, rather than threaded through deviceKEpsilonCorrect,
@@ -249,7 +251,9 @@ void deviceSolveScalarTransport(
     // WHICH GaussSeidel smoother the case named. true = symGaussSeidel (ascending then descending);
     // false = GaussSeidel, whose sweep loop in GaussSeidelSmoother.C is the ascending walk ONLY. They
     // are different smoothers, so the same relTol stops in a different place. Trailing, like nSweeps.
-    bool gsSymmetric = true)
+    bool gsSymmetric = true,
+    // OpenFOAM's lower bound for THIS field, used by the clamp AND by Foam::bound's message.
+    scalar boundFloor = 1e-15)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> Df;
@@ -548,7 +552,13 @@ void deviceSolveScalarTransport(
                                     (pc && pc->valid) ? 1 : turbPolyDeg());
     }
     turbStore().push_back({fieldName, perf});                    // record for the "Solving for <field>" line
-    if (boundPositive) deviceBoundField(dm, field, 1e-15);        // OF bound(field): neg -> local avg, not floor
+    // This IS the per-iteration bound on the incompressible path -- the models' own deviceBoundField
+    // calls there are the validate()-time ones -- so it is where Foam::bound's message comes from, and
+    // it needs the floor OpenFOAM uses for THIS field. That is 1e-15 for k, epsilon and omega but ZERO
+    // for nuTilda, ReThetat and gammaInt (SpalartAllmarasBase.C:487, kOmegaSSTLM.C:548 and :585); the
+    // floor was hardcoded here, which bounded those three against 1e-15 instead of 0 and would now also
+    // print a line OpenFOAM does not. A false diagnostic is worse than a missing one.
+    if (boundPositive) deviceBoundField(dm, field, boundFloor, fieldName, &db);
 }
 
 } // namespace brae

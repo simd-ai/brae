@@ -1,4 +1,5 @@
 // rhoSimpleFoamDriver.cu -- see the header for what is shared with the host driver and why.
+#include "bound_report.cuh"   // printBounding: Foam::bound's message, one formatter for both arms
 #include "brae_notice.cuh"
 #include "rhoSimpleFoamDriver.cuh"
 
@@ -933,6 +934,17 @@ int runMirrorCuda(const std::string& caseDir)
         if (r.count("pIters")) std::printf("   pIters %.0f", res("pIters"));
         if (r.count("uIters")) std::printf("   uIters %.0f", res("uIters"));
         std::printf("\n");
+        // Foam::bound's message, on the iterations where the guard fired. This driver's summary line is
+        // its own format rather than OpenFOAM's, so the bounding lines follow it instead of being
+        // interleaved with per-field solve lines that do not exist here -- but the LINE is OpenFOAM's,
+        // character for character, because its whole value is being greppable beside a real OF log.
+        // Nothing is printed on a healthy iteration, which is why this is not a change to the compact
+        // output in any run that does not need it.
+        for (const auto& b : boundingReports())
+        {
+            printBounding(b.field.c_str(), b.minValue, b.maxValue, b.average);
+        }
+        clearBoundingReports();   // drained here, so emptied here -- see gpuSimpleFoam.cu
         // OpenFOAM's continuityErrs.H (rhoSimpleFoam's pEqn.H:81 / pcEqn.H:94 include it every
         // iteration): contErr = fvc::div(phi) on the corrected MASS flux, sum local = deltaT * the
         // volume-weighted average of |contErr|, global = the same of contErr, cumulative summed over

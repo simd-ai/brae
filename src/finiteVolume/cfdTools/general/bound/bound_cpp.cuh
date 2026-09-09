@@ -26,13 +26,18 @@
 namespace brae {
 namespace cpu {
 
-// Returns the pre-bound minimum, so a caller can report it the way OpenFOAM's Info line does.
+// Returns the pre-bound minimum. `fieldName` makes it PRINT OpenFOAM's line when the guard fires --
+// this header used to say the return value was there "so a caller can report it the way OpenFOAM's Info
+// line does", and not one of the six callers ever did, so both of brae's arms bounded silently. The
+// message is emitted from inside bound(), where OpenFOAM emits it, rather than left to the callers.
+// Passing nullptr keeps a caller silent.
 scalar bound(
     GeometricField<scalar>&     vsf,
     scalar                      lowerBound,
     const PrimitiveMesh&        m,
     const FvGeometry&           g,
-    const std::vector<FvPatch>& patches);
+    const std::vector<FvPatch>& patches,
+    const char*                 fieldName = nullptr);
 
 } // namespace cpu
 } // namespace brae

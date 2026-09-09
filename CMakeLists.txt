@@ -95,6 +95,7 @@ add_library(brae_core STATIC
     src/finiteVolume/cfdTools/general/fvOptions/rotorDiskSource_cpp.cu
     src/finiteVolume/cfdTools/general/fvOptions/actuationDiskSource_cpp.cu
     src/finiteVolume/cfdTools/general/bound/bound_cpp.cu
+    src/finiteVolume/cfdTools/general/bound/bound_report.cu
     src/finiteVolume/cfdTools/general/MRF/MRF_cpp.cu
     src/finiteVolume/cfdTools/general/MRF/device_MRF.cu
     src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedSchemes_cpp.cu
@@ -1253,6 +1254,13 @@ set_tests_properties(precon_policy_one_rule PROPERTIES SKIP_RETURN_CODE 77 TIMEO
 add_test(NAME sa_precon_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_precon_vs_openfoam.sh)
 set_tests_properties(sa_precon_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+add_executable(test_bound_report tests/test_bound_report.cu)
+target_include_directories(test_bound_report PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_bound_report PRIVATE brae_core)
+add_test(NAME bound_report COMMAND test_bound_report)
+add_test(NAME bound_message_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/bound_message_vs_openfoam.sh)
+set_tests_properties(bound_message_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 add_test(NAME turb_precon_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/turb_precon_vs_openfoam.sh)
 set_tests_properties(turb_precon_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)

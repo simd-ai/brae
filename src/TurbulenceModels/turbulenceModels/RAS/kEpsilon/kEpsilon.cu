@@ -11,6 +11,7 @@
 #include <cstdio>
 #include "device_fvoptions.cuh"   // deviceSetValues: fvMatrix::setValues, shared with the energy equation
 #include "device_pcg.cuh"
+#include "device_scalar_transport.cuh"   // boundStore: where the bounding report is recorded
 #include "device_amg.cuh"      // deviceSymGaussSeidel: OpenFOAM's own sweep, when the case names a smoothSolver
 #include "device_blas.cuh"      // deviceAxpy / deviceCopy / deviceHadamard
 #include "device_simple.cuh"    // deviceRelaxDiag -- fvMatrix::relax, already gated
@@ -645,13 +646,32 @@ void assembleKEqn(
 }
 
 
+// `fieldName` is not decoration: OpenFOAM's bound() prints the field's name, its pre-bound min, max and
+// average whenever the guard fires (bound.C:38-46), and brae printed nothing on either arm. The report
+// is recorded in boundStore rather than printed here, because OpenFOAM emits it
+// immediately after that field's own "Solving for" line and this driver batches its per-iteration
+// output -- see ScalarSolveEntry.
 void boundField(
     DeviceBuffer<scalar>& x,
     const DeviceMesh&     dm,
     const DeviceBoundary& db,
-    scalar                floorV)
+    scalar                floorV,
+    const char*           fieldName)
 {
     const int nC = dm.nCells;
+    // BEFORE the clamp, as OpenFOAM does: printing afterwards would report min == floorV every time.
+    // The patch values are folded into min/max (but not the average) -- deviceBoundingReport has why.
+    {
+        DeviceBuffer<scalar> bvalReport;
+        if (db.n) deviceBCValue(db, x, bvalReport);
+        scalar bMin = 0;
+        scalar bMax = 0;
+        scalar bAvg = 0;
+        if (deviceBoundingReport(x, db.n ? &bvalReport : nullptr, floorV, bMin, bMax, bAvg))
+        {
+            boundStore().push_back({fieldName, bMin, bMax, bAvg});
+        }
+    }
     DeviceBuffer<scalar> num, den;
     zeroed(num, nC);
     zeroed(den, nC);
@@ -925,7 +945,7 @@ void correct(
                        &st.isWallCell, &epsilon, in, st.epsResidual,
                        dumpDir.empty() ? std::string() : dumpDir + "eps", in.gsEps);
 
-        boundField(epsilon, dm, dbEps, scalar(1e-15));
+        boundField(epsilon, dm, dbEps, scalar(1e-15), "epsilon");
     }
 
     // ---- the k equation ----------------------------------------------------------------------
@@ -939,7 +959,7 @@ void correct(
                        nullptr, nullptr, in, st.kResidual,
                        dumpDir.empty() ? std::string() : dumpDir + "k", in.gsK);
 
-        boundField(k, dm, dbK, scalar(1e-15));
+        boundField(k, dm, dbK, scalar(1e-15), "k");
     }
 
     correctNut(nut, nutBnd, alphat, alphatBnd, dm, dbK, dbEps, wall, k, epsilon, in);
