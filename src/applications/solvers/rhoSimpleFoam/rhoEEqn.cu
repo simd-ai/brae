@@ -54,22 +54,27 @@ void explicitUpwindDivKernel(
     const scalar* __restrict__ phiBnd,
     const scalar* __restrict__ vf,
     const scalar* __restrict__ vfBnd,
+    const scalar* __restrict__ w,     // face weights; null -> pos0(phi), i.e. upwind
     scalar*       __restrict__ d)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
 
+    // surfaceInterpolationScheme::dotInterpolate -- w*own + (1-w)*nei. A null `w` is the upwind weight
+    // pos0(phi), which is what this kernel computed unconditionally, so the upwind path is unchanged.
     scalar s = 0.0;
     for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)
     {
         const scalar pf = phiInt[f];
-        s += pf * ((pf >= 0.0) ? vf[owner[f]] : vf[nei[f]]);          // +owner
+        const scalar wf = w ? w[f] : ((pf >= 0.0) ? scalar(1) : scalar(0));
+        s += pf * (wf * vf[owner[f]] + (scalar(1) - wf) * vf[nei[f]]);          // +owner
     }
     for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
     {
         const int f = losort[k];
         const scalar pf = phiInt[f];
-        s -= pf * ((pf >= 0.0) ? vf[owner[f]] : vf[nei[f]]);          // -neighbour
+        const scalar wf = w ? w[f] : ((pf >= 0.0) ? scalar(1) : scalar(0));
+        s -= pf * (wf * vf[owner[f]] + (scalar(1) - wf) * vf[nei[f]]);          // -neighbour
     }
     for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)
     {
@@ -132,7 +137,8 @@ void zeroed(DeviceBuffer<scalar>& b, int n)
 bool schemePorted(cpu::rhoSimple::DivScheme s)
 {
     return s == cpu::rhoSimple::DivScheme::upwind
-        || s == cpu::rhoSimple::DivScheme::linearUpwind;
+        || s == cpu::rhoSimple::DivScheme::linearUpwind
+        || s == cpu::rhoSimple::DivScheme::limitedLinear;
 }
 
 void refuseUnsupported(const RhoEnergyInput& in)
@@ -140,11 +146,12 @@ void refuseUnsupported(const RhoEnergyInput& in)
     if (!schemePorted(in.schemeHe) || !schemePorted(in.schemeKE))
     {
         throw std::runtime_error(
-            "rhoSimpleFoam EEqn(cuda): only `Gauss upwind` and `Gauss linearUpwind <grad>` are ported for "
-            "the energy convection terms, and that applies to div(phi,Ekp|K) exactly as it does to "
-            "div(phi,he) -- they are separate fvSchemes entries. Refusing rather than substituting upwind "
-            "for the scheme the case named: a silently different convection term converges to a different "
-            "kinetic energy and therefore a different temperature.");
+            "rhoSimpleFoam EEqn(cuda): only `Gauss upwind`, `Gauss linearUpwind <grad>` and `Gauss "
+            "limitedLinear <k>` are ported for the energy convection terms, and that applies to "
+            "div(phi,Ekp|K) exactly as it does to div(phi,he) -- they are separate fvSchemes entries. "
+            "Refusing rather than substituting upwind for the scheme the case named: a silently "
+            "different convection term converges to a different kinetic energy and therefore a "
+            "different temperature.");
     }
     if (in.hasMRF)
     {
@@ -226,11 +233,24 @@ void kineticEnergyDivergence(
     out.resize(dm.nCells);
     if (dm.nCells > 0)
     {
+        // limitedLinear on div(phi,Ekp|K): a WEIGHT change on the face value, from the same limiter
+        // the implicit term uses. The limiter's gradient is the KE field's own Gauss gradient, limited
+        // by the case's grad(Ekp|K) cellLimited coefficient where it names one -- the driver refuses a
+        // gradient scheme brae does not compute, so reaching here means it is Gauss linear.
+        DeviceBuffer<scalar> wKE;
+        if (in.schemeKE == cpu::rhoSimple::DivScheme::limitedLinear)
+        {
+            DeviceBuffer<scalar> gx, gy, gz;
+            deviceGaussGrad(dm, ke, keB, gx, gy, gz);
+            if (in.limGradKEK > scalar(0)) deviceCellLimitGrad(dm, ke, keB, gx, gy, gz, in.limGradKEK);
+            deviceLimitedFaceWeights(dm, *in.phiInt, ke, gx, gy, gz,
+                                     scalar(2) / std::fmax(in.schemeCoeffKE, scalar(1e-15)), wKE);
+        }
         explicitUpwindDivKernel<<<nBlocks(dm.nCells), TPB>>>(
             dm.nCells, dm.owner.data(), dm.nei.data(), dm.ownerStart.data(),
             dm.losort.data(), dm.losortStart.data(), in.phiInt->data(),
             dm.bndCellStart.data(), dm.bndPerm.data(), in.phiBnd->data(),
-            ke.data(), keB.data(), out.data());
+            ke.data(), keB.data(), wKE.size() ? wKE.data() : nullptr, out.data());
     }
 
     // linearUpwind on the KE term is a deferred face correction on top of the upwind value. It does NOT
@@ -268,7 +288,22 @@ void assembleEEqn(
     // ---- fvm::div(phi, he) ------------------------------------------------------------------
     // The scheme refusal for BOTH convection terms is in refuseUnsupported above, where the host
     // reference keeps it too (rhoEEqn_cpp.cu:41-56, one guard on okKE && okHe).
-    deviceDivUpwindCoeffs(dm, *in.phiInt, E.diag, E.upper, E.lower);
+    // limitedLinear replaces the upwind coefficients rather than adding to the source -- it is a weight
+    // change, not a deferred correction. Same call sequence as the turbulence closure's assembleTransport.
+    if (in.schemeHe == cpu::rhoSimple::DivScheme::limitedLinear)
+    {
+        DeviceBuffer<scalar> hb, gx, gy, gz;
+        deviceBCValue(dbHe, he, hb);
+        deviceGaussGrad(dm, he, hb, gx, gy, gz);
+        if (in.limGradHeK > scalar(0)) deviceCellLimitGrad(dm, he, hb, gx, gy, gz, in.limGradHeK);
+        deviceDivLimitedCoeffs(dm, *in.phiInt, he, gx, gy, gz,
+                               scalar(2) / std::fmax(in.schemeCoeffHe, scalar(1e-15)),
+                               E.diag, E.upper, E.lower);
+    }
+    else
+    {
+        deviceDivUpwindCoeffs(dm, *in.phiInt, E.diag, E.upper, E.lower);
+    }
     deviceBCDivCoeffs(dbHe, *in.phiBnd, E.iC, E.bC);
     zeroed(E.source, nC);
 

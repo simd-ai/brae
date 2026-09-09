@@ -328,6 +328,13 @@ void deviceDivLimitedCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& ph
 // limitedLinearV (OF "Gauss limitedLinearV k_"): the NVDVTVDV vector limiter -- ONE limiter per face from the vector
 // U (gradfV=U[N]-U[P], gradcf=gradfV.(d&gradU[upwind]), r=2*gradcf/gradf-1), applied to all 3 components. U/gUx/gUy/gUz
 // are 3-element arrays (per component). Reduces to deviceDivUpwindCoeffs at limiter=0. Built implicitly like magSqr.
+// The limitedLinear FACE WEIGHTS alone, for an EXPLICIT divergence -- rhoSimpleFoam's fvc::div(phi,Ekp),
+// where the scheme changes the face value rather than any matrix coefficient. Same limiter as
+// deviceDivLimitedCoeffs, through the same device function, and the same currency: twoByk = 2/max(k,SMALL),
+// NOT the raw k the case writes. Face value is then w*field[own] + (1-w)*field[nei].
+void deviceLimitedFaceWeights(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& field,
+                              const DeviceBuffer<scalar>& gx, const DeviceBuffer<scalar>& gy, const DeviceBuffer<scalar>& gz,
+                              scalar twoByk, DeviceBuffer<scalar>& w);
 void deviceDivLimitedVCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>* U,
                              const DeviceBuffer<scalar>* gUx, const DeviceBuffer<scalar>* gUy, const DeviceBuffer<scalar>* gUz,
                              scalar twoByk, DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& upper, DeviceBuffer<scalar>& lower);

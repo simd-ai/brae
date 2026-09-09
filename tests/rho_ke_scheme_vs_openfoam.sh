@@ -117,11 +117,11 @@ say "div(phi,K) is read from its own entry, both directions, both arms" "$([ $fa
 
 # ARM C: an UNPORTED scheme on K alone must still refuse BY NAME, per arm.
 #
-# limitedLinear used to be that scheme on both arms. The HOST now assembles it -- the two entries stay
-# independent, which tests/eeqn_limitedlinear_vs_openfoam.sh checks against OpenFOAM at a developed
-# state -- so what belongs here is that the host RUNS it while the CUDA arm, whose closure still
-# assembles upwind only, refuses it by name. An arm that cannot compute a scheme must say so; an arm
-# that can must not be refused for it.
+# limitedLinear used to be that scheme on both arms; BOTH now assemble it, and the two entries stay
+# independent -- tests/eeqn_limitedlinear_vs_openfoam.sh checks that against OpenFOAM at a developed
+# state, on each arm, against its own validated upwind. What belongs HERE is only that neither arm
+# refuses a scheme it can compute. `Gauss linearUpwind` on K alone is still the unported one, and the
+# arms below cover it.
 stage "$W/C" "$UP" 'bounded Gauss limitedLinear 1'
 out=$( cd "$W/C" && BRAE_RHOSIMPLEFOAM_MIRROR=1 "$BIN" -case "$W/C" 2>&1 || true )
 [ -d "$W/C/$N" ] \
@@ -130,9 +130,9 @@ out=$( cd "$W/C" && BRAE_RHOSIMPLEFOAM_MIRROR=1 "$BIN" -case "$W/C" 2>&1 || true
 rm -rf "$W/C/$N"
 for arm in cuda; do
     out=$( cd "$W/C" && BRAE_RHOSIMPLEFOAM_MIRROR=$arm "$BIN" -case "$W/C" 2>&1 || true )
-    echo "$out" | grep -q "div(phi,Ekp|K)" && ! [ -d "$W/C/$N" ] \
-        && say "limitedLinear on div(phi,K) alone refuses by name (arm $arm)" ok \
-        || { echo "$out" | tail -3; say "limitedLinear on div(phi,K) alone refuses by name (arm $arm)" FAIL; }
+    [ -d "$W/C/$N" ] \
+        && say "limitedLinear on div(phi,K) alone RUNS on the $arm arm too, which now assembles it" ok \
+        || { echo "$out" | tail -3; say "limitedLinear on div(phi,K) alone RUNS on the $arm arm too, which now assembles it" FAIL; }
     rm -rf "$W/C"/[1-9]*
 done
 [ $fail = 0 ] && echo PASS || { echo FAIL; exit 1; }

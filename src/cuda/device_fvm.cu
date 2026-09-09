@@ -71,6 +71,73 @@ void divFaceKernel(int nIf, const scalar* __restrict__ phi, scalar* __restrict__
 // limitedLinear convection: W_f = limiter*CDweight + (1-limiter)*pos0(phi); limiter = clamp(twoByk*r,0,1),
 // r = NVDTVD gradient ratio. Reduces EXACTLY to upwind divFaceKernel at limiter=0. (OF gaussConvectionScheme +
 // limitedSurfaceInterpolationScheme::weights + NVDTVD::r.) gradc{X,Y,Z} = grad(field); d = (Cf-C_own)-(Cf-C_nei).
+// The NVDTVD limiter and its face WEIGHT, in one device function so the matrix coefficients below and
+// the explicit face values the energy equation needs cannot drift about what `limitedLinear k` means.
+// twoByk > 0 selects limitedLinear (limiter = clamp(2/k * r, 0, 1)); twoByk == 0 selects vanAlbada
+// (limiter = r(r+1)/(r^2+1), vanAlbada.H:85), which the Maxwell tutorials name for div(phi,sigma).
+// Same NVDTVD r either way -- only the limiter function differs, so they share this.
+__device__ __forceinline__ scalar limitedFaceWeight(
+    int f, int P, int N, scalar p, scalar cdwF,
+    const scalar* __restrict__ field,
+    const scalar* __restrict__ gx, const scalar* __restrict__ gy, const scalar* __restrict__ gz,
+    const scalar* __restrict__ dOwnX, const scalar* __restrict__ dOwnY, const scalar* __restrict__ dOwnZ,
+    const scalar* __restrict__ dNeiX, const scalar* __restrict__ dNeiY, const scalar* __restrict__ dNeiZ,
+    scalar twoByk)
+{
+    const scalar dx = dOwnX[f] - dNeiX[f], dy = dOwnY[f] - dNeiY[f], dz = dOwnZ[f] - dNeiZ[f];   // d = C[N]-C[P]
+    // NVDTVD::r, upwind-cell gradient (strict phi>0) projected on d, vs the face gradient.
+    const int U = (p > 0.0) ? P : N;
+    const scalar gradcf = dx*gx[U] + dy*gy[U] + dz*gz[U];
+    const scalar gradf  = field[N] - field[P];
+    scalar r;   // sign(s) = (s>=0)?1:-1  (OF Scalar.H)
+    if (fabs(gradcf) >= 1000.0 * fabs(gradf))
+        r = 2.0 * 1000.0 * ((gradcf >= 0.0) ? 1.0 : -1.0) * ((gradf >= 0.0) ? 1.0 : -1.0) - 1.0;
+    else
+        r = 2.0 * (gradcf / gradf) - 1.0;
+    scalar limiter;
+    if (twoByk > 0.0)
+    {
+        limiter = twoByk * r;
+        limiter = (limiter < 0.0) ? 0.0 : (limiter > 1.0 ? 1.0 : limiter);    // clamp(.,0,1)
+    }
+    else
+    {
+        limiter = r * (r + 1.0) / (r*r + 1.0);        // OF vanAlbada: NOT clamped, and it is <= 1 anyway
+    }
+    const scalar pos0 = (p >= 0.0) ? 1.0 : 0.0;
+    return limiter * cdwF + (1.0 - limiter) * pos0;
+}
+
+
+// The face weights alone, for a caller assembling an EXPLICIT divergence rather than matrix
+// coefficients -- rhoSimpleFoam's fvc::div(phi, Ekp). Same limiter, same currency (twoByk, not raw k).
+__global__
+void limitedFaceWeightsKernel(
+    int nIf,
+    const label* __restrict__ own,
+    const label* __restrict__ nei,
+    const scalar* __restrict__ cdw,
+    const scalar* __restrict__ phi,
+    const scalar* __restrict__ field,
+    const scalar* __restrict__ gx,
+    const scalar* __restrict__ gy,
+    const scalar* __restrict__ gz,
+    const scalar* __restrict__ dOwnX,
+    const scalar* __restrict__ dOwnY,
+    const scalar* __restrict__ dOwnZ,
+    const scalar* __restrict__ dNeiX,
+    const scalar* __restrict__ dNeiY,
+    const scalar* __restrict__ dNeiZ,
+    scalar twoByk,
+    scalar* __restrict__ w)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= nIf) return;
+    w[f] = limitedFaceWeight(f, own[f], nei[f], phi[f], cdw[f], field, gx, gy, gz,
+                             dOwnX, dOwnY, dOwnZ, dNeiX, dNeiY, dNeiZ, twoByk);
+}
+
+
 __global__
 void divLimitedFaceKernel(
     int nIf,
@@ -97,31 +164,8 @@ void divLimitedFaceKernel(
 
     const int P = own[f], N = nei[f];
     const scalar p = phi[f];
-    const scalar dx = dOwnX[f] - dNeiX[f], dy = dOwnY[f] - dNeiY[f], dz = dOwnZ[f] - dNeiZ[f];   // d = C[N]-C[P]
-    // NVDTVD::r, upwind-cell gradient (strict phi>0) projected on d, vs the face gradient.
-    const int U = (p > 0.0) ? P : N;
-    const scalar gradcf = dx*gx[U] + dy*gy[U] + dz*gz[U];
-    const scalar gradf  = field[N] - field[P];
-    scalar r;   // sign(s) = (s>=0)?1:-1  (OF Scalar.H)
-    if (fabs(gradcf) >= 1000.0 * fabs(gradf))
-        r = 2.0 * 1000.0 * ((gradcf >= 0.0) ? 1.0 : -1.0) * ((gradf >= 0.0) ? 1.0 : -1.0) - 1.0;
-    else
-        r = 2.0 * (gradcf / gradf) - 1.0;
-    // twoByk > 0 selects limitedLinear (limiter = clamp(2/k * r, 0, 1)); twoByk == 0 selects vanAlbada
-    // (limiter = r(r+1)/(r^2+1), vanAlbada.H:85), which the Maxwell tutorials name for div(phi,sigma).
-    // Same NVDTVD r either way -- only the limiter function differs, so they share one kernel.
-    scalar limiter;
-    if (twoByk > 0.0)
-    {
-        limiter = twoByk * r;
-        limiter = (limiter < 0.0) ? 0.0 : (limiter > 1.0 ? 1.0 : limiter);    // clamp(.,0,1)
-    }
-    else
-    {
-        limiter = r * (r + 1.0) / (r*r + 1.0);        // OF vanAlbada: NOT clamped, and it is <= 1 anyway
-    }
-    const scalar pos0 = (p >= 0.0) ? 1.0 : 0.0;
-    const scalar W = limiter * cdw[f] + (1.0 - limiter) * pos0;
+    const scalar W = limitedFaceWeight(f, P, N, p, cdw[f], field, gx, gy, gz,
+                                       dOwnX, dOwnY, dOwnZ, dNeiX, dNeiY, dNeiZ, twoByk);
     const scalar lo = -W * p;
     lower[f] = lo;
     upper[f] = lo + p;
@@ -566,6 +610,29 @@ void deviceDivLimitedCoeffs(
     cudaCheck(cudaGetLastError(), "divLimitedFace");
     diagGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), upper.data(), lower.data(), diag.data());
     cudaCheck(cudaGetLastError(), "diagGather");
+}
+
+
+void deviceLimitedFaceWeights(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& phiInt,
+    const DeviceBuffer<scalar>& field,
+    const DeviceBuffer<scalar>& gx,
+    const DeviceBuffer<scalar>& gy,
+    const DeviceBuffer<scalar>& gz,
+    scalar                      twoByk,
+    DeviceBuffer<scalar>&       w)
+{
+    const int nIf = dm.nInternalFaces;
+    w.resize(nIf);
+    if (!nIf) return;
+    limitedFaceWeightsKernel<<<nBlocks(nIf), TPB>>>(nIf, dm.owner.data(), dm.nei.data(), dm.w.data(),
+                                                    phiInt.data(), field.data(),
+                                                    gx.data(), gy.data(), gz.data(),
+                                                    dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
+                                                    dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
+                                                    twoByk, w.data());
+    cudaCheck(cudaGetLastError(), "limitedFaceWeights");
 }
 
 

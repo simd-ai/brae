@@ -250,6 +250,12 @@ RhoStepInput buildDeviceStepInput(
     // the whole limited-vs-unlimited gap, while the host arm read 1.5e-12.
     in.gradHeLimitK       = hin.gradHeLimitK;
     in.gradKELimitK       = hin.gradKELimitK;
+    // The energy pair's limitedLinear coefficients and limiter gradients, from the SAME host parse the
+    // host arm uses -- so the two arms cannot disagree about what the case asked for.
+    in.schemeCoeffHe      = hin.schemeCoeffHe;
+    in.schemeCoeffKE      = hin.schemeCoeffKE;
+    in.limGradHeK         = hin.limGradHeK;
+    in.limGradKEK         = hin.limGradKEK;
     in.gradULimitK        = hin.gradULimitK;
 
     in.tolU = hin.tolU;  in.relTolU = hin.relTolU;

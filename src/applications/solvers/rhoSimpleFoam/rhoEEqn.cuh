@@ -102,6 +102,14 @@ struct RhoEnergyInput
     cpu::rhoSimple::DivScheme schemeKE = cpu::rhoSimple::DivScheme::upwind;
     scalar gradHeLimitK = 0.0;
     scalar gradKELimitK = 0.0;
+    // `Gauss limitedLinear <k>` on each of the two entries: the RAW k the case wrote (the weights
+    // compute 2/max(k,SMALL) themselves), plus the cellLimited coefficient of the case's grad(<field>),
+    // which limits the LIMITER's gradient. See EnergyInput, whose host twin documents why that is a
+    // different lookup from gradHeLimitK.
+    scalar schemeCoeffHe = 1.0;
+    scalar schemeCoeffKE = 1.0;
+    scalar limGradHeK    = 0.0;
+    scalar limGradKEK    = 0.0;
 
     bool   correctedLaplacian = false;   // BOTH halves -- see the header
     scalar snGradLimitCoeff   = 0.0;

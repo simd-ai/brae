@@ -135,6 +135,11 @@ struct RhoStepInput
     bool   boundedU = false, boundedHe = false, boundedKE = false;
     scalar schemeCoeffU = 1.0;
     scalar gradULimitK = 0.0, gradHeLimitK = 0.0, gradKELimitK = 0.0;
+    // The energy pair's `Gauss limitedLinear <k>` coefficients (RAW k) and the cellLimited coefficient
+    // of the case's grad(<field>), which limits the LIMITER's own gradient -- a different lookup from
+    // the three above, which hold the gradient linearUpwind NAMES. See RhoEnergyInput.
+    scalar schemeCoeffHe = 1.0, schemeCoeffKE = 1.0;
+    scalar limGradHeK    = 0.0, limGradKEK    = 0.0;
     bool   correctedLaplacian = false;
     scalar snGradLimitCoeff   = 0.0;
     bool   isE = true;                    // he == "e" selects Ekp, "h" selects K

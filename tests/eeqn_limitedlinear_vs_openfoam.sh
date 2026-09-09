@@ -194,15 +194,41 @@ stage "$W/k3" "bounded Gauss limitedLinear 3" "$LL" 5; runBrae 1 "$W/k3"
     && say "a limitedLinear coefficient outside [0,1] is refused, as OpenFOAM does" ok \
     || say "a limitedLinear coefficient outside [0,1] is refused, as OpenFOAM does" FAIL
 
-# ---- ARM 6: the CUDA arm still REFUSES what its closure does not assemble --------------------------
-stage "$W/cu" "$LL" "$LL" 5; runBrae cuda "$W/cu"
-[ "$(its "$W/cu")" = 0 ] && grep -q "EEqn(cuda)" "$W/cu/run.log" \
-    && say "CUDA arm: refuses limitedLinear by name (its closure assembles upwind)" ok \
-    || say "CUDA arm: refuses limitedLinear by name (its closure assembles upwind)" FAIL
-stage "$W/cuU" "$UP" "$UP" 5; runBrae cuda "$W/cuU"
-[ "$(its "$W/cuU")" -ge 1 ] \
-    && say "fail-proof: the CUDA arm still runs the schemes it does assemble" ok \
-    || say "fail-proof: the CUDA arm still runs the schemes it does assemble" FAIL
+# ---- ARM 6: the CUDA arm assembles it too, on the same restart -------------------------------------
+# The device closure took the upwind coefficients unconditionally and refused limitedLinear by name. It
+# now dispatches both terms: the implicit one through deviceDivLimitedCoeffs, the explicit Ekp through
+# the same limiter's face weights. Measured on the same restart the host arm uses, so the two arms are
+# compared to the SAME OpenFOAM run and to each other's upwind baseline.
+restartFrom "$W/rc_ll" "$W/dev";  runBrae cuda "$W/rc_ll"
+restartFrom "$W/rc_up" "$W/devU"; runBrae cuda "$W/rc_up"
+[ "$(its "$W/rc_ll")" -ge 1 ] \
+    && say "CUDA arm: runs limitedLinear instead of refusing it" ok \
+    || { tail -2 "$W/rc_ll/run.log"; say "CUDA arm: runs limitedLinear instead of refusing it" FAIL; }
+dcl=$(relT "$W/rc_ll" "$W/r_of" "$NEXT")
+dcu=$(relT "$W/rc_up" "$W/ru_of" "$NEXT")
+# No worse than this arm's OWN validated upwind, with 3x of headroom -- not a round number, so it
+# cannot be loosened without noticing. Measured: 2.2e-11 against 1.5e-11.
+python3 -c "
+import sys
+ll, up = float(sys.argv[1]), float(sys.argv[2])
+sys.exit(0 if ll <= 3.0 * max(up, 1e-14) else 1)" "$dcl" "$dcu" \
+    && say "CUDA arm: limitedLinear is no worse than its own validated upwind" ok \
+    || say "CUDA arm: limitedLinear is no worse than its own validated upwind" FAIL
+printf '        (CUDA limitedLinear %s vs its upwind %s, each against its own OpenFOAM run)\n' "$dcl" "$dcu"
+# ...and the CUDA arm must still refuse a limiter gradient it cannot compute, like the host.
+stage "$W/culsq" "$LL" "$LL" 5 "leastSquares"; runBrae cuda "$W/culsq"
+[ "$(its "$W/culsq")" = 0 ] \
+    && say "CUDA arm: a limiter gradient brae does not compute is refused there too" ok \
+    || say "CUDA arm: a limiter gradient brae does not compute is refused there too" FAIL
+# ...and the two arms must SEPARATE the two entries the same way the host does.
+restartFrom "$W/rc_mix" "$W/m_he-limited-KE-upwind"; runBrae cuda "$W/rc_mix"
+dmix=$(relT "$W/rc_mix" "$W/mo_he-limited-KE-upwind" "$NEXT")
+python3 -c "
+import sys
+sys.exit(0 if float(sys.argv[1]) <= 3.0 * max(float(sys.argv[2]), 1e-14) else 1)" "$dmix" "$dcu" \
+    && say "CUDA arm: he-limited/KE-upwind matches OpenFOAM (entries read separately)" ok \
+    || say "CUDA arm: he-limited/KE-upwind matches OpenFOAM (entries read separately)" FAIL
+printf '        (%s)\n' "$dmix"
 
 [ "$fail" = 0 ] && echo "== PASSED ==" || echo "== FAILED =="
 exit "$fail"
