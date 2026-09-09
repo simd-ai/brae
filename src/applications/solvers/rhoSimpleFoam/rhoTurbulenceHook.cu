@@ -161,12 +161,18 @@ void correctTurbulence(
         sstIn.rhoCell = kin.rhoCell;           sstIn.rhoBndFace = kin.rhoBndFace;
         sstIn.nuCell  = kin.nuCell;            sstIn.nuBndFace  = kin.nuBndFace;
         sstIn.nuWallFace = kin.nuWallFace;     sstIn.nutBndFace = kin.nutBndFace;
+        sstIn.nutWallFace = kin.nutWallFace;
         sstIn.wfBndMask    = kin.wfBndMask;    sstIn.wallYBndFace = kin.wallYBndFace;
+        sstIn.f1OneMask    = &dev.f1OneMask;
+        // The second-scalar mask encodes 1 = epsilon, 2 = omega, so the kEpsilon buffers serve both.
+        sstIn.turbInletOmegaMask = kin.turbInletEpsMask;  sstIn.turbInletOmegaLen = kin.turbInletEpsLen;
+        sstIn.turbInletKMask     = kin.turbInletKMask;    sstIn.turbInletKInt     = kin.turbInletKInt;
         sstIn.nutWfCmu25Bnd = kin.nutWfCmu25Bnd;  sstIn.nutWfKappaBnd = kin.nutWfKappaBnd;
         sstIn.nutWfEBnd     = kin.nutWfEBnd;      sstIn.nutWfYplLamBnd = kin.nutWfYplLamBnd;
         sstIn.nutWfKindBnd  = kin.nutWfKindBnd;   sstIn.nutCalcMask    = &dev.nutCalcMask;
         sstIn.Ux = kin.Ux;  sstIn.Uy = kin.Uy;  sstIn.Uz = kin.Uz;
         sstIn.yCell = &dev.yCell;
+        sstIn.alphatWallMask = kin.alphatWallMask;  sstIn.alphatPrtFace = kin.alphatPrtFace;
         sstIn.boundedK = kin.boundedK;   sstIn.boundedOmega = kin.boundedEps;
         sstIn.limitedLinear = kin.limitedLinear;  sstIn.limiterCoeff = kin.limiterCoeff;
         sstIn.limGradK = kin.limGradK;
@@ -194,6 +200,12 @@ void correctTurbulence(
                               const_cast<DeviceBoundary&>(dev.dbK),
                               const_cast<DeviceBoundary&>(dev.dbEps),
                               const_cast<DeviceWallData&>(dev.wall), sstIn);
+        // The driver's residualControl reads buf.stages, which only the kEpsilon closure writes. Left
+        // discarded here, an SST case reported k and omega residuals of 0 every iteration and its
+        // `residualControl { k 1e-6; omega 1e-6; }` passed VACUOUSLY -- the run could stop on turbulence
+        // fields that were never checked.
+        buf.stages.kResidual   = sres.k;
+        buf.stages.epsResidual = sres.omega;
         return;
     }
     kEpsilonRAS::correct(f.k, f.epsilon, f.nut, f.nutBnd, &f.alphat, &f.alphatBnd,

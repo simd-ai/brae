@@ -260,27 +260,29 @@ RhoDeviceFields createDeviceFields(
     // lineage (kEpsilon.cu, kOmegaSST.cu) rather than the legacy whole-closure entry points. Any other
     // RAS model still refuses: the nut upload lives inside the closure's own set-up, so running one
     // would be a laminar run wearing a turbulent model's name.
-    // The mirror device kOmegaSST closure EXISTS (kOmegaSST.cu) but is NOT VALIDATED, so it is not
-    // reachable by default. Measured on validation/rhoSST, one iteration restarted from OpenFOAM's own
-    // state: the host arm lands at k 9.3e-06 / omega 5.0e-06 / nut 1.5e-06, this closure at
-    // k 3.1e-03 / omega 3.0e-02 / nut 2.8e-01. k is right; omega comes out TOO LOW in 1156 of 3200
-    // cells (162.7 against OpenFOAM's 281.4 at the worst), and nut = a1*k/max(a1*omega, ...) follows it
-    // up. So the defect is a term in the OMEGA equation, and the k equation and the transport machinery
-    // are not implicated.
+    // The mirror device kOmegaSST closure (kOmegaSST.cu) is VALIDATED and reachable by default.
+    // tests/rho_sst_device_vs_openfoam.sh is the gate; measured against real OpenFOAM v2412 with every
+    // linear solver at tolerance 1e-14 relTol 0 and the case's own momentum solver, so the comparison is
+    // of the discretisation and not of where two Krylov solvers stopped:
     //
-    // BRAE_SST_DEVICE=1 reaches it anyway, for that debugging. Until a gate is green the default is the
-    // refusal, because a turbulence closure that runs and is quietly wrong is the defect this project
-    // exists to catch -- and the host arm carries kOmegaSST today.
-    const bool sstDeviceOptIn = std::getenv("BRAE_SST_DEVICE")
-                             && std::string(std::getenv("BRAE_SST_DEVICE")) == "1";
-    if (hf.turbulent && !hf.rasModel.empty() && hf.rasModel != "kEpsilon"
-     && !(hf.rasModel == "kOmegaSST" && sstDeviceOptIn))
+    //   validation/rhoSST   t=1 and t=20, every field (k omega nut U T p)   <= 1.3e-12
+    //   validation/rhoTI    t=1 and t=20, k/omega/nut                       <= 5.3e-04
+    //   CONTROL             the LEGACY device closure, same harness         3e+07 x the bound
+    //
+    // Four defects closed to get there, each with its own fail-proof measurement in the gate's header:
+    // the wall production read a RECOMPUTED nutkWallFunction where omegaWallFunction reads the STORED
+    // nut patch value; F1 on a boundary face was the owner cell's instead of the blender evaluated ON
+    // the face; the turbulent inlets never refreshed; and the second-scalar inlet mask only ever matched
+    // mixingLengthEpsilon, so every kOmegaSST case had an empty omega mask.
+    //
+    // BRAE_SST_DEVICE is no longer consulted. It is still accepted and ignored, because scripts and
+    // benchmark harnesses set it.
+    if (hf.turbulent && !hf.rasModel.empty() && hf.rasModel != "kEpsilon" && hf.rasModel != "kOmegaSST")
         throw std::runtime_error(
             "brae rhoSimpleFoam (CUDA): RASModel '" + hf.rasModel + "' -- the device closure implements "
-            "the compressible kEpsilon, and its kOmegaSST is written but not yet validated (see "
-            "kOmegaSST.cu; BRAE_SST_DEVICE=1 opts in for debugging). This case would otherwise run with "
-            "NO turbulent viscosity at all, or with one that is measurably wrong. The host arm "
-            "(BRAE_RHOSIMPLEFOAM_MIRROR=1) carries kOmegaSST; refusing rather than running this case "
+            "the compressible kEpsilon and kOmegaSST. This case would otherwise run with NO turbulent "
+            "viscosity at all, or with one that is measurably wrong. The host arm "
+            "(BRAE_RHOSIMPLEFOAM_MIRROR=1) carries the same two; refusing rather than running this case "
             "without a validated closure.");
     // The device closure used to compute nutkWallFunction for EVERY wall-function face, so this arm
     // refused nutU and nutLowRe by name. It dispatches on the face's own NutWall code now, from the
@@ -388,7 +390,12 @@ RhoDeviceFields createDeviceFields(
                 {
                     if (bi >= d.nBndFaces) break;
                     if (kk == 0) { km[bi] = 1; ki[bi] = kc; d.hasTurbulentInlet = true; }
-                    if (ek == 1) { em[bi] = 1; el[bi] = ec; d.hasTurbulentInlet = true; }
+                    // The mask CARRIES the kind, because the device updater needs to know which of the
+                    // two mixing-length inlets it is evaluating: 1 = epsilon (Cmu^0.75*k^1.5/L),
+                    // 2 = omega (sqrt(k)/(Cmu^0.25*L)). Testing only for 1 here left every kOmegaSST
+                    // case with an EMPTY omega mask, so its turbulentMixingLengthFrequencyInlet never
+                    // fired -- rhoTI's omega inlet stayed at the placeholder 100 against OpenFOAM's 115.5.
+                    if (ek == 1 || ek == 2) { em[bi] = ek; el[bi] = ec; d.hasTurbulentInlet = true; }
                 }
             }
             if (d.hasTurbulentInlet)
@@ -420,15 +427,20 @@ RhoDeviceFields createDeviceFields(
         std::vector<scalar> nCmu25, nKappa, nE, nYpl;
         std::vector<label>  nKind;   // per boundary face: which nut wall function (a NutWall code)
         std::vector<scalar> eCmu25, eCmu75, eKappa, eE, eYpl;
+        std::vector<label> f1One;
         label bndIdx = 0;
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
             const bool isWF = isTurbWallPatch(patches, pi, wfPatch);
+            // A wall or empty patch takes F1 = 1; every other patch has it evaluated from the patch's
+            // own k, omega and cross-diffusion. Keyed on the MESH patch type, as OpenFOAM's wallDist is.
+            const bool f1IsOne = (patches[pi].type == "wall" || patches[pi].type == "empty");
             const WallFunctionCoeffs& nc = hf.nut.boundary[pi]->wallCoeffs();
             const WallFunctionCoeffs& ec = second.boundary[pi]->wallCoeffs();
             for (label i = 0; i < patches[pi].size; ++i, ++bndIdx)
             {
                 mask.push_back(isWF ? 1 : 0);
+                f1One.push_back(f1IsOne ? 1 : 0);
                 yBnd.push_back(isWF ? yW[pi][i] : scalar(0.0));
                 nCmu25.push_back(std::pow(nc.Cmu, 0.25));
                 nKappa.push_back(nc.kappa);
@@ -454,8 +466,10 @@ RhoDeviceFields createDeviceFields(
             }
         }
         mask.resize(static_cast<std::size_t>(d.nBndFaces), 0);
+        f1One.resize(static_cast<std::size_t>(d.nBndFaces), 0);
         yBnd.resize(static_cast<std::size_t>(d.nBndFaces), scalar(0.0));
         d.wfBndMask.copyFrom(mask);
+        d.f1OneMask.copyFrom(f1One);
         d.wallYBndFace.copyFrom(yBnd);
         nCmu25.resize(static_cast<std::size_t>(d.nBndFaces), std::pow(scalar(0.09), 0.25));
         nKappa.resize(static_cast<std::size_t>(d.nBndFaces), scalar(0.41));

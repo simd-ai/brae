@@ -66,6 +66,11 @@ struct RhoDeviceFields
     DeviceWallData       wall;
     DeviceBuffer<label>  wfBndMask;      // per BOUNDARY FACE: carries a turbulence wall function
     DeviceBuffer<scalar> wallYBndFace;   // nearWallDist y, per boundary face (0 off a wall-function patch)
+    // Per BOUNDARY FACE: 1 where the SST blender F1 must read 1 rather than be evaluated. OpenFOAM's
+    // wall-distance field y carries fixedValue 0 on the wall patches it was built from and zeroGradient
+    // everywhere else (patchDistMethodTemplates.C:40-48), so at a wall y_b = 0 drives arg1 to its
+    // min(...,10) cap and F1_b = tanh(10^4) = 1, while off a wall y_b is the adjacent cell's value.
+    DeviceBuffer<label>  f1OneMask;
     // nutkWallFunction's own Cmu^0.25 / kappa / E / yPlusLam per boundary face (the nut patch's entry,
     // WallFunctionCoeffs); the epsilon patch's ride in wall.wf* (item 16h-port).
     DeviceBuffer<scalar> nutWfCmu25Bnd, nutWfKappaBnd, nutWfEBnd, nutWfYplLamBnd;

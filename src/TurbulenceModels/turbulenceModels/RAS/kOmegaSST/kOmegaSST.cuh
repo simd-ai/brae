@@ -60,11 +60,35 @@ struct KOmegaSSTInput
     const DeviceBuffer<scalar>* nuBndFace  = nullptr;    // mu_b/rho_b per bnd face.  REQUIRED here
     const DeviceBuffer<scalar>* nuWallFace = nullptr;    // the same, in WALL-face order
     const DeviceBuffer<scalar>* nutBndFace = nullptr;
+    // The STORED wall nut in WALL-face order -- the nut boundary as it ENTERED correct().
+    // omegaWallFunctionFvPatchScalarField::calculate reads nutw from the nut patch field
+    // (omegaWallFunctionFvPatchScalarField.C:199-200) and pairs it with the CURRENT nu_w at :335-340.
+    // Recomputing a nutkWallFunction there instead injects d(nutw) = (dnutw/dnu)*dnu_w every
+    // iteration: measured k 1.98e-06 vs OpenFOAM at iteration 1 on rhoSST with every other field
+    // at 1e-13, confined to the 160 wall cells, sign-flipped between the hot and cold walls
+    // (predicted ratio -9.47, measured -8.8). Null keeps the recomputation.
+    const DeviceBuffer<scalar>* nutWallFace = nullptr;
 
     // The wall-function face set and each face's own coefficients, exactly as the kEpsilon closure
     // carries them -- omegaWallFunction reads the NUT patch's coefficients for its G0 the same way.
     const DeviceBuffer<label>*  wfBndMask    = nullptr;
     const DeviceBuffer<scalar>* wallYBndFace = nullptr;
+    // Per boundary face: 1 where F1 is 1 by construction (a wall or empty patch). See rhoCreateFields.cuh.
+    const DeviceBuffer<label>*  f1OneMask    = nullptr;
+
+    // --- the flux-conditional and turbulent inlets, refreshed where OpenFOAM refreshes them ---
+    // omega_.boundaryFieldRef().updateCoeffs() (kOmegaSSTBase.C:541) fires BEFORE the gradients, so
+    // turbulentMixingLengthFrequencyInlet recomputes omega's refValue from k's CURRENT patch values
+    // there; k's own turbulentIntensityKineticEnergyInlet refreshes later, inside the k equation's
+    // fvMatrix constructor (:600), from U's patch values. Both are inletOutlet underneath, so the flux
+    // switch has to resolve after the refValue moves. Left out, an inlet stays at the case file's
+    // placeholder `value`: measured on rhoTI, k's inlet sat at 0.1 where OpenFOAM computes 9.63 and the
+    // field was 7.5e-02 off at iteration 1. A null mask means the case has no such patch.
+    // omegaLen is the mixing length per boundary face; kInt the turbulent intensity.
+    const DeviceBuffer<label>*  turbInletOmegaMask = nullptr;
+    const DeviceBuffer<scalar>* turbInletOmegaLen  = nullptr;
+    const DeviceBuffer<label>*  turbInletKMask     = nullptr;
+    const DeviceBuffer<scalar>* turbInletKInt      = nullptr;
     const DeviceBuffer<scalar>* nutWfCmu25Bnd  = nullptr;
     const DeviceBuffer<scalar>* nutWfKappaBnd  = nullptr;
     const DeviceBuffer<scalar>* nutWfEBnd      = nullptr;
@@ -73,6 +97,13 @@ struct KOmegaSSTInput
     // Which boundary faces nut's own patch FILLS (a `calculated` nut), so correctNut writes those and
     // leaves a pinned fixedValue alone.
     const DeviceBuffer<label>*  nutCalcMask    = nullptr;
+    // alphat's boundary: WHICH faces EddyDiffusivity::correctNut writes, and each one's Prt. A
+    // compressible::alphatWallFunction face carries its OWN Prt_ (its .C:125), an assignable
+    // `calculated` face takes the model's, and a fixedValue face is left alone -- so this is a mask and
+    // a per-face factor, not one scalar. Writing rho_b*nut_b/Prt over the whole boundary instead drifts
+    // the energy equation every iteration.
+    const DeviceBuffer<label>*  alphatWallMask = nullptr;
+    const DeviceBuffer<scalar>* alphatPrtFace  = nullptr;
 
     const DeviceBuffer<scalar>* Ux = nullptr;
     const DeviceBuffer<scalar>* Uy = nullptr;

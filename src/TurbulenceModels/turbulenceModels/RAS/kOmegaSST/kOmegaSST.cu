@@ -6,6 +6,9 @@
 #include "device_blas.cuh"
 #include "device_fvoptions.cuh"
 #include "nut_wall_function.cuh"
+#include <fstream>
+#include <filesystem>
+#include <system_error>
 #include <cstdio>
 #include <cmath>
 #include <stdexcept>
@@ -48,6 +51,11 @@ void refuseUnsupported(const KOmegaSSTInput& in)
             + (in.divSchemeUnsupported.empty() ? std::string()
                                                : std::string(" (") + in.divSchemeUnsupported + ")")
             + ". Gauss upwind and Gauss limitedLinear <k> are ported, with or without `bounded`.");
+    if (in.co.F3)
+        throw std::runtime_error(
+            "kOmegaSST(cuda): the F3 near-wall switch is set. kOmegaSSTBase multiplies F23 by F3 "
+            "(kOmegaSSTBase.C:F23), which changes both the eddy-viscosity limiter and the production "
+            "limiter. Not implemented; refusing rather than silently running with F3 off.");
     if (in.hasNonWallTurbWallFunc)
         throw std::runtime_error(
             "kOmegaSST(cuda): a turbulence wall function sits on a patch that is not of type `wall`. "
@@ -126,6 +134,74 @@ void gatherCellToFaceKernel(
     face[i] = cell[faceCell[i]];
 }
 
+
+// F1 ON the boundary faces. F1 is a volScalarField built by field algebra from k_, omega_, y_ and
+// CDkOmega (kOmegaSSTBase.C:47-70), so its patch value is that expression evaluated with each
+// operand's PATCH value -- not the owner cell's F1 interpolated out, and not omega's BCs applied to
+// F1. The two differ the moment k_b or omega_b stops equalling the cell, i.e. from the second
+// iteration on a uniform start; measured k 3.4e-07 vs OpenFOAM in the inlet cells at iteration 2,
+// decaying downstream, with every wall row at 1e-12 -- because a zeroGradient k patch and a pinned
+// omega wall row both multiply this diffusivity by zero, so the inlet is the only patch it reaches.
+// CDkOmega's own patch value needs the gradients' patch values, and gaussGrad::correctBoundaryConditions
+// (gaussGrad.C:96-115) replaces their normal component with the patch snGrad: gb = gc + n*(snGrad - n&gc).
+// y_b is the wall-distance field's patch value: zeroGradient off a wall, so the owner cell's.
+__global__
+void f1BoundaryKernel(
+    int nB,
+    const label*  __restrict__ faceCell,
+    const label*  __restrict__ gFace,
+    const label*  __restrict__ f1One,       // 1 on a wall or empty patch: F1 = 1 there (y_b = 0)
+    const scalar* __restrict__ Sfx,
+    const scalar* __restrict__ Sfy,
+    const scalar* __restrict__ Sfz,
+    const scalar* __restrict__ magSf,
+    const scalar* __restrict__ deltaCoeffs,
+    const scalar* __restrict__ kCell,
+    const scalar* __restrict__ omCell,
+    const scalar* __restrict__ kB,
+    const scalar* __restrict__ omB,
+    const scalar* __restrict__ kgx,
+    const scalar* __restrict__ kgy,
+    const scalar* __restrict__ kgz,
+    const scalar* __restrict__ ogx,
+    const scalar* __restrict__ ogy,
+    const scalar* __restrict__ ogz,
+    const scalar* __restrict__ yCell,
+    const scalar* __restrict__ nuB,
+    scalar betaStar,
+    scalar alphaOmega2,
+    scalar* __restrict__ F1b)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nB) return;
+    if (f1One && f1One[i]) { F1b[i] = 1.0; return; }
+
+    const int    c  = faceCell[i];
+    const scalar ob = omB[i];
+    const scalar yb = yCell[c];              // y is zeroGradient off a wall patch
+    if (!(ob > 0.0) || !(yb > 0.0)) { F1b[i] = 1.0; return; }
+
+    const int    f    = gFace[i];
+    const scalar iMag = 1.0 / magSf[f];
+    const scalar nx = Sfx[f]*iMag, ny = Sfy[f]*iMag, nz = Sfz[f]*iMag;
+
+    const scalar snK = (kB[i]  - kCell[c])  * deltaCoeffs[i];
+    const scalar snO = (ob     - omCell[c]) * deltaCoeffs[i];
+    const scalar nK  = nx*kgx[c] + ny*kgy[c] + nz*kgz[c];
+    const scalar nO  = nx*ogx[c] + ny*ogy[c] + nz*ogz[c];
+    const scalar gKx = kgx[c] + nx*(snK - nK), gKy = kgy[c] + ny*(snK - nK), gKz = kgz[c] + nz*(snK - nK);
+    const scalar gOx = ogx[c] + nx*(snO - nO), gOy = ogy[c] + ny*(snO - nO), gOz = ogz[c] + nz*(snO - nO);
+
+    const scalar CDb = (2.0*alphaOmega2) * (gKx*gOx + gKy*gOy + gKz*gOz) / ob;
+    const scalar CDp = fmax(CDb, scalar(1.0e-10));
+    const scalar a   = fmax((1.0/betaStar)*sqrt(fmax(kB[i], scalar(0.0)))/(ob*yb),
+                            500.0*nuB[i]/(yb*yb*ob));
+    const scalar b   = (4.0*alphaOmega2)*kB[i]/(CDp*yb*yb);
+    const scalar arg1 = fmin(fmin(a, b), scalar(10.0));
+    const scalar a4   = arg1*arg1*arg1*arg1;
+    F1b[i] = tanh(a4);
+}
+
 // `bounded Gauss ...` -- boundedConvectionScheme subtracts fvm::Sp(fvc::div(phi), psi), i.e. divPhi*V
 // off the diagonal, with the EQUATION's own (mass) flux. The kEpsilon closure folds this into its
 // reaction kernels; the SST's reactions are shared with the legacy path and take no such flag, so it
@@ -183,6 +259,47 @@ void wallNutDispatchKernel(
     nutBnd[i] = nutkWallFunctionValue(yp, nuFace[i], yplLam, kappa, E);
 }
 
+// BRAE_DUMP_TERMS=<dir>: every contribution to this field's equation, separately, per cell, per call --
+// the SAME columns and the same capture points as the legacy path's dump in device_scalar_transport.cuh,
+// so a file from each closure diffs line for line. A global norm cannot say WHICH term is wrong; this
+// can. The reaction is passed as a callable so the diagonal is captured either side of it.
+template <typename Reaction>
+void dumpTerms(const char* fieldName, int nC, const DeviceBuffer<scalar>& field,
+               PressureMatrix& M, Reaction&& reaction)
+{
+    const char* termDir = std::getenv("BRAE_DUMP_TERMS");
+    if (!termDir) { reaction(); return; }
+    DeviceBuffer<scalar> dgConv;
+    deviceCopy(dgConv, M.diag);
+    reaction();
+    static int callNo = 0;
+    const int myCall = callNo++;
+    std::error_code tec;
+    std::filesystem::create_directories(termDir, tec);
+    char fn[512];
+    std::snprintf(fn, sizeof fn, "%s/%s_%04d", termDir, fieldName, myCall);
+    std::ofstream o(fn);
+    o.precision(10);
+    const std::vector<scalar> hF = field.host(), hDc = dgConv.host(),
+                              hDr = M.diag.host(), hSr = M.source.host();
+    o << "# cell field diagConvLap diagAfterReact srcReact\n";
+    for (int c = 0; c < nC; ++c)
+        o << c << ' ' << hF[c] << ' ' << hDc[c] << ' ' << hDr[c] << ' ' << hSr[c] << '\n';
+    // The OFF-DIAGONALS and the BOUNDARY coefficients. The per-cell columns above cover the diagonal
+    // and the source only, and internalCoeffs never enters M.diag -- it is folded in at solve time --
+    // so a wrong boundary diffusivity is invisible there. That is exactly where the boundary DEff
+    // (DomB/DkB) lands, and where a near-wall error would come from.
+    auto l2 = [](const DeviceBuffer<scalar>& b)
+    {
+        if (!b.size()) return double(0);
+        const std::vector<scalar> h = b.host();
+        double s2 = 0; for (scalar v : h) s2 += double(v) * double(v);
+        return std::sqrt(s2);
+    };
+    std::printf("  [sst] %-5s |upper| %.10g  |lower| %.10g  |iC| %.10g  |bC| %.10g\n",
+                fieldName, l2(M.upper), l2(M.lower), l2(M.iC), l2(M.bC));
+}
+
 } // namespace
 
 
@@ -230,8 +347,22 @@ void correct(
     // omega = sqrt(omegaVis^2 + omegaLog^2) -- OpenFOAM's DEFAULT blender here is binomial with n = 2,
     // not the stepwise the epsilon wall function takes.
     DeviceBuffer<scalar> omega0, G0;
+    // omega_.boundaryFieldRef().updateCoeffs() (kOmegaSSTBase.C:541), in full: the turbulent inlet
+    // recomputes its refValue from k's CURRENT patch values FIRST, then the flux switch resolves which
+    // faces are fixedValue at all -- reversed, the switch would act on the previous iteration's value.
+    // The Cmu is turbulentMixingLengthFrequencyInletFvPatchScalarField.C:137-138's
+    // `turbModel.coeffDict().getOrDefault("Cmu", 0.09)`, which for kOmegaSST is 0.09 unless the case
+    // wrote a Cmu into kOmegaSSTCoeffs -- betaStar is a different key the inlet never reads.
+    if (in.turbInletOmegaMask && in.turbInletOmegaLen)
+        deviceUpdateTurbulentInletSecond(dbK, *in.turbInletOmegaMask, *in.turbInletOmegaLen,
+                                         in.co.Cmu, dbOmega);
+    if (in.phiBnd) deviceUpdateInletOutlet(dbOmega, *in.phiBnd);
+
+    // nutWallFace is the STORED nut boundary, which is what omegaWallFunction's G0 reads; with it the
+    // /*nutWall=*/0 literal below is inert for G0, since the stored value already carries the family.
     deviceWallOmegaG0(wall, k, *in.Ux, *in.Uy, *in.Uz, scalar(0), omega0, G0, in.co,
-                      /*nutWall=*/0, /*atmZ0=*/0.0, /*atmBoundNut=*/true, in.nuWallFace);
+                      /*nutWall=*/0, /*atmZ0=*/0.0, /*atmBoundNut=*/true, in.nuWallFace,
+                      in.nutWallFace);
     // The wall cells' production is the wall function's, not the strain's.
     if (wall.nWF > 0)
     {
@@ -260,15 +391,21 @@ void correct(
     deviceBlend(F1, in.co.beta1,  in.co.beta2,  beta);
     deviceGbyNuLimit(GbyNu0, omega, F2, S2, in.co, GbyNu0lim);
 
-    // The boundary diffusivities take F1 EXTRAPOLATED from the adjacent cell, not deviceBCValue on
-    // omega's boundary: that would apply OMEGA's conditions to F1, so a fixedValue omega inlet would
-    // return omega's refValue instead of the blend. F1 is a calculated field; its patch value is the
-    // assigned one.
+    // The boundary diffusivities take F1 EVALUATED ON the patch faces -- see f1BoundaryKernel. Not
+    // deviceBCValue on omega's boundary (that applies OMEGA's conditions to F1, so a fixedValue omega
+    // inlet returns omega's refValue where F1 must lie in [0,1]), and not the owner cell's F1 either.
     DeviceBuffer<scalar> F1b, DomB, DkB;
     if (in.nutBndFace && in.nutBndFace->size())
     {
         F1b.resize(static_cast<std::size_t>(nB));
-        gatherCellToFaceKernel<<<nBlk(nB), TPB>>>(nB, dbOmega.faceCell.data(), F1.data(), F1b.data());
+        f1BoundaryKernel<<<nBlk(nB), TPB>>>(
+            nB, dbOmega.faceCell.data(), dm.bndGFace.data(),
+            in.f1OneMask ? in.f1OneMask->data() : nullptr,
+            dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(), dm.magSf.data(), dbOmega.deltaCoeffs.data(),
+            k.data(), omega.data(), kbv.data(), obv.data(),
+            kgx.data(), kgy.data(), kgz.data(), ogx.data(), ogy.data(), ogz.data(),
+            in.yCell->data(), in.nuBndFace->data(),
+            in.co.betaStar, in.co.alphaOmega2, F1b.data());
         cudaCheck(cudaGetLastError(), "kOmegaSST F1 boundary");
         deviceDEff(F1b, *in.nutBndFace, in.co.alphaOmega1, in.co.alphaOmega2, scalar(0), DomB);
         deviceDEff(F1b, *in.nutBndFace, in.co.alphaK1,     in.co.alphaK2,     scalar(0), DkB);
@@ -304,6 +441,9 @@ void correct(
         rng("CD", CD); rng("F1", F1); rng("F2", F2);
         rng("gamma", gamma); rng("beta", beta); rng("GbyNu0lim", GbyNu0lim);
         rng("omega", omega); rng("k", k); rng("nut", nut);
+        std::printf("  [sst] sizes: nC %d  nB %d  dm.nBndFaces %d  DomB %zu  DkB %zu  nutBnd %zu\n",
+                    nC, nB, dm.nBndFaces, DomB.size(), DkB.size(),
+                    in.nutBndFace ? in.nutBndFace->size() : std::size_t(0));
     }
 
     const turbulence::TransportScheme sc = schemeOf(in);
@@ -327,13 +467,15 @@ void correct(
         PressureMatrix M;
         turbulence::assembleScalarTransport(M, dm, dbOmega, omega, gammaFace,
                                             DomB.size() ? DomB : gammaFace, sc);
-        deviceOmegaReaction(dm.V, gamma, beta, GbyNu0lim, F1, CD, omega, divU,
-                            M.diag, M.source, in.rhoCell);
         if (in.boundedOmega)
         {
             boundedSpKernel<<<nBlk(nC), TPB>>>(nC, divPhi.data(), dm.V.data(), M.diag.data());
             cudaCheck(cudaGetLastError(), "kOmegaSST bounded omega");
         }
+        dumpTerms("omega", nC, omega, M, [&]{
+            deviceOmegaReaction(dm.V, gamma, beta, GbyNu0lim, F1, CD, omega, divU,
+                                M.diag, M.source, in.rhoCell);
+        });
 
         turbulence::solveScalarEqn(M, omega, dm, in.relaxEquationOmega, in.relaxOmega,
                                    in.fvoOmegaMask, in.fvoOmegaVal,
@@ -347,6 +489,31 @@ void correct(
                                    sv, res.omega, std::string(), in.gsOmega);
         // Foam::bound(omega_, omegaMin_) -- the mirror's area-weighted form, not a clamp.
         kEpsilonRAS::boundField(omega, dm, dbOmega, in.co.omegaMin, "omega");
+        if (std::getenv("BRAE_SST_DEBUG"))
+        {
+            std::printf("  [sst] omega solve: initialResidual %.6g  (tol %.3g relTol %.3g maxIter %d gs %d)\n",
+                        (double)res.omega, (double)in.tol, (double)in.relTol, in.maxIter, (int)in.gsOmega);
+            std::printf("  [sst] relaxOmega %.6g (named %d)  relaxK %.6g (named %d)\n",
+                        (double)in.relaxOmega, (int)in.relaxEquationOmega,
+                        (double)in.relaxK, (int)in.relaxEquationK);
+            std::printf("  [sst] precon %s, valid %d, polyDeg %d\n",
+                        in.precon ? "SET" : "NULL", in.precon ? (int)in.precon->valid : -1, in.polyDeg);
+            // Is every wall cell still pinned to omega0? fvMatrix::setValues writes psi as well as the
+            // matrix, so after the solve a wall cell must hold exactly the wall function's value. If it
+            // does not, the constraint is not reaching the solve.
+            const std::vector<scalar> ho = omega.host(), h0 = omega0.host();
+            const std::vector<label>  hw = wall.isWallCell.host();
+            int nw = 0, ndrift = 0; scalar worst = 0;
+            for (int c = 0; c < nC; ++c)
+            {
+                if (!hw[c]) continue;
+                ++nw;
+                const scalar d = std::fabs(ho[c] - h0[c]) / std::fmax(std::fabs(h0[c]), scalar(1e-30));
+                if (d > scalar(1e-10)) { ++ndrift; worst = std::fmax(worst, d); }
+            }
+            std::printf("  [sst] wall cells %d, drifted off omega0 after the solve: %d (worst rel %.3g)\n",
+                        nw, ndrift, (double)worst);
+        }
     }
 
     // ---- the k equation -----------------------------------------------------------------------
@@ -362,16 +529,25 @@ void correct(
         }
         deviceInterpolate(dm, DkEff, gammaFace);
 
+        // k_'s own boundary refresh, at OpenFOAM's point for it: the fvMatrix constructor at
+        // kOmegaSSTBase.C:600, i.e. AFTER the gradients and F1 were taken from the previous iteration's
+        // k boundary. turbulentIntensityKineticEnergyInlet reads U's CURRENT patch values.
+        if (in.turbInletKMask && in.turbInletKInt)
+            deviceUpdateTurbulentInletK(dbU, *in.turbInletKMask, *in.turbInletKInt, dbK);
+        if (in.phiBnd) deviceUpdateInletOutlet(dbK, *in.phiBnd);
+
         PressureMatrix M;
         turbulence::assembleScalarTransport(M, dm, dbK, k, gammaFace,
                                             DkB.size() ? DkB : gammaFace, sc);
-        deviceKReactionSST(dm.V, k, omega, G, divU, in.co, M.diag, M.source,
-                           /*gammaIntEff=*/nullptr, /*FDES=*/nullptr, in.rhoCell);
         if (in.boundedK)
         {
             boundedSpKernel<<<nBlk(nC), TPB>>>(nC, divPhi.data(), dm.V.data(), M.diag.data());
             cudaCheck(cudaGetLastError(), "kOmegaSST bounded k");
         }
+        dumpTerms("k", nC, k, M, [&]{
+            deviceKReactionSST(dm.V, k, omega, G, divU, in.co, M.diag, M.source,
+                               /*gammaIntEff=*/nullptr, /*FDES=*/nullptr, in.rhoCell);
+        });
 
         // No wall mask: kOmegaSSTBase.C has no boundaryManipulate for k -- kqRWallFunction is
         // zeroGradient, and constraining k in wall cells the way omega is constrained is a different
@@ -380,6 +556,8 @@ void correct(
                                    in.fvoKMask, in.fvoKVal, nullptr, nullptr,
                                    sv, res.k, std::string(), in.gsK);
         kEpsilonRAS::boundField(k, dm, dbK, in.co.kMin, "k");
+        if (std::getenv("BRAE_SST_DEBUG"))
+            std::printf("  [sst] k     solve: initialResidual %.6g\n", (double)res.k);
     }
 
     // ---- correctNut(S2) -----------------------------------------------------------------------
@@ -429,12 +607,12 @@ void correct(
         alphat->resize(nC);
         deviceHadamard(*alphat, *in.rhoCell, nut);
         deviceScale(*alphat, scalar(1) / in.Prt);
-        if (alphatBnd && in.rhoBndFace && nB > 0)
-        {
-            alphatBnd->resize(nB);
-            deviceHadamard(*alphatBnd, *in.rhoBndFace, nutBnd);
-            deviceScale(*alphatBnd, scalar(1) / in.Prt);
-        }
+        // The BOUNDARY half goes through the same kernel the kEpsilon closure uses, on the same mask and
+        // the same per-face Prt -- see KOmegaSSTInput::alphatWallMask. Doing it whole-field here wrote
+        // over the fixedValue faces and used the model's Prt on the wall-function ones.
+        if (alphatBnd && in.alphatWallMask && in.alphatPrtFace && in.rhoBndFace && nB > 0)
+            kEpsilonRAS::alphatBoundary(*alphatBnd, nB, *in.alphatWallMask, *in.rhoBndFace,
+                                        nutBnd, *in.alphatPrtFace);
     }
 }
 
