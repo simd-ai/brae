@@ -175,9 +175,12 @@ struct StepInput
     // acts only as fvOptions.correct(he) after the energy solve, clamping he between he(p,Tmin) and
     // he(p,Tmax). That is why a case whose only option is this one need not set hasFvOptions -- any
     // OTHER option still does, and is still refused by name.
-    bool   limitT    = false;
-    scalar limitTmin = 0.0;
-    scalar limitTmax = 0.0;
+    // Per-patch NutWall code, owned by the field set (see RhoSimpleFields::nutWallKind).
+    const std::vector<int>* nutWallKind = nullptr;
+    bool        limitT    = false;
+    scalar      limitTmin = 0.0;
+    scalar      limitTmax = 0.0;
+    std::string limitTname;   // the fvOptions dict key, for the report line OpenFOAM prints
 };
 
 // field name -> the INITIAL residual of its first solve this iteration, which is what simpleControl's

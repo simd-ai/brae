@@ -1,4 +1,5 @@
 // _cpp REFERENCE implementation -- see rhoSimpleFoam_cpp.cuh for the OpenFOAM provenance and the order.
+#include "limit_temperature_report.cuh"   // OF prints LimitedCells on every limitTemperature call
 #include "rhoSimpleFoam_cpp.cuh"
 #include "kOmegaSST_cpp.cuh"
 #include "cell_wall_dist.cuh"
@@ -628,10 +629,26 @@ Residuals rhoSimpleStep(
     {
         const scalar heMin = hConstTToHe(in.limitTmin, f.thermo);
         const scalar heMax = hConstTToHe(in.limitTmax, f.thermo);
+        // The two numbers OpenFOAM reports, taken BEFORE the clamp: min(T) and max(T) of the CURRENT
+        // temperature, which is the previous thermo.correct()'s -- limitTemperature.C:164-166 reads
+        // thermo.T() at the top of correct(he), and thermo.correct() only runs below. `min`/`max` of a
+        // scalarField are INTERNAL only (it is a Field, not a GeometricField), so no patch value enters.
+        scalar unlimitedTmin = f.T.internal.empty() ? 0.0 : f.T.internal[0];
+        scalar unlimitedTmax = unlimitedTmin;
         for (label c = 0; c < nC; ++c)
         {
-            if      (f.he.internal[c] < heMin) f.he.internal[c] = heMin;
-            else if (f.he.internal[c] > heMax) f.he.internal[c] = heMax;
+            if (f.T.internal[c] < unlimitedTmin) unlimitedTmin = f.T.internal[c];
+            if (f.T.internal[c] > unlimitedTmax) unlimitedTmax = f.T.internal[c];
+        }
+        // Counted over the INTERNAL cells only: OpenFOAM's nBelowMin/nAboveMax come from the
+        // forAll(cells_) loop, and its boundary pass below sets only `changedValues` (limitTemperature.C
+        // :175-186 vs :221-247). Counting the faces too would inflate the number against the oracle.
+        label nBelowMin = 0;
+        label nAboveMax = 0;
+        for (label c = 0; c < nC; ++c)
+        {
+            if      (f.he.internal[c] < heMin) { f.he.internal[c] = heMin; ++nBelowMin; }
+            else if (f.he.internal[c] > heMax) { f.he.internal[c] = heMax; ++nAboveMax; }
         }
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
@@ -645,6 +662,13 @@ Residuals rhoSimpleStep(
             f.he.boundary[pi]->setStoredValues(std::move(hb));
         }
         f.he.evaluateBoundary();
+        // limitTemperature.C:200-215, both lines, every call. See limit_temperature_report.cuh for why
+        // a silent clamp was the wrong shape: these counts are the only evidence the option did
+        // anything, and they are what a gate can compare against OpenFOAM's log line for line.
+        printLimitTemperature(in.limitTname.empty() ? "limitTemperature" : in.limitTname.c_str(),
+                              /*isLower=*/true,  nBelowMin, nC, in.limitTmin, unlimitedTmin);
+        printLimitTemperature(in.limitTname.empty() ? "limitTemperature" : in.limitTname.c_str(),
+                              /*isLower=*/false, nAboveMax, nC, in.limitTmax, unlimitedTmax);
     }
 
     // EEqn.H ends with thermo.correct(): T, and therefore psi, move here and everything below sees them.
@@ -1133,11 +1157,17 @@ Residuals rhoSimpleStep(
         sd.scalars("nutIn", f.nut.internal);
         kEpsilonRef::KEResiduals kres;
         kres.captureStages = sd.on;   // the as-solved systems, for the device twin's dump to diff against
+        // The per-patch nut wall function, the same selection construction used at validate(). Passing
+        // it here and not there (or the reverse) would make the first iteration's wall nut disagree
+        // with every later one -- the drift the closures' shared correctNutField exists to prevent.
+        kEpsilonRef::NutWallSelection nsel;
+        nsel.kind = in.nutWallKind;
+        nsel.U    = &f.U;
         kEpsilonRef::correct(f.U, f.k, f.epsilon, f.nut, f.phi, /*nu=*/0.0, m, g, patches,
                              in.relaxEpsilon, in.relaxK, in.tolTurb, in.relTolTurb, in.maxIterTurb,
                              keco, &kres, in.boundedTurb, /*dropTerm=*/0, &comp, in.fvOpts,
                              in.relaxEquationEps, in.relaxEquationK, /*constrainBeforeWall=*/true,
-                             in.limitedLinearTurb, in.turbLimiterCoeff, in.minIterTurb);
+                             in.limitedLinearTurb, in.turbLimiterCoeff, in.minIterTurb, &nsel);
         res["epsilon"] = kres.epsilon;
         res["k"]       = kres.k;
         sd.scalars("kOut", f.k.internal);

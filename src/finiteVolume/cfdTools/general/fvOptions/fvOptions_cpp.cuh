@@ -94,8 +94,16 @@ struct OptionList
 {
     std::vector<Option> options;
     bool empty() const { return options.empty(); }
-    // The first option whose type this port does not implement, or "" when all are implemented.
-    std::string firstUnsupported() const;
+    // The first ACTIVE option whose type this port does not implement, or "" when all are implemented.
+    //
+    // `implementedByCaller` names types the CALLING DRIVER applies OUTSIDE this list. The catch-all in
+    // read() marks every type it does not build an Option for -- which is right, because a driver that
+    // does nothing with an option must refuse it -- but the rhoSimpleFoam mirror applies
+    // limitTemperature in its own energy step (rhoSimpleFoam_cpp.cu, and device_fvoptions.cu's
+    // limitEnergyKernel on the CUDA arm), so for that driver the catch-all was refusing a case brae
+    // runs. The list is a CALLER's promise, not a global exemption: every other driver still refuses
+    // the same type by passing nothing.
+    std::string firstUnsupported(const std::vector<std::string>& implementedByCaller = {}) const;
 };
 
 // Read system/fvOptions or constant/fvOptions (OpenFOAM looks in both). Absent file => empty list.

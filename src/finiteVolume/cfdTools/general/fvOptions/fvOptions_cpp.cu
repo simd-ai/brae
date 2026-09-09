@@ -90,10 +90,18 @@ tensor transformDiag(const vector& diag, const vector& e1in, const vector& e2in)
 } // namespace
 
 
-std::string OptionList::firstUnsupported() const
+std::string OptionList::firstUnsupported(const std::vector<std::string>& implementedByCaller) const
 {
     for (const Option& o : options)
-        if (o.active && !o.unsupported.empty()) return o.unsupported;
+    {
+        if (!o.active || o.unsupported.empty()) continue;
+        // Scanned rather than short-circuited on the FIRST match: a case can declare an option the
+        // caller implements AND one it does not, and returning "" for the first would hide the second.
+        bool ok = false;
+        for (const std::string& t : implementedByCaller)
+            if (o.unsupported == t) { ok = true; break; }
+        if (!ok) return o.unsupported;
+    }
     return "";
 }
 

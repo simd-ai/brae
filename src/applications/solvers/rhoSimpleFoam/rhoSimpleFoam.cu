@@ -1,4 +1,5 @@
 // CUDA driver for rhoSimpleFoam. See rhoSimpleFoam.cuh for the provenance, the order and the contract.
+#include "limit_temperature_report.cuh"   // OF reports LimitedCells on every call
 #include "rhoSimpleFoam.cuh"
 #include "device_fvoptions.cuh"
 #include <string>   // deviceSetValues: fvOptions.constrain(EEqn)
@@ -88,15 +89,31 @@ void correctFluxCompressible(
 // fvOptions.correct(he) for limitTemperature: clamp he between he(p,Tmin) and he(p,Tmax). A CORRECTION,
 // so nothing in the assembly changes -- it acts on the solved field and then thermo.correct() turns it
 // into a temperature. The bounds arrive already in energy; see the note in RhoStepInput.
+//
+// COUNTING, because OpenFOAM reports how many cells it touched (limitTemperature.C:200-215) and a clamp
+// that says nothing looks the same whether it moved one cell or all of them. The two counters are the
+// only extra work: they are incremented on the branch the clamp already takes, so the arithmetic is
+// unchanged and `fmin(fmax(...))` becomes the equivalent if/else OpenFOAM itself writes.
 __global__ void limitEnergyKernel(
     int    nC,
     scalar heMin,
     scalar heMax,
-    scalar* __restrict__ he)
+    scalar* __restrict__ he,
+    int* __restrict__ nBelow,
+    int* __restrict__ nAbove)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
-    he[c] = fmin(fmax(he[c], heMin), heMax);
+    if (he[c] < heMin)
+    {
+        he[c] = heMin;
+        if (nBelow) atomicAdd(nBelow, 1);
+    }
+    else if (he[c] > heMax)
+    {
+        he[c] = heMax;
+        if (nAbove) atomicAdd(nAbove, 1);
+    }
 }
 
 
@@ -736,10 +753,44 @@ Residuals rhoSimpleStep(
         // overwrite.
         if (in.limitHe)
         {
-            limitEnergyKernel<<<(nC + 255) / 256, 256>>>(nC, in.heMin, in.heMax, f.he.data());
+            // T's extremes BEFORE the clamp, exactly as OpenFOAM reads thermo.T() at the top of
+            // correct(he) -- the temperature the PREVIOUS thermo.correct() left, since this iteration's
+            // runs below. Internal only: OF's min(T)/max(T) are on a scalarField, not a GeometricField.
+            DeviceBuffer<scalar> tMinMaxMean(3);
+            deviceMinMaxMeanInto(f.T, tMinMaxMean.data());
+            DeviceBuffer<label> counts(2);
+            cudaCheck(cudaMemsetAsync(counts.data(), 0, 2 * sizeof(label), cudaStreamPerThread),
+                      "rhoSimpleFoam limitEnergy counters");
+            limitEnergyKernel<<<(nC + 255) / 256, 256>>>(
+                nC, in.heMin, in.heMax, f.he.data(),
+                reinterpret_cast<int*>(counts.data()),
+                reinterpret_cast<int*>(counts.data()) + 1);
             cudaCheck(cudaGetLastError(), "rhoSimpleFoam limitEnergy");
+            // ONE publish and ONE wait for all four, through the same mailbox every other grouped read
+            // uses -- four separate reads here would be four queue drains in the energy phase.
+            int    nBelow = 0, nAbove = 0;
+            scalar tMin = 0, tMax = 0;
+            const DeviceReadValue rv[4] = {
+                {reinterpret_cast<const int*>(counts.data()),     &nBelow, true},
+                {reinterpret_cast<const int*>(counts.data()) + 1, &nAbove, true},
+                {tMinMaxMean.data(),     &tMin, false},
+                {tMinMaxMean.data() + 1, &tMax, false},
+            };
+            deviceReadValues(rv, 4);
+            const char* on = in.limitTname.empty() ? "limitTemperature" : in.limitTname.c_str();
+            printLimitTemperature(on, /*isLower=*/true,  nBelow, nC, in.limitTmin, tMin);
+            printLimitTemperature(on, /*isLower=*/false, nAbove, nC, in.limitTmax, tMax);
         }
         deviceBCValue(dbHe, f.he, f.heBnd);
+        // THE BOUNDARY HALF, which this arm did not have. OpenFOAM clamps he on every patch whose field
+        // does not fix a value and then re-evaluates (limitTemperature.C:229-272); the host mirror does
+        // the same (rhoSimpleFoam_cpp.cu). Here only the internal field was clamped and the boundary was
+        // re-derived from it, which lands on the right answer for a zeroGradient patch -- the derived
+        // value comes from a clamped cell -- and leaves a `calculated` patch outside the range, because
+        // nothing re-derives one. AFTER deviceBCValue, so the re-derivation cannot undo it; the kernel
+        // skips bcType 1 (fixesValue), which is OpenFOAM's own test. The kernel already existed and had
+        // no caller on this path at all.
+        if (in.limitHe) deviceFvoLimitEnergyBoundary(dbHe, in.heMin, in.heMax, f.heBnd);
     }
 
     // EEqn.H ends with thermo.correct(): T, and therefore psi, move HERE and everything below sees them.

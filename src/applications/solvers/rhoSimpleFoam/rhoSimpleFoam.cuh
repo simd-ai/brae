@@ -261,6 +261,12 @@ struct RhoStepInput
     // arrive already converted to ENERGY because the conversion needs the thermo, and the thermo is the
     // caller's here for the same reason thermoCorrect and updateRho are hooks.
     bool   limitHe = false;
+    // The T limits and the option's dict key travel alongside the energy bounds because the REPORT is
+    // in temperature even though the clamp is in energy: OpenFOAM prints Tmin=/Tmax= as the case wrote
+    // them, not the he values they were converted to.
+    scalar limitTmin = 0.0;
+    scalar limitTmax = 0.0;
+    std::string limitTname;
     scalar heMin   = 0.0;
     scalar heMax   = 0.0;
 

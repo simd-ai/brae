@@ -17,6 +17,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace brae {
 namespace cpu {
@@ -29,6 +30,11 @@ struct CaseRefusals
     std::string fvOptionUnsupported;      // its type name, for the refusal message
     bool   limitT = false;                // limitTemperature over all cells (implemented)
     scalar limitTmin = 0, limitTmax = 0;
+    // The fvOptions DICT KEY, not the type: OpenFOAM's report line prints name_ (limitTemperature.C:203
+    // `type() << "=" << name_`), so a case calling its option `limitT` prints `limitTemperature=limitT`
+    // and one calling it `clamp` prints `limitTemperature=clamp`. Reporting the type twice would be a
+    // line that never matches the oracle.
+    std::string limitTname;
     fvOptions::OptionList opts;           // the IMPLEMENTED options, BY VALUE -- the caller owns the
                                           // lifetime (a dangling in.fvOpts was the old static's risk)
 };
@@ -51,6 +57,15 @@ inline CaseRefusals deriveCaseRefusals(const std::string& caseDir, const Primiti
         {
             const FoamDict* o = &entry.second;
             const std::string ty = o->wordOr("type", "");
+            // `active false` is not a comment-out: OpenFOAM still CONSTRUCTS the option and still reads
+            // its dictionary, but fvOptionList's correct()/addSup() skip it (fvOption.C:72
+            // active_(dict_.getOrDefault("active", true)); fvOptionListTemplates.C:386 gates
+            // source.correct(field) on source.isActive()). This walk did not read the key, so a case
+            // declaring `limitTemperature { active false; }` had its clamp APPLIED by brae and skipped
+            // by OpenFOAM -- and, the other way, an inactive unimplemented option refused a case
+            // OpenFOAM runs. fvOptions::read already reads it the same way (fvOptions_cpp.cu:125-126).
+            const std::string act = o->wordOr("active", "true");
+            if (act == "false" || act == "no" || act == "off" || act == "0") continue;
             if (ty == "limitTemperature")
             {
                 const std::string sel = o->wordOr("selectionMode", "all");
@@ -59,9 +74,10 @@ inline CaseRefusals deriveCaseRefusals(const std::string& caseDir, const Primiti
                         "rhoSimpleFoam: limitTemperature with selectionMode '" + sel
                         + "'. brae applies it over all cells; a cell subset is a different option. "
                           "Refusing rather than limiting the wrong cells.");
-                cr.limitT    = true;
-                cr.limitTmin = o->scalarOr("min", 0.0);
-                cr.limitTmax = o->scalarOr("max", 0.0);
+                cr.limitT     = true;
+                cr.limitTname = entry.first;
+                cr.limitTmin  = o->scalarOr("min", 0.0);
+                cr.limitTmax  = o->scalarOr("max", 0.0);
                 std::printf("  fvOption limitTemperature [%g, %g]\n",
                             (double)cr.limitTmin, (double)cr.limitTmax);
             }
@@ -74,7 +90,21 @@ inline CaseRefusals deriveCaseRefusals(const std::string& caseDir, const Primiti
     }
     {
         cr.opts = fvOptions::read(caseDir, m);
-        const std::string bad = cr.opts.firstUnsupported();
+        // limitTemperature is IMPLEMENTED by this driver, on both arms -- the host clamps he between
+        // he(p,Tmin) and he(p,Tmax) after the energy solve (rhoSimpleFoam_cpp.cu, EEqn.H:28) and the
+        // CUDA arm runs limitEnergyKernel (device_fvoptions.cu) for the same thing. It is resolved out
+        // of the option list by the dict walk above, so fvOptions::read never builds an Option for it
+        // and its catch-all (fvOptions_cpp.cu:202-206) marks the type unsupported. That mark was then
+        // promoted straight back into hasFvOptions below, overriding the branch above and refusing
+        // aerofoilNACA0012 -- the only rhoSimpleFoam tutorial whose sole blocker was a capability brae
+        // already had. Measured: with system/fvOptions deleted the host arm runs all 10 iterations and
+        // tracks OpenFOAM to ~1% on U, e, k and omega.
+        //
+        // The exemption is CONDITIONAL on the walk having accepted this case's option: an unsupported
+        // selectionMode already threw above, so reaching here with cr.limitT set means brae will really
+        // apply it. Every other driver passes nothing and still refuses limitTemperature by name.
+        const std::string bad = cr.opts.firstUnsupported(
+            cr.limitT ? std::vector<std::string>{"limitTemperature"} : std::vector<std::string>{});
         if (!bad.empty())
         {
             cr.hasFvOptions = true;
