@@ -227,6 +227,9 @@ void correct(
     // caller keeps the arithmetic it was gated with.
     bool   limitedLinear = false,
     scalar limiterCoeff  = 1.0,
+    // cellLimited k of the case's grad(<field>), which limits the LIMITER's gradient.
+    // 0 => unlimited, which is what this closure did unconditionally.
+    scalar limGradK      = 0.0,
     // fvSolution solvers/<field>/minIter, OF's lduMatrix::solver floor on the iteration count
     // (PBiCGStab.C:262-265: the loop continues while nIterations < minIter even when converged).
     int    minIter       = 0,

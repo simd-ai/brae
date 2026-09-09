@@ -51,6 +51,7 @@ FvScalarMatrix divWithScheme(
     const GeometricField<scalar>& vf,
     bool                          limitedLinear,
     scalar                        limiterCoeff,
+    scalar                        limGradK,      // cellLimited k of the case's grad(<field>), 0 => none
     const PrimitiveMesh&          m,
     const FvGeometry&             g,
     const std::vector<FvPatch>&   patches)
@@ -64,7 +65,12 @@ FvScalarMatrix divWithScheme(
     {
         vfb[pi] = vf.boundary[pi]->value();
     }
-    const std::vector<vector> gradVf = fvc::gaussGrad(vf.internal, vfb, m, g, patches);
+    std::vector<vector> gradVf = fvc::gaussGrad(vf.internal, vfb, m, g, patches);
+    // ...and the case's own limiter on that gradient. OpenFOAM resolves `grad(k)` through gradSchemes
+    // like any other gradient (LimitedScheme.C:56-59), so a cellLimited entry limits the LIMITER's
+    // gradient too. This took the raw Gauss gradient whatever the case said; the driver refuses a
+    // gradient scheme brae does not compute, and passes the cellLimited coefficient through here.
+    if (limGradK > 0.0) cpu::cellLimitGrad(gradVf, vf.internal, vfb, limGradK, m, g, patches);
     return fvm::div(phi.internal, phi.boundary, vf,
                     cpu::limitedSchemes::limitedLinearWeights(phi.internal, vf, gradVf,
                                                               limiterCoeff, m, g),
@@ -203,6 +209,7 @@ void correct(
     bool constrainBeforeWall,
     bool   limitedLinear,
     scalar limiterCoeff,
+    scalar limGradK,
     int    minIter,
     const NutWallSelection* nutSel)
 {
@@ -375,7 +382,7 @@ void correct(
             epsilon.boundary[pi]->updateFromFlux(phi.boundary[pi]);
         }
 
-        FvScalarMatrix M = divWithScheme(phi, epsilon, limitedLinear, limiterCoeff, m, g, patches);
+        FvScalarMatrix M = divWithScheme(phi, epsilon, limitedLinear, limiterCoeff, limGradK, m, g, patches);
         if (res && res->captureStages)
         {
             captureSystem(M, patches, res->epsDivD, res->epsDivSrc, &res->epsDivUpper, &res->epsDivLower);
@@ -563,7 +570,7 @@ void correct(
             k.boundary[pi]->updateFromFlux(phi.boundary[pi]);
         }
 
-        FvScalarMatrix M = divWithScheme(phi, k, limitedLinear, limiterCoeff, m, g, patches);
+        FvScalarMatrix M = divWithScheme(phi, k, limitedLinear, limiterCoeff, limGradK, m, g, patches);
         {
             // `Gauss linear corrected` changes TWO things, and kOmegaSST in this same directory already
             // does both: the implicit face coefficient becomes gamma*nonOrthDeltaCoeffs*magSf, and the

@@ -285,14 +285,14 @@ TurbulenceHookOptions buildTurbulenceHookOptions(
     opt.Prt                   = hf.Prt;
     opt.bounded               = hin.boundedTurb;
     opt.correctedLaplacian    = hin.correctedLaplacian;
-    // limitedLinear is assembled on the HOST closure and not on the device one, so the device arm
-    // must keep refusing it by name: the flag the host parse produces is carried through unchanged,
-    // plus the device's own scheme limit.
-    opt.divSchemeUnsupported = !hin.turbDivUnsupported.empty()
-                             ? hin.turbDivUnsupported
-                             : (hin.limitedLinearTurb
-                                ? std::string("Gauss limitedLinear (device closure is upwind-only)")
-                                : std::string());
+    // limitedLinear is assembled on BOTH closures now -- the device one dispatches to
+    // deviceDivLimitedCoeffs in assembleTransport, on the same limiter gradient the host takes. Only
+    // what the host parse already refused (a `bounded` or coefficient mismatch between the two scalars,
+    // linearUpwind, or a limiter gradient brae does not compute) still reaches this arm as a refusal.
+    opt.divSchemeUnsupported = hin.turbDivUnsupported;
+    opt.limitedLinear        = hin.limitedLinearTurb;
+    opt.limiterCoeff         = hin.turbLimiterCoeff;
+    opt.limGradK             = hin.turbLimGradK;
     opt.relaxEquationK   = hin.relaxEquationK;
     opt.relaxK           = hin.relaxK;
     opt.relaxEquationEps = hin.relaxEquationEps;

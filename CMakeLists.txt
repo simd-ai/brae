@@ -1284,6 +1284,9 @@ set_tests_properties(nut_wall_function_vs_openfoam PROPERTIES SKIP_RETURN_CODE 7
 add_test(NAME eeqn_limitedlinear_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/eeqn_limitedlinear_vs_openfoam.sh)
 set_tests_properties(eeqn_limitedlinear_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 2400 LABELS slow)
+add_test(NAME turb_limitedlinear_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/turb_limitedlinear_vs_openfoam.sh)
+set_tests_properties(turb_limitedlinear_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 2400 LABELS slow)
 add_test(NAME turb_precon_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/turb_precon_vs_openfoam.sh)
 set_tests_properties(turb_precon_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)

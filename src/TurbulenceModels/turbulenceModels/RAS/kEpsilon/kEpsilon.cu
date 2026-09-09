@@ -396,9 +396,11 @@ void refuseUnported(const KEpsilonInput& in)
             "assemble"
             + (in.divSchemeUnsupported.empty() ? std::string()
                                                : std::string(" (") + in.divSchemeUnsupported + ")")
-            + ". Only Gauss upwind, with or without `bounded`, is ported -- which is what the host "
-              "reference assembles. Running upwind where the case said otherwise is the substitution "
-              "this project keeps finding.");
+            + ". Gauss upwind and Gauss limitedLinear <k> are ported, with or without `bounded`. The "
+              "message here used to add \"which is what the host reference assembles\" -- that was "
+              "stale: the host closure has assembled limitedLinear since divWithScheme existed, so the "
+              "sentence described a restriction only this arm had. Running upwind where the case said "
+              "otherwise is the substitution this project keeps finding.");
     }
     if (in.hasNonWallTurbWallFunc)
     {
@@ -545,9 +547,28 @@ void assembleTransport(
                                         in.rhoBndFace->data(), sigma, gammaBnd.data());
     cudaCheck(cudaGetLastError(), "kEpsilon DEff boundary");
 
-    // fvm::div(phi, field), upwind. The boundary half carries the flux-conditional switch the caller has
+    // fvm::div(phi, field). The boundary half carries the flux-conditional switch the caller has
     // already applied to db.
-    deviceDivUpwindCoeffs(dm, *in.phiInt, M.diag, M.upper, M.lower);
+    //
+    // limitedLinear is a WEIGHT change, not a correction, so it replaces the upwind coefficients rather
+    // than adding to the source -- the same shape the host closure's divWithScheme takes. The limiter's
+    // gradient is the field's own Gauss gradient, limited by the case's grad(<field>) cellLimited
+    // coefficient when it names one; the corrected-laplacian block below builds the same three buffers
+    // the same way, and this is deliberately the identical call sequence so the two cannot drift.
+    if (in.limitedLinear)
+    {
+        DeviceBuffer<scalar> bval, gx, gy, gz;
+        deviceBCValue(db, field, bval);
+        deviceGaussGrad(dm, field, bval, gx, gy, gz);
+        if (in.limGradK > scalar(0)) deviceCellLimitGrad(dm, field, bval, gx, gy, gz, in.limGradK);
+        deviceDivLimitedCoeffs(dm, *in.phiInt, field, gx, gy, gz,
+                               scalar(2) / std::fmax(in.limiterCoeff, scalar(1e-15)),
+                               M.diag, M.upper, M.lower);
+    }
+    else
+    {
+        deviceDivUpwindCoeffs(dm, *in.phiInt, M.diag, M.upper, M.lower);
+    }
     zeroed(M.source, nC);
     deviceBCDivCoeffs(db, *in.phiBnd, M.iC, M.bC);
 

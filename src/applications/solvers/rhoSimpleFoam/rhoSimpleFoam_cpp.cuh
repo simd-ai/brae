@@ -155,6 +155,9 @@ struct StepInput
     // `limitedLinear k` (the weights functions compute twoByk themselves, scheme_parse.cuh).
     bool   limitedLinearTurb = false;
     scalar turbLimiterCoeff  = 1.0;
+    // cellLimited k of the LIMITER's gradient for k/epsilon|omega -- grad(k) through gradSchemes, which
+    // is a different lookup from KEpsilonCoeffs::gradKLimitK's use in the corrected laplacian.
+    scalar turbLimGradK      = 0.0;
     bool   linearUpwindTurb  = false; // kOmegaSST assembles it; kEpsilon does not -- refused upstream
     scalar relaxK = 1.0, relaxEpsilon = 1.0;
     scalar tolTurb = 1e-12, relTolTurb = 0.0;

@@ -188,6 +188,16 @@ struct KEpsilonInput
     const DeviceBuffer<label>*  fvoKMask   = nullptr;
     const DeviceBuffer<scalar>* fvoKVal    = nullptr;
 
+    // div(phi,k) and div(phi,epsilon|omega) as `Gauss limitedLinear <k>`: ONE flag and ONE coefficient
+    // for both, because the closures carry one -- entries that disagree are refused by the driver
+    // rather than silently taking k's. `limiterCoeff` is the RAW k the case wrote; the weights compute
+    // 2/max(k,SMALL) themselves. `limGradK` is the cellLimited coefficient of the case's grad(<field>),
+    // which limits the LIMITER's own gradient (LimitedScheme.C:56-59) -- a different lookup from
+    // KEpsilonCoeffs::gradKLimitK's use in the corrected laplacian.
+    bool        limitedLinear = false;
+    scalar      limiterCoeff  = 1.0;
+    scalar      limGradK      = 0.0;
+
     // --- refusals ---
     bool        hasCoupledPatches      = false;
     bool        hasUnportedFvOption    = false;

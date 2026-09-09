@@ -277,6 +277,33 @@ StepInput buildStepInput(
         in.limitedLinearTurb = dK.limited && dS.limited;
         in.turbLimiterCoeff  = dK.coeff;   // RAW k of `limitedLinear k` -- see scheme_parse.cuh
         if (dK.linearUpwind || dS.linearUpwind) in.turbDivUnsupported = "Gauss linearUpwind";
+
+        // THE LIMITER'S GRADIENT, for the turbulence pair, on the same rule as the energy pair above:
+        // OpenFOAM builds limitedLinear's limiter from fvc::grad(<field>) resolved through the case's
+        // gradSchemes (LimitedScheme.C:56-59), so `grad(k)` and `grad(epsilon|omega)` decide it, and
+        // brae computes Gauss linear gradients only. Both closures took a plain unlimited Gauss
+        // gradient here regardless of what the case asked for, so a `grad(k) cellLimited Gauss linear 1`
+        // was read into gradKLimitK, used for the corrected laplacian, and dropped for the limiter.
+        if (in.limitedLinearTurb)
+        {
+            const FieldGradScheme gK = parseFieldGradScheme(caseDir, "k");
+            const FieldGradScheme gS = parseFieldGradScheme(caseDir, secondT);
+            if (!gK.gaussLinear || !gS.gaussLinear)
+                in.turbDivUnsupported =
+                    "a limiter gradient brae does not compute -- div(phi,k)/div(phi," + secondT +
+                    ") are `Gauss limitedLinear`, whose limiter OpenFOAM builds from fvc::grad of each "
+                    "field through the case's gradSchemes (LimitedScheme.C:56-59), and this case "
+                    "resolves them to `" + (gK.gaussLinear ? gS.raw : gK.raw) + "` where brae has Gauss "
+                    "linear only";
+            // ONE coefficient for both, as the closures carry one flag for both. Entries that disagree
+            // refuse above rather than silently taking k's.
+            else if (gK.cellLimitK != gS.cellLimitK)
+                in.turbDivUnsupported =
+                    "grad(k) and grad(" + secondT + ") name different cellLimited coefficients (brae "
+                    "carries one limiter gradient for both)";
+            else
+                in.turbLimGradK = gK.cellLimitK;
+        }
     }
 
     return in;

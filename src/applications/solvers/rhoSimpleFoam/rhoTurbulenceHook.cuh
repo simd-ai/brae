@@ -64,6 +64,12 @@ struct TurbulenceHookOptions
     bool           bounded = false;
     bool           correctedLaplacian = false;
     std::string    divSchemeUnsupported;   // non-empty -> the closure refuses by name
+    // `Gauss limitedLinear <k>` on div(phi,k) and div(phi,epsilon|omega). ONE flag and ONE coefficient
+    // for both, matching the closures; limGradK is the cellLimited coefficient of the case's
+    // grad(<field>), which limits the LIMITER's gradient. See KEpsilonInput.
+    bool           limitedLinear = false;
+    scalar         limiterCoeff  = 1.0;
+    scalar         limGradK      = 0.0;
     bool           relaxEquationK = true,  relaxEquationEps = true;
     scalar         relaxK = 1.0, relaxEps = 1.0;
     scalar         tol = 1e-12, relTol = 0.0;

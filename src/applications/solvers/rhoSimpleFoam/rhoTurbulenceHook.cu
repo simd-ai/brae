@@ -135,6 +135,9 @@ void correctTurbulence(
     kin.boundedK = kin.boundedEps = opt.bounded;
     kin.hasNonUpwindDivScheme = !opt.divSchemeUnsupported.empty();
     kin.divSchemeUnsupported  = opt.divSchemeUnsupported;
+    kin.limitedLinear         = opt.limitedLinear;
+    kin.limiterCoeff          = opt.limiterCoeff;
+    kin.limGradK              = opt.limGradK;
     kin.correctedLaplacian = opt.correctedLaplacian;
     kin.relaxEquationK   = opt.relaxEquationK;   kin.relaxK   = opt.relaxK;
     kin.relaxEquationEps = opt.relaxEquationEps; kin.relaxEps = opt.relaxEps;
