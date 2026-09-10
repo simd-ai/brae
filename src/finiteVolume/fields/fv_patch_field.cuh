@@ -1308,6 +1308,9 @@ protected:
     // OpenFOAM wrote on a restart. The seed is a starting point; vfUpdated_ is a statement about
     // whether the flow has been consulted, and the two are not the same thing.
     std::vector<scalar> vf_;            // per-face valueFraction (freestream seed 0.5; flux-conditional 0)
+    // Read-only view of vfUpdated_ for the flux-conditional patches' construction-time extrapolation,
+    // which must not overwrite a value once a real blend exists.
+    bool valueFractionComputed() const { return vfUpdated_; }
 
 private:
     bool                velocitySign_;  // true: vf=0.5-0.5 U.n/|U| (velocity); false: 0.5+0.5 ... (pressure)
@@ -1338,14 +1341,31 @@ public:
     bool assignable() const override { return true; }    // OF inletOutletFvPatchField.H:164
     bool isInletOutlet() const override { return true; }
     // The mixed base takes a velocity-sign flag and a freestream flag for the far-field family; neither
-    // applies here, so the flux-conditional families get their own four-argument constructor and the
-    // valueFraction comes from updateFromFlux instead.
+    // applies here, so the flux-conditional families get their own constructor and the valueFraction
+    // comes from updateFromFlux instead.
+    //
+    // THE VALUE IS NOT THE inletValue. OpenFOAM's dictionary constructor (inletOutletFvPatchField.C:
+    // refValue.assign("inletValue"), then `if (!readValueEntry(dict)) extrapolateInternal()`) keeps the
+    // file's `value` when there is one and otherwise extrapolates the face cells; inletValue only ever
+    // becomes the refValue. brae used inletValue for both, which a start from rest cannot see
+    // (`inletValue $internalField` there, and the internal field is uniform) and a RESTART cannot miss:
+    // squareBendLiqNoNewtonian restarted from OpenFOAM's own iteration 5 had U = (0 0 0) on all 400
+    // outlet faces at the first assembly where OpenFOAM held the written values, and T = 300 where the
+    // written T_b was the face cells' -- U 1.55e-05, T 5.64e-06, rho 4.60e-07 at the first restarted
+    // iteration against OpenFOAM, the same digits with or without a viscosity model.
+    //   readValue             the file's `value`, per face (empty = the entry is absent)
+    //   extrapolateIfAbsent   absent `value` -> the face cells at the first evaluate that has them, as
+    //                         extrapolateInternal(); false keeps the refValue (freestream's rule)
     InletOutletPatchField(
         const FvPatch& p,
         bool uniform,
         T uval,
-        std::vector<T> vals)
-        : MixedPatchField<T>(p, uniform, uval, std::move(vals), /*velocitySign=*/true)
+        std::vector<T> vals,
+        std::vector<T> readValue = {},
+        bool extrapolateIfAbsent = false)
+        : MixedPatchField<T>(p, uniform, uval, std::move(vals), /*velocitySign=*/true, /*freestream=*/false,
+                             readValue),
+          extrapolatePending_(extrapolateIfAbsent && readValue.size() != static_cast<std::size_t>(p.size))
     {
         // SEED THE VALUE FRACTION AT ZERO, not at the mixed base's 0.5. That 0.5 is the FREESTREAM
         // seed -- a half-and-half flow-angle blend waiting for updateMixedFreestream -- and it is
@@ -1367,7 +1387,26 @@ public:
             vf[i] = (phip[i] < 0.0) ? 1.0 : 0.0;
         this->setValueFraction(std::move(vf));
     }
+    // extrapolateInternal() for a `value`-less entry, done at the first evaluate that carries the internal
+    // field -- construction time in OpenFOAM's sense, so only while no flux has reached the patch. Once one
+    // has, the mixed blend is defined and is what OpenFOAM's evaluate gives.
+    void evaluate(const std::vector<T>& internal) override
+    {
+        if (extrapolatePending_ && !internal.empty())
+        {
+            extrapolatePending_ = false;
+            if (!this->valueFractionComputed())
+            {
+                this->value_ = this->patchInternalField(internal);
+                return;
+            }
+        }
+        MixedPatchField<T>::evaluate(internal);
+    }
     int bcCategory() const override { return 3; }                  // inletOutlet (device: per-face fixedValue|zeroGradient)
+
+private:
+    bool extrapolatePending_ = false;
 };
 
 // The two RAS inlets that derive from inletOutlet in OpenFOAM and recompute their refValue every
@@ -1490,12 +1529,18 @@ public:
     // FALSE, and unlike inletOutlet this one really does inherit it: outletInletFvPatchField declares no
     // assignable() of its own, so mixedFvPatchField's false stands (mixedFvPatchField.H:200).
     bool assignable() const override { return false; }   // OF: outletInlet does NOT override mixed
+    // The same construction rule as inletOutlet (outletInletFvPatchField.C: refValue from outletValue,
+    // then readValueEntry or extrapolateInternal) -- see InletOutletPatchField.
     OutletInletPatchField(
         const FvPatch& p,
         bool uniform,
         T uval,
-        std::vector<T> vals)
-        : MixedPatchField<T>(p, uniform, uval, std::move(vals), /*velocitySign=*/true)
+        std::vector<T> vals,
+        std::vector<T> readValue = {},
+        bool extrapolateIfAbsent = false)
+        : MixedPatchField<T>(p, uniform, uval, std::move(vals), /*velocitySign=*/true, /*freestream=*/false,
+                             readValue),
+          extrapolatePending_(extrapolateIfAbsent && readValue.size() != static_cast<std::size_t>(p.size))
     {
         // SEED THE VALUE FRACTION AT ZERO, not at the mixed base's 0.5. That 0.5 is the FREESTREAM
         // seed -- a half-and-half flow-angle blend waiting for updateMixedFreestream -- and it is
@@ -1515,7 +1560,24 @@ public:
             vf[i] = (phip[i] >= 0.0) ? 1.0 : 0.0;
         this->setValueFraction(std::move(vf));
     }
+    // extrapolateInternal() for a `value`-less entry -- see InletOutletPatchField::evaluate.
+    void evaluate(const std::vector<T>& internal) override
+    {
+        if (extrapolatePending_ && !internal.empty())
+        {
+            extrapolatePending_ = false;
+            if (!this->valueFractionComputed())
+            {
+                this->value_ = this->patchInternalField(internal);
+                return;
+            }
+        }
+        MixedPatchField<T>::evaluate(internal);
+    }
     int bcCategory() const override { return 4; }                  // outletInlet (device: per-face fixedValue|zeroGradient, opposite switch)
+
+private:
+    bool extrapolatePending_ = false;
 };
 
 // pressureInletOutletVelocity (OF directionMixedFvPatchVectorField): an outlet that allows backflow. Per face by the
@@ -2076,10 +2138,20 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
         throw std::runtime_error("brae: timeVaryingMappedFixedValue on patch '" + p.name +
             "' has no boundaryData (constant/boundaryData/" + p.name + "); OF requires it -- not falling back silently");
     }
+    // The file's own `value`, expanded per face; empty when the entry is absent. The mixed family's
+    // dictionary constructors keep it verbatim (readValueEntry) and it is NOT their refValue.
+    auto readValueOf = [&]() -> std::vector<T>
+    {
+        if (!d.hasValue) return {};
+        if (d.valueUniform) return std::vector<T>(p.size, d.uniformValue);
+        if (d.values.size() == static_cast<std::size_t>(p.size)) return d.values;
+        return {};
+    };
     if (d.type == "inletOutlet")   // refValue = inletValue (fall back to value if inletValue omitted)
     {
         const auto v = inletOrValue(d);
-        return std::make_unique<InletOutletPatchField<T>>(p, v.uniform, v.uniformValue, v.values);
+        return std::make_unique<InletOutletPatchField<T>>(p, v.uniform, v.uniformValue, v.values,
+                                                          readValueOf(), /*extrapolateIfAbsent=*/true);
     }
     // outletInlet: the same mixed BC with the flux test inverted -- outflow (phi >= 0) takes the
     // prescribed outletValue, inflow extrapolates. The class and its device category existed already;
@@ -2087,7 +2159,8 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
     if (d.type == "outletInlet")
     {
         const auto v = inletOrValue(d);   // outletValue is read into the same slot
-        return std::make_unique<OutletInletPatchField<T>>(p, v.uniform, v.uniformValue, v.values);
+        return std::make_unique<OutletInletPatchField<T>>(p, v.uniform, v.uniformValue, v.values,
+                                                          readValueOf(), /*extrapolateIfAbsent=*/true);
     }
     // turbulent-inlet BCs (inletOutlet-derived): inflow value computed from U/k by the solver (applyTurbulentInlets);
     // here we build an inletOutlet placeholder from the written `value` so buildField succeeds.
@@ -2118,18 +2191,14 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
             p, d.valueUniform, d.uniformValue, d.values, kind, ki ? d.intensity : d.mixingLength, d.Cmu);
     }
     // base `freestream` (e.g. k/omega) derives from inletOutlet in OF -> BINARY flux switch (kept).
+    // freestreamFvPatchField.C: `if (!readValueEntry(dict)) operator=(freestreamValue())` -- the file's
+    // value when present, else the refValue (no extrapolation, unlike its inletOutlet base).
     if (d.type == "freestream")
-        return std::make_unique<InletOutletPatchField<T>>(p, d.inletUniform, d.inletUniformValue, d.inletValues);
+        return std::make_unique<InletOutletPatchField<T>>(p, d.inletUniform, d.inletUniformValue, d.inletValues,
+                                                          readValueOf(), /*extrapolateIfAbsent=*/false);
     // freestreamVelocity / freestreamPressure derive from mixedFvPatchField in OF -> CONTINUOUS Robin blend
     // vf = 0.5 -/+ 0.5*(U.n)/|U| (flow-angle, not the binary switch). The device recomputes vf each step.
-    // The file's own `value`, expanded per face. OF's mixed constructor keeps it verbatim on read.
-    auto readValueOf = [&]() -> std::vector<T>
-    {
-        if (!d.hasValue) return {};
-        if (d.valueUniform) return std::vector<T>(p.size, d.uniformValue);
-        if (d.values.size() == static_cast<std::size_t>(p.size)) return d.values;
-        return {};
-    };
+    // readValueOf: OF's mixed constructor keeps the file's `value` verbatim on read.
     if (d.type == "freestreamVelocity")   // mixed, velocity sign (0.5 - 0.5 U.n/|U|)
         return std::make_unique<MixedPatchField<T>>(p, d.inletUniform, d.inletUniformValue, d.inletValues,
                                                     true, /*freestream*/true, readValueOf());
