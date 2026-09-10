@@ -265,7 +265,11 @@ void assembleEpsEqn(
     const DeviceBuffer<scalar>&  epsilon,
     const DeviceBuffer<scalar>&  k,
     const DeviceBuffer<scalar>&  nut,
-    const KEpsilonInput&         in);
+    const KEpsilonInput&         in,
+    // epsilon's PATCH VALUES as OpenFOAM's assembly reads them: the last evaluate's, with the
+    // wall-function faces reassigned to the new wall cells (calculateTurbulenceFields' `epf ==
+    // epsilon0`). correct() builds it; null evaluates dbEps live, the pre-H3.5 behaviour.
+    const DeviceBuffer<scalar>*  epsBndValues = nullptr);
 
 // Stage 4: the k system. No wall setValues and no boundaryManipulate -- see the header.
 void assembleKEqn(

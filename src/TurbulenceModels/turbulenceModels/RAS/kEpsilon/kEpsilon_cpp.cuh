@@ -235,7 +235,15 @@ void correct(
     int    minIter       = 0,
     // Which nut wall function each patch carries -- forwarded straight to correctNutField, which is
     // where OpenFOAM's single dispatch point lives. Last, so no positional caller moves.
-    const NutWallSelection* nutSel = nullptr);
+    const NutWallSelection* nutSel = nullptr,
+    // `Gauss linearUpwind <gradScheme>` on div(phi,k) and div(phi,epsilon) -- what both liquid
+    // tutorials write (`bounded Gauss linearUpwind limited`). It keeps upwind's WEIGHTS and adds an
+    // explicit correction, so it is a different source rather than a different matrix; ignoring it runs
+    // upwind under the case's scheme name. luGradK is the cellLimited coefficient of the gradient scheme
+    // the entry NAMES (0 => unlimited Gauss linear), which is not grad(<field>)'s -- see
+    // FieldDivScheme::luGradName. Appended after nutSel for the same reason everything else was.
+    bool   linearUpwind  = false,
+    scalar luGradK       = 0.0);
 
 } // namespace kEpsilonRef
 } // namespace cpu

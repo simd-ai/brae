@@ -130,6 +130,14 @@ struct FieldDivScheme
     // clamp01(2*r) -- which three rho harnesses did until the turbulence-scheme port made it visible.
     scalar coeff        = 1.0;     // the raw k of `limitedLinear k` -- host weights functions
     scalar twoByk       = 0;       // 2/max(k,SMALL)                 -- device kernels
+    // `linearUpwind <name>`: the gradient scheme NAME the scheme reads (linearUpwind.H's constructor,
+    // gradSchemeName_(schemeData)) -- `limited`, `grad(k)`, whatever the entry says. OpenFOAM builds the
+    // correction's gradient from mesh.gradScheme(<name>) (linearUpwind.C:61-68), i.e. the gradSchemes
+    // entry of THAT name, else `default`. It is not grad(<field>), and it is not the gradient the
+    // corrected laplacian's non-orthogonal part takes (correctedSnGrad.C:52-55 asks for grad(<field>)).
+    // squareBendLiq writes `linearUpwind limited` with `limited cellLimited Gauss linear 1` beside a
+    // plain `default Gauss linear`, so the two resolve to different gradients on the same field.
+    std::string luGradName;
     // laplacian(D<field>,<field>) -- OF scalarTransport.C:250, where Dname = "D" + field name.
     // `corrected`/`limited` -> non-orthogonal correction on; `orthogonal`/`uncorrected` -> off.
     // Unlike divSchemes, laplacianSchemes almost always carries a usable `default`, which OF resolves
@@ -189,29 +197,19 @@ struct FieldGradScheme
     bool        gaussLinear  = false;  // `Gauss linear`
     bool        leastSquares = false;  // `leastSquares` -- fvc::leastSquaresGrad / deviceLeastSquaresGrad
     scalar      cellLimitK   = 0.0;    // `cellLimited <scheme> k`; 0 => unlimited
+    // A limiter OTHER than cellLimited -- cellMDLimited, faceLimited, faceMDLimited -- which brae does
+    // not apply. Recorded rather than folded into cellLimitK = 0 (unlimited), which is what the
+    // classification below would otherwise silently make of it: none of them is the word `cellLimited`.
+    // Consumers that can refuse on it do; see parseNamedGradScheme.
+    std::string unsupportedLimiter;
     std::string raw;                   // the statement as written, for the refusal message
 };
 
-inline FieldGradScheme parseFieldGradScheme(const std::string& caseDir, const std::string& field)
+// The half of a gradSchemes lookup that reads the SCHEME once its statement is in fg.raw: which base
+// gradient, which limiter and its coefficient. Shared by the two lookups below so they cannot classify
+// the same text two ways.
+inline void classifyGradScheme(FieldGradScheme& fg)
 {
-    const std::string all = readFvSchemesText(caseDir);
-    const std::string blk = fvSchemesBlock(all, "gradSchemes");
-    const std::string key = "grad(" + field + ")";
-    FieldGradScheme fg;
-    std::size_t q = blk.find(key);
-    bool viaDefault = false;
-    if (q == std::string::npos) { q = blk.find("default"); viaDefault = true; }
-    if (q == std::string::npos)
-        throw std::runtime_error(
-            "brae: fvSchemes gradSchemes has neither `" + key + "` nor a `default`, so the limiter "
-            "gradient for " + field + " has no scheme. OpenFOAM's lookup is named-then-default and the "
-            "absent case is an error there too; inventing one would be a substituted discretisation.");
-    const std::size_t e = blk.find(';', q);
-    fg.raw = blk.substr(q, e == std::string::npos ? std::string::npos : e - q);
-    // Strip the key so `grad(e)` cannot be mistaken for content, and note when it came from `default`.
-    if (!viaDefault && fg.raw.size() > key.size()) fg.raw = fg.raw.substr(key.size());
-    while (!fg.raw.empty() && (fg.raw.front() == ' ' || fg.raw.front() == '\t')) fg.raw.erase(fg.raw.begin());
-
     // EXACT TOKEN after `Gauss`, not a substring search: `pointCellsLeastSquares` contains neither, but
     // a substring test for "linear" would also accept `linearUpwind`, and one for "Gauss" would accept
     // a `Gauss <something else>` brae does not compute.
@@ -234,6 +232,72 @@ inline FieldGradScheme parseFieldGradScheme(const std::string& caseDir, const st
         if (std::sscanf(c, "%lf", &kc) != 1) kc = 1.0;
         fg.cellLimitK = kc;
     }
+    for (const char* lw : {"cellMDLimited", "faceLimited", "faceMDLimited"})
+        if (schemeHasWord(fg.raw, lw)) fg.unsupportedLimiter = lw;
+}
+
+inline FieldGradScheme parseFieldGradScheme(const std::string& caseDir, const std::string& field)
+{
+    const std::string all = readFvSchemesText(caseDir);
+    const std::string blk = fvSchemesBlock(all, "gradSchemes");
+    const std::string key = "grad(" + field + ")";
+    FieldGradScheme fg;
+    std::size_t q = blk.find(key);
+    bool viaDefault = false;
+    if (q == std::string::npos) { q = blk.find("default"); viaDefault = true; }
+    if (q == std::string::npos)
+        throw std::runtime_error(
+            "brae: fvSchemes gradSchemes has neither `" + key + "` nor a `default`, so the limiter "
+            "gradient for " + field + " has no scheme. OpenFOAM's lookup is named-then-default and the "
+            "absent case is an error there too; inventing one would be a substituted discretisation.");
+    const std::size_t e = blk.find(';', q);
+    fg.raw = blk.substr(q, e == std::string::npos ? std::string::npos : e - q);
+    // Strip the key so `grad(e)` cannot be mistaken for content, and note when it came from `default`.
+    if (!viaDefault && fg.raw.size() > key.size()) fg.raw = fg.raw.substr(key.size());
+    while (!fg.raw.empty() && (fg.raw.front() == ' ' || fg.raw.front() == '\t')) fg.raw.erase(fg.raw.begin());
+    classifyGradScheme(fg);
+    return fg;
+}
+
+// mesh.gradScheme(<name>) for an ARBITRARY name -- the one a scheme READS rather than grad(<field>):
+// linearUpwind's `limited`, say. schemesLookup::lookupDetail::lookup is named-then-default
+// (schemesLookupDetail.C:76-89): the entry of that name if the gradSchemes dictionary has one, else
+// `default`, else a FatalIOError when there is no default either.
+//
+// The key is matched as a WHOLE TOKEN at the start of a statement, not as a substring. A name like
+// `limited` is a substring of nothing brae parses today, but a substring search for it would also find
+// `limitedGrad` or the tail of a longer key, and the lookup it models is an exact dictionary lookup.
+inline FieldGradScheme parseNamedGradScheme(const std::string& caseDir, const std::string& name)
+{
+    const std::string all = readFvSchemesText(caseDir);
+    const std::string blk = fvSchemesBlock(all, "gradSchemes");
+    auto findKey = [&](const std::string& key) -> std::size_t
+    {
+        for (std::size_t q = blk.find(key); q != std::string::npos; q = blk.find(key, q + 1))
+        {
+            const bool startOk = (q == 0) || std::isspace((unsigned char)blk[q - 1]) || blk[q - 1] == '{'
+                              || blk[q - 1] == ';' || blk[q - 1] == '"';
+            const std::size_t e = q + key.size();
+            const bool endOk = (e < blk.size())
+                            && (std::isspace((unsigned char)blk[e]) || blk[e] == '"');
+            if (startOk && endOk) return q;
+        }
+        return std::string::npos;
+    };
+    FieldGradScheme fg;
+    std::size_t q = findKey(name);
+    std::string key = name;
+    if (q == std::string::npos) { q = findKey("default"); key = "default"; }
+    if (q == std::string::npos)
+        throw std::runtime_error(
+            "brae: fvSchemes gradSchemes has neither `" + name + "` nor a `default`, and a scheme names "
+            "that gradient. OpenFOAM's lookup is named-then-default and fatals when both are absent "
+            "(schemesLookupDetail.C:76-89); inventing one would be a substituted discretisation.");
+    const std::size_t e = blk.find(';', q);
+    fg.raw = blk.substr(q + key.size(), e == std::string::npos ? std::string::npos : e - q - key.size());
+    while (!fg.raw.empty() && (fg.raw.front() == ' ' || fg.raw.front() == '\t' || fg.raw.front() == '"'))
+        fg.raw.erase(fg.raw.begin());
+    classifyGradScheme(fg);
     return fg;
 }
 
@@ -297,6 +361,22 @@ inline FieldDivScheme parseFieldDivScheme(const std::string& caseDir, const std:
         throw std::runtime_error("brae: fvSchemes `" + key + "` names `" + tok + "`, which brae has not ported "
                                  "for this equation (upwind, linearUpwind, linearUpwindV, limitedLinear, "
                                  "limitedLinearV, LUST). Refusing rather than running a substituted scheme.");
+    if (fs.linearUpwind || fs.linearUpwindV)
+    {
+        // The gradient scheme NAME is the next token, and it is MANDATORY: linearUpwind's and
+        // linearUpwindV's Istream constructors read it as a word (linearUpwind.H, linearUpwindV.H), so
+        // an entry without one is an IO error in OpenFOAM rather than a default.
+        std::size_t i = st.find(tok) + tok.size();
+        while (i < st.size() && std::isspace(static_cast<unsigned char>(st[i]))) ++i;
+        std::string name;
+        while (i < st.size() && !std::isspace(static_cast<unsigned char>(st[i])) && st[i] != ';') name += st[i++];
+        if (name.empty())
+            throw std::runtime_error(
+                "brae: fvSchemes `" + key + "` names `" + tok + "` with no gradient scheme. OpenFOAM "
+                "reads the name as a word (linearUpwind.H) and fatals when it is absent; refusing "
+                "rather than choosing one.");
+        fs.luGradName = name;
+    }
     if (!vectorField && (fs.linearUpwindV || fs.limitedLinearV || fs.lust))
         throw std::runtime_error("brae: fvSchemes `" + key + "` names `" + tok + "` on a SCALAR equation. "
                                  "OpenFOAM instantiates the V forms for vector fields only, and brae's scalar "

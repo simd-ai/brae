@@ -435,7 +435,20 @@ void correct(
     // deferred correction interpolates onto the wall cells' inner faces, saw 10 where OpenFOAM saw 1598 on
     // naca0012, and the second ring of cells read omega 1.4e-04 off at t=1 (queue item 25). Invisible with
     // an orthogonal laplacian (5e-12 on the same case), which is what every SST fixture had.
-    omega.evaluateBoundary();
+    //
+    // THE WALL-FUNCTION PATCHES AND NO OTHERS: that loop runs over the patches carrying
+    // cornerWeights_, the omegaWallFunction ones. The inlet and outlet keep the values their last
+    // evaluate left them, and CDkOmega's grad(omega) just below and the assembly's gradients read those.
+    // This was omega.evaluateBoundary() -- every patch. Measured on squareBendLiq's geometry under
+    // kOmegaSST with `linearUpwind limited`: omega 3.2e-06 off OpenFOAM at iteration 2 with U exact,
+    // 1e-12 with only the wall patches updated. The kEpsilon twin carries the same fix and measurement.
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (omega.boundary[pi]->isTurbulenceWallFunction())
+        {
+            omega.boundary[pi]->evaluate(omega.internal);
+        }
+    }
     if (res && res->captureStages) res->G = G;
 
     // ---- CDkOmega, F1, F2 ------------------------------------------------------------------------
@@ -560,7 +573,9 @@ void correct(
             std::vector<std::vector<scalar>> ob(patches.size());
             for (std::size_t pi = 0; pi < patches.size(); ++pi) ob[pi] = omega.boundary[pi]->value();
             std::vector<vector> gradVf = fvc::gaussGrad(omega.internal, ob, m, g, patches);
-            if (co.gradKLimitK > 0.0) cellLimitGrad(gradVf, omega.internal, ob, co.gradKLimitK, m, g, patches);
+            // The gradient linearUpwind NAMES, where the caller resolved it (see luGradLimitK).
+            const scalar luK = (co.luGradLimitK >= 0.0) ? co.luGradLimitK : co.gradKLimitK;
+            if (luK > 0.0) cellLimitGrad(gradVf, omega.internal, ob, luK, m, g, patches);
             const std::vector<scalar> corr =
                 fvm::linearUpwindCorrection<scalar, vector>(phi.internal, gradVf, m, g);
             for (label c = 0; c < nC; ++c) M.source[c] -= corr[c];
@@ -692,7 +707,8 @@ void correct(
             std::vector<std::vector<scalar>> kb(patches.size());
             for (std::size_t pi = 0; pi < patches.size(); ++pi) kb[pi] = k.boundary[pi]->value();
             std::vector<vector> gradVf = fvc::gaussGrad(k.internal, kb, m, g, patches);
-            if (co.gradKLimitK > 0.0) cellLimitGrad(gradVf, k.internal, kb, co.gradKLimitK, m, g, patches);
+            const scalar luK = (co.luGradLimitK >= 0.0) ? co.luGradLimitK : co.gradKLimitK;
+            if (luK > 0.0) cellLimitGrad(gradVf, k.internal, kb, luK, m, g, patches);
             const std::vector<scalar> corr =
                 fvm::linearUpwindCorrection<scalar, vector>(phi.internal, gradVf, m, g);
             for (label c = 0; c < nC; ++c) M.source[c] -= corr[c];

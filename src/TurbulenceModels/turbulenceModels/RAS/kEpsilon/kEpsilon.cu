@@ -555,7 +555,8 @@ void assembleTransport(
     const DeviceBuffer<scalar>& field,
     const DeviceBuffer<scalar>& nut,
     scalar                      sigma,
-    const KEpsilonInput&        in)
+    const KEpsilonInput&        in,
+    const DeviceBuffer<scalar>* bndValues = nullptr)
 {
     const int nC = dm.nCells;
     const int nB = db.n;
@@ -587,6 +588,7 @@ void assembleTransport(
     sc.correctedLaplacian = in.correctedLaplacian;
     sc.gradFieldLimitK    = in.co.gradKLimitK;
     sc.snGradLimitCoeff   = in.snGradLimitCoeff;
+    sc.bndValues          = bndValues;
     turbulence::assembleScalarTransport(M, dm, db, field, gammaFace, gammaBnd, sc);
 }
 
@@ -602,7 +604,8 @@ void assembleEpsEqn(
     const DeviceBuffer<scalar>& epsilon,
     const DeviceBuffer<scalar>& k,
     const DeviceBuffer<scalar>& nut,
-    const KEpsilonInput&        in)
+    const KEpsilonInput&        in,
+    const DeviceBuffer<scalar>* epsBndValues)
 {
     const int nC = dm.nCells;
 
@@ -624,7 +627,7 @@ void assembleEpsEqn(
     deviceUpdateInletOutlet(dbEps, *in.phiBnd);
 
     assembleTransport(E, st.DepsilonEff, st.gammaEpsFace, st.gammaEpsBnd, dm, dbEps, epsilon, nut,
-                      in.co.sigmaEps, in);
+                      in.co.sigmaEps, in, epsBndValues);
 
     epsReactionKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), in.rhoCell->data(), st.gByNu.data(), k.data(),
                                          epsilon.data(), st.divU.data(), st.divPhi.data(),
@@ -900,15 +903,39 @@ void correct(
         if (++calls == (it ? std::atoi(it) : 1)) dumpDir = std::string(dd) + "/";
     }
 
+    // epsilon's PATCH VALUES as OpenFOAM's assembly will read them. A patch field stores its value, and
+    // what the gradients in the epsilon assembly see is the value of its LAST evaluate -- the previous
+    // solve's correctBoundaryConditions -- except where updateCoeffs assigns one in between, which
+    // epsilonWallFunction does on its own faces only (`epf == scalarField(epsilon0, faceCells)`,
+    // epsilonWallFunctionFvPatchScalarField.C:168-175). The inlet and outlet keep theirs. This arm
+    // holds no stored patch values -- DeviceBoundary evaluates from the cells and its coefficients --
+    // so the stored state is reconstructed here, at entry, before this call moves a cell (the wall
+    // override) or a coefficient (the turbulent inlet and the flux switch, in assembleEpsEqn): with
+    // the previous assembly's coefficients on the cells as that solve left them, it IS the last
+    // evaluate. The one thing it cannot reproduce is Foam::bound's boundary pass, which max()es an
+    // assignable patch's stored value against the floor instead of re-evaluating it; the two differ
+    // only where a boundary-adjacent cell solved below epsilonMin (PORT.md, stage H3.5).
+    //
+    // Before this the assembly evaluated dbEps live, after the wall override and the coefficient
+    // refresh, which is what the host reference did too until stage H3.5 measured it: the
+    // limited gradient at squareBendLiq's outlet-layer cells read the corner wall cells' NEW value on
+    // the outlet faces, epsilon 1.9e-06 off OpenFOAM at iteration 2.
+    DeviceBuffer<scalar> epsBndLast;
+    if (dbEps.n) deviceBCValue(dbEps, epsilon, epsBndLast);
+
     production(st, dm, dbU, nut, in);
     wallTreatment(st, epsilon, dm, wall, k, in);
+    if (dbEps.n && in.wfBndMask && in.wfBndMask->size() == static_cast<std::size_t>(dbEps.n))
+    {
+        turbulence::wallFacesTakeCell(dm, *in.wfBndMask, epsilon, epsBndLast);
+    }
 
     // ---- the epsilon equation ----------------------------------------------------------------
     // Solved FIRST, and the k equation below then reads the epsilon this solve produced. That lag is
     // OpenFOAM's and reversing it is a different algorithm that still converges to something plausible.
     {
         PressureMatrix E;
-        assembleEpsEqn(E, st, dm, dbEps, dbK, epsilon, k, nut, in);
+        assembleEpsEqn(E, st, dm, dbEps, dbK, epsilon, k, nut, in, dbEps.n ? &epsBndLast : nullptr);
 
         // The wall constraint's VALUE IS THE CURRENT FIELD, not the eps0 array -- OpenFOAM's
         // epsilonWallFunction::manipulateMatrix is

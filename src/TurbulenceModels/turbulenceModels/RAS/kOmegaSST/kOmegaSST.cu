@@ -323,6 +323,18 @@ void correct(
     const int nC = dm.nCells;
     const int nB = dbK.n;
 
+    // omega's PATCH VALUES as OpenFOAM reads them for CDkOmega, F1's patch values and the omega
+    // assembly: the LAST evaluate's (the previous solve's correctBoundaryConditions), reassigned only on
+    // the omegaWallFunction faces by calculateTurbulenceFields (`opf == scalarField(omega0, faceCells)`,
+    // omegaWallFunctionFvPatchScalarField.C:167-174). Reconstructed here, before this call refreshes the
+    // turbulent inlet or the flux switch or overrides a wall cell -- see the kEpsilon twin for why that
+    // is the last evaluate, and for the one thing it cannot reproduce (Foam::bound's boundary pass).
+    // Measured under kOmegaSST on squareBendLiq's geometry: the host with every omega patch
+    // re-evaluated read omega 3.2e-06 off OpenFOAM at iteration 2, and 1.6e-12 with only the wall
+    // patches reassigned.
+    DeviceBuffer<scalar> omegaBndLast;
+    if (dbOmega.n) deviceBCValue(dbOmega, omega, omegaBndLast);
+
     // ---- production, from the CURRENT nut (the previous outer iteration's correctNut) ----------
     DeviceBuffer<scalar> gradU, S2, GbyNu0, G;
     deviceGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, gradU);
@@ -371,12 +383,17 @@ void correct(
                                               G.data(), omega.data());
         cudaCheck(cudaGetLastError(), "kOmegaSST wall override");
     }
+    if (dbOmega.n && in.wfBndMask && in.wfBndMask->size() == static_cast<std::size_t>(dbOmega.n))
+    {
+        turbulence::wallFacesTakeCell(dm, *in.wfBndMask, omega, omegaBndLast);
+    }
 
     // ---- CDkOmega, F1, F2 ---------------------------------------------------------------------
     DeviceBuffer<scalar> kbv, obv, kgx, kgy, kgz, ogx, ogy, ogz, CD, F1, F2;
     deviceBCValue(dbK, k, kbv);
     deviceGaussGrad(dm, k, kbv, kgx, kgy, kgz);
-    deviceBCValue(dbOmega, omega, obv);
+    if (omegaBndLast.size()) deviceCopy(obv, omegaBndLast);
+    else                     deviceBCValue(dbOmega, omega, obv);
     deviceGaussGrad(dm, omega, obv, ogx, ogy, ogz);
     deviceCDkOmega(kgx, kgy, kgz, ogx, ogy, ogz, omega, in.co.alphaOmega2, CD);
     // F1/F2 blend on the KINEMATIC laminar viscosity, per cell -- the compressible lineage has no
@@ -466,8 +483,10 @@ void correct(
         deviceInterpolate(dm, DomegaEff, gammaFace);
 
         PressureMatrix M;
+        turbulence::TransportScheme scOmega = sc;
+        scOmega.bndValues = omegaBndLast.size() ? &omegaBndLast : nullptr;
         turbulence::assembleScalarTransport(M, dm, dbOmega, omega, gammaFace,
-                                            DomB.size() ? DomB : gammaFace, sc);
+                                            DomB.size() ? DomB : gammaFace, scOmega);
         if (in.boundedOmega)
         {
             boundedSpKernel<<<nBlk(nC), TPB>>>(nC, divPhi.data(), dm.V.data(), M.diag.data());

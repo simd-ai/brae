@@ -22,6 +22,13 @@ struct KOmegaSSTCoeffs
     // fixture with only the latter cannot tell the two apart. 0 = unlimited.
     scalar gradKLimitK = 0.0;
     scalar gradULimitK = 0.0;   // grad(U) cellLimited <k>: fvc::grad(U) in S2/GbyNu0 (kOmegaSSTBase.C:522) and correctNut (:132)
+    // The gradient `linearUpwind <name>` NAMES on div(phi,k)/div(phi,omega) -- OpenFOAM builds the
+    // correction from mesh.gradScheme(<name>) (linearUpwind.C:61-68), which is NOT grad(k)/grad(omega):
+    // squareBendLiq's `linearUpwind limited` resolves to `cellLimited Gauss linear 1` beside an
+    // unlimited `default`. NEGATIVE means the caller did not resolve it, and the closure then uses
+    // gradKLimitK -- the incompressible lineage's reading, under which its T3A gate was measured (T3A
+    // names `grad(k)` etc., so the two coincide there). The compressible mirror resolves the named scheme.
+    scalar luGradLimitK = -1.0;
 
     scalar alphaK1 = 0.85,     alphaK2 = 1.0;          // k diffusivity blend  (kOmegaSSTBase.C:263,272)
     scalar alphaOmega1 = 0.5,  alphaOmega2 = 0.856;    // omega diffusivity blend         (:281,290)

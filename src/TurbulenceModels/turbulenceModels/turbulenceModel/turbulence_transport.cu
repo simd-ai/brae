@@ -48,7 +48,8 @@ void assembleScalarTransport(
     if (sc.limitedLinear)
     {
         DeviceBuffer<scalar> bval, gx, gy, gz;
-        deviceBCValue(db, field, bval);
+        if (sc.bndValues) deviceCopy(bval, *sc.bndValues);
+        else              deviceBCValue(db, field, bval);
         // The limiter's gradient takes the case's OWN gradScheme for this field -- OpenFOAM builds it
         // through fvc::grad(lPhi) (LimitedScheme.C:56-59), not through a scheme the closure chooses.
         if (sc.limGradLeastSq) deviceLeastSquaresGrad(dm, field, bval, gx, gy, gz);
@@ -79,7 +80,8 @@ void assembleScalarTransport(
         if (sc.correctedLaplacian)
         {
             DeviceBuffer<scalar> bval, gx, gy, gz, ffc, corr;
-            deviceBCValue(db, field, bval);
+            if (sc.bndValues) deviceCopy(bval, *sc.bndValues);
+            else              deviceBCValue(db, field, bval);
             deviceGaussGrad(dm, field, bval, gx, gy, gz);
             // correctedSnGrad's correction takes the field's OWN grad scheme (correctedSnGrad.C:52-55).
             if (sc.gradFieldLimitK > scalar(0))
@@ -99,6 +101,35 @@ void assembleScalarTransport(
             deviceAxpy(-1.0, corr, M.source);
         }
     }
+}
+
+namespace
+{
+__global__ void wallFacesTakeCellKernel(
+    int            nB,
+    const label*   wfMask,
+    const label*   bndCell,
+    const scalar*  cell,
+    scalar*        bnd)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= nB || !wfMask[f]) return;
+    bnd[f] = cell[bndCell[f]];
+}
+} // namespace
+
+void wallFacesTakeCell(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<label>&  wfMask,
+    const DeviceBuffer<scalar>& field,
+    DeviceBuffer<scalar>&       bnd)
+{
+    const int nB = static_cast<int>(bnd.size());
+    if (nB == 0) return;
+    const int tpb = 256;
+    wallFacesTakeCellKernel<<<(nB + tpb - 1) / tpb, tpb>>>(nB, wfMask.data(), dm.bndCell.data(),
+                                                           field.data(), bnd.data());
+    cudaCheck(cudaGetLastError(), "turbulence wallFacesTakeCell");
 }
 
 void solveScalarEqn(

@@ -8,6 +8,7 @@
 #include "cellLimitedGrad_cpp.cuh"
 #include <cmath>
 #include <algorithm>
+#include <stdexcept>
 #include <vector>
 
 namespace brae {
@@ -46,6 +47,12 @@ void captureSystem(
 // OpenFOAM's limitedSurfaceInterpolationScheme builds when the case names no gradScheme for it. The
 // flux handed in is the equation's own -- compressibly the MASS flux, exactly what kEpsilon.C:255/276
 // convect by, and the limiter reads its sign only.
+//
+// linearUpwind is the other shape: upwind's weights (it derives from upwind), plus the scheme's explicit
+// correction, which gaussConvectionScheme::fvmDiv adds as fvm += fvc::surfaceIntegrate(faceFlux*corr)
+// (gaussConvectionScheme.C:112-115). It belongs IN this function rather than beside it because it is
+// part of the same fvm::div object OpenFOAM returns -- a stage capture of "the convection matrix" that
+// left it out would be a different matrix from OpenFOAM's div(phi,k).
 FvScalarMatrix divWithScheme(
     const SurfaceScalarField&     phi,
     const GeometricField<scalar>& vf,
@@ -54,8 +61,30 @@ FvScalarMatrix divWithScheme(
     scalar                        limGradK,      // cellLimited k of the case's grad(<field>), 0 => none
     const PrimitiveMesh&          m,
     const FvGeometry&             g,
-    const std::vector<FvPatch>&   patches)
+    const std::vector<FvPatch>&   patches,
+    bool                          linearUpwind = false,
+    scalar                        luGradK      = 0.0)   // cellLimited k of the gradient linearUpwind NAMES
 {
+    if (linearUpwind)
+    {
+        FvScalarMatrix M = fvm::div(phi.internal, phi.boundary, vf, m, patches);
+        std::vector<std::vector<scalar>> vfb(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            vfb[pi] = vf.boundary[pi]->value();
+        }
+        // gradScheme_().grad(vf, gradSchemeName_) (linearUpwind.C:61-72): Gauss linear over the field's
+        // own patch values, then the NAMED scheme's cellLimited limiter where it has one. The driver
+        // refuses any other named gradient before this is reached.
+        std::vector<vector> gradVf = fvc::gaussGrad(vf.internal, vfb, m, g, patches);
+        if (luGradK > 0.0) cpu::cellLimitGrad(gradVf, vf.internal, vfb, luGradK, m, g, patches);
+        // The caller SUBTRACTS what linearUpwindCorrection returns -- the sign note is in fvm.cuh. The
+        // flux is the equation's own (compressibly the MASS flux), and it picks the upwind cell by
+        // `faceFlux > 0` exactly as linearUpwind.C:74-79 does.
+        const std::vector<scalar> corr = fvm::linearUpwindCorrection<scalar, vector>(phi.internal, gradVf, m, g);
+        for (label c = 0; c < m.nCells(); ++c) M.source[c] -= corr[c];
+        return M;
+    }
     if (!limitedLinear)
     {
         return fvm::div(phi.internal, phi.boundary, vf, m, patches);
@@ -211,8 +240,14 @@ void correct(
     scalar limiterCoeff,
     scalar limGradK,
     int    minIter,
-    const NutWallSelection* nutSel)
+    const NutWallSelection* nutSel,
+    bool   linearUpwind,
+    scalar luGradK)
 {
+    if (linearUpwind && limitedLinear)
+        throw std::runtime_error(
+            "kEpsilonRef::correct: linearUpwind and limitedLinear both requested for the turbulence "
+            "convection -- a div entry names ONE scheme, so this is a caller defect, not a case.");
     const label nC = m.nCells();
     // The wall functions' Cmu/kappa/E are PER PATCH, from each field's own entry (WallFunctionCoeffs),
     // not the model's -- taken inside the patch loops below.
@@ -335,7 +370,22 @@ void correct(
     // (`epf == scalarField(epsilon0, epf.patch().faceCells())`, epsilonWallFunctionFvPatchScalarField.C:
     // 168-175) inside updateCoeffs, before the assembly: grad(epsilon) at the wall cells feeds the
     // corrected laplacian's deferred correction. The omega twin measured it on naca0012 (queue item 25).
-    epsilon.evaluateBoundary();
+    //
+    // THE WALL-FUNCTION PATCHES AND NO OTHERS. That loop runs over the patches carrying cornerWeights_,
+    // i.e. the epsilonWallFunction ones; the inlet and outlet keep the values their last evaluate left
+    // them, and those are the values the assembly's gradients read. This was epsilon.evaluateBoundary()
+    // -- every patch -- which re-derived the inletOutlet/turbulent-inlet values from the current cells.
+    // Invisible under upwind convection; under `linearUpwind limited` the cellLimited gradient at the
+    // outlet-layer cells reads those patch values in its max/min, and on squareBendLiq at iteration 2
+    // the epsilon convection source was 9.0e-05 off OpenFOAM's in exactly the 68 outlet-layer cells,
+    // epsilon 1.9e-06 after the solve; with only the wall patches updated, 1.3e-12.
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (epsilon.boundary[pi]->isTurbulenceWallFunction())
+        {
+            epsilon.boundary[pi]->evaluate(epsilon.internal);
+        }
+    }
     if (res) res->wallCells = static_cast<label>(wallCells.size());
     if (res && res->captureStages)
     {
@@ -382,7 +432,8 @@ void correct(
             epsilon.boundary[pi]->updateFromFlux(phi.boundary[pi]);
         }
 
-        FvScalarMatrix M = divWithScheme(phi, epsilon, limitedLinear, limiterCoeff, limGradK, m, g, patches);
+        FvScalarMatrix M = divWithScheme(phi, epsilon, limitedLinear, limiterCoeff, limGradK, m, g, patches,
+                                         linearUpwind, luGradK);
         if (res && res->captureStages)
         {
             captureSystem(M, patches, res->epsDivD, res->epsDivSrc, &res->epsDivUpper, &res->epsDivLower);
@@ -570,7 +621,8 @@ void correct(
             k.boundary[pi]->updateFromFlux(phi.boundary[pi]);
         }
 
-        FvScalarMatrix M = divWithScheme(phi, k, limitedLinear, limiterCoeff, limGradK, m, g, patches);
+        FvScalarMatrix M = divWithScheme(phi, k, limitedLinear, limiterCoeff, limGradK, m, g, patches,
+                                         linearUpwind, luGradK);
         {
             // `Gauss linear corrected` changes TWO things, and kOmegaSST in this same directory already
             // does both: the implicit face coefficient becomes gamma*nonOrthDeltaCoeffs*magSf, and the

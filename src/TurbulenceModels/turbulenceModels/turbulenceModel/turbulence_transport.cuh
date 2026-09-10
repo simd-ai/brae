@@ -56,6 +56,12 @@ struct TransportScheme
     scalar gradFieldLimitK    = 0.0;
     // `limited <psi> corrected`: caps the non-orthogonal correction per face. Zero => uncapped.
     scalar snGradLimitCoeff   = 0.0;
+    // The field's PATCH VALUES as the gradients below must read them, when they are not what a live
+    // evaluate of `db` gives. OpenFOAM's gradients read the patch field's STORED values -- those of its
+    // last evaluate, plus whatever updateCoeffs assigned since (epsilonWallFunction's
+    // `epf == epsilon0`) -- while `db` carries the coefficients updateCoeffs has JUST refreshed for this
+    // assembly. Null = evaluate `db` live, which is what every caller did before stage H3.5.
+    const DeviceBuffer<scalar>* bndValues = nullptr;
 };
 
 // The linear solve for ONE transported scalar: relax() -> fvOptions.constrain() -> setValues(wall), in
@@ -94,6 +100,17 @@ void solveScalarEqn(
     scalar&                     residualOut,
     const std::string&          dumpPrefix,
     bool                        gs);
+
+// bnd[f] = field[bndCell[f]] on every boundary face `wfMask` marks, and nothing elsewhere: the one
+// assignment the epsilon and omega wall functions make to their own patches inside updateCoeffs
+// (`epf == scalarField(epsilon0, faceCells)`, epsilonWallFunctionFvPatchScalarField.C:168-175; the
+// omega twin at omegaWallFunctionFvPatchScalarField.C:167-174). Shared by both closures so the two
+// cannot drift on which faces it touches.
+void wallFacesTakeCell(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<label>&  wfMask,
+    const DeviceBuffer<scalar>& field,
+    DeviceBuffer<scalar>&       bnd);
 
 // M = fvm::div(phi, field) - fvm::laplacian(gamma, field), with M's source zeroed and its boundary
 // coefficients set. The caller adds the model's reaction terms afterwards.
