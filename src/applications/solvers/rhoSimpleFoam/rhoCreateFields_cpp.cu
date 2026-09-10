@@ -17,6 +17,7 @@
 #include <memory>
 #include "equation_of_state.cuh"
 #include <algorithm>
+#include <cstdio>
 #include <filesystem>
 #include <limits>
 #include <stdexcept>
@@ -291,21 +292,19 @@ RhoSimpleFields createFields(
     // value is the CASE's, not an assumption.
     try { f.deltaT = readDict(caseDir + "/system/controlDict").scalarOr("deltaT", 1.0); } catch (...) {}
 
-    // ...but a SUPPORTED parse is not a supported path. The parser accepts `properties liquid` because
-    // the LEGACY binary carries the NSRDS path; everything below evaluates perfectGas + hConst directly
-    // (perfectGasRho for the rho seed, perfectGasPsi, heOf for the energy build), and on the liquid
-    // parse the scalar Cp/mu/kappa members STAY AT THEIR DEFAULTS (thermo_parse.cuh notes it at the
-    // liquid branch) -- so he would be built from a gas Cp the case never set. device_energy.cu:38-42
-    // records what that costs: squareBendLiq's 350 K walls carried he = -48361 J/kg where Es(1e5,350)
-    // is -15641742 J/kg. The device hooks have this guard (requirePerfectGas, rhoThermoDevice.cu);
-    // the host createFields, which runs FIRST on both arms, did not.
-    if (f.thermo.model != ThermoModel::perfectGas)
-        throw std::runtime_error(
-            "brae: rhoSimpleFoam (OF-mirror) createFields implements perfectGas + hConst only, and "
-            "this case selects `properties liquid`. The liquid path replaces Cp, mu, kappa and rho "
-            "with per-cell NSRDS correlations and inverts he -> T by Newton; the legacy "
-            "gpuRhoSimpleFoam binary carries that path. Refusing rather than running a gas equation "
-            "of state against a liquid's coefficients.");
+    // `properties liquid` RUNS on this arm as of stage H3.4, and what made that safe was removing the
+    // gas formulae from the path rather than adding a liquid branch beside them. Every property now goes
+    // through the eight accessors in liquid_thermo.cuh -- mu, Cp, alpha, rho, psi, he, Cpv and THE -- so
+    // there is exactly ONE place that knows which thermo the case selected, and a call site cannot be
+    // liquid-aware in nineteen places and gas-only in the twentieth.
+    //
+    // The refusal that stood here for stages H3.0 to H3.3 is kept in the history for what it measured:
+    // the parser accepted `properties liquid` while everything below evaluated perfectGas + hConst
+    // directly, and on that parse the scalar Cp/mu/kappa members stay at their GAS defaults, so
+    // squareBendLiq's 350 K walls carried he = -48361 J/kg where Es(1e5, 350) is -15641742 J/kg
+    // (device_energy.cu:38-42). What is refused now is narrower and lives in the parser: any liquid but
+    // H2O, any energy form but sensibleInternalEnergy, and anything but heRhoThermo + pureMixture
+    // (thermo_parse.cuh, the `properties liquid` block).
 
     // thermo.validate(args.executable(), "h", "e") -- rhoSimpleFoam accepts exactly these two energy
     // variables, because EEqn.H's kinetic-energy source is written for both and for nothing else.
@@ -384,6 +383,56 @@ RhoSimpleFields createFields(
     const FieldData<scalar> tFd = guardRead(readField<scalar>(timeDir + "/T"), "T");
     f.T = buildField<scalar>(tFd, patches, nC);
     f.T.evaluateBoundary();
+
+    // T MUST LIE WHERE THE THERMO IS DEFINED, checked before a single property is evaluated from it. A
+    // liquid's correlations are fits on [Tt, Tc]; above Tc H2O's rho is a fractional power of a negative
+    // number, i.e. a NaN (H2OLiquid::inRange). OpenFOAM has no guard and runs on: measured with H2O on
+    // sbMatched's ~1000 K fields, every solve reports `Initial residual = nan` for 1000 iterations and the
+    // run dies reading its own output back. brae used to reach the same NaN and refuse three calls later
+    // under the wrong name -- "flowRateInletVelocity on patch 'inlet': gSum(rho*magSf) is not positive" --
+    // which sends whoever reads it to the inlet instead of the thermo. The gas branch has no range and
+    // this block does nothing there.
+    {
+        const ThermoTRange tr = thermoTRangeOf(f.thermo);
+        if (tr.bounded)
+        {
+            scalar      tMin = f.T.internal.empty() ? scalar(0) : f.T.internal[0];
+            scalar      tMax = tMin;
+            std::string firstBad;
+            scalar      firstBadT = 0;
+            auto visit = [&](scalar T, const std::string& where)
+            {
+                tMin = std::min(tMin, T);
+                tMax = std::max(tMax, T);
+                if (firstBad.empty() && !thermoTInRange(T, f.thermo))
+                {
+                    firstBad  = where;
+                    firstBadT = T;
+                }
+            };
+            for (label c = 0; c < nC; ++c) visit(f.T.internal[c], "cell " + std::to_string(c));
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                const std::vector<scalar>& tb = f.T.boundary[pi]->value();
+                for (std::size_t i = 0; i < tb.size(); ++i)
+                    visit(tb[i], "patch '" + patches[pi].name + "' face " + std::to_string(i));
+            }
+            if (!firstBad.empty())
+            {
+                char buf[640];
+                std::snprintf(buf, sizeof(buf),
+                              "brae: rhoSimpleFoam createFields -- T = %.10g K at %s is outside the range "
+                              "%s's liquid correlations are defined on, [%.2f, %.2f] K (the triple and "
+                              "critical points; the field as read spans %.10g .. %.10g K). Above the "
+                              "critical point the density correlation is a fractional power of a negative "
+                              "number: OpenFOAM computes the NaN and runs on it. Refusing rather than "
+                              "evaluating a liquid's properties at a temperature it does not have.",
+                              (double)firstBadT, firstBad.c_str(), tr.substance, (double)tr.lo,
+                              (double)tr.hi, (double)tMin, (double)tMax);
+                throw std::runtime_error(buf);
+            }
+        }
+    }
 
     // rho: READ_IF_PRESENT, else thermo.rho(). A restart continues from the written density; a cold start
     // computes it from the equation of state.

@@ -64,6 +64,24 @@ RhoDeviceFields createDeviceFields(
     const FvGeometry&                      g,
     const std::vector<FvPatch>&            patches)
 {
+    // THE LIQUID REFUSAL for the device arm, in the one function both the driver (runMirrorCuda) and
+    // the CUDA step harness pass through before any device thermo is evaluated. Stage H3.4 lifted it
+    // from createFields, which the host arm shares, because the HOST step now asks every property
+    // through liquid_thermo.cuh. The device step does not: rhoThermoDevice.cu's kernels call
+    // hConstHeToT, perfectGasPsi, perfectGasRho, transportMu and transportAlpha directly, and
+    // buildDeviceStepInput builds a fixedTemperature constraint and limitTemperature's bounds with
+    // hConstTToHe. Those carry assertPerfectGas, which Release's NDEBUG makes inert, and
+    // rhoThermoDevice.cu's own requirePerfectGas fires only after buildDeviceStepInput has already run
+    // them -- so without this a liquid would come back as a confident wrong number. Stage H3.6 (the
+    // device twin of the accessors) removes it.
+    if (hf.thermo.model != ThermoModel::perfectGas)
+        throw std::runtime_error(
+            "brae: rhoSimpleFoam (OF-mirror) CUDA arm implements perfectGas + hConst only, and this case "
+            "selects `properties liquid`. The HOST arm runs it -- BRAE_RHOSIMPLEFOAM_MIRROR=1 -- because "
+            "its properties go through the thermo accessors; the device kernels still evaluate the "
+            "perfect-gas closed forms. Refusing rather than running a gas equation of state against a "
+            "liquid's coefficients.");
+
     for (std::size_t pi_ = 0; pi_ < patches.size(); ++pi_)
     {
         const FvPatch& p = patches[pi_];

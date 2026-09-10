@@ -66,10 +66,17 @@ struct H2OLiquid
     // Model-valid temperature range, from OF's own liquidProperties construction in H2O.C:
     //     liquidProperties(W=18.015, Tc=647.13, Pc=2.2055e7, Vc, Zc, Tt=273.16, ...)
     // Tt is the triple point and Tc the critical point -- outside [Tt, Tc] the substance is not a liquid
-    // and the correlations are extrapolation, not physics. Used to project the Newton iterate, exactly
-    // as OF's inversion applies its `limit()` function to every step.
+    // and the correlations are extrapolation, not physics. ABOVE Tc it is worse than extrapolation: rho_
+    // is NSRDSfunc5, a/pow(b, 1 + pow(1 - T/c, d)) with c = Tc and d = 0.081 (NSRDSfunc5.H:106), so
+    // 1 - T/Tc goes negative and the fractional power is a NaN. OpenFOAM has no guard -- measured, with
+    // H2O on sbMatched's ~1000 K fields it runs every solve at `Initial residual = nan` for 1000
+    // iterations and dies reading its own output back. brae refuses instead, in two places that share
+    // this one predicate: createFields on the fields as read, and the he -> T inversion on its answer.
+    // (This comment used to say the range PROJECTS the Newton iterate as OpenFOAM's limit() does; that
+    // was wrong -- limit() is the identity for a liquid -- and stage H3.2 made it a post-check.)
     static constexpr scalar Tt = 273.16;    // triple point   [K]
     static constexpr scalar Tc = 647.13;    // critical point [K]
+    BRAE_HD static bool inRange(scalar T) { return T >= Tt && T <= Tc; }
 
     BRAE_HD static scalar rho(scalar T)   { return nsrdsFunc5(98.343885, 0.30542, 647.13, 0.081, T); }
     BRAE_HD static scalar mu(scalar T)    { return nsrdsFunc1(-51.964, 3670.6, 5.7331, -5.3495e-29, 10, T); }
@@ -207,7 +214,7 @@ BRAE_HD inline HeToTResult h2oEnergyToT(
     // hear about it -- but the iterate path stays OpenFOAM's.
     r.converged  = !blewUp
                 && r.residual <= residualBound
-                && Tnew >= H2OLiquid::Tt && Tnew <= H2OLiquid::Tc;
+                && H2OLiquid::inRange(Tnew);
     return r;
 }
 

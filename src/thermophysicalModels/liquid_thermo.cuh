@@ -89,4 +89,58 @@ BRAE_HD inline scalar thermoCpvOf(scalar p, scalar T, const ThermoCoeffs& c)
     return c.internalEnergy ? thermoCv(c) : c.Cp;
 }
 
+// The temperatures the thermo's correlations are defined on, so a call site can refuse a field that
+// leaves them without knowing which thermo it holds. Gas: no range -- hConst and perfectGas are
+// closed forms, and the ten compressible gates run them exactly as before. Liquid: H2O's [Tt, Tc]
+// (see H2OLiquid::inRange for why above Tc is a NaN and not merely an extrapolation).
+struct ThermoTRange
+{
+    bool        bounded;
+    scalar      lo;
+    scalar      hi;
+    const char* substance;
+};
+
+BRAE_HD inline ThermoTRange thermoTRangeOf(const ThermoCoeffs& c)
+{
+    if (c.model == ThermoModel::liquidH2O) return ThermoTRange{true, H2OLiquid::Tt, H2OLiquid::Tc, "H2O"};
+    return ThermoTRange{false, scalar(0), scalar(0), "perfectGas"};
+}
+
+BRAE_HD inline bool thermoTInRange(scalar T, const ThermoCoeffs& c)
+{
+    return (c.model == ThermoModel::liquidH2O) ? H2OLiquid::inRange(T) : true;
+}
+
+// THE(he, p, T0) -- the inverse of thermoHeOf, and the eighth accessor. OpenFOAM asks its mixture for it
+// through the same one call whatever the thermo is: `mixture_.THE(hCells[celli], pCells[celli],
+// TCells[celli])` (heRhoThermo.C:76-82, and the same line on the boundary at :133).
+//
+// NOTE THE THIRD ARGUMENT. It is the CURRENT temperature, and it is not a convenience: OpenFOAM's
+// inversion is a do-while whose tolerance Ttol = T0*1e-4 is computed once from the initial guess and
+// never updated (species::thermo<>::T, thermoI.H:43-88), so THE ANSWER DEPENDS ON T0 -- measured with
+// tools/liqref as a 2.4e-08 K spread over six starting guesses at the same (p, he). A caller that passes
+// a fixed seed instead of the field's own previous value is running a different function from OpenFOAM's,
+// however close its answer looks. See nsrds_functions.cuh for the transcription and the two other things
+// about that loop that a from-scratch inversion would get wrong.
+//
+// The gas branch is p- and T0-independent because hConst's he is affine in T, so the closed form is the
+// fixed point OpenFOAM's loop lands on; it is what the ten compressible gates measure and it is left
+// exactly as it was.
+BRAE_HD inline HeToTResult thermoHeToT(
+    scalar he,
+    scalar p,
+    scalar T0,
+    const ThermoCoeffs& c)
+{
+    if (c.model == ThermoModel::liquidH2O)
+        return h2oEnergyToT(c.internalEnergy ? EnergyForm::sensibleInternalEnergy
+                                             : EnergyForm::sensibleEnthalpy,
+                            he, p, T0);
+    HeToTResult r;
+    r.T         = hConstHeToT(he, c);
+    r.converged = true;
+    return r;
+}
+
 }   // namespace brae
