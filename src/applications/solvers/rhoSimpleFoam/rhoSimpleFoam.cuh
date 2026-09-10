@@ -59,6 +59,7 @@
 #include "device_dilu.cuh"   // RhoSolverWorkspace::dilu -- the case's preconditioner, built once
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
+#include "thermo_types.cuh"   // RhoStepInput::thermo
 #include "device_amg.cuh"
 // After device_amg.cuh: the colour sweep takes the GSFusedComponent declared there.
 #include "device_colour_gauss_seidel.cuh"   // RhoSolverWorkspace::uColouring -- the default momentum solver
@@ -256,27 +257,41 @@ struct RhoStepInput
     // that case. Null means the case has none; `hasFvOptions` continues to mean an UNPORTED one.
     const DevicePorosity* porosity = nullptr;
 
+    // The THERMO, by value: the kernels that turn a temperature into an energy take it directly. It used
+    // to reach this step only through the thermoCorrect/updateRho hooks, and every temperature-to-energy
+    // conversion the step needed -- limitTemperature's bounds, fixedTemperatureConstraint's value -- was
+    // done ONCE by the driver with the perfect-gas closed form and handed over as a number. That is right
+    // for hConst, where he does not depend on p, and wrong for a liquid, where OpenFOAM evaluates
+    // he(p, T) per cell at the current pressure every time (limitTemperature.C:156-157,
+    // fixedTemperatureConstraint.C:125-126). Stage H3.6.
+    ThermoCoeffs thermo;
+
+    // Which of OpenFOAM's energy boundary conditions each boundary FACE of he carries, as basicThermo::
+    // heBoundaryTypes derives it from T's (basicThermo.C:197-231): 0 none, 1 fixedEnergy, 2
+    // gradientEnergy on a fixedGradient T, 3 mixedEnergy on a plain mixed T, 4 mixedEnergy on an
+    // inletOutlet T. The step rebuilds those faces' coefficients from the live p and T at every energy
+    // assembly -- the device twin of energy_boundary.cuh. Null = the static construction-time image,
+    // which is exact for perfectGas + hConst and nothing else.
+    const DeviceBuffer<label>*  heEnergyKind = nullptr;
+
     // fvOptions CONSTRAINTS, which are not sources: OpenFOAM applies them with fvMatrix::setValues, so
     // they also strip the coupling out of the neighbours' equations. Per-cell mask + the value pinned.
-    //   he:          fixedTemperatureConstraint, as the ENERGY he(p, Tuniform)
+    //   he:          fixedTemperatureConstraint -- the TEMPERATURE per cell; the step turns it into
+    //                he(p, T) at the current cell pressure at every constrain, as OpenFOAM does
     //   k / epsilon: scalarFixedValueConstraint naming that field
     const DeviceBuffer<label>*  fvoHeMask  = nullptr;
-    const DeviceBuffer<scalar>* fvoHeVal   = nullptr;
+    const DeviceBuffer<scalar>* fvoHeT     = nullptr;
 
     // limitTemperature (fvOptions/corrections/limitTemperature). A CORRECTION, not a source: it has no
     // addSup and no constrain, so no assembly changes -- it acts only as fvOptions.correct(he) AFTER the
     // energy solve and BEFORE thermo.correct(), which is what makes it show up in T at all. The bounds
-    // arrive already converted to ENERGY because the conversion needs the thermo, and the thermo is the
-    // caller's here for the same reason thermoCorrect and updateRho are hooks.
+    // are TEMPERATURES; the clamp builds he(p, Tmin) and he(p, Tmax) per cell and per boundary face from
+    // `thermo` above, exactly as the host step does.
     bool   limitHe = false;
-    // The T limits and the option's dict key travel alongside the energy bounds because the REPORT is
-    // in temperature even though the clamp is in energy: OpenFOAM prints Tmin=/Tmax= as the case wrote
-    // them, not the he values they were converted to.
+    // OpenFOAM prints Tmin=/Tmax= as the case wrote them, so the report reads these directly.
     scalar limitTmin = 0.0;
     scalar limitTmax = 0.0;
     std::string limitTname;
-    scalar heMin   = 0.0;
-    scalar heMax   = 0.0;
 
     // --- updateCoeffs() for the boundary conditions whose coefficients move with the solution ------
     // OpenFOAM's fvMatrix constructor calls updateCoeffs() at every assembly, so a patch that switches

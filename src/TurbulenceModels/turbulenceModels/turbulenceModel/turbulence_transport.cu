@@ -66,6 +66,21 @@ void assembleScalarTransport(
     zeroed(M.source, nC);
     deviceBCDivCoeffs(db, *sc.phiBnd, M.iC, M.bC);
 
+    // linearUpwind's explicit correction, part of the same fvm::div object -- SUBTRACTED, because
+    // `fvm += fvc::surfaceIntegrate(...)` is `source -= V*su` (fvMatrix.C:1855-1862), exactly as the
+    // momentum equation's deviceAxpy(-corrFac, lu, source). Internal faces only: linearUpwind::correction
+    // leaves every uncoupled boundary face at zero.
+    if (sc.linearUpwind)
+    {
+        DeviceBuffer<scalar> bval, gx, gy, gz, lu;
+        if (sc.bndValues) deviceCopy(bval, *sc.bndValues);
+        else              deviceBCValue(db, field, bval);
+        deviceGaussGrad(dm, field, bval, gx, gy, gz);
+        if (sc.luGradK > scalar(0)) deviceCellLimitGrad(dm, field, bval, gx, gy, gz, sc.luGradK);
+        deviceLinearUpwindCorr(dm, *sc.phiInt, gx, gy, gz, lu);
+        deviceAxpy(-1.0, lu, M.source);
+    }
+
     // - fvm::laplacian(gamma, field).
     {
         DeviceBuffer<scalar> lDiag, lUp, lLo, lIC, lBC;

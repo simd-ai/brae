@@ -667,15 +667,15 @@ Residuals rhoSimpleStep(
         {
             static ThermoCoeffs tc;   // the lambda below cannot capture, so the thermo goes through here
             tc = f.thermo;
-            static bool isE;
-            isE = (f.heName == "e");
+            // he(p, T) through the same accessor every other energy in this step uses, at each cell's own
+            // pressure -- OpenFOAM's `thermo.he(thermo.p(), Tuni, cells_)`. This was the hConst closed
+            // form of T alone, the one gas formula stage H3.4 left on this path: a liquid case with a
+            // fixedTemperatureConstraint would have pinned its cells to an energy computed from the gas
+            // defaults of Cp, R and Tref (stage H3.6).
             cpu::fvOptions::constrain(
                 *in.fvOpts, E, f.he.internal, f.heName, m, patches,
-                [](scalar T)
-                {
-                    const scalar hs = tc.Cp * (T - tc.Tref) + tc.Href;
-                    return isE ? hs - tc.R * T : hs;
-                });
+                [](scalar pc, scalar T) { return thermoHeOf(pc, T, tc); },
+                &f.p.internal);
         }
         const SolverPerformance ep =
             pbicgstab(E, f.he.internal, m, patches, in.tolHe, in.relTolHe, in.maxIterHe, in.minIterHe);

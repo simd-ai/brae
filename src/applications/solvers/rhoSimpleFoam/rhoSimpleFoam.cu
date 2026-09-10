@@ -1,6 +1,8 @@
 // CUDA driver for rhoSimpleFoam. See rhoSimpleFoam.cuh for the provenance, the order and the contract.
 #include "limit_temperature_report.cuh"   // OF reports LimitedCells on every call
 #include "rhoSimpleFoam.cuh"
+#include "rhoThermoDevice.cuh"   // updateEnergyBoundaryCoeffs: the energy conditions, live
+#include "liquid_thermo.cuh"     // thermoHeOf: limitTemperature and fixedTemperatureConstraint per cell
 #include "device_fvoptions.cuh"
 #include <string>   // deviceSetValues: fvOptions.constrain(EEqn)
 #include "pEqn.cuh"              // correctVelocity, relaxField -- the stages that ARE shared
@@ -94,16 +96,25 @@ void correctFluxCompressible(
 // that says nothing looks the same whether it moved one cell or all of them. The two counters are the
 // only extra work: they are incremented on the branch the clamp already takes, so the arithmetic is
 // unchanged and `fmin(fmax(...))` becomes the equivalent if/else OpenFOAM itself writes.
+//
+// THE BOUNDS ARE PER CELL, built here from the cell's own pressure: OpenFOAM's are
+// `thermo.he(thermo.p(), Tmin, cells_)` (limitTemperature.C:156-157), a field over p. They used to arrive
+// as two numbers the driver converted once with the perfect-gas closed form -- exact for hConst, whose
+// he does not see p, and a clamp to the wrong temperature for a liquid, whose Es carries -p/rho(T).
 __global__ void limitEnergyKernel(
     int    nC,
-    scalar heMin,
-    scalar heMax,
+    const scalar* __restrict__ p,
+    scalar Tmin,
+    scalar Tmax,
+    ThermoCoeffs th,
     scalar* __restrict__ he,
     int* __restrict__ nBelow,
     int* __restrict__ nAbove)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
+    const scalar heMin = thermoHeOf(p[c], Tmin, th);
+    const scalar heMax = thermoHeOf(p[c], Tmax, th);
     if (he[c] < heMin)
     {
         he[c] = heMin;
@@ -114,6 +125,53 @@ __global__ void limitEnergyKernel(
         he[c] = heMax;
         if (nAbove) atomicAdd(nAbove, 1);
     }
+}
+
+// ...and the boundary pass: every face whose patch does not fix a value, clamped between he(p_b, Tmin)
+// and he(p_b, Tmax) at the FACE's pressure (limitTemperature.C:229-272). fixesValue() is the predicate
+// thermoCorrectBndKernel uses -- fixedValue, and every mixed-derived face whatever its flux sign
+// (mixedFvPatchField.H:197) -- not bcType == 1 alone, which is what the previous kernel tested: it
+// clamped an inletOutlet outflow face OpenFOAM leaves alone. Unobservable then, since thermo.correct()
+// rewrites he_b on exactly those faces straight after, and matched to OpenFOAM's test now.
+__global__ void limitEnergyBndKernel(
+    int    nB,
+    const label* __restrict__ bcType,
+    const label* __restrict__ ioMask,
+    const label* __restrict__ oioMask,
+    const label* __restrict__ mixedMask,
+    const scalar* __restrict__ pBnd,
+    scalar Tmin,
+    scalar Tmax,
+    ThermoCoeffs th,
+    scalar* __restrict__ heBnd)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nB) return;
+    const bool fixes = bcType[i] == 1
+                    || (ioMask    && ioMask[i])
+                    || (oioMask   && oioMask[i])
+                    || (mixedMask && mixedMask[i]);
+    if (fixes) return;
+    const scalar lo = thermoHeOf(pBnd[i], Tmin, th);
+    const scalar hi = thermoHeOf(pBnd[i], Tmax, th);
+    if      (heBnd[i] < lo) heBnd[i] = lo;
+    else if (heBnd[i] > hi) heBnd[i] = hi;
+}
+
+// fixedTemperatureConstraint's VALUE: he(p, Tuniform) at the cell's CURRENT pressure, every time the
+// constraint is applied -- `eqn.setValues(cells_, thermo.he(thermo.p(), Tuni, cells_))`
+// (fixedTemperatureConstraint.C:125-126). Evaluated over every cell because deviceSetValues reads it only
+// where the mask is set.
+__global__ void heFromPTKernel(
+    int    nC,
+    const scalar* __restrict__ p,
+    const scalar* __restrict__ T,
+    ThermoCoeffs th,
+    scalar* __restrict__ he)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    he[c] = thermoHeOf(p[c], T[c], th);
 }
 
 
@@ -754,6 +812,14 @@ Residuals rhoSimpleStep(
         // faces and inverts he_b on the rest (rhoThermoDevice.cu), so the outlet T_b -- and the rho_b,
         // mu_b, alphaEff_b built from it -- lag the cells by one iteration exactly as OpenFOAM's do.
         deviceBCValue(dbT, f.T, f.TBnd);
+        // ...and the rest of every energy condition's updateCoeffs: he's own coefficients, rebuilt from
+        // the p and T that stand now -- rhoThermoDevice.cu's updateEnergyBoundaryCoeffs, the twin of the
+        // host step's energy_boundary.cuh. A no-op in value for perfectGas + hConst; the static
+        // construction-time image is wrong from the second iteration for a liquid.
+        if (in.heEnergyKind && in.heEnergyKind->size() == static_cast<std::size_t>(dbHe.n))
+            updateEnergyBoundaryCoeffs(dbHe, dbT, f.pBnd, f.TBnd, *in.heEnergyKind, in.thermo, f.heBnd);
+        // he's STORED patch values for the assembly's gradients -- see RhoEnergyInput::heBndValues.
+        if (f.heBnd.size() == static_cast<std::size_t>(dbHe.n)) ein.heBndValues = &f.heBnd;
         assembleEEqn(E, dm, dbHe, f.he, ein);
 
         // fvOptions.constrain(EEqn) -- EEqn.H:20, on the ASSEMBLED matrix and before the solve, which
@@ -762,10 +828,17 @@ Residuals rhoSimpleStep(
         // The driver converts, because only it knows the thermo. Applied here rather than inside
         // assembleEEqn because setValues writes psi as well as the matrix, and the assembly takes he
         // by const reference -- the solve owns it.
-        if (in.fvoHeMask && in.fvoHeVal
+        if (in.fvoHeMask && in.fvoHeT
             && in.fvoHeMask->size() == static_cast<std::size_t>(dm.nCells))
-            deviceSetValues(dm, *in.fvoHeMask, *in.fvoHeVal, E.diag, E.upper, E.lower, E.source,
+        {
+            DeviceBuffer<scalar> heVal;
+            heVal.resize(static_cast<std::size_t>(dm.nCells));
+            heFromPTKernel<<<(dm.nCells + 255) / 256, 256>>>(dm.nCells, f.p.data(), in.fvoHeT->data(),
+                                                             in.thermo, heVal.data());
+            cudaCheck(cudaGetLastError(), "rhoSimpleFoam fixedTemperatureConstraint he(p, T)");
+            deviceSetValues(dm, *in.fvoHeMask, heVal, E.diag, E.upper, E.lower, E.source,
                             E.iC, E.bC, f.he);
+        }
 
         DeviceBuffer<scalar> diagC, b;
         deviceFold(dm, E.diag, E.source, E.iC, E.bC, diagC, b);
@@ -801,7 +874,7 @@ Residuals rhoSimpleStep(
             cudaCheck(cudaMemsetAsync(counts.data(), 0, 2 * sizeof(label), cudaStreamPerThread),
                       "rhoSimpleFoam limitEnergy counters");
             limitEnergyKernel<<<(nC + 255) / 256, 256>>>(
-                nC, in.heMin, in.heMax, f.he.data(),
+                nC, f.p.data(), in.limitTmin, in.limitTmax, in.thermo, f.he.data(),
                 reinterpret_cast<int*>(counts.data()),
                 reinterpret_cast<int*>(counts.data()) + 1);
             cudaCheck(cudaGetLastError(), "rhoSimpleFoam limitEnergy");
@@ -829,7 +902,16 @@ Residuals rhoSimpleStep(
         // nothing re-derives one. AFTER deviceBCValue, so the re-derivation cannot undo it; the kernel
         // skips bcType 1 (fixesValue), which is OpenFOAM's own test. The kernel already existed and had
         // no caller on this path at all.
-        if (in.limitHe) deviceFvoLimitEnergyBoundary(dbHe, in.heMin, in.heMax, f.heBnd);
+        if (in.limitHe && dbHe.n > 0 && f.heBnd.size() == static_cast<std::size_t>(dbHe.n))
+        {
+            limitEnergyBndKernel<<<(dbHe.n + 255) / 256, 256>>>(
+                dbHe.n, dbHe.bcType.data(),
+                dbHe.ioMask.size()    ? dbHe.ioMask.data()    : nullptr,
+                dbHe.oioMask.size()   ? dbHe.oioMask.data()   : nullptr,
+                dbHe.mixedMask.size() ? dbHe.mixedMask.data() : nullptr,
+                f.pBnd.data(), in.limitTmin, in.limitTmax, in.thermo, f.heBnd.data());
+            cudaCheck(cudaGetLastError(), "rhoSimpleFoam limitEnergy boundary");
+        }
     }
 
     // EEqn.H ends with thermo.correct(): T, and therefore psi, move HERE and everything below sees them.

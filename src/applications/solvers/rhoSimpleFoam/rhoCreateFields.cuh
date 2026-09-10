@@ -55,6 +55,10 @@ struct RhoDeviceFields
     DeviceMesh           dm;
     DeviceVectorBoundary dbU;
     DeviceBoundary       dbP, dbHe, dbT;
+    // Per BOUNDARY FACE of he: which of OpenFOAM's energy conditions it carries (RhoStepInput::
+    // heEnergyKind has the codes). Built from T's patch CLASSES with the same tests the host step's
+    // energy_boundary.cuh makes, in basicThermo::heBoundaryTypes' order.
+    DeviceBuffer<label>  heEnergyKind;
     DeviceBoundary       dbK, dbEps;      // empty on a laminar case
     RhoSolverFields      f;               // the mutable solution state, seeded from the host's
 

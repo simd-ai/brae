@@ -4,7 +4,7 @@
 
 #include "device_blas.cuh"        // deviceDivide, deviceCopy -- already gated, not re-written here
 #include "device_kepsilon.cuh"    // deviceGatherWallNu: boundary-face -> wall-face ordering
-#include "transport_model.cuh"   // transportMu -- the SAME function the host reference calls
+#include "liquid_thermo.cuh"     // thermoMuOf -- the SAME accessor the host reference calls
 #include <stdexcept>
 #include <vector>
 
@@ -17,12 +17,15 @@ namespace {
 constexpr int TPB = 256;
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 
-// nu = mu(T)/rho, the LAMINAR kinematic viscosity. The host reference computes exactly this
-// (rhoSimpleFoam_cpp.cu, nuLam/nuLamBnd) with the same transportMu, so cells and boundary faces run one
-// kernel. The rho guard is the boundary's: a boundary face of a patch brae pads rather than solves can
-// carry rho 0, and dividing by it would put an inf into the closure's diffusivity.
+// nu = mu(p,T)/rho, the LAMINAR kinematic viscosity. The host reference computes exactly this
+// (rhoSimpleFoam_cpp.cu, nuLam/nuLamBnd) with the same thermoMuOf, so cells and boundary faces run one
+// kernel -- and, since stage H3.6, a liquid's NSRDS mu(T) as well as a gas's Sutherland one, which is
+// the only place the thermo enters a RAS closure. The rho guard is the boundary's: a boundary face of a
+// patch brae pads rather than solves can carry rho 0, and dividing by it would put an inf into the
+// closure's diffusivity.
 __global__ void nuFromTKernel(
     int                        n,
+    const scalar* __restrict__ p,
     const scalar* __restrict__ T,
     const scalar* __restrict__ rho,
     ThermoCoeffs               c,
@@ -31,7 +34,7 @@ __global__ void nuFromTKernel(
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const scalar r = rho[i];
-    nu[i] = transportMu(T[i], c) / (r > scalar(0) ? r : scalar(1));
+    nu[i] = thermoMuOf(p[i], T[i], c) / (r > scalar(0) ? r : scalar(1));
 }
 
 // The face-wise divide and the wall-face gather are NOT here: deviceDivide (device_blas.cuh, out = a./b
@@ -58,11 +61,11 @@ void correctTurbulence(
     // ---- nu, cells and boundary faces -----------------------------------------------------------
     if (static_cast<int>(buf.nuCell.size()) != nC)  buf.nuCell.resize(nC);
     if (static_cast<int>(buf.nuBnd.size()) != nBF)  buf.nuBnd.resize(nBF);
-    nuFromTKernel<<<nBlocks(nC), TPB>>>(nC, f.T.data(), f.rho.data(), thermo, buf.nuCell.data());
+    nuFromTKernel<<<nBlocks(nC), TPB>>>(nC, f.p.data(), f.T.data(), f.rho.data(), thermo, buf.nuCell.data());
     cudaCheck(cudaGetLastError(), "rho turbulence hook: nu cells");
     if (nBF > 0)
     {
-        nuFromTKernel<<<nBlocks(nBF), TPB>>>(nBF, f.TBnd.data(), f.rhoBnd.data(), thermo,
+        nuFromTKernel<<<nBlocks(nBF), TPB>>>(nBF, f.pBnd.data(), f.TBnd.data(), f.rhoBnd.data(), thermo,
                                              buf.nuBnd.data());
         cudaCheck(cudaGetLastError(), "rho turbulence hook: nu boundary");
     }
@@ -141,6 +144,8 @@ void correctTurbulence(
     kin.limiterCoeff          = opt.limiterCoeff;
     kin.limGradK              = opt.limGradK;
     kin.limGradLeastSq        = opt.limGradLeastSq;
+    kin.linearUpwind          = opt.linearUpwind;
+    kin.luGradK               = opt.luGradK;
     kin.correctedLaplacian = opt.correctedLaplacian;
     kin.relaxEquationK   = opt.relaxEquationK;   kin.relaxK   = opt.relaxK;
     kin.relaxEquationEps = opt.relaxEquationEps; kin.relaxEps = opt.relaxEps;
@@ -177,6 +182,7 @@ void correctTurbulence(
         sstIn.boundedK = kin.boundedK;   sstIn.boundedOmega = kin.boundedEps;
         sstIn.limitedLinear = kin.limitedLinear;  sstIn.limiterCoeff = kin.limiterCoeff;
         sstIn.limGradK = kin.limGradK;   sstIn.limGradLeastSq = kin.limGradLeastSq;
+        sstIn.linearUpwind = kin.linearUpwind;  sstIn.luGradK = kin.luGradK;
         sstIn.correctedLaplacian = kin.correctedLaplacian;
         sstIn.snGradLimitCoeff   = kin.snGradLimitCoeff;
         sstIn.gradULimitK        = opt.co.gradULimitK;

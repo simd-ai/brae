@@ -40,7 +40,9 @@ namespace rhoSimple {
 struct DeviceConstraints
 {
     DeviceBuffer<label>  heMask,  kMask,  epsMask;
-    DeviceBuffer<scalar> heVal,   kVal,   epsVal;
+    // heT is fixedTemperatureConstraint's TEMPERATURE per cell, not an energy: the step evaluates
+    // he(p, T) at the cell's current pressure at every constrain, as OpenFOAM does.
+    DeviceBuffer<scalar> heT,     kVal,   epsVal;
     bool hasHe = false, hasK = false, hasEps = false;
 };
 

@@ -70,6 +70,28 @@ void updateRho(
 // transportAlpha takes the VISCOSITY, not the temperature: constTransport is mu/Pr and sutherland is the
 // Eucken kappa/Cp built from mu. The boundary values are the PATCH's nut and alphat, never the adjacent
 // cell's -- that distinction is the entire reason a wall function exists.
+// The ENERGY boundary conditions, live -- the device twin of energy_boundary.cuh (stage H3.6). Called
+// after T's boundary has been evaluated for the energy assembly (the Tw.evaluate() at the head of all
+// three updateCoeffs) and before the assembly. `kind` is per boundary face (RhoStepInput::heEnergyKind):
+//   1 fixedEnergy     refValue      = he(p_b, T_b)                  fixedEnergy .C:95-114
+//   2 gradientEnergy  refGrad       = Cpv(p_b, T_b) * T's gradient   gradientEnergy .C:95-119
+//   3 mixedEnergy     valueFraction = T's; refValue = he(p_b, T's refValue);
+//                     refGrad       = Cpv(p_b, T_b) * T's refGrad    mixedEnergy .C:103-131
+//   4 mixedEnergy on an inletOutlet T: refValue = he(p_b, T's inletValue); the flux switch owns the
+//                     valueFraction here (deviceUpdateInletOutlet, from the same phi as T's)
+// with the pureMixture-zero term omitted for the reason energy_boundary.cuh gives. A no-op in value on
+// perfectGas + hConst, which is why no gas gate can move.
+// heBnd, he's STORED patch values, takes the fixedEnergy faces' new value as well: the host's
+// setStoredValues, OpenFOAM's operator== on a fixedValue patch. The other kinds change coefficients only.
+void updateEnergyBoundaryCoeffs(
+    DeviceBoundary&             dbHe,
+    const DeviceBoundary&       dbT,
+    const DeviceBuffer<scalar>& pBnd,
+    const DeviceBuffer<scalar>& TBnd,
+    const DeviceBuffer<label>&  kind,
+    const ThermoCoeffs&         c,
+    DeviceBuffer<scalar>&       heBnd);
+
 void effectiveTransport(
     const RhoSolverFields& f,
     const ThermoCoeffs&    c,

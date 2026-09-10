@@ -294,7 +294,8 @@ void assembleEEqn(
     if (in.schemeHe == cpu::rhoSimple::DivScheme::limitedLinear)
     {
         DeviceBuffer<scalar> hb, gx, gy, gz;
-        deviceBCValue(dbHe, he, hb);
+        if (in.heBndValues) deviceCopy(hb, *in.heBndValues);
+        else                deviceBCValue(dbHe, he, hb);
         if (in.limGradHeLeastSq) deviceLeastSquaresGrad(dm, he, hb, gx, gy, gz);
         else                     deviceGaussGrad(dm, he, hb, gx, gy, gz);
         if (in.limGradHeK > scalar(0)) deviceCellLimitGrad(dm, he, hb, gx, gy, gz, in.limGradHeK);
@@ -314,7 +315,8 @@ void assembleEEqn(
     if (in.schemeHe == cpu::rhoSimple::DivScheme::linearUpwind)
     {
         DeviceBuffer<scalar> hb, gx, gy, gz, corr;
-        deviceBCValue(dbHe, he, hb);
+        if (in.heBndValues) deviceCopy(hb, *in.heBndValues);
+        else                deviceBCValue(dbHe, he, hb);
         deviceGaussGrad(dm, he, hb, gx, gy, gz);
         if (in.gradHeLimitK > 0.0) deviceCellLimitGrad(dm, he, hb, gx, gy, gz, in.gradHeLimitK);
         deviceLinearUpwindCorr(dm, *in.phiInt, gx, gy, gz, corr);
@@ -357,7 +359,8 @@ void assembleEEqn(
         if (in.correctedLaplacian)
         {
             DeviceBuffer<scalar> hb, gx, gy, gz, lc;
-            deviceBCValue(dbHe, he, hb);
+            if (in.heBndValues) deviceCopy(hb, *in.heBndValues);
+            else                deviceBCValue(dbHe, he, hb);
             deviceGaussGrad(dm, he, hb, gx, gy, gz);
             if (in.snGradLimitCoeff > 0.0)
             {

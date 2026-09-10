@@ -386,7 +386,8 @@ void constrain(
     const std::string&          field,
     const PrimitiveMesh&        m,
     const std::vector<FvPatch>& patches,
-    scalar                    (*heOfT)(scalar))
+    scalar                    (*heOfPT)(scalar, scalar),
+    const std::vector<scalar>*  pCell)
 {
     for (const Option& o : opts.options)
     {
@@ -401,14 +402,17 @@ void constrain(
             // The energy equation only. OpenFOAM sets he(p, Tuniform), NOT the temperature: putting a
             // temperature where an energy belongs is a 400x error that still converges.
             if (field != "e" && field != "h") continue;
-            if (!heOfT)
+            if (!heOfPT || !pCell || static_cast<label>(pCell->size()) != m.nCells())
                 throw std::runtime_error(
-                    "fvOptions: a fixedTemperatureConstraint is active but no he(T) conversion was "
-                    "supplied. OpenFOAM constrains the energy equation to he(p, Tuniform); refusing "
-                    "rather than constraining it to a temperature.");
+                    "fvOptions: a fixedTemperatureConstraint is active but no he(p, T) conversion and "
+                    "cell pressure were supplied. OpenFOAM constrains the energy equation to "
+                    "he(p, Tuniform) at each cell's pressure; refusing rather than constraining it to a "
+                    "temperature.");
             cells = o.allCells ? std::vector<label>() : o.cells;
             if (o.allCells) { cells.resize(m.nCells()); for (label c = 0; c < m.nCells(); ++c) cells[c] = c; }
-            vals.assign(cells.size(), heOfT(o.Tuniform));
+            vals.resize(cells.size());
+            for (std::size_t i = 0; i < cells.size(); ++i)
+                vals[i] = heOfPT((*pCell)[static_cast<std::size_t>(cells[i])], o.Tuniform);
         }
         else
         {

@@ -77,6 +77,9 @@ struct TurbulenceHookOptions
     scalar         limiterCoeff  = 1.0;
     scalar         limGradK      = 0.0;
     bool           limGradLeastSq = false;
+    // `Gauss linearUpwind <name>` on the pair, and the cellLimited coefficient of the gradient it names.
+    bool           linearUpwind  = false;
+    scalar         luGradK       = 0.0;
     bool           relaxEquationK = true,  relaxEquationEps = true;
     scalar         relaxK = 1.0, relaxEps = 1.0;
     scalar         tol = 1e-12, relTol = 0.0;

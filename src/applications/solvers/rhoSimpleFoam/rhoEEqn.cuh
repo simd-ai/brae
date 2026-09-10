@@ -73,6 +73,17 @@ struct RhoEnergyInput
     const DeviceBuffer<scalar>* alphaEffCell    = nullptr;
     const DeviceBuffer<scalar>* alphaEffBndFace = nullptr;
 
+    // he's PATCH VALUES as the assembly's gradients must read them -- the STORED ones: the last
+    // evaluate's (the previous energy solve), then limitTemperature's boundary clamp, then
+    // thermo.correct()'s `he_b = HE(p_b, T_b)` on every fixesValue face (heRhoThermo.C:112-122), then the
+    // fixedEnergy faces' `operator==` in this iteration's updateCoeffs. A live evaluate of dbHe re-derives
+    // the fixesValue faces from the cells instead: he_cell = HE(p_c, T_c) where the stored value is
+    // HE(p_b, T_b), the same number for an hConst gas and different by (p_b - p_c)/rho for a liquid.
+    // Measured on squareBendLiq's geometry, CUDA arm, `linearUpwind limited` on div(phi,e): T 4.5e-08
+    // off OpenFOAM at iteration 2 with U and p exact, the floor with the stored values (stage H3.6).
+    // Null = evaluate dbHe live, what every caller did before.
+    const DeviceBuffer<scalar>* heBndValues     = nullptr;
+
     // Fields the kinetic-energy term is built from. p and rho are needed only on the `e` branch, but both
     // are required regardless so a caller cannot half-supply the inputs of an equation it selected.
     const DeviceBuffer<scalar>* Ux   = nullptr;

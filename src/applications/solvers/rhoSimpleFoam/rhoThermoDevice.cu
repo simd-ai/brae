@@ -1,10 +1,11 @@
 // Device-resident implementations of the driver's three thermo hooks. See rhoThermoDevice.cuh for why
 // they exist and what they refuse.
 #include "rhoThermoDevice.cuh"
-#include "thermo_model.cuh"          // hConstHeToT, thermoCpByCpv
-#include "equation_of_state.cuh"     // perfectGasPsi, perfectGasRho
-#include "transport_model.cuh"       // transportMu, transportAlpha
+#include "thermo_model.cuh"          // thermoCpByCpv
+#include "liquid_thermo.cuh"         // thermo*Of / thermoHeToT: the host step's accessors, BRAE_HD
 #include "device_blas.cuh"
+#include <climits>
+#include <cstdio>
 #include <stdexcept>
 
 namespace brae {
@@ -16,26 +17,28 @@ namespace {
 constexpr int TPB = 256;
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 
-// The scope guard. It lives in one place rather than at the top of each kernel launch because a partial
-// refusal -- correcting the temperature on the gas path and then evaluating a liquid's transport -- is
-// the failure this project keeps naming.
-void requirePerfectGas(const ThermoCoeffs& c, const char* what)
+// EVERY PROPERTY THROUGH liquid_thermo.cuh, as on the host step (stage H3.6). These kernels called the
+// perfect-gas closed forms directly -- hConstHeToT, perfectGasPsi, perfectGasRho, transportMu,
+// transportAlpha -- behind a requirePerfectGas guard, which is what kept a liquid off this arm. The
+// accessors branch once on the model and are BRAE_HD, so the kernels below and the host step call the
+// same function for every property; on the gas path each accessor is the closed form it replaced,
+// operation for operation, which is why no gas gate can move.
+//
+// The he -> T inversion is the one arithmetic that can FAIL. OpenFOAM raises a FatalError on its
+// iteration cap (species::thermo<>::T, thermoI.H:80-87); a kernel cannot throw, so a face or cell that
+// does not converge leaves its fields untouched and records its index, and the host throws with the
+// inputs read back -- the same refusal and the same message shape as the host step's heToTFailure.
+__device__ __forceinline__ void recordFailure(int* failIdx, int i)
 {
-    if (c.model != ThermoModel::perfectGas)
-    {
-        throw std::runtime_error(
-            std::string("rhoSimpleFoam(cuda): ") + what + " is implemented for perfectGas + hConst + "
-            "(const | sutherland) only, and this case selects a liquid. The liquid path replaces Cp, mu, "
-            "kappa and rho with per-cell NSRDS correlations and inverts he -> T by Newton rather than in "
-            "closed form; device_thermo.cu carries that path for the legacy solver, but no compressible "
-            "liquid fixture gates it through this driver. Refusing rather than running a gas equation of "
-            "state against a liquid's coefficients.");
-    }
+    atomicMin(failIdx, i);
 }
 
 // he -> T -> psi, and the thermo's own rho from the CURRENT p and T. One kernel over cells, one over
 // boundary faces, because the boundary temperature is T's own boundary condition rather than an
 // inversion of the boundary enthalpy.
+//
+// T[i] on entry is the SEED: OpenFOAM passes TCells[celli] to THE (heRhoThermo.C:76-82), and its
+// inversion's tolerance is built once from that seed, so the answer depends on it.
 __global__ void thermoCorrectCellKernel(
     int                   n,
     const scalar* __restrict__ he,
@@ -43,14 +46,20 @@ __global__ void thermoCorrectCellKernel(
     ThermoCoeffs          c,
     scalar* __restrict__  T,
     scalar* __restrict__  psi,
-    scalar* __restrict__  rhoThermo)
+    scalar* __restrict__  rhoThermo,
+    int* __restrict__     failIdx)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const scalar t = hConstHeToT(he[i], c);
-    T[i]         = t;
-    psi[i]       = perfectGasPsi(t, c);
-    rhoThermo[i] = perfectGasRho(p[i], t, c);
+    const HeToTResult inv = thermoHeToT(he[i], p[i], T[i], c);
+    if (!inv.converged)
+    {
+        recordFailure(failIdx, i);
+        return;
+    }
+    T[i]         = inv.T;
+    psi[i]       = thermoPsiOf(p[i], inv.T, c);
+    rhoThermo[i] = thermoRhoOf(p[i], inv.T, c);
 }
 
 // heRhoThermo::calculate()'s patch loop (heRhoThermo.C:102-142), per face. A face whose T fixesValue()
@@ -71,7 +80,8 @@ __global__ void thermoCorrectBndKernel(
     scalar* __restrict__  heBnd,
     scalar* __restrict__  TBnd,
     scalar* __restrict__  psiBnd,
-    scalar* __restrict__  rhoThermoBnd)
+    scalar* __restrict__  rhoThermoBnd,
+    int* __restrict__     failIdx)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -79,10 +89,23 @@ __global__ void thermoCorrectBndKernel(
                     || (ioMask    && ioMask[i])
                     || (oioMask   && oioMask[i])
                     || (mixedMask && mixedMask[i]);
-    if (fixes) heBnd[i] = hConstTToHe(TBnd[i], c);
-    else       TBnd[i]  = hConstHeToT(heBnd[i], c);
-    psiBnd[i]       = perfectGasPsi(TBnd[i], c);
-    rhoThermoBnd[i] = perfectGasRho(pBnd[i], TBnd[i], c);
+    if (fixes)
+    {
+        heBnd[i] = thermoHeOf(pBnd[i], TBnd[i], c);
+    }
+    else
+    {
+        // Seeded with the face's own current T, as heRhoThermo.C:133 seeds it.
+        const HeToTResult inv = thermoHeToT(heBnd[i], pBnd[i], TBnd[i], c);
+        if (!inv.converged)
+        {
+            recordFailure(failIdx, i);
+            return;
+        }
+        TBnd[i] = inv.T;
+    }
+    psiBnd[i]       = thermoPsiOf(pBnd[i], TBnd[i], c);
+    rhoThermoBnd[i] = thermoRhoOf(pBnd[i], TBnd[i], c);
 }
 
 // rho = p/(R T), used only on the hePsiThermo branch -- the heRhoThermo branch is a copy of the stored
@@ -96,7 +119,7 @@ __global__ void rhoFromPTKernel(
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    rho[i] = perfectGasRho(p[i], T[i], c);
+    rho[i] = thermoRhoOf(p[i], T[i], c);
 }
 
 // muEff and alphaEff over an arbitrary run of entries. Cells and boundary faces take the SAME kernel
@@ -104,6 +127,7 @@ __global__ void rhoFromPTKernel(
 // making that the caller's choice is what keeps the boundary from quietly inheriting the cell's.
 __global__ void effectiveTransportKernel(
     int                   n,
+    const scalar* __restrict__ p,
     const scalar* __restrict__ T,
     const scalar* __restrict__ rho,
     const scalar* __restrict__ nut,      // null on a laminar case
@@ -115,33 +139,141 @@ __global__ void effectiveTransportKernel(
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const scalar muLam = transportMu(T[i], c);
+    const scalar muLam = thermoMuOf(p[i], T[i], c);
     // mut = rho*nut, and alphat is READ from the field the turbulence model maintains rather than
     // rebuilt from nut/Prt here, so the two cannot drift apart.
     const scalar mut    = nut    ? rho[i] * nut[i] : scalar(0);
     const scalar alphaT = alphat ? alphat[i]       : scalar(0);
     muEff[i]    = muLam + mut;
-    alphaEff[i] = cpByCpv * (transportAlpha(muLam, c) + alphaT);
+    alphaEff[i] = cpByCpv * (thermoAlphaOf(p[i], T[i], c) + alphaT);
+}
+
+// One face of the energy boundary update -- see updateEnergyBoundaryCoeffs in the header.
+__global__ void energyBoundaryKernel(
+    int                        n,
+    const label* __restrict__  kind,
+    const scalar* __restrict__ pBnd,
+    const scalar* __restrict__ TBnd,
+    const scalar* __restrict__ TrefValue,
+    const scalar* __restrict__ TrefGrad,       // null when T carries no gradient on any face
+    const scalar* __restrict__ Tvf,            // null when T carries no plain mixed face
+    ThermoCoeffs               c,
+    scalar* __restrict__       heRefValue,
+    scalar* __restrict__       heRefGrad,      // null when he carries no gradient slot
+    scalar* __restrict__       heVf,           // null when he carries no plain mixed face
+    scalar* __restrict__       heBnd)          // he's stored patch values
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    switch (kind[i])
+    {
+        case 1:
+            heRefValue[i] = thermoHeOf(pBnd[i], TBnd[i], c);
+            heBnd[i]      = heRefValue[i];
+            break;
+        case 2:
+            if (heRefGrad) heRefGrad[i] = TrefGrad ? thermoCpvOf(pBnd[i], TBnd[i], c) * TrefGrad[i] : scalar(0);
+            break;
+        case 3:
+            if (heVf && Tvf) heVf[i] = Tvf[i];
+            heRefValue[i] = thermoHeOf(pBnd[i], TrefValue[i], c);
+            if (heRefGrad) heRefGrad[i] = TrefGrad ? thermoCpvOf(pBnd[i], TBnd[i], c) * TrefGrad[i] : scalar(0);
+            break;
+        case 4:
+            heRefValue[i] = thermoHeOf(pBnd[i], TrefValue[i], c);
+            break;
+        default:
+            break;
+    }
 }
 
 } // namespace
 
+
+void updateEnergyBoundaryCoeffs(
+    DeviceBoundary&             dbHe,
+    const DeviceBoundary&       dbT,
+    const DeviceBuffer<scalar>& pBnd,
+    const DeviceBuffer<scalar>& TBnd,
+    const DeviceBuffer<label>&  kind,
+    const ThermoCoeffs&         c,
+    DeviceBuffer<scalar>&       heBnd)
+{
+    const int n = dbHe.n;
+    if (n == 0) return;
+    const std::size_t sn = static_cast<std::size_t>(n);
+    if (dbT.n != n || kind.size() != sn || pBnd.size() != sn || TBnd.size() != sn
+        || dbHe.refValue.size() != sn || dbT.refValue.size() != sn || heBnd.size() != sn)
+    {
+        throw std::runtime_error("rhoThermoDevice: the energy boundary update needs he's and T's boundary "
+                                 "descriptors, p_b and T_b on every boundary face -- a size disagrees.");
+    }
+    energyBoundaryKernel<<<nBlocks(n), TPB>>>(
+        n, kind.data(), pBnd.data(), TBnd.data(), dbT.refValue.data(),
+        dbT.refGrad.size() == sn ? dbT.refGrad.data() : nullptr,
+        dbT.valueFraction.size() == sn ? dbT.valueFraction.data() : nullptr,
+        c, dbHe.refValue.data(),
+        dbHe.refGrad.size() == sn ? dbHe.refGrad.data() : nullptr,
+        dbHe.valueFraction.size() == sn ? dbHe.valueFraction.data() : nullptr,
+        heBnd.data());
+    cudaCheck(cudaGetLastError(), "rhoEnergyBoundary");
+}
+
+
+// The host half of the failure path: one int on the device, INT_MAX meaning "every entry converged".
+namespace
+{
+struct FailFlag
+{
+    DeviceBuffer<int> idx;
+    FailFlag() { idx.copyFrom(std::vector<int>(1, INT_MAX)); }
+    int read() const { return idx.host()[0]; }
+};
+
+[[noreturn]] void throwHeToTFailure(
+    const char*                  where,
+    int                          i,
+    const DeviceBuffer<scalar>&  he,
+    const DeviceBuffer<scalar>&  p,
+    const DeviceBuffer<scalar>&  T)
+{
+    const double h = he.host()[static_cast<std::size_t>(i)];
+    const double pp = p.host()[static_cast<std::size_t>(i)];
+    const double t0 = T.host()[static_cast<std::size_t>(i)];
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+                  "brae: rhoSimpleFoam(cuda) thermo.correct() could not invert he -> T at %s %d. "
+                  "he = %.10g J/kg, p = %.10g Pa, seed T = %.10g K. OpenFOAM raises a FatalError here "
+                  "(species::thermo<>::T, thermoI.H:80-87); brae refuses rather than carrying an "
+                  "unconverged temperature into psi, rho and the pressure equation.",
+                  where, i, h, pp, t0);
+    throw std::runtime_error(buf);
+}
+} // namespace
 
 void thermoCorrect(
     RhoSolverFields&      f,
     const DeviceBoundary& dbT,
     const ThermoCoeffs&   c)
 {
-    requirePerfectGas(c, "thermo.correct()");
     const int nC = static_cast<int>(f.he.size());
     if (nC == 0) return;
+    // T is the inversion's SEED, so it has to exist already -- createDeviceFields projects it.
+    if (f.T.size() != static_cast<std::size_t>(nC))
+        throw std::runtime_error("rhoThermoDevice: thermo.correct() needs the current T as the he -> T "
+                                 "seed, and the device T is not sized to the mesh.");
 
-    f.T.resize(nC);
     f.psi.resize(nC);
     f.rhoThermo.resize(nC);
-    thermoCorrectCellKernel<<<nBlocks(nC), TPB>>>(
-        nC, f.he.data(), f.p.data(), c, f.T.data(), f.psi.data(), f.rhoThermo.data());
-    cudaCheck(cudaGetLastError(), "rhoThermoCorrectCell");
+    {
+        FailFlag fail;
+        thermoCorrectCellKernel<<<nBlocks(nC), TPB>>>(
+            nC, f.he.data(), f.p.data(), c, f.T.data(), f.psi.data(), f.rhoThermo.data(),
+            fail.idx.data());
+        cudaCheck(cudaGetLastError(), "rhoThermoCorrectCell");
+        const int bad = fail.read();
+        if (bad != INT_MAX) throwHeToTFailure("cell", bad, f.he, f.p, f.T);
+    }
 
     // The boundary half: calculate()'s patch loop, NOT an evaluate of T's own conditions -- see the
     // kernel. T's boundary was evaluated at the energy assembly and stands; he_b is written on the
@@ -155,13 +287,17 @@ void thermoCorrect(
     }
     f.psiBnd.resize(nB);
     f.rhoThermoBnd.resize(nB);
+    FailFlag fail;
     thermoCorrectBndKernel<<<nBlocks(nB), TPB>>>(
         nB, dbT.bcType.data(),
         dbT.ioMask.size()    ? dbT.ioMask.data()    : nullptr,
         dbT.oioMask.size()   ? dbT.oioMask.data()   : nullptr,
         dbT.mixedMask.size() ? dbT.mixedMask.data() : nullptr,
-        f.pBnd.data(), c, f.heBnd.data(), f.TBnd.data(), f.psiBnd.data(), f.rhoThermoBnd.data());
+        f.pBnd.data(), c, f.heBnd.data(), f.TBnd.data(), f.psiBnd.data(), f.rhoThermoBnd.data(),
+        fail.idx.data());
     cudaCheck(cudaGetLastError(), "rhoThermoCorrectBnd");
+    const int bad = fail.read();
+    if (bad != INT_MAX) throwHeToTFailure("boundary face", bad, f.heBnd, f.pBnd, f.TBnd);
 }
 
 
@@ -169,7 +305,6 @@ void updateRho(
     RhoSolverFields&    f,
     const ThermoCoeffs& c)
 {
-    requirePerfectGas(c, "thermo.rho()");
     const int nC = static_cast<int>(f.p.size());
     if (nC == 0) return;
 
@@ -204,7 +339,6 @@ void effectiveTransport(
     DeviceBuffer<scalar>&  alphaEff,
     DeviceBuffer<scalar>&  alphaEffBnd)
 {
-    requirePerfectGas(c, "the effective transport");
     const scalar cpByCpv = thermoCpByCpv(c);
     // The reference's own predicate: turbulent AND a nut field that actually exists. A case declared
     // turbulent whose closure has not been read is laminar as far as the transport is concerned.
@@ -216,7 +350,7 @@ void effectiveTransport(
         muEff.resize(nC);
         alphaEff.resize(nC);
         effectiveTransportKernel<<<nBlocks(nC), TPB>>>(
-            nC, f.T.data(), f.rho.data(),
+            nC, f.p.data(), f.T.data(), f.rho.data(),
             turb ? f.nut.data() : nullptr,
             (turb && f.alphat.size() == static_cast<std::size_t>(nC)) ? f.alphat.data() : nullptr,
             c, cpByCpv, muEff.data(), alphaEff.data());
@@ -232,7 +366,7 @@ void effectiveTransport(
         // two differ by the whole of the turbulent viscosity, and on one carrying
         // compressible::alphatWallFunction by the whole of the turbulent diffusivity.
         effectiveTransportKernel<<<nBlocks(nB), TPB>>>(
-            nB, f.TBnd.data(), f.rhoBnd.data(),
+            nB, f.pBnd.data(), f.TBnd.data(), f.rhoBnd.data(),
             (turb && f.nutBnd.size() == static_cast<std::size_t>(nB)) ? f.nutBnd.data() : nullptr,
             (turb && f.alphatBnd.size() == static_cast<std::size_t>(nB)) ? f.alphatBnd.data() : nullptr,
             c, cpByCpv, muEffBnd.data(), alphaEffBnd.data());

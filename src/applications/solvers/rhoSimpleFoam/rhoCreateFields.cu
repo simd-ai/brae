@@ -64,24 +64,13 @@ RhoDeviceFields createDeviceFields(
     const FvGeometry&                      g,
     const std::vector<FvPatch>&            patches)
 {
-    // THE LIQUID REFUSAL for the device arm, in the one function both the driver (runMirrorCuda) and
-    // the CUDA step harness pass through before any device thermo is evaluated. Stage H3.4 lifted it
-    // from createFields, which the host arm shares, because the HOST step now asks every property
-    // through liquid_thermo.cuh. The device step does not: rhoThermoDevice.cu's kernels call
-    // hConstHeToT, perfectGasPsi, perfectGasRho, transportMu and transportAlpha directly, and
-    // buildDeviceStepInput builds a fixedTemperature constraint and limitTemperature's bounds with
-    // hConstTToHe. Those carry assertPerfectGas, which Release's NDEBUG makes inert, and
-    // rhoThermoDevice.cu's own requirePerfectGas fires only after buildDeviceStepInput has already run
-    // them -- so without this a liquid would come back as a confident wrong number. Stage H3.6 (the
-    // device twin of the accessors) removes it.
-    if (hf.thermo.model != ThermoModel::perfectGas)
-        throw std::runtime_error(
-            "brae: rhoSimpleFoam (OF-mirror) CUDA arm implements perfectGas + hConst only, and this case "
-            "selects `properties liquid`. The HOST arm runs it -- BRAE_RHOSIMPLEFOAM_MIRROR=1 -- because "
-            "its properties go through the thermo accessors; the device kernels still evaluate the "
-            "perfect-gas closed forms. Refusing rather than running a gas equation of state against a "
-            "liquid's coefficients.");
-
+    // `properties liquid` runs on this arm as of stage H3.6. The refusal that stood here from H3.4 --
+    // the host step had its accessors and the device kernels did not -- is gone because the device now
+    // asks the same ones: rhoThermoDevice.cu's thermo.correct(), thermo.rho() and effective transport,
+    // the turbulence hook's nu, the live energy boundary conditions (updateEnergyBoundaryCoeffs), and
+    // limitTemperature / fixedTemperatureConstraint as he(p, T) per cell. What still refuses a liquid is
+    // the parser (any liquid but H2O, any form but sensibleInternalEnergy) and createFields' correlation
+    // range, both shared with the host.
     for (std::size_t pi_ = 0; pi_ < patches.size(); ++pi_)
     {
         const FvPatch& p = patches[pi_];
@@ -118,6 +107,48 @@ RhoDeviceFields createDeviceFields(
     d.dbP  = buildDeviceBoundary(hf.p, patches, g);
     d.dbHe = buildDeviceBoundary(hf.he, patches, g);
     d.dbT  = buildDeviceBoundary(hf.T, patches, g);
+
+    // THE ENERGY CONDITIONS, classified once. basicThermo::heBoundaryTypes dispatches on T's patch class
+    // in this order -- fixedValue, then zeroGradient/fixedGradient, then mixed (basicThermo.C:197-231)
+    // -- and the step rebuilds the classified faces' coefficients from the live p and T every energy
+    // assembly (updateEnergyBoundaryCoeffs). zeroGradient is 0 here for the reason energy_boundary.cuh
+    // gives: its snGrad is identically zero, so gradientEnergy's gradient is zero for every thermo. The
+    // he patch has to be the class the dispatch implies -- createFields builds it by copying T's type --
+    // and a pairing that does not hold is refused rather than updated as something else.
+    {
+        std::vector<label> kind;
+        kind.reserve(static_cast<std::size_t>(d.dbHe.n));
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const fvPatchField<scalar>& Tp = *hf.T.boundary[pi];
+            const fvPatchField<scalar>& hp = *hf.he.boundary[pi];
+            label k = 0;
+            bool  paired = true;
+            if (dynamic_cast<const FixedValuePatchField<scalar>*>(&Tp))
+            {
+                k = 1;
+                paired = dynamic_cast<const FixedValuePatchField<scalar>*>(&hp) != nullptr;
+            }
+            else if (dynamic_cast<const FixedGradientPatchField<scalar>*>(&Tp))
+            {
+                k = 2;
+                paired = dynamic_cast<const FixedGradientPatchField<scalar>*>(&hp) != nullptr;
+            }
+            else if (dynamic_cast<const MixedPatchField<scalar>*>(&Tp))
+            {
+                k = Tp.isInletOutlet() ? 4 : 3;
+                paired = dynamic_cast<const MixedPatchField<scalar>*>(&hp) != nullptr;
+            }
+            if (!paired)
+                throw std::runtime_error(
+                    "rhoSimpleFoam createFields(cuda): T on patch '" + patches[pi].name + "' maps to an "
+                    "energy condition (basicThermo::heBoundaryTypes) whose class he's patch there does not "
+                    "have. Refusing rather than updating it as another condition.");
+            for (label i = 0; i < patches[pi].size; ++i) kind.push_back(k);
+        }
+        kind.resize(static_cast<std::size_t>(d.dbHe.n), 0);
+        d.heEnergyKind.copyFrom(kind);
+    }
 
     // ---- updateCoeffs() metadata, for the boundary conditions whose coefficients move with the
     //      solution. See the block comment on RhoDeviceFields: the device boundary objects are a

@@ -16,7 +16,6 @@
 #include "residual_control.cuh"
 #include "rhoSimpleFoamDriver_cpp.cuh"   // buildStepInput: the SHARED case -> StepInput parse
 #include "rhoThermoDevice.cuh"           // effectiveTransport, device-resident
-#include "thermo_model.cuh"              // hConstTToHe: limitTemperature is a T limit, the device clamps he
 #include "rhoTurbulenceHook.cuh"         // correctTurbulence, device-resident
 #include "solution_directions.cuh"       // polyMesh::solutionD(): which U components are solved
 #include "device_mesh.cuh"               // deviceDiv: continuityErrs.H on the device arm
@@ -62,6 +61,12 @@ RhoStepInput buildDeviceStepInput(
     // What is NOT projected still refuses, by name and per option: anything the host parse marked
     // unsupported, and any implemented option that is not a porosity (there is no device consumer for
     // the temperature/scalar constraints -- the host arm carries those).
+    // fixedTemperatureConstraint's cells and temperatures, ACCUMULATED across every such option in list
+    // order: OpenFOAM applies each constraint's setValues in turn, so on a cell two of them name the later
+    // one's value stands. This used to upload each option's mask and value over the previous one's, so
+    // only the last constraint in the file applied at all.
+    std::vector<label>  heMaskH;
+    std::vector<scalar> heTH;
     for (const auto& o : refusals.opts.options)
     {
         if (!o.active) continue;
@@ -92,12 +97,25 @@ RhoStepInput buildDeviceStepInput(
             {
                 // OpenFOAM pins he(p, Tuniform), NOT the temperature: setValues on the energy equation
                 // takes an energy, and putting a temperature there is a 400x error that still converges.
-                const scalar heVal = hConstTToHe(o.Tuniform, hf.thermo);
-                constraints.heMask.copyFrom(mask);
-                constraints.heVal.copyFrom(std::vector<scalar>(static_cast<std::size_t>(nCells), heVal));
+                // The ENERGY is formed by the step, per cell, from the pressure standing at each constrain
+                // (fixedTemperatureConstraint.C:125-126) -- a number converted once here with the
+                // perfect-gas closed form was right for hConst and wrong for a liquid (stage H3.6).
+                if (heMaskH.empty())
+                {
+                    heMaskH.assign(static_cast<std::size_t>(nCells), 0);
+                    heTH.assign(static_cast<std::size_t>(nCells), scalar(0));
+                }
+                for (label c = 0; c < nCells; ++c)
+                {
+                    if (!mask[static_cast<std::size_t>(c)]) continue;
+                    heMaskH[static_cast<std::size_t>(c)] = 1;
+                    heTH[static_cast<std::size_t>(c)]    = o.Tuniform;
+                }
+                constraints.heMask.copyFrom(heMaskH);
+                constraints.heT.copyFrom(heTH);
                 constraints.hasHe = true;
-                std::printf("  fvOptions `%s`: fixedTemperatureConstraint T=%g K -> he=%g on %d cells\n",
-                            o.name.c_str(), (double)o.Tuniform, (double)heVal,
+                std::printf("  fvOptions `%s`: fixedTemperatureConstraint T=%g K on %d cells\n",
+                            o.name.c_str(), (double)o.Tuniform,
                             o.allCells ? (int)nCells : (int)o.cells.size());
                 continue;
             }
@@ -183,7 +201,9 @@ RhoStepInput buildDeviceStepInput(
                     o.fixedCoeff ? "fixedCoeff" : "DarcyForchheimer", (int)o.cells.size());
     }
     in.porosity = porosity.active ? &porosity : nullptr;
-    if (constraints.hasHe) { in.fvoHeMask = &constraints.heMask; in.fvoHeVal = &constraints.heVal; }
+    if (constraints.hasHe) { in.fvoHeMask = &constraints.heMask; in.fvoHeT = &constraints.heT; }
+    in.thermo       = hf.thermo;
+    in.heEnergyKind = &dev.heEnergyKind;
 
     // limitTemperature, projected onto the device's OWN form. deriveCaseRefusals resolves this option
     // OUT of the option list (it sets limitT/limitTmin/limitTmax and fvOptions::read never lists it),
@@ -197,11 +217,9 @@ RhoStepInput buildDeviceStepInput(
         in.limitTmin  = refusals.limitTmin;
         in.limitTmax  = refusals.limitTmax;
         in.limitTname = refusals.limitTname;
-        in.heMin      = hConstTToHe(refusals.limitTmin, hf.thermo);
-        in.heMax      = hConstTToHe(refusals.limitTmax, hf.thermo);
-        std::printf("  fvOption limitTemperature [%g, %g] K -> he [%g, %g]\n",
-                    (double)refusals.limitTmin, (double)refusals.limitTmax,
-                    (double)in.heMin, (double)in.heMax);
+        // The bounds stay TEMPERATURES; the step builds he(p, Tmin|Tmax) per cell and per face.
+        std::printf("  fvOption limitTemperature [%g, %g] K\n",
+                    (double)refusals.limitTmin, (double)refusals.limitTmax);
     }
     for (const FvPatch& p : patches)
         if (isCoupledInterfaceType(p.type) || p.type == "processor") in.hasCoupledPatches = true;
@@ -305,14 +323,11 @@ TurbulenceHookOptions buildTurbulenceHookOptions(
     // what the host parse already refused (a `bounded` or coefficient mismatch between the two scalars,
     // linearUpwind, or a limiter gradient brae does not compute) still reaches this arm as a refusal.
     opt.divSchemeUnsupported = hin.turbDivUnsupported;
-    // linearUpwind on the turbulence pair is assembled by the HOST closures only (stage H3.5 --
-    // divWithScheme in kEpsilon_cpp.cu, and kOmegaSST_cpp.cu's own). The device closure's
-    // assembleTransport has no linearUpwind correction, so once the host parse ACCEPTS the scheme it
-    // must still refuse here; before H3.5 the host parse refused it for both arms and this arm inherited
-    // that refusal through turbDivUnsupported, which it would now silently lose.
-    if (opt.divSchemeUnsupported.empty() && hin.linearUpwindTurb)
-        opt.divSchemeUnsupported = "Gauss linearUpwind on div(phi,k)/div(phi," + std::string(opt.sst ? "omega" : "epsilon")
-                                 + ") -- assembled by the host closures, not yet by the device one";
+    // linearUpwind on the turbulence pair: assembled by both closures on both arms since stage H3.6
+    // (turbulence_transport.cu's assembleScalarTransport, the twin of the host's divWithScheme), over the
+    // gradient the entry names, resolved once by the shared parse.
+    opt.linearUpwind         = hin.linearUpwindTurb;
+    opt.luGradK              = hin.turbLUGradK;
     opt.limitedLinear        = hin.limitedLinearTurb;
     opt.limiterCoeff         = hin.turbLimiterCoeff;
     opt.limGradK             = hin.turbLimGradK;

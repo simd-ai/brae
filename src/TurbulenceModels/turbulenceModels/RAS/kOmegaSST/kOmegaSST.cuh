@@ -117,6 +117,8 @@ struct KOmegaSSTInput
     scalar limiterCoeff  = 1.0;        // RAW k; the transport helper converts to 2/max(k,SMALL)
     scalar limGradK      = 0.0;        // the LIMITER's gradient limiter, from grad(<field>)
     bool   limGradLeastSq = false;     // ...and its SCHEME, when the case names leastSquares
+    bool   linearUpwind  = false;      // `Gauss linearUpwind <name>` on the pair (TransportScheme)
+    scalar luGradK       = 0.0;        // ...the cellLimited coefficient of the gradient it NAMES
     bool   correctedLaplacian = false;
     scalar snGradLimitCoeff   = 0.0;
     scalar gradULimitK        = 0.0;   // grad(U) cellLimited, for the production strain

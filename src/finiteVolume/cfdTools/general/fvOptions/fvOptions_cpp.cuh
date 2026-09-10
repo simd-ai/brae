@@ -144,8 +144,13 @@ void constrain(
     const std::vector<FvPatch>& patches,
     // he(p, T) for the fixedTemperatureConstraint; unused by the others. Null means an energy constraint
     // is refused rather than applied with a temperature where an energy belongs -- which is exactly the
-    // mistake the EEqn gate caught once already.
-    scalar                    (*heOfT)(scalar) = nullptr);
+    // mistake the EEqn gate caught once already. It takes the CELL PRESSURE as well as T, because
+    // OpenFOAM's value is `thermo.he(thermo.p(), Tuni, cells_)` (fixedTemperatureConstraint.C:125-126):
+    // a field over p. It used to be he(T) alone, which the caller filled with the perfect-gas closed form
+    // -- right for hConst and wrong for a liquid (stage H3.6).
+    scalar                    (*heOfPT)(scalar p, scalar T) = nullptr,
+    // ...and the pressure it is evaluated at, per cell. Required whenever heOfPT is.
+    const std::vector<scalar>*  pCell = nullptr);
 
 } // namespace fvOptions
 } // namespace cpu

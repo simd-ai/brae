@@ -46,6 +46,14 @@ struct TransportScheme
     // The limiter gradient's SCHEME: leastSquares rather than Gauss linear (gradSchemes grad(<field>)).
     bool   limGradLeastSq  = false;
 
+    // `Gauss linearUpwind <name>`: upwind's weights plus the explicit correction
+    // fvc::surfaceIntegrate(faceFlux*correction) (gaussConvectionScheme.C:112-115), built over the
+    // gradient the entry NAMES -- mesh.gradScheme(<name>), linearUpwind.C:61-68 -- which is Gauss linear
+    // with `luGradK` its cellLimited coefficient (0 = unlimited); the driver refuses any other. The host
+    // closures' divWithScheme is the oracle (stage H3.5); this is its device twin (H3.6).
+    bool   linearUpwind    = false;
+    scalar luGradK         = 0.0;
+
     // `corrected` is TWO changes and this makes both: the implicit coefficient takes
     // nonOrthDeltaCoeffs, and the non-orthogonal part enters as an explicit source. Implementing only
     // the implicit half moves the SOURCE while leaving the DIAGONAL exact, which no gate comparing D()
