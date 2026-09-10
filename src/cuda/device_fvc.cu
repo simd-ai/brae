@@ -59,6 +59,112 @@ void divKernel(
 }
 
 
+// ---- leastSquares gradient (OF leastSquaresGrad.C + leastSquaresVectors.C) ---------------------
+// Two per-cell gathers, no atomics, the same owner/losort/bndPerm walk the Gauss gradient uses. Each
+// cell needs only its OWN inverted dd tensor: OpenFOAM's pVectors use invDd[own] and its nVectors
+// invDd[nei], so on the owner side of a face the cell reads its own, and on the neighbour side likewise.
+//
+// d, the cell-to-cell vector, is already in DeviceMesh: (Cf - C_own) - (Cf - C_nei) = C_nei - C_own, and
+// a boundary face's fvPatch::delta() is (Cf - C_faceCell) verbatim. No new mesh data is uploaded.
+__global__
+void lsqInvDdKernel(
+    int nC,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ losort,
+    const label* __restrict__ losortStart,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ magSf,
+    const scalar* __restrict__ dOwnX, const scalar* __restrict__ dOwnY, const scalar* __restrict__ dOwnZ,
+    const scalar* __restrict__ dNeiX, const scalar* __restrict__ dNeiY, const scalar* __restrict__ dNeiZ,
+    const label* __restrict__ bndCellStart,
+    const label* __restrict__ bndPerm,
+    const label* __restrict__ bndIsEmpty,
+    const label* __restrict__ bndGFace,
+    const scalar* __restrict__ dBndX, const scalar* __restrict__ dBndY, const scalar* __restrict__ dBndZ,
+    scalar* __restrict__ idd)     // 6*nC, component-major
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+
+    symmTensor dd{0, 0, 0, 0, 0, 0};
+    for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)
+    {
+        const vector d{dOwnX[f] - dNeiX[f], dOwnY[f] - dNeiY[f], dOwnZ[f] - dNeiZ[f]};
+        dd = dd + ((1.0 - w[f]) * (magSf[f] / magSqr(d))) * sqr(d);
+    }
+    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
+    {
+        const int f = losort[k];
+        const vector d{dOwnX[f] - dNeiX[f], dOwnY[f] - dNeiY[f], dOwnZ[f] - dNeiZ[f]};
+        dd = dd + (w[f] * (magSf[f] / magSqr(d))) * sqr(d);
+    }
+    for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)
+    {
+        const int bk = bndPerm[k];
+        if (bndIsEmpty[bk]) continue;   // emptyFvPatch::size() == 0 -- this is what leaves dd singular in 2-D
+        const vector d{dBndX[bk], dBndY[bk], dBndZ[bk]};
+        dd = dd + (magSf[bndGFace[bk]] / magSqr(d)) * sqr(d);
+    }
+    const symmTensor r = safeInv(dd);
+    idd[0 * nC + c] = r.xx; idd[1 * nC + c] = r.xy; idd[2 * nC + c] = r.xz;
+    idd[3 * nC + c] = r.yy; idd[4 * nC + c] = r.yz; idd[5 * nC + c] = r.zz;
+}
+
+__global__
+void lsqGradKernel(
+    int nC,
+    const label* __restrict__ own,
+    const label* __restrict__ nei,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ losort,
+    const label* __restrict__ losortStart,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ magSf,
+    const scalar* __restrict__ dOwnX, const scalar* __restrict__ dOwnY, const scalar* __restrict__ dOwnZ,
+    const scalar* __restrict__ dNeiX, const scalar* __restrict__ dNeiY, const scalar* __restrict__ dNeiZ,
+    const scalar* __restrict__ vf,
+    const label* __restrict__ bndCellStart,
+    const label* __restrict__ bndPerm,
+    const label* __restrict__ bndIsEmpty,
+    const label* __restrict__ bndGFace,
+    const scalar* __restrict__ dBndX, const scalar* __restrict__ dBndY, const scalar* __restrict__ dBndZ,
+    const scalar* __restrict__ bval,
+    const scalar* __restrict__ idd,
+    scalar* __restrict__ gx, scalar* __restrict__ gy, scalar* __restrict__ gz)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+
+    const symmTensor iv{idd[0*nC+c], idd[1*nC+c], idd[2*nC+c], idd[3*nC+c], idd[4*nC+c], idd[5*nC+c]};
+    const scalar vc = vf[c];
+    vector s{0, 0, 0};
+    for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)
+    {
+        const vector d{dOwnX[f] - dNeiX[f], dOwnY[f] - dNeiY[f], dOwnZ[f] - dNeiZ[f]};
+        const scalar msd = magSf[f] / magSqr(d);
+        s += ((1.0 - w[f]) * msd * (vf[nei[f]] - vc)) * (iv & d);
+    }
+    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
+    {
+        const int f = losort[k];
+        const vector d{dOwnX[f] - dNeiX[f], dOwnY[f] - dNeiY[f], dOwnZ[f] - dNeiZ[f]};
+        const scalar msd = magSf[f] / magSqr(d);
+        // grad[nei] -= nVectors*dvf with nVectors = -w*msd*(invDd[nei] & d) and dvf = vf[nei] - vf[own]
+        s += (w[f] * msd * (vc - vf[own[f]])) * (iv & d);
+    }
+    for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)
+    {
+        const int bk = bndPerm[k];
+        if (bndIsEmpty[bk]) continue;
+        const vector d{dBndX[bk], dBndY[bk], dBndZ[bk]};
+        s += ((magSf[bndGFace[bk]] / magSqr(d)) * (bval[bk] - vc)) * (iv & d);
+    }
+    // No division by V: the fit vectors already carry the normalisation.
+    gx[c] = s.x; gy[c] = s.y; gz[c] = s.z;
+}
+
+
+
 __global__
 void gradKernel(
     int nC,
@@ -138,6 +244,32 @@ void deviceDiv(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const D
     divKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
                                            phiInt.data(), dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), bval.data(), dm.V.data(), d.data());
     cudaCheck(cudaGetLastError(), "div");
+}
+
+
+void deviceLeastSquaresGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol,
+                            const DeviceBuffer<scalar>& bval,
+                            DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz)
+{
+    const int nC = dm.nCells;
+    gx.resize(nC); gy.resize(nC); gz.resize(nC);
+    DeviceBuffer<scalar> idd; idd.resize(static_cast<std::size_t>(6) * nC);
+    lsqInvDdKernel<<<nBlocks(nC), TPB>>>(
+        nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), dm.w.data(), dm.magSf.data(),
+        dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
+        dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
+        dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), dm.bndGFace.data(),
+        dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), idd.data());
+    cudaCheck(cudaGetLastError(), "lsqInvDd");
+    lsqGradKernel<<<nBlocks(nC), TPB>>>(
+        nC, dm.owner.data(), dm.nei.data(), dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
+        dm.w.data(), dm.magSf.data(),
+        dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
+        dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(), vol.data(),
+        dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), dm.bndGFace.data(),
+        dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), bval.data(), idd.data(),
+        gx.data(), gy.data(), gz.data());
+    cudaCheck(cudaGetLastError(), "lsqGrad");
 }
 
 

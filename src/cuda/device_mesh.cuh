@@ -251,6 +251,12 @@ void deviceGaussGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol, cons
 // expressions, one register set per field (tests/test_grad_fused.cu asserts it with memcmp). skipIf
 // behaves exactly as it does above. Measured motive: gradKernel was 4.5 ms of a 30 ms iteration at 306k
 // cells, 16 launches of which nine were velocity components in threes.
+// leastSquares gradient -- the same signature as deviceGaussGrad, so a caller switches on the case's
+// gradScheme and nothing else. See the kernels in device_fvc.cu for why no volume division appears.
+void deviceLeastSquaresGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol,
+                            const DeviceBuffer<scalar>& bval,
+                            DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz);
+
 void deviceGaussGradFused(const DeviceMesh& dm, int n,
                           const DeviceBuffer<scalar>* const* vol, const DeviceBuffer<scalar>* const* bval,
                           DeviceBuffer<scalar>* gx, DeviceBuffer<scalar>* gy, DeviceBuffer<scalar>* gz,

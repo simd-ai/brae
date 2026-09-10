@@ -71,6 +71,57 @@ BRAE_HD inline scalar magSqr(const symmTensor& a)   // OF magSqr: every off-diag
 {
     return a.xx*a.xx + a.yy*a.yy + a.zz*a.zz + 2*(a.xy*a.xy + a.xz*a.xz + a.yz*a.yz);
 }
+// OF sqr(vector) -> symmTensor: the outer product of a vector with itself (Vector.H sqr).
+BRAE_HD inline symmTensor sqr(const vector& v)
+{
+    return {v.x*v.x, v.x*v.y, v.x*v.z, v.y*v.y, v.y*v.z, v.z*v.z};
+}
+BRAE_HD inline vector operator&(const symmTensor& t, const vector& v)   // OF inner product
+{
+    return {t.xx*v.x + t.xy*v.y + t.xz*v.z,
+            t.xy*v.x + t.yy*v.y + t.yz*v.z,
+            t.xz*v.x + t.yz*v.y + t.zz*v.z};
+}
+BRAE_HD inline scalar det(const symmTensor& t)
+{
+    return t.xx*(t.yy*t.zz - t.yz*t.yz) - t.xy*(t.xy*t.zz - t.yz*t.xz) + t.xz*(t.xy*t.yz - t.yy*t.xz);
+}
+// The adjunct (= cofactor matrix, which is itself symmetric for a symmetric tensor).
+BRAE_HD inline symmTensor adjunct(const symmTensor& t)
+{
+    return {t.yy*t.zz - t.yz*t.yz, t.xz*t.yz - t.xy*t.zz, t.xy*t.yz - t.xz*t.yy,
+            t.xx*t.zz - t.xz*t.xz, t.xy*t.xz - t.xx*t.yz, t.xx*t.yy - t.xy*t.xy};
+}
+// OF SymmTensor::safeInv (SymmTensorI.H:368-421), which is what inv(symmTensorField) calls -- NOT a
+// plain inverse. A 2-D mesh leaves the least-squares dd tensor SINGULAR in the empty direction, because
+// an emptyFvPatch has size 0 and so contributes nothing to the fit; OpenFOAM detects the near-zero
+// diagonal component, adds one to it, inverts, and subtracts it again. Writing a plain cofactor inverse
+// here divides by ~0 on every 2-D fixture in validation/, which is most of them.
+// SMALL = 1e-15 and ROOTVSMALL = 1e-150 in double precision.
+BRAE_HD inline symmTensor safeInv(const symmTensor& t)
+{
+    const scalar mxx = t.xx*t.xx, myy = t.yy*t.yy, mzz = t.zz*t.zz;
+    const scalar threshold = scalar(1e-15) * (mxx + myy + mzz);
+    const bool sxx = mxx < threshold, syy = myy < threshold, szz = mzz < threshold;
+    const symmTensor zero{0, 0, 0, 0, 0, 0};
+    if (sxx || syy || szz)
+    {
+        symmTensor w = t;
+        if (sxx) w.xx += scalar(1);
+        if (syy) w.yy += scalar(1);
+        if (szz) w.zz += scalar(1);
+        const scalar d = det(w);
+        if (fabs(d) < scalar(1e-150)) return zero;
+        symmTensor r = (scalar(1) / d) * adjunct(w);
+        if (sxx) r.xx -= scalar(1);
+        if (syy) r.yy -= scalar(1);
+        if (szz) r.zz -= scalar(1);
+        return r;
+    }
+    const scalar d = det(t);
+    if (fabs(d) < scalar(1e-150)) return zero;
+    return (scalar(1) / d) * adjunct(t);
+}
 
 // 3x3 tensor, mirrors OpenFOAM Tensor<scalar>. Used for grad(U) and turbulence production.
 struct tensor

@@ -87,6 +87,81 @@ std::vector<vector> gaussGrad(
     return grad;
 }
 
+// OpenFOAM leastSquaresGrad.C + leastSquaresVectors.C, transcribed. The fit vectors are geometry only
+// and are rebuilt per call: this runs once per limiter per equation per outer iteration, and caching
+// them would be a second copy of the mesh to keep coherent. Measure before changing that.
+std::vector<vector> leastSquaresGrad(
+    const std::vector<scalar>& internal,
+    const std::vector<std::vector<scalar>>& boundary,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    const label nC  = m.nCells();
+    const label nIf = m.nInternalFaces();
+    const std::vector<label>&  own   = m.owner();
+    const std::vector<label>&  nei   = m.neighbour();
+    const std::vector<scalar>& w     = g.weights();
+    const std::vector<scalar>& magSf = g.magSf();
+    const std::vector<vector>& C     = g.C();
+
+    // ---- dd, the inverse-distance-weighted second-moment tensor (leastSquaresVectors.C:60-120) ----
+    std::vector<symmTensor> dd(nC, symmTensor{0, 0, 0, 0, 0, 0});
+    for (label f = 0; f < nIf; ++f)
+    {
+        const label o = own[f], n = nei[f];
+        const vector d = C[n] - C[o];
+        const symmTensor wdd = (magSf[f] / magSqr(d)) * sqr(d);
+        dd[o] = dd[o] + (1.0 - w[f]) * wdd;
+        dd[n] = dd[n] + w[f] * wdd;
+    }
+    // An emptyFvPatch has size 0 in OpenFOAM, so it contributes nothing here -- which is exactly what
+    // leaves dd singular in the empty direction on a 2-D mesh, and why safeInv below is not optional.
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& fp = patches[pi];
+        if (fp.type == "empty") continue;
+        for (label i = 0; i < fp.size; ++i)
+        {
+            const label c = fp.faceCells[i];
+            const vector d = fp.Cf[i] - C[c];       // fvPatch::delta() on an uncoupled patch
+            dd[c] = dd[c] + (fp.magSf[i] / magSqr(d)) * sqr(d);
+        }
+    }
+    std::vector<symmTensor> invDd(nC);
+    for (label c = 0; c < nC; ++c) invDd[c] = safeInv(dd[c]);
+
+    // ---- the gradient (leastSquaresGrad.C:60-110), with the fit vectors folded in at the face ----
+    std::vector<vector> grad(nC, vector{0, 0, 0});
+    for (label f = 0; f < nIf; ++f)
+    {
+        const label o = own[f], n = nei[f];
+        const vector d = C[n] - C[o];
+        const scalar magSfByMagSqrd = magSf[f] / magSqr(d);
+        const vector pv =  (1.0 - w[f]) * magSfByMagSqrd * (invDd[o] & d);
+        const vector nv = -w[f]         * magSfByMagSqrd * (invDd[n] & d);
+        const scalar dvf = internal[n] - internal[o];
+        grad[o] += pv * dvf;
+        grad[n] = grad[n] - nv * dvf;
+    }
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& fp = patches[pi];
+        if (fp.type == "empty") continue;
+        const std::vector<scalar>& pv = boundary[pi];
+        for (label i = 0; i < fp.size; ++i)
+        {
+            const label c = fp.faceCells[i];
+            const vector d = fp.Cf[i] - C[c];
+            const vector lsP = (fp.magSf[i] / magSqr(d)) * (invDd[c] & d);
+            grad[c] += lsP * (pv[i] - internal[c]);
+        }
+    }
+    // NOT divided by the cell volume: the fit vectors already carry the normalisation. Dividing here --
+    // the reflex from gaussGrad above -- is the easy mistake.
+    return grad;
+}
+
 std::vector<tensor> gaussGrad(
     const GeometricField<vector>& U,
     const PrimitiveMesh& m,

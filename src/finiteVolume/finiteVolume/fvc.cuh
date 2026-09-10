@@ -36,6 +36,22 @@ std::vector<vector> gaussGrad(const std::vector<scalar>& internal,
                               const FvGeometry& g,
                               const std::vector<FvPatch>& patches);
 
+// leastSquaresGrad: OpenFOAM's inverse-distance least-squares fit (leastSquaresGrad.C,
+// leastSquaresVectors.C), NOT a Gauss sum. It is a genuinely different discretisation -- measured on
+// validation/rhoLU at a developed state, swapping the limiter gradient from Gauss linear to this moves
+// the assembled energy diagonal by 9.1e-03 -- so a case naming it must get it, not an approximation.
+//
+// Only the INTERNAL field is returned, as with gaussGrad. OpenFOAM ends calcGrad with
+// lsGrad.correctBoundaryConditions() and gaussGrad::correctBoundaryConditions(vsf, lsGrad), which write
+// the GRADIENT's own boundary field; brae's consumers (the limitedLinear/limitedLinearV limiters) read
+// the gradient at owner and neighbour CELLS only, so those two corrections have nothing to act on here.
+// A future consumer that needs grad on a patch face must add them.
+std::vector<vector> leastSquaresGrad(const std::vector<scalar>& internal,
+                                     const std::vector<std::vector<scalar>>& boundary,
+                                     const PrimitiveMesh& m,
+                                     const FvGeometry& g,
+                                     const std::vector<FvPatch>& patches);
+
 // Gauss gradient of a volVectorField -> volTensorField (grad(U)_ij = sum Sf_i U_j / V).
 std::vector<tensor> gaussGrad(const GeometricField<vector>& U,
                               const PrimitiveMesh& m,
