@@ -105,6 +105,12 @@ struct StepInput
     bool      limGradHeLeastSq = false;
     bool      limGradKELeastSq = false;
     scalar    gradULimitK      = 0.0;
+    // The gradient `linearUpwind <name>` / `linearUpwindV <name>` NAMES in div(phi,U) -- OpenFOAM's
+    // mesh.gradScheme(<name>) (linearUpwind.C:61-68) -- which is a different lookup from grad(U)'s own
+    // scheme above (divDevRhoReff's fvc::grad(U), correctedSnGrad's correction). -1 = not resolved: the
+    // momentum equation then uses gradULimitK, the arithmetic every harness that bypasses the driver
+    // was gated with.
+    scalar    gradULULimitK    = -1.0;
     scalar    gradHeLimitK     = 0.0;
     scalar    gradKELimitK     = 0.0;
     bool      correctedLaplacian = false;
@@ -161,14 +167,18 @@ struct StepInput
     // is a different lookup from KEpsilonCoeffs::gradKLimitK's use in the corrected laplacian.
     scalar turbLimGradK      = 0.0;
     bool   turbLimGradLeastSq = false;
-    bool   linearUpwindTurb  = false; // kOmegaSST assembles it; kEpsilon does not -- refused upstream
+    // `Gauss linearUpwind <name>` on BOTH turbulence scalars, and the cellLimited coefficient of the
+    // gradient scheme <name> resolves to (0 => unlimited Gauss linear). Both host closures assemble it;
+    // the device closure does not, and the CUDA driver refuses it there by name.
+    bool   linearUpwindTurb  = false;
+    scalar turbLUGradK       = 0.0;
     scalar relaxK = 1.0, relaxEpsilon = 1.0;
     scalar tolTurb = 1e-12, relTolTurb = 0.0;
     bool   boundedTurb = false;         // `bounded Gauss <scheme>` on div(phi,k) and div(phi,epsilon)
     // Non-empty = the CASE names a convection scheme on div(phi,k)/div(phi,epsilon|omega) that the
-    // compressible closure does not assemble (Gauss upwind and Gauss limitedLinear, each with or
-    // without `bounded`, are ported; linearUpwind and entries that disagree between the two scalars
-    // are not).
+    // compressible closure does not assemble (Gauss upwind, Gauss limitedLinear and Gauss
+    // linearUpwind over a Gauss linear gradient, each with or without `bounded`, are ported; entries
+    // that disagree between the two scalars are not).
     // The step REFUSES before the closure runs; the device twin carries the same refusal
     // (kEpsilon.cu, hasNonUpwindDivScheme) and both used to be set only by fail-proofs -- the flag was
     // hardcoded in the harness and the case's own fvSchemes never reached either arm.

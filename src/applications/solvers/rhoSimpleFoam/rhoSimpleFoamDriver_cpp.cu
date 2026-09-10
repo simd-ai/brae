@@ -156,6 +156,23 @@ StepInput buildStepInput(
             out = gs.cellLimitK;
             lsq = gs.leastSquares;
         };
+        // THE GRADIENT linearUpwind / linearUpwindV NAMES in div(phi,U), for the momentum convection
+        // correction: mesh.gradScheme(<name>) (linearUpwind.C:61-68), named-then-default. It is NOT
+        // grad(U)'s own scheme (in.gradULimitK, which divDevRhoReff and correctedSnGrad take), and the
+        // two used to be one coefficient -- see rhoUEqn_cpp.cu. Resolved strictly: the correction is
+        // computed from a Gauss linear gradient with an optional cellLimited limiter, and a name that
+        // resolves to anything else is refused rather than approximated by the nearest one brae has.
+        if (in.schemeU == DivScheme::linearUpwind || in.schemeU == DivScheme::linearUpwindV)
+        {
+            const FieldGradScheme gl = parseNamedGradScheme(caseDir, dU.luGradName);
+            if (!gl.gaussLinear || gl.leastSquares || !gl.unsupportedLimiter.empty())
+                throw std::runtime_error(
+                    "rhoSimpleFoam buildStepInput: div(phi,U) names `" + dU.luGradName + "` as the "
+                    "gradient of its linearUpwind correction, and gradSchemes resolves that to `" +
+                    gl.raw + "`. The momentum correction is built from a Gauss linear gradient, "
+                    "optionally cellLimited, on both arms; refusing rather than building it from another.");
+            in.gradULULimitK = gl.cellLimitK;
+        }
         resolveLimiterGrad(in.schemeHe, f.heName, in.limGradHeK, in.limGradHeLeastSq);
         resolveLimiterGrad(in.schemeKE, keName,   in.limGradKEK, in.limGradKELeastSq);
 
@@ -286,6 +303,46 @@ StepInput buildStepInput(
     if (f.turbulent && !f.turbulenceFrozen && !f.k.internal.empty())
     {
         const std::string secondT = (f.rasModel == "kOmegaSST") ? "omega" : "epsilon";
+
+        // grad(k) and grad(epsilon|omega): EACH FIELD'S OWN gradSchemes entry, named-then-default.
+        // That is the gradient correctedSnGrad's non-orthogonal correction takes
+        // (`mesh.gradScheme("grad(" + vf.name() + ')')`, correctedSnGrad.C:52-55) on the corrected
+        // turbulence laplacians, and the one kOmegaSST's CDkOmega is built from -- and it is what
+        // gradKLimitK means to both closures.
+        //
+        // NOT sctl.gradKLimitK, which is wrong here twice over. The shared parser writes the gradient
+        // linearUpwind NAMES in div(phi,epsilon|omega) into that same slot (scheme_parse.cuh, the line
+        // marked EXPERIMENT), so a case writing `linearUpwind limited` had its laplacian corrections
+        // cell-limited where OpenFOAM's are not: on squareBendLiq at iteration 1 the epsilon source
+        // before relax() read 1.56e-04 off OpenFOAM's in 144 cells at the non-orthogonal block
+        // junction, while the convection term itself was exact to 5.6e-15 -- and epsilon 2.6e-06 after
+        // the solve. It also reads only explicit grad(k)/grad(epsilon) lines, so a cellLimited
+        // `default` never reached the closures at all. The shared parser serves the incompressible
+        // drivers too and is left as it is; the mirror resolves its own.
+        {
+            const FieldGradScheme gK = parseFieldGradScheme(caseDir, "k");
+            const FieldGradScheme gS = parseFieldGradScheme(caseDir, secondT);
+            // Only where a gradient of k or the second scalar is actually taken: the corrected
+            // laplacian's correction (both models) and CDkOmega (SST). A case using neither is not
+            // refused over a gradient scheme nothing reads.
+            const bool used = in.correctedLaplacian || f.rasModel == "kOmegaSST";
+            auto gaussOnly = [](const FieldGradScheme& gs)
+            {
+                return gs.gaussLinear && !gs.leastSquares && gs.unsupportedLimiter.empty();
+            };
+            if (used && (!gaussOnly(gK) || !gaussOnly(gS)))
+                in.turbDivUnsupported =
+                    "a grad(k)/grad(" + secondT + ") scheme brae does not compute for the turbulence "
+                    "laplacian correction and CDkOmega -- they resolve to `" + gK.raw + "` and `" + gS.raw +
+                    "`, where the host closures take Gauss linear, optionally cellLimited";
+            else if (used && gK.cellLimitK != gS.cellLimitK)
+                in.turbDivUnsupported =
+                    "grad(k) and grad(" + secondT + ") with different cellLimited coefficients (the "
+                    "closures carry one gradient scheme for both)";
+            else
+                in.gradKLimitK = gK.cellLimitK;
+        }
+
         const FieldDivScheme dK = parseFieldDivScheme(caseDir, "k");
         const FieldDivScheme dS = parseFieldDivScheme(caseDir, secondT);
         in.boundedTurb = dK.bounded;
@@ -299,7 +356,32 @@ StepInput buildStepInput(
                                   + ") with different schemes or coefficients (brae carries one for both)";
         in.limitedLinearTurb = dK.limited && dS.limited;
         in.turbLimiterCoeff  = dK.coeff;   // RAW k of `limitedLinear k` -- see scheme_parse.cuh
-        if (dK.linearUpwind || dS.linearUpwind) in.turbDivUnsupported = "Gauss linearUpwind";
+        // linearUpwind: ONE scheme for both scalars, as limitedLinear is, and a gradient brae computes.
+        // The gradient is the one the entry NAMES (`linearUpwind limited` -> gradSchemes `limited`), not
+        // grad(k) -- OpenFOAM's linearUpwind builds it from mesh.gradScheme(gradSchemeName_)
+        // (linearUpwind.C:61-68). The host closures take a Gauss linear gradient with an optional
+        // cellLimited limiter; anything else the name resolves to is refused rather than approximated.
+        if (dK.linearUpwind != dS.linearUpwind)
+            in.turbDivUnsupported = "linearUpwind on one of div(phi,k)/div(phi," + secondT
+                                  + ") and not the other (brae carries one scheme for both)";
+        else if (dK.linearUpwind && dK.luGradName != dS.luGradName)
+            in.turbDivUnsupported = "linearUpwind on div(phi,k) and div(phi," + secondT + ") naming "
+                                  "different gradient schemes (`" + dK.luGradName + "`, `" + dS.luGradName
+                                  + "`; brae carries one gradient for both)";
+        else if (dK.linearUpwind)
+        {
+            const FieldGradScheme gl = parseNamedGradScheme(caseDir, dK.luGradName);
+            if (!gl.gaussLinear || gl.leastSquares || !gl.unsupportedLimiter.empty())
+                in.turbDivUnsupported =
+                    "Gauss linearUpwind " + dK.luGradName + ", whose gradient resolves to `" + gl.raw
+                    + "` -- the turbulence closures build linearUpwind's correction from a Gauss linear "
+                    "gradient, optionally cellLimited, and nothing else";
+            else
+            {
+                in.linearUpwindTurb = true;
+                in.turbLUGradK      = gl.cellLimitK;
+            }
+        }
 
         // THE LIMITER'S GRADIENT, for the turbulence pair, on the same rule as the energy pair above:
         // OpenFOAM builds limitedLinear's limiter from fvc::grad(<field>) resolved through the case's

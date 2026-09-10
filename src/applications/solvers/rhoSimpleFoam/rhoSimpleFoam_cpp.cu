@@ -23,17 +23,50 @@ namespace brae {
 namespace cpu {
 namespace rhoSimple {
 
+// OpenFOAM raises a FatalError when its he -> T inversion runs out of iterations
+// (species::thermo<>::T, thermoI.H:80-87). h2oEnergyToT is BRAE_HD and cannot throw, so it reports
+// through `converged` and the host caller does it here -- with the inputs, because "the inversion failed"
+// with no numbers is not something anyone can act on. The three ways it can fail are the iteration cap,
+// an energy residual the loop never reached, and an answer outside the correlation's own [Tt, Tc].
+static std::runtime_error heToTFailure(
+    const HeToTResult&  r,
+    scalar              he,
+    scalar              p,
+    scalar              T0,
+    const std::string&  where)
+{
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+                  "brae: rhoSimpleFoam thermo.correct() could not invert he -> T at %s. "
+                  "he = %.10g J/kg, p = %.10g Pa, seed T = %.10g K; the iteration returned T = %.10g K "
+                  "after %d steps with a relative energy residual of %.3g. OpenFOAM raises a FatalError "
+                  "here (species::thermo<>::T, thermoI.H:80-87); brae refuses rather than carrying an "
+                  "unconverged temperature into psi, rho and the pressure equation.",
+                  where.c_str(), (double)he, (double)p, (double)T0, (double)r.T, r.iterations,
+                  (double)r.residual);
+    return std::runtime_error(buf);
+}
+
+
 void thermoCorrect(
     RhoSimpleFields&            f,
     const std::vector<FvPatch>& patches)
 {
-    // T from he, the exact inverse of the hConst relation createFields used in the other direction, and
-    // then psi from THAT T. Doing only the first half is the defect the rhotiming gate exists for: the
-    // pressure equation would carry a psi that belongs to the previous iteration's temperature.
+    // T from he, and then psi from THAT T. Doing only the first half is the defect the rhotiming gate
+    // exists for: the pressure equation would carry a psi that belongs to the previous iteration's
+    // temperature.
+    //
+    // THE SEED IS THE CELL'S OWN PREVIOUS T, read before it is overwritten -- OpenFOAM passes
+    // `TCells[celli]` as the third argument to THE (heRhoThermo.C:76-82) and its inversion's tolerance is
+    // built once from that seed, so the answer depends on it (liquid_thermo.cuh, thermoHeToT). On the gas
+    // path the closed form ignores it and nothing moves.
     const std::size_t nC = f.he.internal.size();
     for (std::size_t c = 0; c < nC; ++c)
     {
-        f.T.internal[c]   = hConstHeToT(f.he.internal[c], f.thermo);
+        const HeToTResult inv = thermoHeToT(f.he.internal[c], f.p.internal[c], f.T.internal[c], f.thermo);
+        if (!inv.converged) throw heToTFailure(inv, f.he.internal[c], f.p.internal[c], f.T.internal[c],
+                                               "cell " + std::to_string(c));
+        f.T.internal[c]   = inv.T;
         f.psi[c]          = thermoPsiOf(f.p.internal[c], f.T.internal[c], f.thermo);
         // heRhoThermo::calculate() fills rho_ HERE, from the p and T it sees at correct() time
         // (heRhoThermo.C:88). It is not the same number as p*psi later in the iteration, because the
@@ -65,7 +98,16 @@ void thermoCorrect(
         else
         {
             const std::vector<scalar>& hb = f.he.boundary[pi]->value();
-            for (label i = 0; i < patches[pi].size; ++i) tb[i] = hConstHeToT(hb[i], f.thermo);
+            for (label i = 0; i < patches[pi].size; ++i)
+            {
+                // Same seed rule as the cells: OpenFOAM passes the face's own current T
+                // (heRhoThermo.C:133), which is what `tb` still holds on this line.
+                const HeToTResult inv = thermoHeToT(hb[i], pb[i], tb[i], f.thermo);
+                if (!inv.converged) throw heToTFailure(inv, hb[i], pb[i], tb[i],
+                                                       "patch '" + patches[pi].name + "' face "
+                                                       + std::to_string(i));
+                tb[i] = inv.T;
+            }
             f.T.boundary[pi]->assignValue(tb);
         }
         for (label i = 0; i < patches[pi].size; ++i)
@@ -511,6 +553,7 @@ Residuals rhoSimpleStep(
     uin.scheme             = in.schemeU;
     uin.schemeCoeff        = in.schemeCoeffU;
     uin.gradULimitK        = in.gradULimitK;
+    uin.gradULULimitK      = in.gradULULimitK;
     uin.correctedLaplacian = in.correctedLaplacian;
     uin.snGradLimitCoeff   = in.snGradLimitCoeff;
     uin.hasMRF             = in.hasMRF;
@@ -644,14 +687,22 @@ Residuals rhoSimpleStep(
     // boundary it does the same for any patch that does not fix a value, then corrects the boundary.
     if (in.limitT)
     {
-        // NOT routed through thermoHeOf yet, and deliberately: OpenFOAM's limitTemperature builds
-        // he(p,Tmin) and he(p,Tmax) as FIELDS over the cell pressure (limitTemperature.C), which is the
-        // same number everywhere only while he is pressure-independent -- true of hConst, false of a
-        // liquid, whose Es is h(T) - p/rho(T). Making these per-cell is part of stage H3.4, where the
-        // liquid path is lifted; doing it here would be a change with nothing to gate it against, since
-        // the liquid case still refuses. The gas path is exact either way.
-        const scalar heMin = hConstTToHe(in.limitTmin, f.thermo);
-        const scalar heMax = hConstTToHe(in.limitTmax, f.thermo);
+        // FIELDS, not two scalars, because that is what OpenFOAM builds:
+        //     heMin = thermo.he(thermo.p(), Tmin, cells_)     (limitTemperature.C:156)
+        //     heMax = thermo.he(thermo.p(), Tmax, cells_)          :157
+        // and on the boundary the same pair per patch against that patch's own p (:243-247). A single
+        // number is right only while he is pressure-independent -- true of hConst, false of a liquid,
+        // whose Es is h(T) - p/rho(T). On squareBendLiq's pressure range the two differ by p/rho ~ 1e2
+        // J/kg against a clamp threshold of ~-1.6e7, so the scalar form would clamp at a temperature a
+        // fraction of a millikelvin off Tmin rather than at Tmin; small, and wrong in a way nothing
+        // downstream would ever reveal.
+        std::vector<scalar> heMin(static_cast<std::size_t>(nC));
+        std::vector<scalar> heMax(static_cast<std::size_t>(nC));
+        for (label c = 0; c < nC; ++c)
+        {
+            heMin[static_cast<std::size_t>(c)] = thermoHeOf(f.p.internal[c], in.limitTmin, f.thermo);
+            heMax[static_cast<std::size_t>(c)] = thermoHeOf(f.p.internal[c], in.limitTmax, f.thermo);
+        }
         // The two numbers OpenFOAM reports, taken BEFORE the clamp: min(T) and max(T) of the CURRENT
         // temperature, which is the previous thermo.correct()'s -- limitTemperature.C:164-166 reads
         // thermo.T() at the top of correct(he), and thermo.correct() only runs below. `min`/`max` of a
@@ -670,17 +721,21 @@ Residuals rhoSimpleStep(
         label nAboveMax = 0;
         for (label c = 0; c < nC; ++c)
         {
-            if      (f.he.internal[c] < heMin) { f.he.internal[c] = heMin; ++nBelowMin; }
-            else if (f.he.internal[c] > heMax) { f.he.internal[c] = heMax; ++nAboveMax; }
+            const std::size_t i = static_cast<std::size_t>(c);
+            if      (f.he.internal[c] < heMin[i]) { f.he.internal[c] = heMin[i]; ++nBelowMin; }
+            else if (f.he.internal[c] > heMax[i]) { f.he.internal[c] = heMax[i]; ++nAboveMax; }
         }
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
             if (f.he.boundary[pi]->fixesValue()) continue;
+            const std::vector<scalar>& pbv = f.p.boundary[pi]->value();
             std::vector<scalar> hb = f.he.boundary[pi]->value();
-            for (auto& v : hb)
+            for (std::size_t i = 0; i < hb.size(); ++i)
             {
-                if      (v < heMin) v = heMin;
-                else if (v > heMax) v = heMax;
+                const scalar lo = thermoHeOf(pbv[i], in.limitTmin, f.thermo);
+                const scalar hi = thermoHeOf(pbv[i], in.limitTmax, f.thermo);
+                if      (hb[i] < lo) hb[i] = lo;
+                else if (hb[i] > hi) hb[i] = hi;
             }
             f.he.boundary[pi]->setStoredValues(std::move(hb));
         }
@@ -990,16 +1045,16 @@ Residuals rhoSimpleStep(
     // run while the momentum and energy equations keep transporting rho*nut and alphat.
     if (f.turbulent && !f.turbulenceFrozen && !f.k.internal.empty())
     {
-        // div(phi,k)/div(phi,epsilon) come from the CASE. The closures below assemble Gauss upwind and
-        // Gauss limitedLinear (each with or without `bounded`) and nothing else, so any other named
-        // scheme must refuse here -- running upwind under the case's name is the substitution this
-        // project keeps finding.
+        // div(phi,k)/div(phi,epsilon) come from the CASE. The closures below assemble Gauss upwind,
+        // Gauss limitedLinear and Gauss linearUpwind over a Gauss linear gradient (each with or without
+        // `bounded`) and nothing else, so any other named scheme must refuse here -- running upwind
+        // under the case's name is the substitution this project keeps finding.
         if (!in.turbDivUnsupported.empty())
             throw std::runtime_error(
                 "rhoSimpleFoam step: div(phi,k)/div(phi,epsilon) asks for `" + in.turbDivUnsupported +
-                "`, which the compressible closure does not assemble -- only Gauss upwind and Gauss "
-                "limitedLinear, with or without `bounded`, are ported. Refusing rather than running "
-                "upwind under the case's scheme name.");
+                "`, which the compressible closure does not assemble -- Gauss upwind, Gauss limitedLinear "
+                "and Gauss linearUpwind over a Gauss linear gradient, with or without `bounded`, are "
+                "ported. Refusing rather than running upwind under the case's scheme name.");
         // The compressible instantiation's inputs. nu is the LAMINAR kinematic viscosity mu(T)/rho, which
         // varies cell by cell here where the incompressible lineage has one number for the case.
         std::vector<scalar> nuLam(nC);
@@ -1056,6 +1111,8 @@ Residuals rhoSimpleStep(
             KOmegaSSTCoeffs sco = f.sstCoeffs;   // the CASE's, read with keCoeffs in createFields
             sco.gradKLimitK      = in.gradKLimitK;
             sco.gradULimitK      = in.gradULimitK;   // grad(U) for S2/GbyNu0
+            // linearUpwind's NAMED gradient, resolved by the driver -- not grad(k)/grad(omega).
+            if (in.linearUpwindTurb) sco.luGradLimitK = in.turbLUGradK;
 
             const std::vector<scalar> y = cellWallDist(m, g, patches);
             kOmegaSST::SSTResiduals sres;
@@ -1210,12 +1267,21 @@ Residuals rhoSimpleStep(
                              keco, &kres, in.boundedTurb, /*dropTerm=*/0, &comp, in.fvOpts,
                              in.relaxEquationEps, in.relaxEquationK, /*constrainBeforeWall=*/true,
                              in.limitedLinearTurb, in.turbLimiterCoeff, in.turbLimGradK,
-                             in.minIterTurb, &nsel);
+                             in.minIterTurb, &nsel, in.linearUpwindTurb, in.turbLUGradK);
         res["epsilon"] = kres.epsilon;
         res["k"]       = kres.k;
         sd.scalars("kOut", f.k.internal);
         sd.scalars("epsD", kres.epsD);
         sd.scalars("epsSrc", kres.epsSrc);
+        // fvm::div(alphaRhoPhi, epsilon) on its own, the twin of tools/dumpKEpsilon's stage_epsDivD/Src:
+        // the convection term INCLUDING linearUpwind's explicit correction, which is what separates a
+        // scheme defect from everything else in the assembled system.
+        sd.scalars("epsDivD", kres.epsDivD);
+        sd.scalars("epsDivSrc", kres.epsDivSrc);
+        // ...and the assembled system BEFORE relax(), constrain() and boundaryManipulate() -- the twin of
+        // stage_epsD0/Src0 -- so a disagreement in the as-solved system can be put before or after them.
+        sd.scalars("epsD0", kres.epsD0);
+        sd.scalars("epsSrc0", kres.epsSrc0);
         sd.scalars("epsUpper", kres.epsUpper);
         sd.scalars("epsLower", kres.epsLower);
         sd.scalars("kD", kres.kD);

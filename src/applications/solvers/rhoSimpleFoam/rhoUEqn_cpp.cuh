@@ -124,6 +124,9 @@ struct RhoMomentumInput
     bool      bounded            = false;
     bool      linearUpwind       = false;
     scalar    gradULimitK        = 0.0;
+    // The gradient linearUpwind/linearUpwindV NAMES in div(phi,U), for the convection correction only.
+    // -1 = not resolved by the caller; the correction then takes gradULimitK (see StepInput).
+    scalar    gradULULimitK      = -1.0;
     DivScheme scheme             = DivScheme::upwind;
     scalar    schemeCoeff        = 1.0;
     bool      correctedLaplacian = false;

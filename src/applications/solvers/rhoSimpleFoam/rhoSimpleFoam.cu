@@ -524,6 +524,7 @@ Residuals rhoSimpleStep(
     uin.scheme = in.schemeU;
     uin.schemeCoeff = in.schemeCoeffU;
     uin.gradULimitK = in.gradULimitK;
+    uin.gradULULimitK = in.gradULULimitK;
     uin.correctedLaplacian = in.correctedLaplacian;
     uin.snGradLimitCoeff = in.snGradLimitCoeff;
     // The porosity the momentum module has always been able to apply, and which the driver never passed.

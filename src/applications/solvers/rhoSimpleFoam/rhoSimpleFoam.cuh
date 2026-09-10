@@ -135,6 +135,7 @@ struct RhoStepInput
     bool   boundedU = false, boundedHe = false, boundedKE = false;
     scalar schemeCoeffU = 1.0;
     scalar gradULimitK = 0.0, gradHeLimitK = 0.0, gradKELimitK = 0.0;
+    scalar gradULULimitK = -1.0;   // linearUpwind's NAMED gradient on div(phi,U) -- see RhoMomentumInput
     // The energy pair's `Gauss limitedLinear <k>` coefficients (RAW k) and the cellLimited coefficient
     // of the case's grad(<field>), which limits the LIMITER's own gradient -- a different lookup from
     // the three above, which hold the gradient linearUpwind NAMES. See RhoEnergyInput.

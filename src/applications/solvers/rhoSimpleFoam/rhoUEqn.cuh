@@ -159,9 +159,15 @@ struct RhoMomentumInput
     // `Gauss linearUpwind grad(U)`: the matrix stays pure upwind and the whole scheme is a deferred
     // source correction. It does NOT vanish at convergence.
     bool   linearUpwind = false;
-    // The `k` of `grad(U) cellLimited Gauss linear <k>` -- the gradient linearUpwind NAMES. 0 leaves the
-    // plain Gauss gradient. An unlimited gradient under a limited name is a different equation.
+    // The `k` of grad(U)'s OWN scheme, `cellLimited Gauss linear <k>` -- what divDevRhoReff's
+    // fvc::grad(U), correctedSnGrad's correction and the limitedLinearV limiter take. 0 = unlimited.
+    // (This comment used to call it "the gradient linearUpwind NAMES"; that is gradULULimitK below, and
+    // the two are different lookups that squareBendLiq was the first case to separate.)
     scalar gradULimitK = 0.0;
+    // The gradient `linearUpwind <name>` / `linearUpwindV <name>` NAMES, for the convection correction
+    // only (linearUpwind.C:61-68). -1 = not resolved by the caller: the correction takes gradULimitK, the
+    // arithmetic every harness that bypasses the driver was gated with.
+    scalar gradULULimitK = -1.0;
     cpu::rhoSimple::DivScheme scheme = cpu::rhoSimple::DivScheme::upwind;
     scalar schemeCoeff = 1.0;            // the `k` of `limitedLinear k`
     bool   correctedLaplacian = false;   // both halves -- see the header note

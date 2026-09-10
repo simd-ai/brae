@@ -156,10 +156,17 @@ FvVectorMatrix assembleUEqn(
     // (gaussConvectionScheme.C:112-115), so it lands here, before everything else -- and it is
     // SUBTRACTED, because `fvm += ...` on an fvMatrix means `source -= V*...` (fvMatrix.C:1855-1862).
     // linearUpwindV carries a DIFFERENT correction, not a scaled one, so it branches before the factor.
+    // THE CORRECTION'S GRADIENT IS THE ONE THE SCHEME NAMES (`linearUpwind limited` ->
+    // mesh.gradScheme("limited"), linearUpwind.C:61-68), not grad(U)'s own, which divDevRhoReff below
+    // takes. They were one coefficient here, and they coincide in every tutorial that sets grad(U) to
+    // the same `$limited` it names (aerofoilNACA0012) -- squareBendLiq names `limited` beside an
+    // unlimited `default`, and ran the correction unlimited: U 1.3e-03 off OpenFOAM at iteration 2,
+    // invisible at iteration 1 only because the start state is uniform.
+    const scalar luGradK = (in.gradULULimitK >= 0.0) ? in.gradULULimitK : in.gradULimitK;
     if (in.scheme == DivScheme::linearUpwindV)
     {
         std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
-        cellLimitGrad(gradU, U, in.gradULimitK, m, g, patches);
+        cellLimitGrad(gradU, U, luGradK, m, g, patches);
         const std::vector<vector> corr =
             limitedSchemes::linearUpwindVCorrection(*in.phi, U, gradU, m, g);
         for (std::size_t c = 0; c < corr.size(); ++c)
@@ -173,7 +180,7 @@ FvVectorMatrix assembleUEqn(
     if (corrFac != 0.0)
     {
         std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
-        cellLimitGrad(gradU, U, in.gradULimitK, m, g, patches);
+        cellLimitGrad(gradU, U, luGradK, m, g, patches);
         const std::vector<vector> corr =
             fvm::linearUpwindCorrection<vector, tensor>(*in.phi, gradU, m, g);
         for (std::size_t c = 0; c < corr.size(); ++c)

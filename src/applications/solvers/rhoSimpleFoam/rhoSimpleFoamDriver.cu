@@ -260,6 +260,7 @@ RhoStepInput buildDeviceStepInput(
     in.limGradHeLeastSq   = hin.limGradHeLeastSq;
     in.limGradKELeastSq   = hin.limGradKELeastSq;
     in.gradULimitK        = hin.gradULimitK;
+    in.gradULULimitK      = hin.gradULULimitK;
 
     in.tolU = hin.tolU;  in.relTolU = hin.relTolU;
     in.tolHe = hin.tolHe; in.relTolHe = hin.relTolHe;
@@ -304,6 +305,14 @@ TurbulenceHookOptions buildTurbulenceHookOptions(
     // what the host parse already refused (a `bounded` or coefficient mismatch between the two scalars,
     // linearUpwind, or a limiter gradient brae does not compute) still reaches this arm as a refusal.
     opt.divSchemeUnsupported = hin.turbDivUnsupported;
+    // linearUpwind on the turbulence pair is assembled by the HOST closures only (stage H3.5 --
+    // divWithScheme in kEpsilon_cpp.cu, and kOmegaSST_cpp.cu's own). The device closure's
+    // assembleTransport has no linearUpwind correction, so once the host parse ACCEPTS the scheme it
+    // must still refuse here; before H3.5 the host parse refused it for both arms and this arm inherited
+    // that refusal through turbDivUnsupported, which it would now silently lose.
+    if (opt.divSchemeUnsupported.empty() && hin.linearUpwindTurb)
+        opt.divSchemeUnsupported = "Gauss linearUpwind on div(phi,k)/div(phi," + std::string(opt.sst ? "omega" : "epsilon")
+                                 + ") -- assembled by the host closures, not yet by the device one";
     opt.limitedLinear        = hin.limitedLinearTurb;
     opt.limiterCoeff         = hin.turbLimiterCoeff;
     opt.limGradK             = hin.turbLimGradK;

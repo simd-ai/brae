@@ -558,11 +558,13 @@ void assembleUEqn(
         }
         const DeviceBuffer<scalar>* ubp[3] = {&ub[0], &ub[1], &ub[2]};
         deviceGaussGradFused(dm, 3, Usrc, ubp, gx, gy, gz);   // one launch, not three
-        if (in.gradULimitK > 0.0)
+        // The gradient the scheme NAMES, not grad(U)'s own -- see RhoMomentumInput::gradULULimitK.
+        const scalar luK = (in.gradULULimitK >= 0.0) ? in.gradULULimitK : in.gradULimitK;
+        if (luK > 0.0)
         {
             for (int k = 0; k < 3; ++k)
             {
-                deviceCellLimitGrad(dm, *Usrc[k], ub[k], gx[k], gy[k], gz[k], in.gradULimitK);
+                deviceCellLimitGrad(dm, *Usrc[k], ub[k], gx[k], gy[k], gz[k], luK);
             }
         }
         deviceLinearUpwindVCorr(dm, *in.phiInt, gx, gy, gz, Ux, Uy, Uz, cx, cy, cz);
@@ -595,10 +597,12 @@ void assembleUEqn(
             DeviceBuffer<scalar> lu;
             // `linearUpwind <name>`, where <name> resolves to `cellLimited Gauss linear <k>`. This
             // correction does NOT vanish at convergence, so an unlimited gradient under a limited name is a
-            // different equation, not a transient difference.
-            if (in.gradULimitK > 0.0)
+            // different equation, not a transient difference. The gradient is the one the scheme NAMES,
+            // not grad(U)'s own -- see RhoMomentumInput::gradULULimitK.
+            const scalar luK = (in.gradULULimitK >= 0.0) ? in.gradULULimitK : in.gradULimitK;
+            if (luK > 0.0)
             {
-                deviceCellLimitGrad(dm, *U[k], ub[k], gx[k], gy[k], gz[k], in.gradULimitK);
+                deviceCellLimitGrad(dm, *U[k], ub[k], gx[k], gy[k], gz[k], luK);
             }
             deviceLinearUpwindCorr(dm, *in.phiInt, gx[k], gy[k], gz[k], lu);
             deviceAxpy(-corrFac, lu, M.source[k]);
