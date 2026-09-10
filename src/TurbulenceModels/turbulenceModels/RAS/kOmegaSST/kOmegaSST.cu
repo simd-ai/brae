@@ -336,6 +336,12 @@ void correct(
     // patches reassigned.
     DeviceBuffer<scalar> omegaBndLast;
     if (dbOmega.n) deviceBCValue(dbOmega, omega, omegaBndLast);
+    // k's, as the HOST REFERENCE reads them: kOmegaSST_cpp.cu refreshes the k patches with
+    // updateTurbulentInlet/updateFromFlux (:657-658, coefficients only) and its k gradients read
+    // k.boundary[pi]->value() (:670, :708) -- the value the previous solve's k.evaluateBoundary() left
+    // (:726). Rebuilt here for the same reason as the kEpsilon twin (kBndLast).
+    DeviceBuffer<scalar> kBndLast;
+    if (dbK.n) deviceBCValue(dbK, k, kBndLast);
 
     // ---- production, from the CURRENT nut (the previous outer iteration's correctNut) ----------
     DeviceBuffer<scalar> gradU, S2, GbyNu0, G;
@@ -559,8 +565,10 @@ void correct(
         if (in.phiBnd) deviceUpdateInletOutlet(dbK, *in.phiBnd);
 
         PressureMatrix M;
+        turbulence::TransportScheme scK = sc;
+        scK.bndValues = kBndLast.size() ? &kBndLast : nullptr;
         turbulence::assembleScalarTransport(M, dm, dbK, k, gammaFace,
-                                            DkB.size() ? DkB : gammaFace, sc);
+                                            DkB.size() ? DkB : gammaFace, scK);
         if (in.boundedK)
         {
             boundedSpKernel<<<nBlk(nC), TPB>>>(nC, divPhi.data(), dm.V.data(), M.diag.data());

@@ -296,9 +296,11 @@ RhoSimpleFields createFields(
     const FvGeometry&           g,
     const std::vector<FvPatch>& patches,
     const FoamDict*             thermoDict,
-    const FoamDict*             turbDict)
+    const FoamDict*             turbDict,
+    scalar                      startTime)
 {
     RhoSimpleFields f;
+    f.startTime = startTime;
     const label nC = m.nCells();
 
     // COUPLED PATCHES, refused on topology alone before any file is read. The patch-field factory
@@ -511,7 +513,9 @@ RhoSimpleFields createFields(
     // compressibleCreatePhi.H builds phi FROM U and the seed would otherwise be carried into the flux.
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
-        f.U.boundary[pi]->updateAtConstruction(f.rho.boundary[pi]->value());
+        // ...at the START TIME, the timeOutputValue() OpenFOAM's constructor evaluates the flow rate's
+        // Function1 at; a constant rate ignores it, a time-dependent one refuses without it.
+        f.U.boundary[pi]->updateAtConstruction(f.rho.boundary[pi]->value(), startTime);
     }
     f.U.evaluateBoundary();
 

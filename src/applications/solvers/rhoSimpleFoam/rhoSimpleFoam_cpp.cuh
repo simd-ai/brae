@@ -69,6 +69,7 @@
 #include "rhoPEqn_cpp.cuh"
 #include "rhoPcEqn_cpp.cuh"
 #include "kEpsilon_cpp.cuh"
+#include <limits>
 #include <map>
 #include <string>
 #include <vector>
@@ -79,6 +80,12 @@ namespace rhoSimple {
 
 struct StepInput
 {
+    // --- time ---
+    // This iteration's time value, db().time().timeOutputValue() in OpenFOAM: what the boundary
+    // Function1s that depend on time (a `coded` flow rate) are evaluated at, at every updateCoeffs. The
+    // driver sets it each iteration; NaN (a harness that has no Time) makes such a Function1 refuse.
+    scalar time = std::numeric_limits<scalar>::quiet_NaN();
+
     // --- algorithm ---
     bool consistent = false;   // simple.consistent() -> pcEqn.H rather than pEqn.H
     bool transonic  = false;   // simple.transonic()  -> the convective pressure branch

@@ -162,6 +162,11 @@ struct PatchFieldData
     // ran: brae's inlet read 50.687834608 where OpenFOAM writes 58.85, on BOTH arms.
     std::string    flowRateRhoName = "rho";
     scalar         flowRate     = 0.0;
+    // The flow rate as the Function1 OpenFOAM evaluates at every updateCoeffs (flowRate_->value(t)):
+    // `constant` for the steady forms (flowRate above holds the same number), `coded` for OpenFOAM's
+    // run-time-compiled one. The patch takes this, never the bare number, so a time-dependent rate
+    // cannot be read as a constant by a consumer that only knows flowRate.
+    Function1      flowRateFunction1;
     scalar         rhoInlet     = -1.0;   // OF default -VGREAT ("not given")
     bool           extrapolateProfile = false;
     scalar         mixingLength = 0;
@@ -489,6 +494,65 @@ inline void setP0Table(PatchFieldData<T>& p, std::vector<std::pair<scalar, scala
         p.inletUniform = true;
         p.hasInletValue = true;
     }
+}
+
+// flowRateInletVelocity's flow rate given as a Function1 DICTIONARY, `{ type <t>; ... }` -- Function1New.C
+// :47-67 reads `type` from it. Only `coded` is evaluated in this form, with the keys CodedFunction1.C
+// reads: `name` (default the entry name, :147) and `code`; codeInclude, localCode, codeOptions and
+// codeLibs are collected so CodedFunction1 can refuse them by name. Any other type is refused here.
+inline Function1 readFlowRateFunction1Dict(
+    TokenStream&       ts,
+    const std::string& key,
+    const std::string& patchName,
+    const std::string& path)
+{
+    std::string type;
+    CodedFunction1Spec spec;
+    spec.name = key;
+    while (ts.peek() != "}")
+    {
+        const std::string k = ts.next();
+        if (k == "type")
+        {
+            type = ts.next();
+            ts.expect(";");
+        }
+        else if (k == "name")
+        {
+            spec.name = ts.next();
+            ts.expect(";");
+        }
+        else if (k == "code")
+        {
+            // The verbatim #{ ... #} token (foam_token_reader.cu, captureVerbatim); a quoted string is a
+            // legal `code` in OpenFOAM too and reaches here as one token.
+            const std::string tok = ts.next();
+            if (!ts.verbatim(tok, spec.code)) spec.code = tok;
+            ts.expect(";");
+        }
+        else if (k == "codeInclude" || k == "localCode" || k == "codeOptions" || k == "codeLibs")
+        {
+            spec.unsupportedKeys += (spec.unsupportedKeys.empty() ? "`" : ", `") + k + "`";
+            skipToSemicolon(ts);
+            if (ts.peek() == ";") ts.next();
+        }
+        else
+        {
+            skipToSemicolon(ts);
+            if (ts.peek() == ";") ts.next();
+        }
+    }
+    ts.expect("}");
+    if (type != "coded")
+        throw std::runtime_error(
+            "brae: flowRateInletVelocity '" + key + "' on patch " + patchName + " is a `" +
+            (type.empty() ? std::string("<no type>") : type) + "` Function1. brae evaluates `constant <value>`, "
+            "a bare value and `{ type coded; }` there; refusing rather than approximating any other.");
+    spec.origin = path + ": patch '" + patchName + "', " + key;
+    // OpenFOAM writes its dynamicCode/ into the case (<case>/<time>/U -> <case>); brae keeps its own
+    // beside it. BRAE_DYNAMIC_CODE_DIR overrides, for a case directory that is not writable.
+    spec.codeDir = (std::filesystem::path(path).parent_path().parent_path() / "dynamicCode" / "brae").string();
+    return Function1::coded(std::move(spec));
 }
 
 template <typename T>
@@ -922,20 +986,32 @@ inline FieldData<T> readField(const std::string& path)
                         p.intensity = ts.nextScalar();
                         ts.expect(";");
                     }
-                    // OF takes a Function1 here; "constant <v>" and a bare "<v>" are the steady forms.
-                    // Anything else (table/polynomial/...) is refused by name rather than approximated.
+                    // OF takes a Function1 here (flowRateInletVelocityFvPatchVectorField.C:71-83). "constant
+                    // <v>" and a bare "<v>" are the steady forms; `{ type coded; ... }` is OpenFOAM's
+                    // run-time-compiled one. Any other form is refused by name -- an inline `table (...)`
+                    // used to reach std::stod and die as "stod" instead.
                     else if (key == "volumetricFlowRate" || key == "massFlowRate")
                     {
                         p.hasFlowRate = true;
                         p.flowRateIsMass = (key == "massFlowRate");
                         std::string w = ts.next();
-                        if (w == "constant") w = ts.next();
-                        else if (w == "{")
-                            throw std::runtime_error(
-                                "brae: flowRateInletVelocity '" + key + "' given as a Function1 dictionary on patch "
-                                + p.name + "; only 'constant <value>' (or a bare value) is supported.");
-                        p.flowRate = std::stod(w);
-                        ts.expect(";");
+                        if (w == "{")
+                        {
+                            p.flowRateFunction1 = readFlowRateFunction1Dict(ts, key, p.name, path);
+                            p.flowRate = 0.0;   // no single number exists; flowRateValue() refuses on it
+                        }
+                        else
+                        {
+                            if (w == "constant") w = ts.next();
+                            if (!isFoamNumber(w))
+                                throw std::runtime_error(
+                                    "brae: flowRateInletVelocity '" + key + "' on patch " + p.name + " starts `" + w +
+                                    "`. brae evaluates `constant <value>`, a bare value and `{ type coded; }` there; "
+                                    "refusing rather than approximating any other Function1.");
+                            p.flowRate = std::stod(w);
+                            p.flowRateFunction1 = Function1::constant(p.flowRate);
+                            ts.expect(";");
+                        }
                     }
                     else if (key == "rho")
                     {

@@ -17,11 +17,19 @@
 //                    last. NOT extrapolation, which would invent pressures the case never asked for.
 //   * a single entry behaves as a constant.
 //
-// Only `table` and `constant` are built here. Anything else keeps the existing named refusal rather
-// than being approximated -- a polynomial silently run as a table is a different boundary condition.
+// Only `table`, `constant` and `coded` are built here. Anything else keeps the existing named refusal
+// rather than being approximated -- a polynomial silently run as a table is a different boundary
+// condition.
+//
+// `coded` (OF Function1Types::CodedFunction1) is compiled at run time -- see codedFunction1.cuh. It is
+// compiled on the FIRST value() rather than when the dictionary is parsed: the field reader re-reads
+// files for the writer and the audits, and a parse is not OpenFOAM's construction. Copies share one
+// compiled function, so a snippet's function-local static lives once, as it does in OpenFOAM's library.
 
 #include "cf_types.cuh"
+#include "codedFunction1.cuh"
 #include <algorithm>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -52,13 +60,28 @@ public:
         return f;
     }
 
-    bool empty() const { return entries_.empty(); }
+    static Function1 coded(CodedFunction1Spec spec)
+    {
+        Function1 f;
+        f.coded_ = std::make_shared<CodedHolder>();
+        f.coded_->spec = std::move(spec);
+        return f;
+    }
+
+    bool empty() const { return entries_.empty() && !coded_; }
+    bool isCoded() const { return static_cast<bool>(coded_); }
+    // The coded function's dictionary, for the writer to echo -- null for the other kinds.
+    const CodedFunction1Spec* codedSpec() const { return coded_ ? &coded_->spec : nullptr; }
+    // OpenFOAM's type name, for refusals.
+    const char* typeName() const { return coded_ ? "coded" : (entries_.size() > 1 ? "table" : "constant"); }
 
     // True when every entry carries the same value, so value(t) is the same at every t. A driver that
     // samples the table once (the rhoSimpleFoam mirror seeds p0 at t = 0 and never refreshes it) can run
     // such a table exactly; anything else it must refuse rather than freeze at the first value.
     bool isConstant() const
     {
+        // What a coded body returns is not known without running it at every time -- never constant.
+        if (coded_) return false;
         for (const auto& e : entries_)
         {
             if (e.second != entries_.front().second) return false;
@@ -69,6 +92,11 @@ public:
     // OF TableBase::value(x): linear between brackets, clamped outside.
     scalar value(scalar t) const
     {
+        if (coded_)
+        {
+            if (!coded_->fn) coded_->fn = std::make_unique<CodedFunction1>(coded_->spec);
+            return coded_->fn->value(t);
+        }
         if (entries_.empty()) return 0;
         if (entries_.size() == 1) return entries_.front().second;
         if (t <= entries_.front().first) return entries_.front().second;   // CLAMP low
@@ -88,7 +116,13 @@ public:
     }
 
 private:
+    struct CodedHolder
+    {
+        CodedFunction1Spec              spec;
+        std::unique_ptr<CodedFunction1> fn;   // built on the first value()
+    };
     std::vector<std::pair<scalar, scalar>> entries_;   // (t, value), ascending in t
+    std::shared_ptr<CodedHolder>           coded_;
 };
 
 }   // namespace brae

@@ -10,6 +10,7 @@
 #include "foam_field_reader.cuh"
 #include "cf_pstream.cuh"
 #include "foam_dict.cuh"   // isCoupledInterfaceType
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -91,8 +92,12 @@ public:
     // field -- not from the face cells, and not from `rhoInlet`, which is only the fallback for a solver
     // that registers no rho (flowRateInletVelocityFvPatchVectorField.C:updateCoeffs/updateValues):
     //     avgU = -flowRate/gSum(rho*magSf);   value = avgU*n      n = patch().nf(), OUTWARD
-    // A patch that is not one does nothing here.
-    virtual void updateFromDensity(const std::vector<scalar>& /*rhop*/) {}
+    // A patch that is not one does nothing here. `time` is db().time().timeOutputValue(), the argument
+    // OpenFOAM hands the flow rate's Function1 (flowRate_->value(t)); a caller that has no time passes
+    // nothing, and a time-dependent rate then refuses rather than being evaluated at an invented one.
+    virtual void updateFromDensity(
+        const std::vector<scalar>& /*rhop*/,
+        scalar                     /*time*/ = std::numeric_limits<scalar>::quiet_NaN()) {}
 
     // OF's updateCoeffs() for the two patches whose value is a function of the patch VELOCITY:
     //   totalPressure                  p_b = p0 - 0.5*rho*neg(phi)*magSqr(U_b)
@@ -124,7 +129,10 @@ public:
     // verbatim and replaces it at the first momentum assembly instead. sbMatched gives no value;
     // angledDuct gives `uniform (0 0 0)`, which makes OF's first inlet mass flux exactly zero. Taking
     // either branch for both was measured at 303x on the convective boundaryCoeffs.
-    virtual void updateAtConstruction(const std::vector<scalar>& /*rhop*/) {}
+    // `time` is the start time -- OpenFOAM's constructor evaluates at timeOutputValue() then.
+    virtual void updateAtConstruction(
+        const std::vector<scalar>& /*rhop*/,
+        scalar                     /*time*/ = std::numeric_limits<scalar>::quiet_NaN()) {}
 
     // OF's turbulent inlets RECOMPUTE their refValue in updateCoeffs, from the patch fields as they stand
     // at that moment -- they do not carry the value the case file was written with:
@@ -218,8 +226,13 @@ public:
     // recompute the rotated value each step.
     virtual const tensor* wedgeFaceT() const { return nullptr; }
     virtual const tensor* wedgeCellT() const { return nullptr; }
-    // flowRateInletVelocity: the dict flow rate, so the solver can recompute avgU against the live rho.
+    // flowRateInletVelocity: the dict flow rate AS ONE NUMBER, for the drivers that take it once. A rate
+    // that depends on time (a `coded` Function1) has no one number, and the patch refuses by name here --
+    // the one place every such driver reads it -- rather than hand over a value it would then freeze.
     virtual scalar flowRateValue() const { return 0.0; }
+    // ...and the rate OpenFOAM evaluates at every updateCoeffs, flowRate_->value(time), for the drivers
+    // that carry the time (the rhoSimpleFoam OF-mirror arms). NaN time refuses on a time-dependent rate.
+    virtual scalar flowRateAt(scalar /*time*/) const { return 0.0; }
     // Is this a flowRateInletVelocity at all, and is its rate a MASS rate? bcCategory() answers neither:
     // it reports 9 for the mass form and a plain fixedValue 1 for the volumetric one, so a driver keying
     // on 9 builds no flow-rate mask for a volumetric inlet and never updates it -- measured on a
@@ -495,9 +508,14 @@ public:
     // brae used to compute avgU*n here, in the constructor, so its very first flux was already -0.1. Every
     // coefficient agreed (sum|iC| to 8 s.f., avgU to 5 s.f.) but the convective boundaryCoeffs did not:
     // OF's bC = -phi_b*U_b vanishes at iteration 1 while brae's did not, leaving sum|bC| 303x apart.
+    //
+    // A TIME-DEPENDENT RATE (a `coded` Function1) has no value to build with before a time is known, so
+    // the placeholder is a zero inlet instead; the invariant on build() below is what makes that safe --
+    // updateAtConstruction replaces it on the drivers that carry a time, and every other driver reads the
+    // rate through flowRateValue(), which refuses.
     FlowRateInletVelocityPatchField(
         const FvPatch& p,
-        scalar flowRate,
+        Function1 flowRate,
         bool isMass,
         scalar rhoInlet,
         bool valueUniform,
@@ -513,24 +531,48 @@ public:
               // segfaulted squareBend on an empty value list; taking only the second was the 303x bC error.
               (valueUniform || !values.empty()) ? valueUniform : false,
               uniformValue,
-              (valueUniform || !values.empty()) ? values : build(p, flowRate, isMass, rhoInlet)),
+              (valueUniform || !values.empty())
+                  ? values
+                  : build(p, flowRate.isConstant() ? flowRate.value(0) : scalar(0), isMass, rhoInlet)),
           isMass_(isMass),
-          flowRate_(flowRate),
+          flowRate_(std::move(flowRate)),
           rhoInlet_(rhoInlet),
           hadValue_(valueUniform || !values.empty())
     {}
 
-    void updateAtConstruction(const std::vector<scalar>& rhop) override
+    void updateAtConstruction(
+        const std::vector<scalar>& rhop,
+        scalar                     time = std::numeric_limits<scalar>::quiet_NaN()) override
     {
         if (hadValue_) return;      // OF keeps the case's `value` until the first momentum assembly
-        updateFromDensity(rhop);
+        updateFromDensity(rhop, time);
     }
     // 9 = flowRateInletVelocity: refValue recomputed per step from the live boundary rho (mass form only).
     // 9 stays the MASS form's category, because five drivers key on it to mean exactly that and only
     // the OF-mirror device path has been taught the volumetric divisor. isFlowRateInlet() is the
     // question a driver should ask; see the base class.
     int bcCategory() const override { return isMass_ ? 9 : 1; }
-    scalar flowRateValue() const override { return flowRate_; }
+    scalar flowRateValue() const override
+    {
+        if (!flowRate_.isConstant())
+            throw std::runtime_error(
+                std::string("flowRateInletVelocity on patch '") + this->patch_.name + "': the flow rate is a `" +
+                flowRate_.typeName() + "` Function1, which OpenFOAM evaluates at the current time at every "
+                "updateCoeffs. This driver takes the rate as ONE number for the whole run; only the "
+                "rhoSimpleFoam OF-mirror arms (BRAE_RHOSIMPLEFOAM_MIRROR=1 or cuda) evaluate it per "
+                "iteration. Refusing rather than freezing it.");
+        return flowRate_.value(0);
+    }
+    scalar flowRateAt(scalar time) const override
+    {
+        if (flowRate_.isConstant()) return flowRate_.value(0);
+        if (time != time)
+            throw std::runtime_error(
+                std::string("flowRateInletVelocity on patch '") + this->patch_.name + "': the flow rate is a `" +
+                flowRate_.typeName() + "` Function1 of time and the caller supplied no time. Refusing rather "
+                "than evaluating it at an invented one.");
+        return flowRate_.value(time);
+    }
     bool isFlowRateInlet() const override { return true; }
     bool flowRateIsMass()  const override { return isMass_; }
     scalar flowRateRhoInlet() const override { return rhoInlet_; }
@@ -541,7 +583,9 @@ public:
     // equation is assembled -- so the inlet moves with the solution instead of staying at the seed the
     // constructor built. The VOLUMETRIC branch is recomputed too: OF passes one{} rather than skipping,
     // which matters when a case supplies both `volumetricFlowRate` and a `value` that disagrees with it.
-    void updateFromDensity(const std::vector<scalar>& rhop) override
+    void updateFromDensity(
+        const std::vector<scalar>& rhop,
+        scalar                     time = std::numeric_limits<scalar>::quiet_NaN()) override
     {
         const label n = this->patch_.size;
         if (n == 0) return;
@@ -566,15 +610,16 @@ public:
                 + "': gSum(rho*magSf) is not positive, so no inlet velocity can be formed from the "
                   "prescribed flow rate.");
         }
-        const scalar avgU = -flowRate_ / sumRhoA;
+        // flowRate_->value(t) at THIS updateCoeffs (flowRateInletVelocityFvPatchVectorField.C:201-237).
+        const scalar avgU = -flowRateAt(time) / sumRhoA;
         std::vector<vector> v(n);
         for (label i = 0; i < n; ++i) v[i] = avgU * this->patch_.nf[i];
         this->setStoredValues(std::move(v));
     }
 
 private:
-    bool   isMass_;
-    scalar flowRate_ = 0.0;
+    bool      isMass_;
+    Function1 flowRate_;
     // Kept, not just forwarded to build(): the DEVICE drivers need it, because on an incompressible solver
     // no rho field is registered and rhoInlet IS OpenFOAM's divisor (.C:233).
     scalar rhoInlet_ = -1.0;
@@ -2086,8 +2131,16 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
                     "density field '" + d.flowRateRhoName + "'; only the default 'rho' and 'none' are "
                     "implemented. OpenFOAM would divide the flow rate by that field's patch values.");
             const bool isMass = d.flowRateIsMass && d.flowRateRhoName != "none";
+            // The Function1 the reader built -- `constant` or `coded`. A PatchFieldData assembled by hand
+            // (the harnesses) carries only the number, which is the constant it always meant.
             return std::make_unique<FlowRateInletVelocityPatchField>(
-                p, d.flowRate, isMass, d.rhoInlet, d.valueUniform, d.uniformValue, d.values);
+                p,
+                d.flowRateFunction1.empty() ? Function1::constant(d.flowRate) : d.flowRateFunction1,
+                isMass,
+                d.rhoInlet,
+                d.valueUniform,
+                d.uniformValue,
+                d.values);
         }
         else throw std::runtime_error("brae: flowRateInletVelocity is a velocity (vector) BC");
     }

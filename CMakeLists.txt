@@ -68,6 +68,7 @@ add_library(brae_core STATIC
     src/parallel/pstream/device_reduce.cu
     src/OpenFOAM/meshes/interface/processor_interface.cu
     src/OpenFOAM/db/foam_token_reader.cu
+    src/OpenFOAM/primitives/functions/Function1/Coded/codedFunction1.cu
     src/OpenFOAM/meshes/primitive_mesh.cu
     src/finiteVolume/fvMesh/fv_geometry.cu
     src/finiteVolume/fvMesh/fv_patch.cu
@@ -173,6 +174,8 @@ target_include_directories(brae_core PUBLIC ${BRAE_HEADER_DIRS} ${MPI_CXX_INCLUD
 # Link MPI libraries directly (not the imported target) so its CXX compile flags do not
 # reach nvcc, which would reject them.
 target_link_libraries(brae_core PUBLIC ${MPI_CXX_LIBRARIES} ${SCOTCH_LIBRARY} ${SCOTCH_ERR_LIBRARY} ZLIB::ZLIB CUDA::nvrtc CUDA::cuda_driver)
+# dlopen/dlsym for the run-time-compiled coded Function1 (codedFunction1.cu).
+target_link_libraries(brae_core PUBLIC ${CMAKE_DL_LIBS})
 # OpenMP runtime (libgomp) linked directly, like MPI above, the imported target's CXX compile flags would reach nvcc.
 if(OpenMP_CXX_FOUND)
     target_link_libraries(brae_core PUBLIC ${OpenMP_CXX_LIBRARIES})
@@ -326,6 +329,15 @@ add_executable(test_gpu_coded_bc tests/test_gpu_coded_bc.cu)
 target_include_directories(test_gpu_coded_bc PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_gpu_coded_bc PRIVATE brae_core)
 add_test(NAME gpu_coded_bc COMMAND test_gpu_coded_bc)
+
+# OpenFOAM's `type coded;` Function1, host side: the snippet compiles and loads, x reaches it, a
+# function-local static lives for the process, and the keys brae cannot reproduce are refused by name.
+# No OpenFOAM oracle here -- that is rho_coded_function1_vs_openfoam, which this covers underneath and
+# which exits 77 where OpenFOAM is not installed.
+add_executable(test_coded_function1 tests/test_coded_function1.cu)
+target_include_directories(test_coded_function1 PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_coded_function1 PRIVATE brae_core)
+add_test(NAME coded_function1 COMMAND test_coded_function1)
 
 add_executable(test_forces tests/test_forces.cu)
 target_include_directories(test_forces PRIVATE ${BRAE_HEADER_DIRS})
@@ -2420,6 +2432,16 @@ set_tests_properties(rho_squarebendliq_vs_openfoam PROPERTIES SKIP_RETURN_CODE 7
 add_test(NAME rho_generalized_newtonian_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_generalized_newtonian_vs_openfoam.sh)
 set_tests_properties(rho_generalized_newtonian_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# The `coded` massFlowRate Function1 on both mirror arms: squareBendLiq's own snippet, and a second one
+# that varies with the time (5*(1 + 0.05*t)) so a brae that froze the rate cannot pass -- which is what
+# found the device k assembly reading k's patch values live where the host reference reads the stored
+# ones. Carries the writer round trip (OpenFOAM restarts from brae's written U and recompiles the body)
+# and eleven refusals: the four keys OpenFOAM compiles against its own headers, `$`, an empty body, two
+# table forms, and the five drivers that take the rate as one number.
+add_test(NAME rho_coded_function1_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_coded_function1_vs_openfoam.sh)
+set_tests_properties(rho_coded_function1_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
 # rhoSimpleFoam's UEqn.H against OpenFOAM's own assembled momentum matrix (tools/dumpPEqn stage harness:
 # rAU, internalCoeffs, boundaryCoeffs). OpenFOAM's muEff is injected so this measures the ASSEMBLY and not

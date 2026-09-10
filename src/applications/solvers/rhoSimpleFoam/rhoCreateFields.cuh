@@ -121,6 +121,9 @@ struct RhoDeviceFields
     bool                              hasFlowRate = false;
     std::vector<DeviceBuffer<scalar>> frMagSf;      // one per flowRate patch: magSf there, 0 elsewhere
     std::vector<scalar>               frMdot;       // matching prescribed flow rate, same order
+    // The patch each frMdot entry belongs to, so the driver can re-evaluate a time-dependent rate
+    // (flowRateAt) at every iteration, as OpenFOAM does at every updateCoeffs.
+    std::vector<std::size_t>          frPatch;
     // 1 where that rate is a MASS rate (divisor gSum(rho*magSf)), 0 where it is VOLUMETRIC
     // (divisor gSum(magSf)). OpenFOAM recomputes both every updateCoeffs; keying the mask on
     // bcCategory()==9 built none for the volumetric form and left it frozen at 0/U's seed.

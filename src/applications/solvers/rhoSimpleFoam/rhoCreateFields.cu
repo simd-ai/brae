@@ -204,9 +204,11 @@ RhoDeviceFields createDeviceFields(
             }
             d.frMagSf.emplace_back();
             d.frMagSf.back().copyFrom(mask);
-            // OpenFOAM re-reads flowRate_->value(t) at every updateCoeffs; steady with a constant entry
-            // makes that the seeded value, which the patch object already holds.
-            d.frMdot.push_back(hf.U.boundary[pi]->flowRateValue());
+            // OpenFOAM re-reads flowRate_->value(t) at every updateCoeffs. Seeded here at the start time the
+            // host fields were built at; the driver refreshes it every iteration (a constant rate returns
+            // the same number, a `coded` one is re-evaluated).
+            d.frMdot.push_back(hf.U.boundary[pi]->flowRateAt(hf.startTime));
+            d.frPatch.push_back(pi);
             d.frIsMass.push_back(hf.U.boundary[pi]->flowRateIsMass() ? 1 : 0);
         }
         if (d.hasFlowRate)
@@ -269,6 +271,13 @@ RhoDeviceFields createDeviceFields(
     d.f.phiInt.copyFrom(hf.phi.internal);
     d.f.phiBnd.copyFrom(flattenBoundary(hf.phi.boundary, patches, d.nBndFaces, 0.0));
     d.f.initialMass = hf.initialMass;
+    // generalizedNewtonian's nu_ as its CONSTRUCTOR left it (createFields, generalizedNewtonian.C:87):
+    // iteration 1's momentum equation reads this one, and correct() replaces it at the end of the step.
+    if (hf.generalizedNewtonian)
+    {
+        d.f.gnNu.copyFrom(hf.gnNu);
+        d.f.gnNuBnd.copyFrom(flattenBoundary(hf.gnNuBnd, patches, d.nBndFaces, 0.0));
+    }
 
     // ---- the two masks, and they are NOT the same question ------------------------------------
     {

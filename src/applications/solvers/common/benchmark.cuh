@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -196,11 +197,14 @@ inline std::filesystem::path fetchSample(const std::string& sample)
 }
 
 // SECURITY: refuse a pulled case that carries code. brae compiles codedFixedValue / codedMixed bodies with NVRTC
-// and runs them on the device, so accepting them here would make `brae benchmark <anything>` an arbitrary-code
-// path onto a contributor's machine. Benchmarks measure the solver and have no reason to ship code.
+// and runs them on the device, and a `type coded;` Function1 with the host C++ compiler, so accepting them
+// here would make `brae benchmark <anything>` an arbitrary-code path onto a contributor's machine.
+// Benchmarks measure the solver and have no reason to ship code.
 inline void refuseExecutableCase(const std::filesystem::path& dir)
 {
     static const char* kCodeMarkers[] = {"codedFixedValue", "codedMixed", "#codeStream", "codedFunctionObject"};
+    // `type coded;` with any spacing -- the Function1 form carries no distinctive word of its own.
+    static const std::regex kCodedFunction1(R"(\btype\s+coded\s*;)");
     std::error_code ec;
     for (auto it = std::filesystem::recursive_directory_iterator(dir, ec);
          it != std::filesystem::recursive_directory_iterator(); ++it)
@@ -218,6 +222,12 @@ inline void refuseExecutableCase(const std::filesystem::path& dir)
                     std::filesystem::relative(it->path(), dir).string() +
                     "). brae compiles coded boundary conditions on the device, so a benchmark is not allowed to "
                     "contain them. Refusing to run it.");
+        if (std::regex_search(text, kCodedFunction1))
+            throw std::runtime_error(
+                "benchmark sample carries executable content (a `type coded;` Function1 in " +
+                std::filesystem::relative(it->path(), dir).string() +
+                "). brae compiles coded Function1s with the host C++ compiler, so a benchmark is not allowed "
+                "to contain them. Refusing to run it.");
     }
 }
 

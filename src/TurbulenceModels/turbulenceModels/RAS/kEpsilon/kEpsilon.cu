@@ -648,7 +648,8 @@ void assembleKEqn(
     const DeviceBuffer<scalar>& k,
     const DeviceBuffer<scalar>& epsilon,
     const DeviceBuffer<scalar>& nut,
-    const KEpsilonInput&        in)
+    const KEpsilonInput&        in,
+    const DeviceBuffer<scalar>* kBndValues)
 {
     const int nC = dm.nCells;
 
@@ -659,7 +660,7 @@ void assembleKEqn(
     }
     deviceUpdateInletOutlet(dbK, *in.phiBnd);
 
-    assembleTransport(K, st.DkEff, st.gammaKFace, st.gammaKBnd, dm, dbK, k, nut, in.co.sigmaK, in);
+    assembleTransport(K, st.DkEff, st.gammaKFace, st.gammaKBnd, dm, dbK, k, nut, in.co.sigmaK, in, kBndValues);
 
     kReactionKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), in.rhoCell->data(), st.G.data(), k.data(),
                                        epsilon.data(), st.divU.data(), st.divPhi.data(),
@@ -924,6 +925,17 @@ void correct(
     // the outlet faces, epsilon 1.9e-06 off OpenFOAM at iteration 2.
     DeviceBuffer<scalar> epsBndLast;
     if (dbEps.n) deviceBCValue(dbEps, epsilon, epsBndLast);
+    // ...and k's, as the HOST REFERENCE reads them. kEpsilon_cpp.cu refreshes the k patches with
+    // updateTurbulentInlet (:620, which only calls setRefValues) and updateFromFlux (:621, the
+    // valueFraction), and its gradients then read k.boundary[pi]->value() (divWithScheme, :637) -- the
+    // value its k.evaluateBoundary() after the PREVIOUS solve left (:679). This arm stores no patch
+    // values, so that value is rebuilt here from the cells and the previous assembly's coefficients,
+    // the same reconstruction as epsilon's above (with the same Foam::bound caveat). It evaluated dbK
+    // live after the refresh instead, which is the same number only while the inlet's refValue never
+    // moves. Measured on squareBendLiq's geometry with a coded massFlowRate 5*(1 + 0.05*t): k 3.2e-08 off
+    // OpenFOAM at iteration 2 in the inlet-layer corner cells, 1.2e-04 by iteration 3; the host 4.7e-13.
+    DeviceBuffer<scalar> kBndLast;
+    if (dbK.n) deviceBCValue(dbK, k, kBndLast);
 
     production(st, dm, dbU, nut, in);
     wallTreatment(st, epsilon, dm, wall, k, in);
@@ -963,7 +975,7 @@ void correct(
     // ---- the k equation ----------------------------------------------------------------------
     {
         PressureMatrix K;
-        assembleKEqn(K, st, dm, dbK, dbU, k, epsilon, nut, in);
+        assembleKEqn(K, st, dm, dbK, dbU, k, epsilon, nut, in, dbK.n ? &kBndLast : nullptr);
 
         // No wall mask: see finishAndSolve.
         finishAndSolve(K, k, dm, in.relaxEquationK, in.relaxK,

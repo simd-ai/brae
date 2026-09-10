@@ -41,6 +41,16 @@ git -C "$TEMPLATE" checkout -q -b pimplefoam/coded-attack
 printf 'FoamFile { version 2.0; format ascii; class dictionary; object U; }\nboundaryField { inlet { type codedFixedValue; code #{ #}; } }\n' > "$TEMPLATE/0/U.coded"
 git -C "$TEMPLATE" add -A && git -C "$TEMPLATE" commit -qm "coded"
 
+# The Function1 form, branched from the CLEAN sample so it trips nothing else. It carries no distinctive
+# word of its own -- `type coded;` inside a massFlowRate is the whole marker -- and brae compiles that body
+# with the HOST compiler, so a benchmark carrying one is arbitrary code on a contributor's machine just as
+# a codedFixedValue is. The spacing is deliberately not the writer's, since the guard matches a pattern.
+git -C "$TEMPLATE" checkout -q pimplefoam/pitz-tiny
+git -C "$TEMPLATE" checkout -q -b pimplefoam/coded-function1-attack
+printf 'FoamFile { version 2.0; format ascii; class dictionary; object U; }\nboundaryField { inlet { type flowRateInletVelocity; massFlowRate { type   coded ; name r; code #{ return 5; #}; } } }\n' > "$TEMPLATE/0/U.f1"
+git -C "$TEMPLATE" add -A && git -C "$TEMPLATE" commit -qm "coded Function1"
+git -C "$TEMPLATE" checkout -q pimplefoam/pitz-tiny
+
 # branched from the CLEAN sample, so the only thing wrong with it is the missing manifest -- otherwise it would
 # trip the code guard first and this would not be testing what it claims to test.
 git -C "$TEMPLATE" checkout -q pimplefoam/pitz-tiny
@@ -138,6 +148,21 @@ elif [ -f "$WORK/brae-benchmark.json" ]; then
     say_fail "refuses_coded_case" "the case was run anyway (a result was written)"
 else
     say_ok "refuses_coded_case"
+fi
+
+# ...and the `type coded;` Function1, which brae compiles with the host C++ compiler. Its own branch, so the
+# clean sample above is the control: the guard refuses these two and still runs pitz-tiny.
+rm -f "$WORK/brae-benchmark.json"
+"$BIN" benchmark pimplefoam/coded-function1-attack > "$WORK/coded_f1.log" 2>&1
+rc=$?
+if [ "$rc" -eq 0 ]; then
+    say_fail "refuses_coded_function1_case" "ran a sample carrying a coded Function1"
+elif ! grep -q "type coded" "$WORK/coded_f1.log"; then
+    say_fail "refuses_coded_function1_case" "refused, but not for the Function1"; sed -n '1,10p' "$WORK/coded_f1.log"
+elif [ -f "$WORK/brae-benchmark.json" ]; then
+    say_fail "refuses_coded_function1_case" "the case was run anyway (a result was written)"
+else
+    say_ok "refuses_coded_function1_case"
 fi
 
 # ---- 4. bad names and bad samples --------------------------------------------------------------------------

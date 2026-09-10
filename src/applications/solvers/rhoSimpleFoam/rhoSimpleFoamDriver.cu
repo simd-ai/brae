@@ -428,7 +428,7 @@ int runMirrorCuda(const std::string& caseDir)
     brae::perPatchWallCoeffsHonoured() = true;
     cpu::rhoSimple::RhoSimpleFields hf =
         cpu::rhoSimple::createFields(caseDir + "/" + startName, caseDir, simpleDict, &fvSolution,
-                                     m, g, patches, &thermoProps, turbProps.get());
+                                     m, g, patches, &thermoProps, turbProps.get(), wc.startTime());
 
     std::printf("brae rhoSimpleFoam (OF-mirror, CUDA): %ld cells, start %s, %s\n",
                 (long)nC, startName.c_str(),
@@ -964,6 +964,10 @@ int runMirrorCuda(const std::string& caseDir)
         gin.muEffCell = &dMu;       gin.muEffBndFace = &dMuB;
         gin.alphaEffCell = &dAl;    gin.alphaEffBndFace = &dAlB;
 
+        // flowRate_->value(t) at THIS iteration's time, as OpenFOAM's updateCoeffs asks it: the rate of a
+        // `coded` Function1 moves with t, and the step reads frMdot at both of its flow-rate updates.
+        for (std::size_t k = 0; k < dev.frPatch.size(); ++k)
+            dev.frMdot[k] = hf.U.boundary[dev.frPatch[k]]->flowRateAt(time.timeValue());
         Residuals r = rhoSimpleStep(dev.f, w, dev.dm, dev.dbU, dev.dbP, dev.dbHe, dev.dbT, gin);
         // THE CLOSURE'S RESIDUALS, which the step cannot return: its turbulence hook is a
         // std::function<void()>, so k and epsilon never reached `r` and the two residualControl

@@ -285,7 +285,11 @@ void assembleKEqn(
     const DeviceBuffer<scalar>&  k,
     const DeviceBuffer<scalar>&  epsilon,
     const DeviceBuffer<scalar>&  nut,
-    const KEpsilonInput&         in);
+    const KEpsilonInput&         in,
+    // k's STORED patch values for the gradients (the last evaluate, captured before this call refreshes
+    // the turbulent inlet and the flux switch); null evaluates live, the same number only while no
+    // patch's coefficients move between iterations.
+    const DeviceBuffer<scalar>*  kBndValues = nullptr);
 
 // Foam::bound(vsf, lowerBound): a cell that solved BELOW the floor takes the AREA-WEIGHTED average of
 // its bounded neighbours, not a hard clamp (bound.C:38-56 via fvc::average = surfaceSum(magSf*ssf)/

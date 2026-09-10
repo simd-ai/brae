@@ -501,7 +501,7 @@ Residuals rhoSimpleStep(
     // angledDuct lose its inlet mass flow.
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
-        f.U.boundary[pi]->updateFromDensity(rhoBnd[pi]);
+        f.U.boundary[pi]->updateFromDensity(rhoBnd[pi], in.time);
     }
 
     // updateCoeffs() for pressureInletOutletVelocity, which OpenFOAM reaches inside the momentum
@@ -947,7 +947,7 @@ Residuals rhoSimpleStep(
         // rho patch value AS IT STANDS, which is what OpenFOAM's lookup returns.
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
-            f.U.boundary[pi]->updateFromDensity(f.rho.boundary[pi]->value());
+            f.U.boundary[pi]->updateFromDensity(f.rho.boundary[pi]->value(), in.time);
         }
         // freestreamVelocity too: its updateCoeffs reads `Up = *this`, the patch's CURRENT value
         // (freestreamVelocityFvPatchVectorField.C:106), and runs again inside this evaluate because the

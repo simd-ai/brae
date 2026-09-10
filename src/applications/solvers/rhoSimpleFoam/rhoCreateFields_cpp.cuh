@@ -62,6 +62,7 @@
 #include "kepsilon_coeffs.cuh"     // KEpsilonCoeffs: the case's own closure constants, carried on the field set
 #include "komega_sst_coeffs.cuh"   // KOmegaSSTCoeffs + readKOmegaSSTCoeffs, likewise
 #include "generalizedNewtonian_cpp.cuh"
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -210,6 +211,11 @@ struct RhoSimpleFields
     // p moves hard in one iteration that is nothing like the post-solve value.
     std::vector<scalar>              rhoThermo;     // filled by thermoCorrect(), read by updateRho()
     std::vector<std::vector<scalar>> rhoThermoBnd;
+
+    // The start TIME VALUE the fields were constructed at -- what OpenFOAM's constructors see as
+    // timeOutputValue(), and so what a flowRateInletVelocity with no `value` evaluates its Function1 at.
+    // NaN when the caller did not say; a time-dependent rate then refuses at construction.
+    scalar startTime = std::numeric_limits<scalar>::quiet_NaN();
 };
 
 // createFields.H + compressibleCreatePhi.H + createFieldRefs.H + pressureControl.
@@ -235,7 +241,9 @@ RhoSimpleFields createFields(
     const FvGeometry&           g,
     const std::vector<FvPatch>& patches,
     const FoamDict*             thermoDict = nullptr,
-    const FoamDict*             turbDict = nullptr);
+    const FoamDict*             turbDict = nullptr,
+    // the start time value (Time's resolved start); needed only by a time-dependent boundary Function1
+    scalar                      startTime = std::numeric_limits<scalar>::quiet_NaN());
 
 // EddyDiffusivity::correctNut's BOUNDARY half, one implementation for construction and both step
 // branches. alphat = rho*nut/Prt is a FIELD assignment in OpenFOAM (EddyDiffusivity.C:38), so every

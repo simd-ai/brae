@@ -146,8 +146,23 @@ inline void writePatchEntry(
     }
     if (d.hasFlowRate)
     {
-        os << "        " << (d.flowRateIsMass ? "massFlowRate" : "volumetricFlowRate")
-           << "    constant " << d.flowRate << ";\n";
+        const char* rateKey = d.flowRateIsMass ? "massFlowRate" : "volumetricFlowRate";
+        if (const CodedFunction1Spec* cs = d.flowRateFunction1.codedSpec())
+        {
+            // OpenFOAM writes the coded dictionary back as it read it (CodedFunction1.C writeData,
+            // dict_.writeEntry), so a restart recompiles the same body. Writing the number the rate had
+            // at this time instead would turn a function of time into a constant for every run that
+            // restarts from here -- OpenFOAM's or brae's.
+            os << "        " << rateKey << "\n        {\n"
+               << "            type            coded;\n"
+               << "            name            " << cs->name << ";\n"
+               << "            code\n            #{" << cs->code << "#};\n"
+               << "        }\n";
+        }
+        else
+        {
+            os << "        " << rateKey << "    constant " << d.flowRate << ";\n";
+        }
         // OF guards both of these with `if (!volumetric_)` (flowRateInletVelocityFvPatchVectorField.C:
         // 245-249) -- i.e. on the MASS form -- and writes `rho` only when it is not the default, through
         // writeEntryIfDifferent. `rho none` is not cosmetic: it selects OpenFOAM's VOLUMETRIC branch for

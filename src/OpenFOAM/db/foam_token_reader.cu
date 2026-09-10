@@ -471,6 +471,72 @@ std::vector<std::string> tokenize(const std::string& s)
     return t;
 }
 
+// OpenFOAM reads `#{ ... #}` as ONE token, a verbatim string (ISstream::readVerbatim): its comments,
+// quotes, `$` and `#include` lines belong to the code, and the first `#}` ends it. brae's pipeline would
+// take one apart -- stripComments drops the code's `//` comments, tokenize strips the quotes off a string
+// literal and splits on every brace, expandIncludes acts on the code's own `#include` -- so the body is
+// lifted out here, before any of that runs, and replaced by a placeholder word the reader redeems through
+// TokenStream::verbatim(). `#eval #{ ... #}` is left in place: expandEvalDirectives evaluates it after the
+// $macros, which is where its body is meant to be expanded. A `#{` inside a comment or a quoted string is
+// not a verbatim opener and is left alone.
+std::string captureVerbatim(const std::string& text, std::vector<std::string>& store)
+{
+    if (text.find("#{") == std::string::npos) return text;
+    std::string out;
+    out.reserve(text.size());
+    enum { CODE, LINE, BLOCK, QUOTE } st = CODE;
+    for (std::size_t i = 0; i < text.size(); ++i)
+    {
+        const char c = text[i];
+        const char d = (i + 1 < text.size()) ? text[i + 1] : '\0';
+        if (st == LINE)
+        {
+            if (c == '\n') st = CODE;
+            out += c;
+            continue;
+        }
+        if (st == BLOCK)
+        {
+            if (c == '*' && d == '/') { st = CODE; out += c; out += d; ++i; continue; }
+            out += c;
+            continue;
+        }
+        if (st == QUOTE)
+        {
+            if (c == '\\' && d != '\0') { out += c; out += d; ++i; continue; }
+            if (c == '"') st = CODE;
+            out += c;
+            continue;
+        }
+        if (c == '/' && d == '/') { st = LINE;  out += c; continue; }
+        if (c == '/' && d == '*') { st = BLOCK; out += c; continue; }
+        if (c == '"')             { st = QUOTE; out += c; continue; }
+        if (c == '#' && d == '{')
+        {
+            const std::size_t e = text.find("#}", i + 2);
+            if (e == std::string::npos)
+                throw std::runtime_error("brae: unterminated #{ ... #} verbatim block");
+            // #eval's own block: keep it, whole, for expandEvalDirectives.
+            std::size_t b = out.size();
+            while (b > 0 && (out[b - 1] == ' ' || out[b - 1] == '\t')) --b;
+            const bool isEval = b >= 5 && out.compare(b - 5, 5, "#eval") == 0;
+            if (isEval)
+            {
+                out.append(text, i, e + 2 - i);
+            }
+            else
+            {
+                out += " __brae_verbatim_" + std::to_string(store.size()) + "__ ";
+                store.push_back(text.substr(i + 2, e - i - 2));
+            }
+            i = e + 1;
+            continue;
+        }
+        out += c;
+    }
+    return out;
+}
+
 } // namespace
 
 // #eval{...} / #calc "..." -- OF src/OpenFOAM/expressions. Run AFTER $macro expansion, because the
@@ -542,8 +608,11 @@ std::string expandEvalDirectives(const std::string& text)
 
 TokenStream::TokenStream(const std::string& path, bool expandVars)
 {
+    // Verbatim blocks first -- see captureVerbatim -- and once more after the includes, for a block that
+    // arrives inside an included fragment.
+    std::string txt = captureVerbatim(readWhole(path), verbatim_);
     // Expand #include directives at the text level (no-op unless a '#' is present, polyMesh stays untouched/fast).
-    std::string txt = expandIncludes(readWhole(path), dirOf(path), 0);
+    txt = captureVerbatim(expandIncludes(txt, dirOf(path), 0), verbatim_);
     // Then in-file $variable macros, if requested (field reader). Done AFTER includes so a var defined in an included
     // fragment is visible. expandDictVariables strips comments + substitutes $name/${name}; stripComments below is then
     // a no-op. polyMesh/non-field reads skip this entirely (expandVars=false).
@@ -569,6 +638,16 @@ TokenStream::TokenStream(const std::string& path, bool expandVars)
         i = 0; // no header, payload starts at the top
     }
     toks_.assign(all.begin() + i, all.end());
+}
+
+bool TokenStream::verbatim(const std::string& token, std::string& body) const
+{
+    static const std::string head = "__brae_verbatim_";
+    if (token.size() <= head.size() + 2 || token.compare(0, head.size(), head) != 0) return false;
+    const std::size_t n = std::strtoul(token.c_str() + head.size(), nullptr, 10);
+    if (n >= verbatim_.size()) return false;
+    body = verbatim_[n];
+    return true;
 }
 
 const std::string& TokenStream::peek() const

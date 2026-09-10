@@ -526,7 +526,7 @@ int runMirror(const std::string& caseDir)
     // announce those entries as unhonoured.
     brae::perPatchWallCoeffsHonoured() = true;
     RhoSimpleFields f = createFields(caseDir + "/" + startName, caseDir, simpleDict, &fvSolution,
-                                     m, g, patches, &thermoProps, turbProps.get());
+                                     m, g, patches, &thermoProps, turbProps.get(), wc.startTime());
     tracerCtx.f = &f;
     tracerCtx.m = &m;
     tracerCtx.g = &g;
@@ -670,6 +670,9 @@ int runMirror(const std::string& caseDir)
     while (time.loop())
     {
         const int iter = time.timeIndex();
+        // The iteration's time value, already advanced by loop() as OpenFOAM's is when the body runs:
+        // what a time-dependent boundary Function1 is evaluated at.
+        in.time = time.timeValue();
         const Residuals r = rhoSimpleStep(f, in, m, g, patches);
 
         auto res = [&](const char* k) { return r.count(k) ? (double)r.at(k) : 0.0; };
