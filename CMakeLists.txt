@@ -412,6 +412,10 @@ target_link_libraries(test_wall_function PRIVATE brae_core)
 add_test(NAME wall_function
          COMMAND test_wall_function ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily282)
 
+add_executable(test_leastsquares_grad tests/test_leastsquares_grad.cu)
+target_include_directories(test_leastsquares_grad PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_leastsquares_grad PRIVATE brae_core)
+
 add_executable(test_fvc_grad tests/test_fvc_grad.cu)
 target_include_directories(test_fvc_grad PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_fvc_grad PRIVATE brae_core)
@@ -2071,6 +2075,16 @@ set_tests_properties(flowrate_device_solver_vs_openfoam PROPERTIES
 # the INPUT entries OpenFOAM's own write() emits and its reader requires (`intensity`, `mixingLength`,
 # `rho`). A field-vs-field gate cannot see this, because it compares a file nothing reads back --
 # tests/written_bc_roundtrip_vs_openfoam.sh.
+# leastSquares gradient, host and device, against OpenFOAM's OWN grad(T) -- a 2x2 whose off-diagonal is
+# the control that the two schemes genuinely differ on this mesh, and whose fixture is 2-D so that
+# SymmTensor::safeInv (the singular empty direction) is exercised --
+# tests/leastsquares_grad_vs_openfoam.sh.
+add_test(NAME leastsquares_grad_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/leastsquares_grad_vs_openfoam.sh)
+set_tests_properties(leastsquares_grad_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
 add_test(NAME written_bc_roundtrip_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/written_bc_roundtrip_vs_openfoam.sh)
 set_tests_properties(written_bc_roundtrip_vs_openfoam PROPERTIES
