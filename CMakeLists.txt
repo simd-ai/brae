@@ -2374,6 +2374,17 @@ target_link_libraries(test_rho_create_fields_cpp PRIVATE brae_core)
 add_test(NAME rho_createfields_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_createfields_vs_openfoam.sh)
 
+# The ENERGY boundary conditions -- fixedEnergy/gradientEnergy/mixedEnergy updateCoeffs -- against
+# OpenFOAM's OWN coefficients, dumped by tools/dumpEnergyBC after he.boundaryField().updateCoeffs().
+# Coefficients rather than a converged field, because on perfectGas + hConst the live update is
+# arithmetically the static construction-time mapping and an end-to-end run cannot discriminate; three
+# controls (affine-instead-of-Cpv, T's value instead of its refValue, refGrad unscaled) can.
+add_executable(test_energy_bc tests/test_energy_bc.cu)
+target_include_directories(test_energy_bc PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_energy_bc PRIVATE brae_core)
+add_test(NAME energy_bc_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/energy_bc_vs_openfoam.sh)
+
 # rhoSimpleFoam's UEqn.H against OpenFOAM's own assembled momentum matrix (tools/dumpPEqn stage harness:
 # rAU, internalCoeffs, boundaryCoeffs). OpenFOAM's muEff is injected so this measures the ASSEMBLY and not
 # the unported compressible turbulence closure. Carries the control that distinguishes the compressible
