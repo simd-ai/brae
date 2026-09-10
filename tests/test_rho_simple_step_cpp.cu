@@ -710,12 +710,17 @@ int main(int argc, char** argv)
         std::printf("     %-34s %s\n", "unported-atm fixture not supplied", "SKIP");
     }
 
-    // ---- THE REFUSAL: `properties liquid` reaching a perfect-gas createFields ---------------------
-    // thermo_parse ACCEPTS the liquid thermo (the legacy binary carries the NSRDS path), so nothing
-    // upstream stops it, and before the guard nothing downstream checked f.thermo.model either: the
-    // rho seed, psi and he were all built from perfectGas formulae with the liquid's scalar Cp left at
-    // its default. The refusal must come from createFields itself and must name the liquid.
-    std::printf("  refusal -- properties liquid on the perfect-gas mirror path\n");
+    // ---- THE REFUSAL: a liquid thermo at temperatures it does not have ------------------------------
+    // Until stage H3.4 this block asserted that `properties liquid` was refused OUTRIGHT on the host arm,
+    // because everything downstream evaluated perfectGas + hConst. H3.4 routed every property through
+    // liquid_thermo.cuh and lifted that refusal; the liquid running correctly is gated by
+    // tests/liquid_thermo_vs_openfoam.sh, not here. What this fixture -- H2O dropped onto sbMatched's
+    // ~1000 K fields -- exercises NOW is the refusal that replaced it: T above H2O's critical point, where
+    // the density correlation is a NaN. OpenFOAM runs on that NaN (measured: every residual `nan` for 1000
+    // iterations); brae must refuse in createFields and name the range, NOT fall through to the first
+    // consumer of the NaN rho -- which before this refusal was the flow-rate inlet, and the message
+    // blamed it.
+    std::printf("  refusal -- a liquid thermo at temperatures outside its correlations\n");
     if (argc > 7)
     {
         bool threw = false;
@@ -726,8 +731,10 @@ int main(int argc, char** argv)
                                                simpleDict, &fvSolution, m, g, patches);
         }
         catch (const std::exception& e) { threw = true; msg = e.what(); }
-        check("a liquid thermo is refused", threw);
-        check("and the refusal names the liquid", msg.find("properties liquid") != std::string::npos);
+        check("a liquid above its critical point is refused", threw);
+        check("and the refusal names the substance and its range",
+              msg.find("H2O") != std::string::npos && msg.find("647.13") != std::string::npos);
+        check("and does NOT blame the flow-rate inlet", msg.find("flowRateInletVelocity") == std::string::npos);
     }
     else
     {

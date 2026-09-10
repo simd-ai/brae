@@ -1,0 +1,13 @@
+FoamFile { version 2.0; format ascii; class dictionary; object turbulenceProperties; }
+// The TURBULENT twin of validation/liqBox: same duct, same water, same walls. kEpsilon is what the
+// squareBendLiq tutorial runs, and it is the default here; the gate also runs kOmegaSST on the same
+// fields, because nothing about a liquid thermo is specific to one closure and a fix that only one of
+// them exercised would be a patch for a tutorial rather than a port. Both 0.orig/epsilon and
+// 0.orig/omega ship for that reason; each model reads only its own.
+simulationType RAS;
+RAS
+{
+    RASModel        kEpsilon;
+    turbulence      on;
+    printCoeffs     on;
+}

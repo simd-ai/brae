@@ -131,10 +131,10 @@ grep -q "atmNutkWallFunction" "$W/unportedatm/nut" \
 UNPORTEDATM="$W/unportedatm"
 fi
 
-# ...and a LIQUID thermo, which the parser ACCEPTS (the legacy binary carries the NSRDS path) and the
-# mirror createFields must therefore refuse itself -- everything downstream of it evaluates
-# perfectGas + hConst directly, and nothing else checks the model. Before the guard this ran a gas
-# equation of state against a liquid's (unset) coefficients.
+# ...and a LIQUID thermo dropped onto this fixture's ~1000 K fields. Until stage H3.4 the host arm
+# refused any liquid outright; it now runs one (tests/liquid_thermo_vs_openfoam.sh), and what this
+# fixture exercises is the refusal that replaced that one: T above H2O's critical point, where the
+# density correlation is a NaN that OpenFOAM runs on and brae must refuse by name.
 LIQUIDTHERMO="$W/liquidthermo"
 mkdir -p "$LIQUIDTHERMO/constant" "$LIQUIDTHERMO/system"
 cp -r "$SRC/constant/." "$LIQUIDTHERMO/constant/"
@@ -171,14 +171,31 @@ grep -q "fixedMean" "$UNMAINTAINED/p" \
 # tests/rho_turb_limitedlinear_vs_openfoam.sh against OpenFOAM run under the same mutation; the arms
 # here cover what STILL refuses: linearUpwind by name, and k/epsilon entries that disagree (the
 # closures carry one flag and coefficient for both scalars). An UNbounded upwind case must still run.
+# linearUpwind on the turbulence pair. Until stage H3.5 this arm asserted it was REFUSED; both host
+# closures assemble it now (gated against OpenFOAM on its own squareBendLiq tutorial,
+# tests/rho_squarebendliq_vs_openfoam.sh), so the arm asserts the two halves of the new contract: a
+# linearUpwind over a Gauss linear gradient RUNS, and one whose NAMED gradient resolves to a scheme the
+# closures do not compute for the correction is refused by name -- linearUpwind builds its correction
+# from mesh.gradScheme(<name>) (linearUpwind.C:61-68), so the name, not grad(k), decides it.
 TDIV="$W/turbdiv"
 rm -rf "$TDIV"; cp -r "$W/case" "$TDIV"
 sed -i 's/turbulence          bounded Gauss upwind;/turbulence          Gauss linearUpwind grad(k);/' "$TDIV/system/fvSchemes"
 grep -q "linearUpwind" "$TDIV/system/fvSchemes" || { echo "FAIL: turbdiv mutation did not apply"; exit 1; }
-tout=$("$BIN" "$TDIV" 0 3 2>&1) && { echo "FAIL: a linearUpwind turbulence scheme was not refused"; exit 1; }
-echo "$tout" | grep -q "linearUpwind" \
-    && echo "  turb-scheme arm: linearUpwind refused by name          ok" \
-    || { echo "$tout" | tail -5; echo "FAIL: the refusal does not name the scheme"; exit 1; }
+tout=$(stdbuf -oL "$BIN" "$TDIV" 0 3 2>&1) || true
+echo "$tout" | grep -q "iter    1" && ! echo "$tout" | grep -q "does not assemble" \
+    && echo "  turb-scheme arm: linearUpwind grad(k) runs             ok" \
+    || { echo "$tout" | tail -5; echo "FAIL: linearUpwind on the turbulence pair was refused or never ran"; exit 1; }
+
+TDIVL="$W/turbdivlsq"
+rm -rf "$TDIVL"; cp -r "$W/case" "$TDIVL"
+sed -i 's/turbulence          bounded Gauss upwind;/turbulence          Gauss linearUpwind lsqGrad;/' "$TDIVL/system/fvSchemes"
+sed -i 's/^    default             Gauss linear;$/    default             Gauss linear;\n    lsqGrad             leastSquares;/' "$TDIVL/system/fvSchemes"
+grep -q "lsqGrad             leastSquares;" "$TDIVL/system/fvSchemes" \
+    || { echo "FAIL: turbdivlsq mutation did not apply"; exit 1; }
+toutl=$("$BIN" "$TDIVL" 0 3 2>&1) && { echo "FAIL: linearUpwind over a leastSquares gradient was not refused"; exit 1; }
+echo "$toutl" | grep -q "Gauss linearUpwind lsqGrad, whose gradient resolves to" \
+    && echo "  turb-scheme arm: linearUpwind over leastSquares refused ok" \
+    || { echo "$toutl" | tail -5; echo "FAIL: the refusal does not name the scheme and its gradient"; exit 1; }
 
 TDIV3="$W/turbdiv3"
 rm -rf "$TDIV3"; cp -r "$W/case" "$TDIV3"

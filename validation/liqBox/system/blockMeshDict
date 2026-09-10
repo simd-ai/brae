@@ -1,0 +1,19 @@
+FoamFile { version 2.0; format ascii; class dictionary; object blockMeshDict; }
+// A 2 m x 0.02 m x 0.05 m duct, 60 x 20 x 1 = 1200 cells. The narrow channel is deliberate: the whole
+// point of this fixture is that limitTemperature's he bounds are FIELDS over the cell pressure, and a
+// liquid's Es carries -p/rho -- so the fixture has to develop a pressure DROP large enough that a
+// single scalar bound is measurably different from the per-cell one. At 5 m/s water this geometry runs
+// ~2.5e+02 Pa across the domain, which is 6.1e-05 K on a clamped cell: five orders above the gate floor.
+scale 1;
+vertices ( (0 0 0) (2 0 0) (2 0.02 0) (0 0.02 0) (0 0 0.05) (2 0 0.05) (2 0.02 0.05) (0 0.02 0.05) );
+blocks ( hex (0 1 2 3 4 5 6 7) (60 20 1) simpleGrading (1 1 1) );
+edges ();
+boundary
+(
+  inlet    { type patch; faces ( (0 4 7 3) ); }
+  outlet   { type patch; faces ( (1 2 6 5) ); }
+  hotWall  { type wall;  faces ( (0 1 5 4) ); }
+  coldWall { type wall;  faces ( (3 7 6 2) ); }
+  frontBack { type empty; faces ( (0 3 2 1) (4 5 6 7) ); }
+);
+mergePatchPairs ();

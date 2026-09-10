@@ -23,6 +23,8 @@ validation/*
 !validation/kEpsCase/
 !validation/incFR/
 !validation/pimFR/
+!validation/liqBox/
+!validation/liqBoxRAS/
 !validation/mixerVessel2D/
 !validation/kEpsCorrect/
 !validation/komegaCoeffs/
@@ -116,6 +118,10 @@ demo/delta/constant/polyMesh/
 demo/delta/constant/extendedFeatureEdgeMesh/
 demo/delta/constant/triSurface/*
 !demo/delta/constant/triSurface/README
+
+# wmake build output for the OpenFOAM oracle utilities under tools/. tools/dumpPEqn had its
+# Make/linuxARM64GccDPInt32Opt/ committed by accident; nothing regenerates from it and nothing reads it.
+tools/*/Make/linux*/
 
 .claude/*
 manifest/*

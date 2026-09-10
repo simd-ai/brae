@@ -38,4 +38,36 @@ echo "$out" | grep -qE "what\(\):.*(fvOption|semiImplicitSource)" \
     && echo "  fvOption refused                                 ok" \
     || { echo "$out" | tail -3; echo "FAIL: no fvOption REFUSAL fired"; fail=1; }
 
+# --- properties liquid -> refused on THIS arm, naming the liquid and the arm ----------------------
+# Stage H3.4 lifted the liquid refusal from createFields, which both arms share, because the HOST step
+# now evaluates every property through liquid_thermo.cuh. The device kernels still call the perfect-gas
+# closed forms, so createDeviceFields refuses instead -- and the harness, like the driver, passes through
+# it. The hot wall is lowered to 350 K so the case stays inside H2O's [273.16, 647.13] K: at the
+# fixture's own 700 K the HOST createFields range refusal would fire first and this arm would be
+# measuring that one instead.
+#
+# Fail-proof, measured by disabling the refusal and re-running: the harness then gets as far as the host
+# reference's thermo.correct(), where the new he -> T inversion refuses -- he = -84235.39 J/kg at cell 0,
+# T = nan -- because the device projection had built he with the PERFECT-GAS formula (Cv*T-scale numbers,
+# where H2O's Es is ~ -1.6e7). Not silent, thanks to the inversion's own check, but misattributed; with
+# the refusal it stops at the right place under the right name.
+mkarm
+cat > "$W/c/constant/thermophysicalProperties" <<'TEOF'
+FoamFile { version 2.0; format ascii; class dictionary; object thermophysicalProperties; }
+thermoType { type heRhoThermo; mixture pureMixture; properties liquid; energy sensibleInternalEnergy; }
+mixture { H2O; }
+TEOF
+sed -i 's/hotWall  { type fixedValue; value uniform 700; }/hotWall  { type fixedValue; value uniform 350; }/' "$W/c/0.orig/T"
+grep -q "uniform 350" "$W/c/0.orig/T" || { echo "FAIL: could not lower the hot wall into H2O's range"; fail=1; }
+# A liquid is sensibleInternalEnergy, so the energy variable is `e` and the kinetic term `Ekp`; rhoBox
+# ships `h` and `K`. Without these the arm is refused on the missing div(phi,e) scheme -- a correct
+# refusal, and not the one this arm exists to see.
+sed -i 's/    div(phi,h) bounded Gauss upwind;/    div(phi,e) bounded Gauss upwind;/; s/    div(phi,K) bounded Gauss upwind;/    div(phi,Ekp) bounded Gauss upwind;/' "$W/c/system/fvSchemes"
+grep -q "div(phi,e)" "$W/c/system/fvSchemes" && grep -q "div(phi,Ekp)" "$W/c/system/fvSchemes" \
+    || { echo "FAIL: could not give the liquid arm its energy schemes"; fail=1; }
+out=$("$BIN" "$W/c" 0.orig 2 2>&1) && { echo "FAIL: a liquid thermo ran on the CUDA path"; fail=1; }
+echo "$out" | grep -q "what():.*CUDA arm implements perfectGas.*properties liquid" \
+    && echo "  properties liquid refused on the CUDA arm        ok" \
+    || { echo "$out" | tail -3; echo "FAIL: no CUDA-arm liquid REFUSAL fired"; fail=1; }
+
 [ $fail = 0 ] && echo PASS || { echo FAIL; exit 1; }

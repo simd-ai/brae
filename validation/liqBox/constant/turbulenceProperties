@@ -1,0 +1,6 @@
+FoamFile { version 2.0; format ascii; class dictionary; object turbulenceProperties; }
+// LAMINAR on purpose. This fixture exists to measure the THERMO -- the property correlations, the
+// he -> T inversion and limitTemperature's per-cell bounds -- and a closure between them and the
+// answer is one more thing that has to be right before the measurement means anything. The turbulent
+// liquid case is squareBendLiq, which this fixture is the small precursor to.
+simulationType laminar;

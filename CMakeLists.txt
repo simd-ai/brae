@@ -2379,11 +2379,37 @@ add_test(NAME rho_createfields_vs_openfoam
 # Coefficients rather than a converged field, because on perfectGas + hConst the live update is
 # arithmetically the static construction-time mapping and an end-to-end run cannot discriminate; three
 # controls (affine-instead-of-Cpv, T's value instead of its refValue, refGrad unscaled) can.
+# brae's cellLimited Gauss linear gradient against OpenFOAM's own (tools/dumpLimitedGrad), cell by cell.
+add_executable(test_limited_grad tests/test_limited_grad.cu)
+target_include_directories(test_limited_grad PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_limited_grad PRIVATE brae_core)
+
 add_executable(test_energy_bc tests/test_energy_bc.cu)
 target_include_directories(test_energy_bc PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_energy_bc PRIVATE brae_core)
 add_test(NAME energy_bc_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/energy_bc_vs_openfoam.sh)
+
+# `properties liquid` END TO END on the host mirror arm (stage H3.4): the NSRDS property correlations,
+# OpenFOAM's own he -> T inversion seeded from the cell's previous T, and limitTemperature's he bounds
+# as FIELDS over the cell pressure. validation/liqBox, 1200 cells, laminar, against real OpenFOAM.
+add_test(NAME liquid_thermo_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/liquid_thermo_vs_openfoam.sh)
+set_tests_properties(liquid_thermo_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# A TURBULENT liquid end to end (stage H3.5): kEpsilon AND kOmegaSST on validation/liqBoxRAS with
+# squareBendLiq's own wall-function and turbulent-inlet set, at iterations 1 and 200, fields and the
+# wall functions' patch values. The liquid enters the closure only through nu = mu(T)/rho(T).
+add_test(NAME liquid_turbulence_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/liquid_turbulence_vs_openfoam.sh)
+set_tests_properties(liquid_turbulence_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# squareBendLiq, OpenFOAM's own turbulent liquid tutorial, iteration by iteration on kEpsilon AND
+# kOmegaSST: the four generic defects stage H3.5 found there (linearUpwind on the turbulence pair, the
+# grad(k)/grad(epsilon) slot, linearUpwind's named gradient on U, the wall-function-only patch update).
+add_test(NAME rho_squarebendliq_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_squarebendliq_vs_openfoam.sh)
+set_tests_properties(rho_squarebendliq_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
 # rhoSimpleFoam's UEqn.H against OpenFOAM's own assembled momentum matrix (tools/dumpPEqn stage harness:
 # rAU, internalCoeffs, boundaryCoeffs). OpenFOAM's muEff is injected so this measures the ASSEMBLY and not
