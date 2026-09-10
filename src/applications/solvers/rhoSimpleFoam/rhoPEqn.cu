@@ -158,6 +158,40 @@ void refuseUnsupported(const RhoPressureInput& in)
     }
 }
 
+
+// The STORED patch values, when the caller carries them (RhoPressureInput::pBndFace and UxBndFace/
+// UyBndFace/UzBndFace): what each field's last evaluate left, which is what OpenFOAM's pressure equation
+// reads through the patch fields and rhoPEqn_cpp.cu through boundary[pi]->value(). Null keeps the
+// re-evaluation against the cells as they stand -- the same number only while nothing has moved since.
+void storedOrEvaluatedP(
+    const RhoPressureInput&     in,
+    int                         nBndFaces,
+    const DeviceBoundary&       dbP,
+    const DeviceBuffer<scalar>& p,
+    DeviceBuffer<scalar>&       out)
+{
+    if (in.pBndFace && in.pBndFace->size() == static_cast<std::size_t>(nBndFaces)) deviceCopy(out, *in.pBndFace);
+    else                                                                              deviceBCValue(dbP, p, out);
+}
+
+void storedOrEvaluatedU(
+    const RhoPressureInput&      in,
+    int                          nBndFaces,
+    const DeviceVectorBoundary&  dbU,
+    const DeviceBuffer<scalar>&  Uk,
+    int                          k,
+    DeviceBuffer<scalar>&        out)
+{
+    const DeviceBuffer<scalar>* stored[3] = { in.UxBndFace, in.UyBndFace, in.UzBndFace };
+    // all three or none: never a stored component beside a re-derived one in the same flux
+    const bool all = in.UxBndFace && in.UyBndFace && in.UzBndFace
+                  && in.UxBndFace->size() == static_cast<std::size_t>(nBndFaces)
+                  && in.UyBndFace->size() == static_cast<std::size_t>(nBndFaces)
+                  && in.UzBndFace->size() == static_cast<std::size_t>(nBndFaces);
+    if (all) deviceCopy(out, *stored[k]);
+    else     deviceBCValue(dbU.comp[k], Uk, out);
+}
+
 } // namespace
 
 
@@ -241,7 +275,7 @@ void pressurePredictor(
     for (int k = 0; k < 3; ++k)
     {
         DeviceBuffer<scalar> Ub;
-        deviceBCValue(dbU.comp[k], *U[k], Ub);
+        storedOrEvaluatedU(in, dm.nBndFaces, dbU, *U[k], k, Ub);
         st.HbyAb[k].resize(dm.nBndFaces);
         if (dm.nBndFaces > 0)
         {
@@ -272,7 +306,7 @@ void pressurePredictor(
     // boundary values (the constrainHbyA loop's Ub buffers are per-component temporaries).
     {
         DeviceBuffer<scalar> ub[3], sfUBnd;
-        for (int k = 0; k < 3; ++k) deviceBCValue(dbU.comp[k], *U[k], ub[k]);
+        for (int k = 0; k < 3; ++k) storedOrEvaluatedU(in, dm.nBndFaces, dbU, *U[k], k, ub[k]);
         deviceBoundaryFlux(dm, ub[0], ub[1], ub[2], sfUBnd);
         deviceConstrainPressure(dbP, st.phiHbyABnd, sfUBnd, in.rhoBndFace->data(), st.rhorAUfBnd);
     }
@@ -305,7 +339,7 @@ void pressurePredictor(
         DeviceBuffer<scalar> psip, psipfInt, pBnd, psipBnd;
         deviceHadamard(psip, *in.psiCell, p);
         deviceInterpolate(dm, psip, psipfInt);
-        deviceBCValue(dbP, p, pBnd);
+        storedOrEvaluatedP(in, dm.nBndFaces, dbP, p, pBnd);
         deviceHadamard(psipBnd, *in.psiBndFace, pBnd);
 
         if (st.phiHbyAInt.size())
@@ -369,7 +403,7 @@ void assemblePEqn(
     if (in.correctedLaplacian)
     {
         DeviceBuffer<scalar> pb, gx, gy, gz, lc;
-        deviceBCValue(dbP, p, pb);
+        storedOrEvaluatedP(in, dm.nBndFaces, dbP, p, pb);
         deviceGaussGrad(dm, p, pb, gx, gy, gz);
         // The explicit half: source gets -V*div(gamma*magSf*(corrVec & interp(grad p))), which
         // deviceLaplacianCorr already returns pre-negated (device_mesh.cuh:288), hence the +1 here.

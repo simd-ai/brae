@@ -234,6 +234,25 @@ void assembleUEqn(
     const DeviceBuffer<scalar>& Uz,
     const RhoMomentumInput&     in)
 {
+    // U's PATCH values for every gradient this assembly forms: the STORED ones the caller carries
+    // (in.UxBndFace/UyBndFace/UzBndFace, refreshed exactly where the host reference calls
+    // U.evaluateBoundary), never a re-evaluation against the cells as they stand. The host's
+    // fvc::gaussGrad sums U.boundary[pi]->value() (fvc.cu:189) and OpenFOAM's gaussGrad the patch field
+    // itself; re-deriving here is the same number only while the cells have not moved since that
+    // evaluate. Measured on aerofoilNACA0012's freestream inlet at iteration 2: the momentum source
+    // 8.8e-05 off the host on 182 of the inlet's 200 cells with every coefficient at 1e-14, then U 4.4e-09
+    // and p 1.5e-07 against OpenFOAM; iteration 1 exact because the start state is uniform. All three or
+    // none, as divDevReff's ubStored below already insists.
+    const DeviceBuffer<scalar>* storedUb[3] = { in.UxBndFace, in.UyBndFace, in.UzBndFace };
+    const bool haveStoredUb = in.UxBndFace && in.UyBndFace && in.UzBndFace
+                           && in.UxBndFace->size() == static_cast<std::size_t>(dm.nBndFaces)
+                           && in.UyBndFace->size() == static_cast<std::size_t>(dm.nBndFaces)
+                           && in.UzBndFace->size() == static_cast<std::size_t>(dm.nBndFaces);
+    auto patchU = [&](int k, const DeviceBuffer<scalar>& cells, DeviceBuffer<scalar>& out)
+    {
+        if (haveStoredUb) deviceCopy(out, *storedUb[k]);
+        else              deviceBCValue(dbU.comp[k], cells, out);
+    };
     refuseUnsupported(dm, in);
 
     // mu_eff, before anything reads it.
@@ -294,7 +313,7 @@ void assembleUEqn(
             for (int k = 0; k < 3; ++k)
             {
                 deviceCopy(Uarr[k], *Usrc[k]);
-                deviceBCValue(dbU.comp[k], *Usrc[k], ub[k]);
+                patchU(k, *Usrc[k], ub[k]);
             }
             const DeviceBuffer<scalar>* ubp[3] = {&ub[0], &ub[1], &ub[2]};
             deviceGaussGradFused(dm, 3, Usrc, ubp, gx, gy, gz);
@@ -334,7 +353,7 @@ void assembleUEqn(
             zeroBuffer(m2b, dm.nBndFaces);
             for (int k = 0; k < 3; ++k)
             {
-                deviceBCValue(dbU.comp[k], *U3[k], ub);
+                patchU(k, *U3[k], ub);
                 deviceHadamard(t, ub, ub);
                 deviceAxpy(1.0, t, m2b);
             }
@@ -494,7 +513,7 @@ void assembleUEqn(
         DeviceBuffer<scalar> gxc[3], gyc[3], gzc[3], ub[3];
         for (int k = 0; k < 3; ++k)
         {
-            deviceBCValue(dbU.comp[k], *U[k], ub[k]);
+            patchU(k, *U[k], ub[k]);
         }
         const DeviceBuffer<scalar>* ubp[3] = {&ub[0], &ub[1], &ub[2]};
         deviceGaussGradFused(dm, 3, U, ubp, gxc, gyc, gzc);
@@ -554,7 +573,7 @@ void assembleUEqn(
         DeviceBuffer<scalar> gx[3], gy[3], gz[3], ub[3], cx, cy, cz;
         for (int k = 0; k < 3; ++k)
         {
-            deviceBCValue(dbU.comp[k], *Usrc[k], ub[k]);
+            patchU(k, *Usrc[k], ub[k]);
         }
         const DeviceBuffer<scalar>* ubp[3] = {&ub[0], &ub[1], &ub[2]};
         deviceGaussGradFused(dm, 3, Usrc, ubp, gx, gy, gz);   // one launch, not three
@@ -588,7 +607,7 @@ void assembleUEqn(
         DeviceBuffer<scalar> ub[3], gx[3], gy[3], gz[3];
         for (int k = 0; k < 3; ++k)
         {
-            deviceBCValue(dbU.comp[k], *U[k], ub[k]);
+            patchU(k, *U[k], ub[k]);
         }
         const DeviceBuffer<scalar>* ubp[3] = {&ub[0], &ub[1], &ub[2]};
         deviceGaussGradFused(dm, 3, U, ubp, gx, gy, gz);   // one launch, not three

@@ -250,6 +250,20 @@ void storeTotalPressureValueKernel(
     refValue[i] = pBnd[i];
 }
 
+// The forward twin of storeTotalPressureValueKernel: a fresh evaluate taken onto f.pBnd on the
+// totalPressure faces ONLY, every other face keeping the value its last evaluate (or p.relax) left.
+__global__
+void takeTotalPressureFacesKernel(
+    int    n,
+    const label*  __restrict__ tpMask,
+    const scalar* __restrict__ fresh,
+    scalar*       __restrict__ pBnd)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || !tpMask[i]) return;
+    pBnd[i] = fresh[i];
+}
+
 } // namespace
 
 
@@ -927,6 +941,8 @@ Residuals rhoSimpleStep(
     RhoPressureInput pin;
     pin.rhoCell = &f.rho;            pin.rhoBndFace = &f.rhoBnd;
     pin.psiCell = &f.psi;            pin.psiBndFace = &f.psiBnd;
+    pin.pBndFace = &f.pBnd;
+    pin.UxBndFace = &f.UxBnd;        pin.UyBndFace = &f.UyBnd;        pin.UzBndFace = &f.UzBnd;
     pin.transonic = in.transonic;
     pin.relaxP = in.relaxPEqn;
     pin.relaxPSpecified = in.relaxPEqnSpecified;
@@ -977,7 +993,20 @@ Residuals rhoSimpleStep(
     if (in.hasMixed) deviceUpdateMixedFreestream(dbU, dbP, f.phiBnd, f.Ux, f.Uy, f.Uz, &f.rhoBnd, /*which=*/2,
                                                      &f.UxBnd, &f.UyBnd, &f.UzBnd);
     deviceUpdateTotalPressure(dbP, f.phiBnd, f.UxBnd, f.UyBnd, f.UzBnd, &f.rhoBnd);
-    deviceBCValue(dbP, f.p, f.pBnd);
+    // updateCoeffs changes no other patch's VALUE: totalPressure's operator== is inside its own
+    // updateCoeffs, and a mixed or zeroGradient face keeps the blend p.relax() left until the limiter's
+    // correctBoundaryConditions (pEqn.H:100-103) -- rhoSimpleFoam_cpp.cu's updateTotalPressure with
+    // evaluateAll = false. This used to re-evaluate EVERY face here, so the freestream faces entered the
+    // pressure equation one evaluate ahead of OpenFOAM's: the p level 1.3e-01 off the host at iteration 2.
+    {
+        DeviceBuffer<scalar> fresh;
+        deviceBCValue(dbP, f.p, fresh);
+        if (dbP.n > 0)
+        {
+            takeTotalPressureFacesKernel<<<(dbP.n + 255) / 256, 256>>>(dbP.n, dbP.tpMask.data(), fresh.data(), f.pBnd.data());
+            cudaCheck(cudaGetLastError(), "rhoSimpleFoam takeTotalPressureFaces");
+        }
+    }
 
     // The non-orthogonal corrector loop. solutionControlI.H:78-95 runs it nNonOrth+1 times, and only the
     // FINAL pass writes phi (simple.finalNonOrthogonalIter()).

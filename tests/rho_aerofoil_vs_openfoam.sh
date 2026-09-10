@@ -31,19 +31,29 @@
 # The control: replacing freestreamVelocity with fixedValue on all three codes collapsed the whole
 # disagreement to 2.5e-12 at every iteration, before any fix.
 #
-# WHAT THIS GATE DOES NOT CLAIM. A THIRD gap survives from ITERATION 2 in U and p only -- U 4.4e-09,
-# p 1.5e-07, with k, omega and nut at 2e-09 and below -- which is why iterations 2 and 3 keep the 1e-06
-# CUDA bound while iteration 1 is held to the host's. It is untouched by either fix above (identical to
-# four digits before and after) and lives in the momentum/pressure path, not the closure.
+# THE THIRD DEFECT, THE SAME CLASS, ON THE MOMENTUM AND PRESSURE SIDES. With the closure exact the CUDA arm
+# still read U 4.4e-09 and p 1.5e-07 from iteration 2. The solver's stage dump (BRAE_STAGE_DUMP_DIR) put
+# the first disagreement in the momentum SOURCE -- every coefficient at 1e-14, the source 8.8e-05 off on
+# 182 of the inlet's 200 cells -- and, once that was closed, in the pressure equation as a near-uniform
+# LEVEL shift (p 1.3e-01 on ~1e5, mean -9.6e-03, std 1.6e-02: the farfield freestreamPressure patch pins
+# the level). Both were the device re-evaluating a patch value against the cells as they stand where
+# OpenFOAM and the host read the field's STORED value: rhoUEqn.cu's five gradient sites (the host's
+# fvc::gaussGrad sums U.boundary[pi]->value(), fvc.cu:189), rhoPEqn.cu's and rhoPcEqn.cu's HbyA
+# boundary, constrainPressure's Sf&U_b, the psi*p boundary and the non-orthogonal grad(p)
+# (rhoPEqn_cpp.cu:184, :221, :256, :303), and the driver's pre-assembly p evaluate, which touched every
+# face where the host's updateTotalPressure(evaluateAll = false) touches only the totalPressure faces --
+# "a mixed or zeroGradient face keeps the blend p.relax() left". Each now takes the stored value the
+# driver carries (f.UxBnd/UyBnd/UzBnd, f.pBnd). After: every field on the CUDA arm at 1.2e-12 to 2.8e-12
+# at every iteration, the host's own numbers.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae_rhoSimpleFoam}"
 OFBASHRC=${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
 ITERS=3
 HOSTBOUND=1e-11      # measured: every field <= 2.8e-12 at every iteration
-CUDABOUND=1e-06      # iterations 2+: the open U/p gap above -- p reaches 2.8e-07 at iteration 3
-CUDABOUND1=1e-11     # ITERATION 1 is held to the host's bound: the freestream fix put every field at 2.7e-12
-OMEGABOUND=1e-07     # the limiter's own signature: 4.0e-09 with it, 3.7e-03 without
+CUDABOUND=1e-11      # the same, at every iteration: nothing is left to bound around on this tutorial
+CUDABOUND1=1e-11
+OMEGABOUND=1e-11     # was 1e-07 while the iteration-2 gap stood; the limiter's signature is 3.7e-03 without it
 
 [ -x "$BRAE" ]     || { echo "SKIP: no brae binary at $BRAE"; exit 77; }
 [ -f "$OFBASHRC" ] || { echo "SKIP: real OpenFOAM not available"; exit 77; }

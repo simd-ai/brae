@@ -2433,14 +2433,28 @@ add_test(NAME rho_generalized_newtonian_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_generalized_newtonian_vs_openfoam.sh)
 set_tests_properties(rho_generalized_newtonian_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
+# THE SIX rhoSimpleFoam TUTORIALS as OpenFOAM ships them, on both mirror arms, meshed by each tutorial's
+# own Allrun.pre -- the standing answer to which of them brae runs and which it refuses. The two halves
+# are each other's control: four must RUN and agree with OpenFOAM (a guard drawn too wide turns it red),
+# two must REFUSE BY NAME (a brae that started running a scheme or boundary condition it does not
+# implement turns it red). Breadth, not depth: three iterations, with the per-component depth left to the
+# dedicated gates. Slow -- it meshes snappyHexMesh's injectorPipe -- and labelled so.
+add_test(NAME rho_tutorials_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_tutorials_vs_openfoam.sh)
+set_tests_properties(rho_tutorials_vs_openfoam PROPERTIES
+                     SKIP_RETURN_CODE 77
+                     LABELS slow
+                     TIMEOUT 3600)
+
 # aerofoilNACA0012, the only rhoSimpleFoam tutorial naming `cellLimited Gauss linear 1` for grad(k) and
 # grad(omega) as well as grad(U), on BOTH mirror arms. CDkOmega takes fvc::grad(k) & fvc::grad(omega),
 # which resolve their scheme by field name, so this case limits them where every other fixture does not
 # -- the device arm took the plain Gauss gradient and no gate ran it (naca_vs_openfoam drives the
-# pre-mirror path; limit_temperature runs this tutorial on the host arm only). The CUDA bound is 1e-06
-# and not the host's 1e-11 because of a SECOND, open device gap at iteration 1 that the script names and
-# measures; the omega bound of 1e-07 is the tight one the limiter fix owns (3.8e-09 with it, 3.7e-03
-# without).
+# pre-mirror path; limit_temperature runs this tutorial on the host arm only). Three device defects were
+# found on it, all of the same class -- a patch value re-evaluated against the cells as they stand where
+# OpenFOAM reads the field's STORED value -- in the closure's freestreamVelocity Up, the momentum
+# gradients and the pressure equation; the script carries each measurement. Both arms are held to 1e-11
+# on every field at every iteration.
 add_test(NAME rho_aerofoil_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_aerofoil_vs_openfoam.sh)
 set_tests_properties(rho_aerofoil_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)

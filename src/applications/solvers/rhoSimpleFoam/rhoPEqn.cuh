@@ -93,6 +93,19 @@ struct RhoPressureInput
     const DeviceBuffer<scalar>* psiCell    = nullptr;   // nCells
     const DeviceBuffer<scalar>* psiBndFace = nullptr;   // boundary faces
 
+    // The STORED patch values of p and U -- what each field's last evaluate left, which is what OpenFOAM's
+    // pressure equation reads through the patch fields and what rhoPEqn_cpp.cu reads through
+    // boundary[pi]->value() (:184 HbyA's boundary, :221 constrainPressure's Sf&U_b, :256 psi*p's boundary,
+    // :303 the non-orthogonal grad(p)). This arm stores no patch values of its own, so the driver hands
+    // them in (f.pBnd, f.UxBnd/UyBnd/UzBnd); null keeps the old re-evaluation against the cells as they
+    // stand, which is the same number only while nothing has moved since that evaluate. Measured on
+    // aerofoilNACA0012 at iteration 2 with the momentum equation already matched to 6.6e-10: p a near-
+    // uniform 1.3e-01 level shift on ~1e5 (1.5e-07 relative), phi 3.5e-06, U 9.3e-06 against the host.
+    const DeviceBuffer<scalar>* pBndFace  = nullptr;
+    const DeviceBuffer<scalar>* UxBndFace = nullptr;   // all three or none: never a stored component
+    const DeviceBuffer<scalar>* UyBndFace = nullptr;   // beside a re-derived one in the same flux
+    const DeviceBuffer<scalar>* UzBndFace = nullptr;
+
     // polyMesh::solutionD(), +1 / -1 per component, as the step's own StepInput carries it. The
     // momentum solve already skips a knocked-out component (rhoSimpleFoam.cu, fvMatrixSolve.C:157-164);
     // fvMatrix<Type>::H() has to zero the same one, because H is where the skipped direction would
