@@ -769,6 +769,12 @@ public:
     }
     std::vector<T> gradientBoundaryCoeffs() const override { return grad_; }
 
+    // OF writes `gradient() = ...` directly on the patch. gradientEnergy does it every updateCoeffs
+    // (gradientEnergyFvPatchScalarField.C:111-116), rebuilding he's prescribed gradient from T's snGrad
+    // and the CURRENT Cpv, so the energy boundary needs a public setter and not only
+    // fixedFluxPressure's updateSnGrad(), which is gated behind updateableSnGrad().
+    void setGradient(std::vector<T> g) { grad_ = std::move(g); }
+
 protected:
     std::vector<T> grad_;   // writable by fixedFluxPressure's updateSnGrad
 
@@ -1197,13 +1203,15 @@ public:
     // OpenFOAM converges to; on airFoil2D its inlet p runs 0.74 to -1.77 across the patch, and the
     // pressure residual at OpenFOAM's own converged state was 17x worse without this.
     //
-    // GATED ON `freestream_`, and the reason is not caution. OF's evaluate calls updateCoeffs() FIRST, and
-    // the other shape this class serves -- the `mixed` T patch basicThermo maps onto mixedEnergy --
-    // overrides updateCoeffs to rebuild refValue/refGrad/valueFraction in ENERGY space from the thermo.
-    // brae carries no such conversion, so its seeded valueFraction is not the one OF blends with, and
-    // blending on it measurably disagrees (mx_vs_openfoam, hotWall: OF 467.8 against a blended 367.9).
-    // The freestream family is maintained -- updateMixedFreestream rewrites vf from the flow angle every
-    // iteration -- so the blend runs exactly where its inputs are real.
+    // GATED ON `vfUpdated_`, and the reason is not caution. OF's evaluate calls updateCoeffs() FIRST, so
+    // a blend is only defined once a real valueFraction has been computed for these faces. The freestream
+    // family gets one from updateMixedFreestream, inletOutlet/outletInlet from updateFromFlux, a plain
+    // `mixed` from its own dictionary at construction, and the `mixed` T patch basicThermo maps onto
+    // mixedEnergy gets all three of refValue/refGrad/valueFraction rebuilt in ENERGY space every energy
+    // assembly (energy_boundary.cuh, stage H3.3). An earlier version of this comment said brae carried no
+    // such conversion and that blending without it measurably disagreed (mx_vs_openfoam, hotWall: OF
+    // 467.8 against a blended 367.9); the conversion exists now and is gated at 0.0 against OpenFOAM's
+    // own coefficients by tests/energy_bc_vs_openfoam.sh.
     void evaluate(const std::vector<T>& internal) override
     {
         // OF's evaluate calls updateCoeffs() FIRST, and for this family updateCoeffs IS the flow-angle

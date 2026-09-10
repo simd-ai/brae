@@ -509,10 +509,11 @@ RhoSimpleFields createFields(
     //                                                        MIXTURES, and pureMixture has one)
     //     fixedGradient -> fixedGradient on Cpv*grad(T)      gradientEnergy with that zero second term:
     //                                                        gradient() = Cpv(pw,Tw)*Tw.snGrad()
-    //                                                        (gradientEnergyFvPatchScalarField.C:99-105),
-    //                                                        and Cpv is the CONSTANT Cp (or Cv = Cp - R
-    //                                                        for sensibleInternalEnergy) under hConst --
-    //                                                        so the mapping is static and exact. The
+    //                                                        (gradientEnergyFvPatchScalarField.C:99-105).
+    //                                                        Under hConst Cpv is the constant Cp (or
+    //                                                        Cv = Cp - R for sensibleInternalEnergy), so
+    //                                                        the seed below and the live update agree
+    //                                                        face for face on the gas path. The
     //                                                        gradient SCALES by Cpv; it must not go
     //                                                        through heOf, which is affine -- applying an
     //                                                        offset to a slope is the trap the mx/hf
@@ -522,20 +523,27 @@ RhoSimpleFields createFields(
     //                      refGrad  -> Cpv*refGrad_T         same zero second term
     //     inletOutlet   -> inletOutlet  on he(T_inletValue)  exact: mixedEnergy is the same mixed BC with
     //                                                        the energy refValue
-    // A multi-species mixture revives the second term, and a thermo whose Cpv varies breaks the static
-    // scaling; the refusal below is what stops either from becoming a silent wrong answer.
+    // A multi-species mixture revives the second term; the refusal below is what stops one becoming a
+    // silent wrong answer.
+    //
+    // SEED ONLY, since stage H3.3. What this block writes is he's state at construction -- before the
+    // first energy assembly -- and updateEnergyBoundaryCoeffs (energy_boundary.cuh) rebuilds the
+    // fixedValue/fixedGradient/mixed coefficients from the live p and T at every assembly thereafter,
+    // exactly as OpenFOAM's three energy conditions do. It stays here rather than being deleted because
+    // a construction-time he is a real state: `he.evaluateBoundary()` below runs on it, and the patches
+    // the live update leaves alone (calculated, and the constraint types) keep it for the whole run.
+    // The static mapping and the live one agree number for number on the gas path, which is what makes
+    // this stage a no-op there.
     {
-        auto heOf = [&](scalar T)
-        {
-            const scalar hs = f.thermo.Cp * (T - f.thermo.Tref) + f.thermo.Href;
-            // e = h - p/rho = h - R*T for a perfect gas. Hf, the heat of formation, belongs to the
-            // ABSOLUTE enthalpy only and must not appear in the sensible energy EEqn transports.
-            return (f.heName == "e") ? hs - f.thermo.R * T : hs;
-        };
+        // THE PROPERTY ACCESSOR, not the hConst closed form this block used to inline. thermoHeOf is
+        // p-dependent on the liquid arm (Es = h(T) - p/rho(T)), so the seed is now built face by face
+        // against p's own boundary values rather than by mapping a dictionary's `uniform` entry, which
+        // has no pressure to be evaluated at.
+        auto heOf = [&](scalar pAt, scalar T) { return thermoHeOf(pAt, T, f.thermo); };
         FieldData<scalar> heFd;
         heFd.internalUniform = false;
         heFd.internalField.resize(nC);
-        for (label c = 0; c < nC; ++c) heFd.internalField[c] = heOf(f.T.internal[c]);
+        for (label c = 0; c < nC; ++c) heFd.internalField[c] = heOf(f.p.internal[c], f.T.internal[c]);
         // OVER THE MESH'S PATCHES, not over the file's entries. OpenFOAM resolves each PATCH to an entry
         // by name, then by group, then by regex, and an entry matching no patch is simply unused. Walking
         // the entries instead refuses on ones that were never going to apply: every modern tutorial
@@ -564,21 +572,48 @@ RhoSimpleFields createFields(
                     "ENERGY ones (basicThermo::heBoundaryTypes) and brae implements that mapping only "
                     "where it is exact for perfectGas+hConst. Refusing rather than transporting an "
                     "energy under a temperature's boundary condition.");
-            b.uniformValue     = heOf(tb.uniformValue);
-            for (auto& v : b.values)      v = heOf(v);
-            b.refValueUniformValue = heOf(tb.refValueUniformValue);   // mixed's refValue slot
-            for (auto& v : b.refValues)   v = heOf(v);
-            b.inletUniformValue = heOf(tb.inletUniformValue);
-            for (auto& v : b.inletValues) v = heOf(v);
+            // PER FACE, against this patch's own p and T. A dictionary entry is `uniform 300` or a list;
+            // he's is neither once the thermo is p-dependent, so every slot is expanded to the patch's
+            // face count and each face converted at its own pressure. On the gas path thermoHeOf ignores
+            // p and every face gets the same number, which is the entry this block used to write.
+            const std::vector<scalar>& pw = f.p.boundary[pi]->value();
+            const std::vector<scalar>& Tw = f.T.boundary[pi]->value();
+            const label np = patches[pi].size;
+            auto perFace = [&](bool uniform, scalar uval, const std::vector<scalar>& vals)
+            {
+                std::vector<scalar> r(static_cast<std::size_t>(np));
+                for (label i = 0; i < np; ++i)
+                    r[static_cast<std::size_t>(i)] =
+                        uniform ? uval
+                                : (static_cast<std::size_t>(i) < vals.size() ? vals[static_cast<std::size_t>(i)]
+                                                                             : scalar(0));
+                return r;
+            };
+            auto mapValues = [&](std::vector<scalar> v)
+            {
+                for (label i = 0; i < np; ++i)
+                    v[static_cast<std::size_t>(i)] = heOf(pw[static_cast<std::size_t>(i)],
+                                                          v[static_cast<std::size_t>(i)]);
+                return v;
+            };
+            b.valueUniform     = false;
+            b.values           = mapValues(perFace(tb.valueUniform, tb.uniformValue, tb.values));
+            b.refValueUniform  = false;                               // mixed's refValue slot
+            b.refValues        = mapValues(perFace(tb.refValueUniform, tb.refValueUniformValue, tb.refValues));
+            b.inletUniform     = false;
+            b.inletValues      = mapValues(perFace(tb.inletUniform, tb.inletUniformValue, tb.inletValues));
             // The GRADIENT slots (fixedGradient's `gradient`, mixed's `refGradient`) SCALE by Cpv --
             // never heOf, which is affine: an offset applied to a slope was worth 7.97e-03 on rhoBoxQ's
-            // T when the mx/hf controls first measured it. Cpv is constant under hConst, which is what
-            // makes this static mapping exact (gradientEnergy/mixedEnergy re-evaluate it live).
+            // T when the mx/hf controls first measured it. Cpv comes from thermoCpvOf at this face's own
+            // p and T rather than from the hConst constant, which is the same number on the gas path and
+            // a correlation on the liquid one.
             if (tb.hasGradient)
             {
-                const scalar Cpv = (f.heName == "e") ? f.thermo.Cp - f.thermo.R : f.thermo.Cp;
-                b.gradientUniformValue = Cpv * tb.gradientUniformValue;
-                for (auto& g : b.gradientValues) g = Cpv * g;
+                b.gradientUniform = false;
+                b.gradientValues  = perFace(tb.gradientUniform, tb.gradientUniformValue, tb.gradientValues);
+                for (label i = 0; i < np; ++i)
+                    b.gradientValues[static_cast<std::size_t>(i)] *=
+                        thermoCpvOf(pw[static_cast<std::size_t>(i)], Tw[static_cast<std::size_t>(i)], f.thermo);
             }
             heFd.boundary.push_back(std::move(b));
         }

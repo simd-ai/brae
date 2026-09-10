@@ -2,6 +2,7 @@
 #include "limit_temperature_report.cuh"   // OF prints LimitedCells on every limitTemperature call
 #include "rhoSimpleFoam_cpp.cuh"
 #include "liquid_thermo.cuh"   // thermo*Of: ONE branch point between the gas and liquid properties
+#include "energy_boundary.cuh"   // fixedEnergy/gradientEnergy/mixedEnergy updateCoeffs, live
 #include "kOmegaSST_cpp.cuh"
 #include "cell_wall_dist.cuh"
 #include "fv_matrix_ops.cuh"
@@ -608,6 +609,13 @@ Residuals rhoSimpleStep(
         // and builds its refValue/refGrad/value from that T. This is the ONLY evaluate T's boundary
         // gets in an iteration; thermo.correct() below then keeps it on fixesValue patches.
         f.T.evaluateBoundary();
+        // ...and the rest of every energy condition's updateCoeffs: he's own boundary coefficients,
+        // rebuilt from the p and T that stand right now (energy_boundary.cuh carries the three OF
+        // classes and the pureMixture argument for the term it omits). This is a no-op IN VALUE for
+        // perfectGas + hConst -- he is p-independent and Cpv is a constant, so every number it writes is
+        // the one createFields stored once -- which is why the compressible gates cannot move; it is the
+        // liquid path, whose Cpv is a correlation and whose Es carries -p/rho, that needs it live.
+        updateEnergyBoundaryCoeffs(f.he, f.T, f.p, f.thermo, patches);
         FvScalarMatrix E = assembleEEqn(f.he, f.U, f.p, f.rho, ein, m, g, patches);
         // fvOptions.constrain(EEqn), EEqn.H:24. A fixedTemperatureConstraint sets he(p, Tuniform) on its
         // cells -- an ENERGY, not a temperature. The thermo conversion is supplied here because the
