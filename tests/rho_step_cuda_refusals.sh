@@ -38,36 +38,47 @@ echo "$out" | grep -qE "what\(\):.*(fvOption|semiImplicitSource)" \
     && echo "  fvOption refused                                 ok" \
     || { echo "$out" | tail -3; echo "FAIL: no fvOption REFUSAL fired"; fail=1; }
 
-# --- properties liquid -> refused on THIS arm, naming the liquid and the arm ----------------------
-# Stage H3.4 lifted the liquid refusal from createFields, which both arms share, because the HOST step
-# now evaluates every property through liquid_thermo.cuh. The device kernels still call the perfect-gas
-# closed forms, so createDeviceFields refuses instead -- and the harness, like the driver, passes through
-# it. The hot wall is lowered to 350 K so the case stays inside H2O's [273.16, 647.13] K: at the
-# fixture's own 700 K the HOST createFields range refusal would fire first and this arm would be
-# measuring that one instead.
-#
-# Fail-proof, measured by disabling the refusal and re-running: the harness then gets as far as the host
-# reference's thermo.correct(), where the new he -> T inversion refuses -- he = -84235.39 J/kg at cell 0,
-# T = nan -- because the device projection had built he with the PERFECT-GAS formula (Cv*T-scale numbers,
-# where H2O's Es is ~ -1.6e7). Not silent, thanks to the inversion's own check, but misattributed; with
-# the refusal it stops at the right place under the right name.
-mkarm
-cat > "$W/c/constant/thermophysicalProperties" <<'TEOF'
+# --- properties liquid on THIS arm ---------------------------------------------------------------
+# Until stage H3.6 this arm asserted the CUDA arm REFUSED a liquid: the host step had H3.4's accessors
+# and the device kernels still called the perfect-gas closed forms. The device asks the same accessors
+# now, so the arm asserts the two halves of the new contract on the same staging -- rhoBox with H2O:
+#   (a) in range (hot wall lowered to 350 K) the liquid RUNS through the CUDA harness, and
+#   (b) at the fixture's own 700 K hot wall -- above H2O's 647.13 K critical point, where the density
+#       correlation is a NaN -- it is refused by name, naming the substance and the range, on this
+#       arm as on the host (createFields is shared).
+# Whether the liquid runs CORRECTLY on this arm is the three liquid gates' question
+# (liquid_thermo/liquid_turbulence/rho_squarebendliq_vs_openfoam, each with a CUDA arm).
+mkliq() {
+    mkarm
+    cat > "$W/c/constant/thermophysicalProperties" <<'TEOF'
 FoamFile { version 2.0; format ascii; class dictionary; object thermophysicalProperties; }
 thermoType { type heRhoThermo; mixture pureMixture; properties liquid; energy sensibleInternalEnergy; }
 mixture { H2O; }
 TEOF
+    # A liquid is sensibleInternalEnergy, so the energy variable is `e` and the kinetic term `Ekp`;
+    # rhoBox ships `h` and `K`. Without these the arm is refused on the missing div(phi,e) scheme -- a
+    # correct refusal, and not the one this arm exists to see.
+    sed -i 's/    div(phi,h) bounded Gauss upwind;/    div(phi,e) bounded Gauss upwind;/; s/    div(phi,K) bounded Gauss upwind;/    div(phi,Ekp) bounded Gauss upwind;/' "$W/c/system/fvSchemes"
+    grep -q "div(phi,e)" "$W/c/system/fvSchemes" && grep -q "div(phi,Ekp)" "$W/c/system/fvSchemes" \
+        || { echo "FAIL: could not give the liquid arm its energy schemes"; fail=1; }
+}
+mkliq
 sed -i 's/hotWall  { type fixedValue; value uniform 700; }/hotWall  { type fixedValue; value uniform 350; }/' "$W/c/0.orig/T"
 grep -q "uniform 350" "$W/c/0.orig/T" || { echo "FAIL: could not lower the hot wall into H2O's range"; fail=1; }
-# A liquid is sensibleInternalEnergy, so the energy variable is `e` and the kinetic term `Ekp`; rhoBox
-# ships `h` and `K`. Without these the arm is refused on the missing div(phi,e) scheme -- a correct
-# refusal, and not the one this arm exists to see.
-sed -i 's/    div(phi,h) bounded Gauss upwind;/    div(phi,e) bounded Gauss upwind;/; s/    div(phi,K) bounded Gauss upwind;/    div(phi,Ekp) bounded Gauss upwind;/' "$W/c/system/fvSchemes"
-grep -q "div(phi,e)" "$W/c/system/fvSchemes" && grep -q "div(phi,Ekp)" "$W/c/system/fvSchemes" \
-    || { echo "FAIL: could not give the liquid arm its energy schemes"; fail=1; }
-out=$("$BIN" "$W/c" 0.orig 2 2>&1) && { echo "FAIL: a liquid thermo ran on the CUDA path"; fail=1; }
-echo "$out" | grep -q "what():.*CUDA arm implements perfectGas.*properties liquid" \
-    && echo "  properties liquid refused on the CUDA arm        ok" \
-    || { echo "$out" | tail -3; echo "FAIL: no CUDA-arm liquid REFUSAL fired"; fail=1; }
+# The harness's own controls are written for the GAS rhoBox (the pressure limiter binds, p moves) and
+# report FAIL on a liquid without any of them being a refusal, so its exit status says nothing here --
+# the question is only whether a refusal fired.
+out=$("$BIN" "$W/c" 0.orig 2 2>&1) || true
+if echo "$out" | grep -q "what():"; then
+    echo "$out" | grep "what():" | head -2; echo "FAIL: a liquid in its range was refused on the CUDA path"; fail=1
+else
+    echo "  properties liquid in range runs on the CUDA path      ok"
+fi
+
+mkliq
+out=$("$BIN" "$W/c" 0.orig 2 2>&1) && { echo "FAIL: H2O at 700 K ran on the CUDA path"; fail=1; }
+echo "$out" | grep -q "what():.*H2O.*647.13" \
+    && echo "  H2O above its critical point refused, naming the range ok" \
+    || { echo "$out" | tail -3; echo "FAIL: no correlation-range REFUSAL fired on the CUDA path"; fail=1; }
 
 [ $fail = 0 ] && echo PASS || { echo FAIL; exit 1; }

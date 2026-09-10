@@ -45,6 +45,14 @@
 # and before the four fixes, on the same staging: k 2.5e-07 at iteration 1 (defect 2), U 1.3e-03 at
 # iteration 2 (defect 3), epsilon 1.9e-06 / omega 3.2e-06 at iteration 2 once 2 and 3 were fixed
 # (defect 4), and a refusal before any of it (defect 1). Bounds: 1e-10, 1e-11 on T.
+# THE CUDA ARM (stage H3.6), same staging: every field at the floor through iteration 3 on both closures
+# (worst U 1.86e-12, epsilon 1.66e-12, omega 1.89e-12). Two device modules found and gated here:
+#   linearUpwind on the device turbulence transport (it was refused on this arm) -- dropped again:
+#       iteration 1  k 1.84e-07, epsilon 1.65e-06
+#   he's STORED patch values in the device energy assembly, where it evaluated dbHe live -- restored
+#   to live: iteration 2  T 4.54e-08 with U and p exact (the liquid's he_b = HE(p_b, T_b) differs
+#   from the cell's by (p_b - p_c)/rho; a gas cannot see it)
+#
 # FAIL-PROOFS, each defect put back in the source and the gate re-run -- every one turns it red, on the
 # fixture and at the iteration where it lives:
 #   1  linearUpwind refused on the turbulence pair  -> brae refuses, both closures
@@ -136,12 +144,16 @@ for MODEL in kEpsilon kOmegaSST; do
     stage "$W/of_$MODEL" "$MODEL" || { echo "FAIL: $MODEL -- staging"; fail=1; continue; }
     ( cd "$W/of_$MODEL" && rhoSimpleFoam > log.rhoSimpleFoam 2>&1 ) || {
         echo "FAIL: $MODEL -- OpenFOAM did not run"; tail -15 "$W/of_$MODEL/log.rhoSimpleFoam"; fail=1; continue; }
-    stage "$W/br_$MODEL" "$MODEL" || { fail=1; continue; }
-    BRAE_RHOSIMPLEFOAM_MIRROR=1 "$BRAE" -case "$W/br_$MODEL" > "$W/br_$MODEL/log.brae" 2>&1 || {
-        echo "FAIL: $MODEL -- brae did not run"; grep -v '^brae NOTICE' "$W/br_$MODEL/log.brae" | tail -5
+    # BOTH ARMS, the CUDA one since stage H3.6: the liquid thermo, the live energy conditions, and
+    # linearUpwind on the turbulence pair are all device modules now, over the same stored patch values.
+    for MIRROR in 1 cuda; do
+    BR="$W/br_${MODEL}_$MIRROR"
+    stage "$BR" "$MODEL" || { fail=1; continue; }
+    BRAE_U_SOLVER=ofOrder BRAE_RHOSIMPLEFOAM_MIRROR=$MIRROR "$BRAE" -case "$BR" > "$BR/log.brae" 2>&1 || {
+        echo "FAIL: $MODEL ($MIRROR) -- brae did not run"; grep -v '^brae NOTICE' "$BR/log.brae" | tail -5
         fail=1; continue; }
-    echo "== squareBendLiq, $MODEL =="
-    ITERS="$ITERS" SECOND="$second" python3 - "$W/br_$MODEL" "$W/of_$MODEL" <<'PYEOF' || fail=1
+    echo "== squareBendLiq, $MODEL -- $([ "$MIRROR" = cuda ] && echo 'CUDA arm' || echo 'host arm') =="
+    MIRROR="$MIRROR" ITERS="$ITERS" SECOND="$second" python3 - "$BR" "$W/of_$MODEL" <<'PYEOF' || fail=1
 import math, os, re, sys
 brae, of = sys.argv[1], sys.argv[2]
 n = int(os.environ['ITERS']); second = os.environ['SECOND']
@@ -176,6 +188,7 @@ for it in range(1, n + 1):
         bad |= not (e < bound)
 sys.exit(1 if bad else 0)
 PYEOF
+    done
 done
 
 [ "$fail" -eq 0 ] && echo "PASSED" || echo "FAILED"

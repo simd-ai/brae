@@ -356,11 +356,10 @@ int main(int argc, char** argv)
         gin.pMinLimit  = mid;
         hin.pMinProbe  = mid;
 
-        // ...and the same for the energy limiter. The floor is chosen in TEMPERATURE and converted with
-        // the reference's OWN hConstTToHe, because the host takes limitTmin/limitTmax in temperature
-        // while the device takes energy. Picking it in energy and inverting by hand would be a second
-        // implementation of the conversion, and the two clamping at slightly different energies is
-        // exactly the kind of difference that would read as a device defect.
+        // ...and the same for the energy limiter. The floor is chosen in TEMPERATURE, and since stage H3.6
+        // BOTH arms take it that way -- each builds he(p, Tmin) per cell from its own thermo accessor --
+        // so the probe hands the device the same two temperatures the host gets. heMinProbe stays an
+        // energy because it is the host oracle's own floor check below.
         scalar tLo = 1e300, tHi = -1e300;
         for (label c = 0; c < nC; ++c)
         { tLo = std::fmin(tLo, tUnlimited[c]); tHi = std::fmax(tHi, tUnlimited[c]); }
@@ -369,11 +368,11 @@ int main(int argc, char** argv)
         hin.limitTmin  = tMid;
         hin.limitTmax  = 1e30;
         hin.heMinProbe = hConstTToHe(tMid, hf.thermo);
-        gin.limitHe = true;
-        gin.heMin   = hConstTToHe(tMid, hf.thermo);
-        gin.heMax   = hConstTToHe(1e30, hf.thermo);
+        gin.limitHe   = true;
+        gin.limitTmin = tMid;
+        gin.limitTmax = 1e30;
         std::printf("  limitTemperature: Tmin forced to %.6g K (range %.6g .. %.6g) -> he floor %.6g\n",
-                    (double)tMid, (double)tLo, (double)tHi, (double)gin.heMin);
+                    (double)tMid, (double)tLo, (double)tHi, (double)hin.heMinProbe);
         gin.limitMaxP  = hf.pressureControl.limitMaxP;
         gin.pMaxLimit  = hf.pressureControl.pMax;
         std::printf("  pressureControl: pMin forced to %.6g (field range %.6g .. %.6g) so the clamp binds\n",

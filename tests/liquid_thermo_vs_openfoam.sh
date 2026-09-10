@@ -35,7 +35,16 @@
 #     ARM 1   iteration 1:   T 6.00e-13   p 2.86e-12   rho 3.10e-13   U 5.98e-13
 #     ARM A   iteration 200: T 9.69e-13   p 3.66e-12   rho 2.83e-13   U 7.18e-13
 #     ARM B   iteration 200: T 4.83e-13   p 6.12e-12   rho 2.62e-13   clamped 848 low / 52 high, both codes
-# Fail-proofs measured through this gate by editing the source and re-running:
+# THE CUDA ARM (stage H3.6) runs every arm against the same OpenFOAM runs. Measured: T 5.1e-13 to
+# 9.7e-13 and rho 2.6e-13 to 3.1e-13 -- the host's floor -- the clamp counts 848/52 and the report lines
+# exact; p 2.9e-11 and U 1.5e-11 at worst, the device linear solvers' floor (see the U bound below).
+# CUDA fail-proofs, each device module broken in the source and the gate re-run -- every one red on the
+# CUDA arm and green on the host arm:
+#   the device he -> T inversion seeded with 300 K   -> ARM A T 1.03e-10; ARM B Tmin count 0 of 848
+#   the live energy boundary update skipped          -> T 6.39e-07, rho 5.06e-08
+#   limitTemperature's device bounds at ONE pressure -> ARM B T 3.21e-07
+#
+# Host fail-proofs measured through this gate by editing the source and re-running:
 #   limitTemperature's he bounds taken as ONE scalar at cell 0's pressure -- ARM B goes red on seven
 #     checks at once: T 3.21e-07, p 5.77e-09, rho 2.57e-08, U 2.56e-08, the Tmin count 2 against 848,
 #     the Tmax count 0 against 52, and OpenFOAM's own report lines (774 LimitedCells against 848,
@@ -107,19 +116,28 @@ for ARM in 1 A B; do
     ( cd "$W/of$ARM" && blockMesh > log.blockMesh 2>&1 && rhoSimpleFoam > log.rhoSimpleFoam 2>&1 ) || {
         echo "FAIL: ARM $ARM -- OpenFOAM did not run"; tail -20 "$W/of$ARM/log.rhoSimpleFoam"; exit 1; }
 
-    stage "$W/br$ARM" "$OPT"
-    pinEnd "$W/br$ARM" "$END"
-    cp -r "$W/of$ARM/constant/polyMesh" "$W/br$ARM/constant/"
-    BRAE_RHOSIMPLEFOAM_MIRROR=1 "$BRAE" -case "$W/br$ARM" > "$W/br$ARM/log.brae" 2>&1 || {
-        echo "FAIL: ARM $ARM -- brae did not run"; tail -25 "$W/br$ARM/log.brae"; exit 1; }
-
     case "$ARM" in
         1) DESC='thermo alone, ONE iteration' ;;
         A) DESC='thermo alone, 200 iterations' ;;
         B) DESC='limitTemperature min 302 max 305, 200 iterations' ;;
     esac
-    echo "== ARM $ARM ($DESC) =="
-    ARM="$ARM" python3 - "$W/br$ARM/$END" "$W/of$ARM/$END" <<'PYEOF' || fail=1
+
+    # BOTH ARMS against the same OpenFOAM run: the host step, and since stage H3.6 the CUDA arm, whose
+    # kernels now ask the same liquid_thermo.cuh accessors for every property, invert he -> T with the
+    # same seeded loop, rebuild the energy boundary conditions live and clamp limitTemperature per cell.
+    # BRAE_U_SOLVER=ofOrder so the momentum solve is the case's own and not the colour-GS substitute --
+    # at tolerance 1e-14 relTol 0 both converge, but the arms should not differ in more than one thing.
+    for MIRROR in 1 cuda; do
+    BR="$W/br${ARM}_$MIRROR"
+    stage "$BR" "$OPT"
+    pinEnd "$BR" "$END"
+    cp -r "$W/of$ARM/constant/polyMesh" "$BR/constant/"
+    BRAE_U_SOLVER=ofOrder BRAE_RHOSIMPLEFOAM_MIRROR=$MIRROR "$BRAE" -case "$BR" > "$BR/log.brae" 2>&1 || {
+        echo "FAIL: ARM $ARM ($MIRROR) -- brae did not run"; grep -v '^brae NOTICE' "$BR/log.brae" | tail -8
+        fail=1; continue; }
+
+    echo "== ARM $ARM ($DESC) -- $([ "$MIRROR" = cuda ] && echo 'CUDA arm' || echo 'host arm') =="
+    MIRROR="$MIRROR" ARM="$ARM" python3 - "$BR/$END" "$W/of$ARM/$END" <<'PYEOF' || fail=1
 import math, os, re, sys
 
 brae, of = sys.argv[1], sys.argv[2]
@@ -165,10 +183,18 @@ rmin, rmax = min(fields['rho'][1]), max(fields['rho'][1])
 say('OpenFOAM rho is a LIQUID (980..1010 kg/m3): %.2f..%.2f' % (rmin, rmax),
     'ok' if 980.0 < rmin and rmax < 1010.0 else 'FAIL')
 
+# THE THERMO IS HELD TO THE SAME BOUND ON BOTH ARMS -- T and rho are what the port is about, and the
+# CUDA arm reaches the host's floor on both (5e-13, 3e-13). U gets a CUDA bound of its own for the
+# reason every CUDA arm in the tree does (rho_mirror_solver_vs_openfoam: "looser than the host arm by
+# exactly the linear solvers between them"): each fully converged device solve carries its own round-off
+# floor -- the device pressure solve takes 108 BiCGStab iterations where OpenFOAM's takes 58 -- and U
+# inherits it. Measured on the CUDA arm: p 2.9e-11 and U 1.5e-11 at worst, against the host's 6e-12 and
+# 1.6e-12; the thermo-sensitive checks below (the clamp counts, the report lines) are exact on both.
+cuda = os.environ.get('MIRROR') == 'cuda'
 report('T   vs OpenFOAM (L2 rel)',   rel(*fields['T']),   1e-11)
 report('p   vs OpenFOAM (L2 rel)',   rel(*fields['p']),   1e-10)
 report('rho vs OpenFOAM (L2 rel)',   rel(*fields['rho']), 1e-11)
-report('U   vs OpenFOAM (L2 rel)',   rel(*fields['U']),   1e-11)
+report('U   vs OpenFOAM (L2 rel)',   rel(*fields['U']),   1e-10 if cuda else 1e-11)
 
 if arm == 'B':
     # limitTemperature's bounds are FIELDS over p. A clamped cell therefore lands on EXACTLY Tmin (or
@@ -194,7 +220,7 @@ PYEOF
     if [ "$ARM" = B ]; then
         # limitTemperature's own report lines, brae's against OpenFOAM's, verbatim.
         grep -h "^limitTemperature=" "$W/ofB/log.rhoSimpleFoam" | tail -2 > "$W/of.lim"
-        grep -h "^limitTemperature=" "$W/brB/log.brae"           | tail -2 > "$W/br.lim"
+        grep -h "^limitTemperature=" "$BR/log.brae"             | tail -2 > "$W/br.lim"
         if diff -q "$W/of.lim" "$W/br.lim" > /dev/null; then
             say "limitTemperature report lines match OpenFOAM's" ok
         else
@@ -202,6 +228,7 @@ PYEOF
             diff "$W/of.lim" "$W/br.lim" || true
         fi
     fi
+    done
 done
 
 [ "$fail" -eq 0 ] && echo "PASSED" || echo "FAILED"

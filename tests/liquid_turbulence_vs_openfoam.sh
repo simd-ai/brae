@@ -30,6 +30,11 @@
 #         k 7.02e-02, epsilon 1.42e-01, nut 2.60e-02, U 3.43e-03, T 1.57e-03
 # against an implemented path at ~1e-12 on every field -- ten orders apart.
 #
+# THE CUDA ARM (stage H3.6), same arms, same OpenFOAM runs: every field and the wall functions' patch
+# values at the host's floor on both closures -- worst k 2.04e-12, epsilon 1.64e-12, omega 1.23e-12,
+# nut 1.79e-12, p 2.16e-11. CUDA fail-proof: the turbulence hook's nu taken at 300 K -> k 3.75e-02,
+# nut 4.49e-02 on the CUDA arm, host arm green.
+#
 # Measured, OpenFOAM v2412:
 #     kEpsilon  it 1   U 5.75e-13 p 3.90e-12 T 9.61e-13 rho 3.03e-13 k 1.54e-12 eps   9.00e-13 nut 7.29e-13
 #     kEpsilon  it 200 U 6.70e-13 p 6.23e-12 T 9.26e-13 rho 2.95e-13 k 2.00e-12 eps   1.23e-12 nut 1.76e-12
@@ -81,14 +86,18 @@ for MODEL in kEpsilon kOmegaSST; do
         stage "$W/of_$TAG" "$MODEL" "$END"
         ( cd "$W/of_$TAG" && blockMesh > log.blockMesh 2>&1 && rhoSimpleFoam > log.rhoSimpleFoam 2>&1 ) || {
             echo "FAIL: $TAG -- OpenFOAM did not run"; tail -20 "$W/of_$TAG/log.rhoSimpleFoam"; exit 1; }
-        stage "$W/br_$TAG" "$MODEL" "$END"
-        cp -r "$W/of_$TAG/constant/polyMesh" "$W/br_$TAG/constant/"
-        BRAE_RHOSIMPLEFOAM_MIRROR=1 "$BRAE" -case "$W/br_$TAG" > "$W/br_$TAG/log.brae" 2>&1 || {
-            echo "FAIL: $TAG -- brae did not run"; grep -v '^brae NOTICE' "$W/br_$TAG/log.brae" | tail -8
+        # BOTH ARMS against the same OpenFOAM run -- the CUDA one since stage H3.6, whose turbulence hook
+        # takes the laminar nu from the same thermoMuOf the host step does.
+        for MIRROR in 1 cuda; do
+        BR="$W/br_${TAG}_$MIRROR"
+        stage "$BR" "$MODEL" "$END"
+        cp -r "$W/of_$TAG/constant/polyMesh" "$BR/constant/"
+        BRAE_U_SOLVER=ofOrder BRAE_RHOSIMPLEFOAM_MIRROR=$MIRROR "$BRAE" -case "$BR" > "$BR/log.brae" 2>&1 || {
+            echo "FAIL: $TAG ($MIRROR) -- brae did not run"; grep -v '^brae NOTICE' "$BR/log.brae" | tail -8
             fail=1; continue; }
 
-        echo "== $MODEL, $END iteration(s) =="
-        MODEL="$MODEL" python3 - "$W/br_$TAG/$END" "$W/of_$TAG/$END" <<'PYEOF' || fail=1
+        echo "== $MODEL, $END iteration(s) -- $([ "$MIRROR" = cuda ] && echo 'CUDA arm' || echo 'host arm') =="
+        MODEL="$MODEL" python3 - "$BR/$END" "$W/of_$TAG/$END" <<'PYEOF' || fail=1
 import math, os, re, sys
 
 brae, of = sys.argv[1], sys.argv[2]
@@ -162,6 +171,7 @@ for f in ('nut', 'alphat'):
 
 sys.exit(bad)
 PYEOF
+        done
     done
 done
 
