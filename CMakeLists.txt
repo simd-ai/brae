@@ -412,6 +412,10 @@ target_link_libraries(test_wall_function PRIVATE brae_core)
 add_test(NAME wall_function
          COMMAND test_wall_function ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily282)
 
+add_executable(test_liqref_inversion tests/test_liqref_inversion.cu)
+target_include_directories(test_liqref_inversion PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_liqref_inversion PRIVATE brae_core)
+
 add_executable(test_leastsquares_grad tests/test_leastsquares_grad.cu)
 target_include_directories(test_leastsquares_grad PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_leastsquares_grad PRIVATE brae_core)
@@ -2088,6 +2092,15 @@ add_test(NAME nut_wallfn_patchkey_vs_openfoam
 set_tests_properties(nut_wallfn_patchkey_vs_openfoam PROPERTIES
                      ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
                      SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
+# brae's H2O he->T inversion against OpenFOAM's OWN answer, PATH included: OpenFOAM stops on a
+# temperature step measured from the initial guess, so its answer depends on T0 and a converged
+# inversion is a different function -- tests/liquid_inversion_vs_openfoam.sh, oracle tools/liqref.
+add_test(NAME liquid_inversion_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/liquid_inversion_vs_openfoam.sh)
+set_tests_properties(liquid_inversion_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77 TIMEOUT 900)
 
 add_test(NAME leastsquares_grad_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/leastsquares_grad_vs_openfoam.sh)
