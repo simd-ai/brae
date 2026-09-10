@@ -140,6 +140,8 @@ struct RhoStepInput
     // the three above, which hold the gradient linearUpwind NAMES. See RhoEnergyInput.
     scalar schemeCoeffHe = 1.0, schemeCoeffKE = 1.0;
     scalar limGradHeK    = 0.0, limGradKEK    = 0.0;
+    bool   limGradHeLeastSq = false, limGradKELeastSq = false;
+    bool   turbLimGradLeastSq = false;
     bool   correctedLaplacian = false;
     scalar snGradLimitCoeff   = 0.0;
     bool   isE = true;                    // he == "e" selects Ekp, "h" selects K

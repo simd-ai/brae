@@ -241,7 +241,8 @@ void kineticEnergyDivergence(
         if (in.schemeKE == cpu::rhoSimple::DivScheme::limitedLinear)
         {
             DeviceBuffer<scalar> gx, gy, gz;
-            deviceGaussGrad(dm, ke, keB, gx, gy, gz);
+            if (in.limGradKELeastSq) deviceLeastSquaresGrad(dm, ke, keB, gx, gy, gz);
+            else                     deviceGaussGrad(dm, ke, keB, gx, gy, gz);
             if (in.limGradKEK > scalar(0)) deviceCellLimitGrad(dm, ke, keB, gx, gy, gz, in.limGradKEK);
             deviceLimitedFaceWeights(dm, *in.phiInt, ke, gx, gy, gz,
                                      scalar(2) / std::fmax(in.schemeCoeffKE, scalar(1e-15)), wKE);
@@ -294,7 +295,8 @@ void assembleEEqn(
     {
         DeviceBuffer<scalar> hb, gx, gy, gz;
         deviceBCValue(dbHe, he, hb);
-        deviceGaussGrad(dm, he, hb, gx, gy, gz);
+        if (in.limGradHeLeastSq) deviceLeastSquaresGrad(dm, he, hb, gx, gy, gz);
+        else                     deviceGaussGrad(dm, he, hb, gx, gy, gz);
         if (in.limGradHeK > scalar(0)) deviceCellLimitGrad(dm, he, hb, gx, gy, gz, in.limGradHeK);
         deviceDivLimitedCoeffs(dm, *in.phiInt, he, gx, gy, gz,
                                scalar(2) / std::fmax(in.schemeCoeffHe, scalar(1e-15)),

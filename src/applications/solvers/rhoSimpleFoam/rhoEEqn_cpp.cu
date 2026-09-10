@@ -80,9 +80,13 @@ std::vector<vector> limiterGrad(
     scalar                                  cellLimitK,
     const PrimitiveMesh&                    m,
     const FvGeometry&                       g,
-    const std::vector<FvPatch>&             patches)
+    const std::vector<FvPatch>&             patches,
+    // The case's gradSchemes for THIS field. OpenFOAM builds limitedLinear's limiter from
+    // fvc::grad(lPhi) (LimitedScheme.C:56-59), so the scheme is the case's, not the caller's choice.
+    bool                                    leastSquares)
 {
-    std::vector<vector> gr = fvc::gaussGrad(vf, vfBnd, m, g, patches);
+    std::vector<vector> gr = leastSquares ? fvc::leastSquaresGrad(vf, vfBnd, m, g, patches)
+                                          : fvc::gaussGrad(vf, vfBnd, m, g, patches);
     if (cellLimitK > 0.0) cpu::cellLimitGrad(gr, vf, vfBnd, cellLimitK, m, g, patches);
     return gr;
 }
@@ -97,6 +101,7 @@ std::vector<scalar> explicitConvectionDivExtensive(
     scalar                                  gradLimitK,
     scalar                                  schemeCoeff,
     scalar                                  limGradK,
+    bool                                    limGradLeastSq,
     bool                                    bounded,
     const PrimitiveMesh&                    m,
     const FvGeometry&                       g,
@@ -115,7 +120,7 @@ std::vector<scalar> explicitConvectionDivExtensive(
     std::vector<scalar> w;
     if (scheme == DivScheme::limitedLinear)
     {
-        const std::vector<vector> gradVf = limiterGrad(vf, vfBnd, limGradK, m, g, patches);
+        const std::vector<vector> gradVf = limiterGrad(vf, vfBnd, limGradK, m, g, patches, limGradLeastSq);
         // limitedLinearWeights reads only .internal (rhoUEqn_cpp.cu uses the same shim), and takes the
         // RAW k -- it computes 2/max(k,SMALL) itself.
         GeometricField<scalar> shim;
@@ -230,7 +235,7 @@ std::vector<scalar> kineticEnergyDivergence(
     const std::vector<std::vector<scalar>> keBnd = kineticEnergyBoundary(in.heName, U, p, rho, patches);
     return explicitConvectionDivExtensive(
         *in.phi, *in.phiBnd, ke, keBnd, in.schemeKE, in.gradKELimitK,
-        in.schemeCoeffKE, in.limGradKEK, in.boundedKE, m, g, patches);
+        in.schemeCoeffKE, in.limGradKEK, in.limGradKELeastSq, in.boundedKE, m, g, patches);
 }
 
 
@@ -257,7 +262,8 @@ FvScalarMatrix assembleEEqn(
     {
         std::vector<std::vector<scalar>> heB(patches.size());
         for (std::size_t pi = 0; pi < patches.size(); ++pi) heB[pi] = he.boundary[pi]->value();
-        const std::vector<vector> gradHe = limiterGrad(he.internal, heB, in.limGradHeK, m, g, patches);
+        const std::vector<vector> gradHe = limiterGrad(he.internal, heB, in.limGradHeK, m, g, patches,
+                                                       in.limGradHeLeastSq);
         M = fvm::div(*in.phi, *in.phiBnd, he,
                      cpu::limitedSchemes::limitedLinearWeights(*in.phi, he, gradHe,
                                                                in.schemeCoeffHe, m, g),

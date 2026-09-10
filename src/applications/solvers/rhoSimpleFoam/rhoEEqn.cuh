@@ -110,6 +110,8 @@ struct RhoEnergyInput
     scalar schemeCoeffKE = 1.0;
     scalar limGradHeK    = 0.0;
     scalar limGradKEK    = 0.0;
+    bool   limGradHeLeastSq = false;
+    bool   limGradKELeastSq = false;
 
     bool   correctedLaplacian = false;   // BOTH halves -- see the header
     scalar snGradLimitCoeff   = 0.0;

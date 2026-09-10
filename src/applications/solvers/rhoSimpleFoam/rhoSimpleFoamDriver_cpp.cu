@@ -118,23 +118,46 @@ StepInput buildStepInput(
         // 2.8e-03. That is a different discretisation, not an approximation, so it refuses. gasMixing
         // is the case this stops: it says `gradSchemes { default leastSquares; }`, and without this
         // check clearing the div-scheme blocker would have made it run and be quietly wrong.
-        auto resolveLimiterGrad = [&](DivScheme sc, const std::string& fld, scalar& out)
+        // THE LIMITER'S GRADIENT, resolved through the case's own gradSchemes. `Gauss linear` and
+        // `leastSquares` are both computed (fvc::gaussGrad / fvc::leastSquaresGrad, and the matching
+        // device kernels); anything else still refuses, because the limiter would then be built from a
+        // gradient the case did not ask for. leastSquares is not a variation on Gauss linear -- measured
+        // against OpenFOAM's own grad(T) on validation/rhoSST, the two differ by 2.5e-01 on the same
+        // field, while each matches OpenFOAM's answer for its own scheme to ~1e-13
+        // (tests/leastsquares_grad_vs_openfoam).
+        // leastSquares is COMPUTED but not yet reachable by default. The gradient itself is validated --
+        // fvc::leastSquaresGrad and deviceLeastSquaresGrad both match OpenFOAM's own grad(T) to 2.5e-13
+        // on validation/rhoSST, device against host to 1.6e-16, with Gauss linear differing by 2.5e-01 on
+        // the same field so the match is not trivial (tests/leastsquares_grad_vs_openfoam). What is NOT
+        // validated is the case END TO END: on the gasMixing tutorial brae still parts from OpenFOAM by
+        // U 1.2e-01 with the gradient matched on BOTH sides, so something else on that path is wrong and
+        // unidentified, and on rhoSST with leastSquares + limitedLinear the run sits at k 9.1e-03 rather
+        // than the floor. Letting the case run on the strength of a correct gradient would be exactly the
+        // silent-substitution failure this refusal exists to prevent. BRAE_LEASTSQUARES=1 opts in, for
+        // the gate and for the work that closes the end-to-end gap.
+        const bool lsqOptIn = std::getenv("BRAE_LEASTSQUARES")
+                           && std::string(std::getenv("BRAE_LEASTSQUARES")) == "1";
+        auto resolveLimiterGrad = [&](DivScheme sc, const std::string& fld, scalar& out, bool& lsq)
         {
             if (sc != DivScheme::limitedLinear) return;
             const FieldGradScheme gs = parseFieldGradScheme(caseDir, fld);
-            if (!gs.gaussLinear)
+            if (!gs.gaussLinear && !(gs.leastSquares && lsqOptIn))
                 throw std::runtime_error(
                     "rhoSimpleFoam buildStepInput: div(phi," + fld + ") is `Gauss limitedLinear`, whose "
                     "limiter OpenFOAM builds from fvc::grad(" + fld + ") through the case's gradSchemes "
                     "(LimitedScheme.C:56-59). This case resolves grad(" + fld + ") to `" + gs.raw +
-                    "`, and brae computes Gauss linear gradients only. Measured on validation/rhoLU at a "
-                    "developed state, swapping that gradient moves the assembled energy diagonal by "
-                    "9.1e-03 and its source by 2.8e-03 -- a different discretisation, not an "
-                    "approximation. Refusing rather than running the limiter off the wrong gradient.");
+                    "`. brae computes `Gauss linear`, and computes `leastSquares` too but does not yet "
+                    "reach it by default -- its gradient matches OpenFOAM's to 2.5e-13 while the case it "
+                    "unblocks does not (BRAE_LEASTSQUARES=1 opts in). Measured on "
+                    "validation/rhoLU at a developed state, swapping that gradient moves the assembled "
+                    "energy diagonal by 9.1e-03 and its source by 2.8e-03 -- a different discretisation, "
+                    "not an approximation. Refusing rather than running the limiter off the wrong "
+                    "gradient.");
             out = gs.cellLimitK;
+            lsq = gs.leastSquares;
         };
-        resolveLimiterGrad(in.schemeHe, f.heName, in.limGradHeK);
-        resolveLimiterGrad(in.schemeKE, keName,   in.limGradKEK);
+        resolveLimiterGrad(in.schemeHe, f.heName, in.limGradHeK, in.limGradHeLeastSq);
+        resolveLimiterGrad(in.schemeKE, keName,   in.limGradKEK, in.limGradKELeastSq);
 
         DeviceSimpleControls sctl;
         parseFvSchemesControls(caseDir, sctl);
@@ -288,21 +311,33 @@ StepInput buildStepInput(
         {
             const FieldGradScheme gK = parseFieldGradScheme(caseDir, "k");
             const FieldGradScheme gS = parseFieldGradScheme(caseDir, secondT);
-            if (!gK.gaussLinear || !gS.gaussLinear)
+            const bool lsqOn = std::getenv("BRAE_LEASTSQUARES")
+                            && std::string(std::getenv("BRAE_LEASTSQUARES")) == "1";
+            const bool kOk = gK.gaussLinear || (gK.leastSquares && lsqOn);
+            const bool sOk = gS.gaussLinear || (gS.leastSquares && lsqOn);
+            if (!kOk || !sOk)
                 in.turbDivUnsupported =
                     "a limiter gradient brae does not compute -- div(phi,k)/div(phi," + secondT +
                     ") are `Gauss limitedLinear`, whose limiter OpenFOAM builds from fvc::grad of each "
                     "field through the case's gradSchemes (LimitedScheme.C:56-59), and this case "
-                    "resolves them to `" + (gK.gaussLinear ? gS.raw : gK.raw) + "` where brae has Gauss "
-                    "linear only";
-            // ONE coefficient for both, as the closures carry one flag for both. Entries that disagree
-            // refuse above rather than silently taking k's.
+                    "resolves them to `" + (kOk ? gS.raw : gK.raw) + "` where brae has `Gauss linear` "
+                    "and `leastSquares`";
+            // ONE coefficient AND ONE SCHEME for both, as the closures carry one limiter gradient for
+            // both. Entries that disagree refuse rather than silently taking k's.
             else if (gK.cellLimitK != gS.cellLimitK)
                 in.turbDivUnsupported =
                     "grad(k) and grad(" + secondT + ") name different cellLimited coefficients (brae "
                     "carries one limiter gradient for both)";
+            else if (gK.leastSquares != gS.leastSquares)
+                in.turbDivUnsupported =
+                    "grad(k) and grad(" + secondT + ") name different gradient SCHEMES (brae carries one "
+                    "limiter gradient for both, and running one field's limiter off the other's gradient "
+                    "would be a substituted discretisation)";
             else
-                in.turbLimGradK = gK.cellLimitK;
+            {
+                in.turbLimGradK      = gK.cellLimitK;
+                in.turbLimGradLeastSq = gK.leastSquares;
+            }
         }
     }
 

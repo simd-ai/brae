@@ -593,6 +593,8 @@ Residuals rhoSimpleStep(
         ein.schemeCoeffKE     = in.schemeCoeffKE;
         ein.limGradHeK        = in.limGradHeK;
         ein.limGradKEK        = in.limGradKEK;
+        ein.limGradHeLeastSq  = in.limGradHeLeastSq;
+        ein.limGradKELeastSq  = in.limGradKELeastSq;
         ein.gradKELimitK      = in.gradKELimitK;
         ein.correctedLaplacian = in.correctedLaplacian;
         ein.snGradLimitCoeff  = in.snGradLimitCoeff;

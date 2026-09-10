@@ -201,6 +201,7 @@ struct KEpsilonInput
     bool        limitedLinear = false;
     scalar      limiterCoeff  = 1.0;
     scalar      limGradK      = 0.0;
+    bool        limGradLeastSq = false;
 
     // --- refusals ---
     bool        hasCoupledPatches      = false;

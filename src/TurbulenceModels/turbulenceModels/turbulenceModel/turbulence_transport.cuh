@@ -43,6 +43,8 @@ struct TransportScheme
     // cellLimited k of the case's grad(<field>), which limits the LIMITER's gradient
     // (LimitedScheme.C:56-59). Zero means unlimited.
     scalar limGradK        = 0.0;
+    // The limiter gradient's SCHEME: leastSquares rather than Gauss linear (gradSchemes grad(<field>)).
+    bool   limGradLeastSq  = false;
 
     // `corrected` is TWO changes and this makes both: the implicit coefficient takes
     // nonOrthDeltaCoeffs, and the non-orthogonal part enters as an explicit source. Implementing only

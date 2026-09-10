@@ -81,6 +81,7 @@ turbulence::TransportScheme schemeOf(const KOmegaSSTInput& in)
     sc.limitedLinear      = in.limitedLinear;
     sc.limiterCoeff       = in.limiterCoeff;
     sc.limGradK           = in.limGradK;
+    sc.limGradLeastSq     = in.limGradLeastSq;
     sc.correctedLaplacian = in.correctedLaplacian;
     sc.gradFieldLimitK    = in.co.gradKLimitK;
     sc.snGradLimitCoeff   = in.snGradLimitCoeff;

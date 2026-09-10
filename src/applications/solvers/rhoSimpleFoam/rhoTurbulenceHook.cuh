@@ -76,6 +76,7 @@ struct TurbulenceHookOptions
     bool           limitedLinear = false;
     scalar         limiterCoeff  = 1.0;
     scalar         limGradK      = 0.0;
+    bool           limGradLeastSq = false;
     bool           relaxEquationK = true,  relaxEquationEps = true;
     scalar         relaxK = 1.0, relaxEps = 1.0;
     scalar         tol = 1e-12, relTol = 0.0;

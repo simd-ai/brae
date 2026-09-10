@@ -120,6 +120,8 @@ struct EnergyInput
     // that linearUpwind names in its own div entry. They coincide only until a case names both.
     scalar    limGradHeK         = 0.0;
     scalar    limGradKEK         = 0.0;
+    bool      limGradHeLeastSq   = false;
+    bool      limGradKELeastSq   = false;
     bool      correctedLaplacian = false;
     scalar    snGradLimitCoeff   = 0.0;
     bool      hasMRF             = false;

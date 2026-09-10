@@ -140,6 +140,7 @@ void correctTurbulence(
     kin.limitedLinear         = opt.limitedLinear;
     kin.limiterCoeff          = opt.limiterCoeff;
     kin.limGradK              = opt.limGradK;
+    kin.limGradLeastSq        = opt.limGradLeastSq;
     kin.correctedLaplacian = opt.correctedLaplacian;
     kin.relaxEquationK   = opt.relaxEquationK;   kin.relaxK   = opt.relaxK;
     kin.relaxEquationEps = opt.relaxEquationEps; kin.relaxEps = opt.relaxEps;
@@ -175,7 +176,7 @@ void correctTurbulence(
         sstIn.alphatWallMask = kin.alphatWallMask;  sstIn.alphatPrtFace = kin.alphatPrtFace;
         sstIn.boundedK = kin.boundedK;   sstIn.boundedOmega = kin.boundedEps;
         sstIn.limitedLinear = kin.limitedLinear;  sstIn.limiterCoeff = kin.limiterCoeff;
-        sstIn.limGradK = kin.limGradK;
+        sstIn.limGradK = kin.limGradK;   sstIn.limGradLeastSq = kin.limGradLeastSq;
         sstIn.correctedLaplacian = kin.correctedLaplacian;
         sstIn.snGradLimitCoeff   = kin.snGradLimitCoeff;
         sstIn.gradULimitK        = opt.co.gradULimitK;

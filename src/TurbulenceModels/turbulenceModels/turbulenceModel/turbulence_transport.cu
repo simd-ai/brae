@@ -49,7 +49,10 @@ void assembleScalarTransport(
     {
         DeviceBuffer<scalar> bval, gx, gy, gz;
         deviceBCValue(db, field, bval);
-        deviceGaussGrad(dm, field, bval, gx, gy, gz);
+        // The limiter's gradient takes the case's OWN gradScheme for this field -- OpenFOAM builds it
+        // through fvc::grad(lPhi) (LimitedScheme.C:56-59), not through a scheme the closure chooses.
+        if (sc.limGradLeastSq) deviceLeastSquaresGrad(dm, field, bval, gx, gy, gz);
+        else                   deviceGaussGrad(dm, field, bval, gx, gy, gz);
         if (sc.limGradK > scalar(0)) deviceCellLimitGrad(dm, field, bval, gx, gy, gz, sc.limGradK);
         deviceDivLimitedCoeffs(dm, *sc.phiInt, field, gx, gy, gz,
                                scalar(2) / std::fmax(sc.limiterCoeff, scalar(1e-15)),

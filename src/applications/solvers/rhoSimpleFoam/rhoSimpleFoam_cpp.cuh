@@ -102,6 +102,8 @@ struct StepInput
     scalar    schemeCoeffKE    = 1.0;
     scalar    limGradHeK       = 0.0;
     scalar    limGradKEK       = 0.0;
+    bool      limGradHeLeastSq = false;
+    bool      limGradKELeastSq = false;
     scalar    gradULimitK      = 0.0;
     scalar    gradHeLimitK     = 0.0;
     scalar    gradKELimitK     = 0.0;
@@ -158,6 +160,7 @@ struct StepInput
     // cellLimited k of the LIMITER's gradient for k/epsilon|omega -- grad(k) through gradSchemes, which
     // is a different lookup from KEpsilonCoeffs::gradKLimitK's use in the corrected laplacian.
     scalar turbLimGradK      = 0.0;
+    bool   turbLimGradLeastSq = false;
     bool   linearUpwindTurb  = false; // kOmegaSST assembles it; kEpsilon does not -- refused upstream
     scalar relaxK = 1.0, relaxEpsilon = 1.0;
     scalar tolTurb = 1e-12, relTolTurb = 0.0;

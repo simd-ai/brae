@@ -186,8 +186,9 @@ inline bool schemeHasWord(const std::string& s, const std::string& w)
 // a silent substitution the moment one does.
 struct FieldGradScheme
 {
-    bool        gaussLinear = false;   // brae computes Gauss linear gradients and nothing else
-    scalar      cellLimitK  = 0.0;     // `cellLimited <scheme> k`; 0 => unlimited
+    bool        gaussLinear  = false;  // `Gauss linear`
+    bool        leastSquares = false;  // `leastSquares` -- fvc::leastSquaresGrad / deviceLeastSquaresGrad
+    scalar      cellLimitK   = 0.0;    // `cellLimited <scheme> k`; 0 => unlimited
     std::string raw;                   // the statement as written, for the refusal message
 };
 
@@ -223,6 +224,8 @@ inline FieldGradScheme parseFieldGradScheme(const std::string& caseDir, const st
         while (*c && *c != ' ' && *c != '\t' && *c != ';') ++c;
         fg.gaussLinear = (std::string(b, c) == "linear");
     }
+    // EXACT token again: `pointCellsLeastSquares` is a DIFFERENT scheme and must not match here.
+    if (schemeHasWord(fg.raw, "leastSquares")) fg.leastSquares = true;
     if (schemeHasWord(fg.raw, "cellLimited"))
     {
         scalar kc = 1.0;
