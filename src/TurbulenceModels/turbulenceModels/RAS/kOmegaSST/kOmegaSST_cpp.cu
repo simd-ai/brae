@@ -1,5 +1,6 @@
 // _cpp REFERENCE implementation -- see kOmegaSST_cpp.cuh for the OpenFOAM provenance and refusals.
 #include "kOmegaSST_cpp.cuh"
+#include "sst_stage_dump.cuh"
 #include "cellLimitedGrad_cpp.cuh"
 #include "nut_wall_function.cuh"
 #include "near_wall_dist.cuh"
@@ -327,6 +328,45 @@ void correct(
     const scalar Cmu25 = std::pow(co.CmuWall, 0.25);    // the WALL FUNCTIONS' Cmu, not the model's betaStar
     std::vector<scalar>& nutF = nutField.internal;
 
+    // The closure instrument -- see sst_stage_dump.cuh. Same names as the device twin's.
+    const turbulence::SstStageDump sd = turbulence::sstStageDump("host");
+    sd.scalars("y", y);
+    sd.scalars("kIn", k.internal);
+    sd.scalars("omegaIn", omega.internal);
+    sd.scalars("nutIn", nutF);
+    if (sd.on)
+    {
+        // The gradient's two operands: the cell values and the PATCH values gaussGrad sums over. If the
+        // cells agree and the faces do not, the gradient's disagreement is the boundary's.
+        std::vector<scalar> ux, uy, uz;
+        ux.reserve(U.internal.size());
+        uy.reserve(U.internal.size());
+        uz.reserve(U.internal.size());
+        for (const vector& v : U.internal)
+        {
+            ux.push_back(v.x);
+            uy.push_back(v.y);
+            uz.push_back(v.z);
+        }
+        sd.scalars("Ux", ux);
+        sd.scalars("Uy", uy);
+        sd.scalars("Uz", uz);
+        std::vector<scalar> bx, by, bz;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const std::vector<vector>& vb = U.boundary[pi]->value();
+            for (const vector& v : vb)
+            {
+                bx.push_back(v.x);
+                by.push_back(v.y);
+                bz.push_back(v.z);
+            }
+        }
+        sd.scalars("UbX", bx);
+        sd.scalars("UbY", by);
+        sd.scalars("UbZ", bz);
+    }
+
     // alpha()*rho() multiplies every source in both equations; alpha is 1 for a single-phase model, so
     // this is rho or it is 1. Null comp is the incompressible reading, bit-for-bit as before.
     auto rhoAt = [&](label cc) { return (comp && comp->rho) ? (*comp->rho)[cc] : scalar(1.0); };
@@ -341,6 +381,26 @@ void correct(
     if (co.gradULimitK > 0.0) cellLimitGrad(gradU, U, co.gradULimitK, m, g, patches);
     const std::vector<scalar> s2  = S2(gradU);
     const std::vector<scalar> gb0 = GbyNu0(gradU);
+    if (sd.on)
+    {
+        std::vector<scalar> flat;
+        flat.reserve(gradU.size() * 9);
+        for (const tensor& t : gradU)
+        {
+            flat.push_back(t.xx);
+            flat.push_back(t.xy);
+            flat.push_back(t.xz);
+            flat.push_back(t.yx);
+            flat.push_back(t.yy);
+            flat.push_back(t.yz);
+            flat.push_back(t.zx);
+            flat.push_back(t.zy);
+            flat.push_back(t.zz);
+        }
+        sd.components("gradU", flat, 9);
+    }
+    sd.scalars("S2", s2);
+    sd.scalars("GbyNu0", gb0);
     std::vector<scalar> G(nC);
     for (label c = 0; c < nC; ++c) G[c] = nutF[c] * gb0[c];      // RAW GbyNu0 -- the k equation's G
 
@@ -450,6 +510,7 @@ void correct(
         }
     }
     if (res && res->captureStages) res->G = G;
+    sd.scalars("G", G);
 
     // ---- CDkOmega, F1, F2 ------------------------------------------------------------------------
     // The case's gradScheme on each, as OpenFOAM resolves grad(k) and grad(omega) separately.
@@ -466,6 +527,8 @@ void correct(
     for (label c = 0; c < nC; ++c) nuCell[c] = nuAt(c);
     std::vector<scalar> f1 = F1(k.internal, omega.internal, y, CD, nuCell, co);
     if (res && res->captureStages) { res->CD = CD; res->f1 = f1; }
+    sd.scalars("CD", CD);
+    sd.scalars("F1", f1);
     // F1 on the boundary faces, for the two diffusivities' boundary coefficients (see the header).
     std::vector<std::vector<scalar>> f1Bnd =
         F1Boundary(k, omega, y, gradK, gradOm, nu, comp ? comp->nuBnd : nullptr, patches, co);
@@ -485,6 +548,7 @@ void correct(
     }
     const std::vector<scalar> f23 = F2(k.internal, omega.internal, y, nuCell, co);
     if (res && res->captureStages) res->f23 = f23;
+    sd.scalars("F23", f23);
 
     // ---- the production limiter: omega uses the LIMITED GbyNu, k uses the raw G ------------------
     // kOmegaSSTBase.C reassigns GbyNu0 = GbyNu(GbyNu0, F23, S2) AFTER G was taken from the raw value.
@@ -494,6 +558,7 @@ void correct(
         gbLim[c] = std::fmin(gb0[c],
                              (co.c1/co.a1)*co.betaStar*omega.internal[c]
                            * std::fmax(co.a1*omega.internal[c], co.b1*f23[c]*std::sqrt(s2[c])));
+    sd.scalars("GbyNuLim", gbLim);
 
 
     // ---- omega equation --------------------------------------------------------------------------

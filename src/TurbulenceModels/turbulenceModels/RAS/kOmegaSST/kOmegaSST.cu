@@ -1,6 +1,7 @@
 // The OF-mirror kOmegaSST on the device. See kOmegaSST.cuh for why this exists alongside the legacy
 // deviceKOmegaSSTCorrect, and kOmegaSST_cpp.cu for the host twin this must agree with.
 #include "kOmegaSST.cuh"
+#include "sst_stage_dump.cuh"
 #include "turbulence_transport.cuh"   // assembleScalarTransport / solveScalarEqn -- shared with kEpsilon
 #include "kEpsilon.cuh"               // boundField: Foam::bound, the mirror's area-weighted form
 #include "device_blas.cuh"
@@ -343,6 +344,30 @@ void correct(
     DeviceBuffer<scalar> kBndLast;
     if (dbK.n) deviceBCValue(dbK, k, kBndLast);
 
+    // The closure instrument -- see sst_stage_dump.cuh. Same names as the host twin's, so the two arms
+    // diff stage by stage.
+    const brae::turbulence::SstStageDump sd = brae::turbulence::sstStageDump("cuda");
+    if (sd.on)
+    {
+        if (in.yCell) sd.scalars("y", in.yCell->host());
+        sd.scalars("kIn", k.host());
+        sd.scalars("omegaIn", omega.host());
+        sd.scalars("nutIn", nut.host());
+        sd.scalars("Ux", in.Ux->host());
+        sd.scalars("Uy", in.Uy->host());
+        sd.scalars("Uz", in.Uz->host());
+        // The patch values the device gradient sums over, in the same patch order as the host's. This
+        // arm stores none -- it evaluates them from the conditions and the cells -- so the same
+        // reconstruction the gradient uses is what gets written.
+        DeviceBuffer<scalar> ubx, uby, ubz;
+        deviceBCValue(dbU.comp[0], *in.Ux, ubx);
+        deviceBCValue(dbU.comp[1], *in.Uy, uby);
+        deviceBCValue(dbU.comp[2], *in.Uz, ubz);
+        sd.scalars("UbX", ubx.host());
+        sd.scalars("UbY", uby.host());
+        sd.scalars("UbZ", ubz.host());
+    }
+
     // ---- production, from the CURRENT nut (the previous outer iteration's correctNut) ----------
     DeviceBuffer<scalar> gradU, S2, GbyNu0, G;
     deviceGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, gradU);
@@ -352,6 +377,20 @@ void correct(
     deviceGByNuFromGradU(gradU, nC, GbyNu0);
     G.resize(nC);
     deviceHadamard(G, nut, GbyNu0);
+    if (sd.on)
+    {
+        // The device holds gradU COMPONENT-major (all xx, then all xy, ...); the host holds one tensor
+        // per cell. Remapped here so both arms write the same nine columns per cell and a diff of the
+        // two files is a diff of the gradient, not of two layouts.
+        const std::vector<scalar> gu = gradU.host();
+        std::vector<scalar> flat(gu.size());
+        for (int comp = 0; comp < 9; ++comp)
+            for (int c = 0; c < nC; ++c)
+                flat[static_cast<std::size_t>(c) * 9 + comp] = gu[static_cast<std::size_t>(comp) * nC + c];
+        sd.components("gradU", flat, 9);
+        sd.scalars("S2", S2.host());
+        sd.scalars("GbyNu0", GbyNu0.host());
+    }
 
     // TWO divergences, because OpenFOAM uses two different fluxes and they coincide only at constant
     // density: `bounded` subtracts fvm::Sp(fvc::div(phi), psi) with the equation's OWN (mass) flux,
@@ -397,17 +436,37 @@ void correct(
     }
 
     // ---- CDkOmega, F1, F2 ---------------------------------------------------------------------
+    // CDkOmega takes fvc::grad(k_) & fvc::grad(omega_) (kOmegaSSTBase.C:555-558), and fvc::grad(vf)
+    // resolves its scheme by the FIELD's name -- "grad(k)", "grad(omega)" -- through gradSchemes
+    // (fvcGrad.C:149). A case naming those `cellLimited Gauss linear 1` therefore limits both, which the
+    // host reference does (kOmegaSST_cpp.cu:458-461) and this arm did not: it took the plain Gauss
+    // gradient whatever the case said, the same defect grad(U) already carried a limiter for above.
+    // Invisible on every fixture whose grad(k)/grad(omega) is plain `Gauss linear`. Measured on
+    // OpenFOAM's own aerofoilNACA0012 tutorial, which names cellLimited for U, k and omega: CUDA arm
+    // k 7.0e-09 off OpenFOAM at iteration 1 in the 554 cells around the farfield, growing to omega
+    // 3.7e-03 and U 1.1e-08 by iteration 3, where the host arm holds 2.6e-12 throughout.
     DeviceBuffer<scalar> kbv, obv, kgx, kgy, kgz, ogx, ogy, ogz, CD, F1, F2;
     deviceBCValue(dbK, k, kbv);
     deviceGaussGrad(dm, k, kbv, kgx, kgy, kgz);
+    if (in.co.gradKLimitK > scalar(0))
+        deviceCellLimitGrad(dm, k, kbv, kgx, kgy, kgz, in.co.gradKLimitK);
     if (omegaBndLast.size()) deviceCopy(obv, omegaBndLast);
     else                     deviceBCValue(dbOmega, omega, obv);
     deviceGaussGrad(dm, omega, obv, ogx, ogy, ogz);
+    if (in.co.gradKLimitK > scalar(0))
+        deviceCellLimitGrad(dm, omega, obv, ogx, ogy, ogz, in.co.gradKLimitK);
     deviceCDkOmega(kgx, kgy, kgz, ogx, ogy, ogz, omega, in.co.alphaOmega2, CD);
     // F1/F2 blend on the KINEMATIC laminar viscosity, per cell -- the compressible lineage has no
     // case-constant nu, and arg1/arg2 are written in nu, not mu.
     deviceF1(k, omega, *in.yCell, CD, scalar(0), in.co, F1, /*lm=*/false, in.nuCell);
     deviceF2(k, omega, *in.yCell, scalar(0), in.co, F2, in.nuCell);
+    if (sd.on)
+    {
+        sd.scalars("G", G.host());
+        sd.scalars("CD", CD.host());
+        sd.scalars("F1", F1.host());
+        sd.scalars("F23", F2.host());
+    }
 
     // ---- the production limiter: omega uses the LIMITED GbyNu, k uses the raw G ---------------
     // kOmegaSSTBase.C reassigns GbyNu0 = GbyNu(GbyNu0, F23, S2) AFTER G was taken from the raw value.
@@ -416,6 +475,7 @@ void correct(
     deviceBlend(F1, in.co.gamma1, in.co.gamma2, gamma);
     deviceBlend(F1, in.co.beta1,  in.co.beta2,  beta);
     deviceGbyNuLimit(GbyNu0, omega, F2, S2, in.co, GbyNu0lim);
+    if (sd.on) sd.scalars("GbyNuLim", GbyNu0lim.host());
 
     // The boundary diffusivities take F1 EVALUATED ON the patch faces -- see f1BoundaryKernel. Not
     // deviceBCValue on omega's boundary (that applies OMEGA's conditions to F1, so a fixedValue omega

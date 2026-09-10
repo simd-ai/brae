@@ -398,21 +398,37 @@ void deviceUpdateMixedFreestream(
     const DeviceBuffer<scalar>& Uy,
     const DeviceBuffer<scalar>& Uz,
     const DeviceBuffer<scalar>* rhoBnd,
-    int which)
+    int which,
+    const DeviceBuffer<scalar>* UbX,
+    const DeviceBuffer<scalar>* UbY,
+    const DeviceBuffer<scalar>* UbZ)
 {
     const int n = dbP.n;
     if (n == 0) return;
-    // OF's `Up` is the patch field's CURRENT value, i.e. the previous evaluate -- so evaluating here with
-    // the existing valueFraction before overwriting it is the same lag OF has.
+    // OF's `Up` is the patch field's STORED value -- `const Field<vector>& Up = *this` -- the one its last
+    // evaluate wrote. When the caller carries that (the rhoSimpleFoam mirror does, as f.UxBnd/UyBnd/UzBnd),
+    // it is used verbatim. Re-evaluating here instead reads the cells AS THEY STAND NOW, which is the same
+    // number only while they have not moved since that evaluate; on aerofoilNACA0012's farfield the two
+    // differ by up to 8.1e-04, which enters gaussGrad's boundary sum and moves grad(U) in the inlet layer.
+    const bool stored = UbX && UbY && UbZ
+                     && UbX->size() == static_cast<std::size_t>(n)
+                     && UbY->size() == static_cast<std::size_t>(n)
+                     && UbZ->size() == static_cast<std::size_t>(n);
     DeviceBuffer<scalar> ub0, ub1, ub2;
-    deviceBCValue(dbU.comp[0], Ux, ub0);
-    deviceBCValue(dbU.comp[1], Uy, ub1);
-    deviceBCValue(dbU.comp[2], Uz, ub2);
+    if (!stored)
+    {
+        deviceBCValue(dbU.comp[0], Ux, ub0);
+        deviceBCValue(dbU.comp[1], Uy, ub1);
+        deviceBCValue(dbU.comp[2], Uz, ub2);
+    }
+    const scalar* pub0 = stored ? UbX->data() : ub0.data();
+    const scalar* pub1 = stored ? UbY->data() : ub1.data();
+    const scalar* pub2 = stored ? UbZ->data() : ub2.data();
     mixedUpdateKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].mixedMask.data(), dbP.mixedMask.data(), dbP.faceCell.data(),
                                            phiBnd.data(), dbP.magSf.data(),
                                            (rhoBnd && rhoBnd->size() == static_cast<std::size_t>(n)) ? rhoBnd->data() : nullptr,
                                            Ux.data(), Uy.data(), Uz.data(),
-                                           ub0.data(), ub1.data(), ub2.data(),
+                                           pub0, pub1, pub2,
                                            dbU.nx.data(), dbU.ny.data(), dbU.nz.data(),
                                            dbU.comp[0].valueFraction.data(), dbU.comp[1].valueFraction.data(),
                                            dbU.comp[2].valueFraction.data(), dbP.valueFraction.data(),

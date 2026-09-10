@@ -2433,6 +2433,18 @@ add_test(NAME rho_generalized_newtonian_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_generalized_newtonian_vs_openfoam.sh)
 set_tests_properties(rho_generalized_newtonian_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
+# aerofoilNACA0012, the only rhoSimpleFoam tutorial naming `cellLimited Gauss linear 1` for grad(k) and
+# grad(omega) as well as grad(U), on BOTH mirror arms. CDkOmega takes fvc::grad(k) & fvc::grad(omega),
+# which resolve their scheme by field name, so this case limits them where every other fixture does not
+# -- the device arm took the plain Gauss gradient and no gate ran it (naca_vs_openfoam drives the
+# pre-mirror path; limit_temperature runs this tutorial on the host arm only). The CUDA bound is 1e-06
+# and not the host's 1e-11 because of a SECOND, open device gap at iteration 1 that the script names and
+# measures; the omega bound of 1e-07 is the tight one the limiter fix owns (3.8e-09 with it, 3.7e-03
+# without).
+add_test(NAME rho_aerofoil_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_aerofoil_vs_openfoam.sh)
+set_tests_properties(rho_aerofoil_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
 # The `coded` massFlowRate Function1 on both mirror arms: squareBendLiq's own snippet, and a second one
 # that varies with the time (5*(1 + 0.05*t)) so a brae that froze the rate cannot pass -- which is what
 # found the device k assembly reading k's patch values live where the host reference reads the stored

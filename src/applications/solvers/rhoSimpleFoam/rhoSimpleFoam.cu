@@ -382,7 +382,8 @@ void updateBoundaryCoeffs(
     //    momentum gradient -- the relaxed blend, or the limiter's re-evaluation (queue items 23 and 25).
     if (in.hasMixed)
     {
-        deviceUpdateMixedFreestream(dbU, dbP, f.phiBnd, f.Ux, f.Uy, f.Uz, &f.rhoBnd, /*which=*/1);
+        deviceUpdateMixedFreestream(dbU, dbP, f.phiBnd, f.Ux, f.Uy, f.Uz, &f.rhoBnd, /*which=*/1,
+                                                     &f.UxBnd, &f.UyBnd, &f.UzBnd);
     }
 
     // 2b. pressureInletOutletVelocity, whose updateCoeffs OpenFOAM reaches inside the momentum fvMatrix
@@ -973,7 +974,8 @@ Residuals rhoSimpleStep(
     // started with, and rho's patch value as it stands -- pcEqn.H:1's on the SIMPLEC branch, the previous
     // tail's on the other.
     // ...and freestreamPressure's valueFraction, from U's patch value as the momentum solve left it.
-    if (in.hasMixed) deviceUpdateMixedFreestream(dbU, dbP, f.phiBnd, f.Ux, f.Uy, f.Uz, &f.rhoBnd, /*which=*/2);
+    if (in.hasMixed) deviceUpdateMixedFreestream(dbU, dbP, f.phiBnd, f.Ux, f.Uy, f.Uz, &f.rhoBnd, /*which=*/2,
+                                                     &f.UxBnd, &f.UyBnd, &f.UzBnd);
     deviceUpdateTotalPressure(dbP, f.phiBnd, f.UxBnd, f.UyBnd, f.UzBnd, &f.rhoBnd);
     deviceBCValue(dbP, f.p, f.pBnd);
 
@@ -1156,7 +1158,8 @@ Residuals rhoSimpleStep(
         updateFlowRateInlets(f, in, dbU);
         // freestreamVelocity's valueFraction rebuilt from the patch's current value, as OpenFOAM's evaluate
         // does here (freestreamVelocityFvPatchVectorField.C:106; the host step carries the measurement).
-        if (in.hasMixed) deviceUpdateMixedFreestream(dbU, dbP, f.phiBnd, f.Ux, f.Uy, f.Uz, &f.rhoBnd, /*which=*/1);
+        if (in.hasMixed) deviceUpdateMixedFreestream(dbU, dbP, f.phiBnd, f.Ux, f.Uy, f.Uz, &f.rhoBnd, /*which=*/1,
+                                                     &f.UxBnd, &f.UyBnd, &f.UzBnd);
         deviceUpdateSymmetry(dbU, f.Ux, f.Uy, f.Uz);
         deviceUpdateWedge(dbU, f.Ux, f.Uy, f.Uz);
         deviceBCValue(dbU.comp[0], f.Ux, f.UxBnd);
@@ -1191,7 +1194,8 @@ Residuals rhoSimpleStep(
     // disk and the one the next momentum assembly reads through grad(p).
     if (pLimited || closedVolume)
     {
-        if (in.hasMixed) deviceUpdateMixedFreestream(dbU, dbP, f.phiBnd, f.Ux, f.Uy, f.Uz, &f.rhoBnd, /*which=*/2);
+        if (in.hasMixed) deviceUpdateMixedFreestream(dbU, dbP, f.phiBnd, f.Ux, f.Uy, f.Uz, &f.rhoBnd, /*which=*/2,
+                                                     &f.UxBnd, &f.UyBnd, &f.UzBnd);
         deviceUpdateTotalPressure(dbP, f.phiBnd, f.UxBnd, f.UyBnd, f.UzBnd, &f.rhoBnd);
         deviceBCValue(dbP, f.p, f.pBnd);
     }

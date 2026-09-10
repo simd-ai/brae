@@ -171,7 +171,16 @@ void deviceUpdateMixedFreestream(DeviceVectorBoundary& dbU, DeviceBoundary& dbP,
                                  const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy,
                                  const DeviceBuffer<scalar>& Uz,
                                  const DeviceBuffer<scalar>* rhoBnd = nullptr,   // compressible: rho at boundary faces
-                                 int which = 3);
+                                 int which = 3,
+                                 // OF's `Up` is the patch field's OWN STORED value -- `const Field<vector>& Up = *this`
+                                 // (freestreamVelocityFvPatchVectorField.C) -- i.e. what the last evaluate left, NOT a
+                                 // re-evaluation against the cells as they stand now. Pass the stored patch velocity
+                                 // (the rhoSimpleFoam mirror carries it as f.UxBnd/UyBnd/UzBnd, refreshed exactly where
+                                 // the host reference calls U.evaluateBoundary) and this uses it. Null keeps the old
+                                 // reconstruction, which is the same number only while the cells have not moved since.
+                                 const DeviceBuffer<scalar>* UbX = nullptr,
+                                 const DeviceBuffer<scalar>* UbY = nullptr,
+                                 const DeviceBuffer<scalar>* UbZ = nullptr);
 // constrainHbyA at mixed velocity faces: OF resets phiHbyA_b = U_b.Sf at fixesValue patches (mixed fixesValue=true).
 // cf's HbyA boundary value uses HbyA_cell in the (1-vf) part; at mixed faces replace hb[k] with the boundary value
 // of U itself (U_b = (1-vf) U_cell + vf U_freestream) so the boundary flux uses U_b, not HbyA_b. Non-mixed faces
