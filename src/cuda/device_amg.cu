@@ -9,7 +9,9 @@
 #include "amg_kernels.cuh"        // mixed-precision V-cycle template kernels (zeroT/smoothT/residualT/gsColorT/restrictT/prolongT)
 #include "device_amg_internal.cuh"// shared AMG-core infra: LduF/lduF/cast_ (FP32 stack), Coloring/greedyColor/gsSweep, gsScaleInvK
 #include <cuda_runtime.h>
-#include <cooperative_groups.h>
+#ifndef BRAE_ACPP
+#include <cooperative_groups.h>   // unused in this file (no cg:: calls) but kept for the CUDA build as-is
+#endif
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -21,7 +23,9 @@
 #include <vector>
 #include <mutex>
 
+#ifndef BRAE_ACPP
 namespace cg = cooperative_groups;
+#endif
 
 namespace brae {
 
@@ -32,20 +36,24 @@ void amgCastFP32(AMGData& amg, const DeviceLduView& A);
 
 AMGGraphCache::~AMGGraphCache()
 {
+#ifndef BRAE_ACPP
     if (exec) cudaGraphExecDestroy(exec);
     if (graph) cudaGraphDestroy(graph);
+#endif
 }
 
 PCGGraphCache::~PCGGraphCache()
 {
+#ifndef BRAE_ACPP
     if (exec) cudaGraphExecDestroy(exec);
     if (graph) cudaGraphDestroy(graph);
+#endif
 }
 
 namespace {
 // General Galerkin RAP scatter (BRAE_AMG_SA): A_c[dst] += w * A_fine[src] over a precomputed triple list.
 // srcKind/dstKind: 0=diag 1=upper 2=lower. One thread per triple into the zeroed coarse LDU; the SA twin of galDiagK/galFaceK.
-__global__
+__device__
 void rapScatterK(
     int nT,
     const label* __restrict__ srcKind,
@@ -71,7 +79,7 @@ void rapScatterK(
     else atomicAdd(&cLo[di], v);
 }
 // Injection Galerkin scatter (default path): coarse LDU from fine diag/upper/lower via faceRestrict/faceFlip.
-__global__
+__device__
 void galDiagK(
     int nF,
     const label* __restrict__ map,
@@ -81,7 +89,7 @@ void galDiagK(
     const int c = blockIdx.x*blockDim.x + threadIdx.x;
     if (c < nF) atomicAdd(&cDiag[map[c]], fineDiag[c]);
 }
-__global__
+__device__
 void galFaceK(
     int nFaces,
     const label* __restrict__ fr,
@@ -917,17 +925,31 @@ void amgGalerkin(
             fl = A.level[k-1].cLower.data();
             nFaces = A.level[k-1].nCoarseFaces;
         }
-        zeroT<scalar><<<nBlocks(L.nCoarse),TPB>>>(L.nCoarse, L.cDiag.data());
-        zeroT<scalar><<<nBlocks(L.nCoarseFaces),TPB>>>(L.nCoarseFaces, L.cUpper.data());
-        zeroT<scalar><<<nBlocks(L.nCoarseFaces),TPB>>>(L.nCoarseFaces, L.cLower.data());
+        zeroTLaunch<scalar>(L.nCoarse, L.cDiag.data());
+        zeroTLaunch<scalar>(L.nCoarseFaces, L.cUpper.data());
+        zeroTLaunch<scalar>(L.nCoarseFaces, L.cLower.data());
         if (A.saSmooth)                                          // general Galerkin A_c = P^T A P (precomputed RAP recipe)
-            rapScatterK<<<nBlocks(L.nTriples),TPB>>>(L.nTriples, L.rapSrcKind.data(), L.rapSrcIdx.data(), L.rapW.data(),
-                L.rapDstKind.data(), L.rapDstIdx.data(), fd, fu, fl, L.cDiag.data(), L.cUpper.data(), L.cLower.data());
+        {
+            const int nT = L.nTriples;
+            const label* srcKind = L.rapSrcKind.data(); const label* srcIdx = L.rapSrcIdx.data();
+            const scalar* w = L.rapW.data();
+            const label* dstKind = L.rapDstKind.data(); const label* dstIdx = L.rapDstIdx.data();
+            scalar* cDiag = L.cDiag.data(); scalar* cUp = L.cUpper.data(); scalar* cLo = L.cLower.data();
+            pcudaParallelFor(nBlocks(nT), TPB, [=] __device__ () {
+                rapScatterK(nT, srcKind, srcIdx, w, dstKind, dstIdx, fd, fu, fl, cDiag, cUp, cLo); });
+        }
         else                                                  // injection Galerkin (default): face-restrict scatter
         {
-            galDiagK<<<nBlocks(L.nFine),TPB>>>(L.nFine, L.map.data(), fd, L.cDiag.data());
-            galFaceK<<<nBlocks(nFaces),TPB>>>(nFaces, L.faceRestrict.data(), L.faceFlip.data(), fu, fl,
-                                              L.cDiag.data(), L.cUpper.data(), L.cLower.data());
+            {
+                const int nF = L.nFine; const label* map = L.map.data(); scalar* cDiag = L.cDiag.data();
+                pcudaParallelFor(nBlocks(nF), TPB, [=] __device__ () { galDiagK(nF, map, fd, cDiag); });
+            }
+            {
+                const label* fr = L.faceRestrict.data(); const label* flip = L.faceFlip.data();
+                scalar* cDiag = L.cDiag.data(); scalar* cUp = L.cUpper.data(); scalar* cLo = L.cLower.data();
+                pcudaParallelFor(nBlocks(nFaces), TPB, [=] __device__ () {
+                    galFaceK(nFaces, fr, flip, fu, fl, cDiag, cUp, cLo); });
+            }
         }
     }
     cudaCheck(cudaGetLastError(), "galerkin");

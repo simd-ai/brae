@@ -1,25 +1,44 @@
 cmake_minimum_required(VERSION 3.24)
 
-# Target NVIDIA GB10 / Grace Blackwell (sm_121). Override with
-# -DCMAKE_CUDA_ARCHITECTURES=90 etc. on older toolkits. Phase 1 is host code in .cu
-# files (compiled by nvcc); the arch matters once kernels land in the G-phases.
-set(BRAE_DEFAULT_CUDA_ARCH 121)
-if(NOT DEFINED CACHE{CMAKE_CUDA_ARCHITECTURES})
-    set(CMAKE_CUDA_ARCHITECTURES ${BRAE_DEFAULT_CUDA_ARCH}
-        CACHE STRING "CUDA architectures cf is built for" FORCE)
+# BRAE_BACKEND: CUDA (default, full solver) or ACPP (AdaptiveCpp/PCUDA, partial -- see BRAE_CUDA_ONLY_SOURCES
+# below for what's excluded). Must be set before project(), since it picks which languages get enabled.
+if(NOT DEFINED CACHE{BRAE_BACKEND})
+    set(BRAE_BACKEND "CUDA" CACHE STRING "Compute backend: CUDA (nvcc, full solver) or ACPP (AdaptiveCpp/SYCL, portable subset)")
+endif()
+set_property(CACHE BRAE_BACKEND PROPERTY STRINGS CUDA ACPP)
+if(NOT BRAE_BACKEND STREQUAL "CUDA" AND NOT BRAE_BACKEND STREQUAL "ACPP")
+    message(FATAL_ERROR "BRAE_BACKEND must be CUDA or ACPP, got '${BRAE_BACKEND}'")
 endif()
 
-project(brae VERSION 0.3.1 LANGUAGES CXX CUDA)
+if(BRAE_BACKEND STREQUAL "CUDA")
+    # Target NVIDIA GB10 / Grace Blackwell (sm_121). Override with
+    # -DCMAKE_CUDA_ARCHITECTURES=90 etc. on older toolkits. Phase 1 is host code in .cu
+    # files (compiled by nvcc); the arch matters once kernels land in the G-phases.
+    set(BRAE_DEFAULT_CUDA_ARCH 121)
+    if(NOT DEFINED CACHE{CMAKE_CUDA_ARCHITECTURES})
+        set(CMAKE_CUDA_ARCHITECTURES ${BRAE_DEFAULT_CUDA_ARCH}
+            CACHE STRING "CUDA architectures cf is built for" FORCE)
+    endif()
+    project(brae VERSION 0.3.1 LANGUAGES CXX CUDA)
+else()
+    # acpp/syclcc is invoked as a CXX compiler (see brae_route_target_through_acpp() below), so no CUDA toolkit needed.
+    project(brae VERSION 0.3.1 LANGUAGES CXX)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-# Per-thread default stream: makes the implicit <<<>>> stream a regular (capturable) per-thread stream, so the
-# AMG V-cycle can be recorded into a CUDA graph and replayed (kills host launch overhead). cf's GPU path is
-# single-threaded, so this is semantically identical to the legacy default stream. Applied to ALL TUs (no mixing).
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --default-stream per-thread")
+
+if(BRAE_BACKEND STREQUAL "CUDA")
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    # Per-thread default stream: makes the implicit <<<>>> stream a regular (capturable) per-thread stream, so the
+    # AMG V-cycle can be recorded into a CUDA graph and replayed (kills host launch overhead). cf's GPU path is
+    # single-threaded, so this is semantically identical to the legacy default stream. Applied to ALL TUs (no mixing).
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --default-stream per-thread")
+    # --extended-lambda: required for pcudaParallelFor's trampoline kernel (pcuda_compat.cuh).
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --extended-lambda")
+endif()
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
@@ -35,13 +54,23 @@ find_package(ZLIB REQUIRED)
 # nCells x nWallFaces; on complex geometries like motorBike the bike surface has ~40k faces -> minutes single-
 # threaded). Optional: if OpenMP is absent the #pragma omp lines are ignored and the loops run serially (no-op).
 find_package(OpenMP)
-if(OpenMP_CXX_FOUND)
+if(OpenMP_CXX_FOUND AND BRAE_BACKEND STREQUAL "CUDA")
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=-fopenmp")
 endif()
 
-# CUDAToolkit: the NVRTC runtime compiler (CUDA::nvrtc) + the driver API (CUDA::cuda_driver) for the device-resident
-# runtime-compiled boundary conditions (device_coded_bc.cu: nvrtc -> PTX -> cuModuleLoadData -> cuLaunchKernel).
-find_package(CUDAToolkit REQUIRED)
+if(BRAE_BACKEND STREQUAL "CUDA")
+    # CUDAToolkit: the NVRTC runtime compiler (CUDA::nvrtc) + the driver API (CUDA::cuda_driver) for the
+    # device-resident runtime-compiled boundary conditions (device_coded_bc.cu: nvrtc -> PTX ->
+    # cuModuleLoadData -> cuLaunchKernel). No PCUDA equivalent; excluded from the ACPP build below.
+    find_package(CUDAToolkit REQUIRED)
+else()
+    # AdaptiveCpp_DIR must point at <acpp-install>/lib/cmake/AdaptiveCpp; PCUDA needs --acpp-targets=generic.
+    if(NOT DEFINED CACHE{ACPP_EXTRA_ARGS})
+        set(ACPP_EXTRA_ARGS "--acpp-targets=generic --acpp-pcuda --acpp-pcuda-chevron-launch"
+            CACHE STRING "Arguments to pass through directly to acpp.")
+    endif()
+    find_package(AdaptiveCpp CONFIG REQUIRED)
+endif()
 
 # SCOTCH, cell-graph partitioner (the decomposePar-equivalent), matching OpenFOAM.
 find_path(SCOTCH_INCLUDE_DIR NAMES scotch.h PATH_SUFFIXES scotch REQUIRED)
@@ -62,7 +91,7 @@ list(REMOVE_DUPLICATES BRAE_HEADER_DIRS)
 # ---------------------------------------------------------------------------
 # brae_core, Phase 1 substrate (comm seam + interfaces). Grows as modules land.
 # ---------------------------------------------------------------------------
-add_library(brae_core STATIC
+set(BRAE_CORE_SOURCES
     src/parallel/pstream/cf_pstream.cu
     src/parallel/pstream/device_halo.cu
     src/parallel/pstream/device_reduce.cu
@@ -100,7 +129,6 @@ add_library(brae_core STATIC
     src/cuda/device_smagorinsky.cu
     src/cuda/device_deshybrid.cu
     src/cuda/device_generalized_newtonian.cu
-    src/cuda/device_coded_bc.cu
     src/cuda/device_energy.cu
     src/thermophysicalModels/device_thermo.cu
     src/finiteVolume/cfdTools/MRF/device_mrf.cu
@@ -113,15 +141,32 @@ add_library(brae_core STATIC
     src/cuda/device_amg_gauss_seidel.cu
     src/cuda/device_amg_vcycle.cu
     src/cuda/device_amg_pcg.cu
-    src/cuda/device_cluster.cu
     src/cuda/device_cyclic.cu
     src/cuda/device_ami.cu
     src/applications/solvers/simpleFoam/device_simple_foam.cu
 )
+
+# No PCUDA equivalent, excluded from the ACPP build:
+#   device_coded_bc.cu   NVRTC + driver API (JIT-compiled user BC snippets)
+#   device_cluster.cu    thread-block clusters + DSM (sm_90+ only)
+set(BRAE_CUDA_ONLY_SOURCES
+    src/cuda/device_coded_bc.cu
+    src/cuda/device_cluster.cu
+)
+if(BRAE_BACKEND STREQUAL "CUDA")
+    list(APPEND BRAE_CORE_SOURCES ${BRAE_CUDA_ONLY_SOURCES})
+else()
+    list(APPEND BRAE_CORE_SOURCES src/cuda/device_coded_bc_acpp_stub.cpp)
+endif()
+
+add_library(brae_core STATIC ${BRAE_CORE_SOURCES})
 target_include_directories(brae_core PUBLIC ${BRAE_HEADER_DIRS} ${MPI_CXX_INCLUDE_DIRS} ${SCOTCH_INCLUDE_DIR})
 # Link MPI libraries directly (not the imported target) so its CXX compile flags do not
 # reach nvcc, which would reject them.
-target_link_libraries(brae_core PUBLIC ${MPI_CXX_LIBRARIES} ${SCOTCH_LIBRARY} ${SCOTCH_ERR_LIBRARY} ZLIB::ZLIB CUDA::nvrtc CUDA::cuda_driver)
+target_link_libraries(brae_core PUBLIC ${MPI_CXX_LIBRARIES} ${SCOTCH_LIBRARY} ${SCOTCH_ERR_LIBRARY} ZLIB::ZLIB)
+if(BRAE_BACKEND STREQUAL "CUDA")
+    target_link_libraries(brae_core PUBLIC CUDA::nvrtc CUDA::cuda_driver)
+endif()
 # OpenMP runtime (libgomp) linked directly, like MPI above, the imported target's CXX compile flags would reach nvcc.
 if(OpenMP_CXX_FOUND)
     target_link_libraries(brae_core PUBLIC ${OpenMP_CXX_LIBRARIES})
@@ -135,6 +180,9 @@ endif()
 # Override the location with -DNVSHMEM_HOME=... or the NVSHMEM_HOME env var.
 # ---------------------------------------------------------------------------
 option(BRAE_WITH_NVSHMEM "Build the NVSHMEM device transport for multi-GPU" ON)
+if(BRAE_BACKEND STREQUAL "ACPP")
+    set(BRAE_WITH_NVSHMEM OFF)
+endif()
 if(BRAE_WITH_NVSHMEM)
     find_path(NVSHMEM_INCLUDE_DIR NAMES nvshmem.h
         HINTS $ENV{NVSHMEM_HOME} ${NVSHMEM_HOME}
@@ -1815,6 +1863,45 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/demo/amgpcg/trace_brae.cu")
     add_executable(trace_brae demo/amgpcg/trace_brae.cu)
     target_include_directories(trace_brae PRIVATE ${BRAE_HEADER_DIRS})
     target_link_libraries(trace_brae PRIVATE brae_core)
+endif()
+
+# ---------------------------------------------------------------------------
+# ACPP backend routing: retrofit every .cu-source target (LANGUAGE -> CXX + AdaptiveCpp's compiler-launch rule).
+# Test targets aren't ACPP-audited -- build a specific target (`--target brae`), not `all`.
+# ---------------------------------------------------------------------------
+if(BRAE_BACKEND STREQUAL "ACPP")
+    function(brae_route_target_through_acpp _target)
+        get_target_property(_srcs ${_target} SOURCES)
+        if(NOT _srcs)
+            return()
+        endif()
+        set(_has_cuda_src FALSE)
+        foreach(_src ${_srcs})
+            if(_src MATCHES "\\.cuh?$")
+                set(_has_cuda_src TRUE)
+                set_source_files_properties("${_src}" PROPERTIES LANGUAGE CXX)
+            endif()
+        endforeach()
+        if(_has_cuda_src)
+            set_target_properties(${_target} PROPERTIES
+                RULE_LAUNCH_COMPILE "${ACPP_COMPILER_LAUNCH_RULE}"
+                RULE_LAUNCH_LINK    "${ACPP_COMPILER_LAUNCH_RULE}")
+            target_link_libraries(${_target} PRIVATE AdaptiveCpp::acpp-rt)
+            target_compile_definitions(${_target} PRIVATE BRAE_ACPP)
+            # Force-includes acpp_pcuda_compat.cuh (cuda_runtime.h + the nvcc-isms PCUDA doesn't predefine).
+            # One -include, not two -- CMake's Makefile generator collapses a second one into the first.
+            target_compile_options(${_target} PRIVATE
+                -include "${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/acpp_pcuda_compat.cuh")
+        endif()
+    endfunction()
+
+    get_property(_brae_all_targets DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(_t ${_brae_all_targets})
+        get_target_property(_t_type ${_t} TYPE)
+        if(_t_type STREQUAL "EXECUTABLE" OR _t_type STREQUAL "STATIC_LIBRARY")
+            brae_route_target_through_acpp(${_t})
+        endif()
+    endforeach()
 endif()
 
 # ---- install ---------------------------------------------------------------------------------------------------

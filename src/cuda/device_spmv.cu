@@ -3,6 +3,7 @@
 #include "device_ldu.cuh"
 #include "device_halo.cuh"
 #include "distributed_ami.cuh"   // DistributedAMI + distributedAmiAmul: optional cyclicAMI coupling in the matvec
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -11,7 +12,7 @@ namespace {
 constexpr int TPB = 256;
 
 
-__global__
+__device__
 void amulKernel(
     int nC,
     const scalar* __restrict__ diag,
@@ -44,7 +45,7 @@ void amulKernel(
 
 // cyclic (periodic) interface off-diagonal, OpenFOAM cyclicFvPatchField::updateInterfaceMatrix. One thread per
 // cyclic face: Apsi[own] += coeff*psi[nbr]. atomicAdd because a cell may own faces on several interfaces.
-__global__
+__device__
 void cyclicAmulKernel(
     int nCyc,
     const label* __restrict__ own,
@@ -61,7 +62,7 @@ void cyclicAmulKernel(
 
 
 // cyclicAMI weighted-stencil off-diagonal, one thread per source face: Apsi[own] += ifc * sum_k w*psi[nbr].
-__global__
+__device__
 void amiAmulKernel(
     int n,
     const label* __restrict__ own,
@@ -87,17 +88,30 @@ void deviceAmul(const DeviceLduView& A, const DeviceBuffer<scalar>& psi, DeviceB
 {
     Apsi.resize(A.nCells);
     const int blocks = (A.nCells + TPB - 1) / TPB;
-    amulKernel<<<blocks, TPB>>>(A.nCells, A.diag, A.upper, A.lower, A.nei, A.owner,
-                                A.ownerStart, A.losort, A.losortStart, psi.data(), Apsi.data());
+    const scalar* psid = psi.data();
+    scalar* Apsid = Apsi.data();
+    const int nC = A.nCells, nCyc = A.nCyc, nAmi = A.nAmi;
+    const scalar *diag = A.diag, *upper = A.upper, *lower = A.lower;
+    const label *nei = A.nei, *owner = A.owner, *ownerStart = A.ownerStart, *losort = A.losort, *losortStart = A.losortStart;
+    pcudaParallelFor(blocks, TPB, [=] __device__ () {
+        amulKernel(nC, diag, upper, lower, nei, owner, ownerStart, losort, losortStart, psid, Apsid);
+    });
     cudaCheck(cudaGetLastError(), "amul");
     if (A.nCyc > 0)
     {
-        cyclicAmulKernel<<<(A.nCyc + TPB - 1) / TPB, TPB>>>(A.nCyc, A.cycOwn, A.cycNbr, A.cycCoeff, psi.data(), Apsi.data());
+        const label* cycOwn = A.cycOwn; const label* cycNbr = A.cycNbr; const scalar* cycCoeff = A.cycCoeff;
+        pcudaParallelFor((nCyc + TPB - 1) / TPB, TPB, [=] __device__ () {
+            cyclicAmulKernel(nCyc, cycOwn, cycNbr, cycCoeff, psid, Apsid);
+        });
         cudaCheck(cudaGetLastError(), "cyclicAmul");
     }
     if (A.nAmi > 0)
     {
-        amiAmulKernel<<<(A.nAmi + TPB - 1) / TPB, TPB>>>(A.nAmi, A.amiOwn, A.amiOff, A.amiNbr, A.amiW, A.amiIfc, psi.data(), Apsi.data());
+        const label* amiOwn = A.amiOwn; const label* amiOff = A.amiOff; const label* amiNbr = A.amiNbr;
+        const scalar* amiW = A.amiW; const scalar* amiIfc = A.amiIfc;
+        pcudaParallelFor((nAmi + TPB - 1) / TPB, TPB, [=] __device__ () {
+            amiAmulKernel(nAmi, amiOwn, amiOff, amiNbr, amiW, amiIfc, psid, Apsid);
+        });
         cudaCheck(cudaGetLastError(), "amiAmul");
     }
 }

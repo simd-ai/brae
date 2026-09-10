@@ -12,6 +12,7 @@
 #include "device_cyclic.cuh"
 #include "device_interface.cuh"
 #include "device_amg.cuh"
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 #include <cmath>
 
@@ -22,7 +23,7 @@ namespace {
 inline scalar yPlusLamHost(scalar kappa, scalar E) { scalar y = 11.0; for (int i = 0; i < 10; ++i) y = std::log(std::fmax(E*y, 1.0)) / kappa; return y; }
 
 
-__global__
+__device__
 void s2Kernel(int nC, const scalar* __restrict__ gradU, scalar* __restrict__ S2)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -42,7 +43,7 @@ void s2Kernel(int nC, const scalar* __restrict__ gradU, scalar* __restrict__ S2)
 }
 
 
-__global__
+__device__
 void cdKernel(
     int nC,
     const scalar* __restrict__ gKx,
@@ -63,7 +64,7 @@ void cdKernel(
 }
 
 
-__global__
+__device__
 void f1Kernel(
     int nC,
     const scalar* __restrict__ k,
@@ -107,7 +108,7 @@ void f1Kernel(
 }
 
 
-__global__
+__device__
 void f2Kernel(
     int nC,
     const scalar* __restrict__ k,
@@ -130,7 +131,7 @@ void f2Kernel(
 }
 
 
-__global__
+__device__
 void blendKernel(int nC, const scalar* __restrict__ F1, scalar psi1, scalar psi2, scalar* __restrict__ out)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -139,7 +140,7 @@ void blendKernel(int nC, const scalar* __restrict__ F1, scalar psi1, scalar psi2
 
 
 // correctNut: nut = a1*k / max(a1*omega, b1*F2*sqrt(S2))
-__global__
+__device__
 void nutSSTKernel(
     int nC,
     const scalar* __restrict__ k,
@@ -159,7 +160,7 @@ void nutSSTKernel(
 
 
 // Pk = min(G, c1*betaStar*k*omega)
-__global__
+__device__
 void pkKernel(
     int nC,
     const scalar* __restrict__ G,
@@ -176,7 +177,7 @@ void pkKernel(
 
 
 // GbyNu = min(GbyNu0, (c1/a1)*betaStar*omega*max(a1*omega, b1*F2*sqrt(S2)))
-__global__
+__device__
 void gbyNuLimitKernel(
     int nC,
     const scalar* __restrict__ GbyNu0,
@@ -198,7 +199,7 @@ void gbyNuLimitKernel(
 
 
 // D = (F1*(alpha1-alpha2)+alpha2)*nut + nu
-__global__
+__device__
 void dEffKernel(
     int nC,
     const scalar* __restrict__ F1,
@@ -218,7 +219,7 @@ void dEffKernel(
 // omega reaction: diag += V*(max(sp1,0) + beta*omega + max(sp2,0));
 //                 source += V*gamma*GbyNu0lim - V*min(sp1,0)*omega - V*min(sp2,0)*omega
 //   sp1 = (2/3)*gamma*divU   (SuSp),   beta*omega (Sp),   sp2 = (F1-1)*CDkOmega/omega   (SuSp)
-__global__
+__device__
 void omegaReactionKernel(
     int nC,
     const scalar* __restrict__ V,
@@ -249,7 +250,7 @@ void omegaReactionKernel(
 
 // k reaction: diag += V*(betaStar*omega + max(sp,0)); source += V*Pk(G) - V*min(sp,0)*k;  sp=(2/3)divU;
 //             Pk = min(G, c1*betaStar*k*omega).  (k-eps kReaction with eps/k->betaStar*omega, G->Pk(G).)
-__global__
+__device__
 void kReactionSSTKernel(
     int nC,
     const scalar* __restrict__ V,
@@ -288,7 +289,7 @@ void kReactionSSTKernel(
 // kOmegaSST-DDES DES factor: FDES = max( (Lt/(CDES*Delta))*(1 - F2), 1 ), Lt = sqrt(k)/(betaStar*omega) (RANS length),
 // Delta = cubeRootVol = V^(1/3), CDES = F1*CDES1 + (1-F1)*CDES2 (SST-blended), F2 = the DDES shielding (RANS in the
 // boundary layer where F2->1 -> FDES=1; LES in free shear where F2->0). Matches OF kOmegaSSTDDES.
-__global__
+__device__
 void kOmegaSSTDESfactorKernel(
     int nC, const scalar* __restrict__ k, const scalar* __restrict__ om, const scalar* __restrict__ V,
     const scalar* __restrict__ F1, const scalar* __restrict__ F2, scalar betaStar, scalar CDES1, scalar CDES2,
@@ -308,7 +309,7 @@ void kOmegaSSTDESfactorKernel(
 // rd denominator sqrt(0.5(S^2+Omega^2)) equals |gradU|). lIDDES = fdTilde*(1+fe)*lRAS + (1-fdTilde)*lLES, and the k
 // destruction beta*k*omega is scaled by FDES = lRAS/lIDDES (== k^(3/2)/lIDDES). NOT clamped to 1: the fe elevated-stress
 // branch makes lIDDES > lRAS -> FDES < 1 (less destruction), which is the intended IDDES behaviour.
-__global__
+__device__
 void kOmegaSSTIDDESfactorKernel(
     int nC, const scalar* __restrict__ k, const scalar* __restrict__ om, const scalar* __restrict__ F1,
     const scalar* __restrict__ gradU, const scalar* __restrict__ nut, const scalar* __restrict__ y,
@@ -345,7 +346,7 @@ void kOmegaSSTIDDESfactorKernel(
 
 // omega wall function (BINOMIAL n=2 default): omega0 = sqrt(omegaVis^2 + omegaLog^2), scattered to wall cells
 // with cornerWeight invNw. G0 IDENTICAL to the epsilon wall function. Clone of device_kepsilon wallFnKernel.
-__global__
+__device__
 void wallOmegaG0Kernel(
     int nWF,
     const label* __restrict__ wfCell,
@@ -392,7 +393,8 @@ void wallOmegaG0Kernel(
 void deviceS2(const DeviceBuffer<scalar>& gradU, int nC, DeviceBuffer<scalar>& S2)
 {
     S2.resize(nC);
-    s2Kernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), S2.data());
+    const scalar* gradUd = gradU.data(); scalar* S2d = S2.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { s2Kernel(nC, gradUd, S2d); });
     cudaCheck(cudaGetLastError(), "S2");
 }
 
@@ -410,8 +412,11 @@ void deviceCDkOmega(
 {
     const int nC = static_cast<int>(omega.size());
     CD.resize(nC);
-    cdKernel<<<nBlocks(nC), TPB>>>(nC, gKx.data(), gKy.data(), gKz.data(), gOx.data(), gOy.data(), gOz.data(),
-                                   omega.data(), 2.0 * alphaOmega2, CD.data());
+    const scalar *gKxd=gKx.data(),*gKyd=gKy.data(),*gKzd=gKz.data(),*gOxd=gOx.data(),*gOyd=gOy.data(),*gOzd=gOz.data();
+    const scalar* omegad = omega.data(); const scalar twoA2 = 2.0 * alphaOmega2; scalar* CDd = CD.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+        cdKernel(nC, gKxd, gKyd, gKzd, gOxd, gOyd, gOzd, omegad, twoA2, CDd);
+    });
     cudaCheck(cudaGetLastError(), "CDkOmega");
 }
 
@@ -429,8 +434,14 @@ void deviceF1(
 {
     const int nC = static_cast<int>(k.size());
     F1.resize(nC);
-    f1Kernel<<<nBlocks(nC), TPB>>>(nC, k.data(), omega.data(), y.data(), CD.data(), nu, co.betaStar, co.alphaOmega2, lm ? 1 : 0, F1.data(),
-                                   nuCell ? nuCell->data() : nullptr);
+    {
+        const scalar *kd=k.data(),*omegad=omega.data(),*yd=y.data(),*CDd=CD.data();
+        const scalar betaStar=co.betaStar, alphaOmega2=co.alphaOmega2; const int lmi = lm ? 1 : 0;
+        scalar* F1d = F1.data(); const scalar* nuCelld = nuCell ? nuCell->data() : nullptr;
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            f1Kernel(nC, kd, omegad, yd, CDd, nu, betaStar, alphaOmega2, lmi, F1d, nuCelld);
+        });
+    }
     cudaCheck(cudaGetLastError(), "F1");
 }
 
@@ -446,8 +457,11 @@ void deviceF2(
 {
     const int nC = static_cast<int>(k.size());
     F2.resize(nC);
-    f2Kernel<<<nBlocks(nC), TPB>>>(nC, k.data(), omega.data(), y.data(), nu, co.betaStar, F2.data(),
-                                   nuCell ? nuCell->data() : nullptr);
+    {
+        const scalar *kd=k.data(),*omegad=omega.data(),*yd=y.data(); const scalar betaStar = co.betaStar;
+        scalar* F2d = F2.data(); const scalar* nuCelld = nuCell ? nuCell->data() : nullptr;
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { f2Kernel(nC, kd, omegad, yd, nu, betaStar, F2d, nuCelld); });
+    }
     cudaCheck(cudaGetLastError(), "F2");
 }
 
@@ -456,7 +470,8 @@ void deviceBlend(const DeviceBuffer<scalar>& F1, scalar psi1, scalar psi2, Devic
 {
     const int nC = static_cast<int>(F1.size());
     out.resize(nC);
-    blendKernel<<<nBlocks(nC), TPB>>>(nC, F1.data(), psi1, psi2, out.data());
+    const scalar* F1d = F1.data(); scalar* outd = out.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { blendKernel(nC, F1d, psi1, psi2, outd); });
     cudaCheck(cudaGetLastError(), "blend");
 }
 
@@ -471,7 +486,11 @@ void deviceNutSST(
 {
     const int nC = static_cast<int>(k.size());
     nut.resize(nC);
-    nutSSTKernel<<<nBlocks(nC), TPB>>>(nC, k.data(), omega.data(), F2.data(), S2.data(), co.a1, co.b1, nut.data());
+    {
+        const scalar *kd=k.data(),*omegad=omega.data(),*F2d=F2.data(),*S2d=S2.data();
+        const scalar a1=co.a1, b1=co.b1; scalar* nutd = nut.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { nutSSTKernel(nC, kd, omegad, F2d, S2d, a1, b1, nutd); });
+    }
     cudaCheck(cudaGetLastError(), "nutSST");
 }
 
@@ -485,7 +504,9 @@ void devicePk(
 {
     const int nC = static_cast<int>(k.size());
     Pk.resize(nC);
-    pkKernel<<<nBlocks(nC), TPB>>>(nC, G.data(), k.data(), omega.data(), co.c1 * co.betaStar, Pk.data());
+    const scalar *Gd=G.data(),*kd=k.data(),*omegad=omega.data(); const scalar c1betaStar = co.c1 * co.betaStar;
+    scalar* Pkd = Pk.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { pkKernel(nC, Gd, kd, omegad, c1betaStar, Pkd); });
     cudaCheck(cudaGetLastError(), "Pk");
 }
 
@@ -500,8 +521,13 @@ void deviceGbyNuLimit(
 {
     const int nC = static_cast<int>(omega.size());
     GbyNu.resize(nC);
-    gbyNuLimitKernel<<<nBlocks(nC), TPB>>>(nC, GbyNu0.data(), omega.data(), F2.data(), S2.data(),
-                                           co.a1, co.b1, co.c1, co.betaStar, GbyNu.data());
+    {
+        const scalar *GbyNu0d=GbyNu0.data(),*omegad=omega.data(),*F2d=F2.data(),*S2d=S2.data();
+        const scalar a1=co.a1, b1=co.b1, c1=co.c1, betaStar=co.betaStar; scalar* GbyNud = GbyNu.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            gbyNuLimitKernel(nC, GbyNu0d, omegad, F2d, S2d, a1, b1, c1, betaStar, GbyNud);
+        });
+    }
     cudaCheck(cudaGetLastError(), "GbyNuLimit");
 }
 
@@ -516,7 +542,8 @@ void deviceDEff(
 {
     const int nC = static_cast<int>(F1.size());
     D.resize(nC);
-    dEffKernel<<<nBlocks(nC), TPB>>>(nC, F1.data(), nut.data(), alpha1, alpha2, nu, D.data());
+    const scalar* F1d = F1.data(); const scalar* nutd = nut.data(); scalar* Dd = D.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { dEffKernel(nC, F1d, nutd, alpha1, alpha2, nu, Dd); });
     cudaCheck(cudaGetLastError(), "DEff");
 }
 
@@ -535,16 +562,21 @@ void deviceOmegaReaction(
     const DeviceBuffer<scalar>* rho)   // compressible rho weighting; nullptr -> incompressible (unchanged)
 {
     const int nC = static_cast<int>(V.size());
-    omegaReactionKernel<<<nBlocks(nC), TPB>>>(nC, V.data(), gamma.data(), beta.data(), GbyNu0lim.data(), F1.data(),
-                                              CD.data(), omega.data(), divU.data(), diag.data(), source.data(),
-                                              rho ? rho->data() : nullptr);
+    {
+        const scalar *Vd=V.data(),*gammad=gamma.data(),*betad=beta.data(),*GbyNu0limd=GbyNu0lim.data(),*F1d=F1.data();
+        const scalar *CDd=CD.data(),*omegad=omega.data(),*divUd=divU.data();
+        scalar *diagd=diag.data(),*sourced=source.data(); const scalar* rhod = rho ? rho->data() : nullptr;
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            omegaReactionKernel(nC, Vd, gammad, betad, GbyNu0limd, F1d, CDd, omegad, divUd, diagd, sourced, rhod);
+        });
+    }
     cudaCheck(cudaGetLastError(), "omegaReaction");
 }
 
 
 // nuWall[i] = nuBnd[wfBndIdx[i]] -- the same OF nu(patchi) the nut wall functions read, re-indexed into the
 // wall-face ordering that DeviceWallData (and therefore omegaWallFunction and the near-wall G0) uses.
-__global__
+__device__
 void gatherWallNuK(
     int n,
     const label* __restrict__ idx,
@@ -564,12 +596,13 @@ void deviceGatherWallNu(
     const int n = static_cast<int>(wfBndIdx.size());
     if (n == 0 || nuBnd.size() == 0) return;
     nuWall.resize(n);
-    gatherWallNuK<<<nBlocks(n), TPB>>>(n, wfBndIdx.data(), nuBnd.data(), nuWall.data());
+    const label* wfBndIdxd = wfBndIdx.data(); const scalar* nuBndd = nuBnd.data(); scalar* nuWalld = nuWall.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { gatherWallNuK(n, wfBndIdxd, nuBndd, nuWalld); });
     cudaCheck(cudaGetLastError(), "gatherWallNu");
 }
 
 // out[i] = cell[faceCell[i]] -- plain adjacent-cell extrapolation for a boundary face.
-__global__
+__device__
 void gatherCellToFaceK(
     int n,
     const label* __restrict__ fc,
@@ -593,7 +626,7 @@ void gatherCellToFaceK(
 //
 // The boundary gradient is the same expression device_divdevreff.cu's gradBKernel uses (OF gaussGrad::
 // correctBoundaryConditions), reproduced here so the SST does not depend on the stress module's layout.
-__global__
+__device__
 void sstNutBoundaryK(
     int nB,
     const label* __restrict__ fc,
@@ -682,12 +715,21 @@ void deviceSSTNutBoundary(
     deviceBCValue(dbU.comp[0], Ux, uxb);
     deviceBCValue(dbU.comp[1], Uy, uyb);
     deviceBCValue(dbU.comp[2], Uz, uzb);
-    sstNutBoundaryK<<<nBlocks(nB), TPB>>>(nB, dbU.comp[0].faceCell.data(), kBnd.data(), omBnd.data(),
-                                          yCell.data(), nuB ? nuB->data() : nullptr, nu,
-                                          gradU.data(), nC, dbU.nx.data(), dbU.ny.data(), dbU.nz.data(),
-                                          uxb.data(), uyb.data(), uzb.data(), Ux.data(), Uy.data(), Uz.data(),
-                                          dbU.comp[0].deltaCoeffs.data(), calcMask.data(),
-                                          co.a1, co.b1, co.betaStar, nutCell.data(), nutBnd.data());
+    {
+        const label* fc = dbU.comp[0].faceCell.data();
+        const scalar *kBndd=kBnd.data(), *omBndd=omBnd.data(), *yCelld=yCell.data();
+        const scalar* nuBd = nuB ? nuB->data() : nullptr;
+        const scalar *gradUd=gradU.data(), *nxd=dbU.nx.data(), *nyd=dbU.ny.data(), *nzd=dbU.nz.data();
+        const scalar *uxbd=uxb.data(), *uybd=uyb.data(), *uzbd=uzb.data();
+        const scalar *Uxd=Ux.data(), *Uyd=Uy.data(), *Uzd=Uz.data(), *dcd=dbU.comp[0].deltaCoeffs.data();
+        const label* calcMaskd = calcMask.data();
+        const scalar a1=co.a1, b1=co.b1, betaStar=co.betaStar; const scalar* nutCelld = nutCell.data();
+        scalar* nutBndd = nutBnd.data();
+        pcudaParallelFor(nBlocks(nB), TPB, [=] __device__ () {
+            sstNutBoundaryK(nB, fc, kBndd, omBndd, yCelld, nuBd, nu, gradUd, nC, nxd, nyd, nzd,
+                            uxbd, uybd, uzbd, Uxd, Uyd, Uzd, dcd, calcMaskd, a1, b1, betaStar, nutCelld, nutBndd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "sstNutBoundary");
 }
 
@@ -712,11 +754,19 @@ void deviceWallOmegaG0(
     cudaCheck(cudaMemsetAsync(G0.data(),     0, nC*sizeof(scalar), cudaStreamPerThread), "G0 zero");
     const scalar Cmu25 = std::pow(co.betaStar, 0.25), yplLam = yPlusLamHost(co.kappa, co.E);
     if (w.nWF > 0)
-        wallOmegaG0Kernel<<<nBlocks(w.nWF), TPB>>>(w.nWF, w.wfCell.data(), w.wfY.data(), w.wfDc.data(), w.wfUwx.data(),
-                                                   w.wfUwy.data(), w.wfUwz.data(), w.invNw.data(), k.data(), Ux.data(),
-                                                   Uy.data(), Uz.data(), nu, yplLam, Cmu25, co.kappa, co.E, atmZ0, atmBoundNut, co.beta1,
-                                                   nutWall, omega0.data(), G0.data(),
-                                                   (nuFace && nuFace->size()) ? nuFace->data() : nullptr);
+    {
+        const int nWF = w.nWF; const label* wfCell = w.wfCell.data();
+        const scalar *wfY=w.wfY.data(), *wfDc=w.wfDc.data();
+        const scalar *wux=w.wfUwx.data(), *wuy=w.wfUwy.data(), *wuz=w.wfUwz.data(), *invNw=w.invNw.data();
+        const scalar *kd=k.data(), *Uxd=Ux.data(), *Uyd=Uy.data(), *Uzd=Uz.data();
+        const scalar kappa=co.kappa, E=co.E, beta1=co.beta1;
+        scalar *omega0d=omega0.data(), *G0d=G0.data();
+        const scalar* nuFaced = (nuFace && nuFace->size()) ? nuFace->data() : nullptr;
+        pcudaParallelFor(nBlocks(nWF), TPB, [=] __device__ () {
+            wallOmegaG0Kernel(nWF, wfCell, wfY, wfDc, wux, wuy, wuz, invNw, kd, Uxd, Uyd, Uzd, nu, yplLam, Cmu25,
+                              kappa, E, atmZ0, atmBoundNut, beta1, nutWall, omega0d, G0d, nuFaced);
+        });
+    }
     cudaCheck(cudaGetLastError(), "wallOmegaG0");
 }
 
@@ -735,10 +785,15 @@ void deviceKReactionSST(
     const DeviceBuffer<scalar>* rho)    // compressible rho weighting; nullptr -> incompressible (unchanged)
 {
     const int nC = static_cast<int>(V.size());
-    kReactionSSTKernel<<<nBlocks(nC), TPB>>>(nC, V.data(), k.data(), omega.data(), G.data(), divU.data(),
-                                             co.betaStar, co.c1 * co.betaStar, gammaIntEff, diag.data(), source.data(),
-                                             FDES ? FDES->data() : nullptr,
-                                             rho ? rho->data() : nullptr);
+    {
+        const scalar *Vd=V.data(),*kd=k.data(),*omegad=omega.data(),*Gd=G.data(),*divUd=divU.data();
+        const scalar betaStar=co.betaStar, c1betaStar=co.c1*co.betaStar;
+        scalar *diagd=diag.data(),*sourced=source.data();
+        const scalar* FDESd = FDES ? FDES->data() : nullptr; const scalar* rhod = rho ? rho->data() : nullptr;
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            kReactionSSTKernel(nC, Vd, kd, omegad, Gd, divUd, betaStar, c1betaStar, gammaIntEff, diagd, sourced, FDESd, rhod);
+        });
+    }
     cudaCheck(cudaGetLastError(), "kReactionSST");
 }
 
@@ -748,10 +803,15 @@ void deviceKOmegaSSTDESfactor(int nC, const DeviceBuffer<scalar>& k, const Devic
     const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& FDES, const DeviceBuffer<scalar>* lesDelta)
 {
     FDES.resize(nC);
-    kOmegaSSTDESfactorKernel<<<nBlocks(nC), TPB>>>(nC, k.data(), omega.data(), V.data(), F1.data(), F2.data(),
-                                                   co.betaStar, co.CDES1, co.CDES2,
-                                                   (lesDelta && lesDelta->size()) ? lesDelta->data() : nullptr,
-                                                   FDES.data());
+    {
+        const scalar *kd=k.data(),*omegad=omega.data(),*Vd=V.data(),*F1d=F1.data(),*F2d=F2.data();
+        const scalar betaStar=co.betaStar, CDES1=co.CDES1, CDES2=co.CDES2;
+        const scalar* lesDeltad = (lesDelta && lesDelta->size()) ? lesDelta->data() : nullptr;
+        scalar* FDESd = FDES.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            kOmegaSSTDESfactorKernel(nC, kd, omegad, Vd, F1d, F2d, betaStar, CDES1, CDES2, lesDeltad, FDESd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "kOmegaSSTDESfactor");
 }
 
@@ -763,8 +823,14 @@ void deviceKOmegaSSTIDDESfactor(int nC, const DeviceBuffer<scalar>& k, const Dev
     const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& FDES)
 {
     FDES.resize(nC);
-    kOmegaSSTIDDESfactorKernel<<<nBlocks(nC), TPB>>>(nC, k.data(), omega.data(), F1.data(), gradU.data(),
-        nut.data(), y.data(), hmax.data(), hwn.data(), nu, co, FDES.data());
+    {
+        const scalar *kd=k.data(),*omegad=omega.data(),*F1d=F1.data(),*gradUd=gradU.data();
+        const scalar *nutd=nut.data(),*yd=y.data(),*hmaxd=hmax.data(),*hwnd=hwn.data();
+        scalar* FDESd = FDES.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            kOmegaSSTIDDESfactorKernel(nC, kd, omegad, F1d, gradUd, nutd, yd, hmaxd, hwnd, nu, co, FDESd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "kOmegaSSTIDDESfactor");
 }
 
@@ -831,7 +897,7 @@ void deviceCellLimitGradU(
 
 // Elementwise a/b. Used for nu = mu/rho (cells) and for phi/interpolate(rho) (faces), which are the two
 // places the SST has to undo a rho weighting that the rest of the compressible solver applies.
-__global__
+__device__
 void nuFromMuRhoK(
     int n,
     const scalar* __restrict__ mu,
@@ -954,12 +1020,18 @@ void deviceKOmegaSSTCorrect(
         const int nIf = dm.nInternalFaces;
         DeviceBuffer<scalar> phiVolInt;
         phiVolInt.resize(nIf);
-        nuFromMuRhoK<<<nBlocks(nIf), TPB>>>(nIf, phiInt.data(), rhoF.data(), phiVolInt.data());
+        {
+            const scalar *phiIntd = phiInt.data(), *rhoFd = rhoF.data(); scalar* phiVolIntd = phiVolInt.data();
+            pcudaParallelFor(nBlocks(nIf), TPB, [=] __device__ () { nuFromMuRhoK(nIf, phiIntd, rhoFd, phiVolIntd); });
+        }
         cudaCheck(cudaGetLastError(), "phiVolInt");
         const int nB = static_cast<int>(phiBnd.size());
         DeviceBuffer<scalar> phiVolBnd;
         phiVolBnd.resize(nB);
-        nuFromMuRhoK<<<nBlocks(nB), TPB>>>(nB, phiBnd.data(), rhoBnd->data(), phiVolBnd.data());
+        {
+            const scalar *phiBndd = phiBnd.data(), *rhoBndd = rhoBnd->data(); scalar* phiVolBndd = phiVolBnd.data();
+            pcudaParallelFor(nBlocks(nB), TPB, [=] __device__ () { nuFromMuRhoK(nB, phiBndd, rhoBndd, phiVolBndd); });
+        }
         cudaCheck(cudaGetLastError(), "phiVolBnd");
         deviceDiv(dm, phiVolInt, phiVolBnd, divU);
         if (ami && ami->n) interfaceAddDiv(*ami, dm.V, divU);
@@ -976,8 +1048,12 @@ void deviceKOmegaSSTCorrect(
     // grad(omega)/CDkOmega/F1/F2 and the reaction all see the wall-corrected omega (matches kOmegaSSTBase::correct).
     DeviceBuffer<scalar> omega0, G0;
     deviceWallOmegaG0(wall, k, Ux, Uy, Uz, nu, omega0, G0, co, nutWall, atmZ0, atmBoundNut, nuWallFace);
-    overrideKernel<<<nBlocks(nC), TPB>>>(nC, wall.isWallCell.data(), G0.data(), omega0.data(), G.data(), omega.data(),
-                                          wall.wallW.size() ? wall.wallW.data() : nullptr);
+    {
+        const label* isWd = wall.isWallCell.data();
+        const scalar* G0d = G0.data(); scalar* omega0d = omega0.data(); scalar* Gd = G.data(); scalar* omegad = omega.data();
+        const scalar* wallWd = wall.wallW.size() ? wall.wallW.data() : nullptr;
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { overrideKernel(nC, isWd, G0d, omega0d, Gd, omegad, wallWd); });
+    }
 
     // CDkOmega from grad(k), grad(omega); F1, F2.
     DeviceBuffer<scalar> kbv;
@@ -999,7 +1075,8 @@ void deviceKOmegaSSTCorrect(
     {
         const int nCk = static_cast<int>(muLam->size());
         nuCellBuf.resize(nCk);
-        nuFromMuRhoK<<<nBlocks(nCk), TPB>>>(nCk, muLam->data(), rho->data(), nuCellBuf.data());
+        const scalar *muLamd = muLam->data(), *rhod = rho->data(); scalar* nuCellBufd = nuCellBuf.data();
+        pcudaParallelFor(nBlocks(nCk), TPB, [=] __device__ () { nuFromMuRhoK(nCk, muLamd, rhod, nuCellBufd); });
         cudaCheck(cudaGetLastError(), "nuFromMuRho");
         nuCell = &nuCellBuf;
     }
@@ -1043,7 +1120,10 @@ void deviceKOmegaSSTCorrect(
         // where F1 must lie in [0,1]. Measured: that made omega 100x worse (3.1e-5 -> 3.2e-3).
         DeviceBuffer<scalar> F1b;
         F1b.resize(nB);
-        gatherCellToFaceK<<<nBlocks(nB), TPB>>>(nB, dbOmega.faceCell.data(), F1.data(), F1b.data());
+        {
+            const label* fc = dbOmega.faceCell.data(); const scalar* F1d = F1.data(); scalar* F1bd = F1b.data();
+            pcudaParallelFor(nBlocks(nB), TPB, [=] __device__ () { gatherCellToFaceK(nB, fc, F1d, F1bd); });
+        }
         cudaCheck(cudaGetLastError(), "F1b");
         DomB.resize(nB); DkB.resize(nB);
         deviceDEff(F1b, *nutBnd, co.alphaOmega1, co.alphaOmega2, rho ? scalar(0) : nu, DomB);
@@ -1101,7 +1181,7 @@ namespace { struct LMCoeffs { scalar ca1=2.0, ca2=0.06, ce1=1.0, ce2=50.0, cThet
 
 
 // DReThetatEff = sigmaThetat*(nut + nu)  (NOT nut/sigma + nu, depsKernel can't express this).
-__global__
+__device__
 void lmReDiffKernel(int nC, const scalar* __restrict__ nut, scalar sigma, scalar nu, scalar* __restrict__ D)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1110,7 +1190,7 @@ void lmReDiffKernel(int nC, const scalar* __restrict__ nut, scalar sigma, scalar
 
 
 // diag += V*sp ; source += V*su  (apply a precomputed semi-implicit reaction).
-__global__
+__device__
 void lmAddReactionKernel(
     int nC,
     const scalar* __restrict__ V,
@@ -1190,7 +1270,7 @@ scalar lmFlength(scalar R, scalar y, scalar om, scalar nu)
 
 
 // ReThetat reaction prep: ReThetat0 Newton loop + Pthetat; outputs sp=Pthetat, su=Pthetat*ReThetat0, and Fthetat.
-__global__
+__device__
 void lmReThetatPrepKernel(
     int nC,
     const scalar* __restrict__ gradU,
@@ -1253,7 +1333,7 @@ void lmReThetatPrepKernel(
 
 
 // gammaInt reaction prep: Pgamma, Egamma -> sp=ce1*Pgamma+ce2*Egamma, su=Pgamma+Egamma.
-__global__
+__device__
 void lmGammaPrepKernel(
     int nC,
     const scalar* __restrict__ gradU,
@@ -1298,7 +1378,7 @@ void lmGammaPrepKernel(
 
 
 // gammaIntEff = max(gammaInt, gammaSep); gammaSep = min(2*max(Rev/(3.235*ReThetac)-1,0)*Freattach, 2)*Fthetat.
-__global__
+__device__
 void lmGammaEffKernel(
     int nC,
     const scalar* __restrict__ gradU,
@@ -1372,33 +1452,59 @@ void deviceKOmegaSSTLMCorrect(
 
     // ReThetat: DReThetatEff = sigmaThetat*(nut+nu); reaction = Pthetat*ReThetat0 - Sp(Pthetat). Fthetat stored for gammaSep.
     DeviceBuffer<scalar> Fth(nC), spR(nC), suR(nC);
-    lmReThetatPrepKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
-        y.data(), ReThetat.data(), gammaInt.data(), nu, lm.cThetat, lm.ce2, 1e-37, lm.lambdaErr, lm.maxIter,
-        Fth.data(), spR.data(), suR.data());
+    {
+        const scalar *gradUd=gradU.data(),*Uxd=Ux.data(),*Uyd=Uy.data(),*Uzd=Uz.data(),*kd=k.data(),*omegad=omega.data();
+        const scalar *yd=y.data(),*ReThetatd=ReThetat.data(),*gammaIntd=gammaInt.data();
+        const scalar cThetat=lm.cThetat, ce2=lm.ce2, lambdaErr=lm.lambdaErr; const int maxIter=lm.maxIter;
+        scalar *Fthd=Fth.data(),*spRd=spR.data(),*suRd=suR.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            lmReThetatPrepKernel(nC, gradUd, Uxd, Uyd, Uzd, kd, omegad, yd, ReThetatd, gammaIntd, nu,
+                                 cThetat, ce2, 1e-37, lambdaErr, maxIter, Fthd, spRd, suRd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "lmReThetatPrep");
     DeviceBuffer<scalar> DRe(nC);
-    lmReDiffKernel<<<nBlocks(nC), TPB>>>(nC, nut.data(), lm.sigmaThetat, nu, DRe.data());   // sigmaThetat*(nut+nu)
+    {
+        const scalar* nutd = nut.data(); const scalar sigmaThetat = lm.sigmaThetat; scalar* DRed = DRe.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { lmReDiffKernel(nC, nutd, sigmaThetat, nu, DRed); });
+    }
     deviceSolveScalarTransport(dm, dbReThetat, ReThetat, "ReThetat", DRe, phiInt, phiBnd, divU, bounded, false, false, nonOrth, 2.0,
                                relax, tol, relTolKE, keCheckEvery, gsEps,
-                               [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ lmAddReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), spR.data(), suR.data(), diag.data(), src.data()); },
+                               [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceLMAddReaction(dm, spR, suR, diag, src); },
                                nullptr, nullptr, ami, cyc, reDdt);
     deviceBoundField(dm, ReThetat, 0.0);
 
     // gammaInt: DgammaIntEff = nut+nu; reaction = Pgamma+Egamma - Sp(ce1*Pgamma+ce2*Egamma).
     DeviceBuffer<scalar> spG(nC), suG(nC);
-    lmGammaPrepKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
-        y.data(), ReThetat.data(), gammaInt.data(), nu, lm.ca1, lm.ca2, lm.ce1, lm.ce2, 1e-37, spG.data(), suG.data());
+    {
+        const scalar *gradUd=gradU.data(),*Uxd=Ux.data(),*Uyd=Uy.data(),*Uzd=Uz.data(),*kd=k.data(),*omegad=omega.data();
+        const scalar *yd=y.data(),*ReThetatd=ReThetat.data(),*gammaIntd=gammaInt.data();
+        const scalar ca1=lm.ca1, ca2=lm.ca2, ce1=lm.ce1, ce2=lm.ce2;
+        scalar *spGd=spG.data(),*suGd=suG.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            lmGammaPrepKernel(nC, gradUd, Uxd, Uyd, Uzd, kd, omegad, yd, ReThetatd, gammaIntd, nu, ca1, ca2, ce1, ce2, 1e-37, spGd, suGd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "lmGammaPrep");
     DeviceBuffer<scalar> DgI(nC);
-    depsKernel<<<nBlocks(nC), TPB>>>(nC, nut.data(), 1.0, nu, DgI.data());   // nut/1 + nu
+    {
+        const scalar* nutd = nut.data(); scalar* DgId = DgI.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { depsKernel(nC, nutd, 1.0, nu, DgId); });   // nut/1 + nu
+    }
     deviceSolveScalarTransport(dm, dbGammaInt, gammaInt, "gammaInt", DgI, phiInt, phiBnd, divU, bounded, false, false, nonOrth, 2.0,
                                relax, tol, relTolKE, keCheckEvery, gsEps,
-                               [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ lmAddReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), spG.data(), suG.data(), diag.data(), src.data()); },
+                               [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceLMAddReaction(dm, spG, suG, diag, src); },
                                nullptr, nullptr, ami, cyc, giDdt);
     deviceBoundField(dm, gammaInt, 0.0);
     gammaIntEff.resize(nC);
-    lmGammaEffKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
-        y.data(), ReThetat.data(), gammaInt.data(), Fth.data(), nu, 1e-37, gammaIntEff.data());
+    {
+        const scalar *gradUd=gradU.data(),*Uxd=Ux.data(),*Uyd=Uy.data(),*Uzd=Uz.data(),*kd=k.data(),*omegad=omega.data();
+        const scalar *yd=y.data(),*ReThetatd=ReThetat.data(),*gammaIntd=gammaInt.data(),*Fthd=Fth.data();
+        scalar* gammaIntEffd = gammaIntEff.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            lmGammaEffKernel(nC, gradUd, Uxd, Uyd, Uzd, kd, omegad, yd, ReThetatd, gammaIntd, Fthd, nu, 1e-37, gammaIntEffd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "lmGammaEff");
 }
 
@@ -1409,7 +1515,8 @@ void deviceKOmegaSSTLMCorrect(
 void deviceLMReDiff(const DeviceBuffer<scalar>& nut, scalar nu, DeviceBuffer<scalar>& D)
 {
     const int nC = static_cast<int>(nut.size()); const LMCoeffs lm; D.resize(nC);
-    lmReDiffKernel<<<nBlocks(nC), TPB>>>(nC, nut.data(), lm.sigmaThetat, nu, D.data());   // sigmaThetat*(nut+nu)
+    const scalar* nutd = nut.data(); const scalar sigmaThetat = lm.sigmaThetat; scalar* Dd = D.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { lmReDiffKernel(nC, nutd, sigmaThetat, nu, Dd); });   // sigmaThetat*(nut+nu)
     cudaCheck(cudaGetLastError(), "deviceLMReDiff");
 }
 void deviceLMReThetatPrep(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU,
@@ -1419,9 +1526,16 @@ void deviceLMReThetatPrep(const DeviceMesh& dm, const DeviceBuffer<scalar>& grad
     DeviceBuffer<scalar>& Fth, DeviceBuffer<scalar>& spR, DeviceBuffer<scalar>& suR)
 {
     const int nC = dm.nCells; const LMCoeffs lm; Fth.resize(nC); spR.resize(nC); suR.resize(nC);
-    lmReThetatPrepKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
-        y.data(), ReThetat.data(), gammaInt.data(), nu, lm.cThetat, lm.ce2, 1e-37, lm.lambdaErr, lm.maxIter,
-        Fth.data(), spR.data(), suR.data());
+    {
+        const scalar *gradUd=gradU.data(),*Uxd=Ux.data(),*Uyd=Uy.data(),*Uzd=Uz.data(),*kd=k.data(),*omegad=omega.data();
+        const scalar *yd=y.data(),*ReThetatd=ReThetat.data(),*gammaIntd=gammaInt.data();
+        const scalar cThetat=lm.cThetat, ce2=lm.ce2, lambdaErr=lm.lambdaErr; const int maxIter=lm.maxIter;
+        scalar *Fthd=Fth.data(),*spRd=spR.data(),*suRd=suR.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            lmReThetatPrepKernel(nC, gradUd, Uxd, Uyd, Uzd, kd, omegad, yd, ReThetatd, gammaIntd, nu,
+                                 cThetat, ce2, 1e-37, lambdaErr, maxIter, Fthd, spRd, suRd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "deviceLMReThetatPrep");
 }
 void deviceLMGammaPrep(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU,
@@ -1431,8 +1545,15 @@ void deviceLMGammaPrep(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU,
     DeviceBuffer<scalar>& spG, DeviceBuffer<scalar>& suG)
 {
     const int nC = dm.nCells; const LMCoeffs lm; spG.resize(nC); suG.resize(nC);
-    lmGammaPrepKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
-        y.data(), ReThetat.data(), gammaInt.data(), nu, lm.ca1, lm.ca2, lm.ce1, lm.ce2, 1e-37, spG.data(), suG.data());
+    {
+        const scalar *gradUd=gradU.data(),*Uxd=Ux.data(),*Uyd=Uy.data(),*Uzd=Uz.data(),*kd=k.data(),*omegad=omega.data();
+        const scalar *yd=y.data(),*ReThetatd=ReThetat.data(),*gammaIntd=gammaInt.data();
+        const scalar ca1=lm.ca1, ca2=lm.ca2, ce1=lm.ce1, ce2=lm.ce2;
+        scalar *spGd=spG.data(),*suGd=suG.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            lmGammaPrepKernel(nC, gradUd, Uxd, Uyd, Uzd, kd, omegad, yd, ReThetatd, gammaIntd, nu, ca1, ca2, ce1, ce2, 1e-37, spGd, suGd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "deviceLMGammaPrep");
 }
 void deviceLMGammaEff(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU,
@@ -1442,14 +1563,23 @@ void deviceLMGammaEff(const DeviceMesh& dm, const DeviceBuffer<scalar>& gradU,
     scalar nu, DeviceBuffer<scalar>& gammaIntEff)
 {
     const int nC = dm.nCells; gammaIntEff.resize(nC);
-    lmGammaEffKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
-        y.data(), ReThetat.data(), gammaInt.data(), Fth.data(), nu, 1e-37, gammaIntEff.data());
+    {
+        const scalar *gradUd=gradU.data(),*Uxd=Ux.data(),*Uyd=Uy.data(),*Uzd=Uz.data(),*kd=k.data(),*omegad=omega.data();
+        const scalar *yd=y.data(),*ReThetatd=ReThetat.data(),*gammaIntd=gammaInt.data(),*Fthd=Fth.data();
+        scalar* gammaIntEffd = gammaIntEff.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            lmGammaEffKernel(nC, gradUd, Uxd, Uyd, Uzd, kd, omegad, yd, ReThetatd, gammaIntd, Fthd, nu, 1e-37, gammaIntEffd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "deviceLMGammaEff");
 }
 void deviceLMAddReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& sp, const DeviceBuffer<scalar>& su,
     DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source)
 {
-    lmAddReactionKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.V.data(), sp.data(), su.data(), diag.data(), source.data());
+    const int nC = dm.nCells;
+    const scalar *Vd = dm.V.data(), *spd = sp.data(), *sud = su.data();
+    scalar *diagd = diag.data(), *sourced = source.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { lmAddReactionKernel(nC, Vd, spd, sud, diagd, sourced); });
     cudaCheck(cudaGetLastError(), "deviceLMAddReaction");
 }
 

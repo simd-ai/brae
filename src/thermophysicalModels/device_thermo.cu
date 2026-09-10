@@ -8,6 +8,7 @@
 #include "device_buffer.cuh"
 #include "device_blas.cuh"   // deviceCopy/deviceHadamard, for thermo.rho()
 #include "device_boundary.cuh"
+#include "pcuda_compat.cuh"
 #include <stdexcept>
 #include <cstdio>
 #include <vector>
@@ -28,7 +29,7 @@ inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 // One pass over the cells: invert he to get T, then evaluate every T-dependent property from it.
 // Fused rather than split per property because each one is a handful of flops on a value already in a
 // register -- splitting would re-read T from global memory four times for no benefit.
-__global__
+__device__
 void thermoUpdateK(
     int n,
     ThermoCoeffs c,
@@ -61,7 +62,7 @@ void thermoUpdateK(
 }
 
 // he from T, used once at startup: cases ship a T field, the energy equation wants he.
-__global__
+__device__
 void heFromTK(
     int n,
     ThermoCoeffs c,
@@ -81,10 +82,12 @@ void deviceHePsiThermoCalculate(
     const ThermoCoeffs& c)
 {
     if (th.n == 0) return;
-    thermoUpdateK<<<nBlocks(th.n), TPB>>>(
-        th.n, c, p.data(), th.he.data(), th.T.data(),
-        nullptr,                       // hePsiThermo::calculate has no rho argument
-        th.psi.data(), th.mu.data(), th.alpha.data());
+    {
+        const int n = th.n; const scalar* pd = p.data(); const scalar* hed = th.he.data();
+        scalar* Td = th.T.data(); scalar* psid = th.psi.data(); scalar* mud = th.mu.data(); scalar* alphad = th.alpha.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            thermoUpdateK(n, c, pd, hed, Td, nullptr, psid, mud, alphad); });
+    }
     cudaCheck(cudaGetLastError(), "hePsiThermoCalculate");
 }
 
@@ -95,10 +98,13 @@ void deviceHeRhoThermoCalculate(
     const ThermoCoeffs& c)
 {
     if (th.n == 0) return;
-    thermoUpdateK<<<nBlocks(th.n), TPB>>>(
-        th.n, c, p.data(), th.he.data(), th.T.data(),
-        th.rhoThermo.data(),           // heRhoThermo::calculate writes the THERMO's rho_, not the solver's
-        th.psi.data(), th.mu.data(), th.alpha.data());
+    {
+        const int n = th.n; const scalar* pd = p.data(); const scalar* hed = th.he.data();
+        scalar* Td = th.T.data(); scalar* rhod = th.rhoThermo.data();
+        scalar* psid = th.psi.data(); scalar* mud = th.mu.data(); scalar* alphad = th.alpha.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            thermoUpdateK(n, c, pd, hed, Td, rhod, psid, mud, alphad); });
+    }
     cudaCheck(cudaGetLastError(), "heRhoThermoCalculate");
 }
 
@@ -195,7 +201,7 @@ void deviceThermoRho(
 
 // rho = rhoPrev + a*(rho - rhoPrev), then rhoPrev = rho. Bounds are re-applied because relaxing toward a
 // previous value cannot violate them, but relaxing AWAY from a clamped value can.
-__global__
+__device__
 void rhoRelaxK(
     int n,
     scalar a,
@@ -212,7 +218,7 @@ void rhoRelaxK(
     rhoPrev[i] = bounded;
 }
 
-__global__
+__device__
 void rhoSeedPrevK(
     int n,
     const scalar* __restrict__ rho,
@@ -235,7 +241,12 @@ void deviceRhoRelaxBuffer(
 {
     const int n = static_cast<int>(rho.size());
     if (n == 0 || rhoPrev.size() != rho.size()) return;
-    rhoRelaxK<<<nBlocks(n), TPB>>>(n, c.relaxRho, c.rhoMin, c.rhoMax, rho.data(), rhoPrev.data());
+    {
+        const scalar a = c.relaxRho; const scalar rMin = c.rhoMin; const scalar rMax = c.rhoMax;
+        scalar* rhod = rho.data(); scalar* rhoPrevd = rhoPrev.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            rhoRelaxK(n, a, rMin, rMax, rhod, rhoPrevd); });
+    }
     cudaCheck(cudaGetLastError(), "rhoRelaxBuffer");
 }
 
@@ -244,30 +255,30 @@ void deviceRhoRelax(
     const ThermoCoeffs& c)
 {
     if (th.n == 0) return;
-    rhoRelaxK<<<nBlocks(th.n), TPB>>>(
-        th.n,
-        c.relaxRho,
-        c.rhoMin,
-        c.rhoMax,
-        th.rho.data(),
-        th.rhoPrev.data());
+    {
+        const int n = th.n; const scalar a = c.relaxRho; const scalar rMin = c.rhoMin; const scalar rMax = c.rhoMax;
+        scalar* rhod = th.rho.data(); scalar* rhoPrevd = th.rhoPrev.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            rhoRelaxK(n, a, rMin, rMax, rhod, rhoPrevd); });
+    }
     cudaCheck(cudaGetLastError(), "rhoRelax");
 }
 
 void deviceRhoSeedPrev(DeviceThermo& th)
 {
     if (th.n == 0) return;
-    rhoSeedPrevK<<<nBlocks(th.n), TPB>>>(
-        th.n,
-        th.rho.data(),
-        th.rhoPrev.data());
+    {
+        const int n = th.n; const scalar* rhod = th.rho.data(); scalar* rhoPrevd = th.rhoPrev.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            rhoSeedPrevK(n, rhod, rhoPrevd); });
+    }
     cudaCheck(cudaGetLastError(), "rhoSeedPrev");
 }
 
 // alphat = rho*nut/Prt. Kept in its own kernel rather than folded into thermoUpdateK because nut is
 // owned by the turbulence model and is only valid after correctTurbulence(), which runs at the END of the
 // outer iteration -- whereas thermoUpdateK runs in the middle of it.
-__global__
+__device__
 void alphatK(
     int n,
     scalar Prt,
@@ -287,12 +298,12 @@ void deviceAlphat(
 {
     if (th.n == 0) return;
     if (static_cast<int>(nut.size()) != th.n) return;   // laminar: no nut field, alphat stays zero
-    alphatK<<<nBlocks(th.n), TPB>>>(
-        th.n,
-        c.Prt,
-        th.rho.data(),
-        nut.data(),
-        th.alphat.data());
+    {
+        const int n = th.n; const scalar prt = c.Prt;
+        const scalar* rhod = th.rho.data(); const scalar* nutd = nut.data(); scalar* alphatd = th.alphat.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            alphatK(n, prt, rhod, nutd, alphatd); });
+    }
     cudaCheck(cudaGetLastError(), "alphat");
 }
 
@@ -310,7 +321,7 @@ void deviceAlphat(
 // T_b = -21369.6 K, from which transportMu took sqrt of a negative and produced NaN in all 112000 cells.
 // The gas inversion is exact and closed-form; the liquid one is Newton, and OF runs Newton at the
 // boundary too (mixture_.THE(phe, pp, pT) is the same thermo::T as the cell path).
-__global__
+__device__
 void TBoundaryGasK(
     int n,
     ThermoCoeffs c,
@@ -327,7 +338,7 @@ void TBoundaryGasK(
 // this function stateless. It only sets the iteration count in any case: acceptance is on the energy
 // residual (see nsrds_functions.cuh), so the answer does not depend on where the iteration started, and
 // tests/test_hetot.cu proves recovery from the opposite end of the valid range.
-__global__
+__device__
 void TBoundaryLiquidK(
     int n,
     EnergyForm form,
@@ -393,21 +404,26 @@ void deviceThermoTBoundary(
         // refValue is what a fixedValue he face contributes to the matrix, so refreshing it here is
         // what actually propagates the corrected energy into the next energy solve.
         const bool haveRef = dbHe.refValue.size() == static_cast<std::size_t>(dbHe.n);
-        TBoundaryLiquidK<<<nBlocks(dbHe.n), TPB>>>(
-            dbHe.n,
-            c.internalEnergy ? EnergyForm::sensibleInternalEnergy : EnergyForm::sensibleEnthalpy,
-            needP ? pBnd.data() : nullptr,
-            heBnd.data(),
-            haveGuess ? dbHe.faceCell.data() : nullptr,
-            haveGuess ? Tcell->data() : nullptr,
-            haveFix ? TFixMask->data() : nullptr,
-            haveFix ? TFix->data() : nullptr,
-            TBnd.data(),
-            (haveFix && haveRef) ? dbHe.refValue.data() : nullptr);
+        const int n = dbHe.n;
+        const EnergyForm form = c.internalEnergy ? EnergyForm::sensibleInternalEnergy : EnergyForm::sensibleEnthalpy;
+        const scalar* pBndD = needP ? pBnd.data() : nullptr;
+        const scalar* heBndD = heBnd.data();
+        const label* faceCellD = haveGuess ? dbHe.faceCell.data() : nullptr;
+        const scalar* TcellD = haveGuess ? Tcell->data() : nullptr;
+        const label* fixMaskD = haveFix ? TFixMask->data() : nullptr;
+        const scalar* TFixD = haveFix ? TFix->data() : nullptr;
+        scalar* TBndD = TBnd.data();
+        scalar* heRefD = (haveFix && haveRef) ? dbHe.refValue.data() : nullptr;
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            TBoundaryLiquidK(n, form, pBndD, heBndD, faceCellD, TcellD, fixMaskD, TFixD, TBndD, heRefD); });
         cudaCheck(cudaGetLastError(), "TBoundaryLiquid");
         return;
     }
-    TBoundaryGasK<<<nBlocks(dbHe.n), TPB>>>(dbHe.n, c, heBnd.data(), TBnd.data());
+    {
+        const int n = dbHe.n; const scalar* heBndD = heBnd.data(); scalar* TBndD = TBnd.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            TBoundaryGasK(n, c, heBndD, TBndD); });
+    }
     cudaCheck(cudaGetLastError(), "TBoundaryGas");
 }
 
@@ -415,7 +431,7 @@ void deviceThermoTBoundary(
 // clamps. Liquid: the NSRDS rho(T) correlation, which has no pressure dependence at all and is NOT
 // clamped, because rhoMin/rhoMax exist to keep a compressible EOS away from its singularity at T -> 0
 // and a liquid correlation has none.
-__global__
+__device__
 void rhoBoundaryK(
     int n,
     ThermoCoeffs c,
@@ -445,12 +461,11 @@ void deviceThermoRhoBoundary(
     DeviceBuffer<scalar> pBnd;
     deviceBCValue(dbP, p, pBnd);
     rhoBnd.resize(dbP.n);
-    rhoBoundaryK<<<nBlocks(dbP.n), TPB>>>(
-        dbP.n,
-        c,
-        pBnd.data(),
-        TBnd.data(),
-        rhoBnd.data());
+    {
+        const int n = dbP.n; const scalar* pBndD = pBnd.data(); const scalar* TBndD = TBnd.data(); scalar* rhoBndD = rhoBnd.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            rhoBoundaryK(n, c, pBndD, TBndD, rhoBndD); });
+    }
     cudaCheck(cudaGetLastError(), "rhoBoundary");
 }
 
@@ -459,7 +474,7 @@ void deviceThermoRhoBoundary(
 // Needed because the compressible momentum boundary wants muEff_b = mu_b + rho_b*nut_b, and the wall
 // functions want the KINEMATIC nu_b = mu_b/rho_b. Both are per-face: a single scalar viscosity is only
 // right for a constant-property incompressible case.
-__global__
+__device__
 void muBoundaryK(
     int n,
     ThermoCoeffs c,
@@ -483,11 +498,11 @@ void deviceThermoMuBoundary(
     const int n = static_cast<int>(TBnd.size());
     if (n == 0) return;
     muBnd.resize(n);
-    muBoundaryK<<<nBlocks(n), TPB>>>(
-        n,
-        c,
-        TBnd.data(),
-        muBnd.data());
+    {
+        const scalar* TBndD = TBnd.data(); scalar* muBndD = muBnd.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            muBoundaryK(n, c, TBndD, muBndD); });
+    }
     cudaCheck(cudaGetLastError(), "muBoundary");
 }
 
@@ -495,7 +510,7 @@ void deviceThermoMuBoundary(
 // transport_.mu(patchi)/rho_.boundaryField()[patchi]. Every OF wall function reads this, so brae's wall
 // functions need it too: in compressible flow it is a field, not the single number a constant-property
 // incompressible case can get away with.
-__global__
+__device__
 void nuBoundaryK(
     int n,
     ThermoCoeffs c,
@@ -527,12 +542,11 @@ void deviceThermoNuBoundary(
     DeviceBuffer<scalar> pBnd;
     deviceBCValue(dbP, p, pBnd);
     nuBnd.resize(dbP.n);
-    nuBoundaryK<<<nBlocks(dbP.n), TPB>>>(
-        dbP.n,
-        c,
-        pBnd.data(),
-        TBnd.data(),
-        nuBnd.data());
+    {
+        const int n = dbP.n; const scalar* pBndD = pBnd.data(); const scalar* TBndD = TBnd.data(); scalar* nuBndD = nuBnd.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            nuBoundaryK(n, c, pBndD, TBndD, nuBndD); });
+    }
     cudaCheck(cudaGetLastError(), "nuBoundary");
 }
 
@@ -546,7 +560,7 @@ void deviceThermoNuBoundary(
 // own (default 0.85) on its patches, and the turbulence model's (default 1.0) everywhere else. nut_b is
 // the wall-function nut on a wall face and the extrapolated cell nut elsewhere, matching what the momentum
 // boundary already uses -- so momentum and energy see one consistent wall eddy viscosity.
-__global__
+__device__
 void alphaEffBoundaryK(
     int n,
     ThermoCoeffs c,
@@ -593,15 +607,14 @@ void deviceAlphaEffBoundary(
             "faces as mu -- alphah is kappa(T)/Cp(T) for a liquid and cannot be recovered from mu.");
     }
     alphaEffBnd.resize(n);
-    alphaEffBoundaryK<<<nBlocks(n), TPB>>>(
-        n,
-        c,
-        muBnd.data(),
-        rhoBnd.data(),
-        (nutBnd && nutBnd->size() == muBnd.size()) ? nutBnd->data() : nullptr,
-        (prtBnd && prtBnd->size() == muBnd.size()) ? prtBnd->data() : nullptr,
-        TBnd.data(),
-        alphaEffBnd.data());
+    {
+        const scalar* muBndD = muBnd.data(); const scalar* rhoBndD = rhoBnd.data();
+        const scalar* nutBndD = (nutBnd && nutBnd->size() == muBnd.size()) ? nutBnd->data() : nullptr;
+        const scalar* prtBndD = (prtBnd && prtBnd->size() == muBnd.size()) ? prtBnd->data() : nullptr;
+        const scalar* TBndD = TBnd.data(); scalar* alphaEffBndD = alphaEffBnd.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            alphaEffBoundaryK(n, c, muBndD, rhoBndD, nutBndD, prtBndD, TBndD, alphaEffBndD); });
+    }
     cudaCheck(cudaGetLastError(), "alphaEffBoundary");
 }
 
@@ -613,7 +626,7 @@ void deviceAlphaEffBoundary(
 //   pressureControl: p min -241053.81  (NEGATIVE)
 // during start-up. A negative p gives a negative rho through the perfect-gas EOS, and the next momentum
 // solve is NaN -- which is exactly what brae did on that case before this existed.
-__global__
+__device__
 void clampPressureK(
     int n,
     scalar pMin,
@@ -632,13 +645,16 @@ void deviceLimitPressure(
 {
     const int n = static_cast<int>(p.size());
     if (n == 0) return;
-    clampPressureK<<<nBlocks(n), TPB>>>(n, pMin, pMax, p.data());
+    {
+        scalar* pd = p.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { clampPressureK(n, pMin, pMax, pd); });
+    }
     cudaCheck(cudaGetLastError(), "limitPressure");
 }
 
 // Liquid he-from-T: e = h(T) - p/rho(T) for sensibleInternalEnergy, h(T) for sensibleEnthalpy.
 // PRESSURE IS REQUIRED here, which the gas form never needed -- hConstTToHe is a pure function of T.
-__global__
+__device__
 void liquidHeFromTK(
     int n,
     EnergyForm form,
@@ -670,16 +686,17 @@ void deviceThermoHeFromT(
             throw std::runtime_error(
                 "brae: seeding he from T for a liquid with sensibleInternalEnergy needs the pressure "
                 "field (e = h(T) - p/rho(T)); the caller passed none.");
-        liquidHeFromTK<<<nBlocks(th.n), TPB>>>(
-            th.n, form, p ? p->data() : nullptr, th.T.data(), th.he.data());
+        const int n = th.n; const scalar* pd = p ? p->data() : nullptr;
+        const scalar* Td = th.T.data(); scalar* hed = th.he.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            liquidHeFromTK(n, form, pd, Td, hed); });
         cudaCheck(cudaGetLastError(), "liquidHeFromT");
         return;
     }
-    heFromTK<<<nBlocks(th.n), TPB>>>(
-        th.n,
-        c,
-        th.T.data(),
-        th.he.data());
+    {
+        const int n = th.n; const scalar* Td = th.T.data(); scalar* hed = th.he.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { heFromTK(n, c, Td, hed); });
+    }
     cudaCheck(cudaGetLastError(), "heFromT");
 }
 
@@ -691,7 +708,7 @@ void deviceThermoHeFromT(
 // conductivity directly, so deriving it from a Prandtl number would discard kappa(T) and substitute a
 // constant-Pr assumption that is not what the case asked for. (OF: thermophysicalProperties' alpha is
 // kappa/Cp for these mixtures; the Pr route belongs to the const/sutherland transport models.)
-__global__
+__device__
 void liquidPropsK(
     int n,
     const scalar* __restrict__ T,
@@ -721,14 +738,14 @@ void deviceThermoLiquidProperties(
     if (c.model != ThermoModel::liquidH2O)
         return;   // the gas path owns its own scalars; silently doing nothing here would hide a miswire
     if (th.CpField.size() != static_cast<std::size_t>(th.n)) th.allocateLiquid();
-    liquidPropsK<<<nBlocks(th.n), TPB>>>(
-        th.n,
-        th.T.data(),
-        th.CpField.data(),
-        th.mu.data(),
-        th.kappa.data(),
-        th.rhoThermo.data(),          // the THERMO density; the solver's rho is assigned separately
-        th.alpha.size() == static_cast<std::size_t>(th.n) ? th.alpha.data() : nullptr);
+    {
+        const int n = th.n; const scalar* Td = th.T.data();
+        scalar* Cpd = th.CpField.data(); scalar* mud = th.mu.data(); scalar* kappad = th.kappa.data();
+        scalar* rhod = th.rhoThermo.data();
+        scalar* alphad = th.alpha.size() == static_cast<std::size_t>(th.n) ? th.alpha.data() : nullptr;
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            liquidPropsK(n, Td, Cpd, mud, kappad, rhod, alphad); });
+    }
     cudaCheck(cudaGetLastError(), "liquidProperties");
 }
 
@@ -749,14 +766,12 @@ void deviceThermoLiquidBoundary(
     muB.resize(n);
     kappaB.resize(n);
     rhoB.resize(n);
-    liquidPropsK<<<nBlocks(n), TPB>>>(
-        n,
-        Tb.data(),
-        CpB.data(),
-        muB.data(),
-        kappaB.data(),
-        rhoB.data(),
-        nullptr);                     // no boundary alpha consumer yet; added when the EEqn needs it
+    {
+        const scalar* Tbd = Tb.data();
+        scalar* CpBd = CpB.data(); scalar* muBd = muB.data(); scalar* kappaBd = kappaB.data(); scalar* rhoBd = rhoB.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            liquidPropsK(n, Tbd, CpBd, muBd, kappaBd, rhoBd, nullptr); });
+    }
     cudaCheck(cudaGetLastError(), "liquidBoundary");
 }
 
@@ -767,7 +782,7 @@ void deviceThermoLiquidBoundary(
 // invert is a diagnosable condition (a bad enthalpy from a diverging pressure iterate, say), and the
 // caller is better placed than the kernel to decide whether that is fatal. OF aborts because it is on
 // the host and has one cell in hand; here the whole field is in flight at once.
-__global__
+__device__
 void h2oEnergyToTK(
     int n,
     EnergyForm form,
@@ -804,14 +819,14 @@ void deviceH2OEnergyToT(
     T.resize(n);
     ok.resize(n);
     residual.resize(n);
-    h2oEnergyToTK<<<nBlocks(n), TPB>>>(
-        n, form, tol, maxIter,
-        target.data(),
-        (p && p->size() == target.size()) ? p->data() : nullptr,
-        Tguess.data(),
-        T.data(),
-        ok.data(),
-        residual.data());
+    {
+        const scalar* targetD = target.data();
+        const scalar* pD = (p && p->size() == target.size()) ? p->data() : nullptr;
+        const scalar* TguessD = Tguess.data();
+        scalar* Td = T.data(); label* okd = ok.data(); scalar* residualD = residual.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            h2oEnergyToTK(n, form, tol, maxIter, targetD, pD, TguessD, Td, okd, residualD); });
+    }
     cudaCheck(cudaGetLastError(), "h2oEnergyToT");
 }
 

@@ -1,6 +1,7 @@
 // Maxwell viscoelastic laminar model -- the device kernels. See device_maxwell.cuh for the equations.
 #include "device_maxwell.cuh"
 #include "device_divdevreff.cuh"   // deviceBoundaryGradU / deviceTensorDivSource (shared with the stress path)
+#include "pcuda_compat.cuh"
 
 namespace brae {
 
@@ -14,7 +15,7 @@ inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 // convention the rest of brae uses. (sigma & gradU)_ij = S_ik G_kj, and twoSymm(T) = T + T^T, so
 //     P_ij = S_ik G_kj + S_jk G_ki - nuM*rLambda*(G_ij + G_ji)
 // which is symmetric, hence six components rather than nine.
-__global__
+__device__
 void maxwellPKernel(
     int nC,
     const scalar* __restrict__ sxx, const scalar* __restrict__ sxy, const scalar* __restrict__ sxz,
@@ -56,7 +57,7 @@ void maxwellPKernel(
 }
 
 // diag += V*rLambda (fvm::Sp), source += V*P. Same V-weighted convention as every other reaction here.
-__global__
+__device__
 void maxwellReactionKernel(int nC, const scalar* __restrict__ V, scalar rLambda,
                            const scalar* __restrict__ P,
                            scalar* __restrict__ diag, scalar* __restrict__ source)
@@ -69,7 +70,7 @@ void maxwellReactionKernel(int nC, const scalar* __restrict__ V, scalar rLambda,
 
 // Expand the six stored components into the packed 9-component layout the tensor-divergence kernel
 // takes. Cheap, and it keeps ONE divergence implementation rather than a symmetric copy of it.
-__global__
+__device__
 void symmExpandKernel(int n,
                       const scalar* __restrict__ sxx, const scalar* __restrict__ sxy, const scalar* __restrict__ sxz,
                       const scalar* __restrict__ syy, const scalar* __restrict__ syz, const scalar* __restrict__ szz,
@@ -82,7 +83,7 @@ void symmExpandKernel(int n,
     T[6*n + i] = sxz[i];  T[7*n + i] = syz[i];  T[8*n + i] = szz[i];
 }
 
-__global__
+__device__
 void scaleTensorKernel(int n9, const scalar* __restrict__ in, scalar s, scalar* __restrict__ out)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -90,7 +91,7 @@ void scaleTensorKernel(int n9, const scalar* __restrict__ in, scalar s, scalar* 
 }
 
 // OF magSqr(symmTensor): the off-diagonals appear twice in the full tensor, so they count twice.
-__global__
+__device__
 void symmMagSqrKernel(int nC,
                       const scalar* __restrict__ sxx, const scalar* __restrict__ sxy, const scalar* __restrict__ sxz,
                       const scalar* __restrict__ syy, const scalar* __restrict__ syz, const scalar* __restrict__ szz,
@@ -107,12 +108,12 @@ void deviceMaxwellP(int nC, const DeviceBuffer<scalar>* sigma, const DeviceBuffe
                     scalar nuM, scalar rLambda, DeviceBuffer<scalar>* P)
 {
     for (int k = 0; k < 6; ++k) P[k].resize(static_cast<std::size_t>(nC));
-    maxwellPKernel<<<nBlocks(nC), TPB>>>(nC,
-                                         sigma[0].data(), sigma[1].data(), sigma[2].data(),
-                                         sigma[3].data(), sigma[4].data(), sigma[5].data(),
-                                         gradU.data(), nuM, rLambda,
-                                         P[0].data(), P[1].data(), P[2].data(),
-                                         P[3].data(), P[4].data(), P[5].data());
+    const scalar *s0=sigma[0].data(),*s1=sigma[1].data(),*s2=sigma[2].data(),*s3=sigma[3].data(),*s4=sigma[4].data(),*s5=sigma[5].data();
+    const scalar* gradUd = gradU.data();
+    scalar *p0=P[0].data(),*p1=P[1].data(),*p2=P[2].data(),*p3=P[3].data(),*p4=P[4].data(),*p5=P[5].data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+        maxwellPKernel(nC, s0, s1, s2, s3, s4, s5, gradUd, nuM, rLambda, p0, p1, p2, p3, p4, p5);
+    });
     cudaCheck(cudaGetLastError(), "maxwellP");
 }
 
@@ -120,7 +121,11 @@ void deviceMaxwellReaction(const DeviceBuffer<scalar>& V, scalar rLambda, const 
                            DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source)
 {
     const int nC = static_cast<int>(V.size());
-    maxwellReactionKernel<<<nBlocks(nC), TPB>>>(nC, V.data(), rLambda, Pc.data(), diag.data(), source.data());
+    const scalar* Vd = V.data(); const scalar* Pcd = Pc.data();
+    scalar* diagd = diag.data(); scalar* sourced = source.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+        maxwellReactionKernel(nC, Vd, rLambda, Pcd, diagd, sourced);
+    });
     cudaCheck(cudaGetLastError(), "maxwellReaction");
 }
 
@@ -130,13 +135,17 @@ void deviceDivSymmTensor(const DeviceMesh& dm,
 {
     const int nC = dm.nCells, nB = dm.nBndFaces;
     DeviceBuffer<scalar> Tc(static_cast<std::size_t>(9)*nC), Tb(static_cast<std::size_t>(9)*nB);
-    symmExpandKernel<<<nBlocks(nC), TPB>>>(nC, sigCell[0].data(), sigCell[1].data(), sigCell[2].data(),
-                                           sigCell[3].data(), sigCell[4].data(), sigCell[5].data(), Tc.data());
+    {
+        const scalar *c0=sigCell[0].data(),*c1=sigCell[1].data(),*c2=sigCell[2].data(),*c3=sigCell[3].data(),*c4=sigCell[4].data(),*c5=sigCell[5].data();
+        scalar* Tcd = Tc.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { symmExpandKernel(nC, c0, c1, c2, c3, c4, c5, Tcd); });
+    }
     cudaCheck(cudaGetLastError(), "symmExpand cells");
     if (nB)
     {
-        symmExpandKernel<<<nBlocks(nB), TPB>>>(nB, sigBnd[0].data(), sigBnd[1].data(), sigBnd[2].data(),
-                                               sigBnd[3].data(), sigBnd[4].data(), sigBnd[5].data(), Tb.data());
+        const scalar *b0=sigBnd[0].data(),*b1=sigBnd[1].data(),*b2=sigBnd[2].data(),*b3=sigBnd[3].data(),*b4=sigBnd[4].data(),*b5=sigBnd[5].data();
+        scalar* Tbd = Tb.data();
+        pcudaParallelFor(nBlocks(nB), TPB, [=] __device__ () { symmExpandKernel(nB, b0, b1, b2, b3, b4, b5, Tbd); });
         cudaCheck(cudaGetLastError(), "symmExpand boundary");
     }
     deviceTensorDivSource(dm, Tc, Tb, outX, outY, outZ);
@@ -151,11 +160,17 @@ void deviceDivNuMGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
     DeviceBuffer<scalar> gradB;
     deviceBoundaryGradU(dm, dbU, Ux, Uy, Uz, gradU, gradB);
     DeviceBuffer<scalar> Tc(static_cast<std::size_t>(9)*nC), Tb(static_cast<std::size_t>(9)*nB);
-    scaleTensorKernel<<<nBlocks(9*nC), TPB>>>(9*nC, gradU.data(), nuM, Tc.data());
+    {
+        const scalar* gradUd = gradU.data();
+        scalar* Tcd = Tc.data();
+        pcudaParallelFor(nBlocks(9*nC), TPB, [=] __device__ () { scaleTensorKernel(9*nC, gradUd, nuM, Tcd); });
+    }
     cudaCheck(cudaGetLastError(), "scale nuM gradU cells");
     if (nB)
     {
-        scaleTensorKernel<<<nBlocks(9*nB), TPB>>>(9*nB, gradB.data(), nuM, Tb.data());
+        const scalar* gradBd = gradB.data();
+        scalar* Tbd = Tb.data();
+        pcudaParallelFor(nBlocks(9*nB), TPB, [=] __device__ () { scaleTensorKernel(9*nB, gradBd, nuM, Tbd); });
         cudaCheck(cudaGetLastError(), "scale nuM gradU boundary");
     }
     deviceTensorDivSource(dm, Tc, Tb, outX, outY, outZ);
@@ -164,8 +179,9 @@ void deviceDivNuMGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
 void deviceSymmMagSqr(int nC, const DeviceBuffer<scalar>* sigma, DeviceBuffer<scalar>& out)
 {
     out.resize(static_cast<std::size_t>(nC));
-    symmMagSqrKernel<<<nBlocks(nC), TPB>>>(nC, sigma[0].data(), sigma[1].data(), sigma[2].data(),
-                                           sigma[3].data(), sigma[4].data(), sigma[5].data(), out.data());
+    const scalar *s0=sigma[0].data(),*s1=sigma[1].data(),*s2=sigma[2].data(),*s3=sigma[3].data(),*s4=sigma[4].data(),*s5=sigma[5].data();
+    scalar* outd = out.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { symmMagSqrKernel(nC, s0, s1, s2, s3, s4, s5, outd); });
     cudaCheck(cudaGetLastError(), "symmMagSqr");
 }
 

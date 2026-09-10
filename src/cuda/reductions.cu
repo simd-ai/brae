@@ -2,7 +2,10 @@
 // accumulator), the device-resident "Into" variants, and the device->host scalar read-back. The reduction order
 // differs from the CPU sequential sum, so results match to machine precision (FP non-associativity), not
 // bit-for-bit -- the validation criterion for reductions. Split from device_blas.cu (elementwise ops in blas1.cu).
+//
+// Kernels' static __shared__ arrays work the same as __device__ functions here as they did as __global__.
 #include "device_blas.cuh"
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -25,7 +28,7 @@ inline void ensureRedScratch()
 }
 
 
-__global__
+__device__
 void dotKernel(const scalar* __restrict__ x, const scalar* __restrict__ y, scalar* result, int n)
 {
     __shared__ scalar sdata[TPB];
@@ -42,7 +45,7 @@ void dotKernel(const scalar* __restrict__ x, const scalar* __restrict__ y, scala
 }
 
 
-__global__
+__device__
 void sumMagKernel(const scalar* __restrict__ x, scalar* result, int n)
 {
     __shared__ scalar sdata[TPB];
@@ -65,7 +68,10 @@ scalar deviceDot(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y)
     const int n = static_cast<int>(x.size());
     ensureRedScratch();
     cudaCheck(cudaMemsetAsync(g_redDev, 0, sizeof(scalar), cudaStreamPerThread), "dot zero");
-    dotKernel<<<nBlocks(n), TPB>>>(x.data(), y.data(), g_redDev, n);
+    const scalar* xd = x.data();
+    const scalar* yd = y.data();
+    scalar* result = g_redDev;
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { dotKernel(xd, yd, result, n); });
     cudaCheck(cudaGetLastError(), "dot");
     cudaCheck(cudaMemcpy(g_redPinned, g_redDev, sizeof(scalar), cudaMemcpyDeviceToHost), "dot result");
     return *g_redPinned;
@@ -76,7 +82,7 @@ scalar deviceDot(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y)
 // sum and dot already exist, but the Courant NUMBER is a maximum, and a maximum cannot be assembled
 // from them. Kept as ratio-of-two-arrays rather than max(x) so the division happens in the same pass
 // and no per-cell ratio array is ever materialised.
-__global__
+__device__
 void maxRatioKernel(const scalar* __restrict__ x, const scalar* __restrict__ y, scalar* result, int n)
 {
     __shared__ scalar sdata[TPB];
@@ -98,7 +104,10 @@ scalar deviceMaxRatio(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>&
     if (n == 0 || (int)y.size() < n) return 0;
     ensureRedScratch();
     cudaCheck(cudaMemsetAsync(g_redDev, 0, sizeof(scalar), cudaStreamPerThread), "maxratio zero");
-    maxRatioKernel<<<nBlocks(n), TPB>>>(x.data(), y.data(), g_redDev, n);
+    const scalar* xd = x.data();
+    const scalar* yd = y.data();
+    scalar* result = g_redDev;
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { maxRatioKernel(xd, yd, result, n); });
     cudaCheck(cudaGetLastError(), "maxratio");
     cudaCheck(cudaMemcpy(g_redPinned, g_redDev, sizeof(scalar), cudaMemcpyDeviceToHost), "maxratio result");
     return *g_redPinned;
@@ -110,7 +119,9 @@ scalar deviceSumMag(const DeviceBuffer<scalar>& x)
     const int n = static_cast<int>(x.size());
     ensureRedScratch();
     cudaCheck(cudaMemsetAsync(g_redDev, 0, sizeof(scalar), cudaStreamPerThread), "summag zero");
-    sumMagKernel<<<nBlocks(n), TPB>>>(x.data(), g_redDev, n);
+    const scalar* xd = x.data();
+    scalar* result = g_redDev;
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { sumMagKernel(xd, result, n); });
     cudaCheck(cudaGetLastError(), "summag");
     cudaCheck(cudaMemcpy(g_redPinned, g_redDev, sizeof(scalar), cudaMemcpyDeviceToHost), "summag result");
     return *g_redPinned;
@@ -122,7 +133,9 @@ void deviceDotInto(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y,
 {
     const int n = static_cast<int>(x.size());
     cudaCheck(cudaMemsetAsync(dResult, 0, sizeof(scalar), cudaStreamPerThread), "dotInto zero");
-    dotKernel<<<nBlocks(n), TPB>>>(x.data(), y.data(), dResult, n);
+    const scalar* xd = x.data();
+    const scalar* yd = y.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { dotKernel(xd, yd, dResult, n); });
     cudaCheck(cudaGetLastError(), "dotInto");
 }
 
@@ -131,7 +144,8 @@ void deviceSumMagInto(const DeviceBuffer<scalar>& x, scalar* dResult)
 {
     const int n = static_cast<int>(x.size());
     cudaCheck(cudaMemsetAsync(dResult, 0, sizeof(scalar), cudaStreamPerThread), "summagInto zero");
-    sumMagKernel<<<nBlocks(n), TPB>>>(x.data(), dResult, n);
+    const scalar* xd = x.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { sumMagKernel(xd, dResult, n); });
     cudaCheck(cudaGetLastError(), "summagInto");
 }
 

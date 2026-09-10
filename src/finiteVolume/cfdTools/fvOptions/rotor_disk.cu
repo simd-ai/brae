@@ -1,6 +1,7 @@
 // cf rotorDiskSource (Froude BEM), geometry build (host) + per-iteration body-force kernel. See rotor_disk.cuh.
 // Mirrors OF rotorDiskSource::setFaceArea / calculate (single lookup profile, fixedTrim, no coning).
 #include "rotor_disk.cuh"
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 #include <cmath>
 
@@ -64,7 +65,7 @@ scalar lookupCdl(
     return C[i1] + w*(C[i2]-C[i1]);
 }
 
-__global__
+__device__
 void rotorForceKernel(
     int n,
     const label* __restrict__ cells,
@@ -219,10 +220,21 @@ void deviceRotorForce(
     cudaCheck(cudaMemsetAsync(fx.data(), 0, nCells*sizeof(scalar), cudaStreamPerThread), "rotor fx zero");
     cudaCheck(cudaMemsetAsync(fy.data(), 0, nCells*sizeof(scalar), cudaStreamPerThread), "rotor fy zero");
     cudaCheck(cudaMemsetAsync(fz.data(), 0, nCells*sizeof(scalar), cudaStreamPerThread), "rotor fz zero");
-    rotorForceKernel<<<nBlocks(rd.n), TPB>>>(rd.n, rd.cells.data(), rd.axis, rd.omega, rd.nBlades, rd.tipEffect, rd.rMax,
-        rd.theta0, rd.localInflow?1:0, rd.inletVel, rd.e2x.data(), rd.e2y.data(), rd.e2z.data(), rd.radius.data(),
-        rd.area.data(), rd.twist.data(), rd.chord.data(), rd.pAlpha.data(), rd.pCd.data(), rd.pCl.data(), rd.nProf,
-        Ux.data(), Uy.data(), Uz.data(), fx.data(), fy.data(), fz.data());
+    {
+        const int n = rd.n; const label* cells = rd.cells.data();
+        const vector axis = rd.axis; const scalar omega = rd.omega, nBlades = rd.nBlades, tipEffect = rd.tipEffect, rMax = rd.rMax;
+        const scalar theta0 = rd.theta0; const int localInflow = rd.localInflow?1:0; const vector inletVel = rd.inletVel;
+        const scalar *e2xd=rd.e2x.data(), *e2yd=rd.e2y.data(), *e2zd=rd.e2z.data(), *radiusd=rd.radius.data();
+        const scalar *aread=rd.area.data(), *twistd=rd.twist.data(), *chordd=rd.chord.data();
+        const scalar *pAd=rd.pAlpha.data(), *pCdd=rd.pCd.data(), *pCld=rd.pCl.data(); const int nProf = rd.nProf;
+        const scalar *Uxd=Ux.data(), *Uyd=Uy.data(), *Uzd=Uz.data();
+        scalar *fxd=fx.data(), *fyd=fy.data(), *fzd=fz.data();
+        pcudaParallelFor(nBlocks(rd.n), TPB, [=] __device__ () {
+            rotorForceKernel(n, cells, axis, omega, nBlades, tipEffect, rMax, theta0, localInflow, inletVel,
+                             e2xd, e2yd, e2zd, radiusd, aread, twistd, chordd, pAd, pCdd, pCld, nProf,
+                             Uxd, Uyd, Uzd, fxd, fyd, fzd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "rotorForce");
 }
 

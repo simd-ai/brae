@@ -4,6 +4,7 @@
 //   laplacian : upper=lower = deltaCoeffs * gammaf * |Sf|
 //   div upwind: lower = -max(phi,0)... w=(phi>=0); lower=-w*phi; upper=lower+phi
 #include "device_mesh.cuh"
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -13,7 +14,7 @@ constexpr int TPB = 256;
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 
 
-__global__
+__device__
 void lapFaceKernel(
     int nIf,
     const scalar* __restrict__ dc,
@@ -39,7 +40,7 @@ void lapFaceKernel(
 // So this differs from divFaceKernel by one line -- the weight -- and nothing else. It is UNBOUNDED by
 // construction (that is what central differencing is), which is why OF pairs it with `bounded` on
 // convection-dominated cases and why LES uses it deliberately.
-__global__
+__device__
 void divFaceLinearKernel(int nIf, const scalar* __restrict__ phi, const scalar* __restrict__ w,
                          scalar* __restrict__ upper, scalar* __restrict__ lower)
 {
@@ -53,7 +54,7 @@ void divFaceLinearKernel(int nIf, const scalar* __restrict__ phi, const scalar* 
     }
 }
 
-__global__
+__device__
 void divFaceKernel(int nIf, const scalar* __restrict__ phi, scalar* __restrict__ upper, scalar* __restrict__ lower)
 {
     const int f = blockIdx.x * blockDim.x + threadIdx.x;
@@ -71,7 +72,7 @@ void divFaceKernel(int nIf, const scalar* __restrict__ phi, scalar* __restrict__
 // limitedLinear convection: W_f = limiter*CDweight + (1-limiter)*pos0(phi); limiter = clamp(twoByk*r,0,1),
 // r = NVDTVD gradient ratio. Reduces EXACTLY to upwind divFaceKernel at limiter=0. (OF gaussConvectionScheme +
 // limitedSurfaceInterpolationScheme::weights + NVDTVD::r.) gradc{X,Y,Z} = grad(field); d = (Cf-C_own)-(Cf-C_nei).
-__global__
+__device__
 void divLimitedFaceKernel(
     int nIf,
     const label* __restrict__ own,
@@ -133,7 +134,7 @@ void divLimitedFaceKernel(
 // gradcf = gradfV.(d & gradU[upwind]), r = 2*gradcf/gradf - 1. One limiter -> W applied to all 3 components (the
 // convection matrix is shared, so this feeds mDiag/mUp/mLo implicitly, exactly as the magSqr path does). gU{n}{x,y,z}
 // = grad(U_n) cell fields; d = (Cf-C_own)-(Cf-C_nei) = C[N]-C[P].
-__global__
+__device__
 void divLimitedVFaceKernel(
     int nIf,
     const label* __restrict__ own,
@@ -190,7 +191,7 @@ void divLimitedVFaceKernel(
 }
 
 
-__global__
+__device__
 void diagGatherKernel(
     int nC,
     const label* __restrict__ ownerStart,
@@ -214,7 +215,7 @@ void diagGatherKernel(
 
 // Fold the boundary into the solve: diagC = rawDiag + sum internalCoeffs over c's boundary faces;
 // b = V*divPhi + sum boundaryCoeffs (= brae::pcg's addBoundaryDiag/addBoundarySource + pEqn source V*div).
-__global__
+__device__
 void foldPressureKernel(
     int nC,
     const label* __restrict__ bndCellStart,
@@ -257,16 +258,27 @@ void deviceLaplacianCoeffs(
     diag.resize(nC);
     // corrected scheme uses nonOrthDeltaCoeffs = 1/max(n.delta, 0.05|delta|) for the implicit part.
     const scalar* dcPtr = nonOrth ? dm.nonOrthDc.data() : dm.dc.data();
-    lapFaceKernel<<<nBlocks(nIf), TPB>>>(nIf, dcPtr, gammafInt.data(), dm.magSf.data(), upper.data(), lower.data());
+    {
+        const scalar* gammafD = gammafInt.data(); const scalar* magSf = dm.magSf.data();
+        scalar* upperD = upper.data(); scalar* lowerD = lower.data();
+        pcudaParallelFor(nBlocks(nIf), TPB, [=] __device__ () {
+            lapFaceKernel(nIf, dcPtr, gammafD, magSf, upperD, lowerD); });
+    }
     cudaCheck(cudaGetLastError(), "lapFace");
-    diagGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), upper.data(), lower.data(), diag.data());
+    {
+        const label* ownerStart = dm.ownerStart.data(); const label* losort = dm.losort.data();
+        const label* losortStart = dm.losortStart.data();
+        const scalar* upperD = upper.data(); const scalar* lowerD = lower.data(); scalar* diagD = diag.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            diagGatherKernel(nC, ownerStart, losort, losortStart, upperD, lowerD, diagD); });
+    }
     cudaCheck(cudaGetLastError(), "diagGather");
 }
 
 
 namespace {
 // faceFluxCorr_f = gamma_f*|Sf|_f * (corrVec_f . grad(vf)_f), grad linearly interpolated owner/neighbour.
-__global__
+__device__
 void lapCorrFaceKernel(
     int nIf,
     const label* __restrict__ own,
@@ -301,7 +313,7 @@ void lapCorrFaceKernel(
 // psi=1 -> unlimited (== corrected); the caller skips this kernel entirely then (bit-identical). psi<1 caps only the
 // pathological faces where |corr| > |orthSn| (e.g. extreme-aspect-ratio + high-non-orth cells); well-behaved faces
 // (|corr| small) keep limiter==1 == full correction, so accuracy on the bulk mesh is preserved.
-__global__
+__device__
 void lapCorrFaceLimitedKernel(
     int nIf,
     const label* __restrict__ own,
@@ -335,7 +347,7 @@ void lapCorrFaceLimitedKernel(
 
 
 // lapCorrSource[c] = -V*fvc::div(ffc)[c] = -sum_{f: owner=c} ffc + sum_{f: nei=c} ffc.
-__global__
+__device__
 void lapCorrGatherKernel(
     int nC,
     const label* __restrict__ ownerStart,
@@ -368,9 +380,15 @@ void deviceLaplacianCorrFlux(
 {
     const int nIf = dm.nInternalFaces;
     ffc.resize(nIf);
-    lapCorrFaceKernel<<<nBlocks(nIf), TPB>>>(nIf, dm.owner.data(), dm.nei.data(), dm.w.data(), gammafInt.data(), dm.magSf.data(),
-                                             dm.corrVecX.data(), dm.corrVecY.data(), dm.corrVecZ.data(),
-                                             gx.data(), gy.data(), gz.data(), ffc.data());
+    {
+        const label* own = dm.owner.data(); const label* nei = dm.nei.data(); const scalar* w = dm.w.data();
+        const scalar* gammafD = gammafInt.data(); const scalar* magSf = dm.magSf.data();
+        const scalar* cvx = dm.corrVecX.data(); const scalar* cvy = dm.corrVecY.data(); const scalar* cvz = dm.corrVecZ.data();
+        const scalar* gxd = gx.data(); const scalar* gyd = gy.data(); const scalar* gzd = gz.data();
+        scalar* ffcd = ffc.data();
+        pcudaParallelFor(nBlocks(nIf), TPB, [=] __device__ () {
+            lapCorrFaceKernel(nIf, own, nei, w, gammafD, magSf, cvx, cvy, cvz, gxd, gyd, gzd, ffcd); });
+    }
     cudaCheck(cudaGetLastError(), "lapCorrFace");
 }
 
@@ -394,9 +412,16 @@ void deviceLaplacianCorrFluxLimited(
     }
     const int nIf = dm.nInternalFaces;
     ffc.resize(nIf);
-    lapCorrFaceLimitedKernel<<<nBlocks(nIf), TPB>>>(nIf, dm.owner.data(), dm.nei.data(), dm.w.data(), gammafInt.data(), dm.magSf.data(),
-                                                    dm.corrVecX.data(), dm.corrVecY.data(), dm.corrVecZ.data(),
-                                                    dm.nonOrthDc.data(), phi.data(), gx.data(), gy.data(), gz.data(), psi, ffc.data());
+    {
+        const label* own = dm.owner.data(); const label* nei = dm.nei.data(); const scalar* w = dm.w.data();
+        const scalar* gammafD = gammafInt.data(); const scalar* magSf = dm.magSf.data();
+        const scalar* cvx = dm.corrVecX.data(); const scalar* cvy = dm.corrVecY.data(); const scalar* cvz = dm.corrVecZ.data();
+        const scalar* nonOrthDc = dm.nonOrthDc.data(); const scalar* phid = phi.data();
+        const scalar* gxd = gx.data(); const scalar* gyd = gy.data(); const scalar* gzd = gz.data();
+        scalar* ffcd = ffc.data();
+        pcudaParallelFor(nBlocks(nIf), TPB, [=] __device__ () {
+            lapCorrFaceLimitedKernel(nIf, own, nei, w, gammafD, magSf, cvx, cvy, cvz, nonOrthDc, phid, gxd, gyd, gzd, psi, ffcd); });
+    }
     cudaCheck(cudaGetLastError(), "lapCorrFaceLimited");
 }
 
@@ -406,7 +431,13 @@ void deviceFaceDivSource(const DeviceMesh& dm, const DeviceBuffer<scalar>& ffc, 
 {
     const int nC = dm.nCells;
     src.resize(nC);
-    lapCorrGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), ffc.data(), src.data());
+    {
+        const label* ownerStart = dm.ownerStart.data(); const label* losort = dm.losort.data();
+        const label* losortStart = dm.losortStart.data();
+        const scalar* ffcD = ffc.data(); scalar* srcd = src.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            lapCorrGatherKernel(nC, ownerStart, losort, losortStart, ffcD, srcd); });
+    }
     cudaCheck(cudaGetLastError(), "lapCorrGather");
 }
 
@@ -437,9 +468,20 @@ void deviceDivCentralCoeffs(
     upper.resize(nIf);
     lower.resize(nIf);
     diag.resize(nC);
-    divFaceLinearKernel<<<nBlocks(nIf), TPB>>>(nIf, phiInt.data(), dm.w.data(), upper.data(), lower.data());
+    {
+        const scalar* phiIntD = phiInt.data(); const scalar* w = dm.w.data();
+        scalar* upperD = upper.data(); scalar* lowerD = lower.data();
+        pcudaParallelFor(nBlocks(nIf), TPB, [=] __device__ () {
+            divFaceLinearKernel(nIf, phiIntD, w, upperD, lowerD); });
+    }
     cudaCheck(cudaGetLastError(), "divFaceLinear");
-    diagGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), upper.data(), lower.data(), diag.data());
+    {
+        const label* ownerStart = dm.ownerStart.data(); const label* losort = dm.losort.data();
+        const label* losortStart = dm.losortStart.data();
+        const scalar* upperD = upper.data(); const scalar* lowerD = lower.data(); scalar* diagD = diag.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            diagGatherKernel(nC, ownerStart, losort, losortStart, upperD, lowerD, diagD); });
+    }
     cudaCheck(cudaGetLastError(), "diagGather");
 }
 
@@ -454,9 +496,19 @@ void deviceDivUpwindCoeffs(
     upper.resize(nIf);
     lower.resize(nIf);
     diag.resize(nC);
-    divFaceKernel<<<nBlocks(nIf), TPB>>>(nIf, phiInt.data(), upper.data(), lower.data());
+    {
+        const scalar* phiIntD = phiInt.data(); scalar* upperD = upper.data(); scalar* lowerD = lower.data();
+        pcudaParallelFor(nBlocks(nIf), TPB, [=] __device__ () {
+            divFaceKernel(nIf, phiIntD, upperD, lowerD); });
+    }
     cudaCheck(cudaGetLastError(), "divFace");
-    diagGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), upper.data(), lower.data(), diag.data());
+    {
+        const label* ownerStart = dm.ownerStart.data(); const label* losort = dm.losort.data();
+        const label* losortStart = dm.losortStart.data();
+        const scalar* upperD = upper.data(); const scalar* lowerD = lower.data(); scalar* diagD = diag.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            diagGatherKernel(nC, ownerStart, losort, losortStart, upperD, lowerD, diagD); });
+    }
     cudaCheck(cudaGetLastError(), "diagGather");
 }
 
@@ -477,13 +529,25 @@ void deviceDivLimitedCoeffs(
     upper.resize(nIf);
     lower.resize(nIf);
     diag.resize(nC);
-    divLimitedFaceKernel<<<nBlocks(nIf), TPB>>>(nIf, dm.owner.data(), dm.nei.data(), dm.w.data(), phiInt.data(), field.data(),
-                                                gx.data(), gy.data(), gz.data(),
-                                                dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
-                                                dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
-                                                twoByk, upper.data(), lower.data());
+    {
+        const label* own = dm.owner.data(); const label* nei = dm.nei.data(); const scalar* w = dm.w.data();
+        const scalar* phiIntD = phiInt.data(); const scalar* fieldD = field.data();
+        const scalar* gxd = gx.data(); const scalar* gyd = gy.data(); const scalar* gzd = gz.data();
+        const scalar* dOwnX = dm.dOwnX.data(); const scalar* dOwnY = dm.dOwnY.data(); const scalar* dOwnZ = dm.dOwnZ.data();
+        const scalar* dNeiX = dm.dNeiX.data(); const scalar* dNeiY = dm.dNeiY.data(); const scalar* dNeiZ = dm.dNeiZ.data();
+        scalar* upperD = upper.data(); scalar* lowerD = lower.data();
+        pcudaParallelFor(nBlocks(nIf), TPB, [=] __device__ () {
+            divLimitedFaceKernel(nIf, own, nei, w, phiIntD, fieldD, gxd, gyd, gzd,
+                                  dOwnX, dOwnY, dOwnZ, dNeiX, dNeiY, dNeiZ, twoByk, upperD, lowerD); });
+    }
     cudaCheck(cudaGetLastError(), "divLimitedFace");
-    diagGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), upper.data(), lower.data(), diag.data());
+    {
+        const label* ownerStart = dm.ownerStart.data(); const label* losort = dm.losort.data();
+        const label* losortStart = dm.losortStart.data();
+        const scalar* upperD = upper.data(); const scalar* lowerD = lower.data(); scalar* diagD = diag.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            diagGatherKernel(nC, ownerStart, losort, losortStart, upperD, lowerD, diagD); });
+    }
     cudaCheck(cudaGetLastError(), "diagGather");
 }
 
@@ -504,16 +568,29 @@ void deviceDivLimitedVCoeffs(
     upper.resize(nIf);
     lower.resize(nIf);
     diag.resize(nC);
-    divLimitedVFaceKernel<<<nBlocks(nIf), TPB>>>(nIf, dm.owner.data(), dm.nei.data(), dm.w.data(), phiInt.data(),
-                                                 U[0].data(), U[1].data(), U[2].data(),
-                                                 gUx[0].data(), gUy[0].data(), gUz[0].data(),
-                                                 gUx[1].data(), gUy[1].data(), gUz[1].data(),
-                                                 gUx[2].data(), gUy[2].data(), gUz[2].data(),
-                                                 dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
-                                                 dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
-                                                 twoByk, upper.data(), lower.data());
+    {
+        const label* own = dm.owner.data(); const label* nei = dm.nei.data(); const scalar* w = dm.w.data();
+        const scalar* phiIntD = phiInt.data();
+        const scalar* U0 = U[0].data(); const scalar* U1 = U[1].data(); const scalar* U2 = U[2].data();
+        const scalar* gU0x = gUx[0].data(); const scalar* gU0y = gUy[0].data(); const scalar* gU0z = gUz[0].data();
+        const scalar* gU1x = gUx[1].data(); const scalar* gU1y = gUy[1].data(); const scalar* gU1z = gUz[1].data();
+        const scalar* gU2x = gUx[2].data(); const scalar* gU2y = gUy[2].data(); const scalar* gU2z = gUz[2].data();
+        const scalar* dOwnX = dm.dOwnX.data(); const scalar* dOwnY = dm.dOwnY.data(); const scalar* dOwnZ = dm.dOwnZ.data();
+        const scalar* dNeiX = dm.dNeiX.data(); const scalar* dNeiY = dm.dNeiY.data(); const scalar* dNeiZ = dm.dNeiZ.data();
+        scalar* upperD = upper.data(); scalar* lowerD = lower.data();
+        pcudaParallelFor(nBlocks(nIf), TPB, [=] __device__ () {
+            divLimitedVFaceKernel(nIf, own, nei, w, phiIntD, U0, U1, U2,
+                                   gU0x, gU0y, gU0z, gU1x, gU1y, gU1z, gU2x, gU2y, gU2z,
+                                   dOwnX, dOwnY, dOwnZ, dNeiX, dNeiY, dNeiZ, twoByk, upperD, lowerD); });
+    }
     cudaCheck(cudaGetLastError(), "divLimitedVFace");
-    diagGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), upper.data(), lower.data(), diag.data());
+    {
+        const label* ownerStart = dm.ownerStart.data(); const label* losort = dm.losort.data();
+        const label* losortStart = dm.losortStart.data();
+        const scalar* upperD = upper.data(); const scalar* lowerD = lower.data(); scalar* diagD = diag.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            diagGatherKernel(nC, ownerStart, losort, losortStart, upperD, lowerD, diagD); });
+    }
     cudaCheck(cudaGetLastError(), "diagGather");
 }
 
@@ -537,16 +614,29 @@ void deviceDivLimitedVCoeffs(
     lower.resize(nIf);
     diag.resize(nC);
     const scalar* g = gradU.data();
-    divLimitedVFaceKernel<<<nBlocks(nIf), TPB>>>(nIf, dm.owner.data(), dm.nei.data(), dm.w.data(), phiInt.data(),
-                                                 U[0].data(), U[1].data(), U[2].data(),
-                                                 g + 0*nC, g + 3*nC, g + 6*nC,     // d(U_0)/d{x,y,z}
-                                                 g + 1*nC, g + 4*nC, g + 7*nC,     // d(U_1)/d{x,y,z}
-                                                 g + 2*nC, g + 5*nC, g + 8*nC,     // d(U_2)/d{x,y,z}
-                                                 dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
-                                                 dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
-                                                 twoByk, upper.data(), lower.data());
+    {
+        const label* own = dm.owner.data(); const label* nei = dm.nei.data(); const scalar* w = dm.w.data();
+        const scalar* phiIntD = phiInt.data();
+        const scalar* U0 = U[0].data(); const scalar* U1 = U[1].data(); const scalar* U2 = U[2].data();
+        const scalar* gU0x = g + 0*nC; const scalar* gU0y = g + 3*nC; const scalar* gU0z = g + 6*nC;
+        const scalar* gU1x = g + 1*nC; const scalar* gU1y = g + 4*nC; const scalar* gU1z = g + 7*nC;
+        const scalar* gU2x = g + 2*nC; const scalar* gU2y = g + 5*nC; const scalar* gU2z = g + 8*nC;
+        const scalar* dOwnX = dm.dOwnX.data(); const scalar* dOwnY = dm.dOwnY.data(); const scalar* dOwnZ = dm.dOwnZ.data();
+        const scalar* dNeiX = dm.dNeiX.data(); const scalar* dNeiY = dm.dNeiY.data(); const scalar* dNeiZ = dm.dNeiZ.data();
+        scalar* upperD = upper.data(); scalar* lowerD = lower.data();
+        pcudaParallelFor(nBlocks(nIf), TPB, [=] __device__ () {
+            divLimitedVFaceKernel(nIf, own, nei, w, phiIntD, U0, U1, U2,
+                                   gU0x, gU0y, gU0z, gU1x, gU1y, gU1z, gU2x, gU2y, gU2z,
+                                   dOwnX, dOwnY, dOwnZ, dNeiX, dNeiY, dNeiZ, twoByk, upperD, lowerD); });
+    }
     cudaCheck(cudaGetLastError(), "divLimitedVFacePacked");
-    diagGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), upper.data(), lower.data(), diag.data());
+    {
+        const label* ownerStart = dm.ownerStart.data(); const label* losort = dm.losort.data();
+        const label* losortStart = dm.losortStart.data();
+        const scalar* upperD = upper.data(); const scalar* lowerD = lower.data(); scalar* diagD = diag.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            diagGatherKernel(nC, ownerStart, losort, losortStart, upperD, lowerD, diagD); });
+    }
     cudaCheck(cudaGetLastError(), "diagGather");
 }
 
@@ -563,14 +653,20 @@ void deviceFoldPressure(
     const int nC = dm.nCells;
     diagC.resize(nC);
     b.resize(nC);
-    foldPressureKernel<<<nBlocks(nC), TPB>>>(nC, dm.bndCellStart.data(), dm.bndPerm.data(), rawDiag.data(),
-                                             dm.V.data(), divPhi.data(), iC.data(), bC.data(), diagC.data(), b.data());
+    {
+        const label* bndCellStart = dm.bndCellStart.data(); const label* bndPerm = dm.bndPerm.data();
+        const scalar* rawDiagD = rawDiag.data(); const scalar* Vd = dm.V.data(); const scalar* divPhiD = divPhi.data();
+        const scalar* iCd = iC.data(); const scalar* bCd = bC.data();
+        scalar* diagCd = diagC.data(); scalar* bd = b.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            foldPressureKernel(nC, bndCellStart, bndPerm, rawDiagD, Vd, divPhiD, iCd, bCd, diagCd, bd); });
+    }
     cudaCheck(cudaGetLastError(), "foldPressure");
 }
 
 
 namespace {
-__global__
+__device__
 void foldKernel(
     int nC,
     const label* __restrict__ bndCellStart,
@@ -611,8 +707,14 @@ void deviceFold(
     const int nC = dm.nCells;
     diagC.resize(nC);
     b.resize(nC);
-    foldKernel<<<nBlocks(nC), TPB>>>(nC, dm.bndCellStart.data(), dm.bndPerm.data(), rawDiag.data(),
-                                     source.data(), iC.data(), bC.data(), diagC.data(), b.data());
+    {
+        const label* bndCellStart = dm.bndCellStart.data(); const label* bndPerm = dm.bndPerm.data();
+        const scalar* rawDiagD = rawDiag.data(); const scalar* sourceD = source.data();
+        const scalar* iCd = iC.data(); const scalar* bCd = bC.data();
+        scalar* diagCd = diagC.data(); scalar* bd = b.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            foldKernel(nC, bndCellStart, bndPerm, rawDiagD, sourceD, iCd, bCd, diagCd, bd); });
+    }
     cudaCheck(cudaGetLastError(), "fold");
 }
 

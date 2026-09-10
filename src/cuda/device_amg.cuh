@@ -18,7 +18,11 @@ namespace brae {
 // Cached CUDA graph of the V-cycle: captured once and replayed across solves while the fine-matrix buffer
 // pointer (key) is unchanged. Owned via unique_ptr so AMGData stays movable and the graph is freed on destruct.
 struct AMGGraphCache {
+#ifndef BRAE_ACPP
+    // See the matching guard in device_pcg.cuh's BiCGGraphCache: no PCUDA/SYCL graph-replay equivalent, and
+    // the only code touching these fields is excluded from the ACPP build.
     cudaGraphExec_t exec = nullptr; cudaGraph_t graph = nullptr; const void* key = nullptr;
+#endif
     ~AMGGraphCache();
 };
 
@@ -27,8 +31,12 @@ struct AMGGraphCache {
 // later solver whose pressure buffer lands at the recycled address would hit the stale entry and replay a graph
 // baked against freed buffers (illegal memory access). Holds the graph-referenced persistent work buffers.
 struct PCGGraphCache {
+#ifndef BRAE_ACPP
+    // See the matching guard in device_pcg.cuh's BiCGGraphCache: no PCUDA/SYCL graph-replay equivalent, and
+    // the only code touching these fields is excluded from the ACPP build.
     cudaGraphExec_t exec = nullptr; cudaGraph_t graph = nullptr;
     cudaGraphConditionalHandle handle{}; const void* key = nullptr;
+#endif
     // tol/relTol/maxIter are baked into the captured pcgSetCondK node, so they are part of the
     // cache identity: replaying with a changed convergence control would silently keep the stale
     // bound. They stay constant per field in the SIMPLE loop (no extra re-capture there), so

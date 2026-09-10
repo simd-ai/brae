@@ -1,6 +1,7 @@
 // cf device DarcyForchheimer porosity. See device_fvoptions.cuh. Mirrors OF porosityModels::DarcyForchheimer::apply
 // (incompressible: mu=nu, rho=1), implicit isotropic resistance into the diagonal + explicit anisotropic remainder.
 #include "device_fvoptions.cuh"
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -42,7 +43,7 @@ void fixedCd(const scalar* a, const scalar* b, scalar rho, scalar magU, scalar* 
     for (int k = 0; k < 9; ++k) Cd[k] = rho*(a[k] + b[k]*magU);
 }
 
-__global__
+__device__
 void porFixedDiagKernel(
     int n,
     const label* __restrict__ cells,
@@ -63,7 +64,7 @@ void porFixedDiagKernel(
     diag[c] += V[c]*(Cd[0] + Cd[4] + Cd[8]);                       // += V*tr(Cd)
 }
 
-__global__
+__device__
 void porFixedSrcKernel(
     int n,
     const label* __restrict__ cells,
@@ -90,7 +91,7 @@ void porFixedSrcKernel(
 }
 
 
-__global__
+__device__
 void porDiagKernel(
     int n,
     const label* __restrict__ cells,
@@ -117,7 +118,7 @@ void porDiagKernel(
 }
 
 
-__global__
+__device__
 void porSrcKernel(
     int n,
     const label* __restrict__ cells,
@@ -160,16 +161,25 @@ void deviceFvoPorosityDiag(
 {
     const int n = static_cast<int>(por.cells.size());
     if (!por.active || !n) return;
+    const label* cellsd = por.cells.data();
+    const scalar *Vd = V.data(), *Uxd = Ux.data(), *Uyd = Uy.data(), *Uzd = Uz.data();
+    scalar* diagd = diag.data();
     if (por.fixed)
     {
         DeviceBuffer<scalar> a, b; a.copyFrom(std::vector<scalar>(por.fa, por.fa+9)); b.copyFrom(std::vector<scalar>(por.fb, por.fb+9));
-        porFixedDiagKernel<<<nBlocks(n), TPB>>>(n, por.cells.data(), por.rhoRef, a.data(), b.data(),
-                                                V.data(), Ux.data(), Uy.data(), Uz.data(), diag.data());
+        const scalar rho = por.rhoRef; const scalar *ad = a.data(), *bd = b.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            porFixedDiagKernel(n, cellsd, rho, ad, bd, Vd, Uxd, Uyd, Uzd, diagd);
+        });
         cudaCheck(cudaGetLastError(), "porosityFixedDiag");
         return;
     }
-    porDiagKernel<<<nBlocks(n), TPB>>>(n, por.cells.data(), nu, por.d.x,por.d.y,por.d.z, por.f.x,por.f.y,por.f.z,
-                                       V.data(), Ux.data(), Uy.data(), Uz.data(), diag.data());
+    {
+        const scalar dx=por.d.x,dy=por.d.y,dz=por.d.z,fx=por.f.x,fy=por.f.y,fz=por.f.z;
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            porDiagKernel(n, cellsd, nu, dx, dy, dz, fx, fy, fz, Vd, Uxd, Uyd, Uzd, diagd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "porDiag");
 }
 
@@ -186,22 +196,31 @@ void deviceFvoPorositySource(
 {
     const int n = static_cast<int>(por.cells.size());
     if (!por.active || !n) return;
+    const label* cellsd = por.cells.data();
+    const scalar *Vd = V.data(), *Uxd = Ux.data(), *Uyd = Uy.data(), *Uzd = Uz.data();
+    scalar* srcd = src.data();
     if (por.fixed)
     {
         DeviceBuffer<scalar> a, b; a.copyFrom(std::vector<scalar>(por.fa, por.fa+9)); b.copyFrom(std::vector<scalar>(por.fb, por.fb+9));
-        porFixedSrcKernel<<<nBlocks(n), TPB>>>(n, por.cells.data(), comp, por.rhoRef, a.data(), b.data(),
-                                               V.data(), Ux.data(), Uy.data(), Uz.data(), src.data());
+        const scalar rho = por.rhoRef; const scalar *ad = a.data(), *bd = b.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            porFixedSrcKernel(n, cellsd, comp, rho, ad, bd, Vd, Uxd, Uyd, Uzd, srcd);
+        });
         cudaCheck(cudaGetLastError(), "porosityFixedSrc");
         return;
     }
-    porSrcKernel<<<nBlocks(n), TPB>>>(n, por.cells.data(), comp, nu, por.d.x,por.d.y,por.d.z, por.f.x,por.f.y,por.f.z,
-                                      V.data(), Ux.data(), Uy.data(), Uz.data(), src.data());
+    {
+        const scalar dx=por.d.x,dy=por.d.y,dz=por.d.z,fx=por.f.x,fy=por.f.y,fz=por.f.z;
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            porSrcKernel(n, cellsd, comp, nu, dx, dy, dz, fx, fy, fz, Vd, Uxd, Uyd, Uzd, srcd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "porSrc");
 }
 
 
 namespace {
-__global__
+__device__
 void limitUKernel(
     int n,
     const label* __restrict__ cells,
@@ -226,7 +245,7 @@ void limitUKernel(
 
 
 // he clamp on a cell selection. Same shape as limitUKernel: gather through the selection list.
-__global__
+__device__
 void limitEnergyKernel(int n, const label* __restrict__ cells, scalar heMin, scalar heMax,
                        scalar* __restrict__ he)
 {
@@ -245,14 +264,15 @@ void deviceFvoLimitEnergy(
 {
     const int n = static_cast<int>(cells.size());
     if (!n) return;
-    limitEnergyKernel<<<nBlocks(n), TPB>>>(n, cells.data(), heMin, heMax, he.data());
+    const label* cellsd = cells.data(); scalar* hed = he.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { limitEnergyKernel(n, cellsd, heMin, heMax, hed); });
     cudaCheck(cudaGetLastError(), "limitTemperature");
 }
 
 // Boundary half: every face whose patch does not fix a value. OF's test is fvPatchField::fixesValue(); on
 // the device that is bcType == 1 (brae: 0 extrapolated, 1 fixedValue, 2 calculated), and an inletOutlet
 // face has already been resolved to 0|1 for this iteration, so the same test covers it.
-__global__
+__device__
 void limitEnergyBndKernel(int n, const label* __restrict__ bcType, scalar heMin, scalar heMax,
                           scalar* __restrict__ heBnd)
 {
@@ -271,7 +291,8 @@ void deviceFvoLimitEnergyBoundary(
 {
     const int n = static_cast<int>(heBnd.size());
     if (!n || dbHe.n != n) return;
-    limitEnergyBndKernel<<<nBlocks(n), TPB>>>(n, dbHe.bcType.data(), heMin, heMax, heBnd.data());
+    const label* bcTyped = dbHe.bcType.data(); scalar* heBndd = heBnd.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { limitEnergyBndKernel(n, bcTyped, heMin, heMax, heBndd); });
     cudaCheck(cudaGetLastError(), "limitTemperatureBnd");
 }
 
@@ -284,13 +305,15 @@ void deviceFvoLimitVelocity(
 {
     const int n = static_cast<int>(cells.size());
     if (!n) return;
-    limitUKernel<<<nBlocks(n), TPB>>>(n, cells.data(), maxU*maxU, Ux.data(), Uy.data(), Uz.data());
+    const label* cellsd = cells.data(); const scalar maxSqrU = maxU*maxU;
+    scalar *Uxd = Ux.data(), *Uyd = Uy.data(), *Uzd = Uz.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { limitUKernel(n, cellsd, maxSqrU, Uxd, Uyd, Uzd); });
     cudaCheck(cudaGetLastError(), "limitVelocity");
 }
 
 
 // velocityDampingConstraint: diag[c] += C*V[c]^(2/3)*(|U|-UMax) where |U| > UMax.
-__global__
+__device__
 void velDampKernel(
     int n,
     const label* __restrict__ cells,
@@ -326,7 +349,10 @@ void deviceFvoVelocityDamping(
 {
     const int n = static_cast<int>(cells.size());
     if (!n) return;
-    velDampKernel<<<nBlocks(n), TPB>>>(n, cells.data(), UMax, C, V.data(), Ux.data(), Uy.data(), Uz.data(), diag.data());
+    const label* cellsd = cells.data();
+    const scalar *Vd = V.data(), *Uxd = Ux.data(), *Uyd = Uy.data(), *Uzd = Uz.data();
+    scalar* diagd = diag.data();
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { velDampKernel(n, cellsd, UMax, C, Vd, Uxd, Uyd, Uzd, diagd); });
     cudaCheck(cudaGetLastError(), "velocityDampingConstraint");
 }
 

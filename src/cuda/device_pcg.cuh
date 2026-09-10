@@ -21,8 +21,12 @@ struct DeviceSolverPerf { scalar initialResidual = 0, finalResidual = 0; int nIt
 // copies here (diagP/upperP/lowerP/ifaceP) that the caller memcpy-refreshes each step -> the graph is captured
 // ONCE and replayed, no per-step re-instantiation. Holds the graph-referenced Krylov vectors + control scalars.
 struct BiCGGraphCache {
+#ifndef BRAE_ACPP
+    // CUDA-graph conditional-node replay has no PCUDA equivalent; the only code touching these fields is
+    // excluded from the ACPP build, so the fields are excluded too rather than left dangling.
     cudaGraphExec_t exec = nullptr; cudaGraph_t graph = nullptr;
     cudaGraphConditionalHandle handle{}; const void* key = nullptr;
+#endif
     DeviceBuffer<scalar> rA, rA0, pA, yA, AyA, sA, zA, tA, Ax;      // persistent Krylov vectors
     DeviceBuffer<scalar> diagP, upperP, lowerP;                     // persistent matrix copies (refreshed per step)
     std::vector<DeviceBuffer<scalar>> ifaceP;                       // persistent interface-coeff copies

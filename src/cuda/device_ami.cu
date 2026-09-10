@@ -1,5 +1,6 @@
 // cf GPU offload, cyclicAMI weighted-stencil coupling kernels. See device_ami.cuh.
 #include "device_ami.cuh"
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -8,7 +9,7 @@ constexpr int TPB = 256;
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 
 
-__global__
+__device__
 void amiInterpKernel(
     int n,
     const label* __restrict__ off,
@@ -27,7 +28,7 @@ void amiInterpKernel(
 }
 
 
-__global__
+__device__
 void amiInterpVecKernel(
     int n,
     const label* __restrict__ off,
@@ -65,7 +66,7 @@ void amiInterpVecKernel(
 }
 
 
-__global__
+__device__
 void amiAmulKernel(
     int n,
     const label* __restrict__ own,
@@ -90,8 +91,13 @@ void amiAmulKernel(
 void deviceAmiAmul(const DeviceAMI& ami, const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi)
 {
     if (ami.n == 0) return;
-    amiAmulKernel<<<nBlocks(ami.n), TPB>>>(ami.n, ami.ownCell.data(), ami.off.data(), ami.nbrCell.data(),
-                                           ami.weight.data(), ami.ifCoeff.data(), psi.data(), Apsi.data());
+    {
+        const int n = ami.n; const label* own = ami.ownCell.data(); const label* off = ami.off.data();
+        const label* nbr = ami.nbrCell.data(); const scalar* w = ami.weight.data(); const scalar* ifc = ami.ifCoeff.data();
+        const scalar* psid = psi.data(); scalar* Apsid = Apsi.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiAmulKernel(n, own, off, nbr, w, ifc, psid, Apsid); });
+    }
     cudaCheck(cudaGetLastError(), "amiAmul");
 }
 
@@ -102,14 +108,19 @@ void deviceAmiAmulCoeff(const DeviceAMI& ami, const DeviceBuffer<scalar>& coeff,
                         const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi)
 {
     if (ami.n == 0) return;
-    amiAmulKernel<<<nBlocks(ami.n), TPB>>>(ami.n, ami.ownCell.data(), ami.off.data(), ami.nbrCell.data(),
-                                           ami.weight.data(), coeff.data(), psi.data(), Apsi.data());
+    {
+        const int n = ami.n; const label* own = ami.ownCell.data(); const label* off = ami.off.data();
+        const label* nbr = ami.nbrCell.data(); const scalar* w = ami.weight.data(); const scalar* coeffD = coeff.data();
+        const scalar* psid = psi.data(); scalar* Apsid = Apsi.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiAmulKernel(n, own, off, nbr, w, coeffD, psid, Apsid); });
+    }
     cudaCheck(cudaGetLastError(), "amiAmulCoeff");
 }
 
 
 namespace {
-__global__
+__device__
 void amiMomKernel(
     int n,
     const label* __restrict__ own,
@@ -133,7 +144,7 @@ void amiMomKernel(
 }
 
 
-__global__
+__device__
 void amiLaplKernel(
     int n,
     const label* __restrict__ own,
@@ -156,7 +167,7 @@ void amiLaplKernel(
 }
 
 
-__global__
+__device__
 void amiOffSumKernel(
     int n,
     const label* __restrict__ own,
@@ -171,7 +182,7 @@ void amiOffSumKernel(
 }
 
 
-__global__
+__device__
 void amiAddHKernel(
     int n,
     const label* __restrict__ own,
@@ -188,7 +199,7 @@ void amiAddHKernel(
 }
 
 
-__global__
+__device__
 void amiFluxKernel(
     int n,
     const label* __restrict__ own,
@@ -213,7 +224,7 @@ void amiFluxKernel(
 }
 
 
-__global__
+__device__
 void amiDivAddKernel(
     int n,
     const label* __restrict__ own,
@@ -228,7 +239,7 @@ void amiDivAddKernel(
 }
 
 
-__global__
+__device__
 void amiGradAddKernel(
     int n,
     const label* __restrict__ own,
@@ -254,7 +265,7 @@ void amiGradAddKernel(
 }
 
 
-__global__
+__device__
 void amiFluxCorrKernel(
     int n,
     const label* __restrict__ own,
@@ -276,8 +287,14 @@ void deviceAmiAssembleMomentum(DeviceAMI& ami, const DeviceBuffer<scalar>& nuEff
     if (ami.n==0) return;
     DeviceBuffer<scalar> nuN;
     deviceAmiInterpolate(ami, nuEffCell, nuN);
-    amiMomKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), nuEffCell.data(), nuN.data(), ami.deltaCoeffs.data(),
-        ami.weights.data(), ami.magSf.data(), ami.phi.data(), ami.ifCoeff.data(), diag.data());
+    {
+        const int n = ami.n; const label* own = ami.ownCell.data();
+        const scalar* nu = nuEffCell.data(); const scalar* nuNd = nuN.data(); const scalar* dc = ami.deltaCoeffs.data();
+        const scalar* w = ami.weights.data(); const scalar* magSf = ami.magSf.data(); const scalar* phi = ami.phi.data();
+        scalar* ifc = ami.ifCoeff.data(); scalar* diagd = diag.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiMomKernel(n, own, nu, nuNd, dc, w, magSf, phi, ifc, diagd); });
+    }
     cudaCheck(cudaGetLastError(),"amiMom");
 }
 
@@ -287,8 +304,14 @@ void deviceAmiAssembleLaplacian(DeviceAMI& ami, const DeviceBuffer<scalar>& gamm
     if (ami.n==0) return;
     DeviceBuffer<scalar> gN;
     deviceAmiInterpolate(ami, gammaCell, gN);
-    amiLaplKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), gammaCell.data(), gN.data(), ami.deltaCoeffs.data(),
-        ami.weights.data(), ami.magSf.data(), ami.ifCoeff.data(), diag.data(), addToDiag?1:0);
+    {
+        const int n = ami.n; const label* own = ami.ownCell.data();
+        const scalar* ga = gammaCell.data(); const scalar* gaN = gN.data(); const scalar* dc = ami.deltaCoeffs.data();
+        const scalar* w = ami.weights.data(); const scalar* magSf = ami.magSf.data();
+        scalar* ifc = ami.ifCoeff.data(); scalar* diagd = diag.data(); const int addD = addToDiag ? 1 : 0;
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiLaplKernel(n, own, ga, gaN, dc, w, magSf, ifc, diagd, addD); });
+    }
     cudaCheck(cudaGetLastError(),"amiLapl");
 }
 
@@ -296,7 +319,12 @@ void deviceAmiAssembleLaplacian(DeviceAMI& ami, const DeviceBuffer<scalar>& gamm
 void deviceAmiOffDiagSum(const DeviceAMI& ami, DeviceBuffer<scalar>& sumOff)
 {
     if (ami.n==0) return;
-    amiOffSumKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.ifCoeff.data(), ami.weightsSum.data(), sumOff.data());
+    {
+        const int n = ami.n; const label* own = ami.ownCell.data(); const scalar* ifc = ami.ifCoeff.data();
+        const scalar* wsum = ami.weightsSum.data(); scalar* sumOffd = sumOff.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiOffSumKernel(n, own, ifc, wsum, sumOffd); });
+    }
     cudaCheck(cudaGetLastError(),"amiOffSum");
 }
 
@@ -304,7 +332,12 @@ void deviceAmiOffDiagSum(const DeviceAMI& ami, DeviceBuffer<scalar>& sumOff)
 void deviceAmiAddH(const DeviceAMI& ami, const DeviceBuffer<scalar>& UkNbr, const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& H)
 {
     if (ami.n==0) return;
-    amiAddHKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.ifCoeff.data(), UkNbr.data(), V.data(), H.data());
+    {
+        const int n = ami.n; const label* own = ami.ownCell.data(); const scalar* ifc = ami.ifCoeff.data();
+        const scalar* UkNbrD = UkNbr.data(); const scalar* Vd = V.data(); scalar* Hd = H.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiAddHKernel(n, own, ifc, UkNbrD, Vd, Hd); });
+    }
     cudaCheck(cudaGetLastError(),"amiAddH");
 }
 
@@ -314,8 +347,15 @@ void deviceAmiFlux(DeviceAMI& ami, const DeviceBuffer<scalar>& Hx, const DeviceB
     if (ami.n==0) return;
     DeviceBuffer<scalar> Hnx,Hny,Hnz;
     deviceAmiInterpolateVec(ami, Hx,Hy,Hz, Hnx,Hny,Hnz);
-    amiFluxKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.weights.data(), Hx.data(),Hy.data(),Hz.data(),
-        Hnx.data(),Hny.data(),Hnz.data(), ami.Sfx.data(),ami.Sfy.data(),ami.Sfz.data(), ami.phi.data());
+    {
+        const int n = ami.n; const label* own = ami.ownCell.data(); const scalar* w = ami.weights.data();
+        const scalar* Hxd = Hx.data(); const scalar* Hyd = Hy.data(); const scalar* Hzd = Hz.data();
+        const scalar* Hnxd = Hnx.data(); const scalar* Hnyd = Hny.data(); const scalar* Hnzd = Hnz.data();
+        const scalar* sfx = ami.Sfx.data(); const scalar* sfy = ami.Sfy.data(); const scalar* sfz = ami.Sfz.data();
+        scalar* phid = ami.phi.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiFluxKernel(n, own, w, Hxd, Hyd, Hzd, Hnxd, Hnyd, Hnzd, sfx, sfy, sfz, phid); });
+    }
     cudaCheck(cudaGetLastError(),"amiFlux");
 }
 
@@ -323,13 +363,18 @@ void deviceAmiFlux(DeviceAMI& ami, const DeviceBuffer<scalar>& Hx, const DeviceB
 void deviceAmiAddDiv(const DeviceAMI& ami, const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& div)
 {
     if (ami.n==0) return;
-    amiDivAddKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.phi.data(), V.data(), div.data());
+    {
+        const int n = ami.n; const label* own = ami.ownCell.data(); const scalar* phi = ami.phi.data();
+        const scalar* Vd = V.data(); scalar* divd = div.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiDivAddKernel(n, own, phi, Vd, divd); });
+    }
     cudaCheck(cudaGetLastError(),"amiDiv");
 }
 
 
 namespace {
-__global__
+__device__
 void amiZeroWallKernel(int n, const label* __restrict__ own, const label* __restrict__ isW, scalar* __restrict__ ifc)
 {
     const int i = blockIdx.x*blockDim.x+threadIdx.x;
@@ -343,7 +388,12 @@ void amiZeroWallKernel(int n, const label* __restrict__ own, const label* __rest
 void deviceAmiZeroWallIfCoeff(DeviceAMI& ami, const DeviceBuffer<label>& isWallCell)
 {
     if (ami.n==0) return;
-    amiZeroWallKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), isWallCell.data(), ami.ifCoeff.data());
+    {
+        const int n = ami.n; const label* own = ami.ownCell.data(); const label* isW = isWallCell.data();
+        scalar* ifc = ami.ifCoeff.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiZeroWallKernel(n, own, isW, ifc); });
+    }
     cudaCheck(cudaGetLastError(),"amiZeroWall");
 }
 
@@ -351,7 +401,7 @@ void deviceAmiZeroWallIfCoeff(DeviceAMI& ami, const DeviceBuffer<label>& isWallC
 namespace {
 // face value of a CELL field on an interface face: fvc::interpolate on a coupled patch, i.e.
 //   w*patchInternalField + (1-w)*patchNeighbourField
-__global__
+__device__
 void amiFaceValueKernel(int n, const label* __restrict__ own, const scalar* __restrict__ w,
                         const scalar* __restrict__ cell, const scalar* __restrict__ nbrInterp,
                         scalar* __restrict__ out)
@@ -368,8 +418,12 @@ void deviceAmiFaceValue(const DeviceAMI& ami, const DeviceBuffer<scalar>& cell, 
     if (ami.n == 0) return;
     DeviceBuffer<scalar> nbr;
     deviceAmiInterpolate(ami, cell, nbr);
-    amiFaceValueKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.weights.data(),
-                                               cell.data(), nbr.data(), out.data());
+    {
+        const int n = ami.n; const label* own = ami.ownCell.data(); const scalar* w = ami.weights.data();
+        const scalar* celld = cell.data(); const scalar* nbrd = nbr.data(); scalar* outd = out.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiFaceValueKernel(n, own, w, celld, nbrd, outd); });
+    }
     cudaCheck(cudaGetLastError(), "amiFaceValue");
 }
 
@@ -385,14 +439,20 @@ void deviceAmiAddGrad(
     if (ami.n==0) return;
     DeviceBuffer<scalar> pN;
     deviceAmiInterpolate(ami, psi, pN);
-    amiGradAddKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.weights.data(), psi.data(), pN.data(),
-        ami.Sfx.data(),ami.Sfy.data(),ami.Sfz.data(), V.data(), gx.data(),gy.data(),gz.data());
+    {
+        const int n = ami.n; const label* own = ami.ownCell.data(); const scalar* w = ami.weights.data();
+        const scalar* psid = psi.data(); const scalar* pNd = pN.data();
+        const scalar* sfx = ami.Sfx.data(); const scalar* sfy = ami.Sfy.data(); const scalar* sfz = ami.Sfz.data();
+        const scalar* Vd = V.data(); scalar* gxd = gx.data(); scalar* gyd = gy.data(); scalar* gzd = gz.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiGradAddKernel(n, own, w, psid, pNd, sfx, sfy, sfz, Vd, gxd, gyd, gzd); });
+    }
     cudaCheck(cudaGetLastError(),"amiGrad");
 }
 
 
 namespace {
-__global__
+__device__
 void amiTensorDivKernel(
     int n,
     const label* __restrict__ own,
@@ -468,7 +528,7 @@ void amiTensorDivKernel(
 }
 } // namespace
 namespace {
-__global__
+__device__
 void amiScaleImplicitKernel(
     int n,
     const scalar* __restrict__ ifc,
@@ -486,7 +546,7 @@ void amiScaleImplicitKernel(
 }
 
 
-__global__
+__device__
 void amiDeferredRotKernel(
     int n,
     const label* __restrict__ own,
@@ -509,7 +569,7 @@ void amiDeferredRotKernel(
 }
 
 
-__global__
+__device__
 void amiGradRotKernel(
     int n,
     const label* __restrict__ own,
@@ -539,8 +599,12 @@ void amiGradRotKernel(
 void deviceAmiScaleImplicit(DeviceAMI& ami)
 {
     if (ami.n==0) return;
-    amiScaleImplicitKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ifCoeff.data(), ami.fT.data(),
-        ami.ifCoeffC[0].data(), ami.ifCoeffC[1].data(), ami.ifCoeffC[2].data());
+    {
+        const int n = ami.n; const scalar* ifc = ami.ifCoeff.data(); const scalar* fT = ami.fT.data();
+        scalar* ic0 = ami.ifCoeffC[0].data(); scalar* ic1 = ami.ifCoeffC[1].data(); scalar* ic2 = ami.ifCoeffC[2].data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiScaleImplicitKernel(n, ifc, fT, ic0, ic1, ic2); });
+    }
     cudaCheck(cudaGetLastError(),"amiScaleImplicit");
 }
 
@@ -554,8 +618,14 @@ void deviceAmiAddDeferredRot(
     DeviceBuffer<scalar>& src)
 {
     if (ami.n==0) return;
-    amiDeferredRotKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.ifCoeff.data(), ami.fT.data(), comp,
-        uiX.data(), uiY.data(), uiZ.data(), src.data());
+    {
+        const int n = ami.n; const label* own = ami.ownCell.data(); const scalar* ifc = ami.ifCoeff.data();
+        const scalar* fT = ami.fT.data(); const int compD = comp;
+        const scalar* uiXd = uiX.data(); const scalar* uiYd = uiY.data(); const scalar* uiZd = uiZ.data();
+        scalar* srcd = src.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiDeferredRotKernel(n, own, ifc, fT, compD, uiXd, uiYd, uiZd, srcd); });
+    }
     cudaCheck(cudaGetLastError(),"amiDeferredRot");
 }
 
@@ -570,8 +640,14 @@ void deviceAmiAddGradRot(
     DeviceBuffer<scalar>& gz)
 {
     if (ami.n==0) return;
-    amiGradRotKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.weights.data(), Uown.data(), UNbr.data(),
-        ami.Sfx.data(), ami.Sfy.data(), ami.Sfz.data(), V.data(), gx.data(), gy.data(), gz.data());
+    {
+        const int n = ami.n; const label* own = ami.ownCell.data(); const scalar* w = ami.weights.data();
+        const scalar* Uownd = Uown.data(); const scalar* UNbrd = UNbr.data();
+        const scalar* sfx = ami.Sfx.data(); const scalar* sfy = ami.Sfy.data(); const scalar* sfz = ami.Sfz.data();
+        const scalar* Vd = V.data(); scalar* gxd = gx.data(); scalar* gyd = gy.data(); scalar* gzd = gz.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiGradRotKernel(n, own, w, Uownd, UNbrd, sfx, sfy, sfz, Vd, gxd, gyd, gzd); });
+    }
     cudaCheck(cudaGetLastError(),"amiGradRot");
 }
 
@@ -585,9 +661,16 @@ void deviceAmiAddTensorDiv(
     DeviceBuffer<scalar>& srcZ)
 {
     if (ami.n==0) return;
-    amiTensorDivKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.off.data(), ami.nbrCell.data(),
-        ami.weight.data(), ami.weights.data(), ami.Sfx.data(), ami.Sfy.data(), ami.Sfz.data(),
-        sigmaC.data(), nC, ami.rotational?ami.fT.data():nullptr, ami.rotational?1:0, srcX.data(), srcY.data(), srcZ.data());
+    {
+        const int n = ami.n; const label* own = ami.ownCell.data(); const label* off = ami.off.data();
+        const label* nbr = ami.nbrCell.data(); const scalar* w = ami.weight.data(); const scalar* wf = ami.weights.data();
+        const scalar* sfx = ami.Sfx.data(); const scalar* sfy = ami.Sfy.data(); const scalar* sfz = ami.Sfz.data();
+        const scalar* sigmaCd = sigmaC.data(); const int nCd = nC;
+        const scalar* fT = ami.rotational ? ami.fT.data() : nullptr; const int rot = ami.rotational ? 1 : 0;
+        scalar* dXd = srcX.data(); scalar* dYd = srcY.data(); scalar* dZd = srcZ.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiTensorDivKernel(n, own, off, nbr, w, wf, sfx, sfy, sfz, sigmaCd, nCd, fT, rot, dXd, dYd, dZd); });
+    }
     cudaCheck(cudaGetLastError(),"amiTensorDiv");
 }
 
@@ -597,7 +680,12 @@ void deviceAmiCorrectFlux(DeviceAMI& ami, const DeviceBuffer<scalar>& p)
     if (ami.n==0) return;
     DeviceBuffer<scalar> pN;
     deviceAmiInterpolate(ami, p, pN);
-    amiFluxCorrKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.ifCoeff.data(), pN.data(), p.data(), ami.phi.data());
+    {
+        const int n = ami.n; const label* own = ami.ownCell.data(); const scalar* ifc = ami.ifCoeff.data();
+        const scalar* pNd = pN.data(); const scalar* pd = p.data(); scalar* phid = ami.phi.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiFluxCorrKernel(n, own, ifc, pNd, pd, phid); });
+    }
     cudaCheck(cudaGetLastError(),"amiFluxCorr");
 }
 
@@ -606,8 +694,12 @@ void deviceAmiInterpolate(const DeviceAMI& ami, const DeviceBuffer<scalar>& psi,
 {
     if (ami.n == 0) return;
     out.resize(ami.n);
-    amiInterpKernel<<<nBlocks(ami.n), TPB>>>(ami.n, ami.off.data(), ami.nbrCell.data(), ami.weight.data(),
-                                             psi.data(), out.data());
+    {
+        const int n = ami.n; const label* off = ami.off.data(); const label* nbr = ami.nbrCell.data();
+        const scalar* w = ami.weight.data(); const scalar* psid = psi.data(); scalar* outd = out.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiInterpKernel(n, off, nbr, w, psid, outd); });
+    }
     cudaCheck(cudaGetLastError(), "amiInterp");
 }
 
@@ -623,15 +715,21 @@ void deviceAmiInterpolateVec(
 {
     if (ami.n == 0) return;
     oX.resize(ami.n); oY.resize(ami.n); oZ.resize(ami.n);
-    amiInterpVecKernel<<<nBlocks(ami.n), TPB>>>(ami.n, ami.off.data(), ami.nbrCell.data(), ami.weight.data(),
-        Ux.data(), Uy.data(), Uz.data(), ami.rotational ? ami.fT.data() : nullptr, ami.rotational ? 1 : 0,
-        oX.data(), oY.data(), oZ.data());
+    {
+        const int n = ami.n; const label* off = ami.off.data(); const label* nbr = ami.nbrCell.data();
+        const scalar* w = ami.weight.data();
+        const scalar* Uxd = Ux.data(); const scalar* Uyd = Uy.data(); const scalar* Uzd = Uz.data();
+        const scalar* fT = ami.rotational ? ami.fT.data() : nullptr; const int rot = ami.rotational ? 1 : 0;
+        scalar* oXd = oX.data(); scalar* oYd = oY.data(); scalar* oZd = oZ.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiInterpVecKernel(n, off, nbr, w, Uxd, Uyd, Uzd, fT, rot, oXd, oYd, oZd); });
+    }
     cudaCheck(cudaGetLastError(), "amiInterpVec");
 }
 
 
 namespace {
-__global__
+__device__
 void amiLinUpwindKernel(
     int n,
     const label* __restrict__ own,
@@ -690,7 +788,7 @@ void amiLinUpwindKernel(
 }
 
 
-__global__
+__device__
 void amiLapCorrKernel(
     int n,
     const label* __restrict__ own,
@@ -760,7 +858,7 @@ void amiLapCorrKernel(
 }
 
 
-__global__
+__device__
 void amiLapCorrPKernel(
     int n,
     const label* __restrict__ own,
@@ -803,10 +901,20 @@ void deviceAmiAddLinUpwindCorr(
     DeviceBuffer<scalar>& corr)
 {
     if (ami.n==0) return;
-    amiLinUpwindKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.off.data(), ami.nbrCell.data(),
-        ami.weight.data(), ami.phi.data(), gUx[0].data(),gUy[0].data(),gUz[0].data(), gUx[1].data(),gUy[1].data(),gUz[1].data(),
-        gUx[2].data(),gUy[2].data(),gUz[2].data(), ami.dOwnX.data(),ami.dOwnY.data(),ami.dOwnZ.data(),
-        ami.dNbrX.data(),ami.dNbrY.data(),ami.dNbrZ.data(), ami.rotational?ami.fT.data():nullptr, ami.rotational?1:0, comp, corr.data());
+    {
+        const int n = ami.n; const label* own = ami.ownCell.data(); const label* off = ami.off.data();
+        const label* nbr = ami.nbrCell.data(); const scalar* w = ami.weight.data(); const scalar* phi = ami.phi.data();
+        const scalar* gx0 = gUx[0].data(); const scalar* gy0 = gUy[0].data(); const scalar* gz0 = gUz[0].data();
+        const scalar* gx1 = gUx[1].data(); const scalar* gy1 = gUy[1].data(); const scalar* gz1 = gUz[1].data();
+        const scalar* gx2 = gUx[2].data(); const scalar* gy2 = gUy[2].data(); const scalar* gz2 = gUz[2].data();
+        const scalar* dox = ami.dOwnX.data(); const scalar* doy = ami.dOwnY.data(); const scalar* doz = ami.dOwnZ.data();
+        const scalar* dnx = ami.dNbrX.data(); const scalar* dny = ami.dNbrY.data(); const scalar* dnz = ami.dNbrZ.data();
+        const scalar* fT = ami.rotational ? ami.fT.data() : nullptr; const int rot = ami.rotational ? 1 : 0;
+        const int compD = comp; scalar* corrd = corr.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiLinUpwindKernel(n, own, off, nbr, w, phi, gx0, gy0, gz0, gx1, gy1, gz1, gx2, gy2, gz2,
+                                dox, doy, doz, dnx, dny, dnz, fT, rot, compD, corrd); });
+    }
     cudaCheck(cudaGetLastError(),"amiLinUpwind");
 }
 
@@ -822,10 +930,17 @@ void deviceAmiAddLinUpwindCorr(
     DeviceBuffer<scalar>& corr)
 {
     if (ami.n==0) return;
-    amiLinUpwindKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.off.data(), ami.nbrCell.data(),
-        ami.weight.data(), ami.phi.data(), gx.data(),gy.data(),gz.data(), gx.data(),gy.data(),gz.data(),
-        gx.data(),gy.data(),gz.data(), ami.dOwnX.data(),ami.dOwnY.data(),ami.dOwnZ.data(),
-        ami.dNbrX.data(),ami.dNbrY.data(),ami.dNbrZ.data(), nullptr, 0, 0, corr.data());
+    {
+        const int n = ami.n; const label* own = ami.ownCell.data(); const label* off = ami.off.data();
+        const label* nbr = ami.nbrCell.data(); const scalar* w = ami.weight.data(); const scalar* phi = ami.phi.data();
+        const scalar* gxd = gx.data(); const scalar* gyd = gy.data(); const scalar* gzd = gz.data();
+        const scalar* dox = ami.dOwnX.data(); const scalar* doy = ami.dOwnY.data(); const scalar* doz = ami.dOwnZ.data();
+        const scalar* dnx = ami.dNbrX.data(); const scalar* dny = ami.dNbrY.data(); const scalar* dnz = ami.dNbrZ.data();
+        scalar* corrd = corr.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiLinUpwindKernel(n, own, off, nbr, w, phi, gxd, gyd, gzd, gxd, gyd, gzd, gxd, gyd, gzd,
+                                dox, doy, doz, dnx, dny, dnz, nullptr, 0, 0, corrd); });
+    }
     cudaCheck(cudaGetLastError(),"amiLinUpwindScalar");
 }
 
@@ -842,10 +957,20 @@ void deviceAmiAddLapCorr(
     if (ami.n==0) return;
     DeviceBuffer<scalar> nuN;
     deviceAmiInterpolate(ami, gammaCell, nuN);
-    amiLapCorrKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.off.data(), ami.nbrCell.data(), ami.weight.data(),
-        ami.weights.data(), gammaCell.data(), nuN.data(), ami.magSf.data(), ami.corrVecX.data(),ami.corrVecY.data(),ami.corrVecZ.data(),
-        gUx[0].data(),gUy[0].data(),gUz[0].data(), gUx[1].data(),gUy[1].data(),gUz[1].data(), gUx[2].data(),gUy[2].data(),gUz[2].data(),
-        ami.rotational?ami.fT.data():nullptr, ami.rotational?1:0, comp, corr.data());
+    {
+        const int n = ami.n; const label* own = ami.ownCell.data(); const label* off = ami.off.data();
+        const label* nbr = ami.nbrCell.data(); const scalar* w = ami.weight.data(); const scalar* wf = ami.weights.data();
+        const scalar* ga = gammaCell.data(); const scalar* gaN = nuN.data(); const scalar* magSf = ami.magSf.data();
+        const scalar* cvx = ami.corrVecX.data(); const scalar* cvy = ami.corrVecY.data(); const scalar* cvz = ami.corrVecZ.data();
+        const scalar* gx0 = gUx[0].data(); const scalar* gy0 = gUy[0].data(); const scalar* gz0 = gUz[0].data();
+        const scalar* gx1 = gUx[1].data(); const scalar* gy1 = gUy[1].data(); const scalar* gz1 = gUz[1].data();
+        const scalar* gx2 = gUx[2].data(); const scalar* gy2 = gUy[2].data(); const scalar* gz2 = gUz[2].data();
+        const scalar* fT = ami.rotational ? ami.fT.data() : nullptr; const int rot = ami.rotational ? 1 : 0;
+        const int compD = comp; scalar* srcd = corr.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiLapCorrKernel(n, own, off, nbr, w, wf, ga, gaN, magSf, cvx, cvy, cvz,
+                              gx0, gy0, gz0, gx1, gy1, gz1, gx2, gy2, gz2, fT, rot, compD, srcd); });
+    }
     cudaCheck(cudaGetLastError(),"amiLapCorr");
 }
 
@@ -861,10 +986,17 @@ void deviceAmiAddLapCorr(
     if (ami.n==0) return;
     DeviceBuffer<scalar> nuN;
     deviceAmiInterpolate(ami, gammaCell, nuN);
-    amiLapCorrKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.off.data(), ami.nbrCell.data(), ami.weight.data(),
-        ami.weights.data(), gammaCell.data(), nuN.data(), ami.magSf.data(), ami.corrVecX.data(),ami.corrVecY.data(),ami.corrVecZ.data(),
-        gx.data(),gy.data(),gz.data(), gx.data(),gy.data(),gz.data(), gx.data(),gy.data(),gz.data(),
-        nullptr, 0, 0, corr.data());
+    {
+        const int n = ami.n; const label* own = ami.ownCell.data(); const label* off = ami.off.data();
+        const label* nbr = ami.nbrCell.data(); const scalar* w = ami.weight.data(); const scalar* wf = ami.weights.data();
+        const scalar* ga = gammaCell.data(); const scalar* gaN = nuN.data(); const scalar* magSf = ami.magSf.data();
+        const scalar* cvx = ami.corrVecX.data(); const scalar* cvy = ami.corrVecY.data(); const scalar* cvz = ami.corrVecZ.data();
+        const scalar* gxd = gx.data(); const scalar* gyd = gy.data(); const scalar* gzd = gz.data();
+        scalar* srcd = corr.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiLapCorrKernel(n, own, off, nbr, w, wf, ga, gaN, magSf, cvx, cvy, cvz,
+                              gxd, gyd, gzd, gxd, gyd, gzd, gxd, gyd, gzd, nullptr, 0, 0, srcd); });
+    }
     cudaCheck(cudaGetLastError(),"amiLapCorrScalar");
 }
 
@@ -883,9 +1015,16 @@ void deviceAmiLapCorrP(
     DeviceBuffer<scalar> gaN, gxN, gyN, gzN;
     deviceAmiInterpolate(ami, gammaCell, gaN); deviceAmiInterpolate(ami, gx, gxN);
     deviceAmiInterpolate(ami, gy, gyN); deviceAmiInterpolate(ami, gz, gzN);
-    amiLapCorrPKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), ami.weights.data(), gammaCell.data(), gaN.data(),
-        ami.magSf.data(), ami.corrVecX.data(),ami.corrVecY.data(),ami.corrVecZ.data(), gx.data(),gy.data(),gz.data(),
-        gxN.data(),gyN.data(),gzN.data(), bp.data(), ffcOut.data());
+    {
+        const int n = ami.n; const label* own = ami.ownCell.data(); const scalar* wf = ami.weights.data();
+        const scalar* ga = gammaCell.data(); const scalar* gaNd = gaN.data(); const scalar* magSf = ami.magSf.data();
+        const scalar* cvx = ami.corrVecX.data(); const scalar* cvy = ami.corrVecY.data(); const scalar* cvz = ami.corrVecZ.data();
+        const scalar* gxd = gx.data(); const scalar* gyd = gy.data(); const scalar* gzd = gz.data();
+        const scalar* gxNd = gxN.data(); const scalar* gyNd = gyN.data(); const scalar* gzNd = gzN.data();
+        scalar* bpd = bp.data(); scalar* ffcOutd = ffcOut.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            amiLapCorrPKernel(n, own, wf, ga, gaNd, magSf, cvx, cvy, cvz, gxd, gyd, gzd, gxNd, gyNd, gzNd, bpd, ffcOutd); });
+    }
     cudaCheck(cudaGetLastError(),"amiLapCorrP");
 }
 

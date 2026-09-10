@@ -9,6 +9,7 @@
 #include "amg_kernels.cuh"         // gsColorT<> (the multicolor GS kernel)
 #include "device_ldu.cuh"          // DeviceLduView / deviceAmul
 #include "device_blas.cuh"         // deviceCopy / deviceAxpy / deviceSumMagInto
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 #include <map>
 #include <vector>
@@ -57,7 +58,7 @@ static const GridColoring& gsColoringFor(const DeviceLduView& A)
 // epsilon get independent graph instances. normFactor is a device-resident scalar; tol/relTol/maxIter are baked in at
 // capture. WHILE nodes require CUDA >= 13; on older toolkits this path compiles out and the host loop below is used.
 #if CUDART_VERSION >= 13000
-__global__
+__device__
 void gsSetCondK(
     cudaGraphConditionalHandle h,
     const scalar* res,
@@ -126,7 +127,7 @@ static scalar deviceSymGaussSeidelGraph(
     deviceCopy(c.r, c.gsB);
     deviceAxpy(-1.0, c.Ax, c.r);
     deviceSumMagInto(c.r, c.gInit.data());
-    gsScaleInvK<<<1,1,0,cudaStreamPerThread>>>(c.gInit.data(), c.gNormF.data());     // gInit = sum|r| / normFactor
+    gsScaleInvLaunch(c.gInit.data(), c.gNormF.data(), cudaStreamPerThread);     // gInit = sum|r| / normFactor
     scalar initRes;
     cudaCheck(cudaMemcpyAsync(&initRes, c.gInit.data(), sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread), "gs init D2H");
     cudaStreamSynchronize(cudaStreamPerThread);                                       // the ONE host sync / solve (OF initialResidual)
@@ -165,8 +166,14 @@ static scalar deviceSymGaussSeidelGraph(
         deviceCopy(c.r, c.gsB);
         deviceAxpy(-1.0, c.Ax, c.r);  // r = b - A*psi
         deviceSumMagInto(c.r, c.gRes.data());
-        gsScaleInvK<<<1,1,0,cudaStreamPerThread>>>(c.gRes.data(), c.gNormF.data());      // finalRes = sum|r| / normFactor
-        gsSetCondK<<<1,1,0,cudaStreamPerThread>>>(c.handle, c.gRes.data(), tol, c.gInit.data(), relTol, c.gIter.data(), maxIter);
+        gsScaleInvLaunch(c.gRes.data(), c.gNormF.data(), cudaStreamPerThread);      // finalRes = sum|r| / normFactor
+        {
+            const cudaGraphConditionalHandle h = c.handle; const scalar* res = c.gRes.data(); const scalar tolD = tol;
+            const scalar* init = c.gInit.data(); const scalar relTolD = relTol; int* iter = c.gIter.data();
+            const int maxI = maxIter;
+            pcudaParallelFor(dim3(1), dim3(1), size_t(0), cudaStreamPerThread, [=] __device__ () {
+                gsSetCondK(h, res, tolD, init, relTolD, iter, maxI); });
+        }
         cudaGraph_t tmp;
         cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &tmp), "gs capture end");
         cudaCheck(cudaGraphInstantiate(&c.exec, c.graph, 0), "gs graph instantiate");
@@ -237,7 +244,7 @@ scalar deviceSymGaussSeidel(
             for (; iter < maxIter; ++iter)
             {
                 deviceAmul(A, psi, Ax);                                                // Ax = A psi
-                smoothT<scalar><<<nBlocks(A.nCells),TPB>>>(A.nCells, b.data(), Ax.data(), A.diag, psi.data());   // psi += w*(b-Ax)/diag
+                smoothTLaunch<scalar>(A.nCells, b.data(), Ax.data(), A.diag, psi.data());   // psi += w*(b-Ax)/diag
                 deviceAmul(A, psi, Ax);
                 deviceCopy(r, b);
                 deviceAxpy(-1.0, Ax, r);
@@ -317,7 +324,7 @@ static void gsSweepF(
         const int lo = gc.startH[col], hi = gc.startH[col+1];
         const int nc = hi - lo;
         if (nc <= 0) continue;
-        gsColorT<float><<<nBlocks(nc),TPB>>>(lo, hi, gc.cells.data(), b, A.diag, A.ownerStart, A.nei, A.upper,
+        gsColorTLaunch<float>(lo, hi, gc.cells.data(), b, A.diag, A.ownerStart, A.nei, A.upper,
                                        A.losortStart, A.losort, A.owner, A.lower, x);
     }
 }
@@ -347,20 +354,20 @@ static scalar deviceSymGaussSeidelF32(
     c.AxF.resize(nC);
     c.rF.resize(nC);
     c.rD.resize(nC);
-    cast_<scalar,float><<<nBlocks(nC),TPB>>>(nC, A.diag, c.dF.data());
+    castLaunch<scalar,float>(nC, A.diag, c.dF.data());
     if (nF > 0)
     {
-        cast_<scalar,float><<<nBlocks(nF),TPB>>>(nF, A.upper, c.uF.data());
-        cast_<scalar,float><<<nBlocks(nF),TPB>>>(nF, A.lower, c.lF.data());
+        castLaunch<scalar,float>(nF, A.upper, c.uF.data());
+        castLaunch<scalar,float>(nF, A.lower, c.lF.data());
     }
-    cast_<scalar,float><<<nBlocks(nC),TPB>>>(nC, b.data(),   c.bF.data());
-    cast_<scalar,float><<<nBlocks(nC),TPB>>>(nC, psi.data(), c.xF.data());
+    castLaunch<scalar,float>(nC, b.data(),   c.bF.data());
+    castLaunch<scalar,float>(nC, psi.data(), c.xF.data());
     const LduF sA{ c.dF.data(), c.uF.data(), c.lF.data(), A.nei, A.owner, A.ownerStart, A.losort, A.losortStart, nC, nF };
     auto residNorm = [&]() -> scalar       // r = b - A x (FP32), |r|_1 in FP64
     {
         amulF(sA, c.xF.data(), c.AxF.data());
-        residualT<float><<<nBlocks(nC),TPB>>>(nC, c.bF.data(), c.AxF.data(), c.rF.data());
-        cast_<float,scalar><<<nBlocks(nC),TPB>>>(nC, c.rF.data(), c.rD.data());
+        residualTLaunch<float>(nC, c.bF.data(), c.AxF.data(), c.rF.data());
+        castLaunch<float,scalar>(nC, c.rF.data(), c.rD.data());
         return deviceSumMag(c.rD) / normFactor;
     };
     const scalar initRes = residNorm();
@@ -377,7 +384,7 @@ static scalar deviceSymGaussSeidelF32(
         }
         if (std::getenv("BRAE_GS_DEBUG")) std::printf("    GS[fp32] init=%.4e final=%.4e iters=%d\n", initRes, finalRes, iter+1);
     }
-    cast_<float,scalar><<<nBlocks(nC),TPB>>>(nC, c.xF.data(), psi.data());         // FP32 field -> FP64
+    castLaunch<float,scalar>(nC, c.xF.data(), psi.data());         // FP32 field -> FP64
     return initRes;
 }
 

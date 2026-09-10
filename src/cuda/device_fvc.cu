@@ -2,6 +2,7 @@
 // gaussGrad are per-cell gathers (internal owner/neighbour faces via ownerStart/losort, boundary faces via
 // bndCellStart), race-free, deterministic, matching the CPU fvc to machine precision.
 #include "device_mesh.cuh"
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -11,7 +12,7 @@ constexpr int TPB = 256;
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 
 
-__global__
+__device__
 void interpKernel(
     int nIf,
     const label* __restrict__ own,
@@ -25,7 +26,7 @@ void interpKernel(
 }
 
 
-__global__
+__device__
 void divKernel(
     int nC,
     const label* __restrict__ ownerStart,
@@ -52,7 +53,7 @@ void divKernel(
 }
 
 
-__global__
+__device__
 void gradKernel(
     int nC,
     const label* __restrict__ own,
@@ -112,7 +113,11 @@ void gradKernel(
 void deviceInterpolate(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol, DeviceBuffer<scalar>& sfInt)
 {
     sfInt.resize(dm.nInternalFaces);
-    interpKernel<<<nBlocks(dm.nInternalFaces), TPB>>>(dm.nInternalFaces, dm.owner.data(), dm.nei.data(), dm.w.data(), vol.data(), sfInt.data());
+    const int nIf = dm.nInternalFaces;
+    const label* own = dm.owner.data(); const label* nei = dm.nei.data(); const scalar* w = dm.w.data();
+    const scalar* vold = vol.data(); scalar* sfd = sfInt.data();
+    pcudaParallelFor(nBlocks(nIf), TPB, [=] __device__ () {
+        interpKernel(nIf, own, nei, w, vold, sfd); });
     cudaCheck(cudaGetLastError(), "interp");
 }
 
@@ -120,8 +125,13 @@ void deviceInterpolate(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol, De
 void deviceDiv(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& bval, DeviceBuffer<scalar>& d)
 {
     d.resize(dm.nCells);
-    divKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
-                                           phiInt.data(), dm.bndCellStart.data(), dm.bndPerm.data(), bval.data(), dm.V.data(), d.data());
+    const int nC = dm.nCells;
+    const label* ownerStart = dm.ownerStart.data(); const label* losort = dm.losort.data();
+    const label* losortStart = dm.losortStart.data(); const scalar* phiIntD = phiInt.data();
+    const label* bndCellStart = dm.bndCellStart.data(); const label* bndPerm = dm.bndPerm.data();
+    const scalar* bvalD = bval.data(); const scalar* Vd = dm.V.data(); scalar* dd = d.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+        divKernel(nC, ownerStart, losort, losortStart, phiIntD, bndCellStart, bndPerm, bvalD, Vd, dd); });
     cudaCheck(cudaGetLastError(), "div");
 }
 
@@ -137,11 +147,20 @@ void deviceGaussGrad(
     gx.resize(dm.nCells);
     gy.resize(dm.nCells);
     gz.resize(dm.nCells);
-    gradKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.owner.data(), dm.nei.data(), dm.w.data(),
-                                            dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(), vol.data(),
-                                            dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
-                                            dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndGFace.data(), bval.data(),
-                                            dm.V.data(), gx.data(), gy.data(), gz.data());
+    {
+        const int nC = dm.nCells;
+        const label* own = dm.owner.data(); const label* nei = dm.nei.data(); const scalar* w = dm.w.data();
+        const scalar* Sfx = dm.Sfx.data(); const scalar* Sfy = dm.Sfy.data(); const scalar* Sfz = dm.Sfz.data();
+        const scalar* vold = vol.data();
+        const label* ownerStart = dm.ownerStart.data(); const label* losort = dm.losort.data();
+        const label* losortStart = dm.losortStart.data();
+        const label* bndCellStart = dm.bndCellStart.data(); const label* bndPerm = dm.bndPerm.data();
+        const label* bndGFace = dm.bndGFace.data(); const scalar* bvalD = bval.data();
+        const scalar* Vd = dm.V.data(); scalar* gxd = gx.data(); scalar* gyd = gy.data(); scalar* gzd = gz.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            gradKernel(nC, own, nei, w, Sfx, Sfy, Sfz, vold, ownerStart, losort, losortStart,
+                       bndCellStart, bndPerm, bndGFace, bvalD, Vd, gxd, gyd, gzd); });
+    }
     cudaCheck(cudaGetLastError(), "gaussGrad");
 }
 
@@ -158,7 +177,7 @@ scalar limFace(scalar maxD, scalar minD, scalar ex)
 }
 
 
-__global__
+__device__
 void cellLimitGradKernel(
     int nC,
     scalar k,
@@ -260,7 +279,7 @@ __device__ __forceinline__ void atomicFmin(scalar* a, scalar v)
 
 // Phase 1 on cells: maxD/minD from the internal + non-coupled boundary faces only. Split out of
 // cellLimitGradKernel so the interface faces can be folded in between the two halves.
-__global__
+__device__
 void cellLimitMinMaxKernel(
     int nC,
     const scalar* __restrict__ U,
@@ -290,7 +309,7 @@ void cellLimitMinMaxKernel(
 }
 
 // Phase 2 on interface faces: the coupled neighbour joins the cell's range.
-__global__
+__device__
 void ifMinMaxKernel(int n, const label* __restrict__ own, const scalar* __restrict__ nbrVal,
                     const scalar* __restrict__ U, scalar* __restrict__ maxD, scalar* __restrict__ minD)
 {
@@ -303,7 +322,7 @@ void ifMinMaxKernel(int n, const label* __restrict__ own, const scalar* __restri
 }
 
 // Phase 3: OF's k<1 widening, applied once the range is complete (interfaces included).
-__global__
+__device__
 void widenKernel(int nC, scalar k, scalar* __restrict__ maxD, scalar* __restrict__ minD)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -314,7 +333,7 @@ void widenKernel(int nC, scalar k, scalar* __restrict__ maxD, scalar* __restrict
 }
 
 // Phase 4 on cells: the limiter from the internal + non-coupled boundary face extrapolations.
-__global__
+__device__
 void cellLimitFactorKernel(
     int nC,
     const label* __restrict__ ownerStart,
@@ -343,7 +362,7 @@ void cellLimitFactorKernel(
 }
 
 // Phase 5 on interface faces: OF's second loop is over EVERY boundary face, not just the uncoupled ones.
-__global__
+__device__
 void ifLimitKernel(int n, const label* __restrict__ own,
                    const scalar* __restrict__ dx, const scalar* __restrict__ dy, const scalar* __restrict__ dz,
                    const scalar* __restrict__ maxD, const scalar* __restrict__ minD,
@@ -356,7 +375,7 @@ void ifLimitKernel(int n, const label* __restrict__ own,
     atomicFmin(&lim[c], limFace(maxD[c], minD[c], dx[i]*gx[c] + dy[i]*gy[c] + dz[i]*gz[c]));
 }
 
-__global__
+__device__
 void applyLimitKernel(int nC, const scalar* __restrict__ lim,
                       scalar* __restrict__ gx, scalar* __restrict__ gy, scalar* __restrict__ gz)
 {
@@ -391,34 +410,79 @@ void deviceCellLimitGrad(
         // single-kernel path below, just split where a scatter can be inserted.
         const int nC = dm.nCells;
         DeviceBuffer<scalar> maxD(nC), minD(nC), lim(nC);
-        cellLimitMinMaxKernel<<<nBlocks(nC), TPB>>>(nC, U.data(), Ubnd.data(),
-            dm.ownerStart.data(), dm.nei.data(), dm.losort.data(), dm.losortStart.data(), dm.owner.data(),
-            dm.bndCellStart.data(), dm.bndPerm.data(), maxD.data(), minD.data());
+        {
+            const scalar* Ud = U.data(); const scalar* Ubndd = Ubnd.data();
+            const label* ownerStart = dm.ownerStart.data(); const label* nei = dm.nei.data();
+            const label* losort = dm.losort.data(); const label* losortStart = dm.losortStart.data();
+            const label* owner = dm.owner.data();
+            const label* bndCellStart = dm.bndCellStart.data(); const label* bndPerm = dm.bndPerm.data();
+            scalar* maxDd = maxD.data(); scalar* minDd = minD.data();
+            pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+                cellLimitMinMaxKernel(nC, Ud, Ubndd, ownerStart, nei, losort, losortStart, owner,
+                                       bndCellStart, bndPerm, maxDd, minDd); });
+        }
         for (int i = 0; i < nIfs; ++i)
             if (ifs[i].n > 0 && ifs[i].nbrVal)
-                ifMinMaxKernel<<<nBlocks(ifs[i].n), TPB>>>(ifs[i].n, ifs[i].ownCell, ifs[i].nbrVal,
-                                                           U.data(), maxD.data(), minD.data());
-        if (k < 1.0) widenKernel<<<nBlocks(nC), TPB>>>(nC, k, maxD.data(), minD.data());
-        cellLimitFactorKernel<<<nBlocks(nC), TPB>>>(nC,
-            dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
-            dm.bndCellStart.data(), dm.bndPerm.data(),
-            dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(), dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
-            dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), maxD.data(), minD.data(),
-            gx.data(), gy.data(), gz.data(), lim.data());
+            {
+                const int n = ifs[i].n; const label* ownCell = ifs[i].ownCell; const scalar* nbrVal = ifs[i].nbrVal;
+                const scalar* Ud = U.data(); scalar* maxDd = maxD.data(); scalar* minDd = minD.data();
+                pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+                    ifMinMaxKernel(n, ownCell, nbrVal, Ud, maxDd, minDd); });
+            }
+        if (k < 1.0)
+        {
+            scalar* maxDd = maxD.data(); scalar* minDd = minD.data();
+            pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { widenKernel(nC, k, maxDd, minDd); });
+        }
+        {
+            const label* ownerStart = dm.ownerStart.data(); const label* losort = dm.losort.data();
+            const label* losortStart = dm.losortStart.data();
+            const label* bndCellStart = dm.bndCellStart.data(); const label* bndPerm = dm.bndPerm.data();
+            const scalar* dOwnX = dm.dOwnX.data(); const scalar* dOwnY = dm.dOwnY.data(); const scalar* dOwnZ = dm.dOwnZ.data();
+            const scalar* dNeiX = dm.dNeiX.data(); const scalar* dNeiY = dm.dNeiY.data(); const scalar* dNeiZ = dm.dNeiZ.data();
+            const scalar* dBndX = dm.dBndX.data(); const scalar* dBndY = dm.dBndY.data(); const scalar* dBndZ = dm.dBndZ.data();
+            const scalar* maxDd = maxD.data(); const scalar* minDd = minD.data();
+            const scalar* gxd = gx.data(); const scalar* gyd = gy.data(); const scalar* gzd = gz.data();
+            scalar* limd = lim.data();
+            pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+                cellLimitFactorKernel(nC, ownerStart, losort, losortStart, bndCellStart, bndPerm,
+                                       dOwnX, dOwnY, dOwnZ, dNeiX, dNeiY, dNeiZ, dBndX, dBndY, dBndZ,
+                                       maxDd, minDd, gxd, gyd, gzd, limd); });
+        }
         for (int i = 0; i < nIfs; ++i)
             if (ifs[i].n > 0 && ifs[i].nbrVal)
-                ifLimitKernel<<<nBlocks(ifs[i].n), TPB>>>(ifs[i].n, ifs[i].ownCell,
-                    ifs[i].dOwnX, ifs[i].dOwnY, ifs[i].dOwnZ, maxD.data(), minD.data(),
-                    gx.data(), gy.data(), gz.data(), lim.data());
-        applyLimitKernel<<<nBlocks(nC), TPB>>>(nC, lim.data(), gx.data(), gy.data(), gz.data());
+            {
+                const int n = ifs[i].n; const label* ownCell = ifs[i].ownCell;
+                const scalar* dOwnX = ifs[i].dOwnX; const scalar* dOwnY = ifs[i].dOwnY; const scalar* dOwnZ = ifs[i].dOwnZ;
+                const scalar* maxDd = maxD.data(); const scalar* minDd = minD.data();
+                const scalar* gxd = gx.data(); const scalar* gyd = gy.data(); const scalar* gzd = gz.data();
+                scalar* limd = lim.data();
+                pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+                    ifLimitKernel(n, ownCell, dOwnX, dOwnY, dOwnZ, maxDd, minDd, gxd, gyd, gzd, limd); });
+            }
+        {
+            const scalar* limd = lim.data(); scalar* gxd = gx.data(); scalar* gyd = gy.data(); scalar* gzd = gz.data();
+            pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { applyLimitKernel(nC, limd, gxd, gyd, gzd); });
+        }
         cudaCheck(cudaGetLastError(), "cellLimitGradInterface");
         return;
     }
-    cellLimitGradKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, k, U.data(), Ubnd.data(),
-        dm.ownerStart.data(), dm.nei.data(), dm.losort.data(), dm.losortStart.data(), dm.owner.data(),
-        dm.bndCellStart.data(), dm.bndPerm.data(),
-        dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(), dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
-        dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), gx.data(), gy.data(), gz.data());
+    {
+        const int nC = dm.nCells;
+        const scalar* Ud = U.data(); const scalar* Ubndd = Ubnd.data();
+        const label* ownerStart = dm.ownerStart.data(); const label* nei = dm.nei.data();
+        const label* losort = dm.losort.data(); const label* losortStart = dm.losortStart.data();
+        const label* owner = dm.owner.data();
+        const label* bndCellStart = dm.bndCellStart.data(); const label* bndPerm = dm.bndPerm.data();
+        const scalar* dOwnX = dm.dOwnX.data(); const scalar* dOwnY = dm.dOwnY.data(); const scalar* dOwnZ = dm.dOwnZ.data();
+        const scalar* dNeiX = dm.dNeiX.data(); const scalar* dNeiY = dm.dNeiY.data(); const scalar* dNeiZ = dm.dNeiZ.data();
+        const scalar* dBndX = dm.dBndX.data(); const scalar* dBndY = dm.dBndY.data(); const scalar* dBndZ = dm.dBndZ.data();
+        scalar* gxd = gx.data(); scalar* gyd = gy.data(); scalar* gzd = gz.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            cellLimitGradKernel(nC, k, Ud, Ubndd, ownerStart, nei, losort, losortStart, owner,
+                                 bndCellStart, bndPerm, dOwnX, dOwnY, dOwnZ, dNeiX, dNeiY, dNeiZ,
+                                 dBndX, dBndY, dBndZ, gxd, gyd, gzd); });
+    }
     cudaCheck(cudaGetLastError(), "cellLimitGrad");
 }
 
