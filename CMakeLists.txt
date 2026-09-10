@@ -2079,6 +2079,16 @@ set_tests_properties(flowrate_device_solver_vs_openfoam PROPERTIES
 # the control that the two schemes genuinely differ on this mesh, and whose fixture is 2-D so that
 # SymmTensor::safeInv (the singular empty direction) is exercised --
 # tests/leastsquares_grad_vs_openfoam.sh.
+# A nut wall function must be resolved through OpenFOAM's patch/group/regex rule, not by exact name --
+# a case keying its walls `"wall.*"` silently kept the permissive nutk default, which is nutk running
+# under another name. The load-bearing arm is the CONTROL that nutU and nutk differ on the fixture --
+# tests/nut_wallfn_patchkey_vs_openfoam.sh.
+add_test(NAME nut_wallfn_patchkey_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/nut_wallfn_patchkey_vs_openfoam.sh)
+set_tests_properties(nut_wallfn_patchkey_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
 add_test(NAME leastsquares_grad_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/leastsquares_grad_vs_openfoam.sh)
 set_tests_properties(leastsquares_grad_vs_openfoam PROPERTIES
