@@ -1,6 +1,7 @@
 // _cpp REFERENCE implementation -- see rhoSimpleFoam_cpp.cuh for the OpenFOAM provenance and the order.
 #include "limit_temperature_report.cuh"   // OF prints LimitedCells on every limitTemperature call
 #include "rhoSimpleFoam_cpp.cuh"
+#include "liquid_thermo.cuh"   // thermo*Of: ONE branch point between the gas and liquid properties
 #include "kOmegaSST_cpp.cuh"
 #include "cell_wall_dist.cuh"
 #include "fv_matrix_ops.cuh"
@@ -32,11 +33,11 @@ void thermoCorrect(
     for (std::size_t c = 0; c < nC; ++c)
     {
         f.T.internal[c]   = hConstHeToT(f.he.internal[c], f.thermo);
-        f.psi[c]          = perfectGasPsi(f.T.internal[c], f.thermo);
+        f.psi[c]          = thermoPsiOf(f.p.internal[c], f.T.internal[c], f.thermo);
         // heRhoThermo::calculate() fills rho_ HERE, from the p and T it sees at correct() time
         // (heRhoThermo.C:88). It is not the same number as p*psi later in the iteration, because the
         // pressure equation has not run yet.
-        f.rhoThermo[c]    = perfectGasRho(f.p.internal[c], f.T.internal[c], f.thermo);
+        f.rhoThermo[c]    = thermoRhoOf(f.p.internal[c], f.T.internal[c], f.thermo);
     }
     // The boundary half is heRhoThermo::calculate()'s patch loop (heRhoThermo.C:102-142; hePsiThermo.C
     // :106-132 has the same shape), NOT an evaluate of T's own boundary conditions. A patch whose T
@@ -57,7 +58,7 @@ void thermoCorrect(
         if (f.T.boundary[pi]->fixesValue())
         {
             std::vector<scalar> hb(patches[pi].size);
-            for (label i = 0; i < patches[pi].size; ++i) hb[i] = hConstTToHe(tb[i], f.thermo);
+            for (label i = 0; i < patches[pi].size; ++i) hb[i] = thermoHeOf(pb[i], tb[i], f.thermo);
             f.he.boundary[pi]->assignValue(std::move(hb));
         }
         else
@@ -68,8 +69,8 @@ void thermoCorrect(
         }
         for (label i = 0; i < patches[pi].size; ++i)
         {
-            f.psiBnd[pi][i]        = perfectGasPsi(tb[i], f.thermo);
-            f.rhoThermoBnd[pi][i]  = perfectGasRho(pb[i], tb[i], f.thermo);
+            f.psiBnd[pi][i]        = thermoPsiOf(pb[i], tb[i], f.thermo);
+            f.rhoThermoBnd[pi][i]  = thermoRhoOf(pb[i], tb[i], f.thermo);
         }
     }
 }
@@ -105,15 +106,17 @@ void effectiveTransport(
         // because an over-diffusive energy equation still returns a nearly uniform T, which on a
         // low-speed fixture is the right answer. Both gates INJECT OpenFOAM's alphaEff, so neither could
         // see it; the comparison of brae's own against OpenFOAM's is what found it.
-        const scalar muLam = transportMu(T, f.thermo);
+        const scalar pc    = f.p.internal[c];
+        const scalar muLam = thermoMuOf(pc, T, f.thermo);
         muEff[c]    = muLam + mut;
-        alphaEff[c] = cpByCpv * (transportAlpha(muLam, f.thermo) + alphat);
+        alphaEff[c] = cpByCpv * (thermoAlphaOf(pc, T, f.thermo) + alphat);
     }
     muEffBnd.assign(patches.size(), {});
     alphaEffBnd.assign(patches.size(), {});
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const std::vector<scalar>& tb = f.T.boundary[pi]->value();
+        const std::vector<scalar>& pbv = f.p.boundary[pi]->value();
         muEffBnd[pi].resize(patches[pi].size);
         alphaEffBnd[pi].resize(patches[pi].size);
         for (label i = 0; i < patches[pi].size; ++i)
@@ -123,9 +126,9 @@ void effectiveTransport(
             const scalar mutB = turb ? f.rho.boundary[pi]->value()[i] * f.nut.boundary[pi]->value()[i] : 0.0;
             const scalar alphatB = (turb && !f.alphat.internal.empty())
                                  ? f.alphat.boundary[pi]->value()[i] : 0.0;
-            muEffBnd[pi][i]    = transportMu(tb[i], f.thermo) + mutB;
+            muEffBnd[pi][i]    = thermoMuOf(pbv[i], tb[i], f.thermo) + mutB;
             alphaEffBnd[pi][i] =
-                cpByCpv * (transportAlpha(transportMu(tb[i], f.thermo), f.thermo) + alphatB);
+                cpByCpv * (thermoAlphaOf(pbv[i], tb[i], f.thermo) + alphatB);
         }
     }
 }
@@ -165,14 +168,14 @@ void updateRho(
         return;
     }
     for (std::size_t c = 0; c < nC; ++c)
-        f.rho.internal[c] = perfectGasRho(f.p.internal[c], f.T.internal[c], f.thermo);
+        f.rho.internal[c] = thermoRhoOf(f.p.internal[c], f.T.internal[c], f.thermo);
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const std::vector<scalar>& pb = f.p.boundary[pi]->value();
         const std::vector<scalar>& tb = f.T.boundary[pi]->value();
         std::vector<scalar> rb(patches[pi].size);
         for (label i = 0; i < patches[pi].size; ++i)
-            rb[i] = perfectGasRho(pb[i], tb[i], f.thermo);
+            rb[i] = thermoRhoOf(pb[i], tb[i], f.thermo);
         f.rho.boundary[pi]->setStoredValues(std::move(rb));
     }
 }
@@ -521,7 +524,7 @@ Residuals rhoSimpleStep(
     {
         muLam.resize(f.T.internal.size());
         for (std::size_t c = 0; c < muLam.size(); ++c)
-            muLam[c] = transportMu(f.T.internal[c], f.thermo);
+            muLam[c] = thermoMuOf(f.p.internal[c], f.T.internal[c], f.thermo);
         uin.muLaminar = &muLam;
     }
     const FvVectorMatrix UEqn = assembleUEqn(f.U, uin, m, g, patches);
@@ -633,6 +636,12 @@ Residuals rhoSimpleStep(
     // boundary it does the same for any patch that does not fix a value, then corrects the boundary.
     if (in.limitT)
     {
+        // NOT routed through thermoHeOf yet, and deliberately: OpenFOAM's limitTemperature builds
+        // he(p,Tmin) and he(p,Tmax) as FIELDS over the cell pressure (limitTemperature.C), which is the
+        // same number everywhere only while he is pressure-independent -- true of hConst, false of a
+        // liquid, whose Es is h(T) - p/rho(T). Making these per-cell is part of stage H3.4, where the
+        // liquid path is lifted; doing it here would be a change with nothing to gate it against, since
+        // the liquid case still refuses. The gas path is exact either way.
         const scalar heMin = hConstTToHe(in.limitTmin, f.thermo);
         const scalar heMax = hConstTToHe(in.limitTmax, f.thermo);
         // The two numbers OpenFOAM reports, taken BEFORE the clamp: min(T) and max(T) of the CURRENT
@@ -987,15 +996,16 @@ Residuals rhoSimpleStep(
         // varies cell by cell here where the incompressible lineage has one number for the case.
         std::vector<scalar> nuLam(nC);
         for (label c = 0; c < nC; ++c)
-            nuLam[c] = transportMu(f.T.internal[c], f.thermo) / f.rho.internal[c];
+            nuLam[c] = thermoMuOf(f.p.internal[c], f.T.internal[c], f.thermo) / f.rho.internal[c];
         std::vector<std::vector<scalar>> nuLamBnd(patches.size());
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
             const std::vector<scalar>& tb = f.T.boundary[pi]->value();
             const std::vector<scalar>& rb = f.rho.boundary[pi]->value();
+            const std::vector<scalar>& pb2 = f.p.boundary[pi]->value();
             nuLamBnd[pi].resize(patches[pi].size);
             for (label i = 0; i < patches[pi].size; ++i)
-                nuLamBnd[pi][i] = transportMu(tb[i], f.thermo) / rb[i];
+                nuLamBnd[pi][i] = thermoMuOf(pb2[i], tb[i], f.thermo) / rb[i];
         }
 
         // compressibleTurbulenceModel::phi() -- the VOLUMETRIC flux, phi/fvc::interpolate(rho). divU is a
