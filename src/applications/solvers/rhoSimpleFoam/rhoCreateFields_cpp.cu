@@ -1,6 +1,7 @@
 // _cpp REFERENCE implementation -- see createFields_cpp.cuh for the OpenFOAM provenance.
 #include "rhoCreateFields_cpp.cuh"
 #include "turbulence_setup.cuh"   // readTurbulenceMinima: the ONE reader of kMin/epsilonMin/omegaMin
+#include "liquid_thermo.cuh"   // thermo*Of: ONE branch point between the gas and liquid properties
 #include "scheme_parse.cuh"   // parseFvSchemesControls: grad(U)'s cellLimited coefficient for validate()
 #include "cellLimitedGrad_cpp.cuh"
 #include "frozen_bc_guard.cuh"
@@ -401,7 +402,7 @@ RhoSimpleFields createFields(
         fd.internalUniform = false;   // defaults TRUE; a hand-built field must say so
         fd.internalField.resize(nC);
         for (label c = 0; c < nC; ++c)
-            fd.internalField[c] = perfectGasRho(f.p.internal[c], f.T.internal[c], f.thermo);
+            fd.internalField[c] = thermoRhoOf(f.p.internal[c], f.T.internal[c], f.thermo);
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
             PatchFieldData<scalar> b;
@@ -412,7 +413,7 @@ RhoSimpleFields createFields(
             const std::vector<scalar>& tb = f.T.boundary[pi]->value();
             b.values.resize(patches[pi].size);
             for (label i = 0; i < patches[pi].size; ++i)
-                b.values[i] = perfectGasRho(pb[i], tb[i], f.thermo);
+                b.values[i] = thermoRhoOf(pb[i], tb[i], f.thermo);
             fd.boundary.push_back(std::move(b));
         }
         f.rho = buildField<scalar>(fd, patches, nC);
@@ -475,14 +476,15 @@ RhoSimpleFields createFields(
 
     // createFieldRefs.H: psi is thermo.psi(). Derived from the same T that rho came from.
     f.psi.resize(nC);
-    for (label c = 0; c < nC; ++c) f.psi[c] = perfectGasPsi(f.T.internal[c], f.thermo);
+    for (label c = 0; c < nC; ++c) f.psi[c] = thermoPsiOf(f.p.internal[c], f.T.internal[c], f.thermo);
     f.psiBnd.resize(patches.size());
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const std::vector<scalar>& tb = f.T.boundary[pi]->value();
+        const std::vector<scalar>& pb = f.p.boundary[pi]->value();
         f.psiBnd[pi].resize(patches[pi].size);
         for (label i = 0; i < patches[pi].size; ++i)
-            f.psiBnd[pi][i] = perfectGasPsi(tb[i], f.thermo);
+            f.psiBnd[pi][i] = thermoPsiOf(pb[i], tb[i], f.thermo);
     }
 
     // thermo.he() -- the variable EEqn transports, WITH ITS BOUNDARY CONDITIONS.
@@ -727,8 +729,21 @@ RhoSimpleFields createFields(
                             // evaluation at createFields, so the wall would keep the file value.
                             if (!f.turbulenceFrozen)
                             {
-                                for (std::size_t pi = 0; pi < patches.size(); ++pi)
-                                    if (patches[pi].name == b.name) f.nutWallKind[pi] = kind;
+                                // Through the SHARED resolution, not `entry.name == patch.name`. A case
+                                // may key its wall entry by regex or by group -- gasMixing uses
+                                // `"wall.*"` for walls_pipe_{air,fuel,main} -- and an exact match then
+                                // assigns NOTHING, leaving every one of those patches on the permissive
+                                // Nutk default seeded above. That is this block's own stated failure
+                                // mode ("a permissive default here is how nutk gets run under another
+                                // name"), and the type check cannot catch it because the type IS
+                                // recognised; only the name match fails. Measured on gasMixing:
+                                // OpenFOAM's wall nut is exactly 0 at iteration 1 (magUp = 0 from a
+                                // still start puts nutU in its viscous branch) where brae wrote nutk's
+                                // 1.4e-04 from k = 6, worth U 1.7e-03 at iteration 1 and 1.2e-01 by
+                                // iteration 5. patch_entry_lookup.cuh's header lists the two earlier
+                                // instances of exactly this.
+                                for (const FvPatch* pp : patchesResolvingTo(nutRaw.boundary, b, patches))
+                                    f.nutWallKind[static_cast<std::size_t>(pp - patches.data())] = kind;
                                 continue;
                             }
                             throw std::runtime_error(
@@ -892,16 +907,17 @@ RhoSimpleFields createFields(
         // mu(T)/rho, per cell and per boundary face.
         std::vector<scalar> nuLam(nC);
         for (label c = 0; c < nC; ++c)
-            nuLam[c] = transportMu(f.T.internal[c], f.thermo) / f.rho.internal[c];
+            nuLam[c] = thermoMuOf(f.p.internal[c], f.T.internal[c], f.thermo) / f.rho.internal[c];
         std::vector<std::vector<scalar>> nuLamBnd(patches.size()), rhoBnd(patches.size());
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
             const std::vector<scalar>& tb = f.T.boundary[pi]->value();
+            const std::vector<scalar>& pb = f.p.boundary[pi]->value();
             const std::vector<scalar>& rb = f.rho.boundary[pi]->value();
             rhoBnd[pi] = rb;
             nuLamBnd[pi].resize(patches[pi].size);
             for (label i = 0; i < patches[pi].size; ++i)
-                nuLamBnd[pi][i] = transportMu(tb[i], f.thermo) / rb[i];
+                nuLamBnd[pi][i] = thermoMuOf(pb[i], tb[i], f.thermo) / rb[i];
         }
         const std::vector<std::vector<scalar>> yWall = nearWallDist(m, g, patches);
         const bool haveAlphat = static_cast<label>(f.alphat.internal.size()) == nC;
