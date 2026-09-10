@@ -245,6 +245,39 @@ bool PressureControl::limit(std::vector<scalar>& p) const
 }
 
 
+void correctGeneralizedNewtonian(
+    RhoSimpleFields&            f,
+    const PrimitiveMesh&        m,
+    const FvGeometry&           g,
+    const std::vector<FvPatch>& patches)
+{
+    // thermo.mu() is the thermo's STORED mu_, last filled by thermo.correct() -- from the p before the
+    // pressure equation. Every transport brae runs (const, sutherland, the NSRDS liquid) is a function of
+    // T alone, so evaluating it at the current p is the same number; the accessor takes p only because
+    // the liquid's signature does.
+    const std::size_t nC = f.U.internal.size();
+    std::vector<scalar> nu0(nC);
+    for (std::size_t c = 0; c < nC; ++c)
+    {
+        nu0[c] = thermoMuOf(f.p.internal[c], f.T.internal[c], f.thermo) / f.rho.internal[c];
+    }
+    std::vector<std::vector<scalar>> nu0Bnd(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const std::vector<scalar>& pb = f.p.boundary[pi]->value();
+        const std::vector<scalar>& tb = f.T.boundary[pi]->value();
+        const std::vector<scalar>& rb = f.rho.boundary[pi]->value();
+        nu0Bnd[pi].resize(patches[pi].size);
+        for (label i = 0; i < patches[pi].size; ++i)
+        {
+            nu0Bnd[pi][i] = thermoMuOf(pb[i], tb[i], f.thermo) / rb[i];
+        }
+    }
+    generalizedNewtonian::correctNu(f.U, nu0, nu0Bnd, f.gnCoeffs, f.gnGradULimitK, m, g, patches,
+                                    f.gnNu, f.gnNuBnd);
+}
+
+
 std::string turbulenceDictPath(const std::string& caseDir)
 {
     const std::string mtPath = caseDir + "/constant/momentumTransport";
@@ -914,13 +947,34 @@ RhoSimpleFields createFields(
             // model; it was solving a different momentum equation. Measured on validation/rhoBox with
             // squareBendLiqNoNewtonian's own laminar block: 5.74e-01 relative on U against OpenFOAM.
             //
-            // The mirror applies NEITHER model, so its envelope is {false, false} and the shared reader
-            // refuses both by name. This has to land BEFORE the liquid-thermo blocker is cleared: today
-            // squareBendLiqNoNewtonian is stopped by the thermo, and lifting that without this would
-            // turn a correct refusal into a confident 1101x-to-2532x-wrong answer.
+            // generalizedNewtonian with the powerLaw viscosity is APPLIED (stage S1 Half B); every other
+            // viscosity model and Maxwell are still refused by name inside the shared reader.
             DeviceSimpleControls lctl;
             lctl.turbulent = false;
-            readLaminarModel(mt2, lctl, {"rhoSimpleFoam (OF-mirror)", false, false});
+            readLaminarModel(mt2, lctl, {"rhoSimpleFoam (OF-mirror)", true, false});
+            if (lctl.gnPowerLaw)
+            {
+                f.generalizedNewtonian = true;
+                f.gnCoeffs.n     = lctl.gnN;
+                f.gnCoeffs.nuMin = lctl.gnNuMin;
+                f.gnCoeffs.nuMax = lctl.gnNuMax;
+                // strainRate() is fvc::grad(this->U()) -> mesh.gradScheme("grad(U)"), named-then-default.
+                // Resolved strictly: the gradient is Gauss linear with an optional cellLimited limiter,
+                // and anything else is refused rather than approximated by the nearest one brae has.
+                const FieldGradScheme gs = parseNamedGradScheme(caseDir, "grad(U)");
+                if (!gs.gaussLinear || gs.leastSquares || !gs.unsupportedLimiter.empty())
+                    throw std::runtime_error(
+                        "brae: rhoSimpleFoam (OF-mirror) -- generalizedNewtonian's strainRate() takes "
+                        "fvc::grad(U) (generalizedNewtonian.C:98), and gradSchemes resolves grad(U) to `" +
+                        gs.raw + "`. The mirror computes Gauss linear, optionally cellLimited; refusing "
+                        "rather than building the viscosity from another gradient.");
+                f.gnGradULimitK = gs.cellLimitK;
+                // The model's CONSTRUCTOR (generalizedNewtonian.C:87): nu_ from the initial U, rho and T,
+                // with U's patches as construction left them -- the same boundary values phi was built
+                // from above. On a case starting from rest this is nuMax in every cell grad(U) cannot
+                // reach yet, and iteration 1's momentum equation runs on it.
+                correctGeneralizedNewtonian(f, m, g, patches);
+            }
         }
         else
         {

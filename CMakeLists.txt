@@ -85,6 +85,8 @@ add_library(brae_core STATIC
     src/matrices/lduMatrix/lduMatrix/device_spmv.cu
     src/matrices/lduMatrix/preconditioners/DILUPreconditioner/device_dilu.cu
     src/TurbulenceModels/turbulenceModels/linearViscousStress/linearViscousStress_cpp.cu
+    src/TurbulenceModels/turbulenceModels/laminar/generalizedNewtonian/generalizedNewtonian_cpp.cu
+    src/TurbulenceModels/turbulenceModels/laminar/generalizedNewtonian/generalizedNewtonian.cu
     src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/kOmegaSST_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/kOmegaSSTLM/kOmegaSSTLM_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/realizableKE/realizableKE_cpp.cu
@@ -2410,6 +2412,14 @@ set_tests_properties(liquid_turbulence_vs_openfoam PROPERTIES SKIP_RETURN_CODE 7
 add_test(NAME rho_squarebendliq_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_squarebendliq_vs_openfoam.sh)
 set_tests_properties(rho_squarebendliq_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# generalizedNewtonian (powerLaw) on both mirror arms, stage S1 Half B: OpenFOAM's own
+# squareBendLiqNoNewtonian from rest (iteration 1) and restarted from OpenFOAM's iteration 5 with the
+# tutorial's coefficients and with the unclamped branch live, against OpenFOAM's written
+# generalizedNewtonian:nu as well as U, p, T and rho.
+add_test(NAME rho_generalized_newtonian_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_generalized_newtonian_vs_openfoam.sh)
+set_tests_properties(rho_generalized_newtonian_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
 # rhoSimpleFoam's UEqn.H against OpenFOAM's own assembled momentum matrix (tools/dumpPEqn stage harness:
 # rAU, internalCoeffs, boundaryCoeffs). OpenFOAM's muEff is injected so this measures the ASSEMBLY and not

@@ -5,6 +5,7 @@
 #include "device_blas.cuh"        // deviceDivide, deviceCopy -- already gated, not re-written here
 #include "device_kepsilon.cuh"    // deviceGatherWallNu: boundary-face -> wall-face ordering
 #include "liquid_thermo.cuh"     // thermoMuOf -- the SAME accessor the host reference calls
+#include "generalizedNewtonian.cuh"   // gpu::generalizedNewtonian::correctNu
 #include <stdexcept>
 #include <vector>
 
@@ -221,6 +222,34 @@ void correctTurbulence(
                          const_cast<DeviceBoundary&>(dev.dbEps),
                          const_cast<DeviceWallData&>(dev.wall), kin);
 }
+
+void correctGeneralizedNewtonian(
+    RhoSolverFields&                                 f,
+    const DeviceMesh&                                dm,
+    const DeviceVectorBoundary&                      dbU,
+    const ThermoCoeffs&                              thermo,
+    const cpu::generalizedNewtonian::PowerLawCoeffs& coeffs,
+    scalar                                           gradULimitK,
+    TurbulenceHookBuffers&                           buf)
+{
+    const int nC  = static_cast<int>(f.rho.size());
+    const int nBF = dm.nBndFaces;
+    if (nC == 0) return;
+    if (static_cast<int>(buf.nuCell.size()) != nC) buf.nuCell.resize(nC);
+    if (static_cast<int>(buf.nuBnd.size()) != nBF) buf.nuBnd.resize(nBF);
+    nuFromTKernel<<<nBlocks(nC), TPB>>>(nC, f.p.data(), f.T.data(), f.rho.data(), thermo, buf.nuCell.data());
+    cudaCheck(cudaGetLastError(), "rho generalizedNewtonian: nu0 cells");
+    if (nBF > 0)
+    {
+        nuFromTKernel<<<nBlocks(nBF), TPB>>>(nBF, f.pBnd.data(), f.TBnd.data(), f.rhoBnd.data(), thermo,
+                                             buf.nuBnd.data());
+        cudaCheck(cudaGetLastError(), "rho generalizedNewtonian: nu0 boundary");
+    }
+    const DeviceBuffer<scalar>* ub[3] = {&f.UxBnd, &f.UyBnd, &f.UzBnd};
+    generalizedNewtonian::correctNu(dm, dbU, f.Ux, f.Uy, f.Uz, ub, gradULimitK, buf.nuCell, buf.nuBnd, coeffs,
+                                    f.gnNu, f.gnNuBnd);
+}
+
 
 } // namespace rhoSimple
 } // namespace gpu

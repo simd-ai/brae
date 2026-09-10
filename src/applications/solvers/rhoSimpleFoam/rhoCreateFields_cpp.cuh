@@ -61,6 +61,7 @@
 #include "fvc.cuh"
 #include "kepsilon_coeffs.cuh"     // KEpsilonCoeffs: the case's own closure constants, carried on the field set
 #include "komega_sst_coeffs.cuh"   // KOmegaSSTCoeffs + readKOmegaSSTCoeffs, likewise
+#include "generalizedNewtonian_cpp.cuh"
 #include <string>
 #include <vector>
 
@@ -187,6 +188,19 @@ struct RhoSimpleFields
     // rasModel, and the driver branches on the same name rather than on which field happens to exist.
     GeometricField<scalar> omega;
 
+    // `simulationType laminar; laminar { model generalizedNewtonian; viscosityModel powerLaw; }`.
+    // nu_ is the model's STORED field (generalizedNewtonian.C:87 and :163): built at construction from the
+    // initial U, rebuilt only by correct() at the end of each iteration, and it REPLACES the molecular
+    // viscosity -- effectiveTransport assembles muEff = rho*nu_ from it. The boundary half is the formula
+    // on the patch values, not the face cell's copy (see generalizedNewtonian_cpp.cuh).
+    bool                                      generalizedNewtonian = false;
+    cpu::generalizedNewtonian::PowerLawCoeffs gnCoeffs{};
+    // cellLimited coefficient of gradSchemes/grad(U), the gradient strainRate() takes -- resolved once,
+    // here, so construction and every correct() read the same scheme.
+    scalar                                    gnGradULimitK = 0.0;
+    std::vector<scalar>                       gnNu;
+    std::vector<std::vector<scalar>>          gnNuBnd;
+
     // heRhoThermo's STORED rho_, and the reason it exists separately from `rho` above.
     // psiThermo::rho() returns p_*psi_, recomputed from whatever p is when it is called.
     // rhoThermo::rho() returns rho_ (rhoThermo.C:233), a field heRhoThermo::calculate() fills with
@@ -248,6 +262,16 @@ inline void correctAlphatBoundary(RhoSimpleFields& f, const std::vector<FvPatch>
         f.alphat.boundary[pi]->setValue(ab);
     }
 }
+
+// nu_ = viscosityModel_->nu(this->nu(), strainRate()) -- ONE implementation for the model's constructor
+// (createFields.H builds `turbulence`) and for the step's turbulence->correct(), so the two cannot drift
+// apart the way the kEpsilon coefficients once did. this->nu() is the compressible one, thermo.mu()/rho_
+// with rho_ the SOLVER's rho, per cell and per boundary face (CompressibleTurbulenceModel.H:123).
+void correctGeneralizedNewtonian(
+    RhoSimpleFields&            f,
+    const PrimitiveMesh&        m,
+    const FvGeometry&           g,
+    const std::vector<FvPatch>& patches);
 
 } // namespace rhoSimple
 } // namespace cpu

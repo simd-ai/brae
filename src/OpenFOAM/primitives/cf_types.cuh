@@ -165,6 +165,12 @@ BRAE_HD inline tensor operator*(scalar s, const tensor& t)
 {
     return {s*t.xx, s*t.xy, s*t.xz, s*t.yx, s*t.yy, s*t.yz, s*t.zx, s*t.zy, s*t.zz};
 }
+// symm(t) = (t + t^T)/2 as a SymmTensor, OpenFOAM TensorI.H:747-755 -- the off-diagonals as
+// 0.5*(a + b), in that form, so the rounding is OpenFOAM's.
+BRAE_HD inline symmTensor symm(const tensor& t)
+{
+    return {t.xx, 0.5*(t.xy + t.yx), 0.5*(t.xz + t.zx), t.yy, 0.5*(t.yz + t.zy), t.zz};
+}
 // dev2(t) = t - 2*sph(t) = t - (2/3)*tr(t)*I  (OpenFOAM TensorI.H).
 BRAE_HD inline tensor dev2(const tensor& t)
 {

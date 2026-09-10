@@ -53,7 +53,9 @@
 // supported path it is.
 //
 // Laminar runs in full too: muEff is the laminar mu(T) and alphaEff is heThermo's CpByCpv*alpha(T), both
-// from the transport model, both recomputed from the current T each iteration.
+// from the transport model, both recomputed from the current T each iteration -- or, when the case selects
+// `laminar { model generalizedNewtonian; viscosityModel powerLaw; }`, muEff is rho*nu_ from the model's
+// stored nu_ (RhoSimpleFields::gnNu), rebuilt at the step's turbulence->correct().
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
@@ -228,6 +230,7 @@ void thermoCorrect(
 
 // The effective transport, recomputed from the CURRENT state:
 //     laminar     muEff = mu(T)              alphaEff = CpByCpv*alpha(T)
+//     gen.Newt.   muEff = rho*nu_            alphaEff = CpByCpv*alpha(T)
 //     turbulent   muEff = mu(T) + rho*nut    alphaEff = CpByCpv*(alpha(T) + alphat)
 // which is heThermo::alphaEff(alphat) and the compressible model's muEff. These two lines are the ONLY
 // place the closure enters the momentum and energy equations -- everything else about a turbulent case is

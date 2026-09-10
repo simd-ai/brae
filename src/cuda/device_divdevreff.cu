@@ -232,13 +232,22 @@ void tensorDivKernel(
 // `div(nu*dev2(T(grad(U))))` down to the boundary treatment.
 void deviceBoundaryGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                          const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
-                         const DeviceBuffer<scalar>& gradU, DeviceBuffer<scalar>& gradB)
+                         const DeviceBuffer<scalar>& gradU, DeviceBuffer<scalar>& gradB,
+                         const DeviceBuffer<scalar>* const* UbStored)
 {
     const int nC = dm.nCells, nB = dm.nBndFaces;
     DeviceBuffer<scalar> uxb, uyb, uzb;
-    deviceBCValue(dbU.comp[0], Ux, uxb);
-    deviceBCValue(dbU.comp[1], Uy, uyb);
-    deviceBCValue(dbU.comp[2], Uz, uzb);
+    DeviceBuffer<scalar>* ub[3] = {&uxb, &uyb, &uzb};
+    const DeviceBuffer<scalar>* Uc[3] = {&Ux, &Uy, &Uz};
+    // The same choice deviceDivDevReff makes for its own gradB: the value the patch HOLDS when the
+    // caller keeps one, since that is what OF's fvc::grad(U) reads (see the header).
+    for (int i = 0; i < 3; ++i)
+    {
+        if (UbStored && UbStored[i] && UbStored[i]->size() == static_cast<std::size_t>(nB))
+            deviceCopy(*ub[i], *UbStored[i]);
+        else
+            deviceBCValue(dbU.comp[i], *Uc[i], *ub[i]);
+    }
     gradB.resize(static_cast<std::size_t>(9) * nB);
     gradBKernel<<<nBlocks(nB), TPB>>>(nB, dm.bndCell.data(), dm.bndGFace.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
                                       gradU.data(), nC, uxb.data(), uyb.data(), uzb.data(), Ux.data(), Uy.data(), Uz.data(),

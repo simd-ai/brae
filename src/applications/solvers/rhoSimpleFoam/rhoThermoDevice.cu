@@ -132,6 +132,7 @@ __global__ void effectiveTransportKernel(
     const scalar* __restrict__ rho,
     const scalar* __restrict__ nut,      // null on a laminar case
     const scalar* __restrict__ alphat,   // null when the case ships none
+    const scalar* __restrict__ nuModel,  // generalizedNewtonian's nu_; null unless the case selects it
     ThermoCoeffs          c,
     scalar                cpByCpv,
     scalar* __restrict__  muEff,
@@ -144,7 +145,9 @@ __global__ void effectiveTransportKernel(
     // rebuilt from nut/Prt here, so the two cannot drift apart.
     const scalar mut    = nut    ? rho[i] * nut[i] : scalar(0);
     const scalar alphaT = alphat ? alphat[i]       : scalar(0);
-    muEff[i]    = muLam + mut;
+    // generalizedNewtonian: nuEff() IS nu_ (generalizedNewtonian.C:139-157), assembled as rho_*nu_ -- the
+    // molecular mu enters only through nu0 inside it. alphaEff is thermo.alphahe() either way.
+    muEff[i]    = nuModel ? rho[i] * nuModel[i] : muLam + mut;
     alphaEff[i] = cpByCpv * (thermoAlphaOf(p[i], T[i], c) + alphaT);
 }
 
@@ -343,6 +346,15 @@ void effectiveTransport(
     // The reference's own predicate: turbulent AND a nut field that actually exists. A case declared
     // turbulent whose closure has not been read is laminar as far as the transport is concerned.
     const bool turb = turbulent && f.nut.size() > 0;
+    // generalizedNewtonian's nu_ exists on the field set only when the case selects the model
+    // (createDeviceFields), and then BOTH halves must be there -- a boundary missing would leave the wall
+    // faces on the molecular viscosity, the defect the boundary_mu_eff gate exists for.
+    const bool gn = f.gnNu.size() > 0;
+    if (gn && (f.gnNu.size() != f.T.size() || f.gnNuBnd.size() != f.TBnd.size()))
+        throw std::runtime_error(
+            "rhoSimpleFoam effectiveTransport(cuda): generalizedNewtonian's nu_ is on the field set with "
+            "the wrong size on cells or boundary faces; refusing rather than assembling part of the "
+            "momentum equation on the molecular viscosity.");
 
     const int nC = static_cast<int>(f.T.size());
     if (nC > 0)
@@ -353,6 +365,7 @@ void effectiveTransport(
             nC, f.p.data(), f.T.data(), f.rho.data(),
             turb ? f.nut.data() : nullptr,
             (turb && f.alphat.size() == static_cast<std::size_t>(nC)) ? f.alphat.data() : nullptr,
+            gn ? f.gnNu.data() : nullptr,
             c, cpByCpv, muEff.data(), alphaEff.data());
         cudaCheck(cudaGetLastError(), "rhoEffTransportCell");
     }
@@ -369,6 +382,7 @@ void effectiveTransport(
             nB, f.pBnd.data(), f.TBnd.data(), f.rhoBnd.data(),
             (turb && f.nutBnd.size() == static_cast<std::size_t>(nB)) ? f.nutBnd.data() : nullptr,
             (turb && f.alphatBnd.size() == static_cast<std::size_t>(nB)) ? f.alphatBnd.data() : nullptr,
+            gn ? f.gnNuBnd.data() : nullptr,
             c, cpByCpv, muEffBnd.data(), alphaEffBnd.data());
         cudaCheck(cudaGetLastError(), "rhoEffTransportBnd");
     }

@@ -445,16 +445,24 @@ std::vector<T> flatBoundary(const GeometricField<T>& gf, const std::vector<FvPat
     return out;
 }
 
+// Per-patch value arrays that are not a GeometricField (a surface field's boundary, a model's stored
+// patch values) into the same layout.
+std::vector<scalar> flatPatchValues(const std::vector<std::vector<scalar>>& bnd,
+                                    const std::vector<FvPatch>& patches)
+{
+    std::vector<scalar> out;
+    for (std::size_t pi = 0; pi < patches.size() && pi < bnd.size(); ++pi)
+    {
+        if (isCoupledInterfaceType(patches[pi].type)) continue;
+        out.insert(out.end(), bnd[pi].begin(), bnd[pi].end());
+    }
+    return out;
+}
+
 std::vector<scalar> flatSurfaceBoundary(const SurfaceScalarField& sf,
                                         const std::vector<FvPatch>& patches)
 {
-    std::vector<scalar> out;
-    for (std::size_t pi = 0; pi < patches.size() && pi < sf.boundary.size(); ++pi)
-    {
-        if (isCoupledInterfaceType(patches[pi].type)) continue;
-        out.insert(out.end(), sf.boundary[pi].begin(), sf.boundary[pi].end());
-    }
-    return out;
+    return flatPatchValues(sf.boundary, patches);
 }
 
 } // namespace
@@ -637,6 +645,15 @@ int runMirror(const std::string& caseDir)
             if (!f.alphat.internal.empty())
                 writeVolField(wsrc + "alphat", outDir + "/alphat", f.alphat.internal, patches, 12,
                               flatBoundary(f.alphat, patches));
+        }
+        // generalizedNewtonian's nu_ is IOobject AUTO_WRITE under the name "generalizedNewtonian:nu"
+        // (generalizedNewtonian.C:79-86), so OpenFOAM writes it in every time directory. Written here
+        // under the same name, off the T template like rho, cells and patch values both.
+        if (f.generalizedNewtonian)
+        {
+            static const DerivedFieldSpec nuSpec{"generalizedNewtonian:nu", "dimensions      [0 2 -1 0 0 0 0];"};
+            writeVolField(wsrc + "T", outDir + "/generalizedNewtonian:nu", f.gnNu, patches, 12,
+                          flatPatchValues(f.gnNuBnd, patches), &nuSpec);
         }
         // phi, so a restart RESUMES the conservative mass flux instead of rebuilding it from
         // interpolate(rho*U)&Sf -- a DIFFERENT field from the corrected phi. Compressible MASS flux

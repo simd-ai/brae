@@ -861,6 +861,16 @@ int runMirrorCuda(const std::string& caseDir)
             correctTurbulence(dev.f, dev, dev.dm, dev.dbU, hf.thermo, turbOpt, turbBuf);
         };
     }
+    // The LAMINAR model's correct(): generalizedNewtonian recomputes nu_ at the same point of the
+    // iteration (rhoSimpleFoam.C calls turbulence->correct() whatever the model). The constructor's nu_
+    // came up with the field set (createDeviceFields); effectiveTransport reads it from there.
+    if (hf.generalizedNewtonian)
+    {
+        gin.correct = [&]()
+        {
+            correctGeneralizedNewtonian(dev.f, dev.dm, dev.dbU, hf.thermo, hf.gnCoeffs, hf.gnGradULimitK, turbBuf);
+        };
+    }
 
     ResidualControl resControl(simpleDict ? simpleDict->subDict("residualControl") : nullptr);
     std::printf("  residualControl=%s\n", resControl.active() ? "on" : "off");
@@ -925,6 +935,13 @@ int runMirrorCuda(const std::string& caseDir)
             if (dev.f.alphat.size())
                 writeVolField(wsrc + "alphat", outDir + "/alphat", host(dev.f.alphat), patches, 12,
                               host(dev.f.alphatBnd));
+        }
+        // generalizedNewtonian's nu_, AUTO_WRITE in OpenFOAM under this name (generalizedNewtonian.C:79-86).
+        if (dev.f.gnNu.size())
+        {
+            static const DerivedFieldSpec nuSpec{"generalizedNewtonian:nu", "dimensions      [0 2 -1 0 0 0 0];"};
+            writeVolField(wsrc + "T", outDir + "/generalizedNewtonian:nu", host(dev.f.gnNu), patches, 12,
+                          host(dev.f.gnNuBnd), &nuSpec);
         }
         writeSurfaceField(outDir + "/phi", host(dev.f.phiInt), host(dev.f.phiBnd), patches, 17,
                           "[1 0 -1 0 0 0 0]");

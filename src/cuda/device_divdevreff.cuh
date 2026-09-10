@@ -73,10 +73,13 @@ void deviceDivDevReff(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                       // it is 4.7e-04 unlimited against 6.7e-08 limited. A factor of 7000.
                       scalar gradULimitK = 0.0);
 
-// Exported for the Maxwell model -- see the definitions in device_divdevreff.cu.
+// Exported for the Maxwell model and for generalizedNewtonian's strainRate -- see the definitions in
+// device_divdevreff.cu. UbStored: U's STORED boundary values, one buffer per component, for a caller that
+// keeps them (the OF-mirror); null re-derives them with deviceBCValue, as Maxwell always has.
 void deviceBoundaryGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                          const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
-                         const DeviceBuffer<scalar>& gradU, DeviceBuffer<scalar>& gradB);
+                         const DeviceBuffer<scalar>& gradU, DeviceBuffer<scalar>& gradB,
+                         const DeviceBuffer<scalar>* const* UbStored = nullptr);
 void deviceTensorDivSource(const DeviceMesh& dm,
                            const DeviceBuffer<scalar>& Tcell, const DeviceBuffer<scalar>& Tbnd,
                            DeviceBuffer<scalar>& srcX, DeviceBuffer<scalar>& srcY, DeviceBuffer<scalar>& srcZ,

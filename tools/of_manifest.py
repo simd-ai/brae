@@ -1435,6 +1435,33 @@ COMPONENTS = {
              validation="tests/rho_createfields_vs_openfoam.sh -- psi bounded at 1e-14 against 1.0/(R*T), from the same T that rho came from. NOT AN OPENFOAM COMPARISON, and the previous wording (`exactly`) implied one: the right-hand side is the SAME expression perfectGasPsi evaluates, so this asserts brae agrees with its own formula. No OpenFOAM psi file is read anywhere in the gate. Cells only -- psiBnd, which the transonic pressure branch interpolates to faces, is compared to nothing.",
              note="One line: psi is a const reference to thermo.psi(). It matters because pEqn uses psi "
                   "AFTER thermo.correct() has moved it."),
+        dict(name="generalizedNewtonian_compressible",
+             of_symbol="laminarModels::generalizedNewtonian<BasicMomentumTransportModel>::correct",
+             of_file="src/TurbulenceModels/turbulenceModels/laminar/generalizedNewtonian/generalizedNewtonian.C",
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/TurbulenceModels/turbulenceModels/laminar/generalizedNewtonian/generalizedNewtonian_cpp.cu",
+             brae_target="src/TurbulenceModels/turbulenceModels/laminar/generalizedNewtonian/generalizedNewtonian.cu",
+             validation="tests/rho_generalized_newtonian_vs_openfoam.sh -- OpenFOAM's own squareBendLiqNoNewtonian, "
+                        "both arms, against OpenFOAM's WRITTEN generalizedNewtonian:nu as well as U, p, T and rho. "
+                        "A: from rest, iteration 1 only (the constructor's nu_, nuMax over the quiescent field). "
+                        "B: restart from OpenFOAM's iteration 5 with the tutorial's coefficients, iterations 6-8 "
+                        "(nu_ at nuMin in every cell). C: the same restart with nuMin 1e-9, the coefficients in "
+                        "generalizedNewtonianCoeffs { powerLawCoeffs { } } beside the flat ones, grad(U) "
+                        "cellLimited -- the unclamped branch in every cell and on every patch face. Bounds 1e-10 "
+                        "(T, rho 1e-11) except C's interior nu_ at 5e-9, which is OpenFOAM's own floor there "
+                        "(OpenFOAM against itself, p solver swapped: 2.2e-10..1.1e-09). NOT CLAIMED: the tutorial "
+                        "from rest past iteration 1 -- its first correct() reads the round-off of a plug (strain "
+                        "rate ~1e-9 1/s in 21120 cells) and OpenFOAM against itself differs by U 1.04e-03 at "
+                        "iteration 2; a converged comparison (nu_ = nuMin everywhere, a constant viscosity) is not "
+                        "run; viscosity models other than powerLaw are refused by name.",
+             note="The model REPLACES the molecular viscosity: nuEff() is nu_ and linearViscousStress assembles "
+                  "rho_*nu_, cells and patch faces, with nu0 = mu/rho_ (the SOLVER's rho). nu_ is STORED: "
+                  "built by the constructor from the initial U, rebuilt only in correct() at the end of the "
+                  "iteration. Its patch values are the formula on the patch values of nu0 and strainRate, and "
+                  "strainRate's come from gaussGrad's boundary correction -- the wall shear. The gate found a "
+                  "generic restart defect before it could see the model: brae's inletOutlet/outletInlet/"
+                  "freestream took their construction value from inletValue where OpenFOAM keeps the file's "
+                  "`value`. See PORT.md, Stage S1 Half B."),
     ],
 }
 

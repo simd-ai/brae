@@ -151,7 +151,10 @@ void effectiveTransport(
         // see it; the comparison of brae's own against OpenFOAM's is what found it.
         const scalar pc    = f.p.internal[c];
         const scalar muLam = thermoMuOf(pc, T, f.thermo);
-        muEff[c]    = muLam + mut;
+        // generalizedNewtonian: nuEff() IS nu_ (generalizedNewtonian.C:139-146) and linearViscousStress
+        // assembles rho_*nuEff -- the molecular mu does not enter at all, except through nu0 inside nu_.
+        // alphaEff is untouched: the laminar ThermalDiffusivity's alphaEff() is thermo.alphahe().
+        muEff[c]    = f.generalizedNewtonian ? f.rho.internal[c] * f.gnNu[c] : muLam + mut;
         alphaEff[c] = cpByCpv * (thermoAlphaOf(pc, T, f.thermo) + alphat);
     }
     muEffBnd.assign(patches.size(), {});
@@ -169,7 +172,11 @@ void effectiveTransport(
             const scalar mutB = turb ? f.rho.boundary[pi]->value()[i] * f.nut.boundary[pi]->value()[i] : 0.0;
             const scalar alphatB = (turb && !f.alphat.internal.empty())
                                  ? f.alphat.boundary[pi]->value()[i] : 0.0;
-            muEffBnd[pi][i]    = thermoMuOf(pbv[i], tb[i], f.thermo) + mutB;
+            // nu_'s own patch value, rho_b*nu_b -- nuEff(patchi) is nu_.boundaryField()[patchi]
+            // (generalizedNewtonian.C:156), not the face cell's.
+            muEffBnd[pi][i]    = f.generalizedNewtonian
+                               ? f.rho.boundary[pi]->value()[i] * f.gnNuBnd[pi][i]
+                               : thermoMuOf(pbv[i], tb[i], f.thermo) + mutB;
             alphaEffBnd[pi][i] =
                 cpByCpv * (thermoAlphaOf(pbv[i], tb[i], f.thermo) + alphatB);
         }
@@ -1036,6 +1043,14 @@ Residuals rhoSimpleStep(
 
     sd.scalars("p", f.p.internal);
     sd.scalars("rhoTail", f.rho.internal);
+
+    // turbulence->correct() for the laminar generalizedNewtonian model (generalizedNewtonian.C:161-165):
+    // nu_ from THIS iteration's corrected U, its tail rho and the T of this iteration's thermo.correct().
+    // Same lag as the RAS closures below -- the next iteration's momentum equation reads it.
+    if (f.generalizedNewtonian)
+    {
+        correctGeneralizedNewtonian(f, m, g, patches);
+    }
 
     // turbulence->correct() -- LAST, after the pressure corrector, so the NEXT iteration's momentum
     // equation uses this iteration's closure. OpenFOAM's lagged coupling; correcting before UEqn instead

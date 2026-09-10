@@ -37,6 +37,7 @@
 #include "rhoCreateFields.cuh"
 #include "rhoSimpleFoam.cuh"
 #include "thermo_types.cuh"
+#include "generalizedNewtonian_cpp.cuh"   // PowerLawCoeffs
 #include <string>
 
 namespace brae {
@@ -113,6 +114,19 @@ void correctTurbulence(
     const ThermoCoeffs&           thermo,
     const TurbulenceHookOptions&  opt,
     TurbulenceHookBuffers&        buf);
+
+// turbulence->correct() for the laminar generalizedNewtonian model (generalizedNewtonian.C:161-165):
+// nu_ = powerLaw(this->nu(), strainRate()) into f.gnNu/f.gnNuBnd, from U with its STORED boundary arrays
+// -- what fvc::grad(U) reads -- and this->nu() = mu(p,T)/rho through the same kernel the RAS closures'
+// nu takes. The host reference is cpu::rhoSimple::correctGeneralizedNewtonian.
+void correctGeneralizedNewtonian(
+    RhoSolverFields&                                 f,
+    const DeviceMesh&                                dm,
+    const DeviceVectorBoundary&                      dbU,
+    const ThermoCoeffs&                              thermo,
+    const cpu::generalizedNewtonian::PowerLawCoeffs& coeffs,
+    scalar                                           gradULimitK,
+    TurbulenceHookBuffers&                           buf);
 
 } // namespace rhoSimple
 } // namespace gpu

@@ -211,15 +211,27 @@ inline void readLaminarModel(
                             "equation: on OpenFOAM's own squareBendLiqNoNewtonian the model's nu is 1101x "
                             "to 2532x the molecular value. Refusing rather than running Stokes under "
                             "another model's name.");
-                    // OF reads the coefficients from powerLawCoeffs{} if present, else from the enclosing
-                    // dictionary (dictionary::optionalSubDict), which is how this tutorial writes them.
-                    const std::string vm = lam->wordOr("viscosityModel", "");
+                    // TWO optionalSubDict levels, as OpenFOAM resolves them. The model's coeffDict_ is
+                    // laminar.optionalSubDict("generalizedNewtonianCoeffs") (laminarModel.C:73), and
+                    // generalizedNewtonianViscosityModel::New reads `viscosityModel` from THAT, mandatory
+                    // (generalizedNewtonianViscosityModelNew.C:39); powerLaw then reads its coefficients
+                    // from coeffDict_.optionalSubDict("powerLawCoeffs") (powerLaw.C:62). The tutorial writes
+                    // everything flat in laminar{}; a case nesting it one level down used to be refused
+                    // as "viscosityModel ''" because only the flat spelling was looked at.
+                    const FoamDict* gc = lam->subDict("generalizedNewtonianCoeffs");
+                    const FoamDict& cd = gc ? *gc : *lam;
+                    if (!cd.found("viscosityModel"))
+                        throw std::runtime_error(
+                            "brae: laminar model generalizedNewtonian needs `viscosityModel` (OpenFOAM reads "
+                            "it with no default, generalizedNewtonianViscosityModelNew.C:39).");
+                    const std::string vm = cd.wordOr("viscosityModel", "");
                     if (vm != "powerLaw")
                         throw std::runtime_error(
                             "brae: unsupported generalizedNewtonian viscosityModel '" + vm +
-                            "' (only 'powerLaw' is implemented).");
-                    const FoamDict* co = lam->subDict("powerLawCoeffs");
-                    const FoamDict& src = co ? *co : *lam;
+                            "' (only 'powerLaw' is implemented; OpenFOAM v2412 also offers BirdCarreau, "
+                            "Casson, CrossPowerLaw, HerschelBulkley and strainRateFunction).");
+                    const FoamDict* co = cd.subDict("powerLawCoeffs");
+                    const FoamDict& src = co ? *co : cd;
                     ctl.gnPowerLaw = true;
                     // ALL THREE are required: OF powerLaw.C:63-65 constructs n_, nuMin_ and nuMax_
                     // straight from the dict with no default, and fatals on a missing entry. The old

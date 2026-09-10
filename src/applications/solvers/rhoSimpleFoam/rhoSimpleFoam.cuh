@@ -100,6 +100,10 @@ struct RhoSolverFields
     // never the adjacent cell's -- at a fixed-temperature wall with compressible::alphatWallFunction the
     // two differ by the whole of alphat, and falling back to the cell value silently removes it.
     DeviceBuffer<scalar> alphatBnd;
+    // laminar generalizedNewtonian's STORED nu_, cells and boundary faces -- the model's state, owned here
+    // for the same reason as the closure's. EMPTY unless the case selects the model: its presence is what
+    // effectiveTransport keys on, so the model cannot be uploaded and then silently not applied.
+    DeviceBuffer<scalar> gnNu, gnNuBnd;
 
     // The THERMO's own density, cells and boundary. NOT the solver's rho above: heRhoThermo::calculate()
     // rewrites this inside thermo.correct(), and rhoThermo::rho() then returns it -- so on a heRhoThermo
@@ -123,6 +127,7 @@ struct RhoStepInput
     // --- the effective transport for THIS iteration, supplied by the caller because it comes from the
     //     thermo and the closure, both of which the caller owns:
     //       laminar     muEff = mu(T)             alphaEff = CpByCpv*alpha(T)
+    //       gen.Newt.   muEff = rho*nu_           alphaEff = CpByCpv*alpha(T)
     //       turbulent   muEff = mu(T) + rho*nut   alphaEff = CpByCpv*(alpha(T) + alphat)
     const DeviceBuffer<scalar>* muEffCell       = nullptr;
     const DeviceBuffer<scalar>* muEffBndFace    = nullptr;
