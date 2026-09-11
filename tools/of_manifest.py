@@ -1435,6 +1435,46 @@ COMPONENTS = {
              validation="tests/rho_createfields_vs_openfoam.sh -- psi bounded at 1e-14 against 1.0/(R*T), from the same T that rho came from. NOT AN OPENFOAM COMPARISON, and the previous wording (`exactly`) implied one: the right-hand side is the SAME expression perfectGasPsi evaluates, so this asserts brae agrees with its own formula. No OpenFOAM psi file is read anywhere in the gate. Cells only -- psiBnd, which the transonic pressure branch interpolates to faces, is compared to nothing.",
              note="One line: psi is a const reference to thermo.psi(). It matters because pEqn uses psi "
                   "AFTER thermo.correct() has moved it."),
+        dict(name="leastSquaresGrad", of_symbol="Foam::fv::leastSquaresGrad",
+             of_file="src/finiteVolume/finiteVolume/gradSchemes/leastSquaresGrad/leastSquaresGrad.C",
+             classification="SHARED_NUMERICAL", status="PORTED",
+             brae_existing="src/cuda/device_mesh.cu (deviceLeastSquaresGrad)",
+             brae_reference="src/finiteVolume/finiteVolume/fvc.cu (fvc::leastSquaresGrad)",
+             brae_target="src/finiteVolume/finiteVolume/gradSchemes/",
+             validation="tests/leastsquares_grad_vs_openfoam.sh -- the GRADIENT itself, SCALAR and VECTOR "
+                        "arms on an orthogonal mesh AND a pitzDaily arm whose boundary faces are SKEWED "
+                        "(fvPatch::delta() is the patch-normal projection of Cf - Cn, not Cf - Cn: brae "
+                        "used the raw vector and an orthogonal mesh cannot tell the two apart -- 1.18e-01 "
+                        "vs 1.84e-12 on pitzDaily, 4.6e-15 either way on squareBend). Scalar and vector "
+                        "arms, against OpenFOAM's own grad(T) and grad(U) on validation/rhoSST, each a 2x2 "
+                        "with the other scheme as the control: brae leastSquares vs OF leastSquares "
+                        "2.5e-13 (scalar) and 2.3e-13 (vector), against OF Gauss linear 2.5e-01, and OF "
+                        "leastSquares against brae Gauss 3.3e-01 (device scalar 2.5e-13, device-vs-host "
+                        "1.6e-16; no device twin for the vector form yet). "
+                        "tests/rho_leastsquares_closure_vs_openfoam.sh -- the CONSUMERS, nine arms on the "
+                        "host arm end to end against real OpenFOAM: the closure's CDkOmega and "
+                        "corrected-laplacian gradients, the turbulence limiters' own gradient, grad(p) and "
+                        "grad(U), each restarted from OpenFOAM's own iteration 5 and each measured "
+                        "separately (before -> after: k 3.1e-06 -> 8.7e-12, 1.7e-05 -> 2.9e-12, "
+                        "3.6e-06 -> 2.9e-12), with the shipped case as the control, a wrong-scheme control "
+                        "(brae's Gauss against OpenFOAM's leastSquares run must differ, 6.3e-08) and the "
+                        "CUDA arm asserted to REFUSE by name. Two fail-proofs, each watched: divDevRhoReff's "
+                        "flag removed, and the limiter's gradient back to Gauss -- different arms go red.",
+             note="OpenFOAM's inverse-distance least-squares fit (leastSquaresVectors.C), not a Gauss sum; "
+                  "a case naming it gets it or is refused. fvc::grad(vf) resolves `grad(<name>)` through "
+                  "gradSchemes (fvcGrad.C:149), so `default leastSquares` reaches every consumer: the "
+                  "limitedLinear limiters' gradient in the energy equation (BRAE_LEASTSQUARES=1) and in "
+                  "both turbulence closures' divWithScheme (LimitedScheme.C:51-55), kOmegaSST's CDkOmega "
+                  "and the k/omega|epsilon corrected-laplacian corrections (gradKLeastSq), grad(p) (the "
+                  "velocity correction pEqn.H:86 / pcEqn.H:99, SIMPLEC's HbyA pcEqn.H:30,65, the non-orth "
+                  "corrections) and grad(U) (divDevRhoReff's dev2 term, the closures' production, "
+                  "validate()'s correctNut) -- the VECTOR form, lsGrad_ij = ownLs_i*deltaVsf_j, sharing "
+                  "one leastSquaresInvDd with the scalar one. Four of those consumers computed the Gauss "
+                  "gradient under the case's own scheme name until this. The DEVICE computes it nowhere "
+                  "and the CUDA mirror arm refuses a leastSquares grad(k), grad(U) or grad(p) by name "
+                  "until that module is ported; the non-orth corrections and the gradient linearUpwind "
+                  "NAMES are ported but not exercised by rhoSST (orthogonal laplacians, upwind divs)."),
+
         dict(name="generalizedNewtonian_compressible",
              of_symbol="laminarModels::generalizedNewtonian<BasicMomentumTransportModel>::correct",
              of_file="src/TurbulenceModels/turbulenceModels/laminar/generalizedNewtonian/generalizedNewtonian.C",

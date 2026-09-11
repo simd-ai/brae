@@ -65,7 +65,22 @@ void divKernel(
 // invDd[nei], so on the owner side of a face the cell reads its own, and on the neighbour side likewise.
 //
 // d, the cell-to-cell vector, is already in DeviceMesh: (Cf - C_own) - (Cf - C_nei) = C_nei - C_own, and
-// a boundary face's fvPatch::delta() is (Cf - C_faceCell) verbatim. No new mesh data is uploaded.
+// a boundary face's fvPatch::delta() is the PATCH-NORMAL PROJECTION of (Cf - C_faceCell),
+// `nHat*(nHat & (Cf() - Cn()))` (fvPatch.C) -- NOT the raw difference, which is the same vector only on
+// an orthogonal mesh. dBnd carries the raw Cf - C (cellLimitedGrad needs that one), so the projection is
+// taken here from Sf/magSf at the same face.
+// fvPatch::delta() on an uncoupled patch: the component of Cf - Cn along the face normal. The host's
+// lsBoundaryDelta (fvc.cu) is the same expression, so the two arms cannot drift.
+BRAE_HD inline vector lsqBndDelta(
+    scalar dx, scalar dy, scalar dz,
+    scalar sfx, scalar sfy, scalar sfz,
+    scalar mag)
+{
+    const vector nH{sfx / mag, sfy / mag, sfz / mag};
+    const scalar p = nH.x * dx + nH.y * dy + nH.z * dz;
+    return vector{p * nH.x, p * nH.y, p * nH.z};
+}
+
 __global__
 void lsqInvDdKernel(
     int nC,
@@ -74,6 +89,7 @@ void lsqInvDdKernel(
     const label* __restrict__ losortStart,
     const scalar* __restrict__ w,
     const scalar* __restrict__ magSf,
+    const scalar* __restrict__ Sfx, const scalar* __restrict__ Sfy, const scalar* __restrict__ Sfz,
     const scalar* __restrict__ dOwnX, const scalar* __restrict__ dOwnY, const scalar* __restrict__ dOwnZ,
     const scalar* __restrict__ dNeiX, const scalar* __restrict__ dNeiY, const scalar* __restrict__ dNeiZ,
     const label* __restrict__ bndCellStart,
@@ -102,8 +118,9 @@ void lsqInvDdKernel(
     {
         const int bk = bndPerm[k];
         if (bndIsEmpty[bk]) continue;   // emptyFvPatch::size() == 0 -- this is what leaves dd singular in 2-D
-        const vector d{dBndX[bk], dBndY[bk], dBndZ[bk]};
-        dd = dd + (magSf[bndGFace[bk]] / magSqr(d)) * sqr(d);
+        const int gf = bndGFace[bk];
+        const vector d = lsqBndDelta(dBndX[bk], dBndY[bk], dBndZ[bk], Sfx[gf], Sfy[gf], Sfz[gf], magSf[gf]);
+        dd = dd + (magSf[gf] / magSqr(d)) * sqr(d);
     }
     const symmTensor r = safeInv(dd);
     idd[0 * nC + c] = r.xx; idd[1 * nC + c] = r.xy; idd[2 * nC + c] = r.xz;
@@ -120,6 +137,7 @@ void lsqGradKernel(
     const label* __restrict__ losortStart,
     const scalar* __restrict__ w,
     const scalar* __restrict__ magSf,
+    const scalar* __restrict__ Sfx, const scalar* __restrict__ Sfy, const scalar* __restrict__ Sfz,
     const scalar* __restrict__ dOwnX, const scalar* __restrict__ dOwnY, const scalar* __restrict__ dOwnZ,
     const scalar* __restrict__ dNeiX, const scalar* __restrict__ dNeiY, const scalar* __restrict__ dNeiZ,
     const scalar* __restrict__ vf,
@@ -156,8 +174,9 @@ void lsqGradKernel(
     {
         const int bk = bndPerm[k];
         if (bndIsEmpty[bk]) continue;
-        const vector d{dBndX[bk], dBndY[bk], dBndZ[bk]};
-        s += ((magSf[bndGFace[bk]] / magSqr(d)) * (bval[bk] - vc)) * (iv & d);
+        const int gf = bndGFace[bk];
+        const vector d = lsqBndDelta(dBndX[bk], dBndY[bk], dBndZ[bk], Sfx[gf], Sfy[gf], Sfz[gf], magSf[gf]);
+        s += ((magSf[gf] / magSqr(d)) * (bval[bk] - vc)) * (iv & d);
     }
     // No division by V: the fit vectors already carry the normalisation.
     gx[c] = s.x; gy[c] = s.y; gz[c] = s.z;
@@ -256,6 +275,7 @@ void deviceLeastSquaresGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vo
     DeviceBuffer<scalar> idd; idd.resize(static_cast<std::size_t>(6) * nC);
     lsqInvDdKernel<<<nBlocks(nC), TPB>>>(
         nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), dm.w.data(), dm.magSf.data(),
+        dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
         dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
         dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
         dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), dm.bndGFace.data(),
@@ -264,6 +284,7 @@ void deviceLeastSquaresGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vo
     lsqGradKernel<<<nBlocks(nC), TPB>>>(
         nC, dm.owner.data(), dm.nei.data(), dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
         dm.w.data(), dm.magSf.data(),
+        dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
         dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
         dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(), vol.data(),
         dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), dm.bndGFace.data(),

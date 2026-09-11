@@ -124,6 +124,11 @@ struct RhoMomentumInput
     bool      bounded            = false;
     bool      linearUpwind       = false;
     scalar    gradULimitK        = 0.0;
+    // grad(U)'s and grad(p)'s BASE scheme: leastSquares, or Gauss linear. The momentum's three grad(U)
+    // consumers (the limitedLinearV weights, linearUpwind's and linearUpwindV's corrections) and
+    // -fvc::grad(p) resolve through the case's gradSchemes in OpenFOAM (fvcGrad.C:149).
+    bool      gradULeastSq       = false;
+    bool      gradPLeastSq       = false;
     // The gradient linearUpwind/linearUpwindV NAMES in div(phi,U), for the convection correction only.
     // -1 = not resolved by the caller; the correction then takes gradULimitK (see StepInput).
     scalar    gradULULimitK      = -1.0;
@@ -174,7 +179,8 @@ void addPressureGradient(
     const GeometricField<scalar>& p,
     const PrimitiveMesh&          m,
     const FvGeometry&             g,
-    const std::vector<FvPatch>&   patches);
+    const std::vector<FvPatch>&   patches,
+    bool                          leastSquares = false);
 
 } // namespace rhoSimple
 } // namespace cpu

@@ -155,14 +155,28 @@ sys.exit(0 if o > 0 and abs(b - o) / o < 0.25 else 1)" "$bs" "$SPREAD" \
     fi
 done
 
-# ---- ARM 3: the LIMITER's gradient is refused when brae cannot compute it, on BOTH arms ------------
+# ---- ARM 3: the LIMITER's gradient ------------------------------------------------------------------
+# `cellMDLimited` is a limiter brae does not apply at all (scheme_parse.cuh records it as
+# unsupportedLimiter rather than folding it into "unlimited"), so it is refused on BOTH arms, by name.
 for arm in 1 cuda; do
     label=$([ "$arm" = 1 ] && echo "host" || echo "CUDA")
-    stage "$W/g_$arm" "$LL" "leastSquares"; runBrae "$arm" "$W/g_$arm"
+    stage "$W/g_$arm" "$LL" "cellMDLimited Gauss linear 1"; runBrae "$arm" "$W/g_$arm"
     [ "$(its "$W/g_$arm")" = 0 ] && grep -q "limiter gradient" "$W/g_$arm/run.log" \
         && say "$label arm: a limiter gradient brae does not compute is refused, by name" ok \
         || say "$label arm: a limiter gradient brae does not compute is refused, by name" FAIL
 done
+# ...and `leastSquares`, which brae DOES compute now: the host runs it, and the CUDA arm -- whose
+# closures, momentum gradients and pressure gradient compute Gauss only -- refuses it BY NAME. Together
+# these two say the refusal tracks what each arm can actually compute rather than being blanket.
+# The host figure itself is gated by tests/rho_leastsquares_closure_vs_openfoam.sh against real OpenFOAM.
+stage "$W/lsq_1" "$LL" "leastSquares"; runBrae 1 "$W/lsq_1"
+[ "$(its "$W/lsq_1")" = "$DEV" ] \
+    && say "host arm: a leastSquares limiter gradient RUNS (it is computed and gated)" ok \
+    || { grep -v '^brae NOTICE' "$W/lsq_1/run.log" | tail -2; say "host arm: a leastSquares limiter gradient RUNS (it is computed and gated)" FAIL; }
+stage "$W/lsq_c" "$LL" "leastSquares"; runBrae cuda "$W/lsq_c"
+[ "$(its "$W/lsq_c")" = 0 ] && grep -q "which this arm computes nowhere yet" "$W/lsq_c/run.log" \
+    && say "CUDA arm: a leastSquares gradient is refused, by name" ok \
+    || { grep -v '^brae NOTICE' "$W/lsq_c/run.log" | tail -2; say "CUDA arm: a leastSquares gradient is refused, by name" FAIL; }
 # ...and NOT refused when the case names Gauss linear -- the refusal must discriminate.
 stage "$W/gok" "$LL" "Gauss linear"; runBrae 1 "$W/gok"
 [ "$(its "$W/gok")" = "$DEV" ] \

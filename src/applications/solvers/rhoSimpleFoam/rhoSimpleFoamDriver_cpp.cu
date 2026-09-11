@@ -202,6 +202,17 @@ StepInput buildStepInput(
         in.snGradLimitCoeff   = (sctl.nonOrth && sctl.nonOrthLimit < 1.0) ? sctl.nonOrthLimit : 0.0;
         in.gradULimitK        = sctl.gradULimitK;
         in.gradKLimitK        = sctl.gradKLimitK;
+        // grad(U)'s and grad(p)'s BASE scheme, each field's own gradSchemes entry, named-then-default:
+        // leastSquares runs on the host (fvc::leastSquaresGrad, vector and scalar forms). The shared
+        // parser above only WARNS on leastSquares and hands out the Gauss coefficient; the mirror resolves
+        // the scheme itself, as it does for grad(k). Any other base scheme still falls to the parser's
+        // reading and its warning -- recorded in PORT.md as open, not widened here.
+        {
+            const FieldGradScheme gU = parseFieldGradScheme(caseDir, "U");
+            const FieldGradScheme gP = parseFieldGradScheme(caseDir, "p");
+            in.gradULeastSq = gU.leastSquares;
+            in.gradPLeastSq = gP.leastSquares;
+        }
         // The ENERGY gradient limiters, which the parser has carried all along and this never forwarded:
         // gradHeLimitK is the cellLimited coefficient of the gradient the energy's linearUpwind NAMES
         // (OF's linearUpwind takes mesh.gradScheme(gradSchemeName_), e.g. aerofoilNACA0012's
@@ -326,21 +337,27 @@ StepInput buildStepInput(
             // laplacian's correction (both models) and CDkOmega (SST). A case using neither is not
             // refused over a gradient scheme nothing reads.
             const bool used = in.correctedLaplacian || f.rasModel == "kOmegaSST";
-            auto gaussOnly = [](const FieldGradScheme& gs)
+            // Gauss linear or leastSquares, either optionally cellLimited: the two base schemes the host
+            // closures compute (fvc::gaussGrad, fvc::leastSquaresGrad -- the latter gated against
+            // OpenFOAM's own grad by tests/leastsquares_grad_vs_openfoam.sh). Anything else is refused.
+            auto computed = [](const FieldGradScheme& gs)
             {
-                return gs.gaussLinear && !gs.leastSquares && gs.unsupportedLimiter.empty();
+                return (gs.gaussLinear || gs.leastSquares) && gs.unsupportedLimiter.empty();
             };
-            if (used && (!gaussOnly(gK) || !gaussOnly(gS)))
+            if (used && (!computed(gK) || !computed(gS)))
                 in.turbDivUnsupported =
                     "a grad(k)/grad(" + secondT + ") scheme brae does not compute for the turbulence "
                     "laplacian correction and CDkOmega -- they resolve to `" + gK.raw + "` and `" + gS.raw +
-                    "`, where the host closures take Gauss linear, optionally cellLimited";
-            else if (used && gK.cellLimitK != gS.cellLimitK)
+                    "`, where the host closures take Gauss linear or leastSquares, optionally cellLimited";
+            else if (used && (gK.cellLimitK != gS.cellLimitK || gK.leastSquares != gS.leastSquares))
                 in.turbDivUnsupported =
-                    "grad(k) and grad(" + secondT + ") with different cellLimited coefficients (the "
-                    "closures carry one gradient scheme for both)";
+                    "grad(k) and grad(" + secondT + ") with different schemes or cellLimited coefficients "
+                    "(the closures carry one gradient scheme for both)";
             else
-                in.gradKLimitK = gK.cellLimitK;
+            {
+                in.gradKLimitK  = gK.cellLimitK;
+                in.gradKLeastSq = used && gK.leastSquares;
+            }
         }
 
         const FieldDivScheme dK = parseFieldDivScheme(caseDir, "k");
@@ -386,17 +403,21 @@ StepInput buildStepInput(
         // THE LIMITER'S GRADIENT, for the turbulence pair, on the same rule as the energy pair above:
         // OpenFOAM builds limitedLinear's limiter from fvc::grad(<field>) resolved through the case's
         // gradSchemes (LimitedScheme.C:56-59), so `grad(k)` and `grad(epsilon|omega)` decide it, and
-        // brae computes Gauss linear gradients only. Both closures took a plain unlimited Gauss
+        // brae computes Gauss linear and leastSquares. Both closures took a plain unlimited Gauss
         // gradient here regardless of what the case asked for, so a `grad(k) cellLimited Gauss linear 1`
         // was read into gradKLimitK, used for the corrected laplacian, and dropped for the limiter.
+        //
+        // leastSquares needed BRAE_LEASTSQUARES=1 here until the closures' divWithScheme took it
+        // (kOmegaSST_cpp.cu, kEpsilon_cpp.cu, under gradKLeastSq). It is computed and gated now --
+        // tests/rho_leastsquares_closure_vs_openfoam.sh's lsqko_komega arm, 8.7e-12 against real OpenFOAM
+        // on validation/rhoSST restarted from its iteration 5 -- so the opt-in is gone from this guard.
+        // The ENERGY limiter keeps its own opt-in: its end-to-end gap is a separate, open measurement.
         if (in.limitedLinearTurb)
         {
             const FieldGradScheme gK = parseFieldGradScheme(caseDir, "k");
             const FieldGradScheme gS = parseFieldGradScheme(caseDir, secondT);
-            const bool lsqOn = std::getenv("BRAE_LEASTSQUARES")
-                            && std::string(std::getenv("BRAE_LEASTSQUARES")) == "1";
-            const bool kOk = gK.gaussLinear || (gK.leastSquares && lsqOn);
-            const bool sOk = gS.gaussLinear || (gS.leastSquares && lsqOn);
+            const bool kOk = (gK.gaussLinear || gK.leastSquares) && gK.unsupportedLimiter.empty();
+            const bool sOk = (gS.gaussLinear || gS.leastSquares) && gS.unsupportedLimiter.empty();
             if (!kOk || !sOk)
                 in.turbDivUnsupported =
                     "a limiter gradient brae does not compute -- div(phi,k)/div(phi," + secondT +

@@ -85,7 +85,12 @@ std::vector<vector> divDevReffExplicit(
     const FvGeometry&             g,
     const std::vector<FvPatch>&   patches,
     // gradSchemes/grad(U): 0 = the unlimited base scheme, >0 = cellLimited with that coefficient.
-    scalar                        gradULimitK = 0.0);
+    scalar                        gradULimitK = 0.0,
+    // ...and whether that gradScheme's BASE is leastSquares rather than Gauss linear (the cellLimited
+    // coefficient above applies on top of either). divDevRhoReff's explicit term is the largest in the
+    // momentum equation, so a `default leastSquares` that reached the closure and the pressure gradient
+    // but not this one left validation/rhoSST at omega 5.6e-04 restarted from OpenFOAM's iteration 5.
+    bool                          gradULeastSq = false);
 
 // The full operator as it appears in UEqn.H: the IMPLICIT laplacian assembled into the matrix, and the
 // EXPLICIT dev2 term added to the source.
@@ -112,7 +117,12 @@ void addDivDevReff(
     // aerofoilNACA0012 asks for `cellLimited Gauss linear 1` on grad(U) while squareBend asks for plain
     // `Gauss linear`, so a fixture with only the latter cannot tell the two apart. 0 = unlimited, which
     // is what every existing caller passes and what `Gauss linear` means.
-    scalar                        gradULimitK = 0.0);
+    scalar                        gradULimitK = 0.0,
+    // ...and whether that gradScheme's BASE is leastSquares rather than Gauss linear (the cellLimited
+    // coefficient above applies on top of either). divDevRhoReff's explicit term is the largest in the
+    // momentum equation, so a `default leastSquares` that reached the closure and the pressure gradient
+    // but not this one left validation/rhoSST at omega 5.6e-04 restarted from OpenFOAM's iteration 5.
+    bool                          gradULeastSq = false);
 
 } // namespace cpu
 } // namespace brae

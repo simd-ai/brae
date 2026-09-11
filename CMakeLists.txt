@@ -2433,6 +2433,18 @@ add_test(NAME rho_generalized_newtonian_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_generalized_newtonian_vs_openfoam.sh)
 set_tests_properties(rho_generalized_newtonian_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
+# `leastSquares` reaching every consumer the rhoSimpleFoam mirror has, on the HOST arm, end to end on
+# validation/rhoSST against real OpenFOAM: the closure's CDkOmega and corrected-laplacian gradients, the
+# turbulence limiters' own gradient, grad(p) (the velocity correction, SIMPLEC's HbyA, the non-orth
+# correction) and grad(U) (divDevRhoReff's dev2 term, the production, validate()'s correctNut). Nine arms,
+# each measured: the shipped case as the control, a wrong-scheme control (brae's Gauss against OpenFOAM's
+# leastSquares run must DIFFER -- 6.3e-08), the limiter arms restarted from OpenFOAM's own iteration 5,
+# and the CUDA arm asserted to REFUSE by name until its modules are ported. The step that unblocks
+# gasMixing/injectorPipe.
+add_test(NAME rho_leastsquares_closure_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_leastsquares_closure_vs_openfoam.sh)
+set_tests_properties(rho_leastsquares_closure_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
 # THE SIX rhoSimpleFoam TUTORIALS as OpenFOAM ships them, on both mirror arms, meshed by each tutorial's
 # own Allrun.pre -- the standing answer to which of them brae runs and which it refuses. The two halves
 # are each other's control: four must RUN and agree with OpenFOAM (a guard drawn too wide turns it red),

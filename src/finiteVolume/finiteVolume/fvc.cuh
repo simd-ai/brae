@@ -46,6 +46,19 @@ std::vector<vector> gaussGrad(const std::vector<scalar>& internal,
 // the GRADIENT's own boundary field; brae's consumers (the limitedLinear/limitedLinearV limiters) read
 // the gradient at owner and neighbour CELLS only, so those two corrections have nothing to act on here.
 // A future consumer that needs grad on a patch face must add them.
+std::vector<tensor> leastSquaresGrad(const std::vector<vector>& internal,
+                                     const std::vector<std::vector<vector>>& boundary,
+                                     const PrimitiveMesh& m,
+                                     const FvGeometry& g,
+                                     const std::vector<FvPatch>& patches);
+std::vector<tensor> leastSquaresGrad(const GeometricField<vector>& U,
+                                     const PrimitiveMesh& m,
+                                     const FvGeometry& g,
+                                     const std::vector<FvPatch>& patches);
+std::vector<vector> leastSquaresGrad(const GeometricField<scalar>& p,
+                                     const PrimitiveMesh& m,
+                                     const FvGeometry& g,
+                                     const std::vector<FvPatch>& patches);
 std::vector<vector> leastSquaresGrad(const std::vector<scalar>& internal,
                                      const std::vector<std::vector<scalar>>& boundary,
                                      const PrimitiveMesh& m,

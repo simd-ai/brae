@@ -86,7 +86,16 @@ FvScalarMatrix divWithScheme(
     scalar                           limiterCoeff,
     const PrimitiveMesh&             m,
     const FvGeometry&                g,
-    const std::vector<FvPatch>&      patches)
+    const std::vector<FvPatch>&      patches,
+    // The limiter's gradient is fvc::grad(lPhi) with lPhi the field itself (LimitedScheme.C:51-55,
+    // limitFuncs::magSqr<scalar> returns phi), so it resolves `grad(k)` / `grad(omega)` -- the same
+    // gradSchemes entry the closure's own gradients take: the same base scheme, and the same cellLimited
+    // coefficient on top. This took the plain Gauss gradient whatever the case said; the driver resolved
+    // the scheme and this function never received it. Measured on validation/rhoSST restarted from
+    // OpenFOAM's own iteration 5 with `grad(k) leastSquares; grad(omega) leastSquares;` and limitedLinear
+    // on both: exact at iteration 6, k 3.1e-06 / omega 6.4e-05 at iteration 7 with the Gauss gradient here.
+    scalar                           limGradK = 0.0,
+    bool                             limGradLeastSq = false)
 {
     if (!limitedLinear)
     {
@@ -98,7 +107,9 @@ FvScalarMatrix divWithScheme(
     {
         vfb[pi] = vf.boundary[pi]->value();
     }
-    const std::vector<vector> gradVf = fvc::gaussGrad(vf.internal, vfb, m, g, patches);
+    std::vector<vector> gradVf = limGradLeastSq ? fvc::leastSquaresGrad(vf.internal, vfb, m, g, patches)
+                                                : fvc::gaussGrad(vf.internal, vfb, m, g, patches);
+    if (limGradK > 0.0) cellLimitGrad(gradVf, vf.internal, vfb, limGradK, m, g, patches);
     return fvm::div(phi.internal, phi.boundary, vf,
                     ls::limitedLinearWeights(phi.internal, vf, gradVf, limiterCoeff, m, g),
                     m, patches);
@@ -377,7 +388,8 @@ void correct(
     // ---- production, from the CURRENT nut (the previous outer iteration's correctNut) -------------
     // fvc::grad(U) through the case's grad(U) scheme (kOmegaSSTBase.C:522): cellLimited where fvSchemes
     // says so. Unlimited here, naca0012 read omega 5.4e-03 / nut 1.2e-03 against OpenFOAM at t = 1.
-    std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+    std::vector<tensor> gradU = co.gradULeastSq ? fvc::leastSquaresGrad(U, m, g, patches)
+                                               : fvc::gaussGrad(U, m, g, patches);
     if (co.gradULimitK > 0.0) cellLimitGrad(gradU, U, co.gradULimitK, m, g, patches);
     const std::vector<scalar> s2  = S2(gradU);
     const std::vector<scalar> gb0 = GbyNu0(gradU);
@@ -514,8 +526,19 @@ void correct(
 
     // ---- CDkOmega, F1, F2 ------------------------------------------------------------------------
     // The case's gradScheme on each, as OpenFOAM resolves grad(k) and grad(omega) separately.
-    std::vector<vector> gradK  = fvc::gaussGrad(k, m, g, patches);
-    std::vector<vector> gradOm = fvc::gaussGrad(omega, m, g, patches);
+    // The base scheme first -- fvc::grad(k_) and fvc::grad(omega_) through the case's `grad(k)` and
+    // `grad(omega)` entries (fvcGrad.C:149), Gauss linear or leastSquares -- from each field's STORED
+    // patch values, then the cellLimited coefficient on top of either, as cellLimitedGrad wraps any base.
+    std::vector<std::vector<scalar>> kbv(patches.size()), obv(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        kbv[pi] = k.boundary[pi]->value();
+        obv[pi] = omega.boundary[pi]->value();
+    }
+    std::vector<vector> gradK  = co.gradKLeastSq ? fvc::leastSquaresGrad(k.internal, kbv, m, g, patches)
+                                                 : fvc::gaussGrad(k.internal, kbv, m, g, patches);
+    std::vector<vector> gradOm = co.gradKLeastSq ? fvc::leastSquaresGrad(omega.internal, obv, m, g, patches)
+                                                 : fvc::gaussGrad(omega.internal, obv, m, g, patches);
     if (co.gradKLimitK > 0.0)
     {
         cellLimitGrad(gradK,  k,     co.gradKLimitK, m, g, patches);
@@ -590,7 +613,8 @@ void correct(
             omega.boundary[pi]->updateFromFlux(phi.boundary[pi]);
         }
 
-        FvScalarMatrix M = divWithScheme(phi, omega, limitedLinear, limiterCoeff, m, g, patches);
+        FvScalarMatrix M = divWithScheme(phi, omega, limitedLinear, limiterCoeff, m, g, patches,
+                                         co.gradKLimitK, co.gradKLeastSq);
         {
             // The laplacian with BOTH halves of `corrected`, then subtracted from the equation. The
             // explicit correction goes into the LAPLACIAN's own source first, so the -1.0 below carries
@@ -600,7 +624,8 @@ void correct(
             {
                 std::vector<std::vector<scalar>> vb(patches.size());
                 for (std::size_t pi = 0; pi < patches.size(); ++pi) vb[pi] = omega.boundary[pi]->value();
-                std::vector<vector> gradVf = fvc::gaussGrad(omega.internal, vb, m, g, patches);   // grad(omega)'s own scheme
+                std::vector<vector> gradVf = co.gradKLeastSq ? fvc::leastSquaresGrad(omega.internal, vb, m, g, patches)
+                                                             : fvc::gaussGrad(omega.internal, vb, m, g, patches);   // grad(omega)'s own scheme
                 if (co.gradKLimitK > 0.0) cellLimitGrad(gradVf, omega.internal, vb, co.gradKLimitK, m, g, patches);
                 const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
                     Df, omega, gradVf, m, g, patches, snGradLimitCoeff);
@@ -723,7 +748,8 @@ void correct(
             k.boundary[pi]->updateFromFlux(phi.boundary[pi]);
         }
 
-        FvScalarMatrix M = divWithScheme(phi, k, limitedLinear, limiterCoeff, m, g, patches);
+        FvScalarMatrix M = divWithScheme(phi, k, limitedLinear, limiterCoeff, m, g, patches,
+                                         co.gradKLimitK, co.gradKLeastSq);
         {
             // The laplacian with BOTH halves of `corrected`, then subtracted from the equation. The
             // explicit correction goes into the LAPLACIAN's own source first, so the -1.0 below carries
@@ -733,7 +759,8 @@ void correct(
             {
                 std::vector<std::vector<scalar>> vb(patches.size());
                 for (std::size_t pi = 0; pi < patches.size(); ++pi) vb[pi] = k.boundary[pi]->value();
-                std::vector<vector> gradVf = fvc::gaussGrad(k.internal, vb, m, g, patches);   // grad(k)'s own scheme
+                std::vector<vector> gradVf = co.gradKLeastSq ? fvc::leastSquaresGrad(k.internal, vb, m, g, patches)
+                                                             : fvc::gaussGrad(k.internal, vb, m, g, patches);   // grad(k)'s own scheme
                 if (co.gradKLimitK > 0.0) cellLimitGrad(gradVf, k.internal, vb, co.gradKLimitK, m, g, patches);
                 const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
                     Df, k, gradVf, m, g, patches, snGradLimitCoeff);

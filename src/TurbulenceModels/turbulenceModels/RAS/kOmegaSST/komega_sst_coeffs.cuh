@@ -21,7 +21,19 @@ struct KOmegaSSTCoeffs
     // `cellLimited Gauss linear 1` for both while squareBend leaves them at the unlimited default, so a
     // fixture with only the latter cannot tell the two apart. 0 = unlimited.
     scalar gradKLimitK = 0.0;
+    // The SCHEME those two entries name, when it is not Gauss: `leastSquares` (OpenFOAM's inverse-distance
+    // least-squares fit, leastSquaresGrad.C), which the case gasMixing/injectorPipe and validation/rhoSST's
+    // leastSquares variant set as `default`. Both fields carry one flag, as they carry one cellLimited
+    // coefficient; a cellLimited <k> on top of it still applies, as cellLimitedGrad wraps any base scheme.
+    bool   gradKLeastSq = false;
     scalar gradULimitK = 0.0;   // grad(U) cellLimited <k>: fvc::grad(U) in S2/GbyNu0 (kOmegaSSTBase.C:522) and correctNut (:132)
+    // grad(U)'s BASE scheme, when the case's gradSchemes resolve it to leastSquares rather than Gauss
+    // linear (the cellLimited coefficient above applies on top of either). fvc::grad(U) is taken by the
+    // closure's production (kOmegaSSTBase.C:522, kEpsilon.C:237) and correctNut; a `default leastSquares`
+    // reaches it, and the shared parser used to WARN and run Gauss (scheme_parse.cuh: "approximated as
+    // Gauss linear"). Measured on validation/rhoSST restarted from OpenFOAM's iteration 5 under
+    // `default leastSquares` with everything else exact: U 3.1e-05, k 2.4e-04, nut 1.3e-03 at iteration 6.
+    bool   gradULeastSq = false;
     // The gradient `linearUpwind <name>` NAMES on div(phi,k)/div(phi,omega) -- OpenFOAM builds the
     // correction from mesh.gradScheme(<name>) (linearUpwind.C:61-68), which is NOT grad(k)/grad(omega):
     // squareBendLiq's `linearUpwind limited` resolves to `cellLimited Gauss linear 1` beside an

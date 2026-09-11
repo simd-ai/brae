@@ -310,6 +310,20 @@ TurbulenceHookOptions buildTurbulenceHookOptions(
     opt.co.snGradLimitCoeff   = hin.snGradLimitCoeff;
     opt.co.gradULimitK        = hin.gradULimitK;
     opt.co.gradKLimitK        = hin.gradKLimitK;
+    // grad(k)/grad(omega|epsilon) resolving to leastSquares runs on the HOST arm (fvc::leastSquaresGrad in
+    // both closures, gated against OpenFOAM on validation/rhoSST); the device closures compute the Gauss
+    // gradient only, and deviceLeastSquaresGrad is not wired into them yet. Running the case here would
+    // build CDkOmega and the laplacian corrections from a different discretisation under the case's own
+    // scheme name -- refused, until that module is ported and gated on its own.
+    if (hin.gradKLeastSq || hin.gradULeastSq || hin.gradPLeastSq)
+        throw std::runtime_error(
+            std::string("rhoSimpleFoam (OF-mirror, CUDA): gradSchemes resolve ") +
+            (hin.gradKLeastSq ? std::string("grad(k)/grad(") + (hf.rasModel == "kOmegaSST" ? "omega" : "epsilon") + ") " : "") +
+            (hin.gradULeastSq ? "grad(U) " : "") + (hin.gradPLeastSq ? "grad(p) " : "") +
+            "to `leastSquares`, which this arm computes nowhere yet: its closures, momentum gradients and "
+            "pressure gradient take Gauss linear, optionally cellLimited. The host arm runs it "
+            "(BRAE_RHOSIMPLEFOAM_MIRROR=1). Refusing rather than running a different gradient under the "
+            "case's scheme name.");
     // kOmegaSST: the model flag and its own coefficients, from the same host parse the host arm reads.
     // The second-scalar buffers carry omega when this is set -- see createFields.
     opt.sst   = (hf.rasModel == "kOmegaSST");

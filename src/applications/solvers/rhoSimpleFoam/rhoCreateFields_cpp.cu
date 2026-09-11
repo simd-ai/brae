@@ -1080,7 +1080,12 @@ RhoSimpleFields createFields(
         {
             const std::vector<scalar> y     = cellWallDist(m, g, patches);
             // validate()'s correctNut takes fvc::grad(U) through the case's grad(U) scheme (kOmegaSSTBase.C:132).
-            std::vector<tensor> gradU = fvc::gaussGrad(f.U, m, g, patches);
+            // grad(U)'s own gradSchemes entry, base scheme then limiter -- the same resolution the step
+            // makes (rhoSimpleFoamDriver_cpp.cu). The shared parser only WARNS on leastSquares and hands
+            // out the Gauss coefficient, so the base scheme is read from parseFieldGradScheme here too.
+            const bool gradULsq = parseFieldGradScheme(caseDir, "U").leastSquares;
+            std::vector<tensor> gradU = gradULsq ? fvc::leastSquaresGrad(f.U, m, g, patches)
+                                                 : fvc::gaussGrad(f.U, m, g, patches);
             {
                 DeviceSimpleControls sctl;
                 parseFvSchemesControls(caseDir, sctl);

@@ -222,7 +222,8 @@ ConsistentPressureStages consistentPressurePredictor(
     }
 
     // HbyA -= (rAU - rAtU)*fvc::grad(p), both branches.
-    const std::vector<vector> gradP = fvc::gaussGrad(p, m, g, patches);
+    const std::vector<vector> gradP = in.gradPLeastSq ? fvc::leastSquaresGrad(p, m, g, patches)
+                                                       : fvc::gaussGrad(p, m, g, patches);
     st.HbyA = st.HbyA0;
     for (label c = 0; c < nC; ++c)
     {
@@ -279,7 +280,8 @@ FvScalarMatrix assemblePcEqn(
     {
         std::vector<std::vector<scalar>> pb(patches.size());
         for (std::size_t pi = 0; pi < patches.size(); ++pi) pb[pi] = p.boundary[pi]->value();
-        const std::vector<vector> gradP = fvc::gaussGrad(p.internal, pb, m, g, patches);
+        const std::vector<vector> gradP = in.gradPLeastSq ? fvc::leastSquaresGrad(p.internal, pb, m, g, patches)
+                                                           : fvc::gaussGrad(p.internal, pb, m, g, patches);
         const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
             gammaf, p, gradP, m, g, patches, in.snGradLimitCoeff);
         for (label c = 0; c < nC; ++c) M.source[c] -= corr[c];

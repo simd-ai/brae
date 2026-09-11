@@ -34,11 +34,13 @@ std::vector<vector> divDevReffExplicit(
     const PrimitiveMesh&          m,
     const FvGeometry&             g,
     const std::vector<FvPatch>&   patches,
-    scalar                        gradULimitK)
+    scalar                        gradULimitK,
+    bool                          gradULeastSq)
 {
     // fvc::grad(U) -- cell tensors, then the boundary tensors with OpenFOAM's gaussGrad boundary
     // correction (wall-normal component replaced by snGrad(U)).
-    std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+    std::vector<tensor> gradU = gradULeastSq ? fvc::leastSquaresGrad(U, m, g, patches)
+                                             : fvc::gaussGrad(U, m, g, patches);
     // The case's gradScheme, applied to the SAME gradient the dev2 term is built from. OpenFOAM resolves
     // fvc::grad(U) here against gradSchemes/grad(U); running the unlimited base scheme where the case
     // names `cellLimited Gauss linear 1` is a different discretisation under the case's own scheme name.
@@ -86,7 +88,8 @@ void addDivDevReff(
     const std::vector<FvPatch>&   patches,
     bool                          correctedLaplacian,
     scalar                        snGradLimitCoeff,
-    scalar                        gradULimitK)
+    scalar                        gradULimitK,
+    bool                          gradULeastSq)
 {
     // Implicit half: OpenFOAM writes `- fvm::laplacian(nuEff, U)` inside divDevReff, and UEqn.H adds
     // divDevReff to the equation -- so the laplacian enters with coefficient -1.
@@ -111,7 +114,8 @@ void addDivDevReff(
         // Gauss linear 1 on aerofoilNACA0012. Measured there at iteration 1 with the unlimited gradient:
         // the momentum source on the 120 aerofoil-adjacent cells 2.36e-05 against OpenFOAM's, with the
         // gradient, the dev2 term, the diagonal and the off-diagonals all exact (queue item 25).
-        std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+        std::vector<tensor> gradU = gradULeastSq ? fvc::leastSquaresGrad(U, m, g, patches)
+                                             : fvc::gaussGrad(U, m, g, patches);
         if (gradULimitK > 0.0) cellLimitGrad(gradU, U, gradULimitK, m, g, patches);
         const std::vector<vector> corr =
             fvm::laplacianNonOrthSource<vector, tensor>(gammaf, U, gradU, m, g, patches,
@@ -135,7 +139,7 @@ void addDivDevReff(
     // tests/test_divdevreff_cpp.cu pins the result against an OpenFOAM dump; do not "simplify" the signs
     // here without re-running it.
     const std::vector<vector> expl =
-        divDevReffExplicit(U, nuEff, nuEffBnd, m, g, patches, gradULimitK);
+        divDevReffExplicit(U, nuEff, nuEffBnd, m, g, patches, gradULimitK, gradULeastSq);
     const std::vector<scalar>& V = g.V();
     for (std::size_t c = 0; c < expl.size(); ++c)
     {

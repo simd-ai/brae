@@ -301,7 +301,8 @@ FvScalarMatrix assemblePEqn(
     {
         std::vector<std::vector<scalar>> pb(patches.size());
         for (std::size_t pi = 0; pi < patches.size(); ++pi) pb[pi] = p.boundary[pi]->value();
-        const std::vector<vector> gradP = fvc::gaussGrad(p.internal, pb, m, g, patches);
+        const std::vector<vector> gradP = in.gradPLeastSq ? fvc::leastSquaresGrad(p.internal, pb, m, g, patches)
+                                                           : fvc::gaussGrad(p.internal, pb, m, g, patches);
         const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
             st.rhorAUf, p, gradP, m, g, patches, in.snGradLimitCoeff);
         for (label c = 0; c < nC; ++c) M.source[c] -= corr[c];

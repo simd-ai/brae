@@ -560,6 +560,8 @@ Residuals rhoSimpleStep(
     uin.scheme             = in.schemeU;
     uin.schemeCoeff        = in.schemeCoeffU;
     uin.gradULimitK        = in.gradULimitK;
+    uin.gradULeastSq       = in.gradULeastSq;
+    uin.gradPLeastSq       = in.gradPLeastSq;
     uin.gradULULimitK      = in.gradULULimitK;
     uin.correctedLaplacian = in.correctedLaplacian;
     uin.snGradLimitCoeff   = in.snGradLimitCoeff;
@@ -595,7 +597,7 @@ Residuals rhoSimpleStep(
         // solve(UEqn == -fvc::grad(p)) on a COPY: the pressure equation needs the ORIGINAL UEqn for
         // A(), H() and H1(), and addPressureGradient would otherwise leave the source carrying -grad(p).
         FvVectorMatrix Mp = UEqn;
-        addPressureGradient(Mp, f.p, m, g, patches);
+        addPressureGradient(Mp, f.p, m, g, patches, in.gradPLeastSq);
         // fvMatrix<vector>::solveSegregated solves only the components polyMesh::solutionD() leaves
         // valid (fvMatrixSolve.C:157-164) -- on a 2D case the empty direction is never solved and its
         // SolverPerformance stays at Zero -- and what residualControl compares is cmptMax over the
@@ -772,6 +774,7 @@ Residuals rhoSimpleStep(
     pin.pRefCell             = f.pressureControl.refCell;
     pin.pRefValue            = f.pressureControl.refValue;
     pin.correctedLaplacian   = in.correctedLaplacian;
+    pin.gradPLeastSq = in.gradPLeastSq;
     pin.snGradLimitCoeff     = in.snGradLimitCoeff;
     pin.hasMRF               = in.hasMRF;
     pin.hasFvOptions         = in.hasFvOptions;
@@ -921,7 +924,8 @@ Residuals rhoSimpleStep(
 
     // U = HbyA - rAtU*fvc::grad(p), with rAtU on the SIMPLEC path and rAU otherwise.
     {
-        const std::vector<vector> gradP = fvc::gaussGrad(f.p, m, g, patches);
+        const std::vector<vector> gradP = in.gradPLeastSq ? fvc::leastSquaresGrad(f.p, m, g, patches)
+                                                          : fvc::gaussGrad(f.p, m, g, patches);
         for (label c = 0; c < nC; ++c)
         {
             f.U.internal[c] = vector{ HbyA[c].x - rAUorAtU[c]*gradP[c].x,
@@ -1125,7 +1129,9 @@ Residuals rhoSimpleStep(
             // The case's gradSchemes for grad(k)/grad(omega), which CDkOmega and therefore F1 depend on.
             KOmegaSSTCoeffs sco = f.sstCoeffs;   // the CASE's, read with keCoeffs in createFields
             sco.gradKLimitK      = in.gradKLimitK;
+            sco.gradKLeastSq     = in.gradKLeastSq;
             sco.gradULimitK      = in.gradULimitK;   // grad(U) for S2/GbyNu0
+            sco.gradULeastSq     = in.gradULeastSq;
             // linearUpwind's NAMED gradient, resolved by the driver -- not grad(k)/grad(omega).
             if (in.linearUpwindTurb) sco.luGradLimitK = in.turbLUGradK;
 
@@ -1264,7 +1270,9 @@ Residuals rhoSimpleStep(
         keco.correctedLaplacian = in.correctedLaplacian;
         keco.snGradLimitCoeff   = in.snGradLimitCoeff;
         keco.gradULimitK        = in.gradULimitK;   // grad(U) for the production
+        keco.gradULeastSq       = in.gradULeastSq;
         keco.gradKLimitK        = in.gradKLimitK;   // grad(k)/grad(epsilon) for the laplacian corrections
+        keco.gradKLeastSq       = in.gradKLeastSq;
 
         sd.scalars("kIn", f.k.internal);
         sd.scalars("epsIn", f.epsilon.internal);

@@ -114,6 +114,8 @@ struct StepInput
     bool      limGradHeLeastSq = false;
     bool      limGradKELeastSq = false;
     scalar    gradULimitK      = 0.0;
+    bool      gradULeastSq     = false;   // grad(U)'s base scheme is leastSquares (see RhoMomentumInput)
+    bool      gradPLeastSq     = false;   // grad(p)'s
     // The gradient `linearUpwind <name>` / `linearUpwindV <name>` NAMES in div(phi,U) -- OpenFOAM's
     // mesh.gradScheme(<name>) (linearUpwind.C:61-68) -- which is a different lookup from grad(U)'s own
     // scheme above (divDevRhoReff's fvc::grad(U), correctedSnGrad's correction). -1 = not resolved: the
@@ -167,6 +169,7 @@ struct StepInput
     // 1263); relaxMatrix at 1.0 still applies the dominance clamp, which is a different matrix.
     bool   relaxEquationOmega = true;
     scalar gradKLimitK       = 0.0;   // gradSchemes/grad(k) and grad(omega), for CDkOmega and F1
+    bool   gradKLeastSq      = false; // ...and whether that scheme is leastSquares rather than Gauss linear
     // ONE scheme for div(phi,k) and div(phi,epsilon|omega), whichever model the case names -- the
     // harness refuses a case whose two entries disagree. The coefficient is the RAW k of
     // `limitedLinear k` (the weights functions compute twoByk themselves, scheme_parse.cuh).

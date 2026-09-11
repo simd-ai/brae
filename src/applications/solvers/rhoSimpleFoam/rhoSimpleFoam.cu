@@ -1014,6 +1014,13 @@ Residuals rhoSimpleStep(
     for (label corr = 1; corr <= nCorr; ++corr)
     {
         PressureMatrix& P = w.P;                          // persistent -- see RhoSolverWorkspace
+        // Every OpenFOAM solve ends with psi.correctBoundaryConditions() (fvMatrixSolve.C:242), so the
+        // second corrector onward assembles from p's boundary as the PREVIOUS corrector's solve left it
+        // -- the host reference's `if (corr > 0) f.p.evaluateBoundary()`. The first corrector keeps
+        // the value the previous iteration's p.relax() left (the totalPressure-only refresh above).
+        // Missing this, the stored value handed to the assembly (pin.pBndFace) was the pre-loop one for
+        // every corrector: rho_nonorth_corrector_vs_openfoam (sbMatched, nNonOrthogonalCorrectors 2) red.
+        if (corr > 1) deviceBCValue(dbP, f.p, f.pBnd);
         if (in.consistent) assemblePcEqn(P, cst, dm, dbP, f.p, pin);
         else               assemblePEqn(P, st, dm, dbP, f.p, pin);
 

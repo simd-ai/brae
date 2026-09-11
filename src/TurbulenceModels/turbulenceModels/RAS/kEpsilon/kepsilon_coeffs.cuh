@@ -38,7 +38,19 @@ struct KEpsilonCoeffs
     // OWN grad scheme). 0 = unlimited. Measured on naca0012 (`limited cellLimited Gauss linear 1` on all
     // three) with these unlimited: k 3.3e-04, omega 5.4e-03, nut 1.2e-03 against OpenFOAM at t = 1.
     scalar gradULimitK = 0.0;
+    // grad(U)'s BASE scheme, when the case's gradSchemes resolve it to leastSquares rather than Gauss
+    // linear (the cellLimited coefficient above applies on top of either). fvc::grad(U) is taken by the
+    // closure's production (kOmegaSSTBase.C:522, kEpsilon.C:237) and correctNut; a `default leastSquares`
+    // reaches it, and the shared parser used to WARN and run Gauss (scheme_parse.cuh: "approximated as
+    // Gauss linear"). Measured on validation/rhoSST restarted from OpenFOAM's iteration 5 under
+    // `default leastSquares` with everything else exact: U 3.1e-05, k 2.4e-04, nut 1.3e-03 at iteration 6.
+    bool   gradULeastSq = false;
     scalar gradKLimitK = 0.0;
+    // The SCHEME those two entries name, when it is not Gauss: `leastSquares` (OpenFOAM's inverse-distance
+    // least-squares fit, leastSquaresGrad.C), which the case gasMixing/injectorPipe and validation/rhoSST's
+    // leastSquares variant set as `default`. Both fields carry one flag, as they carry one cellLimited
+    // coefficient; a cellLimited <k> on top of it still applies, as cellLimitedGrad wraps any base scheme.
+    bool   gradKLeastSq = false;
     bool   correctedLaplacian = false;
     scalar snGradLimitCoeff   = 0.0;    // `limited <k> corrected`; 0 = unlimited
     // realizableKE (OF RAS/realizableKE): variable Cmu (rCmu from strain invariants), strain-based eps production

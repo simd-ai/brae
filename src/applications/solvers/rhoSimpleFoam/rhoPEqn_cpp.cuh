@@ -62,6 +62,12 @@ namespace rhoSimple {
 
 struct PressureInput
 {
+    // grad(p)'s BASE scheme, from the case's gradSchemes entry (fvcGrad.C:149 resolves `grad(p)`):
+    // leastSquares rather than Gauss linear. OpenFOAM's pressure step takes fvc::grad(p) in SIMPLEC's
+    // `HbyA -= (rAU - rAtU)*fvc::grad(p)` (pcEqn.H:30,65) and in each branch's non-orthogonal correction;
+    // the velocity correction `U = HbyA - rAtU*fvc::grad(p)` (pEqn.H:86, pcEqn.H:99) is the step's own.
+    bool gradPLeastSq = false;
+
     const std::vector<scalar>*              rho    = nullptr;   // cells
     const std::vector<std::vector<scalar>>* rhoBnd = nullptr;
     const std::vector<scalar>*              psi    = nullptr;   // cells

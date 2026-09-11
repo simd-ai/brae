@@ -78,6 +78,12 @@ PYEOF
     ( cd "$d" && postProcess -func "grad(T)" -time 1 > log.pp 2>&1 ) \
         || { tail -5 "$d/log.pp"; echo "FAIL: postProcess grad(T) ($sc)"; exit 1; }
     [ -f "$d/1/grad(T)" ] || { echo "FAIL: no grad(T) written ($sc)"; exit 1; }
+    # ...and the VECTOR form. grad(U) is a volTensorField and its own arm: lsGrad_ij = ownLs_i*deltaVsf_j,
+    # a different expression from the scalar one, with its own consumers (divDevRhoReff's dev2 term and
+    # the closure's production). It had no oracle until those consumers existed.
+    ( cd "$d" && postProcess -func "grad(U)" -time 1 > log.ppU 2>&1 ) \
+        || { tail -5 "$d/log.ppU"; echo "FAIL: postProcess grad(U) ($sc)"; exit 1; }
+    [ -f "$d/1/grad(U)" ] || { echo "FAIL: no grad(U) written ($sc)"; exit 1; }
 done
 
 MATCH="$MATCH" DIFFER="$DIFFER" DEVHOST="$DEVHOST" python3 - "$BIN" "$W" <<'PYEOF' || fail=1
@@ -85,8 +91,8 @@ import os, subprocess, sys
 BIN, W = sys.argv[1], sys.argv[2]
 MATCH, DIFFER, DEVHOST = (float(os.environ[k]) for k in ('MATCH', 'DIFFER', 'DEVHOST'))
 
-def run(case):
-    out = subprocess.run([BIN, os.path.join(W, case), '1', 'T'], capture_output=True, text=True)
+def run(case, field='T'):
+    out = subprocess.run([BIN, os.path.join(W, case), '1', field], capture_output=True, text=True)
     if out.returncode != 0:
         print(out.stdout, out.stderr); sys.exit(1)
     v = {}
@@ -97,6 +103,7 @@ def run(case):
     return v
 
 lsq, gauss = run('lsq'), run('gauss')
+lsqU, gaussU = run('lsq', 'U'), run('gauss', 'U')
 ok = True
 def check(label, got, bound, want_below):
     global ok
@@ -111,8 +118,87 @@ check('CONTROL brae leastSquares vs OpenFOAM Gauss linear', lsq['gaussLinear'], 
 check('CONTROL brae gaussGrad vs OpenFOAM leastSquares', gauss['leastSquares'], DIFFER, False)
 check('device leastSquares vs OpenFOAM leastSquares',    lsq['device lsq'],    MATCH,  True)
 check('device leastSquares vs its own host reference',   lsq['device-host'],   DEVHOST, True)
+# The VECTOR form, against OpenFOAM's own grad(U), with the same 2x2. No device twin: the CUDA mirror
+# arm refuses a leastSquares grad(U) by name (rhoSimpleFoamDriver.cu) until that module is ported.
+check('brae leastSquares grad(U) vs OpenFOAM leastSquares',      lsqU['leastSquares'],  MATCH,  True)
+check('brae gaussGrad    grad(U) vs OpenFOAM Gauss linear',      gaussU['gaussLinear'], MATCH,  True)
+check('CONTROL brae leastSquares grad(U) vs OpenFOAM Gauss linear', lsqU['gaussLinear'], DIFFER, False)
+check('CONTROL brae gaussGrad grad(U) vs OpenFOAM leastSquares', gaussU['leastSquares'], DIFFER, False)
 sys.exit(0 if ok else 1)
 PYEOF
+
+# ---- ARM 2: a mesh whose BOUNDARY FACES ARE SKEWED ---------------------------------------------------
+# Everything above runs on validation/rhoSST, an orthogonal blockMesh, and an orthogonal mesh CANNOT SEE
+# the defect this arm exists for. fvPatch::delta() on an uncoupled patch is the patch-normal projection
+# `nHat*(nHat & (Cf() - Cn()))` (fvPatch.C), which leastSquaresVectors uses for both the dd accumulation
+# and the boundary fit vectors. brae used the raw Cf - Cn. The two are the SAME VECTOR wherever Cf - Cn is
+# already normal to the face -- every orthogonal blockMesh -- so rhoSST read 2.5e-13 and this gate passed
+# green while the code was wrong, on host and device alike.
+#
+# MEASURED, brae's leastSquares grad(p) against OpenFOAM's own, same case, same scheme:
+#     validation/pitzDaily          raw Cf-Cn 1.18e-01   projected 1.8e-12   <- discriminates
+#     validation/squareBend         raw 4.6e-15          projected 4.2e-15   <- cannot tell them apart
+#     validation/windAroundBuildings raw 3.7e-15         projected 3.4e-15   <- cannot tell them apart
+# Two of the three candidate fixtures are useless as a gate for this, which is the whole reason it hid.
+# It was found end to end on gasMixing/injectorPipe's snappyHexMesh mesh (grad(p) 5.8e-02, 90% of the
+# squared error in 77 of 74650 cells, every one touching a boundary) and pitzDaily is the committed
+# fixture that reproduces it in 12225 cells.
+PD="$W/pitz"
+rm -rf "$PD"; mkdir -p "$PD"
+cp -r "$ROOT/validation/pitzDaily/constant" "$ROOT/validation/pitzDaily/system" "$PD/"
+cp -r "$ROOT/validation/pitzDaily/0" "$PD/0"
+python3 - "$PD" <<'PYEOF'
+import os, re, sys
+d = sys.argv[1]
+f = os.path.join(d, 'system/fvSchemes'); s = open(f).read()
+s = re.sub(r'gradSchemes\s*\{[^}]*\}', 'gradSchemes { default leastSquares; }', s, flags=re.S)
+open(f, 'w').write(s)
+c = os.path.join(d, 'system/controlDict'); s = open(c).read()
+s = re.sub(r'\bfunctions\s*\{.*\}\s*$', '', s, flags=re.S)
+# five iterations, so p is NONUNIFORM: at time 0 it is uniform and OpenFOAM writes grad(p) as
+# `uniform (0 0 0)`, which is a zero-denominator oracle that reports 0 for any brae field at all.
+for k, v in (('writeFormat','ascii'), ('writePrecision','15'), ('writeCompression','off'),
+             ('endTime','5'), ('writeInterval','5'), ('writeControl','timeStep'),
+             ('startFrom','startTime'), ('startTime','0'), ('deltaT','1')):
+    s = re.sub(r'\b%s\s+[^;]*;' % k, '%s %s;' % (k, v), s) if re.search(r'\b%s\s+' % k, s) else s + '\n%s %s;\n' % (k, v)
+open(c, 'w').write(s)
+p = os.path.join(d, 'system/fvSolution'); s = open(p).read()
+s = re.sub(r'residualControl\s*\{[^}]*\}', '', s); open(p, 'w').write(s)
+PYEOF
+if ( cd "$PD" && simpleFoam > log.simpleFoam 2>&1 ) && [ -d "$PD/5" ] \
+   && ( cd "$PD" && postProcess -func "grad(p)" -time 5 > log.pp 2>&1 ) \
+   && grep -q nonuniform "$PD/5/grad(p)"
+then
+    MATCH="$MATCH" DIFFER="$DIFFER" python3 - "$BIN" "$PD" <<'PYEOF' || fail=1
+import os, subprocess, sys
+BIN, PD = sys.argv[1], sys.argv[2]
+MATCH, DIFFER = float(os.environ['MATCH']), float(os.environ['DIFFER'])
+out = subprocess.run([BIN, PD, '5', 'p'], capture_output=True, text=True)
+if out.returncode != 0:
+    print(out.stdout, out.stderr); sys.exit(1)
+v = {}
+for line in out.stdout.splitlines():
+    q = line.split()
+    if len(q) >= 3 and q[-2] == 'relL2':
+        v[' '.join(q[:-2])] = float(q[-1])
+ok = True
+def check(label, got, bound, below):
+    global ok
+    good = (got < bound) if below else (got > bound)
+    print('     %-56s %.4e  (%s %.1e)  %s'
+          % (label, got, '<' if below else '>', bound, 'ok' if good else 'FAIL'))
+    ok = ok and good
+check('pitzDaily: brae leastSquares vs OpenFOAM leastSquares', v['leastSquares'], MATCH, True)
+check('pitzDaily: device leastSquares vs OpenFOAM leastSquares', v['device lsq'], MATCH, True)
+# The CONTROL. Without it this arm would pass on a brae whose leastSquares had silently become Gauss.
+check('pitzDaily CONTROL brae gaussGrad vs OpenFOAM leastSquares', v['gaussLinear'], DIFFER, False)
+sys.exit(0 if ok else 1)
+PYEOF
+    say "leastSquares holds on a mesh with SKEWED boundary faces (fvPatch::delta projection)" \
+        "$([ $fail = 0 ] && echo ok || echo FAIL)"
+else
+    echo "     pitzDaily arm: simpleFoam or postProcess did not produce a nonuniform grad(p) -- SKIPPED"
+fi
 
 say "leastSquares reproduces OpenFOAM's own gradient, on host and device" "$([ $fail = 0 ] && echo ok || echo FAIL)"
 exit $fail

@@ -31,7 +31,16 @@ FvVectorMatrix divWithScheme(
 
         case DivScheme::limitedLinearV:
         {
-            const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+            // limitedLinearV's limiter is built from fvc::grad(lPhi) with lPhi = U itself:
+            // makeLimitedVSurfaceInterpolationScheme instantiates the V form with limitFuncs::null
+            // (LimitedScheme.H:203), so `grad(U)` is what LimitedScheme.C:51-55 resolves -- the field's own
+            // gradSchemes entry, base scheme AND cellLimited coefficient. This took the unlimited gradient
+            // whatever the case said; the DEVICE arm has applied the limiter all along and the divergence
+            // was recorded as open. gasMixing/injectorPipe is exactly the case that separates them
+            // (`div(phi,U) Gauss limitedLinearV 1` beside `grad(U) cellLimited Gauss linear 0.99`).
+            std::vector<tensor> gradU = in.gradULeastSq ? fvc::leastSquaresGrad(U, m, g, patches)
+                                                        : fvc::gaussGrad(U, m, g, patches);
+            if (in.gradULimitK > 0.0) cellLimitGrad(gradU, U, in.gradULimitK, m, g, patches);
             return fvm::div(*in.phi, *in.phiBnd, U,
                             ls::limitedLinearVWeights(*in.phi, U, gradU, in.schemeCoeff, m, g),
                             m, patches);
@@ -165,7 +174,8 @@ FvVectorMatrix assembleUEqn(
     const scalar luGradK = (in.gradULULimitK >= 0.0) ? in.gradULULimitK : in.gradULimitK;
     if (in.scheme == DivScheme::linearUpwindV)
     {
-        std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+        std::vector<tensor> gradU = in.gradULeastSq ? fvc::leastSquaresGrad(U, m, g, patches)
+                                                        : fvc::gaussGrad(U, m, g, patches);
         cellLimitGrad(gradU, U, luGradK, m, g, patches);
         const std::vector<vector> corr =
             limitedSchemes::linearUpwindVCorrection(*in.phi, U, gradU, m, g);
@@ -179,7 +189,8 @@ FvVectorMatrix assembleUEqn(
     const scalar corrFac = correctionFactor(in);
     if (corrFac != 0.0)
     {
-        std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+        std::vector<tensor> gradU = in.gradULeastSq ? fvc::leastSquaresGrad(U, m, g, patches)
+                                                        : fvc::gaussGrad(U, m, g, patches);
         cellLimitGrad(gradU, U, luGradK, m, g, patches);
         const std::vector<vector> corr =
             fvm::linearUpwindCorrection<vector, tensor>(*in.phi, gradU, m, g);
@@ -221,7 +232,7 @@ FvVectorMatrix assembleUEqn(
         muEffBnd = &muEffBndOwned;
     }
     addDivDevReff(M, U, *muEff, *muEffBnd, m, g, patches, in.correctedLaplacian, in.snGradLimitCoeff,
-                  in.gradULimitK);
+                  in.gradULimitK, in.gradULeastSq);
 
     // == fvOptions(rho, U). rhoSimpleFoam's momentum equation is in FORCE units, which is what selects
     // fixedCoeff's rhoRef branch over the kinematic one.
@@ -279,13 +290,16 @@ void addPressureGradient(
     const GeometricField<scalar>& p,
     const PrimitiveMesh&          m,
     const FvGeometry&             g,
-    const std::vector<FvPatch>&   patches)
+    const std::vector<FvPatch>&   patches,
+    bool                          leastSquares)
 {
     // solve(UEqn == -fvc::grad(p)). The right-hand side of an fvMatrix equation is its source, and
     // fvc::grad returns a per-volume quantity, so the extensive form is -grad(p)*V. p is the ABSOLUTE
     // pressure here, not the kinematic p/rho the incompressible solver carries, which is why this term
     // needs no rho: it is already a force per unit volume.
-    const std::vector<vector> gradP = fvc::gaussGrad(p, m, g, patches);
+    // through the case's grad(p) entry (fvcGrad.C:149): leastSquares where it says so
+    const std::vector<vector> gradP = leastSquares ? fvc::leastSquaresGrad(p, m, g, patches)
+                                                   : fvc::gaussGrad(p, m, g, patches);
     for (label c = 0; c < m.nCells(); ++c)
     {
         UEqn.source[c].x -= gradP[c].x * g.V()[c];
