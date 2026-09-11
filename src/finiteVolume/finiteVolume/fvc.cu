@@ -273,7 +273,8 @@ std::vector<vector> leastSquaresGrad(
 }
 
 std::vector<tensor> gaussGrad(
-    const GeometricField<vector>& U,
+    const std::vector<vector>& internal,
+    const std::vector<std::vector<vector>>& boundary,
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& patches)
@@ -287,7 +288,7 @@ std::vector<tensor> gaussGrad(
     std::vector<tensor> grad(nC, tensor{0,0,0,0,0,0,0,0,0});
     for (label f = 0; f < nIf; ++f)
     {
-        const vector Uf = w[f] * U.internal[own[f]] + (1.0 - w[f]) * U.internal[nei[f]];
+        const vector Uf = w[f] * internal[own[f]] + (1.0 - w[f]) * internal[nei[f]];
         const tensor SfUf = outer(Sf[f], Uf);
         grad[own[f]] += SfUf;
         grad[nei[f]] = grad[nei[f]] - SfUf;
@@ -296,13 +297,25 @@ std::vector<tensor> gaussGrad(
     {
         const FvPatch& fp = patches[pi];
         if (fp.type == "empty") continue;   // emptyFvPatch::size() == 0: never in OpenFOAM's sum (item 36c)
-        const std::vector<vector>& uv = U.boundary[pi]->value();
+        const std::vector<vector>& uv = boundary[pi];
         for (label i = 0; i < fp.size; ++i)
             grad[fp.faceCells[i]] += outer(Sf[fp.start + i], uv[i]);
     }
     for (label c = 0; c < nC; ++c)
         grad[c] = grad[c] / g.V()[c];
     return grad;
+}
+
+// ...and the field form, which is the array form over the values the field currently holds.
+std::vector<tensor> gaussGrad(
+    const GeometricField<vector>& U,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    std::vector<std::vector<vector>> bnd(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi) bnd[pi] = U.boundary[pi]->value();
+    return gaussGrad(U.internal, bnd, m, g, patches);
 }
 
 // Array form. HbyA in pEqn.H is not a GeometricField in the _cpp reference -- it is an internal field

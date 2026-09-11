@@ -178,6 +178,12 @@ int main(int argc, char** argv)
     // ---- the momentum matrix both paths consume ---------------------------------------------
     const scalar relaxU = 0.7;
     cpu::rhoSimple::RhoMomentumInput mi;
+    // The limiter's gradient takes U's patch values as they stand BEFORE updateCoeffs
+    // (gaussConvectionScheme.C:84 precedes fvMatrix.C:396). This harness assembles ONE matrix and runs no
+    // updateCoeffs equivalent of its own, so the field's current boundary IS the pre-update one.
+    std::vector<std::vector<vector>> UPreUpdateBnd(fvp.size());
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi) UPreUpdateBnd[pi] = U.boundary[pi]->value();
+    mi.UPreUpdateBnd = &UPreUpdateBnd;
     mi.phi = &phiF.internalField;  mi.phiBnd = &phiBnd;
     mi.rho = &rhoC;                mi.rhoBnd = &rhoB;
     mi.nuEff = &nuEffC;            mi.nuEffBnd = &nuEffB;

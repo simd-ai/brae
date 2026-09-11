@@ -171,12 +171,13 @@ void cellLimitGrad(
 }
 
 void cellLimitGrad(
-    std::vector<tensor>&          grad,
-    const GeometricField<vector>& vsf,
-    scalar                        k,
-    const PrimitiveMesh&          m,
-    const FvGeometry&             g,
-    const std::vector<FvPatch>&   patches)
+    std::vector<tensor>&                    grad,
+    const std::vector<vector>&              vsf,
+    const std::vector<std::vector<vector>>& vsfBnd,
+    scalar                                  k,
+    const PrimitiveMesh&                    m,
+    const FvGeometry&                       g,
+    const std::vector<FvPatch>&             patches)
 {
     if (k < SMALL_) return;
     const label nC = m.nCells();
@@ -184,7 +185,7 @@ void cellLimitGrad(
     std::vector<std::vector<std::vector<scalar>>> pv(patches.size());
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
-        const std::vector<vector>& b = vsf.boundary[pi]->value();
+        const std::vector<vector>& b = vsfBnd[pi];
         pv[pi].resize(patches[pi].size);
         for (label i = 0; i < patches[pi].size; ++i) pv[pi][i] = {b[i].x, b[i].y, b[i].z};
     }
@@ -199,7 +200,7 @@ void cellLimitGrad(
 
     limitPass(
         nC, 3,
-        [&](label c, int cmpt) { return (&vsf.internal[c].x)[cmpt]; },
+        [&](label c, int cmpt) { return (&vsf[c].x)[cmpt]; },
         [&](label c, int cmpt, const vector& d)
         {
             const scalar* t = &grad[c].xx;
@@ -213,6 +214,21 @@ void cellLimitGrad(
             p[6] *= lim;
         },
         k, m, g, patches, pv);
+}
+
+// ...and the field form, over the values the field currently holds.
+void cellLimitGrad(
+    std::vector<tensor>&          grad,
+    const GeometricField<vector>& vsf,
+    scalar                        k,
+    const PrimitiveMesh&          m,
+    const FvGeometry&             g,
+    const std::vector<FvPatch>&   patches)
+{
+    if (k < SMALL_) return;
+    std::vector<std::vector<vector>> bnd(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi) bnd[pi] = vsf.boundary[pi]->value();
+    cellLimitGrad(grad, vsf.internal, bnd, k, m, g, patches);
 }
 
 } // namespace cpu

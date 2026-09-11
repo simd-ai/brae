@@ -499,6 +499,12 @@ Residuals rhoSimpleStep(
     // same object OF's patch().lookupPatchField(rhoName_) returns -- so the prescribed mass flow is held
     // against the density the flux is actually carrying. Feeding it a different rho is what made
     // angledDuct lose its inlet mass flow.
+    // THE BOUNDARY THE MOMENTUM LIMITER SEES, snapshotted here because everything below is brae's
+    // stand-in for fvMatrix.C:396, which OpenFOAM runs AFTER the convection scheme has already taken its
+    // limiter gradient (gaussConvectionScheme.C:84).
+    std::vector<std::vector<vector>> UPreUpdateBnd(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi) UPreUpdateBnd[pi] = f.U.boundary[pi]->value();
+
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         f.U.boundary[pi]->updateFromDensity(rhoBnd[pi], in.time);
@@ -560,6 +566,9 @@ Residuals rhoSimpleStep(
     uin.scheme             = in.schemeU;
     uin.schemeCoeff        = in.schemeCoeffU;
     uin.gradULimitK        = in.gradULimitK;
+    uin.UPreUpdateBnd      = &UPreUpdateBnd;
+    uin.gradMagSqrULeastSq = in.gradMagSqrULeastSq;
+    uin.gradMagSqrULimitK  = in.gradMagSqrULimitK;
     uin.gradULeastSq       = in.gradULeastSq;
     uin.gradPLeastSq       = in.gradPLeastSq;
     uin.gradULULimitK      = in.gradULULimitK;
@@ -589,6 +598,7 @@ Residuals rhoSimpleStep(
         }
         sd.scalars("UDiag", UEqn.diag);
         sd.scalars("UUpper", UEqn.upper);
+        sd.scalars("ULower", UEqn.lower);
         sd.scalars("USrcX", sx);
         sd.scalars("USrcY", sy);
         sd.scalars("USrcZ", sz);

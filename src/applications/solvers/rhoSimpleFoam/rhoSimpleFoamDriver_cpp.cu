@@ -212,6 +212,11 @@ StepInput buildStepInput(
             const FieldGradScheme gP = parseFieldGradScheme(caseDir, "p");
             in.gradULeastSq = gU.leastSquares;
             in.gradPLeastSq = gP.leastSquares;
+            // ...and the limiter's own field for `Gauss limitedLinear` on a VECTOR: magSqr(U), whose
+            // gradient OpenFOAM resolves under `grad(magSqr(U))` (LimitFuncs.C:34-39).
+            const FieldGradScheme gM = parseFieldGradScheme(caseDir, "magSqr(U)");
+            in.gradMagSqrULeastSq = gM.leastSquares;
+            in.gradMagSqrULimitK  = gM.cellLimitK;
         }
         // The ENERGY gradient limiters, which the parser has carried all along and this never forwarded:
         // gradHeLimitK is the cellLimited coefficient of the gradient the energy's linearUpwind NAMES

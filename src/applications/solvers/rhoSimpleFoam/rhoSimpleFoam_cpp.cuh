@@ -115,6 +115,14 @@ struct StepInput
     bool      limGradKELeastSq = false;
     scalar    gradULimitK      = 0.0;
     bool      gradULeastSq     = false;   // grad(U)'s base scheme is leastSquares (see RhoMomentumInput)
+    // grad(magSqr(U))'s OWN gradSchemes entry. `Gauss limitedLinear` on div(phi,U) is instantiated for a
+    // vector as NVDTVD + limitFuncs::magSqr (LimitedScheme.H:188-189), so LimitedScheme::calcLimiter's
+    // lPhi is Foam::magSqr(phi) (LimitFuncs.C:34-39), a volScalarField NAMED `magSqr(U)` -- and
+    // fvc::grad(lPhi) resolves gradSchemes under the key `grad(magSqr(U))`, which almost always falls to
+    // `default`. This took a hardcoded Gauss gradient whatever the case said; gasMixing/injectorPipe's
+    // default is leastSquares, and the momentum matrix read 4.63e-02 off OpenFOAM's own there.
+    bool      gradMagSqrULeastSq = false;
+    scalar    gradMagSqrULimitK   = 0.0;
     bool      gradPLeastSq     = false;   // grad(p)'s
     // The gradient `linearUpwind <name>` / `linearUpwindV <name>` NAMES in div(phi,U) -- OpenFOAM's
     // mesh.gradScheme(<name>) (linearUpwind.C:61-68) -- which is a different lookup from grad(U)'s own

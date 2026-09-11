@@ -38,9 +38,20 @@ FvVectorMatrix divWithScheme(
             // whatever the case said; the DEVICE arm has applied the limiter all along and the divergence
             // was recorded as open. gasMixing/injectorPipe is exactly the case that separates them
             // (`div(phi,U) Gauss limitedLinearV 1` beside `grad(U) cellLimited Gauss linear 0.99`).
-            std::vector<tensor> gradU = in.gradULeastSq ? fvc::leastSquaresGrad(U, m, g, patches)
-                                                        : fvc::gaussGrad(U, m, g, patches);
-            if (in.gradULimitK > 0.0) cellLimitGrad(gradU, U, in.gradULimitK, m, g, patches);
+            // ...from the patch values standing BEFORE updateCoeffs -- see RhoMomentumInput's
+            // UPreUpdateBnd. Required, not optional: falling back to the field's own boundary here IS
+            // the defect, so a missing snapshot throws rather than silently restoring it.
+            if (!in.UPreUpdateBnd)
+                throw std::runtime_error(
+                    "rhoSimpleFoam UEqn_cpp: div(phi,U) is limitedLinearV, whose limiter OpenFOAM builds "
+                    "from fvc::grad(U) BEFORE the momentum fvMatrix constructor runs updateCoeffs "
+                    "(gaussConvectionScheme.C:84 then fvMatrix.C:396), and no pre-updateCoeffs boundary "
+                    "was supplied. Running it off the refreshed one is a different discretisation.");
+            const std::vector<std::vector<vector>>& ub = *in.UPreUpdateBnd;
+            std::vector<tensor> gradU = in.gradULeastSq
+                ? fvc::leastSquaresGrad(U.internal, ub, m, g, patches)
+                : fvc::gaussGrad(U.internal, ub, m, g, patches);
+            if (in.gradULimitK > 0.0) cellLimitGrad(gradU, U.internal, ub, in.gradULimitK, m, g, patches);
             return fvm::div(*in.phi, *in.phiBnd, U,
                             ls::limitedLinearVWeights(*in.phi, U, gradU, in.schemeCoeff, m, g),
                             m, patches);
@@ -56,15 +67,27 @@ FvVectorMatrix divWithScheme(
                 const vector& u = U.internal[c];
                 mag2[c] = u.x*u.x + u.y*u.y + u.z*u.z;
             }
+            // magSqr over the PRE-updateCoeffs patch values, for the same reason as the V form above.
+            if (!in.UPreUpdateBnd)
+                throw std::runtime_error(
+                    "rhoSimpleFoam UEqn_cpp: div(phi,U) is limitedLinear, whose limiter OpenFOAM builds "
+                    "from fvc::grad(magSqr(U)) BEFORE the momentum fvMatrix constructor runs updateCoeffs "
+                    "(gaussConvectionScheme.C:84 then fvMatrix.C:396), and no pre-updateCoeffs boundary "
+                    "was supplied.");
             std::vector<std::vector<scalar>> mag2b(patches.size());
             for (std::size_t pi = 0; pi < patches.size(); ++pi)
             {
-                const std::vector<vector>& ub = U.boundary[pi]->value();
+                const std::vector<vector>& ub = (*in.UPreUpdateBnd)[pi];
                 mag2b[pi].resize(patches[pi].size);
                 for (label i = 0; i < patches[pi].size; ++i)
                     mag2b[pi][i] = ub[i].x*ub[i].x + ub[i].y*ub[i].y + ub[i].z*ub[i].z;
             }
-            const std::vector<vector> gradM = fvc::gaussGrad(mag2, mag2b, m, g, patches);
+            // grad(magSqr(U)) through ITS OWN gradSchemes entry, base scheme then limiter.
+            std::vector<vector> gradM = in.gradMagSqrULeastSq
+                ? fvc::leastSquaresGrad(mag2, mag2b, m, g, patches)
+                : fvc::gaussGrad(mag2, mag2b, m, g, patches);
+            if (in.gradMagSqrULimitK > 0.0)
+                cellLimitGrad(gradM, mag2, mag2b, in.gradMagSqrULimitK, m, g, patches);
             GeometricField<scalar> shim;      // limitedLinearWeights reads only .internal
             shim.internal = mag2;
             return fvm::div(*in.phi, *in.phiBnd, U,

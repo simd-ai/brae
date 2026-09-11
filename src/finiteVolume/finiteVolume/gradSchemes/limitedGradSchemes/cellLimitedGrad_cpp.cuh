@@ -58,6 +58,18 @@ void cellLimitGrad(
     const FvGeometry&             g,
     const std::vector<FvPatch>&   patches);
 
+// The VECTOR field's limiter over VALUES, for the same reason as the scalar one above and for one more:
+// the momentum limiter takes grad(U) against the patch values standing BEFORE updateCoeffs
+// (gaussConvectionScheme.C:84 precedes fvMatrix.C:396), which are not the ones the field holds.
+void cellLimitGrad(
+    std::vector<tensor>&                    grad,
+    const std::vector<vector>&              vsf,
+    const std::vector<std::vector<vector>>& vsfBnd,
+    scalar                                  k,
+    const PrimitiveMesh&                    m,
+    const FvGeometry&                       g,
+    const std::vector<FvPatch>&             patches);
+
 void cellLimitGrad(
     std::vector<tensor>&          grad,   // in/out, per cell
     const GeometricField<vector>& vsf,

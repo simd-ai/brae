@@ -124,6 +124,24 @@ struct RhoMomentumInput
     bool      bounded            = false;
     bool      linearUpwind       = false;
     scalar    gradULimitK        = 0.0;
+    // U's PATCH VALUES AS THEY STOOD BEFORE this iteration's updateCoeffs equivalents. The only consumer
+    // is the div(phi,U) limiter's gradient: gaussConvectionScheme::fvmDiv takes
+    // tinterpScheme_().weights(vf) (.C:84) and only THEN builds the fvMatrix (:89), whose constructor
+    // calls updateCoeffs (fvMatrix.C:396) -- so LimitedScheme::calcLimiter's fvc::grad(lPhi) reads the
+    // boundary the PREVIOUS iteration left, while divDevRhoReff, internalCoeffs and boundaryCoeffs all
+    // legitimately read the refreshed one. Measured on angledDuctExplicitFixedCoeff restarted from
+    // OpenFOAM's iteration 5: that inlet is 46.9869516954335 before and 46.7633991650534 after, and
+    // feeding the limiter the refreshed value puts the momentum matrix 1.300e-03 off OpenFOAM's own
+    // against 4.405e-13 with the stored one, the Gauss upwind control unmoved at 2.0e-15.
+    const std::vector<std::vector<vector>>* UPreUpdateBnd = nullptr;
+    // grad(magSqr(U))'s OWN gradSchemes entry. `Gauss limitedLinear` on div(phi,U) is instantiated for a
+    // vector as NVDTVD + limitFuncs::magSqr (LimitedScheme.H:188-189), so LimitedScheme::calcLimiter's
+    // lPhi is Foam::magSqr(phi) (LimitFuncs.C:34-39), a volScalarField NAMED `magSqr(U)` -- and
+    // fvc::grad(lPhi) resolves gradSchemes under the key `grad(magSqr(U))`, which almost always falls to
+    // `default`. This took a hardcoded Gauss gradient whatever the case said; gasMixing/injectorPipe's
+    // default is leastSquares, and the momentum matrix read 4.63e-02 off OpenFOAM's own there.
+    bool      gradMagSqrULeastSq = false;
+    scalar    gradMagSqrULimitK   = 0.0;
     // grad(U)'s and grad(p)'s BASE scheme: leastSquares, or Gauss linear. The momentum's three grad(U)
     // consumers (the limitedLinearV weights, linearUpwind's and linearUpwindV's corrections) and
     // -fvc::grad(p) resolve through the case's gradSchemes in OpenFOAM (fvcGrad.C:149).

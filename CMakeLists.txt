@@ -2433,6 +2433,25 @@ add_test(NAME rho_generalized_newtonian_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_generalized_newtonian_vs_openfoam.sh)
 set_tests_properties(rho_generalized_newtonian_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
+# brae's _cpp limitedLinearV / limitedLinear for div(phi,U) against OpenFOAM's OWN momentum matrix
+# off-diagonals (tools/dumpPEqn), on a DEVELOPED field restarted from OpenFOAM's iteration 5.
+#
+# rho_ueqn_cuda_scheme_limitedLinearV holds the DEVICE against the _cpp reference; _cpp itself had no
+# OpenFOAM oracle for this scheme, and when one was put under it the transcription did not hold --
+# UUpper 3.31e-03 (limitedLinearV) and 4.63e-02 (limitedLinear) against a `Gauss upwind` control reading
+# 1.06e-14 on the same harness. Both causes were found in OpenFOAM's own source and fixed:
+#   * the limiter's gradient must be taken from U's patch values BEFORE updateCoeffs --
+#     gaussConvectionScheme.C:84 takes tinterpScheme_().weights(vf) and only then builds the fvMatrix
+#     at :89 whose constructor calls updateCoeffs (fvMatrix.C:396).   3.31e-03 -> 1.76e-14
+#   * `Gauss limitedLinear` on a VECTOR is NVDTVD + limitFuncs::magSqr (LimitedScheme.H:188), so its
+#     gradient is fvc::grad(magSqr(U)) resolved under the key `grad(magSqr(U))` -- brae hardcoded Gauss
+#     where gasMixing's default is leastSquares.                      4.63e-02 -> 3.22e-13
+# The bound was never loosened; it is 1e-12 throughout and the arms came to it.
+add_test(NAME rho_limitedlinearv_cpp_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_limitedlinearv_cpp_vs_openfoam.sh)
+set_tests_properties(rho_limitedlinearv_cpp_vs_openfoam PROPERTIES
+                     SKIP_RETURN_CODE 77 TIMEOUT 3600 LABELS slow)
+
 # `leastSquares` reaching every consumer the rhoSimpleFoam mirror has, on the HOST arm, end to end on
 # validation/rhoSST against real OpenFOAM: the closure's CDkOmega and corrected-laplacian gradients, the
 # turbulence limiters' own gradient, grad(p) (the velocity correction, SIMPLEC's HbyA, the non-orth

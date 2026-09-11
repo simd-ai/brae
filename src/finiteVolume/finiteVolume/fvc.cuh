@@ -66,6 +66,18 @@ std::vector<vector> leastSquaresGrad(const std::vector<scalar>& internal,
                                      const std::vector<FvPatch>& patches);
 
 // Gauss gradient of a volVectorField -> volTensorField (grad(U)_ij = sum Sf_i U_j / V).
+//
+// Array form, and the one that carries the implementation. A caller may need the gradient of U taken
+// against PATCH VALUES OTHER than the ones the field currently holds: LimitedScheme's limiter is built
+// from fvc::grad(lPhi) inside gaussConvectionScheme::fvmDiv (.C:84), which runs BEFORE the fvMatrix
+// constructor that calls updateCoeffs (fvMatrix.C:396) -- so the limiter sees the boundary the previous
+// iteration left, while every term after it sees the refreshed one.
+std::vector<tensor> gaussGrad(const std::vector<vector>& internal,
+                              const std::vector<std::vector<vector>>& boundary,
+                              const PrimitiveMesh& m,
+                              const FvGeometry& g,
+                              const std::vector<FvPatch>& patches);
+
 std::vector<tensor> gaussGrad(const GeometricField<vector>& U,
                               const PrimitiveMesh& m,
                               const FvGeometry& g,
