@@ -471,7 +471,8 @@ COMPONENTS = {
                         "reaches U 1.05x, omega 1.16x and k 1.45x of OpenFOAM's initial residual at its "
                         "converged state -- the _cpp reference's own numbers to within 0.4% (U to seven "
                         "digits) -- and end to end U 2.2e-04, p 7.4e-04, k 9.3e-04, omega 2.2e-02, "
-                        "nut 4.8e-03.",
+                        "nut 4.8e-03."
+                " COMPRESSIBLE fvm::ddt under `Euler` (kOmegaSSTBase.C:572,602), the same term as kEpsilon's: tests/rho_komegasst_vs_openfoam.sh's Euler arm holds omega and k to 1e-13 against the instrumented model and reads omega D() 9.6e-04 / k source 3.0e-02 with the term zeroed. No shipped rhoSimpleFoam tutorial runs kOmegaSST under Euler, so this is gated on sbMatched with the scheme switched. CUDA against the _cpp reference inside the driver, tests/rho_step_cuda_euler.sh (rhoSST switched to Euler, 3 iterations): k 3.5e-13, omega 3.1e-12, nut 1.2e-11, the same floor as the steadyState control run beside it; with the device term withheld k 8.64e-05.",
              note="The _cpp reference could NOT run an SST case until this, and a single-iteration "
                   "probe did not show it: probing from the converged state gave 1.2-1.5x while the "
                   "same code from 0/ reached omega 1e+46 by iteration 200. Three defects, all of them "
@@ -1371,7 +1372,14 @@ COMPONENTS = {
              classification="GPU_REQUIRED", status="REIMPLEMENT",
              brae_reference="src/applications/solvers/rhoSimpleFoam/rhoUEqn_cpp.cu",
              brae_target="src/applications/solvers/rhoSimpleFoam/rhoUEqn.cu",
-             validation="tests/rho_ueqn_vs_openfoam.sh -- against OpenFOAM's OWN assembled momentum matrix, via the tools/dumpPEqn stage harness (stage_rAU = 1/UEqn.A(), stage_UIC, stage_UBC, stage_muEff, stage_Uass) at SIMPLE iteration 1 on 112k-cell sbMatched: rAU 6.13e-15, internalCoeffs 7.1e-15, boundaryCoeffs 4.89e-16 -- but ALL THREE ARE GATED AT 1e-10, five orders looser than the figures suggest, so the bound would pass a far worse assembly than the one measured. The per-patch inlet/outlet/walls figures are printf, not bounded; on this fixture the outlet iC/bC and the walls bC are identically zero in both codes, where relL2 degenerates to an absolute norm. OpenFOAM's own muEff is INJECTED so the number measures the assembly rather than the closure -- and so is OpenFOAM's VELOCITY, internal field and every written patch value, which the text did not say. The injection is a near no-op here (brae's own muEff sits at 1.9e-15 against OpenFOAM's) and the closure is no longer unported: compressible kEpsilon is ported and separately gated, so the live reason for injecting is isolation, not absence. THE CONTROL: assembling with the kinematic nu_eff -- the incompressible divDevReff -- reads 6.2e-01, fourteen orders worse, and forcing that form into the implementation fails the gate at 6.2e-01, so it discriminates the one thing that distinguishes this solver's momentum equation from simpleFoam's.",
+             validation="tests/rho_ueqn_vs_openfoam.sh -- against OpenFOAM's OWN assembled momentum matrix, via the tools/dumpPEqn stage harness (stage_rAU = 1/UEqn.A(), stage_UIC, stage_UBC, stage_muEff, stage_Uass) at SIMPLE iteration 1 on 112k-cell sbMatched: rAU 6.13e-15, internalCoeffs 7.1e-15, boundaryCoeffs 4.89e-16 -- but ALL THREE ARE GATED AT 1e-10, five orders looser than the figures suggest, so the bound would pass a far worse assembly than the one measured. The per-patch inlet/outlet/walls figures are printf, not bounded; on this fixture the outlet iC/bC and the walls bC are identically zero in both codes, where relL2 degenerates to an absolute norm. OpenFOAM's own muEff is INJECTED so the number measures the assembly rather than the closure -- and so is OpenFOAM's VELOCITY, internal field and every written patch value, which the text did not say. The injection is a near no-op here (brae's own muEff sits at 1.9e-15 against OpenFOAM's) and the closure is no longer unported: compressible kEpsilon is ported and separately gated, so the live reason for injecting is isolation, not absence. THE CONTROL: assembling with the kinematic nu_eff -- the incompressible divDevReff -- reads 6.2e-01, fourteen orders worse, and forcing that form into the implementation fails the gate at 6.2e-01, so it discriminates the one thing that distinguishes this solver's momentum equation from simpleFoam's."
+                " _cpp AGAINST OPENFOAM'S OWN MOMENTUM MATRIX ON A DEVELOPED FIELD (tests/rho_limitedlinearv_cpp_vs_openfoam.sh, gasMixing restarted at OpenFOAM's iteration 5, off-diagonals stage_UUpper/ULower, `Gauss upwind` as the control at 1.06e-14): limitedLinearV 3.31e-03 -> 1.76e-14 and limitedLinear 4.63e-02 -> 3.22e-13. Two causes read out of the source: the limiter's gradient is built from U's patch values BEFORE updateCoeffs (gaussConvectionScheme.C:84 takes the weights, :89 builds the fvMatrix whose constructor calls updateCoeffs, fvMatrix.C:396) where brae refreshed first; and `Gauss limitedLinear` on a VECTOR is NVDTVD + limitFuncs::magSqr (LimitedScheme.H:188), so its gradient is fvc::grad(magSqr(U)) under the key grad(magSqr(U)) -- default, leastSquares there -- where brae hardcoded Gauss. Before this the device had been validated against a _cpp reference that was itself unvalidated for both schemes."
+                   " CUDA: the device momentum limiters took the refreshed boundary (RhoMomentumInput::UxPreUpdateBnd "
+                   "now carries the step's pre-updateCoeffs snapshot, required under limitedLinear/V) and a plain Gauss "
+                   "grad(magSqr(U)); measured on gasMixing/injectorPipe restarted at OpenFOAM's iteration 5 the "
+                   "momentum off-diagonals were 3.3e-03 off the host and read 1.2e-15 after, with test_rho_ueqn_cuda "
+                   "(one shared boundary array) at 3.2e-14 either way -- the twin cannot see the snapshot, the "
+                   "restarted end-to-end gate can.",
              note="fvm::div(phi,U) + MRF.DDt(rho,U) + turbulence->divDevRhoReff(U) == fvOptions(rho,U), "
                   "solved against -fvc::grad(p). divDevRhoReff is the COMPRESSIBLE form (rho-weighted, "
                   "dev2 transpose term) and is NOT the incompressible divDevReff that simpleFoam uses. "
@@ -1385,7 +1393,8 @@ COMPONENTS = {
              classification="GPU_REQUIRED", status="REIMPLEMENT",
              brae_reference="src/applications/solvers/rhoSimpleFoam/rhoEEqn_cpp.cu",
              brae_target="src/applications/solvers/rhoSimpleFoam/rhoEEqn.cu",
-             validation="tests/rho_eeqn_vs_openfoam.sh -- against OpenFOAM's OWN assembled energy equation via the tools/dumpPEqn harness (stage_Ekp, stage_he, stage_eD, stage_eSrc, stage_alphaEff, stage_Upred) at SIMPLE iteration 1 on 112k-cell sbMatched: Ekp 6.4e-16 (and 6.1e-16 on every patch), EEqn.D() 3.8e-15, source+boundaryCoeffs 3.9e-15, interior and boundary cells both at machine precision. THE INLET IS NEUTRALISED: the script replaces sbMatched flowRateInletVelocity with a plain `fixedValue uniform (1 2 3)`, ~3.7 m/s against the case own ~523 m/s, so this gate says nothing about the inlet and the energy it carries. NO OFF-DIAGONAL HAS AN OPENFOAM ORACLE: dumpPEqn writes none for this equation and the test compares none, where the sibling momentum gate does. Bounds are 1e-12 on Ekp and 1e-10 on D and source; the per-patch and interior/boundary figures are printf, and the interior/boundary one is an ABSOLUTE L2 with no denominator, so machine precision is not the quantity it reports. alphaEff, he AND OpenFOAM solved U are INJECTED so the number measures the assembly, not the unported compressible turbulence closure or the unported energy boundary types. THE CONTROL: the `h` arm (K = 0.5|U|^2) reads 1.0 against stage_Ekp and builds a convection term differing from the `e` arm by 100% of its own magnitude; forcing the h arm into the implementation fails the gate. NOTE the control is taken on the UNBOUNDED convection term on purpose -- `div(phi,Ekp)` is bounded, and at iteration 1 the bounded subtraction removes the near-uniform p/rho that IS the difference between the arms (|KE div| 1.3e-04 bounded against 1.4e+01 unbounded), so the assembled source at this state cannot discriminate them.",
+             validation="tests/rho_eeqn_vs_openfoam.sh -- against OpenFOAM's OWN assembled energy equation via the tools/dumpPEqn harness (stage_Ekp, stage_he, stage_eD, stage_eSrc, stage_alphaEff, stage_Upred) at SIMPLE iteration 1 on 112k-cell sbMatched: Ekp 6.4e-16 (and 6.1e-16 on every patch), EEqn.D() 3.8e-15, source+boundaryCoeffs 3.9e-15, interior and boundary cells both at machine precision. THE INLET IS NEUTRALISED: the script replaces sbMatched flowRateInletVelocity with a plain `fixedValue uniform (1 2 3)`, ~3.7 m/s against the case own ~523 m/s, so this gate says nothing about the inlet and the energy it carries. NO OFF-DIAGONAL HAS AN OPENFOAM ORACLE: dumpPEqn writes none for this equation and the test compares none, where the sibling momentum gate does. Bounds are 1e-12 on Ekp and 1e-10 on D and source; the per-patch and interior/boundary figures are printf, and the interior/boundary one is an ABSOLUTE L2 with no denominator, so machine precision is not the quantity it reports. alphaEff, he AND OpenFOAM solved U are INJECTED so the number measures the assembly, not the unported compressible turbulence closure or the unported energy boundary types. THE CONTROL: the `h` arm (K = 0.5|U|^2) reads 1.0 against stage_Ekp and builds a convection term differing from the `e` arm by 100% of its own magnitude; forcing the h arm into the implementation fails the gate. NOTE the control is taken on the UNBOUNDED convection term on purpose -- `div(phi,Ekp)` is bounded, and at iteration 1 the bounded subtraction removes the near-uniform p/rho that IS the difference between the arms (|KE div| 1.3e-04 bounded against 1.4e+01 unbounded), so the assembled source at this state cannot discriminate them."
+                " THE CORRECTED LAPLACIAN'S OWN GRADIENT: correctedSnGrad::fullGradCorrection resolves gradScheme::New(mesh.gradScheme('grad(' + name + ')')), i.e. grad(e)'s own gradSchemes entry, and brae took a hardcoded Gauss gradient there. On gasMixing/injectorPipe (default leastSquares, snappyHexMesh) the energy source was 2.8e-07 and the solved he 2.2e-06 off OpenFOAM's own at a developed restart; with the entry honoured 6.3e-11 and 4.7e-16, and T 8.6e-07 -> 9.6e-13 end to end (tests/rho_gasmixing_vs_openfoam.sh). NOT gated on sbMatched: its mesh is orthogonal to 0.78 degrees, the correction is ~0 there, and a leastSquares arm passed with the defect present and absent alike -- measured, then removed as vacuous.",
              note="The kinetic-energy source DIFFERS BY ENERGY VARIABLE: he==e uses Ekp = 0.5|U|^2 + p/rho, "
                   "he==h uses K = 0.5|U|^2. Picking one is a wrong equation for the other thermo. MRF adds "
                   "fvc::div(MRF.phi(), p). thermo.correct() runs at the END and is what updates T, psi, mu "
@@ -1416,7 +1425,8 @@ COMPONENTS = {
              classification="GPU_REQUIRED", status="REIMPLEMENT",
              brae_reference="src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon_cpp.cu",
              brae_target="src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon.cu",
-             validation="tests/rho_kepsilon_vs_openfoam.sh -- against OpenFOAM's OWN kEpsilon, instrumented. tools/dumpKEpsilon is that model with writes added and its equations untouched, registered as kEpsilonDump through makeRASModel, so gradU, divU, GbyNu, G, both diffusivities, the mesh factors the laplacian coefficient is a product of, both off-diagonal sets and both assembled systems (before and after relax/boundaryManipulate) each have an oracle. On 112k-cell sbMatched at SIMPLE iteration 1, given OpenFOAM's own inputs: epsilon 5.0e-15, k 8.9e-16, nut 1.7e-15, alphat 2.3e-15, wall and interior alike, with every intermediate at the same order. THE CONTROL: substituting the MASS flux for the volumetric one in divU -- the one difference between the compressible and incompressible readings of this same templated model -- must be worse by at least 1e3x, measured 5.0e-06 against 5.0e-15. A term sweep drops each of the eight terms in turn and every one of them moves the answer. A short source array for a turbulent inlet is REFUSED by name, with a full-length array as the negative control.",
+             validation="tests/rho_kepsilon_vs_openfoam.sh -- against OpenFOAM's OWN kEpsilon, instrumented. tools/dumpKEpsilon is that model with writes added and its equations untouched, registered as kEpsilonDump through makeRASModel, so gradU, divU, GbyNu, G, both diffusivities, the mesh factors the laplacian coefficient is a product of, both off-diagonal sets and both assembled systems (before and after relax/boundaryManipulate) each have an oracle. On 112k-cell sbMatched at SIMPLE iteration 1, given OpenFOAM's own inputs: epsilon 5.0e-15, k 8.9e-16, nut 1.7e-15, alphat 2.3e-15, wall and interior alike, with every intermediate at the same order. THE CONTROL: substituting the MASS flux for the volumetric one in divU -- the one difference between the compressible and incompressible readings of this same templated model -- must be worse by at least 1e3x, measured 5.0e-06 against 5.0e-15. A term sweep drops each of the eight terms in turn and every one of them moves the answer. A short source array for a turbulent inlet is REFUSED by name, with a full-length array as the negative control."
+                " FVM::DDT UNDER `Euler` (kEpsilon.C:254,275): tests/rho_kepsilon_vs_openfoam.sh's Euler arm holds the assembled k and epsilon systems to 1e-14 against the instrumented model with `ddtSchemes default Euler`, and reads epsilon D() 8.0e-04 / k source 2.8e-02 with the term zeroed (the fail-proof). Found on gasMixing/injectorPipe, the one rhoSimpleFoam tutorial shipping Euler: with every input to the closure exact, its epsilon diagonal was 5.66e-04 and k source 6.14e-03 off OpenFOAM's own assembly, and OpenFOAM minus brae equalled rho*V/deltaT to 4.8e-09. rho.oldTime() in the source is the closure-time rho on a process's first step (GeometricField::oldTime() copies at first use) and the start-of-step rho afterwards -- measured 1.8e-09 and 5.6e-12 respectively, the other choice 1.3e-03 / 2.9e-04. End to end: tests/rho_gasmixing_vs_openfoam.sh, k 2.2e-12 at the first restarted iteration.",
              note="OpenFOAM has ONE templated kEpsilon.C; the compressible instantiation supplies alpha=1, "
                   "rho as a field, alphaRhoPhi as the MASS flux and a nu that varies with T. TWO FLUXES, "
                   "not one: fvm::div takes the mass flux while divU takes the VOLUMETRIC one, because "
@@ -1457,24 +1467,86 @@ COMPONENTS = {
                         "grad(U), each restarted from OpenFOAM's own iteration 5 and each measured "
                         "separately (before -> after: k 3.1e-06 -> 8.7e-12, 1.7e-05 -> 2.9e-12, "
                         "3.6e-06 -> 2.9e-12), with the shipped case as the control, a wrong-scheme control "
-                        "(brae's Gauss against OpenFOAM's leastSquares run must differ, 6.3e-08) and the "
-                        "CUDA arm asserted to REFUSE by name. Two fail-proofs, each watched: divDevRhoReff's "
-                        "flag removed, and the limiter's gradient back to Gauss -- different arms go red.",
+                        "(brae's Gauss against OpenFOAM's leastSquares run must differ, 6.3e-08). Two "
+                        "fail-proofs, each watched: divDevRhoReff's flag removed, and the limiter's gradient "
+                        "back to Gauss -- different arms go red. CUDA, the CLOSURES' grad(k)/grad(epsilon|omega): "
+                        "test_rho_kepsilon_cuda's leastSquares arm against the host closure on pitzDaily "
+                        "(`corrected` laplacians, so the correction path is live) epsilon 7.9e-16, k 8.4e-16, "
+                        "nut 2.7e-15, with the Gauss device answer 3.36e-03 off the leastSquares reference "
+                        "(the control); rho_leastsquares_closure_vs_openfoam.sh's lsq arm now runs the CUDA "
+                        "arm against OpenFOAM, worst p 2.9e-12 (the same floor as the host and as the shipped "
+                        "control). CUDA, grad(p) at its five consumers (RhoStepInput::gradPLeastSq): the "
+                        "closure gate's lsqp arm (grad(p) leastSquares explicit on rhoSST) host 2.900e-12, CUDA "
+                        "2.901e-12 vs OpenFOAM, the shipped Gauss run 1.42e-05 off the leastSquares oracle; "
+                        "tests/rho_step_cuda_lsq.sh (rhoKE and sbMatched, in-gate Gauss control 1.4e-05 / "
+                        "4.7e-03); and tests/rho_gradp_lsq_simplec_vs_openfoam.sh, the SIMPLEC+transonic case "
+                        "nothing else covers: both arms 2e-11 of OpenFOAM at iterations 1-2 with the shipped "
+                        "control at the same floor and OpenFOAM's own two schemes 1.6e-02 apart. THAT GATE "
+                        "FOUND A HOST DEFECT: the device arm was 5.7e-12 of OpenFOAM and the host 1.98e-09, "
+                        "because fvc::snGrad's non-orthogonal correction (SIMPLEC's phiHbyA term, pcEqn.H:27) "
+                        "took a hardcoded Gauss gradient where correctedSnGrad.C:52-55 resolves grad(p)'s own "
+                        "entry -- invisible on rhoSST (not SIMPLEC) and at iteration 1 of sbMatched (p uniform). "
+                        "Fixed in fvc.cu (snGrad takes the field's scheme); 2.02e-11 after.",
              note="OpenFOAM's inverse-distance least-squares fit (leastSquaresVectors.C), not a Gauss sum; "
                   "a case naming it gets it or is refused. fvc::grad(vf) resolves `grad(<name>)` through "
                   "gradSchemes (fvcGrad.C:149), so `default leastSquares` reaches every consumer: the "
-                  "limitedLinear limiters' gradient in the energy equation (BRAE_LEASTSQUARES=1) and in "
+                  "limitedLinear limiters' gradient in the energy equation (reached by default) and in "
                   "both turbulence closures' divWithScheme (LimitedScheme.C:51-55), kOmegaSST's CDkOmega "
                   "and the k/omega|epsilon corrected-laplacian corrections (gradKLeastSq), grad(p) (the "
                   "velocity correction pEqn.H:86 / pcEqn.H:99, SIMPLEC's HbyA pcEqn.H:30,65, the non-orth "
                   "corrections) and grad(U) (divDevRhoReff's dev2 term, the closures' production, "
                   "validate()'s correctNut) -- the VECTOR form, lsGrad_ij = ownLs_i*deltaVsf_j, sharing "
                   "one leastSquaresInvDd with the scalar one. Four of those consumers computed the Gauss "
-                  "gradient under the case's own scheme name until this. The DEVICE computes it nowhere "
-                  "and the CUDA mirror arm refuses a leastSquares grad(k), grad(U) or grad(p) by name "
-                  "until that module is ported; the non-orth corrections and the gradient linearUpwind "
-                  "NAMES are ported but not exercised by rhoSST (orthogonal laplacians, upwind divs)."),
+                  "gradient under the case's own scheme name until this. The DEVICE computes the scalar "
+                  "form (deviceLeastSquaresGrad): the energy limiters' gradient, both closures' limiter "
+                  "gradient, the closures' corrected-laplacian correction (turbulence_transport.cu, "
+                  "TransportScheme::gradFieldLeastSq) and kOmegaSST's CDkOmega (kOmegaSST.cu) take it under "
+                  "the case's scheme; the CUDA mirror arm still refuses a leastSquares grad(U) or grad(p) by "
+                  "name (no device vector form; the pressure gradient's consumers are not wired) until those "
+                  "modules are ported. The non-orth corrections and the gradient linearUpwind NAMES are ported "
+                  "but not exercised by rhoSST (orthogonal laplacians, upwind divs)."),
 
+        dict(name="fvm_ddt_closure", of_symbol="Foam::fv::EulerDdtScheme<Type>::fvmDdt",
+             of_file="src/finiteVolume/finiteVolume/ddtSchemes/EulerDdtScheme/EulerDdtScheme.C",
+             classification="SHARED_NUMERICAL", status="PORTED",
+             brae_files="src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon_cpp.cu, "
+                        "src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/kOmegaSST_cpp.cu "
+                        "(the term, per equation); src/applications/solvers/common/scheme_parse.cuh "
+                        "(parseDdtScheme); src/applications/solvers/rhoSimpleFoam/rhoSimpleFoamDriver_cpp.cu "
+                        "(StepInput::ddtEuler, rDeltaT, firstIteration). CUDA: "
+                        "src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon.cu (inside the "
+                        "reaction kernels, at the reference's position), "
+                        "src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/kOmegaSST.cu (ddtKernel after "
+                        "the shared reaction), src/applications/solvers/rhoSimpleFoam/rhoSimpleFoam.cu "
+                        "(RhoSolverFields::rhoOld written before the closure hook), rhoTurbulenceHook.cu "
+                        "(TurbulenceHookOptions::rDeltaT)",
+             validation="tests/rho_kepsilon_vs_openfoam.sh and tests/rho_komegasst_vs_openfoam.sh, each with an "
+                        "arm that switches sbMatched to `ddtSchemes default Euler` and holds the assembled k and "
+                        "epsilon|omega systems to 1e-13 against the instrumented models (fail-proofs: the term "
+                        "zeroed reads 8.0e-04 / 2.8e-02 and 9.6e-04 / 3.0e-02). End to end on the tutorial that "
+                        "ships Euler, gasMixing/injectorPipe: tests/rho_gasmixing_vs_openfoam.sh, worst 2.0e-11 "
+                        "over iterations 6-8 with both codes restarted from OpenFOAM's own iteration 5. "
+                        "CUDA against the _cpp reference: test_rho_kepsilon_cuda's Euler arm (rDeltaT 2, "
+                        "rho.oldTime() synthesized distinct from rho) epsilon 3.2e-16, k 8.4e-16, nut 2.0e-15, "
+                        "with the term withheld on the device k 4.85e-05 and with rho.oldTime() := rho "
+                        "1.79e-05; inside the driver, tests/rho_step_cuda_euler.sh (rhoKE and rhoSST switched "
+                        "to Euler, 3 iterations, both firstIteration rules exercised) k 4.4e-13, epsilon 3.1e-12, "
+                        "nut 1.8e-11 on kEpsilon, and the in-gate fail-proof with the device term withheld reads "
+                        "k 7.87e-05.",
+             notes=("rhoSimpleFoam's own equations carry no fvm::ddt; the closures do, because the model is "
+                    "shared with the transient solvers, and `steadyState` (five of the six tutorials) makes the "
+                    "term an empty matrix (steadyStateDdtScheme::fvmDdt) while `Euler` makes it rho*V/deltaT on "
+                    "the diagonal and rho.oldTime()*psi.oldTime()*V/deltaT in the source. brae neither parsed nor "
+                    "refused ddtSchemes before this. deltaT is controlDict's LAST entry (the tutorial has two; "
+                    "OpenFOAM's dictionary takes the last, and so does brae's). backward, CrankNicolson, "
+                    "localEuler and bounded are refused by name (device_ddt.cuh carries their coefficients for the "
+                    "transient solvers; this port takes only Euler's). OPEN: the incompressible simpleFoam driver "
+                    "does not yet resolve ddtSchemes for its closures. The CUDA rhoSimpleFoam arm computes the "
+                    "term in both closures (RhoStepInput::firstIteration mirrors the host rule). A RESTART is not "
+                    "a continuation under Euler: OpenFOAM "
+                    "itself, restarted from its own written iteration, differs from its continuous run at the "
+                    "first restarted iteration by k 3.8e-07 (oldTime() created at first use), so gates restart "
+                    "BOTH codes.")),
         dict(name="generalizedNewtonian_compressible",
              of_symbol="laminarModels::generalizedNewtonian<BasicMomentumTransportModel>::correct",
              of_file="src/TurbulenceModels/turbulenceModels/laminar/generalizedNewtonian/generalizedNewtonian.C",
@@ -1501,7 +1573,24 @@ COMPONENTS = {
                   "strainRate's come from gaussGrad's boundary correction -- the wall shear. The gate found a "
                   "generic restart defect before it could see the model: brae's inletOutlet/outletInlet/"
                   "freestream took their construction value from inletValue where OpenFOAM keeps the file's "
-                  "`value`. See PORT.md, Stage S1 Half B."),
+                  "`value`. See PORT.md, Stage S1 Half B. THE DEVICE ARM CARRIED THE SAME DEFECT until the "
+                  "gasMixing/injectorPipe restart gate reached it (tests/rho_gasmixing_vs_openfoam.sh): "
+                  "buildDeviceBoundary seeded an inletOutlet face as fixedValue(inletValue), so every evaluate "
+                  "before the first flux switch -- the closure's stored-patch-value reconstruction at its first "
+                  "step -- returned inletValue; measured as the epsilon equation's off-diagonals 1.6e-04 off the "
+                  "host with 100% of it on outlet-adjacent faces, and 8.8e-04 on the two turbulent inlets when "
+                  "seeded zeroGradient instead. DeviceBoundary::ioStored now carries the file's `value` (the "
+                  "host patch field's, extrapolated where absent) and ioFresh marks it until "
+                  "deviceUpdateInletOutlet first runs (inletOutletFvPatchField.C's dictionary constructor: "
+                  "valueFraction 0, readValueEntry or extrapolateInternal). Both boundary builders. After it the "
+                  "CUDA arm sits at 1.2e-11 of OpenFOAM's own restart over iterations 6-8, the host at 2.0e-11. "
+                  "OPEN: the seed is taken by the CLOSURE boundaries only (buildDeviceBoundary's storedIoSeed, dbK and "
+                  "dbEps in rhoCreateFields.cu). Seeding the solver fields' inletOutlet faces the same way moved "
+                  "validation/restart_vs_openfoam.sh (aerofoilNACA0012 restarted: T, k, omega inletOutlet on the "
+                  "freestream, T's patch thermo-derived) from p 1.5e-05 / T 1.6e-04 to p 1.16e-03 / T 4.2e-03 "
+                  "against OpenFOAM, so U/p/he/T keep the fixedValue(inletValue) construction seed until a stage "
+                  "measurement names the state OpenFOAM's solver fields effectively see at a restart. "
+                  "BRAE_IO_STORED=0 disables the seed everywhere (the control)."),
     ],
 }
 

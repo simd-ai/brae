@@ -19,7 +19,13 @@
 #          grad(U) and grad(p), which the momentum path does not), divSchemes UNCHANGED (upwind, so the limiter
 #          path is not involved and the only leastSquares consumer is CDkOmega; rhoSST's laplacians are
 #          `orthogonal`, so the correction path is not exercised here and is stated as such).
-#          HOST arm vs OpenFOAM at LSQBOUND; CUDA arm must REFUSE by name.
+#          BOTH arms vs OpenFOAM at LSQBOUND (measured: host 2.900e-12, CUDA 2.901e-12, worst p at
+#          iteration 1 -- the shipped control's own floor). The CUDA closures compute grad(k)/grad(omega|epsilon)
+#          leastSquares since the device port (kOmegaSST.cu's CDkOmega, turbulence_transport.cu's
+#          corrected-laplacian correction; the device twin test_rho_kepsilon_cuda holds the kEpsilon
+#          closure to 1e-13 against the host under it, on a `corrected` fixture where this one is
+#          orthogonal). grad(U) and grad(p) leastSquares are still refused by that arm by name, which is
+#          why this arm switches the two closure entries EXPLICITLY and not `default`.
 #   wrong  the control that lsq is not trivially passable: brae's host arm run with fvSchemes saying
 #          `Gauss linear` (so it computes the Gauss gradient) compared against OpenFOAM's leastSquares
 #          run -- must DIFFER by far more than LSQBOUND, or the fixture cannot tell the two schemes apart
@@ -95,9 +101,16 @@ s = re.sub(r'\btolerance\s+[0-9.eE+-]+\s*;', 'tolerance 1e-14;', s)
 s = re.sub(r'\brelTol\s+[0-9.eE+-]+\s*;', 'relTol 0;', s)
 s = re.sub(r'residualControl\s*\{[^}]*\}', '', s)
 open(p, 'w').write(s)
-if v in ('lsq', 'lim'):
+if v in ('lsq', 'lsqp', 'lim'):
     p = os.path.join(d, 'system/fvSchemes'); s = open(p).read()
-    if v == 'lsq':
+    if v == 'lsqp':
+        # grad(p) ALONE, explicit: its five consumers (the momentum source, U = HbyA - rAtU*grad(p),
+        # SIMPLEC's HbyA correction, each pressure branch's non-orth correction) on both arms, with
+        # grad(U) and the closure untouched. The CUDA arm computes grad(p) leastSquares since its port
+        # (tests/rho_step_cuda_lsq.sh is its driver-level twin against the host).
+        s2 = re.sub(r'gradSchemes\s*\{\s*default\s+Gauss linear;',
+                    'gradSchemes     { default Gauss linear;\n    grad(p)         leastSquares;', s)
+    elif v == 'lsq':
         # EXPLICIT entries, not `default`: a leastSquares default also reaches OpenFOAM's grad(U) and
         # grad(p), which brae's momentum path takes as Gauss -- measured U 3.3e-06 / p 3.8e-07 at
         # iteration 1 under `default leastSquares` with upwind divergence. Naming only grad(k) and
@@ -176,13 +189,25 @@ else
 fi
 stage "$W/br_lsq_cuda" lsq || fail=1
 if runBrae "$W/br_lsq_cuda" cuda; then
-    echo "     CUDA: RAN a leastSquares closure it does not compute                       FAIL"; fail=1
-elif grep -q "to \`leastSquares\`, which this arm computes nowhere yet" "$W/br_lsq_cuda/log.brae"; then
-    echo "     CUDA: refuses by name                                                        ok"
+    compare "$W/br_lsq_cuda" "$W/of_lsq" "CUDA" "$LSQBOUND" 0 || fail=1
 else
-    echo "     CUDA: refused, but not by name                                               FAIL"; grep -v '^brae NOTICE' "$W/br_lsq_cuda/log.brae" | tail -3; fail=1
+    echo "     CUDA: did not run the leastSquares variant   FAIL"; grep -v '^brae NOTICE' "$W/br_lsq_cuda/log.brae" | tail -3; fail=1
 fi
 
+echo "== lsqp: grad(p) leastSquares, explicit -- the pressure gradient's five consumers, both arms =="
+stage "$W/of_lsqp" lsqp || fail=1
+runOF "$W/of_lsqp" || { echo "SKIP: OpenFOAM did not run the grad(p) leastSquares variant"; exit 77; }
+for M in 1 cuda; do
+    stage "$W/br_lsqp_$M" lsqp || { fail=1; continue; }
+    if runBrae "$W/br_lsqp_$M" $M; then
+        compare "$W/br_lsqp_$M" "$W/of_lsqp" "$([ $M = cuda ] && echo CUDA || echo host)" "$LSQBOUND" 0 || fail=1
+    else
+        echo "     $M: did not run the grad(p) leastSquares variant   FAIL"; grep -v '^brae NOTICE' "$W/br_lsqp_$M/log.brae" | tail -3; fail=1
+    fi
+done
+# ...and its control: the shipped (Gauss grad(p)) brae run against OpenFOAM's grad(p) leastSquares run
+# must differ, or the fixture cannot tell a Gauss pressure gradient from a least-squares one.
+compare "$W/br_ship_1" "$W/of_lsqp" "lsqp wrong-scheme" "$DIFFER" 1 || fail=1
 echo "== wrong: the Gauss gradient against OpenFOAM's leastSquares run -- must differ =="
 stage "$W/br_wrong" ship || fail=1     # brae computes Gauss linear...
 if runBrae "$W/br_wrong" 1; then
@@ -281,7 +306,7 @@ restartArm gauss_hK     gauss hK     "$LIMBOUND"
 echo "== leastSquares consumers, restarted from OpenFOAM's iteration 5 =="
 restartArm lsqko_komega lsqko komega "$LSQLIMBOUND"
 restartArm lsq_none     lsq   none   "$LSQALLBOUND"
-restartArm lsq_all      lsq   all    "$LSQALLLIMBOUND" BRAE_LEASTSQUARES=1
+restartArm lsq_all      lsq   all    "$LSQALLLIMBOUND"
 
 [ "$fail" -eq 0 ] && echo "PASSED" || echo "FAILED"
 exit $fail

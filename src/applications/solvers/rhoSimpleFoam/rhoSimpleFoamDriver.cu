@@ -262,6 +262,7 @@ RhoStepInput buildDeviceStepInput(
     in.schemeKE  = hin.schemeKE;
     in.schemeCoeffU = hin.schemeCoeffU;
     in.correctedLaplacian = hin.correctedLaplacian;
+    in.ddtEuler           = hin.ddtEuler;   // firstIteration is set per step by the loop below
     in.snGradLimitCoeff   = hin.snGradLimitCoeff;
     // The energy gradient limiters too: the device energy equation has honoured both since it was
     // written (deviceCellLimitGrad on he and on K|Ekp), and this driver never handed them over -- on
@@ -277,8 +278,14 @@ RhoStepInput buildDeviceStepInput(
     in.limGradKEK         = hin.limGradKEK;
     in.limGradHeLeastSq   = hin.limGradHeLeastSq;
     in.limGradKELeastSq   = hin.limGradKELeastSq;
+    in.gradPLeastSq       = hin.gradPLeastSq;   // every grad(p) consumer on this arm dispatches on it
+    // The ENERGY equation's non-orthogonal correction takes grad(he)'s own scheme on this arm too
+    // (rhoEEqn.cu, limGradHeLeastSq / limGradHeK, the flags projected below) -- gated end to end on
+    // gasMixing/injectorPipe by tests/rho_gasmixing_vs_openfoam.sh's CUDA arm.
     in.gradULimitK        = hin.gradULimitK;
     in.gradULULimitK      = hin.gradULULimitK;
+    in.gradMagSqrULeastSq = hin.gradMagSqrULeastSq;   // `Gauss limitedLinear` on U: grad(magSqr(U))'s entry
+    in.gradMagSqrULimitK  = hin.gradMagSqrULimitK;
 
     in.tolU = hin.tolU;  in.relTolU = hin.relTolU;
     in.tolHe = hin.tolHe; in.relTolHe = hin.relTolHe;
@@ -315,20 +322,33 @@ TurbulenceHookOptions buildTurbulenceHookOptions(
     // gradient only, and deviceLeastSquaresGrad is not wired into them yet. Running the case here would
     // build CDkOmega and the laplacian corrections from a different discretisation under the case's own
     // scheme name -- refused, until that module is ported and gated on its own.
-    if (hin.gradKLeastSq || hin.gradULeastSq || hin.gradPLeastSq)
+    // fvm::ddt(alpha, rho, k|epsilon) under `ddtSchemes default Euler`, from the same parse the host
+    // arm reads (parseDdtScheme; rDeltaT = 1/controlDict's LAST deltaT). Both device closures compute
+    // it: kEpsilon.cu (test_rho_kepsilon_cuda's Euler arm, tests/rho_step_cuda_euler.sh) and
+    // kOmegaSST.cu (the same script's SST arm), each against the host reference.
+    opt.rDeltaT               = hin.ddtEuler ? hin.rDeltaT : scalar(0);
+    // grad(k)/grad(epsilon|omega) resolving to leastSquares: computed by both device closures (the
+    // corrected laplacian's correction through turbulence_transport.cu, the SST's CDkOmega in
+    // kOmegaSST.cu; the limiter's own gradient was already limGradLeastSq), gated against the host
+    // reference by test_rho_kepsilon_cuda's leastSquares arm and against OpenFOAM by
+    // tests/rho_leastsquares_closure_vs_openfoam.sh. grad(p) leastSquares is computed at all five of
+    // its device consumers (RhoStepInput::gradPLeastSq; tests/rho_step_cuda_lsq.sh). grad(U) -- the
+    // VECTOR form, divDevRhoReff, the limiters and the closures' production -- is still refused.
+    opt.co.gradKLeastSq       = hin.gradKLeastSq;
+    if (hin.gradULeastSq)
         throw std::runtime_error(
-            std::string("rhoSimpleFoam (OF-mirror, CUDA): gradSchemes resolve ") +
-            (hin.gradKLeastSq ? std::string("grad(k)/grad(") + (hf.rasModel == "kOmegaSST" ? "omega" : "epsilon") + ") " : "") +
-            (hin.gradULeastSq ? "grad(U) " : "") + (hin.gradPLeastSq ? "grad(p) " : "") +
-            "to `leastSquares`, which this arm computes nowhere yet: its closures, momentum gradients and "
-            "pressure gradient take Gauss linear, optionally cellLimited. The host arm runs it "
-            "(BRAE_RHOSIMPLEFOAM_MIRROR=1). Refusing rather than running a different gradient under the "
-            "case's scheme name.");
+            "rhoSimpleFoam (OF-mirror, CUDA): gradSchemes resolve grad(U) to `leastSquares`, which this "
+            "arm computes nowhere yet for a VECTOR: divDevRhoReff's dev2 term, the momentum limiters and "
+            "the closures' production take Gauss linear, optionally cellLimited (the scalar consumers -- "
+            "grad(p), grad(k)/grad(epsilon|omega), the energy limiters -- are ported). The host arm runs "
+            "it (BRAE_RHOSIMPLEFOAM_MIRROR=1). Refusing rather than running a different gradient under "
+            "the case's scheme name.");
     // kOmegaSST: the model flag and its own coefficients, from the same host parse the host arm reads.
     // The second-scalar buffers carry omega when this is set -- see createFields.
     opt.sst   = (hf.rasModel == "kOmegaSST");
     opt.sstCo = hf.sstCoeffs;
-    opt.sstCo.gradKLimitK = hin.gradKLimitK;
+    opt.sstCo.gradKLimitK  = hin.gradKLimitK;
+    opt.sstCo.gradKLeastSq = hin.gradKLeastSq;
     opt.Prt                   = hf.Prt;
     opt.bounded               = hin.boundedTurb;
     opt.correctedLaplacian    = hin.correctedLaplacian;
@@ -966,9 +986,11 @@ int runMirrorCuda(const std::string& caseDir)
     int  nIter = static_cast<int>(nSteps);
     bool converged = false;
     scalar cumulativeContErr = 0.0;   // continuityErrs.H: summed over the run
+    int nStepsThisProcess = 0;        // RhoStepInput::firstIteration: rho.oldTime() semantics
     while (time.loop())
     {
         const int iter = time.timeIndex();
+        gin.firstIteration = (nStepsThisProcess++ == 0);
 
         // muEff and alphaEff, on the device. They are the only route by which the thermo and the
         // closure reach the momentum and energy equations, and computing them on the host would mean

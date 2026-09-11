@@ -22,6 +22,7 @@
 // against 0.5|U|^2 of order 10 -- four orders of magnitude. A solver using the wrong arm converges to a
 // smooth, plausible, wrong temperature field, which is why THE CONTROL below builds the `h` arm on
 // purpose and requires both the kinetic field and the assembled matrix to disagree with OpenFOAM.
+#include "scheme_parse.cuh"   // parseFieldGradScheme
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -226,6 +227,15 @@ int main(int argc, char** argv)
     in.schemeHe           = cpu::rhoSimple::DivScheme::upwind;
     in.schemeKE           = cpu::rhoSimple::DivScheme::upwind;
     in.correctedLaplacian = true;
+    // grad(he)'s OWN gradSchemes entry, which correctedSnGrad::fullGradCorrection resolves for the
+    // corrected laplacian (correctedSnGrad.C) -- the same entry the limitedLinear limiter takes. A
+    // hardcoded Gauss here put the energy source 2.8e-07 and the solved he 2.2e-06 off OpenFOAM on
+    // gasMixing/injectorPipe (default leastSquares); with it honoured, 6.3e-11 and 4.7e-16.
+    {
+        const FieldGradScheme gHe = parseFieldGradScheme(caseDir, f.heName);
+        in.limGradHeLeastSq = gHe.leastSquares;
+        in.limGradHeK       = gHe.cellLimitK;
+    }
     const FoamDict* rf = fvSolution.subDict("relaxationFactors");
     const FoamDict* re = rf ? rf->subDict("equations") : nullptr;
     in.relaxHe = re ? re->scalarOr(f.heName, 1.0) : 1.0;

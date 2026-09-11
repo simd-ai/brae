@@ -13,7 +13,17 @@
 #include <stdexcept>
 #include <vector>
 
+#include <cstdlib>
+#include <string>
+
 namespace brae {
+
+// See DeviceBoundary::ioStored. Read once; "0" disables the stored-value seed.
+inline bool ioStoredEnabled()
+{
+    static const bool on = !(std::getenv("BRAE_IO_STORED") && std::string(std::getenv("BRAE_IO_STORED")) == "0");
+    return on;
+}
 
 struct DeviceBoundary
 {
@@ -31,6 +41,32 @@ struct DeviceBoundary
     DeviceBuffer<label>  assignableMask;
     DeviceBuffer<label>  ioMask;            // 1 if the face is inletOutlet (bcType recomputed from the flux sign)
     DeviceBuffer<label>  oioMask;           // 1 if the face is outletInlet (freestreamPressure): opposite flux switch
+    // The STORED patch value of an inletOutlet / outletInlet face, and whether it is still what an evaluate
+    // must return. OpenFOAM constructs both with valueFraction 0 and the file's `value` (or the cells,
+    // absent one) and first runs the flux switch inside the first assembly's updateCoeffs; until then every
+    // fvc::grad / interpolate reads that stored value. This arm keeps no stored patch values, so before
+    // its first deviceUpdateInletOutlet an evaluate could only return what the construction-time
+    // coefficients give -- fixedValue(inletValue) here, which is neither the stored value on an outflow
+    // face (the owner cell) nor on an inflow one (the last refValue). Measured on gasMixing/injectorPipe
+    // restarted from OpenFOAM's own iteration 5: the closure's assembled epsilon off-diagonals 1.6e-04
+    // off the host with 100% of it on outlet-adjacent faces (461 outflow faces, OpenFOAM's written value
+    // equal to the owner cell on every one); seeded zeroGradient instead, 8.8e-04 with 100% of it on the
+    // two turbulent inlets. From rest (inletValue == internalField) nothing showed. ioFresh is cleared by
+    // the first flux switch, after which the coefficients ARE the last evaluate.
+    // inletOutlet ONLY, and ONLY where the builder is asked (storedIoSeed): the closure's k and
+    // epsilon|omega boundaries, whose stored value the closure reconstructs at its first step (kEpsilon.cu,
+    // kOmegaSST.cu) -- measured on the gasMixing restart above, CUDA 1.2e-11 of OpenFOAM after. Seeding
+    // the SOLVER fields the same way went the other way on validation/restart_vs_openfoam.sh
+    // (aerofoilNACA0012 restarted, T/k/omega inletOutlet on the freestream, thermo-derived T patch):
+    // p 1.5e-05 -> 1.16e-03 and T 1.6e-04 -> 4.2e-03 against OpenFOAM, so U/p/he/T keep their
+    // fixedValue(inletValue) construction seed. Recorded as OPEN in the manifest: which construction
+    // state OpenFOAM's solver fields effectively see at a restart has not been named by a stage
+    // measurement yet, and a seed that helps one gate and hurts another is not a port.
+    // BRAE_IO_STORED=0 disables the seed (ioFresh all zero): the control that reproduces the
+    // fixedValue(inletValue) construction state from a shipped binary, as BRAE_DILU_KE does for the
+    // preconditioner. Never the default.
+    DeviceBuffer<scalar> ioStored;
+    DeviceBuffer<label>  ioFresh;
     DeviceBuffer<label>  mixedMask;         // 1 if the face is mixed/Robin (freestreamVelocity/Pressure): vf recomputed
     DeviceBuffer<label>  piovMask;          // 1 if the face is pressureInletOutletVelocity (bcType+refValue recomputed)
     DeviceBuffer<label>  symMask;            // 1 if the face is slip/symmetry (per-comp vf=|n_k|, ref recomputed each step)
@@ -56,10 +92,13 @@ struct DeviceBoundary
 inline DeviceBoundary buildDeviceBoundary(
     const GeometricField<scalar>& f,
     const std::vector<FvPatch>& fvp,
-    const FvGeometry& g)
+    const FvGeometry& g,
+    // Seed inletOutlet faces with the field's stored value until the first flux switch (ioStored). ON for
+    // the closure fields only -- see DeviceBoundary::ioStored for the two measurements that bound it.
+    bool storedIoSeed = false)
 {
-    std::vector<label> ty, fc, io, oio, mx, pv, sm, tp, sg, asg;
-    std::vector<scalar> ref, dc, ms, vf, p0, rg;   // rg = fixedGradient normal gradient (0 elsewhere)
+    std::vector<label> ty, fc, io, oio, mx, pv, sm, tp, sg, asg, iofr;
+    std::vector<scalar> ref, dc, ms, vf, p0, rg, iost;   // rg = fixedGradient normal gradient (0 elsewhere)
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         if (isCoupledInterfaceType(fvp[pi].type)) continue;                     // cyclic = internal-like (handled by appended faces)
@@ -75,16 +114,28 @@ inline DeviceBoundary buildDeviceBoundary(
         const std::vector<scalar> val = f.boundary[pi]->refValues();   // totalPressure: p0
         // totalPressure's initial device VALUE is the patch value -- the written `value` on a restart from
         // OpenFOAM's output, p0 on a cold start -- while its p0 buffer takes the reference (queue 20).
-        const std::vector<scalar> cur = (cat == 7) ? f.boundary[pi]->value() : std::vector<scalar>{};
+        const std::vector<scalar> cur = (cat == 7 || cat == 3) ? f.boundary[pi]->value() : std::vector<scalar>{};
         const std::vector<scalar>* vfp = f.boundary[pi]->valueFractionPtr();   // mixed (cat 5): per-face vf seed
         const std::vector<scalar>* rgp = f.boundary[pi]->refGradPtr();         // fixedGradient: per-face g
         const label sgm = f.boundary[pi]->updateableSnGrad() ? 1 : 0;   // fixedFluxPressure
         for (label i = 0; i < fvp[pi].size; ++i)
         {
-            // Categories whose VALUE is resolved per-step but whose TYPE is a plain fixedValue: inletOutlet,
-            // outletInlet, totalPressure and flowRateInletVelocity(mass). They must map to 1 here -- pushing
-            // the category through as a device bcType leaves an unknown type that no evaluator handles.
+            // Categories whose VALUE is resolved per-step but whose TYPE is a plain fixedValue: totalPressure
+            // and flowRateInletVelocity(mass) map to 1 here -- pushing the category through as a device
+            // bcType leaves an unknown type that no evaluator handles. inletOutlet and outletInlet START
+            // AS zeroGradient (0): OpenFOAM constructs both with valueFraction 0 (inletOutletFvPatchField.C
+            // and outletInletFvPatchField.C, the dictionary constructors) and the flux switch first runs
+            // inside the first assembly's updateCoeffs. This arm keeps no stored patch values, so until
+            // that first switch every evaluate is what these construction-time coefficients give: seeded
+            // fixedValue(inletValue), a RESTARTED case saw inletValue on every inletOutlet face at its
+            // first step where OpenFOAM's stored value is the last evaluate. Measured on gasMixing/
+            // injectorPipe restarted from OpenFOAM's iteration 5: the closure's assembled epsilon
+            // off-diagonals 1.6e-04 off the host, 100% of it on faces of outlet-adjacent cells (the
+            // outlet's k/epsilon are inletOutlet, all 461 faces outflow, OpenFOAM's written value equal to
+            // the owner cell on every one), while from rest (inletValue == internalField) nothing showed.
             ty.push_back((cat == 3 || cat == 4 || cat == 7 || cat == 9) ? 1 : cat);   // 5 stays mixed
+            iost.push_back((cat == 3 && i < (label)cur.size()) ? cur[i] : 0.0);
+            iofr.push_back((cat == 3 && storedIoSeed && ioStoredEnabled()) ? 1 : 0);
             asg.push_back(f.boundary[pi]->assignable() ? 1 : 0);
             io.push_back(cat == 3 ? 1 : 0);
             oio.push_back(cat == 4 ? 1 : 0);
@@ -108,6 +159,8 @@ inline DeviceBoundary buildDeviceBoundary(
     db.assignableMask.copyFrom(asg);
     db.ioMask.copyFrom(io);
     db.oioMask.copyFrom(oio);
+    db.ioStored.copyFrom(iost);
+    db.ioFresh.copyFrom(iofr);
     db.mixedMask.copyFrom(mx);
     db.piovMask.copyFrom(pv);
     db.symMask.copyFrom(sm);
@@ -280,10 +333,11 @@ void deviceUpdateTotalPressure(DeviceBoundary& db, const DeviceBuffer<scalar>& p
 inline DeviceVectorBoundary buildDeviceVectorBoundary(
     const GeometricField<vector>& f,
     const std::vector<FvPatch>& fvp,
-    const FvGeometry& g)
+    const FvGeometry& g,
+    bool storedIoSeed = false)   // as the scalar builder's
 {
-    std::vector<label> ty[3], fc, io, oio, mx, pv, sm, wdg;
-    std::vector<scalar> dc, ms, ref[3], vf[3], nrm[3], rg[3], wdgT;   // rg = fixedGradient, per component
+    std::vector<label> ty[3], fc, io, oio, mx, pv, sm, wdg, iofr;
+    std::vector<scalar> dc, ms, ref[3], vf[3], nrm[3], rg[3], wdgT, iost[3];   // rg = fixedGradient, per component
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         if (isCoupledInterfaceType(fvp[pi].type)) continue;                     // cyclic = internal-like (handled by appended faces)
@@ -304,6 +358,8 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
                                   wedge ? scalar(0.5)*(scalar(1) - wcT->zz) : scalar(0) };
         // The REFERENCE value, not the current one -- see the scalar builder above.
         const std::vector<vector> val = f.boundary[pi]->refValues();
+        // ...and the STORED value of an inletOutlet/outletInlet face -- see DeviceBoundary::ioStored.
+        const std::vector<vector> curv = (cat == 3) ? f.boundary[pi]->value() : std::vector<vector>{};
         const std::vector<scalar>* vfp = f.boundary[pi]->valueFractionPtr();   // mixed (cat 5): per-face vf seed
         // fixedGradient on a VECTOR field: the gradient is a vector, so it splits per component -- each
         // DeviceBoundary in comp[] carries its own refGrad, exactly as each carries its own refValue.
@@ -315,6 +371,7 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
             ms.push_back(g.magSf()[fvp[pi].start + i]);
             io.push_back(cat == 3 ? 1 : 0);
             oio.push_back(cat == 4 ? 1 : 0);   // inletOutlet / outletInlet (same flux for all 3 comps)
+            iofr.push_back((cat == 3 && storedIoSeed && ioStoredEnabled()) ? 1 : 0);
             // A WEDGE is NOT in the mixed mask, even though it reports category 5. It borrows the mixed
             // (Robin) slot for its COEFFICIENTS only -- its valueFraction d_k = 0.5*(1 - cellT_kk) is pure
             // geometry, fixed for the run. deviceUpdateMixedFreestream rewrites the valueFraction of every
@@ -353,6 +410,7 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
                     ty[k].push_back(5);
                     vf[k].push_back(wdgVf[k]);
                     ref[k].push_back(rv[k]);
+                    iost[k].push_back(0.0);   // never an io face; every per-face array is indexed alike
                 }
             }
             else if (sym)   // mixed kernels; vf_k=|n_k|, ref recomputed per step (init = host value v - n(n.v))
@@ -362,6 +420,10 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
                     ty[k].push_back(5);
                     vf[k].push_back(std::fabs(nrm[k].back()));
                     ref[k].push_back(rv[k]);
+                    // never an io face, but ioStored must have one entry per face like every other array:
+                    // a shorter one was read past its end on a case with a symmetry patch (an illegal
+                    // address in test_mean_velocity_force).
+                    iost[k].push_back(0.0);
                 }
             }
             else
@@ -375,6 +437,8 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
                     ty[k].push_back((cat == 3 || cat == 4 || cat == 9) ? 1 : (cat == 6 ? 0 : cat));
                     vf[k].push_back(seedVf);
                     ref[k].push_back(rv[k]);
+                    iost[k].push_back((cat == 3 && i < (label)curv.size())
+                                      ? (k == 0 ? curv[i].x : k == 1 ? curv[i].y : curv[i].z) : 0.0);
                 }
             }
         }
@@ -390,6 +454,8 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
         db.comp[k].bcType.copyFrom(ty[k]);
         db.comp[k].ioMask.copyFrom(io);
         db.comp[k].oioMask.copyFrom(oio);
+        db.comp[k].ioStored.copyFrom(iost[k]);
+        db.comp[k].ioFresh.copyFrom(iofr);
         db.comp[k].mixedMask.copyFrom(mx);
         db.comp[k].piovMask.copyFrom(pv);
         db.comp[k].symMask.copyFrom(sm);

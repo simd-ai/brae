@@ -182,6 +182,11 @@ struct Compressible
     const SurfaceScalarField*               phiByRho = nullptr;   // the VOLUMETRIC flux, for divU alone
     std::vector<scalar>*                    alphat   = nullptr;   // out: rho*nut/Prt (EddyDiffusivity)
     scalar                                  Prt      = 1.0;
+    // fvm::ddt(alpha, rho, omega_|k_) (kOmegaSSTBase.C:572,602): rDeltaT = 1/deltaT under Euler, 0 under
+    // steadyState. rhoOld is rho.oldTime() -- StepInput::firstIteration says which rho; psi.oldTime() is
+    // the field at entry. The same term the kEpsilon port carries (kEpsilon_cpp.cuh Compressible).
+    scalar                                  rDeltaT  = 0.0;
+    const std::vector<scalar>*              rhoOld   = nullptr;
 };
 
 // kOmegaSSTLM's three virtual overrides of this model, supplied by the DERIVED model rather than

@@ -123,6 +123,16 @@ struct StepInput
     // default is leastSquares, and the momentum matrix read 4.63e-02 off OpenFOAM's own there.
     bool      gradMagSqrULeastSq = false;
     scalar    gradMagSqrULimitK   = 0.0;
+    // fvm::ddt in the CLOSURES (see parseDdtScheme). rDeltaT is 0 under steadyState. firstIteration is
+    // the process's first SIMPLE iteration: GeometricField::oldTime() creates the _0 field as a copy of
+    // the field AT FIRST USE (GeometricField.C, NO_READ), so on that iteration rho.oldTime() inside the
+    // closure's ddt is rho as it stands at the closure -- the tail's relaxed rho -- and on every later
+    // one it is the rho the iteration started with, stored by the first non-const access of the new
+    // time index (rho = thermo.rho() at the pressure tail). Measured on gasMixing at its first restarted
+    // iteration: the source is rho_closure*eps_old*V to 1.8e-09 and rho_start*eps_old*V to 1.3e-03.
+    bool      ddtEuler         = false;
+    scalar    rDeltaT          = 0.0;
+    bool      firstIteration   = true;
     bool      gradPLeastSq     = false;   // grad(p)'s
     // The gradient `linearUpwind <name>` / `linearUpwindV <name>` NAMES in div(phi,U) -- OpenFOAM's
     // mesh.gradScheme(<name>) (linearUpwind.C:61-68) -- which is a different lookup from grad(U)'s own

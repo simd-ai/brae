@@ -113,6 +113,9 @@ struct RhoSolverFields
     // 0.94. Held here rather than inside a thermo object because the driver's thermo is a hook, and a
     // device-resident hook and a host one must be able to write the same state.
     DeviceBuffer<scalar> rhoThermo, rhoThermoBnd;
+    // rho.oldTime() for the closures' fvm::ddt under Euler, written by the step immediately before the
+    // turbulence hook runs (RhoStepInput::ddtEuler). EMPTY under steadyState.
+    DeviceBuffer<scalar> rhoOld;
 
     // fvc::domainIntegrate(psi*p) at the start of the run, for the closed-volume correction.
     double initialMass = 0.0;
@@ -123,6 +126,13 @@ struct RhoStepInput
     // --- algorithm ---
     bool consistent = false;   // simple.consistent() -> pcEqn.H rather than pEqn.H
     bool transonic  = false;   // simple.transonic()  -> the convective pressure branch
+    // fvm::ddt in the CLOSURES under `ddtSchemes default Euler` (kEpsilon.C:254,275). The step owns
+    // rho.oldTime(): on the process's first iteration it is rho as the closure sees it (GeometricField::
+    // oldTime() copies at first use), afterwards the rho this iteration started with -- the host
+    // reference's StepInput::firstIteration rule, measured there (rhoSimpleFoam_cpp.cuh). The step
+    // writes it into RhoSolverFields::rhoOld before the closure hook; the hook carries 1/deltaT.
+    bool ddtEuler       = false;
+    bool firstIteration = true;
 
     // --- the effective transport for THIS iteration, supplied by the caller because it comes from the
     //     thermo and the closure, both of which the caller owns:
@@ -142,6 +152,9 @@ struct RhoStepInput
     scalar schemeCoeffU = 1.0;
     scalar gradULimitK = 0.0, gradHeLimitK = 0.0, gradKELimitK = 0.0;
     scalar gradULULimitK = -1.0;   // linearUpwind's NAMED gradient on div(phi,U) -- see RhoMomentumInput
+    // `Gauss limitedLinear` on U limits on magSqr(U): grad(magSqr(U))'s own entry (RhoMomentumInput).
+    bool   gradMagSqrULeastSq = false;
+    scalar gradMagSqrULimitK  = 0.0;
     // The energy pair's `Gauss limitedLinear <k>` coefficients (RAW k) and the cellLimited coefficient
     // of the case's grad(<field>), which limits the LIMITER's own gradient -- a different lookup from
     // the three above, which hold the gradient linearUpwind NAMES. See RhoEnergyInput.
@@ -149,6 +162,10 @@ struct RhoStepInput
     scalar limGradHeK    = 0.0, limGradKEK    = 0.0;
     bool   limGradHeLeastSq = false, limGradKELeastSq = false;
     bool   turbLimGradLeastSq = false;
+    // grad(p)'s own gradSchemes entry resolving to leastSquares (fvcGrad.C:149): the momentum source
+    // -grad(p)*V, U = HbyA - rAtU*grad(p), SIMPLEC's HbyA correction and each pressure branch's
+    // non-orthogonal correction all take it. The host reference's StepInput::gradPLeastSq.
+    bool   gradPLeastSq = false;
     bool   correctedLaplacian = false;
     scalar snGradLimitCoeff   = 0.0;
     bool   isE = true;                    // he == "e" selects Ekp, "h" selects K

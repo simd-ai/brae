@@ -361,7 +361,15 @@ void assembleEEqn(
             DeviceBuffer<scalar> hb, gx, gy, gz, lc;
             if (in.heBndValues) deviceCopy(hb, *in.heBndValues);
             else                deviceBCValue(dbHe, he, hb);
-            deviceGaussGrad(dm, he, hb, gx, gy, gz);
+            // correctedSnGrad's correction takes grad(he)'s OWN gradSchemes entry (correctedSnGrad.C:
+            // 52-55): its base and its cellLimited coefficient -- the same two the limitedLinear limiter
+            // resolves (limGradHeLeastSq / limGradHeK), as rhoEEqn_cpp.cu's limiterGrad takes them. This
+            // built the correction from an unlimited Gauss gradient whatever the case said; measured on
+            // gasMixing/injectorPipe (default leastSquares, snappyHexMesh) the host read T 8.6e-07 off
+            // OpenFOAM at a developed restart with that defect and 9.6e-13 without it.
+            if (in.limGradHeLeastSq) deviceLeastSquaresGrad(dm, he, hb, gx, gy, gz);
+            else                     deviceGaussGrad(dm, he, hb, gx, gy, gz);
+            if (in.limGradHeK > 0.0) deviceCellLimitGrad(dm, he, hb, gx, gy, gz, in.limGradHeK);
             if (in.snGradLimitCoeff > 0.0)
             {
                 DeviceBuffer<scalar> ffcL;

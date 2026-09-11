@@ -198,6 +198,51 @@ runs() {
 }
 
 # refuses <name> <tutorial path> <expected text> <what it needs>
+# runsHostRefusesCuda <name> <path> <hostBound> <last> <cudaMustSay>: the HOST arm runs and is held against
+# OpenFOAM to iteration <last>; the CUDA arm must refuse BY NAME. For a tutorial the host mirror now runs
+# and the device mirror does not yet implement.
+runsHostRefusesCuda() {
+    local name="$1" path="$2" hb="$3" last="$4" want="$5"
+    echo "== $name (host runs, CUDA refuses) =="
+    if ! mesh "$path" "$name"
+    then
+        echo "     SKIP: the tutorial's own meshing did not run here"
+        note "$name" "-" "SKIPPED (meshing unavailable here)"
+        return 0
+    fi
+    local of="$W/of_$name"
+    stage "$W/mesh_$name" "$of"
+    ( cd "$of" && rhoSimpleFoam > log.rhoSimpleFoam 2>&1 )
+    if [ ! -d "$of/$last" ]
+    then
+        echo "     SKIP: OpenFOAM itself did not reach iteration $last here"
+        note "$name" "-" "SKIPPED (no OpenFOAM oracle)"
+        return 0
+    fi
+    local ok=1 d="$W/br_${name}_1"
+    stage "$W/mesh_$name" "$d"
+    if ! BRAE_RHOSIMPLEFOAM_MIRROR=1 "$BRAE" -case "$d" > "$d/log.brae" 2>&1 || [ ! -d "$d/$last" ]
+    then
+        echo "     host: DID NOT RUN the tutorial"; grep -v '^brae NOTICE' "$d/log.brae" | tail -3; fail=1; ok=0
+    else
+        compare "$d" "$of" "host" "$hb" "$last" || { fail=1; ok=0; }
+    fi
+    d="$W/br_${name}_cuda"
+    stage "$W/mesh_$name" "$d"
+    if BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BRAE" -case "$d" > "$d/log.brae" 2>&1
+    then
+        echo "     CUDA: RAN a tutorial it does not implement                                  FAIL"; fail=1; ok=0
+    elif ! grep -q -- "$want" "$d/log.brae"
+    then
+        echo "     CUDA: refused, but not by name                                               FAIL"
+        grep -v '^brae NOTICE' "$d/log.brae" | tail -2; fail=1; ok=0
+    else
+        echo "     CUDA: refuses by name                                                        ok"
+    fi
+    [ "$ok" = 1 ] && note "$name" "RUNS" "host vs OpenFOAM to iteration $last; CUDA refuses by name" \
+                  || note "$name" "BROKE" "see above"
+}
+
 refuses() {
     local name="$1" path="$2" want="$3" needs="$4"
     echo "== $name (expected to refuse) =="
@@ -244,10 +289,14 @@ runs squareBendLiqNoNewtonian squareBendLiqNoNewtonian     1e-11 1e-11 1
 refuses squareBendLiq        squareBendLiq \
         "uniformFixedValue with a non-constant uniformValue" \
         "the expression PatchFunction1 on its T walls"
-refuses injectorPipe         gasMixing/injectorPipe \
-        'div(phi,e) is `Gauss limitedLinear`' \
-        "leastSquares reached by default: div(phi,e)'s limiter, then grad(k)/grad(epsilon)"
-
+# gasMixing/injectorPipe: iteration 1 ONLY, like squareBendLiqNoNewtonian and for the same reason -- from
+# rest k is `uniform 6`, epsilon `uniform 100` and T uniform, every limitedLinear limiter sits in NVDTVD's
+# 0/0 branch, and the codes part at iteration 2 (T 9.85e-05, k 9.6e-06) on the sign of round-off. Iteration
+# 1 is exact (every field <= 2.8e-12). The DEVELOPED-state gate is tests/rho_gasmixing_vs_openfoam.sh, which
+# restarts both codes from OpenFOAM's own iteration 5 (2.0e-11 worst over iterations 6-8). BOTH arms:
+# the CUDA arm runs it since the closures' fvm::ddt under Euler, grad(k)/grad(epsilon)/grad(p)
+# leastSquares and the energy correction's gradient scheme were ported to it, each gated on its own.
+runs injectorPipe gasMixing/injectorPipe 1e-11 1e-11 1
 echo
 echo "==================== rhoSimpleFoam tutorials, OpenFOAM v2412 ===================="
 sort "$SUMMARY"

@@ -156,7 +156,8 @@ ConsistentPressureStages consistentPressurePredictor(
         }
     }
     const SurfaceScalarField drhof   = interp(drho, drhoB, m, g, patches);
-    const SurfaceScalarField snGradP = fvc::snGrad(p, m, g, patches, in.correctedLaplacian);
+    // ...whose non-orthogonal correction takes grad(p)'s own scheme (correctedSnGrad.C:52-55).
+    const SurfaceScalarField snGradP = fvc::snGrad(p, m, g, patches, in.correctedLaplacian, in.gradPLeastSq);
 
     SurfaceScalarField simplecCorr;
     simplecCorr.internal.resize(st.phiHbyA.internal.size());

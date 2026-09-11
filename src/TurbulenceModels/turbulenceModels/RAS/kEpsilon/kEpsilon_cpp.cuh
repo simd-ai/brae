@@ -135,6 +135,11 @@ struct Compressible
     const std::vector<scalar>*              nu       = nullptr;   // cells, mu/rho; null => the scalar nu
     const std::vector<std::vector<scalar>>* nuBnd    = nullptr;
     const SurfaceScalarField*               phiByRho = nullptr;   // VOLUMETRIC flux, for divU only
+    // fvm::ddt(alpha, rho, k|epsilon) (kEpsilon.C:254,275): rDeltaT = 1/deltaT under Euler, 0 under
+    // steadyState (the term vanishes). rhoOld is rho.oldTime() -- see StepInput::firstIteration for
+    // which rho that is; psi.oldTime() is the field at entry, before the wall function writes it.
+    scalar                                  rDeltaT  = 0.0;
+    const std::vector<scalar>*              rhoOld   = nullptr;
     // EddyDiffusivity::correctNut -- alphat = rho*nut/Prt, which the energy equation needs and the
     // momentum equation does not. Written out when supplied.
     std::vector<scalar>*                    alphat   = nullptr;

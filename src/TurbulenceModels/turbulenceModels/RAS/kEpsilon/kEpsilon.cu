@@ -127,6 +127,9 @@ __global__ void epsReactionKernel(
     scalar        C3,
     scalar        Cmu,
     int           bounded,
+    scalar        rDeltaT,
+    const scalar* rhoOld,
+    const scalar* epsOld,
     scalar*       diag,
     scalar*       source)
 {
@@ -147,6 +150,14 @@ __global__ void epsReactionKernel(
     // - fvm::Sp(C2*alpha*rho*epsilon/k, epsilon)
     diag[c] += C2 * r * eps[c] / k[c] * v;
 
+    // fvm::ddt(alpha, rho, epsilon_), kEpsilon.C:254 -- at the reference's position in the sum, so the
+    // two arms' diagonals round the same way (the stage gate holds them to 1e-13).
+    if (rDeltaT > scalar(0))
+    {
+        diag[c]   += rDeltaT * r * v;
+        source[c] += rDeltaT * rhoOld[c] * epsOld[c] * v;
+    }
+
     // `bounded`: - fvm::Sp(fvc::div(phi), epsilon), against the EQUATION's mass flux. It vanishes where
     // phi is conservative, so it cannot move a converged state -- which is why it needs its own
     // measurement rather than being assumed harmless.
@@ -165,6 +176,9 @@ __global__ void kReactionKernel(
     const scalar* divU,
     const scalar* divPhi,
     int           bounded,
+    scalar        rDeltaT,
+    const scalar* rhoOld,
+    const scalar* kOld,
     scalar*       diag,
     scalar*       source)
 {
@@ -185,6 +199,13 @@ __global__ void kReactionKernel(
     // incompressible lineage where it is 1: at rho ~ 0.38 leaving it out made k's destruction 2.6x too
     // strong across the whole field while epsilon, solved first and correctly weighted, looked fine.
     diag[c] += r * eps[c] / k[c] * v;
+
+    // fvm::ddt(alpha, rho, k_), kEpsilon.C:275
+    if (rDeltaT > scalar(0))
+    {
+        diag[c]   += rDeltaT * r * v;
+        source[c] += rDeltaT * rhoOld[c] * kOld[c] * v;
+    }
 
     if (bounded) diag[c] -= divPhi[c] * v;
 }
@@ -589,6 +610,7 @@ void assembleTransport(
     sc.luGradK            = in.luGradK;
     sc.correctedLaplacian = in.correctedLaplacian;
     sc.gradFieldLimitK    = in.co.gradKLimitK;
+    sc.gradFieldLeastSq   = in.co.gradKLeastSq;
     sc.snGradLimitCoeff   = in.snGradLimitCoeff;
     sc.bndValues          = bndValues;
     turbulence::assembleScalarTransport(M, dm, db, field, gammaFace, gammaBnd, sc);
@@ -607,9 +629,19 @@ void assembleEpsEqn(
     const DeviceBuffer<scalar>& k,
     const DeviceBuffer<scalar>& nut,
     const KEpsilonInput&        in,
-    const DeviceBuffer<scalar>* epsBndValues)
+    const DeviceBuffer<scalar>* epsBndValues,
+    const DeviceBuffer<scalar>* epsOld)
 {
     const int nC = dm.nCells;
+    if (in.rDeltaT > scalar(0) && !(epsOld && epsOld->size() == static_cast<std::size_t>(nC)))
+    {
+        throw std::runtime_error(
+            "kEpsilon(cuda): fvm::ddt under Euler needs epsilon.oldTime() -- the field as correct() was "
+            "entered -- and none was supplied. Refusing rather than assembling the term from the "
+            "wall-overridden field.");
+    }
+    const scalar* rhoOldP = (in.rhoOldCell && in.rhoOldCell->size()) ? in.rhoOldCell->data()
+                                                                       : in.rhoCell->data();
 
     // epsilon_.boundaryFieldRef().updateCoeffs(). turbulentMixingLengthDissipationRateInlet recomputes
     // its refValue from k's CURRENT patch values here, and the flux switch resolves inletOutlet -- both
@@ -634,7 +666,9 @@ void assembleEpsEqn(
     epsReactionKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), in.rhoCell->data(), st.gByNu.data(), k.data(),
                                          epsilon.data(), st.divU.data(), st.divPhi.data(),
                                          in.co.C1, in.co.C2, in.co.C3, in.co.Cmu,
-                                         in.boundedEps ? 1 : 0, E.diag.data(), E.source.data());
+                                         in.boundedEps ? 1 : 0,
+                                         in.rDeltaT, rhoOldP, epsOld ? epsOld->data() : nullptr,
+                                         E.diag.data(), E.source.data());
     cudaCheck(cudaGetLastError(), "kEpsilon eps reaction");
 }
 
@@ -649,9 +683,17 @@ void assembleKEqn(
     const DeviceBuffer<scalar>& epsilon,
     const DeviceBuffer<scalar>& nut,
     const KEpsilonInput&        in,
-    const DeviceBuffer<scalar>* kBndValues)
+    const DeviceBuffer<scalar>* kBndValues,
+    const DeviceBuffer<scalar>* kOld)
 {
     const int nC = dm.nCells;
+    if (in.rDeltaT > scalar(0) && !(kOld && kOld->size() == static_cast<std::size_t>(nC)))
+    {
+        throw std::runtime_error(
+            "kEpsilon(cuda): fvm::ddt under Euler needs k.oldTime() and none was supplied.");
+    }
+    const scalar* rhoOldP = (in.rhoOldCell && in.rhoOldCell->size()) ? in.rhoOldCell->data()
+                                                                       : in.rhoCell->data();
 
     // k_'s own boundary refresh: turbulentIntensityKineticEnergyInlet reads U's CURRENT patch values.
     if (in.turbInletKMask && in.turbInletKInt)
@@ -664,7 +706,9 @@ void assembleKEqn(
 
     kReactionKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), in.rhoCell->data(), st.G.data(), k.data(),
                                        epsilon.data(), st.divU.data(), st.divPhi.data(),
-                                       in.boundedK ? 1 : 0, K.diag.data(), K.source.data());
+                                       in.boundedK ? 1 : 0,
+                                       in.rDeltaT, rhoOldP, kOld ? kOld->data() : nullptr,
+                                       K.diag.data(), K.source.data());
     cudaCheck(cudaGetLastError(), "kEpsilon k reaction");
 }
 
@@ -936,6 +980,16 @@ void correct(
     // OpenFOAM at iteration 2 in the inlet-layer corner cells, 1.2e-04 by iteration 3; the host 4.7e-13.
     DeviceBuffer<scalar> kBndLast;
     if (dbK.n) deviceBCValue(dbK, k, kBndLast);
+    // psi.oldTime() for fvm::ddt under Euler: the fields as this call was entered, taken BEFORE the
+    // wall override rewrites epsilon's wall cells -- the same point kEpsilon_cpp.cu takes its kOld /
+    // epsOld. (OpenFOAM stores the old time at the first non-const access of the new time index,
+    // epsilon_.boundaryFieldRef() at kEpsilon.C:246, which precedes the wall function's write.)
+    DeviceBuffer<scalar> kOld, epsOld;
+    if (in.rDeltaT > scalar(0))
+    {
+        deviceCopy(kOld, k);
+        deviceCopy(epsOld, epsilon);
+    }
 
     production(st, dm, dbU, nut, in);
     wallTreatment(st, epsilon, dm, wall, k, in);
@@ -949,7 +1003,8 @@ void correct(
     // OpenFOAM's and reversing it is a different algorithm that still converges to something plausible.
     {
         PressureMatrix E;
-        assembleEpsEqn(E, st, dm, dbEps, dbK, epsilon, k, nut, in, dbEps.n ? &epsBndLast : nullptr);
+        assembleEpsEqn(E, st, dm, dbEps, dbK, epsilon, k, nut, in, dbEps.n ? &epsBndLast : nullptr,
+                       epsOld.size() ? &epsOld : nullptr);
 
         // The wall constraint's VALUE IS THE CURRENT FIELD, not the eps0 array -- OpenFOAM's
         // epsilonWallFunction::manipulateMatrix is
@@ -975,7 +1030,8 @@ void correct(
     // ---- the k equation ----------------------------------------------------------------------
     {
         PressureMatrix K;
-        assembleKEqn(K, st, dm, dbK, dbU, k, epsilon, nut, in, dbK.n ? &kBndLast : nullptr);
+        assembleKEqn(K, st, dm, dbK, dbU, k, epsilon, nut, in, dbK.n ? &kBndLast : nullptr,
+                     kOld.size() ? &kOld : nullptr);
 
         // No wall mask: see finishAndSolve.
         finishAndSolve(K, k, dm, in.relaxEquationK, in.relaxK,

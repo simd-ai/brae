@@ -30,7 +30,7 @@
 #
 # NOT an end-to-end gate. The gradient is validated here; the CASE it unblocks is not -- gasMixing still
 # parts from OpenFOAM by U 1.2e-01 with the gradient matched on both sides. rhoSimpleFoam therefore still
-# REFUSES leastSquares by default and BRAE_LEASTSQUARES=1 opts in. See rhoSimpleFoamDriver_cpp.cu.
+# reaches leastSquares by default; the BRAE_LEASTSQUARES=1 opt-in that once gated it is gone (its case, gasMixing, now matches -- tests/rho_gasmixing_vs_openfoam.sh).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_leastsquares_grad"

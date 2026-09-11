@@ -142,6 +142,23 @@ struct RhoMomentumInput
     const DeviceBuffer<scalar>* UxBndFace = nullptr;
     const DeviceBuffer<scalar>* UyBndFace = nullptr;
     const DeviceBuffer<scalar>* UzBndFace = nullptr;
+    // ...and the SAME arrays as they stood BEFORE updateCoeffs, for the limitedLinear / limitedLinearV
+    // limiter ONLY. gaussConvectionScheme::fvmDiv takes the limiter weights (its :84, fvc::grad of the
+    // field from its STORED patch values) before it builds the fvMatrix whose constructor runs
+    // updateCoeffs (fvMatrix.C:396) -- so a flowRateInletVelocity's refreshed value is what divDevRhoReff
+    // reads and NOT what the limiter read. The host reference's RhoMomentumInput::UPreUpdateBnd; the
+    // caller snapshots them before its own updateBoundaryCoeffs. REQUIRED under those two schemes:
+    // reading the refreshed arrays instead IS the defect (gasMixing/injectorPipe at OpenFOAM's iteration
+    // 6: the momentum off-diagonals 3.3e-03 off the host, which reads the pre-updateCoeffs values, and
+    // 3.2e-14 in the standalone twin where both arms read one array), so a missing snapshot throws.
+    const DeviceBuffer<scalar>* UxPreUpdateBnd = nullptr;
+    const DeviceBuffer<scalar>* UyPreUpdateBnd = nullptr;
+    const DeviceBuffer<scalar>* UzPreUpdateBnd = nullptr;
+    // `Gauss limitedLinear` on a VECTOR limits on magSqr(U) (LimitedScheme.H:188), whose gradient
+    // OpenFOAM resolves under `grad(magSqr(U))` (LimitFuncs.C:34-39) -- almost always `default`: its
+    // base scheme and cellLimited coefficient, as the host's gradMagSqrULeastSq / gradMagSqrULimitK.
+    bool   gradMagSqrULeastSq = false;
+    scalar gradMagSqrULimitK  = 0.0;
 
     // UEqn.relax(). TWO fields, because OpenFOAM's guard is on the PRESENCE of the entry, not its value:
     // fvMatrix::relax() runs `if (relaxEquation(name, relaxCoeff)) relax(relaxCoeff)` (fvMatrix.C:1250-1263)

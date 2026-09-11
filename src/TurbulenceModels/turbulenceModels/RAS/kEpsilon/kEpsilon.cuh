@@ -79,6 +79,14 @@ struct KEpsilonInput
     // --- the compressible instantiation: alpha = 1, rho = the solver's relaxed density ---
     const DeviceBuffer<scalar>* rhoCell    = nullptr;
     const DeviceBuffer<scalar>* rhoBndFace = nullptr;
+    // fvm::ddt(alpha, rho, k|epsilon) (kEpsilon.C:254,275; EulerDdtScheme.C:365-398): rDeltaT*rho*V on
+    // the diagonal and rDeltaT*rho.oldTime()*psi.oldTime()*V in the source. rDeltaT is 1/deltaT under
+    // `ddtSchemes default Euler` and 0 under steadyState, where OpenFOAM's term is an empty matrix.
+    // psi.oldTime() is the field as correct() is entered, snapshotted there before the wall override
+    // writes it. rhoOldCell is rho.oldTime() as the CALLER resolves it (the step's firstIteration rule,
+    // rhoSimpleFoam_cpp.cuh StepInput); null falls back to rhoCell, the host closure's rhoOldAt.
+    scalar                      rDeltaT    = 0.0;
+    const DeviceBuffer<scalar>* rhoOldCell = nullptr;
     const DeviceBuffer<scalar>* nuCell     = nullptr;    // mu(T)/rho per cell.        REQUIRED.
     const DeviceBuffer<scalar>* nuBndFace  = nullptr;    // mu_b/rho_b per bnd face.   REQUIRED.
     const DeviceBuffer<scalar>* nuWallFace = nullptr;    // the same, in WALL-face order
@@ -273,7 +281,9 @@ void assembleEpsEqn(
     // epsilon's PATCH VALUES as OpenFOAM's assembly reads them: the last evaluate's, with the
     // wall-function faces reassigned to the new wall cells (calculateTurbulenceFields' `epf ==
     // epsilon0`). correct() builds it; null evaluates dbEps live, the pre-H3.5 behaviour.
-    const DeviceBuffer<scalar>*  epsBndValues = nullptr);
+    const DeviceBuffer<scalar>*  epsBndValues = nullptr,
+    // epsilon.oldTime() for fvm::ddt: the field at correct()'s entry. Null with in.rDeltaT > 0 throws.
+    const DeviceBuffer<scalar>*  epsOld       = nullptr);
 
 // Stage 4: the k system. No wall setValues and no boundaryManipulate -- see the header.
 void assembleKEqn(
@@ -289,7 +299,8 @@ void assembleKEqn(
     // k's STORED patch values for the gradients (the last evaluate, captured before this call refreshes
     // the turbulent inlet and the flux switch); null evaluates live, the same number only while no
     // patch's coefficients move between iterations.
-    const DeviceBuffer<scalar>*  kBndValues = nullptr);
+    const DeviceBuffer<scalar>*  kBndValues = nullptr,
+    const DeviceBuffer<scalar>*  kOld       = nullptr);   // k.oldTime() for fvm::ddt, as epsOld above
 
 // Foam::bound(vsf, lowerBound): a cell that solved BELOW the floor takes the AREA-WEIGHTED average of
 // its bounded neighbours, not a hard clamp (bound.C:38-56 via fvc::average = surfaceSum(magSf*ssf)/

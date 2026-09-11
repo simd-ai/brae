@@ -678,7 +678,19 @@ Residuals rhoSimpleStep(
         // the one createFields stored once -- which is why the compressible gates cannot move; it is the
         // liquid path, whose Cpv is a correlation and whose Es carries -p/rho, that needs it live.
         updateEnergyBoundaryCoeffs(f.he, f.T, f.p, f.thermo, patches);
+        sd.scalars("heIn", f.he.internal);
         FvScalarMatrix E = assembleEEqn(f.he, f.U, f.p, f.rho, ein, m, g, patches);
+        sd.scalars("eD", E.diag);
+        sd.scalars("eSrc", E.source);
+        sd.scalars("eUpper", E.upper);
+        sd.scalars("eLower", E.lower);
+        if (sd.on)
+        {
+            sd.scalars("Ekp", kineticEnergy(f.heName, f.U, f.p, f.rho));
+            std::vector<scalar> kd = kineticEnergyDivergence(f.U, f.p, f.rho, ein, m, g, patches);
+            for (label c = 0; c < nC; ++c) kd[c] /= g.V()[c];   // extensive -> per volume, as fvc::div
+            sd.scalars("keDiv", kd);
+        }
         // fvOptions.constrain(EEqn), EEqn.H:24. A fixedTemperatureConstraint sets he(p, Tuniform) on its
         // cells -- an ENERGY, not a temperature. The thermo conversion is supplied here because the
         // fvOptions reference carries no thermo.
@@ -700,6 +712,7 @@ Residuals rhoSimpleStep(
             pbicgstab(E, f.he.internal, m, patches, in.tolHe, in.relTolHe, in.maxIterHe, in.minIterHe);
         res[f.heName] = ep.initialResidual;
         f.he.evaluateBoundary();
+        sd.scalars("heSolved", f.he.internal);
     }
     // fvOptions.correct(he), EEqn.H:27 -- after the energy solve and BEFORE thermo.correct(), which is
     // what makes it show up in T. limitTemperature clamps he between he(p,Tmin) and he(p,Tmax); on the
@@ -1127,6 +1140,8 @@ Residuals rhoSimpleStep(
             sc.nu       = &nuLam;
             sc.nuBnd    = &nuLamBnd;
             sc.phiByRho = &phiByRho;
+            sc.rDeltaT  = in.ddtEuler ? in.rDeltaT : scalar(0);
+            sc.rhoOld   = in.firstIteration ? &f.rho.internal : &rhoPrevIter;
             if (f.alphat.internal.empty())
                 throw std::runtime_error(
                     "rhoSimpleFoam_cpp: the case is RAS but has no alphat field. OpenFOAM's "
@@ -1252,6 +1267,8 @@ Residuals rhoSimpleStep(
         comp.nu       = &nuLam;
         comp.nuBnd    = &nuLamBnd;
         comp.phiByRho = &phiByRho;
+        comp.rDeltaT  = in.ddtEuler ? in.rDeltaT : scalar(0);
+        comp.rhoOld   = in.firstIteration ? &f.rho.internal : &rhoPrevIter;   // see StepInput::firstIteration
         // alphat is REQUIRED, not fabricated: every compressible RAS case ships one (it carries
         // compressible::alphatWallFunction at the walls, which brae could not invent), and a zeroed
         // stand-in would silently remove the turbulent contribution to the energy equation.
@@ -1314,6 +1331,14 @@ Residuals rhoSimpleStep(
         // ...and the assembled system BEFORE relax(), constrain() and boundaryManipulate() -- the twin of
         // stage_epsD0/Src0 -- so a disagreement in the as-solved system can be put before or after them.
         sd.scalars("epsD0", kres.epsD0);
+        // The closure captures that had no dump but DO have an instrument oracle: the laplacian alone
+        // (stage_epsLapD/Src), the div off-diagonals (stage_epsDivDUpper/Lower) and k pre-relax (stage_kD0/kSrc0).
+        sd.scalars("epsLapD", kres.epsLapD);
+        sd.scalars("epsLapSrc", kres.epsLapSrc);
+        sd.scalars("epsDivUpper", kres.epsDivUpper);
+        sd.scalars("epsDivLower", kres.epsDivLower);
+        sd.scalars("kD0", kres.kD0);
+        sd.scalars("kSrc0", kres.kSrc0);
         sd.scalars("epsSrc0", kres.epsSrc0);
         sd.scalars("epsUpper", kres.epsUpper);
         sd.scalars("epsLower", kres.epsLower);

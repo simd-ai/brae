@@ -273,6 +273,14 @@ void correct(
 
     // alpha*rho on a cell: 1 in the incompressible lineage.
     auto rhoAt = [&](label c) { return (comp && comp->rho) ? (*comp->rho)[c] : scalar(1.0); };
+    // fvm::ddt(alpha, rho, psi), EulerDdtScheme::fvmDdt: diag = rho*V/deltaT, source =
+    // rho.oldTime()*psi.oldTime()*V/deltaT. psi.oldTime() is the field as this iteration started -- taken
+    // HERE, before the wall function overwrites epsilon in its cells (those rows are pinned by setValues
+    // afterwards, so what the source holds there is not seen by the solve). Zero under steadyState.
+    const scalar rDeltaT = (comp) ? comp->rDeltaT : scalar(0);
+    const std::vector<scalar> kOld   = k.internal;
+    const std::vector<scalar> epsOld = epsilon.internal;
+    auto rhoOldAt = [&](label c) { return (comp && comp->rhoOld) ? (*comp->rhoOld)[c] : rhoAt(c); };
 
     std::vector<scalar> G(nC);
     for (label c = 0; c < nC; ++c)
@@ -488,6 +496,11 @@ void correct(
 
             // - Sp(C2*epsilon/k, epsilon)
             if (dropTerm != 3) M.diag[c] += co.C2 * rhoAt(c) * epsilon.internal[c] / k.internal[c] * V;
+            if (rDeltaT > 0.0)   // fvm::ddt(alpha, rho, epsilon_), kEpsilon.C:254
+            {
+                M.diag[c]   += rDeltaT * rhoAt(c) * V;
+                M.source[c] += rDeltaT * rhoOldAt(c) * epsOld[c] * V;
+            }
 
             // `bounded`: - Sp(div(phi), epsilon). Vanishes where phi is conservative, so it cannot move
             // a converged state -- which is exactly why it needs its own measurement rather than being
@@ -667,6 +680,11 @@ void correct(
             // destruction 2.6x too strong and k wrong across the whole field (3.3e-01 against OpenFOAM)
             // while epsilon -- solved first, and correctly rho-weighted -- looked far better.
             if (dropTerm != 7) M.diag[c] += rhoAt(c) * epsilon.internal[c] / k.internal[c] * V;
+            if (rDeltaT > 0.0)   // fvm::ddt(alpha, rho, k_), kEpsilon.C:275
+            {
+                M.diag[c]   += rDeltaT * rhoAt(c) * V;
+                M.source[c] += rDeltaT * rhoOldAt(c) * kOld[c] * V;
+            }
 
             if (bounded) M.diag[c] -= divPhi[c] * V;
         }

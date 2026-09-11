@@ -145,6 +145,17 @@ void correctTurbulence(
     kin.limiterCoeff          = opt.limiterCoeff;
     kin.limGradK              = opt.limGradK;
     kin.limGradLeastSq        = opt.limGradLeastSq;
+    kin.rDeltaT               = opt.rDeltaT;
+    if (opt.rDeltaT > scalar(0))
+    {
+        if (f.rhoOld.size() != f.rho.size())
+        {
+            throw std::runtime_error(
+                "rhoSimpleFoam (OF-mirror, CUDA): the closure's fvm::ddt under Euler needs rho.oldTime() "
+                "and the step did not write RhoSolverFields::rhoOld (RhoStepInput::ddtEuler unset?).");
+        }
+        kin.rhoOldCell = &f.rhoOld;
+    }
     kin.linearUpwind          = opt.linearUpwind;
     kin.luGradK               = opt.luGradK;
     kin.correctedLaplacian = opt.correctedLaplacian;
@@ -183,6 +194,7 @@ void correctTurbulence(
         sstIn.boundedK = kin.boundedK;   sstIn.boundedOmega = kin.boundedEps;
         sstIn.limitedLinear = kin.limitedLinear;  sstIn.limiterCoeff = kin.limiterCoeff;
         sstIn.limGradK = kin.limGradK;   sstIn.limGradLeastSq = kin.limGradLeastSq;
+        sstIn.rDeltaT = kin.rDeltaT;     sstIn.rhoOldCell = kin.rhoOldCell;
         sstIn.linearUpwind = kin.linearUpwind;  sstIn.luGradK = kin.luGradK;
         sstIn.correctedLaplacian = kin.correctedLaplacian;
         sstIn.snGradLimitCoeff   = kin.snGradLimitCoeff;

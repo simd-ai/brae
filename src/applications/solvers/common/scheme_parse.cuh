@@ -259,6 +259,58 @@ inline FieldGradScheme parseFieldGradScheme(const std::string& caseDir, const st
     return fg;
 }
 
+// ddtSchemes `default`. rhoSimpleFoam's own equations carry no fvm::ddt, but the turbulence closures
+// do -- kEpsilon.C:254/275 and kOmegaSSTBase.C:572/602 write `fvm::ddt(alpha, rho, k_)` because the model
+// is shared with the transient solvers -- and the scheme decides whether that term is zero
+// (steadyStateDdtScheme::fvmDdt returns an empty matrix) or rho*V/deltaT on the diagonal with
+// rho.oldTime()*psi.oldTime()*V/deltaT in the source (EulerDdtScheme::fvmDdt). Five of the six
+// rhoSimpleFoam tutorials ship steadyState; gasMixing/injectorPipe ships Euler with deltaT 1, and the
+// closure ran without the term: measured on it restarted from OpenFOAM's iteration 5, the epsilon
+// diagonal 5.66e-04 and the k source 6.14e-03 off OpenFOAM's own assembly with every input exact --
+// and OpenFOAM minus brae equal to rho*V/deltaT to 4.8e-09. Any other scheme is refused by name.
+struct DdtSchemeEntry   // the fvSchemes entry; the shared enum DdtScheme (device_ddt.cuh) is the transient solvers'
+{
+    std::string raw;
+    bool steadyState = false;
+    bool euler       = false;
+};
+
+inline DdtSchemeEntry parseDdtScheme(const std::string& caseDir)
+{
+    const std::string all = readFvSchemesText(caseDir);
+    const std::string blk = fvSchemesBlock(all, "ddtSchemes");
+    DdtSchemeEntry d;
+    if (blk.empty())
+        throw std::runtime_error(
+            "brae: fvSchemes has no ddtSchemes block. OpenFOAM's turbulence closures take fvm::ddt "
+            "through it (kEpsilon.C:254, kOmegaSSTBase.C:572) and fatal without one; brae will not "
+            "assume steadyState.");
+    // A NAMED ddt entry (ddt(rho,k) ...) is looked up before `default` (schemesLookup); none is ported.
+    if (blk.find("ddt(") != std::string::npos)
+        throw std::runtime_error(
+            "brae: fvSchemes ddtSchemes carries a named `ddt(...)` entry, which OpenFOAM resolves ahead "
+            "of `default` and brae does not read. Refusing rather than running the closure on `default`.");
+    const std::size_t q = blk.find("default");
+    if (q == std::string::npos)
+        throw std::runtime_error("brae: fvSchemes ddtSchemes has no `default` entry.");
+    const std::size_t e = blk.find(';', q);
+    d.raw = blk.substr(q + 7, e == std::string::npos ? std::string::npos : e - q - 7);
+    while (!d.raw.empty() && (d.raw.front() == ' ' || d.raw.front() == '\t')) d.raw.erase(d.raw.begin());
+    d.steadyState = d.raw.find("steadyState") != std::string::npos;
+    d.euler       = !d.steadyState && d.raw.find("Euler") != std::string::npos
+                 && d.raw.find("localEuler") == std::string::npos
+                 && d.raw.find("bounded") == std::string::npos;
+    if (!d.steadyState && !d.euler)
+        throw std::runtime_error(
+            "brae: fvSchemes ddtSchemes default is `" + d.raw + "`. The turbulence closures take "
+            "fvm::ddt through it (kEpsilon.C:254, kOmegaSSTBase.C:572); brae carries steadyState (no "
+            "term) and Euler (rho*V/deltaT, EulerDdtScheme.C) and nothing else -- backward and "
+            "CrankNicolson have coefficients (device_ddt.cuh DdtCoeffs) that this closure port does not "
+            "yet take. Refusing rather than "
+            "running the closure under another scheme's name.");
+    return d;
+}
+
 // mesh.gradScheme(<name>) for an ARBITRARY name -- the one a scheme READS rather than grad(<field>):
 // linearUpwind's `limited`, say. schemesLookup::lookupDetail::lookup is named-then-default
 // (schemesLookupDetail.C:76-89): the entry of that name if the gradSchemes dictionary has one, else

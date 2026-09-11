@@ -20,13 +20,16 @@ void ioUpdateKernel(
     const label* __restrict__ ioMask,
     const label* __restrict__ oioMask,
     const scalar* __restrict__ phiB,
-    label* __restrict__ bcType)
+    label* __restrict__ bcType,
+    label* __restrict__ ioFresh)   // cleared here: from now on the coefficients are the last evaluate
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
     if (ioMask[i])       bcType[i] = (phiB[i] <  0.0) ? 1 : 0;            // inflow = fixedValue(inletValue)
     else if (oioMask[i]) bcType[i] = (phiB[i] >= 0.0) ? 1 : 0;            // outflow = fixedValue(outletValue)
+    else return;
+    if (ioFresh) ioFresh[i] = 0;
 }
 
 
@@ -385,7 +388,8 @@ void deviceUpdateFlowRateInlet(
 void deviceUpdateInletOutlet(DeviceBoundary& db, const DeviceBuffer<scalar>& phiBnd)
 {
     if (db.n == 0) return;
-    ioUpdateKernel<<<nBlocks(db.n), TPB>>>(db.n, db.ioMask.data(), db.oioMask.data(), phiBnd.data(), db.bcType.data());
+    ioUpdateKernel<<<nBlocks(db.n), TPB>>>(db.n, db.ioMask.data(), db.oioMask.data(), phiBnd.data(), db.bcType.data(),
+                                           db.ioFresh.size() ? db.ioFresh.data() : nullptr);
     cudaCheck(cudaGetLastError(), "ioUpdate");
 }
 

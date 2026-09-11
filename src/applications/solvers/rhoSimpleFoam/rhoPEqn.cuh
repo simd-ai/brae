@@ -132,6 +132,9 @@ struct RhoPressureInput
 
     bool   correctedLaplacian = false;   // BOTH halves, as everywhere else in this port
     scalar snGradLimitCoeff   = 0.0;
+    // grad(p) resolving to leastSquares: the non-orthogonal correction's gradient here and in pcEqn,
+    // and SIMPLEC's HbyA correction (pcEqn.H:30,65). See RhoStepInput::gradPLeastSq.
+    bool   gradPLeastSq       = false;
 
     // constrainHbyA replaces HbyA by U on a patch whose U is NOT assignable -- and assignable() is not
     // fixesValue(): slip and inletOutlet are non-assignable WITHOUT fixing a value. The distinction is

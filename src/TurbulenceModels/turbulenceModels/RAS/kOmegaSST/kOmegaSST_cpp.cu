@@ -381,6 +381,13 @@ void correct(
     // alpha()*rho() multiplies every source in both equations; alpha is 1 for a single-phase model, so
     // this is rho or it is 1. Null comp is the incompressible reading, bit-for-bit as before.
     auto rhoAt = [&](label cc) { return (comp && comp->rho) ? (*comp->rho)[cc] : scalar(1.0); };
+    // fvm::ddt(alpha, rho, psi), EulerDdtScheme::fvmDdt: diag = rho*V/deltaT, source =
+    // rho.oldTime()*psi.oldTime()*V/deltaT; psi.oldTime() is the field as this iteration started, taken
+    // here before anything writes it. Zero under steadyState.
+    const scalar rDeltaT = (comp) ? comp->rDeltaT : scalar(0);
+    const std::vector<scalar> kOld     = k.internal;
+    const std::vector<scalar> omegaOld = omega.internal;
+    auto rhoOldAt = [&](label cc) { return (comp && comp->rhoOld) ? (*comp->rhoOld)[cc] : rhoAt(cc); };
     // this->nu() varies with temperature in the compressible lineage; the incompressible one has a
     // single constant.
     auto nuAt = [&](label cc) { return (comp && comp->nu) ? (*comp->nu)[cc] : nu; };
@@ -648,6 +655,11 @@ void correct(
             M.source[c] -= V * std::fmin(sp1, 0.0) * omega.internal[c];
             // - Sp(beta*omega, omega)
             M.diag[c]   += rc * beta * omega.internal[c] * V;
+            if (rDeltaT > 0.0)   // fvm::ddt(alpha, rho, omega_), kOmegaSSTBase.C:572
+            {
+                M.diag[c]   += rDeltaT * rc * V;
+                M.source[c] += rDeltaT * rhoOldAt(c) * omegaOld[c] * V;
+            }
             // - SuSp((F1 - 1)*CDkOmega/omega, omega)
             const scalar sp2 = rc * (f1[c] - 1.0) * CD[c] / omega.internal[c];
             M.diag[c]   += V * std::fmax(sp2, 0.0);
@@ -792,6 +804,11 @@ void correct(
                 ebk *= (ge < 0.1 ? 0.1 : (ge > 1.0 ? 1.0 : ge));
             }
             M.diag[c]   += rc * ebk * V;
+            if (rDeltaT > 0.0)   // fvm::ddt(alpha, rho, k_), kOmegaSSTBase.C:602
+            {
+                M.diag[c]   += rDeltaT * rc * V;
+                M.source[c] += rDeltaT * rhoOldAt(c) * kOld[c] * V;
+            }
             if (bounded) M.diag[c] -= divPhi[c] * V;                 // - Sp(fvc::div(alphaRhoPhi), k)
         }
         if (linearUpwind)

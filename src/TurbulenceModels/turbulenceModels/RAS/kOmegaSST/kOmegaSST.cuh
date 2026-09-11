@@ -56,6 +56,13 @@ struct KOmegaSSTInput
 
     const DeviceBuffer<scalar>* rhoCell    = nullptr;    // null => the incompressible 1
     const DeviceBuffer<scalar>* rhoBndFace = nullptr;
+    // fvm::ddt(alpha, rho, k|omega) (kOmegaSSTBase.C:572,602; EulerDdtScheme.C:365-398): rDeltaT*rho*V
+    // on the diagonal, rDeltaT*rho.oldTime()*psi.oldTime()*V in the source; 0 under steadyState (an
+    // empty matrix there). psi.oldTime() is the field at correct()'s entry, before the wall override;
+    // rhoOldCell is rho.oldTime() as the caller resolves it (RhoStepInput::firstIteration), null ->
+    // rhoCell, the host closure's rhoOldAt. Same contract as KEpsilonInput's.
+    scalar                      rDeltaT    = 0.0;
+    const DeviceBuffer<scalar>* rhoOldCell = nullptr;
     const DeviceBuffer<scalar>* nuCell     = nullptr;    // mu(T)/rho per cell.       REQUIRED here
     const DeviceBuffer<scalar>* nuBndFace  = nullptr;    // mu_b/rho_b per bnd face.  REQUIRED here
     const DeviceBuffer<scalar>* nuWallFace = nullptr;    // the same, in WALL-face order

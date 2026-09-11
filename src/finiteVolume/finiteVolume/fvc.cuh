@@ -126,7 +126,13 @@ SurfaceScalarField snGrad(
     const PrimitiveMesh&          m,
     const FvGeometry&             g,
     const std::vector<FvPatch>&   patches,
-    bool                          corrected);
+    bool                          corrected,
+    // The correction takes grad(vf)'s OWN gradSchemes entry (correctedSnGrad.C:52-55, gradScheme::New(mesh,
+    // mesh.gradScheme("grad(" + vf.name() + ')'))): leastSquares where the case resolves it so. This took
+    // a hardcoded Gauss gradient; measured on sbMatched (SIMPLEC, transonic) with `grad(p) leastSquares`
+    // against OpenFOAM at iteration 2: U 1.98e-09 with Gauss here, and the CUDA arm -- which takes the
+    // case's gradient -- 5.7e-12 (tests/rho_gradp_lsq_simplec_vs_openfoam.sh).
+    bool                          leastSquares = false);
 
 // interpolate a volScalarField (cell array) to faces: linear internal; boundary = cell value
 // (zeroGradient/extrapolated, as for rAU = 1/A()).

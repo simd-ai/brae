@@ -518,6 +518,110 @@ int main(int argc, char** argv)
     // ---- THE REFUSALS -------------------------------------------------------------------------
     // A comment is not a refusal. Each of these must throw, and the NEGATIVE CONTROL is that the same
     // call with the flag cleared does not -- otherwise the test would pass because everything throws.
+    // ---- fvm::ddt UNDER `ddtSchemes default Euler` -----------------------------------------------
+    // kEpsilon.C:254,275 carry fvm::ddt(alpha, rho, epsilon|k) because the model is shared with the
+    // transient solvers; under steadyState it is an empty matrix and every arm above cannot see it.
+    // gasMixing/injectorPipe ships Euler (deltaT 1) and the host closure was 5.66e-04 off OpenFOAM's
+    // own epsilon diagonal there until the term was ported (kEpsilon_cpp.cu; rho_kepsilon_vs_openfoam's
+    // Euler arm holds it to 1e-14 against the instrumented model). This arm closes _cpp -> CUDA for it.
+    //
+    // rho.oldTime() IS SYNTHESIZED DISTINCT FROM rho, and must be: the term's source is
+    // rDeltaT*rho.oldTime()*psi.oldTime()*V, and with rhoOld == rho a device that read rho for both
+    // would agree everywhere. Whether the device honours the caller's rhoOld is a control below.
+    std::printf("  4. fvm::ddt under Euler\n");
+    {
+        const scalar rDeltaT = 2.0;   // deltaT 0.5: the term is ~2*rho*V, the same order as the destruction
+        std::vector<scalar> rhoOldH(nC);
+        for (label c = 0; c < nC; ++c) rhoOldH[c] = rhoC[c] * (1.0 + 0.12 * (((c % 7) - 3) / 3.0));
+        // the HOST reference, from the same fresh fields
+        GeometricField<scalar> ek = freshField("k"), ee = freshField("epsilon"), en = freshField("nut");
+        ek.evaluateBoundary();
+        ee.evaluateBoundary();
+        std::vector<scalar> eA(nC, 0.0);
+        cpu::kEpsilonRef::Compressible ce = comp;
+        ce.alphat  = &eA;
+        ce.rDeltaT = rDeltaT;
+        ce.rhoOld  = &rhoOldH;
+        cpu::kEpsilonRef::KEResiduals eres;
+        cpu::kEpsilonRef::correct(U, ek, ee, en, phi, 0.0, m, g, fvp, relaxEps, relaxK, tol, relTol,
+                                  maxIter, co, &eres, true, 0, &ce, nullptr);
+        // the DEVICE
+        DeviceBuffer<scalar> dRhoOld(rhoOldH);
+        gpu::kEpsilonRAS::KEpsilonInput ein = gin;
+        ein.rDeltaT    = rDeltaT;
+        ein.rhoOldCell = &dRhoOld;
+        DeviceBuffer<scalar> xK(dk.internal), xE(de.internal), xN(dn.internal), xA, xNutBnd(nutBndH);
+        DeviceBoundary dbxK   = buildDeviceBoundary(dk, fvp, g);
+        DeviceBoundary dbxEps = buildDeviceBoundary(de, fvp, g);
+        gpu::kEpsilonRAS::KEpsilonStages est;
+        gpu::kEpsilonRAS::correct(xK, xE, xN, xNutBnd, &xA, nullptr, est, dm, dbU, dbxK, dbxEps, wall, ein);
+        cmp(xE.host(), ee.internal, "epsilon, Euler rDeltaT=2", 1e-13);
+        cmp(xK.host(), ek.internal, "k, Euler rDeltaT=2",       1e-13);
+        cmp(xN.host(), en.internal, "nut, Euler rDeltaT=2",     1e-13);
+
+        // CONTROL: the term is load-bearing -- the steady device answer above must MISS the Euler
+        // reference, or the arm could pass with the term absent on the device.
+        const scalar rOff = relDiff(ek.internal, gK.host());
+        std::printf("     %-58s rel=%.3e\n", "control: the device WITHOUT the term misses the Euler k", (double)rOff);
+        check(rOff > 1e-6, "fvm::ddt under Euler moves k (control)");
+        const scalar rOffE = relDiff(ee.internal, gE.host());
+        check(rOffE > 1e-6, "...and epsilon (control)");
+
+        // CONTROL: rho.oldTime() is the CALLER's field, not rho. A null rhoOldCell falls back to rho
+        // on the device, and that run must miss the reference built with the distinct rhoOld.
+        {
+            gpu::kEpsilonRAS::KEpsilonInput rin = ein;
+            rin.rhoOldCell = nullptr;
+            DeviceBuffer<scalar> yK(dk.internal), yE(de.internal), yN(dn.internal), yA, yNutBnd(nutBndH);
+            DeviceBoundary dbyK   = buildDeviceBoundary(dk, fvp, g);
+            DeviceBoundary dbyEps = buildDeviceBoundary(de, fvp, g);
+            gpu::kEpsilonRAS::KEpsilonStages yst;
+            gpu::kEpsilonRAS::correct(yK, yE, yN, yNutBnd, &yA, nullptr, yst, dm, dbU, dbyK, dbyEps, wall, rin);
+            const scalar rRho = relDiff(ek.internal, yK.host());
+            std::printf("     %-58s rel=%.3e\n", "control: rho.oldTime() := rho misses the k bound", (double)rRho);
+            check(rRho > 1e-13, "the source takes the caller's rho.oldTime() (control)");
+        }
+    }
+
+    // ---- grad(k) / grad(epsilon) RESOLVING TO leastSquares ----------------------------------------
+    // fvc::grad(vf) resolves gradSchemes under grad(<name>) (fvcGrad.C:149), and correctedSnGrad's
+    // non-orthogonal correction takes that same scheme (correctedSnGrad.C:52-55) -- so under
+    // `gradSchemes default leastSquares` (gasMixing/injectorPipe) the closure's laplacian corrections
+    // are built from the least-squares fit. The host closure computes it under co.gradKLeastSq
+    // (kEpsilon_cpp.cu:473,656; gated against OpenFOAM by rho_leastsquares_closure_vs_openfoam.sh); the
+    // device took Gauss linear whatever the case said and the driver refused such a case. This arm
+    // closes _cpp -> CUDA for it. pitzDaily's laplacians are `corrected` (co.correctedLaplacian above),
+    // so the correction path IS exercised; the control below measures that the fixture discriminates.
+    std::printf("  5. grad(k)/grad(epsilon) leastSquares\n");
+    {
+        KEpsilonCoeffs lco = co;
+        lco.gradKLeastSq = true;
+        GeometricField<scalar> lk = freshField("k"), le = freshField("epsilon"), ln = freshField("nut");
+        lk.evaluateBoundary();
+        le.evaluateBoundary();
+        std::vector<scalar> lA(nC, 0.0);
+        cpu::kEpsilonRef::Compressible cl = comp;
+        cl.alphat = &lA;
+        cpu::kEpsilonRef::KEResiduals lres;
+        cpu::kEpsilonRef::correct(U, lk, le, ln, phi, 0.0, m, g, fvp, relaxEps, relaxK, tol, relTol,
+                                  maxIter, lco, &lres, true, 0, &cl, nullptr);
+        gpu::kEpsilonRAS::KEpsilonInput lin = gin;
+        lin.co = lco;
+        DeviceBuffer<scalar> zK(dk.internal), zE(de.internal), zN(dn.internal), zA, zNutBnd(nutBndH);
+        DeviceBoundary dbzK   = buildDeviceBoundary(dk, fvp, g);
+        DeviceBoundary dbzEps = buildDeviceBoundary(de, fvp, g);
+        gpu::kEpsilonRAS::KEpsilonStages lst;
+        gpu::kEpsilonRAS::correct(zK, zE, zN, zNutBnd, &zA, nullptr, lst, dm, dbU, dbzK, dbzEps, wall, lin);
+        cmp(zE.host(), le.internal, "epsilon, grad leastSquares", 1e-13);
+        cmp(zK.host(), lk.internal, "k, grad leastSquares",       1e-13);
+        cmp(zN.host(), ln.internal, "nut, grad leastSquares",     1e-13);
+        // CONTROL: the Gauss device answer above must MISS the leastSquares reference, or the fixture
+        // cannot tell the two schemes apart and the rows above prove nothing.
+        const scalar rG = relDiff(le.internal, gE.host());
+        std::printf("     %-58s rel=%.3e\n", "control: the Gauss device epsilon misses the lsq reference", (double)rG);
+        check(rG > 1e-10, "the fixture's correction discriminates leastSquares from Gauss (control)");
+    }
+
     std::printf("  refusals\n");
     {
         struct Case { const char* name; gpu::kEpsilonRAS::KEpsilonInput in; };

@@ -305,7 +305,9 @@ void consistentPressurePredictor(
         deviceInterpolate(dm, rhodrAtU, gammaf);
 
         storedOrEvaluatedP(in, dm.nBndFaces, dbP, p, pb);
-        deviceGaussGrad(dm, p, pb, gx, gy, gz);
+        // fvc::grad(p) through the case's grad(p) entry (pcEqn.H:30, fvcGrad.C:149).
+        if (in.gradPLeastSq) deviceLeastSquaresGrad(dm, p, pb, gx, gy, gz);
+        else                 deviceGaussGrad(dm, p, pb, gx, gy, gz);
 
         DeviceBuffer<scalar> ld, lu, ll;
         deviceLaplacianCoeffs(dm, gammaf, ld, lu, ll, in.correctedLaplacian);
@@ -431,7 +433,8 @@ void assemblePcEqn(
     {
         DeviceBuffer<scalar> pb, gx, gy, gz, lc;
         storedOrEvaluatedP(in, dm.nBndFaces, dbP, p, pb);
-        deviceGaussGrad(dm, p, pb, gx, gy, gz);
+        if (in.gradPLeastSq) deviceLeastSquaresGrad(dm, p, pb, gx, gy, gz);
+        else                 deviceGaussGrad(dm, p, pb, gx, gy, gz);
         if (in.snGradLimitCoeff > 0.0)
         {
             DeviceBuffer<scalar> ffcL;

@@ -333,7 +333,13 @@ FvScalarMatrix assembleEEqn(
         {
             std::vector<std::vector<scalar>> vb(patches.size());
             for (std::size_t pi = 0; pi < patches.size(); ++pi) vb[pi] = he.boundary[pi]->value();
-            const std::vector<vector> gradHe = fvc::gaussGrad(he.internal, vb, m, g, patches);
+            // correctedSnGrad::fullGradCorrection takes gradScheme::New(mesh, mesh.gradScheme("grad(" +
+            // vf.name() + ')')) (correctedSnGrad.C) -- the field's OWN gradSchemes entry, the same one
+            // the limitedLinear limiter resolves, so the same flags serve both. This took a hardcoded
+            // Gauss gradient; gasMixing/injectorPipe's default is leastSquares, and on its snappyHexMesh
+            // mesh the correction is largest exactly where the boundary faces are skewed.
+            const std::vector<vector> gradHe =
+                limiterGrad(he.internal, vb, in.limGradHeK, m, g, patches, in.limGradHeLeastSq);
             const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
                 gammaf, he, gradHe, m, g, patches, in.snGradLimitCoeff);
             for (label c = 0; c < nC; ++c) L.source[c] -= corr[c];

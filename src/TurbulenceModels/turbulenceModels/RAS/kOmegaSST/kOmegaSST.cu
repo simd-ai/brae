@@ -87,6 +87,7 @@ turbulence::TransportScheme schemeOf(const KOmegaSSTInput& in)
     sc.luGradK            = in.luGradK;
     sc.correctedLaplacian = in.correctedLaplacian;
     sc.gradFieldLimitK    = in.co.gradKLimitK;
+    sc.gradFieldLeastSq   = in.co.gradKLeastSq;
     sc.snGradLimitCoeff   = in.snGradLimitCoeff;
     return sc;
 }
@@ -108,6 +109,31 @@ turbulence::SolveControls solveOf(const KOmegaSSTInput& in)
 // The wall cells' omega and production are the WALL FUNCTION's, not the transport's. OpenFOAM sets
 // both inside omegaWallFunction::updateCoeffs before the equations are formed
 // (omegaWallFunctionFvPatchScalarField.C), which is why this runs first.
+// fvm::ddt(alpha, rho, psi) under Euler, as kOmegaSST_cpp.cu adds it inside its reaction loop:
+// diag += rDeltaT*rho*V, source += rDeltaT*rho.oldTime()*psi.oldTime()*V. Launched right after the
+// shared reaction kernel (device_komega_sst.cu), which takes no such term; the host adds it between
+// its Sp and its last SuSp, so the two diagonals differ in summation order by an ulp there -- the
+// driver gate measures it (tests/rho_step_cuda_euler.sh, SST arm). rho null = the incompressible 1.
+__global__
+void ddtKernel(
+    int                        nC,
+    const scalar* __restrict__ V,
+    const scalar* __restrict__ rho,
+    const scalar* __restrict__ rhoOld,
+    const scalar* __restrict__ psiOld,
+    scalar                     rDeltaT,
+    scalar* __restrict__       diag,
+    scalar* __restrict__       source)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    const scalar r  = rho    ? rho[c]    : scalar(1);
+    const scalar r0 = rhoOld ? rhoOld[c] : r;
+    diag[c]   += rDeltaT * r * V[c];
+    source[c] += rDeltaT * r0 * psiOld[c] * V[c];
+}
+
+
 __global__
 void overrideWallKernel(
     int nC,
@@ -343,6 +369,16 @@ void correct(
     // (:726). Rebuilt here for the same reason as the kEpsilon twin (kBndLast).
     DeviceBuffer<scalar> kBndLast;
     if (dbK.n) deviceBCValue(dbK, k, kBndLast);
+    // psi.oldTime() for fvm::ddt under Euler: the fields as this call was entered, BEFORE the wall
+    // override rewrites omega's wall cells -- where kOmegaSST_cpp.cu takes its kOld / omegaOld.
+    DeviceBuffer<scalar> kOld, omegaOld;
+    if (in.rDeltaT > scalar(0))
+    {
+        deviceCopy(kOld, k);
+        deviceCopy(omegaOld, omega);
+    }
+    const scalar* rhoOldP = (in.rhoOldCell && in.rhoOldCell->size()) ? in.rhoOldCell->data()
+                          : (in.rhoCell ? in.rhoCell->data() : nullptr);
 
     // The closure instrument -- see sst_stage_dump.cuh. Same names as the host twin's, so the two arms
     // diff stage by stage.
@@ -447,12 +483,17 @@ void correct(
     // 3.7e-03 and U 1.1e-08 by iteration 3, where the host arm holds 2.6e-12 throughout.
     DeviceBuffer<scalar> kbv, obv, kgx, kgy, kgz, ogx, ogy, ogz, CD, F1, F2;
     deviceBCValue(dbK, k, kbv);
-    deviceGaussGrad(dm, k, kbv, kgx, kgy, kgz);
+    // grad(k) and grad(omega) through the case's OWN gradSchemes entry (fvcGrad.C:149): leastSquares
+    // where it resolves so (kOmegaSST_cpp.cu:545-547, gated against OpenFOAM by
+    // tests/rho_leastsquares_closure_vs_openfoam.sh), Gauss linear otherwise, cellLimited on top.
+    if (in.co.gradKLeastSq) deviceLeastSquaresGrad(dm, k, kbv, kgx, kgy, kgz);
+    else                    deviceGaussGrad(dm, k, kbv, kgx, kgy, kgz);
     if (in.co.gradKLimitK > scalar(0))
         deviceCellLimitGrad(dm, k, kbv, kgx, kgy, kgz, in.co.gradKLimitK);
     if (omegaBndLast.size()) deviceCopy(obv, omegaBndLast);
     else                     deviceBCValue(dbOmega, omega, obv);
-    deviceGaussGrad(dm, omega, obv, ogx, ogy, ogz);
+    if (in.co.gradKLeastSq) deviceLeastSquaresGrad(dm, omega, obv, ogx, ogy, ogz);
+    else                    deviceGaussGrad(dm, omega, obv, ogx, ogy, ogz);
     if (in.co.gradKLimitK > scalar(0))
         deviceCellLimitGrad(dm, omega, obv, ogx, ogy, ogz, in.co.gradKLimitK);
     deviceCDkOmega(kgx, kgy, kgz, ogx, ogy, ogz, omega, in.co.alphaOmega2, CD);
@@ -563,6 +604,13 @@ void correct(
         dumpTerms("omega", nC, omega, M, [&]{
             deviceOmegaReaction(dm.V, gamma, beta, GbyNu0lim, F1, CD, omega, divU,
                                 M.diag, M.source, in.rhoCell);
+            if (in.rDeltaT > scalar(0))   // fvm::ddt(alpha, rho, omega_), kOmegaSSTBase.C:572
+            {
+                ddtKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), in.rhoCell ? in.rhoCell->data() : nullptr,
+                                             rhoOldP, omegaOld.data(), in.rDeltaT,
+                                             M.diag.data(), M.source.data());
+                cudaCheck(cudaGetLastError(), "kOmegaSST omega ddt");
+            }
         });
 
         turbulence::solveScalarEqn(M, omega, dm, in.relaxEquationOmega, in.relaxOmega,
@@ -637,6 +685,13 @@ void correct(
         dumpTerms("k", nC, k, M, [&]{
             deviceKReactionSST(dm.V, k, omega, G, divU, in.co, M.diag, M.source,
                                /*gammaIntEff=*/nullptr, /*FDES=*/nullptr, in.rhoCell);
+            if (in.rDeltaT > scalar(0))   // fvm::ddt(alpha, rho, k_), kOmegaSSTBase.C:602
+            {
+                ddtKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), in.rhoCell ? in.rhoCell->data() : nullptr,
+                                             rhoOldP, kOld.data(), in.rDeltaT,
+                                             M.diag.data(), M.source.data());
+                cudaCheck(cudaGetLastError(), "kOmegaSST k ddt");
+            }
         });
 
         // No wall mask: kOmegaSSTBase.C has no boundaryManipulate for k -- kqRWallFunction is

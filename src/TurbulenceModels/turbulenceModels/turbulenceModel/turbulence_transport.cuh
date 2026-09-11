@@ -62,6 +62,9 @@ struct TransportScheme
     // The field's OWN grad scheme, which correctedSnGrad's correction takes (correctedSnGrad.C:52-55).
     // A DIFFERENT lookup from limGradK above, even though both come from gradSchemes.
     scalar gradFieldLimitK    = 0.0;
+    // ...and that scheme's BASE: leastSquares rather than Gauss linear (gradSchemes grad(<field>), as
+    // fvcGrad.C:149 resolves it and correctedSnGrad.C:52-55 takes it). The host closures' gradKLeastSq.
+    bool   gradFieldLeastSq   = false;
     // `limited <psi> corrected`: caps the non-orthogonal correction per face. Zero => uncapped.
     scalar snGradLimitCoeff   = 0.0;
     // The field's PATCH VALUES as the gradients below must read them, when they are not what a live

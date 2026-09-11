@@ -308,12 +308,24 @@ void assembleUEqn(
             // because the fused launch needs the three bval arrays live at once; deviceCopy and the
             // limiter stay per component and compute exactly what they did. Measured motive: gradKernel
             // was 4.5 ms of a 30 ms iteration at 306k cells (nsys, 16 launches per outer iteration).
+            // The limiter's gradient reads the patch values standing BEFORE updateCoeffs -- see
+            // RhoMomentumInput::UxPreUpdateBnd. Required, not optional: the refreshed arrays are the defect.
+            const DeviceBuffer<scalar>* preUb[3] = { in.UxPreUpdateBnd, in.UyPreUpdateBnd, in.UzPreUpdateBnd };
+            for (int k = 0; k < 3; ++k)
+            {
+                if (!preUb[k] || preUb[k]->size() != static_cast<std::size_t>(dm.nBndFaces))
+                    throw std::runtime_error(
+                        "rhoUEqn(cuda): div(phi,U) is limitedLinearV, whose limiter OpenFOAM builds from "
+                        "fvc::grad(U) BEFORE the momentum fvMatrix constructor runs updateCoeffs "
+                        "(gaussConvectionScheme.C:84 then fvMatrix.C:396), and no pre-updateCoeffs boundary "
+                        "was supplied. Running it off the refreshed one is a different discretisation.");
+            }
             const DeviceBuffer<scalar>* Usrc[3] = {&Ux, &Uy, &Uz};
             DeviceBuffer<scalar> Uarr[3], gx[3], gy[3], gz[3], ub[3];
             for (int k = 0; k < 3; ++k)
             {
                 deviceCopy(Uarr[k], *Usrc[k]);
-                patchU(k, *Usrc[k], ub[k]);
+                deviceCopy(ub[k], *preUb[k]);
             }
             const DeviceBuffer<scalar>* ubp[3] = {&ub[0], &ub[1], &ub[2]};
             deviceGaussGradFused(dm, 3, Usrc, ubp, gx, gy, gz);
@@ -350,14 +362,29 @@ void assembleUEqn(
                 deviceHadamard(t, *U3[k], *U3[k]);
                 deviceAxpy(1.0, t, mag2);
             }
+            // magSqr over the PRE-updateCoeffs patch values, for the same reason as the V form above.
+            const DeviceBuffer<scalar>* preUb[3] = { in.UxPreUpdateBnd, in.UyPreUpdateBnd, in.UzPreUpdateBnd };
+            for (int k = 0; k < 3; ++k)
+            {
+                if (!preUb[k] || preUb[k]->size() != static_cast<std::size_t>(dm.nBndFaces))
+                    throw std::runtime_error(
+                        "rhoUEqn(cuda): div(phi,U) is limitedLinear, whose limiter OpenFOAM builds from "
+                        "fvc::grad(magSqr(U)) BEFORE the momentum fvMatrix constructor runs updateCoeffs "
+                        "(gaussConvectionScheme.C:84 then fvMatrix.C:396), and no pre-updateCoeffs boundary "
+                        "was supplied.");
+            }
             zeroBuffer(m2b, dm.nBndFaces);
             for (int k = 0; k < 3; ++k)
             {
-                patchU(k, *U3[k], ub);
-                deviceHadamard(t, ub, ub);
+                deviceHadamard(t, *preUb[k], *preUb[k]);
                 deviceAxpy(1.0, t, m2b);
             }
-            deviceGaussGrad(dm, mag2, m2b, gx, gy, gz);
+            // grad(magSqr(U)) through ITS OWN gradSchemes entry, base scheme then limiter (the host's
+            // gradMagSqrULeastSq / gradMagSqrULimitK). This took a plain Gauss gradient whatever the case
+            // said; gasMixing/injectorPipe's default is leastSquares.
+            if (in.gradMagSqrULeastSq) deviceLeastSquaresGrad(dm, mag2, m2b, gx, gy, gz);
+            else                       deviceGaussGrad(dm, mag2, m2b, gx, gy, gz);
+            if (in.gradMagSqrULimitK > 0.0) deviceCellLimitGrad(dm, mag2, m2b, gx, gy, gz, in.gradMagSqrULimitK);
             deviceDivLimitedCoeffs(
                 dm,
                 *in.phiInt,

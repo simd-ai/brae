@@ -213,6 +213,18 @@ int main(int argc, char** argv)
         comp.phiByRho = useVolumetricFluxForDivU ? &phiByRho : &phi;
         comp.alphat   = &at;
         comp.Prt      = 1.0;
+        // fvm::ddt(alpha, rho, k|omega) (kOmegaSSTBase.C:572,602) through the case's ddtSchemes: nothing
+        // under steadyState, rho*V/deltaT under Euler. One correct() on OpenFOAM's iteration-1 dump, so
+        // rho.oldTime() is the closure's own rho (GeometricField::oldTime() copies at first use).
+        {
+            const DdtSchemeEntry ddt = parseDdtScheme(caseDir);
+            if (ddt.euler)
+            {
+                const scalar dt = readDict(caseDir + "/system/controlDict").scalarOr("deltaT", 1.0);
+                comp.rDeltaT = 1.0 / dt;
+                comp.rhoOld  = &rho;
+            }
+        }
 
         // kOmegaSST takes the laplacian scheme as a function argument, not in its coefficients --
         // sbMatched sets `laplacianSchemes default Gauss linear corrected`, passed below.

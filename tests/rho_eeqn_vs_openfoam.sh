@@ -18,6 +18,13 @@
 # momentum gate: the compressible turbulence closure is a separate manifest component, and a number
 # covering both cannot be attributed to either. A failure here means the ENERGY assembly is wrong.
 #
+# NO leastSquares ARM HERE, on purpose. The corrected laplacian's explicit correction is built from
+# fvc::grad(he) through grad(e)'s own gradSchemes entry (correctedSnGrad::fullGradCorrection), and brae once
+# hardcoded Gauss there; but sbMatched's mesh is orthogonal to 0.78 degrees (checkMesh), so the correction is
+# ~0 and an arm with `default leastSquares` passed with the defect present and absent alike -- measured, a
+# vacuous arm. The assertion lives where the mesh discriminates: tests/rho_gasmixing_vs_openfoam.sh, T at
+# iteration 6, 8.58e-07 without the entry honoured and 9.6e-13 with it.
+#
 # THE CONTROL, which is the reason this gate exists at all: EEqn.H branches on he.name(), with
 # Ekp = 0.5|U|^2 + p/rho for `e` and K = 0.5|U|^2 for `h`. The binary builds the OTHER arm on purpose and
 # requires it to disagree, both as a field against stage_Ekp and as an assembled source. On this fixture

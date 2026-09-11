@@ -23,11 +23,14 @@ void bcValueKernel(
     const scalar* __restrict__ rgr,     // fixedGradient g (null/zero elsewhere)
     const scalar* __restrict__ dcv,
     scalar* __restrict__ value,
-    const int* __restrict__ skipIf)     // device flag: when set, this launch is a no-op (the grad(U) memo hit)
+    const int* __restrict__ skipIf,     // device flag: when set, this launch is a no-op (the grad(U) memo hit)
+    const scalar* __restrict__ ioStored,   // inletOutlet/outletInlet: the stored value until the first flux switch
+    const label* __restrict__ ioFresh)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     if (skipIf && *skipIf) return;
+    if (ioFresh && ioFresh[i]) { value[i] = ioStored[i]; return; }                     // see DeviceBoundary::ioStored
 
     if (type[i] == 8)      return;                                                       // coupled (processor): the
                                                                                          // face value is the halo-
@@ -169,7 +172,9 @@ void deviceBCValue(const DeviceBoundary& db, const DeviceBuffer<scalar>& interna
     bcValueKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.refValue.data(), db.valueFraction.data(),
                                           db.faceCell.data(), internal.data(),
                                           db.refGrad.size() ? db.refGrad.data() : nullptr,
-                                          db.deltaCoeffs.data(), value.data(), skipIf);
+                                          db.deltaCoeffs.data(), value.data(), skipIf,
+                                          db.ioStored.size() ? db.ioStored.data() : nullptr,
+                                          db.ioFresh.size()  ? db.ioFresh.data()  : nullptr);
     cudaCheck(cudaGetLastError(), "bcValue");
 }
 

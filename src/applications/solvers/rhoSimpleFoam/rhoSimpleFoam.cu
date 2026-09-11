@@ -575,6 +575,14 @@ Residuals rhoSimpleStep(
     // before the pressure assembly -- so the blend has to be against the value the iteration started with.
     deviceCopy(pBndPrev, f.pBnd);
 
+    // THE BOUNDARY THE MOMENTUM LIMITER SEES, snapshotted here because updateBoundaryCoeffs below is
+    // brae's stand-in for fvMatrix.C:396, which OpenFOAM runs AFTER the convection scheme has taken its
+    // limiter gradient (gaussConvectionScheme.C:84). The host step does the same (UPreUpdateBnd).
+    DeviceBuffer<scalar> UPreUpdateBnd[3];
+    deviceCopy(UPreUpdateBnd[0], f.UxBnd);
+    deviceCopy(UPreUpdateBnd[1], f.UyBnd);
+    deviceCopy(UPreUpdateBnd[2], f.UzBnd);
+
     updateBoundaryCoeffs(f, dbU, dbP, dbHe, dbT, in);
 
     // ---- UEqn.H ------------------------------------------------------------------------------
@@ -591,6 +599,11 @@ Residuals rhoSimpleStep(
     // 5.4e-04 at iteration 1 growing to 3.9e-03 by iteration 8 while p, T and he all stayed at ~1e-7.
     uin.muEffCell = in.muEffCell;    uin.muEffBndFace = in.muEffBndFace;
     uin.UxBndFace = &f.UxBnd;        uin.UyBndFace = &f.UyBnd;        uin.UzBndFace = &f.UzBnd;
+    uin.UxPreUpdateBnd = &UPreUpdateBnd[0];
+    uin.UyPreUpdateBnd = &UPreUpdateBnd[1];
+    uin.UzPreUpdateBnd = &UPreUpdateBnd[2];
+    uin.gradMagSqrULeastSq = in.gradMagSqrULeastSq;
+    uin.gradMagSqrULimitK  = in.gradMagSqrULimitK;
     uin.relaxU = in.relaxU;
     uin.relaxEquationU = in.relaxEquationU;
     uin.bounded = in.boundedU;
@@ -643,7 +656,9 @@ Residuals rhoSimpleStep(
 
         DeviceBuffer<scalar> gpx, gpy, gpz;
         // f.pBnd as it stands: the relaxed blend, or the limiter's re-evaluation, never re-derived here.
-        deviceGaussGrad(dm, f.p, f.pBnd, gpx, gpy, gpz);
+        // Through the case's grad(p) entry (fvcGrad.C:149): leastSquares where it says so.
+        if (in.gradPLeastSq) deviceLeastSquaresGrad(dm, f.p, f.pBnd, gpx, gpy, gpz);
+        else                 deviceGaussGrad(dm, f.p, f.pBnd, gpx, gpy, gpz);
         addPressureGradient(Mp, dm, gpx, gpy, gpz);
 
         DeviceBuffer<scalar>* U[3] = {&f.Ux, &f.Uy, &f.Uz};
@@ -949,6 +964,7 @@ Residuals rhoSimpleStep(
     pin.pRefCell = in.pRefCell;      pin.pRefValue = in.pRefValue;
     pin.correctedLaplacian = in.correctedLaplacian;
     pin.snGradLimitCoeff = in.snGradLimitCoeff;
+    pin.gradPLeastSq     = in.gradPLeastSq;
     pin.takeUAtBoundary = in.takeUAtBoundary;
     pin.adjustable = in.adjustable;
     pin.hasMRF = in.hasMRF;
@@ -1154,7 +1170,8 @@ Residuals rhoSimpleStep(
     // U = HbyA - rAtU*fvc::grad(p), with rAtU on the SIMPLEC path and rAU otherwise.
     {
         DeviceBuffer<scalar> gpx, gpy, gpz;
-        deviceGaussGrad(dm, f.p, f.pBnd, gpx, gpy, gpz);
+        if (in.gradPLeastSq) deviceLeastSquaresGrad(dm, f.p, f.pBnd, gpx, gpy, gpz);
+        else                 deviceGaussGrad(dm, f.p, f.pBnd, gpx, gpy, gpz);
         PressureStages shim;
         if (in.consistent)
         {
@@ -1258,6 +1275,13 @@ Residuals rhoSimpleStep(
     sd.scalars("kIn", f.k);
     sd.scalars("epsIn", f.epsilon);
     sd.scalars("nutIn", f.nut);
+
+    // rho.oldTime() for the closures' fvm::ddt: see RhoStepInput::ddtEuler. rhoPrevIter is the rho this
+    // iteration started with, captured at the top of the step.
+    if (in.ddtEuler)
+    {
+        deviceCopy(f.rhoOld, in.firstIteration ? f.rho : rhoPrevIter);
+    }
 
     // turbulence->correct() -- LAST, so the NEXT iteration's momentum equation uses this iteration's
     // closure. OpenFOAM's lagged coupling.

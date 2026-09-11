@@ -306,6 +306,18 @@ int main(int argc, char** argv)
     gi.scheme = mi.scheme;
     gi.schemeCoeff = mi.schemeCoeff;
     gi.gradULimitK = mi.gradULimitK;
+    // The limiter's pre-updateCoeffs boundary (RhoMomentumInput::UxPreUpdateBnd): the field's own
+    // evaluate, exactly what mi.UPreUpdateBnd carries on the host -- no updateCoeffs runs between the
+    // snapshot and the assembly in this harness, so both arms read ONE array here. Whether the DRIVER
+    // snapshots before its refresh is the step's business (rhoSimpleFoam.cu), measured end to end on
+    // gasMixing/injectorPipe (tests/rho_gasmixing_vs_openfoam.sh).
+    DeviceBuffer<scalar> dUbPre[3];
+    deviceBCValue(dbU.comp[0], dUx, dUbPre[0]);
+    deviceBCValue(dbU.comp[1], dUy, dUbPre[1]);
+    deviceBCValue(dbU.comp[2], dUz, dUbPre[2]);
+    gi.UxPreUpdateBnd = &dUbPre[0];
+    gi.UyPreUpdateBnd = &dUbPre[1];
+    gi.UzPreUpdateBnd = &dUbPre[2];
 
     gpu::MomentumMatrix M;
     gpu::rhoSimple::assembleUEqn(M, dm, dbU, dUx, dUy, dUz, gi);

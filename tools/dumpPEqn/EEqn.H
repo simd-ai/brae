@@ -46,6 +46,22 @@
     }
 
     EEqn.relax();
+    // Stage harness: the OFF-DIAGONALS after relax() (which touches only D and the source). For a div
+    // scheme they are the face weights times the flux with no convention to reconcile -- what named the
+    // momentum limiter defect; the energy equation had none until now.
+    if (runTime.timeIndex() == braeDumpIter())
+    {
+        surfaceScalarField eUp
+        (
+            IOobject("stage_eUpper", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+            mesh, dimensionedScalar(dimless, Zero)
+        );
+        surfaceScalarField eLo(eUp); eLo.rename("stage_eLower");
+        if (EEqn.hasUpper()) eUp.primitiveFieldRef() = EEqn.upper();
+        if (EEqn.hasLower()) eLo.primitiveFieldRef() = EEqn.lower();
+        else if (EEqn.hasUpper()) eLo.primitiveFieldRef() = EEqn.upper();
+        eUp.write(); eLo.write();
+    }
 
     // Stage harness: the kinetic term and the assembled energy system at iteration 1.
     if (runTime.timeIndex() == braeDumpIter())
@@ -114,6 +130,13 @@
     fvOptions.constrain(EEqn);
 
     EEqn.solve();
+    // Stage harness: he AFTER the solve and BEFORE thermo.correct(), so a disagreement in the
+    // temperature can be split between the energy ASSEMBLY and the he -> T INVERSION. stage_he above is
+    // the pre-solve field, and comparing a post-solve value against it measures the solve, not the code.
+    if (runTime.timeIndex() == braeDumpIter())
+    {
+        volScalarField("stage_heSolved", he).write();
+    }
 
     fvOptions.correct(he);
 

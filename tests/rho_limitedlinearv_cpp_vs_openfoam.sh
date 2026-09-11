@@ -28,14 +28,23 @@
 #     div(phi,U) Gauss limitedLinearV 1 UUpper 3.31e-03   ULower 3.08e-03    <- the case's own scheme
 #     div(phi,U) Gauss limitedLinear 1  UUpper 4.63e-02   ULower 4.33e-02
 # A _cpp component against OpenFOAM's own intermediates is held to machine precision; 3.3e-03 and 4.6e-02
-# are defects not yet found, not tolerances. THIS GATE IS EXPECTED TO FAIL on the two limiter arms until
-# they are fixed, and it is registered that way on purpose -- see CMakeLists.txt.
+# were defects, not tolerances, and this gate was registered WILL_FAIL until they were found in OpenFOAM's
+# own source and fixed (the bound was never loosened):
+#     limitedLinearV  3.31e-03 -> 1.76e-14   the limiter's gradient is taken from U's patch values BEFORE
+#                                            updateCoeffs: gaussConvectionScheme.C:84 takes the weights,
+#                                            then builds the fvMatrix at :89 whose constructor is what
+#                                            calls updateCoeffs (fvMatrix.C:396)
+#     limitedLinear   4.63e-02 -> 3.22e-13   `Gauss limitedLinear` on a VECTOR is NVDTVD + limitFuncs::
+#                                            magSqr (LimitedScheme.H:188), so its gradient is
+#                                            fvc::grad(magSqr(U)) resolved under `grad(magSqr(U))`, which
+#                                            falls to `default` -- leastSquares here, not a hardcoded Gauss
 #
 # WHAT THIS GATE DOES NOT CLAIM. It says nothing about the CUDA arm: the device computes no leastSquares
 # gradient and refuses this case by name, so no device arm can run here at all. It covers div(phi,U) only
-# -- the limiters on div(phi,k|epsilon|e|K) are the same code but are not measured by this script. And it
-# uses gasMixing's snappyHexMesh mesh, which is slow to build; no committed fixture has been screened for
-# whether it also discriminates, so a faster fixture may exist and has simply not been looked for.
+# -- the limiters on div(phi,k|epsilon|e|K) are the same code but are not measured by this script. It
+# uses gasMixing's snappyHexMesh mesh (about a minute to build); compressible/rhoSimpleFoam/
+# angledDuctExplicitFixedCoeff, a blockMesh, was measured to discriminate the same defect at 1.3e-03
+# against a 2.0e-15 control and would make a faster arm.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae_rhoSimpleFoam}"
@@ -108,9 +117,7 @@ arm() {
     ( cd "$W/of" && BRAE_DUMP_STAGE_ITER=$((DEV+1)) dumpPEqn > log.dump 2>&1 )
     [ -f "$W/of/$((DEV+1))/stage_UUpper" ] || { echo "     $1: the instrument wrote no stage_UUpper"; fail=1; return; }
     stage "$W/br" $((DEV+1)) "$2"; rm -rf "$W/br/0"; cp -r "$W/dev/$DEV" "$W/br/$DEV"; mkdir -p "$W/br/dump"
-    # BRAE_LEASTSQUARES=1: gasMixing's energy limiter resolves grad(e) to leastSquares, which is behind
-    # that opt-in. It is not what this gate measures; without it the case refuses and no arm runs.
-    ( cd "$W/br" && BRAE_LEASTSQUARES=1 BRAE_STAGE_DUMP_DIR="$W/br/dump" BRAE_STAGE_DUMP_ITER=1 \
+    ( cd "$W/br" && BRAE_STAGE_DUMP_DIR="$W/br/dump" BRAE_STAGE_DUMP_ITER=1 \
         BRAE_RHOSIMPLEFOAM_MIRROR=1 "$BRAE" -case "$W/br" > log.brae 2>&1 )
     [ -f "$W/br/dump/UUpper" ] || { echo "     $1: brae wrote no UUpper: $(grep -v '^brae NOTICE' "$W/br/log.brae" | tail -1 | cut -c1-100)"; fail=1; return; }
     LABEL="$1" BOUND="$3" python3 - "$W" <<'PYEOF' || fail=1

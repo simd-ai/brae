@@ -520,7 +520,8 @@ SurfaceScalarField snGrad(
     const PrimitiveMesh&          m,
     const FvGeometry&             g,
     const std::vector<FvPatch>&   patches,
-    bool                          corrected)
+    bool                          corrected,
+    bool                          leastSquares)
 {
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
@@ -533,10 +534,12 @@ SurfaceScalarField snGrad(
         sf.internal[f] = dc[f] * (vf.internal[nei[f]] - vf.internal[own[f]]);
 
     // correctedSnGrad::fullGradCorrection -- linear interpolation of grad(vf) dotted with the correction
-    // vectors, which are zero on boundary faces.
+    // vectors, which are zero on boundary faces. grad(vf) through the FIELD's own gradSchemes entry
+    // (correctedSnGrad.C:52-55), as the header says.
     if (corrected)
     {
-        const std::vector<vector>  gradVf   = gaussGrad(vf, m, g, patches);
+        const std::vector<vector>  gradVf   = leastSquares ? leastSquaresGrad(vf, m, g, patches)
+                                                           : gaussGrad(vf, m, g, patches);
         const std::vector<vector>& corrVecs = g.nonOrthCorrectionVectors();
         const std::vector<scalar>& w        = g.weights();
         for (label f = 0; f < nIf; ++f)

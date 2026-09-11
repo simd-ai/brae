@@ -27,6 +27,7 @@
 #include "foam_field_reader.cuh"
 #include "foam_dict.cuh"
 #include "kEpsilon_cpp.cuh"
+#include "scheme_parse.cuh"   // parseDdtScheme
 #include "near_wall_dist.cuh"
 #include "nut_wall_function.cuh"
 #include "fvOptions_cpp.cuh"   // the case's fvOptions: kEpsilon.C constrains BOTH equations
@@ -321,6 +322,19 @@ int main(int argc, char** argv)
         comp.phiByRho = useVolumetricFluxForDivU ? &phiByRho : &phi;
         comp.alphat   = &at;
         comp.Prt      = 1.0;
+        // fvm::ddt(alpha, rho, k|epsilon) (kEpsilon.C:254,275) through the case's ddtSchemes: nothing
+        // under steadyState, rho*V/deltaT under Euler. This harness runs ONE correct() on OpenFOAM's
+        // iteration-1 dump, so rho.oldTime() is the closure's own rho (GeometricField::oldTime() creates
+        // the _0 field as a copy at first use) -- exactly StepInput::firstIteration.
+        {
+            const DdtSchemeEntry ddt = parseDdtScheme(caseDir);
+            if (ddt.euler)
+            {
+                const scalar dt = readDict(caseDir + "/system/controlDict").scalarOr("deltaT", 1.0);
+                comp.rDeltaT = 1.0 / dt;
+                comp.rhoOld  = &rho;
+            }
+        }
 
         // sbMatched's fvSchemes says `laplacianSchemes { default Gauss linear corrected; }`, and that
         // governs the turbulence diffusion terms as much as the momentum ones.

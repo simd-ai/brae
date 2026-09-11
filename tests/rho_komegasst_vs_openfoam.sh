@@ -136,3 +136,17 @@ for fld in stage_sstDivU stage_sstGradU stage_sstS2 stage_sstGbyNu0 stage_sstG s
 done
 
 "$BIN" "$W/case" "$ITERS"
+rc1=$?
+# ---- THE Euler ARM. sbMatched ships `ddtSchemes default steadyState`, under which the closure's fvm::ddt
+# (kOmegaSSTBase.C:572,602) is an empty matrix. gasMixing/injectorPipe ships `Euler`, and the same term missing
+# from kEpsilon put its epsilon diagonal 5.66e-04 and k source 6.14e-03 off OpenFOAM's own assembly with every
+# input exact (tests/rho_kepsilon_vs_openfoam.sh carries that arm and its fail-proof). The same term, here.
+rm -rf "$W/euler"; cp -r "$W/case" "$W/euler"; rm -rf "$W/euler"/[1-9]* "$W/euler"/log*
+sed -i 's/default *steadyState;/default         Euler;/' "$W/euler/system/fvSchemes"
+grep -q "default *Euler;" "$W/euler/system/fvSchemes" || { echo "FAIL: could not stage the Euler arm"; exit 1; }
+echo "== ddtSchemes default Euler (deltaT $(grep -E '^deltaT' "$W/euler/system/controlDict" | awk '{print $2}' | tr -d ';')) =="
+( cd "$W/euler" && BRAE_DUMP_STAGE_ITER="$ITERS" "$DUMP" > dump.log 2>&1 ) \
+    || { echo "FAIL: dumpPEqn did not run"; tail -25 "$W/case/dump.log"; exit 1; }
+"$BIN" "$W/euler" "$ITERS"
+rc2=$?
+[ $rc1 = 0 ] && [ $rc2 = 0 ]; exit $?

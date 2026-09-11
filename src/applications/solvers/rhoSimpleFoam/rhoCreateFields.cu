@@ -360,8 +360,10 @@ RhoDeviceFields createDeviceFields(
     const GeometricField<scalar>& second = sstModel ? hf.omega : hf.epsilon;
     if (hf.turbulent && !second.internal.empty())
     {
-        d.dbK   = buildDeviceBoundary(hf.k, patches, g);
-        d.dbEps = buildDeviceBoundary(second, patches, g);
+        // The closure's boundaries take the stored-value seed (DeviceBoundary::ioStored): the closure
+        // reconstructs each field's stored patch values at its first step from these coefficients.
+        d.dbK   = buildDeviceBoundary(hf.k, patches, g, /*storedIoSeed=*/true);
+        d.dbEps = buildDeviceBoundary(second, patches, g, /*storedIoSeed=*/true);
 
         // F1 and F2 read the wall distance per CELL (arg1/arg2 in kOmegaSSTBase.C), which is a
         // different field from the per-boundary-face nearWallDist the wall functions take.

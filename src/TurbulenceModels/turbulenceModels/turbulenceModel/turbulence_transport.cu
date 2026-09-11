@@ -97,8 +97,11 @@ void assembleScalarTransport(
             DeviceBuffer<scalar> bval, gx, gy, gz, ffc, corr;
             if (sc.bndValues) deviceCopy(bval, *sc.bndValues);
             else              deviceBCValue(db, field, bval);
-            deviceGaussGrad(dm, field, bval, gx, gy, gz);
-            // correctedSnGrad's correction takes the field's OWN grad scheme (correctedSnGrad.C:52-55).
+            // correctedSnGrad's correction takes the field's OWN grad scheme (correctedSnGrad.C:52-55):
+            // its base (leastSquares or Gauss linear) and its cellLimited coefficient, both from the
+            // case's grad(<field>) entry. The host twin is kEpsilon_cpp.cu's laplacian block.
+            if (sc.gradFieldLeastSq) deviceLeastSquaresGrad(dm, field, bval, gx, gy, gz);
+            else                     deviceGaussGrad(dm, field, bval, gx, gy, gz);
             if (sc.gradFieldLimitK > scalar(0))
                 deviceCellLimitGrad(dm, field, bval, gx, gy, gz, sc.gradFieldLimitK);
             if (sc.snGradLimitCoeff > scalar(0.0))

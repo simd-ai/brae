@@ -404,7 +404,9 @@ void assemblePEqn(
     {
         DeviceBuffer<scalar> pb, gx, gy, gz, lc;
         storedOrEvaluatedP(in, dm.nBndFaces, dbP, p, pb);
-        deviceGaussGrad(dm, p, pb, gx, gy, gz);
+        // correctedSnGrad's correction takes grad(p)'s own scheme (correctedSnGrad.C:52-55).
+        if (in.gradPLeastSq) deviceLeastSquaresGrad(dm, p, pb, gx, gy, gz);
+        else                 deviceGaussGrad(dm, p, pb, gx, gy, gz);
         // The explicit half: source gets -V*div(gamma*magSf*(corrVec & interp(grad p))), which
         // deviceLaplacianCorr already returns pre-negated (device_mesh.cuh:288), hence the +1 here.
         if (in.snGradLimitCoeff > 0.0)

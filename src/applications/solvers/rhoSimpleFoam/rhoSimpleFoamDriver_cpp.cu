@@ -124,31 +124,30 @@ StepInput buildStepInput(
         // gradient the case did not ask for. leastSquares is not a variation on Gauss linear -- measured
         // against OpenFOAM's own grad(T) on validation/rhoSST, the two differ by 2.5e-01 on the same
         // field, while each matches OpenFOAM's answer for its own scheme to ~1e-13
-        // (tests/leastsquares_grad_vs_openfoam).
-        // leastSquares is COMPUTED but not yet reachable by default. The gradient itself is validated --
-        // fvc::leastSquaresGrad and deviceLeastSquaresGrad both match OpenFOAM's own grad(T) to 2.5e-13
-        // on validation/rhoSST, device against host to 1.6e-16, with Gauss linear differing by 2.5e-01 on
-        // the same field so the match is not trivial (tests/leastsquares_grad_vs_openfoam). What is NOT
-        // validated is the case END TO END: on the gasMixing tutorial brae still parts from OpenFOAM by
-        // U 1.2e-01 with the gradient matched on BOTH sides, so something else on that path is wrong and
-        // unidentified, and on rhoSST with leastSquares + limitedLinear the run sits at k 9.1e-03 rather
-        // than the floor. Letting the case run on the strength of a correct gradient would be exactly the
-        // silent-substitution failure this refusal exists to prevent. BRAE_LEASTSQUARES=1 opts in, for
-        // the gate and for the work that closes the end-to-end gap.
-        const bool lsqOptIn = std::getenv("BRAE_LEASTSQUARES")
-                           && std::string(std::getenv("BRAE_LEASTSQUARES")) == "1";
-        auto resolveLimiterGrad = [&](DivScheme sc, const std::string& fld, scalar& out, bool& lsq)
+        // (tests/leastsquares_grad_vs_openfoam). leastSquares is computed AND reached by default: the
+        // BRAE_LEASTSQUARES=1 opt-in that used to sit here existed because gasMixing/injectorPipe, the
+        // case it unblocks, parted from OpenFOAM by U 1.2e-01 with the gradient matched on both sides.
+        // That gap has since been named and closed -- fvPatch::delta()'s projection, limitedLinearV's
+        // pre-updateCoeffs boundary, the corrected laplacian's own gradient scheme and the closures'
+        // fvm::ddt -- and the case reads U 1.7e-12 / T 9.6e-13 / k 2.2e-12 restarted from OpenFOAM's
+        // iteration 5 (tests/rho_gasmixing_vs_openfoam.sh). An opt-in left in place would be a refusal
+        // whose reason no longer exists.
+        // `force`: the field's OWN gradSchemes entry is also what correctedSnGrad::fullGradCorrection
+        // resolves for a `corrected` laplacian (correctedSnGrad.C: mesh.gradScheme("grad(" + name + ')')),
+        // so it is needed whether or not the div scheme is limitedLinear. Resolved only for the limiter,
+        // an upwind-div case with a corrected laplacian ran its non-orthogonal correction off a Gauss
+        // gradient under a leastSquares name -- the substitution this refusal exists to prevent.
+        auto resolveLimiterGrad = [&](DivScheme sc, const std::string& fld, scalar& out, bool& lsq,
+                                      bool force = false)
         {
-            if (sc != DivScheme::limitedLinear) return;
+            if (!force && sc != DivScheme::limitedLinear) return;
             const FieldGradScheme gs = parseFieldGradScheme(caseDir, fld);
-            if (!gs.gaussLinear && !(gs.leastSquares && lsqOptIn))
+            if (!gs.gaussLinear && !gs.leastSquares)
                 throw std::runtime_error(
                     "rhoSimpleFoam buildStepInput: div(phi," + fld + ") is `Gauss limitedLinear`, whose "
                     "limiter OpenFOAM builds from fvc::grad(" + fld + ") through the case's gradSchemes "
                     "(LimitedScheme.C:56-59). This case resolves grad(" + fld + ") to `" + gs.raw +
-                    "`. brae computes `Gauss linear`, and computes `leastSquares` too but does not yet "
-                    "reach it by default -- its gradient matches OpenFOAM's to 2.5e-13 while the case it "
-                    "unblocks does not (BRAE_LEASTSQUARES=1 opts in). Measured on "
+                    "`. brae computes `Gauss linear` and `leastSquares` and nothing else. Measured on "
                     "validation/rhoLU at a developed state, swapping that gradient moves the assembled "
                     "energy diagonal by 9.1e-03 and its source by 2.8e-03 -- a different discretisation, "
                     "not an approximation. Refusing rather than running the limiter off the wrong "
@@ -173,7 +172,8 @@ StepInput buildStepInput(
                     "optionally cellLimited, on both arms; refusing rather than building it from another.");
             in.gradULULimitK = gl.cellLimitK;
         }
-        resolveLimiterGrad(in.schemeHe, f.heName, in.limGradHeK, in.limGradHeLeastSq);
+        resolveLimiterGrad(in.schemeHe, f.heName, in.limGradHeK, in.limGradHeLeastSq,
+                           /*force=*/in.correctedLaplacian);
         resolveLimiterGrad(in.schemeKE, keName,   in.limGradKEK, in.limGradKELeastSq);
 
         DeviceSimpleControls sctl;
@@ -217,6 +217,16 @@ StepInput buildStepInput(
             const FieldGradScheme gM = parseFieldGradScheme(caseDir, "magSqr(U)");
             in.gradMagSqrULeastSq = gM.leastSquares;
             in.gradMagSqrULimitK  = gM.cellLimitK;
+        }
+        {
+            const DdtSchemeEntry ddt = parseDdtScheme(caseDir);
+            in.ddtEuler = ddt.euler;
+            if (ddt.euler)
+            {
+                if (!(f.deltaT > 0.0))
+                    throw std::runtime_error("brae: ddtSchemes default Euler needs a positive deltaT in controlDict.");
+                in.rDeltaT = 1.0 / f.deltaT;   // controlDict's LAST deltaT, as OpenFOAM's dictionary reads it
+            }
         }
         // The ENERGY gradient limiters, which the parser has carried all along and this never forwarded:
         // gradHeLimitK is the cellLimited coefficient of the gradient the energy's linearUpwind NAMES
@@ -693,12 +703,14 @@ int runMirror(const std::string& caseDir)
 
     int  nIter = static_cast<int>(nSteps);
     bool converged = false;
+    int nStepsThisProcess = 0;   // StepInput::firstIteration: rho.oldTime() semantics
     while (time.loop())
     {
         const int iter = time.timeIndex();
         // The iteration's time value, already advanced by loop() as OpenFOAM's is when the body runs:
         // what a time-dependent boundary Function1 is evaluated at.
         in.time = time.timeValue();
+        in.firstIteration = (nStepsThisProcess++ == 0);
         const Residuals r = rhoSimpleStep(f, in, m, g, patches);
 
         auto res = [&](const char* k) { return r.count(k) ? (double)r.at(k) : 0.0; };

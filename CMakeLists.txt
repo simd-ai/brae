@@ -2464,6 +2464,15 @@ add_test(NAME rho_leastsquares_closure_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_leastsquares_closure_vs_openfoam.sh)
 set_tests_properties(rho_leastsquares_closure_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
+# gasMixing/injectorPipe at a DEVELOPED state, host arm, both codes restarted from OpenFOAM's own iteration
+# 5 (the protocol and the two measured reasons for it are in the script). The case the leastSquares work was
+# for, and the one that found fvPatch::delta()'s projection, limitedLinearV's pre-updateCoeffs boundary, the
+# corrected laplacian's own gradient scheme and the closures' fvm::ddt under Euler -- each with its fail-proof
+# number in the script header. Worst 2.0e-11 over iterations 6-8; the CUDA arm is asserted to refuse by name.
+add_test(NAME rho_gasmixing_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_gasmixing_vs_openfoam.sh)
+set_tests_properties(rho_gasmixing_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600 LABELS slow)
+
 # THE SIX rhoSimpleFoam TUTORIALS as OpenFOAM ships them, on both mirror arms, meshed by each tutorial's
 # own Allrun.pre -- the standing answer to which of them brae runs and which it refuses. The two halves
 # are each other's control: four must RUN and agree with OpenFOAM (a guard drawn too wide turns it red),
@@ -2777,6 +2786,27 @@ set_tests_properties(rho_step_cuda_turbulent PROPERTIES
                      ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
                      SKIP_RETURN_CODE 77
                      DEPENDS test_rho_simple_step_cuda
+                     TIMEOUT 1800)
+add_test(NAME rho_step_cuda_euler
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_step_cuda_euler.sh)
+set_tests_properties(rho_step_cuda_euler PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_simple_step_cuda
+                     TIMEOUT 1800)
+add_test(NAME rho_step_cuda_lsq
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_step_cuda_lsq.sh)
+set_tests_properties(rho_step_cuda_lsq PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_rho_simple_step_cuda
+                     TIMEOUT 1800)
+add_test(NAME rho_gradp_lsq_simplec_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_gradp_lsq_simplec_vs_openfoam.sh)
+set_tests_properties(rho_gradp_lsq_simplec_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BRAE_BIN=${CMAKE_CURRENT_BINARY_DIR}/brae_rhoSimpleFoam"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
                      TIMEOUT 1800)
 
 add_test(NAME rho_nonorth_corrector_vs_openfoam

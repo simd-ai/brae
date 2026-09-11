@@ -56,6 +56,7 @@
 #include "rhoTurbulenceHook.cuh"   // correctTurbulence: the device-resident closure hook the driver ships
 #include "rhoSimpleFoamDriver.cuh"   // buildDeviceStepInput: the device input struct the driver ships
 #include "rhoSimpleFoamDriver_cpp.cuh"   // buildStepInput: the case -> StepInput translation the solver ships
+#include "linear_solver_setup.cuh"   // readLinearSolverControls: the case's own preconditioner per field
 #include "scheme_parse.cuh"     // parseFieldDivScheme -- div(phi,k|epsilon|omega) from the case          // gpu::kEpsilonRAS -- the device closure the turbulent arm drives
 #include "transport_model.cuh"   // transportMu: nu = mu(T)/rho for the closure inputs
 #include "linearViscousStress_cpp.cuh"   // effectiveFaceViscosity -- the host driver's own rho interpolation
@@ -137,12 +138,21 @@ int main(int argc, char** argv)
     bool boundaryArm  = false;
     bool deviceThermo = false;
     bool turbulentArm = false;
+    // CONTROL for tests/rho_step_cuda_euler.sh: hand the device closure rDeltaT 0 under a case whose
+    // ddtSchemes is Euler, so the run MUST miss the closure bounds below -- the driver-level proof that
+    // the term is load-bearing where the gate measures it. Never set on a registered passing arm.
+    bool deviceDdtOff = false;
+    // CONTROL for tests/rho_step_cuda_lsq.sh: the device takes the Gauss grad(p) under a case whose
+    // grad(p) is leastSquares, so the run MUST miss the momentum bounds. Never set on a passing arm.
+    bool deviceGradPGauss = false;
     for (int a = 3; a < argc; ++a)
     {
         const std::string arg = argv[a];
         if      (arg == "--boundary")      boundaryArm  = true;
         else if (arg == "--device-thermo") deviceThermo = true;
         else if (arg == "--turbulent")     turbulentArm = true;
+        else if (arg == "--device-ddt-off") deviceDdtOff = true;
+        else if (arg == "--device-gradp-gauss") deviceGradPGauss = true;
         else                               iters = std::atoi(argv[a]);
     }
 
@@ -314,6 +324,52 @@ int main(int argc, char** argv)
     gin.pMaxLimit = hf.pressureControl.pMax;
     gin.limitMinP = hf.pressureControl.limitMinP;
     gin.pMinLimit = hf.pressureControl.pMin;
+    if (deviceGradPGauss)
+    {
+        check("--device-gradp-gauss given on a case whose grad(p) is leastSquares", hin.gradPLeastSq);
+        gin.gradPLeastSq = false;
+        std::printf("  CONTROL: the device takes the Gauss grad(p); the host keeps leastSquares\n");
+    }
+    // THE CASE'S OWN PRECONDITIONER ON THE DEVICE SOLVES, as the runnable CUDA driver wires it
+    // (rhoSimpleFoamDriver.cu, the same reader) and as the host reference always solves (pbicgstab.cuh
+    // is DILU). This harness left every device solve on Jacobi. The two arms still met at the pinned
+    // tolerance on rhoBox, rhoKE and rhoSST -- and not on sbMatched's transonic SIMPLEC pressure:
+    // measured with `grad(p) leastSquares` there, Ux 6.677e-11 and p 2.691e-12 at iteration 1 against
+    // 5.829e-12 / 1.538e-13 as shipped, while the two runnable drivers (both on the case's DILU) agree
+    // to 4.1e-12 / 9.1e-14 under either scheme; switching off `consistent` OR `transonic` removed the
+    // gap. The device solver's stopping point, not the discretisation -- queue item 27 on p. The same
+    // Jacobi closure solve read k 3.6e-09 against the host at iteration 2 on sbMatched.
+    bool turbDilu = false;
+    int  turbPolyDeg = 1;
+    {
+        DeviceSimpleControls lctl;
+        lctl.turbulent = hf.turbulent;
+        SolverRunsAs runsAs;
+        runsAs.diluOnEnergy = true;
+        runsAs.smoothSolverOnEnergy     = true;
+        runsAs.smoothSolverOnMomentum   = true;
+        runsAs.smoothSolverOnTurbulence = true;
+        const std::string secondName = (hf.rasModel == "kOmegaSST") ? "omega" : "epsilon";
+        readLinearSolverControls(fvSolution, secondName, lctl, "SIMPLE", hf.heName, runsAs);
+        const FoamDict* solvers = fvSolution.subDict("solvers");
+        const FoamDict* pEntry  = solvers ? solvers->subDict("p") : nullptr;
+        // The transonic pressure's BiCGStab takes the case's DILU where the entry names it; the
+        // non-transonic pressure is symmetric and the step solves it with its AMG-preconditioned CG.
+        const bool diluP = hin.transonic && pEntry && pEntry->wordOr("preconditioner", "") == "DILU";
+        if (lctl.diluU || lctl.diluHe || lctl.diluKE || diluP)
+        {
+            w.dilu = buildDeviceDilu(m.owner(), m.neighbour(), nC);
+        }
+        gin.preconU  = (lctl.diluU  && w.dilu.valid) ? &w.dilu : nullptr;
+        gin.preconHe = (lctl.diluHe && w.dilu.valid) ? &w.dilu : nullptr;
+        gin.preconP  = (diluP       && w.dilu.valid) ? &w.dilu : nullptr;
+        turbDilu    = lctl.diluKE && w.dilu.valid;
+        turbPolyDeg = lctl.polyDegKE;
+        std::printf("  device preconditioners: U %s, %s %s, p %s, k/%s %s\n",
+                    gin.preconU ? "DILU" : "Jacobi", hf.heName.c_str(), gin.preconHe ? "DILU" : "Jacobi",
+                    gin.preconP ? "DILU" : (hin.transonic ? "Jacobi" : "AMG-PCG"),
+                    secondName.c_str(), turbDilu ? "DILU" : "Jacobi");
+    }
 
     // pressureControl::limit, from the case -- AND made to bind, because the case's own limit does not.
     // rhoBox names `pMin 1000` while p sits near 1e5, so the shipped limit never clips and a driver that
@@ -465,6 +521,15 @@ int main(int argc, char** argv)
         // closure this gate drove could differ from the one `brae -case` runs on a case naming any of
         // them (OpenFOAM's angledDuct tutorial names the first).
         turbOpt = gpu::rhoSimple::buildTurbulenceHookOptions(hin, hf, ginConstraints);
+        turbOpt.precon    = turbDilu ? &w.dilu : nullptr;   // the case's own, as the driver wires it
+        turbOpt.polyDegKE = turbPolyDeg;
+        if (deviceDdtOff)
+        {
+            check("--device-ddt-off given on a case whose ddtSchemes is Euler", hin.ddtEuler);
+            turbOpt.rDeltaT = 0.0;
+            std::printf("  CONTROL: the device closure runs WITHOUT fvm::ddt (rDeltaT 0); the host keeps 1/deltaT %.6g\n",
+                        (double)hin.rDeltaT);
+        }
         gin.correct = [&]()
         {
             gpu::rhoSimple::correctTurbulence(gf, dev, dm, dbU, hf.thermo, turbOpt, turbBuf);
@@ -487,6 +552,11 @@ int main(int argc, char** argv)
     int firstBad = -1;
     for (int it = 1; it <= iters; ++it)
     {
+        // rho.oldTime() for the closures' fvm::ddt under Euler: the process's FIRST iteration takes the
+        // closure-time rho, later ones the start-of-iteration rho (StepInput::firstIteration). Both
+        // runnable drivers count it the same way; this harness drives the steps directly, so it does too.
+        hin.firstIteration = (it == 1);
+        gin.firstIteration = (it == 1);
         const cpu::rhoSimple::Residuals hr = cpu::rhoSimple::rhoSimpleStep(hf, hin, m, g, fvp);
 
         // muEff / alphaEff for THIS iteration, from the DEVICE state. The driver takes them as inputs
@@ -582,13 +652,25 @@ int main(int argc, char** argv)
         // WHICH of k, epsilon or nut moved first. A whole-field U number cannot answer that; these can.
         if (turbulentArm)
         {
+            // The SECOND scalar: the host keeps omega in its own field on a kOmegaSST case while the
+            // device's f.epsilon carries omega there (rhoTurbulenceHook.cu). Compared against
+            // hf.epsilon on such a case, this row read 0.000e+00 -- an EMPTY oracle, not agreement.
+            const bool sst = (hf.rasModel == "kOmegaSST");
+            const std::vector<scalar>& hSecond = sst ? hf.omega.internal : hf.epsilon.internal;
             const double rk = relL2(gf.k.host(),       hf.k.internal);
-            const double re = relL2(gf.epsilon.host(), hf.epsilon.internal);
+            const double re = relL2(gf.epsilon.host(), hSecond);
             const double rn = relL2(gf.nut.host(),     hf.nut.internal);
             worstK = std::max(worstK, rk);
             worstE = std::max(worstE, re);
             worstN = std::max(worstN, rn);
-            std::printf("       %-30s k %.3e  epsilon %.3e  nut %.3e\n", "(closure output)", rk, re, rn);
+            // A zero-norm oracle reports 0 for ANY device field (relL2 falls back to the absolute
+            // difference of two empty or all-zero arrays). Refused as a measurement rather than passed.
+            auto l2 = [](const std::vector<scalar>& v)
+            { double t = 0; for (scalar x : v) t += (double)x * x; return std::sqrt(t); };
+            const double nE = l2(hSecond), nK = l2(hf.k.internal);
+            check("the closure oracle is not degenerate (host k, epsilon|omega have a norm)", nE > 0 && nK > 0);
+            std::printf("       %-30s k %.3e  epsilon|omega %.3e  nut %.3e   (host L2: k %.3e  eps|omega %.3e)\n",
+                        "(closure output)", rk, re, rn, nK, nE);
         }
 
         // The alphat BOUNDARY, device against host, on the turbulent arm. Compared directly rather than
@@ -669,6 +751,16 @@ int main(int argc, char** argv)
         // (rhoCreateFields.cu) it reads 1.717e-11 on rhoKE at 3 iterations; bound ~60x. With the device
         // boundary write disabled it reads exactly 1.000000e+00, and with the old wall-only mask 1.1e-04.
         report("alphat boundary (device vs host)", worstAlphatB, 1e-9);
+        // THE CLOSURE'S OWN OUTPUT, asserted and not only printed. Measured on rhoKE over 3 iterations
+        // (tests/rho_step_cuda_turbulent.sh, steadyState; tests/rho_step_cuda_euler.sh, Euler):
+        // k 4.5e-13 / 4.4e-13, epsilon 3.1e-12 / 3.1e-12, nut 1.8e-11 / 1.8e-11; on sbMatched (112000
+        // cells, transonic SIMPLEC, the case's DILU everywhere) over 2 iterations k 1.2e-11, epsilon
+        // 3.4e-11, nut 2.4e-11 (tests/rho_step_cuda_lsq.sh) -- the k bound is 4x that floor and 100x
+        // rhoKE's. With the device closure's fvm::ddt withheld under Euler (--device-ddt-off) k reads
+        // 4.85e-05 in the standalone gate (test_rho_kepsilon_cuda) and the Euler script asserts the miss.
+        report("k (closure output)", worstK, 5e-11);
+        report("epsilon (closure output)", worstE, 1e-10);
+        report("nut (closure output)", worstN, 1e-9);
     }
 
     // ---- CONTROL: the POROSITY reaches the momentum equation -----------------------------------

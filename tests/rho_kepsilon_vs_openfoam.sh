@@ -107,3 +107,18 @@ for fld in stage_kIn stage_epsIn stage_nutIn stage_alphatIn stage_Uturb stage_ph
 done
 
 "$BIN" "$W/case" "$ITERS"
+rc1=$?
+# ---- THE Euler ARM. sbMatched ships `ddtSchemes default steadyState`, under which the closures' fvm::ddt
+# (kEpsilon.C:254,275) is an empty matrix, so the arm above cannot see a missing term. gasMixing/injectorPipe
+# ships `Euler` with deltaT 1 and the closure ran without it: measured there restarted from OpenFOAM's
+# iteration 5, the epsilon diagonal 5.66e-04 and the k source 6.14e-03 off OpenFOAM's own assembly with
+# every input exact, OpenFOAM minus brae equal to rho*V/deltaT to 4.8e-09. The same term, on this fixture.
+rm -rf "$W/euler"; cp -r "$W/case" "$W/euler"; rm -rf "$W/euler"/[1-9]* "$W/euler"/log*
+sed -i 's/default *steadyState;/default         Euler;/' "$W/euler/system/fvSchemes"
+grep -q "default *Euler;" "$W/euler/system/fvSchemes" || { echo "FAIL: could not stage the Euler arm"; exit 1; }
+echo "== ddtSchemes default Euler (deltaT $(grep -E '^deltaT' "$W/euler/system/controlDict" | awk '{print $2}' | tr -d ';')) =="
+( cd "$W/euler" && BRAE_DUMP_STAGE_ITER="$ITERS" "$DUMP" > dump.log 2>&1 ) \
+    || { echo "FAIL: dumpPEqn did not run"; tail -25 "$W/case/dump.log"; exit 1; }
+"$BIN" "$W/euler" "$ITERS"
+rc2=$?
+[ $rc1 = 0 ] && [ $rc2 = 0 ]; exit $?
