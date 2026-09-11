@@ -284,6 +284,7 @@ RhoStepInput buildDeviceStepInput(
     // gasMixing/injectorPipe by tests/rho_gasmixing_vs_openfoam.sh's CUDA arm.
     in.gradULimitK        = hin.gradULimitK;
     in.gradULULimitK      = hin.gradULULimitK;
+    in.gradULeastSq       = hin.gradULeastSq;   // the VECTOR least-squares gradient, three scalar fits
     in.gradMagSqrULeastSq = hin.gradMagSqrULeastSq;   // `Gauss limitedLinear` on U: grad(magSqr(U))'s entry
     in.gradMagSqrULimitK  = hin.gradMagSqrULimitK;
 
@@ -332,23 +333,21 @@ TurbulenceHookOptions buildTurbulenceHookOptions(
     // kOmegaSST.cu; the limiter's own gradient was already limGradLeastSq), gated against the host
     // reference by test_rho_kepsilon_cuda's leastSquares arm and against OpenFOAM by
     // tests/rho_leastsquares_closure_vs_openfoam.sh. grad(p) leastSquares is computed at all five of
-    // its device consumers (RhoStepInput::gradPLeastSq; tests/rho_step_cuda_lsq.sh). grad(U) -- the
-    // VECTOR form, divDevRhoReff, the limiters and the closures' production -- is still refused.
+    // its device consumers (RhoStepInput::gradPLeastSq; tests/rho_step_cuda_lsq.sh), and grad(U)'s
+    // VECTOR form (three scalar fits, deviceLeastSquaresGradU) by divDevRhoReff, the corrected laplacian,
+    // the limitedLinearV limiter and both closures' production -- gated by leastsquares_grad_vs_openfoam's
+    // device twin, test_rho_ueqn_cuda's and test_rho_kepsilon_cuda's leastSquares arms, and the closure
+    // gate's restart arms on this arm. The linearUpwind-NAMED gradient under leastSquares is refused by
+    // the shared parse before this point.
     opt.co.gradKLeastSq       = hin.gradKLeastSq;
-    if (hin.gradULeastSq)
-        throw std::runtime_error(
-            "rhoSimpleFoam (OF-mirror, CUDA): gradSchemes resolve grad(U) to `leastSquares`, which this "
-            "arm computes nowhere yet for a VECTOR: divDevRhoReff's dev2 term, the momentum limiters and "
-            "the closures' production take Gauss linear, optionally cellLimited (the scalar consumers -- "
-            "grad(p), grad(k)/grad(epsilon|omega), the energy limiters -- are ported). The host arm runs "
-            "it (BRAE_RHOSIMPLEFOAM_MIRROR=1). Refusing rather than running a different gradient under "
-            "the case's scheme name.");
+    opt.co.gradULeastSq       = hin.gradULeastSq;
     // kOmegaSST: the model flag and its own coefficients, from the same host parse the host arm reads.
     // The second-scalar buffers carry omega when this is set -- see createFields.
     opt.sst   = (hf.rasModel == "kOmegaSST");
     opt.sstCo = hf.sstCoeffs;
     opt.sstCo.gradKLimitK  = hin.gradKLimitK;
     opt.sstCo.gradKLeastSq = hin.gradKLeastSq;
+    opt.sstCo.gradULeastSq = hin.gradULeastSq;
     opt.Prt                   = hf.Prt;
     opt.bounded               = hin.boundedTurb;
     opt.correctedLaplacian    = hin.correctedLaplacian;

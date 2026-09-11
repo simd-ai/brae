@@ -71,7 +71,8 @@ void deviceDivDevReff(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                       // no probe), laminar, 10 steps: at the tutorial's nu = 1e-6 the difference from
                       // OpenFOAM is 6.5e-07 either way, but at nu = 1e-3 -- the size of a turbulent nut --
                       // it is 4.7e-04 unlimited against 6.7e-08 limited. A factor of 7000.
-                      scalar gradULimitK = 0.0);
+                      scalar gradULimitK = 0.0,
+                      bool gradULeastSq = false);   // grad(U)'s base scheme (see device_divdevreff.cu)
 
 // Exported for the Maxwell model and for generalizedNewtonian's strainRate -- see the definitions in
 // device_divdevreff.cu. UbStored: U's STORED boundary values, one buffer per component, for a caller that

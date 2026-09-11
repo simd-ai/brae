@@ -291,10 +291,13 @@ void deviceDivDevReff(
     const DeviceAMI* ami,
     const DeviceProcStress* proc,
     const DeviceBuffer<scalar>* const* UbStored,
-    scalar gradULimitK)
+    scalar gradULimitK,
+    bool gradULeastSq)
 {
     const int nC = dm.nCells, nB = dm.nBndFaces;
     const DeviceBuffer<scalar>* Uc[3] = { &Ux, &Uy, &Uz };
+    if (gradULeastSq && (cyc || ami || proc))
+        throw std::runtime_error("deviceDivDevReff: grad(U) leastSquares is not computed across a coupled interface.");
 
     // gradU (packed 9*nC): row i = gaussGrad(U_i).
     DeviceBuffer<scalar> gradU(static_cast<std::size_t>(9) * nC);
@@ -336,6 +339,13 @@ void deviceDivDevReff(
         }
     }
     DeviceBuffer<scalar> gxs[3], gys[3], gzs[3];
+    // fvc::grad(U) through the case's grad(U) entry (linearViscousStress.C's divDevRhoReff takes
+    // dev2(T(fvc::grad(U)))): leastSquares where it resolves so, the host's gradULeastSq.
+    if (gradULeastSq)
+    {
+        for (int i = 0; i < 3; ++i) deviceLeastSquaresGrad(dm, *Uc[i], bvals[i], gxs[i], gys[i], gzs[i]);
+    }
+    else
     {
         const DeviceBuffer<scalar>* vol[3] = {Uc[0], Uc[1], Uc[2]};
         const DeviceBuffer<scalar>* bv[3]  = {&bvals[0], &bvals[1], &bvals[2]};

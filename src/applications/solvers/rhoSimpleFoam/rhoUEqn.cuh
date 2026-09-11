@@ -181,6 +181,10 @@ struct RhoMomentumInput
     // (This comment used to call it "the gradient linearUpwind NAMES"; that is gradULULimitK below, and
     // the two are different lookups that squareBendLiq was the first case to separate.)
     scalar gradULimitK = 0.0;
+    // ...and its BASE scheme: leastSquares where grad(U) resolves so (the host's gradULeastSq). Taken by
+    // divDevRhoReff's dev2 term, correctedSnGrad's correction and the limitedLinearV limiter -- the same
+    // three consumers as gradULimitK. NOT by the linearUpwind-named gradient, which the parse refuses.
+    bool   gradULeastSq = false;
     // The gradient `linearUpwind <name>` / `linearUpwindV <name>` NAMES, for the convection correction
     // only (linearUpwind.C:61-68). -1 = not resolved by the caller: the correction takes gradULimitK, the
     // arithmetic every harness that bypasses the driver was gated with.

@@ -328,7 +328,15 @@ void assembleUEqn(
                 deviceCopy(ub[k], *preUb[k]);
             }
             const DeviceBuffer<scalar>* ubp[3] = {&ub[0], &ub[1], &ub[2]};
-            deviceGaussGradFused(dm, 3, Usrc, ubp, gx, gy, gz);
+            // grad(U)'s base scheme: leastSquares where the case resolves it so (the host's gradULeastSq).
+            if (in.gradULeastSq)
+            {
+                for (int k = 0; k < 3; ++k) deviceLeastSquaresGrad(dm, *Usrc[k], ub[k], gx[k], gy[k], gz[k]);
+            }
+            else
+            {
+                deviceGaussGradFused(dm, 3, Usrc, ubp, gx, gy, gz);
+            }
             if (in.gradULimitK > 0.0)
             {
                 for (int k = 0; k < 3; ++k)
@@ -510,7 +518,8 @@ void assembleUEqn(
         nullptr,
         nullptr,
         ubStored,
-        in.gradULimitK);
+        in.gradULimitK,
+        in.gradULeastSq);
 
     // The explicit half of `corrected`: the non-orthogonal deferred source. AFTER divDevRhoReff, which
     // ASSIGNS the source -- added before, it compiles, runs, and is discarded.
@@ -543,7 +552,15 @@ void assembleUEqn(
             patchU(k, *U[k], ub[k]);
         }
         const DeviceBuffer<scalar>* ubp[3] = {&ub[0], &ub[1], &ub[2]};
-        deviceGaussGradFused(dm, 3, U, ubp, gxc, gyc, gzc);
+        // correctedSnGrad's correction takes grad(U)'s own scheme (correctedSnGrad.C:52-55).
+        if (in.gradULeastSq)
+        {
+            for (int k = 0; k < 3; ++k) deviceLeastSquaresGrad(dm, *U[k], ub[k], gxc[k], gyc[k], gzc[k]);
+        }
+        else
+        {
+            deviceGaussGradFused(dm, 3, U, ubp, gxc, gyc, gzc);
+        }
         if (in.gradULimitK > 0.0)
         {
             for (int k = 0; k < 3; ++k)
@@ -603,7 +620,15 @@ void assembleUEqn(
             patchU(k, *Usrc[k], ub[k]);
         }
         const DeviceBuffer<scalar>* ubp[3] = {&ub[0], &ub[1], &ub[2]};
-        deviceGaussGradFused(dm, 3, Usrc, ubp, gx, gy, gz);   // one launch, not three
+        // The NAMED gradient's base scheme, as the host reference reads it (rhoUEqn_cpp.cu:200): grad(U)'s.
+        if (in.gradULeastSq)
+        {
+            for (int k = 0; k < 3; ++k) deviceLeastSquaresGrad(dm, *Usrc[k], ub[k], gx[k], gy[k], gz[k]);
+        }
+        else
+        {
+            deviceGaussGradFused(dm, 3, Usrc, ubp, gx, gy, gz);   // one launch, not three
+        }
         // The gradient the scheme NAMES, not grad(U)'s own -- see RhoMomentumInput::gradULULimitK.
         const scalar luK = (in.gradULULimitK >= 0.0) ? in.gradULULimitK : in.gradULimitK;
         if (luK > 0.0)
@@ -637,7 +662,14 @@ void assembleUEqn(
             patchU(k, *U[k], ub[k]);
         }
         const DeviceBuffer<scalar>* ubp[3] = {&ub[0], &ub[1], &ub[2]};
-        deviceGaussGradFused(dm, 3, U, ubp, gx, gy, gz);   // one launch, not three
+        if (in.gradULeastSq)   // as above: the host's rhoUEqn_cpp.cu:215
+        {
+            for (int k = 0; k < 3; ++k) deviceLeastSquaresGrad(dm, *U[k], ub[k], gx[k], gy[k], gz[k]);
+        }
+        else
+        {
+            deviceGaussGradFused(dm, 3, U, ubp, gx, gy, gz);   // one launch, not three
+        }
         for (int k = 0; k < 3; ++k)
         {
             DeviceBuffer<scalar> lu;

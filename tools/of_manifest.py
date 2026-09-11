@@ -1486,7 +1486,16 @@ COMPONENTS = {
                         "because fvc::snGrad's non-orthogonal correction (SIMPLEC's phiHbyA term, pcEqn.H:27) "
                         "took a hardcoded Gauss gradient where correctedSnGrad.C:52-55 resolves grad(p)'s own "
                         "entry -- invisible on rhoSST (not SIMPLEC) and at iteration 1 of sbMatched (p uniform). "
-                        "Fixed in fvc.cu (snGrad takes the field's scheme); 2.02e-11 after.",
+                        "Fixed in fvc.cu (snGrad takes the field's scheme); 2.02e-11 after. CUDA, the VECTOR form "
+                        "(deviceLeastSquaresGradU: three scalar fits packed as grad(U), leastSquaresGrad.C's "
+                        "lsGrad += ownLs*deltaVsf): leastsquares_grad_vs_openfoam's device twin 9.4e-15 of "
+                        "OpenFOAM's own grad(U) on sbMatched and 4.2e-13 on pitzDaily, device-host 1.5e-16; its "
+                        "consumers -- divDevRhoReff's dev2 term, the corrected laplacian, the limitedLinearV limiter "
+                        "and the linearUpwind-named gradient (rho_ueqn_cuda_lsq, sources 8e-16 of the host), both "
+                        "closures' production (test_rho_kepsilon_cuda's grad(U) arm: GbyNu 5.5e-16, the Gauss "
+                        "GbyNu 5.0e-01 off as the control) -- and end to end rho_leastsquares_closure_vs_openfoam's "
+                        "restart arms now on BOTH mirror arms: lsq_none/CUDA p 2.85e-12, lsq_all/CUDA (`default "
+                        "leastSquares` with every limiter) omega 2.46e-11 against the host's 2.45e-11.",
              note="OpenFOAM's inverse-distance least-squares fit (leastSquaresVectors.C), not a Gauss sum; "
                   "a case naming it gets it or is refused. fvc::grad(vf) resolves `grad(<name>)` through "
                   "gradSchemes (fvcGrad.C:149), so `default leastSquares` reaches every consumer: the "
@@ -1501,9 +1510,16 @@ COMPONENTS = {
                   "form (deviceLeastSquaresGrad): the energy limiters' gradient, both closures' limiter "
                   "gradient, the closures' corrected-laplacian correction (turbulence_transport.cu, "
                   "TransportScheme::gradFieldLeastSq) and kOmegaSST's CDkOmega (kOmegaSST.cu) take it under "
-                  "the case's scheme; the CUDA mirror arm still refuses a leastSquares grad(U) or grad(p) by "
-                  "name (no device vector form; the pressure gradient's consumers are not wired) until those "
-                  "modules are ported. The non-orth corrections and the gradient linearUpwind NAMES are ported "
+                  "the case's scheme, and so do grad(p)'s five consumers (the momentum source, U = HbyA - "
+                  "rAtU*grad(p), SIMPLEC's HbyA correction, both pressure branches' non-orth corrections), the "
+                  "energy equation's non-orth correction (rhoEEqn.cu, grad(he)'s base and cellLimited "
+                  "coefficient) and grad(U)'s VECTOR form at divDevRhoReff, the corrected laplacian, the momentum "
+                  "limiters and both closures' production (deviceLeastSquaresGradU) -- the CUDA mirror arm "
+                  "refuses nothing of leastSquares any more; the linearUpwind-NAMED gradient under leastSquares "
+                  "is refused by the shared parse on both arms. OPEN, both arms: a cellLimited grad(p) is parsed "
+                  "(parseFieldGradScheme) and not applied anywhere; the incompressible simpleFoam pEqn_cpp.cu "
+                  "calls fvc::snGrad without the scheme argument and so still builds SIMPLEC's correction from "
+                  "Gauss under a leastSquares grad(p). The non-orth corrections and the gradient linearUpwind NAMES are ported "
                   "but not exercised by rhoSST (orthogonal laplacians, upwind divs)."),
 
         dict(name="fvm_ddt_closure", of_symbol="Foam::fv::EulerDdtScheme<Type>::fvmDdt",

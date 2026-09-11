@@ -88,6 +88,14 @@ void deviceGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                  const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                  DeviceBuffer<scalar>& gradU, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr);
 void deviceGByNuFromGradU(const DeviceBuffer<scalar>& gradU, int nC, DeviceBuffer<scalar>& gByNu);
+// The same 9*nC tensor from OpenFOAM's least-squares fit: leastSquaresGrad.C's calcGrad on a vector
+// is lsGrad += ownLs*deltaVsf (an outer product), so column j is the SCALAR least-squares gradient of
+// U_j and the three components are three deviceLeastSquaresGrad calls packed exactly as deviceGradU
+// packs its Gauss ones. UbStored: the stored patch values when the caller holds them, else the
+// boundary is evaluated from dbU. Coupled interfaces are not taken (the rho mirror refuses them).
+void deviceLeastSquaresGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
+                             const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+                             DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>* const* UbStored = nullptr);
 // OF grad(U) cellLimited Gauss linear <k> applied to a grad(U) TENSOR (per U-component minmod limiter). For the
 // turbulence strain S2 + production, which OF computes from fvc::grad(U) = the (cellLimited) grad(U) scheme.
 void deviceCellLimitGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,

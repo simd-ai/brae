@@ -406,7 +406,10 @@ void correct(
 
     // ---- production, from the CURRENT nut (the previous outer iteration's correctNut) ----------
     DeviceBuffer<scalar> gradU, S2, GbyNu0, G;
-    deviceGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, gradU);
+    // fvc::grad(U) through the case's grad(U) scheme (kOmegaSSTBase.C:522): leastSquares where it
+    // resolves so (kOmegaSST_cpp.cu:398 is the reference), then cellLimited.
+    if (in.co.gradULeastSq) deviceLeastSquaresGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, gradU);
+    else                    deviceGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, gradU);
     if (in.gradULimitK > scalar(0))
         deviceCellLimitGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, gradU, in.gradULimitK);
     deviceS2(gradU, nC, S2);

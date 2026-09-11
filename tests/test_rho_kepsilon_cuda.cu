@@ -622,6 +622,46 @@ int main(int argc, char** argv)
         check(rG > 1e-10, "the fixture's correction discriminates leastSquares from Gauss (control)");
     }
 
+    // ---- grad(U) RESOLVING TO leastSquares: the production's gradient --------------------------
+    // kEpsilon.C:237 fvc::grad(U) through grad(U)'s own entry; the host takes fvc::leastSquaresGrad's
+    // VECTOR form under co.gradULeastSq (kEpsilon_cpp.cu:260), the device deviceLeastSquaresGradU (three
+    // scalar fits packed as the tensor). The gradient itself is gated against OpenFOAM's own grad(U) by
+    // leastsquares_grad_vs_openfoam; this closes _cpp -> CUDA for its consumer.
+    std::printf("  6. grad(U) leastSquares (the production)\n");
+    {
+        KEpsilonCoeffs uco = co;
+        uco.gradULeastSq = true;
+        GeometricField<scalar> uk = freshField("k"), ue = freshField("epsilon"), un = freshField("nut");
+        uk.evaluateBoundary();
+        ue.evaluateBoundary();
+        std::vector<scalar> uA(nC, 0.0);
+        cpu::kEpsilonRef::Compressible cu = comp;
+        cu.alphat = &uA;
+        cpu::kEpsilonRef::KEResiduals ures;
+        ures.captureStages = true;
+        cpu::kEpsilonRef::correct(U, uk, ue, un, phi, 0.0, m, g, fvp, relaxEps, relaxK, tol, relTol,
+                                  maxIter, uco, &ures, true, 0, &cu, nullptr);
+        gpu::kEpsilonRAS::KEpsilonInput uin = gin;
+        uin.co = uco;
+        DeviceBuffer<scalar> vK(dk.internal), vE(de.internal), vN(dn.internal), vA, vNutBnd(nutBndH);
+        DeviceBoundary dbvK   = buildDeviceBoundary(dk, fvp, g);
+        DeviceBoundary dbvEps = buildDeviceBoundary(de, fvp, g);
+        gpu::kEpsilonRAS::KEpsilonStages ust, upre;
+        {
+            DeviceBuffer<scalar> nPre(dn.internal);
+            gpu::kEpsilonRAS::production(upre, dm, dbU, nPre, uin);
+        }
+        cmp(upre.gByNu.host(), ures.gByNu, "GbyNu from the leastSquares grad(U)", 1e-12);
+        gpu::kEpsilonRAS::correct(vK, vE, vN, vNutBnd, &vA, nullptr, ust, dm, dbU, dbvK, dbvEps, wall, uin);
+        cmp(vE.host(), ue.internal, "epsilon, grad(U) leastSquares", 1e-13);
+        cmp(vK.host(), uk.internal, "k, grad(U) leastSquares",       1e-13);
+        cmp(vN.host(), un.internal, "nut, grad(U) leastSquares",     1e-13);
+        // CONTROL: the Gauss production (pre.gByNu, from the arm above) must MISS the leastSquares one.
+        const scalar rG = relDiff(ures.gByNu, pre.gByNu.host());
+        std::printf("     %-58s rel=%.3e\n", "control: the Gauss GbyNu misses the leastSquares one", (double)rG);
+        check(rG > 1e-6, "the fixture's grad(U) discriminates leastSquares from Gauss (control)");
+    }
+
     std::printf("  refusals\n");
     {
         struct Case { const char* name; gpu::kEpsilonRAS::KEpsilonInput in; };

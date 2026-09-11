@@ -516,8 +516,10 @@ void production(
 
     // fvc::grad(U), then GbyNu = gradU && devTwoSymm(gradU). Both reused: the legacy kernels compute
     // exactly these and are already gated.
-    deviceGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU);
-    // ...through the case's grad(U) scheme (kEpsilon.C:237): cellLimited where fvSchemes says so.
+    // ...through the case's grad(U) scheme (kEpsilon.C:237): leastSquares where it resolves so, then
+    // cellLimited where fvSchemes says so (kEpsilon_cpp.cu:260-262 is the reference).
+    if (in.co.gradULeastSq) deviceLeastSquaresGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU);
+    else                    deviceGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU);
     if (in.co.gradULimitK > scalar(0)) deviceCellLimitGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU, in.co.gradULimitK);
     deviceGByNuFromGradU(st.gradU, nC, st.gByNu);
 

@@ -24,8 +24,9 @@
 #          leastSquares since the device port (kOmegaSST.cu's CDkOmega, turbulence_transport.cu's
 #          corrected-laplacian correction; the device twin test_rho_kepsilon_cuda holds the kEpsilon
 #          closure to 1e-13 against the host under it, on a `corrected` fixture where this one is
-#          orthogonal). grad(U) and grad(p) leastSquares are still refused by that arm by name, which is
-#          why this arm switches the two closure entries EXPLICITLY and not `default`.
+#          orthogonal). The two closure entries are switched EXPLICITLY here so that this arm isolates
+#          CDkOmega; the restart arms below run `default leastSquares` (grad(U), grad(p), the limiters) on
+#          BOTH mirror arms: lsq_none/CUDA p 2.85e-12, lsq_all/CUDA omega 2.46e-11 (host 2.45e-11).
 #   wrong  the control that lsq is not trivially passable: brae's host arm run with fvSchemes saying
 #          `Gauss linear` (so it computes the Gauss gradient) compared against OpenFOAM's leastSquares
 #          run -- must DIFFER by far more than LSQBOUND, or the fixture cannot tell the two schemes apart
@@ -229,13 +230,18 @@ restartArm() {   # restartArm <tag> <grad: gauss|lsq> <lim: komega|hK|all> <boun
     stageR "$of" "$gr" "$lim" 8
     ( cd "$of" && rhoSimpleFoam > log.rhoSimpleFoam 2>&1 )
     [ -d "$of/8" ] || { echo "     $tag: OpenFOAM did not reach iteration 8   FAIL"; fail=1; return; }
-    stageR "$br" "$gr" "$lim" 8
-    rm -rf "$br/0"; cp -r "$of/5" "$br/5"
-    if env $envs BRAE_RHOSIMPLEFOAM_MIRROR=1 "$BRAE" -case "$br" > "$br/log.brae" 2>&1 && [ -d "$br/8" ]; then
-        FIRST=6 LAST=8 compareR "$br" "$of" "$tag" "$bound" || fail=1
-    else
-        echo "     $tag: brae did not run from the restart   FAIL"; grep -v '^brae NOTICE' "$br/log.brae" | tail -2; fail=1
-    fi
+    # BOTH mirror arms from the same OpenFOAM restart: the CUDA arm computes every leastSquares
+    # consumer these arms switch (grad(U)'s vector form last, deviceLeastSquaresGradU).
+    for M in 1 cuda; do
+        local b="${br}_$M" label="$tag/$([ $M = cuda ] && echo CUDA || echo host)"
+        stageR "$b" "$gr" "$lim" 8
+        rm -rf "$b/0"; cp -r "$of/5" "$b/5"
+        if env $envs BRAE_RHOSIMPLEFOAM_MIRROR=$M "$BRAE" -case "$b" > "$b/log.brae" 2>&1 && [ -d "$b/8" ]; then
+            FIRST=6 LAST=8 compareR "$b" "$of" "$label" "$bound" || fail=1
+        else
+            echo "     $label: brae did not run from the restart   FAIL"; grep -v '^brae NOTICE' "$b/log.brae" | tail -2; fail=1
+        fi
+    done
 }
 stageR() {   # stageR <dest> <grad> <lim> <endTime>
     local d="$1" gr="$2" lim="$3" et="$4"

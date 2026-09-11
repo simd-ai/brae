@@ -246,6 +246,11 @@ int main(int argc, char** argv)
     // agree about faces that OpenFOAM does not have.
     const char* limEnv = std::getenv("BRAE_TEST_GRADLIMIT");
     mi.gradULimitK = limEnv ? std::atof(limEnv) : 0.0;
+    // BRAE_TEST_GRADLSQ=1: grad(U)'s base scheme is leastSquares on BOTH arms -- divDevRhoReff's dev2
+    // term, the corrected laplacian's correction and (under limitedLinearV) the limiter's gradient.
+    const char* lsqEnv = std::getenv("BRAE_TEST_GRADLSQ");
+    mi.gradULeastSq = lsqEnv && std::atoi(lsqEnv) != 0;
+    if (mi.gradULeastSq) std::printf("  grad(U) base scheme: leastSquares on both arms\n");
     std::printf("  div(phi,U) scheme under test: %s   grad(U) cellLimited k = %g\n",
                 sch.c_str(), (double)mi.gradULimitK);
     const FvVectorMatrix ref = cpu::rhoSimple::assembleUEqn(U, mi, m, g, fvp);
@@ -306,6 +311,7 @@ int main(int argc, char** argv)
     gi.scheme = mi.scheme;
     gi.schemeCoeff = mi.schemeCoeff;
     gi.gradULimitK = mi.gradULimitK;
+    gi.gradULeastSq = mi.gradULeastSq;
     // The limiter's pre-updateCoeffs boundary (RhoMomentumInput::UxPreUpdateBnd): the field's own
     // evaluate, exactly what mi.UPreUpdateBnd carries on the host -- no updateCoeffs runs between the
     // snapshot and the assembly in this harness, so both arms read ONE array here. Whether the DRIVER

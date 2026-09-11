@@ -118,7 +118,7 @@ check('CONTROL brae leastSquares vs OpenFOAM Gauss linear', lsq['gaussLinear'], 
 check('CONTROL brae gaussGrad vs OpenFOAM leastSquares', gauss['leastSquares'], DIFFER, False)
 check('device leastSquares vs OpenFOAM leastSquares',    lsq['device lsq'],    MATCH,  True)
 check('device leastSquares vs its own host reference',   lsq['device-host'],   DEVHOST, True)
-# The VECTOR form, against OpenFOAM's own grad(U), with the same 2x2. No device twin: the CUDA mirror
+# The device twin of the tensor form (deviceLeastSquaresGradU, three scalar fits): 9.4e-15 of OpenFOAM on sbMatched, 4.2e-13 on pitzDaily, device-host 1.5e-16.
 # arm refuses a leastSquares grad(U) by name (rhoSimpleFoamDriver.cu) until that module is ported.
 check('brae leastSquares grad(U) vs OpenFOAM leastSquares',      lsqU['leastSquares'],  MATCH,  True)
 check('brae gaussGrad    grad(U) vs OpenFOAM Gauss linear',      gaussU['gaussLinear'], MATCH,  True)

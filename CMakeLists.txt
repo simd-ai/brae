@@ -770,6 +770,13 @@ foreach(_sch upwind limitedLinear limitedLinearV LUST linearUpwindV)
              COMMAND ${CMAKE_COMMAND} -E env BRAE_TEST_SCHEME=${_sch}
                      $<TARGET_FILE:test_rho_ueqn_cuda> ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
 endforeach()
+# grad(U) leastSquares on the device (deviceLeastSquaresGradU / three scalar fits) against the host
+# reference, under limitedLinearV so the limiter's gradient is exercised beside divDevRhoReff's and the
+# corrected laplacian's. The gradient itself is gated against OpenFOAM's own grad(U) by
+# leastsquares_grad_vs_openfoam (its device twin).
+add_test(NAME rho_ueqn_cuda_lsq
+         COMMAND ${CMAKE_COMMAND} -E env BRAE_TEST_SCHEME=limitedLinearV BRAE_TEST_GRADLSQ=1
+                 $<TARGET_FILE:test_rho_ueqn_cuda> ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb 1576)
 
 add_executable(test_ueqn_cpp tests/test_ueqn_cpp.cu)
 target_include_directories(test_ueqn_cpp PRIVATE ${BRAE_HEADER_DIRS})

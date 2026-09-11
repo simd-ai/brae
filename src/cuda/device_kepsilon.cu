@@ -641,6 +641,32 @@ void deviceGradU(
 }
 
 
+void deviceLeastSquaresGradU(
+    const DeviceMesh& dm,
+    const DeviceVectorBoundary& dbU,
+    const DeviceBuffer<scalar>& Ux,
+    const DeviceBuffer<scalar>& Uy,
+    const DeviceBuffer<scalar>& Uz,
+    DeviceBuffer<scalar>& gradU,
+    const DeviceBuffer<scalar>* const* UbStored)
+{
+    const int nC = dm.nCells;
+    const DeviceBuffer<scalar>* Uc[3] = { &Ux, &Uy, &Uz };
+    gradU.resize(static_cast<std::size_t>(9) * nC);
+    for (int i = 0; i < 3; ++i)
+    {
+        DeviceBuffer<scalar> bval, gx, gy, gz;
+        if (UbStored && UbStored[i] && UbStored[i]->size() == static_cast<std::size_t>(dm.nBndFaces))
+            deviceCopy(bval, *UbStored[i]);
+        else
+            deviceBCValue(dbU.comp[i], *Uc[i], bval);
+        deviceLeastSquaresGrad(dm, *Uc[i], bval, gx, gy, gz);
+        cudaCheck(cudaMemcpyAsync(gradU.data() + (0*3+i)*nC, gx.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "lsqGradU g");
+        cudaCheck(cudaMemcpyAsync(gradU.data() + (1*3+i)*nC, gy.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "lsqGradU g");
+        cudaCheck(cudaMemcpyAsync(gradU.data() + (2*3+i)*nC, gz.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "lsqGradU g");
+        cudaCheck(cudaStreamSynchronize(cudaStreamPerThread), "lsqGradU sync");   // gx/gy/gz die at the end of this iteration
+    }
+}
 void deviceGByNuFromGradU(const DeviceBuffer<scalar>& gradU, int nC, DeviceBuffer<scalar>& gByNu)
 {
     gByNu.resize(nC);

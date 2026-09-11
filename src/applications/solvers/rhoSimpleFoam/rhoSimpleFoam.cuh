@@ -152,6 +152,7 @@ struct RhoStepInput
     scalar schemeCoeffU = 1.0;
     scalar gradULimitK = 0.0, gradHeLimitK = 0.0, gradKELimitK = 0.0;
     scalar gradULULimitK = -1.0;   // linearUpwind's NAMED gradient on div(phi,U) -- see RhoMomentumInput
+    bool   gradULeastSq  = false;  // grad(U)'s base scheme is leastSquares -- see RhoMomentumInput
     // `Gauss limitedLinear` on U limits on magSqr(U): grad(magSqr(U))'s own entry (RhoMomentumInput).
     bool   gradMagSqrULeastSq = false;
     scalar gradMagSqrULimitK  = 0.0;

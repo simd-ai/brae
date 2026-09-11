@@ -21,6 +21,8 @@
 #include "fvc.cuh"
 #include "device_mesh.cuh"
 #include "device_buffer.cuh"
+#include "device_boundary.cuh"    // buildDeviceVectorBoundary, for the tensor form's device twin
+#include "device_kepsilon.cuh"    // deviceLeastSquaresGradU: three scalar fits packed as grad(U)
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -108,9 +110,38 @@ int vectorArm(const std::string& caseDir, const std::string& t, const std::strin
     std::printf("cells %d\n", (int)m.nCells());
     std::printf("leastSquares relL2 %.6e\n", relL2T(ls, ref));
     std::printf("gaussLinear  relL2 %.6e\n", relL2T(gs, ref));
-    // No device twin for the tensor form yet -- the CUDA arm refuses a leastSquares grad(U) by name.
-    std::printf("device lsq   relL2 %.6e\n", relL2T(ls, ref));
-    std::printf("device-host  relL2 %.6e\n", 0.0);
+    // The device twin of the tensor form: deviceLeastSquaresGradU is three scalar least-squares fits
+    // packed as OpenFOAM's grad(U) (lsGrad_ij = ownLs_i*deltaU_j), read back into the same tensor.
+    std::vector<tensor> dev;
+    {
+        const DeviceMesh dm = buildDeviceMesh(m, g, patches);
+        const DeviceVectorBoundary dbU = buildDeviceVectorBoundary(f, patches, g);
+        std::vector<scalar> ux(m.nCells()), uy(m.nCells()), uz(m.nCells());
+        for (label c = 0; c < m.nCells(); ++c) { ux[c] = f.internal[c].x; uy[c] = f.internal[c].y; uz[c] = f.internal[c].z; }
+        DeviceBuffer<scalar> dUx(ux), dUy(uy), dUz(uz), gradU;
+        // The HOST's patch values, as the scalar twin above hands its own: this gate measures the fit,
+        // not the boundary state. Evaluated live, the device's un-switched inletOutlet faces (no flux
+        // switch runs here) read inletValue where the host reads its stored value -- 1.7e-01 on
+        // sbMatched's U against 4.2e-13 on pitzDaily, which has no such patch.
+        std::vector<scalar> bx, by, bz;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const std::vector<vector>& b = f.boundary[pi]->value();
+            for (label i = 0; i < patches[pi].size; ++i) { bx.push_back(b[i].x); by.push_back(b[i].y); bz.push_back(b[i].z); }
+        }
+        DeviceBuffer<scalar> dbx(bx), dby(by), dbz(bz);
+        const DeviceBuffer<scalar>* ubStored[3] = { &dbx, &dby, &dbz };
+        deviceLeastSquaresGradU(dm, dbU, dUx, dUy, dUz, gradU, ubStored);
+        const std::vector<scalar> h = gradU.host();
+        const label nC = m.nCells();
+        dev.resize(nC);
+        for (label c = 0; c < nC; ++c)
+            dev[c] = tensor{h[(0*3+0)*nC+c], h[(0*3+1)*nC+c], h[(0*3+2)*nC+c],
+                            h[(1*3+0)*nC+c], h[(1*3+1)*nC+c], h[(1*3+2)*nC+c],
+                            h[(2*3+0)*nC+c], h[(2*3+1)*nC+c], h[(2*3+2)*nC+c]};
+    }
+    std::printf("device lsq   relL2 %.6e\n", relL2T(dev, ref));
+    std::printf("device-host  relL2 %.6e\n", relL2T(dev, ls));
     return 0;
 }
 }
