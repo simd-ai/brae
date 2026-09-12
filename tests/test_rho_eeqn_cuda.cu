@@ -135,7 +135,13 @@ int main(int argc, char** argv)
     {
         rhoC[c] = scalar(0.8) + scalar(0.6) * frac(g.C()[c]);
         rho.internal[c] = rhoC[c];
-        he.internal[c] = scalar(2.0e5) + scalar(6.0e4) * frac(g.C()[c]);
+        // Smooth AND free of plateaus: the limitedLinear arm below puts NVDTVD's r on every face, and a
+        // face with he[N] == he[P] sits in its 0/0 branch, where r = 2000*sign(gradcf)*sign(0) - 1 is
+        // decided by the round-off sign of gradcf and the two arms legitimately part (1228 of 24170
+        // faces on matrixDumpAsym with the plateaued frac() alone: upper 5.8e-02, gradients 3.5e-15).
+        // The incommensurate sine breaks every plateau; the degeneracy check below holds it to zero faces.
+        he.internal[c] = scalar(2.0e5) + scalar(6.0e4) * frac(g.C()[c])
+                       + scalar(4.0e3) * std::sin(scalar(37.0) * g.C()[c].x + scalar(23.0) * g.C()[c].y + scalar(11.0) * g.C()[c].z);
     }
     he.evaluateBoundary();   // AFTER the internal field, so the boundary is what the conditions produce
     // he's BOUNDARY IS EVALUATED FROM ITS BOUNDARY CONDITIONS, not stored by hand. The host reads
@@ -194,16 +200,18 @@ int main(int argc, char** argv)
     for (label c = 0; c < nC; ++c)
     { ux[c] = U.internal[c].x; uy[c] = U.internal[c].y; uz[c] = U.internal[c].z; }
 
-    std::vector<scalar> uxb, uyb, uzb, pb, rb, ab, phib;
+    std::vector<scalar> uxb, uyb, uzb, pb, rb, ab, phib, heb;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         const std::vector<vector>& ubv = U.boundary[pi]->value();
         const std::vector<scalar>& pbv = p.boundary[pi]->value();
         const std::vector<scalar>& rbv = rho.boundary[pi]->value();
+        const std::vector<scalar>& hbv = he.boundary[pi]->value();
         for (label i = 0; i < fvp[pi].size; ++i)
         {
             uxb.push_back(ubv[i].x); uyb.push_back(ubv[i].y); uzb.push_back(ubv[i].z);
             pb.push_back(pbv[i]);
+            heb.push_back(hbv[i]);
             rb.push_back(rbv[i]);
             ab.push_back(alphaB[pi][i]);
             phib.push_back(phiBnd[pi][i]);
@@ -211,13 +219,14 @@ int main(int argc, char** argv)
     }
     uxb.resize(dm.nBndFaces, 0.0); uyb.resize(dm.nBndFaces, 0.0); uzb.resize(dm.nBndFaces, 0.0);
     pb.resize(dm.nBndFaces, 0.0);
+    heb.resize(dm.nBndFaces, 0.0);
     rb.resize(dm.nBndFaces, 1.0);
     ab.resize(dm.nBndFaces, 2.0e-5);
     phib.resize(dm.nBndFaces, 0.0);
 
     DeviceBuffer<scalar> dUx(ux), dUy(uy), dUz(uz), dHe(he.internal), dP(p.internal), dRho(rhoC);
     DeviceBuffer<scalar> dAlpha(alphaC), dPhiInt(phiF.internalField);
-    DeviceBuffer<scalar> dUxb(uxb), dUyb(uyb), dUzb(uzb), dPb(pb), dRb(rb), dAb(ab), dPhib(phib);
+    DeviceBuffer<scalar> dUxb(uxb), dUyb(uyb), dUzb(uzb), dPb(pb), dRb(rb), dAb(ab), dPhib(phib), dHeb(heb);
 
     gpu::rhoSimple::RhoEnergyInput gin;
     gin.phiInt = &dPhiInt;          gin.phiBnd = &dPhib;
@@ -226,6 +235,11 @@ int main(int argc, char** argv)
     gin.pCell = &dP; gin.rhoCell = &dRho;
     gin.UxBnd = &dUxb; gin.UyBnd = &dUyb; gin.UzBnd = &dUzb;
     gin.pBnd = &dPb; gin.rhoBnd = &dRb;
+    // he's STORED patch values, as the driver hands them (rhoSimpleFoam.cu: ein.heBndValues = f.heBnd)
+    // and as the host reads them for the limiter's gradient (he.boundary[pi]->value()). Evaluated live
+    // from dbHe instead, the limitedLinear rows below read diag 1.4e-02 / upper 5.8e-02 off the host on
+    // matrixDumpAsym while every upwind row sat at 1e-16 -- the boundary state, not the limiter.
+    gin.heBndValues = &dHeb;
     gin.isE = isE;
     gin.relaxHe = 0.5;
     gin.relaxEquationHe = true;   // the host still uses the 1.0 sentinel; at 0.5 both relax
@@ -348,6 +362,68 @@ int main(int argc, char** argv)
         check(r > 1e-12, "the bounded terms contribute (control)");
     }
 
+    // ---- `Gauss limitedLinear 1` on BOTH convection terms: the limiter's weights against the host ----
+    // Ported on both arms (the device dispatches to deviceDivLimitedCoeffs over the limiter's own
+    // gradient, limGradHeK/limGradKEK cellLimited and limGradHeLeastSq where the case says so; unlimited
+    // Gauss here, as the fixture's fvSchemes has no cellLimited entry). This arm used to be the refusal
+    // control below, and went red the day the port landed -- the module was more capable than the gate.
+    {
+        cpu::rhoSimple::EnergyInput ell = ein;
+        ell.schemeKE = cpu::rhoSimple::DivScheme::limitedLinear;
+        ell.schemeHe = cpu::rhoSimple::DivScheme::limitedLinear;
+        const std::vector<scalar> refKeDivLL = cpu::rhoSimple::kineticEnergyDivergence(U, p, rho, ell, m, g, fvp);
+        const FvScalarMatrix refELL = cpu::rhoSimple::assembleEEqn(he, U, p, rho, ell, m, g, fvp);
+        gpu::rhoSimple::RhoEnergyInput gll = gin;
+        gll.schemeKE = cpu::rhoSimple::DivScheme::limitedLinear;
+        gll.schemeHe = cpu::rhoSimple::DivScheme::limitedLinear;
+        DeviceBuffer<scalar> gKeDivLL;
+        gpu::rhoSimple::kineticEnergyDivergence(gKeDivLL, dm, gll);
+        gpu::PressureMatrix GELL;
+        gpu::rhoSimple::assembleEEqn(GELL, dm, dbHe, dHe, gll);
+        std::printf("  limitedLinear on div(phi,he) and div(phi,Ekp|K)\n");
+        // INSTRUMENT: the limiter's gradient on each arm from the SAME boundary values, and where the
+        // off-diagonal difference lives (interior faces vs faces of boundary-adjacent cells).
+        {
+            std::vector<std::vector<scalar>> heB(fvp.size());
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi) heB[pi] = he.boundary[pi]->value();
+            const std::vector<vector> hg = fvc::gaussGrad(he.internal, heB, m, g, fvp);
+            DeviceBuffer<scalar> gx, gy, gz;
+            deviceGaussGrad(dm, dHe, dHeb, gx, gy, gz);
+            const std::vector<scalar> dx = gx.host(), dy = gy.host(), dz = gz.host();
+            scalar mx = 0, mg = 0;
+            for (label c = 0; c < nC; ++c)
+            {
+                mx = std::fmax(mx, std::fabs(dx[c] - hg[c].x)); mx = std::fmax(mx, std::fabs(dy[c] - hg[c].y)); mx = std::fmax(mx, std::fabs(dz[c] - hg[c].z));
+                mg = std::fmax(mg, std::fabs(hg[c].x)); mg = std::fmax(mg, std::fabs(hg[c].y)); mg = std::fmax(mg, std::fabs(hg[c].z));
+            }
+            std::printf("     instrument: limiter gradient of he, device vs host  rel=%.3e\n", (double)(mg > 0 ? mx / mg : mx));
+            // THE DEGENERACY CONTROL: no internal face may have he[N] == he[P], or the limiter's 0/0
+            // branch decides those faces by round-off sign and the rows below measure nothing there.
+            int nDegenerate = 0;
+            for (label f = 0; f < m.nInternalFaces(); ++f)
+                if (std::fabs(he.internal[m.neighbour()[f]] - he.internal[m.owner()[f]]) <= 1e-12 * std::fabs(he.internal[m.owner()[f]])) ++nDegenerate;
+            std::printf("     instrument: faces with he[N] == he[P]: %d of %d\n", nDegenerate, (int)m.nInternalFaces());
+            check(nDegenerate == 0, "the fixture's he has no plateau face (the limiter's 0/0 branch)");
+        }
+        cmp(gKeDivLL.host(), refKeDivLL, "fvc::div(phi, Ekp|K) limitedLinear", 1e-11);
+        // MEASURED on matrixDumpAsym (e and h) and pitzDailyTurb: diag 5.7e-13, upper 2.4e-12, lower
+        // 1.4e-12, source 1.2e-12 -- the ratio limiter's own floor (test_rho_ueqn_cuda's header records
+        // 5.5e-12 on its off-diagonals under the same scheme; r = 2*gradcf/gradf - 1 amplifies the
+        // gradient's 4e-15). Bounds at ~20x.
+        cmp(GELL.diag.host(),   refELL.diag,   "EEqn diag, limitedLinear",   1e-11);
+        cmp(GELL.upper.host(),  refELL.upper,  "EEqn upper, limitedLinear",  5e-11);
+        cmp(GELL.lower.host(),  refELL.lower,  "EEqn lower, limitedLinear",  5e-11);
+        cmp(GELL.source.host(), refELL.source, "EEqn source, limitedLinear", 1e-10);
+        // CONTROL: the limiter must MOVE the weights off upwind's, or the rows above are the upwind rows.
+        scalar d = 0, mg = 0;
+        for (std::size_t i = 0; i < refE.upper.size(); ++i)
+        {
+            d  = std::fmax(d, std::fabs(refELL.upper[i] - refE.upper[i]));
+            mg = std::fmax(mg, std::fabs(refE.upper[i]));
+        }
+        std::printf("  %-58s rel=%.3e\n", "control: limitedLinear moves the off-diagonals off upwind", (double)(mg > 0 ? d / mg : d));
+        check((mg > 0 ? d / mg : d) > 1e-6, "the fixture's limiter is not upwind (control)");
+    }
     // ---- refusals ---------------------------------------------------------------------------
     {
         struct { const char* what; int which; } cases[] = {
@@ -359,7 +435,8 @@ int main(int argc, char** argv)
             // name a ported scheme for one and an unported one for the other. div(phi,Ekp|K) used to
             // fall through to upwind with no throw while div(phi,he) was refused -- the device being
             // MORE permissive than the host reference that is its own oracle
-            // (rhoEEqn_cpp.cu:41-56 refuses on `!okKE || !okHe`).
+            // (rhoEEqn_cpp.cu:41-56 refuses on `!okKE || !okHe`). LUST here: limitedLinear, which this
+            // case named until the energy limiter was ported on both arms, is now the positive arm above.
             {"an unported div(phi,Ekp|K) scheme is refused", 4},
         };
         for (const auto& cse : cases)
@@ -369,7 +446,7 @@ int main(int argc, char** argv)
             if (cse.which == 1) bad.hasFvOptions = true;
             if (cse.which == 2) bad.hasCoupledPatches = true;
             if (cse.which == 3) bad.schemeHe = cpu::rhoSimple::DivScheme::LUST;
-            if (cse.which == 4) bad.schemeKE = cpu::rhoSimple::DivScheme::limitedLinear;
+            if (cse.which == 4) bad.schemeKE = cpu::rhoSimple::DivScheme::LUST;
             gpu::PressureMatrix Eb;
             bool threw = false;
             try { gpu::rhoSimple::assembleEEqn(Eb, dm, dbHe, dHe, bad); }
@@ -383,7 +460,7 @@ int main(int argc, char** argv)
         // evidence about it.
         {
             gpu::rhoSimple::RhoEnergyInput bad = gin;
-            bad.schemeKE = cpu::rhoSimple::DivScheme::limitedLinear;
+            bad.schemeKE = cpu::rhoSimple::DivScheme::LUST;
             DeviceBuffer<scalar> outBad;
             bool threw = false;
             try { gpu::rhoSimple::kineticEnergyDivergence(outBad, dm, bad); }
