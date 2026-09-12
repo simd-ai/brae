@@ -1,0 +1,16 @@
+FoamFile { version 2.0; format ascii; class dictionary; object blockMeshDict; }
+// The inlet is exactly 0.2 x 0.05 = 0.01 m2, so volumetricFlowRate 0.05166 gives 5.166 m/s exactly
+// and the expected inlet velocity is a round number the gate can assert on.
+scale 1;
+vertices ( (0 0 0) (2 0 0) (2 0.2 0) (0 0.2 0) (0 0 0.05) (2 0 0.05) (2 0.2 0.05) (0 0.2 0.05) );
+blocks ( hex (0 1 2 3 4 5 6 7) (60 20 1) simpleGrading (1 1 1) );
+edges ();
+boundary
+(
+  inlet    { type patch; faces ( (0 4 7 3) ); }
+  outlet   { type patch; faces ( (1 2 6 5) ); }
+  hotWall  { type wall;  faces ( (0 1 5 4) ); }
+  coldWall { type wall;  faces ( (3 7 6 2) ); }
+  frontBack { type empty; faces ( (0 3 2 1) (4 5 6 7) ); }
+);
+mergePatchPairs ();

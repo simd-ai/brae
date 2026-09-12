@@ -40,6 +40,25 @@ void deviceDivDevReff(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                       DeviceBuffer<scalar>& srcX, DeviceBuffer<scalar>& srcY, DeviceBuffer<scalar>& srcZ,
                       const DeviceCyclic* cyc = nullptr, const DeviceAMI* ami = nullptr,
                       const DeviceProcStress* proc = nullptr,
+                      // U's STORED boundary values, one per component, when the caller keeps them. OF's
+                      // fvc::grad(U) reads U.boundaryField() -- the value the last evaluate left -- and
+                      // does NOT re-derive it: updateCoeffs sets a flag and the fvMatrix constructor calls
+                      // nothing else (fvPatchField.C, fvMatrix.C:396). Passing null makes this re-derive
+                      // with deviceBCValue, which is the same number only while the caller evaluates U's
+                      // boundary before every assembly. The OF-mirror does not (queue items 25, 30), so it
+                      // passes its stored values; the drivers that do evaluate leave this null and are
+                      // unchanged.
+                      //
+                      // THE EXCEPTION, and it is not a small one: "the value the last evaluate left" is
+                      // true of the mixed family, whose updateCoeffs only sets coefficients, and FALSE of
+                      // the fixedValue-derived family whose updateCoeffs assigns its own value with
+                      // operator== -- flowRateInletVelocity (flowRateInletVelocityFvPatchVectorField.C:
+                      // 194-196) and pressureInletOutletVelocity among them. For those, OpenFOAM's
+                      // grad(U) at the assembly sees the value updateCoeffs JUST wrote. A caller that
+                      // keeps stored arrays must therefore have its per-BC updaters write the value too,
+                      // not only the refValue; deviceUpdateFlowRateInlet takes the arrays for exactly
+                      // this. Missed, it cost U 8.9e-06 at iteration 1 on validation/rhoTI.
+                      const DeviceBuffer<scalar>* const* UbStored = nullptr,
                       // grad(U) "cellLimited Gauss linear <k>" coefficient; 0 = unlimited.
                       //
                       // OF's linearViscousStress::divDevReff calls fvc::grad(U), which resolves the
@@ -52,12 +71,16 @@ void deviceDivDevReff(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                       // no probe), laminar, 10 steps: at the tutorial's nu = 1e-6 the difference from
                       // OpenFOAM is 6.5e-07 either way, but at nu = 1e-3 -- the size of a turbulent nut --
                       // it is 4.7e-04 unlimited against 6.7e-08 limited. A factor of 7000.
-                      scalar gradULimitK = 0.0);
+                      scalar gradULimitK = 0.0,
+                      bool gradULeastSq = false);   // grad(U)'s base scheme (see device_divdevreff.cu)
 
-// Exported for the Maxwell model -- see the definitions in device_divdevreff.cu.
+// Exported for the Maxwell model and for generalizedNewtonian's strainRate -- see the definitions in
+// device_divdevreff.cu. UbStored: U's STORED boundary values, one buffer per component, for a caller that
+// keeps them (the OF-mirror); null re-derives them with deviceBCValue, as Maxwell always has.
 void deviceBoundaryGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                          const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
-                         const DeviceBuffer<scalar>& gradU, DeviceBuffer<scalar>& gradB);
+                         const DeviceBuffer<scalar>& gradU, DeviceBuffer<scalar>& gradB,
+                         const DeviceBuffer<scalar>* const* UbStored = nullptr);
 void deviceTensorDivSource(const DeviceMesh& dm,
                            const DeviceBuffer<scalar>& Tcell, const DeviceBuffer<scalar>& Tbnd,
                            DeviceBuffer<scalar>& srcX, DeviceBuffer<scalar>& srcY, DeviceBuffer<scalar>& srcZ,

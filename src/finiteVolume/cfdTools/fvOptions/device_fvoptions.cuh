@@ -8,6 +8,7 @@
 #include "cf_types.cuh"
 #include "device_boundary.cuh"   // DeviceBoundary, for the limitTemperature boundary clamp
 #include "device_buffer.cuh"
+#include "device_mesh.cuh"      // DeviceMesh -- deviceSetValues walks the ldu addressing
 
 namespace brae {
 
@@ -57,5 +58,19 @@ void deviceFvoVelocityDamping(const DeviceBuffer<label>& cells, scalar UMax, sca
                               const DeviceBuffer<scalar>& V, const DeviceBuffer<scalar>& Ux,
                               const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                               DeviceBuffer<scalar>& diag);
+
+// fvMatrix::setValues, the matrix manipulation OpenFOAM's fvOptions CONSTRAINTS and the turbulence wall
+// functions both end in. Shared: the kEpsilon closure and the energy equation apply the same one.
+void deviceSetValues(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<label>&  mask,     // per CELL, non-zero = pinned
+    const DeviceBuffer<scalar>& value,    // per CELL
+    DeviceBuffer<scalar>&       diag,
+    DeviceBuffer<scalar>&       upper,
+    DeviceBuffer<scalar>&       lower,
+    DeviceBuffer<scalar>&       source,
+    DeviceBuffer<scalar>&       internalCoeffs,
+    DeviceBuffer<scalar>&       boundaryCoeffs,
+    DeviceBuffer<scalar>&       psi);
 
 } // namespace brae

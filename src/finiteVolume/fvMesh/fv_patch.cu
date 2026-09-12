@@ -1,5 +1,7 @@
 #include <stdexcept>
 #include "fv_patch.cuh"
+
+#include <algorithm>
 #include <cstdlib>
 #include <cmath>
 
@@ -142,6 +144,31 @@ std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g)
             p.magSf[i] = g.magSf()[f];
             p.Cf[i] = g.Cf()[f];
             p.deltaCoeffs[i] = 1.0 / dot(g.Cf()[f] - g.C()[c], nHat);
+        }
+        // OF atmBoundaryLayer.C:45 -- boundBox(pp.localPoints()).min(), taken over every point of every
+        // face on the patch. An empty patch keeps the zero default; nothing reads it.
+        if (pi.size > 0)
+        {
+            bool first = true;
+            for (label i = 0; i < pi.size; ++i)
+            {
+                const label f = pi.start + i;
+                for (label k = m.faceOffsets()[f]; k < m.faceOffsets()[f + 1]; ++k)
+                {
+                    const vector& pt = m.points()[m.faceVerts()[k]];
+                    if (first)
+                    {
+                        p.ppMin = pt;
+                        first   = false;
+                    }
+                    else
+                    {
+                        p.ppMin.x = std::min(p.ppMin.x, pt.x);
+                        p.ppMin.y = std::min(p.ppMin.y, pt.y);
+                        p.ppMin.z = std::min(p.ppMin.z, pt.z);
+                    }
+                }
+            }
         }
         patches.push_back(std::move(p));
     }

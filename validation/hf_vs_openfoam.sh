@@ -175,3 +175,16 @@ if scores.get("T", 1.0) > 1e-4:
 print(f"hf_vs_openfoam: {bad} failures over {checked} fields")
 sys.exit(1 if bad else 0)
 PY
+
+# THE MIRROR ARM. Everything above gates the LEGACY binary; the OF-mirror path refused T `fixedGradient`
+# outright until the he mapping learned it (rhoCreateFields_cpp.cu: gradient slots SCALE by Cpv, they
+# do not go through the affine heOf -- gradientEnergy/mixedEnergyFvPatchScalarField.C, second term
+# identically zero for a pureMixture). The engagement check keeps a fixture regression from silently
+# turning this arm into a second copy of the plain gate.
+grep -q "fixedGradient" "$WORK/0/T" || { echo "FAIL: fixture no longer carries fixedGradient T"; exit 1; }
+OFLAST=$(cd "$WORK" && ls -d [0-9]* | grep -vx 0 | sort -g | tail -1)
+mout=$("$BUILD/test_rho_simple_step_cpp" "$WORK" 0 "$OFLAST" 2>&1) \
+    || { echo "$mout" | tail -15; echo "FAIL(mirror)"; exit 1; }
+echo "$mout" | grep -E "^     T |^     U " | head -2
+echo "$mout" | grep -q "^PASS" || { echo "$mout" | tail -5; echo "FAIL(mirror)"; exit 1; }
+echo "PASS(mirror)"

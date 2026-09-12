@@ -44,9 +44,13 @@ public:
     void               expect(const std::string& t);
     label              nextLabel();
     scalar             nextScalar();
+    // A `#{ ... #}` verbatim block is one token, a placeholder word; this returns the block's raw text
+    // (comments, quotes and `$` intact, delimiters excluded) for such a token, false for any other.
+    bool               verbatim(const std::string& token, std::string& body) const;
 
 private:
     std::vector<std::string> toks_;
+    std::vector<std::string> verbatim_;   // the raw bodies, indexed by the placeholder's number
     std::size_t              pos_ = 0;
 };
 

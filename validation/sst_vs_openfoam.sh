@@ -48,6 +48,17 @@ mkdir -p "$WORK.brae/0" && cp "$WORK.brae"/0.orig/* "$WORK.brae/0/"
 "$BUILD/brae_rhoSimpleFoam" -case "$WORK.brae" > "$WORK.brae/log.brae" 2>&1
 BRLAST=$(ls -d "$WORK.brae"/[0-9]* | grep -v '/0$' | sort -g | tail -1)
 
+# THE STEP HARNESS ON AN SST FIXTURE (queue 13e). tests/test_rho_simple_step_cpp.cu carries a control
+# that perturbs the case's closure coefficient and requires nut to move; it mutated kEpsilon's Cmu whatever
+# the model, read nut 0.0000e+00 on this fixture and FAILED -- unseen because no registered gate pointed
+# the harness at an SST case until this arm. It now perturbs betaStar on kOmegaSST (nut 2.2347e-02 on
+# rhoSST). Fail-proof: with the closure handed default KOmegaSSTCoeffs instead of the case's, this arm FAILS.
+hout=$("$BUILD/test_rho_simple_step_cpp" "$WORK" 0 "$OFLAST" 2>&1) \
+    || { echo "$hout" | grep -E "FAIL|control" | head -12; echo "FAIL(harness on rhoSST)"; exit 1; }
+echo "$hout" | grep -E "betaStar from the CASE|Prt from the CASE" | head -2
+echo "$hout" | grep -q "^PASS" || { echo "$hout" | tail -5; echo "FAIL(harness on rhoSST)"; exit 1; }
+echo "PASS(harness on rhoSST)"
+
 python3 - "$WORK/$OFLAST" "$BRLAST" "$TOL" <<'PY'
 import re, sys, math
 ofd, brd, tol = sys.argv[1], sys.argv[2], float(sys.argv[3])
@@ -99,3 +110,16 @@ if checked < 5:
 print(f"sst_vs_openfoam: {bad} failures over {checked} fields")
 sys.exit(1 if bad else 0)
 PY
+
+# kOmegaSSTLM must be REFUSED compressibly, not run as the plain SST it sets ctl.sst for -- the
+# gamma-ReThetat transition equations are wired on the incompressible drivers only. The mutation only
+# touches the dict, so the refusal fires before any field is read.
+LMW=$(mktemp -d); trap 'rm -rf "$LMW"' EXIT
+cp -r "$WORK"/* "$LMW/"   # the main arm's workdir, mesh already built
+sed -i 's/kOmegaSST;/kOmegaSSTLM;/' "$LMW/constant/turbulenceProperties"
+grep -q "kOmegaSSTLM" "$LMW/constant/turbulenceProperties" || { echo "FAIL: LM mutation did not apply"; exit 1; }
+lmout=$("$BUILD/brae_rhoSimpleFoam" -case "$LMW" 2>&1) && { echo "FAIL: kOmegaSSTLM ran compressibly as plain SST"; exit 1; }
+echo "$lmout" | grep -q "kOmegaSSTLM" \
+    && echo "PASS(lm-refused)" \
+    || { echo "$lmout" | tail -4; echo "FAIL: the refusal does not name kOmegaSSTLM"; exit 1; }
+

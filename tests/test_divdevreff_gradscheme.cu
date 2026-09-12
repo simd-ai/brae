@@ -56,7 +56,7 @@ std::vector<scalar> ddr(const DeviceMesh& dm, const DeviceVectorBoundary& dbU, c
     Ux.copyFrom(ux); Uy.copyFrom(uy); Uz.copyFrom(uz);
     nuC.copyFrom(std::vector<scalar>(nC, nu));
     nuB.copyFrom(std::vector<scalar>(static_cast<std::size_t>(dm.nBndFaces), nu));
-    deviceDivDevReff(dm, dbU, Ux, Uy, Uz, nuC, nuB, sx, sy, sz, nullptr, nullptr, nullptr, kc);
+    deviceDivDevReff(dm, dbU, Ux, Uy, Uz, nuC, nuB, sx, sy, sz, nullptr, nullptr, nullptr, nullptr, kc);
     return (comp == 0 ? sx : (comp == 1 ? sy : sz)).host();
 }
 

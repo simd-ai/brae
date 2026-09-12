@@ -119,6 +119,7 @@ void amiMomKernel(
     const scalar* __restrict__ w,
     const scalar* __restrict__ magSf,
     const scalar* __restrict__ phi,
+    const scalar* __restrict__ wsch,   // div-scheme face weight; null = upwind (pos0(phi))
     scalar* __restrict__ ifc,
     scalar* __restrict__ diag)
 {
@@ -128,8 +129,15 @@ void amiMomKernel(
     const int o=own[i];
     const scalar lap = (w[i]*nu[o] + (1.0-w[i])*nuN[i]) * dc[i] * magSf[i];
     const scalar p = phi[i];
-    ifc[i] = -lap + (p<0.0?p:0.0);
-    atomicAdd(&diag[o], lap + (p>0.0?p:0.0));
+    // THE CONVECTIVE SPLIT IS THE SCHEME'S, not always upwind. OpenFOAM assembles a coupled patch with
+    // the interpolation weights of the div scheme the case NAMED:
+    //     internalCoeffs = phi*w      boundaryCoeffs = -phi*(1-w)
+    // and the solver applies -boundaryCoeffs against the neighbour, so the off-diagonal is phi*(1-w).
+    // Upwind is the special case w = pos0(phi), which recovers max(phi,0)/min(phi,0) exactly -- which is
+    // why a null wsch here is bit-identical to the hardcoded form it replaces.
+    const scalar ws = wsch ? wsch[i] : (p > 0.0 ? scalar(1) : scalar(0));
+    ifc[i] = -lap + p*(1.0 - ws);
+    atomicAdd(&diag[o], lap + p*ws);
 }
 
 
@@ -271,13 +279,16 @@ void amiFluxCorrKernel(
 } // namespace
 
 
-void deviceAmiAssembleMomentum(DeviceAMI& ami, const DeviceBuffer<scalar>& nuEffCell, DeviceBuffer<scalar>& diag)
+void deviceAmiAssembleMomentum(DeviceAMI& ami, const DeviceBuffer<scalar>& nuEffCell, DeviceBuffer<scalar>& diag,
+                               const DeviceBuffer<scalar>* wsch)
 {
     if (ami.n==0) return;
     DeviceBuffer<scalar> nuN;
     deviceAmiInterpolate(ami, nuEffCell, nuN);
     amiMomKernel<<<nBlocks(ami.n),TPB>>>(ami.n, ami.ownCell.data(), nuEffCell.data(), nuN.data(), ami.deltaCoeffs.data(),
-        ami.weights.data(), ami.magSf.data(), ami.phi.data(), ami.ifCoeff.data(), diag.data());
+        ami.weights.data(), ami.magSf.data(), ami.phi.data(),
+        (wsch && (label)wsch->size() == ami.n) ? wsch->data() : nullptr,
+        ami.ifCoeff.data(), diag.data());
     cudaCheck(cudaGetLastError(),"amiMom");
 }
 
@@ -887,6 +898,226 @@ void deviceAmiLapCorrP(
         ami.magSf.data(), ami.corrVecX.data(),ami.corrVecY.data(),ami.corrVecZ.data(), gx.data(),gy.data(),gz.data(),
         gxN.data(),gyN.data(),gzN.data(), bp.data(), ffcOut.data());
     cudaCheck(cudaGetLastError(),"amiLapCorrP");
+}
+
+} // namespace brae
+
+namespace brae {
+namespace {
+
+// The TVD limiter at an AMI face. OF LimitedScheme::calcLimiter's coupled branch, with the four
+// patch-side substitutions spelled out in limitedSchemes_cpp.cuh:
+//   CDweights -> ami.weights,  C[nei]-C[own] -> ami.delta,  lPhi[nei] -> patchNeighbourField,
+//   gradc[nei] -> the gradient's patchNeighbourField (R G R^T on a rotational interface).
+//
+// This is the SAME arithmetic divLimitedVFaceKernel does on an internal face -- deliberately, because a
+// coupled face is not a special scheme, it is the same scheme reading its neighbour through the AMI.
+__global__
+void amiLimitedVWeightKernel(
+    int n,
+    int nC,
+    const label*  __restrict__ own,
+    const label*  __restrict__ off,
+    const label*  __restrict__ nbr,
+    const scalar* __restrict__ wq,        // AMI stencil weights
+    const scalar* __restrict__ cd,        // the patch's interpolation weights
+    const scalar* __restrict__ dX,
+    const scalar* __restrict__ dY,
+    const scalar* __restrict__ dZ,
+    const scalar* __restrict__ phi,
+    const scalar* __restrict__ U0,
+    const scalar* __restrict__ U1,
+    const scalar* __restrict__ U2,
+    const scalar* __restrict__ g,         // packed grad(U): g[q*nC + c], q = 3i+j = d(U_j)/d(x_i)
+    const scalar* __restrict__ fT,
+    int                        rotational,
+    scalar                     twoByk,
+    scalar* __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    const int o = own[i];
+    const scalar p = phi[i];
+
+    scalar R[9];
+    if (rotational)
+        for (int q = 0; q < 9; ++q) R[q] = fT[q*n + i];
+
+    // patchNeighbourField of U and of grad(U), both accumulated over the AMI stencil.
+    scalar uN[3] = {0, 0, 0};
+    scalar gN[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    for (label k = off[i]; k < off[i+1]; ++k)
+    {
+        const int c = nbr[k];
+        const scalar wk = wq[k];
+        scalar v[3] = { U0[c], U1[c], U2[c] };
+        scalar G[9];
+        for (int q = 0; q < 9; ++q) G[q] = g[q*nC + c];
+        if (rotational)
+        {
+            const scalar rv[3] = { R[0]*v[0] + R[1]*v[1] + R[2]*v[2],
+                                   R[3]*v[0] + R[4]*v[1] + R[5]*v[2],
+                                   R[6]*v[0] + R[7]*v[1] + R[8]*v[2] };
+            v[0] = rv[0]; v[1] = rv[1]; v[2] = rv[2];
+            // A gradient is a rank-2 tensor: R G R^T, both indices. R G alone would leave the derivative
+            // index in the neighbour's frame, which is invisible until the interface actually rotates.
+            scalar t[9];
+            for (int r = 0; r < 3; ++r)
+                for (int c2 = 0; c2 < 3; ++c2)
+                {
+                    scalar sum = 0;
+                    for (int x = 0; x < 3; ++x)
+                        for (int y = 0; y < 3; ++y)
+                            sum += R[3*r + x] * G[3*x + y] * R[3*c2 + y];
+                    t[3*r + c2] = sum;
+                }
+            for (int q = 0; q < 9; ++q) G[q] = t[q];
+        }
+        uN[0] += wk*v[0]; uN[1] += wk*v[1]; uN[2] += wk*v[2];
+        for (int q = 0; q < 9; ++q) gN[q] += wk*G[q];
+    }
+
+    const scalar dx = dX[i], dy = dY[i], dz = dZ[i];
+    const scalar gf0 = uN[0] - U0[o], gf1 = uN[1] - U1[o], gf2 = uN[2] - U2[o];   // gradfV
+    const scalar gradf = gf0*gf0 + gf1*gf1 + gf2*gf2;
+
+    scalar G[9];                                             // the UPWIND cell's gradient
+    if (p > 0.0) for (int q = 0; q < 9; ++q) G[q] = g[q*nC + o];
+    else         for (int q = 0; q < 9; ++q) G[q] = gN[q];
+
+    // (d & gradc)_j = d_i * gradc_ij -- a COLUMN dot in this packing.
+    const scalar dg0 = dx*G[0] + dy*G[3] + dz*G[6];
+    const scalar dg1 = dx*G[1] + dy*G[4] + dz*G[7];
+    const scalar dg2 = dx*G[2] + dy*G[5] + dz*G[8];
+    const scalar gradcf = gf0*dg0 + gf1*dg1 + gf2*dg2;
+
+    scalar r;
+    if (fabs(gradcf) >= 1000.0 * fabs(gradf))
+        r = 2.0 * 1000.0 * ((gradcf >= 0.0) ? 1.0 : -1.0) * ((gradf >= 0.0) ? 1.0 : -1.0) - 1.0;
+    else
+        r = 2.0 * (gradcf / gradf) - 1.0;
+    scalar limiter = twoByk * r;
+    limiter = (limiter < 0.0) ? 0.0 : (limiter > 1.0 ? 1.0 : limiter);
+    out[i] = limiter * cd[i] + (1.0 - limiter) * ((p >= 0.0) ? 1.0 : 0.0);
+}
+
+
+// The scalar form. A scalar is never rotated across the interface; its gradient is, as a vector.
+__global__
+void amiLimitedWeightKernel(
+    int n,
+    const label*  __restrict__ own,
+    const label*  __restrict__ off,
+    const label*  __restrict__ nbr,
+    const scalar* __restrict__ wq,
+    const scalar* __restrict__ cd,
+    const scalar* __restrict__ dX,
+    const scalar* __restrict__ dY,
+    const scalar* __restrict__ dZ,
+    const scalar* __restrict__ phi,
+    const scalar* __restrict__ f,
+    const scalar* __restrict__ gx,
+    const scalar* __restrict__ gy,
+    const scalar* __restrict__ gz,
+    const scalar* __restrict__ fT,
+    int                        rotational,
+    scalar                     twoByk,
+    scalar* __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    const int o = own[i];
+    const scalar p = phi[i];
+
+    scalar R[9];
+    if (rotational)
+        for (int q = 0; q < 9; ++q) R[q] = fT[q*n + i];
+
+    scalar fN = 0, gNx = 0, gNy = 0, gNz = 0;
+    for (label k = off[i]; k < off[i+1]; ++k)
+    {
+        const int c = nbr[k];
+        const scalar wk = wq[k];
+        fN += wk * f[c];                       // NOT transformed: a scalar has no orientation
+        scalar vx = gx[c], vy = gy[c], vz = gz[c];
+        if (rotational)
+        {
+            const scalar rx = R[0]*vx + R[1]*vy + R[2]*vz;
+            const scalar ry = R[3]*vx + R[4]*vy + R[5]*vz;
+            const scalar rz = R[6]*vx + R[7]*vy + R[8]*vz;
+            vx = rx; vy = ry; vz = rz;
+        }
+        gNx += wk*vx; gNy += wk*vy; gNz += wk*vz;
+    }
+
+    const scalar dx = dX[i], dy = dY[i], dz = dZ[i];
+    const scalar gradf = fN - f[o];
+    const scalar gcx = (p > 0.0) ? gx[o] : gNx;
+    const scalar gcy = (p > 0.0) ? gy[o] : gNy;
+    const scalar gcz = (p > 0.0) ? gz[o] : gNz;
+    const scalar gradcf = dx*gcx + dy*gcy + dz*gcz;
+
+    scalar r;
+    if (fabs(gradcf) >= 1000.0 * fabs(gradf))
+        r = 2.0 * 1000.0 * ((gradcf >= 0.0) ? 1.0 : -1.0) * ((gradf >= 0.0) ? 1.0 : -1.0) - 1.0;
+    else
+        r = 2.0 * (gradcf / gradf) - 1.0;
+    scalar limiter;
+    if (twoByk > 0.0)
+    {
+        limiter = twoByk * r;
+        limiter = (limiter < 0.0) ? 0.0 : (limiter > 1.0 ? 1.0 : limiter);
+    }
+    else
+    {
+        limiter = r * (r + 1.0) / (r*r + 1.0);    // vanAlbada, as divLimitedFaceKernel does
+    }
+    out[i] = limiter * cd[i] + (1.0 - limiter) * ((p >= 0.0) ? 1.0 : 0.0);
+}
+
+} // namespace
+
+
+void deviceAmiLimitedVWeights(
+    const DeviceAMI&            ami,
+    const DeviceBuffer<scalar>& Ux,
+    const DeviceBuffer<scalar>& Uy,
+    const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>& gradU,
+    const int                   nC,
+    const scalar                twoByk,
+    DeviceBuffer<scalar>&       out)
+{
+    if (!ami.n) return;
+    out.resize(ami.n);
+    amiLimitedVWeightKernel<<<nBlocks(ami.n), TPB>>>(
+        ami.n, nC, ami.ownCell.data(), ami.off.data(), ami.nbrCell.data(), ami.weight.data(),
+        ami.weights.data(), ami.dX.data(), ami.dY.data(), ami.dZ.data(), ami.phi.data(),
+        Ux.data(), Uy.data(), Uz.data(), gradU.data(),
+        ami.rotational ? ami.fT.data() : nullptr, ami.rotational ? 1 : 0, twoByk, out.data());
+    cudaCheck(cudaGetLastError(), "amiLimitedVWeight");
+}
+
+
+void deviceAmiLimitedWeights(
+    const DeviceAMI&            ami,
+    const DeviceBuffer<scalar>& f,
+    const DeviceBuffer<scalar>& gx,
+    const DeviceBuffer<scalar>& gy,
+    const DeviceBuffer<scalar>& gz,
+    const scalar                twoByk,
+    DeviceBuffer<scalar>&       out)
+{
+    if (!ami.n) return;
+    out.resize(ami.n);
+    amiLimitedWeightKernel<<<nBlocks(ami.n), TPB>>>(
+        ami.n, ami.ownCell.data(), ami.off.data(), ami.nbrCell.data(), ami.weight.data(),
+        ami.weights.data(), ami.dX.data(), ami.dY.data(), ami.dZ.data(), ami.phi.data(),
+        f.data(), gx.data(), gy.data(), gz.data(),
+        ami.rotational ? ami.fT.data() : nullptr, ami.rotational ? 1 : 0, twoByk, out.data());
+    cudaCheck(cudaGetLastError(), "amiLimitedWeight");
 }
 
 } // namespace brae

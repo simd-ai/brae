@@ -163,7 +163,7 @@ int main()
             "      maxDeltaxyzCoeffs { deltaCoeff 1.5; } }\n");
         DeviceSimpleControls ctl;
         ctl.turbulent = true;
-        readTurbulenceModel(d, ctl);
+        readTurbulenceModel(d, ctl, {"test", true, true});
         check(ctl.lesDeltaMax, "parser: `delta maxDeltaxyz` sets lesDeltaMax");
         check(std::fabs(ctl.lesDeltaCoeff - 1.5) < 1e-14, "parser: maxDeltaxyzCoeffs/deltaCoeff is honoured");
     }
@@ -171,7 +171,7 @@ int main()
         const FoamDict d = dictFromString("simulationType LES;\nLES { LESModel Smagorinsky; turbulence on; delta cubeRootVol; }\n");
         DeviceSimpleControls ctl;
         ctl.turbulent = true;
-        readTurbulenceModel(d, ctl);
+        readTurbulenceModel(d, ctl, {"test", true, true});
         check(ctl.les && !ctl.lesDeltaMax, "negative control: `delta cubeRootVol` is read as LES but leaves lesDeltaMax off");
     }
 

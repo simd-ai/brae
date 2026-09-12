@@ -13,6 +13,7 @@
 #include "solve_vector.cuh"
 #include "pcg.cuh"
 #include "k_epsilon.cuh"
+#include "near_wall_dist.cuh"
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
 #include "device_ldu.cuh"
@@ -109,6 +110,20 @@ int main(int argc, char** argv) {
     const DeviceVectorBoundary dbU = buildDeviceVectorBoundary(U0, fvp, g);
     const DeviceBoundary dbP = buildDeviceBoundary(p0, fvp, g), dbEps = buildDeviceBoundary(e0, fvp, g), dbK = buildDeviceBoundary(k0, fvp, g);
     const DeviceWallData wall = buildDeviceWallData(m, g, fvp, U0);
+    // nut's boundary in this case: mkNut gives every non-empty patch a `calculated` field of ZERO, and
+    // with no wall patches nothing rewrites it. DkEff(patchi) is therefore nu, on BOTH paths -- the host
+    // reads it from the field, so the device is handed the same numbers rather than the cell value.
+    DeviceBuffer<scalar> dNutB;
+    {
+        GeometricField<scalar> nutRef = mkNut(std::vector<scalar>(nC, 0.0));
+        std::vector<scalar> flat;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            const std::vector<scalar>& b = nutRef.boundary[pi]->value();
+            flat.insert(flat.end(), b.begin(), b.end());
+        }
+        dNutB.copyFrom(flat);
+    }
     // all-extrapolated boundary: deviceBCValue gathers a cell field to boundary faces (nuEff_bnd = cell value),
     // the nuBnd input for the divDevReff boundary stress.
     DeviceBoundary dbExtrap;
@@ -172,7 +187,20 @@ int main(int argc, char** argv) {
         DeviceBuffer<scalar> gnx,gny,gnz; deviceGaussGrad(dm, dp, pbv2, gnx,gny,gnz);
         DeviceBuffer<scalar>* gn[3]={&gnx,&gny,&gnz}; for (int kk=0;kk<3;++kk){ DeviceBuffer<scalar> Un; deviceCorrector(HbyA[kk], rAU, *gn[kk], Un); Uk[kk]=std::move(Un); }
         // turbulence
-        deviceKEpsilonCorrect(dm, wall, dbEps, dbK, dbU, Uk[0], Uk[1], Uk[2], dk, de, dnut, phiInt, phiBnd, nu, relaxEps, relaxK, tol);
+        // DkEff(patchi)/DepsilonEff(patchi) come from nut's OWN boundary on the host path, so the device
+        // is given the same thing -- rebuilt from the CURRENT k each step, exactly as the host's
+        // correctNut rewrites the wall value at the end of every correct().
+        deviceKEpsilonCorrect(dm, wall, dbEps, dbK, dbU, Uk[0], Uk[1], Uk[2], dk, de, dnut, phiInt, phiBnd,
+                              nu, relaxEps, relaxK, tol,
+                              /*bounded*/false, /*boundedEps*/false,
+                              /*limitedK*/false, /*limitedEps*/false, 2.0, 2.0,
+                              /*co*/{}, /*relTolKE*/0.0, /*keCheckEvery*/1,
+                              /*linearUpwindK*/false, /*linearUpwindEps*/false, /*nonOrth*/false,
+                              /*gsK*/false, /*gsEps*/false, /*ami*/nullptr, /*cyc*/nullptr,
+                              /*nutWall*/0, /*atmZ0*/0.0, /*atmBoundNut*/true,
+                              /*kDdt*/{}, /*eDdt*/{},
+                              /*rho*/nullptr, /*muLam*/nullptr, /*rhoBnd*/nullptr, /*nuWallFace*/nullptr,
+                              &dNutB);
     }
 
     const std::vector<scalar> uxg=Uk[0].host(), uyg=Uk[1].host(), pg=dp.host(), kg=dk.host(), eg=de.host();

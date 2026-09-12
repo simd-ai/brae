@@ -197,9 +197,33 @@ int main(int argc, char** argv)
         // brae reads U before p and T, so at construction it had no density and fell back to rhoInlet.
         // Measured on squareBend: avgU 467.9 against OF's 611.7, ratio 1.3074, and the inlet momentum
         // boundaryCoeffs 0.765x OF's while every internalCoeff matched to 8 s.f.
+        //
+        // ONLY WHERE THE CASE GAVE NO `value`. OpenFOAM's dict constructor is
+        //     if (!this->readValueEntry(dict)) { evaluate(...); }
+        // (flowRateInletVelocityFvPatchVectorField.C:93-97) -- the file's `value` wins outright, and the
+        // computed avgU replaces it only at the first updateCoeffs, which is INSIDE the momentum matrix
+        // constructor and therefore AFTER compressibleCreatePhi.H has already built phi from the seeded U.
+        // Re-seeding unconditionally moved brae's initial flux away from OpenFOAM's. Measured on
+        // validation/rhoFR against real OpenFOAM at tolerance 1e-14 / relTol 0, by the seed alone:
+        //     no `value` (OF evaluates too)     U 4.8e-12 at t=1,  1.1e-11 at t=20   <- this driver's floor
+        //     `value uniform (5 0 0)` (shipped) U 6.5e-06,         1.5e-06
+        //     `value uniform (0 0 0)`           U 2.7e-02,         6.5e-03
+        // the last being OpenFOAM's own angledDuctExplicitFixedCoeff tutorial's entry, so it is a live
+        // configuration and not a synthetic seed. OpenFOAM's own seeded and unseeded answers differ by
+        // exactly 6.5e-06 too, so what brae was computing with a `value` was OpenFOAM's answer WITHOUT one.
+        //
+        // The rho below is the adjacent CELL's, where OpenFOAM's updateValues sums the PATCH field
+        // (.C:217-220). That is inert, and provably so rather than merely unmeasured: the seeded U_b
+        // reaches the solution only through the initial phi, which weights it by a density again, so the
+        // product rho*U_b is the prescribed mdot/A whichever density either side divides by, and U_b
+        // itself is overwritten by updateCoeffs before the first momentum assembly. Checked with T's
+        // inlet at 600 K against a 300 K interior, where rho_b is half rho_cell: brae seeds 5.168 and
+        // OpenFOAM 10.336, and every field still agrees to 2.7e-12. It stops being inert the moment the
+        // initial flux below is built with a DIFFERENT density from the one used here -- keep them paired.
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
             if (U.boundary[pi]->bcCategory() != 9) continue;          // 9 = mass-form flowRateInletVelocity
+            if (U.boundary[pi]->flowRateHadValue()) continue;         // the case's `value` is OF's answer here
             const scalar mdot = U.boundary[pi]->flowRateValue();
             scalar sumRhoA = 0.0;
             for (label i = 0; i < fvp[pi].size; ++i)
@@ -331,7 +355,7 @@ int main(int argc, char** argv)
         if (simType != "RAS" && simType != "laminar")
             throw std::runtime_error("brae: unsupported simulationType '" + simType + "' for rhoSimpleFoam (RAS or laminar)");
         ctl.turbulent = (simType == "RAS");
-        readTurbulenceModel(turbProps, ctl);
+        readTurbulenceModel(turbProps, ctl, {"rhoSimpleFoam (legacy, frozen)", true, true});
         // kOmegaSST and kEpsilon are both rho-weighted (every RHS term, the diffusivity, the volumetric
         // divU and the per-face wall nu). SA and the kOmegaSST variants are not, so they stay refused:
         // running one down the incompressible path converges to a wrong answer rather than failing.
@@ -668,8 +692,12 @@ int main(int argc, char** argv)
         // `iter <= endTime` from 1, which on that restart ran TWENTY steps and finished at 30 -- silently
         // changing the iteration count, the write times, and any comparison of a restarted run against a
         // continuous one. Only correct when startTime is 0, which is why every fresh-start case hid it.
-        const long nSteps = std::lround((static_cast<double>(endTime) - static_cast<double>(tStart))
-                                        / static_cast<double>(wc.deltaT()));
+        // OF Time::run tests `value() < endTime - 0.5*deltaT` and operator++ ACCUMULATES the value
+        // (Time.C:785, :1067). std::lround on the quotient disagrees at ratio n + 0.5: measured, real
+        // OpenFOAM runs 2 steps at startTime 0 / endTime 1 / deltaT 0.4 where lround gives 3.
+        const long nSteps = openFoamNSteps(static_cast<double>(tStart),
+                                           static_cast<double>(endTime),
+                                           static_cast<double>(wc.deltaT()));
         if (nSteps < 1)
             throw std::runtime_error(
                 "controlDict endTime (" + std::to_string(endTime) + ") is not beyond the start time ("
@@ -687,8 +715,15 @@ int main(int argc, char** argv)
             printOfResidualLog(iter, r, cumulativeCont);   // no-op unless BRAE_OF_LOG=1
             if (iter % 50 == 0 || iter == 1)
             {
-                std::printf("Time = %d   Ux %.4e  p %.4e  contGlobal %.4e\n",
-                            iter, r.Ux, r.p, r.contGlobal);
+                // OF prints the TIME NAME (runTime.timeName()), not the iteration index. They coincide
+                // only at startTime 0 with deltaT 1, which every fixture in validation/ is -- the blind
+                // spot that hid the same thing on the V2 driver until queue item 39. This driver keeps
+                // no Time object, so the value is built the way Time::operator++ builds it: startTime
+                // plus iter steps of deltaT (Time.C:1067), named by WriteControl::timeName.
+                std::printf("Time = %s   Ux %.4e  p %.4e  contGlobal %.4e\n",
+                            WriteControl::timeName(static_cast<scalar>(tStart)
+                                                   + static_cast<scalar>(iter) * wc.deltaT()).c_str(),
+                            r.Ux, r.p, r.contGlobal);
             }
             resControl.beginIteration();
             // U is gated on Ux alone, matching gpuSimpleFoam: brae tracks no solved-directions mask, so the

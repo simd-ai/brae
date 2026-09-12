@@ -77,5 +77,17 @@ else
     echo "ok:   application_simplefoam"
 fi
 
+# 7. application rhoSimpleFoam is handed over to brae_rhoSimpleFoam. The registry has carried this row
+#    since the compressible solver was added and no test ever exercised it -- and the target was missing
+#    from `add_dependencies(brae ...)`, so on a fresh build the hand-over exec'd a binary that did not
+#    exist. This arm fails on both: the routing notice, and the sibling actually being there to run.
+mkcase "$WORK/rho" "application     rhoSimpleFoam;" "steadyState"
+check application_rhosimplefoam "$WORK/rho" "controlDict application rhoSimpleFoam -> rhoSimpleFoam"
+if [ -x "$(dirname "$BIN")/brae_rhoSimpleFoam" ]; then
+    echo "ok:   rhosimplefoam_sibling_built"
+else
+    echo "FAIL: rhosimplefoam_sibling_built -- the registry routes to a binary that was not built"; fail=1
+fi
+
 [ "$fail" -eq 0 ] && echo "PASS: solver selection routes and refuses correctly"
 exit "$fail"

@@ -40,6 +40,7 @@ void convKernel(
     int n,
     const label* __restrict__ own,
     const scalar* __restrict__ phi,
+    const scalar* __restrict__ wsch,   // div-scheme face weight; null = upwind (pos0(phi))
     scalar* __restrict__ ifCoeff,
     scalar* __restrict__ diag)
 {
@@ -47,8 +48,10 @@ void convKernel(
     if (j >= n) return;
 
     const scalar p = phi[j];
-    ifCoeff[j] += (p < 0.0) ? p : 0.0;                  // off-diag += min(phi,0)
-    atomicAdd(&diag[own[j]], (p > 0.0) ? p : 0.0);      // diag    += max(phi,0)
+    // Same split as momKernel: the div scheme's weight, upwind when none is given.
+    const scalar ws = wsch ? wsch[j] : ((p > 0.0) ? scalar(1) : scalar(0));
+    ifCoeff[j] += p * (1.0 - ws);                       // off-diag += phi*(1-w)
+    atomicAdd(&diag[own[j]], p * ws);                   // diag    += phi*w
 }
 
 
@@ -62,6 +65,7 @@ void momKernel(
     const scalar* __restrict__ w,
     const scalar* __restrict__ magSf,
     const scalar* __restrict__ phi,
+    const scalar* __restrict__ wsch,   // div-scheme face weight; null = upwind (pos0(phi))
     scalar* __restrict__ ifCoeff,
     scalar* __restrict__ diag)
 {
@@ -71,8 +75,12 @@ void momKernel(
     const scalar nf = w[j] * nu[own[j]] + (1.0 - w[j]) * nu[nbr[j]];
     const scalar lap = nf * dc[j] * magSf[j];           // diffusion magnitude (>0)
     const scalar p = phi[j];
-    ifCoeff[j] = -lap + ((p < 0.0) ? p : 0.0);          // off-diag: -laplacian + min(phi,0)
-    atomicAdd(&diag[own[j]], lap + ((p > 0.0) ? p : 0.0));   // diag: +laplacian + max(phi,0)
+    // The convective split is the DIV SCHEME's, not always upwind -- see amiMomKernel for the
+    // OpenFOAM derivation. wsch == null is upwind (pos0(phi)) and reproduces the previous
+    // min(phi,0)/max(phi,0) form exactly.
+    const scalar ws = wsch ? wsch[j] : ((p > 0.0) ? scalar(1) : scalar(0));
+    ifCoeff[j] = -lap + p * (1.0 - ws);                 // off-diag: -laplacian + phi*(1-w)
+    atomicAdd(&diag[own[j]], lap + p * ws);             // diag: +laplacian + phi*w
 }
 
 
@@ -431,19 +439,24 @@ void deviceCyclicAssembleLaplacian(
 }
 
 
-void deviceCyclicAddConvection(DeviceCyclic& cyc, DeviceBuffer<scalar>& diag)
+void deviceCyclicAddConvection(DeviceCyclic& cyc, DeviceBuffer<scalar>& diag, const DeviceBuffer<scalar>* wsch)
 {
     if (cyc.n == 0) return;
-    convKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.phi.data(), cyc.ifCoeff.data(), diag.data());
+    convKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.phi.data(),
+        (wsch && (label)wsch->size() == cyc.n) ? wsch->data() : nullptr,
+        cyc.ifCoeff.data(), diag.data());
     cudaCheck(cudaGetLastError(), "cyclicConv");
 }
 
 
-void deviceCyclicAssembleMomentum(DeviceCyclic& cyc, const DeviceBuffer<scalar>& nuEffCell, DeviceBuffer<scalar>& diag)
+void deviceCyclicAssembleMomentum(DeviceCyclic& cyc, const DeviceBuffer<scalar>& nuEffCell, DeviceBuffer<scalar>& diag,
+                                  const DeviceBuffer<scalar>* wsch)
 {
     if (cyc.n == 0) return;
     momKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), nuEffCell.data(),
-        cyc.deltaCoeffs.data(), cyc.weights.data(), cyc.magSf.data(), cyc.phi.data(), cyc.ifCoeff.data(), diag.data());
+        cyc.deltaCoeffs.data(), cyc.weights.data(), cyc.magSf.data(), cyc.phi.data(),
+        (wsch && (label)wsch->size() == cyc.n) ? wsch->data() : nullptr,
+        cyc.ifCoeff.data(), diag.data());
     cudaCheck(cudaGetLastError(), "cyclicMom");
 }
 
@@ -917,6 +930,192 @@ void deviceCyclicAddTensorDiv(
         cyc.Sfx.data(), cyc.Sfy.data(), cyc.Sfz.data(), sigmaC.data(), nC, fT, cyc.rotational ? 1 : 0,
         srcX.data(), srcY.data(), srcZ.data());
     cudaCheck(cudaGetLastError(), "cyclicTensorDiv");
+}
+
+} // namespace brae
+
+namespace brae {
+namespace {
+
+// The TVD limiter at a cyclic face. Identical arithmetic to amiLimitedVWeightKernel -- OF's
+// LimitedScheme::calcLimiter does not distinguish the two, it just asks the patch for its weights,
+// its delta and its neighbour field -- with the AMI stencil collapsed to the single matched face.
+__global__
+void cycLimitedVWeightKernel(
+    int n,
+    int nC,
+    const label*  __restrict__ own,
+    const label*  __restrict__ nbr,
+    const scalar* __restrict__ cd,
+    const scalar* __restrict__ dX,
+    const scalar* __restrict__ dY,
+    const scalar* __restrict__ dZ,
+    const scalar* __restrict__ phi,
+    const scalar* __restrict__ U0,
+    const scalar* __restrict__ U1,
+    const scalar* __restrict__ U2,
+    const scalar* __restrict__ g,         // packed grad(U): g[q*nC + c], q = 3i+j = d(U_j)/d(x_i)
+    const scalar* __restrict__ fT,
+    int                        rotational,
+    scalar                     twoByk,
+    scalar* __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    const int o = own[i], b = nbr[i];
+    const scalar p = phi[i];
+
+    scalar uN[3] = { U0[b], U1[b], U2[b] };
+    scalar gN[9];
+    for (int q = 0; q < 9; ++q) gN[q] = g[q*nC + b];
+    if (rotational)
+    {
+        scalar R[9];
+        for (int q = 0; q < 9; ++q) R[q] = fT[q*n + i];
+        const scalar rv[3] = { R[0]*uN[0] + R[1]*uN[1] + R[2]*uN[2],
+                               R[3]*uN[0] + R[4]*uN[1] + R[5]*uN[2],
+                               R[6]*uN[0] + R[7]*uN[1] + R[8]*uN[2] };
+        uN[0] = rv[0]; uN[1] = rv[1]; uN[2] = rv[2];
+        scalar t[9];
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c)
+            {
+                scalar sum = 0;
+                for (int x = 0; x < 3; ++x)
+                    for (int y = 0; y < 3; ++y)
+                        sum += R[3*r + x] * gN[3*x + y] * R[3*c + y];   // R G R^T
+                t[3*r + c] = sum;
+            }
+        for (int q = 0; q < 9; ++q) gN[q] = t[q];
+    }
+
+    const scalar dx = dX[i], dy = dY[i], dz = dZ[i];
+    const scalar gf0 = uN[0] - U0[o], gf1 = uN[1] - U1[o], gf2 = uN[2] - U2[o];
+    const scalar gradf = gf0*gf0 + gf1*gf1 + gf2*gf2;
+
+    scalar G[9];
+    if (p > 0.0) for (int q = 0; q < 9; ++q) G[q] = g[q*nC + o];
+    else         for (int q = 0; q < 9; ++q) G[q] = gN[q];
+
+    const scalar dg0 = dx*G[0] + dy*G[3] + dz*G[6];   // (d & gradc)_j = d_i * gradc_ij
+    const scalar dg1 = dx*G[1] + dy*G[4] + dz*G[7];
+    const scalar dg2 = dx*G[2] + dy*G[5] + dz*G[8];
+    const scalar gradcf = gf0*dg0 + gf1*dg1 + gf2*dg2;
+
+    scalar r;
+    if (fabs(gradcf) >= 1000.0 * fabs(gradf))
+        r = 2.0 * 1000.0 * ((gradcf >= 0.0) ? 1.0 : -1.0) * ((gradf >= 0.0) ? 1.0 : -1.0) - 1.0;
+    else
+        r = 2.0 * (gradcf / gradf) - 1.0;
+    scalar limiter = twoByk * r;
+    limiter = (limiter < 0.0) ? 0.0 : (limiter > 1.0 ? 1.0 : limiter);
+    out[i] = limiter * cd[i] + (1.0 - limiter) * ((p >= 0.0) ? 1.0 : 0.0);
+}
+
+
+__global__
+void cycLimitedWeightKernel(
+    int n,
+    const label*  __restrict__ own,
+    const label*  __restrict__ nbr,
+    const scalar* __restrict__ cd,
+    const scalar* __restrict__ dX,
+    const scalar* __restrict__ dY,
+    const scalar* __restrict__ dZ,
+    const scalar* __restrict__ phi,
+    const scalar* __restrict__ f,
+    const scalar* __restrict__ gx,
+    const scalar* __restrict__ gy,
+    const scalar* __restrict__ gz,
+    const scalar* __restrict__ fT,
+    int                        rotational,
+    scalar                     twoByk,
+    scalar* __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    const int o = own[i], b = nbr[i];
+    const scalar p = phi[i];
+
+    scalar gNx = gx[b], gNy = gy[b], gNz = gz[b];
+    if (rotational)
+    {
+        scalar R[9];
+        for (int q = 0; q < 9; ++q) R[q] = fT[q*n + i];
+        const scalar rx = R[0]*gNx + R[1]*gNy + R[2]*gNz;
+        const scalar ry = R[3]*gNx + R[4]*gNy + R[5]*gNz;
+        const scalar rz = R[6]*gNx + R[7]*gNy + R[8]*gNz;
+        gNx = rx; gNy = ry; gNz = rz;
+    }
+
+    const scalar dx = dX[i], dy = dY[i], dz = dZ[i];
+    const scalar gradf = f[b] - f[o];                  // a scalar is not transformed across the interface
+    const scalar gcx = (p > 0.0) ? gx[o] : gNx;
+    const scalar gcy = (p > 0.0) ? gy[o] : gNy;
+    const scalar gcz = (p > 0.0) ? gz[o] : gNz;
+    const scalar gradcf = dx*gcx + dy*gcy + dz*gcz;
+
+    scalar r;
+    if (fabs(gradcf) >= 1000.0 * fabs(gradf))
+        r = 2.0 * 1000.0 * ((gradcf >= 0.0) ? 1.0 : -1.0) * ((gradf >= 0.0) ? 1.0 : -1.0) - 1.0;
+    else
+        r = 2.0 * (gradcf / gradf) - 1.0;
+    scalar limiter;
+    if (twoByk > 0.0)
+    {
+        limiter = twoByk * r;
+        limiter = (limiter < 0.0) ? 0.0 : (limiter > 1.0 ? 1.0 : limiter);
+    }
+    else
+    {
+        limiter = r * (r + 1.0) / (r*r + 1.0);        // vanAlbada
+    }
+    out[i] = limiter * cd[i] + (1.0 - limiter) * ((p >= 0.0) ? 1.0 : 0.0);
+}
+
+} // namespace
+
+
+void deviceCyclicLimitedVWeights(
+    const DeviceCyclic&         cyc,
+    const DeviceBuffer<scalar>& Ux,
+    const DeviceBuffer<scalar>& Uy,
+    const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>& gradU,
+    const int                   nC,
+    const scalar                twoByk,
+    DeviceBuffer<scalar>&       out)
+{
+    if (!cyc.n) return;
+    out.resize(cyc.n);
+    cycLimitedVWeightKernel<<<nBlocks(cyc.n), TPB>>>(
+        cyc.n, nC, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.weights.data(),
+        cyc.dX.data(), cyc.dY.data(), cyc.dZ.data(), cyc.phi.data(),
+        Ux.data(), Uy.data(), Uz.data(), gradU.data(),
+        cyc.rotational ? cyc.fT.data() : nullptr, cyc.rotational ? 1 : 0, twoByk, out.data());
+    cudaCheck(cudaGetLastError(), "cycLimitedVWeight");
+}
+
+
+void deviceCyclicLimitedWeights(
+    const DeviceCyclic&         cyc,
+    const DeviceBuffer<scalar>& f,
+    const DeviceBuffer<scalar>& gx,
+    const DeviceBuffer<scalar>& gy,
+    const DeviceBuffer<scalar>& gz,
+    const scalar                twoByk,
+    DeviceBuffer<scalar>&       out)
+{
+    if (!cyc.n) return;
+    out.resize(cyc.n);
+    cycLimitedWeightKernel<<<nBlocks(cyc.n), TPB>>>(
+        cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.weights.data(),
+        cyc.dX.data(), cyc.dY.data(), cyc.dZ.data(), cyc.phi.data(),
+        f.data(), gx.data(), gy.data(), gz.data(),
+        cyc.rotational ? cyc.fT.data() : nullptr, cyc.rotational ? 1 : 0, twoByk, out.data());
+    cudaCheck(cudaGetLastError(), "cycLimitedWeight");
 }
 
 } // namespace brae

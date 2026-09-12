@@ -12,15 +12,19 @@
 #include "fvc.cuh"   // SurfaceScalarField
 #include <cmath>
 #include <vector>
+#include "solution_directions.cuh"   // fvMatrix<Type>::H()'s validComponents block
 
 namespace brae {
 
 // pEqn.flux(): conservative face flux of a solved matrix. Mirrors fvMatrix::flux() (orthogonal,
 // no faceFluxCorrection): internal = faceH(p) = upper*p[nei] - lower*p[own]; boundary =
 // internalCoeffs*p[faceCell] - boundaryCoeffs.
+// Array form: the flux depends only on the INTERNAL field (the boundary term uses the face cell's
+// internal value, not the patch value), and a GeometricField cannot be copied -- its patch fields are
+// unique_ptr. The GeometricField overload below delegates.
 inline SurfaceScalarField matrixFlux(
     const FvScalarMatrix& M,
-    const GeometricField<scalar>& p,
+    const std::vector<scalar>& pInternal,
     const PrimitiveMesh& m,
     const std::vector<FvPatch>& patches)
 {
@@ -30,16 +34,32 @@ inline SurfaceScalarField matrixFlux(
     SurfaceScalarField flux;
     flux.internal.resize(nIf);
     for (label f = 0; f < nIf; ++f)
-        flux.internal[f] = M.upper[f] * p.internal[nei[f]] - M.lower[f] * p.internal[own[f]];
+        flux.internal[f] = M.upper[f] * pInternal[nei[f]] - M.lower[f] * pInternal[own[f]];
+    // fvMatrix.C:1688 -- `if (faceFluxCorrectionPtr_) fieldFlux += *faceFluxCorrectionPtr_;`.
+    // Omitting this leaves `phi = phiHbyA - pEqn.flux()` non-conservative on a non-orthogonal mesh while
+    // every other check still passes, because the pressure equation carries the correction in its SOURCE
+    // and solves perfectly well without it appearing in the flux.
+    if (!M.faceFluxCorrection.empty())
+        for (label f = 0; f < nIf; ++f)
+            flux.internal[f] += M.faceFluxCorrection[f];
     flux.boundary.resize(patches.size());
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         flux.boundary[pi].resize(patches[pi].size);
         for (label i = 0; i < patches[pi].size; ++i)
-            flux.boundary[pi][i] = M.internalCoeffs[pi][i] * p.internal[patches[pi].faceCells[i]]
+            flux.boundary[pi][i] = M.internalCoeffs[pi][i] * pInternal[patches[pi].faceCells[i]]
                                  - M.boundaryCoeffs[pi][i];
     }
     return flux;
+}
+
+inline SurfaceScalarField matrixFlux(
+    const FvScalarMatrix& M,
+    const GeometricField<scalar>& p,
+    const PrimitiveMesh& m,
+    const std::vector<FvPatch>& patches)
+{
+    return matrixFlux(M, p.internal, m, patches);
 }
 
 // fvMatrix::setValues: fix psi at the given cells to the given values (epsilonWallFunction
@@ -152,6 +172,43 @@ std::vector<scalar> matrixA(
     return A;
 }
 
+// UEqn.H1() -- fvMatrix.C:H1() over lduMatrix::H1() (lduMatrixATmul.C).
+//
+//     H1[nei[f]] -= lower[f];   H1[own[f]] -= upper[f];        // lduMatrix::H1
+//     H1[c] += boundaryCoeffs[c].component(0)  for COUPLED patches only
+//     H1 /= V
+//
+// SIMPLEC's whole difference from SIMPLE is here: rAtU = 1/(1/rAU - H1) = 1/(A - H1), and because
+// A = (diag + cmptAv(internalCoeffs))/V while H1 = -sum(offdiag)/V, that reciprocal is V over the ROW SUM
+// of the folded matrix. It is written as OpenFOAM writes it rather than as the row sum, so the two halves
+// stay independently checkable against fvMatrix.C.
+//
+// NOTE the asymmetry with matrixA/matrixH: A() takes cmptAv(internalCoeffs) and H() takes component-wise
+// terms, but H1() takes boundaryCoeffs.component(0) -- component ZERO, not the average. It is only
+// reached on coupled patches, which this port refuses, so the term is absent here; the citation is kept
+// so that adding coupled patches does not have to rediscover which component OpenFOAM uses.
+template <typename T>
+std::vector<scalar> matrixH1(
+    const FvMatrix<T>& M,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    const label nC = m.nCells(), nIf = m.nInternalFaces();
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+
+    std::vector<scalar> H1(nC, 0.0);
+    for (label f = 0; f < nIf; ++f)
+    {
+        H1[nei[f]] -= M.lower[f];
+        H1[own[f]] -= M.upper[f];
+    }
+    (void)patches;   // coupled patches only; refused on this path
+    for (label c = 0; c < nC; ++c) H1[c] /= g.V()[c];
+    return H1;
+}
+
 inline std::vector<vector> matrixH(
     const FvVectorMatrix& M,
     const GeometricField<vector>& U,
@@ -188,6 +245,23 @@ inline std::vector<vector> matrixH(
             H[patches[pi].faceCells[i]] += M.boundaryCoeffs[pi][i];
     for (label c = 0; c < nC; ++c)
         H[c] = H[c] / g.V()[c];
+    // fvMatrix<Type>::H() ENDS by zeroing every component polyMesh::solutionD() knocks out
+    // (fvMatrix.C, the validComponents block after Hphi.correctBoundaryConditions(); the replace
+    // zeroes the internal AND the boundary field, GeometricField.C). brae never ported it, and it is
+    // what makes OpenFOAM's empty direction a dead end rather than a channel: pEqn.H's
+    // `U = HbyA - rAtU*grad(p)` rewrites all three components every iteration, so with H_z identically
+    // zero no Uz can feed back, whatever round-off the mesh carries. OpenFOAM's own Uz is NOT bit-exact
+    // zero -- measured 2.617306e-11 on pitzDaily at iteration 1, because 5018 of 24170 internal faces
+    // have a nonzero Sf_z -- so the premise that this could be left to exact arithmetic was wrong.
+    // A() and H1() carry no such block and are deliberately untouched.
+    {
+        const SolutionDirections solutionD = solutionDirections(patches);
+        for (int cmpt = 0; cmpt < 3; ++cmpt)
+        {
+            if (solutionD.valid(cmpt)) continue;
+            for (label c = 0; c < nC; ++c) setComponent(H[c], cmpt, scalar(0));
+        }
+    }
     return H;
 }
 

@@ -44,6 +44,10 @@ struct AMIInterface
     std::vector<vector> corrVec;                // per src face non-orth correction vector (nf - delta*deltaCoeffs)
     std::vector<vector> dOwn;                   // per src face Cf - C[own] (linearUpwind own-side reconstruction delta)
     std::vector<vector> dNbr;                   // per STENCIL ENTRY Cf_tgt - C[nbr] (UN-rotated, nbr-side reconstruction)
+    // fvPatch::delta(): dOwn minus the AMI-interpolated, TRANSFORMED neighbour delta -- the vector
+    // deltaCoeffs and corrVec are already built from. Stored so the TVD limiter at a coupled face reads
+    // the same number instead of re-deriving the interpolation and the rotation a second time.
+    std::vector<vector> delta;
     // cyclicACMI. The interface is only PARTIALLY coupled: it shares its faces with a coincident wall
     // (nonOverlapPatch), and the overlap fraction decides how the area splits between them. Partial
     // coverage is the DEFINING FEATURE here, not a defect -- so ACMI is exempt from the coverage
@@ -781,6 +785,7 @@ inline std::vector<AMIInterface> buildAMIInterfaces(
             ai.deltaCoeffs.push_back(dc);
             ai.corrVec.push_back(nf - delta * dc);
             ai.dOwn.push_back(patchD);   // own-side linearUpwind reconstruction delta (Cf - C_own)
+            ai.delta.push_back(delta);   // fvPatch::delta(), the TVD limiter's d
             for (const auto& e : stencil[i])
             {
                 const label j = e.first;

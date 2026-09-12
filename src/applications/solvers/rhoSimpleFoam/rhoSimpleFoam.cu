@@ -1,0 +1,1464 @@
+// CUDA driver for rhoSimpleFoam. See rhoSimpleFoam.cuh for the provenance, the order and the contract.
+#include "limit_temperature_report.cuh"   // OF reports LimitedCells on every call
+#include "rhoSimpleFoam.cuh"
+#include "rhoThermoDevice.cuh"   // updateEnergyBoundaryCoeffs: the energy conditions, live
+#include "fv_patch.cuh"          // PatchExprBinding::fvp: faceCells and deltaCoeffs for the expression
+#include "liquid_thermo.cuh"     // thermoHeOf: limitTemperature and fixedTemperatureConstraint per cell
+#include "device_fvoptions.cuh"
+#include <string>   // deviceSetValues: fvOptions.constrain(EEqn)
+#include "pEqn.cuh"              // correctVelocity, relaxField -- the stages that ARE shared
+#include "device_pcg.cuh"
+#include "device_blas.cuh"
+#include "device_amg.cuh"
+#include "device_simple.cuh"
+#include <cstdio>
+#include <cstdlib>
+#include <algorithm>
+#include <stdexcept>
+#include <vector>
+
+#include <chrono>
+#include <nvtx3/nvToolsExt.h>
+namespace brae {
+namespace gpu {
+namespace rhoSimple {
+
+namespace {
+
+DeviceLduView foldedView(const DeviceMesh& dm, const PressureMatrix& P, const DeviceBuffer<scalar>& diagC)
+{
+    DeviceLduView A{};
+    A.nCells = dm.nCells;
+    A.nInternalFaces = dm.nInternalFaces;
+    A.diag = diagC.data();
+    A.upper = P.upper.data();
+    A.lower = P.lower.data();
+    A.owner = dm.owner.data();
+    A.nei = dm.nei.data();
+    A.ownerStart = dm.ownerStart.data();
+    A.losort = dm.losort.data();
+    A.losortStart = dm.losortStart.data();
+    return A;
+}
+
+DeviceLduView foldedViewM(const DeviceMesh& dm, const MomentumMatrix& M, const DeviceBuffer<scalar>& diagC)
+{
+    DeviceLduView A{};
+    A.nCells = dm.nCells;
+    A.nInternalFaces = dm.nInternalFaces;
+    A.diag = diagC.data();
+    A.upper = M.upper.data();
+    A.lower = M.lower.data();
+    A.owner = dm.owner.data();
+    A.nei = dm.nei.data();
+    A.ownerStart = dm.ownerStart.data();
+    A.losort = dm.losort.data();
+    A.losortStart = dm.losortStart.data();
+    return A;
+}
+
+
+// phi = phiHbyA + pEqn.flux(). PLUS, and gpu::correctFlux cannot be reused for it.
+//
+// rhoSimpleFoam writes the pressure equation as `fvc::div(phiHbyA) - fvm::laplacian(...) == 0` and the
+// reference negates the ENTIRE assembled matrix -- diag, off-diagonals, source, both boundary coefficient
+// arrays and the face-flux correction -- to match. The incompressible solver writes
+// `fvm::laplacian(...) == fvc::div(phiHbyA)` and subtracts. Same physics, opposite sign, and the sign is
+// what makes phi discretely conservative rather than merely plausible: a wrong one leaves div(phi) != 0
+// while the pressure equation still solves happily.
+void correctFluxCompressible(
+    DeviceBuffer<scalar>&       phiInt,
+    DeviceBuffer<scalar>&       phiBnd,
+    const DeviceBuffer<scalar>& phiHbyAInt,
+    const DeviceBuffer<scalar>& phiHbyABnd,
+    const PressureMatrix&       P,
+    const DeviceMesh&           dm,
+    const DeviceBoundary&       dbP,
+    const DeviceBuffer<scalar>& pSolved)
+{
+    DeviceBuffer<scalar> fInt, fBnd;
+    deviceMatrixFluxInternal(P.view(dm), pSolved, fInt);
+    deviceMatrixFluxBoundary(dbP, P.iC, P.bC, pSolved, fBnd);
+    // fvMatrix.C:1688 -- `if (faceFluxCorrectionPtr_) fieldFlux += *faceFluxCorrectionPtr_;`
+    if (P.faceFluxCorr.size() > 0) deviceAxpy(1.0, P.faceFluxCorr, fInt);
+
+    deviceCopy(phiInt, phiHbyAInt);
+    deviceAxpy(1.0, fInt, phiInt);
+    deviceCopy(phiBnd, phiHbyABnd);
+    deviceAxpy(1.0, fBnd, phiBnd);
+}
+
+
+// fvOptions.correct(he) for limitTemperature: clamp he between he(p,Tmin) and he(p,Tmax). A CORRECTION,
+// so nothing in the assembly changes -- it acts on the solved field and then thermo.correct() turns it
+// into a temperature. The bounds arrive already in energy; see the note in RhoStepInput.
+//
+// COUNTING, because OpenFOAM reports how many cells it touched (limitTemperature.C:200-215) and a clamp
+// that says nothing looks the same whether it moved one cell or all of them. The two counters are the
+// only extra work: they are incremented on the branch the clamp already takes, so the arithmetic is
+// unchanged and `fmin(fmax(...))` becomes the equivalent if/else OpenFOAM itself writes.
+//
+// THE BOUNDS ARE PER CELL, built here from the cell's own pressure: OpenFOAM's are
+// `thermo.he(thermo.p(), Tmin, cells_)` (limitTemperature.C:156-157), a field over p. They used to arrive
+// as two numbers the driver converted once with the perfect-gas closed form -- exact for hConst, whose
+// he does not see p, and a clamp to the wrong temperature for a liquid, whose Es carries -p/rho(T).
+__global__ void limitEnergyKernel(
+    int    nC,
+    const scalar* __restrict__ p,
+    scalar Tmin,
+    scalar Tmax,
+    ThermoCoeffs th,
+    scalar* __restrict__ he,
+    int* __restrict__ nBelow,
+    int* __restrict__ nAbove)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    const scalar heMin = thermoHeOf(p[c], Tmin, th);
+    const scalar heMax = thermoHeOf(p[c], Tmax, th);
+    if (he[c] < heMin)
+    {
+        he[c] = heMin;
+        if (nBelow) atomicAdd(nBelow, 1);
+    }
+    else if (he[c] > heMax)
+    {
+        he[c] = heMax;
+        if (nAbove) atomicAdd(nAbove, 1);
+    }
+}
+
+// ...and the boundary pass: every face whose patch does not fix a value, clamped between he(p_b, Tmin)
+// and he(p_b, Tmax) at the FACE's pressure (limitTemperature.C:229-272). fixesValue() is the predicate
+// thermoCorrectBndKernel uses -- fixedValue, and every mixed-derived face whatever its flux sign
+// (mixedFvPatchField.H:197) -- not bcType == 1 alone, which is what the previous kernel tested: it
+// clamped an inletOutlet outflow face OpenFOAM leaves alone. Unobservable then, since thermo.correct()
+// rewrites he_b on exactly those faces straight after, and matched to OpenFOAM's test now.
+__global__ void limitEnergyBndKernel(
+    int    nB,
+    const label* __restrict__ bcType,
+    const label* __restrict__ ioMask,
+    const label* __restrict__ oioMask,
+    const label* __restrict__ mixedMask,
+    const scalar* __restrict__ pBnd,
+    scalar Tmin,
+    scalar Tmax,
+    ThermoCoeffs th,
+    scalar* __restrict__ heBnd)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nB) return;
+    const bool fixes = bcType[i] == 1
+                    || (ioMask    && ioMask[i])
+                    || (oioMask   && oioMask[i])
+                    || (mixedMask && mixedMask[i]);
+    if (fixes) return;
+    const scalar lo = thermoHeOf(pBnd[i], Tmin, th);
+    const scalar hi = thermoHeOf(pBnd[i], Tmax, th);
+    if      (heBnd[i] < lo) heBnd[i] = lo;
+    else if (heBnd[i] > hi) heBnd[i] = hi;
+}
+
+// fixedTemperatureConstraint's VALUE: he(p, Tuniform) at the cell's CURRENT pressure, every time the
+// constraint is applied -- `eqn.setValues(cells_, thermo.he(thermo.p(), Tuni, cells_))`
+// (fixedTemperatureConstraint.C:125-126). Evaluated over every cell because deviceSetValues reads it only
+// where the mask is set.
+__global__ void heFromPTKernel(
+    int    nC,
+    const scalar* __restrict__ p,
+    const scalar* __restrict__ T,
+    ThermoCoeffs th,
+    scalar* __restrict__ he)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    he[c] = thermoHeOf(p[c], T[c], th);
+}
+
+
+// pressureControl::limit -- a clamp, applied in place. OpenFOAM returns true on `limitMaxP || limitMinP`
+// rather than on whether any value actually moved, and the caller re-evaluates p's boundary on that
+// return, so the boundary refresh below is keyed the same way.
+__global__ void limitPressureKernel(
+    int    nC,
+    int    doMax,
+    int    doMin,
+    scalar pMax,
+    scalar pMin,
+    scalar* __restrict__ p)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    if (doMax) p[c] = fmin(p[c], pMax);
+    if (doMin) p[c] = fmax(p[c], pMin);
+}
+
+
+// The closed-volume correction: p += (initialMass - domainIntegrate(psi*p))/domainIntegrate(psi).
+// Two reductions and a scalar add; done on the host because it is two numbers, and the alternative is a
+// device reduction whose result has to come back anyway.
+void closedVolumeCorrection(
+    DeviceBuffer<scalar>&       p,
+    const DeviceBuffer<scalar>& psi,
+    const DeviceMesh&           dm,
+    double                      initialMass)
+{
+    const std::vector<scalar> hp = p.host(), hpsi = psi.host(), V = dm.V.host();
+    double num = 0.0, den = 0.0;
+    for (int c = 0; c < dm.nCells; ++c)
+    {
+        num += (double)hpsi[c] * (double)hp[c] * (double)V[c];
+        den += (double)hpsi[c] * (double)V[c];
+    }
+    // SILENTLY SKIPPED before, which is a third answer: OpenFOAM divides by zero and puts a NaN in p,
+    // the host arm now refuses, and this arm quietly dropped the correction and carried on. Every
+    // OpenFOAM liquid returns psi = 0 outright (liquidPropertiesI.H:100-103), so this is the closed-
+    // volume liquid case, and dropping the mass correction there is not an approximation of it -- the
+    // whole point of the term is that a closed volume has no other way to set p's level.
+    //
+    // The test is on `den`, not on the thermo's name, so it is a property of the equation. See the same
+    // guard and the same wording in the host arm (rhoSimpleFoam_cpp.cu).
+    if (den == 0.0)
+        throw std::runtime_error(
+            "rhoSimpleFoam pEqn (CUDA): the case is a CLOSED VOLUME (adjustPhi found no adjustable "
+            "outflow, so p needs a reference) and the thermo's compressibility psi is identically zero. "
+            "OpenFOAM's own correction, p += (initialMass - domainIntegrate(psi*p))/domainIntegrate(psi) "
+            "(pEqn.H:94-98), divides by zero here and puts a NaN in p. Refusing rather than reproducing "
+            "that -- or, as this arm used to, silently dropping the correction that sets p's level. Give "
+            "p a boundary that fixes its value, or use a thermo with a non-zero psi.");
+    if (den < 0.0) return;
+    const scalar dp = (scalar)((initialMass - num) / den);
+    std::vector<scalar> out(hp);
+    for (int c = 0; c < dm.nCells; ++c) out[c] += dp;
+    p.copyFrom(out);
+}
+
+// p.relax() on the totalPressure faces. GeometricField::relax assigns BOTH halves through operator==
+// (GeometricField.C:1094, :1420), so the patch VALUE OpenFOAM carries out of p.relax() is the blend
+// prevIter_b + alpha*(p_b - prevIter_b). On the device that value lives in refValue -- deviceBCValue
+// reproduces a fixedValue face from it -- so the blended f.pBnd is written back there on the faces
+// tpMask marks. Every other fixedValue face is unchanged by the blend, and every zeroGradient face is
+// re-derived from the relaxed cell: the same function on the same operands, bit for bit.
+__global__
+void storeTotalPressureValueKernel(
+    int    n,
+    const label*  __restrict__ tpMask,
+    const scalar* __restrict__ pBnd,
+    scalar*       __restrict__ refValue)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || !tpMask[i]) return;
+    refValue[i] = pBnd[i];
+}
+
+// The forward twin of storeTotalPressureValueKernel: a fresh evaluate taken onto f.pBnd on the
+// totalPressure faces ONLY, every other face keeping the value its last evaluate (or p.relax) left.
+__global__
+void takeTotalPressureFacesKernel(
+    int    n,
+    const label*  __restrict__ tpMask,
+    const scalar* __restrict__ fresh,
+    scalar*       __restrict__ pBnd)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || !tpMask[i]) return;
+    pBnd[i] = fresh[i];
+}
+
+} // namespace
+
+
+// Instrument: BRAE_STAGE_DUMP_DIR=<dir> (+ BRAE_STAGE_DUMP_ITER=n, default 1) writes this step's stages
+// at ONE iteration as plain columns, the device twin of the host step's StageDump (rhoSimpleFoam_cpp.cu):
+// same names, same layout (vectors as three columns; a surface field as the internal faces plus one
+// `_b` file holding every boundary face in patch order), so the two arms can be held against each
+// other stage by stage from the SAME in-memory trajectory. Costs nothing unless the variable is set.
+namespace
+{
+struct DeviceStageDump
+{
+    std::string dir;
+    bool        on = false;
+
+    void scalars(const char* name, const DeviceBuffer<scalar>& v) const
+    {
+        if (!on) return;
+        const std::vector<scalar> h = v.host();
+        std::FILE* fp = std::fopen((dir + "/" + name).c_str(), "w");
+        if (!fp) return;
+        for (scalar x : h) std::fprintf(fp, "%.17g\n", (double)x);
+        std::fclose(fp);
+    }
+    void vectors(const char* name, const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& z) const
+    {
+        if (!on) return;
+        const std::vector<scalar> hx = x.host(), hy = y.host(), hz = z.host();
+        std::FILE* fp = std::fopen((dir + "/" + name).c_str(), "w");
+        if (!fp) return;
+        for (std::size_t i = 0; i < hx.size(); ++i)
+            std::fprintf(fp, "%.17g %.17g %.17g\n", (double)hx[i], (double)hy[i], (double)hz[i]);
+        std::fclose(fp);
+    }
+    void surface(const char* name, const DeviceBuffer<scalar>& internal, const DeviceBuffer<scalar>& bnd) const
+    {
+        if (!on) return;
+        scalars(name, internal);
+        scalars((std::string(name) + "_b").c_str(), bnd);
+    }
+};
+
+DeviceStageDump deviceStageDump()
+{
+    DeviceStageDump d;
+    const char* dd = std::getenv("BRAE_STAGE_DUMP_DIR");
+    if (!dd) return d;
+    static int calls = 0;
+    const char* it = std::getenv("BRAE_STAGE_DUMP_ITER");
+    d.dir = dd;
+    d.on  = (++calls == (it ? std::atoi(it) : 1));
+    return d;
+}
+} // namespace
+
+// flowRateInletVelocity's updateCoeffs: avgU = -mdot/gSum(rho*magSf) against rho's PATCH value as it
+// stands (flowRateInletVelocityFvPatchVectorField.C:210-220, lookupPatchField(rhoName_)). Called where
+// OpenFOAM reaches that updateCoeffs: the momentum assembly, and the velocity correction's
+// correctBoundaryConditions, where rho's patch value has moved since the assembly (the host step carries
+// the sbMatched measurement, queue item 26).
+//
+// f.U*Bnd GO WITH IT. updateCoeffs here ends in `operator==(avgU*n)` -- an assignment to the patch
+// VALUE, not to a refValue that a later evaluate turns into one -- and this driver keeps its own
+// boundary-value arrays which the momentum assembly hands to deviceDivDevReff as UbStored, so
+// fvc::grad(U) inside dev2(T(grad(U))) reads them directly. Updating the refValue alone left that
+// gradient differentiating against 0/U's file seed until the post-solve refresh: on validation/rhoTI the
+// assembly saw 50 where OpenFOAM had 50.687834607787899, worth USrcX 7.3e-06 in the two inlet columns
+// and U 8.945e-06 over the field at iteration 1, decaying as the seed's influence washed out. Invisible
+// in every written field, because the correction's deviceBCValue refreshes the arrays before the write.
+static void updateFlowRateInlets(
+    RhoSolverFields&       f,
+    const RhoStepInput&    in,
+    DeviceVectorBoundary&  dbU)
+{
+    if (!(in.frMagSf && in.frMdot && in.frNx && in.frNy && in.frNz)) return;
+    for (std::size_t k = 0; k < in.frMagSf->size() && k < in.frMdot->size(); ++k)
+    {
+        // OF's divisor: gSum(rho*magSf) for a mass rate, gSum(magSf) for a volumetric one
+        // (flowRateInletVelocityFvPatchVectorField.C:201-237 -- the volumetric branch passes one{}).
+        const bool isMass = !in.frIsMass || k >= in.frIsMass->size() || (*in.frIsMass)[k] != 0;
+        // deviceSumMag, not a plain sum: the mask holds magSf on the patch and 0 elsewhere, both
+        // non-negative, so |.| is the identity here and there is no separate sum reduction to add.
+        const scalar sumRhoA = isMass ? deviceDot(f.rhoBnd, (*in.frMagSf)[k])
+                                      : deviceSumMag((*in.frMagSf)[k]);
+        if (sumRhoA <= scalar(0)) continue;
+        deviceUpdateFlowRateInlet(dbU, (*in.frMagSf)[k], -(*in.frMdot)[k] / sumRhoA,
+                                  *in.frNx, *in.frNy, *in.frNz,
+                                  &f.UxBnd, &f.UyBnd, &f.UzBnd);
+    }
+}
+
+// updateCoeffs() for the boundary conditions whose coefficients are a function of the SOLUTION.
+//
+// A named function rather than a run of statements inside the step, because it has a contract of its own
+// that is worth testing on its own: given a flux and a boundary density, it must produce the patch
+// coefficients OpenFOAM's updateCoeffs() would. The driver's gate exercises it directly -- doubling the
+// boundary density must halve a flowRateInletVelocity's velocity, and reversing the flux must flip an
+// inletOutlet face between fixedValue and zeroGradient -- and neither of those is visible from a
+// whole-iteration comparison on a fixture whose patches have no coefficients that move.
+void updateBoundaryCoeffs(
+    RhoSolverFields&      f,
+    DeviceVectorBoundary& dbU,
+    DeviceBoundary&       dbP,
+    DeviceBoundary&       dbHe,
+    DeviceBoundary&       dbT,
+    const RhoStepInput&   in)
+{
+    // OpenFOAM runs this inside the fvMatrix constructor, so it has happened before any coefficient is
+    // read. Here the device boundary objects are a snapshot and the driver has to do it by hand; the
+    // order is the reference driver's, which is OpenFOAM's.
+    //
+    // 1. The FLUX SWITCH. inletOutlet/outletInlet pick fixedValue or zeroGradient per face from the sign
+    //    of phi, and OpenFOAM lags it: the flux used is the one this iteration STARTS with. U, he and T
+    //    are the fields that carry one on a compressible case.
+    //
+    //    dbT is refreshed even though nothing in THIS function reads it. T's boundary is consumed by
+    //    thermo.correct(), which is the caller's hook; a host thermo evaluates T's patches on its own
+    //    host field and will not notice, but a device-resident one reads dbT and would otherwise get a
+    //    flux switch frozen at its seeded state. Refreshing it here keeps the two thermo implementations
+    //    interchangeable, which is the whole point of the hook being a hook.
+    deviceUpdateInletOutlet(dbU, f.phiBnd);
+    deviceUpdateInletOutlet(dbHe, f.phiBnd);
+    deviceUpdateInletOutlet(dbT, f.phiBnd);
+
+    // 2. The FREESTREAM BLEND, a different rule from the switch above: valueFraction is rebuilt from the
+    //    current flow ANGLE, 0.5 - 0.5*(Up & nf)/mag(Up), and freestreamPressure follows the velocity
+    //    patch. Left alone, every far-field face keeps the half-and-half blend it was seeded with.
+    //    U only here: freestreamPressure's valueFraction is rebuilt inside the pressure fvMatrix constructor
+    //    (below, before the assembly) and under the limiter, and p's boundary is read AS IT STANDS by the
+    //    momentum gradient -- the relaxed blend, or the limiter's re-evaluation (queue items 23 and 25).
+    if (in.hasMixed)
+    {
+        deviceUpdateMixedFreestream(dbU, dbP, f.phiBnd, f.Ux, f.Uy, f.Uz, &f.rhoBnd, /*which=*/1,
+                                                     &f.UxBnd, &f.UyBnd, &f.UzBnd);
+    }
+
+    // 2b. pressureInletOutletVelocity, whose updateCoeffs OpenFOAM reaches inside the momentum fvMatrix
+    //     constructor (fvMatrix.C:396). It is not a coefficient update alone: it sets valueFraction =
+    //     neg(phi)*(I - nn) from the flux THIS iteration starts with and then calls directionMixed::evaluate
+    //     itself (pressureInletOutletVelocityFvPatchVectorField.C:180-183), so the patch VALUE at the
+    //     assembly is n(n & U_cell) on inflow faces from the cell velocity as it stands here -- the number
+    //     the previous iteration's post-correction evaluate left, and at iteration 1 what OpenFOAM computes
+    //     too, so the 0/U seed never reaches a momentum assembly.
+    //
+    //     totalPressure is NOT updated here any more. OpenFOAM reaches p's updateCoeffs only inside the
+    //     PRESSURE equation's constructor (once the momentum solve has moved U's patch value), so what
+    //     -fvc::grad(p) reads at the momentum assembly is the value the previous tail left: the relaxed
+    //     blend from p.relax(), or the recompute pEqn.H:100-103 runs after the limiter. Updating it here
+    //     from the pre-solve velocity put a one-solve-old dynamic head into the pressure equation and a
+    //     fresh value where OpenFOAM carries the blend: rhoTP at t=1 read U 2.3e-01 relL2 against
+    //     OpenFOAM on this arm with the written inlet still at the (5 0 0) seed.
+    {
+        deviceUpdatePressureInletOutletVelocity(dbU, f.phiBnd, f.Ux, f.Uy, f.Uz, /*directionMixed=*/true);
+        // symmetry/slip and wedge, against THIS iteration's cell velocity -- the header's caller
+        // contract has listed both since it was written (rhoUEqn.cuh, clause 3), and the incompressible
+        // driver has always run them (device_simple_foam.cu:955-956); this driver did not, which no
+        // axis-aligned fixture could see: with n along one axis the per-component vf=|n_k| decouples
+        // and the stale snapshot equals the fresh one. A TILTED symmetry plane (rhoBoxSym) couples the
+        // components and is where the missing calls measured.
+        deviceUpdateSymmetry(dbU, f.Ux, f.Uy, f.Uz);
+        deviceUpdateWedge(dbU, f.Ux, f.Uy, f.Uz);
+    }
+
+    // 3. flowRateInletVelocity, and WHICH rho matters: avgU = -mdot/gSum(rho*magSf) is held against the
+    //    boundary density the flux is actually carrying -- the solver's relaxed rho, which is what
+    //    f.rhoBnd holds here -- not thermo.rho(). Feeding it the other one is the angledDuct defect,
+    //    where the inlet quietly lost the prescribed mass flow. Last, because it reads that rho.
+    updateFlowRateInlets(f, in, dbU);
+}
+
+
+// ---------------------------------------------------------------------------------------------------
+// BRAE_PHASE_TIME (item 67): where the mirror's outer iteration goes. Off unless the variable is set --
+// attributing device work needs a synchronise at each boundary, and that is itself a cost, so the
+// instrument must not be part of a measured run. The V2 driver has carried a hook split since item 54;
+// the mirror had none, so its per-iteration cost could not be attributed at all. The marks are the
+// step's own section boundaries, so what falls between pEqn and turbulence->correct() (the closing
+// stage dumps) is charged to the pressure phase.
+namespace
+{
+double g_tU = 0.0, g_tE = 0.0, g_tP = 0.0, g_tTurb = 0.0;
+// ...and, inside three of them, the linear SOLVE alone (the call returns after the residual readback,
+// so wall time here is the solve's). What a phase spends outside its solve is assembly and corrections.
+double g_tUsol = 0.0, g_tEsol = 0.0, g_tPsol = 0.0;
+std::chrono::steady_clock::time_point g_phaseMark, g_solveMark;
+bool phaseTimeOn()
+{
+    static const bool on = std::getenv("BRAE_PHASE_TIME") != nullptr;
+    return on;
+}
+// ...and the same boundaries as NVTX ranges, so a profiler can attribute kernels and GAPS to a phase.
+// Without them the timeline says what ran and not which equation it belonged to, and after the solver
+// work the question that matters is where the IDLE sits: at 306k the four phases are ~55 ms per outer
+// iteration of wall against ~29 ms of GPU-busy time spread over ~910 launches.
+bool phaseNvtxOn()
+{
+    static const bool on = std::getenv("BRAE_PHASE_NVTX") != nullptr;
+    return on;
+}
+int g_nvtxDepth = 0;
+void phaseRange(const char* name)
+{
+    if (!phaseNvtxOn()) return;
+    if (g_nvtxDepth > 0)
+    {
+        nvtxRangePop();
+        --g_nvtxDepth;
+    }
+    if (name)
+    {
+        nvtxRangePushA(name);
+        ++g_nvtxDepth;
+    }
+}
+// charge the time since the last mark to `slot` (null = start the clock), then restart it
+void phaseMark(double* slot)
+{
+    if (!phaseTimeOn()) return;
+    cudaDeviceSynchronize();
+    const auto now = std::chrono::steady_clock::now();
+    if (slot) *slot += std::chrono::duration<double>(now - g_phaseMark).count();
+    g_phaseMark = now;
+}
+}   // namespace
+
+void solveMarkBegin()
+{
+    if (phaseTimeOn()) g_solveMark = std::chrono::steady_clock::now();
+}
+void solveMarkEnd(double* slot)
+{
+    if (!phaseTimeOn()) return;
+    *slot += std::chrono::duration<double>(std::chrono::steady_clock::now() - g_solveMark).count();
+}
+void rhoPhaseTimeReport(int iterations)
+{
+    if (!phaseTimeOn() || iterations <= 0) return;
+    const double tot = g_tU + g_tE + g_tP + g_tTurb;
+    std::printf("  [phase] over %d iterations: UEqn %.3f s (%.1f ms/it), EEqn %.3f s (%.1f ms/it), "
+                "pEqn %.3f s (%.1f ms/it), turbulence %.3f s (%.1f ms/it); the four total %.3f s (%.1f ms/it)\n",
+                iterations,
+                g_tU,    1e3 * g_tU    / iterations,
+                g_tE,    1e3 * g_tE    / iterations,
+                g_tP,    1e3 * g_tP    / iterations,
+                g_tTurb, 1e3 * g_tTurb / iterations,
+                tot,     1e3 * tot     / iterations);
+    const double n = static_cast<double>(iterations);
+    std::printf("  [phase] of which the linear solves: U %.3f s (%.1f ms/it), he %.3f s (%.1f ms/it), p %.3f s (%.1f ms/it)\n",
+                g_tUsol, 1e3 * g_tUsol / n, g_tEsol, 1e3 * g_tEsol / n, g_tPsol, 1e3 * g_tPsol / n);
+}
+
+namespace {
+
+// The object registry an `expression` PatchFunction1 reads, on the device arm: the solver's device
+// fields by the names OpenFOAM registers them under, downloaded on demand and gathered at the patch's
+// face cells. The patch VALUE is the flat boundary array (TBnd for T), the same array deviceBCValue
+// writes -- OpenFOAM's boundaryField()[patch]. snGrad(x) is carried for the patch's OWN field only, where
+// the patch is a fixedValue and OpenFOAM's virtual is deltaCoeffs*(value - patchInternalField); on any
+// other field the patch class there is not known here, and it is refused by name rather than evaluated
+// with the fixedValue formula.
+class DevicePatchExprContext : public PatchExprContext
+{
+public:
+    DevicePatchExprContext(const PatchExprBinding& b, scalar time, scalar deltaT, const RhoSolverFields& f,
+                           const std::string& heName)
+        : b_(b), time_(time), deltaT_(deltaT), f_(f)
+    {
+        reg("T", &f.T, &f.TBnd);
+        reg("p", &f.p, &f.pBnd);
+        reg("rho", &f.rho, &f.rhoBnd);
+        if (!heName.empty()) reg(heName, &f.he, &f.heBnd);
+        reg("k", &f.k, nullptr);
+        reg("epsilon", &f.epsilon, nullptr);
+        reg("nut", &f.nut, &f.nutBnd);
+        reg("alphat", &f.alphat, &f.alphatBnd);
+    }
+    scalar timeValue() const override { return time_; }
+    scalar deltaT() const override { return deltaT_; }
+    bool scalarPatchValue(const std::string& name, std::vector<scalar>& out) const override
+    {
+        const Reg* r = find(name);
+        if (!r) return false;
+        if (!r->bnd || r->bnd->size() == 0)
+            throw std::runtime_error("brae: " + b_.fn->spec().origin + ": the expression reads the patch value of `"
+                                     + name + "`, whose patch values the device arm does not keep as a flat "
+                                     "array. Refusing rather than substituting the cell values.");
+        const std::vector<scalar> all = r->bnd->host();
+        out.assign(all.begin() + b_.bndOffset, all.begin() + b_.bndOffset + b_.fvp->size);
+        return true;
+    }
+    bool scalarPatchInternal(const std::string& name, std::vector<scalar>& out) const override
+    {
+        const Reg* r = find(name);
+        if (!r) return false;
+        gather(r->cells->host(), out);
+        return true;
+    }
+    bool scalarPatchSnGrad(const std::string& name, std::vector<scalar>& out) const override
+    {
+        const Reg* r = find(name);
+        if (!r) return false;
+        if (name != "T")
+            throw std::runtime_error("brae: " + b_.fn->spec().origin + ": snGrad(" + name + ") on the CUDA arm is "
+                                     "evaluated only for the patch's own field T (a fixedValue there); on `"
+                                     + name + "` the patch class's snGrad is not known here. Refusing rather "
+                                     "than applying the fixedValue formula.");
+        std::vector<scalar> pv, pif;
+        scalarPatchValue(name, pv);
+        scalarPatchInternal(name, pif);
+        out.resize(pv.size());
+        for (std::size_t i = 0; i < out.size(); ++i) out[i] = b_.fvp->deltaCoeffs[i] * (pv[i] - pif[i]);
+        return true;
+    }
+    bool vectorPatchValue(const std::string& name, std::vector<vector>& out) const override
+    {
+        if (name != "U") return false;
+        const std::vector<scalar> x = f_.UxBnd.host(), y = f_.UyBnd.host(), z = f_.UzBnd.host();
+        out.resize(static_cast<std::size_t>(b_.fvp->size));
+        for (std::size_t i = 0; i < out.size(); ++i)
+        {
+            const std::size_t k = static_cast<std::size_t>(b_.bndOffset) + i;
+            out[i] = vector{x[k], y[k], z[k]};
+        }
+        return true;
+    }
+    bool vectorPatchInternal(const std::string& name, std::vector<vector>& out) const override
+    {
+        if (name != "U") return false;
+        const std::vector<scalar> x = f_.Ux.host(), y = f_.Uy.host(), z = f_.Uz.host();
+        out.resize(static_cast<std::size_t>(b_.fvp->size));
+        for (std::size_t i = 0; i < out.size(); ++i)
+        {
+            const std::size_t c = static_cast<std::size_t>(b_.fvp->faceCells[i]);
+            out[i] = vector{x[c], y[c], z[c]};
+        }
+        return true;
+    }
+    std::string registeredNames() const override
+    {
+        std::string s = "U";
+        for (const Reg& r : regs_) s += ", " + r.name;
+        return s;
+    }
+private:
+    struct Reg
+    {
+        std::string                 name;
+        const DeviceBuffer<scalar>* cells;
+        const DeviceBuffer<scalar>* bnd;
+    };
+    void reg(const std::string& name, const DeviceBuffer<scalar>* cells, const DeviceBuffer<scalar>* bnd)
+    {
+        if (cells && cells->size() > 0) regs_.push_back(Reg{name, cells, bnd});
+    }
+    const Reg* find(const std::string& name) const
+    {
+        for (const Reg& r : regs_)
+            if (r.name == name) return &r;
+        return nullptr;
+    }
+    void gather(const std::vector<scalar>& cells, std::vector<scalar>& out) const
+    {
+        out.resize(static_cast<std::size_t>(b_.fvp->size));
+        for (std::size_t i = 0; i < out.size(); ++i)
+            out[i] = cells[static_cast<std::size_t>(b_.fvp->faceCells[i])];
+    }
+    const PatchExprBinding& b_;
+    scalar                  time_;
+    scalar                  deltaT_;
+    const RhoSolverFields&  f_;
+    std::vector<Reg>        regs_;
+};
+
+// uniformFixedValue::updateCoeffs for every `expression` patch on T: value(t) on the host, operator==
+// into the device patch's refValue slice.
+void evaluatePatchExpressions(
+    const std::vector<PatchExprBinding>& bindings,
+    scalar                               time,
+    scalar                               deltaT,
+    const RhoSolverFields&               f,
+    const std::string&                   heName,
+    DeviceBoundary&                      dbT)
+{
+    for (const PatchExprBinding& b : bindings)
+    {
+        if (!b.fn || !b.fvp || b.fvp->size == 0) continue;
+        DevicePatchExprContext ctx(b, time, deltaT, f, heName);
+        const std::vector<scalar> v = b.fn->value(time, ctx, b.fvp->size);
+        if (static_cast<std::size_t>(b.bndOffset + b.fvp->size) > dbT.refValue.size())
+            throw std::runtime_error("brae: the expression patch's faces fall outside the device boundary arrays.");
+        cudaCheck(cudaMemcpy(dbT.refValue.data() + b.bndOffset, v.data(),
+                             v.size() * sizeof(scalar), cudaMemcpyHostToDevice),
+                  "patch expression refValue H2D");
+    }
+}
+
+} // namespace
+
+Residuals rhoSimpleStep(
+    RhoSolverFields&            f,
+    RhoSolverWorkspace&         w,
+    const DeviceMesh&           dm,
+    // NON-const: the updateCoeffs() block at the top of the step rewrites refValue and valueFraction on
+    // the patches that switch on the flux, blend on the flow angle, or carry a prescribed mass flow.
+    DeviceVectorBoundary&       dbU,
+    DeviceBoundary&             dbP,
+    DeviceBoundary&             dbHe,
+    DeviceBoundary&             dbT,
+    const RhoStepInput&         in)
+{
+    Residuals res;
+    const int nC = dm.nCells;
+
+    // rho.prevIter(), stored where OpenFOAM stores it. simpleControl::loop() calls storePrevIterFields()
+    // at the START of the iteration (simpleControl.C:157) and rho.relax() at the tail is
+    // prevIter + alpha*(rho - prevIter) (GeometricField.C:1089-1095); pcEqn.H:1's `rho = thermo.rho()`
+    // does not touch prevIter. This capture used to sit at the tail, one line before the tail's own
+    // updateRho -- exact on the pEqn branch, where rho does not move in between, and wrong on the
+    // SIMPLEC branch, whose pcEqn.H opens with rho = thermo.rho(): the relaxation then blended towards
+    // that mid-iteration density instead of the one the iteration started with. No fixture could see it
+    // (every consistent+subsonic one relaxes rho at 1.0); the gate is rhoBox with `consistent yes` and
+    // `rho 0.5`, both arms against OpenFOAM at a matched iteration count.
+    DeviceBuffer<scalar> rhoPrevIter, rhoBndPrevIter;
+    deviceCopy(rhoPrevIter, f.rho);
+    deviceCopy(rhoBndPrevIter, f.rhoBnd);
+
+    if (!in.muEffCell || !in.muEffBndFace || !in.alphaEffCell || !in.alphaEffBndFace)
+    {
+        throw std::runtime_error(
+            "rhoSimpleFoam(cuda): muEff and alphaEff are required on cells AND boundary faces. They are "
+            "the ONLY place the closure enters the momentum and energy equations, and the boundary value "
+            "is the patch's, not the owner cell's -- on a wall with an alphat wall function the two "
+            "differ by the whole of alphat.");
+    }
+    if (!in.thermoCorrect || !in.updateRho)
+    {
+        throw std::runtime_error(
+            "rhoSimpleFoam(cuda): thermoCorrect and updateRho are required hooks. EEqn.H ends in "
+            "thermo.correct(), which moves T and therefore psi, and every consumer below that point "
+            "reads the result; pcEqn.H opens with rho = thermo.rho(). Running without them would solve "
+            "the whole iteration against the state it started with.");
+    }
+
+    if (w.ones.size() != static_cast<std::size_t>(nC))
+    {
+        w.ones.copyFrom(std::vector<scalar>(nC, scalar(1.0)));
+    }
+
+    // storePrevIter(): OpenFOAM banks prevIter at the TOP of the iteration, so p.relax() below relaxes
+    // against the value p had before this iteration touched it -- not against the value it had at the
+    // start of the pressure solve.
+    DeviceBuffer<scalar> pPrev, pBndPrev;
+    deviceCopy(pPrev, f.p);
+    // BOTH halves: p.relax() assigns the boundary too (GeometricField.C:1094, :1420), and the
+    // totalPressure inlet is a patch whose value moves between here and the tail -- it is recomputed
+    // before the pressure assembly -- so the blend has to be against the value the iteration started with.
+    deviceCopy(pBndPrev, f.pBnd);
+
+    // THE BOUNDARY THE MOMENTUM LIMITER SEES, snapshotted here because updateBoundaryCoeffs below is
+    // brae's stand-in for fvMatrix.C:396, which OpenFOAM runs AFTER the convection scheme has taken its
+    // limiter gradient (gaussConvectionScheme.C:84). The host step does the same (UPreUpdateBnd).
+    DeviceBuffer<scalar> UPreUpdateBnd[3];
+    deviceCopy(UPreUpdateBnd[0], f.UxBnd);
+    deviceCopy(UPreUpdateBnd[1], f.UyBnd);
+    deviceCopy(UPreUpdateBnd[2], f.UzBnd);
+
+    updateBoundaryCoeffs(f, dbU, dbP, dbHe, dbT, in);
+
+    // ---- UEqn.H ------------------------------------------------------------------------------
+    phaseMark(nullptr);
+    phaseRange("UEqn");
+    RhoMomentumInput uin;
+    uin.phiInt = &f.phiInt;          uin.phiBnd = &f.phiBnd;
+    uin.rhoCell = &f.rho;            uin.rhoBndFace = &f.rhoBnd;
+    // THE DYNAMIC SLOT, NOT THE KINEMATIC ONE. RhoMomentumInput carries both: muEffCell/muEffBndFace are
+    // used verbatim, while nuEffCell/nuEffBndFace are KINEMATIC and the module forms rho*nuEff from them
+    // (linearViscousStress.C:107-117). Feeding the dynamic muEff into the kinematic slot multiplies it by
+    // rho a second time -- measured on rhoBox as a constant 1.161 on the whole diffusion term, which is
+    // exactly p/(R*T) = 100000/(287.1*300) there, and it reached the converged velocity as a drift of
+    // 5.4e-04 at iteration 1 growing to 3.9e-03 by iteration 8 while p, T and he all stayed at ~1e-7.
+    uin.muEffCell = in.muEffCell;    uin.muEffBndFace = in.muEffBndFace;
+    uin.UxBndFace = &f.UxBnd;        uin.UyBndFace = &f.UyBnd;        uin.UzBndFace = &f.UzBnd;
+    uin.UxPreUpdateBnd = &UPreUpdateBnd[0];
+    uin.UyPreUpdateBnd = &UPreUpdateBnd[1];
+    uin.UzPreUpdateBnd = &UPreUpdateBnd[2];
+    uin.gradMagSqrULeastSq = in.gradMagSqrULeastSq;
+    uin.gradMagSqrULimitK  = in.gradMagSqrULimitK;
+    uin.relaxU = in.relaxU;
+    uin.relaxEquationU = in.relaxEquationU;
+    uin.bounded = in.boundedU;
+    uin.scheme = in.schemeU;
+    uin.schemeCoeff = in.schemeCoeffU;
+    uin.gradULimitK = in.gradULimitK;
+    uin.gradULULimitK = in.gradULULimitK;
+    uin.gradULeastSq  = in.gradULeastSq;
+    uin.correctedLaplacian = in.correctedLaplacian;
+    uin.snGradLimitCoeff = in.snGradLimitCoeff;
+    // The porosity the momentum module has always been able to apply, and which the driver never passed.
+    uin.porosity = in.porosity;
+    uin.hasMRF = in.hasMRF;
+    uin.hasFvOptions = in.hasFvOptions;
+    uin.hasCoupledPatches = in.hasCoupledPatches;
+    uin.fvOptionUnsupported = in.fvOptionUnsupported;
+
+    const DeviceStageDump sd = deviceStageDump();
+    sd.vectors("Uass", f.Ux, f.Uy, f.Uz);
+    sd.scalars("UassBx", f.UxBnd);
+    sd.scalars("UassBy", f.UyBnd);
+    sd.scalars("UassBz", f.UzBnd);
+    sd.scalars("rhoU", f.rho);
+    sd.surface("phiU", f.phiInt, f.phiBnd);
+    sd.scalars("nutU", f.nut);
+    MomentumMatrix UEqn;
+    assembleUEqn(UEqn, dm, dbU, f.Ux, f.Uy, f.Uz, uin);
+    sd.scalars("UDiag", UEqn.diag);
+    sd.scalars("UUpper", UEqn.upper);
+    sd.scalars("ULower", UEqn.lower);   // the convection makes it differ from upper; the solver experiments need both
+    sd.scalars("USrcX", UEqn.source[0]);
+    sd.scalars("USrcY", UEqn.source[1]);
+    sd.scalars("USrcZ", UEqn.source[2]);
+    sd.scalars("muEffAss", *in.muEffCell);
+
+    {
+        // solve(UEqn == -fvc::grad(p)) on a COPY. The pressure equation needs the ORIGINAL for A(), H()
+        // and H1(); adding grad(p) here would leave the source carrying it and move rAU and HbyA with it.
+        MomentumMatrix Mp;
+        deviceCopy(Mp.diag, UEqn.diag);
+        deviceCopy(Mp.upper, UEqn.upper);
+        deviceCopy(Mp.lower, UEqn.lower);
+        deviceCopy(Mp.relaxedDiag, UEqn.relaxedDiag);
+        Mp.relaxed = UEqn.relaxed;
+        for (int k = 0; k < 3; ++k)
+        {
+            deviceCopy(Mp.source[k], UEqn.source[k]);
+            deviceCopy(Mp.iC[k], UEqn.iC[k]);
+            deviceCopy(Mp.bC[k], UEqn.bC[k]);
+        }
+
+        DeviceBuffer<scalar> gpx, gpy, gpz;
+        // f.pBnd as it stands: the relaxed blend, or the limiter's re-evaluation, never re-derived here.
+        // Through the case's grad(p) entry (fvcGrad.C:149): leastSquares where it says so.
+        if (in.gradPLeastSq) deviceLeastSquaresGrad(dm, f.p, f.pBnd, gpx, gpy, gpz);
+        else                 deviceGaussGrad(dm, f.p, f.pBnd, gpx, gpy, gpz);
+        if (in.gradPLimitK > 0.0) deviceCellLimitGrad(dm, f.p, f.pBnd, gpx, gpy, gpz, in.gradPLimitK);
+        addPressureGradient(Mp, dm, gpx, gpy, gpz);
+
+        DeviceBuffer<scalar>* U[3] = {&f.Ux, &f.Uy, &f.Uz};
+        // U's residual is cmptMax over the components OpenFOAM SOLVES: fvMatrix<vector>::solveSegregated
+        // `continue`s on every component polyMesh::solutionD() knocks out (fvMatrixSolve.C:157-164), that
+        // component's SolverPerformance stays Zero (SolverPerformance.H:117-121), and residualControl
+        // compares cmptMax over the stored vector (solutionControl.C:232, simpleControl.C:67-71).
+        //
+        // This loop reported component 0 -- wrong whenever Uy's initial residual exceeds Ux's, which
+        // on rhoBox is iterations 2, 3 and 8 (OpenFOAM at iteration 2: Ux 3.224e-01, Uy 6.042e-01; this
+        // arm printed 3.224e-01) -- and the reason it did not take a max over three is that it solved
+        // all three unconditionally: the empty direction's system has a ~0 right-hand side and a zero
+        // field, so its normFactor-scaled residual reads 1 on every iteration (measured on rhoBox: Uz
+        // 1.000e+00 at iterations 1..3), which would block convergence on every 2D case. The mask
+        // in.solutionD is derived from the empty patches exactly as calcDirections does
+        // (solution_directions.cuh) and the knocked-out component is not solved, as in OpenFOAM.
+        scalar uInitialResidual = 0.0;
+        // Every solved component's system first (its own folded diagonal and source, the shared
+        // upper/lower, its normFactor -- none reads another component's psi), then the solves: the
+        // Gauss-Seidel walks FUSED into one level walk per sweep (item 60a, byte-identical to one walk
+        // per component, tests/gs_fused_identity; BRAE_GS_FUSED=0 restores those), BiCGStab per
+        // component as before.
+        DeviceBuffer<scalar> diagC[3], b[3], dnf[3];
+        DeviceLduView A[3];
+        int solved[3];
+        int nSolved = 0;
+        for (int k = 0; k < 3; ++k)
+        {
+            if (in.solutionD[k] < 0) continue;
+            deviceFold(dm, Mp.relaxed ? Mp.relaxedDiag : Mp.diag, Mp.source[k], Mp.iC[k], Mp.bC[k], diagC[k], b[k]);
+            A[k] = foldedViewM(dm, Mp, diagC[k]);
+            deviceNormFactorInto(A[k], *U[k], b[k], w.ones, dnf[k]);   // stays on the device (item 66)
+            // The SOLVED system per component (folded, relaxed diagonal and rhs), for the offline
+            // momentum-solver experiments (bench/rhoSimpleFoam/u_precond_experiment.py). Dump only.
+            sd.scalars((std::string("UsolveDiag") + "XYZ"[k]).c_str(), diagC[k]);
+            sd.scalars((std::string("UsolveB") + "XYZ"[k]).c_str(), b[k]);
+            solved[nSolved++] = k;
+        }
+        DeviceSolverPerf perfs[3];
+        if (in.uSymGaussSeidel)
+        {
+            GSFusedComponent comps[3];
+            DeviceSolverPerf fp[3];
+            for (int i = 0; i < nSolved; ++i)
+            {
+                const int k = solved[i];
+                comps[i] = {&A[k], &b[k], U[k], 1.0, dnf[k].data()};
+            }
+            deviceSymGaussSeidelFused(nSolved, comps, in.tolU, in.relTolU, in.maxIterU, in.minIterU, in.nSweepsU,
+                                      in.uGaussSeidelSymmetric, fp);
+            for (int i = 0; i < nSolved; ++i) perfs[solved[i]] = fp[i];
+        }
+        else if (in.uColourGaussSeidel)
+        {
+            // the default momentum solver (see RhoStepInput::uColourGaussSeidel): the same fused components
+            // as the branch above, swept in COLOUR order under smoothSolver::solve's stop rule. The
+            // driver has already announced the order as an approximation; what this branch must not
+            // do is run anything else when the colouring it was promised is missing.
+            if (!in.uColouring || !in.uColouring->valid)
+                throw std::runtime_error(
+                    "brae rhoSimpleFoam (mirror): the default momentum solver selected the multicolour "
+                    "Gauss-Seidel momentum solve but RhoStepInput::uColouring is null or invalid; "
+                    "refusing rather than running a solver the notice did not name");
+            GSFusedComponent comps[3];
+            DeviceSolverPerf fp[3];
+            for (int i = 0; i < nSolved; ++i)
+            {
+                const int k = solved[i];
+                comps[i] = {&A[k], &b[k], U[k], 1.0, dnf[k].data()};
+            }
+            solveMarkBegin();
+            deviceColourGaussSeidelFused(
+                nSolved,
+                comps,
+                *in.uColouring,
+                in.tolU,
+                in.relTolU,
+                in.maxIterU,
+                in.minIterU,
+                in.nSweepsU,
+                in.uGaussSeidelSymmetric,
+                fp);
+            solveMarkEnd(&g_tUsol);
+            for (int i = 0; i < nSolved; ++i) perfs[solved[i]] = fp[i];
+        }
+        else
+        {
+            for (int i = 0; i < nSolved; ++i)
+            {
+                const int k = solved[i];
+                solveMarkBegin();
+                perfs[k] = deviceJacobiBiCGStab(A[k], b[k], *U[k], dnf[k].data(), in.tolU, in.relTolU, in.maxIterU, /*checkEvery=*/1,
+                                                in.minIterU, in.preconU);
+                solveMarkEnd(&g_tUsol);
+            }
+        }
+        for (int i = 0; i < nSolved; ++i) uInitialResidual = std::max(uInitialResidual, perfs[solved[i]].initialResidual);
+        res["U"] = uInitialResidual;
+        // Each SOLVED component's own report, for the driver's OpenFOAM-format `Solving for Ux` line
+        // (of_residual_log.cuh, BRAE_OF_LOG=1). Only the solved ones: fvMatrix<vector>::solveSegregated
+        // `continue`s on a knocked-out component (fvMatrixSolve.C:164) and OpenFOAM prints no line for
+        // it, so its absence from the map is the signal. The numbers are already on the host -- the
+        // max above read them -- so this adds map entries, not a device readback.
+        for (int i = 0; i < nSolved; ++i)
+        {
+            const int k = solved[i];
+            const std::string cmpt = std::string("U") + "xyz"[k];
+            res[cmpt] = perfs[k].initialResidual;
+            res[cmpt + "Final"] = perfs[k].finalResidual;
+            res[cmpt + "Iters"] = static_cast<scalar>(perfs[k].nIterations);
+        }
+        // The work behind the momentum number: BiCGStab iterations summed over the solved components,
+        // printed on the summary line when BRAE_PHASE_TIME is set (the block-by-block investigation).
+        if (phaseTimeOn())
+        {
+            scalar n = 0;
+            for (int i = 0; i < nSolved; ++i) n += static_cast<scalar>(perfs[solved[i]].nIterations);
+            res["uIters"] = n;
+        }
+    }
+    sd.vectors("Upred", f.Ux, f.Uy, f.Uz);
+
+    // ---- EEqn.H ------------------------------------------------------------------------------
+    phaseMark(&g_tU);
+    phaseRange("EEqn");
+    {
+        RhoEnergyInput ein;
+        ein.phiInt = &f.phiInt;           ein.phiBnd = &f.phiBnd;
+        ein.alphaEffCell = in.alphaEffCell;
+        ein.alphaEffBndFace = in.alphaEffBndFace;
+        ein.Ux = &f.Ux; ein.Uy = &f.Uy; ein.Uz = &f.Uz;
+        ein.pCell = &f.p; ein.rhoCell = &f.rho;
+        // Refreshed here, from the just-solved U: EEqn.H's kinetic-energy source is evaluated on
+        // boundary faces as well as cells, and the momentum solve above has moved every one of them.
+        //
+        // AND THE SYMMETRY/WEDGE refValue WITH THEM. deviceBCValue reproduces
+        // correctBoundaryConditions() only for a patch whose value is a function of (refValue, refGrad,
+        // internal). symmetry/slip and wedge are not those: OpenFOAM gives them no updateCoeffs at all
+        // -- symmetryPlaneFvPatchField::evaluate() is (iF + transform(I - 2*sqr(nHat), iF))/2 and
+        // wedgeFvPatchField::evaluate() is transform(cellT(), iF), both read at the moment of
+        // evaluation -- while brae carries them as a mixed refValue that some earlier kernel had to
+        // build FROM the internal field. Left unrefreshed, this call blends the new U_c towards a ref
+        // built from the U the iteration started with.
+        //
+        // AND THE piov refValue: fvMatrixSolve.C:242 ends the solve with psi.correctBoundaryConditions(),
+        // which on that patch is updateCoeffs -> evaluate again -- the NEW cell velocity projected with
+        // the flux mask the iteration started with (f.phiBnd is still that flux here).
+        deviceUpdatePressureInletOutletVelocity(dbU, f.phiBnd, f.Ux, f.Uy, f.Uz, /*directionMixed=*/true);
+        deviceUpdateSymmetry(dbU, f.Ux, f.Uy, f.Uz);
+        deviceUpdateWedge(dbU, f.Ux, f.Uy, f.Uz);
+        deviceBCValue(dbU.comp[0], f.Ux, f.UxBnd);
+        deviceBCValue(dbU.comp[1], f.Uy, f.UyBnd);
+        deviceBCValue(dbU.comp[2], f.Uz, f.UzBnd);
+        ein.UxBnd = &f.UxBnd; ein.UyBnd = &f.UyBnd; ein.UzBnd = &f.UzBnd;
+        ein.pBnd = &f.pBnd; ein.rhoBnd = &f.rhoBnd;
+        ein.isE = in.isE;
+        ein.relaxHe = in.relaxHe;
+        ein.relaxEquationHe = in.relaxEquationHe;
+        ein.boundedHe = in.boundedHe;
+        ein.boundedKE = in.boundedKE;
+        ein.schemeHe = in.schemeHe;
+        ein.schemeKE = in.schemeKE;
+        ein.gradHeLimitK = in.gradHeLimitK;
+        ein.gradKELimitK = in.gradKELimitK;
+        ein.schemeCoeffHe = in.schemeCoeffHe;
+        ein.schemeCoeffKE = in.schemeCoeffKE;
+        ein.limGradHeK    = in.limGradHeK;
+        ein.limGradKEK    = in.limGradKEK;
+        ein.limGradHeLeastSq = in.limGradHeLeastSq;
+        ein.limGradKELeastSq = in.limGradKELeastSq;
+        ein.correctedLaplacian = in.correctedLaplacian;
+        ein.snGradLimitCoeff = in.snGradLimitCoeff;
+        ein.hasMRF = in.hasMRF;
+        ein.hasFvOptions = in.hasFvOptions;
+        ein.hasCoupledPatches = in.hasCoupledPatches;
+
+        PressureMatrix E;
+        // Tw.evaluate() -- every energy condition's updateCoeffs evaluates T's patch from the cells as
+        // they stand at the energy assembly (fixedEnergy .C:108, gradientEnergy .C:109, mixedEnergy .C:97).
+        // The ONLY evaluate T's boundary gets in an iteration: thermo.correct() keeps it on fixesValue
+        // faces and inverts he_b on the rest (rhoThermoDevice.cu), so the outlet T_b -- and the rho_b,
+        // mu_b, alphaEff_b built from it -- lag the cells by one iteration exactly as OpenFOAM's do.
+        //
+        // uniformFixedValue::updateCoeffs first, where T's patch is one with an `expression` uniformValue:
+        // the expression over the fields AS THEY STAND HERE (U after the momentum solve, T's cells and T's
+        // own patch value from the previous iteration), evaluated on the host from the cells this patch
+        // touches and pushed into the device patch's refValue -- OpenFOAM's operator==. deviceBCValue
+        // below then exposes it as the patch value, as the evaluate() in Tw.evaluate() does.
+        if (in.tExpr && !in.tExpr->empty())
+            evaluatePatchExpressions(*in.tExpr, in.time, in.deltaT, f, in.heName, dbT);
+        deviceBCValue(dbT, f.T, f.TBnd);
+        // ...and the rest of every energy condition's updateCoeffs: he's own coefficients, rebuilt from
+        // the p and T that stand now -- rhoThermoDevice.cu's updateEnergyBoundaryCoeffs, the twin of the
+        // host step's energy_boundary.cuh. A no-op in value for perfectGas + hConst; the static
+        // construction-time image is wrong from the second iteration for a liquid.
+        if (in.heEnergyKind && in.heEnergyKind->size() == static_cast<std::size_t>(dbHe.n))
+            updateEnergyBoundaryCoeffs(dbHe, dbT, f.pBnd, f.TBnd, *in.heEnergyKind, in.thermo, f.heBnd);
+        // he's STORED patch values for the assembly's gradients -- see RhoEnergyInput::heBndValues.
+        if (f.heBnd.size() == static_cast<std::size_t>(dbHe.n)) ein.heBndValues = &f.heBnd;
+        assembleEEqn(E, dm, dbHe, f.he, ein);
+
+        // fvOptions.constrain(EEqn) -- EEqn.H:20, on the ASSEMBLED matrix and before the solve, which
+        // is where OpenFOAM applies it. fixedTemperatureConstraint is what lands here, and OpenFOAM
+        // pins he(p, Tuniform), not the temperature: setValues on the energy equation takes an ENERGY.
+        // The driver converts, because only it knows the thermo. Applied here rather than inside
+        // assembleEEqn because setValues writes psi as well as the matrix, and the assembly takes he
+        // by const reference -- the solve owns it.
+        if (in.fvoHeMask && in.fvoHeT
+            && in.fvoHeMask->size() == static_cast<std::size_t>(dm.nCells))
+        {
+            DeviceBuffer<scalar> heVal;
+            heVal.resize(static_cast<std::size_t>(dm.nCells));
+            heFromPTKernel<<<(dm.nCells + 255) / 256, 256>>>(dm.nCells, f.p.data(), in.fvoHeT->data(),
+                                                             in.thermo, heVal.data());
+            cudaCheck(cudaGetLastError(), "rhoSimpleFoam fixedTemperatureConstraint he(p, T)");
+            deviceSetValues(dm, *in.fvoHeMask, heVal, E.diag, E.upper, E.lower, E.source,
+                            E.iC, E.bC, f.he);
+        }
+
+        DeviceBuffer<scalar> diagC, b;
+        deviceFold(dm, E.diag, E.source, E.iC, E.bC, diagC, b);
+        const DeviceLduView A = foldedView(dm, E, diagC);
+        DeviceBuffer<scalar> dnf;
+        deviceNormFactorInto(A, f.he, b, w.ones, dnf);                // stays on the device (item 66)
+        // The solver the case asked for (item 58): `smoothSolver` + a GaussSeidel-family smoother runs
+        // OpenFOAM's own sweep, level-scheduled, under its stopping rule and its nSweeps; anything else
+        // keeps BiCGStab and is announced. squareBend and angledDuct both name a smoothSolver here.
+        DeviceSolverPerf perf;
+        solveMarkBegin();
+        if (in.heSymGaussSeidel)
+            deviceSymGaussSeidel(A, b, f.he, dnf.data(), in.tolHe, in.relTolHe, in.maxIterHe, &perf, in.minIterHe,
+                                 in.nSweepsHe, in.heGaussSeidelSymmetric);
+        else
+            perf = deviceJacobiBiCGStab(A, b, f.he, dnf.data(), in.tolHe, in.relTolHe, in.maxIterHe, /*checkEvery=*/1, in.minIterHe,
+                                        in.preconHe);
+        solveMarkEnd(&g_tEsol);
+        res[in.isE ? "e" : "h"] = perf.initialResidual;
+
+        // fvOptions.correct(he), EEqn.H:27 -- AFTER the solve and BEFORE thermo.correct(), which is what
+        // makes it reach T at all. Applying it later would clamp an energy the thermo had already turned
+        // into a temperature, and applying it earlier would clamp the field the solve is about to
+        // overwrite.
+        if (in.limitHe)
+        {
+            // T's extremes BEFORE the clamp, exactly as OpenFOAM reads thermo.T() at the top of
+            // correct(he) -- the temperature the PREVIOUS thermo.correct() left, since this iteration's
+            // runs below. Internal only: OF's min(T)/max(T) are on a scalarField, not a GeometricField.
+            DeviceBuffer<scalar> tMinMaxMean(3);
+            deviceMinMaxMeanInto(f.T, tMinMaxMean.data());
+            DeviceBuffer<label> counts(2);
+            cudaCheck(cudaMemsetAsync(counts.data(), 0, 2 * sizeof(label), cudaStreamPerThread),
+                      "rhoSimpleFoam limitEnergy counters");
+            limitEnergyKernel<<<(nC + 255) / 256, 256>>>(
+                nC, f.p.data(), in.limitTmin, in.limitTmax, in.thermo, f.he.data(),
+                reinterpret_cast<int*>(counts.data()),
+                reinterpret_cast<int*>(counts.data()) + 1);
+            cudaCheck(cudaGetLastError(), "rhoSimpleFoam limitEnergy");
+            // ONE publish and ONE wait for all four, through the same mailbox every other grouped read
+            // uses -- four separate reads here would be four queue drains in the energy phase.
+            int    nBelow = 0, nAbove = 0;
+            scalar tMin = 0, tMax = 0;
+            const DeviceReadValue rv[4] = {
+                {reinterpret_cast<const int*>(counts.data()),     &nBelow, true},
+                {reinterpret_cast<const int*>(counts.data()) + 1, &nAbove, true},
+                {tMinMaxMean.data(),     &tMin, false},
+                {tMinMaxMean.data() + 1, &tMax, false},
+            };
+            deviceReadValues(rv, 4);
+            const char* on = in.limitTname.empty() ? "limitTemperature" : in.limitTname.c_str();
+            printLimitTemperature(on, /*isLower=*/true,  nBelow, nC, in.limitTmin, tMin);
+            printLimitTemperature(on, /*isLower=*/false, nAbove, nC, in.limitTmax, tMax);
+        }
+        deviceBCValue(dbHe, f.he, f.heBnd);
+        // THE BOUNDARY HALF, which this arm did not have. OpenFOAM clamps he on every patch whose field
+        // does not fix a value and then re-evaluates (limitTemperature.C:229-272); the host mirror does
+        // the same (rhoSimpleFoam_cpp.cu). Here only the internal field was clamped and the boundary was
+        // re-derived from it, which lands on the right answer for a zeroGradient patch -- the derived
+        // value comes from a clamped cell -- and leaves a `calculated` patch outside the range, because
+        // nothing re-derives one. AFTER deviceBCValue, so the re-derivation cannot undo it; the kernel
+        // skips bcType 1 (fixesValue), which is OpenFOAM's own test. The kernel already existed and had
+        // no caller on this path at all.
+        if (in.limitHe && dbHe.n > 0 && f.heBnd.size() == static_cast<std::size_t>(dbHe.n))
+        {
+            limitEnergyBndKernel<<<(dbHe.n + 255) / 256, 256>>>(
+                dbHe.n, dbHe.bcType.data(),
+                dbHe.ioMask.size()    ? dbHe.ioMask.data()    : nullptr,
+                dbHe.oioMask.size()   ? dbHe.oioMask.data()   : nullptr,
+                dbHe.mixedMask.size() ? dbHe.mixedMask.data() : nullptr,
+                f.pBnd.data(), in.limitTmin, in.limitTmax, in.thermo, f.heBnd.data());
+            cudaCheck(cudaGetLastError(), "rhoSimpleFoam limitEnergy boundary");
+        }
+    }
+
+    // EEqn.H ends with thermo.correct(): T, and therefore psi, move HERE and everything below sees them.
+    in.thermoCorrect();
+    sd.scalars("he", f.he);
+    sd.scalars("T", f.T);
+    sd.scalars("psi", f.psi);
+
+    // ---- pEqn.H or pcEqn.H -------------------------------------------------------------------
+    phaseMark(&g_tE);
+    phaseRange("pEqn");
+    RhoPressureInput pin;
+    pin.rhoCell = &f.rho;            pin.rhoBndFace = &f.rhoBnd;
+    pin.psiCell = &f.psi;            pin.psiBndFace = &f.psiBnd;
+    pin.pBndFace = &f.pBnd;
+    pin.UxBndFace = &f.UxBnd;        pin.UyBndFace = &f.UyBnd;        pin.UzBndFace = &f.UzBnd;
+    pin.transonic = in.transonic;
+    pin.relaxP = in.relaxPEqn;
+    pin.relaxPSpecified = in.relaxPEqnSpecified;
+    pin.pRefCell = in.pRefCell;      pin.pRefValue = in.pRefValue;
+    pin.correctedLaplacian = in.correctedLaplacian;
+    pin.snGradLimitCoeff = in.snGradLimitCoeff;
+    pin.gradPLeastSq     = in.gradPLeastSq;
+    pin.gradPLimitK      = in.gradPLimitK;
+    pin.takeUAtBoundary = in.takeUAtBoundary;
+    pin.adjustable = in.adjustable;
+    pin.hasMRF = in.hasMRF;
+    pin.hasFvOptions = in.hasFvOptions;
+    pin.hasCoupledPatches = in.hasCoupledPatches;
+    pin.fvOptionUnsupported = in.fvOptionUnsupported;
+    for (int cmpt = 0; cmpt < 3; ++cmpt) pin.solutionD[cmpt] = in.solutionD[cmpt];
+
+    RhoPressureStages        st;
+    ConsistentPressureStages cst;
+    bool closedVolume = false;
+
+    if (in.consistent)
+    {
+        // pcEqn.H OPENS with `rho = thermo.rho()`. pEqn.H does not -- so the SIMPLEC pressure equation is
+        // built from a density that already reflects the just-solved T and the plain SIMPLE one is not.
+        in.updateRho();
+        consistentPressurePredictor(cst, dm, dbU, dbP, UEqn, f.Ux, f.Uy, f.Uz, f.p, pin);
+        sd.scalars("rAU", cst.rAU);
+        sd.scalars("rAtU", cst.rAtU);
+        sd.scalars("rhorAtU", cst.rhorAtU);
+        sd.vectors("HbyA", cst.HbyA0[0], cst.HbyA0[1], cst.HbyA0[2]);
+        sd.vectors("HbyAc", cst.HbyA[0], cst.HbyA[1], cst.HbyA[2]);
+        sd.surface("phiHbyA0", cst.phiHbyA0Int, cst.phiHbyA0Bnd);
+        sd.surface("phiHbyAc", cst.phiHbyAInt, cst.phiHbyABnd);
+        sd.surface("phid", cst.phidInt, cst.phidBnd);
+        sd.scalars("rhoP", f.rho);
+        closedVolume = cst.closedVolume;
+    }
+    else
+    {
+        pressurePredictor(st, dm, dbU, dbP, UEqn, f.Ux, f.Uy, f.Uz, f.p, pin);
+        closedVolume = st.closedVolume;
+    }
+
+    // totalPressure's updateCoeffs, where OpenFOAM runs it: inside the pressure fvMatrix's constructor
+    // (fvMatrix.C:396; totalPressureFvPatchScalarField.C:152-225, the psiName_ == "none" branch), from
+    // U's PATCH value as the momentum solve left it (f.UxBnd, refreshed above), the flux the iteration
+    // started with, and rho's patch value as it stands -- pcEqn.H:1's on the SIMPLEC branch, the previous
+    // tail's on the other.
+    // ...and freestreamPressure's valueFraction, from U's patch value as the momentum solve left it.
+    if (in.hasMixed) deviceUpdateMixedFreestream(dbU, dbP, f.phiBnd, f.Ux, f.Uy, f.Uz, &f.rhoBnd, /*which=*/2,
+                                                     &f.UxBnd, &f.UyBnd, &f.UzBnd);
+    deviceUpdateTotalPressure(dbP, f.phiBnd, f.UxBnd, f.UyBnd, f.UzBnd, &f.rhoBnd);
+    // updateCoeffs changes no other patch's VALUE: totalPressure's operator== is inside its own
+    // updateCoeffs, and a mixed or zeroGradient face keeps the blend p.relax() left until the limiter's
+    // correctBoundaryConditions (pEqn.H:100-103) -- rhoSimpleFoam_cpp.cu's updateTotalPressure with
+    // evaluateAll = false. This used to re-evaluate EVERY face here, so the freestream faces entered the
+    // pressure equation one evaluate ahead of OpenFOAM's: the p level 1.3e-01 off the host at iteration 2.
+    {
+        DeviceBuffer<scalar> fresh;
+        deviceBCValue(dbP, f.p, fresh);
+        if (dbP.n > 0)
+        {
+            takeTotalPressureFacesKernel<<<(dbP.n + 255) / 256, 256>>>(dbP.n, dbP.tpMask.data(), fresh.data(), f.pBnd.data());
+            cudaCheck(cudaGetLastError(), "rhoSimpleFoam takeTotalPressureFaces");
+        }
+    }
+
+    // The non-orthogonal corrector loop. solutionControlI.H:78-95 runs it nNonOrth+1 times, and only the
+    // FINAL pass writes phi (simple.finalNonOrthogonalIter()).
+    const label nCorr = in.nNonOrthogonalCorrectors + 1;
+    for (label corr = 1; corr <= nCorr; ++corr)
+    {
+        PressureMatrix& P = w.P;                          // persistent -- see RhoSolverWorkspace
+        // Every OpenFOAM solve ends with psi.correctBoundaryConditions() (fvMatrixSolve.C:242), so the
+        // second corrector onward assembles from p's boundary as the PREVIOUS corrector's solve left it
+        // -- the host reference's `if (corr > 0) f.p.evaluateBoundary()`. The first corrector keeps
+        // the value the previous iteration's p.relax() left (the totalPressure-only refresh above).
+        // Missing this, the stored value handed to the assembly (pin.pBndFace) was the pre-loop one for
+        // every corrector: rho_nonorth_corrector_vs_openfoam (sbMatched, nNonOrthogonalCorrectors 2) red.
+        if (corr > 1) deviceBCValue(dbP, f.p, f.pBnd);
+        if (in.consistent) assemblePcEqn(P, cst, dm, dbP, f.p, pin);
+        else               assemblePEqn(P, st, dm, dbP, f.p, pin);
+
+        DeviceBuffer<scalar>& diagC = w.diagC;
+        DeviceBuffer<scalar>& b     = w.b;
+        deviceFold(dm, P.diag, P.source, P.iC, P.bC, diagC, b);
+        const DeviceLduView A = foldedView(dm, P, diagC);
+        DeviceBuffer<scalar> dnf;
+        deviceNormFactorInto(A, f.p, b, w.ones, dnf);                 // stays on the device (item 66)
+
+        DeviceSolverPerf perf;
+        // A BiCGStab has ONE preconditioner. The driver decides between them from BRAE_P_SOLVER and
+        // BRAE_DILU_P and announces what it chose, so two arriving here means the notice already
+        // named one of them and the solve would run the other.
+        if (in.pAmgPrecon && in.preconP)
+        {
+            throw std::runtime_error(
+                "brae rhoSimpleFoam (mirror): the transonic pressure was handed BOTH an AMG hierarchy and "
+                "a DILU preconditioner. A BiCGStab takes one; the driver picks between them "
+                "(BRAE_P_SOLVER, BRAE_DILU_P) and announces the choice, so running either here would "
+                "contradict the notice.");
+        }
+        // The AMG hierarchy, for BOTH pressure equations. It is a function of the MESH ALONE:
+        // agglomerate() is greedy pairwise on the face weights (device_amg.cu:212-355), buildAMG never
+        // sees the matrix (:865-1005), and the weights handed in are |Sf| -- OpenFOAM's own
+        // faceAreaPairGAMGAgglomeration.C:108,162 choice. So the transonic hierarchy IS the subsonic one
+        // on this mesh, and only the Galerkin VALUES change per outer iteration (:1007-1054, OpenFOAM's
+        // asymmetric branch verbatim -- GAMGSolverAgglomerateMatrix.C:135-170's `hasLower()` path, both
+        // cUpper and cLower with the owner/neighbour flip).
+        //
+        // HOISTED ABOVE THE BRANCH. Until it was, the transonic path never entered this block, so the
+        // binary cache below was unreachable on the compressible path and every run started cold
+        // (REFUSALS item 61: "on the rho mirror it is still unreachable (every run cold)").
+        //
+        // Skipped only where no solve will use it: BRAE_P_SOLVER=diagonal or BRAE_DILU_P=1 on a
+        // transonic case. Building it there would pay the agglomeration and a per-iteration Galerkin
+        // for a hierarchy nothing reads -- and the control arm of tests/p_amg_bicgstab_vs_openfoam.sh
+        // is meant to measure what this driver ran BEFORE the AMG, not that plus a dead build.
+        const bool amgOnP = !in.transonic || in.pAmgPrecon;
+        if (amgOnP)
+        {
+            if (!w.amgBuilt)
+            {
+                // Face weights SLICED TO INTERNAL FACES. DeviceMesh::magSf is |Sf| over ALL faces, laid
+                // out [internal | non-cyclic boundary], while owner/nei are internal-only -- handing the
+                // whole array to buildAMG pairs an internal-face addressing with a weight array that
+                // runs on into the boundary, and every decision the agglomeration makes (which faces are
+                // strong, hence which cells merge) is downstream of that pairing.
+                const std::vector<label>  own = dm.owner.host(), nei = dm.nei.host();
+                const std::vector<scalar> magSfAll = dm.magSf.host();
+                const std::size_t nIf = static_cast<std::size_t>(dm.nInternalFaces);
+                const std::vector<label>  ownInt(own.begin(), own.begin() + std::min(nIf, own.size()));
+                const std::vector<label>  neiInt(nei.begin(), nei.begin() + std::min(nIf, nei.size()));
+                const std::vector<scalar> fw(magSfAll.begin(),
+                                             magSfAll.begin() + std::min(nIf, magSfAll.size()));
+                // The hierarchy is a function of the MESH: only the STRUCTURE is serialised, and
+                // cDiag/cUpper/cLower are Galerkin-rebuilt every step. So a cache a simpleFoam run wrote
+                // for this mesh is valid here, and until this line existed the compressible path started
+                // cold on every run even when one was sitting next to constant/polyMesh.
+                w.amg = in.amgCacheDir.empty()
+                      ? buildAMG(ownInt, neiInt, fw, dm.nCells)
+                      : buildOrLoadAMG(ownInt, neiInt, fw, dm.nCells, in.amgCacheDir, true);
+                w.amgBuilt = true;
+            }
+            amgGalerkin(w.amg, diagC, P.upper, P.lower);
+        }
+
+        if (in.transonic)
+        {
+            // fvm::div(phid, p) makes lower = -w*phi and upper = lower + phi, so upper != lower at every
+            // face with flow through it. A symmetric solver on that matrix is not slow, it is wrong: CG
+            // burned the full 3000-iteration cap and the case stalled before printing iteration 1.
+            // The V-cycle itself is asymmetric-safe -- the coarse operator carries both cUpper and
+            // cLower (above) and the solver is asked for an asymmetric-valid coarsest solve.
+            solveMarkBegin();
+            perf = deviceJacobiBiCGStab(A, b, f.p, dnf.data(), in.tolP, in.relTolP, in.maxIterP, in.pcgCheckEvery, in.minIterP,
+                                        in.preconP,                              // DILU when BRAE_DILU_P=1 opted in
+                                        in.pAmgPrecon ? &w.amg : nullptr);       // the V-cycle (the default); both null keeps Jacobi
+            solveMarkEnd(&g_tPsol);
+        }
+        else
+        {
+            solveMarkBegin();
+            perf = deviceAMGPCG(A, w.amg, b, f.p, dnf.data(), in.tolP, in.relTolP, in.maxIterP,
+                                in.captureVcycle, in.pcgCheckEvery, /*corrScaling=*/false, in.minIterP);
+            solveMarkEnd(&g_tPsol);
+        }
+        // solutionControl.C:230-233 takes sp.first() -- the FIRST solve of the iteration, not the last.
+        if (corr == 1) res["p"] = perf.initialResidual;
+        // The work behind the number: how many solver iterations the first p solve took. Printed on
+        // the summary line, so a benchmark log says what the pressure cost, not only where it stopped.
+        if (corr == 1) res["pIters"] = static_cast<scalar>(perf.nIterations);
+
+        if (corr == nCorr)
+        {
+            correctFluxCompressible(f.phiInt, f.phiBnd,
+                                    in.consistent ? cst.phiHbyAInt : st.phiHbyAInt,
+                                    in.consistent ? cst.phiHbyABnd : st.phiHbyABnd,
+                                    P, dm, dbP, f.p);
+        }
+    }
+
+    // p.relax() -- the FIELD factor, not the equation one. Both are spelled `p` in fvSolution and they
+    // live in different sub-dictionaries; using the equation factor here relaxes the wrong thing.
+    // AFTER the flux correction and BEFORE the velocity correction, so phi is built from the unrelaxed
+    // pressure and U from the relaxed one.
+    //
+    // BOTH HALVES. GeometricField::relax is operator==(prevIter() + alpha*(*this - prevIter()))
+    // (GeometricField.C:1094) and operator== assigns the boundary too (:1420), after the solve's own
+    // correctBoundaryConditions (fvMatrixSolve.C:309) has put the solved cell value on every zeroGradient
+    // face -- hence the boundary evaluation BEFORE the cells are relaxed. The blend is what
+    // U = HbyA - rAU*grad(p) reads next and, without a pressure limiter, what the next momentum assembly
+    // reads. On the totalPressure inlet it is a different number from both the fresh p0 - 0.5*rho*|U_b|^2
+    // and the previous one (rhoTP at t=1 blends the 100200 seed towards 100095 at 0.3); everywhere else
+    // it is the same number the old evaluate-after-relax produced.
+    deviceBCValue(dbP, f.p, f.pBnd);
+    relaxField(f.p, pPrev, in.relaxP);
+    relaxField(f.pBnd, pBndPrev, in.relaxP);
+    sd.scalars("pRel", f.p);
+    sd.surface("phi", f.phiInt, f.phiBnd);
+    if (dbP.n > 0)
+    {
+        storeTotalPressureValueKernel<<<(dbP.n + 255) / 256, 256>>>(
+            dbP.n,
+            dbP.tpMask.data(),
+            f.pBnd.data(),
+            dbP.refValue.data());
+        cudaCheck(cudaGetLastError(), "rhoSimpleFoam storeTotalPressureValue");
+    }
+
+    // U = HbyA - rAtU*fvc::grad(p), with rAtU on the SIMPLEC path and rAU otherwise.
+    {
+        DeviceBuffer<scalar> gpx, gpy, gpz;
+        if (in.gradPLeastSq) deviceLeastSquaresGrad(dm, f.p, f.pBnd, gpx, gpy, gpz);
+        else                 deviceGaussGrad(dm, f.p, f.pBnd, gpx, gpy, gpz);
+        if (in.gradPLimitK > 0.0) deviceCellLimitGrad(dm, f.p, f.pBnd, gpx, gpy, gpz, in.gradPLimitK);
+        PressureStages shim;
+        if (in.consistent)
+        {
+            for (int k = 0; k < 3; ++k) deviceCopy(shim.HbyA[k], cst.HbyA[k]);
+            deviceCopy(shim.rAtU, cst.rAtU);
+        }
+        else
+        {
+            for (int k = 0; k < 3; ++k) deviceCopy(shim.HbyA[k], st.HbyA[k]);
+            deviceCopy(shim.rAtU, st.rAU);
+        }
+        correctVelocity(f.Ux, f.Uy, f.Uz, shim, gpx, gpy, gpz);
+
+        // U.correctBoundaryConditions() -- pEqn.H:87 and pcEqn.H:100, on the line IMMEDIATELY after
+        // `U = HbyA - rAU*fvc::grad(p)`. The driver refreshed U's boundary once, before the energy
+        // equation, and never again: from the velocity correction onward f.UxBnd/UyBnd/UzBnd held the
+        // values U had BEFORE the pressure correction, for the rest of the iteration and into the next.
+        //
+        // Found by comparing every field against the host reference rather than the handful the driver
+        // gate reports. At the end of iteration 1 on sbMatched every reported field agreed to ~1e-12
+        // while UxBnd was out by 6.81e-01 and UyBnd/UzBnd by 1.00e+00 -- entirely different values, not
+        // a drift. It fed forward through everything that reads U's patch values: fvc::div(phi, Ekp)
+        // evaluates Ekp on boundary faces, the closure's production and its turbulentIntensity inlet
+        // both read U_b, and the next iteration's flux switch reads the boundary flux built from it.
+        //
+        // The symmetry/wedge refValue is rebuilt first, for the reason given at the energy equation's
+        // refresh above: their value is a function of the CURRENT internal field, and the velocity
+        // correction has just moved it.
+        //
+        // And every flux-switched patch evaluates through its updateCoeffs again here (the updated flag
+        // was cleared by the solve's evaluate), with phi the NEW flux by now (pEqn.H:73): inletOutlet's
+        // valueFraction and the piov mask are rebuilt from it, the piov value from the corrected cells --
+        // what gets written, what the closure reads, and what the next momentum assembly finds.
+        deviceUpdateInletOutlet(dbU, f.phiBnd);
+        deviceUpdatePressureInletOutletVelocity(dbU, f.phiBnd, f.Ux, f.Uy, f.Uz, /*directionMixed=*/true);
+        // flowRateInletVelocity recomputed from rho's patch value as it stands here (see updateFlowRateInlets).
+        updateFlowRateInlets(f, in, dbU);
+        // freestreamVelocity's valueFraction rebuilt from the patch's current value, as OpenFOAM's evaluate
+        // does here (freestreamVelocityFvPatchVectorField.C:106; the host step carries the measurement).
+        if (in.hasMixed) deviceUpdateMixedFreestream(dbU, dbP, f.phiBnd, f.Ux, f.Uy, f.Uz, &f.rhoBnd, /*which=*/1,
+                                                     &f.UxBnd, &f.UyBnd, &f.UzBnd);
+        deviceUpdateSymmetry(dbU, f.Ux, f.Uy, f.Uz);
+        deviceUpdateWedge(dbU, f.Ux, f.Uy, f.Uz);
+        deviceBCValue(dbU.comp[0], f.Ux, f.UxBnd);
+        deviceBCValue(dbU.comp[1], f.Uy, f.UyBnd);
+        deviceBCValue(dbU.comp[2], f.Uz, f.UzBnd);
+    }
+
+    sd.vectors("Upost", f.Ux, f.Uy, f.Uz);
+
+    // pressureControl.limit(p), HERE and not earlier: pEqn.H applies it after the velocity correction, so
+    // U is built from the unclipped pressure and only p carries the clip.
+    const bool pLimited = in.limitMaxP || in.limitMinP;
+    if (pLimited)
+    {
+        limitPressureKernel<<<(nC + 255) / 256, 256>>>(nC, in.limitMaxP ? 1 : 0, in.limitMinP ? 1 : 0,
+                                                       in.pMaxLimit, in.pMinLimit, f.p.data());
+        cudaCheck(cudaGetLastError(), "rhoSimpleFoam limitPressure");
+    }
+
+    // The closed-volume mass correction. `closedVolume` is set by the predictor, on the same condition
+    // adjustPhi and pRefCell are: no patch fixes a pressure value, so the level is undetermined and the
+    // total mass is what pins it.
+    if (closedVolume)
+    {
+        closedVolumeCorrection(f.p, f.psi, dm, f.initialMass);
+    }
+
+    // ONE refresh for both, keyed as OpenFOAM keys it: `if (pLimited || closedVolume)` (pEqn.H:100-103).
+    // On the totalPressure inlet that correctBoundaryConditions is an updateCoeffs (the flag was cleared
+    // by the solve's evaluate): a recompute from the NEW flux, the corrected U's patch value and rho's
+    // patch value as it stands -- BEFORE the tail's rho = thermo.rho() below. It is the value written to
+    // disk and the one the next momentum assembly reads through grad(p).
+    if (pLimited || closedVolume)
+    {
+        if (in.hasMixed) deviceUpdateMixedFreestream(dbU, dbP, f.phiBnd, f.Ux, f.Uy, f.Uz, &f.rhoBnd, /*which=*/2,
+                                                     &f.UxBnd, &f.UyBnd, &f.UzBnd);
+        deviceUpdateTotalPressure(dbP, f.phiBnd, f.UxBnd, f.UyBnd, f.UzBnd, &f.rhoBnd);
+        deviceBCValue(dbP, f.p, f.pBnd);
+    }
+
+    // rho = thermo.rho(), then rho.relax() -- only when NOT transonic.
+    //
+    // THE BOUNDARY IS RELAXED TOO. GeometricField::relax is operator==(prevIter + alpha*(*this -
+    // prevIter)) and operator== assigns BOTH halves. Relaxing only the internal field leaves rho's patch
+    // values at the unrelaxed thermo value, which is a different field from the one OpenFOAM carries --
+    // and it matters directly, because flowRateInletVelocity holds the prescribed mass flow against
+    // rho's PATCH values, so an unrelaxed boundary sets a different inlet velocity every iteration.
+    {
+        // Against rhoPrevIter, captured at the top of the step -- see the note there.
+        in.updateRho();
+        if (!in.transonic)
+        {
+            relaxField(f.rho, rhoPrevIter, in.relaxRho);
+            relaxField(f.rhoBnd, rhoBndPrevIter, in.relaxRho);
+        }
+    }
+
+    sd.scalars("p", f.p);
+    sd.scalars("rhoTail", f.rho);
+    sd.scalars("kIn", f.k);
+    sd.scalars("epsIn", f.epsilon);
+    sd.scalars("nutIn", f.nut);
+
+    // rho.oldTime() for the closures' fvm::ddt: see RhoStepInput::ddtEuler. rhoPrevIter is the rho this
+    // iteration started with, captured at the top of the step.
+    if (in.ddtEuler)
+    {
+        deviceCopy(f.rhoOld, in.firstIteration ? f.rho : rhoPrevIter);
+    }
+
+    // turbulence->correct() -- LAST, so the NEXT iteration's momentum equation uses this iteration's
+    // closure. OpenFOAM's lagged coupling.
+    phaseMark(&g_tP);
+    phaseRange("turbulence");
+    if (in.correct) in.correct();
+    phaseMark(&g_tTurb);
+    phaseRange(nullptr);
+    sd.scalars("kOut", f.k);
+    sd.scalars("epsOut", f.epsilon);
+    sd.scalars("nutOut", f.nut);
+
+    return res;
+}
+
+} // namespace rhoSimple
+} // namespace gpu
+} // namespace brae
+
+

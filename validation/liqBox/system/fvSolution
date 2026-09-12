@@ -1,0 +1,8 @@
+FoamFile { version 2.0; format ascii; class dictionary; object fvSolution; }
+solvers
+{
+  p { solver PBiCGStab; preconditioner DIC; tolerance 1e-14; relTol 0; }
+  "(U|e)" { solver PBiCGStab; preconditioner DILU; tolerance 1e-14; relTol 0; }
+}
+SIMPLE { nNonOrthogonalCorrectors 0; transonic no; consistent no; pMinFactor 0.1; pMaxFactor 1.5; }
+relaxationFactors { fields { p 0.3; } equations { U 0.7; e 0.7; } }

@@ -66,10 +66,17 @@ struct H2OLiquid
     // Model-valid temperature range, from OF's own liquidProperties construction in H2O.C:
     //     liquidProperties(W=18.015, Tc=647.13, Pc=2.2055e7, Vc, Zc, Tt=273.16, ...)
     // Tt is the triple point and Tc the critical point -- outside [Tt, Tc] the substance is not a liquid
-    // and the correlations are extrapolation, not physics. Used to project the Newton iterate, exactly
-    // as OF's inversion applies its `limit()` function to every step.
+    // and the correlations are extrapolation, not physics. ABOVE Tc it is worse than extrapolation: rho_
+    // is NSRDSfunc5, a/pow(b, 1 + pow(1 - T/c, d)) with c = Tc and d = 0.081 (NSRDSfunc5.H:106), so
+    // 1 - T/Tc goes negative and the fractional power is a NaN. OpenFOAM has no guard -- measured, with
+    // H2O on sbMatched's ~1000 K fields it runs every solve at `Initial residual = nan` for 1000
+    // iterations and dies reading its own output back. brae refuses instead, in two places that share
+    // this one predicate: createFields on the fields as read, and the he -> T inversion on its answer.
+    // (This comment used to say the range PROJECTS the Newton iterate as OpenFOAM's limit() does; that
+    // was wrong -- limit() is the identity for a liquid -- and stage H3.2 made it a post-check.)
     static constexpr scalar Tt = 273.16;    // triple point   [K]
     static constexpr scalar Tc = 647.13;    // critical point [K]
+    BRAE_HD static bool inRange(scalar T) { return T >= Tt && T <= Tc; }
 
     BRAE_HD static scalar rho(scalar T)   { return nsrdsFunc5(98.343885, 0.30542, 647.13, 0.081, T); }
     BRAE_HD static scalar mu(scalar T)    { return nsrdsFunc1(-51.964, 3670.6, 5.7331, -5.3495e-29, 10, T); }
@@ -156,33 +163,58 @@ BRAE_HD inline HeToTResult h2oEnergyToT(
     scalar target,
     scalar p,
     scalar T0,
-    scalar tol     = 1e-12,
-    int    maxIter = 50,
-    scalar eScale  = 1e2)
+    // A POST-CHECK on the answer, NOT the stopping test, and DELIBERATELY LOOSE. OpenFOAM stops when
+    // the temperature step falls below T0*1e-4, so the energy residual it exits with is about
+    // Cp*T0*1e-4/|he| ~ 1e-5 for water -- asserting 1e-9 here would reject OpenFOAM's own answers, which
+    // it did on the p = 1e6 rows until this was calibrated against tools/liqref. What actually catches an
+    // unattainable energy is the iteration cap and the [Tt, Tc] range check below; this is the third net.
+    scalar residualBound = 1e-3,
+    int    maxIter       = 100,     // OF thermo.C:36
+    scalar eScale        = 1e2)
 {
     HeToTResult r;
-    // Project the STARTING guess as well as every iterate: a caller handing in a temperature from a
-    // diverging outer iteration must not put the first evaluation outside the correlation's range.
-    scalar T = fmin(fmax(T0, H2OLiquid::Tt), H2OLiquid::Tc);
-    const scalar den = fmax(fabs(target), eScale);
 
-    for (int it = 1; it <= maxIter; ++it)
+    // OF species::thermo<Thermo,Type>::T (thermoI.H:43-88), transcribed. Three things about it are not
+    // what a from-scratch inversion would do, and all three are deliberate here:
+    //
+    //  1. THE STOPPING TEST IS ON THE TEMPERATURE STEP, not on the energy residual, and the tolerance
+    //     Ttol = T0*tol_ (tol_ = 1e-4, thermo.C:33) is computed ONCE FROM THE INITIAL GUESS and never
+    //     updated. So OpenFOAM does not iterate to convergence, and THE ANSWER DEPENDS ON T0. Measured
+    //     with tools/liqref at p = 1e5, Ttrue = 400: T0 = 400 gives exactly 400, T0 = 250 gives
+    //     400.00000002381233, T0 = 450 gives 400.00000000125675 -- six starting guesses, six answers,
+    //     spread 2.4e-08 K. brae used to iterate to a 1e-12 energy residual, which returns ONE answer
+    //     for all six and is therefore a different function, however much "better" it looks.
+    //  2. limit() IS THE IDENTITY for a liquid (liquidPropertiesI.H:28-31 returns T unchanged, and so
+    //     does thermophysicalPropertiesI.H:30-33). brae projected every iterate onto [Tt, Tc] and called
+    //     that OF's limit(); it is not, and it changes the path. The range is enforced BELOW, on the
+    //     converged value, which keeps the refusal without touching the iteration.
+    //  3. The loop is a do-while, so it always takes at least one step even when T0 is already the
+    //     answer -- that step is zero, which is why the T0 = Ttrue row above reads exactly 400.
+    //
+    // OF raises a FatalError on the iteration cap; here that is reported through `converged` and the
+    // caller throws, because this is BRAE_HD and runs on the device.
+    scalar Test = T0;
+    scalar Tnew = T0;
+    const scalar Ttol = T0 * scalar(1.0e-4);
+    int  iter   = 0;
+    bool blewUp = false;
+    do
     {
-        const scalar err = h2oEnergy(form, p, T) - target;
-        r.residual   = fabs(err)/den;
-        r.iterations = it;
-        if (r.residual <= tol) { r.converged = true; break; }
+        Test = Tnew;
+        Tnew = Test - (h2oEnergy(form, p, Test) - target) / h2oCpv(form, p, Test);
+        if (iter++ > maxIter) { blewUp = true; break; }
+    } while (fabs(Tnew - Test) > Ttol);
 
-        const scalar cpv = h2oCpv(form, p, T);       // Cp or Cv; verified against OF in test_nsrds.cu
-        const scalar Tn  = fmin(fmax(T - err/cpv, H2OLiquid::Tt), H2OLiquid::Tc);   // OF's limit()
-        if (Tn == T) { break; }                      // projected onto a bound and stuck: report, do not spin
-        T = Tn;
-    }
-    r.T = T;
-    // One last evaluation so `residual` always describes the T being returned, including on the
-    // clamped-and-stuck exit above.
-    r.residual  = fabs(h2oEnergy(form, p, T) - target)/den;
-    r.converged = r.residual <= tol;
+    r.T          = Tnew;
+    r.iterations = iter;
+    const scalar den = fmax(fabs(target), eScale);
+    r.residual   = fabs(h2oEnergy(form, p, Tnew) - target) / den;
+    // The correlation range as a POST-CHECK rather than a projection: H2O's fits are defined on
+    // [Tt, Tc] and an answer outside them is not a temperature this substance has, so the caller must
+    // hear about it -- but the iterate path stays OpenFOAM's.
+    r.converged  = !blewUp
+                && r.residual <= residualBound
+                && H2OLiquid::inRange(Tnew);
     return r;
 }
 

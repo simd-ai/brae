@@ -10,12 +10,25 @@
 #include <vector>
 #include <unordered_map>
 #include <cstdlib>
+#include <cstdio>
 
 namespace brae {
 
 inline void cudaCheck(cudaError_t e, const char* what)
 {
     if (e != cudaSuccess) throw std::runtime_error(std::string("brae cuda: ") + what + ": " + cudaGetErrorString(e));
+}
+
+// Entry-count census for the caches keyed on a field pointer, under BRAE_CACHE_STATS=1. Such a cache
+// stays bounded only while the pointer is stable: the legacy driver allocates its psi fresh every outer
+// iteration, so a cache keyed on it gains an entry per solve (items 75, 76). Prints on each new high mark.
+inline void cacheStat(const char* name, std::size_t n)
+{
+    static const bool on = std::getenv("BRAE_CACHE_STATS") != nullptr;
+    if (!on) return;
+    static std::unordered_map<std::string, std::size_t> high;
+    std::size_t& h = high[name];
+    if (n > h) { h = n; std::fprintf(stderr, "[cache] %s entries=%zu\n", name, n); }
 }
 
 namespace detail {

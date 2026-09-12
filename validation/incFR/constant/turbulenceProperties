@@ -1,0 +1,4 @@
+FoamFile { version 2.0; format ascii; class dictionary; object turbulenceProperties; }
+// Laminar on purpose: this fixture exists to test ONE boundary condition, and a closure would put
+// its own gap between the arms.
+simulationType laminar;

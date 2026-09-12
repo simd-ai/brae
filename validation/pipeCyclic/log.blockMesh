@@ -1,0 +1,76 @@
+/*---------------------------------------------------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2412                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+Build  : _e5c6ccc3-20250814 OPENFOAM=2412 patch=250814 version=2412
+Arch   : "LSB;label=32;scalar=64"
+Exec   : blockMesh -case /home/ghost/cudafoam/cf/validation/pipeCyclic
+Date   : Jun 21 2026
+Time   : 17:20:11
+Host   : gx10-8ac0
+PID    : 31017
+I/O    : uncollated
+Case   : /home/ghost/cudafoam/cf/validation/pipeCyclic
+nProcs : 1
+trapFpe: Floating point exception trapping enabled (FOAM_SIGFPE).
+fileModificationChecking : Monitoring run-time modified files using timeStampMaster (fileModificationSkew 5, maxFileModificationPolls 20)
+allowSystemOperations : Allowing user-supplied system call operations
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+Create time
+
+Creating block mesh from "system/blockMeshDict"
+Creating block edges
+No non-planar block faces defined
+Creating topology blocks
+
+Creating topology patches - from boundary section
+
+Creating block mesh topology
+
+Check topology
+
+	Basic statistics
+		Number of internal faces : 0
+		Number of boundary faces : 6
+		Number of defined boundary faces : 6
+		Number of undefined boundary faces : 0
+	Checking patch -> block consistency
+
+Creating block offsets
+Creating merge list (geometric search)...
+
+Creating polyMesh from blockMesh
+Creating points with scale (1 1 1)
+    Block 0 cell size :
+        i : 0.2 .. 0.1999999999999993
+        j : 0 .. 0
+        k : 0.1 .. 0.09999999999999996
+
+Creating cells
+Creating patches
+No patch pairs to merge
+
+Writing polyMesh with 0 cellZones
+----------------
+Mesh Information
+----------------
+  boundingBox: (0 -0.3535533905932737 0) (10 0.3535533905932737 0.493844170297569)
+  nPoints: 1581
+  nCells: 1250
+  nFaces: 4025
+  nInternalFaces: 3225
+----------------
+Patches
+----------------
+  patch 0 (start: 3225 size: 25) name: inlet
+  patch 1 (start: 3250 size: 25) name: outlet
+  patch 2 (start: 3275 size: 250) name: side1
+  patch 3 (start: 3525 size: 250) name: side2
+  patch 4 (start: 3775 size: 250) name: walls
+
+End
+

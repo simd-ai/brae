@@ -70,6 +70,14 @@ inline void noticeApproximated(const std::string& subject, const std::string& de
     detail::notice("approximated", subject, detail);
 }
 
+// The case named one thing and brae runs another that computes the SAME numbers -- a rename, not an
+// approximation. Distinct from `approximated` on purpose: reporting an exact equivalence as an
+// approximation teaches the reader to discount the approximated lines that really do differ.
+inline void noticeEquivalent(const std::string& subject, const std::string& detail)
+{
+    detail::notice("equivalent", subject, detail);
+}
+
 // A value could not be read and brae fell back. Say the fallback value.
 inline void noticeDefaulted(const std::string& subject, const std::string& detail)
 {
@@ -81,6 +89,15 @@ inline void noticeDefaulted(const std::string& subject, const std::string& detai
 inline void noticeApplied(const std::string& subject, const std::string& detail)
 {
     if (std::getenv("BRAE_NOTICE_APPLIED")) detail::notice("applied", subject, detail);
+}
+
+// Set by a driver whose wall treatments read Cmu/kappa/E per patch (the rhoSimpleFoam mirror, both
+// arms, item 16h-port) BEFORE it reads its fields: the reader then stays silent on those entries. The
+// legacy drivers leave it false and are told, per patch, what they do not honour.
+inline bool& perPatchWallCoeffsHonoured()
+{
+    static bool honoured = false;
+    return honoured;
 }
 
 }   // namespace brae

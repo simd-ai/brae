@@ -231,7 +231,7 @@ int main()
             "      SpalartAllmarasDDESCoeffs { shielding ZDES2020; Cd3 30; } }\n");
         DeviceSimpleControls ctl;
         ctl.turbulent = true;
-        readTurbulenceModel(d, ctl);
+        readTurbulenceModel(d, ctl, {"test", true, true});
         check(ctl.saCoeffs.zdes, "parser: `shielding ZDES2020` selects it");
         check(std::fabs(ctl.saCoeffs.Cd3 - 30.0) < 1e-14, "parser: Cd3 override is honoured");
         check(!ctl.saCoeffs.usefP2, "parser: usefP2 defaults to false, as OF's Switch does");
@@ -243,7 +243,7 @@ int main()
             "      SpalartAllmarasDDESCoeffs { shielding standard; } }\n");
         DeviceSimpleControls ctl;
         ctl.turbulent = true;
-        readTurbulenceModel(d, ctl);
+        readTurbulenceModel(d, ctl, {"test", true, true});
         check(!ctl.saCoeffs.zdes, "negative control: `shielding standard` leaves ZDES2020 off");
     }
     {
@@ -254,7 +254,7 @@ int main()
         DeviceSimpleControls ctl;
         ctl.turbulent = true;
         bool threw = false;
-        try { readTurbulenceModel(d, ctl); } catch (const std::exception&) { threw = true; }
+        try { readTurbulenceModel(d, ctl, {"test", true, true}); } catch (const std::exception&) { threw = true; }
         check(threw, "refusal: an unimplemented shielding mode is rejected, not silently substituted");
     }
     {
@@ -265,7 +265,7 @@ int main()
         DeviceSimpleControls ctl;
         ctl.turbulent = true;
         bool threw = false;
-        try { readTurbulenceModel(d, ctl); } catch (const std::exception&) { threw = true; }
+        try { readTurbulenceModel(d, ctl, {"test", true, true}); } catch (const std::exception&) { threw = true; }
         check(threw, "refusal: ZDES2020 under IDDES, which never calls fd, is rejected");
     }
 

@@ -1,4 +1,6 @@
 #pragma once
+#include <memory>
+#include <filesystem>
 // thermo_parse.cuh -- read constant/thermophysicalProperties into a ThermoCoeffs.
 //
 // Only the perfectGas + hConst + (sutherland | const) combination is supported today. Anything else is
@@ -74,9 +76,18 @@ inline void readCommonSolutionControls(
 // second independent readDict of the same file records those lookups on an object nobody audits. rhoMin,
 // rhoMax and relaxationFactors/fields/rho were reported unread for exactly that reason while being read
 // perfectly well here -- an audit that cries wolf is an audit people stop reading.
-inline ThermoCoeffs readThermoCoeffs(const std::string& caseDir, const FoamDict* fvSolutionIn = nullptr)
+// `thermoIn` / `turbIn`: the same rule as fvSolutionIn, for the two dicts this function used to read
+// on its own -- with private copies, the mirror's audit could not see a single read of either
+// (queue item 15b), and Prt was read from constant/turbulenceProperties even on a case that ships
+// constant/momentumTransport (item 16g). A caller that has the instance hands it over.
+inline ThermoCoeffs readThermoCoeffs(const std::string& caseDir,
+                                     const FoamDict* fvSolutionIn = nullptr,
+                                     const FoamDict* thermoIn = nullptr,
+                                     const FoamDict* turbIn = nullptr)
 {
-    const FoamDict dict = readDict(caseDir + "/constant/thermophysicalProperties");
+    std::unique_ptr<FoamDict> ownThermo;
+    if (!thermoIn) ownThermo = std::make_unique<FoamDict>(readDict(caseDir + "/constant/thermophysicalProperties"));
+    const FoamDict& dict = thermoIn ? *thermoIn : *ownThermo;
     ThermoCoeffs c;
 
     const FoamDict* tt = dict.subDict("thermoType");
@@ -232,13 +243,25 @@ inline ThermoCoeffs readThermoCoeffs(const std::string& caseDir, const FoamDict*
     // OF names the dict after the model, e.g. RAS { RASModel kOmegaSST; kOmegaSSTCoeffs { Prt 0.85; } }.
     try
     {
-        const FoamDict turbProps = readDict(caseDir + "/constant/turbulenceProperties");
+        // The caller's instance when it has one; else the file, under whichever of OpenFOAM's two
+        // names the case carries (momentumTransport is the newer name, turbulenceProperties the
+        // older; createFields accepts both, so this must too -- item 16g).
+        std::unique_ptr<FoamDict> ownTurb;
+        if (!turbIn)
+        {
+            const std::string mt = caseDir + "/constant/momentumTransport";
+            const std::string tp = caseDir + "/constant/turbulenceProperties";
+            ownTurb = std::make_unique<FoamDict>(readDict(std::filesystem::exists(mt) ? mt : tp));
+        }
+        const FoamDict& turbProps = turbIn ? *turbIn : *ownTurb;
         for (const char* sub : {"RAS", "LES"})
         {
             const FoamDict* d = turbProps.subDict(sub);
             if (!d) continue;
             const std::string model = d->wordOr(std::string(sub) + "Model", "");
-            const FoamDict* coeffs = model.empty() ? nullptr : d->subDict(model + "Coeffs");
+            // optionalSubDict (RASModel.C:72, LESModel likewise): without a `<model>Coeffs` sub-dictionary
+            // OpenFOAM's coeffDict() IS the RAS/LES dictionary, so a flat `Prt 0.7;` reaches it.
+            const FoamDict* coeffs = model.empty() ? nullptr : d->optionalSubDict(model + "Coeffs");
             if (coeffs) c.Prt = coeffs->scalarOr("Prt", c.Prt);
         }
     }

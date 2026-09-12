@@ -25,6 +25,27 @@
 
 namespace brae {
 
+// The entry-direction companion of findPatchEntry below: every mesh patch whose OWN resolution lands
+// on `e`. An entry's key may be a regex or a group name covering several patches, so "the patch this
+// entry is about" is only answerable as a set -- and answerable only by running the patch-direction
+// resolution, or exact-name entries would shadow differently than OF's pass order. The guards that
+// used to compare `entry.name == patch.name` returned nothing for a regex key and silently skipped it
+// (audit finding #16); this is what they resolve through instead.
+template <typename Entry, typename Patch>
+inline const Entry* findPatchEntry(const std::vector<Entry>& entries, const Patch& p);
+
+template <typename Entry, typename Patch>
+inline std::vector<const Patch*> patchesResolvingTo(
+    const std::vector<Entry>& entries,
+    const Entry&              e,
+    const std::vector<Patch>& patches)
+{
+    std::vector<const Patch*> out;
+    for (const Patch& p : patches)
+        if (findPatchEntry(entries, p) == &e) out.push_back(&p);
+    return out;
+}
+
 // The entry that applies to `p`, or nullptr. Entries must expose `.name`; any PatchFieldData<T> does.
 template <typename Entry, typename Patch>
 inline const Entry* findPatchEntry(const std::vector<Entry>& entries, const Patch& p)

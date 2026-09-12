@@ -26,6 +26,7 @@ struct DeviceAMI
     DeviceBuffer<scalar> corrVecX, corrVecY, corrVecZ;  // per src face non-orth correction vec (n)
     DeviceBuffer<scalar> dOwnX, dOwnY, dOwnZ;   // per src face Cf - C[own]                    (n)
     DeviceBuffer<scalar> dNbrX, dNbrY, dNbrZ;   // per STENCIL ENTRY Cf_tgt - C[nbr]           (nnz)
+    DeviceBuffer<scalar> dX, dY, dZ;            // per src face fvPatch::delta()               (n)
     DeviceBuffer<scalar> ifCoeff;               // assembled per-field off-diagonal           (n)
     DeviceBuffer<scalar> phi;                   // assembled interface flux                   (n)
     bool rotational = false;
@@ -38,7 +39,7 @@ inline DeviceAMI buildDeviceAMI(const std::vector<AMIInterface>& amis)
 {
     std::vector<label> oc, offv, nc;
     std::vector<scalar> w, ws, msf, dcf, wt, sfx, sfy, sfz;
-    std::vector<scalar> cvx,cvy,cvz, dox,doy,doz, dnx,dny,dnz;
+    std::vector<scalar> cvx,cvy,cvz, dox,doy,doz, dnx,dny,dnz, dlx,dly,dlz;
     bool rot = false;
     for (const auto& a : amis)
         if (!a.translational) rot = true;
@@ -59,12 +60,16 @@ inline DeviceAMI buildDeviceAMI(const std::vector<AMIInterface>& amis)
             // (e.g. the device unit test) may leave them empty -> default to zero (those corrections then no-op).
             const vector cv = i < a.corrVec.size() ? a.corrVec[i] : vector{0,0,0};
             const vector dO = i < a.dOwn.size()    ? a.dOwn[i]    : vector{0,0,0};
+            const vector dL = i < a.delta.size()   ? a.delta[i]   : vector{0,0,0};
             cvx.push_back(cv.x);
             cvy.push_back(cv.y);
             cvz.push_back(cv.z);
             dox.push_back(dO.x);
             doy.push_back(dO.y);
             doz.push_back(dO.z);
+            dlx.push_back(dL.x);
+            dly.push_back(dL.y);
+            dlz.push_back(dL.z);
             const label b = a.srcOffset[i], e = a.srcOffset[i+1];
             for (label k = b; k < e; ++k)
             {
@@ -102,6 +107,9 @@ inline DeviceAMI buildDeviceAMI(const std::vector<AMIInterface>& amis)
     d.dNbrX.copyFrom(dnx);
     d.dNbrY.copyFrom(dny);
     d.dNbrZ.copyFrom(dnz);
+    d.dX.copyFrom(dlx);
+    d.dY.copyFrom(dly);
+    d.dZ.copyFrom(dlz);
     d.ifCoeff.resize(d.n);
     d.phi.resize(d.n);
     if (rot)
@@ -141,7 +149,10 @@ void deviceAmiAmulCoeff(const DeviceAMI& ami, const DeviceBuffer<scalar>& coeff,
 // assembly (mirrors device_cyclic, with the AMI weighted stencil; explicit ops use the interpolated nbr)
 // MOMENTUM M = div(phi,U) - laplacian(nuEff,U): ifCoeff[i] = -(nuFace*dc*magSf) + min(phi,0); diag[own] +=
 // (nuFace*dc*magSf) + max(phi,0). nuFace = w*nuEff[own] + (1-w)*interp(nuEff). ami.phi must hold the current flux.
-void deviceAmiAssembleMomentum(DeviceAMI& ami, const DeviceBuffer<scalar>& nuEffCell, DeviceBuffer<scalar>& diag);
+// `wsch`, when given, is the div scheme's face interpolation weight per source face; null means upwind
+// (pos0(phi)), which is what this assembly used to hardcode for every case.
+void deviceAmiAssembleMomentum(DeviceAMI& ami, const DeviceBuffer<scalar>& nuEffCell, DeviceBuffer<scalar>& diag,
+                               const DeviceBuffer<scalar>* wsch = nullptr);
 // laplacian(gamma): ifCoeff[i] = gammaFace*dc*magSf; diag[own] -= ifCoeff (when addToDiag).
 void deviceAmiAssembleLaplacian(DeviceAMI& ami, const DeviceBuffer<scalar>& gammaCell, DeviceBuffer<scalar>& diag, bool addToDiag = true);
 // per-owner sum |ifCoeff|*weightsSum (relax diagonal-dominance term).
@@ -201,6 +212,23 @@ void deviceAmiAddLapCorr(const DeviceAMI& ami, int comp, const DeviceBuffer<scal
                          DeviceBuffer<scalar>& corr);
 // PRESSURE non-orth correction (scalar p): ffc = rAtU_face*magSf*(corrVec.grad(p)_face) (no rotation); -ffc into
 // bp[own]; ffcOut[i] = ffc for the post-solve flux correction (ami.phi -= ffcOut).
+// THE DIV SCHEME'S FACE WEIGHT AT THE INTERFACE, for `Gauss limitedLinear[V] k`. Feeds
+// deviceAmiAssembleMomentum's `wsch`; without it the interface is assembled upwind whatever the case
+// asked for -- see amiMomKernel. OF LimitedScheme::calcLimiter, coupled branch.
+//
+// gradU is the PACKED cell gradient deviceGradU produces, gradU[q*nC + c] with q = 3i + j = d(U_j)/d(x_i),
+// which is already the packing NVDVTVDV::r wants -- no transpose on this path. ami.phi must hold the
+// current interface flux (the same field the assembly upwinds on).
+void deviceAmiLimitedVWeights(const DeviceAMI& ami, const DeviceBuffer<scalar>& Ux,
+                              const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+                              const DeviceBuffer<scalar>& gradU, int nC, scalar twoByk,
+                              DeviceBuffer<scalar>& out);
+// The SCALAR form (k, epsilon, omega, nuTilda): the value is not rotated across the interface, its
+// gradient is. twoByk <= 0 selects vanAlbada, exactly as divLimitedFaceKernel does on internal faces.
+void deviceAmiLimitedWeights(const DeviceAMI& ami, const DeviceBuffer<scalar>& f,
+                             const DeviceBuffer<scalar>& gx, const DeviceBuffer<scalar>& gy,
+                             const DeviceBuffer<scalar>& gz, scalar twoByk, DeviceBuffer<scalar>& out);
+
 void deviceAmiLapCorrP(const DeviceAMI& ami, const DeviceBuffer<scalar>& gammaCell, const DeviceBuffer<scalar>& gx,
                        const DeviceBuffer<scalar>& gy, const DeviceBuffer<scalar>& gz, DeviceBuffer<scalar>& bp, DeviceBuffer<scalar>& ffcOut);
 

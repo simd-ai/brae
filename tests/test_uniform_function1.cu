@@ -152,6 +152,192 @@ int main()
         else { std::printf("  FAIL the plain form was refused too -- that breaks every case using it\n"); failures++; }
     }
 
+    // 5. surfaceNormalFixedValue / uniformNormalFixedValue with a Function1 refValue. OF samples a full
+    // PatchFunction1 every updateCoeffs; brae's reader used to SKIP the forms it cannot evaluate without
+    // marking them, so the patch built with an empty value array and every face got U_b = 0*n -- a silent
+    // zero inlet where the case prescribed a ramp (the class comment even said "any Function1 is
+    // ignored"). The reader must mark, and construction must refuse by name.
+    {
+        auto writeU = [&](const std::string& dir, const std::string& body)
+        {
+            std::filesystem::create_directories(dir);
+            const std::string path = dir + "/U";
+            std::ofstream f(path);
+            f << "FoamFile { version 2.0; format ascii; class volVectorField; object U; }\n"
+              << "dimensions [0 1 -1 0 0 0 0];\n"
+              << "internalField uniform (0 0 0);\n"
+              << "boundaryField\n{\n" << body << "\n}\n";
+            return path;
+        };
+        FvPatch p;
+        p.name = "inlet";
+        p.type = "patch";
+        p.size = 1;
+        p.faceCells.assign(1, 0);
+        p.deltaCoeffs.assign(1, 1.0);
+        p.nf.assign(1, vector{1, 0, 0});
+        p.magSf.assign(1, 1.0);
+
+        // A ramped inflow, straight from the OF tutorials' shape. Must refuse and name the table.
+        const FieldData<vector> tab = readField<vector>(writeU(base + "/snf/table",
+            "    inlet { type surfaceNormalFixedValue; refValue table ((0 0) (1 -10));\n"
+            "            value uniform (0 0 0); }"));
+        bool refused = false;
+        try { (void)makePatchField<vector>(p, tab.boundary.at(0)); }
+        catch (const std::exception& e)
+        {
+            const std::string w = e.what();
+            refused = w.find("surfaceNormalFixedValue") != std::string::npos
+                   && w.find("table") != std::string::npos;
+        }
+        if (refused) std::printf("  OK   surfaceNormalFixedValue + table refValue refused by name\n");
+        else { std::printf("  FAIL a table refValue built -- every face would get U_b = 0*n\n"); failures++; }
+
+        // NEGATIVE CONTROL: the constant form must still build, AND still compute refValue*n -- an
+        // accepted patch with the wrong arithmetic would pass a build-only check.
+        const FieldData<vector> plain = readField<vector>(writeU(base + "/snf/plain",
+            "    inlet { type surfaceNormalFixedValue; refValue uniform -10;\n"
+            "            value uniform (0 0 0); }"));
+        bool built = true; vector v0{};
+        try
+        {
+            auto pf = makePatchField<vector>(p, plain.boundary.at(0));
+            pf->evaluate({});   // buildField's job in real use; value_ is unset before it
+            v0 = pf->value().at(0);
+        }
+        catch (const std::exception&) { built = false; }
+        if (built && v0.x == -10.0 && v0.y == 0.0 && v0.z == 0.0)
+            std::printf("  OK   constant refValue still builds U_b = refValue*n = (-10 0 0)\n");
+        else { std::printf("  FAIL the constant form broke (built=%d, U_b=(%g %g %g))\n",
+                           (int)built, (double)v0.x, (double)v0.y, (double)v0.z); failures++; }
+
+        // The uniformNormalFixedValue spelling routes through the same slot; same rule.
+        const FieldData<vector> unf = readField<vector>(writeU(base + "/snf/uniform",
+            "    inlet { type uniformNormalFixedValue; uniformValue table ((0 0) (1 -10));\n"
+            "            value uniform (0 0 0); }"));
+        bool refused2 = false;
+        try { (void)makePatchField<vector>(p, unf.boundary.at(0)); }
+        catch (const std::exception& e)
+        { refused2 = std::string(e.what()).find("uniformValue") != std::string::npos; }
+        if (refused2) std::printf("  OK   uniformNormalFixedValue + table uniformValue refused too\n");
+        else { std::printf("  FAIL the uniformNormalFixedValue spelling still slips through\n"); failures++; }
+
+        // The MISSING entry arrives at the same zero inlet through a typo instead of a table. OF reads
+        // the entry unconditionally (PatchFunction1::New), so absence must refuse as well.
+        const FieldData<vector> miss = readField<vector>(writeU(base + "/snf/missing",
+            "    inlet { type surfaceNormalFixedValue; value uniform (0 0 0); }"));
+        bool refused3 = false;
+        try { (void)makePatchField<vector>(p, miss.boundary.at(0)); }
+        catch (const std::exception& e)
+        { refused3 = std::string(e.what()).find("without the refValue") != std::string::npos; }
+        if (refused3) std::printf("  OK   a missing refValue is refused, not run as U_b = 0\n");
+        else { std::printf("  FAIL a missing refValue built as a silent zero inlet\n"); failures++; }
+    }
+
+    // 6. fixedFluxPressure: built REAL (no longer the silent zeroGradient mapping), refusing assembly
+    // until the solver has run constrainPressure, and honouring the gradient it is handed after.
+    // OpenFOAM's own updateCoeffs fatals the same way (fixedFluxPressureFvPatchScalarField.C:150-163).
+    {
+        auto writeP = [&](const std::string& dir, const std::string& body)
+        {
+            std::filesystem::create_directories(dir);
+            const std::string path = dir + "/p";
+            std::ofstream f(path);
+            f << "FoamFile { version 2.0; format ascii; class volScalarField; object p; }\n"
+              << "dimensions [1 -1 -2 0 0 0 0];\n"
+              << "internalField uniform 100000;\n"
+              << "boundaryField\n{\n" << body << "\n}\n";
+            return path;
+        };
+        FvPatch p;
+        p.name = "outlet";
+        p.type = "patch";
+        p.size = 1;
+        p.faceCells.assign(1, 0);
+        p.deltaCoeffs.assign(1, 1.0);
+        p.nf.assign(1, vector{1, 0, 0});
+        p.magSf.assign(1, 1.0);
+
+        const FieldData<scalar> fd = readField<scalar>(writeP(base + "/ffp",
+            "    outlet { type fixedFluxPressure; value uniform 100000; }"));
+        auto pf = makePatchField<scalar>(p, fd.boundary.at(0));
+        if (pf->updateableSnGrad()) std::printf("  OK   fixedFluxPressure is updateable-snGrad\n");
+        else { std::printf("  FAIL fixedFluxPressure not updateable -- constrainPressure cannot reach it\n"); failures++; }
+
+        bool refusedStale = false;
+        try { (void)pf->valueBoundaryCoeffs(); }
+        catch (const std::exception& e)
+        { refusedStale = std::string(e.what()).find("updateSnGrad") != std::string::npos; }
+        if (refusedStale) std::printf("  OK   assembly before updateSnGrad refuses (OF fatals identically)\n");
+        else { std::printf("  FAIL a never-updated fixedFluxPressure reached the matrix silently\n"); failures++; }
+
+        pf->updateSnGrad(std::vector<scalar>{-0.5});
+        bool ok = true;
+        try
+        {
+            // fixedGradient's own (gated) formulas: gBC = g, vBC = g/deltaCoeffs (= g here).
+            ok = std::fabs((double)pf->gradientBoundaryCoeffs().at(0) + 0.5) < 1e-15
+              && std::fabs((double)pf->valueBoundaryCoeffs().at(0) + 0.5) < 1e-15;
+        }
+        catch (const std::exception&) { ok = false; }
+        if (ok) std::printf("  OK   after updateSnGrad the coefficients carry the solver's gradient\n");
+        else { std::printf("  FAIL the updated gradient did not reach the coefficients\n"); failures++; }
+
+        // control: an ordinary p BC is NOT updateable, and updateSnGrad on it is a wiring error.
+        const FieldData<scalar> plain = readField<scalar>(writeP(base + "/ffp2",
+            "    outlet { type fixedValue; value uniform 100000; }"));
+        auto pf2 = makePatchField<scalar>(p, plain.boundary.at(0));
+        bool wrong = false;
+        try { pf2->updateSnGrad(std::vector<scalar>{1.0}); }
+        catch (const std::exception&) { wrong = true; }
+        if (!pf2->updateableSnGrad() && wrong)
+            std::printf("  OK   fixedValue is not updateable and updateSnGrad on it throws (control)\n");
+        else { std::printf("  FAIL constrainPressure's dispatch would touch an ordinary patch\n"); failures++; }
+    }
+
+    // 7. mixedEnergy keeps its refValue through the reader; ramp on the normal-velocity BCs refuses.
+    {
+        FvPatch p;
+        p.name = "wall";
+        p.type = "wall";
+        p.size = 1;
+        p.faceCells.assign(1, 0);
+        p.deltaCoeffs.assign(1, 1.0);
+        p.nf.assign(1, vector{1, 0, 0});
+        p.magSf.assign(1, 1.0);
+
+        // mixedEnergy is what OpenFOAM WRITES into an he file; a restart read it through a gate that
+        // only accepted `mixed` and lost refValue, rebuilding the patch around zero.
+        const FieldData<scalar> me = readField<scalar>(writeField(base + "/mixede",
+            "    wall { type mixedEnergy; refValue uniform 420000; refGradient uniform 0;\n"
+            "           valueFraction uniform 1; value uniform 420000; }"));
+        const PatchFieldData<scalar>& b = me.boundary.at(0);
+        if (b.hasRefValue && b.refValueUniformValue == 420000.0)
+            std::printf("  OK   mixedEnergy keeps its refValue (was dropped by the mixed-only gate)\n");
+        else
+        { std::printf("  FAIL mixedEnergy refValue lost (has=%d val=%g)\n",
+                      (int)b.hasRefValue, (double)b.refValueUniformValue); failures++; }
+
+        // ramp: a Function1 of time multiplying the value every updateCoeffs
+        // (surfaceNormalFixedValueFvPatchVectorField.C:63-65) -- refused by name, not dropped.
+        std::filesystem::create_directories(base + "/ramp");
+        {
+            std::ofstream f(base + "/ramp/U");
+            f << "FoamFile { version 2.0; format ascii; class volVectorField; object U; }\n"
+              << "dimensions [0 1 -1 0 0 0 0];\ninternalField uniform (0 0 0);\n"
+              << "boundaryField\n{\n"
+              << "    wall { type surfaceNormalFixedValue; refValue uniform -10;\n"
+              << "           ramp table ((0 0) (1 1)); value uniform (0 0 0); }\n}\n";
+        }
+        const FieldData<vector> rv = readField<vector>(base + "/ramp/U");
+        bool refused = false;
+        try { (void)makePatchField<vector>(p, rv.boundary.at(0)); }
+        catch (const std::exception& e)
+        { refused = std::string(e.what()).find("ramp") != std::string::npos; }
+        if (refused) std::printf("  OK   a ramp on surfaceNormalFixedValue is refused by name\n");
+        else { std::printf("  FAIL the ramp key was silently dropped -- a constant inlet where the case asked for a ramp\n"); failures++; }
+    }
+
     std::printf("uniform_function1: %d failures\n", failures);
     return failures == 0 ? 0 : 1;
 }

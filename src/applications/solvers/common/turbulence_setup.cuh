@@ -5,6 +5,7 @@
 // guards wall-function-on-non-wall patches, and applies the turbulent-inlet BCs. Bodies extracted verbatim from
 // gpuSimpleFoam so both drivers stay identical. Call readTurbulenceModel BEFORE readTurbulenceFields (needs ctl.sst).
 #include "solver_controls.cuh"
+#include "patch_entry_lookup.cuh"
 #include "foam_dict.cuh"
 #include "brae_notice.cuh"
 #include "foam_field_reader.cuh"
@@ -14,6 +15,7 @@
 #include "komega_sst_coeffs.cuh"
 #include "spalart_coeffs.cuh"
 #include "turbulent_inlet.cuh"
+#include "frozen_bc_guard.cuh"
 #include <cstdio>
 #include <string>
 #include <utility>
@@ -22,7 +24,153 @@
 namespace brae {
 
 // constant/turbulenceProperties RASModel -> ctl turbulence flags + coeffs (ctl.turbulent must already be set).
-inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls& ctl)
+// The nut wall function the case's 0/nut SELECTS, and the refusals that go with it. Free rather than a
+// lambda inside readTurbulenceFields because simpleFoamV2 needs the same answer: it had no selector at
+// all and ran the k-based nutk under every BC, so a `nutUBlendedWallFunction` case got a wall viscosity
+// from the wrong formula -- measured on backwardFacingStep2D as a wall nut of 0 where the dispatching
+// path gives up to 1.5e-01. One implementation, because a second one is how the two paths disagree
+// about what the case asked for.
+// Foam::bound's lower bounds, read from the TOP LEVEL of a RAS or LES sub-dict exactly as OpenFOAM
+// does: RASModel.C:73-99 and LESModel.C:82-111 both call getOrAddToDict("kMin"/"epsilonMin"/"omegaMin",
+// <the sub-dict>, ..., SMALL). A free function with three callers rather than three parses, because
+// brae has THREE independent readers of constant/turbulenceProperties -- this one, simpleFoamV2's own,
+// and the rhoSimpleFoam mirror's -- and a key added to one of them is a key silently ignored on the
+// other two. That is the shape the turbulence preconditioner policy was in until it was made one rule.
+//
+// `dict` is the RAS or the LES sub-dict; null leaves every default alone. nuTilda, ReThetat and gammaInt
+// are NOT plumbed: OpenFOAM bounds those at a literal Zero (SpalartAllmarasBase.C:487, kOmegaSSTLM.C:548
+// and :585), not at kMin, so brae's 0.0 there is already right.
+inline void readTurbulenceMinima(
+    const FoamDict* dict,
+    scalar&         kMin,
+    scalar&         epsilonMin,
+    scalar&         omegaMin)
+{
+    if (!dict) return;
+    kMin       = dict->scalarOr("kMin", kMin);
+    epsilonMin = dict->scalarOr("epsilonMin", epsilonMin);
+    omegaMin   = dict->scalarOr("omegaMin", omegaMin);
+}
+
+inline bool isNutWallFnType(const std::string& t)
+{
+    return t == "nutkWallFunction"      || t == "nutUSpaldingWallFunction"
+        || t == "nutLowReWallFunction"  || t == "nutUBlendedWallFunction"
+        || t == "nutUWallFunction"      || t == "atmNutkWallFunction";
+}
+
+inline void selectNutWall(
+    const FieldData<scalar>&    nutFD,
+    const std::vector<FvPatch>& fvp,
+    bool                        sa,
+    const std::string&          modelName,
+    NutWall&                    nutWall,
+    scalar&                     atmZ0,
+    bool&                       atmBoundNut)
+{
+
+            std::string wallFnSeen;   // the first wall function seen; a second, different one refuses
+            for (const auto& pb : nutFD.boundary)
+            {
+                // Only wall patches drive the choice -- resolved through the same machinery buildField
+                // uses, so a regex key covering the walls counts as the walls. An entry resolving to NO
+                // patch keeps participating (the old exact-name compare let it, and the refusal
+                // fixtures stage conflicts through exactly such entries).
+                const auto resolved = patchesResolvingTo(nutFD.boundary, pb, fvp);
+                bool onWall = resolved.empty();
+                for (const FvPatch* q : resolved)
+                    if (q->type == "wall") { onWall = true; break; }
+                if (!onWall) continue;
+                if (pb.type == "nutUSpaldingWallFunction") { nutWall = NutWall::Spalding; }
+                else if (pb.type == "nutUBlendedWallFunction") { nutWall = NutWall::Blended; }
+                // nutUWallFunction: OF's default blender is STEPWISE (nutUWallFunctionFvPatchScalarField.C:259,
+                // wallFunctionBlenders(dict, blenderType::STEPWISE, 4)). Any other blender is a different
+                // formula, so it is refused rather than approximated by the stepwise one.
+                else if (pb.type == "nutUWallFunction") { nutWall = NutWall::NutU; }
+                else if (pb.type == "atmNutkWallFunction")   // atmospheric rough-wall nut (k-based path + roughness z0)
+                {
+                    atmZ0 = pb.ablZ0;               // roughness length (from `z0` / $z0 include)
+                    atmBoundNut = pb.atmBoundNut;  // clamp nut>=0 option
+                    printf("  nut wall function: atmNutkWallFunction (rough, z0=%g, boundNut=%s) on %s per the BC\n",
+                           (double)atmZ0, atmBoundNut ? "true" : "false", modelName.c_str());
+                }
+                // nutLowReWallFunction: OF's calcNut() returns Zero UNCONDITIONALLY
+                // (nutLowReWallFunctionFvPatchScalarField.C:38-42 is the entire function). This used to
+                // warn on stderr and fall through to nutk, justified as identical on a resolved mesh --
+                // and that justification does not hold: nutk's yPlus is the K-BASED
+                // Cmu^0.25*y*sqrt(k)/nu, not u_tau*y/nu, so a mesh resolved in friction units can carry
+                // k-based y+ above yPlusLam and take the log branch where OpenFOAM returns 0. It is now
+                // selected rather than substituted; writing zero is exact and cheaper than the log law.
+                else if (pb.type == "nutLowReWallFunction") { nutWall = NutWall::LowRe; }
+                // ONE SELECTOR, SO ONE FUNCTION. OpenFOAM dispatches per patch --
+                // nutWallFunctionFvPatchScalarField.C:181-184 is operator==(calcNut()) on each patch's own
+                // object -- so every wall may carry a different one and OpenFOAM honours each. nutWall
+                // is a single case-wide value, and the winner's kernel then rewrites EVERY wall face
+                // (device_kepsilon.cu spaldingNutKernel/blendedNutKernel/nutUWallKernel all write
+                // unconditionally where isWall). The per-face rescues are gated `type != wall`, so nothing
+                // spares the losing patch.
+                //
+                // Two ways that went wrong silently, both now refused rather than resolved by accident:
+                //   * LAST WINS. The loop assigns as it walks the boundary list, so the last matching
+                //     patch decided for all of them.
+                //   * nutk CANNOT WIN BACK. There is no `nutkWallFunction` branch here and no restoring
+                //     else, so once any patch selected a non-nutk function every wall got it -- including
+                //     the walls that explicitly asked for nutkWallFunction.
+                //
+                // Same shape as the z0 refusal this driver already carries for atmNutkWallFunction
+                // (simpleFoamV2.cu:942-952): brae holds one value, so two different ones must be refused
+                // rather than averaged into a case nobody described.
+                if (!wallFnSeen.empty() && wallFnSeen != pb.type && isNutWallFnType(pb.type))
+                    throw std::runtime_error(
+                        "brae: 0/nut carries more than one nut wall function on wall patches ('"
+                        + wallFnSeen + "' and '" + pb.type + "'). This driver applies ONE wall function to "
+                        "every wall, so running would give a wall the function another patch asked for. "
+                        "OpenFOAM dispatches per patch and honours both. Refusing rather than silently "
+                        "picking whichever the boundary list happens to end on.");
+                if (isNutWallFnType(pb.type)) wallFnSeen = pb.type;
+            }
+            if (!sa && nutWall != NutWall::Nutk)
+            {
+                // LowRe is NOT velocity-based, so it cannot ride the ternary below -- labelling it
+                // `nutUBlendedWallFunction (velocity-based)` would misreport the one case this branch
+                // was just taught to handle.
+                if (nutWall == NutWall::LowRe)
+                    printf("  nut wall function: nutLowReWallFunction (nut = 0 at the wall, honoured on "
+                           "%s per the BC)\n", modelName.c_str());
+                else
+                    printf("  nut wall function: %s (velocity-based, honoured on %s per the BC)\n",
+                           nutWall == NutWall::Spalding ? "nutUSpaldingWallFunction"
+                           : nutWall == NutWall::NutU ? "nutUWallFunction" : "nutUBlendedWallFunction",
+                           modelName.c_str());
+            }
+}
+
+// What the CALLING DRIVER can actually RUN. OpenFOAM's laminarModel::New selects from a table of
+// three -- Stokes, generalizedNewtonian and Maxwell (turbulentFluidThermoModels.C compressible,
+// turbulentTransportModels.C incompressible) -- but which of them a given brae driver APPLIES is a
+// property of the driver, not of OpenFOAM, and this reader is shared by six of them.
+//
+// There is NO DEFAULT, deliberately: a permissive default is exactly how a shared reader comes to
+// promise a capability on behalf of a driver that has none. That already happened here. `ctl.gnPowerLaw`
+// is consumed ONLY on the compressible legacy path (device_simple_foam.cu:1319, guarded by
+// `compressible_`, and :3540 inside rhoSimpleStep), so incompressible simpleFoam read the model,
+// PRINTED "laminar generalizedNewtonian/powerLaw: n=..." and then ran Stokes -- a case told, in its own
+// log, that a viscosity model it never got was in force. Omitting the default makes the compiler list
+// every call site so each one states the truth about itself.
+struct LaminarEnvelope
+{
+    const char* driver;                    // named in the refusal, so the message says WHICH arm
+    bool        generalizedNewtonianPowerLaw;
+    bool        maxwell;
+};
+
+
+// OF laminarModel::New. `simulationType laminar` DOES NOT MEAN "no model": Stokes is one entry in that
+// table and the only one that leaves the molecular viscosity alone.
+inline void readLaminarModel(
+    const FoamDict&        turbProps,
+    DeviceSimpleControls&  ctl,
+    const LaminarEnvelope& env)
 {
         // `simulationType laminar` DOES NOT MEAN "no model". OF selects a laminarModel, and the default
         // (Stokes) is the only one that leaves the molecular viscosity alone. A
@@ -37,23 +185,67 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
         // produced a confident non-converged answer (Ux 1.9e-2, p 3.4e-1 still oscillating at iteration
         // 500). The dict audit did flag `laminar/` as unread, which is what a notice is for; a viscosity
         // model is not a notice-level omission.
-        if (!ctl.turbulent)
         {
             if (const FoamDict* lam = turbProps.subDict("laminar"))
             {
-                const std::string lmodel = lam->wordOr("model", "Stokes");
+                // laminarModel.C reads `model`, with the pre-v2006 spelling `laminarModel` as an alias.
+                // A case using the old key got Stokes silently.
+                const std::string lmodel = lam->found("model") ? lam->wordOr("model", "Stokes")
+                                                               : lam->wordOr("laminarModel", "Stokes");
                 if (lmodel == "generalizedNewtonian")
                 {
-                    // OF reads the coefficients from powerLawCoeffs{} if present, else from the enclosing
-                    // dictionary (dictionary::optionalSubDict), which is how this tutorial writes them.
-                    const std::string vm = lam->wordOr("viscosityModel", "");
+                    // THE ENVELOPE, before anything is parsed: a driver that does not apply the model
+                    // must refuse the case, not read the coefficients and announce them. nuEff() RETURNS
+                    // nu_ (generalizedNewtonian.C:139-146) -- the model REPLACES the molecular viscosity
+                    // rather than adding to it -- so ignoring it is a different momentum equation, not a
+                    // small error. Measured on OpenFOAM's own squareBendLiqNoNewtonian: nu sits at nuMin
+                    // = 1e-3 over the whole field against a molecular mu/rho of 3.9e-7..9.1e-7, which is
+                    // 1101x to 2532x. Measured on validation/rhoBox with that same laminar block: brae
+                    // ignoring it differs from OpenFOAM by 5.74e-01 relative on U.
+                    if (!env.generalizedNewtonianPowerLaw)
+                        throw std::runtime_error(
+                            std::string("brae: ") + env.driver + " -- constant/turbulenceProperties asks "
+                            "for `laminar { model generalizedNewtonian; }`, which this arm does not apply. "
+                            "OpenFOAM's generalizedNewtonian nuEff() RETURNS the model's nu rather than "
+                            "adding to the molecular one, so running without it is a different momentum "
+                            "equation: on OpenFOAM's own squareBendLiqNoNewtonian the model's nu is 1101x "
+                            "to 2532x the molecular value. Refusing rather than running Stokes under "
+                            "another model's name.");
+                    // TWO optionalSubDict levels, as OpenFOAM resolves them. The model's coeffDict_ is
+                    // laminar.optionalSubDict("generalizedNewtonianCoeffs") (laminarModel.C:73), and
+                    // generalizedNewtonianViscosityModel::New reads `viscosityModel` from THAT, mandatory
+                    // (generalizedNewtonianViscosityModelNew.C:39); powerLaw then reads its coefficients
+                    // from coeffDict_.optionalSubDict("powerLawCoeffs") (powerLaw.C:62). The tutorial writes
+                    // everything flat in laminar{}; a case nesting it one level down used to be refused
+                    // as "viscosityModel ''" because only the flat spelling was looked at.
+                    const FoamDict* gc = lam->subDict("generalizedNewtonianCoeffs");
+                    const FoamDict& cd = gc ? *gc : *lam;
+                    if (!cd.found("viscosityModel"))
+                        throw std::runtime_error(
+                            "brae: laminar model generalizedNewtonian needs `viscosityModel` (OpenFOAM reads "
+                            "it with no default, generalizedNewtonianViscosityModelNew.C:39).");
+                    const std::string vm = cd.wordOr("viscosityModel", "");
                     if (vm != "powerLaw")
                         throw std::runtime_error(
                             "brae: unsupported generalizedNewtonian viscosityModel '" + vm +
-                            "' (only 'powerLaw' is implemented).");
-                    const FoamDict* co = lam->subDict("powerLawCoeffs");
-                    const FoamDict& src = co ? *co : *lam;
+                            "' (only 'powerLaw' is implemented; OpenFOAM v2412 also offers BirdCarreau, "
+                            "Casson, CrossPowerLaw, HerschelBulkley and strainRateFunction).");
+                    const FoamDict* co = cd.subDict("powerLawCoeffs");
+                    const FoamDict& src = co ? *co : cd;
                     ctl.gnPowerLaw = true;
+                    // ALL THREE are required: OF powerLaw.C:63-65 constructs n_, nuMin_ and nuMax_
+                    // straight from the dict with no default, and fatals on a missing entry. The old
+                    // guard tested only nuMax, so a case missing `n` silently got n = 1.0 -- which makes
+                    // nu = nu0 identically, the NEWTONIAN answer, on a case that asked for shear
+                    // thinning. squareBendLiqNoNewtonian records what that is worth: nu sits at nuMin
+                    // over essentially the whole field, ~1120x the Newtonian value (see above).
+                    if (!src.found("n") || !src.found("nuMin") || !src.found("nuMax"))
+                        throw std::runtime_error(
+                            "brae: generalizedNewtonian powerLaw needs all three of n, nuMin, nuMax "
+                            "(OpenFOAM powerLaw.C constructs each with no default and fatals without "
+                            "it); missing: " + std::string(!src.found("n") ? "n " : "")
+                            + (!src.found("nuMin") ? "nuMin " : "")
+                            + (!src.found("nuMax") ? "nuMax" : ""));
                     ctl.gnN     = src.scalarOr("n", 1.0);
                     ctl.gnNuMin = src.scalarOr("nuMin", 0.0);
                     ctl.gnNuMax = src.scalarOr("nuMax", 0.0);
@@ -64,6 +256,12 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                 }
                 else if (lmodel == "Maxwell")
                 {
+                    if (!env.maxwell)
+                        throw std::runtime_error(
+                            std::string("brae: ") + env.driver + " -- constant/turbulenceProperties asks "
+                            "for `laminar { model Maxwell; }`, a viscoelastic stress transport this arm "
+                            "does not run. Refusing rather than solving the Newtonian momentum equation "
+                            "under a viscoelastic model's name.");
                     // OF laminarModels::Maxwell. dimensionedScalar(name, dims, coeffDict_) THROWS when the
                     // entry is absent, and coeffDict_ is dictionary::optionalSubDict("MaxwellCoeffs") --
                     // so both spellings the tutorials use are valid: planarPoiseuille writes the
@@ -91,6 +289,17 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                         "running without it is a different momentum equation, not an approximation.");
             }
         }
+}
+
+
+// RAS/LES selection, plus the laminar table above when the case is not turbulent. The envelope is
+// carried through rather than defaulted -- see LaminarEnvelope.
+inline void readTurbulenceModel(
+    const FoamDict&        turbProps,
+    DeviceSimpleControls&  ctl,
+    const LaminarEnvelope& env)
+{
+        if (!ctl.turbulent) readLaminarModel(turbProps, ctl, env);
         if (ctl.turbulent)
         {
             // simulationType LES: DES/LES models live under an LES{} sub-dict (OF convention). SA-DDES reuses the SA
@@ -107,6 +316,7 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                 if (!saDes && !sstDes && !smag && !wale)
                     throw std::runtime_error("brae: unsupported LESModel '" + model
                         + "' (Smagorinsky, WALE, SpalartAllmarasDDES/DES/IDDES or kOmegaSSTDDES/DES/IDDES)");
+                ctl.modelName = model;
                 const std::string delta = les->wordOr("delta", "cubeRootVol");
                 if (delta == "maxDeltaxyz")
                 {
@@ -115,7 +325,10 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                         ctl.lesDeltaCoeff = mc->scalarOr("deltaCoeff", ctl.lesDeltaCoeff);
                 }
                 else if (!saIddes && !sstIddes && delta != "cubeRootVol")   // IDDES computes its own (maxDeltaxyz-based) length scale internally
-                    std::fprintf(stderr, "brae WARNING: LES delta '%s' not supported; using cubeRootVol (V^(1/3)).\n", delta.c_str());
+                    // Refused, not substituted: the filter width IS the model on an LES, and this used to
+                    // print a warning and run cubeRootVol under the case's own `delta` (item 16e).
+                    throw std::runtime_error("brae: LES delta '" + delta + "' is not ported (cubeRootVol, "
+                                             "maxDeltaxyz); refusing rather than running cubeRootVol under it.");
                 const FoamDict* dc = les->subDict(model + "Coeffs");
                 if (wale)   // WALE: the other ALGEBRAIC sub-grid nut. Same slot as Smagorinsky -- no transport
                 {           // scalar, no DES limiter -- only the velocity scale differs (see WaleCoeffs).
@@ -216,6 +429,11 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
                         std::printf("  %s (kOmegaSST-DES, delta=%s): CDES1=%.4g CDES2=%.4g betaStar=%.4g a1=%.4g\n",
                                     model.c_str(), ctl.lesDeltaMax ? "maxDeltaxyz" : "cubeRootVol", ctl.ksstCoeffs.CDES1, ctl.ksstCoeffs.CDES2, ctl.ksstCoeffs.betaStar, ctl.ksstCoeffs.a1);
                 }
+                // The DES arms reuse the kOmegaSST/SA transport and bound with it, and their floors
+                // come from LES{} rather than RAS{} (LESModel.C:82-111). This return is why a RAS-only
+                // read would never have reached them.
+                readTurbulenceMinima(les, ctl.ksstCoeffs.kMin, ctl.keCoeffs.epsilonMin, ctl.ksstCoeffs.omegaMin);
+                ctl.keCoeffs.kMin = ctl.ksstCoeffs.kMin;
                 return;
             }
             const FoamDict* ras = turbProps.subDict("RAS");
@@ -224,6 +442,11 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
             {
                 const std::string sw = ras->wordOr("turbulence", "true");
                 ctl.turbulenceOn = !(sw == "off" || sw == "no" || sw == "false" || sw == "0");
+                // Read BEFORE the turbulence-off early exit below: OpenFOAM constructs kMin_ and bounds
+                // in the model constructor whether or not `turbulence` is on (RASModel.C:73 runs
+                // regardless of :70), so a frozen case still carries the case's floors.
+                readTurbulenceMinima(ras, ctl.keCoeffs.kMin, ctl.keCoeffs.epsilonMin, ctl.ksstCoeffs.omegaMin);
+                ctl.ksstCoeffs.kMin = ctl.keCoeffs.kMin;
                 if (!ctl.turbulenceOn)
                     noticeApplied("turbulenceProperties RAS/turbulence",
                                   "'" + sw + "' -- the model is FROZEN: k/epsilon|omega/nut keep their initial "
@@ -238,11 +461,34 @@ inline void readTurbulenceModel(const FoamDict& turbProps, DeviceSimpleControls&
             const bool rng = (model == "RNGkEpsilon");
             if (model != "kEpsilon" && !rke && !rng && !ctl.sst && !ctl.sa)
                 throw std::runtime_error("brae: unsupported RASModel '" + model + "' (kEpsilon, RNGkEpsilon, realizableKE, kOmegaSST, kOmegaSSTLM or SpalartAllmaras)");
+            ctl.modelName = model;
             if (ctl.sa)
             {
-                // Spalart-Allmaras: OF defaults (coeffs read from RAS.SpalartAllmarasCoeffs would override; not needed here).
-                const SpalartAllmarasCoeffs& c = ctl.saCoeffs;
-                std::printf("  SpalartAllmaras (OF defaults): sigmaNut=%.4g kappa=%.4g Cb1=%.4g Cb2=%.4g Cw1=%.4g Cw2=%.3g Cw3=%.3g Cv1=%.3g Cs=%.3g\n",
+                // Every coefficient from the model's coeffDict, as SpalartAllmarasBase.C:205-312 reads
+                // them (getOrAddToDict on optionalSubDict("SpalartAllmarasCoeffs"), i.e. the RAS dict
+                // itself when the sub-dictionary is absent). This block took the defaults whatever the
+                // case wrote (item 16d). ft2's term (ck, Ct3, Ct4) is not implemented, so a case that
+                // switches it on is refused rather than run without it.
+                const FoamDict* sc = ras ? ras->optionalSubDict("SpalartAllmarasCoeffs") : nullptr;
+                SpalartAllmarasCoeffs& c = ctl.saCoeffs;
+                if (sc)
+                {
+                    c.sigmaNut = sc->scalarOr("sigmaNut", c.sigmaNut);
+                    c.kappa    = sc->scalarOr("kappa",    c.kappa);
+                    c.Cb1      = sc->scalarOr("Cb1",      c.Cb1);
+                    c.Cb2      = sc->scalarOr("Cb2",      c.Cb2);
+                    c.Cw2      = sc->scalarOr("Cw2",      c.Cw2);
+                    c.Cw3      = sc->scalarOr("Cw3",      c.Cw3);
+                    c.Cv1      = sc->scalarOr("Cv1",      c.Cv1);
+                    c.Cs       = sc->scalarOr("Cs",       c.Cs);
+                    const std::string ft2 = sc->wordOr("ft2", "false");
+                    if (ft2 == "true" || ft2 == "yes" || ft2 == "on" || ft2 == "1")
+                        throw std::runtime_error("brae: SpalartAllmarasCoeffs ft2 is on; the ft2 laminar-suppression "
+                                                 "term (ck, Ct3, Ct4 in SpalartAllmarasBase.C) is not implemented. "
+                                                 "Refusing rather than running the model without it.");
+                }
+                std::printf("  SpalartAllmaras%s: sigmaNut=%.4g kappa=%.4g Cb1=%.4g Cb2=%.4g Cw1=%.4g Cw2=%.3g Cw3=%.3g Cv1=%.3g Cs=%.3g\n",
+                            sc ? " (coeffDict)" : " (OF defaults)",
                             c.sigmaNut, c.kappa, c.Cb1, c.Cb2, c.Cw1(), c.Cw2, c.Cw3, c.Cv1, c.Cs);
             }
             else if (ctl.sst)
@@ -332,19 +578,31 @@ struct TurbulenceFields { GeometricField<scalar> k, eps, nut, ReThetat, gammaInt
 
 inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const std::vector<FvPatch>& fvp, label nC,
                                              DeviceSimpleControls& ctl, const std::string& secondName,
-                                             const GeometricField<vector>& U)
+                                             const GeometricField<vector>& U,
+                                             // Non-null: the calling driver does NOT maintain per-step
+                                             // boundaries on these fields, so refuse them by that name
+                                             // (frozen_bc_guard.cuh). gpuPimpleFoam maintains fixedMean
+                                             // on k/epsilon/omega/nuTilda/nut and passes null.
+                                             const char* frozenGuardDriver = nullptr,
+                                             bool frozenGuardCodedMaintained = false)
 {
+    auto guardFrozen = [&](const FieldData<scalar>& fd, const std::string& nm)
+    {
+        if (frozenGuardDriver)
+            refuseFrozenPerStepBC(fd, nm, frozenGuardDriver, frozenGuardCodedMaintained);
+    };
     TurbulentInletMasks masks;
         // Wall-function fidelity guard -- fail loud on a nut/epsilon/omega wall-function BC placed on a patch NOT typed
         // 'wall': brae gates the near-wall model on the geometric patch type, so the wall function would be SILENTLY
-        // inert. Conservative on the patch match -- only errors when the BC patch resolves to a concrete non-'wall'
-        // patch (group/regex names are skipped). NOTE: nutUSpalding/nutUBlended on a non-SA model are NO LONGER an
+        // inert. The entry resolves to its patches through the SAME machinery buildField uses
+        // (patchesResolvingTo: exact name, group, regex, last pattern wins), so a regex-keyed wall
+        // function -- `"(upperWall|lowerWall)"` is how backwardFacingStep2D writes every one of its wall
+        // BCs -- is checked like a concrete one. It used to be compared by exact name and silently
+        // skipped (audit finding #16), which disarmed this guard on exactly the cases that use it most.
+        // An entry that resolves to NO patch is dead text and stays skipped, as OpenFOAM ignores it.
+        // NOTE: nutUSpalding/nutUBlended on a non-SA model are NO LONGER an
         // error -- brae now honours the velocity-based nut wall function on any RAS model (see setNutWall + the
         // NutWall dispatch in device_simple_foam.cuh), matching OpenFOAM.
-        auto patchGeoType = [&](const std::string& nm) -> std::string {
-            for (const auto& q : fvp) if (q.name == nm) return q.type;
-            return "";
-        };
         auto guardWallFn = [&](const FieldData<scalar>& fd, const std::string& field) {
             auto isWF = [](const std::string& t) {
                 return t == "nutkWallFunction" || t == "nutUSpaldingWallFunction" || t == "nutLowReWallFunction"
@@ -353,50 +611,47 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
             for (const auto& pb : fd.boundary)
             {
                 if (!isWF(pb.type)) continue;
-                const std::string gt = patchGeoType(pb.name);
-                if (!gt.empty() && gt != "wall")
-                    throw std::runtime_error(field + " boundary '" + pb.name + "' uses " + pb.type + ", but the patch"
-                        " is type '" + gt + "' (not 'wall'). brae applies the near-wall model only on 'wall' patches, so"
-                        " it would be SILENTLY inert (no wall shear / near-wall constraint). Retype the patch as 'wall'"
-                        " in constant/polyMesh/boundary.");
+                for (const FvPatch* q : patchesResolvingTo(fd.boundary, pb, fvp))
+                    if (q->type != "wall")
+                        throw std::runtime_error(field + " boundaryField key '" + pb.name + "' (" + pb.type
+                            + ") resolves to patch '" + q->name + "', which is type '" + q->type + "' (not"
+                            " 'wall'). brae applies the near-wall model only on 'wall' patches, so"
+                            " it would be SILENTLY inert (no wall shear / near-wall constraint). Retype the patch as 'wall'"
+                            " in constant/polyMesh/boundary.");
             }
         };
         // Pick the nut wall function from the 0/nut wall-patch BC TYPE (OpenFOAM does this per-BC, not by model):
         // nutUSpalding -> Spalding, nutUBlended -> Blended, else nutk. Warn once on nutLowRe (mapped to nutk: identical
         // only on a resolved y+<yPlusLam mesh). SA keeps its Spalding path regardless (ctl.sa short-circuits below).
+        // The nut wall-function family, in one place so the refusal below and guardWallFn cannot drift.
+        auto isNutWallFn = [](const std::string& t) { return isNutWallFnType(t); };
         auto setNutWall = [&](const FieldData<scalar>& fd) {
-            for (const auto& pb : fd.boundary)
-            {
-                const std::string gt = patchGeoType(pb.name);
-                if (!gt.empty() && gt != "wall") continue;                 // only wall patches drive the choice
-                if (pb.type == "nutUSpaldingWallFunction") { ctl.nutWall = NutWall::Spalding; }
-                else if (pb.type == "nutUBlendedWallFunction") { ctl.nutWall = NutWall::Blended; }
-                // nutUWallFunction: OF's default blender is STEPWISE (nutUWallFunctionFvPatchScalarField.C:259,
-                // wallFunctionBlenders(dict, blenderType::STEPWISE, 4)). Any other blender is a different
-                // formula, so it is refused rather than approximated by the stepwise one.
-                else if (pb.type == "nutUWallFunction") { ctl.nutWall = NutWall::NutU; }
-                else if (pb.type == "atmNutkWallFunction")   // atmospheric rough-wall nut (k-based path + roughness z0)
-                {
-                    ctl.atmZ0 = pb.ablZ0;               // roughness length (from `z0` / $z0 include)
-                    ctl.atmBoundNut = pb.atmBoundNut;  // clamp nut>=0 option
-                    printf("  nut wall function: atmNutkWallFunction (rough, z0=%g, boundNut=%s) on %s per the BC\n",
-                           (double)ctl.atmZ0, ctl.atmBoundNut ? "true" : "false", ctl.sst ? "kOmegaSST" : "kEpsilon");
-                }
-                else if (pb.type == "nutLowReWallFunction")
-                    fprintf(stderr, "brae WARNING: nut boundary '%s' uses nutLowReWallFunction; brae applies "
-                        "nutkWallFunction (log law). Identical only where y+<yPlusLam (resolved mesh).\n", pb.name.c_str());
-            }
-            if (!ctl.sa && ctl.nutWall != NutWall::Nutk)
-                printf("  nut wall function: %s (velocity-based, honoured on %s per the BC)\n",
-                       ctl.nutWall == NutWall::Spalding ? "nutUSpaldingWallFunction"
-                       : ctl.nutWall == NutWall::NutU ? "nutUWallFunction" : "nutUBlendedWallFunction",
-                       ctl.sst ? "kOmegaSST" : "kEpsilon");
+            selectNutWall(fd, fvp, ctl.sa, ctl.modelName, ctl.nutWall, ctl.atmZ0, ctl.atmBoundNut);
         };
         GeometricField<scalar> k, eps, nut, ReThetat, gammaInt;   // ReThetat/gammaInt: kOmegaSSTLM transition
         if (ctl.les)   // pure LES Smagorinsky: ONLY nut (algebraic sub-grid viscosity); no k/epsilon/omega/nuTilda transport.
         {
             const FieldData<scalar> nutFD = readField<scalar>(fieldDir + "/nut");
+            guardFrozen(nutFD, "nut");
             guardWallFn(nutFD, "nut");
+            // The algebraic-LES device path honours EXACTLY ONE nut wall function -- nutUSpalding
+            // (device_simple_foam.cu, ctl_.nutWall == NutWall::Spalding on the ctl_.les arm); every
+            // other selection falls to plain cell-value extrapolation there, while setNutWall printed
+            // the case's function as honoured -- the audit's finding #14: an LES case with
+            // nutkWallFunction ran with no wall model at all and the log said otherwise. The k-based
+            // family is not portable here either way -- algebraic LES carries no k field, and OpenFOAM
+            // feeds those functions the model's own sgs k() estimate. BEFORE setNutWall, so the refused
+            // run never prints a wall function as honoured.
+            for (const auto& pb : nutFD.boundary)
+            {
+                if (isNutWallFn(pb.type) && pb.type != "nutUSpaldingWallFunction")
+                    throw std::runtime_error(
+                        "brae: 0/nut patch '" + pb.name + "' asks for " + pb.type + " on LESModel "
+                        + ctl.modelName + ". The algebraic-LES path honours only "
+                        "nutUSpaldingWallFunction (velocity-based); any other wall function would run "
+                        "as plain extrapolation under the case's name. Refusing rather than running "
+                        "without the wall model the case asked for.");
+            }
             setNutWall(nutFD);   // honour a velocity-based nut wall function (nutUSpaldingWallFunction) if the case uses one
             nut = buildField<scalar>(nutFD, fvp, nC);
             nut.evaluateBoundary();
@@ -406,22 +661,127 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
             k   = buildField<scalar>(readField<scalar>(fieldDir + "/nuTilda"), fvp, nC);
             k.evaluateBoundary();
             const FieldData<scalar> nutFD = readField<scalar>(fieldDir + "/nut");
+            guardFrozen(nutFD, "nut");
             guardWallFn(nutFD, "nut");
+            // The SA device path used to hard-force Spalding (`ctl_.sa || ...` in device_simple_foam.cu)
+            // whatever 0/nut asked for -- the audit's finding #15. bump2D:SpalartAllmaras ships
+            // nutLowReWallFunction, whose calcNut() returns Zero UNCONDITIONALLY on every model
+            // (nutLowReWallFunctionFvPatchScalarField.C:38-42), and got a Newton uTau instead. The BC
+            // selects now: Spalding and LowRe are honoured; the k-based family refuses -- OpenFOAM
+            // feeds it SpalartAllmarasBase::k(), the derived estimate
+            // cbrt(fv1)*nuTilda*sqrt(2/Cmu)*|symm(grad U)| (SpalartAllmarasBase.C:394-405), which brae
+            // does not carry; and a concrete wall patch whose nut names NO wall function refuses too,
+            // because the device writes the selected function on every wall face and has no
+            // evaluate-the-BC path to spare it. A case where no wall-typed patch names any nut wall
+            // function keeps the Spalding arithmetic every existing SA gate was measured on.
+            std::string saWallFn;
+            for (const auto& pb : nutFD.boundary)
+            {
+                if (isNutWallFn(pb.type))
+                {
+                    if (pb.type != "nutUSpaldingWallFunction" && pb.type != "nutLowReWallFunction")
+                        throw std::runtime_error(
+                            "brae: 0/nut patch '" + pb.name + "' asks for " + pb.type + " on "
+                            "SpalartAllmaras. The SA path honours nutUSpaldingWallFunction (Newton "
+                            "uTau) and nutLowReWallFunction (zero); OpenFOAM computes the k-based "
+                            "family from the model's derived k() estimate, which brae does not carry. "
+                            "Refusing rather than running Spalding under the case's name.");
+                    if (!saWallFn.empty() && saWallFn != pb.type)
+                        throw std::runtime_error(
+                            "brae: 0/nut carries both '" + saWallFn + "' and '" + pb.type + "' on "
+                            "SpalartAllmaras. This driver applies ONE wall function to every wall; "
+                            "OpenFOAM dispatches per patch and honours both. Refusing rather than "
+                            "silently picking one.");
+                    saWallFn = pb.type;
+                }
+            }
+            // The plain-BC-on-a-wall check runs PATCH-DRIVEN, resolving each wall patch's entry the way
+            // buildField does -- an entry keyed `"wal.*"` used to be invisible to the exact-name compare
+            // here (audit finding #16), so a regex-keyed plain fixedValue on the walls still got the
+            // Spalding hard-force. A wall patch with NO entry at all is left to buildField's own fatal.
+            for (const auto& q : fvp)
+            {
+                if (q.type != "wall") continue;
+                const auto* e = findPatchEntry(nutFD.boundary, q);
+                if (e && !isNutWallFn(e->type))
+                    throw std::runtime_error(
+                        "brae: wall patch '" + q.name + "' resolves its nut BC to key '" + e->name +
+                        "' of type '" + e->type + "' (no wall function) on SpalartAllmaras. The SA "
+                        "path writes its wall function on every wall face and would overwrite this "
+                        "BC; OpenFOAM evaluates it. Refusing rather than substituting Spalding.");
+            }
+            ctl.nutWall = (saWallFn == "nutLowReWallFunction") ? NutWall::LowRe : NutWall::Spalding;
+            std::printf("  nut wall function: %s (honoured on %s per the BC)\n",
+                        saWallFn.empty() ? "nutUSpaldingWallFunction (no wall BC named one; SA default)"
+                                         : saWallFn.c_str(),
+                        ctl.modelName.c_str());
             nut = buildField<scalar>(nutFD, fvp, nC);
             nut.evaluateBoundary();
         }
         else if (ctl.turbulent)
         {
             const FieldData<scalar> kFD = readField<scalar>(fieldDir + "/k");
+            guardFrozen(kFD, "k");
             const FieldData<scalar> sFD = readField<scalar>(fieldDir + "/" + secondName);
+            guardFrozen(sFD, secondName);
             k   = buildField<scalar>(kFD, fvp, nC);
             k.evaluateBoundary();
             eps = buildField<scalar>(sFD, fvp, nC);
             eps.evaluateBoundary();
             const FieldData<scalar> nutFD = readField<scalar>(fieldDir + "/nut");
+            guardFrozen(nutFD, "nut");
             guardWallFn(nutFD, "nut");
             guardWallFn(sFD, secondName);
             setNutWall(nutFD);   // honour the BC-specified velocity-based nut wall function (nutUSpalding/nutUBlended)
+            // WHICH PATCHES THE TURBULENCE WALL FUNCTION ACTUALLY APPLIES TO. OpenFOAM's
+            // epsilonWallFunction/omegaWallFunction are BC objects on this field: only a patch whose BC
+            // is one of them gets an epsilon0/G0 override. brae built its wall set from the patch TYPE,
+            // so a `wall`-typed patch carrying a plain BC was overridden too.
+            //
+            // turbulentFlatPlate's `topWall` is exactly that -- typed `wall`, but U slip, k and epsilon
+            // zeroGradient, nut calculated, i.e. a slip far-field. brae pinned epsilon in its 545
+            // adjacent cells to the wall-function value 1.556e-03 where OpenFOAM transports it to
+            // 3.055e-02, so nut came out 1028x high, the freestream k never decayed from its 1.08e-03
+            // inlet value (OpenFOAM's decays to 1.55e-04) and the run diverged at iteration 395.
+            // findPatchEntry, NOT a name comparison: a boundaryField key may be an exact name, a GROUP or
+            // a REGEX, and OpenFOAM resolves it in that order with the last match winning.
+            // backwardFacingStep2D writes its wall BC as "(upperWall|lowerWall)", so comparing names
+            // matched nothing, left this mask all zeros, and removed the wall function from the whole
+            // case -- U went to 1.400e-01 against OpenFOAM and omega to 9.905e-01 before the suite
+            // caught it.
+            ctl.turbWallPatch.assign(fvp.size(), 0);
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                const auto* pb = findPatchEntry(sFD.boundary, fvp[pi]);
+                if (pb && (pb->type == "epsilonWallFunction" || pb->type == "omegaWallFunction"))
+                    ctl.turbWallPatch[pi] = 1;
+            }
+            {
+                std::size_t nWF = 0, nWall = 0;
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                {
+                    if (fvp[pi].type != "wall") continue;
+                    ++nWall;
+                    if (ctl.turbWallPatch[pi]) ++nWF;
+                }
+                if (nWF != nWall)
+                    std::printf("  turbulence wall function on %zu of %zu wall patch(es) -- the rest carry a "
+                                "plain %s BC and are NOT overridden, as in OpenFOAM\n", nWF, nWall, secondName.c_str());
+            }
+            // epsilonWallFunction `lowReCorrection`, off the epsilon BC that names it. It was read by
+            // NOTHING before: the entry sits inside a boundaryField patch dictionary, which the dict audit
+            // does not track per key, so a case asking for it got the high-Re log-law epsilon and no
+            // warning. turbulentFlatPlate:kEpsilon at y+ ~ 1 diverged at iteration 10 on that.
+            for (const auto& pb : sFD.boundary)
+            {
+                if (pb.type == "epsilonWallFunction" && pb.epsLowRe)
+                {
+                    ctl.keCoeffs.epsLowRe = true;
+                    std::printf("  epsilonWallFunction: lowReCorrection ON (resolved faces take "
+                                "eps = 2*k*nu/y^2 and contribute no wall production)\n");
+                    break;
+                }
+            }
             nut = buildField<scalar>(nutFD, fvp, nC);
             nut.evaluateBoundary();
             if (ctl.lm)   // kOmegaSSTLM transition fields

@@ -63,6 +63,35 @@ inline bool ofResidualLog()
     return on;
 }
 
+// The solver name on the Ux/Uy/Uz lines: what RAN, set by the driver from the branch it wired. The
+// header above says these names are brae's actual ones, and until this holder existed the three lines
+// said "JacobiBiCGStab" whatever the momentum solve was -- DILU-preconditioned, OpenFOAM's own sweep,
+// or the colour-order sweep (the default since 2026-09-08). Defaults to the old string, so a driver
+// that never sets it -- the legacy drivers do not -- keeps printing "JacobiBiCGStab" whatever it ran,
+// which is the known-wrong line this holder was added to fix on the mirror. OpenFOAM composes its own name as
+// preconditioner + solver (PBiCGStab.C:80-83), so the DILU form is spelled `DILUPBiCGStab` to diff
+// line for line against an OpenFOAM log; the others are brae's own names for brae's own solvers.
+inline const char*& momentumSolverName()
+{
+    static const char* name = "JacobiBiCGStab";
+    return name;
+}
+
+// One solve line in OpenFOAM's format (SolverPerformance::print, SolverPerformance.C:95-117:
+// `<solver>:  Solving for <field>, Initial residual = a, Final residual = b, No Iterations n`).
+// Exposed so a driver that can stand behind only some of the lines -- the rhoSimpleFoam mirror
+// prints the momentum ones, whose numbers its step returns -- prints them in the same format.
+inline void printOfSolveLine(
+    const char* solver,
+    const char* field,
+    scalar init,
+    scalar fin,
+    int nIter)
+{
+    std::printf("%s:  Solving for %s, Initial residual = %g, Final residual = %g, No Iterations %d\n",
+                solver, field, (double)init, (double)fin, nIter);
+}
+
 // One line per solved field, in OF's order for rhoSimpleFoam: U, then he, then p, then the continuity
 // errors, then the turbulence scalars (rhoSimpleFoam.C -> UEqn.H, EEqn.H, pEqn.H, turbulence->correct()).
 inline void printOfResidualLog(int iter, const DeviceSimpleResidual& r, scalar cumulativeCont)
@@ -73,13 +102,12 @@ inline void printOfResidualLog(int iter, const DeviceSimpleResidual& r, scalar c
 
     auto line = [](const char* solver, const char* field, scalar init, scalar fin, int nIter)
     {
-        std::printf("%s:  Solving for %s, Initial residual = %g, Final residual = %g, No Iterations %d\n",
-                    solver, field, (double)init, (double)fin, nIter);
+        printOfSolveLine(solver, field, init, fin, nIter);
     };
 
-    line("JacobiBiCGStab", "Ux", r.Ux, r.UxFinal, r.UxIters);
-    line("JacobiBiCGStab", "Uy", r.Uy, r.UyFinal, r.UyIters);
-    line("JacobiBiCGStab", "Uz", r.Uz, r.UzFinal, r.UzIters);
+    line(momentumSolverName(), "Ux", r.Ux, r.UxFinal, r.UxIters);
+    line(momentumSolverName(), "Uy", r.Uy, r.UyFinal, r.UyIters);
+    line(momentumSolverName(), "Uz", r.Uz, r.UzFinal, r.UzIters);
 
     // The energy, from the residual struct: correctTurbulence() clears the shared report store before the
     // turbulence solves, so the EEqn's entry is not there by the time this runs.

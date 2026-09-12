@@ -259,6 +259,13 @@ public:
 
     ~DictAuditScope()
     {
+        // The report goes to stderr, which is unbuffered, while the solver's log goes to stdout, which
+        // is block-buffered when it is a file. With `2>&1` the two interleave at the flush boundary,
+        // which can fall INSIDE a stdout line: the rho mirror's `Time = 30  U 1.2e-03 ...` summary
+        // was found with "-- 9 entries brae never looked at" spliced into it, and a gate's parser
+        // read `--` as a residual (rho_smoothsolver_vs_openfoam, item 15). Flushing stdout first
+        // makes the report land between whole lines, on every driver that owns one of these.
+        std::fflush(stdout);
         // Non-zero only when we are unwinding, i.e. brae threw. C++17's uncaught_exceptions() is the
         // supported way to tell a destructor which path it is on.
         const bool partial = std::uncaught_exceptions() > 0;

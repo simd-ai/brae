@@ -93,7 +93,31 @@ int main(int argc, char *argv[])
             #include "pEqn.H"
         }
 
+        // Stage harness: turbulence->correct() as a BLACK BOX -- every input it reads, then every field
+        // it writes. That is enough to gate another code's closure against it without reaching inside
+        // OpenFOAM's turbulence library, which the solver cannot do: the k and epsilon matrices are
+        // assembled inside the model and never surface here.
+        if (runTime.timeIndex() == braeDumpIter())
+        {
+            volScalarField("stage_kIn",      turbulence->k()()).write();
+            volScalarField("stage_epsIn",    turbulence->epsilon()()).write();
+            volScalarField("stage_nutIn",    turbulence->nut()()).write();
+            volScalarField("stage_alphatIn", turbulence->alphat()()).write();
+            volVectorField("stage_Uturb",    U).write();
+            surfaceScalarField("stage_phiTurb", phi).write();
+            volScalarField("stage_rhoTurb",  rho).write();
+            volScalarField("stage_muTurb",   thermo.mu()()).write();
+        }
+
         turbulence->correct();
+
+        if (runTime.timeIndex() == braeDumpIter())
+        {
+            volScalarField("stage_kOut",      turbulence->k()()).write();
+            volScalarField("stage_epsOut",    turbulence->epsilon()()).write();
+            volScalarField("stage_nutOut",    turbulence->nut()()).write();
+            volScalarField("stage_alphatOut", turbulence->alphat()()).write();
+        }
 
         runTime.write();
 

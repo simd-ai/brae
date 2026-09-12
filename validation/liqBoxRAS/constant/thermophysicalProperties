@@ -1,0 +1,17 @@
+FoamFile { version 2.0; format ascii; class dictionary; object thermophysicalProperties; }
+// OpenFOAM's liquidThermo.H registers exactly this combination:
+//   heRhoThermo<rhoThermo, pureMixture<species::thermo<
+//       thermophysicalPropertiesSelector<liquidProperties>, sensibleInternalEnergy>>>
+// There is no equationOfState, no transport and no thermo entry, because every property is an NSRDS
+// temperature correlation instead. Taken verbatim from the squareBendLiq tutorial's own dictionary.
+thermoType
+{
+    type            heRhoThermo;
+    mixture         pureMixture;
+    properties      liquid;
+    energy          sensibleInternalEnergy;
+}
+mixture
+{
+    H2O;
+}

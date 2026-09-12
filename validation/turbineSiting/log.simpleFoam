@@ -1,0 +1,113 @@
+/*---------------------------------------------------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2412                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+Build  : _e5c6ccc3-20250814 OPENFOAM=2412 patch=250814 version=2412
+Arch   : "LSB;label=32;scalar=64"
+Exec   : simpleFoam -case /tmp/claude-1001/-home-ghost-cudafoam-brae/a1a0eb0f-4b0f-4397-be59-d8786504c350/scratchpad/ts_deep
+Date   : Aug 20 2026
+Time   : 20:16:03
+Host   : gx10-8ac0
+PID    : 420929
+I/O    : uncollated
+Case   : /tmp/claude-1001/-home-ghost-cudafoam-brae/a1a0eb0f-4b0f-4397-be59-d8786504c350/scratchpad/ts_deep
+nProcs : 1
+trapFpe: Floating point exception trapping enabled (FOAM_SIGFPE).
+fileModificationChecking : Monitoring run-time modified files using timeStampMaster (fileModificationSkew 5, maxFileModificationPolls 20)
+allowSystemOperations : Allowing user-supplied system call operations
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+Create time
+
+Create mesh for time = 0
+
+
+SIMPLE: convergence criteria
+    field p	 tolerance 1e-09
+    field U	 tolerance 1e-09
+    field "(k|epsilon)"	 tolerance 1e-09
+
+Reading field p
+
+Reading field U
+
+Reading/calculating face flux field phi
+
+Selecting incompressible transport model Newtonian
+Selecting turbulence model type RAS
+Selecting RAS turbulence model kEpsilon
+kEpsilonCoeffs
+{
+    Cmu             0.09;
+    C1              1.44;
+    C2              1.92;
+    sigmaEps        1.11;
+    C3              0;
+    sigmak          1;
+}
+
+No MRF models present
+
+Creating finite volume options from "constant/fvOptions"
+
+Selecting finite volume options type actuationDiskSource
+    Source: disk1
+    - selecting cells using cellSet actuationDisk1
+    - selected 484 cell(s) with volume 49.2901917473
+    - selecting cells using points
+    - creating actuation disk zone: disk1
+    - force computation method: Froude
+Selecting finite volume options type actuationDiskSource
+    Source: disk2
+    - selecting cells using cellSet actuationDisk2
+    - selected 484 cell(s) with volume 49.2901999759
+    - selecting cells using points
+    - creating actuation disk zone: disk2
+    - force computation method: Froude
+
+
+... [trimmed: 600 iterations of the deep-convergence run] ...
+
+time step continuity errors : sum local = 1.32388339039e-10, global = 1.64407201019e-11, cumulative = 5.14807682369e-06
+smoothSolver:  Solving for epsilon, Initial residual = 8.46153540177e-09, Final residual = 8.46153540177e-09, No Iterations 0
+smoothSolver:  Solving for k, Initial residual = 3.99316605429e-08, Final residual = 7.13886328951e-09, No Iterations 2
+ExecutionTime = 56.85 s  ClockTime = 57 s
+
+Time = 598
+
+smoothSolver:  Solving for Ux, Initial residual = 2.88863667281e-08, Final residual = 6.10094857205e-09, No Iterations 2
+smoothSolver:  Solving for Uy, Initial residual = 2.95780310814e-08, Final residual = 5.55556719826e-09, No Iterations 2
+smoothSolver:  Solving for Uz, Initial residual = 2.341355726e-08, Final residual = 4.35743419212e-09, No Iterations 2
+GAMG:  Solving for p, Initial residual = 8.65711486603e-08, Final residual = 8.65711486603e-08, No Iterations 0
+time step continuity errors : sum local = 5.37392020416e-10, global = 1.44766966975e-11, cumulative = 5.14809130039e-06
+smoothSolver:  Solving for epsilon, Initial residual = 8.7030623349e-09, Final residual = 8.7030623349e-09, No Iterations 0
+smoothSolver:  Solving for k, Initial residual = 3.95517107206e-08, Final residual = 7.09361371756e-09, No Iterations 2
+ExecutionTime = 56.93 s  ClockTime = 57 s
+
+Time = 599
+
+smoothSolver:  Solving for Ux, Initial residual = 2.78086223431e-08, Final residual = 5.95811108842e-09, No Iterations 2
+smoothSolver:  Solving for Uy, Initial residual = 2.80399422371e-08, Final residual = 5.34725763371e-09, No Iterations 2
+smoothSolver:  Solving for Uz, Initial residual = 2.23031729969e-08, Final residual = 9.63812682681e-09, No Iterations 1
+GAMG:  Solving for p, Initial residual = 9.55547701671e-08, Final residual = 9.55547701671e-08, No Iterations 0
+time step continuity errors : sum local = 5.93158016275e-10, global = 1.2496106462e-11, cumulative = 5.1481037965e-06
+smoothSolver:  Solving for epsilon, Initial residual = 8.97467656517e-09, Final residual = 8.97467656517e-09, No Iterations 0
+smoothSolver:  Solving for k, Initial residual = 3.92949744211e-08, Final residual = 7.05234710419e-09, No Iterations 2
+ExecutionTime = 57 s  ClockTime = 57 s
+
+Time = 600
+
+smoothSolver:  Solving for Ux, Initial residual = 2.68465123465e-08, Final residual = 5.81974238978e-09, No Iterations 2
+smoothSolver:  Solving for Uy, Initial residual = 2.69039076079e-08, Final residual = 5.18216399404e-09, No Iterations 2
+smoothSolver:  Solving for Uz, Initial residual = 2.16530626799e-08, Final residual = 9.38202677607e-09, No Iterations 1
+GAMG:  Solving for p, Initial residual = 1.06324034397e-07, Final residual = 2.17877334103e-08, No Iterations 1
+time step continuity errors : sum local = 1.35247761452e-10, global = 1.42437260437e-11, cumulative = 5.14811804022e-06
+smoothSolver:  Solving for epsilon, Initial residual = 9.27756387283e-09, Final residual = 9.27756387283e-09, No Iterations 0
+smoothSolver:  Solving for k, Initial residual = 4.03350830884e-08, Final residual = 7.03962754068e-09, No Iterations 2
+ExecutionTime = 57.09 s  ClockTime = 57 s
+
+End
+

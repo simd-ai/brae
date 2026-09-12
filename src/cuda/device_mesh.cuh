@@ -243,7 +243,24 @@ inline std::vector<scalar> flattenBoundary(const std::vector<std::vector<scalar>
 void deviceInterpolate(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol, DeviceBuffer<scalar>& sfInt);
 void deviceDiv(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& bval, DeviceBuffer<scalar>& d);
 void deviceGaussGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol, const DeviceBuffer<scalar>& bval,
-                     DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz);
+                     DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz,
+                     const int* skipIf = nullptr);
+// The same gradient for n = 1..3 fields in ONE launch, reading the mesh addressing and geometry once
+// instead of n times. gx/gy/gz are arrays of n buffers, resized here; vol/bval are arrays of n pointers.
+// BIT-IDENTICAL, per field, to n separate deviceGaussGrad calls -- same faces, same order, same
+// expressions, one register set per field (tests/test_grad_fused.cu asserts it with memcmp). skipIf
+// behaves exactly as it does above. Measured motive: gradKernel was 4.5 ms of a 30 ms iteration at 306k
+// cells, 16 launches of which nine were velocity components in threes.
+// leastSquares gradient -- the same signature as deviceGaussGrad, so a caller switches on the case's
+// gradScheme and nothing else. See the kernels in device_fvc.cu for why no volume division appears.
+void deviceLeastSquaresGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol,
+                            const DeviceBuffer<scalar>& bval,
+                            DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz);
+
+void deviceGaussGradFused(const DeviceMesh& dm, int n,
+                          const DeviceBuffer<scalar>* const* vol, const DeviceBuffer<scalar>* const* bval,
+                          DeviceBuffer<scalar>* gx, DeviceBuffer<scalar>* gy, DeviceBuffer<scalar>* gz,
+                          const int* skipIf = nullptr);
 
 // The COUPLED-PATCH half of cellLimitedGrad, which brae's addressing cannot see on its own.
 //
@@ -294,6 +311,15 @@ void deviceLaplacianCorrFlux(const DeviceMesh& dm, const DeviceBuffer<scalar>& g
 void deviceLaplacianCorrFluxLimited(const DeviceMesh& dm, const DeviceBuffer<scalar>& gammafInt, const DeviceBuffer<scalar>& phi,
                                     const DeviceBuffer<scalar>& gx, const DeviceBuffer<scalar>& gy, const DeviceBuffer<scalar>& gz,
                                     scalar psi, DeviceBuffer<scalar>& ffc);
+// The VECTOR form of the above: ONE limiter per face from mag(snGrad) and mag(corr) over all three
+// components, as OF's limitedSnGrad<Type> forms it. Limiting each component on its own is a different
+// scheme -- see the kernel comment. phi/gxc/gyc/gzc/ffc are arrays of 3.
+void deviceLaplacianCorrFluxLimitedVec(const DeviceMesh& dm, const DeviceBuffer<scalar>& gammafInt,
+                                       const DeviceBuffer<scalar>& p0, const DeviceBuffer<scalar>& p1,
+                                       const DeviceBuffer<scalar>& p2,
+                                       const DeviceBuffer<scalar>* gxc, const DeviceBuffer<scalar>* gyc,
+                                       const DeviceBuffer<scalar>* gzc,
+                                       scalar psi, DeviceBuffer<scalar>* ffc);
 void deviceFaceDivSource(const DeviceMesh& dm, const DeviceBuffer<scalar>& ffc, DeviceBuffer<scalar>& src);
 void deviceDivUpwindCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt,
                            DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& upper, DeviceBuffer<scalar>& lower);
@@ -308,6 +334,13 @@ void deviceDivLimitedCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& ph
 // limitedLinearV (OF "Gauss limitedLinearV k_"): the NVDVTVDV vector limiter -- ONE limiter per face from the vector
 // U (gradfV=U[N]-U[P], gradcf=gradfV.(d&gradU[upwind]), r=2*gradcf/gradf-1), applied to all 3 components. U/gUx/gUy/gUz
 // are 3-element arrays (per component). Reduces to deviceDivUpwindCoeffs at limiter=0. Built implicitly like magSqr.
+// The limitedLinear FACE WEIGHTS alone, for an EXPLICIT divergence -- rhoSimpleFoam's fvc::div(phi,Ekp),
+// where the scheme changes the face value rather than any matrix coefficient. Same limiter as
+// deviceDivLimitedCoeffs, through the same device function, and the same currency: twoByk = 2/max(k,SMALL),
+// NOT the raw k the case writes. Face value is then w*field[own] + (1-w)*field[nei].
+void deviceLimitedFaceWeights(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& field,
+                              const DeviceBuffer<scalar>& gx, const DeviceBuffer<scalar>& gy, const DeviceBuffer<scalar>& gz,
+                              scalar twoByk, DeviceBuffer<scalar>& w);
 void deviceDivLimitedVCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>* U,
                              const DeviceBuffer<scalar>* gUx, const DeviceBuffer<scalar>* gUy, const DeviceBuffer<scalar>* gUz,
                              scalar twoByk, DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& upper, DeviceBuffer<scalar>& lower);

@@ -63,11 +63,20 @@ SurfaceScalarField readSurfaceField(const std::string& path, const std::vector<F
 }
 
 // OF READ_IF_PRESENT: the stored flux on a restart, else the caller's freshly computed fallback.
+// `wasRead`, when given, reports which branch was taken. A caller that only looks at the returned field
+// cannot tell: a coupled patch's boundary values are meaningful on the read path (OpenFOAM writes the
+// interface flux per patch) and a placeholder on the fallback path, and only the interface knows which.
 inline SurfaceScalarField readPhiIfPresent(const std::string& fieldDir, const std::vector<FvPatch>& patches,
-                                           label nInternalFaces, SurfaceScalarField&& fallback)
+                                           label nInternalFaces, SurfaceScalarField&& fallback,
+                                           bool* wasRead = nullptr)
 {
     const std::string phiPath = fieldDir + "/phi";
-    if (!std::filesystem::exists(phiPath)) return std::move(fallback);
+    if (!std::filesystem::exists(phiPath))
+    {
+        if (wasRead) *wasRead = false;
+        return std::move(fallback);
+    }
+    if (wasRead) *wasRead = true;
     return readSurfaceField(phiPath, patches, nInternalFaces);
 }
 

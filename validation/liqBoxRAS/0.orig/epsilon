@@ -1,0 +1,9 @@
+FoamFile { version 2.0; format ascii; class volScalarField; object epsilon; }
+dimensions [0 2 -3 0 0 0 0]; internalField uniform 14.855;
+boundaryField {
+  inlet    { type turbulentMixingLengthDissipationRateInlet; mixingLength 0.0014; value $internalField; }
+  outlet   { type inletOutlet; inletValue $internalField; value $internalField; }
+  hotWall  { type epsilonWallFunction; value $internalField; }
+  coldWall { type epsilonWallFunction; value $internalField; }
+  frontBack { type empty; }
+}

@@ -36,11 +36,51 @@ struct ScalarSolveEntry
 void clearTurbulenceReport();
 const std::vector<ScalarSolveEntry>& turbulenceReport();
 
+// Foam::bound's message, for the fields whose guard fired this iteration. A store of its own rather than
+// a field on ScalarSolveEntry: the OF-mirror closure reports its residuals through its own path and
+// never fills turbStore, so a report hung off that entry reached one driver and silently not the other.
+// Keyed by field name so a driver that prints per-field solve lines can interleave it exactly where
+// OpenFOAM does, and one that prints a compact summary can emit them after it.
+struct BoundingReport
+{
+    std::string field;
+    scalar      minValue = 0;
+    scalar      maxValue = 0;
+    scalar      average  = 0;
+};
+void clearBoundingReports();
+const std::vector<BoundingReport>& boundingReports();
+
 // k-epsilon model coefficients (shared CPU/device definition).
 // GbyNu = gradU && devTwoSymm(gradU), devTwoSymm(g) = g + g^T - (2/3)tr(g) I.  G = nut*GbyNu.
 void deviceGbyNu(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                  const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                  DeviceBuffer<scalar>& gByNu, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr);
+
+// THE grad(U) MEMO (item 65). OpenFOAM computes fvc::grad(U) once per U state when fvSolution caches it
+// (gradScheme.C: the cached field is reused while the field's event number is unchanged); brae's V2
+// iteration asked for it at four sites -- twice on the predictor's U, twice on the corrected U -- and
+// computed it four times (12 gradKernel launches, ~4.7 ms of the composed flat plate's 60 ms/it). Every
+// site evaluates U's boundary values through the same deviceBCValue on the same dbU, so at one U state
+// the four are the same bits. This shares them: the Gauss gradient of each component and the boundary
+// values it used, keyed on a FINGERPRINT of everything the computation reads that can move between
+// sites -- the three internal fields and, per component, the boundary type, refValue, valueFraction and
+// refGrad arrays -- so reuse never rests on knowing every place U is written. A hit hands back the same
+// bits a fresh computation would; interface (cyclic/AMI) contributions are added by the caller on a
+// copy, as before. BRAE_GRADU_MEMO=0 recomputes at every site (the identity arm); =stale never
+// recomputes after the first (the gate's fail-proof: it must change the run).
+struct GradUMemo
+{
+    int nC = 0;
+    bool valid = false;
+    unsigned long long fp = 0;
+    DeviceBuffer<scalar> gx[3], gy[3], gz[3];     // gaussGrad(U_k), unlimited, interior + boundary faces
+    DeviceBuffer<scalar> ub[3];                   // the boundary values it used (deviceBCValue per component)
+    DeviceBuffer<unsigned long long> dev;         // device state: acc, stored fingerprint, valid, hit, nHit, nMiss
+    unsigned long long computed = 0, reused = 0;  // read only under BRAE_GRADU_MEMO_STATS
+};
+const GradUMemo& deviceGradUShared(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
+                                   const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz);
 
 // gradU tensor (9*nC, OF convention column i = gaussGrad(U_i)) + GbyNu from a prebuilt gradU. Shared by k-eps
 // (GbyNu) and kOmegaSST (which also needs gradU for S2 = 2 magSqr(symm(gradU))).
@@ -48,6 +88,14 @@ void deviceGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                  const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                  DeviceBuffer<scalar>& gradU, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr);
 void deviceGByNuFromGradU(const DeviceBuffer<scalar>& gradU, int nC, DeviceBuffer<scalar>& gByNu);
+// The same 9*nC tensor from OpenFOAM's least-squares fit: leastSquaresGrad.C's calcGrad on a vector
+// is lsGrad += ownLs*deltaVsf (an outer product), so column j is the SCALAR least-squares gradient of
+// U_j and the three components are three deviceLeastSquaresGrad calls packed exactly as deviceGradU
+// packs its Gauss ones. UbStored: the stored patch values when the caller holds them, else the
+// boundary is evaluated from dbU. Coupled interfaces are not taken (the rho mirror refuses them).
+void deviceLeastSquaresGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
+                             const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+                             DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>* const* UbStored = nullptr);
 // OF grad(U) cellLimited Gauss linear <k> applied to a grad(U) TENSOR (per U-component minmod limiter). For the
 // turbulence strain S2 + production, which OF computes from fvc::grad(U) = the (cellLimited) grad(U) scheme.
 void deviceCellLimitGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
@@ -61,7 +109,38 @@ void deviceNut(const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& eps, D
 
 // OF Foam::bound(vsf, lowerBound): where a cell falls below the floor, replace it with the bounded
 // neighbour-average (fvc::average(max(vsf,floor))*pos0(-vsf)), NOT a hard clamp; floor elsewhere.
-void deviceBoundField(const DeviceMesh& dm, DeviceBuffer<scalar>& x, scalar floor);
+// Foam::bound's min/max/average over the field as it stands, and whether the guard fires -- computed
+// BEFORE the clamp, as OpenFOAM does. Returns true when min < lowerBound, i.e. when OpenFOAM would
+// print. One reduction and ONE mailbox read (the three values ride a single publish, so this costs what
+// reading one scalar costs); measured at 306k it is ~50 us per field against a turbulence block of
+// 12-15 ms. BRAE_BOUND_REPORT=0 skips it for a measurement run.
+//
+// THE MIN AND MAX INCLUDE THE BOUNDARY; THE AVERAGE DOES NOT. OpenFOAM's guard is min(vsf), and
+// min/max on a GeometricField are UNARY_REDUCTION_FUNCTION_WITH_BOUNDARY (GeometricFieldFunctions.C:427)
+// -- internal field AND every patch field. So a case whose cells are all above the bound but whose one
+// patch face is below it still trips the guard and still prints. The `average:` in the same line is
+// gAverage(vsf.primitiveField()) (FieldFunctions.C:647): the INTERNAL field only, arithmetic, not
+// volume-weighted. Getting that asymmetry backwards changes both the number printed and whether it
+// prints at all. xBnd is the evaluated patch values (deviceBCValue); null means no boundary to fold in.
+bool deviceBoundingReport(
+    const DeviceBuffer<scalar>& x,
+    const DeviceBuffer<scalar>* xBnd,
+    scalar                      lowerBound,
+    scalar&                     minOut,
+    scalar&                     maxOut,
+    scalar&                     avgOut);
+
+// `fieldName` and `db` are what makes this emit Foam::bound's message (bound.C:38-46). Both default to
+// off so a caller that has neither stays silent rather than printing a line with the wrong name or a
+// guard that misses a boundary-only trigger; a site left unwired is a missing diagnostic, not a wrong
+// one. Pass the field's DeviceBoundary wherever the caller has it: OpenFOAM's guard mins over the patch
+// values too, so without it the message is emitted on a narrower condition than OpenFOAM's.
+void deviceBoundField(
+    const DeviceMesh&     dm,
+    DeviceBuffer<scalar>& x,
+    scalar                floor,
+    const char*           fieldName = nullptr,
+    const DeviceBoundary* db = nullptr);
 
 // Static wall geometry for the wall functions (nearWallDist y, wall-face cell/deltaCoeffs/velocity, 1/nWallFaces).
 struct DeviceWallData
@@ -74,26 +153,48 @@ struct DeviceWallData
     // patch with weights (1-mask), and epsilonWallFunction only constrains where weight > 1e-5.
     // See buildDeviceWallData for what counting them anyway cost.
     DeviceBuffer<label>  wfCell, isWallCell;
+    // Wall-face gather grouped by cell -- see the note in buildWallData. nWC wall cells; wcCell[i] is the
+    // mesh cell, and wcFace[wcStart[i] .. wcStart[i+1]) are its wall faces in ascending face index.
+    int                  nWC = 0;
+    DeviceBuffer<label>  wcCell, wcStart, wcFace;
     // ...and the weight itself, for the partially blocked faces in between: OF blends rather than
     // switches, G[c] = (1-w)*G[c] + w*G0[c] and the same for epsilon (epsilonWallFunction.C:592).
     DeviceBuffer<scalar> wallW;
     DeviceBuffer<scalar> wfY, wfDc, wfUwx, wfUwy, wfUwz, invNw;
+    // epsilonWallFunction's OWN Cmu^0.25, Cmu^0.75, kappa, E and yPlusLam per WALL face (from the
+    // epsilon patch's entry, WallFunctionCoeffs; item 16h-port). Empty -> the kernels use the
+    // model-wide KEpsilonCoeffs values, which is what the legacy drivers still hand them.
+    DeviceBuffer<scalar> wfCmu25, wfCmu75, wfKappa, wfE, wfYplLam;
 };
+// The predicate the wall set is built on, in one place so the DeviceWallData faces and the wall-face ->
+// boundary-face map below cannot drift apart.
+inline bool isTurbWallPatch(const std::vector<FvPatch>& fvp, std::size_t pi, const std::vector<char>& wfPatch)
+{
+    if (fvp[pi].type != "wall") return false;
+    return wfPatch.empty() || (pi < wfPatch.size() && wfPatch[pi]);
+}
+
 // The wall velocity comes in per patch rather than from a GeometricField, because on a MOVING mesh the
 // two can disagree: `movingWallVelocity` is assigned into the solver's device boundary after the move
 // (setPatchVelocity), and the host field is not what the solver imposes. See refreshWallData.
+// `wfPatch`, when non-empty, says which patches carry the turbulence wall function -- see
+// DeviceSimpleControls::turbWallPatch and wallFunctionPatchMask below. A patch has to be BOTH a `wall`
+// and named by its epsilon/omega BC, because that is the set OpenFOAM overrides: the wall function is a
+// BC object on that field, so a `wall`-typed patch whose epsilon BC is plain zeroGradient gets nothing.
+// Empty = fall back to the patch type alone, which is what the SA and LES paths want.
 inline DeviceWallData buildDeviceWallData(
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& fvp,
-    const std::vector<std::vector<vector>>& wallU)
+    const std::vector<std::vector<vector>>& wallU,
+    const std::vector<char>& wfPatch = {})
 {
     const std::vector<std::vector<scalar>> yW = nearWallDist(m, g, fvp);
     std::vector<label> wfCell;
     std::vector<scalar> wfY, wfDc, wux, wuy, wuz;
     std::vector<label> nw(m.nCells(), 0);
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-        if (fvp[pi].type == "wall")
+        if (isTurbWallPatch(fvp, pi, wfPatch))
         {
             const std::vector<vector>& uv = wallU[pi];
             for (label i = 0; i < fvp[pi].size; ++i)
@@ -116,6 +217,33 @@ inline DeviceWallData buildDeviceWallData(
             invNw[c] = 1.0 / nw[c];
             isW[c] = 1;
         }
+
+    // WALL-CELL GATHER ADDRESSING (determinism).
+    //
+    // The wall kernels used to run one thread per wall FACE and atomicAdd the near-wall production into
+    // G0[cell] and eps0/omega0[cell]. `invNw` is 1/(wall faces on this cell), so cells with more than one
+    // wall face demonstrably exist -- and for those the summation order was whatever order the faces
+    // happened to be scheduled in. It is a rare race (most wall cells have exactly one wall face), which
+    // made it worse rather than better: two identical 1-iteration pitzDaily runs came out bit-identical
+    // twice and 1 ULP apart on the third, on epsilon and nut only. The SIMPLE loop then amplified that
+    // single ULP to 1.3e-3 by iteration 20.
+    //
+    // Grouping the wall faces by cell lets one thread own a cell and sum its faces in ascending face
+    // index -- a fixed order -- then write once.
+    std::vector<label> wcCell;
+    for (label c = 0; c < m.nCells(); ++c) if (nw[c] > 0) wcCell.push_back(c);
+    std::vector<label> cellSlot(m.nCells(), -1);
+    for (std::size_t i = 0; i < wcCell.size(); ++i) cellSlot[wcCell[i]] = static_cast<label>(i);
+
+    std::vector<label> wcStart(wcCell.size() + 1, 0);
+    for (std::size_t f = 0; f < wfCell.size(); ++f) ++wcStart[cellSlot[wfCell[f]] + 1];
+    for (std::size_t i = 0; i < wcCell.size(); ++i) wcStart[i+1] += wcStart[i];
+    std::vector<label> wcFace(wfCell.size());
+    {
+        std::vector<label> at(wcStart.begin(), wcStart.end() - 1);
+        for (std::size_t f = 0; f < wfCell.size(); ++f)
+            wcFace[at[cellSlot[wfCell[f]]]++] = static_cast<label>(f);
+    }
     // THE ACMI NON-OVERLAP WALL IS ONLY A WALL WHERE IT IS CLOSED.
     //
     // A cyclicACMI carries a coincident wall (its nonOverlapPatch) whose area is (1-mask)*A, so on the
@@ -149,6 +277,10 @@ inline DeviceWallData buildDeviceWallData(
         if (wallW[c] <= ACMI_WALL_TOL) isW[c] = 0;   // a wall face with no wall behind it
     DeviceWallData w;
     w.nWF = static_cast<int>(wfCell.size());
+    w.nWC = static_cast<int>(wcCell.size());
+    w.wcCell.copyFrom(wcCell);
+    w.wcStart.copyFrom(wcStart);
+    w.wcFace.copyFrom(wcFace);
     w.wfCell.copyFrom(wfCell);
     w.wfY.copyFrom(wfY);
     w.wfDc.copyFrom(wfDc);
@@ -167,12 +299,13 @@ inline DeviceWallData buildDeviceWallData(
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& fvp,
-    const GeometricField<vector>& U)
+    const GeometricField<vector>& U,
+    const std::vector<char>& wfPatch = {})
 {
     std::vector<std::vector<vector>> wallU(fvp.size());
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         if (fvp[pi].type == "wall") wallU[pi] = U.boundary[pi]->value();
-    return buildDeviceWallData(m, g, fvp, wallU);
+    return buildDeviceWallData(m, g, fvp, wallU, wfPatch);
 }
 
 // epsilonWallFunction near-wall values: eps0 = (1/nWall) Cmu^.75 k^1.5/(kappa y); G0 = (1/nWall)(nutw+nu)*
@@ -181,8 +314,14 @@ void deviceWallEpsG0(const DeviceWallData& w, const DeviceBuffer<scalar>& k, con
                      const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz, scalar nu,
                      DeviceBuffer<scalar>& eps0, DeviceBuffer<scalar>& G0, const KEpsilonCoeffs& co = {}, int nutWall = 0,
                      scalar atmZ0 = 0.0, bool atmBoundNut = true,   // z0>0 -> atmNutkWallFunction (rough) for the G0 wall nut
-                     const DeviceBuffer<scalar>* nuFace = nullptr,
-    const DeviceBuffer<scalar>* nutFile = nullptr);   // compressible: nu = mu_b/rho_b per WALL face
+                     const DeviceBuffer<scalar>* nuFace = nullptr,       // compressible: nu = mu_b/rho_b per WALL face
+                     // The STORED wall nut in WALL-face order (the nut boundary as it entered correct()).
+                     // OpenFOAM's epsilonWallFunction reads nutw[facei] from the nut patch field -- the
+                     // value the previous correctNut() or validate() left there -- not a fresh
+                     // nutkWallFunction of the current k and nu_w. Null keeps the recomputation.
+                     const DeviceBuffer<scalar>* nutwStored = nullptr);
+// (epsilonWallFunction's `lowReCorrection` rides on KEpsilonCoeffs::epsLowRe, so it reaches the kernel
+//  without threading a flag through every caller.)
 
 // add the eps / k reaction (Sp/Su) + SuSp(divU) terms to a matrix's diag/source (in place).
 void deviceEpsReaction(const DeviceMesh& dm, const DeviceBuffer<scalar>& eps, const DeviceBuffer<scalar>& k,
@@ -274,7 +413,20 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
                             const DeviceBuffer<label>*  fvoKMask = nullptr,
                             const DeviceBuffer<scalar>* fvoKVal  = nullptr,
                             const DeviceBuffer<label>*  fvoEMask = nullptr,
-                            const DeviceBuffer<scalar>* fvoEVal  = nullptr);
+                            const DeviceBuffer<scalar>* fvoEVal  = nullptr,
+                            // fvSolution solvers/<field>/nSweeps (smoothSolver.C:78, default 1):
+                            // smoothing sweeps between residual EVALUATIONS, so the stop test is
+                            // consulted only on a multiple of it. Read from the TRANSPORTED field's own
+                            // entry; meaningful only on the smoothSolver path. brae ran one sweep per
+                            // evaluation whatever the case said -- validation/airFoil2D ships
+                            // `nSweeps 2` on nuTilda and brae's counts were ODD where OpenFOAM's were
+                            // even in all 50 of its solves.
+                            int nSweeps = 1,
+                            // WHICH GaussSeidel smoother the case named: true = symGaussSeidel
+                            // (ascending then descending), false = GaussSeidel, whose sweep loop in
+                            // GaussSeidelSmoother.C is the ascending walk ONLY. Different smoothers,
+                            // so the same relTol stops in a different place.
+                            bool gsSymmetric = true);
 
 // Closed device kOmegaSST::correct(): production (raw GbyNu0 + omega-wall G0 override) -> F1/F2/CDkOmega/S2 ->
 // omega eqn (loose solve, omega-wall setValues) -> bound -> k eqn (loose solve) -> bound -> correctNut (Bradshaw
@@ -319,7 +471,17 @@ void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, co
                             const DeviceBuffer<scalar>* fvoEVal  = nullptr,
                             // The case's LES filter width (`delta maxDeltaxyz`); null keeps OF's
                             // cubeRootVol. Must match what the convection scheme uses.
-                            const DeviceBuffer<scalar>* lesDelta = nullptr);
+                            const DeviceBuffer<scalar>* lesDelta = nullptr,
+                            // fvSolution solvers/<field>/nSweeps (smoothSolver.C:78, default 1):
+                            // smoothing sweeps between residual EVALUATIONS, so the stop test is
+                            // consulted only on a multiple of it. Read from the TRANSPORTED field's own
+                            // entry; meaningful only on the smoothSolver path.
+                            int nSweeps = 1,
+                            // WHICH GaussSeidel smoother the case named: true = symGaussSeidel
+                            // (ascending then descending), false = GaussSeidel, whose sweep loop in
+                            // GaussSeidelSmoother.C is the ascending walk ONLY. Different smoothers,
+                            // so the same relTol stops in a different place.
+                            bool gsSymmetric = true);
 
 // nuWall[i] = nuBnd[wfBndIdx[i]] -- OF nu(patchi) re-indexed from boundary-face into wall-face ordering.
 void deviceGatherWallNu(const DeviceBuffer<label>& wfBndIdx, const DeviceBuffer<scalar>& nuBnd,
@@ -335,7 +497,12 @@ void deviceKOmegaSSTLMCorrect(const DeviceMesh& dm, const DeviceVectorBoundary& 
                               const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& phiBnd, scalar nu,
                               scalar relax, scalar tol, scalar relTolKE, int keCheckEvery, bool bounded, bool nonOrth,
                               bool gsEps = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
-                              const ScalarDdt& reDdt = {}, const ScalarDdt& giDdt = {});   // transient fvm::ddt(ReThetat)/ddt(gammaInt)
+                              const ScalarDdt& reDdt = {}, const ScalarDdt& giDdt = {},   // transient fvm::ddt(ReThetat)/ddt(gammaInt)
+                              // div(phi,ReThetat) / div(phi,gammaInt) scheme, from the case's fvSchemes.
+                              bool limitedLinear = false, bool linearUpwind = false,
+                              // WHICH GaussSeidel smoother the case named on the transported pair; see
+                              // deviceKOmegaSSTCorrect. The two transition scalars ride the same entry.
+                              bool gsSymmetric = true);
 
 // Spalart-Allmaras (one-equation): solve the nuTilda transport (div - laplacian(DnuTildaEff) + Sp(destruction) ==
 // production + Cb2 grad^2) via the shared scaffold, then nut = nuTilda*fv1. Mirrors SpalartAllmarasBase::correct()
@@ -360,7 +527,20 @@ void deviceSpalartAllmarasCorrect(const DeviceMesh& dm, const DeviceVectorBounda
                                   // The OUTWARD unit normal of the nearest wall face, packed 3 x nC (OF
                                   // wallDist::n()). Only ZDES2020 shielding reads it; nullptr (or the
                                   // wrong size) leaves the standard DDES fd in place.
-                                  const DeviceBuffer<scalar>* wallN = nullptr);
+                                  const DeviceBuffer<scalar>* wallN = nullptr,
+                                  // OF `grad(U)` cellLimited coefficient. SpalartAllmarasBase::correct
+                                  // builds Omega and Stilda from fvc::grad(U) (SpalartAllmarasBase.C:461,
+                                  // Omega = sqrt(2)*mag(skew(gradU)) at :103), which resolves the case's
+                                  // gradSchemes entry. There was no such parameter, so SA's Omega ran
+                                  // unlimited on every driver: measured on windAroundBuildingsBox at
+                                  // t=400, Omega peaks at 7.14e-01 unlimited against 3.24e-02 limited.
+                                  scalar gradULimitK = 0.0,
+                                  int nSweeps = 1,   // solvers/nuTilda/nSweeps; see deviceKEpsilonCorrect
+                                  // WHICH GaussSeidel smoother the case named: true = symGaussSeidel
+                                  // (ascending then descending), false = GaussSeidel, whose sweep loop in
+                                  // GaussSeidelSmoother.C is the ascending walk ONLY. Different smoothers,
+                                  // so the same relTol stops in a different place.
+                                  bool gsSymmetric = true);
 
 // Standalone SA correctNut (nut = nuTilda*fv1(nuTilda)) for the solver startup validate().
 void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, DeviceBuffer<scalar>& nut);

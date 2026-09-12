@@ -1,0 +1,1107 @@
+// rhoSimpleFoamDriver.cu -- see the header for what is shared with the host driver and why.
+#include "io_precision.cuh"   // setIOPrecision: OF ties every Info line to writePrecision
+#include "bound_report.cuh"   // printBounding: Foam::bound's message, one formatter for both arms
+#include "brae_notice.cuh"
+#include "rhoSimpleFoamDriver.cuh"
+
+#include "brae_time.cuh"
+#include "rhoScalarTransportFO.cuh"   // functionObjects::scalarTransport on this arm (item 15c)
+#include "dict_audit.cuh"
+#include <memory>   // DictAuditScope: every dictionary entry read off disk and never applied, reported on every exit
+#include "foam_field_writer.cuh"
+#include "fv_geometry.cuh"
+#include "fv_patch.cuh"
+#include "linear_solver_setup.cuh"
+#include "of_residual_log.cuh"           // momentumSolverName / printOfSolveLine: the OpenFOAM-format momentum lines
+#include "residual_control.cuh"
+#include "rhoSimpleFoamDriver_cpp.cuh"   // buildStepInput: the SHARED case -> StepInput parse
+#include "rhoThermoDevice.cuh"           // effectiveTransport, device-resident
+#include "rhoTurbulenceHook.cuh"         // correctTurbulence, device-resident
+#include "solution_directions.cuh"       // polyMesh::solutionD(): which U components are solved
+#include "device_mesh.cuh"               // deviceDiv: continuityErrs.H on the device arm
+#include "device_blas.cuh"               // deviceHadamard / deviceDot / deviceSumMag / deviceOnes
+#include "solver_controls.cuh"
+#include "write_control.cuh"
+
+#include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <stdexcept>
+#include <string>
+#include <vector>
+#include "start_time.cuh"   // openFoamNSteps: OF Time::run's own step count
+
+namespace brae {
+namespace gpu {
+namespace rhoSimple {
+
+RhoStepInput buildDeviceStepInput(
+    const cpu::rhoSimple::StepInput&       hin,
+    const cpu::rhoSimple::RhoSimpleFields& hf,
+    const cpu::rhoSimple::CaseRefusals&    refusals,
+    const RhoDeviceFields&                 dev,
+    const std::vector<FvPatch>&            patches,
+    DevicePorosity&                        porosity,
+    DeviceConstraints&                     constraints,
+    label                                  nCells)
+{
+    RhoStepInput in;
+
+    in.hasMRF              = refusals.hasMRF;
+    in.hasFvOptions        = refusals.hasFvOptions;
+    in.fvOptionUnsupported = refusals.fvOptionUnsupported;
+
+    // THE POROUS ZONE, projected onto the device. rhoUEqn.cu applies it (in.porosity) and says so in
+    // its own refusal -- "explicitPorositySource (fixedCoeff) IS implemented" -- but nothing built a
+    // DevicePorosity for this driver, so every fvOption the host arm implements was reported here as
+    // "implemented on the host arm only" and the run refused. That turned OpenFOAM's own
+    // angledDuctExplicitFixedCoeff tutorial into a case the host arm ran and the device arm would not,
+    // for no reason but a missing projection.
+    //
+    // What is NOT projected still refuses, by name and per option: anything the host parse marked
+    // unsupported, and any implemented option that is not a porosity (there is no device consumer for
+    // the temperature/scalar constraints -- the host arm carries those).
+    // fixedTemperatureConstraint's cells and temperatures, ACCUMULATED across every such option in list
+    // order: OpenFOAM applies each constraint's setValues in turn, so on a cell two of them name the later
+    // one's value stands. This used to upload each option's mask and value over the previous one's, so
+    // only the last constraint in the file applied at all.
+    std::vector<label>  heMaskH;
+    std::vector<scalar> heTH;
+    for (const auto& o : refusals.opts.options)
+    {
+        if (!o.active) continue;
+        if (!o.unsupported.empty())
+        {
+            // limitTemperature is IMPLEMENTED on this arm too -- it is projected into in.limitHe below
+            // and applied by limitEnergyKernel after the energy solve. deriveCaseRefusals resolves it
+            // out of the option list, so fvOptions::read's catch-all marks it unsupported, and this
+            // loop then refused it a SECOND time, independently of the exemption the host arm takes in
+            // firstUnsupported(). Two refusal paths for one option is how the CUDA arm kept refusing
+            // aerofoilNACA0012 after the host arm was fixed; the condition here is the same one.
+            if (o.unsupported == "limitTemperature" && refusals.limitT) continue;
+            in.hasFvOptions = true;
+            if (in.fvOptionUnsupported.empty()) in.fvOptionUnsupported = o.unsupported;
+            continue;
+        }
+        // THE CONSTRAINTS. Not source terms: OpenFOAM applies them with fvMatrix::setValues, which also
+        // strips the coupling out of the neighbours' equations, and the device equations now do the
+        // same (deviceSetValues). Both were refused here as "implemented on the host arm only", which
+        // is what kept OpenFOAM's own angledDuctExplicitFixedCoeff off this arm.
+        if (o.type == "fixedTemperatureConstraint" || o.type == "scalarFixedValueConstraint")
+        {
+            std::vector<label>  mask(static_cast<std::size_t>(nCells), 0);
+            if (o.allCells) std::fill(mask.begin(), mask.end(), 1);
+            else for (label c : o.cells) if (c >= 0 && c < nCells) mask[static_cast<std::size_t>(c)] = 1;
+
+            if (o.type == "fixedTemperatureConstraint")
+            {
+                // OpenFOAM pins he(p, Tuniform), NOT the temperature: setValues on the energy equation
+                // takes an energy, and putting a temperature there is a 400x error that still converges.
+                // The ENERGY is formed by the step, per cell, from the pressure standing at each constrain
+                // (fixedTemperatureConstraint.C:125-126) -- a number converted once here with the
+                // perfect-gas closed form was right for hConst and wrong for a liquid (stage H3.6).
+                if (heMaskH.empty())
+                {
+                    heMaskH.assign(static_cast<std::size_t>(nCells), 0);
+                    heTH.assign(static_cast<std::size_t>(nCells), scalar(0));
+                }
+                for (label c = 0; c < nCells; ++c)
+                {
+                    if (!mask[static_cast<std::size_t>(c)]) continue;
+                    heMaskH[static_cast<std::size_t>(c)] = 1;
+                    heTH[static_cast<std::size_t>(c)]    = o.Tuniform;
+                }
+                constraints.heMask.copyFrom(heMaskH);
+                constraints.heT.copyFrom(heTH);
+                constraints.hasHe = true;
+                std::printf("  fvOptions `%s`: fixedTemperatureConstraint T=%g K on %d cells\n",
+                            o.name.c_str(), (double)o.Tuniform,
+                            o.allCells ? (int)nCells : (int)o.cells.size());
+                continue;
+            }
+            // scalarFixedValueConstraint: one entry per field it names. k and epsilon are the two the
+            // device closure can pin; any other field has no device consumer and refuses by name.
+            for (const auto& fv : o.fieldValues)
+            {
+                const std::vector<scalar> vals(static_cast<std::size_t>(nCells), fv.second);
+                if (fv.first == "k")
+                {
+                    constraints.kMask.copyFrom(mask); constraints.kVal.copyFrom(vals);
+                    constraints.hasK = true;
+                }
+                else if (fv.first == "epsilon")
+                {
+                    constraints.epsMask.copyFrom(mask); constraints.epsVal.copyFrom(vals);
+                    constraints.hasEps = true;
+                }
+                else
+                {
+                    in.hasFvOptions = true;
+                    if (in.fvOptionUnsupported.empty())
+                        in.fvOptionUnsupported =
+                            "scalarFixedValueConstraint on `" + fv.first + "` (the device equations "
+                            "constrain he, k and epsilon; this field has no device consumer)";
+                    continue;
+                }
+                std::printf("  fvOptions `%s`: scalarFixedValueConstraint %s=%g on %d cells\n",
+                            o.name.c_str(), fv.first.c_str(), (double)fv.second,
+                            o.allCells ? (int)nCells : (int)o.cells.size());
+            }
+            continue;
+        }
+        if (o.type != "explicitPorositySource")
+        {
+            in.hasFvOptions = true;
+            if (in.fvOptionUnsupported.empty())
+                in.fvOptionUnsupported = o.type + " (implemented on the host arm only)";
+            continue;
+        }
+        // A ROTATED coordinate system is refused rather than silently flattened: the device kernel
+        // takes DIAGONAL Darcy coefficients, and dropping D's off-diagonals applies the resistance
+        // along the wrong axes. fixedCoeff carries FULL transformed tensors, so it has no such limit.
+        if (!o.fixedCoeff)
+        {
+            const scalar offD = std::fabs(o.D.xy) + std::fabs(o.D.xz) + std::fabs(o.D.yz)
+                              + std::fabs(o.D.yx) + std::fabs(o.D.zx) + std::fabs(o.D.zy);
+            const scalar offF = std::fabs(o.F.xy) + std::fabs(o.F.xz) + std::fabs(o.F.yz)
+                              + std::fabs(o.F.yx) + std::fabs(o.F.zx) + std::fabs(o.F.zy);
+            const scalar sc = std::fabs(o.D.xx) + std::fabs(o.D.yy) + std::fabs(o.D.zz) + 1.0;
+            if (offD + offF > scalar(1e-10) * sc)
+            {
+                in.hasFvOptions = true;
+                if (in.fvOptionUnsupported.empty())
+                    in.fvOptionUnsupported =
+                        "explicitPorositySource `" + o.name + "` with a ROTATED coordinateSystem (D and "
+                        "F carry off-diagonals); the device porosity kernel takes diagonal coefficients";
+                continue;
+            }
+        }
+        porosity.active = true;
+        porosity.cells.copyFrom(o.cells);
+        porosity.d = vector{o.D.xx, o.D.yy, o.D.zz};
+        // The kernel applies the 0.5 of OF's 0.5*rho*|U|*F itself, so the RAW F goes across.
+        porosity.f = vector{scalar(2) * o.F.xx, scalar(2) * o.F.yy, scalar(2) * o.F.zz};
+        porosity.fixed = o.fixedCoeff;
+        if (o.fixedCoeff)
+        {
+            // fixedCoeff's alpha and beta are FULL tensors: calcTransformModelData rotates diag(alpha)
+            // into the coordinate system's frame, so all nine components matter.
+            const scalar a[9] = {o.alpha.xx, o.alpha.xy, o.alpha.xz,
+                                 o.alpha.yx, o.alpha.yy, o.alpha.yz,
+                                 o.alpha.zx, o.alpha.zy, o.alpha.zz};
+            const scalar b[9] = {o.beta.xx, o.beta.xy, o.beta.xz,
+                                 o.beta.yx, o.beta.yy, o.beta.yz,
+                                 o.beta.zx, o.beta.zy, o.beta.zz};
+            for (int k = 0; k < 9; ++k) { porosity.fa[k] = a[k]; porosity.fb[k] = b[k]; }
+            // fixedCoeff::correct reads rhoRef only when the equation is in FORCE units, which the
+            // compressible momentum equation is.
+            porosity.rhoRef = o.rhoRef;
+        }
+        std::printf("  fvOptions `%s`: explicitPorositySource/%s on %d cells\n", o.name.c_str(),
+                    o.fixedCoeff ? "fixedCoeff" : "DarcyForchheimer", (int)o.cells.size());
+    }
+    in.porosity = porosity.active ? &porosity : nullptr;
+    if (constraints.hasHe) { in.fvoHeMask = &constraints.heMask; in.fvoHeT = &constraints.heT; }
+    in.thermo       = hf.thermo;
+    in.heEnergyKind = &dev.heEnergyKind;
+
+    // limitTemperature, projected onto the device's OWN form. deriveCaseRefusals resolves this option
+    // OUT of the option list (it sets limitT/limitTmin/limitTmax and fvOptions::read never lists it),
+    // so the loop above cannot see it -- and the device applies its limit to he, not T
+    // (rhoSimpleFoam.cu limitEnergyKernel), which is why it needs a conversion rather than a copy.
+    // Without this the host arm clamped the temperature and the device arm silently did not: an
+    // fvOption the case declares, honoured on one arm only, with nothing saying so.
+    if (refusals.limitT)
+    {
+        in.limitHe    = true;
+        in.limitTmin  = refusals.limitTmin;
+        in.limitTmax  = refusals.limitTmax;
+        in.limitTname = refusals.limitTname;
+        // The bounds stay TEMPERATURES; the step builds he(p, Tmin|Tmax) per cell and per face.
+        std::printf("  fvOption limitTemperature [%g, %g] K\n",
+                    (double)refusals.limitTmin, (double)refusals.limitTmax);
+    }
+    for (const FvPatch& p : patches)
+        if (isCoupledInterfaceType(p.type) || p.type == "processor") in.hasCoupledPatches = true;
+
+    in.takeUAtBoundary = &dev.takeUAtBoundary;
+    in.adjustable      = &dev.adjustable;
+
+    in.consistent = hin.consistent;
+    in.transonic  = hin.transonic;
+    in.isE        = (hf.heName == "e");
+    in.nNonOrthogonalCorrectors = hin.nNonOrthogonalCorrectors;
+
+    in.pRefCell  = hf.pressureControl.refCell;
+    in.pRefValue = hf.pressureControl.refValue;
+    in.limitMaxP = hf.pressureControl.limitMaxP;
+    in.pMaxLimit = hf.pressureControl.pMax;
+    in.limitMinP = hf.pressureControl.limitMinP;
+    in.pMinLimit = hf.pressureControl.pMin;
+
+    in.hasMixed = dev.hasMixed;
+    in.frMagSf  = &dev.frMagSf;
+    in.frMdot   = &dev.frMdot;
+    in.frIsMass = &dev.frIsMass;
+    in.frNx     = &dev.frNx;
+    in.frNy     = &dev.frNy;
+    in.frNz     = &dev.frNz;
+    in.tExpr    = &dev.tExpr;
+    in.heName   = hf.heName;
+
+    in.relaxEquationU  = hin.relaxEquationU;   in.relaxU  = hin.relaxU;
+    in.relaxEquationHe = hin.relaxEquationHe;  in.relaxHe = hin.relaxHe;
+    in.relaxP    = hin.relaxP;
+    in.relaxRho  = hin.relaxRho;
+    in.relaxPEqn = hin.relaxPEqn;
+    in.relaxPEqnSpecified = hin.relaxPEqnSpecified;
+
+    in.boundedU  = hin.boundedU;
+    in.boundedHe = hin.boundedHe;
+    in.boundedKE = hin.boundedKE;
+    in.schemeU   = hin.schemeU;
+    in.schemeHe  = hin.schemeHe;
+    in.schemeKE  = hin.schemeKE;
+    in.schemeCoeffU = hin.schemeCoeffU;
+    in.correctedLaplacian = hin.correctedLaplacian;
+    in.ddtEuler           = hin.ddtEuler;   // firstIteration is set per step by the loop below
+    in.snGradLimitCoeff   = hin.snGradLimitCoeff;
+    // The energy gradient limiters too: the device energy equation has honoured both since it was
+    // written (deviceCellLimitGrad on he and on K|Ekp), and this driver never handed them over -- on
+    // rhoKE2 with `grad(e|Ekp) cellLimited Gauss linear 1` the CUDA arm read T 2.35e-02 from OpenFOAM,
+    // the whole limited-vs-unlimited gap, while the host arm read 1.5e-12.
+    in.gradHeLimitK       = hin.gradHeLimitK;
+    in.gradKELimitK       = hin.gradKELimitK;
+    // The energy pair's limitedLinear coefficients and limiter gradients, from the SAME host parse the
+    // host arm uses -- so the two arms cannot disagree about what the case asked for.
+    in.schemeCoeffHe      = hin.schemeCoeffHe;
+    in.schemeCoeffKE      = hin.schemeCoeffKE;
+    in.limGradHeK         = hin.limGradHeK;
+    in.limGradKEK         = hin.limGradKEK;
+    in.limGradHeLeastSq   = hin.limGradHeLeastSq;
+    in.limGradKELeastSq   = hin.limGradKELeastSq;
+    in.gradPLeastSq       = hin.gradPLeastSq;   // every grad(p) consumer on this arm dispatches on it
+    in.gradPLimitK        = hin.gradPLimitK;    // ...and applies its cellLimited coefficient (deviceCellLimitGrad)
+    // The ENERGY equation's non-orthogonal correction takes grad(he)'s own scheme on this arm too
+    // (rhoEEqn.cu, limGradHeLeastSq / limGradHeK, the flags projected below) -- gated end to end on
+    // gasMixing/injectorPipe by tests/rho_gasmixing_vs_openfoam.sh's CUDA arm.
+    in.gradULimitK        = hin.gradULimitK;
+    in.gradULULimitK      = hin.gradULULimitK;
+    in.gradULeastSq       = hin.gradULeastSq;   // the VECTOR least-squares gradient, three scalar fits
+    in.gradMagSqrULeastSq = hin.gradMagSqrULeastSq;   // `Gauss limitedLinear` on U: grad(magSqr(U))'s entry
+    in.gradMagSqrULimitK  = hin.gradMagSqrULimitK;
+
+    in.tolU = hin.tolU;  in.relTolU = hin.relTolU;
+    in.tolHe = hin.tolHe; in.relTolHe = hin.relTolHe;
+    in.tolP = hin.tolP;  in.relTolP = hin.relTolP;
+    in.maxIterU  = hin.maxIterU;  in.minIterU  = hin.minIterU;
+    in.maxIterP  = hin.maxIterP;  in.minIterP  = hin.minIterP;
+    in.maxIterHe = hin.maxIterHe; in.minIterHe = hin.minIterHe;
+
+    // The momentum components OpenFOAM solves, from the same empty patches polyMesh::calcDirections
+    // reads. Derived here rather than in the host StepInput so the harness, which builds its host
+    // input by hand, cannot leave it unset: this function is the one path every device input takes.
+    const SolutionDirections solutionD = solutionDirections(patches);
+    for (int cmpt = 0; cmpt < 3; ++cmpt)
+    {
+        in.solutionD[cmpt] = solutionD.d[cmpt];
+    }
+
+    return in;
+}
+
+TurbulenceHookOptions buildTurbulenceHookOptions(
+    const cpu::rhoSimple::StepInput&       hin,
+    const cpu::rhoSimple::RhoSimpleFields& hf,
+    const DeviceConstraints&               constraints)
+{
+    TurbulenceHookOptions opt;
+    opt.co                    = hf.keCoeffs;
+    opt.co.correctedLaplacian = hin.correctedLaplacian;
+    opt.co.snGradLimitCoeff   = hin.snGradLimitCoeff;
+    opt.co.gradULimitK        = hin.gradULimitK;
+    opt.co.gradKLimitK        = hin.gradKLimitK;
+    // grad(k)/grad(omega|epsilon) resolving to leastSquares runs on the HOST arm (fvc::leastSquaresGrad in
+    // both closures, gated against OpenFOAM on validation/rhoSST); the device closures compute the Gauss
+    // gradient only, and deviceLeastSquaresGrad is not wired into them yet. Running the case here would
+    // build CDkOmega and the laplacian corrections from a different discretisation under the case's own
+    // scheme name -- refused, until that module is ported and gated on its own.
+    // fvm::ddt(alpha, rho, k|epsilon) under `ddtSchemes default Euler`, from the same parse the host
+    // arm reads (parseDdtScheme; rDeltaT = 1/controlDict's LAST deltaT). Both device closures compute
+    // it: kEpsilon.cu (test_rho_kepsilon_cuda's Euler arm, tests/rho_step_cuda_euler.sh) and
+    // kOmegaSST.cu (the same script's SST arm), each against the host reference.
+    opt.rDeltaT               = hin.ddtEuler ? hin.rDeltaT : scalar(0);
+    // grad(k)/grad(epsilon|omega) resolving to leastSquares: computed by both device closures (the
+    // corrected laplacian's correction through turbulence_transport.cu, the SST's CDkOmega in
+    // kOmegaSST.cu; the limiter's own gradient was already limGradLeastSq), gated against the host
+    // reference by test_rho_kepsilon_cuda's leastSquares arm and against OpenFOAM by
+    // tests/rho_leastsquares_closure_vs_openfoam.sh. grad(p) leastSquares is computed at all five of
+    // its device consumers (RhoStepInput::gradPLeastSq; tests/rho_step_cuda_lsq.sh), and grad(U)'s
+    // VECTOR form (three scalar fits, deviceLeastSquaresGradU) by divDevRhoReff, the corrected laplacian,
+    // the limitedLinearV limiter and both closures' production -- gated by leastsquares_grad_vs_openfoam's
+    // device twin, test_rho_ueqn_cuda's and test_rho_kepsilon_cuda's leastSquares arms, and the closure
+    // gate's restart arms on this arm. The linearUpwind-NAMED gradient under leastSquares is refused by
+    // the shared parse before this point.
+    opt.co.gradKLeastSq       = hin.gradKLeastSq;
+    opt.co.gradULeastSq       = hin.gradULeastSq;
+    // kOmegaSST: the model flag and its own coefficients, from the same host parse the host arm reads.
+    // The second-scalar buffers carry omega when this is set -- see createFields.
+    opt.sst   = (hf.rasModel == "kOmegaSST");
+    opt.sstCo = hf.sstCoeffs;
+    opt.sstCo.gradKLimitK  = hin.gradKLimitK;
+    opt.sstCo.gradKLeastSq = hin.gradKLeastSq;
+    opt.sstCo.gradULeastSq = hin.gradULeastSq;
+    opt.Prt                   = hf.Prt;
+    opt.bounded               = hin.boundedTurb;
+    opt.correctedLaplacian    = hin.correctedLaplacian;
+    // limitedLinear is assembled on BOTH closures now -- the device one dispatches to
+    // deviceDivLimitedCoeffs in assembleTransport, on the same limiter gradient the host takes. Only
+    // what the host parse already refused (a `bounded` or coefficient mismatch between the two scalars,
+    // linearUpwind, or a limiter gradient brae does not compute) still reaches this arm as a refusal.
+    opt.divSchemeUnsupported = hin.turbDivUnsupported;
+    // linearUpwind on the turbulence pair: assembled by both closures on both arms since stage H3.6
+    // (turbulence_transport.cu's assembleScalarTransport, the twin of the host's divWithScheme), over the
+    // gradient the entry names, resolved once by the shared parse.
+    opt.linearUpwind         = hin.linearUpwindTurb;
+    opt.luGradK              = hin.turbLUGradK;
+    opt.limitedLinear        = hin.limitedLinearTurb;
+    opt.limiterCoeff         = hin.turbLimiterCoeff;
+    opt.limGradK             = hin.turbLimGradK;
+    opt.limGradLeastSq       = hin.turbLimGradLeastSq;
+    opt.relaxEquationK   = hin.relaxEquationK;
+    opt.relaxK           = hin.relaxK;
+    // THE SECOND SCALAR'S OWN relaxation key -- `omega` under kOmegaSST, `epsilon` otherwise. The driver
+    // reads both (relaxEntry(re,"epsilon") and relaxEntry(re,"omega")); taking epsilon's for an SST case
+    // reads a key the case does not name, so relaxEquation comes back false and the omega equation is
+    // solved UNRELAXED. Measured on validation/rhoSST: the unrelaxed solve overshoots omega low in 944
+    // of 3200 cells (min 162.7 against OpenFOAM's 280.2) while the assembled system itself matches the
+    // legacy closure to 1e-4 on every coefficient -- so it looked like an assembly defect and was not.
+    opt.relaxEquationEps = opt.sst ? hin.relaxEquationOmega : hin.relaxEquationEps;
+    opt.relaxEps         = opt.sst ? hin.relaxOmega         : hin.relaxEpsilon;
+    opt.tol              = hin.tolTurb;
+    opt.relTol           = hin.relTolTurb;
+    opt.maxIter          = hin.maxIterTurb;
+    opt.minIter          = hin.minIterTurb;
+    if (constraints.hasK)
+    {
+        opt.fvoKMask = &constraints.kMask;
+        opt.fvoKVal  = &constraints.kVal;
+    }
+    if (constraints.hasEps)
+    {
+        opt.fvoEpsMask = &constraints.epsMask;
+        opt.fvoEpsVal  = &constraints.epsVal;
+    }
+    return opt;
+}
+
+namespace {
+
+// A device buffer -> the flat host vector the writers take. The device boundary layout already EXCLUDES
+// coupled patches (buildDeviceMesh keeps them out and this driver refuses them anyway), which is the
+// layout foam_field_writer expects, so this is a copy and not a re-ordering.
+std::vector<scalar> host(const DeviceBuffer<scalar>& b)
+{
+    return b.size() ? b.host() : std::vector<scalar>();
+}
+
+} // namespace
+
+int runMirrorCuda(const std::string& caseDir)
+{
+    const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
+    setIOPrecision(controlDict.intOr("writePrecision", 6));   // OF TimeIO.C:375-383
+
+    const FoamDict fvSolution  = readDict(caseDir + "/system/fvSolution");
+    // The unread-entry safety net the legacy drivers have had since item E5, absent on the mirror until
+    // queue item 15: an input this arm parses and never applies is reported at scope exit, on the
+    // normal return AND on a refusal (marked PARTIAL there, since an entry may simply not have been
+    // reached). Declared AFTER the dicts it points at, so it is destroyed first. fvSchemes is audited
+    // through the shared consumption choke point, so it needs no instance here. What this cannot see:
+    // thermophysicalProperties and turbulenceProperties are read as private copies inside createFields
+    // (rhoCreateFields_cpp.cu), and an audit holds pointers -- queued as 15b.
+    // thermophysicalProperties and the turbulence dictionary are read HERE and handed to createFields
+    // (item 15b): FoamDict records the keys its consumers query, so the audit can only report on the
+    // instance the reads happen on. turbulenceDictPath is createFields' own resolution of OpenFOAM's
+    // two names for that dictionary; "" is a case with neither, which createFields refuses.
+    const FoamDict thermoProps = readDict(caseDir + "/constant/thermophysicalProperties");
+    const std::string turbPath = cpu::rhoSimple::turbulenceDictPath(caseDir);
+    std::unique_ptr<FoamDict> turbProps;
+    if (!turbPath.empty()) turbProps = std::make_unique<FoamDict>(readDict(turbPath));
+    DictAuditScope audit;
+    audit.add(controlDict, "system/controlDict");
+    audit.add(fvSolution,  "system/fvSolution");
+    audit.add(thermoProps, "constant/thermophysicalProperties");
+    if (turbProps) audit.add(*turbProps, turbPath.substr(caseDir.size() + 1));
+    audit.addFvSchemes(caseDir);
+    const FoamDict* simpleDict = fvSolution.subDict("SIMPLE");
+
+    // writeFormat: a NOTICE from WriteControl now, on this arm as on the host one. See write_control.cuh.
+
+    PrimitiveMesh m;
+    m.read(caseDir + "/constant/polyMesh");
+    FvGeometry g;
+    g.build(m);
+    const std::vector<FvPatch> patches = buildPatches(m, g);
+    const label nC = m.nCells();
+
+    // The scalarTransport factory, as on the host arm: built by Time, fields resolved from `tracerCtx`
+    // at the first execute(), after the device fields exist (item 15c).
+    brae::tracer::TracerCudaContext tracerCtx;
+    std::vector<brae::tracer::RhoTracerCudaFO*> tracers;
+    std::vector<std::pair<std::string, FunctionObjectList::Factory>> foTypes;
+    foTypes.emplace_back("scalarTransport", brae::tracer::rhoTracerCudaFactory(caseDir, fvSolution, tracerCtx, tracers));
+    Time time(caseDir, controlDict, foTypes);
+    const std::string startName = time.startName();
+    WriteControl& wc = time.writeControl();
+    tracerCtx.fieldDir = caseDir + "/" + startName;
+
+    // The HOST field set first, exactly as the harness does: createDeviceFields projects the device
+    // state from it, and every refusal createFields carries (thermo, RAS model, boundary conditions,
+    // coupled patches) fires here before a single byte reaches the GPU.
+    // This driver's wall treatments read Cmu/kappa/E per patch (item 16h-port): the reader must not
+    // announce those entries as unhonoured.
+    brae::perPatchWallCoeffsHonoured() = true;
+    cpu::rhoSimple::RhoSimpleFields hf =
+        cpu::rhoSimple::createFields(caseDir + "/" + startName, caseDir, simpleDict, &fvSolution,
+                                     m, g, patches, &thermoProps, turbProps.get(), wc.startTime());
+
+    std::printf("brae rhoSimpleFoam (OF-mirror, CUDA): %ld cells, start %s, %s\n",
+                (long)nC, startName.c_str(),
+                hf.turbulent ? (hf.turbulenceFrozen ? (hf.rasModel + " (frozen)").c_str()
+                                                    : hf.rasModel.c_str())
+                             : "laminar");
+
+    cpu::rhoSimple::CaseRefusals refusals;
+    cpu::rhoSimple::StepInput hin =
+        cpu::rhoSimple::buildStepInput(caseDir, hf, fvSolution, m, refusals);
+
+    // fvSolution's `preconditioner` on the three fields this driver solves with BiCGStab. Hoisted out of
+    // the block below because the preconditioner they select is built once, from the mesh, and lives as
+    // long as the run.
+    bool diluU = false, diluHe = false, diluKE = false;
+    int  polyDegKE = 1;                    // the Neumann series' degree on the turbulence pair
+    // DILU on the transonic pressure's BiCGStab (see RhoStepInput::preconP) is OPT-IN, BRAE_DILU_P=1,
+    // and only where the case's own p entry names it (`solver PBiCGStab; preconditioner DILU;`, as
+    // sbMatched does). The default keeps the diagonal and announces the substitution, because the
+    // value is the same and the diagonal is faster: on sbMatched (112k cells, tolerance 1e-12 relTol 0,
+    // so both solves converge fully and the p residual trajectories agree to the printed digits) DILU
+    // took the p solve from 668 to 202 BiCGStab iterations and the phase from 68 to 474 ms per
+    // iteration; on the squareBend tutorial at 896k cells from ~700 to ~300 iterations and from 315 to
+    // 567 ms. The level-scheduled apply (item 70's per-level floor) costs more than the iterations it
+    // saves; the lever is a faster apply, not the default. tests/transonic_p_dilu.sh holds both arms.
+    const FoamDict* solversDict = fvSolution.subDict("solvers");
+    const FoamDict* pEntry = solversDict ? solversDict->subDict("p") : nullptr;
+    const bool caseAsksDiluP = pEntry && pEntry->wordOr("preconditioner", "") == "DILU";
+    const bool diluP = hin.transonic && caseAsksDiluP
+                    && std::getenv("BRAE_DILU_P") && std::string(std::getenv("BRAE_DILU_P")) == "1";
+
+    // BRAE_P_SOLVER, the TRANSONIC pressure's preconditioner, read ONCE here. Every consumer below --
+    // the shared reader's notice (SolverRunsAs::pPrecon), this driver's own lines and the step input --
+    // takes this one decision, so none of them can name a preconditioner another one runs.
+    //   amg       (THE DEFAULT) the case's PBiCGStab preconditioned with brae's AMG V-cycle. OpenFOAM
+    //             registers GAMGPreconditioner in the ASYMMETRIC constructor table as well as the
+    //             symmetric one (GAMGPreconditioner.C:37-42), so `solver PBiCGStab; preconditioner
+    //             GAMG;` is a legal OpenFOAM setting on this matrix -- the like-for-like pair, not a
+    //             substituted solver class. Measured on the squareBend tutorial at 305,760 cells with
+    //             OpenFOAM's OWN PBiCGStab on the same transonic p: diagonal 380.8 solver iterations
+    //             mean and 278.1 ms per outer iteration, DILU 135.3 and 143.9, GAMG 3.8 (max 6) and
+    //             33.8. brae's diagonal arm on the same case ran 2234 BiCGStab iterations over 20 outer
+    //             iterations, 65.9 ms of a 69.5 ms pressure phase.
+    //   diagonal  the diagonal-preconditioned BiCGStab this driver ran before: the opt-out, and the
+    //             control arm of tests/p_amg_bicgstab_vs_openfoam.sh.
+    // BRAE_DILU_P=1 (item 77's opt-in) still selects the case's DILU and therefore turns the AMG off:
+    // a BiCGStab has one preconditioner. Said out loud at the wiring below.
+    const char* pSolverEnv = std::getenv("BRAE_P_SOLVER");
+    const std::string pSolverSel = pSolverEnv ? std::string(pSolverEnv) : std::string("amg");
+    if (pSolverSel != "amg" && pSolverSel != "diagonal")
+    {
+        throw std::runtime_error(
+            "brae rhoSimpleFoam (mirror): BRAE_P_SOLVER='" + pSolverSel + "' names no pressure "
+            "preconditioner this driver runs. Accepted values: `amg` (the case's PBiCGStab "
+            "preconditioned with brae's AMG V-cycle on the transonic pressure, the default) or "
+            "`diagonal` (the diagonal-preconditioned BiCGStab this driver ran before).");
+    }
+    // `diagonal` names the TRANSONIC branch's preconditioner, and there is no diagonal path on the
+    // subsonic one: that matrix is symmetric and the step runs the AMG-preconditioned CG whatever this
+    // says. Refused rather than accepted and ignored -- a gate arm that believed it had selected the
+    // diagonal here would compare one path against itself and call the result a control.
+    if (pSolverSel == "diagonal" && !hin.transonic)
+    {
+        throw std::runtime_error(
+            "brae rhoSimpleFoam (mirror): BRAE_P_SOLVER=diagonal selects the TRANSONIC pressure's "
+            "preconditioner and this case is not transonic (SIMPLE/transonic is not `yes`). The subsonic "
+            "pressure matrix is symmetric and this driver solves it with the AMG-preconditioned CG; "
+            "there is no diagonal path to select here.");
+    }
+    // Two EXPLICIT and contradicting requests. Unset, BRAE_P_SOLVER defaults to `amg` and BRAE_DILU_P=1
+    // simply wins (announced below); spelled out, both name a preconditioner and only one can run, so
+    // this refuses rather than picking one and leaving the other's env var looking honoured.
+    if (diluP && pSolverEnv && pSolverSel == "amg")
+    {
+        throw std::runtime_error(
+            "brae rhoSimpleFoam (mirror): BRAE_P_SOLVER=amg and BRAE_DILU_P=1 both name a preconditioner "
+            "for the transonic pressure's BiCGStab, which takes one. Unset BRAE_P_SOLVER to run the "
+            "case's DILU, or unset BRAE_DILU_P to run the AMG V-cycle.");
+    }
+    const bool pAmgPrecon = hin.transonic && pSolverSel == "amg" && !diluP;
+
+    // The case's smoothSolver selection per field, read below and carried into the step and the
+    // turbulence hook (item 58).
+    bool gsU = false, gsUSym = true, gsHe = false, gsHeSym = true;
+    bool gsK = false, gsEps = false, gsKESym = true;
+    int  nSweepsU = 1, nSweepsHe = 1, nSweepsKE = 1;
+
+    // BRAE_U_SOLVER, the momentum solver, read ONCE here. Every consumer below -- the shared reader's
+    // notice routing, this driver's own notices, the workspace colouring, the step input and the
+    // residual-log name -- takes this one decision, so none of them can disagree.
+    //   colourGS  (THE DEFAULT) a multicolour Gauss-Seidel smoothSolver whatever the entry names,
+    //             under the stop rule the entry names. Measured on the squareBend tutorial at 305,760
+    //             cells, momentum ms per outer iteration: 10.9 against 26.0 for the diagonal BiCGStab
+    //             this driver ran before, 58.5 for a DILU one, 57.2 for OpenFOAM's own index-ordered
+    //             sweep on the host and 36.2 for it level-scheduled on the device
+    //             (bench/results/rhoSimpleFoam_squareBend_gb10.md).
+    //   ofOrder   OpenFOAM's OWN index order on a case that names a GaussSeidel smoothSolver (the
+    //             level-scheduled sweep), and the diagonal BiCGStab on any other entry: what this
+    //             driver ran before. EXACT where colourGS approximates, and the opt-out for a case
+    //             whose momentum must reproduce OpenFOAM's iterate under a loose relTol, not only its
+    //             converged answer.
+    // Both run the case's tolerance, relTol, maxIter, minIter and nSweeps. The difference colourGS
+    // makes is the ORDER of the sweep, which changes where a solve stopped short of convergence stops
+    // -- announced below, per entry, and gated by tests/u_colour_gs_vs_openfoam.sh.
+    // On EVERY entry, including one naming a Krylov solver this driver has. Measured on the same case
+    // at 306k with the U entry pinned, momentum SOLVE ms per outer iteration, brae against OpenFOAM on
+    // 20 cores: PBiCGStab+DILU 60.7 against 14.6 (DILU's forward-backward walk is sequential -- 300
+    // levels on this mesh -- while 20 cores get 20 local factorisations for almost nothing and 5x fewer
+    // iterations), PBiCGStab+diagonal 25.4 against 29.0, and the colour sweep 10.6 to 11.0 on either.
+    // It is the fastest momentum solver this driver has on every entry OpenFOAM's asymmetric smoother
+    // and solver tables allow.
+    // WHAT IT COSTS, because it is not free: on such an entry brae ran the case's own algorithm and so
+    // reproduced OpenFOAM's ITERATE, not only its converged answer. rho_sbmatched_transient_vs_openfoam
+    // reads 4.8e-12 on U that way and 7.7e-10 with the sweep. That gate now runs BOTH: its arms 1 and
+    // cuda take BRAE_U_SOLVER=ofOrder and keep the tight bounds, which is what detects an assembly or
+    // boundary defect (its own items 26a, 26b and 27), and a third arm covers this default at bounds
+    // measured for it. BRAE_U_SOLVER=ofOrder is the opt-out for a case that needs the iterate.
+    bool uColourGS = true;
+    if (const char* e = std::getenv("BRAE_U_SOLVER"))
+    {
+        const std::string sel(e);
+        if (sel == "colourGS")
+        {
+            uColourGS = true;
+        }
+        else if (sel == "ofOrder")
+        {
+            uColourGS = false;
+        }
+        else if (!sel.empty())
+        {
+            throw std::runtime_error(
+                "brae rhoSimpleFoam (mirror): BRAE_U_SOLVER='" + sel + "' names no momentum solver this "
+                "driver runs. Accepted values: `colourGS` (a multicolour Gauss-Seidel smoothSolver on "
+                "every entry, the default) or "
+                "`ofOrder` (OpenFOAM's own index order where the case names a GaussSeidel smoothSolver, "
+                "the case's own Krylov solver otherwise).");
+        }
+    }
+
+    // The case's own linear-solver tolerances, for the same reason the host driver reads them: a gate
+    // pins them so the linear solve is out of the comparison, a SOLVER runs what the case asks for.
+    {
+        DeviceSimpleControls lctl;
+        lctl.turbulent = hf.turbulent;   // gates the reader's k/epsilon block -- see the host driver
+        const std::string secondName = (hf.rasModel == "kOmegaSST") ? "omega" : "epsilon";
+        // What THIS driver runs, so the substitution notices describe it rather than the legacy one.
+        // It wires DILU on the energy solve as well as on U and the turbulence pair; and its pressure
+        // solve is the case's own PBiCGStab on the transonic branch (pcEqn.H's phid matrix is asymmetric,
+        // so there is no CG to run there) and the AMG-preconditioned CG otherwise.
+        SolverRunsAs runsAs;
+        runsAs.diluOnEnergy = true;
+        // This arm runs OpenFOAM's own sweep wherever the case names a smoothSolver (item 58).
+        // BRAE_RHO_SMOOTHSOLVER=0 restores the previous behaviour -- BiCGStab on every field -- with the
+        // notices then announcing each substitution, which is the identity gate's control arm.
+        {
+            const char* e = std::getenv("BRAE_RHO_SMOOTHSOLVER");
+            const bool honour = !(e && std::string(e) == "0");
+            runsAs.smoothSolverOnEnergy     = honour;
+            // ...except on momentum under BRAE_U_SOLVER=colourGS, where OpenFOAM's sweep does NOT run.
+            // The reader's U notice is driven by ctl.gsU = useSymGS("U") && smoothSolverOnMomentum:
+            // true means "OpenFOAM's own sweep runs, nothing to say" and silences it, false makes it
+            // announce `brae runs PBiCGStab preconditioned with ...` against any other entry, an
+            // `ignored` line for the smoother and a preconditioner substitution. In colourGS mode
+            // neither is true -- the colour sweep is not OpenFOAM's and no BiCGStab runs -- so gsU is
+            // kept honest (false) rather than borrowed as a silencer, and the reader is told the caller
+            // owns the U notice. The driver prints exactly one truthful set of lines below, after the
+            // read; tests/u_colour_gs_vs_openfoam.sh asserts both that presence and the reader's silence.
+            runsAs.smoothSolverOnMomentum   = honour && !uColourGS;
+            runsAs.momentumNoticedByCaller  = uColourGS;
+            // ...and it is the one path that runs OpenFOAM's fixed-count nSweeps branch on U, so the
+            // reader hands it a negative nSweeps raw instead of refusing it (linear_solver_setup.cuh).
+            if (uColourGS)
+            {
+                runsAs.fixedSweepsField = "U";
+            }
+            runsAs.smoothSolverOnTurbulence = honour;
+        }
+        if (hin.transonic)
+        {
+            // The notice must say what RUNS: brae's AMG V-cycle by default, the case's DILU when
+            // BRAE_DILU_P=1 opted in, the diagonal under BRAE_P_SOLVER=diagonal. ONE decision
+            // (pAmgPrecon / diluP above), read here and used at the wiring below, so the two cannot
+            // disagree (tests/transonic_p_dilu.sh and tests/p_amg_bicgstab_vs_openfoam.sh hold the arms
+            // to their words).
+            //
+            // `GAMG` is the name of what runs, in OpenFOAM's vocabulary: brae's V-cycle preconditioning
+            // a PBiCGStab is OF's `preconditioner GAMG`, not OF's `solver GAMG` (multigrid AS the
+            // solver, a different algorithm). That makes the shared reader SILENT on a case naming the
+            // pair -- and brae's V-cycle is not OpenFOAM's GAMG, so the driver prints the difference
+            // itself below rather than letting that silence stand.
+            runsAs.pSolver = "PBiCGStab";
+            runsAs.pPrecon = pAmgPrecon ? "GAMG" : diluP ? "DILU" : "diagonal";
+        }
+        readLinearSolverControls(fvSolution, secondName, lctl, "SIMPLE", hf.heName, runsAs);
+        hin.tolU    = lctl.tolU;    hin.relTolU    = lctl.relTolU;    hin.maxIterU    = lctl.maxIterU;    hin.minIterU    = lctl.minIterU;
+        hin.tolP    = lctl.tolP;    hin.relTolP    = lctl.relTolP;    hin.maxIterP    = lctl.maxIterP;    hin.minIterP    = lctl.minIterP;
+        hin.tolHe   = lctl.tolHe;   hin.relTolHe   = lctl.relTolHe;   hin.maxIterHe   = lctl.maxIterHe;   hin.minIterHe   = lctl.minIterHe;
+        hin.tolTurb = lctl.tolKE;   hin.relTolTurb = lctl.relTolKE;   hin.maxIterTurb = lctl.maxIterKE;   hin.minIterTurb = lctl.minIterKE;
+        // Under BRAE_U_SOLVER=colourGS the momentum branch never reads preconU, so a DILU entry must
+        // not make the driver build the level schedule for it (review, round 2).
+        diluU  = lctl.diluU && !uColourGS;
+        diluHe = lctl.diluHe;
+        diluKE = lctl.diluKE;
+        polyDegKE = lctl.polyDegKE;
+        // The case's own smoothSolver selection, carried into the step (item 58). Without these the
+        // driver ran BiCGStab on U, he, k and epsilon while the shared notice -- which takes the flag as
+        // proof the caller honours the dict -- announced nothing for U and the pair.
+        gsU = lctl.gsU;       gsUSym = lctl.gsUSym;     nSweepsU  = lctl.nSweepsU;
+        gsHe = lctl.gsHe;     gsHeSym = lctl.gsHeSym;   nSweepsHe = lctl.nSweepsHe;
+        gsK = lctl.gsK;       gsEps = lctl.gsEps;
+        gsKESym = lctl.gsKESym;                          nSweepsKE = lctl.nSweepsKE;
+        cpu::rhoSimple::printLinearSolverControls(hin, hf.heName, secondName, hf.turbulent);
+    }
+
+    if (uColourGS)
+    {
+        // The U notice for the colour-order momentum solve (the default), from the driver and AFTER the read, since the reader
+        // was told to leave U to the caller (runsAs.momentumNoticedByCaller above). Two cases, one line
+        // each: the case asked for a Gauss-Seidel smoothSolver and gets it in a different ORDER, or it
+        // asked for anything else and gets a different SOLVER. Both run under the stop rule the entry
+        // names (tolerance, relTol, maxIter, minIter, nSweeps); neither leaves the iterate under a
+        // loose relTol where OpenFOAM's would, which is what makes this `approximated` and not
+        // `equivalent`.
+        const FoamDict* uEntry = solversDict ? solversDict->subDict("U") : nullptr;
+        const std::string want = uEntry ? uEntry->wordOr("solver", "") : "";
+        const std::string smoo = uEntry ? uEntry->wordOr("smoother", "") : "";
+        const std::string prec = uEntry ? uEntry->wordOr("preconditioner", "") : "";
+        const bool asksGaussSeidel = want == "smoothSolver"
+                                  && (smoo == "GaussSeidel" || smoo == "symGaussSeidel");
+        if (asksGaussSeidel)
+        {
+            noticeApproximated("solvers/U smoother",
+                               "case asks '" + smoo + "' in OpenFOAM's index order; brae sweeps in COLOUR "
+                               "order -- same stop rule, a different iterate after n sweeps (tests/gs_ladder "
+                               "measured 1.36x/2.76x/6.88x behind after 1/5/10 sweeps on T3A), 5x faster "
+                               "(10.9 against 57.2 ms per iteration at 306k cells). BRAE_U_SOLVER=ofOrder "
+                               "runs OpenFOAM's own order instead");
+        }
+        else
+        {
+            // A DILU-family smoother is STRONGER per sweep than Gauss-Seidel, and a case names one
+            // because plain Gauss-Seidel converges slowly on its mesh (high aspect ratio, strong
+            // anisotropy). The colour sweep will need more sweeps there and, under a maxIter cap, can
+            // stop short of the tolerance the entry asks for. Say so: OpenFOAM's asymmetric smoother
+            // table is GaussSeidel, symGaussSeidel, nonBlockingGaussSeidel, DILU and DILUGaussSeidel
+            // (their .C files' addasymMatrixConstructorToTable), so this is the only family brae
+            // substitutes a weaker smoother for.
+            const bool asksDiluSmoother = smoo.rfind("DILU", 0) == 0;
+            std::string asked = want.empty() ? std::string("no solver") : "'" + want + "'";
+            if (!smoo.empty())
+            {
+                asked += " with smoother '" + smoo + "'";
+            }
+            if (!prec.empty())
+            {
+                asked += " with preconditioner '" + prec + "'";
+            }
+            // Name the VARIANT that runs: with no smoother in the entry gsIsSymmetric() answers true, so
+            // the sweep is the symmetric one (device_sym_gauss_seidel.cuh: symGaussSeidel and GaussSeidel
+            // are different smoothers, not settings of one), and the start-up line says the same.
+            const std::string variant = gsUSym ? "symGaussSeidel" : "GaussSeidel";
+            noticeApproximated("solvers/U solver",
+                               "case asks " + asked + ", brae runs a multicolour " + variant + " smoothSolver "
+                               "to the same tolerance, relTol, maxIter and minIter, nSweeps "
+                             + std::to_string(nSweepsU) + " -- a different solver: the converged answer is "
+                               "the same, the iterate under relTol is not"
+                             + (asksDiluSmoother
+                                ? std::string(", AND Gauss-Seidel is the WEAKER smoother per sweep: this "
+                                              "entry names a DILU-family one, so the solve may need more "
+                                              "sweeps and, under a maxIter cap, stop short of its tolerance")
+                                : std::string())
+                             + ". BRAE_U_SOLVER=ofOrder runs the case's own solver instead");
+        }
+    }
+
+    RhoDeviceFields dev = createDeviceFields(hf, m, g, patches);
+    tracerCtx.dev = &dev;
+    tracerCtx.m = &m;
+    tracerCtx.g = &g;
+    tracerCtx.patches = &patches;
+    DevicePorosity porosity;        // outlives gin: RhoStepInput::porosity points into it
+    DeviceConstraints constraints;  // ...and so do the fvOptions constraint masks
+    RhoStepInput gin =
+        buildDeviceStepInput(hin, hf, refusals, dev, patches, porosity, constraints, nC);
+    // The AMG hierarchy cache: built once per mesh, reloaded on every later run in the same case
+    // directory. The agglomeration is the AMG build cost and is static per mesh, so this is pure
+    // set-up time -- and it is now safe to use: the cache's load path did not rebuild the Galerkin
+    // gather lists, so run 1 wrote .brae_amgcache and run 2 died in galDiagGatherK reading index 0 of a
+    // zero-length buffer (surfacing as "amul: an illegal memory access"). Fixed in the loader
+    // (rebuildGalerkinGather), and a cache-loaded hierarchy now reproduces a cold one BIT-IDENTICALLY
+    // on p, T, U, rho and phi over 30 iterations -- which is the property that matters: this may cost
+    // nothing but time, and it must change no answer.
+    gin.amgCacheDir = caseDir + "/constant/polyMesh";
+    // The momentum and energy solvers the case named (item 58).
+    gin.uSymGaussSeidel  = gsU;   gin.uGaussSeidelSymmetric  = gsUSym;   gin.nSweepsU  = nSweepsU;
+    gin.heSymGaussSeidel = gsHe;  gin.heGaussSeidelSymmetric = gsHeSym;  gin.nSweepsHe = nSweepsHe;
+
+    RhoSolverWorkspace w;
+    // OpenFOAM preconditions k and epsilon with DILU wherever the case says so, and the host reference
+    // always has (pbicgstab.cuh). The device closure ran Jacobi: on sbMatched that left k 5.4e-09 from
+    // OpenFOAM where the host arm sat at 8.4e-12, with both arms' assembled systems agreeing to 1e-11 --
+    // the gap was the solver's stopping point, not the discretisation (queue item 27). buildDeviceDilu is
+    // a level schedule over the mesh, so it is built once here and refreshed per solve inside the solver.
+    if (diluU || diluHe || diluKE || diluP)
+    {
+        w.dilu = buildDeviceDilu(m.owner(), m.neighbour(), nC);
+    }
+    gin.preconU  = (diluU  && w.dilu.valid) ? &w.dilu : nullptr;
+    gin.preconHe = (diluHe && w.dilu.valid) ? &w.dilu : nullptr;
+    // The transonic pressure's BiCGStab takes the same DILU when BRAE_DILU_P=1 opted in (see diluP).
+    // The notice above already said DILU, so a schedule that failed to build is refused, not
+    // silently replaced by the diagonal it just denied.
+    if (diluP && !w.dilu.valid)
+        throw std::runtime_error("brae rhoSimpleFoam (mirror): the DILU level schedule for the transonic pressure "
+                                 "could not be built; refusing rather than running the diagonal the notice "
+                                 "denied. BRAE_DILU=0 selects the diagonal explicitly.");
+    gin.preconP  = diluP ? &w.dilu : nullptr;
+    // ...and the AMG V-cycle instead, from the same one decision. Mutually exclusive with the line
+    // above: the step throws if both arrive (rhoSimpleFoam.cu).
+    gin.pAmgPrecon = pAmgPrecon;
+
+    if (hin.transonic)
+    {
+        // WHAT THE TRANSONIC PRESSURE RUNS, printed in every mode, from the one decision above. A log
+        // that names the momentum solver and not the pressure one sends the reader to the dictionary,
+        // and the dictionary is not what decides this.
+        std::printf("  transonic pressure: PBiCGStab preconditioned with %s\n",
+                    pAmgPrecon ? "brae's AMG V-cycle (BRAE_P_SOLVER=diagonal opts out)"
+                  : diluP      ? "the case's DILU (BRAE_DILU_P=1; the AMG V-cycle is OFF -- a BiCGStab takes one preconditioner)"
+                               : "the diagonal (BRAE_P_SOLVER=diagonal)");
+        if (pAmgPrecon)
+        {
+            // The reader above was told brae preconditions p with GAMG, which is the honest name for a
+            // V-cycle preconditioning a PBiCGStab -- and it makes the reader go SILENT on a case that
+            // asks for that pair. That silence would be a lie: brae's V-cycle is not OpenFOAM's GAMG.
+            // So the difference is stated here, once, whatever the case's p entry says.
+            noticeApproximated(
+                "transonic p preconditioner",
+                "brae runs the case's PBiCGStab preconditioned with ITS OWN AMG V-cycle. OpenFOAM "
+                "registers GAMGPreconditioner in the asymmetric table too (GAMGPreconditioner.C:37-42), "
+                "so the PAIR is OpenFOAM's; the V-cycle inside it is not. It agglomerates greedily in "
+                "pairs on |Sf| and diverges from faceAreaPair at level 1; it smooths by default with "
+                "weighted Jacobi (omega 0.8, one pre- and one post-sweep) rather than the case's "
+                "smoother (BRAE_AMG_GS / BRAE_AMG_TSGS select the other asymmetric-safe ones); its "
+                "coarsest level is a dense LU with partial pivoting, which is OpenFOAM's own "
+                "`directSolveCoarsest` option (GAMGSolver.C:266-278 -> LUscalarMatrix) rather than the "
+                "PBiCGStab it builds by default (:299-328), and it falls back to an iterative solve "
+                "above 96 coarsest cells; it applies ONE V-cycle where GAMGPreconditioner defaults to nVcycles 2 "
+                "(GAMGPreconditioner.C:65); and the V-cycle itself runs in FP32 by default with the "
+                "outer BiCGStab and its residual in FP64 (BRAE_AMG_FP32=0 opts out). So `smoother`, "
+                "`nPreSweeps`, `nPostSweeps`, `nCellsInCoarsestLevel`, `agglomerator` and `mergeLevels` "
+                "in the case's p entry are NOT read. Same linear system and the same stopping rule, so "
+                "the converged answer is the case's; the iterate under a loose relTol is not OpenFOAM's. "
+                "Measured on the squareBend tutorial at 305,760 cells, OpenFOAM's own PBiCGStab on this "
+                "matrix: diagonal 380.8 solver iterations mean and 278.1 ms per outer iteration, DILU "
+                "135.3 and 143.9, GAMG 3.8 and 33.8. BRAE_P_SOLVER=diagonal runs the "
+                "diagonal-preconditioned BiCGStab instead");
+        }
+    }
+
+    if (uColourGS)
+    {
+        // The colouring the colour-order sweep visits the cells in, once per mesh like w.dilu.
+        // PrimitiveMesh::owner() spans the boundary faces as well while neighbour() stops at the
+        // internal ones (primitive_mesh.cuh:99, and the slice buildDeviceDilu takes for the same
+        // reason), so owner is cut to neighbour().size() before the two are paired face by face.
+        const std::vector<label>& ownerAll = m.owner();
+        const std::vector<label>& nei = m.neighbour();
+        const std::vector<label> ownerInternal(
+            ownerAll.begin(),
+            ownerAll.begin() + static_cast<std::ptrdiff_t>(nei.size()));
+        w.uColouring = buildDeviceCellColouring(ownerInternal, nei, static_cast<int>(nC));
+        // The notice above already named the colour sweep, so a colouring that failed to build is
+        // refused, not silently replaced by the BiCGStab the notice just denied.
+        if (!w.uColouring.valid)
+            throw std::runtime_error(
+                "brae rhoSimpleFoam (mirror): the multicolour Gauss-Seidel momentum solve (the default) "
+                "needs a cell colouring and it could not be built; refusing rather than running the solver "
+                "the notice denied. BRAE_U_SOLVER=ofOrder runs OpenFOAM's own order instead.");
+        gin.uColourGaussSeidel = true;
+        // Never both: the step branches `if (uSymGaussSeidel) ... else if (uColourGaussSeidel)`, and
+        // clearing the first here is what keeps it from shadowing the second on a smoothSolver entry.
+        gin.uSymGaussSeidel = false;
+        gin.uColouring = &w.uColouring;
+        std::string sizes;
+        for (int c = 0; c + 1 < static_cast<int>(w.uColouring.startH.size()); ++c)
+        {
+            if (!sizes.empty()) sizes += ' ';
+            sizes += std::to_string(w.uColouring.startH[static_cast<std::size_t>(c) + 1]
+                                  - w.uColouring.startH[static_cast<std::size_t>(c)]);
+        }
+        std::printf("  momentum: multicolour Gauss-Seidel smoothSolver, %d colours (sizes %s), "
+                    "tolerance/relTol/maxIter/minIter/nSweeps from the case's U entry, %s sweeps\n",
+                    w.uColouring.nColours,
+                    sizes.c_str(),
+                    gin.uGaussSeidelSymmetric ? "symGaussSeidel (ascending then descending)"
+                                              : "GaussSeidel (ascending only)");
+    }
+
+    // The name on the OpenFOAM-format `Solving for Ux` line (of_residual_log.cuh, BRAE_OF_LOG=1): what
+    // RUNS, decided from the same flags the step branches on, so the line cannot name a solver the
+    // step did not run. The legacy drivers never set this and keep printing JacobiBiCGStab.
+    momentumSolverName() = gin.uColourGaussSeidel ? "colourGaussSeidel"
+                         : gin.uSymGaussSeidel    ? (gin.uGaussSeidelSymmetric ? "symGaussSeidel"
+                                                                               : "GaussSeidel")
+                         : gin.preconU            ? "DILUPBiCGStab"
+                                                  : "JacobiBiCGStab";
+
+    // THE THERMO HOOKS, device-resident. The step takes them as hooks because EEqn.H ends in
+    // thermo.correct() -- which moves T and therefore psi, and every consumer below that point reads
+    // the result -- and pcEqn.H opens with rho = thermo.rho(); the step refuses to run without them
+    // rather than solve the whole iteration against the state it started with. Both call the same
+    // BRAE_HD inline functions the host reference does, so what differs is where, not what.
+    gin.thermoCorrect = [&]() { thermoCorrect(dev.f, dev.dbT, hf.thermo); };
+    gin.updateRho     = [&]() { updateRho(dev.f, hf.thermo); };
+
+    TurbulenceHookBuffers turbBuf;
+    TurbulenceHookOptions turbOpt;
+    if (hf.turbulent && !hf.turbulenceFrozen && !hf.k.internal.empty())
+    {
+        // The SAME options the CUDA harness's turbulent arm drives (buildTurbulenceHookOptions above).
+        turbOpt = buildTurbulenceHookOptions(hin, hf, constraints);
+        turbOpt.precon = (diluKE && w.dilu.valid) ? &w.dilu : nullptr;
+        turbOpt.polyDegKE = polyDegKE;
+        turbOpt.gsK = gsK;  turbOpt.gsEps = gsEps;  turbOpt.gsSymmetric = gsKESym;  turbOpt.nSweepsKE = nSweepsKE;
+
+        gin.correct = [&]()
+        {
+            correctTurbulence(dev.f, dev, dev.dm, dev.dbU, hf.thermo, turbOpt, turbBuf);
+        };
+    }
+    // The LAMINAR model's correct(): generalizedNewtonian recomputes nu_ at the same point of the
+    // iteration (rhoSimpleFoam.C calls turbulence->correct() whatever the model). The constructor's nu_
+    // came up with the field set (createDeviceFields); effectiveTransport reads it from there.
+    if (hf.generalizedNewtonian)
+    {
+        gin.correct = [&]()
+        {
+            correctGeneralizedNewtonian(dev.f, dev.dm, dev.dbU, hf.thermo, hf.gnCoeffs, hf.gnGradULimitK, turbBuf);
+        };
+    }
+
+    ResidualControl resControl(simpleDict ? simpleDict->subDict("residualControl") : nullptr);
+    std::printf("  residualControl=%s\n", resControl.active() ? "on" : "off");
+
+    const scalar endTime = controlDict.scalarOr("endTime", 0.0);
+    const scalar tStart  = wc.startTime();
+    // OF Time::run tests `value() < endTime - 0.5*deltaT` and operator++ ACCUMULATES the value
+    // (Time.C:785, :1067). std::lround on the quotient disagrees at ratio n + 0.5: measured, real
+    // OpenFOAM runs 2 steps at startTime 0 / endTime 1 / deltaT 0.4 where lround gives 3.
+    const long nSteps = openFoamNSteps(static_cast<double>(tStart),
+                                       static_cast<double>(endTime),
+                                       static_cast<double>(wc.deltaT()));
+    if (nSteps < 1)
+        throw std::runtime_error(
+            "brae rhoSimpleFoam (mirror, CUDA): controlDict endTime (" + std::to_string((double)endTime)
+            + ") is not beyond the start time (" + startName + "): there is nothing to run. endTime is "
+              "an ABSOLUTE time, not a number of iterations.");
+    time.setSteps(static_cast<int>(nSteps));
+
+    const std::string wsrc = caseDir + "/" + startName + "/";
+    const std::string second = (hf.rasModel == "kOmegaSST") ? "omega" : "epsilon";
+
+    auto writeTimeDir = [&](const std::string& tname)
+    {
+        const std::string outDir = caseDir + "/" + tname;
+        std::filesystem::create_directories(outDir);
+        // The ONLY device-to-host traffic in the run, and it happens on the write cadence rather than
+        // every iteration -- which is the whole point of the device path.
+        const std::vector<scalar> ux = host(dev.f.Ux), uy = host(dev.f.Uy), uz = host(dev.f.Uz);
+        const std::vector<scalar> uxb = host(dev.f.UxBnd), uyb = host(dev.f.UyBnd), uzb = host(dev.f.UzBnd);
+        std::vector<vector> U(static_cast<std::size_t>(nC));
+        for (label c = 0; c < nC; ++c) U[c] = vector{ux[c], uy[c], uz[c]};
+        std::vector<vector> UB(uxb.size());
+        for (std::size_t i = 0; i < uxb.size(); ++i) UB[i] = vector{uxb[i], uyb[i], uzb[i]};
+        writeVolField(wsrc + "U", outDir + "/U", U, patches, 12, UB);
+        writeVolField(wsrc + "p", outDir + "/p", host(dev.f.p), patches, 12, host(dev.f.pBnd));
+        writeVolField(wsrc + "T", outDir + "/T", host(dev.f.T), patches, 12, host(dev.f.TBnd));
+        // scalarTransport's transportedField(), written beside the solved fields on the same cadence;
+        // its boundary is evaluated from the device field here, as k's is below.
+        for (const brae::tracer::RhoTracerCudaFO* st : tracers)
+            if (st->ready())
+                writeVolField(wsrc + st->fieldName(), outDir + "/" + st->fieldName(), st->hostField(), patches, 12,
+                              st->boundaryFlat());
+        {
+            static const DerivedFieldSpec rhoSpec{"rho", "dimensions      [1 -3 0 0 0 0 0];"};
+            writeVolField(wsrc + "T", outDir + "/rho", host(dev.f.rho), patches, 12,
+                          host(dev.f.rhoBnd), &rhoSpec);
+        }
+        if (hf.turbulent && dev.f.k.size())
+        {
+            // k and epsilon have no materialised boundary buffer on the device -- their patch values
+            // live in the DeviceBoundary objects the closure solves against -- so they are evaluated
+            // here rather than written with the start directory's boundary echoed back.
+            DeviceBuffer<scalar> kB, eB;
+            deviceBCValue(dev.dbK, dev.f.k, kB);
+            deviceBCValue(dev.dbEps, dev.f.epsilon, eB);
+            writeVolField(wsrc + "k", outDir + "/k", host(dev.f.k), patches, 12, host(kB));
+            writeVolField(wsrc + second, outDir + "/" + second, host(dev.f.epsilon), patches, 12,
+                          host(eB));
+            writeVolField(wsrc + "nut", outDir + "/nut", host(dev.f.nut), patches, 12,
+                          host(dev.f.nutBnd));
+            if (dev.f.alphat.size())
+                writeVolField(wsrc + "alphat", outDir + "/alphat", host(dev.f.alphat), patches, 12,
+                              host(dev.f.alphatBnd));
+        }
+        // generalizedNewtonian's nu_, AUTO_WRITE in OpenFOAM under this name (generalizedNewtonian.C:79-86).
+        if (dev.f.gnNu.size())
+        {
+            static const DerivedFieldSpec nuSpec{"generalizedNewtonian:nu", "dimensions      [0 2 -1 0 0 0 0];"};
+            writeVolField(wsrc + "T", outDir + "/generalizedNewtonian:nu", host(dev.f.gnNu), patches, 12,
+                          host(dev.f.gnNuBnd), &nuSpec);
+        }
+        writeSurfaceField(outDir + "/phi", host(dev.f.phiInt), host(dev.f.phiBnd), patches, 17,
+                          "[1 0 -1 0 0 0 0]");
+        std::printf("written %s\n", outDir.c_str());
+        wc.recordWritten(caseDir, tname);
+    };
+
+    int  nIter = static_cast<int>(nSteps);
+    bool converged = false;
+    scalar cumulativeContErr = 0.0;   // continuityErrs.H: summed over the run
+    int nStepsThisProcess = 0;        // RhoStepInput::firstIteration: rho.oldTime() semantics
+    while (time.loop())
+    {
+        const int iter = time.timeIndex();
+        gin.firstIteration = (nStepsThisProcess++ == 0);
+
+        // muEff and alphaEff, on the device. They are the only route by which the thermo and the
+        // closure reach the momentum and energy equations, and computing them on the host would mean
+        // pulling U, p, T and rho down and pushing four arrays back every iteration.
+        DeviceBuffer<scalar> dMu, dMuB, dAl, dAlB;
+        effectiveTransport(dev.f, hf.thermo, hf.turbulent, dMu, dMuB, dAl, dAlB);
+        gin.muEffCell = &dMu;       gin.muEffBndFace = &dMuB;
+        gin.alphaEffCell = &dAl;    gin.alphaEffBndFace = &dAlB;
+
+        // flowRate_->value(t) at THIS iteration's time, as OpenFOAM's updateCoeffs asks it: the rate of a
+        // `coded` Function1 moves with t, and the step reads frMdot at both of its flow-rate updates.
+        for (std::size_t k = 0; k < dev.frPatch.size(); ++k)
+            dev.frMdot[k] = hf.U.boundary[dev.frPatch[k]]->flowRateAt(time.timeValue());
+        // ...and the time an `expression` PatchFunction1 on T reads (time(), deltaT()), the same
+        // Time::value() the host reference hands its StepInput.
+        gin.time   = time.timeValue();
+        gin.deltaT = time.deltaT();
+        Residuals r = rhoSimpleStep(dev.f, w, dev.dm, dev.dbU, dev.dbP, dev.dbHe, dev.dbT, gin);
+        // THE CLOSURE'S RESIDUALS, which the step cannot return: its turbulence hook is a
+        // std::function<void()>, so k and epsilon never reached `r` and the two residualControl
+        // branches below were dead code on this arm -- a case naming "(k|epsilon)" (angledDuct,
+        // squareBend) was declared converged on p, U and e alone, a strict subset of OpenFOAM's
+        // criteria (simpleControl::criteriaSatisfied walks every field solved this step,
+        // simpleControl.C:58-85), and so stopped no later than OpenFOAM and in practice earlier. The
+        // values were always computed: kEpsilon.cu writes them into the stages this driver owns, and
+        // the hook has run by the time the step returns. Measured on rhoKE with "(k|epsilon)" 1e-3 /
+        // 1e-5 alongside p/U/h 1e-3: the run stops at the same iteration either way with this block
+        // absent, and later under the tighter criterion with it present.
+        if (hf.turbulent)
+        {
+            r["k"]    = turbBuf.stages.kResidual;
+            r[second] = turbBuf.stages.epsResidual;
+        }
+
+        // OpenFOAM's own `Solving for Ux` line per SOLVED component (BRAE_OF_LOG=1), named for the
+        // solver that ran (momentumSolverName()). The knocked-out component has no entry in `r`, as
+        // OpenFOAM prints no line for it (fvMatrixSolve.C:164). Only the momentum lines: they are the
+        // ones whose final residual and iteration count this arm's step returns.
+        if (ofResidualLog())
+        {
+            for (const char* c : {"Ux", "Uy", "Uz"})
+            {
+                if (!r.count(c)) continue;
+                printOfSolveLine(momentumSolverName(),
+                                 c,
+                                 r.at(c),
+                                 r.at(std::string(c) + "Final"),
+                                 static_cast<int>(r.at(std::string(c) + "Iters")));
+            }
+        }
+        auto res = [&](const char* k) { return r.count(k) ? (double)r.at(k) : 0.0; };
+        std::printf("Time = %s   U %.4e   %s %.4e   p %.4e",
+                    WriteControl::timeName(wc.timeValue(iter)).c_str(),
+                    res("U"), hf.heName.c_str(), res(hf.heName.c_str()), res("p"));
+        if (r.count("k")) std::printf("   k %.4e   %s %.4e", res("k"), second.c_str(), res(second.c_str()));
+        if (r.count("pIters")) std::printf("   pIters %.0f", res("pIters"));
+        if (r.count("uIters")) std::printf("   uIters %.0f", res("uIters"));
+        std::printf("\n");
+        // Foam::bound's message, on the iterations where the guard fired. This driver's summary line is
+        // its own format rather than OpenFOAM's, so the bounding lines follow it instead of being
+        // interleaved with per-field solve lines that do not exist here -- but the LINE is OpenFOAM's,
+        // character for character, because its whole value is being greppable beside a real OF log.
+        // Nothing is printed on a healthy iteration, which is why this is not a change to the compact
+        // output in any run that does not need it.
+        for (const auto& b : boundingReports())
+        {
+            printBounding(b.field.c_str(), b.minValue, b.maxValue, b.average);
+        }
+        clearBoundingReports();   // drained here, so emptied here -- see gpuSimpleFoam.cu
+        // OpenFOAM's continuityErrs.H (rhoSimpleFoam's pEqn.H:81 / pcEqn.H:94 include it every
+        // iteration): contErr = fvc::div(phi) on the corrected MASS flux, sum local = deltaT * the
+        // volume-weighted average of |contErr|, global = the same of contErr, cumulative summed over
+        // the run. The host step prints it (rhoSimpleFoam_cpp.cu); this arm printed nothing (item 16a).
+        // Two reductions per iteration, beside the residual reads the summary line above already makes;
+        // tests/mirror_continuity.sh holds the line to the host arm and to a recomputation from the
+        // written phi.
+        {
+            DeviceBuffer<scalar> contErr, R;
+            deviceDiv(dev.dm, dev.f.phiInt, dev.f.phiBnd, contErr);
+            deviceHadamard(R, contErr, dev.dm.V);
+            const DeviceBuffer<scalar>& ones = deviceOnes(dev.dm.nCells);
+            const scalar sumV     = deviceDot(dev.dm.V, ones);
+            const scalar sumLocal = hf.deltaT * deviceSumMag(R) / sumV;
+            const scalar global   = hf.deltaT * deviceDot(R, ones) / sumV;
+            cumulativeContErr += global;
+            std::printf("time step continuity errors : sum local = %g, global = %g, cumulative = %g\n",
+                        sumLocal, global, cumulativeContErr);
+        }
+
+        resControl.beginIteration();
+        bool achieved = resControl.ok(r.count("p") ? r.at("p") : scalar(0), "p");
+        achieved = resControl.ok(r.count("U") ? r.at("U") : scalar(0), "U") && achieved;
+        if (r.count(hf.heName)) achieved = resControl.ok(r.at(hf.heName), hf.heName) && achieved;
+        if (r.count("k"))       achieved = resControl.ok(r.at("k"), "k") && achieved;
+        if (r.count(second))    achieved = resControl.ok(r.at(second), second) && achieved;
+        if (resControl.converged(achieved)) { converged = true; nIter = iter; time.stop(); break; }
+
+        if (time.writeTime()) writeTimeDir(WriteControl::timeName(wc.timeValue(iter)));
+    }
+    time.end();
+    std::printf(converged ? "SIMPLE solution converged in %d iterations\n"
+                          : "SIMPLE reached endTime (%d iterations)\n", nIter);
+    rhoPhaseTimeReport(nIter);   // BRAE_PHASE_TIME (item 67); silent otherwise
+
+    writeTimeDir(WriteControl::timeName(wc.timeValue(nIter)));
+    std::printf("End\n");
+    return 0;
+}
+
+} // namespace rhoSimple
+} // namespace gpu
+} // namespace brae

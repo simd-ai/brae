@@ -2,6 +2,7 @@
 // SIMPLE solver configuration + per-step residual report -- the PODs that parameterise DeviceSimpleSolver.
 // Split out of device_simple_foam.cuh so the solver interface, PIMPLE, rhoSimple etc. can share the controls
 // without pulling in the full solver implementation. Pure data (+ the model-coeff PODs); no device code.
+#include "nut_wall_function.cuh"   // enum class NutWall, beside the formulas it selects
 #include "cf_types.cuh"
 #include "kepsilon_coeffs.cuh"
 #include "komega_sst_coeffs.cuh"
@@ -17,7 +18,16 @@ namespace brae {
 // NOT from the turbulence model. nutk = k-based stepwise log law (nutkWallFunction); Spalding =
 // velocity-based Spalding blend (nutUSpaldingWallFunction); Blended = velocity-based binomial n=4
 // blend (nutUBlendedWallFunction). All three are honoured on any RAS model, exactly as OF does.
-enum class NutWall { Nutk, Spalding, Blended, NutU };   // NutU = nutUWallFunction (STEPWISE blender)
+// The enum itself lives in nut_wall_function.cuh, beside the formulas it selects between, so the
+// turbulence closures can dispatch on it without including this solver-level header. Everything below
+// still reads NutWall::..., unqualified, because it stays in namespace brae.
+// enum class NutWall { Nutk, Spalding, Blended, NutU, LowRe };   // NutU = nutUWallFunction (STEPWISE
+// blender); LowRe = nutLowReWallFunction, whose calcNut() returns Zero UNCONDITIONALLY
+// (nutLowReWallFunctionFvPatchScalarField.C:38-42 is the whole function). It used to be mapped to
+// Nutk with a warning on stderr, on the argument that the two are identical on a resolved mesh --
+// which is false as stated, because nutk s yPlus is the K-BASED Cmu^0.25*y*sqrt(k)/nu, not
+// u_tau*y/nu, so a mesh resolved in friction units can still take nutk s log branch where OpenFOAM
+// returns exactly 0. A warning is not a refusal and a substitution is not a port.
 
 struct DeviceSimpleControls
 {
@@ -26,8 +36,17 @@ struct DeviceSimpleControls
     // factor so a case without Final entries behaves exactly as before.
     scalar relaxUFinal = 0.7, relaxPFinal = 0.3, relaxKFinal = 0.7, relaxEpsFinal = 0.7;
     vector bodyForce{0, 0, 0};                     // constant momentum source (drives periodic/cyclic channels). +V*g.
-    scalar tolU = 1e-8, tolP = 1e-7, tolKE = 1e-8;
+    // lduMatrix::defaultTolerance is 1e-6 for every field (lduMatrix.C:45, read at lduMatrixSolver.C:199);
+    // these were 1e-8 / 1e-7 / 1e-8, which a driver bypassing the reader would have run in silence.
+    scalar tolU = 1e-6, tolP = 1e-6, tolKE = 1e-6;
     scalar relTolU = 0.0, relTolP = 0.0, relTolKE = 0.0;   // solver relTol (fvSolution solvers.{U,p,k,epsilon}.relTol). 0 = abs tol.
+    // The ENERGY equation's own entry (solvers/h, /e, or a regex covering it), filled when the caller
+    // names the field. OF's lduMatrix::solver reads every field from its own sub-dictionary
+    // (lduMatrixSolver.C:196-205; defaults tolerance 1e-6, relTol 0, maxIter 1000, minIter 0). The rho
+    // mirror used to take the energy tolerance from tolKE -- the TURBULENCE slot, which no steady caller
+    // filled -- so he solved to 1e-8/0 whatever the case said.
+    scalar tolHe = 1e-6, relTolHe = 0.0;
+    int    maxIterHe = 1000, minIterHe = 0;
     // fvSolution's `Final` VARIANTS (solvers.pFinal / UFinal / kFinal ...). PIMPLE spends its early outer
     // correctors getting close and its last one getting the answer, so OF gives the last one its own,
     // tighter settings: pimpleControl::loop calls mesh.data().setFinalIteration(true) on the final outer
@@ -53,7 +72,7 @@ struct DeviceSimpleControls
     int    minIterU = 0,    minIterP = 0,    minIterKE = 0;
     int    maxIterUFinal = 1000, maxIterPFinal = 1000, maxIterKEFinal = 1000;
     int    minIterUFinal = 0,    minIterPFinal = 0,    minIterKEFinal = 0;
-    scalar tolUFinal = 1e-8, tolPFinal = 1e-7, tolKEFinal = 1e-8;
+    scalar tolUFinal = 1e-6, tolPFinal = 1e-6, tolKEFinal = 1e-6;
     scalar relTolUFinal = 0.0, relTolPFinal = 0.0, relTolKEFinal = 0.0;
     // TWO flags, because OF selects the Final entry two different ways and the difference is visible in
     // its log on any PISO-mode case (nOuterCorrectors 1, two pressure correctors):
@@ -134,6 +153,13 @@ struct DeviceSimpleControls
     // turbulence is corrected -- so it is not a cost-only control.
     struct OuterResidualControl { std::string field; scalar absTol = 0; scalar relTol = 0; };
     std::vector<OuterResidualControl> outerResidualControl;
+    // WHICH PATCHES CARRY THE TURBULENCE WALL FUNCTION, one entry per fvPatch, 1 = yes. OpenFOAM applies
+    // epsilonWallFunction/omegaWallFunction per BOUNDARY CONDITION -- they are BC objects on the
+    // epsilon/omega field, so only a patch whose BC is one gets a cornerWeights_ entry and an
+    // epsilon0/G0 override. brae selected those cells by PATCH TYPE instead, which is a different set
+    // whenever a `wall`-typed patch carries a plain BC. EMPTY means "fall back to the patch type",
+    // which is what the SA and LES paths use -- they have no epsilon/omega field to read.
+    std::vector<char> turbWallPatch;
     // OF createDyMControls.H, default FALSE: the mesh moves once per time step, on the first outer
     // iteration. When true it moves before EVERY outer corrector, so the outer loop converges the mesh
     // position alongside the pressure-velocity coupling.
@@ -167,12 +193,51 @@ struct DeviceSimpleControls
     scalar gradULimitK = 0.0;    // grad(U) "cellLimited Gauss linear <k>" coeff (OF cellLimitedGrad<minmod>); 0 = unlimited. Set from fvSchemes.
     bool   limitedK = false, limitedEps = false;  // div(phi,k|epsilon) "limitedLinear": implicit limited weight. Set from fvSchemes.
     bool   luK = false, luEps = false;             // div(phi,k|epsilon|nuTilda) "linearUpwind": deferred gradient correction. Set from fvSchemes.
-    bool   gsK = false, gsEps = false;             // scalar linear solver = smoothSolver+symGaussSeidel (read from fvSolution solvers.{k|nuTilda} / {epsilon|omega}).
-    bool   gsU = false;                            // momentum linear solver = smoothSolver+(sym)GaussSeidel (read from fvSolution solvers.U).
+    // "the case ASKED for smoothSolver + a GaussSeidel smoother", read from fvSolution
+    // solvers.{k|nuTilda} / {epsilon|omega} / U. For `symGaussSeidel` brae now runs OpenFOAM's own
+    // sweep (device_sym_gauss_seidel.cuh level-schedules symGaussSeidelSmoother.C without changing an
+    // operation). For `GaussSeidel` it does not -- OF's is the ascending walk only -- and that one
+    // substitution is announced by linear_solver_setup.cuh.
+    bool   gsK = false, gsEps = false;
+    bool   gsU = false;
+    // ...and WHICH GaussSeidel it asked for. OF has two smoothers under that family and they are not
+    // settings of one another: symGaussSeidelSmoother.C walks the cells up then back down,
+    // GaussSeidelSmoother.C walks them up ONLY -- its sweep loop has no second half. brae runs whichever
+    // the case named (device_sym_gauss_seidel.cuh). One flag for the transported turbulence pair, as
+    // nSweeps is, so a case naming different smoothers on k and epsilon|omega is refused rather than run
+    // with whichever entry was read first.
+    bool   gsUSym = true, gsKESym = true;
+    // fvSolution solvers/<field>/nSweeps (smoothSolver.C:78, default 1): the sweeps between residual
+    // EVALUATIONS, so it decides where a solve stops, not merely how fast it gets there.
+    int    nSweepsU = 1, nSweepsHe = 1, nSweepsKE = 1;
+    // The ENERGY equation on a smoothSolver + GaussSeidel-family smoother, and which of the two OF
+    // smoothers. True only when the case asks AND the calling driver honours it (SolverRunsAs::
+    // smoothSolverOnEnergy) -- a shared flag that assumed the caller is how the mirror came to run
+    // BiCGStab under a notice that said nothing.
+    bool   gsHe = false, gsHeSym = true;
     // fvSolution asked for `preconditioner DILU` on U (OF's default for the momentum equations, and the
     // entry brae used to substitute Jacobi for). Only meaningful on the BiCGStab path -- a smoothSolver
     // has no preconditioner in OF either.
     bool   diluU = false;
+    // DILU on the TURBULENCE solve (k, epsilon/omega, nuTilda), when the case asks for it. Separate from
+    // diluU because the two are different fvSolution entries and a case can name one without the other.
+    //
+    // This is not a cost knob. Measured on turbulentFlatPlate:kEpsilon at y+ ~ 1, over 60 consecutive k
+    // solves: OpenFOAM DILU-preconditioned PBiCGStab reduces the residual to a median 0.0064 of initial,
+    // overshooting the case relTol of 0.1 by more than 10x in a single iteration, while brae Jacobi
+    // BiCGStab stops right at the threshold, median 0.0726. In the stiff k-epsilon pair that leaves the
+    // two fields mutually inconsistent every outer iteration and the case DIVERGES; solving them to
+    // 1e-3 instead makes the same code converge to U 1.04e-05 of OpenFOAM.
+    bool   diluKE = false;
+    // The truncated Neumann series' degree on the transported turbulence scalars, when the case names
+    // no preconditioner because brae is substituting its solver (linear_solver_setup.cuh has the
+    // measurement). 1 is plain Jacobi -- the series' first term -- so 1 means "unchanged".
+    int    polyDegKE = 1;
+    // DILU on the ENERGY solve (h or e), when the case asks for it. A third entry because it is a third
+    // fvSolution block: every compressible tutorial writes `"(U|e|k|epsilon)" { preconditioner DILU; }`,
+    // so a driver honouring two of the three still substitutes Jacobi on the energy equation. Only the
+    // OF-mirror driver consumes this; the legacy compressible drivers keep Jacobi there and say so.
+    bool   diluHe = false;
     scalar twoBykK = 2.0, twoBykEps = 2.0;         // 2/max(k_,SMALL) from the limitedLinear coefficient (k_=1 -> 2).
     // div(phi,h|e) and div(phi,K|Ekp) -- the ENERGY equation's convection scheme (rhoSimpleFoam). Read from
     // fvSchemes like every other div scheme; brae used to hardcode upwind here and silently ignore what the
@@ -244,6 +309,11 @@ struct DeviceSimpleControls
     KEpsilonCoeffs keCoeffs;                       // k-eps model coeffs (default = OF); read from turbulenceProperties RAS.kEpsilonCoeffs.
     bool   sst = false;                            // RASModel kOmegaSST (the "second turbulence scalar" eps slot holds omega).
     bool   lm = false;                             // RASModel kOmegaSSTLM (sst + Langtry-Menter gamma-ReThetat transition).
+    // The model word AS THE CASE NAMES IT (RASModel / LESModel / "laminar"), for every print that talks
+    // about the model. The prints used to derive a label from the flags (`sst ? "kOmegaSST" :
+    // "kEpsilon"`), which labelled realizableKE, RNGkEpsilon, SpalartAllmaras and every LES model as
+    // "kEpsilon" -- a wrong statement in the run log about which equations are being solved.
+    std::string modelName = "laminar";
     KOmegaSSTCoeffs ksstCoeffs;                    // kOmegaSST coeffs (default = OF); read from RAS.kOmegaSSTCoeffs.
     bool   sa = false;                             // RASModel SpalartAllmaras (one-equation: the "k" slot holds nuTilda; no 2nd scalar).
     bool   des = false;                            // SpalartAllmarasDDES/kOmegaSSTDDES (simulationType LES): DES length-scale limiter; needs sa/sst=true.
@@ -295,6 +365,12 @@ struct DeviceSimpleResidual
     scalar he = 0, heFinal = 0;
     int    heIters = 0;
     scalar contLocal = 0, contGlobal = 0;          // time step continuity errors, raw (driver applies deltaT + cumulative)
+    // polyMesh::solutionD(): +1 solved, -1 knocked out by an EMPTY patch. fvMatrix<vector>::solveSegregated
+    // `continue`s on every -1 (fvMatrixSolve.C:157-164), so OpenFOAM prints no `Solving for U<cmpt>` line
+    // for it and stores a default SolverPerformance whose initialResidual is Zero -- which is what the
+    // cmptMax in solutionControl.C:232 then compares. The driver needs both facts to report and to
+    // converge the way OpenFOAM does, so the step hands them back with the residuals.
+    int solvedU[3] = {1, 1, 1};
 };
 
 } // namespace brae

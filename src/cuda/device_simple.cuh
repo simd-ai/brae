@@ -13,7 +13,14 @@ namespace brae {
 // bdDiagK = (cmptAv(ic)-ic_k) per boundary face; bdSrcK = boundaryCoeffs_k per boundary face (host-flattened).
 void deviceMatrixH(const DeviceLduView& A, const DeviceMesh& dm, const DeviceBuffer<scalar>& psiK,
                    const DeviceBuffer<scalar>& sourceK, const DeviceBuffer<scalar>& bdDiagK,
-                   const DeviceBuffer<scalar>& bdSrcK, DeviceBuffer<scalar>& Hk);
+                   const DeviceBuffer<scalar>& bdSrcK, DeviceBuffer<scalar>& Hk,
+                   // fvMatrix<Type>::H() ends by zeroing every component polyMesh::solutionD() knocks
+                   // out (fvMatrix.C's validComponents block). This parameter is that block: false for a
+                   // direction an EMPTY patch removed, and Hk comes back identically zero. The host twin
+                   // brae::matrixH derives it from the patch list; here the caller must supply it,
+                   // because a DeviceMesh cannot recover a patch type. Default true = a mesh with no
+                   // empty patch, which is the only case where solving all three is right.
+                   bool valid = true);
 
 // rAU = V/diagC  (A = diagC/V, rAU = 1/A). diagC already folded (= diag + internalCoeffs cmptAv).
 void deviceReciprocalV(const DeviceMesh& dm, const DeviceBuffer<scalar>& diagC, DeviceBuffer<scalar>& rAU);
@@ -52,11 +59,47 @@ void deviceCorrector(const DeviceBuffer<scalar>& HbyA, const DeviceBuffer<scalar
 void deviceBoundaryFlux(const DeviceMesh& dm, const DeviceBuffer<scalar>& uxb, const DeviceBuffer<scalar>& uyb,
                         const DeviceBuffer<scalar>& uzb, DeviceBuffer<scalar>& phiB);
 
+struct DeviceBoundary;   // full type in device_boundary.cuh; only a reference is taken here
+
+// constrainPressure's device half (constrainPressure.C:60-77): on every snGradMask face of dbP,
+//     refGrad = (phiHbyA_b - rho_b*(Sf_b & U_b)) / (magSf_b * den_b)
+// with den_b the CALLING pressure equation's own divisor -- rhorAUf_b (pEqn.H:12), rho_b*rAtU_own
+// (pcEqn.H:16) or rAtU_own (incompressible pEqn.H:21) -- prepared by the caller because the three
+// equations genuinely differ there. rhoBnd null = geometricOneField (the incompressible overload).
+// dbP is const because every caller holds it const; the write goes through DeviceBuffer's device
+// pointer exactly as OF's own constrainPressure const_casts the patch it updates
+// (constrainPressure.C:66).
+void deviceConstrainPressure(
+    const DeviceBoundary&       dbP,
+    const DeviceBuffer<scalar>& phiHbyABnd,
+    const DeviceBuffer<scalar>& sfUBnd,
+    const scalar*               rhoBnd,
+    const DeviceBuffer<scalar>& denBnd);
+
+// den_b = cellField[bndCell] -- the boundary value of a calculated volScalarField (the owner cell's),
+// which is what pcEqn's rhorAtU and simpleFoam's rAtU hand constrainPressure as the divisor.
+void deviceOwnerGather(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& cellField,
+    DeviceBuffer<scalar>&       bnd);
+
 // adjustPhi (no-pressure-reference cases): scale the ADJUSTABLE outflow so the net boundary flux = 0
 // (global continuity). adjustable[i]=1 if the U patch does NOT fix the flux (zeroGradient/inletOutlet/calculated),
 // 0 if it does (fixedValue/noSlip). massCorr = (massIn - fixedMassOut)/adjustableMassOut. Returns massCorr; a no-op
 // (massCorr=1) for a closed domain (all fixed, no adjustable outflow). Operates on the boundary flux in place.
-scalar deviceAdjustPhi(const DeviceBuffer<label>& adjustable, DeviceBuffer<scalar>& phiB);
+// OF adjustPhi. phiInt is the INTERNAL flux and is needed for OF's normaliser
+// totalFlux = VSMALL + sum(mag(phi)), which is taken over the whole surface field and not just the
+// boundary slice being scaled. Null keeps the old behaviour of normalising on the boundary alone, which
+// makes the relative guard weaker than OpenFOAM's -- pass it wherever the internal flux is in hand.
+// closedVolume, when asked for, is MEASURED as OF measures it (adjustPhi.C:145-147): every one of
+// massIn, fixedMassOut and adjustableMassOut negligible against totalFlux. The device drivers used to
+// hardcode `closedVolume = true` after this call -- right for every all-Neumann fixture that really was
+// closed, and wrong on the first open one (rhoBoxP: inletOutlet outlet, all-Neumann p), where the
+// closed-volume mass correction then shifted p by a uniform +43 Pa per outer iteration.
+scalar deviceAdjustPhi(const DeviceBuffer<label>& adjustable,
+                       DeviceBuffer<scalar>& phiB,
+                       const DeviceBuffer<scalar>* phiInt = nullptr,
+                       bool* closedVolume = nullptr);
 
 // fvMatrix::setReference (no-pressure-reference cases): pin the singular pressure system at refCell.
 // OF: source[ref] += diag[ref]*refValue; diag[ref] += diag[ref]. Call BEFORE the AMG coarsening + normFactor.

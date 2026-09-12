@@ -56,6 +56,14 @@ int main(int argc, char** argv) {
 
     // device state (snapshot the inputs BEFORE the CPU correct() mutates k/eps/nut).
     const std::vector<scalar> kIn = k.internal, eIn = eps.internal, nIn = nut.internal;
+    // nut's OWN boundary, snapshotted before correct() overwrites it. DkEff(patchi)/DepsilonEff(patchi)
+    // are built from this on BOTH paths -- passing it on one side only is what made this test fail.
+    std::vector<scalar> nutBIn;
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        const std::vector<scalar>& b = nut.boundary[pi]->value();
+        nutBIn.insert(nutBIn.end(), b.begin(), b.end());
+    }
 
     // CPU correct() (mutates k, eps, nut).
     kepsilon::correct(U, k, eps, nut, phi, nu, m, g, fvp, relaxEps, relaxK, tol, 0.0, 3000);
@@ -69,7 +77,18 @@ int main(int argc, char** argv) {
     std::vector<scalar> ux(nC),uy(nC),uz(nC); for (label c=0;c<nC;++c){ux[c]=U.internal[c].x;uy[c]=U.internal[c].y;uz[c]=U.internal[c].z;}
     DeviceBuffer<scalar> dUx(ux),dUy(uy),dUz(uz), dk(kIn), de(eIn), dnut(nIn);
     DeviceBuffer<scalar> phiB(([&]{std::vector<scalar> o; for(auto&a:phi.boundary)o.insert(o.end(),a.begin(),a.end());return o;}()));
-    deviceKEpsilonCorrect(dm, wall, dbEps, dbK, dbU, dUx, dUy, dUz, dk, de, dnut, DeviceBuffer<scalar>(phi.internal), phiB, nu, relaxEps, relaxK, tol);
+    const DeviceBuffer<scalar> dNutB(nutBIn);
+    deviceKEpsilonCorrect(dm, wall, dbEps, dbK, dbU, dUx, dUy, dUz, dk, de, dnut,
+                          DeviceBuffer<scalar>(phi.internal), phiB, nu, relaxEps, relaxK, tol,
+                          /*bounded*/false, /*boundedEps*/false,
+                          /*limitedK*/false, /*limitedEps*/false, 2.0, 2.0,
+                          /*co*/{}, /*relTolKE*/0.0, /*keCheckEvery*/1,
+                          /*linearUpwindK*/false, /*linearUpwindEps*/false, /*nonOrth*/false,
+                          /*gsK*/false, /*gsEps*/false, /*ami*/nullptr, /*cyc*/nullptr,
+                          /*nutWall*/0, /*atmZ0*/0.0, /*atmBoundNut*/true,
+                          /*kDdt*/{}, /*eDdt*/{},
+                          /*rho*/nullptr, /*muLam*/nullptr, /*rhoBnd*/nullptr, /*nuWallFace*/nullptr,
+                          &dNutB);
 
     std::printf("GPU closed kEpsilon::correct (nCells=%d):\n", nC);
     std::printf("  eps device vs CPU : %.3e\n", relMax(de.host(), eCpu));

@@ -71,6 +71,73 @@ void divFaceKernel(int nIf, const scalar* __restrict__ phi, scalar* __restrict__
 // limitedLinear convection: W_f = limiter*CDweight + (1-limiter)*pos0(phi); limiter = clamp(twoByk*r,0,1),
 // r = NVDTVD gradient ratio. Reduces EXACTLY to upwind divFaceKernel at limiter=0. (OF gaussConvectionScheme +
 // limitedSurfaceInterpolationScheme::weights + NVDTVD::r.) gradc{X,Y,Z} = grad(field); d = (Cf-C_own)-(Cf-C_nei).
+// The NVDTVD limiter and its face WEIGHT, in one device function so the matrix coefficients below and
+// the explicit face values the energy equation needs cannot drift about what `limitedLinear k` means.
+// twoByk > 0 selects limitedLinear (limiter = clamp(2/k * r, 0, 1)); twoByk == 0 selects vanAlbada
+// (limiter = r(r+1)/(r^2+1), vanAlbada.H:85), which the Maxwell tutorials name for div(phi,sigma).
+// Same NVDTVD r either way -- only the limiter function differs, so they share this.
+__device__ __forceinline__ scalar limitedFaceWeight(
+    int f, int P, int N, scalar p, scalar cdwF,
+    const scalar* __restrict__ field,
+    const scalar* __restrict__ gx, const scalar* __restrict__ gy, const scalar* __restrict__ gz,
+    const scalar* __restrict__ dOwnX, const scalar* __restrict__ dOwnY, const scalar* __restrict__ dOwnZ,
+    const scalar* __restrict__ dNeiX, const scalar* __restrict__ dNeiY, const scalar* __restrict__ dNeiZ,
+    scalar twoByk)
+{
+    const scalar dx = dOwnX[f] - dNeiX[f], dy = dOwnY[f] - dNeiY[f], dz = dOwnZ[f] - dNeiZ[f];   // d = C[N]-C[P]
+    // NVDTVD::r, upwind-cell gradient (strict phi>0) projected on d, vs the face gradient.
+    const int U = (p > 0.0) ? P : N;
+    const scalar gradcf = dx*gx[U] + dy*gy[U] + dz*gz[U];
+    const scalar gradf  = field[N] - field[P];
+    scalar r;   // sign(s) = (s>=0)?1:-1  (OF Scalar.H)
+    if (fabs(gradcf) >= 1000.0 * fabs(gradf))
+        r = 2.0 * 1000.0 * ((gradcf >= 0.0) ? 1.0 : -1.0) * ((gradf >= 0.0) ? 1.0 : -1.0) - 1.0;
+    else
+        r = 2.0 * (gradcf / gradf) - 1.0;
+    scalar limiter;
+    if (twoByk > 0.0)
+    {
+        limiter = twoByk * r;
+        limiter = (limiter < 0.0) ? 0.0 : (limiter > 1.0 ? 1.0 : limiter);    // clamp(.,0,1)
+    }
+    else
+    {
+        limiter = r * (r + 1.0) / (r*r + 1.0);        // OF vanAlbada: NOT clamped, and it is <= 1 anyway
+    }
+    const scalar pos0 = (p >= 0.0) ? 1.0 : 0.0;
+    return limiter * cdwF + (1.0 - limiter) * pos0;
+}
+
+
+// The face weights alone, for a caller assembling an EXPLICIT divergence rather than matrix
+// coefficients -- rhoSimpleFoam's fvc::div(phi, Ekp). Same limiter, same currency (twoByk, not raw k).
+__global__
+void limitedFaceWeightsKernel(
+    int nIf,
+    const label* __restrict__ own,
+    const label* __restrict__ nei,
+    const scalar* __restrict__ cdw,
+    const scalar* __restrict__ phi,
+    const scalar* __restrict__ field,
+    const scalar* __restrict__ gx,
+    const scalar* __restrict__ gy,
+    const scalar* __restrict__ gz,
+    const scalar* __restrict__ dOwnX,
+    const scalar* __restrict__ dOwnY,
+    const scalar* __restrict__ dOwnZ,
+    const scalar* __restrict__ dNeiX,
+    const scalar* __restrict__ dNeiY,
+    const scalar* __restrict__ dNeiZ,
+    scalar twoByk,
+    scalar* __restrict__ w)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= nIf) return;
+    w[f] = limitedFaceWeight(f, own[f], nei[f], phi[f], cdw[f], field, gx, gy, gz,
+                             dOwnX, dOwnY, dOwnZ, dNeiX, dNeiY, dNeiZ, twoByk);
+}
+
+
 __global__
 void divLimitedFaceKernel(
     int nIf,
@@ -97,31 +164,8 @@ void divLimitedFaceKernel(
 
     const int P = own[f], N = nei[f];
     const scalar p = phi[f];
-    const scalar dx = dOwnX[f] - dNeiX[f], dy = dOwnY[f] - dNeiY[f], dz = dOwnZ[f] - dNeiZ[f];   // d = C[N]-C[P]
-    // NVDTVD::r, upwind-cell gradient (strict phi>0) projected on d, vs the face gradient.
-    const int U = (p > 0.0) ? P : N;
-    const scalar gradcf = dx*gx[U] + dy*gy[U] + dz*gz[U];
-    const scalar gradf  = field[N] - field[P];
-    scalar r;   // sign(s) = (s>=0)?1:-1  (OF Scalar.H)
-    if (fabs(gradcf) >= 1000.0 * fabs(gradf))
-        r = 2.0 * 1000.0 * ((gradcf >= 0.0) ? 1.0 : -1.0) * ((gradf >= 0.0) ? 1.0 : -1.0) - 1.0;
-    else
-        r = 2.0 * (gradcf / gradf) - 1.0;
-    // twoByk > 0 selects limitedLinear (limiter = clamp(2/k * r, 0, 1)); twoByk == 0 selects vanAlbada
-    // (limiter = r(r+1)/(r^2+1), vanAlbada.H:85), which the Maxwell tutorials name for div(phi,sigma).
-    // Same NVDTVD r either way -- only the limiter function differs, so they share one kernel.
-    scalar limiter;
-    if (twoByk > 0.0)
-    {
-        limiter = twoByk * r;
-        limiter = (limiter < 0.0) ? 0.0 : (limiter > 1.0 ? 1.0 : limiter);    // clamp(.,0,1)
-    }
-    else
-    {
-        limiter = r * (r + 1.0) / (r*r + 1.0);        // OF vanAlbada: NOT clamped, and it is <= 1 anyway
-    }
-    const scalar pos0 = (p >= 0.0) ? 1.0 : 0.0;
-    const scalar W = limiter * cdw[f] + (1.0 - limiter) * pos0;
+    const scalar W = limitedFaceWeight(f, P, N, p, cdw[f], field, gx, gy, gz,
+                                       dOwnX, dOwnY, dOwnZ, dNeiX, dNeiY, dNeiZ, twoByk);
     const scalar lo = -W * p;
     lower[f] = lo;
     upper[f] = lo + p;
@@ -400,6 +444,87 @@ void deviceLaplacianCorrFluxLimited(
     cudaCheck(cudaGetLastError(), "lapCorrFaceLimited");
 }
 
+namespace {
+// The VECTOR form. OF's limitedSnGrad<Type> takes mag() of the whole snGrad and of the whole correction,
+// so a vector field gets ONE limiter per face shared by all three components -- not three independent
+// ones. Limiting per component is a different scheme: it lets one component's correction survive where
+// the vector's own magnitude says the face should be capped, and on airFoil2D the two differ by 0.6%.
+__global__
+void lapCorrFaceLimitedVecKernel(
+    int nIf,
+    const label*  __restrict__ own,
+    const label*  __restrict__ nei,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ gammaf,
+    const scalar* __restrict__ magSf,
+    const scalar* __restrict__ cvx,
+    const scalar* __restrict__ cvy,
+    const scalar* __restrict__ cvz,
+    const scalar* __restrict__ nonOrthDc,
+    const scalar* __restrict__ p0,
+    const scalar* __restrict__ p1,
+    const scalar* __restrict__ p2,
+    const scalar* __restrict__ g0x, const scalar* __restrict__ g0y, const scalar* __restrict__ g0z,
+    const scalar* __restrict__ g1x, const scalar* __restrict__ g1y, const scalar* __restrict__ g1z,
+    const scalar* __restrict__ g2x, const scalar* __restrict__ g2y, const scalar* __restrict__ g2z,
+    scalar psi,
+    scalar* __restrict__ f0,
+    scalar* __restrict__ f1,
+    scalar* __restrict__ f2)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= nIf) return;
+    const int o = own[f], n = nei[f];
+    const scalar wf = w[f], wn = 1.0 - wf;
+
+    const scalar c0 = cvx[f]*(wf*g0x[o] + wn*g0x[n]) + cvy[f]*(wf*g0y[o] + wn*g0y[n])
+                    + cvz[f]*(wf*g0z[o] + wn*g0z[n]);
+    const scalar c1 = cvx[f]*(wf*g1x[o] + wn*g1x[n]) + cvy[f]*(wf*g1y[o] + wn*g1y[n])
+                    + cvz[f]*(wf*g1z[o] + wn*g1z[n]);
+    const scalar c2 = cvx[f]*(wf*g2x[o] + wn*g2x[n]) + cvy[f]*(wf*g2y[o] + wn*g2y[n])
+                    + cvz[f]*(wf*g2z[o] + wn*g2z[n]);
+
+    const scalar d0 = nonOrthDc[f]*(p0[n] - p0[o]);
+    const scalar d1 = nonOrthDc[f]*(p1[n] - p1[o]);
+    const scalar d2 = nonOrthDc[f]*(p2[n] - p2[o]);
+
+    const scalar magOrth = sqrt(d0*d0 + d1*d1 + d2*d2);
+    const scalar magCorr = sqrt(c0*c0 + c1*c1 + c2*c2);
+    scalar limiter = (psi * magOrth) / ((1.0 - psi) * magCorr + 1.0e-15);
+    if (limiter > 1.0) limiter = 1.0;
+
+    const scalar s = gammaf[f] * magSf[f] * limiter;
+    f0[f] = s * c0;
+    f1[f] = s * c1;
+    f2[f] = s * c2;
+}
+} // namespace
+
+void deviceLaplacianCorrFluxLimitedVec(
+    const DeviceMesh& dm,
+    const DeviceBuffer<scalar>& gammafInt,
+    const DeviceBuffer<scalar>& p0,
+    const DeviceBuffer<scalar>& p1,
+    const DeviceBuffer<scalar>& p2,
+    const DeviceBuffer<scalar>* gxc,     // [3]
+    const DeviceBuffer<scalar>* gyc,
+    const DeviceBuffer<scalar>* gzc,
+    scalar psi,
+    DeviceBuffer<scalar>* ffc)           // [3], resized here
+{
+    const int nIf = dm.nInternalFaces;
+    for (int k = 0; k < 3; ++k) ffc[k].resize(nIf);
+    lapCorrFaceLimitedVecKernel<<<nBlocks(nIf), TPB>>>(
+        nIf, dm.owner.data(), dm.nei.data(), dm.w.data(), gammafInt.data(), dm.magSf.data(),
+        dm.corrVecX.data(), dm.corrVecY.data(), dm.corrVecZ.data(), dm.nonOrthDc.data(),
+        p0.data(), p1.data(), p2.data(),
+        gxc[0].data(), gyc[0].data(), gzc[0].data(),
+        gxc[1].data(), gyc[1].data(), gzc[1].data(),
+        gxc[2].data(), gyc[2].data(), gzc[2].data(),
+        psi, ffc[0].data(), ffc[1].data(), ffc[2].data());
+    cudaCheck(cudaGetLastError(), "lapCorrFaceLimitedVec");
+}
+
 
 // src = -V*fvc::div(ffc) (the integrated face-flux divergence, = fvm::laplacian.source()'s correction term).
 void deviceFaceDivSource(const DeviceMesh& dm, const DeviceBuffer<scalar>& ffc, DeviceBuffer<scalar>& src)
@@ -485,6 +610,29 @@ void deviceDivLimitedCoeffs(
     cudaCheck(cudaGetLastError(), "divLimitedFace");
     diagGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), upper.data(), lower.data(), diag.data());
     cudaCheck(cudaGetLastError(), "diagGather");
+}
+
+
+void deviceLimitedFaceWeights(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& phiInt,
+    const DeviceBuffer<scalar>& field,
+    const DeviceBuffer<scalar>& gx,
+    const DeviceBuffer<scalar>& gy,
+    const DeviceBuffer<scalar>& gz,
+    scalar                      twoByk,
+    DeviceBuffer<scalar>&       w)
+{
+    const int nIf = dm.nInternalFaces;
+    w.resize(nIf);
+    if (!nIf) return;
+    limitedFaceWeightsKernel<<<nBlocks(nIf), TPB>>>(nIf, dm.owner.data(), dm.nei.data(), dm.w.data(),
+                                                    phiInt.data(), field.data(),
+                                                    gx.data(), gy.data(), gz.data(),
+                                                    dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
+                                                    dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
+                                                    twoByk, w.data());
+    cudaCheck(cudaGetLastError(), "limitedFaceWeights");
 }
 
 

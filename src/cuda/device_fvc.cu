@@ -3,6 +3,8 @@
 // bndCellStart), race-free, deterministic, matching the CPU fvc to machine precision.
 #include "device_mesh.cuh"
 #include <cuda_runtime.h>
+#include <stdexcept>
+#include <string>
 
 namespace brae {
 
@@ -34,6 +36,7 @@ void divKernel(
     const scalar* __restrict__ phiInt,
     const label* __restrict__ bndCellStart,
     const label* __restrict__ bndPerm,
+    const label* __restrict__ bndIsEmpty,   // emptyFvPatch::size() == 0: never in OpenFOAM's surfaceIntegrate
     const scalar* __restrict__ bval,
     const scalar* __restrict__ V,
     scalar* __restrict__ d)
@@ -47,9 +50,138 @@ void divKernel(
     for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
         s -= phiInt[losort[k]];    // -neighbour internal
     for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)
-        s += bval[bndPerm[k]];   // +boundary
+    {
+        const int bk = bndPerm[k];
+        if (bndIsEmpty[bk]) continue;   // whatever bval holds there -- a flux is zero now, an interpolate is not (item 36d)
+        s += bval[bk];   // +boundary
+    }
     d[c] = s / V[c];
 }
+
+
+// ---- leastSquares gradient (OF leastSquaresGrad.C + leastSquaresVectors.C) ---------------------
+// Two per-cell gathers, no atomics, the same owner/losort/bndPerm walk the Gauss gradient uses. Each
+// cell needs only its OWN inverted dd tensor: OpenFOAM's pVectors use invDd[own] and its nVectors
+// invDd[nei], so on the owner side of a face the cell reads its own, and on the neighbour side likewise.
+//
+// d, the cell-to-cell vector, is already in DeviceMesh: (Cf - C_own) - (Cf - C_nei) = C_nei - C_own, and
+// a boundary face's fvPatch::delta() is the PATCH-NORMAL PROJECTION of (Cf - C_faceCell),
+// `nHat*(nHat & (Cf() - Cn()))` (fvPatch.C) -- NOT the raw difference, which is the same vector only on
+// an orthogonal mesh. dBnd carries the raw Cf - C (cellLimitedGrad needs that one), so the projection is
+// taken here from Sf/magSf at the same face.
+// fvPatch::delta() on an uncoupled patch: the component of Cf - Cn along the face normal. The host's
+// lsBoundaryDelta (fvc.cu) is the same expression, so the two arms cannot drift.
+BRAE_HD inline vector lsqBndDelta(
+    scalar dx, scalar dy, scalar dz,
+    scalar sfx, scalar sfy, scalar sfz,
+    scalar mag)
+{
+    const vector nH{sfx / mag, sfy / mag, sfz / mag};
+    const scalar p = nH.x * dx + nH.y * dy + nH.z * dz;
+    return vector{p * nH.x, p * nH.y, p * nH.z};
+}
+
+__global__
+void lsqInvDdKernel(
+    int nC,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ losort,
+    const label* __restrict__ losortStart,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ magSf,
+    const scalar* __restrict__ Sfx, const scalar* __restrict__ Sfy, const scalar* __restrict__ Sfz,
+    const scalar* __restrict__ dOwnX, const scalar* __restrict__ dOwnY, const scalar* __restrict__ dOwnZ,
+    const scalar* __restrict__ dNeiX, const scalar* __restrict__ dNeiY, const scalar* __restrict__ dNeiZ,
+    const label* __restrict__ bndCellStart,
+    const label* __restrict__ bndPerm,
+    const label* __restrict__ bndIsEmpty,
+    const label* __restrict__ bndGFace,
+    const scalar* __restrict__ dBndX, const scalar* __restrict__ dBndY, const scalar* __restrict__ dBndZ,
+    scalar* __restrict__ idd)     // 6*nC, component-major
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+
+    symmTensor dd{0, 0, 0, 0, 0, 0};
+    for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)
+    {
+        const vector d{dOwnX[f] - dNeiX[f], dOwnY[f] - dNeiY[f], dOwnZ[f] - dNeiZ[f]};
+        dd = dd + ((1.0 - w[f]) * (magSf[f] / magSqr(d))) * sqr(d);
+    }
+    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
+    {
+        const int f = losort[k];
+        const vector d{dOwnX[f] - dNeiX[f], dOwnY[f] - dNeiY[f], dOwnZ[f] - dNeiZ[f]};
+        dd = dd + (w[f] * (magSf[f] / magSqr(d))) * sqr(d);
+    }
+    for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)
+    {
+        const int bk = bndPerm[k];
+        if (bndIsEmpty[bk]) continue;   // emptyFvPatch::size() == 0 -- this is what leaves dd singular in 2-D
+        const int gf = bndGFace[bk];
+        const vector d = lsqBndDelta(dBndX[bk], dBndY[bk], dBndZ[bk], Sfx[gf], Sfy[gf], Sfz[gf], magSf[gf]);
+        dd = dd + (magSf[gf] / magSqr(d)) * sqr(d);
+    }
+    const symmTensor r = safeInv(dd);
+    idd[0 * nC + c] = r.xx; idd[1 * nC + c] = r.xy; idd[2 * nC + c] = r.xz;
+    idd[3 * nC + c] = r.yy; idd[4 * nC + c] = r.yz; idd[5 * nC + c] = r.zz;
+}
+
+__global__
+void lsqGradKernel(
+    int nC,
+    const label* __restrict__ own,
+    const label* __restrict__ nei,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ losort,
+    const label* __restrict__ losortStart,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ magSf,
+    const scalar* __restrict__ Sfx, const scalar* __restrict__ Sfy, const scalar* __restrict__ Sfz,
+    const scalar* __restrict__ dOwnX, const scalar* __restrict__ dOwnY, const scalar* __restrict__ dOwnZ,
+    const scalar* __restrict__ dNeiX, const scalar* __restrict__ dNeiY, const scalar* __restrict__ dNeiZ,
+    const scalar* __restrict__ vf,
+    const label* __restrict__ bndCellStart,
+    const label* __restrict__ bndPerm,
+    const label* __restrict__ bndIsEmpty,
+    const label* __restrict__ bndGFace,
+    const scalar* __restrict__ dBndX, const scalar* __restrict__ dBndY, const scalar* __restrict__ dBndZ,
+    const scalar* __restrict__ bval,
+    const scalar* __restrict__ idd,
+    scalar* __restrict__ gx, scalar* __restrict__ gy, scalar* __restrict__ gz)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+
+    const symmTensor iv{idd[0*nC+c], idd[1*nC+c], idd[2*nC+c], idd[3*nC+c], idd[4*nC+c], idd[5*nC+c]};
+    const scalar vc = vf[c];
+    vector s{0, 0, 0};
+    for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)
+    {
+        const vector d{dOwnX[f] - dNeiX[f], dOwnY[f] - dNeiY[f], dOwnZ[f] - dNeiZ[f]};
+        const scalar msd = magSf[f] / magSqr(d);
+        s += ((1.0 - w[f]) * msd * (vf[nei[f]] - vc)) * (iv & d);
+    }
+    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
+    {
+        const int f = losort[k];
+        const vector d{dOwnX[f] - dNeiX[f], dOwnY[f] - dNeiY[f], dOwnZ[f] - dNeiZ[f]};
+        const scalar msd = magSf[f] / magSqr(d);
+        // grad[nei] -= nVectors*dvf with nVectors = -w*msd*(invDd[nei] & d) and dvf = vf[nei] - vf[own]
+        s += (w[f] * msd * (vc - vf[own[f]])) * (iv & d);
+    }
+    for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)
+    {
+        const int bk = bndPerm[k];
+        if (bndIsEmpty[bk]) continue;
+        const int gf = bndGFace[bk];
+        const vector d = lsqBndDelta(dBndX[bk], dBndY[bk], dBndZ[bk], Sfx[gf], Sfy[gf], Sfz[gf], magSf[gf]);
+        s += ((magSf[gf] / magSqr(d)) * (bval[bk] - vc)) * (iv & d);
+    }
+    // No division by V: the fit vectors already carry the normalisation.
+    gx[c] = s.x; gy[c] = s.y; gz[c] = s.z;
+}
+
 
 
 __global__
@@ -68,14 +200,17 @@ void gradKernel(
     const label* __restrict__ bndCellStart,
     const label* __restrict__ bndPerm,
     const label* __restrict__ bndGFace,
+    const label* __restrict__ bndIsEmpty,   // emptyFvPatch::size() == 0: an empty face is never in OpenFOAM's sum
     const scalar* __restrict__ bval,
     const scalar* __restrict__ V,
     scalar* __restrict__ gx,
     scalar* __restrict__ gy,
-    scalar* __restrict__ gz)
+    scalar* __restrict__ gz,
+    const int* __restrict__ skipIf)     // device flag: when set, this launch is a no-op (the grad(U) memo hit)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
+    if (skipIf && *skipIf) return;
 
     scalar sx = 0.0, sy = 0.0, sz = 0.0;
     for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)   // +owner internal
@@ -96,6 +231,11 @@ void gradKernel(
     for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)   // +boundary
     {
         const int kk = bndPerm[k];
+        // Skipped as the cellLimited kernel below skips them, and for the same reason: OpenFOAM
+        // cannot sum a face of a zero-sized patch. Sf_x and Sf_y of an extruded empty face are
+        // bitwise zero, so this changes nothing in-plane; g_z goes from the cancellation of two
+        // opposite 1e+00-scale terms to internal-face round-off, which is what OpenFOAM has (item 36c).
+        if (bndIsEmpty[kk]) continue;
         const int f = bndGFace[kk];
         const scalar pv = bval[kk];
         sx += Sfx[f] * pv;
@@ -121,8 +261,36 @@ void deviceDiv(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const D
 {
     d.resize(dm.nCells);
     divKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
-                                           phiInt.data(), dm.bndCellStart.data(), dm.bndPerm.data(), bval.data(), dm.V.data(), d.data());
+                                           phiInt.data(), dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), bval.data(), dm.V.data(), d.data());
     cudaCheck(cudaGetLastError(), "div");
+}
+
+
+void deviceLeastSquaresGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol,
+                            const DeviceBuffer<scalar>& bval,
+                            DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz)
+{
+    const int nC = dm.nCells;
+    gx.resize(nC); gy.resize(nC); gz.resize(nC);
+    DeviceBuffer<scalar> idd; idd.resize(static_cast<std::size_t>(6) * nC);
+    lsqInvDdKernel<<<nBlocks(nC), TPB>>>(
+        nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), dm.w.data(), dm.magSf.data(),
+        dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
+        dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
+        dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
+        dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), dm.bndGFace.data(),
+        dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), idd.data());
+    cudaCheck(cudaGetLastError(), "lsqInvDd");
+    lsqGradKernel<<<nBlocks(nC), TPB>>>(
+        nC, dm.owner.data(), dm.nei.data(), dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
+        dm.w.data(), dm.magSf.data(),
+        dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
+        dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
+        dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(), vol.data(),
+        dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), dm.bndGFace.data(),
+        dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), bval.data(), idd.data(),
+        gx.data(), gy.data(), gz.data());
+    cudaCheck(cudaGetLastError(), "lsqGrad");
 }
 
 
@@ -132,7 +300,8 @@ void deviceGaussGrad(
     const DeviceBuffer<scalar>& bval,
     DeviceBuffer<scalar>& gx,
     DeviceBuffer<scalar>& gy,
-    DeviceBuffer<scalar>& gz)
+    DeviceBuffer<scalar>& gz,
+    const int* skipIf)
 {
     gx.resize(dm.nCells);
     gy.resize(dm.nCells);
@@ -140,9 +309,195 @@ void deviceGaussGrad(
     gradKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.owner.data(), dm.nei.data(), dm.w.data(),
                                             dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(), vol.data(),
                                             dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
-                                            dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndGFace.data(), bval.data(),
-                                            dm.V.data(), gx.data(), gy.data(), gz.data());
+                                            dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndGFace.data(), dm.bndIsEmpty.data(), bval.data(),
+                                            dm.V.data(), gx.data(), gy.data(), gz.data(), skipIf);
     cudaCheck(cudaGetLastError(), "gaussGrad");
+}
+
+
+namespace {
+// THE SAME GRADIENT, N FIELDS AT A TIME, IN ONE LAUNCH.
+//
+// WHY. nsys on the compressible iteration at 305,760 cells (12 outer iterations): gradKernel ran 16
+// times per outer iteration at 281 us each -- 4.5 ms/it, 15% of all GPU work and second only to the
+// matrix-vector product, in an iteration that is launch- and bandwidth-bound (about 30 ms of GPU-busy
+// time in 914 launches). Nine of the sixteen are velocity components in groups of three, and each of
+// those three re-reads the WHOLE of the addressing and geometry -- owner, nei, w, Sf*, ownerStart,
+// losort, losortStart, bndCellStart, bndPerm, bndGFace, bndIsEmpty, V -- to carry one field, which is a
+// small fraction of the traffic. Reading the row once is what took the colour Gauss-Seidel sweep from
+// 524 to 231 us at 306k (device_colour_gauss_seidel.cu); this is the same lever on the assembly side.
+//
+// WHY IT IS BIT-IDENTICAL TO gradKernel, per field. Fusing N independent fields is a loop interchange
+// and nothing else: the same three loops, in the same order, over the same faces, with the same
+// expressions, each field accumulated into its own registers in the same sequence. Nothing is
+// reassociated and nothing is shared but the operands that are read. tests/test_grad_fused.cu holds
+// that to memcmp against N separate gradKernel launches, and its one-ulp control proves the per-field
+// registers are not crossed -- which is the failure mode a fused kernel actually has.
+template<int N>
+struct GradFusedFields
+{
+    const scalar* vol[N];
+    const scalar* bval[N];
+    scalar* gx[N];
+    scalar* gy[N];
+    scalar* gz[N];
+};
+
+
+template<int N>
+__global__
+void gradFusedKernel(
+    int nC,
+    const label* __restrict__ own,
+    const label* __restrict__ nei,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ Sfx,
+    const scalar* __restrict__ Sfy,
+    const scalar* __restrict__ Sfz,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ losort,
+    const label* __restrict__ losortStart,
+    const label* __restrict__ bndCellStart,
+    const label* __restrict__ bndPerm,
+    const label* __restrict__ bndGFace,
+    const label* __restrict__ bndIsEmpty,   // emptyFvPatch::size() == 0: an empty face is never in OpenFOAM's sum
+    const scalar* __restrict__ V,
+    GradFusedFields<N> fld,
+    const int* __restrict__ skipIf)     // device flag: when set, this launch is a no-op (the grad(U) memo hit)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    if (skipIf && *skipIf) return;
+
+    scalar sx[N], sy[N], sz[N];
+#pragma unroll
+    for (int i = 0; i < N; ++i)
+    {
+        sx[i] = 0.0;
+        sy[i] = 0.0;
+        sz[i] = 0.0;
+    }
+    for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)   // +owner internal
+    {
+        const scalar wf = w[f];
+        const label o = own[f], n = nei[f];
+        const scalar sfx = Sfx[f], sfy = Sfy[f], sfz = Sfz[f];
+#pragma unroll
+        for (int i = 0; i < N; ++i)
+        {
+            const scalar pf = wf * fld.vol[i][o] + (1.0 - wf) * fld.vol[i][n];
+            sx[i] += sfx * pf;
+            sy[i] += sfy * pf;
+            sz[i] += sfz * pf;
+        }
+    }
+    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)   // -neighbour internal
+    {
+        const int f = losort[k];
+        const scalar wf = w[f];
+        const label o = own[f], n = nei[f];
+        const scalar sfx = Sfx[f], sfy = Sfy[f], sfz = Sfz[f];
+#pragma unroll
+        for (int i = 0; i < N; ++i)
+        {
+            const scalar pf = wf * fld.vol[i][o] + (1.0 - wf) * fld.vol[i][n];
+            sx[i] -= sfx * pf;
+            sy[i] -= sfy * pf;
+            sz[i] -= sfz * pf;
+        }
+    }
+    for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)   // +boundary
+    {
+        const int kk = bndPerm[k];
+        // The same skip as gradKernel's, for the same reason: OpenFOAM cannot sum a face of a
+        // zero-sized patch, so an empty face is in no surface sum (item 36c).
+        if (bndIsEmpty[kk]) continue;
+        const int f = bndGFace[kk];
+        const scalar sfx = Sfx[f], sfy = Sfy[f], sfz = Sfz[f];
+#pragma unroll
+        for (int i = 0; i < N; ++i)
+        {
+            const scalar pv = fld.bval[i][kk];
+            sx[i] += sfx * pv;
+            sy[i] += sfy * pv;
+            sz[i] += sfz * pv;
+        }
+    }
+    const scalar Vc = V[c];
+#pragma unroll
+    for (int i = 0; i < N; ++i)
+    {
+        fld.gx[i][c] = sx[i] / Vc;
+        fld.gy[i][c] = sy[i] / Vc;
+        fld.gz[i][c] = sz[i] / Vc;
+    }
+}
+
+
+template<int N>
+void launchGradFused(
+    const DeviceMesh& dm,
+    const DeviceBuffer<scalar>* const* vol,
+    const DeviceBuffer<scalar>* const* bval,
+    DeviceBuffer<scalar>* gx,
+    DeviceBuffer<scalar>* gy,
+    DeviceBuffer<scalar>* gz,
+    const int* skipIf)
+{
+    GradFusedFields<N> fld;
+    for (int i = 0; i < N; ++i)
+    {
+        fld.vol[i]  = vol[i]->data();
+        fld.bval[i] = bval[i]->data();
+        fld.gx[i]   = gx[i].data();
+        fld.gy[i]   = gy[i].data();
+        fld.gz[i]   = gz[i].data();
+    }
+    gradFusedKernel<N><<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.owner.data(), dm.nei.data(), dm.w.data(),
+                                                    dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
+                                                    dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
+                                                    dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndGFace.data(), dm.bndIsEmpty.data(),
+                                                    dm.V.data(), fld, skipIf);
+    cudaCheck(cudaGetLastError(), "gaussGradFused");
+}
+} // namespace
+
+
+void deviceGaussGradFused(
+    const DeviceMesh& dm,
+    int n,
+    const DeviceBuffer<scalar>* const* vol,
+    const DeviceBuffer<scalar>* const* bval,
+    DeviceBuffer<scalar>* gx,
+    DeviceBuffer<scalar>* gy,
+    DeviceBuffer<scalar>* gz,
+    const int* skipIf)
+{
+    // Refuse rather than truncate: silently gradient-ing the first three of four fields is exactly the
+    // class of quiet substitution this project keeps finding.
+    if (n < 1 || n > 3)
+    {
+        throw std::runtime_error("brae: deviceGaussGradFused takes 1, 2 or 3 fields, asked for "
+                                 + std::to_string(n) + ".");
+    }
+    for (int i = 0; i < n; ++i)
+    {
+        gx[i].resize(dm.nCells);
+        gy[i].resize(dm.nCells);
+        gz[i].resize(dm.nCells);
+    }
+    switch (n)
+    {
+        case 1:
+            launchGradFused<1>(dm, vol, bval, gx, gy, gz, skipIf);
+            break;
+        case 2:
+            launchGradFused<2>(dm, vol, bval, gx, gy, gz, skipIf);
+            break;
+        default:
+            launchGradFused<3>(dm, vol, bval, gx, gy, gz, skipIf);
+            break;
+    }
 }
 
 
@@ -171,6 +526,7 @@ void cellLimitGradKernel(
     const label* __restrict__ owner,
     const label* __restrict__ bndCellStart,
     const label* __restrict__ bndPerm,
+    const label* __restrict__ bndIsEmpty,
     const scalar* __restrict__ dOwnX,
     const scalar* __restrict__ dOwnY,
     const scalar* __restrict__ dOwnZ,
@@ -201,9 +557,28 @@ void cellLimitGradKernel(
         maxD = fmax(maxD,d);
         minD = fmin(minD,d);
     }
+    // EMPTY PATCHES CONTRIBUTE NOTHING, because in OpenFOAM they cannot: emptyFvPatchField is a
+    // ZERO-SIZED patch field (emptyFvPatchField.C:41), so there are no faces to evaluate. brae keeps
+    // those faces in its addressing and has to skip them explicitly, and the host reference does
+    // (cellLimitedGrad_cpp.cu:76 and :116). In the FACE loop it is not harmless: on a 2D mesh Cf - C for
+    // an empty face points out of the plane, so the extrapolate is the out-of-plane gradient -- round-off
+    // rather than physics -- and r = maxDelta/extrapolate is then a ratio of a real number to noise,
+    // which can clamp the limiter far below what any real face asks for. Measured on the host when it
+    // was fixed there: grad(U) 1.39e-02 -> 1.28e-14.
+    //
+    // LATENT ON EVERY REGISTERED FIXTURE, and saying so is the point. rho_ueqn_cuda_cell_limited is the
+    // only arm that drives the limiter on a 2D mesh, and it passes at 2e-12 WITH the skip and WITHOUT
+    // it. Both loops are inert on pitzDailyTurb for a reason worth writing down: an empty face's stored
+    // value equals its cell's, so Ubnd - uc is 0 and cannot move a range that already includes the cell
+    // itself at 0; and the mesh is axis-aligned, so dBnd is out-of-plane while the gradient is in it and
+    // dBnd . g underflows to a limiter of 1. Neither holds in general -- the host's own measurement
+    // above is what a case that breaks the second one costs -- so this brings the device into line with
+    // the host and with OpenFOAM's zero-sized empty patch rather than fixing an observed number.
     for (int j = bndCellStart[c]; j < bndCellStart[c+1]; ++j)
     {
-        const scalar d = Ubnd[bndPerm[j]] - uc;
+        const int bk = bndPerm[j];
+        if (bndIsEmpty[bk]) continue;
+        const scalar d = Ubnd[bk] - uc;
         maxD = fmax(maxD,d);
         minD = fmin(minD,d);
     }
@@ -225,6 +600,7 @@ void cellLimitGradKernel(
     for (int j = bndCellStart[c]; j < bndCellStart[c+1]; ++j)
     {
         const int bk = bndPerm[j];
+        if (bndIsEmpty[bk]) continue;   // see the note above -- here it is NOT round-off-harmless
         lim = fmin(lim, limFace(maxD, minD, dBndX[bk]*gcx + dBndY[bk]*gcy + dBndZ[bk]*gcz));
     }
     gx[c] = gcx*lim;
@@ -272,6 +648,7 @@ void cellLimitMinMaxKernel(
     const label* __restrict__ owner,
     const label* __restrict__ bndCellStart,
     const label* __restrict__ bndPerm,
+    const label* __restrict__ bndIsEmpty,
     scalar* __restrict__ maxD,
     scalar* __restrict__ minD)
 {
@@ -283,8 +660,12 @@ void cellLimitMinMaxKernel(
     { const scalar d = U[nei[f]] - uc; mx = fmax(mx,d); mn = fmin(mn,d); }
     for (int j = losortStart[c]; j < losortStart[c+1]; ++j)
     { const scalar d = U[owner[losort[j]]] - uc; mx = fmax(mx,d); mn = fmin(mn,d); }
+    // Empty patches contribute nothing -- emptyFvPatchField is zero-sized in OpenFOAM, so these faces
+    // do not exist there. Same skip as the single-kernel path, and the host reference at
+    // cellLimitedGrad_cpp.cu:76.
     for (int j = bndCellStart[c]; j < bndCellStart[c+1]; ++j)
-    { const scalar d = Ubnd[bndPerm[j]] - uc; mx = fmax(mx,d); mn = fmin(mn,d); }
+    { const int bk = bndPerm[j]; if (bndIsEmpty[bk]) continue;
+      const scalar d = Ubnd[bk] - uc; mx = fmax(mx,d); mn = fmin(mn,d); }
     maxD[c] = mx;
     minD[c] = mn;
 }
@@ -322,6 +703,7 @@ void cellLimitFactorKernel(
     const label* __restrict__ losortStart,
     const label* __restrict__ bndCellStart,
     const label* __restrict__ bndPerm,
+    const label* __restrict__ bndIsEmpty,
     const scalar* __restrict__ dOwnX, const scalar* __restrict__ dOwnY, const scalar* __restrict__ dOwnZ,
     const scalar* __restrict__ dNeiX, const scalar* __restrict__ dNeiY, const scalar* __restrict__ dNeiZ,
     const scalar* __restrict__ dBndX, const scalar* __restrict__ dBndY, const scalar* __restrict__ dBndZ,
@@ -337,8 +719,12 @@ void cellLimitFactorKernel(
         l = fmin(l, limFace(mx, mn, dOwnX[f]*gcx + dOwnY[f]*gcy + dOwnZ[f]*gcz));
     for (int j = losortStart[c]; j < losortStart[c+1]; ++j)
     { const int f = losort[j]; l = fmin(l, limFace(mx, mn, dNeiX[f]*gcx + dNeiY[f]*gcy + dNeiZ[f]*gcz)); }
+    // ...and here the skip is load-bearing rather than tidy: Cf - C on an empty face points out of the
+    // 2D plane, so this extrapolate is round-off and the ratio against maxDelta can clamp the limiter far
+    // below what any real face asks for (cellLimitedGrad_cpp.cu:111-116).
     for (int j = bndCellStart[c]; j < bndCellStart[c+1]; ++j)
-    { const int bk = bndPerm[j]; l = fmin(l, limFace(mx, mn, dBndX[bk]*gcx + dBndY[bk]*gcy + dBndZ[bk]*gcz)); }
+    { const int bk = bndPerm[j]; if (bndIsEmpty[bk]) continue;
+      l = fmin(l, limFace(mx, mn, dBndX[bk]*gcx + dBndY[bk]*gcy + dBndZ[bk]*gcz)); }
     lim[c] = l;
 }
 
@@ -393,7 +779,7 @@ void deviceCellLimitGrad(
         DeviceBuffer<scalar> maxD(nC), minD(nC), lim(nC);
         cellLimitMinMaxKernel<<<nBlocks(nC), TPB>>>(nC, U.data(), Ubnd.data(),
             dm.ownerStart.data(), dm.nei.data(), dm.losort.data(), dm.losortStart.data(), dm.owner.data(),
-            dm.bndCellStart.data(), dm.bndPerm.data(), maxD.data(), minD.data());
+            dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), maxD.data(), minD.data());
         for (int i = 0; i < nIfs; ++i)
             if (ifs[i].n > 0 && ifs[i].nbrVal)
                 ifMinMaxKernel<<<nBlocks(ifs[i].n), TPB>>>(ifs[i].n, ifs[i].ownCell, ifs[i].nbrVal,
@@ -401,7 +787,7 @@ void deviceCellLimitGrad(
         if (k < 1.0) widenKernel<<<nBlocks(nC), TPB>>>(nC, k, maxD.data(), minD.data());
         cellLimitFactorKernel<<<nBlocks(nC), TPB>>>(nC,
             dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
-            dm.bndCellStart.data(), dm.bndPerm.data(),
+            dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(),
             dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(), dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
             dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), maxD.data(), minD.data(),
             gx.data(), gy.data(), gz.data(), lim.data());
@@ -416,7 +802,7 @@ void deviceCellLimitGrad(
     }
     cellLimitGradKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, k, U.data(), Ubnd.data(),
         dm.ownerStart.data(), dm.nei.data(), dm.losort.data(), dm.losortStart.data(), dm.owner.data(),
-        dm.bndCellStart.data(), dm.bndPerm.data(),
+        dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(),
         dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(), dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
         dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), gx.data(), gy.data(), gz.data());
     cudaCheck(cudaGetLastError(), "cellLimitGrad");

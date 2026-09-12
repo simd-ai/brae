@@ -27,6 +27,8 @@
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "near_wall_dist.cuh"   // closestPointOnTriangle, pointToFaceDist, nwdGreat (= OF correctWalls)
+#include <algorithm>
+#include <unordered_map>
 #include <vector>
 #include <cmath>
 
@@ -185,55 +187,98 @@ inline std::vector<scalar> cellWallDist(
     const std::vector<label>&  fv  = m.faceVerts();
     const std::vector<label>&  fo  = m.faceOffsets();
 
-    // (1) correctBoundaryFaceCells: a cell owning wall face(s) -> exact point-to-face-polygon dist to its own
-    // wall faces (min over them). brae::nearWallDist is the same exact routine OF's smallestDist uses.
-    const std::vector<std::vector<scalar>> nwd = nearWallDist(m, g, patches);
-    std::vector<scalar> wallY(nCells, nwdGreat);
-    for (std::size_t pi = 0; pi < patches.size(); ++pi)
-        if (patches[pi].type == "wall")
-            for (label i = 0; i < patches[pi].size; ++i)
-            {
-                const label c = patches[pi].faceCells[i];
-                if (nwd[pi][i] < wallY[c]) wallY[c] = nwd[pi][i];     // min over the cell's wall faces
-            }
-
-    // (2) correctBoundaryPointCells: a cell point-connected to a wall vertex (and NOT already face-corrected)
-    // -> exact dist to the wall faces sharing that vertex (OF pointFaces[patchPointi]), min over them.
-    std::vector<char> isWallVtx(pts.size(), 0);
-    std::vector<std::vector<label>> vtxWallFaces(pts.size());          // wall vertex -> incident wall faces (global idx)
+    // correctWalls, as OpenFOAM ACTUALLY runs it. patchWave::correct() branches on a static switch:
+    //
+    //     if (cellDistFuncs::useCombinedWallPatch)                       // cellDistFuncs.C:42, DEFAULT TRUE
+    //         correctBoundaryCells(patchIDs.sortedToc(), true, ...);     // "Correct across multiple patches"
+    //     else
+    //         correctBoundaryFaceCells(...); correctBoundaryPointCells(...);   // "Backwards compatible"
+    //
+    // The pair of functions the class is usually read for is the BACKWARDS-COMPATIBLE branch and is not
+    // what runs. correctBoundaryCells builds ONE uindirectPrimitivePatch out of every wall patch's faces
+    // and does both passes on that, so a point's face set spans patch boundaries. Porting the per-patch
+    // branch instead measured 2847 cells off against 963 with brae then reading a median 1.239 of
+    // OpenFOAM -- too LARGE, because a per-patch point sees only a fraction of the faces around it. On
+    // motorBike, whose bike surface is split into 68 wall patches, that distinction is most of the story.
+    //
+    // Combined patch, then:
+    //   faces      every wall patch's faces, in patch order then face order (the combined index)
+    //   meshPoints first appearance walking those faces in order (PrimitivePatchMeshData.C), NOT sorted
+    //   pass 1     for each combined face: owner cell takes smallestDist over getPointNeighbours(face),
+    //              written UNCONDITIONALLY -- a cell owning several wall faces keeps the LAST, not the
+    //              smallest -- and the cell is recorded in nearestFace
+    //   pass 2     for each combined meshPoint in order, for each cell on it NOT already recorded:
+    //              smallestDist over that point's combined faces, then the cell is LOCKED
+    std::vector<label> wf;                                   // combined index -> global face
+    std::vector<label> wfCell;                               // combined index -> owner cell
     for (const FvPatch& p : patches)
         if (p.type == "wall")
             for (label i = 0; i < p.size; ++i)
             {
-                const label gf = p.start + i;
-                for (label j = fo[gf]; j < fo[gf + 1]; ++j)
-                {
-                    const label v = fv[j];
-                    isWallVtx[v] = 1;
-                    vtxWallFaces[v].push_back(gf);
-                }
+                wf.push_back(p.start + i);
+                wfCell.push_back(p.faceCells[i]);
             }
-    std::vector<scalar> ptY(nCells, nwdGreat);
-    for (label f = 0; f < nFaces; ++f)
+
+    if (!wf.empty())
     {
-        const label c0 = own[f], c1 = (f < nIntF ? nei[f] : -1);
-        for (label j = fo[f]; j < fo[f + 1]; ++j)
-        {
-            const label v = fv[j];
-            if (!isWallVtx[v]) continue;
-            for (const label wf : vtxWallFaces[v])
+        // combined-patch point -> combined faces, plus meshPoints in first-appearance order
+        std::unordered_map<label, std::vector<label>> ptF;
+        std::vector<label> meshPoints;
+        meshPoints.reserve(wf.size() * 4);
+        for (std::size_t i = 0; i < wf.size(); ++i)
+            for (label j = fo[wf[i]]; j < fo[wf[i] + 1]; ++j)
             {
-                if (wallY[c0] >= nwdGreat) ptY[c0] = std::fmin(ptY[c0], pointToFaceDist(C[c0], pts, fv, fo[wf], fo[wf + 1]));
-                if (c1 >= 0 && wallY[c1] >= nwdGreat) ptY[c1] = std::fmin(ptY[c1], pointToFaceDist(C[c1], pts, fv, fo[wf], fo[wf + 1]));
+                const label v = fv[j];
+                auto it = ptF.find(v);
+                if (it == ptF.end()) { ptF.emplace(v, std::vector<label>{(label)i}); meshPoints.push_back(v); }
+                else it->second.push_back((label)i);
+            }
+
+        // point -> cells (OF mesh().pointCells()): a cell touches a point if one of its faces uses it.
+        std::vector<std::vector<label>> pc(pts.size());
+        for (label f = 0; f < nFaces; ++f)
+        {
+            const label c0 = own[f], c1 = (f < nIntF ? nei[f] : -1);
+            for (label j = fo[f]; j < fo[f + 1]; ++j)
+            {
+                pc[fv[j]].push_back(c0);
+                if (c1 >= 0) pc[fv[j]].push_back(c1);
+            }
+        }
+        for (auto& v : pc) { std::sort(v.begin(), v.end()); v.erase(std::unique(v.begin(), v.end()), v.end()); }
+
+        std::vector<char> claimed(nCells, 0);
+        auto distTo = [&](const vector& Cc, label ci)
+        { const label gf = wf[ci]; return pointToFaceDist(Cc, pts, fv, fo[gf], fo[gf + 1]); };
+
+        // pass 1 -- cells with a face on the wall
+        for (std::size_t i = 0; i < wf.size(); ++i)
+        {
+            const label c = wfCell[i];
+            const vector& Cc = C[c];
+            scalar best = distTo(Cc, (label)i);              // getPointNeighbours "adds myself" first
+            for (label j = fo[wf[i]]; j < fo[wf[i] + 1]; ++j)
+                for (const label nb : ptF[fv[j]])
+                    if (nb != (label)i) best = std::fmin(best, distTo(Cc, nb));
+            y[c] = best;                                     // unconditional: last face wins, as OF does
+            claimed[c] = 1;
+        }
+
+        // pass 2 -- cells with only a point on the wall; first meshPoint to reach one wins and locks it
+        for (const label v : meshPoints)
+        {
+            const std::vector<label>& faces = ptF[v];
+            for (const label c : pc[v])
+            {
+                if (claimed[c]) continue;
+                scalar best = nwdGreat;
+                for (const label nb : faces) best = std::fmin(best, distTo(C[c], nb));
+                y[c] = best;
+                claimed[c] = 1;
             }
         }
     }
 
-    for (label c = 0; c < nCells; ++c)
-    {
-        if (wallY[c] < nwdGreat)      y[c] = wallY[c];               // face-corrected (priority)
-        else if (ptY[c] < nwdGreat)   y[c] = ptY[c];                // point-corrected
-    }
     // the wave's nearest wall-face centre per reached cell -> the IDDES wall-normal direction (C - origin). Cells the
     // wave never reached keep the default (C, degenerate). Does not alter y (the correctWalls override above is intact).
     if (wallOrigin)

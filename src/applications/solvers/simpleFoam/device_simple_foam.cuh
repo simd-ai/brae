@@ -26,6 +26,7 @@
 #include "device_pcg.cuh"
 #include "device_dilu.cuh"   // OF DILU preconditioner for the momentum BiCGStab
 #include "device_simple.cuh"
+#include "solution_directions.cuh"   // polyMesh::solutionD(): which U components OpenFOAM solves
 #include "device_boundary.cuh"
 #include "thermo_types.cuh"
 #include "device_thermo.cuh"
@@ -74,7 +75,10 @@ public:
         const GeometricField<scalar>* eps = nullptr,
         const GeometricField<scalar>* nut = nullptr,
         const GeometricField<scalar>* ReThetat = nullptr,
-        const GeometricField<scalar>* gammaInt = nullptr);
+        const GeometricField<scalar>* gammaInt = nullptr,
+        // Whether `phi` came off disk. On a coupled patch that decides whether its boundary values are
+        // the previous run's CONSERVATIVE interface flux or an un-coupled placeholder.
+        bool                          phiWasRead = false);
 
     // OF turbulence-model load sequence, ported byte-for-byte (do NOT skip, this is why OF never blows up on a
     // case cf does): (1) the model ctor bounds the read fields  [kEpsilon.C:105-106 bound(k_,kMin_); bound(epsilon_,...);
@@ -178,8 +182,15 @@ public:
     long turbCorrections()  const { return turbCorrections_; }
     long outerIterations()  const { return outerIterations_; }
     void resetLoopCounters() { turbCorrections_ = 0; outerIterations_ = 0; }
+    // The momentum components OpenFOAM SOLVES on this mesh, from the EMPTY patches alone
+    // (polyMesh::calcDirections, polyMesh.C:75-118). The driver reads it to print OpenFOAM's lines and
+    // no others, and to take its residualControl max over the same components OpenFOAM's cmptMax sees.
+    const SolutionDirections& solutionD() const { return sd_; }
 private:
     long turbCorrections_ = 0, outerIterations_ = 0;
+    // Built once in the constructor, where the patch list is: a DeviceMesh cannot recover a patch type,
+    // and polyMesh::calcDirections needs the EMPTY patches' face areas.
+    SolutionDirections sd_;
     // PIMPLE residualControl state: outer-loop convergence flag and iteration-2 reference residuals.
     bool outerConverged_ = false;
     std::map<std::string, scalar> outerInitialResidual_;
@@ -360,10 +371,17 @@ public:
     void setTurbulentInlets(const std::vector<label>& tiMask, const std::vector<scalar>& tiIntensity,
                             const std::vector<label>& mlMask, const std::vector<scalar>& mlLength)
     {
-        bool any = false;
-        for (label m : tiMask) if (m) { any = true; break; }
-        if (!any) for (label m : mlMask) if (m) { any = true; break; }
-        if (!any) return;
+        label nTi = 0, nMl = 0;
+        for (label m : tiMask) if (m) ++nTi;
+        for (label m : mlMask) if (m) ++nMl;
+        // Positive confirmation, because the failure mode here is SILENT and expensive: a
+        // turbulentIntensityKineticEnergyInlet that is never refreshed sits at whatever the file's
+        // `value` entry says, and OpenFOAM tutorials routinely write `value $internalField` there. On
+        // pipeCyclic that is k = 1, against the 0.0038-0.0067 the intensity actually implies -- a 200x
+        // inlet that feeds the whole entrance region and decays only by the pipe exit.
+        std::printf("  turbulent inlets: %d face(s) intensity-based k, %d face(s) mixing-length "
+                    "epsilon/omega, refreshed every iteration\n", (int)nTi, (int)nMl);
+        if (!nTi && !nMl) return;
         tiMask_.copyFrom(tiMask); tiIntensity_.copyFrom(tiIntensity);
         mlMask_.copyFrom(mlMask); mlLength_.copyFrom(mlLength);
         hasTurbInlet_ = true;
@@ -790,10 +808,16 @@ private:
     // pEqn.relax() source (D - D0)*p. Absolute, so it is added to bp_ AFTER deviceFoldPressure (which
     // multiplies divPhi by the cell volume); a member so the fold site can see it.
     DeviceBuffer<scalar> pRelaxSrc_;
-    // flowRateInletVelocity, massFlowRate form: OF recomputes avgU = -mdot/gSum(rho*magSf) every call, so
-    // it moves with the solution. frMagSf_ is magSf masked to the flowRate patches (0 elsewhere), making
+    // flowRateInletVelocity, BOTH forms: OF recomputes avgU = -flowRate/gSum(rho*magSf) every updateCoeffs,
+    // so it moves with the solution. frMagSf_ is magSf masked to the flowRate patches (0 elsewhere), making
     // the patch sum a single dot product against the live boundary rho; frN_ holds the outward normals.
-    struct FlowRatePatch { scalar mdot; };
+    // The DIVISOR depends on the form and on whether a rho field is registered
+    // (flowRateInletVelocityFvPatchVectorField.C:201-238), so each patch carries which it is:
+    //   volumetric, or `rho none`      -> gSum(magSf)                 (.C:208-210, rho is literally one{})
+    //   mass, rho registered           -> gSum(rho_b*magSf)           (.C:215-220) -- the compressible arms
+    //   mass, no rho, rhoInlet given   -> rhoInlet*gSum(magSf)        (.C:233)     -- the incompressible arms
+    //   mass, no rho, no rhoInlet      -> OpenFOAM FatalErrors        (.C:225-231)
+    struct FlowRatePatch { scalar mdot; bool isMass; scalar rhoInlet; std::string name; };
     std::vector<FlowRatePatch> frPatches_;
     std::vector<DeviceBuffer<scalar>> frMagSf_;
     DeviceBuffer<scalar> frNx_, frNy_, frNz_;
@@ -806,6 +830,8 @@ private:
     DeviceBuffer<scalar> mlLength_;
     bool hasTurbInlet_ = false;
     bool hasFlowRate_ = false;
+    // flowRateInletVelocity's updateCoeffs, at OpenFOAM's point for it: the momentum assembly.
+    void updateFlowRateInlets();
     DeviceBuffer<label>  wfBndIdx_;   // wall-face -> boundary-face index (built once)
     DeviceBuffer<scalar> wfNu_;       // nu = mu_b/rho_b gathered onto wall faces, for omegaWallFunction/G0
     DeviceBuffer<scalar> nutBndAll_;  // nut at boundary faces (wall-function value on walls), for alphat_b
@@ -865,10 +891,18 @@ private:
     bool   ufActive_ = false;            // set once the mesh-motion path has run: OF's mesh.dynamic()
     bool   meshPhiValid_ = false;
     DeviceBuffer<scalar> cycIfCoeffMom_, amiIfCoeffMom_;
+    // Coupled-interface edges added to the AMG agglomeration, in the order they were appended to the
+    // fine edge list (internal faces first). The level-0 Galerkin needs a fine coefficient array of the
+    // same extended length, so the interface coefficients are gathered into these positions each step.
+    label                nAmgIfEdges_ = 0, nAmgCycEdges_ = 0, nAmgAmiEdges_ = 0;
+    DeviceBuffer<label>  amgIfAmiSrc_;   // per appended AMI edge: its source face (index into ami_.ifCoeff)
+    DeviceBuffer<scalar> amgIfAmiW_;     // per appended AMI edge: its stencil weight
+    std::vector<label>   amgIfOwn_, amgIfNbr_;
+    DeviceBuffer<scalar> amgFineUpper_, amgFineLower_;   // [internal faces | interface entries]
     std::vector<std::pair<label, label>> cycRuns_, amiRuns_;
     // DILU for the momentum solves (OF's `preconditioner DILU`). The level schedule depends only on the
     // mesh addressing, so it is built once; rD is refactorised inside every solve.
-    DeviceDilu diluU_;
+    DeviceDilu dilu_;   // shared by the momentum and turbulence BiCGStab (schedule depends only on the mesh)
     bool   hasAMI_ = false;                                     // any cyclicAMI interface -> Jacobi-PCG pressure (no AMG)
     bool   amiNonConforming_ = false;                           // ...and a face with >1 partner -> BiCGStab (see below)
     DeviceAMI    ami_;                                          // cyclicAMI weighted-stencil coupling (translational path)

@@ -34,6 +34,19 @@ inline const char* foamClassName(scalar) { return "volScalarField"; }
 inline const char* foamClassName(const vector&) { return "volVectorField"; }
 
 // Write "uniform <v>;" or "nonuniform List<...> N (...);" for a boundary entry field.
+// OpenFOAM's FoamFile `location` is the TIME DIRECTORY NAME -- `location "269";` -- never a path. brae's
+// surface writer put the whole output path there, so two otherwise identical runs in different
+// directories wrote different phi files (tests/gs_device_loop_identity caught it as a byte diff), and
+// the vol writer echoed its 0/ template's `location "0"` into every later time. Both now write what
+// OpenFOAM writes. Readers ignore the entry; a diff does not.
+inline std::string timeDirName(const std::string& outPath)
+{
+    const std::size_t slash = outPath.find_last_of('/');
+    const std::string dir = (slash == std::string::npos) ? std::string(".") : outPath.substr(0, slash);
+    const std::size_t s2 = dir.find_last_of('/');
+    return (s2 == std::string::npos) ? dir : dir.substr(s2 + 1);
+}
+
 template <typename T>
 inline void writeFieldValue(
     std::ostream& os,
@@ -62,6 +75,49 @@ inline void writeFieldValue(
 // One boundaryField patch entry in OpenFOAM structure: type, then the value entries the reader resolved (inletValue
 // for inletOutlet/mixed, value for value-holding BCs). BCs that hold no value (zeroGradient/slip/symmetry/...) write
 // just the type, matching OpenFOAM's output.
+// The `expression` PatchFunction1 dictionary, written back as it was read: OpenFOAM's PatchExprField::
+// writeData echoes dict_ (PatchFunction1Expression.C:147), so a restart from brae's output -- by OpenFOAM
+// or by brae -- re-reads the same expression, variables and functions<> tables. The functions<> tokens
+// are re-emitted one entry per line. The tokenizer strips quotes, so a token that could only have come
+// from a quoted string -- one with whitespace, or a multi-character one holding a delimiter, like the
+// regex "(?i).*walls" -- is quoted again; the single-character delimiters `{ } ( ) ;` are the
+// tokenizer's own and are written bare. (OpenFOAM read brae's output with those quoted, at the
+// functionObjectTrigger's `{`, as "Unexpected '}' while reading dictionary entry".)
+inline void writePatchExprDict(std::ostream& os, const PatchExprSpec& e)
+{
+    auto quoteIfNeeded = [](const std::string& t)
+    {
+        const bool delimiter = t.size() == 1 && std::string("(){};").find(t[0]) != std::string::npos;
+        const bool needs = t.empty()
+                        || (!delimiter && t.find_first_of(" \t\r\n(){};\"$#") != std::string::npos);
+        return needs ? "\"" + t + "\"" : t;
+    };
+    os << "        uniformValue\n        {\n            type            expression;\n";
+    for (const PatchExprSpec::FunctionDict& fd : e.functionDicts)
+    {
+        os << "            " << fd.key << "\n            {\n";
+        int depth = 1;
+        bool lineStart = true;
+        for (const std::string& t : fd.tokens)
+        {
+            if (t == "}") --depth;
+            if (lineStart) os << std::string(static_cast<std::size_t>(12 + 4 * depth), ' ');
+            else           os << ' ';
+            os << quoteIfNeeded(t);
+            lineStart = (t == ";" || t == "{" || t == "}");
+            if (lineStart) os << '\n';
+            if (t == "{") ++depth;
+        }
+        if (!lineStart) os << '\n';
+        os << "            }\n";
+    }
+    os << "            variables\n            (\n";
+    for (const std::string& v : e.variables) os << "                \"" << v << "\"\n";
+    os << "            );\n"
+       << "            expression\n            #{" << e.expression << "#};\n"
+       << "        }\n";
+}
+
 template <typename T>
 inline void writePatchEntry(
     std::ostream& os,
@@ -91,12 +147,93 @@ inline void writePatchEntry(
     // writing phi and a brae->brae restart was attempted at all. Same class as the `gradient` entry
     // above: an INPUT the solve does not change, so echo what was read. OF's own output writes the
     // Function1 in its "constant <v>" form.
+    // uniformFixedValue's `uniformValue` is a PatchFunction1 that OF's reader REQUIRES, exactly like the
+    // gradient above: without it PatchFunction1::New aborts with "Missing or invalid PatchFunction1
+    // entry: uniformValue", so brae's own output could be read back by neither OpenFOAM nor brae. It is
+    // an INPUT the solve does not change, so echo what was read, in the `constant <v>` form OF writes.
+    if (d.hasUniformFn1)
+    {
+        os << "        uniformValue    constant ";
+        formatFoamValue(os, d.uniformFn1Value);
+        os << ";\n";
+    }
+    if (d.hasPatchExpr) writePatchExprDict(os, d.patchExpr);
+    // atmBoundaryLayerInlet{Velocity,K,Epsilon,Omega}: OF builds flowDir, zDir, Uref, Zref, z0 and d as
+    // Function1/PatchFunction1 and REQUIRES every one of them -- reading a field back without them aborts
+    // with "Missing or invalid Function1 entry: flowDir". The tutorial keeps them in an #include that the
+    // written field cannot refer to, so they are echoed inline, in the `constant <v>` form OF writes.
+    if (d.hasABL)
+    {
+        os << "        flowDir         constant ";
+        formatFoamValue(os, d.ablFlowDir);
+        os << ";\n        zDir            constant ";
+        formatFoamValue(os, d.ablZDir);
+        os << ";\n"
+           << "        Uref            constant " << d.ablUref << ";\n"
+           << "        Zref            constant " << d.ablZref << ";\n"
+           << "        z0              constant " << d.ablZ0   << ";\n"
+           << "        d               constant " << d.ablD    << ";\n"
+           << "        kappa           " << d.ablKappa << ";\n"
+           << "        Cmu             " << d.ablCmu   << ";\n"
+           // OF always writes C1/C2 (atmBoundaryLayer.C write); losing a non-default pair on a
+           // roundtrip would silently reset the YGCJ profile to the flat one.
+           << "        C1              " << d.ablC1    << ";\n"
+           << "        C2              " << d.ablC2    << ";\n";
+    }
+    // atmNutkWallFunction takes its roughness length as a PatchFunction1 that OF REQUIRES, and z0 IS the
+    // terrain: a field written without it cannot be read back, and a z0 quietly lost would turn a rough
+    // wall into a smooth one. `boundNut` is echoed because its default (true) is not what every case asks.
+    if (d.type == "atmNutkWallFunction")
+    {
+        os << "        z0              constant " << d.ablZ0 << ";\n"
+           << "        boundNut        " << (d.atmBoundNut ? "true" : "false") << ";\n";
+    }
     if (d.hasFlowRate)
     {
-        os << "        " << (d.flowRateIsMass ? "massFlowRate" : "volumetricFlowRate")
-           << "    constant " << d.flowRate << ";\n";
-        if (d.rhoInlet >= 0) os << "        rhoInlet        " << d.rhoInlet << ";\n";
+        const char* rateKey = d.flowRateIsMass ? "massFlowRate" : "volumetricFlowRate";
+        if (const CodedFunction1Spec* cs = d.flowRateFunction1.codedSpec())
+        {
+            // OpenFOAM writes the coded dictionary back as it read it (CodedFunction1.C writeData,
+            // dict_.writeEntry), so a restart recompiles the same body. Writing the number the rate had
+            // at this time instead would turn a function of time into a constant for every run that
+            // restarts from here -- OpenFOAM's or brae's.
+            os << "        " << rateKey << "\n        {\n"
+               << "            type            coded;\n"
+               << "            name            " << cs->name << ";\n"
+               << "            code\n            #{" << cs->code << "#};\n"
+               << "        }\n";
+        }
+        else
+        {
+            os << "        " << rateKey << "    constant " << d.flowRate << ";\n";
+        }
+        // OF guards both of these with `if (!volumetric_)` (flowRateInletVelocityFvPatchVectorField.C:
+        // 245-249) -- i.e. on the MASS form -- and writes `rho` only when it is not the default, through
+        // writeEntryIfDifferent. `rho none` is not cosmetic: it selects OpenFOAM's VOLUMETRIC branch for
+        // a massFlowRate (.C:208), so losing it on a round-trip changes the prescribed inlet with no
+        // message on either side. Measured on validation/rhoFR with `rho none`: brae runs the inlet at
+        // 6.000 m/s, wrote the patch without it, and real OpenFOAM restarted from that file computed
+        // 5.160413015 -- 14% of the flow rate.
+        if (d.flowRateIsMass)
+        {
+            if (d.flowRateRhoName != "rho")
+                os << "        rho             " << d.flowRateRhoName << ";\n";
+            if (d.rhoInlet >= 0) os << "        rhoInlet        " << d.rhoInlet << ";\n";
+        }
     }
+    // turbulentIntensityKineticEnergyInlet and turbulentMixingLength{DissipationRate,Frequency}Inlet take
+    // their coefficient with dict.get<scalar>(), which THROWS when the key is absent
+    // (turbulentIntensityKineticEnergyInletFvPatchScalarField.C:76), and OpenFOAM's own write() emits it
+    // unconditionally (.C:154-158). Dropping it made brae's output unreadable by OpenFOAM outright --
+    // `--> FOAM FATAL IO ERROR: Entry 'intensity' not found in dictionary ".../k/boundaryField/inlet"`,
+    // measured by restarting real rhoSimpleFoam from brae's own t=2 write of validation/rhoTI. brae could
+    // read it back only because ITS reader defaults intensity to 0, which is a silently laminar inlet.
+    // OF's `U`, `phi` and `k` entries beside these are getOrDefault, so their absence is not an error.
+    if (d.type == "turbulentIntensityKineticEnergyInlet")
+        os << "        intensity       " << d.intensity << ";\n";
+    if (d.type == "turbulentMixingLengthDissipationRateInlet"
+     || d.type == "turbulentMixingLengthFrequencyInlet")
+        os << "        mixingLength    " << d.mixingLength << ";\n";
     if (computed && nComputed)
     {
         // The SOLVED boundary values, not the ones the case was started from. Echoing the input made
@@ -162,7 +299,8 @@ inline void writeVolField(
         throw std::runtime_error("writeVolField: cannot read " + origPath + " (nor " + origPath + ".gz)");
     }
 
-    // FoamFile header block (verbatim, it holds no directives) + the dimensions line.
+    // FoamFile header block (verbatim but for `location`, rewritten below to the output time as
+    // OpenFOAM writes it, and `object` for a derived field) + the dimensions line.
     const std::size_t ff = text.find("FoamFile");
     const std::size_t hb = text.find('{', ff);
     int depth = 0;
@@ -186,6 +324,10 @@ inline void writeVolField(
     {
         const std::regex fmtRe("format\\s+binary\\s*;");
         header = std::regex_replace(header, fmtRe, std::string("format      ascii;"));
+    }
+    {
+        static const std::regex locRe("location\\s+\"[^\"]*\";");
+        header = std::regex_replace(header, locRe, std::string("location    \"") + timeDirName(outPath) + "\";");
     }
     if (derived && derived->object)
     {
@@ -306,7 +448,7 @@ inline void writeSurfaceField(
     if (!out) throw std::runtime_error("writeSurfaceField: cannot write " + outPath);
     out << std::setprecision(precision);
     out << "FoamFile\n{\n    version     2.0;\n    format      ascii;\n    class       surfaceScalarField;\n"
-           "    location    \"" << outPath << "\";\n    object      phi;\n}\n\n";
+           "    location    \"" << timeDirName(outPath) << "\";\n    object      phi;\n}\n\n";
     out << "dimensions      " << dimensions << ";\n\n";
     out << "internalField   nonuniform List<scalar> \n" << phiInternal.size() << "\n(\n";
     for (scalar v : phiInternal) out << v << '\n';

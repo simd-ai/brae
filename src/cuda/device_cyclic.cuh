@@ -27,6 +27,7 @@ struct DeviceCyclic
     DeviceBuffer<scalar> dOwnX, dOwnY, dOwnZ;   // Cf - C[own]          (linearUpwind face delta, own side)
     DeviceBuffer<scalar> dNbrX, dNbrY, dNbrZ;   // Cf_nbr - C[nbr]      (linearUpwind face delta, nbr side, UN-rotated)
     DeviceBuffer<scalar> corrVecX, corrVecY, corrVecZ;   // non-orth correction vector (laplacian "corrected")
+    DeviceBuffer<scalar> dX, dY, dZ;            // fvPatch::delta() = dOwn - transform(forwardT, dNbr)
     DeviceBuffer<scalar> ifCoeff;               // assembled per-field off-diagonal: gammaFace*dc*magSf (+ convection)
     DeviceBuffer<scalar> phi;                   // assembled cyclic-face flux (for continuity / corrector)
     // ROTATIONAL (Phase 1): a vector neighbour value is rotated by forwardT (nbr->own) before coupling. Scalars are
@@ -46,7 +47,7 @@ inline DeviceCyclic buildDeviceCyclic(
 {
     std::vector<label> oc, nc;
     std::vector<scalar> dc, w, ms, sfx, sfy, sfz;
-    std::vector<scalar> dox, doy, doz, dnx, dny, dnz, cvx, cvy, cvz;
+    std::vector<scalar> dox, doy, doz, dnx, dny, dnz, cvx, cvy, cvz, dlx, dly, dlz;
     bool rot = false;
     for (const auto& c : cyclics)
     {
@@ -75,6 +76,9 @@ inline DeviceCyclic buildDeviceCyclic(
             cvx.push_back(c.corrVec[i].x);
             cvy.push_back(c.corrVec[i].y);
             cvz.push_back(c.corrVec[i].z);
+            dlx.push_back(c.delta[i].x);
+            dly.push_back(c.delta[i].y);
+            dlz.push_back(c.delta[i].z);
         }
     }
     DeviceCyclic d;
@@ -97,6 +101,9 @@ inline DeviceCyclic buildDeviceCyclic(
     d.corrVecX.copyFrom(cvx);
     d.corrVecY.copyFrom(cvy);
     d.corrVecZ.copyFrom(cvz);
+    d.dX.copyFrom(dlx);
+    d.dY.copyFrom(dly);
+    d.dZ.copyFrom(dlz);
     d.ifCoeff.resize(d.n);
     d.phi.resize(d.n);
     if (rot)   // pack forwardT (9*n, component-major) + the per-component implicit scratch
@@ -127,13 +134,16 @@ void deviceCyclicAssembleLaplacian(DeviceCyclic& cyc, const DeviceBuffer<scalar>
 
 // upwind convection on the interface: diag[own] += max(phi,0), ifCoeff[j] += min(phi,0). Adds to the existing
 // ifCoeff (call AFTER deviceCyclicAssembleLaplacian) so Apsi[own] += ifCoeff*psi[nbr] carries div-laplacian.
-void deviceCyclicAddConvection(DeviceCyclic& cyc, DeviceBuffer<scalar>& diag);
+void deviceCyclicAddConvection(DeviceCyclic& cyc, DeviceBuffer<scalar>& diag,
+                               const DeviceBuffer<scalar>* wsch = nullptr);
 
 // MOMENTUM matrix interface coupling M = div(phi,U) - laplacian(nuEff,U) (cyc.phi must hold the current flux):
 //   ifCoeff[j] = -(nuFace*dc*magSf) + min(phi,0)            (off-diagonal, used in deviceAmul)
 //   diag[own] += (nuFace*dc*magSf) + max(phi,0)             (folded into the momentum diagonal)
 // with nuFace = w*nuEff[own]+(1-w)*nuEff[nbr]. Mirrors the interior (deviceDivUpwindCoeffs - deviceLaplacianCoeffs).
-void deviceCyclicAssembleMomentum(DeviceCyclic& cyc, const DeviceBuffer<scalar>& nuEffCell, DeviceBuffer<scalar>& diag);
+// `wsch`: the div scheme's face interpolation weight; null = upwind (pos0(phi)), the previous behaviour.
+void deviceCyclicAssembleMomentum(DeviceCyclic& cyc, const DeviceBuffer<scalar>& nuEffCell, DeviceBuffer<scalar>& diag,
+                                  const DeviceBuffer<scalar>* wsch = nullptr);
 
 // add the cyclic off-diagonal to H (OF fvMatrix::H): H[own] -= ifCoeff[j]*psi[nbr]/V[own]. Call AFTER deviceMatrixH.
 void deviceCyclicAddH(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& psi, const DeviceBuffer<scalar>& V,
@@ -221,5 +231,15 @@ void deviceCyclicLapCorrP(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& g
 // tensorDivKernel): srcX/Y/Z[own] += (Sf_j & interp(sigmaC))_{x/y/z}, sigmaC packed component-major (i*3+j)*nC+c.
 void deviceCyclicAddTensorDiv(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& sigmaC, int nC,
                               DeviceBuffer<scalar>& srcX, DeviceBuffer<scalar>& srcY, DeviceBuffer<scalar>& srcZ);
+
+// The DIV SCHEME's face weight at the cyclic faces -- the cyclic twin of deviceAmiLimitedVWeights, with
+// the 1:1 neighbour in place of the AMI stencil. See device_ami.cuh for the packing and the provenance.
+void deviceCyclicLimitedVWeights(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& Ux,
+                                 const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+                                 const DeviceBuffer<scalar>& gradU, int nC, scalar twoByk,
+                                 DeviceBuffer<scalar>& out);
+void deviceCyclicLimitedWeights(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& f,
+                                const DeviceBuffer<scalar>& gx, const DeviceBuffer<scalar>& gy,
+                                const DeviceBuffer<scalar>& gz, scalar twoByk, DeviceBuffer<scalar>& out);
 
 } // namespace brae

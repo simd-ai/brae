@@ -1,10 +1,21 @@
 #pragma once
 // Reads an OpenFOAM field file: dimensions / internalField (uniform|nonuniform) /
 // boundaryField { patch { type; value; ... } }. Templated on the value type (scalar/vector).
-// ASCII for now; binary field values land with the binary field reader (later increment).
+// ASCII AND BINARY. This line used to say "ASCII for now; binary field values land with the binary
+// field reader (later increment)" and had said so since the init commit, two weeks after the binary
+// reader landed -- long enough for an audit of this port to read it and conclude, wrongly, that brae
+// could not restart from an OpenFOAM binary write. Every read here goes through TokenStream, whose
+// readWhole transcodes a binary buffer first (foam_token_reader.cu:170-175, foamBinaryToAscii at :75).
+// Measured: brae restarting from OpenFOAM's own binary time directory writes values IDENTICAL to the
+// same restart from a 17-digit ascii conversion of it.
+// NOT YET honoured on that path: the file's `arch "LSB;label=32;scalar=64"` header. foamBinaryToAscii
+// hardcodes 4-byte labels and 8-byte scalars, so a file from an OpenFOAM built WM_LABEL_SIZE=64 or
+// WM_PRECISION_OPTION=SP decodes at the wrong stride -- see the note there.
 #include "cf_types.cuh"
 #include "function1.cuh"   // OF Function1: constant / table
+#include "patchExprFunction1.cuh"   // OF PatchFunction1 `expression`: the spec the reader fills
 #include "foam_token_reader.cuh"
+#include "brae_notice.cuh"   // noticeApproximated: a per-patch wall-function coefficient brae applies model-wide
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -78,6 +89,12 @@ struct PatchFieldData
     // stale `value` from an overridden fixedValue entry, so the field silently takes that constant
     // instead. Recorded here and refused at construction rather than guessed at.
     std::string    unsupportedFunction1;
+    // uniformFixedValue whose uniformValue is `{ type expression; ... }` (OF PatchFunction1Types::
+    // PatchExprField): the expression, its variables and its functions<> dictionaries, evaluated per
+    // face at every updateCoeffs by patchExprFunction1.cuh. Distinct from unsupportedFunction1, which
+    // stays the refusal for every other non-constant form.
+    PatchExprSpec  patchExpr;
+    bool           hasPatchExpr = false;
     Function1      p0Function1;              // uniformTotalPressure p0(t); empty unless hasP0Function1
     bool           hasP0Function1 = false;
     // pressureInletOutletVelocity's optional `tangentialVelocity`. OF sets
@@ -94,6 +111,20 @@ struct PatchFieldData
     T              refValueUniformValue{};
     std::vector<T> refValues;
     bool           hasValueFraction = false;
+    // Wall-function coefficients written ON THE PATCH. OpenFOAM's wall functions read Cmu/kappa/E from
+    // the patch dictionary (wallFunctionCoefficients.C:73-78; defaults 0.09 / 0.41 / 9.8) and each patch
+    // may differ; brae applies one model-wide value per closure. Parsed so a per-patch value can be
+    // ANNOUNCED instead of skipped (item 16h); honouring it per patch is queued as 16h-port.
+    scalar         wfCmu = 0.09, wfKappa = 0.41, wfE = 9.8;
+    bool           hasWfCmu = false, hasWfKappa = false, hasWfE = false;
+    // ...and the VISCOUS/INERTIAL SUBLAYER BLENDING those four wall functions also read from the patch
+    // dictionary (wallFunctionBlenders.C:59-82: `blending`, one of stepwise/max/binomial/exponential/
+    // tanh, and `n`, the binomial exponent). The default is per wall function, not global -- STEPWISE
+    // for nutk/nutU/epsilon, BINOMIAL with n = 2 for omega -- and brae implements each one's default
+    // and nothing else, so anything else on the patch is REFUSED by name at the end of the entry.
+    std::string    wfBlending;                 // the `blending` word as written, empty when absent
+    scalar         wfBlendN = 0.0;
+    bool           hasWfBlendN = false;
     bool           vfUniform        = false;
     scalar         vfUniformValue   = 0;
     std::vector<scalar> vfValues;
@@ -105,6 +136,11 @@ struct PatchFieldData
     bool           valueUniform = false;
     T              uniformValue{};
     std::vector<T> values;
+    // uniformFixedValue's `uniformValue` PatchFunction1, kept in its OWN slot. It shares the `value`
+    // slot above only in the sense that OF writes both and they agree; brae must write it back because
+    // OF's PatchFunction1::New REQUIRES it -- an output missing it cannot be read by OpenFOAM at all.
+    bool           hasUniformFn1 = false;
+    T              uniformFn1Value{};
     // inletOutlet (and similar mixed BCs): the inflow value. Used as the device refValue.
     bool           hasInletValue   = false;
     bool           inletUniform    = false;
@@ -127,10 +163,27 @@ struct PatchFieldData
     // rhoSimpleFoam it is, so the real patch rho is used and rhoInlet is ignored, exactly as OF does.
     bool           hasFlowRate  = false;
     bool           flowRateIsMass = false;
+    // flowRateInletVelocity's `rho` entry (rhoName_, default "rho"). `rho none;` selects OpenFOAM's
+    // volumetric branch even for a massFlowRate (flowRateInletVelocityFvPatchVectorField.C:205-207,
+    // `volumetric_ || rhoName_ == "none"`). Unparsed, the entry was silently dropped and the mass form
+    // ran: brae's inlet read 50.687834608 where OpenFOAM writes 58.85, on BOTH arms.
+    std::string    flowRateRhoName = "rho";
     scalar         flowRate     = 0.0;
+    // The flow rate as the Function1 OpenFOAM evaluates at every updateCoeffs (flowRate_->value(t)):
+    // `constant` for the steady forms (flowRate above holds the same number), `coded` for OpenFOAM's
+    // run-time-compiled one. The patch takes this, never the bare number, so a time-dependent rate
+    // cannot be read as a constant by a consumer that only knows flowRate.
+    Function1      flowRateFunction1;
     scalar         rhoInlet     = -1.0;   // OF default -VGREAT ("not given")
     bool           extrapolateProfile = false;
     scalar         mixingLength = 0;
+    // turbulentMixingLengthDissipationRateInlet's OWN `Cmu` (turbulentMixingLengthDissipationRateInlet-
+    // FvPatchScalarField.C:91, getCheckOrDefault 0.09). It is the inlet's Cmu only when the turbulence
+    // model's coeffDict carries none (:149 takes the model's first), which kEpsilon's constructor rules
+    // out by adding one (kEpsilon.C:102-108, dimensionedType.C:389). turbulentMixingLengthFrequencyInlet
+    // reads no such entry at all (...FrequencyInlet...C:137-138). Parsed so the precedence lives in the
+    // patch class rather than in an unhandled-key skip.
+    scalar         Cmu          = 0.09;
     // surfaceNormalFixedValue / uniformNormalFixedValue: SCALAR refValue; the BC builds U_b = refValue * face_normal.
     bool                hasNormalRef     = false;
     bool                normalRefUniform = false;
@@ -144,8 +197,25 @@ struct PatchFieldData
     // face from Cf). u* = kappa*|Uref|/ln((Zref+z0)/z0); U(z)=(u*/kappa)ln((z-d+z0)/z0)*flowDir; k=u*^2/sqrt(Cmu);
     // eps=u*^3/(kappa(z-d+z0)); omega=u*/(sqrt(Cmu)kappa(z-d+z0)); z = Cf.zDir.
     bool   hasABL = false;
+    // timeVaryingMappedFixedValue extras. mapMethod default is OF's PLANAR interpolation
+    // (pointToPointPlanarInterpolation); `nearest` selects the matchPoints copy brae used to run for
+    // EVERYTHING -- a silent substitution that staircased any profile coarser than the mesh. A key the
+    // steady scope cannot honour lands in mapUnsupported and the factory refuses by name.
+    bool        mapMethodNearest = false;
+    bool        hasMapOffset = false;
+    T           mapOffsetValue{};
+    std::string mapUnsupported;
+    scalar      mapFilterRadius = 0; label mapFilterSweeps = 0;   // refused only as the ENGAGED pair
     scalar ablUref = 0, ablZref = 0, ablZ0 = 0.1, ablD = 0, ablKappa = 0.41, ablCmu = 0.09;
+    // YGCJ curve-fit coefficients (atmBoundaryLayer.C:70-71 getOrDefault; .H:178-179). The DEFAULTS
+    // make sqrt(C1*log(..)+C2) exactly 1, which is the only profile brae computed before these were
+    // parsed -- a case setting either got the default silently.
+    scalar ablC1 = 0.0, ablC2 = 1.0;
     bool   atmBoundNut = true;   // atmNutkWallFunction boundNut option (clamp nut>=0); z0 is stored in ablZ0.
+    // epsilonWallFunction `lowReCorrection` (epsilonWallFunctionFvPatchScalarField.C:414,
+    // getOrDefault("lowReCorrection", false)). On a face with y+ < yPlusLam it switches epsilon from the
+    // log form to the VISCOUS one AND drops that face's wall production entirely -- see kEpsilon_cpp.
+    bool   epsLowRe = false;
     vector ablFlowDir{1, 0, 0}, ablZDir{0, 0, 1};
 };
 
@@ -193,6 +263,26 @@ inline bool isFoamNumber(const std::string& t)
     if (t.empty()) return false;
     const char c = t[0];
     return (c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.';
+}
+
+// OF v2412 writes atmBoundaryLayer's Uref/Zref/z0/d as Function1 and flowDir/zDir as PatchFunction1,
+// so a field WRITTEN by OpenFOAM reads `flowDir constant (1 0 0);` where the tutorial's own
+// include/ABLConditions has the bare `flowDir (1 0 0);`. Both are the same entry: OF's Function1 parser
+// accepts a bare value as shorthand for `constant <v>`. Consume the keyword so the caller sees the value.
+// Anything else (table / polynomial / sine / coded) IS time-varying: name it so dispatch can refuse,
+// because reading past it would leave the caller's scalar/vector at its default and look like a run.
+inline bool takeConstantFunction1(TokenStream& ts, std::string& unsupported, const std::string& key)
+{
+    const std::string m = ts.peek();
+    if (m == "constant" || m == "uniform")
+    {
+        ts.next();
+        return true;
+    }
+    if (m == "(" || isFoamNumber(m)) return true;      // bare value: OF's own shorthand
+    unsupported = key + " " + m;
+    skipToSemicolon(ts, 0);
+    return false;
 }
 // OF Function1 accepts a BARE value as shorthand for `constant <v>`: `uniformValue (0 0 0);` and
 // `uniformValue 5;` are constants, not tables. brae required the keyword, so a bare vector was
@@ -312,6 +402,34 @@ inline void readTimeVaryingMapped(
         catch (...) {}
     }
     if (best.empty()) return;
+    // ALL numeric dirs are OF's sample times (MappedFile.C:520): more than one means the value
+    // interpolates linearly in t -- on a steady solver, in ITERATION COUNT -- and ends holding the
+    // LAST dir, while holding the smallest (what brae does) is exact only for a single dir. Refuse
+    // the multi-dir table by name rather than run a different profile per iteration count.
+    int nDirs = 0;
+    for (const auto& e : fs::directory_iterator(bd))
+    {
+        if (!e.is_directory()) continue;
+        try { (void)std::stod(e.path().filename().string()); ++nDirs; } catch (...) {}
+    }
+    if (nDirs > 1)
+        throw std::runtime_error(
+            "brae: timeVaryingMappedFixedValue on patch '" + patchName + "' has " +
+            std::to_string(nDirs) + " boundaryData time directories. A steady solver would "
+            "interpolate the profile in ITERATION COUNT (MappedFile.C value()); brae holds one "
+            "directory exactly and refuses a table. Keep a single time directory.");
+    // OF FATALS when the run time is below the smallest sample time (instant::findRange ->
+    // MappedFile.C:593-604); brae used to run silently there. The field's own time dir is t0.
+    {
+        double t0 = 0.0; bool haveT0 = false;
+        try { t0 = std::stod(timeP.substr(timeP.rfind('/') + 1)); haveT0 = true; } catch (...) {}
+        if (haveT0 && t0 < bestT - 1e-12)
+            throw std::runtime_error(
+                "brae: timeVaryingMappedFixedValue on patch '" + patchName + "': the run time " +
+                std::to_string(t0) + " is below the boundaryData sample time " + best +
+                ". OpenFOAM fatals here (MappedFile.C:593-604); brae will not silently run before "
+                "the table starts.");
+    }
     p.mapPoints = readBoundaryDataList<vector>(bd + "/points");
     p.mapValues = readBoundaryDataList<T>(bd + "/" + best + "/" + field);
     p.hasMapData = (p.mapPoints.size() == p.mapValues.size() && !p.mapPoints.empty());
@@ -347,7 +465,8 @@ inline FieldData<scalar> symmTensorComponent(const FieldData<symmTensor>& fd, in
     for (const PatchFieldData<symmTensor>& p : fd.boundary)
     {
         if (p.hasGradient || p.hasInletValue || p.hasRefValue || p.hasValueFraction || p.hasMapData
-         || p.hasNormalRef || p.hasFlowRate || !p.unsupportedFunction1.empty())
+         || p.hasNormalRef || p.hasFlowRate || !p.unsupportedFunction1.empty()
+         || p.hasMapOffset || !p.mapUnsupported.empty())
             throw std::runtime_error(
                 "brae: sigma patch '" + p.name + "' is a '" + p.type + "', whose data brae does not know "
                 "how to split into components. The Maxwell stress supports fixedValue, zeroGradient and "
@@ -358,11 +477,191 @@ inline FieldData<scalar> symmTensorComponent(const FieldData<symmTensor>& fd, in
         q.hasValue     = p.hasValue;
         q.valueUniform = p.valueUniform;
         q.uniformValue = comp(p.uniformValue, k);
+        q.hasUniformFn1   = p.hasUniformFn1;
+        q.uniformFn1Value = comp(p.uniformFn1Value, k);
         q.values.reserve(p.values.size());
         for (const symmTensor& t : p.values) q.values.push_back(comp(t, k));
         out.boundary.push_back(std::move(q));
     }
     return out;
+}
+
+// A p0 table onto the patch data, from either spelling: the Function1 itself, and the constant slot
+// seeded at t = 0 so a solver that never advances time still has a defined p0 rather than zero. p0 is a
+// PRESSURE: scalar only -- the reader is templated on T, so guard rather than cast; a vector field has no
+// p0 and must not silently get one.
+template <typename T>
+inline void setP0Table(PatchFieldData<T>& p, std::vector<std::pair<scalar, scalar>> pts)
+{
+    p.p0Function1 = Function1::table(std::move(pts));
+    p.hasP0Function1 = true;
+    if constexpr (std::is_same_v<T, scalar>)
+    {
+        p.inletUniformValue = p.p0Function1.value(0);
+        p.inletUniform = true;
+        p.hasInletValue = true;
+    }
+}
+
+// flowRateInletVelocity's flow rate given as a Function1 DICTIONARY, `{ type <t>; ... }` -- Function1New.C
+// :47-67 reads `type` from it. Only `coded` is evaluated in this form, with the keys CodedFunction1.C
+// reads: `name` (default the entry name, :147) and `code`; codeInclude, localCode, codeOptions and
+// codeLibs are collected so CodedFunction1 can refuse them by name. Any other type is refused here.
+inline Function1 readFlowRateFunction1Dict(
+    TokenStream&       ts,
+    const std::string& key,
+    const std::string& patchName,
+    const std::string& path)
+{
+    std::string type;
+    CodedFunction1Spec spec;
+    spec.name = key;
+    while (ts.peek() != "}")
+    {
+        const std::string k = ts.next();
+        if (k == "type")
+        {
+            type = ts.next();
+            ts.expect(";");
+        }
+        else if (k == "name")
+        {
+            spec.name = ts.next();
+            ts.expect(";");
+        }
+        else if (k == "code")
+        {
+            // The verbatim #{ ... #} token (foam_token_reader.cu, captureVerbatim); a quoted string is a
+            // legal `code` in OpenFOAM too and reaches here as one token.
+            const std::string tok = ts.next();
+            if (!ts.verbatim(tok, spec.code)) spec.code = tok;
+            ts.expect(";");
+        }
+        else if (k == "codeInclude" || k == "localCode" || k == "codeOptions" || k == "codeLibs")
+        {
+            spec.unsupportedKeys += (spec.unsupportedKeys.empty() ? "`" : ", `") + k + "`";
+            skipToSemicolon(ts);
+            if (ts.peek() == ";") ts.next();
+        }
+        else
+        {
+            skipToSemicolon(ts);
+            if (ts.peek() == ";") ts.next();
+        }
+    }
+    ts.expect("}");
+    if (type != "coded")
+        throw std::runtime_error(
+            "brae: flowRateInletVelocity '" + key + "' on patch " + patchName + " is a `" +
+            (type.empty() ? std::string("<no type>") : type) + "` Function1. brae evaluates `constant <value>`, "
+            "a bare value and `{ type coded; }` there; refusing rather than approximating any other.");
+    spec.origin = path + ": patch '" + patchName + "', " + key;
+    // OpenFOAM writes its dynamicCode/ into the case (<case>/<time>/U -> <case>); brae keeps its own
+    // beside it. BRAE_DYNAMIC_CODE_DIR overrides, for a case directory that is not writable.
+    spec.codeDir = (std::filesystem::path(path).parent_path().parent_path() / "dynamicCode" / "brae").string();
+    return Function1::coded(std::move(spec));
+}
+
+// A PatchFunction1 given as a dictionary, `{ type <t>; ... }`. Reads the WHOLE dictionary balanced and
+// returns its `type`; for `type expression` (OF PatchFunction1Types::PatchExprField, PatchFunction1-
+// Expression.C:45-57 and exprDriver::readDict) it fills the spec: `expression` (a #{ #} verbatim block
+// or a quoted string), `variables` (a list of strings), and the `functions<scalar>`/`functions<vector>`
+// sub-dictionaries -- their entry names, so a reference is refused by name, and their tokens, so the
+// writer can echo them. The expression driver's own `debug*` switches are accepted and ignored (they
+// only change what OpenFOAM prints); every other key is refused by name, because OpenFOAM would have
+// read it as something (`searchFiles`, `lookuptables`, ...) and brae would not.
+inline PatchExprSpec readPatchFunction1Dict(
+    TokenStream&       ts,
+    const std::string& key,
+    const std::string& patchName,
+    const std::string& path,
+    std::string&       type)
+{
+    PatchExprSpec spec;
+    spec.origin = path + ": patch '" + patchName + "', " + key;
+    type.clear();
+    while (ts.peek() != "}")
+    {
+        const std::string k = ts.next();
+        if (k == "type")
+        {
+            type = ts.next();
+            ts.expect(";");
+        }
+        else if (k == "expression")
+        {
+            const std::string tok = ts.next();
+            if (!ts.verbatim(tok, spec.expression)) spec.expression = tok;
+            ts.expect(";");
+        }
+        else if (k == "variables")
+        {
+            // `( "a = 1" "b = ..." )`; the tokenizer hands each quoted string back as one token.
+            // OpenFOAM also accepts a single string here (readVariableStrings); both forms are read.
+            const std::string open = ts.next();
+            if (open == "(")
+            {
+                while (ts.peek() != ")") spec.variables.push_back(ts.next());
+                ts.expect(")");
+            }
+            else
+            {
+                spec.variables.push_back(open);
+            }
+            ts.expect(";");
+        }
+        else if (k == "functions<scalar>" || k == "functions<vector>")
+        {
+            PatchExprSpec::FunctionDict fd;
+            fd.key = k;
+            ts.expect("{");
+            int depth = 1;
+            bool atEntryStart = true;   // depth-1 token that opens an entry is a name
+            std::string pending;
+            while (depth > 0)
+            {
+                const std::string t = ts.next();
+                if (t == "{")
+                {
+                    if (depth == 1 && !pending.empty()) fd.names.push_back(pending);
+                    ++depth;
+                    atEntryStart = false;
+                }
+                else if (t == "}")
+                {
+                    --depth;
+                    if (depth == 1) atEntryStart = true;
+                    if (depth == 0) break;
+                }
+                else if (t == ";")
+                {
+                    if (depth == 1) atEntryStart = true;
+                }
+                else if (depth == 1 && atEntryStart)
+                {
+                    pending = t;
+                    atEntryStart = false;
+                }
+                fd.tokens.push_back(t);
+            }
+            spec.functionDicts.push_back(std::move(fd));
+        }
+        else if (k == "debug" || k == "debug.driver" || k == "debug.parser" || k == "debug.scanner")
+        {
+            skipToSemicolon(ts);
+            if (ts.peek() == ";") ts.next();
+        }
+        else
+        {
+            throw std::runtime_error(
+                "brae: " + spec.origin + ": the PatchFunction1 dictionary carries `" + k + "`, which brae's "
+                "`expression` reader does not carry (it reads type, expression, variables, "
+                "functions<scalar>, functions<vector> and the debug switches). Refusing rather than "
+                "reading past it.");
+        }
+    }
+    ts.expect("}");
+    return spec;
 }
 
 template <typename T>
@@ -412,19 +711,27 @@ inline FieldData<T> readField(const std::string& path)
                     // keys parse always; the generic-named ones (d/kappa/Cmu) only when this is an ABL entry.
                     else if (key == "Uref")
                     {
-                        p.ablUref = ts.nextScalar();
-                        ts.expect(";");
+                        if (takeConstantFunction1(ts, p.unsupportedFunction1, key))
+                        {
+                            p.ablUref = ts.nextScalar();
+                            ts.expect(";");
+                        }
                     }
                     else if (key == "Zref")
                     {
-                        p.ablZref = ts.nextScalar();
-                        ts.expect(";");
+                        if (takeConstantFunction1(ts, p.unsupportedFunction1, key))
+                        {
+                            p.ablZref = ts.nextScalar();
+                            ts.expect(";");
+                        }
                     }
                     else if (key == "z0")
                     {
-                        if (ts.peek() == "uniform" || ts.peek() == "constant") ts.next();
-                        p.ablZ0 = ts.nextScalar();
-                        ts.expect(";");
+                        if (takeConstantFunction1(ts, p.unsupportedFunction1, key))
+                        {
+                            p.ablZ0 = ts.nextScalar();
+                            ts.expect(";");
+                        }
                     }
                     else if (key == "boundNut")   // atmNutkWallFunction: clamp nut>=0 (true/false)
                     {
@@ -432,19 +739,39 @@ inline FieldData<T> readField(const std::string& path)
                         p.atmBoundNut = (v == "true" || v == "yes" || v == "on" || v == "1");
                         ts.expect(";");
                     }
+                    else if (key == "lowReCorrection")   // epsilonWallFunction: resolved-sublayer branch
+                    {
+                        const std::string v = ts.next();
+                        p.epsLowRe = (v == "true" || v == "yes" || v == "on" || v == "1");
+                        ts.expect(";");
+                    }
                     else if (key == "flowDir" || key == "zDir")
                     {
-                        ts.expect("(");
-                        const vector v{ts.nextScalar(), ts.nextScalar(), ts.nextScalar()};
-                        ts.expect(")");
-                        ts.expect(";");
-                        if (key == "flowDir") p.ablFlowDir = v;
-                        else p.ablZDir = v;
+                        if (takeConstantFunction1(ts, p.unsupportedFunction1, key))
+                        {
+                            ts.expect("(");
+                            const vector v{ts.nextScalar(), ts.nextScalar(), ts.nextScalar()};
+                            ts.expect(")");
+                            ts.expect(";");
+                            if (key == "flowDir") p.ablFlowDir = v;
+                            else p.ablZDir = v;
+                        }
                     }
                     else if (key == "d" && p.hasABL)
                     {
-                        if (ts.peek() == "uniform" || ts.peek() == "constant") ts.next();
-                        p.ablD = ts.nextScalar();
+                        if (takeConstantFunction1(ts, p.unsupportedFunction1, key))
+                        {
+                            p.ablD = ts.nextScalar();
+                            ts.expect(";");
+                        }
+                    }
+                    else if ((key == "C1" || key == "C2") && p.hasABL)
+                    {
+                        // GATED on hasABL: bare C1/C2 are also kEpsilon coefficient names, and an
+                        // ungated parse would swallow an unrelated entry that today skips harmlessly.
+                        const scalar v = ts.nextScalar();
+                        if (key == "C1") p.ablC1 = v;
+                        else             p.ablC2 = v;
                         ts.expect(";");
                     }
                     else if ((key == "kappa" || key == "Cmu") && p.hasABL)
@@ -453,6 +780,105 @@ inline FieldData<T> readField(const std::string& path)
                         ts.expect(";");
                         if (key == "kappa") p.ablKappa = v;
                         else p.ablCmu = v;
+                    }
+                    else if ((key == "kappa" || key == "Cmu" || key == "E") && !p.hasABL)
+                    {
+                        // A wall function's own coefficients (see PatchFieldData). Stored on every
+                        // non-ABL entry that carries them; whether the entry IS a wall function is
+                        // decided at the end of the patch, once its type is known, because the keys
+                        // may precede `type` in the file. `Cmu` is ALSO the turbulent mixing-length
+                        // inlet's own entry (PatchFieldData::Cmu, the branch further down that this
+                        // one shadows): it is recorded in both slots and the consumer picks -- the
+                        // first version kept it here only, and `Cmu 0` on a dissipation inlet went
+                        // unrefused (rho_turbinlet_cmu_vs_openfoam caught it).
+                        const scalar v = ts.nextScalar();
+                        ts.expect(";");
+                        if      (key == "kappa") { p.wfKappa = v; p.hasWfKappa = true; }
+                        else if (key == "Cmu")   { p.wfCmu   = v; p.hasWfCmu   = true; p.Cmu = v; }
+                        else                     { p.wfE     = v; p.hasWfE     = true; }
+                    }
+                    else if (key == "blending")
+                    {
+                        p.wfBlending = ts.next();
+                        ts.expect(";");
+                    }
+                    // The binomial exponent. Gated on the value being a NUMBER because `n` is also a
+                    // vector entry elsewhere in a boundary dictionary (fixedNormalSlip's normal, for
+                    // one), and those must keep falling through to the unhandled-key skip.
+                    else if (key == "n" && isFoamNumber(ts.peek()))
+                    {
+                        p.wfBlendN = ts.nextScalar();
+                        p.hasWfBlendN = true;
+                        ts.expect(";");
+                    }
+                    // `ramp` multiplies the normal-velocity BCs' value by a Function1 of time every
+                    // updateCoeffs (surfaceNormalFixedValueFvPatchVectorField.C:63-65). brae evaluates
+                    // no Function1 here, so the key is MARKED and the factory refuses by name -- it
+                    // used to fall into the unhandled-key skip, a constant inlet where the case asked
+                    // for a ramp.
+                    else if (key == "ramp" && (p.type == "surfaceNormalFixedValue"
+                                            || p.type == "uniformNormalFixedValue"))
+                    {
+                        p.unsupportedFunction1 = "ramp";
+                        skipToSemicolon(ts, 0);
+                        ts.expect(";");
+                    }
+                    // timeVaryingMappedFixedValue keys -- parsed where the STEADY scope can honour
+                    // them, marked for refusal where it cannot (the factory throws on mapUnsupported).
+                    else if (key == "mapMethod" && p.type == "timeVaryingMappedFixedValue")
+                    {
+                        const std::string mm = ts.next();
+                        if (mm == "nearest") p.mapMethodNearest = true;
+                        else if (mm.rfind("planar", 0) != 0)
+                            p.mapUnsupported = "mapMethod " + mm;   // OF fatals too (MappedFile.C:117-130)
+                        ts.expect(";");
+                    }
+                    else if (key == "offset" && p.type == "timeVaryingMappedFixedValue")
+                    {
+                        // A Function1 added AFTER mapping (MappedFile.C:743-747). Constant forms are
+                        // exact at steady; any other form (table, csvFile, ...) is refused by name.
+                        const std::string m0 = ts.peek();
+                        if (m0 == "constant" || m0 == "uniform" || m0 == "(" 
+                         || (!m0.empty() && m0.find_first_not_of("+-.0123456789eE") == std::string::npos))
+                        {
+                            if (m0 == "constant" || m0 == "uniform") ts.next();
+                            p.mapOffsetValue = readFoamValue<T>(ts);
+                            p.hasMapOffset = true;
+                        }
+                        else
+                        {
+                            p.mapUnsupported = "offset " + m0;
+                            skipToSemicolon(ts, 0);
+                        }
+                        ts.expect(";");
+                    }
+                    else if (key == "setAverage" && p.type == "timeVaryingMappedFixedValue")
+                    {
+                        const std::string v = ts.next();
+                        if (v == "true" || v == "yes" || v == "on" || v == "1")
+                            p.mapUnsupported = "setAverage";   // rescales to the file average -- fully matters at steady
+                        ts.expect(";");
+                    }
+                    else if (key == "perturb" && p.type == "timeVaryingMappedFixedValue")
+                    {
+                        (void)ts.nextScalar();   // triangulation tie-break only; brae triangulates unperturbed
+                        ts.expect(";");
+                    }
+                    else if (key == "filterRadius" && p.type == "timeVaryingMappedFixedValue")
+                    { p.mapFilterRadius = ts.nextScalar(); ts.expect(";"); }
+                    else if (key == "filterSweeps" && p.type == "timeVaryingMappedFixedValue")
+                    { p.mapFilterSweeps = ts.nextLabel(); ts.expect(";"); }
+                    else if ((key == "sampleFormat" || key == "sampleFile" || key == "coordinateSystem"
+                           || key == "scale1" || key == "scale2" || key == "scale3"
+                           || key == "points" || key == "fieldTable")
+                          && p.type == "timeVaryingMappedFixedValue")
+                    {
+                        // fieldTable is DEAD on this BC in v2412 (the 5-arg MappedFile ctor never
+                        // reads it) -- accepted and skipped; everything else here changes the mapping
+                        // in ways the steady scope does not implement.
+                        if (key != "fieldTable") p.mapUnsupported = key;
+                        skipToSemicolon(ts, 0);
+                        ts.expect(";");
                     }
                     // surfaceNormalFixedValue refValue / uniformNormalFixedValue uniformValue: SCALAR (U_b = refValue * n).
                     else if ((key == "refValue" && p.type == "surfaceNormalFixedValue") ||
@@ -477,8 +903,13 @@ inline FieldData<T> readField(const std::string& path)
                             ts.expect(")");
                             p.hasNormalRef = true;
                         }
-                        else   // table/Function1 -> ramp handles it; treat as 0
+                        else   // table/expression/... -- a Function1 brae cannot evaluate
                         {
+                            // MARK it, so the factory refuses by name. This branch used to skip
+                            // silently ("ramp handles it"), which nothing did: the patch built with an
+                            // EMPTY value array and every face got U_b = 0*n -- a zero inlet where the
+                            // case prescribed a ramp.
+                            p.unsupportedFunction1 = (m == "(" ? "inline Function1" : m);
                             skipToSemicolon(ts, m == "(" ? 1 : 0);
                         }
                         ts.expect(";");
@@ -522,29 +953,31 @@ inline FieldData<T> readField(const std::string& path)
                             // OF Function1 `table ((t v) (t v) ...)`: linear between entries, CLAMPed
                             // outside (TableBase.C:76). pimpleFoam/RAS/TJunction ramps p0 this way.
                             ts.next();                       // "table"
-                            ts.expect("(");
-                            std::vector<std::pair<scalar, scalar>> pts;
-                            while (!ts.eof() && ts.peek() != ")")
+                            if (ts.peek() == ";")
+                            {
+                                // The form OpenFOAM WRITES (Function1::writeData, TableBase::writeEntries):
+                                // `p0 table;` with the points in a `p0Coeffs { values ... }` entry that
+                                // follows -- what every restart from OpenFOAM's own output carries. The
+                                // reader expected `table (` here and fell over the ';' with a raw
+                                // tokeniser error (queue item 20). Provisionally unsupported until the
+                                // p0Coeffs entry below is parsed, so a `table;` with no coefficients is
+                                // still refused by name rather than run at zero.
+                                if (!p.hasP0Function1) p.unsupportedFunction1 = "table (no p0Coeffs entry)";
+                            }
+                            else
                             {
                                 ts.expect("(");
-                                const scalar tt = ts.nextScalar();
-                                const scalar vv = ts.nextScalar();
+                                std::vector<std::pair<scalar, scalar>> pts;
+                                while (!ts.eof() && ts.peek() != ")")
+                                {
+                                    ts.expect("(");
+                                    const scalar tt = ts.nextScalar();
+                                    const scalar vv = ts.nextScalar();
+                                    ts.expect(")");
+                                    pts.emplace_back(tt, vv);
+                                }
                                 ts.expect(")");
-                                pts.emplace_back(tt, vv);
-                            }
-                            ts.expect(")");
-                            p.p0Function1 = Function1::table(std::move(pts));
-                            p.hasP0Function1 = true;
-
-                            // Seed the constant slot with t = 0 so a solver that never advances time
-                            // still has a defined p0 rather than zero.
-                            // p0 is a PRESSURE: scalar only. The reader is templated on T, so guard
-                            // rather than cast -- a vector field has no p0 and must not silently get one.
-                            if constexpr (std::is_same_v<T, scalar>)
-                            {
-                                p.inletUniformValue = p.p0Function1.value(0);
-                                p.inletUniform = true;
-                                p.hasInletValue = true;
+                                setP0Table(p, std::move(pts));
                             }
                         }
                         else
@@ -555,6 +988,59 @@ inline FieldData<T> readField(const std::string& path)
                         }
                         ts.expect(";");
                     }
+                    else if (key == "p0Coeffs")   // the written table: `p0 table;` + this sub-dictionary
+                    {
+                        // Function1New.C reads a table's coefficients from dict.optionalSubDict(name +
+                        // "Coeffs"): `values` (a List of (t v), written with its size), and optionally
+                        // `interpolationScheme` (linear is TableBase's default) and `outOfBounds`
+                        // (clamp is the default, TableBase.C:76). brae evaluates linear + clamp only, so
+                        // anything else is named and refused rather than run as the default.
+                        ts.expect("{");
+                        std::vector<std::pair<scalar, scalar>> pts;
+                        bool haveValues = false;
+                        std::string bad;
+                        while (!ts.eof() && ts.peek() != "}")
+                        {
+                            const std::string ck = ts.next();
+                            if (ck == "values")
+                            {
+                                if (isFoamNumber(ts.peek())) ts.next();   // the list size OpenFOAM writes
+                                ts.expect("(");
+                                while (!ts.eof() && ts.peek() != ")")
+                                {
+                                    ts.expect("(");
+                                    const scalar tt = ts.nextScalar();
+                                    const scalar vv = ts.nextScalar();
+                                    ts.expect(")");
+                                    pts.emplace_back(tt, vv);
+                                }
+                                ts.expect(")");
+                                ts.expect(";");
+                                haveValues = true;
+                            }
+                            else if (ck == "interpolationScheme" || ck == "outOfBounds")
+                            {
+                                const std::string v = ts.next();
+                                ts.expect(";");
+                                const bool okv = (ck == "interpolationScheme") ? (v == "linear") : (v == "clamp");
+                                if (!okv) bad = "table " + ck + " " + v;
+                            }
+                            else
+                            {
+                                if (!skipToSemicolon(ts)) ts.expect(";");
+                            }
+                        }
+                        ts.expect("}");
+                        if (!bad.empty())
+                        {
+                            p.unsupportedFunction1 = bad;
+                        }
+                        else if (haveValues)
+                        {
+                            if (p.unsupportedFunction1 == "table (no p0Coeffs entry)") p.unsupportedFunction1.clear();
+                            setP0Table(p, std::move(pts));
+                        }
+                    }
                     else if (key == "uniformValue")   // uniformFixedValue: steady PatchFunction1 "constant <v>"
                     {
                         const std::string m = ts.next();     // "constant" | "uniform" | a BARE value
@@ -563,6 +1049,8 @@ inline FieldData<T> readField(const std::string& path)
                             p.uniformValue = readFoamValue<T>(ts);
                             p.valueUniform = true;
                             p.hasValue = true;
+                            p.hasUniformFn1 = true;
+                            p.uniformFn1Value = p.uniformValue;
                         }
                         else if (m == "(" || isFoamNumber(m))
                         {
@@ -570,26 +1058,39 @@ inline FieldData<T> readField(const std::string& path)
                             p.uniformValue = readBareFoamValue<T>(ts, m);
                             p.valueUniform = true;
                             p.hasValue = true;
+                            p.hasUniformFn1 = true;
+                            p.uniformFn1Value = p.uniformValue;
                         }
-                        else   // table / polynomial / coded / expression: skip the entry, then REFUSE.
+                        else if (m == "{")
+                        {
+                            // A PatchFunction1 DICTIONARY: `{ type expression; ... }` is read for real
+                            // (readPatchFunction1Dict); any other type inside is named in
+                            // unsupportedFunction1 and refused at construction -- "a dictionary" is a
+                            // much worse error message than "table".
+                            std::string type;
+                            PatchExprSpec spec = readPatchFunction1Dict(ts, key, p.name, path, type);
+                            if (type == "expression")
+                            {
+                                p.patchExpr    = std::move(spec);
+                                p.hasPatchExpr = true;
+                            }
+                            else
+                            {
+                                p.unsupportedFunction1 = type.empty() ? std::string("a dictionary with no type") : type;
+                            }
+                            // A dictionary value has no trailing ';' in OpenFOAM's syntax, but the tutorial
+                            // form `uniformValue { ... }` may be followed by one in a hand-written file.
+                            if (ts.peek() == ";") ts.next();
+                            continue;
+                        }
+                        else   // table / polynomial / coded / csvFile ...: skip the entry, then REFUSE.
                         {
                             // Relying on "dispatch throws when there is no value" is not enough: a case
                             // that overrides an earlier `type fixedValue; value uniform X;` still has
                             // hasValue == true, so the Function1 silently degrades to the constant X.
-                            // squareBendLiq does exactly that (T walls: expression, stale value 350).
-                            // A dict form ({ type expression; ... }) names its Function1 inside, so peek
-                            // the `type` keyword -- "a dictionary" is a much worse error message than
-                            // "expression".
+                            // squareBendLiq's T walls have exactly that shape (a `value uniform 350`
+                            // under an overriding uniformFixedValue); its `expression` is read above.
                             p.unsupportedFunction1 = m;
-                            if (m == "{")
-                            {
-                                const std::string t1 = ts.peek();
-                                if (t1 == "type")
-                                {
-                                    ts.next();
-                                    p.unsupportedFunction1 = ts.peek();
-                                }
-                            }
                             skipToSemicolon(ts, m == "(" ? 1 : 0);
                         }
                         ts.expect(";");
@@ -605,19 +1106,36 @@ inline FieldData<T> readField(const std::string& path)
                         p.intensity = ts.nextScalar();
                         ts.expect(";");
                     }
-                    // OF takes a Function1 here; "constant <v>" and a bare "<v>" are the steady forms.
-                    // Anything else (table/polynomial/...) is refused by name rather than approximated.
+                    // OF takes a Function1 here (flowRateInletVelocityFvPatchVectorField.C:71-83). "constant
+                    // <v>" and a bare "<v>" are the steady forms; `{ type coded; ... }` is OpenFOAM's
+                    // run-time-compiled one. Any other form is refused by name -- an inline `table (...)`
+                    // used to reach std::stod and die as "stod" instead.
                     else if (key == "volumetricFlowRate" || key == "massFlowRate")
                     {
                         p.hasFlowRate = true;
                         p.flowRateIsMass = (key == "massFlowRate");
                         std::string w = ts.next();
-                        if (w == "constant") w = ts.next();
-                        else if (w == "{")
-                            throw std::runtime_error(
-                                "brae: flowRateInletVelocity '" + key + "' given as a Function1 dictionary on patch "
-                                + p.name + "; only 'constant <value>' (or a bare value) is supported.");
-                        p.flowRate = std::stod(w);
+                        if (w == "{")
+                        {
+                            p.flowRateFunction1 = readFlowRateFunction1Dict(ts, key, p.name, path);
+                            p.flowRate = 0.0;   // no single number exists; flowRateValue() refuses on it
+                        }
+                        else
+                        {
+                            if (w == "constant") w = ts.next();
+                            if (!isFoamNumber(w))
+                                throw std::runtime_error(
+                                    "brae: flowRateInletVelocity '" + key + "' on patch " + p.name + " starts `" + w +
+                                    "`. brae evaluates `constant <value>`, a bare value and `{ type coded; }` there; "
+                                    "refusing rather than approximating any other Function1.");
+                            p.flowRate = std::stod(w);
+                            p.flowRateFunction1 = Function1::constant(p.flowRate);
+                            ts.expect(";");
+                        }
+                    }
+                    else if (key == "rho")
+                    {
+                        p.flowRateRhoName = ts.next();
                         ts.expect(";");
                     }
                     else if (key == "rhoInlet")
@@ -651,6 +1169,13 @@ inline FieldData<T> readField(const std::string& path)
                         p.mixingLength = ts.nextScalar();
                         ts.expect(";");
                     }
+                    // The non-ABL `Cmu`: the ABL branch above is gated on hasABL, so this is the
+                    // turbulent inlet's own entry (dead under kEpsilon, see PatchFieldData::Cmu).
+                    else if (key == "Cmu")
+                    {
+                        p.Cmu = ts.nextScalar();
+                        ts.expect(";");
+                    }
                     else if (key == "freestreamValue")   // freestream/freestreamPressure farfield value (may be $internalField)
                     {
                         readValueOrInternal(ts, fd, p.valueUniform, p.uniformValue, p.values);
@@ -670,7 +1195,11 @@ inline FieldData<T> readField(const std::string& path)
                         p.hasGradient = true;
                         ts.expect(";");
                     }
-                    else if (key == "refValue" && p.type == "mixed")
+                    // mixedEnergy is OpenFOAM's own spelling for a mixed he patch (basicThermo maps
+                    // T `mixed` onto it), and it is what OF WRITES into an he output file -- so a
+                    // restart that read `type mixedEnergy` through a mixed-only gate lost its refValue
+                    // and rebuilt the patch around zero.
+                    else if (key == "refValue" && (p.type == "mixed" || p.type == "mixedEnergy"))
                     {
                         readValueOrInternal(ts, fd, p.refValueUniform, p.refValueUniformValue, p.refValues);
                         p.hasRefValue = true;
@@ -726,6 +1255,66 @@ inline FieldData<T> readField(const std::string& path)
                         throw std::runtime_error("brae: timeVaryingMappedFixedValue on patch '" + p.name +
                             "' requires constant/boundaryData/" + p.name + " (points + a time dir); read failed: " + e.what());
                     }
+                }
+                // THE VISCOUS/INERTIAL SUBLAYER BLENDING (wallFunctionBlenders). Only four wall
+                // functions read it -- epsilonWallFunction, omegaWallFunction, nutkWallFunction and
+                // nutUWallFunction are the only classes in OpenFOAM that reference blender_ -- and each
+                // carries its OWN default: STEPWISE for the three, BINOMIAL with n = 2 for omega
+                // (epsilonWallFunctionFvPatchScalarField.C:413, nutUWallFunctionFvPatchScalarField.C:259,
+                // nutkWallFunctionFvPatchScalarField.C:216, omegaWallFunctionFvPatchScalarField.C:405).
+                // brae implements each one's default and nothing else, so a patch that names a different
+                // blender is refused BY NAME rather than run with the default: the alternatives are not
+                // small corrections -- `max`, `exponential` and `tanh` change nut and omega across the
+                // whole buffer layer, and under any blender but stepwise omega's G is added on EVERY
+                // face rather than only above yPlusLam (omegaWallFunctionFvPatchScalarField.C:604).
+                // The derived rough/lowRe wall functions override calcNut and never consult the blender,
+                // so they are deliberately not matched here.
+                {
+                    const bool omegaWf = (p.type == "omegaWallFunction");
+                    const bool blendedWf = omegaWf || p.type == "epsilonWallFunction"
+                                        || p.type == "nutkWallFunction" || p.type == "nutUWallFunction";
+                    const std::string own = omegaWf ? "binomial" : "stepwise";
+                    if (blendedWf && !p.wfBlending.empty() && p.wfBlending != own)
+                    {
+                        throw std::runtime_error("brae: boundaryField/" + p.name + " (" + p.type +
+                            ") sets `blending " + p.wfBlending + "` -- brae implements only OpenFOAM's own "
+                            "default for this wall function (" + own + "), and running " + own +
+                            " where the case asked for " + p.wfBlending + " would change nut and omega "
+                            "through the buffer layer (wallFunctionBlenders.H). Remove the entry to run "
+                            + own + ", or port the blender");
+                    }
+                    // `n` only reaches the answer under the binomial blender. omega's blender IS
+                    // binomial unless the patch says otherwise, so an `n` there is live even with no
+                    // `blending` entry; under stepwise OpenFOAM reads it and never uses it, and brae
+                    // is silent for the same reason.
+                    const bool binomialHere = blendedWf
+                        && (p.wfBlending == "binomial" || (omegaWf && p.wfBlending.empty()));
+                    if (binomialHere && p.hasWfBlendN && p.wfBlendN != 2.0)
+                    {
+                        throw std::runtime_error("brae: boundaryField/" + p.name + " (" + p.type +
+                            ") sets `n " + std::to_string(p.wfBlendN) + "` -- brae's binomial blend is "
+                            "fixed at OpenFOAM's default exponent 2 for this wall function "
+                            "(omegaWallFunctionFvPatchScalarField.C:405), and a different exponent is a "
+                            "different omega through the buffer layer. Remove the entry to run 2");
+                    }
+                }
+                // A per-patch wall-function coefficient the LEGACY drivers will NOT apply per patch:
+                // said so, with the value the case wrote and the one they run (item 16h). Silence here
+                // is what let turbineSiting's `kappa 0.4` on its terrain epsilonWallFunction run at
+                // 0.41. The rhoSimpleFoam mirror honours them (16h-port) and says so before reading.
+                if (p.type.find("WallFunction") != std::string::npos && !brae::perPatchWallCoeffsHonoured())
+                {
+                    auto announce = [&](const char* key, bool has, scalar v, scalar def)
+                    {
+                        if (!has || v == def) return;
+                        noticeApproximated("boundaryField/" + p.name + "/" + key,
+                            "the " + p.type + " patch writes " + key + " " + std::to_string(v) +
+                            "; brae applies its model-wide value (OpenFOAM: wallFunctionCoefficients.C reads it "
+                            "per patch, default " + std::to_string(def) + ") -- not honoured per patch");
+                    };
+                    announce("Cmu",   p.hasWfCmu,   p.wfCmu,   0.09);
+                    announce("kappa", p.hasWfKappa, p.wfKappa, 0.41);
+                    announce("E",     p.hasWfE,     p.wfE,     9.8);
                 }
                 fd.boundary.push_back(std::move(p));
             }

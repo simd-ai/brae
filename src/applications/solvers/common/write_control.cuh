@@ -42,6 +42,28 @@ public:
             noticeIgnored("controlDict stopAt",
                           "'" + stopAt + "' -- brae does not re-read controlDict during a run, so only "
                           "'endTime' is meaningful; the run will go to endTime or residualControl");
+
+        // OpenFOAM's writeFormat is a WRITE option ONLY: TimeIO.C:370-372 sets writeStreamOption_ and
+        // nothing reads it back. A file's format is taken from its OWN FoamFile header
+        // (IOobjectReadHeader.C:51, applied at :111), so an ascii time directory written under
+        // `writeFormat binary` is read by real OpenFOAM without complaint -- measured on squareBend at
+        // 112k, OF restarted from brae's ascii output with binary still set and ran to End. brae's
+        // writer rewrites a binary template header to `format ascii` (foam_field_writer.cuh:241-242),
+        // so the file is honestly labelled rather than lying about its contents.
+        //
+        // What IS lost is precision and size, and that is why this is a NOTICE and not silence: brae
+        // writes 12 significant digits where binary is exact, and the file is several times larger on
+        // the big meshes that ask for binary in the first place. It is not a REFUSAL because nothing
+        // numerical is at stake and the output is readable by every OpenFOAM tool -- and because only
+        // the rhoSimpleFoam mirror ever refused it, while simpleFoamV2, gpuSimpleFoam, gpuPimpleFoam
+        // and the legacy rho drivers all wrote ascii under the same setting saying nothing at all.
+        // One notice here covers every driver, since every one of them builds a WriteControl.
+        if (controlDict.wordOr("writeFormat", "ascii") == "binary")
+            noticeApproximated("controlDict writeFormat",
+                               "'binary' -- brae's field writer emits ascii only. OpenFOAM reads the "
+                               "format from each file's own header, not from controlDict, so the output "
+                               "is readable; it is larger and carries 12 significant digits rather than "
+                               "binary's exact bits");
     }
 
     scalar deltaT() const { return deltaT_; }
@@ -67,8 +89,10 @@ public:
     // Foam::Time::operator++ write switch. Not const: the runTime branch latches the interval index.
     bool isWriteTime(int iter, scalar tval)
     {
+        // OF's absent-entry default is GREAT; casting that to long is undefined, and it means "never"
+        // (Time.C: !(timeIndex % writeInterval) with an interval no index reaches).
         if (control_ == "timeStep")
-            return interval_ >= 1 && (iter % static_cast<long>(interval_)) == 0;   // Time.C: !(timeIndex % writeInterval)
+            return interval_ >= 1 && interval_ < 1e18 && (iter % static_cast<long>(interval_)) == 0;
         if (control_ == "runTime" || control_ == "adjustable" || control_ == "adjustableRunTime")
         {
             const long wi = static_cast<long>(((tval - startTime_) + 0.5 * deltaT_) / interval_);

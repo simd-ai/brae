@@ -26,6 +26,19 @@
 
 namespace brae {
 
+// A Function1 entry's leading token is either the function's NAME or, in OF's bare shorthand, the value
+// itself. Telling those apart is all that separates `Cp 0.386;` from `Cp table (...)`.
+inline bool isFoamScalarToken(const std::string& t)
+{
+    try
+    {
+        std::size_t n = 0;
+        (void)std::stod(t, &n);
+        return n == t.size();
+    }
+    catch (...) { return false; }
+}
+
 struct FvOptionsData
 {
     // momentum (vectorSemiImplicitSource on field "U"): explicit per-component source Su*V/VDash, implicit Sp*V.
@@ -438,7 +451,15 @@ inline FvOptionsData readFvOptions(
         }
         if (type == "actuationDiskSource")   // Froude actuator disk (turbine/propeller)
         {
-            if (co.wordOr("variant", "Froude") != "Froude") continue;    // (variableScaling: future)
+            // OF's own keyword. variableScaling is a DIFFERENT thrust law, not a refinement of Froude,
+            // so dropping the source would run the turbine site with no turbines in it and converge.
+            if (co.wordOr("variant", "Froude") != "Froude")
+            {
+                fo.unsupported.push_back(
+                    "source '" + s.first + "' is actuationDiskSource with variant '"
+                    + co.wordOr("variant", "Froude") + "'; brae implements only Froude");
+                continue;
+            }
             FvOptionsData::ActuationDisk disk;
             const std::vector<scalar> dd = co.scalarListOr("diskDir", {});
             if (dd.size() >= 3)
@@ -448,9 +469,30 @@ inline FvOptionsData readFvOptions(
                 if (m > 0) disk.diskDir = vector{d.x/m, d.y/m, d.z/m};
             }
             disk.area = co.scalarOr("diskArea", 0.0);
+            // OF builds Cp and Ct as Function1<scalar> of mag(Uref) and evaluates them EVERY iteration, so
+            // a table is a thrust curve, not a decoration. brae reads the constant form only; taking the
+            // first knot of a table would run a plausible-looking turbine at the wrong operating point.
+            bool curved = false;
+            for (const char* key : {"Cp", "Ct"})
+            {
+                const std::string w = co.wordOr(key, "");
+                if (w.empty() || isFoamScalarToken(w) || w == "constant" || w == "uniform") continue;
+                curved = true;
+                fo.unsupported.push_back(
+                    "source '" + s.first + "' has actuationDiskSource " + key + " as a non-constant "
+                    "Function1 ('" + w + "'); brae evaluates only `constant`/`uniform`");
+            }
+            if (curved) continue;
             const scalar Cp = co.scalarOr("Cp", 0.0), Ct = co.scalarOr("Ct", 0.0);
-            if (disk.area <= 0 || Ct <= 0 || Cp <= 0) continue;
-            disk.a = 1.0 - Cp/Ct;                                        // induction (sink cancels)
+            if (disk.area <= 0 || Ct <= 0 || Cp <= 0)
+            {
+                fo.unsupported.push_back(
+                    "source '" + s.first + "' is actuationDiskSource with diskArea/Cp/Ct missing or "
+                    "non-positive; OpenFOAM itself fails on Cp,Ct <= 0");
+                continue;
+            }
+            disk.a = 1.0 - Cp/Ct;                                        // induction (sink cancels: OF scales
+                                                                         // BOTH Cp and Ct by sink_)
             {
                 const auto it = zones.find(selZoneName(co, opt));
                 if (it != zones.end()) disk.diskCells = it->second;
