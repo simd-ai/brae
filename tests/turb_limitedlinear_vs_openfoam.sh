@@ -161,22 +161,25 @@ done
 for arm in 1 cuda; do
     label=$([ "$arm" = 1 ] && echo "host" || echo "CUDA")
     stage "$W/g_$arm" "$LL" "cellMDLimited Gauss linear 1"; runBrae "$arm" "$W/g_$arm"
-    [ "$(its "$W/g_$arm")" = 0 ] && grep -q "limiter gradient" "$W/g_$arm/run.log" \
+    # BY NAME means the limiter's name is in the refusal. The default rewritten above reaches grad(U)
+    # and grad(p) as well as grad(k)/grad(epsilon), and whichever consumer's refusal fires first must
+    # still name `cellMDLimited` -- the phrase a particular consumer used is not the contract.
+    [ "$(its "$W/g_$arm")" = 0 ] && grep -q "cellMDLimited" "$W/g_$arm/run.log" \
         && say "$label arm: a limiter gradient brae does not compute is refused, by name" ok \
         || say "$label arm: a limiter gradient brae does not compute is refused, by name" FAIL
 done
-# ...and `leastSquares`, which brae DOES compute now: the host runs it, and the CUDA arm -- whose
-# closures, momentum gradients and pressure gradient compute Gauss only -- refuses it BY NAME. Together
-# these two say the refusal tracks what each arm can actually compute rather than being blanket.
-# The host figure itself is gated by tests/rho_leastsquares_closure_vs_openfoam.sh against real OpenFOAM.
-stage "$W/lsq_1" "$LL" "leastSquares"; runBrae 1 "$W/lsq_1"
-[ "$(its "$W/lsq_1")" = "$DEV" ] \
-    && say "host arm: a leastSquares limiter gradient RUNS (it is computed and gated)" ok \
-    || { grep -v '^brae NOTICE' "$W/lsq_1/run.log" | tail -2; say "host arm: a leastSquares limiter gradient RUNS (it is computed and gated)" FAIL; }
-stage "$W/lsq_c" "$LL" "leastSquares"; runBrae cuda "$W/lsq_c"
-[ "$(its "$W/lsq_c")" = 0 ] && grep -q "which this arm computes nowhere yet" "$W/lsq_c/run.log" \
-    && say "CUDA arm: a leastSquares gradient is refused, by name" ok \
-    || { grep -v '^brae NOTICE' "$W/lsq_c/run.log" | tail -2; say "CUDA arm: a leastSquares gradient is refused, by name" FAIL; }
+# ...and `leastSquares`, which BOTH arms compute now (the device closures' limiter gradient and
+# corrected-laplacian gradient take it since the grad(k)/grad(epsilon|omega) leastSquares port;
+# tests/rho_leastsquares_closure_vs_openfoam.sh holds both arms against real OpenFOAM under it). Together
+# with the cellMDLimited refusal above, these say the refusal tracks what each arm can actually compute
+# rather than being blanket. The CUDA line asserted a refusal until that port and went red the day it landed.
+for arm in 1 cuda; do
+    label=$([ "$arm" = 1 ] && echo "host" || echo "CUDA")
+    stage "$W/lsq_$arm" "$LL" "leastSquares"; runBrae "$arm" "$W/lsq_$arm"
+    [ "$(its "$W/lsq_$arm")" = "$DEV" ] \
+        && say "$label arm: a leastSquares limiter gradient RUNS (it is computed and gated)" ok \
+        || { grep -v '^brae NOTICE' "$W/lsq_$arm/run.log" | tail -2; say "$label arm: a leastSquares limiter gradient RUNS (it is computed and gated)" FAIL; }
+done
 # ...and NOT refused when the case names Gauss linear -- the refusal must discriminate.
 stage "$W/gok" "$LL" "Gauss linear"; runBrae 1 "$W/gok"
 [ "$(its "$W/gok")" = "$DEV" ] \

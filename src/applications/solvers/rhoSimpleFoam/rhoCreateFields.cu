@@ -1,5 +1,7 @@
 // The device projection of rhoSimpleFoam's createFields.H. See rhoCreateFields.cuh for the contract and
 // for what deliberately stays on the host.
+#include <cstdlib>
+#include <string>
 #include "nut_wall_function.cuh"   // enum class NutWall: which member each nut patch carries
 #include "rhoCreateFields.cuh"
 #include "near_wall_dist.cuh"
@@ -103,10 +105,18 @@ RhoDeviceFields createDeviceFields(
     d.turbulent = hf.turbulent;
     d.turbulenceFrozen = hf.turbulenceFrozen;
 
-    d.dbU  = buildDeviceVectorBoundary(hf.U, patches, g);
-    d.dbP  = buildDeviceBoundary(hf.p, patches, g);
-    d.dbHe = buildDeviceBoundary(hf.he, patches, g);
-    d.dbT  = buildDeviceBoundary(hf.T, patches, g);
+    // BRAE_IO_STORED_SOLVER=1: the stored-value seed (DeviceBoundary::ioStored) on the SOLVER fields'
+    // inletOutlet faces too. OFF by default, and INERT on this arm: nothing evaluates U/p/he/T's
+    // inletOutlet faces before the step's first flux switch, so with it on neither mirror arm changes a
+    // digit on the naca0012 restart (tests/rho_naca_restart_vs_openfoam.sh, both arms 1.8e-09 of
+    // OpenFOAM's own restart). The 1.16e-03 that validation/restart_vs_openfoam.sh once read with a seed
+    // was the PRE-MIRROR driver (that gate runs it) under the outletInlet/freestreamPressure seed, which
+    // buildDeviceBoundary no longer takes for any field. The hatch stays as the control.
+    const bool solverIoSeed = std::getenv("BRAE_IO_STORED_SOLVER") && std::string(std::getenv("BRAE_IO_STORED_SOLVER")) == "1";
+    d.dbU  = buildDeviceVectorBoundary(hf.U, patches, g, solverIoSeed);
+    d.dbP  = buildDeviceBoundary(hf.p, patches, g, solverIoSeed);
+    d.dbHe = buildDeviceBoundary(hf.he, patches, g, solverIoSeed);
+    d.dbT  = buildDeviceBoundary(hf.T, patches, g, solverIoSeed);
 
     // THE ENERGY CONDITIONS, classified once. basicThermo::heBoundaryTypes dispatches on T's patch class
     // in this order -- fixedValue, then zeroGradient/fixedGradient, then mixed (basicThermo.C:197-231)

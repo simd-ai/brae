@@ -170,11 +170,18 @@ else
 fi
 
 # ---- ARM 4: THE LIMITER'S GRADIENT is refused when it is not one brae computes ---------------------
-# This is what stops gasMixing running quietly wrong once the div blocker is cleared.
-stage "$W/lsq" "$LL" "$LL" 5 "leastSquares"; runBrae 1 "$W/lsq"
-[ "$(its "$W/lsq")" = 0 ] && grep -q "LimitedScheme.C" "$W/lsq/run.log" \
+# This is what stops gasMixing running quietly wrong once the div blocker is cleared. `leastSquares` was
+# the example here until both arms computed it (gasMixing/injectorPipe runs on both under `default
+# leastSquares`, tests/rho_gasmixing_vs_openfoam.sh); cellMDLimited is a limiter neither arm applies.
+stage "$W/lsq" "$LL" "$LL" 5 "cellMDLimited Gauss linear 1"; runBrae 1 "$W/lsq"
+[ "$(its "$W/lsq")" = 0 ] && grep -qi "cellMDLimited" "$W/lsq/run.log" \
     && say "a limiter gradient brae does not compute is refused, by name" ok \
-    || say "a limiter gradient brae does not compute is refused, by name" FAIL
+    || { grep -v '^brae NOTICE' "$W/lsq/run.log" | tail -2; say "a limiter gradient brae does not compute is refused, by name" FAIL; }
+# ...and leastSquares, which brae DOES compute, RUNS on the host (its consumers are gated on gasMixing).
+stage "$W/lsqrun" "$LL" "$LL" 5 "leastSquares"; runBrae 1 "$W/lsqrun"
+[ "$(its "$W/lsqrun")" = 5 ] \
+    && say "host arm: a leastSquares limiter gradient RUNS (it is computed and gated)" ok \
+    || { grep -v '^brae NOTICE' "$W/lsqrun/run.log" | tail -2; say "host arm: a leastSquares limiter gradient RUNS (it is computed and gated)" FAIL; }
 # ...and NOT refused when the case does name Gauss linear -- the refusal must discriminate.
 stage "$W/gl" "$LL" "$LL" 5 "Gauss linear"; runBrae 1 "$W/gl"
 [ "$(its "$W/gl")" = 5 ] \
@@ -215,11 +222,16 @@ sys.exit(0 if ll <= 3.0 * max(up, 1e-14) else 1)" "$dcl" "$dcu" \
     && say "CUDA arm: limitedLinear is no worse than its own validated upwind" ok \
     || say "CUDA arm: limitedLinear is no worse than its own validated upwind" FAIL
 printf '        (CUDA limitedLinear %s vs its upwind %s, each against its own OpenFOAM run)\n' "$dcl" "$dcu"
-# ...and the CUDA arm must still refuse a limiter gradient it cannot compute, like the host.
-stage "$W/culsq" "$LL" "$LL" 5 "leastSquares"; runBrae cuda "$W/culsq"
-[ "$(its "$W/culsq")" = 0 ] \
+# ...and the CUDA arm must still refuse a limiter gradient it cannot compute, like the host -- and run
+# leastSquares, which it computes (the energy limiter's gradient scheme is projected to it).
+stage "$W/culsq" "$LL" "$LL" 5 "cellMDLimited Gauss linear 1"; runBrae cuda "$W/culsq"
+[ "$(its "$W/culsq")" = 0 ] && grep -qi "cellMDLimited" "$W/culsq/run.log" \
     && say "CUDA arm: a limiter gradient brae does not compute is refused there too" ok \
-    || say "CUDA arm: a limiter gradient brae does not compute is refused there too" FAIL
+    || { grep -v '^brae NOTICE' "$W/culsq/run.log" | tail -2; say "CUDA arm: a limiter gradient brae does not compute is refused there too" FAIL; }
+stage "$W/culsqrun" "$LL" "$LL" 5 "leastSquares"; runBrae cuda "$W/culsqrun"
+[ "$(its "$W/culsqrun")" = 5 ] \
+    && say "CUDA arm: a leastSquares limiter gradient RUNS (it is computed and gated)" ok \
+    || { grep -v '^brae NOTICE' "$W/culsqrun/run.log" | tail -2; say "CUDA arm: a leastSquares limiter gradient RUNS (it is computed and gated)" FAIL; }
 # ...and the two arms must SEPARATE the two entries the same way the host does.
 restartFrom "$W/rc_mix" "$W/m_he-limited-KE-upwind"; runBrae cuda "$W/rc_mix"
 dmix=$(relT "$W/rc_mix" "$W/mo_he-limited-KE-upwind" "$NEXT")

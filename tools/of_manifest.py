@@ -1525,7 +1525,11 @@ COMPONENTS = {
                   "coefficient) and grad(U)'s VECTOR form at divDevRhoReff, the corrected laplacian, the momentum "
                   "limiters and both closures' production (deviceLeastSquaresGradU) -- the CUDA mirror arm "
                   "refuses nothing of leastSquares any more; the linearUpwind-NAMED gradient under leastSquares "
-                  "is refused by the shared parse on both arms. A cellLimited grad(p) (parseFieldGradScheme's "
+                  "is refused by the shared parse on both arms, and so is any limiter brae does not apply "
+                  "(cellMDLimited, faceLimited, faceMDLimited) on grad(U), grad(p), grad(magSqr(U)), grad(he) and "
+                  "grad(Ekp|K) -- the parse recorded it and the shared reader only warned, so the unlimited gradient "
+                  "ran under the case's scheme name (tests/eeqn_limitedlinear_vs_openfoam.sh's cellMDLimited arm). "
+                  "A cellLimited grad(p) (parseFieldGradScheme's "
                   "cellLimitK for p, applied nowhere until this) now limits every grad(p) consumer on both arms, "
                   "fvc::snGrad's correction included -- tests/rho_gradp_lsq_simplec_vs_openfoam.sh's lim arm, "
                   "sbMatched with `grad(p) cellLimited Gauss linear 1`: host 2.02e-11, CUDA 2.48e-11 of OpenFOAM "
@@ -1614,13 +1618,17 @@ COMPONENTS = {
                   "deviceUpdateInletOutlet first runs (inletOutletFvPatchField.C's dictionary constructor: "
                   "valueFraction 0, readValueEntry or extrapolateInternal). Both boundary builders. After it the "
                   "CUDA arm sits at 1.2e-11 of OpenFOAM's own restart over iterations 6-8, the host at 2.0e-11. "
-                  "OPEN: the seed is taken by the CLOSURE boundaries only (buildDeviceBoundary's storedIoSeed, dbK and "
-                  "dbEps in rhoCreateFields.cu). Seeding the solver fields' inletOutlet faces the same way moved "
-                  "validation/restart_vs_openfoam.sh (aerofoilNACA0012 restarted: T, k, omega inletOutlet on the "
-                  "freestream, T's patch thermo-derived) from p 1.5e-05 / T 1.6e-04 to p 1.16e-03 / T 4.2e-03 "
-                  "against OpenFOAM, so U/p/he/T keep the fixedValue(inletValue) construction seed until a stage "
-                  "measurement names the state OpenFOAM's solver fields effectively see at a restart. "
-                  "BRAE_IO_STORED=0 disables the seed everywhere (the control)."),
+                  "The seed is taken by the CLOSURE boundaries (buildDeviceBoundary's storedIoSeed, dbK and dbEps in "
+                  "rhoCreateFields.cu) and is INERT on the solver fields: nothing evaluates U/p/he/T's inletOutlet "
+                  "faces before the step's first flux switch, and with BRAE_IO_STORED_SOLVER=1 neither mirror arm "
+                  "changes a digit. MEASURED CLOSED by tests/rho_naca_restart_vs_openfoam.sh (aerofoilNACA0012: "
+                  "kOmegaSST, inletOutlet T/k/omega, freestream U/p, restarted from OpenFOAM's iteration 100 under "
+                  "the gasMixing protocol): host and CUDA both 1.8e-09 of OpenFOAM's own restart (p at the first "
+                  "restarted iteration, <= 2.2e-10 elsewhere), CUDA vs host <= 5.2e-13; at the case's own "
+                  "tolerances the arms read 2.5e-05 apart, solver stopping points. The 1.16e-03 that "
+                  "validation/restart_vs_openfoam.sh once read with a seed was the PRE-MIRROR driver (which that "
+                  "gate runs, BRAE_RHOSIMPLEFOAM_MIRROR unset) under the outletInlet/freestreamPressure seed, no "
+                  "longer taken for any field. BRAE_IO_STORED=0 disables the seed everywhere (the control)."),
     ],
 }
 

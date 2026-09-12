@@ -152,6 +152,15 @@ StepInput buildStepInput(
                     "energy diagonal by 9.1e-03 and its source by 2.8e-03 -- a different discretisation, "
                     "not an approximation. Refusing rather than running the limiter off the wrong "
                     "gradient.");
+            // ...and a limiter brae does not apply (cellMDLimited, faceLimited, faceMDLimited) is refused
+            // too, by name: the shared reader only WARNED and the gradient ran unlimited under the
+            // case's scheme name -- tests/eeqn_limitedlinear_vs_openfoam.sh's cellMDLimited arm found it.
+            if (!gs.unsupportedLimiter.empty())
+                throw std::runtime_error(
+                    "rhoSimpleFoam buildStepInput: gradSchemes resolves grad(" + fld + ") to `" + gs.raw +
+                    "` with the `" + gs.unsupportedLimiter + "` limiter, which neither arm applies "
+                    "(cellLimited is the one ported). Refusing rather than running the unlimited gradient "
+                    "under the case's scheme name.");
             out = gs.cellLimitK;
             lsq = gs.leastSquares;
         };
@@ -210,6 +219,16 @@ StepInput buildStepInput(
         {
             const FieldGradScheme gU = parseFieldGradScheme(caseDir, "U");
             const FieldGradScheme gP = parseFieldGradScheme(caseDir, "p");
+            // A limiter neither arm applies (cellMDLimited, faceLimited, faceMDLimited) is refused by
+            // name rather than run unlimited under the case's scheme name -- the parse records it
+            // (FieldGradScheme::unsupportedLimiter) and the shared reader only WARNED.
+            for (const FieldGradScheme* g : {&gU, &gP})
+                if (!g->unsupportedLimiter.empty())
+                    throw std::runtime_error(
+                        "rhoSimpleFoam buildStepInput: gradSchemes resolves `" + g->raw + "` with the `" +
+                        g->unsupportedLimiter + "` limiter, which neither arm applies (cellLimited is the "
+                        "one ported). Refusing rather than running the unlimited gradient under the case's "
+                        "scheme name.");
             in.gradULeastSq = gU.leastSquares;
             in.gradPLeastSq = gP.leastSquares;
             in.gradPLimitK  = gP.cellLimitK;   // applied at every grad(p) consumer, snGrad's correction included
@@ -218,6 +237,11 @@ StepInput buildStepInput(
             const FieldGradScheme gM = parseFieldGradScheme(caseDir, "magSqr(U)");
             in.gradMagSqrULeastSq = gM.leastSquares;
             in.gradMagSqrULimitK  = gM.cellLimitK;
+            if (!gM.unsupportedLimiter.empty())
+                throw std::runtime_error(
+                    "rhoSimpleFoam buildStepInput: gradSchemes resolves grad(magSqr(U)) to `" + gM.raw +
+                    "` with the `" + gM.unsupportedLimiter + "` limiter, which neither arm applies. Refusing "
+                    "rather than running the unlimited gradient under the case's scheme name.");
         }
         {
             const DdtSchemeEntry ddt = parseDdtScheme(caseDir);

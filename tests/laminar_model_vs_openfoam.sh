@@ -122,13 +122,28 @@ sys.exit(0 if sig > 1000.0 * max(noise, 1e-12) else 1)" "$REL" "$NOISE" 2> /dev/
     || say "...and it is at least 1000x OpenFOAM's own run-to-run noise, so it is signal" FAIL
 printf '        (generalizedNewtonian vs Stokes: %s relative on U; OpenFOAM against itself: %s)\n' "$REL" "$NOISE"
 
-# ---- ARM 1 + 2: the rhoSimpleFoam MIRROR refuses, by name, on BOTH arms ----------------------------
+# ---- ARM 1 + 2: the rhoSimpleFoam MIRROR runs generalizedNewtonian on BOTH arms, and lands on
+# OpenFOAM's generalizedNewtonian answer rather than its Stokes one. Both arms have applied the model
+# since the powerLaw port (a8944ea, gated at 1e-11 on squareBendLiqNoNewtonian by
+# tests/rho_tutorials_vs_openfoam.sh); this arm asserted a refusal until then and went red the day it
+# landed. Maxwell is still refused by name on both.
+GNBOUND=${GNBOUND:-1e-09}   # measured: host 1.46e-11, CUDA 1.25e-11 vs OpenFOAM's own generalizedNewtonian run (U, max-abs relative at IT), against 3.92e-02 vs its Stokes run
 for arm in 1 cuda; do
     label=$([ "$arm" = 1 ] && echo "host" || echo "CUDA")
     stage "$W/m$arm" "$RHO" "$GN"; runBrae "$arm" "$W/m$arm"
-    refusedBy "$W/m$arm" "generalizedNewtonian" \
-        && say "rho mirror ($label): refuses the model it does not apply, by name" ok \
-        || { tail -2 "$W/m$arm/run.log"; say "rho mirror ($label): refuses the model it does not apply, by name" FAIL; }
+    if [ "$(its "$W/m$arm")" -ge 1 ]; then
+        RGN=$(relU "$W/m$arm" "$W/ofGN"); RST=$(relU "$W/m$arm" "$W/ofST")
+        python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < float(sys.argv[2]) else 1)" "$RGN" "$GNBOUND" 2> /dev/null \
+            && say "rho mirror ($label): runs the model and matches OpenFOAM's generalizedNewtonian run" ok \
+            || say "rho mirror ($label): runs the model and matches OpenFOAM's generalizedNewtonian run" FAIL
+        # ...and NOT OpenFOAM's Stokes run: the model must have been applied, not announced.
+        python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) >= 0.02 else 1)" "$RST" 2> /dev/null \
+            && say "rho mirror ($label): ...and is off OpenFOAM's Stokes run by the model's own effect" ok \
+            || say "rho mirror ($label): ...and is off OpenFOAM's Stokes run by the model's own effect" FAIL
+        printf '        (%s vs OpenFOAM generalizedNewtonian %s, vs OpenFOAM Stokes %s)\n' "$label" "$RGN" "$RST"
+    else
+        tail -2 "$W/m$arm/run.log"; say "rho mirror ($label): runs the model and matches OpenFOAM's generalizedNewtonian run" FAIL
+    fi
     stage "$W/x$arm" "$RHO" "$MX"; runBrae "$arm" "$W/x$arm"
     refusedBy "$W/x$arm" "Maxwell" \
         && say "rho mirror ($label): refuses Maxwell too" ok \

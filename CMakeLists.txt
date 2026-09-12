@@ -2808,6 +2808,14 @@ set_tests_properties(rho_step_cuda_lsq PROPERTIES
                      SKIP_RETURN_CODE 77
                      DEPENDS test_rho_simple_step_cuda
                      TIMEOUT 1800)
+add_test(NAME rho_naca_restart_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_naca_restart_vs_openfoam.sh)
+set_tests_properties(rho_naca_restart_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BRAE_BIN=${CMAKE_CURRENT_BINARY_DIR}/brae_rhoSimpleFoam"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS brae_rhoSimpleFoam
+                     LABELS slow
+                     TIMEOUT 2400)
 add_test(NAME rho_gradp_lsq_simplec_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_gradp_lsq_simplec_vs_openfoam.sh)
 set_tests_properties(rho_gradp_lsq_simplec_vs_openfoam PROPERTIES
