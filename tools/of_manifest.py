@@ -1629,6 +1629,51 @@ COMPONENTS = {
                   "validation/restart_vs_openfoam.sh once read with a seed was the PRE-MIRROR driver (which that "
                   "gate runs, BRAE_RHOSIMPLEFOAM_MIRROR unset) under the outletInlet/freestreamPressure seed, no "
                   "longer taken for any field. BRAE_IO_STORED=0 disables the seed everywhere (the control)."),
+        dict(name="PatchFunction1Expression",
+             of_symbol="PatchFunction1Types::PatchExprField<Type>::value",
+             of_file="src/finiteVolume/expressions/PatchFunction1/PatchFunction1Expression.C",
+             classification="HOST_ONLY", status="PORTED",
+             brae_reference="src/finiteVolume/expressions/PatchFunction1/patchExprFunction1.cu",
+             brae_target="src/finiteVolume/expressions/PatchFunction1/patchExprFunction1.cu",
+             validation="tests/rho_patch_expression_vs_openfoam.sh -- squareBendLiq's own T walls, `type "
+                        "expression` with its variables and functions<scalar> table verbatim, both mirror arms "
+                        "against OpenFOAM's WRITTEN wall values iteration by iteration and the cells alongside "
+                        "(solvers tightened to 1e-14 relTol 0 on both codes, since the expression reads |U_c| "
+                        "after the momentum solve). Walls at iteration 1: host 1.21e-13, CUDA 1.21e-13 (22400 "
+                        "distinct values around 500.003); iterations 2-3 exactly 0 (both 500); cells over 1-3 "
+                        "1.86e-12 on both arms. Bounds 1e-12 walls, 1e-11 cells. THE CONTROL is a `constant 500` "
+                        "wall on the host arm, which the same comparison rejects at 3.63e-07 -- six orders above "
+                        "the bound. Also asserted: the oracle is non-uniform and above 500 at iteration 1; brae's "
+                        "written T carries the dictionary and OpenFOAM restarts from it; six refusals by name "
+                        "(sqrt, a functions<scalar> entry referenced, an unregistered field, the expression on U, "
+                        "on p, and the entry-less form). tests/test_patch_expr.cu covers the grammar without "
+                        "OpenFOAM: precedence and associativity as operator-precedence.m4 declares them, lookups "
+                        "in OpenFOAM's order, Foam::max's NaN side, mag() of a vector, 17 refusals by name. "
+                        "tests/rho_tutorials_vs_openfoam.sh now RUNS squareBendLiq on both arms (1.9e-12).",
+             note="THE SUBSET, and nothing else: numbers, + - * /, unary minus, parentheses, identifiers that "
+                  "are `variables` entries or registered fields (the PATCH value, getField), internalField(x), "
+                  "snGrad(x) (the patch class's own virtual on the host; the fixedValue formula on the CUDA arm "
+                  "for the patch's own field only), mag(vector), max, min, time(), deltaT(), arg(), pi(). "
+                  "OpenFOAM's grammar has ~60 more rules; every other token -- another function, a comparison, "
+                  "?:, .x component access, vector arithmetic, a functions<> entry referenced, name{where} "
+                  "remote variables -- is refused BY NAME at parse or first evaluation. WHERE IT IS EVALUATED "
+                  "is the port: uniformFixedValue::updateCoeffs runs inside fixedEnergy::updateCoeffs -> "
+                  "Tw.evaluate(), once per iteration (the first fvm:: term's fvMatrix constructor; later ones "
+                  "find updated()), over U AFTER the momentum solve and T's cells and T's own patch value from "
+                  "the previous iteration -- so both steps evaluate it immediately before energy_boundary's "
+                  "updateEnergyBoundaryCoeffs. On T ONLY: an expression on any other field is refused by name "
+                  "(that field's own updateCoeffs is where OpenFOAM would evaluate it, and no brae step "
+                  "reproduces that); the entry-less form (no `value`) is refused because OpenFOAM evaluates it "
+                  "at construction over fields brae has not built. The CUDA arm evaluates the same host code "
+                  "on the patch's cells downloaded at the assembly and pushes the result into dbT's refValue "
+                  "(operator==), which deviceBCValue then exposes -- the flowRate Function1's arrangement. "
+                  "Foam::max is (b < a) ? a : b, so max(NaN, 0) is 0 -- transcribed, not std::max; the walls "
+                  "reach exactly 500 from iteration 2 because max((500 - 500.003)/500, 0) is 0 and "
+                  "par1*T_c*0 is 0. heBoundaryTypes dispatches on the CLASS: uniformFixedValue is a "
+                  "fixedValueFvPatchField, so he gets fixedEnergy seeded from T's `value`; createFields_cpp "
+                  "now maps it so. THE WRITER echoes the dictionary (PatchExprField::writeData echoes dict_): "
+                  "the functions<> tokens are re-emitted with the tokenizer's single-character delimiters "
+                  "bare -- quoting them made OpenFOAM's reader fail at the functionObjectTrigger's `{`."),
     ],
 }
 

@@ -13,6 +13,7 @@
 // WM_PRECISION_OPTION=SP decodes at the wrong stride -- see the note there.
 #include "cf_types.cuh"
 #include "function1.cuh"   // OF Function1: constant / table
+#include "patchExprFunction1.cuh"   // OF PatchFunction1 `expression`: the spec the reader fills
 #include "foam_token_reader.cuh"
 #include "brae_notice.cuh"   // noticeApproximated: a per-patch wall-function coefficient brae applies model-wide
 #include <string>
@@ -88,6 +89,12 @@ struct PatchFieldData
     // stale `value` from an overridden fixedValue entry, so the field silently takes that constant
     // instead. Recorded here and refused at construction rather than guessed at.
     std::string    unsupportedFunction1;
+    // uniformFixedValue whose uniformValue is `{ type expression; ... }` (OF PatchFunction1Types::
+    // PatchExprField): the expression, its variables and its functions<> dictionaries, evaluated per
+    // face at every updateCoeffs by patchExprFunction1.cuh. Distinct from unsupportedFunction1, which
+    // stays the refusal for every other non-constant form.
+    PatchExprSpec  patchExpr;
+    bool           hasPatchExpr = false;
     Function1      p0Function1;              // uniformTotalPressure p0(t); empty unless hasP0Function1
     bool           hasP0Function1 = false;
     // pressureInletOutletVelocity's optional `tangentialVelocity`. OF sets
@@ -555,6 +562,108 @@ inline Function1 readFlowRateFunction1Dict(
     return Function1::coded(std::move(spec));
 }
 
+// A PatchFunction1 given as a dictionary, `{ type <t>; ... }`. Reads the WHOLE dictionary balanced and
+// returns its `type`; for `type expression` (OF PatchFunction1Types::PatchExprField, PatchFunction1-
+// Expression.C:45-57 and exprDriver::readDict) it fills the spec: `expression` (a #{ #} verbatim block
+// or a quoted string), `variables` (a list of strings), and the `functions<scalar>`/`functions<vector>`
+// sub-dictionaries -- their entry names, so a reference is refused by name, and their tokens, so the
+// writer can echo them. The expression driver's own `debug*` switches are accepted and ignored (they
+// only change what OpenFOAM prints); every other key is refused by name, because OpenFOAM would have
+// read it as something (`searchFiles`, `lookuptables`, ...) and brae would not.
+inline PatchExprSpec readPatchFunction1Dict(
+    TokenStream&       ts,
+    const std::string& key,
+    const std::string& patchName,
+    const std::string& path,
+    std::string&       type)
+{
+    PatchExprSpec spec;
+    spec.origin = path + ": patch '" + patchName + "', " + key;
+    type.clear();
+    while (ts.peek() != "}")
+    {
+        const std::string k = ts.next();
+        if (k == "type")
+        {
+            type = ts.next();
+            ts.expect(";");
+        }
+        else if (k == "expression")
+        {
+            const std::string tok = ts.next();
+            if (!ts.verbatim(tok, spec.expression)) spec.expression = tok;
+            ts.expect(";");
+        }
+        else if (k == "variables")
+        {
+            // `( "a = 1" "b = ..." )`; the tokenizer hands each quoted string back as one token.
+            // OpenFOAM also accepts a single string here (readVariableStrings); both forms are read.
+            const std::string open = ts.next();
+            if (open == "(")
+            {
+                while (ts.peek() != ")") spec.variables.push_back(ts.next());
+                ts.expect(")");
+            }
+            else
+            {
+                spec.variables.push_back(open);
+            }
+            ts.expect(";");
+        }
+        else if (k == "functions<scalar>" || k == "functions<vector>")
+        {
+            PatchExprSpec::FunctionDict fd;
+            fd.key = k;
+            ts.expect("{");
+            int depth = 1;
+            bool atEntryStart = true;   // depth-1 token that opens an entry is a name
+            std::string pending;
+            while (depth > 0)
+            {
+                const std::string t = ts.next();
+                if (t == "{")
+                {
+                    if (depth == 1 && !pending.empty()) fd.names.push_back(pending);
+                    ++depth;
+                    atEntryStart = false;
+                }
+                else if (t == "}")
+                {
+                    --depth;
+                    if (depth == 1) atEntryStart = true;
+                    if (depth == 0) break;
+                }
+                else if (t == ";")
+                {
+                    if (depth == 1) atEntryStart = true;
+                }
+                else if (depth == 1 && atEntryStart)
+                {
+                    pending = t;
+                    atEntryStart = false;
+                }
+                fd.tokens.push_back(t);
+            }
+            spec.functionDicts.push_back(std::move(fd));
+        }
+        else if (k == "debug" || k == "debug.driver" || k == "debug.parser" || k == "debug.scanner")
+        {
+            skipToSemicolon(ts);
+            if (ts.peek() == ";") ts.next();
+        }
+        else
+        {
+            throw std::runtime_error(
+                "brae: " + spec.origin + ": the PatchFunction1 dictionary carries `" + k + "`, which brae's "
+                "`expression` reader does not carry (it reads type, expression, variables, "
+                "functions<scalar>, functions<vector> and the debug switches). Refusing rather than "
+                "reading past it.");
+        }
+    }
+    ts.expect("}");
+    return spec;
+}
+
 template <typename T>
 inline FieldData<T> readField(const std::string& path)
 {
@@ -952,25 +1061,36 @@ inline FieldData<T> readField(const std::string& path)
                             p.hasUniformFn1 = true;
                             p.uniformFn1Value = p.uniformValue;
                         }
-                        else   // table / polynomial / coded / expression: skip the entry, then REFUSE.
+                        else if (m == "{")
+                        {
+                            // A PatchFunction1 DICTIONARY: `{ type expression; ... }` is read for real
+                            // (readPatchFunction1Dict); any other type inside is named in
+                            // unsupportedFunction1 and refused at construction -- "a dictionary" is a
+                            // much worse error message than "table".
+                            std::string type;
+                            PatchExprSpec spec = readPatchFunction1Dict(ts, key, p.name, path, type);
+                            if (type == "expression")
+                            {
+                                p.patchExpr    = std::move(spec);
+                                p.hasPatchExpr = true;
+                            }
+                            else
+                            {
+                                p.unsupportedFunction1 = type.empty() ? std::string("a dictionary with no type") : type;
+                            }
+                            // A dictionary value has no trailing ';' in OpenFOAM's syntax, but the tutorial
+                            // form `uniformValue { ... }` may be followed by one in a hand-written file.
+                            if (ts.peek() == ";") ts.next();
+                            continue;
+                        }
+                        else   // table / polynomial / coded / csvFile ...: skip the entry, then REFUSE.
                         {
                             // Relying on "dispatch throws when there is no value" is not enough: a case
                             // that overrides an earlier `type fixedValue; value uniform X;` still has
                             // hasValue == true, so the Function1 silently degrades to the constant X.
-                            // squareBendLiq does exactly that (T walls: expression, stale value 350).
-                            // A dict form ({ type expression; ... }) names its Function1 inside, so peek
-                            // the `type` keyword -- "a dictionary" is a much worse error message than
-                            // "expression".
+                            // squareBendLiq's T walls have exactly that shape (a `value uniform 350`
+                            // under an overriding uniformFixedValue); its `expression` is read above.
                             p.unsupportedFunction1 = m;
-                            if (m == "{")
-                            {
-                                const std::string t1 = ts.peek();
-                                if (t1 == "type")
-                                {
-                                    ts.next();
-                                    p.unsupportedFunction1 = ts.peek();
-                                }
-                            }
                             skipToSemicolon(ts, m == "(" ? 1 : 0);
                         }
                         ts.expect(";");

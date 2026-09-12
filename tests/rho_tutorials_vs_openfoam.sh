@@ -4,19 +4,23 @@
 # OWN Allrun.pre (or blockMesh where it has none), so what runs here is the case OpenFOAM distributes and
 # not a fixture trimmed to suit.
 #
-# THE TWO HALVES ARE EACH OTHER'S CONTROL, which is the whole point of running all six in one gate:
-#   * four RUN, and are held against real OpenFOAM iteration by iteration. A brae that started refusing
-#     them -- a new guard drawn too wide -- turns this red.
-#   * two REFUSE, and must refuse BY NAME. A brae that started RUNNING them would be running a case whose
-#     scheme or boundary condition it does not implement, silently substituting something else, and that
-#     turns this red too. Without the running half, a brae that refused everything would pass the refusal
-#     half; without the refusal half, a brae that ran everything regardless would pass the running half.
+# ALL SIX RUN on both arms and are held against real OpenFOAM iteration by iteration. A brae that started
+# refusing one -- a new guard drawn too wide -- turns this red. The other half of that control, a brae
+# that started RUNNING a scheme or boundary condition it does not implement by silently substituting
+# something else, is no longer carried here: the last refused tutorial (squareBendLiq, its T walls'
+# `expression` PatchFunction1) was ported, and the refusals by name now live in the dedicated gates that
+# port each feature (rho_patch_expression, rho_coded_function1, turb_limitedlinear, eeqn_limitedlinear,
+# laminar_model, ...), each with the running case as its control. The refuses() helper below stays for
+# the next tutorial OpenFOAM ships that brae does not run.
 #
 # BOUNDS, all measured, per case, and each the worst field over iterations 1-3 unless noted:
 #   aerofoilNACA0012          host 2.8e-12   CUDA 2.8e-12
 #   angledDuctExplicitFixed   host 1.6e-10   CUDA 1.2e-10
 #   squareBend                host 5.5e-10   CUDA 6.6e-11
 #   squareBendLiqNoNewtonian  ITERATION 1 ONLY, host 5.8e-13, CUDA 5.5e-13
+#   squareBendLiq             host 1.9e-12   CUDA 1.9e-12   (its T walls are the `expression`
+#                             PatchFunction1, evaluated on both arms; the wall values themselves are
+#                             gated by tests/rho_patch_expression_vs_openfoam.sh at 1e-12)
 # tests/rho_aerofoil_vs_openfoam.sh is the deep gate on that tutorial and carries the three device defects
 # it found and closed; this one asserts the coarser property -- it still runs, and still agrees.
 #
@@ -286,9 +290,7 @@ runs aerofoilNACA0012        aerofoilNACA0012             1e-11 1e-11 "$ITERS"
 runs angledDuctExplicitFixedCoeff angledDuctExplicitFixedCoeff 1e-09 1e-09 "$ITERS"
 runs squareBend              squareBend                   5e-09 5e-09 "$ITERS"
 runs squareBendLiqNoNewtonian squareBendLiqNoNewtonian     1e-11 1e-11 1
-refuses squareBendLiq        squareBendLiq \
-        "uniformFixedValue with a non-constant uniformValue" \
-        "the expression PatchFunction1 on its T walls"
+runs squareBendLiq           squareBendLiq                1e-11 1e-11 "$ITERS"
 # gasMixing/injectorPipe: iteration 1 ONLY, like squareBendLiqNoNewtonian and for the same reason -- from
 # rest k is `uniform 6`, epsilon `uniform 100` and T uniform, every limitedLinear limiter sits in NVDTVD's
 # 0/0 branch, and the codes part at iteration 2 (T 9.85e-05, k 9.6e-06) on the sign of round-off. Iteration

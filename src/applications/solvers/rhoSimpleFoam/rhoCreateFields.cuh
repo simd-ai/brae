@@ -128,6 +128,8 @@ struct RhoDeviceFields
     // (divisor gSum(magSf)). OpenFOAM recomputes both every updateCoeffs; keying the mask on
     // bcCategory()==9 built none for the volumetric form and left it frozen at 0/U's seed.
     std::vector<int>                  frIsMass;
+    // The `expression` PatchFunction1s on T, one binding per patch that carries one (RhoStepInput::tExpr).
+    std::vector<PatchExprBinding>     tExpr;
     DeviceBuffer<scalar>              frNx, frNy, frNz;   // boundary-face normals, all faces
 
     bool turbulent = false;

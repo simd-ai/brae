@@ -246,6 +246,8 @@ RhoStepInput buildDeviceStepInput(
     in.frNx     = &dev.frNx;
     in.frNy     = &dev.frNy;
     in.frNz     = &dev.frNz;
+    in.tExpr    = &dev.tExpr;
+    in.heName   = hf.heName;
 
     in.relaxEquationU  = hin.relaxEquationU;   in.relaxU  = hin.relaxU;
     in.relaxEquationHe = hin.relaxEquationHe;  in.relaxHe = hin.relaxHe;
@@ -1004,6 +1006,10 @@ int runMirrorCuda(const std::string& caseDir)
         // `coded` Function1 moves with t, and the step reads frMdot at both of its flow-rate updates.
         for (std::size_t k = 0; k < dev.frPatch.size(); ++k)
             dev.frMdot[k] = hf.U.boundary[dev.frPatch[k]]->flowRateAt(time.timeValue());
+        // ...and the time an `expression` PatchFunction1 on T reads (time(), deltaT()), the same
+        // Time::value() the host reference hands its StepInput.
+        gin.time   = time.timeValue();
+        gin.deltaT = time.deltaT();
         Residuals r = rhoSimpleStep(dev.f, w, dev.dm, dev.dbU, dev.dbP, dev.dbHe, dev.dbT, gin);
         // THE CLOSURE'S RESIDUALS, which the step cannot return: its turbulence hook is a
         // std::function<void()>, so k and epsilon never reached `r` and the two residualControl

@@ -2,6 +2,7 @@
 #include "limit_temperature_report.cuh"   // OF reports LimitedCells on every call
 #include "rhoSimpleFoam.cuh"
 #include "rhoThermoDevice.cuh"   // updateEnergyBoundaryCoeffs: the energy conditions, live
+#include "fv_patch.cuh"          // PatchExprBinding::fvp: faceCells and deltaCoeffs for the expression
 #include "liquid_thermo.cuh"     // thermoHeOf: limitTemperature and fixedTemperatureConstraint per cell
 #include "device_fvoptions.cuh"
 #include <string>   // deviceSetValues: fvOptions.constrain(EEqn)
@@ -515,6 +516,153 @@ void rhoPhaseTimeReport(int iterations)
                 g_tUsol, 1e3 * g_tUsol / n, g_tEsol, 1e3 * g_tEsol / n, g_tPsol, 1e3 * g_tPsol / n);
 }
 
+namespace {
+
+// The object registry an `expression` PatchFunction1 reads, on the device arm: the solver's device
+// fields by the names OpenFOAM registers them under, downloaded on demand and gathered at the patch's
+// face cells. The patch VALUE is the flat boundary array (TBnd for T), the same array deviceBCValue
+// writes -- OpenFOAM's boundaryField()[patch]. snGrad(x) is carried for the patch's OWN field only, where
+// the patch is a fixedValue and OpenFOAM's virtual is deltaCoeffs*(value - patchInternalField); on any
+// other field the patch class there is not known here, and it is refused by name rather than evaluated
+// with the fixedValue formula.
+class DevicePatchExprContext : public PatchExprContext
+{
+public:
+    DevicePatchExprContext(const PatchExprBinding& b, scalar time, scalar deltaT, const RhoSolverFields& f,
+                           const std::string& heName)
+        : b_(b), time_(time), deltaT_(deltaT), f_(f)
+    {
+        reg("T", &f.T, &f.TBnd);
+        reg("p", &f.p, &f.pBnd);
+        reg("rho", &f.rho, &f.rhoBnd);
+        if (!heName.empty()) reg(heName, &f.he, &f.heBnd);
+        reg("k", &f.k, nullptr);
+        reg("epsilon", &f.epsilon, nullptr);
+        reg("nut", &f.nut, &f.nutBnd);
+        reg("alphat", &f.alphat, &f.alphatBnd);
+    }
+    scalar timeValue() const override { return time_; }
+    scalar deltaT() const override { return deltaT_; }
+    bool scalarPatchValue(const std::string& name, std::vector<scalar>& out) const override
+    {
+        const Reg* r = find(name);
+        if (!r) return false;
+        if (!r->bnd || r->bnd->size() == 0)
+            throw std::runtime_error("brae: " + b_.fn->spec().origin + ": the expression reads the patch value of `"
+                                     + name + "`, whose patch values the device arm does not keep as a flat "
+                                     "array. Refusing rather than substituting the cell values.");
+        const std::vector<scalar> all = r->bnd->host();
+        out.assign(all.begin() + b_.bndOffset, all.begin() + b_.bndOffset + b_.fvp->size);
+        return true;
+    }
+    bool scalarPatchInternal(const std::string& name, std::vector<scalar>& out) const override
+    {
+        const Reg* r = find(name);
+        if (!r) return false;
+        gather(r->cells->host(), out);
+        return true;
+    }
+    bool scalarPatchSnGrad(const std::string& name, std::vector<scalar>& out) const override
+    {
+        const Reg* r = find(name);
+        if (!r) return false;
+        if (name != "T")
+            throw std::runtime_error("brae: " + b_.fn->spec().origin + ": snGrad(" + name + ") on the CUDA arm is "
+                                     "evaluated only for the patch's own field T (a fixedValue there); on `"
+                                     + name + "` the patch class's snGrad is not known here. Refusing rather "
+                                     "than applying the fixedValue formula.");
+        std::vector<scalar> pv, pif;
+        scalarPatchValue(name, pv);
+        scalarPatchInternal(name, pif);
+        out.resize(pv.size());
+        for (std::size_t i = 0; i < out.size(); ++i) out[i] = b_.fvp->deltaCoeffs[i] * (pv[i] - pif[i]);
+        return true;
+    }
+    bool vectorPatchValue(const std::string& name, std::vector<vector>& out) const override
+    {
+        if (name != "U") return false;
+        const std::vector<scalar> x = f_.UxBnd.host(), y = f_.UyBnd.host(), z = f_.UzBnd.host();
+        out.resize(static_cast<std::size_t>(b_.fvp->size));
+        for (std::size_t i = 0; i < out.size(); ++i)
+        {
+            const std::size_t k = static_cast<std::size_t>(b_.bndOffset) + i;
+            out[i] = vector{x[k], y[k], z[k]};
+        }
+        return true;
+    }
+    bool vectorPatchInternal(const std::string& name, std::vector<vector>& out) const override
+    {
+        if (name != "U") return false;
+        const std::vector<scalar> x = f_.Ux.host(), y = f_.Uy.host(), z = f_.Uz.host();
+        out.resize(static_cast<std::size_t>(b_.fvp->size));
+        for (std::size_t i = 0; i < out.size(); ++i)
+        {
+            const std::size_t c = static_cast<std::size_t>(b_.fvp->faceCells[i]);
+            out[i] = vector{x[c], y[c], z[c]};
+        }
+        return true;
+    }
+    std::string registeredNames() const override
+    {
+        std::string s = "U";
+        for (const Reg& r : regs_) s += ", " + r.name;
+        return s;
+    }
+private:
+    struct Reg
+    {
+        std::string                 name;
+        const DeviceBuffer<scalar>* cells;
+        const DeviceBuffer<scalar>* bnd;
+    };
+    void reg(const std::string& name, const DeviceBuffer<scalar>* cells, const DeviceBuffer<scalar>* bnd)
+    {
+        if (cells && cells->size() > 0) regs_.push_back(Reg{name, cells, bnd});
+    }
+    const Reg* find(const std::string& name) const
+    {
+        for (const Reg& r : regs_)
+            if (r.name == name) return &r;
+        return nullptr;
+    }
+    void gather(const std::vector<scalar>& cells, std::vector<scalar>& out) const
+    {
+        out.resize(static_cast<std::size_t>(b_.fvp->size));
+        for (std::size_t i = 0; i < out.size(); ++i)
+            out[i] = cells[static_cast<std::size_t>(b_.fvp->faceCells[i])];
+    }
+    const PatchExprBinding& b_;
+    scalar                  time_;
+    scalar                  deltaT_;
+    const RhoSolverFields&  f_;
+    std::vector<Reg>        regs_;
+};
+
+// uniformFixedValue::updateCoeffs for every `expression` patch on T: value(t) on the host, operator==
+// into the device patch's refValue slice.
+void evaluatePatchExpressions(
+    const std::vector<PatchExprBinding>& bindings,
+    scalar                               time,
+    scalar                               deltaT,
+    const RhoSolverFields&               f,
+    const std::string&                   heName,
+    DeviceBoundary&                      dbT)
+{
+    for (const PatchExprBinding& b : bindings)
+    {
+        if (!b.fn || !b.fvp || b.fvp->size == 0) continue;
+        DevicePatchExprContext ctx(b, time, deltaT, f, heName);
+        const std::vector<scalar> v = b.fn->value(time, ctx, b.fvp->size);
+        if (static_cast<std::size_t>(b.bndOffset + b.fvp->size) > dbT.refValue.size())
+            throw std::runtime_error("brae: the expression patch's faces fall outside the device boundary arrays.");
+        cudaCheck(cudaMemcpy(dbT.refValue.data() + b.bndOffset, v.data(),
+                             v.size() * sizeof(scalar), cudaMemcpyHostToDevice),
+                  "patch expression refValue H2D");
+    }
+}
+
+} // namespace
+
 Residuals rhoSimpleStep(
     RhoSolverFields&            f,
     RhoSolverWorkspace&         w,
@@ -843,6 +991,14 @@ Residuals rhoSimpleStep(
         // The ONLY evaluate T's boundary gets in an iteration: thermo.correct() keeps it on fixesValue
         // faces and inverts he_b on the rest (rhoThermoDevice.cu), so the outlet T_b -- and the rho_b,
         // mu_b, alphaEff_b built from it -- lag the cells by one iteration exactly as OpenFOAM's do.
+        //
+        // uniformFixedValue::updateCoeffs first, where T's patch is one with an `expression` uniformValue:
+        // the expression over the fields AS THEY STAND HERE (U after the momentum solve, T's cells and T's
+        // own patch value from the previous iteration), evaluated on the host from the cells this patch
+        // touches and pushed into the device patch's refValue -- OpenFOAM's operator==. deviceBCValue
+        // below then exposes it as the patch value, as the evaluate() in Tw.evaluate() does.
+        if (in.tExpr && !in.tExpr->empty())
+            evaluatePatchExpressions(*in.tExpr, in.time, in.deltaT, f, in.heName, dbT);
         deviceBCValue(dbT, f.T, f.TBnd);
         // ...and the rest of every energy condition's updateCoeffs: he's own coefficients, rebuilt from
         // the p and T that stand now -- rhoThermoDevice.cu's updateEnergyBoundaryCoeffs, the twin of the

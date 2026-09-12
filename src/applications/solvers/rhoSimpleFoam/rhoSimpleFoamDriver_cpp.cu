@@ -735,6 +735,7 @@ int runMirror(const std::string& caseDir)
         // The iteration's time value, already advanced by loop() as OpenFOAM's is when the body runs:
         // what a time-dependent boundary Function1 is evaluated at.
         in.time = time.timeValue();
+        in.deltaT = time.deltaT();
         in.firstIteration = (nStepsThisProcess++ == 0);
         const Residuals r = rhoSimpleStep(f, in, m, g, patches);
 

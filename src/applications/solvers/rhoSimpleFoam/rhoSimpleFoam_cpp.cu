@@ -4,6 +4,7 @@
 #include "rhoSimpleFoam_cpp.cuh"
 #include "liquid_thermo.cuh"   // thermo*Of: ONE branch point between the gas and liquid properties
 #include "energy_boundary.cuh"   // fixedEnergy/gradientEnergy/mixedEnergy updateCoeffs, live
+#include "patchExprFunction1.cuh"   // the `expression` PatchFunction1 on T, evaluated at that updateCoeffs
 #include "kOmegaSST_cpp.cuh"
 #include "cell_wall_dist.cuh"
 #include "fv_matrix_ops.cuh"
@@ -23,6 +24,89 @@
 namespace brae {
 namespace cpu {
 namespace rhoSimple {
+
+namespace {
+
+// The object registry an `expression` PatchFunction1 reads (patchExprDriverTemplates.C getField /
+// patchInternalField / patchNormalField), for one patch of one evaluation: the solver's fields by the
+// names OpenFOAM registers them under. snGrad(x) is the patch class's own virtual, as OpenFOAM's
+// boundaryField()[patch].snGrad() is -- deltaCoeffs*(value - patchInternalField) on a fixedValue T.
+class HostPatchExprContext : public PatchExprContext
+{
+public:
+    HostPatchExprContext(const RhoSimpleFields& f, std::size_t patch, scalar time, scalar deltaT)
+        : f_(f), pi_(patch), time_(time), deltaT_(deltaT)
+    {
+        reg("T", f.T);
+        reg("p", f.p);
+        reg("rho", f.rho);
+        reg(f.heName, f.he);
+        reg("k", f.k);
+        reg("epsilon", f.epsilon);
+        reg("omega", f.omega);
+        reg("nut", f.nut);
+        reg("alphat", f.alphat);
+    }
+    scalar timeValue() const override { return time_; }
+    scalar deltaT() const override { return deltaT_; }
+    bool scalarPatchValue(const std::string& name, std::vector<scalar>& out) const override
+    {
+        const GeometricField<scalar>* g = find(name);
+        if (!g) return false;
+        out = g->boundary[pi_]->value();
+        return true;
+    }
+    bool scalarPatchInternal(const std::string& name, std::vector<scalar>& out) const override
+    {
+        const GeometricField<scalar>* g = find(name);
+        if (!g) return false;
+        out = g->boundary[pi_]->patchInternalField(g->internal);
+        return true;
+    }
+    bool scalarPatchSnGrad(const std::string& name, std::vector<scalar>& out) const override
+    {
+        const GeometricField<scalar>* g = find(name);
+        if (!g) return false;
+        out = g->boundary[pi_]->snGrad(g->internal);
+        return true;
+    }
+    bool vectorPatchValue(const std::string& name, std::vector<vector>& out) const override
+    {
+        if (name != "U" || f_.U.internal.empty()) return false;
+        out = f_.U.boundary[pi_]->value();
+        return true;
+    }
+    bool vectorPatchInternal(const std::string& name, std::vector<vector>& out) const override
+    {
+        if (name != "U" || f_.U.internal.empty()) return false;
+        out = f_.U.boundary[pi_]->patchInternalField(f_.U.internal);
+        return true;
+    }
+    std::string registeredNames() const override
+    {
+        std::string s = "U";
+        for (const auto& [n, g] : scalars_) s += ", " + n;
+        return s;
+    }
+private:
+    void reg(const std::string& name, const GeometricField<scalar>& g)
+    {
+        if (!name.empty() && !g.internal.empty() && g.boundary.size() > pi_) scalars_.emplace_back(name, &g);
+    }
+    const GeometricField<scalar>* find(const std::string& name) const
+    {
+        for (const auto& [n, g] : scalars_)
+            if (n == name) return g;
+        return nullptr;
+    }
+    const RhoSimpleFields& f_;
+    std::size_t            pi_;
+    scalar                 time_;
+    scalar                 deltaT_;
+    std::vector<std::pair<std::string, const GeometricField<scalar>*>> scalars_;
+};
+
+} // namespace
 
 // OpenFOAM raises a FatalError when its he -> T inversion runs out of iterations
 // (species::thermo<>::T, thermoI.H:80-87). h2oEnergyToT is BRAE_HD and cannot throw, so it reports
@@ -671,6 +755,20 @@ Residuals rhoSimpleStep(
         // they stand at the energy assembly (fixedEnergy .C:108, gradientEnergy .C:109, mixedEnergy .C:97)
         // and builds its refValue/refGrad/value from that T. This is the ONLY evaluate T's boundary
         // gets in an iteration; thermo.correct() below then keeps it on fixesValue patches.
+        //
+        // uniformFixedValue::updateCoeffs first, where T's patch is one: operator==(refValueFunc_->value(t))
+        // (uniformFixedValueFvPatchField.C), and for an `expression` PatchFunction1 that value is the
+        // expression over the fields AS THEY STAND HERE -- U after the momentum solve, T's cells and T's
+        // own patch value from the previous iteration (PatchFunction1Expression.C:93-105, the driver's
+        // getField reading boundaryField()[patch]). Exactly one evaluation per iteration: the fvMatrix
+        // constructor of the first fvm:: term calls updateCoeffs, the later ones find updated(), and the
+        // solve's correctBoundaryConditions clears the flag.
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (!f.T.boundary[pi]->patchExpression()) continue;
+            HostPatchExprContext ctx(f, pi, in.time, in.deltaT);
+            f.T.boundary[pi]->updateFromPatchExpression(ctx, in.time);
+        }
         f.T.evaluateBoundary();
         // ...and the rest of every energy condition's updateCoeffs: he's own boundary coefficients,
         // rebuilt from the p and T that stand right now (energy_boundary.cuh carries the three OF

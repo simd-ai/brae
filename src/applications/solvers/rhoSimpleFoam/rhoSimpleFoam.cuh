@@ -68,7 +68,9 @@
 #include "rhoPEqn.cuh"
 #include "rhoPcEqn.cuh"
 #include "device_fvoptions.cuh"   // DevicePorosity
+#include "patchExprFunction1.cuh"   // PatchExprFunction1: the `expression` PatchFunction1 on T
 #include <functional>
+#include <limits>
 #include <map>
 #include <string>
 #include <vector>
@@ -119,6 +121,16 @@ struct RhoSolverFields
 
     // fvc::domainIntegrate(psi*p) at the start of the run, for the closed-volume correction.
     double initialMass = 0.0;
+};
+
+// One `expression` PatchFunction1 on the device arm: the host patch that owns it, the fvPatch (face
+// cells, deltaCoeffs), and where that patch's faces start in the flat boundary arrays.
+struct PatchExprBinding
+{
+    std::size_t               patch     = 0;
+    label                     bndOffset = 0;
+    const FvPatch*            fvp       = nullptr;
+    const PatchExprFunction1* fn        = nullptr;
 };
 
 struct RhoStepInput
@@ -339,6 +351,15 @@ struct RhoStepInput
     const DeviceBuffer<scalar>*              frNx    = nullptr;
     const DeviceBuffer<scalar>*              frNy    = nullptr;
     const DeviceBuffer<scalar>*              frNz    = nullptr;
+    // uniformFixedValue `expression` PatchFunction1s on T's patches. The device patch is a pre-baked
+    // snapshot, so the expression is evaluated on the HOST at the energy assembly, over the cells this
+    // patch touches as they stand then, and the result pushed into dbT's refValue where OpenFOAM's
+    // updateCoeffs assigns it (evaluatePatchExpressions, rhoSimpleFoam.cu). time/deltaT are what its
+    // time() and deltaT() read -- Time::value(), Time::deltaTValue(); NaN refuses.
+    const std::vector<PatchExprBinding>*     tExpr   = nullptr;
+    std::string                              heName;   // "h" or "e": what the expression finds he under
+    scalar                                   time    = std::numeric_limits<scalar>::quiet_NaN();
+    scalar                                   deltaT  = std::numeric_limits<scalar>::quiet_NaN();
 
     // --- refusals, each thrown by the component that owns the term ---
     bool hasMRF = false, hasFvOptions = false, hasCoupledPatches = false;

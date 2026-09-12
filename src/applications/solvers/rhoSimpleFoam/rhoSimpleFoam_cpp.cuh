@@ -85,6 +85,9 @@ struct StepInput
     // Function1s that depend on time (a `coded` flow rate) are evaluated at, at every updateCoeffs. The
     // driver sets it each iteration; NaN (a harness that has no Time) makes such a Function1 refuse.
     scalar time = std::numeric_limits<scalar>::quiet_NaN();
+    // Time::deltaTValue(), what an `expression` PatchFunction1's deltaT() reads (exprDriver.C:282-294).
+    // NaN makes such an expression refuse rather than assume the steady case's 1.
+    scalar deltaT = std::numeric_limits<scalar>::quiet_NaN();
 
     // --- algorithm ---
     bool consistent = false;   // simple.consistent() -> pcEqn.H rather than pEqn.H

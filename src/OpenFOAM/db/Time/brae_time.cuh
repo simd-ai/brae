@@ -39,6 +39,7 @@
 #include "write_control.cuh"
 #include "start_time.cuh"   // OF Time::setControls() startFrom (Time.C:149)   // OF writeControl/writeInterval cadence, which Time owns   // noticeIgnored: the established "never drop an input silently" channel
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
@@ -281,6 +282,9 @@ public:
 
     int    timeIndex() const { return iter_; }
     scalar timeValue() const { return wc_ ? wc_->timeValue(iter_) : scalar(iter_); }
+    // OF Time::deltaTValue(): the controlDict's deltaT, what an expression's deltaT() reads. NaN without a
+    // WriteControl, so a consumer that needs it refuses rather than assuming 1.
+    scalar deltaT() const { return wc_ ? wc_->deltaT() : std::numeric_limits<scalar>::quiet_NaN(); }
     std::string timeName() const { return WriteControl::timeName(timeValue()); }
 
     // OF runTime.write(): true when this step is a write time. functionObjects_.write() fires here and

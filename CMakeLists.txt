@@ -69,6 +69,7 @@ add_library(brae_core STATIC
     src/OpenFOAM/meshes/interface/processor_interface.cu
     src/OpenFOAM/db/foam_token_reader.cu
     src/OpenFOAM/primitives/functions/Function1/Coded/codedFunction1.cu
+    src/finiteVolume/expressions/PatchFunction1/patchExprFunction1.cu
     src/OpenFOAM/meshes/primitive_mesh.cu
     src/finiteVolume/fvMesh/fv_geometry.cu
     src/finiteVolume/fvMesh/fv_patch.cu
@@ -338,6 +339,15 @@ add_executable(test_coded_function1 tests/test_coded_function1.cu)
 target_include_directories(test_coded_function1 PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_coded_function1 PRIVATE brae_core)
 add_test(NAME coded_function1 COMMAND test_coded_function1)
+
+# OpenFOAM's `type expression;` PatchFunction1 evaluator, host side, without OpenFOAM: the grammar's
+# precedence and associativity, the field lookups in OpenFOAM's order, Foam::max's NaN side, mag() of a
+# vector, and every token outside the carried subset refused by name. The OpenFOAM oracle is
+# rho_patch_expression_vs_openfoam, which exits 77 where OpenFOAM is not installed.
+add_executable(test_patch_expr tests/test_patch_expr.cu)
+target_include_directories(test_patch_expr PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_patch_expr PRIVATE brae_core)
+add_test(NAME patch_expr COMMAND test_patch_expr)
 
 add_executable(test_forces tests/test_forces.cu)
 target_include_directories(test_forces PRIVATE ${BRAE_HEADER_DIRS})
@@ -2481,11 +2491,11 @@ add_test(NAME rho_gasmixing_vs_openfoam
 set_tests_properties(rho_gasmixing_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600 LABELS slow)
 
 # THE SIX rhoSimpleFoam TUTORIALS as OpenFOAM ships them, on both mirror arms, meshed by each tutorial's
-# own Allrun.pre -- the standing answer to which of them brae runs and which it refuses. The two halves
-# are each other's control: four must RUN and agree with OpenFOAM (a guard drawn too wide turns it red),
-# two must REFUSE BY NAME (a brae that started running a scheme or boundary condition it does not
-# implement turns it red). Breadth, not depth: three iterations, with the per-component depth left to the
-# dedicated gates. Slow -- it meshes snappyHexMesh's injectorPipe -- and labelled so.
+# own Allrun.pre -- the standing answer to which of them brae runs. All six RUN on both arms and agree
+# with OpenFOAM (a guard drawn too wide turns it red); the refusals by name live in the per-feature gates
+# since the last refused tutorial, squareBendLiq's `expression` T walls, was ported. Breadth, not depth:
+# three iterations, with the per-component depth left to the dedicated gates. Slow -- it meshes
+# snappyHexMesh's injectorPipe -- and labelled so.
 add_test(NAME rho_tutorials_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_tutorials_vs_openfoam.sh)
 set_tests_properties(rho_tutorials_vs_openfoam PROPERTIES
@@ -2515,6 +2525,15 @@ set_tests_properties(rho_aerofoil_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIM
 add_test(NAME rho_coded_function1_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_coded_function1_vs_openfoam.sh)
 set_tests_properties(rho_coded_function1_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# squareBendLiq's T walls -- OpenFOAM's `type expression;` PatchFunction1 -- on both rhoSimpleFoam mirror
+# arms against real OpenFOAM's WRITTEN wall values, iteration by iteration, with the cells alongside.
+# Carries the constant-wall control that the comparison must reject, the writer round trip OpenFOAM
+# restarts from, and the refusals by name (an unsupported function, a functions<> reference, an
+# unregistered field, the expression on U and on p, the entry-less form).
+add_test(NAME rho_patch_expression_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_patch_expression_vs_openfoam.sh)
+set_tests_properties(rho_patch_expression_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
 # rhoSimpleFoam's UEqn.H against OpenFOAM's own assembled momentum matrix (tools/dumpPEqn stage harness:
 # rAU, internalCoeffs, boundaryCoeffs). OpenFOAM's muEff is injected so this measures the ASSEMBLY and not

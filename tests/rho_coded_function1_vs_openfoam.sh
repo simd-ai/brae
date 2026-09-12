@@ -5,9 +5,10 @@
 # WHAT RUNS VERBATIM: the tutorial's inlet, `massFlowRate { type coded; name liquidIn; code #{ static bool
 # reported(false); if (!reported) { Info<< "Using coded value for massFlowRate" << nl; reported = true; }
 # return 5; #}; }`. OpenFOAM compiles it with wmake and dlopens it; brae compiles it with the host C++
-# compiler against its Foam shim and dlopens it (codedFunction1.cuh). What is still REPLACED: the T walls'
-# `expression` PatchFunction1 overlay, by the `fixedValue uniform 350` the file states first -- that is a
-# different, unported feature, and it stays refused by name on the unmodified tutorial.
+# compiler against its Foam shim and dlopens it (codedFunction1.cuh). What is REPLACED here: the T walls'
+# `expression` PatchFunction1 overlay, by the `fixedValue uniform 350` the file states first -- a different
+# feature with its own gate (tests/rho_patch_expression_vs_openfoam.sh runs the unmodified tutorial on both
+# arms); replacing it keeps this gate about the coded inlet alone.
 #
 # WHY A SECOND SNIPPET. The tutorial's body returns 5 for every x, which is numerically identical to
 # `constant 5`: a brae that froze the time, or evaluated the code once, or never fed x at all would pass

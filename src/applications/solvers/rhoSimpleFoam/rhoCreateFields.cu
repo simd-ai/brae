@@ -229,6 +229,28 @@ RhoDeviceFields createDeviceFields(
         }
     }
 
+    // ---- the `expression` PatchFunction1s on T --------------------------------------------------
+    // Bound to the host patch that parsed them; the step evaluates them on the host at the energy
+    // assembly and pushes the result into dbT (RhoStepInput::tExpr). The offset is the patch's first face
+    // in the flat boundary arrays, which run over the non-coupled patches in mesh order (the coupled
+    // ones are refused on this arm).
+    {
+        label off = 0;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (const PatchExprFunction1* fn = hf.T.boundary[pi]->patchExpression())
+            {
+                PatchExprBinding b;
+                b.patch     = pi;
+                b.bndOffset = off;
+                b.fvp       = &patches[pi];
+                b.fn        = fn;
+                d.tExpr.push_back(b);
+            }
+            if (!isCoupledInterfaceType(patches[pi].type)) off += patches[pi].size;
+        }
+    }
+
     // ---- the solution state ------------------------------------------------------------------
     {
         std::vector<scalar> ux(nC), uy(nC), uz(nC);

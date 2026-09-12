@@ -648,7 +648,19 @@ RhoSimpleFields createFields(
             const PatchFieldData<scalar>& tb = *tbp;
             PatchFieldData<scalar> b = tb;          // type and structure carried over
             b.name = patches[pi].name;              // the PATCH's name, so buildField resolves it directly
+            if (tb.type == "uniformFixedValue")
+            {
+                // heBoundaryTypes dispatches on the CLASS (isA<fixedValueFvPatchScalarField>, basicThermo.C:
+                // 203), and uniformFixedValue is one: he gets fixedEnergy, seeded from T's `value` exactly
+                // as from a fixedValue's. The uniformValue -- a constant or an `expression` -- belongs to
+                // T alone; its result reaches he through updateEnergyBoundaryCoeffs at every assembly.
+                b.type          = "fixedValue";
+                b.hasUniformFn1 = false;
+                b.hasPatchExpr  = false;
+                b.patchExpr     = PatchExprSpec{};
+            }
             if (tb.type != "fixedValue" && tb.type != "zeroGradient" && tb.type != "inletOutlet"
+                && tb.type != "uniformFixedValue"
                 && tb.type != "fixedGradient" && tb.type != "mixed"
                 && tb.type != "calculated" && tb.type != "empty" && tb.type != "symmetry"
                 && tb.type != "symmetryPlane" && tb.type != "wedge" && tb.type != "slip")
@@ -1117,6 +1129,33 @@ RhoSimpleFields createFields(
         f.rhoThermoBnd[pi] = f.rho.boundary[pi]->value();
 
     for (label c = 0; c < nC; ++c) f.initialMass += f.rho.internal[c] * g.V()[c];
+
+    // An `expression` PatchFunction1 is evaluated by the step on T ALONE, inside the energy conditions'
+    // updateCoeffs where OpenFOAM's fixedEnergy evaluates T's patch. On any other field OpenFOAM evaluates
+    // it in that field's own updateCoeffs, which no brae step reproduces, and the patch would stay at its
+    // `value` for the whole run -- a converged answer under a frozen boundary. Refused by name. U is
+    // refused earlier still, by the factory (the evaluator carries vectors no further than mag()).
+    auto refuseExpressionOn = [&](const GeometricField<scalar>& fld, const std::string& nm)
+    {
+        for (std::size_t pi = 0; pi < fld.boundary.size(); ++pi)
+        {
+            if (!fld.boundary[pi]->patchExpression()) continue;
+            throw std::runtime_error(
+                "brae: " + nm + " on patch '" + patches[pi].name + "' has a uniformFixedValue `expression`. "
+                "brae evaluates that PatchFunction1 only on T, at the energy assembly where OpenFOAM's "
+                "fixedEnergy::updateCoeffs evaluates T's patch; on " + nm + " OpenFOAM evaluates it in " + nm
+                + "'s own updateCoeffs, which no brae step reproduces. Refusing rather than running the "
+                "patch frozen at its `value`.");
+        }
+    };
+    refuseExpressionOn(f.p, "p");
+    refuseExpressionOn(f.rho, "rho");
+    refuseExpressionOn(f.he, f.heName);
+    refuseExpressionOn(f.k, "k");
+    refuseExpressionOn(f.epsilon, "epsilon");
+    refuseExpressionOn(f.omega, "omega");
+    refuseExpressionOn(f.nut, "nut");
+    refuseExpressionOn(f.alphat, "alphat");
 
     return f;
 }

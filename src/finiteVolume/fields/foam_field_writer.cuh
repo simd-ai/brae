@@ -75,6 +75,49 @@ inline void writeFieldValue(
 // One boundaryField patch entry in OpenFOAM structure: type, then the value entries the reader resolved (inletValue
 // for inletOutlet/mixed, value for value-holding BCs). BCs that hold no value (zeroGradient/slip/symmetry/...) write
 // just the type, matching OpenFOAM's output.
+// The `expression` PatchFunction1 dictionary, written back as it was read: OpenFOAM's PatchExprField::
+// writeData echoes dict_ (PatchFunction1Expression.C:147), so a restart from brae's output -- by OpenFOAM
+// or by brae -- re-reads the same expression, variables and functions<> tables. The functions<> tokens
+// are re-emitted one entry per line. The tokenizer strips quotes, so a token that could only have come
+// from a quoted string -- one with whitespace, or a multi-character one holding a delimiter, like the
+// regex "(?i).*walls" -- is quoted again; the single-character delimiters `{ } ( ) ;` are the
+// tokenizer's own and are written bare. (OpenFOAM read brae's output with those quoted, at the
+// functionObjectTrigger's `{`, as "Unexpected '}' while reading dictionary entry".)
+inline void writePatchExprDict(std::ostream& os, const PatchExprSpec& e)
+{
+    auto quoteIfNeeded = [](const std::string& t)
+    {
+        const bool delimiter = t.size() == 1 && std::string("(){};").find(t[0]) != std::string::npos;
+        const bool needs = t.empty()
+                        || (!delimiter && t.find_first_of(" \t\r\n(){};\"$#") != std::string::npos);
+        return needs ? "\"" + t + "\"" : t;
+    };
+    os << "        uniformValue\n        {\n            type            expression;\n";
+    for (const PatchExprSpec::FunctionDict& fd : e.functionDicts)
+    {
+        os << "            " << fd.key << "\n            {\n";
+        int depth = 1;
+        bool lineStart = true;
+        for (const std::string& t : fd.tokens)
+        {
+            if (t == "}") --depth;
+            if (lineStart) os << std::string(static_cast<std::size_t>(12 + 4 * depth), ' ');
+            else           os << ' ';
+            os << quoteIfNeeded(t);
+            lineStart = (t == ";" || t == "{" || t == "}");
+            if (lineStart) os << '\n';
+            if (t == "{") ++depth;
+        }
+        if (!lineStart) os << '\n';
+        os << "            }\n";
+    }
+    os << "            variables\n            (\n";
+    for (const std::string& v : e.variables) os << "                \"" << v << "\"\n";
+    os << "            );\n"
+       << "            expression\n            #{" << e.expression << "#};\n"
+       << "        }\n";
+}
+
 template <typename T>
 inline void writePatchEntry(
     std::ostream& os,
@@ -114,6 +157,7 @@ inline void writePatchEntry(
         formatFoamValue(os, d.uniformFn1Value);
         os << ";\n";
     }
+    if (d.hasPatchExpr) writePatchExprDict(os, d.patchExpr);
     // atmBoundaryLayerInlet{Velocity,K,Epsilon,Omega}: OF builds flowDir, zDir, Uref, Zref, z0 and d as
     // Function1/PatchFunction1 and REQUIRES every one of them -- reading a field back without them aborts
     // with "Missing or invalid Function1 entry: flowDir". The tutorial keeps them in an #include that the

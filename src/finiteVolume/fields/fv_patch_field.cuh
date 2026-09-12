@@ -233,6 +233,17 @@ public:
     // ...and the rate OpenFOAM evaluates at every updateCoeffs, flowRate_->value(time), for the drivers
     // that carry the time (the rhoSimpleFoam OF-mirror arms). NaN time refuses on a time-dependent rate.
     virtual scalar flowRateAt(scalar /*time*/) const { return 0.0; }
+    // OF uniformFixedValue::updateCoeffs on a patch whose uniformValue is an `expression` PatchFunction1
+    // (uniformFixedValueFvPatchField.C updateCoeffs: operator==(refValueFunc_->value(t))): the expression
+    // is evaluated over the registered fields AS THEY STAND and the result becomes the stored value. The
+    // solver calls this where OpenFOAM's updateCoeffs runs -- for T, inside the energy conditions'
+    // updateCoeffs (energy_boundary.cuh), once per iteration -- with the context standing in for the
+    // object registry. A no-op on every other patch.
+    virtual void updateFromPatchExpression(const PatchExprContext& /*ctx*/, scalar /*arg*/) {}
+    // The expression itself: for the CUDA driver, which evaluates it on the host and pushes the result
+    // to the device patch, and for the createFields refusal on fields whose updateCoeffs no brae step
+    // reproduces. Null on every other patch.
+    virtual const PatchExprFunction1* patchExpression() const { return nullptr; }
     // Is this a flowRateInletVelocity at all, and is its rate a MASS rate? bcCategory() answers neither:
     // it reports 9 for the mass form and a plain fixedValue 1 for the volumetric one, so a driver keying
     // on 9 builds no flow-rate mask for a volumetric inlet and never updates it -- measured on a
@@ -376,6 +387,38 @@ private:
     bool           uniform_;
     T              uniformValue_;
     std::vector<T> values_;
+};
+
+// uniformFixedValue whose uniformValue is `{ type expression; ... }` (OF PatchFunction1Types::PatchExprField):
+// a fixedValue whose per-face value is re-evaluated from the registered fields at every updateCoeffs.
+// Seeded from the file's `value`, as OpenFOAM's constructor is when the entry carries one
+// (uniformFixedValueFvPatchField.C dictionary constructor: readValueEntry, else evaluate()); the factory
+// refuses the entry-less form rather than evaluating the expression at construction over fields brae
+// has not built yet. Scalar only: the evaluator carries vectors no further than mag().
+template <typename T>
+class UniformFixedValueExprPatchField : public FixedValuePatchField<T>
+{
+public:
+    UniformFixedValueExprPatchField(
+        const FvPatch& p,
+        bool uniform,
+        T uval,
+        std::vector<T> vals,
+        PatchExprSpec spec)
+        : FixedValuePatchField<T>(p, uniform, uval, std::move(vals)), fn_(std::move(spec))
+    {}
+    void updateFromPatchExpression(const PatchExprContext& ctx, scalar arg) override
+    {
+        if constexpr (std::is_same<T, scalar>::value)
+        {
+            // operator== on a fixedValue patch replaces the STORED value (setStoredValues), which the
+            // evaluate() that follows in OpenFOAM's Tw.evaluate() then exposes.
+            this->setStoredValues(fn_.value(arg, ctx, this->patch_.size));
+        }
+    }
+    const PatchExprFunction1* patchExpression() const override { return &fn_; }
+private:
+    PatchExprFunction1 fn_;
 };
 
 // totalPressure (incompressible, rho=none/psi=none): a fixedValue p whose value is recomputed each step from the patch
@@ -2031,6 +2074,27 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
             "brae: patch " + p.name + " has " + d.type + " with a non-constant Function1 entry ('"
             + d.unsupportedFunction1 + "'). brae evaluates only `constant`/`uniform` Function1 entries, "
             "so the prescribed variation would be lost. Replace it with a constant.");
+    }
+    if (d.type == "uniformFixedValue" && d.hasPatchExpr)
+    {
+        if constexpr (std::is_same<T, scalar>::value)
+        {
+            if (!d.hasValue)
+                throw std::runtime_error(
+                    "brae: patch " + p.name + " has uniformFixedValue with an `expression` uniformValue and "
+                    "no `value` entry. OpenFOAM evaluates the expression at construction there "
+                    "(uniformFixedValueFvPatchField.C: extrapolateInternal, evaluate) over fields brae has "
+                    "not built yet; refusing rather than seeding the patch with something else.");
+            return std::make_unique<UniformFixedValueExprPatchField<T>>(
+                p, d.valueUniform, d.uniformValue, d.values, d.patchExpr);
+        }
+        else
+        {
+            throw std::runtime_error(
+                "brae: patch " + p.name + " has uniformFixedValue with an `expression` uniformValue on a "
+                "non-scalar field. brae's expression evaluator carries vectors no further than mag(); "
+                "refusing rather than substituting the patch's `value` entry.");
+        }
     }
     if (d.type == "uniformFixedValue" && !d.unsupportedFunction1.empty())
     {
