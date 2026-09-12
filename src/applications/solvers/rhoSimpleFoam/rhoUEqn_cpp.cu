@@ -314,15 +314,17 @@ void addPressureGradient(
     const PrimitiveMesh&          m,
     const FvGeometry&             g,
     const std::vector<FvPatch>&   patches,
-    bool                          leastSquares)
+    bool                          leastSquares,
+    scalar                        cellLimitK)
 {
     // solve(UEqn == -fvc::grad(p)). The right-hand side of an fvMatrix equation is its source, and
     // fvc::grad returns a per-volume quantity, so the extensive form is -grad(p)*V. p is the ABSOLUTE
     // pressure here, not the kinematic p/rho the incompressible solver carries, which is why this term
     // needs no rho: it is already a force per unit volume.
     // through the case's grad(p) entry (fvcGrad.C:149): leastSquares where it says so
-    const std::vector<vector> gradP = leastSquares ? fvc::leastSquaresGrad(p, m, g, patches)
-                                                   : fvc::gaussGrad(p, m, g, patches);
+    std::vector<vector> gradP = leastSquares ? fvc::leastSquaresGrad(p, m, g, patches)
+                                             : fvc::gaussGrad(p, m, g, patches);
+    if (cellLimitK > 0.0) cellLimitGrad(gradP, p, cellLimitK, m, g, patches);
     for (label c = 0; c < m.nCells(); ++c)
     {
         UEqn.source[c].x -= gradP[c].x * g.V()[c];

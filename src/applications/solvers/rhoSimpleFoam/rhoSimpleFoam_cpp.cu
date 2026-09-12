@@ -1,4 +1,5 @@
 // _cpp REFERENCE implementation -- see rhoSimpleFoam_cpp.cuh for the OpenFOAM provenance and the order.
+#include "cellLimitedGrad_cpp.cuh"   // cpu::cellLimitGrad on grad(p) (U = HbyA - rAtU*grad(p))
 #include "limit_temperature_report.cuh"   // OF prints LimitedCells on every limitTemperature call
 #include "rhoSimpleFoam_cpp.cuh"
 #include "liquid_thermo.cuh"   // thermo*Of: ONE branch point between the gas and liquid properties
@@ -607,7 +608,7 @@ Residuals rhoSimpleStep(
         // solve(UEqn == -fvc::grad(p)) on a COPY: the pressure equation needs the ORIGINAL UEqn for
         // A(), H() and H1(), and addPressureGradient would otherwise leave the source carrying -grad(p).
         FvVectorMatrix Mp = UEqn;
-        addPressureGradient(Mp, f.p, m, g, patches, in.gradPLeastSq);
+        addPressureGradient(Mp, f.p, m, g, patches, in.gradPLeastSq, in.gradPLimitK);
         // fvMatrix<vector>::solveSegregated solves only the components polyMesh::solutionD() leaves
         // valid (fvMatrixSolve.C:157-164) -- on a 2D case the empty direction is never solved and its
         // SolverPerformance stays at Zero -- and what residualControl compares is cmptMax over the
@@ -798,6 +799,7 @@ Residuals rhoSimpleStep(
     pin.pRefValue            = f.pressureControl.refValue;
     pin.correctedLaplacian   = in.correctedLaplacian;
     pin.gradPLeastSq = in.gradPLeastSq;
+    pin.gradPLimitK  = in.gradPLimitK;
     pin.snGradLimitCoeff     = in.snGradLimitCoeff;
     pin.hasMRF               = in.hasMRF;
     pin.hasFvOptions         = in.hasFvOptions;
@@ -947,8 +949,9 @@ Residuals rhoSimpleStep(
 
     // U = HbyA - rAtU*fvc::grad(p), with rAtU on the SIMPLEC path and rAU otherwise.
     {
-        const std::vector<vector> gradP = in.gradPLeastSq ? fvc::leastSquaresGrad(f.p, m, g, patches)
-                                                          : fvc::gaussGrad(f.p, m, g, patches);
+        std::vector<vector> gradP = in.gradPLeastSq ? fvc::leastSquaresGrad(f.p, m, g, patches)
+                                                    : fvc::gaussGrad(f.p, m, g, patches);
+        if (in.gradPLimitK > 0.0) cpu::cellLimitGrad(gradP, f.p, in.gradPLimitK, m, g, patches);
         for (label c = 0; c < nC; ++c)
         {
             f.U.internal[c] = vector{ HbyA[c].x - rAUorAtU[c]*gradP[c].x,

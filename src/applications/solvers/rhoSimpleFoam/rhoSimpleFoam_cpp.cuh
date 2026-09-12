@@ -134,6 +134,10 @@ struct StepInput
     scalar    rDeltaT          = 0.0;
     bool      firstIteration   = true;
     bool      gradPLeastSq     = false;   // grad(p)'s
+    // grad(p)'s cellLimited coefficient (`grad(p) cellLimited Gauss linear <k>`, or a cellLimited
+    // default): every fvc::grad(p) and correctedSnGrad's correction take it. Parsed and applied nowhere
+    // until this -- a case naming it ran the unlimited gradient under its own scheme name.
+    scalar    gradPLimitK      = 0.0;
     // The gradient `linearUpwind <name>` / `linearUpwindV <name>` NAMES in div(phi,U) -- OpenFOAM's
     // mesh.gradScheme(<name>) (linearUpwind.C:61-68) -- which is a different lookup from grad(U)'s own
     // scheme above (divDevRhoReff's fvc::grad(U), correctedSnGrad's correction). -1 = not resolved: the

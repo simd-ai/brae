@@ -67,6 +67,7 @@ struct PressureInput
     // `HbyA -= (rAU - rAtU)*fvc::grad(p)` (pcEqn.H:30,65) and in each branch's non-orthogonal correction;
     // the velocity correction `U = HbyA - rAtU*fvc::grad(p)` (pEqn.H:86, pcEqn.H:99) is the step's own.
     bool gradPLeastSq = false;
+    scalar gradPLimitK = 0.0;   // grad(p)'s cellLimited coefficient, on every grad(p) here and in pcEqn
 
     const std::vector<scalar>*              rho    = nullptr;   // cells
     const std::vector<std::vector<scalar>>* rhoBnd = nullptr;

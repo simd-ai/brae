@@ -212,6 +212,7 @@ StepInput buildStepInput(
             const FieldGradScheme gP = parseFieldGradScheme(caseDir, "p");
             in.gradULeastSq = gU.leastSquares;
             in.gradPLeastSq = gP.leastSquares;
+            in.gradPLimitK  = gP.cellLimitK;   // applied at every grad(p) consumer, snGrad's correction included
             // ...and the limiter's own field for `Gauss limitedLinear` on a VECTOR: magSqr(U), whose
             // gradient OpenFOAM resolves under `grad(magSqr(U))` (LimitFuncs.C:34-39).
             const FieldGradScheme gM = parseFieldGradScheme(caseDir, "magSqr(U)");

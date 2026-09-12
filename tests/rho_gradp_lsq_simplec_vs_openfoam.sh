@@ -54,9 +54,10 @@ s = re.sub(r'functions\s*\{.*?\n\}', 'functions\n{\n}', s, flags=re.S); open(p, 
 p = os.path.join(d, 'system/fvSolution'); s = open(p).read()
 s = re.sub(r'\btolerance\s+[0-9.eE+-]+\s*;', 'tolerance 1e-14;', s); s = re.sub(r'\brelTol\s+[0-9.eE+-]+\s*;', 'relTol 0;', s)
 s = re.sub(r'residualControl\s*\{[^}]*\}', '', s); open(p, 'w').write(s)
-if v == 'lsq':
+if v in ('lsq', 'lim'):
     p = os.path.join(d, 'system/fvSchemes'); s = open(p).read()
-    s2, n = re.subn(r'(gradSchemes\s*\{\s*default\s+Gauss linear;)', r'\1\n    grad(p)         leastSquares;', s)
+    entry = 'leastSquares' if v == 'lsq' else 'cellLimited Gauss linear 1'
+    s2, n = re.subn(r'(gradSchemes\s*\{\s*default\s+Gauss linear;)', r'\1\n    grad(p)         ' + entry + ';', s)
     assert n == 1, 'gradSchemes default Gauss linear not found once'
     open(p, 'w').write(s2)
 PYEOF
@@ -109,6 +110,30 @@ for v in ship lsq; do
 done
 # the schemes must be distinguishable on OpenFOAM's own runs, or the lsq arm proves nothing
 compare "$W/of_ship" "$W/of_lsq" "OpenFOAM Gauss vs OpenFOAM lsq" "$DIFFER" 1 || fail=1
+
+# ---- `grad(p) cellLimited Gauss linear 1`: the limiter on every grad(p) consumer (fvcGrad.C:149 resolves
+# each fvc::grad(p) through the same entry, correctedSnGrad's correction included). Parsed and applied
+# nowhere on either arm until this: the host ran the unlimited gradient under the case's scheme name.
+# BOTH arms vs OpenFOAM. The limiter must BITE on OpenFOAM's own runs (Gauss vs cellLimited must
+# differ), or the arm is vacuous -- measured below: 5.4e-02 (k at iteration 2), which is also the
+# fail-proof, the unlimited host being 2.3e-11 of OpenFOAM's Gauss run. MEASURED after the port: host
+# 2.02e-11, CUDA 2.48e-11 (epsilon at iteration 1 either way, the shipped control's own floor).
+stage "$W/of_lim" lim; ( cd "$W/of_lim" && rhoSimpleFoam > log 2>&1 )
+[ -d "$W/of_lim/$ITERS" ] || { echo "SKIP: OpenFOAM did not reach iteration $ITERS (lim)"; tail -3 "$W/of_lim/log"; exit 77; }
+echo "== lim: grad(p) cellLimited Gauss linear 1 =="
+stage "$W/br_lim_1" lim
+if BRAE_RHOSIMPLEFOAM_MIRROR=1 "$BRAE" -case "$W/br_lim_1" > "$W/br_lim_1/log" 2>&1 && [ -d "$W/br_lim_1/$ITERS" ]; then
+    compare "$W/br_lim_1" "$W/of_lim" "host vs OpenFOAM" "$BOUND" 0 || fail=1
+else
+    echo "     host: DID NOT RUN   FAIL"; grep -v '^brae NOTICE' "$W/br_lim_1/log" | tail -3; fail=1
+fi
+stage "$W/br_lim_cuda" lim
+if BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BRAE" -case "$W/br_lim_cuda" > "$W/br_lim_cuda/log" 2>&1 && [ -d "$W/br_lim_cuda/$ITERS" ]; then
+    compare "$W/br_lim_cuda" "$W/of_lim" "CUDA vs OpenFOAM" "$BOUND" 0 || fail=1
+else
+    echo "     CUDA: DID NOT RUN   FAIL"; grep -v '^brae NOTICE' "$W/br_lim_cuda/log" | tail -3; fail=1
+fi
+compare "$W/of_ship" "$W/of_lim" "OpenFOAM Gauss vs OpenFOAM cellLimited" "$DIFFER" 1 || fail=1
 
 [ $fail = 0 ] && echo "== PASSED ==" || echo "== FAILED =="
 exit $fail

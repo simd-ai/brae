@@ -660,6 +660,7 @@ Residuals rhoSimpleStep(
         // Through the case's grad(p) entry (fvcGrad.C:149): leastSquares where it says so.
         if (in.gradPLeastSq) deviceLeastSquaresGrad(dm, f.p, f.pBnd, gpx, gpy, gpz);
         else                 deviceGaussGrad(dm, f.p, f.pBnd, gpx, gpy, gpz);
+        if (in.gradPLimitK > 0.0) deviceCellLimitGrad(dm, f.p, f.pBnd, gpx, gpy, gpz, in.gradPLimitK);
         addPressureGradient(Mp, dm, gpx, gpy, gpz);
 
         DeviceBuffer<scalar>* U[3] = {&f.Ux, &f.Uy, &f.Uz};
@@ -966,6 +967,7 @@ Residuals rhoSimpleStep(
     pin.correctedLaplacian = in.correctedLaplacian;
     pin.snGradLimitCoeff = in.snGradLimitCoeff;
     pin.gradPLeastSq     = in.gradPLeastSq;
+    pin.gradPLimitK      = in.gradPLimitK;
     pin.takeUAtBoundary = in.takeUAtBoundary;
     pin.adjustable = in.adjustable;
     pin.hasMRF = in.hasMRF;
@@ -1173,6 +1175,7 @@ Residuals rhoSimpleStep(
         DeviceBuffer<scalar> gpx, gpy, gpz;
         if (in.gradPLeastSq) deviceLeastSquaresGrad(dm, f.p, f.pBnd, gpx, gpy, gpz);
         else                 deviceGaussGrad(dm, f.p, f.pBnd, gpx, gpy, gpz);
+        if (in.gradPLimitK > 0.0) deviceCellLimitGrad(dm, f.p, f.pBnd, gpx, gpy, gpz, in.gradPLimitK);
         PressureStages shim;
         if (in.consistent)
         {

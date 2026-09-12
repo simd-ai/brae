@@ -407,6 +407,7 @@ void assemblePEqn(
         // correctedSnGrad's correction takes grad(p)'s own scheme (correctedSnGrad.C:52-55).
         if (in.gradPLeastSq) deviceLeastSquaresGrad(dm, p, pb, gx, gy, gz);
         else                 deviceGaussGrad(dm, p, pb, gx, gy, gz);
+        if (in.gradPLimitK > 0.0) deviceCellLimitGrad(dm, p, pb, gx, gy, gz, in.gradPLimitK);
         // The explicit half: source gets -V*div(gamma*magSf*(corrVec & interp(grad p))), which
         // deviceLaplacianCorr already returns pre-negated (device_mesh.cuh:288), hence the +1 here.
         if (in.snGradLimitCoeff > 0.0)

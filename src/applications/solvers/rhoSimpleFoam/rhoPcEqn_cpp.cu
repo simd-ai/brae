@@ -1,7 +1,8 @@
 // _cpp REFERENCE implementation -- see pcEqn_cpp.cuh for the OpenFOAM provenance and the refusal contract.
 #include "rhoPcEqn_cpp.cuh"
 #include "fvm.cuh"
-#include "fvc.cuh"   // gaussGrad, for the laplacian non-orthogonal correction
+#include "fvc.cuh"
+#include "cellLimitedGrad_cpp.cuh"   // cpu::cellLimitGrad on grad(p)   // gaussGrad, for the laplacian non-orthogonal correction
 #include "fv_matrix_ops.cuh"
 #include "linearViscousStress_cpp.cuh"   // effectiveFaceViscosity: linear inside, BOUNDARY field on faces
 #include <cmath>
@@ -157,7 +158,8 @@ ConsistentPressureStages consistentPressurePredictor(
     }
     const SurfaceScalarField drhof   = interp(drho, drhoB, m, g, patches);
     // ...whose non-orthogonal correction takes grad(p)'s own scheme (correctedSnGrad.C:52-55).
-    const SurfaceScalarField snGradP = fvc::snGrad(p, m, g, patches, in.correctedLaplacian, in.gradPLeastSq);
+    const SurfaceScalarField snGradP = fvc::snGrad(p, m, g, patches, in.correctedLaplacian, in.gradPLeastSq,
+                                                   in.gradPLimitK);
 
     SurfaceScalarField simplecCorr;
     simplecCorr.internal.resize(st.phiHbyA.internal.size());
@@ -223,8 +225,9 @@ ConsistentPressureStages consistentPressurePredictor(
     }
 
     // HbyA -= (rAU - rAtU)*fvc::grad(p), both branches.
-    const std::vector<vector> gradP = in.gradPLeastSq ? fvc::leastSquaresGrad(p, m, g, patches)
-                                                       : fvc::gaussGrad(p, m, g, patches);
+    std::vector<vector> gradP = in.gradPLeastSq ? fvc::leastSquaresGrad(p, m, g, patches)
+                                                : fvc::gaussGrad(p, m, g, patches);
+    if (in.gradPLimitK > 0.0) cpu::cellLimitGrad(gradP, p, in.gradPLimitK, m, g, patches);
     st.HbyA = st.HbyA0;
     for (label c = 0; c < nC; ++c)
     {
@@ -281,8 +284,9 @@ FvScalarMatrix assemblePcEqn(
     {
         std::vector<std::vector<scalar>> pb(patches.size());
         for (std::size_t pi = 0; pi < patches.size(); ++pi) pb[pi] = p.boundary[pi]->value();
-        const std::vector<vector> gradP = in.gradPLeastSq ? fvc::leastSquaresGrad(p.internal, pb, m, g, patches)
-                                                           : fvc::gaussGrad(p.internal, pb, m, g, patches);
+        std::vector<vector> gradP = in.gradPLeastSq ? fvc::leastSquaresGrad(p.internal, pb, m, g, patches)
+                                                    : fvc::gaussGrad(p.internal, pb, m, g, patches);
+        if (in.gradPLimitK > 0.0) cpu::cellLimitGrad(gradP, p.internal, pb, in.gradPLimitK, m, g, patches);
         const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
             gammaf, p, gradP, m, g, patches, in.snGradLimitCoeff);
         for (label c = 0; c < nC; ++c) M.source[c] -= corr[c];

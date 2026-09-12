@@ -192,13 +192,15 @@ FvVectorMatrix assembleUEqn(
 
 // Step 3: the right-hand side of `solve(UEqn == -fvc::grad(p))`, added to source as -grad(p)*V after
 // relaxation. p here is the ABSOLUTE pressure the thermo owns, not a kinematic p/rho.
+// grad(p) through the case's grad(p) entry: base scheme (leastSquares) and cellLimited coefficient.
 void addPressureGradient(
     FvVectorMatrix&               UEqn,
     const GeometricField<scalar>& p,
     const PrimitiveMesh&          m,
     const FvGeometry&             g,
     const std::vector<FvPatch>&   patches,
-    bool                          leastSquares = false);
+    bool                          leastSquares = false,
+    scalar                        cellLimitK = 0.0);
 
 } // namespace rhoSimple
 } // namespace cpu

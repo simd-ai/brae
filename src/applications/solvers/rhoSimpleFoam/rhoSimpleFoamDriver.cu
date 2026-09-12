@@ -279,6 +279,7 @@ RhoStepInput buildDeviceStepInput(
     in.limGradHeLeastSq   = hin.limGradHeLeastSq;
     in.limGradKELeastSq   = hin.limGradKELeastSq;
     in.gradPLeastSq       = hin.gradPLeastSq;   // every grad(p) consumer on this arm dispatches on it
+    in.gradPLimitK        = hin.gradPLimitK;    // ...and applies its cellLimited coefficient (deviceCellLimitGrad)
     // The ENERGY equation's non-orthogonal correction takes grad(he)'s own scheme on this arm too
     // (rhoEEqn.cu, limGradHeLeastSq / limGradHeK, the flags projected below) -- gated end to end on
     // gasMixing/injectorPipe by tests/rho_gasmixing_vs_openfoam.sh's CUDA arm.

@@ -167,6 +167,7 @@ struct RhoStepInput
     // -grad(p)*V, U = HbyA - rAtU*grad(p), SIMPLEC's HbyA correction and each pressure branch's
     // non-orthogonal correction all take it. The host reference's StepInput::gradPLeastSq.
     bool   gradPLeastSq = false;
+    scalar gradPLimitK  = 0.0;   // ...and its cellLimited coefficient, on the same five consumers (0 = unlimited)
     bool   correctedLaplacian = false;
     scalar snGradLimitCoeff   = 0.0;
     bool   isE = true;                    // he == "e" selects Ekp, "h" selects K

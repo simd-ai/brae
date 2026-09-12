@@ -1,4 +1,5 @@
 #include "fvc.cuh"
+#include "cellLimitedGrad_cpp.cuh"   // the field's own cellLimited coefficient on snGrad's correction gradient
 
 namespace brae {
 namespace fvc {
@@ -521,7 +522,8 @@ SurfaceScalarField snGrad(
     const FvGeometry&             g,
     const std::vector<FvPatch>&   patches,
     bool                          corrected,
-    bool                          leastSquares)
+    bool                          leastSquares,
+    scalar                        cellLimitK)
 {
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
@@ -538,8 +540,9 @@ SurfaceScalarField snGrad(
     // (correctedSnGrad.C:52-55), as the header says.
     if (corrected)
     {
-        const std::vector<vector>  gradVf   = leastSquares ? leastSquaresGrad(vf, m, g, patches)
+        std::vector<vector>        gradVf   = leastSquares ? leastSquaresGrad(vf, m, g, patches)
                                                            : gaussGrad(vf, m, g, patches);
+        if (cellLimitK > 0.0) cpu::cellLimitGrad(gradVf, vf, cellLimitK, m, g, patches);
         const std::vector<vector>& corrVecs = g.nonOrthCorrectionVectors();
         const std::vector<scalar>& w        = g.weights();
         for (label f = 0; f < nIf; ++f)
