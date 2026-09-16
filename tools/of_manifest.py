@@ -1518,7 +1518,18 @@ COMPONENTS = {
              classification="HOST_ONLY", status="REIMPLEMENT",
              brae_reference="src/applications/solvers/interFoam/inter_solve_cpp.cuh",
              brae_target="src/applications/solvers/interFoam/braeInterFoam.cu",
-             validation="SHIPPED and gated end to end. brae_interFoam runs a case from the command line and "
+             validation="A WHOLE TIME STEP'S ALPHA HALF NOW RUNS ON THE DEVICE "
+                        "(device_inter_alpha_step.cu: the sub-cycle, the correctors, the MULESCorr "
+                        "pre-solve, and mixture.correct() at all three placements OpenFOAM runs it). "
+                        "Against the host solver over six steps of three sub-cycles and two correctors: "
+                        "the explicit path 8.9e-16 in alpha and 9.1e-13 in rho, the MULESCorr path "
+                        "6.9e-11 and 6.8e-08 -- larger because two different linear solvers run the "
+                        "pre-solve -- and the two paths differ from each other by 1.4e-02, so neither "
+                        "arm is a copy of the other. Leaving out the mixture.correct() AFTER the "
+                        "sub-cycle (alphaEqnSubCycle.H:36-38) leaves rho 1.1e+02 of 1000 wrong while "
+                        "alpha is 0.000e+00 unchanged: UEqn would be built on the wrong density and no "
+                        "interface gate could see it. "
+                        "SHIPPED and gated end to end. brae_interFoam runs a case from the command line and "
                         "`brae -case` routes to it (tests/solver_dispatch.sh). Against real OpenFOAM: "
                         "damBreak alpha 3.4e-09, p_rgh 2.3e-06 and U 3.3e-06 relative "
                         "(tests/interfoam_dambreak_vs_openfoam.sh); capillaryRise -- where surface "
