@@ -22,6 +22,7 @@
 #include "fvc.cuh"
 #include "interface_properties_cpp.cuh"
 #include "inter_case_cpp.cuh"
+#include "solution_directions.cuh"
 #include "inter_driver_cpp.cuh"
 #include "inter_solve_cpp.cuh"
 #include "alpha_eqn_cpp.cuh"
@@ -461,6 +462,10 @@ int main(int argc, char** argv)
         C.pressure.tol = scalar(1e-12);
         C.pressure.maxIter = 4000;
         C.nCorrectors = static_cast<int>(dv.pimple.nCorrectors);
+        { const SolutionDirections sd = solutionDirections(fvp);
+          for (int k = 0; k < 3; ++k) C.solutionD[k] = sd.d[k];
+          std::printf("  solutionD = (%d %d %d) -- damBreak is 2-D, so one direction is knocked out\n",
+                      sd.d[0], sd.d[1], sd.d[2]); }
         C.momentumPredictor = dv.momentumPredictorOn;
         C.relaxU = dv.relaxU;
         C.relaxEquationU = dv.relaxEquationU;
@@ -505,9 +510,9 @@ int main(int argc, char** argv)
             cudaDeviceSynchronize();
 
             // The HOST's momentum matrix from the same post-alpha state, so rAU and HbyA compare.
-            std::vector<scalar> devRho, devRhoPhi;
+            std::vector<scalar> devRho, rpi_host_int;
             rr.copyTo(devRho);
-            rpi.copyTo(devRhoPhi);
+            rpi.copyTo(rpi_host_int);
 
             std::vector<scalar> dRAU, dHx, dDiag;
             taps.rAU.copyTo(dRAU);
@@ -535,6 +540,93 @@ int main(int argc, char** argv)
             std::printf("  [taps] worst rAU/(dt/rho) = %.4f  (must be <= 1: the ddt alone puts "
                         "rho*V/dt on the diagonal)\n", (double)worstBound);
             check("rAU is bounded by dt/rho, so the ddt is on the diagonal", worstBound <= scalar(1.0));
+
+            // ---- the HOST's own UEqn from the SAME post-alpha state ------------------------------
+            // Both sides are handed the DEVICE's rhoPhi, rho and alpha, so what is compared is the
+            // momentum assembly and A()/H() alone -- the alpha half is already gated at 6.9e-11 and
+            // folding it in again would only blur this.
+            {
+                std::vector<scalar> devRhoPhiB, devAlphaNow;
+                rpb.copyTo(devRhoPhiB);
+                a1.copyTo(devAlphaNow);
+
+                std::vector<std::vector<scalar>> rpBndH(fvp.size()), rhoBndH(fvp.size()),
+                                                 nuBndH(fvp.size());
+                { label o3 = 0;
+                  for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                  { for (label i = 0; i < fvp[pi].size; ++i) rpBndH[pi].push_back(devRhoPhiB[o3 + i]);
+                    o3 += fvp[pi].size; } }
+
+                std::vector<scalar> a2h(static_cast<std::size_t>(nC)), nuH, rhoOldH;
+                for (label c = 0; c < nC; ++c) a2h[c] = scalar(1) - devAlphaNow[c];
+                brae::cpu::twoPhase::mixtureNu(devAlphaNow, a2h, dv.mixture.phases, nuH);
+                { std::vector<scalar> a2o(static_cast<std::size_t>(nC));
+                  for (label c = 0; c < nC; ++c) a2o[c] = scalar(1) - warmAlpha[c];
+                  brae::cpu::twoPhase::mixtureRho(warmAlpha, a2o, dv.mixture.phases, rhoOldH); }
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                  for (label i = 0; i < fvp[pi].size; ++i)
+                  { rhoBndH[pi].push_back(devRho[fvp[pi].faceCells[i]]);
+                    nuBndH[pi].push_back(nuH[fvp[pi].faceCells[i]]); }
+
+                std::vector<vector> UOldH(static_cast<std::size_t>(nC));
+                for (label c = 0; c < nC; ++c) UOldH[c] = vector{x0[c], y0[c], z0[c]};
+
+                GeometricField<vector> Uh2;
+                Uh2.internal = UOldH;
+                InterFields tmpf = buildInterFields(caseDir, startDir, m, g, fvp);
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                    Uh2.boundary.push_back(std::move(tmpf.U.boundary[pi]));
+                Uh2.evaluateBoundary();
+
+                InterMomentumInput hm;
+                hm.rhoPhi = &rpi_host_int;
+                hm.rhoPhiBnd = &rpBndH;
+                hm.rho = &devRho;
+                hm.rhoOld = &rhoOldH;
+                hm.rhoBnd = &rhoBndH;
+                hm.UOld = &UOldH;
+                hm.nuEff = &nuH;
+                hm.nuEffBnd = &nuBndH;
+                hm.deltaT = dt;
+                hm.scheme = dv.divRhoPhiU;
+                hm.schemeCoeff = dv.divRhoPhiUCoeff;
+                hm.relaxEquationU = dv.relaxEquationU;
+                hm.relaxU = dv.relaxU;
+                const FvVectorMatrix hUEqn = assembleUEqn(Uh2, hm, m, g, fvp);
+
+                const std::vector<scalar> Ah = matrixA(hUEqn, m, g, fvp);
+                const std::vector<vector> Hh = matrixH(hUEqn, Uh2, m, g, fvp);
+
+                std::vector<scalar> dSrc;
+                taps.UEqnSourceX.copyTo(dSrc);
+                scalar wS = 0, sS = 0;
+                for (label c = 0; c < nC; ++c)
+                {
+                    wS = std::fmax(wS, std::fabs(dSrc[c] - hUEqn.source[c].x));
+                    sS = std::fmax(sS, std::fabs(hUEqn.source[c].x));
+                }
+                std::printf("  [taps vs host] UEqn.source.x %.4e of %.4e\n", (double)wS, (double)sS);
+
+                scalar wR = 0, sR = 0, wH = 0, sH = 0, wD = 0, sD = 0;
+                for (label c = 0; c < nC; ++c)
+                {
+                    const scalar rh = scalar(1)/Ah[c];
+                    wR = std::fmax(wR, std::fabs(dRAU[c] - rh));
+                    sR = std::fmax(sR, std::fabs(rh));
+                    const scalar hh = rh*Hh[c].x;
+                    wH = std::fmax(wH, std::fabs(dHx[c] - hh));
+                    sH = std::fmax(sH, std::fabs(hh));
+                    wD = std::fmax(wD, std::fabs(dDiag[c] - hUEqn.diag[c]));
+                    sD = std::fmax(sD, std::fabs(hUEqn.diag[c]));
+                }
+                std::printf("  [taps vs host] UEqn.diag %.4e of %.4e;  rAU %.4e of %.4e;  "
+                            "HbyA.x %.4e of %.4e\n",
+                            (double)wD, (double)sD, (double)wR, (double)sR, (double)wH, (double)sH);
+                check("the device's momentum diagonal matches the host's on damBreak",
+                      wD < scalar(1e-10)*sD);
+                check("...and so does rAU", wR < scalar(1e-10)*sR);
+                check("...and so does HbyA", wH < scalar(1e-8)*sH);
+            }
         }
 
         for (int s2 = 0; s2 < nSteps; ++s2)

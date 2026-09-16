@@ -261,6 +261,8 @@ int main()
     ctl.pRefCell          = 0;
     ctl.pRefValue         = 0;
     ctl.takeUAtBoundary   = &dTakeU;
+    // the box fixture is 2-D too (Nz = 1 with wall z-patches, not empty), so all three stay valid
+    ctl.solutionD[0] = ctl.solutionD[1] = ctl.solutionD[2] = 1;
 
     DevicePhaseProperties props{rho1, nu1, rho2, nu2};
 

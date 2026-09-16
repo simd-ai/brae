@@ -111,6 +111,12 @@ struct DeviceInterStepControls
     bool   needReference     = false;
     int    pRefCell          = 0;
     scalar pRefValue         = 0;
+    // polyMesh::solutionD() -- which coordinate directions the vector equation is SOLVED in. On a 2-D
+    // case the empty direction is knocked out, and fvMatrix::H()'s validComponents block skips it. This
+    // port hardcoded all three as valid, which on damBreak -- empty front and back -- told H() to solve
+    // a direction OpenFOAM never does.
+    int    solutionD[3]      = {1, 1, 1};
+
     // constrainHbyA's per-face `assignable` mask, which the shared pressure predictor requires.
     // assignable() is NOT fixesValue(): slip and inletOutlet are non-assignable without fixing one,
     // and damBreak's atmosphere is pressureInletOutletVelocity.
