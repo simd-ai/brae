@@ -128,6 +128,7 @@ add_library(brae_core STATIC
     src/applications/solvers/simpleFoam/simpleFoamV2.cu
     src/applications/solvers/simpleFoam/pEqn_cpp.cu
     src/applications/solvers/simpleFoam/createFields_cpp.cu
+    src/applications/solvers/interFoam/inter_case_cpp.cu
     src/transportModels/interfaceProperties/interface_properties_cpp.cu
     src/applications/solvers/interFoam/inter_solve_cpp.cu
     src/applications/solvers/interFoam/inter_peqn_cpp.cu
@@ -3150,6 +3151,21 @@ target_include_directories(test_interface_curvature_cpp PRIVATE ${BRAE_HEADER_DI
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_interface_curvature_cpp PRIVATE brae_core)
 add_test(NAME interface_curvature_cpp COMMAND test_interface_curvature_cpp)
+
+# interFoam step 14: createFields against damBreak's own case. damBreak ships 0.orig and NO mesh, so
+# the fixture is a PROCEDURE -- blockMesh then setFields -- not a directory this repo can check in.
+# The shell gate runs OpenFOAM's own two utilities and hands the prepared case to the binary; both
+# SKIP rather than fail where OpenFOAM is not installed.
+add_executable(test_inter_case_cpp tests/test_inter_case_cpp.cu)
+target_include_directories(test_inter_case_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_inter_case_cpp PRIVATE brae_core)
+add_test(NAME interfoam_createfields_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_createfields_vs_openfoam.sh)
+set_tests_properties(interfoam_createfields_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_inter_case_cpp
+                     TIMEOUT 600)
 
 # These five read damBreak's own dictionaries. A box without OpenFOAM must SKIP, not report green: the
 # arms silently stopped running the moment $FOAM_TUTORIALS was empty, and nothing said so.

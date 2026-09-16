@@ -1716,11 +1716,26 @@ COMPONENTS = {
         dict(name="interFoam_createFields", of_symbol="createFields",
              of_file="applications/solvers/multiphase/interFoam/createFields.H",
              classification="CONFIGURATION", status="REIMPLEMENT",
-             brae_reference="src/applications/solvers/interFoam/inter_create_fields_cpp.cuh",
-             brae_target="src/applications/solvers/interFoam/device_inter_create_fields.cu",
-             validation="Field-by-field against OpenFOAM's own written state, as rhoCreateFields is.",
-             note="alpha1, p_rgh, gh/ghf from the gravity field, rhoPhi. g and hRef come from "
-                  "constant/g and constant/hRef, neither of which brae reads today."),
+             brae_reference="src/applications/solvers/interFoam/inter_case_cpp.cuh",
+             brae_target="src/applications/solvers/interFoam/device_inter_case.cu",
+             validation="tests/interfoam_createfields_vs_openfoam.sh -- damBreak's OWN case, prepared "
+                        "the way the tutorial does. damBreak ships 0.orig and NO mesh, so the fixture "
+                        "is a PROCEDURE (blockMesh then setFields), not a directory this repo can "
+                        "check in; the gate runs OpenFOAM's own utilities and SKIPs where OpenFOAM is "
+                        "absent. 2268 cells, 5 patches, 324 water cells.",
+             note="ONE translation from case to fields, shared by the gate and by the solver -- a "
+                  "private copy in the driver is the defect rhoSimpleFoam's mirror wrote down: the "
+                  "gate proves the step, the driver feeds it something else, nothing compares them. "
+                  "Three things: the alpha field's NAME comes from `phases (water air)`, so a "
+                  "hard-coded alpha1 finds no file on any shipped case; phi is READ when present "
+                  "(createAlphaFluxes.H) and only computed from U when it is not, so a restart "
+                  "continues from the written flux rather than discarding the continuity error the "
+                  "last pressure corrector drove down; and fvSchemes KEYS contain parentheses and "
+                  "commas, so FoamDict cannot look them up -- they are read as text through "
+                  "scheme_parse's fvSchemesBlock, the same route every other brae solver uses. A "
+                  "non-laminar simulationType is refused: interFoam's turbulence is "
+                  "incompressibleInterPhaseTransportModel, a MIXTURE model handed the blended rho, "
+                  "not the single-phase model brae already has."),
     ],
 
     "rhoSimpleFoam": [
