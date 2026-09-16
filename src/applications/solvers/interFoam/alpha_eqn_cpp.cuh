@@ -210,6 +210,10 @@ struct AlphaStepInput
 
     // MULES
     bool    MULESCorr = false;
+    // alphaApplyPrevCorr: reuse the PREVIOUS time step's compression flux as a first guess. 3 of the
+    // 44 shipped tutorials set it. `prevCorr` carries that cached flux in and out; empty means there
+    // is none yet, which is what the first step and a topology change both look like.
+    bool    alphaApplyPrevCorr = false;
     // the case's own linear-solver controls for the implicit upwind pre-solve (MULESCorr only)
     scalar  tolAlpha = 1e-8, relTolAlpha = 0;
     int     maxIterAlpha = 1000;
@@ -226,7 +230,8 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
                   const FvGeometry&                       g,
                   const std::vector<FvPatch>&             patches,
                   SurfaceScalarField&                     alphaPhi10,
-                  SurfaceScalarField&                     rhoPhi);
+                  SurfaceScalarField&                     rhoPhi,
+                  SurfaceScalarField*                     prevCorr = nullptr);
 
 } // namespace interFoam
 } // namespace cpu

@@ -4,6 +4,9 @@
 #include "limitedSchemes_cpp.cuh"
 #include "cellLimitedGrad_cpp.cuh"
 #include "fv_patch_field.cuh"
+#include "fvm.cuh"
+#include "fv_matrix_ops.cuh"
+#include "pbicgstab.cuh"
 #include <memory>
 
 namespace brae {
@@ -343,25 +346,74 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
                   const FvGeometry&                       g,
                   const std::vector<FvPatch>&             patches,
                   SurfaceScalarField&                     alphaPhi10,
-                  SurfaceScalarField&                     rhoPhi)
+                  SurfaceScalarField&                     rhoPhi,
+                  SurfaceScalarField*                     prevCorr)
 {
     if (!in.phi || !in.phiCN)
         throw std::runtime_error("brae interFoam alphaEqn: phi and phiCN are both required.");
     if (in.nAlphaCorr < 1)
         throw std::runtime_error("brae interFoam alphaEqn: nAlphaCorr must be at least 1.");
-    if (in.MULESCorr)
-        throw std::runtime_error(
-            "brae interFoam alphaEqn: `MULESCorr yes` needs the IMPLICIT upwind pre-solve "
-            "(alphaEqn.H:103-122) -- an fvScalarMatrix of fvm::ddt(alpha1) + fvm::div(phiCN, alpha1) "
-            "solved with the case's own smoothSolver, whose result CMULES then corrects. The limiter "
-            "half is ported and gated (MULES::correct); the matrix half is not wired here yet. 13 of "
-            "the 44 shipped tutorials set it, damBreak among them.");
-
     const label nC = m.nCells();
 
     // The alpha field starts each sub-step from its old time.
     alpha1.internal = alpha1Old;
     alpha1.evaluateBoundary();
+
+    SurfaceScalarField upwindFlux;              // talphaPhi1UD -- cached for alphaApplyPrevCorr
+    if (in.MULESCorr)
+    {
+        // alphaEqn.H:103-155, THE IMPLICIT PRE-SOLVE.
+        //
+        //     fvScalarMatrix alpha1Eqn
+        //     (
+        //         EulerDdtScheme<scalar>(mesh).fvmDdt(alpha1)
+        //       + gaussConvectionScheme<scalar>(mesh, phiCN, upwind<scalar>(mesh, phiCN))
+        //             .fvmDiv(phiCN, alpha1)
+        //      == Su + fvm::Sp(Sp + divU, alpha1)
+        //     );
+        //
+        // THE CONVECTION IS UPWIND, NAMED EXPLICITLY IN THE CODE -- not the case's div(phi,alpha).
+        // That is the whole point of the split: the implicit half is first-order and unconditionally
+        // bounded, and every bit of the case's scheme lives in the correction CMULES then limits.
+        // Running the case's vanLeer here would make the pre-solve itself unbounded and leave CMULES
+        // correcting towards a field that had already overshot.
+        //
+        // Su, Sp and divU are all zeroField for interFoam (interFoam/alphaSuSp.H), so the right-hand
+        // side vanishes; it is written out above rather than dropped because interPhaseChangeFoam's
+        // own alphaSuSp.H makes all three live.
+        FvScalarMatrix M = fvm::div<scalar>(in.phiCN->internal, in.phiCN->boundary, alpha1, m, patches);
+
+        // fvm::ddt(alpha1), Euler, rho == 1: diag += V/dt, source += V*alpha.oldTime()/dt.
+        const scalar rDeltaT = scalar(1) / in.deltaT;
+        for (label c = 0; c < nC; ++c)
+        {
+            M.diag[c]   += rDeltaT * g.V()[c];
+            M.source[c] += rDeltaT * g.V()[c] * alpha1Old[c];
+        }
+
+        pbicgstab(M, alpha1.internal, m, patches, in.tolAlpha, in.relTolAlpha, in.maxIterAlpha);
+        alpha1.evaluateBoundary();
+
+        // alphaPhi10 = alpha1Eqn.flux(): the CONSERVATIVE face flux of the SOLVED matrix, not the
+        // upwind flux of the pre-solve field. The two differ by the solver's own residual, and using
+        // the second leaves alphaPhi10 inconsistent with the alpha it is supposed to have produced.
+        upwindFlux = matrixFlux(M, alpha1.internal, m, patches);
+        alphaPhi10 = upwindFlux;
+
+        // alphaApplyPrevCorr: the previous step's compression flux as a first guess, limited against
+        // the field the pre-solve has just produced.
+        if (in.alphaApplyPrevCorr && prevCorr && !prevCorr->internal.empty())
+        {
+            MULES::Fields mf0;
+            MULES::correctLimited(rDeltaT, alpha1, *in.phiCN, *prevCorr, mf0, mulesCtl,
+                                  m, g, patches);
+            for (std::size_t f = 0; f < alphaPhi10.internal.size(); ++f)
+                alphaPhi10.internal[f] += prevCorr->internal[f];
+            for (std::size_t pi = 0; pi < alphaPhi10.boundary.size(); ++pi)
+                for (std::size_t i = 0; i < alphaPhi10.boundary[pi].size(); ++i)
+                    alphaPhi10.boundary[pi][i] += prevCorr->boundary[pi][i];
+        }
+    }
 
     for (label aCorr = 0; aCorr < in.nAlphaCorr; ++aCorr)
     {
@@ -402,12 +454,67 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
         SurfaceScalarField un;
         alphaPhiUn(*in.phi, phir, alpha1, alpha2, in.alphaScheme, in.alpharScheme, m, g, patches, un);
 
-        // MULES::explicitSolve(geometricOneField(), alpha1, phiCN, alphaPhi10, 0, 0, 1, 0) --
-        // alphaEqn.H:208-220. alphaPhi10 IS alphaPhiUn on the explicit path, limited in place.
-        alphaPhi10 = un;
         MULES::Fields mf;                       // all null: rho == 1, Sp == Su == 0, bounds [0,1]
-        MULES::explicitSolveLimited(scalar(1)/in.deltaT, alpha1, alpha1Old, *in.phiCN, alphaPhi10,
-                                    mf, mulesCtl, m, g, patches);
+        if (in.MULESCorr)
+        {
+            // alphaEqn.H:178-205. The correction is what the high-order flux adds to the upwind one
+            // the implicit solve already applied, and CMULES limits THAT.
+            SurfaceScalarField corr = un;
+            for (std::size_t f = 0; f < corr.internal.size(); ++f)
+                corr.internal[f] -= alphaPhi10.internal[f];
+            for (std::size_t pi = 0; pi < corr.boundary.size(); ++pi)
+                for (std::size_t i = 0; i < corr.boundary[pi].size(); ++i)
+                    corr.boundary[pi][i] -= alphaPhi10.boundary[pi][i];
+
+            const std::vector<scalar> alpha10 = alpha1.internal;      // saved for the relaxation
+            MULES::correctLimited(scalar(1)/in.deltaT, alpha1, un, corr, mf, mulesCtl, m, g, patches);
+
+            // UNDER-RELAXED FOR EVERY CORRECTOR BUT THE FIRST, and BOTH halves are relaxed: the field
+            // by averaging with its pre-correction value, the flux by taking half the correction.
+            // Relaxing one and not the other leaves alpha and alphaPhi10 describing different states,
+            // and rhoPhi is built from the flux while UEqn is built on the field.
+            const scalar w = (aCorr == 0) ? scalar(1) : scalar(0.5);
+            if (aCorr != 0)
+            {
+                for (label c = 0; c < nC; ++c)
+                    alpha1.internal[c] = scalar(0.5)*alpha1.internal[c] + scalar(0.5)*alpha10[c];
+                alpha1.evaluateBoundary();
+            }
+            for (std::size_t f = 0; f < corr.internal.size(); ++f)
+                alphaPhi10.internal[f] += w * corr.internal[f];
+            for (std::size_t pi = 0; pi < corr.boundary.size(); ++pi)
+                for (std::size_t i = 0; i < corr.boundary[pi].size(); ++i)
+                    alphaPhi10.boundary[pi][i] += w * corr.boundary[pi][i];
+        }
+        else
+        {
+            // MULES::explicitSolve(geometricOneField(), alpha1, phiCN, alphaPhi10, 0, 0, 1, 0) --
+            // alphaEqn.H:208-220. alphaPhi10 IS alphaPhiUn on the explicit path, limited in place.
+            alphaPhi10 = un;
+            MULES::explicitSolveLimited(scalar(1)/in.deltaT, alpha1, alpha1Old, *in.phiCN, alphaPhi10,
+                                        mf, mulesCtl, m, g, patches);
+        }
+    }
+
+    // alphaEqn.H:228-236: the cache for the NEXT step is alphaPhi10 minus the upwind flux -- i.e. the
+    // compression the correctors ended up applying. Cleared otherwise, so a case that turns
+    // alphaApplyPrevCorr off does not carry a stale flux forward.
+    if (prevCorr)
+    {
+        if (in.alphaApplyPrevCorr && in.MULESCorr)
+        {
+            *prevCorr = alphaPhi10;
+            for (std::size_t f = 0; f < prevCorr->internal.size(); ++f)
+                prevCorr->internal[f] -= upwindFlux.internal[f];
+            for (std::size_t pi = 0; pi < prevCorr->boundary.size(); ++pi)
+                for (std::size_t i = 0; i < prevCorr->boundary[pi].size(); ++i)
+                    prevCorr->boundary[pi][i] -= upwindFlux.boundary[pi][i];
+        }
+        else
+        {
+            prevCorr->internal.clear();
+            prevCorr->boundary.clear();
+        }
     }
 
     // rhoPhi = alphaPhi10*(rho1 - rho2) + phiCN*rho2, alphaEqn.H:248. The Euler branch multiplies
