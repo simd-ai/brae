@@ -60,7 +60,41 @@ __global__ void massFluxKernel(
     if (f < n) rhoPhi[f] = alphaPhi[f]*dRho + phi[f]*rho2;
 }
 
+__global__ void mulKernel(const scalar* __restrict__ a, const scalar* __restrict__ b,
+                          int n, scalar* __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = a[i]*b[i];
+}
+
+__global__ void subKernel(const scalar* __restrict__ a, const scalar* __restrict__ b,
+                          int n, scalar* __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = a[i] - b[i];
+}
+
 }   // namespace
+
+
+void deviceMultiplyFaces(int n, const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& b,
+                         DeviceBuffer<scalar>& out)
+{
+    if (n <= 0) return;
+    out.resize(static_cast<std::size_t>(n));
+    mulKernel<<<nBlocks(n), TPB>>>(a.data(), b.data(), n, out.data());
+    ckA(cudaGetLastError(), "multiply faces");
+}
+
+
+void deviceSubtractFaces(int n, const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& b,
+                         DeviceBuffer<scalar>& out)
+{
+    if (n <= 0) return;
+    out.resize(static_cast<std::size_t>(n));
+    subKernel<<<nBlocks(n), TPB>>>(a.data(), b.data(), n, out.data());
+    ckA(cudaGetLastError(), "subtract faces");
+}
 
 
 void deviceAlphaFaceFlux(

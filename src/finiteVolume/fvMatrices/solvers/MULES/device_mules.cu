@@ -227,7 +227,74 @@ __global__ void fillKernel(scalar* __restrict__ x, int n, scalar v)
     if (i < n) x[i] = v;
 }
 
+__global__ void blendKernel(
+    const scalar* __restrict__ bd, const scalar* __restrict__ lam,
+    const scalar* __restrict__ corr, int n, scalar* __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = bd[i] + lam[i]*corr[i];
+}
+
+__global__ void explicitSolveKernel(
+    const scalar* __restrict__ psiOld, const scalar* __restrict__ divPhiPsi,
+    const scalar* __restrict__ rho, const scalar* __restrict__ rhoOld,
+    const scalar* __restrict__ Sp, const scalar* __restrict__ Su,
+    int nC, scalar rDeltaT, scalar* __restrict__ psi)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    // rho.oldTime() in the numerator and rho in the denominator -- not the same field on a VoF
+    // interface, where the two differ by the density ratio in every cell the interface crossed.
+    const scalar num = at(rhoOld, c, scalar(1))*psiOld[c]*rDeltaT + at(Su, c, scalar(0)) - divPhiPsi[c];
+    const scalar den = at(rho, c, scalar(1))*rDeltaT - at(Sp, c, scalar(0));
+    psi[c] = num / den;
+}
+
 }   // namespace
+
+
+void deviceMulesBlend(
+    int                         nInternalFaces,
+    int                         nBoundaryFaces,
+    const DeviceBuffer<scalar>& phiBDInt,  const DeviceBuffer<scalar>& phiBDBnd,
+    const DeviceBuffer<scalar>& lambdaInt, const DeviceBuffer<scalar>& lambdaBnd,
+    const DeviceBuffer<scalar>& phiCorrInt,const DeviceBuffer<scalar>& phiCorrBnd,
+    DeviceBuffer<scalar>&       phiPsiInt, DeviceBuffer<scalar>&       phiPsiBnd)
+{
+    if (nInternalFaces > 0)
+    {
+        phiPsiInt.resize(static_cast<std::size_t>(nInternalFaces));
+        blendKernel<<<nBlocks(nInternalFaces), TPB>>>(
+            phiBDInt.data(), lambdaInt.data(), phiCorrInt.data(), nInternalFaces, phiPsiInt.data());
+        ckM(cudaGetLastError(), "blend internal");
+    }
+    if (nBoundaryFaces > 0)
+    {
+        phiPsiBnd.resize(static_cast<std::size_t>(nBoundaryFaces));
+        blendKernel<<<nBlocks(nBoundaryFaces), TPB>>>(
+            phiBDBnd.data(), lambdaBnd.data(), phiCorrBnd.data(), nBoundaryFaces, phiPsiBnd.data());
+        ckM(cudaGetLastError(), "blend boundary");
+    }
+}
+
+
+void deviceMulesExplicitSolve(
+    const DeviceMesh&           dm,
+    scalar                      rDeltaT,
+    const DeviceBuffer<scalar>& psiOld,
+    const DeviceBuffer<scalar>& phiPsiInt,
+    const DeviceBuffer<scalar>& phiPsiBnd,
+    const DeviceMulesFields&    f,
+    DeviceBuffer<scalar>&       psi)
+{
+    DeviceBuffer<scalar> divPhiPsi(dm.nCells);
+    deviceDiv(dm, phiPsiInt, phiPsiBnd, divPhiPsi);
+    psi.resize(static_cast<std::size_t>(dm.nCells));
+    explicitSolveKernel<<<nBlocks(dm.nCells), TPB>>>(
+        psiOld.data(), divPhiPsi.data(), f.rho, f.rhoOld, f.Sp, f.Su,
+        dm.nCells, rDeltaT, psi.data());
+    ckM(cudaGetLastError(), "explicit solve");
+}
 
 
 void deviceMulesDonorFlux(

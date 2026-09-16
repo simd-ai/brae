@@ -86,4 +86,28 @@ void deviceMulesLimiter(
     DeviceBuffer<scalar>&        lambdaInt,
     DeviceBuffer<scalar>&        lambdaBnd);
 
+// phiPsi = phiBD + lambda*phiCorr (MULESTemplates.C:634). The blend is separate from the limiter so a
+// caller can keep the limiter's lambda -- which a stock OpenFOAM run never writes and which every gate
+// on this component needs.
+void deviceMulesBlend(
+    int                         nInternalFaces,
+    int                         nBoundaryFaces,
+    const DeviceBuffer<scalar>& phiBDInt,  const DeviceBuffer<scalar>& phiBDBnd,
+    const DeviceBuffer<scalar>& lambdaInt, const DeviceBuffer<scalar>& lambdaBnd,
+    const DeviceBuffer<scalar>& phiCorrInt,const DeviceBuffer<scalar>& phiCorrBnd,
+    DeviceBuffer<scalar>&       phiPsiInt, DeviceBuffer<scalar>&       phiPsiBnd);
+
+// MULES::explicitSolve on a fixed mesh (MULESTemplates.C:20-70):
+//     psi = (rho.oldTime()*psi0*rDeltaT + Su - surfaceIntegrate(phiPsi)) / (rho*rDeltaT - Sp)
+// NOTE rho.oldTime() above the line and rho below it -- the same split fvm::ddt(rho,U) carries, and on
+// a VoF interface those differ by the density ratio.
+void deviceMulesExplicitSolve(
+    const DeviceMesh&           dm,
+    scalar                      rDeltaT,
+    const DeviceBuffer<scalar>& psiOld,
+    const DeviceBuffer<scalar>& phiPsiInt,
+    const DeviceBuffer<scalar>& phiPsiBnd,
+    const DeviceMulesFields&    f,
+    DeviceBuffer<scalar>&       psi);
+
 } // namespace brae

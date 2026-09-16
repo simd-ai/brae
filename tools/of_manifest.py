@@ -1544,11 +1544,15 @@ COMPONENTS = {
              of_file="applications/solvers/multiphase/VoF/alphaEqn.H",
              classification="SHARED_NUMERICAL", status="REIMPLEMENT",
              brae_reference="src/applications/solvers/interFoam/alpha_eqn_cpp.cuh",
-             brae_target="src/applications/solvers/interFoam/device_alpha_eqn.cu",
+             brae_target="src/applications/solvers/interFoam/device_alpha_step.cu",
              validation="tests/test_alpha_eqn_cpp.cu covers the FLUX ASSEMBLY. Boundedness is the gate for "
                         "the MULES half and is an ASSERTION, not a tolerance: 0 <= alpha <= 1 exactly, "
                         "every cell, every sub-cycle. A VoF gate that only checks agreement can pass "
-                        "while the field goes unbounded and is then clipped.",
+                        "while the field goes unbounded and is then clipped. ON THE DEVICE, "
+                        "tests/test_device_alpha_step.cu runs the WHOLE explicit corrector on a rotating "
+                        "blob -- discretely divergence-free, so boundedness means something -- against "
+                        "the host: alpha in [0,1] exactly, 1.1e-16 after one step and 9.99e-16 after "
+                        "forty of two correctors each.",
              note="SPLIT IN TWO. The flux assembly is landed: alphaControls, the off-centring, phic, "
                   "phiCN, alphaPhiUn and rhoPhi. MULES is interFoam_MULES and is not. Su/Sp/divU are "
                   "identically zero for THIS solver (interFoam/alphaSuSp.H is three zeroFields); they "
@@ -1560,7 +1564,12 @@ COMPONENTS = {
                   "do not under `Gauss vanLeer` (7); and rhoPhi's two branches multiply rho2f by phiCN "
                   "on the Euler path and phi on the other. Only Euler, localEuler and CrankNicolson ddt "
                   "are accepted (alphaEqn.H:49-51), and CrankNicolson is refused when sub-cycling. "
-                  "`Gauss interfaceCompression` on div(phirb,alpha) (4 tutorials) is refused by name."),
+                  "`Gauss interfaceCompression` on div(phirb,alpha) (4 tutorials) is refused by name. "
+                  "THE DEVICE SPLIT IS ONE CORRECTOR PER CALL, not the nAlphaCorr loop: OpenFOAM "
+                  "re-evaluates alpha's boundary at the end of every MULES solve and runs "
+                  "mixture.correct() after that, and the next corrector's flux, gradient and limiter all "
+                  "read them. Looping inside the call put nHatf 2.885e-04 out on a field whose largest "
+                  "value is 1.736e-03, and 3.2e-09 into alpha by the end of a single step."),
         dict(name="interFoam_MULES", of_symbol="MULES::limiter",
              of_file="src/finiteVolume/fvMatrices/solvers/MULES/MULES.C",
              classification="SHARED_NUMERICAL", status="REIMPLEMENT",

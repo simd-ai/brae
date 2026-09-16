@@ -70,4 +70,24 @@ void deviceInterfaceCurvature(
     const DeviceBuffer<scalar>& nHatfBnd,
     DeviceBuffer<scalar>&       K);
 
+// interfaceProperties::correct()'s device half, in one call: grad(alpha1) -> nHatf -> K. It is a
+// function rather than three call sites because deltaN and the minus sign in K = -div(nHatf) are each
+// one place to go wrong, and alphaEqn.H invokes this once per corrector and once more between the
+// sub-cycle and UEqn.
+//
+// IT IS A SEPARATE CALL FROM THE ALPHA CORRECTOR ON PURPOSE. OpenFOAM runs it at alphaEqn.H:225, AFTER
+// MULES::explicitSolve has ended with psi.correctBoundaryConditions() (MULESTemplates.C:181) -- so the
+// gradient it takes sees alpha's NEW patch values, not the ones the corrector started from. Folding it
+// into deviceAlphaCorrector meant it read the pre-solve boundary; MEASURED on a rotating blob, that put
+// nHatf 2.885e-04 out on a field of scale 1.7e-03, which is 17%, and carried 3.2e-09 into alpha by the
+// end of the step. The caller evaluates the boundary between the two calls, which is what OpenFOAM does.
+void deviceInterfaceCorrect(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& alpha1,
+    const DeviceBuffer<scalar>& alpha1Bnd,      // the patch values the host has just evaluated
+    const DeviceBuffer<scalar>& nHatfBnd,       // contact angle already applied, where there is one
+    scalar                      deltaN,
+    DeviceBuffer<scalar>&       nHatfInt,
+    DeviceBuffer<scalar>&       K);
+
 } // namespace brae

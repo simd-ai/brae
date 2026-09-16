@@ -63,4 +63,13 @@ void deviceMassFlux(
     scalar                      rho2,
     DeviceBuffer<scalar>&       rhoPhi);
 
+// phir = phic*mixture.nHatf(), alphaEqn.H:162. nHatf is already a FLUX (nHatfv & Sf), not a unit
+// vector, so this is a product of two face fields and needs no area weighting of its own.
+void deviceMultiplyFaces(int n, const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& b,
+                         DeviceBuffer<scalar>& out);
+
+// out = a - b, per face. phiCorr = phiPsi - phiBD.
+void deviceSubtractFaces(int n, const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& b,
+                         DeviceBuffer<scalar>& out);
+
 } // namespace brae

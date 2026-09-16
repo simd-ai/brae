@@ -132,4 +132,20 @@ void deviceInterfaceCurvature(
     ckIP(cudaGetLastError(), "curvature negate");
 }
 
+
+void deviceInterfaceCorrect(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& alpha1,
+    const DeviceBuffer<scalar>& alpha1Bnd,
+    const DeviceBuffer<scalar>& nHatfBnd,
+    scalar                      deltaN,
+    DeviceBuffer<scalar>&       nHatfInt,
+    DeviceBuffer<scalar>&       K)
+{
+    DeviceBuffer<scalar> gx, gy, gz;
+    deviceGaussGrad(dm, alpha1, alpha1Bnd, gx, gy, gz);
+    deviceInterfaceNormalFlux(dm, dm.nInternalFaces, gx, gy, gz, deltaN, nHatfInt);
+    deviceInterfaceCurvature(dm, nHatfInt, nHatfBnd, K);
+}
+
 } // namespace brae
