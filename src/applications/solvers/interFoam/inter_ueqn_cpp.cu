@@ -1,6 +1,7 @@
 // interFoam's momentum predictor -- see inter_ueqn_cpp.cuh for the provenance and for the three things
 // that are not in rhoSimpleFoam's UEqn.
 #include "inter_ueqn_cpp.cuh"
+#include "solve_vector.cuh"
 
 namespace brae {
 namespace cpu {
@@ -192,6 +193,28 @@ void addMomentumPredictorSource(
         UEqn.source[c].y += R[c].y * V[c];
         UEqn.source[c].z += R[c].z * V[c];
     }
+}
+
+
+void momentumPredictor(GeometricField<vector>&     U,
+                       const InterMomentumInput&   in,
+                       const SurfaceScalarField&   faceForce,
+                       const MomentumSolveControls& sc,
+                       const PrimitiveMesh&        m,
+                       const FvGeometry&           g,
+                       const std::vector<FvPatch>& patches,
+                       FvVectorMatrix&             UEqnOut)
+{
+    // ORDER IS OpenFOAM's: assemble and RELAX first, then add the face force. `solve(UEqn == R)`
+    // builds a new equation from the ALREADY-RELAXED matrix, so relaxing after adding R would relax
+    // the buoyancy and surface tension too -- which OpenFOAM does not do.
+    UEqnOut = assembleUEqn(U, in, m, g, patches);
+
+    // rAU and H() are taken from the relaxed matrix BEFORE the face force, which is why the matrix is
+    // handed back to the caller here rather than after.
+    FvVectorMatrix solved = UEqnOut;
+    addMomentumPredictorSource(solved, faceForce, m, g, patches);
+    solveVector(solved, U, m, patches, sc.tolU, sc.relTolU, sc.maxIterU);
 }
 
 } // namespace interFoam

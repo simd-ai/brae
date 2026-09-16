@@ -31,6 +31,7 @@
 #include "fvm.cuh"
 #include "fv_matrix_ops.cuh"
 #include "pbicgstab.cuh"
+#include "interface_properties_cpp.cuh"
 #include <memory>
 #include <tuple>
 #include <cstdlib>
@@ -385,6 +386,164 @@ int main(int argc, char** argv)
         // Conservation IS the solve's accuracy, so the bound is the tolerance, not a constant.
         check("MULESCorr conserves alpha to the alpha solve's own linear tolerance",
               std::get<2>(semi) < scalar(1e3) * in.tolAlpha);
+    }
+
+    // ---- 6. THE MOMENTUM PREDICTOR, AND WHAT p_rgh ACTUALLY BUYS ----------------------------------
+    // On a hydrostatic start -- damBreak's own, p_rgh uniform and alpha sharp -- the momentum
+    // predictor's ENTIRE body force is zero except at the interface:
+    //
+    //     reconstruct((sigma*K*snGrad(alpha) - ghf*snGrad(rho) - snGrad(p_rgh)) * magSf)
+    //
+    // snGrad(p_rgh) is zero because p_rgh is uniform, snGrad(rho) because rho is piecewise constant,
+    // snGrad(alpha) likewise. So the bulk of the water column feels NOTHING and the motion comes from
+    // the pressure solve. That is what solving for p_rgh rather than p buys, and it is the arm that
+    // separates this formulation from the obvious reading of "add gravity" -- rho*g everywhere in the
+    // source, which accelerates the whole column and then asks the pressure solve to cancel it.
+    {
+        // the three face fields, on damBreak's own initial state
+        SurfaceScalarField nHatf;
+        std::vector<scalar> K;
+        brae::cpu::interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, nHatf, K);
+
+        GeometricField<scalar> rhoField;
+        rhoField.internal = f.rho;
+        for (const FvPatch& q : patches)
+            rhoField.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
+        rhoField.evaluateBoundary();
+
+        // constrainPressure(p_rgh, U, phiHbyA, rAUf, MRF) BEFORE the pressure gradient is touched.
+        // damBreak's walls are fixedFluxPressure, whose snGrad is PRESCRIBED from the flux rather than
+        // computed from the field, and brae refuses to assemble one that has not been set -- which is
+        // what happened the first time this arm was written. At t = 0 damBreak is at rest, so the
+        // prescribed flux is zero and so is the gradient; the call is here because the solver makes it
+        // every step, not because the number is interesting on this one.
+        {
+            GeometricField<scalar>& prgh = const_cast<GeometricField<scalar>&>(f.p_rgh);
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                if (prgh.boundary[pi]->updateableSnGrad())
+                    prgh.boundary[pi]->updateSnGrad(
+                        std::vector<scalar>(static_cast<std::size_t>(patches[pi].size), scalar(0)));
+        }
+
+        const SurfaceScalarField snRho  = fvc::snGrad(rhoField, m, g, patches, false);
+        const SurfaceScalarField snPrgh = fvc::snGrad(f.p_rgh,  m, g, patches, false);
+        const SurfaceScalarField snA    = fvc::snGrad(f.alpha1, m, g, patches, false);
+
+        // surfaceTensionForce = interpolate(sigma*K)*snGrad(alpha1)
+        std::vector<scalar> sK;
+        brae::cpu::interfaceProps::sigmaK(K, f.interface.sigma, sK);
+        const SurfaceScalarField sKf = fvc::interpolate(sK, m, g, patches);
+
+        SurfaceScalarField force;
+        {
+            std::vector<scalar> stf(static_cast<std::size_t>(m.nInternalFaces()));
+            for (label fi = 0; fi < m.nInternalFaces(); ++fi) stf[fi] = sKf.internal[fi]*snA.internal[fi];
+            std::vector<scalar> out;
+            momentumSourceFlux(stf, f.ghfInternal, snRho.internal, snPrgh.internal, g.magSf(), out);
+            force.internal = out;
+            force.boundary.resize(patches.size());
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                force.boundary[pi].assign(static_cast<std::size_t>(patches[pi].size), scalar(0));
+        }
+
+        // THE ARM: the reconstructed force, cell by cell, split by how far the cell is from the
+        // interface. A cell whose own alpha and all of whose neighbours' alphas are equal is in the
+        // bulk; anything else is at or beside the interface.
+        const std::vector<vector> R = reconstruct(force, m, g, patches);
+        std::vector<bool> nearIface(static_cast<std::size_t>(nC), false);
+        for (label fi = 0; fi < m.nInternalFaces(); ++fi)
+            if (f.alpha1.internal[m.owner()[fi]] != f.alpha1.internal[m.neighbour()[fi]])
+            { nearIface[m.owner()[fi]] = true; nearIface[m.neighbour()[fi]] = true; }
+
+        scalar bulkMax = 0, ifaceMax = 0;
+        label  nBulk = 0, nIface = 0;
+        for (label c = 0; c < nC; ++c)
+        {
+            const scalar mag = std::sqrt(R[c].x*R[c].x + R[c].y*R[c].y + R[c].z*R[c].z);
+            if (nearIface[c]) { ifaceMax = std::fmax(ifaceMax, mag); ++nIface; }
+            else              { bulkMax  = std::fmax(bulkMax,  mag); ++nBulk;  }
+        }
+        std::printf("  momentum source on damBreak's hydrostatic start:\n");
+        std::printf("    %ld bulk cells      worst |force| = %.3e\n", (long)nBulk,  (double)bulkMax);
+        std::printf("    %ld interface cells worst |force| = %.3e\n", (long)nIface, (double)ifaceMax);
+        check("the momentum source is ZERO in the bulk of each phase -- that is what p_rgh buys",
+              bulkMax <= scalar(1e-9));
+        check("...and NON-zero at the interface, so the zero above is not an empty field",
+              ifaceMax > scalar(1));
+        check("...and the fixture actually has both kinds of cell", nBulk > 100 && nIface > 10);
+
+        // ...and the predictor runs: assemble, relax, add the force, solve.
+        GeometricField<vector> U = buildField<vector>(readField<vector>(startDir + "/U"), patches, nC);
+        U.evaluateBoundary();
+        const std::vector<vector> U0 = U.internal;
+        std::vector<scalar> rhoOld = f.rho, nuEff = f.nu;
+        std::vector<std::vector<scalar>> rhoBnd(patches.size()), nuBnd(patches.size()), phiBnd(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            rhoBnd[pi].resize(static_cast<std::size_t>(patches[pi].size));
+            nuBnd[pi].resize(static_cast<std::size_t>(patches[pi].size));
+            phiBnd[pi].assign(static_cast<std::size_t>(patches[pi].size), scalar(0));
+            for (label i = 0; i < patches[pi].size; ++i)
+            {
+                rhoBnd[pi][i] = f.rho[patches[pi].faceCells[i]];
+                nuBnd[pi][i]  = f.nu [patches[pi].faceCells[i]];
+            }
+        }
+        InterMomentumInput in;
+        in.rhoPhi = &f.rhoPhi.internal; in.rhoPhiBnd = &phiBnd;
+        in.rho = &f.rho; in.rhoOld = &rhoOld; in.rhoBnd = &rhoBnd;
+        in.UOld = &U0;
+        in.nuEff = &nuEff; in.nuEffBnd = &nuBnd;
+        in.deltaT = f.deltaT;
+        in.scheme = f.divRhoPhiU;
+        in.relaxEquationU = true; in.relaxU = scalar(1);   // damBreak: equations { ".*" 1; }
+
+        MomentumSolveControls sc;
+        FvVectorMatrix UEqn;
+        momentumPredictor(U, in, force, sc, m, g, patches, UEqn);
+
+        // THE PREDICTOR ALONE PRODUCES A HUGE INTERFACE VELOCITY, AND THAT IS CORRECT.
+        //
+        // This arm first asserted |U| < 100 m/s and measured 111. The expectation was wrong, not the
+        // code: the face force at the interface is 1.57e+05 N/m^3 and the AIR side of it has rho = 1,
+        // so the acceleration there is 1.57e+05 m/s^2 and one deltaT of 1e-3 gives 157 m/s. The
+        // momentum predictor is an UNBALANCED equation by construction -- surface tension and buoyancy
+        // with no pressure to oppose them -- and the pressure corrector that follows immediately
+        // cancels almost all of it. OpenFOAM does exactly the same; the intermediate U is not a
+        // physical velocity and bounding it would be gating a number nobody uses.
+        //
+        // What IS assertable is the same p_rgh statement carried through the solve: the bulk felt no
+        // force, so after one predictor the bulk is still at rest and everything that moved is at the
+        // interface.
+        scalar maxU = 0, bulkU = 0, ifaceU = 0;
+        for (label c = 0; c < nC; ++c)
+        {
+            const vector& v = U.internal[c];
+            const scalar mg = std::sqrt(v.x*v.x + v.y*v.y + v.z*v.z);
+            maxU = std::fmax(maxU, mg);
+            if (nearIface[c]) ifaceU = std::fmax(ifaceU, mg);
+            else              bulkU  = std::fmax(bulkU,  mg);
+        }
+        std::printf("    after one momentum predictor: max |U| = %.4e m/s"
+                    "  (interface %.4e, bulk %.4e)\n",
+                    (double)maxU, (double)ifaceU, (double)bulkU);
+        check("the predictor solved and U is finite", std::isfinite(maxU) && maxU > scalar(0));
+        check("everything that moved is AT the interface -- the bulk felt no force and did not move",
+              bulkU < scalar(1e-3) * ifaceU);
+        // ...and the magnitude is the unbalanced force over one step, on the light side of the jump.
+        const scalar predicted = ifaceMax / f.mixture.phases.rho2 * f.deltaT;
+        std::printf("    an unbalanced %.3e N/m^3 on rho = %.0f over dt = %.1e predicts %.3e m/s\n",
+                    (double)ifaceMax, (double)f.mixture.phases.rho2, (double)f.deltaT, (double)predicted);
+        check("...and its size is that unbalanced force over one step, within an order of magnitude",
+              ifaceU > scalar(0.1)*predicted && ifaceU < scalar(10)*predicted);
+
+        // A() is positive definite -- the diagonal of a relaxed momentum matrix always is, and rAU is
+        // 1/A(), so a zero or negative entry would make the pressure equation meaningless.
+        const std::vector<scalar> A = matrixA(UEqn, m, g, patches);
+        scalar minA = A[0];
+        for (scalar a : A) minA = std::fmin(minA, a);
+        std::printf("    min UEqn.A() = %.4e\n", (double)minA);
+        check("UEqn.A() is strictly positive everywhere, so rAU = 1/A() is finite", minA > scalar(0));
     }
 
     std::printf("test_inter_case_cpp: %d failures\n", failures);

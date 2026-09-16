@@ -232,13 +232,19 @@ inline void momentumSourceFlux(const std::vector<scalar>& surfaceTensionForce,
                                const std::vector<scalar>& ghf,
                                const std::vector<scalar>& snGradRho,
                                const std::vector<scalar>& snGradPrgh,
-                               const std::vector<scalar>& magSf,
+                               const std::vector<scalar>& magSf,   // the mesh's full face array
                                std::vector<scalar>&       out)
 {
-    const std::size_t n = magSf.size();
-    if (surfaceTensionForce.size() != n || ghf.size() != n
-     || snGradRho.size() != n || snGradPrgh.size() != n)
+    // The three face fields set the length; magSf is the MESH'S FULL FACE ARRAY -- internal faces
+    // first, then the boundary patches -- so it indexes straight through and is only required to be
+    // long enough. compressionFlux carries the same convention, and getting it wrong here cost a run
+    // on damBreak that failed with a length mismatch rather than a wrong number.
+    const std::size_t n = surfaceTensionForce.size();
+    if (ghf.size() != n || snGradRho.size() != n || snGradPrgh.size() != n)
         throw std::runtime_error("brae interFoam UEqn: momentum source face fields differ in length.");
+    if (magSf.size() < n)
+        throw std::runtime_error(
+            "brae interFoam UEqn: magSf is shorter than the face fields it scales.");
     out.resize(n);
     for (std::size_t f = 0; f < n; ++f)
         out[f] = (surfaceTensionForce[f] - ghf[f]*snGradRho[f] - snGradPrgh[f]) * magSf[f];
@@ -297,6 +303,43 @@ void addMomentumPredictorSource(
     const PrimitiveMesh&        m,
     const FvGeometry&           g,
     const std::vector<FvPatch>& patches);
+
+// ---------------------------------------------------------------------------------------------------
+// UEqn.H end to end, on a case: assemble, add the face-force source, solve.
+//
+// WHAT THE SOURCE LOOKS LIKE ON A REAL CASE, and it is the clearest statement of what the p_rgh
+// formulation IS. The momentum predictor's only body force is
+//
+//     fvc::reconstruct((surfaceTensionForce - ghf*snGrad(rho) - snGrad(p_rgh)) * magSf)
+//
+// and on a hydrostatic start -- p_rgh uniform, alpha sharp -- every one of those three terms is
+// IDENTICALLY ZERO except at the interface: snGrad(p_rgh) because p_rgh is uniform, snGrad(rho)
+// because rho is piecewise constant, and the surface tension because snGrad(alpha) is. So the bulk of
+// each phase feels NOTHING from the momentum predictor, and the motion comes from the pressure solve.
+//
+// That is the whole point of solving for p_rgh rather than p: gravity is absorbed into the pressure
+// variable and appears only where the density actually varies. A port that put rho*g in the momentum
+// source instead -- the obvious reading of "add gravity" -- would accelerate the entire water column
+// and then have the pressure solve cancel it, which is a much worse-conditioned problem and gives a
+// different answer at the interface. tests/test_inter_case_cpp.cu asserts the zero directly.
+struct MomentumSolveControls
+{
+    scalar tolU    = 1e-7;
+    scalar relTolU = 0;
+    int    maxIterU = 1000;
+};
+
+// Assemble UEqn, add the reconstructed face force, and solve for U. `faceForce` is the surface field
+// (surfaceTensionForce - ghf*snGrad(rho) - snGrad(p_rgh)) * magSf, formed by the caller so that the
+// three terms are visible where they are chosen.
+void momentumPredictor(GeometricField<vector>&     U,
+                       const InterMomentumInput&   in,
+                       const SurfaceScalarField&   faceForce,
+                       const MomentumSolveControls& sc,
+                       const PrimitiveMesh&        m,
+                       const FvGeometry&           g,
+                       const std::vector<FvPatch>& patches,
+                       FvVectorMatrix&             UEqnOut);
 
 } // namespace interFoam
 } // namespace cpu
