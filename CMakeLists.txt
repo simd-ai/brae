@@ -1778,6 +1778,9 @@ add_dependencies(brae brae_pimpleFoam)
 # so the run died at the hand-over with the case fully parsed. The comment above already said every
 # registered solver belongs here; only the line was missing.
 add_dependencies(brae brae_rhoSimpleFoam)
+# ...and brae_interFoam, added to this list at the same time as its registry row, because the comment
+# above says every registered solver belongs here and the last one to be added was not.
+add_dependencies(brae brae_interFoam)
 
 # End-to-end kOmegaSSTLM (Langtry-Menter transition) vs a SAVED OpenFOAM v2412 oracle (no OF needed at test time):
 # runs brae on a transition flat plate and checks U L2 < 3% and the gammaInt transition is captured.
@@ -1827,6 +1830,12 @@ add_executable(test_cyclic_fvc tests/test_cyclic_fvc.cu)
 target_include_directories(test_cyclic_fvc PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_cyclic_fvc PRIVATE brae_core)
 add_test(NAME cyclic_fvc COMMAND test_cyclic_fvc ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannel)
+
+# brae_interFoam: transient two-phase VoF. Gated against real OpenFOAM on damBreak (alpha 3.4e-09)
+# and capillaryRise (0.7%, the case where surface tension IS the answer).
+add_executable(brae_interFoam src/applications/solvers/interFoam/braeInterFoam.cu)
+target_include_directories(brae_interFoam PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(brae_interFoam PRIVATE brae_core)
 
 # brae_rhoSimpleFoam: steady compressible solver (subsonic, laminar)
 add_executable(brae_rhoSimpleFoam src/applications/solvers/rhoSimpleFoam/gpuRhoSimpleFoam.cu)

@@ -1517,12 +1517,15 @@ COMPONENTS = {
              of_file="applications/solvers/multiphase/interFoam/interFoam.C",
              classification="HOST_ONLY", status="REIMPLEMENT",
              brae_reference="src/applications/solvers/interFoam/inter_solve_cpp.cuh",
-             brae_target="src/applications/solvers/interFoam/brae_inter_foam.cu",
-             validation="tests/test_inter_solve_cpp.cu now -- the sub-cycle against a sub-step whose "
-                        "behaviour is exactly known, and the loop order recorded from the driver "
-                        "itself. tests/interfoam_tutorials_vs_openfoam.sh once the pieces are wired: "
-                        "damBreak first, then capillaryRise (surface tension IS the answer there, so a "
-                        "missing sigma cannot hide), then damBreakWithObstacle in 3D.",
+             brae_target="src/applications/solvers/interFoam/braeInterFoam.cu",
+             validation="SHIPPED and gated end to end. brae_interFoam runs a case from the command line and "
+                        "`brae -case` routes to it (tests/solver_dispatch.sh). Against real OpenFOAM: "
+                        "damBreak alpha 3.4e-09, p_rgh 2.3e-06 and U 3.3e-06 relative "
+                        "(tests/interfoam_dambreak_vs_openfoam.sh); capillaryRise -- where surface "
+                        "tension IS the answer and the only tutorial with a contact angle -- 0.7% "
+                        "(tests/interfoam_capillaryrise_vs_openfoam.sh); the curvature itself to "
+                        "2.5e-14 at four calculateK pass counts "
+                        "(tests/interfoam_curvature_vs_openfoam.sh).",
              note="The time loop, and the sub-cycle inside it. THE SUB-CYCLE is used by 33 of the 44 "
                   "shipped tutorials (23 at nAlphaSubCycles 3), and all three ways to get it wrong "
                   "leave a BOUNDED, plausible alpha field that no boundedness gate sees: running the "
