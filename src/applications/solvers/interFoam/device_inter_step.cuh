@@ -83,6 +83,7 @@ struct DeviceInterStepTaps
     DeviceBuffer<scalar> phiHbyAInt;      // AFTER the two interFoam terms
     DeviceBuffer<scalar> UEqnDiag;        // relaxed, as A() takes it
     DeviceBuffer<scalar> UEqnSourceX;
+    DeviceBuffer<scalar> ddtRhoOld;       // rho.oldTime(), the field the ddt source is built on
 };
 
 struct DeviceInterStepControls
@@ -111,6 +112,19 @@ struct DeviceInterStepControls
     bool   needReference     = false;
     int    pRefCell          = 0;
     scalar pRefValue         = 0;
+    // div(rhoPhi,U), as the case's fvSchemes NAMES it. THIS WAS HARDCODED TO upwind, and damBreak asks
+    // for `Gauss linearUpwind grad(U)` -- which is the one scheme whose MATRIX is pure upwind while the
+    // whole of it lives in a DEFERRED SOURCE CORRECTION. So the diagonal matched the host exactly, to
+    // 1.5e-16 relative, while the source was 0.76% out: precisely the signature that took five other
+    // candidates to eliminate. 24 of the 44 shipped tutorials name linearUpwind here.
+    brae::cpu::DivScheme divScheme = brae::cpu::DivScheme::upwind;
+    scalar divSchemeCoeff          = 1;
+    // the `k` of `grad(U) cellLimited Gauss linear <k>`. gradULimitK is the gradient linearUpwind
+    // NAMES; gradUSchemeLimitK is the gradSchemes `grad(U)` ENTRY, which divDevRhoReff's dev2 term
+    // takes. On interFoam's tutorials they are the same word twice, but they are separate lookups.
+    scalar gradULimitK             = 0;
+    scalar gradUSchemeLimitK       = 0;
+
     // polyMesh::solutionD() -- which coordinate directions the vector equation is SOLVED in. On a 2-D
     // case the empty direction is knocked out, and fvMatrix::H()'s validComponents block skips it. This
     // port hardcoded all three as valid, which on damBreak -- empty front and back -- told H() to solve

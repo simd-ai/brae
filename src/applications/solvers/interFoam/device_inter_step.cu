@@ -166,7 +166,11 @@ void deviceInterStep(
     uin.nuEffCell     = &muCell;           // mu = rho*nuEff, the rho-weighted overload
     uin.nuEffFace     = &muFace;
     uin.nuEffBndFace  = &muBndFace;
-    uin.scheme        = brae::cpu::DivScheme::upwind;
+    uin.scheme            = ctl.divScheme;
+    uin.schemeCoeff       = ctl.divSchemeCoeff;
+    uin.linearUpwind      = (ctl.divScheme == brae::cpu::DivScheme::linearUpwind);
+    uin.gradULimitK       = ctl.gradULimitK;
+    uin.gradUSchemeLimitK = ctl.gradUSchemeLimitK;
     uin.relaxU        = ctl.relaxU;
     uin.relaxEquation = ctl.relaxEquationU;
     uin.ddtRho        = &rho;
@@ -180,6 +184,7 @@ void deviceInterStep(
     probe("muCell", muCell);
     probe("muFace", muFace);
     probe("rhoOld", rhoOld);
+    if (taps) deviceCopy(taps->ddtRhoOld, rhoOld);
 
     gpu::MomentumMatrix UEqn;
     gpu::assembleUEqn(UEqn, dm, dbU, UX, UY, UZ, uin);

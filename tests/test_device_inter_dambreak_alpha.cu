@@ -468,6 +468,26 @@ int main(int argc, char** argv)
         C.pressure.tol = scalar(1e-12);
         C.pressure.maxIter = 4000;
         C.nCorrectors = static_cast<int>(dv.pimple.nCorrectors);
+        // the case's own div(rhoPhi,U). damBreak says `Gauss linearUpwind grad(U)`; the two enums are
+        // separate types with the same members, so the mapping is written out rather than cast.
+        switch (dv.divRhoPhiU)
+        {
+            case DivScheme::linearUpwind:
+                C.divScheme = brae::cpu::DivScheme::linearUpwind;  break;
+            case DivScheme::linearUpwindV:
+                C.divScheme = brae::cpu::DivScheme::linearUpwindV; break;
+            case DivScheme::limitedLinear:
+                C.divScheme = brae::cpu::DivScheme::limitedLinear; break;
+            case DivScheme::limitedLinearV:
+                C.divScheme = brae::cpu::DivScheme::limitedLinearV; break;
+            case DivScheme::LUST:
+                C.divScheme = brae::cpu::DivScheme::LUST;          break;
+            default:
+                C.divScheme = brae::cpu::DivScheme::upwind;        break;
+        }
+        C.divSchemeCoeff = dv.divRhoPhiUCoeff;
+        std::printf("  div(rhoPhi,U) is %s\n",
+                    dv.divRhoPhiU == DivScheme::linearUpwind ? "Gauss linearUpwind grad(U)" : "another scheme");
         { const SolutionDirections sd = solutionDirections(fvp);
           for (int k = 0; k < 3; ++k) C.solutionD[k] = sd.d[k];
           std::printf("  solutionD = (%d %d %d) -- damBreak is 2-D, so one direction is knocked out\n",
@@ -614,6 +634,27 @@ int main(int argc, char** argv)
                 const std::vector<scalar> Ah = matrixA(hUEqn, m, g, fvp);
                 const std::vector<vector> Hh = matrixH(hUEqn, Uh2, m, g, fvp);
 
+                // rho.oldTime(), measured rather than argued about: with viscosity and relax both
+                // ruled out the source IS the ddt, and the ddt has exactly three inputs.
+                {
+                    std::vector<scalar> dRhoOld;
+                    taps.ddtRhoOld.copyTo(dRhoOld);
+                    scalar wRo = 0, sRo = 0;
+                    label iw2 = -1;
+                    for (label c = 0; c < nC; ++c)
+                    {
+                        const scalar e = std::fabs(dRhoOld[c] - rhoOldH[c]);
+                        if (e > wRo) { wRo = e; iw2 = c; }
+                        sRo = std::fmax(sRo, std::fabs(rhoOldH[c]));
+                    }
+                    std::printf("  [bisect] rho.oldTime(): %.4e of %.4e", (double)wRo, (double)sRo);
+                    if (iw2 >= 0)
+                        std::printf("  (cell %ld: device %.17g, host %.17g; alpha_old there %.17g)",
+                                    (long)iw2, (double)dRhoOld[iw2], (double)rhoOldH[iw2],
+                                    (double)warmAlpha[iw2]);
+                    std::printf("\n");
+                }
+
                 std::vector<scalar> dSrc;
                 taps.UEqnSourceX.copyTo(dSrc);
                 scalar wS = 0, sS = 0;
@@ -673,6 +714,44 @@ int main(int argc, char** argv)
                     }
                     std::printf("  [bisect] with nuEff ZEROED: source.x %.4e of %.4e\n",
                                 (double)w0, (double)x0s);
+                }
+
+                // BISECT #2: RELAX OFF on both sides. damBreak says `equations { ".*" 1; }`, which
+                // relaxEquation() FINDS, so relax(1) runs and adds (relaxedDiag - rawDiag)*psi to the
+                // source -- on the synthetic gate that clamp moved the diagonal by 1.2e+03 of 1.0e+06.
+                // If the gap vanishes without it, the relax source is the fault; if it survives, the
+                // ddt assembly is.
+                {
+                    InterMomentumInput hm1 = hm;
+                    hm1.relaxEquationU = false;
+                    const FvVectorMatrix h1 = assembleUEqn(Uh2, hm1, m, g, fvp);
+
+                    DeviceInterStepTaps t1;
+                    DeviceInterStepControls C1 = C;
+                    C1.relaxEquationU = false;
+                    DeviceBuffer<scalar> c1(warmAlpha), c1o(warmAlpha);
+                    DeviceBuffer<scalar> wx(x0), wy(y0), wz(z0), wox(x0), woy(y0), woz(z0);
+                    DeviceBuffer<scalar> rI2(dv.phi.internal), rB2(flatten(dv.phi.boundary));
+                    DeviceBuffer<scalar> rOI(dv.phi.internal), rOB(flatten(dv.phi.boundary));
+                    DeviceBuffer<scalar> rp3(dv.p_rgh.internal), rp4;
+                    DeviceBuffer<scalar> rn(dv.nHatf.internal), rnb(flatten(dv.nHatf.boundary));
+                    DeviceBuffer<scalar> rab(pv2(dv.alpha1)), rk(dv.K);
+                    DeviceBuffer<scalar> zrho, zmu, znu, zri, zrb;
+                    DeviceVectorBoundary db1 = buildDeviceVectorBoundary(dv.U, fvp, g);
+                    deviceInterStep(dm, dt, C1, pr2, H, Gh, Ghf, MagSf, c1, c1o, wx, wy, wz,
+                                    wox, woy, woz, rI2, rB2, rOI, rOB, dUFixes, rp3, rp4, rn, rnb,
+                                    rab, rk, dFixes, dFlag, db1, zrho, zmu, znu, zri, zrb, &t1);
+                    cudaDeviceSynchronize();
+                    std::vector<scalar> s1;
+                    t1.UEqnSourceX.copyTo(s1);
+                    scalar w1 = 0, x1s = 0;
+                    for (label c = 0; c < nC; ++c)
+                    {
+                        w1  = std::fmax(w1, std::fabs(s1[c] - h1.source[c].x));
+                        x1s = std::fmax(x1s, std::fabs(h1.source[c].x));
+                    }
+                    std::printf("  [bisect] with RELAX OFF:     source.x %.4e of %.4e\n",
+                                (double)w1, (double)x1s);
                 }
 
                 scalar wR = 0, sR = 0, wH = 0, sH = 0, wD = 0, sD = 0;
