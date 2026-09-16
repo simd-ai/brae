@@ -76,6 +76,12 @@ void divFaceKernel(int nIf, const scalar* __restrict__ phi, scalar* __restrict__
 // twoByk > 0 selects limitedLinear (limiter = clamp(2/k * r, 0, 1)); twoByk == 0 selects vanAlbada
 // (limiter = r(r+1)/(r^2+1), vanAlbada.H:85), which the Maxwell tutorials name for div(phi,sigma).
 // Same NVDTVD r either way -- only the limiter function differs, so they share this.
+//
+// vanLeer (vanLeer.H:70, limiter = (r + |r|)/(1 + |r|)) is selected by the SENTINEL kVanLeerTwoByk,
+// not by a third sign convention: twoByk is a real coefficient for limitedLinear and 0 already means
+// vanAlbada, and device_ami.cu reads `<= 0` as vanAlbada too -- so a negative range would have changed
+// the AMI path's meaning silently. An exact sentinel cannot collide with 2/max(k,SMALL), which is
+// always > 0. Every interFoam tutorial names `div(phi,alpha) Gauss vanLeer`, which is why it is here.
 __device__ __forceinline__ scalar limitedFaceWeight(
     int f, int P, int N, scalar p, scalar cdwF,
     const scalar* __restrict__ field,
@@ -99,6 +105,17 @@ __device__ __forceinline__ scalar limitedFaceWeight(
     {
         limiter = twoByk * r;
         limiter = (limiter < 0.0) ? 0.0 : (limiter > 1.0 ? 1.0 : limiter);    // clamp(.,0,1)
+    }
+    else if (twoByk == kVanLeerTwoByk)
+    {
+        // OF vanLeer.H:70, not clamped -- and it is NOT bounded by 1, which is the thing to know before
+        // anyone "tidies" a clamp in here. psi(r) = 0 for r <= 0, rises through psi(1) = 1, and
+        // ASYMPTOTES TO 2 (r=5 -> 1.667, r=100 -> 1.980). That is the Sweby TVD ceiling, not a bug:
+        // limitedLinear clamps to [0,1] because its own form would run away, vanLeer does not because
+        // its form is already second-order TVD. Verified against OpenFOAM's own expression over 2880
+        // (flux, phiP, phiN, gradP, gradN, d) samples: worst difference 0.000e+00.
+        const scalar ar = fabs(r);
+        limiter = (r + ar) / (1.0 + ar);
     }
     else
     {

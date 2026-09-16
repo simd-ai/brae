@@ -357,6 +357,13 @@ void deviceFaceDivSource(const DeviceMesh& dm, const DeviceBuffer<scalar>& ffc, 
 void deviceDivUpwindCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt,
                            DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& upper, DeviceBuffer<scalar>& lower);
 // limitedLinear convection (OF "Gauss limitedLinear k_"): implicit limited face weight W_f = limiter*CDweight +
+// THE LIMITER SELECTOR carried in `twoByk` everywhere below. It is a real coefficient for limitedLinear
+// (2/max(k,SMALL), always > 0); 0 already means vanAlbada; and kVanLeerTwoByk selects vanLeer. A sentinel
+// rather than a sign convention, because device_ami.cu reads `twoByk <= 0` as vanAlbada and a negative
+// RANGE would have changed the AMI path's meaning without a word. vanLeer is what every interFoam
+// tutorial names for div(phi,alpha) -- OF vanLeer.H:70, limiter = (r + |r|)/(1 + |r|).
+constexpr scalar kVanLeerTwoByk = -1.0;
+
 // (1-limiter)*pos0(phi), limiter = clamp(twoByk*r, 0, 1), r = NVDTVD ratio from grad(field). twoByk = 2/max(k_,SMALL)
 // (k_=1 -> twoByk=2). gx/gy/gz = cell grad(field) (Gauss). Reduces to deviceDivUpwindCoeffs at limiter=0.
 void deviceDivCentralCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt,

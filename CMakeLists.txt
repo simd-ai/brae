@@ -3686,7 +3686,9 @@ add_test(NAME node_cli COMMAND test_node_cli)
 # what a failure looks like to someone at a terminal.
 add_test(NAME brae_run
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/brae_run.sh $<TARGET_FILE:brae> python3)
-set_tests_properties(brae_run PROPERTIES TIMEOUT 120)
+# brae-agent is optional (built only with libcurl headers), and `brae job` execs it -- so a box without
+# it must SKIP, not fail. The GH200 reported 9 red checks for exactly this on 2026-09-16.
+set_tests_properties(brae_run PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 set_tests_properties(node_cli PROPERTIES TIMEOUT 60)
 
 # The real transport, against a deliberately awkward local server: a redirect that would leak the bearer token,
