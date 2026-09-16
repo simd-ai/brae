@@ -495,6 +495,64 @@ int main(int argc, char** argv)
         check("...and a non-wedge patch does not (control)", otherOne);
     }
 
+    // ---- 5b. AN EMPTY PATCH CONTRIBUTES NOTHING -------------------------------------------------
+    // emptyFvPatch::size() is 0 in OpenFOAM (emptyFvPatch.H:79), so MULES' boundary loops are simply
+    // never entered for one. brae's FvPatch keeps the faces, so the skip has to be explicit -- and it
+    // was missing, while fvc::div right next door carried it. It is latent on damBreak and
+    // capillaryRise because their empty-patch flux happens to be zero; this arm makes it NOT zero,
+    // which is the only way to see the difference. Every 2D VoF case has two empty patches carrying
+    // the largest faces in the mesh.
+    {
+        Case c = makeCase();
+        for (FvPatch& q : c.fvp)
+            if (q.name == "wallZmin" || q.name == "wallZmax") q.type = "empty";
+
+        // WHERE IT IS OBSERVABLE, and it took two tries to find out. On the EXPLICIT path a boundary
+        // flux cannot reach the limiter at all: boundedDonorFlux overwrites phiBD with phiPsi on every
+        // non-coupled patch, so phiCorr there is identically zero, and the only thing an empty patch
+        // could still touch -- sumPhiBD in the budget -- does not move any clamp on this fixture.
+        // Comparing alpha instead of lambda did not help: explicitSolve goes through fvc::div, which
+        // already skips empty patches, so that arm was measuring fvc::div's skip and NOT MULES's, and
+        // removing MULES's own skip left it green.
+        //
+        // CMULES is where it bites. limitCorr takes phiCorr from the CALLER, boundary and all, so an
+        // empty patch's faces enter sumPhip/mSumPhim and the outlet test directly.
+        auto runCorr = [&](scalar patchFlux)
+        {
+            GeometricField<scalar> a = makeAlpha(c, kN/3);
+            SurfaceScalarField corr = centralFlux(c, a);
+            for (std::size_t pi = 0; pi < c.fvp.size(); ++pi)
+                if (c.fvp[pi].name == "wallZmin" || c.fvp[pi].name == "wallZmax")
+                    corr.boundary[pi].assign(static_cast<std::size_t>(c.fvp[pi].size), patchFlux);
+            mules::Fields f;
+            mules::Controls ctl; ctl.nLimiterIter = 5;
+            mules::Limiter lam;
+            mules::limitCorr(scalar(1)/kDt, a, c.phi, corr, f, ctl, c.m, c.g, c.fvp, &lam);
+            return lam.internal;
+        };
+
+        const std::vector<scalar> quiet = runCorr(scalar(0));
+        const std::vector<scalar> loud  = runCorr(scalar(1e3));
+        scalar worst = 0;
+        for (std::size_t i = 0; i < quiet.size(); ++i)
+            worst = std::fmax(worst, std::fabs(quiet[i] - loud[i]));
+        std::printf("  CMULES, empty patches carrying 0 vs 1e3: worst change in lambda = %.3e\n",
+                    (double)worst);
+        check("a flux on an EMPTY patch changes nothing -- OpenFOAM never sees those faces",
+              worst == scalar(0));
+
+        // CONTROL: the same flux on a REAL patch does change it, or the arm above would pass for a
+        // limiter that ignores every boundary.
+        for (FvPatch& q : c.fvp)
+            if (q.name == "wallZmin" || q.name == "wallZmax") q.type = "wall";
+        const std::vector<scalar> real = runCorr(scalar(1e3));
+        scalar worstReal = 0;
+        for (std::size_t i = 0; i < quiet.size(); ++i)
+            worstReal = std::fmax(worstReal, std::fabs(quiet[i] - real[i]));
+        std::printf("  ...and the same flux on a WALL patch instead: %.3e\n", (double)worstReal);
+        check("...while the same flux on a real patch does change it (control)", worstReal > scalar(1e-6));
+    }
+
     // ---- 6. the controls that have a non-obvious default -------------------------------------------
     {
         const std::string base = "/tmp/brae_mules";

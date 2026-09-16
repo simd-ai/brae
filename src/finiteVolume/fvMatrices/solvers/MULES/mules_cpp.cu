@@ -146,6 +146,13 @@ void limiter(Limiter&                      lambda,
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const FvPatch& q = patches[pi];
+        // AN EMPTY PATCH CONTRIBUTES NOTHING. emptyFvPatch::size() is 0 in OpenFOAM
+        // (emptyFvPatch.H:79), so every one of these loop bodies is simply never entered there --
+        // the extrema, sumPhiBD and the phiCorr accumulation all skip it. brae's FvPatch keeps the
+        // faces, so the skip has to be explicit, and fvc::div already carries the same line for the
+        // same reason. Without it a 2D case -- which is damBreak, capillaryRise and most VoF
+        // tutorials -- folds its front and back faces into every cell's flux budget.
+        if (q.type == "empty") continue;
         const std::vector<scalar>& pv = psi.boundary[pi]->value();
         const bool fixesValue = psi.boundary[pi]->fixesValue();
 
@@ -228,6 +235,7 @@ void limiter(Limiter&                      lambda,
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
             const FvPatch& q = patches[pi];
+            if (q.type == "empty") continue;            // see the note above
             for (label i = 0; i < q.size; ++i)
             {
                 const label ci = q.faceCells[i];
@@ -453,6 +461,7 @@ void limiterCorr(Limiter&                      lambda,
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const FvPatch& q = patches[pi];
+        if (q.type == "empty") continue;                // see limiter(), above
         const std::vector<scalar>& pv = psi.boundary[pi]->value();
         const bool fixesValue = psi.boundary[pi]->fixesValue();
         for (label i = 0; i < q.size; ++i)
@@ -524,6 +533,7 @@ void limiterCorr(Limiter&                      lambda,
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
             const FvPatch& q = patches[pi];
+            if (q.type == "empty") continue;            // see the note above
             for (label i = 0; i < q.size; ++i)
             {
                 const label ci = q.faceCells[i];
