@@ -118,6 +118,10 @@ RunReport runInterFoam(const std::string&          caseDir,
                     };
                     alphaEqnSubCycle(f.alphaCtl.nAlphaSubCycles, rep.deltaT,
                                      f.alpha1.internal, alphaOld, f.rhoPhi, step1);
+                    // ...and the boundary with it. Dropping this was tried together with the reset in
+                    // alphaEqnStep: damBreak's alpha went thirty times further from OpenFOAM and
+                    // capillaryRise did not move, so the extra evaluations are load-bearing rather
+                    // than spurious.
                     f.alpha1.evaluateBoundary();
                     break;
                 }

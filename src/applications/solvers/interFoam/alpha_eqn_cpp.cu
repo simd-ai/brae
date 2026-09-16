@@ -357,7 +357,14 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
         throw std::runtime_error("brae interFoam alphaEqn: nAlphaCorr must be at least 1.");
     const label nC = m.nCells();
 
-    // The alpha field starts each sub-step from its old time.
+    // The alpha field starts each sub-step from its old time, boundary included.
+    //
+    // REMOVING THIS evaluateBoundary WAS TRIED AND IS WRONG. The reasoning looked sound -- OpenFOAM's
+    // subCycle does not reset alpha1, and on a contact-angle patch every evaluate() runs the `limit
+    // gradient` clamp and moves the wall gradient, so an extra one should advance a boundary the
+    // solver has not advanced. Measured: damBreak's alpha went from 3.43e-09 to 1.05e-07 against
+    // OpenFOAM, thirty times worse, and capillaryRise did not move at all. The boundary must be
+    // consistent with the internal field this assignment has just changed.
     alpha1.internal = alpha1Old;
     alpha1.evaluateBoundary();
 
@@ -415,6 +422,14 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
                 for (std::size_t i = 0; i < alphaPhi10.boundary[pi].size(); ++i)
                     alphaPhi10.boundary[pi][i] += prevCorr->boundary[pi][i];
         }
+
+        // alphaEqn.H:151-153 -- alpha2 = 1 - alpha1, then mixture.correct(), INSIDE the MULESCorr
+        // block and before the corrector loop. That is a calculateK pass of its own, and since the
+        // curvature is a fixed point in its passes (see interface_properties_cpp.cu) one pass short is
+        // not a rounding difference. Missing it put damBreak at 1.05e-07 against OpenFOAM where the
+        // full sequence gives 3.4e-09 -- thirty times worse, and only visible because damBreak is the
+        // case that sets MULESCorr.
+        interfaceProps::calculateK(alpha1, ic, m, g, patches, /*gradLeastSquares=*/false, nHatf, K);
     }
 
     for (label aCorr = 0; aCorr < in.nAlphaCorr; ++aCorr)
