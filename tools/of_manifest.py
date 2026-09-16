@@ -1732,7 +1732,15 @@ COMPONENTS = {
                         "gained an optional fvm::ddt(rho,U) applied BEFORE relax(), and a relaxEquation "
                         "flag so relax(1) still runs the diagonal-dominance clamp -- damBreak's "
                         "fvSolution says `equations { \".*\" 1; }` and skipping it there would differ "
-                        "from OpenFOAM on every shipped interFoam tutorial.",
+                        "from OpenFOAM on every shipped interFoam tutorial. "
+                        "THE ASSEMBLED MATRIX IS GATED WHOLE (tests/test_device_inter_ueqn_assembly.cu) "
+                        "against the host's assembleUEqn on a VoF state: off-diagonals and boundary "
+                        "coefficients bit-identical, the relaxed diagonal 1.1e-13 of 1.0e+06 and the "
+                        "source 5.8e-11 of 4.5e+05. Two things it measures that no solved field could: "
+                        "relax(1)'s diagonal-dominance clamp MOVES the diagonal by 1.2e+03, so skipping "
+                        "relax at alpha == 1 is a different matrix; and passing rho for rho.oldTime() "
+                        "puts the ddt source 1000.0x out in exactly 64 of 512 cells -- one layer, the "
+                        "one the interface crossed.",
              note="fvm::ddt(rho,U) + fvm::div(rhoPhi,U) + MRF.DDt(rho,U) + turbulence->divDevRhoReff(rho,U), "
                   "with the momentum predictor's source reconstructed from surfaceTensionForce() - "
                   "ghf*snGrad(rho) - snGrad(p_rgh). Assembly from pieces brae already had, EXCEPT two. "
