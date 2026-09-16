@@ -2,6 +2,8 @@
 #include "device_inter_peqn.cuh"
 #include "device_fvc_reconstruct.cuh"
 #include "device_mesh.cuh"
+#include "device_ldu.cuh"
+#include "device_simple.cuh"
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
@@ -96,6 +98,33 @@ __global__ void ddtCorrBoundaryKernel(
 }
 
 // pe.source += fvc::div(phiHbyA)*V -- a PLUS, fvMatrix::operator== (fvMatrix.C:1855-1862).
+__global__ void addPhiHbyATermsKernel(
+    const scalar* __restrict__ rhoRAUf, const scalar* __restrict__ ddtCorr,
+    const scalar* __restrict__ phig, int n, int haveDdt, scalar* __restrict__ phiHbyA)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= n) return;
+    if (haveDdt) phiHbyA[f] += rhoRAUf[f]*ddtCorr[f];
+    phiHbyA[f] += phig[f];
+}
+
+__global__ void addPhigBoundaryKernel(const scalar* __restrict__ phig, int n,
+                                      scalar* __restrict__ phiHbyA)
+{
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    // the boundary half of phig, WITHOUT ddtCorr -- see the header
+    if (b < n) phiHbyA[b] += phig[b];
+}
+
+// fvMatrix::flux() at a boundary face: internalCoeffs*p[faceCell] - boundaryCoeffs.
+__global__ void pFluxBoundaryKernel(
+    const label* __restrict__ bndCell, const scalar* __restrict__ iC, const scalar* __restrict__ bC,
+    const scalar* __restrict__ p, int nBf, scalar* __restrict__ flux)
+{
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b < nBf) flux[b] = iC[b]*p[bndCell[b]] - bC[b];
+}
+
 __global__ void addDivSourceKernel(const scalar* __restrict__ div, const scalar* __restrict__ V,
                                    int nC, scalar* __restrict__ source)
 {
@@ -312,6 +341,70 @@ void deviceInterAssemblePEqn(
                 "value-fixing patch is singular without it, so this cannot be defaulted away.");
         setReferenceKernel<<<1, 1>>>(pRefCell, pRefValue, P.diag.data(), P.source.data());
         ckP(cudaGetLastError(), "setReference");
+    }
+}
+
+
+void deviceInterAddPhiHbyATerms(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& rhoRAUfInt,
+    const DeviceBuffer<scalar>& ddtCorrInt,
+    const DeviceBuffer<scalar>& phigInt,
+    const DeviceBuffer<scalar>& phigBnd,
+    bool                        haveDdtCorr,
+    DeviceBuffer<scalar>&       phiHbyAInt,
+    DeviceBuffer<scalar>&       phiHbyABnd)
+{
+    const int nIf = dm.nInternalFaces, nBf = dm.nBndFaces;
+    if (static_cast<int>(phiHbyAInt.size()) != nIf || static_cast<int>(phiHbyABnd.size()) != nBf)
+        throw std::runtime_error(
+            "brae interFoam device pEqn: phiHbyA must already hold fvc::flux(HbyA) on BOTH sides. The "
+            "boundary half is not decoration -- fvc::div(phiHbyA) sums it, so it is how a wall's "
+            "buoyancy and surface tension reach the pressure equation's source.");
+    if (nIf > 0)
+    {
+        addPhiHbyATermsKernel<<<nBlocks(nIf), TPB>>>(
+            rhoRAUfInt.data(), haveDdtCorr ? ddtCorrInt.data() : nullptr, phigInt.data(),
+            nIf, haveDdtCorr ? 1 : 0, phiHbyAInt.data());
+        ckP(cudaGetLastError(), "phiHbyA += rhoRAUf*ddtCorr + phig");
+    }
+    if (nBf > 0)
+    {
+        addPhigBoundaryKernel<<<nBlocks(nBf), TPB>>>(phigBnd.data(), nBf, phiHbyABnd.data());
+        ckP(cudaGetLastError(), "phiHbyA += phig, boundary");
+    }
+}
+
+
+void deviceInterPEqnFlux(
+    const DeviceMesh&           dm,
+    const DevicePressureMatrix& P,
+    const DeviceBuffer<scalar>& iC,
+    const DeviceBuffer<scalar>& bC,
+    const DeviceBuffer<scalar>& pSolved,
+    DeviceBuffer<scalar>&       fluxInt,
+    DeviceBuffer<scalar>&       fluxBnd)
+{
+    const int nBf = dm.nBndFaces;
+    DeviceLduView A{};
+    A.nCells = dm.nCells;
+    A.nInternalFaces = dm.nInternalFaces;
+    A.diag = P.diag.data();
+    A.upper = P.upper.data();
+    A.lower = P.lower.data();
+    A.owner = dm.owner.data();
+    A.nei = dm.nei.data();
+    A.ownerStart = dm.ownerStart.data();
+    A.losort = dm.losort.data();
+    A.losortStart = dm.losortStart.data();
+    deviceMatrixFluxInternal(A, pSolved, fluxInt);
+
+    fluxBnd.resize(static_cast<std::size_t>(nBf));
+    if (nBf > 0)
+    {
+        pFluxBoundaryKernel<<<nBlocks(nBf), TPB>>>(dm.bndCell.data(), iC.data(), bC.data(),
+                                                   pSolved.data(), nBf, fluxBnd.data());
+        ckP(cudaGetLastError(), "pEqn.flux(), boundary");
     }
 }
 

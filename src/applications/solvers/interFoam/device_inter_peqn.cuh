@@ -121,6 +121,45 @@ struct DevicePressureMatrix
     DeviceBuffer<scalar> source;               // extensive
 };
 
+// phiHbyA's two interFoam-only terms, added to the flux of HbyA that the shared pressure predictor
+// already built (pEqn.H:36-42):
+//
+//     phiHbyA += fvc::interpolate(rho*rAU) * fvc::ddtCorr(U, phi)      internal faces only
+//     phiHbyA += phig                                                  internal faces AND boundary
+//
+// THE BOUNDARY HALF OF phig IS NOT OPTIONAL. `phiHbyA += phig` in pEqn.H is a whole-surfaceScalarField
+// operation and fvc::div(phiHbyA) sums the boundary faces, so a wall's buoyancy and surface tension
+// enter the PRESSURE EQUATION'S SOURCE through it. Adding phig to the internal faces alone drops that
+// entirely -- and at a contact-angle wall it is the term the contact angle exists to apply. On
+// capillaryRise, where momentumPredictor is off, the pressure corrector is the ONLY route surface
+// tension has into the solution at all.
+//
+// ddtCorr has NO boundary half here: OpenFOAM's expression multiplies it by interpolate(rho*rAU), a
+// field fvc::interpolate builds on the internal faces, and the host reference adds it there only.
+void deviceInterAddPhiHbyATerms(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& rhoRAUfInt,     // interpolate(rho*rAU)
+    const DeviceBuffer<scalar>& ddtCorrInt,
+    const DeviceBuffer<scalar>& phigInt,
+    const DeviceBuffer<scalar>& phigBnd,
+    bool                        haveDdtCorr,    // false on a start from rest
+    DeviceBuffer<scalar>&       phiHbyAInt,
+    DeviceBuffer<scalar>&       phiHbyABnd);
+
+// phi = phiHbyA - p_rghEqn.flux(), pEqn.H:56. fvMatrix::flux() is
+//     internal  upper*p[nei] - lower*p[own]
+//     boundary  internalCoeffs*p[faceCell] - boundaryCoeffs      <- the face CELL's value, not the patch's
+// and `phi = phiHbyA - flux` is what makes phi conservative. The flux is ALSO what the velocity
+// correction reads, so it is returned rather than folded away.
+void deviceInterPEqnFlux(
+    const DeviceMesh&           dm,
+    const DevicePressureMatrix& P,
+    const DeviceBuffer<scalar>& iC,
+    const DeviceBuffer<scalar>& bC,
+    const DeviceBuffer<scalar>& pSolved,
+    DeviceBuffer<scalar>&       fluxInt,
+    DeviceBuffer<scalar>&       fluxBnd);
+
 void deviceInterAssemblePEqn(
     const DeviceMesh&           dm,
     const DeviceBuffer<scalar>& rAUfInt,       // fvc::interpolate(rAU) on the internal faces

@@ -24,6 +24,7 @@
 #include "device_fvc_reconstruct.cuh"
 #include "fvm.cuh"
 #include "fvc.cuh"
+#include "fv_matrix_ops.cuh"
 #include "device_mesh.cuh"
 #include <algorithm>
 #include <cmath>
@@ -462,6 +463,161 @@ int main()
         int nOther = 0;
         for (label c = 0; c < nC; ++c) if (c != 3 && rd[c] != dd[c]) ++nOther;
         check("...and touches no other cell", nOther == 0);
+    }
+
+    // ---- 7. phiHbyA's two interFoam terms, and phi = phiHbyA - pEqn.flux() -----------------------
+    {
+        const label nFaces = static_cast<label>(g.magSf().size());
+
+        // fvc::flux(HbyA) stands in for whatever the shared pressure predictor produced -- what is
+        // under test is the two terms added to it.
+        std::vector<scalar> baseInt(static_cast<std::size_t>(nIf)), baseBnd;
+        for (label f = 0; f < nIf; ++f)
+            baseInt[f] = scalar(0.2)*std::cos(scalar(0.23)*scalar(f)) * g.magSf()[f];
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                const label gf = fvp[pi].start + i;
+                baseBnd.push_back(scalar(0.2)*std::cos(scalar(0.23)*scalar(gf)) * g.magSf()[gf]);
+            }
+
+        std::vector<scalar> rhoRAUfInt, phigAll(nFaces), ddtInt(static_cast<std::size_t>(nIf));
+        ifm::rhoRAUf(rho, rAU, m, g, rhoRAUfInt);
+        for (label f = 0; f < nFaces; ++f)
+            phigAll[f] = (stf[f] - ghf[f]*snRho[f]) * rAUf[f] * g.magSf()[f];
+        for (label f = 0; f < nIf; ++f)
+            ddtInt[f] = scalar(12)*std::sin(scalar(0.41)*scalar(f));
+
+        // the HOST's own composition, written out as pEqn.H does it
+        std::vector<scalar> wantInt(static_cast<std::size_t>(nIf)), wantBnd(baseBnd);
+        for (label f = 0; f < nIf; ++f)
+            wantInt[f] = baseInt[f] + rhoRAUfInt[f]*ddtInt[f] + phigAll[f];
+        {
+            label off = 0;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                for (label i = 0; i < fvp[pi].size; ++i)
+                    wantBnd[off + i] += phigAll[fvp[pi].start + i];
+                off += fvp[pi].size;
+            }
+        }
+
+        std::vector<scalar> phigInt(phigAll.begin(), phigAll.begin() + nIf), phigBndV;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            for (label i = 0; i < fvp[pi].size; ++i)
+                phigBndV.push_back(phigAll[fvp[pi].start + i]);
+
+        DeviceBuffer<scalar> dBaseI(baseInt), dBaseB(baseBnd), dRhoRAUf(rhoRAUfInt),
+                             dDdt(ddtInt), dPhigI(phigInt), dPhigB(phigBndV);
+        deviceInterAddPhiHbyATerms(dm, dRhoRAUf, dDdt, dPhigI, dPhigB, /*haveDdtCorr=*/true,
+                                   dBaseI, dBaseB);
+        std::vector<scalar> gotI, gotB;
+        dBaseI.copyTo(gotI);
+        dBaseB.copyTo(gotB);
+        std::printf("  phiHbyA terms: internal %.3e, boundary %.3e\n",
+                    (double)worst(gotI, wantInt), (double)worst(gotB, wantBnd));
+        check("phiHbyA's two extra terms match the host, internal and boundary",
+              worst(gotI, wantInt) == scalar(0) && worst(gotB, wantBnd) == scalar(0));
+
+        // THE BOUNDARY HALF OF phig IS NOT DECORATION: fvc::div(phiHbyA) sums it, so dropping it
+        // changes the PRESSURE EQUATION'S SOURCE. On capillaryRise, where momentumPredictor is off,
+        // that is the only route surface tension has into the solution at all.
+        {
+            SurfaceScalarField withB, withoutB;
+            withB.internal = gotI;
+            withoutB.internal = gotI;
+            withB.boundary.resize(fvp.size());
+            withoutB.boundary.resize(fvp.size());
+            label off = 0;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                for (label i = 0; i < fvp[pi].size; ++i)
+                {
+                    withB.boundary[pi].push_back(gotB[off + i]);
+                    withoutB.boundary[pi].push_back(baseBnd[off + i]);   // phig never added
+                }
+                off += fvp[pi].size;
+            }
+            const std::vector<scalar> dW = fvc::div(withB, m, g, fvp);
+            const std::vector<scalar> dN = fvc::div(withoutB, m, g, fvp);
+            scalar d = 0, sc = 0;
+            for (label c = 0; c < nC; ++c)
+            {
+                d  = std::fmax(d, std::fabs(dW[c] - dN[c]));
+                sc = std::fmax(sc, std::fabs(dW[c]));
+            }
+            std::printf("  dropping phig's BOUNDARY half moves div(phiHbyA) by %.3e of %.3e\n",
+                        (double)d, (double)sc);
+            check("the boundary half of phig reaches the pressure equation's source",
+                  d > scalar(0.01)*sc);
+        }
+
+        // ---- phi = phiHbyA - pEqn.flux() ----------------------------------------------------------
+        {
+            std::vector<scalar> rAUfInt(static_cast<std::size_t>(nIf));
+            for (label f = 0; f < nIf; ++f)
+            {
+                const scalar w = g.weights()[f];
+                rAUfInt[f] = w*rAU[m.owner()[f]] + (scalar(1) - w)*rAU[m.neighbour()[f]];
+            }
+            SurfaceScalarField rAUfField;
+            rAUfField.internal = rAUfInt;
+            rAUfField.boundary.resize(fvp.size());
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                for (label i = 0; i < fvp[pi].size; ++i)
+                    rAUfField.boundary[pi].push_back(rAU[fvp[pi].faceCells[i]]);
+
+            // ONE fixedValue p_rgh patch. A zeroGradient scalar contributes (0, 0) to a laplacian's
+            // boundary coefficients, so flux() there is identically zero and the boundary arm would be
+            // comparing two zeros -- which is how this fixture was first written. A fixedValue patch
+            // gives it something to compute, and damBreak's atmosphere (totalPressure) fixes a value
+            // for the same reason.
+            GeometricField<scalar> prgh2;
+            prgh2.internal = p_rgh;
+            for (const FvPatch& q : fvp)
+            {
+                if (q.name == "inlet")
+                    prgh2.boundary.push_back(std::make_unique<FixedValuePatchField<scalar>>(
+                        q, true, scalar(0), std::vector<scalar>{}));
+                else
+                    prgh2.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
+            }
+            prgh2.evaluateBoundary();
+            FvScalarMatrix pe = fvm::laplacian<scalar>(rAUfField, prgh2, m, g, fvp, false);
+            const SurfaceScalarField hostFlux = matrixFlux(pe, p_rgh, m, fvp);
+
+            std::vector<scalar> iCv, bCv;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                for (label i = 0; i < fvp[pi].size; ++i)
+                {
+                    iCv.push_back(pe.internalCoeffs[pi][i]);
+                    bCv.push_back(pe.boundaryCoeffs[pi][i]);
+                }
+
+            DeviceBuffer<scalar> dRAUfI(rAUfInt), dZI(std::vector<scalar>(nIf, scalar(0))),
+                                 dZB(std::vector<scalar>(nBf, scalar(0)));
+            DevicePressureMatrix P2;
+            deviceInterAssemblePEqn(dm, dRAUfI, dZI, dZB, false, 0, scalar(0), P2);
+            DeviceBuffer<scalar> dIC(iCv), dBC(bCv), dP(p_rgh), fI, fB;
+            deviceInterPEqnFlux(dm, P2, dIC, dBC, dP, fI, fB);
+            std::vector<scalar> gI, gB, wB;
+            fI.copyTo(gI);
+            fB.copyTo(gB);
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                for (scalar v : hostFlux.boundary[pi]) wB.push_back(v);
+            scalar s1 = 0, s2 = 0;
+            for (label f = 0; f < nIf; ++f) s1 = std::fmax(s1, std::fabs(hostFlux.internal[f]));
+            for (label b = 0; b < nBf; ++b) s2 = std::fmax(s2, std::fabs(wB[b]));
+            std::printf("  pEqn.flux(): internal %.3e of %.3e, boundary %.3e of %.3e\n",
+                        (double)worst(gI, hostFlux.internal), (double)s1,
+                        (double)worst(gB, wB), (double)s2);
+            check("pEqn.flux() matches the host, internal and boundary",
+                  worst(gI, hostFlux.internal) <= scalar(1e-14)*s1
+               && worst(gB, wB) <= scalar(1e-14)*std::fmax(s2, scalar(1e-300)));
+            check("...and it is not zero, so the flux is really being computed", s1 > scalar(1e-12));
+            check("...on the BOUNDARY too, which needs a patch that contributes coefficients at all",
+                  s2 > scalar(1e-12));
+        }
     }
 
     std::printf("test_device_inter_peqn: %d failures\n", failures);

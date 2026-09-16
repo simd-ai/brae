@@ -1775,7 +1775,12 @@ COMPONENTS = {
                         "2.2e+00 -- with two arms a solved field could not show: fvMatrix::operator== is "
                         "a PLUS (taking it as a minus moves the source by twice its own size, and still "
                         "converges), and setReference DOUBLES the diagonal entry rather than replacing "
-                        "the row, touching no other cell.",
+                        "the row, touching no other cell. phiHbyA's two interFoam-only terms and "
+                        "pEqn.flux() are bit-identical to the host on both sides -- and dropping phig's "
+                        "BOUNDARY half moves fvc::div(phiHbyA) by 9.4e+01 of 1.9e+02, half the source, "
+                        "because `phiHbyA += phig` is a whole-surfaceScalarField operation and the "
+                        "divergence sums the boundary faces. On capillaryRise, where momentumPredictor "
+                        "is off, that is the only route surface tension has into the solution.",
              note="rAU = 1/UEqn.A(), phiHbyA, the p_rgh laplacian, then U and phi rebuilt. Four things "
                   "are not shared with any other pressure corrector. (1) phig carries NO snGrad(p_rgh) "
                   "where UEqn's source does -- the pressure gradient is explicit there and IMPLICIT "
