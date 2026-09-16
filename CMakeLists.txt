@@ -130,6 +130,7 @@ add_library(brae_core STATIC
     src/applications/solvers/simpleFoam/createFields_cpp.cu
     src/applications/solvers/interFoam/inter_driver_cpp.cu
     src/applications/solvers/interFoam/inter_case_cpp.cu
+    src/transportModels/interfaceProperties/device_interface_properties.cu
     src/transportModels/twoPhaseMixture/device_two_phase_mixture.cu
     src/transportModels/interfaceProperties/interface_properties_cpp.cu
     src/applications/solvers/interFoam/inter_solve_cpp.cu
@@ -3059,6 +3060,17 @@ add_executable(test_device_two_phase_mixture tests/test_device_two_phase_mixture
 target_include_directories(test_device_two_phase_mixture PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_device_two_phase_mixture PRIVATE brae_core)
 add_test(NAME device_two_phase_mixture COMMAND test_device_two_phase_mixture)
+
+# ...and the interface normal and curvature. Unlike the mixture this CANNOT be bit-for-bit: K is a
+# reduction and the device sums a cell's faces in a different order from the host's serial loop, so a
+# difference is guaranteed and only its size is in question. The per-face half has no reduction and is
+# held to 4 ULP; K to 1e-12 relative, which is four orders below the curvature it measures.
+add_executable(test_device_interface_properties tests/test_device_interface_properties.cu)
+target_include_directories(test_device_interface_properties PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_interface_properties PRIVATE brae_core)
+add_test(NAME device_interface_properties COMMAND test_device_interface_properties)
+set_tests_properties(device_interface_properties PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(device_two_phase_mixture PROPERTIES SKIP_RETURN_CODE 77)
 
 add_test(NAME two_phase_mixture
