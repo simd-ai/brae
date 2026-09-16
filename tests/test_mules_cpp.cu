@@ -526,6 +526,201 @@ int main(int argc, char** argv)
         check("no solvers entry for the field is refused", threw);
     }
 
+    // ---- 7. CMULES: the semi-implicit path ---------------------------------------------------------
+    // Selected by `MULESCorr yes` -- 13 of the 44 shipped tutorials, damBreak included. Four things
+    // differ from the explicit path and each is asserted separately; see the header for why.
+    {
+        const std::string base = "/tmp/brae_cmules";
+        std::filesystem::remove_all(base);
+        auto write = [&](const std::string& dir, const std::string& body)
+        {
+            std::filesystem::create_directories(base + "/" + dir);
+            std::ofstream(base + "/" + dir + "/fvSolution")
+                << "FoamFile { version 2.0; format ascii; class dictionary; object fvSolution; }\n"
+                << "solvers\n{\n    \"alpha.water.*\"\n    {\n" << body << "    }\n}\n";
+            return readDict(base + "/" + dir + "/fvSolution");
+        };
+
+        // (D) nLimiterIter is MANDATORY here and OPTIONAL there. The pair is the arm: the same
+        //     dictionary must be accepted by one reader and refused by the other, or the difference is
+        //     not being modelled at all.
+        const FoamDict noIter = write("noiter", "        nAlphaCorr 1;\n");
+        checkNum("the explicit limiter defaults nLimiterIter to 3",
+                 scalar(mules::readControls(noIter, "alpha.water").nLimiterIter), scalar(3));
+        bool threw = false;
+        try { (void)mules::readControlsCorr(noIter, "alpha.water"); }
+        catch (const std::exception&) { threw = true; }
+        check("...and CMULES REFUSES the same dictionary -- get<label>, no default", threw);
+        const FoamDict withIter = write("with", "        nLimiterIter 5;\n");
+        checkNum("CMULES reads nLimiterIter when it is given (control)",
+                 scalar(mules::readControlsCorr(withIter, "alpha.water").nLimiterIter), scalar(5));
+
+        const Case c = makeCase();
+        mules::Fields f;
+        mules::Controls ctl; ctl.nLimiterIter = 5;
+
+        // (A) correct() uses the CURRENT psi, not psi.oldTime(). With a zero correction it must be the
+        //     IDENTITY -- the implicit solve has already advanced the field and there is nothing left
+        //     to add. The explicit form would hand back psi.oldTime() instead, silently undoing it.
+        {
+            GeometricField<scalar> a = makeAlpha(c, kN/3);
+            std::vector<scalar> advanced = a.internal;
+            for (scalar& v : advanced) v = scalar(0.5)*v + scalar(0.25);   // "after the implicit solve"
+            const std::vector<scalar> before = advanced;
+            const std::vector<scalar> old    = a.internal;                 // deliberately DIFFERENT
+
+            SurfaceScalarField zero;
+            zero.internal.assign(static_cast<std::size_t>(c.m.nInternalFaces()), scalar(0));
+            zero.boundary.resize(c.fvp.size());
+            for (std::size_t pi = 0; pi < c.fvp.size(); ++pi)
+                zero.boundary[pi].assign(static_cast<std::size_t>(c.fvp[pi].size), scalar(0));
+
+            mules::correct(scalar(1)/kDt, advanced, zero, f, c.m, c.g, c.fvp);
+            scalar wIdent = 0, wOld = 0;
+            for (std::size_t i = 0; i < advanced.size(); ++i)
+            {
+                wIdent = std::fmax(wIdent, std::fabs(advanced[i] - before[i]));
+                wOld   = std::fmax(wOld,   std::fabs(advanced[i] - old[i]));
+            }
+            std::printf("  CMULES correct with zero phiCorr: |psi - psi_in| = %.3e, |psi - psi_old| = %.3e\n",
+                        (double)wIdent, (double)wOld);
+            check("a zero correction leaves psi exactly where the implicit solve put it", wIdent == scalar(0));
+            check("...and that is NOT psi.oldTime(), so the two forms are distinguishable",
+                  wOld > scalar(0.1));
+        }
+
+        // (B + the limiter) boundedness, as an increment. psi is already advanced and in bounds; the
+        // correction alone would push it out. CMULES must stop it, and the unlimited control must not.
+        {
+            GeometricField<scalar> a;
+            a.internal.resize(static_cast<std::size_t>(c.m.nCells()));
+            for (label i = 0; i < c.m.nCells(); ++i) a.internal[i] = (i < kN/3) ? scalar(1) : scalar(0);
+            for (const FvPatch& q : c.fvp)
+                a.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
+            a.evaluateBoundary();
+
+            // a correction big enough to overshoot: the difference between central and upwind, scaled
+            SurfaceScalarField corr;
+            corr.internal.resize(static_cast<std::size_t>(c.m.nInternalFaces()));
+            for (label i = 0; i < c.m.nInternalFaces(); ++i)
+            {
+                const label o = c.m.owner()[i], n = c.m.neighbour()[i];
+                const scalar up = (c.phi.internal[i] >= 0) ? a.internal[o] : a.internal[n];
+                const scalar cd = scalar(0.5)*(a.internal[o] + a.internal[n]);
+                corr.internal[i] = scalar(4) * c.phi.internal[i] * (cd - up);
+            }
+            corr.boundary.resize(c.fvp.size());
+            for (std::size_t pi = 0; pi < c.fvp.size(); ++pi)
+                corr.boundary[pi].assign(static_cast<std::size_t>(c.fvp[pi].size), scalar(0));
+
+            std::vector<scalar> unlimited = a.internal;
+            SurfaceScalarField rawCorr = corr;
+            mules::correct(scalar(1)/kDt, unlimited, rawCorr, f, c.m, c.g, c.fvp);
+            scalar wRaw = 0;
+            for (scalar v : unlimited) wRaw = std::fmax(wRaw, std::fmax(-v, v - scalar(1)));
+
+            GeometricField<scalar> lim;
+            lim.internal = a.internal;
+            for (const FvPatch& q : c.fvp)
+                lim.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
+            lim.evaluateBoundary();
+            SurfaceScalarField limCorr = corr;
+            mules::Limiter lam;
+            mules::correctLimited(scalar(1)/kDt, lim, c.phi, limCorr, f, ctl, c.m, c.g, c.fvp, &lam);
+            scalar wLim = 0;
+            for (scalar v : lim.internal) wLim = std::fmax(wLim, std::fmax(-v, v - scalar(1)));
+
+            std::printf("  CMULES as an increment: limited excursion %.3e, UNLIMITED %.3e\n",
+                        (double)wLim, (double)wRaw);
+            check("CMULES keeps psi in [0,1]", wLim <= scalar(1e-14));
+            check("...and the unlimited correction does not (control)", wRaw > scalar(1e-3));
+
+            // limitCorr scales phiCorr IN PLACE -- it does not rebuild a blended flux.
+            bool scaled = true;
+            for (std::size_t i = 0; i < limCorr.internal.size(); ++i)
+                scaled = scaled && (std::fabs(limCorr.internal[i]
+                                            - lam.internal[i]*corr.internal[i]) <= scalar(1e-15));
+            check("limitCorr multiplies phiCorr by lambda in place", scaled);
+        }
+
+        // (C) UNCOUPLED BOUNDARIES ARE LIMITED, BUT OUTLETS ONLY -- AND "OUTLET" MEANS THE TOTAL FLUX.
+        //
+        //     The explicit path has no such branch, because its boundary correction is identically
+        //     zero. Here it is not, and OpenFOAM's test is
+        //
+        //         if ((phi[f] + phiCorr[f]) > SMALL*SMALL)     CMULESTemplates.C:545
+        //
+        //     -- the DONOR PLUS THE CORRECTION, not the prescribed flux. A face whose prescribed flux
+        //     is an inflow but whose corrected flux leaves the domain is limited like any other outlet.
+        //     This arm was written first against `phi` alone and the inlet came back limited: the
+        //     correction there was large enough to reverse the total. The three cases below pin the
+        //     test on the right quantity by construction.
+        {
+            GeometricField<scalar> a;
+            a.internal.resize(static_cast<std::size_t>(c.m.nCells()));
+            for (label i = 0; i < c.m.nCells(); ++i) a.internal[i] = (i < kN/3) ? scalar(1) : scalar(0);
+            for (const FvPatch& q : c.fvp)
+                a.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
+            a.evaluateBoundary();
+
+            // `inletCorr` is the correction put on the INLET patch, whose prescribed flux is -kU.
+            auto inletLambda = [&](scalar inletCorr)
+            {
+                SurfaceScalarField corr;
+                corr.internal.resize(static_cast<std::size_t>(c.m.nInternalFaces()));
+                for (label i = 0; i < c.m.nInternalFaces(); ++i)
+                {
+                    const label o = c.m.owner()[i], n = c.m.neighbour()[i];
+                    const scalar up = (c.phi.internal[i] >= 0) ? a.internal[o] : a.internal[n];
+                    const scalar cd = scalar(0.5)*(a.internal[o] + a.internal[n]);
+                    corr.internal[i] = scalar(4) * c.phi.internal[i] * (cd - up);
+                }
+                corr.boundary.resize(c.fvp.size());
+                for (std::size_t pi = 0; pi < c.fvp.size(); ++pi)
+                {
+                    const FvPatch& q = c.fvp[pi];
+                    const scalar v = (q.name == "inlet")  ? inletCorr
+                                   : (q.name == "outlet") ? scalar(2)
+                                                          : scalar(0);
+                    corr.boundary[pi].assign(static_cast<std::size_t>(q.size), v);
+                }
+                mules::Limiter lam;
+                SurfaceScalarField work = corr;
+                mules::limitCorr(scalar(1)/kDt, a, c.phi, work, f, ctl, c.m, c.g, c.fvp, &lam);
+                scalar inLam = 1, outLam = 1;
+                for (std::size_t pi = 0; pi < c.fvp.size(); ++pi)
+                {
+                    if (c.fvp[pi].name == "inlet")
+                        for (scalar l : lam.boundary[pi]) inLam = std::fmin(inLam, l);
+                    if (c.fvp[pi].name == "outlet")
+                        for (scalar l : lam.boundary[pi]) outLam = std::fmin(outLam, l);
+                }
+                return std::pair<scalar,scalar>{inLam, outLam};
+            };
+
+            // 1. a genuine inlet: phi = -1, correction +0.5, total -0.5 -> NOT limited
+            const auto inflow = inletLambda(scalar(0.5));
+            std::printf("  CMULES boundary: inlet phi %+.1f corr %+.1f total %+.1f -> lambda %.6f\n",
+                        (double)(-kU), 0.5, (double)(-kU + 0.5), (double)inflow.first);
+            check("a boundary face whose TOTAL flux enters the domain is left unlimited",
+                  inflow.first >= scalar(1) - scalar(1e-12));
+
+            // 2. the outlet on the same run: phi = +1, correction +2 -> limited
+            std::printf("  CMULES boundary: outlet phi %+.1f corr %+.1f total %+.1f -> lambda %.6f\n",
+                        (double)kU, 2.0, (double)(kU + 2.0), (double)inflow.second);
+            check("...while the outlet on the same run IS limited (control)",
+                  inflow.second < scalar(1) - scalar(1e-9));
+
+            // 3. THE DISCRIMINATOR: the same inlet patch, correction +2, total +1 -> limited, because
+            //    the test is on the total and not on the prescribed flux.
+            const auto reversed = inletLambda(scalar(2));
+            std::printf("  CMULES boundary: inlet phi %+.1f corr %+.1f total %+.1f -> lambda %.6f\n",
+                        (double)(-kU), 2.0, (double)(-kU + 2.0), (double)reversed.first);
+            check("an INFLOW face whose correction reverses the total IS limited -- the test is on "
+                  "phi + phiCorr, not on phi", reversed.first < scalar(1) - scalar(1e-9));
+        }
+    }
+
     std::printf("test_mules_cpp: %d failures\n", failures);
     return failures ? 1 : 0;
 }

@@ -17,6 +17,11 @@ namespace {
 // against a rare zero.
 constexpr scalar kRootVSmall = scalar(1.0e-150);
 
+// OpenFOAM's SMALL*SMALL, the threshold CMULES tests the boundary flux against to decide whether a face
+// is an outlet. Not zero: a face whose total flux is numerically nothing counts as an inlet and is left
+// unlimited, which is the conservative side to err on.
+constexpr scalar kSmallSquared = scalar(1.0e-15) * scalar(1.0e-15);
+
 inline scalar at(const std::vector<scalar>* f, std::size_t i, scalar constantValue)
 {
     return f ? (*f)[i] : constantValue;
@@ -359,6 +364,279 @@ void explicitSolveLimited(scalar                        rDeltaT,
     psi.evaluateBoundary();
     limit(rDeltaT, psi, psiOld, phi, phiPsi, f, c, m, g, patches, lambdaOut);
     explicitSolve(rDeltaT, psi.internal, psiOld, phiPsi, f, m, g, patches);
+    psi.evaluateBoundary();
+}
+
+// ---------------------------------------------------------------------------------------------------
+// CMULES -- see the header for A, B, C and D, the four things that make this not the explicit path.
+
+Controls readControlsCorr(const FoamDict& fvSolution, const std::string& psiName)
+{
+    const FoamDict* solvers = fvSolution.subDict("solvers");
+    const FoamDict* sd = solvers ? solvers->subDict(psiName) : nullptr;
+    if (!sd)
+        throw std::runtime_error(
+            "brae CMULES: fvSolution has no `solvers/" + psiName + "` entry.");
+
+    Controls c;
+    // D: nLimiterIter is get<label> here, not getOrDefault. A case that asks for MULESCorr and omits it
+    // is a FatalError in OpenFOAM, and defaulting it to 3 would run that case with an iteration count
+    // nobody chose.
+    const scalar n = sd->scalarOr("nLimiterIter", scalar(-1));
+    if (n < 0)
+        throw std::runtime_error(
+            "brae CMULES: `nLimiterIter` is missing from solvers/" + psiName + ". The semi-implicit "
+            "path reads it with get<label> and has NO default (CMULESTemplates.C:225), unlike the "
+            "explicit limiter which defaults it to 3. OpenFOAM FatalErrors here.");
+    c.nLimiterIter = static_cast<label>(n);
+    if (c.nLimiterIter < 1)
+        throw std::runtime_error("brae CMULES: nLimiterIter must be at least 1.");
+    c.smoothLimiter = sd->scalarOr("smoothLimiter", scalar(0));
+    c.extremaCoeff  = sd->scalarOr("extremaCoeff",  scalar(0));
+    c.boundaryExtremaCoeff = sd->scalarOr("boundaryExtremaCoeff", c.extremaCoeff);
+    return c;
+}
+
+
+void limiterCorr(Limiter&                      lambda,
+                 scalar                        rDeltaT,
+                 const GeometricField<scalar>& psi,
+                 const SurfaceScalarField&     phi,
+                 const SurfaceScalarField&     phiCorr,
+                 const Fields&                 f,
+                 const Controls&               c,
+                 const PrimitiveMesh&          m,
+                 const FvGeometry&             g,
+                 const std::vector<FvPatch>&   patches)
+{
+    const label nC  = m.nCells();
+    const label nIf = m.nInternalFaces();
+    const std::vector<label>&  own = m.owner();
+    const std::vector<label>&  nei = m.neighbour();
+    const std::vector<scalar>& V   = g.V();
+    const std::vector<scalar>& psiIf = psi.internal;
+
+    const scalar boundaryDeltaExtremaCoeff =
+        std::fmax(c.boundaryExtremaCoeff - c.extremaCoeff, scalar(0));
+
+    lambda.internal.assign(static_cast<std::size_t>(nIf), scalar(1));
+    lambda.boundary.assign(patches.size(), std::vector<scalar>{});
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        lambda.boundary[pi].assign(static_cast<std::size_t>(patches[pi].size), scalar(1));
+
+    // The swapped initialisation, exactly as in the explicit limiter.
+    std::vector<scalar> psiMaxn(static_cast<std::size_t>(nC));
+    std::vector<scalar> psiMinn(static_cast<std::size_t>(nC));
+    for (label ci = 0; ci < nC; ++ci)
+    {
+        psiMaxn[ci] = at(f.psiMin, ci, scalar(0));
+        psiMinn[ci] = at(f.psiMax, ci, scalar(1));
+    }
+
+    // B: NO sumPhiBD. There is no donor flux here -- it went through the implicit matrix.
+    std::vector<scalar> sumPhip (static_cast<std::size_t>(nC), scalar(0));
+    std::vector<scalar> mSumPhim(static_cast<std::size_t>(nC), scalar(0));
+
+    for (label fi = 0; fi < nIf; ++fi)
+    {
+        const label o = own[fi], n = nei[fi];
+        psiMaxn[o] = std::fmax(psiMaxn[o], psiIf[n]);
+        psiMinn[o] = std::fmin(psiMinn[o], psiIf[n]);
+        psiMaxn[n] = std::fmax(psiMaxn[n], psiIf[o]);
+        psiMinn[n] = std::fmin(psiMinn[n], psiIf[o]);
+
+        const scalar pc = phiCorr.internal[fi];
+        if (pc > scalar(0)) { sumPhip[o]  += pc; mSumPhim[n] += pc; }
+        else                { mSumPhim[o] -= pc; sumPhip[n]  -= pc; }
+    }
+
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& q = patches[pi];
+        const std::vector<scalar>& pv = psi.boundary[pi]->value();
+        const bool fixesValue = psi.boundary[pi]->fixesValue();
+        for (label i = 0; i < q.size; ++i)
+        {
+            const label ci = q.faceCells[i];
+            if (fixesValue)
+            {
+                psiMaxn[ci] = std::fmax(psiMaxn[ci], pv[i]);
+                psiMinn[ci] = std::fmin(psiMinn[ci], pv[i]);
+            }
+            else if (boundaryDeltaExtremaCoeff > scalar(0))
+            {
+                const scalar extrema = boundaryDeltaExtremaCoeff
+                                     * (at(f.psiMax, ci, scalar(1)) - at(f.psiMin, ci, scalar(0)));
+                psiMaxn[ci] += extrema;
+                psiMinn[ci] -= extrema;
+            }
+            const scalar pc = phiCorr.boundary[pi][i];
+            if (pc > scalar(0)) sumPhip[ci]  += pc;
+            else                mSumPhim[ci] -= pc;
+        }
+    }
+
+    for (label ci = 0; ci < nC; ++ci)
+    {
+        const scalar pMax = at(f.psiMax, ci, scalar(1));
+        const scalar pMin = at(f.psiMin, ci, scalar(0));
+        psiMaxn[ci] = std::fmin(psiMaxn[ci] + c.extremaCoeff * (pMax - pMin), pMax);
+        psiMinn[ci] = std::fmax(psiMinn[ci] - c.extremaCoeff * (pMax - pMin), pMin);
+        if (c.smoothLimiter > scalar(1e-15))
+        {
+            psiMaxn[ci] = std::fmin(c.smoothLimiter*psiIf[ci]
+                                  + (scalar(1) - c.smoothLimiter)*psiMaxn[ci], pMax);
+            psiMinn[ci] = std::fmax(c.smoothLimiter*psiIf[ci]
+                                  + (scalar(1) - c.smoothLimiter)*psiMinn[ci], pMin);
+        }
+    }
+
+    // A and B together: the budget is measured against psi AS IT STANDS -- rho*psi, the current values
+    // -- with no donor term. CMULESTemplates.C:400-412.
+    for (label ci = 0; ci < nC; ++ci)
+    {
+        const scalar rhoC = at(f.rho, ci, scalar(1));
+        const scalar SpC  = at(f.Sp,  ci, scalar(0));
+        const scalar SuC  = at(f.Su,  ci, scalar(0));
+        const scalar a = (rhoC*rDeltaT - SpC);
+        const scalar b = rhoC*psiIf[ci]*rDeltaT;
+        const scalar mx = V[ci]*(a*psiMaxn[ci] - SuC - b);
+        const scalar mn = V[ci]*(SuC - a*psiMinn[ci] + b);
+        psiMaxn[ci] = mx;
+        psiMinn[ci] = mn;
+    }
+
+    std::vector<scalar> sumlPhip (static_cast<std::size_t>(nC));
+    std::vector<scalar> mSumlPhim(static_cast<std::size_t>(nC));
+
+    for (label it = 0; it < c.nLimiterIter; ++it)
+    {
+        std::fill(sumlPhip.begin(),  sumlPhip.end(),  scalar(0));
+        std::fill(mSumlPhim.begin(), mSumlPhim.end(), scalar(0));
+
+        for (label fi = 0; fi < nIf; ++fi)
+        {
+            const label o = own[fi], n = nei[fi];
+            const scalar lpc = lambda.internal[fi] * phiCorr.internal[fi];
+            if (lpc > scalar(0)) { sumlPhip[o]  += lpc; mSumlPhim[n] += lpc; }
+            else                 { mSumlPhim[o] -= lpc; sumlPhip[n]  -= lpc; }
+        }
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const FvPatch& q = patches[pi];
+            for (label i = 0; i < q.size; ++i)
+            {
+                const label ci = q.faceCells[i];
+                const scalar lpc = lambda.boundary[pi][i] * phiCorr.boundary[pi][i];
+                if (lpc > scalar(0)) sumlPhip[ci]  += lpc;
+                else                 mSumlPhim[ci] -= lpc;
+            }
+        }
+
+        for (label ci = 0; ci < nC; ++ci)
+        {
+            sumlPhip[ci]  = clamp01((sumlPhip[ci]  + psiMaxn[ci]) / (mSumPhim[ci] + kRootVSmall));
+            mSumlPhim[ci] = clamp01((mSumlPhim[ci] + psiMinn[ci]) / (sumPhip[ci]  + kRootVSmall));
+        }
+        const std::vector<scalar>& lambdam = sumlPhip;
+        const std::vector<scalar>& lambdap = mSumlPhim;
+
+        for (label fi = 0; fi < nIf; ++fi)
+        {
+            const label o = own[fi], n = nei[fi];
+            lambda.internal[fi] = (phiCorr.internal[fi] > scalar(0))
+                ? std::fmin(lambda.internal[fi], std::fmin(lambdap[o], lambdam[n]))
+                : std::fmin(lambda.internal[fi], std::fmin(lambdam[o], lambdap[n]));
+        }
+
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const FvPatch& q = patches[pi];
+            if (q.type == "wedge")
+            {
+                std::fill(lambda.boundary[pi].begin(), lambda.boundary[pi].end(), scalar(0));
+                continue;
+            }
+            // C: the branch the explicit limiter does not have. phiCorr is genuinely non-zero on the
+            // boundary here, so it has to be limited -- but ONLY where the total flux LEAVES the
+            // domain. OpenFOAM's own comment is "Limit outlet faces only". Limiting an inlet would
+            // throttle a prescribed inflow, and the threshold is SMALL*SMALL, not 0, so a face with a
+            // numerically-zero flux counts as an inlet and is left alone.
+            for (label i = 0; i < q.size; ++i)
+            {
+                const scalar total = phi.boundary[pi][i] + phiCorr.boundary[pi][i];
+                if (total <= kSmallSquared) continue;
+                const label ci = q.faceCells[i];
+                lambda.boundary[pi][i] = (phiCorr.boundary[pi][i] > scalar(0))
+                    ? std::fmin(lambda.boundary[pi][i], lambdap[ci])
+                    : std::fmin(lambda.boundary[pi][i], lambdam[ci]);
+            }
+        }
+        // syncTools::syncFaceList(minEqOp) -- parallel only, and absent for the same reason as above.
+    }
+}
+
+
+void limitCorr(scalar                        rDeltaT,
+               const GeometricField<scalar>& psi,
+               const SurfaceScalarField&     phi,
+               SurfaceScalarField&           phiCorr,
+               const Fields&                 f,
+               const Controls&               c,
+               const PrimitiveMesh&          m,
+               const FvGeometry&             g,
+               const std::vector<FvPatch>&   patches,
+               Limiter*                      lambdaOut)
+{
+    Limiter lambda;
+    limiterCorr(lambda, rDeltaT, psi, phi, phiCorr, f, c, m, g, patches);
+
+    // phiCorr *= lambda, IN PLACE. No blended flux is formed: there is nothing to blend against.
+    for (std::size_t fi = 0; fi < phiCorr.internal.size(); ++fi)
+        phiCorr.internal[fi] *= lambda.internal[fi];
+    for (std::size_t pi = 0; pi < phiCorr.boundary.size(); ++pi)
+        for (std::size_t i = 0; i < phiCorr.boundary[pi].size(); ++i)
+            phiCorr.boundary[pi][i] *= lambda.boundary[pi][i];
+
+    if (lambdaOut) *lambdaOut = lambda;
+}
+
+
+void correct(scalar                      rDeltaT,
+             std::vector<scalar>&        psi,
+             const SurfaceScalarField&   phiCorr,
+             const Fields&               f,
+             const PrimitiveMesh&        m,
+             const FvGeometry&           g,
+             const std::vector<FvPatch>& patches)
+{
+    const std::vector<scalar> divPhiCorr = fvc::div(phiCorr, m, g, patches);
+    const label nC = m.nCells();
+    for (label ci = 0; ci < nC; ++ci)
+    {
+        // A: rho*psi, both CURRENT. explicitSolve's rho.oldTime()*psi.oldTime() would re-do the time
+        // step from the old state carrying only the correction, discarding the implicit solve.
+        const scalar rhoC = at(f.rho, ci, scalar(1));
+        const scalar num  = rhoC*psi[ci]*rDeltaT + at(f.Su, ci, scalar(0)) - divPhiCorr[ci];
+        const scalar den  = rhoC*rDeltaT - at(f.Sp, ci, scalar(0));
+        psi[ci] = num / den;
+    }
+}
+
+
+void correctLimited(scalar                        rDeltaT,
+                    GeometricField<scalar>&       psi,
+                    const SurfaceScalarField&     phi,
+                    SurfaceScalarField&           phiCorr,
+                    const Fields&                 f,
+                    const Controls&               c,
+                    const PrimitiveMesh&          m,
+                    const FvGeometry&             g,
+                    const std::vector<FvPatch>&   patches,
+                    Limiter*                      lambdaOut)
+{
+    limitCorr(rDeltaT, psi, phi, phiCorr, f, c, m, g, patches, lambdaOut);
+    correct(rDeltaT, psi.internal, phiCorr, f, m, g, patches);
     psi.evaluateBoundary();
 }
 

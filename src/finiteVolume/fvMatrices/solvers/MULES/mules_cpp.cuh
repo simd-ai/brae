@@ -177,6 +177,101 @@ void explicitSolveLimited(scalar                        rDeltaT,
                           const std::vector<FvPatch>&   patches,
                           Limiter*                      lambdaOut = nullptr);
 
+// ---------------------------------------------------------------------------------------------------
+// CMULES -- the SEMI-IMPLICIT path, selected by `MULESCorr yes` (13 of the 44 shipped interFoam
+// tutorials, damBreak among them).
+//
+//   provenance: src/finiteVolume/fvMatrices/solvers/MULES/CMULESTemplates.C
+//                 :38-76    correct()     -- the update
+//                 :203-568  limiterCorr() -- the limiter
+//                 :570-627  limitCorr()   -- phiCorr *= lambda
+//
+// WHAT CHANGES, AND WHY. With MULESCorr the upwind part of the alpha equation is solved IMPLICITLY as a
+// matrix (alphaEqn.H:103-122) instead of being carried explicitly. So by the time CMULES runs, psi has
+// ALREADY been advanced a full time step; what is left is the antidiffusive correction alone. That one
+// fact produces every difference below, and each is a place a port that reuses the explicit code is
+// quietly wrong.
+//
+// A. correct() USES THE CURRENT psi AND THE CURRENT rho:
+//
+//        psi = (rho*psi*rDeltaT + Su - surfaceIntegrate(phiCorr)) / (rho*rDeltaT - Sp)
+//
+//    where explicitSolve uses rho.oldTime()*psi.oldTime(). Substituting psi.oldTime() here throws away
+//    the implicit solve's result and re-does the time step from the old state with only the correction
+//    flux -- which loses the entire upwind advection. The field stays bounded, so a boundedness gate
+//    does not notice; the interface simply stops moving at the right speed.
+//
+// B. THE BUDGET TRANSFORM CARRIES NO sumPhiBD (CMULESTemplates.C:400-412). There is no bounded donor
+//    flux in CMULES -- it went through the matrix -- so the budget is measured against psi as it
+//    stands, not against psi.oldTime() plus a donor step. Copying the explicit transform brings a term
+//    that does not exist here.
+//
+// C. UNCOUPLED BOUNDARY FACES ARE LIMITED, BUT OUTLETS ONLY (CMULESTemplates.C:537-561):
+//
+//        if ((phi[f] + phiCorr[f]) > SMALL*SMALL)   // "Limit outlet faces only"
+//
+//    In explicit MULES the boundary correction is identically zero (phiBD is overwritten with phiPsi),
+//    so its uncoupled patches need no branch at all. Here phiCorr arrives from the caller and IS
+//    non-zero on the boundary, so it must be limited -- but only where the total flux leaves the
+//    domain. Limiting an inlet would throttle a prescribed inflow.
+//
+// D. nLimiterIter IS MANDATORY HERE (`get<label>`, CMULESTemplates.C:225), where the explicit limiter
+//    defaults it to 3. A case that sets `MULESCorr yes` and omits nLimiterIter is a FatalError in
+//    OpenFOAM. Defaulting it would run the case OpenFOAM refuses, with an iteration count nobody chose.
+//
+// The two limiters are kept as two functions, as OpenFOAM keeps them, rather than merged behind a flag.
+// Merging would put A, B and C behind branches in one body and hide precisely what this comment exists
+// to name.
+
+// Like readControls, but nLimiterIter has NO DEFAULT -- see D.
+Controls readControlsCorr(const FoamDict& fvSolution, const std::string& psiName);
+
+// MULES::limiterCorr, CMULESTemplates.C:203-568. `phi` is needed only for the outlet test in C.
+void limiterCorr(Limiter&                      lambda,
+                 scalar                        rDeltaT,
+                 const GeometricField<scalar>& psi,
+                 const SurfaceScalarField&     phi,
+                 const SurfaceScalarField&     phiCorr,
+                 const Fields&                 f,
+                 const Controls&               c,
+                 const PrimitiveMesh&          m,
+                 const FvGeometry&             g,
+                 const std::vector<FvPatch>&   patches);
+
+// MULES::limitCorr, CMULESTemplates.C:570-627: phiCorr *= lambda, IN PLACE. Note it does not rebuild a
+// blended flux -- there is nothing to blend against.
+void limitCorr(scalar                        rDeltaT,
+               const GeometricField<scalar>& psi,
+               const SurfaceScalarField&     phi,
+               SurfaceScalarField&           phiCorr,
+               const Fields&                 f,
+               const Controls&               c,
+               const PrimitiveMesh&          m,
+               const FvGeometry&             g,
+               const std::vector<FvPatch>&   patches,
+               Limiter*                      lambdaOut = nullptr);
+
+// MULES::correct, CMULESTemplates.C:38-76 -- see A.
+void correct(scalar                      rDeltaT,
+             std::vector<scalar>&        psi,
+             const SurfaceScalarField&   phiCorr,
+             const Fields&               f,
+             const PrimitiveMesh&        m,
+             const FvGeometry&           g,
+             const std::vector<FvPatch>& patches);
+
+// limitCorr then correct -- what alphaEqn.H:183-193 calls.
+void correctLimited(scalar                        rDeltaT,
+                    GeometricField<scalar>&       psi,
+                    const SurfaceScalarField&     phi,
+                    SurfaceScalarField&           phiCorr,
+                    const Fields&                 f,
+                    const Controls&               c,
+                    const PrimitiveMesh&          m,
+                    const FvGeometry&             g,
+                    const std::vector<FvPatch>&   patches,
+                    Limiter*                      lambdaOut = nullptr);
+
 } // namespace MULES
 } // namespace cpu
 } // namespace brae

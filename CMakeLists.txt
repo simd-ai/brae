@@ -128,6 +128,7 @@ add_library(brae_core STATIC
     src/applications/solvers/simpleFoam/simpleFoamV2.cu
     src/applications/solvers/simpleFoam/pEqn_cpp.cu
     src/applications/solvers/simpleFoam/createFields_cpp.cu
+    src/applications/solvers/interFoam/inter_peqn_cpp.cu
     src/finiteVolume/fvMatrices/solvers/MULES/mules_cpp.cu
     src/applications/solvers/interFoam/alpha_eqn_cpp.cu
     src/applications/solvers/interFoam/inter_ueqn_cpp.cu
@@ -3105,6 +3106,17 @@ target_link_libraries(test_mules_cpp PRIVATE brae_core)
 add_test(NAME mules_cpp
          COMMAND test_mules_cpp
                  ${BRAE_OF_TUTORIALS}/multiphase/interFoam/laminar/damBreak/damBreak)
+
+# interFoam step 10: pEqn.H. Only the four things that are NOT shared with every other pressure
+# corrector -- where the pressure gradient went (explicit in UEqn, implicit here), ddtCorr's
+# interpolate(rho*rAU) weighting, the /rAUf inside the velocity reconstruction, and the reference that
+# moves p AND rebuilds p_rgh. Two of the four are invisible unless rho and rAU actually vary, which is
+# what the fixture is built for.
+add_executable(test_inter_peqn_cpp tests/test_inter_peqn_cpp.cu)
+target_include_directories(test_inter_peqn_cpp PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_peqn_cpp PRIVATE brae_core)
+add_test(NAME inter_peqn_cpp COMMAND test_inter_peqn_cpp)
 
 # These five read damBreak's own dictionaries. A box without OpenFOAM must SKIP, not report green: the
 # arms silently stopped running the moment $FOAM_TUTORIALS was empty, and nothing said so.
