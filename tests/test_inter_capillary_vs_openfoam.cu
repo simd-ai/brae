@@ -31,11 +31,19 @@
 //       of the boundary gradient with the patch's own snGrad; brae was using the raw cell gradient,
 //       so on a contact-angle patch it discarded exactly the quantity the contact angle sets.
 //
-//   THE REMAINING CANDIDATE, not yet eliminated: alphaContactAngle's evaluate() MUTATES its own
-//   gradient (`gradient() = deltaCoeffs*(clamp(value + gradient/deltaCoeffs, 0, 1) - value)` under
-//   `limit gradient`), so it is NOT idempotent -- calling it twice is not calling it once. brae and
-//   OpenFOAM do not evaluate the alpha boundary the same number of times per step, and each extra
-//   call moves the gradient. That is the next thing to check.
+//     * alphaContactAngle's NON-IDEMPOTENT evaluate() -- it mutates its own gradient under
+//       `limit gradient`, so the number of times each solver evaluates the alpha boundary could
+//       matter. It does not: the clamp bites on 2 of 800 faces and in 3 of 20 calls, and FORCING
+//       idempotence makes the error four times worse (24.9% -> 128%), so the mutation is
+//       load-bearing and its call count is not the problem.
+//     * A PURE SCALE on the surface-tension force. Scaling sigma by 0.93 makes the peak velocity
+//       match EXACTLY (ratio 1.000) and makes the worst-cell error WORSE (1.95e-02 -> 2.37e-02). So
+//       the magnitude is not the story: the curvature FIELD has a different shape near the contact
+//       line, and a solver tuned to match the peak would be further from OpenFOAM everywhere else.
+//
+//   WHAT IS LEFT is to read OpenFOAM's own K_ rather than infer it -- which is what the of-instrument
+//   skill is for, and what the manifest originally budgeted for this component. A stock run never
+//   writes the curvature, and every cheap proxy for it has now been used up.
 //
 //   The arms below record the discrepancy at its measured size: they fail if it grows, and they fail
 //   if it disappears without this comment being updated.

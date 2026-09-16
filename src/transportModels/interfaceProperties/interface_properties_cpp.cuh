@@ -38,6 +38,7 @@
 #include "geometric_field.cuh"
 #include "fvc.cuh"
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
