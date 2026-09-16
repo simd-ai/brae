@@ -60,6 +60,7 @@
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
 #include "fvc.cuh"
+#include "ldu_matrix.cuh"
 #include <stdexcept>
 #include <vector>
 
@@ -114,6 +115,92 @@ void applyPressureReference(std::vector<scalar>&       p,
                             const std::vector<scalar>& gh,
                             label                      pRefCell,
                             scalar                     pRefValue);
+
+// ---------------------------------------------------------------------------------------------------
+// fvc::ddtCorr(U, phi) -- the transient flux correction, Euler, fixed mesh.
+//
+//   provenance: src/finiteVolume/finiteVolume/ddtSchemes/EulerDdtScheme/EulerDdtScheme.C
+//                 (fvcDdtPhiCorr: phiCorr = phi.oldTime() - (interpolate(U.oldTime()) & Sf))
+//               src/finiteVolume/finiteVolume/ddtSchemes/ddtScheme/ddtScheme.C
+//                 (fvcDdtPhiCoeff, the limiter on it)
+//
+// WHAT IT IS FOR. phi and U are separate state: the pressure corrector writes phi, and U is
+// reconstructed from it, so after a step the stored flux and the flux you would get by interpolating
+// the stored velocity DO NOT AGREE. That difference is real information -- it is the part of the flux
+// that lives on faces and has no cell-centred representation -- and ddtCorr feeds it back into the
+// next pressure equation instead of letting it be rebuilt from the smoother, interpolated field. A
+// solver that drops it decouples pressure and velocity slowly and rings.
+//
+// THREE THINGS, all of them in the COEFFICIENT rather than the difference:
+//
+//   1. THE DEFAULT IS A LIMITER, NOT A CONSTANT. ddtPhiCoeff_ is -1 unless fvSchemes says otherwise
+//      (ddtScheme.H:135), and that selects
+//          coeff = 1 - min(|phiCorr| / (|phi| + SMALL), 1)
+//      -- so the correction is switched OFF wherever it is large compared with the flux itself, which
+//      is exactly where feeding it back would be unstable. A port that used a constant 1 would apply
+//      it hardest where OpenFOAM applies it least.
+//
+//   2. IT IS ZEROED ON EVERY PATCH WHERE U FIXES A VALUE (ddtScheme.C:~275). At a wall or a
+//      prescribed inlet the flux is whatever the boundary condition says, and there is no
+//      inconsistency to correct; leaving the coefficient at 1 there injects a spurious flux into the
+//      pressure equation at precisely the boundaries that are supposed to be prescribed.
+//
+//   3. THE OLD TIME, BOTH TIMES. phi.oldTime() and U.oldTime() -- not the current fields, which are
+//      what the corrector is about to produce.
+struct DdtCorrInput
+{
+    const SurfaceScalarField*  phiOld = nullptr;      // phi.oldTime()
+    const std::vector<vector>* UOld   = nullptr;      // U.oldTime(), cell values
+    // fvSchemes' ddtPhiCoeff. NEGATIVE (the default) selects the limiter in note 1; a non-negative
+    // value is used verbatim as a constant coefficient.
+    scalar ddtPhiCoeff = -1;
+    scalar deltaT = 0;
+};
+
+// Returns coeff*rDeltaT*phiCorr on the internal faces, and zero on every patch where U fixes a value.
+void ddtCorr(const DdtCorrInput&           in,
+             const GeometricField<vector>& U,
+             const PrimitiveMesh&          m,
+             const FvGeometry&             g,
+             const std::vector<FvPatch>&   patches,
+             SurfaceScalarField&           out);
+
+// ---------------------------------------------------------------------------------------------------
+// pEqn.H end to end: rAU, HbyA, phiHbyA, the p_rgh solve, then U and phi rebuilt.
+struct PressureSolveControls
+{
+    scalar tolP    = 1e-7;
+    scalar relTolP = 0;
+    int    maxIterP = 2000;
+    label  nCorrectors = 1;          // pimple.correct()
+    label  nNonOrthogonalCorrectors = 0;
+    // p_rgh has no value-fixing patch anywhere -> the system is singular and needs a reference.
+    bool   needReference = false;
+    label  pRefCell  = 0;
+    scalar pRefValue = 0;
+};
+
+struct PressureStepInput
+{
+    const FvVectorMatrix*      UEqn      = nullptr;   // the RELAXED momentum matrix, before the force
+    const std::vector<scalar>* rho       = nullptr;
+    const std::vector<scalar>* gh        = nullptr;
+    const std::vector<scalar>* ghf       = nullptr;   // internal faces
+    const SurfaceScalarField*  stf       = nullptr;   // surfaceTensionForce, faces
+    const SurfaceScalarField*  snGradRho = nullptr;
+    const DdtCorrInput*        ddt       = nullptr;   // null = no ddtCorr (steady start)
+};
+
+// One pass of pEqn.H. p_rgh, U and phi are all updated in place; `p` is (re)built at the end.
+void pressureCorrector(GeometricField<scalar>&      p_rgh,
+                       GeometricField<vector>&      U,
+                       SurfaceScalarField&          phi,
+                       std::vector<scalar>&         p,
+                       const PressureStepInput&     in,
+                       const PressureSolveControls& sc,
+                       const PrimitiveMesh&         m,
+                       const FvGeometry&            g,
+                       const std::vector<FvPatch>&  patches);
 
 } // namespace interFoam
 } // namespace cpu

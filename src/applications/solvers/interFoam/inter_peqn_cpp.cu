@@ -2,6 +2,10 @@
 // in it that are interFoam's own.
 #include "inter_peqn_cpp.cuh"
 #include "fvc_reconstruct_cpp.cuh"
+#include <cmath>
+#include "fvm.cuh"
+#include "fv_matrix_ops.cuh"
+#include "pbicgstab.cuh"
 
 namespace brae {
 namespace cpu {
@@ -145,6 +149,219 @@ void applyPressureReference(std::vector<scalar>&       p,
     for (scalar& v : p) v += shift;
     // ...AND p_rgh IS REBUILT FROM THE SHIFTED p. It does not keep what the solve gave it -- note 4.
     for (std::size_t c = 0; c < p.size(); ++c) p_rgh[c] = p[c] - rho[c]*gh[c];
+}
+
+
+void ddtCorr(const DdtCorrInput&           in,
+             const GeometricField<vector>& U,
+             const PrimitiveMesh&          m,
+             const FvGeometry&             g,
+             const std::vector<FvPatch>&   patches,
+             SurfaceScalarField&           out)
+{
+    if (!in.phiOld || !in.UOld)
+        throw std::runtime_error(
+            "brae interFoam ddtCorr: phi.oldTime() and U.oldTime() are both required -- the "
+            "correction is the difference between them, at the OLD time (note 3).");
+    if (in.deltaT <= scalar(0))
+        throw std::runtime_error("brae interFoam ddtCorr: deltaT must be positive.");
+
+    const label nIf = m.nInternalFaces();
+    const std::vector<label>&  own = m.owner();
+    const std::vector<label>&  nei = m.neighbour();
+    const std::vector<scalar>& w   = g.weights();
+    const std::vector<vector>& Sf  = g.Sf();
+    const scalar rDeltaT = scalar(1) / in.deltaT;
+    const scalar kSmall  = scalar(1e-37);                 // OF SMALL
+
+    out.internal.resize(static_cast<std::size_t>(nIf));
+    for (label f = 0; f < nIf; ++f)
+    {
+        // phiCorr = phi.oldTime() - (interpolate(U.oldTime()) & Sf)
+        const vector& uo = (*in.UOld)[own[f]];
+        const vector& un = (*in.UOld)[nei[f]];
+        const vector uf{w[f]*uo.x + (scalar(1) - w[f])*un.x,
+                        w[f]*uo.y + (scalar(1) - w[f])*un.y,
+                        w[f]*uo.z + (scalar(1) - w[f])*un.z};
+        const scalar interpFlux = uf.x*Sf[f].x + uf.y*Sf[f].y + uf.z*Sf[f].z;
+        const scalar phiCorr    = in.phiOld->internal[f] - interpFlux;
+
+        // note 1: a NEGATIVE ddtPhiCoeff selects the limiter, which is the default. It switches the
+        // correction OFF where it is large compared with the flux -- the opposite of what a constant 1
+        // would do.
+        const scalar coeff = (in.ddtPhiCoeff < scalar(0))
+            ? scalar(1) - std::fmin(std::fabs(phiCorr)
+                                  / (std::fabs(in.phiOld->internal[f]) + kSmall), scalar(1))
+            : in.ddtPhiCoeff;
+
+        out.internal[f] = coeff * rDeltaT * phiCorr;
+    }
+
+    // note 2: zero on every patch where U fixes a value. brae has no cyclicAMI in a VoF case yet; the
+    // loop is per patch so adding one changes only that patch.
+    out.boundary.assign(patches.size(), std::vector<scalar>{});
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        out.boundary[pi].assign(static_cast<std::size_t>(patches[pi].size), scalar(0));
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (U.boundary[pi]->fixesValue()) continue;       // already zero, and stays zero
+        const FvPatch& q = patches[pi];
+        for (label i = 0; i < q.size; ++i)
+        {
+            const vector& uo = (*in.UOld)[q.faceCells[i]];
+            const vector& S  = Sf[q.start + i];
+            const scalar interpFlux = uo.x*S.x + uo.y*S.y + uo.z*S.z;
+            const scalar pOld = (pi < in.phiOld->boundary.size()
+                                 && static_cast<std::size_t>(i) < in.phiOld->boundary[pi].size())
+                              ? in.phiOld->boundary[pi][i] : scalar(0);
+            const scalar phiCorr = pOld - interpFlux;
+            const scalar coeff = (in.ddtPhiCoeff < scalar(0))
+                ? scalar(1) - std::fmin(std::fabs(phiCorr)/(std::fabs(pOld) + kSmall), scalar(1))
+                : in.ddtPhiCoeff;
+            out.boundary[pi][i] = coeff * rDeltaT * phiCorr;
+        }
+    }
+}
+
+
+void pressureCorrector(GeometricField<scalar>&      p_rgh,
+                       GeometricField<vector>&      U,
+                       SurfaceScalarField&          phi,
+                       std::vector<scalar>&         p,
+                       const PressureStepInput&     in,
+                       const PressureSolveControls& sc,
+                       const PrimitiveMesh&         m,
+                       const FvGeometry&            g,
+                       const std::vector<FvPatch>&  patches)
+{
+    if (!in.UEqn || !in.rho || !in.gh || !in.ghf || !in.stf || !in.snGradRho)
+        throw std::runtime_error("brae interFoam pEqn: a required field is missing.");
+
+    const label nC  = m.nCells();
+    const label nIf = m.nInternalFaces();
+
+    // rAU = 1/UEqn.A(), rAUf = interpolate(rAU).
+    const std::vector<scalar> A = matrixA(*in.UEqn, m, g, patches);
+    std::vector<scalar> rAU(static_cast<std::size_t>(nC));
+    for (label c = 0; c < nC; ++c) rAU[c] = scalar(1) / A[c];
+    const SurfaceScalarField rAUfField = fvc::interpolate(rAU, m, g, patches);
+
+    // HbyA = constrainHbyA(rAU*UEqn.H(), U, p_rgh).
+    const std::vector<vector> H = matrixH(*in.UEqn, U, m, g, patches);
+    std::vector<vector> HbyA(static_cast<std::size_t>(nC));
+    for (label c = 0; c < nC; ++c)
+        HbyA[c] = vector{rAU[c]*H[c].x, rAU[c]*H[c].y, rAU[c]*H[c].z};
+
+    // phiHbyA = fvc::flux(HbyA) + interpolate(rho*rAU)*ddtCorr(U, phi, Uf).
+    // NOTE the weighting is interpolate(rho*rAU) -- the PRODUCT -- not interpolate(rho)*rAUf; see
+    // note 2 in the header, and the 250x it is worth across the interface.
+    // constrainHbyA(HbyA, U, p_rgh), constrainHbyA.C:
+    //     if (!U.boundaryField()[patchi].assignable()) HbyAbf[patchi] = U.boundaryField()[patchi];
+    // Everywhere else HbyA keeps the extrapolated value H() gives it, which is the owner cell's.
+    // assignable() is NOT fixesValue(): slip and inletOutlet are non-assignable without fixing one,
+    // and damBreak's atmosphere is pressureInletOutletVelocity. simpleFoam's pEqn_cpp carries the same
+    // three lines, and they are the same three lines on purpose.
+    std::vector<std::vector<vector>> HbyAb(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& q = patches[pi];
+        HbyAb[pi].resize(static_cast<std::size_t>(q.size));
+        const bool takeU = !U.boundary[pi]->assignable();
+        const std::vector<vector>& ub = U.boundary[pi]->value();
+        for (label i = 0; i < q.size; ++i)
+            HbyAb[pi][i] = takeU ? ub[i] : HbyA[q.faceCells[i]];
+    }
+    SurfaceScalarField phiHbyA = fvc::flux(HbyA, HbyAb, m, g, patches);
+
+    if (in.ddt)
+    {
+        std::vector<scalar> rhoRAU;
+        rhoRAUf(*in.rho, rAU, m, g, rhoRAU);
+        SurfaceScalarField corr;
+        ddtCorr(*in.ddt, U, m, g, patches, corr);
+        for (label f = 0; f < nIf; ++f) phiHbyA.internal[f] += rhoRAU[f] * corr.internal[f];
+    }
+
+    // phig = (surfaceTensionForce - ghf*snGrad(rho)) * rAUf * magSf -- and NOT snGrad(p_rgh), which is
+    // the laplacian below. phiHbyA += phig.
+    std::vector<scalar> phig;
+    buoyancyFlux(in.stf->internal, *in.ghf, in.snGradRho->internal, rAUfField.internal, g.magSf(), phig);
+    for (label f = 0; f < nIf; ++f) phiHbyA.internal[f] += phig[f];
+
+    // constrainPressure(p_rgh, U, phiHbyA, rAUf, MRF): a fixedFluxPressure patch's gradient is
+    // PRESCRIBED from the flux, and brae refuses to assemble one that has not been set.
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (!p_rgh.boundary[pi]->updateableSnGrad()) continue;
+        const FvPatch& q = patches[pi];
+        std::vector<scalar> sn(static_cast<std::size_t>(q.size));
+        for (label i = 0; i < q.size; ++i)
+        {
+            const scalar rf = rAU[q.faceCells[i]];        // interpolate(rAU) at an uncoupled patch
+            const scalar ph = (pi < phiHbyA.boundary.size()
+                               && static_cast<std::size_t>(i) < phiHbyA.boundary[pi].size())
+                            ? phiHbyA.boundary[pi][i] : scalar(0);
+            const scalar Uf = (pi < phi.boundary.size()
+                               && static_cast<std::size_t>(i) < phi.boundary[pi].size())
+                            ? phi.boundary[pi][i] : scalar(0);
+            sn[i] = (ph - Uf) / (q.magSf[i] * rf);
+        }
+        p_rgh.boundary[pi]->updateSnGrad(sn);
+    }
+
+    for (label corr = 0; corr <= sc.nNonOrthogonalCorrectors; ++corr)
+    {
+        FvScalarMatrix pe = fvm::laplacian<scalar>(rAUfField, p_rgh, m, g, patches, /*corrected=*/false);
+        const std::vector<scalar> div = fvc::div(phiHbyA, m, g, patches);
+        for (label c = 0; c < nC; ++c) pe.source[c] += div[c] * g.V()[c];
+
+        if (sc.needReference)
+        {
+            // fvMatrix::setReference: source += diag*refValue, diag += diag -- pinning one cell in a
+            // system that is otherwise singular because every patch is zeroGradient.
+            pe.source[sc.pRefCell] += pe.diag[sc.pRefCell] * sc.pRefValue;
+            pe.diag[sc.pRefCell]   += pe.diag[sc.pRefCell];
+        }
+
+        pbicgstab(pe, p_rgh.internal, m, patches, sc.tolP, sc.relTolP, sc.maxIterP);
+        p_rgh.evaluateBoundary();
+
+        if (corr == sc.nNonOrthogonalCorrectors)
+        {
+            const SurfaceScalarField pFlux = matrixFlux(pe, p_rgh.internal, m, patches);
+
+            // phi = phiHbyA - p_rghEqn.flux()
+            phi = phiHbyA;
+            for (label f = 0; f < nIf; ++f) phi.internal[f] -= pFlux.internal[f];
+            for (std::size_t pi = 0; pi < phi.boundary.size(); ++pi)
+                for (std::size_t i = 0; i < phi.boundary[pi].size(); ++i)
+                    phi.boundary[pi][i] -= pFlux.boundary[pi][i];
+
+            // U = HbyA + rAU*fvc::reconstruct((phig - p_rghEqn.flux())/rAUf) -- the divide INSIDE the
+            // reconstruction and the multiply OUTSIDE, which coincide only for a uniform rAU.
+            std::vector<scalar> faceFlux(static_cast<std::size_t>(nIf));
+            for (label f = 0; f < nIf; ++f) faceFlux[f] = phig[f] - pFlux.internal[f];
+            std::vector<std::vector<scalar>> ffB(patches.size()), rB(patches.size());
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                const FvPatch& q = patches[pi];
+                ffB[pi].assign(static_cast<std::size_t>(q.size), scalar(0));
+                rB[pi].resize(static_cast<std::size_t>(q.size));
+                for (label i = 0; i < q.size; ++i)
+                {
+                    rB[pi][i]  = rAU[q.faceCells[i]];
+                    ffB[pi][i] = -pFlux.boundary[pi][i];
+                }
+            }
+            correctVelocity(HbyA, rAU, faceFlux, rAUfField.internal, ffB, rB, m, g, patches, U.internal);
+            U.evaluateBoundary();
+        }
+    }
+
+    // p == p_rgh + rho*gh, then the reference shift if p_rgh needs one -- and BOTH fields move.
+    staticPressure(p_rgh.internal, *in.rho, *in.gh, p);
+    if (sc.needReference)
+        applyPressureReference(p, p_rgh.internal, *in.rho, *in.gh, sc.pRefCell, sc.pRefValue);
 }
 
 } // namespace interFoam

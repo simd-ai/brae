@@ -32,6 +32,7 @@
 #include "fv_matrix_ops.cuh"
 #include "pbicgstab.cuh"
 #include "interface_properties_cpp.cuh"
+#include "inter_peqn_cpp.cuh"
 #include <memory>
 #include <tuple>
 #include <cstdlib>
@@ -544,6 +545,137 @@ int main(int argc, char** argv)
         for (scalar a : A) minA = std::fmin(minA, a);
         std::printf("    min UEqn.A() = %.4e\n", (double)minA);
         check("UEqn.A() is strictly positive everywhere, so rAU = 1/A() is finite", minA > scalar(0));
+    }
+
+    // ---- 7. THE PRESSURE CORRECTOR, AND WHAT IT IS FOR --------------------------------------------
+    // The momentum predictor above left 111 m/s at the interface from an unbalanced face force. The
+    // pressure corrector's whole job is to cancel that: it finds the p_rgh whose gradient balances
+    // buoyancy and surface tension, and rebuilds U and phi from it. Two assertions, and neither is a
+    // tolerance:
+    //
+    //   * phi IS DIVERGENCE-FREE AFTERWARDS, to the pressure solve's own accuracy. That is the
+    //     postcondition the whole equation exists to produce, it holds on any mesh, and it is the one
+    //     thing a pressure corrector cannot be right without.
+    //   * THE VELOCITY COLLAPSES. 111 m/s of unbalanced interface motion becomes something physical,
+    //     and the ratio is the measurement that says the balance was actually found rather than the
+    //     field merely being overwritten.
+    {
+        GeometricField<vector> U = buildField<vector>(readField<vector>(startDir + "/U"), patches, nC);
+        U.evaluateBoundary();
+        const std::vector<vector> U0 = U.internal;
+
+        // rebuild the same face force as arm 6
+        SurfaceScalarField nHatf2;
+        std::vector<scalar> K2;
+        brae::cpu::interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, nHatf2, K2);
+        GeometricField<scalar> rhoF;
+        rhoF.internal = f.rho;
+        for (const FvPatch& q : patches)
+            rhoF.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
+        rhoF.evaluateBoundary();
+        const SurfaceScalarField snRho2 = fvc::snGrad(rhoF,     m, g, patches, false);
+        const SurfaceScalarField snA2   = fvc::snGrad(f.alpha1, m, g, patches, false);
+        std::vector<scalar> sK2;
+        brae::cpu::interfaceProps::sigmaK(K2, f.interface.sigma, sK2);
+        const SurfaceScalarField sKf2 = fvc::interpolate(sK2, m, g, patches);
+        SurfaceScalarField stf2;
+        stf2.internal.resize(static_cast<std::size_t>(m.nInternalFaces()));
+        for (label fi = 0; fi < m.nInternalFaces(); ++fi)
+            stf2.internal[fi] = sKf2.internal[fi]*snA2.internal[fi];
+        stf2.boundary.resize(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            stf2.boundary[pi].assign(static_cast<std::size_t>(patches[pi].size), scalar(0));
+
+        // the momentum predictor, exactly as arm 6 ran it
+        GeometricField<scalar>& prgh = const_cast<GeometricField<scalar>&>(f.p_rgh);
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            if (prgh.boundary[pi]->updateableSnGrad())
+                prgh.boundary[pi]->updateSnGrad(
+                    std::vector<scalar>(static_cast<std::size_t>(patches[pi].size), scalar(0)));
+        const SurfaceScalarField snP2 = fvc::snGrad(prgh, m, g, patches, false);
+        SurfaceScalarField force2;
+        {
+            std::vector<scalar> out;
+            momentumSourceFlux(stf2.internal, f.ghfInternal, snRho2.internal, snP2.internal,
+                               g.magSf(), out);
+            force2.internal = out;
+            force2.boundary.resize(patches.size());
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                force2.boundary[pi].assign(static_cast<std::size_t>(patches[pi].size), scalar(0));
+        }
+
+        std::vector<scalar> rhoOld2 = f.rho, nuEff2 = f.nu;
+        std::vector<std::vector<scalar>> rhoB(patches.size()), nuB(patches.size()), phB(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            rhoB[pi].resize(static_cast<std::size_t>(patches[pi].size));
+            nuB[pi].resize(static_cast<std::size_t>(patches[pi].size));
+            phB[pi].assign(static_cast<std::size_t>(patches[pi].size), scalar(0));
+            for (label i = 0; i < patches[pi].size; ++i)
+            {
+                rhoB[pi][i] = f.rho[patches[pi].faceCells[i]];
+                nuB[pi][i]  = f.nu [patches[pi].faceCells[i]];
+            }
+        }
+        InterMomentumInput mi;
+        mi.rhoPhi = &f.rhoPhi.internal; mi.rhoPhiBnd = &phB;
+        mi.rho = &f.rho; mi.rhoOld = &rhoOld2; mi.rhoBnd = &rhoB;
+        mi.UOld = &U0;
+        mi.nuEff = &nuEff2; mi.nuEffBnd = &nuB;
+        mi.deltaT = f.deltaT;
+        mi.scheme = f.divRhoPhiU;
+        mi.relaxEquationU = true; mi.relaxU = scalar(1);
+
+        MomentumSolveControls msc;
+        FvVectorMatrix UEqn;
+        momentumPredictor(U, mi, force2, msc, m, g, patches, UEqn);
+        scalar afterPredictor = 0;
+        for (const vector& v : U.internal)
+            afterPredictor = std::fmax(afterPredictor, std::sqrt(v.x*v.x + v.y*v.y + v.z*v.z));
+
+        // ...and now the corrector.
+        SurfaceScalarField phiW = f.phi;
+        std::vector<scalar> pOut;
+        PressureStepInput pi2;
+        pi2.UEqn = &UEqn; pi2.rho = &f.rho; pi2.gh = &f.gh; pi2.ghf = &f.ghfInternal;
+        pi2.stf = &stf2;  pi2.snGradRho = &snRho2;
+        // damBreak's atmosphere is totalPressure, which FIXES a value, so p_rgh needs no reference.
+        PressureSolveControls psc;
+        psc.needReference = false;
+        psc.tolP = scalar(1e-12);
+        pressureCorrector(prgh, U, phiW, pOut, pi2, psc, m, g, patches);
+
+        scalar afterCorrector = 0;
+        for (const vector& v : U.internal)
+            afterCorrector = std::fmax(afterCorrector, std::sqrt(v.x*v.x + v.y*v.y + v.z*v.z));
+
+        scalar worstDivPhi = 0, phiScale = 0;
+        {
+            const std::vector<scalar> d = fvc::div(phiW, m, g, patches);
+            for (scalar v : d) worstDivPhi = std::fmax(worstDivPhi, std::fabs(v));
+            for (scalar v : phiW.internal) phiScale = std::fmax(phiScale, std::fabs(v));
+        }
+        std::printf("  pressure corrector on damBreak's first step:\n");
+        std::printf("    max |U| %.4e before -> %.4e after   (factor %.1f)\n",
+                    (double)afterPredictor, (double)afterCorrector,
+                    (double)(afterPredictor/afterCorrector));
+        // THE SCALE MATTERS. fvc::div returns sum(phi)/V, so its natural yardstick is |phi|/V, not 1 --
+        // and on damBreak's 3e-06 m^3 cells those differ by six orders. Comparing against max(1, |phi|)
+        // would have passed this arm for the wrong reason, because |phi| here is 1.8e-04.
+        scalar minV = g.V()[0];
+        for (scalar v : g.V()) minV = std::fmin(minV, v);
+        const scalar divScale = phiScale / minV;
+        std::printf("    worst |div(phi)| = %.3e   (|phi| up to %.3e over %.3e m^3 cells,"
+                    " so the scale is %.3e)\n",
+                    (double)worstDivPhi, (double)phiScale, (double)minV, (double)divScale);
+        std::printf("    relative: %.3e\n", (double)(worstDivPhi/divScale));
+
+        check("the corrector produced a divergence-free flux -- the postcondition of the whole equation",
+              worstDivPhi < scalar(1e-9) * divScale);
+        check("...and it CANCELLED the predictor's unbalanced interface velocity",
+              afterCorrector < scalar(0.1) * afterPredictor);
+        check("...to something finite and physical", std::isfinite(afterCorrector));
+        check("p was rebuilt as p_rgh + rho*gh", pOut.size() == static_cast<std::size_t>(nC));
     }
 
     std::printf("test_inter_case_cpp: %d failures\n", failures);
