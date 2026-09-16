@@ -721,6 +721,43 @@ int main(int argc, char** argv)
                                 (double)w0, (double)x0s);
                 }
 
+                // BISECT #3: UPWIND ON BOTH SIDES. The matrix is identical either way -- linearUpwind
+                // derives its weights from upwind -- so this removes ONLY the deferred source
+                // correction. If the gap collapses to round-off, the whole of the remaining 1.1e-05
+                // is in that correction and its gradient; if it survives, it is somewhere else.
+                {
+                    InterMomentumInput hm2 = hm;
+                    hm2.scheme = DivScheme::upwind;
+                    const FvVectorMatrix h2 = assembleUEqn(Uh2, hm2, m, g, fvp);
+
+                    DeviceInterStepTaps t2;
+                    DeviceInterStepControls C2 = C;
+                    C2.divScheme = brae::cpu::DivScheme::upwind;
+                    DeviceBuffer<scalar> e1(warmAlpha), e1o(warmAlpha);
+                    DeviceBuffer<scalar> ex(x0), ey(y0), ez(z0), eox(x0), eoy(y0), eoz(z0);
+                    DeviceBuffer<scalar> eI(dv.phi.internal), eB(flatten(dv.phi.boundary));
+                    DeviceBuffer<scalar> eOI(dv.phi.internal), eOB(flatten(dv.phi.boundary));
+                    DeviceBuffer<scalar> epr(dv.p_rgh.internal), epf;
+                    DeviceBuffer<scalar> en(dv.nHatf.internal), enb(flatten(dv.nHatf.boundary));
+                    DeviceBuffer<scalar> eab(pv2(dv.alpha1)), ek(dv.K);
+                    DeviceBuffer<scalar> erho, emu, enu, eri, erb;
+                    DeviceVectorBoundary db2b = buildDeviceVectorBoundary(dv.U, fvp, g);
+                    deviceInterStep(dm, dt, C2, pr2, H, Gh, Ghf, MagSf, e1, e1o, ex, ey, ez,
+                                    eox, eoy, eoz, eI, eB, eOI, eOB, dUFixes, epr, epf, en, enb,
+                                    eab, ek, dFixes, dFlag, db2b, erho, emu, enu, eri, erb, &t2);
+                    cudaDeviceSynchronize();
+                    std::vector<scalar> s2;
+                    t2.UEqnSourceX.copyTo(s2);
+                    scalar w2 = 0, x2s = 0;
+                    for (label c = 0; c < nC; ++c)
+                    {
+                        w2  = std::fmax(w2, std::fabs(s2[c] - h2.source[c].x));
+                        x2s = std::fmax(x2s, std::fabs(h2.source[c].x));
+                    }
+                    std::printf("  [bisect] UPWIND on both:     source.x %.4e of %.4e\n",
+                                (double)w2, (double)x2s);
+                }
+
                 // BISECT #2: RELAX OFF on both sides. damBreak says `equations { ".*" 1; }`, which
                 // relaxEquation() FINDS, so relax(1) runs and adds (relaxedDiag - rawDiag)*psi to the
                 // source -- on the synthetic gate that clamp moved the diagonal by 1.2e+03 of 1.0e+06.
