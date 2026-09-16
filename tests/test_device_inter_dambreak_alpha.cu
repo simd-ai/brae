@@ -444,6 +444,9 @@ int main(int argc, char** argv)
             for (label i = 0; i < fvp[pi].size; ++i)
             { i2.push_back(pe.internalCoeffs[pi][i]); b2.push_back(pe.boundaryCoeffs[pi][i]); }
           iC.copyFrom(i2); bC.copyFrom(b2); };
+        H.pressure.updateBoundary =
+            [&](const DeviceBuffer<scalar>& pr)
+        { pr.copyTo(dv.p_rgh.internal); dv.p_rgh.evaluateBoundary(); };
 
         std::vector<int> takeU, uFixes;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
@@ -457,6 +460,7 @@ int main(int argc, char** argv)
         C.momentum.tol = scalar(1e-12);
         C.pressure.tol = scalar(1e-12);
         C.pressure.maxIter = 4000;
+        C.nCorrectors = static_cast<int>(dv.pimple.nCorrectors);
         C.momentumPredictor = dv.momentumPredictorOn;
         C.relaxU = dv.relaxU;
         C.relaxEquationU = dv.relaxEquationU;
@@ -481,6 +485,57 @@ int main(int argc, char** argv)
         // the warm state, kept BEFORE the run: the hooks write dv.alpha1.internal every corrector, so
         // by the end it holds the device's own answer and cannot serve as a reference point.
         const std::vector<scalar> warmAlpha = dv.alpha1.internal;
+
+        // ---- ONE step with the taps open, against the host's own UEqn from the SAME state ---------
+        // A final U that is 60% out cannot say which of a dozen operators did it. These can.
+        {
+            DeviceInterStepTaps taps;
+            DeviceBuffer<scalar> a1(warmAlpha), a1o(warmAlpha);
+            DeviceBuffer<scalar> ux(x0), uy(y0), uz(z0), uox(x0), uoy(y0), uoz(z0);
+            DeviceBuffer<scalar> phI(dv.phi.internal), phB(flatten(dv.phi.boundary));
+            DeviceBuffer<scalar> phOI(dv.phi.internal), phOB(flatten(dv.phi.boundary));
+            DeviceBuffer<scalar> pr(dv.p_rgh.internal), pf2;
+            DeviceBuffer<scalar> nh(dv.nHatf.internal), nhb(flatten(dv.nHatf.boundary));
+            DeviceBuffer<scalar> ab(pv2(dv.alpha1)), kk(dv.K);
+            DeviceBuffer<scalar> rr, mm, nn, rpi, rpb;
+            DeviceVectorBoundary dbt = buildDeviceVectorBoundary(dv.U, fvp, g);
+            deviceInterStep(dm, dt, C, pr2, H, Gh, Ghf, MagSf, a1, a1o, ux, uy, uz, uox, uoy, uoz,
+                            phI, phB, phOI, phOB, dUFixes, pr, pf2, nh, nhb, ab, kk,
+                            dFixes, dFlag, dbt, rr, mm, nn, rpi, rpb, &taps);
+            cudaDeviceSynchronize();
+
+            // The HOST's momentum matrix from the same post-alpha state, so rAU and HbyA compare.
+            std::vector<scalar> devRho, devRhoPhi;
+            rr.copyTo(devRho);
+            rpi.copyTo(devRhoPhi);
+
+            std::vector<scalar> dRAU, dHx, dDiag;
+            taps.rAU.copyTo(dRAU);
+            taps.HbyA[0].copyTo(dHx);
+            taps.UEqnDiag.copyTo(dDiag);
+
+            scalar mnR = dRAU.empty() ? 0 : dRAU[0], mxR = mnR;
+            for (scalar v : dRAU) { mnR = std::fmin(mnR, v); mxR = std::fmax(mxR, v); }
+            scalar mxH = 0;
+            for (scalar v : dHx) mxH = std::fmax(mxH, std::fabs(v));
+            scalar mnD = dDiag.empty() ? 0 : dDiag[0], mxD = mnD;
+            for (scalar v : dDiag) { mnD = std::fmin(mnD, v); mxD = std::fmax(mxD, v); }
+            std::printf("  [taps] rAU in [%.4e, %.4e];  max|HbyA.x| %.4e;  UEqn.diag in [%.4e, %.4e]\n",
+                        (double)mnR, (double)mxR, (double)mxH, (double)mnD, (double)mxD);
+
+            // rho*V/dt is what the ddt alone puts on the diagonal, so A() = diag/V should be at least
+            // rho/dt everywhere and rAU at most dt/rho. A rAU far above that means the diagonal is
+            // missing the ddt, or the relax, or the boundary fold.
+            scalar worstBound = 0;
+            for (label c = 0; c < nC; ++c)
+            {
+                const scalar rAUmax = dt / devRho[c];
+                worstBound = std::fmax(worstBound, dRAU[c] / rAUmax);
+            }
+            std::printf("  [taps] worst rAU/(dt/rho) = %.4f  (must be <= 1: the ddt alone puts "
+                        "rho*V/dt on the diagonal)\n", (double)worstBound);
+            check("rAU is bounded by dt/rho, so the ddt is on the diagonal", worstBound <= scalar(1.0));
+        }
 
         for (int s2 = 0; s2 < nSteps; ++s2)
         {

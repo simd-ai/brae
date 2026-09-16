@@ -78,7 +78,8 @@ void deviceInterStep(
     DeviceBuffer<scalar>&            mu,
     DeviceBuffer<scalar>&            nu,
     DeviceBuffer<scalar>&            rhoPhiInt,
-    DeviceBuffer<scalar>&            rhoPhiBnd)
+    DeviceBuffer<scalar>&            rhoPhiBnd,
+    DeviceInterStepTaps*             taps)
 {
     if (!hooks.updateUBoundary || !hooks.interfaceForces)
         throw std::runtime_error(
@@ -169,6 +170,11 @@ void deviceInterStep(
     probe("UEqn.upper", UEqn.upper);
     probe("UEqn.source", UEqn.source[0]);
     probe("UEqn.iC", UEqn.iC[0]);
+    if (taps)
+    {
+        deviceCopy(taps->UEqnDiag, UEqn.relaxed ? UEqn.relaxedDiag : UEqn.diag);
+        deviceCopy(taps->UEqnSourceX, UEqn.source[0]);
+    }
 
     // ---- 4. THE MOMENTUM PREDICTOR, if the case asks for one --------------------------------------
     // damBreak sets `momentumPredictor no`. The matrix above is still assembled and relaxed either
@@ -214,53 +220,76 @@ void deviceInterStep(
         (void)A;
     }
 
-    // ---- 5. THE PRESSURE CORRECTOR, last ---------------------------------------------------------
-    gpu::PressureStages st;
-    gpu::PressureInput pin;
-    if (!ctl.takeUAtBoundary)
+    // ---- 5. THE PRESSURE CORRECTOR, last, and nCorrectors TIMES -----------------------------------
+    // interFoam.C:118-121 wraps the WHOLE of pEqn.H in `while (pimple.correct())`, so every pass
+    // rebuilds rAU, HbyA, phiHbyA and phig from the U and phi the previous one left -- it is not a
+    // repeated solve of one system. The momentum matrix is the same throughout, which is why it is
+    // assembled above the loop.
+    if (ctl.nCorrectors < 1)
         throw std::runtime_error(
-            "brae interFoam device step: constrainHbyA needs the per-face `assignable` mask. "
-            "assignable() is NOT fixesValue() -- see DeviceInterStepControls.");
-    pin.takeUAtBoundary = ctl.takeUAtBoundary;
-    pin.solutionD[0] = pin.solutionD[1] = pin.solutionD[2] = 1;
-    gpu::pressurePredictor(st, dm, dbU, UEqn, UX, UY, UZ, pin, nullptr, nullptr);
-    probe("rAU", st.rAU);
-    probe("HbyA.x", st.HbyA[0]);
-    probe("phiHbyA", st.phiHbyAInt);
+            "brae interFoam device step: nCorrectors must be at least 1; fvSolution's PIMPLE block "
+            "reads it and damBreak asks for three.");
 
-    // rAUf over the FULL face array: interpolate(rAU) internally, and the face cell's rAU at an
-    // uncoupled patch, which is what fvc::interpolate gives there.
-    DeviceBuffer<scalar> rAUfAll;
-    deviceInterpolateFull(dm, st.rAU, rAUfAll);
+    for (int corr = 0; corr < ctl.nCorrectors; ++corr)
+    {
+        gpu::PressureStages st;
+        gpu::PressureInput pin;
+        if (!ctl.takeUAtBoundary)
+            throw std::runtime_error(
+                "brae interFoam device step: constrainHbyA needs the per-face `assignable` mask. "
+                "assignable() is NOT fixesValue() -- see DeviceInterStepControls.");
+        pin.takeUAtBoundary = ctl.takeUAtBoundary;
+        pin.solutionD[0] = pin.solutionD[1] = pin.solutionD[2] = 1;
+        gpu::pressurePredictor(st, dm, dbU, UEqn, UX, UY, UZ, pin, nullptr, nullptr);
+        probe("rAU", st.rAU);
+        probe("HbyA.x", st.HbyA[0]);
+        probe("phiHbyA", st.phiHbyAInt);
+        if (taps && corr == 0)
+        {
+            deviceCopy(taps->rAU, st.rAU);
+            for (int k = 0; k < 3; ++k) deviceCopy(taps->HbyA[k], st.HbyA[k]);
+        }
 
-    DeviceInterPressureInput pi;
-    pi.stf = &stf;
-    pi.ghf = &ghf;
-    pi.snGradRho = &snGradRho;
-    pi.magSf = &magSf;
-    pi.rAUfAll = &rAUfAll;
-    pi.rho = &rho;
-    pi.gh  = &gh;
-    // fvc::ddtCorr(U, phi), Euler. The coefficient is OpenFOAM's DEFAULT LIMITER (ddtPhiCoeff_ = -1),
-    // not a constant: it switches the correction off where it is large compared with the flux, and it
-    // is zero on every patch where U fixes a value.
-    DeviceBuffer<scalar> ddtCorrI, ddtCorrB;
-    deviceDdtCorr(dm, phiOldInt, phiOldBnd, UOldX, UOldY, UOldZ, bndUFixesValue,
-                  /*ddtPhiCoeff=*/scalar(-1), deltaT, ddtCorrI, ddtCorrB);
-    probe("ddtCorr", ddtCorrI);
-    pi.ddtCorrInt = &ddtCorrI;
-    pi.needReference = ctl.needReference;
-    pi.pRefCell = ctl.pRefCell;
-    pi.pRefValue = ctl.pRefValue;
-    pi.solve = ctl.pressure;
+        // rAUf over the FULL face array: interpolate(rAU) internally, and the face cell's rAU at an
+        // uncoupled patch, which is what fvc::interpolate gives there.
+        DeviceBuffer<scalar> rAUfAll;
+        deviceInterpolateFull(dm, st.rAU, rAUfAll);
 
-    deviceInterPressureStep(dm, pi, hooks.pressure, st.rAU, st.HbyA[0], st.HbyA[1], st.HbyA[2],
-                            st.phiHbyAInt, st.phiHbyABnd, p_rgh, phiInt, phiBnd,
-                            UX, UY, UZ, p);
+        // fvc::ddtCorr(U, phi), Euler. The coefficient is OpenFOAM's DEFAULT LIMITER
+        // (ddtPhiCoeff_ = -1), not a constant: it switches the correction off where it is large
+        // compared with the flux, and it is zero on every patch where U fixes a value.
+        DeviceBuffer<scalar> ddtCorrI, ddtCorrB;
+        deviceDdtCorr(dm, phiOldInt, phiOldBnd, UOldX, UOldY, UOldZ, bndUFixesValue,
+                      /*ddtPhiCoeff=*/scalar(-1), deltaT, ddtCorrI, ddtCorrB);
+
+        DeviceInterPressureInput pi;
+        pi.stf = &stf;
+        pi.ghf = &ghf;
+        pi.snGradRho = &snGradRho;
+        pi.magSf = &magSf;
+        pi.rAUfAll = &rAUfAll;
+        pi.rho = &rho;
+        pi.gh  = &gh;
+        pi.ddtCorrInt = &ddtCorrI;
+        pi.needReference = ctl.needReference;
+        pi.pRefCell = ctl.pRefCell;
+        pi.pRefValue = ctl.pRefValue;
+        pi.solve = ctl.pressure;
+
+        deviceInterPressureStep(dm, pi, hooks.pressure, st.rAU, st.HbyA[0], st.HbyA[1], st.HbyA[2],
+                                st.phiHbyAInt, st.phiHbyABnd, p_rgh, phiInt, phiBnd,
+                                UX, UY, UZ, p);
+
+        if (taps && corr == 0) deviceCopy(taps->phiHbyAInt, st.phiHbyAInt);
+
+        // p_rgh.correctBoundaryConditions() at the end of pEqn.H, and U's with it: the next pass's
+        // laplacian, its flux and its HbyA all read them.
+        if (hooks.pressure.updateBoundary) hooks.pressure.updateBoundary(p_rgh);
+        hooks.updateUBoundary(UX, UY, UZ, dbU);
+    }
     probe("p_rgh", p_rgh);
     probe("phi", phiInt);
     probe("U.x", UX);
-    hooks.updateUBoundary(UX, UY, UZ, dbU);
 }
 
 } // namespace brae

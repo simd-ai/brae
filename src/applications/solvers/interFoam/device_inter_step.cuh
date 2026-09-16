@@ -72,6 +72,19 @@ struct DeviceInterStepHooks
                        DeviceBuffer<scalar>&       snGradPrgh)> interfaceForces;
 };
 
+// Intermediates the step is willing to hand back, for a gate that has to localise a disagreement
+// rather than only measure one. A whole step is a dozen operators and a final U that is 60% out cannot
+// say which of them did it; these can. Null costs nothing. This is the of-instrument approach applied
+// to brae's own code -- the same reason tools/dumpInterFoam exists for OpenFOAM's.
+struct DeviceInterStepTaps
+{
+    DeviceBuffer<scalar> rAU;
+    DeviceBuffer<scalar> HbyA[3];
+    DeviceBuffer<scalar> phiHbyAInt;      // AFTER the two interFoam terms
+    DeviceBuffer<scalar> UEqnDiag;        // relaxed, as A() takes it
+    DeviceBuffer<scalar> UEqnSourceX;
+};
+
 struct DeviceInterStepControls
 {
     DeviceInterAlphaControls  alpha;
@@ -83,6 +96,15 @@ struct DeviceInterStepControls
 
     DeviceAlphaSolverControls momentum;      // the case's fvSolution entry for U
     DeviceAlphaSolverControls pressure;      // ...and for p_rgh
+    // pimple.correct() -- fvSolution's PIMPLE/nCorrectors. THE WHOLE OF pEqn.H REPEATS, not just the
+    // solve: interFoam.C wraps `#include "pEqn.H"` in `while (pimple.correct())`, so rAU, HbyA,
+    // phiHbyA, phig, the solve, U and phi are all rebuilt each pass, each from the U and phi the last
+    // one left. damBreak asks for THREE and this port ran ONE, which is a real omission -- but it is
+    // NOT the cause of the 60% gap in U that this file is under diagnosis for: MEASURED, going from
+    // one corrector to three moved U from 1.6039e-01 to 1.5848e-01 of a field whose max is 2.65e-01,
+    // about one per cent of the gap. Written here because the first version of this comment claimed
+    // the opposite before the measurement came back.
+    int    nCorrectors       = 1;
     bool   momentumPredictor = true;         // damBreak sets this OFF
     scalar relaxU            = 1;
     bool   relaxEquationU    = false;        // the case NAMES a factor -- see gpu::MomentumInput
@@ -140,6 +162,7 @@ void deviceInterStep(
     DeviceBuffer<scalar>&            mu,
     DeviceBuffer<scalar>&            nu,
     DeviceBuffer<scalar>&            rhoPhiInt,
-    DeviceBuffer<scalar>&            rhoPhiBnd);
+    DeviceBuffer<scalar>&            rhoPhiBnd,
+    DeviceInterStepTaps*             taps = nullptr);
 
 } // namespace brae

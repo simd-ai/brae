@@ -42,6 +42,11 @@ namespace brae {
 
 struct DeviceInterPressureHooks
 {
+    // p_rgh's patch values, re-evaluated after each solve. The NEXT corrector's laplacian and its flux
+    // both read them, exactly as OpenFOAM's p_rgh.correctBoundaryConditions() at the end of pEqn.H
+    // leaves them for the next pass. Optional: a case with nCorrectors 1 never needs it.
+    std::function<void(const DeviceBuffer<scalar>& p_rgh)> updateBoundary;
+
     // p_rgh's laplacian boundary coefficients, flattened in boundary-face order, AFTER
     // constrainPressure has set any fixedFluxPressure patch's gradient from phiHbyA. Branchy per-patch
     // dispatch over fixedFluxPressure, totalPressure and zeroGradient -- host work, as everywhere else.
