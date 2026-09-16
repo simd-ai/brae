@@ -907,6 +907,23 @@ int main(int argc, char** argv)
                                 "iC.x %.4e of %.4e;  bC.x %.4e of %.4e\n",
                                 (double)wu2, (double)su2, (double)wl2, (double)sl2,
                                 (double)wi2, (double)si2, (double)wb2, (double)sb2);
+
+                    // WHICH SIDE is near zero, per patch, with the BC type beside it. bC's error
+                    // equals its own magnitude, so one of the two is essentially nothing.
+                    { label o7 = 0;
+                      for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                      {
+                          scalar mxD = 0, mxH = 0;
+                          for (label i = 0; i < fvp[pi].size; ++i)
+                          {
+                              mxD = std::fmax(mxD, std::fabs(dbc[o7 + i]));
+                              mxH = std::fmax(mxH, std::fabs(hUEqn.boundaryCoeffs[pi][i].x));
+                          }
+                          std::printf("      bC %-14s %-8s device %.4e  host %.4e\n",
+                                      fvp[pi].name.c_str(), fvp[pi].type.c_str(),
+                                      (double)mxD, (double)mxH);
+                          o7 += fvp[pi].size;
+                      } }
                 }
 
                 // ---- phiHbyA, built on the host the way pEqn.H builds it -------------------------
