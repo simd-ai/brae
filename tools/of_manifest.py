@@ -1780,7 +1780,14 @@ COMPONENTS = {
                         "BOUNDARY half moves fvc::div(phiHbyA) by 9.4e+01 of 1.9e+02, half the source, "
                         "because `phiHbyA += phig` is a whole-surfaceScalarField operation and the "
                         "divergence sums the boundary faces. On capillaryRise, where momentumPredictor "
-                        "is off, that is the only route surface tension has into the solution.",
+                        "is off, that is the only route surface tension has into the solution. "
+                        "ONE WHOLE PASS runs on the device (device_inter_pressure_step.cu, stages 1-4 "
+                        "reusing simpleFoam's pressurePredictor) and is gated against the host's "
+                        "pressureCorrector: p_rgh 4.0e-11 relative, U 1.6e-12, p rebuilt exactly. Two "
+                        "arms measure placements: dropping phig's boundary half moves the SOLVED p_rgh "
+                        "by 6.1e+05 of 1.2e+06 -- HALF the field, not just the flux -- and p is 0.000e+00 "
+                        "from p_rgh_solved + rho*gh against 1.2e+06 from the p_rgh the pass started "
+                        "with, which is the difference between rebuilding p and carrying it.",
              note="rAU = 1/UEqn.A(), phiHbyA, the p_rgh laplacian, then U and phi rebuilt. Four things "
                   "are not shared with any other pressure corrector. (1) phig carries NO snGrad(p_rgh) "
                   "where UEqn's source does -- the pressure gradient is explicit there and IMPLICIT "

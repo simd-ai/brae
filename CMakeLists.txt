@@ -147,6 +147,7 @@ add_library(brae_core STATIC
     src/applications/solvers/interFoam/device_inter_peqn.cu
     src/applications/solvers/interFoam/device_inter_alpha_step.cu
     src/finiteVolume/cfdTools/general/device_alpha_courant.cu
+    src/applications/solvers/interFoam/device_inter_pressure_step.cu
     src/applications/solvers/interFoam/inter_ueqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoCreateFields_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoUEqn_cpp.cu
@@ -3100,6 +3101,13 @@ target_include_directories(test_device_alpha_flux PRIVATE ${BRAE_HEADER_DIRS}
 target_link_libraries(test_device_alpha_flux PRIVATE brae_core)
 add_test(NAME device_alpha_flux COMMAND test_device_alpha_flux)
 set_tests_properties(device_alpha_flux PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_device_inter_pressure_step tests/test_device_inter_pressure_step.cu)
+target_include_directories(test_device_inter_pressure_step PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_inter_pressure_step PRIVATE brae_core)
+add_test(NAME device_inter_pressure_step COMMAND test_device_inter_pressure_step)
+set_tests_properties(device_inter_pressure_step PROPERTIES SKIP_RETURN_CODE 77)
 
 add_executable(test_device_inter_ueqn_assembly tests/test_device_inter_ueqn_assembly.cu)
 target_include_directories(test_device_inter_ueqn_assembly PRIVATE ${BRAE_HEADER_DIRS}

@@ -1,0 +1,100 @@
+#pragma once
+// ONE PASS OF pEqn.H on the device -- rAU and HbyA, phiHbyA with interFoam's two extra terms, the
+// p_rgh solve, then phi, U and p rebuilt from it.
+//
+// provenance:
+//   openfoam:  applications/solvers/multiphase/interFoam/pEqn.H:1-89
+//   host:      src/applications/solvers/interFoam/inter_peqn_cpp.cu, pressureCorrector -- the ORACLE,
+//              and the path that reaches 2.29e-06 relative in p_rgh and 3.31e-06 in U on damBreak
+//              against real OpenFOAM.
+//   tests:     tests/test_device_inter_pressure_step.cu
+//
+// ONE PASS, NOT THE NON-ORTHOGONAL LOOP, for the same reason deviceAlphaCorrector is one corrector:
+// OpenFOAM re-evaluates p_rgh's boundary after every solve and the next pass's matrix and flux both
+// read it, and a call that looped internally could not do that. The loop is the caller's.
+//
+// STAGES 1-4 ARE simpleFoam's pressurePredictor, REUSED. rAU = 1/A(), H(), HbyA, constrainHbyA and
+// fvc::flux(HbyA) are the same operators, and A() takes the RELAXED diagonal with the boundary average
+// added ON TOP of it -- OpenFOAM's relax() writes diag_ in place and A() is taken afterwards. What
+// interFoam adds is stages 5 onward, and each is already landed and gated on its own.
+//
+// THE THREE THINGS THIS FILE OWNS ARE PLACEMENTS, not operators:
+//
+//   phig GOES INTO phiHbyA ON BOTH SIDES. fvc::div(phiHbyA) sums the boundary faces, so a wall's
+//   buoyancy and surface tension reach the pressure equation's SOURCE through it -- measured at 9.4e+01
+//   of 1.9e+02, half the source. On capillaryRise, where momentumPredictor is off, that is the only
+//   route surface tension has into the solution at all.
+//
+//   THE SAME phig IS REUSED IN THE VELOCITY CORRECTION, (phig - flux)/rAUf, and it is the flux BEFORE
+//   the division. Recomputing it there from a separately interpolated rAUf would be a different number.
+//
+//   p IS REBUILT FROM THE SOLVED p_rgh, not carried. p == p_rgh + rho*gh, and when p_rgh needs a
+//   reference BOTH move: p is shifted and p_rgh is then rebuilt from the shifted p. Stopping after the
+//   first leaves them disagreeing by a constant that surfaces in the next step's momentum source.
+#include "cf_types.cuh"
+#include "device_buffer.cuh"
+#include "device_mesh.cuh"
+#include "device_inter_peqn.cuh"
+#include "device_alpha_presolve.cuh"   // DeviceAlphaSolverControls, the same shape of solver entry
+#include <functional>
+
+namespace brae {
+
+struct DeviceInterPressureHooks
+{
+    // p_rgh's laplacian boundary coefficients, flattened in boundary-face order, AFTER
+    // constrainPressure has set any fixedFluxPressure patch's gradient from phiHbyA. Branchy per-patch
+    // dispatch over fixedFluxPressure, totalPressure and zeroGradient -- host work, as everywhere else.
+    std::function<void(const DeviceBuffer<scalar>& phiHbyAInt,
+                       const DeviceBuffer<scalar>& phiHbyABnd,
+                       const DeviceBuffer<scalar>& rAUfInt,
+                       DeviceBuffer<scalar>&       iC,
+                       DeviceBuffer<scalar>&       bC)> pressureCoeffs;
+};
+
+struct DeviceInterPressureInput
+{
+    // the face fields the buoyancy flux is built from, over the mesh's FULL face array
+    const DeviceBuffer<scalar>* stf       = nullptr;   // surfaceTensionForce
+    const DeviceBuffer<scalar>* ghf       = nullptr;
+    const DeviceBuffer<scalar>* snGradRho = nullptr;
+    const DeviceBuffer<scalar>* magSf     = nullptr;
+    const DeviceBuffer<scalar>* rAUfAll   = nullptr;   // interpolate(rAU) over the full face array
+
+    const DeviceBuffer<scalar>* rho = nullptr;         // cells, for interpolate(rho*rAU) and for p
+    const DeviceBuffer<scalar>* gh  = nullptr;         // cells
+
+    // fvc::ddtCorr(U, phi). Null on a start from rest, where there is no old flux to correct against.
+    const DeviceBuffer<scalar>* ddtCorrInt = nullptr;
+
+    bool   needReference = false;
+    int    pRefCell      = 0;
+    scalar pRefValue     = 0;
+
+    DeviceAlphaSolverControls solve;    // the case's fvSolution entry for p_rgh
+};
+
+// `phiHbyAInt`/`phiHbyABnd` come in as fvc::flux(HbyA) -- what the shared pressure predictor left --
+// and are advanced in place to phiHbyA + the two terms. `p_rgh` goes in as the previous value and comes
+// out solved. `phi`, `U` and `p` are rebuilt from it.
+//
+// Returns the solver's final normalised residual, so a caller can refuse a pass that did not converge.
+scalar deviceInterPressureStep(
+    const DeviceMesh&                  dm,
+    const DeviceInterPressureInput&    in,
+    const DeviceInterPressureHooks&    hooks,
+    const DeviceBuffer<scalar>&        rAU,
+    const DeviceBuffer<scalar>&        HbyAX,
+    const DeviceBuffer<scalar>&        HbyAY,
+    const DeviceBuffer<scalar>&        HbyAZ,
+    DeviceBuffer<scalar>&              phiHbyAInt,
+    DeviceBuffer<scalar>&              phiHbyABnd,
+    DeviceBuffer<scalar>&              p_rgh,
+    DeviceBuffer<scalar>&              phiInt,
+    DeviceBuffer<scalar>&              phiBnd,
+    DeviceBuffer<scalar>&              UX,
+    DeviceBuffer<scalar>&              UY,
+    DeviceBuffer<scalar>&              UZ,
+    DeviceBuffer<scalar>&              p);
+
+} // namespace brae
