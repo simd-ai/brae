@@ -128,6 +128,7 @@ add_library(brae_core STATIC
     src/applications/solvers/simpleFoam/simpleFoamV2.cu
     src/applications/solvers/simpleFoam/pEqn_cpp.cu
     src/applications/solvers/simpleFoam/createFields_cpp.cu
+    src/applications/solvers/interFoam/inter_solve_cpp.cu
     src/applications/solvers/interFoam/inter_peqn_cpp.cu
     src/finiteVolume/fvMatrices/solvers/MULES/mules_cpp.cu
     src/applications/solvers/interFoam/alpha_eqn_cpp.cu
@@ -3127,6 +3128,16 @@ target_include_directories(test_alpha_courant_cpp PRIVATE ${BRAE_HEADER_DIRS}
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_alpha_courant_cpp PRIVATE brae_core)
 add_test(NAME alpha_courant_cpp COMMAND test_alpha_courant_cpp)
+
+# interFoam step 12: the time step -- the alpha sub-cycle (33 of the 44 tutorials use it) and the order
+# of the PIMPLE loop. The three sub-cycle mistakes all leave a BOUNDED, plausible alpha field, so no
+# boundedness gate sees them; and the loop order decides which rho the momentum predictor is built on,
+# which is a factor of 1000 at a water/air interface.
+add_executable(test_inter_solve_cpp tests/test_inter_solve_cpp.cu)
+target_include_directories(test_inter_solve_cpp PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_solve_cpp PRIVATE brae_core)
+add_test(NAME inter_solve_cpp COMMAND test_inter_solve_cpp)
 
 # These five read damBreak's own dictionaries. A box without OpenFOAM must SKIP, not report green: the
 # arms silently stopped running the moment $FOAM_TUTORIALS was empty, and nothing said so.
