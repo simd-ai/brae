@@ -130,6 +130,7 @@ add_library(brae_core STATIC
     src/applications/solvers/simpleFoam/createFields_cpp.cu
     src/applications/solvers/interFoam/inter_driver_cpp.cu
     src/applications/solvers/interFoam/inter_case_cpp.cu
+    src/transportModels/twoPhaseMixture/device_two_phase_mixture.cu
     src/transportModels/interfaceProperties/interface_properties_cpp.cu
     src/applications/solvers/interFoam/inter_solve_cpp.cu
     src/applications/solvers/interFoam/inter_peqn_cpp.cu
@@ -3049,6 +3050,17 @@ add_executable(test_two_phase_mixture tests/test_two_phase_mixture.cu)
 target_include_directories(test_two_phase_mixture PRIVATE ${BRAE_HEADER_DIRS}
                            ${CMAKE_CURRENT_SOURCE_DIR}/src/transportModels/twoPhaseMixture)
 target_link_libraries(test_two_phase_mixture PRIVATE brae_core)
+# interFoam on the DEVICE, first component: the mixture. Held to BIT-FOR-BIT agreement with the host
+# reference rather than to a tolerance -- it is per-cell arithmetic with no addressing, reduction or
+# interpolation, so there is nothing for a tolerance to absorb and any difference is a defect. The
+# sweep leaves [0,1] on purpose: rho takes the raw alpha and mu/nu the clamped one, and a fused kernel
+# that clamps once passes every in-range test.
+add_executable(test_device_two_phase_mixture tests/test_device_two_phase_mixture.cu)
+target_include_directories(test_device_two_phase_mixture PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_device_two_phase_mixture PRIVATE brae_core)
+add_test(NAME device_two_phase_mixture COMMAND test_device_two_phase_mixture)
+set_tests_properties(device_two_phase_mixture PROPERTIES SKIP_RETURN_CODE 77)
+
 add_test(NAME two_phase_mixture
          COMMAND test_two_phase_mixture
                  ${BRAE_OF_TUTORIALS}/multiphase/interFoam/laminar/damBreak/damBreak)
