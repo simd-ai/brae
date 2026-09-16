@@ -136,6 +136,7 @@ add_library(brae_core STATIC
     src/applications/solvers/interFoam/inter_solve_cpp.cu
     src/applications/solvers/interFoam/inter_peqn_cpp.cu
     src/finiteVolume/fvMatrices/solvers/MULES/mules_cpp.cu
+    src/finiteVolume/fvMatrices/solvers/MULES/device_mules.cu
     src/applications/solvers/interFoam/alpha_eqn_cpp.cu
     src/applications/solvers/interFoam/inter_ueqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoCreateFields_cpp.cu
@@ -3070,6 +3071,17 @@ target_include_directories(test_device_interface_properties PRIVATE ${BRAE_HEADE
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_device_interface_properties PRIVATE brae_core)
 add_test(NAME device_interface_properties COMMAND test_device_interface_properties)
+
+# ...and MULES. Two kinds of arm: the PROPERTY (alpha stays in [0,1]) asserted exactly, because that is
+# what MULES is for and needs no host to compare against; and lambda itself within a measured
+# tolerance, because each cell's five gathers run in a different ORDER from the host's face loop and
+# floating-point addition is not associative. The donor flux has no reduction and IS bit-identical.
+add_executable(test_device_mules tests/test_device_mules.cu)
+target_include_directories(test_device_mules PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_mules PRIVATE brae_core)
+add_test(NAME device_mules COMMAND test_device_mules)
+set_tests_properties(device_mules PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(device_interface_properties PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(device_two_phase_mixture PROPERTIES SKIP_RETURN_CODE 77)
 
