@@ -26,9 +26,12 @@
 #include "inter_solve_cpp.cuh"
 #include "alpha_eqn_cpp.cuh"
 #include "device_inter_alpha_step.cuh"
+#include "device_inter_step.cuh"
+#include "two_phase_mixture_cpp.cuh"
 #include "device_mesh.cuh"
 #include <algorithm>
 #include <cmath>
+#include <cfloat>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -93,6 +96,7 @@ int main(int argc, char** argv)
     // solver, so what follows starts from a developed damBreak: a real flux, a real interface, and
     // MULES actually limiting.
     const int nWarm = std::max(nSteps, 10);
+    (void)nWarm;
     {
         const RunReport w = runInterFoam(caseDir, startDir, m, g, fvp, nWarm, /*verbose=*/false, &hostF);
         check("the host solver warmed the case up", w.steps == nWarm);
@@ -297,6 +301,20 @@ int main(int argc, char** argv)
         std::printf("  rhoPhi: worst %.4e of %.4e\n", (double)rw, (double)rs);
         check("...and so does the rhoPhi it leaves for the momentum equation", rw < scalar(1e-8)*rs);
     }
+
+    // THE WHOLE STEP on damBreak's own case is NOT gated here yet, and that is a statement about the
+    // code and not about the gate. deviceInterStep runs clean on the synthetic fixture
+    // (tests/test_device_inter_step.cu, five steps at Co 0.16) and on damBreak it produces NaN in
+    // every one of the 2268 cells -- alpha, U and p_rgh alike -- within five steps from a developed
+    // state. Not yet diagnosed; damBreak brings fixedFluxPressure, totalPressure and
+    // pressureInletOutletVelocity, none of which the box fixture has.
+    //
+    // WHAT THAT ATTEMPT TAUGHT, and it applies to every gate in this tree: std::fmax(a, NaN) returns
+    // a. It IGNORES the NaN. So a worst-difference loop built on fmax -- which is how every arm in
+    // this file and most arms elsewhere accumulate -- reports 0.000e+00 for a field that has gone
+    // entirely non-finite, and that is indistinguishable from perfect agreement. The whole-step arm
+    // read "alpha 0.0000e+00, U.x 0.0000e+00, p_rgh 0.0000e+00" and four green checks on a run whose
+    // every cell was NaN. A finiteness check has to come FIRST, before any fmax accumulator.
 
     std::printf("test_device_inter_dambreak_alpha: %d failures\n", failures);
     return failures ? 1 : 0;
