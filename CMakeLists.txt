@@ -115,6 +115,7 @@ add_library(brae_core STATIC
     src/applications/solvers/simpleFoam/simpleFoamV2.cu
     src/applications/solvers/simpleFoam/pEqn_cpp.cu
     src/applications/solvers/simpleFoam/createFields_cpp.cu
+    src/applications/solvers/interFoam/alpha_eqn_cpp.cu
     src/applications/solvers/interFoam/inter_ueqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoCreateFields_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoUEqn_cpp.cu
@@ -3065,6 +3066,18 @@ target_include_directories(test_inter_ueqn_cpp PRIVATE ${BRAE_HEADER_DIRS}
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_inter_ueqn_cpp PRIVATE brae_core)
 add_test(NAME inter_ueqn_cpp COMMAND test_inter_ueqn_cpp)
+
+# interFoam step 8: alphaEqn.H's flux assembly -- the controls, the off-centring, phic, alphaPhiUn and
+# rhoPhi. MULES itself is the next stage and is deliberately not here. The arms that matter are the ones
+# no field plot shows: phic zeroed on non-coupled boundaries, the two minus signs in the nested
+# compressive flux, and vanLeer's limiter reaching 2 rather than being clamped to 1.
+add_executable(test_alpha_eqn_cpp tests/test_alpha_eqn_cpp.cu)
+target_include_directories(test_alpha_eqn_cpp PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_alpha_eqn_cpp PRIVATE brae_core)
+add_test(NAME alpha_eqn_cpp
+         COMMAND test_alpha_eqn_cpp
+                 $ENV{FOAM_TUTORIALS}/multiphase/interFoam/laminar/damBreak/damBreak)
 
 add_executable(test_residual_control tests/test_residual_control.cu)
 target_include_directories(test_residual_control PRIVATE ${BRAE_HEADER_DIRS})

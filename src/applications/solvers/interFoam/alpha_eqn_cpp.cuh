@@ -1,0 +1,174 @@
+#pragma once
+// interFoam's alpha equation -- the FLUX ASSEMBLY, the host reference.
+//
+// provenance:
+//   openfoam:
+//     file: applications/solvers/multiphase/VoF/alphaEqn.H
+//     also: applications/solvers/multiphase/interFoam/alphaControls.H  (the dictionary keys)
+//           applications/solvers/multiphase/interFoam/alphaSuSp.H      (Su, Sp, divU -- see below)
+//           src/finiteVolume/finiteVolume/fvc/fvcFluxTemplates.C:80-90 (fvc::flux(phi, vf, name))
+//           src/finiteVolume/finiteVolume/convectionSchemes/gaussConvectionScheme/
+//             gaussConvectionScheme.C:64-73  (flux(faceFlux, vf) == faceFlux*interpolate(vf))
+//           src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/vanLeer/vanLeer.H:85
+//   brae:
+//     reference: this header
+//     cuda:      (pending)
+//     tests:     tests/test_alpha_eqn_cpp.cu
+//
+// WHAT IS IN THIS FILE AND WHAT IS NOT. alphaEqn.H is two things bolted together: the assembly of the
+// advective and compressive fluxes, and MULES, which limits them. MULES is an explicit iterative
+// bound-preserving limiter -- not a matrix assembly -- and it needs an instrumented OpenFOAM for its
+// oracle, so the manifest budgets it as its own stage. THIS FILE IS EVERYTHING ELSE: the controls, the
+// off-centring, the compression flux, alphaPhiUn, and rhoPhi. It hands MULES a face flux and takes one
+// back.
+//
+// Su, Sp AND divU ARE IDENTICALLY ZERO HERE. interFoam/alphaSuSp.H is three lines --
+// `zeroField Su; zeroField Sp; zeroField divU;` -- so alphaEqn.H's source terms collapse for THIS
+// solver. They are live in interPhaseChangeFoam, which is a different solver with its own alphaSuSp.H.
+// Carrying them would be carrying machinery this port does not have, and the places they would enter
+// are named at each site below rather than left implicit.
+//
+// FOUR THINGS WORTH NAMING, none of them arithmetic:
+//
+// 1. phic IS ZEROED ON EVERY NON-COUPLED BOUNDARY PATCH (alphaEqn.H:79-89). Interface compression is an
+//    anti-diffusion term; applied at an inlet or an outlet it pulls interface INTO the domain through a
+//    boundary that has no interface. OpenFOAM's comment is "Do not compress interface at non-coupled
+//    boundary faces". A port that builds phic from the boundary flux and stops there runs a physically
+//    different problem at every open boundary, and it looks like an inflow condition problem.
+//
+// 2. alphaPhiUn'S SECOND TERM IS A NESTED FLUX WITH TWO MINUS SIGNS (alphaEqn.H:171-176):
+//
+//        fvc::flux(-fvc::flux(-phir, alpha2, alpharScheme), alpha1, alpharScheme)
+//
+//    fvc::flux(psi, vf, scheme) is psi*interpolate(vf) where the INTERPOLATION IS UPWINDED BY psi. So
+//    alpha2 is interpolated against -phir and alpha1 against the result. Dropping either minus leaves a
+//    flux of the same magnitude, upwinded from the wrong side -- which on a limited scheme differs only
+//    at the interface, i.e. only where the answer is decided.
+//
+// 3. rhoPhi's TWO BRANCHES DIFFER IN WHICH FLUX MULTIPLIES rho2f (alphaEqn.H:248 vs 260): phiCN on the
+//    Euler/localEuler branch, phi on the other. With ocCoeff == 0 the two are the same field, so on
+//    every Euler case -- 42 of the 44 shipped tutorials -- the difference is unobservable. It is exactly
+//    the one CrankNicolson case that would show it.
+//
+// 4. rho1f - rho2f IS AN ORDER. rhoPhi = alphaPhi10*(rho1f - rho2f) + phi*rho2f is a linear blend that
+//    reduces to phi*rho1f where alpha1 is 1 and phi*rho2f where it is 0. Swapped, it still has the right
+//    dimensions and the right magnitude and inverts the mixture.
+#include "cf_types.cuh"
+#include "foam_dict.cuh"
+#include "primitive_mesh.cuh"
+#include "fv_geometry.cuh"
+#include "fv_patch.cuh"
+#include "geometric_field.cuh"
+#include "fvc.cuh"
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace brae {
+namespace cpu {
+namespace interFoam {
+
+// fvSolution's solvers/<alpha1> entry. nAlphaCorr and nAlphaSubCycles are get<label> in
+// alphaControls.H -- NO default, so a case omitting either is a FatalError in OpenFOAM and a refusal
+// here. The rest are getOrDefault.
+struct AlphaControls
+{
+    label  nAlphaCorr         = 0;       // MANDATORY
+    label  nAlphaSubCycles    = 0;       // MANDATORY
+    bool   MULESCorr          = false;
+    bool   alphaApplyPrevCorr = false;
+    scalar icAlpha            = 0;       // isotropic compression; 0 in every shipped tutorial
+    scalar scAlpha            = 0;       // shear compression;     absent in every shipped tutorial
+};
+
+AlphaControls readAlphaControls(const FoamDict& fvSolution, const std::string& alphaFieldName);
+
+// ddtSchemes `ddt(alpha)`. alphaEqn.H:18-52 accepts EXACTLY Euler, localEuler and CrankNicolson, and
+// FatalErrors on anything else -- so `backward`, which the rest of brae supports, is refused here by
+// OpenFOAM itself rather than by a limitation of this port.
+enum class AlphaDdt { Euler, localEuler, CrankNicolson, other };
+
+// The off-centring coefficient, alphaEqn.H:6-53.
+//
+//   Euler / localEuler                          -> 0
+//   CrankNicolson, first step of a cold start   -> 0   (the scheme has no old-time ddt to off-centre)
+//   CrankNicolson, thereafter                   -> the scheme's own ocCoeff
+//   CrankNicolson with nAlphaSubCycles > 1      -> FatalError
+//
+// `warmedUp` is OpenFOAM's `alphaRestart || timeIndex > startTimeIndex + 1`, decided by the caller
+// because it is a property of the run, not of the schemes.
+scalar offCentringCoeff(AlphaDdt scheme,
+                        label    nAlphaSubCycles,
+                        scalar   schemeOcCoeff,
+                        bool     warmedUp);
+
+// cnCoeff = 1/(1 + ocCoeff), alphaEqn.H:56. 1 for Euler.
+inline scalar blendingCoeff(scalar ocCoeff) { return scalar(1) / (scalar(1) + ocCoeff); }
+
+// phic, alphaEqn.H:59-89. The optional isotropic and shear contributions are included because they are
+// cheap and because leaving them out would mean silently ignoring icAlpha/scAlpha on a case that sets
+// them -- but note that NO shipped interFoam tutorial sets either to a non-zero value, so nothing in
+// the tutorial set exercises them. `magU` and `shear` may be empty when the corresponding coefficient
+// is zero; they are required when it is not.
+//
+// THE BOUNDARY IS ZEROED on every non-coupled patch. brae has no coupled patch in a VoF case yet, so
+// every patch is zeroed today; the argument is here so that adding cyclic does not silently change the
+// interior behaviour.
+void compressionFlux(scalar                       cAlpha,
+                     const SurfaceScalarField&    phi,
+                     const std::vector<scalar>&   magSf,          // the mesh's full face array
+                     const std::vector<FvPatch>&  patches,
+                     scalar                       icAlpha,
+                     const std::vector<scalar>&   magUf,          // internal; icAlpha > 0 only
+                     scalar                       scAlpha,
+                     const std::vector<scalar>&   shearf,         // internal; scAlpha > 0 only
+                     SurfaceScalarField&          phic);
+
+// phiCN, alphaEqn.H:91-97. Returns phi itself when ocCoeff == 0, which is what OpenFOAM's tmp does.
+void offCentredFlux(const SurfaceScalarField& phi,
+                    const SurfaceScalarField& phiOld,
+                    scalar                    cnCoeff,
+                    scalar                    ocCoeff,
+                    SurfaceScalarField&       phiCN);
+
+// The interpolation scheme named by a divSchemes entry for the alpha fluxes. `Gauss vanLeer` is
+// div(phi,alpha) in all 42 shipped tutorials; div(phirb,alpha) is `Gauss linear` in 31, `Gauss vanLeer`
+// in 7 and `Gauss interfaceCompression` in 4. The last is a separate scheme, not a variant, and is
+// refused by name.
+enum class AlphaFluxScheme { vanLeer, linear, upwind, interfaceCompression };
+
+// fvc::flux(psi, vf, scheme) == psi*interpolate(vf), with the interpolation UPWINDED BY psi
+// (gaussConvectionScheme.C:64-73). `psi` is the flux that both scales the result and picks the upwind
+// side, which is why the two are one argument and not two.
+void fluxWithScheme(const SurfaceScalarField&     psi,
+                    const GeometricField<scalar>& vf,
+                    AlphaFluxScheme               scheme,
+                    const PrimitiveMesh&          m,
+                    const FvGeometry&             g,
+                    const std::vector<FvPatch>&   patches,
+                    SurfaceScalarField&           out);
+
+// alphaPhiUn, alphaEqn.H:164-176 -- the advective flux plus the compressive one. See note 2.
+void alphaPhiUn(const SurfaceScalarField&     phi,
+                const SurfaceScalarField&     phir,
+                const GeometricField<scalar>& alpha1,
+                const GeometricField<scalar>& alpha2,
+                AlphaFluxScheme               alphaScheme,
+                AlphaFluxScheme               alpharScheme,
+                const PrimitiveMesh&          m,
+                const FvGeometry&             g,
+                const std::vector<FvPatch>&   patches,
+                SurfaceScalarField&           out);
+
+// rhoPhi = alphaPhi10*(rho1f - rho2f) + phiForRho2*rho2f, alphaEqn.H:248 / :260. `phiForRho2` is phiCN
+// on the Euler/localEuler branch and phi on the other -- see note 3; the caller picks, and this refuses
+// to guess.
+void massFlux(const SurfaceScalarField& alphaPhi10,
+              const SurfaceScalarField& phiForRho2,
+              scalar                    rho1,
+              scalar                    rho2,
+              SurfaceScalarField&       rhoPhi);
+
+} // namespace interFoam
+} // namespace cpu
+} // namespace brae

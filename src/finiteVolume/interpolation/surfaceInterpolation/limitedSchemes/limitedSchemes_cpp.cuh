@@ -100,6 +100,17 @@ inline scalar rVector(scalar faceFlux, const vector& phiP, const vector& phiN,
 // limitedLinear.H's limiter, and the blend limitedSurfaceInterpolationScheme::weights applies to it.
 inline scalar limitedLinearLimiter(scalar r, scalar twoByk) { return clamp01(twoByk * r); }
 
+// vanLeer.H:85 -- (r + |r|)/(1 + |r|). NOT clamped, and NOT bounded by 1: it rises through 1 at r = 1
+// and asymptotes to 2 as r -> inf, which is the Sweby TVD ceiling. limitedLinear clamps to [0,1]
+// because its own twoByk*r form would run away; writing the same clamp here would cap vanLeer at the
+// central-difference weight and make it a different scheme. Every interFoam tutorial limits
+// div(phi,alpha) with it, so this is the VoF scheme, not an option.
+inline scalar vanLeerLimiter(scalar r)
+{
+    const scalar ar = std::fabs(r);
+    return (r + ar) / (scalar(1) + ar);
+}
+
 inline scalar blend(scalar limiter, scalar cdWeight, scalar faceFlux)
 {
     return limiter*cdWeight + (1.0 - limiter)*((faceFlux >= 0.0) ? 1.0 : 0.0);   // pos0
@@ -164,6 +175,16 @@ std::vector<scalar> limitedLinearWeights(
     const GeometricField<scalar>&     vf,
     const std::vector<vector>&        gradVf,
     scalar                            k,        // the scheme coefficient; `limitedLinear 1` -> k = 1
+    const PrimitiveMesh&              m,
+    const FvGeometry&                 g);
+
+// vanLeer, scalar form: weights = limiter*CD + (1-limiter)*pos0(phi), with vanLeer's own limiter. It
+// takes no coefficient -- `Gauss vanLeer` has no k -- which is the one structural difference from
+// limitedLinear's signature.
+std::vector<scalar> vanLeerWeights(
+    const std::vector<scalar>&        phi,
+    const GeometricField<scalar>&     vf,
+    const std::vector<vector>&        gradVf,
     const PrimitiveMesh&              m,
     const FvGeometry&                 g);
 

@@ -1528,14 +1528,24 @@ COMPONENTS = {
         dict(name="interFoam_alphaEqn", of_symbol="alphaEqn",
              of_file="applications/solvers/multiphase/VoF/alphaEqn.H",
              classification="SHARED_NUMERICAL", status="REIMPLEMENT",
-             brae_reference="src/applications/solvers/interFoam/alphaEqn_cpp.cu",
-             brae_target="src/applications/solvers/interFoam/alphaEqn.cu",
-             validation="Boundedness is an ASSERTION, not a tolerance: 0 <= alpha <= 1 exactly, every cell, "
-                        "every sub-cycle. A VoF gate that only checks agreement can pass while the field "
-                        "goes unbounded and is then clipped.",
-             note="cAlpha interface compression enters as div(phirb,alpha) with phir = cAlpha*|phi/magSf|. "
-                  "Only Euler and CrankNicolson ddt are accepted (alphaEqn.H:44-50 FatalErrors otherwise), "
-                  "and CrankNicolson is refused when sub-cycling."),
+             brae_reference="src/applications/solvers/interFoam/alpha_eqn_cpp.cuh",
+             brae_target="src/applications/solvers/interFoam/device_alpha_eqn.cu",
+             validation="tests/test_alpha_eqn_cpp.cu covers the FLUX ASSEMBLY. Boundedness is the gate for "
+                        "the MULES half and is an ASSERTION, not a tolerance: 0 <= alpha <= 1 exactly, "
+                        "every cell, every sub-cycle. A VoF gate that only checks agreement can pass "
+                        "while the field goes unbounded and is then clipped.",
+             note="SPLIT IN TWO. The flux assembly is landed: alphaControls, the off-centring, phic, "
+                  "phiCN, alphaPhiUn and rhoPhi. MULES is interFoam_MULES and is not. Su/Sp/divU are "
+                  "identically zero for THIS solver (interFoam/alphaSuSp.H is three zeroFields); they "
+                  "are live in interPhaseChangeFoam, which has its own. Three things the gate pins that "
+                  "no field shows: phic is zeroed on every NON-COUPLED boundary (alphaEqn.H:79-89, "
+                  "compression at an inlet sharpens an interface the boundary does not have); "
+                  "alphaPhiUn's compressive term is a nested flux with TWO minus signs, which cancel "
+                  "exactly under `Gauss linear` (31 tutorials, so the mistake is invisible there) and "
+                  "do not under `Gauss vanLeer` (7); and rhoPhi's two branches multiply rho2f by phiCN "
+                  "on the Euler path and phi on the other. Only Euler, localEuler and CrankNicolson ddt "
+                  "are accepted (alphaEqn.H:49-51), and CrankNicolson is refused when sub-cycling. "
+                  "`Gauss interfaceCompression` on div(phirb,alpha) (4 tutorials) is refused by name."),
         dict(name="interFoam_MULES", of_symbol="MULES::limiter",
              of_file="src/finiteVolume/fvMatrices/solvers/MULES/MULES.C",
              classification="SHARED_NUMERICAL", status="REIMPLEMENT",
