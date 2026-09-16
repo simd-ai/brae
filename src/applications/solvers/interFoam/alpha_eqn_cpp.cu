@@ -403,9 +403,15 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
         pbicgstab(M, alpha1.internal, m, patches, in.tolAlpha, in.relTolAlpha, in.maxIterAlpha);
         alpha1.evaluateBoundary();
 
-        // alphaPhi10 = alpha1Eqn.flux(): the CONSERVATIVE face flux of the SOLVED matrix, not the
-        // upwind flux of the pre-solve field. The two differ by the solver's own residual, and using
-        // the second leaves alphaPhi10 inconsistent with the alpha it is supposed to have produced.
+        // alphaPhi10 = alpha1Eqn.flux(): the CONSERVATIVE face flux of the SOLVED matrix, not a flux
+        // rebuilt from the field afterwards. What it buys is the closure
+        //     alpha == alpha.oldTime() - (dt/V)*sum_f alphaPhi10
+        // to the LINEAR SOLVER's residual. MEASURED (tests/test_device_alpha_presolve.cu): on the
+        // INTERNAL faces of this pure-upwind matrix flux() is bit-identical to the upwind flux of the
+        // SOLVED field -- faceH collapses to phi*psi[upwind] -- so those two are not two things. What
+        // does break the closure is rebuilding the flux from the field the solve STARTED from (5.1e-03)
+        // or with any other interpolation (a central flux, 2.3e-02); and at a patch whose coefficients
+        // are not (1, 0), flux() carries the prescribed value where a rebuilt flux carries the cell's.
         upwindFlux = matrixFlux(M, alpha1.internal, m, patches);
         alphaPhi10 = upwindFlux;
 
