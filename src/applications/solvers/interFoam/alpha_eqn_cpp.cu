@@ -3,6 +3,8 @@
 #include "alpha_eqn_cpp.cuh"
 #include "limitedSchemes_cpp.cuh"
 #include "cellLimitedGrad_cpp.cuh"
+#include "fv_patch_field.cuh"
+#include <memory>
 
 namespace brae {
 namespace cpu {
@@ -327,6 +329,90 @@ void massFlux(const SurfaceScalarField& alphaPhi10,
             rhoPhi.boundary[pi][i] =
                 alphaPhi10.boundary[pi][i] * dRho + phiForRho2.boundary[pi][i] * rho2;
     }
+}
+
+
+// ---------------------------------------------------------------------------------------------------
+
+void alphaEqnStep(GeometricField<scalar>&                 alpha1,
+                  const std::vector<scalar>&              alpha1Old,
+                  const AlphaStepInput&                   in,
+                  const interfaceProps::InterfaceCoeffs&  ic,
+                  const MULES::Controls&                  mulesCtl,
+                  const PrimitiveMesh&                    m,
+                  const FvGeometry&                       g,
+                  const std::vector<FvPatch>&             patches,
+                  SurfaceScalarField&                     alphaPhi10,
+                  SurfaceScalarField&                     rhoPhi)
+{
+    if (!in.phi || !in.phiCN)
+        throw std::runtime_error("brae interFoam alphaEqn: phi and phiCN are both required.");
+    if (in.nAlphaCorr < 1)
+        throw std::runtime_error("brae interFoam alphaEqn: nAlphaCorr must be at least 1.");
+    if (in.MULESCorr)
+        throw std::runtime_error(
+            "brae interFoam alphaEqn: `MULESCorr yes` needs the IMPLICIT upwind pre-solve "
+            "(alphaEqn.H:103-122) -- an fvScalarMatrix of fvm::ddt(alpha1) + fvm::div(phiCN, alpha1) "
+            "solved with the case's own smoothSolver, whose result CMULES then corrects. The limiter "
+            "half is ported and gated (MULES::correct); the matrix half is not wired here yet. 13 of "
+            "the 44 shipped tutorials set it, damBreak among them.");
+
+    const label nC = m.nCells();
+
+    // The alpha field starts each sub-step from its old time.
+    alpha1.internal = alpha1Old;
+    alpha1.evaluateBoundary();
+
+    for (label aCorr = 0; aCorr < in.nAlphaCorr; ++aCorr)
+    {
+        // mixture.correct(): the interface normal from the CURRENT alpha. Inside the loop on purpose
+        // -- the second corrector compresses towards where MULES has just put the interface, not
+        // towards where it was at the start of the step.
+        SurfaceScalarField nHatf;
+        std::vector<scalar> K;
+        interfaceProps::calculateK(alpha1, ic, m, g, patches, /*gradLeastSquares=*/false, nHatf, K);
+
+        // phic = cAlpha*|phi/magSf|, zeroed on every non-coupled boundary.
+        SurfaceScalarField phic;
+        compressionFlux(ic.cAlpha, *in.phi, g.magSf(), patches,
+                        in.icAlpha, {}, in.scAlpha, {}, phic);
+
+        // phir = phic*nHatf. nHatf is already a FLUX (nHatfv & Sf), not a unit vector, so this is a
+        // product of two face fields and needs no further area weighting.
+        SurfaceScalarField phir;
+        phir.internal.resize(phic.internal.size());
+        for (std::size_t f = 0; f < phic.internal.size(); ++f)
+            phir.internal[f] = phic.internal[f] * nHatf.internal[f];
+        phir.boundary.resize(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            phir.boundary[pi].resize(phic.boundary[pi].size());
+            for (std::size_t i = 0; i < phic.boundary[pi].size(); ++i)
+                phir.boundary[pi][i] = phic.boundary[pi][i] * nHatf.boundary[pi][i];
+        }
+
+        // alpha2 = 1 - alpha1, rebuilt from the CURRENT alpha1 -- the compressive term reads it.
+        GeometricField<scalar> alpha2;
+        alpha2.internal.resize(static_cast<std::size_t>(nC));
+        for (label c = 0; c < nC; ++c) alpha2.internal[c] = scalar(1) - alpha1.internal[c];
+        for (const FvPatch& q : patches)
+            alpha2.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
+        alpha2.evaluateBoundary();
+
+        SurfaceScalarField un;
+        alphaPhiUn(*in.phi, phir, alpha1, alpha2, in.alphaScheme, in.alpharScheme, m, g, patches, un);
+
+        // MULES::explicitSolve(geometricOneField(), alpha1, phiCN, alphaPhi10, 0, 0, 1, 0) --
+        // alphaEqn.H:208-220. alphaPhi10 IS alphaPhiUn on the explicit path, limited in place.
+        alphaPhi10 = un;
+        MULES::Fields mf;                       // all null: rho == 1, Sp == Su == 0, bounds [0,1]
+        MULES::explicitSolveLimited(scalar(1)/in.deltaT, alpha1, alpha1Old, *in.phiCN, alphaPhi10,
+                                    mf, mulesCtl, m, g, patches);
+    }
+
+    // rhoPhi = alphaPhi10*(rho1 - rho2) + phiCN*rho2, alphaEqn.H:248. The Euler branch multiplies
+    // rho2 by phiCN; the CrankNicolson one by phi, and they are the same field only when ocCoeff is 0.
+    massFlux(alphaPhi10, *in.phiCN, in.rho1, in.rho2, rhoPhi);
 }
 
 } // namespace interFoam

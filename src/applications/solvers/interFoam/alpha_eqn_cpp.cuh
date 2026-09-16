@@ -60,6 +60,8 @@
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
 #include "fvc.cuh"
+#include "interface_properties_cpp.cuh"
+#include "mules_cpp.cuh"
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -168,6 +170,63 @@ void massFlux(const SurfaceScalarField& alphaPhi10,
               scalar                    rho1,
               scalar                    rho2,
               SurfaceScalarField&       rhoPhi);
+
+// ---------------------------------------------------------------------------------------------------
+// THE WHOLE alphaEqn.H, assembled from the pieces above plus MULES. This is what alphaEqnSubCycle
+// calls once per sub-step.
+//
+//   for (aCorr = 0; aCorr < nAlphaCorr; ++aCorr)
+//   {
+//       phir       = phic*mixture.nHatf();
+//       alphaPhiUn = fvc::flux(phi, alpha1, alphaScheme)
+//                  + fvc::flux(-fvc::flux(-phir, alpha2, alpharScheme), alpha1, alpharScheme);
+//       ... MULES ...
+//       alpha2 = 1 - alpha1;
+//       mixture.correct();
+//   }
+//   rhoPhi = alphaPhi10*(rho1 - rho2) + phiCN*rho2;
+//
+// TWO THINGS THE LOOP DOES THAT ARE EASY TO HOIST OUT OF IT AND WRONG TO:
+//
+//   * mixture.correct() INSIDE the corrector loop recomputes nHatf from the alpha MULES has just
+//     produced, so phir is DIFFERENT on the second corrector. Hoisting the curvature out of the loop
+//     makes every corrector compress the interface towards where it was at the start of the step --
+//     which converges, to a slightly stale interface, and nAlphaCorr is 2 or 3 in 11 of the 44
+//     shipped tutorials.
+//   * alpha1 is updated IN PLACE by each corrector. The correctors are a sequence, not an average.
+struct AlphaStepInput
+{
+    const SurfaceScalarField* phi      = nullptr;   // the volumetric flux
+    const SurfaceScalarField* phiCN    = nullptr;   // off-centred; == phi for Euler
+
+    scalar  cAlpha   = 0;
+    label   nAlphaCorr = 1;
+    scalar  icAlpha  = 0;
+    scalar  scAlpha  = 0;
+    scalar  rho1 = 0, rho2 = 0;
+    scalar  deltaT = 0;
+    AlphaFluxScheme alphaScheme  = AlphaFluxScheme::vanLeer;
+    AlphaFluxScheme alpharScheme = AlphaFluxScheme::linear;
+
+    // MULES
+    bool    MULESCorr = false;
+    // the case's own linear-solver controls for the implicit upwind pre-solve (MULESCorr only)
+    scalar  tolAlpha = 1e-8, relTolAlpha = 0;
+    int     maxIterAlpha = 1000;
+};
+
+// One alphaEqn.H. `alpha1` carries the field AND its boundary conditions and is advanced in place;
+// `alpha1Old` is the sub-step's starting value and is not written.
+void alphaEqnStep(GeometricField<scalar>&                 alpha1,
+                  const std::vector<scalar>&              alpha1Old,
+                  const AlphaStepInput&                   in,
+                  const interfaceProps::InterfaceCoeffs&  ic,
+                  const MULES::Controls&                  mulesCtl,
+                  const PrimitiveMesh&                    m,
+                  const FvGeometry&                       g,
+                  const std::vector<FvPatch>&             patches,
+                  SurfaceScalarField&                     alphaPhi10,
+                  SurfaceScalarField&                     rhoPhi);
 
 } // namespace interFoam
 } // namespace cpu

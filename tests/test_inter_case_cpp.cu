@@ -26,6 +26,12 @@
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "inter_case_cpp.cuh"
+#include "foam_field_reader.cuh"
+#include "fv_patch_field.cuh"
+#include "fvm.cuh"
+#include "fv_matrix_ops.cuh"
+#include "pbicgstab.cuh"
+#include <memory>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -170,6 +176,184 @@ int main(int argc, char** argv)
     // outer iteration before alphaEqn has ever written it.
     checkNum("rhoPhi exists from the start", scalar(f.rhoPhi.internal.size()),
              scalar(m.nInternalFaces()));
+
+    // ---- 5. ONE ALPHA STEP ON THE REAL CASE -------------------------------------------------------
+    // The first time any of this advects anything on a mesh OpenFOAM built. What is asserted is what
+    // holds for ANY flux on ANY mesh -- boundedness, exactly -- plus non-vacuity: the interface has to
+    // have MOVED, or the bound is satisfied by doing nothing.
+    //
+    // CONSERVATION IS NOT ASSERTED HERE, and the reason is the fixture, not the code. An exactly
+    // conservative arm needs a discretely divergence-free flux; the analytic vortex below is
+    // divergence-free as a continuous field but its pointwise face fluxes are not, so alpha's total
+    // legitimately drifts by that residual. The measured divergence is printed beside the drift so the
+    // two can be compared, and the exact conservation claim stays where the fixture supports it --
+    // tests/test_mules_cpp.cu, on a flux built to close.
+    {
+        // damBreak sets MULESCorr yes, so the very first thing to check is that brae says so.
+        {
+            GeometricField<scalar> a = buildField<scalar>(
+                readField<scalar>(startDir + "/" + f.alphaName), patches, nC);
+            a.evaluateBoundary();
+            AlphaStepInput in;
+            in.phi = &f.phi; in.phiCN = &f.phi;
+            in.nAlphaCorr = f.alphaCtl.nAlphaCorr;
+            in.MULESCorr  = f.alphaCtl.MULESCorr;
+            in.rho1 = f.mixture.phases.rho1; in.rho2 = f.mixture.phases.rho2;
+            in.deltaT = f.deltaT;
+            SurfaceScalarField aPhi, rPhi;
+            bool threw = false;
+            try
+            {
+                alphaEqnStep(a, f.alpha1.internal, in, f.interface, f.mulesCtl,
+                             m, g, patches, aPhi, rPhi);
+            }
+            catch (const std::exception&) { threw = true; }
+            check("damBreak's `MULESCorr yes` is refused by name -- the implicit pre-solve is not wired",
+                  threw && f.alphaCtl.MULESCorr);
+        }
+
+        // ...and now the explicit path, which 30 of the 44 shipped tutorials take.
+        // A VORTEX from a stream function that vanishes on the bounding box, so the velocity is
+        // tangential at every wall: psi = A sin(pi x/Lx) sin(pi y/Ly), U = (dpsi/dy, -dpsi/dx).
+        vector lo = g.C()[0], hi = g.C()[0];
+        for (label c = 0; c < nC; ++c)
+        {
+            lo.x = std::fmin(lo.x, g.C()[c].x); hi.x = std::fmax(hi.x, g.C()[c].x);
+            lo.y = std::fmin(lo.y, g.C()[c].y); hi.y = std::fmax(hi.y, g.C()[c].y);
+        }
+        const scalar Lx = hi.x - lo.x, Ly = hi.y - lo.y, A = scalar(0.05);
+        auto Uat = [&](const vector& X)
+        {
+            const scalar sx = std::sin(scalar(M_PI)*(X.x - lo.x)/Lx);
+            const scalar cx = std::cos(scalar(M_PI)*(X.x - lo.x)/Lx);
+            const scalar sy = std::sin(scalar(M_PI)*(X.y - lo.y)/Ly);
+            const scalar cy = std::cos(scalar(M_PI)*(X.y - lo.y)/Ly);
+            return vector{ A*sx*cy*scalar(M_PI)/Ly, -A*cx*sy*scalar(M_PI)/Lx, scalar(0)};
+        };
+
+        SurfaceScalarField phi;
+        phi.internal.resize(static_cast<std::size_t>(m.nInternalFaces()));
+        for (label fi = 0; fi < m.nInternalFaces(); ++fi)
+        {
+            const vector U = Uat(g.Cf()[fi]);
+            const vector& S = g.Sf()[fi];
+            phi.internal[fi] = U.x*S.x + U.y*S.y + U.z*S.z;
+        }
+        phi.boundary.resize(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            phi.boundary[pi].assign(static_cast<std::size_t>(patches[pi].size), scalar(0));
+
+        // ...AND THEN PROJECTED ONTO THE DIVERGENCE-FREE SPACE, because MULES's bound assumes one.
+        //
+        // This was found by measuring, not by reasoning: the pointwise vortex flux above is
+        // divergence-free as a CONTINUOUS field and emphatically not as a discrete one -- |div(phi)|
+        // came out at 2.15e+01 -- and alpha left [0,1] by 3.1e-02 within 20 steps. That is not a MULES
+        // defect: interFoam's explicit solve passes divU as a zeroField (alphaEqn.H:217), i.e. it
+        // ASSUMES the flux closes, and OpenFOAM would go out of bounds on the same input. A boundedness
+        // gate fed a divergent flux tests nothing but the fixture.
+        //
+        // The projection is CorrectPhi's: solve laplacian(1, pcorr) == div(phi) with every patch
+        // zeroGradient (the flux is tangential at all of them) and a reference cell to pin the
+        // singular system, then subtract the resulting face flux.
+        scalar divBefore = 0, worstDiv = 0;
+        {
+            auto worstOf = [&](const SurfaceScalarField& p)
+            {
+                const std::vector<scalar> d = fvc::div(p, m, g, patches);
+                scalar w = 0;
+                for (scalar v : d) w = std::fmax(w, std::fabs(v));
+                return w;
+            };
+            divBefore = worstOf(phi);
+
+            GeometricField<scalar> pcorr;
+            pcorr.internal.assign(static_cast<std::size_t>(nC), scalar(0));
+            for (const FvPatch& q : patches)
+                pcorr.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
+            pcorr.evaluateBoundary();
+
+            SurfaceScalarField one;
+            one.internal.assign(static_cast<std::size_t>(m.nInternalFaces()), scalar(1));
+            one.boundary.resize(patches.size());
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                one.boundary[pi].assign(static_cast<std::size_t>(patches[pi].size), scalar(1));
+
+            FvScalarMatrix pe = fvm::laplacian<scalar>(one, pcorr, m, g, patches, /*corrected=*/false);
+            const std::vector<scalar> dv = fvc::div(phi, m, g, patches);
+            for (label c = 0; c < nC; ++c) pe.source[c] += dv[c]*g.V()[c];
+            // an all-zeroGradient laplacian is singular: pin one cell, as fvMatrix::setReference does
+            pe.source[0] += pe.diag[0]*scalar(0);
+            pe.diag[0]   += pe.diag[0];
+            pbicgstab(pe, pcorr.internal, m, patches, scalar(1e-14), scalar(0), 2000);
+            pcorr.evaluateBoundary();
+
+            const SurfaceScalarField corr = matrixFlux(pe, pcorr.internal, m, patches);
+            for (label fi = 0; fi < m.nInternalFaces(); ++fi) phi.internal[fi] -= corr.internal[fi];
+            worstDiv = worstOf(phi);
+            std::printf("  vortex flux: worst |div(phi)| %.3e before projection, %.3e after\n",
+                        (double)divBefore, (double)worstDiv);
+            check("the projection actually made the flux divergence-free",
+                  worstDiv < scalar(1e-6)*std::fmax(scalar(1), divBefore));
+        }
+
+        GeometricField<scalar> alpha = buildField<scalar>(
+            readField<scalar>(startDir + "/" + f.alphaName), patches, nC);
+        alpha.evaluateBoundary();
+
+        AlphaStepInput in;
+        in.phi = &phi; in.phiCN = &phi;
+        in.cAlpha = f.interface.cAlpha;
+        in.nAlphaCorr = f.alphaCtl.nAlphaCorr;
+        in.rho1 = f.mixture.phases.rho1; in.rho2 = f.mixture.phases.rho2;
+        in.alphaScheme  = f.divPhiAlpha;
+        in.alpharScheme = f.divPhirbAlpha;
+        in.MULESCorr = false;                 // the path this arm exercises
+        in.deltaT = scalar(2e-3);
+
+        auto mass = [&](const std::vector<scalar>& a)
+        {
+            scalar s = 0;
+            for (label c = 0; c < nC; ++c) s += a[c]*g.V()[c];
+            return s;
+        };
+        const scalar mass0 = mass(alpha.internal);
+        const std::vector<scalar> start = alpha.internal;
+
+        scalar worstExcursion = 0;
+        const label nSteps = 20;
+        for (label step = 0; step < nSteps; ++step)
+        {
+            const std::vector<scalar> old = alpha.internal;
+            SurfaceScalarField aPhi, rPhi;
+            alphaEqnStep(alpha, old, in, f.interface, f.mulesCtl, m, g, patches, aPhi, rPhi);
+            for (scalar v : alpha.internal)
+                worstExcursion = std::fmax(worstExcursion, std::fmax(-v, v - scalar(1)));
+        }
+
+        scalar moved = 0;
+        for (label c = 0; c < nC; ++c) moved = std::fmax(moved, std::fabs(alpha.internal[c] - start[c]));
+        const scalar drift = std::fabs(mass(alpha.internal) - mass0) / mass0;
+
+        std::printf("  %ld alpha steps on damBreak's mesh, vortex flux:\n", (long)nSteps);
+        std::printf("    worst excursion outside [0,1] = %.3e\n", (double)worstExcursion);
+        std::printf("    largest change in any cell    = %.4f\n", (double)moved);
+        std::printf("    relative mass drift           = %.3e  (worst |div(phi)| = %.3e)\n",
+                    (double)drift, (double)worstDiv);
+
+        // THE BOUND IS THE FIXTURE'S OWN RESIDUAL, not a round number. The projection leaves
+        // |div(phi)| at some small epsilon; each step can therefore inject at most epsilon*deltaT of
+        // alpha into a cell, and nSteps of them at most nSteps*epsilon*deltaT. Measured: the residual
+        // divergence is 2.4e-12, which predicts 9.7e-14, and the observed excursion is 9.5e-14. So
+        // what is left is the projection's residue and nothing else -- and the bound TIGHTENS on its
+        // own if the projection is ever improved, which a hand-picked constant would not.
+        const scalar permitted = scalar(2) * worstDiv * in.deltaT * static_cast<scalar>(nSteps);
+        std::printf("    the residual divergence permits at most %.3e; observed %.3e\n",
+                    (double)permitted, (double)worstExcursion);
+        check("alpha stays in [0,1] to the level the projection's residual allows, and no further",
+              worstExcursion <= permitted);
+        check("...and the interface actually MOVED, so the bound is not satisfied by doing nothing",
+              moved > scalar(0.1));
+    }
 
     std::printf("test_inter_case_cpp: %d failures\n", failures);
     return failures ? 1 : 0;
