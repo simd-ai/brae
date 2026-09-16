@@ -104,6 +104,11 @@ void correctVelocity(const std::vector<vector>&              HbyA,
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const FvPatch& q = patches[pi];
+        // EMPTY PATCHES ARE NOT IN surfaceSum -- emptyFvPatch::size() is 0 in OpenFOAM. This loop did
+        // NOT skip them, and that was hiding a second defect: with the empty faces included the
+        // tensor is invertible on a 2-D mesh, so the plain cofactor inverse below never divided by
+        // zero. It is safeInv's job to handle the singular direction, not this loop's to avoid it.
+        if (q.type == "empty") continue;
         for (label i = 0; i < q.size; ++i)
         {
             const label ci = own[q.start + i];
@@ -114,7 +119,8 @@ void correctVelocity(const std::vector<vector>&              HbyA,
     U.resize(static_cast<std::size_t>(nC));
     for (label c = 0; c < nC; ++c)
     {
-        const vector r = dot(inv(T[c]), v[c]);
+        // safeInv, as OpenFOAM's inv(Field<tensor>) is (tensorField.C:55) -- see fvc_reconstruct_cpp.cuh
+        const vector r = dot(safeInv(T[c]), v[c]);
         U[c] = vector{HbyA[c].x + rAU[c]*r.x,
                       HbyA[c].y + rAU[c]*r.y,
                       HbyA[c].z + rAU[c]*r.z};

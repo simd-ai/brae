@@ -71,16 +71,35 @@ __global__ void reconstructKernel(
                    Txx,Txy,Txz, Tyx,Tyy,Tyz, Tzx,Tzy,Tzz, vx,vy,vz);
     }
 
-    // 3x3 inverse by cofactors. The tensor is sum(SfHat (x) Sf) over a closed cell, symmetric positive
-    // definite, so no pivoting is needed.
+    // OpenFOAM's Tensor::safeInv (TensorI.H:608-661), which is what inv(Field<tensor>) calls --
+    // tensorField.C:55 uses safeInv and NOT the plain Tensor::inv. ON A 2-D MESH THE TENSOR IS
+    // SINGULAR: surfaceSum skips the empty patches above, so zz has no contribution at all and a
+    // plain cofactor inverse divides by zero. Measured before this was here: NaN in ALL 2268 cells of
+    // damBreak within one step, every stage before it finite.
+    const scalar sxx = Txx*Txx, syy = Tyy*Tyy, szz = Tzz*Tzz;
+    const scalar threshold = scalar(1.0e-15) * (sxx + syy + szz);      // OF SMALL
+    const bool smallXX = sxx < threshold, smallYY = syy < threshold, smallZZ = szz < threshold;
+    if (smallXX) Txx += scalar(1);
+    if (smallYY) Tyy += scalar(1);
+    if (smallZZ) Tzz += scalar(1);
+
     const scalar c00 = Tyy*Tzz - Tyz*Tzy;
     const scalar c01 = Tyz*Tzx - Tyx*Tzz;
     const scalar c02 = Tyx*Tzy - Tyy*Tzx;
-    const scalar s   = scalar(1) / (Txx*c00 + Txy*c01 + Txz*c02);
+    const scalar det = Txx*c00 + Txy*c01 + Txz*c02;
+    if (fabs(det) < scalar(1.0e-150))                                  // OF ROOTVSMALL
+    {
+        outX[c] = 0; outY[c] = 0; outZ[c] = 0;
+        return;
+    }
+    const scalar s = scalar(1) / det;
 
-    const scalar i00 = c00*s,                     i01 = (Txz*Tzy - Txy*Tzz)*s, i02 = (Txy*Tyz - Txz*Tyy)*s;
-    const scalar i10 = c01*s,                     i11 = (Txx*Tzz - Txz*Tzx)*s, i12 = (Txz*Tyx - Txx*Tyz)*s;
-    const scalar i20 = c02*s,                     i21 = (Txy*Tzx - Txx*Tzy)*s, i22 = (Txx*Tyy - Txy*Tyx)*s;
+    scalar i00 = c00*s,  i01 = (Txz*Tzy - Txy*Tzz)*s, i02 = (Txy*Tyz - Txz*Tyy)*s;
+    scalar i10 = c01*s,  i11 = (Txx*Tzz - Txz*Tzx)*s, i12 = (Txz*Tyx - Txx*Tyz)*s;
+    scalar i20 = c02*s,  i21 = (Txy*Tzx - Txx*Tzy)*s, i22 = (Txx*Tyy - Txy*Tyx)*s;
+    if (smallXX) i00 -= scalar(1);
+    if (smallYY) i11 -= scalar(1);
+    if (smallZZ) i22 -= scalar(1);
 
     outX[c] = i00*vx + i01*vy + i02*vz;
     outY[c] = i10*vx + i11*vy + i12*vz;

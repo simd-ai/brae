@@ -5,10 +5,43 @@
 #include "device_ldu.cuh"
 #include "device_pcg.cuh"
 #include <cuda_runtime.h>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <vector>
 
 namespace brae {
+namespace {
+
+// A STAGE PROBE, off unless BRAE_INTER_STEP_CHECK is set. One whole step is a dozen operators and a
+// field that has gone non-finite at the first of them looks exactly like one that went at the last; a
+// gate downstream sees only the end. This names the first stage whose output is not finite, which is
+// what turns "damBreak gives NaN" into a line number. It is the of-instrument approach applied to
+// brae's own code rather than to OpenFOAM's.
+bool stepCheckOn()
+{
+    static const bool on = (std::getenv("BRAE_INTER_STEP_CHECK") != nullptr);
+    return on;
+}
+
+void probe(const char* stage, const DeviceBuffer<scalar>& b)
+{
+    if (!stepCheckOn() || b.size() == 0) return;
+    std::vector<scalar> h;
+    b.copyTo(h);
+    int bad = 0;
+    scalar mx = 0;
+    for (scalar v : h)
+    {
+        if (!std::isfinite(v)) ++bad;
+        else mx = std::fmax(mx, std::fabs(v));
+    }
+    std::fprintf(stderr, "  [step] %-22s n=%-7zu non-finite=%-6d max|.|=%.6g\n",
+                 stage, h.size(), bad, (double)mx);
+}
+
+}   // namespace
 
 void deviceInterStep(
     const DeviceMesh&                dm,
@@ -73,11 +106,19 @@ void deviceInterStep(
                          alpha1Bnd, nHatfBnd, bndAlphaFixesValue, bndAlphaFlag,
                          nHatfInt, K, rhoPhiInt, rhoPhiBnd, alpha2, rho, mu, nu);
 
+    probe("alpha", alpha1);
+    probe("rho", rho);
+    probe("rhoPhi", rhoPhiInt);
+
     // ---- 2. THE INTERFACE FORCES, from the field the alpha step just left --------------------------
     // surfaceTensionForce() and snGrad(rho) both read the NEW alpha, and both equations below read
     // them. Building them before the alpha step would apply last step's interface.
     DeviceBuffer<scalar> stf, snGradRho, nuEffCell, nuEffBnd, snGradPrgh;
     hooks.interfaceForces(alpha1, K, rho, stf, snGradRho, nuEffCell, nuEffBnd, snGradPrgh);
+
+    probe("stf", stf);
+    probe("snGradRho", snGradRho);
+    probe("nuEffCell", nuEffCell);
 
     // ---- 3. THE MOMENTUM MATRIX -------------------------------------------------------------------
     hooks.updateUBoundary(UX, UY, UZ, dbU);
@@ -115,8 +156,16 @@ void deviceInterStep(
     uin.ddtUOld[2]    = &UOldZ;
     uin.ddtDeltaT     = deltaT;
 
+    probe("muCell", muCell);
+    probe("muFace", muFace);
+    probe("rhoOld", rhoOld);
+
     gpu::MomentumMatrix UEqn;
     gpu::assembleUEqn(UEqn, dm, dbU, UX, UY, UZ, uin);
+    probe("UEqn.diag", UEqn.relaxed ? UEqn.relaxedDiag : UEqn.diag);
+    probe("UEqn.upper", UEqn.upper);
+    probe("UEqn.source", UEqn.source[0]);
+    probe("UEqn.iC", UEqn.iC[0]);
 
     // ---- 4. THE MOMENTUM PREDICTOR, if the case asks for one --------------------------------------
     // damBreak sets `momentumPredictor no`. The matrix above is still assembled and relaxed either
@@ -172,6 +221,9 @@ void deviceInterStep(
     pin.takeUAtBoundary = ctl.takeUAtBoundary;
     pin.solutionD[0] = pin.solutionD[1] = pin.solutionD[2] = 1;
     gpu::pressurePredictor(st, dm, dbU, UEqn, UX, UY, UZ, pin, nullptr, nullptr);
+    probe("rAU", st.rAU);
+    probe("HbyA.x", st.HbyA[0]);
+    probe("phiHbyA", st.phiHbyAInt);
 
     // rAUf over the FULL face array: interpolate(rAU) internally, and the face cell's rAU at an
     // uncoupled patch, which is what fvc::interpolate gives there.
@@ -195,6 +247,9 @@ void deviceInterStep(
     deviceInterPressureStep(dm, pi, hooks.pressure, st.rAU, st.HbyA[0], st.HbyA[1], st.HbyA[2],
                             st.phiHbyAInt, st.phiHbyABnd, p_rgh, phiInt, phiBnd,
                             UX, UY, UZ, p);
+    probe("p_rgh", p_rgh);
+    probe("phi", phiInt);
+    probe("U.x", UX);
     hooks.updateUBoundary(UX, UY, UZ, dbU);
 }
 

@@ -29,8 +29,53 @@ namespace brae {
 namespace cpu {
 namespace fvcReconstruct {
 
-// 3x3 inverse by cofactors. The tensor here is sum(SfHat (x) Sf) over a cell's faces, which is
-// symmetric positive-definite on any closed cell, so no pivoting is needed.
+// OpenFOAM's Tensor::safeInv (TensorI.H:608-661), which is what inv(Field<tensor>) actually calls --
+// tensorField.C:55 uses safeInv and NOT the plain Tensor::inv. The difference is the whole of 2-D:
+//
+//   threshold = SMALL*(magSqr(xx) + magSqr(yy) + magSqr(zz))
+//   any diagonal below it gets +1 before the inversion and -1 after
+//   a determinant below ROOTVSMALL returns the ZERO tensor rather than dividing
+//
+// ON A 2-D MESH THE TENSOR IS SINGULAR and the plain cofactor inverse gives NaN. surfaceSum skips
+// empty patches -- emptyFvPatch::size() is 0 -- so sum(SfHat (x) Sf) has NO contribution in the empty
+// direction and its zz is exactly zero. Measured: the device reconstruct, which correctly skips empty
+// faces, produced NaN in ALL 2268 cells of damBreak within one step, and brae's correctVelocity only
+// escaped it by NOT skipping them, which is a second defect masking the first.
+inline tensor safeInv(const tensor& t)
+{
+    constexpr scalar kSmall = 1.0e-15;          // OF SMALL
+    constexpr scalar kRootVSmall = 1.0e-150;    // OF ROOTVSMALL
+
+    const scalar sxx = t.xx*t.xx, syy = t.yy*t.yy, szz = t.zz*t.zz;
+    const scalar threshold = kSmall * (sxx + syy + szz);
+    const bool smallXX = sxx < threshold, smallYY = syy < threshold, smallZZ = szz < threshold;
+
+    tensor w = t;
+    if (smallXX || smallYY || smallZZ)
+    {
+        if (smallXX) w.xx += scalar(1);
+        if (smallYY) w.yy += scalar(1);
+        if (smallZZ) w.zz += scalar(1);
+    }
+
+    const scalar det = w.xx*(w.yy*w.zz - w.yz*w.zy)
+                     + w.xy*(w.yz*w.zx - w.yx*w.zz)
+                     + w.xz*(w.yx*w.zy - w.yy*w.zx);
+    if (std::fabs(det) < kRootVSmall) return tensor{0,0,0,0,0,0,0,0,0};
+
+    const scalar s = scalar(1) / det;
+    tensor r{
+        (w.yy*w.zz - w.yz*w.zy)*s, (w.xz*w.zy - w.xy*w.zz)*s, (w.xy*w.yz - w.xz*w.yy)*s,
+        (w.yz*w.zx - w.yx*w.zz)*s, (w.xx*w.zz - w.xz*w.zx)*s, (w.xz*w.yx - w.xx*w.yz)*s,
+        (w.yx*w.zy - w.yy*w.zx)*s, (w.xy*w.zx - w.xx*w.zy)*s, (w.xx*w.yy - w.xy*w.yx)*s};
+    if (smallXX) r.xx -= scalar(1);
+    if (smallYY) r.yy -= scalar(1);
+    if (smallZZ) r.zz -= scalar(1);
+    return r;
+}
+
+// 3x3 inverse by cofactors, with no 2-D guard. Kept because the gate's identity arms run on 3-D cells
+// where the two agree exactly; every SOLVER path goes through safeInv above, as OpenFOAM's does.
 inline tensor inv(const tensor& t)
 {
     const scalar c00 = t.yy*t.zz - t.yz*t.zy;
@@ -84,7 +129,7 @@ inline void reconstruct(int nCells,
     for (const BoundaryFace& b : bnd) accumulate(b.Sf, b.ssf, T[b.cell], v[b.cell]);
 
     out.resize(static_cast<std::size_t>(nCells));
-    for (int c = 0; c < nCells; ++c) out[c] = dot(inv(T[c]), v[c]);
+    for (int c = 0; c < nCells; ++c) out[c] = dot(safeInv(T[c]), v[c]);
 }
 
 }   // namespace fvcReconstruct

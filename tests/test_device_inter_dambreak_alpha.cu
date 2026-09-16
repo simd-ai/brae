@@ -302,6 +302,161 @@ int main(int argc, char** argv)
         check("...and so does the rhoPhi it leaves for the momentum equation", rw < scalar(1e-8)*rs);
     }
 
+    // ---- THE WHOLE STEP, DIAGNOSTIC ONLY ----------------------------------------------------------
+    // Runs only under BRAE_INTER_WHOLE_STEP, because deviceInterStep currently produces NaN on this
+    // case and a red gate in the suite helps nobody. With BRAE_INTER_STEP_CHECK set as well, the step
+    // prints the first stage whose output is not finite -- which is what turns "damBreak gives NaN"
+    // into a line number.
+    if (std::getenv("BRAE_INTER_WHOLE_STEP"))
+    {
+        InterFields dv = buildInterFields(caseDir, startDir, m, g, fvp);
+        {
+            InterFields warm = buildInterFields(caseDir, startDir, m, g, fvp);
+            runInterFoam(caseDir, startDir, m, g, fvp, nWarm, /*verbose=*/false, &warm);
+            dv.alpha1.internal = warm.alpha1.internal;
+            dv.U.internal      = warm.U.internal;
+            dv.p_rgh.internal  = warm.p_rgh.internal;
+            dv.phi = warm.phi;  dv.nHatf = warm.nHatf;  dv.K = warm.K;  dv.rho = warm.rho;
+            dv.alpha1.evaluateBoundary();
+            dv.U.evaluateBoundary();
+            dv.p_rgh.evaluateBoundary();
+        }
+        auto pv2 = [&](const GeometricField<scalar>& f)
+        { std::vector<scalar> v;
+          for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+          { const auto& b = f.boundary[pi]->value(); v.insert(v.end(), b.begin(), b.end()); }
+          return v; };
+        auto fullFace = [&](const SurfaceScalarField& f)
+        { std::vector<scalar> v(f.internal);
+          for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+              v.insert(v.end(), f.boundary[pi].begin(), f.boundary[pi].end());
+          return v; };
+
+        DeviceInterStepHooks H;
+        H.alpha.updateBoundary =
+            [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& aB, DeviceBuffer<scalar>& nB)
+        { a.copyTo(dv.alpha1.internal); dv.alpha1.evaluateBoundary(); aB.copyFrom(pv2(dv.alpha1));
+          SurfaceScalarField nHb; std::vector<scalar> Kb;
+          ip::calculateK(dv.alpha1, dv.interface, m, g, fvp, false, nHb, Kb);
+          nB.copyFrom(flatten(nHb.boundary)); };
+        H.alpha.divCoeffs =
+            [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC)
+        { a.copyTo(dv.alpha1.internal); dv.alpha1.evaluateBoundary();
+          FvScalarMatrix M = fvm::div<scalar>(dv.phi.internal, dv.phi.boundary, dv.alpha1, m, fvp);
+          std::vector<scalar> i2, b2;
+          for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            for (label i = 0; i < fvp[pi].size; ++i)
+            { i2.push_back(M.internalCoeffs[pi][i]); b2.push_back(M.boundaryCoeffs[pi][i]); }
+          iC.copyFrom(i2); bC.copyFrom(b2); };
+        H.updateUBoundary =
+            [&](const DeviceBuffer<scalar>& ax, const DeviceBuffer<scalar>& ay,
+                const DeviceBuffer<scalar>& az, DeviceVectorBoundary& db)
+        { std::vector<scalar> x, y, z; ax.copyTo(x); ay.copyTo(y); az.copyTo(z);
+          for (label c = 0; c < nC; ++c) dv.U.internal[c] = vector{x[c], y[c], z[c]};
+          dv.U.evaluateBoundary(); db = buildDeviceVectorBoundary(dv.U, fvp, g); };
+        H.interfaceForces =
+            [&](const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& Kd,
+                const DeviceBuffer<scalar>& rd, DeviceBuffer<scalar>& stf,
+                DeviceBuffer<scalar>& snRho, DeviceBuffer<scalar>& nuC, DeviceBuffer<scalar>& nuB,
+                DeviceBuffer<scalar>& snP)
+        { a.copyTo(dv.alpha1.internal); dv.alpha1.evaluateBoundary();
+          Kd.copyTo(dv.K); rd.copyTo(dv.rho);
+          std::vector<scalar> sK; ip::sigmaK(dv.K, dv.interface.sigma, sK);
+          const SurfaceScalarField sKf = fvc::interpolate(sK, m, g, fvp);
+          const SurfaceScalarField snA = fvc::snGrad(dv.alpha1, m, g, fvp, false);
+          SurfaceScalarField t;
+          t.internal.resize(static_cast<std::size_t>(nIf));
+          for (label f = 0; f < nIf; ++f) t.internal[f] = sKf.internal[f]*snA.internal[f];
+          t.boundary.resize(fvp.size());
+          for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            for (label i = 0; i < fvp[pi].size; ++i)
+              t.boundary[pi].push_back(sKf.boundary[pi][i]*snA.boundary[pi][i]);
+          stf.copyFrom(fullFace(t));
+          GeometricField<scalar> rhoF;
+          rhoF.internal = dv.rho;
+          for (const FvPatch& q : fvp)
+            rhoF.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
+          rhoF.evaluateBoundary();
+          snRho.copyFrom(fullFace(fvc::snGrad(rhoF, m, g, fvp, false)));
+          std::vector<scalar> a2(static_cast<std::size_t>(nC)), nuv;
+          for (label c = 0; c < nC; ++c) a2[c] = scalar(1) - dv.alpha1.internal[c];
+          brae::cpu::twoPhase::mixtureNu(dv.alpha1.internal, a2, dv.mixture.phases, nuv);
+          nuC.copyFrom(nuv);
+          std::vector<scalar> nb;
+          for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            for (label i = 0; i < fvp[pi].size; ++i) nb.push_back(nuv[fvp[pi].faceCells[i]]);
+          nuB.copyFrom(nb);
+          snP.resize(0); };
+        H.pressure.pressureCoeffs =
+            [&](const DeviceBuffer<scalar>&, const DeviceBuffer<scalar>& phiHB,
+                const DeviceBuffer<scalar>& rAUfI, DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC)
+        { std::vector<scalar> hB, rI; phiHB.copyTo(hB); rAUfI.copyTo(rI);
+          label off = 0;
+          for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+          { const FvPatch& q = fvp[pi];
+            if (dv.p_rgh.boundary[pi]->updateableSnGrad())
+            { std::vector<scalar> sn(static_cast<std::size_t>(q.size));
+              for (label i = 0; i < q.size; ++i)
+                sn[i] = (hB[off + i] - dv.phi.boundary[pi][i]) / (q.magSf[i] * (rI.empty()?scalar(1):rI[0]));
+              dv.p_rgh.boundary[pi]->updateSnGrad(sn); }
+            off += q.size; }
+          SurfaceScalarField rf2;
+          rf2.internal = rI;
+          rf2.boundary.resize(fvp.size());
+          for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            rf2.boundary[pi].assign(static_cast<std::size_t>(fvp[pi].size), rI.empty()?scalar(0):rI[0]);
+          FvScalarMatrix pe = fvm::laplacian<scalar>(rf2, dv.p_rgh, m, g, fvp, false);
+          std::vector<scalar> i2, b2;
+          for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            for (label i = 0; i < fvp[pi].size; ++i)
+            { i2.push_back(pe.internalCoeffs[pi][i]); b2.push_back(pe.boundaryCoeffs[pi][i]); }
+          iC.copyFrom(i2); bC.copyFrom(b2); };
+
+        std::vector<int> takeU;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+          for (label i = 0; i < fvp[pi].size; ++i)
+            takeU.push_back(dv.U.boundary[pi]->assignable() ? 0 : 1);
+        DeviceBuffer<int> dTakeU(takeU);
+
+        DeviceInterStepControls C;
+        C.alpha = dctl;  C.mules = dmc;  C.alphaInput = din;
+        C.momentum.tol = scalar(1e-12);
+        C.pressure.tol = scalar(1e-12);
+        C.pressure.maxIter = 4000;
+        C.momentumPredictor = dv.momentumPredictorOn;
+        C.relaxU = dv.relaxU;
+        C.relaxEquationU = dv.relaxEquationU;
+        C.takeUAtBoundary = &dTakeU;
+
+        std::vector<scalar> x0(nC), y0(nC), z0(nC);
+        for (label c = 0; c < nC; ++c)
+        { x0[c] = dv.U.internal[c].x; y0[c] = dv.U.internal[c].y; z0[c] = dv.U.internal[c].z; }
+        DeviceBuffer<scalar> A2(dv.alpha1.internal), AO(dv.alpha1.internal);
+        DeviceBuffer<scalar> Ux(x0), Uy(y0), Uz(z0), Uox(x0), Uoy(y0), Uoz(z0);
+        DeviceBuffer<scalar> PhI(dv.phi.internal), PhB(flatten(dv.phi.boundary));
+        DeviceBuffer<scalar> Prgh(dv.p_rgh.internal), Pf;
+        DeviceBuffer<scalar> NH(dv.nHatf.internal), NHB(flatten(dv.nHatf.boundary));
+        DeviceBuffer<scalar> ABnd(pv2(dv.alpha1)), Kd2(dv.K), Gh(dv.gh), Ghf, MagSf(g.magSf());
+        { SurfaceScalarField gf; gf.internal = dv.ghfInternal; gf.boundary = dv.ghfBoundary;
+          Ghf.copyFrom(fullFace(gf)); }
+        DeviceBuffer<scalar> Rho2, Mu2, Nu2, RpI2, RpB2;
+        DeviceVectorBoundary db2 = buildDeviceVectorBoundary(dv.U, fvp, g);
+        DevicePhaseProperties pr2{dv.mixture.phases.rho1, dv.mixture.phases.nu1,
+                                  dv.mixture.phases.rho2, dv.mixture.phases.nu2};
+
+        std::printf("  [whole step, diagnostic] one step with BRAE_INTER_STEP_CHECK to name the stage\n");
+        deviceInterStep(dm, dt, C, pr2, H, Gh, Ghf, MagSf, A2, AO, Ux, Uy, Uz, Uox, Uoy, Uoz,
+                        PhI, PhB, Prgh, Pf, NH, NHB, ABnd, Kd2, dFixes, dFlag, db2,
+                        Rho2, Mu2, Nu2, RpI2, RpB2);
+        cudaDeviceSynchronize();
+        std::vector<scalar> fa2;
+        A2.copyTo(fa2);
+        int bad = 0;
+        for (label c = 0; c < nC; ++c) if (!std::isfinite(fa2[c])) ++bad;
+        std::printf("  [whole step, diagnostic] non-finite alpha cells after one step: %d of %ld\n",
+                    bad, (long)nC);
+    }
+
     // THE WHOLE STEP on damBreak's own case is NOT gated here yet, and that is a statement about the
     // code and not about the gate. deviceInterStep runs clean on the synthetic fixture
     // (tests/test_device_inter_step.cu, five steps at Co 0.16) and on damBreak it produces NaN in
