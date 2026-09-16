@@ -74,4 +74,31 @@ void deviceMomentumSourceFlux(
     const DeviceBuffer<scalar>& magSf,
     DeviceBuffer<scalar>&       out);
 
+// mu_eff = rho*nuEff, which is what interFoam's divDevRhoReff(rho, U) is built on -- the rho-weighted
+// overload of linearViscousStress (linearViscousStress.C:119-131), reached through
+// incompressibleInterPhaseTransportModel.C:129. Given mu, the operator is the one brae already has.
+//
+// TWO THINGS WORTH NAMING.
+//
+//   rho*nuEff IS NOT THE MIXTURE'S mu. The mixture's rho takes the RAW alpha while nu's denominator
+//   takes the CLAMPED one (two_phase_mixture_cpp.cuh), so wherever MULES has left alpha outside [0,1]
+//   the two differ. OpenFOAM forms rho*nuEff, so this forms rho*nuEff.
+//
+//   THE FACE VALUE IS interpolate(rho*nuEff), THE PRODUCT INTERPOLATED ONCE -- fvm::laplacian takes a
+//   cell field and interpolates it. Interpolating the two factors separately is a different field, and
+//   across a VoF interface rho jumps by 1000 in one face, which is exactly where the two stop agreeing.
+//   deviceRhoRAUf carries the same lesson for interpolate(rho*rAU).
+//
+// `muBnd` is the product of the PATCH values, not of the face cells': the stress at a wall is what the
+// boundary condition says nu and rho are there.
+void deviceInterMuEff(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& rho,
+    const DeviceBuffer<scalar>& nuEff,
+    const DeviceBuffer<scalar>& rhoBnd,
+    const DeviceBuffer<scalar>& nuEffBnd,
+    DeviceBuffer<scalar>&       muCell,
+    DeviceBuffer<scalar>&       muFace,     // internal faces: interpolate(rho*nuEff)
+    DeviceBuffer<scalar>&       muBnd);
+
 } // namespace brae

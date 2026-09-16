@@ -1725,7 +1725,14 @@ COMPONENTS = {
                         "bit-identical to the host on a non-uniform flux; the ddt bit-identical, with "
                         "rho.oldTime() replaced by rho measured at exactly 1000.0x, the density ratio; "
                         "and the p_rgh body force on a hydrostatic start 0.000e+00 in the bulk against "
-                        "1.96e+04 at the interface, which is what the formulation is FOR.",
+                        "1.96e+04 at the interface, which is what the formulation is FOR. mu = rho*nuEff "
+                        "is bit-identical too, and its FACE value is the product interpolated ONCE -- "
+                        "interpolating the two factors separately is 3.4e-03 where the right answer is "
+                        "1.0e-03. The device ASSEMBLY reuses gpu::assembleUEqn with rhoPhi and mu; that "
+                        "gained an optional fvm::ddt(rho,U) applied BEFORE relax(), and a relaxEquation "
+                        "flag so relax(1) still runs the diagonal-dominance clamp -- damBreak's "
+                        "fvSolution says `equations { \".*\" 1; }` and skipping it there would differ "
+                        "from OpenFOAM on every shipped interFoam tutorial.",
              note="fvm::ddt(rho,U) + fvm::div(rhoPhi,U) + MRF.DDt(rho,U) + turbulence->divDevRhoReff(rho,U), "
                   "with the momentum predictor's source reconstructed from surfaceTensionForce() - "
                   "ghf*snGrad(rho) - snGrad(p_rgh). Assembly from pieces brae already had, EXCEPT two. "

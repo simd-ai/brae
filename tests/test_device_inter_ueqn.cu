@@ -31,6 +31,7 @@
 #include "device_mesh.cuh"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <cuda_runtime.h>
 #include <vector>
@@ -45,6 +46,16 @@ void check(const char* what, bool ok)
 {
     std::printf(ok ? "  ok:   %s\n" : "  FAIL: %s\n", what);
     if (!ok) ++failures;
+}
+// BIT equality, by the bits. `a == b` is fine, but `fabs(a - expr)` is not when `expr` contains a
+// product: g++ at -O3 on ARM64 CONTRACTS the subtract-of-a-product into an FMA, computes the product at
+// higher precision and subtracts the correctly-rounded double, and then reports a THIRD of an ULP of
+// difference between two values that are the same. -ffp-contract=fast permits that across statements,
+// so hoisting the product into a local does not stop it. This is the same contraction that makes the
+// device/host claims elsewhere in this tree ULP-based wherever a product appears.
+bool sameBits(scalar a, scalar b)
+{
+    return std::memcmp(&a, &b, sizeof(scalar)) == 0;
 }
 }   // namespace
 
@@ -301,6 +312,71 @@ int main()
         check("the p_rgh body force is IDENTICALLY zero away from the interface", bulk == scalar(0));
         check("...and is not zero at it, so the fixture is not uniformly empty",
               atInterface > scalar(1));
+    }
+
+    // ---- 4. mu_eff = rho*nuEff, and the FACE value is the product interpolated once ---------------
+    // fvm::laplacian takes a CELL field and interpolates it, so the face viscosity is
+    // interpolate(rho*nuEff). Interpolating the two factors separately is a different field, and across
+    // a VoF interface rho jumps by 1000 in a single face -- which is exactly where they part company.
+    // deviceRhoRAUf carries the same lesson for interpolate(rho*rAU).
+    {
+        std::vector<scalar> rho(static_cast<std::size_t>(nC)), nuEff(static_cast<std::size_t>(nC));
+        for (label c = 0; c < nC; ++c)
+        {
+            const bool water = g.C()[c].y < scalar(4);
+            rho[c]   = water ? scalar(1000) : scalar(1);
+            nuEff[c] = water ? scalar(1e-6) : scalar(1.48e-5);      // water and air, damBreak's own
+        }
+        std::vector<scalar> rhoBnd, nuBnd;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                rhoBnd.push_back(rho[fvp[pi].faceCells[i]]);
+                nuBnd.push_back(nuEff[fvp[pi].faceCells[i]]);
+            }
+
+        const std::vector<scalar> hostMu = ifm::dynamicViscosity(rho, nuEff);
+
+        DeviceBuffer<scalar> dRho(rho), dNu(nuEff), dRhoB(rhoBnd), dNuB(nuBnd), mc, mf, mb;
+        deviceInterMuEff(dm, dRho, dNu, dRhoB, dNuB, mc, mf, mb);
+        std::vector<scalar> gotC, gotF, gotB;
+        mc.copyTo(gotC);
+        mf.copyTo(gotF);
+        mb.copyTo(gotB);
+
+        scalar wC = 0;
+        for (label c = 0; c < nC; ++c) wC = std::fmax(wC, std::fabs(gotC[c] - hostMu[c]));
+        std::printf("  mu = rho*nuEff: worst |device - host| = %.3e\n", (double)wC);
+        check("the cell viscosity matches the host bit for bit", wC == scalar(0));
+
+        // the face value, against the product interpolated once and against the two-interpolation form
+        scalar wF = 0, twoWay = 0, scale = 0;
+        for (label f = 0; f < nIf; ++f)
+        {
+            const scalar w = g.weights()[f];
+            const label o = m.owner()[f], n = m.neighbour()[f];
+            const scalar right = w*hostMu[o] + (scalar(1) - w)*hostMu[n];
+            const scalar wrong = (w*rho[o] + (scalar(1) - w)*rho[n])
+                               * (w*nuEff[o] + (scalar(1) - w)*nuEff[n]);
+            wF     = std::fmax(wF, std::fabs(gotF[f] - right));
+            twoWay = std::fmax(twoWay, std::fabs(wrong - right));
+            scale  = std::fmax(scale, std::fabs(right));
+        }
+        std::printf("  interpolate(rho*nuEff): worst %.3e; against "
+                    "interpolate(rho)*interpolate(nuEff): %.3e of %.3e\n",
+                    (double)wF, (double)twoWay, (double)scale);
+        check("the face viscosity is the PRODUCT interpolated once", wF == scalar(0));
+        check("...and interpolating the two factors separately is a different field",
+              twoWay > scalar(0.1)*scale);
+
+        // COMPARED BY BITS, not by a subtraction -- see sameBits above. fabs(got - rho*nu) reported
+        // 6.607e-20 here, a THIRD of an ULP of 0.001, which is not a difference two doubles can have:
+        // it was the comparison contracting into an FMA, not the values differing.
+        int nDiff = 0;
+        for (label b = 0; b < nBf; ++b)
+            if (!sameBits(gotB[b], rhoBnd[b]*nuBnd[b])) ++nDiff;
+        std::printf("  the patch viscosity: %d of %ld faces differ in any bit\n", nDiff, (long)nBf);
+        check("the patch viscosity is the product of the PATCH values, bit for bit", nDiff == 0);
     }
 
     std::printf("test_device_inter_ueqn: %d failures\n", failures);

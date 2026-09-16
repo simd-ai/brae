@@ -35,6 +35,22 @@ __global__ void ddtRhoUKernel(
     sz[c] += w * uoz[c];
 }
 
+__global__ void productKernel(const scalar* __restrict__ a, const scalar* __restrict__ b,
+                              int n, scalar* __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = a[i]*b[i];
+}
+
+// interpolate(rho*nuEff) -- the PRODUCT, interpolated once.
+__global__ void interpProductKernel(
+    const label* __restrict__ own, const label* __restrict__ nei, const scalar* __restrict__ w,
+    const scalar* __restrict__ mu, int nIf, scalar* __restrict__ out)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f < nIf) out[f] = w[f]*mu[own[f]] + (scalar(1) - w[f])*mu[nei[f]];
+}
+
 __global__ void sourceFluxKernel(
     const scalar* __restrict__ stf, const scalar* __restrict__ ghf,
     const scalar* __restrict__ snGradRho, const scalar* __restrict__ snGradPrgh,
@@ -94,6 +110,46 @@ void deviceMomentumSourceFlux(
         surfaceTensionForce.data(), ghf.data(), snGradRho.data(), snGradPrgh.data(),
         magSf.data(), n, out.data());
     ckU(cudaGetLastError(), "momentum source flux");
+}
+
+
+void deviceInterMuEff(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& rho,
+    const DeviceBuffer<scalar>& nuEff,
+    const DeviceBuffer<scalar>& rhoBnd,
+    const DeviceBuffer<scalar>& nuEffBnd,
+    DeviceBuffer<scalar>&       muCell,
+    DeviceBuffer<scalar>&       muFace,
+    DeviceBuffer<scalar>&       muBnd)
+{
+    const int nC = dm.nCells, nIf = dm.nInternalFaces, nBf = dm.nBndFaces;
+    if (static_cast<int>(rho.size()) != nC || static_cast<int>(nuEff.size()) != nC)
+        throw std::runtime_error("brae interFoam device UEqn: rho and nuEff must be cell fields.");
+    if (static_cast<int>(rhoBnd.size()) != nBf || static_cast<int>(nuEffBnd.size()) != nBf)
+        throw std::runtime_error(
+            "brae interFoam device UEqn: rho and nuEff must also come with their PATCH values -- the "
+            "stress at a wall is what the boundary condition says they are there, not what the face "
+            "cell holds.");
+
+    muCell.resize(static_cast<std::size_t>(nC));
+    productKernel<<<nBlocks(nC), TPB>>>(rho.data(), nuEff.data(), nC, muCell.data());
+    ckU(cudaGetLastError(), "mu = rho*nuEff");
+
+    muFace.resize(static_cast<std::size_t>(nIf));
+    if (nIf > 0)
+    {
+        interpProductKernel<<<nBlocks(nIf), TPB>>>(dm.owner.data(), dm.nei.data(), dm.w.data(),
+                                                   muCell.data(), nIf, muFace.data());
+        ckU(cudaGetLastError(), "interpolate(rho*nuEff)");
+    }
+
+    muBnd.resize(static_cast<std::size_t>(nBf));
+    if (nBf > 0)
+    {
+        productKernel<<<nBlocks(nBf), TPB>>>(rhoBnd.data(), nuEffBnd.data(), nBf, muBnd.data());
+        ckU(cudaGetLastError(), "mu at the patch");
+    }
 }
 
 } // namespace brae

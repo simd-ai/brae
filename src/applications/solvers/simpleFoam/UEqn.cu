@@ -1,5 +1,6 @@
 // CUDA implementation -- see UEqn.cuh for the provenance and the contract with the _cpp reference.
 #include "UEqn.cuh"
+#include "device_inter_ueqn.cuh"
 #include "device_blas.cuh"
 #include "device_divdevreff.cuh"
 #include "device_kepsilon.cuh"   // deviceGradUShared: grad(U) once per U state (item 65)
@@ -302,13 +303,28 @@ void assembleUEqn(
             deviceFvoPorositySource(*in.porosity, k, in.nuLaminar, dm.V, Ux, Uy, Uz, M.source[k]);
     }
 
+    // ---- fvm::ddt(rho, U), for a transient momentum equation --------------------------------
+    // BEFORE relax(), as the fvMatrix constructor's `+` puts it. rho and rho.oldTime() are separate
+    // fields on purpose -- see device_inter_ueqn.cuh.
+    if (in.ddtRho)
+    {
+        if (!in.ddtRhoOld || !in.ddtUOld[0] || !in.ddtUOld[1] || !in.ddtUOld[2])
+            throw std::runtime_error(
+                "brae momentum: a transient ddt needs rho, rho.oldTime() and all three components of "
+                "U.oldTime(). rho.oldTime() is NOT rho at a VoF interface -- they differ by the density "
+                "ratio -- so it is a separate argument and cannot be defaulted to the first.");
+        deviceInterEulerDdtRhoU(dm, *in.ddtRho, *in.ddtRhoOld,
+                                *in.ddtUOld[0], *in.ddtUOld[1], *in.ddtUOld[2], in.ddtDeltaT,
+                                M.diag, M.source[0], M.source[1], M.source[2]);
+    }
+
     // ---- UEqn.relax() -----------------------------------------------------------------------
     // OpenFOAM's fvMatrix::relax is ASYMMETRIC: it ADDS cmptMax(cmptMag(internalCoeffs)) to the diagonal
     // and REMOVES cmptMin(internalCoeffs), which are different quantities and agree only when the three
     // components are equal. Both are supplied here rather than approximated by |iC[0]|, so slip and
     // symmetry patches -- where the components genuinely differ -- stay right.
     M.relaxed = false;
-    if (in.relaxU > 0.0 && in.relaxU < 1.0)
+    if (in.relaxU > 0.0 && (in.relaxU < 1.0 || in.relaxEquation))
     {
         DeviceBuffer<scalar> iCmaxMag, iCmin;
         deviceCmptMaxMag3(M.iC[0], M.iC[1], M.iC[2], iCmaxMag);
