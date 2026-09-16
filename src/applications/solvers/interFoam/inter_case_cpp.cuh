@@ -67,6 +67,15 @@ struct InterFields
 
     // --- derived
     std::vector<scalar> alpha2, rho, mu, nu, gh, p;
+    // THE INTERFACE NORMAL AND CURVATURE ARE STATE, not a derived quantity recomputed on demand.
+    // calculateK reads alpha's WALL GRADIENT, which the previous calculateK wrote through
+    // correctContactAngle -- so it is a fixed-point iteration, and running it a different number of
+    // times than OpenFOAM gives a different curvature. Measured on capillaryRise against OpenFOAM's
+    // own K: one pass is 18% low at the contact line, two passes agree to 4e-07 relative, three
+    // overshoot by 8%. interfaceProperties' CONSTRUCTOR runs the first pass, which is why these are
+    // filled by buildInterFields and not left empty.
+    SurfaceScalarField  nHatf;
+    std::vector<scalar> K;
     std::vector<scalar> ghfInternal;       // gh on the internal faces
     SurfaceScalarField  rhoPhi;
 

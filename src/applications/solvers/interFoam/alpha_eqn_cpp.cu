@@ -347,6 +347,8 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
                   const std::vector<FvPatch>&             patches,
                   SurfaceScalarField&                     alphaPhi10,
                   SurfaceScalarField&                     rhoPhi,
+                  SurfaceScalarField&                     nHatf,
+                  std::vector<scalar>&                    K,
                   SurfaceScalarField*                     prevCorr)
 {
     if (!in.phi || !in.phiCN)
@@ -417,12 +419,10 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
 
     for (label aCorr = 0; aCorr < in.nAlphaCorr; ++aCorr)
     {
-        // mixture.correct(): the interface normal from the CURRENT alpha. Inside the loop on purpose
-        // -- the second corrector compresses towards where MULES has just put the interface, not
-        // towards where it was at the start of the step.
-        SurfaceScalarField nHatf;
-        std::vector<scalar> K;
-        interfaceProps::calculateK(alpha1, ic, m, g, patches, /*gradLeastSquares=*/false, nHatf, K);
+        // phir uses the nHatf mixture.correct() left LAST TIME (alphaEqn.H:162), not one computed
+        // here. That ordering is not cosmetic: calculateK reads alpha's wall gradient, which its own
+        // previous pass wrote, so an extra pass changes the curvature. Measured against OpenFOAM's own
+        // K on capillaryRise, one pass too few is 18% low at the contact line.
 
         // phic = cAlpha*|phi/magSf|, zeroed on every non-coupled boundary.
         SurfaceScalarField phic;
@@ -494,6 +494,10 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
             MULES::explicitSolveLimited(scalar(1)/in.deltaT, alpha1, alpha1Old, *in.phiCN, alphaPhi10,
                                         mf, mulesCtl, m, g, patches);
         }
+
+        // ...and mixture.correct() at the BOTTOM of the corrector, alphaEqn.H:225. The next corrector
+        // (or the next sub-cycle) compresses towards where MULES has just put the interface.
+        interfaceProps::calculateK(alpha1, ic, m, g, patches, /*gradLeastSquares=*/false, nHatf, K);
     }
 
     // alphaEqn.H:228-236: the cache for the NEXT step is alphaPhi10 minus the upwind flux -- i.e. the

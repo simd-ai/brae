@@ -3181,6 +3181,21 @@ target_include_directories(test_inter_capillary_vs_openfoam PRIVATE ${BRAE_HEADE
 target_link_libraries(test_inter_capillary_vs_openfoam PRIVATE brae_core)
 add_test(NAME interfoam_capillaryrise_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_capillaryrise_vs_openfoam.sh)
+
+# ...and the CURVATURE itself, against OpenFOAM's UNMODIFIED interfaceProperties via
+# tools/dumpInterfaceK. Swept over four calculateK pass counts, because the curvature is a FIXED POINT
+# in those passes -- it reads the wall gradient its own previous pass wrote -- so agreement at one
+# count says much less than agreement at four.
+add_executable(test_inter_curvature_vs_openfoam tests/test_inter_curvature_vs_openfoam.cu)
+target_include_directories(test_inter_curvature_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_inter_curvature_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_curvature_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_curvature_vs_openfoam.sh)
+set_tests_properties(interfoam_curvature_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_inter_curvature_vs_openfoam
+                     TIMEOUT 600)
 set_tests_properties(interfoam_capillaryrise_vs_openfoam PROPERTIES
                      ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
                      SKIP_RETURN_CODE 77

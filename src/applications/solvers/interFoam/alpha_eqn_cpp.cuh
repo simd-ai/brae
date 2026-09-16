@@ -231,6 +231,12 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
                   const std::vector<FvPatch>&             patches,
                   SurfaceScalarField&                     alphaPhi10,
                   SurfaceScalarField&                     rhoPhi,
+                  // mixture.nHatf(): read at the TOP of each corrector and rewritten at its BOTTOM by
+                  // mixture.correct(), exactly as alphaEqn.H:162 and :225 do. Passing it in and out
+                  // rather than recomputing it here is what makes the number of calculateK passes
+                  // match OpenFOAM's -- and the curvature is a fixed point in those passes.
+                  SurfaceScalarField&                     nHatf,
+                  std::vector<scalar>&                    K,
                   SurfaceScalarField*                     prevCorr = nullptr);
 
 } // namespace interFoam

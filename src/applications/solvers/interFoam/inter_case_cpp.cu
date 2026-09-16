@@ -243,6 +243,10 @@ InterFields buildInterFields(const std::string&          caseDir,
     }
     staticPressure(f.p_rgh.internal, f.rho, f.gh, f.p);
 
+    // interfaceProperties' CONSTRUCTOR calls calculateK (interfaceProperties.C:196-210). That first
+    // pass is what leaves alpha's wall gradient non-zero for the second one to build on.
+    interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, f.nHatf, f.K);
+
     // rhoPhi starts at the mass flux implied by the read alpha and phi: alphaEqn overwrites it every
     // step, but UEqn would read it on the very first outer iteration if it did not exist.
     {

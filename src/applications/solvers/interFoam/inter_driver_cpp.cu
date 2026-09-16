@@ -113,7 +113,7 @@ RunReport runInterFoam(const std::string&          caseDir,
                         sub.deltaT = dtSub;
                         SurfaceScalarField aPhi;
                         alphaEqnStep(f.alpha1, aOld, sub, f.interface, f.mulesCtl,
-                                     m, g, patches, aPhi, rPhi, &prevCorr);
+                                     m, g, patches, aPhi, rPhi, f.nHatf, f.K, &prevCorr);
                         aNew = f.alpha1.internal;
                     };
                     alphaEqnSubCycle(f.alphaCtl.nAlphaSubCycles, rep.deltaT,
@@ -131,6 +131,10 @@ RunReport runInterFoam(const std::string&          caseDir,
                     cpu::twoPhase::mixtureRho(f.alpha1.internal, f.alpha2, f.mixture.phases, f.rho);
                     cpu::twoPhase::mixtureMu (f.alpha1.internal, f.mixture.phases, f.mu);
                     cpu::twoPhase::mixtureNu (f.alpha1.internal, f.mu, f.mixture.phases, f.nu);
+                    // ...AND THE CURVATURE. interFoam.C:154 calls mixture.correct() here, after the
+                    // sub-cycle and before UEqn, and interfaceProperties::correct() IS calculateK.
+                    // Rebuilding only rho/mu/nu leaves UEqn's surface-tension force one pass behind.
+                    interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, f.nHatf, f.K);
                     break;
                 }
 
@@ -142,11 +146,11 @@ RunReport runInterFoam(const std::string&          caseDir,
                     // Splitting them across two hook calls would mean rebuilding the curvature.
                     if (s == Stage::pEqn) break;       // done in the UEqn pass, see above
 
-                    SurfaceScalarField nHatf;
-                    std::vector<scalar> K;
-                    interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, nHatf, K);
+                    // UEqn.H uses mixture.surfaceTensionForce(), which reads the K the LAST
+                    // mixture.correct() left -- it does not recompute one. An extra pass here would
+                    // put UEqn's force one iteration ahead of the alpha equation's.
                     std::vector<scalar> sK;
-                    interfaceProps::sigmaK(K, f.interface.sigma, sK);
+                    interfaceProps::sigmaK(f.K, f.interface.sigma, sK);
                     const SurfaceScalarField sKf = fvc::interpolate(sK, m, g, patches);
 
                     const GeometricField<scalar> rhoF = zgField(f.rho, patches);

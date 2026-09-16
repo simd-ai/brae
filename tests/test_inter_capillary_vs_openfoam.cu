@@ -41,9 +41,23 @@
 //       the magnitude is not the story: the curvature FIELD has a different shape near the contact
 //       line, and a solver tuned to match the peak would be further from OpenFOAM everywhere else.
 //
-//   WHAT IS LEFT is to read OpenFOAM's own K_ rather than infer it -- which is what the of-instrument
-//   skill is for, and what the manifest originally budgeted for this component. A stock run never
-//   writes the curvature, and every cheap proxy for it has now been used up.
+//     * THE CURVATURE FORMULA. tools/dumpInterfaceK now reads OpenFOAM's own K from its UNMODIFIED
+//       interfaceProperties, and tests/interfoam_curvature_vs_openfoam.sh compares brae's against it
+//       at FOUR calculateK pass counts: agreement is 2.5e-14 relative at every one, i.e. round-off.
+//       The formula, the contact-angle rotation, deltaN and the wall gradient are all exactly right.
+//
+//   THAT LEFT ONE THING, AND IT WAS REAL: calculateK is a FIXED POINT, not a pure function. It reads
+//   alpha's wall gradient, which correctContactAngle wrote at the end of its own previous pass, so on
+//   capillaryRise the wall gradient runs 7070.5 -> 8659.4 -> 9353.1 -> 9681.2 over four passes. brae
+//   was running it in the wrong PLACES: at the top of each alpha corrector instead of the bottom, not
+//   at all in createFields, and not at all in the mixture.correct() between the sub-cycle and UEqn.
+//   Moving those to interFoam.C's own call sites took this gate from 24.9% to 12.8%.
+//
+//   WHAT IS LEFT is the remaining call-sequence difference. brae and OpenFOAM now make the same FOUR
+//   calculateK passes before the first momentum equation, but the alpha boundary is EVALUATED a
+//   different number of times between them -- MULES, the sub-cycle reset and evaluateBoundary each
+//   trigger one, and each runs alphaContactAngle's clamp. Counting those on both sides is the next
+//   step, and it is now the only candidate left.
 //
 //   The arms below record the discrepancy at its measured size: they fail if it grows, and they fail
 //   if it disappears without this comment being updated.
@@ -183,8 +197,9 @@ int main(int argc, char** argv)
 
     const scalar rel = uLinf / uRef;
     std::printf("  OPEN: brae is %.1f%% off OpenFOAM, worst at the contact line\n", (double)(100*rel));
-    // TIGHTENED from 0.90 to 0.30 after the boundary-gradient fix took it from 76.5% to 24.9%.
-    check("the known discrepancy has not GROWN", rel < scalar(0.30));
+    // TIGHTENED twice from its original 0.90: to 0.30 after the boundary-gradient fix (76.5% ->
+    // 24.9%), and to 0.15 after the calculateK call sites were moved to interFoam.C's own (-> 12.8%).
+    check("the known discrepancy has not GROWN", rel < scalar(0.15));
     check("...and if it has been FIXED, this arm fails so the finding gets closed rather than forgotten",
           rel > scalar(0.01));
 

@@ -1637,7 +1637,18 @@ COMPONENTS = {
                   "shipped tutorial anywhere in OpenFOAM; smoothing is fvc::average, which is "
                   "AREA-WEIGHTED and indistinguishable from a plain mean on a cube, so its gate runs "
                   "on anisotropic cells. Combining it with a leastSquares gradient is refused by "
-                  "name -- there is no case to validate that against."),
+                  "name -- there is no case to validate that against. INSTRUMENTED 2026-09-16: "
+                  "tools/dumpInterfaceK reads K, nHatf, the surface-tension force and alpha's "
+                  "post-correct boundary from OpenFOAM's UNMODIFIED class -- nHatf() and sigmaK() are "
+                  "public, so nothing is copied or patched. It found that calculateK is a FIXED POINT: "
+                  "it reads the wall gradient correctContactAngle wrote at the end of its own previous "
+                  "pass, so on capillaryRise that gradient runs 7070.5 -> 8659.4 -> 9353.1 -> 9681.2 "
+                  "over four passes and the curvature depends on WHERE the solver calls it, not only "
+                  "on the formula. brae's formula is exact -- 2.5e-14 relative against OpenFOAM at "
+                  "every one of four pass counts (tests/interfoam_curvature_vs_openfoam.sh) -- and its "
+                  "call sites were wrong: at the top of each alpha corrector instead of the bottom, "
+                  "absent from createFields, and absent from the mixture.correct() between the "
+                  "sub-cycle and UEqn. Fixing those took capillaryRise from 24.9% to 12.8%."),
         dict(name="interFoam_twoPhaseMixture", of_symbol="twoPhaseMixture",
              of_file="src/transportModels/twoPhaseMixture/twoPhaseMixture/twoPhaseMixture.C",
              classification="MODEL", status="REIMPLEMENT",

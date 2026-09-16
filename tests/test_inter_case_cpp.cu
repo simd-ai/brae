@@ -86,7 +86,7 @@ int main(int argc, char** argv)
     std::printf("  mesh: %ld cells, %ld internal faces, %zu patches\n",
                 (long)m.nCells(), (long)m.nInternalFaces(), patches.size());
 
-    const InterFields f = buildInterFields(caseDir, startDir, m, g, patches);
+    InterFields f = buildInterFields(caseDir, startDir, m, g, patches);
 
     // ---- 1. the case's own settings ---------------------------------------------------------------
     check   ("the alpha field is named from `phases (water air)`", f.alphaName == "alpha.water");
@@ -323,7 +323,7 @@ int main(int argc, char** argv)
             {
                 const std::vector<scalar> old = al.internal;
                 SurfaceScalarField aPhi, rPhi;
-                alphaEqnStep(al, old, a, f.interface, f.mulesCtl, m, g, patches, aPhi, rPhi, &prev);
+                alphaEqnStep(al, old, a, f.interface, f.mulesCtl, m, g, patches, aPhi, rPhi, f.nHatf, f.K, &prev);
                 for (scalar v : al.internal)
                     worst = std::fmax(worst, std::fmax(-v, v - scalar(1)));
             }
