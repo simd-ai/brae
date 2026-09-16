@@ -138,6 +138,7 @@ add_library(brae_core STATIC
     src/finiteVolume/fvMatrices/solvers/MULES/mules_cpp.cu
     src/finiteVolume/fvMatrices/solvers/MULES/device_mules.cu
     src/applications/solvers/interFoam/alpha_eqn_cpp.cu
+    src/applications/solvers/interFoam/device_alpha_flux.cu
     src/applications/solvers/interFoam/inter_ueqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoCreateFields_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoUEqn_cpp.cu
@@ -3081,6 +3082,16 @@ target_include_directories(test_device_mules PRIVATE ${BRAE_HEADER_DIRS}
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_device_mules PRIVATE brae_core)
 add_test(NAME device_mules COMMAND test_device_mules)
+
+# ...and the alpha fluxes. The arm worth having is alphaPhiUn: five face operations with two minus
+# signs in the middle, where the upwind direction of each interpolation is set by the flux passed in --
+# so the negations change WHICH CELL each face reads, not just a sign.
+add_executable(test_device_alpha_flux tests/test_device_alpha_flux.cu)
+target_include_directories(test_device_alpha_flux PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_alpha_flux PRIVATE brae_core)
+add_test(NAME device_alpha_flux COMMAND test_device_alpha_flux)
+set_tests_properties(device_alpha_flux PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(device_mules PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(device_interface_properties PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(device_two_phase_mixture PROPERTIES SKIP_RETURN_CODE 77)

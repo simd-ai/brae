@@ -1,0 +1,66 @@
+#pragma once
+// interFoam's alpha fluxes on the device -- phic, phir, alphaPhiUn and rhoPhi.
+//
+// provenance:
+//   openfoam:  applications/solvers/multiphase/VoF/alphaEqn.H:59-89 (phic), :162 (phir),
+//              :164-176 (alphaPhiUn), :248 (rhoPhi)
+//   host:      src/applications/solvers/interFoam/alpha_eqn_cpp.cu -- the ORACLE, gated against
+//              OpenFOAM's own expressions in tests/test_alpha_eqn_cpp.cu.
+//   tests:     tests/test_device_alpha_flux.cu
+//
+// THE NESTED FLUX IS COMPOSED ON THE HOST, ONE LAUNCH PER TERM, and that is deliberate:
+//
+//     alphaPhiUn = fvc::flux(phi, alpha1, alphaScheme)
+//                + fvc::flux(-fvc::flux(-phir, alpha2, alpharScheme), alpha1, alpharScheme)
+//
+// is five face-sized operations with TWO MINUS SIGNS in the middle of them, and the upwind direction
+// of each interpolation is set by the flux passed in -- so the negations are not cosmetic, they change
+// which cell each face reads. Fusing it into one kernel would hide exactly that, and the arithmetic
+// intensity is far too low for the fusion to pay: every one of these is memory-bound on a face field.
+// The host composition stays readable and each piece is separately gated.
+#include "cf_types.cuh"
+#include "device_buffer.cuh"
+#include "device_mesh.cuh"
+
+namespace brae {
+
+// fvc::flux(psi, vf, scheme) == psi*interpolate(vf), with the interpolation weights `w` computed from
+// THAT psi (deviceLimitedFaceWeights for vanLeer, the mesh's own for linear, pos0 for upwind). The
+// weights are an argument rather than a scheme enum so the caller cannot pass one flux to the weights
+// and another to the multiply -- which is a different operator, and the one mistake this call invites.
+void deviceAlphaFaceFlux(
+    const DeviceMesh&           dm,
+    int                         nInternalFaces,
+    const DeviceBuffer<scalar>& psiInt,
+    const DeviceBuffer<scalar>& w,
+    const DeviceBuffer<scalar>& field,
+    DeviceBuffer<scalar>&       out);
+
+// out = -in, per face. Exists so the two minus signs in alphaPhiUn are visible as two calls rather
+// than folded into a sign flag nobody reads.
+void deviceNegateFaces(int n, const DeviceBuffer<scalar>& in, DeviceBuffer<scalar>& out);
+
+// phic = cAlpha*|phi/magSf|, alphaEqn.H:59 -- and ZERO on every non-coupled boundary face (:79-89).
+// Interface compression is anti-diffusion; at an open boundary it sharpens an interface the boundary
+// does not have, so OpenFOAM switches it off there and so does this.
+void deviceCompressionFlux(
+    const DeviceMesh&           dm,
+    int                         nInternalFaces,
+    int                         nBoundaryFaces,
+    const DeviceBuffer<scalar>& phiInt,
+    scalar                      cAlpha,
+    DeviceBuffer<scalar>&       phicInt,
+    DeviceBuffer<scalar>&       phicBnd);
+
+// rhoPhi = alphaPhi10*(rho1 - rho2) + phiForRho2*rho2, alphaEqn.H:248. The subtraction ORDER is what
+// makes this reduce to phi*rho1 in pure phase 1 and phi*rho2 in pure phase 2; swapped it keeps both
+// the dimensions and the magnitude and inverts the mixture.
+void deviceMassFlux(
+    int                         n,
+    const DeviceBuffer<scalar>& alphaPhi,
+    const DeviceBuffer<scalar>& phiForRho2,
+    scalar                      rho1,
+    scalar                      rho2,
+    DeviceBuffer<scalar>&       rhoPhi);
+
+} // namespace brae
