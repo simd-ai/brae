@@ -3103,10 +3103,22 @@ target_link_libraries(test_device_alpha_flux PRIVATE brae_core)
 add_test(NAME device_alpha_flux COMMAND test_device_alpha_flux)
 set_tests_properties(device_alpha_flux PROPERTIES SKIP_RETURN_CODE 77)
 
+add_executable(test_device_inter_dambreak_alpha tests/test_device_inter_dambreak_alpha.cu)
+target_include_directories(test_device_inter_dambreak_alpha PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_inter_dambreak_alpha PRIVATE brae_core)
+
 add_executable(test_device_inter_step tests/test_device_inter_step.cu)
 target_include_directories(test_device_inter_step PRIVATE ${BRAE_HEADER_DIRS}
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_device_inter_step PRIVATE brae_core)
+add_test(NAME interfoam_dambreak_device_vs_host
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_dambreak_device_vs_host.sh)
+set_tests_properties(interfoam_dambreak_device_vs_host PROPERTIES
+                     SKIP_RETURN_CODE 77
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_dependencies(brae test_device_inter_dambreak_alpha)
+
 add_test(NAME device_inter_step COMMAND test_device_inter_step)
 set_tests_properties(device_inter_step PROPERTIES SKIP_RETURN_CODE 77)
 
