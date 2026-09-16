@@ -14,7 +14,9 @@
 //             (surfaceTensionForce() = interpolate(sigma*K)*snGrad(alpha1))
 //   brae:
 //     reference: this header
-//     cuda:      (pending)
+//     cuda:      src/applications/solvers/interFoam/device_inter_ueqn.cu -- the two pieces that are
+//                NOT rhoSimpleFoam's (the two-rho ddt and the face force); fvm::div(rhoPhi,U) and
+//                divDevRhoReff are the device operators that solver already carries.
 //     tests:     tests/test_inter_ueqn_cpp.cu
 //
 // OpenFOAM, verbatim:

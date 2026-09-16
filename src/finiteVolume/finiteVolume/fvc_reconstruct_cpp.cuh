@@ -4,7 +4,8 @@
 // provenance:
 //   openfoam:  src/finiteVolume/finiteVolume/fvc/fvcReconstruct.C:64-85
 //              src/finiteVolume/finiteVolume/fvc/fvcSurfaceIntegrate.C:160-170 (surfaceSum)
-//   cuda:      src/cuda/device_fvc_reconstruct.cu   (not written yet)
+//   cuda:      src/finiteVolume/finiteVolume/device_fvc_reconstruct.cu -- same gather addressing as
+//              deviceDiv but with the SAME SIGN on the neighbour; the identity below is its gate too.
 //
 //     SfHat = Sf/magSf
 //     reconstruct(ssf) = inv(surfaceSum(SfHat (x) Sf)) & surfaceSum(SfHat*ssf)

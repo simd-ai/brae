@@ -1707,8 +1707,14 @@ COMPONENTS = {
              classification="SHARED_NUMERICAL", status="REIMPLEMENT",
              brae_reference="src/applications/solvers/interFoam/inter_ueqn_cpp.cuh",
              brae_target="src/applications/solvers/interFoam/device_inter_ueqn.cu",
-             validation="tests/test_inter_ueqn_cpp.cu now; OpenFOAM's own assembled matrix once the "
-                        "solver runs end to end, as the rhoSimpleFoam momentum gate does.",
+             validation="tests/test_inter_ueqn_cpp.cu, and end to end at 3.3e-06 relative in U on damBreak "
+                        "against real OpenFOAM. ON THE DEVICE, tests/test_device_inter_ueqn.cu: "
+                        "fvc::reconstruct pinned by its own identity -- reconstruct(V & Sf) == V to "
+                        "0.000e+00 on 2:1:0.5 cells, where the div-sign convention gives 2.5e+00 -- and "
+                        "bit-identical to the host on a non-uniform flux; the ddt bit-identical, with "
+                        "rho.oldTime() replaced by rho measured at exactly 1000.0x, the density ratio; "
+                        "and the p_rgh body force on a hydrostatic start 0.000e+00 in the bulk against "
+                        "1.96e+04 at the interface, which is what the formulation is FOR.",
              note="fvm::ddt(rho,U) + fvm::div(rhoPhi,U) + MRF.DDt(rho,U) + turbulence->divDevRhoReff(rho,U), "
                   "with the momentum predictor's source reconstructed from surfaceTensionForce() - "
                   "ghf*snGrad(rho) - snGrad(p_rgh). Assembly from pieces brae already had, EXCEPT two. "
