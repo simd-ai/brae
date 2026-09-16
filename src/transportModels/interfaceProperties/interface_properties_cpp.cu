@@ -280,8 +280,28 @@ void calculateK(const GeometricField<scalar>& alpha1,
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const FvPatch& q = patches[pi];
+
+        // gradAlphaf's BOUNDARY VALUE is not the owner cell's gradient. fvc::grad runs
+        // gaussGrad::correctBoundaryConditions, which replaces the WALL-NORMAL COMPONENT with the
+        // patch's own snGrad (gaussGrad.C):
+        //
+        //     gGrad_b += n*(vsf_b.snGrad() - (n & gGrad_b))
+        //
+        // and fvc::interpolate at an uncoupled patch then returns that value unchanged. This mattered
+        // more than anywhere else it could have: on a contact-angle patch alpha's snGrad is exactly
+        // what the contact angle SETS, so taking the raw cell gradient here discards the boundary
+        // condition's own contribution to the normal the curvature is built from. Measured on
+        // capillaryRise, where the contact angle carries the whole case.
         std::vector<vector> gb(static_cast<std::size_t>(q.size));
-        for (label i = 0; i < q.size; ++i) gb[i] = gradAlpha[q.faceCells[i]];
+        const std::vector<scalar> snA = alpha1.boundary[pi]->snGrad(alpha1.internal);
+        for (label i = 0; i < q.size; ++i)
+        {
+            const vector& n  = q.nf[i];
+            const vector  gc = gradAlpha[q.faceCells[i]];
+            const scalar  nn = n.x*gc.x + n.y*gc.y + n.z*gc.z;
+            const scalar  d  = snA[i] - nn;
+            gb[i] = vector{gc.x + n.x*d, gc.y + n.y*d, gc.z + n.z*d};
+        }
 
         std::vector<vector> nb;
         faceUnitNormal(gb, dN, nb);

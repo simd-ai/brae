@@ -13,12 +13,32 @@
 //   1.4e-04 against OpenFOAM's 2.59e-01 -- three orders down, the meniscus never forms. With it on,
 //   brae gets 2.85e-01. The correction is doing the physics, not decorating it.
 //
-//   OPEN: brae is about 10% HIGH. Measured after one step at the worst cell, which is on the contact
-//   line: brae U = (-1.974e-02, 2.852e-01) against OpenFOAM's (-1.654e-02, 2.589e-01). The direction
-//   is right and the magnitude is not, and the error is largest where the wall meets the interface.
-//   That is a real discrepancy in the contact-angle path and it is recorded here at its MEASURED size
-//   rather than hidden behind a loose bound: the arms below fail if it grows, and fail if it
-//   disappears without this comment being updated.
+//   OPEN: brae's curvature is about 7.5% HIGH. After ONE step -- where alpha has not moved at all, so
+//   the alpha equation is out of the picture and U comes entirely from the surface-tension force --
+//   brae's worst wall cell is U = (-1.902e-02, 2.782e-01) against OpenFOAM's (-1.654e-02, 2.589e-01).
+//   Over five steps that reaches 25% at the contact line while the PEAK velocity agrees to 2.1%.
+//
+//   WHAT HAS BEEN ELIMINATED, each by measurement rather than by reading:
+//     * the alpha equation -- at step 1 alpha agrees exactly, because it has not moved
+//     * the gradient scheme -- capillaryRise and damBreak both say `default Gauss linear`
+//     * theta() -- constantAlphaContactAngle returns theta0 uniformly, which is what brae does
+//     * relaxation -- capillaryRise names NO relaxationFactors, and brae now reads that (it was
+//       hardcoded on, which was a real defect; the dominance clamp turned out to be a no-op because
+//       rho/dt is 1e8, so the number did not move)
+//     * deltaN -- 6.3e-05 against a |gradAlpha| of order 6e+03, i.e. six orders below relevance
+//     * THE BOUNDARY GRADIENT -- this WAS the bug, and fixing it took the error from 76.5% to 24.9%.
+//       fvc::grad runs gaussGrad::correctBoundaryConditions, which replaces the wall-normal component
+//       of the boundary gradient with the patch's own snGrad; brae was using the raw cell gradient,
+//       so on a contact-angle patch it discarded exactly the quantity the contact angle sets.
+//
+//   THE REMAINING CANDIDATE, not yet eliminated: alphaContactAngle's evaluate() MUTATES its own
+//   gradient (`gradient() = deltaCoeffs*(clamp(value + gradient/deltaCoeffs, 0, 1) - value)` under
+//   `limit gradient`), so it is NOT idempotent -- calling it twice is not calling it once. brae and
+//   OpenFOAM do not evaluate the alpha boundary the same number of times per step, and each extra
+//   call moves the gradient. That is the next thing to check.
+//
+//   The arms below record the discrepancy at its measured size: they fail if it grows, and they fail
+//   if it disappears without this comment being updated.
 //
 // The case is NOT closed -- it has an inlet and an atmosphere -- so alpha's total is not conserved and
 // nothing here asserts that it is. damBreak's gate is where the conservation claim lives.
@@ -130,9 +150,33 @@ int main(int argc, char** argv)
     // THE OPEN DISCREPANCY, recorded at its measured size. 2.66e-02 against |U| 2.59e-01 after one
     // step; the arms bracket it so that a regression fails and an improvement fails too, which is what
     // forces the comment at the top of this file to be updated when it is fixed.
+    // WHERE the error is, printed because this is an open finding and the next person needs it.
+    {
+        std::vector<bool> atWall(static_cast<std::size_t>(nC), false);
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            if (patches[pi].name == "walls")
+                for (label i = 0; i < patches[pi].size; ++i) atWall[patches[pi].faceCells[i]] = true;
+        scalar eW = 0, eI = 0;
+        label cw = -1;
+        for (label c = 0; c < nC; ++c)
+        {
+            const vector& a = fin.U.internal[c];
+            const vector& b = ofU[c];
+            const scalar e = std::sqrt((a.x-b.x)*(a.x-b.x)+(a.y-b.y)*(a.y-b.y)+(a.z-b.z)*(a.z-b.z));
+            if (atWall[c]) { if (e > eW) { eW = e; cw = c; } }
+            else             eI = std::fmax(eI, e);
+        }
+        std::printf("    worst at a WALL cell %.4e, away from the wall %.4e\n", (double)eW, (double)eI);
+        if (cw >= 0)
+            std::printf("    worst wall cell: brae U = (%.4e %.4e), OpenFOAM = (%.4e %.4e)\n",
+                        (double)fin.U.internal[cw].x, (double)fin.U.internal[cw].y,
+                        (double)ofU[cw].x, (double)ofU[cw].y);
+    }
+
     const scalar rel = uLinf / uRef;
     std::printf("  OPEN: brae is %.1f%% off OpenFOAM, worst at the contact line\n", (double)(100*rel));
-    check("the known discrepancy has not GROWN", rel < scalar(0.90));
+    // TIGHTENED from 0.90 to 0.30 after the boundary-gradient fix took it from 76.5% to 24.9%.
+    check("the known discrepancy has not GROWN", rel < scalar(0.30));
     check("...and if it has been FIXED, this arm fails so the finding gets closed rather than forgotten",
           rel > scalar(0.01));
 
