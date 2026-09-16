@@ -1525,7 +1525,14 @@ COMPONENTS = {
                         "tension IS the answer and the only tutorial with a contact angle -- 0.7% "
                         "(tests/interfoam_capillaryrise_vs_openfoam.sh); the curvature itself to "
                         "2.5e-14 at four calculateK pass counts "
-                        "(tests/interfoam_curvature_vs_openfoam.sh).",
+                        "(tests/interfoam_curvature_vs_openfoam.sh). THE SUB-CYCLE IS ON THE DEVICE "
+                        "(device_alpha_subcycle.cu) and matches the host's loop to 1.1e-16 in alpha and "
+                        "2.2e-16 in the weighted rhoPhi over three sub-steps. Its gate is four "
+                        "deliberately-wrong sub-cycles run beside the right one, because each failure "
+                        "leaves a bounded plausible field: the full deltaT per sub-step 3.2e-01, "
+                        "restarting each from the old alpha 9.8e-02, the last rhoPhi instead of the "
+                        "weighted sum 4.1e-02 of 8.4e-01 -- and that last one is 0.000e+00 in ALPHA, so "
+                        "no boundedness or interface gate could ever see it.",
              note="The time loop, and the sub-cycle inside it. THE SUB-CYCLE is used by 33 of the 44 "
                   "shipped tutorials (23 at nAlphaSubCycles 3), and all three ways to get it wrong "
                   "leave a BOUNDED, plausible alpha field that no boundedness gate sees: running the "
