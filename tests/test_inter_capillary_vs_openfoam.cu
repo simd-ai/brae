@@ -10,57 +10,31 @@
 // WHAT THIS GATE ESTABLISHES, AND WHAT IT RECORDS AS OPEN.
 //
 //   ESTABLISHED: the contact angle carries the case. With it off, brae's velocity after one step is
-//   1.4e-04 against OpenFOAM's 2.59e-01 -- three orders down, the meniscus never forms. With it on,
-//   brae gets 2.85e-01. The correction is doing the physics, not decorating it.
+//   1.4e-04 against OpenFOAM's 2.59e-01 -- three orders down, the meniscus never forms.
 //
-//   OPEN: brae's curvature is about 7.5% HIGH. After ONE step -- where alpha has not moved at all, so
-//   the alpha equation is out of the picture and U comes entirely from the surface-tension force --
-//   brae's worst wall cell is U = (-1.902e-02, 2.782e-01) against OpenFOAM's (-1.654e-02, 2.589e-01).
-//   Over five steps that reaches 25% at the contact line while the PEAK velocity agrees to 2.1%.
+//   AND THE 12.8% THAT USED TO BE HERE IS CLOSED. It took two instruments and a sequence of
+//   eliminations; what it was in the end:
 //
-//   WHAT HAS BEEN ELIMINATED, each by measurement rather than by reading:
-//     * the alpha equation -- at step 1 alpha agrees exactly, because it has not moved
-//     * the gradient scheme -- capillaryRise and damBreak both say `default Gauss linear`
-//     * theta() -- constantAlphaContactAngle returns theta0 uniformly, which is what brae does
-//     * relaxation -- capillaryRise names NO relaxationFactors, and brae now reads that (it was
-//       hardcoded on, which was a real defect; the dominance clamp turned out to be a no-op because
-//       rho/dt is 1e8, so the number did not move)
-//     * deltaN -- 6.3e-05 against a |gradAlpha| of order 6e+03, i.e. six orders below relevance
-//     * THE BOUNDARY GRADIENT -- this WAS the bug, and fixing it took the error from 76.5% to 24.9%.
-//       fvc::grad runs gaussGrad::correctBoundaryConditions, which replaces the wall-normal component
-//       of the boundary gradient with the patch's own snGrad; brae was using the raw cell gradient,
-//       so on a contact-angle patch it discarded exactly the quantity the contact angle sets.
+//     THE MIXTURE'S BOUNDARY VALUES MUST COME FROM alpha's PATCH VALUES, NOT THE FACE CELL'S.
 //
-//     * alphaContactAngle's NON-IDEMPOTENT evaluate() -- it mutates its own gradient under
-//       `limit gradient`, so the number of times each solver evaluates the alpha boundary could
-//       matter. It does not: the clamp bites on 2 of 800 faces and in 3 of 20 calls, and FORCING
-//       idempotence makes the error four times worse (24.9% -> 128%), so the mutation is
-//       load-bearing and its call count is not the problem.
-//     * A PURE SCALE on the surface-tension force. Scaling sigma by 0.93 makes the peak velocity
-//       match EXACTLY (ratio 1.000) and makes the worst-cell error WORSE (1.95e-02 -> 2.37e-02). So
-//       the magnitude is not the story: the curvature FIELD has a different shape near the contact
-//       line, and a solver tuned to match the peak would be further from OpenFOAM everywhere else.
+//   At a contact-angle wall alpha's patch value is patchInternalField + gradient/deltaCoeffs, and the
+//   contact angle's gradient is precisely what pulls the interface UP THE WALL -- 9681 over a
+//   deltaCoeffs of 20000 is +0.48 of alpha. So the wall FACE can be carrying water while the cell
+//   behind it is air. rho and nu there follow the face, not the cell, and divDevRhoReff's laplacian
+//   reads them through internalCoeffs, which lands in UEqn.A(), which is rAU, which scales the whole
+//   velocity field through the pressure corrector.
 //
-//     * THE CURVATURE FORMULA. tools/dumpInterfaceK now reads OpenFOAM's own K from its UNMODIFIED
-//       interfaceProperties, and tests/interfoam_curvature_vs_openfoam.sh compares brae's against it
-//       at FOUR calculateK pass counts: agreement is 2.5e-14 relative at every one, i.e. round-off.
-//       The formula, the contact-angle rotation, deltaN and the wall gradient are all exactly right.
+//   It was TWO CELLS OF EIGHT THOUSAND -- the contact line -- and they set the velocity everywhere.
+//   UEqn.A() went from 1.8e-03 to 6.3e-05 relative and rAU from 1.3e-01 to 2.9e-03; this gate went
+//   from 12.8% to 0.7% and damBreak did not move at all (3.4346e-09), because damBreak's alpha walls
+//   are zeroGradient and its patch value IS the cell value.
 //
-//   THAT LEFT ONE THING, AND IT WAS REAL: calculateK is a FIXED POINT, not a pure function. It reads
-//   alpha's wall gradient, which correctContactAngle wrote at the end of its own previous pass, so on
-//   capillaryRise the wall gradient runs 7070.5 -> 8659.4 -> 9353.1 -> 9681.2 over four passes. brae
-//   was running it in the wrong PLACES: at the top of each alpha corrector instead of the bottom, not
-//   at all in createFields, and not at all in the mixture.correct() between the sub-cycle and UEqn.
-//   Moving those to interFoam.C's own call sites took this gate from 24.9% to 12.8%.
-//
-//   WHAT IS LEFT is the remaining call-sequence difference. brae and OpenFOAM now make the same FOUR
-//   calculateK passes before the first momentum equation, but the alpha boundary is EVALUATED a
-//   different number of times between them -- MULES, the sub-cycle reset and evaluateBoundary each
-//   trigger one, and each runs alphaContactAngle's clamp. Counting those on both sides is the next
-//   step, and it is now the only candidate left.
-//
-//   The arms below record the discrepancy at its measured size: they fail if it grows, and they fail
-//   if it disappears without this comment being updated.
+//   HOW IT WAS FOUND, because the route matters more than the answer: tools/dumpInterFoam writes
+//   rAU, HbyA, phig, stf, snGrad(rho), rho, rho*nuEff and UEqn.A() at the first pEqn. Comparing them
+//   in that order showed rho exact, the surface tension exact (3.5e-14), the buoyancy exact
+//   (7.0e-14), the viscosity exact (0.0) -- and A wrong. Grouping A's error by phase showed it exact
+//   in all 3200 water cells, and grouping by patch showed exactly 2 cells wrong, both touching the
+//   walls. Every one of those splits was necessary; a single relative-L2 said only "6% somewhere".
 //
 // The case is NOT closed -- it has an inlet and an atmosphere -- so alpha's total is not conserved and
 // nothing here asserts that it is. damBreak's gate is where the conservation claim lives.
@@ -244,11 +218,11 @@ int main(int argc, char** argv)
 
     const scalar rel = uLinf / uRef;
     std::printf("  OPEN: brae is %.1f%% off OpenFOAM, worst at the contact line\n", (double)(100*rel));
-    // TIGHTENED twice from its original 0.90: to 0.30 after the boundary-gradient fix (76.5% ->
-    // 24.9%), and to 0.15 after the calculateK call sites were moved to interFoam.C's own (-> 12.8%).
-    check("the known discrepancy has not GROWN", rel < scalar(0.15));
-    check("...and if it has been FIXED, this arm fails so the finding gets closed rather than forgotten",
-          rel > scalar(0.01));
+    // TIGHTENED four times from its original 0.90, each after a measured fix: 0.30 (the boundary
+    // gradient, 76.5% -> 24.9%), 0.15 (the calculateK call sites -> 12.8%), and now 0.02 (the boundary
+    // mixture -> 0.7%). What is left is the two-cell contact line still carrying a slightly different
+    // alpha patch value after five steps, which shows as 1.2% more active wall faces than OpenFOAM.
+    check("brae agrees with OpenFOAM on the case surface tension decides", rel < scalar(0.02));
 
     std::printf("test_inter_capillary_vs_openfoam: %d failures\n", failures);
     return failures ? 1 : 0;

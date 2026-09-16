@@ -67,6 +67,15 @@ struct InterFields
 
     // --- derived
     std::vector<scalar> alpha2, rho, mu, nu, gh, p;
+    // THE MIXTURE ON THE BOUNDARY, built from alpha's PATCH VALUES and not from the face cell's.
+    // Those are different fields at a contact-angle wall: alpha's patch value is
+    // patchInternalField + gradient/deltaCoeffs, and the contact angle's gradient is what pulls the
+    // interface up the wall -- 9681 over a deltaCoeffs of 20000 is +0.48 of alpha. Taking the cell
+    // value instead gives an AIR viscosity on a face the interface has climbed, and
+    // divDevRhoReff's laplacian is built from exactly that. Measured on capillaryRise against
+    // OpenFOAM's own UEqn.A(): exact in all 3200 water cells, up to 56% low in the air cells at the
+    // wall, which is where the contact line is.
+    std::vector<std::vector<scalar>> rhoBnd, muBnd, nuBnd;
     // THE INTERFACE NORMAL AND CURVATURE ARE STATE, not a derived quantity recomputed on demand.
     // calculateK reads alpha's WALL GRADIENT, which the previous calculateK wrote through
     // correctContactAngle -- so it is a fixed-point iteration, and running it a different number of
@@ -122,6 +131,10 @@ struct InterFields
 };
 
 // The case's dictionaries and fields -> InterFields. Throws, by name, on anything not ported.
+// Rebuild the boundary blends from alpha's current patch values. Called wherever mixture.correct()
+// is -- the patch values move with the contact angle every calculateK.
+void updateMixtureBoundary(InterFields& f, const std::vector<FvPatch>& patches);
+
 InterFields buildInterFields(const std::string&          caseDir,
                              const std::string&          startDir,
                              const PrimitiveMesh&        m,

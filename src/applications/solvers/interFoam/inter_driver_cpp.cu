@@ -140,6 +140,8 @@ RunReport runInterFoam(const std::string&          caseDir,
                     // sub-cycle and before UEqn, and interfaceProperties::correct() IS calculateK.
                     // Rebuilding only rho/mu/nu leaves UEqn's surface-tension force one pass behind.
                     interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, f.nHatf, f.K);
+                    // ...and the boundary blends, which move with alpha's patch values.
+                    updateMixtureBoundary(f, patches);
                     break;
                 }
 
@@ -214,11 +216,9 @@ RunReport runInterFoam(const std::string&          caseDir,
                         phB[pi] = f.rhoPhi.boundary.size() > pi
                                 ? f.rhoPhi.boundary[pi]
                                 : std::vector<scalar>(static_cast<std::size_t>(q.size), scalar(0));
-                        for (label i = 0; i < q.size; ++i)
-                        {
-                            rhoB[pi][i] = f.rho[q.faceCells[i]];
-                            nuB[pi][i]  = f.nu [q.faceCells[i]];
-                        }
+                        // alpha's PATCH values, not the face cell's -- see InterFields::rhoBnd.
+                        rhoB[pi] = f.rhoBnd[pi];
+                        nuB[pi]  = f.nuBnd[pi];
                     }
 
                     InterMomentumInput mi;

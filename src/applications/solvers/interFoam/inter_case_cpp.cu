@@ -10,6 +10,33 @@ namespace brae {
 namespace cpu {
 namespace interFoam {
 
+void updateMixtureBoundary(InterFields& f, const std::vector<FvPatch>& patches)
+{
+    f.rhoBnd.resize(patches.size());
+    f.muBnd.resize(patches.size());
+    f.nuBnd.resize(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const std::vector<scalar>& ab = f.alpha1.boundary[pi]->value();
+        const std::size_t n = ab.size();
+        f.rhoBnd[pi].resize(n);
+        f.muBnd[pi].resize(n);
+        f.nuBnd[pi].resize(n);
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            // rho takes the RAW alpha and mu/nu the CLAMPED one, exactly as in the interior
+            // (two_phase_mixture_cpp.cuh) -- the split is a property of the model, not of where it is
+            // evaluated.
+            const scalar a  = ab[i];
+            const scalar ac = cpu::twoPhase::limitedAlpha(a);
+            const auto&  p  = f.mixture.phases;
+            f.rhoBnd[pi][i] = a*p.rho1 + (scalar(1) - a)*p.rho2;
+            f.muBnd[pi][i]  = ac*p.rho1*p.nu1 + (scalar(1) - ac)*p.rho2*p.nu2;
+            f.nuBnd[pi][i]  = f.muBnd[pi][i] / (ac*p.rho1 + (scalar(1) - ac)*p.rho2);
+        }
+    }
+}
+
 namespace {
 
 // fvSchemes' divSchemes entry for div(rhoPhi,U). The shipped tutorials ask for `Gauss linearUpwind
@@ -233,6 +260,9 @@ InterFields buildInterFields(const std::string&          caseDir,
     cpu::twoPhase::mixtureRho(f.alpha1.internal, f.alpha2, f.mixture.phases, f.rho);
     cpu::twoPhase::mixtureMu (f.alpha1.internal, f.mixture.phases, f.mu);
     cpu::twoPhase::mixtureNu (f.alpha1.internal, f.mu, f.mixture.phases, f.nu);
+
+    // ...and the same three blends on every patch, from alpha's own boundary values.
+    updateMixtureBoundary(f, patches);
 
     // --- gh, ghf and p ------------------------------------------------------------------------
     ghField(f.g, f.ghRefValue, g.C(), f.gh);
