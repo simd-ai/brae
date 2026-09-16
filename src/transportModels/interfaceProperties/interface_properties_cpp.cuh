@@ -32,6 +32,11 @@
 //   default here would run a case OpenFOAM refuses, with an interface compression the user never chose.
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
+#include "primitive_mesh.cuh"
+#include "fv_geometry.cuh"
+#include "fv_patch.cuh"
+#include "geometric_field.cuh"
+#include "fvc.cuh"
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -47,6 +52,10 @@ struct InterfaceCoeffs
     scalar cAlpha = 0;                 // interface compression; MANDATORY, no default
     int    nAlphaSmoothCurvature = 0;  // curvature smoothing passes; defaults to 0
     scalar sigma  = 0;                 // surface tension
+    // theta0 per patch, in DEGREES, or < 0 where the patch is not an alphaContactAngle. Only one of
+    // the 44 shipped tutorials sets one (laminar/capillaryRise), and that is the case where surface
+    // tension IS the answer -- so it is the one a missing contact angle cannot hide in.
+    std::vector<scalar> contactAngleDeg;
 };
 
 // solverDict(alpha1.name()) is the fvSolution `solvers` entry for the alpha field -- damBreak names it
@@ -116,6 +125,55 @@ inline void sigmaK(const std::vector<scalar>& K, scalar sigma, std::vector<scala
     out.resize(K.size());
     for (std::size_t i = 0; i < K.size(); ++i) out[i] = sigma * K[i];
 }
+
+// --------------------------------------------------------------------------------------------------
+// calculateK and its parts. See interface_properties_cpp.cu for the provenance and for how curvature
+// is gated without an instrumented OpenFOAM: it is a GEOMETRIC quantity, so a flat interface has K = 0
+// exactly at any resolution and a sphere of radius R has K -> 2/R as the mesh refines.
+
+// alpha1L = fvc::average(fvc::interpolate(alpha1L)), nPasses times. fvc::average is AREA-WEIGHTED.
+void smoothAlpha(std::vector<scalar>&        alpha,
+                 int                         nPasses,
+                 const PrimitiveMesh&        m,
+                 const FvGeometry&           g,
+                 const std::vector<FvPatch>& patches);
+
+// The contact-angle rotation. POSTCONDITION: acos(nHatp & nf) == theta.
+void correctContactAngle(std::vector<vector>&       nHatp,
+                         const std::vector<vector>& nf,
+                         const std::vector<scalar>& theta,       // RADIANS
+                         scalar                     dN);
+
+// acap.gradient() = (nf & nHatp)*mag(gradAlphaf) -- the correction writes back into alpha's own wall
+// gradient, not only into the normal used for curvature.
+std::vector<scalar> contactAngleGradient(const std::vector<vector>& nHatp,
+                                         const std::vector<vector>& nf,
+                                         const std::vector<vector>& gradAlphaf);
+
+// fvc::gaussGrad written against raw values, for the smoothed field which has no patch objects of its
+// own. Gated to reproduce fvc::gaussGrad exactly on an unsmoothed field, so the two cannot drift.
+std::vector<vector> gaussGradFromValues(const std::vector<scalar>&              cells,
+                                        const std::vector<std::vector<scalar>>& boundary,
+                                        const PrimitiveMesh&                    m,
+                                        const FvGeometry&                       g,
+                                        const std::vector<FvPatch>&             patches);
+
+// K = -fvc::div(nHatf). The MINUS is the sign convention for the whole solver.
+void curvature(const SurfaceScalarField&   nHatf,
+               const PrimitiveMesh&        m,
+               const FvGeometry&           g,
+               const std::vector<FvPatch>& patches,
+               std::vector<scalar>&        K);
+
+// interfaceProperties.C:107-165, end to end.
+void calculateK(const GeometricField<scalar>& alpha1,
+                const InterfaceCoeffs&        c,
+                const PrimitiveMesh&          m,
+                const FvGeometry&             g,
+                const std::vector<FvPatch>&   patches,
+                bool                          gradLeastSquares,
+                SurfaceScalarField&           nHatf,
+                std::vector<scalar>&          K);
 
 }   // namespace interfaceProps
 }   // namespace cpu

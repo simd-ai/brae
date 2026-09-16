@@ -1610,11 +1610,26 @@ COMPONENTS = {
              classification="MODEL", status="REIMPLEMENT",
              brae_reference="src/transportModels/interfaceProperties/interface_properties_cpp.cuh",
              brae_target="src/transportModels/interfaceProperties/device_interface_properties.cu",
-             validation="Curvature K_ against OpenFOAM's own, which a stock run never writes -- so this needs "
-                        "an instrumented interfaceProperties. Curvature is where a VoF port diverges invisibly.",
-             note="K_ = -div(nHatf) where nHatf = (gradAlphaf/(|gradAlphaf| + deltaN)) & Sf "
-                  "(interfaceProperties.C:141-153), plus alphaContactAngle correction on wall patches. "
-                  "surfaceTensionForce() = sigma*K_*snGrad(alpha1)."),
+             validation="tests/test_interface_properties.cu (the dictionaries) and "
+                        "tests/test_interface_curvature_cpp.cu (K itself). NO INSTRUMENTED OpenFOAM "
+                        "WAS NEEDED: curvature is GEOMETRY. A plane's spurious K is 5+ orders below a "
+                        "real one and tracks deltaN; a sphere of radius R gives 2/R to 0.1% at 16^3 "
+                        "and the error FALLS on refinement, which is what makes the bound the "
+                        "scheme's rather than the mesh's; a bubble gives the exact negative; and the "
+                        "contact angle has the exact postcondition acos(nHat & nf) == theta.",
+             note="K_ = -div(nHatf) with nHatf = (gradAlphaf/(|gradAlphaf| + deltaN)) & Sf "
+                  "(interfaceProperties.C:141-153), plus the alphaContactAngle correction on wall "
+                  "patches. surfaceTensionForce() = interpolate(sigma*K)*snGrad(alpha1). THE MINUS in "
+                  "K is the sign convention for the whole solver -- drop it and every surface-tension "
+                  "force points the wrong way with the right magnitude, which a flat-interface test "
+                  "cannot see because -0 is 0. fvc::grad(alpha1, \"nHat\") resolves a NAMED "
+                  "gradScheme. The contact-angle correction also writes alpha's own WALL GRADIENT "
+                  "(acap.gradient() = (nf & nHat)*mag(gradAlphaf)), not only the normal used for "
+                  "curvature; only laminar/capillaryRise sets one. nAlphaSmoothCurvature is set by NO "
+                  "shipped tutorial anywhere in OpenFOAM; smoothing is fvc::average, which is "
+                  "AREA-WEIGHTED and indistinguishable from a plain mean on a cube, so its gate runs "
+                  "on anisotropic cells. Combining it with a leastSquares gradient is refused by "
+                  "name -- there is no case to validate that against."),
         dict(name="interFoam_twoPhaseMixture", of_symbol="twoPhaseMixture",
              of_file="src/transportModels/twoPhaseMixture/twoPhaseMixture/twoPhaseMixture.C",
              classification="MODEL", status="REIMPLEMENT",

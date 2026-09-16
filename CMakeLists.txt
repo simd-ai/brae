@@ -128,6 +128,7 @@ add_library(brae_core STATIC
     src/applications/solvers/simpleFoam/simpleFoamV2.cu
     src/applications/solvers/simpleFoam/pEqn_cpp.cu
     src/applications/solvers/simpleFoam/createFields_cpp.cu
+    src/transportModels/interfaceProperties/interface_properties_cpp.cu
     src/applications/solvers/interFoam/inter_solve_cpp.cu
     src/applications/solvers/interFoam/inter_peqn_cpp.cu
     src/finiteVolume/fvMatrices/solvers/MULES/mules_cpp.cu
@@ -3138,6 +3139,17 @@ target_include_directories(test_inter_solve_cpp PRIVATE ${BRAE_HEADER_DIRS}
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_inter_solve_cpp PRIVATE brae_core)
 add_test(NAME inter_solve_cpp COMMAND test_inter_solve_cpp)
+
+# interFoam step 13: interface CURVATURE, the component the manifest carried as needing an instrumented
+# OpenFOAM. It does not: curvature is GEOMETRY. A plane has K = 0 exactly at any resolution, a sphere
+# of radius R has K = 2/R as the mesh refines, and the contact angle has an exact postcondition --
+# acos(nHat & nf) IS theta. The convergence arm is what makes the sphere's tolerance a statement about
+# the scheme rather than about this mesh.
+add_executable(test_interface_curvature_cpp tests/test_interface_curvature_cpp.cu)
+target_include_directories(test_interface_curvature_cpp PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_interface_curvature_cpp PRIVATE brae_core)
+add_test(NAME interface_curvature_cpp COMMAND test_interface_curvature_cpp)
 
 # These five read damBreak's own dictionaries. A box without OpenFOAM must SKIP, not report green: the
 # arms silently stopped running the moment $FOAM_TUTORIALS was empty, and nothing said so.
