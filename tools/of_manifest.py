@@ -1557,7 +1557,7 @@ COMPONENTS = {
         dict(name="interFoam_interfaceProperties", of_symbol="interfaceProperties",
              of_file="src/transportModels/interfaceProperties/interfaceProperties.C",
              classification="MODEL", status="REIMPLEMENT",
-             brae_reference="src/transportModels/interfaceProperties/interface_properties_cpp.cu",
+             brae_reference="src/transportModels/interfaceProperties/interface_properties_cpp.cuh",
              brae_target="src/transportModels/interfaceProperties/device_interface_properties.cu",
              validation="Curvature K_ against OpenFOAM's own, which a stock run never writes -- so this needs "
                         "an instrumented interfaceProperties. Curvature is where a VoF port diverges invisibly.",
@@ -1567,26 +1567,34 @@ COMPONENTS = {
         dict(name="interFoam_twoPhaseMixture", of_symbol="twoPhaseMixture",
              of_file="src/transportModels/twoPhaseMixture/twoPhaseMixture/twoPhaseMixture.C",
              classification="MODEL", status="REIMPLEMENT",
-             brae_reference="src/transportModels/twoPhaseMixture/two_phase_mixture_cpp.cu",
+             brae_reference="src/transportModels/twoPhaseMixture/two_phase_mixture_cpp.cuh",
              brae_target="src/transportModels/twoPhaseMixture/device_two_phase_mixture.cu",
              validation="rho and mu as alpha-weighted blends, against OpenFOAM's own fields at iteration 1.",
              note="Field plumbing rather than new numerics: rho = alpha1*rho1 + (1-alpha1)*rho2, same for mu."),
         dict(name="interFoam_immiscibleMixture", of_symbol="immiscibleIncompressibleTwoPhaseMixture",
              of_file="src/transportModels/immiscibleIncompressibleTwoPhaseMixture/immiscibleIncompressibleTwoPhaseMixture.C",
              classification="MODEL", status="REIMPLEMENT",
-             brae_reference="src/transportModels/twoPhaseMixture/two_phase_mixture_cpp.cu",
+             brae_reference="src/transportModels/twoPhaseMixture/two_phase_mixture_cpp.cuh",
              brae_target="src/transportModels/twoPhaseMixture/device_two_phase_mixture.cu",
              validation="Shares the twoPhaseMixture gate.",
              note="Joins twoPhaseMixture and interfaceProperties into the one object interFoam.C holds."),
         dict(name="interFoam_UEqn", of_symbol="UEqn",
              of_file="applications/solvers/multiphase/interFoam/UEqn.H",
              classification="SHARED_NUMERICAL", status="REIMPLEMENT",
-             brae_reference="src/applications/solvers/interFoam/interUEqn_cpp.cu",
-             brae_target="src/applications/solvers/interFoam/interUEqn.cu",
-             validation="Against OpenFOAM's own assembled matrix, as the rhoSimpleFoam momentum gate is.",
+             brae_reference="src/applications/solvers/interFoam/inter_ueqn_cpp.cuh",
+             brae_target="src/applications/solvers/interFoam/device_inter_ueqn.cu",
+             validation="tests/test_inter_ueqn_cpp.cu now; OpenFOAM's own assembled matrix once the "
+                        "solver runs end to end, as the rhoSimpleFoam momentum gate does.",
              note="fvm::ddt(rho,U) + fvm::div(rhoPhi,U) + MRF.DDt(rho,U) + turbulence->divDevRhoReff(rho,U), "
                   "with the momentum predictor's source reconstructed from surfaceTensionForce() - "
-                  "ghf*snGrad(rho) - snGrad(p_rgh). divDevRhoReff is the COMPRESSIBLE overload brae already has."),
+                  "ghf*snGrad(rho) - snGrad(p_rgh). Assembly from pieces brae already had, EXCEPT two. "
+                  "(1) fvm::ddt(rho,U) puts rho on the diagonal and rho.oldTime() in the SOURCE "
+                  "(EulerDdtScheme.C:455-467); here those differ by the water/air ratio in every cell the "
+                  "interface crossed, so carrying one rho field is a 1000x error exactly at the interface. "
+                  "(2) the momentum source is a reconstructed FACE flux, not a cell gradient, and "
+                  "`solve(UEqn == R)` adds it with a PLUS where rhoSimpleFoam's twin carries the minus "
+                  "inside R. MRF, fvOptions, localEuler/CrankNicolson ddt and `Gauss limitedLinear` on "
+                  "div(rhoPhi,U) are refused by name."),
         dict(name="interFoam_pEqn", of_symbol="pEqn",
              of_file="applications/solvers/multiphase/interFoam/pEqn.H",
              classification="SHARED_NUMERICAL", status="REIMPLEMENT",
@@ -1599,9 +1607,12 @@ COMPONENTS = {
         dict(name="interFoam_vanLeer", of_symbol="vanLeer",
              of_file="src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/vanLeer/vanLeer.C",
              classification="SHARED_NUMERICAL", status="REIMPLEMENT",
-             brae_reference="src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedSchemes_cpp.cuh",
+             brae_reference="src/cuda/device_fvm.cu",
              brae_target="src/cuda/device_fvm.cu",
-             validation="Against OpenFOAM's own face weights, as the other limited schemes are.",
+             validation="tests/test_scheme_blocks.cu -- the selector, with a fail-proof; and the limiter "
+                        "against vanLeer.H:70 directly. It asymptotes to 2, not 1: it is a Sweby TVD "
+                        "limiter, not a [0,1] blend, and writing the clamp limitedLinear needs would "
+                        "make it a different scheme.",
              note="EVERY interFoam tutorial uses `div(phi,alpha) Gauss vanLeer`. brae has limitedLinear/V, "
                   "vanAlbada, LUST, linearUpwind/V -- not vanLeer. Small, and blocking."),
         dict(name="interFoam_alphaCourantNo", of_symbol="alphaCourantNo",
@@ -1615,8 +1626,8 @@ COMPONENTS = {
         dict(name="interFoam_createFields", of_symbol="createFields",
              of_file="applications/solvers/multiphase/interFoam/createFields.H",
              classification="CONFIGURATION", status="REIMPLEMENT",
-             brae_reference="src/applications/solvers/interFoam/interCreateFields_cpp.cu",
-             brae_target="src/applications/solvers/interFoam/interCreateFields.cu",
+             brae_reference="src/applications/solvers/interFoam/inter_create_fields_cpp.cuh",
+             brae_target="src/applications/solvers/interFoam/device_inter_create_fields.cu",
              validation="Field-by-field against OpenFOAM's own written state, as rhoCreateFields is.",
              note="alpha1, p_rgh, gh/ghf from the gravity field, rhoPhi. g and hRef come from "
                   "constant/g and constant/hRef, neither of which brae reads today."),

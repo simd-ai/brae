@@ -177,6 +177,22 @@ struct DeviceSimpleControls
     scalar maxwellNuM = 0.0;
     scalar maxwellLambda = 0.0;
     bool   divSigmaVanAlbada = false;   // div(phi,sigma) Gauss vanAlbada (what both Maxwell tutorials name)
+    // interFoam's VoF transport, both halves of it, in the same `twoByk` currency every other limited
+    // scheme here uses (see kVanLeerTwoByk in device_mesh.cuh): > 0 is limitedLinear's 2/max(k,SMALL),
+    // 0 is vanAlbada, -1 is vanLeer. Every interFoam tutorial writes
+    //     div(phi,alpha)   Gauss vanLeer;
+    //     div(phirb,alpha) Gauss linear;
+    // so vanLeer is the default here and the compression flux is plain linear. Both are REFUSED by name
+    // when the case asks for something brae does not have -- substituting a limiter on the interface
+    // transport is not a tolerance, it is a different interface.
+    scalar divAlphaTwoByk   = -1.0;    // kVanLeerTwoByk
+    bool   divAlphaRbLinear = true;    // div(phirb,alpha) Gauss linear
+    // WHETHER THE CASE NAMED ONE, which the value alone cannot say: the defaults above are what
+    // every interFoam tutorial asks for, so a test asserting `divAlphaTwoByk == kVanLeerTwoByk`
+    // passes whether the parser selected it or never ran -- the exact shape of the div(phi,sigma)
+    // defect above. Caught by the fail-proof on tests/test_scheme_blocks.cu, 2026-09-16.
+    bool   foundDivAlpha    = false;
+    bool   foundDivAlphaRb  = false;
     scalar relaxSigma = 1.0;            // relaxationFactors/equations/sigma (OF sigmaEqn.relax(); absent -> none)
     bool   gsSigma = false;             // solvers/sigma smoothSolver + a GaussSeidel smoother
     bool   divULimitedV = false;

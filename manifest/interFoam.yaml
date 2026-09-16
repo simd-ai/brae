@@ -54,7 +54,7 @@ components:
       file: src/transportModels/interfaceProperties/interfaceProperties.C
     classification: MODEL
     brae_status: REIMPLEMENT
-    brae_reference: src/transportModels/interfaceProperties/interface_properties_cpp.cu
+    brae_reference: src/transportModels/interfaceProperties/interface_properties_cpp.cuh
     brae_target: src/transportModels/interfaceProperties/device_interface_properties.cu
     validation: "Curvature K_ against OpenFOAM's own, which a stock run never writes -- so this needs an instrumented interfaceProperties. Curvature is where a VoF port diverges invisibly."
     note: "K_ = -div(nHatf) where nHatf = (gradAlphaf/(|gradAlphaf| + deltaN)) & Sf (interfaceProperties.C:141-153), plus alphaContactAngle correction on wall patches. surfaceTensionForce() = sigma*K_*snGrad(alpha1)."
@@ -65,7 +65,7 @@ components:
       file: src/transportModels/twoPhaseMixture/twoPhaseMixture/twoPhaseMixture.C
     classification: MODEL
     brae_status: REIMPLEMENT
-    brae_reference: src/transportModels/twoPhaseMixture/two_phase_mixture_cpp.cu
+    brae_reference: src/transportModels/twoPhaseMixture/two_phase_mixture_cpp.cuh
     brae_target: src/transportModels/twoPhaseMixture/device_two_phase_mixture.cu
     validation: "rho and mu as alpha-weighted blends, against OpenFOAM's own fields at iteration 1."
     note: "Field plumbing rather than new numerics: rho = alpha1*rho1 + (1-alpha1)*rho2, same for mu."
@@ -76,7 +76,7 @@ components:
       file: src/transportModels/immiscibleIncompressibleTwoPhaseMixture/immiscibleIncompressibleTwoPhaseMixture.C
     classification: MODEL
     brae_status: REIMPLEMENT
-    brae_reference: src/transportModels/twoPhaseMixture/two_phase_mixture_cpp.cu
+    brae_reference: src/transportModels/twoPhaseMixture/two_phase_mixture_cpp.cuh
     brae_target: src/transportModels/twoPhaseMixture/device_two_phase_mixture.cu
     validation: Shares the twoPhaseMixture gate.
     note: Joins twoPhaseMixture and interfaceProperties into the one object interFoam.C holds.
@@ -87,10 +87,10 @@ components:
       file: applications/solvers/multiphase/interFoam/UEqn.H
     classification: SHARED_NUMERICAL
     brae_status: REIMPLEMENT
-    brae_reference: src/applications/solvers/interFoam/interUEqn_cpp.cu
-    brae_target: src/applications/solvers/interFoam/interUEqn.cu
-    validation: "Against OpenFOAM's own assembled matrix, as the rhoSimpleFoam momentum gate is."
-    note: "fvm::ddt(rho,U) + fvm::div(rhoPhi,U) + MRF.DDt(rho,U) + turbulence->divDevRhoReff(rho,U), with the momentum predictor's source reconstructed from surfaceTensionForce() - ghf*snGrad(rho) - snGrad(p_rgh). divDevRhoReff is the COMPRESSIBLE overload brae already has."
+    brae_reference: src/applications/solvers/interFoam/inter_ueqn_cpp.cuh
+    brae_target: src/applications/solvers/interFoam/device_inter_ueqn.cu
+    validation: "tests/test_inter_ueqn_cpp.cu now; OpenFOAM's own assembled matrix once the solver runs end to end, as the rhoSimpleFoam momentum gate does."
+    note: "fvm::ddt(rho,U) + fvm::div(rhoPhi,U) + MRF.DDt(rho,U) + turbulence->divDevRhoReff(rho,U), with the momentum predictor's source reconstructed from surfaceTensionForce() - ghf*snGrad(rho) - snGrad(p_rgh). Assembly from pieces brae already had, EXCEPT two. (1) fvm::ddt(rho,U) puts rho on the diagonal and rho.oldTime() in the SOURCE (EulerDdtScheme.C:455-467); here those differ by the water/air ratio in every cell the interface crossed, so carrying one rho field is a 1000x error exactly at the interface. (2) the momentum source is a reconstructed FACE flux, not a cell gradient, and `solve(UEqn == R)` adds it with a PLUS where rhoSimpleFoam's twin carries the minus inside R. MRF, fvOptions, localEuler/CrankNicolson ddt and `Gauss limitedLinear` on div(rhoPhi,U) are refused by name."
 
   interFoam_pEqn:
     openfoam:
@@ -109,9 +109,9 @@ components:
       file: src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/vanLeer/vanLeer.C
     classification: SHARED_NUMERICAL
     brae_status: REIMPLEMENT
-    brae_reference: src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedSchemes_cpp.cuh
+    brae_reference: src/cuda/device_fvm.cu
     brae_target: src/cuda/device_fvm.cu
-    validation: "Against OpenFOAM's own face weights, as the other limited schemes are."
+    validation: "tests/test_scheme_blocks.cu -- the selector, with a fail-proof; and the limiter against vanLeer.H:70 directly. It asymptotes to 2, not 1: it is a Sweby TVD limiter, not a [0,1] blend, and writing the clamp limitedLinear needs would make it a different scheme."
     note: "EVERY interFoam tutorial uses `div(phi,alpha) Gauss vanLeer`. brae has limitedLinear/V, vanAlbada, LUST, linearUpwind/V -- not vanLeer. Small, and blocking."
 
   interFoam_alphaCourantNo:
@@ -131,75 +131,91 @@ components:
       file: applications/solvers/multiphase/interFoam/createFields.H
     classification: CONFIGURATION
     brae_status: REIMPLEMENT
-    brae_reference: src/applications/solvers/interFoam/interCreateFields_cpp.cu
-    brae_target: src/applications/solvers/interFoam/interCreateFields.cu
+    brae_reference: src/applications/solvers/interFoam/inter_create_fields_cpp.cuh
+    brae_target: src/applications/solvers/interFoam/device_inter_create_fields.cu
     validation: "Field-by-field against OpenFOAM's own written state, as rhoCreateFields is."
     note: "alpha1, p_rgh, gh/ghf from the gravity field, rhoPhi. g and hRef come from constant/g and constant/hRef, neither of which brae reads today."
 
 validation_cases:
-  damBreak:
-    path: /usr/lib/openfoam/openfoam2412/tutorials/multiphase/interFoam/laminar/damBreak/damBreak
-    derived_selection_sites: 31
-    derived_unresolved: 0
-    derived_required_implementations:
-      - {category: boundary, keyword: empty, resolves_to: emptyPolyPatch}
-      - {category: boundary, keyword: fixedFluxPressure, resolves_to: fixedFluxPressureFvPatchScalarField}
-      - {category: boundary, keyword: inletOutlet, resolves_to: inletOutlet}
-      - {category: boundary, keyword: noSlip, resolves_to: noSlipFvPatchVectorField}
-      - {category: boundary, keyword: pressureInletOutletVelocity, resolves_to: pressureInletOutletVelocityFvPatchVectorField}
-      - {category: boundary, keyword: totalPressure, resolves_to: totalPressureFvPatchScalarField}
-      - {category: boundary, keyword: zeroGradient, resolves_to: zeroGradient}
-      - {category: linear-solver, keyword: DIC, resolves_to: DICPreconditioner}
-      - {category: linear-solver, keyword: PCG, resolves_to: PCG}
-      - {category: linear-solver, keyword: smoothSolver, resolves_to: smoothSolver}
-      - {category: linear-solver, keyword: symGaussSeidel, resolves_to: symGaussSeidelSmoother}
-      - {category: scheme, keyword: Euler, resolves_to: EulerDdtScheme}
-      - {category: scheme, keyword: corrected, resolves_to: correctedSnGrad}
-      - {category: scheme, keyword: linear, resolves_to: linear}
-
-  damBreak:
-    path: /usr/lib/openfoam/openfoam2412/tutorials/multiphase/interFoam/RAS/damBreak/damBreak
-    derived_selection_sites: 52
+  pitzDaily:
+    path: /usr/lib/openfoam/openfoam2412/tutorials/incompressible/simpleFoam/pitzDaily
+    derived_selection_sites: 47
     derived_unresolved: 0
     derived_required_implementations:
       - {category: boundary, keyword: calculated, resolves_to: calculated}
       - {category: boundary, keyword: empty, resolves_to: emptyPolyPatch}
       - {category: boundary, keyword: epsilonWallFunction, resolves_to: epsilonWallFunctionFvPatchScalarField}
-      - {category: boundary, keyword: fixedFluxPressure, resolves_to: fixedFluxPressureFvPatchScalarField}
+      - {category: boundary, keyword: fixedValue, resolves_to: fixedValue}
+      - {category: boundary, keyword: kqRWallFunction, resolves_to: kqRWallFunction}
+      - {category: boundary, keyword: noSlip, resolves_to: noSlipFvPatchVectorField}
+      - {category: boundary, keyword: nutkWallFunction, resolves_to: nutkWallFunctionFvPatchScalarField}
+      - {category: boundary, keyword: omegaWallFunction, resolves_to: omegaWallFunctionFvPatchScalarField}
+      - {category: boundary, keyword: zeroGradient, resolves_to: zeroGradient}
+      - {category: linear-solver, keyword: GAMG, resolves_to: GAMGSolver}
+      - {category: linear-solver, keyword: GaussSeidel, resolves_to: GaussSeidelSmoother}
+      - {category: linear-solver, keyword: smoothSolver, resolves_to: smoothSolver}
+      - {category: linear-solver, keyword: symGaussSeidel, resolves_to: symGaussSeidelSmoother}
+      - {category: scheme, keyword: corrected, resolves_to: correctedSnGrad}
+      - {category: scheme, keyword: limitedLinear, resolves_to: limitedLinearLimiter}
+      - {category: scheme, keyword: linear, resolves_to: linear}
+      - {category: scheme, keyword: steadyState, resolves_to: steadyStateDdtScheme}
+      - {category: turbulence, keyword: kEpsilon, resolves_to: kEpsilon}
+
+  airFoil2D:
+    path: /usr/lib/openfoam/openfoam2412/tutorials/incompressible/simpleFoam/airFoil2D
+    derived_selection_sites: 33
+    derived_unresolved: 0
+    derived_required_implementations:
+      - {category: boundary, keyword: empty, resolves_to: emptyPolyPatch}
+      - {category: boundary, keyword: fixedValue, resolves_to: fixedValue}
+      - {category: boundary, keyword: freestream, resolves_to: freestream}
+      - {category: boundary, keyword: freestreamPressure, resolves_to: freestreamPressureFvPatchScalarField}
+      - {category: boundary, keyword: freestreamVelocity, resolves_to: freestreamVelocityFvPatchVectorField}
+      - {category: boundary, keyword: noSlip, resolves_to: noSlipFvPatchVectorField}
+      - {category: boundary, keyword: nutUSpaldingWallFunction, resolves_to: nutUSpaldingWallFunctionFvPatchScalarField}
+      - {category: boundary, keyword: zeroGradient, resolves_to: zeroGradient}
+      - {category: functionObject, keyword: div, resolves_to: div}
+      - {category: functionObject, keyword: mag, resolves_to: mag}
+      - {category: functionObject, keyword: momentumError, resolves_to: momentumError}
+      - {category: functionObject, keyword: turbulenceFields, resolves_to: turbulenceFields}
+      - {category: linear-solver, keyword: GAMG, resolves_to: GAMGSolver}
+      - {category: linear-solver, keyword: GaussSeidel, resolves_to: GaussSeidelSmoother}
+      - {category: linear-solver, keyword: smoothSolver, resolves_to: smoothSolver}
+      - {category: scheme, keyword: corrected, resolves_to: correctedSnGrad}
+      - {category: scheme, keyword: linear, resolves_to: linear}
+      - {category: scheme, keyword: steadyState, resolves_to: steadyStateDdtScheme}
+      - {category: turbulence, keyword: SpalartAllmaras, resolves_to: SpalartAllmaras}
+
+  motorBike:
+    path: /usr/lib/openfoam/openfoam2412/tutorials/incompressible/simpleFoam/motorBike
+    derived_selection_sites: 59
+    derived_unresolved: 2
+    derived_required_implementations:
+      - {category: boundary, keyword: calculated, resolves_to: calculated}
+      - {category: boundary, keyword: fixedValue, resolves_to: fixedValue}
       - {category: boundary, keyword: inletOutlet, resolves_to: inletOutlet}
       - {category: boundary, keyword: kqRWallFunction, resolves_to: kqRWallFunction}
       - {category: boundary, keyword: noSlip, resolves_to: noSlipFvPatchVectorField}
       - {category: boundary, keyword: nutkWallFunction, resolves_to: nutkWallFunctionFvPatchScalarField}
-      - {category: boundary, keyword: pressureInletOutletVelocity, resolves_to: pressureInletOutletVelocityFvPatchVectorField}
-      - {category: boundary, keyword: totalPressure, resolves_to: totalPressureFvPatchScalarField}
+      - {category: boundary, keyword: omegaWallFunction, resolves_to: omegaWallFunctionFvPatchScalarField}
+      - {category: boundary, keyword: slip, resolves_to: slip}
       - {category: boundary, keyword: zeroGradient, resolves_to: zeroGradient}
-      - {category: linear-solver, keyword: DIC, resolves_to: DICPreconditioner}
-      - {category: linear-solver, keyword: PCG, resolves_to: PCG}
+      - {category: functionObject, keyword: ensightWrite, resolves_to: ensightWrite}
+      - {category: functionObject, keyword: foamReport, resolves_to: foamReport}
+      - {category: functionObject, keyword: forceCoeffs, resolves_to: null}
+      - {category: functionObject, keyword: graphFunctionObject, resolves_to: graphFunctionObject}
+      - {category: functionObject, keyword: nearWallFields, resolves_to: nearWallFields}
+      - {category: functionObject, keyword: solverInfo, resolves_to: solverInfo}
+      - {category: functionObject, keyword: streamLine, resolves_to: streamLine}
+      - {category: functionObject, keyword: surfaces, resolves_to: sampledSurfaces}
+      - {category: functionObject, keyword: wallBoundedStreamLine, resolves_to: wallBoundedStreamLine}
+      - {category: linear-solver, keyword: GAMG, resolves_to: GAMGSolver}
+      - {category: linear-solver, keyword: GaussSeidel, resolves_to: GaussSeidelSmoother}
       - {category: linear-solver, keyword: smoothSolver, resolves_to: smoothSolver}
-      - {category: linear-solver, keyword: symGaussSeidel, resolves_to: symGaussSeidelSmoother}
-      - {category: scheme, keyword: Euler, resolves_to: EulerDdtScheme}
-      - {category: scheme, keyword: linear, resolves_to: linear}
-      - {category: scheme, keyword: orthogonal, resolves_to: orthogonalSnGrad}
-      - {category: turbulence, keyword: kEpsilon, resolves_to: kEpsilon}
-
-  capillaryRise:
-    path: /usr/lib/openfoam/openfoam2412/tutorials/multiphase/interFoam/laminar/capillaryRise
-    derived_selection_sites: 26
-    derived_unresolved: 0
-    derived_required_implementations:
-      - {category: boundary, keyword: constantAlphaContactAngle, resolves_to: constantAlphaContactAngleFvPatchScalarField}
-      - {category: boundary, keyword: empty, resolves_to: emptyPolyPatch}
-      - {category: boundary, keyword: fixedFluxPressure, resolves_to: fixedFluxPressureFvPatchScalarField}
-      - {category: boundary, keyword: fixedValue, resolves_to: fixedValue}
-      - {category: boundary, keyword: inletOutlet, resolves_to: inletOutlet}
-      - {category: boundary, keyword: noSlip, resolves_to: noSlipFvPatchVectorField}
-      - {category: boundary, keyword: pressureInletOutletVelocity, resolves_to: pressureInletOutletVelocityFvPatchVectorField}
-      - {category: boundary, keyword: zeroGradient, resolves_to: zeroGradient}
-      - {category: linear-solver, keyword: DIC, resolves_to: DICPreconditioner}
-      - {category: linear-solver, keyword: PCG, resolves_to: PCG}
-      - {category: linear-solver, keyword: smoothSolver, resolves_to: smoothSolver}
-      - {category: linear-solver, keyword: symGaussSeidel, resolves_to: symGaussSeidelSmoother}
-      - {category: scheme, keyword: Euler, resolves_to: EulerDdtScheme}
+      - {category: scheme, keyword: cellLimited, resolves_to: null}
       - {category: scheme, keyword: corrected, resolves_to: correctedSnGrad}
       - {category: scheme, keyword: linear, resolves_to: linear}
+      - {category: scheme, keyword: steadyState, resolves_to: steadyStateDdtScheme}
+      - {category: scheme, keyword: upwind, resolves_to: upwind}
+      - {category: turbulence, keyword: kOmegaSST, resolves_to: kOmegaSST}
 

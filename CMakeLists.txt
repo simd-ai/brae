@@ -115,6 +115,7 @@ add_library(brae_core STATIC
     src/applications/solvers/simpleFoam/simpleFoamV2.cu
     src/applications/solvers/simpleFoam/pEqn_cpp.cu
     src/applications/solvers/simpleFoam/createFields_cpp.cu
+    src/applications/solvers/interFoam/inter_ueqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoCreateFields_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoUEqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoUEqn.cu
@@ -715,6 +716,15 @@ add_test(NAME manifest_simplefoam_not_drifted
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/of_manifest.py simpleFoam
                  --check ${CMAKE_CURRENT_SOURCE_DIR}/manifest/simpleFoam.yaml)
 set_tests_properties(manifest_simplefoam_not_drifted PROPERTIES SKIP_RETURN_CODE 77)
+
+# ...and the interFoam twin, added with the manifest itself rather than weeks later. The curated half of
+# that table is where each component's brae_reference/brae_target path lives, and those paths were WRONG
+# for six components within a day of being written -- the files landed under different names. Nothing
+# caught it because nothing asked.
+add_test(NAME manifest_interfoam_not_drifted
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/of_manifest.py interFoam
+                 --check ${CMAKE_CURRENT_SOURCE_DIR}/manifest/interFoam.yaml)
+set_tests_properties(manifest_interfoam_not_drifted PROPERTIES SKIP_RETURN_CODE 77)
 
 add_executable(test_rho_kepsilon_cuda tests/test_rho_kepsilon_cuda.cu)
 target_include_directories(test_rho_kepsilon_cuda PRIVATE ${BRAE_HEADER_DIRS})
@@ -3001,6 +3011,60 @@ add_executable(test_scheme_blocks tests/test_scheme_blocks.cu)
 target_include_directories(test_scheme_blocks PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_scheme_blocks PRIVATE brae_core)
 add_test(NAME scheme_blocks COMMAND test_scheme_blocks)
+
+# interFoam step 3: the two-phase mixture. Reads the case's own transportProperties (phase ORDER decides
+# which phase alpha1 is) and blends rho/mu/nu, where rho takes the RAW alpha and mu/nu the clamped one --
+# a difference invisible on any in-range field, so the gate sweeps alpha outside [0,1] and carries a
+# control that fails if rho is clamped.
+add_executable(test_two_phase_mixture tests/test_two_phase_mixture.cu)
+target_include_directories(test_two_phase_mixture PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/src/transportModels/twoPhaseMixture)
+target_link_libraries(test_two_phase_mixture PRIVATE brae_core)
+add_test(NAME two_phase_mixture
+         COMMAND test_two_phase_mixture
+                 $ENV{FOAM_TUTORIALS}/multiphase/interFoam/laminar/damBreak/damBreak)
+
+# interFoam step 4: interface curvature and surface tension. The dictionary half is the part that bites --
+# damBreak keys its alpha solver as the REGEX "alpha.water.*", cAlpha has NO default in OpenFOAM, and
+# deltaN is 1e-8/cbrt(average(V)) rather than a constant.
+add_executable(test_interface_properties tests/test_interface_properties.cu)
+target_include_directories(test_interface_properties PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/src/transportModels/interfaceProperties
+                           ${CMAKE_CURRENT_SOURCE_DIR}/src/transportModels/twoPhaseMixture)
+target_link_libraries(test_interface_properties PRIVATE brae_core)
+add_test(NAME interface_properties
+         COMMAND test_interface_properties
+                 $ENV{FOAM_TUTORIALS}/multiphase/interFoam/laminar/damBreak/damBreak)
+
+# interFoam step 5: the gravity fields. ghRef carries g's SIGN (gh.H:2-7), and NO shipped tutorial sets
+# constant/hRef -- so on every stock case ghRef is 0 and the sign is unobservable. The gate supplies its
+# own hRef, which is the only way that arm can discriminate.
+add_executable(test_inter_create_fields tests/test_inter_create_fields.cu)
+target_include_directories(test_inter_create_fields PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/interFoam)
+target_link_libraries(test_inter_create_fields PRIVATE brae_core)
+add_test(NAME inter_create_fields
+         COMMAND test_inter_create_fields
+                 $ENV{FOAM_TUTORIALS}/multiphase/interFoam/laminar/damBreak/damBreak)
+
+# interFoam step 6: fvc::reconstruct, which brae did not have and interFoam needs twice (the momentum
+# predictor's source and rebuilding U after the pressure solve). Held against its defining identity --
+# reconstruct(V & Sf) == V -- which no fixture is needed for and which both plausible mistakes break.
+add_executable(test_fvc_reconstruct tests/test_fvc_reconstruct.cu)
+target_include_directories(test_fvc_reconstruct PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_fvc_reconstruct PRIVATE brae_core)
+add_test(NAME fvc_reconstruct COMMAND test_fvc_reconstruct)
+
+# interFoam step 7: UEqn.H. Assembly from pieces brae already had, plus the two that are new to this
+# solver -- fvm::ddt(rho, U) with rho.oldTime() in the SOURCE and rho in the DIAGONAL (they differ by the
+# water/air ratio in every cell the interface crossed), and a momentum source that is a reconstructed
+# FACE flux rather than a cell gradient. Arms 1 and 3 carry the controls that separate each from its
+# plausible substitute; neither difference is visible on a smooth field.
+add_executable(test_inter_ueqn_cpp tests/test_inter_ueqn_cpp.cu)
+target_include_directories(test_inter_ueqn_cpp PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_ueqn_cpp PRIVATE brae_core)
+add_test(NAME inter_ueqn_cpp COMMAND test_inter_ueqn_cpp)
 
 add_executable(test_residual_control tests/test_residual_control.cu)
 target_include_directories(test_residual_control PRIVATE ${BRAE_HEADER_DIRS})

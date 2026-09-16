@@ -788,6 +788,38 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                 // Found by the coverage manifest, not by a case: `vanAlbada` appeared as a type the
                 // tutorials DEMAND and brae never names in a quoted comparison, which is exactly the
                 // signature of a control that is plumbed but never selected.
+                // interFoam's alpha transport. Two entries, two different jobs: div(phi,alpha) carries
+                // the VoF field and every tutorial limits it with vanLeer, while div(phirb,alpha) is the
+                // INTERFACE COMPRESSION flux and every tutorial leaves it linear. Getting either wrong
+                // changes where the interface sits, so neither is substituted silently.
+                if (inDiv && ln.find("div(phi,alpha)") != std::string::npos)
+                {
+                    const std::string sw = divSchemeWord(ln);
+                    ctl.foundDivAlpha = true;
+                    if      (sw == "vanLeer")   ctl.divAlphaTwoByk = scalar(-1.0);          // kVanLeerTwoByk
+                    else if (sw == "vanAlbada") ctl.divAlphaTwoByk = scalar(0.0);
+                    else if (sw == "limitedLinear")
+                    {
+                        const scalar t = limitedTwoByk(ln);
+                        ctl.divAlphaTwoByk = (t > 0.0) ? t : scalar(2.0);
+                    }
+                    else if (!sw.empty())
+                        throw std::runtime_error(
+                            "brae: div(phi,alpha) scheme 'Gauss " + sw + "' is not implemented (brae has "
+                            "`vanLeer`, `vanAlbada` and `limitedLinear <k>`). This entry limits the VoF "
+                            "transport itself, so running another limiter moves the interface:\n  " + ln);
+                }
+                if (inDiv && ln.find("div(phirb,alpha)") != std::string::npos)
+                {
+                    const std::string sw = divSchemeWord(ln);
+                    ctl.foundDivAlphaRb = true;
+                    if (sw == "linear") ctl.divAlphaRbLinear = true;
+                    else if (!sw.empty())
+                        throw std::runtime_error(
+                            "brae: div(phirb,alpha) scheme 'Gauss " + sw + "' is not implemented (brae has "
+                            "`linear`, which is what every interFoam tutorial names). This entry is the "
+                            "INTERFACE COMPRESSION flux, not the transport:\n  " + ln);
+                }
                 if (inDiv && ln.find("div(phi,sigma)") != std::string::npos)
                 {
                     const std::string sw = divSchemeWord(ln);
