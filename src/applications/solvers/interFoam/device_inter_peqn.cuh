@@ -98,6 +98,22 @@ void deviceStaticPressure(
     const DeviceBuffer<scalar>& gh,
     DeviceBuffer<scalar>&       p);
 
+// fvc::interpolate(vf) over the mesh's FULL face array: the linear weights on the internal faces, and
+// the FACE CELL's value at an uncoupled patch -- which is what surfaceInterpolation gives there, since
+// there is no second cell to weight against. rAUf is wanted in exactly that form by the pressure step,
+// which reads its head for the laplacian and its tail for the velocity correction.
+void deviceInterpolateFull(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& vf,
+    DeviceBuffer<scalar>&       out);
+
+// A cell field gathered to the boundary faces -- the face cell's value, one per boundary face. This is
+// zeroGradient, and it is what rho's patch values are when no patch condition says otherwise.
+void deviceGatherBoundary(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& vf,
+    DeviceBuffer<scalar>&       out);
+
 // ---------------------------------------------------------------------------------------------------
 // THE p_rgh MATRIX: fvm::laplacian(rAUf, p_rgh) == fvc::div(phiHbyA), pEqn.H:44-56.
 //

@@ -98,6 +98,32 @@ __global__ void ddtCorrBoundaryKernel(
 }
 
 // pe.source += fvc::div(phiHbyA)*V -- a PLUS, fvMatrix::operator== (fvMatrix.C:1855-1862).
+__global__ void interpolateFullKernel(
+    const label* __restrict__ own, const label* __restrict__ nei, const scalar* __restrict__ w,
+    const label* __restrict__ bndCell, const label* __restrict__ bndGFace,
+    const scalar* __restrict__ vf, int nIf, int nBf, scalar* __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < nIf)
+    {
+        out[i] = w[i]*vf[own[i]] + (scalar(1) - w[i])*vf[nei[i]];
+    }
+    else if (i < nIf + nBf)
+    {
+        const int b = i - nIf;
+        // at an uncoupled patch there is no second cell to weight against, so the face value IS the
+        // cell's. bndGFace puts it where the mesh's face order expects it.
+        out[bndGFace[b]] = vf[bndCell[b]];
+    }
+}
+
+__global__ void gatherBoundaryKernel(const label* __restrict__ bndCell, const scalar* __restrict__ vf,
+                                     int nBf, scalar* __restrict__ out)
+{
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b < nBf) out[b] = vf[bndCell[b]];
+}
+
 __global__ void addPhiHbyATermsKernel(
     const scalar* __restrict__ rhoRAUf, const scalar* __restrict__ ddtCorr,
     const scalar* __restrict__ phig, int n, int haveDdt, scalar* __restrict__ phiHbyA)
@@ -406,6 +432,34 @@ void deviceInterPEqnFlux(
                                                    pSolved.data(), nBf, fluxBnd.data());
         ckP(cudaGetLastError(), "pEqn.flux(), boundary");
     }
+}
+
+
+void deviceInterpolateFull(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& vf,
+    DeviceBuffer<scalar>&       out)
+{
+    const int nIf = dm.nInternalFaces, nBf = dm.nBndFaces;
+    out.resize(static_cast<std::size_t>(nIf + nBf));
+    if (nIf + nBf == 0) return;
+    interpolateFullKernel<<<nBlocks(nIf + nBf), TPB>>>(
+        dm.owner.data(), dm.nei.data(), dm.w.data(), dm.bndCell.data(), dm.bndGFace.data(),
+        vf.data(), nIf, nBf, out.data());
+    ckP(cudaGetLastError(), "fvc::interpolate, full face array");
+}
+
+
+void deviceGatherBoundary(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& vf,
+    DeviceBuffer<scalar>&       out)
+{
+    const int nBf = dm.nBndFaces;
+    out.resize(static_cast<std::size_t>(nBf));
+    if (nBf == 0) return;
+    gatherBoundaryKernel<<<nBlocks(nBf), TPB>>>(dm.bndCell.data(), vf.data(), nBf, out.data());
+    ckP(cudaGetLastError(), "gather to the boundary");
 }
 
 } // namespace brae
