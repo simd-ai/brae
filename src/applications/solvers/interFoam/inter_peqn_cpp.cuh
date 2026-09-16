@@ -7,7 +7,9 @@
 //     also: src/finiteVolume/finiteVolume/fvc/fvcMeshPhi.C   (ddtCorr's weighting)
 //   brae:
 //     reference: this header
-//     cuda:      (pending)
+//     cuda:      src/applications/solvers/interFoam/device_inter_peqn.cu -- the four notes below;
+//                the laplacian, the solve and the non-orthogonal loop are the device machinery
+//                every other pressure corrector already shares.
 //     tests:     tests/test_inter_peqn_cpp.cu
 //
 // WHAT IS HERE. The laplacian, the solve and the non-orthogonal loop are the machinery brae already has

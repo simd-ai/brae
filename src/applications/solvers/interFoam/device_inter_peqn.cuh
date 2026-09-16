@@ -1,0 +1,101 @@
+#pragma once
+// interFoam's pressure corrector on the device -- the four things that are interFoam's OWN.
+//
+// provenance:
+//   openfoam:  applications/solvers/multiphase/interFoam/pEqn.H:1-89
+//              src/finiteVolume/finiteVolume/ddtSchemes/EulerDdtScheme/EulerDdtScheme.C (fvcDdtPhiCorr)
+//              src/finiteVolume/finiteVolume/ddtSchemes/ddtScheme/ddtScheme.C (fvcDdtPhiCoeff)
+//   host:      src/applications/solvers/interFoam/inter_peqn_cpp.cu -- the ORACLE, gated in
+//              tests/test_inter_peqn_cpp.cu and running end to end at 2.3e-06 relative in p_rgh on
+//              damBreak against real OpenFOAM.
+//   tests:     tests/test_device_inter_peqn.cu
+//
+// The laplacian, the solve and the non-orthogonal loop are machinery brae already has and shares with
+// every other pressure corrector. What is ported here is the four places a port that copies simpleFoam's
+// pEqn -- or interFoam's own UEqn -- is wrong, and each still converges when it is:
+//
+//   1. phig CARRIES NO snGrad(p_rgh), where UEqn's source does. The pressure gradient is EXPLICIT in
+//      the momentum predictor and IMPLICIT here -- it is the laplacian being solved. Carrying it into
+//      phig counts it twice and converges to a flow with the wrong balance at the interface.
+//      deviceBuoyancyFlux takes no p_rgh at all, so the term cannot be passed by accident.
+//
+//   2. ddtCorr IS WEIGHTED BY interpolate(rho*rAU), NOT interpolate(rho)*rAUf. The PRODUCT is formed
+//      per cell and interpolated once. Linear interpolation does not commute with multiplication, and
+//      the gap is largest where the two factors vary most -- across a VoF interface that is a factor of
+//      1000 in a single face.
+//
+//   3. THE VELOCITY CORRECTION DIVIDES BY rAUf INSIDE reconstruct AND MULTIPLIES BY rAU OUTSIDE:
+//          U = HbyA + rAU*fvc::reconstruct((phig - p_rghEqn.flux())/rAUf)
+//      The two forms coincide EXACTLY when rAU is uniform -- which it is on any single-phase fixture
+//      with a uniform mesh -- so a gate built on one cannot tell them apart.
+//
+//   4. THE ddtCorr COEFFICIENT IS A LIMITER BY DEFAULT, NOT A CONSTANT. ddtPhiCoeff_ is -1 unless
+//      fvSchemes says otherwise, selecting 1 - min(|phiCorr|/(|phi| + SMALL), 1) -- the correction is
+//      switched OFF where it is large compared with the flux itself. A constant 1 applies it hardest
+//      where OpenFOAM applies it least. It is also zeroed on every patch where U fixes a value.
+#include "cf_types.cuh"
+#include "device_buffer.cuh"
+#include "device_mesh.cuh"
+
+namespace brae {
+
+// phig = (surfaceTensionForce - ghf*snGrad(rho)) * rAUf * magSf, pEqn.H:28-34. No p_rgh -- see 1.
+// `magSf` and the three face fields are the mesh's FULL face arrays, internal faces first.
+void deviceBuoyancyFlux(
+    int                         n,
+    const DeviceBuffer<scalar>& surfaceTensionForce,
+    const DeviceBuffer<scalar>& ghf,
+    const DeviceBuffer<scalar>& snGradRho,
+    const DeviceBuffer<scalar>& rAUf,
+    const DeviceBuffer<scalar>& magSf,
+    DeviceBuffer<scalar>&       phig);
+
+// fvc::interpolate(rho*rAU) on the internal faces -- the product per cell, interpolated once. See 2.
+void deviceRhoRAUf(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& rho,
+    const DeviceBuffer<scalar>& rAU,
+    DeviceBuffer<scalar>&       out);
+
+// fvc::ddtCorr(U, phi), Euler, fixed mesh. `bndUFixesValue` is 1 on every boundary face whose patch
+// fixes U's value, and the correction is zero there -- see 4. It is passed rather than derived because
+// which patches fix a value is a fact about boundary conditions, and the device mesh carries none.
+void deviceDdtCorr(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& phiOldInt,
+    const DeviceBuffer<scalar>& phiOldBnd,
+    const DeviceBuffer<scalar>& UOldX,
+    const DeviceBuffer<scalar>& UOldY,
+    const DeviceBuffer<scalar>& UOldZ,
+    const DeviceBuffer<int>&    bndUFixesValue,
+    scalar                      ddtPhiCoeff,      // negative selects the limiter -- the default
+    scalar                      deltaT,
+    DeviceBuffer<scalar>&       outInt,
+    DeviceBuffer<scalar>&       outBnd);
+
+// U = HbyA + rAU*fvc::reconstruct((phig - p_rghEqn.flux())/rAUf), pEqn.H:58. `faceFlux` is the
+// difference BEFORE the division; the division happens inside so the two operations cannot be
+// separated at a call site and quietly reordered -- see 3.
+void deviceCorrectVelocity(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& HbyAX,
+    const DeviceBuffer<scalar>& HbyAY,
+    const DeviceBuffer<scalar>& HbyAZ,
+    const DeviceBuffer<scalar>& rAU,
+    const DeviceBuffer<scalar>& faceFluxInt,
+    const DeviceBuffer<scalar>& rAUfInt,
+    const DeviceBuffer<scalar>& faceFluxBnd,
+    const DeviceBuffer<scalar>& rAUfBnd,
+    DeviceBuffer<scalar>&       UX,
+    DeviceBuffer<scalar>&       UY,
+    DeviceBuffer<scalar>&       UZ);
+
+// p = p_rgh + rho*gh, pEqn.H:72 -- the field interFoam writes and never solves.
+void deviceStaticPressure(
+    int                         nC,
+    const DeviceBuffer<scalar>& p_rgh,
+    const DeviceBuffer<scalar>& rho,
+    const DeviceBuffer<scalar>& gh,
+    DeviceBuffer<scalar>&       p);
+
+} // namespace brae

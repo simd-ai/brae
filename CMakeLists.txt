@@ -144,6 +144,7 @@ add_library(brae_core STATIC
     src/applications/solvers/interFoam/device_alpha_subcycle.cu
     src/finiteVolume/finiteVolume/device_fvc_reconstruct.cu
     src/applications/solvers/interFoam/device_inter_ueqn.cu
+    src/applications/solvers/interFoam/device_inter_peqn.cu
     src/applications/solvers/interFoam/inter_ueqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoCreateFields_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoUEqn_cpp.cu
@@ -3097,6 +3098,13 @@ target_include_directories(test_device_alpha_flux PRIVATE ${BRAE_HEADER_DIRS}
 target_link_libraries(test_device_alpha_flux PRIVATE brae_core)
 add_test(NAME device_alpha_flux COMMAND test_device_alpha_flux)
 set_tests_properties(device_alpha_flux PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_device_inter_peqn tests/test_device_inter_peqn.cu)
+target_include_directories(test_device_inter_peqn PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_inter_peqn PRIVATE brae_core)
+add_test(NAME device_inter_peqn COMMAND test_device_inter_peqn)
+set_tests_properties(device_inter_peqn PROPERTIES SKIP_RETURN_CODE 77)
 
 add_executable(test_device_inter_ueqn tests/test_device_inter_ueqn.cu)
 target_include_directories(test_device_inter_ueqn PRIVATE ${BRAE_HEADER_DIRS}

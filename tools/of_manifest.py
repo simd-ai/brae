@@ -1732,7 +1732,14 @@ COMPONENTS = {
              brae_target="src/applications/solvers/interFoam/device_inter_peqn.cu",
              validation="tests/test_inter_peqn_cpp.cu covers the four parts that are interFoam's own; the "
                         "laplacian, the solve and the non-orthogonal loop are shared machinery gated "
-                        "elsewhere.",
+                        "elsewhere. ON THE DEVICE, tests/test_device_inter_peqn.cu: all four bit-identical "
+                        "to the host, each beside its own wrong version on a fixture built to make that "
+                        "version wrong -- rAU = dt/rho so the interface carries a 1000x jump. Carrying "
+                        "snGrad(p_rgh) into phig moves it by 1.4e+02 of 1.3e+02; "
+                        "interpolate(rho)*interpolate(rAU) is 2.5e-01 where the true product is dt = "
+                        "1.0e-03 exactly, i.e. 250x; reconstruct without the rAUf division is 8.7e-01 out "
+                        "in U; and a constant ddtCorr coefficient instead of the limiter is 1.5e+02 of "
+                        "4.0e+02, while the real one is 0.000e+00 on every value-fixing patch.",
              note="rAU = 1/UEqn.A(), phiHbyA, the p_rgh laplacian, then U and phi rebuilt. Four things "
                   "are not shared with any other pressure corrector. (1) phig carries NO snGrad(p_rgh) "
                   "where UEqn's source does -- the pressure gradient is explicit there and IMPLICIT "
