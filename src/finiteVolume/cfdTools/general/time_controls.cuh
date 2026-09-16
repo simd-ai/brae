@@ -30,6 +30,8 @@
 #include "foam_dict.cuh"
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace brae {
@@ -125,6 +127,104 @@ inline scalar setDeltaT(scalar deltaT, scalar CoNum, const TimeControls& tc)
     const scalar maxDeltaTFact = tc.maxCo/(CoNum + kSmall);
     const scalar deltaTFact = std::min(std::min(maxDeltaTFact, scalar(1) + scalar(0.1)*maxDeltaTFact), scalar(1.2));
     return std::min(deltaTFact*deltaT, tc.maxDeltaT);
+}
+
+// ---------------------------------------------------------------------------------------------------
+// THE VoF ADDITION: a SECOND Courant number, computed only where the interface is.
+//
+//   provenance: applications/solvers/multiphase/VoF/alphaCourantNo.H:34-54
+//               src/transportModels/interfaceProperties/interfaceProperties.C:244-248 (nearInterface)
+//               applications/solvers/multiphase/VoF/setDeltaT.H:36-53
+//
+// WHY A SECOND ONE AT ALL. The ordinary Courant number is a global maximum over every cell, so it is
+// set by whatever corner of the domain has the fastest flow -- usually far from the interface. A VoF
+// interface has its own, much tighter stability limit, and MULES does not protect against advecting it
+// more than a cell per step. interFoam therefore limits the step by BOTH, and the shipped tutorials
+// almost always set maxAlphaCo equal to or below maxCo (0.65/0.65 in 12 of them, 0.5/0.5 in 10).
+//
+// FOUR THINGS TO GET RIGHT:
+//
+// 1. maxAlphaCo IS MANDATORY. alphaCourantNo.H reads it with get<scalar> -- no default -- where
+//    readTimeControls.H gives maxCo a default of 1. A case that turns on adjustTimeStep for interFoam
+//    and omits maxAlphaCo is a FatalError, and defaulting it would run the interface unconstrained.
+//
+// 2. nearInterface() IS A 0/1 MASK, NOT A WEIGHT: pos0(alpha1 - 0.01)*pos0(0.99 - alpha1). pos0 is 1
+//    at exactly zero, so the band is the CLOSED interval [0.01, 0.99]. A smooth weight, or pos instead
+//    of pos0, changes which cells are counted at the edges of the band.
+//
+// 3. WITH NO INTERFACE THE ALPHA COURANT NUMBER IS ZERO, and the step is then limited by maxCo alone
+//    -- maxAlphaCo/(0 + SMALL) is astronomically large and the min picks the other branch. That is
+//    correct and it matters: a case that has not yet developed an interface must not be throttled.
+//
+// 4. THE TWO LIMITS COMBINE INSIDE maxDeltaTFact, BEFORE THE DAMPING:
+//        maxDeltaTFact = min(maxCo/(CoNum + SMALL), maxAlphaCo/(alphaCoNum + SMALL))
+//    and the 1.2 cap and the `1 + 0.1*maxDeltaTFact` growth damping are applied to that combined
+//    value. Damping each separately and then taking the min is not the same number.
+
+struct VoFTimeControls
+{
+    TimeControls base;
+    scalar       maxAlphaCo = 0;     // MANDATORY -- see note 1
+
+    static VoFTimeControls read(const FoamDict& controlDict)
+    {
+        VoFTimeControls tc;
+        tc.base = TimeControls::read(controlDict);
+        // get<scalar>, not getOrDefault: alphaCourantNo.H:34-37.
+        tc.maxAlphaCo = controlDict.scalarOr("maxAlphaCo", scalar(-1));
+        if (tc.base.adjustTimeStep && tc.maxAlphaCo < 0)
+            throw std::runtime_error(
+                "brae interFoam: controlDict sets `adjustTimeStep` but has no `maxAlphaCo`. OpenFOAM "
+                "reads it with get<scalar> and has NO default (alphaCourantNo.H:34-37), unlike maxCo "
+                "which defaults to 1. Defaulting it here would advance the interface with no limit of "
+                "its own, which is the one thing the second Courant number exists to prevent.");
+        return tc;
+    }
+};
+
+// nearInterface() = pos0(alpha1 - 0.01)*pos0(0.99 - alpha1) -- interfaceProperties.C:244-248.
+// A 0/1 mask over the CLOSED band [0.01, 0.99]; pos0 is 1 at exactly zero, so both ends are included.
+inline std::vector<scalar> nearInterface(const std::vector<scalar>& alpha1)
+{
+    std::vector<scalar> mask(alpha1.size());
+    for (std::size_t c = 0; c < alpha1.size(); ++c)
+    {
+        const scalar lo = alpha1[c] - scalar(0.01);
+        const scalar hi = scalar(0.99) - alpha1[c];
+        mask[c] = ((lo >= scalar(0)) ? scalar(1) : scalar(0))
+                * ((hi >= scalar(0)) ? scalar(1) : scalar(0));
+    }
+    return mask;
+}
+
+// alphaCourantNo.H:42-54 -- the ordinary Courant formula with sumPhi masked to the interface band.
+// Shares courantNo() rather than repeating it: the ONLY difference between the two is the mask, and
+// writing the formula twice is two chances for the 0.5 or the gSum-of-ratios to drift apart.
+inline CourantNumbers alphaCourantNo(
+    const std::vector<scalar>& sumPhi,      // surfaceSum(mag(phi)), per cell
+    const std::vector<scalar>& alpha1,
+    const std::vector<scalar>& V,
+    scalar                     deltaT)
+{
+    const std::vector<scalar> mask = nearInterface(alpha1);
+    std::vector<scalar> masked(sumPhi.size());
+    for (std::size_t c = 0; c < sumPhi.size() && c < mask.size(); ++c) masked[c] = mask[c]*sumPhi[c];
+    // NOTE the denominators are NOT masked: meanAlphaCoNum is gSum(maskedPhi)/gSum(V), over the WHOLE
+    // mesh volume, not over the interface cells' volume. It is a domain-average of an interface
+    // quantity and reads small; the max is what limits the step.
+    return courantNo(masked, V, deltaT);
+}
+
+// VoF setDeltaT.H:36-53. Both limits enter maxDeltaTFact BEFORE the damping -- see note 4.
+inline scalar setDeltaTVoF(scalar deltaT, scalar CoNum, scalar alphaCoNum, const VoFTimeControls& tc)
+{
+    if (!tc.base.adjustTimeStep) return deltaT;
+    const scalar kSmall = 1.0e-37;
+    const scalar maxDeltaTFact = std::min(tc.base.maxCo/(CoNum + kSmall),
+                                          tc.maxAlphaCo/(alphaCoNum + kSmall));
+    const scalar deltaTFact =
+        std::min(std::min(maxDeltaTFact, scalar(1) + scalar(0.1)*maxDeltaTFact), scalar(1.2));
+    return std::min(deltaTFact*deltaT, tc.base.maxDeltaT);
 }
 
 }   // namespace brae

@@ -3118,6 +3118,16 @@ target_include_directories(test_inter_peqn_cpp PRIVATE ${BRAE_HEADER_DIRS}
 target_link_libraries(test_inter_peqn_cpp PRIVATE brae_core)
 add_test(NAME inter_peqn_cpp COMMAND test_inter_peqn_cpp)
 
+# interFoam step 11: the SECOND Courant number and the time step that shares it. maxAlphaCo is
+# MANDATORY where maxCo defaults to 1 -- the same controlDict is refused by one reader and not the
+# other -- and nearInterface() is a 0/1 mask over the CLOSED band [0.01, 0.99], so the two cells at its
+# edges are the ones an advancing interface is passing through.
+add_executable(test_alpha_courant_cpp tests/test_alpha_courant_cpp.cu)
+target_include_directories(test_alpha_courant_cpp PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_alpha_courant_cpp PRIVATE brae_core)
+add_test(NAME alpha_courant_cpp COMMAND test_alpha_courant_cpp)
+
 # These five read damBreak's own dictionaries. A box without OpenFOAM must SKIP, not report green: the
 # arms silently stopped running the moment $FOAM_TUTORIALS was empty, and nothing said so.
 set_tests_properties(two_phase_mixture interface_properties inter_create_fields

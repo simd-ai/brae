@@ -1574,11 +1574,25 @@ COMPONENTS = {
         dict(name="interFoam_CMULES", of_symbol="MULES::correct",
              of_file="src/finiteVolume/fvMatrices/solvers/MULES/CMULESTemplates.C",
              classification="SHARED_NUMERICAL", status="REIMPLEMENT",
-             brae_reference="src/finiteVolume/fvMatrices/solvers/MULES/mules_cpp.cu",
+             brae_reference="src/finiteVolume/fvMatrices/solvers/MULES/mules_cpp.cuh",
              brae_target="src/finiteVolume/fvMatrices/solvers/MULES/device_mules.cu",
-             validation="Shares the MULES gate; the semi-implicit path is a separate arm of it.",
-             note="The semi-implicit variant, used when MULESCorr is set. Separate from the explicit limiter "
-                  "above and selected per case."),
+             validation="tests/test_mules_cpp.cu arm 7. Shares the boundedness oracle; the four structural "
+                        "differences from the explicit path are asserted one by one, each with its own "
+                        "fail-proof.",
+             note="The semi-implicit variant, `MULESCorr yes` -- 13 of the 44 shipped tutorials, damBreak "
+                  "included. With it the upwind part of the alpha equation goes through an implicit "
+                  "MATRIX, so by the time CMULES runs psi is ALREADY advanced and only the antidiffusive "
+                  "correction is left. Four consequences, all of them places a port that reuses the "
+                  "explicit code is quietly wrong. (A) correct() uses the CURRENT rho and psi, not their "
+                  "oldTime values: with a zero correction it is the identity, where the explicit form "
+                  "would hand back psi.oldTime() and undo the implicit solve -- bounded, so a "
+                  "boundedness gate never notices, the interface just moves at the wrong speed. (B) the "
+                  "budget transform carries NO sumPhiBD, because there is no donor flux. (C) uncoupled "
+                  "boundary faces ARE limited, but outlets only, and `outlet` means phi + phiCorr > "
+                  "SMALL*SMALL -- the TOTAL, so an inflow face whose correction reverses it is limited "
+                  "like any other. (D) nLimiterIter is get<label> with NO DEFAULT here where the "
+                  "explicit limiter defaults it to 3, so the same dictionary is accepted by one reader "
+                  "and refused by the other."),
         dict(name="interFoam_interfaceProperties", of_symbol="interfaceProperties",
              of_file="src/transportModels/interfaceProperties/interfaceProperties.C",
              classification="MODEL", status="REIMPLEMENT",
@@ -1623,12 +1637,23 @@ COMPONENTS = {
         dict(name="interFoam_pEqn", of_symbol="pEqn",
              of_file="applications/solvers/multiphase/interFoam/pEqn.H",
              classification="SHARED_NUMERICAL", status="REIMPLEMENT",
-             brae_reference="src/applications/solvers/interFoam/interPEqn_cpp.cu",
-             brae_target="src/applications/solvers/interFoam/interPEqn.cu",
-             validation="Against OpenFOAM's own p_rgh matrix and the reconstructed flux.",
-             note="A DIFFERENT PRESSURE EQUATION from anything ported: laplacian(rAUf, p_rgh) == div(phiHbyA), "
-                  "with phig = (surfaceTensionForce() - ghf*snGrad(rho))*rAUf*magSf added to phiHbyA first. "
-                  "p_rgh, not p. constrainHbyA/adjustPhi/constrainPressure are already ported and reused."),
+             brae_reference="src/applications/solvers/interFoam/inter_peqn_cpp.cuh",
+             brae_target="src/applications/solvers/interFoam/device_inter_peqn.cu",
+             validation="tests/test_inter_peqn_cpp.cu covers the four parts that are interFoam's own; the "
+                        "laplacian, the solve and the non-orthogonal loop are shared machinery gated "
+                        "elsewhere.",
+             note="rAU = 1/UEqn.A(), phiHbyA, the p_rgh laplacian, then U and phi rebuilt. Four things "
+                  "are not shared with any other pressure corrector. (1) phig carries NO snGrad(p_rgh) "
+                  "where UEqn's source does -- the pressure gradient is explicit there and IMPLICIT "
+                  "here, and carrying it twice still converges, to the wrong balance at the interface. "
+                  "(2) ddtCorr is weighted by interpolate(rho*rAU), the PRODUCT interpolated once, not "
+                  "by interpolate(rho)*rAUf: rAU is of order dt/rho, so the two factors jump opposite "
+                  "ways across the interface and the rival form is 250x out there while agreeing "
+                  "exactly on any single-phase fixture. (3) the velocity correction divides by rAUf "
+                  "INSIDE reconstruct and multiplies by rAU outside -- identical for a uniform rAU, "
+                  "which is every easy fixture. (4) when p_rgh has no value-fixing patch, p is shifted "
+                  "AND p_rgh is rebuilt from the shifted p; damBreak's totalPressure atmosphere hides "
+                  "this, 8 shipped tutorials do not."),
         dict(name="interFoam_vanLeer", of_symbol="vanLeer",
              of_file="src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/vanLeer/vanLeer.C",
              classification="SHARED_NUMERICAL", status="REIMPLEMENT",
@@ -1643,11 +1668,24 @@ COMPONENTS = {
         dict(name="interFoam_alphaCourantNo", of_symbol="alphaCourantNo",
              of_file="applications/solvers/multiphase/VoF/alphaCourantNo.H",
              classification="CONFIGURATION", status="REIMPLEMENT",
-             brae_reference="src/applications/solvers/interFoam/interFoam_cpp.cu",
-             brae_target="src/applications/solvers/interFoam/interFoam.cu",
-             validation="Part of the end-to-end tutorial gate; the interface Courant number sets the step.",
-             note="maxAlphaCo drives the adaptive time step alongside maxCo. Needs adjustTimeStep, which "
-                  "brae_pimpleFoam refuses today."),
+             brae_reference="src/finiteVolume/cfdTools/general/time_controls.cuh",
+             brae_target="src/finiteVolume/cfdTools/general/time_controls.cuh",
+             validation="tests/test_alpha_courant_cpp.cu. Four fail-proofs: defaulting maxAlphaCo, "
+                        "pos for pos0, masking the mean's denominator, and dropping the alpha limit "
+                        "from setDeltaT.",
+             note="A SECOND Courant number, over the interface cells only, because the ordinary one is a "
+                  "global max set by whatever corner runs fastest -- usually nowhere near the "
+                  "interface -- and MULES does not stop the interface being advected more than a cell "
+                  "per step. Landed alongside the existing time_controls, which already gives every "
+                  "transient solver CourantNo/setInitialDeltaT/setDeltaT (brae_pimpleFoam stopped "
+                  "refusing adjustTimeStep when that landed). Four things: maxAlphaCo is get<scalar> "
+                  "with NO default where maxCo defaults to 1, so the same controlDict is refused by "
+                  "one reader and not the other; nearInterface() is a 0/1 MASK over the CLOSED band "
+                  "[0.01, 0.99] (pos0 is 1 at exactly zero), so the two cells at its edges -- the ones "
+                  "an advancing interface is passing through -- are counted; meanAlphaCoNum divides by "
+                  "gSum(V) over the WHOLE mesh, not the interface volume; and with no interface "
+                  "alphaCoNum is exactly 0 so maxAlphaCo/(0+SMALL) lets maxCo alone set the step, "
+                  "which a differently-guarded division would turn into a freeze."),
         dict(name="interFoam_createFields", of_symbol="createFields",
              of_file="applications/solvers/multiphase/interFoam/createFields.H",
              classification="CONFIGURATION", status="REIMPLEMENT",
