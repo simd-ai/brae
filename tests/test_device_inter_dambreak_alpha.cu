@@ -413,9 +413,15 @@ int main(int argc, char** argv)
           for (label c = 0; c < nC; ++c) a2[c] = scalar(1) - dv.alpha1.internal[c];
           brae::cpu::twoPhase::mixtureNu(dv.alpha1.internal, a2, dv.mixture.phases, nuv);
           nuC.copyFrom(nuv);
-          std::vector<scalar> nb;
+          // nuEff AT ALPHA'S PATCH VALUES, not at the face cell's -- the same rule the boundary rho
+          // follows, and for the same reason: at a contact-angle wall they are different fields.
+          std::vector<scalar> nb, abv;
           for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-            for (label i = 0; i < fvp[pi].size; ++i) nb.push_back(nuv[fvp[pi].faceCells[i]]);
+          { const std::vector<scalar>& v = dv.alpha1.boundary[pi]->value();
+            abv.insert(abv.end(), v.begin(), v.end()); }
+          { std::vector<scalar> ab2(abv.size());
+            for (std::size_t i = 0; i < abv.size(); ++i) ab2[i] = scalar(1) - abv[i];
+            brae::cpu::twoPhase::mixtureNu(abv, ab2, dv.mixture.phases, nb); }
           nuB.copyFrom(nb);
           snP.resize(0); };
         H.pressure.pressureCoeffs =
@@ -563,10 +569,21 @@ int main(int argc, char** argv)
                 { std::vector<scalar> a2o(static_cast<std::size_t>(nC));
                   for (label c = 0; c < nC; ++c) a2o[c] = scalar(1) - warmAlpha[c];
                   brae::cpu::twoPhase::mixtureRho(warmAlpha, a2o, dv.mixture.phases, rhoOldH); }
+                // the host reference's boundary mixture, from ALPHA'S PATCH VALUES too -- InterFields
+                // builds rhoBnd/nuBnd that way and it was worth 12.8% on capillaryRise.
                 for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-                  for (label i = 0; i < fvp[pi].size; ++i)
-                  { rhoBndH[pi].push_back(devRho[fvp[pi].faceCells[i]]);
-                    nuBndH[pi].push_back(nuH[fvp[pi].faceCells[i]]); }
+                {
+                    const std::vector<scalar>& av = dv.alpha1.boundary[pi]->value();
+                    for (label i = 0; i < fvp[pi].size; ++i)
+                    {
+                        const scalar a1b = av[i];
+                        const scalar a2b = scalar(1) - a1b;
+                        rhoBndH[pi].push_back(a1b*dv.mixture.phases.rho1 + a2b*dv.mixture.phases.rho2);
+                        std::vector<scalar> one{a1b}, two{a2b}, outv;
+                        brae::cpu::twoPhase::mixtureNu(one, two, dv.mixture.phases, outv);
+                        nuBndH[pi].push_back(outv[0]);
+                    }
+                }
 
                 std::vector<vector> UOldH(static_cast<std::size_t>(nC));
                 for (label c = 0; c < nC; ++c) UOldH[c] = vector{x0[c], y0[c], z0[c]};
@@ -606,6 +623,57 @@ int main(int argc, char** argv)
                     sS = std::fmax(sS, std::fabs(hUEqn.source[c].x));
                 }
                 std::printf("  [taps vs host] UEqn.source.x %.4e of %.4e\n", (double)wS, (double)sS);
+
+                // BISECT THE SOURCE. Assemble the host matrix again with the viscosity ZEROED: the
+                // ddt source and the relax contribution survive, the explicit dev2(T(grad U)) term
+                // does not. If the device's own zero-viscosity source then agrees, the gap is the
+                // dev2 term; if it does not, it is the ddt or the relax.
+                {
+                    std::vector<scalar> zeroNu(static_cast<std::size_t>(nC), scalar(0));
+                    std::vector<std::vector<scalar>> zeroNuB(fvp.size());
+                    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                        zeroNuB[pi].assign(static_cast<std::size_t>(fvp[pi].size), scalar(0));
+                    InterMomentumInput hm0 = hm;
+                    hm0.nuEff = &zeroNu;
+                    hm0.nuEffBnd = &zeroNuB;
+                    const FvVectorMatrix h0 = assembleUEqn(Uh2, hm0, m, g, fvp);
+
+                    DeviceInterStepTaps t0;
+                    DeviceInterStepControls C0 = C;
+                    DeviceBuffer<scalar> b1(warmAlpha), b1o(warmAlpha);
+                    DeviceBuffer<scalar> vx(x0), vy(y0), vz(z0), vox(x0), voy(y0), voz(z0);
+                    DeviceBuffer<scalar> qI(dv.phi.internal), qB(flatten(dv.phi.boundary));
+                    DeviceBuffer<scalar> qOI(dv.phi.internal), qOB(flatten(dv.phi.boundary));
+                    DeviceBuffer<scalar> qr(dv.p_rgh.internal), qp;
+                    DeviceBuffer<scalar> qn(dv.nHatf.internal), qnb(flatten(dv.nHatf.boundary));
+                    DeviceBuffer<scalar> qab(pv2(dv.alpha1)), qk(dv.K);
+                    DeviceBuffer<scalar> qrho, qmu, qnu, qri, qrb;
+                    DeviceVectorBoundary db0 = buildDeviceVectorBoundary(dv.U, fvp, g);
+                    // the hook that zeroes nuEff on the device side too
+                    DeviceInterStepHooks H0 = H;
+                    H0.interfaceForces =
+                        [&](const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& Kd,
+                            const DeviceBuffer<scalar>& rd, DeviceBuffer<scalar>& stf,
+                            DeviceBuffer<scalar>& snRho, DeviceBuffer<scalar>& nuC,
+                            DeviceBuffer<scalar>& nuB, DeviceBuffer<scalar>& snP)
+                    { H.interfaceForces(a, Kd, rd, stf, snRho, nuC, nuB, snP);
+                      nuC.copyFrom(std::vector<scalar>(static_cast<std::size_t>(nC), scalar(0)));
+                      nuB.copyFrom(std::vector<scalar>(static_cast<std::size_t>(nBf), scalar(0))); };
+                    deviceInterStep(dm, dt, C0, pr2, H0, Gh, Ghf, MagSf, b1, b1o, vx, vy, vz,
+                                    vox, voy, voz, qI, qB, qOI, qOB, dUFixes, qr, qp, qn, qnb,
+                                    qab, qk, dFixes, dFlag, db0, qrho, qmu, qnu, qri, qrb, &t0);
+                    cudaDeviceSynchronize();
+                    std::vector<scalar> s0;
+                    t0.UEqnSourceX.copyTo(s0);
+                    scalar w0 = 0, x0s = 0;
+                    for (label c = 0; c < nC; ++c)
+                    {
+                        w0  = std::fmax(w0, std::fabs(s0[c] - h0.source[c].x));
+                        x0s = std::fmax(x0s, std::fabs(h0.source[c].x));
+                    }
+                    std::printf("  [bisect] with nuEff ZEROED: source.x %.4e of %.4e\n",
+                                (double)w0, (double)x0s);
+                }
 
                 scalar wR = 0, sR = 0, wH = 0, sH = 0, wD = 0, sD = 0;
                 for (label c = 0; c < nC; ++c)

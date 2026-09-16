@@ -83,6 +83,13 @@ struct MomentumInput
     // interFoam's fvm::ddt(rho, U), Euler: rho on the DIAGONAL and rho.oldTime() in the SOURCE, which
     // at a VoF interface differ by a factor of 1000. Added BEFORE relax(), as the matrix constructor's
     // `+` does. All null means a steady equation, which is what simpleFoam has.
+    // U's STORED boundary values, one buffer per component. OF's fvc::grad(U) inside
+    // linearViscousStress reads U.boundaryField() -- the value the LAST evaluate left -- and does not
+    // re-derive it. Null makes deviceDivDevReff re-derive with deviceBCValue, which is the same number
+    // only while the caller evaluates U's boundary the same way; at a flux-conditional patch like
+    // damBreak's pressureInletOutletVelocity atmosphere it is not.
+    const DeviceBuffer<scalar>* const* UbStored = nullptr;
+
     const DeviceBuffer<scalar>* ddtRho    = nullptr;
     const DeviceBuffer<scalar>* ddtRhoOld = nullptr;
     const DeviceBuffer<scalar>* ddtUOld[3] = {nullptr, nullptr, nullptr};

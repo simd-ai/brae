@@ -154,7 +154,7 @@ void assembleUEqn(
     // (it computes -div(sigma) per volume and then subtracts it times V). So this is the source, directly.
     deviceDivDevReff(dm, dbU, Ux, Uy, Uz, *in.nuEffCell, *in.nuEffBndFace,
                      M.source[0], M.source[1], M.source[2],
-                     /*cyc*/nullptr, /*ami*/nullptr, /*proc*/nullptr, /*UbStored*/nullptr,
+                     /*cyc*/nullptr, /*ami*/nullptr, /*proc*/nullptr, in.UbStored,
                      // The gradSchemes `grad(U)` entry, which linearViscousStress.C:114's fvc::grad(U)
                      // resolves. These five arguments fell through to their defaults, so the case's
                      // limiter never reached the dev2 term on this driver -- the legacy one has passed

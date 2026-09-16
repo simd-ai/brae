@@ -127,9 +127,18 @@ void deviceInterStep(
     // ---- 3. THE MOMENTUM MATRIX -------------------------------------------------------------------
     hooks.updateUBoundary(UX, UY, UZ, dbU);
 
+    // THE BOUNDARY MIXTURE COMES FROM ALPHA'S PATCH VALUES, not from the face cell's. Those are
+    // different fields at a contact-angle wall -- alpha's patch value is patchInternalField +
+    // gradient/deltaCoeffs, and the contact angle's gradient is what pulls the interface up it. Taking
+    // the cell value instead gives an AIR viscosity on a face the interface has climbed, and
+    // divDevRhoReff's laplacian is built from exactly that. Measured on capillaryRise against
+    // OpenFOAM's own UEqn.A(): exact in all 3200 water cells, up to 56% low in the air cells AT THE
+    // WALL, which is where the contact line is. deviceMixtureCorrect is the same fused kernel the
+    // cells use, applied to the patch values.
     DeviceBuffer<scalar> rhoBnd(static_cast<std::size_t>(nBf));
     if (nBf > 0)
-        deviceGatherBoundary(dm, rho, rhoBnd);
+        deviceMixtureCorrect(alpha1Bnd.data(), nBf, props,
+                             nullptr, rhoBnd.data(), nullptr, nullptr);
 
     DeviceBuffer<scalar> muCell, muFace, muBndFace;
     deviceInterMuEff(dm, rho, nuEffCell, rhoBnd, nuEffBnd, muCell, muFace, muBndFace);
@@ -143,6 +152,13 @@ void deviceInterStep(
         rhoOld.resize(static_cast<std::size_t>(nC));
         deviceMixtureCorrect(alpha1Old.data(), nC, props, nullptr, rhoOld.data(), nullptr, nullptr);
     }
+
+    // U's stored boundary values, per component, for fvc::grad(U) inside divDevRhoReff.
+    DeviceBuffer<scalar> ubx, uby, ubz;
+    deviceBCValue(dbU.comp[0], UX, ubx);
+    deviceBCValue(dbU.comp[1], UY, uby);
+    deviceBCValue(dbU.comp[2], UZ, ubz);
+    const DeviceBuffer<scalar>* ubPtr[3] = {&ubx, &uby, &ubz};
 
     gpu::MomentumInput uin;
     uin.phiInt        = &rhoPhiInt;        // the MASS flux out of the alpha equation
@@ -159,6 +175,7 @@ void deviceInterStep(
     uin.ddtUOld[1]    = &UOldY;
     uin.ddtUOld[2]    = &UOldZ;
     uin.ddtDeltaT     = deltaT;
+    uin.UbStored      = ubPtr;
 
     probe("muCell", muCell);
     probe("muFace", muFace);
