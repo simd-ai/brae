@@ -19,6 +19,7 @@
 #include "interface_properties_cpp.cuh"
 #include "fvc.cuh"
 #include <algorithm>
+#include <cstdlib>
 
 namespace brae {
 namespace cpu {
@@ -284,12 +285,38 @@ void calculateK(const GeometricField<scalar>& alpha1,
 
         std::vector<vector> nb;
         faceUnitNormal(gb, dN, nb);
-        if (!c.contactAngleDeg.empty() && pi < c.contactAngleDeg.size()
-            && c.contactAngleDeg[pi] >= scalar(0))
+
+        // correctContactAngle, on every patch that IS one. The patch itself carries theta0 -- brae's
+        // ConstantAlphaContactAnglePatchField returns it from contactAngleTheta0() -- so the dispatch
+        // is the same question OpenFOAM asks (isA<alphaContactAngleTwoPhaseFvPatchScalarField>) and
+        // there is no parallel list to keep in step with the boundary conditions.
+        // BRAE_NO_CONTACT_ANGLE is the gate's CONTROL, not a user switch: capillaryRise's whole
+        // motion comes from this correction, and tests/test_inter_capillary_vs_openfoam.cu turns it
+        // off to show that -- without it brae's velocity is 200x too small, not 10% off.
+        const scalar theta0 = std::getenv("BRAE_NO_CONTACT_ANGLE")
+                            ? scalar(-1) : alpha1.boundary[pi]->contactAngleTheta0();
+        if (theta0 >= scalar(0))
         {
             const std::vector<scalar> th(static_cast<std::size_t>(q.size),
-                                         c.contactAngleDeg[pi] * scalar(M_PI) / scalar(180));
+                                         theta0 * scalar(M_PI) / scalar(180));
             correctContactAngle(nb, q.nf, th, dN);
+
+            // ...AND THE PATCH'S OWN GRADIENT IS WRITTEN BACK (interfaceProperties.C:97):
+            //     acap.gradient() = (nf & nHatp)*mag(gradAlphaf[patchi]);  acap.evaluate();
+            // The contact angle does not only bend the normal the curvature is built from -- it sets
+            // alpha's WALL GRADIENT, and therefore the next gradient of alpha, and therefore where the
+            // interface meets the wall at all. A port that corrected nHat and stopped would wet the
+            // wall identically whatever theta0 said.
+            const std::vector<scalar> gr = contactAngleGradient(nb, q.nf, gb);
+            auto* fg = dynamic_cast<FixedGradientPatchField<scalar>*>(
+                const_cast<fvPatchField<scalar>*>(alpha1.boundary[pi].get()));
+            if (!fg)
+                throw std::runtime_error(
+                    "brae interfaceProperties: patch '" + q.name + "' reports a contact angle but is "
+                    "not a fixedGradient patch, so its wall gradient cannot be set. OpenFOAM's "
+                    "alphaContactAngle derives from fixedGradient for exactly this reason.");
+            fg->setGradient(gr);
+            const_cast<GeometricField<scalar>&>(alpha1).boundary[pi]->evaluate(alpha1.internal);
         }
         nHatf.boundary[pi].resize(static_cast<std::size_t>(q.size));
         for (label i = 0; i < q.size; ++i)

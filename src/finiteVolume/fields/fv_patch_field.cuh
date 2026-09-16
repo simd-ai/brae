@@ -68,6 +68,12 @@ public:
     virtual bool assignable() const { return true; }
     // constrainPressure's dispatch (OF: isA<updateablePatchTypes::updateableSnGrad>, constrainPressure.C:62).
     // Only fixedFluxPressure overrides; the setter on anything else is a wiring error, not a no-op.
+    // alphaContactAngle: theta0 in DEGREES, or < 0 on any other patch. interfaceProperties'
+    // correctContactAngle finds its patches through this rather than through a dynamic_cast, so a
+    // second contact-angle model (dynamic, temperature-dependent) is a new return value here and not
+    // a new branch at every call site.
+    virtual scalar contactAngleTheta0() const { return scalar(-1); }
+
     virtual bool updateableSnGrad() const { return false; }
     virtual void updateSnGrad(const std::vector<T>&)
     {
@@ -882,6 +888,87 @@ private:
 // It replaced a silent factory mapping to zeroGradient that the OF-mirror envelopes had to refuse
 // around by substring. evaluate() stays unguarded on purpose: OF evaluates the construction-time
 // gradient (the file's, or zero) before any solve, and so must brae's evaluateBoundary passes.
+// constantAlphaContactAngle (OF alphaContactAngleTwoPhaseFvPatchScalarField + constantAlphaContactAngle):
+// a fixedGradient alpha whose gradient interfaceProperties::correctContactAngle sets every curvature
+// evaluation, exactly as constrainPressure sets fixedFluxPressure's. The BC itself carries no formula
+// beyond theta0 and the LIMIT.
+//
+// THE LIMIT IS FOUR DIFFERENT evaluate() BODIES, not a safety net
+// (alphaContactAngleTwoPhaseFvPatchScalarField.C:~150):
+//
+//   gradient      cap the gradient so the face value it implies stays in [0,1], BEFORE evaluating
+//   zeroGradient  discard the contact angle's gradient entirely at evaluation time
+//   alpha         evaluate, then clamp the resulting face VALUE
+//   none          neither
+//
+// capillaryRise -- the only shipped tutorial with a contact angle -- says `limit gradient`. Defaulting
+// to `none` would run the same theta0 through a different boundary, and the difference shows up as
+// alpha creeping outside [0,1] at the wall, which reads as a MULES failure a long way from here.
+//
+// NOTE the limiter uses `*this` -- the patch value as it stands, from the PREVIOUS evaluation -- and
+// not patchInternalField(). That is OpenFOAM's own expression and it is transcribed rather than
+// tidied, because the two differ on the first evaluation of every step.
+class ConstantAlphaContactAnglePatchField : public FixedGradientPatchField<scalar>
+{
+public:
+    enum class Limit { none, gradient, zeroGradient, alpha };
+
+    ConstantAlphaContactAnglePatchField(const FvPatch& p, scalar theta0Deg, const std::string& limitWord,
+                                        bool uniform, scalar v, const std::vector<scalar>& vs)
+        : FixedGradientPatchField<scalar>(p, true, scalar(0), std::vector<scalar>{}),
+          theta0_(theta0Deg), limit_(parseLimit(limitWord, p.name))
+    {
+        // `value` seeds the patch value; the gradient starts at zero and is written by
+        // correctContactAngle before it is ever used.
+        this->value_.assign(static_cast<std::size_t>(p.size), scalar(0));
+        for (label i = 0; i < p.size; ++i)
+            this->value_[static_cast<std::size_t>(i)] =
+                uniform ? v : (static_cast<std::size_t>(i) < vs.size() ? vs[static_cast<std::size_t>(i)] : scalar(0));
+    }
+
+    scalar contactAngleTheta0() const override { return theta0_; }
+
+    void evaluate(const std::vector<scalar>& internal) override
+    {
+        const std::vector<scalar>& dc = this->patch_.deltaCoeffs;
+        if (limit_ == Limit::gradient)
+        {
+            for (std::size_t i = 0; i < this->grad_.size(); ++i)
+            {
+                const scalar implied = this->value_[i] + this->grad_[i]/dc[i];
+                const scalar clamped = implied < scalar(0) ? scalar(0)
+                                     : (implied > scalar(1) ? scalar(1) : implied);
+                this->grad_[i] = dc[i] * (clamped - this->value_[i]);
+            }
+        }
+        else if (limit_ == Limit::zeroGradient)
+        {
+            std::fill(this->grad_.begin(), this->grad_.end(), scalar(0));
+        }
+
+        FixedGradientPatchField<scalar>::evaluate(internal);
+
+        if (limit_ == Limit::alpha)
+            for (scalar& v : this->value_)
+                v = v < scalar(0) ? scalar(0) : (v > scalar(1) ? scalar(1) : v);
+    }
+
+private:
+    static Limit parseLimit(const std::string& w, const std::string& patchName)
+    {
+        if (w.empty() || w == "none")     return Limit::none;
+        if (w == "gradient")              return Limit::gradient;
+        if (w == "zeroGradient")          return Limit::zeroGradient;
+        if (w == "alpha")                 return Limit::alpha;
+        throw std::runtime_error(
+            "brae: patch '" + patchName + "' is constantAlphaContactAngle with `limit " + w +
+            "`, which is not one of none/gradient/zeroGradient/alpha.");
+    }
+
+    scalar theta0_;
+    Limit  limit_;
+};
+
 class FixedFluxPressurePatchField : public FixedGradientPatchField<scalar>
 {
 public:
@@ -2035,6 +2122,19 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
     // same relation from the other side. This exists so a gate can read the `he` OpenFOAM WROTE --
     // test_rho_eeqn_cpp refused angledDuct with `unsupported BC type 'fixedEnergy'` and could not run on
     // any case whose inlet fixes a temperature, which is most of them.
+    if constexpr (std::is_same_v<T, scalar>)
+    {
+        if (d.type == "constantAlphaContactAngle")
+        {
+            if (d.contactTheta0 < scalar(0))
+                throw std::runtime_error(
+                    "brae: patch " + p.name + " is constantAlphaContactAngle but has no `theta0`. "
+                    "OpenFOAM reads it with get<scalar> and has no default; a contact angle nobody "
+                    "chose would set the wall's wetting behaviour.");
+            return std::make_unique<ConstantAlphaContactAnglePatchField>(
+                p, d.contactTheta0, d.contactLimit, d.valueUniform, d.uniformValue, d.values);
+        }
+    }
     if (d.type == "fixedGradient" || d.type == "gradientEnergy")
     {
         if (!d.hasGradient)

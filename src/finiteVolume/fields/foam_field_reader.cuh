@@ -129,6 +129,12 @@ struct PatchFieldData
     scalar         vfUniformValue   = 0;
     std::vector<scalar> vfValues;
 
+    // alphaContactAngle (interFoam). theta0 in DEGREES, < 0 when the patch is not one; `limit` is the
+    // word as written, because it selects between four different evaluate() bodies and defaulting it
+    // would run a different one from the case's.
+    scalar         contactTheta0 = -1;
+    std::string    contactLimit;
+
     bool           hasGradient    = false;
     bool           gradientUniform = false;
     T              gradientUniformValue{};
@@ -772,6 +778,16 @@ inline FieldData<T> readField(const std::string& path)
                         const scalar v = ts.nextScalar();
                         if (key == "C1") p.ablC1 = v;
                         else             p.ablC2 = v;
+                        ts.expect(";");
+                    }
+                    else if (key == "theta0")
+                    {
+                        p.contactTheta0 = ts.nextScalar();
+                        ts.expect(";");
+                    }
+                    else if (key == "limit")
+                    {
+                        p.contactLimit = ts.next();
                         ts.expect(";");
                     }
                     else if ((key == "kappa" || key == "Cmu") && p.hasABL)

@@ -205,7 +205,7 @@ RunReport runInterFoam(const std::string&          caseDir,
                     mi.deltaT = rep.deltaT;
                     mi.scheme = f.divRhoPhiU;
                     mi.schemeCoeff = f.divRhoPhiUCoeff;
-                    mi.relaxEquationU = true; mi.relaxU = scalar(1);
+                    mi.relaxEquationU = f.relaxEquationU; mi.relaxU = f.relaxU;
 
                     MomentumSolveControls msc;
                     FvVectorMatrix UEqn;

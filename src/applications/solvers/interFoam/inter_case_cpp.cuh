@@ -90,6 +90,14 @@ struct InterFields
     LoopControls pimple;
     label   nNonOrthogonalCorrectors = 0;
     bool    momentumPredictorOn = true;
+    // relaxationFactors/equations. THE QUESTION IS "DOES THE CASE NAME ONE", not "is it below 1":
+    // fvMatrix::relax() is `if (mesh.relaxEquation(name, coeff)) relax(coeff)` and relaxEquation is
+    // `found(name) || found("default")` (solution.C:330-334), so a case naming 1 relaxes -- the
+    // dominance clamp still runs -- and a case naming nothing does not. damBreak says `".*" 1`;
+    // capillaryRise has no relaxationFactors block at all, and this was hardcoded to true until that
+    // case was run.
+    bool    relaxEquationU = false;
+    scalar  relaxU = 1.0;
 
     vector  g{0, 0, 0};
     scalar  hRef = 0;

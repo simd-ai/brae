@@ -3172,6 +3172,20 @@ target_include_directories(test_inter_dambreak_vs_openfoam PRIVATE ${BRAE_HEADER
 target_link_libraries(test_inter_dambreak_vs_openfoam PRIVATE brae_core)
 add_test(NAME interfoam_dambreak_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_dambreak_vs_openfoam.sh)
+
+# ...and capillaryRise, where surface tension IS the answer rather than a correction, and which is the
+# ONLY shipped interFoam tutorial with a contact angle. damBreak would still look broadly right with
+# sigma set to zero; this one would not move at all.
+add_executable(test_inter_capillary_vs_openfoam tests/test_inter_capillary_vs_openfoam.cu)
+target_include_directories(test_inter_capillary_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_inter_capillary_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_capillaryrise_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_capillaryrise_vs_openfoam.sh)
+set_tests_properties(interfoam_capillaryrise_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_inter_capillary_vs_openfoam
+                     TIMEOUT 900)
 set_tests_properties(interfoam_dambreak_vs_openfoam PROPERTIES
                      ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
                      SKIP_RETURN_CODE 77

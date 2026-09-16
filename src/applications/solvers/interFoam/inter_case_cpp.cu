@@ -191,6 +191,22 @@ InterFields buildInterFields(const std::string&          caseDir,
         f.pimple.turbOnFinalIterOnly = true;
     }
 
+    // relaxationFactors/equations -- see InterFields::relaxEquationU.
+    {
+        const FoamDict* rf = fvSolution.subDict("relaxationFactors");
+        const FoamDict* eq = rf ? rf->subDict("equations") : nullptr;
+        if (eq)
+        {
+            // OpenFOAM resolves the name through the same regex machinery fvSolution uses everywhere;
+            // `".*" 1` matches U, and an explicit `U` entry wins over a `default`.
+            const scalar u   = eq->scalarOr("U", scalar(-1));
+            const scalar any = eq->scalarOr("\".*\"", scalar(-1));
+            const scalar def = eq->scalarOr("default", scalar(-1));
+            const scalar v = (u >= 0) ? u : ((any >= 0) ? any : def);
+            if (v >= 0) { f.relaxEquationU = true; f.relaxU = v; }
+        }
+    }
+
     // --- gravity ------------------------------------------------------------------------------
     f.g          = readGravity(caseDir);
     f.hRef       = readHRef(caseDir);
