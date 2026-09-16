@@ -25,6 +25,8 @@
 #include "solution_directions.cuh"
 #include "inter_driver_cpp.cuh"
 #include "inter_solve_cpp.cuh"
+#include "inter_peqn_cpp.cuh"
+#include "inter_ueqn_cpp.cuh"
 #include "alpha_eqn_cpp.cuh"
 #include "device_inter_alpha_step.cuh"
 #include "device_inter_step.cuh"
@@ -357,6 +359,8 @@ int main(int argc, char** argv)
           for (std::size_t pi = 0; pi < fvp.size(); ++pi)
           { const auto& b = f.boundary[pi]->value(); v.insert(v.end(), b.begin(), b.end()); }
           return v; };
+        const label nFacesAll = static_cast<label>(g.magSf().size());
+        std::vector<scalar> ghfAll;
         auto fullFace = [&](const SurfaceScalarField& f)
         { std::vector<scalar> v(f.internal);
           for (std::size_t pi = 0; pi < fvp.size(); ++pi)
@@ -507,7 +511,8 @@ int main(int argc, char** argv)
         DeviceBuffer<scalar> NH(dv.nHatf.internal), NHB(flatten(dv.nHatf.boundary));
         DeviceBuffer<scalar> ABnd(pv2(dv.alpha1)), Kd2(dv.K), Gh(dv.gh), Ghf, MagSf(g.magSf());
         { SurfaceScalarField gf; gf.internal = dv.ghfInternal; gf.boundary = dv.ghfBoundary;
-          Ghf.copyFrom(fullFace(gf)); }
+          ghfAll = fullFace(gf);
+          Ghf.copyFrom(ghfAll); }
         DeviceBuffer<scalar> Rho2, Mu2, Nu2, RpI2, RpB2;
         DeviceVectorBoundary db2 = buildDeviceVectorBoundary(dv.U, fvp, g);
         DevicePhaseProperties pr2{dv.mixture.phases.rho1, dv.mixture.phases.nu1,
@@ -769,6 +774,116 @@ int main(int argc, char** argv)
                 std::printf("  [taps vs host] UEqn.diag %.4e of %.4e;  rAU %.4e of %.4e;  "
                             "HbyA.x %.4e of %.4e\n",
                             (double)wD, (double)sD, (double)wR, (double)sR, (double)wH, (double)sH);
+
+                // ---- phiHbyA, built on the host the way pEqn.H builds it -------------------------
+                // The momentum half is now right to 1.1e-05; this asks whether the flux the pressure
+                // equation is actually SOLVED on agrees. It is four things -- fvc::flux(HbyA) with
+                // constrainHbyA, interpolate(rho*rAU)*ddtCorr, and phig on BOTH sides -- and the tap
+                // holds all of them.
+                {
+                    std::vector<vector> HbyAh(static_cast<std::size_t>(nC));
+                    std::vector<scalar> rAUh(static_cast<std::size_t>(nC));
+                    for (label c = 0; c < nC; ++c)
+                    {
+                        rAUh[c] = scalar(1)/Ah[c];
+                        HbyAh[c] = vector{rAUh[c]*Hh[c].x, rAUh[c]*Hh[c].y, rAUh[c]*Hh[c].z};
+                    }
+                    // constrainHbyA: on a patch whose U BC is NOT assignable, HbyA's boundary value is
+                    // U's. assignable() is not fixesValue().
+                    std::vector<std::vector<vector>> HbyAb(fvp.size());
+                    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                    {
+                        const bool takeUb = !dv.U.boundary[pi]->assignable();
+                        const std::vector<vector>& ub = dv.U.boundary[pi]->value();
+                        for (label i = 0; i < fvp[pi].size; ++i)
+                            HbyAb[pi].push_back(takeUb ? ub[i] : HbyAh[fvp[pi].faceCells[i]]);
+                    }
+                    SurfaceScalarField phiHh = fvc::flux(HbyAh, HbyAb, m, g, fvp);
+
+                    // interpolate(rho*rAU)*ddtCorr, internal faces
+                    std::vector<scalar> rrAUf;
+                    rhoRAUf(devRho, rAUh, m, g, rrAUf);
+                    SurfaceScalarField phiOldF;
+                    phiOldF.internal = dv.phi.internal;
+                    phiOldF.boundary = dv.phi.boundary;
+                    DdtCorrInput dci;
+                    dci.phiOld = &phiOldF;
+                    dci.UOld = &UOldH;
+                    dci.ddtPhiCoeff = -1;
+                    dci.deltaT = dt;
+                    SurfaceScalarField dcorr;
+                    ddtCorr(dci, Uh2, m, g, fvp, dcorr);
+                    for (label f = 0; f < nIf; ++f)
+                        phiHh.internal[f] += rrAUf[f]*dcorr.internal[f];
+
+                    // phig on BOTH sides, from the same stf/snGradRho the hook built
+                    std::vector<scalar> stfH, snRhoH, rAUfAllH(nFacesAll);
+                    { std::vector<scalar> sK;
+                      ip::sigmaK(dv.K, dv.interface.sigma, sK);
+                      const SurfaceScalarField sKf = fvc::interpolate(sK, m, g, fvp);
+                      const SurfaceScalarField snA = fvc::snGrad(dv.alpha1, m, g, fvp, false);
+                      stfH.resize(static_cast<std::size_t>(nFacesAll));
+                      for (label f = 0; f < nIf; ++f) stfH[f] = sKf.internal[f]*snA.internal[f];
+                      { label o4 = nIf;
+                        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                          for (label i = 0; i < fvp[pi].size; ++i)
+                            stfH[o4++] = sKf.boundary[pi][i]*snA.boundary[pi][i]; }
+                      GeometricField<scalar> rhoFh;
+                      rhoFh.internal = devRho;
+                      for (const FvPatch& q : fvp)
+                        rhoFh.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
+                      rhoFh.evaluateBoundary();
+                      const SurfaceScalarField sr = fvc::snGrad(rhoFh, m, g, fvp, false);
+                      snRhoH.assign(sr.internal.begin(), sr.internal.end());
+                      for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                        snRhoH.insert(snRhoH.end(), sr.boundary[pi].begin(), sr.boundary[pi].end()); }
+                    for (label f = 0; f < nIf; ++f)
+                    {
+                        const scalar w = g.weights()[f];
+                        rAUfAllH[f] = w*rAUh[m.owner()[f]] + (scalar(1) - w)*rAUh[m.neighbour()[f]];
+                    }
+                    { label o5 = nIf;
+                      for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                        for (label i = 0; i < fvp[pi].size; ++i)
+                          rAUfAllH[o5++] = rAUh[fvp[pi].faceCells[i]]; }
+                    std::vector<scalar> phigH;
+                    buoyancyFlux(stfH, ghfAll, snRhoH, rAUfAllH, g.magSf(), phigH);
+                    for (label f = 0; f < nIf; ++f) phiHh.internal[f] += phigH[f];
+
+                    std::vector<scalar> dPhiH;
+                    taps.phiHbyAInt.copyTo(dPhiH);
+                    scalar wP = 0, sP = 0;
+                    for (label f = 0; f < nIf; ++f)
+                    {
+                        wP = std::fmax(wP, std::fabs(dPhiH[f] - phiHh.internal[f]));
+                        sP = std::fmax(sP, std::fabs(phiHh.internal[f]));
+                    }
+                    std::printf("  [taps vs host] phiHbyA %.4e of %.4e\n", (double)wP, (double)sP);
+                }
+
+                // ---- ONE STEP, end to end, against the host at the SAME step count ---------------
+                // phiHbyA is right to 2.5e-04 and U after five steps is 58% out. Either the error
+                // amplifies -- in which case one step is small -- or the comparison is not
+                // like-for-like, in which case one step is already large. The two look nothing alike.
+                {
+                    InterFields r1 = buildInterFields(caseDir, startDir, m, g, fvp);
+                    runInterFoam(caseDir, startDir, m, g, fvp, nWarm + 1, /*verbose=*/false, &r1);
+                    std::vector<scalar> u1, p1, a1v;
+                    ux.copyTo(u1);
+                    pr.copyTo(p1);
+                    a1.copyTo(a1v);
+                    scalar wu1 = 0, su1 = 0, wp1 = 0, sp1 = 0, wa1 = 0;
+                    for (label c = 0; c < nC; ++c)
+                    {
+                        wu1 = std::fmax(wu1, std::fabs(u1[c] - r1.U.internal[c].x));
+                        su1 = std::fmax(su1, std::fabs(r1.U.internal[c].x));
+                        wp1 = std::fmax(wp1, std::fabs(p1[c] - r1.p_rgh.internal[c]));
+                        sp1 = std::fmax(sp1, std::fabs(r1.p_rgh.internal[c]));
+                        wa1 = std::fmax(wa1, std::fabs(a1v[c] - r1.alpha1.internal[c]));
+                    }
+                    std::printf("  [one step] alpha %.4e;  U.x %.4e of %.4e;  p_rgh %.4e of %.4e\n",
+                                (double)wa1, (double)wu1, (double)su1, (double)wp1, (double)sp1);
+                }
                 check("the device's momentum diagonal matches the host's on damBreak",
                       wD < scalar(1e-10)*sD);
                 check("...and so does rAU", wR < scalar(1e-10)*sR);
