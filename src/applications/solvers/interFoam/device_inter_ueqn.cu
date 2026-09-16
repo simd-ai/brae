@@ -1,6 +1,7 @@
 // interFoam's momentum predictor on the device -- see device_inter_ueqn.cuh for the two rho fields and
 // for why the body force is a face flux.
 #include "device_inter_ueqn.cuh"
+#include "device_fvc_reconstruct.cuh"
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
@@ -33,6 +34,19 @@ __global__ void ddtRhoUKernel(
     sx[c] += w * uox[c];
     sy[c] += w * uoy[c];
     sz[c] += w * uoz[c];
+}
+
+// source += V*R, componentwise. A PLUS -- see the header.
+__global__ void addForceKernel(
+    const scalar* __restrict__ rx, const scalar* __restrict__ ry, const scalar* __restrict__ rz,
+    const scalar* __restrict__ V, int nC,
+    scalar* __restrict__ sx, scalar* __restrict__ sy, scalar* __restrict__ sz)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    sx[c] += rx[c]*V[c];
+    sy[c] += ry[c]*V[c];
+    sz[c] += rz[c]*V[c];
 }
 
 __global__ void productKernel(const scalar* __restrict__ a, const scalar* __restrict__ b,
@@ -150,6 +164,27 @@ void deviceInterMuEff(
         productKernel<<<nBlocks(nBf), TPB>>>(rhoBnd.data(), nuEffBnd.data(), nBf, muBnd.data());
         ckU(cudaGetLastError(), "mu at the patch");
     }
+}
+
+
+void deviceAddMomentumPredictorSource(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& faceForceInt,
+    const DeviceBuffer<scalar>& faceForceBnd,
+    DeviceBuffer<scalar>&       srcX,
+    DeviceBuffer<scalar>&       srcY,
+    DeviceBuffer<scalar>&       srcZ)
+{
+    const int nC = dm.nCells;
+    if (static_cast<int>(srcX.size()) != nC)
+        throw std::runtime_error(
+            "brae interFoam device UEqn: the face force is added INTO an existing source -- the matrix "
+            "is assembled and relaxed first, and this runs on a copy of it.");
+    DeviceBuffer<scalar> rx, ry, rz;
+    deviceReconstruct(dm, faceForceInt, faceForceBnd, rx, ry, rz);
+    addForceKernel<<<nBlocks(nC), TPB>>>(rx.data(), ry.data(), rz.data(), dm.V.data(), nC,
+                                         srcX.data(), srcY.data(), srcZ.data());
+    ckU(cudaGetLastError(), "source += V*reconstruct(faceForce)");
 }
 
 } // namespace brae

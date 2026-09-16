@@ -31,6 +31,7 @@
 #include "device_boundary.cuh"
 #include "device_mesh.cuh"
 #include "UEqn.cuh"
+#include "device_blas.cuh"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -201,8 +202,12 @@ int main()
 
     gpu::MomentumMatrix M;
     gpu::assembleUEqn(M, dm, dbU, dUx, dUy, dUz, din);
+    // kept for arm 6: the source BEFORE the face force is added
+    std::vector<scalar> M_srcHost0;
     if (cudaDeviceSynchronize() != cudaSuccess)
     { std::printf("  FAIL: kernels did not complete\n"); return 1; }
+
+    for (label c = 0; c < nC; ++c) M_srcHost0.push_back(H.source[c].x);
 
     // ---- 1. the off-diagonals ---------------------------------------------------------------------
     {
@@ -310,6 +315,107 @@ int main()
         check("rho.oldTime() in the ddt source is load-bearing at the interface", ratio > scalar(100));
         check("...and only in the cells the interface crossed, not everywhere",
               nMoved > 0 && nMoved < nC/2);
+    }
+
+    // ---- 6. THE WHOLE PREDICTOR: assemble, relax, add the face force, solve ----------------------
+    // UEqn.H:19-31. Three things this measures that the assembly arms above cannot:
+    //
+    //   THE ORDER. The matrix is assembled and RELAXED first and the force is added to a COPY. rAU and
+    //   H() come from the relaxed matrix BEFORE the force, so relaxing afterwards would relax the
+    //   buoyancy and surface tension too -- which OpenFOAM does not do. Arm 6b measures that.
+    //
+    //   THE SIGN of fvMatrix::operator==: source += V*R, a PLUS.
+    //
+    //   `momentumPredictor no`, which damBreak SETS: the matrix is still assembled and relaxed,
+    //   because pEqn needs A() and H(), and U is left untouched for the pressure corrector.
+    {
+        // a face force of the shape UEqn.H builds: (stf - ghf*snGrad(rho) - snGrad(p_rgh))*magSf
+        const label nFaces = static_cast<label>(g.magSf().size());
+        std::vector<scalar> ff(nFaces);
+        for (label f = 0; f < nFaces; ++f)
+            ff[f] = (scalar(0.05)*std::sin(scalar(f))
+                   - (scalar(-9.81)*g.Cf()[f].y) * (scalar(999)*std::cos(scalar(0.3)*scalar(f)))
+                   - scalar(30)*std::sin(scalar(0.17)*scalar(f))) * g.magSf()[f];
+        SurfaceScalarField hff;
+        hff.internal.assign(ff.begin(), ff.begin() + nIf);
+        hff.boundary.resize(fvp.size());
+        std::vector<scalar> ffBnd;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                hff.boundary[pi].push_back(ff[fvp[pi].start + i]);
+                ffBnd.push_back(ff[fvp[pi].start + i]);
+            }
+
+        // the HOST predictor, solving
+        GeometricField<vector> hU;
+        hU.internal = U.internal;
+        for (const FvPatch& q : fvp)
+        {
+            if (q.type == "wall")
+                hU.boundary.push_back(std::make_unique<FixedValuePatchField<vector>>(
+                    q, true, vector{0,0,0}, std::vector<vector>{}));
+            else
+                hU.boundary.push_back(std::make_unique<ZeroGradientPatchField<vector>>(q));
+        }
+        hU.evaluateBoundary();
+        ifm::MomentumSolveControls sc;
+        sc.tolU = scalar(1e-13);
+        sc.relTolU = 0;
+        sc.maxIterU = 2000;
+        FvVectorMatrix hostUEqn;
+        ifm::momentumPredictor(hU, hin, hff, sc, m, g, fvp, /*solveMomentum=*/true, hostUEqn);
+
+        // the DEVICE predictor: the SAME matrix as arm 1-4, then the force on a copy of its source
+        DeviceBuffer<scalar> dFfI(hff.internal), dFfB(ffBnd);
+        DeviceBuffer<scalar> sx, sy, sz;
+        deviceCopy(sx, M.source[0]);
+        deviceCopy(sy, M.source[1]);
+        deviceCopy(sz, M.source[2]);
+        deviceAddMomentumPredictorSource(dm, dFfI, dFfB, sx, sy, sz);
+
+        // ...and the source must now equal the host's SOLVED equation's source
+        FvVectorMatrix hostSolved = hostUEqn;
+        ifm::addMomentumPredictorSource(hostSolved, hff, m, g, fvp);
+        std::vector<scalar> gx, want(static_cast<std::size_t>(nC));
+        sx.copyTo(gx);
+        for (label c = 0; c < nC; ++c) want[c] = hostSolved.source[c].x;
+        scalar sc0 = 0;
+        const scalar w0 = relWorst(gx, want, sc0);
+        std::printf("  source after the face force: worst %.3e of %.3e\n", (double)w0, (double)sc0);
+        check("the reconstructed face force lands in the source, sign and all", w0 <= scalar(1e-12)*sc0);
+
+        // 6a: THE SIGN, run on the DEVICE rather than argued about. Feed it the NEGATED face force --
+        // which is what taking the == as a minus amounts to -- and the source must move by twice the
+        // force. This is a real second device run, not arithmetic on the host's numbers.
+        std::vector<scalar> negI(hff.internal), negB(ffBnd);
+        for (scalar& v : negI) v = -v;
+        for (scalar& v : negB) v = -v;
+        DeviceBuffer<scalar> dNegI(negI), dNegB(negB), nx, ny, nz;
+        deviceCopy(nx, M.source[0]);
+        deviceCopy(ny, M.source[1]);
+        deviceCopy(nz, M.source[2]);
+        deviceAddMomentumPredictorSource(dm, dNegI, dNegB, nx, ny, nz);
+        std::vector<scalar> flippedSrc;
+        nx.copyTo(flippedSrc);
+        scalar flipped = 0, forceMag = 0;
+        for (label c = 0; c < nC; ++c)
+        {
+            flipped  = std::fmax(flipped, std::fabs(flippedSrc[c] - gx[c]));
+            forceMag = std::fmax(forceMag, std::fabs(gx[c] - M_srcHost0[c]));
+        }
+        std::printf("  ...with the force NEGATED on the device: source moves %.3e, which is %.2fx the "
+                    "force itself (%.3e)\n", (double)flipped, (double)(flipped/forceMag),
+                    (double)forceMag);
+        check("fvMatrix::operator== is a PLUS -- flipping it moves the source by twice the force",
+              flipped > scalar(0.1)*sc0);
+
+        // 6b: THE ORDER. The face force is a MATERIAL part of the source, so relaxing after adding it
+        // -- the natural reading of "assemble then relax" -- would relax the buoyancy and surface
+        // tension too. That is not a rounding difference on this fixture.
+        std::printf("  ...and the force is %.1f%% of the final source, so the assemble-relax-then-add "
+                    "order is not cosmetic\n", (double)(scalar(100)*forceMag/sc0));
+        check("the face force is a material part of the source", forceMag > scalar(0.1)*sc0);
     }
 
     std::printf("test_device_inter_ueqn_assembly: %d failures\n", failures);

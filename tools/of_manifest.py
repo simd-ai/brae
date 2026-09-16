@@ -1740,7 +1740,11 @@ COMPONENTS = {
                         "relax(1)'s diagonal-dominance clamp MOVES the diagonal by 1.2e+03, so skipping "
                         "relax at alpha == 1 is a different matrix; and passing rho for rho.oldTime() "
                         "puts the ddt source 1000.0x out in exactly 64 of 512 cells -- one layer, the "
-                        "one the interface crossed.",
+                        "one the interface crossed. THE WHOLE PREDICTOR is gated there too: the "
+                        "reconstructed face force lands in the source to 1.2e-16 relative, negating it "
+                        "on the device moves the source by 2.00x the force exactly (a sign flip's "
+                        "signature), and the force is 15.4% of the final source -- so assembling and "
+                        "relaxing BEFORE adding it, which is what OpenFOAM does, is not cosmetic.",
              note="fvm::ddt(rho,U) + fvm::div(rhoPhi,U) + MRF.DDt(rho,U) + turbulence->divDevRhoReff(rho,U), "
                   "with the momentum predictor's source reconstructed from surfaceTensionForce() - "
                   "ghf*snGrad(rho) - snGrad(p_rgh). Assembly from pieces brae already had, EXCEPT two. "

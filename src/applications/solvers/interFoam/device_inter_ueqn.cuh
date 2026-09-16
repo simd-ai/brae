@@ -101,4 +101,23 @@ void deviceInterMuEff(
     DeviceBuffer<scalar>&       muFace,     // internal faces: interpolate(rho*nuEff)
     DeviceBuffer<scalar>&       muBnd);
 
+// ---------------------------------------------------------------------------------------------------
+// `solve(UEqn == fvc::reconstruct(faceForce))` -- UEqn.H:19-31.
+//
+// source += V*reconstruct(faceForce). THE SIGN IS A PLUS: fvMatrix::operator== is source += V*R, where
+// rhoSimpleFoam's grad(p) term carries the minus inside R itself. Both conventions live in this tree
+// and the wrong one here still converges.
+//
+// THE ORDER IS OpenFOAM's: the matrix is assembled and RELAXED first, and the face force is added to a
+// COPY afterwards. Relaxing after adding it would relax the buoyancy and surface tension too, which
+// OpenFOAM does not do -- and rAU and H() are taken from the relaxed matrix BEFORE the force, so the
+// caller keeps the original.
+void deviceAddMomentumPredictorSource(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& faceForceInt,
+    const DeviceBuffer<scalar>& faceForceBnd,
+    DeviceBuffer<scalar>&       srcX,
+    DeviceBuffer<scalar>&       srcY,
+    DeviceBuffer<scalar>&       srcZ);
+
 } // namespace brae
