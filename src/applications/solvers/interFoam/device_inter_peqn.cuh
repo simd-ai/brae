@@ -98,4 +98,37 @@ void deviceStaticPressure(
     const DeviceBuffer<scalar>& gh,
     DeviceBuffer<scalar>&       p);
 
+// ---------------------------------------------------------------------------------------------------
+// THE p_rgh MATRIX: fvm::laplacian(rAUf, p_rgh) == fvc::div(phiHbyA), pEqn.H:44-56.
+//
+// `iC`/`bC` are p_rgh's own boundary coefficients, flattened in boundary-face order, from the host's
+// per-patch valueInternalCoeffs/gradientInternalCoeffs -- fixedFluxPressure, totalPressure and
+// zeroGradient each contribute differently and that dispatch stays on the host, as everywhere else in
+// this port. Everything that scales with the CELL COUNT is here.
+//
+// THE SIGN. `pe.source[c] += div[c]*V[c]` -- fvMatrix::operator== is source += V*R, a PLUS, where
+// rhoSimpleFoam's momentum path carries the minus inside R = -grad(p). Both conventions live in this
+// tree and getting this one backwards still converges, to a pressure field that drives the flow the
+// wrong way.
+//
+// setReference PINS ONE CELL when no patch fixes a value: source += diag*refValue AND diag += diag --
+// it DOUBLES the diagonal entry rather than replacing the row. damBreak does not need it (its
+// atmosphere patch is totalPressure) but 8 of the shipped tutorials have no value-fixing p_rgh patch
+// at all and every one of those does.
+struct DevicePressureMatrix
+{
+    DeviceBuffer<scalar> diag, upper, lower;   // the RAW LDU, before the boundary fold
+    DeviceBuffer<scalar> source;               // extensive
+};
+
+void deviceInterAssemblePEqn(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& rAUfInt,       // fvc::interpolate(rAU) on the internal faces
+    const DeviceBuffer<scalar>& phiHbyAInt,
+    const DeviceBuffer<scalar>& phiHbyABnd,
+    bool                        needReference,
+    int                         pRefCell,
+    scalar                      pRefValue,
+    DevicePressureMatrix&       P);
+
 } // namespace brae

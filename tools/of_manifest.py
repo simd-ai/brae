@@ -1765,7 +1765,13 @@ COMPONENTS = {
                         "interpolate(rho)*interpolate(rAU) is 2.5e-01 where the true product is dt = "
                         "1.0e-03 exactly, i.e. 250x; reconstruct without the rAUf division is 8.7e-01 out "
                         "in U; and a constant ddtCorr coefficient instead of the limiter is 1.5e+02 of "
-                        "4.0e+02, while the real one is 0.000e+00 on every value-fixing patch.",
+                        "4.0e+02, while the real one is 0.000e+00 on every value-fixing patch. THE "
+                        "p_rgh MATRIX IS ASSEMBLED ON THE DEVICE TOO and gated as a MATRIX -- "
+                        "off-diagonals bit-identical, diagonal 1.7e-18 of 1.1e-02 and source 4.4e-16 of "
+                        "2.2e+00 -- with two arms a solved field could not show: fvMatrix::operator== is "
+                        "a PLUS (taking it as a minus moves the source by twice its own size, and still "
+                        "converges), and setReference DOUBLES the diagonal entry rather than replacing "
+                        "the row, touching no other cell.",
              note="rAU = 1/UEqn.A(), phiHbyA, the p_rgh laplacian, then U and phi rebuilt. Four things "
                   "are not shared with any other pressure corrector. (1) phig carries NO snGrad(p_rgh) "
                   "where UEqn's source does -- the pressure gradient is explicit there and IMPLICIT "

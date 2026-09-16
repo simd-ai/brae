@@ -1,6 +1,7 @@
 // interFoam's pressure corrector on the device -- see device_inter_peqn.cuh for the four.
 #include "device_inter_peqn.cuh"
 #include "device_fvc_reconstruct.cuh"
+#include "device_mesh.cuh"
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
@@ -92,6 +93,26 @@ __global__ void ddtCorrBoundaryKernel(
     const scalar pOld    = phiOldBnd[b];
     const scalar phiCorr = pOld - interpFlux;
     out[b] = ddtCoeff(phiCorr, pOld, given) * rDeltaT * phiCorr;
+}
+
+// pe.source += fvc::div(phiHbyA)*V -- a PLUS, fvMatrix::operator== (fvMatrix.C:1855-1862).
+__global__ void addDivSourceKernel(const scalar* __restrict__ div, const scalar* __restrict__ V,
+                                   int nC, scalar* __restrict__ source)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c < nC) source[c] += div[c]*V[c];
+}
+
+// fvMatrix::setReference: source += diag*refValue, then diag += diag. It DOUBLES the entry; replacing
+// the row instead gives a different matrix that still solves.
+__global__ void setReferenceKernel(int cell, scalar refValue,
+                                   scalar* __restrict__ diag, scalar* __restrict__ source)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+    {
+        source[cell] += diag[cell]*refValue;
+        diag[cell]   += diag[cell];
+    }
 }
 
 __global__ void divideKernel(const scalar* __restrict__ a, const scalar* __restrict__ b,
@@ -254,6 +275,44 @@ void deviceStaticPressure(
     p.resize(static_cast<std::size_t>(nC));
     staticPressureKernel<<<nBlocks(nC), TPB>>>(p_rgh.data(), rho.data(), gh.data(), nC, p.data());
     ckP(cudaGetLastError(), "p = p_rgh + rho*gh");
+}
+
+
+void deviceInterAssemblePEqn(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& rAUfInt,
+    const DeviceBuffer<scalar>& phiHbyAInt,
+    const DeviceBuffer<scalar>& phiHbyABnd,
+    bool                        needReference,
+    int                         pRefCell,
+    scalar                      pRefValue,
+    DevicePressureMatrix&       P)
+{
+    const int nC = dm.nCells;
+
+    // fvm::laplacian(rAUf, p_rgh), UNCORRECTED -- interFoam's pEqn passes corrected=false, and the
+    // shipped tutorials' `laplacianSchemes default Gauss linear corrected` applies to the momentum
+    // equation, not to this one. A corrected laplacian here would need its deferred source AND the
+    // matching faceFluxCorrection, or phi comes out non-conservative while the equation still solves.
+    deviceLaplacianCoeffs(dm, rAUfInt, P.diag, P.upper, P.lower, /*nonOrth=*/false);
+
+    // == fvc::div(phiHbyA): source += div*V, a PLUS.
+    DeviceBuffer<scalar> div(static_cast<std::size_t>(nC));
+    deviceDiv(dm, phiHbyAInt, phiHbyABnd, div);
+    P.source.resize(static_cast<std::size_t>(nC));
+    cudaMemset(P.source.data(), 0, sizeof(scalar)*nC);
+    addDivSourceKernel<<<nBlocks(nC), TPB>>>(div.data(), dm.V.data(), nC, P.source.data());
+    ckP(cudaGetLastError(), "source += div(phiHbyA)*V");
+
+    if (needReference)
+    {
+        if (pRefCell < 0 || pRefCell >= nC)
+            throw std::runtime_error(
+                "brae interFoam device pEqn: pRefCell is outside the mesh. A case whose p_rgh has no "
+                "value-fixing patch is singular without it, so this cannot be defaulted away.");
+        setReferenceKernel<<<1, 1>>>(pRefCell, pRefValue, P.diag.data(), P.source.data());
+        ckP(cudaGetLastError(), "setReference");
+    }
 }
 
 } // namespace brae

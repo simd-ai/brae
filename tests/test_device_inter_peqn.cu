@@ -22,6 +22,8 @@
 #include "inter_peqn_cpp.cuh"
 #include "device_inter_peqn.cuh"
 #include "device_fvc_reconstruct.cuh"
+#include "fvm.cuh"
+#include "fvc.cuh"
 #include "device_mesh.cuh"
 #include <algorithm>
 #include <cmath>
@@ -346,6 +348,120 @@ int main()
         dP.copyTo(got);
         std::printf("  p = p_rgh + rho*gh: worst %.3e\n", (double)worst(got, hostP));
         check("the static pressure matches the host bit for bit", worst(got, hostP) == scalar(0));
+    }
+
+    // ---- 6. THE p_rgh MATRIX: fvm::laplacian(rAUf, p_rgh) == fvc::div(phiHbyA) --------------------
+    // Compared as a MATRIX -- diagonal, both off-diagonals and the source -- and not as a solved field,
+    // where the linear solver's tolerance would absorb any difference. Two arms beneath it measure
+    // things a solved field could not show at all: the sign of the == and what setReference does.
+    {
+        GeometricField<scalar> prgh;
+        prgh.internal = p_rgh;
+        for (const FvPatch& q : fvp)
+            prgh.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
+        prgh.evaluateBoundary();
+
+        // rAUf on the internal faces, from the physical rAU = dt/rho
+        std::vector<scalar> rAUfInt(static_cast<std::size_t>(nIf));
+        for (label f = 0; f < nIf; ++f)
+        {
+            const scalar w = g.weights()[f];
+            rAUfInt[f] = w*rAU[m.owner()[f]] + (scalar(1) - w)*rAU[m.neighbour()[f]];
+        }
+
+        // phiHbyA: a flux that is NOT divergence-free, so the source is not uniformly zero
+        std::vector<scalar> phiHInt(static_cast<std::size_t>(nIf)), phiHBnd;
+        for (label f = 0; f < nIf; ++f)
+            phiHInt[f] = scalar(0.4)*std::sin(scalar(0.31)*scalar(f)) * g.magSf()[f];
+        std::vector<std::vector<scalar>> phiHBndH(fvp.size());
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                const label gf = fvp[pi].start + i;
+                const scalar v = scalar(0.4)*std::sin(scalar(0.31)*scalar(gf)) * g.magSf()[gf];
+                phiHBndH[pi].push_back(v);
+                phiHBnd.push_back(v);
+            }
+
+        SurfaceScalarField phiH;
+        phiH.internal = phiHInt;
+        phiH.boundary = phiHBndH;
+
+        // fvm::laplacian takes the WHOLE surface field: the boundary half of rAUf is what sets the
+        // patches' contribution to the diagonal, and a matrix built from the internal faces alone is
+        // a different one at every boundary cell.
+        SurfaceScalarField rAUfField;
+        rAUfField.internal = rAUfInt;
+        rAUfField.boundary.resize(fvp.size());
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            for (label i = 0; i < fvp[pi].size; ++i)
+                rAUfField.boundary[pi].push_back(rAU[fvp[pi].faceCells[i]]);
+
+        FvScalarMatrix hostPe =
+            fvm::laplacian<scalar>(rAUfField, prgh, m, g, fvp, /*corrected=*/false);
+        const std::vector<scalar> divH = fvc::div(phiH, m, g, fvp);
+        for (label c = 0; c < nC; ++c) hostPe.source[c] += divH[c] * g.V()[c];
+
+        DeviceBuffer<scalar> dRAUf(rAUfInt), dPhiHI(phiHInt), dPhiHB(phiHBnd);
+        DevicePressureMatrix P;
+        deviceInterAssemblePEqn(dm, dRAUf, dPhiHI, dPhiHB, /*needReference=*/false, 0, scalar(0), P);
+        std::vector<scalar> dd, du, dl, ds;
+        P.diag.copyTo(dd);
+        P.upper.copyTo(du);
+        P.lower.copyTo(dl);
+        P.source.copyTo(ds);
+
+        auto rel = [&](const std::vector<scalar>& a, const std::vector<scalar>& b, scalar& sc)
+        {
+            scalar w = 0;
+            sc = 0;
+            for (std::size_t i = 0; i < a.size() && i < b.size(); ++i)
+            {
+                w  = std::fmax(w, std::fabs(a[i] - b[i]));
+                sc = std::fmax(sc, std::fabs(b[i]));
+            }
+            return w;
+        };
+        scalar s1 = 0, s2 = 0, s3 = 0, s4 = 0;
+        const scalar wd = rel(dd, hostPe.diag,   s1);
+        const scalar wu = rel(du, hostPe.upper,  s2);
+        const scalar wl = rel(dl, hostPe.lower,  s3);
+        const scalar ws = rel(ds, hostPe.source, s4);
+        std::printf("  p_rgh matrix: diag %.3e of %.3e, upper %.3e of %.3e, lower %.3e of %.3e, "
+                    "source %.3e of %.3e\n",
+                    (double)wd, (double)s1, (double)wu, (double)s2,
+                    (double)wl, (double)s3, (double)ws, (double)s4);
+        check("the laplacian matches the host", wd <= scalar(1e-14)*s1 && wu <= scalar(1e-14)*s2
+                                             && wl <= scalar(1e-14)*s3);
+        check("...and so does the divergence source", ws <= scalar(1e-13)*s4);
+        check("...and the source is not zero, so fvc::div(phiHbyA) is really in it", s4 > scalar(1e-6));
+
+        // THE SIGN OF ==. fvMatrix::operator== is source += V*R, a PLUS. rhoSimpleFoam's momentum path
+        // carries the minus inside R = -grad(p), so both conventions live in this tree and the wrong
+        // one here still converges -- to a pressure that drives the flow backwards.
+        scalar flipped = 0;
+        for (label c = 0; c < nC; ++c)
+            flipped = std::fmax(flipped, std::fabs((-divH[c]*g.V()[c]) - hostPe.source[c]));
+        std::printf("  ...with the == taken as a MINUS instead: %.3e of %.3e\n",
+                    (double)flipped, (double)s4);
+        check("the sign of fvMatrix::operator== is a plus, and a minus is a different equation",
+              flipped > s4);
+
+        // setReference DOUBLES the diagonal entry rather than replacing the row.
+        DevicePressureMatrix R;
+        deviceInterAssemblePEqn(dm, dRAUf, dPhiHI, dPhiHB, /*needReference=*/true,
+                                /*pRefCell=*/3, /*pRefValue=*/scalar(7), R);
+        std::vector<scalar> rd, rs;
+        R.diag.copyTo(rd);
+        R.source.copyTo(rs);
+        std::printf("  setReference at cell 3: diag %.6g -> %.6g, source %.6g -> %.6g\n",
+                    (double)dd[3], (double)rd[3], (double)ds[3], (double)rs[3]);
+        check("setReference DOUBLES the diagonal entry", rd[3] == scalar(2)*dd[3]);
+        check("...and adds diag*refValue to the source, the ORIGINAL diag and not the doubled one",
+              std::fabs(rs[3] - (ds[3] + dd[3]*scalar(7))) <= scalar(1e-12)*std::fabs(rs[3]));
+        int nOther = 0;
+        for (label c = 0; c < nC; ++c) if (c != 3 && rd[c] != dd[c]) ++nOther;
+        check("...and touches no other cell", nOther == 0);
     }
 
     std::printf("test_device_inter_peqn: %d failures\n", failures);
