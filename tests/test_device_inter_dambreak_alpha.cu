@@ -719,6 +719,33 @@ int main(int argc, char** argv)
                     }
                     std::printf("  [bisect] with nuEff ZEROED: source.x %.4e of %.4e\n",
                                 (double)w0, (double)x0s);
+
+                    // THE dev2 CONTRIBUTION ALONE, both sides, by difference. Split interior from
+                    // boundary-adjacent, which is the split that has named every boundary defect in
+                    // this tree: exact inside and wrong at the wall is a boundary treatment, not a
+                    // scheme.
+                    std::vector<char> touchesPatch(static_cast<std::size_t>(nC), 0);
+                    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                    {
+                        if (fvp[pi].type == "empty") continue;
+                        for (label i = 0; i < fvp[pi].size; ++i)
+                            touchesPatch[fvp[pi].faceCells[i]] = 1;
+                    }
+                    std::vector<scalar> dFull;
+                    taps.UEqnSourceX.copyTo(dFull);
+                    scalar wIn = 0, sIn = 0, wBd = 0, sBd = 0;
+                    int nIn = 0, nBd = 0;
+                    for (label c = 0; c < nC; ++c)
+                    {
+                        const scalar dDev = dFull[c] - s0[c];
+                        const scalar hDev = hUEqn.source[c].x - h0.source[c].x;
+                        const scalar e = std::fabs(dDev - hDev);
+                        if (touchesPatch[c]) { wBd = std::fmax(wBd, e); sBd = std::fmax(sBd, std::fabs(hDev)); ++nBd; }
+                        else                 { wIn = std::fmax(wIn, e); sIn = std::fmax(sIn, std::fabs(hDev)); ++nIn; }
+                    }
+                    std::printf("  [dev2 alone] interior (%d cells) %.4e of %.4e;  "
+                                "patch-adjacent (%d cells) %.4e of %.4e\n",
+                                nIn, (double)wIn, (double)sIn, nBd, (double)wBd, (double)sBd);
                 }
 
                 // BISECT #3: UPWIND ON BOTH SIDES. The matrix is identical either way -- linearUpwind
