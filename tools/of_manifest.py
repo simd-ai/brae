@@ -1778,10 +1778,15 @@ COMPONENTS = {
              of_file="applications/solvers/multiphase/VoF/alphaCourantNo.H",
              classification="CONFIGURATION", status="REIMPLEMENT",
              brae_reference="src/finiteVolume/cfdTools/general/time_controls.cuh",
-             brae_target="src/finiteVolume/cfdTools/general/time_controls.cuh",
+             brae_target="src/finiteVolume/cfdTools/general/device_alpha_courant.cu",
              validation="tests/test_alpha_courant_cpp.cu. Four fail-proofs: defaulting maxAlphaCo, "
                         "pos for pos0, masking the mean's denominator, and dropping the alpha limit "
-                        "from setDeltaT.",
+                        "from setDeltaT. ON THE DEVICE, tests/test_device_alpha_courant.cu repeats "
+                        "three of them plus the boundary half of surfaceSum (0.0035 against 0.0043), "
+                        "with the fixture landing 40 cells EXACTLY on the band's edges so pos and pos0 "
+                        "differ. Agreement is 1e-14 relative and NOT bit-exact, and that is itself the "
+                        "measurement: a max over per-cell sums would be bit-identical if the sums were, "
+                        "so the one ULP proves sumPhi is a gather here and a scatter on the host.",
              note="A SECOND Courant number, over the interface cells only, because the ordinary one is a "
                   "global max set by whatever corner runs fastest -- usually nowhere near the "
                   "interface -- and MULES does not stop the interface being advected more than a cell "
