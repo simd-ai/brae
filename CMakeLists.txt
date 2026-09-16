@@ -59,6 +59,19 @@ foreach(_h ${BRAE_ALL_HEADERS})
 endforeach()
 list(REMOVE_DUPLICATES BRAE_HEADER_DIRS)
 
+# Where OpenFOAM's tutorials live. $ENV{FOAM_TUTORIALS} is only set inside an OpenFOAM shell, and a
+# cmake run outside one leaves it EMPTY -- which silently handed the interFoam gates the path
+# "/multiphase/interFoam/..." and made every dictionary arm skip while the test still reported green.
+# Defaulted to the known install exactly as tests/*.sh default OFBASHRC, and overridable.
+if(DEFINED ENV{FOAM_TUTORIALS} AND NOT "$ENV{FOAM_TUTORIALS}" STREQUAL "")
+    set(BRAE_OF_TUTORIALS "$ENV{FOAM_TUTORIALS}" CACHE PATH "OpenFOAM tutorials directory")
+else()
+    set(BRAE_OF_TUTORIALS "/usr/lib/openfoam/openfoam2412/tutorials" CACHE PATH "OpenFOAM tutorials directory")
+endif()
+if(NOT EXISTS "${BRAE_OF_TUTORIALS}")
+    message(STATUS "OpenFOAM tutorials not found at ${BRAE_OF_TUTORIALS}; tutorial-backed arms will SKIP")
+endif()
+
 # ---------------------------------------------------------------------------
 # brae_core, Phase 1 substrate (comm seam + interfaces). Grows as modules land.
 # ---------------------------------------------------------------------------
@@ -115,6 +128,7 @@ add_library(brae_core STATIC
     src/applications/solvers/simpleFoam/simpleFoamV2.cu
     src/applications/solvers/simpleFoam/pEqn_cpp.cu
     src/applications/solvers/simpleFoam/createFields_cpp.cu
+    src/finiteVolume/fvMatrices/solvers/MULES/mules_cpp.cu
     src/applications/solvers/interFoam/alpha_eqn_cpp.cu
     src/applications/solvers/interFoam/inter_ueqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoCreateFields_cpp.cu
@@ -3023,7 +3037,7 @@ target_include_directories(test_two_phase_mixture PRIVATE ${BRAE_HEADER_DIRS}
 target_link_libraries(test_two_phase_mixture PRIVATE brae_core)
 add_test(NAME two_phase_mixture
          COMMAND test_two_phase_mixture
-                 $ENV{FOAM_TUTORIALS}/multiphase/interFoam/laminar/damBreak/damBreak)
+                 ${BRAE_OF_TUTORIALS}/multiphase/interFoam/laminar/damBreak/damBreak)
 
 # interFoam step 4: interface curvature and surface tension. The dictionary half is the part that bites --
 # damBreak keys its alpha solver as the REGEX "alpha.water.*", cAlpha has NO default in OpenFOAM, and
@@ -3035,7 +3049,7 @@ target_include_directories(test_interface_properties PRIVATE ${BRAE_HEADER_DIRS}
 target_link_libraries(test_interface_properties PRIVATE brae_core)
 add_test(NAME interface_properties
          COMMAND test_interface_properties
-                 $ENV{FOAM_TUTORIALS}/multiphase/interFoam/laminar/damBreak/damBreak)
+                 ${BRAE_OF_TUTORIALS}/multiphase/interFoam/laminar/damBreak/damBreak)
 
 # interFoam step 5: the gravity fields. ghRef carries g's SIGN (gh.H:2-7), and NO shipped tutorial sets
 # constant/hRef -- so on every stock case ghRef is 0 and the sign is unobservable. The gate supplies its
@@ -3046,7 +3060,7 @@ target_include_directories(test_inter_create_fields PRIVATE ${BRAE_HEADER_DIRS}
 target_link_libraries(test_inter_create_fields PRIVATE brae_core)
 add_test(NAME inter_create_fields
          COMMAND test_inter_create_fields
-                 $ENV{FOAM_TUTORIALS}/multiphase/interFoam/laminar/damBreak/damBreak)
+                 ${BRAE_OF_TUTORIALS}/multiphase/interFoam/laminar/damBreak/damBreak)
 
 # interFoam step 6: fvc::reconstruct, which brae did not have and interFoam needs twice (the momentum
 # predictor's source and rebuilding U after the pressure solve). Held against its defining identity --
@@ -3077,7 +3091,26 @@ target_include_directories(test_alpha_eqn_cpp PRIVATE ${BRAE_HEADER_DIRS}
 target_link_libraries(test_alpha_eqn_cpp PRIVATE brae_core)
 add_test(NAME alpha_eqn_cpp
          COMMAND test_alpha_eqn_cpp
-                 $ENV{FOAM_TUTORIALS}/multiphase/interFoam/laminar/damBreak/damBreak)
+                 ${BRAE_OF_TUTORIALS}/multiphase/interFoam/laminar/damBreak/damBreak)
+
+# interFoam step 9: MULES. The oracle is BOUNDEDNESS -- an assertion, not a tolerance -- and it needs no
+# instrumented OpenFOAM, which matters because a stock run never writes the limiter. A boundedness gate
+# alone would pass with lambda == 0 everywhere (i.e. first-order upwind, the case's scheme discarded),
+# so the gate is a PAIR: the limited run stays in [0,1] where the unlimited one does not, AND a smooth
+# in-bounds field comes back with lambda == 1 on every face.
+add_executable(test_mules_cpp tests/test_mules_cpp.cu)
+target_include_directories(test_mules_cpp PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_mules_cpp PRIVATE brae_core)
+add_test(NAME mules_cpp
+         COMMAND test_mules_cpp
+                 ${BRAE_OF_TUTORIALS}/multiphase/interFoam/laminar/damBreak/damBreak)
+
+# These five read damBreak's own dictionaries. A box without OpenFOAM must SKIP, not report green: the
+# arms silently stopped running the moment $FOAM_TUTORIALS was empty, and nothing said so.
+set_tests_properties(two_phase_mixture interface_properties inter_create_fields
+                     alpha_eqn_cpp mules_cpp
+                     PROPERTIES SKIP_RETURN_CODE 77)
 
 add_executable(test_residual_control tests/test_residual_control.cu)
 target_include_directories(test_residual_control PRIVATE ${BRAE_HEADER_DIRS})

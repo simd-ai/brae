@@ -75,8 +75,11 @@ int main(int argc, char** argv)
     }
     else
     {
-        std::printf("  (no tutorial given; using damBreak's values inline)\n");
-        p.rho1 = 1000; p.nu1 = 1e-06; p.rho2 = 1; p.nu2 = 1.48e-05;
+        // A SKIP, not a pass. This arm is the only one that reads damBreak's own phase ORDER, and it
+        // reported green for its whole life because $FOAM_TUTORIALS is empty outside an OpenFOAM shell
+        // and the path silently became "/multiphase/interFoam/...". ctest SKIP_RETURN_CODE is 77.
+        std::printf("  SKIP: OpenFOAM's damBreak tutorial not found at \"%s\"\n", tut.c_str());
+        return 77;
     }
 
     // ---- 2. the three blends, including alpha OUTSIDE [0,1] ---------------------------------------

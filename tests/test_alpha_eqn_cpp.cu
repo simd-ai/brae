@@ -109,7 +109,8 @@ int main(int argc, char** argv)
     }
     else
     {
-        std::printf("  (no tutorial given; dictionary arm skipped)\n");
+        std::printf("  SKIP: OpenFOAM's damBreak tutorial not found at \"%s\"\n", tut.c_str());
+        return 77;
     }
 
     // ---- 1b. the refusals, and the control ---------------------------------------------------------

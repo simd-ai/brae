@@ -32,10 +32,10 @@ components:
       file: src/finiteVolume/fvMatrices/solvers/MULES/MULES.C
     classification: SHARED_NUMERICAL
     brae_status: REIMPLEMENT
-    brae_reference: src/finiteVolume/fvMatrices/solvers/MULES/mules_cpp.cu
+    brae_reference: src/finiteVolume/fvMatrices/solvers/MULES/mules_cpp.cuh
     brae_target: src/finiteVolume/fvMatrices/solvers/MULES/device_mules.cu
-    validation: "Against OpenFOAM's own limiter field, face by face. The oracle needs an instrumented MULES (see the of-instrument skill) because the limiter is never written by a stock run."
-    note: "THE LARGEST SINGLE PIECE, and the least brae-like. MULES is an EXPLICIT, ITERATIVE, bound-preserving flux limiter -- not a matrix assembly -- so almost none of the fvm:: machinery the other solvers share applies to it. Budget it as its own stage."
+    validation: "tests/test_mules_cpp.cu. The oracle is BOUNDEDNESS, not a stored field, which is what makes the gate possible at all -- a stock run never writes the limiter. It is a PAIR of arms, because either alone is trivially satisfiable: the limited run stays in [0,1] exactly where the unlimited one does not, AND a monotone in-bounds field comes back with lambda == 1 on every face away from the domain ends. lambda == 0 everywhere passes the first and fails the second, and it is first-order upwind -- the case's scheme silently discarded."
+    note: "THE LARGEST SINGLE PIECE, and the least brae-like. An EXPLICIT, ITERATIVE, bound-preserving flux limiter -- not a matrix assembly -- so almost none of the fvm:: machinery the other solvers share applies. Landed: limiter, limit, explicitSolve. Four things the gate pins that no converged field shows: psiMaxn/psiMinn are initialised SWAPPED (:280-281) so the neighbour scan builds from the far end; the neighbourhood extrema EXCLUDE the cell's own value, which is what lets an interface advance; phiBD is overwritten with phiPsi on every non-coupled boundary so the prescribed flux is never limited (:600-609); and a wedge patch gets lambda = 0 outright (:530-533). Two things measured and NOT claimed: the running min(lambda,...) is defensive rather than load-bearing (removing it gives a bit-identical field, because both accumulators are built from lambda), and in one dimension the first pass is already the fixed point -- nLimiterIter only bites where a cell's faces are limited by different neighbours at once."
 
   interFoam_CMULES:
     openfoam:

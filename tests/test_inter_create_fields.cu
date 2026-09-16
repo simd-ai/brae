@@ -60,7 +60,12 @@ int main(int argc, char** argv)
 
     // ---- 1. damBreak's own constant/g -------------------------------------------------------------
     const std::string tut = (argc > 1) ? argv[1] : "";
-    if (!tut.empty() && std::filesystem::exists(tut + "/constant/g"))
+    if (tut.empty() || !std::filesystem::exists(tut + "/constant/g"))
+    {
+        // A SKIP, not a silent pass -- see tests/test_two_phase_mixture.cu for why this mattered.
+        std::printf("  SKIP: OpenFOAM's damBreak tutorial not found at \"%s\"\n", tut.c_str());
+        return 77;
+    }
     {
         const vector g = readGravity(tut);
         checkNum("damBreak g.x", g.x, scalar(0));
