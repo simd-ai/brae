@@ -385,10 +385,25 @@ int main(int argc, char** argv)
           iC.copyFrom(i2); bC.copyFrom(b2); };
         H.updateUBoundary =
             [&](const DeviceBuffer<scalar>& ax, const DeviceBuffer<scalar>& ay,
-                const DeviceBuffer<scalar>& az, DeviceVectorBoundary& db)
+                const DeviceBuffer<scalar>& az, DeviceVectorBoundary& db,
+                DeviceBuffer<scalar>* ubOut)
         { std::vector<scalar> x, y, z; ax.copyTo(x); ay.copyTo(y); az.copyTo(z);
           for (label c = 0; c < nC; ++c) dv.U.internal[c] = vector{x[c], y[c], z[c]};
-          dv.U.evaluateBoundary(); db = buildDeviceVectorBoundary(dv.U, fvp, g); };
+          dv.U.evaluateBoundary();
+          db = buildDeviceVectorBoundary(dv.U, fvp, g);
+          // U's STORED patch values, per component -- what fvc::grad(U) inside divDevRhoReff reads.
+          if (ubOut)
+          {
+              std::vector<scalar> bx, by, bz;
+              for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+              {
+                  const std::vector<vector>& v = dv.U.boundary[pi]->value();
+                  for (const vector& u : v) { bx.push_back(u.x); by.push_back(u.y); bz.push_back(u.z); }
+              }
+              ubOut[0].copyFrom(bx);
+              ubOut[1].copyFrom(by);
+              ubOut[2].copyFrom(bz);
+          } };
         H.interfaceForces =
             [&](const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& Kd,
                 const DeviceBuffer<scalar>& rd, DeviceBuffer<scalar>& stf,
@@ -746,6 +761,26 @@ int main(int argc, char** argv)
                     std::printf("  [dev2 alone] interior (%d cells) %.4e of %.4e;  "
                                 "patch-adjacent (%d cells) %.4e of %.4e\n",
                                 nIn, (double)wIn, (double)sIn, nBd, (double)wBd, (double)sBd);
+
+                    // ...and BY PATCH, with each patch's declared BC type beside it. Which condition
+                    // is at fault is the whole question, and a single patch-adjacent number cannot
+                    // say. damBreak brings three noSlip walls, a pressureInletOutletVelocity
+                    // atmosphere and two EMPTY patches.
+                    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                    {
+                        scalar wp = 0, sp = 0;
+                        for (label i = 0; i < fvp[pi].size; ++i)
+                        {
+                            const label c = fvp[pi].faceCells[i];
+                            const scalar dDev = dFull[c] - s0[c];
+                            const scalar hDev = hUEqn.source[c].x - h0.source[c].x;
+                            wp = std::fmax(wp, std::fabs(dDev - hDev));
+                            sp = std::fmax(sp, std::fabs(hDev));
+                        }
+                        std::printf("      %-14s %-8s %4ld faces:  %.4e of %.4e\n",
+                                    fvp[pi].name.c_str(), fvp[pi].type.c_str(),
+                                    (long)fvp[pi].size, (double)wp, (double)sp);
+                    }
                 }
 
                 // BISECT #3: UPWIND ON BOTH SIDES. The matrix is identical either way -- linearUpwind
@@ -838,6 +873,41 @@ int main(int argc, char** argv)
                 std::printf("  [taps vs host] UEqn.diag %.4e of %.4e;  rAU %.4e of %.4e;  "
                             "HbyA.x %.4e of %.4e\n",
                             (double)wD, (double)sD, (double)wR, (double)sR, (double)wH, (double)sH);
+
+                // H() takes the OFF-DIAGONALS and the BOUNDARY coefficients too, and with the source
+                // and the diagonal both exact those are what is left.
+                {
+                    std::vector<scalar> du, dl, dic, dbc;
+                    taps.UEqnUpper.copyTo(du);
+                    taps.UEqnLower.copyTo(dl);
+                    taps.UEqnIC.copyTo(dic);
+                    taps.UEqnBC.copyTo(dbc);
+                    scalar wu2 = 0, su2 = 0, wl2 = 0, sl2 = 0;
+                    for (label f = 0; f < nIf; ++f)
+                    {
+                        wu2 = std::fmax(wu2, std::fabs(du[f] - hUEqn.upper[f]));
+                        su2 = std::fmax(su2, std::fabs(hUEqn.upper[f]));
+                        wl2 = std::fmax(wl2, std::fabs(dl[f] - hUEqn.lower[f]));
+                        sl2 = std::fmax(sl2, std::fabs(hUEqn.lower[f]));
+                    }
+                    scalar wi2 = 0, si2 = 0, wb2 = 0, sb2 = 0;
+                    label off6 = 0;
+                    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                    {
+                        for (label i = 0; i < fvp[pi].size; ++i)
+                        {
+                            wi2 = std::fmax(wi2, std::fabs(dic[off6 + i] - hUEqn.internalCoeffs[pi][i].x));
+                            si2 = std::fmax(si2, std::fabs(hUEqn.internalCoeffs[pi][i].x));
+                            wb2 = std::fmax(wb2, std::fabs(dbc[off6 + i] - hUEqn.boundaryCoeffs[pi][i].x));
+                            sb2 = std::fmax(sb2, std::fabs(hUEqn.boundaryCoeffs[pi][i].x));
+                        }
+                        off6 += fvp[pi].size;
+                    }
+                    std::printf("  [taps vs host] upper %.4e of %.4e;  lower %.4e of %.4e;  "
+                                "iC.x %.4e of %.4e;  bC.x %.4e of %.4e\n",
+                                (double)wu2, (double)su2, (double)wl2, (double)sl2,
+                                (double)wi2, (double)si2, (double)wb2, (double)sb2);
+                }
 
                 // ---- phiHbyA, built on the host the way pEqn.H builds it -------------------------
                 // The momentum half is now right to 1.1e-05; this asks whether the flux the pressure

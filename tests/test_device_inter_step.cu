@@ -171,13 +171,26 @@ int main()
     };
     hooks.updateUBoundary =
         [&](const DeviceBuffer<scalar>& dx, const DeviceBuffer<scalar>& dy,
-            const DeviceBuffer<scalar>& dz, DeviceVectorBoundary& db)
+            const DeviceBuffer<scalar>& dz, DeviceVectorBoundary& db,
+                DeviceBuffer<scalar>* ubOut)
     {
         std::vector<scalar> a, b, c;
         dx.copyTo(a); dy.copyTo(b); dz.copyTo(c);
         for (label i = 0; i < nC; ++i) Uh.internal[i] = vector{a[i], b[i], c[i]};
         Uh.evaluateBoundary();
         db = buildDeviceVectorBoundary(Uh, fvp, g);
+        if (ubOut)
+        {
+            std::vector<scalar> bx, by, bz;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                const std::vector<vector>& v = Uh.boundary[pi]->value();
+                for (const vector& u : v) { bx.push_back(u.x); by.push_back(u.y); bz.push_back(u.z); }
+            }
+            ubOut[0].copyFrom(bx);
+            ubOut[1].copyFrom(by);
+            ubOut[2].copyFrom(bz);
+        }
     };
     hooks.interfaceForces =
         [&](const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& Kd,

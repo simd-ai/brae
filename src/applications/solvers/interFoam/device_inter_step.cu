@@ -125,7 +125,8 @@ void deviceInterStep(
     probe("nuEffCell", nuEffCell);
 
     // ---- 3. THE MOMENTUM MATRIX -------------------------------------------------------------------
-    hooks.updateUBoundary(UX, UY, UZ, dbU);
+    DeviceBuffer<scalar> ub[3];
+    hooks.updateUBoundary(UX, UY, UZ, dbU, ub);
 
     // THE BOUNDARY MIXTURE COMES FROM ALPHA'S PATCH VALUES, not from the face cell's. Those are
     // different fields at a contact-angle wall -- alpha's patch value is patchInternalField +
@@ -153,12 +154,9 @@ void deviceInterStep(
         deviceMixtureCorrect(alpha1Old.data(), nC, props, nullptr, rhoOld.data(), nullptr, nullptr);
     }
 
-    // U's stored boundary values, per component, for fvc::grad(U) inside divDevRhoReff.
-    DeviceBuffer<scalar> ubx, uby, ubz;
-    deviceBCValue(dbU.comp[0], UX, ubx);
-    deviceBCValue(dbU.comp[1], UY, uby);
-    deviceBCValue(dbU.comp[2], UZ, ubz);
-    const DeviceBuffer<scalar>* ubPtr[3] = {&ubx, &uby, &ubz};
+    // U's STORED boundary values, filled by the hook from the host's evaluate -- see the hook's own
+    // comment for why deviceBCValue is not a substitute.
+    const DeviceBuffer<scalar>* ubPtr[3] = {&ub[0], &ub[1], &ub[2]};
 
     gpu::MomentumInput uin;
     uin.phiInt        = &rhoPhiInt;        // the MASS flux out of the alpha equation
@@ -196,6 +194,10 @@ void deviceInterStep(
     {
         deviceCopy(taps->UEqnDiag, UEqn.relaxed ? UEqn.relaxedDiag : UEqn.diag);
         deviceCopy(taps->UEqnSourceX, UEqn.source[0]);
+        deviceCopy(taps->UEqnUpper, UEqn.upper);
+        deviceCopy(taps->UEqnLower, UEqn.lower);
+        deviceCopy(taps->UEqnIC, UEqn.iC[0]);
+        deviceCopy(taps->UEqnBC, UEqn.bC[0]);
     }
 
     // ---- 4. THE MOMENTUM PREDICTOR, if the case asks for one --------------------------------------
@@ -238,7 +240,7 @@ void deviceInterStep(
             deviceJacobiBiCGStab(Ak, b, *Uk[k], dNf.data(),
                                  ctl.momentum.tol, ctl.momentum.relTol, ctl.momentum.maxIter);
         }
-        hooks.updateUBoundary(UX, UY, UZ, dbU);
+        hooks.updateUBoundary(UX, UY, UZ, dbU, ub);
         (void)A;
     }
 
@@ -307,7 +309,7 @@ void deviceInterStep(
         // p_rgh.correctBoundaryConditions() at the end of pEqn.H, and U's with it: the next pass's
         // laplacian, its flux and its HbyA all read them.
         if (hooks.pressure.updateBoundary) hooks.pressure.updateBoundary(p_rgh);
-        hooks.updateUBoundary(UX, UY, UZ, dbU);
+        hooks.updateUBoundary(UX, UY, UZ, dbU, ub);
     }
     probe("p_rgh", p_rgh);
     probe("phi", phiInt);

@@ -50,10 +50,17 @@ struct DeviceInterStepHooks
 
     // U's boundary, rebuilt from whatever the device last wrote. It is refreshed once per step rather
     // than per corrector because interFoam's PIMPLE loop evaluates it there.
+    // `UbStored` are U's EVALUATED patch values, one buffer per component, as the host's evaluate
+    // left them. They are NOT the same as re-deriving them on the device with deviceBCValue: at a
+    // flux-conditional patch like damBreak's pressureInletOutletVelocity atmosphere the two differ,
+    // and fvc::grad(U) inside divDevRhoReff reads the STORED ones. MEASURED with the re-derived value
+    // standing in: the dev2 term's contribution was 100% wrong on that patch's 46 cells (2.24e-06 of
+    // 2.24e-06) while the three walls were between exact and 0.8%.
     std::function<void(const DeviceBuffer<scalar>& Ux,
                        const DeviceBuffer<scalar>& Uy,
                        const DeviceBuffer<scalar>& Uz,
-                       DeviceVectorBoundary&       dbU)> updateUBoundary;
+                       DeviceVectorBoundary&       dbU,
+                       DeviceBuffer<scalar>*       UbStored)> updateUBoundary;
 
     // The face fields that depend on the NEW alpha, over the mesh's FULL face array:
     // surfaceTensionForce() = interpolate(sigma*K)*snGrad(alpha1), and snGrad(rho). Both are rebuilt
@@ -83,6 +90,8 @@ struct DeviceInterStepTaps
     DeviceBuffer<scalar> phiHbyAInt;      // AFTER the two interFoam terms
     DeviceBuffer<scalar> UEqnDiag;        // relaxed, as A() takes it
     DeviceBuffer<scalar> UEqnSourceX;
+    DeviceBuffer<scalar> UEqnUpper, UEqnLower;
+    DeviceBuffer<scalar> UEqnIC, UEqnBC;   // component 0
     DeviceBuffer<scalar> ddtRhoOld;       // rho.oldTime(), the field the ddt source is built on
 };
 
