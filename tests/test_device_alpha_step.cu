@@ -38,6 +38,8 @@
 #include "geometric_field.cuh"
 #include "alpha_eqn_cpp.cuh"
 #include "interface_properties_cpp.cuh"
+#include "device_alpha_presolve.cuh"
+#include "fvm.cuh"
 #include "mules_cpp.cuh"
 #include "device_alpha_step.cuh"
 #include "device_alpha_flux.cuh"
@@ -157,7 +159,7 @@ int main()
     ip::InterfaceCoeffs ic;
     ic.cAlpha = scalar(1);
     mules::Controls mctl;
-    mctl.nLimiterIter = 3;
+    mctl.nLimiterIter = 5;      // damBreak's own value
 
     const int nAlphaCorr = 2;
     const scalar dt = scalar(0.01);              // Co = 0.24 on this mesh
@@ -177,8 +179,13 @@ int main()
     in.alpharScheme = ifm::AlphaFluxScheme::linear;
 
     // ---- the HOST trajectory ----------------------------------------------------------------------
-    auto runHost = [&](int steps)
+    auto runHost = [&](int steps, bool mulesCorr)
     {
+        ifm::AlphaStepInput hin = in;
+        hin.MULESCorr = mulesCorr;
+        hin.tolAlpha = scalar(1e-12);
+        hin.relTolAlpha = 0;
+        hin.maxIterAlpha = 2000;
         GeometricField<scalar> a;
         a.internal = a0;
         for (const FvPatch& q : fvp)
@@ -190,7 +197,7 @@ int main()
         for (int s = 0; s < steps; ++s)
         {
             const std::vector<scalar> old = a.internal;
-            ifm::alphaEqnStep(a, old, in, ic, mctl, m, g, fvp, alphaPhi, rhoPhi, nHatf, K, nullptr);
+            ifm::alphaEqnStep(a, old, hin, ic, mctl, m, g, fvp, alphaPhi, rhoPhi, nHatf, K, nullptr);
         }
         return a.internal;
     };
@@ -219,16 +226,21 @@ int main()
     din.deltaN = ip::deltaN(g.V());
     din.alphaScheme  = DeviceAlphaScheme::vanLeer;
     din.alpharScheme = DeviceAlphaScheme::linear;
-    DeviceMulesControls dmc;
-    dmc.nLimiterIter = mctl.nLimiterIter;
+    DeviceMulesControls dmcBase;
+    dmcBase.nLimiterIter = mctl.nLimiterIter;
 
     // `freezeNHatf` is arm 5's control: it keeps the interface normal at its INITIAL value instead of
     // letting the step's own mixture.correct() rewrite it, which is the one ordering fact this file
     // owns. Both runs are otherwise identical.
-    auto runDevice = [&](int steps, bool freezeNHatf, scalar cAlpha)
+    scalar worstPreSolveExcursion = 0;      // filled by the MULESCorr path, read by arm 6
+    auto runDevice = [&](int steps, bool freezeNHatf, scalar cAlpha, bool mulesCorr = false,
+                         scalar preSolveTol = scalar(1e-12), int nLimiterIter = 0)
     {
+        DeviceMulesControls dmc = dmcBase;
+        if (nLimiterIter > 0) dmc.nLimiterIter = nLimiterIter;
         DeviceAlphaStepInput li = din;
         li.cAlpha = cAlpha;
+        li.MULESCorr = mulesCorr;
 
         // The boundary is evaluated on the host from the DEVICE's own field, which is the split
         // device_alpha_step.cuh states: branchy per-patch dispatch stays off the GPU. It is rebuilt
@@ -272,8 +284,43 @@ int main()
             dAOld.copyFrom(work.internal);
             dA.copyFrom(work.internal);
 
+            if (mulesCorr)
+            {
+                // alphaEqn.H:103-155, ONCE before the correctors: the implicit upwind pre-solve, then
+                // a mixture.correct() of its own. The boundary coefficients come from the host's
+                // fvm::div, as deviceAlphaPreSolve's header requires.
+                GeometricField<scalar> ab;
+                ab.internal = work.internal;
+                for (const FvPatch& q : fvp)
+                    ab.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
+                ab.evaluateBoundary();
+                FvScalarMatrix Mb = fvm::div<scalar>(phi.internal, phi.boundary, ab, m, fvp);
+                std::vector<scalar> iCv, bCv;
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                    for (label i = 0; i < fvp[pi].size; ++i)
+                    {
+                        iCv.push_back(Mb.internalCoeffs[pi][i]);
+                        bCv.push_back(Mb.boundaryCoeffs[pi][i]);
+                    }
+                DeviceBuffer<scalar> dIC(iCv), dBC(bCv);
+                DeviceAlphaSolverControls psc;
+                psc.tol     = preSolveTol;
+                psc.relTol  = 0;
+                psc.maxIter = 2000;
+                deviceAlphaPreSolve(dm, dA, dAOld, dPhiInt, dIC, dBC, dt, psc, aPhiInt, aPhiBnd);
+                {
+                    std::vector<scalar> pv;
+                    dA.copyTo(pv);
+                    for (label c = 0; c < nC; ++c)
+                        worstPreSolveExcursion = std::fmax(worstPreSolveExcursion,
+                            std::fmax(-pv[c], pv[c] - scalar(1)));
+                }
+                correctBoundaryAndMixture();          // alphaEqn.H:151-153
+            }
+
             for (int aCorr = 0; aCorr < nAlphaCorr; ++aCorr)
             {
+                li.aCorr = aCorr;
                 DeviceAlphaBoundary db;
                 db.alpha1     = &dABnd;
                 db.nHatfBnd   = &dNHatfBnd;
@@ -291,7 +338,7 @@ int main()
     };
 
     const std::vector<scalar> dev = runDevice(nSteps, /*freezeNHatf=*/false, ic.cAlpha);
-    const std::vector<scalar> hst = runHost(nSteps);
+    const std::vector<scalar> hst = runHost(nSteps, /*mulesCorr=*/false);
     if (cudaDeviceSynchronize() != cudaSuccess)
     { std::printf("  FAIL: kernels did not complete\n"); return 1; }
 
@@ -317,7 +364,7 @@ int main()
     // here would be a term, not an accumulation, and arm 3 below could not tell the two apart.
     {
         const std::vector<scalar> d1 = runDevice(1, false, ic.cAlpha);
-        const std::vector<scalar> h1 = runHost(1);
+        const std::vector<scalar> h1 = runHost(1, /*mulesCorr=*/false);
         scalar worst = 0;
         for (label c = 0; c < nC; ++c) worst = std::fmax(worst, std::fabs(d1[c] - h1[c]));
         std::printf("  after ONE step: worst |device - host| = %.4e\n", (double)worst);
@@ -374,6 +421,81 @@ int main()
         std::printf("  freezing nHatf at its initial value moves the answer by %.4e\n", (double)d);
         check("rewriting nHatf inside the corrector is load-bearing, so the order is under test",
               d > scalar(1e-2));
+    }
+
+    // ---- 6. damBreak's OWN PATH: MULESCorr, the implicit pre-solve and CMULES -------------------
+    // 13 of the 44 shipped tutorials set `MULESCorr yes`; damBreak is one, at nAlphaCorr 2 and
+    // nLimiterIter 5, which is what this arm runs. Every piece is separately gated -- the pre-solve in
+    // tests/test_device_alpha_presolve.cu, CMULES in tests/test_device_mules_corr.cu -- so what is
+    // under test here is again the ORDER: the pre-solve once per sub-cycle and not once per corrector,
+    // a mixture.correct() of its own between it and the first corrector (alphaEqn.H:151-153), the
+    // correction taken against the flux the pre-solve left rather than against nothing, and the
+    // under-relaxation of BOTH the field and the flux from the second corrector onward.
+    {
+        worstPreSolveExcursion = 0;
+        const std::vector<scalar> devC = runDevice(nSteps, false, ic.cAlpha, /*mulesCorr=*/true);
+        const scalar excPre = worstPreSolveExcursion;
+        worstPreSolveExcursion = 0;
+        const std::vector<scalar> devLoose =
+            runDevice(nSteps, false, ic.cAlpha, /*mulesCorr=*/true, /*preSolveTol=*/scalar(1e-6));
+        const scalar excPreLoose = worstPreSolveExcursion;
+        scalar excLoose = 0;
+        for (label c = 0; c < nC; ++c)
+            excLoose = std::fmax(excLoose, std::fmax(-devLoose[c], devLoose[c] - scalar(1)));
+        std::printf("  pre-solve's own worst excursion: %.3e at tol 1e-12, %.3e at tol 1e-6 "
+                    "(final field at 1e-6: %.3e)\n",
+                    (double)excPre, (double)excPreLoose, (double)excLoose);
+        check("the implicit pre-solve is EXACTLY bounded when it is solved exactly",
+              excPre <= scalar(1e-14));
+        check("...and its excursion tracks the linear solver's tolerance, so that is where a loose "
+              "pre-solve leaks", excPreLoose > scalar(1e-9));
+
+        // ...and the same sweep in nLimiterIter, which is where the FINAL field's excursion comes
+        // from: MULES is a fixed-point iteration and its bound is exact only in the limit.
+        const std::vector<scalar> devIter =
+            runDevice(nSteps, false, ic.cAlpha, true, scalar(1e-12), /*nLimiterIter=*/40);
+        scalar excIter = 0;
+        for (label c = 0; c < nC; ++c)
+            excIter = std::fmax(excIter, std::fmax(-devIter[c], devIter[c] - scalar(1)));
+        const std::vector<scalar> hstC = runHost(nSteps, /*mulesCorr=*/true);
+
+        scalar exc = 0, excH = 0, worst = 0, moved = 0;
+        for (label c = 0; c < nC; ++c)
+        {
+            exc   = std::fmax(exc, std::fmax(-devC[c], devC[c] - scalar(1)));
+            excH  = std::fmax(excH, std::fmax(-hstC[c], hstC[c] - scalar(1)));
+            worst = std::fmax(worst, std::fabs(devC[c] - hstC[c]));
+            moved = std::fmax(moved, std::fabs(devC[c] - a0[c]));
+        }
+        std::printf("  MULESCorr, %d steps x %d correctors: excursion device %.3e / host %.3e, "
+                    "worst |device - host| %.4e, the field moved %.4f\n",
+                    nSteps, nAlphaCorr, (double)exc, (double)excH, (double)worst, (double)moved);
+        std::printf("  ...and at nLimiterIter 40 instead of %d the excursion is %.3e\n",
+                    (int)mctl.nLimiterIter, (double)excIter);
+        // NOT "exactly bounded", because it is not, and the host says the same number to three
+        // digits. CMULES bounds the CORRECTION against a budget it reaches by fixed-point iteration,
+        // so the bound is exact only in the limit -- unlike the explicit path in arm 1, which comes
+        // back at 0.000e+00 and whose assertion stays exact. What is asserted here is what holds: the
+        // excursion is small, it is the host's, and it SHRINKS when the iteration is given more
+        // passes. An arm that demanded [0,1] exactly here would have to be satisfied by weakening
+        // something real, and an arm that merely bounded it at 1e-5 would not notice a limiter that
+        // had stopped iterating at all.
+        check("the semi-implicit path holds alpha to within 1e-5 of [0,1]", exc <= scalar(1e-5));
+        check("...the SAME excursion the host reaches, so it is CMULES' and not the device's",
+              std::fabs(exc - excH) < scalar(1e-3)*exc);
+        check("...and more limiter passes shrink it, which is what makes it the iteration's",
+              excIter < scalar(0.5)*exc);
+        check("...and tracks the host over forty steps", worst < scalar(1e-9));
+        check("...having actually advected", moved > scalar(0.5));
+
+        // THE DISCRIMINATOR: the two paths must not agree. If they did, this arm would be re-testing
+        // the explicit one -- the implicit pre-solve advances alpha with first-order upwind before the
+        // correctors ever run, so the answer after forty steps is a different field.
+        scalar apart = 0;
+        for (label c = 0; c < nC; ++c) apart = std::fmax(apart, std::fabs(devC[c] - dev[c]));
+        std::printf("  ...and it differs from the explicit path by %.4e\n", (double)apart);
+        check("MULESCorr gives a different answer from the explicit path, so this arm is not a "
+              "second copy of arm 3", apart > scalar(1e-2));
     }
 
     std::printf("test_device_alpha_step: %d failures\n", failures);

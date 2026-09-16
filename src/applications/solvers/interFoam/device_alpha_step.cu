@@ -1,6 +1,7 @@
 // The device alpha step -- see device_alpha_step.cuh for the provenance and for what is NOT here.
 #include "device_alpha_step.cuh"
 #include "device_alpha_flux.cuh"
+#include "device_mules.cuh"
 #include <stdexcept>
 #include <string>
 
@@ -43,11 +44,35 @@ __global__ void upwindWeightKernel(const scalar* __restrict__ phi, int n, scalar
     if (i < n) w[i] = (phi[i] >= scalar(0)) ? scalar(1) : scalar(0);
 }
 
+// alphaPhi10 += w*corr (alphaEqn.H:203). w is 1 on the first corrector and 0.5 after.
+__global__ void axpyKernel(scalar w, const scalar* __restrict__ corr, int n, scalar* __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] += w*corr[i];
+}
+
+// alpha1 = 0.5*alpha1 + 0.5*alpha10 (alphaEqn.H:197-201). BOTH halves of the state are relaxed -- the
+// field here and the flux in axpyKernel above. Relaxing one and not the other leaves alpha and
+// alphaPhi10 describing different states, and rhoPhi is built from the flux while UEqn is built on the
+// field.
+__global__ void relaxKernel(const scalar* __restrict__ alpha10, int nC, scalar* __restrict__ alpha1)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c < nC) alpha1[c] = scalar(0.5)*alpha1[c] + scalar(0.5)*alpha10[c];
+}
+
 __global__ void addKernel(const scalar* __restrict__ a, const scalar* __restrict__ b,
                           int n, scalar* __restrict__ out)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = a[i] + b[i];
+}
+
+void copyFaces(int n, const DeviceBuffer<scalar>& in, DeviceBuffer<scalar>& out)
+{
+    if (n <= 0) return;
+    out.resize(static_cast<std::size_t>(n));
+    ckS(cudaMemcpy(out.data(), in.data(), sizeof(scalar)*n, cudaMemcpyDeviceToDevice), "copy faces");
 }
 
 void addFaces(int n, const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& b,
@@ -154,6 +179,7 @@ void deviceAlphaCorrector(
     DeviceBuffer<scalar> advInt, advBnd, negPhirInt, negPhirBnd;
     DeviceBuffer<scalar> innerInt, innerBnd, negInnerInt, negInnerBnd, compInt, compBnd;
     DeviceBuffer<scalar> phiBDInt, phiBDBnd, corrInt, corrBnd, lamInt, lamBnd;
+    DeviceBuffer<scalar> unInt, unBnd, alpha10;
     DeviceMulesFields mf;                       // all null: rho == 1, Sp == Su == 0, bounds [0,1]
 
     // phic = cAlpha*|phi/magSf|, zeroed on every non-coupled boundary face.
@@ -184,13 +210,67 @@ void deviceAlphaCorrector(
     deviceNegateFaces(nBf, innerBnd, negInnerBnd);
     fluxWithScheme(dm, in.alpharScheme, negInnerInt, negInnerBnd, alpha1, *bnd.alpha1,
                    compInt, compBnd);
-    addFaces(nIf, advInt, compInt, alphaPhi10Int);
-    addFaces(nBf, advBnd, compBnd, alphaPhi10Bnd);
+    addFaces(nIf, advInt, compInt, unInt);
+    addFaces(nBf, advBnd, compBnd, unBnd);
+
+    if (in.MULESCorr)
+    {
+        // alphaEqn.H:178-205. The high-order flux is not limited as a whole here: what CMULES limits
+        // is what it ADDS to the flux the implicit pre-solve already applied, because that half has
+        // already advanced alpha a full time step.
+        if (static_cast<int>(alphaPhi10Int.size()) != nIf
+         || static_cast<int>(alphaPhi10Bnd.size()) != nBf)
+            throw std::runtime_error(
+                "brae interFoam device alphaEqn: on the MULESCorr path alphaPhi10 comes IN as the flux "
+                "the pre-solve or the previous corrector left. An empty one would make the correction "
+                "the whole high-order flux, which is the explicit path wearing CMULES' limiter.");
+
+        deviceSubtractFaces(nIf, unInt, alphaPhi10Int, corrInt);
+        deviceSubtractFaces(nBf, unBnd, alphaPhi10Bnd, corrBnd);
+
+        // saved BEFORE the correction, for the relaxation below
+        alpha10.resize(static_cast<std::size_t>(nC));
+        ckS(cudaMemcpy(alpha10.data(), alpha1.data(), sizeof(scalar)*nC, cudaMemcpyDeviceToDevice),
+            "alpha10 = alpha1");
+
+        // MULES::correctLimited: limit the correction in place, then apply it to the CURRENT alpha.
+        //
+        // THE FLUX THE OUTLET TEST READS IS alphaPhiUn, NOT phiCN. OpenFOAM's call is
+        //     MULES::correct(geometricOneField(), alpha1, talphaPhi1Un(), talphaPhi1Corr.ref(), ...)
+        // so the "total flux leaves the domain" test of device_mules.cuh (C) is on
+        // alphaPhiUn + phiCorr. Passing phiCN here was this file's first wiring and it is a different
+        // quantity -- phiCN is the volumetric flux, alphaPhiUn is the alpha flux, and on a boundary
+        // face holding alpha they differ by a factor of alpha.
+        deviceMulesLimitCorr(dm, nIf, nBf, rDeltaT, alpha1, *bnd.alpha1, *bnd.fixesValue, *bnd.flag,
+                             unBnd, corrInt, corrBnd, mf, mulesCtl);
+        deviceMulesCorrect(dm, rDeltaT, corrInt, corrBnd, mf, alpha1);
+
+        // UNDER-RELAXED FOR EVERY CORRECTOR BUT THE FIRST, both halves (alphaEqn.H:195-205).
+        const scalar w = (in.aCorr == 0) ? scalar(1) : scalar(0.5);
+        if (in.aCorr != 0)
+        {
+            relaxKernel<<<nBlocks(nC), TPB>>>(alpha10.data(), nC, alpha1.data());
+            ckS(cudaGetLastError(), "corrector relaxation");
+        }
+        if (nIf > 0)
+        {
+            axpyKernel<<<nBlocks(nIf), TPB>>>(w, corrInt.data(), nIf, alphaPhi10Int.data());
+            ckS(cudaGetLastError(), "alphaPhi10 += w*corr");
+        }
+        if (nBf > 0)
+        {
+            axpyKernel<<<nBlocks(nBf), TPB>>>(w, corrBnd.data(), nBf, alphaPhi10Bnd.data());
+            ckS(cudaGetLastError(), "alphaPhi10 += w*corr, boundary");
+        }
+        return;
+    }
 
     // MULES::explicitSolve(geometricOneField(), alpha1, phiCN, alphaPhi10, 0, 0, 1, 0) --
     // alphaEqn.H:208-220. alphaPhi10 IS alphaPhiUn on the explicit path, limited IN PLACE, and the
     // limiter runs against phiCN rather than phi: on a Crank-Nicolson case those differ, and
     // bounding the correction against the wrong flux would bound the wrong equation.
+    copyFaces(nIf, unInt, alphaPhi10Int);
+    copyFaces(nBf, unBnd, alphaPhi10Bnd);
     deviceMulesDonorFlux(dm, nIf, nBf, *in.phiCNInt, alpha1, alphaPhi10Bnd, phiBDInt, phiBDBnd);
     deviceSubtractFaces(nIf, alphaPhi10Int, phiBDInt, corrInt);
     deviceSubtractFaces(nBf, alphaPhi10Bnd, phiBDBnd, corrBnd);

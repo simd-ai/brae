@@ -75,6 +75,18 @@ struct DeviceAlphaStepInput
 
     DeviceAlphaScheme alphaScheme  = DeviceAlphaScheme::vanLeer;
     DeviceAlphaScheme alpharScheme = DeviceAlphaScheme::linear;
+
+    // THE SEMI-IMPLICIT PATH, `MULESCorr yes` -- 13 of the 44 shipped tutorials, damBreak among them
+    // (nAlphaCorr 2, nLimiterIter 5). The caller runs deviceAlphaPreSolve ONCE per sub-cycle before
+    // the first corrector and hands its flux in as alphaPhi10; each corrector then computes what the
+    // high-order flux ADDS to that, limits the addition with CMULES and applies it. With MULESCorr
+    // off, alphaPhi10 is an output and the corrector limits the whole flux instead.
+    bool MULESCorr = false;
+
+    // Which corrector this is. It selects the under-relaxation weight OpenFOAM applies from the SECOND
+    // corrector onward (alphaEqn.H:195-205), and it is the caller's loop index rather than a scalar
+    // because the 0.5 is OpenFOAM's number and not a tunable.
+    int aCorr = 0;
 };
 
 // alpha1's boundary, evaluated by the caller. `nHatf` is the interface flux the previous
@@ -102,6 +114,12 @@ struct DeviceAlphaBoundary
 //   evaluate alpha1's boundary   -- MULES::explicitSolve ends with psi.correctBoundaryConditions()
 //   deviceInterfaceCorrect       -- mixture.correct(), alphaEqn.H:225, which reads that NEW boundary.
 //
+// ...and on the MULESCorr path, ONCE before the loop, deviceAlphaPreSolve followed by a
+// deviceInterfaceCorrect of its own -- alphaEqn.H:151-153. That extra mixture.correct() is inside the
+// MULESCorr block and before the correctors, and it is a calculateK pass in its own right. Missing it
+// put damBreak at 1.05e-07 against OpenFOAM where the full sequence gives 3.4346e-09, thirty times
+// worse, and only damBreak could show it because it is the case that sets MULESCorr.
+//
 // The second was inside this call once. It read the PRE-solve boundary, which put nHatf 2.885e-04 out
 // on a field whose largest value is 1.7e-03 -- see device_interface_properties.cuh for the measurement.
 //
@@ -116,6 +134,8 @@ void deviceAlphaCorrector(
     const DeviceAlphaBoundary&     bnd,
     const DeviceMulesControls&     mulesCtl,
     const DeviceBuffer<scalar>&    nHatfInt,       // read only: what the last mixture.correct() left
+    // OUT with MULESCorr off -- the limited high-order flux. IN AND OUT with it on: in as the flux the
+    // pre-solve (or the previous corrector) left, out with this corrector's limited correction added.
     DeviceBuffer<scalar>&          alphaPhi10Int,
     DeviceBuffer<scalar>&          alphaPhi10Bnd);
 
