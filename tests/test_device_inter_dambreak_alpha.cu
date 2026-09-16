@@ -390,6 +390,16 @@ int main(int argc, char** argv)
         { std::vector<scalar> x, y, z; ax.copyTo(x); ay.copyTo(y); az.copyTo(z);
           for (label c = 0; c < nC; ++c) dv.U.internal[c] = vector{x[c], y[c], z[c]};
           dv.U.evaluateBoundary();
+          // the flux-conditional velocity patches, as the solver's pressureCorrector does -- see the
+          // note there. Both sides of this comparison must resolve them the same way or the dev2 term
+          // reads a different U at the patch.
+          for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+          {
+              std::vector<vector> Uc(static_cast<std::size_t>(fvp[pi].size), vector{0, 0, 0});
+              for (label i = 0; i < fvp[pi].size; ++i)
+                  Uc[i] = dv.U.internal[fvp[pi].faceCells[i]];
+              dv.U.boundary[pi]->updateFromPatchVelocity(dv.U.boundary[pi]->value(), Uc, {});
+          }
           db = buildDeviceVectorBoundary(dv.U, fvp, g);
           // U's STORED patch values, per component -- what fvc::grad(U) inside divDevRhoReff reads.
           if (ubOut)
@@ -634,6 +644,18 @@ int main(int argc, char** argv)
                 for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                     Uh2.boundary.push_back(std::move(tmpf.U.boundary[pi]));
                 Uh2.evaluateBoundary();
+                // ...and the flux-conditional velocity patches, as the solver's pressureCorrector now
+                // does. Without it the REFERENCE carries the written seed at
+                // pressureInletOutletVelocity and its boundaryCoeffs come out 3.34e-06 where OpenFOAM's
+                // own are 0 -- so the comparison would be against a matrix brae's solver does not
+                // build either. MEASURED with tools/dumpInterFoam: OpenFOAM |bC| = 0 on that patch.
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                {
+                    std::vector<vector> Uc(static_cast<std::size_t>(fvp[pi].size), vector{0, 0, 0});
+                    for (label i = 0; i < fvp[pi].size; ++i)
+                        Uc[i] = Uh2.internal[fvp[pi].faceCells[i]];
+                    Uh2.boundary[pi]->updateFromPatchVelocity(Uh2.boundary[pi]->value(), Uc, {});
+                }
 
                 InterMomentumInput hm;
                 hm.rhoPhi = &rpi_host_int;

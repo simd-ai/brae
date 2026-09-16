@@ -383,6 +383,31 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
             }
             correctVelocity(HbyA, rAU, faceFlux, rAUfField.internal, ffB, rB, m, g, patches, U.internal);
             U.evaluateBoundary();
+
+            // ...AND THE FLUX-CONDITIONAL VELOCITY PATCHES, which evaluateBoundary() alone does not
+            // resolve. pressureInletOutletVelocity is a directionMixed: OpenFOAM's evaluate() leaves
+            // the patch value at patchInternalField on an OUTFLOW face and at the normal component of
+            // it on an INFLOW one, and its matrix coefficients are built from THAT value --
+            // valueBoundaryCoeffs = value - (1 - d)*pif, which is identically zero on outflow BECAUSE
+            // value == pif there. Leaving the WRITTEN seed in place instead makes it value - pif,
+            // which is not zero.
+            //
+            // MEASURED on damBreak with tools/dumpInterFoam, which dumps OpenFOAM's own assembled
+            // UEqn.boundaryCoeffs(): OpenFOAM |bC| = 0 on the atmosphere, brae's host 3.3406e-06, and
+            // brae's DEVICE path 0 -- the device was right and this was the defect. rhoSimpleFoam has
+            // called updateFromPatchVelocity for this reason since its own pcEqn gate; interFoam never
+            // did.
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                const FvPatch& q = patches[pi];
+                std::vector<vector> Ucell(static_cast<std::size_t>(q.size), vector{0, 0, 0});
+                for (label i = 0; i < q.size; ++i)
+                {
+                    const label c = q.faceCells[i];
+                    if (c >= 0 && c < static_cast<label>(U.internal.size())) Ucell[i] = U.internal[c];
+                }
+                U.boundary[pi]->updateFromPatchVelocity(U.boundary[pi]->value(), Ucell, {});
+            }
         }
     }
 
