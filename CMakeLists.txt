@@ -3162,6 +3162,21 @@ target_include_directories(test_inter_case_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_inter_case_cpp PRIVATE brae_core)
 add_test(NAME interfoam_createfields_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_createfields_vs_openfoam.sh)
+
+# interFoam step 16: brae's interFoam against REAL OpenFOAM's, on damBreak, after exactly N IDENTICAL
+# time steps. The gate rewrites the case with `adjustTimeStep no` before running either -- an adaptive
+# step makes the two diverge in TIME the moment their Courant numbers differ at all, and then every
+# field is compared at a different instant.
+add_executable(test_inter_dambreak_vs_openfoam tests/test_inter_dambreak_vs_openfoam.cu)
+target_include_directories(test_inter_dambreak_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_inter_dambreak_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_dambreak_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_dambreak_vs_openfoam.sh)
+set_tests_properties(interfoam_dambreak_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_inter_dambreak_vs_openfoam
+                     TIMEOUT 900)
 set_tests_properties(interfoam_createfields_vs_openfoam PROPERTIES
                      ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
                      SKIP_RETURN_CODE 77

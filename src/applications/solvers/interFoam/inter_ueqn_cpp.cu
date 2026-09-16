@@ -203,6 +203,7 @@ void momentumPredictor(GeometricField<vector>&     U,
                        const PrimitiveMesh&        m,
                        const FvGeometry&           g,
                        const std::vector<FvPatch>& patches,
+                       bool                        solveMomentum,
                        FvVectorMatrix&             UEqnOut)
 {
     // ORDER IS OpenFOAM's: assemble and RELAX first, then add the face force. `solve(UEqn == R)`
@@ -212,6 +213,9 @@ void momentumPredictor(GeometricField<vector>&     U,
 
     // rAU and H() are taken from the relaxed matrix BEFORE the face force, which is why the matrix is
     // handed back to the caller here rather than after.
+    // UEqn.H:17-31 wraps the solve in `if (pimple.momentumPredictor())`. With it off the matrix is
+    // still assembled and relaxed -- pEqn needs A() and H() -- and U is untouched.
+    if (!solveMomentum) return;
     FvVectorMatrix solved = UEqnOut;
     addMomentumPredictorSource(solved, faceForce, m, g, patches);
     solveVector(solved, U, m, patches, sc.tolU, sc.relTolU, sc.maxIterU);

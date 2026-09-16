@@ -36,7 +36,8 @@ RunReport runInterFoam(const std::string&          caseDir,
                        const FvGeometry&           g,
                        const std::vector<FvPatch>& patches,
                        label                       nSteps,
-                       bool                        verbose)
+                       bool                        verbose,
+                       InterFields*                fieldsOut)
 {
     InterFields f = buildInterFields(caseDir, startDir, m, g, patches);
     const label nC = m.nCells();
@@ -55,10 +56,10 @@ RunReport runInterFoam(const std::string&          caseDir,
     for (label step = 0; step < nSteps; ++step)
     {
         // The stages, in interFoam.C's order. runTimeStep owns the order; this lambda owns the work.
-        LoopControls lc;
-        lc.nOuterCorrectors = 1;                 // damBreak's fvSolution: PIMPLE { nOuterCorrectors 1 }
-        lc.nCorrectors      = 3;                 // ...and nCorrectors 3
-        lc.frozenFlow       = false;
+        // THE CASE'S OWN PIMPLE CONTROLS, read in buildInterFields. These were hardcoded here until
+        // damBreak's fvSolution was actually read: it says nOuterCorrectors 1, nCorrectors 3 AND
+        // `momentumPredictor no`, and the last of those changes which algorithm runs.
+        const LoopControls lc = f.pimple;
 
         SolverHooks hooks;
         hooks.run = [&](Stage s)
@@ -208,7 +209,8 @@ RunReport runInterFoam(const std::string&          caseDir,
 
                     MomentumSolveControls msc;
                     FvVectorMatrix UEqn;
-                    momentumPredictor(f.U, mi, force, msc, m, g, patches, UEqn);
+                    momentumPredictor(f.U, mi, force, msc, m, g, patches,
+                                      f.momentumPredictorOn, UEqn);
 
                     DdtCorrInput dc;
                     dc.phiOld = &phiOld; dc.UOld = &UOld; dc.deltaT = rep.deltaT;
@@ -219,6 +221,7 @@ RunReport runInterFoam(const std::string&          caseDir,
 
                     PressureSolveControls psc;
                     psc.nCorrectors = lc.nCorrectors;
+                    psc.nNonOrthogonalCorrectors = f.nNonOrthogonalCorrectors;
                     psc.needReference = false;          // damBreak's atmosphere is totalPressure
                     psc.tolP = scalar(1e-9);
                     for (label c = 0; c < lc.nCorrectors; ++c)
@@ -274,6 +277,7 @@ RunReport runInterFoam(const std::string&          caseDir,
         const std::vector<scalar> d = fvc::div(f.phi, m, g, patches);
         for (scalar v : d) rep.worstDivPhi = std::fmax(rep.worstDivPhi, std::fabs(v));
     }
+    if (fieldsOut) *fieldsOut = std::move(f);
     return rep;
 }
 

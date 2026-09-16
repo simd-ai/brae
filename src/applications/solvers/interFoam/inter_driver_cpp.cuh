@@ -53,7 +53,11 @@ RunReport runInterFoam(const std::string&          caseDir,
                        const FvGeometry&           g,
                        const std::vector<FvPatch>& patches,
                        label                       nSteps,
-                       bool                        verbose = true);
+                       bool                        verbose = true,
+                       // The FIELDS at the end, for a gate that has to compare them against
+                       // OpenFOAM's own. A solver's real output is files; this exists so the
+                       // comparison does not have to write and re-read them.
+                       InterFields*                fieldsOut = nullptr);
 
 } // namespace interFoam
 } // namespace cpu

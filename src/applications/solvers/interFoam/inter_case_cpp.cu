@@ -173,6 +173,24 @@ InterFields buildInterFields(const std::string&          caseDir,
                                                                       : DdtScheme::steadyState)));
     }
 
+    // fvSolution's PIMPLE block -- see InterFields::pimple for why momentumPredictor is read rather
+    // than assumed.
+    {
+        const FoamDict* pim = fvSolution.subDict("PIMPLE");
+        if (!pim)
+            throw std::runtime_error(
+                "brae interFoam: fvSolution has no PIMPLE block. interFoam is a PIMPLE solver and every "
+                "shipped tutorial carries one; there is no default to fall back to.");
+        f.pimple.nOuterCorrectors = static_cast<label>(pim->scalarOr("nOuterCorrectors", scalar(1)));
+        f.pimple.nCorrectors      = static_cast<label>(pim->scalarOr("nCorrectors", scalar(1)));
+        f.nNonOrthogonalCorrectors =
+            static_cast<label>(pim->scalarOr("nNonOrthogonalCorrectors", scalar(0)));
+        const std::string mp = pim->wordOr("momentumPredictor", "yes");
+        f.momentumPredictorOn = !(mp == "no" || mp == "false" || mp == "off" || mp == "0");
+        f.pimple.frozenFlow = false;
+        f.pimple.turbOnFinalIterOnly = true;
+    }
+
     // --- gravity ------------------------------------------------------------------------------
     f.g          = readGravity(caseDir);
     f.hRef       = readHRef(caseDir);

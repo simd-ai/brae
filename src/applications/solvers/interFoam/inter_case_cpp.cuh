@@ -46,6 +46,7 @@
 #include "interface_properties_cpp.cuh"
 #include "alpha_eqn_cpp.cuh"
 #include "inter_ueqn_cpp.cuh"
+#include "inter_solve_cpp.cuh"
 #include "inter_create_fields_cpp.cuh"
 #include "mules_cpp.cuh"
 #include <memory>
@@ -81,6 +82,14 @@ struct InterFields
     AlphaFluxScheme              divPhirbAlpha  = AlphaFluxScheme::linear;
     AlphaDdt                     ddtAlpha       = AlphaDdt::Euler;
     DdtScheme                    ddtU           = DdtScheme::Euler;
+
+    // fvSolution's PIMPLE block. READ, not assumed: damBreak sets `momentumPredictor no`, which means
+    // UEqn is ASSEMBLED AND NEVER SOLVED -- the matrix exists so pEqn can take A() and H() from it,
+    // and the velocity is left entirely to the pressure corrector. A driver that always solves the
+    // momentum equation runs a different algorithm on the canonical case and converges anyway.
+    LoopControls pimple;
+    label   nNonOrthogonalCorrectors = 0;
+    bool    momentumPredictorOn = true;
 
     vector  g{0, 0, 0};
     scalar  hRef = 0;

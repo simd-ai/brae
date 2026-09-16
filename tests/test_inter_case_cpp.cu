@@ -502,7 +502,7 @@ int main(int argc, char** argv)
 
         MomentumSolveControls sc;
         FvVectorMatrix UEqn;
-        momentumPredictor(U, in, force, sc, m, g, patches, UEqn);
+        momentumPredictor(U, in, force, sc, m, g, patches, true, UEqn);
 
         // THE PREDICTOR ALONE PRODUCES A HUGE INTERFACE VELOCITY, AND THAT IS CORRECT.
         //
@@ -629,7 +629,7 @@ int main(int argc, char** argv)
 
         MomentumSolveControls msc;
         FvVectorMatrix UEqn;
-        momentumPredictor(U, mi, force2, msc, m, g, patches, UEqn);
+        momentumPredictor(U, mi, force2, msc, m, g, patches, true, UEqn);
         scalar afterPredictor = 0;
         for (const vector& v : U.internal)
             afterPredictor = std::fmax(afterPredictor, std::sqrt(v.x*v.x + v.y*v.y + v.z*v.z));

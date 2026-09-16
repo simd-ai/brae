@@ -339,6 +339,11 @@ void momentumPredictor(GeometricField<vector>&     U,
                        const PrimitiveMesh&        m,
                        const FvGeometry&           g,
                        const std::vector<FvPatch>& patches,
+                       // pimple.momentumPredictor(). FALSE means ASSEMBLE AND RELAX BUT DO NOT SOLVE --
+                       // the matrix is still needed for rAU = 1/A() and H(), and U is left for the
+                       // pressure corrector. damBreak sets `momentumPredictor no`, so this is the
+                       // canonical case's own setting, not an exotic one.
+                       bool                        solveMomentum,
                        FvVectorMatrix&             UEqnOut);
 
 } // namespace interFoam
