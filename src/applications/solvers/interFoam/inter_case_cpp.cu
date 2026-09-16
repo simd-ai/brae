@@ -240,6 +240,15 @@ InterFields buildInterFields(const std::string&          caseDir,
         std::vector<vector> Cf(static_cast<std::size_t>(m.nInternalFaces()));
         for (label i = 0; i < m.nInternalFaces(); ++i) Cf[i] = g.Cf()[i];
         ghField(f.g, f.ghRefValue, Cf, f.ghfInternal);
+
+        f.ghfBoundary.resize(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const FvPatch& q = patches[pi];
+            std::vector<vector> bCf(static_cast<std::size_t>(q.size));
+            for (label i = 0; i < q.size; ++i) bCf[i] = g.Cf()[q.start + i];
+            ghField(f.g, f.ghRefValue, bCf, f.ghfBoundary[pi]);
+        }
     }
     staticPressure(f.p_rgh.internal, f.rho, f.gh, f.p);
 

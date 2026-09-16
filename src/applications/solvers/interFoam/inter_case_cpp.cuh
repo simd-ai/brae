@@ -76,7 +76,12 @@ struct InterFields
     // filled by buildInterFields and not left empty.
     SurfaceScalarField  nHatf;
     std::vector<scalar> K;
-    std::vector<scalar> ghfInternal;       // gh on the internal faces
+    std::vector<scalar> ghfInternal;                 // gh on the internal faces
+    // ...AND ON THE BOUNDARY. The face forces are surfaceScalarFields, boundary included, and at a
+    // contact-angle wall snGrad(alpha) is the contact angle's own gradient -- so zeroing the boundary
+    // of the surface-tension force removes exactly the term the contact angle exists to apply. That
+    // was measured on capillaryRise: it is worth 6% of the velocity at step 1.
+    std::vector<std::vector<scalar>> ghfBoundary;
     SurfaceScalarField  rhoPhi;
 
     // --- the case's own settings

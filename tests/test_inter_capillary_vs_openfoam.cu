@@ -195,6 +195,53 @@ int main(int argc, char** argv)
                         (double)ofU[cw].x, (double)ofU[cw].y);
     }
 
+    // THE WALL GRADIENT AFTER THE RUN, brae vs OpenFOAM's own written alpha. constantAlphaContactAngle
+    // derives from fixedGradient, so OpenFOAM WRITES its `gradient` list -- which means the fixed point
+    // the contact angle converges to is directly comparable without instrumenting anything. If the two
+    // wall gradients agree and the velocities do not, the remaining difference is downstream of the
+    // curvature; if they disagree, it is the contact angle's own iteration.
+    {
+        const FieldData<scalar> ofA = readField<scalar>(ofDir + "/alpha.water");
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (fin.alpha1.boundary[pi]->contactAngleTheta0() < scalar(0)) continue;
+            const std::vector<scalar> bg = fin.alpha1.boundary[pi]->snGrad(fin.alpha1.internal);
+            const PatchFieldData<scalar>* op = nullptr;
+            for (const auto& b : ofA.boundary) if (b.name == patches[pi].name) op = &b;
+            if (!op || op->gradientValues.size() != bg.size())
+            {
+                std::printf("  (OpenFOAM wrote no wall gradient for '%s')\n", patches[pi].name.c_str());
+                break;
+            }
+            scalar w = 0, r = 0, sb = 0, so = 0;
+            std::size_t nbz = 0, noz = 0, iw = 0;
+            for (std::size_t i = 0; i < bg.size(); ++i)
+            {
+                const scalar e = std::fabs(bg[i] - op->gradientValues[i]);
+                if (e > w) { w = e; iw = i; }
+                r = std::fmax(r, std::fabs(op->gradientValues[i]));
+                sb += std::fabs(bg[i]); so += std::fabs(op->gradientValues[i]);
+                if (std::fabs(bg[i]) > scalar(1e-30)) ++nbz;
+                if (std::fabs(op->gradientValues[i]) > scalar(1e-30)) ++noz;
+            }
+            std::printf("  wall gradient after the run: %zu non-zero (OpenFOAM %zu); "
+                        "worst %.4e of %.4e at face %zu (brae %.6e, OF %.6e)\n",
+                        nbz, noz, (double)w, (double)r, iw,
+                        (double)bg[iw], (double)op->gradientValues[iw]);
+            std::printf("    sum|brae| %.6e  sum|OF| %.6e  ratio %.6f\n",
+                        (double)sb, (double)so, (double)(so > 0 ? sb/so : 0));
+            // After ONE step the two agree exactly -- 2 faces each, gradient 9681.222 vs 9681.222 to
+            // 4.5e-10. After FIVE, brae's contact line has spread to 330 faces against OpenFOAM's 326
+            // and the worst gradient differs by 0.15%. So the contact angle itself is exact and what
+            // drifts is where the interface has got to, which is the open finding above.
+            std::printf("    (%.1f%% more faces active than OpenFOAM)\n",
+                        (double)(100.0*(double(nbz) - double(noz))/double(noz)));
+            check("the contact line is in the same place, to within a few faces of OpenFOAM's",
+                  nbz <= noz + noz/20 + 2 && nbz + noz/20 + 2 >= noz);
+            check("...and carries a gradient of the same size", w < scalar(0.01) * r);
+        }
+    }
+
     const scalar rel = uLinf / uRef;
     std::printf("  OPEN: brae is %.1f%% off OpenFOAM, worst at the contact line\n", (double)(100*rel));
     // TIGHTENED twice from its original 0.90: to 0.30 after the boundary-gradient fix (76.5% ->

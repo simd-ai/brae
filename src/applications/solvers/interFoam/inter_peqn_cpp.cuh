@@ -186,6 +186,13 @@ struct PressureStepInput
     const std::vector<scalar>* rho       = nullptr;
     const std::vector<scalar>* gh        = nullptr;
     const std::vector<scalar>* ghf       = nullptr;   // internal faces
+    // ...AND THE BOUNDARY. `phiHbyA += phig` in pEqn.H is a whole-surfaceScalarField operation, and
+    // fvc::div(phiHbyA) sums the boundary faces -- so the wall's buoyancy and surface tension enter
+    // the PRESSURE EQUATION'S SOURCE through it. Adding phig to the internal faces alone drops that
+    // entirely, which at a contact-angle wall is the term the contact angle exists to apply. Measured
+    // on capillaryRise, where momentumPredictor is off and the pressure corrector is the ONLY route
+    // the surface tension has into the solution.
+    const std::vector<std::vector<scalar>>* ghfBnd = nullptr;
     const SurfaceScalarField*  stf       = nullptr;   // surfaceTensionForce, faces
     const SurfaceScalarField*  snGradRho = nullptr;
     const DdtCorrInput*        ddt       = nullptr;   // null = no ddtCorr (steady start)

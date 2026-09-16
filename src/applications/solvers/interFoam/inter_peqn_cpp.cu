@@ -288,6 +288,27 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
     buoyancyFlux(in.stf->internal, *in.ghf, in.snGradRho->internal, rAUfField.internal, g.magSf(), phig);
     for (label f = 0; f < nIf; ++f) phiHbyA.internal[f] += phig[f];
 
+    // ...ON THE BOUNDARY TOO -- see PressureStepInput::ghfBnd. rAUf at an uncoupled patch is the face
+    // cell's rAU, which is what fvc::interpolate gives there.
+    std::vector<std::vector<scalar>> phigBnd(patches.size());
+    if (in.ghfBnd)
+    {
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const FvPatch& q = patches[pi];
+            std::vector<scalar> rAUfb(static_cast<std::size_t>(q.size));
+            for (label i = 0; i < q.size; ++i) rAUfb[i] = rAU[q.faceCells[i]];
+            buoyancyFlux(in.stf->boundary[pi], (*in.ghfBnd)[pi], in.snGradRho->boundary[pi],
+                         rAUfb, q.magSf, phigBnd[pi]);
+            for (label i = 0; i < q.size; ++i) phiHbyA.boundary[pi][i] += phigBnd[pi][i];
+        }
+    }
+    else
+    {
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            phigBnd[pi].assign(static_cast<std::size_t>(patches[pi].size), scalar(0));
+    }
+
     // constrainPressure(p_rgh, U, phiHbyA, rAUf, MRF): a fixedFluxPressure patch's gradient is
     // PRESCRIBED from the flux, and brae refuses to assemble one that has not been set.
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
@@ -350,7 +371,8 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
                 for (label i = 0; i < q.size; ++i)
                 {
                     rB[pi][i]  = rAU[q.faceCells[i]];
-                    ffB[pi][i] = -pFlux.boundary[pi][i];
+                    // (phig - p_rghEqn.flux()) on the boundary, the same expression as inside.
+                    ffB[pi][i] = phigBnd[pi][i] - pFlux.boundary[pi][i];
                 }
             }
             correctVelocity(HbyA, rAU, faceFlux, rAUfField.internal, ffB, rB, m, g, patches, U.internal);

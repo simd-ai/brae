@@ -8,6 +8,7 @@
 #include "foam_field_reader.cuh"
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 
 namespace brae {
@@ -165,9 +166,19 @@ RunReport runInterFoam(const std::string&          caseDir,
                     stf.internal.resize(static_cast<std::size_t>(m.nInternalFaces()));
                     for (label fi = 0; fi < m.nInternalFaces(); ++fi)
                         stf.internal[fi] = sKf.internal[fi]*snA.internal[fi];
+                    // THE BOUNDARY IS NOT ZERO. surfaceTensionForce() is a surfaceScalarField and at a
+                    // contact-angle wall snGrad(alpha1) is the gradient correctContactAngle just wrote
+                    // -- 9681 on capillaryRise -- so this is precisely where the contact angle enters
+                    // the pressure equation. Zeroing it cost 6% of the velocity at step 1, all of it
+                    // at the wall.
                     stf.boundary.assign(patches.size(), std::vector<scalar>{});
                     for (std::size_t pi = 0; pi < patches.size(); ++pi)
-                        stf.boundary[pi].assign(static_cast<std::size_t>(patches[pi].size), scalar(0));
+                    {
+                        const FvPatch& q = patches[pi];
+                        stf.boundary[pi].resize(static_cast<std::size_t>(q.size));
+                        for (label i = 0; i < q.size; ++i)
+                            stf.boundary[pi][i] = sKf.boundary[pi][i] * snA.boundary[pi][i];
+                    }
 
                     // constrainPressure before snGrad(p_rgh): a fixedFluxPressure gradient is
                     // PRESCRIBED, and brae refuses to assemble one that has not been set.
@@ -185,7 +196,12 @@ RunReport runInterFoam(const std::string&          caseDir,
                         force.internal = out;
                         force.boundary.assign(patches.size(), std::vector<scalar>{});
                         for (std::size_t pi = 0; pi < patches.size(); ++pi)
-                            force.boundary[pi].assign(static_cast<std::size_t>(patches[pi].size), scalar(0));
+                        {
+                            const FvPatch& q = patches[pi];
+                            momentumSourceFlux(stf.boundary[pi], f.ghfBoundary[pi],
+                                               snRho.boundary[pi], snP.boundary[pi],
+                                               q.magSf, force.boundary[pi]);
+                        }
                     }
 
                     std::vector<std::vector<scalar>> rhoB(patches.size()), nuB(patches.size()),
@@ -225,13 +241,14 @@ RunReport runInterFoam(const std::string&          caseDir,
 
                     PressureStepInput pin;
                     pin.UEqn = &UEqn; pin.rho = &f.rho; pin.gh = &f.gh; pin.ghf = &f.ghfInternal;
+                    pin.ghfBnd = &f.ghfBoundary;
                     pin.stf = &stf; pin.snGradRho = &snRho; pin.ddt = &dc;
 
                     PressureSolveControls psc;
                     psc.nCorrectors = lc.nCorrectors;
                     psc.nNonOrthogonalCorrectors = f.nNonOrthogonalCorrectors;
                     psc.needReference = false;          // damBreak's atmosphere is totalPressure
-                    psc.tolP = scalar(1e-9);
+                    psc.tolP = std::getenv("BRAE_PTOL") ? std::atof(std::getenv("BRAE_PTOL")) : scalar(1e-9);
                     for (label c = 0; c < lc.nCorrectors; ++c)
                         pressureCorrector(f.p_rgh, f.U, f.phi, f.p, pin, psc, m, g, patches);
                     break;
