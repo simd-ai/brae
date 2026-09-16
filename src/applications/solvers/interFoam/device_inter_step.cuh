@@ -118,6 +118,13 @@ void deviceInterStep(
     const DeviceBuffer<scalar>&      UOldZ,
     DeviceBuffer<scalar>&            phiInt,
     DeviceBuffer<scalar>&            phiBnd,
+    // phi.oldTime(), and U's per-face fixesValue mask. Both are fvc::ddtCorr's, which pEqn.H adds to
+    // phiHbyA: phi and U are separate state, so after a step the stored flux and the flux you would
+    // get by interpolating the stored velocity DO NOT agree, and that difference is real information
+    // the pressure equation needs. A solver that drops it decouples pressure and velocity slowly.
+    const DeviceBuffer<scalar>&      phiOldInt,
+    const DeviceBuffer<scalar>&      phiOldBnd,
+    const DeviceBuffer<int>&         bndUFixesValue,
     DeviceBuffer<scalar>&            p_rgh,
     DeviceBuffer<scalar>&            p,
     // carried across steps so the calculateK pass count matches OpenFOAM's

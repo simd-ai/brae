@@ -240,6 +240,9 @@ int main()
         for (label i = 0; i < fvp[pi].size; ++i)
         { fixes.push_back(0); flag.push_back(fvp[pi].type == "empty" ? 1 : 0); takeU.push_back(1); }
     DeviceBuffer<int> dFixes(fixes), dFlag(flag), dTakeU(takeU);
+    // U is noSlip on every patch of this fixture, so it fixes a value everywhere and ddtCorr is zero
+    // on the whole boundary -- which is what OpenFOAM does at a wall.
+    DeviceBuffer<int> dUFix(std::vector<int>(static_cast<std::size_t>(nBf), 1));
 
     DeviceInterStepControls ctl;
     ctl.alpha.nAlphaSubCycles = 1;
@@ -290,9 +293,12 @@ int main()
         std::vector<scalar> cx2, cy2, cz2;
         dUx.copyTo(cx2); dUy.copyTo(cy2); dUz.copyTo(cz2);
         dUox.copyFrom(cx2); dUoy.copyFrom(cy2); dUoz.copyFrom(cz2);
+        std::vector<scalar> poi, pob;
+        dPhiI.copyTo(poi);  dPhiB.copyTo(pob);
+        DeviceBuffer<scalar> dPhiOI(poi), dPhiOB(pob);
         deviceInterStep(dm, dt, ctl, props, hooks, dGh, dGhf, dMagSf,
                         dAlpha, dAlphaOld, dUx, dUy, dUz, dUox, dUoy, dUoz,
-                        dPhiI, dPhiB, dPrgh, dP, dNHatf, dNHatfB, dABnd, dK,
+                        dPhiI, dPhiB, dPhiOI, dPhiOB, dUFix, dPrgh, dP, dNHatf, dNHatfB, dABnd, dK,
                         dFixes, dFlag, dbU, dRho, dMu, dNu, dRhoPhiI, dRhoPhiB);
     }
     if (cudaDeviceSynchronize() != cudaSuccess)

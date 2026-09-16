@@ -298,17 +298,47 @@ int main(int argc, char** argv)
             rw = std::fmax(rw, std::fabs(devRhoPhi[f] - hRhoPhi.internal[f]));
             rs = std::fmax(rs, std::fabs(hRhoPhi.internal[f]));
         }
-        std::printf("  rhoPhi: worst %.4e of %.4e\n", (double)rw, (double)rs);
-        check("...and so does the rhoPhi it leaves for the momentum equation", rw < scalar(1e-8)*rs);
+        // SCALED BY THE DENSITY RATIO, not by rhoPhi's own magnitude. rhoPhi is
+        // alphaPhi*(rho1 - rho2) + phiCN*rho2, so its max is set by the phiCN*rho2 term while its
+        // ERROR is the alpha flux's, multiplied by rho1 - rho2 = 999. Comparing the gap to the max
+        // therefore measures the ratio of two unrelated things: the arm read 1.2e-10 relative on one
+        // warm state and 1.6e-08 on another, from the same code, because the SCALE moved. Dividing
+        // the gap by the density ratio recovers the alpha-flux error it actually is, and that has to
+        // sit under alpha's own agreement.
+        const scalar rhoRatio = devF.mixture.phases.rho1 - devF.mixture.phases.rho2;
+        std::printf("  rhoPhi: worst %.4e of %.4e;  /(rho1 - rho2) = %.4e, against alpha's %.4e\n",
+                    (double)rw, (double)rs, (double)(rw/rhoRatio), (double)worst);
+        check("...and so does the rhoPhi it leaves for the momentum equation -- its error is the "
+              "alpha flux's, times the density ratio", rw/rhoRatio < worst);
     }
 
-    // ---- THE WHOLE STEP, DIAGNOSTIC ONLY ----------------------------------------------------------
-    // Runs only under BRAE_INTER_WHOLE_STEP, because deviceInterStep currently produces NaN on this
-    // case and a red gate in the suite helps nobody. With BRAE_INTER_STEP_CHECK set as well, the step
-    // prints the first stage whose output is not finite -- which is what turns "damBreak gives NaN"
-    // into a line number.
+    // ---- THE WHOLE STEP on damBreak's own case: STILL UNDER DIAGNOSIS ----------------------------
+    // Runs only under BRAE_INTER_WHOLE_STEP. It is finite, bounded and advancing, and alpha tracks the
+    // host to 1.85e-03 of a field whose range is 1 -- but U is 1.60e-01 of 2.65e-01, SIXTY PER CENT,
+    // and that is a defect and not a tolerance. damBreak sets `momentumPredictor no`, so U comes only
+    // from HbyA + rAU*reconstruct((phig - flux)/rAUf): the error is in HbyA or in the momentum matrix
+    // under this case's real boundary conditions, neither of which the box fixture exercises. A red
+    // gate in the suite helps nobody, so it stays behind the switch until that is found.
+    //
+    // WHAT THE ARM HAS ALREADY PAID FOR, all three found by running it:
+    //   fvc::reconstruct needs OpenFOAM's safeInv -- a 2-D mesh makes the tensor singular and the
+    //     plain cofactor inverse gave NaN in all 2268 cells (fvc_reconstruct_cpp.cuh).
+    //   the case must be fixed to `adjustTimeStep no` -- the host reads damBreak's own controlDict and
+    //     grows dt, so the two sat at different physical times and alpha read 9.57e-01 out.
+    //   the step was not computing fvc::ddtCorr at all; adding it took alpha 2.28e-03 -> 1.85e-03 and
+    //     p_rgh 1.22e+02 -> 7.57e+01.
+    //
+    // This needs damBreak's REAL conditions: fixedFluxPressure on three walls, whose gradient
+    // constrainPressure PRESCRIBES from phiHbyA, totalPressure at the atmosphere, noSlip walls and a
+    // pressureInletOutletVelocity outlet. BRAE_INTER_STEP_CHECK prints the first stage whose output is
+    // not finite, which is how the reconstruct defect was named.
     if (std::getenv("BRAE_INTER_WHOLE_STEP"))
     {
+        InterFields ref = buildInterFields(caseDir, startDir, m, g, fvp);
+        const RunReport w0 = runInterFoam(caseDir, startDir, m, g, fvp, nWarm + nSteps,
+                                          /*verbose=*/false, &ref);
+        check("the host solver ran the warm-up plus the compared steps", w0.steps == nWarm + nSteps);
+
         InterFields dv = buildInterFields(caseDir, startDir, m, g, fvp);
         {
             InterFields warm = buildInterFields(caseDir, startDir, m, g, fvp);
@@ -389,22 +419,25 @@ int main(int argc, char** argv)
           snP.resize(0); };
         H.pressure.pressureCoeffs =
             [&](const DeviceBuffer<scalar>&, const DeviceBuffer<scalar>& phiHB,
-                const DeviceBuffer<scalar>& rAUfI, DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC)
-        { std::vector<scalar> hB, rI; phiHB.copyTo(hB); rAUfI.copyTo(rI);
+                const DeviceBuffer<scalar>& rAUfAll, DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC)
+        { std::vector<scalar> hB, rA; phiHB.copyTo(hB); rAUfAll.copyTo(rA);
+          // rAUf PER FACE, from the full array -- the internal faces first, then the patches in order.
+          // Standing in rA[0] for every boundary face put U 60% out on this case.
           label off = 0;
           for (std::size_t pi = 0; pi < fvp.size(); ++pi)
           { const FvPatch& q = fvp[pi];
             if (dv.p_rgh.boundary[pi]->updateableSnGrad())
             { std::vector<scalar> sn(static_cast<std::size_t>(q.size));
               for (label i = 0; i < q.size; ++i)
-                sn[i] = (hB[off + i] - dv.phi.boundary[pi][i]) / (q.magSf[i] * (rI.empty()?scalar(1):rI[0]));
+                sn[i] = (hB[off + i] - dv.phi.boundary[pi][i]) / (q.magSf[i] * rA[nIf + off + i]);
               dv.p_rgh.boundary[pi]->updateSnGrad(sn); }
             off += q.size; }
           SurfaceScalarField rf2;
-          rf2.internal = rI;
+          rf2.internal.assign(rA.begin(), rA.begin() + nIf);
           rf2.boundary.resize(fvp.size());
-          for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-            rf2.boundary[pi].assign(static_cast<std::size_t>(fvp[pi].size), rI.empty()?scalar(0):rI[0]);
+          { label o2 = nIf;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+              for (label i = 0; i < fvp[pi].size; ++i) rf2.boundary[pi].push_back(rA[o2++]); }
           FvScalarMatrix pe = fvm::laplacian<scalar>(rf2, dv.p_rgh, m, g, fvp, false);
           std::vector<scalar> i2, b2;
           for (std::size_t pi = 0; pi < fvp.size(); ++pi)
@@ -412,11 +445,12 @@ int main(int argc, char** argv)
             { i2.push_back(pe.internalCoeffs[pi][i]); b2.push_back(pe.boundaryCoeffs[pi][i]); }
           iC.copyFrom(i2); bC.copyFrom(b2); };
 
-        std::vector<int> takeU;
+        std::vector<int> takeU, uFixes;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
           for (label i = 0; i < fvp[pi].size; ++i)
-            takeU.push_back(dv.U.boundary[pi]->assignable() ? 0 : 1);
-        DeviceBuffer<int> dTakeU(takeU);
+          { takeU.push_back(dv.U.boundary[pi]->assignable() ? 0 : 1);
+            uFixes.push_back(dv.U.boundary[pi]->fixesValue() ? 1 : 0); }
+        DeviceBuffer<int> dTakeU(takeU), dUFixes(uFixes);
 
         DeviceInterStepControls C;
         C.alpha = dctl;  C.mules = dmc;  C.alphaInput = din;
@@ -444,32 +478,75 @@ int main(int argc, char** argv)
         DevicePhaseProperties pr2{dv.mixture.phases.rho1, dv.mixture.phases.nu1,
                                   dv.mixture.phases.rho2, dv.mixture.phases.nu2};
 
-        std::printf("  [whole step, diagnostic] one step with BRAE_INTER_STEP_CHECK to name the stage\n");
-        deviceInterStep(dm, dt, C, pr2, H, Gh, Ghf, MagSf, A2, AO, Ux, Uy, Uz, Uox, Uoy, Uoz,
-                        PhI, PhB, Prgh, Pf, NH, NHB, ABnd, Kd2, dFixes, dFlag, db2,
-                        Rho2, Mu2, Nu2, RpI2, RpB2);
-        cudaDeviceSynchronize();
-        std::vector<scalar> fa2;
-        A2.copyTo(fa2);
-        int bad = 0;
-        for (label c = 0; c < nC; ++c) if (!std::isfinite(fa2[c])) ++bad;
-        std::printf("  [whole step, diagnostic] non-finite alpha cells after one step: %d of %ld\n",
-                    bad, (long)nC);
-    }
+        // the warm state, kept BEFORE the run: the hooks write dv.alpha1.internal every corrector, so
+        // by the end it holds the device's own answer and cannot serve as a reference point.
+        const std::vector<scalar> warmAlpha = dv.alpha1.internal;
 
-    // THE WHOLE STEP on damBreak's own case is NOT gated here yet, and that is a statement about the
-    // code and not about the gate. deviceInterStep runs clean on the synthetic fixture
-    // (tests/test_device_inter_step.cu, five steps at Co 0.16) and on damBreak it produces NaN in
-    // every one of the 2268 cells -- alpha, U and p_rgh alike -- within five steps from a developed
-    // state. Not yet diagnosed; damBreak brings fixedFluxPressure, totalPressure and
-    // pressureInletOutletVelocity, none of which the box fixture has.
-    //
-    // WHAT THAT ATTEMPT TAUGHT, and it applies to every gate in this tree: std::fmax(a, NaN) returns
-    // a. It IGNORES the NaN. So a worst-difference loop built on fmax -- which is how every arm in
-    // this file and most arms elsewhere accumulate -- reports 0.000e+00 for a field that has gone
-    // entirely non-finite, and that is indistinguishable from perfect agreement. The whole-step arm
-    // read "alpha 0.0000e+00, U.x 0.0000e+00, p_rgh 0.0000e+00" and four green checks on a run whose
-    // every cell was NaN. A finiteness check has to come FIRST, before any fmax accumulator.
+        for (int s2 = 0; s2 < nSteps; ++s2)
+        {
+            std::vector<scalar> ca, cx, cy, cz;
+            A2.copyTo(ca);  AO.copyFrom(ca);
+            Ux.copyTo(cx);  Uy.copyTo(cy);  Uz.copyTo(cz);
+            Uox.copyFrom(cx); Uoy.copyFrom(cy); Uoz.copyFrom(cz);
+            // phi.oldTime() is the flux this step STARTS from -- ddtCorr's whole content is the
+            // disagreement between it and the flux interpolate(U.oldTime()) would give.
+            std::vector<scalar> poi, pob;
+            PhI.copyTo(poi);  PhB.copyTo(pob);
+            DeviceBuffer<scalar> PhOI(poi), PhOB(pob);
+            deviceInterStep(dm, dt, C, pr2, H, Gh, Ghf, MagSf, A2, AO, Ux, Uy, Uz, Uox, Uoy, Uoz,
+                            PhI, PhB, PhOI, PhOB, dUFixes, Prgh, Pf, NH, NHB, ABnd, Kd2,
+                            dFixes, dFlag, db2, Rho2, Mu2, Nu2, RpI2, RpB2);
+        }
+        if (cudaDeviceSynchronize() != cudaSuccess)
+        { std::printf("  FAIL: whole-step kernels did not complete\n"); return 1; }
+
+        std::vector<scalar> fa2, fux, fprgh;
+        A2.copyTo(fa2);
+        Ux.copyTo(fux);
+        Prgh.copyTo(fprgh);
+
+        // FINITE FIRST, and this is not defensive noise. std::fmax(a, NaN) returns a -- it IGNORES the
+        // NaN -- so every |device - host| accumulator below reads 0.000e+00 for a field that has gone
+        // non-finite, which is indistinguishable from perfect agreement. That is exactly what this
+        // gate reported before the check existed: alpha, U and p_rgh all "0.0000e+00" and four green
+        // arms, on a run whose every cell was NaN. Any worst-difference loop built on fmax needs this
+        // ahead of it.
+        int nBadA = 0, nBadU = 0, nBadP = 0;
+        for (label c = 0; c < nC; ++c)
+        {
+            if (!std::isfinite(fa2[c]))   ++nBadA;
+            if (!std::isfinite(fux[c]))   ++nBadU;
+            if (!std::isfinite(fprgh[c])) ++nBadP;
+        }
+        std::printf("  non-finite cells after %d whole steps: alpha %d, U.x %d, p_rgh %d of %ld\n",
+                    nSteps, nBadA, nBadU, nBadP, (long)nC);
+        check("the whole device step leaves every field finite", nBadA + nBadU + nBadP == 0);
+
+        scalar devMoved = 0;
+        for (label c = 0; c < nC; ++c)
+            devMoved = std::fmax(devMoved, std::fabs(fa2[c] - warmAlpha[c]));
+        check("...and it advanced the field", devMoved > scalar(1e-9));
+
+        scalar wa = 0, wu = 0, wp = 0, sa = 0, su = 0, sp = 0, exc = 0;
+        for (label c = 0; c < nC; ++c)
+        {
+            wa = std::fmax(wa, std::fabs(fa2[c]   - ref.alpha1.internal[c]));
+            wu = std::fmax(wu, std::fabs(fux[c]   - ref.U.internal[c].x));
+            wp = std::fmax(wp, std::fabs(fprgh[c] - ref.p_rgh.internal[c]));
+            sa = std::fmax(sa, std::fabs(ref.alpha1.internal[c]));
+            su = std::fmax(su, std::fabs(ref.U.internal[c].x));
+            sp = std::fmax(sp, std::fabs(ref.p_rgh.internal[c]));
+            exc = std::fmax(exc, std::fmax(-fa2[c], fa2[c] - scalar(1)));
+        }
+        std::printf("  WHOLE STEP, %d steps: alpha %.4e of %.3f, U.x %.4e of %.4e, "
+                    "p_rgh %.4e of %.4e;  the device moved alpha %.4e, excursion %.3e\n",
+                    nSteps, (double)wa, (double)sa, (double)wu, (double)su,
+                    (double)wp, (double)sp, (double)devMoved, (double)exc);
+        check("the whole device step tracks the host on damBreak", wa < scalar(1e-6));
+        check("...in the velocity it leaves", wu < scalar(1e-5)*std::fmax(su, scalar(1e-30)));
+        check("...and in the pressure", wp < scalar(1e-5)*std::fmax(sp, scalar(1e-30)));
+        check("...with alpha still bounded", exc <= scalar(1e-6));
+    }
 
     std::printf("test_device_inter_dambreak_alpha: %d failures\n", failures);
     return failures ? 1 : 0;

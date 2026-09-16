@@ -45,9 +45,14 @@ struct DeviceInterPressureHooks
     // p_rgh's laplacian boundary coefficients, flattened in boundary-face order, AFTER
     // constrainPressure has set any fixedFluxPressure patch's gradient from phiHbyA. Branchy per-patch
     // dispatch over fixedFluxPressure, totalPressure and zeroGradient -- host work, as everywhere else.
+    // `rAUfAll` is the FULL face array -- internal faces then the boundary patches -- and not just the
+    // internal half. Both are needed: the laplacian's boundary coefficients scale with rAUf at the
+    // patch, and constrainPressure divides by it per face. A hook given only the internal half has to
+    // invent the boundary values, and standing in the first internal face's value for all of them put
+    // U 60% out on damBreak.
     std::function<void(const DeviceBuffer<scalar>& phiHbyAInt,
                        const DeviceBuffer<scalar>& phiHbyABnd,
-                       const DeviceBuffer<scalar>& rAUfInt,
+                       const DeviceBuffer<scalar>& rAUfAll,
                        DeviceBuffer<scalar>&       iC,
                        DeviceBuffer<scalar>&       bC)> pressureCoeffs;
 };

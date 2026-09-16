@@ -62,6 +62,9 @@ void deviceInterStep(
     const DeviceBuffer<scalar>&      UOldZ,
     DeviceBuffer<scalar>&            phiInt,
     DeviceBuffer<scalar>&            phiBnd,
+    const DeviceBuffer<scalar>&      phiOldInt,
+    const DeviceBuffer<scalar>&      phiOldBnd,
+    const DeviceBuffer<int>&         bndUFixesValue,
     DeviceBuffer<scalar>&            p_rgh,
     DeviceBuffer<scalar>&            p,
     DeviceBuffer<scalar>&            nHatfInt,
@@ -238,7 +241,14 @@ void deviceInterStep(
     pi.rAUfAll = &rAUfAll;
     pi.rho = &rho;
     pi.gh  = &gh;
-    pi.ddtCorrInt = nullptr;
+    // fvc::ddtCorr(U, phi), Euler. The coefficient is OpenFOAM's DEFAULT LIMITER (ddtPhiCoeff_ = -1),
+    // not a constant: it switches the correction off where it is large compared with the flux, and it
+    // is zero on every patch where U fixes a value.
+    DeviceBuffer<scalar> ddtCorrI, ddtCorrB;
+    deviceDdtCorr(dm, phiOldInt, phiOldBnd, UOldX, UOldY, UOldZ, bndUFixesValue,
+                  /*ddtPhiCoeff=*/scalar(-1), deltaT, ddtCorrI, ddtCorrB);
+    probe("ddtCorr", ddtCorrI);
+    pi.ddtCorrInt = &ddtCorrI;
     pi.needReference = ctl.needReference;
     pi.pRefCell = ctl.pRefCell;
     pi.pRefValue = ctl.pRefValue;

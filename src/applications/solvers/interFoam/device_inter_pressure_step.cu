@@ -93,7 +93,7 @@ scalar deviceInterPressureStep(
 
     // constrainPressure, then the matrix.
     DeviceBuffer<scalar> iC, bC;
-    hooks.pressureCoeffs(phiHbyAInt, phiHbyABnd, rAUfInt, iC, bC);
+    hooks.pressureCoeffs(phiHbyAInt, phiHbyABnd, *in.rAUfAll, iC, bC);
 
     DevicePressureMatrix P;
     deviceInterAssemblePEqn(dm, rAUfInt, phiHbyAInt, phiHbyABnd,

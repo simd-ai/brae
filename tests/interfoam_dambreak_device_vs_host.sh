@@ -37,6 +37,24 @@ command -v blockMesh > /dev/null 2>&1 || { echo "SKIP: blockMesh not on PATH"; e
 
 cp -r "$W/case/0.orig" "$W/case/0"
 ( cd "$W/case" && blockMesh > log.blockMesh 2>&1 ) || { echo "SKIP: blockMesh failed"; exit 77; }
+
+# A FIXED time step, as interfoam_dambreak_vs_openfoam.sh does and for the same reason. damBreak's own
+# controlDict says `adjustTimeStep yes`, so the HOST solver -- which reads it -- grows dt from the
+# Courant number while the device loop in the test takes the fixed dt it is given. The two then sit at
+# DIFFERENT PHYSICAL TIMES and every field disagrees by an amount that looks like a discretisation
+# error and is actually a clock. Measured before this was here: alpha 9.57e-01 out of a field whose
+# range is 1, on a device run that had advanced alpha by 1.85e-02 and a host run that had advanced it
+# by 9.56e-01.
+DT="$DT" python3 - "$W/case" <<'PYEOF'
+import os, re, sys
+d = sys.argv[1]
+p = os.path.join(d, 'system/controlDict')
+s = open(p).read()
+for k, v in (('adjustTimeStep', 'no'), ('deltaT', os.environ['DT']), ('writeControl', 'runTime')):
+    s = re.sub(r'^%s\s+.*' % k, '%-16s %s;' % (k, v), s, flags=re.M) \
+        if re.search(r'^%s\s+' % k, s, re.M) else s + '\n%-16s %s;\n' % (k, v)
+open(p, 'w').write(s)
+PYEOF
 if command -v setFields > /dev/null 2>&1; then
     ( cd "$W/case" && setFields > log.setFields 2>&1 ) || { echo "SKIP: setFields failed"; exit 77; }
 fi
