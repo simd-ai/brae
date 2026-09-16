@@ -3094,6 +3094,13 @@ target_link_libraries(test_device_alpha_flux PRIVATE brae_core)
 add_test(NAME device_alpha_flux COMMAND test_device_alpha_flux)
 set_tests_properties(device_alpha_flux PROPERTIES SKIP_RETURN_CODE 77)
 
+add_executable(test_device_mules_corr tests/test_device_mules_corr.cu)
+target_include_directories(test_device_mules_corr PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_mules_corr PRIVATE brae_core)
+add_test(NAME device_mules_corr COMMAND test_device_mules_corr)
+set_tests_properties(device_mules_corr PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(test_device_alpha_step tests/test_device_alpha_step.cu)
 target_include_directories(test_device_alpha_step PRIVATE ${BRAE_HEADER_DIRS}
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)

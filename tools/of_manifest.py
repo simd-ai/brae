@@ -1602,7 +1602,11 @@ COMPONENTS = {
              brae_target="src/finiteVolume/fvMatrices/solvers/MULES/device_mules.cu",
              validation="tests/test_mules_cpp.cu arm 7. Shares the boundedness oracle; the four structural "
                         "differences from the explicit path are asserted one by one, each with its own "
-                        "fail-proof.",
+                        "fail-proof. ON THE DEVICE, tests/test_device_mules_corr.cu repeats A, B, C and "
+                        "the empty-patch skip against the host limiter: psi stays in [0,1] exactly where "
+                        "the unlimited control reaches 4.0e-01, and lambda came out bit-identical on all "
+                        "264 faces, 32 of them strictly inside (0,1) -- not guaranteed, since the budgets "
+                        "are gathers there and a face loop here, so the gate keeps a tolerance.",
              note="LANDED AND RUNNING on damBreak's own mesh. The semi-implicit variant, `MULESCorr yes` -- 13 of the 44 shipped tutorials, damBreak "
                   "included. With it the upwind part of the alpha equation goes through an implicit "
                   "MATRIX, so by the time CMULES runs psi is ALREADY advanced and only the antidiffusive "

@@ -110,4 +110,86 @@ void deviceMulesExplicitSolve(
     const DeviceMulesFields&    f,
     DeviceBuffer<scalar>&       psi);
 
+// ---------------------------------------------------------------------------------------------------
+// CMULES on the device -- the SEMI-IMPLICIT path, `MULESCorr yes`, which damBreak and twelve other
+// shipped tutorials select.
+//
+//   provenance: src/finiteVolume/fvMatrices/solvers/MULES/CMULESTemplates.C
+//   host:       mules_cpp.cu, limiterCorr / limitCorr / correct -- the ORACLE, whose own header spells
+//               out A, B, C and D, the four things that make this not the explicit path.
+//
+// Three of those four are visible in the signatures below and are worth naming here too, because the
+// temptation on the device is to reach for the explicit kernels with a flag:
+//
+//   A. correct() takes the CURRENT psi and the CURRENT rho, where the explicit solve takes
+//      psi.oldTime() and rho.oldTime(). By the time CMULES runs, the implicit upwind matrix has
+//      ALREADY advanced psi a whole time step; substituting the old values throws that away and
+//      re-does the step carrying only the correction. The field stays bounded, so a boundedness gate
+//      does not notice -- the interface simply moves at the wrong speed.
+//
+//   B. There is NO phiBD and NO sumPhiBD anywhere below. The donor flux went through the matrix, so
+//      the budget is measured against psi as it stands. deviceMulesLimiterCorr therefore takes no
+//      phiBD argument at all, rather than one it would have to be passed zero.
+//
+//   C. Uncoupled boundary faces ARE limited here -- phiCorr arrives from the caller and is genuinely
+//      non-zero on them -- but OUTLETS ONLY, tested on `phi + phiCorr`, the TOTAL flux, against
+//      SMALL*SMALL rather than zero. That is why `phiBnd` appears in the limiter's arguments when the
+//      explicit one needs no such thing.
+//
+// The same no-atomics gather structure as the explicit path. The consequence differs only in degree:
+// bit-identity is not guaranteed, because the budgets sum in a different order from the host's face
+// loop -- but MEASURED on the gate's fixture, CMULES' lambda comes out exact on all 264 faces (32 of
+// them strictly inside (0,1)), where the explicit limiter differs on five by 3.7e-15. The gate keeps a
+// tolerance rather than asserting equality, because what was measured on one fixture is not a
+// guarantee, and asserts boundedness exactly.
+
+// MULES::limiterCorr. `lambdaInt`/`lambdaBnd` are sized and filled here: 1 on every face, then
+// tightened nLimiterIter times.
+void deviceMulesLimiterCorr(
+    const DeviceMesh&            dm,
+    int                          nInternalFaces,
+    int                          nBoundaryFaces,
+    scalar                       rDeltaT,
+    const DeviceBuffer<scalar>&  psi,             // CURRENT, post-implicit-solve -- see A
+    const DeviceBuffer<scalar>&  psiBndValue,
+    const DeviceBuffer<int>&     bndFixesValue,
+    const DeviceBuffer<int>&     bndFlag,         // 0 ordinary, 1 empty, 2 wedge
+    const DeviceBuffer<scalar>&  phiBnd,          // the boundary VOLUMETRIC flux -- see C
+    const DeviceBuffer<scalar>&  phiCorrInt,
+    const DeviceBuffer<scalar>&  phiCorrBnd,
+    const DeviceMulesFields&     f,
+    const DeviceMulesControls&   c,
+    DeviceBuffer<scalar>&        lambdaInt,
+    DeviceBuffer<scalar>&        lambdaBnd);
+
+// MULES::limitCorr: the limiter, then phiCorr *= lambda IN PLACE. No blended flux is formed -- there is
+// nothing to blend against, which is the shape difference B leaves behind.
+void deviceMulesLimitCorr(
+    const DeviceMesh&            dm,
+    int                          nInternalFaces,
+    int                          nBoundaryFaces,
+    scalar                       rDeltaT,
+    const DeviceBuffer<scalar>&  psi,
+    const DeviceBuffer<scalar>&  psiBndValue,
+    const DeviceBuffer<int>&     bndFixesValue,
+    const DeviceBuffer<int>&     bndFlag,
+    const DeviceBuffer<scalar>&  phiBnd,
+    DeviceBuffer<scalar>&        phiCorrInt,      // scaled in place
+    DeviceBuffer<scalar>&        phiCorrBnd,      // scaled in place
+    const DeviceMulesFields&     f,
+    const DeviceMulesControls&   c,
+    DeviceBuffer<scalar>*        lambdaIntOut = nullptr,
+    DeviceBuffer<scalar>*        lambdaBndOut = nullptr);
+
+// MULES::correct, CMULESTemplates.C:38-76:
+//     psi = (rho*psi*rDeltaT + Su - surfaceIntegrate(phiCorr)) / (rho*rDeltaT - Sp)
+// Both rho and psi on the right are the CURRENT ones -- see A.
+void deviceMulesCorrect(
+    const DeviceMesh&           dm,
+    scalar                      rDeltaT,
+    const DeviceBuffer<scalar>& phiCorrInt,
+    const DeviceBuffer<scalar>& phiCorrBnd,
+    const DeviceMulesFields&    f,
+    DeviceBuffer<scalar>&       psi);            // in and out
+
 } // namespace brae

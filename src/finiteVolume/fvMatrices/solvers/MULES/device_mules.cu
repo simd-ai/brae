@@ -17,6 +17,10 @@ inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 // the untouched majority of the domain, not a guard against a rare zero.
 __device__ constexpr scalar kRootVSmall = scalar(1.0e-150);
 
+// OpenFOAM's SMALL*SMALL, the threshold CMULES tests the TOTAL boundary flux against. It is not zero,
+// and that matters: a face whose flux is numerically nothing must count as an inlet and be left alone.
+__device__ constexpr scalar kSmallSquared = scalar(1.0e-15) * scalar(1.0e-15);
+
 inline void ckM(cudaError_t e, const char* what)
 {
     if (e != cudaSuccess)
@@ -250,6 +254,140 @@ __global__ void explicitSolveKernel(
     psi[c] = num / den;
 }
 
+
+// -- CMULES ------------------------------------------------------------------------------------------
+// THE SETUP, without a donor flux. Everything that differs from setupKernel above is marked; what is
+// NOT marked is identical on purpose, because the extrema scan, the extremaCoeff relaxation and the
+// smoothLimiter blend are shared between the two limiters in OpenFOAM too.
+__global__ void setupCorrKernel(
+    int nC,
+    const label*  __restrict__ own,      const label*  __restrict__ nei,
+    const label*  __restrict__ ownerStart,
+    const label*  __restrict__ losort,   const label*  __restrict__ losortStart,
+    const label*  __restrict__ bndCellStart, const label* __restrict__ bndPerm,
+    const int*    __restrict__ bndFlag,  const int*    __restrict__ bndFixes,
+    const scalar* __restrict__ psi,
+    const scalar* __restrict__ psiBndValue,
+    const scalar* __restrict__ phiCorr,  const scalar* __restrict__ phiCorrBnd,
+    const scalar* __restrict__ V,
+    const scalar* __restrict__ rho,
+    const scalar* __restrict__ Sp,  const scalar* __restrict__ Su,
+    const scalar* __restrict__ psiMaxF, const scalar* __restrict__ psiMinF,
+    scalar rDeltaT, scalar extremaCoeff, scalar boundaryDeltaExtremaCoeff, scalar smoothLimiter,
+    scalar* __restrict__ psiMaxn, scalar* __restrict__ psiMinn,
+    scalar* __restrict__ sumPhip, scalar* __restrict__ mSumPhim)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+
+    const scalar pMax = at(psiMaxF, c, scalar(1));
+    const scalar pMin = at(psiMinF, c, scalar(0));
+
+    scalar mx = pMin, mn = pMax;                       // the swapped initialisation, as above
+    scalar sP = 0, mSP = 0;                            // B: no sumPhiBD -- there is no donor flux
+
+    for (int k = ownerStart[c]; k < ownerStart[c + 1]; ++k)
+    {
+        const scalar pn = psi[nei[k]];
+        mx = fmax(mx, pn);
+        mn = fmin(mn, pn);
+        const scalar pc = phiCorr[k];
+        if (pc > scalar(0)) sP  += pc;
+        else                mSP -= pc;
+    }
+    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
+    {
+        const int f = losort[k];
+        const scalar po = psi[own[f]];
+        mx = fmax(mx, po);
+        mn = fmin(mn, po);
+        const scalar pc = phiCorr[f];
+        if (pc > scalar(0)) mSP += pc;
+        else                sP  -= pc;
+    }
+    for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)
+    {
+        const int b = bndPerm[k];
+        if (bndFlag[b] == 1) continue;                 // empty
+        if (bndFixes[b])
+        {
+            mx = fmax(mx, psiBndValue[b]);
+            mn = fmin(mn, psiBndValue[b]);
+        }
+        else if (boundaryDeltaExtremaCoeff > scalar(0))
+        {
+            const scalar extrema = boundaryDeltaExtremaCoeff * (pMax - pMin);
+            mx += extrema;
+            mn -= extrema;
+        }
+        const scalar pc = phiCorrBnd[b];
+        if (pc > scalar(0)) sP  += pc;
+        else                mSP -= pc;
+    }
+
+    mx = fmin(mx + extremaCoeff*(pMax - pMin), pMax);
+    mn = fmax(mn - extremaCoeff*(pMax - pMin), pMin);
+    if (smoothLimiter > scalar(1e-15))
+    {
+        mx = fmin(smoothLimiter*psi[c] + (scalar(1) - smoothLimiter)*mx, pMax);
+        mn = fmax(smoothLimiter*psi[c] + (scalar(1) - smoothLimiter)*mn, pMin);
+    }
+
+    // A and B together (CMULESTemplates.C:400-412): rho and psi are the CURRENT ones, and nothing is
+    // added for a donor step because there was not one.
+    const scalar rhoC = at(rho, c, scalar(1));
+    const scalar a   = rhoC*rDeltaT - at(Sp, c, scalar(0));
+    const scalar b   = rhoC*psi[c]*rDeltaT;
+    const scalar SuC = at(Su, c, scalar(0));
+    psiMaxn[c]  = V[c]*(a*mx - SuC - b);
+    psiMinn[c]  = V[c]*(SuC - a*mn + b);
+    sumPhip[c]  = sP;
+    mSumPhim[c] = mSP;
+}
+
+// C: the boundary tightening the explicit path does not have. A wedge is zeroed outright, and every
+// other face is limited ONLY where the TOTAL flux phi + phiCorr leaves the domain -- OpenFOAM's own
+// comment is "Limit outlet faces only" (CMULESTemplates.C:537-561). The threshold is SMALL*SMALL, not
+// zero, so a face whose flux is numerically nothing counts as an inlet and is left alone. Limiting an
+// inlet would throttle a prescribed inflow.
+__global__ void iterBoundaryCorrKernel(
+    int nBf,
+    const label*  __restrict__ bndCell,
+    const int*    __restrict__ bndFlag,
+    const scalar* __restrict__ phiBnd, const scalar* __restrict__ phiCorrBnd,
+    const scalar* __restrict__ lambdam, const scalar* __restrict__ lambdap,
+    scalar* __restrict__ lambdaBnd)
+{
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= nBf) return;
+    if (bndFlag[b] == 2) { lambdaBnd[b] = scalar(0); return; }       // wedge
+    const scalar pc = phiCorrBnd[b];
+    if (phiBnd[b] + pc <= kSmallSquared) return;                     // inlet, or no flux at all
+    const int c = bndCell[b];
+    lambdaBnd[b] = (pc > scalar(0)) ? fmin(lambdaBnd[b], lambdap[c])
+                                    : fmin(lambdaBnd[b], lambdam[c]);
+}
+
+__global__ void scaleKernel(const scalar* __restrict__ lam, int n, scalar* __restrict__ x)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] *= lam[i];
+}
+
+// A: rho*psi with BOTH current, where explicitSolveKernel takes rhoOld*psiOld.
+__global__ void correctKernel(
+    const scalar* __restrict__ divPhiCorr,
+    const scalar* __restrict__ rho, const scalar* __restrict__ Sp, const scalar* __restrict__ Su,
+    int nC, scalar rDeltaT, scalar* __restrict__ psi)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    const scalar rhoC = at(rho, c, scalar(1));
+    const scalar num  = rhoC*psi[c]*rDeltaT + at(Su, c, scalar(0)) - divPhiCorr[c];
+    const scalar den  = rhoC*rDeltaT - at(Sp, c, scalar(0));
+    psi[c] = num / den;
+}
+
 }   // namespace
 
 
@@ -399,6 +537,142 @@ void deviceMulesLimiter(
             ckM(cudaGetLastError(), "iter boundary");
         }
     }
+}
+
+
+// -- CMULES ------------------------------------------------------------------------------------------
+
+void deviceMulesLimiterCorr(
+    const DeviceMesh&            dm,
+    int                          nInternalFaces,
+    int                          nBoundaryFaces,
+    scalar                       rDeltaT,
+    const DeviceBuffer<scalar>&  psi,
+    const DeviceBuffer<scalar>&  psiBndValue,
+    const DeviceBuffer<int>&     bndFixesValue,
+    const DeviceBuffer<int>&     bndFlag,
+    const DeviceBuffer<scalar>&  phiBnd,
+    const DeviceBuffer<scalar>&  phiCorrInt,
+    const DeviceBuffer<scalar>&  phiCorrBnd,
+    const DeviceMulesFields&     f,
+    const DeviceMulesControls&   c,
+    DeviceBuffer<scalar>&        lambdaInt,
+    DeviceBuffer<scalar>&        lambdaBnd)
+{
+    const int nC = dm.nCells;
+
+    lambdaInt.resize(static_cast<std::size_t>(nInternalFaces));
+    lambdaBnd.resize(static_cast<std::size_t>(nBoundaryFaces));
+    if (nInternalFaces > 0)
+    {
+        fillKernel<<<nBlocks(nInternalFaces), TPB>>>(lambdaInt.data(), nInternalFaces, scalar(1));
+        ckM(cudaGetLastError(), "lambda init");
+    }
+    if (nBoundaryFaces > 0)
+    {
+        fillKernel<<<nBlocks(nBoundaryFaces), TPB>>>(lambdaBnd.data(), nBoundaryFaces, scalar(1));
+        ckM(cudaGetLastError(), "lambda boundary init");
+    }
+
+    // boundaryExtremaCoeff DEFAULTS TO extremaCoeff, not to 0 (MULESTemplates.C:220), so what the scan
+    // adds at a boundary is the DIFFERENCE and is normally nothing.
+    const scalar boundaryDelta = std::max(c.boundaryExtremaCoeff - c.extremaCoeff, scalar(0));
+
+    DeviceBuffer<scalar> psiMaxn(nC), psiMinn(nC), sumPhip(nC), mSumPhim(nC);
+    setupCorrKernel<<<nBlocks(nC), TPB>>>(
+        nC, dm.owner.data(), dm.nei.data(), dm.ownerStart.data(),
+        dm.losort.data(), dm.losortStart.data(), dm.bndCellStart.data(), dm.bndPerm.data(),
+        bndFlag.data(), bndFixesValue.data(),
+        psi.data(), psiBndValue.data(), phiCorrInt.data(), phiCorrBnd.data(),
+        dm.V.data(), f.rho, f.Sp, f.Su, f.psiMax, f.psiMin,
+        rDeltaT, c.extremaCoeff, boundaryDelta, c.smoothLimiter,
+        psiMaxn.data(), psiMinn.data(), sumPhip.data(), mSumPhim.data());
+    ckM(cudaGetLastError(), "CMULES setup");
+
+    DeviceBuffer<scalar> lambdam(nC), lambdap(nC);
+    for (label it = 0; it < c.nLimiterIter; ++it)
+    {
+        // part 1 is shared with the explicit limiter: it reads only lambda and phiCorr, neither of
+        // which A, B or C touches.
+        iterCellKernel<<<nBlocks(nC), TPB>>>(
+            nC, dm.owner.data(), dm.nei.data(), dm.ownerStart.data(),
+            dm.losort.data(), dm.losortStart.data(), dm.bndCellStart.data(), dm.bndPerm.data(),
+            bndFlag.data(), lambdaInt.data(), lambdaBnd.data(),
+            phiCorrInt.data(), phiCorrBnd.data(),
+            psiMaxn.data(), psiMinn.data(), sumPhip.data(), mSumPhim.data(),
+            lambdam.data(), lambdap.data());
+        ckM(cudaGetLastError(), "CMULES iteration, cells");
+
+        if (nInternalFaces > 0)
+        {
+            iterFaceKernel<<<nBlocks(nInternalFaces), TPB>>>(
+                nInternalFaces, dm.owner.data(), dm.nei.data(), phiCorrInt.data(),
+                lambdam.data(), lambdap.data(), lambdaInt.data());
+            ckM(cudaGetLastError(), "CMULES iteration, faces");
+        }
+        if (nBoundaryFaces > 0)
+        {
+            iterBoundaryCorrKernel<<<nBlocks(nBoundaryFaces), TPB>>>(
+                nBoundaryFaces, dm.bndCell.data(), bndFlag.data(),
+                phiBnd.data(), phiCorrBnd.data(), lambdam.data(), lambdap.data(), lambdaBnd.data());
+            ckM(cudaGetLastError(), "CMULES iteration, boundary");
+        }
+    }
+}
+
+
+void deviceMulesLimitCorr(
+    const DeviceMesh&            dm,
+    int                          nInternalFaces,
+    int                          nBoundaryFaces,
+    scalar                       rDeltaT,
+    const DeviceBuffer<scalar>&  psi,
+    const DeviceBuffer<scalar>&  psiBndValue,
+    const DeviceBuffer<int>&     bndFixesValue,
+    const DeviceBuffer<int>&     bndFlag,
+    const DeviceBuffer<scalar>&  phiBnd,
+    DeviceBuffer<scalar>&        phiCorrInt,
+    DeviceBuffer<scalar>&        phiCorrBnd,
+    const DeviceMulesFields&     f,
+    const DeviceMulesControls&   c,
+    DeviceBuffer<scalar>*        lambdaIntOut,
+    DeviceBuffer<scalar>*        lambdaBndOut)
+{
+    DeviceBuffer<scalar> li, lb;
+    DeviceBuffer<scalar>& lambdaInt = lambdaIntOut ? *lambdaIntOut : li;
+    DeviceBuffer<scalar>& lambdaBnd = lambdaBndOut ? *lambdaBndOut : lb;
+
+    deviceMulesLimiterCorr(dm, nInternalFaces, nBoundaryFaces, rDeltaT, psi, psiBndValue,
+                           bndFixesValue, bndFlag, phiBnd, phiCorrInt, phiCorrBnd, f, c,
+                           lambdaInt, lambdaBnd);
+
+    // phiCorr *= lambda, in place. No blended flux: see B.
+    if (nInternalFaces > 0)
+    {
+        scaleKernel<<<nBlocks(nInternalFaces), TPB>>>(lambdaInt.data(), nInternalFaces, phiCorrInt.data());
+        ckM(cudaGetLastError(), "phiCorr *= lambda");
+    }
+    if (nBoundaryFaces > 0)
+    {
+        scaleKernel<<<nBlocks(nBoundaryFaces), TPB>>>(lambdaBnd.data(), nBoundaryFaces, phiCorrBnd.data());
+        ckM(cudaGetLastError(), "phiCorr *= lambda, boundary");
+    }
+}
+
+
+void deviceMulesCorrect(
+    const DeviceMesh&           dm,
+    scalar                      rDeltaT,
+    const DeviceBuffer<scalar>& phiCorrInt,
+    const DeviceBuffer<scalar>& phiCorrBnd,
+    const DeviceMulesFields&    f,
+    DeviceBuffer<scalar>&       psi)
+{
+    DeviceBuffer<scalar> divPhiCorr(dm.nCells);
+    deviceDiv(dm, phiCorrInt, phiCorrBnd, divPhiCorr);
+    correctKernel<<<nBlocks(dm.nCells), TPB>>>(
+        divPhiCorr.data(), f.rho, f.Sp, f.Su, dm.nCells, rDeltaT, psi.data());
+    ckM(cudaGetLastError(), "CMULES correct");
 }
 
 } // namespace brae
