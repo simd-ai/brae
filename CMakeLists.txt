@@ -128,6 +128,7 @@ add_library(brae_core STATIC
     src/applications/solvers/simpleFoam/simpleFoamV2.cu
     src/applications/solvers/simpleFoam/pEqn_cpp.cu
     src/applications/solvers/simpleFoam/createFields_cpp.cu
+    src/applications/solvers/interFoam/inter_driver_cpp.cu
     src/applications/solvers/interFoam/inter_case_cpp.cu
     src/transportModels/interfaceProperties/interface_properties_cpp.cu
     src/applications/solvers/interFoam/inter_solve_cpp.cu
