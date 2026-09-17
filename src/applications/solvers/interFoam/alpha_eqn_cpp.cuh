@@ -62,6 +62,7 @@
 #include "fvc.cuh"
 #include "interface_properties_cpp.cuh"
 #include "mules_cpp.cuh"
+#include "inter_solve_record.cuh"
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -221,6 +222,13 @@ struct AlphaStepInput
     // the case's own linear-solver controls for the implicit upwind pre-solve (MULESCorr only)
     scalar  tolAlpha = 1e-8, relTolAlpha = 0;
     int     maxIterAlpha = 1000;
+    // `solver smoothSolver; smoother symGaussSeidel|GaussSeidel;` -- run brae::smoothSolver, which is
+    // OpenFOAM's, in place of the DILU-PBiCGStab this step grew up on. See smooth_solver_cpp.cuh.
+    bool smoothSolver = false;
+    bool symmetric = true;
+    int nSweeps = 1;
+    // appended to, one record per pre-solve; null = not kept
+    std::vector<LinearSolveRecord>* solveLog = nullptr;
 };
 
 // One alphaEqn.H. `alpha1` carries the field AND its boundary conditions and is advanced in place;

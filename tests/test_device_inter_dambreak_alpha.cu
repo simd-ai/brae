@@ -149,6 +149,10 @@ int main(int argc, char** argv)
     hin.alphaScheme  = hostF.divPhiAlpha;
     hin.alpharScheme = hostF.divPhirbAlpha;
     hin.tolAlpha = hostF.aSolve.tol;
+    // ...and the case's own smoother on the host too, now that it has one (smooth_solver_cpp.cuh)
+    hin.smoothSolver = hostF.aSolve.gaussSeidel();
+    hin.symmetric = (hostF.aSolve.smoother == "symGaussSeidel");
+    hin.nSweeps = hostF.aSolve.nSweeps;
     hin.relTolAlpha = 0;
     hin.maxIterAlpha = 2000;
 

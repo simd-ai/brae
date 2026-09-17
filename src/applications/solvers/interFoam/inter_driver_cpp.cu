@@ -125,6 +125,11 @@ RunReport runInterFoam(
                     ai.tolAlpha = f.aSolve.tol;
                     ai.relTolAlpha = f.aSolve.relTol;
                     ai.maxIterAlpha = f.aSolve.maxIter;
+                    // ...and the case's own smoother, which the host can now run
+                    ai.smoothSolver = f.aSolve.gaussSeidel();
+                    ai.symmetric = (f.aSolve.smoother == "symGaussSeidel");
+                    ai.nSweeps = f.aSolve.nSweeps;
+                    ai.solveLog = &rep.alphaSolves;
 
                     auto step1 = [&](const std::vector<scalar>& aOld, scalar dtSub,
                                      std::vector<scalar>& aNew, SurfaceScalarField& rPhi)

@@ -46,6 +46,8 @@ struct RunReport
     scalar alphaMass    = 0;      // sum(alpha*V), which a closed domain must conserve
     // every p_rgh solve of the run, in order: nCorrectors x (nNonOrthogonalCorrectors + 1) per step
     std::vector<PressureSolveRecord> pSolves;
+    // ...and every alpha pre-solve: one per sub-cycle per step, and none on a case without MULESCorr
+    std::vector<LinearSolveRecord> alphaSolves;
 };
 
 // Run `nSteps` of interFoam on a prepared case. Returns the state at the end; `verbose` prints the

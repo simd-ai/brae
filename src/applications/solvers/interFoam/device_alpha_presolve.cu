@@ -63,7 +63,8 @@ scalar deviceAlphaPreSolve(
     scalar                        deltaT,
     const DeviceAlphaSolverControls& sc,
     DeviceBuffer<scalar>&         alphaPhi10Int,
-    DeviceBuffer<scalar>&         alphaPhi10Bnd)
+    DeviceBuffer<scalar>&         alphaPhi10Bnd,
+    DeviceSolverPerf*             perfOut)
 {
     const int nC  = dm.nCells;
     const int nIf = dm.nInternalFaces;
@@ -127,6 +128,10 @@ scalar deviceAlphaPreSolve(
         ckP(cudaGetLastError(), "matrix flux, boundary");
     }
     (void)nIf;
+    if (perfOut)
+    {
+        *perfOut = perf;
+    }
     return perf.finalResidual;
 }
 

@@ -298,14 +298,6 @@ RunReport runInterFoamDevice(
     C.alpha.preSolve.smoothSolver = f.aSolve.gaussSeidel();
     C.alpha.preSolve.symmetric = (f.aSolve.smoother == "symGaussSeidel");
     C.alpha.preSolve.nSweeps = f.aSolve.nSweeps;
-    if (f.alphaCtl.MULESCorr && !f.aSolve.gaussSeidel())
-    {
-        noticeApproximated("interFoam alpha pre-solve (device)",
-            "the case asks for `solver " + f.aSolve.solver + "; smoother " + f.aSolve.smoother +
-            ";` and the device runs Jacobi-BiCGStab at the same tolerance. That is not only a cost "
-            "difference: at damBreak's 1e-8 it left alpha 3.3e-06 from OpenFOAM where the case's own "
-            "symGaussSeidel leaves 1e-13.");
-    }
     C.mules = DeviceMulesControls{f.mulesCtl.nLimiterIter, f.mulesCtl.smoothLimiter,
                                   f.mulesCtl.extremaCoeff, f.mulesCtl.boundaryExtremaCoeff};
     C.alphaInput.cAlpha = f.interface.cAlpha;
@@ -336,8 +328,9 @@ RunReport runInterFoamDevice(
     // solver still runs the device BiCGStab, under the notice buildInterFields already printed.
     DeviceDilu dic = buildDeviceDilu(m.owner(), m.neighbour(), nC);
     C.dic = &dic;
-    std::vector<DeviceSolverPerf> pLog;
+    std::vector<DeviceSolverPerf> pLog, aLog;
     C.pressureSolveLog = &pLog;
+    C.alpha.preSolveLog = &aLog;
     C.pressurePcgDIC = f.pSolve.pcgDIC();
     C.pressureFinalPcgDIC = f.pSolveFinal.pcgDIC();
     C.pressure.tol = f.pSolve.tol;
@@ -422,6 +415,10 @@ RunReport runInterFoamDevice(
     for (const DeviceSolverPerf& sp : pLog)
     {
         rep.pSolves.push_back(PressureSolveRecord{sp.initialResidual, sp.finalResidual, sp.nIterations});
+    }
+    for (const DeviceSolverPerf& sp : aLog)
+    {
+        rep.alphaSolves.push_back(LinearSolveRecord{sp.initialResidual, sp.finalResidual, sp.nIterations});
     }
 
     // hand the device's answer back through the host fields, so a caller compares the same objects

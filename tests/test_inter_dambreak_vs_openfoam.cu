@@ -69,6 +69,11 @@ int main(int argc, char** argv)
     }
     const std::string caseDir = argv[1], startDir = argv[2], ofDir = argv[3];
     const label nSteps = static_cast<label>(std::atol(argv[4]));
+    // `bigstep`: the staging script's second run, at dt 5e-3, where the interface moves 0.69 rather
+    // than 3.7e-03 and the alpha pre-solve is hard enough for its solver log to discriminate. See the
+    // script's header for why the two things this gate measures want opposite fixtures.
+    const bool bigStep = argc > 7 && std::string(argv[7]) == "bigstep";
+    std::printf("  profile: %s\n", bigStep ? "bigstep -- the solver logs discriminate here" : "small step -- the tight field bounds live here");
 
     if (!std::filesystem::exists(ofDir + "/alpha.water"))
     {
@@ -99,6 +104,52 @@ int main(int argc, char** argv)
         check("OpenFOAM's log gave a p_rgh solve for every corrector of every step",
               !ofSolves.empty() && ofSolves.size() % static_cast<std::size_t>(nSteps) == 0);
         failures += brae::gatecheck::compareSolves("host", r.pSolves, ofSolves, nSteps);
+    }
+
+    // ...AND THE alpha PRE-SOLVE'S, which is the arm that would have caught the device running
+    // Jacobi-BiCGStab for the case's symGaussSeidel: OpenFOAM's smoother takes TWO sweeps to 1e-13 on
+    // this near-triangular upwind matrix, and no Krylov solver stopping at 1e-8 reports that.
+    const std::vector<LinearSolveRecord> ofAlphaSolves =
+        argc > 5 ? brae::gatecheck::readOfSolves(argv[5], fin.alphaName) : std::vector<LinearSolveRecord>{};
+    if (argc > 5)
+    {
+        check("OpenFOAM's log gave an alpha solve for every step",
+              ofAlphaSolves.size() == static_cast<std::size_t>(nSteps));
+        // THE FINAL RESIDUAL IS THE ARM THAT TELLS SOLVERS APART, and only on a fixture where the solve
+        // is hard. At dt 1e-4 it is not: the smoother takes ONE sweep, so would a Krylov solver, and
+        // the control below read 2.6e-03 from OpenFOAM's residuals beside the device's honest 1.5e-03
+        // -- an arm that cannot separate those is decoration, so there it is printed and not asserted.
+        // Under `bigstep` OpenFOAM takes 0, 5, 2, 2, 2 sweeps, the host leaves its final residuals to
+        // 9.1e-10 (lduMatrix::residual's operation order is transcribed too) and the bound is 1e-7.
+        failures += brae::gatecheck::compareSolves("host", r.alphaSolves, ofAlphaSolves, nSteps,
+                                                   fin.alphaName.c_str(), scalar(1e-10), scalar(1e-9),
+                                                   bigStep ? scalar(1e-7) : scalar(-1));
+        // ...AND ITS CONTROL: the same run with the alpha entry renamed to PBiCGStab, which is what the
+        // host ran until it had a smoothSolver. Measured under `bigstep`: two iteration counts of five
+        // and final residuals 100% out.
+        if (argc > 6 && bigStep)
+        {
+            const RunReport rc = runInterFoam(argv[6], std::string(argv[6]) + "/0", m, g, patches,
+                                              nSteps, /*verbose=*/false);
+            scalar wFinal = 0;
+            std::size_t nSame = 0;
+            for (std::size_t k = 0; k < rc.alphaSolves.size() && k < ofAlphaSolves.size(); ++k)
+            {
+                if (rc.alphaSolves[k].nIterations == ofAlphaSolves[k].nIterations)
+                {
+                    ++nSame;
+                }
+            }
+            std::printf("  CONTROL, the alpha entry renamed to PBiCGStab:\n");
+            brae::gatecheck::compareSolves("control", rc.alphaSolves, ofAlphaSolves, nSteps,
+                                           fin.alphaName.c_str(), scalar(1e300), scalar(1e300),
+                                           scalar(-1), &wFinal, /*assertArms=*/false);
+            std::printf("  CONTROL: %zu of %zu iteration counts equal, final residuals %.3e (relative) out\n",
+                        nSame, ofAlphaSolves.size(), (double)wFinal);
+            check("...and PBiCGStab does NOT take OpenFOAM's sweep counts", nSame < ofAlphaSolves.size());
+            check("...nor leave its final residuals: more than 20% out, against a bound of 1e-7",
+                  wFinal > scalar(0.2));
+        }
     }
     else
     {
@@ -154,8 +205,12 @@ int main(int argc, char** argv)
     // interFoam never applied; see updatePressurePatchesFromVelocity). The bound follows at about 30x.
     // A gate that would pass at 5% is not measuring the discretisation, it is measuring that something
     // happened; this one would not pass at the 5e-11 it carried one fix ago.
-    check("...and agrees with it to 1e-12 absolute, which is the discretisation and not the control",
-          dAlpha.linf < scalar(1e-12));
+    // ...and under `bigstep`, where the interface moves 0.69 instead of 3.7e-03 and carries the error
+    // with it, MEASURED 1.2e-12 and bounded at 5e-11.
+    const scalar alphaBound = bigStep ? scalar(5e-11) : scalar(1e-12);
+    std::printf("  (alpha bound for this profile: %.0e)\n", (double)alphaBound);
+    check("...and agrees with it absolutely, which is the discretisation and not the control",
+          dAlpha.linf < alphaBound);
 
     // p_rgh and U. BOTH codes now run the case's own PCG with DIC -- brae::pcg is a transcription of
     // lduMatrix PCG + DICPreconditioner, gated in tests/test_pcg.cu -- and both select p_rgh for the
@@ -228,6 +283,11 @@ int main(int argc, char** argv)
             if (argc > 5)
             {
                 failures += brae::gatecheck::compareSolves("device", rd.pSolves, ofSolves, nSteps);
+                // Under `bigstep` the device leaves OpenFOAM's final residuals to 5.0e-09 (the host
+                // 9.1e-10: its reductions sum in OpenFOAM's order and the device's do not). Bound 1e-6.
+                failures += brae::gatecheck::compareSolves("device", rd.alphaSolves, ofAlphaSolves, nSteps,
+                                                           dev.alphaName.c_str(), scalar(1e-10),
+                                                           scalar(1e-9), bigStep ? scalar(1e-6) : scalar(-1));
             }
             const Diff da = compare(dev.alpha1.internal, ofAlpha);
             const Diff dp = compare(dev.p_rgh.internal, ofPrgh);
@@ -246,7 +306,7 @@ int main(int argc, char** argv)
             // four thousand times the host's -- and the reason was the alpha pre-solve: the driver ran
             // Jacobi-BiCGStab to a hardcoded 1e-12 where the case names symGaussSeidel at 1e-8. At the
             // case's OWN 1e-8 that substitution read alpha 3.3e-06 and U 1.2e-03.
-            check("the DEVICE's alpha agrees with OpenFOAM's to 1e-12", da.linf < scalar(1e-12));
+            check("the DEVICE's alpha agrees with OpenFOAM's to the host's bound", da.linf < alphaBound);
             check("...its p_rgh to 2e-10 relative", dp.linf < scalar(2e-10)*std::fmax(dp.refMax, scalar(1e-12)));
             check("...and its U to 5e-10 relative", du < scalar(5e-10)*std::fmax(uRef, scalar(1e-12)));
         }

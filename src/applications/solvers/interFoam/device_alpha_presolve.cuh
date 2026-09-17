@@ -53,6 +53,7 @@
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
+#include "device_pcg.cuh"   // DeviceSolverPerf
 
 namespace brae {
 
@@ -88,6 +89,8 @@ scalar deviceAlphaPreSolve(
     scalar                        deltaT,
     const DeviceAlphaSolverControls& sc,
     DeviceBuffer<scalar>&         alphaPhi10Int,
-    DeviceBuffer<scalar>&         alphaPhi10Bnd);
+    DeviceBuffer<scalar>&         alphaPhi10Bnd,
+    // the solver's own report -- initial and final residual and the iteration count; null = not kept
+    DeviceSolverPerf*             perfOut = nullptr);
 
 } // namespace brae

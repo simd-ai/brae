@@ -256,16 +256,16 @@ InterFields buildInterFields(const std::string&          caseDir,
             f.aSolve.maxIter = static_cast<int>(ad->scalarOr("maxIter", scalar(1000)));
             f.aSolve.nSweeps = static_cast<int>(ad->scalarOr("nSweeps", scalar(1)));
         }
-        if (f.alphaCtl.MULESCorr && !f.aSolve.solver.empty())
+        if (f.alphaCtl.MULESCorr && !f.aSolve.solver.empty() && !f.aSolve.gaussSeidel())
         {
-            // The HOST has no smoothSolver, so it always substitutes, and says so. Measured on damBreak
-            // it is harmless -- DILU on a near-triangular upwind matrix is as nearly exact as a
-            // Gauss-Seidel sweep, and the host's alpha is 3.6e-14 from OpenFOAM's -- but it is measured
-            // on one case, not proven, and the notice is what makes that visible on another.
-            noticeApproximated("interFoam alpha pre-solve (host)",
+            // smoothSolver with either Gauss-Seidel smoother is OpenFOAM's own on both paths
+            // (smooth_solver_cpp.cuh, deviceSymGaussSeidel). Anything else still substitutes, and says
+            // what it costs when the substitute is a poor match for a near-triangular upwind matrix.
+            noticeApproximated("interFoam alpha pre-solve",
                 "the case asks for `solver " + f.aSolve.solver + "; smoother " + f.aSolve.smoother +
-                ";` and brae's host path runs DILU-PBiCGStab at the same tolerance. The device path "
-                "runs the case's own smoother.");
+                ";` and brae runs BiCGStab at the same tolerance (DILU-preconditioned on the host, "
+                "Jacobi on the device). On damBreak the device's substitute left alpha 3.3e-06 from "
+                "OpenFOAM at the case's own 1e-8.");
         }
         if (f.alphaCtl.MULESCorr && f.aSolve.solver.empty())
             throw std::runtime_error(

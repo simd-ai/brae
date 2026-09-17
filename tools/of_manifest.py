@@ -1855,11 +1855,12 @@ COMPONENTS = {
                   "shipped drivers alpha 1.6e-10 -> 1.1e-15, U 3.7e-08 -> 2.6e-14 relative, p_rgh 2.5e-10 "
                   "-> 2.5e-14, the adaptive clock 3e-10 -> 2e-12. Every bound in "
                   "tests/test_device_inter_dambreak_alpha.cu followed, from 1e-8/1e-7/1e-6 to "
-                  "1e-13/1e-12/1e-12. THE HOST STILL SUBSTITUTES (it has no smoothSolver) and says so in a "
-                  "noticeApproximated; on damBreak that is measured harmless, 3.6e-14, because DILU on a "
-                  "near-triangular matrix is as nearly exact as the sweep -- measured on one case, not "
-                  "proven. A device path with any other alpha solver gets a notice that carries the "
-                  "3.3e-06."),
+                  "1e-13/1e-12/1e-12. THE HOST SUBSTITUTED TOO (DILU-PBiCGStab, under a notice) until it had a "
+                  "smoothSolver of its own -- see interFoam_smoothSolver. On damBreak that was measured "
+                  "harmless, 3.6e-14, because DILU on a near-triangular matrix is as nearly exact as the "
+                  "sweep; measured on one case, not proven, which is why it was closed rather than left. "
+                  "Any alpha solver that is not smoothSolver with a Gauss-Seidel smoother still runs "
+                  "BiCGStab on both paths, under a notice that carries the 3.3e-06."),
         dict(name="interFoam_MULES", of_symbol="MULES::limiter",
              of_file="src/finiteVolume/fvMatrices/solvers/MULES/MULES.C",
              classification="SHARED_NUMERICAL", status="REIMPLEMENT",
@@ -2172,6 +2173,57 @@ COMPONENTS = {
                   "bounds tightened to 1e-12, 2e-10 and 5e-10. That gate also has a DEVICE arm now, at the "
                   "case's own tolerances -- what `brae_interFoam -device` runs -- held to the host's "
                   "bounds."),
+        dict(name="interFoam_smoothSolver", of_symbol="smoothSolver",
+             of_file="src/OpenFOAM/matrices/lduMatrix/solvers/smoothSolver/smoothSolver.C",
+             classification="SHARED_NUMERICAL", status="REIMPLEMENT",
+             brae_reference="src/OpenFOAM/matrices/smooth_solver_cpp.cuh",
+             brae_target="src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_gauss_seidel.cu",
+             validation="THREE LINKS, EACH MEASURED. (1) THE SWEEP against OpenFOAM's own numbers: "
+                        "tests/gs_ladder.cu used to carry its own inline transcription of "
+                        "symGaussSeidelSmoother.C, which proved that THAT copy was OpenFOAM's; its LEG 1 and LEG "
+                        "3 now call brae::gaussSeidelSmoothFolded, the function the host solver runs, and hold it "
+                        "to OpenFOAM's residual after exactly n sweeps for n = 1..10 on T3A's real momentum "
+                        "system -- symGaussSeidel 8.0e-13, GaussSeidel 1.7e-13. (2) THE LOOP, "
+                        "tests/test_smooth_solver_cpp.cu: nIterations counts SWEEPS and the residual is evaluated "
+                        "once per nSweeps, so `nSweeps 2; maxIter 5` runs SIX; a negative nSweeps is a fixed "
+                        "count that reports NO residual; minIter forces a converged system through the loop; a "
+                        "mesh out of OpenFOAM's upper-triangular face order is refused, not smoothed. Its oracle "
+                        "is the device's deviceSymGaussSeidel in LEVEL-SCHEDULED mode: same sweep count on four "
+                        "solves (13, 94, 28, 187) and iterates 0.000e+00 apart -- bit-identical after 187 sweeps "
+                        "from two implementations that share no loop. THE FIRST DRAFT OF THAT ARM COMPARED A HOST "
+                        "SWEEP WITH A HOST SWEEP: deviceSymGaussSeidel's DEFAULT is to run the sweep on the CPU "
+                        "(faster on these meshes), so 0.000e+00 was true and said nothing. The gate now selects "
+                        "the device loop before the first solve and ASSERTS it got it, through "
+                        "deviceGaussSeidelUsesHostSmoother(). Its control: at relTol 0.05 PBiCGStab's iterate is "
+                        "3.3 away from this solver's from the same initial residual. (3) END TO END, "
+                        "tests/interfoam_dambreak_vs_openfoam.sh, against OpenFOAM's `smoothSolver: Solving for "
+                        "alpha.water` log lines, host AND device: every sweep count equal, and at dt 5e-3 "
+                        "(OpenFOAM's counts 0, 5, 2, 2, 2) the FINAL residuals to 9.1e-10 on the host and 5.0e-09 "
+                        "on the device, with a PBiCGStab control that gets two counts of five and is 100% out. "
+                        "WHAT IT DOES NOT CLAIM: coupled interfaces. The smoothers' "
+                        "initMatrixInterfaces/updateMatrixInterfaces calls have nothing to do in a serial run "
+                        "with no coupled patch, and the host transcription omits them; a processor or cyclic "
+                        "patch is not covered.",
+             note="Ported because interFoam's MULESCorr pre-solve names `solver smoothSolver; smoother "
+                  "symGaussSeidel;` in every tutorial that sets MULESCorr and the host ran DILU-PBiCGStab "
+                  "in its place, under a notice. The device already had OpenFOAM's (deviceSymGaussSeidel); "
+                  "the host did not. THREE THINGS TO GET RIGHT, none visible in a converged field: the "
+                  "reverse half of symGaussSeidel does NOT distribute -- it gathers off the bPrime the "
+                  "forward half LEFT (symGaussSeidelSmoother.C:192); nIterations counts sweeps, "
+                  "`(nIterations += nSweeps) < maxIter`; and the loop's residual is lduMatrix::residual "
+                  "(lduMatrixATmul.C:268), which starts from source - diag*psi and subtracts the off- "
+                  "diagonals face by face -- NOT b - A.psi. That last one is invisible until the solve ends "
+                  "at round-off: on damBreak the smoother stops at 1e-14, where the rounding IS the "
+                  "residual, and with OpenFOAM's operation order transcribed the host reproduces its final "
+                  "residuals to four digits there (6.835e-15, 1.202e-14, 1.851e-14, 2.067e-14). THE END-TO- "
+                  "END ARM TAUGHT ITS OWN LESSON ABOUT FIXTURES. At the gate's dt 1e-4 the alpha system is "
+                  "so diagonally dominant (Co ~ 1e-3) that every solver lands on the exact solution in ONE "
+                  "iteration: the PBiCGStab control read 2.6e-03 from OpenFOAM's final residuals, right "
+                  "beside the device's honest 1.5e-03, so the arm could not tell solvers apart and would "
+                  "have certified either. The gate now runs a second profile at dt 5e-3, where the "
+                  "interface moves 0.69 and the solve is real, and asserts the solver-log arms only there. "
+                  "The fields hold on that profile too: alpha 1.2e-12 and p_rgh 1.3e-12 relative on both "
+                  "paths, U 4.3e-12 on the host and 8.5e-12 on the device."),
         dict(name="interFoam_vanLeer", of_symbol="vanLeer",
              of_file="src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/vanLeer/vanLeer.C",
              classification="SHARED_NUMERICAL", status="REIMPLEMENT",

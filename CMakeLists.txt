@@ -95,6 +95,7 @@ add_library(brae_core STATIC
     src/OpenFOAM/matrices/pcg.cu
     src/OpenFOAM/matrices/gamg.cu
     src/OpenFOAM/matrices/pbicgstab.cu
+    src/OpenFOAM/matrices/smooth_solver_cpp.cu
     src/matrices/lduMatrix/lduMatrix/blas1.cu
     src/matrices/lduMatrix/lduMatrix/reductions.cu
     src/matrices/lduMatrix/lduMatrix/device_spmv.cu
@@ -3516,6 +3517,14 @@ target_include_directories(test_device_dic PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_C
 target_link_libraries(test_device_dic PRIVATE brae_core)
 add_test(NAME device_dic COMMAND test_device_dic)
 set_tests_properties(device_dic PROPERTIES SKIP_RETURN_CODE 77)
+
+# brae::smoothSolver, the host reference: smoothSolver::solve's loop (what nIterations counts, nSweeps,
+# minIter, the negative-sweep branch, the mesh-order refusal) against the device's OpenFOAM-held solver,
+# with PBiCGStab as the control. The SWEEP is gs_ladder's, against OpenFOAM's own per-sweep residuals.
+add_executable(test_smooth_solver_cpp tests/test_smooth_solver_cpp.cu)
+target_include_directories(test_smooth_solver_cpp PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_smooth_solver_cpp PRIVATE brae_core)
+add_test(NAME smooth_solver_cpp COMMAND test_smooth_solver_cpp)
 
 add_executable(test_dilu tests/test_dilu.cu)
 target_include_directories(test_dilu PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)

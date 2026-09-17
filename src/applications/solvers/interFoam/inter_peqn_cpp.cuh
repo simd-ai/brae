@@ -63,6 +63,7 @@
 #include "geometric_field.cuh"
 #include "fvc.cuh"
 #include "ldu_matrix.cuh"
+#include "inter_solve_record.cuh"
 #include <stdexcept>
 #include <vector>
 
@@ -212,15 +213,8 @@ struct PressureTaps
     std::vector<scalar> snGradRho;
 };
 
-// One p_rgh solve as the solver itself reports it -- OpenFOAM's "Solving for p_rgh, Initial residual =
-// ..., Final residual = ..., No Iterations N" line. It is what says whether a solve STOPPED where
-// OpenFOAM's did, which a converged field cannot: see tests/test_inter_capillary_vs_openfoam.cu.
-struct PressureSolveRecord
-{
-    scalar initialResidual = 0;
-    scalar finalResidual = 0;
-    int nIterations = 0;
-};
+// One p_rgh solve as the solver itself reports it -- see inter_solve_record.cuh.
+using PressureSolveRecord = LinearSolveRecord;
 
 struct PressureStepInput
 {

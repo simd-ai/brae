@@ -104,8 +104,13 @@ void deviceInterAlphaStep(
             // alphaEqn.H:103-155: the implicit upwind pre-solve, ONCE per sub-step, then a
             // mixture.correct() of its own before the correctors begin.
             hooks.divCoeffs(alpha, iC, bC);
+            DeviceSolverPerf pre;
             deviceAlphaPreSolve(dm, alpha, subOld, *li.phiCNInt, iC, bC, dtSub, ctl.preSolve,
-                                alphaPhiInt, alphaPhiBnd);
+                                alphaPhiInt, alphaPhiBnd, &pre);
+            if (ctl.preSolveLog)
+            {
+                ctl.preSolveLog->push_back(pre);
+            }
             correctMixture(alpha, true);                        // alphaEqn.H:151-153
         }
 

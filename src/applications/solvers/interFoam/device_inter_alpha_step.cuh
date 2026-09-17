@@ -37,6 +37,7 @@
 #include "device_alpha_presolve.cuh"
 #include "device_two_phase_mixture.cuh"
 #include <functional>
+#include <vector>
 
 namespace brae {
 
@@ -82,6 +83,8 @@ struct DeviceInterAlphaControls
     // 223) and NOT at the mixture.correct() after the sub-cycle, which leaves alpha2 alone. They are
     // one contact-angle pass older than alpha1's -- see deviceBoundaryRho.
     DeviceBuffer<scalar>* alpha2BndOut = nullptr;
+    // appended to, one record per pre-solve; null = not kept
+    std::vector<DeviceSolverPerf>* preSolveLog = nullptr;
 };
 
 // `alpha1` is advanced in place from `alpha1Old`, which is never written. `rho`, `mu` and `nu` come out

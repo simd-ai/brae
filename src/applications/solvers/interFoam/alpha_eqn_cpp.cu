@@ -7,6 +7,7 @@
 #include "fvm.cuh"
 #include "fv_matrix_ops.cuh"
 #include "pbicgstab.cuh"
+#include "smooth_solver_cpp.cuh"
 #include <memory>
 
 namespace brae {
@@ -400,7 +401,14 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
             M.source[c] += rDeltaT * g.V()[c] * alpha1Old[c];
         }
 
-        pbicgstab(M, alpha1.internal, m, patches, in.tolAlpha, in.relTolAlpha, in.maxIterAlpha);
+        const SolverPerformance sp = in.smoothSolver
+            ? smoothSolver(M, alpha1.internal, m, patches, in.symmetric,
+                           in.tolAlpha, in.relTolAlpha, in.maxIterAlpha, 0, in.nSweeps)
+            : pbicgstab(M, alpha1.internal, m, patches, in.tolAlpha, in.relTolAlpha, in.maxIterAlpha);
+        if (in.solveLog)
+        {
+            in.solveLog->push_back(LinearSolveRecord{sp.initialResidual, sp.finalResidual, sp.nIterations});
+        }
         alpha1.evaluateBoundary();
 
         // alphaPhi10 = alpha1Eqn.flux(): the CONSERVATIVE face flux of the SOLVED matrix, not a flux
