@@ -112,7 +112,10 @@ struct DeviceInterStepControls
     DeviceAlphaStepInput      alphaInput;
 
     DeviceAlphaSolverControls momentum;      // the case's fvSolution entry for U
-    DeviceAlphaSolverControls pressure;      // ...and for p_rgh
+    // ...and for p_rgh, on every corrector but the last
+    DeviceAlphaSolverControls pressure;
+    // ...and p_rghFinal on the last -- pEqn.H:50's select(finalInnerIter()); see InterFields::pSolve
+    DeviceAlphaSolverControls pressureFinal;
     // pimple.correct() -- fvSolution's PIMPLE/nCorrectors. THE WHOLE OF pEqn.H REPEATS, not just the
     // solve: interFoam.C wraps `#include "pEqn.H"` in `while (pimple.correct())`, so rAU, HbyA,
     // phiHbyA, phig, the solve, U and phi are all rebuilt each pass, each from the U and phi the last

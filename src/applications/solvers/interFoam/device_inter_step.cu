@@ -298,7 +298,7 @@ void deviceInterStep(
         pi.needReference = ctl.needReference;
         pi.pRefCell = ctl.pRefCell;
         pi.pRefValue = ctl.pRefValue;
-        pi.solve = ctl.pressure;
+        pi.solve = (corr == ctl.nCorrectors - 1) ? ctl.pressureFinal : ctl.pressure;
 
         DevicePressureTaps pt;
         deviceInterPressureStep(dm, pi, hooks.pressure, st.rAU, st.HbyA[0], st.HbyA[1], st.HbyA[2],

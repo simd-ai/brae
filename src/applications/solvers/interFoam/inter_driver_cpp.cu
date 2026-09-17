@@ -31,15 +31,16 @@ GeometricField<scalar> zgField(const std::vector<scalar>& cells, const std::vect
 }   // namespace
 
 
-RunReport runInterFoam(const std::string&          caseDir,
-                       const std::string&          startDir,
-                       const PrimitiveMesh&        m,
-                       const FvGeometry&           g,
-                       const std::vector<FvPatch>& patches,
-                       label                       nSteps,
-                       bool                        verbose,
-                       InterFields*                fieldsOut,
-                       scalar                      endTime)
+RunReport runInterFoam(
+    const std::string& caseDir,
+    const std::string& startDir,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    label nSteps,
+    bool verbose,
+    InterFields* fieldsOut,
+    scalar endTime)
 {
     InterFields f = buildInterFields(caseDir, startDir, m, g, patches);
     const label nC = m.nCells();
@@ -262,12 +263,20 @@ RunReport runInterFoam(const std::string&          caseDir,
                     psc.needReference = false;          // damBreak's atmosphere is totalPressure
                     // the CASE's own solve, not a hardcoded 1e-9. BRAE_PTOL still overrides, because
                     // a device-vs-host gate has to pin both sides to one stopping point.
-                    psc.tolP    = std::getenv("BRAE_PTOL")
-                                ? std::atof(std::getenv("BRAE_PTOL")) : f.tolP;
-                    psc.relTolP = std::getenv("BRAE_PTOL") ? scalar(0) : f.relTolP;
-                    psc.maxIterP = f.maxIterP;
+                    const char* ptol = std::getenv("BRAE_PTOL");
+                    psc.tolP = ptol ? std::atof(ptol) : f.pSolve.tol;
+                    psc.relTolP = ptol ? scalar(0) : f.pSolve.relTol;
+                    psc.maxIterP = f.pSolve.maxIter;
+                    psc.pcgDIC = f.pSolve.pcgDIC();
+                    psc.tolPFinal = ptol ? std::atof(ptol) : f.pSolveFinal.tol;
+                    psc.relTolPFinal = ptol ? scalar(0) : f.pSolveFinal.relTol;
+                    psc.maxIterPFinal = f.pSolveFinal.maxIter;
+                    psc.pcgDICFinal = f.pSolveFinal.pcgDIC();
                     for (label c = 0; c < lc.nCorrectors; ++c)
+                    {
+                        psc.finalCorrector = (c == lc.nCorrectors - 1);
                         pressureCorrector(f.p_rgh, f.U, f.phi, f.p, pin, psc, m, g, patches);
+                    }
                     break;
                 }
 
@@ -295,11 +304,12 @@ RunReport runInterFoam(const std::string&          caseDir,
                 const vector& v = f.U.internal[c];
                 maxU = std::fmax(maxU, std::sqrt(v.x*v.x + v.y*v.y + v.z*v.z));
             }
-            // %.9g on t and dt, not %.6f/%.3e: these two are the ones a clock gate reads back, and
-            // OpenFOAM's own log prints six significant figures, so anything coarser here makes the
-            // comparison measure this printf. See tests/interfoam_dambreak_clock_vs_openfoam.sh.
-            std::printf("  t = %.9g  dt = %.9g  Co %.3f  alphaCo %.3f  "
-                        "alpha [%.3e, %.6f]  max|U| %.4f\n",
+            // %.17g on t and dt -- round-trip precision -- because these two are what a clock gate
+            // reads back. At %.9g the gate bottomed out at 2.389e-09 on host AND device and stayed
+            // there when the fields moved four orders closer to OpenFOAM's: it was measuring this
+            // printf. See tests/interfoam_dambreak_clock_vs_openfoam.sh.
+            std::printf("  t = %.17g  dt = %.17g  Co %.3f  alphaCo %.3f  "
+                        "alpha [%.3e, %.15g]  max|U| %.4f\n",
                         (double)rep.time, (double)rep.deltaT, (double)rep.CoNum,
                         (double)rep.alphaCoNum, (double)aMin, (double)aMax, (double)maxU);
         }

@@ -49,6 +49,7 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include "device_gate_finite.cuh"
 
 using namespace brae;
 using namespace brae::cpu::interFoam;
@@ -133,6 +134,9 @@ int main(int argc, char** argv)
     const RunReport r = runInterFoam(caseDir, startDir, m, g, patches, nSteps, true, &fin);
     check("brae ran the same number of steps", r.steps == nSteps);
 
+    // worstU accumulates with std::fmax, which drops NaN: a non-finite brae U would read 0 error.
+    failures += brae::gatecheck::nonFinite("brae U", fin.U.internal);
+    check("OpenFOAM's U has one value per cell", ofU.size() == fin.U.internal.size());
     scalar uRef = 0;
     const scalar uLinf = worstU(fin.U.internal, ofU, uRef);
     scalar braeMax = 0;

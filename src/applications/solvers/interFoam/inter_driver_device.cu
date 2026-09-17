@@ -72,15 +72,16 @@ void updateVelocityPatches(GeometricField<vector>& U, const std::vector<FvPatch>
 }   // namespace
 
 
-RunReport runInterFoamDevice(const std::string&          caseDir,
-                             const std::string&          startDir,
-                             const PrimitiveMesh&        m,
-                             const FvGeometry&           g,
-                             const std::vector<FvPatch>& fvp,
-                             label                       nSteps,
-                             bool                        verbose,
-                             InterFields*                fieldsOut,
-                             scalar                      endTime)
+RunReport runInterFoamDevice(
+    const std::string& caseDir,
+    const std::string& startDir,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp,
+    label nSteps,
+    bool verbose,
+    InterFields* fieldsOut,
+    scalar endTime)
 {
     InterFields f = buildInterFields(caseDir, startDir, m, g, fvp);
     const label nC = m.nCells(), nIf = m.nInternalFaces();
@@ -275,9 +276,15 @@ RunReport runInterFoamDevice(const std::string&          caseDir,
     C.momentumPredictor = f.momentumPredictorOn;
     C.relaxU = f.relaxU;
     C.relaxEquationU = f.relaxEquationU;
-    C.pressure.tol = f.tolP;
-    C.pressure.relTol = f.relTolP;
-    C.pressure.maxIter = f.maxIterP;
+    // Both entries, selected per corrector inside the step. The device solver itself is still not
+    // the case's PCG+DIC -- a DIC preconditioner is a triangular sweep -- so where the solve stops
+    // differs from OpenFOAM's exactly as the host's did before brae::pcg; the tolerances are the case's.
+    C.pressure.tol = f.pSolve.tol;
+    C.pressure.relTol = f.pSolve.relTol;
+    C.pressure.maxIter = f.pSolve.maxIter;
+    C.pressureFinal.tol = f.pSolveFinal.tol;
+    C.pressureFinal.relTol = f.pSolveFinal.relTol;
+    C.pressureFinal.maxIter = f.pSolveFinal.maxIter;
     C.momentum.tol = scalar(1e-12);
     C.takeUAtBoundary = &dTakeU;
     { const SolutionDirections sd = solutionDirections(fvp);
@@ -316,10 +323,10 @@ RunReport runInterFoamDevice(const std::string&          caseDir,
         // OpenFOAM's two #includes each build their own surfaceSum(mag(phi)), and so do these two
         // calls. The host driver caches one and shares it, which is the single place it deliberately
         // differs from OpenFOAM; the device does not need to, so it does not.
-        rep.CoNum      = deviceAlphaCourantNo(dm, dPhiI, dPhiB, nullptr, rep.deltaT).CoNum;
-        rep.alphaCoNum = deviceAlphaCourantNo(dm, dPhiI, dPhiB, &dA,    rep.deltaT).CoNum;
-        rep.deltaT     = setDeltaTVoF(rep.deltaT, rep.CoNum, rep.alphaCoNum, f.timeCtl,
-                                      rep.time, &f.writeCadence);
+        rep.CoNum = deviceAlphaCourantNo(dm, dPhiI, dPhiB, nullptr, rep.deltaT).CoNum;
+        rep.alphaCoNum = deviceAlphaCourantNo(dm, dPhiI, dPhiB, &dA, rep.deltaT).CoNum;
+        rep.deltaT = setDeltaTVoF(rep.deltaT, rep.CoNum, rep.alphaCoNum, f.timeCtl,
+                                  rep.time, &f.writeCadence);
 
         std::vector<scalar> ca, cx, cy, cz;
         dA.copyTo(ca);   dAOld.copyFrom(ca);
@@ -344,8 +351,8 @@ RunReport runInterFoamDevice(const std::string&          caseDir,
             dA.copyTo(av);
             scalar lo = av.empty() ? 0 : av[0], hi = lo;
             for (scalar v : av) { lo = std::fmin(lo, v); hi = std::fmax(hi, v); }
-            std::printf("   t = %.9g  dt = %.9g  Co %.3f  alphaCo %.3f  [device]  "
-                        "alpha [%.3e, %.6f]\n",
+            std::printf("   t = %.17g  dt = %.17g  Co %.3f  alphaCo %.3f  [device]  "
+                        "alpha [%.3e, %.15g]\n",
                         (double)rep.time, (double)rep.deltaT, (double)rep.CoNum,
                         (double)rep.alphaCoNum, (double)lo, (double)hi);
         }

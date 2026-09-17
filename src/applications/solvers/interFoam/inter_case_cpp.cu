@@ -1,6 +1,7 @@
 // interFoam's createFields -- see inter_case_cpp.cuh for the provenance and for the four things the
 // order of this file encodes.
 #include "inter_case_cpp.cuh"
+#include "brae_notice.cuh"
 #include "foam_field_reader.cuh"
 #include "read_surface_field.cuh"
 #include "scheme_parse.cuh"
@@ -231,9 +232,32 @@ InterFields buildInterFields(const std::string&          caseDir,
                 "solve's tolerance from there and every shipped tutorial carries one; assuming a "
                 "tolerance would run the case to a convergence nobody asked for, which is exactly the "
                 "defect this replaced.");
-        f.tolP     = pr->scalarOr("tolerance", scalar(1e-7));
-        f.relTolP  = (pf ? pf->scalarOr("relTol", scalar(0)) : scalar(0));
-        f.maxIterP = static_cast<int>(pr->scalarOr("maxIter", scalar(2000)));
+        // lduMatrix::solver::readControls (lduMatrixSolver.C:195-205): tolerance 1e-6, relTol 0,
+        // maxIter 1000 when absent.
+        auto readSolve = [&](const FoamDict& d)
+        {
+            InterFields::PressureLinearSolve s;
+            s.solver = d.wordOr("solver", "");
+            s.preconditioner = d.wordOr("preconditioner", "");
+            s.tol = d.scalarOr("tolerance", scalar(1e-6));
+            s.relTol = d.scalarOr("relTol", scalar(0));
+            s.maxIter = static_cast<int>(d.scalarOr("maxIter", scalar(1000)));
+            if (!s.pcgDIC())
+                noticeApproximated("interFoam p_rgh solve",
+                    "the case asks for `solver " + s.solver + "; preconditioner " +
+                    s.preconditioner + ";` and brae runs PBiCGStab at the same tolerance. Only "
+                    "PCG with DIC is OpenFOAM's own solver here; the difference is where the solve "
+                    "stops, which on a VoF case is visible as alpha's over-1 excursion.");
+            return s;
+        };
+        f.pSolve = readSolve(*pr);
+        if (!pf)
+            throw std::runtime_error(
+                "brae interFoam: fvSolution has `solvers/p_rgh` but no `p_rghFinal`. pEqn.H solves "
+                "the last corrector with p_rgh.select(finalInnerIter()), which OpenFOAM resolves to "
+                "the Final entry and refuses to run without; guessing it would pick the last "
+                "corrector's stopping point for the case.");
+        f.pSolveFinal = readSolve(*pf);
     }
 
     // relaxationFactors/equations -- see InterFields::relaxEquationU.

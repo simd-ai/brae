@@ -359,7 +359,7 @@ int main(int argc, char** argv)
         for (label c = 0; c < nC; ++c)
         { dux[c] = devF.U.internal[c].x; hux[c] = hostF.U.internal[c].x; }
         failures += brae::gatecheck::nonFinite("device alpha", devF.alpha1.internal);
-        failures += brae::gatecheck::nonFinite("device U.x",   dux);
+        failures += brae::gatecheck::nonFinite("device U.x", dux);
         failures += brae::gatecheck::nonFinite("device p_rgh", devF.p_rgh.internal);
 
         scalar wa = 0, wu = 0, wp = 0, sa = 0, su = 0, sp = 0, exc = 0, moved = 0;
@@ -390,7 +390,7 @@ int main(int argc, char** argv)
               "pressure corrector", moved > scalar(1e-4));
     }
 
-    // ---- THE SAME STEP ON THE CASE'S OWN CLOCK ---------------------------------------------------
+    // THE SAME STEP ON THE CASE'S OWN CLOCK.
     // Every arm above runs at a FIXED dt, because the host driver read damBreak's `adjustTimeStep yes`
     // and grew its step while the device loop took whatever it was handed -- two runs at different
     // physical times, which read as alpha 9.57e-01 out and look like a discretisation error.
@@ -429,12 +429,15 @@ int main(int argc, char** argv)
             su = std::fmax(su, std::fabs(hostF.U.internal[c].x));
         }
         const scalar dtRel = std::fabs(rd.deltaT - rh.deltaT)/std::fmax(rh.deltaT, scalar(1e-30));
-        const scalar tRel  = std::fabs(rd.time   - rh.time)  /std::fmax(rh.time,   scalar(1e-30));
+        const scalar tRel = std::fabs(rd.time - rh.time)/std::fmax(rh.time, scalar(1e-30));
         const scalar coRel = std::fabs(rd.CoNum - rh.CoNum)/std::fmax(rh.CoNum, scalar(1e-30));
         const scalar acRel = std::fabs(rd.alphaCoNum - rh.alphaCoNum)
                            / std::fmax(rh.alphaCoNum, scalar(1e-30));
         scalar capped = dt;
-        for (label k = 0; k < nAdapt; ++k) capped *= scalar(1.2);
+        for (label k = 0; k < nAdapt; ++k)
+        {
+            capped *= scalar(1.2);
+        }
 
         std::printf("  THE CASE'S OWN CLOCK, %d steps: host dt %.6e -> t %.6e, device dt %.6e -> "
                     "t %.6e  (dt %.3e, t %.3e);  Co %.4e/%.4e, alphaCo %.4e/%.4e;  "

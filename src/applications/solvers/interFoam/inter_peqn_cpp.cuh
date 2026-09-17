@@ -171,9 +171,21 @@ void ddtCorr(const DdtCorrInput&           in,
 // pEqn.H end to end: rAU, HbyA, phiHbyA, the p_rgh solve, then U and phi rebuilt.
 struct PressureSolveControls
 {
-    scalar tolP    = 1e-7;
+    // solvers/p_rgh, for every corrector but the last...
+    scalar tolP = 1e-7;
     scalar relTolP = 0;
-    int    maxIterP = 2000;
+    // lduMatrix::defaultMaxIter (lduMatrix.H:125)
+    int maxIterP = 1000;
+    // `solver PCG; preconditioner DIC;` -> brae::pcg
+    bool pcgDIC = false;
+    // ...and solvers/p_rghFinal for the last. See InterFields::pSolve for why there are two.
+    scalar tolPFinal = 1e-7;
+    scalar relTolPFinal = 0;
+    int maxIterPFinal = 1000;
+    bool pcgDICFinal = false;
+    // pimpleControl::finalInnerIter() (pimpleControlI.H:98-111): corrPISO == nCorrPISO. The caller
+    // knows which pass this is; pressureCorrector owns the non-orthogonal half of the test.
+    bool finalCorrector = true;
     label  nCorrectors = 1;          // pimple.correct()
     label  nNonOrthogonalCorrectors = 0;
     // p_rgh has no value-fixing patch anywhere -> the system is singular and needs a reference.

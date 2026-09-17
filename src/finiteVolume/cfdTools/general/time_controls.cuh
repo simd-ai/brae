@@ -228,9 +228,11 @@ inline CourantNumbers alphaCourantNo(
 // 0.004`, OpenFOAM ended at t = 0.00385757 and brae at 0.00385805.
 struct WriteCadence
 {
-    bool   adjustable     = false;   // writeControl adjustableRunTime -- the only mode that adjusts
-    scalar writeInterval  = 0;
-    label  writeTimeIndex = 0;       // Time::writeTimeIndex_, which advance() below moves
+    // writeControl adjustableRunTime -- the only mode that adjusts
+    bool adjustable = false;
+    scalar writeInterval = 0;
+    // Time::writeTimeIndex_, which advance() below moves
+    label writeTimeIndex = 0;
 
     static WriteCadence read(const FoamDict& controlDict)
     {
@@ -241,7 +243,7 @@ struct WriteCadence
         // no-op on the very case it was measured against. Any other value, tabulated or not, leaves
         // adjustDeltaT a no-op exactly as it is in OpenFOAM.
         const std::string wc = controlDict.wordOr("writeControl", "timeStep");
-        w.adjustable    = (wc == "adjustable" || wc == "adjustableRunTime");
+        w.adjustable = (wc == "adjustable" || wc == "adjustableRunTime");
         w.writeInterval = controlDict.scalarOr("writeInterval", scalar(0));
         if (w.adjustable && !(w.writeInterval > scalar(0)))
             throw std::runtime_error(
@@ -252,18 +254,26 @@ struct WriteCadence
 
     // Time::operator++ (Time.C:1046-1074), and the two details there both matter: the time is the one
     // AFTER the step, the deltaT is the one that took it, and the index only ever moves FORWARD.
-    void advance(scalar tSinceStart, scalar deltaT)
+    void advance(
+        scalar tSinceStart,
+        scalar deltaT)
     {
         if (!adjustable) return;
         const label wi =
             static_cast<label>((tSinceStart + scalar(0.5)*deltaT)/writeInterval);
-        if (wi > writeTimeIndex) writeTimeIndex = wi;
+        if (wi > writeTimeIndex)
+        {
+            writeTimeIndex = wi;
+        }
     }
 };
 
 // Time::adjustDeltaT() (Time.C:1136-1170). `tSinceStart` is value() - startTime_, which is what the
 // drivers' own clocks already measure.
-inline scalar adjustDeltaT(scalar deltaT, scalar tSinceStart, const WriteCadence& w)
+inline scalar adjustDeltaT(
+    scalar deltaT,
+    scalar tSinceStart,
+    const WriteCadence& w)
 {
     if (!w.adjustable) return deltaT;
 
@@ -279,19 +289,23 @@ inline scalar adjustDeltaT(scalar deltaT, scalar tSinceStart, const WriteCadence
     const scalar newDeltaT = timeToNextWrite/nStepsToNextWrite;
 
     // Control the increase of the time step to within a factor of 2 and the decrease within 5.
-    return (newDeltaT >= deltaT) ? std::min(newDeltaT, scalar(2)*deltaT)
-                                 : std::max(newDeltaT, scalar(0.2)*deltaT);
+    if (newDeltaT >= deltaT)
+    {
+        return std::min(newDeltaT, scalar(2)*deltaT);
+    }
+    return std::max(newDeltaT, scalar(0.2)*deltaT);
 }
 
 // setDeltaT.H, and the adjustDeltaT that Time::setDeltaT performs on the way in. `w` null is a case
 // with no adjustable write cadence -- every gate fixture, and any case on `writeControl timeStep` or
 // `runTime`, for which OpenFOAM's adjustDeltaT is a no-op anyway.
-inline scalar setDeltaTVoF(scalar              deltaT,
-                           scalar              CoNum,
-                           scalar              alphaCoNum,
-                           const VoFTimeControls& tc,
-                           scalar              tSinceStart = 0,
-                           const WriteCadence* w = nullptr)
+inline scalar setDeltaTVoF(
+    scalar deltaT,
+    scalar CoNum,
+    scalar alphaCoNum,
+    const VoFTimeControls& tc,
+    scalar tSinceStart = 0,
+    const WriteCadence* w = nullptr)
 {
     if (!tc.base.adjustTimeStep) return deltaT;
     const scalar kSmall = 1.0e-37;

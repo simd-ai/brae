@@ -19,6 +19,7 @@
 #include "fv_patch.cuh"
 #include "foam_field_reader.cuh"
 #include "inter_driver_cpp.cuh"
+#include "device_gate_finite.cuh"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -108,6 +109,12 @@ int main(int argc, char** argv)
     check("OpenFOAM's own run actually moved the interface, so there is something to compare",
           ofMoved > scalar(1e-6));
 
+    // BEFORE any fmax below: compare() accumulates Linf with std::fmax, which DROPS a NaN, so a brae
+    // field gone non-finite would read Linf 0 and pass every bound in this file. See
+    // tests/device_gate_finite.cuh for the run that printed four green checks on 2268 NaN cells.
+    failures += brae::gatecheck::nonFinite("brae alpha", fin.alpha1.internal);
+    failures += brae::gatecheck::nonFinite("brae p_rgh", fin.p_rgh.internal);
+    failures += brae::gatecheck::nonFinite("brae U", fin.U.internal);
     const Diff dAlpha = compare(fin.alpha1.internal, ofAlpha);
     std::printf("  alpha:  Linf %.4e  L2 %.4e   (OpenFOAM moved %.4e, so Linf is %.2f%% of the change)\n",
                 (double)dAlpha.linf, (double)dAlpha.l2, (double)ofMoved,
@@ -119,26 +126,30 @@ int main(int argc, char** argv)
     std::printf("  ...against %.4e for a solver that did NOTHING\n", (double)dNothing.linf);
     check("brae's alpha is far closer to OpenFOAM's than the initial field is",
           dAlpha.linf < scalar(0.05) * dNothing.linf);
-    // MEASURED 3.43e-09, i.e. one part in a million of OpenFOAM's own change. The bound is set an
-    // order of magnitude above that rather than at the 5% the control needs -- a gate that would pass
-    // at 5% is not measuring the discretisation, it is measuring that something happened.
-    check("...and agrees with it to 1e-7 absolute, which is the discretisation and not the control",
-          dAlpha.linf < scalar(1e-7));
+    // MEASURED 2.2337e-12. It was 3.43e-09, then 1.24e-08 once the case's own p_rgh tolerance was
+    // read, and every one of those was the PRESSURE SOLVER: brae ran PBiCGStab where damBreak names
+    // PCG with DIC, and applied p_rghFinal's relTol to all three correctors where pEqn.H selects
+    // p_rgh (relTol 0.05) for the first two. With brae::pcg and the per-corrector selection it is
+    // 2.2e-12 -- four orders -- and the bound follows it, at about 20x for another compiler's
+    // contraction. A gate that would pass at 5% is not measuring the discretisation, it is measuring
+    // that something happened; this one would not pass at the old 1e-8.
+    check("...and agrees with it to 5e-11 absolute, which is the discretisation and not the control",
+          dAlpha.linf < scalar(5e-11));
 
-    // p_rgh and U. NEITHER solver's linear solve is the other's -- OpenFOAM runs PCG/DIC at tolerance
-    // 1e-07 relTol 0.05 on p_rgh, brae's host path runs DILU-preconditioned BiCGStab -- so these
-    // fields carry the two solvers' residuals whatever the discretisation does. relTol 0.05 in
-    // particular means OpenFOAM stops when the residual has fallen by a factor of 20, which is a long
-    // way from converged. The bounds are stated relative to each field's own scale for that reason.
+    // p_rgh and U. BOTH codes now run the case's own PCG with DIC -- brae::pcg is a transcription of
+    // lduMatrix PCG + DICPreconditioner, gated in tests/test_pcg.cu -- and both select p_rgh for the
+    // first two correctors and p_rghFinal for the last. So the two stop at the same residual, and what
+    // is left is floating point amplified through a solve that stops at relTol 0.05, not two solvers'
+    // different stopping points. The bounds are relative to each field's own scale.
     const std::vector<scalar> ofPrgh = readCells(ofDir + "/p_rgh");
     const Diff dP = compare(fin.p_rgh.internal, ofPrgh);
     std::printf("  p_rgh:  Linf %.4e  L2 %.4e   (|p_rgh| up to %.4e)\n",
                 (double)dP.linf, (double)dP.l2, (double)dP.refMax);
     std::printf("          relative %.3e\n", (double)(dP.linf/std::fmax(dP.refMax, scalar(1e-30))));
-    // MEASURED 2.3e-06 relative. OpenFOAM's p_rgh runs at relTol 0.05 -- it stops when the residual
-    // has fallen by a factor of 20 -- so agreement much below this would be luck rather than a claim.
-    check("p_rgh agrees with OpenFOAM's to 1e-4 relative, inside the two linear solves' own residuals",
-          dP.linf < scalar(1e-4) * std::fmax(dP.refMax, scalar(1e-12)));
+    // MEASURED 7.194e-10 relative; 3.35e-06 on PBiCGStab. The old comment here said agreement much
+    // below 2.3e-06 "would be luck rather than a claim" -- that was the substituted solver talking.
+    check("p_rgh agrees with OpenFOAM's to 1e-8 relative, both running the case's PCG+DIC",
+          dP.linf < scalar(1e-8) * std::fmax(dP.refMax, scalar(1e-12)));
 
     const FieldData<vector> ofUfd = readField<vector>(ofDir + "/U");
     std::vector<vector> ofU;
@@ -154,9 +165,10 @@ int main(int argc, char** argv)
     }
     std::printf("  U:      Linf %.4e            (|U| up to %.4e)\n", (double)uLinf, (double)uRef);
     std::printf("          relative %.3e\n", (double)(uLinf/std::fmax(uRef, scalar(1e-30))));
-    // MEASURED 3.3e-06 relative. U is rebuilt from the pressure flux, so it carries p_rgh's residual.
-    check("U agrees with OpenFOAM's to 1e-4 relative, the same bound and for the same reason",
-          uLinf < scalar(1e-4) * std::fmax(uRef, scalar(1e-12)));
+    // MEASURED 1.966e-08 relative; 9.76e-06 on PBiCGStab. U is rebuilt from the pressure flux, so it
+    // carries whatever p_rgh's solve leaves.
+    check("U agrees with OpenFOAM's to 4e-7 relative, for the same reason",
+          uLinf < scalar(4e-7) * std::fmax(uRef, scalar(1e-12)));
 
     // ...and the conserved quantity, which neither solver's linear tolerance can move.
     scalar ofMass = 0, a0Mass = 0;

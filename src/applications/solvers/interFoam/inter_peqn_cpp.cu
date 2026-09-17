@@ -6,6 +6,7 @@
 #include "fvm.cuh"
 #include "fv_matrix_ops.cuh"
 #include "pbicgstab.cuh"
+#include "pcg.cuh"
 
 namespace brae {
 namespace cpu {
@@ -350,7 +351,21 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
             pe.diag[sc.pRefCell]   += pe.diag[sc.pRefCell];
         }
 
-        pbicgstab(pe, p_rgh.internal, m, patches, sc.tolP, sc.relTolP, sc.maxIterP);
+        // p_rgh.select(pimple.finalInnerIter()) (pEqn.H:50): the Final entry on the last
+        // non-orthogonal pass of the last corrector, the plain entry everywhere else. And the case's
+        // own solver where brae has OpenFOAM's -- the choice is not cosmetic. On damBreak the over-1
+        // alpha excursion is dt x the div(phi) this solve leaves behind (interFoam's alphaSuSp.H has
+        // no divU), and tightening ONLY p_rgh removed the whole of it on both codes, from 1.16e-06
+        // to 4.9e-13; with PBiCGStab standing in for PCG+DIC brae's excursion ran 0.12x to 3.18x
+        // OpenFOAM's from one step to the next.
+        const bool finalInner = sc.finalCorrector && corr == sc.nNonOrthogonalCorrectors;
+        const scalar tol = finalInner ? sc.tolPFinal : sc.tolP;
+        const scalar relTol = finalInner ? sc.relTolPFinal : sc.relTolP;
+        const int maxIter = finalInner ? sc.maxIterPFinal : sc.maxIterP;
+        if (finalInner ? sc.pcgDICFinal : sc.pcgDIC)
+            pcg(pe, p_rgh.internal, m, patches, tol, relTol, maxIter);
+        else
+            pbicgstab(pe, p_rgh.internal, m, patches, tol, relTol, maxIter);
         p_rgh.evaluateBoundary();
 
         if (corr == sc.nNonOrthogonalCorrectors)

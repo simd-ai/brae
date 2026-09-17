@@ -1894,16 +1894,18 @@ COMPONENTS = {
                   "is a conditioning effect in the budget that grows with the correction. The exact "
                   "mechanism is not attributed; the gate asserts the characterisation -- the bound AND "
                   "the scaling -- so a change in behaviour fails rather than being absorbed. "
-                  "OPEN, AND NEWLY VISIBLE: on damBreak over ten adaptive steps brae's alpha reaches "
-                  "1 + 2.306e-06 where real OpenFOAM, at writePrecision 14 on the same case, logs "
-                  "Max(alpha.water) = 1.0000011623306 -- so brae's over-1 excursion is 1.98x "
-                  "OpenFOAM's, on a run whose alpha field agrees with it to 1.24e-08. That gap was "
-                  "invisible because test_inter_case_cpp bounded the excursion at a round 1e-6 and "
-                  "brae sat at 1.0e-06, passing on no margin; porting Time::adjustDeltaT shifted the "
-                  "run a few thousandths of a second and it read 2.306e-06 and failed. The bound is "
-                  "now 2.5x the ORACLE's own measured excursion, because a bound below what OpenFOAM "
-                  "itself achieves -- and 1e-6 is below its 1.1623e-06 -- is not a tight bound but a "
-                  "broken one. Closing the 2x is open."),
+                  "NOT CMULES, AS IT TURNED OUT: on damBreak over ten adaptive steps brae's alpha "
+                  "reached 1 + 2.306e-06 where real OpenFOAM reached 1 + 1.1361e-06, 1.98x, and it "
+                  "was first recorded here as an open CMULES gap. Measuring it put it elsewhere. "
+                  "interFoam's alphaSuSp.H has no divU, so the MULESCorr pre-solve on a full cell "
+                  "gives a = 1/(1 + dt*div(phi)) and the excursion is dt times the continuity error "
+                  "the PRESSURE solve left. Tightening only the alpha solve changed nothing to the "
+                  "last digit; tightening only p_rgh took both codes from 1.16e-06 to 4.9e-13. The "
+                  "per-step ratio ran 0.12x to 3.18x, not a steady 2x. Closed under interFoam_pEqn, "
+                  "and test_inter_case_cpp now holds it at OpenFOAM's own value to 2% (0.9931x). "
+                  "OpenFOAM prints Max(alpha.water) TWICE a step -- after the pre-solve "
+                  "(alphaEqn.H:124) and after the correctors (alphaEqn.H:263) -- and the gate's "
+                  "constant had been taken from the first while it reads the second."),
         dict(name="interFoam_interfaceProperties", of_symbol="interfaceProperties",
              of_file="src/transportModels/interfaceProperties/interfaceProperties.C",
              classification="MODEL", status="REIMPLEMENT",
@@ -2040,7 +2042,27 @@ COMPONENTS = {
                   "INSIDE reconstruct and multiplies by rAU outside -- identical for a uniform rAU, "
                   "which is every easy fixture. (4) when p_rgh has no value-fixing patch, p is shifted "
                   "AND p_rgh is rebuilt from the shifted p; damBreak's totalPressure atmosphere hides "
-                  "this, 8 shipped tutorials do not."),
+                  "this, 8 shipped tutorials do not. "
+                  "THE SOLVE ITSELF WAS A SUBSTITUTION IN TWO WAYS, and on a VoF case it shows. brae ran "
+                  "PBiCGStab where every damBreak-family tutorial names `solver PCG; preconditioner DIC;`, "
+                  "and took relTol from p_rghFinal for all three correctors where pEqn.H:50 solves with "
+                  "p_rgh.select(pimple.finalInnerIter()) -- `p_rgh` (relTol 0.05) for the first two, "
+                  "`p_rghFinal` for the last (pimpleControlI.H:98-111). Both are fixed: brae::pcg is "
+                  "lduMatrix PCG + DICPreconditioner (gated in tests/test_pcg.cu), InterFields reads both "
+                  "entries with lduMatrix::solver's own defaults (tolerance 1e-6, maxIter 1000 -- brae had "
+                  "2000), a missing p_rghFinal is refused by name, and any other solver still runs "
+                  "PBiCGStab under a noticeApproximated that says it moves the stopping point, not just the "
+                  "cost. MEASURED on damBreak against real OpenFOAM, five fixed steps on the case's own "
+                  "solves: alpha 1.24e-08 -> 2.2337e-12, p_rgh 3.35e-06 -> 7.194e-10 relative, U 9.76e-06 "
+                  "-> 1.966e-08 relative, and the gate bounds tightened to 5e-11, 1e-8 and 4e-7 with them. "
+                  "Over ten adaptive steps alpha's over-1 excursion -- which is dt times this solve's "
+                  "continuity error -- went from 0.12-3.18x OpenFOAM's to 0.99-1.00x. Each half alone is "
+                  "not enough: PCG with the old relTol gave 0.73-4.90x, PBiCGStab with the per-corrector "
+                  "selection 1.98-18.41x. This is the lesson turbulentFlatPlate:kEpsilon taught about DILU: "
+                  "a substituted solver at the same tolerance does not only cost differently, it STOPS "
+                  "somewhere else. capillaryRise does not move (0.7%), so that gap is not this. THE DEVICE "
+                  "still runs its own solver on p_rgh -- a DIC preconditioner is a triangular sweep -- with "
+                  "the case's per-corrector tolerances; its stopping point is the open half."),
         dict(name="interFoam_vanLeer", of_symbol="vanLeer",
              of_file="src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/vanLeer/vanLeer.C",
              classification="SHARED_NUMERICAL", status="REIMPLEMENT",
@@ -2093,13 +2115,17 @@ COMPONENTS = {
                   "one made the whole clamp a no-op on the very case it was measured against). "
                   "tests/interfoam_dambreak_clock_vs_openfoam.sh now holds the clock against real "
                   "OpenFOAM on the tutorial AS IT SHIPS: thirteen steps over one write interval, deltaT "
-                  "agreeing to 2.389e-09 and t to 2.333e-09, both landing exactly on 0.05 -- and "
-                  "`brae_interFoam -device`, which refused adjustTimeStep until this landed, gives the "
-                  "same thirteen steps to the same 2.389e-09 and the same exact 0.05. That gate "
-                  "needed `writePrecision 14` AND `timePrecision 14` in the staged controlDict -- at "
-                  "OpenFOAM's default six figures the comparison bottomed out at 3.2e-06, which is half "
-                  "an ULP of the PRINTING (0.00119047619 logged as 0.00119048) and a bound set there "
-                  "would have been measuring a printf."),
+                  "BIT-IDENTICAL, 0.000e+00 on every step at 17 digits, both landing exactly on 0.05 "
+                  "-- and `brae_interFoam -device`, which refused adjustTimeStep until this landed, is "
+                  "bit-identical too. Over those thirteen steps the Courant number never binds at "
+                  "maxCo 1, so this gate is the cap, adjustDeltaT and the loop bound; the Courant "
+                  "feedback is the device gate's adaptive arm at maxCo 0.0015. GETTING TO A TRUE "
+                  "NUMBER TOOK THREE PRINTFS: at OpenFOAM's default six figures it read 3.2e-06 (half "
+                  "an ULP of 0.00119047619 logged as 0.00119048); at writePrecision/timePrecision 14 "
+                  "it read 2.389e-09 and stayed there, identical on host and device, while the fields "
+                  "moved four orders closer -- which was brae's own `%.9g`; at 17 digits on both "
+                  "sides it is zero. A comment in the gate had explained the 2.389e-09 as field "
+                  "disagreement arriving through the Courant number. It was a printf."),
         dict(name="interFoam_createFields", of_symbol="createFields",
              of_file="applications/solvers/multiphase/interFoam/createFields.H",
              classification="CONFIGURATION", status="REIMPLEMENT",

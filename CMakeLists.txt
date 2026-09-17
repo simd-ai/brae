@@ -3333,7 +3333,8 @@ add_test(NAME interfoam_createfields_vs_openfoam
 # step makes the two diverge in TIME the moment their Courant numbers differ at all, and then every
 # field is compared at a different instant.
 add_executable(test_inter_dambreak_vs_openfoam tests/test_inter_dambreak_vs_openfoam.cu)
-target_include_directories(test_inter_dambreak_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS})
+target_include_directories(test_inter_dambreak_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_inter_dambreak_vs_openfoam PRIVATE brae_core)
 add_test(NAME interfoam_dambreak_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_dambreak_vs_openfoam.sh)
@@ -3342,7 +3343,8 @@ add_test(NAME interfoam_dambreak_vs_openfoam
 # ONLY shipped interFoam tutorial with a contact angle. damBreak would still look broadly right with
 # sigma set to zero; this one would not move at all.
 add_executable(test_inter_capillary_vs_openfoam tests/test_inter_capillary_vs_openfoam.cu)
-target_include_directories(test_inter_capillary_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS})
+target_include_directories(test_inter_capillary_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_inter_capillary_vs_openfoam PRIVATE brae_core)
 add_test(NAME interfoam_capillaryrise_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_capillaryrise_vs_openfoam.sh)

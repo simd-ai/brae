@@ -17,11 +17,11 @@
 # THE ORACLE IS OpenFOAM'S OWN LOG, and its precision is the gate's precision. At OpenFOAM's default
 # six significant figures the comparison bottomed out at 3.2e-06 -- which is half an ULP of the
 # PRINTING (0.00119047619 logged as 0.00119048), not a difference between the two runs, and a bound
-# set there would have been measuring a printf. controlDict gets `writePrecision 14` below, which
+# set there would have been measuring a printf. controlDict gets `writePrecision 17` below, which
 # TimeIO.C:375-389 feeds to IOstream::defaultPrecision and hence to Info, so the log carries the
 # number rather than a rounding of it. It changes no arithmetic.
 #
-# `timePrecision 14` goes with it, and is a SECOND setting: the "Time = " line is timeName(), whose
+# `timePrecision 17` goes with it, and is a SECOND setting: the "Time = " line is timeName(), whose
 # precision is timeName's own (TimeIO.C:338), not writePrecision's. With only writePrecision raised,
 # deltaT agreed to 2.4e-09 and t was still stuck at the 3.2e-06 of its own printing.
 #
@@ -58,7 +58,7 @@ cp -r "$W/case/0.orig" "$W/case/0"
 ( cd "$W/case" && blockMesh > log.blockMesh 2>&1 ) || { echo "SKIP: blockMesh failed"; exit 77; }
 ( cd "$W/case" && setFields > log.setFields 2>&1 ) || { echo "SKIP: setFields failed"; exit 77; }
 sed -i "s/^endTime .*/endTime         $ENDTIME;/" "$W/case/system/controlDict"
-for kv in "writePrecision 14" "timePrecision 14"; do
+for kv in "writePrecision 17" "timePrecision 17"; do
     k=${kv% *}; v=${kv#* }
     sed -i "s/^$k .*/$k  $v;/" "$W/case/system/controlDict"
     grep -q "^$k" "$W/case/system/controlDict" || echo "$k  $v;" >> "$W/case/system/controlDict"
@@ -118,14 +118,21 @@ print("  deltaT worst %.3e relative over %d steps;  t worst %.3e;  ends OF %.9g 
 check("the first step is the write cadence's and not setDeltaT.H's raw 1.2x (%.9g, not 1.2e-04)"
       % brDt[0], abs(brDt[0] - 1.2e-4) > 1e-8)
 
-# 1e-08, and what sets it is NOT the clock. deltaT is a function of the Courant number, the Courant
-# number is a function of the flux, and brae's flux is not bit-identical to OpenFOAM's -- the
-# companion gate interfoam_dambreak_vs_openfoam.sh measures the fields at alpha 1.24e-08 and U
-# 9.76e-06 relative. A 2.4e-09 spread in deltaT is that difference arriving here, so this bound moves
-# when the FIELDS get closer and not when setDeltaT does. The clock arithmetic itself is held exactly
-# by the last check in this file, which is bit-level: both runs land on 0.05.
-check("brae's time step tracks OpenFOAM's, step for step", wDt < 1e-8)
-check("...so the two clocks stay together", wT < 1e-8)
+# 1e-13, because over these thirteen steps the clock is PURE ARITHMETIC. At damBreak's maxCo 1 the
+# Courant number never binds this early -- setDeltaT's 1.2 cap sets every step until Time::
+# adjustDeltaT trims the last three to land on 0.05 -- so dt does not depend on the fields at all, and
+# the only difference left is floating point. (The Courant branch is held by the adaptive arm of
+# test_device_inter_dambreak_alpha, at maxCo 0.0015, where it does bind.)
+#
+# THIS WAS 1e-08, justified by a comment saying the 2.4e-09 it measured was brae's fields arriving
+# through the Courant number. It was not: brae printed dt with %.9g, and 2.389e-09 was that printf's
+# resolution -- which is why it stayed at exactly 2.389e-09 on host and device alike when the fields
+# moved four orders closer to OpenFOAM's. At %.17g against OpenFOAM's writePrecision 17 it reads
+# 0.000e+00 on every step, host and device -- bit-identical; at writePrecision 14 the same run read
+# 1.7e-14, OpenFOAM's print again. The 1e-13 is headroom for FMA contraction under another compiler,
+# not for any disagreement measured here.
+check("brae's time step tracks OpenFOAM's, step for step", wDt < 1e-13)
+check("...so the two clocks stay together", wT < 1e-13)
 check("...and land on the same end time", abs(brT[-1] - ofT[-1])/ofT[-1] < 1e-12)
 
 # Landing ON the write time is the whole point of adjustDeltaT, and it is a sharper statement than
@@ -146,7 +153,7 @@ if dev is not None:
               % (vDt, m, vT, dvT[-1]))
         check("-device took the same number of steps (%d vs %d)" % (len(dvT), len(ofT)),
               len(dvT) == len(ofT))
-        check("-device's time step tracks OpenFOAM's, step for step", vDt < 1e-8)
+        check("-device's time step tracks OpenFOAM's, step for step", vDt < 1e-13)
         check("...and lands on the write time exactly", abs(dvT[-1] - end) < 1e-12*end)
 
 print("interfoam_dambreak_clock_vs_openfoam: %d failures" % fails)

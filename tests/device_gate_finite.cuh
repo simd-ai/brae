@@ -42,5 +42,26 @@ inline int nonFinite(const char* what, const std::vector<T>& v)
     }
 }
 
+// ...and for a VECTOR field, all three components. Without this overload a U field matches the template
+// above, whose non-floating branch returns 0 -- so `nonFinite("U", U.internal)` would compile, check
+// nothing, and put the same false confidence one call higher. A non-template overload wins resolution.
+inline int nonFinite(
+    const char* what,
+    const std::vector<vector>& v)
+{
+    int bad = 0;
+    for (const vector& x : v)
+    {
+        if (!std::isfinite(x.x) || !std::isfinite(x.y) || !std::isfinite(x.z))
+        {
+            ++bad;
+        }
+    }
+    if (bad)
+        std::printf("  !!    %s: %d of %zu vectors are NOT FINITE -- every fmax difference below "
+                    "would read 0.000e+00\n", what, bad, v.size());
+    return bad;
+}
+
 }   // namespace gatecheck
 }   // namespace brae

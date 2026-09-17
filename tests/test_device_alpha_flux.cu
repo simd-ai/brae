@@ -225,6 +225,15 @@ int main()
                     (double)worst);
         check("...which is why it must run BEFORE the accumulator: fmax hides it", worst == scalar(2));
     }
+    // ...AND FOR A VECTOR FIELD, through its own overload. Without that overload a std::vector<vector>
+    // matched the template, whose non-floating branch returns 0 -- so the guard compiled and checked
+    // nothing. A NaN in ONE component of ONE vector must be counted.
+    {
+        const scalar nan = std::numeric_limits<scalar>::quiet_NaN();
+        const std::vector<vector> poisoned{vector{1, 2, 3}, vector{4, nan, 6}, vector{7, 8, 9}};
+        const int bad = brae::gatecheck::nonFinite("deliberate NaN in U.y (self-test)", poisoned);
+        check("the finiteness guard reports a NaN in one component of a vector field", bad == 1);
+    }
 
     std::printf("test_device_alpha_flux: %d failures\n", failures);
     return failures ? 1 : 0;

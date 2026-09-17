@@ -102,7 +102,7 @@ struct InterFields
     // Part of the TIME STEP, not of the output: Time::setDeltaT calls adjustDeltaT, which under
     // `writeControl adjustableRunTime` trims deltaT to land on the next write time. See
     // time_controls.cuh, which carries the damBreak measurement.
-    WriteCadence                 writeCadence;
+    WriteCadence writeCadence;
     DivScheme                    divRhoPhiU     = DivScheme::upwind;
     scalar                       divRhoPhiUCoeff = 1.0;
     AlphaFluxScheme              divPhiAlpha    = AlphaFluxScheme::vanLeer;
@@ -125,13 +125,31 @@ struct InterFields
     // improvement: OpenFOAM's answer IS the loosely-solved one, and a gate comparing against it
     // measures the two stopping points.
     //
-    // relTol is read from the FINAL entry where the case has one. OpenFOAM's PIMPLE selects
-    // `p_rghFinal` on the last corrector (fvSolution's `select(finalIter)`), and the tutorials set
-    // relTol 0 there precisely so the step ends on a converged pressure; taking the non-final 0.05 for
-    // every corrector would stop the last one early.
-    scalar  tolP     = 1e-7;
-    scalar  relTolP  = 0;
-    int     maxIterP = 2000;
+    // TWO ENTRIES, CHOSEN PER CORRECTOR. pEqn.H:50 solves with p_rgh.select(pimple.finalInnerIter()),
+    // and finalInnerIter() (pimpleControlI.H:98-111) is true only on the LAST corrector's last
+    // non-orthogonal pass -- so damBreak's three correctors solve to `relTol 0.05` twice and to
+    // p_rghFinal's `relTol 0` once. This used to read relTol from the Final entry and apply it to all
+    // three, which over-solved the first two and handed the last a different starting guess.
+    //
+    // AND THE SOLVER, where brae has OpenFOAM's own. It is not cosmetic here: damBreak's over-1 alpha
+    // excursion is dt x the div(phi) this solve leaves (interFoam's alphaSuSp.H has no divU), and
+    // with PBiCGStab standing in for the case's PCG+DIC it ran anywhere from 0.12x to 3.18x
+    // OpenFOAM's from step to step. Tightening ONLY p_rgh removed all of it on both codes.
+    struct PressureLinearSolve
+    {
+        std::string solver;
+        std::string preconditioner;
+        scalar tol = 1e-7;
+        scalar relTol = 0;
+        // lduMatrix::defaultMaxIter, lduMatrix.H:125
+        int maxIter = 1000;
+        // brae::pcg is lduMatrix PCG + DICPreconditioner, gated in tests/test_pcg.cu
+        bool pcgDIC() const { return solver == "PCG" && preconditioner == "DIC"; }
+    };
+    // solvers/p_rgh
+    PressureLinearSolve pSolve;
+    // solvers/p_rghFinal
+    PressureLinearSolve pSolveFinal;
     // relaxationFactors/equations. THE QUESTION IS "DOES THE CASE NAME ONE", not "is it below 1":
     // fvMatrix::relax() is `if (mesh.relaxEquation(name, coeff)) relax(coeff)` and relaxEquation is
     // `found(name) || found("default")` (solution.C:330-334), so a case naming 1 relaxes -- the

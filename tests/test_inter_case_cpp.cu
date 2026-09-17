@@ -644,6 +644,7 @@ int main(int argc, char** argv)
         PressureSolveControls psc;
         psc.needReference = false;
         psc.tolP = scalar(1e-12);
+        psc.tolPFinal = scalar(1e-12);   // one corrector is the final one
         pressureCorrector(prgh, U, phiW, pOut, pi2, psc, m, g, patches);
 
         scalar afterCorrector = 0;
@@ -706,41 +707,37 @@ int main(int argc, char** argv)
                     (double)drift, (double)r.maxU, (double)r.worstDivPhi);
 
         check("the solver ran every step it was asked for", r.steps == 10);
-        // THE BOUND, AND WHY IT IS 1e-6 RATHER THAN ROUND-OFF.
+        // THE BOUND IS OpenFOAM'S OWN EXCURSION, TWO-SIDED, AND WHAT SETS IT IS THE PRESSURE SOLVE.
         //
-        // The per-step trace above shows alpha's undershoot tracking deltaT as the adaptive step grows
-        // 1.2e-03 -> 6.2e-03: -4.7e-13, then -2.8e-11, -8.4e-11, -2.2e-10, -4.7e-09, -1.2e-08. A
-        // factor of 5.2 in deltaT for a factor of about 1000 in the residue is the dt^4 behaviour
-        // already measured and asserted in this file's MULESCorr arm above -- damBreak sets
-        // `MULESCorr yes`, so this is the same semi-implicit path and the same conditioning effect in
-        // CMULES's budget, not a new one.
+        // The over-1 excursion here is not CMULES's residue. interFoam's alphaSuSp.H has no divU, so
+        // the MULESCorr upwind pre-solve on a water-filled cell solves a = 1/(1 + dt*div(phi)): the
+        // excursion is dt times the continuity error the p_rgh solve left behind. Measured on this
+        // case against real OpenFOAM, ten steps each way: tightening ONLY the alpha solve to 1e-13
+        // changed nothing to the last digit, and tightening ONLY p_rgh took both codes from 1.16e-06
+        // to 4.9e-13.
         //
-        // THE BOUND IS OpenFOAM'S OWN EXCURSION AND NOT A ROUND NUMBER, which it was until the clock
-        // was ported. `1e-6` stood here and brae sat at 1.0e-06 -- passing on a margin of nothing --
-        // until Time::adjustDeltaT landed and the run shifted a few thousandths of a second, at which
-        // point it read 2.306e-06 and the arm failed. That looked like a regression and was not: real
-        // OpenFOAM on this same case, at writePrecision 14, logs
+        // So the number depends on WHERE the pressure solve stops, and until this arm's latest change
+        // brae stopped it somewhere else. brae ran PBiCGStab where damBreak names PCG with DIC, and
+        // applied p_rghFinal's relTol to all three correctors where pEqn.H:50 selects p_rgh (relTol
+        // 0.05) for the first two. The excursion ran from 0.12x to 3.18x OpenFOAM's step by step, and
+        // this arm first bounded it at a round 1e-6, then at 2.5x OpenFOAM's once that failed. Each
+        // half of the fix alone left it at 0.73-4.90x (PCG only) and 1.98-18.41x (selection only);
+        // with both it is 0.99-1.00x at every step.
         //
-        //     Max(alpha.water) = 1.0000011623306
+        // The comparand is the END-OF-STEP value, OpenFOAM's SECOND `Max(alpha.water)` print of step
+        // ten (alphaEqn.H:263, after the MULES correctors) at writePrecision 14: 1.0000011360508. The
+        // constant here used to be 1.1623e-06, which is the FIRST print (alphaEqn.H:124, straight after
+        // the pre-solve) -- a different quantity from the r.alphaMax this arm reads.
         //
-        // so OPENFOAM ITSELF exceeds 1 by 1.1623e-06 here and would have failed the old bound. A
-        // number below what the oracle achieves is not a tight bound, it is a broken one.
-        //
-        // WHAT IS LEFT IS A REAL GAP, and it is recorded rather than absorbed: brae's 2.306e-06 is
-        // 1.98x OpenFOAM's 1.1623e-06 at the same instant, on a case where the two agree to 1.24e-08
-        // in alpha itself. So the bound below is 2.5x the oracle's measured excursion -- brae is
-        // inside it by 1.26x, which is tight enough to catch a real drift, and closing the 2x is the
-        // manifest's open item, not this arm's to hide.
-        const scalar kOfExcursion = scalar(1.1623e-6);   // OpenFOAM 2412, damBreak, 10 steps, as above
-        const scalar kBound       = scalar(2.5)*kOfExcursion;
-        const scalar exc          = std::fmax(-r.alphaMin, r.alphaMax - scalar(1));
-        std::printf("    alpha's excursion is %.3e against OpenFOAM's own %.3e on this case (%.2fx),"
-                    " and the per-step trace shows it tracking deltaT (the CMULES residue gated"
-                    " above)\n",
-                    (double)exc, (double)kOfExcursion, (double)(exc/kOfExcursion));
-        check("alpha stays inside 2.5x OpenFOAM's own excursion on this case, which is the only"
-              " number here that means anything",
-              exc < kBound);
+        // 2% either way. Both ablations above fail it, so it discriminates the thing that was wrong.
+        const scalar kOfExcursion = scalar(1.1360508e-6);
+        const scalar exc = std::fmax(-r.alphaMin, r.alphaMax - scalar(1));
+        const scalar ratio = exc/kOfExcursion;
+        std::printf("    alpha's excursion is %.4e against OpenFOAM's own %.4e on this case (%.4fx)\n",
+                    (double)exc, (double)kOfExcursion, (double)ratio);
+        check("alpha's excursion is OpenFOAM's own to 2%, which only happens when the pressure solve"
+              " stops where OpenFOAM's does",
+              std::fabs(ratio - scalar(1)) < scalar(0.02));
         check("...and the water is all still there: damBreak is closed", drift < scalar(1e-8));
         check("phi is divergence-free at the end, as the corrector leaves it",
               r.worstDivPhi < scalar(1e-6) * (scalar(1)/minV));
