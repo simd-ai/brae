@@ -160,6 +160,14 @@ RunReport runInterFoam(
                     };
                     alphaEqnSubCycle(f.alphaCtl.nAlphaSubCycles, rep.deltaT,
                                      f.alpha1.internal, alphaOld, f.rhoPhi, step1);
+                    // rhoPhi HAS JUST CHANGED, and a condition may name it (`phi rhoPhi;`). OpenFOAM's
+                    // conditions look their flux up at every updateCoeffs, so UEqn's U and the first
+                    // pressure corrector's p_rgh read THIS step's rhoPhi; brae's are told, and were
+                    // last told at the end of the previous step. With phi the two moments hold the
+                    // same field -- the alpha step does not touch phi -- which is why this push was
+                    // never missed. Measured on damBreak with the atmosphere naming rhoPhi on U:
+                    // alpha 2.5e-09 and U 2.2e-05 from OpenFOAM, from step two; on p_rgh alone 4.7e-10.
+                    pushFluxToPatches(f, patches);
                     // ...and the boundary with it. Dropping this was tried together with the reset in
                     // alphaEqnStep: damBreak's alpha went thirty times further from OpenFOAM and
                     // capillaryRise did not move, so the extra evaluations are load-bearing rather
@@ -206,6 +214,15 @@ RunReport runInterFoam(
                     // step's own time and time index, so a wave model the alpha sub-cycles updated
                     // updates AGAIN, from the alpha they left. Ahead of everything that reads U_b.
                     updateWaveVelocity(f.waves, f.alpha1, f.U, rep.time, rep.steps, m, g, patches);
+                    // ...AND pressureInletOutletVelocity's, WHICH RE-EVALUATES THE PATCH VALUE, not
+                    // only its coefficients: its updateCoeffs() ends in directionMixed::evaluate()
+                    // (pressureInletOutletVelocityFvPatchVectorField.C:118-131), and that evaluate
+                    // clears the updated flag, so EVERY updateCoeffs looks the flux up again and
+                    // rewrites the value. With `phi` nothing has moved since the last corrector's
+                    // evaluate and this is the same value bit for bit. With `phi rhoPhi;` the alpha
+                    // step has just moved the flux: measured on damBreak, alpha 8.4e-11 from OpenFOAM
+                    // and the p_rgh residuals 5e-07 from step two without it, 1.2e-12 with.
+                    updateVelocityPatchesFromCells(f.U, patches);
 
                     // UEqn.H uses mixture.surfaceTensionForce(), which reads the K the LAST
                     // mixture.correct() left -- it does not recompute one. An extra pass here would

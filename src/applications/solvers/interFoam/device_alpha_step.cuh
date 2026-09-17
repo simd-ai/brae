@@ -45,6 +45,7 @@
 // [0,1] -- and to the host within a measured tolerance.
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
+#include <functional>
 #include "device_mesh.cuh"
 #include "device_mules.cuh"
 
@@ -100,6 +101,14 @@ struct DeviceAlphaBoundary
     const DeviceBuffer<scalar>* nHatfBnd   = nullptr;  // read only, like nHatfInt
     const DeviceBuffer<int>*    fixesValue = nullptr;  // 1 where the patch fixes a value
     const DeviceBuffer<int>*    flag       = nullptr;  // 0 ordinary, 1 empty, 2 wedge
+    // alpha1's boundaryField().updateCoeffs(), for a condition whose value a MODEL supplies (waveAlpha).
+    // On the explicit path it is the correctBoundaryConditions() that OPENS MULES::explicitSolve
+    // (MULESTemplates.C:168): AFTER the high-order flux has been built on the values the last update
+    // left, BEFORE the limiter. The call REWRITES the buffer `alpha1` above points at, and the
+    // corrector then builds the bounded flux's boundary on the new values -- upwind's boundary flux is
+    // phi_b*psi_b -- so the correction is no longer zero there. Null on a case with no such patch, and
+    // then nothing below changes by a bit. See inter_waves_cpp.cuh for what was and was not measured.
+    std::function<void(const DeviceBuffer<scalar>& alpha1)> updateModelled;
 };
 
 // ONE corrector of alphaEqn.H:157-220 -- the flux and the MULES solve, and NOT mixture.correct().

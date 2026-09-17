@@ -17,9 +17,10 @@
 // single-phase one brae has". That was written from memory and is wrong for 15 of the 17 turbulent
 // tutorials: incompressibleInterPhaseTransportModel.C:99-106 constructs the ordinary one by default.
 //
-// AND WAVES, on the host: waveAlpha and waveVelocity over all ten of OpenFOAM's wave models
-// (inter_waves_cpp.cuh, src/waveModels). `-device` refuses a wave case rather than freeze its inlet.
-// Each flux-conditional condition is handed the flux its own `phi` entry NAMES -- phi or rhoPhi.
+// AND WAVES, host and `-device`: waveAlpha and waveVelocity over all ten of OpenFOAM's wave models
+// (inter_waves_cpp.cuh, src/waveModels). Each flux-conditional condition is handed the flux its own
+// `phi` entry NAMES -- phi or rhoPhi; on `-device` a VELOCITY condition naming rhoPhi is refused,
+// because that one switch runs on the device and reads phi.
 //
 // WHAT IT WILL NOT RUN. Every refusal the components carry is in force: LES and every RASModel but
 // kEpsilon, `vanLeerV` or `limitedLinear` on div(rhoPhi,U),

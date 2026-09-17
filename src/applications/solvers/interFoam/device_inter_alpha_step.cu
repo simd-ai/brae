@@ -102,10 +102,13 @@ void deviceInterAlphaStep(
                              alpha2.data(), rho.data(), mu.data(), nu.data());
     };
 
+    // which sub-cycle this is, 1-based -- the wave conditions' clock
+    int subCycle = 0;
     DeviceAlphaEqnStep step =
         [&](const DeviceBuffer<scalar>& subOld, scalar dtSub, DeviceBuffer<scalar>& alpha,
             DeviceBuffer<scalar>& rpInt, DeviceBuffer<scalar>& rpBnd)
     {
+        ++subCycle;
         DeviceAlphaStepInput li = in;
         li.deltaT    = dtSub;
         li.MULESCorr = ctl.MULESCorr;
@@ -129,6 +132,11 @@ void deviceInterAlphaStep(
         {
             // alphaEqn.H:103-155: the implicit upwind pre-solve, ONCE per sub-step, then a
             // mixture.correct() of its own before the correctors begin.
+            // ...and the fvMatrix constructor's updateCoeffs, ahead of the assembly that reads it
+            if (hooks.updateModelledBoundary)
+            {
+                hooks.updateModelledBoundary(subCycle, alpha, alpha1Bnd);
+            }
             hooks.divCoeffs(alpha, iC, bC);
             DeviceSolverPerf pre;
             deviceAlphaPreSolve(dm, alpha, subOld, *li.phiCNInt, iC, bC, dtSub, ctl.preSolve,
@@ -192,6 +200,13 @@ void deviceInterAlphaStep(
             db.nHatfBnd   = &nHatfBnd;
             db.fixesValue = &bndFixesValue;
             db.flag       = &bndFlag;
+            if (hooks.updateModelledBoundary && !ctl.MULESCorr)
+            {
+                db.updateModelled = [&](const DeviceBuffer<scalar>& a)
+                {
+                    hooks.updateModelledBoundary(subCycle, a, alpha1Bnd);
+                };
+            }
             deviceAlphaCorrector(dm, alpha, subOld, li, db, mulesCtl, nHatfInt,
                                  alphaPhiInt, alphaPhiBnd);
             correctMixture(alpha, true);                        // alphaEqn.H:223-225

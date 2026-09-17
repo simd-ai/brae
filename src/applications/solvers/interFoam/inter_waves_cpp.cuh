@@ -37,6 +37,14 @@
 // evaluated at the step's time 1.0e-04; no fourth update in UEqn 9.5e-03, and the update ORDER arm
 // fails; the active absorption left out 2.1e-01.
 //
+// UNDER MULESCorr the first updateCoeffs of a sub-cycle is the pre-solve's matrix construction instead,
+// and THAT position is gated (the gate's `mulescorr` profile): updating after the pre-solve reads
+// alpha 8.9e-07 from OpenFOAM, against 1.1e-10.
+//
+// THE DEVICE LOOP calls the same two functions through its alpha and velocity hooks, at the same clock
+// and in the same order (device_inter_alpha_step.cuh, DeviceAlphaBoundary::updateModelled), and is held
+// to OpenFOAM on every profile of the gate at the host's bounds.
+//
 // AND WHAT WAS NOT. The update opens MULES::explicitSolve (MULESTemplates.C:168), so it sits BETWEEN
 // the high-order flux, built on the value the last update left, and the limiter. That position is
 // transcribed and it agrees with the log -- and moving the update to AFTER the solve changed no digit

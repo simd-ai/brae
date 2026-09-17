@@ -71,6 +71,16 @@ struct DeviceInterAlphaHooks
     std::function<void(const DeviceBuffer<scalar>& alpha1,
                        DeviceBuffer<scalar>&       iC,
                        DeviceBuffer<scalar>&       bC)> divCoeffs;
+
+    // waveAlpha: the patch values a wave MODEL supplies, at the clock of the sub-cycle it is called in
+    // (1-based). A sub-cycle is its own time index to OpenFOAM, so the model updates in each -- see
+    // inter_waves_cpp.cuh. Called where OpenFOAM's first updateCoeffs of the pass fires: ahead of the
+    // pre-solve's assembly under MULESCorr, and otherwise between the high-order flux and the limiter
+    // (DeviceAlphaBoundary::updateModelled). Null on a case with no such patch.
+    std::function<void(
+        int subCycle,
+        const DeviceBuffer<scalar>& alpha1,
+        DeviceBuffer<scalar>& alpha1Bnd)> updateModelledBoundary;
 };
 
 struct DeviceInterAlphaControls

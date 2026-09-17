@@ -56,6 +56,26 @@
 # control is the big-step run without the setting: the setting has to move OpenFOAM's own answer, or a
 # brae that ignored it would pass. The device loop runs neither outer nor non-orthogonal correctors and
 # REFUSES both, so on those two profiles the test asserts the refusal instead of a run.
+#
+# AND `rhophi`: every flux-conditional condition of the atmosphere -- U's pressureInletOutletVelocity,
+# p_rgh's totalPressure, alpha's inletOutlet -- given `phi rhoPhi;`. OpenFOAM's conditions look their
+# flux up BY NAME, three shipped tutorials name rhoPhi on a totalPressure top, and brae's reader kept
+# no `phi` entry at all (tests/interfoam_waves_vs_openfoam.sh found it, on the two solitary-wave cases
+# that write it). Those cases put the name on p_rgh only; this profile puts it on all three, so the
+# velocity's and alpha's switches are held against OpenFOAM too. The DEVICE runs U's switch itself and
+# reads phi there, so it REFUSES this profile, and the test asserts the refusal.
+# IT FAILED THE FIRST TIME IT RAN, on two things a condition naming `phi` can never see, because
+# nothing moves phi between the end of one step's pressure correctors and the next step's UEqn -- and
+# the ALPHA step moves rhoPhi exactly there:
+#   the push.   brae's conditions are TOLD their flux, and were last told at the end of the previous
+#               step; OpenFOAM's look it up at every updateCoeffs, so UEqn's U and the first corrector's
+#               p_rgh read THIS step's rhoPhi. Naming it on p_rgh alone: alpha 4.7e-10 -> 1.2e-12.
+#   the value.  pressureInletOutletVelocity::updateCoeffs ends in directionMixed::evaluate(), which
+#               REWRITES THE PATCH VALUE and clears the updated flag -- so UEqn's fvMatrix constructor
+#               re-evaluates U's atmosphere from the new flux. brae refreshed the coefficients and kept
+#               the value. Naming it on U alone: alpha 2.5e-09 before the push, 8.4e-11 after it,
+#               1.2e-12 with the value re-evaluated as well.
+# The control: naming rhoPhi moves OpenFOAM's OWN alpha by 1.0e-06 over these five steps.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_dambreak_vs_openfoam"
@@ -97,6 +117,12 @@ run_at()
         sed -i 's/inletValue *uniform 0;/inletValue      uniform 1;/' "$C/0/alpha.water"
         grep -q "inletValue *uniform 1;" "$C/0/alpha.water" \
             || { echo "FAIL: the inflow fixture's inletValue was not rewritten"; return 1; }
+    fi
+    if [ "$profile" = rhophi ]; then
+        for fld in U p_rgh alpha.water; do
+            sed -i '/^ *atmosphere/,/}/ s/^\( *\)type\( .*\)$/\1type\2\n\1phi             rhoPhi;/' "$C/0/$fld"
+            grep -q "phi  *rhoPhi;" "$C/0/$fld" || { echo "FAIL: $fld's atmosphere was not given phi rhoPhi"; return 1; }
+        done
     fi
     case "$profile" in
         nouter)  sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' "$C/system/fvSolution"
@@ -192,7 +218,7 @@ PYEOF
     # ...and the sub-cycled one reads the un-sub-cycled one: the sub-cycle count has to be live too
     [ "$profile" = prevcorrsub ] && std="$W/prevcorr/$end"
     # ...and the three PIMPLE profiles read the big-step run without their setting
-    case "$profile" in nouter|nonorth|mompred) std="$W/bigstep/$end" ;; esac
+    case "$profile" in nouter|nonorth|mompred|rhophi) std="$W/bigstep/$end" ;; esac
     "$BIN" "$C" "$C/0" "$C/$end" "$STEPS" "$C/log.interFoam" "$C.control" "$profile" $std
 }
 
@@ -206,4 +232,5 @@ run_at "$DT_OUT" outflow "$STEPS_OUT" || rc=1
 run_at "$DT_BIG" nouter || rc=1
 run_at "$DT_BIG" nonorth || rc=1
 run_at "$DT_BIG" mompred || rc=1
+run_at "$DT_BIG" rhophi || rc=1
 exit $rc

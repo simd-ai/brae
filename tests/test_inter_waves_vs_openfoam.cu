@@ -21,6 +21,7 @@
 #include "inter_driver_cpp.cuh"
 #include "device_gate_finite.cuh"
 #include "inter_solve_log.cuh"
+#include <cuda_runtime.h>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -363,6 +364,21 @@ int main(
                                                    scalar(1e-10), scalar(1e-6));
     }
 
+    // `mulescorr`: the implicit alpha pre-solve, one per sub-cycle per step. Its matrix is assembled on
+    // the wave patch's NEW value -- the update's second call site -- and updating after the pre-solve
+    // instead reads alpha 8.9e-07 from OpenFOAM against 1.1e-10.
+    const bool mulesCorr = (profile == "mulescorr");
+    const std::vector<LinearSolveRecord> ofAlphaSolves =
+        mulesCorr ? brae::gatecheck::readOfSolves(logPath, fin.alphaName) : std::vector<LinearSolveRecord>();
+    if (mulesCorr)
+    {
+        check("OpenFOAM logged an alpha solve for every sub-cycle of every step",
+              ofAlphaSolves.size() == static_cast<std::size_t>(nSteps)
+                                     * static_cast<std::size_t>(fin.alphaCtl.nAlphaSubCycles));
+        failures += brae::gatecheck::compareSolves("host", r.alphaSolves, ofAlphaSolves, nSteps,
+                                                   fin.alphaName.c_str(), scalar(1e-10), scalar(1e-6));
+    }
+
     const Diff dA = compare(fin.alpha1.internal, ofAlpha);
     const Diff dP = compare(fin.p_rgh.internal, ofPrgh);
     const Diff dU = compare(fin.U.internal, ofU);
@@ -381,6 +397,65 @@ int main(
                 (double)dStillU.rel(), (double)dStillA.linf);
     check("the wave moves OpenFOAM's own U far more than brae is from it",
           dStillU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)));
+
+    // THE DEVICE LOOP, against OpenFOAM directly and at the case's own tolerances -- what
+    // `brae_interFoam -device` runs. The wave model is the HOST's on both paths (a boundary condition's
+    // per-patch arithmetic, reached through the alpha and velocity hooks); what is under test is that
+    // the device loop calls it at OpenFOAM's clock, in OpenFOAM's order, and feeds what it returns into
+    // the alpha flux, the limiter, the momentum matrix and constrainPressure.
+    int nDev = 0;
+    if (cudaGetDeviceCount(&nDev) != cudaSuccess)
+    {
+        cudaGetLastError();
+        nDev = 0;
+    }
+    if (nDev <= 0)
+    {
+        std::printf("  (no CUDA device: the device arm is skipped)\n");
+    }
+    else
+    {
+        InterFields dev;
+        const RunReport rd = runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
+        check("the device driver ran the same number of steps", rd.steps == nSteps);
+        check("...and found the wave boundary conditions", dev.waves.any);
+        failures += brae::gatecheck::nonFinite("device alpha", dev.alpha1.internal);
+        failures += brae::gatecheck::nonFinite("device p_rgh", dev.p_rgh.internal);
+        failures += brae::gatecheck::nonFinite("device U", dev.U.internal);
+        {
+            std::vector<std::string> mine;
+            for (const std::string& u : dev.waves.updateLog)
+            {
+                mine.push_back(u.substr(0, u.find('@')));
+            }
+            check("the DEVICE loop updated the wave models in OpenFOAM's ORDER, update for update",
+                  mine == ofw.updates);
+        }
+        // STEP ONE's initial residuals: the host reads 1.4e-11 at worst and is bounded at 1e-10; the
+        // device reads 2.2e-10, on the second corrector's 6e-05 -- a difference of 1e-14 in a residual
+        // that is itself the difference of two numbers of order one, summed in the GPU's order. 5e-9.
+        failures += brae::gatecheck::compareSolves("device", rd.pSolves, ofP, nSteps, "p_rgh",
+                                                   scalar(5e-9), runBound);
+        if (mulesCorr)
+        {
+            failures += brae::gatecheck::compareSolves("device", rd.alphaSolves, ofAlphaSolves, nSteps,
+                                                       dev.alphaName.c_str(), scalar(5e-9), scalar(1e-6));
+        }
+        const Diff eA = compare(dev.alpha1.internal, ofAlpha);
+        const Diff eP = compare(dev.p_rgh.internal, ofPrgh);
+        const Diff eU = compare(dev.U.internal, ofU);
+        std::printf("  DEVICE vs OpenFOAM: alpha %.4e, p_rgh %.4e, U %.4e\n", (double)eA.linf,
+                    (double)eP.rel(), (double)eU.rel());
+        // THE HOST'S BOUNDS. MEASURED, worst of the thirteen profiles at the case's tolerances: alpha
+        // 1.3e-10, p_rgh 6.3e-10, U 1.8e-08 (1.3e-07 on `shipped`); under `tight` 7.8e-12, 7.8e-12 and
+        // 7.5e-10. ONE CASE READS VERY DIFFERENTLY ON THE TWO PATHS AND IT IS NOT A DEFECT: on
+        // solitaryMcCowan the host is 1.6e-10 of alpha from OpenFOAM and the device 2.3e-12. With every
+        // p_rgh solve tightened on all three codes they read 1.9e-12 and 2.0e-12 -- the same -- so the
+        // host's figure is where that case's relTol 0.1 happened to leave it.
+        check("the DEVICE's alpha agrees with OpenFOAM's to the host's bound", eA.linf < alphaBound);
+        check("...its p_rgh", eP.rel() < pBound);
+        check("...and its U", eU.rel() < uBound);
+    }
 
     std::printf("test_inter_waves_vs_openfoam: %d failures\n", failures);
     return failures == 0 ? 0 : 1;

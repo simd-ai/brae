@@ -272,6 +272,13 @@ void deviceAlphaCorrector(
     copyFaces(nIf, unInt, alphaPhi10Int);
     copyFaces(nBf, unBnd, alphaPhi10Bnd);
     deviceMulesDonorFlux(dm, nIf, nBf, *in.phiCNInt, alpha1, alphaPhi10Bnd, phiBDInt, phiBDBnd);
+    if (bnd.updateModelled)
+    {
+        // psi.correctBoundaryConditions(), then the bounded flux ON THE NEW PATCH VALUES. Where the
+        // values did not move this is the product that built unBnd, bit for bit.
+        bnd.updateModelled(alpha1);
+        deviceMultiplyFaces(nBf, *in.phiCNBnd, *bnd.alpha1, phiBDBnd);
+    }
     deviceSubtractFaces(nIf, alphaPhi10Int, phiBDInt, corrInt);
     deviceSubtractFaces(nBf, alphaPhi10Bnd, phiBDBnd, corrBnd);
     deviceMulesLimiter(dm, nIf, nBf, rDeltaT, alpha1, alpha1Old, *bnd.alpha1,

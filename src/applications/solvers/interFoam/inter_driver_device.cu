@@ -105,30 +105,17 @@ RunReport runInterFoamDevice(
               "step, which runs none. The host path (no -device) does.");
     }
 
-    // ...AND A CONDITION THAT NAMES A FLUX OTHER THAN phi. The host hands each patch the flux its `phi`
-    // entry names (namedPatchFlux); this loop keeps rhoPhi on the device and its flux switches read phi.
+    // ...AND A VELOCITY CONDITION THAT NAMES A FLUX OTHER THAN phi. p_rgh's and alpha's conditions are
+    // evaluated on the host, which hands each the flux its `phi` entry names (namedPatchFlux, through
+    // pushFlux below). U's pressureInletOutletVelocity switch runs ON THE DEVICE and reads phi.
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        for (const std::string* name : {&f.U.boundary[pi]->fluxName(), &f.p_rgh.boundary[pi]->fluxName(),
-                                        &f.alpha1.boundary[pi]->fluxName()})
-        {
-            if (*name == "phi") continue;
-            throw std::runtime_error(
-                "brae interFoam (device): patch `" + fvp[pi].name + "` names the flux `" + *name
-                + "` in its `phi` entry, and the device loop's flux switches read phi. The host path "
-                "(no -device) hands each patch the flux it names.");
-        }
-    }
-
-    // ...AND THE WAVE CONDITIONS. Their values change inside the alpha sub-cycle, between the
-    // high-order flux and the limiter, and the device alpha step has no such point yet: it would run
-    // with the inlet frozen at the case file's `value`.
-    if (f.waves.any)
-    {
+        const std::string& name = f.U.boundary[pi]->fluxName();
+        if (name == "phi") continue;
         throw std::runtime_error(
-            "brae interFoam (device): the case has waveAlpha/waveVelocity patches, which the device "
-            "loop does not update -- it would freeze them at the file's `value`. The host path (no "
-            "-device) runs them.");
+            "brae interFoam (device): U's patch `" + fvp[pi].name + "` names the flux `" + name
+            + "` in its `phi` entry, and the device loop's velocity switch reads phi. The host path "
+            "(no -device) hands each patch the flux it names.");
     }
 
     DeviceMesh dm = buildDeviceMesh(m, g, fvp);
@@ -153,19 +140,47 @@ RunReport runInterFoamDevice(
     // patches look phi up whenever they update; brae's are told, and the device path holds the only
     // current copy. See pushFluxToPatches for what not telling them cost on capillaryRise.
     DeviceBuffer<scalar> dPhiB(flattenPatches(f.phi.boundary));
-    auto pushFlux = [&]()
+    // rhoPhi, which the alpha step writes. Declared HERE because pushFlux reads its boundary: a
+    // condition may name `phi rhoPhi;` (three tutorials' totalPressure top does), and the device holds
+    // the only current copy. Empty until the first alpha step, when the host's -- built at rest by
+    // buildInterFields -- is the field.
+    DeviceBuffer<scalar> dRpI, dRpB;
+    bool namesRhoPhi = false;
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        std::vector<scalar> pb;
-        dPhiB.copyTo(pb);
+        if (f.p_rgh.boundary[pi]->fluxName() == "rhoPhi" || f.alpha1.boundary[pi]->fluxName() == "rhoPhi")
+        {
+            namesRhoPhi = true;
+        }
+    }
+    auto unflatten = [&](const DeviceBuffer<scalar>& d, std::vector<std::vector<scalar>>& out)
+    {
+        std::vector<scalar> flat;
+        d.copyTo(flat);
+        out.assign(fvp.size(), std::vector<scalar>());
         std::size_t off = 0;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
             const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
-            f.phi.boundary[pi].assign(pb.begin() + off, pb.begin() + off + n);
+            out[pi].assign(flat.begin() + off, flat.begin() + off + n);
             off += n;
+        }
+    };
+    auto pushFlux = [&]()
+    {
+        unflatten(dPhiB, f.phi.boundary);
+        if (namesRhoPhi && dRpB.size() == dPhiB.size())
+        {
+            unflatten(dRpB, f.rhoPhi.boundary);
         }
         pushFluxToPatches(f, fvp);
     };
+
+    // THE WAVE CONDITIONS' CLOCK: OpenFOAM's time and time index for the step being taken, which the
+    // hooks need and the loop below sets before each step. See inter_waves_cpp.cuh.
+    scalar stepTime = 0;
+    scalar stepDeltaT = 0;
+    label stepIndex = 0;
 
     // TURBULENCE. The closure is the device's (device_inter_turbulence.cuh). BRAE_INTER_HOST_CLOSURE=1
     // puts the HOST reference in its place inside the same device loop -- the mixed build the closure
@@ -212,6 +227,21 @@ RunReport runInterFoamDevice(
         f.alpha1.evaluateBoundary();
         aBnd.copyFrom(patchValues(f.alpha1, fvp));
     };
+    if (f.waves.any)
+    {
+        H.alpha.updateModelledBoundary =
+            [&](int subCycle, const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& aBnd)
+        {
+            // waveAlpha's updateCoeffs at the SUB-CYCLE's clock. The model reads alpha's and U's cell
+            // values: alpha's are the device's, and f.U's are the last updateUBoundary's.
+            a.copyTo(f.alpha1.internal);
+            const SubCycleClock clock = subCycleClock(stepTime, stepDeltaT, stepIndex,
+                                                      f.alphaCtl.nAlphaSubCycles, subCycle);
+            updateWaveAlpha(f.waves, f.alpha1, f.U, clock.t, clock.timeIndex, m, g, fvp);
+            f.alpha1.evaluateBoundary();
+            aBnd.copyFrom(patchValues(f.alpha1, fvp));
+        };
+    }
     H.alpha.divCoeffs =
         [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC)
     {
@@ -233,6 +263,11 @@ RunReport runInterFoamDevice(
         std::vector<scalar> x, y, z;
         ux.copyTo(x); uy.copyTo(y); uz.copyTo(z);
         for (label c = 0; c < nC; ++c) f.U.internal[c] = vector{x[c], y[c], z[c]};
+        // waveVelocity's updateCoeffs, at the STEP's clock: the first call of a step is UEqn's, where
+        // the model -- last updated inside the alpha sub-cycles -- updates again from the alpha they
+        // left (f.alpha1 is the alpha hooks' last copy) and the U the step started on. Every later
+        // call of the step is the same time index and re-assigns the same values.
+        updateWaveVelocity(f.waves, f.alpha1, f.U, stepTime, stepIndex, m, g, fvp);
         f.U.evaluateBoundary();
         updateVelocityPatches(f.U, fvp);
         db = buildDeviceVectorBoundary(f.U, fvp, g);
@@ -488,7 +523,7 @@ RunReport runInterFoamDevice(
     DeviceBuffer<scalar> dGh(f.gh), dGhf, dMagSf(g.magSf());
     { SurfaceScalarField gf; gf.internal = f.ghfInternal; gf.boundary = f.ghfBoundary;
       dGhf.copyFrom(fullFace(gf, fvp)); }
-    DeviceBuffer<scalar> dRho, dMu, dNu, dRpI, dRpB;
+    DeviceBuffer<scalar> dRho, dMu, dNu;
     DeviceVectorBoundary dbU = buildDeviceVectorBoundary(f.U, fvp, g);
 
     RunReport rep;
@@ -517,6 +552,11 @@ RunReport runInterFoamDevice(
         std::vector<scalar> poi, pob;
         dPhiI.copyTo(poi); dPhiB.copyTo(pob);
         DeviceBuffer<scalar> dPhiOI(poi), dPhiOB(pob);
+
+        // OpenFOAM's clock for the step about to be taken: ++runTime comes before the alpha step
+        stepDeltaT = rep.deltaT;
+        stepTime = rep.time + rep.deltaT;
+        stepIndex = s + 1;
 
         // rho.oldTime() for the closure's ddt: f.rho still holds what the LAST step's hook left, and
         // dRho what the last step wrote -- nothing yet at the first, where the host's is the field

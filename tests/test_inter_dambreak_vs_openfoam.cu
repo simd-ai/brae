@@ -83,8 +83,11 @@ int main(int argc, char** argv)
     const std::string profileName = argc > 7 ? argv[7] : "";
     const bool nOuter = profileName == "nouter", nonOrth = profileName == "nonorth";
     const bool momPred = profileName == "mompred";
-    const bool pimpleProfile = nOuter || nonOrth || momPred;
-    const bool deviceRefuses = nOuter || nonOrth;
+    // `rhophi`: the atmosphere's three flux-conditional conditions all name `phi rhoPhi;`. The device
+    // runs U's switch itself and reads phi there, so it refuses the case.
+    const bool namedFlux = profileName == "rhophi";
+    const bool pimpleProfile = nOuter || nonOrth || momPred || namedFlux;
+    const bool deviceRefuses = nOuter || nonOrth || namedFlux;
     const bool bigStep = (argc > 7 && std::string(argv[7]) == "bigstep") || prevCorr || pimpleProfile;
     // `inflow`: the atmosphere's inletValue set to 1, so water enters over air cells and rho's patch
     // value differs from the cell's on a patch where p_rgh fixes a value. It is the only fixture here
@@ -99,6 +102,7 @@ int main(int argc, char** argv)
               : nOuter ? "nouter -- nOuterCorrectors 2, at the big step"
               : nonOrth ? "nonorth -- nNonOrthogonalCorrectors 1, at the big step"
               : momPred ? "mompred -- momentumPredictor yes, at the big step"
+              : namedFlux ? "rhophi -- the atmosphere's conditions all name phi rhoPhi, at the big step"
               : bigStep ? "bigstep -- the solver logs discriminate here"
               : inflow  ? "inflow -- snGrad(rho) is live on the atmosphere here"
               : outflow ? "outflow -- water leaves through the atmosphere with alphaApplyPrevCorr on"
@@ -322,7 +326,8 @@ int main(int argc, char** argv)
                          : nOuter ? "nOuterCorrectors 2"
                          : nonOrth ? "nNonOrthogonalCorrectors 1"
                          : momPred ? "momentumPredictor yes"
-                                   : "alphaApplyPrevCorr yes";
+                         : namedFlux ? "phi rhoPhi"
+                                     : "alphaApplyPrevCorr yes";
         check("the control was given OpenFOAM's answer without the setting under test", argc > 8);
         if (argc > 8)
         {
@@ -434,7 +439,9 @@ int main(int argc, char** argv)
                     threw = true;
                     why = e.what();
                 }
-                const char* named = nOuter ? "nOuterCorrectors" : "nNonOrthogonalCorrectors";
+                const char* named = nOuter ? "nOuterCorrectors"
+                                  : nonOrth ? "nNonOrthogonalCorrectors"
+                                            : "names the flux";
                 std::printf("  DEVICE: %s\n", threw ? why.substr(0, 140).c_str() : "RAN -- it must not");
                 check("the DEVICE refuses this case rather than run it at a smaller count",
                       threw && why.find(named) != std::string::npos);

@@ -217,12 +217,15 @@ if [ $HAVE_GPU = 1 ]; then
     arm device_nNonOrth1    refused "nNonOrthogonalCorrectors 1" "-device" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"
     arm device_mesh_dynamic refused "dynamicRefineFvMesh"     "-device" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
     # the device loop carries the kEpsilon closure now, in both lineages
-    # the wave conditions are the host's only: the device loop would freeze them at the file's value
+    # the device loop drives the wave conditions through its alpha and velocity hooks
     BASE="$BW"
-    arm device_waves        refused "waveAlpha/waveVelocity"  "-device" true
-    # ...and so is a condition that names a flux other than phi
+    arm device_waves        runs    -                        "-device" true
+    # a p_rgh or alpha condition that names rhoPhi is evaluated on the host and handed rhoPhi; U's
+    # pressureInletOutletVelocity switch runs ON the device and reads phi, so there the name is refused
     BASE="$B"
-    arm device_flux_rhoPhi  refused "names the flux"          "-device" "sed -i '/totalPressure/a\        phi             rhoPhi;' 0/p_rgh"
+    arm device_flux_rhoPhi  runs    -                        "-device" "sed -i '/totalPressure/a\        phi             rhoPhi;' 0/p_rgh"
+    arm device_Uflux_rhoPhi refused "names the flux"          "-device" "sed -i '/pressureInletOutletVelocity/a\        phi             rhoPhi;' 0/U"
+    arm host_Uflux_rhoPhi   runs    -                        "" "sed -i '/pressureInletOutletVelocity/a\        phi             rhoPhi;' 0/U"
     BASE="$BR"
     arm device_ras          runs    -                        "-device" true
     arm device_ras_uniform  runs    -                        "-device" "sed -i 's/^density .*/density uniform;/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,k) /div(phi,k) /; s/div(rhoPhi,epsilon) /div(phi,epsilon) /' system/fvSchemes"

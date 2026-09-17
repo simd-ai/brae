@@ -24,7 +24,7 @@
 # harmonics in the phase and five in the depth and so shows a wrong coefficient at its own order.
 # The three-dimensional ones (Grimshaw, McCowan, irregularMultiDirection) carry slip side walls.
 #
-# AND FIVE PROFILES OF stokesI, which is where the conditions themselves were ported:
+# AND SIX PROFILES OF stokesI, which is where the conditions themselves were ported:
 #   shipped   the tutorial's own mesh (500 x 75) and waveProperties, ten steps at its own deltaT 0.01.
 #             Its rampTime is 3 s, so at t = 0.1 the wave stands at a thirtieth of its height and |U|
 #             is 2.7e-03: the weakest signal here, and the one that is the case as it ships. (Ten steps
@@ -36,6 +36,10 @@
 #   crest     the same with wavePhase pi/2: level ABOVE the reference depth, inflow, the other half.
 #   tight     trough with BOTH codes' p_rgh solves at 1e-13 and no relTol: the discretisation with
 #             the stopping point taken out.
+#   mulescorr trough with `MULESCorr yes`, which no wave tutorial sets either. Under it alpha's first
+#             updateCoeffs of a sub-cycle is the PRE-SOLVE's matrix construction, not the explicit
+#             solve's correctBoundaryConditions, so the wave update has a second call site on both
+#             paths and this is the only profile that reaches it.
 #   mompred   trough with `momentumPredictor yes`, which no wave tutorial sets. The tutorial names
 #             PBiCG for U; the staging names smoothSolver with symGaussSeidel, which both codes run.
 #             It is here for what it found -- see below.
@@ -44,6 +48,12 @@
 # GAMG, which brae's interFoam does not have (it substitutes under a notice), so the staging names PCG
 # with DIC there. The gate is about the boundary conditions; a solver-log arm across two different
 # solvers would be about the solver. `brae_interFoam` on the tutorial as shipped runs under that notice.
+# WHAT THAT SUBSTITUTION IS WORTH ON THESE CASES WAS MEASURED, and it is not small: OpenFOAM against
+# ITSELF on the `trough` fixture, with nothing changed but p_rghFinal's solver -- GAMG or PCG, the same
+# DIC, the same tolerance 1e-7 -- differs by 1.8e-02 of alpha and 9.6% of U after twenty steps. brae with
+# its substitute is 2.3e-02 and 19% from OpenFOAM-with-GAMG. The tank's active absorption feeds the
+# water level back into the velocity, and where the last pressure solve stops is part of the answer at
+# that tolerance; agreeing with the tutorial AS SHIPPED needs OpenFOAM's GAMG, agglomeration and all.
 #
 # THE CONTROL is OpenFOAM's own answer for the same tank with NO WAVE -- the generating patch given the
 # absorbing model too: on stokesI the wave moves its U by 100% and its alpha by 0.73, against brae's
@@ -92,7 +102,7 @@ command -v blockMesh > /dev/null 2>&1 || { echo "SKIP: blockMesh not on PATH"; e
 command -v interFoam > /dev/null 2>&1 || { echo "SKIP: interFoam not on PATH"; exit 77; }
 
 # stage <name> <tutorial> <deltaT> <nSteps> <mesh: "nx ny nz"|-> <waves: shipped|trough|crest|still>
-#       <solves: case|tight|mompred>
+#       <solves: case|tight|mompred|mulescorr>
 stage()
 {
     local name="$1" tutorial="$2" dt="$3" n="$4" nx="$5" waves="$6" solves="$7"
@@ -144,6 +154,12 @@ if solves == 'tight':
     t, k = re.subn(r'tolerance\s+1e-0?[67];', 'tolerance       1e-13;', t)
     assert k >= 2, 'p_rgh tolerances not found'
     t = re.sub(r'relTol\s+0\.1;', 'relTol          0;', t)
+if solves == 'mulescorr':
+    t, k = re.subn(r'(cAlpha\s+[^;]+;)',
+                   r'\1\n        MULESCorr       yes;\n        nLimiterIter    3;'
+                   r'\n        solver          smoothSolver;\n        smoother        symGaussSeidel;'
+                   r'\n        tolerance       1e-8;\n        relTol          0;', t)
+    assert k == 1, 'the alpha entry was not found'
 if solves == 'mompred':
     t, k = re.subn(r'momentumPredictor\s+no;', 'momentumPredictor yes;', t)
     assert k == 1, 'momentumPredictor not found'
@@ -199,6 +215,9 @@ stage trough       stokesI 0.01 20 "100 1 75" trough  case    || rc=1
 stage crest        stokesI 0.01 20 "100 1 75" crest   case    || rc=1
 stage tight        stokesI 0.01 20 "100 1 75" trough  tight   || rc=1
 stage mompred      stokesI 0.01 20 "100 1 75" trough  mompred || rc=1
+stage mulescorr    stokesI 0.01 20 "100 1 75" trough  mulescorr || rc=1
+grep -q "Solving for alpha.water" "$W/mulescorr/log.interFoam" \
+    || { echo "FAIL: OpenFOAM's mulescorr run never solved the implicit alpha equation"; exit 1; }
 
 # the other eight models, as "tutorial|mesh|steps". The 3-D ones keep a spanwise direction.
 MODELS=(
@@ -229,6 +248,7 @@ gate trough  0.01 20 trough  smallStill   || rc=1
 gate crest   0.01 20 crest   smallStill   || rc=1
 gate tight   0.01 20 tight   smallStill   || rc=1
 gate mompred 0.01 20 mompred smallStill   || rc=1
+gate mulescorr 0.01 20 mulescorr smallStill || rc=1
 for entry in "${MODELS[@]}"; do
     IFS='|' read -r tutorial mesh steps <<< "$entry"
     gate "$tutorial" 0.01 "$steps" "$tutorial" "${tutorial}Still" || rc=1
