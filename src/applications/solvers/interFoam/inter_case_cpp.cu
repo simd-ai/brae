@@ -31,6 +31,36 @@ void pushFluxToPatches(
     }
 }
 
+GeometricField<scalar> rhoWithPatchValues(
+    const std::vector<scalar>& rhoCells,
+    const std::vector<std::vector<scalar>>& rhoBnd,
+    const std::vector<FvPatch>& patches)
+{
+    GeometricField<scalar> r;
+    r.internal = rhoCells;
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& q = patches[pi];
+        if (q.type == "empty")
+        {
+            // OpenFOAM's empty patch field has no faces at all; it contributes nothing anywhere
+            r.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
+            continue;
+        }
+        const bool have = pi < rhoBnd.size() && rhoBnd[pi].size() == static_cast<std::size_t>(q.size);
+        if (!have)
+        {
+            throw std::runtime_error(
+                "brae interFoam: rho has no patch values on '" + q.name + "'. fvc::snGrad(rho) reads "
+                "them -- rho's patches are `calculated`, not zeroGradient -- and defaulting to the cell "
+                "value would zero a term that is 100% of the pressure source on an inflow patch.");
+        }
+        r.boundary.push_back(std::make_unique<FixedValuePatchField<scalar>>(q, false, scalar(0), rhoBnd[pi]));
+    }
+    r.evaluateBoundary();
+    return r;
+}
+
 void updateMixtureBoundary(InterFields& f, const std::vector<FvPatch>& patches)
 {
     f.rhoBnd.resize(patches.size());

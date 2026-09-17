@@ -73,7 +73,14 @@ int main(int argc, char** argv)
     // than 3.7e-03 and the alpha pre-solve is hard enough for its solver log to discriminate. See the
     // script's header for why the two things this gate measures want opposite fixtures.
     const bool bigStep = argc > 7 && std::string(argv[7]) == "bigstep";
-    std::printf("  profile: %s\n", bigStep ? "bigstep -- the solver logs discriminate here" : "small step -- the tight field bounds live here");
+    // `inflow`: the atmosphere's inletValue set to 1, so water enters over air cells and rho's patch
+    // value differs from the cell's on a patch where p_rgh fixes a value. It is the only fixture here
+    // on which fvc::snGrad(rho) is non-zero on a boundary that does not cancel it. See the script.
+    const bool inflow = argc > 7 && std::string(argv[7]) == "inflow";
+    std::printf("  profile: %s\n",
+                bigStep ? "bigstep -- the solver logs discriminate here"
+              : inflow  ? "inflow -- snGrad(rho) is live on the atmosphere here"
+                        : "small step -- the tight field bounds live here");
 
     if (!std::filesystem::exists(ofDir + "/alpha.water"))
     {
@@ -225,8 +232,18 @@ int main(int argc, char** argv)
     // MEASURED 8.585e-12 relative; 7.2e-10 before totalPressure's dynamic term and 3.35e-06 on
     // PBiCGStab. The old comment here said agreement much below 2.3e-06 "would be luck rather than a
     // claim" -- that was the substituted solver talking.
-    check("p_rgh agrees with OpenFOAM's to 2e-10 relative, both running the case's PCG+DIC",
-          dP.linf < scalar(2e-10) * std::fmax(dP.refMax, scalar(1e-12)));
+    // Under `inflow` MEASURED 4.3e-11 on the host and 6.9e-10 on the device, and neither moves when
+    // every solve is tightened on both codes -- so it is not the tolerance ball. It is round-off
+    // through a transient in which |U| goes 0.19 -> 20 m/s in one step across a 1000:1 boundary
+    // density: device against host under tight solves is 1e-12 after two steps and 7e-10 after three.
+    // Before rho's patch values reached snGrad(rho) all three fields were 100% out, so 1e-8 is eight
+    // orders inside the defect it guards.
+    const scalar pBoundHost = inflow ? scalar(1e-9) : scalar(2e-10);
+    const scalar pBoundDev = inflow ? scalar(1e-8) : scalar(2e-10);
+    const scalar uBoundHost = inflow ? scalar(2e-11) : scalar(5e-10);
+    const scalar uBoundDev = inflow ? scalar(1e-8) : scalar(5e-10);
+    check("p_rgh agrees with OpenFOAM's relatively, both running the case's PCG+DIC",
+          dP.linf < pBoundHost * std::fmax(dP.refMax, scalar(1e-12)));
 
     const FieldData<vector> ofUfd = readField<vector>(ofDir + "/U");
     std::vector<vector> ofU;
@@ -244,18 +261,55 @@ int main(int argc, char** argv)
     std::printf("          relative %.3e\n", (double)(uLinf/std::fmax(uRef, scalar(1e-30))));
     // MEASURED 2.286e-11 relative; 2.0e-08 before totalPressure's dynamic term and 9.76e-06 on
     // PBiCGStab. U is rebuilt from the pressure flux, so it carries whatever p_rgh's solve leaves.
-    check("U agrees with OpenFOAM's to 5e-10 relative, for the same reason",
-          uLinf < scalar(5e-10) * std::fmax(uRef, scalar(1e-12)));
+    check("U agrees with OpenFOAM's relatively, for the same reason",
+          uLinf < uBoundHost * std::fmax(uRef, scalar(1e-12)));
+
+    // THE `inflow` CONTROL: the ORACLE's answer has to depend on the term, or agreeing with it proves
+    // nothing about the term. argv[8] is real OpenFOAM's U on the STANDARD case at the same instant;
+    // the two differ only in the atmosphere's inletValue, and in three steps almost no water has
+    // entered -- what moves the flow is rho_b on the inflow faces, through snGrad(rho) in phig and
+    // through totalPressure's 0.5*rho_b*|U_b|^2. Without rho's patch values brae sat 100% from this
+    // oracle, i.e. near the standard answer.
+    if (inflow)
+    {
+        check("the inflow control was given the standard case's OpenFOAM answer", argc > 8);
+        if (argc > 8)
+        {
+            const FieldData<vector> sfd = readField<vector>(std::string(argv[8]) + "/U");
+            scalar apart = 0, stdMax = 0;
+            for (label c = 0; c < nC && sfd.internalField.size() == static_cast<std::size_t>(nC); ++c)
+            {
+                const vector& a = sfd.internalField[static_cast<std::size_t>(c)];
+                const vector& b = ofU[static_cast<std::size_t>(c)];
+                apart = std::fmax(apart, std::sqrt((a.x-b.x)*(a.x-b.x) + (a.y-b.y)*(a.y-b.y) + (a.z-b.z)*(a.z-b.z)));
+                stdMax = std::fmax(stdMax, std::sqrt(a.x*a.x + a.y*a.y + a.z*a.z));
+            }
+            std::printf("  CONTROL: OpenFOAM's max|U| is %.4e here and %.4e on the standard case; the two "
+                        "answers are %.4e apart\n", (double)uRef, (double)stdMax, (double)apart);
+            check("...OpenFOAM's own answer moves by more than 10x the standard case's whole velocity",
+                  apart > scalar(10)*stdMax && stdMax > scalar(0));
+        }
+    }
 
     // ...and the conserved quantity, which neither solver's linear tolerance can move.
     scalar ofMass = 0, a0Mass = 0;
     for (label c = 0; c < nC; ++c) { ofMass += ofAlpha[c]*g.V()[c]; a0Mass += a0[c]*g.V()[c]; }
     std::printf("  water volume: initial %.10e, OpenFOAM %.10e, brae %.10e\n",
                 (double)a0Mass, (double)ofMass, (double)r.alphaMass);
-    check("OpenFOAM conserves the water too (a closed domain)",
-          std::fabs(ofMass - a0Mass)/a0Mass < scalar(1e-6));
-    check("brae's water volume agrees with OpenFOAM's to 1e-9 -- both conserve, so this IS exact",
-          std::fabs(r.alphaMass - ofMass)/ofMass < scalar(1e-9));
+    if (inflow)
+    {
+        // water ENTERS through the atmosphere on this profile, so the domain is not closed and the
+        // conservation arm has nothing to assert; what both codes let in is compared instead
+        check("brae lets in the water OpenFOAM lets in, to 1e-12",
+              std::fabs(r.alphaMass - ofMass)/ofMass < scalar(1e-12));
+    }
+    else
+    {
+        check("OpenFOAM conserves the water too (a closed domain)",
+              std::fabs(ofMass - a0Mass)/a0Mass < scalar(1e-6));
+        check("brae's water volume agrees with OpenFOAM's to 1e-9 -- both conserve, so this IS exact",
+              std::fabs(r.alphaMass - ofMass)/ofMass < scalar(1e-9));
+    }
 
     // THE DEVICE DRIVER, against OpenFOAM directly, at the case's own tolerances -- which is what
     // `brae_interFoam -device` runs on this tutorial. interfoam_dambreak_device_vs_host.sh compares
@@ -307,8 +361,9 @@ int main(int argc, char** argv)
             // Jacobi-BiCGStab to a hardcoded 1e-12 where the case names symGaussSeidel at 1e-8. At the
             // case's OWN 1e-8 that substitution read alpha 3.3e-06 and U 1.2e-03.
             check("the DEVICE's alpha agrees with OpenFOAM's to the host's bound", da.linf < alphaBound);
-            check("...its p_rgh to 2e-10 relative", dp.linf < scalar(2e-10)*std::fmax(dp.refMax, scalar(1e-12)));
-            check("...and its U to 5e-10 relative", du < scalar(5e-10)*std::fmax(uRef, scalar(1e-12)));
+            check("...its p_rgh to the device's bound for this profile",
+                  dp.linf < pBoundDev*std::fmax(dp.refMax, scalar(1e-12)));
+            check("...and its U", du < uBoundDev*std::fmax(uRef, scalar(1e-12)));
         }
     }
 

@@ -93,7 +93,7 @@ void deviceInterStep(
     const int nBf = dm.nBndFaces;
     const int nFaces = nIf + nBf;
 
-    // ---- 1. THE ALPHA EQUATION, FIRST -------------------------------------------------------------
+    // 1. THE ALPHA EQUATION, FIRST
     // interFoam.C:96-104. It leaves rhoPhi behind, and mixture.correct() at its end leaves rho, mu and
     // nu -- so the momentum equation below is built on the NEW density, not on last step's.
     // the caller's cAlpha, deltaN and schemes; the flux and the time step are the step's own.
@@ -117,25 +117,9 @@ void deviceInterStep(
     probe("rho", rho);
     probe("rhoPhi", rhoPhiInt);
 
-    // ---- 2. THE INTERFACE FORCES, from the field the alpha step just left --------------------------
+    // 2. THE INTERFACE FORCES, from the field the alpha step just left
     // surfaceTensionForce() and snGrad(rho) both read the NEW alpha, and both equations below read
     // them. Building them before the alpha step would apply last step's interface.
-    DeviceBuffer<scalar> stf, snGradRho, nuEffCell, nuEffBnd, snGradPrgh;
-    hooks.interfaceForces(alpha1, K, rho, stf, snGradRho, nuEffCell, nuEffBnd, snGradPrgh);
-
-    probe("stf", stf);
-    probe("snGradRho", snGradRho);
-    probe("nuEffCell", nuEffCell);
-
-    // ---- 3. THE MOMENTUM MATRIX -------------------------------------------------------------------
-    DeviceBuffer<scalar> ub[3];
-    hooks.updateUBoundary(UX, UY, UZ, dbU, ub);
-    // pressureInletOutletVelocity's updateCoeffs, from the flux registered NOW: an inflow face fixes
-    // its tangential components, an outflow face is zeroGradient. The hook rebuilds dbU from the host
-    // patches' categories, which carry no flux, so without this every such face stayed zeroGradient for
-    // the whole run -- which agreed with the host only while the host made the same omission.
-    deviceUpdatePressureInletOutletVelocity(dbU, phiBnd, UX, UY, UZ, /*directionMixed=*/true);
-
     // THE BOUNDARY MIXTURE COMES FROM ALPHA'S PATCH VALUES, not from the face cell's. Those are
     // different fields at a contact-angle wall -- alpha's patch value is patchInternalField +
     // gradient/deltaCoeffs, and the contact angle's gradient is what pulls the interface up it. Taking
@@ -157,6 +141,24 @@ void deviceInterStep(
         }
         deviceBoundaryRho(alpha1Bnd.data(), alpha2Bnd.data(), nBf, props, rhoBnd.data());
     }
+
+    // rhoBnd is built ABOVE the hook because the hook reads it too: snGrad(rho) on a patch is
+    // deltaCoeffs*(rho_b - rho_cell), and rho_b is this.
+    DeviceBuffer<scalar> stf, snGradRho, nuEffCell, nuEffBnd, snGradPrgh;
+    hooks.interfaceForces(alpha1, K, rho, rhoBnd, stf, snGradRho, nuEffCell, nuEffBnd, snGradPrgh);
+
+    probe("stf", stf);
+    probe("snGradRho", snGradRho);
+    probe("nuEffCell", nuEffCell);
+
+    // 3. THE MOMENTUM MATRIX
+    DeviceBuffer<scalar> ub[3];
+    hooks.updateUBoundary(UX, UY, UZ, dbU, ub);
+    // pressureInletOutletVelocity's updateCoeffs, from the flux registered NOW: an inflow face fixes
+    // its tangential components, an outflow face is zeroGradient. The hook rebuilds dbU from the host
+    // patches' categories, which carry no flux, so without this every such face stayed zeroGradient for
+    // the whole run -- which agreed with the host only while the host made the same omission.
+    deviceUpdatePressureInletOutletVelocity(dbU, phiBnd, UX, UY, UZ, /*directionMixed=*/true);
 
     DeviceBuffer<scalar> muCell, muFace, muBndFace;
     deviceInterMuEff(dm, rho, nuEffCell, rhoBnd, nuEffBnd, muCell, muFace, muBndFace);
@@ -217,7 +219,7 @@ void deviceInterStep(
         deviceCopy(taps->UEqnBC, UEqn.bC[0]);
     }
 
-    // ---- 4. THE MOMENTUM PREDICTOR, if the case asks for one --------------------------------------
+    // 4. THE MOMENTUM PREDICTOR, if the case asks for one
     // damBreak sets `momentumPredictor no`. The matrix above is still assembled and relaxed either
     // way, because the pressure corrector is built on its A() and H().
     if (ctl.momentumPredictor)
@@ -262,7 +264,7 @@ void deviceInterStep(
         (void)A;
     }
 
-    // ---- 5. THE PRESSURE CORRECTOR, last, and nCorrectors TIMES -----------------------------------
+    // 5. THE PRESSURE CORRECTOR, last, and nCorrectors TIMES
     // interFoam.C:118-121 wraps the WHOLE of pEqn.H in `while (pimple.correct())`, so every pass
     // rebuilds rAU, HbyA, phiHbyA and phig from the U and phi the previous one left -- it is not a
     // repeated solve of one system. The momentum matrix is the same throughout, which is why it is

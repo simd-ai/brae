@@ -195,12 +195,13 @@ int main()
     };
     hooks.interfaceForces =
         [&](const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& Kd,
-            const DeviceBuffer<scalar>& rhod, DeviceBuffer<scalar>& stf,
+            const DeviceBuffer<scalar>& rhod, const DeviceBuffer<scalar>& rhoBd,
+            DeviceBuffer<scalar>& stf,
             DeviceBuffer<scalar>& snRho, DeviceBuffer<scalar>& nuC, DeviceBuffer<scalar>& nuB,
             DeviceBuffer<scalar>& snP)
     {
-        std::vector<scalar> av, Kv, rv;
-        a.copyTo(av); Kd.copyTo(Kv); rhod.copyTo(rv);
+        std::vector<scalar> av, Kv, rv, rbv;
+        a.copyTo(av); Kd.copyTo(Kv); rhod.copyTo(rv); rhoBd.copyTo(rbv);
         work.internal = av;
         work.evaluateBoundary();
         // surfaceTensionForce = interpolate(sigma*K)*snGrad(alpha1), snGrad(rho) -- over the full array
@@ -212,6 +213,25 @@ int main()
             s[f]  = (w*sigma*Kv[o] + (1-w)*sigma*Kv[n]) * dc*(av[n] - av[o]);
             sr[f] = dc*(rv[n] - rv[o]);
             sp[f] = dc*(prghH.internal[n] - prghH.internal[o]);
+        }
+        // snGrad(rho) ON THE BOUNDARY is deltaCoeffs*(rho_b - rho_cell): rho's patches are
+        // `calculated`, not zeroGradient. On this fixture alpha's patches are zeroGradient, so rho_b is
+        // the cell's and the term is zero either way -- the arm that makes it non-zero is the
+        // OpenFOAM one, tests/interfoam_dambreak_inflow_vs_openfoam.sh.
+        {
+            std::size_t k = 0;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                for (label i = 0; i < fvp[pi].size; ++i)
+                {
+                    if (fvp[pi].type != "empty")
+                    {
+                        sr[static_cast<std::size_t>(nIf) + k] =
+                            fvp[pi].deltaCoeffs[i]*(rbv[k] - rv[fvp[pi].faceCells[i]]);
+                    }
+                    ++k;
+                }
+            }
         }
         stf.copyFrom(s);
         snRho.copyFrom(sr);

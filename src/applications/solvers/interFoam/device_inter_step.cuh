@@ -69,6 +69,11 @@ struct DeviceInterStepHooks
     std::function<void(const DeviceBuffer<scalar>& alpha1,
                        const DeviceBuffer<scalar>& K,
                        const DeviceBuffer<scalar>& rho,
+                       // rho's PATCH values, boundary-face order. snGrad(rho) on a patch is
+                       // deltaCoeffs*(rho_b - rho_cell): rho's patches are `calculated`, and a
+                       // zeroGradient copy zeroes a term that is 100% of the pressure source on an
+                       // inflow patch -- see rhoWithPatchValues in inter_case_cpp.cuh.
+                       const DeviceBuffer<scalar>& rhoBnd,
                        DeviceBuffer<scalar>&       stf,
                        DeviceBuffer<scalar>&       snGradRho,
                        DeviceBuffer<scalar>&       nuEffCell,

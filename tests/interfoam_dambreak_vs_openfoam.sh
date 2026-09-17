@@ -18,6 +18,18 @@
 # tell solvers apart. At dt 5e-3 the interface moves 0.69, OpenFOAM's smoother takes 0, 5, 2, 2, 2
 # sweeps, brae takes the same and leaves its final residuals to 9e-10 -- and the PBiCGStab CONTROL gets
 # two counts of five and is 100% out. The `bigstep` profile is where those arms are asserted.
+#
+# AND A THIRD PROFILE, `inflow`, for a term neither shipped tutorial exercises. rho is built from an
+# expression, so its patches are `calculated` and fvc::snGrad(rho) on a patch is
+# deltaCoeffs*(rho_b - rho_cell); brae took it from a zeroGradient copy, which is 0 everywhere. On a
+# fixedFluxPressure wall that cancels through constrainPressure, and everywhere else on damBreak and
+# capillaryRise alpha's patch value equals the cell's -- so it was carried as LATENT. Setting the
+# atmosphere's inletValue to 1 makes water enter over air cells: OpenFOAM's boundary snGrad(rho) is then
+# 1.57e+05 on 19 of 46 faces, phig there is 1.66e-02 against a phiHbyA of 2.5e-06, max|U| goes 0.19 ->
+# 20 m/s in ONE step, and brae was 100% out in alpha, p_rgh and U from the second step on.
+# THREE steps only: the fixture is violent enough that round-off grows 700x a step (device against
+# host, every solve tightened: 1e-12 after two steps, 7e-10 after three), so a longer run measures the
+# conditioning and not the term.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_dambreak_vs_openfoam"
@@ -25,6 +37,7 @@ OFBASHRC=${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
 TUT=${BRAE_OF_TUTORIALS:-/usr/lib/openfoam/openfoam2412/tutorials}
 SRC="$TUT/multiphase/interFoam/laminar/damBreak/damBreak"
 STEPS=${STEPS:-5}
+STEPS_INFLOW=${STEPS_INFLOW:-3}
 DT=${DT:-1e-4}
 DT_BIG=${DT_BIG:-5e-3}
 
@@ -41,14 +54,22 @@ set -u
 command -v blockMesh > /dev/null 2>&1 || { echo "SKIP: blockMesh not on PATH"; exit 77; }
 command -v interFoam > /dev/null 2>&1 || { echo "SKIP: interFoam not on PATH"; exit 77; }
 
-# run_at <deltaT> <profile>: stage the tutorial at a FIXED step, run real OpenFOAM, run the gate.
+# run_at <deltaT> <profile> [nSteps]: stage the tutorial at a FIXED step, run real OpenFOAM, run the gate.
 run_at()
 {
-    local dt="$1" profile="$2"
+    local dt="$1" profile="$2" STEPS="${3:-$STEPS}"
     local C="$W/$profile"
     cp -r "$SRC" "$C" || return 1
     rm -rf "$C"/[1-9]* "$C"/0 "$C"/processor* "$C"/log.*
     cp -r "$C/0.orig" "$C/0"
+    if [ "$profile" = inflow ]; then
+        # WATER ENTERS OVER AIR CELLS: the one change that makes rho_b differ from rho_cell on a patch
+        # where p_rgh fixes a value. setFields rewrites only the internal field, so the patch entry
+        # survives it.
+        sed -i 's/inletValue *uniform 0;/inletValue      uniform 1;/' "$C/0/alpha.water"
+        grep -q "inletValue *uniform 1;" "$C/0/alpha.water" \
+            || { echo "FAIL: the inflow fixture's inletValue was not rewritten"; return 1; }
+    fi
 
     # A FIXED time step, and write exactly once at step N. writePrecision 15 because the comparison is
     # against brae's fp64 and an ascii round-trip at the default 6 digits would dominate the difference.
@@ -63,7 +84,8 @@ s = re.sub(r'^adjustTimeStep .*', 'adjustTimeStep  no;',        s, flags=re.M)
 s = re.sub(r'^deltaT .*',         'deltaT          %s;' % dt,   s, flags=re.M)
 s = re.sub(r'^endTime .*',        'endTime         %.10g;' % (n*float(dt)), s, flags=re.M)
 s = re.sub(r'^writeControl .*',   'writeControl    timeStep;',  s, flags=re.M)
-s = re.sub(r'^writeInterval .*',  'writeInterval   %d;' % n,    s, flags=re.M)
+# every step is written, so the `inflow` control can read the STANDARD case at its own end time
+s = re.sub(r'^writeInterval .*',  'writeInterval   1;',         s, flags=re.M)
 s = re.sub(r'^writeFormat .*',    'writeFormat     ascii;',     s, flags=re.M)
 s = re.sub(r'^writePrecision .*', 'writePrecision  15;',        s, flags=re.M)
 open(c, 'w').write(s)
@@ -96,10 +118,14 @@ open(q, 'w').write(t)
 PYEOF
     grep -q "PBiCGStab" "$C.control/system/fvSolution" || { echo "FAIL: the control case was not rewritten"; return 1; }
 
-    "$BIN" "$C" "$C/0" "$C/$end" "$STEPS" "$C/log.interFoam" "$C.control" "$profile"
+    # the `inflow` control reads the STANDARD case's OpenFOAM answer at the same instant
+    local std=""
+    [ "$profile" = inflow ] && std="$W/small/$end"
+    "$BIN" "$C" "$C/0" "$C/$end" "$STEPS" "$C/log.interFoam" "$C.control" "$profile" $std
 }
 
 rc=0
 run_at "$DT" small || rc=1
 run_at "$DT_BIG" bigstep || rc=1
+run_at "$DT" inflow "$STEPS_INFLOW" || rc=1
 exit $rc

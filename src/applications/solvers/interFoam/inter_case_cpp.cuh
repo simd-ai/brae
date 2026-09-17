@@ -190,6 +190,21 @@ struct InterFields
     bool    phiWasRead = false;            // see note 3
 };
 
+// rho AS OpenFOAM HOLDS IT: the cell values plus CALCULATED patch values, for fvc::snGrad(rho).
+// createFields.H builds rho from `alpha1*rho1 + alpha2*rho2`, so its patches are `calculated` and their
+// snGrad() is the base class's, deltaCoeffs*(rho_b - rho_cell) (fvPatchField.C:220-223) -- NOT zero.
+// brae took snGrad(rho) from a zeroGradient copy, which is zero on every patch. On a fixedFluxPressure
+// wall that cancels through constrainPressure, and on both shipped tutorials alpha's patch value equals
+// the cell's everywhere else, so nothing showed: the manifest carried it as LATENT. It is not small.
+// Where a value-fixing pressure patch takes in one phase over a cell holding the other -- measured on
+// damBreak with the atmosphere's inletValue set to 1 -- OpenFOAM's boundary snGrad(rho) is 1.57e+05 on
+// 19 of 46 faces and phig there is 1.66e-02 against a phiHbyA of 2.5e-06. brae had 0, and alpha, p_rgh
+// and U were each 100% out from the second step on.
+GeometricField<scalar> rhoWithPatchValues(
+    const std::vector<scalar>& rhoCells,
+    const std::vector<std::vector<scalar>>& rhoBnd,
+    const std::vector<FvPatch>& patches);
+
 // Tell every flux-conditional patch of U, p_rgh and alpha1 the current phi -- see the definition.
 // Call it whenever phi changes, before the next boundary evaluation reads it.
 void pushFluxToPatches(

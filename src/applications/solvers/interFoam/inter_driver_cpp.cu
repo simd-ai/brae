@@ -17,17 +17,6 @@ namespace interFoam {
 
 namespace {
 
-// A zeroGradient copy of a cell field, for the fvc:: calls that need a boundary.
-GeometricField<scalar> zgField(const std::vector<scalar>& cells, const std::vector<FvPatch>& patches)
-{
-    GeometricField<scalar> f;
-    f.internal = cells;
-    for (const FvPatch& q : patches)
-        f.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
-    f.evaluateBoundary();
-    return f;
-}
-
 }   // namespace
 
 
@@ -192,7 +181,8 @@ RunReport runInterFoam(
                     interfaceProps::sigmaK(f.K, f.interface.sigma, sK);
                     const SurfaceScalarField sKf = fvc::interpolate(sK, m, g, patches);
 
-                    const GeometricField<scalar> rhoF = zgField(f.rho, patches);
+                    // rho's CALCULATED patch values, not a zeroGradient copy -- see rhoWithPatchValues
+                    const GeometricField<scalar> rhoF = rhoWithPatchValues(f.rho, f.rhoBnd, patches);
                     const SurfaceScalarField snRho = fvc::snGrad(rhoF, m, g, patches, false);
                     const SurfaceScalarField snA   = fvc::snGrad(f.alpha1, m, g, patches, false);
 

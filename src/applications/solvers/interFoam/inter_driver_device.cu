@@ -189,7 +189,8 @@ RunReport runInterFoamDevice(
     };
     H.interfaceForces =
         [&](const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& Kd,
-            const DeviceBuffer<scalar>& rd, DeviceBuffer<scalar>& stf, DeviceBuffer<scalar>& snRho,
+            const DeviceBuffer<scalar>& rd, const DeviceBuffer<scalar>& rhoBd,
+            DeviceBuffer<scalar>& stf, DeviceBuffer<scalar>& snRho,
             DeviceBuffer<scalar>& nuC, DeviceBuffer<scalar>& nuB, DeviceBuffer<scalar>& snP)
     {
         a.copyTo(f.alpha1.internal);
@@ -212,11 +213,21 @@ RunReport runInterFoamDevice(
                 t.boundary[pi].push_back(sKf.boundary[pi][i]*snA.boundary[pi][i]);
         stf.copyFrom(fullFace(t, fvp));
 
-        GeometricField<scalar> rhoF;
-        rhoF.internal = f.rho;
-        for (const FvPatch& q : fvp)
-            rhoF.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
-        rhoF.evaluateBoundary();
+        // rho's CALCULATED patch values, from the device's own blend (which carries alpha2's
+        // one-pass-older patch values) -- not a zeroGradient copy. See rhoWithPatchValues.
+        std::vector<scalar> rbFlat;
+        rhoBd.copyTo(rbFlat);
+        std::vector<std::vector<scalar>> rb(fvp.size());
+        {
+            std::size_t off = 0;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+                rb[pi].assign(rbFlat.begin() + off, rbFlat.begin() + off + n);
+                off += n;
+            }
+        }
+        const GeometricField<scalar> rhoF = rhoWithPatchValues(f.rho, rb, fvp);
         snRho.copyFrom(fullFace(fvc::snGrad(rhoF, m, g, fvp, false), fvp));
 
         // the mixture's own nu. NOTE mixtureNu's second argument is mu, not alpha2.
