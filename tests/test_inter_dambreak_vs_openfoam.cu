@@ -83,11 +83,15 @@ int main(int argc, char** argv)
     // value differs from the cell's on a patch where p_rgh fixes a value. It is the only fixture here
     // on which fvc::snGrad(rho) is non-zero on a boundary that does not cancel it. See the script.
     const bool inflow = argc > 7 && std::string(argv[7]) == "inflow";
+    // `outflow`: the water column raised to the atmosphere with alphaApplyPrevCorr on, at dt 1e-2 --
+    // the one fixture on which the previous-correction limiter's flux argument changes the answer.
+    const bool outflow = argc > 7 && std::string(argv[7]) == "outflow";
     std::printf("  profile: %s\n",
                 prevCorrSub ? "prevcorrsub -- alphaApplyPrevCorr yes across TWO sub-cycles"
               : prevCorr ? "prevcorr -- alphaApplyPrevCorr yes, at the big step"
               : bigStep ? "bigstep -- the solver logs discriminate here"
               : inflow  ? "inflow -- snGrad(rho) is live on the atmosphere here"
+              : outflow ? "outflow -- water leaves through the atmosphere with alphaApplyPrevCorr on"
                         : "small step -- the tight field bounds live here");
 
     if (!std::filesystem::exists(ofDir + "/alpha.water"))
@@ -223,7 +227,9 @@ int main(int argc, char** argv)
     // happened; this one would not pass at the 5e-11 it carried one fix ago.
     // ...and under `bigstep`, where the interface moves 0.69 instead of 3.7e-03 and carries the error
     // with it, MEASURED 1.2e-12 and bounded at 5e-11.
-    const scalar alphaBound = bigStep ? scalar(5e-11) : scalar(1e-12);
+    // under `outflow` MEASURED 4.6e-13 on the host and 4.7e-13 on the device, bounded at 5e-11 like
+    // the other profiles on which the interface travels
+    const scalar alphaBound = (bigStep || outflow) ? scalar(5e-11) : scalar(1e-12);
     std::printf("  (alpha bound for this profile: %.0e)\n", (double)alphaBound);
     check("...and agrees with it absolutely, which is the discretisation and not the control",
           dAlpha.linf < alphaBound);
@@ -293,6 +299,24 @@ int main(int argc, char** argv)
         }
     }
 
+    // THE `outflow` CONTROL, and this one is on BRAE: the host runs again with the limiter reading
+    // phiCN, which is what it did before this profile measured it. Everything else in the run is the
+    // same code on the same case. MEASURED 5.5e-03 of alpha; the arm asks for four orders less than
+    // that, against a main-run bound of 5e-11.
+    if (outflow)
+    {
+        setenv("BRAE_CONTROL_PREVCORR_PHICN", "1", 1);
+        InterFields wrongF;
+        const RunReport rw = runInterFoam(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/false, &wrongF);
+        unsetenv("BRAE_CONTROL_PREVCORR_PHICN");
+        const Diff dWrong = compare(wrongF.alpha1.internal, ofAlpha);
+        std::printf("  CONTROL: with phiCN in the outlet test brae is %.4e of alpha from OpenFOAM; with "
+                    "alphaPhi10, %.4e\n", (double)dWrong.linf, (double)dAlpha.linf);
+        check("...the control ran the same number of steps", rw.steps == nSteps);
+        check("...and the WRONG argument is caught: more than 1e-6 out, against 5e-11 allowed",
+              dWrong.linf > scalar(1e-6));
+    }
+
     // THE `inflow` CONTROL: the ORACLE's answer has to depend on the term, or agreeing with it proves
     // nothing about the term. argv[8] is real OpenFOAM's U on the STANDARD case at the same instant;
     // the two differ only in the atmosphere's inletValue, and in three steps almost no water has
@@ -325,11 +349,11 @@ int main(int argc, char** argv)
     for (label c = 0; c < nC; ++c) { ofMass += ofAlpha[c]*g.V()[c]; a0Mass += a0[c]*g.V()[c]; }
     std::printf("  water volume: initial %.10e, OpenFOAM %.10e, brae %.10e\n",
                 (double)a0Mass, (double)ofMass, (double)r.alphaMass);
-    if (inflow)
+    if (inflow || outflow)
     {
-        // water ENTERS through the atmosphere on this profile, so the domain is not closed and the
-        // conservation arm has nothing to assert; what both codes let in is compared instead
-        check("brae lets in the water OpenFOAM lets in, to 1e-12",
+        // water CROSSES the atmosphere on these profiles, so the domain is not closed and the
+        // conservation arm has nothing to assert; what both codes let through is compared instead
+        check("brae lets through the water OpenFOAM lets through, to 1e-12",
               std::fabs(r.alphaMass - ofMass)/ofMass < scalar(1e-12));
     }
     else

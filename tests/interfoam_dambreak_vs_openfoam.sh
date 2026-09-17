@@ -38,6 +38,16 @@
 # runs at the big step, where the interface moves enough for last step's correction to matter, and the
 # staging asserts OpenFOAM's log says "Applying the previous iteration compression flux" -- an oracle
 # that never took the path would agree with a brae that ignored the switch.
+#
+# AND `outflow`, for ONE ARGUMENT of that path. MULES::correct's flux argument feeds a single test, the
+# boundary outlet test `(phi_b + phiCorr_b) > 0`, and OpenFOAM passes the ALPHA flux alphaPhi10 where
+# brae's host passed the volumetric phiCN. It took three fixtures to measure. On damBreak the two agree
+# to five digits (the cached correction's boundary half is zero unless water LEAVES through an outflow
+# face). With the water column raised to the atmosphere it does leave, and at dt 5e-3 the two tests
+# decide differently on up to 13 faces a step -- and the answer is STILL bit-identical, because the cell
+# limiter returns 1 there. It needs the limiter biting as well: the same fixture at dt 1e-2, four steps,
+# where brae with phiCN is 5.5e-03 of alpha and 2.2% of U from OpenFOAM and with alphaPhi10 4.6e-13.
+# The test re-runs the host with BRAE_CONTROL_PREVCORR_PHICN set and requires THAT to fail.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_dambreak_vs_openfoam"
@@ -48,6 +58,8 @@ STEPS=${STEPS:-5}
 STEPS_INFLOW=${STEPS_INFLOW:-3}
 DT=${DT:-1e-4}
 DT_BIG=${DT_BIG:-5e-3}
+DT_OUT=${DT_OUT:-1e-2}
+STEPS_OUT=${STEPS_OUT:-4}
 
 [ -x "$BIN" ]      || { echo "SKIP: $BIN not built"; exit 77; }
 [ -d "$SRC" ]      || { echo "SKIP: damBreak tutorial not found at $SRC"; exit 77; }
@@ -78,7 +90,14 @@ run_at()
         grep -q "inletValue *uniform 1;" "$C/0/alpha.water" \
             || { echo "FAIL: the inflow fixture's inletValue was not rewritten"; return 1; }
     fi
-    if [ "$profile" = prevcorr ] || [ "$profile" = prevcorrsub ]; then
+    if [ "$profile" = outflow ]; then
+        # THE WATER COLUMN REACHES THE ATMOSPHERE, whose faces over it turn out to be OUTFLOW (the patch
+        # fixes p_rgh, not p, so the column top sees the lower pressure): water leaves through them.
+        sed -i 's/box (0 0 -1) (0.1461 0.292 1);/box (0 0 -1) (0.1461 1 1);/' "$C/system/setFieldsDict"
+        grep -q "box (0 0 -1) (0.1461 1 1);" "$C/system/setFieldsDict" \
+            || { echo "FAIL: the outflow fixture's water column was not raised"; return 1; }
+    fi
+    if [ "$profile" = prevcorr ] || [ "$profile" = prevcorrsub ] || [ "$profile" = outflow ]; then
         sed -i 's/^\( *\)MULESCorr  *yes;/\1MULESCorr       yes;\n\1alphaApplyPrevCorr yes;/' "$C/system/fvSolution"
         grep -q "alphaApplyPrevCorr yes;" "$C/system/fvSolution" \
             || { echo "FAIL: alphaApplyPrevCorr was not switched on in the staged case"; return 1; }
@@ -115,7 +134,7 @@ PYEOF
     ( cd "$C" && setFields > log.setFields 2>&1 ) || { echo "FAIL: setFields"; tail -20 "$C/log.setFields"; return 1; }
     ( cd "$C" && interFoam > log.interFoam 2>&1 ) || { echo "FAIL: interFoam"; tail -30 "$C/log.interFoam"; return 1; }
 
-    if [ "$profile" = prevcorr ] || [ "$profile" = prevcorrsub ]; then
+    if [ "$profile" = prevcorr ] || [ "$profile" = prevcorrsub ] || [ "$profile" = outflow ]; then
         grep -q "Applying the previous iteration compression flux" "$C/log.interFoam" \
             || { echo "FAIL: OpenFOAM never applied the previous correction, so this oracle cannot gate it"; return 1; }
     fi
@@ -160,4 +179,5 @@ run_at "$DT_BIG" bigstep || rc=1
 run_at "$DT" inflow "$STEPS_INFLOW" || rc=1
 run_at "$DT_BIG" prevcorr || rc=1
 run_at "$DT_BIG" prevcorrsub || rc=1
+run_at "$DT_OUT" outflow "$STEPS_OUT" || rc=1
 exit $rc

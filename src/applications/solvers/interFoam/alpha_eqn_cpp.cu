@@ -430,15 +430,24 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
         // not phiCN. limiterCorr reads it in exactly one place, the boundary outlet test
         // `(phi_b + phiCorr_b) > SMALL*SMALL` (CMULESTemplates.C:546), and this call passed the
         // VOLUMETRIC flux there -- the same slip the corrector loop below had, fixed there when its
-        // gate measured 3.99e-09 -> 1.07e-10, and left here because nothing ran this branch. TAKEN FROM
-        // THE SOURCE, NOT FROM A MEASUREMENT: on damBreak the two agree, because the boundary half of
-        // the cached correction is zero unless alpha's patch value moves between the pre-solve and the
-        // correctors, which needs water leaving through an outflow face.
+        // gate measured 3.99e-09 -> 1.07e-10, and left here because nothing ran this branch.
+        //
+        // IT TOOK THREE FIXTURES TO MEASURE, and the two that failed say when it matters. On damBreak
+        // the arguments agree to five digits: the boundary half of the cached correction is zero
+        // unless alpha's patch value moves between the pre-solve and the correctors, which needs water
+        // LEAVING through an outflow face. With the water column raised to the atmosphere it does
+        // leave, and the two tests then DECIDE DIFFERENTLY on up to 13 boundary faces a step, on
+        // corrections worth 15% of the face flux -- and the answer was still bit-identical at dt 5e-3,
+        // because on those faces the cell limiter returned 1 and made the decision moot. It needs the
+        // decision to differ AND the limiter to be biting: the same fixture at dt 1e-2, where one
+        // application moves one cell's alpha by 0.10. Against real OpenFOAM, four steps: alpha 5.5e-03,
+        // p_rgh 5.7e-03 and U 2.2e-02 with phiCN; 4.6e-13, 2.7e-13 and 5.5e-13 with alphaPhi10.
         if (in.alphaApplyPrevCorr && prevCorr && !prevCorr->internal.empty())
         {
             MULES::Fields mf0;
-            MULES::correctLimited(rDeltaT, alpha1, alphaPhi10, *prevCorr, mf0, mulesCtl,
-                                  m, g, patches);
+            MULES::correctLimited(rDeltaT, alpha1,
+                                  in.controlPrevCorrOutletOnPhiCN ? *in.phiCN : alphaPhi10,
+                                  *prevCorr, mf0, mulesCtl, m, g, patches);
             for (std::size_t f = 0; f < alphaPhi10.internal.size(); ++f)
                 alphaPhi10.internal[f] += prevCorr->internal[f];
             for (std::size_t pi = 0; pi < alphaPhi10.boundary.size(); ++pi)

@@ -119,6 +119,14 @@ RunReport runInterFoam(
                     ai.symmetric = (f.aSolve.smoother == "symGaussSeidel");
                     ai.nSweeps = f.aSolve.nSweeps;
                     ai.solveLog = &rep.alphaSolves;
+                    // A GATE'S CONTROL, read here as BRAE_PTOL is and announced every step it is on:
+                    // see AlphaStepInput::controlPrevCorrOutletOnPhiCN. It makes the answer WRONG.
+                    if (std::getenv("BRAE_CONTROL_PREVCORR_PHICN"))
+                    {
+                        ai.controlPrevCorrOutletOnPhiCN = true;
+                        std::printf("  *** CONTROL MODE: the previous-correction limiter is reading "
+                                    "phiCN, not alphaPhi10. This run is deliberately wrong. ***\n");
+                    }
 
                     auto step1 = [&](const std::vector<scalar>& aOld, scalar dtSub,
                                      std::vector<scalar>& aNew, SurfaceScalarField& rPhi)

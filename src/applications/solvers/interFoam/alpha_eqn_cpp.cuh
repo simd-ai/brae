@@ -229,6 +229,11 @@ struct AlphaStepInput
     int nSweeps = 1;
     // appended to, one record per pre-solve; null = not kept
     std::vector<LinearSolveRecord>* solveLog = nullptr;
+    // A GATE'S CONTROL, never set by a solver: hand the previous-correction limiter the VOLUMETRIC flux
+    // phiCN as its outlet-test argument, which is what this code did before it was measured, in place
+    // of the alpha flux OpenFOAM passes. tests/interfoam_dambreak_vs_openfoam.sh's `outflow` profile
+    // runs it to show the gate fails when that argument is wrong: 5.5e-03 of alpha against 4.6e-13.
+    bool controlPrevCorrOutletOnPhiCN = false;
 };
 
 // One alphaEqn.H. `alpha1` carries the field AND its boundary conditions and is advanced in place;
