@@ -242,6 +242,37 @@ InterFields buildInterFields(const std::string&          caseDir,
         f.pimple.turbOnFinalIterOnly = true;
     }
 
+    // solvers/<alpha> -- the linear solve of the MULESCorr pre-solve. A case without MULESCorr never
+    // solves for alpha and need not name a solver (capillaryRise does not).
+    {
+        const FoamDict* sv = fvSolution.subDict("solvers");
+        const FoamDict* ad = sv ? sv->subDict(f.alphaName) : nullptr;
+        if (ad)
+        {
+            f.aSolve.solver = ad->wordOr("solver", "");
+            f.aSolve.smoother = ad->wordOr("smoother", "");
+            f.aSolve.tol = ad->scalarOr("tolerance", scalar(1e-6));
+            f.aSolve.relTol = ad->scalarOr("relTol", scalar(0));
+            f.aSolve.maxIter = static_cast<int>(ad->scalarOr("maxIter", scalar(1000)));
+            f.aSolve.nSweeps = static_cast<int>(ad->scalarOr("nSweeps", scalar(1)));
+        }
+        if (f.alphaCtl.MULESCorr && !f.aSolve.solver.empty())
+        {
+            // The HOST has no smoothSolver, so it always substitutes, and says so. Measured on damBreak
+            // it is harmless -- DILU on a near-triangular upwind matrix is as nearly exact as a
+            // Gauss-Seidel sweep, and the host's alpha is 3.6e-14 from OpenFOAM's -- but it is measured
+            // on one case, not proven, and the notice is what makes that visible on another.
+            noticeApproximated("interFoam alpha pre-solve (host)",
+                "the case asks for `solver " + f.aSolve.solver + "; smoother " + f.aSolve.smoother +
+                ";` and brae's host path runs DILU-PBiCGStab at the same tolerance. The device path "
+                "runs the case's own smoother.");
+        }
+        if (f.alphaCtl.MULESCorr && f.aSolve.solver.empty())
+            throw std::runtime_error(
+                "brae interFoam: `MULESCorr yes` solves an implicit alpha equation and fvSolution's `solvers/"
+                + f.alphaName + "` names no `solver` for it. OpenFOAM refuses the same case.");
+    }
+
     // solvers/p_rgh -- the case's own pressure solve. See InterFields::tolP for why this is read
     // rather than assumed, and why relTol comes from the Final entry.
     {

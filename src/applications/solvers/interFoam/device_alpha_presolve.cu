@@ -3,6 +3,7 @@
 #include "device_alpha_presolve.cuh"
 #include "device_ldu.cuh"
 #include "device_pcg.cuh"
+#include "device_amg.cuh"   // deviceSymGaussSeidel
 #include "device_blas.cuh"
 #include "device_simple.cuh"
 #include <cuda_runtime.h>
@@ -95,12 +96,28 @@ scalar deviceAlphaPreSolve(
     DeviceBuffer<scalar> dNf;
     deviceNormFactorInto(A, alpha1, b, deviceOnes(nC), dNf);
 
-    // BiCGStab because the matrix is ASYMMETRIC: upwind convection gives upper != lower.
-    const DeviceSolverPerf perf =
-        deviceJacobiBiCGStab(A, b, alpha1, dNf.data(), sc.tol, sc.relTol, sc.maxIter);
+    // THE CASE'S OWN SMOOTHER WHERE IT NAMES ONE, and the choice decides the answer. An implicit upwind
+    // matrix is nearly triangular in flow order, so a Gauss-Seidel sweep is nearly an exact solve:
+    // OpenFOAM's log on damBreak reads "No Iterations 2, Final residual 9.3e-14" at `tolerance 1e-8`.
+    // Jacobi-BiCGStab has no such property and stops AT 1e-8. Measured against real OpenFOAM, five
+    // steps of damBreak with this solve at the case's 1e-8: alpha 3.3e-06 and U 1.2e-03 out. The driver
+    // used to hide that by hardcoding 1e-12 (alpha 1.6e-10) -- a tolerance nobody chose, standing in
+    // for a solver the case did not ask for.
+    DeviceSolverPerf perf;
+    if (sc.smoothSolver)
+    {
+        deviceSymGaussSeidel(A, b, alpha1, dNf.data(), sc.tol, sc.relTol, sc.maxIter,
+                             &perf, /*minIter=*/0, sc.nSweeps, sc.symmetric);
+    }
+    else
+    {
+        // BiCGStab because the matrix is ASYMMETRIC: upwind convection gives upper != lower.
+        perf = deviceJacobiBiCGStab(A, b, alpha1, dNf.data(), sc.tol, sc.relTol, sc.maxIter);
+    }
 
-    // alphaPhi10 = alpha1Eqn.flux(), the CONSERVATIVE flux of the solved matrix -- not the upwind flux
-    // of the solved field. The two differ by the solver's residual.
+    // alphaPhi10 = alpha1Eqn.flux(), the CONSERVATIVE flux of the solved matrix. For a pure upwind
+    // matrix that IS the upwind flux of the solved field, bit for bit; it is taken from the matrix
+    // because that is what alphaEqn.H does and what stays right if the scheme ever changes.
     deviceMatrixFluxInternal(A, alpha1, alphaPhi10Int);
     alphaPhi10Bnd.resize(static_cast<std::size_t>(nBf));
     if (nBf > 0)

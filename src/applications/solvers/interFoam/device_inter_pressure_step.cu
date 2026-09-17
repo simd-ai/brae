@@ -6,6 +6,8 @@
 #include "device_pcg.cuh"
 #include <cuda_runtime.h>
 #include <stdexcept>
+#include <cstdlib>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -114,10 +116,29 @@ scalar deviceInterPressureStep(
     DeviceBuffer<scalar> diagC, b;
     deviceFold(dm, P.diag, P.source, iC, bC, diagC, b);
     const DeviceLduView A = deviceLduView(dm, diagC, P.upper, P.lower);
-    DeviceBuffer<scalar> dNf;
-    deviceNormFactorInto(A, p_rgh, b, deviceOnes(nC), dNf);
-    const DeviceSolverPerf perf =
-        deviceJacobiBiCGStab(A, b, p_rgh, dNf.data(), in.solve.tol, in.solve.relTol, in.solve.maxIter);
+    DeviceSolverPerf perf;
+    if (in.pcgDIC)
+    {
+        if (!in.dic)
+        {
+            throw std::runtime_error(
+                "brae interFoam device pressure step: the case asks for PCG with DIC and no level "
+                "schedule was handed in. Build one from the mesh with buildDeviceDilu.");
+        }
+        const scalar nf = deviceNormFactor(A, p_rgh, b, deviceOnes(nC));
+        perf = deviceDICPCG(A, b, p_rgh, nf, in.solve.tol, in.solve.relTol, in.solve.maxIter, 0, *in.dic);
+    }
+    else
+    {
+        DeviceBuffer<scalar> dNf;
+        deviceNormFactorInto(A, p_rgh, b, deviceOnes(nC), dNf);
+        perf = deviceJacobiBiCGStab(A, b, p_rgh, dNf.data(),
+                                    in.solve.tol, in.solve.relTol, in.solve.maxIter);
+    }
+    if (in.solveLog)
+    {
+        in.solveLog->push_back(perf);
+    }
 
     // phi = phiHbyA - p_rghEqn.flux(). The flux is taken from the UNFOLDED matrix, because
     // fvMatrix::flux() reads upper/lower and the boundary coefficients, not the folded diagonal.

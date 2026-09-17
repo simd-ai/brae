@@ -25,14 +25,12 @@
 // would catch, because each is correct in isolation.
 #include "cf_types.cuh"
 #include "inter_case_cpp.cuh"
+#include "inter_peqn_cpp.cuh"
 #include <string>
 
 namespace brae {
 namespace cpu {
 namespace interFoam {
-
-// inter_peqn_cpp.cuh
-struct PressureTaps;
 
 struct RunReport
 {
@@ -46,6 +44,8 @@ struct RunReport
     scalar maxU         = 0;
     scalar worstDivPhi  = 0;
     scalar alphaMass    = 0;      // sum(alpha*V), which a closed domain must conserve
+    // every p_rgh solve of the run, in order: nCorrectors x (nNonOrthogonalCorrectors + 1) per step
+    std::vector<PressureSolveRecord> pSolves;
 };
 
 // Run `nSteps` of interFoam on a prepared case. Returns the state at the end; `verbose` prints the

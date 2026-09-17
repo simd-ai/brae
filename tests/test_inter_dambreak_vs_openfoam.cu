@@ -20,6 +20,8 @@
 #include "foam_field_reader.cuh"
 #include "inter_driver_cpp.cuh"
 #include "device_gate_finite.cuh"
+#include "inter_solve_log.cuh"
+#include <cuda_runtime.h>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -86,6 +88,23 @@ int main(int argc, char** argv)
     const RunReport r = runInterFoam(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/true, &fin);
     check("brae ran the same number of steps", r.steps == nSteps);
 
+    // THE SOLVER'S OWN LOG AGAINST OpenFOAM'S. The field bounds below tightened by four orders when the
+    // host took the case's PCG with DIC and its per-corrector p_rgh/p_rghFinal selection; this arm is
+    // the direct statement of why -- every solve takes OpenFOAM's iteration count.
+    const std::vector<PressureSolveRecord> ofSolves =
+        argc > 5 ? brae::gatecheck::readOfPressureSolves(argv[5]) : std::vector<PressureSolveRecord>{};
+    if (argc > 5)
+    {
+        // the FAIL-PROOF: nothing in compareSolves can pass on an empty parse
+        check("OpenFOAM's log gave a p_rgh solve for every corrector of every step",
+              !ofSolves.empty() && ofSolves.size() % static_cast<std::size_t>(nSteps) == 0);
+        failures += brae::gatecheck::compareSolves("host", r.pSolves, ofSolves, nSteps);
+    }
+    else
+    {
+        std::printf("  (no OpenFOAM log given: the solver-log arms are skipped)\n");
+    }
+
     auto readCells = [&](const std::string& path)
     {
         const FieldData<scalar> fd = readField<scalar>(path);
@@ -130,11 +149,13 @@ int main(int argc, char** argv)
     // read, and every one of those was the PRESSURE SOLVER: brae ran PBiCGStab where damBreak names
     // PCG with DIC, and applied p_rghFinal's relTol to all three correctors where pEqn.H selects
     // p_rgh (relTol 0.05) for the first two. With brae::pcg and the per-corrector selection it is
-    // 2.2e-12 -- four orders -- and the bound follows it, at about 20x for another compiler's
-    // contraction. A gate that would pass at 5% is not measuring the discretisation, it is measuring
-    // that something happened; this one would not pass at the old 1e-8.
-    check("...and agrees with it to 5e-11 absolute, which is the discretisation and not the control",
-          dAlpha.linf < scalar(5e-11));
+    // 2.2e-12 -- four orders. Then 1.3e-12 with capillaryRise's three boundary fixes, and 3.6e-14 once
+    // the atmosphere's totalPressure was given its dynamic term (p0 - 0.5*rho*neg(phi)*|U|^2, which
+    // interFoam never applied; see updatePressurePatchesFromVelocity). The bound follows at about 30x.
+    // A gate that would pass at 5% is not measuring the discretisation, it is measuring that something
+    // happened; this one would not pass at the 5e-11 it carried one fix ago.
+    check("...and agrees with it to 1e-12 absolute, which is the discretisation and not the control",
+          dAlpha.linf < scalar(1e-12));
 
     // p_rgh and U. BOTH codes now run the case's own PCG with DIC -- brae::pcg is a transcription of
     // lduMatrix PCG + DICPreconditioner, gated in tests/test_pcg.cu -- and both select p_rgh for the
@@ -146,10 +167,11 @@ int main(int argc, char** argv)
     std::printf("  p_rgh:  Linf %.4e  L2 %.4e   (|p_rgh| up to %.4e)\n",
                 (double)dP.linf, (double)dP.l2, (double)dP.refMax);
     std::printf("          relative %.3e\n", (double)(dP.linf/std::fmax(dP.refMax, scalar(1e-30))));
-    // MEASURED 7.194e-10 relative; 3.35e-06 on PBiCGStab. The old comment here said agreement much
-    // below 2.3e-06 "would be luck rather than a claim" -- that was the substituted solver talking.
-    check("p_rgh agrees with OpenFOAM's to 1e-8 relative, both running the case's PCG+DIC",
-          dP.linf < scalar(1e-8) * std::fmax(dP.refMax, scalar(1e-12)));
+    // MEASURED 8.585e-12 relative; 7.2e-10 before totalPressure's dynamic term and 3.35e-06 on
+    // PBiCGStab. The old comment here said agreement much below 2.3e-06 "would be luck rather than a
+    // claim" -- that was the substituted solver talking.
+    check("p_rgh agrees with OpenFOAM's to 2e-10 relative, both running the case's PCG+DIC",
+          dP.linf < scalar(2e-10) * std::fmax(dP.refMax, scalar(1e-12)));
 
     const FieldData<vector> ofUfd = readField<vector>(ofDir + "/U");
     std::vector<vector> ofU;
@@ -165,10 +187,10 @@ int main(int argc, char** argv)
     }
     std::printf("  U:      Linf %.4e            (|U| up to %.4e)\n", (double)uLinf, (double)uRef);
     std::printf("          relative %.3e\n", (double)(uLinf/std::fmax(uRef, scalar(1e-30))));
-    // MEASURED 1.966e-08 relative; 9.76e-06 on PBiCGStab. U is rebuilt from the pressure flux, so it
-    // carries whatever p_rgh's solve leaves.
-    check("U agrees with OpenFOAM's to 4e-7 relative, for the same reason",
-          uLinf < scalar(4e-7) * std::fmax(uRef, scalar(1e-12)));
+    // MEASURED 2.286e-11 relative; 2.0e-08 before totalPressure's dynamic term and 9.76e-06 on
+    // PBiCGStab. U is rebuilt from the pressure flux, so it carries whatever p_rgh's solve leaves.
+    check("U agrees with OpenFOAM's to 5e-10 relative, for the same reason",
+          uLinf < scalar(5e-10) * std::fmax(uRef, scalar(1e-12)));
 
     // ...and the conserved quantity, which neither solver's linear tolerance can move.
     scalar ofMass = 0, a0Mass = 0;
@@ -179,6 +201,56 @@ int main(int argc, char** argv)
           std::fabs(ofMass - a0Mass)/a0Mass < scalar(1e-6));
     check("brae's water volume agrees with OpenFOAM's to 1e-9 -- both conserve, so this IS exact",
           std::fabs(r.alphaMass - ofMass)/ofMass < scalar(1e-9));
+
+    // THE DEVICE DRIVER, against OpenFOAM directly, at the case's own tolerances -- which is what
+    // `brae_interFoam -device` runs on this tutorial. interfoam_dambreak_device_vs_host.sh compares
+    // device with host under TIGHTENED solves, where the choice of pressure solver cannot show; here it
+    // can, and until the device took the case's PCG with DIC it would have.
+    {
+        int nDev = 0;
+        if (cudaGetDeviceCount(&nDev) != cudaSuccess)
+        {
+            cudaGetLastError();
+            nDev = 0;
+        }
+        if (nDev <= 0)
+        {
+            std::printf("  (no CUDA device: the device arms are skipped)\n");
+        }
+        else
+        {
+            InterFields dev;
+            const RunReport rd = runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
+            check("the device driver ran the same number of steps", rd.steps == nSteps);
+            failures += brae::gatecheck::nonFinite("device alpha", dev.alpha1.internal);
+            failures += brae::gatecheck::nonFinite("device p_rgh", dev.p_rgh.internal);
+            failures += brae::gatecheck::nonFinite("device U", dev.U.internal);
+            if (argc > 5)
+            {
+                failures += brae::gatecheck::compareSolves("device", rd.pSolves, ofSolves, nSteps);
+            }
+            const Diff da = compare(dev.alpha1.internal, ofAlpha);
+            const Diff dp = compare(dev.p_rgh.internal, ofPrgh);
+            scalar du = 0;
+            for (label c = 0; c < nC; ++c)
+            {
+                const vector& a = dev.U.internal[c];
+                const vector& b = ofU[c];
+                du = std::fmax(du, std::sqrt((a.x-b.x)*(a.x-b.x) + (a.y-b.y)*(a.y-b.y) + (a.z-b.z)*(a.z-b.z)));
+            }
+            std::printf("  DEVICE vs OpenFOAM: alpha %.4e, p_rgh %.3e relative, U %.3e relative\n",
+                        (double)da.linf, (double)(dp.linf/std::fmax(dp.refMax, scalar(1e-30))),
+                        (double)(du/std::fmax(uRef, scalar(1e-30))));
+            // THE HOST'S BOUNDS, because the device now reads the host's numbers to three digits:
+            // 3.6e-14, 8.6e-12, 2.3e-11. It did not when this arm was written -- alpha was 1.6e-10,
+            // four thousand times the host's -- and the reason was the alpha pre-solve: the driver ran
+            // Jacobi-BiCGStab to a hardcoded 1e-12 where the case names symGaussSeidel at 1e-8. At the
+            // case's OWN 1e-8 that substitution read alpha 3.3e-06 and U 1.2e-03.
+            check("the DEVICE's alpha agrees with OpenFOAM's to 1e-12", da.linf < scalar(1e-12));
+            check("...its p_rgh to 2e-10 relative", dp.linf < scalar(2e-10)*std::fmax(dp.refMax, scalar(1e-12)));
+            check("...and its U to 5e-10 relative", du < scalar(5e-10)*std::fmax(uRef, scalar(1e-12)));
+        }
+    }
 
     std::printf("test_inter_dambreak_vs_openfoam: %d failures\n", failures);
     return failures ? 1 : 0;

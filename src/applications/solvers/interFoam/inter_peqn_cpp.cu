@@ -3,6 +3,8 @@
 #include "inter_peqn_cpp.cuh"
 #include "fvc_reconstruct_cpp.cuh"
 #include <cmath>
+#include <cstdlib>
+#include <cstdio>
 #include "fvm.cuh"
 #include "fv_matrix_ops.cuh"
 #include "pbicgstab.cuh"
@@ -231,6 +233,30 @@ void ddtCorr(const DdtCorrInput&           in,
 }
 
 
+void updatePressurePatchesFromVelocity(
+    GeometricField<scalar>& p_rgh,
+    const GeometricField<vector>& U,
+    const std::vector<std::vector<scalar>>* rhoBnd,
+    const std::vector<FvPatch>& patches)
+{
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        // bcCategory 7 is totalPressure, the one p_rgh patch type here that reads the velocity
+        if (p_rgh.boundary[pi]->bcCategory() != 7) continue;
+        const bool haveRho = rhoBnd && pi < rhoBnd->size()
+                          && (*rhoBnd)[pi].size() == static_cast<std::size_t>(patches[pi].size);
+        if (!haveRho)
+        {
+            throw std::runtime_error(
+                "brae interFoam pEqn: patch '" + patches[pi].name + "' is totalPressure and no rho "
+                "patch values were supplied. p_rgh has the dimensions of pressure, so OpenFOAM's form "
+                "is p0 - 0.5*rho*neg(phi)*|U|^2; defaulting rho to 1 would be the incompressible "
+                "form and wrong by the density.");
+        }
+        p_rgh.boundary[pi]->updateFromPatchVelocity(U.boundary[pi]->value(), {}, (*rhoBnd)[pi]);
+    }
+}
+
 void pressureCorrector(GeometricField<scalar>&      p_rgh,
                        GeometricField<vector>&      U,
                        SurfaceScalarField&          phi,
@@ -350,6 +376,8 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
 
     for (label corr = 0; corr <= sc.nNonOrthogonalCorrectors; ++corr)
     {
+        // the fvMatrix constructor's updateCoeffs -- see updatePressurePatchesFromVelocity
+        updatePressurePatchesFromVelocity(p_rgh, U, in.rhoBnd, patches);
         FvScalarMatrix pe = fvm::laplacian<scalar>(rAUfField, p_rgh, m, g, patches, /*corrected=*/false);
         const std::vector<scalar> div = fvc::div(phiHbyA, m, g, patches);
         for (label c = 0; c < nC; ++c) pe.source[c] += div[c] * g.V()[c];
@@ -373,10 +401,13 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
         const scalar tol = finalInner ? sc.tolPFinal : sc.tolP;
         const scalar relTol = finalInner ? sc.relTolPFinal : sc.relTolP;
         const int maxIter = finalInner ? sc.maxIterPFinal : sc.maxIterP;
-        if (finalInner ? sc.pcgDICFinal : sc.pcgDIC)
-            pcg(pe, p_rgh.internal, m, patches, tol, relTol, maxIter);
-        else
-            pbicgstab(pe, p_rgh.internal, m, patches, tol, relTol, maxIter);
+        const SolverPerformance sp = (finalInner ? sc.pcgDICFinal : sc.pcgDIC)
+            ? pcg(pe, p_rgh.internal, m, patches, tol, relTol, maxIter)
+            : pbicgstab(pe, p_rgh.internal, m, patches, tol, relTol, maxIter);
+        if (in.solveLog)
+        {
+            in.solveLog->push_back(PressureSolveRecord{sp.initialResidual, sp.finalResidual, sp.nIterations});
+        }
         p_rgh.evaluateBoundary();
 
         if (corr == sc.nNonOrthogonalCorrectors)

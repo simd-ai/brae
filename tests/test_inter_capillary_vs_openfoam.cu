@@ -75,10 +75,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 #include "device_gate_finite.cuh"
 #include "inter_peqn_cpp.cuh"
+#include "inter_solve_log.cuh"
 #include <cuda_runtime.h>
 
 using namespace brae;
@@ -165,6 +167,20 @@ int main(int argc, char** argv)
     const RunReport r = runInterFoam(caseDir, startDir, m, g, patches, nSteps, true, &fin,
                                      scalar(1.0e300), &taps);
     check("brae ran the same number of steps", r.steps == nSteps);
+
+    const std::vector<PressureSolveRecord> ofSolves =
+        argc > 7 ? brae::gatecheck::readOfPressureSolves(argv[7]) : std::vector<PressureSolveRecord>{};
+    if (argc > 7)
+    {
+        // the FAIL-PROOF: nothing below can pass on an empty parse
+        check("OpenFOAM's log gave a p_rgh solve for every corrector of every step",
+              !ofSolves.empty() && ofSolves.size() % static_cast<std::size_t>(nSteps) == 0);
+        failures += brae::gatecheck::compareSolves("host", r.pSolves, ofSolves, nSteps);
+    }
+    else
+    {
+        std::printf("  (no OpenFOAM log given: the solver-log arms are skipped)\n");
+    }
 
     // worstU accumulates with std::fmax, which drops NaN: a non-finite brae U would read 0 error.
     failures += brae::gatecheck::nonFinite("brae U", fin.U.internal);
@@ -400,11 +416,18 @@ int main(int argc, char** argv)
     //   it never called deviceUpdatePressureInletOutletVelocity, so an inflow face stayed zeroGradient.
     //
     // TWO STATEMENTS, AND THEY NEED TWO OpenFOAM RUNS. With every linear solve tightened on BOTH codes
-    // the device is OpenFOAM's to 3.5e-08 -- that is the discretisation, and it is checked. At the
-    // case's OWN tolerances (p_rgh relTol 0.05 on the first two correctors) it is 9.2e-04, because the
-    // device still runs its own solver on p_rgh where the host runs the case's PCG with DIC, and a
-    // different solver at the same relTol stops somewhere else. That is recorded as OPEN, bounded from
-    // above so it cannot grow unnoticed; a device DIC is what closes it.
+    // the device is OpenFOAM's to 3.5e-08 -- that is the discretisation. At the case's OWN tolerances
+    // (p_rgh relTol 0.05 on the first two correctors) it WAS 9.2e-04, because the device ran BiCGStab
+    // where the case names PCG with DIC, and a different solver at the same relTol stops somewhere
+    // else. With deviceDICPCG it is 4.8e-08, and the solver-log arm above holds the reason directly:
+    // all fifteen solves take OpenFOAM's iteration count.
+    //
+    // THE BOUND IS THE HOST'S, 1e-6, and what sets it is the case and not brae. The last corrector
+    // solves to `tolerance 1e-07`, and two correct CG runs whose reductions sum in a different order
+    // land in different places inside that ball: over the five step counts the device reads 3.8e-07,
+    // 8.3e-08, 5.5e-08, 1.1e-07, 4.8e-08 and the host 1.6e-08, 3.0e-08, 7.4e-08, 1.4e-07, 5.0e-08.
+    // The tightened arm below is where round-off-level agreement is asserted, because only there is
+    // it true.
     {
         int nDev = 0;
         if (cudaGetDeviceCount(&nDev) != cudaSuccess)
@@ -421,13 +444,17 @@ int main(int argc, char** argv)
             InterFields dev;
             const RunReport rd = runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
             check("the device driver ran the same number of steps", rd.steps == nSteps);
+            if (argc > 7)
+            {
+                failures += brae::gatecheck::compareSolves("device", rd.pSolves, ofSolves, nSteps);
+            }
             failures += brae::gatecheck::nonFinite("device U", dev.U.internal);
             scalar dRef = 0;
             const scalar dLinf = worstU(dev.U.internal, ofU, dRef);
-            std::printf("  DEVICE at the case's own tolerances: %.4e of %.4e (%.3e)  OPEN -- its p_rgh "
-                        "solver is not the case's\n",
+            std::printf("  DEVICE at the case's own tolerances: %.4e of %.4e (%.3e)\n",
                         (double)dLinf, (double)dRef, (double)(dLinf/dRef));
-            check("...which leaves the device within 2e-3 of OpenFOAM, and no worse", dLinf < scalar(2e-3)*dRef);
+            check("the DEVICE driver agrees with OpenFOAM at the case's own tolerances, to 1e-6",
+                  dLinf < scalar(1e-6)*dRef);
 
             if (argc > 6)
             {

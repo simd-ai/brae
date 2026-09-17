@@ -36,7 +36,10 @@
 #include "device_mesh.cuh"
 #include "device_inter_peqn.cuh"
 #include "device_alpha_presolve.cuh"   // DeviceAlphaSolverControls, the same shape of solver entry
+#include "device_dilu.cuh"
+#include "device_pcg.cuh"   // DeviceSolverPerf
 #include <functional>
+#include <vector>
 
 namespace brae {
 
@@ -82,6 +85,15 @@ struct DeviceInterPressureInput
     scalar pRefValue     = 0;
 
     DeviceAlphaSolverControls solve;    // the case's fvSolution entry for p_rgh
+    // `solver PCG; preconditioner DIC;` -- run OpenFOAM's own pair (deviceDICPCG) rather than the
+    // BiCGStab this step grew up on. It decides where a relTol 0.05 solve STOPS, which on capillaryRise
+    // was the whole of the device's 9.2e-04. `dic` is the level schedule: mesh-only, built once by the
+    // caller with buildDeviceDilu, and required when pcgDIC is set.
+    bool pcgDIC = false;
+    DeviceDilu* dic = nullptr;
+    // appended to, one record per solve -- the solver's own initial/final residual and iteration
+    // count, which is what a gate compares with OpenFOAM's "Solving for p_rgh" lines; null = not kept
+    std::vector<DeviceSolverPerf>* solveLog = nullptr;
 };
 
 // `phiHbyAInt`/`phiHbyABnd` come in as fvc::flux(HbyA) -- what the shared pressure predictor left --

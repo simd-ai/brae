@@ -63,6 +63,14 @@ struct DeviceAlphaSolverControls
     scalar tol     = 1e-8;
     scalar relTol  = 0;
     int    maxIter = 1000;
+    // `solver smoothSolver; smoother symGaussSeidel|GaussSeidel;` -- what every MULESCorr tutorial names
+    // for alpha. Read by the alpha pre-solve only; the momentum and pressure entries that share this
+    // struct ignore it. See deviceAlphaPreSolve for why it is not interchangeable with BiCGStab.
+    bool smoothSolver = false;
+    // symGaussSeidel (ascending then descending) against GaussSeidel (ascending only)
+    bool symmetric = true;
+    // smoothSolver.C:78 -- sweeps between residual evaluations
+    int nSweeps = 1;
 };
 
 // `alpha1` goes in as the initial guess -- the sub-step's old time, which is what OpenFOAM hands the

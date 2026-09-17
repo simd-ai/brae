@@ -63,4 +63,4 @@ END=$(python3 -c "print('%.10g' % ($STEPS*float('$DT')))")
 [ -d "$W/case/$END" ] || { echo "FAIL: OpenFOAM wrote no $END directory"; ls "$W/case"; exit 1; }
 echo "OpenFOAM ran $STEPS steps of deltaT $DT to t = $END"
 
-"$BIN" "$W/case" "$W/case/0" "$W/case/$END" "$STEPS"
+"$BIN" "$W/case" "$W/case/0" "$W/case/$END" "$STEPS" "$W/case/log.interFoam"

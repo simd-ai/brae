@@ -152,6 +152,23 @@ struct InterFields
         // brae::pcg is lduMatrix PCG + DICPreconditioner, gated in tests/test_pcg.cu
         bool pcgDIC() const { return solver == "PCG" && preconditioner == "DIC"; }
     };
+    // THE CASE'S alpha SOLVE, which only a MULESCorr case performs (the implicit upwind pre-solve,
+    // alphaEqn.H:103-149). It used to run at a struct default of 1e-8 on the host and a hardcoded
+    // 1e-12 on the device, neither read from the case. Defaults are lduMatrix::solver's own.
+    struct AlphaLinearSolve
+    {
+        std::string solver;
+        std::string smoother;
+        scalar tol = 1e-6;
+        scalar relTol = 0;
+        int maxIter = 1000;
+        int nSweeps = 1;
+        bool gaussSeidel() const
+        {
+            return solver == "smoothSolver" && (smoother == "symGaussSeidel" || smoother == "GaussSeidel");
+        }
+    };
+    AlphaLinearSolve aSolve;
     // solvers/p_rgh
     PressureLinearSolve pSolve;
     // solvers/p_rghFinal

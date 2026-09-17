@@ -148,7 +148,7 @@ int main(int argc, char** argv)
     hin.MULESCorr = hostF.alphaCtl.MULESCorr;
     hin.alphaScheme  = hostF.divPhiAlpha;
     hin.alpharScheme = hostF.divPhirbAlpha;
-    hin.tolAlpha = scalar(1e-12);
+    hin.tolAlpha = hostF.aSolve.tol;
     hin.relTolAlpha = 0;
     hin.maxIterAlpha = 2000;
 
@@ -249,9 +249,16 @@ int main(int argc, char** argv)
     dctl.nAlphaSubCycles = static_cast<int>(devF.alphaCtl.nAlphaSubCycles);
     dctl.nAlphaCorr      = static_cast<int>(devF.alphaCtl.nAlphaCorr);
     dctl.MULESCorr       = devF.alphaCtl.MULESCorr;
-    dctl.preSolve.tol    = scalar(1e-12);
-    dctl.preSolve.relTol = 0;
-    dctl.preSolve.maxIter = 2000;
+    // THE CASE'S OWN alpha SOLVE on both sides: symGaussSeidel at 1e-8 on the device, which has
+    // OpenFOAM's smoother, and the case's tolerance on the host. This arm used to pin BOTH to 1e-12 and
+    // still read 6.9e-11, which its own comment put down to "the pre-solve's residual". It was: two
+    // different solvers each stopping at 1e-12. See deviceAlphaPreSolve.
+    dctl.preSolve.tol = devF.aSolve.tol;
+    dctl.preSolve.relTol = devF.aSolve.relTol;
+    dctl.preSolve.maxIter = devF.aSolve.maxIter;
+    dctl.preSolve.smoothSolver = devF.aSolve.gaussSeidel();
+    dctl.preSolve.symmetric = (devF.aSolve.smoother == "symGaussSeidel");
+    dctl.preSolve.nSweeps = devF.aSolve.nSweeps;
 
     DevicePhaseProperties props{devF.mixture.phases.rho1, devF.mixture.phases.nu1,
                                 devF.mixture.phases.rho2, devF.mixture.phases.nu2};
@@ -295,10 +302,13 @@ int main(int argc, char** argv)
                                  (double)devAlpha[iw], (double)hostAlpha[iw]);
         std::printf("\n  ...the interface moved %.4e, worst excursion from [0,1] %.3e\n",
                     (double)moved, (double)exc);
-        check("the device alpha half tracks the host on damBreak's real mesh", worst < scalar(1e-8));
+        // MEASURED 4.6e-14. It was 6.9e-11 under a bound of 1e-8 while the device pre-solve ran
+        // Jacobi-BiCGStab where the case names symGaussSeidel; the bound follows, at about 40x.
+        check("the device alpha half tracks the host on damBreak's real mesh", worst < scalar(2e-12));
         check("...having actually advected the interface", moved > scalar(1e-5));
-        check("...and alpha is bounded to 1e-6, which is CMULES' fixed-point iteration and the "
-              "pre-solve's residual, both measured on the synthetic gate", exc <= scalar(1e-6));
+        // MEASURED 6.4e-15. The 1e-6 this carried was sized for a pre-solve that stopped AT its
+        // tolerance; the case's own smoother leaves 1e-13 of residual, and the excursion went with it.
+        check("...and alpha is bounded to 1e-12", exc <= scalar(1e-12));
 
         scalar rw = 0, rs = 0;
         for (label f = 0; f < nIf; ++f)
@@ -379,10 +389,14 @@ int main(int argc, char** argv)
                     "U.x %.4e of %.4e, p_rgh %.4e of %.4e;  moved %.4e, excursion %.3e\n",
                     nSteps, (double)wa, (double)sa, (double)wu, (double)su,
                     (double)wp, (double)sp, (double)moved, (double)exc);
-        check("the device driver tracks the host driver on damBreak", wa < scalar(1e-8));
-        check("...in the velocity it leaves", wu < scalar(1e-7)*std::fmax(su, scalar(1e-30)));
-        check("...and in the pressure", wp < scalar(1e-8)*std::fmax(sp, scalar(1e-30)));
-        check("...with alpha bounded", exc <= scalar(1e-6));
+        // MEASURED alpha 1.1e-15, U 2.6e-14 and p_rgh 2.5e-14 relative, excursion 2.0e-15 -- round-off,
+        // from 1.6e-10, 3.7e-08 and 2.5e-10. Two substitutions were the whole of it: the device's p_rgh
+        // solver (now the case's PCG with DIC) and its alpha pre-solve (now the case's symGaussSeidel).
+        // The bounds were 1e-8, 1e-7, 1e-8 and 1e-6; they follow, at about 40x.
+        check("the device driver tracks the host driver on damBreak", wa < scalar(1e-13));
+        check("...in the velocity it leaves", wu < scalar(1e-12)*std::fmax(su, scalar(1e-30)));
+        check("...and in the pressure", wp < scalar(1e-12)*std::fmax(sp, scalar(1e-30)));
+        check("...with alpha bounded", exc <= scalar(1e-12));
         // damBreak starts FROM REST, so the alpha equation alone advects nothing -- the flux is made by
         // the pressure corrector out of gravity. That the interface moved at all is what says the
         // whole loop ran and not just its alpha half.
@@ -451,13 +465,15 @@ int main(int argc, char** argv)
         // Both Courant numbers are compared outright, not just their effect on dt: the alpha one does
         // not bind here -- from rest the interface band carries almost no flux -- so nothing else in
         // this arm would notice if deviceAlphaCourantNo's mask were wrong.
-        check("...and the device computed it itself", rh.CoNum > scalar(0) && coRel < scalar(1e-9));
+        // MEASURED on this arm: Co 5.0e-13, alphaCo 9.2e-13, dt 2.2e-12, t 4.6e-13, alpha 6.6e-14 and
+        // U 4.2e-12 relative. All six bounds below were 1e-9, 1e-8 or 1e-7 and follow at 40-100x.
+        check("...and the device computed it itself", rh.CoNum > scalar(0) && coRel < scalar(1e-10));
         check("...along with the VoF one, which does not bind here and so is checked outright",
-              rh.alphaCoNum > scalar(0) && acRel < scalar(1e-9));
-        check("the device picks the host's time step from its own Courant numbers", dtRel < scalar(1e-9));
-        check("...so both land at the same physical time", tRel < scalar(1e-9));
-        check("...and on the same interface", wa < scalar(1e-8));
-        check("...and the same velocity", wu < scalar(1e-7)*std::fmax(su, scalar(1e-30)));
+              rh.alphaCoNum > scalar(0) && acRel < scalar(1e-10));
+        check("the device picks the host's time step from its own Courant numbers", dtRel < scalar(1e-10));
+        check("...so both land at the same physical time", tRel < scalar(1e-10));
+        check("...and on the same interface", wa < scalar(5e-12));
+        check("...and the same velocity", wu < scalar(2e-10)*std::fmax(su, scalar(1e-30)));
     }
     else
     {

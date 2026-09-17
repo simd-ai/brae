@@ -12,6 +12,7 @@
 #include "solution_directions.cuh"
 #include "fvm.cuh"
 #include "fvc.cuh"
+#include "brae_notice.cuh"
 #include "device_inter_step.cuh"
 #include "device_alpha_courant.cuh"
 #include "time_controls.cuh"
@@ -19,6 +20,7 @@
 #include "device_boundary.cuh"
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -265,6 +267,10 @@ RunReport runInterFoamDevice(
         { label o = nIf;
           for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             for (label i = 0; i < fvp[pi].size; ++i) rf.boundary[pi].push_back(rA[o++]); }
+        // totalPressure's updateCoeffs, where the fvMatrix constructor runs it. f.U's patch values and
+        // f.phi's are current (updateUBoundary ran after the last corrector and pushed the flux); a
+        // totalPressure patch is never a contact-angle wall, so f.rhoBnd is exact on it.
+        updatePressurePatchesFromVelocity(f.p_rgh, f.U, &f.rhoBnd, fvp);
         FvScalarMatrix pe = fvm::laplacian<scalar>(rf, f.p_rgh, m, g, fvp, false);
         std::vector<scalar> i2, b2;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
@@ -284,8 +290,22 @@ RunReport runInterFoamDevice(
     C.alpha.nAlphaSubCycles = static_cast<int>(f.alphaCtl.nAlphaSubCycles);
     C.alpha.nAlphaCorr      = static_cast<int>(f.alphaCtl.nAlphaCorr);
     C.alpha.MULESCorr       = f.alphaCtl.MULESCorr;
-    C.alpha.preSolve.tol    = scalar(1e-12);
-    C.alpha.preSolve.maxIter = 2000;
+    // THE CASE'S OWN alpha SOLVE: its smoother where it names a Gauss-Seidel one (the device has
+    // OpenFOAM's, level-scheduled and exact), and its tolerances either way. See deviceAlphaPreSolve.
+    C.alpha.preSolve.tol = f.aSolve.tol;
+    C.alpha.preSolve.relTol = f.aSolve.relTol;
+    C.alpha.preSolve.maxIter = f.aSolve.maxIter;
+    C.alpha.preSolve.smoothSolver = f.aSolve.gaussSeidel();
+    C.alpha.preSolve.symmetric = (f.aSolve.smoother == "symGaussSeidel");
+    C.alpha.preSolve.nSweeps = f.aSolve.nSweeps;
+    if (f.alphaCtl.MULESCorr && !f.aSolve.gaussSeidel())
+    {
+        noticeApproximated("interFoam alpha pre-solve (device)",
+            "the case asks for `solver " + f.aSolve.solver + "; smoother " + f.aSolve.smoother +
+            ";` and the device runs Jacobi-BiCGStab at the same tolerance. That is not only a cost "
+            "difference: at damBreak's 1e-8 it left alpha 3.3e-06 from OpenFOAM where the case's own "
+            "symGaussSeidel leaves 1e-13.");
+    }
     C.mules = DeviceMulesControls{f.mulesCtl.nLimiterIter, f.mulesCtl.smoothLimiter,
                                   f.mulesCtl.extremaCoeff, f.mulesCtl.boundaryExtremaCoeff};
     C.alphaInput.cAlpha = f.interface.cAlpha;
@@ -310,9 +330,16 @@ RunReport runInterFoamDevice(
     C.momentumPredictor = f.momentumPredictorOn;
     C.relaxU = f.relaxU;
     C.relaxEquationU = f.relaxEquationU;
-    // Both entries, selected per corrector inside the step. The device solver itself is still not
-    // the case's PCG+DIC -- a DIC preconditioner is a triangular sweep -- so where the solve stops
-    // differs from OpenFOAM's exactly as the host's did before brae::pcg; the tolerances are the case's.
+    // Both entries, selected per corrector inside the step -- and the case's own PCG with DIC where it
+    // names one, which every shipped interFoam tutorial does. The DIC is the level-scheduled DILU with
+    // lower aliased to upper, bit-identical to DICPreconditioner.C (tests/test_device_dic.cu). Any other
+    // solver still runs the device BiCGStab, under the notice buildInterFields already printed.
+    DeviceDilu dic = buildDeviceDilu(m.owner(), m.neighbour(), nC);
+    C.dic = &dic;
+    std::vector<DeviceSolverPerf> pLog;
+    C.pressureSolveLog = &pLog;
+    C.pressurePcgDIC = f.pSolve.pcgDIC();
+    C.pressureFinalPcgDIC = f.pSolveFinal.pcgDIC();
     C.pressure.tol = f.pSolve.tol;
     C.pressure.relTol = f.pSolve.relTol;
     C.pressure.maxIter = f.pSolve.maxIter;
@@ -390,6 +417,11 @@ RunReport runInterFoamDevice(
                         (double)rep.time, (double)rep.deltaT, (double)rep.CoNum,
                         (double)rep.alphaCoNum, (double)lo, (double)hi);
         }
+    }
+
+    for (const DeviceSolverPerf& sp : pLog)
+    {
+        rep.pSolves.push_back(PressureSolveRecord{sp.initialResidual, sp.finalResidual, sp.nIterations});
     }
 
     // hand the device's answer back through the host fields, so a caller compares the same objects

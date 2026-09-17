@@ -29,7 +29,8 @@ DeviceSolverPerf deviceJacobiPCG(
     scalar tol,
     scalar relTol,
     int maxIter,
-    int minIter)
+    int minIter,
+    const DeviceDilu* precon)
 {
     const int nC = A.nCells;
     DeviceBuffer<scalar> wA(nC), rA(nC), pA(nC), Ax(nC);
@@ -52,7 +53,14 @@ DeviceSolverPerf deviceJacobiPCG(
         do
         {
             wArAold = wArA;
-            deviceJacobi(wA, rA, A.diag);                   // wA = M^-1 rA  (Jacobi)
+            if (precon)
+            {
+                diluApply(A, *precon, rA, wA);              // wA = M^-1 rA  (DIC on a symmetric A)
+            }
+            else
+            {
+                deviceJacobi(wA, rA, A.diag);               // wA = M^-1 rA  (Jacobi)
+            }
             wArA = deviceDot(wA, rA);
             if (nIter == 0) deviceCopy(pA, wA);             // pA = wA
             else                                            // pA = wA + beta*pA
@@ -72,6 +80,31 @@ DeviceSolverPerf deviceJacobiPCG(
     }
     perf.nIterations = nIter;
     return perf;
+}
+
+DeviceSolverPerf deviceDICPCG(
+    const DeviceLduView& A,
+    const DeviceBuffer<scalar>& b,
+    DeviceBuffer<scalar>& psi,
+    scalar normFactor,
+    scalar tol,
+    scalar relTol,
+    int maxIter,
+    int minIter,
+    DeviceDilu& dic)
+{
+    if (!dic.valid || dic.nCells != A.nCells)
+    {
+        throw std::runtime_error(
+            "brae deviceDICPCG: the DIC level schedule was not built for this mesh "
+            "(buildDeviceDilu, once, from the mesh addressing).");
+    }
+    // a symmetric lduMatrix has no lower: everything below reads `upper`, as OpenFOAM's DIC and its
+    // symmetric Amul do
+    DeviceLduView S = A;
+    S.lower = A.upper;
+    diluUpdate(S, dic);
+    return deviceJacobiPCG(S, b, psi, normFactor, tol, relTol, maxIter, minIter, &dic);
 }
 
 void deviceNormFactorInto(

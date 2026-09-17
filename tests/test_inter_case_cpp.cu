@@ -639,6 +639,7 @@ int main(int argc, char** argv)
         std::vector<scalar> pOut;
         PressureStepInput pi2;
         pi2.UEqn = &UEqn; pi2.rho = &f.rho; pi2.gh = &f.gh; pi2.ghf = &f.ghfInternal;
+        pi2.rhoBnd = &f.rhoBnd;
         pi2.stf = &stf2;  pi2.snGradRho = &snRho2;
         // damBreak's atmosphere is totalPressure, which FIXES a value, so p_rgh needs no reference.
         PressureSolveControls psc;

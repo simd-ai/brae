@@ -316,7 +316,11 @@ void deviceInterStep(
         pi.needReference = ctl.needReference;
         pi.pRefCell = ctl.pRefCell;
         pi.pRefValue = ctl.pRefValue;
-        pi.solve = (corr == ctl.nCorrectors - 1) ? ctl.pressureFinal : ctl.pressure;
+        const bool finalCorr = (corr == ctl.nCorrectors - 1);
+        pi.solve = finalCorr ? ctl.pressureFinal : ctl.pressure;
+        pi.pcgDIC = finalCorr ? ctl.pressureFinalPcgDIC : ctl.pressurePcgDIC;
+        pi.dic = ctl.dic;
+        pi.solveLog = ctl.pressureSolveLog;
 
         DevicePressureTaps pt;
         deviceInterPressureStep(dm, pi, hooks.pressure, st.rAU, st.HbyA[0], st.HbyA[1], st.HbyA[2],

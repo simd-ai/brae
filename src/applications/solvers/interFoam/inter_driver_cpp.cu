@@ -121,6 +121,10 @@ RunReport runInterFoam(
                     ai.MULESCorr = f.alphaCtl.MULESCorr;
                     ai.alphaApplyPrevCorr = f.alphaCtl.alphaApplyPrevCorr;
                     ai.alpha2BndOut = &f.alpha2Bnd;
+                    // the case's own tolerances, where a struct default of 1e-8 used to stand
+                    ai.tolAlpha = f.aSolve.tol;
+                    ai.relTolAlpha = f.aSolve.relTol;
+                    ai.maxIterAlpha = f.aSolve.maxIter;
 
                     auto step1 = [&](const std::vector<scalar>& aOld, scalar dtSub,
                                      std::vector<scalar>& aNew, SurfaceScalarField& rPhi)
@@ -266,7 +270,9 @@ RunReport runInterFoam(
                     pin.UEqn = &UEqn; pin.rho = &f.rho; pin.gh = &f.gh; pin.ghf = &f.ghfInternal;
                     pin.ghfBnd = &f.ghfBoundary;
                     pin.stf = &stf; pin.snGradRho = &snRho; pin.ddt = &dc;
+                    pin.rhoBnd = &f.rhoBnd;
                     pin.taps = pressureTaps;
+                    pin.solveLog = &rep.pSolves;
 
                     PressureSolveControls psc;
                     psc.nCorrectors = lc.nCorrectors;

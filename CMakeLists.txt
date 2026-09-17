@@ -3508,6 +3508,15 @@ add_executable(test_lust_implicit tests/test_lust_implicit.cu)
 target_include_directories(test_lust_implicit PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_lust_implicit PRIVATE brae_core)
 add_test(NAME lust_implicit COMMAND test_lust_implicit)
+# DIC on the device: the level-scheduled DILU with lower aliased to upper, held BIT-IDENTICAL to a
+# transcription of DICPreconditioner.C, and PCG with it held to the host PCG+DIC's ITERATE at relTol
+# 0.05 -- which is where interFoam's p_rgh stops on every corrector but the last.
+add_executable(test_device_dic tests/test_device_dic.cu)
+target_include_directories(test_device_dic PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_dic PRIVATE brae_core)
+add_test(NAME device_dic COMMAND test_device_dic)
+set_tests_properties(device_dic PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(test_dilu tests/test_dilu.cu)
 target_include_directories(test_dilu PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_dilu PRIVATE brae_core)

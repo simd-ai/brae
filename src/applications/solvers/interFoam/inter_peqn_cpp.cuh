@@ -212,6 +212,16 @@ struct PressureTaps
     std::vector<scalar> snGradRho;
 };
 
+// One p_rgh solve as the solver itself reports it -- OpenFOAM's "Solving for p_rgh, Initial residual =
+// ..., Final residual = ..., No Iterations N" line. It is what says whether a solve STOPPED where
+// OpenFOAM's did, which a converged field cannot: see tests/test_inter_capillary_vs_openfoam.cu.
+struct PressureSolveRecord
+{
+    scalar initialResidual = 0;
+    scalar finalResidual = 0;
+    int nIterations = 0;
+};
+
 struct PressureStepInput
 {
     const FvVectorMatrix*      UEqn      = nullptr;   // the RELAXED momentum matrix, before the force
@@ -228,9 +238,32 @@ struct PressureStepInput
     const SurfaceScalarField*  stf       = nullptr;   // surfaceTensionForce, faces
     const SurfaceScalarField*  snGradRho = nullptr;
     const DdtCorrInput*        ddt       = nullptr;   // null = no ddtCorr (steady start)
+    // rho's PATCH values, which totalPressure reads -- see updatePressurePatchesFromVelocity. Required
+    // when p_rgh carries a totalPressure patch, and refused by name when it is missing there.
+    const std::vector<std::vector<scalar>>* rhoBnd = nullptr;
     // null = no capture
     PressureTaps* taps = nullptr;
+    // appended to, one record per solve; null = not kept
+    std::vector<PressureSolveRecord>* solveLog = nullptr;
 };
+
+// totalPressure's updateCoeffs, at the moment OpenFOAM runs it: fvm::laplacian(rAUf, p_rgh) constructs
+// an fvMatrix, whose constructor calls psi.boundaryFieldRef().updateCoeffs(). For a dimPressure field
+// with no psi that is (totalPressureFvPatchScalarField.C:118-127)
+//
+//     p_b = p0 - 0.5*rho_b*neg(phi_b)*magSqr(U_b)
+//
+// with rho_b, phi_b and U_b LOOKED UP as patch fields right then. brae's patch cannot look anything up,
+// and interFoam never told it: the atmosphere of damBreak sat at p0 for the whole run, with no dynamic
+// pressure on the faces drawing air in. Five steps from rest that is 1e-9 of p_rgh and no field gate
+// could see it; what saw it was the solver log against OpenFOAM's, where the initial residual of the
+// THIRD solve of step one was 1.7e-06 out with the first two exact. The flux must already have reached
+// the patch (pushFluxToPatches); U's patch values and rho's are passed here.
+void updatePressurePatchesFromVelocity(
+    GeometricField<scalar>& p_rgh,
+    const GeometricField<vector>& U,
+    const std::vector<std::vector<scalar>>* rhoBnd,
+    const std::vector<FvPatch>& patches);
 
 // One pass of pEqn.H. p_rgh, U and phi are all updated in place; `p` is (re)built at the end.
 void pressureCorrector(GeometricField<scalar>&      p_rgh,

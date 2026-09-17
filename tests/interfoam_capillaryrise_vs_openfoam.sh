@@ -92,4 +92,4 @@ PYEOF
 ( cd "$W/tight" && interFoam > log.interFoam 2>&1 ) || { echo "FAIL: interFoam (tightened)"; tail -30 "$W/tight/log.interFoam"; exit 1; }
 [ -d "$W/tight/$END" ] || { echo "FAIL: the tightened OpenFOAM run wrote no $END directory"; exit 1; }
 
-"$BIN" "$W/case" "$W/case/0" "$W/case/$END" "$STEPS" "$W/tight" "$W/tight/$END"
+"$BIN" "$W/case" "$W/case/0" "$W/case/$END" "$STEPS" "$W/tight" "$W/tight/$END" "$W/case/log.interFoam"
