@@ -154,6 +154,96 @@ AlphaDdt parseAlphaDdt(const std::string& entry)
     return AlphaDdt::other;                              // refused by offCentringCoeff, by name
 }
 
+// WHAT A CASE CAN ASK FOR THAT interFoam.C HONOURS AND brae DOES NOT EVEN READ. Every one of these ran
+// to completion without a word until brae was run over all 44 shipped tutorials and the ones that
+// reached `End:` were counted: laminar/damBreakWithObstacle and laminar/oscillatingBox both did, and
+// both ask for `dynamicRefineFvMesh` -- adaptive refinement driven by alpha. Seventeen more tutorials
+// carry a moving mesh and were only stopped because they hit some OTHER refusal first. braeInterFoam.cu's
+// own header listed MRF and fvOptions as refused; nothing refused them.
+//
+// The rule for each is OpenFOAM's own, read from the source named beside it, because a refusal that
+// fires on a case OpenFOAM would run as a static, source-free one is a defect too.
+void refuseUnportedCaseInputs(
+    const std::string& caseDir,
+    const FoamDict& controlDict)
+{
+    // createDynamicFvMesh.H -> dynamicFvMesh::New (dynamicFvMeshNew.C:65-128): with no dictionary the
+    // mesh is static; with one, `dynamicFvMesh` is MANDATORY and names the class.
+    const std::string dyn = caseDir + "/constant/dynamicMeshDict";
+    if (std::filesystem::exists(dyn))
+    {
+        const FoamDict d = readDict(dyn);
+        const std::string type = d.wordOr("dynamicFvMesh", "");
+        if (type.empty())
+        {
+            throw std::runtime_error(
+                "brae interFoam: constant/dynamicMeshDict has no `dynamicFvMesh` entry. OpenFOAM reads "
+                "it with get<word> and stops without one.");
+        }
+        if (type != "staticFvMesh")
+        {
+            throw std::runtime_error(
+                "brae interFoam: constant/dynamicMeshDict asks for `dynamicFvMesh " + type + "`. brae's "
+                "mesh does not move or refine -- interFoam.C's mesh.update(), correctPhi and the "
+                "mesh-flux terms are not ported -- and running it on the mesh as written would solve a "
+                "different problem. 19 of the 44 shipped interFoam tutorials ask for one.");
+        }
+    }
+
+    // createMRF.H -> IOMRFZoneList (READ_IF_PRESENT); a zone is active unless it says otherwise
+    // (MRFZone.C:248, :553).
+    const std::string mrf = caseDir + "/constant/MRFProperties";
+    if (std::filesystem::exists(mrf))
+    {
+        const FoamDict d = readDict(mrf);
+        for (const auto& z : d.subs)
+        {
+            const std::string a = z.second.wordOr("active", "true");
+            if (a == "false" || a == "no" || a == "off" || a == "0") continue;
+            throw std::runtime_error(
+                "brae interFoam: constant/MRFProperties has an active zone `" + z.first + "`. MRF adds "
+                "a Coriolis source to UEqn and makes every flux relative; none of that is ported here.");
+        }
+    }
+
+    // createFvOptions.H -> fv::options::createIOobject (fvOptions.C:46-84): constant/ FIRST, then
+    // system/. An option is active unless it says otherwise (fvOption.C:72).
+    for (const char* where : {"/constant/fvOptions", "/system/fvOptions"})
+    {
+        const std::string fo = caseDir + where;
+        if (!std::filesystem::exists(fo)) continue;
+        const FoamDict d = readDict(fo);
+        for (const auto& o : d.subs)
+        {
+            const std::string a = o.second.wordOr("active", "true");
+            if (a == "false" || a == "no" || a == "off" || a == "0") continue;
+            throw std::runtime_error(
+                "brae interFoam: " + std::string(where + 1) + " has an active option `" + o.first
+                + "` (type `" + o.second.wordOr("type", "?") + "`). interFoam applies fvOptions to UEqn "
+                  "and to U after every corrector; brae's interFoam applies none.");
+        }
+        // OpenFOAM stops at the first file it finds
+        break;
+    }
+
+    // A function object does not normally touch the solution, and brae runs none. setTimeStep is the
+    // exception: Time::adjustDeltaT ends with functionObjects_.adjustTimeStep(), so it OVERRIDES the
+    // deltaT the Courant number chose -- the clock this solver now reproduces bit for bit.
+    if (const FoamDict* fns = controlDict.subDict("functions"))
+    {
+        for (const auto& fo : fns->subs)
+        {
+            if (fo.second.wordOr("type", "") == "setTimeStep")
+            {
+                throw std::runtime_error(
+                    "brae interFoam: controlDict's function object `" + fo.first + "` is a "
+                    "setTimeStep. It overrides deltaT from inside Time::adjustDeltaT, and brae runs no "
+                    "function objects.");
+            }
+        }
+    }
+}
+
 void refuseUnportedTurbulence(const std::string& caseDir)
 {
     const std::string path = caseDir + "/constant/momentumTransport";
@@ -188,6 +278,7 @@ InterFields buildInterFields(const std::string&          caseDir,
 
     // --- the dictionaries ---------------------------------------------------------------------
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
+    refuseUnportedCaseInputs(caseDir, controlDict);
     const FoamDict fvSolution  = readDict(caseDir + "/system/fvSolution");
     const FoamDict fvSchemes   = readDict(caseDir + "/system/fvSchemes");
 

@@ -91,6 +91,24 @@ RunReport runInterFoamDevice(
     label nBf = 0;
     for (const FvPatch& q : fvp) nBf += q.size;
 
+    // TWO PIMPLE CONTROLS THE HOST HONOURS AND THIS LOOP DOES NOT, refused rather than run as 1 and 0.
+    // deviceInterStep is one outer corrector with no non-orthogonal pass; 5 shipped tutorials ask for
+    // nOuterCorrectors 2 or 3 and 4 for nNonOrthogonalCorrectors 1, and until this was here `-device`
+    // would have taken every one of them at the smaller number without a word.
+    if (f.pimple.nOuterCorrectors > 1)
+    {
+        throw std::runtime_error(
+            "brae interFoam (device): `nOuterCorrectors " + std::to_string(f.pimple.nOuterCorrectors)
+            + "` is not wired into the device loop, which runs one. The host path (no -device) does.");
+    }
+    if (f.nNonOrthogonalCorrectors > 0)
+    {
+        throw std::runtime_error(
+            "brae interFoam (device): `nNonOrthogonalCorrectors "
+            + std::to_string(f.nNonOrthogonalCorrectors) + "` is not wired into the device pressure "
+              "step, which runs none. The host path (no -device) does.");
+    }
+
     DeviceMesh dm = buildDeviceMesh(m, g, fvp);
 
     // the masks the device needs that the mesh does not carry

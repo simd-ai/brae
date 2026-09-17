@@ -15,6 +15,15 @@
 // `limitedLinear` on div(rhoPhi,U), `interfaceCompression` on div(phirb,alpha), localEuler/LTS,
 // CrankNicolson under sub-cycling, MRF, fvOptions, and a case that omits nAlphaCorr, nAlphaSubCycles,
 // cAlpha, maxAlphaCo or -- under MULESCorr -- nLimiterIter. Each throws by name.
+//
+// THAT LIST WAS NOT TRUE when it was written: MRF and fvOptions were named here and refused nowhere,
+// and a moving or refining mesh was not even named. brae was run over all 44 shipped tutorials and the
+// ones that reached `End:` were counted -- two did that should not have, both on `dynamicRefineFvMesh`.
+// Also refused now: any `dynamicFvMesh` but staticFvMesh (19 tutorials), a dictionary-form `sigma` and a
+// missing one (both used to become ZERO surface tension), a setTimeStep function object, and on
+// `-device` nOuterCorrectors above 1 and nNonOrthogonalCorrectors above 0, which that loop does not run.
+// tests/interfoam_refusals.sh holds every one of them, each beside the form OpenFOAM treats as nothing
+// -- `staticFvMesh`, `active no` -- which must still RUN.
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"

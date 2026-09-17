@@ -3121,6 +3121,15 @@ set_tests_properties(interfoam_dambreak_device_vs_host PROPERTIES
                      ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 add_dependencies(brae test_device_inter_dambreak_alpha)
 
+# What brae's interFoam REFUSES and what it must not: one unported input at a time on damBreak, each beside
+# the form of it OpenFOAM treats as nothing. Found by running brae over all 44 tutorials and counting
+# the ones that reached End: -- two did, on a dynamicRefineFvMesh brae never opened.
+add_test(NAME interfoam_refusals
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_refusals.sh)
+set_tests_properties(interfoam_refusals PROPERTIES
+                     SKIP_RETURN_CODE 77
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+
 # The ADAPTIVE CLOCK against real OpenFOAM, on damBreak exactly as it ships -- the one interFoam gate
 # that does not pin deltaT, and so the only one that can see setDeltaT or Time::adjustDeltaT.
 add_test(NAME interfoam_dambreak_clock_vs_openfoam

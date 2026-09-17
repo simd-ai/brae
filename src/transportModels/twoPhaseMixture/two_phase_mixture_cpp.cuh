@@ -91,7 +91,25 @@ inline MixtureSpec readTransportProperties(const std::string& casePath)
         if (i == 0) { m.phases.rho1 = rho; m.phases.nu1 = nu; }
         else        { m.phases.rho2 = rho; m.phases.nu2 = nu; }
     }
-    m.sigma = d.scalarOr("sigma", scalar(0));
+    // surfaceTensionModel::New (surfaceTensionModelNew.C:36-66): a DICTIONARY named sigma selects a
+    // model by its `type`; otherwise sigma is a dimensionedScalar read with no default
+    // (constantSurfaceTension.C:53). This read it with scalarOr("sigma", 0), so a temperature-dependent
+    // model AND a missing entry both became ZERO SURFACE TENSION, silently -- on capillaryRise that is
+    // the whole answer.
+    if (const FoamDict* sd = d.subDict("sigma"))
+    {
+        throw std::runtime_error(
+            "brae interFoam: `sigma` is a dictionary selecting surfaceTensionModel `"
+            + sd->wordOr("type", "?") + "`; brae has the constant model only.");
+    }
+    const scalar kAbsent = scalar(-1.0e300);
+    m.sigma = d.scalarOr("sigma", kAbsent);
+    if (m.sigma == kAbsent)
+    {
+        throw std::runtime_error(
+            "brae interFoam: constant/transportProperties has no `sigma`. OpenFOAM reads it with no "
+            "default and stops; zero is a value a case has to ask for.");
+    }
     return m;
 }
 
