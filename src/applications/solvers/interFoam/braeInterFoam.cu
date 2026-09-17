@@ -28,14 +28,21 @@
 
 int main(int argc, char** argv)
 {
+    bool onDevice = false;
     std::string caseDir = ".";
     for (int i = 1; i < argc; ++i)
     {
         if (std::strcmp(argv[i], "-case") == 0 && i + 1 < argc) caseDir = argv[++i];
+        else if (std::strcmp(argv[i], "-device") == 0) onDevice = true;
         else if (std::strcmp(argv[i], "-help") == 0)
         {
             std::printf("brae_interFoam: OpenFOAM's interFoam, re-ported.\n"
-                        "  usage: brae_interFoam -case <dir>\n");
+                        "  usage: brae_interFoam -case <dir> [-device]\n"
+                        "    -device  run the time loop on the GPU (runInterFoamDevice). The same\n"
+                        "             components and the same case translation; the boundary\n"
+                        "             conditions stay on the host. Gated against the host loop on\n"
+                        "             damBreak's own mesh: alpha 7.3e-11, U 2.6e-09 relative,\n"
+                        "             p_rgh 6.9e-11 over five steps.\n");
             return 0;
         }
     }
@@ -77,7 +84,11 @@ int main(int argc, char** argv)
         std::printf("brae interFoam (OF-mirror): %ld cells, start %s, endTime %g\n",
                     (long)m.nCells(), buf, (double)endTime);
 
-        const RunReport r = runInterFoam(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/true);
+        // ONE case translation and ONE time loop per path, both the ones the gates call. A private
+        // copy here would be the defect this file's header names.
+        const RunReport r = onDevice
+            ? runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/true)
+            : runInterFoam(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/true);
 
         std::printf("End: t = %.6g, alpha in [%.3e, %.8f], max|U| %.4g m/s, worst |div(phi)| %.3e\n",
                     (double)r.time, (double)r.alphaMin, (double)r.alphaMax,

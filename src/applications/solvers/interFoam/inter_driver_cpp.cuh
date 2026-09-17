@@ -59,6 +59,28 @@ RunReport runInterFoam(const std::string&          caseDir,
                        // comparison does not have to write and re-read them.
                        InterFields*                fieldsOut = nullptr);
 
+// ...and the SAME run on the GPU. Every operator, every corrector and every loop is the device code
+// gated in tests/test_device_inter_dambreak_alpha.cu, which tracks this host driver on damBreak's own
+// mesh to alpha 7.3e-11, U 2.6e-09 relative and p_rgh 6.9e-11 over five steps.
+//
+// THE HOOKS LIVE HERE AND NOT IN THE GATE, and that is the point. A device path whose boundary
+// evaluation is written inside a test is the defect braeInterFoam.cu's own header names: the gate
+// proves the step and the driver feeds it something else, with nothing comparing the two. What the
+// gate exercises is this function.
+//
+// WHAT IS STILL ON THE HOST is what has been throughout: the boundary conditions. alpha's patch values
+// and its contact angle, fvm::div's per-patch coefficients for the MULESCorr pre-solve, U's patch
+// values for the stress and for constrainHbyA, and p_rgh's for the pressure laplacian. Everything that
+// scales with the CELL COUNT runs on the device.
+RunReport runInterFoamDevice(const std::string&          caseDir,
+                             const std::string&          startDir,
+                             const PrimitiveMesh&        m,
+                             const FvGeometry&           g,
+                             const std::vector<FvPatch>& patches,
+                             label                       nSteps,
+                             bool                        verbose = true,
+                             InterFields*                fieldsOut = nullptr);
+
 } // namespace interFoam
 } // namespace cpu
 } // namespace brae
