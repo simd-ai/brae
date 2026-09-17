@@ -76,9 +76,33 @@ if command -v setFields > /dev/null 2>&1; then
     ( cd "$W/case" && setFields > log.setFields 2>&1 ) || { echo "SKIP: setFields failed"; exit 77; }
 fi
 
-# BRAE_PTOL: brae's host driver hardcodes the p_rgh solve to 1e-9 (inter_driver_cpp.cu) rather than
-# reading the case's solvers/p_rgh entry, and the device loop in the test solves to 1e-12. Two
+# A SECOND COPY ON THE CASE'S OWN CLOCK. Everything above pins dt so that a field difference cannot be
+# a clock. That pinning also means nothing here exercises setDeltaT, and the device loop ignored the
+# Courant number entirely until it was wired in -- so the last arm of the test gets a case with
+# `adjustTimeStep yes` restored and checks that both drivers grow dt the same way. The mesh, the 0/
+# fields and the tightened p_rgh solve are the ones prepared above; only the clock differs.
+#
+# AND maxCo IS LOWERED TO 0.0015, which is the only reason this arm measures anything. setDeltaT.H
+# takes min(maxCo/Co, 1 + 0.1*maxCo/Co, 1.2), so the Courant number only reaches deltaT when
+# maxCo/Co < 2 -- below that the 1.2 cap is a constant and dt rides it whatever Co says. damBreak at
+# its own maxCo 1 does exactly that for its first TWENTY-THREE steps (measured: dt climbs 1.2x from
+# 1e-4 to 7.457e-04 before Co first binds at 0.731), so five steps at maxCo 1 would have compared two
+# runs of 1.2^5 and called the Courant port validated. At 0.0015 the trajectory is Co's own --
+# 1.200e-04, 1.365e-04, 1.072e-04, 1.025e-04, 1.020e-04, growing and then shrinking -- and a one per
+# cent error in CoNum moves dt by one per cent.
+cp -r "$W/case" "$W/adaptive"
+python3 - "$W/adaptive" <<'PYEOF'
+import os, re, sys
+p = os.path.join(sys.argv[1], 'system/controlDict')
+s = open(p).read()
+for k, v in (('adjustTimeStep', 'yes'), ('maxCo', '0.0015')):
+    s = re.sub(r'^%s\s+.*' % k, '%-16s %s;' % (k, v), s, flags=re.M)
+open(p, 'w').write(s)
+PYEOF
+
+# BRAE_PTOL: brae's host driver reads the case's solvers/p_rgh entry (tolerance 1e-07, relTol 0.05 --
+# five per cent of the initial residual), and the device loop in the test solves to 1e-12. Two
 # different stopping points make the comparison measure the solvers and not the discretisation, so
-# both are pinned here. damBreak's own entry is `tolerance 1e-07; relTol 0.05` -- five per cent of the
-# initial residual -- which is looser still.
-BRAE_NCORR=${BRAE_NCORR:-} BRAE_PTOL=${BRAE_PTOL:-1e-12} "$BIN" "$W/case" "$W/case/0" "$STEPS" "$DT"
+# BRAE_PTOL pins both: it overrides the tolerance on the host side and zeroes relTol with it.
+BRAE_NCORR=${BRAE_NCORR:-} BRAE_PTOL=${BRAE_PTOL:-1e-12} \
+    "$BIN" "$W/case" "$W/case/0" "$STEPS" "$DT" "$W/adaptive"

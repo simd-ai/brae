@@ -71,10 +71,14 @@ int main(int argc, char** argv)
         std::snprintf(buf, sizeof buf, "%g", (double)startTime);
         const std::string startDir = caseDir + "/" + buf;
 
-        // An upper bound on the steps: with adjustTimeStep the count is not known ahead of time, and
-        // the loop stops when the end time is reached. A fixed-step case needs exactly (end-start)/dt.
+        // An upper bound on the steps, and endTime below is the REAL bound. A fixed-step case needs
+        // exactly (end-start)/dt; an adjustTimeStep case cannot be counted ahead of time, because
+        // deltaT is chosen from a Courant number that does not exist yet. This count used to be the
+        // only bound and the comment here claimed otherwise: damBreak at `endTime 0.004` ran its 40
+        // steps out to t = 0.054, thirteen times past the end of the case. The 4x allows the step to
+        // grow at setDeltaT's 1.2 cap for eight steps before endTime has to stop the loop.
         const label nSteps = (deltaT0 > scalar(0))
-            ? static_cast<label>((endTime - startTime) / deltaT0 + scalar(0.5))
+            ? static_cast<label>(scalar(4)*(endTime - startTime) / deltaT0 + scalar(0.5))
             : label(0);
         if (nSteps < 1)
             throw std::runtime_error(
@@ -87,8 +91,10 @@ int main(int argc, char** argv)
         // ONE case translation and ONE time loop per path, both the ones the gates call. A private
         // copy here would be the defect this file's header names.
         const RunReport r = onDevice
-            ? runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/true)
-            : runInterFoam(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/true);
+            ? runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/true,
+                                 /*fieldsOut=*/nullptr, endTime)
+            : runInterFoam(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/true,
+                           /*fieldsOut=*/nullptr, endTime);
 
         std::printf("End: t = %.6g, alpha in [%.3e, %.8f], max|U| %.4g m/s, worst |div(phi)| %.3e\n",
                     (double)r.time, (double)r.alphaMin, (double)r.alphaMax,

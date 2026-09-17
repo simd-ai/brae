@@ -146,6 +146,7 @@ InterFields buildInterFields(const std::string&          caseDir,
     f.mulesCtl  = f.alphaCtl.MULESCorr ? MULES::readControlsCorr(fvSolution, f.alphaName)
                                        : MULES::readControls(fvSolution, f.alphaName);
     f.timeCtl   = VoFTimeControls::read(controlDict);
+    f.writeCadence = WriteCadence::read(controlDict);
     f.deltaT    = controlDict.scalarOr("deltaT", scalar(1e-3));
 
     {

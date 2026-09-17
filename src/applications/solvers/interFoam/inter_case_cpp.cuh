@@ -99,6 +99,10 @@ struct InterFields
     AlphaControls                alphaCtl;
     MULES::Controls              mulesCtl;
     VoFTimeControls              timeCtl;
+    // Part of the TIME STEP, not of the output: Time::setDeltaT calls adjustDeltaT, which under
+    // `writeControl adjustableRunTime` trims deltaT to land on the next write time. See
+    // time_controls.cuh, which carries the damBreak measurement.
+    WriteCadence                 writeCadence;
     DivScheme                    divRhoPhiU     = DivScheme::upwind;
     scalar                       divRhoPhiUCoeff = 1.0;
     AlphaFluxScheme              divPhiAlpha    = AlphaFluxScheme::vanLeer;

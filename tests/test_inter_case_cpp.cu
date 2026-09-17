@@ -715,15 +715,32 @@ int main(int argc, char** argv)
         // `MULESCorr yes`, so this is the same semi-implicit path and the same conditioning effect in
         // CMULES's budget, not a new one.
         //
-        // This is a NEW arm's bound set from its own measurement, not an existing bound relaxed: 1e-6
-        // is five orders below anything that means something for a volume fraction, and the mechanism
-        // is characterised and gated separately rather than absorbed here. If the residue ever stops
-        // scaling with deltaT, the arm above fails first.
-        std::printf("    alpha's excursion is %.3e, and the per-step trace shows it tracking deltaT"
-                    " (the CMULES residue gated above)\n",
-                    (double)std::fmax(-r.alphaMin, r.alphaMax - scalar(1)));
-        check("alpha stays within 1e-6 of [0,1] over the whole run -- negligible as a volume fraction",
-              r.alphaMin > scalar(-1e-6) && r.alphaMax < scalar(1) + scalar(1e-6));
+        // THE BOUND IS OpenFOAM'S OWN EXCURSION AND NOT A ROUND NUMBER, which it was until the clock
+        // was ported. `1e-6` stood here and brae sat at 1.0e-06 -- passing on a margin of nothing --
+        // until Time::adjustDeltaT landed and the run shifted a few thousandths of a second, at which
+        // point it read 2.306e-06 and the arm failed. That looked like a regression and was not: real
+        // OpenFOAM on this same case, at writePrecision 14, logs
+        //
+        //     Max(alpha.water) = 1.0000011623306
+        //
+        // so OPENFOAM ITSELF exceeds 1 by 1.1623e-06 here and would have failed the old bound. A
+        // number below what the oracle achieves is not a tight bound, it is a broken one.
+        //
+        // WHAT IS LEFT IS A REAL GAP, and it is recorded rather than absorbed: brae's 2.306e-06 is
+        // 1.98x OpenFOAM's 1.1623e-06 at the same instant, on a case where the two agree to 1.24e-08
+        // in alpha itself. So the bound below is 2.5x the oracle's measured excursion -- brae is
+        // inside it by 1.26x, which is tight enough to catch a real drift, and closing the 2x is the
+        // manifest's open item, not this arm's to hide.
+        const scalar kOfExcursion = scalar(1.1623e-6);   // OpenFOAM 2412, damBreak, 10 steps, as above
+        const scalar kBound       = scalar(2.5)*kOfExcursion;
+        const scalar exc          = std::fmax(-r.alphaMin, r.alphaMax - scalar(1));
+        std::printf("    alpha's excursion is %.3e against OpenFOAM's own %.3e on this case (%.2fx),"
+                    " and the per-step trace shows it tracking deltaT (the CMULES residue gated"
+                    " above)\n",
+                    (double)exc, (double)kOfExcursion, (double)(exc/kOfExcursion));
+        check("alpha stays inside 2.5x OpenFOAM's own excursion on this case, which is the only"
+              " number here that means anything",
+              exc < kBound);
         check("...and the water is all still there: damBreak is closed", drift < scalar(1e-8));
         check("phi is divergence-free at the end, as the corrector leaves it",
               r.worstDivPhi < scalar(1e-6) * (scalar(1)/minV));

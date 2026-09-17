@@ -38,7 +38,8 @@ RunReport runInterFoam(const std::string&          caseDir,
                        const std::vector<FvPatch>& patches,
                        label                       nSteps,
                        bool                        verbose,
-                       InterFields*                fieldsOut)
+                       InterFields*                fieldsOut,
+                       scalar                      endTime)
 {
     InterFields f = buildInterFields(caseDir, startDir, m, g, patches);
     const label nC = m.nCells();
@@ -56,6 +57,13 @@ RunReport runInterFoam(const std::string&          caseDir,
 
     for (label step = 0; step < nSteps; ++step)
     {
+        // Time::run() (Time.C:1000), and it sits HERE -- above CourantNo.H and setDeltaT.H -- so the
+        // deltaT it tests is the one the previous iteration ended with, not the one this iteration is
+        // about to choose. The half-step slack is OpenFOAM's: a run overshoots endTime by up to half a
+        // step rather than landing on it, unless writeControl is adjustableRunTime and Time::
+        // adjustDeltaT() trims the last few.
+        if (!(rep.time < endTime - scalar(0.5)*rep.deltaT)) break;
+
         // The stages, in interFoam.C's order. runTimeStep owns the order; this lambda owns the work.
         // THE CASE'S OWN PIMPLE CONTROLS, read in buildInterFields. These were hardcoded here until
         // damBreak's fvSolution was actually read: it says nOuterCorrectors 1, nCorrectors 3 AND
@@ -84,11 +92,15 @@ RunReport runInterFoam(const std::string&          caseDir,
                 }
                 case Stage::alphaCourantNo:  break;    // computed above, from the same sumPhi
                 case Stage::setDeltaT:
-                    rep.deltaT = setDeltaTVoF(rep.deltaT, rep.CoNum, rep.alphaCoNum, f.timeCtl);
+                    rep.deltaT = setDeltaTVoF(rep.deltaT, rep.CoNum, rep.alphaCoNum, f.timeCtl,
+                                              rep.time, &f.writeCadence);
                     break;
                 case Stage::advanceTime:
                     rep.time += rep.deltaT;
                     ++rep.steps;
+                    // Time::operator++ moves writeTimeIndex_ AFTER the time, with the step that took
+                    // it -- which is what the next adjustDeltaT measures the distance to.
+                    f.writeCadence.advance(rep.time, rep.deltaT);
                     break;
 
                 case Stage::alphaControls: break;      // read once, in buildInterFields
@@ -283,7 +295,10 @@ RunReport runInterFoam(const std::string&          caseDir,
                 const vector& v = f.U.internal[c];
                 maxU = std::fmax(maxU, std::sqrt(v.x*v.x + v.y*v.y + v.z*v.z));
             }
-            std::printf("  t = %.6f  dt = %.3e  Co %.3f  alphaCo %.3f  "
+            // %.9g on t and dt, not %.6f/%.3e: these two are the ones a clock gate reads back, and
+            // OpenFOAM's own log prints six significant figures, so anything coarser here makes the
+            // comparison measure this printf. See tests/interfoam_dambreak_clock_vs_openfoam.sh.
+            std::printf("  t = %.9g  dt = %.9g  Co %.3f  alphaCo %.3f  "
                         "alpha [%.3e, %.6f]  max|U| %.4f\n",
                         (double)rep.time, (double)rep.deltaT, (double)rep.CoNum,
                         (double)rep.alphaCoNum, (double)aMin, (double)aMax, (double)maxU);

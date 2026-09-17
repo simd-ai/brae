@@ -13,6 +13,8 @@
 #include "fvm.cuh"
 #include "fvc.cuh"
 #include "device_inter_step.cuh"
+#include "device_alpha_courant.cuh"
+#include "time_controls.cuh"
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
 #include <cmath>
@@ -77,20 +79,14 @@ RunReport runInterFoamDevice(const std::string&          caseDir,
                              const std::vector<FvPatch>& fvp,
                              label                       nSteps,
                              bool                        verbose,
-                             InterFields*                fieldsOut)
+                             InterFields*                fieldsOut,
+                             scalar                      endTime)
 {
     InterFields f = buildInterFields(caseDir, startDir, m, g, fvp);
     const label nC = m.nCells(), nIf = m.nInternalFaces();
     const label nFaces = static_cast<label>(g.magSf().size());
     label nBf = 0;
     for (const FvPatch& q : fvp) nBf += q.size;
-
-    if (f.timeCtl.base.adjustTimeStep)
-        throw std::runtime_error(
-            "brae interFoam (device): `adjustTimeStep yes` is not wired into the device loop yet. The "
-            "VoF Courant number itself is ported (deviceAlphaCourantNo) but nothing here feeds it back "
-            "into deltaT, and running with a fixed step while the case asks for an adaptive one would "
-            "silently solve a different problem.");
 
     DeviceMesh dm = buildDeviceMesh(m, g, fvp);
 
@@ -311,6 +307,20 @@ RunReport runInterFoamDevice(const std::string&          caseDir,
     rep.deltaT = f.deltaT;
     for (label s = 0; s < nSteps; ++s)
     {
+        if (!(rep.time < endTime - scalar(0.5)*rep.deltaT)) break;   // Time::run(), Time.C:1000
+
+        // interFoam.C:98-100 -- CourantNo.H, alphaCourantNo.H, setDeltaT.H, and only THEN ++runTime.
+        // Both numbers come off the flux the LAST step left behind and the step size still in force;
+        // computing them after the step, or after deltaT moves, throttles on the wrong pair.
+        //
+        // OpenFOAM's two #includes each build their own surfaceSum(mag(phi)), and so do these two
+        // calls. The host driver caches one and shares it, which is the single place it deliberately
+        // differs from OpenFOAM; the device does not need to, so it does not.
+        rep.CoNum      = deviceAlphaCourantNo(dm, dPhiI, dPhiB, nullptr, rep.deltaT).CoNum;
+        rep.alphaCoNum = deviceAlphaCourantNo(dm, dPhiI, dPhiB, &dA,    rep.deltaT).CoNum;
+        rep.deltaT     = setDeltaTVoF(rep.deltaT, rep.CoNum, rep.alphaCoNum, f.timeCtl,
+                                      rep.time, &f.writeCadence);
+
         std::vector<scalar> ca, cx, cy, cz;
         dA.copyTo(ca);   dAOld.copyFrom(ca);
         dUx.copyTo(cx);  dUy.copyTo(cy);  dUz.copyTo(cz);
@@ -319,13 +329,14 @@ RunReport runInterFoamDevice(const std::string&          caseDir,
         dPhiI.copyTo(poi); dPhiB.copyTo(pob);
         DeviceBuffer<scalar> dPhiOI(poi), dPhiOB(pob);
 
-        deviceInterStep(dm, f.deltaT, C, props, H, dGh, dGhf, dMagSf,
+        deviceInterStep(dm, rep.deltaT, C, props, H, dGh, dGhf, dMagSf,
                         dA, dAOld, dUx, dUy, dUz, dUox, dUoy, dUoz,
                         dPhiI, dPhiB, dPhiOI, dPhiOB, dUFixes, dPrgh, dP,
                         dNH, dNHB, dABnd, dK, dAFixes, dAFlag, dbU,
                         dRho, dMu, dNu, dRpI, dRpB);
         rep.steps = s + 1;
-        rep.time += f.deltaT;
+        rep.time += rep.deltaT;
+        f.writeCadence.advance(rep.time, rep.deltaT);   // Time::operator++, Time.C:1046-1074
 
         if (verbose)
         {
@@ -333,8 +344,10 @@ RunReport runInterFoamDevice(const std::string&          caseDir,
             dA.copyTo(av);
             scalar lo = av.empty() ? 0 : av[0], hi = lo;
             for (scalar v : av) { lo = std::fmin(lo, v); hi = std::fmax(hi, v); }
-            std::printf("   t = %.6f  dt = %.3e  [device]  alpha [%.3e, %.6f]\n",
-                        (double)rep.time, (double)f.deltaT, (double)lo, (double)hi);
+            std::printf("   t = %.9g  dt = %.9g  Co %.3f  alphaCo %.3f  [device]  "
+                        "alpha [%.3e, %.6f]\n",
+                        (double)rep.time, (double)rep.deltaT, (double)rep.CoNum,
+                        (double)rep.alphaCoNum, (double)lo, (double)hi);
         }
     }
 

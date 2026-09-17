@@ -3120,6 +3120,15 @@ set_tests_properties(interfoam_dambreak_device_vs_host PROPERTIES
                      ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 add_dependencies(brae test_device_inter_dambreak_alpha)
 
+# The ADAPTIVE CLOCK against real OpenFOAM, on damBreak exactly as it ships -- the one interFoam gate
+# that does not pin deltaT, and so the only one that can see setDeltaT or Time::adjustDeltaT.
+add_test(NAME interfoam_dambreak_clock_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_dambreak_clock_vs_openfoam.sh)
+set_tests_properties(interfoam_dambreak_clock_vs_openfoam PROPERTIES
+                     SKIP_RETURN_CODE 77
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_dependencies(brae brae_interFoam)
+
 add_test(NAME device_inter_step COMMAND test_device_inter_step)
 set_tests_properties(device_inter_step PROPERTIES SKIP_RETURN_CODE 77)
 

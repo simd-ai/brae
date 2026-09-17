@@ -57,7 +57,14 @@ RunReport runInterFoam(const std::string&          caseDir,
                        // The FIELDS at the end, for a gate that has to compare them against
                        // OpenFOAM's own. A solver's real output is files; this exists so the
                        // comparison does not have to write and re-read them.
-                       InterFields*                fieldsOut = nullptr);
+                       InterFields*                fieldsOut = nullptr,
+                       // OpenFOAM's OWN loop bound, Time::run(): `value() < endTime - 0.5*deltaT`,
+                       // tested BEFORE setDeltaT with the step the last iteration left in force. With
+                       // adjustTimeStep a step count alone cannot express it -- deltaT is not known
+                       // ahead of time -- and brae_interFoam ran damBreak's `endTime 0.004` out to
+                       // t = 0.054 before this was a parameter. Left at VGREAT, nSteps is the bound,
+                       // which is what every gate wants.
+                       scalar                      endTime = scalar(1.0e300));
 
 // ...and the SAME run on the GPU. Every operator, every corrector and every loop is the device code
 // gated in tests/test_device_inter_dambreak_alpha.cu, which tracks this host driver on damBreak's own
@@ -79,7 +86,8 @@ RunReport runInterFoamDevice(const std::string&          caseDir,
                              const std::vector<FvPatch>& patches,
                              label                       nSteps,
                              bool                        verbose = true,
-                             InterFields*                fieldsOut = nullptr);
+                             InterFields*                fieldsOut = nullptr,
+                             scalar                      endTime = scalar(1.0e300));
 
 } // namespace interFoam
 } // namespace cpu

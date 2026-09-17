@@ -216,7 +216,82 @@ inline CourantNumbers alphaCourantNo(
 }
 
 // VoF setDeltaT.H:36-53. Both limits enter maxDeltaTFact BEFORE the damping -- see note 4.
-inline scalar setDeltaTVoF(scalar deltaT, scalar CoNum, scalar alphaCoNum, const VoFTimeControls& tc)
+// THE WRITE CADENCE IS PART OF THE TIME STEP, which is not obvious and is why this is here rather
+// than wherever brae decides to write fields. Time::setDeltaT(scalar) takes `adjust = true` by
+// default (Time.C:1178) and calls Time::adjustDeltaT(), which under `writeControl adjustableRunTime`
+// SHORTENS the step so the next write time is landed on exactly. So a solver that reads maxCo and
+// maxAlphaCo and ignores writeControl does not reproduce OpenFOAM's deltaT.
+//
+// MEASURED ON damBreak, whose controlDict says `writeControl adjustableRunTime; writeInterval 0.05`:
+// OpenFOAM's first step is 0.000119904 -- that is 0.05/417 -- where brae's unclamped setDeltaTVoF
+// gave 0.00012. The gap is in the fourth digit and it compounds: eleven steps later, on `endTime
+// 0.004`, OpenFOAM ended at t = 0.00385757 and brae at 0.00385805.
+struct WriteCadence
+{
+    bool   adjustable     = false;   // writeControl adjustableRunTime -- the only mode that adjusts
+    scalar writeInterval  = 0;
+    label  writeTimeIndex = 0;       // Time::writeTimeIndex_, which advance() below moves
+
+    static WriteCadence read(const FoamDict& controlDict)
+    {
+        WriteCadence w;
+        // BOTH spellings, from Time::writeControlNames (Time.C:53-62), which tabulates
+        // wcAdjustableRunTime twice -- as "adjustable" and as "adjustableRunTime". damBreak's own
+        // controlDict uses the short one, and matching only the long one made this whole clamp a
+        // no-op on the very case it was measured against. Any other value, tabulated or not, leaves
+        // adjustDeltaT a no-op exactly as it is in OpenFOAM.
+        const std::string wc = controlDict.wordOr("writeControl", "timeStep");
+        w.adjustable    = (wc == "adjustable" || wc == "adjustableRunTime");
+        w.writeInterval = controlDict.scalarOr("writeInterval", scalar(0));
+        if (w.adjustable && !(w.writeInterval > scalar(0)))
+            throw std::runtime_error(
+                "brae: controlDict says `writeControl adjustableRunTime` but gives no positive "
+                "`writeInterval`. Time::adjustDeltaT divides by it (Time.C:1150).");
+        return w;
+    }
+
+    // Time::operator++ (Time.C:1046-1074), and the two details there both matter: the time is the one
+    // AFTER the step, the deltaT is the one that took it, and the index only ever moves FORWARD.
+    void advance(scalar tSinceStart, scalar deltaT)
+    {
+        if (!adjustable) return;
+        const label wi =
+            static_cast<label>((tSinceStart + scalar(0.5)*deltaT)/writeInterval);
+        if (wi > writeTimeIndex) writeTimeIndex = wi;
+    }
+};
+
+// Time::adjustDeltaT() (Time.C:1136-1170). `tSinceStart` is value() - startTime_, which is what the
+// drivers' own clocks already measure.
+inline scalar adjustDeltaT(scalar deltaT, scalar tSinceStart, const WriteCadence& w)
+{
+    if (!w.adjustable) return deltaT;
+
+    const scalar timeToNextWrite =
+        std::max(scalar(0), scalar(w.writeTimeIndex + 1)*w.writeInterval - tSinceStart);
+    const scalar n = timeToNextWrite/deltaT;
+
+    // "For tiny deltaT the label can overflow" -- OpenFOAM leaves deltaT alone rather than wrapping.
+    if (!(n < scalar(2147483647))) return deltaT;
+
+    // nSteps can be < 1 so make sure at least 1
+    const label nStepsToNextWrite = std::max(label(1), static_cast<label>(std::lround(n)));
+    const scalar newDeltaT = timeToNextWrite/nStepsToNextWrite;
+
+    // Control the increase of the time step to within a factor of 2 and the decrease within 5.
+    return (newDeltaT >= deltaT) ? std::min(newDeltaT, scalar(2)*deltaT)
+                                 : std::max(newDeltaT, scalar(0.2)*deltaT);
+}
+
+// setDeltaT.H, and the adjustDeltaT that Time::setDeltaT performs on the way in. `w` null is a case
+// with no adjustable write cadence -- every gate fixture, and any case on `writeControl timeStep` or
+// `runTime`, for which OpenFOAM's adjustDeltaT is a no-op anyway.
+inline scalar setDeltaTVoF(scalar              deltaT,
+                           scalar              CoNum,
+                           scalar              alphaCoNum,
+                           const VoFTimeControls& tc,
+                           scalar              tSinceStart = 0,
+                           const WriteCadence* w = nullptr)
 {
     if (!tc.base.adjustTimeStep) return deltaT;
     const scalar kSmall = 1.0e-37;
@@ -224,7 +299,8 @@ inline scalar setDeltaTVoF(scalar deltaT, scalar CoNum, scalar alphaCoNum, const
                                           tc.maxAlphaCo/(alphaCoNum + kSmall));
     const scalar deltaTFact =
         std::min(std::min(maxDeltaTFact, scalar(1) + scalar(0.1)*maxDeltaTFact), scalar(1.2));
-    return std::min(deltaTFact*deltaT, tc.base.maxDeltaT);
+    const scalar dt = std::min(deltaTFact*deltaT, tc.base.maxDeltaT);
+    return w ? adjustDeltaT(dt, tSinceStart, *w) : dt;
 }
 
 }   // namespace brae
