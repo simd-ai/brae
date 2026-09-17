@@ -218,6 +218,23 @@ InterFields buildInterFields(const std::string&          caseDir,
         f.pimple.turbOnFinalIterOnly = true;
     }
 
+    // solvers/p_rgh -- the case's own pressure solve. See InterFields::tolP for why this is read
+    // rather than assumed, and why relTol comes from the Final entry.
+    {
+        const FoamDict* sv = fvSolution.subDict("solvers");
+        const FoamDict* pr = sv ? sv->subDict("p_rgh") : nullptr;
+        const FoamDict* pf = sv ? sv->subDict("p_rghFinal") : nullptr;
+        if (!pr)
+            throw std::runtime_error(
+                "brae interFoam: fvSolution has no `solvers/p_rgh` entry. OpenFOAM reads the pressure "
+                "solve's tolerance from there and every shipped tutorial carries one; assuming a "
+                "tolerance would run the case to a convergence nobody asked for, which is exactly the "
+                "defect this replaced.");
+        f.tolP     = pr->scalarOr("tolerance", scalar(1e-7));
+        f.relTolP  = (pf ? pf->scalarOr("relTol", scalar(0)) : scalar(0));
+        f.maxIterP = static_cast<int>(pr->scalarOr("maxIter", scalar(2000)));
+    }
+
     // relaxationFactors/equations -- see InterFields::relaxEquationU.
     {
         const FoamDict* rf = fvSolution.subDict("relaxationFactors");

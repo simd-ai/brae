@@ -113,6 +113,21 @@ struct InterFields
     LoopControls pimple;
     label   nNonOrthogonalCorrectors = 0;
     bool    momentumPredictorOn = true;
+
+    // THE CASE'S OWN p_rgh SOLVE, read from fvSolution's `solvers` block. It was hardcoded to 1e-9 in
+    // the driver, with a BRAE_PTOL override -- so every tutorial ran to a tolerance nobody chose, and
+    // a case asking for a LOOSER one (damBreak says `tolerance 1e-07; relTol 0.05`, five per cent of
+    // the initial residual) was solved far tighter than OpenFOAM solves it. That is not a free
+    // improvement: OpenFOAM's answer IS the loosely-solved one, and a gate comparing against it
+    // measures the two stopping points.
+    //
+    // relTol is read from the FINAL entry where the case has one. OpenFOAM's PIMPLE selects
+    // `p_rghFinal` on the last corrector (fvSolution's `select(finalIter)`), and the tutorials set
+    // relTol 0 there precisely so the step ends on a converged pressure; taking the non-final 0.05 for
+    // every corrector would stop the last one early.
+    scalar  tolP     = 1e-7;
+    scalar  relTolP  = 0;
+    int     maxIterP = 2000;
     // relaxationFactors/equations. THE QUESTION IS "DOES THE CASE NAME ONE", not "is it below 1":
     // fvMatrix::relax() is `if (mesh.relaxEquation(name, coeff)) relax(coeff)` and relaxEquation is
     // `found(name) || found("default")` (solution.C:330-334), so a case naming 1 relaxes -- the

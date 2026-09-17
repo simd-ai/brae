@@ -248,7 +248,12 @@ RunReport runInterFoam(const std::string&          caseDir,
                     psc.nCorrectors = lc.nCorrectors;
                     psc.nNonOrthogonalCorrectors = f.nNonOrthogonalCorrectors;
                     psc.needReference = false;          // damBreak's atmosphere is totalPressure
-                    psc.tolP = std::getenv("BRAE_PTOL") ? std::atof(std::getenv("BRAE_PTOL")) : scalar(1e-9);
+                    // the CASE's own solve, not a hardcoded 1e-9. BRAE_PTOL still overrides, because
+                    // a device-vs-host gate has to pin both sides to one stopping point.
+                    psc.tolP    = std::getenv("BRAE_PTOL")
+                                ? std::atof(std::getenv("BRAE_PTOL")) : f.tolP;
+                    psc.relTolP = std::getenv("BRAE_PTOL") ? scalar(0) : f.relTolP;
+                    psc.maxIterP = f.maxIterP;
                     for (label c = 0; c < lc.nCorrectors; ++c)
                         pressureCorrector(f.p_rgh, f.U, f.phi, f.p, pin, psc, m, g, patches);
                     break;
