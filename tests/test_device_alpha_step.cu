@@ -32,6 +32,7 @@
 // host to 2.2e-16 and two to 5.7e-08, which was corrector 2 reading the boundary corrector 1 started
 // from. That is why the nAlphaCorr loop is here and not inside the call.
 #include "box_mesh.cuh"
+#include "device_gate_finite.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "fv_patch_field.cuh"
@@ -311,6 +312,7 @@ int main()
                 {
                     std::vector<scalar> pv;
                     dA.copyTo(pv);
+                    failures += brae::gatecheck::nonFinite("pv", pv);
                     for (label c = 0; c < nC; ++c)
                         worstPreSolveExcursion = std::fmax(worstPreSolveExcursion,
                             std::fmax(-pv[c], pv[c] - scalar(1)));
@@ -334,6 +336,7 @@ int main()
         }
         std::vector<scalar> out;
         dA.copyTo(out);
+        failures += brae::gatecheck::nonFinite("out", out);
         return out;
     };
 

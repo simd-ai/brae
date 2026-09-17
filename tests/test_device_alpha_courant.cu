@@ -24,6 +24,7 @@
 // order. A max over those sums would be bit-identical if the sums were -- so the one ULP that shows up
 // in CoNum is itself the measurement that they are not.
 #include "box_mesh.cuh"
+#include "device_gate_finite.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "time_controls.cuh"

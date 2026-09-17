@@ -15,6 +15,7 @@
 //   THE PRESSURE CORRECTOR IS LAST, and arm 2 checks the state it leaves is self-consistent:
 //   p == p_rgh + rho*gh exactly, and alpha still in [0,1].
 #include "box_mesh.cuh"
+#include "device_gate_finite.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "fv_patch_field.cuh"
@@ -234,6 +235,7 @@ int main()
     {
         std::vector<scalar> rf;
         rAUfInt.copyTo(rf);
+        failures += brae::gatecheck::nonFinite("rf", rf);
         SurfaceScalarField rf2;
         rf2.internal = rf;
         rf2.boundary.resize(fvp.size());
@@ -305,6 +307,7 @@ int main()
     {
         std::vector<scalar> cur;
         dAlpha.copyTo(cur);
+        failures += brae::gatecheck::nonFinite("cur", cur);
         dAlphaOld.copyFrom(cur);
         std::vector<scalar> cx2, cy2, cz2;
         dUx.copyTo(cx2); dUy.copyTo(cy2); dUz.copyTo(cz2);
@@ -322,11 +325,17 @@ int main()
 
     std::vector<scalar> alpha, rhoV, prgh, pV, ux, rhoPhi;
     dAlpha.copyTo(alpha);
+    failures += brae::gatecheck::nonFinite("alpha", alpha);
     dRho.copyTo(rhoV);
+    failures += brae::gatecheck::nonFinite("rhoV", rhoV);
     dPrgh.copyTo(prgh);
+    failures += brae::gatecheck::nonFinite("prgh", prgh);
     dP.copyTo(pV);
+    failures += brae::gatecheck::nonFinite("pV", pV);
     dUx.copyTo(ux);
+    failures += brae::gatecheck::nonFinite("ux", ux);
     dRhoPhiI.copyTo(rhoPhi);
+    failures += brae::gatecheck::nonFinite("rhoPhi", rhoPhi);
 
     // ---- 1. the step ran, and moved everything ---------------------------------------------------
     {

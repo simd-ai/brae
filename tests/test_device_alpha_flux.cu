@@ -9,6 +9,7 @@
 // phic, the mass flux and the plain face flux are per-face arithmetic and are held tightly; the only
 // slack anywhere here is the fused multiply-add the two compilers choose differently.
 #include "box_mesh.cuh"
+#include "device_gate_finite.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "fv_patch_field.cuh"
@@ -20,6 +21,7 @@
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cuda_runtime.h>
 #include <memory>
@@ -115,7 +117,9 @@ int main()
         cudaDeviceSynchronize();
         std::vector<scalar> pi_, pb;
         dPhicInt.copyTo(pi_);
+        failures += brae::gatecheck::nonFinite("pi_", pi_);
         dPhicBnd.copyTo(pb);
+        failures += brae::gatecheck::nonFinite("pb", pb);
 
         scalar ref = 0;
         const scalar w = worstOf(pi_, hPhic.internal, ref);
@@ -149,6 +153,7 @@ int main()
         {   // `linear` weights are the mesh's own, copied so the flux kernel takes one uniform argument
             std::vector<scalar> hw;
             dm.w.copyTo(hw);
+            failures += brae::gatecheck::nonFinite("hw", hw);
             wLin.copyFrom(hw);
         }
         deviceLimitedFaceWeights(dm, dPhi, dA1, gx, gy, gz, scalar(-1.0) /*kVanLeerTwoByk*/, wVL);
@@ -163,7 +168,9 @@ int main()
 
         std::vector<scalar> hAdv, hComp;
         adv.copyTo(hAdv);
+        failures += brae::gatecheck::nonFinite("hAdv", hAdv);
         comp.copyTo(hComp);
+        failures += brae::gatecheck::nonFinite("hComp", hComp);
         std::vector<scalar> dUn(static_cast<std::size_t>(nIf));
         for (label f = 0; f < nIf; ++f) dUn[f] = hAdv[f] + hComp[f];
 
@@ -194,11 +201,29 @@ int main()
         cudaDeviceSynchronize();
         std::vector<scalar> r;
         dRhoPhi.copyTo(r);
+        failures += brae::gatecheck::nonFinite("r", r);
 
         scalar ref = 0;
         const scalar w = worstOf(r, hRhoPhi.internal, ref);
         std::printf("  rhoPhi: worst %.3e of %.3e\n", (double)w, (double)ref);
         check("rhoPhi matches the host", w < scalar(1e-14) * ref);
+    }
+
+    // ---- THE FAIL-PROOF FOR THE FINITENESS GUARD ITSELF -------------------------------------------
+    // 124 of these guards now sit ahead of the fmax accumulators across the device gates, and a guard
+    // that never fires is decoration. This one hands it a NaN on purpose. The "!!" line it prints is
+    // the guard working, not a failure -- the count is checked here and NOT added to `failures`.
+    {
+        const std::vector<scalar> poisoned{scalar(1), std::numeric_limits<scalar>::quiet_NaN(),
+                                           scalar(3)};
+        const int bad = brae::gatecheck::nonFinite("deliberate NaN (self-test)", poisoned);
+        check("the finiteness guard reports a NaN", bad == 1);
+        // ...and this is what it protects against: fmax DROPS the NaN difference silently.
+        scalar worst = 0;
+        for (scalar v : poisoned) worst = std::fmax(worst, std::fabs(v - scalar(1)));
+        std::printf("  fmax over a difference containing a NaN gives %.4e -- the NaN is gone\n",
+                    (double)worst);
+        check("...which is why it must run BEFORE the accumulator: fmax hides it", worst == scalar(2));
     }
 
     std::printf("test_device_alpha_flux: %d failures\n", failures);

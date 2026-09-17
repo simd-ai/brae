@@ -14,6 +14,7 @@
 // the same field to about the pre-solve tolerance, not to round-off. The synthetic gate measured that
 // at 6.9e-11 over six steps; this one says what it is on the real mesh.
 #include "primitive_mesh.cuh"
+#include "device_gate_finite.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "fv_patch_field.cuh"
@@ -263,6 +264,7 @@ int main(int argc, char** argv)
     {
         std::vector<scalar> cur;
         dA.copyTo(cur);
+        failures += brae::gatecheck::nonFinite("cur", cur);
         dAOld.copyFrom(cur);
         deviceInterAlphaStep(dm, dA, dAOld, dt, din, dmc, dctl, props, hooks,
                              dABnd, dNHatfB, dFixes, dFlag, dNHatf, dK, rpI, rpB, a2, rho, mu, nu);
@@ -272,7 +274,9 @@ int main(int argc, char** argv)
 
     std::vector<scalar> devAlpha, devRhoPhi;
     dA.copyTo(devAlpha);
+    failures += brae::gatecheck::nonFinite("devAlpha", devAlpha);
     rpI.copyTo(devRhoPhi);
+    failures += brae::gatecheck::nonFinite("devRhoPhi", devRhoPhi);
 
     // ---- the comparison ---------------------------------------------------------------------------
     {
@@ -579,12 +583,17 @@ int main(int argc, char** argv)
             // The HOST's momentum matrix from the same post-alpha state, so rAU and HbyA compare.
             std::vector<scalar> devRho, rpi_host_int;
             rr.copyTo(devRho);
+            failures += brae::gatecheck::nonFinite("devRho", devRho);
             rpi.copyTo(rpi_host_int);
+            failures += brae::gatecheck::nonFinite("rpi_host_int", rpi_host_int);
 
             std::vector<scalar> dRAU, dHx, dDiag;
             taps.rAU.copyTo(dRAU);
+            failures += brae::gatecheck::nonFinite("dRAU", dRAU);
             taps.HbyA[0].copyTo(dHx);
+            failures += brae::gatecheck::nonFinite("dHx", dHx);
             taps.UEqnDiag.copyTo(dDiag);
+            failures += brae::gatecheck::nonFinite("dDiag", dDiag);
 
             scalar mnR = dRAU.empty() ? 0 : dRAU[0], mxR = mnR;
             for (scalar v : dRAU) { mnR = std::fmin(mnR, v); mxR = std::fmax(mxR, v); }
@@ -615,7 +624,9 @@ int main(int argc, char** argv)
             {
                 std::vector<scalar> devRhoPhiB, devAlphaNow;
                 rpb.copyTo(devRhoPhiB);
+                failures += brae::gatecheck::nonFinite("devRhoPhiB", devRhoPhiB);
                 a1.copyTo(devAlphaNow);
+                failures += brae::gatecheck::nonFinite("devAlphaNow", devAlphaNow);
 
                 std::vector<std::vector<scalar>> rpBndH(fvp.size()), rhoBndH(fvp.size()),
                                                  nuBndH(fvp.size());
@@ -694,6 +705,7 @@ int main(int argc, char** argv)
                 {
                     std::vector<scalar> dRhoOld;
                     taps.ddtRhoOld.copyTo(dRhoOld);
+                    failures += brae::gatecheck::nonFinite("dRhoOld", dRhoOld);
                     scalar wRo = 0, sRo = 0;
                     label iw2 = -1;
                     for (label c = 0; c < nC; ++c)
@@ -712,6 +724,7 @@ int main(int argc, char** argv)
 
                 std::vector<scalar> dSrc;
                 taps.UEqnSourceX.copyTo(dSrc);
+                failures += brae::gatecheck::nonFinite("dSrc", dSrc);
                 scalar wS = 0, sS = 0;
                 for (label c = 0; c < nC; ++c)
                 {
@@ -761,6 +774,7 @@ int main(int argc, char** argv)
                     cudaDeviceSynchronize();
                     std::vector<scalar> s0;
                     t0.UEqnSourceX.copyTo(s0);
+                    failures += brae::gatecheck::nonFinite("s0", s0);
                     scalar w0 = 0, x0s = 0;
                     for (label c = 0; c < nC; ++c)
                     {
@@ -783,6 +797,7 @@ int main(int argc, char** argv)
                     }
                     std::vector<scalar> dFull;
                     taps.UEqnSourceX.copyTo(dFull);
+                    failures += brae::gatecheck::nonFinite("dFull", dFull);
                     scalar wIn = 0, sIn = 0, wBd = 0, sBd = 0;
                     int nIn = 0, nBd = 0;
                     for (label c = 0; c < nC; ++c)
@@ -845,6 +860,7 @@ int main(int argc, char** argv)
                     cudaDeviceSynchronize();
                     std::vector<scalar> s2;
                     t2.UEqnSourceX.copyTo(s2);
+                    failures += brae::gatecheck::nonFinite("s2", s2);
                     scalar w2 = 0, x2s = 0;
                     for (label c = 0; c < nC; ++c)
                     {
@@ -883,6 +899,7 @@ int main(int argc, char** argv)
                     cudaDeviceSynchronize();
                     std::vector<scalar> s1;
                     t1.UEqnSourceX.copyTo(s1);
+                    failures += brae::gatecheck::nonFinite("s1", s1);
                     scalar w1 = 0, x1s = 0;
                     for (label c = 0; c < nC; ++c)
                     {
@@ -914,9 +931,13 @@ int main(int argc, char** argv)
                 {
                     std::vector<scalar> du, dl, dic, dbc;
                     taps.UEqnUpper.copyTo(du);
+                    failures += brae::gatecheck::nonFinite("du", du);
                     taps.UEqnLower.copyTo(dl);
+                    failures += brae::gatecheck::nonFinite("dl", dl);
                     taps.UEqnIC.copyTo(dic);
+                    failures += brae::gatecheck::nonFinite("dic", dic);
                     taps.UEqnBC.copyTo(dbc);
+                    failures += brae::gatecheck::nonFinite("dbc", dbc);
                     scalar wu2 = 0, su2 = 0, wl2 = 0, sl2 = 0;
                     for (label f = 0; f < nIf; ++f)
                     {
@@ -1038,6 +1059,7 @@ int main(int argc, char** argv)
 
                     std::vector<scalar> dPhiH;
                     taps.phiHbyAInt.copyTo(dPhiH);
+                    failures += brae::gatecheck::nonFinite("dPhiH", dPhiH);
                     scalar wP = 0, sP = 0;
                     for (label f = 0; f < nIf; ++f)
                     {
@@ -1048,6 +1070,7 @@ int main(int argc, char** argv)
                     // faces alone leaves the pressure equation's source half unmeasured.
                     std::vector<scalar> dPhiHB;
                     taps.phiHbyABnd.copyTo(dPhiHB);
+                    failures += brae::gatecheck::nonFinite("dPhiHB", dPhiHB);
                     scalar wPB = 0, sPB = 0;
                     label o8 = 0;
                     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
@@ -1068,6 +1091,7 @@ int main(int argc, char** argv)
                     {
                         std::vector<scalar> rAUfDev;
                         taps.rAUfAllTap.copyTo(rAUfDev);
+                        failures += brae::gatecheck::nonFinite("rAUfDev", rAUfDev);
                         SurfaceScalarField rfD;
                         rfD.internal.assign(rAUfDev.begin(), rAUfDev.begin() + nIf);
                         rfD.boundary.resize(fvp.size());
@@ -1110,6 +1134,7 @@ int main(int argc, char** argv)
                         pbicgstab(peH, pHost, m, fvp, scalar(1e-12), scalar(0), 4000);
                         std::vector<scalar> pDev;
                         taps.pSolved.copyTo(pDev);
+                        failures += brae::gatecheck::nonFinite("pDev", pDev);
                         scalar wSame = 0, sSame = 0;
                         for (label c = 0; c < nC; ++c)
                         {
@@ -1145,8 +1170,11 @@ int main(int argc, char** argv)
                     runInterFoam(caseDir, startDir, m, g, fvp, nWarm + 1, /*verbose=*/false, &r1);
                     std::vector<scalar> u1, p1, a1v;
                     ux.copyTo(u1);
+                    failures += brae::gatecheck::nonFinite("u1", u1);
                     pr.copyTo(p1);
+                    failures += brae::gatecheck::nonFinite("p1", p1);
                     a1.copyTo(a1v);
+                    failures += brae::gatecheck::nonFinite("a1v", a1v);
                     scalar wu1 = 0, su1 = 0, wp1 = 0, sp1 = 0, wa1 = 0;
                     for (label c = 0; c < nC; ++c)
                     {
@@ -1231,8 +1259,11 @@ int main(int argc, char** argv)
 
         std::vector<scalar> fa2, fux, fprgh;
         A2.copyTo(fa2);
+        failures += brae::gatecheck::nonFinite("fa2", fa2);
         Ux.copyTo(fux);
+        failures += brae::gatecheck::nonFinite("fux", fux);
         Prgh.copyTo(fprgh);
+        failures += brae::gatecheck::nonFinite("fprgh", fprgh);
 
         // FINITE FIRST, and this is not defensive noise. std::fmax(a, NaN) returns a -- it IGNORES the
         // NaN -- so every |device - host| accumulator below reads 0.000e+00 for a field that has gone

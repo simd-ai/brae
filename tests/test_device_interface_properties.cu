@@ -13,6 +13,7 @@
 // The per-face part has no reduction and IS asserted tightly: nHatf differs only by the fused
 // multiply-add the two compilers pick differently (see device_two_phase_mixture.cu for that story).
 #include "box_mesh.cuh"
+#include "device_gate_finite.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "fv_patch_field.cuh"
@@ -134,7 +135,9 @@ int main()
 
     std::vector<scalar> nInt, Kd;
     dNHatfInt.copyTo(nInt);
+    failures += brae::gatecheck::nonFinite("nInt", nInt);
     dK.copyTo(Kd);
+    failures += brae::gatecheck::nonFinite("Kd", Kd);
 
     // --- nHatf: per face, no reduction, so only the FMA choice separates them ---
     {

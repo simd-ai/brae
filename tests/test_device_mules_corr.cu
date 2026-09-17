@@ -31,6 +31,7 @@
 // tolerance because the guarantee does not exist; the boundedness that MULES exists for is asserted
 // exactly, as it must be.
 #include "box_mesh.cuh"
+#include "device_gate_finite.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "fv_patch_field.cuh"
@@ -173,6 +174,7 @@ int main()
         if (cudaDeviceSynchronize() != cudaSuccess)
         { std::printf("  FAIL: kernels did not complete\n"); return 1; }
         lamInt.copyTo(devLam);
+        failures += brae::gatecheck::nonFinite("devLam", devLam);
 
         int nDiff = 0;
         scalar worst = 0;
@@ -215,6 +217,7 @@ int main()
                                  dPhiBnd, dCorr, dCorrBnd, df, dc);
             deviceMulesCorrect(dm, rDeltaT, dCorr, dCorrBnd, df, dOut);
             dOut.copyTo(lim);
+            failures += brae::gatecheck::nonFinite("lim", lim);
         }
         {
             // the control: the same correction applied with no limiter at all
@@ -222,6 +225,7 @@ int main()
             DeviceBuffer<scalar> dOut(a.internal);
             deviceMulesCorrect(dm, rDeltaT, dCorr, dCorrBnd, df, dOut);
             dOut.copyTo(unlim);
+            failures += brae::gatecheck::nonFinite("unlim", unlim);
         }
         scalar wLim = 0, wUn = 0, moved = 0;
         for (label c = 0; c < nC; ++c)
@@ -255,6 +259,7 @@ int main()
                                    dPhiBnd, dCorr, dCorrBnd, df, dc, lamInt, lamBnd);
             std::vector<scalar> lb;
             lamBnd.copyTo(lb);
+            failures += brae::gatecheck::nonFinite("lb", lb);
             scalar inLam = 1, outLam = 1;
             label off = 0;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
@@ -303,6 +308,7 @@ int main()
         deviceMulesCorrect(dm, rDeltaT, zero, zeroB, df, dOut);
         std::vector<scalar> out;
         dOut.copyTo(out);
+        failures += brae::gatecheck::nonFinite("out", out);
 
         scalar dIn = 0, dOld = 0;
         for (label c = 0; c < nC; ++c)
@@ -345,6 +351,7 @@ int main()
                                    dPhiBnd, dCorr, dCorrBnd, df, dc, lamInt, lamBnd);
             std::vector<scalar> v;
             lamInt.copyTo(v);
+            failures += brae::gatecheck::nonFinite("v", v);
             return v;
         };
         const std::vector<scalar> q0 = lamWith(scalar(0));
@@ -370,6 +377,7 @@ int main()
                                    dPhiBnd, dCorr, dCorrBnd, df, dc, lamInt, lamBnd);
             std::vector<scalar> v;
             lamInt.copyTo(v);
+            failures += brae::gatecheck::nonFinite("v", v);
             return v;
         };
         const std::vector<scalar> r0 = lamOrdinary(scalar(0));

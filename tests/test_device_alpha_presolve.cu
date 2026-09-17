@@ -24,6 +24,7 @@
 //   case's own scheme. Arm 4 says so, and arm 0 measures that the fixture's flux really is
 //   divergence-free -- otherwise boundedness would mean nothing.
 #include "box_mesh.cuh"
+#include "device_gate_finite.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "fv_patch_field.cuh"

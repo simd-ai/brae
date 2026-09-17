@@ -18,6 +18,7 @@
 // system with different Krylov solvers, so they land on the same field to about the tolerance they
 // were given, and no tighter. The fixture asks for 1e-13.
 #include "box_mesh.cuh"
+#include "device_gate_finite.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "fv_patch_field.cuh"
@@ -252,6 +253,7 @@ int main()
     {
         std::vector<scalar> rf;
         rAUfInt.copyTo(rf);
+        failures += brae::gatecheck::nonFinite("rf", rf);
         SurfaceScalarField rAUfField;
         rAUfField.internal = rf;
         rAUfField.boundary.resize(fvp.size());
@@ -283,8 +285,11 @@ int main()
 
     std::vector<scalar> gPrgh, gUx, gP;
     dPrgh.copyTo(gPrgh);
+    failures += brae::gatecheck::nonFinite("gPrgh", gPrgh);
     ux.copyTo(gUx);
+    failures += brae::gatecheck::nonFinite("gUx", gUx);
     pOut.copyTo(gP);
+    failures += brae::gatecheck::nonFinite("gP", gP);
 
     // ---- 1. p_rgh, U and p against the host -------------------------------------------------------
     {

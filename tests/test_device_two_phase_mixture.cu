@@ -19,6 +19,7 @@
 // result for all three passes every smooth test and is wrong exactly where MULES leaves an overshoot,
 // which is exactly at an interface.
 #include "two_phase_mixture_cpp.cuh"
+#include "device_gate_finite.cuh"
 #include "device_two_phase_mixture.cuh"
 #include "device_buffer.cuh"
 #include <algorithm>
@@ -145,6 +146,7 @@ int main()
         { std::printf("  FAIL: rho-only launch did not complete\n"); return 1; }
         std::vector<scalar> h;
         only.copyTo(h);
+        failures += brae::gatecheck::nonFinite("h", h);
         // device against DEVICE: the two launches run the same instructions, so this one IS exact.
         bool same = true;
         for (int c = 0; c < n; ++c) same = same && (h[c] == rhoD[c]);

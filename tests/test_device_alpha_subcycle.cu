@@ -17,6 +17,7 @@
 // evaluation + deviceInterfaceCorrect), not a stub: a sub-cycle that only ever drove a toy step would
 // be testing the loop against arithmetic rather than against the solver it wraps.
 #include "box_mesh.cuh"
+#include "device_gate_finite.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "fv_patch_field.cuh"
@@ -165,6 +166,7 @@ int main()
 
         std::vector<scalar> start;
         alphaOld.copyTo(start);
+        failures += brae::gatecheck::nonFinite("start", start);
         work.internal = start;
         work.evaluateBoundary();
         alpha.copyFrom(start);
@@ -183,6 +185,7 @@ int main()
             // MULES::explicitSolve ends with correctBoundaryConditions, then mixture.correct()
             std::vector<scalar> cur;
             alpha.copyTo(cur);
+            failures += brae::gatecheck::nonFinite("cur", cur);
             work.internal = cur;
             work.evaluateBoundary();
             dABnd.copyFrom(flattenPatches(work));
@@ -216,11 +219,14 @@ int main()
         DeviceBuffer<scalar> alpha(a0), alphaOld(a0), rInt, rBnd;
         deviceAlphaEqnSubCycle(nSub, totalDt, alpha, alphaOld, rInt, rBnd, step);
         alpha.copyTo(ref);
+        failures += brae::gatecheck::nonFinite("ref", ref);
         rInt.copyTo(refRhoPhi);
+        failures += brae::gatecheck::nonFinite("refRhoPhi", refRhoPhi);
 
         // alphaOld must be untouched -- d
         std::vector<scalar> oldAfter;
         alphaOld.copyTo(oldAfter);
+        failures += brae::gatecheck::nonFinite("oldAfter", oldAfter);
         const scalar dOld = worstDiff(oldAfter, a0);
         scalar exc = 0, moved = 0;
         for (label c = 0; c < nC; ++c)
@@ -248,10 +254,12 @@ int main()
             step(carried, totalDt, alpha, rInt, rBnd);      // the FULL step, three times
             std::vector<scalar> cur;
             alpha.copyTo(cur);
+            failures += brae::gatecheck::nonFinite("cur", cur);
             carried.copyFrom(cur);
         }
         std::vector<scalar> wrong;
         alpha.copyTo(wrong);
+        failures += brae::gatecheck::nonFinite("wrong", wrong);
         const scalar d = worstDiff(wrong, ref);
         std::printf("  a: sub-steps at the full deltaT instead of deltaT/%d -> %.4e\n", nSub, (double)d);
         check("a: the sub-step deltaT is divided, and running the full one is a different field",
@@ -269,6 +277,7 @@ int main()
             step(alphaOld, dtSub, alpha, rInt, rBnd);       // always from a0
         std::vector<scalar> wrong;
         alpha.copyTo(wrong);
+        failures += brae::gatecheck::nonFinite("wrong", wrong);
         const scalar d = worstDiff(wrong, ref);
         std::printf("  b: every sub-step restarted from the time step's old alpha -> %.4e\n", (double)d);
         check("b: each sub-step continues from the last one, and restarting is a different field",
@@ -289,6 +298,7 @@ int main()
             step(carried, dtSub, alpha, rInt, rBnd);
             std::vector<scalar> cur;
             alpha.copyTo(cur);
+            failures += brae::gatecheck::nonFinite("cur", cur);
             carried.copyFrom(cur);
             rInt.copyTo(last);                              // keep only the LAST
         }
@@ -303,6 +313,7 @@ int main()
         // ...and the alpha field is IDENTICAL either way, which is exactly why c needs its own arm
         std::vector<scalar> alphaSame;
         alpha.copyTo(alphaSame);
+        failures += brae::gatecheck::nonFinite("alphaSame", alphaSame);
         std::printf("  ...while alpha is %.3e away, i.e. the same field -- c is invisible in alpha\n",
                     (double)worstDiff(alphaSame, ref));
         check("...and alpha cannot see c at all, so no boundedness or interface gate would catch it",
@@ -320,12 +331,14 @@ int main()
         deviceAlphaEqnSubCycle(1, totalDt, a1, old1, i1, b1, step);
         std::vector<scalar> one;
         a1.copyTo(one);
+        failures += brae::gatecheck::nonFinite("one", one);
 
         seed();
         DeviceBuffer<scalar> a2(a0), old2(a0), i2, b2;
         step(old2, totalDt, a2, i2, b2);
         std::vector<scalar> plain;
         a2.copyTo(plain);
+        failures += brae::gatecheck::nonFinite("plain", plain);
 
         const scalar d = worstDiff(one, plain);
         std::printf("  nAlphaSubCycles 1 vs one bare step: %.3e\n", (double)d);

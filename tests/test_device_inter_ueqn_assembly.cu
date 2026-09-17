@@ -22,6 +22,7 @@
 // same plane moved one cell, so the cells the interface crossed have rho_old = 1 against rho = 1000.
 // On a converged smooth field the two rho fields agree and the ddt arm would be vacuous.
 #include "box_mesh.cuh"
+#include "device_gate_finite.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "fv_patch_field.cuh"
@@ -213,7 +214,9 @@ int main()
     {
         std::vector<scalar> up, lo;
         M.upper.copyTo(up);
+        failures += brae::gatecheck::nonFinite("up", up);
         M.lower.copyTo(lo);
+        failures += brae::gatecheck::nonFinite("lo", lo);
         scalar su = 0, sl = 0;
         const scalar wu = relWorst(up, H.upper, su);
         const scalar wl = relWorst(lo, H.lower, sl);
@@ -228,8 +231,10 @@ int main()
     {
         std::vector<scalar> raw, rel;
         M.diag.copyTo(raw);
+        failures += brae::gatecheck::nonFinite("raw", raw);
         check("relax() ran, because the case NAMES a factor even though it is 1", M.relaxed);
         M.relaxedDiag.copyTo(rel);
+        failures += brae::gatecheck::nonFinite("rel", rel);
         scalar sr = 0;
         const scalar wr = relWorst(rel, H.diag, sr);
         std::printf("  diagonal after relax: worst %.3e of %.3e\n", (double)wr, (double)sr);
@@ -252,6 +257,7 @@ int main()
         {
             std::vector<scalar> src, want(static_cast<std::size_t>(nC));
             M.source[k].copyTo(src);
+            failures += brae::gatecheck::nonFinite("src", src);
             for (label c = 0; c < nC; ++c)
                 want[c] = (k == 0) ? H.source[c].x : (k == 1) ? H.source[c].y : H.source[c].z;
             scalar sc = 0;
@@ -267,7 +273,9 @@ int main()
         {
             std::vector<scalar> iC, bC, wantI, wantB;
             M.iC[k].copyTo(iC);
+            failures += brae::gatecheck::nonFinite("iC", iC);
             M.bC[k].copyTo(bC);
+            failures += brae::gatecheck::nonFinite("bC", bC);
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
@@ -298,7 +306,9 @@ int main()
         gpu::assembleUEqn(W, dm, dbU, dUx, dUy, dUz, wrong);
         std::vector<scalar> good, bad;
         M.source[0].copyTo(good);
+        failures += brae::gatecheck::nonFinite("good", good);
         W.source[0].copyTo(bad);
+        failures += brae::gatecheck::nonFinite("bad", bad);
         scalar ratio = 0;
         int nMoved = 0;
         for (label c = 0; c < nC; ++c)
@@ -379,6 +389,7 @@ int main()
         ifm::addMomentumPredictorSource(hostSolved, hff, m, g, fvp);
         std::vector<scalar> gx, want(static_cast<std::size_t>(nC));
         sx.copyTo(gx);
+        failures += brae::gatecheck::nonFinite("gx", gx);
         for (label c = 0; c < nC; ++c) want[c] = hostSolved.source[c].x;
         scalar sc0 = 0;
         const scalar w0 = relWorst(gx, want, sc0);
@@ -398,6 +409,7 @@ int main()
         deviceAddMomentumPredictorSource(dm, dNegI, dNegB, nx, ny, nz);
         std::vector<scalar> flippedSrc;
         nx.copyTo(flippedSrc);
+        failures += brae::gatecheck::nonFinite("flippedSrc", flippedSrc);
         scalar flipped = 0, forceMag = 0;
         for (label c = 0; c < nC; ++c)
         {

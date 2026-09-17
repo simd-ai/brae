@@ -15,6 +15,7 @@
 //   THE CELLS ARE 2:1:0.5. On a cube every face has the same area, so anything carrying a magSf
 //   factor is indistinguishable from the same thing without one.
 #include "box_mesh.cuh"
+#include "device_gate_finite.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "fv_patch_field.cuh"
@@ -108,6 +109,7 @@ int main()
         { std::printf("  FAIL: kernels did not complete\n"); return 1; }
         std::vector<scalar> got;
         dPhig.copyTo(got);
+        failures += brae::gatecheck::nonFinite("got", got);
         std::printf("  phig: worst |device - host| = %.3e\n", (double)worst(got, hostPhig));
         check("phig matches the host bit for bit", worst(got, hostPhig) == scalar(0));
 
@@ -137,6 +139,7 @@ int main()
         deviceRhoRAUf(dm, dRho, dRAU, dOut);
         std::vector<scalar> got;
         dOut.copyTo(got);
+        failures += brae::gatecheck::nonFinite("got", got);
         std::printf("  interpolate(rho*rAU): worst |device - host| = %.3e\n",
                     (double)worst(got, hostOut));
         check("the interpolated product matches the host bit for bit", worst(got, hostOut) == scalar(0));
@@ -199,8 +202,11 @@ int main()
         deviceCorrectVelocity(dm, dHx, dHy, dHz, dRAU, dFf, dRf, dFfB, dRfB, dUx, dUy, dUz);
         std::vector<scalar> ux, uy, uz;
         dUx.copyTo(ux);
+        failures += brae::gatecheck::nonFinite("ux", ux);
         dUy.copyTo(uy);
+        failures += brae::gatecheck::nonFinite("uy", uy);
         dUz.copyTo(uz);
+        failures += brae::gatecheck::nonFinite("uz", uz);
         scalar w3 = 0, scale = 0;
         for (label c = 0; c < nC; ++c)
         {
@@ -218,6 +224,7 @@ int main()
         deviceReconstruct(dm, dFf, dFfB, rx, ry, rz);
         std::vector<scalar> nx;
         rx.copyTo(nx);
+        failures += brae::gatecheck::nonFinite("nx", nx);
         scalar d = 0;
         for (label c = 0; c < nC; ++c) d = std::fmax(d, std::fabs((hx[c] + nx[c]) - ux[c]));
         std::printf("  ...against reconstruct(f) with no rAUf division and no rAU outside: %.3e\n",
@@ -294,7 +301,9 @@ int main()
         deviceDdtCorr(dm, dPhiOld, dPhiOldB, dUox, dUoy, dUoz, dFixes, scalar(-1), dt, dOutI, dOutB);
         std::vector<scalar> gi, gb;
         dOutI.copyTo(gi);
+        failures += brae::gatecheck::nonFinite("gi", gi);
         dOutB.copyTo(gb);
+        failures += brae::gatecheck::nonFinite("gb", gb);
 
         std::vector<scalar> hb;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
@@ -311,6 +320,7 @@ int main()
         deviceDdtCorr(dm, dPhiOld, dPhiOldB, dUox, dUoy, dUoz, dFixes, scalar(1), dt, cI, cB);
         std::vector<scalar> ci;
         cI.copyTo(ci);
+        failures += brae::gatecheck::nonFinite("ci", ci);
         scalar d = 0, scale = 0;
         for (label f = 0; f < nIf; ++f)
         {
@@ -347,6 +357,7 @@ int main()
         deviceStaticPressure(static_cast<int>(nC), dPrgh, dRho, dGh, dP);
         std::vector<scalar> got;
         dP.copyTo(got);
+        failures += brae::gatecheck::nonFinite("got", got);
         std::printf("  p = p_rgh + rho*gh: worst %.3e\n", (double)worst(got, hostP));
         check("the static pressure matches the host bit for bit", worst(got, hostP) == scalar(0));
     }
@@ -408,9 +419,13 @@ int main()
         deviceInterAssemblePEqn(dm, dRAUf, dPhiHI, dPhiHB, /*needReference=*/false, 0, scalar(0), P);
         std::vector<scalar> dd, du, dl, ds;
         P.diag.copyTo(dd);
+        failures += brae::gatecheck::nonFinite("dd", dd);
         P.upper.copyTo(du);
+        failures += brae::gatecheck::nonFinite("du", du);
         P.lower.copyTo(dl);
+        failures += brae::gatecheck::nonFinite("dl", dl);
         P.source.copyTo(ds);
+        failures += brae::gatecheck::nonFinite("ds", ds);
 
         auto rel = [&](const std::vector<scalar>& a, const std::vector<scalar>& b, scalar& sc)
         {
@@ -454,7 +469,9 @@ int main()
                                 /*pRefCell=*/3, /*pRefValue=*/scalar(7), R);
         std::vector<scalar> rd, rs;
         R.diag.copyTo(rd);
+        failures += brae::gatecheck::nonFinite("rd", rd);
         R.source.copyTo(rs);
+        failures += brae::gatecheck::nonFinite("rs", rs);
         std::printf("  setReference at cell 3: diag %.6g -> %.6g, source %.6g -> %.6g\n",
                     (double)dd[3], (double)rd[3], (double)ds[3], (double)rs[3]);
         check("setReference DOUBLES the diagonal entry", rd[3] == scalar(2)*dd[3]);
@@ -513,7 +530,9 @@ int main()
                                    dBaseI, dBaseB);
         std::vector<scalar> gotI, gotB;
         dBaseI.copyTo(gotI);
+        failures += brae::gatecheck::nonFinite("gotI", gotI);
         dBaseB.copyTo(gotB);
+        failures += brae::gatecheck::nonFinite("gotB", gotB);
         std::printf("  phiHbyA terms: internal %.3e, boundary %.3e\n",
                     (double)worst(gotI, wantInt), (double)worst(gotB, wantBnd));
         check("phiHbyA's two extra terms match the host, internal and boundary",
@@ -602,7 +621,9 @@ int main()
             deviceInterPEqnFlux(dm, P2, dIC, dBC, dP, fI, fB);
             std::vector<scalar> gI, gB, wB;
             fI.copyTo(gI);
+            failures += brae::gatecheck::nonFinite("gI", gI);
             fB.copyTo(gB);
+            failures += brae::gatecheck::nonFinite("gB", gB);
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                 for (scalar v : hostFlux.boundary[pi]) wB.push_back(v);
             scalar s1 = 0, s2 = 0;

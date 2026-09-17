@@ -21,6 +21,7 @@
 //   interface -- a version that put rho*g in the source instead would be uniformly non-zero and would
 //   still converge.
 #include "box_mesh.cuh"
+#include "device_gate_finite.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
@@ -100,8 +101,11 @@ int main()
     { std::printf("  FAIL: kernels did not complete\n"); return 1; }
     std::vector<scalar> hx, hy, hz;
     rx.copyTo(hx);
+    failures += brae::gatecheck::nonFinite("hx", hx);
     ry.copyTo(hy);
+    failures += brae::gatecheck::nonFinite("hy", hy);
     rz.copyTo(hz);
+    failures += brae::gatecheck::nonFinite("hz", hz);
 
     // 1a: THE IDENTITY
     {
@@ -143,8 +147,11 @@ int main()
         deviceReconstruct(dm, dI, dB, dx, dy, dz);
         std::vector<scalar> ox, oy, oz;
         dx.copyTo(ox);
+        failures += brae::gatecheck::nonFinite("ox", ox);
         dy.copyTo(oy);
+        failures += brae::gatecheck::nonFinite("oy", oy);
         dz.copyTo(oz);
+        failures += brae::gatecheck::nonFinite("oz", oz);
         scalar worst = 0, scale = 0;
         for (label c = 0; c < nC; ++c)
         {
@@ -220,9 +227,13 @@ int main()
         deviceInterEulerDdtRhoU(dm, dRho, dRhoOld, dUox, dUoy, dUoz, dt, dDiag, dSx, dSy, dSz);
         std::vector<scalar> gd, gx2, gy2, gz2;
         dDiag.copyTo(gd);
+        failures += brae::gatecheck::nonFinite("gd", gd);
         dSx.copyTo(gx2);
+        failures += brae::gatecheck::nonFinite("gx2", gx2);
         dSy.copyTo(gy2);
+        failures += brae::gatecheck::nonFinite("gy2", gy2);
         dSz.copyTo(gz2);
+        failures += brae::gatecheck::nonFinite("gz2", gz2);
 
         scalar wd = 0, ws = 0, sScale = 0;
         for (label c = 0; c < nC; ++c)
@@ -242,6 +253,7 @@ int main()
         deviceInterEulerDdtRhoU(dm, dRho, dRho, dUox, dUoy, dUoz, dt, cDiag, cSx, cSy, cSz);
         std::vector<scalar> cx;
         cSx.copyTo(cx);
+        failures += brae::gatecheck::nonFinite("cx", cx);
         scalar ratio = 0;
         for (label c = 0; c < nC; ++c)
             if (std::fabs(gx2[c]) > scalar(1e-30))
@@ -270,6 +282,7 @@ int main()
         deviceMomentumSourceFlux(static_cast<int>(nFaces), dStf, dGhf, dSnRho, dSnP, dMagSf, dOut);
         std::vector<scalar> got;
         dOut.copyTo(got);
+        failures += brae::gatecheck::nonFinite("got", got);
         scalar worst = 0, scale = 0;
         for (label f = 0; f < nFaces; ++f)
         {
@@ -297,8 +310,11 @@ int main()
         deviceReconstruct(dm, dzI, dzB, fx, fy, fz);
         std::vector<scalar> ax, ay, az;
         fx.copyTo(ax);
+        failures += brae::gatecheck::nonFinite("ax", ax);
         fy.copyTo(ay);
+        failures += brae::gatecheck::nonFinite("ay", ay);
         fz.copyTo(az);
+        failures += brae::gatecheck::nonFinite("az", az);
         scalar bulk = 0, atInterface = 0;
         for (label c = 0; c < nC; ++c)
         {
@@ -341,8 +357,11 @@ int main()
         deviceInterMuEff(dm, dRho, dNu, dRhoB, dNuB, mc, mf, mb);
         std::vector<scalar> gotC, gotF, gotB;
         mc.copyTo(gotC);
+        failures += brae::gatecheck::nonFinite("gotC", gotC);
         mf.copyTo(gotF);
+        failures += brae::gatecheck::nonFinite("gotF", gotF);
         mb.copyTo(gotB);
+        failures += brae::gatecheck::nonFinite("gotB", gotB);
 
         scalar wC = 0;
         for (label c = 0; c < nC; ++c) wC = std::fmax(wC, std::fabs(gotC[c] - hostMu[c]));

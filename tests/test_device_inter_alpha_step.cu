@@ -18,6 +18,7 @@
 // that reaches 3.4346e-09 in alpha on damBreak against real OpenFOAM -- so agreement here is agreement
 // with OpenFOAM two links along, and the links are each measured.
 #include "box_mesh.cuh"
+#include "device_gate_finite.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "fv_patch_field.cuh"
@@ -211,6 +212,7 @@ int main()
         {
             std::vector<scalar> cur;
             alpha.copyTo(cur);
+            failures += brae::gatecheck::nonFinite("cur", cur);
             alphaOld.copyFrom(cur);
             deviceInterAlphaStep(dm, alpha, alphaOld, totalDt, din, dmc, ctl, props, hooks,
                                  aBnd, nBnd, dFixes, dFlag, nHatf, K, rpInt, rpBnd,

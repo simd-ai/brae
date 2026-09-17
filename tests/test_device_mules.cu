@@ -16,6 +16,7 @@
 // The host side is gated on boundedness against an unlimited control in tests/test_mules_cpp.cu, so
 // agreement here is agreement with a limiter that has already been shown to limit.
 #include "box_mesh.cuh"
+#include "device_gate_finite.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "fv_patch_field.cuh"
@@ -167,7 +168,9 @@ int main()
 
     std::vector<scalar> bd, lam;
     dBDInt.copyTo(bd);
+    failures += brae::gatecheck::nonFinite("bd", bd);
     dLamInt.copyTo(lam);
+    failures += brae::gatecheck::nonFinite("lam", lam);
 
     // --- the donor flux is per face, no reduction: it IS bit-identical ---
     {
