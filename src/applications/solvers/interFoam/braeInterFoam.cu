@@ -22,6 +22,14 @@
 // `phi` entry NAMES -- phi or rhoPhi; on `-device` a VELOCITY condition naming rhoPhi is refused,
 // because that one switch runs on the device and reads phi.
 //
+// AND p_rgh's LINEAR SOLVER AS THE CASE NAMES IT, host and `-device`: PCG with DIC, or GAMG --
+// OpenFOAM's own faceAreaPair hierarchy, smoother and V-cycle (src/matrices/lduMatrix/solvers/GAMG),
+// which eight of the nine wave tutorials name for p_rghFinal. Every GAMG control whose branch is not
+// ported is refused by name: mergeLevels above 1, another agglomerator, updateInterval,
+// cacheAgglomeration no, interpolateCorrection, directSolveCoarsest, a coarsestLevelCorr dictionary,
+// a processorAgglomerator, and any smoother but DIC, DICGaussSeidel, GaussSeidel and symGaussSeidel
+// -- on `-device`, any smoother but DIC. Any OTHER solver for p_rgh still substitutes, under a notice.
+//
 // WHAT IT WILL NOT RUN. Every refusal the components carry is in force: LES and every RASModel but
 // kEpsilon, `vanLeerV` or `limitedLinear` on div(rhoPhi,U),
 // `interfaceCompression` on div(phirb,alpha), any ddtSchemes default but Euler, a `corrected` or

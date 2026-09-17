@@ -355,6 +355,9 @@ void deviceInterStep(
         pi.solve = finalCorr ? ctl.pressureFinal : ctl.pressure;
         pi.pcgDIC = finalCorr ? ctl.pressureFinalPcgDIC : ctl.pressurePcgDIC;
         pi.dic = ctl.dic;
+        pi.gamg = finalCorr ? ctl.pressureFinalGamg : ctl.pressureGamg;
+        pi.gamgCache = ctl.gamgCache;
+        pi.gamgLog = ctl.gamgLog;
         pi.solveLog = ctl.pressureSolveLog;
 
         DevicePressureTaps pt;

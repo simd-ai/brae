@@ -95,7 +95,8 @@ arm()
     echo "$out" | grep -q "^End: t" && got=runs
     local ok=1
     [ "$got" = "$expect" ] || ok=0
-    if [ "$expect" = refused ] && [ "$needle" != "-" ]; then
+    # a needle on a `runs` arm is a NOTICE the run must carry: a declared substitution, not a silent one
+    if [ "$needle" != "-" ]; then
         echo "$out" | grep -qF -- "$needle" || ok=0
     fi
     if [ $ok = 1 ]; then
@@ -204,6 +205,26 @@ arm waves_noRampTime        refused "rampTime"                "" "sed -i '/rampT
 arm waves_noActiveAbsorption refused "activeAbsorption"       "" "sed -i '/activeAbsorption/d' constant/waveProperties"
 arm waves_restart           refused "this is a restart"       "" "mkdir -p 0/uniform; printf '%s\nwaterDepthRef 0.6;\n' '$HDR' > 0/uniform/waveProperties.inlet"
 arm waves_otherWaveDict     refused "waveDict"                "" "sed -i '0,/type  *waveVelocity;/s//type            waveVelocity;\n        waveDict        otherWaves;/' 0/U"
+
+# p_rghFinal NAMES GAMG in this tutorial as shipped, and waves_baseline above ran it. What else the
+# entry may say: every control whose branch of GAMGSolver or GAMGAgglomeration is not ported is
+# refused by name, because each one moves where the solve stops and none moves a converged field.
+GE="sed -i '/p_rghFinal/,/}/ s/smoother  *DIC;/smoother        DIC;\\n        "
+arm gamg_GaussSeidel        runs    -                        "" "sed -i '/p_rghFinal/,/}/ s/smoother  *DIC;/smoother        GaussSeidel;/' system/fvSolution"
+arm gamg_DICGaussSeidel     runs    -                        "" "sed -i '/p_rghFinal/,/}/ s/smoother  *DIC;/smoother        DICGaussSeidel;/' system/fvSolution"
+arm gamg_smootherDILU       refused "smoother DILU"           "" "sed -i '/p_rghFinal/,/}/ s/smoother  *DIC;/smoother        DILU;/' system/fvSolution"
+arm gamg_noSmoother         refused "names no \`smoother\`"   "" "sed -i '/p_rghFinal/,/}/ {/smoother/d}' system/fvSolution"
+arm gamg_sweeps             runs    -                        "" "${GE}nPreSweeps 2; nFinestSweeps 3;/' system/fvSolution"
+arm gamg_mergeLevels1       runs    -                        "" "${GE}mergeLevels 1; agglomerator faceAreaPair; cacheAgglomeration on;/' system/fvSolution"
+arm gamg_mergeLevels2       refused "mergeLevels 2"           "" "${GE}mergeLevels 2;/' system/fvSolution"
+arm gamg_agglomerator       refused "agglomerator algebraicPair" "" "${GE}agglomerator algebraicPair;/' system/fvSolution"
+arm gamg_updateInterval     refused "updateInterval"          "" "${GE}updateInterval 5;/' system/fvSolution"
+arm gamg_noCache            refused "cacheAgglomeration no"   "" "${GE}cacheAgglomeration no;/' system/fvSolution"
+arm gamg_interpolate        refused "interpolateCorrection yes" "" "${GE}interpolateCorrection yes;/' system/fvSolution"
+arm gamg_directCoarsest     refused "directSolveCoarsest yes" "" "${GE}directSolveCoarsest yes;/' system/fvSolution"
+arm gamg_coarsestLevelCorr  refused "coarsestLevelCorr"       "" "${GE}coarsestLevelCorr { solver PCG; preconditioner DIC; tolerance 1e-3; relTol 0; }/' system/fvSolution"
+arm gamg_procAgglomerator   refused "processorAgglomerator"   "" "${GE}processorAgglomerator masterCoarsest;/' system/fvSolution"
+arm gamg_notASwitch         refused "is not a Switch"         "" "${GE}scaleCorrection maybe;/' system/fvSolution"
 BASE="$B"
 
 # PIMPLE controls the HOST honours...
@@ -219,7 +240,18 @@ if [ $HAVE_GPU = 1 ]; then
     # the device loop carries the kEpsilon closure now, in both lineages
     # the device loop drives the wave conditions through its alpha and velocity hooks
     BASE="$BW"
+    # ...WITH THE TUTORIAL'S OWN GAMG for p_rghFinal, and so under no notice about the p_rgh solve: a
+    # `runs` arm cannot say "and did not substitute", so that is checked on the output directly
     arm device_waves        runs    -                        "-device" true
+    if "$BIN" -case "$W/device_waves" -device 2>&1 | grep -q "approximated.*p_rgh"; then
+        echo "  FAIL: device_waves                       ran GAMG's entry under a p_rgh substitution notice"
+        fails=$((fails+1))
+    else
+        echo "  ok:   device_waves                       no p_rgh substitution notice"
+    fi
+    # the device's GAMG has the DIC smoother; the host's other three are refused there, and run here
+    arm device_gamg_GaussSeidel refused "DIC smoother only"   "-device" "sed -i '/p_rghFinal/,/}/ s/smoother  *DIC;/smoother        GaussSeidel;/' system/fvSolution"
+    arm device_gamg_sweeps  runs    -                        "-device" "${GE}nPreSweeps 2; nFinestSweeps 3;/' system/fvSolution"
     # a p_rgh or alpha condition that names rhoPhi is evaluated on the host and handed rhoPhi; U's
     # pressureInletOutletVelocity switch runs ON the device and reads phi, so there the name is refused
     BASE="$B"

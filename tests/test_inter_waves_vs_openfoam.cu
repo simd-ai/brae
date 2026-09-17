@@ -291,9 +291,14 @@ int main(
     // 7.7e-12 and U 6.3e-10 -- and p_rgh's is alpha's times rho*g*h, the weight of the water column
     // the alpha difference stands for. Bounds at about 30x, 4x for U on `shipped`. With
     // constrainPressure taking phi_b for Sf & U_b the same arms read alpha 3.0e-03 and U 260%.
-    const scalar alphaBound = tight ? scalar(3e-10) : scalar(5e-9);
-    const scalar pBound = tight ? scalar(3e-10) : scalar(2e-8);
-    const scalar uBound = tight ? scalar(2e-8) : scalar(5e-7);
+    //
+    // THOSE WERE MEASURED WITH PCG STAGED IN GAMG's PLACE. With p_rghFinal run as the tutorials name
+    // it -- GAMG, on both loops -- the worst of the fourteen profiles reads alpha 2.9e-11, p_rgh
+    // 5.2e-11 and U 9.3e-09 (`shipped`, on the device; 1.9e-09 elsewhere), so the bounds came down
+    // from 5e-9, 2e-8 and 5e-7. `tight` is unchanged at 7.8e-12, 7.8e-12 and 5.7e-10.
+    const scalar alphaBound = tight ? scalar(3e-10) : scalar(1e-9);
+    const scalar pBound = tight ? scalar(3e-10) : scalar(2e-9);
+    const scalar uBound = tight ? scalar(2e-8) : scalar(2e-7);
 
     // THE PATCH VALUES the two conditions last assigned -- the wave model's output, face by face
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
@@ -337,13 +342,16 @@ int main(
     // Every iteration count is asserted on every profile. The initial RESIDUALS are asserted at the
     // case's own tolerances only: under `tight` the second corrector starts from a residual of 1e-11,
     // where two correct solves differ in the fourth digit (measured 1.5e-04 relative) and mean nothing.
-    // MEASURED over the run: at most 5.5e-08 on eleven of the thirteen profiles, bound 1e-5. The two
-    // 3-D solitary cases read 4.6e-06 and 4.2e-05, every bit of it on the SECOND corrector, which
-    // starts from the 1.8e-07 the first one's one-iteration solve left behind -- 1e-12 of absolute
-    // difference is 5e-06 of that -- while their first correctors agree to 1e-08 and all 60 iteration
-    // counts are OpenFOAM's. Those two are bounded at 1e-3.
-    const bool solitary3D = (profile == "solitaryGrimshaw" || profile == "solitaryMcCowan");
-    const scalar runBound = tight ? scalar(1e300) : (solitary3D ? scalar(1e-3) : scalar(1e-5));
+    // MEASURED over the run WITH PCG STAGED FOR p_rghFinal: at most 5.5e-08 on eleven of the thirteen
+    // profiles, bound 1e-5. The two 3-D solitary cases read 4.6e-06 and 4.2e-05, every bit of it on the
+    // SECOND corrector, which starts from the 1.8e-07 the first one's one-iteration solve left behind
+    // -- 1e-12 of absolute difference is 5e-06 of that -- while their first correctors agree to 1e-08
+    // and all 60 iteration counts are OpenFOAM's. Those two were bounded at 1e-3.
+    //
+    // THAT EXCEPTION IS GONE. It belonged to the PCG staged in GAMG's place: run as the tutorials name
+    // it, the two 3-D cases read 1.7e-09 and 6.4e-09 over the run and the worst of all thirteen
+    // untightened profiles is 6.4e-09, host and device, so one bound holds them all and it is 1e-6.
+    const scalar runBound = tight ? scalar(1e300) : scalar(1e-6);
     const std::vector<LinearSolveRecord> ofP = brae::gatecheck::readOfPressureSolves(logPath);
     failures += brae::gatecheck::compareSolves("host", r.pSolves, ofP, nSteps, "p_rgh", scalar(1e-10),
                                                runBound);

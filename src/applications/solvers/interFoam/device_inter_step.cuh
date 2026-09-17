@@ -125,6 +125,11 @@ struct DeviceInterStepControls
     bool pressurePcgDIC = false;
     bool pressureFinalPcgDIC = false;
     DeviceDilu* dic = nullptr;
+    // ...or `solver GAMG;`, each entry with its own controls, and the mesh's hierarchy both share
+    const GamgControls* pressureGamg = nullptr;
+    const GamgControls* pressureFinalGamg = nullptr;
+    DeviceGamgCache* gamgCache = nullptr;
+    GamgSolveLog* gamgLog = nullptr;
     // every p_rgh solve's own report, appended in order; null = not kept
     std::vector<DeviceSolverPerf>* pressureSolveLog = nullptr;
     // ...and the momentum predictor's: an array of THREE logs, [0] Ux, [1] Uy, [2] Uz; null = not kept

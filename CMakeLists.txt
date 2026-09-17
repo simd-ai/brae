@@ -96,6 +96,8 @@ add_library(brae_core STATIC
     src/OpenFOAM/matrices/gamg.cu
     src/OpenFOAM/matrices/pbicgstab.cu
     src/OpenFOAM/matrices/smooth_solver_cpp.cu
+    src/matrices/lduMatrix/solvers/GAMG/GAMGAgglomerations/pair_gamg_agglomeration_cpp.cu
+    src/matrices/lduMatrix/solvers/GAMG/gamg_solver_cpp.cu
     src/matrices/lduMatrix/lduMatrix/blas1.cu
     src/matrices/lduMatrix/lduMatrix/reductions.cu
     src/matrices/lduMatrix/lduMatrix/device_spmv.cu
@@ -218,6 +220,7 @@ add_library(brae_core STATIC
     src/matrices/lduMatrix/smoothers/GaussSeidel/device_colour_gauss_seidel.cu
     src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_vcycle.cu
     src/matrices/lduMatrix/solvers/PCG/device_amg_pcg.cu
+    src/matrices/lduMatrix/solvers/GAMG/device_gamg_solver.cu
     src/cuda/device_cluster.cu
     src/cuda/device_cyclic.cu
     src/cuda/device_ami.cu
@@ -3383,6 +3386,16 @@ target_include_directories(test_inter_waves_vs_openfoam PRIVATE ${BRAE_HEADER_DI
 target_link_libraries(test_inter_waves_vs_openfoam PRIVATE brae_core)
 add_test(NAME interfoam_waves_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_waves_vs_openfoam.sh)
+
+# ...and the SOLVER those tutorials name for p_rghFinal, GAMG, as shipped: OpenFOAM's hierarchy level
+# by level, the coarsest-level solve of every V-cycle and every p_rgh line, from its log under its own
+# debug switches; the control is OpenFOAM's own answer with PCG in GAMG's place.
+add_executable(test_inter_gamg_vs_openfoam tests/test_inter_gamg_vs_openfoam.cu)
+target_include_directories(test_inter_gamg_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_gamg_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_gamg_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_gamg_vs_openfoam.sh)
 
 # ...and capillaryRise, where surface tension IS the answer rather than a correction, and which is the
 # ONLY shipped interFoam tutorial with a contact angle. damBreak would still look broadly right with

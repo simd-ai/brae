@@ -44,6 +44,9 @@ RunReport runInterFoam(
 
     SurfaceScalarField prevCorr;                 // alphaApplyPrevCorr's cache
     RunReport rep;
+    // the mesh's GAMG hierarchy, built by the first p_rgh solve that names GAMG and kept for the run
+    GamgAgglomerationCache gamgCache;
+    GamgSolveLog gamgLog;
     rep.deltaT = f.deltaT;
 
     for (label step = 0; step < nSteps; ++step)
@@ -366,6 +369,17 @@ RunReport runInterFoam(
                     psc.relTolPFinal = ptol ? scalar(0) : f.pSolveFinal.relTol;
                     psc.maxIterPFinal = f.pSolveFinal.maxIter;
                     psc.pcgDICFinal = f.pSolveFinal.pcgDIC();
+                    // GAMG where the entry names it, at the same stopping point as the lines above
+                    GamgControls gamgP = f.pSolve.gamg;
+                    gamgP.tolerance = psc.tolP;
+                    gamgP.relTol = psc.relTolP;
+                    GamgControls gamgPFinal = f.pSolveFinal.gamg;
+                    gamgPFinal.tolerance = psc.tolPFinal;
+                    gamgPFinal.relTol = psc.relTolPFinal;
+                    psc.gamg = f.pSolve.gamgSolver() ? &gamgP : nullptr;
+                    psc.gamgFinal = f.pSolveFinal.gamgSolver() ? &gamgPFinal : nullptr;
+                    psc.gamgCache = &gamgCache;
+                    pin.gamgLog = &gamgLog;
                     for (label c = 0; c < lc.nCorrectors; ++c)
                     {
                         psc.finalCorrector = (c == lc.nCorrectors - 1);
@@ -446,6 +460,23 @@ RunReport runInterFoam(
     {
         const std::vector<scalar> d = fvc::div(f.phi, m, g, patches);
         for (scalar v : d) rep.worstDivPhi = std::fmax(rep.worstDivPhi, std::fabs(v));
+    }
+    if (gamgCache.built)
+    {
+        const GamgAgglomeration& a = gamgCache.agglomeration;
+        for (label leveli = 0; leveli <= a.size(); ++leveli)
+        {
+            const GamgLduAddressing& addr = a.meshLevel(leveli);
+            RunReport::GamgLevel lv;
+            lv.nCells = addr.nCells;
+            lv.nFaces = static_cast<label>(addr.upperAddr.size());
+            lv.profile = gamgLduBand(addr).second;
+            rep.gamgLevels.push_back(lv);
+        }
+        for (const SolverPerformance& sp : gamgLog.coarsest)
+        {
+            rep.gamgCoarsestSolves.push_back(LinearSolveRecord{sp.initialResidual, sp.finalResidual, sp.nIterations});
+        }
     }
     if (fieldsOut) *fieldsOut = std::move(f);
     return rep;

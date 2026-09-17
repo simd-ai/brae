@@ -64,6 +64,7 @@
 #include "fvc.cuh"
 #include "ldu_matrix.cuh"
 #include "inter_solve_record.cuh"
+#include "gamg_solver_cpp.cuh"
 #include <stdexcept>
 #include <vector>
 
@@ -184,6 +185,13 @@ struct PressureSolveControls
     scalar relTolPFinal = 0;
     int maxIterPFinal = 1000;
     bool pcgDICFinal = false;
+    // `solver GAMG;` -> brae::gamgSolve with that entry's controls; null on an entry that names
+    // another solver. The hierarchy is the MESH's, built on the first GAMG solve from whichever
+    // entry ran it and shared by both from then on (GAMGAgglomeration::New looks it up on the mesh
+    // before it reads a dictionary), so the caller owns it across steps.
+    const GamgControls* gamg = nullptr;
+    const GamgControls* gamgFinal = nullptr;
+    GamgAgglomerationCache* gamgCache = nullptr;
     // pimpleControl::finalInnerIter() (pimpleControlI.H:98-111): corrPISO == nCorrPISO. The caller
     // knows which pass this is; pressureCorrector owns the non-orthogonal half of the test.
     bool finalCorrector = true;
@@ -258,6 +266,8 @@ struct PressureStepInput
     PressureTaps* taps = nullptr;
     // appended to, one record per solve; null = not kept
     std::vector<PressureSolveRecord>* solveLog = nullptr;
+    // the coarsest-level solve of every GAMG V-cycle, in order; null = not kept
+    GamgSolveLog* gamgLog = nullptr;
 };
 
 // U.correctBoundaryConditions() FOR THE FLUX-CONDITIONAL VELOCITY PATCHES, which evaluateBoundary()

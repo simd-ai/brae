@@ -44,16 +44,18 @@
 #             PBiCG for U; the staging names smoothSolver with symGaussSeidel, which both codes run.
 #             It is here for what it found -- see below.
 #
-# ONE THING IS CHANGED IN EVERY PROFILE AND IT IS NOT THE WAVES: the tutorial solves p_rghFinal with
-# GAMG, which brae's interFoam does not have (it substitutes under a notice), so the staging names PCG
-# with DIC there. The gate is about the boundary conditions; a solver-log arm across two different
-# solvers would be about the solver. `brae_interFoam` on the tutorial as shipped runs under that notice.
+# THE PRESSURE SOLVER IS THE TUTORIAL'S OWN, which for eight of the nine is GAMG on the last corrector.
+# IT WAS NOT, until brae had OpenFOAM's GAMG on both loops (tests/interfoam_gamg_vs_openfoam.sh): every
+# profile here used to be staged with PCG and DIC in its place, because a solver-log arm across two
+# different solvers would have been about the solver. With that staging gone the worst profile reads
+# alpha 2.9e-11 where it read 1.6e-10, the two 3-D solitary cases lost their 1e-3 residual bound
+# (6.4e-09 now), and the field bounds came down.
 # WHAT THAT SUBSTITUTION IS WORTH ON THESE CASES WAS MEASURED, and it is not small: OpenFOAM against
 # ITSELF on the `trough` fixture, with nothing changed but p_rghFinal's solver -- GAMG or PCG, the same
 # DIC, the same tolerance 1e-7 -- differs by 1.8e-02 of alpha and 9.6% of U after twenty steps. brae with
-# its substitute is 2.3e-02 and 19% from OpenFOAM-with-GAMG. The tank's active absorption feeds the
+# its substitute WAS 2.3e-02 and 19% from OpenFOAM-with-GAMG. The tank's active absorption feeds the
 # water level back into the velocity, and where the last pressure solve stops is part of the answer at
-# that tolerance; agreeing with the tutorial AS SHIPPED needs OpenFOAM's GAMG, agglomeration and all.
+# that tolerance; agreeing with the tutorial AS SHIPPED needed OpenFOAM's GAMG, agglomeration and all.
 #
 # THE CONTROL is OpenFOAM's own answer for the same tank with NO WAVE -- the generating patch given the
 # absorbing model too: on stokesI the wave moves its U by 100% and its alpha by 0.73, against brae's
@@ -141,15 +143,13 @@ t = open(q).read()
 m = re.search(r'(p_rghFinal\s*\{)([^}]*)\}', t)
 assert m, 'no p_rghFinal entry'
 body = m.group(2)
-# eight of the nine name GAMG with a DIC smoother; irregularMultiDirection already names PCG with DIC
+# eight of the nine name GAMG with a DIC smoother; irregularMultiDirection names PCG with DIC. BOTH
+# ARE RUN AS THE TUTORIAL NAMES THEM -- this used to rewrite GAMG to PCG, see the header.
 if 'GAMG' in body:
-    body, k1 = re.subn(r'solver\s+GAMG;', 'solver          PCG;', body)
-    body, k2 = re.subn(r'smoother\s+DIC;', 'preconditioner  DIC;', body)
-    assert k1 == 1 and k2 == 1, 'p_rghFinal is GAMG without a DIC smoother'
+    assert re.search(r'smoother\s+DIC;', body), 'p_rghFinal is GAMG without a DIC smoother'
 else:
     assert re.search(r'solver\s+PCG;', body) and re.search(r'preconditioner\s+DIC;', body), \
         'p_rghFinal is neither GAMG nor PCG with DIC'
-t = t[:m.start(2)] + body + t[m.end(2):]
 if solves == 'tight':
     t, k = re.subn(r'tolerance\s+1e-0?[67];', 'tolerance       1e-13;', t)
     assert k >= 2, 'p_rgh tolerances not found'

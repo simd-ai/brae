@@ -37,6 +37,7 @@ dictionary access are all the second kind.
 | `src/OpenFOAM/` | `src/OpenFOAM/` | primitives, meshes, db, matrices/solution |
 | `src/matrices/lduMatrix/lduMatrix/` | same | LDU view, BLAS1, deterministic reductions, SpMV |
 | `src/matrices/lduMatrix/solvers/PCG/` | same | PCG and the AMG-preconditioned / conditional-graph drivers |
+| `src/matrices/lduMatrix/solvers/GAMG/` | same | OpenFOAM's GAMGSolver: the host reference (V-cycle, DIC and Gauss-Seidel smoothers, correction scaling, PCG on the coarsest level) and the device V-cycle with the DIC smoother; `GAMGAgglomerations/` holds the faceAreaPair hierarchy and its numbering |
 | `src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/` | same | AMG build, Galerkin re-coarsening, V-cycle, smoothers, cache |
 | `src/matrices/lduMatrix/preconditioners/DILUPreconditioner/` | same | level-scheduled DILU |
 | `src/finiteVolume/` | `src/finiteVolume/` | fields, fvMesh, fvMatrices, fvc/fvm, cfdTools |

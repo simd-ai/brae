@@ -117,7 +117,19 @@ scalar deviceInterPressureStep(
     deviceFold(dm, P.diag, P.source, iC, bC, diagC, b);
     const DeviceLduView A = deviceLduView(dm, diagC, P.upper, P.lower);
     DeviceSolverPerf perf;
-    if (in.pcgDIC)
+    if (in.gamg)
+    {
+        if (!in.dic || !in.gamgCache)
+        {
+            throw std::runtime_error(
+                "brae interFoam device pressure step: the case asks for GAMG and the caller handed in no "
+                "fine-level DIC schedule or no hierarchy cache. Build the first with buildDeviceDilu; "
+                "the second is a DeviceGamgCache that outlives the step.");
+        }
+        DeviceGamgHierarchy& hierarchy = in.gamgCache->get(in.gamg->nCellsInCoarsestLevel);
+        perf = deviceGamgSolve(A, b, p_rgh, *in.dic, hierarchy, *in.gamg, in.gamgLog);
+    }
+    else if (in.pcgDIC)
     {
         if (!in.dic)
         {

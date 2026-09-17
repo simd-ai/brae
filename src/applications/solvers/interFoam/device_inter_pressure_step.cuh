@@ -37,6 +37,7 @@
 #include "device_inter_peqn.cuh"
 #include "device_alpha_presolve.cuh"   // DeviceAlphaSolverControls, the same shape of solver entry
 #include "device_dilu.cuh"
+#include "device_gamg_solver.cuh"
 #include "device_pcg.cuh"   // DeviceSolverPerf
 #include <functional>
 #include <vector>
@@ -91,6 +92,13 @@ struct DeviceInterPressureInput
     // caller with buildDeviceDilu, and required when pcgDIC is set.
     bool pcgDIC = false;
     DeviceDilu* dic = nullptr;
+    // `solver GAMG;` -- OpenFOAM's own V-cycle on the device (device_gamg_solver.cuh), with that
+    // entry's controls; null on an entry that names another solver. The hierarchy is the mesh's and
+    // the caller owns it across steps. `dic` is required here too: it is the FINE level's schedule.
+    const GamgControls* gamg = nullptr;
+    DeviceGamgCache* gamgCache = nullptr;
+    // the coarsest-level solve of every V-cycle, in order; null = not kept
+    GamgSolveLog* gamgLog = nullptr;
     // appended to, one record per solve -- the solver's own initial/final residual and iteration
     // count, which is what a gate compares with OpenFOAM's "Solving for p_rgh" lines; null = not kept
     std::vector<DeviceSolverPerf>* solveLog = nullptr;

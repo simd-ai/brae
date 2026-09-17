@@ -453,9 +453,30 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
         const scalar tol = finalInner ? sc.tolPFinal : sc.tolP;
         const scalar relTol = finalInner ? sc.relTolPFinal : sc.relTolP;
         const int maxIter = finalInner ? sc.maxIterPFinal : sc.maxIterP;
-        const SolverPerformance sp = (finalInner ? sc.pcgDICFinal : sc.pcgDIC)
-            ? pcg(pe, p_rgh.internal, m, patches, tol, relTol, maxIter)
-            : pbicgstab(pe, p_rgh.internal, m, patches, tol, relTol, maxIter);
+        const GamgControls* gamgCtl = finalInner ? sc.gamgFinal : sc.gamg;
+        SolverPerformance sp;
+        if (gamgCtl)
+        {
+            // GAMG, where the case names it: OpenFOAM's own hierarchy, smoother and stopping rule.
+            // See gamg_solver_cpp.cuh for what standing PCG in for it cost on the wave tank.
+            if (!sc.gamgCache)
+            {
+                throw std::runtime_error(
+                    "brae interFoam pEqn: the case names GAMG for p_rgh and the caller handed in no "
+                    "agglomeration cache. The hierarchy is the mesh's and has to outlive the step.");
+            }
+            const GamgAgglomeration& agglomeration =
+                sc.gamgCache->get(m, g, gamgCtl->nCellsInCoarsestLevel);
+            sp = gamgSolve(pe, p_rgh.internal, m, patches, agglomeration, *gamgCtl, in.gamgLog);
+        }
+        else if (finalInner ? sc.pcgDICFinal : sc.pcgDIC)
+        {
+            sp = pcg(pe, p_rgh.internal, m, patches, tol, relTol, maxIter);
+        }
+        else
+        {
+            sp = pbicgstab(pe, p_rgh.internal, m, patches, tol, relTol, maxIter);
+        }
         if (in.solveLog)
         {
             in.solveLog->push_back(PressureSolveRecord{sp.initialResidual, sp.finalResidual, sp.nIterations});

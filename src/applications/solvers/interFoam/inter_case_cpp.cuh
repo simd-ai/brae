@@ -49,6 +49,7 @@
 #include "inter_solve_cpp.cuh"
 #include "inter_create_fields_cpp.cuh"
 #include "inter_linear_solve.cuh"
+#include "gamg_solver_cpp.cuh"
 #include "inter_turbulence_cpp.cuh"
 #include "inter_waves_cpp.cuh"
 #include "mules_cpp.cuh"
@@ -169,6 +170,10 @@ struct InterFields
         int maxIter = 1000;
         // brae::pcg is lduMatrix PCG + DICPreconditioner, gated in tests/test_pcg.cu
         bool pcgDIC() const { return solver == "PCG" && preconditioner == "DIC"; }
+        // brae::gamgSolve is GAMGSolver on the faceAreaPair hierarchy, gated in
+        // tests/interfoam_gamg_vs_openfoam.sh; `gamg` holds that entry's controls
+        bool gamgSolver() const { return solver == "GAMG"; }
+        GamgControls gamg;
     };
     // THE CASE'S alpha SOLVE, which only a MULESCorr case performs (the implicit upwind pre-solve,
     // alphaEqn.H:103-149). It used to run at a struct default of 1e-8 on the host and a hardcoded

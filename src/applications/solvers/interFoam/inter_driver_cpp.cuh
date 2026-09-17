@@ -55,6 +55,17 @@ struct RunReport
     // solves them
     std::vector<LinearSolveRecord> epsilonSolves;
     std::vector<LinearSolveRecord> kSolves;
+    // ...and, where p_rgh names GAMG, what OpenFOAM prints under its own debug switches: the
+    // hierarchy (cells, faces and lduAddressing::band()'s profile per level, the mesh first) and the
+    // coarsest-level solve of every V-cycle of every GAMG solve, in order
+    struct GamgLevel
+    {
+        label nCells = 0;
+        label nFaces = 0;
+        scalar profile = 0;
+    };
+    std::vector<GamgLevel> gamgLevels;
+    std::vector<LinearSolveRecord> gamgCoarsestSolves;
     // WHICH closure produced them. The device loop can run either (BRAE_INTER_HOST_CLOSURE), and a
     // gate comparing the two has to know each arm took the path it is named for.
     bool turbulenceOnDevice = false;

@@ -471,6 +471,22 @@ RunReport runInterFoamDevice(
     // names one, which every shipped interFoam tutorial does. The DIC is the level-scheduled DILU with
     // lower aliased to upper, bit-identical to DICPreconditioner.C (tests/test_device_dic.cu). Any other
     // solver still runs the device BiCGStab, under the notice buildInterFields already printed.
+    //
+    // ...AND THE CASE'S OWN GAMG, where it names that: OpenFOAM's V-cycle on the device
+    // (device_gamg_solver.cuh) on the host-built faceAreaPair hierarchy. The device's has the DIC
+    // smoother, which is what every shipped interFoam tutorial that names GAMG asks for; the other
+    // three the host runs are refused here rather than run as DIC.
+    for (const InterFields::PressureLinearSolve* entry : {&f.pSolve, &f.pSolveFinal})
+    {
+        if (entry->gamgSolver() && !deviceGamgSmootherPorted(entry->gamg.smoother))
+        {
+            throw std::runtime_error(
+                "brae interFoam -device: fvSolution's GAMG entry for p_rgh asks for `smoother "
+                + entry->gamg.smoother + "`. The device's GAMG has the DIC smoother only "
+                "(device_gamg_solver.cuh); the host loop runs DIC, DICGaussSeidel, GaussSeidel and "
+                "symGaussSeidel. Refused rather than smoothed with something the case did not name.");
+        }
+    }
     DeviceDilu dic = buildDeviceDilu(m.owner(), m.neighbour(), nC);
     C.dic = &dic;
     std::vector<DeviceSolverPerf> pLog, aLog, uLog[3];
@@ -479,6 +495,14 @@ RunReport runInterFoamDevice(
     C.alpha.preSolveLog = &aLog;
     C.pressurePcgDIC = f.pSolve.pcgDIC();
     C.pressureFinalPcgDIC = f.pSolveFinal.pcgDIC();
+    DeviceGamgCache gamgCache;
+    gamgCache.mesh = &m;
+    gamgCache.geometry = &g;
+    GamgSolveLog gamgLog;
+    C.pressureGamg = f.pSolve.gamgSolver() ? &f.pSolve.gamg : nullptr;
+    C.pressureFinalGamg = f.pSolveFinal.gamgSolver() ? &f.pSolveFinal.gamg : nullptr;
+    C.gamgCache = &gamgCache;
+    C.gamgLog = &gamgLog;
     C.pressure.tol = f.pSolve.tol;
     C.pressure.relTol = f.pSolve.relTol;
     C.pressure.maxIter = f.pSolve.maxIter;
@@ -654,6 +678,23 @@ RunReport runInterFoamDevice(
         }
     }
 
+    if (gamgCache.host.built)
+    {
+        const GamgAgglomeration& a = gamgCache.host.agglomeration;
+        for (label leveli = 0; leveli <= a.size(); ++leveli)
+        {
+            const GamgLduAddressing& addr = a.meshLevel(leveli);
+            RunReport::GamgLevel lv;
+            lv.nCells = addr.nCells;
+            lv.nFaces = static_cast<label>(addr.upperAddr.size());
+            lv.profile = gamgLduBand(addr).second;
+            rep.gamgLevels.push_back(lv);
+        }
+        for (const SolverPerformance& sp : gamgLog.coarsest)
+        {
+            rep.gamgCoarsestSolves.push_back(LinearSolveRecord{sp.initialResidual, sp.finalResidual, sp.nIterations});
+        }
+    }
     for (const DeviceSolverPerf& sp : pLog)
     {
         rep.pSolves.push_back(PressureSolveRecord{sp.initialResidual, sp.finalResidual, sp.nIterations});
