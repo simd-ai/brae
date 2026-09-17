@@ -29,6 +29,16 @@
 #
 # THE CONTROLS are OpenFOAM's own answers at the same instant: the case run laminar (133% of U away),
 # and the run this profile differs from in its one setting.
+#
+# THE DEVICE LOOP RUNS EVERY PROFILE TWICE, because the closure went onto the device one module at a
+# time. With the device closure -- what `brae_interFoam -device` runs -- it is held to OpenFOAM at the
+# host's bounds. With the HOST closure in its place (BRAE_INTER_HOST_CLOSURE=1, which the driver
+# announces) it is the oracle for the first: against OpenFOAM a disagreement could be the loop's or the
+# closure's, between those two only the closure's. MEASURED: device closure against host closure in the
+# same loop, U 3.3e-14, k 1.1e-15, epsilon 1.6e-15, nut 1.9e-15, the same sweep counts solve for solve.
+# The `custom` profile is where the device closure's one defect showed: it left the wall laplacian
+# coefficient out of relax(), as the host reference had, and every epsilon residual was 1.1e-04 from
+# OpenFOAM's with the fields unmoved. 5.3e-14 with it.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_ras_dambreak_vs_openfoam"

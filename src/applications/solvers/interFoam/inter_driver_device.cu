@@ -14,6 +14,8 @@
 #include "fvc.cuh"
 #include "brae_notice.cuh"
 #include "device_inter_step.cuh"
+#include "device_inter_turbulence.cuh"
+#include "device_blas.cuh"
 #include "device_alpha_courant.cuh"
 #include "time_controls.cuh"
 #include "device_mesh.cuh"
@@ -103,15 +105,6 @@ RunReport runInterFoamDevice(
               "step, which runs none. The host path (no -device) does.");
     }
 
-    // ...AND TURBULENCE. The host runs kEpsilon in both of interFoam's lineages; the device step has
-    // no nut in its momentum equation and no closure stage, so it would run the case laminar.
-    if (f.turbulence.on)
-    {
-        throw std::runtime_error(
-            "brae interFoam (device): the case is RAS kEpsilon and the device loop carries no "
-            "turbulence -- it would run laminar. The host path (no -device) does.");
-    }
-
     DeviceMesh dm = buildDeviceMesh(m, g, fvp);
 
     // the masks the device needs that the mesh does not carry
@@ -147,6 +140,24 @@ RunReport runInterFoamDevice(
         }
         pushFluxToPatches(f, fvp);
     };
+
+    // TURBULENCE. The closure is the device's (device_inter_turbulence.cuh). BRAE_INTER_HOST_CLOSURE=1
+    // puts the HOST reference in its place inside the same device loop -- the mixed build the closure
+    // was wired against, kept because it is the one comparison that says whether a disagreement is the
+    // closure's or the loop's. It is a gate's instrument, not a mode, and it says so every run.
+    const bool hostClosure = f.turbulence.on && std::getenv("BRAE_INTER_HOST_CLOSURE") != nullptr;
+    const bool deviceClosure = f.turbulence.on && !hostClosure;
+    if (hostClosure)
+    {
+        std::printf("  *** BRAE_INTER_HOST_CLOSURE: the device loop is running the HOST kEpsilon. ***\n");
+    }
+    DeviceInterTurbulence dTurb = deviceClosure
+        ? buildDeviceInterTurbulence(f.turbulence, f.U, m, g, fvp)
+        : DeviceInterTurbulence();
+    // what the closure reads after the step, kept by the interfaceForces hook: rho's patch values as
+    // the device step blended them, and the mixture's nu on cells and patches
+    std::vector<std::vector<scalar>> stepRhoBnd;
+    DeviceBuffer<scalar> dStepRhoBnd, dStepNu, dStepNuBnd;
 
     // the hooks: every one is per-patch host work, and nothing else
     DeviceInterStepHooks H;
@@ -248,16 +259,38 @@ RunReport runInterFoamDevice(
                 off += n;
             }
         }
+        // ...kept: the closure reads rho's patch values after the step, and these are the device's
+        stepRhoBnd = rb;
+        if (deviceClosure)
+        {
+            deviceCopy(dStepRhoBnd, rhoBd);
+        }
         const GeometricField<scalar> rhoF = rhoWithPatchValues(f.rho, rb, fvp);
         snRho.copyFrom(fullFace(fvc::snGrad(rhoF, m, g, fvp, false), fvp));
 
         // the mixture's own nu. NOTE mixtureNu's second argument is mu, not alpha2.
         cpu::twoPhase::mixtureMu(f.alpha1.internal, f.mixture.phases, f.mu);
         cpu::twoPhase::mixtureNu(f.alpha1.internal, f.mu, f.mixture.phases, f.nu);
-        nuC.copyFrom(f.nu);
         // f.nuBnd is the alpha hook's, taken BEFORE its curvature pass. Rebuilding it here would read
         // alpha's patch values one contact-angle pass too late.
-        nuB.copyFrom(flattenPatches(f.nuBnd));
+        // nuEff = nut + nu: the mixture's nu alone on a laminar case. nut is the closure's, as the
+        // LAST step's correct() left it -- or validate()'s, or the case file's, at the first.
+        if (deviceClosure)
+        {
+            // the mixture's nu alone: the step adds the device's nut (DeviceInterStepControls::nutCell)
+            nuC.copyFrom(f.nu);
+            nuB.copyFrom(flattenPatches(f.nuBnd));
+            deviceCopy(dStepNu, nuC);
+            deviceCopy(dStepNuBnd, nuB);
+        }
+        else
+        {
+            std::vector<scalar> nuEff;
+            std::vector<std::vector<scalar>> nuEffB;
+            interNuEff(f.turbulence, f.nu, f.nuBnd, nuEff, nuEffB);
+            nuC.copyFrom(nuEff);
+            nuB.copyFrom(flattenPatches(nuEffB));
+        }
 
         // snGrad(p_rgh) is read ONLY when the case runs a momentum predictor; it is explicit there and
         // implicit in the pressure equation, and carrying it into both would count it twice.
@@ -391,6 +424,11 @@ RunReport runInterFoamDevice(
         C.momentum.nSweeps = f.uSolveFinal.nSweeps;
     }
     C.takeUAtBoundary = &dTakeU;
+    if (deviceClosure)
+    {
+        C.nutCell = &dTurb.nut;
+        C.nutBnd = &dTurb.nutBnd;
+    }
     { const SolutionDirections sd = solutionDirections(fvp);
       for (int k = 0; k < 3; ++k) C.solutionD[k] = sd.d[k]; }
 
@@ -416,6 +454,7 @@ RunReport runInterFoamDevice(
 
     RunReport rep;
     rep.deltaT = f.deltaT;
+    rep.turbulenceOnDevice = deviceClosure;
     for (label s = 0; s < nSteps; ++s)
     {
         if (!(rep.time < endTime - scalar(0.5)*rep.deltaT)) break;   // Time::run(), Time.C:1000
@@ -440,11 +479,85 @@ RunReport runInterFoamDevice(
         dPhiI.copyTo(poi); dPhiB.copyTo(pob);
         DeviceBuffer<scalar> dPhiOI(poi), dPhiOB(pob);
 
+        // rho.oldTime() for the closure's ddt: f.rho still holds what the LAST step's hook left, and
+        // dRho what the last step wrote -- nothing yet at the first, where the host's is the field
+        const std::vector<scalar> rhoOldHost = hostClosure ? f.rho : std::vector<scalar>();
+        DeviceBuffer<scalar> dRhoOld;
+        if (deviceClosure)
+        {
+            if (dRho.size() == static_cast<std::size_t>(nC))
+            {
+                deviceCopy(dRhoOld, dRho);
+            }
+            else
+            {
+                dRhoOld.copyFrom(f.rho);
+            }
+        }
+
         deviceInterStep(dm, rep.deltaT, C, props, H, dGh, dGhf, dMagSf,
                         dA, dAOld, dUx, dUy, dUz, dUox, dUoy, dUoz,
                         dPhiI, dPhiB, dPhiOI, dPhiOB, dUFixes, dPrgh, dP,
                         dNH, dNHB, dABnd, dK, dAFixes, dAFlag, dbU,
                         dRho, dMu, dNu, dRpI, dRpB);
+
+        // turbulence->correct(), interFoam.C:169-172 -- after the last pressure corrector of the one
+        // outer corrector this loop runs. dbU is current: the step's last updateUBoundary rebuilt it
+        // and the pressureInletOutletVelocity switch ran on it after that.
+        if (deviceClosure)
+        {
+            DeviceInterTurbulenceStepInput ti;
+            ti.Ux = &dUx;
+            ti.Uy = &dUy;
+            ti.Uz = &dUz;
+            ti.phiInt = &dPhiI;
+            ti.phiBnd = &dPhiB;
+            ti.rhoPhiInt = &dRpI;
+            ti.rhoPhiBnd = &dRpB;
+            ti.rho = &dRho;
+            ti.rhoBnd = &dStepRhoBnd;
+            ti.rhoOld = &dRhoOld;
+            ti.nu = &dStepNu;
+            ti.nuBnd = &dStepNuBnd;
+            ti.deltaT = rep.deltaT;
+            ti.epsilonLog = &rep.epsilonSolves;
+            ti.kLog = &rep.kSolves;
+            deviceCorrectInterTurbulence(dTurb, f.turbulence, ti, dm, dbU);
+        }
+        // ...or THE HOST CLOSURE in the same loop. f.U is current (the step's last updateUBoundary
+        // wrote it, patches included) and so are f.rho, f.nu and f.nuBnd (the hooks'); phi's interior
+        // and rhoPhi are the device's only.
+        if (hostClosure)
+        {
+            dPhiI.copyTo(f.phi.internal);
+            pushFlux();
+            dRpI.copyTo(f.rhoPhi.internal);
+            {
+                std::vector<scalar> rb;
+                dRpB.copyTo(rb);
+                f.rhoPhi.boundary.assign(fvp.size(), std::vector<scalar>());
+                std::size_t off = 0;
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                {
+                    const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+                    f.rhoPhi.boundary[pi].assign(rb.begin() + off, rb.begin() + off + n);
+                    off += n;
+                }
+            }
+            InterTurbulenceStepInput ti;
+            ti.U = &f.U;
+            ti.phi = &f.phi;
+            ti.rhoPhi = &f.rhoPhi;
+            ti.rho = &f.rho;
+            ti.rhoBnd = &stepRhoBnd;
+            ti.rhoOld = &rhoOldHost;
+            ti.nu = &f.nu;
+            ti.nuBnd = &f.nuBnd;
+            ti.deltaT = rep.deltaT;
+            ti.epsilonLog = &rep.epsilonSolves;
+            ti.kLog = &rep.kSolves;
+            correctInterTurbulence(f.turbulence, ti, m, g, fvp);
+        }
         rep.steps = s + 1;
         rep.time += rep.deltaT;
         f.writeCadence.advance(rep.time, rep.deltaT);   // Time::operator++, Time.C:1046-1074
@@ -489,6 +602,10 @@ RunReport runInterFoamDevice(
     f.p_rgh.evaluateBoundary();
     dP.copyTo(f.p);
     dRho.copyTo(f.rho);
+    if (deviceClosure)
+    {
+        downloadDeviceInterTurbulence(dTurb, f.turbulence, fvp);
+    }
     dPhiI.copyTo(f.phi.internal);
 
     // ...and the REPORT's own numbers. Leaving maxU and worstDivPhi at their defaults printed

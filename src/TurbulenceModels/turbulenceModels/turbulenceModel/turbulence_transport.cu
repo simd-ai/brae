@@ -256,7 +256,9 @@ void solveScalarEqn(
     const SolveControls&        sv,
     scalar&                     residualOut,
     const std::string&          dumpPrefix,   // "" = no dump; else <dir>/<name> path prefix
-    bool                        gs)           // this field's own solver: the case's smoothSolver, or BiCGStab
+    // this field's own solver: the case's smoothSolver, or BiCGStab
+    bool gs,
+    DeviceSolverPerf* perfOut)
 {
     const int nC  = dm.nCells;
     const int nIf = dm.nInternalFaces;
@@ -357,6 +359,10 @@ void solveScalarEqn(
         perf = deviceJacobiBiCGStab(A, b, field, dnf.data(), sv.tol, sv.relTol, sv.maxIter, /*checkEvery=*/1, sv.minIter,
                                     sv.precon, /*amg=*/nullptr, sv.polyDeg);
     residualOut = perf.initialResidual;
+    if (perfOut)
+    {
+        *perfOut = perf;
+    }
     dump("SolveOut", field);
 }
 

@@ -163,6 +163,13 @@ struct DeviceInterStepControls
     // a direction OpenFOAM never does.
     int    solutionD[3]      = {1, 1, 1};
 
+    // THE EDDY VISCOSITY, when the closure lives on the device: nuEff = nut + nu (eddyViscosity::nuEff),
+    // cells and boundary faces. The interfaceForces hook hands back the MIXTURE's nu and these are added
+    // to it on the device, so nut never crosses to the host. Null = the hook's value is nuEff already --
+    // a laminar case, or the host closure, which adds its own nut inside the hook.
+    const DeviceBuffer<scalar>* nutCell = nullptr;
+    const DeviceBuffer<scalar>* nutBnd = nullptr;
+
     // constrainHbyA's per-face `assignable` mask, which the shared pressure predictor requires.
     // assignable() is NOT fixesValue(): slip and inletOutlet are non-assignable without fixing one,
     // and damBreak's atmosphere is pressureInletOutletVelocity.

@@ -151,6 +151,7 @@ add_library(brae_core STATIC
     src/finiteVolume/cfdTools/general/device_alpha_courant.cu
     src/applications/solvers/interFoam/device_inter_pressure_step.cu
     src/applications/solvers/interFoam/device_inter_step.cu
+    src/applications/solvers/interFoam/device_inter_turbulence.cu
     src/applications/solvers/interFoam/inter_driver_device.cu
     src/applications/solvers/interFoam/inter_ueqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoCreateFields_cpp.cu

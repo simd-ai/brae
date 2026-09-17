@@ -144,8 +144,12 @@ struct Compressible
     // THE FLUX A FLUX-CONDITIONAL PATCH LOOKS UP, when that is not the equation's own. inletOutlet
     // reads the registry's `phi` (inletOutletFvPatchField.C, phiName_ default "phi"). In rhoSimpleFoam
     // that IS the mass flux the equation convects with, so null -- the equation's flux -- is right.
-    // In interFoam's `density variable` lineage the equation convects with rhoPhi while `phi` is the
-    // volumetric flux: the same sign wherever rho_b > 0, but a different field, so it is named.
+    // In interFoam's `density variable` lineage the equation convects with rhoPhi, and rhoPhi is NOT
+    // rho*phi at the moment the closure runs: the ALPHA step built it from the phi the time step
+    // started on, and the pressure correctors have moved phi since. An earlier version of this note
+    // argued the two must share a sign wherever rho_b > 0; measured on RAS/damBreak at step one,
+    // rhoPhi is exactly 0 on all 46 atmosphere faces (the case starts at rest) while phi is not, and
+    // handing the patches rhoPhi is 4.9e-04 of U after five steps.
     const SurfaceScalarField* bcPhi = nullptr;
     // fvm::ddt(alpha, rho, k|epsilon) (kEpsilon.C:254,275): rDeltaT = 1/deltaT under Euler, 0 under
     // steadyState (the term vanishes). rhoOld is rho.oldTime() -- see StepInput::firstIteration for

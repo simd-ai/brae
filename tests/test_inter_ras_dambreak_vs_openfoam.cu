@@ -12,6 +12,11 @@
 //   custom     uniform with its own kEpsilonCoeffs, equation relaxation 0.7 and a tolerance at which
 //              `minIter 1` is what forces each sweep -- three settings the shipped case cannot see
 //
+// THE DEVICE LOOP RUNS EVERY PROFILE TOO, twice: with the device closure (what `-device` runs), held to
+// OpenFOAM at the host's bounds, and with the HOST closure in its place (BRAE_INTER_HOST_CLOSURE), held
+// to the first. Against OpenFOAM a disagreement could be the loop's or the closure's; between those two
+// it can only be the closure's. Each arm asserts WHICH closure it ran.
+//
 // TWO CONTROLS ON THE ORACLE, each OpenFOAM's own answer at the same instant:
 //   laminar     the case with `simulationType laminar`. If the turbulent oracle sat on top of it, a
 //               brae that ignored turbulence would pass every field bound here.
@@ -24,6 +29,7 @@
 #include "inter_driver_cpp.cuh"
 #include "device_gate_finite.cuh"
 #include "inter_solve_log.cuh"
+#include <cuda_runtime.h>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -245,6 +251,110 @@ int main(
     check(custom ? "...and the custom settings move it by more than 1%"
                  : "...and the lineage moves it by more than 10%, so `density` is live on this fixture",
           dOtherU.rel() > (custom ? scalar(0.01) : scalar(0.1)));
+
+    // THE DEVICE LOOP, against OpenFOAM directly and at the case's own tolerances -- what
+    // `brae_interFoam -device` runs on this tutorial.
+    int nDev = 0;
+    if (cudaGetDeviceCount(&nDev) != cudaSuccess)
+    {
+        cudaGetLastError();
+        nDev = 0;
+    }
+    if (nDev <= 0)
+    {
+        std::printf("  (no CUDA device: the device arm is skipped)\n");
+    }
+    else
+    {
+        InterFields dev;
+        const RunReport rd = runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
+        check("the device driver ran the same number of steps", rd.steps == nSteps);
+        check("...turbulent, in the lineage this profile names",
+              dev.turbulence.on && dev.turbulence.variableDensity == variable);
+        // THE PATH: the device loop can carry either closure, and "agrees with OpenFOAM" is true of both
+        check("...with the closure ON THE DEVICE", rd.turbulenceOnDevice);
+        failures += brae::gatecheck::nonFinite("device alpha", dev.alpha1.internal);
+        failures += brae::gatecheck::nonFinite("device p_rgh", dev.p_rgh.internal);
+        failures += brae::gatecheck::nonFinite("device U", dev.U.internal);
+        failures += brae::gatecheck::nonFinite("device k", dev.turbulence.k.internal);
+        failures += brae::gatecheck::nonFinite("device epsilon", dev.turbulence.epsilon.internal);
+        failures += brae::gatecheck::nonFinite("device nut", dev.turbulence.nut.internal);
+        failures += brae::gatecheck::compareSolves("device", rd.pSolves, ofP, nSteps);
+        failures += brae::gatecheck::compareSolves("device", rd.alphaSolves, ofA, nSteps,
+                                                   dev.alphaName.c_str(), scalar(1e-10), scalar(1e-9));
+        // MEASURED: initial residuals 1.8e-13 (epsilon) and 4.0e-13 (k) from OpenFOAM's over the run.
+        // THE CONTROL IS ON `custom`: with the wall laplacian coefficient left out of relax() -- what
+        // the device closure did until this gate -- epsilon's fields do not move (9.8e-14) and its
+        // initial residuals are 1.1e-04 out in every step. 1e-10 is six orders inside that.
+        failures += brae::gatecheck::compareSolves("device", rd.epsilonSolves, ofE, nSteps, "epsilon",
+                                                   scalar(1e-10), scalar(1e-10), scalar(1e-5));
+        failures += brae::gatecheck::compareSolves("device", rd.kSolves, ofK, nSteps, "k",
+                                                   scalar(1e-10), scalar(1e-10), scalar(1e-5));
+        const Diff eA = compare(dev.alpha1.internal, ofAlpha);
+        const Diff eP = compare(dev.p_rgh.internal, ofPrgh);
+        const Diff eU = compare(dev.U.internal, ofU);
+        const Diff eK = compare(dev.turbulence.k.internal, ofKf);
+        const Diff eE = compare(dev.turbulence.epsilon.internal, ofEf);
+        const Diff eN = compare(dev.turbulence.nut.internal, ofNut);
+        std::printf("  DEVICE vs OpenFOAM: alpha %.4e, p_rgh %.4e, U %.4e, k %.4e, epsilon %.4e, nut %.4e\n",
+                    (double)eA.linf, (double)eP.rel(), (double)eU.rel(), (double)eK.rel(),
+                    (double)eE.rel(), (double)eN.rel());
+        // THE HOST'S BOUNDS. MEASURED, worst of the three profiles: alpha 4.9e-13, p_rgh 7.1e-13,
+        // U 3.3e-11, k 2.8e-13, epsilon 2.5e-13, nut 4.8e-13. Each device-side decision was broken in
+        // turn, once: the patches handed rhoPhi for phi 4.9e-04 of U; the wall nut recomputed instead
+        // of read from the stored patch 6.1e-06; rho.oldTime() taken as rho 5.6%; divU from the mass
+        // flux 53%; BiCGStab for the case's symGaussSeidel 1 of 5 epsilon iteration counts.
+        check("the DEVICE's alpha agrees with OpenFOAM's to the host's bound", eA.linf < scalar(2e-11));
+        check("...its p_rgh", eP.rel() < scalar(2e-11));
+        check("...its U", eU.rel() < scalar(5e-10));
+        check("...its k", eK.rel() < scalar(1e-11));
+        check("...its epsilon", eE.rel() < scalar(1e-11));
+        check("...and its nut", eN.rel() < scalar(2e-11));
+
+        // THE SAME DEVICE LOOP WITH THE HOST CLOSURE IN THE DEVICE ONE'S PLACE -- the `_cpp` reference
+        // as the in-repo oracle, with everything around it held fixed. Against OpenFOAM a disagreement
+        // could be the loop's or the closure's; against this it can only be the closure's.
+        setenv("BRAE_INTER_HOST_CLOSURE", "1", 1);
+        InterFields mix;
+        const RunReport rm = runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &mix);
+        unsetenv("BRAE_INTER_HOST_CLOSURE");
+        check("the mixed run took the HOST closure", !rm.turbulenceOnDevice && rm.steps == nSteps);
+        failures += brae::gatecheck::nonFinite("mixed k", mix.turbulence.k.internal);
+        failures += brae::gatecheck::nonFinite("mixed epsilon", mix.turbulence.epsilon.internal);
+        failures += brae::gatecheck::nonFinite("mixed nut", mix.turbulence.nut.internal);
+        failures += brae::gatecheck::nonFinite("mixed U", mix.U.internal);
+        const Diff mU = compare(dev.U.internal, mix.U.internal);
+        const Diff mK = compare(dev.turbulence.k.internal, mix.turbulence.k.internal);
+        const Diff mE = compare(dev.turbulence.epsilon.internal, mix.turbulence.epsilon.internal);
+        const Diff mN = compare(dev.turbulence.nut.internal, mix.turbulence.nut.internal);
+        std::printf("  DEVICE closure vs HOST closure, same device loop: U %.4e, k %.4e, epsilon %.4e, "
+                    "nut %.4e\n", (double)mU.rel(), (double)mK.rel(), (double)mE.rel(), (double)mN.rel());
+        // MEASURED, worst of the three profiles: U 3.3e-14, k 1.1e-15, epsilon 1.6e-15, nut 1.9e-15
+        // -- round-off between two implementations that share no kernel. Bounds at about 30x.
+        check("the device closure agrees with the host closure in U", mU.rel() < scalar(1e-12));
+        check("...in k", mK.rel() < scalar(5e-14));
+        check("...in epsilon", mE.rel() < scalar(5e-14));
+        check("...and in nut", mN.rel() < scalar(5e-14));
+        // the two closures took the same sweeps, solve for solve
+        std::size_t sameE = 0;
+        std::size_t sameK = 0;
+        for (std::size_t q = 0; q < rd.epsilonSolves.size() && q < rm.epsilonSolves.size(); ++q)
+        {
+            if (rd.epsilonSolves[q].nIterations == rm.epsilonSolves[q].nIterations)
+            {
+                ++sameE;
+            }
+        }
+        for (std::size_t q = 0; q < rd.kSolves.size() && q < rm.kSolves.size(); ++q)
+        {
+            if (rd.kSolves[q].nIterations == rm.kSolves[q].nIterations)
+            {
+                ++sameK;
+            }
+        }
+        check("...and took the host closure's sweep counts, solve for solve",
+              sameE == static_cast<std::size_t>(nSteps) && sameK == static_cast<std::size_t>(nSteps));
+    }
 
     std::printf("test_inter_ras_dambreak_vs_openfoam: %d failures\n", failures);
     return failures == 0 ? 0 : 1;

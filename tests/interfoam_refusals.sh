@@ -160,6 +160,8 @@ arm ras_uniform             runs    -                        "" "sed -i 's/^dens
 arm ras_limitedLinear       refused "Gauss upwind"            "" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss limitedLinear 1;/' system/fvSchemes"
 arm ras_nutSpalding         refused "nutUSpaldingWallFunction" "" "sed -i 's/nutkWallFunction/nutUSpaldingWallFunction/' 0/nut"
 arm ras_nutCalculatedWall   refused "no nut wall function"    "" "sed -i '/leftWall/,/}/ s/nutkWallFunction/calculated/' 0/nut"
+# a wall function on a patch that is not a `wall`: OpenFOAM's nutWallFunction::checkType stops on it
+arm ras_wallFnOnPatch       refused "must be a \`wall\`"       "" "sed -i '/leftWall/,/}/ s/type  *wall;/type            patch;/' constant/polyMesh/boundary"
 arm ras_noKFinal            refused "kFinal"                  "" "sed -i 's/\"(U|k|epsilon)\.\*\"/\"(U|k|epsilon)\"/' system/fvSolution"
 arm ras_PBiCGStab           refused "smoothSolver"            "" "sed -i '/(U|k|epsilon)/,/}/ s/solver  *smoothSolver;/solver          PBiCGStab;/' system/fvSolution"
 arm ras_everyOuter          refused "turbOnFinalIterOnly"     "" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;\\n    turbOnFinalIterOnly no;/' system/fvSolution"
@@ -182,8 +184,11 @@ if [ $HAVE_GPU = 1 ]; then
     arm device_nOuter2      refused "nOuterCorrectors 2"      "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' system/fvSolution"
     arm device_nNonOrth1    refused "nNonOrthogonalCorrectors 1" "-device" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"
     arm device_mesh_dynamic refused "dynamicRefineFvMesh"     "-device" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
+    # the device loop carries the kEpsilon closure now, in both lineages
     BASE="$BR"
-    arm device_ras          refused "carries no turbulence"   "-device" true
+    arm device_ras          runs    -                        "-device" true
+    arm device_ras_uniform  runs    -                        "-device" "sed -i 's/^density .*/density uniform;/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,k) /div(phi,k) /; s/div(rhoPhi,epsilon) /div(phi,epsilon) /' system/fvSchemes"
+    arm device_ras_kOmegaSST refused "kOmegaSST"             "-device" "sed -i 's/RASModel .*/RASModel        kOmegaSST;/' constant/turbulenceProperties"
     BASE="$B"
 else
     echo "  (no GPU: the -device arms are skipped)"

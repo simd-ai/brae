@@ -55,6 +55,9 @@ struct RunReport
     // solves them
     std::vector<LinearSolveRecord> epsilonSolves;
     std::vector<LinearSolveRecord> kSolves;
+    // WHICH closure produced them. The device loop can run either (BRAE_INTER_HOST_CLOSURE), and a
+    // gate comparing the two has to know each arm took the path it is named for.
+    bool turbulenceOnDevice = false;
 };
 
 // Run `nSteps` of interFoam on a prepared case. Returns the state at the end; `verbose` prints the

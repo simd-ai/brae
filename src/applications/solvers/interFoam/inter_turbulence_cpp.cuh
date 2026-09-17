@@ -33,8 +33,8 @@
 //
 // WHAT IS REFUSED, by name: every RASModel but kEpsilon, LES, `turbulence off`, a k/epsilon
 // convection scheme other than `Gauss upwind` (what all 11 kEpsilon tutorials name), a nut wall
-// function outside nutk/nutU/nutLowRe, and a ddt scheme other than Euler. The device loop refuses
-// turbulence altogether.
+// function outside nutk/nutU/nutLowRe or on a patch that is not a `wall`, and a ddt scheme other than
+// Euler. The device loop runs the same closure's device twin: device_inter_turbulence.cuh.
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
 #include "fv_geometry.cuh"

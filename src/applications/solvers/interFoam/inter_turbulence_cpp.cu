@@ -164,6 +164,13 @@ std::vector<int> readNutWallKinds(
                 "the family are different functions of different inputs and are not substituted.");
         for (const FvPatch* pp : patchesResolvingTo(nutRaw.boundary, b, patches))
         {
+            // nutWallFunctionFvPatchScalarField::checkType (nutWallFunctionFvPatchScalarField.C:45-55):
+            // "Invalid wall function specification ... must be wall", a FatalError at construction
+            if (pp->type != "wall")
+                throw std::runtime_error(
+                    std::string(WHO) + "nut patch `" + pp->name + "` carries `" + b.type
+                    + "` and its patch type is `" + pp->type + "`. A nut wall function's patch must be "
+                    "a `wall`; OpenFOAM stops on this at construction (nutWallFunction checkType).");
             kind[static_cast<std::size_t>(pp - patches.data())] = k;
         }
     }

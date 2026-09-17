@@ -147,6 +147,19 @@ void deviceInterStep(
     // deltaCoeffs*(rho_b - rho_cell), and rho_b is this.
     DeviceBuffer<scalar> stf, snGradRho, nuEffCell, nuEffBnd, snGradPrgh;
     hooks.interfaceForces(alpha1, K, rho, rhoBnd, stf, snGradRho, nuEffCell, nuEffBnd, snGradPrgh);
+    // nuEff = nut + nu where the closure is the device's -- see DeviceInterStepControls::nutCell
+    if (ctl.nutCell || ctl.nutBnd)
+    {
+        if (!ctl.nutCell || !ctl.nutBnd || ctl.nutCell->size() != nuEffCell.size()
+         || ctl.nutBnd->size() != nuEffBnd.size())
+        {
+            throw std::runtime_error(
+                "brae interFoam device step: nut must be given on cells AND boundary faces, each the "
+                "size of the viscosity it is added to.");
+        }
+        deviceAxpy(scalar(1), *ctl.nutCell, nuEffCell);
+        deviceAxpy(scalar(1), *ctl.nutBnd, nuEffBnd);
+    }
 
     probe("stf", stf);
     probe("snGradRho", snGradRho);
