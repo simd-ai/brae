@@ -89,6 +89,11 @@ struct DeviceInterPressureInput
 // out solved. `phi`, `U` and `p` are rebuilt from it.
 //
 // Returns the solver's final normalised residual, so a caller can refuse a pass that did not converge.
+struct DevicePressureTaps
+{
+    DeviceBuffer<scalar> diag, upper, lower, source, iC, bC;
+};
+
 scalar deviceInterPressureStep(
     const DeviceMesh&                  dm,
     const DeviceInterPressureInput&    in,
@@ -105,6 +110,7 @@ scalar deviceInterPressureStep(
     DeviceBuffer<scalar>&              UX,
     DeviceBuffer<scalar>&              UY,
     DeviceBuffer<scalar>&              UZ,
-    DeviceBuffer<scalar>&              p);
+    DeviceBuffer<scalar>&              p,
+    DevicePressureTaps*                taps = nullptr);
 
 } // namespace brae

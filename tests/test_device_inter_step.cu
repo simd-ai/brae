@@ -218,9 +218,10 @@ int main()
         // nuEff: the mixture's own, which mixture.correct() has just written
         brae::cpu::twoPhase::PhaseProperties pp;
         pp.rho1 = rho1; pp.rho2 = rho2; pp.nu1 = nu1; pp.nu2 = nu2;
-        std::vector<scalar> a2(av.size()), nuv;
-        for (std::size_t i = 0; i < av.size(); ++i) a2[i] = scalar(1) - av[i];
-        brae::cpu::twoPhase::mixtureNu(av, a2, pp, nuv);
+        // mixtureNu takes mu, not alpha2 -- see two_phase_mixture_cpp.cuh:130.
+        std::vector<scalar> muv, nuv;
+        brae::cpu::twoPhase::mixtureMu(av, pp, muv);
+        brae::cpu::twoPhase::mixtureNu(av, muv, pp, nuv);
         nuC.copyFrom(nuv);
         std::vector<scalar> nb;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)

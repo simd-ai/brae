@@ -300,11 +300,27 @@ void deviceInterStep(
         pi.pRefValue = ctl.pRefValue;
         pi.solve = ctl.pressure;
 
+        DevicePressureTaps pt;
         deviceInterPressureStep(dm, pi, hooks.pressure, st.rAU, st.HbyA[0], st.HbyA[1], st.HbyA[2],
                                 st.phiHbyAInt, st.phiHbyABnd, p_rgh, phiInt, phiBnd,
-                                UX, UY, UZ, p);
+                                UX, UY, UZ, p, (taps && corr == 0) ? &pt : nullptr);
+        if (taps && corr == 0)
+        {
+            deviceCopy(taps->pDiag, pt.diag);
+            deviceCopy(taps->pUpper, pt.upper);
+            deviceCopy(taps->pLower, pt.lower);
+            deviceCopy(taps->pSource, pt.source);
+            deviceCopy(taps->pIC, pt.iC);
+            deviceCopy(taps->pBC, pt.bC);
+            deviceCopy(taps->rAUfAllTap, rAUfAll);
+            deviceCopy(taps->pSolved, p_rgh);
+        }
 
-        if (taps && corr == 0) deviceCopy(taps->phiHbyAInt, st.phiHbyAInt);
+        if (taps && corr == 0)
+        {
+            deviceCopy(taps->phiHbyAInt, st.phiHbyAInt);
+            deviceCopy(taps->phiHbyABnd, st.phiHbyABnd);
+        }
 
         // p_rgh.correctBoundaryConditions() at the end of pEqn.H, and U's with it: the next pass's
         // laplacian, its flux and its HbyA all read them.

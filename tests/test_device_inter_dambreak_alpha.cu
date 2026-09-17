@@ -26,6 +26,7 @@
 #include "inter_driver_cpp.cuh"
 #include "inter_solve_cpp.cuh"
 #include "inter_peqn_cpp.cuh"
+#include "pbicgstab.cuh"
 #include "inter_ueqn_cpp.cuh"
 #include "alpha_eqn_cpp.cuh"
 #include "device_inter_alpha_step.cuh"
@@ -315,27 +316,32 @@ int main(int argc, char** argv)
               "alpha flux's, times the density ratio", rw/rhoRatio < worst);
     }
 
-    // ---- THE WHOLE STEP on damBreak's own case: STILL UNDER DIAGNOSIS ----------------------------
-    // Runs only under BRAE_INTER_WHOLE_STEP. It is finite, bounded and advancing, and alpha tracks the
-    // host to 1.85e-03 of a field whose range is 1 -- but U is 1.60e-01 of 2.65e-01, SIXTY PER CENT,
-    // and that is a defect and not a tolerance. damBreak sets `momentumPredictor no`, so U comes only
-    // from HbyA + rAU*reconstruct((phig - flux)/rAUf): the error is in HbyA or in the momentum matrix
-    // under this case's real boundary conditions, neither of which the box fixture exercises. A red
-    // gate in the suite helps nobody, so it stays behind the switch until that is found.
+    // ---- THE WHOLE STEP on damBreak's own mesh and case ------------------------------------------
+    // Every one of interFoam's halves, on the case the host solver is itself gated against real
+    // OpenFOAM on: fixedFluxPressure on three walls whose gradient constrainPressure PRESCRIBES from
+    // phiHbyA, totalPressure at the atmosphere, noSlip walls, a pressureInletOutletVelocity outlet,
+    // and 4536 EMPTY faces. None of that appears on a box fixture.
     //
-    // WHAT THE ARM HAS ALREADY PAID FOR, all three found by running it:
-    //   fvc::reconstruct needs OpenFOAM's safeInv -- a 2-D mesh makes the tensor singular and the
-    //     plain cofactor inverse gave NaN in all 2268 cells (fvc_reconstruct_cpp.cuh).
-    //   the case must be fixed to `adjustTimeStep no` -- the host reads damBreak's own controlDict and
+    // WHAT GETTING HERE COST, every one found by running this arm and each worth keeping:
+    //   fvc::reconstruct needs OpenFOAM's safeInv -- a 2-D mesh makes the tensor singular and the plain
+    //     cofactor inverse gave NaN in all 2268 cells, which std::fmax then hid as 0.000e+00.
+    //   the case must be forced to `adjustTimeStep no` -- the host reads damBreak's own controlDict and
     //     grows dt, so the two sat at different physical times and alpha read 9.57e-01 out.
-    //   the step was not computing fvc::ddtCorr at all; adding it took alpha 2.28e-03 -> 1.85e-03 and
-    //     p_rgh 1.22e+02 -> 7.57e+01.
+    //   the step computed no fvc::ddtCorr at all, ran ONE pressure corrector where the case asks for
+    //     three, hardcoded div(rhoPhi,U) as upwind where the case says linearUpwind, and hardcoded
+    //     solutionD as all-valid on a 2-D mesh.
+    //   UbStored must be U's STORED patch values; filling it with deviceBCValue re-derives them and is
+    //     a no-op, which left the dev2 term 100% wrong on the atmosphere alone.
+    //   interFoam's pressureCorrector never called updateFromPatchVelocity, so the flux-conditional
+    //     velocity patches kept their written seed and UEqn's boundaryCoeffs came out 3.34e-06 where
+    //     OpenFOAM's own -- dumped with tools/dumpInterFoam -- are 0.
+    //   and THIS FILE's own hooks called mixtureNu(alpha1, alpha2, ...) where its second argument is
+    //     mu: nu = mu/(clamped blend), not a complement. Both sides used the same nonsense, so they
+    //     agreed with each other while runInterFoam, which calls it correctly, did not. That one was
+    //     worth 58% of U and it was in the gate, not in the code under test.
     //
-    // This needs damBreak's REAL conditions: fixedFluxPressure on three walls, whose gradient
-    // constrainPressure PRESCRIBES from phiHbyA, totalPressure at the atmosphere, noSlip walls and a
-    // pressureInletOutletVelocity outlet. BRAE_INTER_STEP_CHECK prints the first stage whose output is
-    // not finite, which is how the reconstruct defect was named.
-    if (std::getenv("BRAE_INTER_WHOLE_STEP"))
+    // BRAE_INTER_STEP_CHECK prints the first stage whose output is not finite; the taps below compare
+    // the momentum and pressure systems coefficient by coefficient.
     {
         InterFields ref = buildInterFields(caseDir, startDir, m, g, fvp);
         const RunReport w0 = runInterFoam(caseDir, startDir, m, g, fvp, nWarm + nSteps,
@@ -438,9 +444,13 @@ int main(int argc, char** argv)
             rhoF.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
           rhoF.evaluateBoundary();
           snRho.copyFrom(fullFace(fvc::snGrad(rhoF, m, g, fvp, false)));
-          std::vector<scalar> a2(static_cast<std::size_t>(nC)), nuv;
-          for (label c = 0; c < nC; ++c) a2[c] = scalar(1) - dv.alpha1.internal[c];
-          brae::cpu::twoPhase::mixtureNu(dv.alpha1.internal, a2, dv.mixture.phases, nuv);
+          // mixtureNu's SECOND argument is mu, not alpha2 (two_phase_mixture_cpp.cuh:130):
+          // nu = mu/(clamped blend). Passing the complement there gives nonsense, and because both
+          // sides of this comparison used the same nonsense they agreed with each other while
+          // runInterFoam -- which calls it correctly -- did not.
+          std::vector<scalar> muv, nuv;
+          brae::cpu::twoPhase::mixtureMu(dv.alpha1.internal, dv.mixture.phases, muv);
+          brae::cpu::twoPhase::mixtureNu(dv.alpha1.internal, muv, dv.mixture.phases, nuv);
           nuC.copyFrom(nuv);
           // nuEff AT ALPHA'S PATCH VALUES, not at the face cell's -- the same rule the boundary rho
           // follows, and for the same reason: at a contact-angle wall they are different fields.
@@ -448,9 +458,9 @@ int main(int argc, char** argv)
           for (std::size_t pi = 0; pi < fvp.size(); ++pi)
           { const std::vector<scalar>& v = dv.alpha1.boundary[pi]->value();
             abv.insert(abv.end(), v.begin(), v.end()); }
-          { std::vector<scalar> ab2(abv.size());
-            for (std::size_t i = 0; i < abv.size(); ++i) ab2[i] = scalar(1) - abv[i];
-            brae::cpu::twoPhase::mixtureNu(abv, ab2, dv.mixture.phases, nb); }
+          { std::vector<scalar> abMu;
+            brae::cpu::twoPhase::mixtureMu(abv, dv.mixture.phases, abMu);
+            brae::cpu::twoPhase::mixtureNu(abv, abMu, dv.mixture.phases, nb); }
           nuB.copyFrom(nb);
           snP.resize(0); };
         H.pressure.pressureCoeffs =
@@ -546,6 +556,7 @@ int main(int argc, char** argv)
         // the warm state, kept BEFORE the run: the hooks write dv.alpha1.internal every corrector, so
         // by the end it holds the device's own answer and cannot serve as a reference point.
         const std::vector<scalar> warmAlpha = dv.alpha1.internal;
+        const std::vector<scalar> warmPrgh  = dv.p_rgh.internal;
 
         // ---- ONE step with the taps open, against the host's own UEqn from the SAME state ---------
         // A final U that is 60% out cannot say which of a dozen operators did it. These can.
@@ -613,9 +624,9 @@ int main(int argc, char** argv)
                   { for (label i = 0; i < fvp[pi].size; ++i) rpBndH[pi].push_back(devRhoPhiB[o3 + i]);
                     o3 += fvp[pi].size; } }
 
-                std::vector<scalar> a2h(static_cast<std::size_t>(nC)), nuH, rhoOldH;
-                for (label c = 0; c < nC; ++c) a2h[c] = scalar(1) - devAlphaNow[c];
-                brae::cpu::twoPhase::mixtureNu(devAlphaNow, a2h, dv.mixture.phases, nuH);
+                std::vector<scalar> muH, nuH, rhoOldH;
+                brae::cpu::twoPhase::mixtureMu(devAlphaNow, dv.mixture.phases, muH);
+                brae::cpu::twoPhase::mixtureNu(devAlphaNow, muH, dv.mixture.phases, nuH);
                 { std::vector<scalar> a2o(static_cast<std::size_t>(nC));
                   for (label c = 0; c < nC; ++c) a2o[c] = scalar(1) - warmAlpha[c];
                   brae::cpu::twoPhase::mixtureRho(warmAlpha, a2o, dv.mixture.phases, rhoOldH); }
@@ -629,9 +640,11 @@ int main(int argc, char** argv)
                         const scalar a1b = av[i];
                         const scalar a2b = scalar(1) - a1b;
                         rhoBndH[pi].push_back(a1b*dv.mixture.phases.rho1 + a2b*dv.mixture.phases.rho2);
-                        std::vector<scalar> one{a1b}, two{a2b}, outv;
-                        brae::cpu::twoPhase::mixtureNu(one, two, dv.mixture.phases, outv);
+                        std::vector<scalar> one{a1b}, mu1, outv;
+                        brae::cpu::twoPhase::mixtureMu(one, dv.mixture.phases, mu1);
+                        brae::cpu::twoPhase::mixtureNu(one, mu1, dv.mixture.phases, outv);
                         nuBndH[pi].push_back(outv[0]);
+                        (void)a2b;
                     }
                 }
 
@@ -1031,7 +1044,96 @@ int main(int argc, char** argv)
                         wP = std::fmax(wP, std::fabs(dPhiH[f] - phiHh.internal[f]));
                         sP = std::fmax(sP, std::fabs(phiHh.internal[f]));
                     }
-                    std::printf("  [taps vs host] phiHbyA %.4e of %.4e\n", (double)wP, (double)sP);
+                    // ...AND ITS BOUNDARY, which fvc::div(phiHbyA) sums. Comparing the internal
+                    // faces alone leaves the pressure equation's source half unmeasured.
+                    std::vector<scalar> dPhiHB;
+                    taps.phiHbyABnd.copyTo(dPhiHB);
+                    scalar wPB = 0, sPB = 0;
+                    label o8 = 0;
+                    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                    {
+                        for (label i = 0; i < fvp[pi].size; ++i)
+                        {
+                            wPB = std::fmax(wPB, std::fabs(dPhiHB[o8 + i] - phiHh.boundary[pi][i]));
+                            sPB = std::fmax(sPB, std::fabs(phiHh.boundary[pi][i]));
+                        }
+                        o8 += fvp[pi].size;
+                    }
+                    std::printf("  [taps vs host] phiHbyA %.4e of %.4e;  BOUNDARY %.4e of %.4e\n",
+                                (double)wP, (double)sP, (double)wPB, (double)sPB);
+                    // ---- THE p_rgh MATRIX, coefficient by coefficient ------------------------
+                    // The source is exact on both sides now, so a p_rgh that is 7.5e+01 out has to be
+                    // the matrix. Built on the host from the DEVICE's own rAUf and p_rgh boundary, so
+                    // what is compared is the assembly.
+                    {
+                        std::vector<scalar> rAUfDev;
+                        taps.rAUfAllTap.copyTo(rAUfDev);
+                        SurfaceScalarField rfD;
+                        rfD.internal.assign(rAUfDev.begin(), rAUfDev.begin() + nIf);
+                        rfD.boundary.resize(fvp.size());
+                        { label oa = nIf;
+                          for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                            for (label i = 0; i < fvp[pi].size; ++i) rfD.boundary[pi].push_back(rAUfDev[oa++]); }
+                        FvScalarMatrix peH = fvm::laplacian<scalar>(rfD, dv.p_rgh, m, g, fvp, false);
+                        const std::vector<scalar> dvH = fvc::div(phiHh, m, g, fvp);
+                        for (label c = 0; c < nC; ++c) peH.source[c] += dvH[c]*g.V()[c];
+
+                        std::vector<scalar> pd, pu, pl, ps, pic, pbc;
+                        taps.pDiag.copyTo(pd);   taps.pUpper.copyTo(pu);  taps.pLower.copyTo(pl);
+                        taps.pSource.copyTo(ps); taps.pIC.copyTo(pic);    taps.pBC.copyTo(pbc);
+                        scalar wpd=0,spd=0,wpu=0,spu=0,wps=0,sps=0,wpi=0,spi2=0,wpb=0,spb=0;
+                        for (label c = 0; c < nC; ++c)
+                        { wpd=std::fmax(wpd,std::fabs(pd[c]-peH.diag[c])); spd=std::fmax(spd,std::fabs(peH.diag[c]));
+                          wps=std::fmax(wps,std::fabs(ps[c]-peH.source[c])); sps=std::fmax(sps,std::fabs(peH.source[c])); }
+                        for (label f = 0; f < nIf; ++f)
+                        { wpu=std::fmax(wpu,std::fabs(pu[f]-peH.upper[f])); spu=std::fmax(spu,std::fabs(peH.upper[f])); }
+                        { label ob = 0;
+                          for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                          { for (label i = 0; i < fvp[pi].size; ++i)
+                            { wpi=std::fmax(wpi,std::fabs(pic[ob+i]-peH.internalCoeffs[pi][i])); spi2=std::fmax(spi2,std::fabs(peH.internalCoeffs[pi][i]));
+                              wpb=std::fmax(wpb,std::fabs(pbc[ob+i]-peH.boundaryCoeffs[pi][i])); spb=std::fmax(spb,std::fabs(peH.boundaryCoeffs[pi][i])); }
+                            ob += fvp[pi].size; } }
+                        std::printf("  [pEqn vs host] diag %.4e of %.4e;  upper %.4e of %.4e;  "
+                                    "source %.4e of %.4e;  iC %.4e of %.4e;  bC %.4e of %.4e\n",
+                                    (double)wpd,(double)spd,(double)wpu,(double)spu,
+                                    (double)wps,(double)sps,(double)wpi,(double)spi2,
+                                    (double)wpb,(double)spb);
+                        (void)pl;
+
+                        // THE DECISIVE ONE. Matrix exact, source exact, solved field 6.4e+01 apart --
+                        // so either the two SOLVES differ, or `ref`/`r1` is not solving this system at
+                        // all and my reconstruction of the host's state is what is off. Solving THIS
+                        // matrix on the host, from the same starting p_rgh, separates the two: if it
+                        // lands on the device's answer, the device is right and the reference is the
+                        // problem.
+                        std::vector<scalar> pHost = warmPrgh;
+                        pbicgstab(peH, pHost, m, fvp, scalar(1e-12), scalar(0), 4000);
+                        std::vector<scalar> pDev;
+                        taps.pSolved.copyTo(pDev);
+                        scalar wSame = 0, sSame = 0;
+                        for (label c = 0; c < nC; ++c)
+                        {
+                            wSame = std::fmax(wSame, std::fabs(pDev[c] - pHost[c]));
+                            sSame = std::fmax(sSame, std::fabs(pHost[c]));
+                        }
+                        std::printf("  [pEqn vs host] SAME system solved on the host: %.4e of %.4e\n",
+                                    (double)wSame, (double)sSame);
+                    }
+
+                    { label o9 = 0;
+                      for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                      {
+                          scalar wq = 0, sq = 0;
+                          for (label i = 0; i < fvp[pi].size; ++i)
+                          {
+                              wq = std::fmax(wq, std::fabs(dPhiHB[o9 + i] - phiHh.boundary[pi][i]));
+                              sq = std::fmax(sq, std::fabs(phiHh.boundary[pi][i]));
+                          }
+                          std::printf("      phiHbyA_b %-14s %-8s %.4e of %.4e\n",
+                                      fvp[pi].name.c_str(), fvp[pi].type.c_str(),
+                                      (double)wq, (double)sq);
+                          o9 += fvp[pi].size;
+                      } }
                 }
 
                 // ---- ONE STEP, end to end, against the host at the SAME step count ---------------
@@ -1056,6 +1158,51 @@ int main(int argc, char** argv)
                     }
                     std::printf("  [one step] alpha %.4e;  U.x %.4e of %.4e;  p_rgh %.4e of %.4e\n",
                                 (double)wa1, (double)wu1, (double)su1, (double)wp1, (double)sp1);
+
+                    // IS THE p_rgh ERROR A CONSTANT? A pressure equation with no value-fixing patch is
+                    // singular and setReference pins one cell; if the two sides pin it differently the
+                    // whole field is offset by a constant and every derived quantity that reads a
+                    // GRADIENT is untouched. Subtracting the mean separates that from a real shape
+                    // difference in one number.
+                    scalar mean = 0;
+                    for (label c = 0; c < nC; ++c) mean += (p1[c] - r1.p_rgh.internal[c]);
+                    mean /= static_cast<scalar>(nC);
+                    scalar spread = 0;
+                    for (label c = 0; c < nC; ++c)
+                        spread = std::fmax(spread, std::fabs((p1[c] - r1.p_rgh.internal[c]) - mean));
+                    std::printf("  [one step] p_rgh error: mean %.4e, spread about it %.4e "
+                                "(a pure offset would leave the spread at round-off)\n",
+                                (double)mean, (double)spread);
+
+                    // WHERE is it? Interior against each patch's own cells, with the BC type beside
+                    // it -- the split that named the dev2 defect in one run.
+                    {
+                        std::vector<char> tp(static_cast<std::size_t>(nC), 0);
+                        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                        {
+                            if (fvp[pi].type == "empty") continue;
+                            for (label i = 0; i < fvp[pi].size; ++i) tp[fvp[pi].faceCells[i]] = 1;
+                        }
+                        scalar wIn2 = 0;
+                        int nIn2 = 0;
+                        for (label c = 0; c < nC; ++c)
+                            if (!tp[c]) { wIn2 = std::fmax(wIn2, std::fabs(p1[c] - r1.p_rgh.internal[c])); ++nIn2; }
+                        std::printf("      p_rgh interior (%d cells) %.4e\n", nIn2, (double)wIn2);
+                        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                        {
+                            if (fvp[pi].type == "empty") continue;
+                            scalar wp3 = 0;
+                            for (label i = 0; i < fvp[pi].size; ++i)
+                            {
+                                const label c = fvp[pi].faceCells[i];
+                                wp3 = std::fmax(wp3, std::fabs(p1[c] - r1.p_rgh.internal[c]));
+                            }
+                            std::printf("      p_rgh %-14s %-8s %.4e   (BC %s)\n",
+                                        fvp[pi].name.c_str(), fvp[pi].type.c_str(), (double)wp3,
+                                        dv.p_rgh.boundary[pi]->updateableSnGrad()
+                                            ? "prescribes its gradient" : "does not");
+                        }
+                    }
                 }
                 check("the device's momentum diagonal matches the host's on damBreak",
                       wD < scalar(1e-10)*sD);
@@ -1124,9 +1271,12 @@ int main(int argc, char** argv)
                     "p_rgh %.4e of %.4e;  the device moved alpha %.4e, excursion %.3e\n",
                     nSteps, (double)wa, (double)sa, (double)wu, (double)su,
                     (double)wp, (double)sp, (double)devMoved, (double)exc);
-        check("the whole device step tracks the host on damBreak", wa < scalar(1e-6));
-        check("...in the velocity it leaves", wu < scalar(1e-5)*std::fmax(su, scalar(1e-30)));
-        check("...and in the pressure", wp < scalar(1e-5)*std::fmax(sp, scalar(1e-30)));
+        // MEASURED over five steps: alpha 7.3e-11, U 6.8e-10 of 2.7e-01 (2.6e-09 relative), p_rgh
+        // 2.0e-07 of 2.8e+03 (6.9e-11). The bounds are two orders above those and far below anything
+        // a real defect has produced here -- the smallest of the six found through this arm was 1%.
+        check("the whole device step tracks the host on damBreak", wa < scalar(1e-8));
+        check("...in the velocity it leaves", wu < scalar(1e-7)*std::fmax(su, scalar(1e-30)));
+        check("...and in the pressure", wp < scalar(1e-8)*std::fmax(sp, scalar(1e-30)));
         check("...with alpha still bounded", exc <= scalar(1e-6));
     }
 

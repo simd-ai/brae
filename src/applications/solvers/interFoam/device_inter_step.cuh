@@ -88,10 +88,17 @@ struct DeviceInterStepTaps
     DeviceBuffer<scalar> rAU;
     DeviceBuffer<scalar> HbyA[3];
     DeviceBuffer<scalar> phiHbyAInt;      // AFTER the two interFoam terms
+    DeviceBuffer<scalar> phiHbyABnd;      // ...and its BOUNDARY, which fvc::div sums too
     DeviceBuffer<scalar> UEqnDiag;        // relaxed, as A() takes it
     DeviceBuffer<scalar> UEqnSourceX;
     DeviceBuffer<scalar> UEqnUpper, UEqnLower;
     DeviceBuffer<scalar> UEqnIC, UEqnBC;   // component 0
+    // the p_rgh system, first corrector: the raw LDU, the extensive source, and the boundary
+    // coefficients the fold uses. Source and matrix are separate questions and a solved field cannot
+    // tell them apart.
+    DeviceBuffer<scalar> pDiag, pUpper, pLower, pSource, pIC, pBC;
+    DeviceBuffer<scalar> rAUfAllTap;
+    DeviceBuffer<scalar> pSolved;         // p_rgh after the FIRST corrector's solve
     DeviceBuffer<scalar> ddtRhoOld;       // rho.oldTime(), the field the ddt source is built on
 };
 

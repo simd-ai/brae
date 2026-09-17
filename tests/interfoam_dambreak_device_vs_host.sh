@@ -45,7 +45,7 @@ cp -r "$W/case/0.orig" "$W/case/0"
 # error and is actually a clock. Measured before this was here: alpha 9.57e-01 out of a field whose
 # range is 1, on a device run that had advanced alpha by 1.85e-02 and a host run that had advanced it
 # by 9.56e-01.
-DT="$DT" python3 - "$W/case" <<'PYEOF'
+DT="$DT" BRAE_NCORR="${BRAE_NCORR:-}" python3 - "$W/case" <<'PYEOF'
 import os, re, sys
 d = sys.argv[1]
 p = os.path.join(d, 'system/controlDict')
@@ -54,9 +54,31 @@ for k, v in (('adjustTimeStep', 'no'), ('deltaT', os.environ['DT']), ('writeCont
     s = re.sub(r'^%s\s+.*' % k, '%-16s %s;' % (k, v), s, flags=re.M) \
         if re.search(r'^%s\s+' % k, s, re.M) else s + '\n%-16s %s;\n' % (k, v)
 open(p, 'w').write(s)
+
+# ...AND A TIGHT PRESSURE SOLVE, for the same reason as the fixed time step. damBreak asks for
+# `tolerance 1e-07; relTol 0.05` on p_rgh -- the host stops when the residual has fallen to FIVE PER
+# CENT of its initial value, while the device loop in the test solves to 1e-12. The comparison then
+# measures the two solvers' stopping points and not the discretisation at all: measured before this
+# was here, p_rgh was 6.35e+01 of 2.85e+03 (2.2%) and U 23%, spread over the whole field rather than
+# any one patch, with phiHbyA -- the pressure equation's entire input -- exact to 2.2e-19.
+q = os.path.join(d, 'system/fvSolution')
+t = open(q).read()
+t = re.sub(r'(p_rgh\w*\s*\{[^}]*?tolerance\s+)[^;]+;', r'\g<1>1e-12;', t)
+t = re.sub(r'(p_rgh\w*\s*\{[^}]*?relTol\s+)[^;]+;', r'\g<1>0;', t)
+# BISECT: BRAE_NCORR forces the PIMPLE corrector count on BOTH sides, so a difference that only
+# appears from the second corrector onward -- a field one side refreshes between passes and the other
+# does not -- separates from one present in the first.
+if os.environ.get('BRAE_NCORR'):
+    t = re.sub(r'(nCorrectors\s+)\d+;', r'\g<1>' + os.environ['BRAE_NCORR'] + ';', t)
+open(q, 'w').write(t)
 PYEOF
 if command -v setFields > /dev/null 2>&1; then
     ( cd "$W/case" && setFields > log.setFields 2>&1 ) || { echo "SKIP: setFields failed"; exit 77; }
 fi
 
-"$BIN" "$W/case" "$W/case/0" "$STEPS" "$DT"
+# BRAE_PTOL: brae's host driver hardcodes the p_rgh solve to 1e-9 (inter_driver_cpp.cu) rather than
+# reading the case's solvers/p_rgh entry, and the device loop in the test solves to 1e-12. Two
+# different stopping points make the comparison measure the solvers and not the discretisation, so
+# both are pinned here. damBreak's own entry is `tolerance 1e-07; relTol 0.05` -- five per cent of the
+# initial residual -- which is looser still.
+BRAE_NCORR=${BRAE_NCORR:-} BRAE_PTOL=${BRAE_PTOL:-1e-12} "$BIN" "$W/case" "$W/case/0" "$STEPS" "$DT"

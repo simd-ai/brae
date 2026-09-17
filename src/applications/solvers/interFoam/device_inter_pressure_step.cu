@@ -48,7 +48,8 @@ scalar deviceInterPressureStep(
     DeviceBuffer<scalar>&              UX,
     DeviceBuffer<scalar>&              UY,
     DeviceBuffer<scalar>&              UZ,
-    DeviceBuffer<scalar>&              p)
+    DeviceBuffer<scalar>&              p,
+    DevicePressureTaps*                taps)
 {
     if (!in.stf || !in.ghf || !in.snGradRho || !in.magSf || !in.rAUfAll || !in.rho || !in.gh)
         throw std::runtime_error("brae interFoam device pEqn: a required field is missing.");
@@ -98,6 +99,16 @@ scalar deviceInterPressureStep(
     DevicePressureMatrix P;
     deviceInterAssemblePEqn(dm, rAUfInt, phiHbyAInt, phiHbyABnd,
                             in.needReference, in.pRefCell, in.pRefValue, P);
+
+    if (taps)
+    {
+        deviceCopy(taps->diag,   P.diag);
+        deviceCopy(taps->upper,  P.upper);
+        deviceCopy(taps->lower,  P.lower);
+        deviceCopy(taps->source, P.source);
+        deviceCopy(taps->iC,     iC);
+        deviceCopy(taps->bC,     bC);
+    }
 
     // fold the boundary in and solve.
     DeviceBuffer<scalar> diagC, b;
