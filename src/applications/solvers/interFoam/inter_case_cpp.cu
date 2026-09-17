@@ -574,8 +574,13 @@ InterFields buildInterFields(const std::string&          caseDir,
     f.ghRefValue = ghRef(f.g, f.hRef);
 
     // --- the read fields ----------------------------------------------------------------------
-    f.alpha1 = buildField<scalar>(readField<scalar>(startDir + "/" + f.alphaName), patches, nC);
-    f.U      = buildField<vector>(readField<vector>(startDir + "/U"),              patches, nC);
+    // THE WAVE CONDITIONS ARE CLAIMED HERE, on this reader's own copy of the file data, and nowhere
+    // else: the shared factory refuses both type names, so no other solver can build one frozen.
+    FieldData<scalar> alphaData = readField<scalar>(startDir + "/" + f.alphaName);
+    FieldData<vector> UData = readField<vector>(startDir + "/U");
+    f.waves = readInterWaves(caseDir, startDir, alphaData, UData, patches, f.g, f.alphaName);
+    f.alpha1 = buildField<scalar>(alphaData, patches, nC);
+    f.U = buildField<vector>(UData, patches, nC);
     f.p_rgh  = buildField<scalar>(readField<scalar>(startDir + "/p_rgh"),          patches, nC);
     f.alpha1.evaluateBoundary();
     f.U.evaluateBoundary();

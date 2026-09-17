@@ -50,6 +50,7 @@
 #include "inter_create_fields_cpp.cuh"
 #include "inter_linear_solve.cuh"
 #include "inter_turbulence_cpp.cuh"
+#include "inter_waves_cpp.cuh"
 #include "mules_cpp.cuh"
 #include <memory>
 #include <string>
@@ -183,6 +184,8 @@ struct InterFields
     AlphaLinearSolve uSolveFinal;
     // incompressibleInterPhaseTransportModel: laminar, or kEpsilon in one of its two lineages
     InterTurbulence turbulence;
+    // waveAlpha / waveVelocity patches and their models -- see inter_waves_cpp.cuh for the timing
+    InterWaves waves;
     // solvers/p_rgh
     PressureLinearSolve pSolve;
     // solvers/p_rghFinal

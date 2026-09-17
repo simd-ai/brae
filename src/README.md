@@ -41,6 +41,7 @@ dictionary access are all the second kind.
 | `src/matrices/lduMatrix/preconditioners/DILUPreconditioner/` | same | level-scheduled DILU |
 | `src/finiteVolume/` | `src/finiteVolume/` | fields, fvMesh, fvMatrices, fvc/fvm, cfdTools |
 | `src/TurbulenceModels/` | `src/TurbulenceModels/` | momentum transport models |
+| `src/waveModels/` | `src/waveModels/` | the wave generation and absorption models behind `waveAlpha` / `waveVelocity` |
 | `src/applications/solvers/` | `applications/solvers/` | thin drivers only |
 
 Paths follow **the OpenFOAM version actually being mirrored**. v2412 puts the turbulence models under

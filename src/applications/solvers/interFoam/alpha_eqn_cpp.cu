@@ -396,6 +396,11 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
         // Su, Sp and divU are all zeroField for interFoam (interFoam/alphaSuSp.H), so the right-hand
         // side vanishes; it is written out above rather than dropped because interPhaseChangeFoam's
         // own alphaSuSp.H makes all three live.
+        // ...and the fvMatrix constructor's updateCoeffs, ahead of the assembly that reads it
+        if (in.updateModelledBoundary)
+        {
+            in.updateModelledBoundary();
+        }
         FvScalarMatrix M = fvm::div<scalar>(in.phiCN->internal, in.phiCN->boundary, alpha1, m, patches);
 
         // fvm::ddt(alpha1), Euler, rho == 1: diag += V/dt, source += V*alpha.oldTime()/dt.
@@ -543,6 +548,12 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
             // MULES::explicitSolve(geometricOneField(), alpha1, phiCN, alphaPhi10, 0, 0, 1, 0) --
             // alphaEqn.H:208-220. alphaPhi10 IS alphaPhiUn on the explicit path, limited in place.
             alphaPhi10 = un;
+            // `un` above read alpha's patch values as the LAST update left them; the limiter below
+            // reads them as this one leaves them -- see AlphaStepInput::updateModelledBoundary
+            if (in.updateModelledBoundary)
+            {
+                in.updateModelledBoundary();
+            }
             MULES::explicitSolveLimited(scalar(1)/in.deltaT, alpha1, alpha1Old, *in.phiCN, alphaPhi10,
                                         mf, mulesCtl, m, g, patches);
         }

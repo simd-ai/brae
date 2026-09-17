@@ -105,6 +105,17 @@ RunReport runInterFoamDevice(
               "step, which runs none. The host path (no -device) does.");
     }
 
+    // ...AND THE WAVE CONDITIONS. Their values change inside the alpha sub-cycle, between the
+    // high-order flux and the limiter, and the device alpha step has no such point yet: it would run
+    // with the inlet frozen at the case file's `value`.
+    if (f.waves.any)
+    {
+        throw std::runtime_error(
+            "brae interFoam (device): the case has waveAlpha/waveVelocity patches, which the device "
+            "loop does not update -- it would freeze them at the file's `value`. The host path (no "
+            "-device) runs them.");
+    }
+
     DeviceMesh dm = buildDeviceMesh(m, g, fvp);
 
     // the masks the device needs that the mesh does not carry
@@ -296,10 +307,15 @@ RunReport runInterFoamDevice(
         // implicit in the pressure equation, and carrying it into both would count it twice.
         if (f.momentumPredictorOn)
         {
+            // the gradient the last constrainPressure left, and zero only before the first -- see the
+            // host driver's UEqn stage for what zeroing it every step cost
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-                if (f.p_rgh.boundary[pi]->updateableSnGrad())
-                    f.p_rgh.boundary[pi]->updateSnGrad(
-                        std::vector<scalar>(static_cast<std::size_t>(fvp[pi].size), scalar(0)));
+            {
+                if (!f.p_rgh.boundary[pi]->updateableSnGrad()) continue;
+                if (f.p_rgh.boundary[pi]->snGradEverSet()) continue;
+                f.p_rgh.boundary[pi]->updateSnGrad(
+                    std::vector<scalar>(static_cast<std::size_t>(fvp[pi].size), scalar(0)));
+            }
             snP.copyFrom(fullFace(fvc::snGrad(f.p_rgh, m, g, fvp, false), fvp));
         }
         else snP.resize(0);
@@ -319,9 +335,17 @@ RunReport runInterFoamDevice(
             const FvPatch& q = fvp[pi];
             if (f.p_rgh.boundary[pi]->updateableSnGrad())
             {
+                // (phiHbyA_b - (Sf_b & U_b))/(magSf_b*rAUf_b): the VELOCITY's flux, not the stored
+                // phi_b -- see pressureCorrector, and tests/interfoam_waves_vs_openfoam.sh for what
+                // the difference is worth on a patch whose U_b changes. f.U's patch values are current:
+                // updateUBoundary ran after the last corrector.
+                const std::vector<vector>& ub = f.U.boundary[pi]->value();
                 std::vector<scalar> sn(static_cast<std::size_t>(q.size));
                 for (label i = 0; i < q.size; ++i)
-                    sn[i] = (hB[off + i] - f.phi.boundary[pi][i]) / (q.magSf[i] * rA[nIf + off + i]);
+                {
+                    const scalar SfU = dot(g.Sf()[q.start + i], ub[i]);
+                    sn[i] = (hB[off + i] - SfU) / (q.magSf[i] * rA[nIf + off + i]);
+                }
                 f.p_rgh.boundary[pi]->updateSnGrad(sn);
             }
             off += q.size;

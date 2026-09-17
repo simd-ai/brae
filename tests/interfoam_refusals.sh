@@ -62,6 +62,18 @@ cp -r "$BR/0.orig" "$BR/0"
 sed -i 's/^endTime .*/endTime         0.0002;/; s/^deltaT .*/deltaT          1e-4;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
     "$BR/system/controlDict"
 
+# ...and laminar/waves/stokesI, for the wave boundary conditions, on a coarser mesh than it ships
+SRCW="$TUT/multiphase/interFoam/laminar/waves/stokesI"
+[ -d "$SRCW" ] || { echo "SKIP: waves/stokesI tutorial not found at $SRCW"; exit 77; }
+BW="$W/baseWaves"
+cp -r "$SRCW" "$BW" || exit 1
+cp -r "$BW/0.orig" "$BW/0"
+sed -i 's/(500 1 75) simpleGrading/(50 1 75) simpleGrading/' "$BW/system/blockMeshDict"
+( cd "$BW" && blockMesh > log.blockMesh 2>&1 && setFields > log.setFields 2>&1 ) \
+    || { echo "SKIP: blockMesh/setFields failed on waves/stokesI"; exit 77; }
+sed -i 's/^endTime .*/endTime         0.02;/; s/^deltaT .*/deltaT          0.01;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
+    "$BW/system/controlDict"
+
 HAVE_GPU=0
 if command -v nvidia-smi > /dev/null 2>&1 && nvidia-smi > /dev/null 2>&1; then HAVE_GPU=1; fi
 
@@ -174,6 +186,20 @@ BASE="$B"
 arm mompred_noUFinal        refused "UFinal"                  "" "sed -i 's/momentumPredictor  *no;/momentumPredictor yes;/' system/fvSolution"
 arm mompred_withUFinal      runs    -                        "" "sed -i 's/momentumPredictor  *no;/momentumPredictor yes;/; s/^\( *\)U\$/\1\"U.*\"/' system/fvSolution"
 
+# WAVES. The host runs waveAlpha and waveVelocity over StokesI and shallowWaterAbsorption, and
+# nothing else under those names.
+BASE="$BW"
+arm waves_baseline          runs    -                        "" true
+arm waves_StokesII          refused "StokesII"                "" "sed -i 's/waveModel  *StokesI;/waveModel       StokesII;/' constant/waveProperties"
+arm waves_noPatchEntry      refused "no entry for patch"      "" "sed -i 's/^outlet\$/outletElsewhere/' constant/waveProperties"
+arm waves_noProperties      refused "no constant/waveProperties" "" "rm constant/waveProperties"
+arm waves_otherAlpha        refused "alpha.oil"               "" "sed -i '0,/alpha  *alpha.water;/s//alpha           alpha.oil;/' constant/waveProperties"
+arm waves_noRampTime        refused "rampTime"                "" "sed -i '/rampTime/d' constant/waveProperties"
+arm waves_noActiveAbsorption refused "activeAbsorption"       "" "sed -i '/activeAbsorption/d' constant/waveProperties"
+arm waves_restart           refused "this is a restart"       "" "mkdir -p 0/uniform; printf '%s\nwaterDepthRef 0.6;\n' '$HDR' > 0/uniform/waveProperties.inlet"
+arm waves_otherWaveDict     refused "waveDict"                "" "sed -i '0,/type  *waveVelocity;/s//type            waveVelocity;\n        waveDict        otherWaves;/' 0/U"
+BASE="$B"
+
 # PIMPLE controls the HOST honours...
 arm host_nOuter2            runs    -                        "" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' system/fvSolution"
 arm host_nNonOrth1          runs    -                        "" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"
@@ -185,6 +211,9 @@ if [ $HAVE_GPU = 1 ]; then
     arm device_nNonOrth1    refused "nNonOrthogonalCorrectors 1" "-device" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"
     arm device_mesh_dynamic refused "dynamicRefineFvMesh"     "-device" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
     # the device loop carries the kEpsilon closure now, in both lineages
+    # the wave conditions are the host's only: the device loop would freeze them at the file's value
+    BASE="$BW"
+    arm device_waves        refused "waveAlpha/waveVelocity"  "-device" true
     BASE="$BR"
     arm device_ras          runs    -                        "-device" true
     arm device_ras_uniform  runs    -                        "-device" "sed -i 's/^density .*/density uniform;/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,k) /div(phi,k) /; s/div(rhoPhi,epsilon) /div(phi,epsilon) /' system/fvSchemes"

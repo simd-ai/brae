@@ -375,10 +375,22 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
 
     // constrainPressure(p_rgh, U, phiHbyA, rAUf, MRF): a fixedFluxPressure patch's gradient is
     // PRESCRIBED from the flux, and brae refuses to assemble one that has not been set.
+    //
+    //     snGrad = (phiHbyA_b - (Sf_b & U_b)) / (magSf_b * rAUf_b)          constrainPressure.C:62-72
+    //
+    // THE FLUX SUBTRACTED IS THE VELOCITY'S, Sf & U_b -- NOT the stored phi_b, which is what this took.
+    // The two are the same number on a wall that does not move, which is every fixedFluxPressure
+    // patch this solver had met: there phi_b is whatever the last corrector left, 0 or 1.9e-37. On a
+    // patch whose U_b CHANGES they are not: with phi_b the corrector hands back exactly the flux it
+    // was given, so a flux that starts at zero stays at zero and the inlet never opens. Measured on
+    // laminar/waves/stokesI after ten steps, against real OpenFOAM, with the wave model's own patch
+    // values exact to 4e-16: U 260% out, and OpenFOAM's own answer with the wave switched OFF was
+    // closer to it (64%) than brae was.
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         if (!p_rgh.boundary[pi]->updateableSnGrad()) continue;
         const FvPatch& q = patches[pi];
+        const std::vector<vector>& ub = U.boundary[pi]->value();
         std::vector<scalar> sn(static_cast<std::size_t>(q.size));
         for (label i = 0; i < q.size; ++i)
         {
@@ -386,10 +398,8 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
             const scalar ph = (pi < phiHbyA.boundary.size()
                                && static_cast<std::size_t>(i) < phiHbyA.boundary[pi].size())
                             ? phiHbyA.boundary[pi][i] : scalar(0);
-            const scalar Uf = (pi < phi.boundary.size()
-                               && static_cast<std::size_t>(i) < phi.boundary[pi].size())
-                            ? phi.boundary[pi][i] : scalar(0);
-            sn[i] = (ph - Uf) / (q.magSf[i] * rf);
+            const scalar SfU = dot(g.Sf()[q.start + i], ub[i]);
+            sn[i] = (ph - SfU) / (q.magSf[i] * rf);
         }
         p_rgh.boundary[pi]->updateSnGrad(sn);
     }

@@ -80,6 +80,11 @@ public:
         throw std::runtime_error("brae: updateSnGrad called on patch '" + patch_.name +
                                  "', which is not an updateable-snGrad boundary condition.");
     }
+    // Has updateSnGrad EVER been called? An updateable-snGrad patch KEEPS the gradient the last
+    // constrainPressure gave it, and an explicit fvc::snGrad(p) between two pressure equations reads
+    // exactly that -- so a caller that needs "a gradient" there may supply OpenFOAM's construction
+    // value, zero, only while this is false. True on every patch that has no such gradient.
+    virtual bool snGradEverSet() const { return true; }
 
     // Is this specifically an inletOutlet? adjustPhi (pEqn.H) branches on
     // `Up.fixesValue() && !isA<inletOutletFvPatchVectorField>(Up)` -- it needs BOTH questions, because
@@ -982,6 +987,7 @@ public:
         grad_ = g;
         everUpdated_ = true;
     }
+    bool snGradEverSet() const override { return everUpdated_; }
     std::vector<scalar> valueInternalCoeffs() const override
     { requireUpdated(); return FixedGradientPatchField<scalar>::valueInternalCoeffs(); }
     std::vector<scalar> valueBoundaryCoeffs() const override

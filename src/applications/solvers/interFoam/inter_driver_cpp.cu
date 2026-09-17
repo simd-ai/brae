@@ -134,11 +134,25 @@ RunReport runInterFoam(
                                     "phiCN, not alphaPhi10. This run is deliberately wrong. ***\n");
                     }
 
+                    // which sub-cycle this is, 1-based: the wave conditions are evaluated at the
+                    // SUB-CYCLE's time and time index (inter_waves_cpp.cuh)
+                    label subCycle = 0;
                     auto step1 = [&](const std::vector<scalar>& aOld, scalar dtSub,
                                      std::vector<scalar>& aNew, SurfaceScalarField& rPhi)
                     {
+                        ++subCycle;
                         AlphaStepInput sub = ai;
                         sub.deltaT = dtSub;
+                        if (f.waves.any)
+                        {
+                            const SubCycleClock clock = subCycleClock(
+                                rep.time, rep.deltaT, rep.steps, f.alphaCtl.nAlphaSubCycles, subCycle);
+                            sub.updateModelledBoundary = [&f, &m, &g, &patches, clock]()
+                            {
+                                updateWaveAlpha(f.waves, f.alpha1, f.U, clock.t, clock.timeIndex,
+                                                m, g, patches);
+                            };
+                        }
                         SurfaceScalarField aPhi;
                         alphaEqnStep(f.alpha1, aOld, sub, f.interface, f.mulesCtl,
                                      m, g, patches, aPhi, rPhi, f.nHatf, f.K, &prevCorr);
@@ -188,6 +202,11 @@ RunReport runInterFoam(
                     // Splitting them across two hook calls would mean rebuilding the curvature.
                     if (s == Stage::pEqn) break;       // done in the UEqn pass, see above
 
+                    // U's boundaryField().updateCoeffs(), which UEqn's fvMatrix constructor runs: the
+                    // step's own time and time index, so a wave model the alpha sub-cycles updated
+                    // updates AGAIN, from the alpha they left. Ahead of everything that reads U_b.
+                    updateWaveVelocity(f.waves, f.alpha1, f.U, rep.time, rep.steps, m, g, patches);
+
                     // UEqn.H uses mixture.surfaceTensionForce(), which reads the K the LAST
                     // mixture.correct() left -- it does not recompute one. An extra pass here would
                     // put UEqn's force one iteration ahead of the alpha equation's.
@@ -218,12 +237,22 @@ RunReport runInterFoam(
                             stf.boundary[pi][i] = sKf.boundary[pi][i] * snA.boundary[pi][i];
                     }
 
-                    // constrainPressure before snGrad(p_rgh): a fixedFluxPressure gradient is
-                    // PRESCRIBED, and brae refuses to assemble one that has not been set.
+                    // fvc::snGrad(p_rgh) ON A fixedFluxPressure PATCH IS THE GRADIENT THE LAST
+                    // constrainPressure LEFT THERE -- the previous step's last corrector's -- and zero
+                    // only before the first one, which is OpenFOAM's construction value
+                    // (fixedFluxPressureFvPatchScalarField.C, `gradient() = 0.0`). This zeroed it EVERY
+                    // step. The term is read by the momentum predictor alone, and on a wall whose
+                    // alpha is zeroGradient the stored gradient IS zero (phig_b vanishes with
+                    // snGrad(rho)), which is every predictor case gated before this one. On
+                    // waves/stokesI with `momentumPredictor yes` the inlet's is not: measured against
+                    // real OpenFOAM after twenty steps, alpha 5.1e-04 and U 5.4% with the zero.
                     for (std::size_t pi = 0; pi < patches.size(); ++pi)
-                        if (f.p_rgh.boundary[pi]->updateableSnGrad())
-                            f.p_rgh.boundary[pi]->updateSnGrad(
-                                std::vector<scalar>(static_cast<std::size_t>(patches[pi].size), scalar(0)));
+                    {
+                        if (!f.p_rgh.boundary[pi]->updateableSnGrad()) continue;
+                        if (f.p_rgh.boundary[pi]->snGradEverSet()) continue;
+                        f.p_rgh.boundary[pi]->updateSnGrad(
+                            std::vector<scalar>(static_cast<std::size_t>(patches[pi].size), scalar(0)));
+                    }
                     const SurfaceScalarField snP = fvc::snGrad(f.p_rgh, m, g, patches, false);
 
                     SurfaceScalarField force;

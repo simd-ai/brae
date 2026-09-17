@@ -63,6 +63,7 @@
 #include "interface_properties_cpp.cuh"
 #include "mules_cpp.cuh"
 #include "inter_solve_record.cuh"
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -234,6 +235,14 @@ struct AlphaStepInput
     // of the alpha flux OpenFOAM passes. tests/interfoam_dambreak_vs_openfoam.sh's `outflow` profile
     // runs it to show the gate fails when that argument is wrong: 5.5e-03 of alpha against 4.6e-13.
     bool controlPrevCorrOutletOnPhiCN = false;
+
+    // alpha1's boundaryField().updateCoeffs(), for the conditions whose value a MODEL supplies --
+    // waveAlpha. Called where OpenFOAM's first one of the pass fires: at the pre-solve's matrix
+    // construction under MULESCorr, and otherwise at the correctBoundaryConditions() that OPENS
+    // MULES::explicitSolve (MULESTemplates.C:168) -- AFTER the high-order flux has been built on the
+    // values the last update left, and BEFORE the limiter builds its bounded flux on these. Null on a
+    // case with no such patch.
+    std::function<void()> updateModelledBoundary;
 };
 
 // One alphaEqn.H. `alpha1` carries the field AND its boundary conditions and is advanced in place;
