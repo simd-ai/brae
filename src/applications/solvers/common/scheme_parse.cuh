@@ -354,7 +354,15 @@ inline FieldGradScheme parseNamedGradScheme(const std::string& caseDir, const st
 }
 
 
-inline FieldDivScheme parseFieldDivScheme(const std::string& caseDir, const std::string& field, bool vectorField = false)
+// `fluxName` is the flux the equation is WRITTEN with, which is part of the dictionary key: interFoam's
+// `density variable` turbulence convects k with rhoPhi and looks up `div(rhoPhi,k)`, where every other
+// caller's key is `div(phi,<field>)`. The two are different entries and a case names the one its
+// lineage reads -- RAS/damBreak ships div(rhoPhi,k) and no div(phi,k) at all.
+inline FieldDivScheme parseFieldDivScheme(
+    const std::string& caseDir,
+    const std::string& field,
+    bool vectorField = false,
+    const std::string& fluxName = "phi")
 {
     // Same source as parseFvSchemesControls: $-expanded, so `div(phi,tracer0) $turbulence;` resolves.
     const std::string all = readFvSchemesText(caseDir);
@@ -363,7 +371,7 @@ inline FieldDivScheme parseFieldDivScheme(const std::string& caseDir, const std:
     // first and misreports why a lookup failed -- every fvSchemes has several `default` lines.
     std::string raw = fvSchemesBlock(all, "divSchemes");
     if (raw.empty()) raw = all;
-    const std::string key = "div(phi," + field + ")";
+    const std::string key = "div(" + fluxName + "," + field + ")";
 
     // Find the statement for this field: from the key to its terminating ';'.
     const std::size_t k = raw.find(key);

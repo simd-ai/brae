@@ -131,6 +131,7 @@ add_library(brae_core STATIC
     src/applications/solvers/simpleFoam/createFields_cpp.cu
     src/applications/solvers/interFoam/inter_driver_cpp.cu
     src/applications/solvers/interFoam/inter_case_cpp.cu
+    src/applications/solvers/interFoam/inter_turbulence_cpp.cu
     src/transportModels/interfaceProperties/device_interface_properties.cu
     src/transportModels/twoPhaseMixture/device_two_phase_mixture.cu
     src/transportModels/interfaceProperties/interface_properties_cpp.cu
@@ -3348,6 +3349,16 @@ target_include_directories(test_inter_dambreak_vs_openfoam PRIVATE ${BRAE_HEADER
 target_link_libraries(test_inter_dambreak_vs_openfoam PRIVATE brae_core)
 add_test(NAME interfoam_dambreak_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_dambreak_vs_openfoam.sh)
+
+# ...and RAS/damBreak: kEpsilon in BOTH of incompressibleInterPhaseTransportModel's lineages, against
+# real OpenFOAM's fields and its epsilon and k solver log, with OpenFOAM's laminar answer and its
+# other lineage's as the controls.
+add_executable(test_inter_ras_dambreak_vs_openfoam tests/test_inter_ras_dambreak_vs_openfoam.cu)
+target_include_directories(test_inter_ras_dambreak_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_ras_dambreak_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_ras_dambreak_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_ras_dambreak_vs_openfoam.sh)
 
 # ...and capillaryRise, where surface tension IS the answer rather than a correction, and which is the
 # ONLY shipped interFoam tutorial with a contact angle. damBreak would still look broadly right with

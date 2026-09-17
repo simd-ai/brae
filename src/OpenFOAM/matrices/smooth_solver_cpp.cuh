@@ -44,6 +44,17 @@
 
 namespace brae {
 
+// WHICH LINEAR SOLVER the case names for a field. Null, where a caller takes a pointer to one, keeps
+// PBiCGStab -- what every caller ran before there was a choice. `smoothSolver` runs brae::smoothSolver
+// below, OpenFOAM's own.
+struct LinearSolverChoice
+{
+    bool smoothSolver = false;
+    // symGaussSeidel (true) or GaussSeidel (false)
+    bool symmetric = true;
+    int nSweeps = 1;
+};
+
 // ownerStartAddr: for cell c, the internal faces it owns are [ownStart[c], ownStart[c+1]). Throws if
 // the internal faces are not in OpenFOAM's upper-triangular order (sorted by owner, owner < neighbour),
 // because both smoothers are only the ones OpenFOAM runs on a mesh ordered that way.

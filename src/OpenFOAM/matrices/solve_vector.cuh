@@ -14,16 +14,9 @@
 
 namespace brae {
 
-// WHICH LINEAR SOLVER the case names for the field. Null keeps PBiCGStab, which is what every caller
-// here ran before there was a choice. `smoothSolver` runs brae::smoothSolver -- OpenFOAM's own, see
-// smooth_solver_cpp.cuh -- component by component, as fvMatrix<vector>::solveSegregated does.
-struct VectorLinearSolver
-{
-    bool smoothSolver = false;
-    // symGaussSeidel (true) or GaussSeidel (false)
-    bool symmetric = true;
-    int nSweeps = 1;
-};
+// The choice is LinearSolverChoice (smooth_solver_cpp.cuh). `smoothSolver` runs component by component,
+// as fvMatrix<vector>::solveSegregated does.
+using VectorLinearSolver = LinearSolverChoice;
 
 // `solutionD` is fvMesh::validComponents<vector>() -- polyMesh::solutionD(): given, a component it
 // knocks out (-1) is NOT solved, exactly fvMatrixSolve.C:162-164's `continue`, and its entry in

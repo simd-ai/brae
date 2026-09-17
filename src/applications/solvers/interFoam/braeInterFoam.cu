@@ -10,11 +10,18 @@
 // the defect this project keeps finding one level up: the gate proves the step, the driver feeds it
 // something else, and nothing compares the two.
 //
-// WHAT IT WILL NOT RUN. Every refusal the components carry is in force: a non-laminar simulationType
-// (interFoam's turbulence is a MIXTURE model, not the single-phase one brae has), `vanLeerV` or
-// `limitedLinear` on div(rhoPhi,U), `interfaceCompression` on div(phirb,alpha), localEuler/LTS,
-// CrankNicolson under sub-cycling, MRF, fvOptions, and a case that omits nAlphaCorr, nAlphaSubCycles,
-// cAlpha, maxAlphaCo or -- under MULESCorr -- nLimiterIter. Each throws by name.
+// WHAT IT RUNS TURBULENT: RAS kEpsilon on the host, in both of interFoam's lineages -- the ordinary
+// single-phase model, and under `density variable` the rho-weighted one (inter_turbulence_cpp.cuh).
+// An earlier version of this header said interFoam's turbulence "is a MIXTURE model, not the
+// single-phase one brae has". That was written from memory and is wrong for 15 of the 17 turbulent
+// tutorials: incompressibleInterPhaseTransportModel.C:99-106 constructs the ordinary one by default.
+//
+// WHAT IT WILL NOT RUN. Every refusal the components carry is in force: LES and every RASModel but
+// kEpsilon, turbulence on `-device`, `vanLeerV` or `limitedLinear` on div(rhoPhi,U),
+// `interfaceCompression` on div(phirb,alpha), any ddtSchemes default but Euler, a `corrected` or
+// `limited` laplacian or snGrad on a mesh that is not orthogonal, MRF, fvOptions, and a case that
+// omits nAlphaCorr, nAlphaSubCycles, cAlpha, maxAlphaCo or -- under MULESCorr -- nLimiterIter. Each
+// throws by name.
 //
 // THAT LIST WAS NOT TRUE when it was written: MRF and fvOptions were named here and refused nowhere,
 // and a moving or refining mesh was not even named. brae was run over all 44 shipped tutorials and the

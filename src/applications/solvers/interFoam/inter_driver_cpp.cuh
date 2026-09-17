@@ -51,6 +51,10 @@ struct RunReport
     // ...and the momentum predictor's, per component -- Ux, Uy, Uz -- when the case runs one. A
     // component the mesh does not solve (the empty direction of a 2-D case) stays empty.
     std::vector<LinearSolveRecord> uSolves[3];
+    // ...and the closure's two, one each per time step, on a RAS case: epsilon first, as kEpsilon.C
+    // solves them
+    std::vector<LinearSolveRecord> epsilonSolves;
+    std::vector<LinearSolveRecord> kSolves;
 };
 
 // Run `nSteps` of interFoam on a prepared case. Returns the state at the end; `verbose` prints the

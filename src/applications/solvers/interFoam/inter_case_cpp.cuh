@@ -48,6 +48,8 @@
 #include "inter_ueqn_cpp.cuh"
 #include "inter_solve_cpp.cuh"
 #include "inter_create_fields_cpp.cuh"
+#include "inter_linear_solve.cuh"
+#include "inter_turbulence_cpp.cuh"
 #include "mules_cpp.cuh"
 #include <memory>
 #include <string>
@@ -56,6 +58,16 @@
 namespace brae {
 namespace cpu {
 namespace interFoam {
+
+// What the case's laplacianSchemes and snGradSchemes `default` say about the NON-ORTHOGONAL part.
+struct NonOrthScheme
+{
+    // `corrected`, or `limited` with a coefficient above 0
+    bool corrected = false;
+    // `limited <c>` with 0 < c < 1; 0 is "not limited", brae's convention throughout fvm/fvc
+    scalar limitCoeff = 0;
+    std::string raw;
+};
 
 struct InterFields
 {
@@ -115,6 +127,11 @@ struct InterFields
     AlphaFluxScheme              divPhirbAlpha  = AlphaFluxScheme::linear;
     AlphaDdt                     ddtAlpha       = AlphaDdt::Euler;
     DdtScheme                    ddtU           = DdtScheme::Euler;
+    // laplacianSchemes and snGradSchemes `default`. brae's interFoam assembles orthogonal, so these
+    // exist to REFUSE a corrected scheme on a mesh where the correction is not zero -- see
+    // refuseUncorrectedOnSkewMesh -- and to hand the turbulence closure the case's own.
+    NonOrthScheme laplacianScheme;
+    NonOrthScheme snGradScheme;
 
     // fvSolution's PIMPLE block. READ, not assumed: damBreak sets `momentumPredictor no`, which means
     // UEqn is ASSEMBLED AND NEVER SOLVED -- the matrix exists so pEqn can take A() and H() from it,
@@ -155,19 +172,7 @@ struct InterFields
     // THE CASE'S alpha SOLVE, which only a MULESCorr case performs (the implicit upwind pre-solve,
     // alphaEqn.H:103-149). It used to run at a struct default of 1e-8 on the host and a hardcoded
     // 1e-12 on the device, neither read from the case. Defaults are lduMatrix::solver's own.
-    struct AlphaLinearSolve
-    {
-        std::string solver;
-        std::string smoother;
-        scalar tol = 1e-6;
-        scalar relTol = 0;
-        int maxIter = 1000;
-        int nSweeps = 1;
-        bool gaussSeidel() const
-        {
-            return solver == "smoothSolver" && (smoother == "symGaussSeidel" || smoother == "GaussSeidel");
-        }
-    };
+    using AlphaLinearSolve = SmoothLinearSolve;
     AlphaLinearSolve aSolve;
     // ...AND U's, which only a `momentumPredictor yes` case solves. fvMatrix::solve() selects `UFinal`
     // on the final outer corrector and `U` on the others (the mesh's finalIteration flag), so with
@@ -176,6 +181,8 @@ struct InterFields
     // struct default of 1e-7 on the host and a hardcoded 1e-12 on the device, reading neither entry.
     AlphaLinearSolve uSolve;
     AlphaLinearSolve uSolveFinal;
+    // incompressibleInterPhaseTransportModel: laminar, or kEpsilon in one of its two lineages
+    InterTurbulence turbulence;
     // solvers/p_rgh
     PressureLinearSolve pSolve;
     // solvers/p_rghFinal

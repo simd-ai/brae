@@ -14,6 +14,15 @@
 # too, so beside each refused input sits the form of it that OpenFOAM treats as nothing: `staticFvMesh`,
 # an MRF zone and an fvOption with `active no`, a scalar sigma. Those must RUN.
 #
+# THEN TURBULENCE ARRIVED, and with it the question of what ELSE had only been kept out by the
+# turbulence refusal. Two things, both read and then never used: `ddtSchemes default` went into
+# f.ddtU and no further, so CrankNicolson and localEuler would have run as Euler; and laplacianSchemes
+# and snGradSchemes were never opened, so `corrected` -- 28 of 44 tutorials -- ran orthogonal. On a mesh
+# of rectangles the second is not a substitution (the correction vector is zero, which is why damBreak
+# agrees with OpenFOAM to 1e-12 under `Gauss linear corrected`); on any other mesh it is. So the mesh
+# arms below shear damBreak's upper blocks by six degrees: refused under the case's own `corrected`,
+# and it must RUN once the case itself says `orthogonal`.
+#
 # No OpenFOAM solver is run -- only its mesh generator, because damBreak ships no mesh.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -42,6 +51,17 @@ cp -r "$B/0.orig" "$B/0"
 sed -i 's/^endTime .*/endTime         0.0002;/; s/^deltaT .*/deltaT          1e-4;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
     "$B/system/controlDict"
 
+# ...and RAS/damBreak, the turbulent twin, for the arms that need a case that IS turbulent
+SRCR="$TUT/multiphase/interFoam/RAS/damBreak/damBreak"
+[ -d "$SRCR" ] || { echo "SKIP: RAS/damBreak tutorial not found at $SRCR"; exit 77; }
+BR="$W/baseRAS"
+cp -r "$SRCR" "$BR" || exit 1
+cp -r "$BR/0.orig" "$BR/0"
+( cd "$BR" && blockMesh > log.blockMesh 2>&1 && setFields > log.setFields 2>&1 ) \
+    || { echo "SKIP: blockMesh/setFields failed on RAS/damBreak"; exit 77; }
+sed -i 's/^endTime .*/endTime         0.0002;/; s/^deltaT .*/deltaT          1e-4;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
+    "$BR/system/controlDict"
+
 HAVE_GPU=0
 if command -v nvidia-smi > /dev/null 2>&1 && nvidia-smi > /dev/null 2>&1; then HAVE_GPU=1; fi
 
@@ -54,7 +74,7 @@ arm()
     local name="$1" expect="$2" needle="$3" flags="$4"
     shift 4
     local C="$W/$name"
-    cp -r "$B" "$C"
+    cp -r "${BASE:-$B}" "$C"
     ( cd "$C" && eval "$@" ) || { echo "  FAIL: $name -- the staging edit itself failed"; fails=$((fails+1)); return; }
     local out
     # shellcheck disable=SC2086
@@ -110,7 +130,42 @@ arm fo_harmless             runs    -                        "" "sed -i 's|^// \
 
 # already refused before this gate; here so they stay refused
 arm nonNewtonian            refused "CrossPowerLaw"           "" "sed -i '0,/transportModel  *Newtonian;/s//transportModel  CrossPowerLaw;/' constant/transportProperties"
-arm turbulence_RAS          refused "simulationType"          "" "sed -i 's/simulationType .*/simulationType RAS;/' constant/turbulenceProperties"
+
+# the time scheme: read into f.ddtU and then handed to nobody, so these ran as Euler
+arm ddt_CrankNicolson       refused "CrankNicolson"           "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson 0.5;/' system/fvSchemes"
+arm ddt_localEuler          refused "localEuler"              "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         localEuler;/' system/fvSchemes"
+
+# a solver-entry floor neither the alpha pre-solve nor the momentum predictor honours yet
+arm alpha_minIter           refused "minIter 1"               "" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       yes;\\n\\1minIter 1;/' system/fvSolution"
+
+# the non-orthogonal correction: damBreak says `corrected`, brae assembles orthogonal. SHEAR holds the
+# edit that makes that matter -- the upper blocks' top edge moved 0.4 in x, six degrees.
+SHEAR="sed -i 's/(0 4 /(0.4 4 /; s/(2 4 /(2.4 4 /; s/(2.16438 4 /(2.56438 4 /; s/(4 4 /(4.4 4 /' system/blockMeshDict && blockMesh > log.blockMesh 2>&1 && rm -rf 0 && cp -r 0.orig 0 && setFields > log.setFields 2>&1"
+ORTHO="sed -i '/^laplacianSchemes/,/^}/ s/default .*/default         Gauss linear orthogonal;/; /^snGradSchemes/,/^}/ s/default .*/default         orthogonal;/' system/fvSchemes"
+arm mesh_sheared_corrected  refused "non-orthogonal"          "" "$SHEAR"
+arm mesh_sheared_orthogonal runs    -                        "" "$SHEAR && $ORTHO"
+arm mesh_square_corrected   runs    -                        "" true
+
+# TURBULENCE. laminar damBreak made RAS carries no k, epsilon or nut, and OpenFOAM stops on it too.
+arm ras_noFields            refused "does not exist"          "" "sed -i 's/simulationType .*/simulationType RAS;\\nRAS { RASModel kEpsilon; turbulence on; }/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,U) .*/&\\n    div(phi,k) Gauss upwind;\\n    div(phi,epsilon) Gauss upwind;/' system/fvSchemes"
+BASE="$BR"
+arm ras_baseline            runs    -                        "" true
+arm ras_kOmegaSST           refused "kOmegaSST"               "" "sed -i 's/RASModel .*/RASModel        kOmegaSST;/' constant/turbulenceProperties"
+arm ras_LES                 refused "LES"                     "" "sed -i 's/^simulationType .*/simulationType LES;/' constant/turbulenceProperties"
+arm ras_turbulenceOff       refused "turbulence off"          "" "sed -i 's/turbulence  *on;/turbulence      off;/' constant/turbulenceProperties"
+arm ras_densityBad          refused "density mixture"         "" "sed -i 's/^density .*/density mixture;/' constant/turbulenceProperties"
+# `density uniform` looks up div(phi,k), which this tutorial does not carry: OpenFOAM stops there too
+arm ras_uniform_noDivPhiK   refused "div(phi,k)"              "" "sed -i 's/^density .*/density uniform;/' constant/turbulenceProperties"
+arm ras_uniform             runs    -                        "" "sed -i 's/^density .*/density uniform;/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,k) /div(phi,k) /; s/div(rhoPhi,epsilon) /div(phi,epsilon) /' system/fvSchemes"
+arm ras_limitedLinear       refused "Gauss upwind"            "" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss limitedLinear 1;/' system/fvSchemes"
+arm ras_nutSpalding         refused "nutUSpaldingWallFunction" "" "sed -i 's/nutkWallFunction/nutUSpaldingWallFunction/' 0/nut"
+arm ras_nutCalculatedWall   refused "no nut wall function"    "" "sed -i '/leftWall/,/}/ s/nutkWallFunction/calculated/' 0/nut"
+arm ras_noKFinal            refused "kFinal"                  "" "sed -i 's/\"(U|k|epsilon)\.\*\"/\"(U|k|epsilon)\"/' system/fvSolution"
+arm ras_PBiCGStab           refused "smoothSolver"            "" "sed -i '/(U|k|epsilon)/,/}/ s/solver  *smoothSolver;/solver          PBiCGStab;/' system/fvSolution"
+arm ras_everyOuter          refused "turbOnFinalIterOnly"     "" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;\\n    turbOnFinalIterOnly no;/' system/fvSolution"
+# ...and the form of it that changes nothing: one outer corrector IS the final one
+arm ras_everyOuter_single   runs    -                        "" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 1;\\n    turbOnFinalIterOnly no;/' system/fvSolution"
+BASE="$B"
 
 # the momentum predictor's solver entry: damBreak names `U` only, and with one outer corrector
 # fvMatrix::solve() selects `UFinal`, so real OpenFOAM stops on it. brae ran it, reading neither.
@@ -127,6 +182,9 @@ if [ $HAVE_GPU = 1 ]; then
     arm device_nOuter2      refused "nOuterCorrectors 2"      "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' system/fvSolution"
     arm device_nNonOrth1    refused "nNonOrthogonalCorrectors 1" "-device" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"
     arm device_mesh_dynamic refused "dynamicRefineFvMesh"     "-device" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
+    BASE="$BR"
+    arm device_ras          refused "carries no turbulence"   "-device" true
+    BASE="$B"
 else
     echo "  (no GPU: the -device arms are skipped)"
 fi

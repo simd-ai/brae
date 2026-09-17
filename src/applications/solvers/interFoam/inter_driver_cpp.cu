@@ -261,7 +261,12 @@ RunReport runInterFoam(
                     mi.rhoPhi = &f.rhoPhi.internal; mi.rhoPhiBnd = &phB;
                     mi.rho = &f.rho; mi.rhoOld = &rhoOld; mi.rhoBnd = &rhoB;
                     mi.UOld = &UOld;
-                    mi.nuEff = &f.nu; mi.nuEffBnd = &nuB;
+                    // nuEff = nut + nu: the mixture's nu alone when the case is laminar
+                    std::vector<scalar> nuEff;
+                    std::vector<std::vector<scalar>> nuEffB;
+                    interNuEff(f.turbulence, f.nu, nuB, nuEff, nuEffB);
+                    mi.nuEff = &nuEff;
+                    mi.nuEffBnd = &nuEffB;
                     mi.deltaT = rep.deltaT;
                     mi.scheme = f.divRhoPhiU;
                     mi.schemeCoeff = f.divRhoPhiUCoeff;
@@ -324,7 +329,26 @@ RunReport runInterFoam(
                     break;
                 }
 
-                case Stage::turbulenceCorrect: break;   // laminar
+                case Stage::turbulenceCorrect:
+                {
+                    // interFoam.C:169-172, after the last pressure corrector: the closure sees the
+                    // U and phi this outer corrector ended on, and the rho, rhoPhi and nu the alpha
+                    // step left. Does nothing on a laminar case.
+                    InterTurbulenceStepInput ti;
+                    ti.U = &f.U;
+                    ti.phi = &f.phi;
+                    ti.rhoPhi = &f.rhoPhi;
+                    ti.rho = &f.rho;
+                    ti.rhoBnd = &f.rhoBnd;
+                    ti.rhoOld = &rhoOld;
+                    ti.nu = &f.nu;
+                    ti.nuBnd = &f.nuBnd;
+                    ti.deltaT = rep.deltaT;
+                    ti.epsilonLog = &rep.epsilonSolves;
+                    ti.kLog = &rep.kSolves;
+                    correctInterTurbulence(f.turbulence, ti, m, g, patches);
+                    break;
+                }
                 case Stage::write:            break;
             }
         };

@@ -244,22 +244,91 @@ void refuseUnportedCaseInputs(
     }
 }
 
-void refuseUnportedTurbulence(const std::string& caseDir)
+NonOrthScheme readNonOrthScheme(
+    const std::string& fvSchemesText,
+    const std::string& block)
 {
-    const std::string path = caseDir + "/constant/momentumTransport";
-    const std::string alt  = caseDir + "/constant/turbulenceProperties";
-    const std::string p = std::filesystem::exists(path) ? path
-                        : (std::filesystem::exists(alt) ? alt : std::string());
-    if (p.empty()) return;                                // no dictionary at all -> laminar
-    const FoamDict d = readDict(p);
-    const std::string sim = d.wordOr("simulationType", "laminar");
-    if (sim != "laminar")
+    const std::string blk = fvSchemesBlock(fvSchemesText, block);
+    const std::size_t q = blk.find("default");
+    if (blk.empty() || q == std::string::npos)
         throw std::runtime_error(
-            "brae interFoam: constant/" + std::filesystem::path(p).filename().string()
-            + " asks for simulationType `" + sim + "`. interFoam's turbulence is "
-              "incompressibleInterPhaseTransportModel, which selects a MIXTURE model and hands it the "
-              "blended rho -- not the single-phase model brae already has. Refused rather than run "
-              "with the wrong density in the closure.");
+            "brae interFoam: fvSchemes `" + block + "` has no `default`. interFoam takes every "
+            "laplacian and snGrad through it; OpenFOAM stops on a case without one.");
+    const std::size_t e = blk.find(';', q);
+    NonOrthScheme s;
+    s.raw = blk.substr(q + 7, e == std::string::npos ? std::string::npos : e - q - 7);
+    const std::size_t b = s.raw.find_first_not_of(" \t\n\r");
+    s.raw = (b == std::string::npos) ? std::string() : s.raw.substr(b);
+    if (schemeHasWord(s.raw, "limited"))
+    {
+        // `limited <c>` and `limited corrected <c>` are the same scheme (limitedSnGrad.H:98-124):
+        // 1 is fully corrected, 0 is uncorrected.
+        double c = -1;
+        const char* at = s.raw.c_str() + s.raw.find("limited") + 7;
+        while (*at && !(std::isdigit(static_cast<unsigned char>(*at)) || *at == '.'))
+        {
+            ++at;
+        }
+        if (std::sscanf(at, "%lf", &c) != 1 || c < 0 || c > 1)
+            throw std::runtime_error(
+                "brae interFoam: fvSchemes `" + block + "` default is `" + s.raw + "`, a limited "
+                "scheme with no coefficient in [0,1].");
+        s.corrected = (c > 0);
+        s.limitCoeff = (c < 1) ? static_cast<scalar>(c) : scalar(0);
+        return s;
+    }
+    if (schemeHasWord(s.raw, "corrected"))
+    {
+        s.corrected = true;
+        return s;
+    }
+    if (schemeHasWord(s.raw, "uncorrected") || schemeHasWord(s.raw, "orthogonal")) return s;
+    throw std::runtime_error(
+        "brae interFoam: fvSchemes `" + block + "` default is `" + s.raw + "`, which names none of "
+        "corrected, uncorrected, orthogonal or limited.");
+}
+
+// 1 - cos(angle between the cell-centre vector and the face normal), the largest over the internal
+// faces. Exactly 0 on a mesh of rectangles; boundary faces do not enter, because v2412's
+// fvPatch::delta() is already the patch-NORMAL part of Cf - Cn for every non-coupled patch.
+scalar maxNonOrthogonality(
+    const PrimitiveMesh& m,
+    const FvGeometry& g)
+{
+    scalar worst = 0;
+    for (label fi = 0; fi < m.nInternalFaces(); ++fi)
+    {
+        const vector d = g.C()[m.neighbour()[fi]] - g.C()[m.owner()[fi]];
+        const vector& S = g.Sf()[fi];
+        const scalar c = dot(d, S) / (mag(d) * g.magSf()[fi]);
+        worst = std::fmax(worst, scalar(1) - c);
+    }
+    return worst;
+}
+
+// interFoam's pressure laplacian, its three snGrads and the momentum laplacian are assembled
+// ORTHOGONAL here, whatever the case says -- and 28 of the 44 tutorials say `corrected` or `limited`.
+// On a mesh of rectangles that is not a substitution: the correction vector n - d/(n.d) is zero, so
+// `corrected` and `orthogonal` are one scheme, which is why damBreak and capillaryRise agree with
+// OpenFOAM to 1e-12 under `Gauss linear corrected`. On any other mesh it IS one, it was silent, and
+// the only thing that kept it from running was that every such tutorial was refused for something else.
+void refuseUncorrectedOnSkewMesh(
+    const NonOrthScheme& laplacian,
+    const NonOrthScheme& snGrad,
+    const PrimitiveMesh& m,
+    const FvGeometry& g)
+{
+    if (!laplacian.corrected && !snGrad.corrected) return;
+    const scalar worst = maxNonOrthogonality(m, g);
+    // round-off on a mesh of rectangles is 1e-16; one degree is 1.5e-04
+    if (worst < scalar(1e-10)) return;
+    const scalar degrees = std::acos(scalar(1) - worst) * scalar(180) / scalar(3.14159265358979323846);
+    throw std::runtime_error(
+        "brae interFoam: fvSchemes asks for a non-orthogonal correction (laplacianSchemes `"
+        + laplacian.raw + "`, snGradSchemes `" + snGrad.raw + "`) and the mesh is non-orthogonal by "
+        "up to " + std::to_string(degrees) + " degrees. brae's interFoam assembles the pressure "
+        "laplacian and its snGrads orthogonal; that is the case's own scheme only where the "
+        "correction vanishes. Refused rather than run `orthogonal` under the name `corrected`.");
 }
 
 }   // namespace
@@ -273,8 +342,6 @@ InterFields buildInterFields(const std::string&          caseDir,
 {
     InterFields f;
     const label nC = m.nCells();
-
-    refuseUnportedTurbulence(caseDir);
 
     // --- the dictionaries ---------------------------------------------------------------------
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
@@ -343,6 +410,18 @@ InterFields buildInterFields(const std::string&          caseDir,
                    : (dflt.find("localEuler")    != std::string::npos ? DdtScheme::localEuler
                    : (dflt.find("backward")      != std::string::npos ? DdtScheme::backward
                                                                       : DdtScheme::steadyState)));
+        // READ AND THEN NEVER USED: neither driver handed ddtU to the momentum equation, whose
+        // input defaults to Euler, so `CrankNicolson 0.5` (RAS/floatingObject) and `localEuler`
+        // (RAS/DTCHull) would have run as Euler. Both tutorials were being stopped for other reasons.
+        if (f.ddtU != DdtScheme::Euler)
+            throw std::runtime_error(
+                "brae interFoam: ddtSchemes default is `" + dflt + "`. The momentum equation, the "
+                "ddt flux correction in pEqn and the turbulence closure carry Euler only; refusing "
+                "rather than running Euler under another scheme's name.");
+
+        f.laplacianScheme = readNonOrthScheme(all, "laplacianSchemes");
+        f.snGradScheme = readNonOrthScheme(all, "snGradSchemes");
+        refuseUncorrectedOnSkewMesh(f.laplacianScheme, f.snGradScheme, m, g);
     }
 
     // fvSolution's PIMPLE block -- see InterFields::pimple for why momentumPredictor is read rather
@@ -360,7 +439,9 @@ InterFields buildInterFields(const std::string&          caseDir,
         const std::string mp = pim->wordOr("momentumPredictor", "yes");
         f.momentumPredictorOn = !(mp == "no" || mp == "false" || mp == "off" || mp == "0");
         f.pimple.frozenFlow = false;
-        f.pimple.turbOnFinalIterOnly = true;
+        // pimpleControl.C:51-52
+        const std::string tf = pim->wordOr("turbOnFinalIterOnly", "yes");
+        f.pimple.turbOnFinalIterOnly = !(tf == "no" || tf == "false" || tf == "off" || tf == "0");
     }
 
     // solvers/<alpha> -- the linear solve of the MULESCorr pre-solve. A case without MULESCorr never
@@ -370,13 +451,16 @@ InterFields buildInterFields(const std::string&          caseDir,
         const FoamDict* ad = sv ? sv->subDict(f.alphaName) : nullptr;
         if (ad)
         {
-            f.aSolve.solver = ad->wordOr("solver", "");
-            f.aSolve.smoother = ad->wordOr("smoother", "");
-            f.aSolve.tol = ad->scalarOr("tolerance", scalar(1e-6));
-            f.aSolve.relTol = ad->scalarOr("relTol", scalar(0));
-            f.aSolve.maxIter = static_cast<int>(ad->scalarOr("maxIter", scalar(1000)));
-            f.aSolve.nSweeps = static_cast<int>(ad->scalarOr("nSweeps", scalar(1)));
+            f.aSolve = SmoothLinearSolve::read(*ad);
         }
+        // minIter is honoured for k and epsilon and nowhere else yet. Three tutorials name it for
+        // alpha (DTCHull, DTCHullMoving, electrostaticDeposition): it forces a sweep on the steps
+        // where the pre-solve's initial residual is already under tolerance, which moves alpha.
+        if (f.alphaCtl.MULESCorr && f.aSolve.minIter > 0)
+            throw std::runtime_error(
+                "brae interFoam: `solvers/" + f.alphaName + "` names `minIter "
+                + std::to_string(f.aSolve.minIter) + "`, which the alpha pre-solve does not honour "
+                "yet. Refused rather than stop a sweep earlier than OpenFOAM does.");
         if (f.alphaCtl.MULESCorr && !f.aSolve.solver.empty() && !f.aSolve.gaussSeidel())
         {
             // smoothSolver with either Gauss-Seidel smoother is OpenFOAM's own on both paths
@@ -410,12 +494,12 @@ InterFields buildInterFields(const std::string&          caseDir,
                     + name + "` entry. fvMatrix::solve() selects it by the final-iteration flag -- UFinal "
                       "on the last outer corrector, U on the others -- and OpenFOAM stops without it.");
             }
-            out.solver = d->wordOr("solver", "");
-            out.smoother = d->wordOr("smoother", "");
-            out.tol = d->scalarOr("tolerance", scalar(1e-6));
-            out.relTol = d->scalarOr("relTol", scalar(0));
-            out.maxIter = static_cast<int>(d->scalarOr("maxIter", scalar(1000)));
-            out.nSweeps = static_cast<int>(d->scalarOr("nSweeps", scalar(1)));
+            out = SmoothLinearSolve::read(*d);
+            if (out.minIter > 0)
+                throw std::runtime_error(
+                    std::string("brae interFoam: `solvers/") + name + "` names `minIter "
+                    + std::to_string(out.minIter) + "`, which the momentum predictor does not honour "
+                    "yet. Refused rather than stop a sweep earlier than OpenFOAM does.");
             if (!out.gaussSeidel())
             {
                 noticeApproximated(std::string("interFoam ") + name + " solve",
@@ -515,6 +599,19 @@ InterFields buildInterFields(const std::string&          caseDir,
 
     // ...and the same three blends on every patch, from alpha's own boundary values.
     updateMixtureBoundary(f, patches);
+
+    // Turbulence. createFields.H:78 constructs it AFTER the mixture, because validate() -- in the one
+    // lineage that calls it -- evaluates the nut wall functions with the mixture's nu at the wall.
+    f.turbulence = readInterTurbulence(caseDir, startDir, fvSolution, f.ddtU == DdtScheme::Euler,
+                                       f.laplacianScheme.corrected, f.laplacianScheme.limitCoeff,
+                                       patches, nC);
+    if (f.turbulence.on && !f.pimple.turbOnFinalIterOnly && f.pimple.nOuterCorrectors > 1)
+        throw std::runtime_error(
+            "brae interFoam: `turbOnFinalIterOnly no` with nOuterCorrectors "
+            + std::to_string(f.pimple.nOuterCorrectors) + " runs turbulence->correct() more than once "
+            "inside a time step. The second call needs k.oldTime() and the non-Final solver entries, "
+            "which this port does not carry; no shipped tutorial sets it.");
+    validateInterTurbulence(f.turbulence, f.U, f.nu, f.nuBnd, m, g, patches);
 
     // --- gh, ghf and p ------------------------------------------------------------------------
     ghField(f.g, f.ghRefValue, g.C(), f.gh);

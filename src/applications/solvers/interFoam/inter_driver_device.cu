@@ -103,6 +103,15 @@ RunReport runInterFoamDevice(
               "step, which runs none. The host path (no -device) does.");
     }
 
+    // ...AND TURBULENCE. The host runs kEpsilon in both of interFoam's lineages; the device step has
+    // no nut in its momentum equation and no closure stage, so it would run the case laminar.
+    if (f.turbulence.on)
+    {
+        throw std::runtime_error(
+            "brae interFoam (device): the case is RAS kEpsilon and the device loop carries no "
+            "turbulence -- it would run laminar. The host path (no -device) does.");
+    }
+
     DeviceMesh dm = buildDeviceMesh(m, g, fvp);
 
     // the masks the device needs that the mesh does not carry
