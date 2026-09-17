@@ -1,6 +1,7 @@
 // interFoam's createFields -- see inter_case_cpp.cuh for the provenance and for the four things the
 // order of this file encodes.
 #include "inter_case_cpp.cuh"
+#include "inter_peqn_cpp.cuh"
 #include "brae_notice.cuh"
 #include "foam_field_reader.cuh"
 #include "read_surface_field.cuh"
@@ -23,11 +24,29 @@ void pushFluxToPatches(
     InterFields& f,
     const std::vector<FvPatch>& patches)
 {
+    // rhoPhi does not exist yet at the first call, from buildInterFields before the mixture is built;
+    // nothing reads a flux that early, and the call that closes buildInterFields hands it over
+    const SurfaceScalarField* rhoPhi = f.rhoPhi.boundary.size() == patches.size() ? &f.rhoPhi : nullptr;
     for (std::size_t pi = 0; pi < patches.size() && pi < f.phi.boundary.size(); ++pi)
     {
-        f.U.boundary[pi]->updateFromFlux(f.phi.boundary[pi]);
-        f.p_rgh.boundary[pi]->updateFromFlux(f.phi.boundary[pi]);
-        f.alpha1.boundary[pi]->updateFromFlux(f.phi.boundary[pi]);
+        // each condition the flux its own `phi` entry NAMES -- see namedPatchFlux
+        auto fluxFor = [&](const std::string& name) -> const std::vector<scalar>*
+        {
+            if (name == "rhoPhi" && !rhoPhi) return nullptr;
+            return &namedPatchFlux(name, pi, patches[pi].name, f.phi, rhoPhi);
+        };
+        if (const std::vector<scalar>* q = fluxFor(f.U.boundary[pi]->fluxName()))
+        {
+            f.U.boundary[pi]->updateFromFlux(*q);
+        }
+        if (const std::vector<scalar>* q = fluxFor(f.p_rgh.boundary[pi]->fluxName()))
+        {
+            f.p_rgh.boundary[pi]->updateFromFlux(*q);
+        }
+        if (const std::vector<scalar>* q = fluxFor(f.alpha1.boundary[pi]->fluxName()))
+        {
+            f.alpha1.boundary[pi]->updateFromFlux(*q);
+        }
     }
 }
 
@@ -647,6 +666,8 @@ InterFields buildInterFields(const std::string&          caseDir,
         fluxWithScheme(f.phi, f.alpha1, f.divPhiAlpha, m, g, patches, alphaPhi);
         massFlux(alphaPhi, f.phi, f.mixture.phases.rho1, f.mixture.phases.rho2, f.rhoPhi);
     }
+    // ...and now that rhoPhi exists, the patches that NAME it learn it
+    pushFluxToPatches(f, patches);
 
     return f;
 }

@@ -35,9 +35,11 @@
 // two are the same matrix; whether OpenFOAM's pairing is the one its names promise on a patch that is
 // not is not something this port decides.
 //
-// WHAT IS REFUSED, by name: every generation model but StokesI, every absorption model but
-// shallowWaterAbsorption, and a restart -- OpenFOAM re-reads <startTime>/uniform/waveProperties.<patch>
-// for the reference depth it stored, and brae does not.
+// THE MODELS are OpenFOAM's nine generation models and its one absorption model, one file each under
+// waveGenerationModels/ and waveAbsorptionModels/ as OpenFOAM lays them out; this file is the base
+// class and the selector. REFUSED, by name: a model outside those ten, and a restart -- OpenFOAM
+// re-reads <startTime>/uniform/waveProperties.<patch> for the reference depth it stored, and brae
+// does not.
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
 #include "fv_geometry.cuh"
@@ -45,6 +47,7 @@
 #include "primitive_mesh.cuh"
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace brae {
@@ -82,9 +85,12 @@ public:
     const std::string& patchName() const { return patchName_; }
     scalar waterDepthRef() const { return waterDepthRef_; }
     bool activeAbsorption() const { return activeAbsorption_; }
-    // 0 for a model that has none
-    virtual scalar waveLength() const { return scalar(0); }
     const tensor& Rlg() const { return Rlg_; }
+    // waveModel::info, as far as it prints NUMBERS: each (label, value) pair is one line of the block
+    // OpenFOAM writes to its log when it creates the model, label for label, so a gate can hold every
+    // derived constant -- reference depth, wave length, StokesV's lambda, cnoidal's m, a solitary
+    // wave's x0 -- against OpenFOAM's own without knowing which model it is looking at.
+    virtual std::vector<std::pair<std::string, scalar>> info() const;
 
 protected:
     WaveModel(

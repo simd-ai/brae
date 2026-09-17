@@ -225,6 +225,11 @@ public:
     // The wall-function coefficients THIS patch carries (see WallFunctionCoeffs): set from the patch's
     // own dictionary by makePatchField, read by the model's wall treatment for the field it belongs to.
     const WallFunctionCoeffs& wallCoeffs() const { return wallCoeffs_; }
+    // The NAME of the flux this condition's updateCoeffs looks up -- its `phi` entry, default "phi".
+    // brae's conditions are TOLD their flux (updateFromFlux); this says which one the case asked for,
+    // so a solver carrying more than one can hand over the right one or refuse the name.
+    const std::string& fluxName() const { return fluxName_; }
+    void setFluxName(const std::string& n) { fluxName_ = n; }
     void setWallCoeffs(const WallFunctionCoeffs& c) { wallCoeffs_ = c; }
     // The patch's REFERENCE value -- inletValue / outletValue / freestreamValue / refValue -- as opposed
     // to its current value(). For most BCs the two are the same object and this returns value(); the
@@ -334,6 +339,7 @@ protected:
     const FvPatch& patch_;
     std::vector<T> value_;
     WallFunctionCoeffs wallCoeffs_;
+    std::string fluxName_ = "phi";
 };
 
 // fixedValue: value is prescribed (uniform or per-face).
@@ -2105,6 +2111,7 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     if (f)
     {
         f->setWallCoeffs(WallFunctionCoeffs{d.wfCmu, d.wfKappa, d.wfE});
+        f->setFluxName(d.phiName);
     }
     return f;
 }

@@ -273,6 +273,17 @@ InterTurbulence readInterTurbulence(
     t.epsilon = readTurbulenceField(startDir, "epsilon", patches, nCells);
     t.nut = readTurbulenceField(startDir, "nut", patches, nCells);
     t.nutWallKind = readNutWallKinds(startDir, t.epsilon, patches);
+    // the closure tells k's and epsilon's flux-conditional patches the volumetric phi and nothing else
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        for (const std::string* name : {&t.k.boundary[pi]->fluxName(), &t.epsilon.boundary[pi]->fluxName()})
+        {
+            if (*name == "phi") continue;
+            throw std::runtime_error(
+                std::string(WHO) + "patch `" + patches[pi].name + "` of k or epsilon names the flux `"
+                + *name + "` in its `phi` entry; the turbulence closure hands its patches phi only.");
+        }
+    }
 
     t.kSolveFinal = readFinalSolve(fvSolution, "k");
     t.epsSolveFinal = readFinalSolve(fvSolution, "epsilon");

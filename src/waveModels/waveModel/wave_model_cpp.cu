@@ -1,5 +1,6 @@
 // OpenFOAM's waveModel, the host reference. See wave_model_cpp.cuh.
 #include "wave_model_cpp.cuh"
+#include "wave_generation_bases_cpp.cuh"
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -11,7 +12,6 @@ namespace waveModels {
 namespace {
 
 const char* const WHO = "brae waveModel: ";
-const scalar PI = 3.14159265358979323846;
 // OpenFOAM's SMALL and ROOTVSMALL in double precision
 const scalar OF_SMALL = 1.0e-15;
 const scalar OF_ROOTVSMALL = 1.0e-150;
@@ -25,237 +25,6 @@ vector dotTV(
                   T.yx*v.x + T.yy*v.y + T.yz*v.z,
                   T.zx*v.x + T.zy*v.y + T.zz*v.z};
 }
-
-scalar requiredScalar(
-    const FoamDict& d,
-    const std::string& key,
-    const std::string& patchName)
-{
-    if (!d.found(key))
-        throw std::runtime_error(
-            std::string(WHO) + "waveProperties entry for patch `" + patchName + "` has no `" + key
-            + "`. OpenFOAM reads it with readEntry and stops without it.");
-    return d.scalarOr(key, scalar(0));
-}
-
-// OpenFOAM's Switch: the words it accepts as true or false, and a FatalIOError on anything else
-bool requiredSwitch(
-    const FoamDict& d,
-    const std::string& key,
-    const std::string& patchName)
-{
-    if (!d.found(key))
-        throw std::runtime_error(
-            std::string(WHO) + "waveProperties entry for patch `" + patchName + "` has no `" + key
-            + "`. OpenFOAM reads it with readEntry and stops without it.");
-    const std::string w = d.wordOr(key, "");
-    if (w == "yes" || w == "true" || w == "on" || w == "y" || w == "t" || w == "1") return true;
-    if (w == "no" || w == "false" || w == "off" || w == "n" || w == "f" || w == "0") return false;
-    throw std::runtime_error(
-        std::string(WHO) + "waveProperties entry for patch `" + patchName + "` has `" + key + " " + w
-        + "`, which is not a Switch.");
-}
-
-
-// waveGenerationModel -> irregularWaveModel -> regularWaveModel -> StokesI
-class StokesI : public WaveModel
-{
-public:
-    StokesI(
-        const FvPatch& patch,
-        const PrimitiveMesh& m,
-        const FvGeometry& g,
-        const vector& gravity)
-        : WaveModel(patch, m, g, gravity)
-    {
-        type_ = "StokesI";
-    }
-
-    scalar waveLength() const override { return waveLength_; }
-
-    void readDict(
-        const FoamDict& d,
-        const std::vector<scalar>& alphaInternal) override
-    {
-        WaveModel::readDict(d, alphaInternal);
-        // waveGenerationModel::readDict
-        activeAbsorption_ = requiredSwitch(d, "activeAbsorption", patchName_);
-        // irregularWaveModel::readDict
-        rampTime_ = requiredScalar(d, "rampTime", patchName_);
-        // regularWaveModel::readDict
-        waveHeight_ = requiredScalar(d, "waveHeight", patchName_);
-        if (waveHeight_ < 0)
-            throw std::runtime_error(std::string(WHO) + "waveHeight must not be negative.");
-        // degToRad
-        waveAngle_ = requiredScalar(d, "waveAngle", patchName_)*PI/scalar(180);
-        wavePeriod_ = requiredScalar(d, "wavePeriod", patchName_);
-        if (wavePeriod_ < 0)
-            throw std::runtime_error(std::string(WHO) + "wavePeriod must not be negative.");
-        wavePhase_ = d.scalarOr("wavePhase", scalar(1.5)*PI);
-        // StokesI::readDict -- the dispersion relation by 100 fixed-point passes, no tolerance
-        const scalar L0 = mag(g_)*wavePeriod_*wavePeriod_/(scalar(2)*PI);
-        scalar L = L0;
-        for (int i = 1; i <= 100; ++i)
-        {
-            L = L0*std::tanh(scalar(2)*PI*waterDepthRef_/L);
-        }
-        waveLength_ = L;
-    }
-
-protected:
-    scalar timeCoeff(scalar t) const override
-    {
-        // clamp(t/rampTime_, zero_one{})
-        const scalar c = t/rampTime_;
-        return c < scalar(0) ? scalar(0) : (c > scalar(1) ? scalar(1) : c);
-    }
-
-    scalar eta(
-        scalar H,
-        scalar Kx,
-        scalar x,
-        scalar Ky,
-        scalar y,
-        scalar omega,
-        scalar t,
-        scalar phase) const
-    {
-        const scalar phaseTot = Kx*x + Ky*y - omega*t + phase;
-        return H*scalar(0.5)*std::cos(phaseTot);
-    }
-
-    vector UfBase(
-        scalar H,
-        scalar h,
-        scalar Kx,
-        scalar x,
-        scalar Ky,
-        scalar y,
-        scalar omega,
-        scalar t,
-        scalar phase,
-        scalar z) const
-    {
-        const scalar k = std::sqrt(Kx*Kx + Ky*Ky);
-        const scalar phaseTot = Kx*x + Ky*y - omega*t + phase;
-        scalar u = H*scalar(0.5)*omega*std::cos(phaseTot)*std::cosh(k*z)/std::sinh(k*h);
-        const scalar w = H*scalar(0.5)*omega*std::sin(phaseTot)*std::sinh(k*z)/std::sinh(k*h);
-        const scalar v = u*std::sin(waveAngle_);
-        u *= std::cos(waveAngle_);
-        return vector{u, v, w};
-    }
-
-    void setLevel(
-        scalar t,
-        scalar tCoeff,
-        std::vector<scalar>& level) const override
-    {
-        const scalar waveOmega = scalar(2)*PI/wavePeriod_;
-        const scalar waveK = scalar(2)*PI/waveLength_;
-        const scalar waveKx = waveK*std::cos(waveAngle_);
-        const scalar waveKy = waveK*std::sin(waveAngle_);
-        for (std::size_t p = 0; p < level.size(); ++p)
-        {
-            const scalar e = eta(waveHeight_, waveKx, xPaddle_[p], waveKy, yPaddle_[p], waveOmega, t,
-                                 wavePhase_);
-            level[p] = waterDepthRef_ + tCoeff*e;
-        }
-    }
-
-    void setVelocity(
-        scalar t,
-        scalar tCoeff,
-        const std::vector<scalar>& level) override
-    {
-        const scalar waveOmega = scalar(2)*PI/wavePeriod_;
-        const scalar waveK = scalar(2)*PI/waveLength_;
-        const scalar waveKx = waveK*std::cos(waveAngle_);
-        const scalar waveKy = waveK*std::sin(waveAngle_);
-        for (label facei = 0; facei < patch_.size; ++facei)
-        {
-            scalar fraction = 1;
-            scalar z = 0;
-            setPaddlePropeties(level, facei, fraction, z);
-            if (!(fraction > 0)) continue;
-            const label p = faceToPaddle_[facei];
-            const vector Uf = UfBase(waveHeight_, waterDepthRef_, waveKx, xPaddle_[p], waveKy,
-                                     yPaddle_[p], waveOmega, t, wavePhase_, z);
-            U_[facei] = (fraction*Uf)*tCoeff;
-        }
-    }
-
-private:
-    scalar rampTime_ = 0;
-    scalar waveHeight_ = 0;
-    scalar waveAngle_ = 0;
-    scalar wavePeriod_ = 0;
-    scalar waveLength_ = 0;
-    scalar wavePhase_ = 0;
-};
-
-
-// waveAbsorptionModel -> shallowWaterAbsorption
-class ShallowWaterAbsorption : public WaveModel
-{
-public:
-    ShallowWaterAbsorption(
-        const FvPatch& patch,
-        const PrimitiveMesh& m,
-        const FvGeometry& g,
-        const vector& gravity)
-        : WaveModel(patch, m, g, gravity)
-    {
-        type_ = "shallowWaterAbsorption";
-    }
-
-    void readDict(
-        const FoamDict& d,
-        const std::vector<scalar>& alphaInternal) override
-    {
-        WaveModel::readDict(d, alphaInternal);
-        // waveAbsorptionModel::readDict: "always set to true"
-        activeAbsorption_ = true;
-    }
-
-protected:
-    // "No time ramping applied for absorption"
-    scalar timeCoeff(scalar) const override { return scalar(1); }
-
-    void setLevel(
-        scalar,
-        scalar,
-        std::vector<scalar>& level) const override
-    {
-        for (scalar& l : level)
-        {
-            l = waterDepthRef_;
-        }
-    }
-
-    // U's patchInternalField with x and y zeroed -- "zero-gradient condition to z-component of
-    // velocity only". The components zeroed are the GLOBAL ones, and correct() then rotates the
-    // result as though it were local.
-    void setVelocity(
-        scalar,
-        scalar,
-        const std::vector<scalar>&) override
-    {
-        for (label facei = 0; facei < patch_.size; ++facei)
-        {
-            const vector& uc = (*UNow_)[patch_.faceCells[facei]];
-            U_[facei] = vector{scalar(0), scalar(0), uc.z};
-        }
-    }
-
-    // alpha's patchInternalField
-    void setAlpha(const std::vector<scalar>&) override
-    {
-        for (label facei = 0; facei < patch_.size; ++facei)
-        {
-            alpha_[facei] = (*alphaNow_)[patch_.faceCells[facei]];
-        }
-    }
-};
 
 } // namespace
 
@@ -448,7 +217,7 @@ void WaveModel::readDict(
         throw std::runtime_error(
             std::string(WHO) + "patch `" + patchName_ + "` names the velocity field `" + uName
             + "`; the solver's is `U`.");
-    nPaddle_ = static_cast<label>(requiredScalar(d, "nPaddle", patchName_));
+    nPaddle_ = static_cast<label>(requiredWaveScalar(d, "nPaddle", patchName_));
     if (nPaddle_ < 1)
         throw std::runtime_error(
             std::string(WHO) + "patch `" + patchName_ + "`: nPaddle must be greater than zero.");
@@ -527,6 +296,12 @@ bool WaveModel::correct(
 }
 
 
+std::vector<std::pair<std::string, scalar>> WaveModel::info() const
+{
+    return {{"Reference water depth", waterDepthRef_}};
+}
+
+
 void requireAlphaName(
     const FoamDict& patchDict,
     const std::string& patchName,
@@ -558,22 +333,34 @@ std::unique_ptr<WaveModel> WaveModel::New(
             + "`. OpenFOAM stops on it: \"Dictionary entry for patch ... not found\".");
     requireAlphaName(*pd, patch.name, alphaName);
     const std::string model = pd->wordOr("waveModel", "");
+    // the run-time selection table: OpenFOAM's ten
+    const std::pair<const char*, WaveModelMaker*> table[] =
+    {
+        {"StokesI", &makeStokesI},
+        {"StokesII", &makeStokesII},
+        {"StokesV", &makeStokesV},
+        {"cnoidal", &makeCnoidal},
+        {"streamFunction", &makeStreamFunction},
+        {"irregularMultiDirectional", &makeIrregularMultiDirectional},
+        {"Boussinesq", &makeBoussinesq},
+        {"Grimshaw", &makeGrimshaw},
+        {"McCowan", &makeMcCowan},
+        {"shallowWaterAbsorption", &makeShallowWaterAbsorption},
+    };
     std::unique_ptr<WaveModel> w;
-    if (model == "StokesI")
+    for (const auto& entry : table)
     {
-        w = std::make_unique<StokesI>(patch, m, g, gravity);
+        if (model == entry.first)
+        {
+            w = entry.second(patch, m, g, gravity);
+        }
     }
-    else if (model == "shallowWaterAbsorption")
-    {
-        w = std::make_unique<ShallowWaterAbsorption>(patch, m, g, gravity);
-    }
-    else
+    if (!w)
     {
         throw std::runtime_error(
-            std::string(WHO) + "patch `" + patch.name + "` asks for waveModel `" + model + "`. brae "
-            "has StokesI and shallowWaterAbsorption; StokesII, StokesV, cnoidal, Boussinesq, Grimshaw, "
-            "McCowan, streamFunction, irregularMultiDirectional and the rest are different wave "
-            "theories and are not substituted.");
+            std::string(WHO) + "patch `" + patch.name + "` asks for waveModel `" + model + "`, which "
+            "is none of OpenFOAM's ten (StokesI, StokesII, StokesV, cnoidal, streamFunction, "
+            "irregularMultiDirectional, Boussinesq, Grimshaw, McCowan, shallowWaterAbsorption).");
     }
     w->mesh_ = &m;
     w->geometry_ = &g;

@@ -216,6 +216,22 @@ struct PressureTaps
 // One p_rgh solve as the solver itself reports it -- see inter_solve_record.cuh.
 using PressureSolveRecord = LinearSolveRecord;
 
+// THE FLUX A PATCH'S CONDITION NAMES, by its `phi` entry: `phi` (the default) or `rhoPhi`. interFoam
+// carries both, and OpenFOAM's flux-conditional conditions look theirs up BY NAME in updateCoeffs --
+// three shipped tutorials write `phi rhoPhi;` on their totalPressure top. brae's conditions are told
+// their flux, and were told `phi` whatever the case said. The two are not the same switch: rhoPhi is
+// the ALPHA step's flux, built from the phi the time step started on, so inside a pressure corrector
+// it is one corrector behind and at step one of a case at rest it is ZERO on every face. Measured on
+// solitaryGrimshaw against real OpenFOAM, with the wave model's own patch values exact to 7e-17: the
+// p_rgh initial residual wrong from STEP ONE and U 2.4e-05 out after thirty; 9.6e-10 with the named
+// flux. Any other name is refused: brae's interFoam has no third flux to hand over.
+const std::vector<scalar>& namedPatchFlux(
+    const std::string& fluxName,
+    std::size_t patchIndex,
+    const std::string& patchName,
+    const SurfaceScalarField& phi,
+    const SurfaceScalarField* rhoPhi);
+
 struct PressureStepInput
 {
     const FvVectorMatrix*      UEqn      = nullptr;   // the RELAXED momentum matrix, before the force
@@ -229,6 +245,9 @@ struct PressureStepInput
     // on capillaryRise, where momentumPredictor is off and the pressure corrector is the ONLY route
     // the surface tension has into the solution.
     const std::vector<std::vector<scalar>>* ghfBnd = nullptr;
+    // the alpha step's mass flux, for a patch whose condition names `phi rhoPhi` -- see namedPatchFlux.
+    // It does not change inside the pressure correctors. Null refuses such a patch.
+    const SurfaceScalarField* rhoPhi = nullptr;
     const SurfaceScalarField*  stf       = nullptr;   // surfaceTensionForce, faces
     const SurfaceScalarField*  snGradRho = nullptr;
     const DdtCorrInput*        ddt       = nullptr;   // null = no ddtCorr (steady start)

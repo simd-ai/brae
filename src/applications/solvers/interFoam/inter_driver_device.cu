@@ -105,6 +105,21 @@ RunReport runInterFoamDevice(
               "step, which runs none. The host path (no -device) does.");
     }
 
+    // ...AND A CONDITION THAT NAMES A FLUX OTHER THAN phi. The host hands each patch the flux its `phi`
+    // entry names (namedPatchFlux); this loop keeps rhoPhi on the device and its flux switches read phi.
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        for (const std::string* name : {&f.U.boundary[pi]->fluxName(), &f.p_rgh.boundary[pi]->fluxName(),
+                                        &f.alpha1.boundary[pi]->fluxName()})
+        {
+            if (*name == "phi") continue;
+            throw std::runtime_error(
+                "brae interFoam (device): patch `" + fvp[pi].name + "` names the flux `" + *name
+                + "` in its `phi` entry, and the device loop's flux switches read phi. The host path "
+                "(no -device) hands each patch the flux it names.");
+        }
+    }
+
     // ...AND THE WAVE CONDITIONS. Their values change inside the alpha sub-cycle, between the
     // high-order flux and the limiter, and the device alpha step has no such point yet: it would run
     // with the inlet frozen at the case file's `value`.

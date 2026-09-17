@@ -132,6 +132,19 @@ add_library(brae_core STATIC
     src/applications/solvers/interFoam/inter_driver_cpp.cu
     src/applications/solvers/interFoam/inter_case_cpp.cu
     src/applications/solvers/interFoam/inter_turbulence_cpp.cu
+    src/applications/solvers/interFoam/inter_waves_cpp.cu
+    src/waveModels/waveModel/wave_model_cpp.cu
+    src/waveModels/waveGenerationModels/base/wave_generation_bases_cpp.cu
+    src/waveModels/waveGenerationModels/derived/StokesI/stokes_i_wave_model_cpp.cu
+    src/waveModels/waveGenerationModels/derived/StokesII/stokes_ii_wave_model_cpp.cu
+    src/waveModels/waveGenerationModels/derived/StokesV/stokes_v_wave_model_cpp.cu
+    src/waveModels/waveGenerationModels/derived/cnoidal/cnoidal_wave_model_cpp.cu
+    src/waveModels/waveGenerationModels/derived/streamFunction/stream_function_wave_model_cpp.cu
+    src/waveModels/waveGenerationModels/derived/irregularMultiDirectional/irregular_multi_directional_wave_model_cpp.cu
+    src/waveModels/waveGenerationModels/derived/Boussinesq/boussinesq_wave_model_cpp.cu
+    src/waveModels/waveGenerationModels/derived/Grimshaw/grimshaw_wave_model_cpp.cu
+    src/waveModels/waveGenerationModels/derived/McCowan/mccowan_wave_model_cpp.cu
+    src/waveModels/waveAbsorptionModels/derived/shallowWaterAbsorption/shallow_water_absorption_cpp.cu
     src/transportModels/interfaceProperties/device_interface_properties.cu
     src/transportModels/twoPhaseMixture/device_two_phase_mixture.cu
     src/transportModels/interfaceProperties/interface_properties_cpp.cu
@@ -3360,6 +3373,16 @@ target_include_directories(test_inter_ras_dambreak_vs_openfoam PRIVATE ${BRAE_HE
 target_link_libraries(test_inter_ras_dambreak_vs_openfoam PRIVATE brae_core)
 add_test(NAME interfoam_ras_dambreak_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_ras_dambreak_vs_openfoam.sh)
+
+# ...and the wave boundary conditions (waveAlpha, waveVelocity) on laminar/waves/stokesI: fields, the
+# patch values the wave model assigns, its two derived constants and the ORDER it updates in, all
+# against real OpenFOAM; the control is OpenFOAM's own answer with the wave switched off.
+add_executable(test_inter_waves_vs_openfoam tests/test_inter_waves_vs_openfoam.cu)
+target_include_directories(test_inter_waves_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_waves_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_waves_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_waves_vs_openfoam.sh)
 
 # ...and capillaryRise, where surface tension IS the answer rather than a correction, and which is the
 # ONLY shipped interFoam tutorial with a contact angle. damBreak would still look broadly right with

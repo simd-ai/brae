@@ -330,6 +330,7 @@ RunReport runInterFoam(
                     pin.ghfBnd = &f.ghfBoundary;
                     pin.stf = &stf; pin.snGradRho = &snRho; pin.ddt = &dc;
                     pin.rhoBnd = &f.rhoBnd;
+                    pin.rhoPhi = &f.rhoPhi;
                     pin.taps = pressureTaps;
                     pin.solveLog = &rep.pSolves;
 

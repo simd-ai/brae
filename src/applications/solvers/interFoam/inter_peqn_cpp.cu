@@ -233,6 +233,28 @@ void ddtCorr(const DdtCorrInput&           in,
 }
 
 
+const std::vector<scalar>& namedPatchFlux(
+    const std::string& fluxName,
+    std::size_t patchIndex,
+    const std::string& patchName,
+    const SurfaceScalarField& phi,
+    const SurfaceScalarField* rhoPhi)
+{
+    if (fluxName == "phi") return phi.boundary[patchIndex];
+    if (fluxName == "rhoPhi")
+    {
+        if (!rhoPhi || patchIndex >= rhoPhi->boundary.size())
+            throw std::runtime_error(
+                "brae interFoam: patch `" + patchName + "` names `phi rhoPhi` and the caller has no "
+                "rhoPhi to hand it.");
+        return rhoPhi->boundary[patchIndex];
+    }
+    throw std::runtime_error(
+        "brae interFoam: patch `" + patchName + "` names the flux `" + fluxName + "`. interFoam has "
+        "`phi` and `rhoPhi`; OpenFOAM would look the named field up and stop when there is none.");
+}
+
+
 void updateVelocityPatchesFromCells(
     GeometricField<vector>& U,
     const std::vector<FvPatch>& patches)
@@ -458,8 +480,11 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
             // what leaving this out cost on capillaryRise.
             for (std::size_t pi = 0; pi < patches.size() && pi < phi.boundary.size(); ++pi)
             {
-                U.boundary[pi]->updateFromFlux(phi.boundary[pi]);
-                p_rgh.boundary[pi]->updateFromFlux(phi.boundary[pi]);
+                // ...each the flux ITS OWN entry names -- see namedPatchFlux
+                U.boundary[pi]->updateFromFlux(
+                    namedPatchFlux(U.boundary[pi]->fluxName(), pi, patches[pi].name, phi, in.rhoPhi));
+                p_rgh.boundary[pi]->updateFromFlux(
+                    namedPatchFlux(p_rgh.boundary[pi]->fluxName(), pi, patches[pi].name, phi, in.rhoPhi));
             }
 
             // U = HbyA + rAU*fvc::reconstruct((phig - p_rghEqn.flux())/rAUf) -- the divide INSIDE the

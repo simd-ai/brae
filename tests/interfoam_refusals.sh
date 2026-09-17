@@ -190,7 +190,13 @@ arm mompred_withUFinal      runs    -                        "" "sed -i 's/momen
 # nothing else under those names.
 BASE="$BW"
 arm waves_baseline          runs    -                        "" true
-arm waves_StokesII          refused "StokesII"                "" "sed -i 's/waveModel  *StokesI;/waveModel       StokesII;/' constant/waveProperties"
+arm waves_StokesII          runs    -                        "" "sed -i 's/waveModel  *StokesI;/waveModel       StokesII;/' constant/waveProperties"
+arm waves_unknownModel      refused "StokesIII"               "" "sed -i 's/waveModel  *StokesI;/waveModel       StokesIII;/' constant/waveProperties"
+arm waves_streamFn_noBjs    refused "Bjs"                     "" "sed -i 's/waveModel  *StokesI;/waveModel       streamFunction;\n    uMean 1;\n    waveLength 6;\n    Ejs (0.05 0.01);/' constant/waveProperties"
+# THE FLUX A CONDITION NAMES. totalPressure's `phi rhoPhi;` is three tutorials' own; brae read no `phi`
+# entry at all and told every condition phi.
+arm flux_rhoPhi             runs    -                        "" "sed -i '/totalPressure/a\        phi             rhoPhi;' 0/p_rgh"
+arm flux_unknown            refused "phiAbsolute"             "" "sed -i '/totalPressure/a\        phi             phiAbsolute;' 0/p_rgh"
 arm waves_noPatchEntry      refused "no entry for patch"      "" "sed -i 's/^outlet\$/outletElsewhere/' constant/waveProperties"
 arm waves_noProperties      refused "no constant/waveProperties" "" "rm constant/waveProperties"
 arm waves_otherAlpha        refused "alpha.oil"               "" "sed -i '0,/alpha  *alpha.water;/s//alpha           alpha.oil;/' constant/waveProperties"
@@ -214,6 +220,9 @@ if [ $HAVE_GPU = 1 ]; then
     # the wave conditions are the host's only: the device loop would freeze them at the file's value
     BASE="$BW"
     arm device_waves        refused "waveAlpha/waveVelocity"  "-device" true
+    # ...and so is a condition that names a flux other than phi
+    BASE="$B"
+    arm device_flux_rhoPhi  refused "names the flux"          "-device" "sed -i '/totalPressure/a\        phi             rhoPhi;' 0/p_rgh"
     BASE="$BR"
     arm device_ras          runs    -                        "-device" true
     arm device_ras_uniform  runs    -                        "-device" "sed -i 's/^density .*/density uniform;/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,k) /div(phi,k) /; s/div(rhoPhi,epsilon) /div(phi,epsilon) /' system/fvSchemes"

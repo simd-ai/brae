@@ -163,6 +163,12 @@ struct PatchFieldData
     // does not implement. Recorded so it can be refused by name instead of silently running low-speed.
     std::string    psiName      = "none";
     scalar         gammaTP      = 1.0;
+    // `phi <name>;` -- the flux a flux-conditional condition looks up (totalPressure, inletOutlet,
+    // pressureInletOutletVelocity and their relatives all carry a phiName_, default "phi"). It is a
+    // FIELD NAME, not a number, and a solver with more than one flux can be asked for the other:
+    // interFoam's solitaryGrimshaw, solitaryMcCowan and mangroveInteraction write `phi rhoPhi;` on
+    // their totalPressure top. This entry was skipped with every other unknown key.
+    std::string phiName = "phi";
     // flowRateInletVelocity (OF flowRateInletVelocityFvPatchVectorField). OF selects the branch by which
     // key is present: "volumetricFlowRate" -> volumetric_ = true; otherwise "massFlowRate" (default
     // rhoName "rho"). rhoInlet is only the FALLBACK used when the rho field is not registered -- in
@@ -1163,6 +1169,11 @@ inline FieldData<T> readField(const std::string& path)
                     {
                         const std::string w = ts.next();
                         p.extrapolateProfile = (w == "true" || w == "yes" || w == "on" || w == "1");
+                        ts.expect(";");
+                    }
+                    else if (key == "phi")    // the flux a flux-conditional condition looks up, by NAME
+                    {
+                        p.phiName = ts.next();
                         ts.expect(";");
                     }
                     else if (key == "psi")    // totalPressure: selects OF's isentropic branch when != none
