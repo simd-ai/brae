@@ -425,10 +425,19 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
 
         // alphaApplyPrevCorr: the previous step's compression flux as a first guess, limited against
         // the field the pre-solve has just produced.
+        //
+        // THE FLUX ARGUMENT IS alphaPhi10, the ALPHA flux the pre-solve left (alphaEqn.H:136-144), and
+        // not phiCN. limiterCorr reads it in exactly one place, the boundary outlet test
+        // `(phi_b + phiCorr_b) > SMALL*SMALL` (CMULESTemplates.C:546), and this call passed the
+        // VOLUMETRIC flux there -- the same slip the corrector loop below had, fixed there when its
+        // gate measured 3.99e-09 -> 1.07e-10, and left here because nothing ran this branch. TAKEN FROM
+        // THE SOURCE, NOT FROM A MEASUREMENT: on damBreak the two agree, because the boundary half of
+        // the cached correction is zero unless alpha's patch value moves between the pre-solve and the
+        // correctors, which needs water leaving through an outflow face.
         if (in.alphaApplyPrevCorr && prevCorr && !prevCorr->internal.empty())
         {
             MULES::Fields mf0;
-            MULES::correctLimited(rDeltaT, alpha1, *in.phiCN, *prevCorr, mf0, mulesCtl,
+            MULES::correctLimited(rDeltaT, alpha1, alphaPhi10, *prevCorr, mf0, mulesCtl,
                                   m, g, patches);
             for (std::size_t f = 0; f < alphaPhi10.internal.size(); ++f)
                 alphaPhi10.internal[f] += prevCorr->internal[f];

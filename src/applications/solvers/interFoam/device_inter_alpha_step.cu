@@ -4,6 +4,7 @@
 #include "device_alpha_subcycle.cuh"
 #include "device_alpha_flux.cuh"
 #include "device_interface_properties.cuh"
+#include "device_blas.cuh"
 #include <cuda_runtime.h>
 #include <stdexcept>
 
@@ -32,6 +33,31 @@ void deviceInterAlphaStep(
     DeviceBuffer<scalar>&            mu,
     DeviceBuffer<scalar>&            nu)
 {
+    if (ctl.alphaApplyPrevCorr)
+    {
+        if (!ctl.MULESCorr)
+        {
+            // alphaEqn.H:228 tests `alphaApplyPrevCorr && MULESCorr`; without MULESCorr the switch does
+            // nothing in OpenFOAM either, and saying so beats a cache nobody reads
+            throw std::runtime_error(
+                "brae interFoam device alpha step: `alphaApplyPrevCorr yes` without `MULESCorr yes`. "
+                "OpenFOAM only ever applies the previous correction inside the MULESCorr block.");
+        }
+        if (!ctl.prevCorrInt || !ctl.prevCorrBnd)
+        {
+            throw std::runtime_error(
+                "brae interFoam device alpha step: `alphaApplyPrevCorr yes` and no cache was handed "
+                "in. The previous correction outlives this call, so the caller owns it -- see "
+                "DeviceInterAlphaControls.");
+        }
+        if (!hooks.refreshBoundary)
+        {
+            throw std::runtime_error(
+                "brae interFoam device alpha step: `alphaApplyPrevCorr yes` needs the refreshBoundary "
+                "hook. The limiter reads alpha's patch values as the pre-solve left them, and "
+                "updateBoundary would buy them with a curvature pass OpenFOAM does not take there.");
+        }
+    }
     if (!hooks.updateBoundary)
         throw std::runtime_error(
             "brae interFoam device alpha step: the boundary hook is required. alpha's patch values are "
@@ -111,7 +137,51 @@ void deviceInterAlphaStep(
             {
                 ctl.preSolveLog->push_back(pre);
             }
+
+            // talphaPhi1UD, the upwind flux the pre-solve left, kept for the cache at the bottom
+            DeviceBuffer<scalar> upInt, upBnd;
+            if (ctl.alphaApplyPrevCorr)
+            {
+                deviceCopy(upInt, alphaPhiInt);
+                deviceCopy(upBnd, alphaPhiBnd);
+            }
+
+            // alphaEqn.H:133-147 -- "Applying the previous iteration compression flux". `.valid()` is
+            // the cache having been filled, which the first alpha step of a run has not done.
+            if (ctl.alphaApplyPrevCorr
+             && static_cast<int>(ctl.prevCorrInt->size()) == nIf
+             && static_cast<int>(ctl.prevCorrBnd->size()) == nBf)
+            {
+                // alpha1Eqn.solve() ends with correctBoundaryConditions(): patch values, no curvature
+                hooks.refreshBoundary(alpha, alpha1Bnd);
+
+                // MULES::correct(one, alpha1, alphaPhi10, talphaPhi1Corr0.ref(), one, zero). The flux
+                // the outlet test reads is alphaPhi10 -- the ALPHA flux -- and the cached correction
+                // is limited IN PLACE, so what is added below is the limited one.
+                const DeviceMulesFields mf0;
+                const scalar rDeltaT = scalar(1)/dtSub;
+                deviceMulesLimitCorr(dm, nIf, nBf, rDeltaT, alpha, alpha1Bnd, bndFixesValue, bndFlag,
+                                     alphaPhiBnd, *ctl.prevCorrInt, *ctl.prevCorrBnd, mf0, mulesCtl);
+                deviceMulesCorrect(dm, rDeltaT, *ctl.prevCorrInt, *ctl.prevCorrBnd, mf0, alpha);
+
+                // alphaPhi10 += talphaPhi1Corr0()
+                deviceAxpy(scalar(1), *ctl.prevCorrInt, alphaPhiInt);
+                if (nBf > 0)
+                {
+                    deviceAxpy(scalar(1), *ctl.prevCorrBnd, alphaPhiBnd);
+                }
+            }
+
             correctMixture(alpha, true);                        // alphaEqn.H:151-153
+
+            // Cache the upwind-flux (alphaEqn.H:150), to be turned into the correction once the
+            // correctors below have run. Held in the cache buffers themselves, as OpenFOAM holds it
+            // in talphaPhi1Corr0.
+            if (ctl.alphaApplyPrevCorr)
+            {
+                deviceCopy(*ctl.prevCorrInt, upInt);
+                deviceCopy(*ctl.prevCorrBnd, upBnd);
+            }
         }
 
         for (int aCorr = 0; aCorr < ctl.nAlphaCorr; ++aCorr)
@@ -125,6 +195,18 @@ void deviceInterAlphaStep(
             deviceAlphaCorrector(dm, alpha, subOld, li, db, mulesCtl, nHatfInt,
                                  alphaPhiInt, alphaPhiBnd);
             correctMixture(alpha, true);                        // alphaEqn.H:223-225
+        }
+
+        // alphaEqn.H:228-236: talphaPhi1Corr0 = alphaPhi10 - talphaPhi1Corr0, i.e. the compression the
+        // correctors ended up applying on top of the upwind flux. The `else` clears it, which here is
+        // the caller's buffers staying empty because nothing above ever filled them.
+        if (ctl.alphaApplyPrevCorr)
+        {
+            DeviceBuffer<scalar> tInt, tBnd;
+            deviceSubtractFaces(nIf, alphaPhiInt, *ctl.prevCorrInt, tInt);
+            deviceSubtractFaces(nBf, alphaPhiBnd, *ctl.prevCorrBnd, tBnd);
+            deviceCopy(*ctl.prevCorrInt, tInt);
+            deviceCopy(*ctl.prevCorrBnd, tBnd);
         }
 
         // rhoPhi = alphaPhi10*(rho1 - rho2) + phiCN*rho2, alphaEqn.H:248 -- built once per SUB-STEP,

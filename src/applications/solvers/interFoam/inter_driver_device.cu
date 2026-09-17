@@ -303,6 +303,12 @@ RunReport runInterFoamDevice(
     C.alpha.MULESCorr       = f.alphaCtl.MULESCorr;
     // THE CASE'S OWN alpha SOLVE: its smoother where it names a Gauss-Seidel one (the device has
     // OpenFOAM's, level-scheduled and exact), and its tolerances either way. See deviceAlphaPreSolve.
+    // `alphaApplyPrevCorr`: the cache outlives every step, so it lives here. See
+    // DeviceInterAlphaControls -- the device ignored this switch until it was measured.
+    DeviceBuffer<scalar> dPrevCorrI, dPrevCorrB;
+    C.alpha.alphaApplyPrevCorr = f.alphaCtl.alphaApplyPrevCorr;
+    C.alpha.prevCorrInt = &dPrevCorrI;
+    C.alpha.prevCorrBnd = &dPrevCorrB;
     C.alpha.preSolve.tol = f.aSolve.tol;
     C.alpha.preSolve.relTol = f.aSolve.relTol;
     C.alpha.preSolve.maxIter = f.aSolve.maxIter;

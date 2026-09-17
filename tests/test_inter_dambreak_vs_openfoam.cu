@@ -72,13 +72,21 @@ int main(int argc, char** argv)
     // `bigstep`: the staging script's second run, at dt 5e-3, where the interface moves 0.69 rather
     // than 3.7e-03 and the alpha pre-solve is hard enough for its solver log to discriminate. See the
     // script's header for why the two things this gate measures want opposite fixtures.
-    const bool bigStep = argc > 7 && std::string(argv[7]) == "bigstep";
+    // `prevcorr`: the big step again, with `alphaApplyPrevCorr yes`. It takes every big-step bound and
+    // arm, and adds a control on the oracle (below).
+    // `prevcorrsub` is `prevcorr` with nAlphaSubCycles 2: the cache has to cross a sub-cycle boundary.
+    // Its control reads the un-sub-cycled run, so what it proves live is the sub-cycle count.
+    const bool prevCorrSub = argc > 7 && std::string(argv[7]) == "prevcorrsub";
+    const bool prevCorr = (argc > 7 && std::string(argv[7]) == "prevcorr") || prevCorrSub;
+    const bool bigStep = (argc > 7 && std::string(argv[7]) == "bigstep") || prevCorr;
     // `inflow`: the atmosphere's inletValue set to 1, so water enters over air cells and rho's patch
     // value differs from the cell's on a patch where p_rgh fixes a value. It is the only fixture here
     // on which fvc::snGrad(rho) is non-zero on a boundary that does not cancel it. See the script.
     const bool inflow = argc > 7 && std::string(argv[7]) == "inflow";
     std::printf("  profile: %s\n",
-                bigStep ? "bigstep -- the solver logs discriminate here"
+                prevCorrSub ? "prevcorrsub -- alphaApplyPrevCorr yes across TWO sub-cycles"
+              : prevCorr ? "prevcorr -- alphaApplyPrevCorr yes, at the big step"
+              : bigStep ? "bigstep -- the solver logs discriminate here"
               : inflow  ? "inflow -- snGrad(rho) is live on the atmosphere here"
                         : "small step -- the tight field bounds live here");
 
@@ -120,8 +128,9 @@ int main(int argc, char** argv)
         argc > 5 ? brae::gatecheck::readOfSolves(argv[5], fin.alphaName) : std::vector<LinearSolveRecord>{};
     if (argc > 5)
     {
-        check("OpenFOAM's log gave an alpha solve for every step",
-              ofAlphaSolves.size() == static_cast<std::size_t>(nSteps));
+        // one pre-solve per SUB-CYCLE per step
+        check("OpenFOAM's log gave an alpha solve for every sub-cycle of every step",
+              ofAlphaSolves.size() == static_cast<std::size_t>(nSteps)*static_cast<std::size_t>(fin.alphaCtl.nAlphaSubCycles));
         // THE FINAL RESIDUAL IS THE ARM THAT TELLS SOLVERS APART, and only on a fixture where the solve
         // is hard. At dt 1e-4 it is not: the smoother takes ONE sweep, so would a Krylov solver, and
         // the control below read 2.6e-03 from OpenFOAM's residuals beside the device's honest 1.5e-03
@@ -263,6 +272,26 @@ int main(int argc, char** argv)
     // PBiCGStab. U is rebuilt from the pressure flux, so it carries whatever p_rgh's solve leaves.
     check("U agrees with OpenFOAM's relatively, for the same reason",
           uLinf < uBoundHost * std::fmax(uRef, scalar(1e-12)));
+
+    // THE `prevcorr` CONTROLS, on the oracle as the inflow one is. argv[8] is real OpenFOAM's alpha from
+    // the run this profile differs from in ONE setting: for `prevcorr` the same run without the switch,
+    // for `prevcorrsub` the same run without the second sub-cycle. If the two agreed to round-off that
+    // setting would be doing nothing on this fixture, and a brae that ignored it would pass every
+    // bound above -- as the device did, 1.07e-02 out, until it was given the switch at all.
+    if (prevCorr)
+    {
+        const char* what = prevCorrSub ? "nAlphaSubCycles 2" : "alphaApplyPrevCorr yes";
+        check("the control was given OpenFOAM's answer without the setting under test", argc > 8);
+        if (argc > 8)
+        {
+            const std::vector<scalar> offAlpha = readCells(std::string(argv[8]) + "/alpha.water");
+            const Diff dSwitch = compare(offAlpha, ofAlpha);
+            std::printf("  CONTROL: `%s` moves OpenFOAM's own alpha by %.4e; brae is %.4e from OpenFOAM "
+                        "with it\n", what, (double)dSwitch.linf, (double)dAlpha.linf);
+            check("...which is more than 1000x brae's distance from the oracle",
+                  dSwitch.linf > scalar(1000)*dAlpha.linf && dSwitch.linf > scalar(1e-8));
+        }
+    }
 
     // THE `inflow` CONTROL: the ORACLE's answer has to depend on the term, or agreeing with it proves
     // nothing about the term. argv[8] is real OpenFOAM's U on the STANDARD case at the same instant;

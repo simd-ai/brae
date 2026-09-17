@@ -30,6 +30,14 @@
 # THREE steps only: the fixture is violent enough that round-off grows 700x a step (device against
 # host, every solve tightened: 1e-12 after two steps, 7e-10 after three), so a longer run measures the
 # conditioning and not the term.
+#
+# AND A FOURTH, `prevcorr`: `alphaApplyPrevCorr yes`, which caches the compression flux the correctors
+# ended on and applies it, limited, as the NEXT step's first guess (alphaEqn.H:133-150, :228-236). Three
+# shipped tutorials set it and brae refuses all three for other reasons (RAS, moving meshes, LTS), so
+# no tutorial can gate it; OpenFOAM honours the switch on any MULESCorr case, and damBreak is one. It
+# runs at the big step, where the interface moves enough for last step's correction to matter, and the
+# staging asserts OpenFOAM's log says "Applying the previous iteration compression flux" -- an oracle
+# that never took the path would agree with a brae that ignored the switch.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_dambreak_vs_openfoam"
@@ -70,6 +78,19 @@ run_at()
         grep -q "inletValue *uniform 1;" "$C/0/alpha.water" \
             || { echo "FAIL: the inflow fixture's inletValue was not rewritten"; return 1; }
     fi
+    if [ "$profile" = prevcorr ] || [ "$profile" = prevcorrsub ]; then
+        sed -i 's/^\( *\)MULESCorr  *yes;/\1MULESCorr       yes;\n\1alphaApplyPrevCorr yes;/' "$C/system/fvSolution"
+        grep -q "alphaApplyPrevCorr yes;" "$C/system/fvSolution" \
+            || { echo "FAIL: alphaApplyPrevCorr was not switched on in the staged case"; return 1; }
+    fi
+    if [ "$profile" = prevcorrsub ]; then
+        # ...AND TWO SUB-CYCLES, because talphaPhi1Corr0 outlives the sub-cycle as well as the time step:
+        # the second sub-cycle's pre-solve applies the correction the FIRST one ended on. damBreak's own
+        # nAlphaSubCycles is 1, which cannot tell a cache that crosses sub-cycles from one that is reset.
+        sed -i 's/nAlphaSubCycles  *1;/nAlphaSubCycles 2;/' "$C/system/fvSolution"
+        grep -q "nAlphaSubCycles 2;" "$C/system/fvSolution" \
+            || { echo "FAIL: nAlphaSubCycles was not raised in the staged case"; return 1; }
+    fi
 
     # A FIXED time step, and write exactly once at step N. writePrecision 15 because the comparison is
     # against brae's fp64 and an ascii round-trip at the default 6 digits would dominate the difference.
@@ -93,6 +114,11 @@ PYEOF
     ( cd "$C" && blockMesh > log.blockMesh 2>&1 ) || { echo "FAIL: blockMesh"; tail -20 "$C/log.blockMesh"; return 1; }
     ( cd "$C" && setFields > log.setFields 2>&1 ) || { echo "FAIL: setFields"; tail -20 "$C/log.setFields"; return 1; }
     ( cd "$C" && interFoam > log.interFoam 2>&1 ) || { echo "FAIL: interFoam"; tail -30 "$C/log.interFoam"; return 1; }
+
+    if [ "$profile" = prevcorr ] || [ "$profile" = prevcorrsub ]; then
+        grep -q "Applying the previous iteration compression flux" "$C/log.interFoam" \
+            || { echo "FAIL: OpenFOAM never applied the previous correction, so this oracle cannot gate it"; return 1; }
+    fi
 
     local end
     end=$(python3 -c "print('%.10g' % ($STEPS*float('$dt')))")
@@ -121,6 +147,10 @@ PYEOF
     # the `inflow` control reads the STANDARD case's OpenFOAM answer at the same instant
     local std=""
     [ "$profile" = inflow ] && std="$W/small/$end"
+    # ...and the `prevcorr` control reads the SAME run without the switch
+    [ "$profile" = prevcorr ] && std="$W/bigstep/$end"
+    # ...and the sub-cycled one reads the un-sub-cycled one: the sub-cycle count has to be live too
+    [ "$profile" = prevcorrsub ] && std="$W/prevcorr/$end"
     "$BIN" "$C" "$C/0" "$C/$end" "$STEPS" "$C/log.interFoam" "$C.control" "$profile" $std
 }
 
@@ -128,4 +158,6 @@ rc=0
 run_at "$DT" small || rc=1
 run_at "$DT_BIG" bigstep || rc=1
 run_at "$DT" inflow "$STEPS_INFLOW" || rc=1
+run_at "$DT_BIG" prevcorr || rc=1
+run_at "$DT_BIG" prevcorrsub || rc=1
 exit $rc

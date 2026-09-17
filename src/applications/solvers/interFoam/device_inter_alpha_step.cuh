@@ -85,6 +85,17 @@ struct DeviceInterAlphaControls
     DeviceBuffer<scalar>* alpha2BndOut = nullptr;
     // appended to, one record per pre-solve; null = not kept
     std::vector<DeviceSolverPerf>* preSolveLog = nullptr;
+    // `alphaApplyPrevCorr yes` (alphaEqn.H:133-150, :228-236): the compression flux the correctors
+    // ENDED on is cached, and the next pre-solve applies it, limited, before its own correctors run.
+    // The cache is talphaPhi1Corr0 and it outlives the call -- it carries across SUB-CYCLES as well as
+    // time steps -- so the CALLER owns it: two buffers, empty until the first alpha step has filled
+    // them, which is what OpenFOAM's `.valid()` tests. Setting the switch without handing them in is
+    // refused; this step used to ignore the switch altogether, and on damBreak at dt 5e-3 that put the
+    // device 1.07e-02 of alpha from OpenFOAM -- to five digits, OpenFOAM's own distance from itself
+    // with the switch off.
+    bool alphaApplyPrevCorr = false;
+    DeviceBuffer<scalar>* prevCorrInt = nullptr;
+    DeviceBuffer<scalar>* prevCorrBnd = nullptr;
 };
 
 // `alpha1` is advanced in place from `alpha1Old`, which is never written. `rho`, `mu` and `nu` come out
