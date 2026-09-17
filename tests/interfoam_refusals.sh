@@ -112,6 +112,11 @@ arm fo_harmless             runs    -                        "" "sed -i 's|^// \
 arm nonNewtonian            refused "CrossPowerLaw"           "" "sed -i '0,/transportModel  *Newtonian;/s//transportModel  CrossPowerLaw;/' constant/transportProperties"
 arm turbulence_RAS          refused "simulationType"          "" "sed -i 's/simulationType .*/simulationType RAS;/' constant/turbulenceProperties"
 
+# the momentum predictor's solver entry: damBreak names `U` only, and with one outer corrector
+# fvMatrix::solve() selects `UFinal`, so real OpenFOAM stops on it. brae ran it, reading neither.
+arm mompred_noUFinal        refused "UFinal"                  "" "sed -i 's/momentumPredictor  *no;/momentumPredictor yes;/' system/fvSolution"
+arm mompred_withUFinal      runs    -                        "" "sed -i 's/momentumPredictor  *no;/momentumPredictor yes;/; s/^\( *\)U\$/\1\"U.*\"/' system/fvSolution"
+
 # PIMPLE controls the HOST honours...
 arm host_nOuter2            runs    -                        "" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' system/fvSolution"
 arm host_nNonOrth1          runs    -                        "" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"

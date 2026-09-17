@@ -78,7 +78,14 @@ int main(int argc, char** argv)
     // Its control reads the un-sub-cycled run, so what it proves live is the sub-cycle count.
     const bool prevCorrSub = argc > 7 && std::string(argv[7]) == "prevcorrsub";
     const bool prevCorr = (argc > 7 && std::string(argv[7]) == "prevcorr") || prevCorrSub;
-    const bool bigStep = (argc > 7 && std::string(argv[7]) == "bigstep") || prevCorr;
+    // THREE PIMPLE CONTROLS damBreak does not use, each at the big step: nOuterCorrectors 2,
+    // nNonOrthogonalCorrectors 1, momentumPredictor yes. The device REFUSES the first two.
+    const std::string profileName = argc > 7 ? argv[7] : "";
+    const bool nOuter = profileName == "nouter", nonOrth = profileName == "nonorth";
+    const bool momPred = profileName == "mompred";
+    const bool pimpleProfile = nOuter || nonOrth || momPred;
+    const bool deviceRefuses = nOuter || nonOrth;
+    const bool bigStep = (argc > 7 && std::string(argv[7]) == "bigstep") || prevCorr || pimpleProfile;
     // `inflow`: the atmosphere's inletValue set to 1, so water enters over air cells and rho's patch
     // value differs from the cell's on a patch where p_rgh fixes a value. It is the only fixture here
     // on which fvc::snGrad(rho) is non-zero on a boundary that does not cancel it. See the script.
@@ -89,6 +96,9 @@ int main(int argc, char** argv)
     std::printf("  profile: %s\n",
                 prevCorrSub ? "prevcorrsub -- alphaApplyPrevCorr yes across TWO sub-cycles"
               : prevCorr ? "prevcorr -- alphaApplyPrevCorr yes, at the big step"
+              : nOuter ? "nouter -- nOuterCorrectors 2, at the big step"
+              : nonOrth ? "nonorth -- nNonOrthogonalCorrectors 1, at the big step"
+              : momPred ? "mompred -- momentumPredictor yes, at the big step"
               : bigStep ? "bigstep -- the solver logs discriminate here"
               : inflow  ? "inflow -- snGrad(rho) is live on the atmosphere here"
               : outflow ? "outflow -- water leaves through the atmosphere with alphaApplyPrevCorr on"
@@ -132,9 +142,12 @@ int main(int argc, char** argv)
         argc > 5 ? brae::gatecheck::readOfSolves(argv[5], fin.alphaName) : std::vector<LinearSolveRecord>{};
     if (argc > 5)
     {
-        // one pre-solve per SUB-CYCLE per step
-        check("OpenFOAM's log gave an alpha solve for every sub-cycle of every step",
-              ofAlphaSolves.size() == static_cast<std::size_t>(nSteps)*static_cast<std::size_t>(fin.alphaCtl.nAlphaSubCycles));
+        // one pre-solve per SUB-CYCLE per OUTER CORRECTOR per step: alphaEqnSubCycle.H sits inside the
+        // PIMPLE loop, so a second outer corrector solves alpha again
+        check("OpenFOAM's log gave an alpha solve for every sub-cycle of every outer corrector of every step",
+              ofAlphaSolves.size() == static_cast<std::size_t>(nSteps)
+                                    * static_cast<std::size_t>(fin.alphaCtl.nAlphaSubCycles)
+                                    * static_cast<std::size_t>(fin.pimple.nOuterCorrectors));
         // THE FINAL RESIDUAL IS THE ARM THAT TELLS SOLVERS APART, and only on a fixture where the solve
         // is hard. At dt 1e-4 it is not: the smoother takes ONE sweep, so would a Krylov solver, and
         // the control below read 2.6e-03 from OpenFOAM's residuals beside the device's honest 1.5e-03
@@ -260,6 +273,25 @@ int main(int argc, char** argv)
     check("p_rgh agrees with OpenFOAM's relatively, both running the case's PCG+DIC",
           dP.linf < pBoundHost * std::fmax(dP.refMax, scalar(1e-12)));
 
+    // THE MOMENTUM PREDICTOR'S SOLVES, component by component, under `mompred`. OpenFOAM logs "Solving
+    // for Ux" and "Solving for Uy" and NO Uz -- the empty direction is skipped, not solved to zero
+    // (fvMatrixSolve.C:162-164) -- and takes the `UFinal` entry, because with one outer corrector that
+    // corrector is the final one.
+    std::vector<LinearSolveRecord> ofUx, ofUy, ofUz;
+    if (momPred && argc > 5)
+    {
+        ofUx = brae::gatecheck::readOfSolves(argv[5], "Ux");
+        ofUy = brae::gatecheck::readOfSolves(argv[5], "Uy");
+        ofUz = brae::gatecheck::readOfSolves(argv[5], "Uz");
+        check("OpenFOAM logged a Ux and a Uy solve for every step, and no Uz on this 2-D case",
+              ofUx.size() == static_cast<std::size_t>(nSteps) && ofUy.size() == ofUx.size() && ofUz.empty());
+        check("...and brae did not solve Uz either", r.uSolves[2].empty());
+        failures += brae::gatecheck::compareSolves("host", r.uSolves[0], ofUx, nSteps, "Ux",
+                                                   scalar(1e-10), scalar(1e-9), scalar(1e-6));
+        failures += brae::gatecheck::compareSolves("host", r.uSolves[1], ofUy, nSteps, "Uy",
+                                                   scalar(1e-10), scalar(1e-9), scalar(1e-6));
+    }
+
     const FieldData<vector> ofUfd = readField<vector>(ofDir + "/U");
     std::vector<vector> ofU;
     if (ofUfd.internalUniform) ofU.assign(static_cast<std::size_t>(nC), ofUfd.internalUniformValue);
@@ -284,9 +316,13 @@ int main(int argc, char** argv)
     // for `prevcorrsub` the same run without the second sub-cycle. If the two agreed to round-off that
     // setting would be doing nothing on this fixture, and a brae that ignored it would pass every
     // bound above -- as the device did, 1.07e-02 out, until it was given the switch at all.
-    if (prevCorr)
+    if (prevCorr || pimpleProfile)
     {
-        const char* what = prevCorrSub ? "nAlphaSubCycles 2" : "alphaApplyPrevCorr yes";
+        const char* what = prevCorrSub ? "nAlphaSubCycles 2"
+                         : nOuter ? "nOuterCorrectors 2"
+                         : nonOrth ? "nNonOrthogonalCorrectors 1"
+                         : momPred ? "momentumPredictor yes"
+                                   : "alphaApplyPrevCorr yes";
         check("the control was given OpenFOAM's answer without the setting under test", argc > 8);
         if (argc > 8)
         {
@@ -381,6 +417,30 @@ int main(int argc, char** argv)
         }
         else
         {
+            if (deviceRefuses)
+            {
+                // The device loop runs one outer corrector and no non-orthogonal pass. Running this
+                // case at 1 and 0 would be a silent substitution, so what is asserted here is that it
+                // does NOT run -- and that the message names the control the case asked for.
+                bool threw = false;
+                std::string why;
+                try
+                {
+                    InterFields unused;
+                    runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &unused);
+                }
+                catch (const std::exception& e)
+                {
+                    threw = true;
+                    why = e.what();
+                }
+                const char* named = nOuter ? "nOuterCorrectors" : "nNonOrthogonalCorrectors";
+                std::printf("  DEVICE: %s\n", threw ? why.substr(0, 140).c_str() : "RAN -- it must not");
+                check("the DEVICE refuses this case rather than run it at a smaller count",
+                      threw && why.find(named) != std::string::npos);
+                std::printf("test_inter_dambreak_vs_openfoam: %d failures\n", failures);
+                return failures ? 1 : 0;
+            }
             InterFields dev;
             const RunReport rd = runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
             check("the device driver ran the same number of steps", rd.steps == nSteps);
@@ -390,6 +450,14 @@ int main(int argc, char** argv)
             if (argc > 5)
             {
                 failures += brae::gatecheck::compareSolves("device", rd.pSolves, ofSolves, nSteps);
+                if (momPred)
+                {
+                    check("...and the device did not solve Uz either", rd.uSolves[2].empty());
+                    failures += brae::gatecheck::compareSolves("device", rd.uSolves[0], ofUx, nSteps, "Ux",
+                                                               scalar(1e-10), scalar(1e-9), scalar(1e-5));
+                    failures += brae::gatecheck::compareSolves("device", rd.uSolves[1], ofUy, nSteps, "Uy",
+                                                               scalar(1e-10), scalar(1e-9), scalar(1e-5));
+                }
                 // Under `bigstep` the device leaves OpenFOAM's final residuals to 5.0e-09 (the host
                 // 9.1e-10: its reductions sum in OpenFOAM's order and the device's do not). Bound 1e-6.
                 failures += brae::gatecheck::compareSolves("device", rd.alphaSolves, ofAlphaSolves, nSteps,

@@ -52,6 +52,22 @@ inline std::vector<LinearSolveRecord> readOfPressureSolves(const std::string& lo
 // with its discretisation exact to 3.5e-08, purely because it ran a different solver to the same
 // relTol. An iteration count is the sharpest statement of "the same solver" a log can make -- Jacobi
 // in the same CG loop takes 21 iterations where DIC takes 8 (tests/test_device_dic.cu).
+// The relative difference of two NORMALISED residuals, with the floor a normalised residual has. It is
+// sum|b - A.psi| over a normFactor of the same size as sum|b|, so each term is a cancellation of O(1)
+// quantities and the quotient cannot be resolved below about 1e-16 whatever the two codes do. Without
+// the floor this gate failed on agreement it should have praised: a non-orthogonal corrector's second
+// solve starting from an already-converged p_rgh (initial residual 5e-8, the two codes 6e-18 apart,
+// "1.3e-10 relative"), and a second outer corrector's alpha solve ending at 1.935e-14 in BOTH logs to
+// four digits ("2.2e-05 relative", 4e-19 absolute). A different SOLVER is still nine orders above it.
+inline scalar residualRelDiff(
+    scalar mine,
+    scalar of)
+{
+    const scalar d = std::fabs(mine - of);
+    if (d <= scalar(1e-16)) return scalar(0);
+    return d/std::fmax(of, scalar(1e-300));
+}
+
 inline int compareSolves(
     const char* who,
     const std::vector<LinearSolveRecord>& mine,
@@ -92,8 +108,7 @@ inline int compareSolves(
         {
             ++nSame;
         }
-        const scalar e = std::fabs(mine[k].initialResidual - of[k].initialResidual)
-                       / std::fmax(of[k].initialResidual, scalar(1e-300));
+        const scalar e = residualRelDiff(mine[k].initialResidual, of[k].initialResidual);
         wInit = std::fmax(wInit, e);
         if (k < perStep)
         {
@@ -118,8 +133,7 @@ inline int compareSolves(
     {
         if (of[k].finalResidual > scalar(0))
         {
-            wFinal = std::fmax(wFinal, std::fabs(mine[k].finalResidual - of[k].finalResidual)
-                                       / of[k].finalResidual);
+            wFinal = std::fmax(wFinal, residualRelDiff(mine[k].finalResidual, of[k].finalResidual));
         }
     }
     if (worstFinalOut)
@@ -130,8 +144,7 @@ inline int compareSolves(
     std::printf("\n    initial residual, relative difference per solve:");
     for (std::size_t k = 0; k < mine.size() && k < of.size(); ++k)
     {
-        std::printf(" %.1e", (double)(std::fabs(mine[k].initialResidual - of[k].initialResidual)
-                                      / std::fmax(of[k].initialResidual, scalar(1e-300))));
+        std::printf(" %.1e", (double)residualRelDiff(mine[k].initialResidual, of[k].initialResidual));
     }
     std::printf("\n");
     check("...it ran as many solves of that field as OpenFOAM logged", mine.size() == of.size() && !of.empty());

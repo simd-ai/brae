@@ -233,6 +233,26 @@ void ddtCorr(const DdtCorrInput&           in,
 }
 
 
+void updateVelocityPatchesFromCells(
+    GeometricField<vector>& U,
+    const std::vector<FvPatch>& patches)
+{
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& q = patches[pi];
+        std::vector<vector> Ucell(static_cast<std::size_t>(q.size), vector{0, 0, 0});
+        for (label i = 0; i < q.size; ++i)
+        {
+            const label c = q.faceCells[i];
+            if (c >= 0 && c < static_cast<label>(U.internal.size()))
+            {
+                Ucell[static_cast<std::size_t>(i)] = U.internal[static_cast<std::size_t>(c)];
+            }
+        }
+        U.boundary[pi]->updateFromPatchVelocity(U.boundary[pi]->value(), Ucell, {});
+    }
+}
+
 void updatePressurePatchesFromVelocity(
     GeometricField<scalar>& p_rgh,
     const GeometricField<vector>& U,
@@ -465,17 +485,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
             // brae's DEVICE path 0 -- the device was right and this was the defect. rhoSimpleFoam has
             // called updateFromPatchVelocity for this reason since its own pcEqn gate; interFoam never
             // did.
-            for (std::size_t pi = 0; pi < patches.size(); ++pi)
-            {
-                const FvPatch& q = patches[pi];
-                std::vector<vector> Ucell(static_cast<std::size_t>(q.size), vector{0, 0, 0});
-                for (label i = 0; i < q.size; ++i)
-                {
-                    const label c = q.faceCells[i];
-                    if (c >= 0 && c < static_cast<label>(U.internal.size())) Ucell[i] = U.internal[c];
-                }
-                U.boundary[pi]->updateFromPatchVelocity(U.boundary[pi]->value(), Ucell, {});
-            }
+            updateVelocityPatchesFromCells(U, patches);
         }
     }
 

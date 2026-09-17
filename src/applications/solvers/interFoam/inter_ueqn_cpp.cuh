@@ -97,6 +97,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "solve_vector.cuh"
+#include "inter_solve_record.cuh"
 
 namespace brae {
 namespace cpu {
@@ -329,6 +331,13 @@ struct MomentumSolveControls
     scalar tolU    = 1e-7;
     scalar relTolU = 0;
     int    maxIterU = 1000;
+    // the case's solver for U -- see InterFields::uSolve
+    VectorLinearSolver which;
+    // fvMesh::validComponents: a 2-D case does not solve the empty direction (fvMatrixSolve.C:162-164).
+    // Null solves all three.
+    const SolutionDirections* solutionD = nullptr;
+    // appended to, one record per SOLVED component per call, [0] Ux, [1] Uy, [2] Uz; null = not kept
+    std::vector<LinearSolveRecord>* solveLog = nullptr;
 };
 
 // Assemble UEqn, add the reconstructed face force, and solve for U. `faceForce` is the surface field

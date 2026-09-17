@@ -62,13 +62,7 @@ std::vector<scalar> fullFace(const SurfaceScalarField& f, const std::vector<FvPa
 // see the note in pressureCorrector, and tools/dumpInterFoam for OpenFOAM's own numbers.
 void updateVelocityPatches(GeometricField<vector>& U, const std::vector<FvPatch>& fvp)
 {
-    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-    {
-        std::vector<vector> Uc(static_cast<std::size_t>(fvp[pi].size), vector{0, 0, 0});
-        for (label i = 0; i < fvp[pi].size; ++i)
-            Uc[i] = U.internal[fvp[pi].faceCells[i]];
-        U.boundary[pi]->updateFromPatchVelocity(U.boundary[pi]->value(), Uc, {});
-    }
+    updateVelocityPatchesFromCells(U, fvp);
 }
 
 }   // namespace
@@ -363,7 +357,8 @@ RunReport runInterFoamDevice(
     // solver still runs the device BiCGStab, under the notice buildInterFields already printed.
     DeviceDilu dic = buildDeviceDilu(m.owner(), m.neighbour(), nC);
     C.dic = &dic;
-    std::vector<DeviceSolverPerf> pLog, aLog;
+    std::vector<DeviceSolverPerf> pLog, aLog, uLog[3];
+    C.momentumSolveLog = uLog;
     C.pressureSolveLog = &pLog;
     C.alpha.preSolveLog = &aLog;
     C.pressurePcgDIC = f.pSolve.pcgDIC();
@@ -374,7 +369,18 @@ RunReport runInterFoamDevice(
     C.pressureFinal.tol = f.pSolveFinal.tol;
     C.pressureFinal.relTol = f.pSolveFinal.relTol;
     C.pressureFinal.maxIter = f.pSolveFinal.maxIter;
-    C.momentum.tol = scalar(1e-12);
+    // THE CASE'S OWN SOLVE FOR U, where a hardcoded 1e-12 on Jacobi-BiCGStab used to stand. The device
+    // loop runs ONE outer corrector (more are refused above), and that one is the final one, so the
+    // entry fvMatrix::solve() selects is UFinal.
+    if (f.momentumPredictorOn)
+    {
+        C.momentum.tol = f.uSolveFinal.tol;
+        C.momentum.relTol = f.uSolveFinal.relTol;
+        C.momentum.maxIter = f.uSolveFinal.maxIter;
+        C.momentum.smoothSolver = f.uSolveFinal.gaussSeidel();
+        C.momentum.symmetric = (f.uSolveFinal.smoother == "symGaussSeidel");
+        C.momentum.nSweeps = f.uSolveFinal.nSweeps;
+    }
     C.takeUAtBoundary = &dTakeU;
     { const SolutionDirections sd = solutionDirections(fvp);
       for (int k = 0; k < 3; ++k) C.solutionD[k] = sd.d[k]; }
@@ -454,6 +460,13 @@ RunReport runInterFoamDevice(
     for (const DeviceSolverPerf& sp : aLog)
     {
         rep.alphaSolves.push_back(LinearSolveRecord{sp.initialResidual, sp.finalResidual, sp.nIterations});
+    }
+    for (int k = 0; k < 3; ++k)
+    {
+        for (const DeviceSolverPerf& sp : uLog[k])
+        {
+            rep.uSolves[k].push_back(LinearSolveRecord{sp.initialResidual, sp.finalResidual, sp.nIterations});
+        }
     }
 
     // hand the device's answer back through the host fields, so a caller compares the same objects

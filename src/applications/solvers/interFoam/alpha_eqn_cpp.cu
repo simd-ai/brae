@@ -358,15 +358,20 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
         throw std::runtime_error("brae interFoam alphaEqn: nAlphaCorr must be at least 1.");
     const label nC = m.nCells();
 
-    // The alpha field starts each sub-step from its old time, boundary included.
+    // alpha1 COMES IN AS IT STANDS AND IS NOT RESET TO ITS OLD TIME. alphaEqn.H has no such assignment
+    // anywhere: the old time enters through fvmDdt's source and through MULES' psi.oldTime(), and the
+    // CURRENT alpha1 is the pre-solve's initial guess, the field alphaPhiUn is built from and the one
+    // the limiter takes its extrema from (MULESTemplates.C:208 against :244). With one outer corrector
+    // the two are the same field -- nothing has touched alpha1 since the last step, or the last
+    // sub-cycle, ended -- so resetting it was a no-op, and this function did reset it, for as long as it
+    // had only ever been run that way. With `nOuterCorrectors 2` OpenFOAM's second pass starts from the
+    // FIRST PASS'S RESULT. Measured on damBreak at dt 5e-3 against real OpenFOAM: every first-pass alpha
+    // solve exact to 1e-13 and every second-pass one 84% to 170% out in its initial residual, one of
+    // them taking 3 sweeps for OpenFOAM's 2, and the fields 4.9e-06 in alpha and 1.0e-03 in U.
     //
-    // REMOVING THIS evaluateBoundary WAS TRIED AND IS WRONG. The reasoning looked sound -- OpenFOAM's
-    // subCycle does not reset alpha1, and on a contact-angle patch every evaluate() runs the `limit
-    // gradient` clamp and moves the wall gradient, so an extra one should advance a boundary the
-    // solver has not advanced. Measured: damBreak's alpha went from 3.43e-09 to 1.05e-07 against
-    // OpenFOAM, thirty times worse, and capillaryRise did not move at all. The boundary must be
-    // consistent with the internal field this assignment has just changed.
-    alpha1.internal = alpha1Old;
+    // The evaluateBoundary stays. Removing it was tried, with the reset, when this file had other
+    // defects, and read thirty times worse on damBreak; the boundary has to reflect the flux the last
+    // pressure corrector left, which a flux-conditional patch only learns here.
     alpha1.evaluateBoundary();
 
     SurfaceScalarField upwindFlux;              // talphaPhi1UD -- cached for alphaApplyPrevCorr

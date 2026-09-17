@@ -169,6 +169,13 @@ struct InterFields
         }
     };
     AlphaLinearSolve aSolve;
+    // ...AND U's, which only a `momentumPredictor yes` case solves. fvMatrix::solve() selects `UFinal`
+    // on the final outer corrector and `U` on the others (the mesh's finalIteration flag), so with
+    // nOuterCorrectors 1 it is UFinal that is read and `U` alone is not enough: OpenFOAM stops on
+    // damBreak with the predictor switched on, "Entry 'UFinal' not found". brae ran that case, to a
+    // struct default of 1e-7 on the host and a hardcoded 1e-12 on the device, reading neither entry.
+    AlphaLinearSolve uSolve;
+    AlphaLinearSolve uSolveFinal;
     // solvers/p_rgh
     PressureLinearSolve pSolve;
     // solvers/p_rghFinal

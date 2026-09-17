@@ -60,6 +60,10 @@ RunReport runInterFoam(
         // damBreak's fvSolution was actually read: it says nOuterCorrectors 1, nCorrectors 3 AND
         // `momentumPredictor no`, and the last of those changes which algorithm runs.
         const LoopControls lc = f.pimple;
+        // which outer corrector this is: alphaControls opens each one. fvMatrix::solve() selects the
+        // `Final` solver entry on the last, and U's is the one place this driver has to know.
+        label outerIndex = -1;
+        const SolutionDirections solD = solutionDirections(patches);
 
         SolverHooks hooks;
         hooks.run = [&](Stage s)
@@ -94,7 +98,9 @@ RunReport runInterFoam(
                     f.writeCadence.advance(rep.time, rep.deltaT);
                     break;
 
-                case Stage::alphaControls: break;      // read once, in buildInterFields
+                case Stage::alphaControls:             // read once, in buildInterFields
+                    ++outerIndex;
+                    break;
 
                 case Stage::alphaEqnSubCycle:
                 {
@@ -261,7 +267,23 @@ RunReport runInterFoam(
                     mi.schemeCoeff = f.divRhoPhiUCoeff;
                     mi.relaxEquationU = f.relaxEquationU; mi.relaxU = f.relaxU;
 
+                    // THE CASE'S OWN SOLVE FOR U: UFinal on the last outer corrector, U on the others,
+                    // its smoother where it names a Gauss-Seidel one, and only the components the
+                    // mesh solves. This was a struct default of 1e-7 on PBiCGStab, reading nothing.
                     MomentumSolveControls msc;
+                    if (f.momentumPredictorOn)
+                    {
+                        const bool finalOuter = (outerIndex >= lc.nOuterCorrectors - 1);
+                        const InterFields::AlphaLinearSolve& us = finalOuter ? f.uSolveFinal : f.uSolve;
+                        msc.tolU = us.tol;
+                        msc.relTolU = us.relTol;
+                        msc.maxIterU = us.maxIter;
+                        msc.which.smoothSolver = us.gaussSeidel();
+                        msc.which.symmetric = (us.smoother == "symGaussSeidel");
+                        msc.which.nSweeps = us.nSweeps;
+                        msc.solutionD = &solD;
+                        msc.solveLog = rep.uSolves;
+                    }
                     FvVectorMatrix UEqn;
                     momentumPredictor(f.U, mi, force, msc, m, g, patches,
                                       f.momentumPredictorOn, UEqn);

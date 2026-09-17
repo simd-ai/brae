@@ -48,6 +48,14 @@
 # limiter returns 1 there. It needs the limiter biting as well: the same fixture at dt 1e-2, four steps,
 # where brae with phiCN is 5.5e-03 of alpha and 2.2% of U from OpenFOAM and with alphaPhi10 4.6e-13.
 # The test re-runs the host with BRAE_CONTROL_PREVCORR_PHICN set and requires THAT to fail.
+#
+# AND THREE PIMPLE CONTROLS damBreak DOES NOT USE: `nouter` (nOuterCorrectors 2), `nonorth`
+# (nNonOrthogonalCorrectors 1) and `mompred` (momentumPredictor yes). brae's host RAN all three and
+# nothing held any of them against OpenFOAM -- which is the position alphaApplyPrevCorr was in while it
+# carried a wrong limiter argument. 5, 4 and 5 of the 44 shipped tutorials set them. Each profile's
+# control is the big-step run without the setting: the setting has to move OpenFOAM's own answer, or a
+# brae that ignored it would pass. The device loop runs neither outer nor non-orthogonal correctors and
+# REFUSES both, so on those two profiles the test asserts the refusal instead of a run.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_dambreak_vs_openfoam"
@@ -90,6 +98,19 @@ run_at()
         grep -q "inletValue *uniform 1;" "$C/0/alpha.water" \
             || { echo "FAIL: the inflow fixture's inletValue was not rewritten"; return 1; }
     fi
+    case "$profile" in
+        nouter)  sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' "$C/system/fvSolution"
+                 grep -q "nOuterCorrectors 2;" "$C/system/fvSolution" || { echo "FAIL: nOuterCorrectors was not raised"; return 1; } ;;
+        nonorth) sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' "$C/system/fvSolution"
+                 grep -q "nNonOrthogonalCorrectors 1;" "$C/system/fvSolution" || { echo "FAIL: nNonOrthogonalCorrectors was not raised"; return 1; } ;;
+        mompred) sed -i 's/momentumPredictor  *no;/momentumPredictor yes;/' "$C/system/fvSolution"
+                 grep -q "momentumPredictor yes;" "$C/system/fvSolution" || { echo "FAIL: momentumPredictor was not switched on"; return 1; }
+                 # damBreak names `U` only, and with one outer corrector fvMatrix::solve() selects
+                 # `UFinal`: real OpenFOAM stops on this case, "Entry 'UFinal' not found". The key
+                 # becomes the regex "U.*", which is how the tutorials that DO run a predictor write it.
+                 sed -i 's/^\( *\)U$/\1"U.*"/' "$C/system/fvSolution"
+                 grep -q '"U\.\*"' "$C/system/fvSolution" || { echo "FAIL: the U solver entry was not widened to UFinal"; return 1; } ;;
+    esac
     if [ "$profile" = outflow ]; then
         # THE WATER COLUMN REACHES THE ATMOSPHERE, whose faces over it turn out to be OUTFLOW (the patch
         # fixes p_rgh, not p, so the column top sees the lower pressure): water leaves through them.
@@ -170,6 +191,8 @@ PYEOF
     [ "$profile" = prevcorr ] && std="$W/bigstep/$end"
     # ...and the sub-cycled one reads the un-sub-cycled one: the sub-cycle count has to be live too
     [ "$profile" = prevcorrsub ] && std="$W/prevcorr/$end"
+    # ...and the three PIMPLE profiles read the big-step run without their setting
+    case "$profile" in nouter|nonorth|mompred) std="$W/bigstep/$end" ;; esac
     "$BIN" "$C" "$C/0" "$C/$end" "$STEPS" "$C/log.interFoam" "$C.control" "$profile" $std
 }
 
@@ -180,4 +203,7 @@ run_at "$DT" inflow "$STEPS_INFLOW" || rc=1
 run_at "$DT_BIG" prevcorr || rc=1
 run_at "$DT_BIG" prevcorrsub || rc=1
 run_at "$DT_OUT" outflow "$STEPS_OUT" || rc=1
+run_at "$DT_BIG" nouter || rc=1
+run_at "$DT_BIG" nonorth || rc=1
+run_at "$DT_BIG" mompred || rc=1
 exit $rc

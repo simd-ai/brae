@@ -1,6 +1,7 @@
 // interFoam's momentum predictor -- see inter_ueqn_cpp.cuh for the provenance and for the three things
 // that are not in rhoSimpleFoam's UEqn.
 #include "inter_ueqn_cpp.cuh"
+#include "inter_peqn_cpp.cuh"
 #include "solve_vector.cuh"
 
 namespace brae {
@@ -218,7 +219,20 @@ void momentumPredictor(GeometricField<vector>&     U,
     if (!solveMomentum) return;
     FvVectorMatrix solved = UEqnOut;
     addMomentumPredictorSource(solved, faceForce, m, g, patches);
-    solveVector(solved, U, m, patches, sc.tolU, sc.relTolU, sc.maxIterU);
+    SolverPerformance perf[3];
+    solveVector(solved, U, m, patches, sc.tolU, sc.relTolU, sc.maxIterU, 0, sc.solutionD, perf, &sc.which);
+    // fvMatrix::solve() ends with psi.correctBoundaryConditions(); solveVector's evaluateBoundary() is
+    // only half of that for a flux-conditional patch -- see updateVelocityPatchesFromCells.
+    updateVelocityPatchesFromCells(U, patches);
+    if (sc.solveLog)
+    {
+        for (int k = 0; k < 3; ++k)
+        {
+            if (sc.solutionD && !sc.solutionD->valid(k)) continue;
+            sc.solveLog[k].push_back(
+                LinearSolveRecord{perf[k].initialResidual, perf[k].finalResidual, perf[k].nIterations});
+        }
+    }
 }
 
 } // namespace interFoam

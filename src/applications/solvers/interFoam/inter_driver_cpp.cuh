@@ -48,6 +48,9 @@ struct RunReport
     std::vector<PressureSolveRecord> pSolves;
     // ...and every alpha pre-solve: one per sub-cycle per step, and none on a case without MULESCorr
     std::vector<LinearSolveRecord> alphaSolves;
+    // ...and the momentum predictor's, per component -- Ux, Uy, Uz -- when the case runs one. A
+    // component the mesh does not solve (the empty direction of a 2-D case) stays empty.
+    std::vector<LinearSolveRecord> uSolves[3];
 };
 
 // Run `nSteps` of interFoam on a prepared case. Returns the state at the end; `verbose` prints the

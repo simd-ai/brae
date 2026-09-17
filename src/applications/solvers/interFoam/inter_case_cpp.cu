@@ -394,6 +394,40 @@ InterFields buildInterFields(const std::string&          caseDir,
                 + f.alphaName + "` names no `solver` for it. OpenFOAM refuses the same case.");
     }
 
+    // solvers/U and solvers/UFinal -- read only when the case solves a momentum predictor, and then
+    // REQUIRED exactly where OpenFOAM requires them.
+    if (f.momentumPredictorOn)
+    {
+        const FoamDict* sv = fvSolution.subDict("solvers");
+        auto readU = [&](const char* name, bool required, InterFields::AlphaLinearSolve& out)
+        {
+            const FoamDict* d = sv ? sv->subDict(name) : nullptr;
+            if (!d)
+            {
+                if (!required) return;
+                throw std::runtime_error(
+                    std::string("brae interFoam: `momentumPredictor yes` and fvSolution has no `solvers/")
+                    + name + "` entry. fvMatrix::solve() selects it by the final-iteration flag -- UFinal "
+                      "on the last outer corrector, U on the others -- and OpenFOAM stops without it.");
+            }
+            out.solver = d->wordOr("solver", "");
+            out.smoother = d->wordOr("smoother", "");
+            out.tol = d->scalarOr("tolerance", scalar(1e-6));
+            out.relTol = d->scalarOr("relTol", scalar(0));
+            out.maxIter = static_cast<int>(d->scalarOr("maxIter", scalar(1000)));
+            out.nSweeps = static_cast<int>(d->scalarOr("nSweeps", scalar(1)));
+            if (!out.gaussSeidel())
+            {
+                noticeApproximated(std::string("interFoam ") + name + " solve",
+                    "the case asks for `solver " + out.solver + "` and brae runs BiCGStab at the same "
+                    "tolerance. Only smoothSolver with a Gauss-Seidel smoother is OpenFOAM's own here; "
+                    "the difference is where the solve stops.");
+            }
+        };
+        readU("UFinal", true, f.uSolveFinal);
+        readU("U", f.pimple.nOuterCorrectors > 1, f.uSolve);
+    }
+
     // solvers/p_rgh -- the case's own pressure solve. See InterFields::tolP for why this is read
     // rather than assumed, and why relTol comes from the Final entry.
     {

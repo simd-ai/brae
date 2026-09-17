@@ -241,6 +241,19 @@ struct PressureStepInput
     std::vector<PressureSolveRecord>* solveLog = nullptr;
 };
 
+// U.correctBoundaryConditions() FOR THE FLUX-CONDITIONAL VELOCITY PATCHES, which evaluateBoundary()
+// alone does not resolve. pressureInletOutletVelocity is a directionMixed: OpenFOAM's evaluate() leaves
+// the patch value at patchInternalField on an outflow face and at its normal component on an inflow
+// one, and brae's class keeps its STORED value through evaluate() on purpose, so this is what moves it.
+// It must run wherever OpenFOAM's U.correctBoundaryConditions() does -- after the velocity correction
+// in pEqn.H, AND after the momentum predictor's solve, which ends with one. The second was missing on
+// the host: under `momentumPredictor yes` the first pressure corrector then read a stale U_b in
+// totalPressure's 0.5*rho*|U_b|^2, and the host sat at U 9.2e-08 from OpenFOAM on a case where the
+// device, which did refresh it, sat at 8.7e-12.
+void updateVelocityPatchesFromCells(
+    GeometricField<vector>& U,
+    const std::vector<FvPatch>& patches);
+
 // totalPressure's updateCoeffs, at the moment OpenFOAM runs it: fvm::laplacian(rAUf, p_rgh) constructs
 // an fvMatrix, whose constructor calls psi.boundaryFieldRef().updateCoeffs(). For a dimPressure field
 // with no psi that is (totalPressureFvPatchScalarField.C:118-127)

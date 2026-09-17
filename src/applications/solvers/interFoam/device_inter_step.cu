@@ -4,6 +4,7 @@
 #include "device_blas.cuh"
 #include "device_ldu.cuh"
 #include "device_pcg.cuh"
+#include "device_amg.cuh"   // deviceSymGaussSeidel
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdio>
@@ -250,14 +251,33 @@ void deviceInterStep(
         DeviceBuffer<scalar>* Sk[3] = {&sx, &sy, &sz};
         for (int k = 0; k < 3; ++k)
         {
+            // fvMatrixSolve.C:162-164: a component the mesh does not solve is SKIPPED, not solved to
+            // zero -- on a 2-D case that is the empty direction, and OpenFOAM's log has no Uz line.
+            if (ctl.solutionD[k] == -1) continue;
             DeviceBuffer<scalar> diagC, b;
             deviceFold(dm, UEqn.relaxed ? UEqn.relaxedDiag : UEqn.diag, *Sk[k],
                        UEqn.iC[k], UEqn.bC[k], diagC, b);
             const DeviceLduView Ak = deviceLduView(dm, diagC, UEqn.upper, UEqn.lower);
             DeviceBuffer<scalar> dNf;
             deviceNormFactorInto(Ak, *Uk[k], b, deviceOnes(nC), dNf);
-            deviceJacobiBiCGStab(Ak, b, *Uk[k], dNf.data(),
-                                 ctl.momentum.tol, ctl.momentum.relTol, ctl.momentum.maxIter);
+            // the case's own smoother where it names one -- see deviceAlphaPreSolve for what a
+            // substituted solver at the same tolerance costs
+            DeviceSolverPerf perf;
+            if (ctl.momentum.smoothSolver)
+            {
+                deviceSymGaussSeidel(Ak, b, *Uk[k], dNf.data(), ctl.momentum.tol, ctl.momentum.relTol,
+                                     ctl.momentum.maxIter, &perf, /*minIter=*/0, ctl.momentum.nSweeps,
+                                     ctl.momentum.symmetric);
+            }
+            else
+            {
+                perf = deviceJacobiBiCGStab(Ak, b, *Uk[k], dNf.data(), ctl.momentum.tol,
+                                            ctl.momentum.relTol, ctl.momentum.maxIter);
+            }
+            if (ctl.momentumSolveLog)
+            {
+                ctl.momentumSolveLog[k].push_back(perf);
+            }
         }
         hooks.updateUBoundary(UX, UY, UZ, dbU, ub);
         deviceUpdatePressureInletOutletVelocity(dbU, phiBnd, UX, UY, UZ, /*directionMixed=*/true);
