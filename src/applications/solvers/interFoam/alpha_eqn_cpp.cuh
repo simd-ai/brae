@@ -196,6 +196,10 @@ void massFlux(const SurfaceScalarField& alphaPhi10,
 //   * alpha1 is updated IN PLACE by each corrector. The correctors are a sequence, not an average.
 struct AlphaStepInput
 {
+    // OUT, optional: alpha2's patch values as `alpha2 = 1.0 - alpha1` leaves them (alphaEqn.H:223),
+    // which is BEFORE the corrector's mixture.correct() moves alpha1's. See InterFields::alpha2Bnd.
+    std::vector<std::vector<scalar>>* alpha2BndOut = nullptr;
+
     const SurfaceScalarField* phi      = nullptr;   // the volumetric flux
     const SurfaceScalarField* phiCN    = nullptr;   // off-centred; == phi for Euler
 

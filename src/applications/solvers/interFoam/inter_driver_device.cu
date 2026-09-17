@@ -107,18 +107,50 @@ RunReport runInterFoamDevice(
     }
     DeviceBuffer<int> dAFixes(aFixes), dAFlag(aFlag), dTakeU(takeU), dUFixes(uFixes);
 
-    // ---- the hooks: every one is per-patch host work, and nothing else ----------------------------
+    // THE BOUNDARY FLUX, declared above the hooks because they read it. OpenFOAM's flux-conditional
+    // patches look phi up whenever they update; brae's are told, and the device path holds the only
+    // current copy. See pushFluxToPatches for what not telling them cost on capillaryRise.
+    DeviceBuffer<scalar> dPhiB(flattenPatches(f.phi.boundary));
+    auto pushFlux = [&]()
+    {
+        std::vector<scalar> pb;
+        dPhiB.copyTo(pb);
+        std::size_t off = 0;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+            f.phi.boundary[pi].assign(pb.begin() + off, pb.begin() + off + n);
+            off += n;
+        }
+        pushFluxToPatches(f, fvp);
+    };
+
+    // the hooks: every one is per-patch host work, and nothing else
     DeviceInterStepHooks H;
     H.alpha.updateBoundary =
         [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& aBnd, DeviceBuffer<scalar>& nBnd)
     {
+        pushFlux();
         a.copyTo(f.alpha1.internal);
         f.alpha1.evaluateBoundary();
         aBnd.copyFrom(patchValues(f.alpha1, fvp));
+        // The boundary viscosity from alpha's patch values as they stand HERE, before the curvature
+        // pass below rewrites the contact-angle gradient: mixture.correct() is calcNu() and THEN
+        // interfaceProperties::correct(). The last call of a step is the one UEqn reads. See the host
+        // driver's mixtureCorrect stage for the measurement.
+        updateMixtureBoundary(f, fvp);
         SurfaceScalarField nHb;
         std::vector<scalar> Kb;
         interfaceProps::calculateK(f.alpha1, f.interface, m, g, fvp, false, nHb, Kb);
         nBnd.copyFrom(flattenPatches(nHb.boundary));
+    };
+    H.alpha.refreshBoundary =
+        [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& aBnd)
+    {
+        pushFlux();
+        a.copyTo(f.alpha1.internal);
+        f.alpha1.evaluateBoundary();
+        aBnd.copyFrom(patchValues(f.alpha1, fvp));
     };
     H.alpha.divCoeffs =
         [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC)
@@ -137,6 +169,7 @@ RunReport runInterFoamDevice(
         [&](const DeviceBuffer<scalar>& ux, const DeviceBuffer<scalar>& uy,
             const DeviceBuffer<scalar>& uz, DeviceVectorBoundary& db, DeviceBuffer<scalar>* ubOut)
     {
+        pushFlux();
         std::vector<scalar> x, y, z;
         ux.copyTo(x); uy.copyTo(y); uz.copyTo(z);
         for (label c = 0; c < nC; ++c) f.U.internal[c] = vector{x[c], y[c], z[c]};
@@ -188,7 +221,8 @@ RunReport runInterFoamDevice(
         cpu::twoPhase::mixtureMu(f.alpha1.internal, f.mixture.phases, f.mu);
         cpu::twoPhase::mixtureNu(f.alpha1.internal, f.mu, f.mixture.phases, f.nu);
         nuC.copyFrom(f.nu);
-        updateMixtureBoundary(f, fvp);
+        // f.nuBnd is the alpha hook's, taken BEFORE its curvature pass. Rebuilding it here would read
+        // alpha's patch values one contact-angle pass too late.
         nuB.copyFrom(flattenPatches(f.nuBnd));
 
         // snGrad(p_rgh) is read ONLY when the case runs a momentum predictor; it is explicit there and
@@ -300,7 +334,7 @@ RunReport runInterFoamDevice(
 
     DeviceBuffer<scalar> dA(f.alpha1.internal), dAOld(f.alpha1.internal);
     DeviceBuffer<scalar> dUx(ux), dUy(uy), dUz(uz), dUox(ux), dUoy(uy), dUoz(uz);
-    DeviceBuffer<scalar> dPhiI(f.phi.internal), dPhiB(flattenPatches(f.phi.boundary));
+    DeviceBuffer<scalar> dPhiI(f.phi.internal);
     DeviceBuffer<scalar> dPrgh(f.p_rgh.internal), dP;
     DeviceBuffer<scalar> dNH(f.nHatf.internal), dNHB(flattenPatches(f.nHatf.boundary));
     DeviceBuffer<scalar> dABnd(patchValues(f.alpha1, fvp)), dK(f.K);

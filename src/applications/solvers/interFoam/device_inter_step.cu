@@ -106,7 +106,10 @@ void deviceInterStep(
     ain.rho2 = props.rho2;
 
     DeviceBuffer<scalar> alpha2;
-    deviceInterAlphaStep(dm, alpha1, alpha1Old, deltaT, ain, ctl.mules, ctl.alpha, props, hooks.alpha,
+    DeviceBuffer<scalar> alpha2Bnd;
+    DeviceInterAlphaControls actl = ctl.alpha;
+    actl.alpha2BndOut = &alpha2Bnd;
+    deviceInterAlphaStep(dm, alpha1, alpha1Old, deltaT, ain, ctl.mules, actl, props, hooks.alpha,
                          alpha1Bnd, nHatfBnd, bndAlphaFixesValue, bndAlphaFlag,
                          nHatfInt, K, rhoPhiInt, rhoPhiBnd, alpha2, rho, mu, nu);
 
@@ -127,6 +130,11 @@ void deviceInterStep(
     // ---- 3. THE MOMENTUM MATRIX -------------------------------------------------------------------
     DeviceBuffer<scalar> ub[3];
     hooks.updateUBoundary(UX, UY, UZ, dbU, ub);
+    // pressureInletOutletVelocity's updateCoeffs, from the flux registered NOW: an inflow face fixes
+    // its tangential components, an outflow face is zeroGradient. The hook rebuilds dbU from the host
+    // patches' categories, which carry no flux, so without this every such face stayed zeroGradient for
+    // the whole run -- which agreed with the host only while the host made the same omission.
+    deviceUpdatePressureInletOutletVelocity(dbU, phiBnd, UX, UY, UZ, /*directionMixed=*/true);
 
     // THE BOUNDARY MIXTURE COMES FROM ALPHA'S PATCH VALUES, not from the face cell's. Those are
     // different fields at a contact-angle wall -- alpha's patch value is patchInternalField +
@@ -136,10 +144,19 @@ void deviceInterStep(
     // OpenFOAM's own UEqn.A(): exact in all 3200 water cells, up to 56% low in the air cells AT THE
     // WALL, which is where the contact line is. deviceMixtureCorrect is the same fused kernel the
     // cells use, applied to the patch values.
+    // ...and from ALPHA2's patch values for the rho2 half, which are one contact-angle pass older than
+    // alpha1's -- see deviceBoundaryRho.
     DeviceBuffer<scalar> rhoBnd(static_cast<std::size_t>(nBf));
     if (nBf > 0)
-        deviceMixtureCorrect(alpha1Bnd.data(), nBf, props,
-                             nullptr, rhoBnd.data(), nullptr, nullptr);
+    {
+        if (alpha2Bnd.size() != static_cast<std::size_t>(nBf))
+        {
+            throw std::runtime_error(
+                "brae interFoam device step: the alpha step assigned no alpha2 patch values, so rho's "
+                "boundary cannot be blended. nAlphaCorr must be at least 1.");
+        }
+        deviceBoundaryRho(alpha1Bnd.data(), alpha2Bnd.data(), nBf, props, rhoBnd.data());
+    }
 
     DeviceBuffer<scalar> muCell, muFace, muBndFace;
     deviceInterMuEff(dm, rho, nuEffCell, rhoBnd, nuEffBnd, muCell, muFace, muBndFace);
@@ -241,6 +258,7 @@ void deviceInterStep(
                                  ctl.momentum.tol, ctl.momentum.relTol, ctl.momentum.maxIter);
         }
         hooks.updateUBoundary(UX, UY, UZ, dbU, ub);
+        deviceUpdatePressureInletOutletVelocity(dbU, phiBnd, UX, UY, UZ, /*directionMixed=*/true);
         (void)A;
     }
 
@@ -326,6 +344,7 @@ void deviceInterStep(
         // laplacian, its flux and its HbyA all read them.
         if (hooks.pressure.updateBoundary) hooks.pressure.updateBoundary(p_rgh);
         hooks.updateUBoundary(UX, UY, UZ, dbU, ub);
+        deviceUpdatePressureInletOutletVelocity(dbU, phiBnd, UX, UY, UZ, /*directionMixed=*/true);
     }
     probe("p_rgh", p_rgh);
     probe("phi", phiInt);

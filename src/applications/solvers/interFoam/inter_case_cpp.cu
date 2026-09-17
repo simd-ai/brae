@@ -11,6 +11,26 @@ namespace brae {
 namespace cpu {
 namespace interFoam {
 
+// OpenFOAM's flux-conditional patches LOOK UP phi when they update (pressureInletOutletVelocity,
+// inletOutlet, totalPressure: `patch().lookupPatchField<surfaceScalarField, scalar>(phiName_)` inside
+// updateCoeffs), so whatever phi is at that moment decides which faces are inflow. brae's patches
+// cannot look anything up; they are told, through updateFromFlux, and interFoam never told them. Every
+// such face therefore sat at OUTFLOW for the whole run -- on capillaryRise's bottom inlet, where water
+// is drawn IN, that dropped pressureInletOutletVelocity's two fixed tangential components and with them
+// 2/3 muEff magSf deltaCoeffs of UEqn.A(): 5.33e+05 by that formula, 5.339e+05 measured against
+// OpenFOAM's own UEqn.A() dump, in every cell of the bottom row.
+void pushFluxToPatches(
+    InterFields& f,
+    const std::vector<FvPatch>& patches)
+{
+    for (std::size_t pi = 0; pi < patches.size() && pi < f.phi.boundary.size(); ++pi)
+    {
+        f.U.boundary[pi]->updateFromFlux(f.phi.boundary[pi]);
+        f.p_rgh.boundary[pi]->updateFromFlux(f.phi.boundary[pi]);
+        f.alpha1.boundary[pi]->updateFromFlux(f.phi.boundary[pi]);
+    }
+}
+
 void updateMixtureBoundary(InterFields& f, const std::vector<FvPatch>& patches)
 {
     f.rhoBnd.resize(patches.size());
@@ -31,7 +51,9 @@ void updateMixtureBoundary(InterFields& f, const std::vector<FvPatch>& patches)
             const scalar a  = ab[i];
             const scalar ac = cpu::twoPhase::limitedAlpha(a);
             const auto&  p  = f.mixture.phases;
-            f.rhoBnd[pi][i] = a*p.rho1 + (scalar(1) - a)*p.rho2;
+            const bool haveA2 = pi < f.alpha2Bnd.size() && i < f.alpha2Bnd[pi].size();
+            const scalar a2 = haveA2 ? f.alpha2Bnd[pi][i] : scalar(1) - a;
+            f.rhoBnd[pi][i] = a*p.rho1 + a2*p.rho2;
             f.muBnd[pi][i]  = ac*p.rho1*p.nu1 + (scalar(1) - ac)*p.rho2*p.nu2;
             f.nuBnd[pi][i]  = f.muBnd[pi][i] / (ac*p.rho1 + (scalar(1) - ac)*p.rho2);
         }
@@ -294,6 +316,8 @@ InterFields buildInterFields(const std::string&          caseDir,
     // has just driven down, and recomputing it discards exactly that.
     f.phi = readPhiIfPresent(startDir, patches, m.nInternalFaces(),
                              fvc::flux(f.U, m, g, patches), &f.phiWasRead);
+    // ...AND EVERY PATCH THAT DECIDES INFLOW FROM OUTFLOW BY IT LEARNS IT. See pushFluxToPatches.
+    pushFluxToPatches(f, patches);
 
     // --- the mixture --------------------------------------------------------------------------
     // 2: rho from the RAW alpha, mu and nu from the CLAMPED one -- see two_phase_mixture_cpp.cuh.

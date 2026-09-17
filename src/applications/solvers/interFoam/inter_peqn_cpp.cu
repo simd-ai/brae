@@ -293,6 +293,17 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
     // the laplacian below. phiHbyA += phig.
     std::vector<scalar> phig;
     buoyancyFlux(in.stf->internal, *in.ghf, in.snGradRho->internal, rAUfField.internal, g.magSf(), phig);
+    if (in.taps)
+    {
+        in.taps->A = A;
+        in.taps->rAU = rAU;
+        in.taps->HbyA = HbyA;
+        in.taps->rAUf = rAUfField.internal;
+        in.taps->phig = phig;
+        in.taps->phiHbyA = phiHbyA.internal;
+        in.taps->stf = in.stf->internal;
+        in.taps->snGradRho = in.snGradRho->internal;
+    }
     for (label f = 0; f < nIf; ++f) phiHbyA.internal[f] += phig[f];
 
     // ...ON THE BOUNDARY TOO -- see PressureStepInput::ghfBnd. rAUf at an uncoupled patch is the face
@@ -378,6 +389,17 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
             for (std::size_t pi = 0; pi < phi.boundary.size(); ++pi)
                 for (std::size_t i = 0; i < phi.boundary[pi].size(); ++i)
                     phi.boundary[pi][i] -= pFlux.boundary[pi][i];
+
+            // THE NEW FLUX REACHES THE FLUX-CONDITIONAL PATCHES BEFORE U'S BOUNDARY IS EVALUATED, which
+            // is the order pEqn.H gives: `phi = phiHbyA - p_rghEqn.flux()`, then
+            // U.correctBoundaryConditions(), whose updateCoeffs looks phi up. p_rgh's patches take it
+            // too, for the next corrector's laplacian. See pushFluxToPatches in inter_case_cpp.cu for
+            // what leaving this out cost on capillaryRise.
+            for (std::size_t pi = 0; pi < patches.size() && pi < phi.boundary.size(); ++pi)
+            {
+                U.boundary[pi]->updateFromFlux(phi.boundary[pi]);
+                p_rgh.boundary[pi]->updateFromFlux(phi.boundary[pi]);
+            }
 
             // U = HbyA + rAU*fvc::reconstruct((phig - p_rghEqn.flux())/rAUf) -- the divide INSIDE the
             // reconstruction and the multiply OUTSIDE, which coincide only for a uniform rAU.

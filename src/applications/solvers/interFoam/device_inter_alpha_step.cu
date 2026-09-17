@@ -54,9 +54,19 @@ void deviceInterAlphaStep(
     // mixture.correct() at the BOTTOM of a corrector: the interface normal from alpha's new field, then
     // the mixture properties from it. interfaceProperties reads mu and nu right after, which is why the
     // two are one call and not two.
-    auto correctMixture = [&](const DeviceBuffer<scalar>& a)
+    auto correctMixture = [&](
+        const DeviceBuffer<scalar>& a,
+        bool assignsAlpha2)
     {
         hooks.updateBoundary(a, alpha1Bnd, nHatfBnd);
+        // alpha1Bnd is alpha1's patch as MULES's correctBoundaryConditions left it and BEFORE the
+        // curvature pass below moves it -- which is the state `alpha2 = 1.0 - alpha1` reads.
+        if (assignsAlpha2 && ctl.alpha2BndOut && nBf > 0)
+        {
+            ctl.alpha2BndOut->resize(static_cast<std::size_t>(nBf));
+            deviceMixtureCorrect(alpha1Bnd.data(), nBf, props,
+                                 ctl.alpha2BndOut->data(), nullptr, nullptr, nullptr);
+        }
         deviceInterfaceCorrect(dm, a, alpha1Bnd, nHatfBnd, in.deltaN, nHatfInt, K);
         alpha2.resize(static_cast<std::size_t>(nC));
         rho.resize(static_cast<std::size_t>(nC));
@@ -79,7 +89,15 @@ void deviceInterAlphaStep(
         // to alpha1, so this lambda never assumes the two are the same object.
         alpha.resize(static_cast<std::size_t>(nC));
         cudaMemcpy(alpha.data(), subOld.data(), sizeof(scalar)*nC, cudaMemcpyDeviceToDevice);
-        hooks.updateBoundary(alpha, alpha1Bnd, nHatfBnd);
+        // patch values only -- NOT a mixture.correct(); see DeviceInterAlphaHooks::refreshBoundary
+        if (hooks.refreshBoundary)
+        {
+            hooks.refreshBoundary(alpha, alpha1Bnd);
+        }
+        else
+        {
+            hooks.updateBoundary(alpha, alpha1Bnd, nHatfBnd);
+        }
 
         if (ctl.MULESCorr)
         {
@@ -88,7 +106,7 @@ void deviceInterAlphaStep(
             hooks.divCoeffs(alpha, iC, bC);
             deviceAlphaPreSolve(dm, alpha, subOld, *li.phiCNInt, iC, bC, dtSub, ctl.preSolve,
                                 alphaPhiInt, alphaPhiBnd);
-            correctMixture(alpha);                              // alphaEqn.H:151-153
+            correctMixture(alpha, true);                        // alphaEqn.H:151-153
         }
 
         for (int aCorr = 0; aCorr < ctl.nAlphaCorr; ++aCorr)
@@ -101,7 +119,7 @@ void deviceInterAlphaStep(
             db.flag       = &bndFlag;
             deviceAlphaCorrector(dm, alpha, subOld, li, db, mulesCtl, nHatfInt,
                                  alphaPhiInt, alphaPhiBnd);
-            correctMixture(alpha);                              // alphaEqn.H:225
+            correctMixture(alpha, true);                        // alphaEqn.H:223-225
         }
 
         // rhoPhi = alphaPhi10*(rho1 - rho2) + phiCN*rho2, alphaEqn.H:248 -- built once per SUB-STEP,
@@ -116,7 +134,7 @@ void deviceInterAlphaStep(
     // ...and mixture.correct() ONCE MORE after the whole sub-cycle (alphaEqnSubCycle.H:36-38), so that
     // the momentum equation is built on the NEW density. Skipping it builds UEqn on the density the
     // step started with, which at a water/air interface is wrong by a factor of 1000 and converges.
-    correctMixture(alpha1);
+    correctMixture(alpha1, false);
 }
 
 } // namespace brae

@@ -31,6 +31,9 @@ namespace brae {
 namespace cpu {
 namespace interFoam {
 
+// inter_peqn_cpp.cuh
+struct PressureTaps;
+
 struct RunReport
 {
     label  steps        = 0;
@@ -65,7 +68,10 @@ RunReport runInterFoam(
     // ahead of time -- and brae_interFoam ran damBreak's `endTime 0.004` out to
     // t = 0.054 before this was a parameter. Left at VGREAT, nSteps is the bound,
     // which is what every gate wants.
-    scalar endTime = scalar(1.0e300));
+    scalar endTime = scalar(1.0e300),
+    // The pressure corrector's intermediates, for comparing against tools/dumpInterFoam. Null in
+    // every production run.
+    PressureTaps* pressureTaps = nullptr);
 
 // ...and the SAME run on the GPU. Every operator, every corrector and every loop is the device code
 // gated in tests/test_device_inter_dambreak_alpha.cu, which tracks this host driver on damBreak's own

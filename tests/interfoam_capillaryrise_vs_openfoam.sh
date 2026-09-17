@@ -64,10 +64,32 @@ PYEOF
 
 ( cd "$W/case" && blockMesh > log.blockMesh 2>&1 ) || { echo "FAIL: blockMesh"; tail -20 "$W/case/log.blockMesh"; exit 1; }
 ( cd "$W/case" && setFields > log.setFields 2>&1 ) || { echo "FAIL: setFields"; tail -20 "$W/case/log.setFields"; exit 1; }
-( cd "$W/case" && interFoam > log.interFoam 2>&1 ) || { echo "FAIL: interFoam"; tail -30 "$W/case/log.interFoam"; exit 1; }
+# tools/dumpInterFoam when it is built: OpenFOAM's own interFoam with writes added and nothing else, so
+# the gate can read the pressure corrector term by term. BRAE_DUMP_ITER makes it dump the last step.
+OFSOLVER=interFoam
+command -v dumpInterFoam > /dev/null 2>&1 && OFSOLVER=dumpInterFoam
+( cd "$W/case" && BRAE_DUMP_ITER="$STEPS" $OFSOLVER > log.interFoam 2>&1 ) || { echo "FAIL: $OFSOLVER"; tail -30 "$W/case/log.interFoam"; exit 1; }
+echo "OpenFOAM solver: $OFSOLVER"
 
 END=$(python3 -c "print('%.10g' % ($STEPS*float('$DT')))")
 [ -d "$W/case/$END" ] || { echo "FAIL: OpenFOAM wrote no $END directory"; ls "$W/case"; exit 1; }
 echo "OpenFOAM ran $STEPS steps of deltaT $DT to t = $END"
 
-"$BIN" "$W/case" "$W/case/0" "$W/case/$END" "$STEPS"
+# A SECOND OpenFOAM RUN WITH EVERY LINEAR SOLVE TIGHTENED, for the device arm. The device runs its own
+# solver on p_rgh, so at the case's relTol 0.05 it stops somewhere OpenFOAM does not and the comparison
+# measures that (9.2e-04) rather than the discretisation (3.5e-08). Tightening both codes separates the
+# two; the gate reports each.
+cp -r "$W/case" "$W/tight"
+rm -rf "$W/tight/$END" "$W"/tight/log.interFoam
+python3 - "$W/tight" <<'PYEOF'
+import os, re, sys
+q = os.path.join(sys.argv[1], 'system/fvSolution')
+t = open(q).read()
+t = re.sub(r'(tolerance\s+)[^;]+;', r'\g<1>1e-13;', t)
+t = re.sub(r'(relTol\s+)[^;]+;', r'\g<1>0;', t)
+open(q, 'w').write(t)
+PYEOF
+( cd "$W/tight" && interFoam > log.interFoam 2>&1 ) || { echo "FAIL: interFoam (tightened)"; tail -30 "$W/tight/log.interFoam"; exit 1; }
+[ -d "$W/tight/$END" ] || { echo "FAIL: the tightened OpenFOAM run wrote no $END directory"; exit 1; }
+
+"$BIN" "$W/case" "$W/case/0" "$W/case/$END" "$STEPS" "$W/tight" "$W/tight/$END"

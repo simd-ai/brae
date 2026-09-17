@@ -516,6 +516,22 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
                                         mf, mulesCtl, m, g, patches);
         }
 
+        // alpha2 = 1.0 - alpha1 (alphaEqn.H:223), a whole-field assignment, so alpha2's PATCH values
+        // are fixed here -- one line above the mixture.correct() that rewrites alpha1's.
+        if (in.alpha2BndOut)
+        {
+            in.alpha2BndOut->resize(patches.size());
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                const std::vector<scalar>& ab = alpha1.boundary[pi]->value();
+                (*in.alpha2BndOut)[pi].resize(ab.size());
+                for (std::size_t i = 0; i < ab.size(); ++i)
+                {
+                    (*in.alpha2BndOut)[pi][i] = scalar(1) - ab[i];
+                }
+            }
+        }
+
         // ...and mixture.correct() at the BOTTOM of the corrector, alphaEqn.H:225. The next corrector
         // (or the next sub-cycle) compresses towards where MULES has just put the interface.
         interfaceProps::calculateK(alpha1, ic, m, g, patches, /*gradLeastSquares=*/false, nHatf, K);

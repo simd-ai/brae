@@ -67,6 +67,12 @@ struct InterFields
 
     // --- derived
     std::vector<scalar> alpha2, rho, mu, nu, gh, p;
+    // alpha2's PATCH values, which are NOT 1 - alpha1's. `alpha2 = 1.0 - alpha1` (alphaEqn.H:223) runs
+    // one line ABOVE the corrector's mixture.correct(), and at a contact-angle wall that call rewrites
+    // alpha1's gradient and re-evaluates its patch. `rho == alpha1*rho1 + alpha2*rho2` then blends the
+    // NEW alpha1 patch value with the OLD alpha2 one. Empty until the first alpha step, where
+    // 1 - alpha1's patch value is what OpenFOAM's createFields leaves too.
+    std::vector<std::vector<scalar>> alpha2Bnd;
     // THE MIXTURE ON THE BOUNDARY, built from alpha's PATCH VALUES and not from the face cell's.
     // Those are different fields at a contact-angle wall: alpha's patch value is
     // patchInternalField + gradient/deltaCoeffs, and the contact angle's gradient is what pulls the
@@ -166,6 +172,12 @@ struct InterFields
     std::string alphaName;                 // "alpha." + phase1Name
     bool    phiWasRead = false;            // see note 3
 };
+
+// Tell every flux-conditional patch of U, p_rgh and alpha1 the current phi -- see the definition.
+// Call it whenever phi changes, before the next boundary evaluation reads it.
+void pushFluxToPatches(
+    InterFields& f,
+    const std::vector<FvPatch>& patches);
 
 // The case's dictionaries and fields -> InterFields. Throws, by name, on anything not ported.
 // Rebuild the boundary blends from alpha's current patch values. Called wherever mixture.correct()

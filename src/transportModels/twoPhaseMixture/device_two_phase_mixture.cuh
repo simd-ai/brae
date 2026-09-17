@@ -51,4 +51,16 @@ void deviceMixtureCorrect(
     scalar*                     mu,
     scalar*                     nu);
 
+// rho ON THE BOUNDARY, where alpha2's patch values are a field of their own and NOT 1 - alpha1's.
+// `alpha2 = 1.0 - alpha1` (alphaEqn.H:223) runs one line above the corrector's mixture.correct(), and
+// at a contact-angle wall that call rewrites alpha1's gradient and re-evaluates its patch; `rho ==
+// alpha1*rho1 + alpha2*rho2` then blends the NEW alpha1 patch value with the OLD alpha2 one. Measured on
+// capillaryRise against OpenFOAM's own rho*nu at the wall: 7.4e-05 out with 1 - alpha1, 1e-17 with this.
+void deviceBoundaryRho(
+    const scalar* alpha1Bnd,
+    const scalar* alpha2Bnd,
+    int nFaces,
+    const DevicePhaseProperties& props,
+    scalar* rhoBnd);
+
 } // namespace brae

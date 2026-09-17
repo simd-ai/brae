@@ -71,7 +71,39 @@ __global__ void mixtureCorrectKernel(
     }
 }
 
+__global__
+void boundaryRhoKernel(
+    const scalar* __restrict__ alpha1,
+    const scalar* __restrict__ alpha2,
+    int n,
+    scalar rho1,
+    scalar rho2,
+    scalar* __restrict__ rho)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    rho[i] = alpha1[i]*rho1 + alpha2[i]*rho2;
+}
+
 }   // namespace
+
+
+void deviceBoundaryRho(
+    const scalar* alpha1Bnd,
+    const scalar* alpha2Bnd,
+    int nFaces,
+    const DevicePhaseProperties& props,
+    scalar* rhoBnd)
+{
+    if (nFaces <= 0) return;
+    if (!alpha1Bnd || !alpha2Bnd || !rhoBnd)
+    {
+        throw std::runtime_error("brae deviceBoundaryRho: a null buffer.");
+    }
+    boundaryRhoKernel<<<nBlocks(nFaces), TPB>>>(
+        alpha1Bnd, alpha2Bnd, nFaces, props.rho1, props.rho2, rhoBnd);
+    cudaCheckMix(cudaGetLastError(), "boundaryRhoKernel launch");
+}
 
 
 void deviceMixtureCorrect(

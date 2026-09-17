@@ -194,6 +194,24 @@ struct PressureSolveControls
     scalar pRefValue = 0;
 };
 
+// Every intermediate tools/dumpInterFoam/pEqn.H writes, taken at the same point in the pass, so a gap
+// in the pressure corrector can be read term by term against OpenFOAM's own numbers. Overwritten on
+// every call: what is left is the LAST corrector's, which is also what the dump leaves, because it
+// writes all of them into the same time directory.
+struct PressureTaps
+{
+    std::vector<scalar> A;
+    std::vector<scalar> rAU;
+    std::vector<vector> HbyA;
+    // internal faces only
+    std::vector<scalar> rAUf;
+    std::vector<scalar> phig;
+    // BEFORE `phiHbyA += phig`, which is where the dump writes it
+    std::vector<scalar> phiHbyA;
+    std::vector<scalar> stf;
+    std::vector<scalar> snGradRho;
+};
+
 struct PressureStepInput
 {
     const FvVectorMatrix*      UEqn      = nullptr;   // the RELAXED momentum matrix, before the force
@@ -210,6 +228,8 @@ struct PressureStepInput
     const SurfaceScalarField*  stf       = nullptr;   // surfaceTensionForce, faces
     const SurfaceScalarField*  snGradRho = nullptr;
     const DdtCorrInput*        ddt       = nullptr;   // null = no ddtCorr (steady start)
+    // null = no capture
+    PressureTaps* taps = nullptr;
 };
 
 // One pass of pEqn.H. p_rgh, U and phi are all updated in place; `p` is (re)built at the end.

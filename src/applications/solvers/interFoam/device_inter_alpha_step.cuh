@@ -51,6 +51,20 @@ struct DeviceInterAlphaHooks
                        DeviceBuffer<scalar>&       alpha1Bnd,
                        DeviceBuffer<scalar>&       nHatfBnd)> updateBoundary;
 
+    // alpha1's patch values ALONE, with no curvature pass behind them. Optional; when absent the step
+    // falls back to updateBoundary, which is only right on a case with no contact angle.
+    //
+    // The two are different calls because interfaceProperties::correct() has a SIDE EFFECT at a
+    // contact-angle wall: it rewrites the patch's gradient (interfaceProperties.C:97), and the gradient
+    // is a fixed-point iteration in its passes -- 7070.5, 8659.4, 9353.1, 9681.2 on capillaryRise. So
+    // the NUMBER of passes is part of the answer. The sub-step's reset of alpha1 needs fresh patch
+    // values and is not a mixture.correct(); routing it through updateBoundary gave the device five
+    // curvature passes a step where OpenFOAM takes three, and put it 1.9% out in U after ONE step on
+    // capillaryRise with every other term exact. damBreak has no contact angle and could not see it.
+    std::function<void(
+        const DeviceBuffer<scalar>& alpha1,
+        DeviceBuffer<scalar>& alpha1Bnd)> refreshBoundary;
+
     // fvm::div(phiCN, alpha1)'s internalCoeffs and boundaryCoeffs, flattened in boundary-face order.
     // Only reached when MULESCorr is on; a case without it never needs them and passing none is fine.
     std::function<void(const DeviceBuffer<scalar>& alpha1,
@@ -64,6 +78,10 @@ struct DeviceInterAlphaControls
     int  nAlphaCorr      = 1;
     bool MULESCorr       = false;
     DeviceAlphaSolverControls preSolve;   // the case's fvSolution entry for alpha, MULESCorr only
+    // OUT, optional: alpha2's PATCH values, assigned where alphaEqn.H assigns alpha2 (lines 151 and
+    // 223) and NOT at the mixture.correct() after the sub-cycle, which leaves alpha2 alone. They are
+    // one contact-angle pass older than alpha1's -- see deviceBoundaryRho.
+    DeviceBuffer<scalar>* alpha2BndOut = nullptr;
 };
 
 // `alpha1` is advanced in place from `alpha1Old`, which is never written. `rho`, `mu` and `nu` come out

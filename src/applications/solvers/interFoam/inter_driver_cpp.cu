@@ -40,7 +40,8 @@ RunReport runInterFoam(
     label nSteps,
     bool verbose,
     InterFields* fieldsOut,
-    scalar endTime)
+    scalar endTime,
+    PressureTaps* pressureTaps)
 {
     InterFields f = buildInterFields(caseDir, startDir, m, g, patches);
     const label nC = m.nCells();
@@ -119,6 +120,7 @@ RunReport runInterFoam(
                     ai.alpharScheme = f.divPhirbAlpha;
                     ai.MULESCorr = f.alphaCtl.MULESCorr;
                     ai.alphaApplyPrevCorr = f.alphaCtl.alphaApplyPrevCorr;
+                    ai.alpha2BndOut = &f.alpha2Bnd;
 
                     auto step1 = [&](const std::vector<scalar>& aOld, scalar dtSub,
                                      std::vector<scalar>& aNew, SurfaceScalarField& rPhi)
@@ -149,12 +151,20 @@ RunReport runInterFoam(
                     cpu::twoPhase::mixtureRho(f.alpha1.internal, f.alpha2, f.mixture.phases, f.rho);
                     cpu::twoPhase::mixtureMu (f.alpha1.internal, f.mixture.phases, f.mu);
                     cpu::twoPhase::mixtureNu (f.alpha1.internal, f.mu, f.mixture.phases, f.nu);
-                    // ...AND THE CURVATURE. interFoam.C:154 calls mixture.correct() here, after the
+                    // THE BOUNDARY BLENDS FIRST, from alpha's patch values as they stand NOW. `rho ==`
+                    // (alphaEqnSubCycle.H:36) and calcNu() both read them before the curvature below
+                    // moves them: immiscibleIncompressibleTwoPhaseMixture::correct() is calcNu() THEN
+                    // interfaceProperties::correct() (immiscibleIncompressibleTwoPhaseMixture.H:78-82),
+                    // and at a contact-angle wall the second call rewrites alpha's gradient and so its
+                    // patch value. Blending after it gave the laplacian a wall viscosity one contact-
+                    // angle pass ahead: measured on capillaryRise against OpenFOAM's own UEqn.A() after
+                    // one step, exact in every cell off the wall and 1.26% high in the air cells at it,
+                    // which was the whole of the 0.2% that step leaves in U.
+                    updateMixtureBoundary(f, patches);
+                    // ...THEN THE CURVATURE. interFoam.C:154 calls mixture.correct() here, after the
                     // sub-cycle and before UEqn, and interfaceProperties::correct() IS calculateK.
                     // Rebuilding only rho/mu/nu leaves UEqn's surface-tension force one pass behind.
                     interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, f.nHatf, f.K);
-                    // ...and the boundary blends, which move with alpha's patch values.
-                    updateMixtureBoundary(f, patches);
                     break;
                 }
 
@@ -256,6 +266,7 @@ RunReport runInterFoam(
                     pin.UEqn = &UEqn; pin.rho = &f.rho; pin.gh = &f.gh; pin.ghf = &f.ghfInternal;
                     pin.ghfBnd = &f.ghfBoundary;
                     pin.stf = &stf; pin.snGradRho = &snRho; pin.ddt = &dc;
+                    pin.taps = pressureTaps;
 
                     PressureSolveControls psc;
                     psc.nCorrectors = lc.nCorrectors;
@@ -277,6 +288,8 @@ RunReport runInterFoam(
                         psc.finalCorrector = (c == lc.nCorrectors - 1);
                         pressureCorrector(f.p_rgh, f.U, f.phi, f.p, pin, psc, m, g, patches);
                     }
+                    // alpha1's inletOutlet reads the flux the step ended on, at the next MULES pass.
+                    pushFluxToPatches(f, patches);
                     break;
                 }
 

@@ -1955,7 +1955,26 @@ COMPONENTS = {
              brae_reference="src/transportModels/twoPhaseMixture/two_phase_mixture_cpp.cuh",
              brae_target="src/transportModels/twoPhaseMixture/device_two_phase_mixture.cu",
              validation="Shares the twoPhaseMixture gate.",
-             note="Joins twoPhaseMixture and interfaceProperties into the one object interFoam.C holds."),
+             note="Joins twoPhaseMixture and interfaceProperties into the one object interFoam.C holds -- "
+                  "AND THE ORDER IT JOINS THEM IN IS PART OF THE ANSWER. correct() is calcNu() THEN "
+                  "interfaceProperties::correct() (immiscibleIncompressibleTwoPhaseMixture.H:78-82), and at "
+                  "a contact-angle wall the second call rewrites alpha's patch gradient and so its patch "
+                  "value. Three things follow, all measured on capillaryRise against tools/dumpInterFoam "
+                  "and together the whole of the 0.7% that case carried: (1) the boundary viscosity is "
+                  "blended BEFORE the curvature pass; brae did it after, and UEqn.A() was exact in every "
+                  "cell off the wall and 1.26% high in the air cells at it -- 0.2% of U after one step, "
+                  "before the contact line had moved a face. (2) `alpha2 = 1.0 - alpha1` (alphaEqn.H:151 "
+                  "and :223) is a whole-field assignment one line ABOVE mixture.correct(), so alpha2's "
+                  "PATCH values are one contact-angle pass older than alpha1's, and `rho == alpha1*rho1 + "
+                  "alpha2*rho2` blends the two: 7.4e-05 of rho*nu at the wall with 1 - alpha1, 1e-17 with "
+                  "the stale value carried (InterFields::alpha2Bnd on the host, deviceBoundaryRho on the "
+                  "device). (3) because the curvature pass has that side effect, the NUMBER of passes is "
+                  "part of the answer -- the gradient runs 7070.5, 8659.4, 9353.1, 9681.2 -- and the "
+                  "device's alpha-boundary hook ran the host's calculateK on every call, including the sub- "
+                  "step's reset of alpha1, which is not a mixture.correct(): five passes a step where "
+                  "OpenFOAM takes three, K 0.6% out at the contact line and U 1.9% out after ONE step. The "
+                  "hook is now two (DeviceInterAlphaHooks::refreshBoundary). damBreak has no contact angle, "
+                  "where calculateK has no side effect, and could see none of the three."),
         dict(name="interFoam_UEqn", of_symbol="UEqn",
              of_file="applications/solvers/multiphase/interFoam/UEqn.H",
              classification="SHARED_NUMERICAL", status="REIMPLEMENT",
@@ -2062,7 +2081,37 @@ COMPONENTS = {
                   "a substituted solver at the same tolerance does not only cost differently, it STOPS "
                   "somewhere else. capillaryRise does not move (0.7%), so that gap is not this. THE DEVICE "
                   "still runs its own solver on p_rgh -- a DIC preconditioner is a triangular sweep -- with "
-                  "the case's per-corrector tolerances; its stopping point is the open half."),
+                  "the case's per-corrector tolerances; its stopping point is the open half. "
+                  "WHAT capillaryRise's 0.7% WAS, since it was not the solver: three defects in how the "
+                  "mixture meets a contact-angle wall (interFoam_immiscibleMixture) and one here. "
+                  "OpenFOAM's flux-conditional patches LOOK PHI UP when they update -- "
+                  "pressureInletOutletVelocity, inletOutlet, totalPressure all call "
+                  "lookupPatchField(phiName_) inside updateCoeffs -- and brae's are TOLD, through "
+                  "updateFromFlux, which interFoam never called. Every such face was therefore an OUTFLOW "
+                  "face for the whole run. capillaryRise's bottom inlet draws water IN, so its "
+                  "pressureInletOutletVelocity lost the two fixed tangential components and with them 2/3 "
+                  "muEff magSf deltaCoeffs of UEqn.A() in every cell of the bottom row: 5.33e+05 by that "
+                  "formula, 5.339e+05 measured against OpenFOAM's own UEqn.A() dump. It appears at step two "
+                  "because step one starts from rest. Fixed with pushFluxToPatches (at start-up, inside "
+                  "pressureCorrector between `phi = phiHbyA - p_rghEqn.flux()` and U's boundary evaluation, "
+                  "which is pEqn.H's order, and after the corrector loop for alpha's inletOutlet); the "
+                  "device had the same omission plus its own -- it never called "
+                  "deviceUpdatePressureInletOutletVelocity, so its inflow faces stayed zeroGradient -- and "
+                  "agreed with the host only while the host was wrong the same way. RESULT, "
+                  "tests/interfoam_capillaryrise_vs_openfoam.sh, five steps: U 2.8e-03 -> 2.1e-08 (0.7% -> "
+                  "5.0e-08 of |U|), alpha 4.6e-05 -> 4.6e-09, p_rgh 1.3e-04 -> 8.1e-08 relative, wall "
+                  "gradient 4.5e-05 -> 5.2e-09 of its peak, UEqn.A() to 4.3e-09 and the wall's rho*nu to "
+                  "1e-17; with every solve tightened the host is 5.5e-14 of |U| after one step. The gate's "
+                  "bound went 0.02 -> 1e-6 and it now checks alpha, p_rgh and the pressure corrector's "
+                  "terms wall-against-rest. damBreak moved too, the right way: alpha 2.23e-12 -> 1.30e-12, "
+                  "p_rgh 7.2e-10 -> 6.5e-10, U 2.0e-08 -> 1.5e-08. THE DEVICE now has a gate on this case, "
+                  "against OpenFOAM directly: 3.5e-08 with every solve tightened on both codes (2.2e-12 "
+                  "after one step), and 9.2e-04 at the case's own tolerances, which is its p_rgh solver "
+                  "stopping somewhere the case's PCG+DIC does not -- bounded at 2e-3 and OPEN. LATENT, not "
+                  "measured to matter on either tutorial: brae takes snGrad(rho) from a zeroGradient rho, "
+                  "so it is 0 on every patch, where OpenFOAM's rho patch is the blend above and its snGrad "
+                  "is not; on a fixedFluxPressure wall the term cancels through constrainPressure and on "
+                  "these inlets alpha's patch value equals the cell's."),
         dict(name="interFoam_vanLeer", of_symbol="vanLeer",
              of_file="src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/vanLeer/vanLeer.C",
              classification="SHARED_NUMERICAL", status="REIMPLEMENT",
