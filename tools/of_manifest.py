@@ -1893,7 +1893,7 @@ COMPONENTS = {
                   "do not under `Gauss vanLeer` (7); and rhoPhi's two branches multiply rho2f by phiCN "
                   "on the Euler path and phi on the other. Only Euler, localEuler and CrankNicolson ddt "
                   "are accepted (alphaEqn.H:49-51), and CrankNicolson is refused when sub-cycling. "
-                  "`Gauss interfaceCompression` on div(phirb,alpha) (4 tutorials) is refused by name. "
+                  "`Gauss interfaceCompression` on div(phirb,alpha) (4 tutorials) is interFoam_interfaceCompression. "
                   "THE WHOLE MULESCorr PATH NOW RUNS ON THE DEVICE and is gated end to end against the "
                   "host over 40 steps at nAlphaCorr 2 / nLimiterIter 5, damBreak's own settings: "
                   "1.07e-10, and it differs from the explicit path by 3.3e-02 so the arm is not a "
@@ -2815,8 +2815,8 @@ COMPONENTS = {
                         "pointFaces walk OpenFOAM takes here and the ascending order give the same lists on a block "
                         "mesh) and face::average against a vertex mean for cellMotion (equal on flat parallel faces); "
                         "the Final solver entry, which moveDynamicMesh never selects; and the device. UNDER "
-                        "interFoam: waveMakerSolitary runs as shipped and is gated end to end (interFoam_correctPhi); "
-                        "the other four waveMakers stop at `Gauss interfaceCompression`.",
+                        "interFoam: all five are gated end to end (interFoam_correctPhi, "
+                        "interFoam_interfaceCompression).",
              note="ONE newPoints(), IN OpenFOAM'S ORDER, all on the mesh before the move (motionSolver.C:200-204, "
                   "displacementLaplacianFvMotionSolver.C:199-318): the inverseDistance diffusivity 1/interpolate(y), "
                   "y the meshWave distance to the named patches (patchWave: FaceCellWave<wallPoint> seeded with the "
@@ -2965,10 +2965,48 @@ COMPONENTS = {
                   "flips the pairing direction; and on a moving mesh the wave velocity model updates at the mesh "
                   "update, where OpenFOAM's log has it. A wave condition on a moving mesh is no longer refused: "
                   "OpenFOAM's model keeps its construction geometry and reads the patch's current magSf, and "
-                  "brae's does the same. OPEN, found on the way: brae's dictionary expansion resolves `$name` only "
-                  "against literal keys, where OpenFOAM's matches patterns too (REGEX_RECURSIVE) -- the two "
-                  "multi-paddle waveMakers write `p_rgh { $pcorr; ... }` against a `\"(pcorr|pcorrFinal)\"` "
-                  "entry, and brae reads no solver there and approximates p_rgh under a notice."),
+                  "brae's does the same. CLOSED, found on the way: brae's dictionary expansion resolved `$name` "
+                  "only against literal keys, where OpenFOAM's keyword substitution matches patterns too "
+                  "(REGEX_RECURSIVE, dictionary.C:415-443) -- the two multi-paddle waveMakers write "
+                  "`p_rgh { $pcorr; ... }` against a `\"(pcorr|pcorrFinal)\"` entry, and brae read no solver "
+                  "there and ran PBiCGStab under a notice. The expander now searches as dictionary::csearch "
+                  "does (tests/test_dict_scoped_macro.cu, scored against foamDictionary -expand over the 9,500 "
+                  "tutorial dictionaries: 2,958 moved entries agree with OpenFOAM, 17 agreed only before), and "
+                  "both cases are profiles of the moving gate."),
+        dict(name="interFoam_interfaceCompression", of_symbol="interfaceCompressionLimiter",
+             of_file="src/transportModels/interfaceProperties/interfaceCompression/interfaceCompression.H",
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedSchemes_cpp.cuh",
+             brae_target="",
+             validation="tests/interfoam_dambreak_vs_openfoam.sh's `compression`: damBreak at dt 5e-3 with "
+                        "`div(phirb,alpha) Gauss interfaceCompression`, on a mesh that does not move. MEASURED: "
+                        "every p_rgh and alpha iteration count OpenFOAM's, alpha 6.6e-14, p_rgh 3.1e-14, U 2.2e-13. "
+                        "THE CONTROL: the scheme moves OpenFOAM's own alpha by 1.03e-01 against `Gauss linear`. "
+                        "BROKEN ONCE EACH: the quadratic form OpenFOAM leaves commented out 1.0e-02 of alpha; min "
+                        "for max 8.1e-02. NOT DISCRIMINATED: pos against pos0 in the blend (no face where the "
+                        "limiter is below 1 carries exactly zero flux). END TO END, tests/interfoam_moving_vs_openfoam."
+                        "sh's `piston` and `flap`: laminar/waves/waveMakerPiston and waveMakerFlap, thirty steps of "
+                        "0.01, the mesh deformed by the paddle, correctPhi, the absorbing outlet -- with p_rgh, "
+                        "p_rghFinal and pcorr converged to 1e-13, because as shipped their 135- to 480-iteration "
+                        "solves carry last-bit differences out to U 3.9e-07 on the piston (converged: 1.6e-09); "
+                        "alpha 1.5e-12 and 1.0e-11, U 1.6e-09 and 1.1e-09, every solve below its tolerance in both "
+                        "codes, counts equal on short solves and within 2% on long ones (3 of 194 at worst). NOT "
+                        "CLAIMED: the device, which refuses the scheme by name -- its alpha mapping took it as "
+                        "linear until the host ported it. THE TWO MULTI-PADDLE waveMakers, `multiPiston` and "
+                        "`multiFlap` of the same script: AS SHIPPED on their own 448000-cell 3-D mesh, four paddles "
+                        "at 45 degrees, thirty steps of 0.01, GAMG as the solver of pcorr and p_rgh through "
+                        "`p_rgh { $pcorr; }`. MEASURED (piston, flap): all 90 p_rgh and all 31 pcorr iteration "
+                        "counts OpenFOAM's, alpha 5.7e-13 and 2.9e-12, p_rgh 5.6e-13 and 2.6e-12, U 2.2e-10 and "
+                        "1.8e-09, the moved points 1.1e-16 of the extent; the control, OpenFOAM with its mesh held "
+                        "still, U 100%. BROKEN ONCE, the pattern lookup taken out of the dictionary reader: 48 of "
+                        "90 p_rgh counts, alpha 9.7e-04, U 1.0e-01.",
+             note="A PhiScheme (interfaceCompression.C:33-41), so the limiter reads the two cell values of the field "
+                  "and nothing else: clamp(1 - max(sqr(1 - 4 phiP (1 - phiP)), sqr(1 - 4 phiN (1 - phiN))), 0, 1), "
+                  "the quartic form -- 1 where both cells are half full, 0 where either is empty or full -- blended "
+                  "as limitedSurfaceInterpolationScheme::weights does, limiter*CDweight + (1 - limiter)*"
+                  "pos0(faceFlux), and 1 on an uncoupled patch (PhiScheme.C). alphaEqn.H applies it twice through "
+                  "fvc::flux(-fvc::flux(-phir, alpha2, alpharScheme), alpha1, alpharScheme): on alpha2 upwinded by "
+                  "-phir, then on alpha1 by the negated result."),
         dict(name="interFoam_pressureReference", of_symbol="setRefCell",
              of_file="src/finiteVolume/cfdTools/general/findRefCell/findRefCell.C",
              classification="GPU_REQUIRED", status="REIMPLEMENT",

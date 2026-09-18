@@ -93,6 +93,32 @@ std::vector<scalar> vanLeerWeights(
 }
 
 
+std::vector<scalar> interfaceCompressionWeights(
+    const std::vector<scalar>&    phi,
+    const GeometricField<scalar>& vf,
+    const PrimitiveMesh&          m,
+    const FvGeometry&             g)
+{
+    const label nIf = m.nInternalFaces();
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    const std::vector<scalar>& cd = g.weights();
+
+    std::vector<scalar> w(static_cast<std::size_t>(nIf));
+    for (label f = 0; f < nIf; ++f)
+    {
+        const scalar phiP = vf.internal[static_cast<std::size_t>(own[f])];
+        const scalar phiN = vf.internal[static_cast<std::size_t>(nei[f])];
+        // Quartic compression scheme
+        const scalar aP = 1 - 4*phiP*(1 - phiP);
+        const scalar aN = 1 - 4*phiN*(1 - phiN);
+        const scalar lim = detail::clamp01(1 - std::fmax(aP*aP, aN*aN));
+        w[static_cast<std::size_t>(f)] = detail::blend(lim, cd[f], phi[f]);
+    }
+    return w;
+}
+
+
 std::vector<scalar> vanLeerVWeights(
     const std::vector<scalar>&    phi,
     const GeometricField<vector>& vf,

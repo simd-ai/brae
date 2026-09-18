@@ -52,8 +52,9 @@
 namespace brae {
 
 // The face interpolation for one of the two fluxes. `interfaceCompression` is absent on purpose: it is
-// not a limiter variant but a different scheme entirely, the host refuses it by name, and a device enum
-// that silently mapped it to vanLeer would be the exact substitution this project keeps finding.
+// not a limiter variant but a different scheme entirely, the host runs it and the device driver refuses
+// it by name -- a device enum that mapped it to vanLeer, or to linear as the driver's mapping did until
+// the host ported it, would be the exact substitution this project keeps finding.
 enum class DeviceAlphaScheme
 {
     linear,

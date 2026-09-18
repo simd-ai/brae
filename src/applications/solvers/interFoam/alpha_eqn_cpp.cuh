@@ -137,8 +137,8 @@ void offCentredFlux(const SurfaceScalarField& phi,
 
 // The interpolation scheme named by a divSchemes entry for the alpha fluxes. `Gauss vanLeer` is
 // div(phi,alpha) in all 42 shipped tutorials; div(phirb,alpha) is `Gauss linear` in 31, `Gauss vanLeer`
-// in 7 and `Gauss interfaceCompression` in 4. The last is a separate scheme, not a variant, and is
-// refused by name.
+// in 7 and `Gauss interfaceCompression` in 4. The last is a separate scheme, not a variant: a PhiScheme
+// whose limiter reads the two cell values alone (limitedSchemes_cpp.cuh, interfaceCompressionWeights).
 enum class AlphaFluxScheme { vanLeer, linear, upwind, interfaceCompression };
 
 // fvc::flux(psi, vf, scheme) == psi*interpolate(vf), with the interpolation UPWINDED BY psi

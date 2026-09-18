@@ -91,8 +91,11 @@ int main(int argc, char** argv)
     // upwind through a switch's `default` until this profile existed. Both run on both paths.
     const bool vanLeerV = profileName == "vanleerv";
     const bool linear = profileName == "linear";
-    const bool pimpleProfile = nOuter || nonOrth || momPred || namedFlux || vanLeerV || linear;
-    const bool deviceRefuses = nOuter || nonOrth || namedFlux;
+    // `compression`: div(phirb,alpha) as `Gauss interfaceCompression`, the PhiScheme four waveMaker
+    // tutorials name, on a mesh that does not move. The device has no such scheme and refuses it.
+    const bool compression = profileName == "compression";
+    const bool pimpleProfile = nOuter || nonOrth || momPred || namedFlux || vanLeerV || linear || compression;
+    const bool deviceRefuses = nOuter || nonOrth || namedFlux || compression;
     const bool bigStep = (argc > 7 && std::string(argv[7]) == "bigstep") || prevCorr || pimpleProfile;
     // `inflow`: the atmosphere's inletValue set to 1, so water enters over air cells and rho's patch
     // value differs from the cell's on a patch where p_rgh fixes a value. It is the only fixture here
@@ -108,6 +111,7 @@ int main(int argc, char** argv)
               : nonOrth ? "nonorth -- nNonOrthogonalCorrectors 1, at the big step"
               : momPred ? "mompred -- momentumPredictor yes, at the big step"
               : namedFlux ? "rhophi -- the atmosphere's conditions all name phi rhoPhi, at the big step"
+              : compression ? "compression -- div(phirb,alpha) Gauss interfaceCompression, at the big step"
               : bigStep ? "bigstep -- the solver logs discriminate here"
               : inflow  ? "inflow -- snGrad(rho) is live on the atmosphere here"
               : outflow ? "outflow -- water leaves through the atmosphere with alphaApplyPrevCorr on"
@@ -334,6 +338,7 @@ int main(int argc, char** argv)
                          : namedFlux ? "phi rhoPhi"
                          : vanLeerV ? "div(rhoPhi,U) Gauss vanLeerV"
                          : linear ? "div(rhoPhi,U) Gauss linear"
+                         : compression ? "div(phirb,alpha) Gauss interfaceCompression"
                                   : "alphaApplyPrevCorr yes";
         check("the control was given OpenFOAM's answer without the setting under test", argc > 8);
         if (argc > 8)
@@ -448,6 +453,7 @@ int main(int argc, char** argv)
                 }
                 const char* named = nOuter ? "nOuterCorrectors"
                                   : nonOrth ? "nNonOrthogonalCorrectors"
+                                  : compression ? "interfaceCompression"
                                             : "names the flux";
                 std::printf("  DEVICE: %s\n", threw ? why.substr(0, 140).c_str() : "RAN -- it must not");
                 check("the DEVICE refuses this case rather than run it at a smaller count",

@@ -57,6 +57,14 @@
 # brae that ignored it would pass. The device loop runs neither outer nor non-orthogonal correctors and
 # REFUSES both, so on those two profiles the test asserts the refusal instead of a run.
 #
+# AND `compression`: div(phirb,alpha) as `Gauss interfaceCompression`, the PhiScheme four waveMaker
+# tutorials name and none on a mesh that does not move, at the big step with the big-step run (`Gauss
+# linear`) as the control. MEASURED: alpha 6.6e-14, p_rgh 3.1e-14, U 2.2e-13, every count OpenFOAM's; the
+# scheme moves OpenFOAM's own alpha by 1.03e-01. BROKEN ONCE EACH: the quadratic form OpenFOAM leaves
+# commented out, 1.0e-02 of alpha; min for max, 8.1e-02; pos for pos0 in the blend, no change -- no face
+# where the limiter is below 1 carries exactly zero flux, so that one is not claimed. The device REFUSES
+# the scheme, and the test asserts the refusal.
+#
 # AND `rhophi`: every flux-conditional condition of the atmosphere -- U's pressureInletOutletVelocity,
 # p_rgh's totalPressure, alpha's inletOutlet -- given `phi rhoPhi;`. OpenFOAM's conditions look their
 # flux up BY NAME, three shipped tutorials name rhoPhi on a totalPressure top, and brae's reader kept
@@ -138,6 +146,8 @@ run_at()
                  grep -q "nNonOrthogonalCorrectors 1;" "$C/system/fvSolution" || { echo "FAIL: nNonOrthogonalCorrectors was not raised"; return 1; } ;;
         vanleerv) sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss vanLeerV;/' "$C/system/fvSchemes"
                  grep -q "Gauss vanLeerV;" "$C/system/fvSchemes" || { echo "FAIL: div(rhoPhi,U) was not set to vanLeerV"; return 1; } ;;
+        compression) sed -i 's/div(phirb,alpha) .*/div(phirb,alpha) Gauss interfaceCompression;/' "$C/system/fvSchemes"
+                 grep -q "div(phirb,alpha) Gauss interfaceCompression;" "$C/system/fvSchemes" || { echo "FAIL: div(phirb,alpha) was not set to interfaceCompression"; return 1; } ;;
         linear)  sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss linear;/' "$C/system/fvSchemes"
                  grep -q "div(rhoPhi,U)  Gauss linear;" "$C/system/fvSchemes" || { echo "FAIL: div(rhoPhi,U) was not set to linear"; return 1; } ;;
         mompred) sed -i 's/momentumPredictor  *no;/momentumPredictor yes;/' "$C/system/fvSolution"
@@ -229,7 +239,7 @@ PYEOF
     # ...and the sub-cycled one reads the un-sub-cycled one: the sub-cycle count has to be live too
     [ "$profile" = prevcorrsub ] && std="$W/prevcorr/$end"
     # ...and the three PIMPLE profiles read the big-step run without their setting
-    case "$profile" in nouter|nonorth|mompred|rhophi|vanleerv|linear) std="$W/bigstep/$end" ;; esac
+    case "$profile" in nouter|nonorth|mompred|rhophi|vanleerv|linear|compression) std="$W/bigstep/$end" ;; esac
     "$BIN" "$C" "$C/0" "$C/$end" "$STEPS" "$C/log.interFoam" "$C.control" "$profile" $std
 }
 
@@ -246,4 +256,5 @@ run_at "$DT_BIG" mompred || rc=1
 run_at "$DT_BIG" rhophi || rc=1
 run_at "$DT_BIG" vanleerv || rc=1
 run_at "$DT_BIG" linear || rc=1
+run_at "$DT_BIG" compression || rc=1
 exit $rc

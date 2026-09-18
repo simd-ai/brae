@@ -195,12 +195,6 @@ void fluxWithScheme(const SurfaceScalarField&     psi,
                     const std::vector<FvPatch>&   patches,
                     SurfaceScalarField&           out)
 {
-    if (scheme == AlphaFluxScheme::interfaceCompression)
-        throw std::runtime_error(
-            "brae interFoam alphaEqn: `Gauss interfaceCompression` is not ported. It is a separate "
-            "scheme, not a variant of vanLeer -- it replaces the limiter with an explicit interface "
-            "sharpener -- and four shipped tutorials name it on div(phirb,alpha).");
-
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
     const std::vector<label>& nei = m.neighbour();
@@ -213,6 +207,10 @@ void fluxWithScheme(const SurfaceScalarField&     psi,
             break;
         case AlphaFluxScheme::upwind:
             w = limitedSchemes::upwindWeights(psi.internal);
+            break;
+        case AlphaFluxScheme::interfaceCompression:
+            // a PhiScheme: the two cell values alone, no gradient (limitedSchemes_cpp.cuh)
+            w = limitedSchemes::interfaceCompressionWeights(psi.internal, vf, m, g);
             break;
         case AlphaFluxScheme::vanLeer:
         default:

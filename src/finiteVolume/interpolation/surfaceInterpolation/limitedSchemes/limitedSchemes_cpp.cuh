@@ -188,6 +188,21 @@ std::vector<scalar> vanLeerWeights(
     const PrimitiveMesh&              m,
     const FvGeometry&                 g);
 
+// interfaceCompression: a PhiScheme (makePhiSurfaceInterpolationScheme(interfaceCompression,
+// interfaceCompressionLimiter, scalar), interfaceCompression.C:33-41), so its limiter reads the TWO CELL
+// VALUES of the field and nothing else -- no gradient, no r:
+//     limiter = clamp(1 - max(sqr(1 - 4 phiP (1 - phiP)), sqr(1 - 4 phiN (1 - phiN))), 0, 1)
+// (interfaceCompression.H, the quartic form). It is 1 where both cells are half full and 0 where either
+// is empty or full, so the face value is central across the interface and upwind away from it. The
+// blend is limitedSurfaceInterpolationScheme::weights' (PhiScheme.C, limiter; limitedSurfaceInterpolation-
+// Scheme.C, weights). Internal faces only: on an uncoupled patch the limiter is 1 and the face value is
+// the patch's own.
+std::vector<scalar> interfaceCompressionWeights(
+    const std::vector<scalar>&        phi,
+    const GeometricField<scalar>&     vf,
+    const PrimitiveMesh&              m,
+    const FvGeometry&                 g);
+
 // vanLeerV: vanLeer's limiter on NVDVTVDV's r -- makeLimitedVSurfaceInterpolationScheme(vanLeerV,
 // vanLeerLimiter) in vanLeer.C:37, which is LimitedScheme<vector, vanLeerLimiter<NVDVTVDV>, null>.
 // Eight interFoam tutorials name it for div(rhoPhi,U), every one a closed tank in motion. The

@@ -511,6 +511,16 @@ RunReport runInterFoamDevice(
                                   f.mulesCtl.extremaCoeff, f.mulesCtl.boundaryExtremaCoeff};
     C.alphaInput.cAlpha = f.interface.cAlpha;
     C.alphaInput.deltaN = interfaceProps::deltaN(g.V());
+    // `Gauss interfaceCompression` runs on the host (limitedSchemes_cpp.cuh). The device has no such
+    // scheme, and the two mappings below would take it as vanLeer and as linear without a word.
+    if (f.divPhiAlpha == AlphaFluxScheme::interfaceCompression
+        || f.divPhirbAlpha == AlphaFluxScheme::interfaceCompression)
+    {
+        throw std::runtime_error(
+            "brae interFoam -device: the case names `Gauss interfaceCompression` for an alpha flux. The "
+            "device alpha step has linear, upwind and vanLeer; the host loop has interfaceCompression. "
+            "Run without -device.");
+    }
     C.alphaInput.alphaScheme  = (f.divPhiAlpha == AlphaFluxScheme::linear) ? DeviceAlphaScheme::linear
                               : (f.divPhiAlpha == AlphaFluxScheme::upwind) ? DeviceAlphaScheme::upwind
                               : DeviceAlphaScheme::vanLeer;

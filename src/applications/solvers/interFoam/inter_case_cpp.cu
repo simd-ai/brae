@@ -177,7 +177,7 @@ AlphaFluxScheme parseAlphaDiv(const std::string& entry, const char* key)
     if (e.find("vanLeer") != std::string::npos)   return AlphaFluxScheme::vanLeer;
     if (e.find("upwind")  != std::string::npos)   return AlphaFluxScheme::upwind;
     if (e.find("interfaceCompression") != std::string::npos)
-        return AlphaFluxScheme::interfaceCompression;   // refused downstream, by name
+        return AlphaFluxScheme::interfaceCompression;   // the host's; the device refuses it
     if (e.find("linear")  != std::string::npos)   return AlphaFluxScheme::linear;
     throw std::runtime_error(
         std::string("brae interFoam: `") + key + " " + entry + "` is not ported.");

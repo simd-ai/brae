@@ -54,6 +54,32 @@
 #                  and an unconverged Krylov iterate carries every last-bit difference forward --
 #                  as shipped 22 of 22 counts and alpha 7.6e-09; converged (150 to 176 iterations, the
 #                  same in both) alpha 1.2e-10
+#   piston, flap   laminar/waves/waveMakerPiston and waveMakerFlap, thirty steps of 0.01: the paddle
+#                  deforming the mesh, `Gauss interfaceCompression` on div(phirb,alpha), correctPhi, an
+#                  absorbing outlet -- with p_rgh, p_rghFinal and pcorr CONVERGED to 1e-13 (the staging
+#                  says why: as shipped the piston's final corrector takes 135 PCG iterations and pcorr
+#                  350 to 480, and last-bit differences ride them out to U 3.9e-07). Converged, solves of
+#                  150 to 480 iterations still stop an iteration or three apart -- 194 against 197 at the
+#                  piston's last step, both below 1e-13 -- so for these two profiles every solve must end
+#                  below its tolerance in both codes and the counts must match on short solves and be
+#                  within 2% on long ones. MEASURED: alpha 1.5e-12 and 1.0e-11, U 1.6e-09 and 1.1e-09.
+#   multiPiston,   laminar/waves/waveMakerMultiPaddlePiston and waveMakerMultiPaddleFlap AS SHIPPED, on
+#   multiFlap      their own 448000-cell 3-D mesh, thirty steps of 0.01: four paddles at 45 degrees,
+#                  interfaceCompression, correctPhi, and GAMG (DICGaussSeidel) AS THE SOLVER of pcorr and
+#                  p_rgh -- which the case writes as `p_rgh { $pcorr; ... }` against a
+#                  `"(pcorr|pcorrFinal)"` key, a keyword reference OpenFOAM resolves through PATTERNS
+#                  (dictionary.C:415-443). brae's expander matched literal keys only, read no solver for
+#                  p_rgh and ran PBiCGStab under a notice; tests/test_dict_scoped_macro.cu holds the rule.
+#                  GAMG's solves are 0 to 21 cycles, so every count is asserted equal, as shipped.
+#                  MEASURED (piston, flap): all 90 p_rgh and all 31 pcorr counts OpenFOAM's in both;
+#                  alpha 5.7e-13 and 2.9e-12, p_rgh 5.6e-13 and 2.6e-12, U 2.2e-10 and 1.8e-09; the
+#                  moved points 1.1e-16 of the extent; the paddles' wall velocity 2.5e-14 on 3.9e-02
+#                  and 3.3e-14 on 2.1e-01 m/s. The control, OpenFOAM with its mesh held still: U 100%.
+#                  BROKEN ONCE, the pattern lookup taken out of the reader (piston): 48 of 90 p_rgh
+#                  counts, 19 of 31 pcorr, alpha 9.7e-04, U 1.0e-01.
+#                  Thirty steps and not ten because of the wall check: the paddle is on a 2 s ramp, and
+#                  at t = 0.1 the piston's wall moves at 1.5e-02 m/s, where the 2.3e-14 that point
+#                  round-off over deltaT leaves is 1.5e-12 of it -- over the 1e-12 bound, which stays.
 #   solitary       laminar/waves/waveMakerSolitary AS SHIPPED, thirty steps of 0.01: the first gated
 #                  case whose cells CHANGE VOLUME -- displacementLaplacian from a solitary-wave paddle --
 #                  under correctPhi (its default), with an absorbing waveVelocity outlet and a
@@ -218,9 +244,23 @@ if profile.startswith('mixer') or profile.startswith('sloshing2D') or profile.st
         assert k == 1, 'momentumPredictor not found'
         t, k = re.subn(r'\n    U\n    \{', '\n    "U.*"\n    {', t)
         assert k == 1, 'the U entry was not found'
-elif profile.startswith('solitary'):
-    # waves/waveMakerSolitary AS SHIPPED: nothing to stage in fvSolution
+elif profile.startswith('solitary') or profile.startswith('multi'):
+    # waves/waveMakerSolitary and the two multi-paddle tanks AS SHIPPED: nothing to stage in fvSolution
     pass
+elif profile.startswith('piston') or profile.startswith('flap'):
+    # the pressure solves converged: p_rgh, p_rghFinal and pcorr at tolerance 1e-13, relTol 0. As shipped
+    # (p_rgh relTol 0.05, pcorr 1e-10) the piston's third corrector takes 135 PCG iterations and pcorr
+    # 350 to 480, and last-bit differences ride those solves out to U 3.9e-07 and alpha 5.0e-09 after
+    # thirty steps; converged, 8.3e-11 and 7.6e-14. The motion solve is left as shipped.
+    for key in ('p_rgh', 'p_rghFinal', '"(pcorr|pcorrFinal)"'):
+        m = re.search(r'\n    %s\s*\{[^}]*\}' % re.escape(key), t)
+        assert m, 'the %s entry was not found' % key
+        body = m.group(0)
+        body = re.sub(r'tolerance\s+[^;]+;', 'tolerance       1e-13;', body)
+        body = re.sub(r'relTol\s+[^;]+;', 'relTol          0;', body)
+        if 'tolerance' not in body:
+            body = body.replace('}', '    tolerance       1e-13;\n        relTol          0;\n    }')
+        t = t.replace(m.group(0), body)
 elif profile.startswith('closedDamBreak'):
     ref = '1e5' if profile == 'closedDamBreakRef' else '0'
     t, k = re.subn(r'(nNonOrthogonalCorrectors\s+0;)', r'\1\n    pRefPoint       (0.292 0.292 0.0073);\n    pRefValue       %s;' % ref, t)
@@ -231,7 +271,10 @@ if not profile.startswith('closedDamBreak'):
     # the three tanks name vanLeerV, run as shipped; the `*Static` controls hold the mesh still
     f = os.path.join(d, 'system/fvSchemes')
     t = open(f).read()
-    if not profile.startswith('solitary'):
+    if profile.startswith('piston') or profile.startswith('flap') or profile.startswith('multi'):
+        assert re.search(r'div\(phirb,alpha\)\s+Gauss interfaceCompression;', t), \
+            'div(phirb,alpha) is no longer Gauss interfaceCompression'
+    elif not profile.startswith('solitary'):
         assert re.search(r'div\(rhoPhi,U\)\s+Gauss vanLeerV;', t), 'div(rhoPhi,U) is no longer Gauss vanLeerV'
     p = os.path.join(d, 'constant/dynamicMeshDict')
     t = open(p).read()
@@ -308,6 +351,14 @@ stage sloshing2DCorrectPhi sloshingTank2D   0.01  10 sloshing2DCorrectPhi || rc=
 stage cylinderCorrectPhi   sloshingCylinder 0.001 10 cylinderCorrectPhi   || rc=1
 stage solitaryStatic waves/waveMakerSolitary 0.01 30 solitaryStatic || rc=1
 stage solitary       waves/waveMakerSolitary 0.01 30 solitary       || rc=1
+stage pistonStatic   waves/waveMakerPiston   0.01 30 pistonStatic   || rc=1
+stage piston         waves/waveMakerPiston   0.01 30 piston         || rc=1
+stage flapStatic     waves/waveMakerFlap     0.01 30 flapStatic     || rc=1
+stage flap           waves/waveMakerFlap     0.01 30 flap           || rc=1
+stage multiPistonStatic waves/waveMakerMultiPaddlePiston 0.01 30 multiPistonStatic || rc=1
+stage multiPiston       waves/waveMakerMultiPaddlePiston 0.01 30 multiPiston       || rc=1
+stage multiFlapStatic   waves/waveMakerMultiPaddleFlap   0.01 30 multiFlapStatic   || rc=1
+stage multiFlap         waves/waveMakerMultiPaddleFlap   0.01 30 multiFlap         || rc=1
 stage closedRef1e5   damBreak/damBreak 0.001 20 closedDamBreakRef || rc=1
 stage closedDamBreak damBreak/damBreak 0.001 20 closedDamBreak    || rc=1
 stage closedDamBreakInitU damBreak/damBreak 0.001 20 closedDamBreakInitU || rc=1
@@ -321,6 +372,11 @@ grep -q "Selecting dynamicFvMesh staticFvMesh" "$W/mixerStatic/log.interFoam" \
 grep -q "^Courant Number mean: 0.0[1-9]" "$W/mixer/log.interFoam" \
     || { echo "FAIL: OpenFOAM's mixer never moved its fluid"; exit 1; }
 
+for c in multiPiston multiFlap; do
+    grep -q "^GAMG:  Solving for p_rgh" "$W/$c/log.interFoam" \
+        || { echo "FAIL: OpenFOAM's $c log does not solve p_rgh with GAMG, the solver \$pcorr brings in"; exit 1; }
+done
+
 gate mixer          2e-4  10 mixer          mixerStatic  || rc=1
 gate mixerCorr      2e-4  10 mixerCorr      mixerStatic  || rc=1
 gate mixerOuter     2e-4  10 mixerOuter     mixerStatic  || rc=1
@@ -332,6 +388,10 @@ gate mixerCorrectPhi      2e-4  10 mixerCorrectPhi      mixerStatic      || rc=1
 gate sloshing2DCorrectPhi 0.01  10 sloshing2DCorrectPhi sloshing2DStatic || rc=1
 gate cylinderCorrectPhi   0.001 10 cylinderCorrectPhi   cylinderStatic   || rc=1
 gate solitary       0.01  30 solitary       solitaryStatic || rc=1
+gate piston         0.01  30 piston         pistonStatic   || rc=1
+gate flap           0.01  30 flap           flapStatic     || rc=1
+gate multiPiston    0.01  30 multiPiston    multiPistonStatic || rc=1
+gate multiFlap      0.01  30 multiFlap      multiFlapStatic   || rc=1
 gate closedDamBreak 0.001 20 closedDamBreak closedRef1e5 || rc=1
 gate closedDamBreakInitU 0.001 20 closedDamBreakInitU closedDamBreak || rc=1
 

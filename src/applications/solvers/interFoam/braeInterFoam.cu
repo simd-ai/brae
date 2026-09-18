@@ -41,8 +41,12 @@
 // pressure reference (pRefCell or pRefPoint, pRefValue, adjustPhi). `-device` refuses a moving mesh
 // and a closed tank. Still refused by name: a cellZone or cellSet, every other motionSolver, a
 // turbulent case on a moving mesh, points0, and a restart of a moved mesh. testTubeMixer, the five
-// sloshing tanks and waveMakerSolitary run as shipped; the other four waveMakers stop at
-// `Gauss interfaceCompression`.
+// sloshing tanks and the five waveMakers run -- waveMakerPiston and waveMakerFlap gated with their
+// pressure solves converged, and the two multi-paddle ones approximating p_rgh under a notice, since
+// their `p_rgh { $pcorr; }` names a pattern-keyed entry brae's dictionary expansion does not resolve.
+//
+// AND `Gauss interfaceCompression` on the alpha fluxes, on the host: the PhiScheme four waveMakers name
+// for div(phirb,alpha). `-device` refuses it.
 //
 // AND THE CASE'S NON-ORTHOGONAL CORRECTIONS, on the host: `corrected` and `limited` laplacians and
 // snGrads on a mesh that is not orthogonal (the tanks' 44 degrees), through the pressure equation,
@@ -56,7 +60,7 @@
 //
 // WHAT IT WILL NOT RUN. Every refusal the components carry is in force: LES and every RASModel but
 // kEpsilon, `limitedLinear` on div(rhoPhi,U),
-// `interfaceCompression` on div(phirb,alpha), any ddtSchemes default but Euler, MRF, fvOptions, and a case that
+// any ddtSchemes default but Euler, MRF, fvOptions, and a case that
 // omits nAlphaCorr, nAlphaSubCycles, cAlpha, maxAlphaCo or -- under MULESCorr -- nLimiterIter. Each
 // throws by name.
 //
