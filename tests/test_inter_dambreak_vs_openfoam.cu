@@ -86,7 +86,12 @@ int main(int argc, char** argv)
     // `rhophi`: the atmosphere's three flux-conditional conditions all name `phi rhoPhi;`. The device
     // runs U's switch itself and reads phi there, so it refuses the case.
     const bool namedFlux = profileName == "rhophi";
-    const bool pimpleProfile = nOuter || nonOrth || momPred || namedFlux;
+    // `vanleerv` and `linear`: div(rhoPhi,U) as two schemes the tutorial does not name -- the V-limited
+    // vanLeer that the closed-tank tutorials use, and central differencing, which the device mapped to
+    // upwind through a switch's `default` until this profile existed. Both run on both paths.
+    const bool vanLeerV = profileName == "vanleerv";
+    const bool linear = profileName == "linear";
+    const bool pimpleProfile = nOuter || nonOrth || momPred || namedFlux || vanLeerV || linear;
     const bool deviceRefuses = nOuter || nonOrth || namedFlux;
     const bool bigStep = (argc > 7 && std::string(argv[7]) == "bigstep") || prevCorr || pimpleProfile;
     // `inflow`: the atmosphere's inletValue set to 1, so water enters over air cells and rho's patch
@@ -327,7 +332,9 @@ int main(int argc, char** argv)
                          : nonOrth ? "nNonOrthogonalCorrectors 1"
                          : momPred ? "momentumPredictor yes"
                          : namedFlux ? "phi rhoPhi"
-                                     : "alphaApplyPrevCorr yes";
+                         : vanLeerV ? "div(rhoPhi,U) Gauss vanLeerV"
+                         : linear ? "div(rhoPhi,U) Gauss linear"
+                                  : "alphaApplyPrevCorr yes";
         check("the control was given OpenFOAM's answer without the setting under test", argc > 8);
         if (argc > 8)
         {

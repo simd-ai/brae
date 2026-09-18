@@ -37,12 +37,16 @@
 // pressure reference (pRefCell or pRefPoint, pRefValue, adjustPhi), which every solid-body tutorial
 // needs and no earlier case had. `-device` refuses both. Still refused by name: a cellZone or cellSet,
 // every other motionSolver, `correctPhi yes` (the default on a moving mesh), a turbulent or a wave
-// case on a moving mesh, points0, and a restart of a moved mesh. The solid-body tutorials themselves
-// still stop on `Gauss vanLeerV` (all seven) and, five of them, on their 44-degree non-orthogonal
-// tanks.
+// case on a moving mesh, points0, and a restart of a moved mesh. testTubeMixer runs as shipped but for
+// p_rghFinal's PCG-with-GAMG-preconditioner, which is substituted under a notice; the five sloshing
+// tanks still stop on their 44-degree non-orthogonal cells.
+//
+// AND div(rhoPhi,U) AS THE CASE NAMES IT, on both paths: upwind, linear, linearUpwind, linearUpwindV,
+// limitedLinearV, LUST and vanLeerV -- the last the V-limited vanLeer the closed-tank tutorials use.
+// `Gauss linear` on the device fell through a switch's default to upwind until this was wired.
 //
 // WHAT IT WILL NOT RUN. Every refusal the components carry is in force: LES and every RASModel but
-// kEpsilon, `vanLeerV` or `limitedLinear` on div(rhoPhi,U),
+// kEpsilon, `limitedLinear` on div(rhoPhi,U),
 // `interfaceCompression` on div(phirb,alpha), any ddtSchemes default but Euler, a `corrected` or
 // `limited` laplacian or snGrad on a mesh that is not orthogonal, MRF, fvOptions, and a case that
 // omits nAlphaCorr, nAlphaSubCycles, cAlpha, maxAlphaCo or -- under MULESCorr -- nLimiterIter. Each

@@ -64,6 +64,13 @@
 # that write it). Those cases put the name on p_rgh only; this profile puts it on all three, so the
 # velocity's and alpha's switches are held against OpenFOAM too. The DEVICE runs U's switch itself and
 # reads phi there, so it REFUSES this profile, and the test asserts the refusal.
+# AND TWO MOMENTUM SCHEMES the tutorial does not name, `vanleerv` and `linear`, each on div(rhoPhi,U)
+# at the big step with the big-step run as the control: `Gauss vanLeerV`, the V-limited vanLeer every
+# closed-tank tutorial names (one limiter per face from the vector difference, vanLeer's unclamped
+# function -- limitedSchemes_cpp.cuh), and `Gauss linear`, which interFoam's own scheme enum carried
+# and whose DEVICE mapping fell through a switch's `default` to upwind until this profile existed. Both
+# run on both paths.
+#
 # IT FAILED THE FIRST TIME IT RAN, on two things a condition naming `phi` can never see, because
 # nothing moves phi between the end of one step's pressure correctors and the next step's UEqn -- and
 # the ALPHA step moves rhoPhi exactly there:
@@ -129,6 +136,10 @@ run_at()
                  grep -q "nOuterCorrectors 2;" "$C/system/fvSolution" || { echo "FAIL: nOuterCorrectors was not raised"; return 1; } ;;
         nonorth) sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' "$C/system/fvSolution"
                  grep -q "nNonOrthogonalCorrectors 1;" "$C/system/fvSolution" || { echo "FAIL: nNonOrthogonalCorrectors was not raised"; return 1; } ;;
+        vanleerv) sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss vanLeerV;/' "$C/system/fvSchemes"
+                 grep -q "Gauss vanLeerV;" "$C/system/fvSchemes" || { echo "FAIL: div(rhoPhi,U) was not set to vanLeerV"; return 1; } ;;
+        linear)  sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss linear;/' "$C/system/fvSchemes"
+                 grep -q "div(rhoPhi,U)  Gauss linear;" "$C/system/fvSchemes" || { echo "FAIL: div(rhoPhi,U) was not set to linear"; return 1; } ;;
         mompred) sed -i 's/momentumPredictor  *no;/momentumPredictor yes;/' "$C/system/fvSolution"
                  grep -q "momentumPredictor yes;" "$C/system/fvSolution" || { echo "FAIL: momentumPredictor was not switched on"; return 1; }
                  # damBreak names `U` only, and with one outer corrector fvMatrix::solve() selects
@@ -218,7 +229,7 @@ PYEOF
     # ...and the sub-cycled one reads the un-sub-cycled one: the sub-cycle count has to be live too
     [ "$profile" = prevcorrsub ] && std="$W/prevcorr/$end"
     # ...and the three PIMPLE profiles read the big-step run without their setting
-    case "$profile" in nouter|nonorth|mompred|rhophi) std="$W/bigstep/$end" ;; esac
+    case "$profile" in nouter|nonorth|mompred|rhophi|vanleerv|linear) std="$W/bigstep/$end" ;; esac
     "$BIN" "$C" "$C/0" "$C/$end" "$STEPS" "$C/log.interFoam" "$C.control" "$profile" $std
 }
 
@@ -233,4 +244,6 @@ run_at "$DT_BIG" nouter || rc=1
 run_at "$DT_BIG" nonorth || rc=1
 run_at "$DT_BIG" mompred || rc=1
 run_at "$DT_BIG" rhophi || rc=1
+run_at "$DT_BIG" vanleerv || rc=1
+run_at "$DT_BIG" linear || rc=1
 exit $rc

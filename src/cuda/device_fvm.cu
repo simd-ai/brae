@@ -82,24 +82,12 @@ void divFaceKernel(int nIf, const scalar* __restrict__ phi, scalar* __restrict__
 // vanAlbada, and device_ami.cu reads `<= 0` as vanAlbada too -- so a negative range would have changed
 // the AMI path's meaning silently. An exact sentinel cannot collide with 2/max(k,SMALL), which is
 // always > 0. Every interFoam tutorial names `div(phi,alpha) Gauss vanLeer`, which is why it is here.
-__device__ __forceinline__ scalar limitedFaceWeight(
-    int f, int P, int N, scalar p, scalar cdwF,
-    const scalar* __restrict__ field,
-    const scalar* __restrict__ gx, const scalar* __restrict__ gy, const scalar* __restrict__ gz,
-    const scalar* __restrict__ dOwnX, const scalar* __restrict__ dOwnY, const scalar* __restrict__ dOwnZ,
-    const scalar* __restrict__ dNeiX, const scalar* __restrict__ dNeiY, const scalar* __restrict__ dNeiZ,
+// THE LIMITER OF r, selected by twoByk as the comment above says. Shared by the scalar kernel and the
+// V kernel, so that `vanLeerV` and `vanLeer` are one expression and not two.
+__device__ __forceinline__ scalar limiterOfR(
+    scalar r,
     scalar twoByk)
 {
-    const scalar dx = dOwnX[f] - dNeiX[f], dy = dOwnY[f] - dNeiY[f], dz = dOwnZ[f] - dNeiZ[f];   // d = C[N]-C[P]
-    // NVDTVD::r, upwind-cell gradient (strict phi>0) projected on d, vs the face gradient.
-    const int U = (p > 0.0) ? P : N;
-    const scalar gradcf = dx*gx[U] + dy*gy[U] + dz*gz[U];
-    const scalar gradf  = field[N] - field[P];
-    scalar r;   // sign(s) = (s>=0)?1:-1  (OF Scalar.H)
-    if (fabs(gradcf) >= 1000.0 * fabs(gradf))
-        r = 2.0 * 1000.0 * ((gradcf >= 0.0) ? 1.0 : -1.0) * ((gradf >= 0.0) ? 1.0 : -1.0) - 1.0;
-    else
-        r = 2.0 * (gradcf / gradf) - 1.0;
     scalar limiter;
     if (twoByk > 0.0)
     {
@@ -121,6 +109,28 @@ __device__ __forceinline__ scalar limitedFaceWeight(
     {
         limiter = r * (r + 1.0) / (r*r + 1.0);        // OF vanAlbada: NOT clamped, and it is <= 1 anyway
     }
+    return limiter;
+}
+
+__device__ __forceinline__ scalar limitedFaceWeight(
+    int f, int P, int N, scalar p, scalar cdwF,
+    const scalar* __restrict__ field,
+    const scalar* __restrict__ gx, const scalar* __restrict__ gy, const scalar* __restrict__ gz,
+    const scalar* __restrict__ dOwnX, const scalar* __restrict__ dOwnY, const scalar* __restrict__ dOwnZ,
+    const scalar* __restrict__ dNeiX, const scalar* __restrict__ dNeiY, const scalar* __restrict__ dNeiZ,
+    scalar twoByk)
+{
+    const scalar dx = dOwnX[f] - dNeiX[f], dy = dOwnY[f] - dNeiY[f], dz = dOwnZ[f] - dNeiZ[f];   // d = C[N]-C[P]
+    // NVDTVD::r, upwind-cell gradient (strict phi>0) projected on d, vs the face gradient.
+    const int U = (p > 0.0) ? P : N;
+    const scalar gradcf = dx*gx[U] + dy*gy[U] + dz*gz[U];
+    const scalar gradf = field[N] - field[P];
+    scalar r;   // sign(s) = (s>=0)?1:-1  (OF Scalar.H)
+    if (fabs(gradcf) >= 1000.0 * fabs(gradf))
+        r = 2.0 * 1000.0 * ((gradcf >= 0.0) ? 1.0 : -1.0) * ((gradf >= 0.0) ? 1.0 : -1.0) - 1.0;
+    else
+        r = 2.0 * (gradcf / gradf) - 1.0;
+    const scalar limiter = limiterOfR(r, twoByk);
     const scalar pos0 = (p >= 0.0) ? 1.0 : 0.0;
     return limiter * cdwF + (1.0 - limiter) * pos0;
 }
@@ -241,8 +251,9 @@ void divLimitedVFaceKernel(
         r = 2.0 * 1000.0 * ((gradcf >= 0.0) ? 1.0 : -1.0) * ((gradf >= 0.0) ? 1.0 : -1.0) - 1.0;
     else
         r = 2.0 * (gradcf / gradf) - 1.0;
-    scalar limiter = twoByk * r;
-    limiter = (limiter < 0.0) ? 0.0 : (limiter > 1.0 ? 1.0 : limiter);        // clamp(.,0,1)
+    // limitedLinearV's clamp, or vanLeerV's unclamped limiter by the sentinel -- the V schemes differ
+    // from their scalar forms in r alone (NVDVTVDV against NVDTVD), never in the limiter
+    const scalar limiter = limiterOfR(r, twoByk);
     const scalar pos0 = (p >= 0.0) ? 1.0 : 0.0;
     const scalar W = limiter * cdw[f] + (1.0 - limiter) * pos0;
     const scalar lo = -W * p;

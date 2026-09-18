@@ -52,10 +52,12 @@ void assembleUEqn(
     switch (in.scheme)
     {
         case cpu::DivScheme::limitedLinearV:
+        case cpu::DivScheme::vanLeerV:
         {
             // The kernel takes CONTIGUOUS 3-arrays (it indexes U[0..2]), not an array of pointers, so
             // the components are gathered into one. Three device copies per assembly; the alternative is
-            // a second kernel signature.
+            // a second kernel signature. vanLeerV is the same NVDVTVDV r with vanLeer's limiter, which
+            // the kernel selects by the sentinel (device_mesh.cuh, kVanLeerTwoByk).
             const DeviceBuffer<scalar>* Usrc[3] = {&Ux, &Uy, &Uz};
             DeviceBuffer<scalar> Uarr[3], gx[3], gy[3], gz[3];
             const GradUMemo& gm = deviceGradUShared(dm, dbU, Ux, Uy, Uz);   // grad(U) at this U, once (item 65)
@@ -66,9 +68,10 @@ void assembleUEqn(
                 deviceCopy(gy[k], gm.gy[k]);
                 deviceCopy(gz[k], gm.gz[k]);
             }
-            deviceDivLimitedVCoeffs(dm, *in.phiInt, Uarr, gx, gy, gz,
-                                    2.0 / std::fmax(in.schemeCoeff, 1e-15),
-                                    M.diag, M.upper, M.lower);
+            const scalar twoByk = (in.scheme == cpu::DivScheme::vanLeerV)
+                ? kVanLeerTwoByk
+                : 2.0 / std::fmax(in.schemeCoeff, 1e-15);
+            deviceDivLimitedVCoeffs(dm, *in.phiInt, Uarr, gx, gy, gz, twoByk, M.diag, M.upper, M.lower);
             break;
         }
         case cpu::DivScheme::limitedLinear:
@@ -96,6 +99,15 @@ void assembleUEqn(
                                    M.diag, M.upper, M.lower);
             break;
         }
+        case cpu::DivScheme::linear:
+            // central differencing: the mesh's own weights. THIS FELL THROUGH TO `default` -- upwind
+            // -- until interFoam's driver was read: its own scheme enum has `linear` (three shipped
+            // tutorials name it for div(rhoPhi,U)) and its device mapping had no case for it, so a
+            // -device run of such a case would have convected upwind under the name `linear`. None of
+            // the three runs yet for other reasons; the dambreak gate's `linear` profile holds it now.
+            deviceDivCentralCoeffs(dm, *in.phiInt, M.diag, M.upper, M.lower);
+            break;
+
         case cpu::DivScheme::LUST:
         {
             // weights = 0.75*linear + 0.25*upwind, and the coefficients are LINEAR in the weights

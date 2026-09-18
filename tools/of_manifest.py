@@ -2848,6 +2848,35 @@ COMPONENTS = {
                   "adjustable outflow can remove stops the run -- which is what a wall velocity with the wrong "
                   "normal component does on a closed tank. brae's driver set needReference = false with a note "
                   "that damBreak's atmosphere is a totalPressure; every case gated before this one had one."),
+        dict(name="interFoam_vanLeerV", of_symbol="vanLeerV",
+             of_file="src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/vanLeer/vanLeer.C",
+             classification="SHARED_NUMERICAL", status="REIMPLEMENT",
+             brae_reference="src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedSchemes_cpp.cuh",
+             brae_target="src/cuda/device_fvm.cu",
+             validation="tests/interfoam_dambreak_vs_openfoam.sh's `vanleerv` profile: laminar/damBreak at the big step "
+                        "with `div(rhoPhi,U) Gauss vanLeerV` in place of its linearUpwind, five steps against real "
+                        "OpenFOAM, host and device, with the big-step run as the control. MEASURED: alpha 1.2e-13, "
+                        "U 3.1e-13 on the host and alpha 3.8e-14, U 1.2e-11 on the device, all 15 p_rgh counts "
+                        "OpenFOAM's; the scheme moves OpenFOAM's own alpha by 2.0e-01. AND ON THE FIXTURE IT EXISTS "
+                        "FOR: tests/interfoam_moving_vs_openfoam.sh's testTubeMixer, whose own fvSchemes name it, now "
+                        "run as shipped there -- alpha 4.1e-12 and U 4.2e-11 at worst over five profiles. BROKEN ONCE: "
+                        "vanLeer's limiter replaced by limitedLinear's clamp of 2r on the same r, host and device "
+                        "alike, alpha 2.1e-01 (45% of the change the scheme makes). A SECOND PROFILE, `linear`, holds "
+                        "`Gauss linear` on div(rhoPhi,U) on both paths (alpha 9.8e-14 host, 1.2e-13 device), for the "
+                        "reason in the note.",
+             note="vanLeerV IS LimitedScheme<vector, vanLeerLimiter<NVDVTVDV>, null> (vanLeer.C:37): the r of the V "
+                  "schemes -- one per face, from the vector difference across it dotted with the upwind cell's "
+                  "gradient projected on d (NVDVTVDV.H) -- with vanLeer's (r + |r|)/(1 + |r|), which is not "
+                  "clamped and reaches 2. The gradient is fvc::grad(U) through the case's grad(U) entry "
+                  "(LimitedScheme::calcLimiter). brae already had both halves: rVector for limitedLinearV and "
+                  "vanLeerLimiter for div(phi,alpha); vanLeerVWeights is their product. On the device the V kernel "
+                  "selected its limiter by clamping alone, so the limiter selection was hoisted out of the scalar "
+                  "kernel into limiterOfR and both kernels take it, vanLeer chosen by the kVanLeerTwoByk sentinel. "
+                  "THE `linear` PROFILE EXISTS BECAUSE OF WHAT WAS FOUND WIRING THIS: interFoam's own scheme enum "
+                  "has `linear` (three shipped tutorials name it) and its device mapping had no case for it, so "
+                  "it fell through the switch's `default` to upwind -- a -device run would have convected upwind "
+                  "under the name `linear`. The shared cpu::DivScheme now has `linear` (deviceDivCentralCoeffs; "
+                  "the mesh's own weights on the host) and the mapping names every scheme with no default."),
         dict(name="interFoam_vanLeer", of_symbol="vanLeer",
              of_file="src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/vanLeer/vanLeer.C",
              classification="SHARED_NUMERICAL", status="REIMPLEMENT",

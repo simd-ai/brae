@@ -113,9 +113,10 @@ enum class DdtScheme { Euler, backward, CrankNicolson, localEuler, steadyState }
 
 // div(rhoPhi,U), as named by fvSchemes. The shipped tutorials ask for linearUpwind grad(U) (24 files),
 // vanLeerV (8), upwind (6), linear (3) and limitedLinear 0.2 (1). vanLeerV is the V-variant of the
-// limiter added for div(phi,alpha) and is NOT the same object -- it limits the component along the
-// direction of steepest change rather than each component separately -- so it is refused until ported.
-enum class DivScheme { upwind, linear, limitedLinear, limitedLinearV, linearUpwind, linearUpwindV, LUST };
+// limiter every tutorial names for div(phi,alpha) and is NOT the same object: one limiter per face
+// from the vector difference (NVDVTVDV), applied to all three components, with vanLeer's unclamped
+// limiter function -- limitedSchemes_cpp.cuh has both halves.
+enum class DivScheme { upwind, linear, limitedLinear, limitedLinearV, linearUpwind, linearUpwindV, LUST, vanLeerV };
 
 struct InterMomentumInput
 {

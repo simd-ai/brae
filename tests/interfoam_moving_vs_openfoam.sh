@@ -9,12 +9,12 @@
 # THE FIXTURE is laminar/testTubeMixer, the one solid-body tutorial on an orthogonal mesh: a 1 x 10 x 1
 # cm tube of water and air on a turntable (rotatingMotion, 2 pi rad/s) that also tilts about its own
 # axis (oscillatingRotatingMotion, 45 degrees at 40 rad/s), every wall a movingWallVelocity, p_rgh a
-# fixedFluxPressure everywhere, and PIMPLE naming pRefPoint and pRefValue 1e5. TWO THINGS ARE STAGED
-# AWAY FROM THE TUTORIAL, and each is a refusal or a substitution today, not a choice:
-#   div(rhoPhi,U)   `Gauss vanLeerV` -> `Gauss linear`: the vector-limited scheme is not ported yet
+# fixedFluxPressure everywhere, PIMPLE naming pRefPoint and pRefValue 1e5, and `div(rhoPhi,U) Gauss
+# vanLeerV` -- run as shipped now that vanLeerV is ported (it was staged to `Gauss linear` before). ONE
+# THING IS STAGED AWAY FROM THE TUTORIAL, a substitution today and not a choice:
 #   p_rghFinal      PCG with a GAMG PRECONDITIONER -> `solver GAMG; smoother DIC;` at the same
 #                   tolerance 2e-09: the preconditioner form is not ported yet
-# Both are named in interFoam_dynamicMesh's manifest entry as what this gate does not claim.
+# It is named in interFoam_dynamicMesh's manifest entry as what this gate does not claim.
 #
 # PROFILES, ten steps of deltaT 2e-4 (the tutorial's is 1e-4 under maxCo 0.5; at 2e-4 the Courant
 # number reaches 0.16 and the walls move a cell width in about thirty steps):
@@ -37,10 +37,11 @@
 # still water in a still tube, which is the whole of the answer away; for the reference, OpenFOAM's
 # closed dam with `pRefValue 1e5`, which moves its p by 1e5 and nothing else.
 #
-# MEASURED, the five mixer profiles: every p_rgh iteration count OpenFOAM's (20 to 40 per profile),
-# initial residuals 3.7e-11 in step one and 4.8e-09 over the run; alpha 5.6e-12, p_rgh 1.5e-13,
-# U 1.0e-10, Uf 6.8e-11 at worst; the wall velocity 7.0e-14 on 1050 faces (|U_wall| 1.8); the moved
-# points OpenFOAM's exactly. The closed dam: 60 of 60 counts, alpha 1.2e-14, U 8.1e-14, p 5.7e-15.
+# MEASURED, the five mixer profiles with the tutorial's own vanLeerV: every p_rgh iteration count
+# OpenFOAM's (20 to 40 per profile), initial residuals 3.7e-11 in step one and 1.2e-09 over the run;
+# alpha 4.1e-12, p_rgh 1.5e-13, U 4.2e-11 at worst; the wall velocity 7.0e-14 on 1050 faces (|U_wall|
+# 1.8); the moved points OpenFOAM's exactly. (With `Gauss linear` staged in vanLeerV's place, before
+# that scheme was ported: alpha 5.6e-12, U 1.0e-10.) The closed dam: 60 of 60 counts, alpha 1.2e-14, U 8.1e-14, p 5.7e-15.
 #
 # EVERY PORT DECISION WAS BROKEN ONCE, with switches that are not in the tree, on `mixer`:
 #   phi left ABSOLUTE after the corrector (no makeRelative)     alpha 9.2e-01, U 470%
@@ -141,9 +142,7 @@ open(q, 'w').write(t)
 if profile.startswith('mixer'):
     f = os.path.join(d, 'system/fvSchemes')
     t = open(f).read()
-    t, k = re.subn(r'div\(rhoPhi,U\)\s+Gauss vanLeerV;', 'div(rhoPhi,U)   Gauss linear;', t)
-    assert k == 1, 'div(rhoPhi,U) is no longer Gauss vanLeerV'
-    open(f, 'w').write(t)
+    assert re.search(r'div\(rhoPhi,U\)\s+Gauss vanLeerV;', t), 'div(rhoPhi,U) is no longer Gauss vanLeerV'
     if profile == 'mixerStatic':
         p = os.path.join(d, 'constant/dynamicMeshDict')
         t = open(p).read()

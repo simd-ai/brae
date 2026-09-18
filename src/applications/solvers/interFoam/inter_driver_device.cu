@@ -472,6 +472,9 @@ RunReport runInterFoamDevice(
     C.alphaInput.alpharScheme = (f.divPhirbAlpha == AlphaFluxScheme::vanLeer) ? DeviceAlphaScheme::vanLeer
                               : (f.divPhirbAlpha == AlphaFluxScheme::upwind) ? DeviceAlphaScheme::upwind
                               : DeviceAlphaScheme::linear;
+    // EVERY SCHEME NAMED, NO default: this switch used to end in `default: upwind`, and interFoam's
+    // `linear` -- which its own enum carries and three shipped tutorials name -- fell through it, so
+    // a -device run of such a case would have convected upwind under the name `linear`.
     switch (f.divRhoPhiU)
     {
         case DivScheme::linearUpwind:   C.divScheme = brae::cpu::DivScheme::linearUpwind;   break;
@@ -479,7 +482,9 @@ RunReport runInterFoamDevice(
         case DivScheme::limitedLinear:  C.divScheme = brae::cpu::DivScheme::limitedLinear;  break;
         case DivScheme::limitedLinearV: C.divScheme = brae::cpu::DivScheme::limitedLinearV; break;
         case DivScheme::LUST:           C.divScheme = brae::cpu::DivScheme::LUST;           break;
-        default:                        C.divScheme = brae::cpu::DivScheme::upwind;         break;
+        case DivScheme::vanLeerV:       C.divScheme = brae::cpu::DivScheme::vanLeerV;       break;
+        case DivScheme::linear:         C.divScheme = brae::cpu::DivScheme::linear;         break;
+        case DivScheme::upwind:         C.divScheme = brae::cpu::DivScheme::upwind;         break;
     }
     C.divSchemeCoeff = f.divRhoPhiUCoeff;
     C.nCorrectors = static_cast<int>(f.pimple.nCorrectors);

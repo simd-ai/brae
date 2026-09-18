@@ -93,6 +93,34 @@ std::vector<scalar> vanLeerWeights(
 }
 
 
+std::vector<scalar> vanLeerVWeights(
+    const std::vector<scalar>&    phi,
+    const GeometricField<vector>& vf,
+    const std::vector<tensor>&    gradVf,
+    const PrimitiveMesh&          m,
+    const FvGeometry&             g)
+{
+    const label nIf = m.nInternalFaces();
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    const std::vector<scalar>& cd = g.weights();
+    const std::vector<vector>& C = g.C();
+
+    std::vector<scalar> w(nIf);
+    for (label f = 0; f < nIf; ++f)
+    {
+        const label P = own[f];
+        const label N = nei[f];
+        const vector d{C[N].x - C[P].x, C[N].y - C[P].y, C[N].z - C[P].z};
+        const scalar r = rVector(phi[f], vf.internal[P], vf.internal[N], gradVf[P], gradVf[N], d);
+        // vanLeer's limiter is not clamped -- see vanLeerWeights
+        const scalar lim = vanLeerLimiter(r);
+        w[f] = lim*cd[f] + (1.0 - lim)*((phi[f] >= 0.0) ? 1.0 : 0.0);
+    }
+    return w;
+}
+
+
 std::vector<scalar> limitedLinearVWeights(
     const std::vector<scalar>&    phi,
     const GeometricField<vector>& vf,

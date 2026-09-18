@@ -188,6 +188,18 @@ std::vector<scalar> vanLeerWeights(
     const PrimitiveMesh&              m,
     const FvGeometry&                 g);
 
+// vanLeerV: vanLeer's limiter on NVDVTVDV's r -- makeLimitedVSurfaceInterpolationScheme(vanLeerV,
+// vanLeerLimiter) in vanLeer.C:37, which is LimitedScheme<vector, vanLeerLimiter<NVDVTVDV>, null>.
+// Eight interFoam tutorials name it for div(rhoPhi,U), every one a closed tank in motion. The
+// gradient is grad(U) through the case's own gradSchemes entry, as LimitedScheme::calcLimiter's
+// fvc::grad(lPhi) resolves it.
+std::vector<scalar> vanLeerVWeights(
+    const std::vector<scalar>&        phi,
+    const GeometricField<vector>&     vf,
+    const std::vector<tensor>&        gradVf,
+    const PrimitiveMesh&              m,
+    const FvGeometry&                 g);
+
 // limitedLinearV: the same limiter, but r is formed on the VECTOR difference (NVDVTVDV), so all three
 // components share one limiter per face instead of being limited independently.
 std::vector<scalar> limitedLinearVWeights(

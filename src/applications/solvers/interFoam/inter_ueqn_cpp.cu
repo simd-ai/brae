@@ -92,6 +92,15 @@ FvVectorMatrix divWithScheme(const GeometricField<vector>& U,
             return fvm::div<vector>(phi, *in.rhoPhiBnd, U, w, m, patches);
         }
 
+        case DivScheme::vanLeerV:
+        {
+            // the limiter's gradient is fvc::grad(U) through the case's grad(U) entry
+            // (LimitedScheme::calcLimiter), as limitedLinearV's above
+            const std::vector<tensor> gU = gradU(U, in, in.gradULimitK, m, g, patches);
+            const std::vector<scalar> w = limitedSchemes::vanLeerVWeights(phi, U, gU, m, g);
+            return fvm::div<vector>(phi, *in.rhoPhiBnd, U, w, m, patches);
+        }
+
         case DivScheme::LUST:
             return fvm::div<vector>(phi, *in.rhoPhiBnd, U, limitedSchemes::lustWeights(phi, g), m, patches);
 

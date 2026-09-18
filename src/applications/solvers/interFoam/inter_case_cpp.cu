@@ -113,8 +113,8 @@ namespace {
 
 // fvSchemes' divSchemes entry for div(rhoPhi,U). The shipped tutorials ask for `Gauss linearUpwind
 // grad(U)` (24), `Gauss vanLeerV` (8), `Gauss upwind` (6), `Gauss linear` (3) and
-// `Gauss limitedLinear 0.2` (1). Anything else -- and vanLeerV, which is not ported -- is refused by
-// name rather than run as something similar.
+// `Gauss limitedLinear 0.2` (1). Anything else is refused by name rather than run as something
+// similar.
 DivScheme parseMomentumDiv(const std::string& entry, scalar& coeff)
 {
     coeff = scalar(1);
@@ -137,6 +137,7 @@ DivScheme parseMomentumDiv(const std::string& entry, scalar& coeff)
     if (s == "LUST")          return DivScheme::LUST;
     if (s == "linearUpwind")  return DivScheme::linearUpwind;
     if (s == "linearUpwindV") return DivScheme::linearUpwindV;
+    if (s == "vanLeerV")      return DivScheme::vanLeerV;
     if (s == "limitedLinearV")
     {
         if (tok.size() > 2) coeff = std::stod(tok[2]);
@@ -148,9 +149,8 @@ DivScheme parseMomentumDiv(const std::string& entry, scalar& coeff)
         return DivScheme::limitedLinear;    // refused downstream, by name, with the reason
     }
     throw std::runtime_error(
-        "brae interFoam: `div(rhoPhi,U) " + entry + "` is not ported. `vanLeerV` (8 shipped tutorials) "
-        "is the V-variant of the alpha limiter and limits along the direction of steepest change "
-        "rather than per component -- it is a different scheme, not a variant of vanLeer.");
+        "brae interFoam: `div(rhoPhi,U) " + entry + "` is not ported. brae has upwind, linear, "
+        "linearUpwind, linearUpwindV, limitedLinearV, LUST and vanLeerV here.");
 }
 
 AlphaFluxScheme parseAlphaDiv(const std::string& entry, const char* key)
@@ -775,6 +775,18 @@ InterFields buildInterFields(const std::string&          caseDir,
             InterFields::PressureLinearSolve s;
             s.solver = d.wordOr("solver", "");
             s.preconditioner = d.wordOr("preconditioner", "");
+            // a `preconditioner { preconditioner GAMG; ... }` sub-dictionary (testTubeMixer and the
+            // sloshing tanks, on p_rghFinal and pcorr): lduMatrix::preconditioner::New reads the name
+            // from inside it. Named here so the notice below says what the case asked for rather
+            // than `preconditioner ;`. The form itself is not ported.
+            if (s.preconditioner.empty())
+            {
+                const FoamDict* pd = d.subDict("preconditioner");
+                if (pd)
+                {
+                    s.preconditioner = "{ " + pd->wordOr("preconditioner", "") + " ... }";
+                }
+            }
             s.tol = d.scalarOr("tolerance", scalar(1e-6));
             s.relTol = d.scalarOr("relTol", scalar(0));
             s.maxIter = static_cast<int>(d.scalarOr("maxIter", scalar(1000)));

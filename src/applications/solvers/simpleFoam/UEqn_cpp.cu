@@ -35,6 +35,16 @@ FvVectorMatrix divWithScheme(
                             m, patches);
         }
 
+        case DivScheme::vanLeerV:
+        {
+            const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
+            return fvm::div(*in.phi, *in.phiBnd, U, ls::vanLeerVWeights(*in.phi, U, gradU, m, g), m, patches);
+        }
+
+        case DivScheme::linear:
+            // central differencing: the mesh's own interpolation weights, nothing limited
+            return fvm::div(*in.phi, *in.phiBnd, U, g.weights(), m, patches);
+
         case DivScheme::limitedLinear:
         {
             // NOT per-component and NOT the V form: LimitedScheme.H instantiates limitedLinear for a
