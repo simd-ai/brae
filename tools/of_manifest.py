@@ -2572,6 +2572,46 @@ COMPONENTS = {
                   "zone with no omega, which OpenFOAM's mandatory Function1::New stops on and brae ran at zero. "
                   "The refusal that used to stand here fired on any active zone; brae's interFoam had once read "
                   "MRFProperties, ignored it and converged. HOST ONLY SO FAR."),
+        dict(name="interFoam_fvOptions", of_symbol="fv::options",
+             of_file="src/finiteVolume/cfdTools/general/fvOptions/fvOptions.C",
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/finiteVolume/cfdTools/general/fvOptions/fvOptions_cpp.cuh",
+             validation="tests/interfoam_angledduct_vs_openfoam.sh, real OpenFOAM on RAS/angledDuct (its own blockMesh, "
+                        "28000 cells non-orthogonal to 44.5 degrees, the `porosity` zone 8000 of them), ten fixed steps "
+                        "of the tutorial's deltaT 1e-3, THREE ARMS. `inactive` has the option `active no` in both codes "
+                        "and is held at the floor: alpha 5.7e-16, p_rgh 3.8e-15, U 4.3e-15, k 7.6e-15, epsilon 5.8e-15, "
+                        "nut 5.2e-15. `porous` is the case as shipped: alpha 1.6e-14, p_rgh 6.3e-11, U 5.1e-11, k "
+                        "4.6e-12, epsilon 5.3e-12, nut 5.7e-12. `porousWater` starts the duct full of water: p_rgh "
+                        "4.6e-12, U 2.8e-12. Every p_rgh, alpha, epsilon and k iteration count OpenFOAM's in all three. "
+                        "THE FOUR ORDERS BETWEEN inactive AND porous ARE ROUND-OFF, MEASURED TWICE: one entry of the "
+                        "resistance tensor multiplied by (1 + 2.2e-16) moves brae's p_rgh agreement from 6.3e-11 to "
+                        "1.7e-11; and the residual that is 1.5e-10 out is the second corrector's, itself 2.2e-05, "
+                        "where the first solve of the run agrees to 1.1e-16 and the same line with the option off -- "
+                        "2.5e-02 there -- agrees to 1e-13. Bounds at about 30x, per arm. EACH ARM IS ANOTHER'S "
+                        "CONTROL: the option moves OpenFOAM's own U by 23% (73% in water). BROKEN ONCE EACH (U): the "
+                        "inlet never refreshed 100%; refreshed with the face cell's rho 6.5e+06; as a volumetric rate "
+                        "2.9e+02; mu as rho*nuEff 5.3e-02 (1.8e-01 in water); the kinematic form, no rho, NOTHING on "
+                        "`porous` -- rho is exactly 1 in the zone for the whole shipped run -- and 4.9e-01 on "
+                        "`porousWater`, which is why that arm exists. tests/interfoam_refusals.sh holds six fvOptions "
+                        "arms. NOT CLAIMED, each refused by name: every other option type, explicitPorositySource's "
+                        "fixedCoeff model, an option under a moving mesh or beside an MRF zone, the device loop; the "
+                        "Forchheimer half (f is zero in the tutorial).",
+             note="interFoam reaches fvOptions in four places (UEqn.H:9 `== fvOptions(rho, U)`, :14 constrain, :31 and "
+                  "pEqn.H:65 correct); a source reaches the first alone. The arithmetic is the host reference "
+                  "simpleFoam and rhoSimpleFoam already gate; what is interFoam's is what it is handed. The "
+                  "equation is FORCE-dimensioned, so DarcyForchheimer::correct takes the field named `rho` and, "
+                  "finding no `thermo:mu`, rho*nu with the field named `nu` (DarcyForchheimer.C:203-218) -- the "
+                  "mixture's rho and its LAMINAR nu. WHAT THE GATE FOUND WAS NOT THE OPTION. interFoam's loops never "
+                  "refreshed a flowRateInletVelocity, which OpenFOAM recomputes at every momentum assembly "
+                  "(fvMatrix.C:396 -> updateCoeffs) from the rate at that time and, for a massFlowRate, the field "
+                  "named `rho` on the patch. angledDuct ships `massFlowRate constant 0.1` beside `value uniform (0 "
+                  "0 0)`: brae's inlet stayed at zero, its largest velocity 1.9e-04 m/s against OpenFOAM's 0.21, "
+                  "silently -- the frozen inlet this project's rules name. It was localised by the `inactive` arm: "
+                  "the same 100% with the option off. The host loop refreshes it now; the device loop, which "
+                  "uploads U's patches once, refuses a mass rate or a volumetric one beside a `value`. "
+                  "waterChannel's volumetric inlet carries no `value`, so its constructor had built the right one. "
+                  "ALSO: the shared fvOptions reader looked in system/ before constant/, where "
+                  "fv::options::createIOobject (fvOptions.C:46-84) looks in constant/ first. HOST ONLY SO FAR."),
         dict(name="interFoam_waveModel", of_symbol="waveModel",
              of_file="src/waveModels/waveModel/waveModel.C",
              classification="BOUNDARY_CONDITION", status="REIMPLEMENT",

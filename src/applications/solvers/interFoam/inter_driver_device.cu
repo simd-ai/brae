@@ -92,6 +92,30 @@ RunReport runInterFoamDevice(
             "(inter_turbulence_cpp.cu around kOmegaSST_cpp.cu) and gated there against OpenFOAM on "
             "RAS/waterChannel. Refused rather than run under kEpsilon's name or laminar.");
 
+    for (const fvOptions::Option& o : f.fvOptions.options)
+    {
+        if (!o.active) continue;
+        throw std::runtime_error(
+            "brae interFoam (device): fvOptions has an active option `" + o.name + "` (" + o.type
+            + "). The host loop applies explicitPorositySource/DarcyForchheimer in UEqn (gated on "
+            "RAS/angledDuct); the device loop's UEqn applies no fvOption. Refused rather than run the "
+            "case without its resistance.");
+    }
+    // A flowRateInletVelocity is RECOMPUTED at every momentum assembly (the host loop has it,
+    // inter_driver_cpp.cu). The device loop uploads U's patch values once, so it is right only for the
+    // inlet that never changes: a constant VOLUMETRIC rate whose constructor already built the value.
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        const auto& ub = *f.U.boundary[pi];
+        if (!ub.isFlowRateInlet()) continue;
+        if (!ub.flowRateIsMass() && !ub.flowRateHadValue()) continue;
+        throw std::runtime_error(
+            "brae interFoam (device): U patch `" + fvp[pi].name + "` is a flowRateInletVelocity given as "
+            + (ub.flowRateIsMass() ? std::string("a massFlowRate") : std::string("a volumetricFlowRate beside a `value`"))
+            + ". OpenFOAM recomputes it at every momentum assembly -- from the mixture's rho on the "
+            "patch for a mass rate, and over the file's `value` for either -- and the device loop "
+            "keeps the value it uploaded. Refused rather than run a frozen inlet.");
+    }
     if (!f.mrfZones.empty())
         throw std::runtime_error(
             "brae interFoam (device): the case has an active MRF zone. The host loop carries it "

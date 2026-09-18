@@ -543,6 +543,27 @@ RunReport runInterFoam(
                         msc.solutionD = &solD;
                         msc.solveLog = rep.uSolves;
                     }
+                    // U.boundaryFieldRef().updateCoeffs(), which the fvMatrix constructor runs when UEqn
+                    // is assembled (fvMatrix.C:396). A flowRateInletVelocity recomputes its value there
+                    // from the rate at this time and -- for a massFlowRate -- the field named `rho` on
+                    // the patch, which in interFoam is the MIXTURE's (flowRateInletVelocity...C:201-237).
+                    // This loop never called it: RAS/angledDuct ships `massFlowRate constant 0.1` beside
+                    // `value uniform (0 0 0)`, the inlet stayed at the file's zero, and after ten steps
+                    // brae's largest velocity was 1.9e-04 m/s against OpenFOAM's 0.21 -- U 100% out, with
+                    // no notice. waterChannel's volumetric inlet carries no `value`, so its constructor
+                    // had already built the right one.
+                    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                    {
+                        if (f.U.boundary[pi]->isFlowRateInlet())
+                        {
+                            f.U.boundary[pi]->updateFromDensity(f.rhoBnd[pi], rep.time);
+                        }
+                    }
+                    if (!f.fvOptions.empty())
+                    {
+                        mi.fvOptions = &f.fvOptions;
+                        mi.nuLaminar = &f.nu;
+                    }
                     // MRF.correctBoundaryVelocity(U), UEqn.H:1 -- before the matrix reads U's patches
                     if (!f.mrfZones.empty())
                     {

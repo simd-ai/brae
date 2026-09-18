@@ -212,25 +212,8 @@ void refuseUnportedCaseInputs(
     // constant/MRFProperties is read in buildInterFields (createMRF.H), which ports it and refuses by
     // name what no gate holds: MRF under a moving mesh, under RAS, and beside a fixedFluxPressure patch.
 
-    // createFvOptions.H -> fv::options::createIOobject (fvOptions.C:46-84): constant/ FIRST, then
-    // system/. An option is active unless it says otherwise (fvOption.C:72).
-    for (const char* where : {"/constant/fvOptions", "/system/fvOptions"})
-    {
-        const std::string fo = caseDir + where;
-        if (!std::filesystem::exists(fo)) continue;
-        const FoamDict d = readDict(fo);
-        for (const auto& o : d.subs)
-        {
-            const std::string a = o.second.wordOr("active", "true");
-            if (a == "false" || a == "no" || a == "off" || a == "0") continue;
-            throw std::runtime_error(
-                "brae interFoam: " + std::string(where + 1) + " has an active option `" + o.first
-                + "` (type `" + o.second.wordOr("type", "?") + "`). interFoam applies fvOptions to UEqn "
-                  "and to U after every corrector; brae's interFoam applies none.");
-        }
-        // OpenFOAM stops at the first file it finds
-        break;
-    }
+    // fvOptions are read in buildInterFields (createFvOptions.H), which ports explicitPorositySource /
+    // DarcyForchheimer and refuses every other active option by name.
 
     // A function object does not normally touch the solution, and brae runs none. setTimeStep is the
     // exception: Time::adjustDeltaT ends with functionObjects_.adjustTimeStep(), so it OVERRIDES the
@@ -934,6 +917,40 @@ InterFields buildInterFields(const std::string&          caseDir,
             }
         }
     }
+    // createFvOptions.H -> fv::options (constant/ first, then system/; an option is active unless it
+    // says otherwise, fvOption.C:72). interFoam reaches the list in four places: UEqn.H:9
+    // `== fvOptions(rho, U)`, :14 constrain(UEqn), :31 and pEqn.H:65 correct(U). A source reaches the
+    // first alone, and ONE source is ported here.
+    f.fvOptions = fvOptions::read(caseDir, m);
+    for (const fvOptions::Option& o : f.fvOptions.options)
+    {
+        if (!o.active) continue;
+        const bool darcyForchheimer = o.unsupported.empty() && !o.rotorDisk && !o.actuationDisk
+                                   && !o.fixedCoeff && o.constraint == fvOptions::Option::Constraint::none;
+        if (darcyForchheimer) continue;
+        const std::string what = !o.unsupported.empty() ? o.unsupported
+                               : o.fixedCoeff ? std::string("explicitPorositySource with the fixedCoeff model")
+                               : o.type;
+        throw std::runtime_error(
+            "brae interFoam: fvOptions has an active option `" + o.name + "` (" + what + "). interFoam "
+            "applies fvOptions to UEqn as `== fvOptions(rho, U)`, constrains the matrix with them and "
+            "corrects U after every corrector; brae's interFoam carries explicitPorositySource with "
+            "DarcyForchheimer -- RAS/angledDuct's, gated against OpenFOAM -- and nothing else.");
+    }
+    bool anyFvOption = false;
+    for (const fvOptions::Option& o : f.fvOptions.options)
+    {
+        anyFvOption = anyFvOption || o.active;
+    }
+    if (anyFvOption && f.dynamicMesh)
+        throw std::runtime_error(
+            "brae interFoam: the case has an active fvOption AND a moving mesh. The option's cell "
+            "selection and its resistance tensor are taken once; no shipped tutorial pairs them and no "
+            "gate holds it.");
+    if (anyFvOption && !f.mrfZones.empty())
+        throw std::runtime_error(
+            "brae interFoam: the case has an active fvOption AND an active MRF zone. Each is gated on "
+            "its own tutorial and nothing holds the two together against OpenFOAM.");
     if (!f.mrfZones.empty() && f.dynamicMesh)
         throw std::runtime_error(
             "brae interFoam: the case has an active MRF zone AND a moving mesh. MRF.update() rebuilds "

@@ -34,6 +34,7 @@
 //
 //   4. gh and ghf need g AND hRef, and ghRef carries g's SIGN (inter_create_fields_cpp.cuh).
 //      p = p_rgh + rho*gh is written and never solved.
+#include "fvOptions_cpp.cuh"
 #include "MRF_cpp.cuh"
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
@@ -161,6 +162,10 @@ struct InterFields
     // case without MRF. UEqn.H and pEqn.H reach it in four places -- see inter_ueqn_cpp.cuh and
     // inter_peqn_cpp.cuh.
     std::vector<MRF::Zone> mrfZones;
+    // createFvOptions.H: the case's ACTIVE options. interFoam applies them in UEqn.H:9 (== fvOptions(rho,
+    // U)), :14 (constrain) and :31 plus pEqn.H:65 (correct). ONE is ported, explicitPorositySource with
+    // DarcyForchheimer, which only the first of those reaches; everything else is refused by name.
+    fvOptions::OptionList fvOptions;
     // createDyMControls.H / readDyMControls.H: PIMPLE's `correctPhi` (default mesh.dynamic()),
     // `checkMeshCourantNo` and `moveMeshOuterCorrectors` (default false)
     bool correctPhi = false;

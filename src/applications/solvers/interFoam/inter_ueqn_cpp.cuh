@@ -81,6 +81,7 @@
 //    Sign: `solve(UEqn == R)` is fvMatrix::operator==, i.e. source += V*R (fvMatrix.C:1855-1862 with the
 //    double negative of operator-=). rhoSimpleFoam's addPressureGradient carries the same convention with
 //    R = -grad(p); it is written out again here because getting it backwards still converges.
+#include "fvOptions_cpp.cuh"
 #include "MRF_cpp.cuh"
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"
@@ -173,7 +174,15 @@ struct InterMomentumInput
     const std::vector<MRF::Zone>* mrf = nullptr;
     // declared by the case and NOT handed over in `mrf` -> refused, never ignored
     bool      hasMRF             = false;
-    bool      hasFvOptions       = false;        // declared by the case -> refuse until ported
+    // `== fvOptions(rho, U)`, UEqn.H:9. The case's options, every active one of them an
+    // explicitPorositySource/DarcyForchheimer (the case reader refuses the rest). The equation is
+    // FORCE-dimensioned, so DarcyForchheimer::correct takes the field named `rho` and, finding no
+    // `thermo:mu`, rho*nu with the field named `nu` (DarcyForchheimer.C:203-218) -- the MIXTURE's
+    // laminar nu, never nuEff. Null or empty is a case without options.
+    const fvOptions::OptionList*  fvOptions = nullptr;
+    const std::vector<scalar>*    nuLaminar = nullptr;
+    // declared by the case and NOT handed over in `fvOptions` -> refused, never ignored
+    bool      hasFvOptions       = false;
     std::string fvOptionUnsupported;
 };
 

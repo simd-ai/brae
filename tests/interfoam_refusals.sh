@@ -149,8 +149,12 @@ arm mrf_inactive            runs    -                        "" "printf '%s\nMRF
 arm mrf_empty               runs    -                        "" "printf '%s\n' '$HDR' > constant/MRFProperties"
 
 # fvOptions, in both places OpenFOAM looks
-arm fvoptions_system        refused "system/fvOptions"        "" "printf '%s\nsrc { type scalarSemiImplicitSource; }\n' '$HDR' > system/fvOptions"
-arm fvoptions_constant      refused "constant/fvOptions"      "" "printf '%s\nsrc { type scalarSemiImplicitSource; }\n' '$HDR' > constant/fvOptions"
+arm fvoptions_system        refused "scalarSemiImplicitSource" "" "printf '%s\nsrc { type scalarSemiImplicitSource; }\n' '$HDR' > system/fvOptions"
+arm fvoptions_constant      refused "scalarSemiImplicitSource" "" "printf '%s\nsrc { type scalarSemiImplicitSource; }\n' '$HDR' > constant/fvOptions"
+# explicitPorositySource/DarcyForchheimer IS ported (tests/interfoam_angledduct_vs_openfoam.sh); its
+# fixedCoeff model is not, and neither is any other type
+arm fvoptions_fixedCoeff    refused "fixedCoeff"              "" "$ZONE; printf '%s\nsrc { type explicitPorositySource; explicitPorositySourceCoeffs { selectionMode cellZone; cellZone rotor; type fixedCoeff; alpha (1 1 1); beta (0 0 0); rhoRef 1; coordinateSystem { origin (0 0 0); e1 (1 0 0); e2 (0 1 0); } } }\n' '$HDR' > constant/fvOptions"
+arm fvoptions_darcy         runs    -                        "" "$ZONE; printf '%s\nsrc { type explicitPorositySource; explicitPorositySourceCoeffs { selectionMode cellZone; cellZone rotor; type DarcyForchheimer; d (1e5 1e5 1e5); f (0 0 0); coordinateSystem { origin (0 0 0); e1 (1 0 0); e2 (0 1 0); } } }\n' '$HDR' > constant/fvOptions"
 arm fvoptions_inactive      runs    -                        "" "printf '%s\nsrc { type scalarSemiImplicitSource; active no; }\n' '$HDR' > system/fvOptions"
 # constant/ is looked up FIRST and OpenFOAM stops there: an inactive one in constant/ hides an active
 # one in system/

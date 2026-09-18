@@ -112,7 +112,10 @@ OptionList read(const std::string& caseDir, const PrimitiveMesh& m)
     OptionList list;
     namespace fs = std::filesystem;
     std::string path;
-    for (const std::string& p : {caseDir + "/system/fvOptions", caseDir + "/constant/fvOptions"})
+    // constant/ FIRST, then system/: fv::options::createIOobject (fvOptions.C:46-84) tries the constant
+    // directory and looks in system only when there is no file there. This had them the other way
+    // round, which reads the wrong file on a case that carries both.
+    for (const std::string& p : {caseDir + "/constant/fvOptions", caseDir + "/system/fvOptions"})
         if (fs::exists(p))
         {
             path = p;

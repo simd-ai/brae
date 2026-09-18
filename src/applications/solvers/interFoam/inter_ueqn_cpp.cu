@@ -29,7 +29,7 @@ void refuseUnsupported(const InterMomentumInput& in)
             "brae interFoam UEqn: the case declares MRF, and UEqn.H adds MRF.DDt(rho, U). brae has "
             "shipped a solver that read MRFProperties, ignored it, converged and reported nothing "
             "wrong; this refuses instead. Hand the resolved zones over in InterMomentumInput::mrf.");
-    if (in.hasFvOptions)
+    if (in.hasFvOptions && (!in.fvOptions || in.fvOptions->empty()))
         throw std::runtime_error(
             "brae interFoam UEqn: the case declares fvOptions `" + in.fvOptionUnsupported
             + "`, which UEqn.H applies as fvOptions(rho, U) and constrains the matrix with. Not ported.");
@@ -193,6 +193,26 @@ FvVectorMatrix assembleUEqn(
     }
     addDivDevReff(M, U, *muEff, *muEffBnd, m, g, patches, in.correctedLaplacian, in.snGradLimitCoeff,
                   in.gradULimitK, in.gradULeastSq);
+
+    // == fvOptions(rho, U), UEqn.H:9. explicitPorositySource builds a porosityEqn and does
+    // `eqn -= porosityEqn`, and `UEqn == options` subtracts that again, so the NET effect is the
+    // porosity equation as written: diag += V*tr(Cd)/3, source -= V*((Cd - I*tr(Cd)/3) & U), with
+    //     Cd = mu*D + (rho*|U|)*F,   mu = rho*nu                  (DarcyForchheimerTemplates.C:53)
+    // fvOptions_cpp carries that arithmetic and both negations; this hands it interFoam's fields.
+    if (in.fvOptions && !in.fvOptions->empty())
+    {
+        if (!in.nuLaminar)
+            throw std::runtime_error(
+                "brae interFoam UEqn: fvOptions(rho, U) needs the mixture's LAMINAR nu -- "
+                "DarcyForchheimer's mu is rho*nu (DarcyForchheimer.C:214-217), not rho*nuEff.");
+        const std::vector<scalar>& rho = *in.rho;
+        std::vector<scalar> mu(rho.size());
+        for (std::size_t c = 0; c < rho.size(); ++c)
+        {
+            mu[c] = rho[c] * (*in.nuLaminar)[c];
+        }
+        fvOptions::addSup(*in.fvOptions, M, U, scalar(0), g, /*forceDimensions=*/true, &rho, &mu);
+    }
 
     // UEqn.relax(). damBreak names `".*" 1`, which relaxEquation() finds, and relax(1) still applies the
     // diagonal-dominance clamp -- see InterMomentumInput::relaxEquationU.

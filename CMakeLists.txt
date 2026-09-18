@@ -3414,6 +3414,16 @@ target_link_libraries(test_inter_mrf_vs_openfoam PRIVATE brae_core)
 add_test(NAME interfoam_mrf_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_mrf_vs_openfoam.sh)
 
+# ...and an fvOption, on RAS/angledDuct as shipped: explicitPorositySource/DarcyForchheimer in a
+# force-dimensioned UEqn (rho and rho*nu from the mixture), under kEpsilon on a mesh non-orthogonal to
+# 44.5 degrees. The control is OpenFOAM with the option inactive; the device loop must refuse by name.
+add_executable(test_inter_angledduct_vs_openfoam tests/test_inter_angledduct_vs_openfoam.cu)
+target_include_directories(test_inter_angledduct_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_angledduct_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_angledduct_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_angledduct_vs_openfoam.sh)
+
 # ...and the wave boundary conditions (waveAlpha, waveVelocity) on laminar/waves/stokesI: fields, the
 # patch values the wave model assigns, its two derived constants and the ORDER it updates in, all
 # against real OpenFOAM; the control is OpenFOAM's own answer with the wave switched off.
