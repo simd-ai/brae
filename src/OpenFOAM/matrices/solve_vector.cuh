@@ -8,10 +8,15 @@
 #include "ldu_matrix.cuh"
 #include "geometric_field.cuh"
 #include "pbicgstab.cuh"
+#include "smooth_solver_cpp.cuh"
 #include "solution_directions.cuh"
 #include <vector>
 
 namespace brae {
+
+// The choice is LinearSolverChoice (smooth_solver_cpp.cuh). `smoothSolver` runs component by component,
+// as fvMatrix<vector>::solveSegregated does.
+using VectorLinearSolver = LinearSolverChoice;
 
 // `solutionD` is fvMesh::validComponents<vector>() -- polyMesh::solutionD(): given, a component it
 // knocks out (-1) is NOT solved, exactly fvMatrixSolve.C:162-164's `continue`, and its entry in
@@ -29,7 +34,8 @@ inline SolverPerformance solveVector(
     int maxIter,
     int minIter = 0,
     const SolutionDirections* solutionD = nullptr,
-    SolverPerformance* perfCmpt = nullptr)
+    SolverPerformance* perfCmpt = nullptr,
+    const VectorLinearSolver* which = nullptr)
 {
     const label nC = m.nCells();
     SolverPerformance perf;
@@ -57,7 +63,10 @@ inline SolverPerformance solveVector(
         }
         std::vector<scalar> psi(nC);
         for (label c = 0; c < nC; ++c) psi[c] = component(U.internal[c], cmpt);
-        const SolverPerformance p = pbicgstab(Mc, psi, m, patches, tolerance, relTol, maxIter, minIter);
+        const SolverPerformance p = (which && which->smoothSolver)
+            ? smoothSolver(Mc, psi, m, patches, which->symmetric, tolerance, relTol, maxIter, minIter,
+                           which->nSweeps)
+            : pbicgstab(Mc, psi, m, patches, tolerance, relTol, maxIter, minIter);
         for (label c = 0; c < nC; ++c) setComponent(U.internal[c], cmpt, psi[c]);
         if (perfCmpt) perfCmpt[cmpt] = p;
         if (cmpt == 0) perf = p;

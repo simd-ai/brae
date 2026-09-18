@@ -77,8 +77,10 @@ enum class DivScheme
     limitedLinear,    // weights from the NVDTVD limiter on magSqr(U); no correction
     limitedLinearV,   // weights from the NVDVTVDV vector limiter;  no correction
     LUST,             // weights = 0.75*linear + 0.25*upwind;       correction = 0.25*linearUpwind's
-    linearUpwindV     // weights UNCHANGED;  a DIFFERENT correction: linearUpwind's, limited so it cannot
+    linearUpwindV,    // weights UNCHANGED;  a DIFFERENT correction: linearUpwind's, limited so it cannot
                       // overshoot the owner-to-neighbour jump along its own direction (linearUpwindV.C)
+    vanLeerV,         // weights from vanLeer's limiter on the NVDVTVDV vector r; no correction, no k
+    linear            // weights = the mesh's own (central differencing); no correction
 };
 
 struct MomentumInput

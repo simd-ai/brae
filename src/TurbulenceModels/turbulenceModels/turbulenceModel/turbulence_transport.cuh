@@ -128,7 +128,10 @@ void solveScalarEqn(
     const SolveControls&        sv,
     scalar&                     residualOut,
     const std::string&          dumpPrefix,
-    bool                        gs);
+    bool gs,
+    // the solve WHOLE -- initial residual, final residual, iteration count -- which is what OpenFOAM's
+    // log prints and so what a solver-log gate compares. Null = not kept.
+    DeviceSolverPerf* perfOut = nullptr);
 
 // bnd[f] = field[bndCell[f]] on every boundary face `wfMask` marks, and nothing elsewhere: the one
 // assignment the epsilon and omega wall functions make to their own patches inside updateCoeffs

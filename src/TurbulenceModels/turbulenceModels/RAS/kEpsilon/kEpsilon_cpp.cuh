@@ -55,6 +55,7 @@
 #include "fvm.cuh"
 #include "fvc.cuh"
 #include "fv_matrix_ops.cuh"
+#include "smooth_solver_cpp.cuh"   // LinearSolverChoice, SolverPerformance
 #include <vector>
 
 namespace brae {
@@ -69,6 +70,11 @@ struct KEResiduals
     scalar epsilon = 0;
     scalar k = 0;
     label  wallCells = 0;
+    // The two solves WHOLE -- initial residual, final residual, iteration count -- which is what
+    // OpenFOAM's log prints per solve and so what a solver-log gate compares. `epsilon` and `k` above
+    // are the initial residuals alone and predate these.
+    SolverPerformance epsPerf;
+    SolverPerformance kPerf;
     // Per-cell |b - A.psi| for the epsilon equation, so the residual can be located rather than only
     // measured. A residual concentrated at the wall means the wall treatment; at the inlet or outlet, a
     // boundary condition; spread through the interior, the operator.
@@ -135,6 +141,16 @@ struct Compressible
     const std::vector<scalar>*              nu       = nullptr;   // cells, mu/rho; null => the scalar nu
     const std::vector<std::vector<scalar>>* nuBnd    = nullptr;
     const SurfaceScalarField*               phiByRho = nullptr;   // VOLUMETRIC flux, for divU only
+    // THE FLUX A FLUX-CONDITIONAL PATCH LOOKS UP, when that is not the equation's own. inletOutlet
+    // reads the registry's `phi` (inletOutletFvPatchField.C, phiName_ default "phi"). In rhoSimpleFoam
+    // that IS the mass flux the equation convects with, so null -- the equation's flux -- is right.
+    // In interFoam's `density variable` lineage the equation convects with rhoPhi, and rhoPhi is NOT
+    // rho*phi at the moment the closure runs: the ALPHA step built it from the phi the time step
+    // started on, and the pressure correctors have moved phi since. An earlier version of this note
+    // argued the two must share a sign wherever rho_b > 0; measured on RAS/damBreak at step one,
+    // rhoPhi is exactly 0 on all 46 atmosphere faces (the case starts at rest) while phi is not, and
+    // handing the patches rhoPhi is 4.9e-04 of U after five steps.
+    const SurfaceScalarField* bcPhi = nullptr;
     // fvm::ddt(alpha, rho, k|epsilon) (kEpsilon.C:254,275): rDeltaT = 1/deltaT under Euler, 0 under
     // steadyState (the term vanishes). rhoOld is rho.oldTime() -- see StepInput::firstIteration for
     // which rho that is; psi.oldTime() is the field at entry, before the wall function writes it.
@@ -248,7 +264,12 @@ void correct(
     // the entry NAMES (0 => unlimited Gauss linear), which is not grad(<field>)'s -- see
     // FieldDivScheme::luGradName. Appended after nutSel for the same reason everything else was.
     bool   linearUpwind  = false,
-    scalar luGradK       = 0.0);
+    scalar luGradK = 0.0,
+    // THE CASE'S LINEAR SOLVER for both equations. Null keeps PBiCGStab, which every caller before
+    // interFoam ran; interFoam's tutorials name `smoothSolver; symGaussSeidel;` for k and epsilon, and
+    // a substituted solver at the same tolerance stops somewhere else (measured three times in the
+    // interFoam port: p_rgh, alpha, U). Last, so no positional caller moves.
+    const LinearSolverChoice* which = nullptr);
 
 } // namespace kEpsilonRef
 } // namespace cpu

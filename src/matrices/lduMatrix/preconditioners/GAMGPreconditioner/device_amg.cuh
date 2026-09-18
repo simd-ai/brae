@@ -342,6 +342,11 @@ scalar deviceSymGaussSeidel(const DeviceLduView& A, const DeviceBuffer<scalar>& 
                             const scalar* dNormFactor, scalar tol, scalar relTol, int maxIter,
                             DeviceSolverPerf* perf = nullptr, int minIter = 0, int nSweeps = 1, bool symmetric = true);
 
+// Which sweep deviceSymGaussSeidel runs in THIS process: OpenFOAM's sequential one on the CPU (the
+// default, by measurement) or the level-scheduled device loop (BRAE_GS_HOST_SMOOTHER=0). Both are the
+// same arithmetic; an identity gate needs to know which of them it compared.
+bool deviceGaussSeidelUsesHostSmoother();
+
 // The components of ONE vector matrix, solved together (item 60a): their systems share topology, upper
 // and lower; each has its own folded diagonal, source, normFactor, residual, sweep count and stop. One
 // level walk per sweep updates every still-active component, so the per-level latency is paid once.

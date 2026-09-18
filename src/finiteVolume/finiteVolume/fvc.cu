@@ -423,11 +423,53 @@ SurfaceScalarField interpolate(
     return sf;
 }
 
+SurfaceVectorField interpolate(
+    const std::vector<vector>& cells,
+    const std::vector<std::vector<vector>>& boundary,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    const label nIf = m.nInternalFaces();
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    const std::vector<scalar>& w = g.weights();
+    SurfaceVectorField out;
+    out.internal.resize(static_cast<std::size_t>(nIf));
+    for (label f = 0; f < nIf; ++f)
+    {
+        // surfaceInterpolationScheme::interpolate: w*vf[own] + (1 - w)*vf[nei], per component
+        const vector& uo = cells[own[f]];
+        const vector& un = cells[nei[f]];
+        out.internal[f] = vector{
+            w[f]*uo.x + (scalar(1) - w[f])*un.x,
+            w[f]*uo.y + (scalar(1) - w[f])*un.y,
+            w[f]*uo.z + (scalar(1) - w[f])*un.z};
+    }
+    out.boundary.resize(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        out.boundary[pi] = pi < boundary.size()
+            ? boundary[pi]
+            : std::vector<vector>(static_cast<std::size_t>(patches[pi].size), vector{0, 0, 0});
+    }
+    return out;
+}
+
 std::vector<scalar> div(
     const SurfaceScalarField& phi,
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& patches)
+{
+    return div(phi, m, patches, g.V());
+}
+
+std::vector<scalar> div(
+    const SurfaceScalarField& phi,
+    const PrimitiveMesh& m,
+    const std::vector<FvPatch>& patches,
+    const std::vector<scalar>& Vsc)
 {
     const label nC = m.nCells(), nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
@@ -446,7 +488,7 @@ std::vector<scalar> div(
             d[patches[pi].faceCells[i]] += phi.boundary[pi][i];
     }
     for (label c = 0; c < nC; ++c)
-        d[c] /= g.V()[c];
+        d[c] /= Vsc[c];
     return d;
 }
 

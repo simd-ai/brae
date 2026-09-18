@@ -129,6 +129,12 @@ struct PatchFieldData
     scalar         vfUniformValue   = 0;
     std::vector<scalar> vfValues;
 
+    // alphaContactAngle (interFoam). theta0 in DEGREES, < 0 when the patch is not one; `limit` is the
+    // word as written, because it selects between four different evaluate() bodies and defaulting it
+    // would run a different one from the case's.
+    scalar         contactTheta0 = -1;
+    std::string    contactLimit;
+
     bool           hasGradient    = false;
     bool           gradientUniform = false;
     T              gradientUniformValue{};
@@ -157,6 +163,12 @@ struct PatchFieldData
     // does not implement. Recorded so it can be refused by name instead of silently running low-speed.
     std::string    psiName      = "none";
     scalar         gammaTP      = 1.0;
+    // `phi <name>;` -- the flux a flux-conditional condition looks up (totalPressure, inletOutlet,
+    // pressureInletOutletVelocity and their relatives all carry a phiName_, default "phi"). It is a
+    // FIELD NAME, not a number, and a solver with more than one flux can be asked for the other:
+    // interFoam's solitaryGrimshaw, solitaryMcCowan and mangroveInteraction write `phi rhoPhi;` on
+    // their totalPressure top. This entry was skipped with every other unknown key.
+    std::string phiName = "phi";
     // flowRateInletVelocity (OF flowRateInletVelocityFvPatchVectorField). OF selects the branch by which
     // key is present: "volumetricFlowRate" -> volumetric_ = true; otherwise "massFlowRate" (default
     // rhoName "rho"). rhoInlet is only the FALLBACK used when the rho field is not registered -- in
@@ -774,6 +786,16 @@ inline FieldData<T> readField(const std::string& path)
                         else             p.ablC2 = v;
                         ts.expect(";");
                     }
+                    else if (key == "theta0")
+                    {
+                        p.contactTheta0 = ts.nextScalar();
+                        ts.expect(";");
+                    }
+                    else if (key == "limit")
+                    {
+                        p.contactLimit = ts.next();
+                        ts.expect(";");
+                    }
                     else if ((key == "kappa" || key == "Cmu") && p.hasABL)
                     {
                         const scalar v = ts.nextScalar();
@@ -1147,6 +1169,11 @@ inline FieldData<T> readField(const std::string& path)
                     {
                         const std::string w = ts.next();
                         p.extrapolateProfile = (w == "true" || w == "yes" || w == "on" || w == "1");
+                        ts.expect(";");
+                    }
+                    else if (key == "phi")    // the flux a flux-conditional condition looks up, by NAME
+                    {
+                        p.phiName = ts.next();
                         ts.expect(";");
                     }
                     else if (key == "psi")    // totalPressure: selects OF's isentropic branch when != none

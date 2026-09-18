@@ -76,6 +76,13 @@ struct KEpsilonInput
     const DeviceBuffer<scalar>* phiBnd      = nullptr;
     const DeviceBuffer<scalar>* phiByRhoInt = nullptr;   // VOLUMETRIC flux -- divU ONLY
     const DeviceBuffer<scalar>* phiByRhoBnd = nullptr;
+    // THE FLUX A FLUX-CONDITIONAL PATCH LOOKS UP, when that is not the equation's own -- the host
+    // reference's Compressible::bcPhi. inletOutlet reads the registry's `phi`. In rhoSimpleFoam that IS
+    // the mass flux above, so null (the equation's flux) is right. In interFoam's `density variable`
+    // lineage the equation convects with rhoPhi, which the ALPHA step built from the phi the time step
+    // started on; `phi` has been through the pressure correctors since. Measured on RAS/damBreak at
+    // step one: rhoPhi is exactly 0 on all 46 atmosphere faces (phi started at rest) and phi is not.
+    const DeviceBuffer<scalar>* bcPhiBnd = nullptr;
 
     // --- the compressible instantiation: alpha = 1, rho = the solver's relaxed density ---
     const DeviceBuffer<scalar>* rhoCell    = nullptr;
@@ -249,6 +256,9 @@ struct KEpsilonStages
     scalar epsResidual = 0.0;
     scalar kResidual   = 0.0;
     label  wallCells   = 0;
+    // the two solves whole, for a solver-log gate; the two residuals above are their initial ones
+    DeviceSolverPerf epsPerf;
+    DeviceSolverPerf kPerf;
 };
 
 // Stage 1: gradU, gByNu, divU, divPhi and G. Touches no matrix. G is left PRE-wall, which is the state

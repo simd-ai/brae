@@ -354,7 +354,15 @@ inline FieldGradScheme parseNamedGradScheme(const std::string& caseDir, const st
 }
 
 
-inline FieldDivScheme parseFieldDivScheme(const std::string& caseDir, const std::string& field, bool vectorField = false)
+// `fluxName` is the flux the equation is WRITTEN with, which is part of the dictionary key: interFoam's
+// `density variable` turbulence convects k with rhoPhi and looks up `div(rhoPhi,k)`, where every other
+// caller's key is `div(phi,<field>)`. The two are different entries and a case names the one its
+// lineage reads -- RAS/damBreak ships div(rhoPhi,k) and no div(phi,k) at all.
+inline FieldDivScheme parseFieldDivScheme(
+    const std::string& caseDir,
+    const std::string& field,
+    bool vectorField = false,
+    const std::string& fluxName = "phi")
 {
     // Same source as parseFvSchemesControls: $-expanded, so `div(phi,tracer0) $turbulence;` resolves.
     const std::string all = readFvSchemesText(caseDir);
@@ -363,7 +371,7 @@ inline FieldDivScheme parseFieldDivScheme(const std::string& caseDir, const std:
     // first and misreports why a lookup failed -- every fvSchemes has several `default` lines.
     std::string raw = fvSchemesBlock(all, "divSchemes");
     if (raw.empty()) raw = all;
-    const std::string key = "div(phi," + field + ")";
+    const std::string key = "div(" + fluxName + "," + field + ")";
 
     // Find the statement for this field: from the key to its terminating ';'.
     const std::size_t k = raw.find(key);
@@ -788,6 +796,38 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                 // Found by the coverage manifest, not by a case: `vanAlbada` appeared as a type the
                 // tutorials DEMAND and brae never names in a quoted comparison, which is exactly the
                 // signature of a control that is plumbed but never selected.
+                // interFoam's alpha transport. Two entries, two different jobs: div(phi,alpha) carries
+                // the VoF field and every tutorial limits it with vanLeer, while div(phirb,alpha) is the
+                // INTERFACE COMPRESSION flux and every tutorial leaves it linear. Getting either wrong
+                // changes where the interface sits, so neither is substituted silently.
+                if (inDiv && ln.find("div(phi,alpha)") != std::string::npos)
+                {
+                    const std::string sw = divSchemeWord(ln);
+                    ctl.foundDivAlpha = true;
+                    if      (sw == "vanLeer")   ctl.divAlphaTwoByk = scalar(-1.0);          // kVanLeerTwoByk
+                    else if (sw == "vanAlbada") ctl.divAlphaTwoByk = scalar(0.0);
+                    else if (sw == "limitedLinear")
+                    {
+                        const scalar t = limitedTwoByk(ln);
+                        ctl.divAlphaTwoByk = (t > 0.0) ? t : scalar(2.0);
+                    }
+                    else if (!sw.empty())
+                        throw std::runtime_error(
+                            "brae: div(phi,alpha) scheme 'Gauss " + sw + "' is not implemented (brae has "
+                            "`vanLeer`, `vanAlbada` and `limitedLinear <k>`). This entry limits the VoF "
+                            "transport itself, so running another limiter moves the interface:\n  " + ln);
+                }
+                if (inDiv && ln.find("div(phirb,alpha)") != std::string::npos)
+                {
+                    const std::string sw = divSchemeWord(ln);
+                    ctl.foundDivAlphaRb = true;
+                    if (sw == "linear") ctl.divAlphaRbLinear = true;
+                    else if (!sw.empty())
+                        throw std::runtime_error(
+                            "brae: div(phirb,alpha) scheme 'Gauss " + sw + "' is not implemented (brae has "
+                            "`linear`, which is what every interFoam tutorial names). This entry is the "
+                            "INTERFACE COMPRESSION flux, not the transport:\n  " + ln);
+                }
                 if (inDiv && ln.find("div(phi,sigma)") != std::string::npos)
                 {
                     const std::string sw = divSchemeWord(ln);

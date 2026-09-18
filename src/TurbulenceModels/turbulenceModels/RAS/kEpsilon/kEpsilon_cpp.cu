@@ -245,7 +245,8 @@ void correct(
     int    minIter,
     const NutWallSelection* nutSel,
     bool   linearUpwind,
-    scalar luGradK)
+    scalar luGradK,
+    const LinearSolverChoice* which)
 {
     if (linearUpwind && limitedLinear)
         throw std::runtime_error(
@@ -270,6 +271,19 @@ void correct(
                                  : fvc::div(phi, m, g, patches);
     const std::vector<scalar> divPhi =
         (comp && comp->phiByRho) ? fvc::div(phi, m, g, patches) : divU;
+
+    // the flux inletOutlet and its relatives look up -- see Compressible::bcPhi
+    const SurfaceScalarField& patchFlux = (comp && comp->bcPhi) ? *comp->bcPhi : phi;
+    // the case's linear solver for both equations -- see the `which` parameter
+    auto solveScalar = [&](const FvScalarMatrix& A, std::vector<scalar>& psi)
+    {
+        if (which && which->smoothSolver)
+        {
+            return smoothSolver(A, psi, m, patches, which->symmetric, tol, relTol, maxIter, minIter,
+                                which->nSweeps);
+        }
+        return pbicgstab(A, psi, m, patches, tol, relTol, maxIter, minIter);
+    };
 
     // alpha*rho on a cell: 1 in the incompressible lineage.
     auto rhoAt = [&](label c) { return (comp && comp->rho) ? (*comp->rho)[c] : scalar(1.0); };
@@ -441,7 +455,7 @@ void correct(
             // (kEpsilon.C:102-108 getOrAddToDict; dimensionedType.C:389 adds the default). So the dict
             // always has it, and a patch `Cmu` entry is dead under this model.
             epsilon.boundary[pi]->updateTurbulentInlet({}, k.boundary[pi]->value(), co.Cmu, true);
-            epsilon.boundary[pi]->updateFromFlux(phi.boundary[pi]);
+            epsilon.boundary[pi]->updateFromFlux(patchFlux.boundary[pi]);
         }
 
         FvScalarMatrix M = divWithScheme(phi, epsilon, limitedLinear, limiterCoeff, limGradK, m, g, patches,
@@ -532,7 +546,32 @@ void correct(
         // An earlier version of this note said the discriminating fixture "does not exist yet". It did;
         // it was simply not under validation/, and saying it did not exist is what kept the number at
         // 2.1e-01 unmeasured for as long as it was.
-        if (relaxEquationEps) relaxMatrix(M, epsilon, m, patches, relaxEps);
+        if (relaxEquationEps)
+        {
+            // epsilonWallFunction IS A fixedValue PATCH in OpenFOAM
+            // (epsilonWallFunctionFvPatchScalarField.H:97-99), so when relax() runs its faces still
+            // carry the laplacian's fixedValue coefficient ic = gamma_b*deltaCoeffs*magSf, and relax()
+            // leaves max(|D0 + ic|, sumOff)/alpha - ic on the diagonal (fvMatrix.C relax():
+            // += cmptMax(cmptMag(iCoeffs)), /= alpha, -= cmptMin(iCoeffs)). brae's factory maps the
+            // patch to zeroGradient, so ic was 0 here and the diagonal came out D0/alpha. The rows
+            // concerned are exactly the ones setValues pins next -- it zeroes these coefficients again
+            // and writes source = value*D -- so the SOLUTION cannot see the difference. The diagonal
+            // survives into normFactor, though: measured on interFoam's RAS/damBreak at relaxation
+            // 0.7, epsilon agreed with OpenFOAM to 1e-13 while every one of its initial and final
+            // residuals sat 1.1e-04 away, and k's -- kqRWallFunction IS zeroGradient -- at 1e-13.
+            // A residual is what the stopping rule reads, so it decides where a solve stops. With a
+            // factor of 1 the two expressions are equal, which is why no unrelaxed gate saw it.
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                if (!epsilon.boundary[pi]->isTurbulenceWallFunction()) continue;
+                for (label i = 0; i < patches[pi].size; ++i)
+                {
+                    M.internalCoeffs[pi][i] +=
+                        Df.boundary[pi][i] * patches[pi].deltaCoeffs[i] * patches[pi].magSf[i];
+                }
+            }
+            relaxMatrix(M, epsilon, m, patches, relaxEps);
+        }
         // THE WALL VALUE IS READ FROM THE FIELD, at the moment the wall pass runs -- OpenFOAM's
         // epsilonWallFunction::manipulateMatrix is
         // `matrix.setValues(patch().faceCells(), patchInternalField())`
@@ -598,8 +637,12 @@ void correct(
         {
             captureSystem(M, patches, res->epsD, res->epsSrc, &res->epsUpper, &res->epsLower);
         }
-        const SolverPerformance p = pbicgstab(M, epsilon.internal, m, patches, tol, relTol, maxIter, minIter);
-        if (res) res->epsilon = p.initialResidual;
+        const SolverPerformance p = solveScalar(M, epsilon.internal);
+        if (res)
+        {
+            res->epsilon = p.initialResidual;
+            res->epsPerf = p;
+        }
 
         // Foam::bound(epsilon_, epsilonMin_): a cell that solved NEGATIVE takes its neighbours'
         // average, not a floor. Inert under upwind convection, which does not produce one -- see
@@ -636,7 +679,7 @@ void correct(
         {
             // turbulentIntensityKineticEnergyInlet reads U's patch values (and no Cmu at all).
             k.boundary[pi]->updateTurbulentInlet(U.boundary[pi]->value(), {}, co.Cmu, true);
-            k.boundary[pi]->updateFromFlux(phi.boundary[pi]);
+            k.boundary[pi]->updateFromFlux(patchFlux.boundary[pi]);
         }
 
         FvScalarMatrix M = divWithScheme(phi, k, limitedLinear, limiterCoeff, limGradK, m, g, patches,
@@ -697,8 +740,12 @@ void correct(
         {
             captureSystem(M, patches, res->kD, res->kSrc, &res->kUpper, &res->kLower);
         }
-        const SolverPerformance p = pbicgstab(M, k.internal, m, patches, tol, relTol, maxIter, minIter);
-        if (res) res->k = p.initialResidual;
+        const SolverPerformance p = solveScalar(M, k.internal);
+        if (res)
+        {
+            res->k = p.initialResidual;
+            res->kPerf = p;
+        }
 
         k.evaluateBoundary();
         bound(k, co.kMin, m, g, patches, "k");   // Foam::bound(k_, kMin_)

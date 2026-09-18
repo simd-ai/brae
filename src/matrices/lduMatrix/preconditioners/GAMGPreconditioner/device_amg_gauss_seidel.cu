@@ -739,6 +739,17 @@ bool hostSmootherSelected()
     }();
     return on;
 }
+}   // namespace
+
+// For a gate that has to PROVE which sweep ran: the mode is fixed at first use from
+// BRAE_GS_HOST_SMOOTHER, so a test that sets the variable and then asks gets the truth, where one that
+// only sets it is trusting that nothing solved first.
+bool deviceGaussSeidelUsesHostSmoother()
+{
+    return hostSmootherSelected();
+}
+
+namespace {
 void announceHostSmoother(int nComp)
 {
     static bool announced = false;

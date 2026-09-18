@@ -73,6 +73,27 @@ struct MomentumInput
     const DeviceBuffer<scalar>* nuEffFace = nullptr;     // internal faces (interpolated)
     const DeviceBuffer<scalar>* nuEffBndFace = nullptr;  // boundary faces -- the PATCH value, not the cell's
     scalar relaxU = 1.0;
+    // THE GUARD IS "THE CASE NAMES A FACTOR", NOT "THE FACTOR IS BELOW 1". relaxEquation() FINDS
+    // `equations { ".*" 1; }` -- damBreak's fvSolution says exactly that -- and relax(1) still runs the
+    // diagonal-dominance clamp D = max(|D|, sumOff)/alpha (fvMatrix.C:1102-1107). Skipping relax at
+    // alpha == 1 would differ from OpenFOAM on every shipped interFoam tutorial. It defaults to false,
+    // which leaves simpleFoam on the `0 < relaxU < 1` condition it has always used.
+    bool   relaxEquation = false;
+
+    // interFoam's fvm::ddt(rho, U), Euler: rho on the DIAGONAL and rho.oldTime() in the SOURCE, which
+    // at a VoF interface differ by a factor of 1000. Added BEFORE relax(), as the matrix constructor's
+    // `+` does. All null means a steady equation, which is what simpleFoam has.
+    // U's STORED boundary values, one buffer per component. OF's fvc::grad(U) inside
+    // linearViscousStress reads U.boundaryField() -- the value the LAST evaluate left -- and does not
+    // re-derive it. Null makes deviceDivDevReff re-derive with deviceBCValue, which is the same number
+    // only while the caller evaluates U's boundary the same way; at a flux-conditional patch like
+    // damBreak's pressureInletOutletVelocity atmosphere it is not.
+    const DeviceBuffer<scalar>* const* UbStored = nullptr;
+
+    const DeviceBuffer<scalar>* ddtRho    = nullptr;
+    const DeviceBuffer<scalar>* ddtRhoOld = nullptr;
+    const DeviceBuffer<scalar>* ddtUOld[3] = {nullptr, nullptr, nullptr};
+    scalar ddtDeltaT = 0;
     bool   bounded = false;   // `bounded Gauss <scheme>`: diag -= V*div(phi); see UEqn_cpp.cuh
     // `Gauss linearUpwind grad(U)`: the matrix stays pure upwind and the whole scheme is a deferred
     // source correction -- see UEqn_cpp.cuh. Unlike `bounded` it does NOT vanish at convergence.

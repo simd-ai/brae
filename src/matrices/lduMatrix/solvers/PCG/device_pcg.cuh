@@ -47,9 +47,39 @@ bool normFactorOnHost();                    // BRAE_NORMFACTOR_HOST=1: the point
 void announceNormFactorMode();              // once per process, from every pointer-taking solver entry
 
 
+// `precon` non-null replaces the Jacobi step with diluApply, which the caller must have brought up to
+// date with diluUpdate for THIS matrix. Prefer deviceDICPCG below, which does both.
 DeviceSolverPerf deviceJacobiPCG(const DeviceLduView& A, const DeviceBuffer<scalar>& b,
                                  DeviceBuffer<scalar>& psi, scalar normFactor,
-                                 scalar tol, scalar relTol, int maxIter, int minIter = 0);
+                                 scalar tol, scalar relTol, int maxIter, int minIter = 0,
+                                 const DeviceDilu* precon = nullptr);
+
+// `solver PCG; preconditioner DIC;` -- OpenFOAM's own pair, and what every interFoam tutorial names for
+// p_rgh. THE HEADER OF THIS FILE USED TO CALL DIC "a later phase" because its sweeps are sequential; the
+// level-scheduled DILU in device_dilu.cuh already solved that, exactly, and DIC IS that DILU on a
+// symmetric matrix. DICPreconditioner.C and DILUPreconditioner.C are the same two functions with
+// `lower` replaced by `upper`: the same face order, the same multiplication order, the same divisions.
+// tests/test_device_dic.cu holds the device sweep BIT-IDENTICAL to a transcription of DIC's loops.
+//
+// WHY IT IS NOT A TUNING KNOB. At a loose relTol the iterate depends on which preconditioner left it
+// there. interFoam's p_rgh runs at relTol 0.05 on all but the last corrector, and with the device on
+// its own solver it sat 9.2e-04 of |U| from OpenFOAM on capillaryRise at the case's tolerances while
+// agreeing to 3.5e-08 with every solve tightened -- the whole gap was where the solve stopped.
+//
+// DIC READS ONLY `upper`, as OpenFOAM's does: a symmetric lduMatrix has no lower at all
+// (lduMatrix::lower() returns upper). The view handed to the sweep and to Amul therefore aliases
+// lower to upper, so a caller's stale or differently-rounded `lower` buffer cannot enter the solve.
+// `dic` carries the level schedule (mesh-only, build once with buildDeviceDilu) and is updated here.
+DeviceSolverPerf deviceDICPCG(
+    const DeviceLduView& A,
+    const DeviceBuffer<scalar>& b,
+    DeviceBuffer<scalar>& psi,
+    scalar normFactor,
+    scalar tol,
+    scalar relTol,
+    int maxIter,
+    int minIter,
+    DeviceDilu& dic);
 
 // Jacobi-preconditioned BiCGStab for the NON-symmetric momentum matrix (upwind convection -> upper!=lower).
 // Same recurrence as brae::pbicgstab; device-resident.

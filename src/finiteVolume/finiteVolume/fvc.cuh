@@ -19,6 +19,12 @@ struct SurfaceScalarField {
     std::vector<std::vector<scalar>> boundary;   // [patch][face]
 };
 
+// ...and a surfaceVectorField, laid out the same way: Uf, the face velocity of a moving mesh
+struct SurfaceVectorField {
+    std::vector<vector>              internal;
+    std::vector<std::vector<vector>> boundary;
+};
+
 namespace fvc {
 
 std::vector<vector> gaussGrad(const GeometricField<scalar>& p,
@@ -142,6 +148,15 @@ SurfaceScalarField snGrad(
     // The block's coefficient, NOT laplacianSchemes' -- these are two entries for two operators.
     scalar                        limitCoeff   = 0.0);
 
+// fvc::interpolate of a vector field with its own patch values: linear on the internal faces, the
+// patch value on a boundary face -- what createUfIfPresent.H and fvc::correctUf build Uf from.
+SurfaceVectorField interpolate(
+    const std::vector<vector>& cells,
+    const std::vector<std::vector<vector>>& boundary,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches);
+
 // interpolate a volScalarField (cell array) to faces: linear internal; boundary = cell value
 // (zeroGradient/extrapolated, as for rAU = 1/A()).
 SurfaceScalarField interpolate(const std::vector<scalar>& vol,
@@ -152,6 +167,15 @@ SurfaceScalarField interpolate(const std::vector<scalar>& vol,
 std::vector<scalar> div(const SurfaceScalarField& phi,
                         const PrimitiveMesh& m, const FvGeometry& g,
                         const std::vector<FvPatch>& patches);
+
+// fvc::surfaceIntegrate divides by mesh.Vsc(), NOT mesh.V() (fvcSurfaceIntegrate.C:77): on a moving
+// mesh inside an alpha sub-cycle that is the volume interpolated to the sub-cycle's time. `Vsc` is
+// that volume; the overload above is this one with g.V().
+std::vector<scalar> div(
+    const SurfaceScalarField& phi,
+    const PrimitiveMesh& m,
+    const std::vector<FvPatch>& patches,
+    const std::vector<scalar>& Vsc);
 
 // Boundary face gradient tensors of U (per patch), built from the cell gradient and corrected so
 // the wall-normal component equals snGrad(U) (OpenFOAM gaussGrad::correctBoundaryConditions):

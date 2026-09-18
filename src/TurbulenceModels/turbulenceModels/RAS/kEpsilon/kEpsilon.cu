@@ -464,6 +464,22 @@ __global__ void alphatKernel(
 // The wall-cell mask, from the per-wall-face cell list DeviceWallData already carries. isWallCell in
 // that struct answers "is this cell's epsilon fixed by a wall function", which is the same question --
 // it is copied rather than recomputed so the two cannot drift.
+// iC[f] += gamma_b*deltaCoeffs*magSf on the wall-function faces: the laplacian's fixedValue
+// internalCoeff, which OpenFOAM's epsilonWallFunction patch carries into relax()
+__global__ void wallLaplacianCoeffKernel(
+    int nB,
+    const label* __restrict__ wfMask,
+    const scalar* __restrict__ gammaBnd,
+    const scalar* __restrict__ deltaCoeffs,
+    const scalar* __restrict__ magSf,
+    scalar* __restrict__ iC)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= nB) return;
+    if (!wfMask[f]) return;
+    iC[f] += gammaBnd[f] * deltaCoeffs[f] * magSf[f];
+}
+
 __global__ void copyMaskKernel(int nC, const label* src, label* dst)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -726,7 +742,7 @@ void assembleEpsEqn(
         deviceUpdateTurbulentInletSecond(dbK, *in.turbInletEpsMask, *in.turbInletEpsLen,
                                          in.co.Cmu, dbEps);
     }
-    deviceUpdateInletOutlet(dbEps, *in.phiBnd);
+    deviceUpdateInletOutlet(dbEps, in.bcPhiBnd ? *in.bcPhiBnd : *in.phiBnd);
 
     assembleTransport(E, st.DepsilonEff, st.gammaEpsFace, st.gammaEpsBnd, dm, dbEps, epsilon, nut,
                       in.co.sigmaEps, in, epsBndValues, /*stageTag=*/"eps");
@@ -768,7 +784,7 @@ void assembleKEqn(
     {
         deviceUpdateTurbulentInletK(dbU, *in.turbInletKMask, *in.turbInletKInt, dbK);
     }
-    deviceUpdateInletOutlet(dbK, *in.phiBnd);
+    deviceUpdateInletOutlet(dbK, in.bcPhiBnd ? *in.bcPhiBnd : *in.phiBnd);
 
     assembleTransport(K, st.DkEff, st.gammaKFace, st.gammaKBnd, dm, dbK, k, nut, in.co.sigmaK, in, kBndValues,
                       /*stageTag=*/"k");
@@ -990,7 +1006,8 @@ void finishAndSolve(
     const KEpsilonInput&        in,
     scalar&                     residualOut,
     const std::string&          dumpPrefix,
-    bool                        gs)
+    bool gs,
+    DeviceSolverPerf* perfOut)
 {
     turbulence::SolveControls sv;
     sv.tol         = in.tol;
@@ -1004,7 +1021,7 @@ void finishAndSolve(
     sv.gsColour    = in.gsColour;
     sv.colouring   = in.colouring;
     turbulence::solveScalarEqn(M, field, dm, relaxEquation, alpha, fvoMask, fvoVal, wallMask, wallVal,
-                               sv, residualOut, dumpPrefix, gs);
+                               sv, residualOut, dumpPrefix, gs, perfOut);
 }
 
 } // namespace
@@ -1119,10 +1136,24 @@ void correct(
         //
         // wallTreatment has already written eps0 into epsilon for every wall cell, so on a case with no
         // constraint this reads exactly what it read before.
+        // epsilonWallFunction IS A fixedValue PATCH in OpenFOAM, so at relax() its faces still carry
+        // the laplacian's fixedValue coefficient and the relaxed diagonal is
+        // max(|D0 + ic|, sumOff)/alpha - ic, not D0/alpha. See kEpsilon_cpp.cu, where it was found and
+        // measured (interFoam RAS/damBreak at relaxation 0.7: epsilon equal to 1e-13 while every
+        // residual of its solve sat 1.1e-04 from OpenFOAM's). The rows are the ones setValues pins
+        // next, so only normFactor -- and so where the solve stops -- can see it.
+        if (in.relaxEquationEps && in.relaxEps > scalar(0) && dbEps.n && in.wfBndMask)
+        {
+            wallLaplacianCoeffKernel<<<nBlk(dbEps.n), TPB>>>(dbEps.n, in.wfBndMask->data(),
+                                                             st.gammaEpsBnd.data(),
+                                                             dbEps.deltaCoeffs.data(),
+                                                             dbEps.magSf.data(), E.iC.data());
+            cudaCheck(cudaGetLastError(), "kEpsilon wall laplacian coefficient");
+        }
         finishAndSolve(E, epsilon, dm, in.relaxEquationEps, in.relaxEps,
                        in.fvoEpsMask, in.fvoEpsVal,
                        &st.isWallCell, &epsilon, in, st.epsResidual,
-                       dumpDir.empty() ? std::string() : dumpDir + "eps", in.gsEps);
+                       dumpDir.empty() ? std::string() : dumpDir + "eps", in.gsEps, &st.epsPerf);
 
         boundField(epsilon, dm, dbEps, in.co.epsilonMin, "epsilon");
     }
@@ -1137,7 +1168,7 @@ void correct(
         finishAndSolve(K, k, dm, in.relaxEquationK, in.relaxK,
                        in.fvoKMask, in.fvoKVal,
                        nullptr, nullptr, in, st.kResidual,
-                       dumpDir.empty() ? std::string() : dumpDir + "k", in.gsK);
+                       dumpDir.empty() ? std::string() : dumpDir + "k", in.gsK, &st.kPerf);
 
         boundField(k, dm, dbK, in.co.kMin, "k");
     }

@@ -8,6 +8,20 @@ set -uo pipefail
 
 BRAE="${1:?usage: brae_run.sh /path/to/brae}"
 PY="${2:-python3}"
+
+# `brae job` EXECS brae-agent, and brae-agent is built only when libcurl's headers are present
+# (CMakeLists.txt gates the target on them; install.sh says so and treats its absence as non-fatal,
+# because someone building brae to run simulations does not need it). Without it every assertion below
+# fails on the same hand-over error rather than on anything this script is about. Measured on a GH200
+# with no libcurl-dev, 2026-09-16: 9 of 10 checks red, all reading
+#   "cannot start 'brae-agent', which brae needs for `brae job`".
+# A missing OPTIONAL component is a skip, not a failure -- the same rule already applied to
+# energy_bc_vs_openfoam (dumpEnergyBC) and the manifest gates (ofscan).
+if [ ! -x "$(dirname "$BRAE")/brae-agent" ]; then
+    echo "SKIP: brae-agent not built next to $BRAE (needs libcurl headers); \`brae job\` cannot run"
+    exit 77
+fi
+
 fails=0
 check() { if [ "$2" = "$3" ]; then echo "ok:   $1"; else echo "FAIL: $1"; echo "  expected: $3"; echo "  actual:   $2"; fails=$((fails+1)); fi; }
 contains() { if printf '%s' "$2" | grep -qF -- "$3"; then echo "ok:   $1"; else echo "FAIL: $1"; echo "  wanted substring: $3"; echo "  in: $2"; fails=$((fails+1)); fi; }

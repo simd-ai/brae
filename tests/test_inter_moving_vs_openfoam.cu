@@ -1,0 +1,266 @@
+// brae's interFoam on a MOVING MESH against REAL OpenFOAM's: a closed tank in solid-body motion.
+//
+// THE ORACLE is OpenFOAM's written state after exactly N identical fixed steps -- alpha, p_rgh, U,
+// the moved polyMesh/points, the face velocity Uf and the mesh flux meshPhi -- and its log's "Solving
+// for p_rgh" lines, solve by solve. The mesh motion itself is held to OpenFOAM's digits by
+// tests/test_mesh_motion_vs_openfoam.cu; this gate is about what the SOLVER does with it: the wall
+// velocity, the relative flux, the old volumes in every time derivative, Uf in ddtCorr, and the
+// pressure reference of a tank with no free surface to the outside.
+//
+// tests/interfoam_moving_vs_openfoam.sh says what each profile is for and what it measured.
+#include "primitive_mesh.cuh"
+#include "fv_geometry.cuh"
+#include "fv_patch.cuh"
+#include "foam_field_reader.cuh"
+#include "inter_driver_cpp.cuh"
+#include "device_gate_finite.cuh"
+#include "inter_solve_log.cuh"
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <regex>
+#include <sstream>
+#include <string>
+#include <vector>
+
+using namespace brae;
+using namespace brae::cpu::interFoam;
+
+namespace {
+int failures = 0;
+
+void check(
+    const char* what,
+    bool ok)
+{
+    std::printf(ok ? "  ok:   %s\n" : "  FAIL: %s\n", what);
+    if (!ok)
+    {
+        ++failures;
+    }
+}
+
+struct Diff
+{
+    scalar linf = 0;
+    scalar refMax = 0;
+    scalar rel() const
+    {
+        return linf/std::fmax(refMax, scalar(1e-300));
+    }
+};
+
+Diff compare(
+    const std::vector<scalar>& a,
+    const std::vector<scalar>& b)
+{
+    Diff d;
+    for (std::size_t i = 0; i < a.size() && i < b.size(); ++i)
+    {
+        d.linf = std::fmax(d.linf, std::fabs(a[i] - b[i]));
+        d.refMax = std::fmax(d.refMax, std::fabs(b[i]));
+    }
+    return d;
+}
+
+Diff compare(
+    const std::vector<vector>& a,
+    const std::vector<vector>& b)
+{
+    Diff d;
+    for (std::size_t i = 0; i < a.size() && i < b.size(); ++i)
+    {
+        d.linf = std::fmax(d.linf, mag(a[i] - b[i]));
+        d.refMax = std::fmax(d.refMax, mag(b[i]));
+    }
+    return d;
+}
+
+std::vector<vector> readPointsFile(const std::string& path)
+{
+    std::ifstream in(path);
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    const std::string text = buffer.str();
+    static const std::regex head(R"(\n\s*([0-9]+)\s*\n?\()");
+    std::smatch mh;
+    std::vector<vector> out;
+    if (!std::regex_search(text, mh, head)) return out;
+    const std::size_t n = static_cast<std::size_t>(std::atol(mh[1].str().c_str()));
+    const char* p = text.c_str() + mh.position(0) + mh.length(0);
+    out.reserve(n);
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        while (*p && *p != '(')
+        {
+            ++p;
+        }
+        if (!*p) break;
+        ++p;
+        char* end = nullptr;
+        vector v;
+        v.x = std::strtod(p, &end);
+        p = end;
+        v.y = std::strtod(p, &end);
+        p = end;
+        v.z = std::strtod(p, &end);
+        p = end;
+        out.push_back(v);
+    }
+    return out;
+}
+
+template <class T>
+std::vector<T> cellValues(
+    const FieldData<T>& fd,
+    label nC)
+{
+    if (fd.internalUniform)
+    {
+        return std::vector<T>(static_cast<std::size_t>(nC), fd.internalUniformValue);
+    }
+    return fd.internalField;
+}
+}   // namespace
+
+int main(
+    int argc,
+    char** argv)
+{
+    std::printf("== brae interFoam vs OpenFOAM interFoam: a moving mesh ==\n");
+    if (argc < 8)
+    {
+        std::printf("  SKIP: usage: %s <caseDir> <startDir> <ofTimeDir> <nSteps> <log> <profile> "
+                    "<staticOfTimeDir>\n", argv[0]);
+        return 77;
+    }
+    const std::string caseDir = argv[1];
+    const std::string startDir = argv[2];
+    const std::string ofDir = argv[3];
+    const label nSteps = static_cast<label>(std::atol(argv[4]));
+    const std::string logPath = argv[5];
+    const std::string profile = argv[6];
+    const std::string staticDir = argv[7];
+    std::printf("  profile: %s\n", profile.c_str());
+
+    PrimitiveMesh m;
+    m.read(caseDir + "/constant/polyMesh");
+    FvGeometry g;
+    g.build(m);
+    std::vector<FvPatch> patches = buildPatches(m, g);
+    const label nC = m.nCells();
+    MutableMesh mutableMesh;
+    mutableMesh.m = &m;
+    mutableMesh.g = &g;
+    mutableMesh.patches = &patches;
+
+    InterFields fin;
+    const RunReport r = runInterFoam(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/false, &fin,
+                                     scalar(1.0e300), nullptr, &mutableMesh);
+    // `closed*`: a closed tank whose mesh does NOT move -- the pressure reference alone
+    const bool moving = profile.rfind("closed", 0) != 0;
+    check("brae ran the same number of steps", r.steps == nSteps);
+    check("the case moves its mesh, and brae read it so", (fin.dynamicMesh != nullptr) == moving);
+    check("p_rgh needs a reference on this closed tank, and brae read it so", fin.pRef.needReference);
+    std::printf("  motion: %s; pRefCell %d, pRefValue %g\n",
+                fin.dynamicMesh ? fin.dynamicMesh->motionType().c_str() : "none",
+                (int)fin.pRef.pRefCell, (double)fin.pRef.pRefValue);
+
+    failures += brae::gatecheck::nonFinite("brae alpha", fin.alpha1.internal);
+    failures += brae::gatecheck::nonFinite("brae p_rgh", fin.p_rgh.internal);
+    failures += brae::gatecheck::nonFinite("brae U", fin.U.internal);
+
+    // THE MESH the fields sit on: brae's points at the end against OpenFOAM's written ones
+    if (moving)
+    {
+        const std::vector<vector> ofPoints = readPointsFile(ofDir + "/polyMesh/points");
+        scalar lengthScale = 0;
+        scalar dPoint = 0;
+        for (std::size_t i = 0; i < ofPoints.size() && i < m.points().size(); ++i)
+        {
+            lengthScale = std::fmax(lengthScale, mag(ofPoints[i]));
+            dPoint = std::fmax(dPoint, mag(m.points()[i] - ofPoints[i]));
+        }
+        std::printf("  points at the end: %.3e of the mesh's extent (%zu points)\n",
+                    (double)(dPoint/std::fmax(lengthScale, scalar(1e-300))), ofPoints.size());
+        check("OpenFOAM wrote the moved mesh", ofPoints.size() == m.points().size() && !ofPoints.empty());
+        check("brae's mesh ended where OpenFOAM's did", dPoint <= scalar(1e-15)*lengthScale);
+    }
+
+    // THE SOLVES: every p_rgh line, iteration counts and residuals
+    const std::vector<LinearSolveRecord> ofP = brae::gatecheck::readOfPressureSolves(logPath);
+    failures += brae::gatecheck::compareSolves("host", r.pSolves, ofP, nSteps, "p_rgh", scalar(1e-10),
+                                               scalar(1e-6));
+
+    const std::vector<scalar> ofAlpha = cellValues(readField<scalar>(ofDir + "/" + fin.alphaName), nC);
+    const std::vector<scalar> ofPrgh = cellValues(readField<scalar>(ofDir + "/p_rgh"), nC);
+    const std::vector<scalar> ofP2 = cellValues(readField<scalar>(ofDir + "/p"), nC);
+    const std::vector<vector> ofU = cellValues(readField<vector>(ofDir + "/U"), nC);
+
+    const Diff dA = compare(fin.alpha1.internal, ofAlpha);
+    const Diff dP = compare(fin.p_rgh.internal, ofPrgh);
+    const Diff dPp = compare(fin.p, ofP2);
+    const Diff dU = compare(fin.U.internal, ofU);
+    std::printf("  alpha:   Linf %.4e\n", (double)dA.linf);
+    std::printf("  p_rgh:   relative %.4e   (|p_rgh| up to %.4e)\n", (double)dP.rel(), (double)dP.refMax);
+    std::printf("  p:       relative %.4e   (|p| up to %.4e)\n", (double)dPp.rel(), (double)dPp.refMax);
+    std::printf("  U:       relative %.4e   (|U| up to %.4e)\n", (double)dU.rel(), (double)dU.refMax);
+
+    // Uf and the wall velocity, face by face, against what OpenFOAM wrote
+    if (moving)
+    {
+        const FieldData<vector> ofUf = readField<vector>(ofDir + "/Uf");
+        const FieldData<vector> ofUFd = readField<vector>(ofDir + "/U");
+        const Diff dUf = compare(fin.Uf.internal, ofUf.internalField);
+        std::printf("  Uf:      relative %.4e   (|Uf| up to %.4e)\n", (double)dUf.rel(), (double)dUf.refMax);
+        check("Uf on the internal faces is OpenFOAM's", dUf.rel() < scalar(2e-7) && !ofUf.internalField.empty());
+        scalar dWall = 0;
+        scalar wallScale = 0;
+        std::size_t nWall = 0;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (!fin.movingWallVelocityPatch[pi]) continue;
+            const PatchFieldData<vector>* b = findPatchEntry(ofUFd, patches[pi]);
+            if (!b || b->valueUniform) continue;
+            const Diff d = compare(fin.U.boundary[pi]->value(), b->values);
+            dWall = std::fmax(dWall, d.linf);
+            wallScale = std::fmax(wallScale, d.refMax);
+            nWall += b->values.size();
+        }
+        std::printf("  wall velocity: Linf %.4e on %zu moving-wall faces (|U_wall| up to %.4e)\n",
+                    (double)dWall, nWall, (double)wallScale);
+        check("the moving walls carry OpenFOAM's velocity", nWall > 0 && dWall <= scalar(1e-12)*wallScale);
+    }
+
+    // BOUNDS: see the script for what was measured
+    check("alpha agrees with OpenFOAM's absolutely", dA.linf < scalar(1e-9));
+    check("p_rgh agrees with OpenFOAM's relatively", dP.rel() < scalar(1e-8));
+    check("p agrees with OpenFOAM's relatively", dPp.rel() < scalar(1e-8));
+    check("U agrees with OpenFOAM's relatively", dU.rel() < scalar(2e-7));
+
+    // THE CONTROL, on the oracle: OpenFOAM's own answer for the same tank with the mesh held still,
+    // or -- for the closed dam -- with the other pRefValue, which moves p and nothing else
+    if (moving)
+    {
+        const Diff cU = compare(cellValues(readField<vector>(staticDir + "/U"), nC), ofU);
+        const Diff cA = compare(cellValues(readField<scalar>(staticDir + "/" + fin.alphaName), nC), ofAlpha);
+        std::printf("  CONTROL: OpenFOAM with a static mesh against OpenFOAM with the motion, U relative %.4e, "
+                    "alpha %.4e\n", (double)cU.rel(), (double)cA.linf);
+        check("the motion moves OpenFOAM's own U far more than brae is from it",
+              cU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)));
+    }
+    else
+    {
+        const Diff cP = compare(cellValues(readField<scalar>(staticDir + "/p"), nC), ofP2);
+        const Diff cU = compare(cellValues(readField<vector>(staticDir + "/U"), nC), ofU);
+        std::printf("  CONTROL: OpenFOAM with pRefValue 1e5 against OpenFOAM with 0, p relative %.4e, "
+                    "U relative %.4e\n", (double)cP.rel(), (double)cU.rel());
+        check("the reference value moves OpenFOAM's own p far more than brae is from it",
+              cP.rel() > scalar(1000)*std::fmax(dPp.rel(), scalar(1e-14)));
+        check("...and its U not at all", cU.rel() < scalar(1e-9));
+    }
+
+    std::printf("test_inter_moving_vs_openfoam: %d failures\n", failures);
+    return failures == 0 ? 0 : 1;
+}

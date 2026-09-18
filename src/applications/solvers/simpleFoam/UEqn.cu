@@ -1,5 +1,6 @@
 // CUDA implementation -- see UEqn.cuh for the provenance and the contract with the _cpp reference.
 #include "UEqn.cuh"
+#include "device_inter_ueqn.cuh"
 #include "device_blas.cuh"
 #include "device_divdevreff.cuh"
 #include "device_kepsilon.cuh"   // deviceGradUShared: grad(U) once per U state (item 65)
@@ -51,10 +52,12 @@ void assembleUEqn(
     switch (in.scheme)
     {
         case cpu::DivScheme::limitedLinearV:
+        case cpu::DivScheme::vanLeerV:
         {
             // The kernel takes CONTIGUOUS 3-arrays (it indexes U[0..2]), not an array of pointers, so
             // the components are gathered into one. Three device copies per assembly; the alternative is
-            // a second kernel signature.
+            // a second kernel signature. vanLeerV is the same NVDVTVDV r with vanLeer's limiter, which
+            // the kernel selects by the sentinel (device_mesh.cuh, kVanLeerTwoByk).
             const DeviceBuffer<scalar>* Usrc[3] = {&Ux, &Uy, &Uz};
             DeviceBuffer<scalar> Uarr[3], gx[3], gy[3], gz[3];
             const GradUMemo& gm = deviceGradUShared(dm, dbU, Ux, Uy, Uz);   // grad(U) at this U, once (item 65)
@@ -65,9 +68,10 @@ void assembleUEqn(
                 deviceCopy(gy[k], gm.gy[k]);
                 deviceCopy(gz[k], gm.gz[k]);
             }
-            deviceDivLimitedVCoeffs(dm, *in.phiInt, Uarr, gx, gy, gz,
-                                    2.0 / std::fmax(in.schemeCoeff, 1e-15),
-                                    M.diag, M.upper, M.lower);
+            const scalar twoByk = (in.scheme == cpu::DivScheme::vanLeerV)
+                ? kVanLeerTwoByk
+                : 2.0 / std::fmax(in.schemeCoeff, 1e-15);
+            deviceDivLimitedVCoeffs(dm, *in.phiInt, Uarr, gx, gy, gz, twoByk, M.diag, M.upper, M.lower);
             break;
         }
         case cpu::DivScheme::limitedLinear:
@@ -95,6 +99,15 @@ void assembleUEqn(
                                    M.diag, M.upper, M.lower);
             break;
         }
+        case cpu::DivScheme::linear:
+            // central differencing: the mesh's own weights. THIS FELL THROUGH TO `default` -- upwind
+            // -- until interFoam's driver was read: its own scheme enum has `linear` (three shipped
+            // tutorials name it for div(rhoPhi,U)) and its device mapping had no case for it, so a
+            // -device run of such a case would have convected upwind under the name `linear`. None of
+            // the three runs yet for other reasons; the dambreak gate's `linear` profile holds it now.
+            deviceDivCentralCoeffs(dm, *in.phiInt, M.diag, M.upper, M.lower);
+            break;
+
         case cpu::DivScheme::LUST:
         {
             // weights = 0.75*linear + 0.25*upwind, and the coefficients are LINEAR in the weights
@@ -153,7 +166,7 @@ void assembleUEqn(
     // (it computes -div(sigma) per volume and then subtracts it times V). So this is the source, directly.
     deviceDivDevReff(dm, dbU, Ux, Uy, Uz, *in.nuEffCell, *in.nuEffBndFace,
                      M.source[0], M.source[1], M.source[2],
-                     /*cyc*/nullptr, /*ami*/nullptr, /*proc*/nullptr, /*UbStored*/nullptr,
+                     /*cyc*/nullptr, /*ami*/nullptr, /*proc*/nullptr, in.UbStored,
                      // The gradSchemes `grad(U)` entry, which linearViscousStress.C:114's fvc::grad(U)
                      // resolves. These five arguments fell through to their defaults, so the case's
                      // limiter never reached the dev2 term on this driver -- the legacy one has passed
@@ -302,13 +315,28 @@ void assembleUEqn(
             deviceFvoPorositySource(*in.porosity, k, in.nuLaminar, dm.V, Ux, Uy, Uz, M.source[k]);
     }
 
+    // ---- fvm::ddt(rho, U), for a transient momentum equation --------------------------------
+    // BEFORE relax(), as the fvMatrix constructor's `+` puts it. rho and rho.oldTime() are separate
+    // fields on purpose -- see device_inter_ueqn.cuh.
+    if (in.ddtRho)
+    {
+        if (!in.ddtRhoOld || !in.ddtUOld[0] || !in.ddtUOld[1] || !in.ddtUOld[2])
+            throw std::runtime_error(
+                "brae momentum: a transient ddt needs rho, rho.oldTime() and all three components of "
+                "U.oldTime(). rho.oldTime() is NOT rho at a VoF interface -- they differ by the density "
+                "ratio -- so it is a separate argument and cannot be defaulted to the first.");
+        deviceInterEulerDdtRhoU(dm, *in.ddtRho, *in.ddtRhoOld,
+                                *in.ddtUOld[0], *in.ddtUOld[1], *in.ddtUOld[2], in.ddtDeltaT,
+                                M.diag, M.source[0], M.source[1], M.source[2]);
+    }
+
     // ---- UEqn.relax() -----------------------------------------------------------------------
     // OpenFOAM's fvMatrix::relax is ASYMMETRIC: it ADDS cmptMax(cmptMag(internalCoeffs)) to the diagonal
     // and REMOVES cmptMin(internalCoeffs), which are different quantities and agree only when the three
     // components are equal. Both are supplied here rather than approximated by |iC[0]|, so slip and
     // symmetry patches -- where the components genuinely differ -- stay right.
     M.relaxed = false;
-    if (in.relaxU > 0.0 && in.relaxU < 1.0)
+    if (in.relaxU > 0.0 && (in.relaxU < 1.0 || in.relaxEquation))
     {
         DeviceBuffer<scalar> iCmaxMag, iCmin;
         deviceCmptMaxMag3(M.iC[0], M.iC[1], M.iC[2], iCmaxMag);
