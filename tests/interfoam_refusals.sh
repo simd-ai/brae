@@ -254,7 +254,10 @@ BASE="$BM"
 arm moving_baseline         runs    -                        "" true
 arm moving_cellZone         refused "cellZone rotor"          "" "sed -i 's/^motionSolver .*/motionSolver    solidBody;\ncellZone        rotor;/' constant/dynamicMeshDict"
 arm moving_cellSetNone      runs    -                        "" "sed -i 's/^motionSolver .*/motionSolver    solidBody;\ncellSet         none;/' constant/dynamicMeshDict"
-arm moving_displacementLap  refused "motionSolver displacementLaplacian" "" "sed -i 's/^motionSolver .*/motionSolver    displacementLaplacian;/' constant/dynamicMeshDict"
+# displacementLaplacian is ported (tests/displacement_laplacian_vs_openfoam.sh); a motion solver that is
+# not is still refused by name, and displacementLaplacian without its mandatory diffusivity by that
+arm moving_velocityLap      refused "motionSolver velocityLaplacian" "" "sed -i 's/^motionSolver .*/motionSolver    velocityLaplacian;/' constant/dynamicMeshDict"
+arm moving_displacementLap  refused "has no \`diffusivity\`"   "" "sed -i 's/^motionSolver .*/motionSolver    displacementLaplacian;/' constant/dynamicMeshDict"
 arm moving_unknownFunction  refused "solidBodyMotionFunction \`wobble\`" "" "sed -i 's/^solidBodyMotionFunction .*/solidBodyMotionFunction wobble;/' constant/dynamicMeshDict"
 arm moving_drivenLinear     refused "drivenLinearMotion"      "" "sed -i 's/^solidBodyMotionFunction .*/solidBodyMotionFunction drivenLinearMotion;/' constant/dynamicMeshDict"
 arm moving_omegaTable       refused "Function1 \`table\`"    "" "sed -i 's/omega  *6.2832;.*/omega           table ((0 6.2832) (1 6.2832));/' constant/dynamicMeshDict"

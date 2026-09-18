@@ -1,4 +1,5 @@
 #include "gamg_solver_cpp.cuh"
+#include "foam_dict.cuh"
 #include "smooth_solver_cpp.cuh"
 #include <algorithm>
 #include <cmath>
@@ -629,6 +630,104 @@ void foldBoundary(
 }
 
 } // namespace
+
+GamgControls readGamgControls(
+    const FoamDict& d,
+    scalar tol,
+    scalar relTol,
+    int maxIter,
+    const std::string& who)
+{
+    auto switchOr = [&](const std::string& key, bool def)
+    {
+        if (!d.found(key)) return def;
+        const std::string w = d.wordOr(key, "");
+        if (w == "yes" || w == "true" || w == "on" || w == "y" || w == "t" || w == "1") return true;
+        if (w == "no" || w == "false" || w == "off" || w == "n" || w == "f" || w == "0") return false;
+        throw std::runtime_error(who + "has `" + key + " " + w + "`, which is not a Switch.");
+    };
+
+    GamgControls c;
+    c.smoother = d.wordOr("smoother", "");
+    c.tolerance = tol;
+    c.relTol = relTol;
+    c.maxIter = maxIter;
+    c.minIter = d.intOr("minIter", 0);
+    c.nPreSweeps = d.intOr("nPreSweeps", c.nPreSweeps);
+    c.preSweepsLevelMultiplier = d.intOr("preSweepsLevelMultiplier", c.preSweepsLevelMultiplier);
+    c.maxPreSweeps = d.intOr("maxPreSweeps", c.maxPreSweeps);
+    c.nPostSweeps = d.intOr("nPostSweeps", c.nPostSweeps);
+    c.postSweepsLevelMultiplier = d.intOr("postSweepsLevelMultiplier", c.postSweepsLevelMultiplier);
+    c.maxPostSweeps = d.intOr("maxPostSweeps", c.maxPostSweeps);
+    c.nFinestSweeps = d.intOr("nFinestSweeps", c.nFinestSweeps);
+    c.scaleCorrection = switchOr("scaleCorrection", true);
+    c.nCellsInCoarsestLevel = static_cast<label>(d.intOr("nCellsInCoarsestLevel", 10));
+
+    if (c.smoother.empty())
+    {
+        throw std::runtime_error(
+            who + "names no `smoother`. lduMatrix::smoother::New reads it with a mandatory lookup and "
+            "OpenFOAM stops without it.");
+    }
+    if (!gamgSmootherPorted(c.smoother))
+    {
+        throw std::runtime_error(
+            who + "asks for `smoother " + c.smoother + "`, which is not ported. brae's GAMG has DIC, "
+            "DICGaussSeidel, GaussSeidel and symGaussSeidel (gamg_solver_cpp.cuh).");
+    }
+    const std::string agglomerator = d.wordOr("agglomerator", "faceAreaPair");
+    if (agglomerator != "faceAreaPair")
+    {
+        throw std::runtime_error(
+            who + "asks for `agglomerator " + agglomerator + "`. Only faceAreaPair is ported "
+            "(pair_gamg_agglomeration_cpp.cuh); another agglomerator is another hierarchy.");
+    }
+    if (d.intOr("mergeLevels", 1) != 1)
+    {
+        throw std::runtime_error(
+            who + "asks for `mergeLevels " + std::to_string(d.intOr("mergeLevels", 1)) + "`. "
+            "pairGAMGAgglomeration then folds pairs of levels into one (combineLevels, "
+            "pairGAMGAgglomerate.C:138), which is not ported.");
+    }
+    if (d.intOr("updateInterval", 1) != 1)
+    {
+        throw std::runtime_error(
+            who + "sets `updateInterval`. faceAreaPairGAMGAgglomeration then weighs faces by magSf "
+            "rather than by the perturbed area vector whenever the time index is not a multiple of it "
+            "(faceAreaPairGAMGAgglomeration.C:66-99); only the default's branch is ported.");
+    }
+    if (!switchOr("cacheAgglomeration", true))
+    {
+        throw std::runtime_error(
+            who + "sets `cacheAgglomeration no`. The hierarchy is then rebuilt at every solve, each "
+            "time from wherever the static pairing direction was left; brae builds it once.");
+    }
+    if (switchOr("interpolateCorrection", false))
+    {
+        throw std::runtime_error(
+            who + "sets `interpolateCorrection yes` (GAMGSolverInterpolate.C), which is not ported.");
+    }
+    if (switchOr("directSolveCoarsest", false))
+    {
+        throw std::runtime_error(
+            who + "sets `directSolveCoarsest yes`. The coarsest level is then LU-factored rather than "
+            "solved by PCG to the entry's tolerance (GAMGSolver.C:303), which is not ported.");
+    }
+    if (d.subDict("coarsestLevelCorr"))
+    {
+        throw std::runtime_error(
+            who + "carries a `coarsestLevelCorr` sub-dictionary. GAMGSolver then builds the coarsest "
+            "level's solver from it (GAMGSolver.C:318) instead of PCG with DIC at the entry's own "
+            "tolerance, which is the one brae runs.");
+    }
+    if (d.found("processorAgglomerator"))
+    {
+        throw std::runtime_error(
+            who + "names a `processorAgglomerator`. This is a serial solver and the entry selects a "
+            "different coarse hierarchy in OpenFOAM's parallel runs.");
+    }
+    return c;
+}
 
 SolverPerformance gamgSolve(
     const FvScalarMatrix& M,

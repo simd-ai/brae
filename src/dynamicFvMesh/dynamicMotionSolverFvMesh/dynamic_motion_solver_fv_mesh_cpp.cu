@@ -33,42 +33,6 @@ scalar triangleSweptVol(
 
 } // namespace
 
-vector faceCentreOfPoints(
-    const PrimitiveMesh& m,
-    label f,
-    const std::vector<vector>& points)
-{
-    const label nPoints = m.faceSize(f);
-    // If the face is a triangle, do a direct calculation
-    if (nPoints == 3)
-    {
-        return (1.0/3.0)*(points[m.faceVert(f, 0)] + points[m.faceVert(f, 1)] + points[m.faceVert(f, 2)]);
-    }
-    vector centrePoint{0, 0, 0};
-    for (label pI = 0; pI < nPoints; ++pI)
-    {
-        centrePoint += points[m.faceVert(f, pI)];
-    }
-    centrePoint = centrePoint/scalar(nPoints);
-
-    scalar sumA = 0;
-    vector sumAc{0, 0, 0};
-    for (label pI = 0; pI < nPoints; ++pI)
-    {
-        const vector& thisPoint = points[m.faceVert(f, pI)];
-        const vector& nextPoint = points[m.faceVert(f, (pI + 1)%nPoints)];
-        // 3*triangle centre
-        const vector ttc = thisPoint + nextPoint + centrePoint;
-        // 2*triangle area
-        const scalar ta = mag(cross(thisPoint - centrePoint, nextPoint - centrePoint));
-        sumA += ta;
-        sumAc += ta*ttc;
-    }
-    // VSMALL
-    if (sumA > scalar(1e-300)) return sumAc/(3.0*sumA);
-    return centrePoint;
-}
-
 scalar faceSweptVolume(
     const PrimitiveMesh& m,
     label f,
@@ -131,17 +95,18 @@ std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::New(
     {
         solver = d.wordOr("solver", "");
     }
-    if (solver != "solidBody")
+    if (solver != "solidBody" && solver != "displacementLaplacian")
     {
         throw std::runtime_error(
             std::string(WHO) + "constant/dynamicMeshDict asks for `motionSolver " + solver + "`. Only "
-            "solidBody is ported -- a prescribed rigid transformation of the points. The others SOLVE "
-            "for the point motion (displacementLaplacian and its kin, from point boundary conditions) "
-            "or integrate a body's equations of motion (rigidBodyMotion, sixDoFRigidBodyMotion).");
+            "solidBody -- a prescribed rigid transformation of the points -- and displacementLaplacian "
+            "are ported. The others solve for the point motion another way (velocityLaplacian, "
+            "displacementSBRStress, ...) or integrate a body's equations of motion (rigidBodyMotion, "
+            "sixDoFRigidBodyMotion).");
     }
 
     // motionSolver::coeffDict(): optionalSubDict(typeName + "Coeffs")
-    const FoamDict& coeffs = *d.optionalSubDict("solidBodyCoeffs");
+    const FoamDict& coeffs = *d.optionalSubDict(solver + "Coeffs");
     for (const char* key : {"cellZone", "cellSet"})
     {
         const std::string name = coeffs.wordOr(key, "");
@@ -149,7 +114,7 @@ std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::New(
         if (!name.empty() && name != "none")
         {
             throw std::runtime_error(
-                std::string(WHO) + "the solidBody motion names `" + key + " " + name + "`. Only the "
+                std::string(WHO) + "the " + solver + " motion names `" + key + " " + name + "`. Only the "
                 "motion of the ENTIRE mesh is ported: moving part of one deforms the cells around it "
                 "or slides it on a coupled interface, and neither is here.");
         }
@@ -178,6 +143,12 @@ std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::New(
     }
 
     std::unique_ptr<DynamicMotionSolverFvMesh> mesh(new DynamicMotionSolverFvMesh());
+    if (solver == "displacementLaplacian")
+    {
+        mesh->displacement_ = DisplacementLaplacianFvMotionSolver::New(coeffs, caseDir, startDir);
+        mesh->motionType_ = solver;
+        return mesh;
+    }
     mesh->SBMF_ = SolidBodyMotionFunction::New(coeffs, caseDir);
     mesh->motionType_ = mesh->SBMF_->type();
     return mesh;
@@ -192,6 +163,10 @@ void DynamicMotionSolverFvMesh::attach(
     g_ = &g;
     patches_ = &patches;
     points0_ = m.points();
+    if (displacement_)
+    {
+        displacement_->attach(m, g, patches);
+    }
     oldPoints_ = m.points();
     meshPhi_.internal.assign(static_cast<std::size_t>(m.nInternalFaces()), scalar(0));
     meshPhi_.boundary.resize(patches.size());
@@ -204,7 +179,9 @@ void DynamicMotionSolverFvMesh::attach(
 void DynamicMotionSolverFvMesh::update(
     scalar time,
     scalar deltaT,
-    label timeIndex)
+    label timeIndex,
+    bool finalIteration,
+    GamgAgglomerationCache* agglomeration)
 {
     if (!attached())
     {
@@ -212,6 +189,26 @@ void DynamicMotionSolverFvMesh::update(
     }
     PrimitiveMesh& m = *m_;
     FvGeometry& g = *g_;
+
+    // motionSolver::newPoints(), evaluated before fvMesh::movePoints is entered: on the mesh as it
+    // stands. A displacement solver's GAMG hierarchy is the MESH's, shared with every other GAMG solve
+    // of the run, so the caller hands in the one it keeps.
+    std::vector<vector> newPoints;
+    if (displacement_)
+    {
+        if (!agglomeration)
+        {
+            throw std::runtime_error(
+                std::string(WHO) + "the displacementLaplacian solve needs the run's GAMG agglomeration "
+                "cache: the hierarchy is a MeshObject of the mesh, and every GAMG solve shares it.");
+        }
+        newPoints = displacement_->newPoints(time, finalIteration, m, g, *patches_, *agglomeration);
+    }
+    else
+    {
+        // solidBodyMotionSolver::curPoints, moveAllCells
+        newPoints = transformPoints(SBMF_->transformation(time), points0_);
+    }
 
     // fvMesh::movePoints: grab old time volumes if the time has been incremented
     if (!haveTimeIndex_ || curTimeIndex_ < timeIndex)
@@ -227,9 +224,6 @@ void DynamicMotionSolverFvMesh::update(
         curMotionTimeIndex_ = timeIndex;
     }
     haveTimeIndex_ = true;
-
-    // solidBodyMotionSolver::curPoints, moveAllCells
-    std::vector<vector> newPoints = transformPoints(SBMF_->transformation(time), points0_);
 
     // fvGeometryScheme::setMeshPhi
     const scalar rdt = 1.0/deltaT;
@@ -262,6 +256,14 @@ void DynamicMotionSolverFvMesh::update(
     for (std::size_t pi = 0; pi < rebuilt.size(); ++pi)
     {
         (*patches_)[pi] = rebuilt[pi];
+    }
+    // meshObject::movePoints: GAMGAgglomeration::movePoints sets requireUpdate_ whenever the time index
+    // is a multiple of updateInterval, which is 1, and the next GAMGAgglomeration::New builds the
+    // hierarchy again on the moved mesh, from wherever the static pairing direction was left
+    // (GAMGAgglomeration.C:311-330, :498-516)
+    if (agglomeration)
+    {
+        agglomeration->built = false;
     }
 }
 

@@ -2782,6 +2782,90 @@ COMPONENTS = {
                   "divides by Vsc, not V. HOST_ONLY is a finished state: the motion is mesh topology and "
                   "geometry, computed once per step; what the DEVICE loop needs is the moved geometry uploaded, "
                   "which is interFoam_dynamicMesh's target."),
+        dict(name="interFoam_displacementLaplacian", of_symbol="displacementLaplacianFvMotionSolver",
+             of_file="src/fvMotionSolver/fvMotionSolvers/displacement/laplacian/displacementLaplacianFvMotionSolver.C",
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/fvMotionSolver/fvMotionSolvers/displacement/laplacian/"
+                            "displacement_laplacian_fv_motion_solver_cpp.cuh",
+             brae_target="",
+             validation="tests/displacement_laplacian_vs_openfoam.sh: the moved polyMesh/points, the motion solver's "
+                        "cellDisplacement and pointDisplacement, meshPhi and every GAMG solve of the displacement "
+                        "equation against OpenFOAM's moveDynamicMesh run SERIALLY with a fixed deltaT, written per "
+                        "step at writePrecision 18, and V and C of the moved mesh from postProcess. SEVEN PROFILES, "
+                        "each the tutorial's own mesh and dictionaries: waveMakerPiston, waveMakerFlap (the wall "
+                        "tilts) and waveMakerSolitary (0.26 m of stroke, two blocks), 20 steps of 0.05 to t = 1, "
+                        "waveMakerMultiPaddleFlap and waveMakerMultiPaddlePiston (four paddles at 45 degrees, 3-D, "
+                        "448000 cells), 4 steps of 0.1, and the piston and the flap again with `secondOrder yes` "
+                        "staged into the paddle. MEASURED, worst of the seven: all 204 GAMG solves take "
+                        "OpenFOAM's iteration count; points 2.9e-16 of the extent; cellDisplacement and "
+                        "pointDisplacement 1.3e-14 of the largest displacement; meshPhi 2.4e-13 of the run's largest "
+                        "|meshPhi|; V 1.1e-13 relative, C 5.9e-16 of the extent. The bounds are those numbers and say why: see the note. "
+                        "THE CONTROL: the wall distance taken from rightwall instead of leftwall, 9.9e-01 of the "
+                        "displacement, which the script asserts FAILS. BROKEN ONCE EACH, as a fraction of the largest "
+                        "displacement: the paddle's values not written back over the interpolated ones 3.7e-02; y on "
+                        "the named patch the next cell's instead of the wave's SMALL 4.0e-01 and 20 of 40 counts; the "
+                        "wall distance without correctWalls 2.3e-05 (the flap only, whose wall tilts); the 2-D "
+                        "correction skipped 7.4e-02 (the solitary only); volPointInterpolation's weights made once "
+                        "6.2e-04; the diffusivity computed once 9.1e-02; the GAMG hierarchy kept from step one "
+                        "1.9e-01; the non-orthogonal correction dropped 7.9e-02. SEVEN REFUSALS asserted by name: a "
+                        "diffusivity other than inverseDistance, a cellDisplacement solver other than GAMG, a "
+                        "laplacian other than Gauss linear corrected, a point condition other than fixedValue, "
+                        "zeroGradient, empty and waveMaker, an unknown motionType, a waveMaker without `value`, and "
+                        "frozenPointsZone. NOT CLAIMED, because these meshes cannot tell: pointCells' order (the "
+                        "pointFaces walk OpenFOAM takes here and the ascending order give the same lists on a block "
+                        "mesh) and face::average against a vertex mean for cellMotion (equal on flat parallel faces); "
+                        "the Final solver entry, which moveDynamicMesh never selects; the waveMaker tutorials under "
+                        "interFoam, which still stop at correctPhi; and the device.",
+             note="ONE newPoints(), IN OpenFOAM'S ORDER, all on the mesh before the move (motionSolver.C:200-204, "
+                  "displacementLaplacianFvMotionSolver.C:199-318): the inverseDistance diffusivity 1/interpolate(y), "
+                  "y the meshWave distance to the named patches (patchWave: FaceCellWave<wallPoint> seeded with the "
+                  "patch face centres, visiting cells() in OpenFOAM's order and taking a new origin only when nearer "
+                  "by 1%, then correctBoundaryCells' exact distance for every cell touching the patches), whose "
+                  "boundary value is the wave's own on the named patches -- sqrt(0) + SMALL, so the diffusivity there "
+                  "is 1e15 -- and the next cell's elsewhere; the point conditions' updateCoeffs, each writing its "
+                  "values straight into the point field in patch order; cellMotion on every patch whose point "
+                  "condition fixes a value, the face::average of the POINT field; laplacian(diffusivity, "
+                  "cellDisplacement) Gauss linear corrected, solved component by component with GAMG from the last "
+                  "step's solution, the empty direction skipped; then volPointInterpolation -- cells to points by "
+                  "1/|p - C|, boundary faces of real patches to patch points by 1/|p - Cf|, the weights remade on "
+                  "every move -- the fixing conditions evaluated again over it, points0 + pointDisplacement, and "
+                  "twoDPointCorrector, whose plane normal is taken once and whose mid-plane is the current bounds'. "
+                  "THE GAMG SOLVE HAS TO BE OPENFOAM'S EXACTLY: the paddle's 1e15 diffusivity dominates the residual "
+                  "normalisation, the equation is declared converged after one V-cycle, and the mesh is that "
+                  "V-cycle's. The hierarchy is the mesh's MeshObject, shared with p_rgh's GAMG and rebuilt after "
+                  "each move; DynamicMotionSolverFvMesh::update takes the run's cache and invalidates it. "
+                  "AN OPEN FINDING THAT BELONGS TO THE SHARED OPERATORS: brae's fvm::laplacian forms its face "
+                  "coefficient as (deltaCoeffs*gamma)*magSf where gaussLaplacianScheme forms gammaMagSf = "
+                  "gamma*magSf first, and brae's linear interpolation is w*P + (1 - w)*N where "
+                  "surfaceInterpolationScheme::dotInterpolate is lambda*(P - N) + N. Switched to OpenFOAM's order, "
+                  "every profile of this gate is EXACT for its first four to seven steps; they are what the gate's "
+                  "bounds are. Left as they are here because every solver's laplacian and interpolation read them. "
+                  "face::centre, face::average and face::nearestPoint are src/OpenFOAM/meshes/meshShapes/face/"
+                  "face_cpp.cuh; the wave src/meshTools/cellDist/patchWave/; the interpolation "
+                  "src/finiteVolume/interpolation/volPointInterpolation/vol_point_interpolation_cpp.cuh (the older "
+                  "vol_point_interpolation.cuh, which velocityComponentLaplacian uses, was left alone). "
+                  "moveDynamicMesh does not link libwaveModels, which interFoam does: the gate's controlDict loads it."),
+        dict(name="interFoam_waveMaker", of_symbol="waveMakerPointPatchVectorField",
+             of_file="src/waveModels/derivedPointPatchFields/waveMaker/waveMakerPointPatchVectorField.C",
+             classification="HOST_ONLY", status="REIMPLEMENT",
+             brae_reference="src/waveModels/derivedPointPatchFields/waveMaker/"
+                            "wave_maker_point_patch_vector_field_cpp.cuh",
+             brae_target="",
+             validation="tests/displacement_laplacian_vs_openfoam.sh (interFoam_displacementLaplacian): the paddle is "
+                        "every profile's only moving boundary, so its displacement is the whole of the motion -- "
+                        "piston and flap, one paddle and four at 45 degrees, and the solitary stroke with its Newton "
+                        "iteration -- and the piston and the flap with `secondOrder yes` staged in, which no tutorial "
+                        "turns on. The paddle points' pointDisplacement is OpenFOAM's to the gate's 2e-14 of the "
+                        "largest displacement. NOT CLAIMED: a waveMaker without `value`, which OpenFOAM evaluates "
+                        "at construction (refused).",
+             note="updateCoeffs (waveMakerPointPatchVectorField.C:278-436): the wave length by 100 fixed-point "
+                  "iterations of L = L0 tanh(2 pi h/L), the paddle's phase its centre's position alone (wavePhase is "
+                  "read and never used), and the ramp clamp(t/rampTime, 0, 1) on the piston and the flap but not the "
+                  "solitary stroke; the flap's stroke scaled by the point's height above the patch's lowest point. "
+                  "The paddle centres and every point's paddle are taken from the patch's points at construction "
+                  "(initialiseGeometry) and never again; the reference depth on the first updateCoeffs. HOST_ONLY is "
+                  "a finished state: the condition is a function of time on the patch's points, and what the "
+                  "device needs is the moved mesh."),
         dict(name="interFoam_dynamicMesh", of_symbol="mesh.update",
              of_file="applications/solvers/multiphase/interFoam/interFoam.C",
              classification="GPU_REQUIRED", status="REIMPLEMENT",

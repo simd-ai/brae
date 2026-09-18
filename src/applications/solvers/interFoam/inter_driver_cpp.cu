@@ -174,7 +174,12 @@ RunReport runInterFoam(
                     // interFoam.C:118: on the first outer corrector, or on every one under
                     // moveMeshOuterCorrectors
                     if (outerOfStep != 0 && !f.moveMeshOuterCorrectors) break;
-                    dyn->update(rep.time, rep.deltaT, rep.steps);
+                    // pimpleControl sets "finalIteration" on the mesh before the last outer
+                    // corrector's body runs, so a displacement solve there takes the Final entry.
+                    // The GAMG hierarchy is the mesh's: a displacement solve builds it or reuses the
+                    // one p_rgh left, and the move marks it for rebuilding.
+                    const bool finalIteration = (outerOfStep >= lc.nOuterCorrectors - 1);
+                    dyn->update(rep.time, rep.deltaT, rep.steps, finalIteration, &gamgCache);
 
                     // dynamicMotionSolverFvMesh::update ends in U.correctBoundaryConditions(): a
                     // movingWallVelocity patch takes the wall's velocity from the motion of THIS
@@ -196,12 +201,6 @@ RunReport runInterFoam(
                         }
                     }
                     // the correctPhi block is refused where the case is read (InterFields::correctPhi)
-
-                    // GAMGAgglomeration is a MeshObject and movePoints() marks it for rebuilding
-                    // whenever the time index is a multiple of updateInterval, which is 1 -- so the
-                    // hierarchy is rebuilt at every step, from wherever the static pairing direction
-                    // was left (GAMGAgglomeration.C:500-517)
-                    gamgCache.built = false;
                     break;
                 }
 

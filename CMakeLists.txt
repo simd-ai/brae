@@ -99,6 +99,13 @@ add_library(brae_core STATIC
     src/matrices/lduMatrix/solvers/GAMG/GAMGAgglomerations/pair_gamg_agglomeration_cpp.cu
     src/matrices/lduMatrix/solvers/GAMG/gamg_solver_cpp.cu
     src/meshTools/solidBodyMotionFunctions/solid_body_motion_function_cpp.cu
+    src/OpenFOAM/meshes/meshShapes/face/face_cpp.cu
+    src/OpenFOAM/meshes/primitiveMesh/PrimitivePatch/primitive_patch_cpp.cu
+    src/meshTools/cellDist/patchWave/patch_wave_cpp.cu
+    src/meshTools/twoDPointCorrector/two_d_point_corrector_cpp.cu
+    src/finiteVolume/interpolation/volPointInterpolation/vol_point_interpolation_cpp.cu
+    src/waveModels/derivedPointPatchFields/waveMaker/wave_maker_point_patch_vector_field_cpp.cu
+    src/fvMotionSolver/fvMotionSolvers/displacement/laplacian/displacement_laplacian_fv_motion_solver_cpp.cu
     src/dynamicFvMesh/dynamicMotionSolverFvMesh/dynamic_motion_solver_fv_mesh_cpp.cu
     src/matrices/lduMatrix/lduMatrix/blas1.cu
     src/matrices/lduMatrix/lduMatrix/reductions.cu
@@ -3397,6 +3404,15 @@ target_include_directories(test_mesh_motion_vs_openfoam PRIVATE ${BRAE_HEADER_DI
 target_link_libraries(test_mesh_motion_vs_openfoam PRIVATE brae_core)
 add_test(NAME mesh_motion_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mesh_motion_vs_openfoam.sh)
+
+# ...and a DEFORMING one: displacementLaplacian from the waveMaker paddles, the points, the motion
+# solver's two fields, meshPhi and every GAMG solve against OpenFOAM's moveDynamicMesh, per time step.
+add_executable(test_displacement_laplacian_vs_openfoam tests/test_displacement_laplacian_vs_openfoam.cu)
+target_include_directories(test_displacement_laplacian_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_displacement_laplacian_vs_openfoam PRIVATE brae_core)
+add_test(NAME displacement_laplacian_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/displacement_laplacian_vs_openfoam.sh)
 
 # ...and interFoam ON a mesh in solid-body motion: a closed tank, against OpenFOAM's fields, its moved
 # mesh, its Uf and its wall velocity, with the same tank held still as the control.

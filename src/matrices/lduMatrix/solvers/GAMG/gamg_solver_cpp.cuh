@@ -51,6 +51,7 @@
 // solver differ), interpolateCorrection, directSolveCoarsest, a coarsestLevelCorr sub-dictionary,
 // and any smoother but DIC, DICGaussSeidel, GaussSeidel and symGaussSeidel.
 #include "cf_types.cuh"
+#include "foam_dict.cuh"
 #include "fv_patch.cuh"
 #include "ldu_matrix.cuh"
 #include "pair_gamg_agglomeration_cpp.cuh"
@@ -119,6 +120,15 @@ struct GamgPreconditionerControls
 
 // True for the smoothers gamgSolve runs. The reader refuses the rest by name.
 bool gamgSmootherPorted(const std::string& smoother);
+
+// An fvSolution GAMG entry: the controls GAMGSolver reads, and a refusal, by name, of every one that
+// selects a branch brae does not have. `who` opens each message -- the solver and field the entry is for.
+GamgControls readGamgControls(
+    const FoamDict& d,
+    scalar tol,
+    scalar relTol,
+    int maxIter,
+    const std::string& who);
 
 // What OpenFOAM prints under `DebugSwitches { GAMG 1; }`: the coarsest-level solve of every V-cycle
 struct GamgSolveLog

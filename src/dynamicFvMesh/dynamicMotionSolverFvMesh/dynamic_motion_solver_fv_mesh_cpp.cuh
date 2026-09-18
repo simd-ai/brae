@@ -1,6 +1,8 @@
 #pragma once
-// OpenFOAM's dynamicMotionSolverFvMesh with the solidBody motion solver, the host reference: what
-// mesh.update() does to the mesh, and everything a solver then reads from a mesh that has moved.
+// OpenFOAM's dynamicMotionSolverFvMesh with the solidBody or the displacementLaplacian motion solver,
+// the host reference: what mesh.update() does to the mesh, and everything a solver then reads from a
+// mesh that has moved. The displacement solver is its own file,
+// src/fvMotionSolver/fvMotionSolvers/displacement/laplacian/.
 //
 // provenance:
 //   openfoam:  src/dynamicFvMesh/dynamicFvMesh/dynamicFvMeshNew.C:65-128 (no dictionary: static)
@@ -15,7 +17,8 @@
 //              src/OpenFOAM/meshes/polyMesh/polyMesh.C (movePoints, oldPoints)
 //              src/OpenFOAM/meshes/meshShapes/face/face.C:513-563 (centre), :656-730 (sweptVol)
 //              src/OpenFOAM/meshes/primitiveShapes/triangle/triangleI.H:386-401 (sweptVol)
-//   tests:     tests/test_mesh_motion_vs_openfoam.cu, against the polyMesh/points and meshPhi
+//   tests:     tests/test_mesh_motion_vs_openfoam.cu and tests/test_displacement_laplacian_vs_openfoam.cu,
+//              against the polyMesh/points and meshPhi
 //              OpenFOAM writes per time step and the V and C its postProcess writes from them
 //
 // THE ORDER INSIDE ONE update(), which is fvMesh::movePoints':
@@ -36,11 +39,15 @@
 // swept_volume.cuh uses a third arrangement of the same cross product; this file transcribes face.C.
 //
 // NOT PORTED, refused by name where the dictionary is read: every dynamicFvMesh but
-// dynamicMotionSolverFvMesh (and staticFvMesh, which is no motion); every motionSolver but solidBody;
+// dynamicMotionSolverFvMesh (and staticFvMesh, which is no motion); every motionSolver but solidBody
+// and displacementLaplacian;
 // a `cellZone` or `cellSet` (the motion of part of a mesh deforms the cells around it, and the
 // interFoam tutorial that asks for one slides it on an AMI); a `points0` file; and a start from a
 // time directory that carries its own polyMesh/points.
 #include "cf_types.cuh"
+#include "displacement_laplacian_fv_motion_solver_cpp.cuh"
+#include "face_cpp.cuh"
+#include "gamg_solver_cpp.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "fvc.cuh"
@@ -52,12 +59,8 @@
 
 namespace brae {
 
-// face::centre(points) and face::sweptVol(oldPoints, newPoints), for face f of the mesh's topology
-vector faceCentreOfPoints(
-    const PrimitiveMesh& m,
-    label f,
-    const std::vector<vector>& points);
-
+// face::sweptVol(oldPoints, newPoints), for face f of the mesh's topology (face::centre is
+// face_cpp.cuh's faceCentreOfPoints)
 scalar faceSweptVolume(
     const PrimitiveMesh& m,
     label f,
@@ -98,11 +101,15 @@ public:
         return m_ != nullptr;
     }
 
-    // mesh.update() at the new time
+    // mesh.update() at the new time. finalIteration is PIMPLE's "finalIteration" flag, which selects
+    // the displacement equation's Final solver entry; agglomeration is the run's GAMG hierarchy, which a
+    // displacement solver shares with every other GAMG solve and which a move invalidates.
     void update(
         scalar time,
         scalar deltaT,
-        label timeIndex);
+        label timeIndex,
+        bool finalIteration = false,
+        GamgAgglomerationCache* agglomeration = nullptr);
 
     // polyMesh::moving(): false until the first update
     bool moving() const
@@ -112,6 +119,11 @@ public:
     const std::string& motionType() const
     {
         return motionType_;
+    }
+    // the displacementLaplacian solver, or null for a solid-body motion
+    const DisplacementLaplacianFvMotionSolver* displacementSolver() const
+    {
+        return displacement_.get();
     }
     const std::vector<vector>& points0() const
     {
@@ -143,6 +155,7 @@ private:
     FvGeometry* g_ = nullptr;
     std::vector<FvPatch>* patches_ = nullptr;
     std::unique_ptr<SolidBodyMotionFunction> SBMF_;
+    std::unique_ptr<DisplacementLaplacianFvMotionSolver> displacement_;
     std::string motionType_;
     std::vector<vector> points0_;
     std::vector<vector> oldPoints_;
