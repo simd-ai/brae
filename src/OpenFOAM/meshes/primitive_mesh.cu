@@ -273,7 +273,62 @@ void PrimitiveMesh::readBoundary(const std::string& dir)
         while (ts.peek() != "}")
         {
             const std::string key = ts.next();
-            if      (key == "scale")
+            if      (key == "scale" && ts.peek() == "{")
+            {
+                // THE DICTIONARY FORM, `scale { type coded; code #{ ... #}; }`. OpenFOAM reads `scale` as a
+                // PatchFunction1 (cyclicACMIPolyPatch.C:625), so the selector may sit inside a block, and
+                // RAS/damBreakLeakage writes a per-face coded one there. This branch took `{` for the
+                // selector word and the parse died on "expected ';' got 'type'", naming nothing. `constant`
+                // and `table` are read as their inline forms are; any other type reaches the refusal below
+                // under its own name.
+                ts.expect("{");
+                while (ts.peek() != "}")
+                {
+                    const std::string k2 = ts.next();
+                    if (k2 == "type")
+                    {
+                        acmiScaleType = ts.next();
+                        ts.expect(";");
+                    }
+                    else if (k2 == "value" && ts.peek() != "{")
+                    {
+                        acmiScaleConst = ts.nextScalar();
+                        ts.expect(";");
+                    }
+                    else if (k2 == "values")
+                    {
+                        acmiScaleTable = readAcmiScaleTable(ts);
+                        ts.expect(";");
+                    }
+                    else if (ts.peek() == "{")
+                    {
+                        ts.expect("{");
+                        for (int depth = 1; depth > 0; )
+                        {
+                            const std::string t = ts.next();
+                            if (t == "{")
+                            {
+                                ++depth;
+                            }
+                            else if (t == "}")
+                            {
+                                --depth;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        while (ts.peek() != ";")
+                        {
+                            ts.next();
+                        }
+                        ts.expect(";");
+                    }
+                }
+                ts.expect("}");
+                continue;
+            }
+            else if (key == "scale")
             {
                 acmiScaleType = ts.next();
                 // `scale constant 0.5;` carries its value inline; `scale table;` defers to scaleCoeffs.

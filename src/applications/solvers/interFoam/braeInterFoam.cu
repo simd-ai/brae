@@ -13,6 +13,8 @@
 // WHAT IT RUNS TURBULENT: RAS kEpsilon, host and `-device`, in both of interFoam's lineages -- the
 // ordinary single-phase model, and under `density variable` the rho-weighted one
 // (inter_turbulence_cpp.cuh; device_inter_turbulence.cuh for what the device closure is handed).
+// And RAS kOmegaSST, on the HOST and in the ordinary lineage only: RAS/waterChannel, gated in
+// tests/interfoam_waterchannel_vs_openfoam.sh. `-device` refuses it by name.
 // An earlier version of this header said interFoam's turbulence "is a MIXTURE model, not the
 // single-phase one brae has". That was written from memory and is wrong for 15 of the 17 turbulent
 // tutorials: incompressibleInterPhaseTransportModel.C:99-106 constructs the ordinary one by default.
@@ -59,7 +61,7 @@
 // `Gauss linear` on the device fell through a switch's default to upwind until this was wired.
 //
 // WHAT IT WILL NOT RUN. Every refusal the components carry is in force: LES and every RASModel but
-// kEpsilon, `limitedLinear` on div(rhoPhi,U),
+// kEpsilon and kOmegaSST, `limitedLinear` on div(rhoPhi,U),
 // any ddtSchemes default but Euler, MRF, fvOptions, and a case that
 // omits nAlphaCorr, nAlphaSubCycles, cAlpha, maxAlphaCo or -- under MULESCorr -- nLimiterIter. Each
 // throws by name.

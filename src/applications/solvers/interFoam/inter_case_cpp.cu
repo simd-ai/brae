@@ -4,9 +4,11 @@
 #include "inter_peqn_cpp.cuh"
 #include "brae_notice.cuh"
 #include "foam_field_reader.cuh"
+#include "mrf_read.cuh"   // readCellZones
 #include "read_surface_field.cuh"
 #include "scheme_parse.cuh"
 #include <filesystem>
+#include <map>
 
 namespace brae {
 namespace cpu {
@@ -207,21 +209,8 @@ void refuseUnportedCaseInputs(
     // constant/dynamicMeshDict is read by DynamicMotionSolverFvMesh::New in buildInterFields, which
     // refuses by name every motion that is not the rigid motion of the whole mesh.
 
-    // createMRF.H -> IOMRFZoneList (READ_IF_PRESENT); a zone is active unless it says otherwise
-    // (MRFZone.C:248, :553).
-    const std::string mrf = caseDir + "/constant/MRFProperties";
-    if (std::filesystem::exists(mrf))
-    {
-        const FoamDict d = readDict(mrf);
-        for (const auto& z : d.subs)
-        {
-            const std::string a = z.second.wordOr("active", "true");
-            if (a == "false" || a == "no" || a == "off" || a == "0") continue;
-            throw std::runtime_error(
-                "brae interFoam: constant/MRFProperties has an active zone `" + z.first + "`. MRF adds "
-                "a Coriolis source to UEqn and makes every flux relative; none of that is ported here.");
-        }
-    }
+    // constant/MRFProperties is read in buildInterFields (createMRF.H), which ports it and refuses by
+    // name what no gate holds: MRF under a moving mesh, under RAS, and beside a fixedFluxPressure patch.
 
     // createFvOptions.H -> fv::options::createIOobject (fvOptions.C:46-84): constant/ FIRST, then
     // system/. An option is active unless it says otherwise (fvOption.C:72).
@@ -916,7 +905,7 @@ InterFields buildInterFields(const std::string&          caseDir,
     // lineage that calls it -- evaluates the nut wall functions with the mixture's nu at the wall.
     f.turbulence = readInterTurbulence(caseDir, startDir, fvSolution, f.ddtU == DdtScheme::Euler,
                                        f.laplacianScheme.corrected, f.laplacianScheme.limitCoeff,
-                                       patches, nC);
+                                       patches, nC, &m, &g);
     if (f.turbulence.on && !f.pimple.turbOnFinalIterOnly && f.pimple.nOuterCorrectors > 1)
         throw std::runtime_error(
             "brae interFoam: `turbOnFinalIterOnly no` with nOuterCorrectors "
@@ -924,6 +913,46 @@ InterFields buildInterFields(const std::string&          caseDir,
             "inside a time step. The second call needs k.oldTime() and the non-Final solver entries, "
             "which this port does not carry; no shipped tutorial sets it.");
     validateInterTurbulence(f.turbulence, f.U, f.nu, f.nuBnd, m, g, patches);
+
+    // createMRF.H -> IOMRFZoneList (READ_IF_PRESENT); a zone is active unless it says otherwise
+    // (MRFZone.C:248, :553). createFields.H:129 constructs it AFTER everything above, and nothing here
+    // applies it: MRF.correctBoundaryVelocity(U) is UEqn.H's first line, not createFields'.
+    {
+        const std::vector<MRF::ZoneSpec> specs = MRF::readMRFProperties(caseDir + "/constant");
+        if (!specs.empty())
+        {
+            const std::map<std::string, std::vector<label>> zoneMap =
+                readCellZones(caseDir + "/constant/polyMesh");
+            for (const MRF::ZoneSpec& sp : specs)
+            {
+                const auto it = zoneMap.find(sp.cellZone);
+                if (it == zoneMap.end())
+                    throw std::runtime_error(
+                        "brae interFoam: MRF cellZone `" + sp.cellZone + "` is not in "
+                        "constant/polyMesh/cellZones. OpenFOAM stops on this (MRFZone.C:258-266).");
+                f.mrfZones.push_back(MRF::buildZone(sp, it->second, m, patches));
+            }
+        }
+    }
+    if (!f.mrfZones.empty() && f.dynamicMesh)
+        throw std::runtime_error(
+            "brae interFoam: the case has an active MRF zone AND a moving mesh. MRF.update() rebuilds "
+            "the zone's face lists when the topology changes and makeRelative composes with the mesh "
+            "flux (interFoam.C:128, pEqn.H:19-24); no shipped tutorial pairs them and no gate holds it.");
+    if (!f.mrfZones.empty() && f.turbulence.on)
+        throw std::runtime_error(
+            "brae interFoam: the case has an active MRF zone AND is turbulent. The one shipped MRF "
+            "tutorial, laminar/mixerVessel2D, is laminar, so no gate holds the closure in a rotating "
+            "frame against OpenFOAM. Refused rather than run ungated.");
+    for (std::size_t pi = 0; pi < patches.size() && !f.mrfZones.empty(); ++pi)
+    {
+        if (!f.p_rgh.boundary[pi]->updateableSnGrad()) continue;
+        throw std::runtime_error(
+            "brae interFoam: the case has an active MRF zone AND p_rgh patch `" + patches[pi].name
+            + "` is a fixedFluxPressure. constrainPressure(p_rgh, U, phiHbyA, rAUf, MRF) subtracts "
+            "MRF.relative(Sf & U_b) there (constrainPressureI.H), and this port's subtracts Sf & U_b; "
+            "mixerVessel2D's walls are zeroGradient, so nothing gates the difference.");
+    }
     if (f.dynamicMesh && f.turbulence.on)
     {
         throw std::runtime_error(

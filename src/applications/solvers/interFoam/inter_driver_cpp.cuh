@@ -54,6 +54,8 @@ struct RunReport
     // ...and the closure's two, one each per time step, on a RAS case: epsilon first, as kEpsilon.C
     // solves them
     std::vector<LinearSolveRecord> epsilonSolves;
+    // kOmegaSST's first solve in place of epsilon's
+    std::vector<LinearSolveRecord> omegaSolves;
     std::vector<LinearSolveRecord> kSolves;
     // ...and, where p_rgh names GAMG, what OpenFOAM prints under its own debug switches: the
     // hierarchy (cells, faces and lduAddressing::band()'s profile per level, the mesh first) and the

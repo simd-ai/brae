@@ -111,6 +111,53 @@ int main()
         }
     }
 
+    // ---- 2b. THE DICTIONARY FORM: `scale { type coded; ... }` is refused BY NAME, and the same form
+    // holding a table is read. OpenFOAM reads `scale` as a PatchFunction1 (cyclicACMIPolyPatch.C:625);
+    // RAS/damBreakLeakage writes a coded one, and the parser died there on "expected ';' got 'type'".
+    {
+        writeBoundary(dir,
+            "        scale\n        {\n            type            coded;\n"
+            "            name            leak;\n            sub { a 1; }\n        }\n",
+            "cyclicACMI");
+        PrimitiveMesh m;
+        bool named = false;
+        try
+        {
+            m.readBoundary(dir);
+        }
+        catch (const std::exception& e)
+        {
+            named = std::string(e.what()).find("`scale coded`") != std::string::npos;
+            std::printf("  scale { type coded; }: %s\n", e.what());
+        }
+        if (!named)
+        {
+            std::printf("  FAIL a coded scale block is not refused under its own name\n");
+            ++failures;
+        }
+        writeBoundary(dir,
+            "        scale\n        {\n            type            table;\n"
+            "            values          3((0 1)(0.2 1)(0.3 0));\n        }\n",
+            "cyclicACMI");
+        PrimitiveMesh m2;
+        try
+        {
+            m2.readBoundary(dir);
+            const bool ok = m2.patches().size() == 2
+                         && std::fabs(m2.patches()[1].acmiScale.value(0.25) - 0.5) < 1e-12;
+            if (!ok)
+            {
+                std::printf("  FAIL scale { type table; values ...; } does not read as the inline table does\n");
+                ++failures;
+            }
+        }
+        catch (const std::exception& e)
+        {
+            std::printf("  FAIL scale { type table; } threw (%s)\n", e.what());
+            ++failures;
+        }
+    }
+
     // ---- 3. VACUITY GUARD: without the block, the same cyclicACMI patch must parse fine ----
     {
         writeBoundary(dir, "", "cyclicACMI");

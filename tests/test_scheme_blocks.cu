@@ -324,6 +324,54 @@ int main()
         }
     }
 
+    // ---- A PATTERN KEY names the scheme: fvSchemes is a dictionary, and OpenFOAM looks a scheme up as
+    // it looks anything up -- the literal key, else the last pattern that matches. interFoam's
+    // RAS/waterChannel writes `"div\(phi,(k|omega)\)" Gauss upwind;` under `default none`, and the
+    // per-field parser, which searched the text for the literal key, refused the case.
+    {
+        const std::string dir = tmp + "/patternKey";
+        std::filesystem::create_directories(dir + "/system");
+        std::ofstream(dir + "/system/fvSchemes")
+            << "ddtSchemes { default Euler; }\n"
+            << "gradSchemes { default Gauss linear; }\n"
+            << "divSchemes\n{\n    default none;\n"
+            << "    div(phi,k) bounded Gauss limitedLinear 1;\n"
+            << "    \"div\\(phi,(k|omega)\\)\" Gauss upwind;\n}\n"
+            << LAP_ORTHOGONAL;
+        bool omegaOk = false;
+        try
+        {
+            const FieldDivScheme fo = parseFieldDivScheme(dir, "omega");
+            omegaOk = !fo.bounded && !fo.limited && !fo.linearUpwind;
+        }
+        catch (const std::exception& e)
+        {
+            std::printf("  div(phi,omega) through the pattern threw: %s\n", e.what());
+        }
+        checkFlag("div(phi,omega) resolves through \"div\\(phi,(k|omega)\\)\" to plain upwind", omegaOk, true);
+        bool literalWins = false;
+        try
+        {
+            const FieldDivScheme fk = parseFieldDivScheme(dir, "k");
+            literalWins = fk.bounded && fk.limited;
+        }
+        catch (const std::exception&)
+        {
+        }
+        checkFlag("...and the LITERAL div(phi,k) wins over the pattern that also matches it", literalWins, true);
+        bool refused = false;
+        try
+        {
+            parseFieldDivScheme(dir, "epsilon");
+        }
+        catch (const std::exception&)
+        {
+            refused = true;
+        }
+        checkFlag("...while div(phi,epsilon), which no key names, is still refused under `default none`",
+                  refused, true);
+    }
+
     std::printf("scheme_blocks: %d failures\n", failures);
     return failures ? 1 : 0;
 }

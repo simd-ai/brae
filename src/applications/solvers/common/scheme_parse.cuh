@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <map>
+#include <regex>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -375,7 +376,49 @@ inline FieldDivScheme parseFieldDivScheme(
 
     // Find the statement for this field: from the key to its terminating ';'.
     const std::size_t k = raw.find(key);
+    // A PATTERN KEY, when no literal one names the field. fvSchemes is a dictionary and OpenFOAM looks
+    // a scheme up as it looks anything up: the literal key, else the LAST pattern that matches
+    // (dictionarySearch.C, csearch). RAS/waterChannel writes
+    //     "div\(phi,(k|omega)\)"      Gauss upwind;
+    // and this parser, which searches the text for the literal key, refused the case as having no
+    // div(phi,k) under `default none`.
+    std::string patternStatement;
     if (k == std::string::npos)
+    {
+        std::size_t pos = 0;
+        while (pos < raw.size())
+        {
+            const std::size_t semi = raw.find(';', pos);
+            if (semi == std::string::npos)
+            {
+                break;
+            }
+            std::size_t q0 = pos;
+            while (q0 < semi && std::isspace(static_cast<unsigned char>(raw[q0])))
+            {
+                ++q0;
+            }
+            const std::size_t q1 = (q0 < semi && raw[q0] == '"') ? raw.find('"', q0 + 1) : std::string::npos;
+            if (q1 != std::string::npos && q1 < semi)
+            {
+                bool matches = false;
+                try
+                {
+                    matches = std::regex_match(key, compileFoamRegex(raw.substr(q0 + 1, q1 - q0 - 1)));
+                }
+                catch (...)
+                {
+                }
+                if (matches)
+                {
+                    // the key in the pattern's place, so everything below reads one shape of statement
+                    patternStatement = key + raw.substr(q1 + 1, semi - q1 - 1);
+                }
+            }
+            pos = semi + 1;
+        }
+    }
+    if (k == std::string::npos && patternStatement.empty())
     {
         // OF: `default none` means an unlisted scheme is a fatal error, not a silent fallback.
         const std::size_t d = raw.find("default");
@@ -391,8 +434,10 @@ inline FieldDivScheme parseFieldDivScheme(
             "brae: fvSchemes divSchemes has no `" + key + "` entry and brae does not resolve the "
             "divSchemes `default`; add the entry explicitly.");
     }
-    const std::size_t end = raw.find(';', k);
-    const std::string st = raw.substr(k, end == std::string::npos ? std::string::npos : end - k);
+    const std::size_t end = (k == std::string::npos) ? std::string::npos : raw.find(';', k);
+    const std::string st = !patternStatement.empty()
+                         ? patternStatement
+                         : raw.substr(k, end == std::string::npos ? std::string::npos : end - k);
 
     FieldDivScheme fs;
     divSchemesConsumed().insert(key);   // recorded here too: the tracer's own div(phi,<field>)

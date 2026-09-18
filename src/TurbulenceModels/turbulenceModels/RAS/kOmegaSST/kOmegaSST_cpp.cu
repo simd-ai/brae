@@ -213,14 +213,19 @@ std::vector<std::vector<scalar>> F1Boundary(
         if (p.type == "wall" || p.type == "empty") continue;   // wall: y = 0 -> arg1 = 10 -> F1 = 1
         const std::vector<scalar>& kb = k.boundary[pi]->value();
         const std::vector<scalar>& ob = omega.boundary[pi]->value();
+        // THE PATCH'S OWN snGrad(), which is what gaussGrad::correctBoundaryConditions asks for
+        // (gaussGrad.C:164-168) -- see correctNutField, where the inline (value - cell)*deltaCoeffs
+        // cost interFoam's waterChannel its whole atmosphere
+        const std::vector<scalar> snKPatch = k.boundary[pi]->snGrad(k.internal);
+        const std::vector<scalar> snOPatch = omega.boundary[pi]->snGrad(omega.internal);
         for (label i = 0; i < p.size; ++i)
         {
             const label c = p.faceCells[i];
             if (!(ob[i] > 0.0) || !(y[c] > 0.0)) continue;
             // The Gauss gradients' boundary values: gb = gc + n*(snGrad - n&gc), for k and omega.
             const vector& n = p.nf[i];
-            const scalar snK = (kb[i] - k.internal[c]) * p.deltaCoeffs[i];
-            const scalar snO = (ob[i] - omega.internal[c]) * p.deltaCoeffs[i];
+            const scalar snK = snKPatch[i];
+            const scalar snO = snOPatch[i];
             const vector& gKc = gradK[c];
             const vector& gOc = gradOmega[c];
             const scalar nK = n.x*gKc.x + n.y*gKc.y + n.z*gKc.z;
@@ -327,8 +332,19 @@ void correct(
     const Compressible*            comp,
     int                            minIter,
     bool                           relaxEquationOmega,
-    bool                           relaxEquationK)
+    bool                           relaxEquationK,
+    const LinearSolverChoice*      which)
 {
+    // the case's linear solver for both equations -- see the `which` parameter
+    auto solveScalar = [&](const FvScalarMatrix& A, std::vector<scalar>& psi)
+    {
+        if (which && which->smoothSolver)
+        {
+            return smoothSolver(A, psi, m, patches, which->symmetric, tol, relTol, maxIter, minIter,
+                                which->nSweeps);
+        }
+        return pbicgstab(A, psi, m, patches, tol, relTol, maxIter, minIter);
+    };
     if (co.F3)
         throw std::runtime_error(
             "kOmegaSST_cpp: the F3 near-wall switch is set. kOmegaSSTBase multiplies F23 by F3 "
@@ -484,14 +500,15 @@ void correct(
         // cell and left k 1e-06 off while p, T, U and the second scalar sat at 1e-12; on kOmegaSST it
         // compounded into a 1e-03 trajectory drift by iteration 10.
         const std::vector<scalar>& nutw = nutField.boundary[pi]->value();
-        const std::vector<vector>& Uw = U.boundary[pi]->value();
+        // mag(Uw.snGrad()), the wall patch's own (omegaWallFunctionFvPatchScalarField.C:253)
+        const std::vector<vector> snUw = U.boundary[pi]->snGrad(U.internal);
         for (label i = 0; i < wp.size; ++i)
         {
             const label c = wp.faceCells[i];
             const scalar w = 1.0 / nw[c], kc = k.internal[c];
             const scalar omegaVis = 6.0*nuFace[i]/(co.beta1*yw[i]*yw[i]);
             const scalar omegaLog = std::sqrt(kc)/(Cmu25*co.kappa*yw[i]);
-            const scalar magGradUw = mag((Uw[i] - U.internal[c]) * wp.deltaCoeffs[i]);
+            const scalar magGradUw = mag(snUw[i]);
             om0[c] += w * std::sqrt(omegaVis*omegaVis + omegaLog*omegaLog);
             G0[c]  += w * (nutw[i] + nuFace[i]) * magGradUw * Cmu25 * std::sqrt(kc) / (co.kappa * yw[i]);
         }
@@ -713,8 +730,12 @@ void correct(
         setValues(M, omega.internal, m, patches, wallCells, omVals);
         if (res && res->captureStages)
             captureSSTSystem(M, patches, res->omD, res->omSrc, &res->omUpper, &res->omLower);
-        const SolverPerformance po = pbicgstab(M, omega.internal, m, patches, tol, relTol, maxIter, minIter);
-        if (res) res->omega = po.initialResidual;
+        const SolverPerformance po = solveScalar(M, omega.internal);
+        if (res)
+        {
+            res->omega = po.initialResidual;
+            res->omegaPerf = po;
+        }
         if (std::getenv("BRAE_SST_DEBUG"))
             std::printf("    [omega] init=%.3e final=%.3e nIter=%d\n",
                         po.initialResidual, po.finalResidual, po.nIterations);
@@ -827,8 +848,12 @@ void correct(
         if (relaxEquationK) relaxMatrix(M, k, m, patches, relaxK);
         if (res && res->captureStages)
             captureSSTSystem(M, patches, res->kD, res->kSrc, &res->kUpper, &res->kLower);
-        const SolverPerformance pk = pbicgstab(M, k.internal, m, patches, tol, relTol, maxIter, minIter);
-        if (res) res->k = pk.initialResidual;
+        const SolverPerformance pk = solveScalar(M, k.internal);
+        if (res)
+        {
+            res->k = pk.initialResidual;
+            res->kPerf = pk;
+        }
         if (std::getenv("BRAE_SST_DEBUG"))
             std::printf("    [k] init=%.3e final=%.3e nIter=%d\n",
                         pk.initialResidual, pk.finalResidual, pk.nIterations);
@@ -905,7 +930,15 @@ void correctNutField(
 
         const std::vector<scalar>& kb = k.boundary[pi]->value();
         const std::vector<scalar>& ob = omega.boundary[pi]->value();
-        const std::vector<vector>& ub = U.boundary[pi]->value();
+        // THE PATCH'S OWN snGrad(): gaussGrad::correctBoundaryConditions replaces the boundary
+        // gradient's normal component with `vsf.boundaryField()[patchi].snGrad()` (gaussGrad.C:164-168),
+        // and that is a virtual. On a directionMixed patch it is built from the valueFraction and the
+        // cell, NOT from the stored value: interFoam's waterChannel opens its top through a
+        // pressureInletOutletVelocity whose file value is (0 0 0) over cells moving at (1 0 0), with a
+        // valueFraction of zero at construction, so OpenFOAM's snGrad there is 0 and its nut k/omega =
+        // 3.33e-02, where (value - cell)*deltaCoeffs read a shear of 1/d and gave 3.7e-05 -- the whole
+        // patch 100% out, and the first p_rgh residual 7.1e-03 with it.
+        const std::vector<vector> snU = U.boundary[pi]->snGrad(U.internal);
         std::vector<scalar> vals(patches[pi].size);
         for (label i = 0; i < patches[pi].size; ++i)
         {
@@ -920,7 +953,7 @@ void correctNutField(
             const scalar gc[9] = { t.xx, t.xy, t.xz, t.yx, t.yy, t.yz, t.zx, t.zy, t.zz };
             const vector& n = patches[pi].nf[i];
             const scalar nv[3] = { n.x, n.y, n.z };
-            const vector sng = (ub[i] - U.internal[c]) * patches[pi].deltaCoeffs[i];
+            const vector sng = snU[i];
             const scalar sn[3] = { sng.x, sng.y, sng.z };
 
             scalar ngc[3];

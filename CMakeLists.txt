@@ -3387,6 +3387,23 @@ target_link_libraries(test_inter_ras_dambreak_vs_openfoam PRIVATE brae_core)
 add_test(NAME interfoam_ras_dambreak_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_ras_dambreak_vs_openfoam.sh)
 
+# ...and kOmegaSST, on RAS/waterChannel as shipped: the ordinary incompressible model handed the
+# mixture's nu, the cell wall distance, omega and nutk wall functions, and a convection scheme named
+# through a pattern key. The control is OpenFOAM's own laminar run; the device loop must refuse by name.
+add_executable(test_inter_waterchannel_vs_openfoam tests/test_inter_waterchannel_vs_openfoam.cu)
+target_include_directories(test_inter_waterchannel_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_waterchannel_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_waterchannel_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_waterchannel_vs_openfoam.sh)
+
+# ...whose first run found pressureInletOutletVelocity's snGrad() reading the stored value where
+# OpenFOAM's directionMixed builds it from the valueFraction and the cell. Held on its own here.
+add_executable(test_piov_sngrad tests/test_piov_sngrad.cu)
+target_include_directories(test_piov_sngrad PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_piov_sngrad PRIVATE brae_core)
+add_test(NAME piov_sngrad COMMAND test_piov_sngrad)
+
 # ...and the wave boundary conditions (waveAlpha, waveVelocity) on laminar/waves/stokesI: fields, the
 # patch values the wave model assigns, its two derived constants and the ORDER it updates in, all
 # against real OpenFOAM; the control is OpenFOAM's own answer with the wave switched off.

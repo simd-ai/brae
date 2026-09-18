@@ -543,6 +543,12 @@ RunReport runInterFoam(
                         msc.solutionD = &solD;
                         msc.solveLog = rep.uSolves;
                     }
+                    // MRF.correctBoundaryVelocity(U), UEqn.H:1 -- before the matrix reads U's patches
+                    if (!f.mrfZones.empty())
+                    {
+                        MRF::correctBoundaryVelocity(f.U, f.mrfZones, patches);
+                        mi.mrf = &f.mrfZones;
+                    }
                     FvVectorMatrix UEqn;
                     momentumPredictor(f.U, mi, force, msc, m, g, patches,
                                       f.momentumPredictorOn, UEqn);
@@ -560,6 +566,7 @@ RunReport runInterFoam(
                     pin.rhoPhi = &f.rhoPhi;
                     pin.taps = pressureTaps;
                     pin.solveLog = &rep.pSolves;
+                    pin.mrf = f.mrfZones.empty() ? nullptr : &f.mrfZones;
                     pin.meshPhi = dyn ? &dyn->meshPhi() : nullptr;
                     pin.Uf = dyn ? &f.Uf : nullptr;
                     // pEqn.H:4, rAU.ref() = 1/UEqn.A(): kept for the next mesh update's CorrectPhi
@@ -625,6 +632,7 @@ RunReport runInterFoam(
                     ti.nuBnd = &f.nuBnd;
                     ti.deltaT = rep.deltaT;
                     ti.epsilonLog = &rep.epsilonSolves;
+                    ti.omegaLog = &rep.omegaSolves;
                     ti.kLog = &rep.kSolves;
                     correctInterTurbulence(f.turbulence, ti, m, g, patches);
                     break;

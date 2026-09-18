@@ -52,6 +52,7 @@
 #include "fvm.cuh"
 #include "fvc.cuh"
 #include "fv_matrix_ops.cuh"
+#include "smooth_solver_cpp.cuh"   // LinearSolverChoice, SolverPerformance
 #include <vector>
 
 namespace brae {
@@ -151,6 +152,11 @@ void correctNutField(
 struct SSTResiduals
 {
     scalar omega = 0, k = 0;
+    // The two solves WHOLE -- initial residual, final residual, iteration count -- which is what
+    // OpenFOAM's log prints per solve and so what a solver-log gate compares. `omega` and `k` above are
+    // the initial residuals alone and predate these.
+    SolverPerformance omegaPerf;
+    SolverPerformance kPerf;
 
     // OPT-IN diagnostics, compared against tools/dumpKOmegaSST's stage_sst* writes. The solver asks for
     // the residuals every outer iteration and would otherwise pay to copy every intermediate with them.
@@ -258,7 +264,12 @@ void correct(
     // 1.0 still applies the dominance clamp. Defaulted true so every positional caller keeps its
     // arithmetic; the compressible driver passes what the case says. Same shape as kEpsilon_cpp.
     bool                           relaxEquationOmega = true,
-    bool                           relaxEquationK = true);
+    bool                           relaxEquationK = true,
+    // THE CASE'S LINEAR SOLVER for both equations, as kEpsilon_cpp takes it. Null keeps PBiCGStab,
+    // which every caller before interFoam ran; interFoam's waterChannel names `smoothSolver;
+    // symGaussSeidel;` for k and omega, and a substituted solver at the same tolerance stops somewhere
+    // else. Last, so no positional caller moves.
+    const LinearSolverChoice*      which = nullptr);
 
 } // namespace kOmegaSST
 } // namespace cpu

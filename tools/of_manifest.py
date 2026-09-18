@@ -2493,6 +2493,51 @@ COMPONENTS = {
                   "reporting for the log arm, and the wall coefficient in relax(). A nut wall function on a patch "
                   "that is not a `wall` is refused on both paths, as OpenFOAM's nutWallFunction::checkType refuses "
                   "it."),
+        dict(name="interFoam_kOmegaSST", of_symbol="kOmegaSSTBase",
+             of_file="src/TurbulenceModels/turbulenceModels/Base/kOmegaSST/kOmegaSSTBase.C",
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/kOmegaSST_cpp.cuh",
+             validation="tests/interfoam_waterchannel_vs_openfoam.sh, real OpenFOAM on RAS/waterChannel AS SHIPPED "
+                        "(its own 28000-cell blockMesh + two extrudeMesh passes, non-orthogonal to 13.7 degrees), "
+                        "ten fixed steps of the tutorial's deltaT 0.1. MEASURED: all 20 p_rgh, 10 alpha, 10 omega and "
+                        "10 k iteration counts OpenFOAM's, initial residuals within 9.3e-13; alpha 7.9e-13, p_rgh "
+                        "7.6e-13, U 4.3e-12, k 2.4e-12, omega 3.9e-12, nut 3.5e-12, the wall's nut 9.2e-13 of its "
+                        "largest value; bounds at about 30x. THE CONTROL: OpenFOAM's own laminar run, 51% of U. THE "
+                        "PATH is asserted: the model, the uniform lineage, a wall distance in every cell, OpenFOAM's "
+                        "log selecting kOmegaSST and solving omega. BROKEN ONCE EACH (U, omega at t = 1): validate() "
+                        "skipped 5.1e-01, 1.7e-01; fvm::ddt dropped 3.8e-01, 2.2e+01 and 0 of 10 omega counts; the "
+                        "wall distance doubled 4.1e-04, 5.1e-01; PBiCGStab for the case's symGaussSeidel 1.7e-04, "
+                        "3.7e-02; water's nu as a scalar for the mixture's field 3.5e-05, 8.5e-03; the laplacian's "
+                        "non-orthogonal correction dropped 3.7e-07, 7.2e-04. NOT DISCRIMINATED, measured: the inline "
+                        "(value - cell)*deltaCoeffs for the patch's snGrad() on k, omega and the wall U (identical to "
+                        "the last digit), and relax() not called at the case's factor of 1. "
+                        "tests/interfoam_refusals.sh holds ten kOmegaSST arms on RAS/damBreak made kOmegaSST, on a "
+                        "base that runs. NOT CLAIMED, each refused by name: `density variable` with kOmegaSST (no "
+                        "tutorial pairs them), F3, decayControl, a wall-function blending other than binomial n = 2 "
+                        "or coefficients other than the defaults, any nut wall function but nutk, a convection "
+                        "scheme other than Gauss upwind, a moving mesh, and the device loop.",
+             note="WIRING, not a new closure: kOmegaSST_cpp.cu is the reference rhoSimpleFoam and simpleFoam already "
+                  "gate, handed what incompressible::turbulenceModel::New(U, phi, mixture) hands OpenFOAM's -- the "
+                  "mixture's nu as a field, the volumetric phi, 1/deltaT for fvm::ddt, wallDist's cell y -- by "
+                  "inter_turbulence_cpp.cu. The reference gained the case's linear solver (it ran PBiCGStab "
+                  "whatever the case named) and the two solves' full records. THREE SHARED DEFECTS THE CASE FOUND. "
+                  "(1) pressureInletOutletVelocity::snGrad() returned (stored value - cell)*deltaCoeffs where "
+                  "OpenFOAM's directionMixed builds it from the valueFraction and the cell and never reads the "
+                  "stored value: at construction waterChannel's atmosphere holds the file's (0 0 0) over cells at "
+                  "(1 0 0), correctNut read a shear of 1/d there and wrote nut 3.7e-05 for OpenFOAM's k/omega = "
+                  "3.33e-02 -- the patch 100% out, the run's FIRST p_rgh residual 7.1e-03, and at t = 1 U 3.5e-03, "
+                  "omega 4.0e-02, nut 2.3e-01. Localised by running the same case laminar (already 6e-13) and then "
+                  "comparing the constructed nut, patch by patch, with `interFoam -postProcess -func "
+                  "writeObjects(nut)`; tests/test_piov_sngrad.cu holds it. (2) The per-field div scheme parser "
+                  "searched fvSchemes for the literal key, and the case names its scheme through a pattern, "
+                  "`\"div\\(phi,(k|omega)\\)\" Gauss upwind;` -- refused as having no div(phi,k); now the literal "
+                  "key, else the last matching pattern, as the dictionary lookup does (tests/test_scheme_blocks.cu). "
+                  "(3) kOmegaSST_cpp took three boundary gradients inline instead of from the patch; switched to "
+                  "snGrad(), which changes nothing on any gated case. ALSO: kOmegaSST_cpp.cuh says decayControl is "
+                  "refused and nothing read the key; interFoam's reader does now. The closure keys both wall "
+                  "functions on the MESH patch type, so the reader holds every `wall` patch to nutkWallFunction "
+                  "and omegaWallFunction and every other patch to neither. HOST ONLY SO FAR: the device loop "
+                  "refuses by name, first among its refusals."),
         dict(name="interFoam_waveModel", of_symbol="waveModel",
              of_file="src/waveModels/waveModel/waveModel.C",
              classification="BOUNDARY_CONDITION", status="REIMPLEMENT",
