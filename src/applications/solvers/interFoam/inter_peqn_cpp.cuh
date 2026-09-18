@@ -205,6 +205,10 @@ struct PressureSolveControls
     // before it reads a dictionary), so the caller owns it across steps.
     const GamgControls* gamg = nullptr;
     const GamgControls* gamgFinal = nullptr;
+    // ...or `solver PCG; preconditioner { preconditioner GAMG; ... }` -> brae::pcgGamgSolve, the PCG
+    // controls above and the preconditioner's own here, on the same mesh hierarchy
+    const GamgPreconditionerControls* pcgGamg = nullptr;
+    const GamgPreconditionerControls* pcgGamgFinal = nullptr;
     GamgAgglomerationCache* gamgCache = nullptr;
     // laplacianSchemes' default for fvm::laplacian(rAUf, p_rgh): `corrected` adds the explicit
     // non-orthogonal correction to the source and stores it as the matrix's faceFluxCorrection, which

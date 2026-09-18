@@ -412,14 +412,176 @@ bool gamgSmootherPorted(const std::string& smoother)
         || smoother == "symGaussSeidel";
 }
 
-SolverPerformance gamgSolve(
-    const FvScalarMatrix& M,
-    std::vector<scalar>& psi,
-    const PrimitiveMesh& m,
-    const std::vector<FvPatch>& patches,
-    const GamgAgglomeration& agglomeration,
+namespace {
+
+// GAMGSolver's constructor and initVcycle, for one matrix: the folded fine level, the coarse matrices
+// built from it, the work fields and one smoother per level. Held by pointer from the smoothers, so it
+// is built in place and never copied.
+struct GamgHierarchy
+{
+    const GamgAgglomeration* agglomeration = nullptr;
+    LduLevel fine;
+    std::vector<LduLevel> matrixLevels;
+    std::vector<std::vector<scalar>> coarseCorrFields;
+    std::vector<std::vector<scalar>> coarseSources;
+    std::vector<Smoother> smoothers;
+    // the sub-fields OpenFOAM carves out of Apsi and finestCorrection
+    std::vector<scalar> ACf;
+    std::vector<scalar> preSmoothedCoarseCorrField;
+
+    GamgHierarchy(const GamgHierarchy&) = delete;
+    GamgHierarchy& operator=(const GamgHierarchy&) = delete;
+    GamgHierarchy() = default;
+
+    // `fineDiag` and `fineUpper` are the matrix as the solver is handed it, boundary folded in
+    void build(
+        const GamgAgglomeration& a,
+        const std::vector<scalar>& fineDiag,
+        const std::vector<scalar>& fineUpper,
+        const std::string& smoother)
+    {
+        agglomeration = &a;
+        fine.addr = &a.fineMesh;
+        fine.diag = fineDiag;
+        fine.upper = fineUpper;
+        const label nLevels = a.size();
+        matrixLevels.clear();
+        matrixLevels.reserve(static_cast<std::size_t>(nLevels));
+        for (label fineLevelIndex = 0; fineLevelIndex < nLevels; ++fineLevelIndex)
+        {
+            const LduLevel& fineMatrix =
+                fineLevelIndex == 0 ? fine : matrixLevels[static_cast<std::size_t>(fineLevelIndex) - 1];
+            matrixLevels.push_back(agglomerateMatrix(fineMatrix, a, fineLevelIndex));
+        }
+        coarseCorrFields.assign(static_cast<std::size_t>(nLevels), std::vector<scalar>());
+        coarseSources.assign(static_cast<std::size_t>(nLevels), std::vector<scalar>());
+        smoothers.clear();
+        smoothers.reserve(static_cast<std::size_t>(nLevels) + 1);
+        smoothers.emplace_back(fine, smoother);
+        for (label leveli = 0; leveli < nLevels; ++leveli)
+        {
+            const std::size_t li = static_cast<std::size_t>(leveli);
+            coarseSources[li].resize(matrixLevels[li].diag.size());
+            coarseCorrFields[li].resize(matrixLevels[li].diag.size());
+            smoothers.emplace_back(matrixLevels[li], smoother);
+        }
+    }
+};
+
+// GAMGSolver::Vcycle (GAMGSolverSolve.C:170-463). psi is corrected in place; Apsi is scratch, and on
+// return holds A*finestCorrection when the correction was scaled.
+void vCycle(
+    GamgHierarchy& h,
     const GamgControls& controls,
+    std::vector<scalar>& psi,
+    const std::vector<scalar>& source,
+    std::vector<scalar>& Apsi,
+    std::vector<scalar>& finestCorrection,
+    const std::vector<scalar>& finestResidual,
     GamgSolveLog* log)
+{
+    const GamgAgglomeration& agglomeration = *h.agglomeration;
+    const label coarsestLevel = static_cast<label>(h.matrixLevels.size()) - 1;
+    std::vector<std::vector<scalar>>& coarseCorrFields = h.coarseCorrFields;
+    std::vector<std::vector<scalar>>& coarseSources = h.coarseSources;
+
+    // Restrict finest grid residual for the next level up.
+    restrictField(coarseSources[0], finestResidual, agglomeration.restrictAddressing[0]);
+
+    // Residual restriction (going to coarser levels)
+    for (label leveli = 0; leveli < coarsestLevel; ++leveli)
+    {
+        const std::size_t li = static_cast<std::size_t>(leveli);
+        // the optional pre-smoothing sweeps
+        if (controls.nPreSweeps)
+        {
+            std::fill(coarseCorrFields[li].begin(), coarseCorrFields[li].end(), scalar(0));
+            h.smoothers[li + 1].smooth(
+                coarseCorrFields[li],
+                coarseSources[li],
+                std::min(
+                    controls.nPreSweeps + controls.preSweepsLevelMultiplier*leveli,
+                    controls.maxPreSweeps));
+            // but not on the coarsest level because it evaluates to 1
+            if (controls.scaleCorrection && leveli < coarsestLevel - 1)
+            {
+                h.ACf.resize(coarseCorrFields[li].size());
+                scale(coarseCorrFields[li], h.ACf, h.matrixLevels[li], coarseSources[li]);
+            }
+            // Correct the residual with the new solution
+            residual(h.matrixLevels[li], coarseSources[li], coarseCorrFields[li], coarseSources[li]);
+        }
+        // Residual is equal to source
+        restrictField(coarseSources[li + 1], coarseSources[li], agglomeration.restrictAddressing[li + 1]);
+    }
+
+    // solveCoarsestLevel
+    {
+        const std::size_t lc = static_cast<std::size_t>(coarsestLevel);
+        std::fill(coarseCorrFields[lc].begin(), coarseCorrFields[lc].end(), scalar(0));
+        const SolverPerformance coarsePerf = pcgDic(
+            h.matrixLevels[lc],
+            coarseCorrFields[lc],
+            coarseSources[lc],
+            controls.tolerance,
+            controls.relTol);
+        if (log)
+        {
+            log->coarsest.push_back(coarsePerf);
+        }
+    }
+
+    // Smoothing and prolongation of the coarse correction fields (going to finer levels)
+    for (label leveli = coarsestLevel - 1; leveli >= 0; --leveli)
+    {
+        const std::size_t li = static_cast<std::size_t>(leveli);
+        // Only store the preSmoothedCoarseCorrField if pre-smoothing is used
+        if (controls.nPreSweeps)
+        {
+            h.preSmoothedCoarseCorrField = coarseCorrFields[li];
+        }
+        prolongField(coarseCorrFields[li], coarseCorrFields[li + 1], agglomeration.restrictAddressing[li + 1]);
+
+        // Scale coarse-grid correction field
+        // but not on the coarsest level because it evaluates to 1
+        if (controls.scaleCorrection && leveli < coarsestLevel - 1)
+        {
+            h.ACf.resize(coarseCorrFields[li].size());
+            scale(coarseCorrFields[li], h.ACf, h.matrixLevels[li], coarseSources[li]);
+        }
+        if (controls.nPreSweeps)
+        {
+            for (std::size_t i = 0; i < coarseCorrFields[li].size(); ++i)
+            {
+                coarseCorrFields[li][i] += h.preSmoothedCoarseCorrField[i];
+            }
+        }
+        h.smoothers[li + 1].smooth(
+            coarseCorrFields[li],
+            coarseSources[li],
+            std::min(
+                controls.nPostSweeps + controls.postSweepsLevelMultiplier*leveli,
+                controls.maxPostSweeps));
+    }
+
+    // Prolong the finest level correction
+    prolongField(finestCorrection, coarseCorrFields[0], agglomeration.restrictAddressing[0]);
+    if (controls.scaleCorrection)
+    {
+        scale(finestCorrection, Apsi, h.fine, finestResidual);
+    }
+    for (std::size_t i = 0; i < psi.size(); ++i)
+    {
+        psi[i] += finestCorrection[i];
+    }
+    h.smoothers[0].smooth(psi, source, controls.nFinestSweeps);
+}
+
+void checkGamgInputs(
+    const FvScalarMatrix& M,
+    const PrimitiveMesh& m,
+    const GamgAgglomeration& agglomeration,
+    const GamgControls& controls)
 {
     if (!gamgSmootherPorted(controls.smoother))
     {
@@ -444,34 +606,48 @@ SolverPerformance gamgSolve(
     {
         throw std::runtime_error("brae GAMG: the agglomeration was built for a different mesh.");
     }
+}
 
-    // fvMatrix::solveSegregated: addBoundaryDiag, addBoundarySource
-    LduLevel fine;
-    fine.addr = &agglomeration.fineMesh;
-    fine.diag = M.diag;
-    fine.upper = M.upper;
-    std::vector<scalar> source = M.source;
+// fvMatrix::solveSegregated: addBoundaryDiag, addBoundarySource
+void foldBoundary(
+    const FvScalarMatrix& M,
+    const std::vector<FvPatch>& patches,
+    std::vector<scalar>& diag,
+    std::vector<scalar>& source)
+{
+    diag = M.diag;
+    source = M.source;
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         for (label i = 0; i < patches[pi].size; ++i)
         {
             const std::size_t c = static_cast<std::size_t>(patches[pi].faceCells[i]);
-            fine.diag[c] += M.internalCoeffs[pi][static_cast<std::size_t>(i)];
+            diag[c] += M.internalCoeffs[pi][static_cast<std::size_t>(i)];
             source[c] += M.boundaryCoeffs[pi][static_cast<std::size_t>(i)];
         }
     }
+}
+
+} // namespace
+
+SolverPerformance gamgSolve(
+    const FvScalarMatrix& M,
+    std::vector<scalar>& psi,
+    const PrimitiveMesh& m,
+    const std::vector<FvPatch>& patches,
+    const GamgAgglomeration& agglomeration,
+    const GamgControls& controls,
+    GamgSolveLog* log)
+{
+    checkGamgInputs(M, m, agglomeration, controls);
+    std::vector<scalar> diag;
+    std::vector<scalar> source;
+    foldBoundary(M, patches, diag, source);
 
     // the constructor: one coarse matrix per agglomeration level, each from the one above
-    const label nLevels = agglomeration.size();
-    std::vector<LduLevel> matrixLevels;
-    matrixLevels.reserve(static_cast<std::size_t>(nLevels));
-    for (label fineLevelIndex = 0; fineLevelIndex < nLevels; ++fineLevelIndex)
-    {
-        const LduLevel& fineMatrix =
-            fineLevelIndex == 0 ? fine : matrixLevels[static_cast<std::size_t>(fineLevelIndex) - 1];
-        matrixLevels.push_back(agglomerateMatrix(fineMatrix, agglomeration, fineLevelIndex));
-    }
-    const label coarsestLevel = nLevels - 1;
+    GamgHierarchy h;
+    h.build(agglomeration, diag, M.upper, controls.smoother);
+    const LduLevel& fine = h.fine;
 
     const std::size_t nCells = psi.size();
     std::vector<scalar> Apsi(nCells);
@@ -489,115 +665,9 @@ SolverPerformance gamgSolve(
     perf.finalResidual = perf.initialResidual;
     if (controls.minIter <= 0 && converged(perf, controls.tolerance, controls.relTol)) return perf;
 
-    // initVcycle
-    std::vector<std::vector<scalar>> coarseCorrFields(static_cast<std::size_t>(nLevels));
-    std::vector<std::vector<scalar>> coarseSources(static_cast<std::size_t>(nLevels));
-    std::vector<Smoother> smoothers;
-    smoothers.reserve(static_cast<std::size_t>(nLevels) + 1);
-    smoothers.emplace_back(fine, controls.smoother);
-    for (label leveli = 0; leveli < nLevels; ++leveli)
-    {
-        const std::size_t li = static_cast<std::size_t>(leveli);
-        coarseSources[li].resize(matrixLevels[li].diag.size());
-        coarseCorrFields[li].resize(matrixLevels[li].diag.size());
-        smoothers.emplace_back(matrixLevels[li], controls.smoother);
-    }
-    // the sub-fields OpenFOAM carves out of Apsi and finestCorrection
-    std::vector<scalar> ACf;
-    std::vector<scalar> preSmoothedCoarseCorrField;
-
     do
     {
-        // Vcycle. Restrict finest grid residual for the next level up.
-        restrictField(coarseSources[0], finestResidual, agglomeration.restrictAddressing[0]);
-
-        // Residual restriction (going to coarser levels)
-        for (label leveli = 0; leveli < coarsestLevel; ++leveli)
-        {
-            const std::size_t li = static_cast<std::size_t>(leveli);
-            // the optional pre-smoothing sweeps
-            if (controls.nPreSweeps)
-            {
-                std::fill(coarseCorrFields[li].begin(), coarseCorrFields[li].end(), scalar(0));
-                smoothers[li + 1].smooth(
-                    coarseCorrFields[li],
-                    coarseSources[li],
-                    std::min(
-                        controls.nPreSweeps + controls.preSweepsLevelMultiplier*leveli,
-                        controls.maxPreSweeps));
-                // but not on the coarsest level because it evaluates to 1
-                if (controls.scaleCorrection && leveli < coarsestLevel - 1)
-                {
-                    ACf.resize(coarseCorrFields[li].size());
-                    scale(coarseCorrFields[li], ACf, matrixLevels[li], coarseSources[li]);
-                }
-                // Correct the residual with the new solution
-                residual(matrixLevels[li], coarseSources[li], coarseCorrFields[li], coarseSources[li]);
-            }
-            // Residual is equal to source
-            restrictField(coarseSources[li + 1], coarseSources[li], agglomeration.restrictAddressing[li + 1]);
-        }
-
-        // solveCoarsestLevel
-        {
-            const std::size_t lc = static_cast<std::size_t>(coarsestLevel);
-            std::fill(coarseCorrFields[lc].begin(), coarseCorrFields[lc].end(), scalar(0));
-            const SolverPerformance coarsePerf = pcgDic(
-                matrixLevels[lc],
-                coarseCorrFields[lc],
-                coarseSources[lc],
-                controls.tolerance,
-                controls.relTol);
-            if (log)
-            {
-                log->coarsest.push_back(coarsePerf);
-            }
-        }
-
-        // Smoothing and prolongation of the coarse correction fields (going to finer levels)
-        for (label leveli = coarsestLevel - 1; leveli >= 0; --leveli)
-        {
-            const std::size_t li = static_cast<std::size_t>(leveli);
-            // Only store the preSmoothedCoarseCorrField if pre-smoothing is used
-            if (controls.nPreSweeps)
-            {
-                preSmoothedCoarseCorrField = coarseCorrFields[li];
-            }
-            prolongField(coarseCorrFields[li], coarseCorrFields[li + 1], agglomeration.restrictAddressing[li + 1]);
-
-            // Scale coarse-grid correction field
-            // but not on the coarsest level because it evaluates to 1
-            if (controls.scaleCorrection && leveli < coarsestLevel - 1)
-            {
-                ACf.resize(coarseCorrFields[li].size());
-                scale(coarseCorrFields[li], ACf, matrixLevels[li], coarseSources[li]);
-            }
-            if (controls.nPreSweeps)
-            {
-                for (std::size_t i = 0; i < coarseCorrFields[li].size(); ++i)
-                {
-                    coarseCorrFields[li][i] += preSmoothedCoarseCorrField[i];
-                }
-            }
-            smoothers[li + 1].smooth(
-                coarseCorrFields[li],
-                coarseSources[li],
-                std::min(
-                    controls.nPostSweeps + controls.postSweepsLevelMultiplier*leveli,
-                    controls.maxPostSweeps));
-        }
-
-        // Prolong the finest level correction
-        prolongField(finestCorrection, coarseCorrFields[0], agglomeration.restrictAddressing[0]);
-        if (controls.scaleCorrection)
-        {
-            scale(finestCorrection, Apsi, fine, finestResidual);
-        }
-        for (std::size_t i = 0; i < nCells; ++i)
-        {
-            psi[i] += finestCorrection[i];
-        }
-        smoothers[0].smooth(psi, source, controls.nFinestSweeps);
+        vCycle(h, controls, psi, source, Apsi, finestCorrection, finestResidual, log);
 
         // Calculate finest level residual field
         amul(fine, psi, Apsi);
@@ -611,6 +681,116 @@ SolverPerformance gamgSolve(
     (
         (++perf.nIterations < controls.maxIter && !converged(perf, controls.tolerance, controls.relTol))
      || perf.nIterations < controls.minIter
+    );
+    return perf;
+}
+
+SolverPerformance pcgGamgSolve(
+    const FvScalarMatrix& M,
+    std::vector<scalar>& psi,
+    const PrimitiveMesh& m,
+    const std::vector<FvPatch>& patches,
+    const GamgAgglomeration& agglomeration,
+    scalar tolerance,
+    scalar relTol,
+    int maxIter,
+    int minIter,
+    const GamgPreconditionerControls& precond,
+    GamgSolveLog* log)
+{
+    checkGamgInputs(M, m, agglomeration, precond.gamg);
+    if (precond.nVcycles < 1)
+    {
+        throw std::runtime_error("brae GAMG preconditioner: nVcycles must be at least 1.");
+    }
+    std::vector<scalar> diag;
+    std::vector<scalar> source;
+    foldBoundary(M, patches, diag, source);
+
+    // PCG::scalarSolve (PCG.C:67-215)
+    LduLevel A;
+    A.addr = &agglomeration.fineMesh;
+    A.diag = diag;
+    A.upper = M.upper;
+    const std::size_t nCells = psi.size();
+    std::vector<scalar> pA(nCells);
+    std::vector<scalar> wA(nCells);
+    scalar wArA = perfGreat;
+    scalar wArAold = wArA;
+
+    amul(A, psi, wA);
+    std::vector<scalar> rA(nCells);
+    for (std::size_t cell = 0; cell < nCells; ++cell)
+    {
+        rA[cell] = source[cell] - wA[cell];
+    }
+    const scalar nf = normFactor(A, psi, source, wA, pA);
+
+    SolverPerformance perf;
+    perf.initialResidual = sumMag(rA)/nf;
+    perf.finalResidual = perf.initialResidual;
+    if (minIter <= 0 && converged(perf, tolerance, relTol)) return perf;
+
+    // the preconditioner, constructed on first use: a GAMGSolver on the same matrix, with the
+    // `preconditioner` sub-dictionary as its controls (lduMatrixPreconditioner.C, New)
+    GamgHierarchy h;
+    h.build(agglomeration, diag, M.upper, precond.gamg.smoother);
+    std::vector<scalar> AwA(nCells);
+    std::vector<scalar> finestCorrection(nCells);
+    std::vector<scalar> finestResidual(nCells);
+    // GAMGPreconditioner::precondition (GAMGPreconditioner.C:79-150): nVcycles V-cycles from zero
+    auto precondition = [&](std::vector<scalar>& w, const std::vector<scalar>& r)
+    {
+        std::fill(w.begin(), w.end(), scalar(0));
+        finestResidual = r;
+        for (int cycle = 0; cycle < precond.nVcycles; ++cycle)
+        {
+            vCycle(h, precond.gamg, w, r, AwA, finestCorrection, finestResidual, log);
+            if (cycle < precond.nVcycles - 1)
+            {
+                // Calculate finest level residual field
+                amul(A, w, AwA);
+                finestResidual = r;
+                for (std::size_t i = 0; i < nCells; ++i)
+                {
+                    finestResidual[i] -= AwA[i];
+                }
+            }
+        }
+    };
+
+    do
+    {
+        wArAold = wArA;
+        precondition(wA, rA);
+        wArA = sumProd(wA, rA);
+        if (perf.nIterations == 0)
+        {
+            pA = wA;
+        }
+        else
+        {
+            const scalar beta = wArA/wArAold;
+            for (std::size_t cell = 0; cell < nCells; ++cell)
+            {
+                pA[cell] = wA[cell] + beta*pA[cell];
+            }
+        }
+        amul(A, pA, wA);
+        const scalar wApA = sumProd(wA, pA);
+        // checkSingularity
+        if (std::fabs(wApA)/nf < perfVSmall) break;
+        const scalar alpha = wArA/wApA;
+        for (std::size_t cell = 0; cell < nCells; ++cell)
+        {
+            psi[cell] += alpha*pA[cell];
+            rA[cell] -= alpha*wA[cell];
+        }
+        perf.finalResidual = sumMag(rA)/nf;
+    } while
+    (
+        (++perf.nIterations < maxIter && !converged(perf, tolerance, relTol))
+     || perf.nIterations < minIter
     );
     return perf;
 }

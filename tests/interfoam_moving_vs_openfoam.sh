@@ -9,12 +9,10 @@
 # THE FIXTURE is laminar/testTubeMixer, the one solid-body tutorial on an orthogonal mesh: a 1 x 10 x 1
 # cm tube of water and air on a turntable (rotatingMotion, 2 pi rad/s) that also tilts about its own
 # axis (oscillatingRotatingMotion, 45 degrees at 40 rad/s), every wall a movingWallVelocity, p_rgh a
-# fixedFluxPressure everywhere, PIMPLE naming pRefPoint and pRefValue 1e5, and `div(rhoPhi,U) Gauss
-# vanLeerV` -- run as shipped now that vanLeerV is ported (it was staged to `Gauss linear` before). ONE
-# THING IS STAGED AWAY FROM THE TUTORIAL, a substitution today and not a choice:
-#   p_rghFinal      PCG with a GAMG PRECONDITIONER -> `solver GAMG; smoother DIC;` at the same
-#                   tolerance 2e-09: the preconditioner form is not ported yet
-# It is named in interFoam_dynamicMesh's manifest entry as what this gate does not claim.
+# fixedFluxPressure everywhere, PIMPLE naming pRefPoint and pRefValue 1e5, `div(rhoPhi,U) Gauss
+# vanLeerV`, and p_rghFinal as PCG with a GAMG PRECONDITIONER -- ALL AS SHIPPED. The last two were
+# staged away (to `Gauss linear` and to `solver GAMG; smoother DIC;`) until each was ported; the
+# preconditioner is held on its own in tests/interfoam_gamg_vs_openfoam.sh.
 #
 # PROFILES, ten steps of deltaT 2e-4 (the tutorial's is 1e-4 under maxCo 0.5; at 2e-4 the Courant
 # number reaches 0.16 and the walls move a cell width in about thirty steps):
@@ -28,12 +26,12 @@
 #   mixerOuterOnce nOuterCorrectors 2 without it: the second corrector must NOT move the mesh
 #   mixerPred      momentumPredictor yes: U solved on the moving mesh (smoothSolver GaussSeidel, the
 #                  tutorial's own U entry), with UFinal added because the tutorial names none
-#   sloshing2D     laminar/sloshingTank2D as shipped but for p_rghFinal: the SDA roll-sway-heave of a
+#   sloshing2D     laminar/sloshingTank2D AS SHIPPED: the SDA roll-sway-heave of a
 #                  tank whose chamfered corners make its cells NON-ORTHOGONAL by 44 degrees, with the
 #                  tutorial's `Gauss linear corrected` laplacian and `corrected` snGrad -- the first
 #                  fixture on which interFoam's non-orthogonal corrections are not zero -- 2-D with
 #                  empty front and back, nAlphaSubCycles 3, cAlpha 1.5, ten of its own steps of 0.01
-#   cylinder       laminar/sloshingCylinder as shipped but for p_rghFinal: a snappyHexMesh cylinder
+#   cylinder       laminar/sloshingCylinder: a snappyHexMesh cylinder
 #                  (polyhedra, 26 degrees) under an oscillatingLinearMotion and a rotatingMotion,
 #                  MULESCorr and nNonOrthogonalCorrectors 1 -- the corrector loop on a corrected
 #                  laplacian -- ten of its own steps of 0.001, with the oscillation's phase and
@@ -48,11 +46,11 @@
 # still water in a still tube, which is the whole of the answer away; for the reference, OpenFOAM's
 # closed dam with `pRefValue 1e5`, which moves its p by 1e5 and nothing else.
 #
-# MEASURED, the five mixer profiles with the tutorial's own vanLeerV: every p_rgh iteration count
-# OpenFOAM's (20 to 40 per profile), initial residuals 3.7e-11 in step one and 1.2e-09 over the run;
-# alpha 4.1e-12, p_rgh 1.5e-13, U 4.2e-11 at worst; the wall velocity 7.0e-14 on 1050 faces (|U_wall|
-# 1.8); the moved points OpenFOAM's exactly. (With `Gauss linear` staged in vanLeerV's place, before
-# that scheme was ported: alpha 5.6e-12, U 1.0e-10.) The closed dam: 60 of 60 counts, alpha 1.2e-14, U 8.1e-14, p 5.7e-15.
+# MEASURED, the five mixer profiles as shipped: every p_rgh iteration count OpenFOAM's (20 to 40 per
+# profile), initial residuals 5.8e-11 in step one and 1.6e-09 over the run; alpha 6.1e-12, U 7.0e-11
+# at worst; the wall velocity 7.0e-14 on 1050 faces (|U_wall| 1.8); the moved points OpenFOAM's
+# exactly. (With p_rghFinal and div(rhoPhi,U) staged, before either was ported: alpha 5.6e-12, U
+# 1.0e-10.) The closed dam: 60 of 60 counts, alpha 1.2e-14, U 8.1e-14, p 5.7e-15.
 #
 # THE TWO NON-ORTHOGONAL TANKS: sloshing2D reads 20 of 20 counts, alpha 5.8e-15, p_rgh 3.2e-14, U
 # 3.9e-13 (the motion is the whole answer: the still tank is 100% of U away); cylinder 40 of 40,
@@ -146,10 +144,8 @@ if profile.startswith('mixer') or profile.startswith('sloshing2D') or profile.st
     m = re.search(r'p_rghFinal\s*\{.*?\n    \}', t, flags=re.S)
     assert m, 'no p_rghFinal entry'
     if 'preconditioner' in m.group(0):
-        # the mixer and the sloshing tanks: PCG with a GAMG preconditioner, staged to GAMG with DIC
+        # the mixer and the sloshing tanks: PCG with a GAMG preconditioner, run as shipped
         assert 'GAMG' in m.group(0), 'p_rghFinal is no longer PCG with a GAMG preconditioner'
-        t = t[:m.start()] + ('p_rghFinal\n    {\n        solver          GAMG;\n        smoother        DIC;\n'
-                             '        tolerance       2e-09;\n        relTol          0;\n        maxIter         20;\n    }') + t[m.end():]
     else:
         # the cylinder: `$p_rgh; relTol 0; maxIter 20;` on a GAMG/DIC p_rgh, run as shipped
         assert '$p_rgh' in m.group(0), 'p_rghFinal is neither the preconditioner form nor $p_rgh'

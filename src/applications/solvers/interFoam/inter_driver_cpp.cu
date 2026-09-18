@@ -518,6 +518,9 @@ RunReport runInterFoam(
                     gamgPFinal.relTol = psc.relTolPFinal;
                     psc.gamg = f.pSolve.gamgSolver() ? &gamgP : nullptr;
                     psc.gamgFinal = f.pSolveFinal.gamgSolver() ? &gamgPFinal : nullptr;
+                    // the preconditioner's own controls are the sub-dictionary's, BRAE_PTOL or not
+                    psc.pcgGamg = f.pSolve.pcgGamg() ? &f.pSolve.gamgPrecond : nullptr;
+                    psc.pcgGamgFinal = f.pSolveFinal.pcgGamg() ? &f.pSolveFinal.gamgPrecond : nullptr;
                     psc.gamgCache = &gamgCache;
                     pin.gamgLog = &gamgLog;
                     for (label c = 0; c < lc.nCorrectors; ++c)

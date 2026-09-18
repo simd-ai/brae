@@ -74,22 +74,12 @@ sed -i 's/(500 1 75) simpleGrading/(50 1 75) simpleGrading/' "$BW/system/blockMe
 sed -i 's/^endTime .*/endTime         0.02;/; s/^deltaT .*/deltaT          0.01;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
     "$BW/system/controlDict"
 
-# ...and laminar/testTubeMixer, for the moving mesh, with the one thing the moving gate stages
-# (interfoam_moving_vs_openfoam.sh): p_rghFinal as `solver GAMG; smoother DIC;` for the
-# PCG-with-GAMG-preconditioner form
+# ...and laminar/testTubeMixer, for the moving mesh, AS SHIPPED
 SRCM="$TUT/multiphase/interFoam/laminar/testTubeMixer"
 [ -d "$SRCM" ] || { echo "SKIP: testTubeMixer tutorial not found at $SRCM"; exit 77; }
 BM="$W/baseMoving"
 cp -r "$SRCM" "$BM" || exit 1
 cp -r "$BM/0.orig" "$BM/0"
-python3 - "$BM/system/fvSolution" <<'PYEOF'
-import re, sys
-p = sys.argv[1]
-t = open(p).read()
-m = re.search(r'p_rghFinal\s*\{.*?\n    \}', t, flags=re.S)
-t = t[:m.start()] + 'p_rghFinal\n    {\n        solver          GAMG;\n        smoother        DIC;\n        tolerance       2e-09;\n        relTol          0;\n        maxIter         20;\n    }' + t[m.end():]
-open(p, 'w').write(t)
-PYEOF
 ( cd "$BM" && blockMesh > log.blockMesh 2>&1 && setFields > log.setFields 2>&1 ) \
     || { echo "SKIP: blockMesh/setFields failed on testTubeMixer"; exit 77; }
 sed -i 's/^endTime .*/endTime         0.0002;/; s/^deltaT .*/deltaT          1e-4;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
@@ -276,6 +266,9 @@ arm moving_refPointOutside  refused "lies in no cell"         "" "sed -i 's/^\( 
 arm moving_refCell          runs    -                        "" "sed -i 's/^\( *\)pRefPoint .*/\1pRefCell 3;/' system/fvSolution"
 KEFIELDS='for n, dim, t, v in [("k", "[0 2 -2 0 0 0 0]", "kqRWallFunction", "0.1"), ("epsilon", "[0 2 -3 0 0 0 0]", "epsilonWallFunction", "0.1"), ("nut", "[0 2 -1 0 0 0 0]", "nutkWallFunction", "0")]: open("0/" + n, "w").write("FoamFile { version 2.0; format ascii; class volScalarField; object %s; }\ndimensions %s;\ninternalField uniform %s;\nboundaryField { walls { type %s; value uniform %s; } }\n" % (n, dim, v, t, v))'
 arm moving_RAS              refused "the mesh moves and the case is turbulent" "" "sed -i 's/^simulationType .*/simulationType RAS;\nRAS { RASModel kEpsilon; turbulence on; }/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,U) .*/&\n    div(phi,k) Gauss upwind;\n    div(phi,epsilon) Gauss upwind;/' system/fvSchemes; sed -i 's/(U|k|epsilon)/XX/; s/^    U$/    \"(U|k|epsilon).*\"/' system/fvSolution; python3 -c '$KEFIELDS'"
+# a dictionary-form preconditioner other than GAMG or DIC is substituted under a notice, not run silently
+arm moving_precondDILU      runs    "preconditioner { DILU ... }" "" "sed -i '/p_rghFinal/,/^    }/ s/preconditioner  *GAMG;/preconditioner DILU;/' system/fvSolution"
+arm moving_precondNoSmoother refused "names no \`smoother\`" "" "sed -i '/p_rghFinal/,/^    }/ {/smoother/d}' system/fvSolution"
 # the tutorial's own vanLeerV runs (moving_baseline); the vector scheme brae still lacks does not
 arm moving_limitedLinear    refused "grad(magSqr(U))"          "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear 1;/' system/fvSchemes"
 arm moving_unknownScheme    refused "Gauss QUICKV"             "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss QUICKV;/' system/fvSchemes"

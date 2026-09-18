@@ -840,26 +840,46 @@ InterFields buildInterFields(const std::string&          caseDir,
             InterFields::PressureLinearSolve s;
             s.solver = d.wordOr("solver", "");
             s.preconditioner = d.wordOr("preconditioner", "");
-            // a `preconditioner { preconditioner GAMG; ... }` sub-dictionary (testTubeMixer and the
-            // sloshing tanks, on p_rghFinal and pcorr): lduMatrix::preconditioner::New reads the name
-            // from inside it. Named here so the notice below says what the case asked for rather
-            // than `preconditioner ;`. The form itself is not ported.
+            s.tol = d.scalarOr("tolerance", scalar(1e-6));
+            s.relTol = d.scalarOr("relTol", scalar(0));
+            s.maxIter = static_cast<int>(d.scalarOr("maxIter", scalar(1000)));
+            // a `preconditioner { preconditioner <name>; ... }` sub-dictionary: lduMatrix::
+            // preconditioner::New reads the name from inside it and hands the preconditioner THAT
+            // dictionary as its controls (lduMatrixPreconditioner.C). A GAMG one is a GAMGSolver
+            // reading its tolerance, relTol, smoother and sweeps from there -- not from the PCG entry.
             if (s.preconditioner.empty())
             {
                 const FoamDict* pd = d.subDict("preconditioner");
                 if (pd)
                 {
-                    s.preconditioner = "{ " + pd->wordOr("preconditioner", "") + " ... }";
+                    const std::string name = pd->wordOr("preconditioner", "");
+                    if (name == "DIC")
+                    {
+                        s.preconditioner = "DIC";
+                    }
+                    else if (name == "GAMG")
+                    {
+                        s.preconditioner = "{ GAMG ... }";
+                        s.gamgPreconditioned = true;
+                        // lduMatrix::solver::readControls on the sub-dictionary: its own defaults
+                        s.gamgPrecond.gamg = readGamgControls(
+                            *pd,
+                            pd->scalarOr("tolerance", scalar(1e-6)),
+                            pd->scalarOr("relTol", scalar(0)),
+                            static_cast<int>(pd->scalarOr("maxIter", scalar(1000))));
+                        s.gamgPrecond.nVcycles = pd->intOr("nVcycles", 2);
+                    }
+                    else
+                    {
+                        s.preconditioner = "{ " + name + " ... }";
+                    }
                 }
             }
-            s.tol = d.scalarOr("tolerance", scalar(1e-6));
-            s.relTol = d.scalarOr("relTol", scalar(0));
-            s.maxIter = static_cast<int>(d.scalarOr("maxIter", scalar(1000)));
             if (s.gamgSolver())
             {
                 s.gamg = readGamgControls(d, s.tol, s.relTol, s.maxIter);
             }
-            if (!s.pcgDIC() && !s.gamgSolver())
+            if (!s.pcgDIC() && !s.gamgSolver() && !s.pcgGamg())
                 noticeApproximated("interFoam p_rgh solve",
                     "the case asks for `solver " + s.solver + "; preconditioner " +
                     s.preconditioner + ";` and brae runs PBiCGStab at the same tolerance. Only "

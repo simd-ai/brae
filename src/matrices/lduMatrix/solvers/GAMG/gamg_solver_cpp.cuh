@@ -108,6 +108,15 @@ struct GamgAgglomerationCache
     }
 };
 
+// A `preconditioner { preconditioner GAMG; ... }` sub-dictionary: GAMGSolver's controls read from IT --
+// its own tolerance and relTol, which only the coarsest-level PCG uses, its smoother, its sweeps --
+// and nVcycles, the V-cycles per application (GAMGPreconditioner.C:60, default 2).
+struct GamgPreconditionerControls
+{
+    GamgControls gamg;
+    int nVcycles = 2;
+};
+
 // True for the smoothers gamgSolve runs. The reader refuses the rest by name.
 bool gamgSmootherPorted(const std::string& smoother);
 
@@ -140,6 +149,25 @@ SolverPerformance gamgSolve(
     const std::vector<FvPatch>& patches,
     const GamgAgglomeration& agglomeration,
     const GamgControls& controls,
+    GamgSolveLog* log = nullptr);
+
+// PCG::scalarSolve with the GAMGPreconditioner: `solver PCG; preconditioner { preconditioner GAMG; ...}`,
+// which six of the seven solid-body tutorials name for p_rghFinal and pcorr. Each application starts
+// from zero and runs nVcycles V-cycles of the SAME cycle gamgSolve runs, on a GAMGSolver built on the
+// PCG's own matrix with the sub-dictionary's controls; between cycles the residual is recomputed. The
+// preconditioner is built only if the first residual does not already satisfy the tolerance, as
+// PCG.C builds it. tolerance, relTol, maxIter and minIter are the PCG's.
+SolverPerformance pcgGamgSolve(
+    const FvScalarMatrix& M,
+    std::vector<scalar>& psi,
+    const PrimitiveMesh& m,
+    const std::vector<FvPatch>& patches,
+    const GamgAgglomeration& agglomeration,
+    scalar tolerance,
+    scalar relTol,
+    int maxIter,
+    int minIter,
+    const GamgPreconditionerControls& precond,
     GamgSolveLog* log = nullptr);
 
 } // namespace brae

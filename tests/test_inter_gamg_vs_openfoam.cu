@@ -169,7 +169,10 @@ int main(
     InterFields fin;
     const RunReport r = runInterFoam(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/false, &fin);
     check("brae ran the same number of steps", r.steps == nSteps);
-    check("the case names GAMG for p_rghFinal, and brae read it so", fin.pSolveFinal.gamgSolver());
+    // `pcgGamg*`: PCG with a GAMG PRECONDITIONER, the solid-body tutorials' form
+    const bool preconditioned = profile.rfind("pcgGamg", 0) == 0;
+    check("the case names GAMG for p_rghFinal, and brae read it so",
+          preconditioned ? fin.pSolveFinal.pcgGamg() : fin.pSolveFinal.gamgSolver());
 
     // THE HIERARCHY
     const std::vector<OfLevel> ofLevels = readOfLevels(logPath);
@@ -244,11 +247,24 @@ int main(
     // (`coarsest`, whose 459-cell level takes the most iterations). Bound 1e-5. With the coarsest
     // level solved to 1e-12 instead of the entry's own tolerance NOT ONE count is OpenFOAM's -- and
     // the fields do not move a digit, so this arm is the only thing that holds that decision.
+    //
+    // UNDER THE PRECONDITIONER THE COARSEST RESIDUAL IS NOT 1, and is round-off. Its source is the
+    // PCG's residual restricted twelve cells deep, which sums over each aggregate and so cancels to
+    // the aggregate's net flux imbalance -- about 1e-26 on `pcgGamg` -- and a solve from zero is then
+    // normalised by sum|source| + 1e-20 (solverPerformance::small_): the "initial residual" is the
+    // source's size in units of 1e-20, OpenFOAM's 1.2e-06 to 7.6e-11. Below the preconditioner's own
+    // tolerance the solve takes NO iteration and the coarsest level contributes a zero correction,
+    // which is what OpenFOAM does in six of the eight V-cycles here. MEASURED: all eight counts
+    // OpenFOAM's; the residuals 3.3e-04 apart, which is the cancellation of 1e-12 per-cell residuals
+    // down to 1e-26 read to its last digits. On those profiles the residual bound is 1e-3; the
+    // counts are asserted exactly, as everywhere.
+    const scalar coarseResidualBound = preconditioned ? scalar(1e-3) : scalar(1e-10);
+    const scalar coarseFinalBound = preconditioned ? scalar(1e-3) : scalar(1e-5);
     const std::vector<LinearSolveRecord> ofC = brae::gatecheck::readOfSolves(logPath, "coarsestLevelCorr");
     check("OpenFOAM logged a coarsest-level solve per V-cycle", !ofC.empty());
     failures += brae::gatecheck::compareSolves("host", r.gamgCoarsestSolves, ofC, nSteps,
-                                               "coarsestLevelCorr", scalar(1e-10), scalar(1e-10),
-                                               scalar(1e-5));
+                                               "coarsestLevelCorr", scalar(1e-10), coarseResidualBound,
+                                               coarseFinalBound);
 
     failures += brae::gatecheck::nonFinite("brae alpha", fin.alpha1.internal);
     failures += brae::gatecheck::nonFinite("brae p_rgh", fin.p_rgh.internal);
@@ -323,6 +339,10 @@ int main(
     if (nDev <= 0)
     {
         std::printf("  (no CUDA device: the device arm is skipped)\n");
+    }
+    else if (preconditioned)
+    {
+        std::printf("  (the GAMG preconditioner is ported on the host only: no device arm)\n");
     }
     else if (!dicSmoother)
     {

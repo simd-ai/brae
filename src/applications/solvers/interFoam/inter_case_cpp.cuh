@@ -214,6 +214,12 @@ struct InterFields
         // tests/interfoam_gamg_vs_openfoam.sh; `gamg` holds that entry's controls
         bool gamgSolver() const { return solver == "GAMG"; }
         GamgControls gamg;
+        // `solver PCG; preconditioner { preconditioner GAMG; ... }` -- brae::pcgGamgSolve, with the
+        // sub-dictionary's controls in `gamgPrecond`. Six of the seven solid-body tutorials name it
+        // for p_rghFinal.
+        bool pcgGamg() const { return solver == "PCG" && gamgPreconditioned; }
+        bool gamgPreconditioned = false;
+        GamgPreconditionerControls gamgPrecond;
     };
     // THE CASE'S alpha SOLVE, which only a MULESCorr case performs (the implicit upwind pre-solve,
     // alphaEqn.H:103-149). It used to run at a struct default of 1e-8 on the host and a hardcoded

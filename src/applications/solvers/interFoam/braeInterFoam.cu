@@ -24,7 +24,8 @@
 //
 // AND p_rgh's LINEAR SOLVER AS THE CASE NAMES IT, host and `-device`: PCG with DIC, or GAMG --
 // OpenFOAM's own faceAreaPair hierarchy, smoother and V-cycle (src/matrices/lduMatrix/solvers/GAMG),
-// which eight of the nine wave tutorials name for p_rghFinal. Every GAMG control whose branch is not
+// which eight of the nine wave tutorials name for p_rghFinal -- and, on the host, PCG with a GAMG
+// PRECONDITIONER, which six of the seven solid-body tutorials name. Every GAMG control whose branch is not
 // ported is refused by name: mergeLevels above 1, another agglomerator, updateInterval,
 // cacheAgglomeration no, interpolateCorrection, directSolveCoarsest, a coarsestLevelCorr dictionary,
 // a processorAgglomerator, and any smoother but DIC, DICGaussSeidel, GaussSeidel and symGaussSeidel
@@ -38,8 +39,7 @@
 // needs and no earlier case had. `-device` refuses both. Still refused by name: a cellZone or cellSet,
 // every other motionSolver, `correctPhi yes` (the default on a moving mesh), a turbulent or a wave
 // case on a moving mesh, points0, and a restart of a moved mesh. testTubeMixer and the five sloshing
-// tanks run as shipped but for p_rghFinal's PCG-with-GAMG-preconditioner, which is substituted under
-// a notice.
+// tanks run as shipped.
 //
 // AND THE CASE'S NON-ORTHOGONAL CORRECTIONS, on the host: `corrected` and `limited` laplacians and
 // snGrads on a mesh that is not orthogonal (the tanks' 44 degrees), through the pressure equation,

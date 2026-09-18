@@ -510,6 +510,15 @@ RunReport runInterFoamDevice(
     // three the host runs are refused here rather than run as DIC.
     for (const InterFields::PressureLinearSolve* entry : {&f.pSolve, &f.pSolveFinal})
     {
+        // the GAMG PRECONDITIONER is the host's only: the reader no longer declares it, so the
+        // device does, and says what it runs instead
+        if (entry->pcgGamg())
+        {
+            noticeApproximated("interFoam p_rgh solve on the device",
+                "the case asks for `solver PCG; preconditioner { preconditioner GAMG; ... }` and the "
+                "device loop runs Jacobi-BiCGStab at the same tolerance; the GAMG preconditioner is "
+                "ported on the host loop only (pcgGamgSolve). The difference is where the solve stops.");
+        }
         if (entry->gamgSolver() && !deviceGamgSmootherPorted(entry->gamg.smoother))
         {
             throw std::runtime_error(

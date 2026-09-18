@@ -39,6 +39,14 @@
 #                THE HIERARCHY IS THE MESH'S: the first GAMG solve of the run builds it, from ITS
 #                entry, and the other entry's nCellsInCoarsestLevel is never read.
 #   tutorial     stokesI's own 500 x 75 mesh, ten steps.
+#   pcgGamg      p_rghFinal as the solid-body tutorials write it: `solver PCG; preconditioner {
+#                preconditioner GAMG; tolerance 1e-7; relTol 0; nVcycles 2; smoother DICGaussSeidel;
+#                nPreSweeps 2; }` -- PCG with a GAMGSolver as its preconditioner, two V-cycles from zero
+#                per application, the sub-dictionary its controls. The coarsest-level log is the
+#                preconditioner's.
+#   pcgGamgTol   the same with the sub-dictionary's tolerance 1e-3, nVcycles 3 and the DIC smoother,
+#                against the PCG's 1e-7: the coarsest-level solve takes the PRECONDITIONER's tolerance,
+#                and a port that took the PCG's would read other coarsest counts.
 #   <the other seven tutorials that name GAMG>
 #                stokesII, stokesV, cnoidal, streamFunction, solitary, solitaryGrimshaw and
 #                solitaryMcCowan on the wave gate's meshes and step counts, each AS SHIPPED where that
@@ -70,6 +78,14 @@
 #   post-sweeps without the level multiplier     alpha 9.7e-05
 #   the hierarchy built from the entry in use    `both`: 10 levels for 8, alpha 8.5e-09
 # `square`, `cubes` and `coarsest` exist because of the two lines that read NOTHING without them.
+#
+# THE GAMG PRECONDITIONER (`pcgGamg`, `pcgGamgTol`): 40 of 40 p_rgh counts on both, alpha 4.9e-12 and
+# 3.4e-12, every coarsest-level count OpenFOAM's (8 and 9). BROKEN ONCE EACH:
+#   one V-cycle per application where the entry says two     34 of 40 counts, alpha 1.5e-02
+#   no residual recomputed between the two V-cycles          34 of 40, alpha 1.4e-02
+#   the application starting from the last one's w, not 0    alpha 7.1e-05, final residuals 98% out
+#   the coarsest solve at the PCG's tolerance, not the       0 of 9 coarsest counts; no field moves
+#     preconditioner's own (`pcgGamgTol`: 1e-3 against 1e-7)
 #
 # THE DEVICE LOOP RUNS EVERY DIC PROFILE TOO (sixteen; its GAMG has the DIC smoother and refuses the
 # other three, which tests/interfoam_refusals.sh holds). MEASURED: every p_rgh and every coarsest-level
@@ -158,6 +174,12 @@ elif entry in smoother:
     body = re.sub(r'smoother\s+DIC;', 'smoother        %s;' % smoother[entry], body)
 elif entry in add:
     body += '    ' + add[entry] + '\n    '
+elif entry in ('pcgGamg', 'pcgGamgTol'):
+    tol, cycles, smooth, pre = ('1e-7', '2', 'DICGaussSeidel', 'nPreSweeps 2; ') if entry == 'pcgGamg' \
+                               else ('1e-3', '3', 'DIC', '')
+    body = ('\n        solver          PCG;\n        preconditioner\n        {\n            preconditioner GAMG; '
+            'tolerance %s; relTol 0; nVcycles %s; smoother %s; %s\n        }\n        tolerance       1e-7;\n'
+            '        relTol          0;\n        maxIter         20;\n    ' % (tol, cycles, smooth, pre))
 elif entry == 'deep':
     body, k = re.subn(r'tolerance\s+1e-7;', 'tolerance       1e-12;', body)
     assert k == 1, 'p_rghFinal tolerance not found'
@@ -209,7 +231,7 @@ rc=0
 SMALL="100 1 75"
 stage pcg            stokesI 0.01 20 "$SMALL" pcg            quiet || rc=1
 stage shippedQuiet   stokesI 0.01 20 "$SMALL" shipped        quiet || rc=1
-for entry in shipped deep gaussSeidel symGaussSeidel dicGaussSeidel sweeps coarsest noscale both; do
+for entry in shipped deep gaussSeidel symGaussSeidel dicGaussSeidel sweeps coarsest noscale both pcgGamg pcgGamgTol; do
     stage "$entry"   stokesI 0.01 20 "$SMALL" "$entry"       debug || rc=1
 done
 stage squarePcg      stokesI 0.01 10 "800 1 30" pcg          quiet || rc=1
@@ -248,7 +270,7 @@ grep -q "^GAMG:  Solving for p_rgh.*No Iterations" "$W/both/log.interFoam" \
 [ "$(grep -c '^DICPCG:  Solving for p_rgh' "$W/both/log.interFoam")" = 0 ] \
     || { echo "FAIL: OpenFOAM's both run still solves p_rgh with PCG"; rc=1; }
 
-for entry in shipped deep gaussSeidel symGaussSeidel dicGaussSeidel sweeps coarsest noscale both; do
+for entry in shipped deep gaussSeidel symGaussSeidel dicGaussSeidel sweeps coarsest noscale both pcgGamg pcgGamgTol; do
     gate "$entry" 0.01 20 "$entry" pcg || rc=1
 done
 gate square   0.01 10 square   squarePcg   || rc=1
