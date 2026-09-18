@@ -2814,8 +2814,9 @@ COMPONENTS = {
                         "frozenPointsZone. NOT CLAIMED, because these meshes cannot tell: pointCells' order (the "
                         "pointFaces walk OpenFOAM takes here and the ascending order give the same lists on a block "
                         "mesh) and face::average against a vertex mean for cellMotion (equal on flat parallel faces); "
-                        "the Final solver entry, which moveDynamicMesh never selects; the waveMaker tutorials under "
-                        "interFoam, which still stop at correctPhi; and the device.",
+                        "the Final solver entry, which moveDynamicMesh never selects; and the device. UNDER "
+                        "interFoam: waveMakerSolitary runs as shipped and is gated end to end (interFoam_correctPhi); "
+                        "the other four waveMakers stop at `Gauss interfaceCompression`.",
              note="ONE newPoints(), IN OpenFOAM'S ORDER, all on the mesh before the move (motionSolver.C:200-204, "
                   "displacementLaplacianFvMotionSolver.C:199-318): the inverseDistance diffusivity 1/interpolate(y), "
                   "y the meshWave distance to the named patches (patchWave: FaceCellWave<wallPoint> seeded with the "
@@ -2894,8 +2895,8 @@ COMPONENTS = {
                         "THIS GATE CANNOT SEE, because the motion is rigid: every cell keeps its volume to round-off, "
                         "so V0 against V in fvm::ddt and MULES and Vsc's interpolation inside a sub-cycle move the "
                         "answer by 1e-15 -- transcribed, and gated only by a mesh that deforms. NOT CLAIMED: "
-                        "correctPhi yes (the default on a moving mesh; refused), a turbulent case on a moving mesh "
-                        "(refused), a wave condition on one (refused), the device (refused).",
+                        "a turbulent case on a moving mesh (refused) and the device (refused). correctPhi is "
+                        "interFoam_correctPhi, and a wave condition on a moving mesh runs: see there.",
              note="WHAT interFoam DOES ON A MOVING MESH, in the order of interFoam.C:118-148 and pEqn.H. At the top "
                   "of the first outer corrector: mesh.update(), whose last line is U.correctBoundaryConditions() -- "
                   "a movingWallVelocity takes Uwall = Up + n*(Un - n&Up) with Up the face::centre displacement "
@@ -2920,6 +2921,54 @@ COMPONENTS = {
                   "case needs the same objects mutable -- the points, the geometry, and the patches every patch "
                   "field references -- so runInterFoam takes a MutableMesh naming them, checked by address, and "
                   "refuses a moving case without one."),
+        dict(name="interFoam_correctPhi", of_symbol="CorrectPhi",
+             of_file="src/finiteVolume/cfdTools/general/CorrectPhi/CorrectPhi.C",
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/applications/solvers/interFoam/inter_correct_phi_cpp.cuh",
+             brae_target="",
+             validation="tests/interfoam_moving_vs_openfoam.sh, real OpenFOAM run serially for fixed steps. FIVE "
+                        "PROFILES: the three solid-body tanks with `correctPhi yes` (testTubeMixer; sloshingTank2D's "
+                        "non-orthogonal pcorr laplacian; sloshingCylinder's non-orthogonal corrector, pcorr then "
+                        "pcorrFinal, staged `maxIter 1000` because the shipped 100 leaves PCG unconverged at 0.1 to "
+                        "0.3 in both codes and then reads alpha 7.6e-09 on 22 of 22 counts); laminar/waves/"
+                        "waveMakerSolitary AS SHIPPED, thirty steps -- a deforming mesh, correctPhi by default, an "
+                        "absorbing outlet, an open top; and closed damBreak STARTED MOVING, U (0.1 0 0) against its "
+                        "walls, where initCorrectPhi does 79 iterations of work. Every other profile of the gate "
+                        "compares initCorrectPhi's start-up solve too. MEASURED: every pcorr and p_rgh iteration count "
+                        "OpenFOAM's; waveMakerSolitary alpha 2.9e-12, p_rgh 3.3e-13, U 1.7e-10; the tanks alpha "
+                        "1.4e-12, 3.0e-13, 1.2e-10; the moving dam alpha 1.2e-14, U 2.3e-12. BROKEN ONCE EACH: "
+                        "correctUphiBCs skipped, and phi not rebuilt from Sf & Uf, both stop the run in adjustPhi as "
+                        "OpenFOAM would; rAUf = 1 alpha 3.6e-02; no pcorr reference 4.1e-07; phi left absolute "
+                        "9.9e-01; pcorr's non-orthogonal flux dropped 4.9e-01 (the cylinder -- identically zero with "
+                        "no corrector, since pcorr starts at 0); initCorrectPhi skipped 3.2e-02 on the moving dam; "
+                        "fvm::ddt's V0 as V 1.1e-02 and the sub-cycle's Vsc as V 2.6e-03 on waveMakerSolitary, the "
+                        "first gated case whose cells change volume; the outlet's wave model updated in UEqn "
+                        "rather than at the mesh update U 2.0e-05. NOT CLAIMED: the curvature pass after "
+                        "CorrectPhi (under 3e-13 on these tanks), the corrected flux handed to flux-conditional "
+                        "patches (a closed tank has none), a divU, and the device (it runs initCorrectPhi on the "
+                        "host and refuses a moving mesh).",
+             note="ONE CorrectPhi (CorrectPhi.C:36-117): correctUphiBCs when the mesh is changing -- every velocity "
+                  "patch that FIXES A VALUE evaluated again, a pressureInletOutletVelocity against the Sf & Uf "
+                  "flux, and phi there set to U_b & Sf; pcorr zero, fixedValue where p_rgh fixes a value and "
+                  "zeroGradient elsewhere; on a closed domain phi made relative, adjustPhi, made absolute; "
+                  "laplacian(rAUf, pcorr) == div(phi), pinned at cell 0 to 0 when it needs a reference, solved "
+                  "nNonOrthogonalCorrectors + 1 times with pcorrFinal last; phi -= flux() on the last pass, the "
+                  "face correction included. interFoam.C:136-146 then makes phi relative and calls "
+                  "mixture.correct(), which recomputes nHatf on the moved mesh. initCorrectPhi.H runs it at the "
+                  "start of EVERY case with rAUf exactly 1 (OpenFOAM's interpolation of a uniform 1 is exact); on "
+                  "a case at rest it is one solve of zero iterations, and no existing gate moved a digit when it "
+                  "went in. rAU is kept across steps under correctPhi (pEqn.H:4). THREE THINGS CHANGED ON THE WAY: "
+                  "pressureInletOutletVelocity now FIXES A VALUE, as directionMixed does in OpenFOAM (it said "
+                  "false; switching it moved nothing on damBreak, waves or capillaryRise, host or device); PCG "
+                  "with a GAMG preconditioner builds the mesh's hierarchy only when its initial residual has not "
+                  "converged, as PCG.C constructs its preconditioner, so a pcorr at rest neither builds it nor "
+                  "flips the pairing direction; and on a moving mesh the wave velocity model updates at the mesh "
+                  "update, where OpenFOAM's log has it. A wave condition on a moving mesh is no longer refused: "
+                  "OpenFOAM's model keeps its construction geometry and reads the patch's current magSf, and "
+                  "brae's does the same. OPEN, found on the way: brae's dictionary expansion resolves `$name` only "
+                  "against literal keys, where OpenFOAM's matches patterns too (REGEX_RECURSIVE) -- the two "
+                  "multi-paddle waveMakers write `p_rgh { $pcorr; ... }` against a `\"(pcorr|pcorrFinal)\"` "
+                  "entry, and brae reads no solver there and approximates p_rgh under a notice."),
         dict(name="interFoam_pressureReference", of_symbol="setRefCell",
              of_file="src/finiteVolume/cfdTools/general/findRefCell/findRefCell.C",
              classification="GPU_REQUIRED", status="REIMPLEMENT",

@@ -646,13 +646,17 @@ InterFields buildInterFields(const std::string&          caseDir,
         f.correctPhi = switchOr("correctPhi", dynamic);
         f.checkMeshCourantNo = switchOr("checkMeshCourantNo", false);
         f.moveMeshOuterCorrectors = switchOr("moveMeshOuterCorrectors", false);
-        if (dynamic && f.correctPhi)
+        // initCorrectPhi.H: under correctPhi, rAU is a field kept across steps, READ_IF_PRESENT and
+        // 1 when absent; pEqn.H:4 then assigns 1/UEqn.A() into it and never clears it, so every mesh
+        // update's CorrectPhi interpolates the LAST corrector's rAU
+        f.rAU.assign(static_cast<std::size_t>(m.nCells()), scalar(1));
+        if (f.correctPhi
+            && (std::filesystem::exists(startDir + "/rAU") || std::filesystem::exists(startDir + "/rAU.gz")))
         {
             throw std::runtime_error(
-                "brae interFoam: the mesh moves and PIMPLE's `correctPhi` is on (it defaults to on for a "
-                "moving mesh; the solid-body tutorials write `correctPhi no`). interFoam.C:136-146 then "
-                "rebuilds phi from Uf after every mesh update and solves CorrectPhi's pcorr equation "
-                "against it, which is not ported. Refused rather than run without the correction.");
+                "brae interFoam: " + startDir + "/rAU exists. initCorrectPhi.H reads it (READ_IF_PRESENT) "
+                "as the rAU the first CorrectPhi interpolates; brae starts from 1, which is what "
+                "OpenFOAM does only without the file.");
         }
     }
 
@@ -738,7 +742,9 @@ InterFields buildInterFields(const std::string&          caseDir,
                 "defect this replaced.");
         // lduMatrix::solver::readControls (lduMatrixSolver.C:195-205): tolerance 1e-6, relTol 0,
         // maxIter 1000 when absent.
-        auto readSolve = [&](const FoamDict& d)
+        auto readSolve = [&](
+            const FoamDict& d,
+            const std::string& field)
         {
             InterFields::PressureLinearSolve s;
             s.solver = d.wordOr("solver", "");
@@ -770,7 +776,7 @@ InterFields buildInterFields(const std::string&          caseDir,
                             pd->scalarOr("tolerance", scalar(1e-6)),
                             pd->scalarOr("relTol", scalar(0)),
                             static_cast<int>(pd->scalarOr("maxIter", scalar(1000))),
-                            "brae interFoam: fvSolution's GAMG preconditioner for p_rgh ");
+                            "brae interFoam: fvSolution's GAMG preconditioner for " + field + " ");
                         s.gamgPrecond.nVcycles = pd->intOr("nVcycles", 2);
                     }
                     else
@@ -786,24 +792,62 @@ InterFields buildInterFields(const std::string&          caseDir,
                     s.tol,
                     s.relTol,
                     s.maxIter,
-                    "brae interFoam: fvSolution's GAMG entry for p_rgh ");
+                    "brae interFoam: fvSolution's GAMG entry for " + field + " ");
             }
+            return s;
+        };
+        auto noticeUnported = [&](const InterFields::PressureLinearSolve& s)
+        {
             if (!s.pcgDIC() && !s.gamgSolver() && !s.pcgGamg())
                 noticeApproximated("interFoam p_rgh solve",
                     "the case asks for `solver " + s.solver + "; preconditioner " +
                     s.preconditioner + ";` and brae runs PBiCGStab at the same tolerance. Only "
                     "PCG with DIC is OpenFOAM's own solver here; the difference is where the solve "
                     "stops, which on a VoF case is visible as alpha's over-1 excursion.");
-            return s;
         };
-        f.pSolve = readSolve(*pr);
+        f.pSolve = readSolve(*pr, "p_rgh");
+        noticeUnported(f.pSolve);
         if (!pf)
             throw std::runtime_error(
                 "brae interFoam: fvSolution has `solvers/p_rgh` but no `p_rghFinal`. pEqn.H solves "
                 "the last corrector with p_rgh.select(finalInnerIter()), which OpenFOAM resolves to "
                 "the Final entry and refuses to run without; guessing it would pick the last "
                 "corrector's stopping point for the case.");
-        f.pSolveFinal = readSolve(*pf);
+        f.pSolveFinal = readSolve(*pf, "p_rghFinal");
+        noticeUnported(f.pSolveFinal);
+
+        // solvers/pcorr and pcorrFinal: CorrectPhi's solve, which initCorrectPhi.H runs at the start of
+        // EVERY case -- moving or not, correctPhi or not -- and interFoam.C:139 after every mesh update
+        // under `correctPhi`. pcorr.select(finalNonOrthogonalIter()) takes pcorrFinal on the last
+        // non-orthogonal pass and pcorr on the others, and OpenFOAM stops without the one it asks for.
+        // No approximation here: every tutorial names PCG with DIC, PCG with a GAMG preconditioner, or
+        // GAMG, and a zero right-hand side -- the start of a case at rest -- is exact under all three.
+        auto readPcorr = [&](
+            const std::string& field,
+            InterFields::PressureLinearSolve& out)
+        {
+            const FoamDict* d = sv->subDict(field);
+            if (!d)
+            {
+                throw std::runtime_error(
+                    "brae interFoam: fvSolution has no `solvers/" + field + "` entry. CorrectPhi "
+                    "(CorrectPhi.C:111) solves pcorr with it -- at the start of every case, from "
+                    "initCorrectPhi.H -- and OpenFOAM stops without it.");
+            }
+            out = readSolve(*d, field);
+            if (!out.pcgDIC() && !out.gamgSolver() && !out.pcgGamg())
+            {
+                throw std::runtime_error(
+                    "brae interFoam: fvSolution solves " + field + " with `solver " + out.solver +
+                    "; preconditioner " + out.preconditioner + ";`. Only PCG with DIC, PCG with a "
+                    "GAMG preconditioner and GAMG are ported for CorrectPhi's pcorr.");
+            }
+        };
+        readPcorr("pcorrFinal", f.pcorrSolveFinal);
+        if (f.nNonOrthogonalCorrectors > 0)
+        {
+            readPcorr("pcorr", f.pcorrSolve);
+        }
     }
 
     // relaxationFactors/equations -- see InterFields::relaxEquationU.
@@ -887,13 +931,11 @@ InterFields buildInterFields(const std::string&          caseDir,
             "follows the mesh (wallDist::movePoints) and the closure's own moving-mesh terms are not "
             "ported; refused rather than run the closure on the mesh as it started.");
     }
-    if (f.dynamicMesh && f.waves.any)
-    {
-        throw std::runtime_error(
-            "brae interFoam: the mesh moves and a patch carries a wave condition. The wave models take "
-            "their geometry once, at construction (waveModel::initialiseGeometry); on a moving patch that "
-            "is not the patch the condition is applied to. Not ported; no tutorial combines the two.");
-    }
+    // A WAVE CONDITION ON A MOVING MESH IS NOT REFUSED. OpenFOAM's wave models take their geometry once,
+    // at construction (waveModel::initialiseGeometry: the patch's orientation, each face's height and
+    // paddle), and read only its magSf and its face cells' alpha as the run goes (waveModel::waterLevel);
+    // brae's WaveModel does the same, through the patch the mesh update rebuilds in place. The five
+    // waveMaker tutorials absorb at a wall whose points the motion pins, where the two are one geometry.
 
     // --- gh, ghf and p ------------------------------------------------------------------------
     ghField(f.g, f.ghRefValue, g.C(), f.gh);

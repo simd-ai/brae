@@ -241,6 +241,14 @@ struct InterFields
     PressureLinearSolve pSolve;
     // solvers/p_rghFinal
     PressureLinearSolve pSolveFinal;
+    // solvers/pcorr and pcorrFinal, for CorrectPhi -- pcorr is read only when a non-orthogonal
+    // corrector asks for it
+    PressureLinearSolve pcorrSolve;
+    PressureLinearSolve pcorrSolveFinal;
+    // rAU as pEqn.H leaves it for the next mesh update's CorrectPhi: 1 at the start (initCorrectPhi.H),
+    // then 1/UEqn.A() of the last corrector. Its patch values are the face cells' (A() is
+    // extrapolatedCalculated), which is what fvc::interpolate's boundary takes.
+    std::vector<scalar> rAU;
     // relaxationFactors/equations. THE QUESTION IS "DOES THE CASE NAME ONE", not "is it below 1":
     // fvMatrix::relax() is `if (mesh.relaxEquation(name, coeff)) relax(coeff)` and relaxEquation is
     // `found(name) || found("default")` (solution.C:330-334), so a case naming 1 relaxes -- the

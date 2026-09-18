@@ -16,6 +16,7 @@
 #include "device_gate_finite.cuh"
 #include "inter_solve_log.cuh"
 #include <cmath>
+#include <filesystem>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -156,13 +157,23 @@ int main(
     mutableMesh.patches = &patches;
 
     InterFields fin;
+    PressureTaps taps;
     const RunReport r = runInterFoam(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/false, &fin,
-                                     scalar(1.0e300), nullptr, &mutableMesh);
+                                     scalar(1.0e300), &taps, &mutableMesh);
     // `closed*`: a closed tank whose mesh does NOT move -- the pressure reference alone
     const bool moving = profile.rfind("closed", 0) != 0;
     check("brae ran the same number of steps", r.steps == nSteps);
     check("the case moves its mesh, and brae read it so", (fin.dynamicMesh != nullptr) == moving);
-    check("p_rgh needs a reference on this closed tank, and brae read it so", fin.pRef.needReference);
+    // waves/waveMakerSolitary is OPEN: a totalPressure atmosphere fixes p_rgh's level
+    const bool open = profile.rfind("solitary", 0) == 0;
+    if (open)
+    {
+        check("p_rgh is fixed at the atmosphere, and brae read it so", !fin.pRef.needReference);
+    }
+    else
+    {
+        check("p_rgh needs a reference on this closed tank, and brae read it so", fin.pRef.needReference);
+    }
     std::printf("  motion: %s; pRefCell %d, pRefValue %g\n",
                 fin.dynamicMesh ? fin.dynamicMesh->motionType().c_str() : "none",
                 (int)fin.pRef.pRefCell, (double)fin.pRef.pRefValue);
@@ -191,6 +202,19 @@ int main(
     // THE SOLVES: every p_rgh line, iteration counts and residuals
     const std::vector<LinearSolveRecord> ofP = brae::gatecheck::readOfPressureSolves(logPath);
     failures += brae::gatecheck::compareSolves("host", r.pSolves, ofP, nSteps, "p_rgh", scalar(1e-10),
+                                               scalar(1e-6));
+
+    // ...AND EVERY pcorr LINE: initCorrectPhi's at the start of every profile -- moving or not, with
+    // correctPhi or without -- and on a `*CorrectPhi` profile CorrectPhi's after every mesh update, one
+    // per non-orthogonal pass
+    const std::vector<LinearSolveRecord> ofPcorr = brae::gatecheck::readOfSolves(logPath, "pcorr");
+    const bool correctPhiOn = fin.correctPhi && moving;
+    std::printf("  pcorr solves: brae %zu, OpenFOAM %zu%s\n", r.pcorrSolves.size(), ofPcorr.size(),
+                correctPhiOn ? " (correctPhi on)" : " (the start only)");
+    check("OpenFOAM's log shows CorrectPhi at the start, and after every mesh update where correctPhi is on",
+          !ofPcorr.empty()
+          && (correctPhiOn ? ofPcorr.size() > static_cast<std::size_t>(nSteps) : ofPcorr.size() <= 2));
+    failures += brae::gatecheck::compareSolves("host", r.pcorrSolves, ofPcorr, nSteps, "pcorr", scalar(1e-10),
                                                scalar(1e-6));
 
     const std::vector<scalar> ofAlpha = cellValues(readField<scalar>(ofDir + "/" + fin.alphaName), nC);
@@ -233,6 +257,85 @@ int main(
         check("the moving walls carry OpenFOAM's velocity", nWall > 0 && dWall <= scalar(1e-12)*wallScale);
     }
 
+    // THE PRESSURE CORRECTOR TERM BY TERM, when the case was run with tools/dumpInterFoam rather than
+    // interFoam (BRAE_DUMP_ITER = the last step): both sides hold the last corrector of the last step.
+    // Cells beside a moving wall are split from the rest. A diagnostic, not an arm: the staging script
+    // runs interFoam, and this block is how a gap on a moving mesh is taken apart.
+    if (std::filesystem::exists(ofDir + "/rAU.dump"))
+    {
+        std::vector<bool> wallCell(static_cast<std::size_t>(nC), false);
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (!fin.movingWallVelocityPatch[pi]) continue;
+            for (label i = 0; i < patches[pi].size; ++i)
+            {
+                wallCell[static_cast<std::size_t>(patches[pi].faceCells[i])] = true;
+            }
+        }
+        const label nIf = m.nInternalFaces();
+        auto report = [&](
+            const char* name,
+            const std::vector<scalar>& brae,
+            const std::string& file,
+            bool faces)
+        {
+            if (!std::filesystem::exists(file))
+            {
+                std::printf("    %-10s (no dump)\n", name);
+                return;
+            }
+            const FieldData<scalar> fd = readField<scalar>(file);
+            const std::size_t n = static_cast<std::size_t>(faces ? nIf : nC);
+            const std::vector<scalar> of = fd.internalUniform
+                ? std::vector<scalar>(n, fd.internalUniformValue)
+                : fd.internalField;
+            if (of.size() != n || brae.size() != n)
+            {
+                std::printf("    %-10s size mismatch (brae %zu, OpenFOAM %zu, expected %zu)\n",
+                            name, brae.size(), of.size(), n);
+                return;
+            }
+            scalar wW = 0;
+            scalar wI = 0;
+            scalar sc = 0;
+            std::size_t at = 0;
+            for (std::size_t k = 0; k < n; ++k)
+            {
+                const bool wall = faces
+                    ? (wallCell[static_cast<std::size_t>(m.owner()[k])] || wallCell[static_cast<std::size_t>(m.neighbour()[k])])
+                    : wallCell[k];
+                const scalar e = std::fabs(brae[k] - of[k]);
+                if (e > std::fmax(wW, wI))
+                {
+                    at = k;
+                }
+                if (wall)
+                {
+                    wW = std::fmax(wW, e);
+                }
+                else
+                {
+                    wI = std::fmax(wI, e);
+                }
+                sc = std::fmax(sc, std::fabs(of[k]));
+            }
+            std::printf("    %-10s moving wall %.3e  rest %.3e  of %.3e  (relative %.2e; worst %s %zu: brae %.12e, OF %.12e)\n",
+                        name, (double)wW, (double)wI, (double)sc,
+                        (double)(std::fmax(wW, wI)/std::fmax(sc, scalar(1e-300))),
+                        faces ? "face" : "cell", at, (double)brae[at], (double)of[at]);
+        };
+        std::printf("  pressure corrector against tools/dumpInterFoam, last corrector of step %ld:\n",
+                    (long)nSteps);
+        report("UEqn.A", taps.A, ofDir + "/UEqnA.dump", false);
+        report("rAU", taps.rAU, ofDir + "/rAU.dump", false);
+        report("rAUf", taps.rAUf, ofDir + "/rAUf.dump", true);
+        report("stf", taps.stf, ofDir + "/stf.dump", true);
+        report("snGradRho", taps.snGradRho, ofDir + "/snGradRho.dump", true);
+        report("phig", taps.phig, ofDir + "/phig.dump", true);
+        report("phiHbyA", taps.phiHbyA, ofDir + "/phiHbyA.dump", true);
+        report("rho", fin.rho, ofDir + "/rho.dump", false);
+    }
+
     // BOUNDS: see the script for what was measured
     check("alpha agrees with OpenFOAM's absolutely", dA.linf < scalar(1e-9));
     check("p_rgh agrees with OpenFOAM's relatively", dP.rel() < scalar(1e-8));
@@ -254,11 +357,23 @@ int main(
     {
         const Diff cP = compare(cellValues(readField<scalar>(staticDir + "/p"), nC), ofP2);
         const Diff cU = compare(cellValues(readField<vector>(staticDir + "/U"), nC), ofU);
-        std::printf("  CONTROL: OpenFOAM with pRefValue 1e5 against OpenFOAM with 0, p relative %.4e, "
-                    "U relative %.4e\n", (double)cP.rel(), (double)cU.rel());
-        check("the reference value moves OpenFOAM's own p far more than brae is from it",
-              cP.rel() > scalar(1000)*std::fmax(dPp.rel(), scalar(1e-14)));
-        check("...and its U not at all", cU.rel() < scalar(1e-9));
+        if (profile == "closedDamBreakInitU")
+        {
+            // the same closed tank STARTED AT REST: what the initial motion, and the start-up
+            // CorrectPhi that makes its flux divergence-free, are worth
+            std::printf("  CONTROL: OpenFOAM's tank started at rest against OpenFOAM's started moving, U "
+                        "relative %.4e, p relative %.4e\n", (double)cU.rel(), (double)cP.rel());
+            check("starting the tank moving moves OpenFOAM's own U far more than brae is from it",
+                  cU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)));
+        }
+        else
+        {
+            std::printf("  CONTROL: OpenFOAM with pRefValue 1e5 against OpenFOAM with 0, p relative %.4e, "
+                        "U relative %.4e\n", (double)cP.rel(), (double)cU.rel());
+            check("the reference value moves OpenFOAM's own p far more than brae is from it",
+                  cP.rel() > scalar(1000)*std::fmax(dPp.rel(), scalar(1e-14)));
+            check("...and its U not at all", cU.rel() < scalar(1e-9));
+        }
     }
 
     std::printf("test_inter_moving_vs_openfoam: %d failures\n", failures);

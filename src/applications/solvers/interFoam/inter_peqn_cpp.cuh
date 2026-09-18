@@ -298,7 +298,17 @@ struct PressureStepInput
     // make phi relative to the motion, so the phi that leaves the corrector is the RELATIVE flux.
     const SurfaceScalarField* meshPhi = nullptr;
     SurfaceVectorField* Uf = nullptr;
+    // out: rAU = 1/UEqn.A() of this corrector, which interFoam keeps for CorrectPhi; null = not kept
+    std::vector<scalar>* rAUOut = nullptr;
 };
+
+// fvc::makeRelative(phi, U) and makeAbsolute (fvcMeshPhi.C:76, :121) on a moving mesh
+void makeRelativeFlux(
+    SurfaceScalarField& phi,
+    const SurfaceScalarField& meshPhi);
+void makeAbsoluteFlux(
+    SurfaceScalarField& phi,
+    const SurfaceScalarField& meshPhi);
 
 // U.correctBoundaryConditions() FOR THE FLUX-CONDITIONAL VELOCITY PATCHES, which evaluateBoundary()
 // alone does not resolve. pressureInletOutletVelocity is a directionMixed: OpenFOAM's evaluate() leaves

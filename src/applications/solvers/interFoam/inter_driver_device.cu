@@ -4,6 +4,7 @@
 // is separately landed and separately gated; what this file owns is the wiring, and that wiring is
 // what tests/test_device_inter_dambreak_alpha.cu measures against the host driver on damBreak.
 #include "inter_driver_cpp.cuh"
+#include "inter_correct_phi_cpp.cuh"
 #include "inter_case_cpp.cuh"
 #include "inter_peqn_cpp.cuh"
 #include "inter_ueqn_cpp.cuh"
@@ -143,6 +144,42 @@ RunReport runInterFoamDevice(
             "brae interFoam (device): U's patch `" + fvp[pi].name + "` names the flux `" + name
             + "` in its `phi` entry, and the device loop's velocity switch reads phi. The host path "
             "(no -device) hands each patch the flux it names.");
+    }
+
+    // initCorrectPhi.H, on the host and before anything is uploaded -- see runInterFoam. A GAMG pcorr
+    // SOLVER builds the mesh's hierarchy even at rest (the GAMGSolver constructor builds it before the
+    // first residual), and OpenFOAM's p_rgh GAMG then reuses that one; the device builds its own from
+    // p_rgh's entry, which is the same hierarchy only when the two ask for the same coarsest level.
+    std::vector<LinearSolveRecord> initPcorrSolves;
+    {
+        GamgAgglomerationCache initCache;
+        CorrectPhiControls cpc;
+        cpc.pcorr = &f.pcorrSolve;
+        cpc.pcorrFinal = &f.pcorrSolveFinal;
+        cpc.gamgCache = &initCache;
+        cpc.correctedLaplacian = f.laplacianScheme.corrected;
+        cpc.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
+        cpc.nNonOrthogonalCorrectors = f.nNonOrthogonalCorrectors;
+        const SurfaceScalarField one = unitFaceField(m, fvp);
+        CorrectPhiInput cin;
+        cin.rAUf = &one;
+        cin.rhoPhi = &f.rhoPhi;
+        cin.solveLog = &initPcorrSolves;
+        correctPhi(f.U, f.phi, f.p_rgh, cin, cpc, m, g, fvp);
+        pushFluxToPatches(f, fvp);
+        for (const InterFields::PressureLinearSolve* ps : {&f.pSolve, &f.pSolveFinal})
+        {
+            if (initCache.built && ps->gamgSolver()
+                && ps->gamg.nCellsInCoarsestLevel != f.pcorrSolveFinal.gamg.nCellsInCoarsestLevel)
+            {
+                throw std::runtime_error(
+                    "brae interFoam -device: pcorrFinal is GAMG with nCellsInCoarsestLevel " +
+                    std::to_string(f.pcorrSolveFinal.gamg.nCellsInCoarsestLevel) + " and p_rgh with " +
+                    std::to_string(ps->gamg.nCellsInCoarsestLevel) + ". OpenFOAM's p_rgh reuses the "
+                    "hierarchy pcorr built at the start; the device builds its own from p_rgh's entry. "
+                    "Run without -device.");
+            }
+        }
     }
 
     DeviceMesh dm = buildDeviceMesh(m, g, fvp);
@@ -592,6 +629,7 @@ RunReport runInterFoamDevice(
     DeviceVectorBoundary dbU = buildDeviceVectorBoundary(f.U, fvp, g);
 
     RunReport rep;
+    rep.pcorrSolves = initPcorrSolves;
     rep.deltaT = f.deltaT;
     rep.turbulenceOnDevice = deviceClosure;
     for (label s = 0; s < nSteps; ++s)

@@ -37,6 +37,15 @@
 // evaluated at the step's time 1.0e-04; no fourth update in UEqn 9.5e-03, and the update ORDER arm
 // fails; the active absorption left out 2.1e-01.
 //
+// ON A MOVING MESH the velocity model's first update of a step is EARLIER: dynamicMotionSolverFvMesh::
+// update() ends in U.correctBoundaryConditions(), so OpenFOAM's log prints "Updating ... wave model"
+// right after the motion solve, ahead of CorrectPhi's pcorr and the alpha sub-cycles, and an absorber
+// reads the water level the previous step left. The driver makes that call in its mesh-update stage,
+// and UEqn's is then a no-op for the time index. Measured on waveMakerSolitary (its outlet absorbs):
+// updated in UEqn instead, U 2.0e-05 and alpha 1.3e-08 from OpenFOAM after thirty steps, against
+// 1.7e-10 and 2.9e-12, and step one's pcorr takes 167 iterations to OpenFOAM's 168 -- the velocity
+// correctUphiBCs writes into phi at the outlet is the stale one.
+//
 // UNDER MULESCorr the first updateCoeffs of a sub-cycle is the pre-solve's matrix construction instead,
 // and THAT position is gated (the gate's `mulescorr` profile): updating after the pre-solve reads
 // alpha 8.9e-07 from OpenFOAM, against 1.1e-10.

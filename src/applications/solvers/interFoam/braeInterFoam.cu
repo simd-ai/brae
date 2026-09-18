@@ -31,15 +31,18 @@
 // a processorAgglomerator, and any smoother but DIC, DICGaussSeidel, GaussSeidel and symGaussSeidel
 // -- on `-device`, any smoother but DIC. Any OTHER solver for p_rgh still substitutes, under a notice.
 //
-// AND A MESH IN SOLID-BODY MOTION, on the host: dynamicMotionSolverFvMesh with the solidBody solver
-// moving the whole mesh under any of OpenFOAM's motion functions but drivenLinearMotion
-// (src/dynamicFvMesh, src/meshTools/solidBodyMotionFunctions), with movingWallVelocity walls, the
-// relative flux, Uf and the old volumes where interFoam.C and pEqn.H read them -- and a CLOSED tank's
-// pressure reference (pRefCell or pRefPoint, pRefValue, adjustPhi), which every solid-body tutorial
-// needs and no earlier case had. `-device` refuses both. Still refused by name: a cellZone or cellSet,
-// every other motionSolver, `correctPhi yes` (the default on a moving mesh), a turbulent or a wave
-// case on a moving mesh, points0, and a restart of a moved mesh. testTubeMixer and the five sloshing
-// tanks run as shipped.
+// AND A MOVING MESH, on the host: dynamicMotionSolverFvMesh with the solidBody solver moving the
+// whole mesh under any of OpenFOAM's motion functions but drivenLinearMotion
+// (src/dynamicFvMesh, src/meshTools/solidBodyMotionFunctions), or with displacementLaplacian DEFORMING
+// it from waveMaker paddles (src/fvMotionSolver, src/waveModels/derivedPointPatchFields), with
+// movingWallVelocity walls, the relative flux, Uf and the old volumes where interFoam.C and pEqn.H
+// read them; CorrectPhi after every update under `correctPhi` (the default on a moving mesh) and at
+// the start of EVERY case (initCorrectPhi.H); a wave absorber on a moving mesh; and a CLOSED tank's
+// pressure reference (pRefCell or pRefPoint, pRefValue, adjustPhi). `-device` refuses a moving mesh
+// and a closed tank. Still refused by name: a cellZone or cellSet, every other motionSolver, a
+// turbulent case on a moving mesh, points0, and a restart of a moved mesh. testTubeMixer, the five
+// sloshing tanks and waveMakerSolitary run as shipped; the other four waveMakers stop at
+// `Gauss interfaceCompression`.
 //
 // AND THE CASE'S NON-ORTHOGONAL CORRECTIONS, on the host: `corrected` and `limited` laplacians and
 // snGrads on a mesh that is not orthogonal (the tanks' 44 degrees), through the pressure equation,

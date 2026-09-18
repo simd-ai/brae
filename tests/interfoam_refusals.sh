@@ -262,7 +262,10 @@ arm moving_unknownFunction  refused "solidBodyMotionFunction \`wobble\`" "" "sed
 arm moving_drivenLinear     refused "drivenLinearMotion"      "" "sed -i 's/^solidBodyMotionFunction .*/solidBodyMotionFunction drivenLinearMotion;/' constant/dynamicMeshDict"
 arm moving_omegaTable       refused "Function1 \`table\`"    "" "sed -i 's/omega  *6.2832;.*/omega           table ((0 6.2832) (1 6.2832));/' constant/dynamicMeshDict"
 arm moving_points0          refused "points0 exists"          "" "cp constant/polyMesh/points constant/polyMesh/points0"
-arm moving_correctPhi       refused "correctPhi"              "" "sed -i 's/correctPhi  *no;/correctPhi      yes;/' system/fvSolution"
+# correctPhi is ported (tests/interfoam_moving_vs_openfoam.sh's *CorrectPhi profiles); CorrectPhi's
+# pcorrFinal entry, which every case now reads at its start, is refused by name when it is missing
+arm moving_correctPhi       runs    -                        "" "sed -i 's/correctPhi  *no;/correctPhi      yes;/' system/fvSolution"
+arm moving_noPcorr          refused "solvers/pcorrFinal"     "" "sed -i 's/\"pcorr\.\*\"/pcorrNot/' system/fvSolution"
 arm moving_noRefValue       refused "no pRefValue"            "" "sed -i '/pRefValue/d' system/fvSolution"
 arm moving_noRefPoint       refused "neither pRefCell nor pRefPoint" "" "sed -i '/pRefPoint/d' system/fvSolution"
 arm moving_refPointOutside  refused "lies in no cell"         "" "sed -i 's/^\( *\)pRefPoint .*/\1pRefPoint (1 1 1);/' system/fvSolution"

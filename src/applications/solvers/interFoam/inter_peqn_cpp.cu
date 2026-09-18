@@ -444,6 +444,10 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
     const std::vector<scalar> A = matrixA(*in.UEqn, m, g, patches);
     std::vector<scalar> rAU(static_cast<std::size_t>(nC));
     for (label c = 0; c < nC; ++c) rAU[c] = scalar(1) / A[c];
+    if (in.rAUOut)
+    {
+        *in.rAUOut = rAU;
+    }
     const SurfaceScalarField rAUfField = fvc::interpolate(rAU, m, g, patches);
 
     // HbyA = constrainHbyA(rAU*UEqn.H(), U, p_rgh).
@@ -629,9 +633,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
                     "brae interFoam pEqn: the case names a GAMG preconditioner for p_rgh and the caller "
                     "handed in no agglomeration cache. The hierarchy is the mesh's and has to outlive the step.");
             }
-            const GamgAgglomeration& agglomeration =
-                sc.gamgCache->get(m, g, pcgGamgCtl->gamg.nCellsInCoarsestLevel);
-            sp = pcgGamgSolve(pe, p_rgh.internal, m, patches, agglomeration, tol, relTol, maxIter, 0,
+            sp = pcgGamgSolve(pe, p_rgh.internal, m, g, patches, *sc.gamgCache, tol, relTol, maxIter, 0,
                               *pcgGamgCtl, in.gamgLog);
         }
         else if (gamgCtl)

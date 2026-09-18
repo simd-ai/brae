@@ -1804,6 +1804,12 @@ public:
     // at every pressureInletOutletVelocity patch -- an outlet that is supposed to let the pressure set
     // its own inflow.
     bool assignable() const override { return true; }
+    // TRUE AS WELL, and for the same reason: directionMixedFvPatchField.H:130 says so and the derived
+    // class does not override it. correctUphiBCs (CorrectPhi) re-evaluates exactly the velocity patches
+    // that fix a value and writes phi there from U_b & Sf; ddtCorr zeroes its coefficient on them; and
+    // adjustPhi counts their outflow as fixed. This class answered false until correctPhi was ported,
+    // and switching it moved nothing on the damBreak, waves or capillaryRise gates, host or device.
+    bool fixesValue() const override { return true; }
     using ExtrapolatedValuePatchField<T>::ExtrapolatedValuePatchField;
     int bcCategory() const override { return 6; }                  // device: pressureInletOutletVelocity (outlet, adjustable flux)
 

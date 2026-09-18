@@ -180,4 +180,22 @@ SolverPerformance pcgGamgSolve(
     const GamgPreconditionerControls& precond,
     GamgSolveLog* log = nullptr);
 
+// ...and the form a solver uses, which hands in the MESH's hierarchy cache rather than a hierarchy:
+// PCG constructs its preconditioner only when the initial residual has not already converged
+// (PCG.C:111-118), so a solve that converges there -- pcorr at the start of a case at rest -- never
+// builds the hierarchy, nor flips the pairing direction the next build starts from.
+SolverPerformance pcgGamgSolve(
+    const FvScalarMatrix& M,
+    std::vector<scalar>& psi,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    GamgAgglomerationCache& cache,
+    scalar tolerance,
+    scalar relTol,
+    int maxIter,
+    int minIter,
+    const GamgPreconditionerControls& precond,
+    GamgSolveLog* log = nullptr);
+
 } // namespace brae

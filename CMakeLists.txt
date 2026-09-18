@@ -161,6 +161,7 @@ add_library(brae_core STATIC
     src/transportModels/interfaceProperties/interface_properties_cpp.cu
     src/applications/solvers/interFoam/inter_solve_cpp.cu
     src/applications/solvers/interFoam/inter_peqn_cpp.cu
+    src/applications/solvers/interFoam/inter_correct_phi_cpp.cu
     src/finiteVolume/fvMatrices/solvers/MULES/mules_cpp.cu
     src/finiteVolume/fvMatrices/solvers/MULES/device_mules.cu
     src/applications/solvers/interFoam/alpha_eqn_cpp.cu

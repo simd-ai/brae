@@ -66,6 +66,9 @@ struct RunReport
     };
     std::vector<GamgLevel> gamgLevels;
     std::vector<LinearSolveRecord> gamgCoarsestSolves;
+    // ...and every pcorr solve: initCorrectPhi's at the start, then CorrectPhi's after each mesh
+    // update under `correctPhi`, one per non-orthogonal pass
+    std::vector<LinearSolveRecord> pcorrSolves;
     // WHICH closure produced them. The device loop can run either (BRAE_INTER_HOST_CLOSURE), and a
     // gate comparing the two has to know each arm took the path it is named for.
     bool turbulenceOnDevice = false;

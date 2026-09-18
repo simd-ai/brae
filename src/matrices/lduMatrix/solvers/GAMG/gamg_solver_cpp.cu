@@ -3,6 +3,7 @@
 #include "smooth_solver_cpp.cuh"
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <stdexcept>
 
 namespace brae {
@@ -784,12 +785,17 @@ SolverPerformance gamgSolve(
     return perf;
 }
 
-SolverPerformance pcgGamgSolve(
+namespace {
+
+// PCG::scalarSolve with the GAMG preconditioner. `fineAddr` is the mesh's own addressing, and the
+// hierarchy is fetched only when the preconditioner is first needed -- see pcgGamgSolve's cache form.
+SolverPerformance pcgGamgSolveImpl(
     const FvScalarMatrix& M,
     std::vector<scalar>& psi,
     const PrimitiveMesh& m,
     const std::vector<FvPatch>& patches,
-    const GamgAgglomeration& agglomeration,
+    const GamgLduAddressing& fineAddr,
+    const std::function<const GamgAgglomeration&()>& agglomerationOf,
     scalar tolerance,
     scalar relTol,
     int maxIter,
@@ -797,7 +803,6 @@ SolverPerformance pcgGamgSolve(
     const GamgPreconditionerControls& precond,
     GamgSolveLog* log)
 {
-    checkGamgInputs(M, m, agglomeration, precond.gamg);
     if (precond.nVcycles < 1)
     {
         throw std::runtime_error("brae GAMG preconditioner: nVcycles must be at least 1.");
@@ -808,7 +813,7 @@ SolverPerformance pcgGamgSolve(
 
     // PCG::scalarSolve (PCG.C:67-215)
     LduLevel A;
-    A.addr = &agglomeration.fineMesh;
+    A.addr = &fineAddr;
     A.diag = diag;
     A.upper = M.upper;
     const std::size_t nCells = psi.size();
@@ -831,7 +836,10 @@ SolverPerformance pcgGamgSolve(
     if (minIter <= 0 && converged(perf, tolerance, relTol)) return perf;
 
     // the preconditioner, constructed on first use: a GAMGSolver on the same matrix, with the
-    // `preconditioner` sub-dictionary as its controls (lduMatrixPreconditioner.C, New)
+    // `preconditioner` sub-dictionary as its controls (lduMatrixPreconditioner.C, New) -- and so the
+    // mesh's hierarchy with it, which a solve that converges at its initial residual never builds
+    const GamgAgglomeration& agglomeration = agglomerationOf();
+    checkGamgInputs(M, m, agglomeration, precond.gamg);
     GamgHierarchy h;
     h.build(agglomeration, diag, M.upper, precond.gamg.smoother);
     std::vector<scalar> AwA(nCells);
@@ -892,6 +900,70 @@ SolverPerformance pcgGamgSolve(
      || perf.nIterations < minIter
     );
     return perf;
+}
+
+} // namespace
+
+SolverPerformance pcgGamgSolve(
+    const FvScalarMatrix& M,
+    std::vector<scalar>& psi,
+    const PrimitiveMesh& m,
+    const std::vector<FvPatch>& patches,
+    const GamgAgglomeration& agglomeration,
+    scalar tolerance,
+    scalar relTol,
+    int maxIter,
+    int minIter,
+    const GamgPreconditionerControls& precond,
+    GamgSolveLog* log)
+{
+    checkGamgInputs(M, m, agglomeration, precond.gamg);
+    return pcgGamgSolveImpl(
+        M,
+        psi,
+        m,
+        patches,
+        agglomeration.fineMesh,
+        [&agglomeration]() -> const GamgAgglomeration& { return agglomeration; },
+        tolerance,
+        relTol,
+        maxIter,
+        minIter,
+        precond,
+        log);
+}
+
+SolverPerformance pcgGamgSolve(
+    const FvScalarMatrix& M,
+    std::vector<scalar>& psi,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    GamgAgglomerationCache& cache,
+    scalar tolerance,
+    scalar relTol,
+    int maxIter,
+    int minIter,
+    const GamgPreconditionerControls& precond,
+    GamgSolveLog* log)
+{
+    GamgLduAddressing fineAddr;
+    fineAddr.nCells = m.nCells();
+    fineAddr.lowerAddr.assign(m.owner().begin(), m.owner().begin() + m.nInternalFaces());
+    fineAddr.upperAddr.assign(m.neighbour().begin(), m.neighbour().end());
+    return pcgGamgSolveImpl(
+        M,
+        psi,
+        m,
+        patches,
+        fineAddr,
+        [&]() -> const GamgAgglomeration& { return cache.get(m, g, precond.gamg.nCellsInCoarsestLevel); },
+        tolerance,
+        relTol,
+        maxIter,
+        minIter,
+        precond,
+        log);
 }
 
 } // namespace brae

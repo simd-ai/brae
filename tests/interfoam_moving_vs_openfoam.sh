@@ -41,6 +41,47 @@
 #                  fixedFluxPressure, alpha zeroGradient) and `pRefPoint (0.292 0.292 0.0073);
 #                  pRefValue 0;` -- the pressure reference on a mesh that does not move, twenty of the
 #                  tutorial's own steps of 0.001
+#   closedDamBreakInitU  the same tank STARTED MOVING, U (0.1 0 0) in every cell against walls at rest:
+#                  the phi createFields builds is not divergence-free, so initCorrectPhi's pcorr solve
+#                  has work to do (79 iterations in both codes); the control is the tank at rest
+#   mixerCorrectPhi, sloshing2DCorrectPhi, cylinderCorrectPhi
+#                  the three solid-body tanks with `correctPhi yes`: phi rebuilt as Sf & Uf after every
+#                  mesh update and CorrectPhi solved against it with the last corrector's rAU -- closed
+#                  tanks, so through adjustPhi and pcorr's reference; the tank's non-orthogonal pcorr
+#                  laplacian; and the cylinder's non-orthogonal corrector, pcorr then pcorrFinal. The
+#                  cylinder's pcorr is staged `maxIter 1000`: the tutorial's 100 stops PCG UNCONVERGED
+#                  after every update in both codes, at residuals of 0.1 to 0.3 agreeing to four digits,
+#                  and an unconverged Krylov iterate carries every last-bit difference forward --
+#                  as shipped 22 of 22 counts and alpha 7.6e-09; converged (150 to 176 iterations, the
+#                  same in both) alpha 1.2e-10
+#   solitary       laminar/waves/waveMakerSolitary AS SHIPPED, thirty steps of 0.01: the first gated
+#                  case whose cells CHANGE VOLUME -- displacementLaplacian from a solitary-wave paddle --
+#                  under correctPhi (its default), with an absorbing waveVelocity outlet and a
+#                  totalPressure atmosphere; an OPEN tank, so no reference; the control holds its mesh
+#                  still
+#
+# CORRECTPHI, BROKEN ONCE EACH (the three *CorrectPhi tanks; closedDamBreakInitU where it says so):
+#   correctUphiBCs skipped -- phi on the walls left at Sf & Uf       adjustPhi STOPS THE RUN on all three
+#                                                                    ("continuity error cannot be removed")
+#   phi left as it was instead of rebuilt from Sf & Uf              the same
+#   rAUf = 1 instead of interpolate(rAU) of the last corrector       alpha 3.6e-02, 18 of 22 pcorr counts
+#   no adjustPhi and no reference for pcorr                          alpha 4.1e-07; InitU 1.3e-08
+#   phi left ABSOLUTE after CorrectPhi                               alpha 9.9e-01
+#   pcorr's non-orthogonal face flux dropped from its flux()         alpha 4.9e-01 on the cylinder; ZERO on
+#                                                                    the others, where pcorr starts at 0 and
+#                                                                    one pass leaves the correction zero
+#   initCorrectPhi skipped                                           InitU alpha 3.2e-02, U 15%, and the pcorr
+#                                                                    count sequence off on every profile
+# NOT DISCRIMINATED, and not claimed: the curvature pass mixture.correct() makes after CorrectPhi (it
+# moves these tanks' alpha by less than 3e-13), and the corrected flux handed to flux-conditional
+# patches (a closed tank has none).
+#
+# THE DEFORMING MESH, BROKEN ONCE EACH on solitary: fvm::ddt(rho, U)'s source with V for V0, U 1.1e-02;
+# the alpha sub-cycle's Vsc and Vsc0 as V, alpha 2.6e-03 and U 5.1e-02; and the outlet's wave model
+# updated in UEqn rather than at the mesh update (inter_waves_cpp.cuh), U 2.0e-05 and alpha 1.3e-08.
+# MEASURED on solitary: 60 of 60 p_rgh and 31 of 31 pcorr counts, alpha 2.9e-12, p_rgh 3.3e-13, U 1.7e-10;
+# the three *CorrectPhi tanks alpha 1.4e-12, 3.0e-13, 1.2e-10 and U 9.9e-12, 8.2e-13, 7.7e-09; the
+# start-moving dam alpha 1.2e-14, U 2.3e-12.
 #
 # CONTROLS on the oracle: for the motion, OpenFOAM's own tank with `dynamicFvMesh staticFvMesh` --
 # still water in a still tube, which is the whole of the answer away; for the reference, OpenFOAM's
@@ -83,10 +124,9 @@
 #   the mesh moved on EVERY outer corrector (mixerOuterOnce)    alpha 5.1e-07, 29 of 40 counts
 #   oldPoints re-taken on the second update (mixerOuter)        alpha 9.9e-02, U 100%
 #
-# WHAT THIS GATE CANNOT SEE, because the motion is RIGID: every cell keeps its volume to round-off, so
-# V0 against V in fvm::ddt and MULES, and Vsc's interpolation inside a sub-cycle, change the answer by
-# 1e-15 and no less. Those lines are transcribed from EulerDdtScheme.C, MULESTemplates.C and
-# fvMeshGeometry.C, and are gated only when a mesh DEFORMS (the waveMaker tutorials, not yet run).
+# V0 AGAINST V in fvm::ddt and MULES, and Vsc's interpolation inside a sub-cycle, change the rigid tanks'
+# answer by 1e-15 and no less -- every cell keeps its volume -- and are gated by `solitary`, whose
+# cells change theirs (the deforming-mesh arms above).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_moving_vs_openfoam"
@@ -161,13 +201,28 @@ if profile.startswith('mixer') or profile.startswith('sloshing2D') or profile.st
         t, k = re.subn(r'nCorrectors\s+2;', 'nCorrectors     2;\n    nOuterCorrectors 2;'
                        + ('\n    moveMeshOuterCorrectors yes;' if profile == 'mixerOuter' else ''), t)
         assert k == 1, 'nCorrectors not found'
+    if profile.endswith('CorrectPhi'):
+        # PIMPLE's `correctPhi`, which every solid-body tutorial writes as `no`
+        t, k = re.subn(r'correctPhi\s+no;', 'correctPhi      yes;', t)
+        assert k == 1, 'correctPhi no; not found'
+    if profile == 'cylinderCorrectPhi':
+        # the tutorial caps pcorr at `maxIter 100`, and after every mesh update PCG stops there
+        # UNCONVERGED in both codes, at final residuals of 0.1 to 0.3 that agree to four digits. The
+        # iterate a Krylov solver leaves unconverged carries every last-bit difference in its input
+        # forward, amplified: as shipped the cylinder reads 22 of 22 pcorr counts and alpha 7.6e-09,
+        # U 1.1e-07. Allowed to converge (150 to 176 iterations, the same in both), alpha 1.2e-10.
+        t, k = re.subn(r'maxIter\s+100;', 'maxIter 1000;', t)
+        assert k == 1, 'pcorr maxIter 100 not found'
     if profile == 'mixerPred':
         t, k = re.subn(r'momentumPredictor\s+no;', 'momentumPredictor yes;', t)
         assert k == 1, 'momentumPredictor not found'
         t, k = re.subn(r'\n    U\n    \{', '\n    "U.*"\n    {', t)
         assert k == 1, 'the U entry was not found'
+elif profile.startswith('solitary'):
+    # waves/waveMakerSolitary AS SHIPPED: nothing to stage in fvSolution
+    pass
 elif profile.startswith('closedDamBreak'):
-    ref = '0' if profile == 'closedDamBreak' else '1e5'
+    ref = '1e5' if profile == 'closedDamBreakRef' else '0'
     t, k = re.subn(r'(nNonOrthogonalCorrectors\s+0;)', r'\1\n    pRefPoint       (0.292 0.292 0.0073);\n    pRefValue       %s;' % ref, t)
     assert k == 1, 'PIMPLE block not found'
 open(q, 'w').write(t)
@@ -176,7 +231,8 @@ if not profile.startswith('closedDamBreak'):
     # the three tanks name vanLeerV, run as shipped; the `*Static` controls hold the mesh still
     f = os.path.join(d, 'system/fvSchemes')
     t = open(f).read()
-    assert re.search(r'div\(rhoPhi,U\)\s+Gauss vanLeerV;', t), 'div(rhoPhi,U) is no longer Gauss vanLeerV'
+    if not profile.startswith('solitary'):
+        assert re.search(r'div\(rhoPhi,U\)\s+Gauss vanLeerV;', t), 'div(rhoPhi,U) is no longer Gauss vanLeerV'
     p = os.path.join(d, 'constant/dynamicMeshDict')
     t = open(p).read()
     if profile.endswith('Static'):
@@ -205,6 +261,11 @@ else:
         t = open(p).read()
         t, k = re.subn(r'atmosphere\s*\{[^}]*\}', 'atmosphere\n    {\n        %s\n    }' % body, t, flags=re.S)
         assert k == 1, 'atmosphere entry not found in ' + fld
+        if fld == 'U' and profile == 'closedDamBreakInitU':
+            # a closed tank that STARTS MOVING: U (0.1 0 0) in every cell against walls at rest, so the
+            # phi createFields builds is not divergence-free and initCorrectPhi has work to do
+            t, k = re.subn(r'internalField\s+uniform\s*\(0 0 0\);', 'internalField   uniform (0.1 0 0);', t)
+            assert k == 1, 'U internalField not found'
         open(p, 'w').write(t)
 PYEOF
     ( cd "$C" && blockMesh > log.blockMesh 2>&1 ) || { echo "FAIL: blockMesh [$name]"; tail -20 "$C/log.blockMesh"; return 1; }
@@ -242,8 +303,14 @@ stage sloshing2DStatic sloshingTank2D 0.01  10 sloshing2DStatic || rc=1
 stage sloshing2D     sloshingTank2D 0.01  10 sloshing2D     || rc=1
 stage cylinderStatic sloshingCylinder 0.001 10 cylinderStatic || rc=1
 stage cylinder       sloshingCylinder 0.001 10 cylinder      || rc=1
+stage mixerCorrectPhi      testTubeMixer    2e-4  10 mixerCorrectPhi      || rc=1
+stage sloshing2DCorrectPhi sloshingTank2D   0.01  10 sloshing2DCorrectPhi || rc=1
+stage cylinderCorrectPhi   sloshingCylinder 0.001 10 cylinderCorrectPhi   || rc=1
+stage solitaryStatic waves/waveMakerSolitary 0.01 30 solitaryStatic || rc=1
+stage solitary       waves/waveMakerSolitary 0.01 30 solitary       || rc=1
 stage closedRef1e5   damBreak/damBreak 0.001 20 closedDamBreakRef || rc=1
 stage closedDamBreak damBreak/damBreak 0.001 20 closedDamBreak    || rc=1
+stage closedDamBreakInitU damBreak/damBreak 0.001 20 closedDamBreakInitU || rc=1
 [ $rc = 0 ] || { echo "interfoam_moving_vs_openfoam: staging failed"; exit 1; }
 
 # the oracle took the path
@@ -261,7 +328,12 @@ gate mixerOuterOnce 2e-4  10 mixerOuterOnce mixerStatic  || rc=1
 gate mixerPred      2e-4  10 mixerPred      mixerStatic  || rc=1
 gate sloshing2D     0.01  10 sloshing2D     sloshing2DStatic || rc=1
 gate cylinder       0.001 10 cylinder       cylinderStatic   || rc=1
+gate mixerCorrectPhi      2e-4  10 mixerCorrectPhi      mixerStatic      || rc=1
+gate sloshing2DCorrectPhi 0.01  10 sloshing2DCorrectPhi sloshing2DStatic || rc=1
+gate cylinderCorrectPhi   0.001 10 cylinderCorrectPhi   cylinderStatic   || rc=1
+gate solitary       0.01  30 solitary       solitaryStatic || rc=1
 gate closedDamBreak 0.001 20 closedDamBreak closedRef1e5 || rc=1
+gate closedDamBreakInitU 0.001 20 closedDamBreakInitU closedDamBreak || rc=1
 
 echo "interfoam_moving_vs_openfoam: rc $rc"
 exit $rc
