@@ -147,7 +147,7 @@ FvVectorMatrix assembleUEqn(
     }
 
     // fvm::ddt(rho, U). Added to the SAME matrix, before relax, exactly as the constructor's `+` does.
-    addEulerDdtRhoU(M, *in.rho, *in.rhoOld, *in.UOld, g.V(), in.deltaT);
+    addEulerDdtRhoU(M, *in.rho, *in.rhoOld, *in.UOld, g.V(), in.deltaT, in.V0);
 
     // turbulence->divDevRhoReff(rho, U). incompressibleInterPhaseTransportModel.C:129 forwards to
     // linearViscousStress's rho-weighted overload, so the operator is brae's existing one given

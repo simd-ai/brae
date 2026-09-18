@@ -82,6 +82,25 @@ RunReport runInterFoamDevice(
     scalar endTime)
 {
     InterFields f = buildInterFields(caseDir, startDir, m, g, fvp);
+
+    // NOT ON THE DEVICE YET, refused rather than run on the mesh as it started or on a singular
+    // pressure system: a mesh that moves (the host loop has it, inter_driver_cpp.cu), and a closed
+    // case -- one whose p_rgh fixes its value on no patch -- whose pressure reference the device
+    // step pins at pRefValue where OpenFOAM pins it at the cell's current p_rgh, with neither the
+    // level shift of p nor adjustPhi.
+    if (f.dynamicMesh)
+    {
+        throw std::runtime_error(
+            "brae interFoam -device: the case moves its mesh (" + f.dynamicMesh->motionType() + "). The "
+            "device loop does not move one; the host loop does. Run without -device.");
+    }
+    if (f.pRef.needReference)
+    {
+        throw std::runtime_error(
+            "brae interFoam -device: p_rgh fixes its value on no patch and needs a reference cell. The "
+            "device pressure step's reference is not OpenFOAM's (pEqn.H:47 pins the cell at its current "
+            "p_rgh and :74-83 shifts p's level); the host loop's is. Run without -device.");
+    }
     const label nC = m.nCells(), nIf = m.nInternalFaces();
     const label nFaces = static_cast<label>(g.magSf().size());
     label nBf = 0;

@@ -52,6 +52,7 @@
 #include "gamg_solver_cpp.cuh"
 #include "inter_turbulence_cpp.cuh"
 #include "inter_waves_cpp.cuh"
+#include "dynamic_motion_solver_fv_mesh_cpp.cuh"
 #include "mules_cpp.cuh"
 #include <memory>
 #include <string>
@@ -142,6 +143,38 @@ struct InterFields
     LoopControls pimple;
     label   nNonOrthogonalCorrectors = 0;
     bool    momentumPredictorOn = true;
+
+    // constant/dynamicMeshDict: a mesh that MOVES, as a rigid body, or null for one that does not.
+    // Read here so that every refusal fires with the case; the driver attaches it to a mutable mesh
+    // and calls update() where interFoam.C:120 calls mesh.update(). Shared, because InterFields is
+    // copied by value into a gate's `fieldsOut`.
+    std::shared_ptr<DynamicMotionSolverFvMesh> dynamicMesh;
+    // createDyMControls.H / readDyMControls.H: PIMPLE's `correctPhi` (default mesh.dynamic()),
+    // `checkMeshCourantNo` and `moveMeshOuterCorrectors` (default false)
+    bool correctPhi = false;
+    bool checkMeshCourantNo = false;
+    bool moveMeshOuterCorrectors = false;
+    // U's patches of type movingWallVelocity, whose value the driver assigns from the motion at every
+    // mesh update (movingWallVelocityFvPatchVectorField::updateCoeffs). The shared factory builds
+    // them as fixedValue, which is what they are on a mesh that does not move.
+    std::vector<char> movingWallVelocityPatch;
+    // fvc::interpolate(U) at the start and fvc::correctUf's result after every pressure corrector
+    // (createUfIfPresent.H, pEqn.H:70): the face velocity a moving mesh's ddtCorr reads at its OLD
+    // time. Empty on a mesh that does not move.
+    SurfaceVectorField Uf;
+
+    // THE PRESSURE REFERENCE. p_rgh.needReference() is true when NO patch fixes its value -- a
+    // closed tank -- and then createFields.H:104-124 reads pRefCell or pRefPoint and pRefValue from
+    // the PIMPLE dictionary, pEqn.H:47 pins the reference cell at its CURRENT p_rgh, and pEqn.H:74-83
+    // shifts p to pRefValue there and rebuilds p_rgh from it. This was `needReference = false` in the
+    // driver, with a note that damBreak's atmosphere is a totalPressure; every gated case had one.
+    struct PressureReference
+    {
+        bool needReference = false;
+        label pRefCell = -1;
+        scalar pRefValue = 0;
+    };
+    PressureReference pRef;
 
     // THE CASE'S OWN p_rgh SOLVE, read from fvSolution's `solvers` block. It was hardcoded to 1e-9 in
     // the driver, with a BRAE_PTOL override -- so every tutorial ran to a tolerance nobody chose, and

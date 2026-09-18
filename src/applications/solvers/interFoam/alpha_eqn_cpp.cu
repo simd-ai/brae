@@ -403,10 +403,17 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
         }
         FvScalarMatrix M = fvm::div<scalar>(in.phiCN->internal, in.phiCN->boundary, alpha1, m, patches);
 
-        // fvm::ddt(alpha1), Euler, rho == 1: diag += V/dt, source += V*alpha.oldTime()/dt.
+        // fvm::ddt(alpha1), Euler, rho == 1: diag += V/dt, source += V*alpha.oldTime()/dt -- and on
+        // a moving mesh the diagonal's V is Vsc and the source's is Vsc0 (EulerDdtScheme.C:383-392)
         const scalar rDeltaT = scalar(1) / in.deltaT;
         for (label c = 0; c < nC; ++c)
         {
+            if (in.Vsc)
+            {
+                M.diag[c]   += rDeltaT * (*in.Vsc)[c];
+                M.source[c] += rDeltaT * alpha1Old[c] * (*in.Vsc0)[c];
+                continue;
+            }
             M.diag[c]   += rDeltaT * g.V()[c];
             M.source[c] += rDeltaT * g.V()[c] * alpha1Old[c];
         }
@@ -455,6 +462,8 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
         if (in.alphaApplyPrevCorr && prevCorr && !prevCorr->internal.empty())
         {
             MULES::Fields mf0;
+            mf0.Vsc = in.Vsc;
+            mf0.Vsc0 = in.Vsc0;
             MULES::correctLimited(rDeltaT, alpha1,
                                   in.controlPrevCorrOutletOnPhiCN ? *in.phiCN : alphaPhi10,
                                   *prevCorr, mf0, mulesCtl, m, g, patches);
@@ -512,6 +521,8 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
         alphaPhiUn(*in.phi, phir, alpha1, alpha2, in.alphaScheme, in.alpharScheme, m, g, patches, un);
 
         MULES::Fields mf;                       // all null: rho == 1, Sp == Su == 0, bounds [0,1]
+        mf.Vsc = in.Vsc;                        // ...and the volumes of a mesh that moves
+        mf.Vsc0 = in.Vsc0;
         if (in.MULESCorr)
         {
             // alphaEqn.H:178-205. The correction is what the high-order flux adds to the upwind one

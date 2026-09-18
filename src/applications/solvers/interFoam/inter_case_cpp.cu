@@ -186,28 +186,8 @@ void refuseUnportedCaseInputs(
     const std::string& caseDir,
     const FoamDict& controlDict)
 {
-    // createDynamicFvMesh.H -> dynamicFvMesh::New (dynamicFvMeshNew.C:65-128): with no dictionary the
-    // mesh is static; with one, `dynamicFvMesh` is MANDATORY and names the class.
-    const std::string dyn = caseDir + "/constant/dynamicMeshDict";
-    if (std::filesystem::exists(dyn))
-    {
-        const FoamDict d = readDict(dyn);
-        const std::string type = d.wordOr("dynamicFvMesh", "");
-        if (type.empty())
-        {
-            throw std::runtime_error(
-                "brae interFoam: constant/dynamicMeshDict has no `dynamicFvMesh` entry. OpenFOAM reads "
-                "it with get<word> and stops without one.");
-        }
-        if (type != "staticFvMesh")
-        {
-            throw std::runtime_error(
-                "brae interFoam: constant/dynamicMeshDict asks for `dynamicFvMesh " + type + "`. brae's "
-                "mesh does not move or refine -- interFoam.C's mesh.update(), correctPhi and the "
-                "mesh-flux terms are not ported -- and running it on the mesh as written would solve a "
-                "different problem. 19 of the 44 shipped interFoam tutorials ask for one.");
-        }
-    }
+    // constant/dynamicMeshDict is read by DynamicMotionSolverFvMesh::New in buildInterFields, which
+    // refuses by name every motion that is not the rigid motion of the whole mesh.
 
     // createMRF.H -> IOMRFZoneList (READ_IF_PRESENT); a zone is active unless it says otherwise
     // (MRFZone.C:248, :553).
@@ -350,6 +330,130 @@ void refuseUncorrectedOnSkewMesh(
         "correction vanishes. Refused rather than run `orthogonal` under the name `corrected`.");
 }
 
+
+// THE PRESSURE REFERENCE OF A CLOSED CASE -- see InterFields::PressureReference.
+//
+// setRefCell (findRefCell.C:36-110): needReference() is "no patch fixes a value"; then `pRefCell`,
+// else `pRefPoint` located with mesh.findCell(point, FACE_PLANES) -- the nearest cell centre if the
+// point is inside that cell by every face plane, else the FIRST cell in index order that is -- and
+// `pRefValue`, all mandatory. OpenFOAM falls back to an octree search with the cells decomposed
+// into tets when the plane test finds no cell; that fallback is refused here by name.
+InterFields::PressureReference readPressureReference(
+    const GeometricField<scalar>& p_rgh,
+    const FoamDict& fvSolution,
+    const PrimitiveMesh& m,
+    const FvGeometry& g)
+{
+    InterFields::PressureReference r;
+    r.needReference = true;
+    for (const auto& pf : p_rgh.boundary)
+    {
+        if (pf->fixesValue())
+        {
+            r.needReference = false;
+            break;
+        }
+    }
+    if (!r.needReference) return r;
+
+    const FoamDict* pim = fvSolution.subDict("PIMPLE");
+    if (!pim)
+    {
+        throw std::runtime_error("brae interFoam: fvSolution has no PIMPLE block for the pressure reference.");
+    }
+    if (pim->found("pRefCell"))
+    {
+        r.pRefCell = static_cast<label>(pim->scalarOr("pRefCell", scalar(-1)));
+        if (r.pRefCell < 0 || r.pRefCell >= m.nCells())
+        {
+            throw std::runtime_error(
+                "brae interFoam: PIMPLE's pRefCell " + std::to_string(r.pRefCell) + " is outside the mesh's "
+                + std::to_string(m.nCells()) + " cells. OpenFOAM stops on the same condition.");
+        }
+    }
+    else if (pim->found("pRefPoint"))
+    {
+        const std::vector<scalar> pv = pim->scalarListOr("pRefPoint", {});
+        if (pv.size() != 3)
+        {
+            throw std::runtime_error("brae interFoam: PIMPLE's pRefPoint is not a point.");
+        }
+        const vector refPoint{pv[0], pv[1], pv[2]};
+        // cell -> faces, for primitiveMesh::pointInCell
+        std::vector<std::vector<label>> cellFaces(static_cast<std::size_t>(m.nCells()));
+        for (label f = 0; f < m.nFaces(); ++f)
+        {
+            cellFaces[static_cast<std::size_t>(m.owner()[f])].push_back(f);
+            if (f < m.nInternalFaces())
+            {
+                cellFaces[static_cast<std::size_t>(m.neighbour()[f])].push_back(f);
+            }
+        }
+        auto pointInCell = [&](label celli)
+        {
+            for (const label nFace : cellFaces[static_cast<std::size_t>(celli)])
+            {
+                const vector proj = refPoint - g.Cf()[nFace];
+                vector normal = g.Sf()[nFace];
+                if (m.owner()[nFace] != celli)
+                {
+                    normal = scalar(-1)*normal;
+                }
+                if (dot(normal, proj) > 0) return false;
+            }
+            return true;
+        };
+        // primitiveMesh::findNearestCell: the first of the nearest centres
+        label nearest = 0;
+        scalar minProximity = magSqr(g.C()[0] - refPoint);
+        for (label celli = 1; celli < m.nCells(); ++celli)
+        {
+            const scalar proximity = magSqr(g.C()[celli] - refPoint);
+            if (proximity < minProximity)
+            {
+                nearest = celli;
+                minProximity = proximity;
+            }
+        }
+        r.pRefCell = -1;
+        if (pointInCell(nearest))
+        {
+            r.pRefCell = nearest;
+        }
+        else
+        {
+            for (label celli = 0; celli < m.nCells(); ++celli)
+            {
+                if (pointInCell(celli))
+                {
+                    r.pRefCell = celli;
+                    break;
+                }
+            }
+        }
+        if (r.pRefCell < 0)
+        {
+            throw std::runtime_error(
+                "brae interFoam: PIMPLE's pRefPoint lies in no cell by the face-plane test. OpenFOAM then "
+                "searches again with an octree over the cells' tet decomposition (polyMesh::findCell, "
+                "CELL_TETS), which is not ported.");
+        }
+    }
+    else
+    {
+        throw std::runtime_error(
+            "brae interFoam: p_rgh fixes its value on no patch, so it needs a reference, and PIMPLE names "
+            "neither pRefCell nor pRefPoint. OpenFOAM stops on the same condition (findRefCell.C:91).");
+    }
+    if (!pim->found("pRefValue"))
+    {
+        throw std::runtime_error(
+            "brae interFoam: p_rgh needs a reference and PIMPLE names no pRefValue. OpenFOAM reads it "
+            "with a mandatory lookup (findRefCell.C:100).");
+    }
+    r.pRefValue = pim->scalarOr("pRefValue", scalar(0));
+    return r;
+}
 
 // ONE `solver GAMG;` ENTRY. Everything GAMGSolver::readControls and GAMGAgglomeration read from it,
 // and a refusal for each control whose branch is not ported -- by name, because every one of them
@@ -562,6 +666,26 @@ InterFields buildInterFields(const std::string&          caseDir,
         // pimpleControl.C:51-52
         const std::string tf = pim->wordOr("turbOnFinalIterOnly", "yes");
         f.pimple.turbOnFinalIterOnly = !(tf == "no" || tf == "false" || tf == "off" || tf == "0");
+
+        // createDyMControls.H: `correctPhi` defaults to mesh.dynamic(), the other two to false
+        auto switchOr = [&](const char* key, bool def)
+        {
+            const std::string w = pim->wordOr(key, def ? "yes" : "no");
+            return !(w == "no" || w == "false" || w == "off" || w == "0" || w == "n" || w == "f");
+        };
+        f.dynamicMesh = DynamicMotionSolverFvMesh::New(caseDir, startDir);
+        const bool dynamic = f.dynamicMesh != nullptr;
+        f.correctPhi = switchOr("correctPhi", dynamic);
+        f.checkMeshCourantNo = switchOr("checkMeshCourantNo", false);
+        f.moveMeshOuterCorrectors = switchOr("moveMeshOuterCorrectors", false);
+        if (dynamic && f.correctPhi)
+        {
+            throw std::runtime_error(
+                "brae interFoam: the mesh moves and PIMPLE's `correctPhi` is on (it defaults to on for a "
+                "moving mesh; the solid-body tutorials write `correctPhi no`). interFoam.C:136-146 then "
+                "rebuilds phi from Uf after every mesh update and solves CorrectPhi's pcorr equation "
+                "against it, which is not ported. Refused rather than run without the correction.");
+        }
     }
 
     // solvers/<alpha> -- the linear solve of the MULESCorr pre-solve. A case without MULESCorr never
@@ -705,6 +829,15 @@ InterFields buildInterFields(const std::string&          caseDir,
     f.waves = readInterWaves(caseDir, startDir, alphaData, UData, patches, f.g, f.alphaName);
     f.alpha1 = buildField<scalar>(alphaData, patches, nC);
     f.U = buildField<vector>(UData, patches, nC);
+    f.movingWallVelocityPatch.assign(patches.size(), 0);
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const PatchFieldData<vector>* entry = findPatchEntry(UData, patches[pi]);
+        if (entry && entry->type == "movingWallVelocity")
+        {
+            f.movingWallVelocityPatch[pi] = 1;
+        }
+    }
     f.p_rgh  = buildField<scalar>(readField<scalar>(startDir + "/p_rgh"),          patches, nC);
     f.alpha1.evaluateBoundary();
     f.U.evaluateBoundary();
@@ -741,6 +874,20 @@ InterFields buildInterFields(const std::string&          caseDir,
             "inside a time step. The second call needs k.oldTime() and the non-Final solver entries, "
             "which this port does not carry; no shipped tutorial sets it.");
     validateInterTurbulence(f.turbulence, f.U, f.nu, f.nuBnd, m, g, patches);
+    if (f.dynamicMesh && f.turbulence.on)
+    {
+        throw std::runtime_error(
+            "brae interFoam: the mesh moves and the case is turbulent. The closure's wall distance "
+            "follows the mesh (wallDist::movePoints) and the closure's own moving-mesh terms are not "
+            "ported; refused rather than run the closure on the mesh as it started.");
+    }
+    if (f.dynamicMesh && f.waves.any)
+    {
+        throw std::runtime_error(
+            "brae interFoam: the mesh moves and a patch carries a wave condition. The wave models take "
+            "their geometry once, at construction (waveModel::initialiseGeometry); on a moving patch that "
+            "is not the patch the condition is applied to. Not ported; no tutorial combines the two.");
+    }
 
     // --- gh, ghf and p ------------------------------------------------------------------------
     ghField(f.g, f.ghRefValue, g.C(), f.gh);
@@ -759,6 +906,26 @@ InterFields buildInterFields(const std::string&          caseDir,
         }
     }
     staticPressure(f.p_rgh.internal, f.rho, f.gh, f.p);
+    f.pRef = readPressureReference(f.p_rgh, fvSolution, m, g);
+    if (f.pRef.needReference)
+    {
+        // createFields.H:115-124
+        applyPressureReference(f.p, f.p_rgh.internal, f.rho, f.gh, f.pRef.pRefCell, f.pRef.pRefValue);
+        f.p_rgh.evaluateBoundary();
+    }
+
+    // createUfIfPresent.H: the face velocity of a moving mesh, interpolate(U) to begin with. A
+    // `Uf` file in the start directory is a restart's, and a restart of a moving mesh is refused
+    // where the mesh is read.
+    if (f.dynamicMesh)
+    {
+        std::vector<std::vector<vector>> Ub(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            Ub[pi] = f.U.boundary[pi]->value();
+        }
+        f.Uf = fvc::interpolate(f.U.internal, Ub, m, g, patches);
+    }
 
     // interfaceProperties' CONSTRUCTOR calls calculateK (interfaceProperties.C:196-210). That first
     // pass is what leaves alpha's wall gradient non-zero for the second one to build on.

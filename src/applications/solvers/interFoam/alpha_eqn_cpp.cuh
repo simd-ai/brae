@@ -236,6 +236,12 @@ struct AlphaStepInput
     // runs it to show the gate fails when that argument is wrong: 5.5e-03 of alpha against 4.6e-13.
     bool controlPrevCorrOutletOnPhiCN = false;
 
+    // A MOVING MESH: mesh.Vsc() and mesh.Vsc0() at this (sub-)step -- see MULES::Fields. Null on a
+    // mesh that does not move. The pre-solve's fvm::ddt takes Vsc on the diagonal and Vsc0 in the
+    // source (EulerDdtScheme.C:383-392), and both go to MULES.
+    const std::vector<scalar>* Vsc = nullptr;
+    const std::vector<scalar>* Vsc0 = nullptr;
+
     // alpha1's boundaryField().updateCoeffs(), for the conditions whose value a MODEL supplies --
     // waveAlpha. Called where OpenFOAM's first one of the pass fires: at the pre-solve's matrix
     // construction under MULESCorr, and otherwise at the correctBoundaryConditions() that OPENS

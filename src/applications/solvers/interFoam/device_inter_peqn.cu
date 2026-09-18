@@ -14,8 +14,10 @@ namespace {
 constexpr int TPB = 256;
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 
-// OpenFOAM's SMALL, the guard in fvcDdtPhiCoeff's denominator.
-__device__ constexpr scalar kSmall = scalar(1.0e-37);
+// OpenFOAM's SMALL IN A DOUBLE BUILD (doubleScalar.H:62), the guard in fvcDdtPhiCoeff's denominator.
+// This was 1e-37, the FLOAT build's VSMALL, as the host's ddtCorr was; the two differ only where
+// |phi| is at or below 1e-15.
+__device__ constexpr scalar kSmall = scalar(1.0e-15);
 
 void ckP(cudaError_t e, const char* what)
 {

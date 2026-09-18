@@ -14,6 +14,42 @@ namespace brae {
 namespace cpu {
 namespace interFoam {
 
+// fvc::makeRelative(phi, U) and makeAbsolute (fvcMeshPhi.C:76, :121): phi -= meshPhi and phi += meshPhi,
+// on every face
+void makeRelativeFlux(
+    SurfaceScalarField& phi,
+    const SurfaceScalarField& meshPhi)
+{
+    for (std::size_t f = 0; f < phi.internal.size(); ++f)
+    {
+        phi.internal[f] -= meshPhi.internal[f];
+    }
+    for (std::size_t pi = 0; pi < phi.boundary.size() && pi < meshPhi.boundary.size(); ++pi)
+    {
+        for (std::size_t i = 0; i < phi.boundary[pi].size() && i < meshPhi.boundary[pi].size(); ++i)
+        {
+            phi.boundary[pi][i] -= meshPhi.boundary[pi][i];
+        }
+    }
+}
+
+void makeAbsoluteFlux(
+    SurfaceScalarField& phi,
+    const SurfaceScalarField& meshPhi)
+{
+    for (std::size_t f = 0; f < phi.internal.size(); ++f)
+    {
+        phi.internal[f] += meshPhi.internal[f];
+    }
+    for (std::size_t pi = 0; pi < phi.boundary.size() && pi < meshPhi.boundary.size(); ++pi)
+    {
+        for (std::size_t i = 0; i < phi.boundary[pi].size() && i < meshPhi.boundary[pi].size(); ++i)
+        {
+            phi.boundary[pi][i] += meshPhi.boundary[pi][i];
+        }
+    }
+}
+
 void buoyancyFlux(const std::vector<scalar>& surfaceTensionForce,
                   const std::vector<scalar>& ghf,
                   const std::vector<scalar>& snGradRho,
@@ -181,26 +217,32 @@ void ddtCorr(const DdtCorrInput&           in,
     const std::vector<scalar>& w   = g.weights();
     const std::vector<vector>& Sf  = g.Sf();
     const scalar rDeltaT = scalar(1) / in.deltaT;
-    const scalar kSmall  = scalar(1e-37);                 // OF SMALL
+    // OpenFOAM's SMALL IN A DOUBLE BUILD (doubleScalar.H:62). This was 1e-37, which is the FLOAT
+    // build's VSMALL (floatScalar.H:64): the two differ where |phi| is at or below 1e-15, so the
+    // limiter's ratio there was |phiCorr|/|phi| instead of |phiCorr|/1e-15.
+    const scalar kSmall = scalar(1e-15);
 
     out.internal.resize(static_cast<std::size_t>(nIf));
     for (label f = 0; f < nIf; ++f)
     {
-        // phiCorr = phi.oldTime() - (interpolate(U.oldTime()) & Sf)
+        // phiCorr = phi.oldTime() - (interpolate(U.oldTime()) & Sf) -- or, on a moving mesh,
+        // (Sf & Uf.oldTime()) in phi.oldTime()'s place, with the Sf and weights of the mesh as it
+        // stands NOW (EulerDdtScheme.C, fvcDdtUfCorr)
         const vector& uo = (*in.UOld)[own[f]];
         const vector& un = (*in.UOld)[nei[f]];
         const vector uf{w[f]*uo.x + (scalar(1) - w[f])*un.x,
                         w[f]*uo.y + (scalar(1) - w[f])*un.y,
                         w[f]*uo.z + (scalar(1) - w[f])*un.z};
         const scalar interpFlux = uf.x*Sf[f].x + uf.y*Sf[f].y + uf.z*Sf[f].z;
-        const scalar phiCorr    = in.phiOld->internal[f] - interpFlux;
+        const scalar phiUf0 = in.UfOld ? dot(Sf[f], in.UfOld->internal[f]) : in.phiOld->internal[f];
+        const scalar phiCorr = phiUf0 - interpFlux;
 
         // note 1: a NEGATIVE ddtPhiCoeff selects the limiter, which is the default. It switches the
         // correction OFF where it is large compared with the flux -- the opposite of what a constant 1
         // would do.
         const scalar coeff = (in.ddtPhiCoeff < scalar(0))
             ? scalar(1) - std::fmin(std::fabs(phiCorr)
-                                  / (std::fabs(in.phiOld->internal[f]) + kSmall), scalar(1))
+                                  / (std::fabs(phiUf0) + kSmall), scalar(1))
             : in.ddtPhiCoeff;
 
         out.internal[f] = coeff * rDeltaT * phiCorr;
@@ -220,9 +262,11 @@ void ddtCorr(const DdtCorrInput&           in,
             const vector& uo = (*in.UOld)[q.faceCells[i]];
             const vector& S  = Sf[q.start + i];
             const scalar interpFlux = uo.x*S.x + uo.y*S.y + uo.z*S.z;
-            const scalar pOld = (pi < in.phiOld->boundary.size()
-                                 && static_cast<std::size_t>(i) < in.phiOld->boundary[pi].size())
-                              ? in.phiOld->boundary[pi][i] : scalar(0);
+            const scalar pOld = in.UfOld
+                              ? dot(S, in.UfOld->boundary[pi][i])
+                              : ((pi < in.phiOld->boundary.size()
+                                  && static_cast<std::size_t>(i) < in.phiOld->boundary[pi].size())
+                                 ? in.phiOld->boundary[pi][i] : scalar(0));
             const scalar phiCorr = pOld - interpFlux;
             const scalar coeff = (in.ddtPhiCoeff < scalar(0))
                 ? scalar(1) - std::fmin(std::fabs(phiCorr)/(std::fabs(pOld) + kSmall), scalar(1))
@@ -299,6 +343,87 @@ void updatePressurePatchesFromVelocity(
     }
 }
 
+bool adjustPhi(
+    SurfaceScalarField& phi,
+    const GeometricField<vector>& U,
+    bool needReference,
+    const std::vector<FvPatch>& patches)
+{
+    if (!needReference) return false;
+    scalar massIn = 0;
+    scalar fixedMassOut = 0;
+    scalar adjustableMassOut = 0;
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (patches[pi].type == "empty" || isCoupledInterfaceType(patches[pi].type)) continue;
+        const fvPatchField<vector>& Up = *U.boundary[pi];
+        const std::vector<scalar>& phip = phi.boundary[pi];
+        // `Up.fixesValue() && !isA<inletOutletFvPatchVectorField>(Up)`: a fixed outflow is not
+        // adjustable, an inletOutlet's is
+        const bool fixed = Up.fixesValue() && !dynamic_cast<const InletOutletPatchField<vector>*>(&Up);
+        for (const scalar v : phip)
+        {
+            if (v < 0)
+            {
+                massIn -= v;
+            }
+            else if (fixed)
+            {
+                fixedMassOut += v;
+            }
+            else
+            {
+                adjustableMassOut += v;
+            }
+        }
+    }
+    // the total flux in the domain, used for normalisation: VSMALL + sum(mag(phi))
+    scalar totalFlux = scalar(1e-300);
+    for (const scalar v : phi.internal)
+    {
+        totalFlux += std::fabs(v);
+    }
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (patches[pi].type == "empty") continue;
+        for (const scalar v : phi.boundary[pi])
+        {
+            totalFlux += std::fabs(v);
+        }
+    }
+    scalar massCorr = 1;
+    const scalar magAdjustableMassOut = std::fabs(adjustableMassOut);
+    // VSMALL, SMALL
+    if (magAdjustableMassOut > scalar(1e-300) && magAdjustableMassOut/totalFlux > scalar(1e-15))
+    {
+        massCorr = (massIn - fixedMassOut)/adjustableMassOut;
+    }
+    else if (std::fabs(fixedMassOut - massIn)/totalFlux > scalar(1e-8))
+    {
+        throw std::runtime_error(
+            "brae interFoam adjustPhi: continuity error cannot be removed by adjusting the outflow. "
+            "OpenFOAM stops here (adjustPhi.C:106). Total flux " + std::to_string(totalFlux)
+            + ", specified mass inflow " + std::to_string(massIn) + ", specified mass outflow "
+            + std::to_string(fixedMassOut) + ", adjustable mass outflow " + std::to_string(adjustableMassOut));
+    }
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (patches[pi].type == "empty" || isCoupledInterfaceType(patches[pi].type)) continue;
+        const fvPatchField<vector>& Up = *U.boundary[pi];
+        if (Up.fixesValue() && !dynamic_cast<const InletOutletPatchField<vector>*>(&Up)) continue;
+        for (scalar& v : phi.boundary[pi])
+        {
+            if (v > 0)
+            {
+                v *= massCorr;
+            }
+        }
+    }
+    return std::fabs(massIn)/totalFlux < scalar(1e-15)
+        && std::fabs(fixedMassOut)/totalFlux < scalar(1e-15)
+        && std::fabs(adjustableMassOut)/totalFlux < scalar(1e-15);
+}
+
 void pressureCorrector(GeometricField<scalar>&      p_rgh,
                        GeometricField<vector>&      U,
                        SurfaceScalarField&          phi,
@@ -348,6 +473,8 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
     }
     SurfaceScalarField phiHbyA = fvc::flux(HbyA, HbyAb, m, g, patches);
 
+    if ((in.meshPhi == nullptr) != (in.Uf == nullptr))
+        throw std::runtime_error("brae interFoam pEqn: a moving mesh needs both meshPhi and Uf, or neither.");
     if (in.ddt)
     {
         std::vector<scalar> rhoRAU;
@@ -355,6 +482,21 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
         SurfaceScalarField corr;
         ddtCorr(*in.ddt, U, m, g, patches, corr);
         for (label f = 0; f < nIf; ++f) phiHbyA.internal[f] += rhoRAU[f] * corr.internal[f];
+    }
+
+    // pEqn.H:19-24: on a closed case the boundary flux is balanced by adjustPhi, and on a moving mesh
+    // it is the RELATIVE flux that is balanced -- makeRelative around it, makeAbsolute after
+    if (sc.needReference)
+    {
+        if (in.meshPhi)
+        {
+            makeRelativeFlux(phiHbyA, *in.meshPhi);
+        }
+        adjustPhi(phiHbyA, U, true, patches);
+        if (in.meshPhi)
+        {
+            makeAbsoluteFlux(phiHbyA, *in.meshPhi);
+        }
     }
 
     // phig = (surfaceTensionForce - ghf*snGrad(rho)) * rAUf * magSf -- and NOT snGrad(p_rgh), which is
@@ -436,9 +578,14 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
 
         if (sc.needReference)
         {
-            // fvMatrix::setReference: source += diag*refValue, diag += diag -- pinning one cell in a
-            // system that is otherwise singular because every patch is zeroGradient.
-            pe.source[sc.pRefCell] += pe.diag[sc.pRefCell] * sc.pRefValue;
+            // p_rghEqn.setReference(pRefCell, getRefCellValue(p_rgh, pRefCell)) (pEqn.H:47): the cell
+            // is pinned at ITS CURRENT p_rgh, not at pRefValue -- pRefValue is p's level, applied
+            // below after the solve. fvMatrix::setReference: source += diag*value, diag += diag.
+            // This used pRefValue here, on a path no gated case had ever taken.
+            if (sc.pRefCell < 0 || sc.pRefCell >= nC)
+                throw std::runtime_error("brae interFoam pEqn: pRefCell is outside the mesh.");
+            const scalar refValue = p_rgh.internal[sc.pRefCell];
+            pe.source[sc.pRefCell] += pe.diag[sc.pRefCell] * refValue;
             pe.diag[sc.pRefCell]   += pe.diag[sc.pRefCell];
         }
 
@@ -545,10 +692,45 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
         }
     }
 
+    // pEqn.H:70-73 on a moving mesh: fvc::correctUf(Uf, U, phi) -- Uf = interpolate(U), then its
+    // normal component replaced by the ABSOLUTE flux's, Uf += n*(phi/magSf - (n & Uf)) -- and then
+    // phi is made relative to the motion. The flux that leaves here is the RELATIVE one, which the
+    // next alpha equation convects with.
+    if (in.meshPhi)
+    {
+        std::vector<std::vector<vector>> Ub(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            Ub[pi] = U.boundary[pi]->value();
+        }
+        *in.Uf = fvc::interpolate(U.internal, Ub, m, g, patches);
+        for (label f = 0; f < nIf; ++f)
+        {
+            const vector n = g.Sf()[f]/g.magSf()[f];
+            vector& uf = in.Uf->internal[f];
+            uf += n*(phi.internal[f]/g.magSf()[f] - dot(n, uf));
+        }
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const FvPatch& q = patches[pi];
+            if (q.type == "empty") continue;
+            for (label i = 0; i < q.size; ++i)
+            {
+                const vector n = g.Sf()[q.start + i]/q.magSf[i];
+                vector& uf = in.Uf->boundary[pi][i];
+                uf += n*(phi.boundary[pi][i]/q.magSf[i] - dot(n, uf));
+            }
+        }
+        makeRelativeFlux(phi, *in.meshPhi);
+    }
+
     // p == p_rgh + rho*gh, then the reference shift if p_rgh needs one -- and BOTH fields move.
     staticPressure(p_rgh.internal, *in.rho, *in.gh, p);
     if (sc.needReference)
+    {
         applyPressureReference(p, p_rgh.internal, *in.rho, *in.gh, sc.pRefCell, sc.pRefValue);
+        p_rgh.evaluateBoundary();
+    }
 }
 
 } // namespace interFoam

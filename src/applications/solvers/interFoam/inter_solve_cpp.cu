@@ -81,6 +81,7 @@ const char* stageName(Stage s)
         case Stage::alphaCourantNo:    return "alphaCourantNo";
         case Stage::setDeltaT:         return "setDeltaT";
         case Stage::advanceTime:       return "++runTime";
+        case Stage::meshUpdate:        return "meshUpdate";
         case Stage::alphaControls:     return "alphaControls";
         case Stage::alphaEqnSubCycle:  return "alphaEqnSubCycle";
         case Stage::mixtureCorrect:    return "mixture.correct";
@@ -111,6 +112,7 @@ void runTimeStep(const LoopControls& ctl, const SolverHooks& hooks)
     {
         const bool finalIter = (outer == ctl.nOuterCorrectors - 1);
 
+        hooks.run(Stage::meshUpdate);
         hooks.run(Stage::alphaControls);
         hooks.run(Stage::alphaEqnSubCycle);
         // Called AGAIN here even though alphaEqn calls it per corrector: the sub-cycle may have moved

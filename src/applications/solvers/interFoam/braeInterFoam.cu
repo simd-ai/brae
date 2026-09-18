@@ -30,6 +30,17 @@
 // a processorAgglomerator, and any smoother but DIC, DICGaussSeidel, GaussSeidel and symGaussSeidel
 // -- on `-device`, any smoother but DIC. Any OTHER solver for p_rgh still substitutes, under a notice.
 //
+// AND A MESH IN SOLID-BODY MOTION, on the host: dynamicMotionSolverFvMesh with the solidBody solver
+// moving the whole mesh under any of OpenFOAM's motion functions but drivenLinearMotion
+// (src/dynamicFvMesh, src/meshTools/solidBodyMotionFunctions), with movingWallVelocity walls, the
+// relative flux, Uf and the old volumes where interFoam.C and pEqn.H read them -- and a CLOSED tank's
+// pressure reference (pRefCell or pRefPoint, pRefValue, adjustPhi), which every solid-body tutorial
+// needs and no earlier case had. `-device` refuses both. Still refused by name: a cellZone or cellSet,
+// every other motionSolver, `correctPhi yes` (the default on a moving mesh), a turbulent or a wave
+// case on a moving mesh, points0, and a restart of a moved mesh. The solid-body tutorials themselves
+// still stop on `Gauss vanLeerV` (all seven) and, five of them, on their 44-degree non-orthogonal
+// tanks.
+//
 // WHAT IT WILL NOT RUN. Every refusal the components carry is in force: LES and every RASModel but
 // kEpsilon, `vanLeerV` or `limitedLinear` on div(rhoPhi,U),
 // `interfaceCompression` on div(phirb,alpha), any ddtSchemes default but Euler, a `corrected` or
@@ -40,7 +51,7 @@
 // THAT LIST WAS NOT TRUE when it was written: MRF and fvOptions were named here and refused nowhere,
 // and a moving or refining mesh was not even named. brae was run over all 44 shipped tutorials and the
 // ones that reached `End:` were counted -- two did that should not have, both on `dynamicRefineFvMesh`.
-// Also refused now: any `dynamicFvMesh` but staticFvMesh (19 tutorials), a dictionary-form `sigma` and a
+// Also refused now: any `dynamicFvMesh` but staticFvMesh and the solid-body motion above, a dictionary-form `sigma` and a
 // missing one (both used to become ZERO surface tension), a setTimeStep function object, and on
 // `-device` nOuterCorrectors above 1 and nNonOrthogonalCorrectors above 0, which that loop does not run.
 // tests/interfoam_refusals.sh holds every one of them, each beside the form OpenFOAM treats as nothing
@@ -93,7 +104,12 @@ int main(int argc, char** argv)
         m.read(caseDir + "/constant/polyMesh");
         FvGeometry g;
         g.build(m);
-        const std::vector<FvPatch> patches = buildPatches(m, g);
+        std::vector<FvPatch> patches = buildPatches(m, g);
+        // ...handed to the host loop mutable as well, for a case whose mesh moves (MutableMesh)
+        MutableMesh mutableMesh;
+        mutableMesh.m = &m;
+        mutableMesh.g = &g;
+        mutableMesh.patches = &patches;
 
         // The start directory OpenFOAM would use. `0` is written as `0` and not `0.000000`, which is
         // what every tutorial ships.
@@ -124,7 +140,7 @@ int main(int argc, char** argv)
             ? runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/true,
                                  /*fieldsOut=*/nullptr, endTime)
             : runInterFoam(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/true,
-                           /*fieldsOut=*/nullptr, endTime);
+                           /*fieldsOut=*/nullptr, endTime, /*pressureTaps=*/nullptr, &mutableMesh);
 
         std::printf("End: t = %.6g, alpha in [%.3e, %.8f], max|U| %.4g m/s, worst |div(phi)| %.3e\n",
                     (double)r.time, (double)r.alphaMin, (double)r.alphaMax,

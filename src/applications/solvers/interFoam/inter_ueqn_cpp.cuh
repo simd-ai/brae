@@ -131,6 +131,8 @@ struct InterMomentumInput
 
     // U at the previous time level, for the ddt source.
     const std::vector<vector>*              UOld      = nullptr;   // cells
+    // ...and the cell volumes at that level, on a mesh that moves; null on one that does not
+    const std::vector<scalar>* V0 = nullptr;   // cells
 
     // The mixture KINEMATIC effective viscosity, nu + nut. Multiplied by rho here, because the
     // multiplication is the one decision this component owns (see note 2 in the header).
@@ -205,22 +207,36 @@ inline std::vector<std::vector<scalar>> dynamicViscosityBoundary(
 //
 // rhoOld is a SEPARATE argument from rho on purpose: passing the same vector twice is the defect this
 // signature exists to make visible at the call site.
+// `V0` is the OLD-time volume of a mesh that moves (EulerDdtScheme.C:459-462: the source carries
+// mesh().Vsc0() where the diagonal carries Vsc()); null on a mesh that does not.
 inline void addEulerDdtRhoU(FvVectorMatrix&            M,
                             const std::vector<scalar>& rho,
                             const std::vector<scalar>& rhoOld,
                             const std::vector<vector>& UOld,
                             const std::vector<scalar>& V,
-                            scalar                     deltaT)
+                            scalar deltaT,
+                            const std::vector<scalar>* V0 = nullptr)
 {
     if (deltaT <= scalar(0))
         throw std::runtime_error("brae interFoam UEqn: deltaT must be positive; interFoam has no steady path.");
     const std::size_t nC = rho.size();
     if (rhoOld.size() != nC || UOld.size() != nC || V.size() != nC || M.diag.size() != nC)
         throw std::runtime_error("brae interFoam UEqn: ddt field lengths disagree.");
+    if (V0 && V0->size() != nC)
+        throw std::runtime_error("brae interFoam UEqn: the old-time volumes are not the mesh's cells.");
     const scalar rDeltaT = scalar(1) / deltaT;
     for (std::size_t c = 0; c < nC; ++c)
     {
         M.diag[c] += rDeltaT * rho[c] * V[c];
+        if (V0)
+        {
+            // rDeltaT*rho.oldTime()*vf.oldTime()*mesh().Vsc0(), in that order
+            const scalar w = rDeltaT * rhoOld[c];
+            M.source[c].x += w * UOld[c].x * (*V0)[c];
+            M.source[c].y += w * UOld[c].y * (*V0)[c];
+            M.source[c].z += w * UOld[c].z * (*V0)[c];
+            continue;
+        }
         const scalar w = rDeltaT * rhoOld[c] * V[c];
         M.source[c].x += w * UOld[c].x;
         M.source[c].y += w * UOld[c].y;

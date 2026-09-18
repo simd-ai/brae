@@ -353,8 +353,10 @@ int main(
     // untightened profiles is 6.4e-09, host and device, so one bound holds them all and it is 1e-6.
     const scalar runBound = tight ? scalar(1e300) : scalar(1e-6);
     const std::vector<LinearSolveRecord> ofP = brae::gatecheck::readOfPressureSolves(logPath);
+    // the Final entry's tolerance, for the edge-stop rule compareSolves explains; under `tight` it is
+    // 1e-13 and the rule fired once (the host's seventeenth solve) after ddtCorr's SMALL was corrected
     failures += brae::gatecheck::compareSolves("host", r.pSolves, ofP, nSteps, "p_rgh", scalar(1e-10),
-                                               runBound);
+                                               runBound, scalar(-1), nullptr, true, fin.pSolveFinal.tol);
 
     // `mompred`: the momentum predictor's own solves. This case is 2-D in x and z, so OpenFOAM logs
     // Ux and Uz and no Uy -- the empty direction is skipped, not solved to zero.
@@ -443,7 +445,8 @@ int main(
         // device reads 2.2e-10, on the second corrector's 6e-05 -- a difference of 1e-14 in a residual
         // that is itself the difference of two numbers of order one, summed in the GPU's order. 5e-9.
         failures += brae::gatecheck::compareSolves("device", rd.pSolves, ofP, nSteps, "p_rgh",
-                                                   scalar(5e-9), runBound);
+                                                   scalar(5e-9), runBound, scalar(-1), nullptr, true,
+                                                   dev.pSolveFinal.tol);
         if (mulesCorr)
         {
             failures += brae::gatecheck::compareSolves("device", rd.alphaSolves, ofAlphaSolves, nSteps,

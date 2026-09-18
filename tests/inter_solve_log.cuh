@@ -85,7 +85,18 @@ inline int compareSolves(
     scalar* worstFinalOut = nullptr,
     // false = MEASURE ONLY: print the comparison, assert nothing, return 0. For a control, whose whole
     // purpose is to disagree -- an uncounted "FAIL:" line in a passing log is a trap for the next reader.
-    bool assertArms = true)
+    bool assertArms = true,
+    // THE SOLVE'S ABSOLUTE TOLERANCE, for the one disagreement in an iteration count that is not a
+    // different solver: a residual that lands ON the tolerance. A solve at `tolerance 1e-13` whose
+    // sixteenth residual is 1.000e-13 stops or does not on the last bit of a number that is itself a
+    // difference of two O(1) quantities, and the other code's sixteenth, summed in another order,
+    // falls a bit above or below. MEASURED on waves/stokesI `tight`: OpenFOAM 16 with a final residual
+    // of 1.000e-13, the host 17 ending at 5.3e-14 and the device 16 -- the same solver on the same
+    // system. So a count that differs by EXACTLY ONE, where the shorter run's final residual is within
+    // a thousandth of the tolerance, is counted as equal and printed as an edge stop. Negative = no
+    // tolerance known, no exception. This is not a bound on the count: two apart, or one apart with
+    // the shorter run's residual anywhere else, is still a different solve.
+    scalar tolerance = scalar(-1))
 {
     int failures = 0;
     auto check = [&](
@@ -100,6 +111,7 @@ inline int compareSolves(
         }
     };
     std::size_t nSame = 0;
+    std::size_t nEdge = 0;
     scalar wInit = 0, wInitFirst = 0;
     const std::size_t perStep = nSteps > 0 ? of.size()/static_cast<std::size_t>(nSteps) : 0;
     for (std::size_t k = 0; k < mine.size() && k < of.size(); ++k)
@@ -108,6 +120,20 @@ inline int compareSolves(
         {
             ++nSame;
         }
+        else if (tolerance > scalar(0) && std::abs(mine[k].nIterations - of[k].nIterations) == 1)
+        {
+            const LinearSolveRecord& shorter = mine[k].nIterations < of[k].nIterations ? mine[k] : of[k];
+            if (shorter.finalResidual <= tolerance
+                && shorter.finalResidual >= tolerance*(scalar(1) - scalar(1e-3)))
+            {
+                ++nSame;
+                ++nEdge;
+                std::printf("  (solve %zu: %d against %d iterations, the shorter ending at %.4e on a "
+                            "tolerance of %.1e -- an edge stop, counted as equal)\n",
+                            k + 1, of[k].nIterations, mine[k].nIterations, (double)shorter.finalResidual,
+                            (double)tolerance);
+            }
+        }
         const scalar e = residualRelDiff(mine[k].initialResidual, of[k].initialResidual);
         wInit = std::fmax(wInit, e);
         if (k < perStep)
@@ -115,9 +141,10 @@ inline int compareSolves(
             wInitFirst = std::fmax(wInitFirst, e);
         }
     }
-    std::printf("  %s %s solves against OpenFOAM's log: %zu of %zu iteration counts equal;  initial "
+    std::printf("  %s %s solves against OpenFOAM's log: %zu of %zu iteration counts equal%s;  initial "
                 "residual worst %.3e in step one, %.3e over the run\n",
-                who, field, nSame, of.size(), (double)wInitFirst, (double)wInit);
+                who, field, nSame, of.size(), nEdge ? " (one of them an edge stop)" : "",
+                (double)wInitFirst, (double)wInit);
     std::printf("    iterations (OpenFOAM/%s):", who);
     for (std::size_t k = 0; k < mine.size() && k < of.size(); ++k)
     {

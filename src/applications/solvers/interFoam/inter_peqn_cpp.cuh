@@ -155,11 +155,25 @@ struct DdtCorrInput
 {
     const SurfaceScalarField*  phiOld = nullptr;      // phi.oldTime()
     const std::vector<vector>* UOld   = nullptr;      // U.oldTime(), cell values
+    // A MOVING MESH: fvc::ddtCorr(U, phi, Uf) is ddtCorr(U, Uf) when mesh.dynamic() (fvcDdtPhiCorr,
+    // fvcMeshPhi.C), and EulerDdtScheme::fvcDdtUfCorr replaces phi.oldTime() by Sf & Uf.oldTime()
+    // -- the NEW Sf, and the interpolation of U.oldTime() with the NEW weights. Null on a mesh that
+    // does not move.
+    const SurfaceVectorField* UfOld = nullptr;
     // fvSchemes' ddtPhiCoeff. NEGATIVE (the default) selects the limiter in note 1; a non-negative
     // value is used verbatim as a constant coefficient.
     scalar ddtPhiCoeff = -1;
     scalar deltaT = 0;
 };
+
+// adjustPhi(phi, U, p): on a case that needs a pressure reference, scale the OUTFLOW of the patches
+// whose velocity is not fixed so that the boundary flux balances (adjustPhi.C:36-137). Returns what
+// OpenFOAM returns. Throws where OpenFOAM stops: an imbalance no adjustable outflow can remove.
+bool adjustPhi(
+    SurfaceScalarField& phi,
+    const GeometricField<vector>& U,
+    bool needReference,
+    const std::vector<FvPatch>& patches);
 
 // Returns coeff*rDeltaT*phiCorr on the internal faces, and zero on every patch where U fixes a value.
 void ddtCorr(const DdtCorrInput&           in,
@@ -268,6 +282,11 @@ struct PressureStepInput
     std::vector<PressureSolveRecord>* solveLog = nullptr;
     // the coarsest-level solve of every GAMG V-cycle, in order; null = not kept
     GamgSolveLog* gamgLog = nullptr;
+    // A MOVING MESH: its mesh-motion flux and the face velocity Uf, both non-null or both null.
+    // pEqn.H:19-24 makes phiHbyA relative around adjustPhi; :70-73 correct Uf from the new phi and
+    // make phi relative to the motion, so the phi that leaves the corrector is the RELATIVE flux.
+    const SurfaceScalarField* meshPhi = nullptr;
+    SurfaceVectorField* Uf = nullptr;
 };
 
 // U.correctBoundaryConditions() FOR THE FLUX-CONDITIONAL VELOCITY PATCHES, which evaluateBoundary()

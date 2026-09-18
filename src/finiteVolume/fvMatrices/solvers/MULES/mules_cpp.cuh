@@ -100,6 +100,13 @@ struct Fields
     const std::vector<scalar>* Su     = nullptr;   // null == zeroField()
     const std::vector<scalar>* psiMax = nullptr;   // null == oneField()            (interFoam)
     const std::vector<scalar>* psiMin = nullptr;   // null == zeroField()
+    // A MOVING MESH: mesh.Vsc() and mesh.Vsc0(), the cell volumes at the end and at the start of the
+    // (sub-)step. Null == a mesh that does not move, where Vsc is the mesh's V and the old volume is
+    // never read. When set, explicitSolve takes MULESTemplates.C's `mesh.moving()` branch -- the old
+    // value is weighted by Vsc0/Vsc -- the limiter's budgets take theirs (:397-417), and every
+    // surfaceIntegrate divides by Vsc (fvcSurfaceIntegrate.C:77). Both or neither.
+    const std::vector<scalar>* Vsc = nullptr;
+    const std::vector<scalar>* Vsc0 = nullptr;
 };
 
 // lambda, on every face of the mesh. Kept as one object because OpenFOAM's allLambda is one array

@@ -165,7 +165,7 @@ int main()
             const std::vector<Stage> seen = record(ctl);
             const std::vector<Stage> want{
                 Stage::courantNo, Stage::alphaCourantNo, Stage::setDeltaT, Stage::advanceTime,
-                Stage::alphaControls, Stage::alphaEqnSubCycle, Stage::mixtureCorrect,
+                Stage::meshUpdate, Stage::alphaControls, Stage::alphaEqnSubCycle, Stage::mixtureCorrect,
                 Stage::UEqn, Stage::pEqn, Stage::pEqn, Stage::turbulenceCorrect,
                 Stage::write};
             std::printf("  %s\n", join(seen).c_str());

@@ -117,6 +117,10 @@ enum class Stage
     alphaCourantNo,
     setDeltaT,
     advanceTime,
+    // interFoam.C:118-148, at the top of every outer corrector: mesh.update() on the first (or on
+    // every one under moveMeshOuterCorrectors), and what the solver rebuilds when the mesh changed.
+    // The hook decides whether the mesh moves at all; a static case does nothing here.
+    meshUpdate,
     alphaControls,
     alphaEqnSubCycle,
     mixtureCorrect,

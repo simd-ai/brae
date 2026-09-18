@@ -17,6 +17,44 @@ namespace interFoam {
 
 namespace {
 
+// movingWallVelocityFvPatchVectorField::updateCoeffs when the mesh moves: Uwall() on every patch of
+// that type, assigned as the patch's fixed value.
+//
+//     oldFc = face::centre(oldPoints)                 -- face::centre, not the mesh's Cf
+//     Up    = (faceCentres - oldFc)/deltaT            -- the new face::centre
+//     Un    = meshPhi_p/(magSf + VSMALL)
+//     Uwall = Up + n*(Un - (n & Up))
+//
+// The normal component is REPLACED by the swept volume's, so the wall's flux is the mesh flux
+// exactly and a closed tank's boundary balance (adjustPhi) closes on it.
+void updateMovingWallVelocity(
+    InterFields& f,
+    const DynamicMotionSolverFvMesh& dyn,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    scalar deltaT)
+{
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (!f.movingWallVelocityPatch[pi]) continue;
+        const FvPatch& q = patches[pi];
+        std::vector<vector> uwall(static_cast<std::size_t>(q.size));
+        for (label i = 0; i < q.size; ++i)
+        {
+            const label facei = q.start + i;
+            const vector oldFc = faceCentreOfPoints(m, facei, dyn.oldPoints());
+            const vector newFc = faceCentreOfPoints(m, facei, m.points());
+            const vector Up = (newFc - oldFc)/deltaT;
+            const vector n = g.Sf()[facei]/q.magSf[i];
+            // VSMALL
+            const scalar Un = dyn.meshPhi().boundary[pi][i]/(q.magSf[i] + scalar(1e-300));
+            uwall[i] = Up + n*(Un - dot(n, Up));
+        }
+        f.U.boundary[pi]->setStoredValues(std::move(uwall));
+    }
+}
+
 }   // namespace
 
 
@@ -30,10 +68,35 @@ RunReport runInterFoam(
     bool verbose,
     InterFields* fieldsOut,
     scalar endTime,
-    PressureTaps* pressureTaps)
+    PressureTaps* pressureTaps,
+    const MutableMesh* mutableMesh)
 {
     InterFields f = buildInterFields(caseDir, startDir, m, g, patches);
     const label nC = m.nCells();
+
+    // A MESH THAT MOVES is attached to the caller's mutable objects -- the ones the fields were just
+    // built against, checked by address -- and moved in place at every mesh update below.
+    DynamicMotionSolverFvMesh* dyn = f.dynamicMesh.get();
+    if (dyn)
+    {
+        if (!mutableMesh || !mutableMesh->m || !mutableMesh->g || !mutableMesh->patches)
+        {
+            throw std::runtime_error(
+                "brae interFoam: the case moves its mesh (" + dyn->motionType() + ") and the caller handed "
+                "the driver a mesh it may not move. Pass the same mesh, geometry and patches through "
+                "MutableMesh; the fields hold references to those patches and must see every move.");
+        }
+        if (mutableMesh->m != &m || mutableMesh->g != &g || mutableMesh->patches != &patches)
+        {
+            throw std::runtime_error(
+                "brae interFoam: MutableMesh names different objects from the mesh, geometry and patches "
+                "the fields were built against. Moving a copy would leave every field on the old mesh.");
+        }
+        dyn->attach(*mutableMesh->m, *mutableMesh->g, *mutableMesh->patches);
+    }
+    // which outer corrector of the step this is, for the mesh update interFoam.C:118 makes on the
+    // first one only; reset with every time step
+    label outerOfStep = -1;
 
     // The four old-time fields. See the header: each is read by something different, and each is
     // correct in isolation, which is why losing one is invisible to any single equation's gate.
@@ -41,6 +104,8 @@ RunReport runInterFoam(
     std::vector<vector> UOld     = f.U.internal;
     std::vector<scalar> rhoOld   = f.rho;
     SurfaceScalarField  phiOld   = f.phi;
+    // ...and a fifth on a moving mesh: Uf.oldTime(), which ddtCorr reads in phi.oldTime()'s place
+    SurfaceVectorField UfOld = f.Uf;
 
     SurfaceScalarField prevCorr;                 // alphaApplyPrevCorr's cache
     RunReport rep;
@@ -96,10 +161,49 @@ RunReport runInterFoam(
                 case Stage::advanceTime:
                     rep.time += rep.deltaT;
                     ++rep.steps;
+                    outerOfStep = -1;
                     // Time::operator++ moves writeTimeIndex_ AFTER the time, with the step that took
                     // it -- which is what the next adjustDeltaT measures the distance to.
                     f.writeCadence.advance(rep.time, rep.deltaT);
                     break;
+
+                case Stage::meshUpdate:
+                {
+                    ++outerOfStep;
+                    if (!dyn) break;
+                    // interFoam.C:118: on the first outer corrector, or on every one under
+                    // moveMeshOuterCorrectors
+                    if (outerOfStep != 0 && !f.moveMeshOuterCorrectors) break;
+                    dyn->update(rep.time, rep.deltaT, rep.steps);
+
+                    // dynamicMotionSolverFvMesh::update ends in U.correctBoundaryConditions(): a
+                    // movingWallVelocity patch takes the wall's velocity from the motion of THIS
+                    // step (movingWallVelocityFvPatchVectorField.C, Uwall), every other patch is
+                    // evaluated as it stands
+                    updateMovingWallVelocity(f, *dyn, m, g, patches, rep.deltaT);
+                    f.U.evaluateBoundary();
+
+                    // interFoam.C:130-131: gh and ghf follow the cell and face centres
+                    ghField(f.g, f.ghRefValue, g.C(), f.gh);
+                    {
+                        std::vector<vector> Cf(g.Cf().begin(), g.Cf().begin() + m.nInternalFaces());
+                        ghField(f.g, f.ghRefValue, Cf, f.ghfInternal);
+                        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                        {
+                            const FvPatch& q = patches[pi];
+                            std::vector<vector> bCf(g.Cf().begin() + q.start, g.Cf().begin() + q.start + q.size);
+                            ghField(f.g, f.ghRefValue, bCf, f.ghfBoundary[pi]);
+                        }
+                    }
+                    // the correctPhi block is refused where the case is read (InterFields::correctPhi)
+
+                    // GAMGAgglomeration is a MeshObject and movePoints() marks it for rebuilding
+                    // whenever the time index is a multiple of updateInterval, which is 1 -- so the
+                    // hierarchy is rebuilt at every step, from wherever the static pairing direction
+                    // was left (GAMGAgglomeration.C:500-517)
+                    gamgCache.built = false;
+                    break;
+                }
 
                 case Stage::alphaControls:             // read once, in buildInterFields
                     ++outerIndex;
@@ -146,6 +250,25 @@ RunReport runInterFoam(
                         ++subCycle;
                         AlphaStepInput sub = ai;
                         sub.deltaT = dtSub;
+                        // a moving mesh's volumes at this sub-cycle's clock: fvMesh::Vsc and Vsc0
+                        // interpolate between V0 and V by the sub-cycle's position in the step
+                        std::vector<scalar> VscK;
+                        std::vector<scalar> Vsc0K;
+                        if (dyn)
+                        {
+                            SubCycleTimeState ts;
+                            ts.subCycling = f.alphaCtl.nAlphaSubCycles > 1;
+                            const SubCycleClock clock = subCycleClock(
+                                rep.time, rep.deltaT, rep.steps, f.alphaCtl.nAlphaSubCycles, subCycle);
+                            ts.value = clock.t;
+                            ts.deltaT = dtSub;
+                            ts.value0 = rep.time;
+                            ts.deltaT0 = rep.deltaT;
+                            VscK = dyn->Vsc(ts);
+                            Vsc0K = dyn->Vsc0(ts);
+                            sub.Vsc = &VscK;
+                            sub.Vsc0 = &Vsc0K;
+                        }
                         if (f.waves.any)
                         {
                             const SubCycleClock clock = subCycleClock(
@@ -310,6 +433,7 @@ RunReport runInterFoam(
                     mi.rhoPhi = &f.rhoPhi.internal; mi.rhoPhiBnd = &phB;
                     mi.rho = &f.rho; mi.rhoOld = &rhoOld; mi.rhoBnd = &rhoB;
                     mi.UOld = &UOld;
+                    mi.V0 = dyn ? &dyn->V0() : nullptr;
                     // nuEff = nut + nu: the mixture's nu alone when the case is laminar
                     std::vector<scalar> nuEff;
                     std::vector<std::vector<scalar>> nuEffB;
@@ -344,6 +468,8 @@ RunReport runInterFoam(
 
                     DdtCorrInput dc;
                     dc.phiOld = &phiOld; dc.UOld = &UOld; dc.deltaT = rep.deltaT;
+                    // ddtCorr(U, phi, Uf) is ddtCorr(U, Uf) when the mesh is dynamic
+                    dc.UfOld = dyn ? &UfOld : nullptr;
 
                     PressureStepInput pin;
                     pin.UEqn = &UEqn; pin.rho = &f.rho; pin.gh = &f.gh; pin.ghf = &f.ghfInternal;
@@ -353,11 +479,16 @@ RunReport runInterFoam(
                     pin.rhoPhi = &f.rhoPhi;
                     pin.taps = pressureTaps;
                     pin.solveLog = &rep.pSolves;
+                    pin.meshPhi = dyn ? &dyn->meshPhi() : nullptr;
+                    pin.Uf = dyn ? &f.Uf : nullptr;
 
                     PressureSolveControls psc;
                     psc.nCorrectors = lc.nCorrectors;
                     psc.nNonOrthogonalCorrectors = f.nNonOrthogonalCorrectors;
-                    psc.needReference = false;          // damBreak's atmosphere is totalPressure
+                    // p_rgh.needReference() and setRefCell, read with the case -- see InterFields::pRef
+                    psc.needReference = f.pRef.needReference;
+                    psc.pRefCell = f.pRef.pRefCell;
+                    psc.pRefValue = f.pRef.pRefValue;
                     // the CASE's own solve, not a hardcoded 1e-9. BRAE_PTOL still overrides, because
                     // a device-vs-host gate has to pin both sides to one stopping point.
                     const char* ptol = std::getenv("BRAE_PTOL");
@@ -416,11 +547,12 @@ RunReport runInterFoam(
 
         runTimeStep(lc, hooks);
 
-        // ...and the old-time set moves forward, all four together.
+        // ...and the old-time set moves forward, all four together -- five on a moving mesh.
         alphaOld = f.alpha1.internal;
         UOld     = f.U.internal;
         rhoOld   = f.rho;
         phiOld   = f.phi;
+        UfOld = f.Uf;
 
         if (verbose)
         {

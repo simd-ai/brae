@@ -74,6 +74,28 @@ sed -i 's/(500 1 75) simpleGrading/(50 1 75) simpleGrading/' "$BW/system/blockMe
 sed -i 's/^endTime .*/endTime         0.02;/; s/^deltaT .*/deltaT          0.01;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
     "$BW/system/controlDict"
 
+# ...and laminar/testTubeMixer, for the moving mesh, with the two things the moving gate stages
+# (interfoam_moving_vs_openfoam.sh): div(rhoPhi,U) Gauss linear for vanLeerV, and p_rghFinal as
+# `solver GAMG; smoother DIC;` for the PCG-with-GAMG-preconditioner form
+SRCM="$TUT/multiphase/interFoam/laminar/testTubeMixer"
+[ -d "$SRCM" ] || { echo "SKIP: testTubeMixer tutorial not found at $SRCM"; exit 77; }
+BM="$W/baseMoving"
+cp -r "$SRCM" "$BM" || exit 1
+cp -r "$BM/0.orig" "$BM/0"
+sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss linear;/' "$BM/system/fvSchemes"
+python3 - "$BM/system/fvSolution" <<'PYEOF'
+import re, sys
+p = sys.argv[1]
+t = open(p).read()
+m = re.search(r'p_rghFinal\s*\{.*?\n    \}', t, flags=re.S)
+t = t[:m.start()] + 'p_rghFinal\n    {\n        solver          GAMG;\n        smoother        DIC;\n        tolerance       2e-09;\n        relTol          0;\n        maxIter         20;\n    }' + t[m.end():]
+open(p, 'w').write(t)
+PYEOF
+( cd "$BM" && blockMesh > log.blockMesh 2>&1 && setFields > log.setFields 2>&1 ) \
+    || { echo "SKIP: blockMesh/setFields failed on testTubeMixer"; exit 77; }
+sed -i 's/^endTime .*/endTime         0.0002;/; s/^deltaT .*/deltaT          1e-4;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
+    "$BM/system/controlDict"
+
 HAVE_GPU=0
 if command -v nvidia-smi > /dev/null 2>&1 && nvidia-smi > /dev/null 2>&1; then HAVE_GPU=1; fi
 
@@ -115,7 +137,9 @@ arm baseline                runs    -                        "" true
 
 # the mesh
 arm mesh_dynamicRefine      refused "dynamicRefineFvMesh"     "" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
-arm mesh_motionSolver       refused "dynamicMotionSolverFvMesh" "" "printf '%s\ndynamicFvMesh dynamicMotionSolverFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
+# dynamicMotionSolverFvMesh IS ported for a solidBody motion of the whole mesh; without a motionSolver
+# it is refused by that name, and the moving arms below hold the rest
+arm mesh_motionSolver       refused "motionSolver"             "" "printf '%s\ndynamicFvMesh dynamicMotionSolverFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
 arm mesh_noType             refused "no \`dynamicFvMesh\` entry" "" "printf '%s\n' '$HDR' > constant/dynamicMeshDict"
 arm mesh_static             runs    -                        "" "printf '%s\ndynamicFvMesh staticFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
 
@@ -227,6 +251,27 @@ arm gamg_procAgglomerator   refused "processorAgglomerator"   "" "${GE}processor
 arm gamg_notASwitch         refused "is not a Switch"         "" "${GE}scaleCorrection maybe;/' system/fvSolution"
 BASE="$B"
 
+# THE MOVING MESH: a solid-body motion of the whole mesh runs; everything else about a moving mesh is
+# refused by name -- and so is what the SOLVER does not do on one yet
+BASE="$BM"
+arm moving_baseline         runs    -                        "" true
+arm moving_cellZone         refused "cellZone rotor"          "" "sed -i 's/^motionSolver .*/motionSolver    solidBody;\ncellZone        rotor;/' constant/dynamicMeshDict"
+arm moving_cellSetNone      runs    -                        "" "sed -i 's/^motionSolver .*/motionSolver    solidBody;\ncellSet         none;/' constant/dynamicMeshDict"
+arm moving_displacementLap  refused "motionSolver displacementLaplacian" "" "sed -i 's/^motionSolver .*/motionSolver    displacementLaplacian;/' constant/dynamicMeshDict"
+arm moving_unknownFunction  refused "solidBodyMotionFunction \`wobble\`" "" "sed -i 's/^solidBodyMotionFunction .*/solidBodyMotionFunction wobble;/' constant/dynamicMeshDict"
+arm moving_drivenLinear     refused "drivenLinearMotion"      "" "sed -i 's/^solidBodyMotionFunction .*/solidBodyMotionFunction drivenLinearMotion;/' constant/dynamicMeshDict"
+arm moving_omegaTable       refused "Function1 \`table\`"    "" "sed -i 's/omega  *6.2832;.*/omega           table ((0 6.2832) (1 6.2832));/' constant/dynamicMeshDict"
+arm moving_points0          refused "points0 exists"          "" "cp constant/polyMesh/points constant/polyMesh/points0"
+arm moving_correctPhi       refused "correctPhi"              "" "sed -i 's/correctPhi  *no;/correctPhi      yes;/' system/fvSolution"
+arm moving_noRefValue       refused "no pRefValue"            "" "sed -i '/pRefValue/d' system/fvSolution"
+arm moving_noRefPoint       refused "neither pRefCell nor pRefPoint" "" "sed -i '/pRefPoint/d' system/fvSolution"
+arm moving_refPointOutside  refused "lies in no cell"         "" "sed -i 's/^\( *\)pRefPoint .*/\1pRefPoint (1 1 1);/' system/fvSolution"
+arm moving_refCell          runs    -                        "" "sed -i 's/^\( *\)pRefPoint .*/\1pRefCell 3;/' system/fvSolution"
+KEFIELDS='for n, dim, t, v in [("k", "[0 2 -2 0 0 0 0]", "kqRWallFunction", "0.1"), ("epsilon", "[0 2 -3 0 0 0 0]", "epsilonWallFunction", "0.1"), ("nut", "[0 2 -1 0 0 0 0]", "nutkWallFunction", "0")]: open("0/" + n, "w").write("FoamFile { version 2.0; format ascii; class volScalarField; object %s; }\ndimensions %s;\ninternalField uniform %s;\nboundaryField { walls { type %s; value uniform %s; } }\n" % (n, dim, v, t, v))'
+arm moving_RAS              refused "the mesh moves and the case is turbulent" "" "sed -i 's/^simulationType .*/simulationType RAS;\nRAS { RASModel kEpsilon; turbulence on; }/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,U) .*/&\n    div(phi,k) Gauss upwind;\n    div(phi,epsilon) Gauss upwind;/' system/fvSchemes; sed -i 's/(U|k|epsilon)/XX/; s/^    U$/    \"(U|k|epsilon).*\"/' system/fvSolution; python3 -c '$KEFIELDS'"
+arm moving_vanLeerV         refused "vanLeerV"                "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss vanLeerV;/' system/fvSchemes"
+BASE="$B"
+
 # PIMPLE controls the HOST honours...
 arm host_nOuter2            runs    -                        "" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' system/fvSolution"
 arm host_nNonOrth1          runs    -                        "" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"
@@ -237,6 +282,12 @@ if [ $HAVE_GPU = 1 ]; then
     arm device_nOuter2      refused "nOuterCorrectors 2"      "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' system/fvSolution"
     arm device_nNonOrth1    refused "nNonOrthogonalCorrectors 1" "-device" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"
     arm device_mesh_dynamic refused "dynamicRefineFvMesh"     "-device" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
+    # the device loop moves no mesh and pins no pressure reference; both are refused by name there
+    BASE="$BM"
+    arm device_moving       refused "does not move one"       "-device" true
+    BASE="$B"
+    arm device_closed       refused "needs a reference cell"  "-device" "sed -i '/atmosphere/,/}/ s/type  *totalPressure;/type            fixedFluxPressure;/' 0/p_rgh; sed -i '/nNonOrthogonalCorrectors/a\    pRefPoint (0.292 0.292 0.0073);\n    pRefValue 0;' system/fvSolution"
+    BASE="$B"
     # the device loop carries the kEpsilon closure now, in both lineages
     # the device loop drives the wave conditions through its alpha and velocity hooks
     BASE="$BW"

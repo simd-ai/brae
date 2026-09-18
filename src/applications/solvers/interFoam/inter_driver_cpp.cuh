@@ -71,6 +71,18 @@ struct RunReport
     bool turbulenceOnDevice = false;
 };
 
+// THE MESH A MOVING CASE IS ALLOWED TO MOVE. runInterFoam takes its mesh by const reference, as every
+// gate hands it in, and a case whose mesh moves needs the SAME objects mutable -- the points, the
+// geometry built from them, and the patches' copies of it, which every patch field references. The
+// caller passes them here as well; the driver checks they are the objects it was given and refuses a
+// moving case without them, rather than moving a copy the fields cannot see.
+struct MutableMesh
+{
+    PrimitiveMesh* m = nullptr;
+    FvGeometry* g = nullptr;
+    std::vector<FvPatch>* patches = nullptr;
+};
+
 // Run `nSteps` of interFoam on a prepared case. Returns the state at the end; `verbose` prints the
 // per-step line OpenFOAM's own solver prints.
 RunReport runInterFoam(
@@ -94,7 +106,9 @@ RunReport runInterFoam(
     scalar endTime = scalar(1.0e300),
     // The pressure corrector's intermediates, for comparing against tools/dumpInterFoam. Null in
     // every production run.
-    PressureTaps* pressureTaps = nullptr);
+    PressureTaps* pressureTaps = nullptr,
+    // see MutableMesh: required by a case whose mesh moves, ignored by one whose mesh does not
+    const MutableMesh* mutableMesh = nullptr);
 
 // ...and the SAME run on the GPU. Every operator, every corrector and every loop is the device code
 // gated in tests/test_device_inter_dambreak_alpha.cu, which tracks this host driver on damBreak's own

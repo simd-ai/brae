@@ -99,7 +99,8 @@ void limiter(Limiter&                      lambda,
     const label nIf = m.nInternalFaces();
     const std::vector<label>&  own = m.owner();
     const std::vector<label>&  nei = m.neighbour();
-    const std::vector<scalar>& V   = g.V();
+    // mesh.Vsc(): the mesh's V unless the mesh moves (Fields::Vsc)
+    const std::vector<scalar>& V = f.Vsc ? *f.Vsc : g.V();
     const std::vector<scalar>& psiIf = psi.internal;
 
     const scalar boundaryDeltaExtremaCoeff =
@@ -210,6 +211,15 @@ void limiter(Limiter&                      lambda,
         const scalar SpC   = at(f.Sp,     ci, scalar(0));
         const scalar SuC   = at(f.Su,     ci, scalar(0));
         const scalar a = (rhoC*rDeltaT - SpC);
+        if (f.Vsc0)
+        {
+            // MULESTemplates.C:397-417, the moving-mesh branch: the old value's term carries the OLD
+            // volume and stands outside the bracket
+            const scalar b = ((*f.Vsc0)[ci]*rDeltaT)*rhoO*psiOld[ci];
+            psiMaxn[ci] = V[ci]*(a*psiMaxn[ci] - SuC) - b + sumPhiBD[ci];
+            psiMinn[ci] = V[ci]*(SuC - a*psiMinn[ci]) + b - sumPhiBD[ci];
+            continue;
+        }
         const scalar b = (rhoO*rDeltaT)*psiOld[ci];
         const scalar mx = V[ci]*(a*psiMaxn[ci] - SuC - b) + sumPhiBD[ci];
         const scalar mn = V[ci]*(SuC - a*psiMinn[ci] + b) - sumPhiBD[ci];
@@ -337,15 +347,20 @@ void explicitSolve(scalar                      rDeltaT,
                    const FvGeometry&           g,
                    const std::vector<FvPatch>& patches)
 {
-    // fvc::surfaceIntegrate(phiPsi) -- the divergence, per unit volume.
-    const std::vector<scalar> divPhiPsi = fvc::div(phiPsi, m, g, patches);
+    // fvc::surfaceIntegrate(phiPsi) -- the divergence, per unit volume, and the volume is Vsc
+    const std::vector<scalar> divPhiPsi = f.Vsc ? fvc::div(phiPsi, m, patches, *f.Vsc)
+                                                : fvc::div(phiPsi, m, g, patches);
 
     const label nC = m.nCells();
     psi.resize(static_cast<std::size_t>(nC));
     for (label ci = 0; ci < nC; ++ci)
     {
         // rho.oldTime() above the line and rho below it -- the same split fvm::ddt(rho,U) carries.
-        const scalar num = at(f.rhoOld, ci, scalar(1))*psiOld[ci]*rDeltaT
+        // On a moving mesh (MULESTemplates.C:60-68) the old value is weighted by Vsc0/Vsc as well.
+        const scalar old = f.Vsc0
+            ? (*f.Vsc0)[ci]*at(f.rhoOld, ci, scalar(1))*psiOld[ci]*rDeltaT/(*f.Vsc)[ci]
+            : at(f.rhoOld, ci, scalar(1))*psiOld[ci]*rDeltaT;
+        const scalar num = old
                          + at(f.Su, ci, scalar(0))
                          - divPhiPsi[ci];
         const scalar den = at(f.rho, ci, scalar(1))*rDeltaT - at(f.Sp, ci, scalar(0));
@@ -421,7 +436,8 @@ void limiterCorr(Limiter&                      lambda,
     const label nIf = m.nInternalFaces();
     const std::vector<label>&  own = m.owner();
     const std::vector<label>&  nei = m.neighbour();
-    const std::vector<scalar>& V   = g.V();
+    // mesh.Vsc(): the mesh's V unless the mesh moves (Fields::Vsc)
+    const std::vector<scalar>& V = f.Vsc ? *f.Vsc : g.V();
     const std::vector<scalar>& psiIf = psi.internal;
 
     const scalar boundaryDeltaExtremaCoeff =
@@ -620,7 +636,10 @@ void correct(scalar                      rDeltaT,
              const FvGeometry&           g,
              const std::vector<FvPatch>& patches)
 {
-    const std::vector<scalar> divPhiCorr = fvc::div(phiCorr, m, g, patches);
+    // CMULESTemplates.C:50-75: the same formula whether the mesh moves or not, but surfaceIntegrate
+    // divides by Vsc either way
+    const std::vector<scalar> divPhiCorr = f.Vsc ? fvc::div(phiCorr, m, patches, *f.Vsc)
+                                                 : fvc::div(phiCorr, m, g, patches);
     const label nC = m.nCells();
     for (label ci = 0; ci < nC; ++ci)
     {
