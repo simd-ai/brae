@@ -2538,6 +2538,40 @@ COMPONENTS = {
                   "functions on the MESH patch type, so the reader holds every `wall` patch to nutkWallFunction "
                   "and omegaWallFunction and every other patch to neither. HOST ONLY SO FAR: the device loop "
                   "refuses by name, first among its refusals."),
+        dict(name="interFoam_MRF", of_symbol="MRFZoneList",
+             of_file="src/finiteVolume/cfdTools/general/MRF/MRFZoneList.C",
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/finiteVolume/cfdTools/general/MRF/MRF_cpp.cuh",
+             validation="tests/interfoam_mrf_vs_openfoam.sh, real OpenFOAM on laminar/mixerVessel2D AS SHIPPED (its "
+                        "own m4 blockMesh, topoSet and setsToZones; 3072 cells, the `rotor` zone 1536 of them with "
+                        "3024 internal faces and 192 rotor faces that move with the frame), twenty fixed steps of the "
+                        "tutorial's deltaT 1e-3. MEASURED: all 60 p_rgh iteration counts OpenFOAM's, initial residuals "
+                        "within 1.2e-11; alpha 8.2e-15, p_rgh 4.9e-14, U 1.9e-15; bounds at about 30x. THE CONTROL: "
+                        "OpenFOAM with the zone `active no`, where nothing moves (100% of U). THE PATH is asserted: "
+                        "one active zone, a proper part of the mesh, with included faces, turning at the case's "
+                        "6.2831853 rad/s; OpenFOAM's log building the zone list. BROKEN ONCE EACH (U, p_rgh, p_rgh "
+                        "counts equal): makeRelative(phiHbyA) dropped 1.1e+00, 8.7e-01, 24 of 60; the ddtCorr flux "
+                        "not zero-filtered 1.7e-01, 2.2e-01, 30 of 60; correctBoundaryVelocity skipped 1.6e-01, "
+                        "6.1e-01, 29 of 60; MRF.DDt dropped 2.7e-02, 2.9e-01, 42 of 60; MRF.DDt(U) for MRF.DDt(rho, "
+                        "U) the same to two digits (rho is 1000 in the water). tests/interfoam_refusals.sh holds nine "
+                        "MRF arms. NOT CLAIMED, each refused by name: MRF under a moving mesh, under RAS, beside a "
+                        "fixedFluxPressure patch (constrainPressure's MRF.relative(Sf & U_b)), an omega that varies "
+                        "in time, and the device loop. The rotor's frame velocity has no oracle of its own -- "
+                        "OpenFOAM writes a noSlip patch as its type alone -- and is held through U.",
+             note="interFoam reaches MRF in four places that do arithmetic (UEqn.H:1, :6; pEqn.H:17, :19), and the "
+                  "host reference simpleFoam and rhoSimpleFoam already gate supplies three of them: "
+                  "correctBoundaryVelocity, addCoriolis (weighted by rho here, MRFZoneList::DDt(rho, U) = "
+                  "rho*DDt(U)) and makeRelative. THE FOURTH IS NEW: MRF.zeroFilter on the ddtCorr flux -- "
+                  "MRFZone::zero sets it to Zero on the zone's internal, included and excluded faces "
+                  "(MRFZoneTemplates.C:213-247), because inside the zone phi.oldTime() is relative to the frame "
+                  "and the flux of U.oldTime() is not, so their difference there is the frame flux and not a "
+                  "correction. ONE SHARED DEFECT: `omega` is a Function1 (MRFZone.C) and the tutorial writes "
+                  "`omega constant 6.2831853;`; the reader took scalarOr, which reads the LAST token -- right for "
+                  "that spelling by accident, a crash on a table's `)` and a silent ZERO for the dictionary form. "
+                  "It reads a constant in its three spellings now, refuses any other type by name, and refuses a "
+                  "zone with no omega, which OpenFOAM's mandatory Function1::New stops on and brae ran at zero. "
+                  "The refusal that used to stand here fired on any active zone; brae's interFoam had once read "
+                  "MRFProperties, ignored it and converged. HOST ONLY SO FAR."),
         dict(name="interFoam_waveModel", of_symbol="waveModel",
              of_file="src/waveModels/waveModel/waveModel.C",
              classification="BOUNDARY_CONDITION", status="REIMPLEMENT",

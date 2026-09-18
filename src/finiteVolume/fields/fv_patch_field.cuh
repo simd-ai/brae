@@ -1883,12 +1883,41 @@ public:
         }
     }
 
-    // OF directionMixedFvPatchField::snGrad() =
+    // OF directionMixedFvPatchField::snGrad() (directionMixedFvPatchField.C) =
     //     (transform(vf, refValue) + transform(I - vf, pif + refGrad/deltaCoeffs) - pif)*deltaCoeffs,
-    // which this class's own coefficients are built to satisfy (see gradientBoundaryCoeffs below).
+    // with this class's refValue = refGrad = 0 and vf = neg(phi)*(I - nn), Zero until the first
+    // updateCoeffs (pressureInletOutletVelocityFvPatchVectorField.C:47-49, :95-99, :180). That is
+    //     -neg(phi)*(pif - n*(n & pif))*deltaCoeffs
+    // and it NEVER READS THE STORED VALUE. This returned snGradFromCoeffs, which is
+    // (value - pif)*deltaCoeffs: the same number once the value has been refreshed from the cell, and a
+    // different one before that. interFoam's waterChannel constructs kOmegaSST over an atmosphere whose
+    // file value is (0 0 0) above cells moving at (1 0 0): OpenFOAM's correctNut reads a boundary
+    // grad(U) with snGrad 0 there and writes nut = k/omega = 3.33e-02, and brae read a shear of 1/d and
+    // wrote 3.7e-05 -- the patch 100% out, the first p_rgh residual of the run 7.1e-03 with it.
     std::vector<T> snGrad(const std::vector<T>& internal) const override
     {
-        return this->snGradFromCoeffs(internal);
+        if constexpr (!std::is_same<T, vector>::value)
+        {
+            return this->snGradFromCoeffs(internal);
+        }
+        else
+        {
+            const std::vector<T> pif = this->patchInternalField(internal);
+            std::vector<T> r(static_cast<std::size_t>(this->patch_.size), T{});
+            for (label i = 0; i < this->patch_.size; ++i)
+            {
+                const bool inflow = i < static_cast<label>(phi_.size()) && phi_[i] < scalar(0);
+                if (!inflow)
+                {
+                    continue;
+                }
+                const vector& nf = this->patch_.nf[i];
+                const scalar nd = nf.x*pif[i].x + nf.y*pif[i].y + nf.z*pif[i].z;
+                const scalar dc = this->patch_.deltaCoeffs[i];
+                r[i] = vector{ -(pif[i].x - nd*nf.x)*dc, -(pif[i].y - nd*nf.y)*dc, -(pif[i].z - nd*nf.z)*dc };
+            }
+            return r;
+        }
     }
     std::vector<T> gradientBoundaryCoeffs() const override        // snGrad - gic_k*pif
     {

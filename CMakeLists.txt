@@ -9,7 +9,7 @@ if(NOT DEFINED CACHE{CMAKE_CUDA_ARCHITECTURES})
         CACHE STRING "CUDA architectures cf is built for" FORCE)
 endif()
 
-project(brae VERSION 0.3.1 LANGUAGES CXX CUDA)
+project(brae VERSION 0.4.0 LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -3403,6 +3403,16 @@ add_executable(test_piov_sngrad tests/test_piov_sngrad.cu)
 target_include_directories(test_piov_sngrad PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_piov_sngrad PRIVATE brae_core)
 add_test(NAME piov_sngrad COMMAND test_piov_sngrad)
+
+# ...and MRF, on laminar/mixerVessel2D as shipped: the rotor's frame velocity, rho*(Omega x U), the
+# zero-filtered ddtCorr flux and the relative phiHbyA. The control is OpenFOAM with the zone inactive;
+# the device loop must refuse by name.
+add_executable(test_inter_mrf_vs_openfoam tests/test_inter_mrf_vs_openfoam.cu)
+target_include_directories(test_inter_mrf_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_mrf_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_mrf_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_mrf_vs_openfoam.sh)
 
 # ...and the wave boundary conditions (waveAlpha, waveVelocity) on laminar/waves/stokesI: fields, the
 # patch values the wave model assigns, its two derived constants and the ORDER it updates in, all

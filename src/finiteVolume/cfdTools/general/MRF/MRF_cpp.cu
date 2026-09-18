@@ -1,4 +1,5 @@
 #include "MRF_cpp.cuh"
+#include <stdexcept>
 #include "foam_dict.cuh"
 #include "mrf_read.cuh"      // readCellZones: the polyMesh cellZones parser (ASCII + binary)
 
@@ -51,7 +52,61 @@ std::vector<ZoneSpec> readMRFProperties(const std::string& constantDir)
         z.active = isOn(mrf.wordOr("active", "yes"));
         if (!z.active) continue;
         z.cellZone = mrf.wordOr("cellZone", "");
-        z.omega    = mrf.scalarOr("omega", 0.0);
+        // omega IS A Function1 (MRFZone.C, `omega_.reset(Function1<scalar>::New("omega", coeffs_,
+        // &mesh_))`), mandatory, and a transient case may make it one: interFoam's mixerVessel2D writes
+        // `omega constant 6.2831853;`. This took scalarOr, which reads the LAST token -- right for that
+        // spelling by accident, a crash on a table's `)` and a silent ZERO for the dictionary form,
+        // which is not a leaf at all. A constant is read in each of its three spellings; any other
+        // type is refused by name, because a frame whose speed brae holds fixed is a different case.
+        {
+            const std::vector<std::string>* ov = mrf.find("omega");
+            const FoamDict* od = mrf.subDict("omega");
+            auto number = [&](const std::string& t)
+            {
+                std::size_t used = 0;
+                scalar v = 0;
+                try
+                {
+                    v = std::stod(t, &used);
+                }
+                catch (...)
+                {
+                    used = 0;
+                }
+                if (used != t.size() || t.empty())
+                    throw std::runtime_error(
+                        "brae MRF: zone `" + s.first + "` has `omega " + t + "`, which is not a number.");
+                return v;
+            };
+            if (ov && ov->size() == 1)
+            {
+                z.omega = number((*ov)[0]);
+            }
+            else if (ov && ov->size() == 2 && (*ov)[0] == "constant")
+            {
+                z.omega = number((*ov)[1]);
+            }
+            else if (od && od->wordOr("type", "") == "constant" && od->find("value"))
+            {
+                z.omega = number(od->find("value")->back());
+            }
+            else if (ov || od)
+            {
+                const std::string type = ov ? (ov->empty() ? std::string("<empty>") : (*ov)[0])
+                                            : od->wordOr("type", "<no type>");
+                throw std::runtime_error(
+                    "brae MRF: zone `" + s.first + "` gives omega as a Function1 of type `" + type
+                    + "`. brae reads a constant (`omega 6.28;`, `omega constant 6.28;`, or "
+                    "`omega { type constant; value 6.28; }`) and holds it for the run; a speed that "
+                    "varies in time is not ported, and holding it fixed would solve another case.");
+            }
+            else
+            {
+                throw std::runtime_error(
+                    "brae MRF: zone `" + s.first + "` has no `omega` entry. OpenFOAM's Function1::New "
+                    "is mandatory there (MRFZone.C) and stops; brae used to run the zone at omega 0.");
+            }
+        }
         z.axis     = asVector(mrf.scalarListOr("axis", {}), vector{0, 0, 1});
         z.origin   = asVector(mrf.scalarListOr("origin", {}), vector{0, 0, 0});
         z.nonRotatingPatches = mrf.wordListOr("nonRotatingPatches", {});

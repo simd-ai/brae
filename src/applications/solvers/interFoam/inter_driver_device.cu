@@ -83,6 +83,21 @@ RunReport runInterFoamDevice(
     scalar endTime)
 {
     InterFields f = buildInterFields(caseDir, startDir, m, g, fvp);
+    // FIRST among the device refusals: the model is what a reader of the message has to change, and
+    // every refusal below is about the loop around it
+    if (f.turbulence.on && f.turbulence.model == cpu::interFoam::InterRasModel::KOmegaSST)
+        throw std::runtime_error(
+            "brae interFoam (device): the case is RAS kOmegaSST. The device loop runs kEpsilon's device "
+            "twin (device_inter_turbulence.cuh) and nothing else; kOmegaSST is ported on the host "
+            "(inter_turbulence_cpp.cu around kOmegaSST_cpp.cu) and gated there against OpenFOAM on "
+            "RAS/waterChannel. Refused rather than run under kEpsilon's name or laminar.");
+
+    if (!f.mrfZones.empty())
+        throw std::runtime_error(
+            "brae interFoam (device): the case has an active MRF zone. The host loop carries it "
+            "(MRF.correctBoundaryVelocity, MRF.DDt(rho, U), zeroFilter and makeRelative -- gated on "
+            "laminar/mixerVessel2D); the device loop's UEqn and pEqn carry none of the four. Refused "
+            "rather than run the case in an inertial frame.");
 
     // NOT ON THE DEVICE YET, refused rather than run on the mesh as it started or on a singular
     // pressure system: a mesh that moves (the host loop has it, inter_driver_cpp.cu), and a closed

@@ -1,5 +1,6 @@
 #pragma once
-// interFoam's turbulence -- incompressibleInterPhaseTransportModel around kEpsilon, the host reference.
+// interFoam's turbulence -- incompressibleInterPhaseTransportModel around kEpsilon or kOmegaSST, the
+// host reference.
 //
 // provenance:
 //   openfoam:  src/phaseSystemModels/twoPhaseInter/incompressibleInterPhaseTransportModel/
@@ -10,8 +11,12 @@
 //              src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon.C:214-296 (correct)
 //              src/TurbulenceModels/turbulenceModels/linearViscousStress/linearViscousStress.C:107-133
 //              applications/solvers/multiphase/interFoam/interFoam.C:169-172 (where correct() is called)
-//   brae:      kEpsilon_cpp.cuh is the closure; this file only chooses what it is handed
-//   tests:     tests/interfoam_ras_dambreak_vs_openfoam.sh against real OpenFOAM, both lineages
+//              src/TurbulenceModels/turbulenceModels/Base/kOmegaSST/kOmegaSSTBase.C:497-612 (correct),
+//                  :117-126 (correctNut), :408-461 (decayControl)
+//   brae:      kEpsilon_cpp.cuh and kOmegaSST_cpp.cuh are the closures; this file only chooses what
+//              they are handed
+//   tests:     tests/interfoam_ras_dambreak_vs_openfoam.sh against real OpenFOAM, both lineages;
+//              tests/interfoam_waterchannel_vs_openfoam.sh, kOmegaSST on RAS/waterChannel
 //
 // THERE ARE TWO MODELS BEHIND ONE KEYWORD, and the case picks by a line most cases do not carry.
 //
@@ -31,10 +36,20 @@
 // UEqn takes the stress as rho*nuEff in both: -fvc::div(rho*nuEff*dev2(T(grad U))) -
 // fvm::laplacian(rho*nuEff, U), with nuEff = nut + nu.
 //
-// WHAT IS REFUSED, by name: every RASModel but kEpsilon, LES, `turbulence off`, a k/epsilon
-// convection scheme other than `Gauss upwind` (what all 11 kEpsilon tutorials name), a nut wall
-// function outside nutk/nutU/nutLowRe or on a patch that is not a `wall`, and a ddt scheme other than
-// Euler. The device loop runs the same closure's device twin: device_inter_turbulence.cuh.
+// kOmegaSST (RAS/waterChannel, and four tutorials that need more than the model) is the UNIFORM lineage
+// only: the ordinary incompressible kOmegaSST, handed the mixture's nu as a field, the volumetric phi,
+// and the CELL wall distance wallDist::New(mesh).y() for F1 and F2. The closure applies
+// omegaWallFunction and nutkWallFunction on every patch whose MESH type is `wall`, so the reader holds
+// the case to exactly that: each `wall` patch carries both, no other patch carries either.
+//
+// WHAT IS REFUSED, by name: every RASModel but kEpsilon and kOmegaSST, LES, `turbulence off`, a
+// convection scheme on the turbulence scalars other than `Gauss upwind` (what every tutorial of either
+// model names), a nut wall function outside nutk/nutU/nutLowRe (kEpsilon) or other than nutk
+// (kOmegaSST) or on a patch that is not a `wall`, and a ddt scheme other than Euler. Under kOmegaSST
+// also: `density variable` (no tutorial pairs them, so no gate would hold it), F3, decayControl, a
+// wall-function blending other than the default binomial n = 2, wall-function coefficients other than
+// the defaults, and a moving mesh (y is taken once). The device loop runs kEpsilon's device twin,
+// device_inter_turbulence.cuh, and refuses kOmegaSST by name.
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
 #include "fv_geometry.cuh"
@@ -44,6 +59,7 @@
 #include "inter_linear_solve.cuh"
 #include "inter_solve_record.cuh"
 #include "kepsilon_coeffs.cuh"
+#include "komega_sst_coeffs.cuh"
 #include "primitive_mesh.cuh"
 #include <string>
 #include <vector>
@@ -66,15 +82,29 @@ struct EquationRelax
         const std::string& name);
 };
 
+enum class InterRasModel
+{
+    KEpsilon,
+    KOmegaSST
+};
+
 struct InterTurbulence
 {
     // simulationType RAS. False is laminar: no fields, nuEff = nu, correct() does nothing.
     bool on = false;
+    InterRasModel model = InterRasModel::KEpsilon;
     // `density variable` -- see the header
     bool variableDensity = false;
     KEpsilonCoeffs coeffs;
     GeometricField<scalar> k;
+    // kEpsilon's second scalar; empty under kOmegaSST
     GeometricField<scalar> epsilon;
+    // kOmegaSST's; empty under kEpsilon
+    GeometricField<scalar> omega;
+    KOmegaSSTCoeffs sstCoeffs;
+    // wallDist::New(mesh).y(), the CELL wall distance F1 and F2 take -- not the near-wall face
+    // distance the wall functions use. Taken once: kOmegaSST on a moving mesh is refused.
+    std::vector<scalar> yCell;
     GeometricField<scalar> nut;
     // per patch, a NutWall value; read where the dictionary TYPE still exists
     std::vector<int> nutWallKind;
@@ -85,8 +115,10 @@ struct InterTurbulence
     // time step needs k.oldTime(), which is not the field at entry.
     SmoothLinearSolve kSolveFinal;
     SmoothLinearSolve epsSolveFinal;
+    SmoothLinearSolve omegaSolveFinal;
     EquationRelax kRelaxFinal;
     EquationRelax epsRelaxFinal;
+    EquationRelax omegaRelaxFinal;
 };
 
 // Reads constant/turbulenceProperties, the three fields and their solver, scheme and relaxation
@@ -100,7 +132,10 @@ InterTurbulence readInterTurbulence(
     bool laplacianCorrected,
     scalar laplacianLimitCoeff,
     const std::vector<FvPatch>& patches,
-    label nCells);
+    label nCells,
+    // kOmegaSST's cell wall distance needs the mesh; null is a caller that can only run kEpsilon
+    const PrimitiveMesh* mesh = nullptr,
+    const FvGeometry* geometry = nullptr);
 
 // turbulence->validate(), which incompressibleInterPhaseTransportModel's constructor calls in the
 // UNIFORM lineage only. Does nothing in the variable one, and nothing when laminar.
@@ -138,6 +173,8 @@ struct InterTurbulenceStepInput
     // every solve of the run, in order, for the solver-log gate
     std::vector<LinearSolveRecord>* epsilonLog = nullptr;
     std::vector<LinearSolveRecord>* kLog = nullptr;
+    // kOmegaSST's first solve, omega before k as kOmegaSSTBase.C:555-607 has them
+    std::vector<LinearSolveRecord>* omegaLog = nullptr;
 };
 
 // turbulence->correct(), interFoam.C:171.

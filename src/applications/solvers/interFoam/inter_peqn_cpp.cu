@@ -485,7 +485,28 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
         rhoRAUf(*in.rho, rAU, m, g, rhoRAU);
         SurfaceScalarField corr;
         ddtCorr(*in.ddt, U, m, g, patches, corr);
+        // MRF.zeroFilter(...), pEqn.H:17: MRFZone::zero sets the flux to Zero on the zone's internal,
+        // included and excluded faces (MRFZoneTemplates.C:213-247). The correction compares phi.oldTime()
+        // with the flux of U.oldTime(), and inside the zone the first is RELATIVE to the frame and the
+        // second is not, so their difference there is the frame flux and not a correction. Only the
+        // internal faces carry a ddtCorr here: its boundary value is zero (ddtCouplingCoeff).
+        if (in.mrf)
+        {
+            for (const MRF::Zone& z : *in.mrf)
+            {
+                if (!z.active) continue;
+                for (label fi : z.internalFaces)
+                {
+                    corr.internal[fi] = scalar(0);
+                }
+            }
+        }
         for (label f = 0; f < nIf; ++f) phiHbyA.internal[f] += rhoRAU[f] * corr.internal[f];
+    }
+    // MRF.makeRelative(phiHbyA), pEqn.H:19
+    if (in.mrf && !in.mrf->empty())
+    {
+        MRF::makeRelative(phiHbyA, *in.mrf, g, patches);
     }
 
     // pEqn.H:19-24: on a closed case the boundary flux is balanced by adjustPhi, and on a moving mesh

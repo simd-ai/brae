@@ -1,7 +1,10 @@
 // interFoam's turbulence, the host reference. See inter_turbulence_cpp.cuh for the two lineages.
 #include "inter_turbulence_cpp.cuh"
 #include "foam_field_reader.cuh"
+#include "cellLimitedGrad_cpp.cuh"
+#include "cell_wall_dist.cuh"
 #include "kEpsilon_cpp.cuh"
+#include "kOmegaSST_cpp.cuh"
 #include "near_wall_dist.cuh"
 #include "nut_wall_function.cuh"
 #include "patch_entry_lookup.cuh"
@@ -49,8 +52,9 @@ GeometricField<scalar> readTurbulenceField(
     const std::string path = startDir + "/" + name;
     if (!std::filesystem::exists(path))
         throw std::runtime_error(
-            std::string(WHO) + "the case is RAS kEpsilon and " + path + " does not exist. OpenFOAM "
-            "reads k, epsilon and nut MUST_READ when the model is constructed and stops without them.");
+            std::string(WHO) + "the case is RAS and " + path + " does not exist. OpenFOAM reads k, "
+            "the model's second scalar and nut MUST_READ when the model is constructed and stops "
+            "without them.");
     GeometricField<scalar> f = buildField<scalar>(readField<scalar>(path), patches, nCells);
     f.evaluateBoundary();
     return f;
@@ -74,13 +78,14 @@ SmoothLinearSolve readFinalSolve(
         throw std::runtime_error(
             std::string(WHO) + "`solvers/" + name + "` names `solver " + s.solver + "; smoother "
             + s.smoother + ";`. brae's interFoam closure runs OpenFOAM's smoothSolver with the "
-            "GaussSeidel or symGaussSeidel smoother -- what every kEpsilon tutorial names -- and "
+            "GaussSeidel or symGaussSeidel smoother -- what every turbulent tutorial names -- and "
             "nothing else: a substituted solver at the same tolerance stops somewhere else.");
     return s;
 }
 
-// div(<flux>,<field>): `Gauss upwind` and nothing else. The closure has limitedLinear and
-// linearUpwind, but no interFoam case gates them here and all 11 kEpsilon tutorials name upwind.
+// div(<flux>,<field>): `Gauss upwind` and nothing else. The closures have limitedLinear and
+// linearUpwind, but no interFoam case gates them here: all 11 kEpsilon tutorials name upwind, and so
+// does waterChannel for k and omega.
 void requireUpwind(
     const std::string& caseDir,
     const std::string& field,
@@ -94,39 +99,42 @@ void requireUpwind(
             "refusing rather than running an ungated one.");
 }
 
-// grad(U), which the production GbyNu takes (kEpsilon.C:237)
+// grad(U), which the production GbyNu takes (kEpsilon.C:237, kOmegaSSTBase.C:520)
+template <class Coeffs>
 void readGradU(
     const std::string& caseDir,
-    KEpsilonCoeffs& co)
+    Coeffs& co)
 {
     const FieldGradScheme gu = parseFieldGradScheme(caseDir, "U");
     if (!gu.unsupportedLimiter.empty() || !(gu.gaussLinear || gu.leastSquares))
         throw std::runtime_error(
-            std::string(WHO) + "fvSchemes grad(U) resolves to `" + gu.raw + "`, which the kEpsilon "
+            std::string(WHO) + "fvSchemes grad(U) resolves to `" + gu.raw + "`, which the closure's "
             "production does not compute (Gauss linear and leastSquares, optionally cellLimited).");
     co.gradULeastSq = gu.leastSquares;
     co.gradULimitK = gu.cellLimitK;
 }
 
-// grad(k) and grad(epsilon), which the corrected laplacian's deferred correction takes. The closure
-// carries ONE setting for both fields.
+// grad(k) and grad(epsilon|omega), which the corrected laplacian's deferred correction takes -- and
+// under kOmegaSST CDkOmega too (kOmegaSSTBase.C:548). The closure carries ONE setting for both fields.
+template <class Coeffs>
 void readGradK(
     const std::string& caseDir,
-    KEpsilonCoeffs& co)
+    const std::string& second,
+    Coeffs& co)
 {
     const FieldGradScheme gk = parseFieldGradScheme(caseDir, "k");
-    const FieldGradScheme ge = parseFieldGradScheme(caseDir, "epsilon");
+    const FieldGradScheme ge = parseFieldGradScheme(caseDir, second);
     for (const FieldGradScheme* q : {&gk, &ge})
     {
         if (!q->unsupportedLimiter.empty() || !(q->gaussLinear || q->leastSquares))
             throw std::runtime_error(
                 std::string(WHO) + "fvSchemes resolves a turbulence gradient to `" + q->raw
-                + "`, which the kEpsilon closure does not compute.");
+                + "`, which the closure does not compute.");
     }
     if (gk.leastSquares != ge.leastSquares || gk.cellLimitK != ge.cellLimitK)
         throw std::runtime_error(
             std::string(WHO) + "fvSchemes names different schemes for grad(k) (`" + gk.raw
-            + "`) and grad(epsilon) (`" + ge.raw + "`); the closure carries one for both.");
+            + "`) and grad(" + second + ") (`" + ge.raw + "`); the closure carries one for both.");
     co.gradKLeastSq = gk.leastSquares;
     co.gradKLimitK = gk.cellLimitK;
 }
@@ -188,6 +196,74 @@ std::vector<int> readNutWallKinds(
     return kind;
 }
 
+// kOmegaSST's walls. kOmegaSST_cpp applies omegaWallFunction (:466-520) and nutkWallFunction
+// (correctNutField) on every patch whose MESH type is `wall`, with the model's kappa, E and CmuWall and
+// OpenFOAM's default binomial n = 2 blender. The case is held to exactly that, patch by patch, here --
+// the last place the dictionary types exist.
+void requireSstWalls(
+    const std::string& startDir,
+    const KOmegaSSTCoeffs& co,
+    const std::vector<FvPatch>& patches)
+{
+    const FieldData<scalar> nutRaw = readField<scalar>(startDir + "/nut");
+    const FieldData<scalar> omegaRaw = readField<scalar>(startDir + "/omega");
+    bool anyWall = false;
+    for (const FvPatch& p : patches)
+    {
+        const PatchFieldData<scalar>* nb = findPatchEntry(nutRaw.boundary, p);
+        const PatchFieldData<scalar>* ob = findPatchEntry(omegaRaw.boundary, p);
+        const std::string nutType = nb ? nb->type : std::string();
+        const std::string omegaType = ob ? ob->type : std::string();
+        const bool wall = (p.type == "wall");
+        anyWall = anyWall || wall;
+        const bool nutIsWallFn = nutType.rfind("nut", 0) == 0 || nutType.rfind("atmNut", 0) == 0;
+        if (nutIsWallFn && nutType != "nutkWallFunction")
+            throw std::runtime_error(
+                std::string(WHO) + "nut patch `" + p.name + "` carries `" + nutType + "`. The "
+                "kOmegaSST closure has nutkWallFunction; the rest of the family are different "
+                "functions of different inputs and are not substituted.");
+        if (nutIsWallFn && !wall)
+            throw std::runtime_error(
+                std::string(WHO) + "nut patch `" + p.name + "` carries `" + nutType + "` and its patch "
+                "type is `" + p.type + "`. A nut wall function's patch must be a `wall`; OpenFOAM stops "
+                "on this at construction (nutWallFunction checkType).");
+        if (wall && (nutType != "nutkWallFunction" || omegaType != "omegaWallFunction"))
+            throw std::runtime_error(
+                std::string(WHO) + "wall patch `" + p.name + "` carries nut `" + nutType + "` and omega `"
+                + omegaType + "`. The kOmegaSST closure evaluates nutkWallFunction and "
+                "omegaWallFunction on every `wall` patch; a wall without them would get values "
+                "OpenFOAM does not compute there.");
+        if (!wall && omegaType == "omegaWallFunction")
+            throw std::runtime_error(
+                std::string(WHO) + "omega patch `" + p.name + "` carries omegaWallFunction and its "
+                "patch type is `" + p.type + "`; the closure applies it on `wall` patches only.");
+        if (!wall) continue;
+        for (const PatchFieldData<scalar>* b : {nb, ob})
+        {
+            const bool coeffsDiffer = (b->hasWfCmu && b->wfCmu != co.CmuWall)
+                                   || (b->hasWfKappa && b->wfKappa != co.kappa)
+                                   || (b->hasWfE && b->wfE != co.E);
+            if (coeffsDiffer)
+                throw std::runtime_error(
+                    std::string(WHO) + "wall patch `" + p.name + "` names wall-function coefficients "
+                    "other than Cmu 0.09, kappa 0.41, E 9.8. The kOmegaSST closure carries one set for "
+                    "every wall and this reader does not thread a patch's own through.");
+            const bool blendOther = !b->wfBlending.empty()
+                                 && (b->wfBlending != "binomial" || (b->hasWfBlendN && b->wfBlendN != 2));
+            if (blendOther)
+                throw std::runtime_error(
+                    std::string(WHO) + "wall patch `" + p.name + "` names `blending " + b->wfBlending
+                    + "`. The kOmegaSST closure blends omega's viscous and log values binomially with "
+                    "n = 2, OpenFOAM's default (omegaWallFunctionFvPatchScalarField.C:445), and "
+                    "nothing else.");
+        }
+    }
+    if (!anyWall)
+        throw std::runtime_error(
+            std::string(WHO) + "the case is kOmegaSST and the mesh has no `wall` patch. F1 and F2 take "
+            "the distance to the nearest wall, which does not exist here.");
+}
+
 } // namespace
 
 
@@ -199,7 +275,9 @@ InterTurbulence readInterTurbulence(
     bool laplacianCorrected,
     scalar laplacianLimitCoeff,
     const std::vector<FvPatch>& patches,
-    label nCells)
+    label nCells,
+    const PrimitiveMesh* mesh,
+    const FvGeometry* geometry)
 {
     InterTurbulence t;
     const std::string path = caseDir + "/constant/momentumTransport";
@@ -231,11 +309,12 @@ InterTurbulence readInterTurbulence(
 
     const FoamDict* ras = d.subDict("RAS");
     const std::string model = ras ? ras->wordOr("RASModel", "") : "";
-    if (model != "kEpsilon")
+    if (model != "kEpsilon" && model != "kOmegaSST")
         throw std::runtime_error(
-            std::string(WHO) + file + " asks for RASModel `" + model + "`. kEpsilon is the one model "
-            "wired into interFoam (11 of the 17 turbulent tutorials); refusing rather than running it "
-            "under another model's name.");
+            std::string(WHO) + file + " asks for RASModel `" + model + "`. kEpsilon and kOmegaSST are "
+            "the models wired into interFoam (16 of the 17 turbulent tutorials name one of them); "
+            "refusing rather than running it under another model's name.");
+    t.model = (model == "kOmegaSST") ? InterRasModel::KOmegaSST : InterRasModel::KEpsilon;
     const std::string sw = ras->wordOr("turbulence", "on");
     if (sw == "off" || sw == "no" || sw == "false")
         throw std::runtime_error(
@@ -244,8 +323,74 @@ InterTurbulence readInterTurbulence(
             "and no gate holds that against OpenFOAM yet. Refused rather than run ungated.");
     if (!eulerDdt)
         throw std::runtime_error(
-            std::string(WHO) + "the k and epsilon equations take fvm::ddt through ddtSchemes "
-            "(kEpsilon.C:254, :275) and the closure carries Euler only.");
+            std::string(WHO) + "the closure's two equations take fvm::ddt through ddtSchemes "
+            "(kEpsilon.C:254, :275; kOmegaSSTBase.C:558, :589) and the closures carry Euler only.");
+    t.coeffs.correctedLaplacian = laplacianCorrected;
+    t.coeffs.snGradLimitCoeff = laplacianLimitCoeff;
+    const FoamDict* rfAll = fvSolution.subDict("relaxationFactors");
+    const FoamDict* eqAll = rfAll ? rfAll->subDict("equations") : nullptr;
+
+    if (t.model == InterRasModel::KOmegaSST)
+    {
+        if (t.variableDensity)
+            throw std::runtime_error(
+                std::string(WHO) + file + " pairs `density variable` with kOmegaSST. That is "
+                "kOmegaSSTBase.C with rho the mixture density and rhoPhi its flux; no shipped tutorial "
+                "pairs them, so no gate would hold it against OpenFOAM. Refused rather than run "
+                "ungated.");
+        if (!mesh || !geometry)
+            throw std::runtime_error(
+                std::string(WHO) + "kOmegaSST needs the mesh for its wall distance and this caller "
+                "handed readInterTurbulence none.");
+        readKOmegaSSTCoeffs(ras, t.sstCoeffs);
+        scalar epsilonMinUnused = 0;
+        readTurbulenceMinima(ras, t.sstCoeffs.kMin, epsilonMinUnused, t.sstCoeffs.omegaMin);
+        // kOmegaSSTBase.C:408-461. With it the two equations gain beta*sqr(omegaInf) and
+        // betaStar*omegaInf*kInf and the closure here carries neither term.
+        const FoamDict* sstDict = ras->optionalSubDict("kOmegaSSTCoeffs");
+        const std::string decay = (sstDict ? sstDict : ras)->wordOr("decayControl", "no");
+        if (decay == "yes" || decay == "on" || decay == "true")
+            throw std::runtime_error(
+                std::string(WHO) + file + " sets `decayControl " + decay + "`. It adds "
+                "beta*sqr(omegaInf) to the omega equation and betaStar*omegaInf*kInf to k's "
+                "(kOmegaSSTBase.C:574, :594), and kOmegaSST_cpp carries neither.");
+        if (t.sstCoeffs.F3)
+            throw std::runtime_error(
+                std::string(WHO) + file + " sets `F3 yes`. kOmegaSSTBase multiplies F23 by F3, which "
+                "changes the eddy-viscosity limiter and the production limiter; not ported.");
+        readGradU(caseDir, t.sstCoeffs);
+        readGradK(caseDir, "omega", t.sstCoeffs);
+        requireUpwind(caseDir, "k", "phi");
+        requireUpwind(caseDir, "omega", "phi");
+
+        t.k = readTurbulenceField(startDir, "k", patches, nCells);
+        t.omega = readTurbulenceField(startDir, "omega", patches, nCells);
+        t.nut = readTurbulenceField(startDir, "nut", patches, nCells);
+        requireSstWalls(startDir, t.sstCoeffs, patches);
+        t.nutWallKind.assign(patches.size(), -1);
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (patches[pi].type == "wall")
+            {
+                t.nutWallKind[pi] = static_cast<int>(NutWall::Nutk);
+            }
+            for (const std::string* name : {&t.k.boundary[pi]->fluxName(), &t.omega.boundary[pi]->fluxName()})
+            {
+                if (*name == "phi") continue;
+                throw std::runtime_error(
+                    std::string(WHO) + "patch `" + patches[pi].name + "` of k or omega names the flux `"
+                    + *name + "` in its `phi` entry; the turbulence closure hands its patches phi only.");
+            }
+        }
+        t.yCell = cellWallDist(*mesh, *geometry, patches);
+
+        t.kSolveFinal = readFinalSolve(fvSolution, "k");
+        t.omegaSolveFinal = readFinalSolve(fvSolution, "omega");
+        t.kRelaxFinal = EquationRelax::read(eqAll, "kFinal");
+        t.omegaRelaxFinal = EquationRelax::read(eqAll, "omegaFinal");
+        t.on = true;
+        return t;
+    }
 
     // all six, as kEpsilon.C:199-204 reads them; optionalSubDict as RASModel.C:72
     if (const FoamDict* kec = ras->optionalSubDict("kEpsilonCoeffs"))
@@ -259,10 +404,8 @@ InterTurbulence readInterTurbulence(
     }
     scalar omegaMinUnused = 0;
     readTurbulenceMinima(ras, t.coeffs.kMin, t.coeffs.epsilonMin, omegaMinUnused);
-    t.coeffs.correctedLaplacian = laplacianCorrected;
-    t.coeffs.snGradLimitCoeff = laplacianLimitCoeff;
     readGradU(caseDir, t.coeffs);
-    readGradK(caseDir, t.coeffs);
+    readGradK(caseDir, "epsilon", t.coeffs);
 
     // THE KEY CARRIES THE FLUX'S NAME: div(rhoPhi,k) in the variable lineage, div(phi,k) in the other
     const std::string flux = t.variableDensity ? "rhoPhi" : "phi";
@@ -287,10 +430,8 @@ InterTurbulence readInterTurbulence(
 
     t.kSolveFinal = readFinalSolve(fvSolution, "k");
     t.epsSolveFinal = readFinalSolve(fvSolution, "epsilon");
-    const FoamDict* rf = fvSolution.subDict("relaxationFactors");
-    const FoamDict* eq = rf ? rf->subDict("equations") : nullptr;
-    t.kRelaxFinal = EquationRelax::read(eq, "kFinal");
-    t.epsRelaxFinal = EquationRelax::read(eq, "epsilonFinal");
+    t.kRelaxFinal = EquationRelax::read(eqAll, "kFinal");
+    t.epsRelaxFinal = EquationRelax::read(eqAll, "epsilonFinal");
 
     t.on = true;
     return t;
@@ -310,6 +451,23 @@ void validateInterTurbulence(
     // incompressibleInterPhaseTransportModel.C:99-109: validate() sits in the `else` branch, so the
     // variable lineage enters the first UEqn on the nut the case file holds.
     if (t.variableDensity) return;
+    if (t.model == InterRasModel::KOmegaSST)
+    {
+        // eddyViscosity::validate -> kOmegaSSTBase::correctNut() (kOmegaSSTBase.C:129-133), which
+        // takes fvc::grad(U) by the case's own grad(U) scheme
+        std::vector<tensor> gradU = t.sstCoeffs.gradULeastSq ? fvc::leastSquaresGrad(U, m, g, patches)
+                                                             : fvc::gaussGrad(U, m, g, patches);
+        if (t.sstCoeffs.gradULimitK > 0)
+        {
+            cpu::cellLimitGrad(gradU, U, t.sstCoeffs.gradULimitK, m, g, patches);
+        }
+        kOmegaSST::Compressible sstComp;
+        sstComp.nu = &nu;
+        sstComp.nuBnd = &nuBnd;
+        kOmegaSST::correctNutField(U, t.k, t.omega, t.nut, gradU, t.yCell, nearWallDist(m, g, patches),
+                                   scalar(0), m, g, patches, t.sstCoeffs, &sstComp);
+        return;
+    }
     // the mixture's nu in BOTH lineages: a field, never the scalar the single-phase callers pass
     kEpsilonRef::Compressible comp;
     comp.nu = &nu;
@@ -360,6 +518,44 @@ void correctInterTurbulence(
         throw std::runtime_error(std::string(WHO) + "correctInterTurbulence needs every input field.");
     if (!(in.deltaT > 0))
         throw std::runtime_error(std::string(WHO) + "correctInterTurbulence needs a positive deltaT.");
+
+    if (t.model == InterRasModel::KOmegaSST)
+    {
+        // the ordinary incompressible kOmegaSST: alpha = rho = 1, the volumetric phi, the mixture's nu
+        kOmegaSST::Compressible sstComp;
+        sstComp.nu = in.nu;
+        sstComp.nuBnd = in.nuBnd;
+        sstComp.rDeltaT = scalar(1) / in.deltaT;
+        const SmoothLinearSolve& ks = t.kSolveFinal;
+        const SmoothLinearSolve& os = t.omegaSolveFinal;
+        if (ks.smoother != os.smoother || ks.tol != os.tol || ks.relTol != os.relTol
+         || ks.maxIter != os.maxIter || ks.minIter != os.minIter || ks.nSweeps != os.nSweeps)
+            throw std::runtime_error(
+                std::string(WHO) + "fvSolution gives kFinal and omegaFinal different solver settings; "
+                "the closure takes one set for both equations.");
+        LinearSolverChoice which;
+        which.smoothSolver = true;
+        which.symmetric = (ks.smoother == "symGaussSeidel");
+        which.nSweeps = ks.nSweeps;
+        kOmegaSST::SSTResiduals res;
+        kOmegaSST::correct(*in.U, t.k, t.omega, t.nut, *in.phi, t.yCell, scalar(0), m, g, patches,
+                           t.omegaRelaxFinal.factor, t.kRelaxFinal.factor, ks.tol, ks.relTol, ks.maxIter,
+                           t.sstCoeffs, &res, /*bounded=*/false, /*limitedLinear=*/false,
+                           /*limiterCoeff=*/scalar(1), /*linearUpwind=*/false,
+                           t.coeffs.correctedLaplacian, t.coeffs.snGradLimitCoeff, /*lm=*/nullptr,
+                           &sstComp, ks.minIter, t.omegaRelaxFinal.on, t.kRelaxFinal.on, &which);
+        if (in.omegaLog)
+        {
+            in.omegaLog->push_back({res.omegaPerf.initialResidual, res.omegaPerf.finalResidual,
+                                    res.omegaPerf.nIterations});
+        }
+        if (in.kLog)
+        {
+            in.kLog->push_back({res.kPerf.initialResidual, res.kPerf.finalResidual,
+                                res.kPerf.nIterations});
+        }
+        return;
+    }
 
     // the mixture's nu in BOTH lineages, as at validate()
     kEpsilonRef::Compressible comp;

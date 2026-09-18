@@ -81,6 +81,7 @@
 //    Sign: `solve(UEqn == R)` is fvMatrix::operator==, i.e. source += V*R (fvMatrix.C:1855-1862 with the
 //    double negative of operator-=). rhoSimpleFoam's addPressureGradient carries the same convention with
 //    R = -grad(p); it is written out again here because getting it backwards still converges.
+#include "MRF_cpp.cuh"
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
@@ -167,7 +168,11 @@ struct InterMomentumInput
     bool      correctedLaplacian = false;
     scalar    snGradLimitCoeff   = 0.0;
 
-    bool      hasMRF             = false;        // declared by the case -> refuse until ported
+    // MRF.DDt(rho, U), UEqn.H:6. The case's ACTIVE zones, resolved; null or empty is a case without
+    // MRF. MRF.correctBoundaryVelocity(U) is the CALLER's, before this assembles: U is const here.
+    const std::vector<MRF::Zone>* mrf = nullptr;
+    // declared by the case and NOT handed over in `mrf` -> refused, never ignored
+    bool      hasMRF             = false;
     bool      hasFvOptions       = false;        // declared by the case -> refuse until ported
     std::string fvOptionUnsupported;
 };

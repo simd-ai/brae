@@ -56,6 +56,7 @@
 //    the next time step's momentum source. damBreak does not exercise this -- its atmosphere patch is
 //    totalPressure, which fixes a value -- but 8 of the shipped tutorials have no value-fixing p_rgh
 //    patch at all, and those all do.
+#include "MRF_cpp.cuh"
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
@@ -293,6 +294,9 @@ struct PressureStepInput
     std::vector<PressureSolveRecord>* solveLog = nullptr;
     // the coarsest-level solve of every GAMG V-cycle, in order; null = not kept
     GamgSolveLog* gamgLog = nullptr;
+    // MRF, pEqn.H:17-19: the ddtCorr flux is ZERO-FILTERED on the zone's faces and phiHbyA made
+    // relative to the frame. Null or empty is a case without MRF.
+    const std::vector<MRF::Zone>* mrf = nullptr;
     // A MOVING MESH: its mesh-motion flux and the face velocity Uf, both non-null or both null.
     // pEqn.H:19-24 makes phiHbyA relative around adjustPhi; :70-73 correct Uf from the new phi and
     // make phi relative to the motion, so the phi that leaves the corrector is the RELATIVE flux.

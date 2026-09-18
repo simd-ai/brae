@@ -24,11 +24,11 @@ void refuseUnsupported(const InterMomentumInput& in)
             "scheme (alphaEqn.H:44-50 accepts only Euler and CrankNicolson, and refuses CrankNicolson "
             "under sub-cycling), so the two would advance the same field by different rules.");
     }
-    if (in.hasMRF)
+    if (in.hasMRF && (!in.mrf || in.mrf->empty()))
         throw std::runtime_error(
             "brae interFoam UEqn: the case declares MRF, and UEqn.H adds MRF.DDt(rho, U). brae has "
             "shipped a solver that read MRFProperties, ignored it, converged and reported nothing "
-            "wrong; this refuses instead.");
+            "wrong; this refuses instead. Hand the resolved zones over in InterMomentumInput::mrf.");
     if (in.hasFvOptions)
         throw std::runtime_error(
             "brae interFoam UEqn: the case declares fvOptions `" + in.fvOptionUnsupported
@@ -157,6 +157,24 @@ FvVectorMatrix assembleUEqn(
 
     // fvm::ddt(rho, U). Added to the SAME matrix, before relax, exactly as the constructor's `+` does.
     addEulerDdtRhoU(M, *in.rho, *in.rhoOld, *in.UOld, g.V(), in.deltaT, in.V0);
+
+    // + MRF.DDt(rho, U), UEqn.H:6. MRFZoneList::DDt(rho, U) is rho*DDt(U) (MRFZoneList.C), and DDt(U)
+    // the volVectorField Omega x U on the zone's cells, built from the CURRENT U -- explicit, lagged
+    // like any deferred term. `fvMatrix + volField` is source -= V*field (fvMatrix.C:1855-1862), so
+    // the cell takes  source -= V*rho*(Omega x U).
+    if (in.mrf && !in.mrf->empty())
+    {
+        std::vector<vector> acc(static_cast<std::size_t>(m.nCells()), vector{0, 0, 0});
+        // addCoriolis subtracts V*(Omega x U) from what it is handed
+        MRF::addCoriolis(*in.mrf, U.internal, g.V(), acc);
+        const std::vector<scalar>& rho = *in.rho;
+        for (label c = 0; c < m.nCells(); ++c)
+        {
+            M.source[c].x += rho[c] * acc[c].x;
+            M.source[c].y += rho[c] * acc[c].y;
+            M.source[c].z += rho[c] * acc[c].z;
+        }
+    }
 
     // turbulence->divDevRhoReff(rho, U). incompressibleInterPhaseTransportModel.C:129 forwards to
     // linearViscousStress's rho-weighted overload, so the operator is brae's existing one given

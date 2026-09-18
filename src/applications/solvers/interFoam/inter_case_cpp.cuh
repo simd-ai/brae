@@ -34,6 +34,7 @@
 //
 //   4. gh and ghf need g AND hRef, and ghRef carries g's SIGN (inter_create_fields_cpp.cuh).
 //      p = p_rgh + rho*gh is written and never solved.
+#include "MRF_cpp.cuh"
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
 #include "primitive_mesh.cuh"
@@ -156,6 +157,10 @@ struct InterFields
     // and calls update() where interFoam.C:120 calls mesh.update(). Shared, because InterFields is
     // copied by value into a gate's `fieldsOut`.
     std::shared_ptr<DynamicMotionSolverFvMesh> dynamicMesh;
+    // createMRF.H: every ACTIVE zone of constant/MRFProperties, resolved against the mesh. Empty is a
+    // case without MRF. UEqn.H and pEqn.H reach it in four places -- see inter_ueqn_cpp.cuh and
+    // inter_peqn_cpp.cuh.
+    std::vector<MRF::Zone> mrfZones;
     // createDyMControls.H / readDyMControls.H: PIMPLE's `correctPhi` (default mesh.dynamic()),
     // `checkMeshCourantNo` and `moveMeshOuterCorrectors` (default false)
     bool correctPhi = false;

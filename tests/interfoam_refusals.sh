@@ -133,7 +133,18 @@ arm mesh_noType             refused "no \`dynamicFvMesh\` entry" "" "printf '%s\
 arm mesh_static             runs    -                        "" "printf '%s\ndynamicFvMesh staticFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
 
 # MRF
-arm mrf_active              refused "MRFProperties"           "" "printf '%s\nMRF1 { cellZone all; origin (0 0 0); axis (0 0 1); omega 10; }\n' '$HDR' > constant/MRFProperties"
+# MRF IS PORTED on the host (tests/interfoam_mrf_vs_openfoam.sh holds laminar/mixerVessel2D to OpenFOAM).
+# What is refused is what no gate holds, each by name. ZONE writes a 100-cell `rotor` cellZone into
+# damBreak, so the arms below reach the refusal they name and not "no such zone".
+ZONE="python3 -c \"open('constant/polyMesh/cellZones','w').write('FoamFile { version 2.0; format ascii; class regIOobject; location \\\"constant/polyMesh\\\"; object cellZones; }\\n1\\n(\\nrotor\\n{\\n    type cellZone;\\n    cellLabels List<label> 100(' + ' '.join(str(i) for i in range(100)) + ');\\n}\\n)\\n')\""
+MRFD="printf '%s\nMRF1 { cellZone rotor; origin (0 0 0); axis (0 0 1); OMEGA }\n' '$HDR' > constant/MRFProperties"
+arm mrf_noSuchZone          refused "is not in constant/polyMesh/cellZones" "" "printf '%s\nMRF1 { cellZone all; origin (0 0 0); axis (0 0 1); omega 10; }\n' '$HDR' > constant/MRFProperties"
+# damBreak's walls are fixedFluxPressure, where constrainPressure takes MRF.relative(Sf & U_b)
+arm mrf_fixedFluxPressure   refused "is a fixedFluxPressure"  "" "$ZONE; ${MRFD/OMEGA/omega 10;}"
+arm mrf_omegaConstant       refused "is a fixedFluxPressure"  "" "$ZONE; ${MRFD/OMEGA/omega constant 10;}"
+arm mrf_omegaDict           refused "is a fixedFluxPressure"  "" "$ZONE; ${MRFD/OMEGA/omega \{ type constant; value 10; \}}"
+arm mrf_omegaTable          refused "Function1 of type \`table\`" "" "$ZONE; ${MRFD/OMEGA/omega table ((0 0) (1 10));}"
+arm mrf_noOmega             refused "has no \`omega\` entry"  "" "$ZONE; ${MRFD/OMEGA/}"
 arm mrf_inactive            runs    -                        "" "printf '%s\nMRF1 { cellZone all; active no; origin (0 0 0); axis (0 0 1); omega 10; }\n' '$HDR' > constant/MRFProperties"
 arm mrf_empty               runs    -                        "" "printf '%s\n' '$HDR' > constant/MRFProperties"
 
@@ -184,7 +195,21 @@ arm grad_namedU             refused "grad(U) cellLimited"    "" "sed -i '/^gradS
 arm ras_noFields            refused "does not exist"          "" "sed -i 's/simulationType .*/simulationType RAS;\\nRAS { RASModel kEpsilon; turbulence on; }/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,U) .*/&\\n    div(phi,k) Gauss upwind;\\n    div(phi,epsilon) Gauss upwind;/' system/fvSchemes"
 BASE="$BR"
 arm ras_baseline            runs    -                        "" true
-arm ras_kOmegaSST           refused "kOmegaSST"               "" "sed -i 's/RASModel .*/RASModel        kOmegaSST;/' constant/turbulenceProperties"
+arm mrf_RAS                 refused "MRF zone AND is turbulent" "" "$ZONE; ${MRFD/OMEGA/omega 10;}"
+arm ras_otherModel          refused "realizableKE"            "" "sed -i 's/RASModel .*/RASModel        realizableKE;/' constant/turbulenceProperties"
+# kOmegaSST IS ported, in the uniform lineage (tests/interfoam_waterchannel_vs_openfoam.sh holds it to
+# OpenFOAM). RAS/damBreak made kOmegaSST: `density variable` with it is refused, and so is each thing
+# the closure does not carry -- on a base that RUNS, so a refusal is the one edit's.
+arm sst_variableDensity     refused "density variable"        "" "sed -i 's/RASModel .*/RASModel        kOmegaSST;/' constant/turbulenceProperties"
+SSTBASE="sed -i 's/RASModel .*/RASModel        kOmegaSST;/; /^density /d' constant/turbulenceProperties; sed -i 's/div(rhoPhi,k) .*/div(phi,k) Gauss upwind;/; s/div(rhoPhi,epsilon) .*/div(phi,omega) Gauss upwind;/' system/fvSchemes; sed -i 's/(U|k|epsilon)/(U|k|omega)/' system/fvSolution; sed 's/epsilonWallFunction/omegaWallFunction/; s/object  *epsilon;/object      omega;/; s/\\[0 2 -3 0 0 0 0\\]/[0 0 -1 0 0 0 0]/' 0/epsilon > 0/omega"
+arm sst_baseline            runs    -                        "" "$SSTBASE"
+arm sst_noOmega             refused "does not exist"          "" "$SSTBASE; rm 0/omega"
+arm sst_decayControl        refused "decayControl"            "" "$SSTBASE; sed -i 's/RASModel .*/&\\n    kOmegaSSTCoeffs { decayControl yes; kInf 1e-5; omegaInf 1; }/' constant/turbulenceProperties"
+arm sst_F3                  refused "F3"                      "" "$SSTBASE; sed -i 's/RASModel .*/&\\n    kOmegaSSTCoeffs { F3 yes; }/' constant/turbulenceProperties"
+arm sst_blending            refused "blending stepwise"       "" "$SSTBASE; sed -i '0,/omegaWallFunction;/ s/omegaWallFunction;/omegaWallFunction;\\n        blending        stepwise;/' 0/omega"
+arm sst_nutU                refused "nutUWallFunction"        "" "$SSTBASE; sed -i '0,/nutkWallFunction/ s/nutkWallFunction/nutUWallFunction/' 0/nut"
+arm sst_wallWithoutOmegaWF  refused "omegaWallFunction"       "" "$SSTBASE; sed -i '0,/omegaWallFunction;/ s/omegaWallFunction;/zeroGradient;/' 0/omega"
+arm sst_linearUpwindOmega   refused "div(phi,omega)"          "" "$SSTBASE; sed -i 's/div(phi,omega) .*/div(phi,omega) Gauss linearUpwind grad(omega);/' system/fvSchemes"
 arm ras_LES                 refused "LES"                     "" "sed -i 's/^simulationType .*/simulationType LES;/' constant/turbulenceProperties"
 arm ras_turbulenceOff       refused "turbulence off"          "" "sed -i 's/turbulence  *on;/turbulence      off;/' constant/turbulenceProperties"
 arm ras_densityBad          refused "density mixture"         "" "sed -i 's/^density .*/density mixture;/' constant/turbulenceProperties"
@@ -322,7 +347,9 @@ if [ $HAVE_GPU = 1 ]; then
     BASE="$BR"
     arm device_ras          runs    -                        "-device" true
     arm device_ras_uniform  runs    -                        "-device" "sed -i 's/^density .*/density uniform;/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,k) /div(phi,k) /; s/div(rhoPhi,epsilon) /div(phi,epsilon) /' system/fvSchemes"
-    arm device_ras_kOmegaSST refused "kOmegaSST"             "-device" "sed -i 's/RASModel .*/RASModel        kOmegaSST;/' constant/turbulenceProperties"
+    arm device_ras_otherModel refused "realizableKE"         "-device" "sed -i 's/RASModel .*/RASModel        realizableKE;/' constant/turbulenceProperties"
+    # the device loop carries kEpsilon's twin only: a kOmegaSST case the HOST runs is refused by name
+    arm device_sst          refused "the case is RAS kOmegaSST" "-device" "$SSTBASE"
     BASE="$B"
 else
     echo "  (no GPU: the -device arms are skipped)"

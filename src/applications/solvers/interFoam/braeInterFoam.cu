@@ -62,7 +62,8 @@
 //
 // WHAT IT WILL NOT RUN. Every refusal the components carry is in force: LES and every RASModel but
 // kEpsilon and kOmegaSST, `limitedLinear` on div(rhoPhi,U),
-// any ddtSchemes default but Euler, MRF, fvOptions, and a case that
+// any ddtSchemes default but Euler, fvOptions, MRF on the device or beside a moving mesh, RAS or a
+// fixedFluxPressure patch (the host runs it otherwise: tests/interfoam_mrf_vs_openfoam.sh), and a case that
 // omits nAlphaCorr, nAlphaSubCycles, cAlpha, maxAlphaCo or -- under MULESCorr -- nLimiterIter. Each
 // throws by name.
 //
