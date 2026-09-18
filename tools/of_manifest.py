@@ -2733,9 +2733,9 @@ COMPONENTS = {
                         "linearMotion, axisRotationMotion and tabulated6DoFMotion with linear interpolation on the "
                         "tutorials' meshes. MEASURED: points and meshPhi differ from OpenFOAM's by EXACTLY ZERO on "
                         "every profile, and the gate asserts zero (BRAE_MESH_MOTION_ROUNDOFF=1 holds 1e-15 and 1e-12 "
-                        "instead, for a compiler that orders floating point differently). V and C read 1.7e-14 and "
-                        "8.0e-16 at worst, and 1.4e-14 and 5.7e-16 BEFORE the mesh moves: fv_geometry's own round-off "
-                        "against primitiveMesh's, recorded as an open finding. CONTROL on brae's side (the oracle has "
+                        "instead, for a compiler that orders floating point differently) -- and V and C of the moved "
+                        "mesh are exact too, since fv_geometry's face centres took primitiveMeshTools.C's operation "
+                        "order (interFoam_nonOrthCorrection); they read 1.7e-14 and 8.0e-16 before. CONTROL on brae's side (the oracle has "
                         "no wrong answer to offer): the two multiMotion entries in the other order, 1.5e-01 of the "
                         "extent, which the script asserts FAILS. BROKEN ONCE EACH -- and the reason the comparison "
                         "is exact, since all but the last sit under any round-off bound: meshPhi as sweptVol/deltaT "
@@ -2832,7 +2832,10 @@ COMPONENTS = {
                         "reference moves the level and nothing else. BROKEN ONCE: the reference cell pinned at "
                         "pRefValue rather than its current p_rgh (what this code did on a path no gated case had "
                         "taken) reads 15 of 60 counts and U 4.4e-05 on the closed dam, 18 of 20 and 5.3e-07 on the "
-                        "moving tube. Every solid-body tutorial is a closed tank and takes this path. NOT CLAIMED: "
+                        "moving tube. Every solid-body tutorial is a closed tank and takes this path -- and "
+                        "sloshingTank2D's pRefPoint (0 0 0.15) LIES ON A FACE: findCell takes the nearer of two "
+                        "centres 5e-16 apart, brae took the other one while its face centres differed from "
+                        "OpenFOAM's in the last bit, and read alpha 2.8e-06 and 18 of 20 counts for it. NOT CLAIMED: "
                         "polyMesh::findCell's octree fallback when the face-plane test finds no cell (refused by "
                         "name), and the device (refused: its reference is the pRefValue one).",
              note="p_rgh.needReference() is `no patch fixes a value` (GeometricField.C:1068-1085). setRefCell "
@@ -2877,6 +2880,51 @@ COMPONENTS = {
                   "it fell through the switch's `default` to upwind -- a -device run would have convected upwind "
                   "under the name `linear`. The shared cpu::DivScheme now has `linear` (deviceDivCentralCoeffs; "
                   "the mesh's own weights on the host) and the mapping names every scheme with no default."),
+        dict(name="interFoam_nonOrthCorrection", of_symbol="correctedSnGrad",
+             of_file="src/finiteVolume/finiteVolume/snGradSchemes/correctedSnGrad/correctedSnGrad.C",
+             classification="SHARED_NUMERICAL", status="REIMPLEMENT",
+             brae_reference="src/applications/solvers/interFoam/inter_peqn_cpp.cu",
+             brae_target="",
+             validation="tests/interfoam_moving_vs_openfoam.sh's two non-orthogonal tanks, against real OpenFOAM: "
+                        "laminar/sloshingTank2D as shipped but for p_rghFinal -- SDA motion, 44-degree chamfered "
+                        "cells, `Gauss linear corrected` and `corrected`, nAlphaSubCycles 3, cAlpha 1.5, 2-D -- ten of "
+                        "its own steps: 20 of 20 p_rgh counts, alpha 5.8e-15, p_rgh 3.2e-14, U 3.9e-13, the still "
+                        "tank 100% of U away; and laminar/sloshingCylinder -- a snappyHexMesh cylinder of polyhedra "
+                        "at 26 degrees, MULESCorr, nNonOrthogonalCorrectors 1, its oscillation's phase and vertical "
+                        "shifts zeroed because as shipped the mesh jumps 6.9 cm at the first update and OpenFOAM "
+                        "itself blows up at any fixed step -- ten steps of 0.001: 40 of 40 counts, alpha 6.9e-11, U "
+                        "1.0e-08. BROKEN ONCE EACH (tank / cylinder): the pressure laplacian's explicit correction "
+                        "dropped from the source 8.7e-02 / 2.1e-01; its face flux dropped from p_rghEqn.flux() 9.5e-02 "
+                        "/ 2.6e-01; the viscous laplacian orthogonal 6.4e-10 / 2.7e-04; the three snGrads orthogonal "
+                        "1.3e-11 / 4.6e-04 (the tank's interface is horizontal; the cylinder is the fixture for that "
+                        "one). tests/interfoam_refusals.sh: `corrected` on a sheared damBreak RUNS on the host and is "
+                        "refused on the device; `uncorrected` on it is refused by name; and three gradSchemes arms. "
+                        "WHAT IT DOES NOT CLAIM: `uncorrected` on a mesh that is not orthogonal, any gradSchemes "
+                        "entry but `Gauss linear`, the device.",
+             note="THE OPERATORS, from gaussLaplacianSchemes.C and correctedSnGrad.C: a corrected laplacian's matrix "
+                  "takes nonOrthDeltaCoeffs on the internal faces and the patch's own coefficients on the boundary; "
+                  "its source takes -V*div(gammaMagSf*snGradCorrection(vf)), the correction being "
+                  "nonOrthCorrectionVectors dotted with the linear interpolate of grad(vf) THROUGH vf's OWN "
+                  "gradSchemes entry, a vector field's by component and so through `default`; and because "
+                  "p_rgh is fluxRequired the same face field is kept as the matrix's faceFluxCorrection, which "
+                  "p_rghEqn.flux() adds back so `phi = phiHbyA - flux` stays conservative. A corrected snGrad is "
+                  "nonOrthDeltaCoeffs*(vfN - vfP) plus that correction. `limited <c>` caps the correction per "
+                  "face against the orthogonal part. brae had all of it (fvm.cuh, fvc.cu, addDivDevReff) from "
+                  "rhoSimpleFoam; interFoam refused every corrected scheme on a mesh that was not orthogonal and "
+                  "now passes the case's flags through the pressure equation, the viscous term and the three "
+                  "snGrads -- p_rgh in the predictor's force, rho in phig, alpha in the surface-tension force. "
+                  "`uncorrected` is NOT brae's orthogonal assembly: uncorrectedSnGrad takes nonOrthDeltaCoeffs, "
+                  "orthogonalSnGrad takes deltaCoeffs (uncorrectedSnGrad.H:91, orthogonalSnGrad.H:91), so it is "
+                  "refused on a mesh where they differ. gradSchemes WERE NEVER READ by this solver: 40 of the 44 "
+                  "tutorials write `default Gauss linear;` alone, and the four that limit a gradient "
+                  "(mixerVesselAMI, DTCHull, DTCHullMoving, electrostaticDeposition) would have run unlimited; "
+                  "every entry but `Gauss linear` is refused now. TWO FINDINGS ON THE WAY, both about a mesh "
+                  "that is not a mesh of rectangles: fv_geometry's face centres were (1/3)*(sumAc/sumA) where "
+                  "primitiveMeshTools.C computes (1/3)*sumAc/sumA, and a triangle's (a+b+c)/3 where OpenFOAM "
+                  "writes (1/3)*(a+b+c) -- with OpenFOAM's order V and C are OpenFOAM's to the bit on every mesh "
+                  "the motion gate runs (hex, chamfered, snappy), where they read 1e-14 before; and that last "
+                  "digit decided the pressure reference of sloshingTank2D, whose pRefPoint lies on a face "
+                  "(interFoam_pressureReference)."),
         dict(name="interFoam_vanLeer", of_symbol="vanLeer",
              of_file="src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/vanLeer/vanLeer.C",
              classification="SHARED_NUMERICAL", status="REIMPLEMENT",

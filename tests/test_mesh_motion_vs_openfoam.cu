@@ -254,14 +254,20 @@ int main(
         check("meshPhi is OpenFOAM's, to the bit", worstPhi == scalar(0));
     }
     check("V and C were compared at one step at least", nV > 0);
-    // V and C are NOT exact and were not before the mesh moved: MEASURED 1.4e-14 and 5.7e-16 at worst
-    // before any motion (the snappyHexMesh cylinder) and 1.7e-14 and 8.0e-16 after it. That is
-    // fv_geometry's arithmetic against primitiveMesh's, on the same points, and no part of this port.
-    check("V of the moved mesh is OpenFOAM's to round-off", worstV < scalar(1e-13));
-    check("C of the moved mesh is OpenFOAM's to round-off", worstC < scalar(5e-15));
-    if (startV >= 0)
+    // V AND C ARE EXACT TOO, since fv_geometry's face centres took primitiveMeshTools.C's operation
+    // order ((1/3)*sumAc/sumA, and (1/3)*(a + b + c) on a triangle). Before that they read 1.4e-14 and
+    // 5.7e-16 at worst before any motion and 1.7e-14 and 8.0e-16 after it -- and on sloshingTank2D the
+    // 1e-16 in a cell centre chose the wrong cell for pRefPoint (0 0 0.15), which lies on a face.
+    if (std::getenv("BRAE_MESH_MOTION_ROUNDOFF"))
     {
-        check("...and no further from it than the mesh was before it moved", worstV < scalar(4)*startV + scalar(1e-15));
+        check("V of the moved mesh is OpenFOAM's to round-off", worstV < scalar(1e-13));
+        check("C of the moved mesh is OpenFOAM's to round-off", worstC < scalar(5e-15));
+    }
+    else
+    {
+        check("V of the moved mesh is OpenFOAM's, to the bit", worstV == scalar(0));
+        check("C of the moved mesh is OpenFOAM's, to the bit", worstC == scalar(0));
+        check("...and so were V and C before it moved", startV == scalar(0) && startC == scalar(0));
     }
     check("V0 is the volume the mesh had before each update, exactly", worstV0 == scalar(0));
     check("a rigid motion kept every volume to round-off", dRigid < scalar(1e-10));

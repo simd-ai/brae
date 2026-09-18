@@ -37,9 +37,15 @@
 // pressure reference (pRefCell or pRefPoint, pRefValue, adjustPhi), which every solid-body tutorial
 // needs and no earlier case had. `-device` refuses both. Still refused by name: a cellZone or cellSet,
 // every other motionSolver, `correctPhi yes` (the default on a moving mesh), a turbulent or a wave
-// case on a moving mesh, points0, and a restart of a moved mesh. testTubeMixer runs as shipped but for
-// p_rghFinal's PCG-with-GAMG-preconditioner, which is substituted under a notice; the five sloshing
-// tanks still stop on their 44-degree non-orthogonal cells.
+// case on a moving mesh, points0, and a restart of a moved mesh. testTubeMixer and the five sloshing
+// tanks run as shipped but for p_rghFinal's PCG-with-GAMG-preconditioner, which is substituted under
+// a notice.
+//
+// AND THE CASE'S NON-ORTHOGONAL CORRECTIONS, on the host: `corrected` and `limited` laplacians and
+// snGrads on a mesh that is not orthogonal (the tanks' 44 degrees), through the pressure equation,
+// the viscous term and the three snGrads. `uncorrected` on such a mesh is refused, and so is every
+// gradSchemes entry but `Gauss linear` -- gradSchemes were not read at all before. `-device` refuses a
+// correction that is not zero.
 //
 // AND div(rhoPhi,U) AS THE CASE NAMES IT, on both paths: upwind, linear, linearUpwind, linearUpwindV,
 // limitedLinearV, LUST and vanLeerV -- the last the V-limited vanLeer the closed-tank tutorials use.
@@ -47,8 +53,7 @@
 //
 // WHAT IT WILL NOT RUN. Every refusal the components carry is in force: LES and every RASModel but
 // kEpsilon, `limitedLinear` on div(rhoPhi,U),
-// `interfaceCompression` on div(phirb,alpha), any ddtSchemes default but Euler, a `corrected` or
-// `limited` laplacian or snGrad on a mesh that is not orthogonal, MRF, fvOptions, and a case that
+// `interfaceCompression` on div(phirb,alpha), any ddtSchemes default but Euler, MRF, fvOptions, and a case that
 // omits nAlphaCorr, nAlphaSubCycles, cAlpha, maxAlphaCo or -- under MULESCorr -- nLimiterIter. Each
 // throws by name.
 //

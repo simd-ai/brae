@@ -572,7 +572,24 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
     {
         // the fvMatrix constructor's updateCoeffs -- see updatePressurePatchesFromVelocity
         updatePressurePatchesFromVelocity(p_rgh, U, in.rhoBnd, patches);
-        FvScalarMatrix pe = fvm::laplacian<scalar>(rAUfField, p_rgh, m, g, patches, /*corrected=*/false);
+        FvScalarMatrix pe = fvm::laplacian<scalar>(rAUfField, p_rgh, m, g, patches, sc.correctedLaplacian);
+        if (sc.correctedLaplacian)
+        {
+            // gaussLaplacianSchemes.C: source -= V*div(gammaMagSf*snGradCorrection(p_rgh)), the
+            // correction from grad(p_rgh) through its own gradSchemes entry (Gauss linear, the only one
+            // this solver admits) on the p_rgh of THIS pass, and the same flux kept for
+            // p_rghEqn.flux(). The two are built from one face field so `phi = phiHbyA - flux` stays
+            // conservative on a non-orthogonal mesh.
+            const std::vector<vector> gradP = fvc::gaussGrad(p_rgh, m, g, patches);
+            const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
+                rAUfField, p_rgh, gradP, m, g, patches, sc.snGradLimitCoeff);
+            for (label c = 0; c < nC; ++c)
+            {
+                pe.source[c] -= corr[c];
+            }
+            pe.faceFluxCorrection = fvm::laplacianCorrFlux<scalar, vector>(
+                rAUfField, gradP, m, g, sc.snGradLimitCoeff, &p_rgh);
+        }
         const std::vector<scalar> div = fvc::div(phiHbyA, m, g, patches);
         for (label c = 0; c < nC; ++c) pe.source[c] += div[c] * g.V()[c];
 

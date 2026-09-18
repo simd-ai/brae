@@ -12,10 +12,10 @@
 # writeCellVolumes and writeCellCentres on the first and last of those time directories. Checked once
 # by hand on testTubeMixer: moveDynamicMesh's points and meshPhi are interFoam's, byte for byte.
 #
-# MEASURED, every profile: points and meshPhi differ from OpenFOAM's by EXACTLY ZERO -- the same
-# operations in the same order, not merely the same motion. V and C read 1e-15 and 1e-16, and read the
-# same BEFORE the mesh moves: that is fv_geometry's own round-off against primitiveMesh's, not the
-# motion's, and the test prints both so the two cannot be confused.
+# MEASURED, every profile: points, meshPhi, V and C differ from OpenFOAM's by EXACTLY ZERO -- the same
+# operations in the same order, not merely the same motion. V and C read 1e-15 and 1e-16 until
+# fv_geometry's face centres took primitiveMeshTools.C's operation order; the test still prints them
+# before any motion, so the geometry's own agreement and the motion's cannot be confused.
 #
 # PROFILES, each the tutorial's own constant/dynamicMeshDict unless it says otherwise:
 #   testTubeMixer      multiMotion: a rotatingMotion table carrying an oscillatingRotatingMotion box.

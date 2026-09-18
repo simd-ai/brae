@@ -206,6 +206,13 @@ struct PressureSolveControls
     const GamgControls* gamg = nullptr;
     const GamgControls* gamgFinal = nullptr;
     GamgAgglomerationCache* gamgCache = nullptr;
+    // laplacianSchemes' default for fvm::laplacian(rAUf, p_rgh): `corrected` adds the explicit
+    // non-orthogonal correction to the source and stores it as the matrix's faceFluxCorrection, which
+    // p_rghEqn.flux() adds back (gaussLaplacianSchemes.C, the fluxRequired branch -- createFields.H
+    // sets fluxRequired for p_rgh); `limited <c>` caps it. The non-orthogonal corrector loop below
+    // rebuilds the matrix each pass on the p_rgh the last one left.
+    bool correctedLaplacian = false;
+    scalar snGradLimitCoeff = 0;
     // pimpleControl::finalInnerIter() (pimpleControlI.H:98-111): corrPISO == nCorrPISO. The caller
     // knows which pass this is; pressureCorrector owns the non-orthogonal half of the test.
     bool finalCorrector = true;

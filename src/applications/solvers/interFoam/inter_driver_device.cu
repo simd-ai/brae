@@ -94,6 +94,14 @@ RunReport runInterFoamDevice(
             "brae interFoam -device: the case moves its mesh (" + f.dynamicMesh->motionType() + "). The "
             "device loop does not move one; the host loop does. Run without -device.");
     }
+    if ((f.laplacianScheme.corrected || f.snGradScheme.corrected) && maxNonOrthogonality(m, g) >= scalar(1e-10))
+    {
+        throw std::runtime_error(
+            "brae interFoam -device: fvSchemes asks for a non-orthogonal correction (laplacianSchemes `"
+            + f.laplacianScheme.raw + "`, snGradSchemes `" + f.snGradScheme.raw + "`) and the mesh is not "
+            "orthogonal. The device loop assembles the pressure laplacian and its snGrads orthogonal; the "
+            "host loop takes the case's scheme. Run without -device.");
+    }
     if (f.pRef.needReference)
     {
         throw std::runtime_error(

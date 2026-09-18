@@ -178,9 +178,17 @@ arm alpha_minIter           refused "minIter 1"               "" "sed -i 's/^\\(
 # edit that makes that matter -- the upper blocks' top edge moved 0.4 in x, six degrees.
 SHEAR="sed -i 's/(0 4 /(0.4 4 /; s/(2 4 /(2.4 4 /; s/(2.16438 4 /(2.56438 4 /; s/(4 4 /(4.4 4 /' system/blockMeshDict && blockMesh > log.blockMesh 2>&1 && rm -rf 0 && cp -r 0.orig 0 && setFields > log.setFields 2>&1"
 ORTHO="sed -i '/^laplacianSchemes/,/^}/ s/default .*/default         Gauss linear orthogonal;/; /^snGradSchemes/,/^}/ s/default .*/default         orthogonal;/' system/fvSchemes"
-arm mesh_sheared_corrected  refused "non-orthogonal"          "" "$SHEAR"
+# the corrected schemes RUN on a non-orthogonal mesh now (interfoam_moving_vs_openfoam.sh's tanks);
+# `uncorrected` there is refused, because OpenFOAM's takes the non-orthogonal delta coefficient
+UNCORR="sed -i '/^laplacianSchemes/,/^}/ s/default .*/default         Gauss linear uncorrected;/; /^snGradSchemes/,/^}/ s/default .*/default         uncorrected;/' system/fvSchemes"
+arm mesh_sheared_corrected  runs    -                        "" "$SHEAR"
 arm mesh_sheared_orthogonal runs    -                        "" "$SHEAR && $ORTHO"
+arm mesh_sheared_uncorrected refused "uncorrected"           "" "$SHEAR && $UNCORR"
+arm mesh_square_uncorrected runs    -                        "" "$UNCORR"
 arm mesh_square_corrected   runs    -                        "" true
+arm grad_cellLimited        refused "gradSchemes"            "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         cellLimited Gauss linear 1;/' system/fvSchemes"
+arm grad_leastSquares       refused "gradSchemes"            "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         leastSquares;/' system/fvSchemes"
+arm grad_namedU             refused "grad(U) cellLimited"    "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
 
 # TURBULENCE. laminar damBreak made RAS carries no k, epsilon or nut, and OpenFOAM stops on it too.
 arm ras_noFields            refused "does not exist"          "" "sed -i 's/simulationType .*/simulationType RAS;\\nRAS { RASModel kEpsilon; turbulence on; }/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,U) .*/&\\n    div(phi,k) Gauss upwind;\\n    div(phi,epsilon) Gauss upwind;/' system/fvSchemes"
@@ -283,6 +291,8 @@ if [ $HAVE_GPU = 1 ]; then
     arm device_nOuter2      refused "nOuterCorrectors 2"      "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' system/fvSolution"
     arm device_nNonOrth1    refused "nNonOrthogonalCorrectors 1" "-device" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"
     arm device_mesh_dynamic refused "dynamicRefineFvMesh"     "-device" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
+    # ...nor a non-orthogonal correction where it is not zero
+    arm device_sheared_corrected refused "not orthogonal"     "-device" "$SHEAR"
     # the device loop moves no mesh and pins no pressure reference; both are refused by name there
     BASE="$BM"
     arm device_moving       refused "does not move one"       "-device" true

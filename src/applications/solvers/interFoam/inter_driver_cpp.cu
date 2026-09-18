@@ -359,8 +359,12 @@ RunReport runInterFoam(
 
                     // rho's CALCULATED patch values, not a zeroGradient copy -- see rhoWithPatchValues
                     const GeometricField<scalar> rhoF = rhoWithPatchValues(f.rho, f.rhoBnd, patches);
-                    const SurfaceScalarField snRho = fvc::snGrad(rhoF, m, g, patches, false);
-                    const SurfaceScalarField snA   = fvc::snGrad(f.alpha1, m, g, patches, false);
+                    // snGradSchemes' default: the corrected (or limited) form on a mesh that is
+                    // not orthogonal, through the fields' own Gauss linear gradients
+                    const bool snCorr = f.snGradScheme.corrected;
+                    const scalar snLim = f.snGradScheme.limitCoeff;
+                    const SurfaceScalarField snRho = fvc::snGrad(rhoF, m, g, patches, snCorr, false, 0, snLim);
+                    const SurfaceScalarField snA = fvc::snGrad(f.alpha1, m, g, patches, snCorr, false, 0, snLim);
 
                     SurfaceScalarField stf;
                     stf.internal.resize(static_cast<std::size_t>(m.nInternalFaces()));
@@ -396,7 +400,7 @@ RunReport runInterFoam(
                         f.p_rgh.boundary[pi]->updateSnGrad(
                             std::vector<scalar>(static_cast<std::size_t>(patches[pi].size), scalar(0)));
                     }
-                    const SurfaceScalarField snP = fvc::snGrad(f.p_rgh, m, g, patches, false);
+                    const SurfaceScalarField snP = fvc::snGrad(f.p_rgh, m, g, patches, snCorr, false, 0, snLim);
 
                     SurfaceScalarField force;
                     {
@@ -444,6 +448,9 @@ RunReport runInterFoam(
                     mi.scheme = f.divRhoPhiU;
                     mi.schemeCoeff = f.divRhoPhiUCoeff;
                     mi.relaxEquationU = f.relaxEquationU; mi.relaxU = f.relaxU;
+                    // laplacianSchemes' default, for the viscous term's fvm::laplacian(rho*nuEff, U)
+                    mi.correctedLaplacian = f.laplacianScheme.corrected;
+                    mi.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
 
                     // THE CASE'S OWN SOLVE FOR U: UFinal on the last outer corrector, U on the others,
                     // its smoother where it names a Gauss-Seidel one, and only the components the
@@ -485,6 +492,8 @@ RunReport runInterFoam(
                     PressureSolveControls psc;
                     psc.nCorrectors = lc.nCorrectors;
                     psc.nNonOrthogonalCorrectors = f.nNonOrthogonalCorrectors;
+                    psc.correctedLaplacian = f.laplacianScheme.corrected;
+                    psc.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
                     // p_rgh.needReference() and setRefCell, read with the case -- see InterFields::pRef
                     psc.needReference = f.pRef.needReference;
                     psc.pRefCell = f.pRef.pRefCell;

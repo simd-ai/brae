@@ -72,6 +72,13 @@ struct NonOrthScheme
     std::string raw;
 };
 
+// 1 - cos(angle between the cell-centre vector and the face normal), the largest over the internal
+// faces; 0 on a mesh of rectangles. Public because the device driver, which assembles orthogonal,
+// refuses a corrected scheme on a mesh where the correction is not zero.
+scalar maxNonOrthogonality(
+    const PrimitiveMesh& m,
+    const FvGeometry& g);
+
 struct InterFields
 {
     // --- read from the start directory

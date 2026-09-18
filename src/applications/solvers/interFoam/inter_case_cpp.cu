@@ -109,6 +109,24 @@ void updateMixtureBoundary(InterFields& f, const std::vector<FvPatch>& patches)
     }
 }
 
+// 1 - cos(angle between the cell-centre vector and the face normal), the largest over the internal
+// faces. Exactly 0 on a mesh of rectangles; boundary faces do not enter, because v2412's
+// fvPatch::delta() is already the patch-NORMAL part of Cf - Cn for every non-coupled patch.
+scalar maxNonOrthogonality(
+    const PrimitiveMesh& m,
+    const FvGeometry& g)
+{
+    scalar worst = 0;
+    for (label fi = 0; fi < m.nInternalFaces(); ++fi)
+    {
+        const vector d = g.C()[m.neighbour()[fi]] - g.C()[m.owner()[fi]];
+        const vector& S = g.Sf()[fi];
+        const scalar c = dot(d, S) / (mag(d) * g.magSf()[fi]);
+        worst = std::fmax(worst, scalar(1) - c);
+    }
+    return worst;
+}
+
 namespace {
 
 // fvSchemes' divSchemes entry for div(rhoPhi,U). The shipped tutorials ask for `Gauss linearUpwind
@@ -287,26 +305,12 @@ NonOrthScheme readNonOrthScheme(
         "corrected, uncorrected, orthogonal or limited.");
 }
 
-// 1 - cos(angle between the cell-centre vector and the face normal), the largest over the internal
-// faces. Exactly 0 on a mesh of rectangles; boundary faces do not enter, because v2412's
-// fvPatch::delta() is already the patch-NORMAL part of Cf - Cn for every non-coupled patch.
-scalar maxNonOrthogonality(
-    const PrimitiveMesh& m,
-    const FvGeometry& g)
-{
-    scalar worst = 0;
-    for (label fi = 0; fi < m.nInternalFaces(); ++fi)
-    {
-        const vector d = g.C()[m.neighbour()[fi]] - g.C()[m.owner()[fi]];
-        const vector& S = g.Sf()[fi];
-        const scalar c = dot(d, S) / (mag(d) * g.magSf()[fi]);
-        worst = std::fmax(worst, scalar(1) - c);
-    }
-    return worst;
-}
 
-// interFoam's pressure laplacian, its three snGrads and the momentum laplacian are assembled
-// ORTHOGONAL here, whatever the case says -- and 28 of the 44 tutorials say `corrected` or `limited`.
+// interFoam's pressure laplacian, its three snGrads and the momentum laplacian take the case's
+// `corrected` and `limited` schemes now (fvm::laplacian's corrected form, fvc::snGrad's). What is NOT
+// theirs is `uncorrected`: OpenFOAM's uncorrectedSnGrad takes nonOrthDeltaCoeffs where orthogonalSnGrad
+// takes deltaCoeffs (uncorrectedSnGrad.H:91, orthogonalSnGrad.H:91), and brae's orthogonal assembly
+// takes the latter -- the same number on a mesh of rectangles, where the two coefficients coincide.
 // On a mesh of rectangles that is not a substitution: the correction vector n - d/(n.d) is zero, so
 // `corrected` and `orthogonal` are one scheme, which is why damBreak and capillaryRise agree with
 // OpenFOAM to 1e-12 under `Gauss linear corrected`. On any other mesh it IS one, it was silent, and
@@ -317,17 +321,77 @@ void refuseUncorrectedOnSkewMesh(
     const PrimitiveMesh& m,
     const FvGeometry& g)
 {
-    if (!laplacian.corrected && !snGrad.corrected) return;
+    const bool uncorrected =
+        schemeHasWord(laplacian.raw, "uncorrected") || schemeHasWord(snGrad.raw, "uncorrected");
+    if (!uncorrected) return;
     const scalar worst = maxNonOrthogonality(m, g);
     // round-off on a mesh of rectangles is 1e-16; one degree is 1.5e-04
     if (worst < scalar(1e-10)) return;
     const scalar degrees = std::acos(scalar(1) - worst) * scalar(180) / scalar(3.14159265358979323846);
     throw std::runtime_error(
-        "brae interFoam: fvSchemes asks for a non-orthogonal correction (laplacianSchemes `"
-        + laplacian.raw + "`, snGradSchemes `" + snGrad.raw + "`) and the mesh is non-orthogonal by "
-        "up to " + std::to_string(degrees) + " degrees. brae's interFoam assembles the pressure "
-        "laplacian and its snGrads orthogonal; that is the case's own scheme only where the "
-        "correction vanishes. Refused rather than run `orthogonal` under the name `corrected`.");
+        "brae interFoam: fvSchemes asks for `uncorrected` (laplacianSchemes `" + laplacian.raw
+        + "`, snGradSchemes `" + snGrad.raw + "`) and the mesh is non-orthogonal by up to "
+        + std::to_string(degrees) + " degrees. OpenFOAM's uncorrectedSnGrad divides by the "
+        "non-orthogonal delta coefficient where brae's orthogonal assembly divides by |d|; the two "
+        "differ on this mesh. Refused rather than run `orthogonal` under the name `uncorrected`.");
+}
+
+// gradSchemes. interFoam's gradients -- grad(U) for the momentum scheme and the viscous term's
+// explicit half, grad(p_rgh), grad(rho) and grad(alpha) for the non-orthogonal corrections, and
+// grad(alpha) for the interface normal -- are all Gauss linear and unlimited here. 40 of the 44
+// tutorials write `default Gauss linear;` and nothing else; the four that name a cellLimited or a
+// leastSquares gradient are refused, because a gradient the case limits and brae does not is a
+// different discretisation that converges. This used to read nothing.
+void refuseUnportedGradSchemes(const std::string& fvSchemesText)
+{
+    const std::string blk = fvSchemesBlock(fvSchemesText, "gradSchemes");
+    if (blk.empty())
+        throw std::runtime_error("brae interFoam: fvSchemes has no gradSchemes block.");
+    // every `key scheme;` line of the block
+    std::size_t at = 0;
+    while (true)
+    {
+        const std::size_t e = blk.find(';', at);
+        if (e == std::string::npos) break;
+        std::string line = blk.substr(at, e - at);
+        at = e + 1;
+        const std::size_t b = line.find_first_not_of(" \t\n\r{");
+        if (b == std::string::npos) continue;
+        line = line.substr(b);
+        const std::size_t sp = line.find_first_of(" \t");
+        if (sp == std::string::npos) continue;
+        const std::string key = line.substr(0, sp);
+        std::string scheme = line.substr(sp);
+        const std::size_t sb = scheme.find_first_not_of(" \t\n\r");
+        scheme = (sb == std::string::npos) ? std::string() : scheme.substr(sb);
+        while (!scheme.empty() && std::isspace(static_cast<unsigned char>(scheme.back())))
+        {
+            scheme.pop_back();
+        }
+        std::string collapsed;
+        for (char ch : scheme)
+        {
+            if (std::isspace(static_cast<unsigned char>(ch)))
+            {
+                if (!collapsed.empty() && collapsed.back() != ' ')
+                {
+                    collapsed += ' ';
+                }
+            }
+            else
+            {
+                collapsed += ch;
+            }
+        }
+        if (collapsed != "Gauss linear")
+        {
+            throw std::runtime_error(
+                "brae interFoam: fvSchemes gradSchemes `" + key + " " + collapsed + "` is not ported. "
+                "Every gradient this solver takes -- grad(U), grad(p_rgh), grad(rho), grad(alpha) -- is "
+                "Gauss linear and unlimited; a limited or least-squares gradient is a different "
+                "discretisation. 40 of the 44 shipped tutorials write `default Gauss linear;` alone.");
+        }
+    }
 }
 
 
@@ -646,6 +710,7 @@ InterFields buildInterFields(const std::string&          caseDir,
         f.laplacianScheme = readNonOrthScheme(all, "laplacianSchemes");
         f.snGradScheme = readNonOrthScheme(all, "snGradSchemes");
         refuseUncorrectedOnSkewMesh(f.laplacianScheme, f.snGradScheme, m, g);
+        refuseUnportedGradSchemes(all);
     }
 
     // fvSolution's PIMPLE block -- see InterFields::pimple for why momentumPredictor is read rather
