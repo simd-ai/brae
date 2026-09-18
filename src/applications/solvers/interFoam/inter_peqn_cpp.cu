@@ -259,7 +259,10 @@ void ddtCorr(const DdtCorrInput&           in,
         const FvPatch& q = patches[pi];
         for (label i = 0; i < q.size; ++i)
         {
-            const vector& uo = (*in.UOld)[q.faceCells[i]];
+            const bool havePatch = in.UOldBnd && pi < in.UOldBnd->size()
+                                && static_cast<std::size_t>(i) < (*in.UOldBnd)[pi].size();
+            const vector& uo = havePatch ? (*in.UOldBnd)[pi][static_cast<std::size_t>(i)]
+                                         : (*in.UOld)[q.faceCells[i]];
             const vector& S  = Sf[q.start + i];
             const scalar interpFlux = uo.x*S.x + uo.y*S.y + uo.z*S.z;
             const scalar pOld = in.UfOld
@@ -488,8 +491,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
         // MRF.zeroFilter(...), pEqn.H:17: MRFZone::zero sets the flux to Zero on the zone's internal,
         // included and excluded faces (MRFZoneTemplates.C:213-247). The correction compares phi.oldTime()
         // with the flux of U.oldTime(), and inside the zone the first is RELATIVE to the frame and the
-        // second is not, so their difference there is the frame flux and not a correction. Only the
-        // internal faces carry a ddtCorr here: its boundary value is zero (ddtCouplingCoeff).
+        // second is not, so their difference there is the frame flux and not a correction.
         if (in.mrf)
         {
             for (const MRF::Zone& z : *in.mrf)
@@ -499,9 +501,49 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
                 {
                     corr.internal[fi] = scalar(0);
                 }
+                for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                {
+                    for (const std::vector<std::vector<label>>* lists : {&z.includedFaces, &z.excludedFaces})
+                    {
+                        if (pi >= lists->size()) continue;
+                        for (label fi : (*lists)[pi])
+                        {
+                            corr.boundary[pi][static_cast<std::size_t>(fi)] = scalar(0);
+                        }
+                    }
+                }
             }
         }
         for (label f = 0; f < nIf; ++f) phiHbyA.internal[f] += rhoRAU[f] * corr.internal[f];
+        // ...AND THE BOUNDARY. pEqn.H:16-17 adds a whole surfaceScalarField, and fvcDdtPhiCoeff zeroes
+        // the coupling coefficient only on a patch where U FIXES A VALUE (ddtScheme.C, fvcDdtPhiCoeff:
+        // `if (U.boundaryField()[patchi].fixesValue() ...) ccbf[patchi] = 0.0`). On any other patch --
+        // a zeroGradient outlet -- the correction is live, with interpolate(rho*rAU)'s patch value:
+        // rho's own and rAU's extrapolated one, 1/A of the face cell (fvMatrix::A() is
+        // extrapolatedCalculated). ddtCorr above already computed it and this dropped it. Every open
+        // patch gated before RAS/weirOverflow carried a value-fixing U, where it is zero; that case's
+        // outlet is `U zeroGradient`, and once its flux turned outward at the third step the coefficient
+        // left zero: phi 3.2e-04 out in the outlet's top corner after that step, U 3.6e-05 after ten.
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (U.boundary[pi]->fixesValue()) continue;
+            const FvPatch& q = patches[pi];
+            bool any = false;
+            for (label i = 0; i < q.size && !any; ++i)
+            {
+                any = corr.boundary[pi][static_cast<std::size_t>(i)] != scalar(0);
+            }
+            if (!any) continue;
+            if (!in.rhoBnd || in.rhoBnd->size() <= pi)
+                throw std::runtime_error(
+                    "brae interFoam pEqn: patch `" + q.name + "` does not fix U, so ddtCorr is live on "
+                    "it and needs rho's patch values (PressureStepInput::rhoBnd) for interpolate(rho*rAU).");
+            for (label i = 0; i < q.size; ++i)
+            {
+                const std::size_t k = static_cast<std::size_t>(i);
+                phiHbyA.boundary[pi][k] += (*in.rhoBnd)[pi][k] * rAU[q.faceCells[i]] * corr.boundary[pi][k];
+            }
+        }
     }
     // MRF.makeRelative(phiHbyA), pEqn.H:19
     if (in.mrf && !in.mrf->empty())

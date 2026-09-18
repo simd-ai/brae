@@ -101,6 +101,38 @@ RunReport runInterFoamDevice(
             "RAS/angledDuct); the device loop's UEqn applies no fvOption. Refused rather than run the "
             "case without its resistance.");
     }
+    // Two conditions the host loop rebuilds from the solution as it goes and the device loop, which
+    // uploads patch values and refValues once, would freeze.
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        if (f.U.boundary[pi]->isVariableHeightFlowRateInlet())
+            throw std::runtime_error(
+                "brae interFoam (device): U patch `" + fvp[pi].name + "` is a "
+                "variableHeightFlowRateInletVelocity. OpenFOAM rebuilds it at every momentum assembly "
+                "from the phase fraction on the patch; the host loop does (gated on RAS/weirOverflow) "
+                "and the device loop keeps the value it uploaded. Refused rather than run a frozen inlet.");
+        if (f.alpha1.boundary[pi]->isVariableHeightFlowRate())
+            throw std::runtime_error(
+                "brae interFoam (device): alpha patch `" + fvp[pi].name + "` is a variableHeightFlowRate. "
+                "Its refValue follows the face cell at every update; the host loop carries that (gated "
+                "on RAS/weirOverflow) and the device loop uploads refValue once. Refused rather than run "
+                "it as an inletOutlet of zero.");
+    }
+    // ddtCorr's BOUNDARY HALF is live on an open patch whose U does not fix a value (fvcDdtPhiCoeff zeroes
+    // the coupling coefficient only where it does). The host pressure equation adds it; the device's
+    // deviceInterAddPhiHbyATerms has no such term. A zero-flux patch -- a slip wall, a symmetry plane --
+    // is safe: with phi 0 there the limiter's coefficient is exactly 0.
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        // slip, symmetry and symmetryPlane carry no normal flux, whatever the patch's mesh type says:
+        // waves/solitaryMcCowan's `sides` is a `patch` with a slip U
+        if (fvp[pi].type != "patch" || f.U.boundary[pi]->fixesValue() || f.U.boundary[pi]->isSymmetry()) continue;
+        throw std::runtime_error(
+            "brae interFoam (device): U on the open patch `" + fvp[pi].name + "` does not fix a value (a "
+            "zeroGradient outlet, say), so fvc::ddtCorr is live on that patch's faces "
+            "(ddtScheme.C, fvcDdtPhiCoeff). The host loop adds it to phiHbyA (gated on RAS/weirOverflow); "
+            "the device loop's pressure equation does not. Refused rather than run without the term.");
+    }
     // A flowRateInletVelocity is RECOMPUTED at every momentum assembly (the host loop has it,
     // inter_driver_cpp.cu). The device loop uploads U's patch values once, so it is right only for the
     // inlet that never changes: a constant VOLUMETRIC rate whose constructor already built the value.

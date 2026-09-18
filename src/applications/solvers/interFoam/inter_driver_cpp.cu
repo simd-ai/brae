@@ -134,6 +134,17 @@ RunReport runInterFoam(
     // correct in isolation, which is why losing one is invisible to any single equation's gate.
     std::vector<scalar> alphaOld = f.alpha1.internal;
     std::vector<vector> UOld     = f.U.internal;
+    // U.oldTime()'s PATCH values, which ddtCorr's boundary half reads -- see DdtCorrInput::UOldBnd
+    auto patchValuesOf = [&](const GeometricField<vector>& fld)
+    {
+        std::vector<std::vector<vector>> b(fld.boundary.size());
+        for (std::size_t pi = 0; pi < fld.boundary.size(); ++pi)
+        {
+            b[pi] = fld.boundary[pi]->value();
+        }
+        return b;
+    };
+    std::vector<std::vector<vector>> UOldBnd = patchValuesOf(f.U);
     std::vector<scalar> rhoOld   = f.rho;
     SurfaceScalarField  phiOld   = f.phi;
     // ...and a fifth on a moving mesh: Uf.oldTime(), which ddtCorr reads in phi.oldTime()'s place
@@ -558,6 +569,20 @@ RunReport runInterFoam(
                         {
                             f.U.boundary[pi]->updateFromDensity(f.rhoBnd[pi], rep.time);
                         }
+                        // ...and a variableHeightFlowRateInletVelocity rebuilds itself there too, from
+                        // the STORED values of the phase field it names on this patch
+                        // (variableHeightFlowRateInletVelocityFvPatchVectorField.C:103-139)
+                        if (f.U.boundary[pi]->isVariableHeightFlowRateInlet())
+                        {
+                            if (f.U.boundary[pi]->alphaFieldName() != f.alphaName)
+                                throw std::runtime_error(
+                                    "brae interFoam: U patch `" + patches[pi].name + "` is a "
+                                    "variableHeightFlowRateInletVelocity naming `alpha "
+                                    + f.U.boundary[pi]->alphaFieldName() + "`, and this case's phase field is `"
+                                    + f.alphaName + "`. OpenFOAM looks the named field up and stops "
+                                    "without it.");
+                            f.U.boundary[pi]->updateFromAlphaPatch(f.alpha1.boundary[pi]->value(), rep.time);
+                        }
                     }
                     if (!f.fvOptions.empty())
                     {
@@ -576,6 +601,7 @@ RunReport runInterFoam(
 
                     DdtCorrInput dc;
                     dc.phiOld = &phiOld; dc.UOld = &UOld; dc.deltaT = rep.deltaT;
+                    dc.UOldBnd = &UOldBnd;
                     // ddtCorr(U, phi, Uf) is ddtCorr(U, Uf) when the mesh is dynamic
                     dc.UfOld = dyn ? &UfOld : nullptr;
 
@@ -667,6 +693,7 @@ RunReport runInterFoam(
         // ...and the old-time set moves forward, all four together -- five on a moving mesh.
         alphaOld = f.alpha1.internal;
         UOld     = f.U.internal;
+        UOldBnd  = patchValuesOf(f.U);
         rhoOld   = f.rho;
         phiOld   = f.phi;
         UfOld = f.Uf;

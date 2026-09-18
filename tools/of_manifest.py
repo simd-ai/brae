@@ -2612,6 +2612,48 @@ COMPONENTS = {
                   "waterChannel's volumetric inlet carries no `value`, so its constructor had built the right one. "
                   "ALSO: the shared fvOptions reader looked in system/ before constant/, where "
                   "fv::options::createIOobject (fvOptions.C:46-84) looks in constant/ first. HOST ONLY SO FAR."),
+        dict(name="interFoam_variableHeightFlowRate", of_symbol="variableHeightFlowRateInletVelocityFvPatchVectorField",
+             of_file="src/finiteVolume/fields/fvPatchFields/derived/variableHeightFlowRateInletVelocity/"
+                     "variableHeightFlowRateInletVelocityFvPatchVectorField.C",
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/finiteVolume/fields/fv_patch_field.cuh",
+             validation="tests/interfoam_weiroverflow_vs_openfoam.sh, real OpenFOAM on RAS/weirOverflow AS SHIPPED (its "
+                        "own blockMesh, 5080 cells non-orthogonal to 26.4 degrees, setFields), ten fixed steps of the "
+                        "tutorial's deltaT 1e-3. MEASURED: all 30 p_rgh, 10 epsilon and 10 k iteration counts "
+                        "OpenFOAM's; alpha 4.0e-13, p_rgh 8.0e-13, U 1.8e-11, k 5.1e-14, epsilon 6.2e-14, nut 8.8e-14; "
+                        "the inlet's velocity 2.7e-13 of its largest value, face by face against the `value` OpenFOAM "
+                        "writes; bounds at about 30x. One p_rgh initial residual is 7.2e-08 out -- step one's third "
+                        "corrector, itself 2.8e-05 after a PCG solve stopped at relTol 0.05, where p_rgh agrees to "
+                        "8e-13 -- and that bound is 2e-06 for that stated reason. THE CONTROL: OpenFOAM with the inlet "
+                        "U a fixedValue at the file's (0 0 0), 100% of U. BROKEN ONCE EACH (U): U_p without the "
+                        "alpha_p weight 7.6e-01; avgU over the whole inlet area 6.0e-01; alpha_p from the face cells "
+                        "4.7e-03; ddtCorr's boundary half dropped 3.6e-05 and 22 of 30 p_rgh counts; the alpha "
+                        "condition never updated -- the inlet stays dry and the velocity condition refuses by name. "
+                        "THE ALPHA CONDITION HAS NO CONTROL ON THE CASE: inside [0, 1] its value is the face cell's "
+                        "on inflow and on outflow, and an inletOutlet of 0 in its place sends OpenFOAM itself to NaN "
+                        "(the velocity condition divides by a wet area of zero). Its per-face logic, with bounds "
+                        "that are not 0 and 1, is held by tests/test_variable_height_flow_rate.cu against "
+                        "OpenFOAM's text, with an inletOutlet as the control. NOT CLAIMED: a flowRate that varies in "
+                        "time (refused), and the device loop (refused by name).",
+             note="TWO CONDITIONS. variableHeightFlowRateInletVelocity is a fixedValue whose updateCoeffs rebuilds "
+                  "n*avgU*alpha_p, avgU = -flowRate/gSum(magSf*alpha_p), from the phase field's STORED patch values "
+                  "clipped to [0, 1]; the driver hands them over at the momentum assembly, where the flow-rate inlet "
+                  "is refreshed too. variableHeightFlowRate is a mixed condition (refGrad 0, assignable false) whose "
+                  "updateCoeffs sets, where phi < -SMALL, valueFraction 1 and refValue the face cell's value "
+                  "clipped at lowerBound and upperBound, and elsewhere zeroGradient; the flux reaches it through "
+                  "updateFromFlux and the cells through evaluate(). WHAT THE GATE FOUND WAS IN THE PRESSURE "
+                  "EQUATION. brae added fvc::ddtCorr to phiHbyA on the internal faces only; OpenFOAM adds a whole "
+                  "surface field and zeroes the coupling coefficient only where U FIXES A VALUE (ddtScheme.C, "
+                  "fvcDdtPhiCoeff). weirOverflow's outlet is `U zeroGradient`, the first gated open patch that "
+                  "fixes nothing: phi 3.2e-04 out at the outlet after the third step -- when its flux turned "
+                  "outward and the limiter's coefficient left zero -- and U 3.6e-05 after ten. Localised by where "
+                  "and when (cells, stored patch values and phi all agreed to 3e-10 after two steps), and "
+                  "converging the pressure solves to 1e-13 changed nothing, which ruled the stopping point out. "
+                  "The boundary term reads U.oldTime()'s PATCH value, not the face cell's (fvc::dotInterpolate): "
+                  "on angledDuct's tilted slip wall the cell's velocity made a correction OpenFOAM does not have, "
+                  "and that gate's floor arm caught it (4e-15 to 1.4e-11). The device pressure equation has no "
+                  "boundary half and its header said OpenFOAM has none; corrected, and the device loop refuses an "
+                  "open patch whose U fixes no value. HOST ONLY SO FAR."),
         dict(name="interFoam_waveModel", of_symbol="waveModel",
              of_file="src/waveModels/waveModel/waveModel.C",
              classification="BOUNDARY_CONDITION", status="REIMPLEMENT",

@@ -279,6 +279,14 @@ public:
     // when absent (.C:93-97), so this says whether the patch is still carrying the file's seed.
     virtual bool flowRateHadValue() const { return false; }
     virtual const char* patchName() const { return ""; }
+    // variableHeightFlowRateInletVelocity: a fixedValue the DRIVER refreshes where OpenFOAM's updateCoeffs
+    // does, from the named phase field's STORED values on this patch. `alphaFieldName` is the `alpha` entry.
+    virtual bool isVariableHeightFlowRateInlet() const { return false; }
+    virtual const std::string& alphaFieldName() const { static const std::string none; return none; }
+    virtual void updateFromAlphaPatch(const std::vector<scalar>&, scalar) {}
+    // variableHeightFlowRate: a mixed condition whose refValue follows the face CELL, so no loop that
+    // uploads refValue once can carry it
+    virtual bool isVariableHeightFlowRate() const { return false; }
 
     // turbulentIntensityKineticEnergyInlet / turbulentMixingLengthDissipationRateInlet: which one, and
     // its coefficient (the intensity, or the mixing length). Exposed for the same reason
@@ -1507,6 +1515,151 @@ private:
     std::vector<T> refGrad_;
 };
 
+// variableHeightFlowRate (OF variableHeightFlowRateFvPatchScalarField): the phase fraction at an inlet
+// whose water level is free to move. A mixed condition, refGrad 0, that updateCoeffs rebuilds per face from
+// the flux and the face CELL (variableHeightFlowRateFvPatchField.C:125-164):
+//     phi < -SMALL   valueFraction 1, refValue = 0 where alpha_c < lowerBound, 1 where > upperBound,
+//                    else alpha_c itself -- inflow carries in what the cell already holds, clipped
+//     otherwise      valueFraction 0, refValue 0 -- zeroGradient
+// It does NOT override assignable() (mixed: false). The dictionary constructor keeps the file's `value` or
+// extrapolates the cell when there is none (:84-88), and seeds refValue, refGrad and valueFraction at 0.
+// brae's patches cannot look the flux or the cell up: the flux arrives through updateFromFlux and the
+// cell through evaluate(), which is where OpenFOAM's evaluate runs updateCoeffs too.
+class VariableHeightFlowRatePatchField : public MixedPatchField<scalar>
+{
+public:
+    VariableHeightFlowRatePatchField(
+        const FvPatch& p,
+        scalar lowerBound,
+        scalar upperBound,
+        std::vector<scalar> readValue)
+        : MixedPatchField<scalar>(p, /*uniform=*/false, scalar(0),
+                                  std::vector<scalar>(static_cast<std::size_t>(p.size), scalar(0)),
+                                  /*velocitySign=*/true, /*freestream=*/false, readValue),
+          lowerBound_(lowerBound),
+          upperBound_(upperBound),
+          extrapolatePending_(readValue.size() != static_cast<std::size_t>(p.size))
+    {
+        this->vf_.assign(static_cast<std::size_t>(p.size), scalar(0));
+    }
+    bool isVariableHeightFlowRate() const override { return true; }
+
+    void updateFromFlux(const std::vector<scalar>& phip) override
+    {
+        phi_ = phip;
+        rebuild();
+    }
+    void evaluate(const std::vector<scalar>& internal) override
+    {
+        if (!internal.empty())
+        {
+            pif_ = this->patchInternalField(internal);
+            if (extrapolatePending_)
+            {
+                // extrapolateInternal() for a `value`-less entry, at the first evaluate that has the cells
+                extrapolatePending_ = false;
+                if (!this->valueFractionComputed())
+                {
+                    this->value_ = pif_;
+                    return;
+                }
+            }
+            rebuild();
+        }
+        MixedPatchField<scalar>::evaluate(internal);
+    }
+
+private:
+    // updateCoeffs. SMALL is OpenFOAM's 1e-15 for a double scalar.
+    void rebuild()
+    {
+        const std::size_t n = static_cast<std::size_t>(this->patch_.size);
+        if (phi_.size() < n || pif_.size() < n) return;
+        std::vector<scalar> ref(n, scalar(0));
+        std::vector<scalar> vf(n, scalar(0));
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            if (!(phi_[i] < scalar(-1e-15))) continue;
+            const scalar a = pif_[i];
+            ref[i] = (a < lowerBound_) ? scalar(0) : ((a > upperBound_) ? scalar(1) : a);
+            vf[i] = scalar(1);
+        }
+        this->setRefValues(std::move(ref));
+        this->setValueFraction(std::move(vf));
+    }
+
+    scalar lowerBound_;
+    scalar upperBound_;
+    bool extrapolatePending_;
+    std::vector<scalar> phi_;
+    std::vector<scalar> pif_;
+};
+
+// variableHeightFlowRateInletVelocity (OF ...InletVelocityFvPatchVectorField): a fixedValue that
+// updateCoeffs rebuilds from the phase field's values ON THIS PATCH, clipped to [0, 1]
+// (variableHeightFlowRateInletVelocityFvPatchVectorField.C:103-139):
+//     avgU = -flowRate(t)/gSum(magSf*alpha_p),   U_p = n*avgU*alpha_p
+// so the prescribed VOLUME rate of water enters through the wet part of the inlet only, whatever height
+// that is. The constructor is fixedValue's: the file's `value`, mandatory, stands until the first
+// updateCoeffs. brae's patch cannot look alpha up; the driver hands it over where OpenFOAM's updateCoeffs
+// runs, the momentum assembly.
+class VariableHeightFlowRateInletVelocityPatchField : public FixedValuePatchField<vector>
+{
+public:
+    VariableHeightFlowRateInletVelocityPatchField(
+        const FvPatch& p,
+        Function1 flowRate,
+        std::string alphaName,
+        bool valueUniform,
+        const vector& uniformValue,
+        const std::vector<vector>& values)
+        : FixedValuePatchField<vector>(p, valueUniform, uniformValue, values),
+          flowRate_(std::move(flowRate)),
+          alphaName_(std::move(alphaName))
+    {}
+    bool isVariableHeightFlowRateInlet() const override { return true; }
+    const std::string& alphaFieldName() const override { return alphaName_; }
+
+    void updateFromAlphaPatch(
+        const std::vector<scalar>& alphap,
+        scalar time) override
+    {
+        const label n = this->patch_.size;
+        if (n == 0) return;
+        if (alphap.size() < static_cast<std::size_t>(n))
+            throw std::runtime_error(
+                std::string("variableHeightFlowRateInletVelocity on patch '") + this->patch_.name
+                + "': needs the phase fraction on every face of the patch, and was given fewer.");
+        if (!flowRate_.isConstant() && time != time)
+            throw std::runtime_error(
+                std::string("variableHeightFlowRateInletVelocity on patch '") + this->patch_.name
+                + "': the flow rate is a function of time and the caller supplied no time.");
+        std::vector<scalar> a(static_cast<std::size_t>(n));
+        scalar wetArea = 0;
+        for (label i = 0; i < n; ++i)
+        {
+            a[i] = std::fmin(std::fmax(alphap[i], scalar(0)), scalar(1));
+            wetArea += this->patch_.magSf[i] * a[i];
+        }
+        // OpenFOAM divides whatever the sum is; a dry inlet is a division by zero there and a refusal here
+        if (!(wetArea > scalar(0)))
+            throw std::runtime_error(
+                std::string("variableHeightFlowRateInletVelocity on patch '") + this->patch_.name
+                + "': gSum(magSf*alpha) is not positive -- the inlet holds no water to carry the flow rate.");
+        const scalar avgU = -flowRate_.value(flowRate_.isConstant() ? scalar(0) : time) / wetArea;
+        std::vector<vector> v(static_cast<std::size_t>(n));
+        for (label i = 0; i < n; ++i)
+        {
+            v[i] = this->patch_.nf[i] * (avgU * a[i]);
+        }
+        this->setStoredValues(std::move(v));
+    }
+
+private:
+    Function1 flowRate_;
+    std::string alphaName_;
+};
+
 // inletOutlet: flux-conditional mix (OF mixed, valueFraction = neg(phi), refValue = inletValue, refGrad = 0).
 // Per face: inflow (phi<0) -> fixedValue = inletValue; outflow (phi>=0) -> zeroGradient. The host evaluate()
 // does not see the flux; the DEVICE recomputes the per-face fixedValue|zeroGradient choice every iteration from
@@ -2322,6 +2475,46 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
                 p, d.valueUniform, d.uniformValue, d.values, p0.uniform, p0.uniformValue, p0.values);
         return std::make_unique<TotalPressurePatchField<T>>(
             p, p0.uniform, p0.uniformValue, p0.values, p0.uniform, p0.uniformValue, p0.values);
+    }
+    if (d.type == "variableHeightFlowRateInletVelocity")
+    {
+        if constexpr (std::is_same_v<T, vector>)
+        {
+            if (!d.hasVhFlowRate || d.vhAlphaName.empty())
+                throw std::runtime_error("brae: variableHeightFlowRateInletVelocity on patch " + p.name +
+                    " needs both `flowRate` and `alpha` (OpenFOAM reads both without a default).");
+            if (!d.hasValue)
+                throw std::runtime_error("brae: variableHeightFlowRateInletVelocity on patch " + p.name +
+                    " has no `value`. It is constructed as a fixedValue, whose `value` is mandatory.");
+            return std::make_unique<VariableHeightFlowRateInletVelocityPatchField>(
+                p, d.vhFlowRateFunction1, d.vhAlphaName, d.valueUniform, d.uniformValue, d.values);
+        }
+        else
+        {
+            throw std::runtime_error("brae: variableHeightFlowRateInletVelocity on patch " + p.name +
+                                     " is a VELOCITY condition and the field is not a vector.");
+        }
+    }
+    if (d.type == "variableHeightFlowRate")
+    {
+        if constexpr (std::is_same_v<T, scalar>)
+        {
+            if (!d.hasLowerBound || !d.hasUpperBound)
+                throw std::runtime_error("brae: variableHeightFlowRate on patch " + p.name +
+                    " needs both `lowerBound` and `upperBound` (OpenFOAM reads both without a default).");
+            std::vector<scalar> readValue;
+            if (d.hasValue)
+            {
+                readValue = d.valueUniform ? std::vector<scalar>(static_cast<std::size_t>(p.size), d.uniformValue)
+                                           : d.values;
+            }
+            return std::make_unique<VariableHeightFlowRatePatchField>(p, d.lowerBound, d.upperBound, readValue);
+        }
+        else
+        {
+            throw std::runtime_error("brae: variableHeightFlowRate on patch " + p.name +
+                                     " is a PHASE-FRACTION condition and the field is not a scalar.");
+        }
     }
     if (d.type == "flowRateInletVelocity")
     {

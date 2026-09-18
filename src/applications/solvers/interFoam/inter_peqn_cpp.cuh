@@ -156,6 +156,12 @@ struct DdtCorrInput
 {
     const SurfaceScalarField*  phiOld = nullptr;      // phi.oldTime()
     const std::vector<vector>* UOld   = nullptr;      // U.oldTime(), cell values
+    // ...AND ITS PATCH VALUES, [patch][face]. fvc::dotInterpolate(Sf, U.oldTime()) on a boundary face is
+    // Sf & U_b.oldTime() -- the PATCH value, not the face cell's (EulerDdtScheme.C, fvcDdtPhiCorr). They
+    // are the same number on a zeroGradient patch and on no other: a slip wall's U_b has no normal
+    // component, so its correction is exactly zero where the cell's velocity would give one. Null makes
+    // ddtCorr take the face cell, which is right for zeroGradient alone; the drivers always pass it.
+    const std::vector<std::vector<vector>>* UOldBnd = nullptr;
     // A MOVING MESH: fvc::ddtCorr(U, phi, Uf) is ddtCorr(U, Uf) when mesh.dynamic() (fvcDdtPhiCorr,
     // fvcMeshPhi.C), and EulerDdtScheme::fvcDdtUfCorr replaces phi.oldTime() by Sf & Uf.oldTime()
     // -- the NEW Sf, and the interpolation of U.oldTime() with the NEW weights. Null on a mesh that

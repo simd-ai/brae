@@ -187,6 +187,16 @@ struct PatchFieldData
     // cannot be read as a constant by a consumer that only knows flowRate.
     Function1      flowRateFunction1;
     scalar         rhoInlet     = -1.0;   // OF default -VGREAT ("not given")
+    // variableHeightFlowRateInletVelocity: `flowRate` (a Function1) and `alpha`, the phase field's name
+    // (variableHeightFlowRateInletVelocityFvPatchVectorField.C:57-58, both mandatory)
+    bool           hasVhFlowRate = false;
+    Function1      vhFlowRateFunction1;
+    std::string    vhAlphaName;
+    // variableHeightFlowRate: `lowerBound` and `upperBound`, both mandatory (...FvPatchField.C:81-82)
+    bool           hasLowerBound = false;
+    bool           hasUpperBound = false;
+    scalar         lowerBound   = 0.0;
+    scalar         upperBound   = 0.0;
     bool           extrapolateProfile = false;
     scalar         mixingLength = 0;
     // turbulentMixingLengthDissipationRateInlet's OWN `Cmu` (turbulentMixingLengthDissipationRateInlet-
@@ -1154,6 +1164,37 @@ inline FieldData<T> readField(const std::string& path)
                             p.flowRateFunction1 = Function1::constant(p.flowRate);
                             ts.expect(";");
                         }
+                    }
+                    else if (key == "flowRate")   // variableHeightFlowRateInletVelocity
+                    {
+                        std::string w = ts.next();
+                        if (w == "constant") w = ts.next();
+                        if (!isFoamNumber(w))
+                            throw std::runtime_error(
+                                "brae: `flowRate` on patch " + p.name + " starts `" + w + "`. It is a "
+                                "Function1 (variableHeightFlowRateInletVelocityFvPatchVectorField.C:57) and "
+                                "brae reads `constant <value>` and a bare value there; refusing rather than "
+                                "holding a time-varying rate fixed.");
+                        p.hasVhFlowRate = true;
+                        p.vhFlowRateFunction1 = Function1::constant(std::stod(w));
+                        ts.expect(";");
+                    }
+                    else if (key == "alpha")      // ...and the phase field it weights the inlet by
+                    {
+                        p.vhAlphaName = ts.next();
+                        ts.expect(";");
+                    }
+                    else if (key == "lowerBound")  // variableHeightFlowRate
+                    {
+                        p.lowerBound = ts.nextScalar();
+                        p.hasLowerBound = true;
+                        ts.expect(";");
+                    }
+                    else if (key == "upperBound")
+                    {
+                        p.upperBound = ts.nextScalar();
+                        p.hasUpperBound = true;
+                        ts.expect(";");
                     }
                     else if (key == "rho")
                     {

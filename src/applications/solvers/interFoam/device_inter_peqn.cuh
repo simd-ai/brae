@@ -150,8 +150,12 @@ struct DevicePressureMatrix
 // capillaryRise, where momentumPredictor is off, the pressure corrector is the ONLY route surface
 // tension has into the solution at all.
 //
-// ddtCorr has NO boundary half here: OpenFOAM's expression multiplies it by interpolate(rho*rAU), a
-// field fvc::interpolate builds on the internal faces, and the host reference adds it there only.
+// ddtCorr HAS NO BOUNDARY HALF HERE, AND OpenFOAM'S DOES. This comment used to say fvc::interpolate
+// builds interpolate(rho*rAU) on the internal faces only; it builds the patch values too, and
+// fvcDdtPhiCoeff zeroes the coupling coefficient only where U FIXES A VALUE (ddtScheme.C). On a patch
+// that does not -- RAS/weirOverflow's `U zeroGradient` outlet -- the correction is live, and the host
+// reference carries it since that case's gate found it missing (inter_peqn_cpp.cu). The device loop
+// REFUSES a case with such an open patch (inter_driver_device.cu) until this kernel is taught the same.
 void deviceInterAddPhiHbyATerms(
     const DeviceMesh&           dm,
     const DeviceBuffer<scalar>& rhoRAUfInt,     // interpolate(rho*rAU)

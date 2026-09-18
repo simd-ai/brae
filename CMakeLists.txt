@@ -3424,6 +3424,23 @@ target_link_libraries(test_inter_angledduct_vs_openfoam PRIVATE brae_core)
 add_test(NAME interfoam_angledduct_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_angledduct_vs_openfoam.sh)
 
+# ...and the free-level inlet, on RAS/weirOverflow as shipped: variableHeightFlowRateInletVelocity on U
+# and variableHeightFlowRate on alpha. The controls are OpenFOAM with the inlet frozen at its file value
+# and with the alpha condition an inletOutlet of zero; the device loop must refuse by name.
+add_executable(test_inter_weiroverflow_vs_openfoam tests/test_inter_weiroverflow_vs_openfoam.cu)
+target_include_directories(test_inter_weiroverflow_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_weiroverflow_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_weiroverflow_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_weiroverflow_vs_openfoam.sh)
+
+# ...whose alpha condition that case cannot tell from a zeroGradient; its per-face logic, with bounds
+# that are not 0 and 1, is held here against OpenFOAM's own text, with an inletOutlet as the control.
+add_executable(test_variable_height_flow_rate tests/test_variable_height_flow_rate.cu)
+target_include_directories(test_variable_height_flow_rate PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_variable_height_flow_rate PRIVATE brae_core)
+add_test(NAME variable_height_flow_rate COMMAND test_variable_height_flow_rate)
+
 # ...and the wave boundary conditions (waveAlpha, waveVelocity) on laminar/waves/stokesI: fields, the
 # patch values the wave model assigns, its two derived constants and the ORDER it updates in, all
 # against real OpenFOAM; the control is OpenFOAM's own answer with the wave switched off.
