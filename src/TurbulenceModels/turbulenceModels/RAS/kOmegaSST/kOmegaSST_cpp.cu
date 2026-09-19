@@ -968,6 +968,15 @@ void correctNutField(
         // a coupled patch interpolates. MEASURED on RAS/waterChannel with the inlet's nut zeroGradient:
         // skipped, it kept the value it was built with (0) where OpenFOAM holds the cell's, and U was
         // 8.7e-05 from OpenFOAM after ten steps (tests/interfoam_waterchannel_vs_openfoam.sh `nutInletZeroGrad`).
+        // An EMPTY patch is not among them: OpenFOAM's emptyFvPatchField has size 0, so there is nothing
+        // to evaluate, and brae keeps the faces only for its addressing. Evaluating it copied the cell nut
+        // into faces OpenFOAM does not have -- which the kEpsilon closure and the device closure leave
+        // alone -- and put rhoSimpleFoam's device-against-host alphat boundary gate 2.1e-01 out on
+        // validation/rhoSST's frontBack while every field agreed to 1e-13 (tests/rho_step_cuda_euler.sh).
+        if (patches[pi].type == "empty")
+        {
+            continue;
+        }
         if (nutField.boundary[pi]->bcCategory() != 2)
         {
             nutField.boundary[pi]->evaluate(nutF);
