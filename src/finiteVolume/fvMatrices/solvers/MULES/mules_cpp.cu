@@ -75,11 +75,24 @@ void boundedDonorFlux(const SurfaceScalarField&     phi,
 
     // THE OVERWRITE. On every non-coupled patch phiBD becomes phiPsi, so phiCorr is identically zero
     // there and the boundary flux passes through the limiter untouched -- see note 3 in the header.
-    // brae has no coupled patch in a VoF case yet, so this is every patch today; it is written per
-    // patch so that adding cyclic changes only the coupled ones.
+    // A COUPLED face keeps upwind's own flux, from the cell the flux leaves (MULESTemplates.C:605, `if
+    // (!phiBDPf.coupled())`).
     phiBD.boundary.assign(patches.size(), std::vector<scalar>{});
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
         phiBD.boundary[pi] = phiPsi.boundary[pi];
+        if (!patches[pi].coupled)
+        {
+            continue;
+        }
+        const FvPatch& q = patches[pi];
+        for (std::size_t i = 0; i < phiBD.boundary[pi].size(); ++i)
+        {
+            const scalar p = phi.boundary[pi][i];
+            phiBD.boundary[pi][i] = p * ((p >= scalar(0)) ? psi.internal[q.faceCells[i]]
+                                                           : psi.internal[q.nbrFaceCells[i]]);
+        }
+    }
 }
 
 
@@ -165,7 +178,12 @@ void limiter(Limiter&                      lambda,
             // neighbour cell's value; a patch that FIXES A VALUE contributes that value, because psi
             // really can reach it there; anything else (zeroGradient, inletOutlet on outflow)
             // contributes NOTHING -- its own extrema are already represented by the interior.
-            if (fixesValue)
+            if (q.coupled)
+            {
+                psiMaxn[ci] = std::fmax(psiMaxn[ci], psiIf[q.nbrFaceCells[i]]);
+                psiMinn[ci] = std::fmin(psiMinn[ci], psiIf[q.nbrFaceCells[i]]);
+            }
+            else if (fixesValue)
             {
                 psiMaxn[ci] = std::fmax(psiMaxn[ci], pv[i]);
                 psiMinn[ci] = std::fmin(psiMinn[ci], pv[i]);
@@ -288,11 +306,39 @@ void limiter(Limiter&                      lambda,
                 continue;
             }
             // An UNCOUPLED patch is left alone: phiCorr is zero there by construction (see
-            // boundedDonorFlux), so lambda on it multiplies nothing. Only coupled patches take the
-            // per-cell limiters, and brae has none in a VoF case yet.
+            // boundedDonorFlux), so lambda on it multiplies nothing. A COUPLED patch takes this side's
+            // per-cell limiter (MULESTemplates.C:543); the sync below brings the other side's.
+            if (q.coupled)
+            {
+                for (label i = 0; i < q.size; ++i)
+                {
+                    const label ci = q.faceCells[i];
+                    lambda.boundary[pi][i] = (phiCorr.boundary[pi][i] > scalar(0))
+                        ? std::fmin(lambda.boundary[pi][i], lambdap[ci])
+                        : std::fmin(lambda.boundary[pi][i], lambdam[ci]);
+                }
+            }
         }
-        // syncTools::syncFaceList(minEqOp) -- a parallel reduction over coupled faces, and a no-op in
-        // serial. It belongs here and is absent because the coupled branch above is.
+        // syncTools::syncFaceList(mesh, allLambda, minEqOp<scalar>()). NOT a no-op in serial: it syncs
+        // a cyclic pair too, and leaves both sides of a coupled face with the SMALLER of their limiters
+        // -- which is an internal face's one limiter, min(lambda, lambdap of the cell the correction
+        // leaves, lambdam of the cell it enters).
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const FvPatch& q = patches[pi];
+            if (!q.coupled || !q.owner)
+            {
+                continue;
+            }
+            std::vector<scalar>& mine = lambda.boundary[pi];
+            std::vector<scalar>& theirs = lambda.boundary[static_cast<std::size_t>(q.nbrPatch)];
+            for (std::size_t i = 0; i < mine.size(); ++i)
+            {
+                const scalar lo = std::fmin(mine[i], theirs[i]);
+                mine[i] = lo;
+                theirs[i] = lo;
+            }
+        }
     }
 }
 
@@ -483,7 +529,13 @@ void limiterCorr(Limiter&                      lambda,
         for (label i = 0; i < q.size; ++i)
         {
             const label ci = q.faceCells[i];
-            if (fixesValue)
+            if (q.coupled)
+            {
+                // CMULESTemplates.C:327 -- the cell on the other side, as on an internal face
+                psiMaxn[ci] = std::fmax(psiMaxn[ci], psiIf[q.nbrFaceCells[i]]);
+                psiMinn[ci] = std::fmin(psiMinn[ci], psiIf[q.nbrFaceCells[i]]);
+            }
+            else if (fixesValue)
             {
                 psiMaxn[ci] = std::fmax(psiMaxn[ci], pv[i]);
                 psiMinn[ci] = std::fmin(psiMinn[ci], pv[i]);
@@ -591,14 +643,35 @@ void limiterCorr(Limiter&                      lambda,
             for (label i = 0; i < q.size; ++i)
             {
                 const scalar total = phi.boundary[pi][i] + phiCorr.boundary[pi][i];
-                if (total <= kSmallSquared) continue;
+                // ...on an UNCOUPLED patch. A coupled face is limited whichever way its flux goes
+                // (CMULESTemplates.C:516).
+                if (!q.coupled && total <= kSmallSquared) continue;
                 const label ci = q.faceCells[i];
                 lambda.boundary[pi][i] = (phiCorr.boundary[pi][i] > scalar(0))
                     ? std::fmin(lambda.boundary[pi][i], lambdap[ci])
                     : std::fmin(lambda.boundary[pi][i], lambdam[ci]);
             }
         }
-        // syncTools::syncFaceList(minEqOp) -- parallel only, and absent for the same reason as above.
+        // syncTools::syncFaceList(mesh, allLambda, minEqOp<scalar>()). NOT a no-op in serial: it syncs
+        // a cyclic pair too, and leaves both sides of a coupled face with the SMALLER of their limiters
+        // -- which is an internal face's one limiter, min(lambda, lambdap of the cell the correction
+        // leaves, lambdam of the cell it enters).
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const FvPatch& q = patches[pi];
+            if (!q.coupled || !q.owner)
+            {
+                continue;
+            }
+            std::vector<scalar>& mine = lambda.boundary[pi];
+            std::vector<scalar>& theirs = lambda.boundary[static_cast<std::size_t>(q.nbrPatch)];
+            for (std::size_t i = 0; i < mine.size(); ++i)
+            {
+                const scalar lo = std::fmin(mine[i], theirs[i]);
+                mine[i] = lo;
+                theirs[i] = lo;
+            }
+        }
     }
 }
 

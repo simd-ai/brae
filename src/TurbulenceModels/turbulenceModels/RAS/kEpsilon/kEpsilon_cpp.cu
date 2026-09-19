@@ -37,7 +37,8 @@ void captureSystem(
         {
             const label c = patches[pi].faceCells[i];
             D[c] += M.internalCoeffs[pi][i];
-            S[c] += M.boundaryCoeffs[pi][i];
+            // a coupled patch's boundaryCoeffs are interface coefficients, not a source
+            if (!patches[pi].coupled) S[c] += M.boundaryCoeffs[pi][i];
         }
 }
 
@@ -83,7 +84,8 @@ FvScalarMatrix divWithScheme(
         // The caller SUBTRACTS what linearUpwindCorrection returns -- the sign note is in fvm.cuh. The
         // flux is the equation's own (compressibly the MASS flux), and it picks the upwind cell by
         // `faceFlux > 0` exactly as linearUpwind.C:74-79 does.
-        const std::vector<scalar> corr = fvm::linearUpwindCorrection<scalar, vector>(phi.internal, gradVf, m, g);
+        std::vector<scalar> corr = fvm::linearUpwindCorrection<scalar, vector>(phi.internal, gradVf, m, g);
+        fvm::addLinearUpwindCorrectionCoupled<scalar, vector>(corr, phi.boundary, gradVf, g, patches);
         for (label c = 0; c < m.nCells(); ++c) M.source[c] -= corr[c];
         return M;
     }
@@ -150,6 +152,11 @@ SurfaceScalarField effectiveDiffusivity(
     SurfaceScalarField sf = fvc::interpolate(D, m, g, patches);
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
+        if (patches[pi].coupled)
+        {
+            // a coupled face keeps fvc::interpolate's value: DkEff's two CELLS, interpolated
+            continue;
+        }
         const std::vector<scalar>& nb = nutField.boundary[pi]->value();
         for (label i = 0; i < patches[pi].size; ++i)
         {

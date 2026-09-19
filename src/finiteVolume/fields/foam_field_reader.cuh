@@ -202,6 +202,24 @@ struct PatchFieldData
     // PatchFunction1 that brae reads as `uniform <value>` or a bare value
     bool           hasAlphaMin  = false;
     scalar         alphaMin     = 1.0;
+    // porousBafflePressure (a fixedJump cyclic): `D` and `I` are Function1s, read as `constant <value>`
+    // or a bare value; `length` is a scalar; `uniformJump` defaults false; `jump` is MUST_READ on the
+    // owner side and read as `uniform <value>`; `relax` (default -1, off) and `minJump` are fixedJump's.
+    // Anything else in those slots is named here and refused where the patch is built.
+    bool           hasBaffleD = false;
+    bool           hasBaffleI = false;
+    bool           hasBaffleLength = false;
+    scalar         baffleD = 0.0;
+    scalar         baffleI = 0.0;
+    scalar         baffleLength = 0.0;
+    bool           uniformJump = false;
+    bool           hasJump = false;
+    bool           jumpIsUniform = true;
+    scalar         jumpUniform = 0.0;
+    std::vector<scalar> jumpValues;      // `nonuniform`: what OpenFOAM writes once rho varies along the baffle
+    bool           hasJumpRelax = false;
+    bool           hasMinJump = false;
+    std::string    baffleUnsupported;
     bool           hasPrghP     = false;
     scalar         prghP        = 0.0;
     std::string    prghPUnsupported;
@@ -1191,6 +1209,77 @@ inline FieldData<T> readField(const std::string& path)
                     {
                         p.vhAlphaName = ts.next();
                         ts.expect(";");
+                    }
+                    else if (key == "D" || key == "I")   // porousBafflePressure's two Function1s
+                    {
+                        std::string w = ts.next();
+                        if (w == "constant") w = ts.next();
+                        if (isFoamNumber(w))
+                        {
+                            if (key == "D")
+                            {
+                                p.baffleD = std::stod(w);
+                                p.hasBaffleD = true;
+                            }
+                            else
+                            {
+                                p.baffleI = std::stod(w);
+                                p.hasBaffleI = true;
+                            }
+                            ts.expect(";");
+                        }
+                        else
+                        {
+                            p.baffleUnsupported = "`" + key + " " + w + " ...`, a Function1 other than `constant`";
+                            if (!skipToSemicolon(ts)) ts.expect(";");
+                        }
+                    }
+                    else if (key == "length")
+                    {
+                        p.baffleLength = ts.nextScalar();
+                        p.hasBaffleLength = true;
+                        ts.expect(";");
+                    }
+                    else if (key == "uniformJump")
+                    {
+                        const std::string w = ts.next();
+                        p.uniformJump = (w == "true" || w == "yes" || w == "on" || w == "1");
+                        ts.expect(";");
+                    }
+                    else if (key == "jump")
+                    {
+                        std::string w = ts.next();
+                        if (w == "uniform")
+                        {
+                            p.jumpUniform = ts.nextScalar();
+                            p.hasJump = true;
+                            ts.expect(";");
+                        }
+                        else if (w == "nonuniform")
+                        {
+                            ts.next();
+                            const label n = ts.nextLabel();
+                            ts.expect("(");
+                            p.jumpValues.resize(static_cast<std::size_t>(n));
+                            for (label i = 0; i < n; ++i)
+                            {
+                                p.jumpValues[static_cast<std::size_t>(i)] = ts.nextScalar();
+                            }
+                            ts.expect(")");
+                            p.jumpIsUniform = false;
+                            p.hasJump = true;
+                            ts.expect(";");
+                        }
+                        else
+                        {
+                            p.baffleUnsupported = "a `jump` that is neither `uniform <value>` nor a `nonuniform` list";
+                            if (!skipToSemicolon(ts)) ts.expect(";");
+                        }
+                    }
+                    else if (key == "relax" || key == "minJump")   // fixedJump's own two
+                    {
+                        (key == "relax" ? p.hasJumpRelax : p.hasMinJump) = true;
+                        if (!skipToSemicolon(ts)) ts.expect(";");
                     }
                     else if (key == "alphaMin")    // the two permeable-wall conditions
                     {

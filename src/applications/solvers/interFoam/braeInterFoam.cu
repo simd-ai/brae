@@ -60,6 +60,15 @@
 // limitedLinearV, LUST and vanLeerV -- the last the V-limited vanLeer the closed-tank tutorials use.
 // `Gauss linear` on the device fell through a switch's default to upwind until this was wired.
 //
+// AND A CYCLIC PAIR, on the host: a translational `cyclic` -- a baffle pair included -- coupled through
+// every operator, matrix and linear solver on the path (PCG/DIC and smoothSolver carry the interface
+// coefficients), and on it p_rgh's porousBafflePressure, the cyclic with a jump rebuilt at every
+// pressure assembly. tests/interfoam_baffle_vs_openfoam.sh holds RAS/damBreakPorousBaffle against
+// OpenFOAM. Refused by name across a cyclic: GAMG and PBiCGStab, a momentum predictor, every
+// div(rhoPhi,U) scheme but upwind and linearUpwind, interfaceCompression, a moving mesh, MRF, fvOptions,
+// waves, kOmegaSST, a pair that is rotational or not orthogonal, and cyclicAMI/ACMI/processor patches.
+// `-device` refuses any cyclic, naming the patch.
+//
 // WHAT IT WILL NOT RUN. Every refusal the components carry is in force: LES and every RASModel but
 // kEpsilon and kOmegaSST, `limitedLinear` on div(rhoPhi,U),
 // any ddtSchemes default but Euler, every fvOption but explicitPorositySource/DarcyForchheimer (host
@@ -125,6 +134,12 @@ int main(int argc, char** argv)
         FvGeometry g;
         g.build(m);
         std::vector<FvPatch> patches = buildPatches(m, g);
+        if (!onDevice)
+        {
+            // THE HOST LOOP COUPLES A CYCLIC: its operators branch on FvPatch::coupled. The device loop
+            // does not, and is handed the mesh as it was -- where a cyclic is refused by name.
+            attachCyclicCoupling(patches, m, g);
+        }
         // ...handed to the host loop mutable as well, for a case whose mesh moves (MutableMesh)
         MutableMesh mutableMesh;
         mutableMesh.m = &m;

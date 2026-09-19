@@ -294,12 +294,25 @@ struct PressureStepInput
     // rho's PATCH values, which totalPressure reads -- see updatePressurePatchesFromVelocity. Required
     // when p_rgh carries a totalPressure patch, and refused by name when it is missing there.
     const std::vector<std::vector<scalar>>* rhoBnd = nullptr;
+    // the mixture's LAMINAR nu on every patch -- turbulence->nu(patchi), which a porousBafflePressure
+    // reads at the pressure assembly. Null where no patch is one.
+    const std::vector<std::vector<scalar>>* nuBnd = nullptr;
     // null = no capture
     PressureTaps* taps = nullptr;
     // appended to, one record per solve; null = not kept
     std::vector<PressureSolveRecord>* solveLog = nullptr;
     // the coarsest-level solve of every GAMG V-cycle, in order; null = not kept
     GamgSolveLog* gamgLog = nullptr;
+    // U's PATCHES ARE STILL `updated()` when this corrector starts. The fvMatrix constructor runs
+    // psi.boundaryFieldRef().updateCoeffs() at the momentum assembly, which sets each patch's updated_
+    // flag, and only an evaluate() clears it. With the momentum predictor OFF nothing evaluates U between
+    // the assembly and the FIRST corrector's U.correctBoundaryConditions(), so that evaluate finds
+    // updated() true, SKIPS updateCoeffs (mixedFvPatchField.C, evaluate: `if (!this->updated())`) and
+    // blends with the valueFraction the assembly-time flux gave; the second corrector is the first to
+    // see the new phi. True for the first corrector after such an assembly, false otherwise.
+    // PER CLASS: a condition whose updateCoeffs ends in evaluate() clears the flag itself and is exempt
+    // (fvPatchField::updateCoeffsEvaluates).
+    bool uPatchesUpdatedAtEntry = false;
     // MRF, pEqn.H:17-19: the ddtCorr flux is ZERO-FILTERED on the zone's faces and phiHbyA made
     // relative to the frame. Null or empty is a case without MRF.
     const std::vector<MRF::Zone>* mrf = nullptr;

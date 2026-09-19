@@ -739,6 +739,7 @@ SolverPerformance gamgSolve(
     const GamgControls& controls,
     GamgSolveLog* log)
 {
+    refuseCoupledPatches(patches, "GAMG");
     checkGamgInputs(M, m, agglomeration, controls);
     std::vector<scalar> diag;
     std::vector<scalar> source;
@@ -803,6 +804,7 @@ SolverPerformance pcgGamgSolveImpl(
     const GamgPreconditionerControls& precond,
     GamgSolveLog* log)
 {
+    refuseCoupledPatches(patches, "PCG with the GAMG preconditioner");
     if (precond.nVcycles < 1)
     {
         throw std::runtime_error("brae GAMG preconditioner: nVcycles must be at least 1.");

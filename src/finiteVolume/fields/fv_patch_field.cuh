@@ -352,6 +352,38 @@ public:
     virtual void assignValue(std::vector<T> v) { value_ = std::move(v); }
     // Coupled-patch neighbour (halo) values for the matrix; non-coupled patches return value().
     virtual const std::vector<T>& patchNeighbourField() const { return value_; }
+
+    // THE OF-MIRROR COUPLING (FvPatch::coupled, see fv_patch.cuh). coupled() is OpenFOAM's: the patch
+    // takes its face value from the cell on the other side, its matrix boundaryCoeffs are INTERFACE
+    // coefficients and never a source, and every interpolation across it starts from the two cells.
+    // patchNeighbourField(internal) is LIVE -- gathered from the field it is handed, not from the last
+    // evaluate() -- because that is what OpenFOAM's is, and it is where a jump enters: a jump cyclic's
+    // is the neighbour cell's value LESS the jump (jumpCyclicFvPatchField.C, patchNeighbourField).
+    virtual bool coupled() const { return false; }
+    virtual std::vector<T> patchNeighbourField(const std::vector<T>& /*internal*/) const
+    {
+        throw std::runtime_error(
+            "brae: patchNeighbourField(internal) asked of patch '" + patch_.name + "', which is not coupled.");
+    }
+    // The jump this SIDE subtracts from the neighbour cell, already signed (the owner's jump on the
+    // owner, its negative on the other side); null on a patch without one. The interface update of a
+    // linear solve applies it only when it is handed the field itself (jumpCyclicFvPatchFields.C,
+    // "only apply jump to original field").
+    virtual const std::vector<T>* coupledJump() const { return nullptr; }
+    // Store the OWNER's jump; the other side negates it as it takes it.
+    virtual void setOwnerJump(const std::vector<T>& /*ownerJump*/) {}
+    // porousBafflePressure: the OWNER's jump, rebuilt from the flux, the laminar viscosity and the
+    // density on its own patch -- what its updateCoeffs computes and setJump stores. The driver hands
+    // the result to both sides through setOwnerJump, because in OpenFOAM the other side reads the
+    // owner's (fixedJumpFvPatchField::jump()).
+    virtual bool isPorousBafflePressure() const { return false; }
+    virtual std::vector<scalar> porousBaffleJump(
+        const std::vector<scalar>& /*phip*/,
+        const std::vector<scalar>& /*nup*/,
+        const std::vector<scalar>& /*rhop*/) const
+    {
+        return {};
+    }
     const FvPatch&        patch() const { return patch_; }
 
     std::vector<T> patchInternalField(const std::vector<T>& internal) const
@@ -2450,6 +2482,178 @@ template <> inline vector CyclicFvPatchField<vector>::transformValue(const vecto
     return hasTransform_ ? dot(v, transpose(forwardT_)) : v;   // transform(forwardT, v) = forwardT & v = v & forwardT^T
 }
 
+// cyclic, in the OF-mirror tree (OF cyclicFvPatchField, with jumpCyclicFvPatchField's jump folded in so
+// that one class serves both): built only on a patch attachCyclicCoupling() has filled. Its value is
+// coupledFvPatchField::evaluate's, w*pif + (1 - w)*pnf, and its four matrix coefficient sets are never
+// read -- fvm::laplacian and fvm::div branch on FvPatch::coupled and build the interface coefficients
+// from the scheme's weights and deltaCoeffs, as gaussLaplacianScheme and gaussConvectionScheme do.
+// Translational only; attachCyclicCoupling refuses the rest.
+template <typename T>
+class CoupledCyclicPatchField : public fvPatchField<T>
+{
+public:
+    explicit CoupledCyclicPatchField(const FvPatch& p)
+        : fvPatchField<T>(p)
+    {
+        if (!p.coupled)
+        {
+            throw std::runtime_error(
+                "brae: a coupled cyclic patch field was asked for on patch '" + p.name + "', whose "
+                "coupling was never attached (attachCyclicCoupling).");
+        }
+        this->value_.assign(static_cast<std::size_t>(p.size), T{});
+    }
+
+    bool coupled() const override { return true; }
+    bool fixesValue() const override { return false; }
+
+    std::vector<T> patchNeighbourField(const std::vector<T>& internal) const override
+    {
+        const FvPatch& p = this->patch_;
+        std::vector<T> pnf(static_cast<std::size_t>(p.size));
+        for (std::size_t i = 0; i < pnf.size(); ++i)
+        {
+            pnf[i] = internal[p.nbrFaceCells[i]];
+            if (!jump_.empty())
+            {
+                pnf[i] = pnf[i] - jump_[i];
+            }
+        }
+        return pnf;
+    }
+
+    void evaluate(const std::vector<T>& internal) override
+    {
+        if (internal.empty())
+        {
+            return;
+        }
+        const FvPatch& p = this->patch_;
+        const std::vector<T> pnf = patchNeighbourField(internal);
+        this->value_.resize(pnf.size());
+        for (std::size_t i = 0; i < pnf.size(); ++i)
+        {
+            this->value_[i] = p.weights[i]*internal[p.faceCells[i]] + (scalar(1) - p.weights[i])*pnf[i];
+        }
+    }
+
+    std::vector<T> valueInternalCoeffs()    const override { return std::vector<T>(this->patch_.size, T{}); }
+    std::vector<T> valueBoundaryCoeffs()    const override { return std::vector<T>(this->patch_.size, T{}); }
+    std::vector<T> gradientInternalCoeffs() const override { return std::vector<T>(this->patch_.size, T{}); }
+    std::vector<T> gradientBoundaryCoeffs() const override { return std::vector<T>(this->patch_.size, T{}); }
+
+    // coupledFvPatchField::snGrad(deltaCoeffs) = dc*(pnf - pif), with the patch's own 1/|delta|
+    std::vector<T> snGrad(const std::vector<T>& internal) const override
+    {
+        const FvPatch& p = this->patch_;
+        const std::vector<T> pnf = patchNeighbourField(internal);
+        std::vector<T> sn(pnf.size());
+        for (std::size_t i = 0; i < pnf.size(); ++i)
+        {
+            sn[i] = p.deltaCoeffs[i]*(pnf[i] - internal[p.faceCells[i]]);
+        }
+        return sn;
+    }
+
+    const std::vector<T>* coupledJump() const override { return jump_.empty() ? nullptr : &jump_; }
+    void setOwnerJump(const std::vector<T>& ownerJump) override
+    {
+        jump_ = ownerJump;
+        if (!this->patch_.owner)
+        {
+            for (T& j : jump_)
+            {
+                j = scalar(-1)*j;
+            }
+        }
+    }
+
+protected:
+    std::vector<T> jump_;
+};
+
+// porousBafflePressure (OF porousBafflePressureFvPatchField, a fixedJump cyclic): the pressure drop of a
+// porous baffle of zero thickness, Darcy-Forchheimer in the velocity NORMAL to it
+// (porousBafflePressureFvPatchField.C:125-189):
+//     Un   = phi_p/magSf                  (and gAverage(Un) on every face under `uniformJump`)
+//     jump = -sign(Un)*(D*nu_p + I*0.5*|Un|)*|Un|*length
+//     jump *= rho_p                       when the field has the dimensions of PRESSURE, as p_rgh has
+// nu_p is the turbulence model's LAMINAR nu on the patch and rho_p the field named `rho`; both are the
+// stored patch values of a cyclic, the two cells' interpolated. sign() is OpenFOAM's: +1 at zero. Only
+// the OWNER side computes it (fixedJump::setJump is a no-op on the other), so this class returns the
+// jump and the driver stores it on both sides.
+class PorousBafflePressurePatchField : public CoupledCyclicPatchField<scalar>
+{
+public:
+    PorousBafflePressurePatchField(
+        const FvPatch& p,
+        scalar D,
+        scalar I,
+        scalar length,
+        bool uniformJump,
+        const std::vector<scalar>& readJump)
+        : CoupledCyclicPatchField<scalar>(p),
+          D_(D),
+          I_(I),
+          length_(length),
+          uniformJump_(uniformJump)
+    {
+        // the file's `jump`, which stands until the first pressure assembly replaces it. Each side
+        // starts from its own entry; buildInterFields then gives the other side the owner's.
+        this->setOwnerJump(readJump);
+    }
+
+    bool isPorousBafflePressure() const override { return true; }
+
+    std::vector<scalar> porousBaffleJump(
+        const std::vector<scalar>& phip,
+        const std::vector<scalar>& nup,
+        const std::vector<scalar>& rhop) const override
+    {
+        const FvPatch& p = this->patch_;
+        const std::size_t n = static_cast<std::size_t>(p.size);
+        if (phip.size() < n || nup.size() < n || rhop.size() < n)
+        {
+            throw std::runtime_error(
+                "brae: porousBafflePressure on patch '" + p.name + "' needs phi, the laminar nu and rho on "
+                "every face of the patch; it was handed fewer.");
+        }
+        std::vector<scalar> Un(n);
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            Un[i] = phip[i]/p.magSf[i];
+        }
+        if (uniformJump_ && n > 0)
+        {
+            scalar sum = 0;
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                sum += Un[i];
+            }
+            const scalar avg = sum/static_cast<scalar>(n);
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                Un[i] = avg;
+            }
+        }
+        std::vector<scalar> jump(n);
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const scalar magUn = std::fabs(Un[i]);
+            const scalar sgn = (Un[i] >= scalar(0)) ? scalar(1) : scalar(-1);
+            jump[i] = -sgn*(D_*nup[i] + I_*scalar(0.5)*magUn)*magUn*length_;
+            jump[i] = jump[i]*rhop[i];
+        }
+        return jump;
+    }
+
+private:
+    scalar D_;
+    scalar I_;
+    scalar length_;
+    bool uniformJump_;
+};
+
 // inletOutlet / totalPressure take their operating value from the inletValue slot, falling back to the plain `value`
 // when inletValue is omitted. One accessor for that choice (returns a view; the referenced vector outlives the call).
 template <typename T>
@@ -2677,6 +2881,54 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
         {
             throw std::runtime_error("brae: permeableAlphaPressureInletOutletVelocity on patch " + p.name +
                                      " is a VELOCITY condition and the field is not a vector.");
+        }
+    }
+    if (d.type == "porousBafflePressure")
+    {
+        if constexpr (std::is_same_v<T, scalar>)
+        {
+            const std::string who = "brae: porousBafflePressure on patch " + p.name;
+            if (!p.coupled)
+                throw std::runtime_error(
+                    who + " needs the cyclic pair it sits on COUPLED, and this patch is not (its mesh type is `"
+                    + p.type + "`, or the driver never attached the coupling). It is ported in interFoam's "
+                    "host loop only; refused rather than run as a wall.");
+            if (!d.baffleUnsupported.empty())
+                throw std::runtime_error(who + " has " + d.baffleUnsupported + ", which is not ported.");
+            if (!d.hasBaffleD || !d.hasBaffleI || !d.hasBaffleLength)
+                throw std::runtime_error(
+                    who + " needs `D`, `I` and `length`; OpenFOAM reads all three without a default "
+                    "(porousBafflePressureFvPatchField.C:68-70).");
+            if (p.owner && !d.hasJump)
+                throw std::runtime_error(
+                    who + " has no `jump` entry, which OpenFOAM reads MUST_READ on the owner side "
+                    "(fixedJumpFvPatchField.C:75).");
+            if (d.hasJumpRelax || d.hasMinJump)
+                throw std::runtime_error(
+                    who + " sets `relax` or `minJump`. fixedJump's relaxation of the jump, and its floor, "
+                    "are not ported.");
+            if (d.phiName != "phi")
+                throw std::runtime_error(
+                    who + " names `phi " + d.phiName + "`. A MASS flux is divided by rho before the jump "
+                    "is formed (porousBafflePressureFvPatchField.C:136-139); only the volumetric `phi` "
+                    "is ported.");
+            if (!d.flowRateRhoName.empty() && d.flowRateRhoName != "rho")
+                throw std::runtime_error(
+                    who + " names `rho " + d.flowRateRhoName + "`, and interFoam's density field is `rho`.");
+            const std::size_t nf = static_cast<std::size_t>(p.size);
+            if (d.hasJump && !d.jumpIsUniform && d.jumpValues.size() != nf)
+                throw std::runtime_error(
+                    who + " has a `jump` of " + std::to_string(d.jumpValues.size()) + " values on a patch of "
+                    + std::to_string(nf) + " faces.");
+            const std::vector<scalar> readJump = (d.hasJump && !d.jumpIsUniform)
+                                               ? d.jumpValues
+                                               : std::vector<scalar>(nf, d.jumpUniform);
+            return std::make_unique<PorousBafflePressurePatchField>(p, d.baffleD, d.baffleI, d.baffleLength,
+                                                                    d.uniformJump, readJump);
+        }
+        else
+        {
+            throw std::runtime_error("brae: porousBafflePressure on patch " + p.name + " is a SCALAR condition.");
         }
     }
     if (d.type == "prghPermeableAlphaTotalPressure")
@@ -2968,6 +3220,9 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
         return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     // cyclic: the device-resident solver couples it via appended internal faces (DeviceMesh), so the host patch
     // field is a no-op placeholder here (its value is unused; the FvPatch type "cyclic" drives the device skip).
+    // ...EXCEPT in the OF-mirror tree, where the driver has attached the coupling to the mesh patch and
+    // the host operators branch on it: there a cyclic is a real coupled patch field.
+    if (d.type == "cyclic" && p.coupled)         return std::make_unique<CoupledCyclicPatchField<T>>(p);
     if (isCoupledInterfaceType(d.type))          return std::make_unique<ZeroGradientPatchField<T>>(p);
     if (d.type == "empty")           return std::make_unique<EmptyPatchField<T>>(p);
     if (d.type == "symmetryPlane" || d.type == "symmetry" || d.type == "slip")

@@ -111,6 +111,14 @@ RunReport runInterFoamDevice(
                 "variableHeightFlowRateInletVelocity. OpenFOAM rebuilds it at every momentum assembly "
                 "from the phase fraction on the patch; the host loop does (gated on RAS/weirOverflow) "
                 "and the device loop keeps the value it uploaded. Refused rather than run a frozen inlet.");
+        if (f.U.boundary[pi]->needsAlphaPatchValues() || f.p_rgh.boundary[pi]->needsAlphaPatchValues()
+         || f.p_rgh.boundary[pi]->isPrghPermeableAlphaTotalPressure())
+            throw std::runtime_error(
+                "brae interFoam (device): patch `" + fvp[pi].name + "` carries a permeable-wall condition "
+                "(permeableAlphaPressureInletOutletVelocity or prghPermeableAlphaTotalPressure). Each "
+                "switches face by face between a wall and an open boundary on the phase fraction at the "
+                "patch, at every update; the host loop carries that (gated on laminar/damBreakPermeable) "
+                "and the device loop uploads the blend once. Refused rather than run a wall that never opens.");
         if (f.alpha1.boundary[pi]->isVariableHeightFlowRate())
             throw std::runtime_error(
                 "brae interFoam (device): alpha patch `" + fvp[pi].name + "` is a variableHeightFlowRate. "

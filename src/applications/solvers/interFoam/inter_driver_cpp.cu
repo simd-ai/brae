@@ -384,6 +384,8 @@ RunReport runInterFoam(
                     // capillaryRise did not move, so the extra evaluations are load-bearing rather
                     // than spurious.
                     f.alpha1.evaluateBoundary();
+                    // ...and the conditions that look alpha up read the values THIS evaluate left
+                    pushAlphaToPatches(f, patches);
                     break;
                 }
 
@@ -610,6 +612,7 @@ RunReport runInterFoam(
                     pin.ghfBnd = &f.ghfBoundary;
                     pin.stf = &stf; pin.snGradRho = &snRho; pin.ddt = &dc;
                     pin.rhoBnd = &f.rhoBnd;
+                    pin.nuBnd = &f.nuBnd;
                     pin.rhoPhi = &f.rhoPhi;
                     pin.taps = pressureTaps;
                     pin.solveLog = &rep.pSolves;
@@ -656,6 +659,8 @@ RunReport runInterFoam(
                     for (label c = 0; c < lc.nCorrectors; ++c)
                     {
                         psc.finalCorrector = (c == lc.nCorrectors - 1);
+                        // a predictor's solve ends in U.correctBoundaryConditions(), which clears the flag
+                        pin.uPatchesUpdatedAtEntry = (c == 0) && !f.momentumPredictorOn;
                         pressureCorrector(f.p_rgh, f.U, f.phi, f.p, pin, psc, m, g, patches);
                     }
                     // alpha1's inletOutlet reads the flux the step ended on, at the next MULES pass.

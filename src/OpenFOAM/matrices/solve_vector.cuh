@@ -37,6 +37,9 @@ inline SolverPerformance solveVector(
     SolverPerformance* perfCmpt = nullptr,
     const VectorLinearSolver* which = nullptr)
 {
+    // fvMatrix<Type>::solveSegregated moves a coupled patch's contribution between the components'
+    // sources before each solve; not ported, so a momentum predictor across a cyclic is refused
+    refuseCoupledPatches(patches, "the segregated vector solve");
     const label nC = m.nCells();
     SolverPerformance perf;
     for (int cmpt = 0; cmpt < 3; ++cmpt)

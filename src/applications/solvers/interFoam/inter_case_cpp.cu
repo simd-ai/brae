@@ -104,6 +104,12 @@ GeometricField<scalar> rhoWithPatchValues(
             r.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
             continue;
         }
+        if (q.coupled)
+        {
+            // rho's patch on a cyclic is a cyclic: snGrad(rho) there is deltaCoeffs*(rho_nbr - rho_own)
+            r.boundary.push_back(std::make_unique<CoupledCyclicPatchField<scalar>>(q));
+            continue;
+        }
         const bool have = pi < rhoBnd.size() && rhoBnd[pi].size() == static_cast<std::size_t>(q.size);
         if (!have)
         {
@@ -130,6 +136,29 @@ void updateMixtureBoundary(InterFields& f, const std::vector<FvPatch>& patches)
         f.rhoBnd[pi].resize(n);
         f.muBnd[pi].resize(n);
         f.nuBnd[pi].resize(n);
+        if (patches[pi].coupled)
+        {
+            // ON A COUPLED PATCH the blend is NOT formed from alpha's patch value. OpenFOAM v2412 ends
+            // every GeometricField operation with result.correctLocalBoundaryConditions()
+            // (GeometricFieldFunctionsM.C; `localConsistency`, on by default, etc/controlDict:225), which
+            // re-evaluates a constraint patch of the RESULT: coupledFvPatchField::evaluateLocal is
+            // evaluate(), w*pif + (1 - w)*pnf of the result's own cells. For rho, linear in alpha, that
+            // is the same number. For nu it is not: measured on RAS/damBreakPorousBaffle with the free
+            // surface across the baffle, on the one face whose two cells hold alpha 0.679 and 0.520,
+            // nu(alpha_b) against the two cells' nu interpolated is 4.5e-04 of nu -- and
+            // porousBafflePressure reads exactly that patch value. It put the jump 2.8e-08 out on that
+            // face after 60 steps and U 1.05e-09, where the same case with a plain cyclic held 3e-12;
+            // refitting OpenFOAM's own written jump from its own written alpha is exact to 5e-16 with
+            // the interpolated cells and 2.8e-08 out without.
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                const label k = static_cast<label>(i);
+                f.rhoBnd[pi][i] = coupledLinear(patches[pi], k, f.rho);
+                f.muBnd[pi][i] = coupledLinear(patches[pi], k, f.mu);
+                f.nuBnd[pi][i] = coupledLinear(patches[pi], k, f.nu);
+            }
+            continue;
+        }
         for (std::size_t i = 0; i < n; ++i)
         {
             // rho takes the RAW alpha and mu/nu the CLAMPED one, exactly as in the interior
@@ -212,6 +241,25 @@ DivScheme parseMomentumDiv(const std::string& entry, scalar& coeff)
 AlphaFluxScheme parseAlphaDiv(const std::string& entry, const char* key)
 {
     const std::string e = entry;
+    // `Gauss interfaceCompression vanLeer 1` is NOT the PhiScheme `Gauss interfaceCompression`: it is the
+    // run-time selectable limited scheme of interfaceCompression.H (interfaceCompressionNew), vanLeer
+    // with a compression coefficient. Matching by substring read it as plain vanLeer and ran it without
+    // a word -- found while writing a refusal arm for the cyclic baffle. No shipped interFoam tutorial
+    // names it; refused, by name.
+    {
+        const std::size_t at = e.find("interfaceCompression");
+        if (at != std::string::npos)
+        {
+            std::string rest = e.substr(at + std::string("interfaceCompression").size());
+            while (!rest.empty() && (rest.back() == ';' || rest.back() == ' ' || rest.back() == '\t')) rest.pop_back();
+            while (!rest.empty() && (rest.front() == ' ' || rest.front() == '\t')) rest.erase(rest.begin());
+            if (!rest.empty())
+                throw std::runtime_error(
+                    std::string("brae interFoam: `") + key + " " + entry + "` is interfaceCompression.H's "
+                    "limited scheme with a compression coefficient (`" + rest + "`), not the PhiScheme "
+                    "`Gauss interfaceCompression`. It is not ported.");
+        }
+    }
     if (e.find("vanLeer") != std::string::npos)   return AlphaFluxScheme::vanLeer;
     if (e.find("upwind")  != std::string::npos)   return AlphaFluxScheme::upwind;
     if (e.find("interfaceCompression") != std::string::npos)
@@ -1018,6 +1066,71 @@ InterFields buildInterFields(const std::string&          caseDir,
     // paddle), and read only its magSf and its face cells' alpha as the run goes (waveModel::waterLevel);
     // brae's WaveModel does the same, through the patch the mesh update rebuilds in place. The five
     // waveMaker tutorials absorb at a wall whose points the motion pins, where the two are one geometry.
+
+    // --- coupled patches ----------------------------------------------------------------------
+    // A cyclic is a real coupled patch here ONLY when the caller attached its coupling to the mesh patch
+    // (attachCyclicCoupling): then the shared factory built a CoupledCyclicPatchField and every operator
+    // on this path branches on FvPatch::coupled. Without it the factory's placeholder is a zeroGradient
+    // and the pair would run as two walls, silently -- so that is refused, and so is every coupled
+    // type the operators do not carry, and every pairing of a cyclic with a part of interFoam that was
+    // never run across one.
+    {
+        const FvPatch* firstCoupled = nullptr;
+        for (const FvPatch& q : patches)
+        {
+            if (isCoupledInterfaceType(q.type) && !q.coupled)
+            {
+                throw std::runtime_error(
+                    "brae interFoam: patch `" + q.name + "` is " + q.type + " and its coupling is not "
+                    "attached. The host loop couples a translational `cyclic` (a baffle pair included) "
+                    "once attachCyclicCoupling() has filled the mesh patch; cyclicAMI, cyclicACMI and "
+                    "processor patches are not ported here. Refused rather than run as two walls.");
+            }
+            if (q.coupled && !firstCoupled)
+            {
+                firstCoupled = &q;
+            }
+        }
+        // A JUMP IS THE OWNER'S: fixedJumpFvPatchField::jump() on the other side returns the owner's, so
+        // the file's `jump` on the owner is handed across before anything reads it
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (!patches[pi].coupled || !patches[pi].owner) continue;
+            if (const std::vector<scalar>* j = f.p_rgh.boundary[pi]->coupledJump())
+            {
+                f.p_rgh.boundary[static_cast<std::size_t>(patches[pi].nbrPatch)]->setOwnerJump(*j);
+            }
+        }
+        f.p_rgh.evaluateBoundary();
+        if (firstCoupled)
+        {
+            const std::string who = "brae interFoam: the case has the cyclic patch `" + firstCoupled->name + "` AND ";
+            if (f.dynamicMesh)
+                throw std::runtime_error(who + "a moving mesh. The pair's weights and deltas are taken once.");
+            if (!f.mrfZones.empty())
+                throw std::runtime_error(who + "an active MRF zone. MRF's face lists do not carry coupled faces here.");
+            if (anyFvOption)
+                throw std::runtime_error(who + "an active fvOption. Nothing holds the two together against OpenFOAM.");
+            if (f.waves.any)
+                throw std::runtime_error(who + "a wave condition. Nothing holds the two together against OpenFOAM.");
+            if (f.turbulence.on && f.turbulence.model != InterRasModel::KEpsilon)
+                throw std::runtime_error(who + "a RAS model other than kEpsilon, the one closure carried across a cyclic.");
+            // gaussLaplacianScheme adds the deferred non-orthogonal correction on a coupled face too
+            // (its correction vectors are not zero there); fvm::laplacian here does not assemble it
+            for (const FvPatch& q : patches)
+            {
+                for (std::size_t i = 0; q.coupled && i < q.nonOrthCorrectionVectors.size(); ++i)
+                {
+                    if (mag(q.nonOrthCorrectionVectors[i]) > scalar(1e-10))
+                        throw std::runtime_error(
+                            "brae interFoam: cyclic patch `" + q.name + "` is non-orthogonal (|nf - delta*"
+                            "nonOrthDeltaCoeffs| = " + std::to_string((double)mag(q.nonOrthCorrectionVectors[i]))
+                            + " on face " + std::to_string(i) + "). The deferred correction of a laplacian on "
+                            "a coupled face is not assembled here.");
+                }
+            }
+        }
+    }
 
     // --- gh, ghf and p ------------------------------------------------------------------------
     ghField(f.g, f.ghRefValue, g.C(), f.gh);

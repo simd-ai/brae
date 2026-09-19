@@ -297,6 +297,13 @@ void pushFluxToPatches(
     InterFields& f,
     const std::vector<FvPatch>& patches);
 
+// ...and the phase field's stored patch values, to the conditions that look ALPHA up (the two
+// permeable-wall ones). pushFluxToPatches ends with it; call it again after any evaluate of alpha's
+// boundary that the next momentum or pressure assembly should see.
+void pushAlphaToPatches(
+    InterFields& f,
+    const std::vector<FvPatch>& patches);
+
 // The case's dictionaries and fields -> InterFields. Throws, by name, on anything not ported.
 // Rebuild the boundary blends from alpha's current patch values. Called wherever mixture.correct()
 // is -- the patch values move with the contact angle every calculateK.

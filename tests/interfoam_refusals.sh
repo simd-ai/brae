@@ -85,6 +85,19 @@ cp -r "$BM/0.orig" "$BM/0"
 sed -i 's/^endTime .*/endTime         0.0002;/; s/^deltaT .*/deltaT          1e-4;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
     "$BM/system/controlDict"
 
+# ...and RAS/damBreakPorousBaffle, for the cyclic baffle, meshed as its Allrun does
+SRCB="$TUT/multiphase/interFoam/RAS/damBreakPorousBaffle"
+[ -d "$SRCB" ] || { echo "SKIP: damBreakPorousBaffle tutorial not found at $SRCB"; exit 77; }
+command -v createBaffles > /dev/null 2>&1 || { echo "SKIP: createBaffles not on PATH"; exit 77; }
+BB="$W/baseBaffle"
+cp -r "$SRCB" "$BB" || exit 1
+cp -r "$BB/0.orig" "$BB/0"
+( cd "$BB" && blockMesh > log.blockMesh 2>&1 && setFields > log.setFields 2>&1 \
+      && createBaffles -overwrite > log.createBaffles 2>&1 ) \
+    || { echo "SKIP: blockMesh/setFields/createBaffles failed on damBreakPorousBaffle"; exit 77; }
+sed -i 's/^endTime .*/endTime         0.0002;/; s/^deltaT .*/deltaT          1e-4;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
+    "$BB/system/controlDict"
+
 HAVE_GPU=0
 if command -v nvidia-smi > /dev/null 2>&1 && nvidia-smi > /dev/null 2>&1; then HAVE_GPU=1; fi
 
@@ -148,6 +161,15 @@ arm mrf_noOmega             refused "has no \`omega\` entry"  "" "$ZONE; ${MRFD/
 arm mrf_inactive            runs    -                        "" "printf '%s\nMRF1 { cellZone all; active no; origin (0 0 0); axis (0 0 1); omega 10; }\n' '$HDR' > constant/MRFProperties"
 arm mrf_empty               runs    -                        "" "printf '%s\n' '$HDR' > constant/MRFProperties"
 
+# THE PERMEABLE WALL is ported (tests/interfoam_permeable_vs_openfoam.sh). What it refuses, by name:
+PERMU="python3 -c \"import re; p='0/U'; t=open(p).read(); t=re.sub(r'rightWall\\s*\\{[^}]*\\}', 'rightWall { type permeableAlphaPressureInletOutletVelocity; alpha alpha.water; alphaMin 0.01; PHI value uniform (0 0 0); }', t, count=1); open(p,'w').write(t)\""
+PERMP="python3 -c \"import re; p='0/p_rgh'; t=open(p).read(); t=re.sub(r'rightWall\\s*\\{[^}]*\\}', 'rightWall { type prghPermeableAlphaTotalPressure; alpha alpha.water; alphaMin 0.01; PENTRY value uniform 0; }', t, count=1); open(p,'w').write(t)\""
+arm permeable_runs          runs    -                        "" "${PERMU/PHI /}; ${PERMP/PENTRY/p uniform 0;}"
+arm permeable_massFlux      refused "MASS flux"               "" "${PERMU/PHI /phi rhoPhi; }; ${PERMP/PENTRY/p uniform 0;}"
+arm permeable_pTable        refused "PatchFunction1"          "" "${PERMU/PHI /}; ${PERMP/PENTRY/p table ((0 0) (1 10));}"
+arm permeable_noP           refused "has no \`p\` entry"      "" "${PERMU/PHI /}; ${PERMP/PENTRY/}"
+PERMUOIL="${PERMU/PHI /}"
+arm permeable_otherAlpha    refused "names \`alpha alpha.oil\`" "" "${PERMUOIL/alpha.water/alpha.oil}; ${PERMP/PENTRY/p uniform 0;}"
 # fvOptions, in both places OpenFOAM looks
 arm fvoptions_system        refused "scalarSemiImplicitSource" "" "printf '%s\nsrc { type scalarSemiImplicitSource; }\n' '$HDR' > system/fvOptions"
 arm fvoptions_constant      refused "scalarSemiImplicitSource" "" "printf '%s\nsrc { type scalarSemiImplicitSource; }\n' '$HDR' > constant/fvOptions"
@@ -314,7 +336,34 @@ arm host_nOuter2            runs    -                        "" "sed -i 's/nOute
 arm host_nNonOrth1          runs    -                        "" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"
 
 # ...and the DEVICE loop does not, so there they are refused rather than run as 1 and 0
+# THE CYCLIC BAFFLE is ported in the host loop (tests/interfoam_baffle_vs_openfoam.sh): every operator,
+# matrix and linear solver on RAS/damBreakPorousBaffle's path couples the pair, and p_rgh's
+# porousBafflePressure carries its jump. What is NOT carried across a cyclic is refused, each by name --
+# a solver without interface coefficients would run the pair as two walls and converge.
+BASE="$BB"
+PRGH="python3 -c \"import re; p='0/p_rgh'; t=open(p).read(); t=re.sub(r'(porous_half[01]\\s*\\{[^}]*?)length', r'\\1EXTRA length', t); open(p,'w').write(t)\""
+arm baffle_runs             runs    -                                  "" true
+arm baffle_plainCyclic      runs    -                                  "" "python3 -c \"import re; p='0/p_rgh'; t=open(p).read(); t=re.sub(r'(porous_half[01]\\s*\\{)[^}]*\\}', r'\\1 type cyclic; }', t); open(p,'w').write(t)\""
+arm baffle_relax            refused "sets \`relax\` or \`minJump\`"      "" "${PRGH/EXTRA/relax 0.5;}"
+arm baffle_minJump          refused "sets \`relax\` or \`minJump\`"      "" "${PRGH/EXTRA/minJump 0;}"
+arm baffle_massFlux         refused "MASS flux"                        "" "${PRGH/EXTRA/phi rhoPhi;}"
+arm baffle_DTable           refused "a Function1 other than"           "" "sed -i 's/^\\( *D  *\\)1000;/\\1table ((0 1000) (1 2000));/' 0/p_rgh"
+arm baffle_noLength         refused "needs \`D\`, \`I\` and \`length\`"   "" "sed -i '/^ *length  *0.15;/d' 0/p_rgh"
+arm baffle_noJump           refused "has no \`jump\` entry"             "" "sed -i '/^ *jump  *uniform 0;/d' 0/p_rgh"
+arm baffle_GAMG             refused "GAMG does not carry the interface" "" "python3 -c \"import re; p='system/fvSolution'; t=open(p).read(); t=re.sub(r'(\\n    p_rgh\\s*\\{\\s*solver\\s+)PCG;\\s*preconditioner\\s+DIC;', r'\\1GAMG; smoother DIC;', t); open(p,'w').write(t)\""
+arm baffle_momentumPredictor refused "the segregated vector solve"     "" "sed -i 's/momentumPredictor  *no;/momentumPredictor   yes;/; /^ *minIter  *1;/d' system/fvSolution"
+arm baffle_vanLeerV         refused "does not carry them onto the coupled patch" "" "sed -i 's/div(rhoPhi,U)  *Gauss linearUpwind grad(U);/div(rhoPhi,U)   Gauss vanLeerV;/' system/fvSchemes"
+arm baffle_compression      refused "\`interfaceCompression\` across the coupled patch" "" "sed -i 's/div(phirb,alpha)  *Gauss linear;/div(phirb,alpha) Gauss interfaceCompression;/' system/fvSchemes"
+BASE="$B"
+# ...and what writing that arm found: `Gauss interfaceCompression vanLeer 1` is ANOTHER scheme, which a
+# substring match read as plain vanLeer and ran
+arm compressionNew_refused  refused "limited scheme with a compression coefficient" "" "sed -i 's/div(phi,alpha)  *Gauss vanLeer;/div(phi,alpha)  Gauss interfaceCompression vanLeer 1;/' system/fvSchemes"
+
 if [ $HAVE_GPU = 1 ]; then
+    # the device loop is handed the mesh WITHOUT the coupling attached, and refuses the pair by name
+    BASE="$BB"
+    arm device_baffle       refused "porous_half0" "-device" true
+    BASE="$B"
     arm device_baseline     runs    -                        "-device" true
     arm device_nOuter2      refused "nOuterCorrectors 2"      "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' system/fvSolution"
     arm device_nNonOrth1    refused "nNonOrthogonalCorrectors 1" "-device" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"

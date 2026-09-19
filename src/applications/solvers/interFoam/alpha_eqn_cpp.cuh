@@ -115,9 +115,10 @@ inline scalar blendingCoeff(scalar ocCoeff) { return scalar(1) / (scalar(1) + oc
 // the tutorial set exercises them. `magU` and `shear` may be empty when the corresponding coefficient
 // is zero; they are required when it is not.
 //
-// THE BOUNDARY IS ZEROED on every non-coupled patch. brae has no coupled patch in a VoF case yet, so
-// every patch is zeroed today; the argument is here so that adding cyclic does not silently change the
-// interior behaviour.
+// THE BOUNDARY IS ZEROED on every non-coupled patch, and LEFT ALONE on a coupled one (FvPatch::coupled),
+// where the interface does pass through: RAS/damBreakPorousBaffle's cyclic baffle, with the free surface
+// staged across it, reads alpha 7.9e-03 out when the pair is zeroed like a wall
+// (tests/interfoam_baffle_vs_openfoam.sh).
 void compressionFlux(scalar                       cAlpha,
                      const SurfaceScalarField&    phi,
                      const std::vector<scalar>&   magSf,          // the mesh's full face array

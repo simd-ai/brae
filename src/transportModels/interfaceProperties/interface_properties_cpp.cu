@@ -228,6 +228,13 @@ void calculateK(const GeometricField<scalar>& alpha1,
                 "shipped OpenFOAM tutorial sets nAlphaSmoothCurvature at all, so there is no case to "
                 "validate the combination against.");
 
+        for (const FvPatch& q : patches)
+        {
+            if (q.coupled)
+                throw std::runtime_error(
+                    "brae interfaceProperties: nAlphaSmoothCurvature across the coupled patch '" + q.name
+                    + "' is not ported.");
+        }
         std::vector<scalar> a = alpha1.internal;
         smoothAlpha(a, c.nAlphaSmoothCurvature, m, g, patches);
 
@@ -296,6 +303,13 @@ void calculateK(const GeometricField<scalar>& alpha1,
         const std::vector<scalar> snA = alpha1.boundary[pi]->snGrad(alpha1.internal);
         for (label i = 0; i < q.size; ++i)
         {
+            if (q.coupled)
+            {
+                // ...and at a COUPLED patch it returns the two cells' gradients interpolated, as on an
+                // internal face; gaussGrad::correctBoundaryConditions leaves a coupled patch alone
+                gb[i] = coupledLinear(q, i, gradAlpha);
+                continue;
+            }
             const vector& n  = q.nf[i];
             const vector  gc = gradAlpha[q.faceCells[i]];
             const scalar  nn = n.x*gc.x + n.y*gc.y + n.z*gc.z;

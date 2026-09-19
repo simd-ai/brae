@@ -1,4 +1,6 @@
 #include "fvc.cuh"
+#include <stdexcept>
+#include <string>
 #include "cellLimitedGrad_cpp.cuh"   // the field's own cellLimited coefficient on snGrad's correction gradient
 
 namespace brae {
@@ -37,6 +39,13 @@ std::vector<vector> gaussGrad(
         // the cancellation of two large opposite terms, which is round-off (item 36c).
         if (fp.type == "empty") continue;
         if (pi >= boundary.size()) continue;
+        if (fp.coupled)
+        {
+            // a coupled face is interpolated from its two cells, whatever the patch array holds
+            for (label i = 0; i < fp.size; ++i)
+                grad[fp.faceCells[i]] += Sf[fp.start + i] * coupledLinear(fp, i, internal);
+            continue;
+        }
         for (label i = 0; i < fp.size && i < (label)boundary[pi].size(); ++i)
             grad[fp.faceCells[i]] += Sf[fp.start + i] * boundary[pi][i];
     }
@@ -78,6 +87,18 @@ std::vector<vector> gaussGrad(
     {
         const FvPatch& fp = patches[pi];
         if (fp.type == "empty") continue;   // emptyFvPatch::size() == 0: never in OpenFOAM's sum (item 36c)
+        if (fp.coupled)
+        {
+            // from the two cells, plus whatever the patch field puts between them: a jump cyclic's
+            // patchNeighbourField is the neighbour cell's value LESS the jump
+            const std::vector<scalar> pnf = p.boundary[pi]->patchNeighbourField(p.internal);
+            for (label i = 0; i < fp.size; ++i)
+            {
+                const scalar wf = fp.weights[i];
+                grad[fp.faceCells[i]] += Sf[fp.start + i] * (wf*p.internal[fp.faceCells[i]] + (scalar(1) - wf)*pnf[i]);
+            }
+            continue;
+        }
         const std::vector<scalar>& pv = p.boundary[pi]->value();
         for (label i = 0; i < fp.size; ++i)
             grad[fp.faceCells[i]] += Sf[fp.start + i] * pv[i];
@@ -119,6 +140,15 @@ std::vector<symmTensor> leastSquaresInvDd(
     const std::vector<scalar>& w     = g.weights();
     const std::vector<scalar>& magSf = g.magSf();
     const std::vector<vector>& C     = g.C();
+    for (const FvPatch& fp : patches)
+    {
+        if (fp.coupled)
+        {
+            throw std::runtime_error(
+                "brae: a leastSquares gradient on a mesh with the coupled patch '" + fp.name + "' is not "
+                "ported: leastSquaresVectors.C weights a coupled face by the cell on the other side.");
+        }
+    }
     std::vector<symmTensor> dd(nC, symmTensor{0, 0, 0, 0, 0, 0});
     for (label f = 0; f < nIf; ++f)
     {
@@ -298,6 +328,12 @@ std::vector<tensor> gaussGrad(
     {
         const FvPatch& fp = patches[pi];
         if (fp.type == "empty") continue;   // emptyFvPatch::size() == 0: never in OpenFOAM's sum (item 36c)
+        if (fp.coupled)
+        {
+            for (label i = 0; i < fp.size; ++i)
+                grad[fp.faceCells[i]] += outer(Sf[fp.start + i], coupledLinear(fp, i, internal));
+            continue;
+        }
         const std::vector<vector>& uv = boundary[pi];
         for (label i = 0; i < fp.size; ++i)
             grad[fp.faceCells[i]] += outer(Sf[fp.start + i], uv[i]);
@@ -353,6 +389,12 @@ SurfaceScalarField flux(
         // not skip them adds nothing. It used to store U_c . Sf, which on an extruded mesh is U_z*Sf_z
         // -- round-off, but round-off that reached div, adjustPhi and the continuity error (item 36d).
         if (fp.type == "empty") continue;
+        if (fp.coupled)
+        {
+            for (label i = 0; i < fp.size; ++i)
+                phi.boundary[pi][i] = dot(coupledLinear(fp, i, internal), Sf[fp.start + i]);
+            continue;
+        }
         for (label i = 0; i < fp.size; ++i)
             phi.boundary[pi][i] = dot(boundary[pi][i], Sf[fp.start + i]);
     }
@@ -417,6 +459,12 @@ SurfaceScalarField interpolate(
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         sf.boundary[pi].resize(patches[pi].size);
+        if (patches[pi].coupled)
+        {
+            for (label i = 0; i < patches[pi].size; ++i)
+                sf.boundary[pi][i] = coupledLinear(patches[pi], i, vol);
+            continue;
+        }
         for (label i = 0; i < patches[pi].size; ++i)
             sf.boundary[pi][i] = vol[patches[pi].faceCells[i]];
     }
@@ -449,6 +497,13 @@ SurfaceVectorField interpolate(
     out.boundary.resize(patches.size());
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
+        if (patches[pi].coupled)
+        {
+            out.boundary[pi].resize(static_cast<std::size_t>(patches[pi].size));
+            for (label i = 0; i < patches[pi].size; ++i)
+                out.boundary[pi][static_cast<std::size_t>(i)] = coupledLinear(patches[pi], i, cells);
+            continue;
+        }
         out.boundary[pi] = pi < boundary.size()
             ? boundary[pi]
             : std::vector<vector>(static_cast<std::size_t>(patches[pi].size), vector{0, 0, 0});
@@ -507,6 +562,17 @@ std::vector<std::vector<tensor>> gradUBoundary(
         const FvPatch& fp = patches[pi];
         gb[pi].assign(fp.size, tensor{0,0,0,0,0,0,0,0,0});
         if (fp.type == "empty") continue;   // empty patches contribute nothing to fvc operations
+        if (fp.coupled)
+        {
+            // gaussGrad::correctBoundaryConditions skips a coupled patch (gaussGrad.C, `if
+            // (!vsf.boundaryField()[patchi].coupled())`): the gradient's own cyclic patch field is left
+            // at what its evaluate() gives, the two cells' gradients interpolated
+            for (label i = 0; i < fp.size; ++i)
+            {
+                gb[pi][i] = coupledLinear(fp, i, gradUcell);
+            }
+            continue;
+        }
         // THE PATCH'S OWN snGrad(), as OF's gaussGrad::correctBoundaryConditions asks for it
         // (gaussGrad.C: `gGradbf[patchi] += n*(vsf.boundaryField()[patchi].snGrad() - (n & gGradbf))`).
         // This used to inline (U_b - U_c)*deltaCoeffs, which is the BASE class's formula and wrong on
@@ -550,6 +616,12 @@ std::vector<vector> div(
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         if (patches[pi].type == "empty") continue;   // empty patches excluded (OF fvc semantics)
+        if (patches[pi].coupled)
+        {
+            for (label i = 0; i < patches[pi].size; ++i)
+                d[patches[pi].faceCells[i]] += dot(Sf[patches[pi].start + i], coupledLinear(patches[pi], i, tCell));
+            continue;
+        }
         for (label i = 0; i < patches[pi].size; ++i)
             d[patches[pi].faceCells[i]] += dot(Sf[patches[pi].start + i], tBnd[pi][i]);
     }
@@ -581,17 +653,18 @@ SurfaceScalarField snGrad(
     // correctedSnGrad::fullGradCorrection -- linear interpolation of grad(vf) dotted with the correction
     // vectors, which are zero on boundary faces. grad(vf) through the FIELD's own gradSchemes entry
     // (correctedSnGrad.C:52-55), as the header says.
+    std::vector<vector> gradVf;
+    const bool limited = (limitCoeff > 0.0 && limitCoeff < 1.0);
     if (corrected)
     {
-        std::vector<vector>        gradVf   = leastSquares ? leastSquaresGrad(vf, m, g, patches)
-                                                           : gaussGrad(vf, m, g, patches);
+        gradVf = leastSquares ? leastSquaresGrad(vf, m, g, patches)
+                              : gaussGrad(vf, m, g, patches);
         if (cellLimitK > 0.0) cpu::cellLimitGrad(gradVf, vf, cellLimitK, m, g, patches);
         const std::vector<vector>& corrVecs = g.nonOrthCorrectionVectors();
         const std::vector<scalar>& w        = g.weights();
         // limitedSnGrad's per-face cap, against the ORTHOGONAL part of this same snGrad -- which is
         // sf.internal[f] as it stands here, before the correction is added. Same arithmetic as
         // fvm::laplacianCorrFlux's, on the same quantity; psi >= 1 or 0 means uncapped.
-        const bool limited = (limitCoeff > 0.0 && limitCoeff < 1.0);
         for (label f = 0; f < nIf; ++f)
         {
             const vector& go = gradVf[own[f]];
@@ -615,6 +688,32 @@ SurfaceScalarField snGrad(
         const std::vector<scalar> gIC = vf.boundary[pi]->gradientInternalCoeffs();
         const std::vector<scalar> gBC = vf.boundary[pi]->gradientBoundaryCoeffs();
         sf.boundary[pi].resize(fp.size);
+        if (fp.coupled)
+        {
+            // snGradScheme.C, the pvf.coupled() branch: pvf.snGrad(deltaCoeffs) = dc*(pnf - pif), with
+            // the SCHEME's deltaCoeffs -- nonOrthDeltaCoeffs under `corrected` -- and, there, the
+            // correction too: nonOrthCorrectionVectors is not zero on a coupled patch. pnf comes from
+            // the patch field, because a jump cyclic's is the neighbour cell LESS the jump.
+            const std::vector<scalar> pnf = vf.boundary[pi]->patchNeighbourField(vf.internal);
+            for (label i = 0; i < fp.size; ++i)
+            {
+                const scalar dcb = corrected ? fp.nonOrthDeltaCoeffs[i] : fp.deltaCoeffs[i];
+                scalar v = dcb * (pnf[i] - vf.internal[fp.faceCells[i]]);
+                if (corrected)
+                {
+                    scalar corr = dot(fp.nonOrthCorrectionVectors[i], coupledLinear(fp, i, gradVf));
+                    if (limited)
+                    {
+                        corr *= std::fmin(limitCoeff * std::fabs(v)
+                                              / ((1.0 - limitCoeff) * std::fabs(corr) + 1e-15),
+                                          1.0);
+                    }
+                    v += corr;
+                }
+                sf.boundary[pi][i] = v;
+            }
+            continue;
+        }
         for (label i = 0; i < fp.size; ++i)
             sf.boundary[pi][i] = gIC[i] * vf.internal[fp.faceCells[i]] + gBC[i];
     }

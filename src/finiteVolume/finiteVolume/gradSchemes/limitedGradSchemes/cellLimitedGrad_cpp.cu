@@ -1,3 +1,5 @@
+#include <stdexcept>
+#include <string>
 #include "cellLimitedGrad_cpp.cuh"
 
 #include <algorithm>
@@ -46,6 +48,17 @@ void limitPass(
     const std::vector<FvPatch>& patches,
     const std::vector<std::vector<std::vector<scalar>>>& patchValues)   // [patch][face][cmpt]
 {
+    for (const FvPatch& fp : patches)
+    {
+        if (fp.coupled)
+        {
+            // cellLimitedGrad.C takes a coupled face's range from patchNeighbourField, the cell on the
+            // other side, where an uncoupled one gives its patch value
+            throw std::runtime_error(
+                "brae: a cellLimited gradient on a mesh with the coupled patch '" + fp.name
+                + "' is not ported in the OF-mirror operators.");
+        }
+    }
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
     const std::vector<label>& nei = m.neighbour();

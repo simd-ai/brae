@@ -261,8 +261,11 @@ void ddtCorr(const DdtCorrInput&           in,
         {
             const bool havePatch = in.UOldBnd && pi < in.UOldBnd->size()
                                 && static_cast<std::size_t>(i) < (*in.UOldBnd)[pi].size();
-            const vector& uo = havePatch ? (*in.UOldBnd)[pi][static_cast<std::size_t>(i)]
-                                         : (*in.UOld)[q.faceCells[i]];
+            // ON A COUPLED PATCH fvc::dotInterpolate(Sf, U.oldTime()) is the two CELLS' old velocities
+            // interpolated, as on an internal face, and never the stored patch value
+            const vector uo = q.coupled ? coupledLinear(q, i, *in.UOld)
+                            : havePatch ? (*in.UOldBnd)[pi][static_cast<std::size_t>(i)]
+                                        : (*in.UOld)[q.faceCells[i]];
             const vector& S  = Sf[q.start + i];
             const scalar interpFlux = uo.x*S.x + uo.y*S.y + uo.z*S.z;
             const scalar pOld = in.UfOld
@@ -541,6 +544,16 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
             for (label i = 0; i < q.size; ++i)
             {
                 const std::size_t k = static_cast<std::size_t>(i);
+                if (q.coupled)
+                {
+                    // interpolate(rho*rAU) on a coupled face: the PRODUCT per cell, interpolated once
+                    const label P = q.faceCells[i];
+                    const label N = q.nbrFaceCells[k];
+                    const scalar rr = q.weights[k]*((*in.rho)[P]*rAU[P])
+                                    + (scalar(1) - q.weights[k])*((*in.rho)[N]*rAU[N]);
+                    phiHbyA.boundary[pi][k] += rr * corr.boundary[pi][k];
+                    continue;
+                }
                 phiHbyA.boundary[pi][k] += (*in.rhoBnd)[pi][k] * rAU[q.faceCells[i]] * corr.boundary[pi][k];
             }
         }
@@ -592,7 +605,11 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
         {
             const FvPatch& q = patches[pi];
             std::vector<scalar> rAUfb(static_cast<std::size_t>(q.size));
-            for (label i = 0; i < q.size; ++i) rAUfb[i] = rAU[q.faceCells[i]];
+            for (label i = 0; i < q.size; ++i)
+            {
+                // interpolate(rAU): the face cell's at an uncoupled patch, the two cells' at a coupled one
+                rAUfb[i] = q.coupled ? coupledLinear(q, i, rAU) : rAU[q.faceCells[i]];
+            }
             buoyancyFlux(in.stf->boundary[pi], (*in.ghfBnd)[pi], in.snGradRho->boundary[pi],
                          rAUfb, q.magSf, phigBnd[pi]);
             for (label i = 0; i < q.size; ++i) phiHbyA.boundary[pi][i] += phigBnd[pi][i];
@@ -632,6 +649,21 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
             const scalar SfU = dot(g.Sf()[q.start + i], ub[i]);
             sn[i] = (ph - SfU) / (q.magSf[i] * rf);
         }
+        // prghPermeableAlphaTotalPressure rebuilds its refValue and valueFraction INSIDE updateSnGrad,
+        // from rho, phi and U on the patch and gh at the face centres (...FvPatchScalarField.C:151-212).
+        // The phi it looks up is the field as it stands when constrainPressure runs -- the last
+        // corrector's, not phiHbyA.
+        if (p_rgh.boundary[pi]->isPrghPermeableAlphaTotalPressure())
+        {
+            if (!in.rhoBnd || !in.ghfBnd || in.rhoBnd->size() <= pi || in.ghfBnd->size() <= pi
+             || phi.boundary.size() <= pi)
+                throw std::runtime_error(
+                    "brae interFoam pEqn: p_rgh patch `" + q.name + "` is a prghPermeableAlphaTotalPressure, "
+                    "which needs rho's patch values, gh at the patch's face centres and phi on the patch "
+                    "(PressureStepInput::rhoBnd, ::ghfBnd).");
+            p_rgh.boundary[pi]->updatePermeableTotalPressure((*in.rhoBnd)[pi], phi.boundary[pi], ub,
+                                                             (*in.ghfBnd)[pi]);
+        }
         p_rgh.boundary[pi]->updateSnGrad(sn);
     }
 
@@ -639,6 +671,23 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
     {
         // the fvMatrix constructor's updateCoeffs -- see updatePressurePatchesFromVelocity
         updatePressurePatchesFromVelocity(p_rgh, U, in.rhoBnd, patches);
+        // porousBafflePressure::updateCoeffs, which fvMatrix's constructor runs at THIS assembly: the
+        // owner's jump from phi as it stands -- the last corrector's, not phiHbyA -- and from the
+        // stored patch values of the laminar nu and of rho; the other side takes the owner's
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (!patches[pi].owner || !p_rgh.boundary[pi]->isPorousBafflePressure()) continue;
+            if (!in.rhoBnd || !in.nuBnd || in.rhoBnd->size() <= pi || in.nuBnd->size() <= pi)
+                throw std::runtime_error(
+                    "brae interFoam pEqn: p_rgh patch `" + patches[pi].name + "` is a porousBafflePressure, "
+                    "which needs the patch values of rho and of the mixture's laminar nu "
+                    "(PressureStepInput::rhoBnd, ::nuBnd).");
+            const std::vector<scalar> jump = p_rgh.boundary[pi]->porousBaffleJump(
+                namedPatchFlux(p_rgh.boundary[pi]->fluxName(), pi, patches[pi].name, phi, in.rhoPhi),
+                (*in.nuBnd)[pi], (*in.rhoBnd)[pi]);
+            p_rgh.boundary[pi]->setOwnerJump(jump);
+            p_rgh.boundary[static_cast<std::size_t>(patches[pi].nbrPatch)]->setOwnerJump(jump);
+        }
         FvScalarMatrix pe = fvm::laplacian<scalar>(rAUfField, p_rgh, m, g, patches, sc.correctedLaplacian);
         if (sc.correctedLaplacian)
         {
@@ -715,7 +764,13 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
         }
         else if (finalInner ? sc.pcgDICFinal : sc.pcgDIC)
         {
-            sp = pcg(pe, p_rgh.internal, m, patches, tol, relTol, maxIter);
+            // a jump cyclic's jump enters the solve through the interface update, and only there
+            CoupledJumps jumps(patches.size(), nullptr);
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                jumps[pi] = p_rgh.boundary[pi]->coupledJump();
+            }
+            sp = pcg(pe, p_rgh.internal, m, patches, tol, relTol, maxIter, 0, &jumps);
         }
         else
         {
@@ -729,7 +784,9 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
 
         if (corr == sc.nNonOrthogonalCorrectors)
         {
-            const SurfaceScalarField pFlux = matrixFlux(pe, p_rgh.internal, m, patches);
+            // through the FIELD, so that a coupled patch's half is boundaryCoeffs*patchNeighbourField
+            // with the patch's own jump in it
+            const SurfaceScalarField pFlux = matrixFlux(pe, p_rgh, m, patches);
 
             // phi = phiHbyA - p_rghEqn.flux()
             phi = phiHbyA;
@@ -745,9 +802,22 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
             // what leaving this out cost on capillaryRise.
             for (std::size_t pi = 0; pi < patches.size() && pi < phi.boundary.size(); ++pi)
             {
-                // ...each the flux ITS OWN entry names -- see namedPatchFlux
-                U.boundary[pi]->updateFromFlux(
-                    namedPatchFlux(U.boundary[pi]->fluxName(), pi, patches[pi].name, phi, in.rhoPhi));
+                // ...each the flux ITS OWN entry names -- see namedPatchFlux. NOT U's on a corrector
+                // that starts with its patches still updated(): OpenFOAM's evaluate skips updateCoeffs
+                // there and blends with the assembly-time valueFraction -- see uPatchesUpdatedAtEntry.
+                // laminar/damBreakPermeable's wall flips faces from outflow to inflow in the first
+                // corrector of the first step; taking the new flux at once put the second corrector's
+                // initial residual 1.2e-03 out and U 1.5e-06 after one step, with HbyA and the internal
+                // phiHbyA of that corrector exact against tools/dumpInterFoam.
+                // A class whose updateCoeffs ENDS IN evaluate() is never left updated, and takes the new
+                // flux in every corrector: pressureInletOutletVelocity. With the skip applied to it as
+                // well, an atmosphere face turning from outflow to inflow at step 55 of the staged wet
+                // wall put U 6.9e-03 out in one step, from 3.5e-13 the step before.
+                if (!in.uPatchesUpdatedAtEntry || U.boundary[pi]->updateCoeffsEvaluates())
+                {
+                    U.boundary[pi]->updateFromFlux(
+                        namedPatchFlux(U.boundary[pi]->fluxName(), pi, patches[pi].name, phi, in.rhoPhi));
+                }
                 p_rgh.boundary[pi]->updateFromFlux(
                     namedPatchFlux(p_rgh.boundary[pi]->fluxName(), pi, patches[pi].name, phi, in.rhoPhi));
             }
@@ -764,7 +834,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
                 rB[pi].resize(static_cast<std::size_t>(q.size));
                 for (label i = 0; i < q.size; ++i)
                 {
-                    rB[pi][i]  = rAU[q.faceCells[i]];
+                    rB[pi][i]  = q.coupled ? coupledLinear(q, i, rAU) : rAU[q.faceCells[i]];
                     // (phig - p_rghEqn.flux()) on the boundary, the same expression as inside.
                     ffB[pi][i] = phigBnd[pi][i] - pFlux.boundary[pi][i];
                 }

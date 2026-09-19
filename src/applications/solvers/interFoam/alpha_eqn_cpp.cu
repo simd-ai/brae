@@ -148,12 +148,30 @@ void compressionFlux(scalar                       cAlpha,
 
     // "Do not compress interface at non-coupled boundary faces (inlets, outlets etc.)" --
     // alphaEqn.H:79-89. Interface compression is anti-diffusion; at an open boundary it sharpens an
-    // interface the boundary does not have, pulling alpha in through it. brae has no coupled patch in a
-    // VoF case yet, so every patch is zeroed; the loop is written per patch so that adding cyclic
-    // changes only the patches that are coupled.
+    // interface the boundary does not have, pulling alpha in through it. Every uncoupled patch is
+    // zeroed; a coupled one is not.
     phic.boundary.assign(patches.size(), std::vector<scalar>{});
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
-        phic.boundary[pi].assign(static_cast<std::size_t>(patches[pi].size), scalar(0));
+    {
+        const FvPatch& fp = patches[pi];
+        phic.boundary[pi].assign(static_cast<std::size_t>(fp.size), scalar(0));
+        if (!fp.coupled)
+        {
+            continue;
+        }
+        // A COUPLED patch is the one kind alphaEqn.H:79-89 leaves alone: the interface does pass
+        // through it, and phic there is what it is on an internal face
+        if (icAlpha > scalar(0) || scAlpha > scalar(0))
+        {
+            throw std::runtime_error(
+                "brae interFoam alphaEqn: icAlpha or scAlpha is set and patch `" + fp.name + "` is "
+                "coupled; the isotropic and shear compression terms are carried on internal faces only.");
+        }
+        for (std::size_t i = 0; i < phic.boundary[pi].size(); ++i)
+        {
+            phic.boundary[pi][i] = cAlpha * std::fabs(phi.boundary[pi][i] / fp.magSf[i]);
+        }
+    }
 }
 
 
@@ -200,6 +218,7 @@ void fluxWithScheme(const SurfaceScalarField&     psi,
     const std::vector<label>& nei = m.neighbour();
 
     std::vector<scalar> w;
+    std::vector<vector> gradVfLimited;          // vanLeer's, kept for the coupled faces below
     switch (scheme)
     {
         case AlphaFluxScheme::linear:
@@ -219,8 +238,8 @@ void fluxWithScheme(const SurfaceScalarField&     psi,
             // 44 shipped interFoam tutorials say `default Gauss linear`, and this takes that. The one
             // that says `cellLimited leastSquares 1` is not served by this path yet and would need the
             // scheme resolved at the call site, as rhoSimpleFoam does for grad(U).
-            const std::vector<vector> gradVf = fvc::gaussGrad(vf, m, g, patches);
-            w = limitedSchemes::vanLeerWeights(psi.internal, vf, gradVf, m, g);
+            gradVfLimited = fvc::gaussGrad(vf, m, g, patches);
+            w = limitedSchemes::vanLeerWeights(psi.internal, vf, gradVfLimited, m, g);
             break;
         }
     }
@@ -242,6 +261,45 @@ void fluxWithScheme(const SurfaceScalarField&     psi,
     {
         const std::vector<scalar>& vb = vf.boundary[pi]->value();
         out.boundary[pi].resize(vb.size());
+        if (patches[pi].coupled)
+        {
+            // THE SCHEME'S OWN WEIGHT ON A COUPLED FACE, as on an internal one (LimitedScheme.C,
+            // calcLimiter's bLim[patchi].coupled() branch): the limiter from the two cells, their
+            // gradients and the patch's delta, blended with the patch's central weight. An uncoupled
+            // patch takes limiter 1 and weight 1 -- the patch value, below.
+            const FvPatch& fp = patches[pi];
+            for (std::size_t i = 0; i < vb.size(); ++i)
+            {
+                const label P = fp.faceCells[i];
+                const label N = fp.nbrFaceCells[i];
+                const scalar pb = psi.boundary[pi][i];
+                const scalar up = (pb >= scalar(0)) ? scalar(1) : scalar(0);
+                scalar wf = fp.weights[i];
+                switch (scheme)
+                {
+                    case AlphaFluxScheme::linear:
+                        break;
+                    case AlphaFluxScheme::upwind:
+                        wf = up;
+                        break;
+                    case AlphaFluxScheme::interfaceCompression:
+                        throw std::runtime_error(
+                            "brae interFoam alphaEqn: `interfaceCompression` across the coupled patch `"
+                            + fp.name + "` is not ported.");
+                    case AlphaFluxScheme::vanLeer:
+                    default:
+                    {
+                        const scalar r = limitedSchemes::detail::rScalar(pb, vf.internal[P], vf.internal[N],
+                                                                 gradVfLimited[P], gradVfLimited[N], fp.delta[i]);
+                        const scalar lim = limitedSchemes::detail::vanLeerLimiter(r);
+                        wf = lim*fp.weights[i] + (scalar(1) - lim)*up;
+                        break;
+                    }
+                }
+                out.boundary[pi][i] = pb * (wf*vf.internal[P] + (scalar(1) - wf)*vf.internal[N]);
+            }
+            continue;
+        }
         for (std::size_t i = 0; i < vb.size(); ++i)
         {
             const scalar pb = (pi < psi.boundary.size() && i < psi.boundary[pi].size())
@@ -512,7 +570,14 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
         alpha2.internal.resize(static_cast<std::size_t>(nC));
         for (label c = 0; c < nC; ++c) alpha2.internal[c] = scalar(1) - alpha1.internal[c];
         for (const FvPatch& q : patches)
+        {
+            if (q.coupled)
+            {
+                alpha2.boundary.push_back(std::make_unique<CoupledCyclicPatchField<scalar>>(q));
+                continue;
+            }
             alpha2.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
+        }
         alpha2.evaluateBoundary();
 
         SurfaceScalarField un;

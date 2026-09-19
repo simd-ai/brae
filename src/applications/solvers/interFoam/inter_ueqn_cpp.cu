@@ -140,10 +140,18 @@ FvVectorMatrix assembleUEqn(
      || in.scheme == DivScheme::LUST)
     {
         const std::vector<tensor> gU = gradU(U, in, luGradK, m, g, patches);
-        const std::vector<vector> corr =
+        std::vector<vector> corr =
             (in.scheme == DivScheme::linearUpwindV)
                 ? limitedSchemes::linearUpwindVCorrection(*in.rhoPhi, U, gU, m, g)
                 : fvm::linearUpwindCorrection<vector, tensor>(*in.rhoPhi, gU, m, g);
+        for (const FvPatch& q : patches)
+        {
+            if (q.coupled && in.scheme != DivScheme::linearUpwind)
+                throw std::runtime_error(
+                    "brae interFoam UEqn: linearUpwindV and LUST carry no explicit correction across "
+                    "the coupled patch `" + q.name + "`; only linearUpwind's is ported.");
+        }
+        fvm::addLinearUpwindCorrectionCoupled<vector, tensor>(corr, *in.rhoPhiBnd, gU, g, patches);
         // LUST carries a QUARTER of linearUpwind's correction (LUST.H overrides both weights and
         // correction; taking one without the other is a different scheme).
         const scalar fac = (in.scheme == DivScheme::LUST) ? scalar(0.25) : scalar(1);

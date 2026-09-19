@@ -33,6 +33,24 @@ std::vector<label> lduOwnerStart(
     return ownStart;
 }
 
+namespace {
+
+void gaussSeidelSweeps(
+    const std::vector<label>& ownStart,
+    const std::vector<label>& nei,
+    const std::vector<scalar>& diag,
+    const std::vector<scalar>& upper,
+    const std::vector<scalar>& lower,
+    const std::vector<scalar>& b,
+    std::vector<scalar>& psi,
+    int nSweeps,
+    bool symmetric,
+    const FvScalarMatrix* M,
+    const std::vector<FvPatch>* patches,
+    const CoupledJumps* jumps);
+
+} // namespace
+
 void gaussSeidelSmoothFolded(
     const std::vector<label>& ownStart,
     const std::vector<label>& nei,
@@ -44,14 +62,55 @@ void gaussSeidelSmoothFolded(
     int nSweeps,
     bool symmetric)
 {
+    gaussSeidelSweeps(ownStart, nei, diag, upper, lower, b, psi, nSweeps, symmetric, nullptr, nullptr, nullptr);
+}
+
+void gaussSeidelSmoothFolded(
+    const std::vector<label>& ownStart,
+    const std::vector<label>& nei,
+    const std::vector<scalar>& diag,
+    const std::vector<scalar>& upper,
+    const std::vector<scalar>& lower,
+    const std::vector<scalar>& b,
+    std::vector<scalar>& psi,
+    int nSweeps,
+    bool symmetric,
+    const FvScalarMatrix& M,
+    const std::vector<FvPatch>& patches,
+    const CoupledJumps* jumps)
+{
+    gaussSeidelSweeps(ownStart, nei, diag, upper, lower, b, psi, nSweeps, symmetric, &M, &patches, jumps);
+}
+
+namespace {
+
+void gaussSeidelSweeps(
+    const std::vector<label>& ownStart,
+    const std::vector<label>& nei,
+    const std::vector<scalar>& diag,
+    const std::vector<scalar>& upper,
+    const std::vector<scalar>& lower,
+    const std::vector<scalar>& b,
+    std::vector<scalar>& psi,
+    int nSweeps,
+    bool symmetric,
+    const FvScalarMatrix* M,
+    const std::vector<FvPatch>* patches,
+    const CoupledJumps* jumps)
+{
     const label nCells = static_cast<label>(psi.size());
     std::vector<scalar> bPrime(static_cast<std::size_t>(nCells));
 
     for (int sweep = 0; sweep < nSweeps; ++sweep)
     {
-        // bPrime = source. The coupled-interface update OpenFOAM makes here has nothing to do in a
-        // serial run with no coupled patch, which is the only kind this host path sees.
+        // bPrime = source, and then the coupled interfaces, Jacobi: bPrime += coeff*pnf from psi as the
+        // sweep finds it (GaussSeidelSmoother.C, updateMatrixInterfaces with add = false, which the
+        // patch field turns into an addition)
         bPrime = b;
+        if (M && patches)
+        {
+            updateCoupledInterfaces(*M, *patches, psi, bPrime, scalar(1), true, jumps);
+        }
 
         for (label celli = 0; celli < nCells; ++celli)
         {
@@ -106,6 +165,8 @@ void gaussSeidelSmoothFolded(
     }
 }
 
+} // namespace
+
 SolverPerformance smoothSolver(
     const FvScalarMatrix& M,
     std::vector<scalar>& psi,
@@ -116,7 +177,8 @@ SolverPerformance smoothSolver(
     scalar relTol,
     int maxIter,
     int minIter,
-    int nSweeps)
+    int nSweeps,
+    const CoupledJumps* jumps)
 {
     const label nC = m.nCells();
     const label nIf = m.nInternalFaces();
@@ -132,7 +194,11 @@ SolverPerformance smoothSolver(
         {
             const std::size_t c = static_cast<std::size_t>(patches[pi].faceCells[i]);
             diagC[c] += M.internalCoeffs[pi][static_cast<std::size_t>(i)];
-            b[c] += M.boundaryCoeffs[pi][static_cast<std::size_t>(i)];
+            // a coupled patch's boundaryCoeffs are interface coefficients, not a source
+            if (!patches[pi].coupled)
+            {
+                b[c] += M.boundaryCoeffs[pi][static_cast<std::size_t>(i)];
+            }
         }
     }
 
@@ -144,7 +210,7 @@ SolverPerformance smoothSolver(
     // If nSweeps is negative do a fixed number of sweeps -- and report no residual at all.
     if (nSweeps < 0)
     {
-        gaussSeidelSmoothFolded(ownStart, nei, diagC, M.upper, M.lower, b, psi, -nSweeps, symmetric);
+        gaussSeidelSmoothFolded(ownStart, nei, diagC, M.upper, M.lower, b, psi, -nSweeps, symmetric, M, patches, jumps);
         perf.nIterations -= nSweeps;
         return perf;
     }
@@ -164,6 +230,8 @@ SolverPerformance smoothSolver(
             Ax[n] += M.lower[static_cast<std::size_t>(f)]*x[o];
             Ax[o] += M.upper[static_cast<std::size_t>(f)]*x[n];
         }
+        // the only operand is psi, the solution field: a jump applies
+        updateCoupledInterfaces(M, patches, x, Ax, scalar(-1), true, jumps);
     };
 
     std::vector<scalar> Apsi(static_cast<std::size_t>(nC));
@@ -175,6 +243,18 @@ SolverPerformance smoothSolver(
     {
         sumA[static_cast<std::size_t>(nei[static_cast<std::size_t>(f)])] += M.lower[static_cast<std::size_t>(f)];
         sumA[static_cast<std::size_t>(own[static_cast<std::size_t>(f)])] += M.upper[static_cast<std::size_t>(f)];
+    }
+    // lduMatrix::sumA: sumA[faceCell] -= interfaceBouCoeffs
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (!patches[pi].coupled)
+        {
+            continue;
+        }
+        for (label i = 0; i < patches[pi].size; ++i)
+        {
+            sumA[static_cast<std::size_t>(patches[pi].faceCells[i])] -= M.boundaryCoeffs[pi][static_cast<std::size_t>(i)];
+        }
     }
     scalar xRef = 0;
     for (label c = 0; c < nC; ++c)
@@ -210,6 +290,8 @@ SolverPerformance smoothSolver(
             rA[n] -= M.lower[static_cast<std::size_t>(f)]*psi[o];
             rA[o] -= M.upper[static_cast<std::size_t>(f)]*psi[n];
         }
+        // lduMatrix::residual: the interfaces ADD, coeff*pnf
+        updateCoupledInterfaces(M, patches, psi, rA, scalar(1), true, jumps);
         scalar s = 0;
         for (label c = 0; c < nC; ++c)
         {
@@ -241,7 +323,7 @@ SolverPerformance smoothSolver(
         // Smoothing loop
         do
         {
-            gaussSeidelSmoothFolded(ownStart, nei, diagC, M.upper, M.lower, b, psi, nSweeps, symmetric);
+            gaussSeidelSmoothFolded(ownStart, nei, diagC, M.upper, M.lower, b, psi, nSweeps, symmetric, M, patches, jumps);
             perf.finalResidual = residual();
         } while
         (

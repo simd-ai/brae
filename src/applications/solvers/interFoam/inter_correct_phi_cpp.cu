@@ -50,12 +50,15 @@ GeometricField<scalar> makePcorr(
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const FvPatch& p = patches[pi];
-        if (isCoupledInterfaceType(p.type))
+        if (isCoupledInterfaceType(p.type) && !p.coupled)
         {
             throw std::runtime_error(
-                std::string(WHO) + "patch `" + p.name + "` is " + p.type + ", and pcorr on a coupled "
-                "patch is not ported.");
+                std::string(WHO) + "patch `" + p.name + "` is " + p.type + " and its coupling is not "
+                "attached; pcorr across it is ported for an attached `cyclic` only.");
         }
+        // an attached cyclic falls to the constraint branch below and gets a PLAIN cyclic: pcorr's
+        // patch types come from the mesh patch (CorrectPhi.C:52-66), so even under a p_rgh that
+        // carries a jump there, pcorr carries none
         if (p_rgh.boundary[pi]->fixesValue())
         {
             pcorr.boundary[pi].reset(new FixedValuePatchField<scalar>(p, true, scalar(0), {}));

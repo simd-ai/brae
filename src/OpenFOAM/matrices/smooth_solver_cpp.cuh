@@ -76,6 +76,25 @@ void gaussSeidelSmoothFolded(
     int nSweeps,
     bool symmetric);
 
+// ...with COUPLED PATCHES. Each sweep starts bPrime = source and then ADDS coeff*pnf over every coupled
+// patch, pnf the cell on the other side AS IT STANDS at the start of the sweep (GaussSeidelSmoother.C:
+// "the parallel boundary is treated as an effective jacobi interface", with the change of sign its
+// comment explains). psi here is always the solution field, so a jump is always applied. `M` supplies
+// the interface coefficients; `diag` is still the folded diagonal.
+void gaussSeidelSmoothFolded(
+    const std::vector<label>& ownStart,
+    const std::vector<label>& nei,
+    const std::vector<scalar>& diag,
+    const std::vector<scalar>& upper,
+    const std::vector<scalar>& lower,
+    const std::vector<scalar>& b,
+    std::vector<scalar>& psi,
+    int nSweeps,
+    bool symmetric,
+    const FvScalarMatrix& M,
+    const std::vector<FvPatch>& patches,
+    const CoupledJumps* jumps);
+
 // smoothSolver::solve. Folds the boundary like fvMatrix::solve and solves A*psi = b in place.
 // `symmetric` selects symGaussSeidel (true) or GaussSeidel (false).
 SolverPerformance smoothSolver(
@@ -88,6 +107,7 @@ SolverPerformance smoothSolver(
     scalar relTol,
     int maxIter,
     int minIter = 0,
-    int nSweeps = 1);
+    int nSweeps = 1,
+    const CoupledJumps* jumps = nullptr);
 
 } // namespace brae
