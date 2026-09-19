@@ -85,7 +85,7 @@ stage()
     case "$profile" in
         laminar)
             sed -i 's/^simulationType .*/simulationType laminar;/' "$C/constant/turbulenceProperties" ;;
-        uniform|custom|nutAtmosphere)
+        uniform|custom|nutAtmosphere|sst)
             sed -i '/^density /d' "$C/constant/turbulenceProperties"
             sed -i 's/^\( *\)div(rhoPhi,k) .*/\1div(phi,k)      Gauss upwind;/; s/^\( *\)div(rhoPhi,epsilon) .*/\1div(phi,epsilon) Gauss upwind;/' \
                 "$C/system/fvSchemes"
@@ -103,6 +103,36 @@ s, n = re.subn(r'atmosphere\s*\{[^}]*\}', 'atmosphere\n    {\n        type      
 assert n == 1
 open(p, 'w').write(s)
 PYEOF
+    fi
+    # `sst`: the same tutorial made kOmegaSST -- omega from its epsilon file with omegaWallFunction, the
+    # closure's own div entries, the solver entry renamed, and fvSchemes' mandatory wallDist method.
+    # RAS/damBreak's nut atmosphere is `calculated`, which is what lets the DEVICE closure run it.
+    if [ "$profile" = sst ]; then
+        python3 - "$C" <<'SSTEOF' || { echo "FAIL: the sst profile was not staged"; return 1; }
+import os, re, sys
+d = sys.argv[1]
+q = os.path.join(d, 'constant/turbulenceProperties')
+t = open(q).read()
+t, n = re.subn(r'RASModel\s+\w+;', 'RASModel        kOmegaSST;', t)
+assert n == 1, 'no RASModel entry'
+open(q, 'w').write(t)
+q = os.path.join(d, 'system/fvSchemes')
+t = open(q).read()
+t, n = re.subn(r'div\(phi,epsilon\)\s+Gauss upwind;', 'div(phi,omega)  Gauss upwind;', t)
+assert n == 1, 'the epsilon div entry was not renamed'
+t = t.rstrip() + '\n\nwallDist\n{\n    method meshWave;\n}\n'
+open(q, 'w').write(t)
+q = os.path.join(d, 'system/fvSolution')
+t = open(q).read()
+t, n = re.subn(r'\(U\|k\|epsilon\)', '(U|k|omega)', t)
+assert n >= 1, 'no (U|k|epsilon) solver entry'
+open(q, 'w').write(t)
+e = open(os.path.join(d, '0/epsilon')).read()
+e = e.replace('epsilonWallFunction', 'omegaWallFunction')
+e = re.sub(r'object\s+epsilon;', 'object      omega;', e)
+e = e.replace('[0 2 -3 0 0 0 0]', '[0 0 -1 0 0 0 0]')
+open(os.path.join(d, '0/omega'), 'w').write(e)
+SSTEOF
     fi
     if [ "$profile" = custom ]; then
         python3 - "$C" <<'PYEOF' || { echo "FAIL: the custom profile was not staged"; return 1; }
@@ -166,7 +196,7 @@ PYEOF
 }
 
 rc=0
-for p in laminar variable uniform custom nutAtmosphere; do
+for p in laminar variable uniform custom nutAtmosphere sst; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_ras_dambreak_vs_openfoam: staging failed"; exit 1; }
@@ -180,6 +210,8 @@ done
        custom uniform "$W/laminar/$END" "$W/uniform/$END" || rc=1
 "$BIN" "$W/nutAtmosphere" "$W/nutAtmosphere/0" "$W/nutAtmosphere/$END" "$STEPS" "$W/nutAtmosphere/log.interFoam" \
        nutAtmosphere uniform "$W/laminar/$END" "$W/uniform/$END" || rc=1
+"$BIN" "$W/sst" "$W/sst/0" "$W/sst/$END" "$STEPS" "$W/sst/log.interFoam" \
+       sst uniform "$W/laminar/$END" "$W/uniform/$END" || rc=1
 
 echo "interfoam_ras_dambreak_vs_openfoam: rc $rc"
 exit $rc

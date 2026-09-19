@@ -9,7 +9,10 @@
 // THE CONTROL is OpenFOAM's own answer with `simulationType laminar` at the same instant: if the
 // turbulent oracle sat on top of it, a brae that ignored the model would pass every field bound.
 //
-// THE DEVICE LOOP MUST REFUSE the case, naming kOmegaSST: it carries kEpsilon's device twin only.
+// THE DEVICE LOOP RUNS kOmegaSST NOW (gated on RAS/damBreak made kOmegaSST, tests/
+// interfoam_ras_dambreak_vs_openfoam.sh `sst`) and must still refuse THIS case, naming the one thing the
+// device closure does not carry: the outlet's inletOutlet nut, which correctBoundaryConditions evaluates
+// against the flux.
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -279,10 +282,15 @@ int main(
         }
         catch (const std::exception& e)
         {
-            named = std::string(e.what()).find("kOmegaSST") != std::string::npos;
+            const std::string w = e.what();
+            // either of the two things this case asks for that the device does not carry: nut's
+            // flux-conditional outlet, and the GAMG smoother the case names (the profiles differ in
+            // which comes first)
+            named = (w.find("inletOutlet") != std::string::npos && w.find("nut") != std::string::npos)
+                 || w.find("smoother") != std::string::npos;
             std::printf("  device: %s\n", e.what());
         }
-        check("the device loop refuses the case and names kOmegaSST", named);
+        check("the device loop refuses the case, naming the inletOutlet nut or the GAMG smoother", named);
     }
 
     std::printf("test_inter_waterchannel_vs_openfoam: %d failures\n", failures);

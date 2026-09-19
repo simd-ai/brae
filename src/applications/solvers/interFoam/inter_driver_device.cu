@@ -85,13 +85,9 @@ RunReport runInterFoamDevice(
     InterFields f = buildInterFields(caseDir, startDir, m, g, fvp);
     // FIRST among the device refusals: the model is what a reader of the message has to change, and
     // every refusal below is about the loop around it
-    if (f.turbulence.on && f.turbulence.model == cpu::interFoam::InterRasModel::KOmegaSST)
-        throw std::runtime_error(
-            "brae interFoam (device): the case is RAS kOmegaSST. The device loop runs kEpsilon's device "
-            "twin (device_inter_turbulence.cuh) and nothing else; kOmegaSST is ported on the host "
-            "(inter_turbulence_cpp.cu around kOmegaSST_cpp.cu) and gated there against OpenFOAM on "
-            "RAS/waterChannel. Refused rather than run under kEpsilon's name or laminar.");
-
+    // (kOmegaSST runs on this loop now: device_inter_turbulence.cu's SST branch hands the closure
+    // rhoSimpleFoam gates what the host's SST branch hands its reference. Gated against OpenFOAM on
+    // RAS/waterChannel.)
     if (f.turbulence.on && f.turbulence.model == cpu::interFoam::InterRasModel::KEqnLES)
         throw std::runtime_error(
             "brae interFoam (device): the case is LES kEqn. The device loop runs kEpsilon's device twin "
@@ -857,7 +853,9 @@ RunReport runInterFoamDevice(
             ti.nu = &dStepNu;
             ti.nuBnd = &dStepNuBnd;
             ti.deltaT = rep.deltaT;
-            ti.epsilonLog = &rep.epsilonSolves;
+            // the second field's log is omega's under kOmegaSST, as the host driver keeps it
+            ti.epsilonLog = (f.turbulence.model == cpu::interFoam::InterRasModel::KOmegaSST)
+                          ? &rep.omegaSolves : &rep.epsilonSolves;
             ti.kLog = &rep.kSolves;
             deviceCorrectInterTurbulence(dTurb, f.turbulence, ti, dm, dbU);
         }
@@ -891,6 +889,8 @@ RunReport runInterFoamDevice(
             ti.nu = &f.nu;
             ti.nuBnd = &f.nuBnd;
             ti.deltaT = rep.deltaT;
+            // the host closure keeps the two second fields in separate logs and fills the model's own
+            ti.omegaLog = &rep.omegaSolves;
             ti.epsilonLog = &rep.epsilonSolves;
             ti.kLog = &rep.kSolves;
             correctInterTurbulence(f.turbulence, ti, m, g, fvp);

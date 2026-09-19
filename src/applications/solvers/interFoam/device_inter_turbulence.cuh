@@ -37,6 +37,7 @@
 #include "inter_solve_record.cuh"
 #include "inter_turbulence_cpp.cuh"
 #include "kEpsilon.cuh"
+#include "kOmegaSST.cuh"
 #include "primitive_mesh.cuh"
 #include <vector>
 
@@ -69,6 +70,14 @@ struct DeviceInterTurbulence
     // rho = 1 for the uniform lineage, cells and boundary faces
     DeviceBuffer<scalar> onesCell;
     DeviceBuffer<scalar> onesBnd;
+
+    // kOmegaSST's own, when the case names it: the CELL wall distance F1 and F2 read (wallDist::New's y,
+    // not the wall functions' near-wall face distance), the faces where F1 is 1 by construction, and
+    // which nut faces the closure's field assignment fills. The second field lives in InterTurbulence::
+    // omega there, not ::epsilon, and `epsilon` below carries it.
+    DeviceBuffer<scalar> yCell;
+    DeviceBuffer<label>  f1OneMask;
+    DeviceBuffer<label>  nutCalcMask;
 
     // per-step scratch
     DeviceBuffer<scalar> nuWall;

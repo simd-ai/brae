@@ -113,6 +113,10 @@ int main(
     // nutAtmosphere: the uniform lineage with the atmosphere's nut an inletOutlet, which
     // correctBoundaryConditions evaluates after the model's field assignment
     const bool nutAtmosphere = (profile == "nutAtmosphere");
+    // `sst`: RAS/damBreak made kOmegaSST, whose second field is omega and whose closure runs on the
+    // device through device_inter_turbulence's SST branch
+    const bool sst = (profile == "sst");
+    const char* secondName = sst ? "omega" : "epsilon";
     std::printf("  profile: %s\n",
                 nutAtmosphere ? "nutAtmosphere -- uniform, the atmosphere's nut an inletOutlet"
               : custom ? "custom -- its own coefficients, relaxation 0.7, and minIter forcing each sweep"
@@ -181,10 +185,10 @@ int main(
     // the solver logs: p_rgh and alpha as on the laminar case, and the closure's two
     const std::vector<LinearSolveRecord> ofP = brae::gatecheck::readOfPressureSolves(logPath);
     const std::vector<LinearSolveRecord> ofA = brae::gatecheck::readOfSolves(logPath, fin.alphaName);
-    const std::vector<LinearSolveRecord> ofE = brae::gatecheck::readOfSolves(logPath, "epsilon");
+    const std::vector<LinearSolveRecord> ofE = brae::gatecheck::readOfSolves(logPath, secondName);
     const std::vector<LinearSolveRecord> ofK = brae::gatecheck::readOfSolves(logPath, "k");
     // the FAIL-PROOF: nothing in compareSolves can pass on an empty parse
-    check("OpenFOAM's log gave one epsilon and one k solve per step",
+    check("OpenFOAM's log gave one solve of the closure's second field and one k solve per step",
           ofE.size() == static_cast<std::size_t>(nSteps) && ofK.size() == ofE.size());
     failures += brae::gatecheck::compareSolves("host", r.pSolves, ofP, nSteps);
     failures += brae::gatecheck::compareSolves("host", r.alphaSolves, ofA, nSteps, fin.alphaName.c_str(),
@@ -194,8 +198,8 @@ int main(
     // the solver: it is step one's k solve, which ends at 4.140e-10, and the two codes are 3.6e-16
     // apart there -- a few units in the last place of a normalised residual. PBiCGStab in the same
     // seat takes 1 of 5 iteration counts and leaves final residuals 100% out.
-    failures += brae::gatecheck::compareSolves("host", r.epsilonSolves, ofE, nSteps, "epsilon",
-                                               scalar(1e-10), scalar(1e-10), scalar(1e-5));
+    failures += brae::gatecheck::compareSolves("host", sst ? r.omegaSolves : r.epsilonSolves, ofE, nSteps,
+                                               secondName, scalar(1e-10), scalar(1e-10), scalar(1e-5));
     failures += brae::gatecheck::compareSolves("host", r.kSolves, ofK, nSteps, "k",
                                                scalar(1e-10), scalar(1e-10), scalar(1e-5));
 
@@ -204,14 +208,16 @@ int main(
     failures += brae::gatecheck::nonFinite("brae p_rgh", fin.p_rgh.internal);
     failures += brae::gatecheck::nonFinite("brae U", fin.U.internal);
     failures += brae::gatecheck::nonFinite("brae k", fin.turbulence.k.internal);
-    failures += brae::gatecheck::nonFinite("brae epsilon", fin.turbulence.epsilon.internal);
+    const std::vector<scalar>& braeSecond = sst ? fin.turbulence.omega.internal
+                                                : fin.turbulence.epsilon.internal;
+    failures += brae::gatecheck::nonFinite("brae second field", braeSecond);
     failures += brae::gatecheck::nonFinite("brae nut", fin.turbulence.nut.internal);
 
     const std::vector<scalar> ofAlpha = readCells(ofDir + "/alpha.water");
     const std::vector<scalar> ofPrgh = readCells(ofDir + "/p_rgh");
     const std::vector<vector> ofU = readVectorCells(ofDir + "/U");
     const std::vector<scalar> ofKf = readCells(ofDir + "/k");
-    const std::vector<scalar> ofEf = readCells(ofDir + "/epsilon");
+    const std::vector<scalar> ofEf = readCells(ofDir + "/" + std::string(secondName));
     const std::vector<scalar> ofNut = readCells(ofDir + "/nut");
     check("OpenFOAM's fields have one value per cell",
           ofAlpha.size() == static_cast<std::size_t>(nC) && ofKf.size() == ofAlpha.size()
@@ -221,13 +227,14 @@ int main(
     const Diff dP = compare(fin.p_rgh.internal, ofPrgh);
     const Diff dU = compare(fin.U.internal, ofU);
     const Diff dK = compare(fin.turbulence.k.internal, ofKf);
-    const Diff dE = compare(fin.turbulence.epsilon.internal, ofEf);
+    const Diff dE = compare(braeSecond, ofEf);
     const Diff dN = compare(fin.turbulence.nut.internal, ofNut);
     std::printf("  alpha:   Linf %.4e\n", (double)dA.linf);
     std::printf("  p_rgh:   relative %.4e   (|p_rgh| up to %.4e)\n", (double)dP.rel(), (double)dP.refMax);
     std::printf("  U:       relative %.4e   (|U| up to %.4e)\n", (double)dU.rel(), (double)dU.refMax);
     std::printf("  k:       relative %.4e   (k up to %.4e)\n", (double)dK.rel(), (double)dK.refMax);
-    std::printf("  epsilon: relative %.4e   (epsilon up to %.4e)\n", (double)dE.rel(), (double)dE.refMax);
+    std::printf("  %-8s relative %.4e   (%s up to %.4e)\n", (std::string(secondName) + ":").c_str(),
+                (double)dE.rel(), secondName, (double)dE.refMax);
     std::printf("  nut:     relative %.4e   (nut up to %.4e)\n", (double)dN.rel(), (double)dN.refMax);
 
     // MEASURED, worst of the three profiles: alpha 4.9e-13, p_rgh 7.1e-13, U 1.3e-11, k 2.8e-13,
@@ -238,7 +245,7 @@ int main(
     check("p_rgh agrees with OpenFOAM's relatively", dP.rel() < scalar(2e-11));
     check("U agrees with OpenFOAM's relatively", dU.rel() < scalar(5e-10));
     check("k agrees with OpenFOAM's relatively", dK.rel() < scalar(1e-11));
-    check("epsilon agrees with OpenFOAM's relatively", dE.rel() < scalar(1e-11));
+    check("the closure's second field agrees with OpenFOAM's relatively", dE.rel() < scalar(1e-11));
     check("nut agrees with OpenFOAM's relatively", dN.rel() < scalar(2e-11));
 
     // THE CONTROLS, on the oracle
@@ -301,7 +308,9 @@ int main(
         failures += brae::gatecheck::nonFinite("device p_rgh", dev.p_rgh.internal);
         failures += brae::gatecheck::nonFinite("device U", dev.U.internal);
         failures += brae::gatecheck::nonFinite("device k", dev.turbulence.k.internal);
-        failures += brae::gatecheck::nonFinite("device epsilon", dev.turbulence.epsilon.internal);
+        const std::vector<scalar>& devSecond = sst ? dev.turbulence.omega.internal
+                                                   : dev.turbulence.epsilon.internal;
+        failures += brae::gatecheck::nonFinite("device second field", devSecond);
         failures += brae::gatecheck::nonFinite("device nut", dev.turbulence.nut.internal);
         failures += brae::gatecheck::compareSolves("device", rd.pSolves, ofP, nSteps);
         failures += brae::gatecheck::compareSolves("device", rd.alphaSolves, ofA, nSteps,
@@ -310,18 +319,19 @@ int main(
         // THE CONTROL IS ON `custom`: with the wall laplacian coefficient left out of relax() -- what
         // the device closure did until this gate -- epsilon's fields do not move (9.8e-14) and its
         // initial residuals are 1.1e-04 out in every step. 1e-10 is six orders inside that.
-        failures += brae::gatecheck::compareSolves("device", rd.epsilonSolves, ofE, nSteps, "epsilon",
-                                                   scalar(1e-10), scalar(1e-10), scalar(1e-5));
+        failures += brae::gatecheck::compareSolves("device", sst ? rd.omegaSolves : rd.epsilonSolves, ofE,
+                                                   nSteps, secondName, scalar(1e-10), scalar(1e-10),
+                                                   scalar(1e-5));
         failures += brae::gatecheck::compareSolves("device", rd.kSolves, ofK, nSteps, "k",
                                                    scalar(1e-10), scalar(1e-10), scalar(1e-5));
         const Diff eA = compare(dev.alpha1.internal, ofAlpha);
         const Diff eP = compare(dev.p_rgh.internal, ofPrgh);
         const Diff eU = compare(dev.U.internal, ofU);
         const Diff eK = compare(dev.turbulence.k.internal, ofKf);
-        const Diff eE = compare(dev.turbulence.epsilon.internal, ofEf);
+        const Diff eE = compare(devSecond, ofEf);
         const Diff eN = compare(dev.turbulence.nut.internal, ofNut);
-        std::printf("  DEVICE vs OpenFOAM: alpha %.4e, p_rgh %.4e, U %.4e, k %.4e, epsilon %.4e, nut %.4e\n",
-                    (double)eA.linf, (double)eP.rel(), (double)eU.rel(), (double)eK.rel(),
+        std::printf("  DEVICE vs OpenFOAM: alpha %.4e, p_rgh %.4e, U %.4e, k %.4e, %s %.4e, nut %.4e\n",
+                    (double)eA.linf, (double)eP.rel(), (double)eU.rel(), (double)eK.rel(), secondName,
                     (double)eE.rel(), (double)eN.rel());
         // THE HOST'S BOUNDS. MEASURED, worst of the three profiles: alpha 4.9e-13, p_rgh 7.1e-13,
         // U 3.3e-11, k 2.8e-13, epsilon 2.5e-13, nut 4.8e-13. Each device-side decision was broken in
@@ -331,9 +341,16 @@ int main(
         check("the DEVICE's alpha agrees with OpenFOAM's to the host's bound", eA.linf < scalar(2e-11));
         check("...its p_rgh", eP.rel() < scalar(2e-11));
         check("...its U", eU.rel() < scalar(5e-10));
-        check("...its k", eK.rel() < scalar(1e-11));
-        check("...its epsilon", eE.rel() < scalar(1e-11));
-        check("...and its nut", eN.rel() < scalar(2e-11));
+        // `sst` HAS ITS OWN BOUNDS, and the reason is the device LOOP, not the closure. MEASURED with
+        // every solve tightened on both codes -- which does not move them -- device against OpenFOAM:
+        // k 5.2e-12, omega 3.1e-11, nut 1.9e-10, U 5.5e-11, where the HOST loop on the same case is
+        // 6.7e-15, 1.9e-15, 1.3e-13 and 1.1e-13 and the device closure is the host closure's to 5e-15 /
+        // 8e-16 / 3.7e-14 (the arm below). The device loop's U is about 5e-11 from OpenFOAM on the
+        // kEpsilon profiles too; under kOmegaSST nut carries it through k/omega and F2, which is the
+        // 1.9e-10. Bounds at about 30x the measurement.
+        check("...its k", eK.rel() < (sst ? scalar(2e-10) : scalar(1e-11)));
+        check("...its second closure field", eE.rel() < (sst ? scalar(1e-9) : scalar(1e-11)));
+        check("...and its nut", eN.rel() < (sst ? scalar(5e-9) : scalar(2e-11)));
 
         // THE SAME DEVICE LOOP WITH THE HOST CLOSURE IN THE DEVICE ONE'S PLACE -- the `_cpp` reference
         // as the in-repo oracle, with everything around it held fixed. Against OpenFOAM a disagreement
@@ -344,27 +361,36 @@ int main(
         unsetenv("BRAE_INTER_HOST_CLOSURE");
         check("the mixed run took the HOST closure", !rm.turbulenceOnDevice && rm.steps == nSteps);
         failures += brae::gatecheck::nonFinite("mixed k", mix.turbulence.k.internal);
-        failures += brae::gatecheck::nonFinite("mixed epsilon", mix.turbulence.epsilon.internal);
+        const std::vector<scalar>& mixSecond = sst ? mix.turbulence.omega.internal
+                                                   : mix.turbulence.epsilon.internal;
+        failures += brae::gatecheck::nonFinite("mixed second field", mixSecond);
         failures += brae::gatecheck::nonFinite("mixed nut", mix.turbulence.nut.internal);
         failures += brae::gatecheck::nonFinite("mixed U", mix.U.internal);
         const Diff mU = compare(dev.U.internal, mix.U.internal);
         const Diff mK = compare(dev.turbulence.k.internal, mix.turbulence.k.internal);
-        const Diff mE = compare(dev.turbulence.epsilon.internal, mix.turbulence.epsilon.internal);
+        const Diff mE = compare(devSecond, mixSecond);
         const Diff mN = compare(dev.turbulence.nut.internal, mix.turbulence.nut.internal);
-        std::printf("  DEVICE closure vs HOST closure, same device loop: U %.4e, k %.4e, epsilon %.4e, "
-                    "nut %.4e\n", (double)mU.rel(), (double)mK.rel(), (double)mE.rel(), (double)mN.rel());
+        std::printf("  DEVICE closure vs HOST closure, same device loop: U %.4e, k %.4e, %s %.4e, "
+                    "nut %.4e\n", (double)mU.rel(), (double)mK.rel(), secondName, (double)mE.rel(),
+                    (double)mN.rel());
         // MEASURED, worst of the three profiles: U 3.3e-14, k 1.1e-15, epsilon 1.6e-15, nut 1.9e-15
         // -- round-off between two implementations that share no kernel. Bounds at about 30x.
-        check("the device closure agrees with the host closure in U", mU.rel() < scalar(1e-12));
-        check("...in k", mK.rel() < scalar(5e-14));
-        check("...in epsilon", mE.rel() < scalar(5e-14));
-        check("...and in nut", mN.rel() < scalar(5e-14));
+        // THE MODULE'S OWN CLAIM: the device closure is the host reference's. MEASURED under `sst` at the
+        // case's own tolerances: U 8.6e-13, k 1.2e-13, omega 6.6e-14, nut 9.5e-13, and with every solve
+        // tightened 1.4e-13 / 5.3e-15 / 7.8e-16 / 3.7e-14 -- round-off between two implementations that
+        // share no kernel. kEpsilon's are 3.3e-14 / 1.1e-15 / 1.6e-15 / 1.9e-15. Bounds at about 30x.
+        check("the device closure agrees with the host closure in U", mU.rel() < (sst ? scalar(3e-11) : scalar(1e-12)));
+        check("...in k", mK.rel() < (sst ? scalar(5e-12) : scalar(5e-14)));
+        check("...in the second closure field", mE.rel() < (sst ? scalar(5e-12) : scalar(5e-14)));
+        check("...and in nut", mN.rel() < (sst ? scalar(5e-11) : scalar(5e-14)));
         // the two closures took the same sweeps, solve for solve
         std::size_t sameE = 0;
         std::size_t sameK = 0;
-        for (std::size_t q = 0; q < rd.epsilonSolves.size() && q < rm.epsilonSolves.size(); ++q)
+        const std::vector<LinearSolveRecord>& devSecondSolves = sst ? rd.omegaSolves : rd.epsilonSolves;
+        const std::vector<LinearSolveRecord>& mixSecondSolves = sst ? rm.omegaSolves : rm.epsilonSolves;
+        for (std::size_t q = 0; q < devSecondSolves.size() && q < mixSecondSolves.size(); ++q)
         {
-            if (rd.epsilonSolves[q].nIterations == rm.epsilonSolves[q].nIterations)
+            if (devSecondSolves[q].nIterations == mixSecondSolves[q].nIterations)
             {
                 ++sameE;
             }

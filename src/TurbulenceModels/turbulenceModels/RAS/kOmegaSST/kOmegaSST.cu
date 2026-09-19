@@ -622,7 +622,7 @@ void correct(
                                    // constraint value is the current field.
                                    wall.nWF > 0 ? &wall.isWallCell : nullptr,
                                    wall.nWF > 0 ? &omega0 : nullptr,
-                                   sv, res.omega, std::string(), in.gsOmega);
+                                   sv, res.omega, std::string(), in.gsOmega, &res.omegaPerf);
         // Foam::bound(omega_, omegaMin_) -- the mirror's area-weighted form, not a clamp.
         kEpsilonRAS::boundField(omega, dm, dbOmega, in.co.omegaMin, "omega");
         if (std::getenv("BRAE_SST_DEBUG"))
@@ -695,7 +695,7 @@ void correct(
         // equation.
         turbulence::solveScalarEqn(M, k, dm, in.relaxEquationK, in.relaxK,
                                    in.fvoKMask, in.fvoKVal, nullptr, nullptr,
-                                   sv, res.k, std::string(), in.gsK);
+                                   sv, res.k, std::string(), in.gsK, &res.kPerf);
         kEpsilonRAS::boundField(k, dm, dbK, in.co.kMin, "k");
         if (std::getenv("BRAE_SST_DEBUG"))
             std::printf("  [sst] k     solve: initialResidual %.6g\n", (double)res.k);
