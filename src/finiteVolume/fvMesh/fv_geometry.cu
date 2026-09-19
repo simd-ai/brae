@@ -187,6 +187,17 @@ void FvGeometry::applyAreaScaling(const std::vector<std::pair<label, scalar>>& f
     areaScaled_ = true;
 }
 
+void FvGeometry::setFaceArea(label f, const vector& Sf)
+{
+    Sf_[f] = Sf;
+    magSf_[f] = mag(Sf);
+}
+
+void FvGeometry::updateCellCentresAndVols(const PrimitiveMesh& m)
+{
+    makeCellCentresAndVols(m);
+}
+
 void FvGeometry::build(const PrimitiveMesh& m)
 {
     buildFaceGeometry(m);

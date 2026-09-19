@@ -2017,7 +2017,12 @@ COMPONENTS = {
                   "min(lambda,...) is defensive rather than load-bearing (removing it gives a "
                   "bit-identical field, because both accumulators are built from lambda), and in one "
                   "dimension the first pass is already the fixed point -- nLimiterIter only bites where "
-                  "a cell's faces are limited by different neighbours at once."),
+                  "a cell's faces are limited by different neighbours at once. AND ACROSS A COUPLED PATCH "
+                  "the limiter is synced by syncTools::syncFaceList (:566), which exchanges across "
+                  "processor and cyclicPolyPatch ONLY: an AMI pair keeps each side's own limiter, so the "
+                  "limited flux across a cyclicACMI is not equal and opposite. brae synced it; measured "
+                  "on damBreakLeakage's opening step, the receiving side's alpha flux 75% of the giving "
+                  "side's in OpenFOAM (FvPatch::ami, interFoam_cyclicACMI)."),
         dict(name="interFoam_CMULES", of_symbol="MULES::correct",
              of_file="src/finiteVolume/fvMatrices/solvers/MULES/CMULESTemplates.C",
              classification="SHARED_NUMERICAL", status="REIMPLEMENT",
@@ -2695,9 +2700,10 @@ COMPONENTS = {
                         "class's 1.1e-04; grad(U)'s wedge value unrotated 2.9e-04. tests/test_wedge_patch.cu "
                         "holds the geometry. NOT DISCRIMINATED: grad(alpha)'s wedge value rotated for the "
                         "interface normal -- provably invisible, the normal correction removes the one component "
-                        "nHatf keeps. OPEN: symmetryPlane and symmetry give the gradient field THEIR constraint "
-                        "type the same way, and fvc::gradUBoundary does not transform for them yet; no gated case "
-                        "reaches it.",
+                        "nHatf keeps. symmetryPlane and symmetry give the gradient field THEIR constraint type "
+                        "the same way: fvc::gradUBoundary mirror-averages the cell gradient there, gated by "
+                        "tests/interfoam_leakage_vs_openfoam.sh (HbyA 3% out beside its symmetry patches "
+                        "without it; U 7.8e-02 with it broken).",
              note="The host WedgePatchField overrode evaluate() alone: a vector wedge assembled with the "
                   "zeroGradient coefficients, where transformFvPatchField (.C:95-136) has valueInternalCoeffs 1 - "
                   "d, gradientInternalCoeffs -deltaCoeffs*d, the boundary coefficients from snGrad and the patch "
@@ -2756,6 +2762,54 @@ COMPONENTS = {
                   "reconstruction with the coupled rAUf, pcorr a plain cyclic). ALSO FOUND: `Gauss "
                   "interfaceCompression vanLeer 1`, interfaceCompression.H's limited scheme, was read as plain "
                   "vanLeer by a substring match and ran; refused. HOST ONLY SO FAR."),
+        dict(name="interFoam_cyclicACMI", of_symbol="cyclicACMIPolyPatch",
+             of_file="src/meshTools/AMIInterpolation/patches/cyclicACMI/cyclicACMIPolyPatch/cyclicACMIPolyPatch.C",
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/finiteVolume/fvMesh/fvPatches/constraint/cyclicACMI/cyclic_acmi_cpp.cu",
+             validation="tests/interfoam_leakage_vs_openfoam.sh, real OpenFOAM on RAS/damBreakLeakage as its "
+                        "Allrun meshes it (2268 cells; a createBaffles cyclicACMI pair of 13 faces whose "
+                        "non-overlap patches are symmetry planes; a coded per-face scale that opens two faces at "
+                        "t > 0.5), every solve pinned at 1e-13. MEASURED, 520 steps from t = 0 with the baffle "
+                        "opening at step 500: alpha 3.4e-13, p_rgh 1.5e-13, U 4.9e-12, k 9.2e-13, epsilon "
+                        "2.2e-13, nut 3.5e-13, the flux through the four baffle patches 3.2e-14 of its largest; "
+                        "and 30 steps restarted from OpenFOAM's own state at t = 0.49, U 5.2e-12. CONTROLS: the "
+                        "baffle never opened, U 100%; opened on every face, 179%. BROKEN ONCE EACH (U, leak / "
+                        "restart): MULES synced across the pair 1.7e-01; phic formed after the rescale 1.7e-09; "
+                        "no symmetry reflection of grad(U) 7.8e-02; the clock at 0 green / 1.0; the neighbour "
+                        "unscaled 2.7; the non-overlap patch at full area 7.0e-01; never rescaled 1.0; the "
+                        "patches' |Sf| not reset 1.8. NOT DISCRIMINATED: recomputing the face cells' volumes "
+                        "after the rescale (bitwise the same here). NOT CLAIMED, each refused: a pair not "
+                        "coincident face for face, a moving mesh, the explicit MULES path, icAlpha, scAlpha and "
+                        "alpha sub-cycling under a moving scale, and the device loop.",
+             note="A COINCIDENT pair (createBaffles) gives each face one AMI partner, its twin, with weight 1 "
+                  "(measured: all 13 faces `1(i)`, weight `1(1)`), so the coupling is the cyclic's "
+                  "(coupleTranslationalPair) on areas the mask splits: coupled raw*max(tol, mask), "
+                  "non-overlap raw*(1 - min(max(mask, tol), 1 - tol)), mask = min(1 - tol, max(tol, "
+                  "scale*1)), tol 1e-10, the neighbour's scale a clone of the owner's evaluated on its own "
+                  "faces. The rescale runs once per time index, lazily in OpenFOAM, and WHERE is part of "
+                  "the answer: after alphaEqn.H forms phic on the old areas and before the pre-solve "
+                  "(alphaEqnStep's geometryUpdate). Found on the way: MULES does not sync its limiter across "
+                  "an AMI pair (interFoam_MULES); grad(U) on a symmetry patch is mirror-averaged "
+                  "(interFoam_wedgeCoefficients); the host loop's clock started at 0 on every restart. "
+                  "buildPatches' ACMI refusal stays for every other driver; the interFoam host opts out "
+                  "with mirrorACMI. HOST ONLY SO FAR."),
+        dict(name="interFoam_codedPatchFunction1", of_symbol="CodedField",
+             of_file="src/meshTools/PatchFunction1/CodedField/CodedField.C",
+             classification="HOST_ONLY", status="REIMPLEMENT",
+             brae_reference="src/meshTools/PatchFunction1/CodedField/codedPatchFunction1.cu",
+             validation="tests/interfoam_leakage_vs_openfoam.sh (the scale that opens damBreakLeakage's baffle: "
+                        "the masks at the end are open on exactly the faces the code names, on both sides, and "
+                        "the neighbour's clone left unevaluated puts U 2.7 out); tests/interfoam_refusals.sh "
+                        "(codeInclude refused, a name the shim lacks -- this->time().timeIndex() -- refused "
+                        "with the compiler's output).",
+             note="`code` pasted as the body of value(x) in a class that gives this->patch() and "
+                  "this->time(), as codedPatchFunction1Template does, compiled with g++ against a SHIM "
+                  "of OpenFOAM's scope: the coded Function1's scalar one plus Vector, Field, tmp, Zero, "
+                  "forAll, the field-vector inner product, a polyPatch with name/size/faceCentres and a "
+                  "Time with value/timeOutputValue. Not timeIndex(): OpenFOAM continues it across a "
+                  "restart from <start>/uniform/time, which brae does not read. The compile-and-load half "
+                  "is shared with the coded Function1 (coded_library). HOST_ONLY: evaluated once per step "
+                  "on the host, where the mask is formed."),
         dict(name="interFoam_porousBafflePressure", of_symbol="porousBafflePressureFvPatchField",
              of_file="src/TurbulenceModels/turbulenceModels/derivedFvPatchFields/porousBafflePressure/"
                      "porousBafflePressureFvPatchField.C",

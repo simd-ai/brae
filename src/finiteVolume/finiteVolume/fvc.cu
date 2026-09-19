@@ -584,6 +584,22 @@ tensor transformTensor(
     return Tt;
 }
 
+// basicSymmetryFvPatchField::evaluate (basicSymmetryFvPatchField.C) and symmetryPlaneFvPatchField::
+// evaluate, for a tensor: (iF + transform(I - 2.0*sqr(nHat), iF))/2.0 -- the value and its mirror image
+// in the plane, averaged
+tensor symmetryValue(
+    const tensor& G,
+    const vector& n)
+{
+    const tensor R{1 - 2.0*(n.x*n.x), 0 - 2.0*(n.x*n.y), 0 - 2.0*(n.x*n.z),
+                   0 - 2.0*(n.y*n.x), 1 - 2.0*(n.y*n.y), 0 - 2.0*(n.y*n.z),
+                   0 - 2.0*(n.z*n.x), 0 - 2.0*(n.z*n.y), 1 - 2.0*(n.z*n.z)};
+    const tensor T = transformTensor(R, G);
+    return tensor{(G.xx + T.xx)/2.0, (G.xy + T.xy)/2.0, (G.xz + T.xz)/2.0,
+                  (G.yx + T.yx)/2.0, (G.yy + T.yy)/2.0, (G.yz + T.yz)/2.0,
+                  (G.zx + T.zx)/2.0, (G.zy + T.zy)/2.0, (G.zz + T.zz)/2.0};
+}
+
 } // namespace
 
 std::vector<std::vector<tensor>> gradUBoundary(
@@ -626,16 +642,46 @@ std::vector<std::vector<tensor>> gradUBoundary(
         // faceT & G & faceT^T, not the cell gradient itself. Measured on LES/nozzleFlow2D, where every
         // cell touches the two wedge planes: without the rotation HbyA was 2e-06 out in every cell and
         // 5.6e-06 in the axis corner at step two, against OpenFOAM's dumped HbyA.
-        // symmetryPlane and symmetry take THEIR constraint type the same way and are NOT transformed
-        // here yet -- an open finding, unreached by any gated case.
+        // symmetry and symmetryPlane take THEIR constraint type the same way: the value is the cell
+        // gradient averaged with its mirror image, (G + R G R^T)/2 with R = I - 2 nn -- per face on a
+        // `symmetry` (basicSymmetry, patch().nf()), with the patch's ONE normal on a `symmetryPlane`
+        // (symmetryPlanePolyPatch::calcGeometry: the area-weighted sum of the face areas, normalised).
+        // The normal correction below then replaces the normal row; what the mirror adds is the
+        // tangential rows' NORMAL column, dU_n/dt, zeroed. Measured on RAS/damBreakLeakage, whose
+        // cyclicACMI hands its closed area to two symmetry patches: HbyA 3% out beside the baffle on the
+        // opening step without it, against OpenFOAM's dumped HbyA.
         const tensor* faceT = U.boundary[pi]->wedgeFaceT();
+        const bool symmetry = (fp.type == "symmetry");
+        const bool symmetryPlane = (fp.type == "symmetryPlane");
+        vector planeN{0, 0, 0};
+        if (symmetryPlane)
+        {
+            vector sumA{0, 0, 0};
+            for (label i = 0; i < fp.size; ++i)
+            {
+                sumA = sumA + Sf[fp.start + i];
+            }
+            const scalar a = mag(sumA);
+            planeN = (a > scalar(1.0e-150)) ? sumA/a : vector{0, 0, 0};
+        }
         for (label i = 0; i < fp.size; ++i)
         {
             const label c  = fp.faceCells[i];
             const label gf = fp.start + i;
             const vector n = (1.0 / magSf[gf]) * Sf[gf];                       // unit normal
-            const tensor gc = faceT ? transformTensor(*faceT, gradUcell[c])
-                                    : gradUcell[c];                            // the gradient's patch value
+            tensor gc = gradUcell[c];                                          // the gradient's patch value
+            if (faceT)
+            {
+                gc = transformTensor(*faceT, gradUcell[c]);
+            }
+            else if (symmetry)
+            {
+                gc = symmetryValue(gradUcell[c], Sf[gf]/magSf[gf]);
+            }
+            else if (symmetryPlane)
+            {
+                gc = symmetryValue(gradUcell[c], planeN);
+            }
             gb[pi][i] = gc + outer(n, sn[i] - dot(n, gc));                     // normal comp -> snGrad
         }
     }

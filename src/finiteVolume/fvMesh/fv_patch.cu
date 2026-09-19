@@ -7,7 +7,7 @@
 
 namespace brae {
 
-std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g)
+std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g, bool mirrorACMI)
 {
     std::vector<FvPatch> patches;
     patches.reserve(m.patches().size());
@@ -74,7 +74,11 @@ std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g)
         // so ACMI stays refused while the turbulence coupling is open. BRAE_ALLOW_ACMI=1 opts in for
         // development; it is deliberately not a dictionary setting, so no case file can turn it on by
         // accident.
-        if (pi.type == "cyclicACMI" && !std::getenv("BRAE_ALLOW_ACMI"))
+        //
+        // The refusal is the device drivers'. The OF-mirror interFoam host loop couples a COINCIDENT
+        // pair itself (cyclic_acmi_cpp), k and epsilon included, and is gated against OpenFOAM on
+        // RAS/damBreakLeakage; it says so with mirrorACMI, which no case file can set.
+        if (pi.type == "cyclicACMI" && !mirrorACMI && !std::getenv("BRAE_ALLOW_ACMI"))
             throw std::runtime_error(
                 "brae: patch '" + pi.name + "' is type 'cyclicACMI'. The momentum, pressure and interface "
                 "flux path now matches OpenFOAM -- on pimpleFoam/RAS/oscillatingInletACMI2D run laminar "
@@ -175,6 +179,50 @@ std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g)
     return patches;
 }
 
+void coupleTranslationalPair(
+    FvPatch& p,
+    const FvPatch& q,
+    label nbr,
+    bool owner,
+    const FvGeometry& g)
+{
+    p.coupled = true;
+    p.nbrPatch = nbr;
+    p.owner = owner;
+    p.nbrFaceCells = q.faceCells;
+    const std::size_t n = static_cast<std::size_t>(p.size);
+    p.weights.resize(n);
+    p.delta.resize(n);
+    p.nonOrthDeltaCoeffs.resize(n);
+    p.nonOrthCorrectionVectors.resize(n);
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        const label f = p.start + static_cast<label>(i);
+        const label fn = q.start + static_cast<label>(i);
+        // `transform unknown` leaves OpenFOAM to work the transform out from the two sides' normals
+        // (cyclicPolyPatch::calcTransforms): anti-parallel is a translation -- a baffle is one of
+        // zero length -- and anything else is a rotation, which is refused above when it is named.
+        if (dot(p.nf[i], q.nf[i]) > scalar(-1) + scalar(1e-6))
+        {
+            throw std::runtime_error(
+                "brae: cyclic patch '" + p.name + "' and its neighbour '" + q.name + "' do not face each "
+                "other (nf & nf_nbr = " + std::to_string(dot(p.nf[i], q.nf[i])) + " on face "
+                + std::to_string(i) + "), so OpenFOAM would couple them through a rotation. The "
+                "OF-mirror operators couple a translational cyclic only.");
+        }
+        const vector patchD = g.Cf()[f] - g.C()[p.faceCells[i]];
+        const vector nbrD = g.Cf()[fn] - g.C()[q.faceCells[i]];
+        const scalar di = dot(p.nf[i], patchD);
+        const scalar dni = dot(q.nf[i], nbrD);
+        const vector d = patchD - nbrD;
+        p.weights[i] = dni/(di + dni);
+        p.delta[i] = d;
+        p.deltaCoeffs[i] = scalar(1)/mag(d);
+        p.nonOrthDeltaCoeffs[i] = scalar(1)/std::fmax(dot(p.nf[i], d), scalar(0.05)*mag(d));
+        p.nonOrthCorrectionVectors[i] = p.nf[i] - d*p.nonOrthDeltaCoeffs[i];
+    }
+}
+
 void attachCyclicCoupling(
     std::vector<FvPatch>& patches,
     const PrimitiveMesh& m,
@@ -215,41 +263,7 @@ void attachCyclicCoupling(
                 "brae: cyclic patch '" + p.name + "' has " + std::to_string(p.size) + " faces and its "
                 "neighbour '" + q.name + "' " + std::to_string(q.size) + ".");
         }
-        p.coupled = true;
-        p.nbrPatch = nbr;
-        p.owner = static_cast<label>(pi) < nbr;
-        p.nbrFaceCells = q.faceCells;
-        const std::size_t n = static_cast<std::size_t>(p.size);
-        p.weights.resize(n);
-        p.delta.resize(n);
-        p.nonOrthDeltaCoeffs.resize(n);
-        p.nonOrthCorrectionVectors.resize(n);
-        for (std::size_t i = 0; i < n; ++i)
-        {
-            const label f = p.start + static_cast<label>(i);
-            const label fn = q.start + static_cast<label>(i);
-            // `transform unknown` leaves OpenFOAM to work the transform out from the two sides' normals
-            // (cyclicPolyPatch::calcTransforms): anti-parallel is a translation -- a baffle is one of
-            // zero length -- and anything else is a rotation, which is refused above when it is named.
-            if (dot(p.nf[i], q.nf[i]) > scalar(-1) + scalar(1e-6))
-            {
-                throw std::runtime_error(
-                    "brae: cyclic patch '" + p.name + "' and its neighbour '" + q.name + "' do not face each "
-                    "other (nf & nf_nbr = " + std::to_string(dot(p.nf[i], q.nf[i])) + " on face "
-                    + std::to_string(i) + "), so OpenFOAM would couple them through a rotation. The "
-                    "OF-mirror operators couple a translational cyclic only.");
-            }
-            const vector patchD = g.Cf()[f] - g.C()[p.faceCells[i]];
-            const vector nbrD = g.Cf()[fn] - g.C()[q.faceCells[i]];
-            const scalar di = dot(p.nf[i], patchD);
-            const scalar dni = dot(q.nf[i], nbrD);
-            const vector d = patchD - nbrD;
-            p.weights[i] = dni/(di + dni);
-            p.delta[i] = d;
-            p.deltaCoeffs[i] = scalar(1)/mag(d);
-            p.nonOrthDeltaCoeffs[i] = scalar(1)/std::fmax(dot(p.nf[i], d), scalar(0.05)*mag(d));
-            p.nonOrthCorrectionVectors[i] = p.nf[i] - d*p.nonOrthDeltaCoeffs[i];
-        }
+        coupleTranslationalPair(p, q, nbr, static_cast<label>(pi) < nbr, g);
     }
 }
 

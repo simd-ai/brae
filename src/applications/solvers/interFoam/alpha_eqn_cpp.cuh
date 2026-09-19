@@ -250,6 +250,10 @@ struct AlphaStepInput
     // values the last update left, and BEFORE the limiter builds its bounded flux on these. Null on a
     // case with no such patch.
     std::function<void()> updateModelledBoundary;
+    // Called once per call, after phic is formed and before anything else: where OpenFOAM's first
+    // interpolation across a cyclicACMI lands in the step, and so where its lazy rescale does (the
+    // driver makes it a no-op after the step's first).
+    std::function<void()> geometryUpdate;
 };
 
 // One alphaEqn.H. `alpha1` carries the field AND its boundary conditions and is advanced in place;

@@ -36,6 +36,19 @@ public:
     // cyclicACMIPolyPatch.C:392).
     void applyAreaScaling(const std::vector<std::pair<label, scalar>>& faceScale);
 
+    // cyclicACMIPolyPatch::scalePatchFaceAreas (cyclicACMIPolyPatch.C:230-258) for a scale that moves
+    // with time: the face's area set from its RAW area times the mask, and |Sf| taken from the result
+    // (cyclicACMIFvPatch::resetPatchAreas, magSf = mag(faceAreas)). Used by cyclic_acmi_cpp every step.
+    void setFaceArea(label f, const vector& Sf);
+
+    // primitiveMeshTools::updateCellCentresAndVols after the rescale: the centres and volumes from the
+    // current face areas, and NOTHING else -- OpenFOAM's weights, deltaCoeffs and non-orthogonal vectors
+    // are cached from the first time they were asked for and a static mesh never clears them. It
+    // recomputes every cell where OpenFOAM recomputes the ACMI patches' face cells only; the rest are
+    // unchanged inputs, and the per-cell sum runs in OpenFOAM's order either way (owned faces ascending,
+    // then neighbour faces ascending -- primitiveMesh::calcCells, and makeCellCentresAndVols' two passes).
+    void updateCellCentresAndVols(const PrimitiveMesh& m);
+
     // Pre-scaling |Sf| of the faces applyAreaScaling touched (empty on a mesh without cyclicACMI).
     // The AMI normalises its overlap by the RAW area: dividing by an already-scaled area returns 1 for
     // every face and erases the mask. Stored sparsely -- only ACMI faces are ever scaled -- so a mesh

@@ -45,6 +45,11 @@ struct FvPatch {
     // cyclicPolyPatch::owner(): index() < neighbPatchID(). A jump is stored on the owner and read,
     // negated, by the other side.
     bool                owner = false;
+    // Coupled through an AMI (a cyclicACMI pair, cyclic_acmi_cpp): the interpolation is the cyclic's,
+    // but syncTools::syncBoundaryFaceList exchanges values across processor and cyclicPolyPatch only
+    // (syncToolsTemplates.C:1223), and cyclicAMIPolyPatch derives from coupledPolyPatch. So whatever
+    // OpenFOAM syncs with syncFaceList -- MULES' limiter -- is NOT synced across this pair.
+    bool                ami = false;
     std::vector<label>  nbrFaceCells;
     std::vector<scalar> weights;
     std::vector<vector> delta;
@@ -66,6 +71,17 @@ inline T coupledLinear(
     return p.weights[k]*cells[p.faceCells[k]] + (scalar(1) - p.weights[k])*cells[p.nbrFaceCells[k]];
 }
 
+// Fill the coupled half of `p` against its neighbour `q` (index `nbr`), a translational pair whose
+// faces meet face for face: the weights, delta and non-orthogonal vectors of cyclicFvPatch.C and
+// basicFvGeometryScheme.C. attachCyclicCoupling uses it for every `cyclic`; cyclic_acmi_cpp for a
+// coincident cyclicACMI pair, whose AMI maps each face onto its twin with weight 1.
+void coupleTranslationalPair(
+    FvPatch& p,
+    const FvPatch& q,
+    label nbr,
+    bool owner,
+    const FvGeometry& g);
+
 // Fill the coupled half of every `cyclic` patch. Refuses a rotational pair by name: the vector
 // transform is not carried through the operators that branch on `coupled`.
 void attachCyclicCoupling(
@@ -73,6 +89,8 @@ void attachCyclicCoupling(
     const PrimitiveMesh& m,
     const FvGeometry& g);
 
-std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g);
+// mirrorACMI: the caller is the OF-mirror interFoam host loop, which couples a coincident cyclicACMI
+// pair itself (cpu::cyclicACMI::setup); every other caller has the refusal below.
+std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g, bool mirrorACMI = false);
 
 } // namespace brae

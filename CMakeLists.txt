@@ -81,11 +81,14 @@ add_library(brae_core STATIC
     src/parallel/pstream/device_reduce.cu
     src/OpenFOAM/meshes/interface/processor_interface.cu
     src/OpenFOAM/db/foam_token_reader.cu
+    src/OpenFOAM/db/dynamicLibrary/codedBase/coded_library.cu
     src/OpenFOAM/primitives/functions/Function1/Coded/codedFunction1.cu
+    src/meshTools/PatchFunction1/CodedField/codedPatchFunction1.cu
     src/finiteVolume/expressions/PatchFunction1/patchExprFunction1.cu
     src/OpenFOAM/meshes/primitive_mesh.cu
     src/finiteVolume/fvMesh/fv_geometry.cu
     src/finiteVolume/fvMesh/fv_patch.cu
+    src/finiteVolume/fvMesh/fvPatches/constraint/cyclicACMI/cyclic_acmi_cpp.cu
     src/OpenFOAM/decompose/scotch_decomposition.cu
     src/OpenFOAM/decompose/domain_decomposition.cu
     src/TurbulenceModels/turbulenceModels/derivedFvPatchFields/wallFunctions/nut_wall_function.cu
@@ -3494,6 +3497,15 @@ target_include_directories(test_inter_limitedlinear_vs_openfoam PRIVATE ${BRAE_H
 target_link_libraries(test_inter_limitedlinear_vs_openfoam PRIVATE brae_core)
 add_test(NAME interfoam_limitedlinear_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_limitedlinear_vs_openfoam.sh)
+
+# interFoam across a coded cyclicACMI baffle against real OpenFOAM on damBreakLeakage. The script carries
+# the measurements, the controls and the fail-proofs.
+add_executable(test_inter_leakage_vs_openfoam tests/test_inter_leakage_vs_openfoam.cu)
+target_include_directories(test_inter_leakage_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_leakage_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_leakage_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_leakage_vs_openfoam.sh)
 
 # ...and the wave boundary conditions (waveAlpha, waveVelocity) on laminar/waves/stokesI: fields, the
 # patch values the wave model assigns, its two derived constants and the ORDER it updates in, all

@@ -3319,6 +3319,10 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
     // ...EXCEPT in the OF-mirror tree, where the driver has attached the coupling to the mesh patch and
     // the host operators branch on it: there a cyclic is a real coupled patch field.
     if (d.type == "cyclic" && p.coupled)         return std::make_unique<CoupledCyclicPatchField<T>>(p);
+    // a coincident cyclicACMI pair the interFoam host loop coupled (cyclic_acmi_cpp): its AMI maps every
+    // face onto its twin with weight 1, so cyclicACMIFvPatchField's value and coefficients are the
+    // cyclic's, on the areas the mask scaled
+    if (d.type == "cyclicACMI" && p.coupled)     return std::make_unique<CoupledCyclicPatchField<T>>(p);
     if (isCoupledInterfaceType(d.type))          return std::make_unique<ZeroGradientPatchField<T>>(p);
     if (d.type == "empty")           return std::make_unique<EmptyPatchField<T>>(p);
     if (d.type == "symmetryPlane" || d.type == "symmetry" || d.type == "slip")

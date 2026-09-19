@@ -430,6 +430,24 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
     // pressure corrector left, which a flux-conditional patch only learns here.
     alpha1.evaluateBoundary();
 
+    // phic = cAlpha*|phi/magSf|, zeroed on every non-coupled boundary -- ONCE, at the top, as alphaEqn.H
+    // computes it (:59-89), before the pre-solve and before anything interpolates across the mesh. With
+    // fixed geometry it is the same field wherever it is formed. With a cyclicACMI whose scale moves the
+    // open area, it is not: OpenFOAM rescales lazily, and this phic is the one formed on the areas the
+    // step STARTED with -- see geometryUpdate below.
+    SurfaceScalarField phic;
+    compressionFlux(ic.cAlpha, *in.phi, g.magSf(), patches,
+                    in.icAlpha, {}, in.scAlpha, {}, phic);
+    // ...and the step's geometry change lands here, after phic and before the pre-solve assembles.
+    // MEASURED on RAS/damBreakLeakage's opening step with OpenFOAM's alphaEqn instrumented: phic on the
+    // newly opened faces is 41.7, |phi| over the CLOSED area, against nHatf on the open one, and the
+    // limited correction then cancels the pre-solve's flux on the receiving side exactly (its alpha
+    // flux 6e-23 where rescaling first gave 5.8e-13).
+    if (in.geometryUpdate)
+    {
+        in.geometryUpdate();
+    }
+
     SurfaceScalarField upwindFlux;              // talphaPhi1UD -- cached for alphaApplyPrevCorr
     if (in.MULESCorr)
     {
@@ -546,13 +564,8 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
         // previous pass wrote, so an extra pass changes the curvature. Measured against OpenFOAM's own
         // K on capillaryRise, one pass too few is 18% low at the contact line.
 
-        // phic = cAlpha*|phi/magSf|, zeroed on every non-coupled boundary.
-        SurfaceScalarField phic;
-        compressionFlux(ic.cAlpha, *in.phi, g.magSf(), patches,
-                        in.icAlpha, {}, in.scAlpha, {}, phic);
-
-        // phir = phic*nHatf. nHatf is already a FLUX (nHatfv & Sf), not a unit vector, so this is a
-        // product of two face fields and needs no further area weighting.
+        // phir = phic*nHatf, with the phic formed at the top. nHatf is already a FLUX (nHatfv & Sf), not
+        // a unit vector, so this is a product of two face fields and needs no further area weighting.
         SurfaceScalarField phir;
         phir.internal.resize(phic.internal.size());
         for (std::size_t f = 0; f < phic.internal.size(); ++f)

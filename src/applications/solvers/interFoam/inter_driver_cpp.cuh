@@ -23,6 +23,7 @@
 //
 // Losing any one of them leaves a solver that runs and is wrong in a way no single equation's gate
 // would catch, because each is correct in isolation.
+#include "cyclic_acmi_cpp.cuh"
 #include "cf_types.cuh"
 #include "inter_case_cpp.cuh"
 #include "inter_peqn_cpp.cuh"
@@ -86,6 +87,9 @@ struct MutableMesh
     PrimitiveMesh* m = nullptr;
     FvGeometry* g = nullptr;
     std::vector<FvPatch>* patches = nullptr;
+    // the cyclicACMI pairs cpu::cyclicACMI::setup coupled, rescaled at every step when a `scale` moves
+    // their open area with time (the geometry above is what they rescale)
+    cpu::cyclicACMI::Interfaces* acmi = nullptr;
 };
 
 // Run `nSteps` of interFoam on a prepared case. Returns the state at the end; `verbose` prints the

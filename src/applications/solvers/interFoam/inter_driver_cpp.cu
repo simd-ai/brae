@@ -1,5 +1,6 @@
 // brae's interFoam time loop -- see inter_driver_cpp.cuh for why the driver owns no numerics and for
 // the four old-time fields that are its actual content.
+#include <filesystem>
 #include "inter_driver_cpp.cuh"
 #include "inter_correct_phi_cpp.cuh"
 #include "inter_solve_cpp.cuh"
@@ -59,6 +60,33 @@ void updateMovingWallVelocity(
 }   // namespace
 
 
+namespace {
+
+// The time the start directory names -- OpenFOAM's time directories ARE their times. A directory whose
+// name is not one cannot tell the loop when it starts, and is refused rather than read as 0.
+scalar startTimeOf(const std::string& startDir)
+{
+    std::filesystem::path p(startDir);
+    if (p.filename().empty())
+    {
+        p = p.parent_path();
+    }
+    const std::string name = p.filename().string();
+    char* end = nullptr;
+    const double v = std::strtod(name.c_str(), &end);
+    if (name.empty() || end == name.c_str() || *end != '\0' || !std::isfinite(v))
+    {
+        throw std::runtime_error(
+            "brae interFoam: the start directory `" + startDir + "` is not named by a time, so the loop "
+            "cannot tell when the case starts. OpenFOAM reads the fields from the directory of the start "
+            "time; pass that one.");
+    }
+    return static_cast<scalar>(v);
+}
+
+} // namespace
+
+
 RunReport runInterFoam(
     const std::string& caseDir,
     const std::string& startDir,
@@ -95,7 +123,62 @@ RunReport runInterFoam(
         }
         dyn->attach(*mutableMesh->m, *mutableMesh->g, *mutableMesh->patches);
     }
+    // A cyclicACMI pair whose `scale` moves with time is rescaled at every step, in place, on the
+    // caller's mutable objects -- the same check as for a moving mesh
+    cpu::cyclicACMI::Interfaces* acmi = mutableMesh ? mutableMesh->acmi : nullptr;
+    {
+        bool hasACMI = false;
+        for (const FvPatch& q : patches)
+        {
+            hasACMI = hasACMI || q.type == "cyclicACMI";
+        }
+        if (hasACMI && (!acmi || acmi->empty()))
+        {
+            throw std::runtime_error(
+                "brae interFoam: the mesh has a cyclicACMI pair and the caller handed the driver no ACMI "
+                "state. Couple it with cpu::cyclicACMI::setup and pass the result through MutableMesh.");
+        }
+        if (acmi && acmi->scaled())
+        {
+            if (mutableMesh->m != &m || mutableMesh->g != &g || mutableMesh->patches != &patches)
+            {
+                throw std::runtime_error(
+                    "brae interFoam: MutableMesh names different objects from the mesh, geometry and "
+                    "patches the fields were built against; the cyclicACMI rescale would move a copy.");
+            }
+            if (dyn)
+            {
+                throw std::runtime_error(
+                    "brae interFoam: the case scales a cyclicACMI interface AND moves its mesh. OpenFOAM "
+                    "then re-runs the AMI and rescales the mesh flux in cyclicACMIFvPatch::movePoints; "
+                    "that is not ported.");
+            }
+            // WHERE IN THE STEP the rescale lands is part of the answer (cyclic_acmi_cpp.cuh): after
+            // alphaEqn.H forms phic and before the pre-solve. That point is gated for the pre-solving
+            // (MULESCorr) path with no isotropic or shear compression and one alpha sub-cycle. Each of
+            // the three moves OpenFOAM's first interpolation across the pair -- the explicit path to the
+            // high-order flux after phir, icAlpha/scAlpha to an interpolate before phic, a sub-cycle to
+            // a rescale at every sub-cycle's own time -- and none is gated, so each is refused.
+            if (!f.alphaCtl.MULESCorr || f.alphaCtl.icAlpha != scalar(0) || f.alphaCtl.scAlpha != scalar(0)
+             || f.alphaCtl.nAlphaSubCycles != 1)
+            {
+                throw std::runtime_error(
+                    "brae interFoam: the case scales a cyclicACMI interface with time, and the step's "
+                    "rescale point is ported for `MULESCorr yes`, icAlpha 0, scAlpha 0 and nAlphaSubCycles 1 "
+                    "only; this case sets MULESCorr " + std::string(f.alphaCtl.MULESCorr ? "yes" : "no") +
+                    ", icAlpha " + std::to_string((double)f.alphaCtl.icAlpha) + ", scAlpha " +
+                    std::to_string((double)f.alphaCtl.scAlpha) + ", nAlphaSubCycles " +
+                    std::to_string((long)f.alphaCtl.nAlphaSubCycles) + ".");
+            }
+        }
+    }
     RunReport rep;
+    // THE CLOCK STARTS AT THE START TIME: the instant the fields are read from, which is where
+    // OpenFOAM's Time begins (Time::setControls). It started at 0 whatever the case said, so a restart
+    // at 0.49 read every time-dependent input -- a wave, a table, a coded ACMI scale -- half a second
+    // early, and endTime was measured from the wrong origin.
+    const scalar startTime = startTimeOf(startDir);
+    rep.time = startTime;
     // the mesh's GAMG hierarchy, built by the first GAMG solve -- pcorr's, p_rgh's or the mesh
     // motion's -- and kept for the run
     GamgAgglomerationCache gamgCache;
@@ -151,6 +234,8 @@ RunReport runInterFoam(
     SurfaceVectorField UfOld = f.Uf;
 
     SurfaceScalarField prevCorr;                 // alphaApplyPrevCorr's cache
+    // cyclicACMIPolyPatch::updateAreas runs once per time index (prevTimeIndex_)
+    bool acmiRescaledThisStep = false;
     GamgSolveLog gamgLog;
     rep.deltaT = f.deltaT;
 
@@ -195,16 +280,18 @@ RunReport runInterFoam(
                 }
                 case Stage::alphaCourantNo:  break;    // computed above, from the same sumPhi
                 case Stage::setDeltaT:
+                    // Time::adjustDeltaT measures from the start, value() - startTime_ (Time.C:1150)
                     rep.deltaT = setDeltaTVoF(rep.deltaT, rep.CoNum, rep.alphaCoNum, f.timeCtl,
-                                              rep.time, &f.writeCadence);
+                                              rep.time - startTime, &f.writeCadence);
                     break;
                 case Stage::advanceTime:
                     rep.time += rep.deltaT;
                     ++rep.steps;
+                    acmiRescaledThisStep = false;
                     outerOfStep = -1;
                     // Time::operator++ moves writeTimeIndex_ AFTER the time, with the step that took
                     // it -- which is what the next adjustDeltaT measures the distance to.
-                    f.writeCadence.advance(rep.time, rep.deltaT);
+                    f.writeCadence.advance(rep.time - startTime, rep.deltaT);
                     break;
 
                 case Stage::meshUpdate:
@@ -334,6 +421,20 @@ RunReport runInterFoam(
                     {
                         ++subCycle;
                         AlphaStepInput sub = ai;
+                        // cyclicACMIPolyPatch::updateAreas: the step's first interpolation across the
+                        // pair, which alphaEqnStep places after phic (see its geometryUpdate)
+                        if (acmi && acmi->scaled())
+                        {
+                            sub.geometryUpdate = [&]()
+                            {
+                                if (acmiRescaledThisStep)
+                                {
+                                    return;
+                                }
+                                acmi->rescale(rep.time, m, *mutableMesh->g, *mutableMesh->patches);
+                                acmiRescaledThisStep = true;
+                            };
+                        }
                         sub.deltaT = dtSub;
                         // a moving mesh's volumes at this sub-cycle's clock: fvMesh::Vsc and Vsc0
                         // interpolate between V0 and V by the sub-cycle's position in the step

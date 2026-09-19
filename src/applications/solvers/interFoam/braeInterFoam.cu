@@ -73,6 +73,10 @@
 // axisymmetric wedge -- whose host matrix coefficients and gradient patch value it took to get there.
 // tests/interfoam_les_vs_openfoam.sh holds LES/nozzleFlow2D against OpenFOAM; `-device` refuses LES.
 //
+// AND a coincident cyclicACMI pair, on the host -- a createBaffles baffle whose `scale` (a constant, a
+// table or a coded per-face PatchFunction1) opens and shuts faces with time: RAS/damBreakLeakage, held by
+// tests/interfoam_leakage_vs_openfoam.sh. `-device` refuses it by name.
+//
 // AND `Gauss limitedLinear` on div(rhoPhi,U), on the host: one magSqr limiter per face, as OpenFOAM's
 // vector form has it. tests/interfoam_limitedlinear_vs_openfoam.sh holds eulerianInjection against
 // OpenFOAM; `-device` refuses it.
@@ -142,11 +146,17 @@ int main(int argc, char** argv)
         m.read(caseDir + "/constant/polyMesh");
         FvGeometry g;
         g.build(m);
-        std::vector<FvPatch> patches = buildPatches(m, g);
+        // mirrorACMI: this loop couples a coincident cyclicACMI pair itself; the device loop, handed the
+        // same patches uncoupled, refuses it by name
+        std::vector<FvPatch> patches = buildPatches(m, g, /*mirrorACMI=*/true);
+        cpu::cyclicACMI::Interfaces acmi;
         if (!onDevice)
         {
             // THE HOST LOOP COUPLES A CYCLIC: its operators branch on FvPatch::coupled. The device loop
-            // does not, and is handed the mesh as it was -- where a cyclic is refused by name.
+            // does not, and is handed the mesh as it was -- where a cyclic is refused by name. A
+            // coincident cyclicACMI pair is coupled first: its masks split the face areas, which moves
+            // the cell geometry every patch is built from.
+            acmi = cpu::cyclicACMI::setup(m, g, patches, startTime);
             attachCyclicCoupling(patches, m, g);
         }
         // ...handed to the host loop mutable as well, for a case whose mesh moves (MutableMesh)
@@ -154,6 +164,7 @@ int main(int argc, char** argv)
         mutableMesh.m = &m;
         mutableMesh.g = &g;
         mutableMesh.patches = &patches;
+        mutableMesh.acmi = &acmi;
 
         // The start directory OpenFOAM would use. `0` is written as `0` and not `0.000000`, which is
         // what every tutorial ships.

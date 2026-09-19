@@ -98,6 +98,18 @@ cp -r "$BB/0.orig" "$BB/0"
 sed -i 's/^endTime .*/endTime         0.0002;/; s/^deltaT .*/deltaT          1e-4;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
     "$BB/system/controlDict"
 
+# ...and RAS/damBreakLeakage, for the coded cyclicACMI baffle, meshed as its Allrun does
+SRCK="$TUT/multiphase/interFoam/RAS/damBreakLeakage"
+[ -d "$SRCK" ] || { echo "SKIP: damBreakLeakage tutorial not found at $SRCK"; exit 77; }
+BK="$W/baseLeak"
+cp -r "$SRCK" "$BK" || exit 1
+cp -r "$BK/0.orig" "$BK/0"
+( cd "$BK" && blockMesh > log.blockMesh 2>&1 && setFields > log.setFields 2>&1 \
+      && createBaffles -overwrite > log.createBaffles 2>&1 ) \
+    || { echo "SKIP: blockMesh/setFields/createBaffles failed on damBreakLeakage"; exit 77; }
+sed -i 's/^endTime .*/endTime         0.0002;/; s/^deltaT .*/deltaT          1e-4;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
+    "$BK/system/controlDict"
+
 # ...and LES/nozzleFlow2D, for LES kEqn on a wedge, meshed as its Allrun does, two steps at a fixed 1e-9
 SRCL="$TUT/multiphase/interFoam/LES/nozzleFlow2D"
 [ -d "$SRCL" ] || { echo "SKIP: nozzleFlow2D tutorial not found at $SRCL"; exit 77; }
@@ -396,9 +408,23 @@ arm les_linearUpwindK       refused "neither \`Gauss upwind\` nor"     "" "sed -
 arm les_cellLimitedGradU    refused "Gauss linear 1\` is not ported"  "" "sed -i 's/^\\( *default  *\\)Gauss linear;/\\1cellLimited Gauss linear 1;/' system/fvSchemes"
 BASE="$B"
 
+# the coded cyclicACMI baffle: it runs; the rescale point is ported for MULESCorr and one sub-cycle only;
+# the coded scale refuses what OpenFOAM would compile against its own headers, and a name its shim lacks
+BASE="$BK"
+arm leak_runs               runs    -                        "" true
+arm leak_explicitMULES      refused "MULESCorr no"           "" "sed -i 's/MULESCorr  *yes;/MULESCorr       no;/' system/fvSolution"
+arm leak_subCycles          refused "nAlphaSubCycles 2"      "" "sed -i 's/nAlphaSubCycles  *1;/nAlphaSubCycles 2;/' system/fvSolution"
+arm leak_codeInclude        refused "codeInclude"            "" "sed -i '0,/type            coded;/s//type            coded;\n            codeInclude #{ #};/' constant/polyMesh/boundary"
+arm leak_timeIndex          refused "did not compile"        "" "sed -i 's/this->time().value()/scalar(this->time().timeIndex())/' constant/polyMesh/boundary"
+arm leak_noNonOverlap       refused "nonOverlapPatch"        "" "sed -i '0,/nonOverlapPatch wall_block;/s///' constant/polyMesh/boundary"
+BASE="$B"
+
 if [ $HAVE_GPU = 1 ]; then
     BASE="$BL"
     arm device_les          refused "the case is LES kEqn" "-device" true
+    # the device loop is handed the ACMI pair uncoupled, and refuses it by name
+    BASE="$BK"
+    arm device_leak         refused "coupled_half0"         "-device" true
     # the device momentum's limitedLinear branch is 51% off OpenFOAM's U where the host agrees to 4e-12
     BASE="$B"
     arm device_limitedLinear refused "Gauss limitedLinear"    "-device" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear 0.2;/' system/fvSchemes"

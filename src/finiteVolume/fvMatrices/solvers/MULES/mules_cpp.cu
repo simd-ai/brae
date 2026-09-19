@@ -322,11 +322,15 @@ void limiter(Limiter&                      lambda,
         // syncTools::syncFaceList(mesh, allLambda, minEqOp<scalar>()). NOT a no-op in serial: it syncs
         // a cyclic pair too, and leaves both sides of a coupled face with the SMALLER of their limiters
         // -- which is an internal face's one limiter, min(lambda, lambdap of the cell the correction
-        // leaves, lambdam of the cell it enters).
+        // leaves, lambdam of the cell it enters). It does NOT sync an AMI pair (FvPatch::ami): each side
+        // keeps its own limiter and the limited flux is not equal and opposite across it. MEASURED on
+        // damBreakLeakage's opening step against OpenFOAM's written alphaPhi0: the receiving side's
+        // flux 0.75 of the giving side's in OpenFOAM, and the receiving cell's alpha 33% high when brae
+        // synced it.
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
             const FvPatch& q = patches[pi];
-            if (!q.coupled || !q.owner)
+            if (!q.coupled || !q.owner || q.ami)
             {
                 continue;
             }
@@ -655,11 +659,15 @@ void limiterCorr(Limiter&                      lambda,
         // syncTools::syncFaceList(mesh, allLambda, minEqOp<scalar>()). NOT a no-op in serial: it syncs
         // a cyclic pair too, and leaves both sides of a coupled face with the SMALLER of their limiters
         // -- which is an internal face's one limiter, min(lambda, lambdap of the cell the correction
-        // leaves, lambdam of the cell it enters).
+        // leaves, lambdam of the cell it enters). It does NOT sync an AMI pair (FvPatch::ami): each side
+        // keeps its own limiter and the limited flux is not equal and opposite across it. MEASURED on
+        // damBreakLeakage's opening step against OpenFOAM's written alphaPhi0: the receiving side's
+        // flux 0.75 of the giving side's in OpenFOAM, and the receiving cell's alpha 33% high when brae
+        // synced it.
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
             const FvPatch& q = patches[pi];
-            if (!q.coupled || !q.owner)
+            if (!q.coupled || !q.owner || q.ami)
             {
                 continue;
             }

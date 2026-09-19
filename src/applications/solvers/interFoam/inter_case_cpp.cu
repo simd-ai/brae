@@ -1097,8 +1097,9 @@ InterFields buildInterFields(const std::string&          caseDir,
                 throw std::runtime_error(
                     "brae interFoam: patch `" + q.name + "` is " + q.type + " and its coupling is not "
                     "attached. The host loop couples a translational `cyclic` (a baffle pair included) "
-                    "once attachCyclicCoupling() has filled the mesh patch; cyclicAMI, cyclicACMI and "
-                    "processor patches are not ported here. Refused rather than run as two walls.");
+                    "once attachCyclicCoupling() has filled the mesh patch, and a coincident cyclicACMI "
+                    "pair once cpu::cyclicACMI::setup() has; cyclicAMI and processor patches are not "
+                    "ported here. Refused rather than run as two walls.");
             }
             if (q.coupled && !firstCoupled)
             {
