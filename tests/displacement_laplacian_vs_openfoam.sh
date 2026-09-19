@@ -51,7 +51,7 @@
 # entry, which moveDynamicMesh never selects; nor the device.
 #
 # THE CONTROL: brae reading `inverseDistance (rightwall)` against OpenFOAM's leftwall must FAIL, and the
-# script asserts that it does. THE REFUSALS: seven arms, each an input brae must name rather than run.
+# script asserts that it does. THE REFUSALS: ten arms, each an input brae must name rather than run.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_displacement_laplacian_vs_openfoam"
@@ -221,6 +221,28 @@ if echo " $PROFILES " | grep -q " piston "; then
         "$(printf "$SUB" 0/pointDisplacement '(leftwall\s*\{\s*type\s+waveMaker;)\s*value\s+uniform\s*\([^)]*\);' '\1')" || rc=1
     refuse frozenPoints "frozenPointsZone" \
         "$(printf "$SUB" constant/dynamicMeshDict '(diffusivity\s+inverseDistance\s*\([^)]*\);)' '\1 frozenPointsZone none;')" || rc=1
+    # the diffusivity's wall distance reads fvSchemes' `patchDist` (wallDist's patch type name is "patch")
+    refuse patchDistPoisson "patchDist { method Poisson; }" \
+        "open('system/fvSchemes', 'a').write(chr(10) + 'patchDist { method Poisson; }' + chr(10))" || rc=1
+    refuse patchDistNoCorrect "patchDist { correctWalls false; }" \
+        "open('system/fvSchemes', 'a').write(chr(10) + 'patchDist { correctWalls false; }' + chr(10))" || rc=1
+    refuse patchDistInterval "patchDist { updateInterval 2; }" \
+        "open('system/fvSchemes', 'a').write(chr(10) + 'patchDist { updateInterval 2; }' + chr(10))" || rc=1
+    # ...and its opposite: the dictionary naming exactly the defaults must RUN
+    R="$W/accept_patchDistDefaults"
+    rm -rf "$R"
+    mkdir -p "$R"
+    cp -r "$W/piston/constant" "$W/piston/system" "$W/piston/0" "$R/"
+    printf '\npatchDist { method meshWave; correctWalls true; updateInterval 1; }\n' >> "$R/system/fvSchemes"
+    out=$(gate piston 0.05 20 "$R" 2>&1)
+    st=$?
+    if [ $st -ne 0 ] || echo "$out" | grep -q "REFUSED:"; then
+        echo "FAIL: [patchDistDefaults] the defaults, written out, did not run and pass (status $st)"
+        echo "$out" | tail -5 | sed 's/^/      /'
+        rc=1
+    else
+        echo "ok:   RUNS [patchDistDefaults]: patchDist naming meshWave, correctWalls true, updateInterval 1"
+    fi
 fi
 
 echo "displacement_laplacian_vs_openfoam: rc $rc"

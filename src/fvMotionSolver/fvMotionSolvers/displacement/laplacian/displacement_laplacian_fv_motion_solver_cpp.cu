@@ -264,6 +264,36 @@ std::unique_ptr<DisplacementLaplacianFvMotionSolver> DisplacementLaplacianFvMoti
             std::string(WHO) + "interpolate(yPatch), which the inverseDistance diffusivity takes, is `" +
             joined(interp) + "`. Only `linear` is ported there.");
     }
+    // ...and the wall distance itself: inverseDistanceDiffusivity::correct asks for
+    // wallDist::New(mesh, meshWave, patchSet), whose patch type name is "patch", so it reads fvSchemes'
+    // `patchDist` sub-dictionary (wallDist.C:98-101, subOrEmptyDict) -- meshWave unless it names another
+    // method (patchDistMethod.C:64-76), meshWave's correctWalls (default true), and updateInterval
+    // (default 1: recomputed at every motion). diffusivityCorrect runs meshWave with correctWalls, every
+    // step; anything else the dictionary asks for is refused.
+    if (const FoamDict* pd = fvSchemes.subDict("patchDist"))
+    {
+        const std::string method = pd->wordOr("method", "meshWave");
+        if (method != "meshWave")
+        {
+            throw std::runtime_error(
+                std::string(WHO) + "fvSchemes names `patchDist { method " + method + "; }`, the wall distance "
+                "the inverseDistance diffusivity takes. Only meshWave is ported.");
+        }
+        const std::string cw = pd->wordOr("correctWalls", "true");
+        if (cw == "false" || cw == "no" || cw == "off")
+        {
+            throw std::runtime_error(
+                std::string(WHO) + "fvSchemes sets `patchDist { correctWalls " + cw + "; }`; the ported "
+                "meshWave always corrects the cells beside the patches.");
+        }
+        const scalar interval = pd->scalarOr("updateInterval", scalar(1));
+        if (interval != scalar(1))
+        {
+            throw std::runtime_error(
+                std::string(WHO) + "fvSchemes sets `patchDist { updateInterval " + pd->wordOr("updateInterval", "")
+                + "; }`; only 1, the default, is ported (the distance is recomputed at every motion).");
+        }
+    }
     return s;
 }
 
