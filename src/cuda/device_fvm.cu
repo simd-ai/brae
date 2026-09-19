@@ -275,12 +275,28 @@ void diagGatherKernel(
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
 
+    // A TRANSCRIPTION of the host's fvm::laplacian (fvm.cuh): `diag[own] -= coeff; diag[nei] -= coeff`
+    // in FACE ORDER from zero, so this cell's owner and neighbour lists (each ascending) are merged by
+    // face index. Summed owner-first, the diagonal differed from the host's in the last bit.
     scalar s = 0.0;
-    for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)
-        s += lower[f];              // faces owned by c
-    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
-        s += upper[losort[k]];    // faces neighbouring c
-    diag[c] = -s;
+    int fo = ownerStart[c];
+    const int foEnd = ownerStart[c + 1];
+    int kn = losortStart[c];
+    const int knEnd = losortStart[c + 1];
+    while (fo < foEnd || kn < knEnd)
+    {
+        if ((kn >= knEnd) || (fo < foEnd && fo < losort[kn]))
+        {
+            s -= lower[fo];             // a face c owns
+            ++fo;
+        }
+        else
+        {
+            s -= upper[losort[kn]];     // a face c neighbours
+            ++kn;
+        }
+    }
+    diag[c] = s;
 }
 
 
@@ -402,7 +418,8 @@ void lapCorrFaceLimitedKernel(
     const scalar orthSn = nonOrthDc[f] * (phi[n] - phi[o]);        // orthogonal snGrad (over-relaxed)
     scalar limiter = (psi * fabs(orthSn)) / ((1.0 - psi) * fabs(corr) + 1.0e-15);
     if (limiter > 1.0) limiter = 1.0;
-    ffc[f] = gammaf[f] * magSf[f] * limiter * corr;
+    // the host's order: corr = lim*corr, then (gamma*magSf)*corr (fvm.cuh laplacianCorrFlux)
+    ffc[f] = (gammaf[f] * magSf[f]) * (limiter * corr);
 }
 
 
@@ -419,11 +436,27 @@ void lapCorrGatherKernel(
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
 
+    // The host's laplacianNonOrthSource sums `src[own] += ffc; src[nei] -= ffc` in FACE ORDER and the
+    // caller subtracts it; this is its negation, accumulated in the same order (owner and neighbour
+    // lists merged by face index), so it is the host's value with the sign flipped, bit for bit.
     scalar s = 0.0;
-    for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)
-        s -= ffc[f];               // c is owner
-    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
-        s += ffc[losort[k]];      // c is neighbour
+    int fo = ownerStart[c];
+    const int foEnd = ownerStart[c + 1];
+    int kn = losortStart[c];
+    const int knEnd = losortStart[c + 1];
+    while (fo < foEnd || kn < knEnd)
+    {
+        if ((kn >= knEnd) || (fo < foEnd && fo < losort[kn]))
+        {
+            s -= ffc[fo];               // c is owner
+            ++fo;
+        }
+        else
+        {
+            s += ffc[losort[kn]];       // c is neighbour
+            ++kn;
+        }
+    }
     src[c] = s;
 }
 } // namespace
@@ -521,10 +554,11 @@ void lapCorrFaceLimitedVecKernel(
     scalar limiter = (psi * magOrth) / ((1.0 - psi) * magCorr + 1.0e-15);
     if (limiter > 1.0) limiter = 1.0;
 
-    const scalar s = gammaf[f] * magSf[f] * limiter;
-    f0[f] = s * c0;
-    f1[f] = s * c1;
-    f2[f] = s * c2;
+    // the host's order: corr = lim*corr, then (gamma*magSf)*corr (fvm.cuh laplacianCorrFlux)
+    const scalar gm = gammaf[f] * magSf[f];
+    f0[f] = gm * (limiter * c0);
+    f1[f] = gm * (limiter * c1);
+    f2[f] = gm * (limiter * c2);
 }
 } // namespace
 

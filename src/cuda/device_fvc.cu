@@ -46,11 +46,28 @@ void divKernel(
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
 
+    // A TRANSCRIPTION of the host's fvc::div (fvc.cu): `d[own] += phi; d[nei] -= phi` in FACE ORDER from
+    // zero, so this cell's owner and neighbour lists (each ascending) are merged by face index, then the
+    // boundary faces in patch order, then the division by V. Summed owner-first it differed from the
+    // host's in the last bit (tests/test_device_laplacian_vs_host.cu holds the two to memcmp).
     scalar s = 0.0;
-    for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)
-        s += phiInt[f];              // +owner internal
-    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
-        s -= phiInt[losort[k]];    // -neighbour internal
+    int fo = ownerStart[c];
+    const int foEnd = ownerStart[c + 1];
+    int kn = losortStart[c];
+    const int knEnd = losortStart[c + 1];
+    while (fo < foEnd || kn < knEnd)
+    {
+        if ((kn >= knEnd) || (fo < foEnd && fo < losort[kn]))
+        {
+            s += phiInt[fo];            // +owner internal
+            ++fo;
+        }
+        else
+        {
+            s -= phiInt[losort[kn]];    // -neighbour internal
+            ++kn;
+        }
+    }
     for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)
     {
         const int bk = bndPerm[k];
