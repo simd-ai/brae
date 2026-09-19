@@ -746,14 +746,10 @@ InterFields buildInterFields(const std::string&          caseDir,
         {
             f.aSolve = SmoothLinearSolve::read(*ad);
         }
-        // minIter is honoured for k and epsilon and nowhere else yet. Three tutorials name it for
-        // alpha (DTCHull, DTCHullMoving, electrostaticDeposition): it forces a sweep on the steps
-        // where the pre-solve's initial residual is already under tolerance, which moves alpha.
-        if (f.alphaCtl.MULESCorr && f.aSolve.minIter > 0)
-            throw std::runtime_error(
-                "brae interFoam: `solvers/" + f.alphaName + "` names `minIter "
-                + std::to_string(f.aSolve.minIter) + "`, which the alpha pre-solve does not honour "
-                "yet. Refused rather than stop a sweep earlier than OpenFOAM does.");
+        // minIter: three tutorials name it for alpha (DTCHull, DTCHullMoving, electrostaticDeposition).
+        // It forces a sweep on the steps where the pre-solve's initial residual is already under
+        // tolerance, which moves alpha. The host pre-solve honours it (AlphaStepInput::minIterAlpha,
+        // gated on laminar/damBreak `alphaminiter`); the device loop refuses it.
         if (f.alphaCtl.MULESCorr && !f.aSolve.solver.empty() && !f.aSolve.gaussSeidel())
         {
             // smoothSolver with either Gauss-Seidel smoother is OpenFOAM's own on both paths

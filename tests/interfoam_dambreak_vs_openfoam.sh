@@ -91,6 +91,14 @@
 #               the value. Naming it on U alone: alpha 2.5e-09 before the push, 8.4e-11 after it,
 #               1.2e-12 with the value re-evaluated as well.
 # The control: naming rhoPhi moves OpenFOAM's OWN alpha by 1.0e-06 over these five steps.
+#
+# PROFILE alphaminiter: the alpha entry names `minIter 1`, at the big step. OpenFOAM's first pre-solve
+# starts under its tolerance and takes no sweep; minIter forces one. MEASURED: all 5 alpha sweep counts
+# OpenFOAM's (1 5 2 2 2), alpha 7.3e-14, U 2.6e-13. THE FIELDS CANNOT WITNESS IT on damBreak -- that first
+# pre-solve starts on an exact solution, so the forced sweep changes nothing (alpha identical to the last
+# digit at alpha tolerances 1e-8, 1e-5, 1e-4, 1e-3) -- so the control is the sweep count: OpenFOAM without
+# minIter logs 1 of the 5 differently. BROKEN (minIter ignored, as brae had it): the first count 0 for 1.
+# The device refuses the profile by name.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_dambreak_vs_openfoam"
@@ -108,7 +116,9 @@ STEPS_OUT=${STEPS_OUT:-4}
 [ -d "$SRC" ]      || { echo "SKIP: damBreak tutorial not found at $SRC"; exit 77; }
 [ -f "$OFBASHRC" ] || { echo "SKIP: real OpenFOAM not available"; exit 77; }
 
-W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+W=${KEEP_W:-$(mktemp -d)}
+[ -n "${KEEP_W:-}" ] || trap 'rm -rf "$W"' EXIT
+mkdir -p "$W"
 
 set +u
 # shellcheck disable=SC1091
@@ -158,6 +168,23 @@ run_at()
                  sed -i 's/^\( *\)U$/\1"U.*"/' "$C/system/fvSolution"
                  grep -q '"U\.\*"' "$C/system/fvSolution" || { echo "FAIL: the U solver entry was not widened to UFinal"; return 1; } ;;
     esac
+    if [ "$profile" = alphaminiter ]; then
+        # THE ALPHA ENTRY NAMES `minIter 1` (DTCHull, DTCHullMoving and electrostaticDeposition do). At the
+        # big step OpenFOAM's FIRST pre-solve starts under its tolerance and takes no sweep; minIter forces
+        # one. Its control is the `bigstep` run, which is the same case without it.
+        python3 - "$C" <<'PYEOF' || { echo "FAIL: the $profile profile was not staged"; return 1; }
+import os, re, sys
+q = os.path.join(sys.argv[1], 'system/fvSolution')
+t = open(q).read()
+m = re.search(r'("alpha\.water\.\*"\s*\{)([^}]*)\}', t)
+assert m, 'no alpha.water.* entry'
+body = m.group(2)
+assert 'minIter' not in body, 'the tutorial names minIter already'
+body = body + '    minIter         1;\n    '
+t = t[:m.start(2)] + body + t[m.end(2):]
+open(q, 'w').write(t)
+PYEOF
+    fi
     if [ "$profile" = outflow ]; then
         # THE WATER COLUMN REACHES THE ATMOSPHERE, whose faces over it turn out to be OUTFLOW (the patch
         # fixes p_rgh, not p, so the column top sees the lower pressure): water leaves through them.
@@ -239,7 +266,7 @@ PYEOF
     # ...and the sub-cycled one reads the un-sub-cycled one: the sub-cycle count has to be live too
     [ "$profile" = prevcorrsub ] && std="$W/prevcorr/$end"
     # ...and the three PIMPLE profiles read the big-step run without their setting
-    case "$profile" in nouter|nonorth|mompred|rhophi|vanleerv|linear|compression) std="$W/bigstep/$end" ;; esac
+    case "$profile" in nouter|nonorth|mompred|rhophi|vanleerv|linear|compression|alphaminiter) std="$W/bigstep/$end" ;; esac
     "$BIN" "$C" "$C/0" "$C/$end" "$STEPS" "$C/log.interFoam" "$C.control" "$profile" $std
 }
 
@@ -257,4 +284,5 @@ run_at "$DT_BIG" rhophi || rc=1
 run_at "$DT_BIG" vanleerv || rc=1
 run_at "$DT_BIG" linear || rc=1
 run_at "$DT_BIG" compression || rc=1
+run_at "$DT_BIG" alphaminiter || rc=1
 exit $rc

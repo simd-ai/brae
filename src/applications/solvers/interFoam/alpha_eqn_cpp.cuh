@@ -224,6 +224,9 @@ struct AlphaStepInput
     // the case's own linear-solver controls for the implicit upwind pre-solve (MULESCorr only)
     scalar  tolAlpha = 1e-8, relTolAlpha = 0;
     int     maxIterAlpha = 1000;
+    // `minIter`: the sweeps the solve takes even when its initial residual is already under tolerance
+    // (smoothSolver.C: `if (minIter_ > 0 || !converged)`)
+    int     minIterAlpha = 0;
     // `solver smoothSolver; smoother symGaussSeidel|GaussSeidel;` -- run brae::smoothSolver, which is
     // OpenFOAM's, in place of the DILU-PBiCGStab this step grew up on. See smooth_solver_cpp.cuh.
     bool smoothSolver = false;

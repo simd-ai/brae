@@ -1882,7 +1882,8 @@ COMPONENTS = {
                         "blob -- discretely divergence-free, so boundedness means something -- against "
                         "the host: alpha in [0,1] exactly, 1.1e-16 after one step and 9.99e-16 after "
                         "forty of two correctors each.",
-             note="ALPHA'S BOUNDARY IS NOT EVALUATED BEFORE ITS FLUXES (alphaEqn.H has no such call): the explicit path reads the patch values the last MULES solve left, at the first step the file's own `value`; brae evaluated at the top of alphaEqnStep. MEASURED on RAS/mixerVesselAMI, whose outlet writes `value uniform 0` under water: OpenFOAM's 62 outlet cells rise to 1.104 in the first sub-cycle, brae held them at 1, alpha 9.4e-02 after one step (tests/interfoam_ami_vs_openfoam.sh; restored, 1.9e-06 of U after 100 steps). "
+             note="minIter ON THE PRE-SOLVE is honoured on the host (AlphaStepInput::minIterAlpha): gated as laminar/damBreak `alphaminiter` on the sweep count, which is all damBreak can witness (the forced sweep acts on an exact solution); ignored it logs 0 where OpenFOAM logs 1. The device refuses it. "
+                  "ALPHA'S BOUNDARY IS NOT EVALUATED BEFORE ITS FLUXES (alphaEqn.H has no such call): the explicit path reads the patch values the last MULES solve left, at the first step the file's own `value`; brae evaluated at the top of alphaEqnStep. MEASURED on RAS/mixerVesselAMI, whose outlet writes `value uniform 0` under water: OpenFOAM's 62 outlet cells rise to 1.104 in the first sub-cycle, brae held them at 1, alpha 9.4e-02 after one step (tests/interfoam_ami_vs_openfoam.sh; restored, 1.9e-06 of U after 100 steps). "
                   "SPLIT IN TWO. The flux assembly is landed: alphaControls, the off-centring, phic, "
                   "phiCN, alphaPhiUn and rhoPhi. MULES is interFoam_MULES and is not. Su/Sp/divU are "
                   "identically zero for THIS solver (interFoam/alphaSuSp.H is three zeroFields); they "

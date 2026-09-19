@@ -94,8 +94,13 @@ int main(int argc, char** argv)
     // `compression`: div(phirb,alpha) as `Gauss interfaceCompression`, the PhiScheme four waveMaker
     // tutorials name, on a mesh that does not move. The device has no such scheme and refuses it.
     const bool compression = profileName == "compression";
-    const bool pimpleProfile = nOuter || nonOrth || momPred || namedFlux || vanLeerV || linear || compression;
-    const bool deviceRefuses = nOuter || nonOrth || namedFlux || compression;
+    // `alphaminiter`: the alpha entry names `minIter 1`. At the big step OpenFOAM's first pre-solve starts
+    // under its tolerance and takes no sweep; minIter forces one. The device's pre-solve does not honour
+    // minIter and refuses the case.
+    const bool alphaMinIter = profileName == "alphaminiter";
+    const bool pimpleProfile = nOuter || nonOrth || momPred || namedFlux || vanLeerV || linear || compression
+                            || alphaMinIter;
+    const bool deviceRefuses = nOuter || nonOrth || namedFlux || compression || alphaMinIter;
     const bool bigStep = (argc > 7 && std::string(argv[7]) == "bigstep") || prevCorr || pimpleProfile;
     // `inflow`: the atmosphere's inletValue set to 1, so water enters over air cells and rho's patch
     // value differs from the cell's on a patch where p_rgh fixes a value. It is the only fixture here
@@ -112,6 +117,7 @@ int main(int argc, char** argv)
               : momPred ? "mompred -- momentumPredictor yes, at the big step"
               : namedFlux ? "rhophi -- the atmosphere's conditions all name phi rhoPhi, at the big step"
               : compression ? "compression -- div(phirb,alpha) Gauss interfaceCompression, at the big step"
+              : alphaMinIter ? "alphaminiter -- the alpha pre-solve names minIter 1, at the big step"
               : bigStep ? "bigstep -- the solver logs discriminate here"
               : inflow  ? "inflow -- snGrad(rho) is live on the atmosphere here"
               : outflow ? "outflow -- water leaves through the atmosphere with alphaApplyPrevCorr on"
@@ -341,7 +347,27 @@ int main(int argc, char** argv)
                          : compression ? "div(phirb,alpha) Gauss interfaceCompression"
                                   : "alphaApplyPrevCorr yes";
         check("the control was given OpenFOAM's answer without the setting under test", argc > 8);
-        if (argc > 8)
+        if (argc > 8 && alphaMinIter)
+        {
+            // minIter DOES NOT MOVE damBreak's FIELDS: the one pre-solve that starts under tolerance is the
+            // first, and it starts on an exact solution, so the forced sweep changes nothing (measured at
+            // alpha tolerances 1e-8, 1e-5, 1e-4 and 1e-3: alpha identical to the last digit). What it moves
+            // is the SWEEP COUNT OpenFOAM logs -- which the host's alpha solves above are held to -- so the
+            // control is that count: OpenFOAM's run without minIter must log a different one.
+            const std::string offLog = std::filesystem::path(argv[8]).parent_path().string() + "/log.interFoam";
+            const std::vector<LinearSolveRecord> offSolves = brae::gatecheck::readOfSolves(offLog, fin.alphaName);
+            const std::vector<LinearSolveRecord> onSolves = brae::gatecheck::readOfSolves(argv[5], fin.alphaName);
+            std::size_t differ = 0;
+            for (std::size_t k = 0; k < offSolves.size() && k < onSolves.size(); ++k)
+            {
+                differ += (offSolves[k].nIterations != onSolves[k].nIterations) ? 1 : 0;
+            }
+            std::printf("  CONTROL: without `minIter 1` OpenFOAM logs %zu of %zu alpha sweep counts differently\n",
+                        differ, onSolves.size());
+            check("...so the sweep counts brae is held to can tell minIter from its absence",
+                  !onSolves.empty() && offSolves.size() == onSolves.size() && differ > 0);
+        }
+        else if (argc > 8)
         {
             const std::vector<scalar> offAlpha = readCells(std::string(argv[8]) + "/alpha.water");
             const Diff dSwitch = compare(offAlpha, ofAlpha);
@@ -454,6 +480,7 @@ int main(int argc, char** argv)
                 const char* named = nOuter ? "nOuterCorrectors"
                                   : nonOrth ? "nNonOrthogonalCorrectors"
                                   : compression ? "interfaceCompression"
+                                  : alphaMinIter ? "minIter"
                                             : "names the flux";
                 std::printf("  DEVICE: %s\n", threw ? why.substr(0, 140).c_str() : "RAN -- it must not");
                 check("the DEVICE refuses this case rather than run it at a smaller count",

@@ -240,7 +240,9 @@ arm ddt_CrankNicolson       refused "CrankNicolson"           "" "sed -i '/^ddtS
 arm ddt_localEuler          refused "localEuler"              "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         localEuler;/' system/fvSchemes"
 
 # a solver-entry floor neither the alpha pre-solve nor the momentum predictor honours yet
-arm alpha_minIter           refused "minIter 1"               "" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       yes;\\n\\1minIter 1;/' system/fvSolution"
+# the host's alpha pre-solve honours minIter (tests/interfoam_dambreak_vs_openfoam.sh `alphaminiter`); the
+# device's does not, and refuses it
+arm alpha_minIter           runs    -                        "" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       yes;\\n\\1minIter 1;/' system/fvSolution"
 
 # the non-orthogonal correction: damBreak says `corrected`, brae assembles orthogonal. SHEAR holds the
 # edit that makes that matter -- the upper blocks' top edge moved 0.4 in x, six degrees.
@@ -463,6 +465,9 @@ if [ $HAVE_GPU = 1 ]; then
     # the device loop's UEqn applies no fvOption, and refuses the mangroves by name
     BASE="$BG"
     arm device_mangrove     refused "Mangroves"             "-device" true
+    # the device's alpha pre-solve does not honour minIter (the host's does)
+    BASE="$B"
+    arm device_alphaMinIter    refused "minIter 1"               "-device" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       yes;\\n\\1minIter 1;/' system/fvSolution"
     # the device loop is handed the ACMI pair uncoupled, and refuses it by name
     BASE="$BK"
     arm device_leak         refused "coupled_half0"         "-device" true

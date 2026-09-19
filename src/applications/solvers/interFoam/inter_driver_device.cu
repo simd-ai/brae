@@ -604,6 +604,12 @@ RunReport runInterFoamDevice(
     C.alpha.alphaApplyPrevCorr = f.alphaCtl.alphaApplyPrevCorr;
     C.alpha.prevCorrInt = &dPrevCorrI;
     C.alpha.prevCorrBnd = &dPrevCorrB;
+    if (f.alphaCtl.MULESCorr && f.aSolve.minIter > 0)
+        throw std::runtime_error(
+            "brae interFoam (device): `solvers/" + f.alphaName + "` names `minIter "
+            + std::to_string(f.aSolve.minIter) + "`, which the device's alpha pre-solve does not honour. "
+            "The host loop does (gated on laminar/damBreak `alphaminiter`). Refused rather than stop a "
+            "sweep earlier than OpenFOAM does.");
     C.alpha.preSolve.tol = f.aSolve.tol;
     C.alpha.preSolve.relTol = f.aSolve.relTol;
     C.alpha.preSolve.maxIter = f.aSolve.maxIter;

@@ -432,6 +432,7 @@ RunReport runInterFoam(
                     ai.tolAlpha = f.aSolve.tol;
                     ai.relTolAlpha = f.aSolve.relTol;
                     ai.maxIterAlpha = f.aSolve.maxIter;
+                    ai.minIterAlpha = f.aSolve.minIter;
                     // ...and the case's own smoother, which the host can now run
                     ai.smoothSolver = f.aSolve.gaussSeidel();
                     ai.symmetric = (f.aSolve.smoother == "symGaussSeidel");
