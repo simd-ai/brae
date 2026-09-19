@@ -50,6 +50,42 @@ void pushFluxToPatches(
             f.alpha1.boundary[pi]->updateFromFlux(*q);
         }
     }
+    pushAlphaToPatches(f, patches);
+}
+
+// The two permeable-wall conditions look the PHASE FIELD up, by the name in their `alpha` entry, and read
+// its STORED values on their own patch at every updateCoeffs
+// (pressurePermeableAlphaInletOutletVelocity...C:160-163, prghPermeableAlphaTotalPressure...C:190-193).
+// brae's patches are told, after alpha's last boundary evaluate of the step, so a face whose alpha
+// crosses alphaMin switches in the step OpenFOAM switches it. NOT DISCRIMINATED by the gate: no face of
+// damBreakPermeable's wall crosses the threshold in either gated run.
+void pushAlphaToPatches(
+    InterFields& f,
+    const std::vector<FvPatch>& patches)
+{
+    for (std::size_t pi = 0; pi < patches.size() && pi < f.alpha1.boundary.size(); ++pi)
+    {
+        for (fvPatchField<vector>* ub : {f.U.boundary[pi].get()})
+        {
+            if (!ub->needsAlphaPatchValues()) continue;
+            if (ub->alphaFieldName() != f.alphaName)
+                throw std::runtime_error(
+                    "brae interFoam: U patch `" + patches[pi].name + "` names `alpha " + ub->alphaFieldName()
+                    + "`, and this case's phase field is `" + f.alphaName + "`. OpenFOAM looks the named "
+                    "field up and stops without it.");
+            ub->updateFromAlphaValues(f.alpha1.boundary[pi]->value());
+        }
+        for (fvPatchField<scalar>* pb : {f.p_rgh.boundary[pi].get()})
+        {
+            if (!pb->needsAlphaPatchValues()) continue;
+            if (pb->alphaFieldName() != f.alphaName)
+                throw std::runtime_error(
+                    "brae interFoam: p_rgh patch `" + patches[pi].name + "` names `alpha " + pb->alphaFieldName()
+                    + "`, and this case's phase field is `" + f.alphaName + "`. OpenFOAM looks the named "
+                    "field up and stops without it.");
+            pb->updateFromAlphaValues(f.alpha1.boundary[pi]->value());
+        }
+    }
 }
 
 GeometricField<scalar> rhoWithPatchValues(

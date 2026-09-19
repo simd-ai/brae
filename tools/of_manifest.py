@@ -2654,6 +2654,58 @@ COMPONENTS = {
                   "and that gate's floor arm caught it (4e-15 to 1.4e-11). The device pressure equation has no "
                   "boundary half and its header said OpenFOAM has none; corrected, and the device loop refuses an "
                   "open patch whose U fixes no value. HOST ONLY SO FAR."),
+        dict(name="interFoam_permeableWall", of_symbol="prghPermeableAlphaTotalPressureFvPatchScalarField",
+             of_file="src/finiteVolume/fields/fvPatchFields/derived/prghPermeableAlphaTotalPressure/"
+                     "prghPermeableAlphaTotalPressureFvPatchScalarField.C",
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/finiteVolume/fields/fv_patch_field.cuh",
+             validation="tests/interfoam_permeable_vs_openfoam.sh, real OpenFOAM on laminar/damBreakPermeable (kEpsilon "
+                        "despite the directory; 2268 cells), fixed steps of 1e-3, two profiles. `shipped`, 20 steps, "
+                        "the case as it is: the wall is dry throughout. `wetWall`, 140 steps, the setFields box "
+                        "mirrored against the wall: 27 of its 50 faces wet at the start, 25 at the end. MEASURED: "
+                        "shipped alpha 8.5e-15, p_rgh 8.0e-15, U 2.7e-15, k 2.6e-15, epsilon 6.6e-15, nut 3.7e-15; "
+                        "wetWall alpha 4.0e-13, p_rgh 5.0e-14, U 1.4e-14, all 420 p_rgh counts OpenFOAM's. The "
+                        "wall's U and p_rgh face by face against the values OpenFOAM writes (shipped: 40 moving "
+                        "faces, 5.3e-16; wetWall: OpenFOAM writes uniform 0 and brae is held to exactly 0). THE "
+                        "CONTROL: OpenFOAM with the wall a noSlip and fixedFluxPressure, 99% of U on wetWall. BROKEN "
+                        "ONCE EACH (U shipped, U wetWall): hydrostatic term out 1.0, 1.0; pressure open on every "
+                        "face nothing, 17; velocity ignoring alpha nothing, 1.3e-01; threshold 0.5 for alphaMin "
+                        "0.01 nothing, 2.2e-02; U's patches updated in every corrector 8.6e-08, 3.4e-06; the "
+                        "dynamic term out 8.6e-08, 3.4e-06; the lag applied to pressureInletOutletVelocity too "
+                        "nothing, 3.9e-02. shipped cannot see four of the seven, which is why wetWall exists. "
+                        "tests/test_permeable_wall_conditions.cu holds the per-face logic against OpenFOAM's text, "
+                        "the `alpha none` half and strict pos included, with an inletOutlet as the control. NOT "
+                        "ASSERTED: epsilon's solver RESIDUALS (counts are) -- 1.8e-06 per step apart with the "
+                        "field at 7e-15, and 0.0 apart with the wall closed: brae's epsilonWallFunction is a "
+                        "zeroGradient whose rows setValues writes, OpenFOAM's derives from fixedValue, and on a "
+                        "wall that carries flux the two normalise differently. NOT DISCRIMINATED: whether the "
+                        "phase fraction reaches the patches before or after alpha's own boundary evaluation. NOT "
+                        "CLAIMED: wetWall beyond 140 steps; a mass flux `phi`, a `p` that is not uniform, an "
+                        "`alpha` naming another field (each refused by name, tests/interfoam_refusals.sh); the "
+                        "device loop (refused by name).",
+             note="TWO CONDITIONS on one wall. permeableAlphaPressureInletOutletVelocity "
+                  "(pressurePermeableAlphaInletOutletVelocityFvPatchVectorField.C:127-178) is a mixed condition: "
+                  "refValue (phi/magSf)*n, valueFraction neg(phi), and with an alpha valueFraction = "
+                  "max(pos(alpha_p - alphaMin), valueFraction) with refValue 0 where that is 1 -- closed where "
+                  "wet, closed to inflow, zeroGradient where dry and leaving. prghPermeableAlphaTotalPressure "
+                  "(.C:151-243) is driven by constrainPressure like fixedFluxPressure: refValue p0 - "
+                  "0.5*rho*neg(phi)*|U_b|^2 - rho*gh, refGrad snGradp, valueFraction 1 - pos(alpha_p - alphaMin). "
+                  "pos is STRICT in v2412. WHAT THE GATE FOUND: fvMatrix's constructor runs "
+                  "U.boundaryFieldRef().updateCoeffs() at the momentum assembly, which sets each patch's updated_ "
+                  "flag; with momentumPredictor off nothing evaluates U until the FIRST corrector's "
+                  "U.correctBoundaryConditions(), where mixed::evaluate sees the flag and skips updateCoeffs -- so "
+                  "that one evaluation uses the ASSEMBLY-time valueFraction, not the new flux's. brae pushed the "
+                  "new flux to every U patch in every corrector: U 8.6e-08 on shipped, 3.4e-06 on wetWall. Its "
+                  "whole effect runs through the dynamic term -- COUNTED: the term is non-zero 51 times in shipped "
+                  "and 23 in wetWall, and never with the lag removed, since an updated patch holds U_b = 0 "
+                  "wherever phi < 0. PER CLASS: a condition whose updateCoeffs ends in evaluate() clears the flag "
+                  "itself (pressureInletOutletVelocity; also fixedNormalInletOutletVelocity and "
+                  "fluxCorrectedVelocity, not ported) and is exempt -- applying the lag to it broke wetWall at "
+                  "3.9e-02. WHY 140 STEPS: at step 142 a wet face goes dry, where phi was 0 or one ulp of "
+                  "round-off; neg(phi) then reads the SIGN of that round-off (brae -3.4e-21), and UEqn.A() in cell "
+                  "1792 is 2.018795e+04 in OpenFOAM against 2.019174e+04. The condition is ill-conditioned there "
+                  "in OpenFOAM itself. operator=(pvf) is not ported: interFoam's one assignment to U is followed "
+                  "at once by correctBoundaryConditions (pEqn.H:58-59). HOST ONLY SO FAR."),
         dict(name="interFoam_waveModel", of_symbol="waveModel",
              of_file="src/waveModels/waveModel/waveModel.C",
              classification="BOUNDARY_CONDITION", status="REIMPLEMENT",

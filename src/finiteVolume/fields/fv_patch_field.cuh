@@ -287,6 +287,25 @@ public:
     // variableHeightFlowRate: a mixed condition whose refValue follows the face CELL, so no loop that
     // uploads refValue once can carry it
     virtual bool isVariableHeightFlowRate() const { return false; }
+    // DOES THIS CLASS'S updateCoeffs() END IN evaluate()? It decides whether the patch is still
+    // `updated()` after a matrix assembly: fvMatrix's constructor runs updateCoeffs, which sets the flag,
+    // and only an evaluate clears it. pressureInletOutletVelocity (and fixedNormalInletOutletVelocity,
+    // fluxCorrectedVelocity) call directionMixed::evaluate() at the end of their updateCoeffs, so they
+    // are never left updated; mixed, inletOutlet and the permeable wall are. See
+    // PressureStepInput::uPatchesUpdatedAtEntry for what the flag then does to the first corrector.
+    virtual bool updateCoeffsEvaluates() const { return false; }
+    // The two permeable-wall conditions read the named phase field's STORED values on their own patch
+    // at every updateCoeffs. brae's patches cannot look a field up: the driver hands the values over.
+    virtual bool needsAlphaPatchValues() const { return false; }
+    virtual void updateFromAlphaValues(const std::vector<scalar>&) {}
+    // prghPermeableAlphaTotalPressure: refValue and valueFraction, which its updateSnGrad rebuilds from
+    // rho, phi and U on the patch and gh at the face centres, just before it takes the gradient
+    virtual bool isPrghPermeableAlphaTotalPressure() const { return false; }
+    virtual void updatePermeableTotalPressure(
+        const std::vector<scalar>&,
+        const std::vector<scalar>&,
+        const std::vector<vector>&,
+        const std::vector<scalar>&) {}
 
     // turbulentIntensityKineticEnergyInlet / turbulentMixingLengthDissipationRateInlet: which one, and
     // its coefficient (the intensity, or the mixing length). Exposed for the same reason
@@ -1660,6 +1679,164 @@ private:
     std::string alphaName_;
 };
 
+// permeableAlphaPressureInletOutletVelocity (OF pressurePermeableAlphaInletOutletVelocityFvPatchVectorField,
+// whose TypeName is the name above): a wall that is a WALL where it is wet and OPEN where it is dry. A
+// mixed condition with a SCALAR valueFraction, refGrad 0 (.C:127-178):
+//     refValue      = (phi/magSf)*n
+//     valueFraction = neg(phi)
+//     with `alpha`: valueFraction = max(pos(alpha_p - alphaMin), valueFraction), and refValue = 0 on
+//                   every face where that is 1
+// so a wet face, and any face the flux ENTERS through, holds U = 0, and a dry face the flux leaves
+// through is zeroGradient. pos is STRICT in this OpenFOAM (Scalar.H:243, s > 0). The dictionary
+// constructor reads `value` (mandatory) and seeds refValue 0, refGrad 0, valueFraction 1 (.C:86-90).
+// assignable() is TRUE (.H:185), overriding mixed. phi is the VOLUMETRIC flux here; a mass flux would
+// divide by rho and is refused where the patch is built.
+// NOT PORTED: operator=(pvf), which stores lerp(pvf, n*(n & pvf), valueFraction) (.C:199-207). The one
+// assignment interFoam makes to U is followed at once by U.correctBoundaryConditions() (pEqn.H:58-59),
+// which replaces what it stored; the wall's U agrees with the `value` OpenFOAM writes to 1e-13.
+class PermeableAlphaPressureInletOutletVelocityPatchField : public MixedPatchField<vector>
+{
+public:
+    PermeableAlphaPressureInletOutletVelocityPatchField(
+        const FvPatch& p,
+        std::string alphaName,
+        scalar alphaMin,
+        std::vector<vector> readValue)
+        : MixedPatchField<vector>(p, /*uniform=*/false, vector{0, 0, 0},
+                                  std::vector<vector>(static_cast<std::size_t>(p.size), vector{0, 0, 0}),
+                                  /*velocitySign=*/true, /*freestream=*/false, readValue),
+          alphaName_(std::move(alphaName)),
+          alphaMin_(alphaMin)
+    {
+        this->vf_.assign(static_cast<std::size_t>(p.size), scalar(1));
+    }
+    bool assignable() const override { return true; }
+    bool needsAlphaPatchValues() const override { return alphaName_ != "none"; }
+    const std::string& alphaFieldName() const override { return alphaName_; }
+
+    void updateFromFlux(const std::vector<scalar>& phip) override
+    {
+        phi_ = phip;
+        rebuild();
+    }
+    void updateFromAlphaValues(const std::vector<scalar>& alphap) override
+    {
+        alpha_ = alphap;
+        rebuild();
+    }
+
+private:
+    void rebuild()
+    {
+        const std::size_t n = static_cast<std::size_t>(this->patch_.size);
+        const bool withAlpha = alphaName_ != "none";
+        if (phi_.size() < n || (withAlpha && alpha_.size() < n)) return;
+        std::vector<vector> ref(n, vector{0, 0, 0});
+        std::vector<scalar> vf(n, scalar(0));
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const label f = static_cast<label>(i);
+            ref[i] = this->patch_.nf[f] * (phi_[i] / this->patch_.magSf[f]);
+            vf[i] = (phi_[i] < scalar(0)) ? scalar(1) : scalar(0);
+            if (withAlpha)
+            {
+                const scalar cut = (alpha_[i] - alphaMin_ > scalar(0)) ? scalar(1) : scalar(0);
+                vf[i] = std::fmax(cut, vf[i]);
+                if (vf[i] == scalar(1))
+                {
+                    ref[i] = vector{0, 0, 0};
+                }
+            }
+        }
+        this->setRefValues(std::move(ref));
+        this->setValueFraction(std::move(vf));
+    }
+
+    std::string alphaName_;
+    scalar alphaMin_;
+    std::vector<scalar> phi_;
+    std::vector<scalar> alpha_;
+};
+
+// prghPermeableAlphaTotalPressure (OF prghPermeableAlphaTotalPressureFvPatchScalarField): the pressure
+// half of the same wall. A mixed condition that constrainPressure drives through updateSnGrad(snGradp),
+// as it drives fixedFluxPressure (.C:151-212):
+//     refValue      = p0 - 0.5*rho_p*neg(phi_p)*magSqr(U_p) - rho_p*((g & Cf) - ghRef)
+//     refGrad       = snGradp
+//     valueFraction = 1 - pos(alpha_p - alphaMin)            (left at 0 without an `alpha`)
+// so a WET face takes the flux-consistent gradient a wall takes, and a DRY one the total pressure in
+// p_rgh's terms. The dictionary constructor seeds refValue ONE, refGrad 0, valueFraction 0, and the
+// value is the file's `value` or, without one, that refValue of 1 (.C:88-95).
+class PrghPermeableAlphaTotalPressurePatchField : public MixedPatchField<scalar>
+{
+public:
+    PrghPermeableAlphaTotalPressurePatchField(
+        const FvPatch& p,
+        scalar p0,
+        std::string alphaName,
+        scalar alphaMin,
+        std::vector<scalar> readValue)
+        : MixedPatchField<scalar>(p, /*uniform=*/true, scalar(1), {}, /*velocitySign=*/false,
+                                  /*freestream=*/false,
+                                  readValue.size() == static_cast<std::size_t>(p.size)
+                                      ? readValue
+                                      : std::vector<scalar>(static_cast<std::size_t>(p.size), scalar(1))),
+          p0_(p0),
+          alphaName_(std::move(alphaName)),
+          alphaMin_(alphaMin)
+    {
+        this->vf_.assign(static_cast<std::size_t>(p.size), scalar(0));
+    }
+    bool updateableSnGrad() const override { return true; }
+    bool snGradEverSet() const override { return everUpdated_; }
+    bool isPrghPermeableAlphaTotalPressure() const override { return true; }
+    bool needsAlphaPatchValues() const override { return alphaName_ != "none"; }
+    const std::string& alphaFieldName() const override { return alphaName_; }
+
+    void updateFromAlphaValues(const std::vector<scalar>& alphap) override { alpha_ = alphap; }
+
+    void updatePermeableTotalPressure(
+        const std::vector<scalar>& rhop,
+        const std::vector<scalar>& phip,
+        const std::vector<vector>& Up,
+        const std::vector<scalar>& ghp) override
+    {
+        const std::size_t n = static_cast<std::size_t>(this->patch_.size);
+        const bool withAlpha = alphaName_ != "none";
+        if (rhop.size() < n || phip.size() < n || Up.size() < n || ghp.size() < n || (withAlpha && alpha_.size() < n))
+            throw std::runtime_error(
+                "brae: prghPermeableAlphaTotalPressure on patch '" + this->patch_.name + "' needs rho, phi, "
+                "U and gh on every face of the patch" + (withAlpha ? ", and the phase fraction" : "")
+                + "; it was handed fewer.");
+        std::vector<scalar> ref(n);
+        std::vector<scalar> vf(n, scalar(0));
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const scalar inflow = (phip[i] < scalar(0)) ? scalar(1) : scalar(0);
+            const scalar magSqrU = Up[i].x*Up[i].x + Up[i].y*Up[i].y + Up[i].z*Up[i].z;
+            ref[i] = p0_ - scalar(0.5)*rhop[i]*inflow*magSqrU - rhop[i]*ghp[i];
+            if (withAlpha)
+            {
+                vf[i] = scalar(1) - ((alpha_[i] - alphaMin_ > scalar(0)) ? scalar(1) : scalar(0));
+            }
+        }
+        this->setRefValues(std::move(ref));
+        this->setValueFraction(std::move(vf));
+    }
+    void updateSnGrad(const std::vector<scalar>& g) override
+    {
+        this->setRefGrad(g);
+        everUpdated_ = true;
+    }
+
+private:
+    scalar p0_;
+    std::string alphaName_;
+    scalar alphaMin_;
+    std::vector<scalar> alpha_;
+    bool everUpdated_ = false;
+};
+
 // inletOutlet: flux-conditional mix (OF mixed, valueFraction = neg(phi), refValue = inletValue, refGrad = 0).
 // Per face: inflow (phi<0) -> fixedValue = inletValue; outflow (phi>=0) -> zeroGradient. The host evaluate()
 // does not see the flux; the DEVICE recomputes the per-face fixedValue|zeroGradient choice every iteration from
@@ -1957,6 +2134,9 @@ public:
     // at every pressureInletOutletVelocity patch -- an outlet that is supposed to let the pressure set
     // its own inflow.
     bool assignable() const override { return true; }
+    // pressureInletOutletVelocityFvPatchVectorField.C, updateCoeffs: its last line is
+    // directionMixedFvPatchVectorField::evaluate()
+    bool updateCoeffsEvaluates() const override { return true; }
     // TRUE AS WELL, and for the same reason: directionMixedFvPatchField.H:130 says so and the derived
     // class does not override it. correctUphiBCs (CorrectPhi) re-evaluates exactly the velocity patches
     // that fix a value and writes phi there from U_b & Sf; ddtCorr zeroes its coefficient on them; and
@@ -2475,6 +2655,56 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
                 p, d.valueUniform, d.uniformValue, d.values, p0.uniform, p0.uniformValue, p0.values);
         return std::make_unique<TotalPressurePatchField<T>>(
             p, p0.uniform, p0.uniformValue, p0.values, p0.uniform, p0.uniformValue, p0.values);
+    }
+    if (d.type == "permeableAlphaPressureInletOutletVelocity")
+    {
+        if constexpr (std::is_same_v<T, vector>)
+        {
+            if (!d.hasValue)
+                throw std::runtime_error("brae: permeableAlphaPressureInletOutletVelocity on patch " + p.name +
+                    " has no `value`, which OpenFOAM reads MUST_READ.");
+            if (d.phiName != "phi")
+                throw std::runtime_error("brae: permeableAlphaPressureInletOutletVelocity on patch " + p.name +
+                    " names `phi " + d.phiName + "`. With a MASS flux its refValue is phi/(rho*magSf) "
+                    "(the .C's dimMass/dimTime branch); brae carries the volumetric form only.");
+            std::vector<vector> readValue = d.valueUniform
+                ? std::vector<vector>(static_cast<std::size_t>(p.size), d.uniformValue) : d.values;
+            return std::make_unique<PermeableAlphaPressureInletOutletVelocityPatchField>(
+                p, d.vhAlphaName.empty() ? std::string("none") : d.vhAlphaName,
+                d.hasAlphaMin ? d.alphaMin : scalar(1), std::move(readValue));
+        }
+        else
+        {
+            throw std::runtime_error("brae: permeableAlphaPressureInletOutletVelocity on patch " + p.name +
+                                     " is a VELOCITY condition and the field is not a vector.");
+        }
+    }
+    if (d.type == "prghPermeableAlphaTotalPressure")
+    {
+        if constexpr (std::is_same_v<T, scalar>)
+        {
+            if (!d.prghPUnsupported.empty())
+                throw std::runtime_error("brae: prghPermeableAlphaTotalPressure on patch " + p.name +
+                    " gives `p` as `" + d.prghPUnsupported + "`. It is a PatchFunction1; brae reads "
+                    "`uniform <value>` and a bare value, and refuses anything that varies.");
+            if (!d.hasPrghP)
+                throw std::runtime_error("brae: prghPermeableAlphaTotalPressure on patch " + p.name +
+                    " has no `p` entry, which OpenFOAM's PatchFunction1::New makes mandatory.");
+            std::vector<scalar> readValue;
+            if (d.hasValue)
+            {
+                readValue = d.valueUniform ? std::vector<scalar>(static_cast<std::size_t>(p.size), d.uniformValue)
+                                           : d.values;
+            }
+            return std::make_unique<PrghPermeableAlphaTotalPressurePatchField>(
+                p, d.prghP, d.vhAlphaName.empty() ? std::string("none") : d.vhAlphaName,
+                d.hasAlphaMin ? d.alphaMin : scalar(1), std::move(readValue));
+        }
+        else
+        {
+            throw std::runtime_error("brae: prghPermeableAlphaTotalPressure on patch " + p.name +
+                                     " is a PRESSURE condition and the field is not a scalar.");
+        }
     }
     if (d.type == "variableHeightFlowRateInletVelocity")
     {

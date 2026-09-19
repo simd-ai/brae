@@ -197,6 +197,14 @@ struct PatchFieldData
     bool           hasUpperBound = false;
     scalar         lowerBound   = 0.0;
     scalar         upperBound   = 0.0;
+    // permeableAlphaPressureInletOutletVelocity and prghPermeableAlphaTotalPressure: `alphaMin` (default
+    // 1) beside the `alpha` name above (default `none`), and the second one's reference pressure `p`, a
+    // PatchFunction1 that brae reads as `uniform <value>` or a bare value
+    bool           hasAlphaMin  = false;
+    scalar         alphaMin     = 1.0;
+    bool           hasPrghP     = false;
+    scalar         prghP        = 0.0;
+    std::string    prghPUnsupported;
     bool           extrapolateProfile = false;
     scalar         mixingLength = 0;
     // turbulentMixingLengthDissipationRateInlet's OWN `Cmu` (turbulentMixingLengthDissipationRateInlet-
@@ -1183,6 +1191,37 @@ inline FieldData<T> readField(const std::string& path)
                     {
                         p.vhAlphaName = ts.next();
                         ts.expect(";");
+                    }
+                    else if (key == "alphaMin")    // the two permeable-wall conditions
+                    {
+                        p.alphaMin = ts.nextScalar();
+                        p.hasAlphaMin = true;
+                        ts.expect(";");
+                    }
+                    else if (key == "p")           // prghPermeableAlphaTotalPressure's reference pressure
+                    {
+                        std::string w = ts.next();
+                        if (w == "uniform" || w == "constant") w = ts.next();
+                        if (isFoamNumber(w))
+                        {
+                            p.prghP = std::stod(w);
+                            p.hasPrghP = true;
+                            ts.expect(";");
+                        }
+                        else
+                        {
+                            // named by the dispatch, not died on here: skip the entry whole
+                            p.prghPUnsupported = w;
+                            int depth = (w == "{" || w == "(") ? 1 : 0;
+                            while (!ts.eof() && !(depth == 0 && ts.peek() == ";"))
+                            {
+                                const std::string t = ts.next();
+                                if (t == "{" || t == "(") ++depth;
+                                else if (t == "}" || t == ")") --depth;
+                                if (depth == 0 && (t == "}")) break;
+                            }
+                            if (!ts.eof() && ts.peek() == ";") ts.next();
+                        }
                     }
                     else if (key == "lowerBound")  // variableHeightFlowRate
                     {

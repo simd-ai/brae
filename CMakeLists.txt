@@ -3441,6 +3441,24 @@ target_include_directories(test_variable_height_flow_rate PRIVATE ${BRAE_HEADER_
 target_link_libraries(test_variable_height_flow_rate PRIVATE brae_core)
 add_test(NAME variable_height_flow_rate COMMAND test_variable_height_flow_rate)
 
+# The two permeable-wall conditions face by face, against OpenFOAM's text: the `alpha none` half and the
+# dry-inflow face, which laminar/damBreakPermeable does not reach.
+add_executable(test_permeable_wall_conditions tests/test_permeable_wall_conditions.cu)
+target_include_directories(test_permeable_wall_conditions PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_permeable_wall_conditions PRIVATE brae_core)
+add_test(NAME permeable_wall_conditions COMMAND test_permeable_wall_conditions)
+
+# ...and the permeable wall, on laminar/damBreakPermeable: a velocity and a pressure condition that each
+# switch face by face, on the phase fraction at the patch, between a wall and an open boundary. Two
+# profiles -- as shipped (the wall stays dry) and the column staged against the wall (faces go dry as it
+# falls); the control is OpenFOAM with the wall closed, and the device loop must refuse by name.
+add_executable(test_inter_permeable_vs_openfoam tests/test_inter_permeable_vs_openfoam.cu)
+target_include_directories(test_inter_permeable_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_permeable_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_permeable_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_permeable_vs_openfoam.sh)
+
 # ...and the wave boundary conditions (waveAlpha, waveVelocity) on laminar/waves/stokesI: fields, the
 # patch values the wave model assigns, its two derived constants and the ORDER it updates in, all
 # against real OpenFOAM; the control is OpenFOAM's own answer with the wave switched off.
