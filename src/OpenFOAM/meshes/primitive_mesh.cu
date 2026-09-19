@@ -268,6 +268,10 @@ void PrimitiveMesh::readBoundary(const std::string& dir)
         std::string acmiScaleType;
         std::vector<std::pair<scalar, scalar>> acmiScaleTable;
         scalar acmiScaleConst = 1;
+        // `type coded;`: the keys CodedField.C reads -- `name` (default the entry name, :158) and `code`;
+        // codeInclude, localCode, codeOptions and codeLibs are collected so the coded object refuses them
+        CodedPatchFunction1Spec acmiCoded;
+        acmiCoded.name = "scale";
         pi.name = ts.next();
         ts.expect("{");
         while (ts.peek() != "}")
@@ -299,6 +303,49 @@ void PrimitiveMesh::readBoundary(const std::string& dir)
                     {
                         acmiScaleTable = readAcmiScaleTable(ts);
                         ts.expect(";");
+                    }
+                    else if (k2 == "code")
+                    {
+                        // the verbatim #{ ... #} token; a quoted string is a legal `code` too
+                        const std::string tok = ts.next();
+                        if (!ts.verbatim(tok, acmiCoded.code))
+                        {
+                            acmiCoded.code = tok;
+                        }
+                        ts.expect(";");
+                    }
+                    else if (k2 == "name")
+                    {
+                        acmiCoded.name = ts.next();
+                        ts.expect(";");
+                    }
+                    else if (k2 == "codeInclude" || k2 == "localCode" || k2 == "codeOptions" || k2 == "codeLibs")
+                    {
+                        acmiCoded.unsupportedKeys += (acmiCoded.unsupportedKeys.empty() ? "`" : ", `") + k2 + "`";
+                        if (ts.peek() == "{")
+                        {
+                            ts.expect("{");
+                            for (int depth = 1; depth > 0; )
+                            {
+                                const std::string t = ts.next();
+                                if (t == "{")
+                                {
+                                    ++depth;
+                                }
+                                else if (t == "}")
+                                {
+                                    --depth;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            while (ts.peek() != ";")
+                            {
+                                ts.next();
+                            }
+                            ts.expect(";");
+                        }
                     }
                     else if (ts.peek() == "{")
                     {
@@ -409,10 +456,19 @@ void PrimitiveMesh::readBoundary(const std::string& dir)
             if (acmiScaleType == "constant")        pi.acmiScale = Function1::constant(acmiScaleConst);
             else if (acmiScaleType == "table" && !acmiScaleTable.empty())
                                                     pi.acmiScale = Function1::table(acmiScaleTable);
+            else if (acmiScaleType == "coded")
+            {
+                acmiCoded.origin = dir + "/boundary: patch '" + pi.name + "', scale";
+                // <case>/dynamicCode, where OpenFOAM builds its own (a brae/ subdirectory keeps the two apart)
+                acmiCoded.codeDir =
+                    (std::filesystem::path(dir).parent_path().parent_path() / "dynamicCode" / "brae").string();
+                pi.acmiScaleCoded = true;
+                pi.acmiScaleCodedSpec = acmiCoded;
+            }
             else
                 throw std::runtime_error(
                     "brae: cyclicACMI '" + pi.name + "' has `scale " + acmiScaleType + "`, which brae "
-                    "does not evaluate (it reads `constant` and `table`). The scale sets how far the "
+                    "does not evaluate (it reads `constant`, `table` and `coded`). The scale sets how far the "
                     "interface is open at each time, so substituting another function solves a "
                     "different case.");
         }
