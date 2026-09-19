@@ -425,10 +425,17 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
     // solve exact to 1e-13 and every second-pass one 84% to 170% out in its initial residual, one of
     // them taking 3 sweeps for OpenFOAM's 2, and the fields 4.9e-06 in alpha and 1.0e-03 in U.
     //
-    // The evaluateBoundary stays. Removing it was tried, with the reset, when this file had other
-    // defects, and read thirty times worse on damBreak; the boundary has to reflect the flux the last
-    // pressure corrector left, which a flux-conditional patch only learns here.
-    alpha1.evaluateBoundary();
+    // NOR IS ITS BOUNDARY EVALUATED HERE. OpenFOAM's alphaEqn.H evaluates alpha1 nowhere before its
+    // fluxes: the explicit path's alphaPhiUn = fvc::flux(phi, alpha1, ...) reads the patch values as the
+    // LAST evaluate left them -- the previous MULES solve's closing correctBoundaryConditions, or at the
+    // first step the file's own `value` -- and the pre-solve's matrix reads only coefficients. A
+    // flux-conditional patch learns the new flux at its next evaluate, not before. MEASURED on
+    // RAS/mixerVesselAMI's first step (explicit MULES, two sub-cycles), with OpenFOAM's sub-cycles
+    // instrumented: the outlet's alpha flux is exactly 0 in sub-cycle one, since the file writes `value
+    // uniform 0` there under water, and the 62 outlet cells rise to 1.104; brae evaluated here, took the
+    // cells' alpha of 1 on the outflow faces, and kept them at 1 -- alpha 9.4e-02 from OpenFOAM after one
+    // step. (An earlier version kept this evaluate on a damBreak measurement taken while the file had
+    // other defects.)
 
     // phic = cAlpha*|phi/magSf|, zeroed on every non-coupled boundary -- ONCE, at the top, as alphaEqn.H
     // computes it (:59-89), before the pre-solve and before anything interpolates across the mesh. With

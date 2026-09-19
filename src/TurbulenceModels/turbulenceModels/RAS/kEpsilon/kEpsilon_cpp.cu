@@ -866,6 +866,17 @@ void correctNutField(
             continue;
         }
 
+        // ...EXCEPT where the patch's operator= is empty: fixedValue (fixedValueFvPatchField.H:202-216)
+        // and mixed (mixedFvPatchField.H:303-317) ignore a field assignment, so nut there is what
+        // correctBoundaryConditions then evaluates -- a fixedValue keeps its own value, a mixed blends
+        // with the new cell nut. MEASURED on RAS/mixerVesselAMI, whose gasInlet writes `nut fixedValue
+        // 0`: brae put Cmu*k^2/epsilon = 1.29e-03 there where OpenFOAM keeps 0, and U was 2.7e-03 from
+        // OpenFOAM after one step.
+        if (nutField.boundary[pi]->fixesValue() && !nutField.boundary[pi]->assignable())
+        {
+            nutField.boundary[pi]->evaluate(nutF);
+            continue;
+        }
         const std::vector<scalar>& kb = k.boundary[pi]->value();
         const std::vector<scalar>& eb = epsilon.boundary[pi]->value();
         std::vector<scalar> nb(patches[pi].size);
