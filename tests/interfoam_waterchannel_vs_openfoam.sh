@@ -53,6 +53,12 @@
 # BROKEN ONCE EACH: the outlet never evaluated (as brae had it) U 9.2e-07, nut 8.5e-04; the inlet
 # written by the assignment U 1.2e-01, nut 3.2e-02.
 #
+# PROFILE nutInletZeroGrad: the inlet's nut zeroGradient -- a patch kind kOmegaSST's closure used to skip
+# entirely, so it kept the value it was built with (0) where correctBoundaryConditions gives OpenFOAM the
+# cell's nut; the inlet's U fixes a value, so the viscous term reads it. MEASURED: U 3.8e-12, nut 1.0e-12.
+# CONTROL: OpenFOAM with the patch pinned at 0 (brae's old answer), nut 1.4e-05 away. BROKEN (as brae
+# had it): U 8.7e-05.
+#
 # NOT CLAIMED: `density variable` with kOmegaSST, F3, decayControl, a wall-function blending other than
 # binomial n = 2, a moving mesh and the device -- all refused by name; the scalarTransport function
 # object `s`, which brae does not run (it does not feed back into the flow).
@@ -103,6 +109,20 @@ stage()
     fi
     # nutPatches: nut pinned at the inlet (fixedValue) and flux-conditional at the outlet (inletOutlet),
     # the two patch kinds kOmegaSST's field assignment does not write
+    # nutInletZeroGrad: the inlet's nut zeroGradient, which correctBoundaryConditions sets to the cell's
+    # nut; nutInletZero, its control: the same patch pinned at 0, which is what brae's closure left there
+    if [ "$profile" = nutInletZeroGrad ] || [ "$profile" = nutInletZero ]; then
+        PROFILE="$profile" python3 - "$C" <<'PYEOF' || { echo "FAIL: the $profile profile was not staged"; return 1; }
+import os, sys
+p = sys.argv[1] + '/0/nut'
+s = open(p).read()
+i = s.index('    ".*"')
+body = ('        type            zeroGradient;\n' if os.environ['PROFILE'] == 'nutInletZeroGrad'
+        else '        type            fixedValue;\n        value           uniform 0;\n')
+s = s[:i] + '    inlet\n    {\n' + body + '    }\n\n' + s[i:]
+open(p, 'w').write(s)
+PYEOF
+    fi
     if [ "$profile" = nutPatches ]; then
         python3 - "$C" <<'PYEOF' || { echo "FAIL: the nutPatches profile was not staged"; return 1; }
 import sys
@@ -147,7 +167,7 @@ PYEOF
 }
 
 rc=0
-for p in laminar sst nutPatches; do
+for p in laminar sst nutPatches nutInletZeroGrad nutInletZero; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_waterchannel_vs_openfoam: staging failed"; exit 1; }
@@ -163,6 +183,10 @@ grep -q "Solving for omega" "$W/laminar/log.interFoam" \
 "$BIN" "$W/sst" "$W/sst/0" "$W/sst/$END" "$STEPS" "$W/sst/log.interFoam" "$W/laminar/$END" || rc=1
 "$BIN" "$W/nutPatches" "$W/nutPatches/0" "$W/nutPatches/$END" "$STEPS" "$W/nutPatches/log.interFoam" \
        "$W/laminar/$END" "$W/sst/$END" || rc=1
+# the control is OpenFOAM's answer with the patch pinned at 0: nut 1.4e-05 away, a floor of 1e-6 (six
+# orders above the round-off both codes reach)
+"$BIN" "$W/nutInletZeroGrad" "$W/nutInletZeroGrad/0" "$W/nutInletZeroGrad/$END" "$STEPS" \
+       "$W/nutInletZeroGrad/log.interFoam" "$W/laminar/$END" "$W/nutInletZero/$END" 1e-6 || rc=1
 
 echo "interfoam_waterchannel_vs_openfoam: rc $rc"
 exit $rc

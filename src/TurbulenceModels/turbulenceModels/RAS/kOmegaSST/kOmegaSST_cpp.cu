@@ -942,7 +942,16 @@ void correctNutField(
             nutField.boundary[pi]->evaluate(nutF);
             continue;
         }
-        if (nutField.boundary[pi]->bcCategory() != 2) continue;   // fixedValue means the case PINNED it
+        // ...and every other patch that is not `calculated`: correctBoundaryConditions evaluates it --
+        // a zeroGradient or symmetry takes the new cell nut, a fixedValue keeps the value the case pinned,
+        // a coupled patch interpolates. MEASURED on RAS/waterChannel with the inlet's nut zeroGradient:
+        // skipped, it kept the value it was built with (0) where OpenFOAM holds the cell's, and U was
+        // 8.7e-05 from OpenFOAM after ten steps (tests/interfoam_waterchannel_vs_openfoam.sh `nutInletZeroGrad`).
+        if (nutField.boundary[pi]->bcCategory() != 2)
+        {
+            nutField.boundary[pi]->evaluate(nutF);
+            continue;
+        }
 
         const std::vector<scalar>& kb = k.boundary[pi]->value();
         const std::vector<scalar>& ob = omega.boundary[pi]->value();
