@@ -531,6 +531,7 @@ void validateInterTurbulence(
     const GeometricField<vector>& U,
     const std::vector<scalar>& nu,
     const std::vector<std::vector<scalar>>& nuBnd,
+    const SurfaceScalarField& phi,
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& patches)
@@ -558,6 +559,7 @@ void validateInterTurbulence(
         kOmegaSST::Compressible sstComp;
         sstComp.nu = &nu;
         sstComp.nuBnd = &nuBnd;
+        sstComp.nutPhi = &phi;
         kOmegaSST::correctNutField(U, t.k, t.omega, t.nut, gradU, t.yCell, nearWallDist(m, g, patches),
                                    scalar(0), m, g, patches, t.sstCoeffs, &sstComp);
         return;
@@ -566,6 +568,7 @@ void validateInterTurbulence(
     kEpsilonRef::Compressible comp;
     comp.nu = &nu;
     comp.nuBnd = &nuBnd;
+    comp.nutPhi = &phi;
     kEpsilonRef::NutWallSelection sel;
     sel.kind = &t.nutWallKind;
     sel.U = &U;
@@ -641,6 +644,7 @@ void correctInterTurbulence(
         sstComp.nu = in.nu;
         sstComp.nuBnd = in.nuBnd;
         sstComp.rDeltaT = scalar(1) / in.deltaT;
+        sstComp.nutPhi = in.phi;
         const SmoothLinearSolve& ks = t.kSolveFinal;
         const SmoothLinearSolve& os = t.omegaSolveFinal;
         if (ks.smoother != os.smoother || ks.tol != os.tol || ks.relTol != os.relTol
@@ -677,6 +681,7 @@ void correctInterTurbulence(
     comp.nu = in.nu;
     comp.nuBnd = in.nuBnd;
     comp.rDeltaT = scalar(1) / in.deltaT;
+    comp.nutPhi = in.phi;
     comp.V0 = in.V0;
     comp.meshPhi = in.meshPhi;
     // The equation's own flux. In the variable lineage that is rhoPhi, while divU and every

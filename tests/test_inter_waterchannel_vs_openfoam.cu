@@ -245,6 +245,16 @@ int main(
                 (double)dLamU.rel());
     check("the model moves OpenFOAM's own U far more than brae is from it",
           dLamU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)) && dLamU.rel() > scalar(1e-3));
+    // ...and for a profile that changes nut's patches, OpenFOAM's own answer without the change: the
+    // patches must move OpenFOAM's nut far more than brae is from it
+    if (argc > 7)
+    {
+        const Diff dShipN = compare(readCells(std::string(argv[7]) + "/nut"), ofNut);
+        std::printf("  CONTROL: OpenFOAM with the shipped nut patches against this profile, nut relative %.4e\n",
+                    (double)dShipN.rel());
+        check("the profile's nut patches move OpenFOAM's own nut far more than brae is from it",
+              dShipN.rel() > scalar(1000)*std::fmax(dN.rel(), scalar(1e-14)) && dShipN.rel() > scalar(1e-4));
+    }
 
     // THE DEVICE LOOP REFUSES, by name
     int nDev = 0;

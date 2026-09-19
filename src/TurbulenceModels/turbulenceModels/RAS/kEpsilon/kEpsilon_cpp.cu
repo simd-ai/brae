@@ -892,6 +892,22 @@ void correctNutField(
         // with the new cell nut. MEASURED on RAS/mixerVesselAMI, whose gasInlet writes `nut fixedValue
         // 0`: brae put Cmu*k^2/epsilon = 1.29e-03 there where OpenFOAM keeps 0, and U was 2.7e-03 from
         // OpenFOAM after one step.
+        // an inletOutlet nut (or a relative): OpenFOAM's correctBoundaryConditions evaluates it against the
+        // cell nut just assigned, inflow faces taking the inletValue. MEASURED on RAS/waterChannel under
+        // kOmegaSST with `outlet inletOutlet; inletValue 0.002`: skipped, nut 8.5e-04 from OpenFOAM after
+        // ten steps and U 9.2e-07 (tests/interfoam_waterchannel_vs_openfoam.sh `nutOutlet`).
+        if (nutField.boundary[pi]->isInletOutlet())
+        {
+            if (!comp || !comp->nutPhi || comp->nutPhi->boundary.size() <= pi)
+            {
+                throw std::runtime_error(
+                    "brae kEpsilon: nut on patch `" + patches[pi].name + "` is flux-conditional (inletOutlet) and the "
+                    "caller handed the closure no flux to decide inflow by (Compressible::nutPhi).");
+            }
+            nutField.boundary[pi]->updateFromFlux(comp->nutPhi->boundary[pi]);
+            nutField.boundary[pi]->evaluate(nutF);
+            continue;
+        }
         if (nutField.boundary[pi]->fixesValue() && !nutField.boundary[pi]->assignable())
         {
             nutField.boundary[pi]->evaluate(nutF);

@@ -926,6 +926,22 @@ void correctNutField(
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         if (patches[pi].type == "wall") continue;
+        // an inletOutlet nut (or a relative): OpenFOAM's correctBoundaryConditions evaluates it against the
+        // cell nut just assigned, inflow faces taking the inletValue. MEASURED on RAS/waterChannel under
+        // kOmegaSST with `outlet inletOutlet; inletValue 0.002`: skipped, nut 8.5e-04 from OpenFOAM after
+        // ten steps and U 9.2e-07 (tests/interfoam_waterchannel_vs_openfoam.sh `nutOutlet`).
+        if (nutField.boundary[pi]->isInletOutlet())
+        {
+            if (!comp || !comp->nutPhi || comp->nutPhi->boundary.size() <= pi)
+            {
+                throw std::runtime_error(
+                    "brae kOmegaSST: nut on patch `" + patches[pi].name + "` is flux-conditional (inletOutlet) and the "
+                    "caller handed the closure no flux to decide inflow by (Compressible::nutPhi).");
+            }
+            nutField.boundary[pi]->updateFromFlux(comp->nutPhi->boundary[pi]);
+            nutField.boundary[pi]->evaluate(nutF);
+            continue;
+        }
         if (nutField.boundary[pi]->bcCategory() != 2) continue;   // fixedValue means the case PINNED it
 
         const std::vector<scalar>& kb = k.boundary[pi]->value();

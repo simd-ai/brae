@@ -348,6 +348,17 @@ RunReport runInterFoamDevice(
     {
         std::printf("  *** BRAE_INTER_HOST_CLOSURE: the device loop is running the HOST kEpsilon. ***\n");
     }
+    // nut's flux-conditional patches: after the model's field assignment OpenFOAM evaluates them against
+    // the flux (the host closure does, kEpsilonRef::Compressible::nutPhi); the device closure writes nut's
+    // boundary from k and epsilon alone
+    for (std::size_t pi = 0; deviceClosure && pi < fvp.size(); ++pi)
+    {
+        if (f.turbulence.nut.boundary[pi]->isInletOutlet())
+            throw std::runtime_error(
+                "brae interFoam (device): nut on patch `" + fvp[pi].name + "` is an inletOutlet, which the "
+                "device closure does not evaluate against the flux. The host loop does (gated on "
+                "RAS/damBreak `nutAtmosphere`). Refused rather than run it as a calculated patch.");
+    }
     DeviceInterTurbulence dTurb = deviceClosure
         ? buildDeviceInterTurbulence(f.turbulence, f.U, m, g, fvp)
         : DeviceInterTurbulence();

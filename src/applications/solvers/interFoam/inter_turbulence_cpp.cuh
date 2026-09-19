@@ -161,6 +161,7 @@ void validateInterTurbulence(
     const GeometricField<vector>& U,
     const std::vector<scalar>& nu,
     const std::vector<std::vector<scalar>>& nuBnd,
+    const SurfaceScalarField& phi,     // the flux nut's inletOutlet patches decide inflow by
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& patches);

@@ -1000,7 +1000,7 @@ InterFields buildInterFields(const std::string&          caseDir,
             + std::to_string(f.pimple.nOuterCorrectors) + " runs turbulence->correct() more than once "
             "inside a time step. The second call needs k.oldTime() and the non-Final solver entries, "
             "which this port does not carry; no shipped tutorial sets it.");
-    validateInterTurbulence(f.turbulence, f.U, f.nu, f.nuBnd, m, g, patches);
+    validateInterTurbulence(f.turbulence, f.U, f.nu, f.nuBnd, f.phi, m, g, patches);
 
     // createMRF.H -> IOMRFZoneList (READ_IF_PRESENT); a zone is active unless it says otherwise
     // (MRFZone.C:248, :553). createFields.H:129 constructs it AFTER everything above, and nothing here

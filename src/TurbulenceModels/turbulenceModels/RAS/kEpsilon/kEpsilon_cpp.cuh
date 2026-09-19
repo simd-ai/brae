@@ -160,6 +160,11 @@ struct Compressible
     // rDeltaT*psi.oldTime()*V0, where the diagonal keeps V; and divU is the divergence of the ABSOLUTE
     // flux, fvc::div(fvc::absolute(phi, U)) = div(phi + mesh.phi()) (kEpsilon.C:232-235). Null on a
     // static mesh, where both collapse to the forms above.
+    // THE FLUX nut's flux-conditional patches read (inletOutlet's phiName, `phi` by default). After the
+    // field assignment OpenFOAM's nut.correctBoundaryConditions() evaluates such a patch: valueFraction =
+    // neg(phi), then the mixed blend of the inletValue and the new cell nut. Null refuses a case that has
+    // one rather than leave it stale.
+    const SurfaceScalarField*               nutPhi   = nullptr;
     const std::vector<scalar>*              V0       = nullptr;
     const SurfaceScalarField*               meshPhi  = nullptr;
     // EddyDiffusivity::correctNut -- alphat = rho*nut/Prt, which the energy equation needs and the

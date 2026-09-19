@@ -39,6 +39,13 @@
 # The `custom` profile is where the device closure's one defect showed: it left the wall laplacian
 # coefficient out of relax(), as the host reference had, and every epsilon residual was 1.1e-04 from
 # OpenFOAM's with the fields unmoved. 5.3e-14 with it.
+#
+# PROFILE nutAtmosphere: the uniform lineage with the atmosphere's nut an inletOutlet (inletValue 1e-3),
+# which nut.correctBoundaryConditions() evaluates after kEpsilon's field assignment: inflow faces -- 20
+# of the 46 at t = 0.005 -- take the inletValue, outflow faces the new cell nut. MEASURED: U 6.0e-14,
+# nut 2.7e-15. CONTROL: the atmosphere `calculated`, OpenFOAM's U 2.7e-03 away. BROKEN ONCE EACH: the
+# patch written by the assignment, Cmu*k_b^2/epsilon_b (as brae had it), U 2.7e-03; evaluated without
+# the flux's valueFraction, U 4.4e-04. The device closure refuses the profile by name.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_ras_dambreak_vs_openfoam"
@@ -52,7 +59,9 @@ DT=${DT:-1e-3}
 [ -d "$SRC" ]      || { echo "SKIP: RAS/damBreak tutorial not found at $SRC"; exit 77; }
 [ -f "$OFBASHRC" ] || { echo "SKIP: real OpenFOAM not available"; exit 77; }
 
-W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+W=${KEEP_W:-$(mktemp -d)}
+[ -n "${KEEP_W:-}" ] || trap 'rm -rf "$W"' EXIT
+mkdir -p "$W"
 
 set +u
 # shellcheck disable=SC1091
@@ -76,12 +85,25 @@ stage()
     case "$profile" in
         laminar)
             sed -i 's/^simulationType .*/simulationType laminar;/' "$C/constant/turbulenceProperties" ;;
-        uniform|custom)
+        uniform|custom|nutAtmosphere)
             sed -i '/^density /d' "$C/constant/turbulenceProperties"
             sed -i 's/^\( *\)div(rhoPhi,k) .*/\1div(phi,k)      Gauss upwind;/; s/^\( *\)div(rhoPhi,epsilon) .*/\1div(phi,epsilon) Gauss upwind;/' \
                 "$C/system/fvSchemes"
             grep -q "div(phi,epsilon)" "$C/system/fvSchemes" || { echo "FAIL: the div entries were not renamed"; return 1; } ;;
     esac
+    # nutAtmosphere: the atmosphere's nut an inletOutlet, which correctBoundaryConditions evaluates after
+    # kEpsilon's field assignment -- inflow faces take the inletValue, outflow faces the new cell nut
+    if [ "$profile" = nutAtmosphere ]; then
+        python3 - "$C" <<'PYEOF' || { echo "FAIL: the nutAtmosphere profile was not staged"; return 1; }
+import re, sys
+p = sys.argv[1] + '/0/nut'
+s = open(p).read()
+s, n = re.subn(r'atmosphere\s*\{[^}]*\}', 'atmosphere\n    {\n        type            inletOutlet;\n'
+               '        inletValue      uniform 0.001;\n        value           uniform 0;\n    }', s)
+assert n == 1
+open(p, 'w').write(s)
+PYEOF
+    fi
     if [ "$profile" = custom ]; then
         python3 - "$C" <<'PYEOF' || { echo "FAIL: the custom profile was not staged"; return 1; }
 import os, re, sys
@@ -144,7 +166,7 @@ PYEOF
 }
 
 rc=0
-for p in laminar variable uniform custom; do
+for p in laminar variable uniform custom nutAtmosphere; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_ras_dambreak_vs_openfoam: staging failed"; exit 1; }
@@ -156,6 +178,8 @@ done
        uniform uniform "$W/laminar/$END" "$W/variable/$END" || rc=1
 "$BIN" "$W/custom" "$W/custom/0" "$W/custom/$END" "$STEPS" "$W/custom/log.interFoam" \
        custom uniform "$W/laminar/$END" "$W/uniform/$END" || rc=1
+"$BIN" "$W/nutAtmosphere" "$W/nutAtmosphere/0" "$W/nutAtmosphere/$END" "$STEPS" "$W/nutAtmosphere/log.interFoam" \
+       nutAtmosphere uniform "$W/laminar/$END" "$W/uniform/$END" || rc=1
 
 echo "interfoam_ras_dambreak_vs_openfoam: rc $rc"
 exit $rc

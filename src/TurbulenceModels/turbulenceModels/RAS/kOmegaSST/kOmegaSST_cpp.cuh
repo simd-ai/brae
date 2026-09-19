@@ -193,6 +193,11 @@ struct Compressible
     // the field at entry. The same term the kEpsilon port carries (kEpsilon_cpp.cuh Compressible).
     scalar                                  rDeltaT  = 0.0;
     const std::vector<scalar>*              rhoOld   = nullptr;
+    // THE FLUX nut's flux-conditional patches read (inletOutlet's phiName, `phi` by default). After the
+    // field assignment OpenFOAM's nut.correctBoundaryConditions() evaluates such a patch: valueFraction =
+    // neg(phi), then the mixed blend of the inletValue and the new cell nut. Null refuses a case that has
+    // one rather than leave it stale.
+    const SurfaceScalarField*               nutPhi   = nullptr;
 };
 
 // kOmegaSSTLM's three virtual overrides of this model, supplied by the DERIVED model rather than

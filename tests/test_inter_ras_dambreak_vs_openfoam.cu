@@ -110,8 +110,12 @@ int main(
     const std::string laminarDir = argv[8];
     const std::string otherDir = argv[9];
     const bool custom = (profile == "custom");
+    // nutAtmosphere: the uniform lineage with the atmosphere's nut an inletOutlet, which
+    // correctBoundaryConditions evaluates after the model's field assignment
+    const bool nutAtmosphere = (profile == "nutAtmosphere");
     std::printf("  profile: %s\n",
-                custom ? "custom -- its own coefficients, relaxation 0.7, and minIter forcing each sweep"
+                nutAtmosphere ? "nutAtmosphere -- uniform, the atmosphere's nut an inletOutlet"
+              : custom ? "custom -- its own coefficients, relaxation 0.7, and minIter forcing each sweep"
               : variable ? "variable -- `density variable`, as the tutorial ships"
                          : "uniform -- the ordinary single-phase lineage");
 
@@ -248,9 +252,12 @@ int main(
     // MEASURED 1.33 (laminar), 0.29 (the other lineage) and 3.7e-02 (custom against plain uniform),
     // beside a U bound of 5e-10
     check("turbulence moves OpenFOAM's own U by more than 10%", dLamU.rel() > scalar(0.1));
-    check(custom ? "...and the custom settings move it by more than 1%"
-                 : "...and the lineage moves it by more than 10%, so `density` is live on this fixture",
-          dOtherU.rel() > (custom ? scalar(0.01) : scalar(0.1)));
+    // MEASURED for nutAtmosphere against plain uniform: U 2.7e-03, nut 4.7e-02 -- 20 of the atmosphere's
+    // 46 faces take air IN at t = 0.005, where the inletValue stands in for the cell's nut
+    check(nutAtmosphere ? "...and the atmosphere's inletOutlet nut moves it by more than 1e-3"
+          : custom ? "...and the custom settings move it by more than 1%"
+                   : "...and the lineage moves it by more than 10%, so `density` is live on this fixture",
+          dOtherU.rel() > (nutAtmosphere ? scalar(1e-3) : custom ? scalar(0.01) : scalar(0.1)));
 
     // THE DEVICE LOOP, against OpenFOAM directly and at the case's own tolerances -- what
     // `brae_interFoam -device` runs on this tutorial.
@@ -263,6 +270,23 @@ int main(
     if (nDev <= 0)
     {
         std::printf("  (no CUDA device: the device arm is skipped)\n");
+    }
+    else if (nutAtmosphere)
+    {
+        // the device closure carries no flux-conditional nut patch: it must refuse, by name
+        bool named = false;
+        try
+        {
+            InterFields dev;
+            runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
+        }
+        catch (const std::exception& e)
+        {
+            const std::string w = e.what();
+            named = w.find("atmosphere") != std::string::npos && w.find("inletOutlet") != std::string::npos;
+            std::printf("  device: %s\n", e.what());
+        }
+        check("the device loop refuses an inletOutlet nut and names the patch", named);
     }
     else
     {

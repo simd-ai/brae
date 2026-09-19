@@ -46,6 +46,13 @@
 # boundary gradient in place of the patch's snGrad() (identical to the last digit: those patches hold
 # refreshed values whenever the closure reads them), and relax() not called at the case's factor of 1.
 #
+# PROFILE nutPatches: nut PINNED at the inlet (fixedValue 0.01) and FLUX-CONDITIONAL at the outlet
+# (inletOutlet, inletValue 0.002) -- the two patch kinds kOmegaSST's field assignment does not write:
+# a fixedValue's operator= is empty, and correctBoundaryConditions evaluates an inletOutlet against the
+# flux. MEASURED: U 3.4e-12, nut 1.7e-12. CONTROL: the shipped patches, OpenFOAM's nut 3.2e-02 away.
+# BROKEN ONCE EACH: the outlet never evaluated (as brae had it) U 9.2e-07, nut 8.5e-04; the inlet
+# written by the assignment U 1.2e-01, nut 3.2e-02.
+#
 # NOT CLAIMED: `density variable` with kOmegaSST, F3, decayControl, a wall-function blending other than
 # binomial n = 2, a moving mesh and the device -- all refused by name; the scalarTransport function
 # object `s`, which brae does not run (it does not feed back into the flow).
@@ -94,6 +101,20 @@ stage()
     if [ "$profile" = laminar ]; then
         sed -i 's/^simulationType .*/simulationType laminar;/' "$C/constant/turbulenceProperties"
     fi
+    # nutPatches: nut pinned at the inlet (fixedValue) and flux-conditional at the outlet (inletOutlet),
+    # the two patch kinds kOmegaSST's field assignment does not write
+    if [ "$profile" = nutPatches ]; then
+        python3 - "$C" <<'PYEOF' || { echo "FAIL: the nutPatches profile was not staged"; return 1; }
+import sys
+p = sys.argv[1] + '/0/nut'
+s = open(p).read()
+i = s.index('    ".*"')
+s = s[:i] + ('    inlet\n    {\n        type            fixedValue;\n        value           uniform 0.01;\n    }\n\n'
+             '    outlet\n    {\n        type            inletOutlet;\n        inletValue      uniform 0.002;\n'
+             '        value           uniform 0;\n    }\n\n') + s[i:]
+open(p, 'w').write(s)
+PYEOF
+    fi
 
     STEPS="$STEPS" DT="$DT" python3 - "$C" <<'PYEOF' || { echo "FAIL: staging $profile"; return 1; }
 import os, re, sys
@@ -126,7 +147,7 @@ PYEOF
 }
 
 rc=0
-for p in laminar sst; do
+for p in laminar sst nutPatches; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_waterchannel_vs_openfoam: staging failed"; exit 1; }
@@ -140,6 +161,8 @@ grep -q "Solving for omega" "$W/laminar/log.interFoam" \
     && { echo "FAIL: OpenFOAM's laminar control solved omega"; exit 1; }
 
 "$BIN" "$W/sst" "$W/sst/0" "$W/sst/$END" "$STEPS" "$W/sst/log.interFoam" "$W/laminar/$END" || rc=1
+"$BIN" "$W/nutPatches" "$W/nutPatches/0" "$W/nutPatches/$END" "$STEPS" "$W/nutPatches/log.interFoam" \
+       "$W/laminar/$END" "$W/sst/$END" || rc=1
 
 echo "interfoam_waterchannel_vs_openfoam: rc $rc"
 exit $rc
