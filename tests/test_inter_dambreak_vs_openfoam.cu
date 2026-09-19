@@ -114,8 +114,10 @@ int main(int argc, char** argv)
                             || alphaMinIter || gradLsqLimited;
     // `nonorth` RUNS on the device: its pressure step carries the non-orthogonal loop (transcribed from
     // the host's pressureCorrector), and the device arm below holds it to OpenFOAM
+    // `sheared` RUNS on the device too: the non-orthogonal correction is on that path now, and the
+    // device arm below holds it to OpenFOAM on a mesh that is not orthogonal
     const bool deviceRefuses = nOuter || namedFlux || compression || alphaMinIter || gradLsqLimited
-                            || nHatLimited || sheared;
+                            || nHatLimited;
     const bool bigStep = (argc > 7 && std::string(argv[7]) == "bigstep") || prevCorr || pimpleProfile || sheared;
     // `inflow`: the atmosphere's inletValue set to 1, so water enters over air cells and rho's patch
     // value differs from the cell's on a patch where p_rgh fixes a value. It is the only fixture here
@@ -503,7 +505,7 @@ int main(int argc, char** argv)
                                   : compression ? "interfaceCompression"
                                   : alphaMinIter ? "minIter"
                                   : (gradLsqLimited || nHatLimited) ? "cellLimited"
-                                  : sheared ? "non-orthogonal correction"
+                    
                                             : "names the flux";
                 std::printf("  DEVICE: %s\n", threw ? why.substr(0, 140).c_str() : "RAN -- it must not");
                 check("the DEVICE refuses this case rather than run it at a smaller count",

@@ -504,7 +504,10 @@ if [ $HAVE_GPU = 1 ]; then
     arm device_nNonOrth1    runs    -                        "-device" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"
     arm device_mesh_dynamic refused "dynamicRefineFvMesh"     "-device" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
     # ...nor a non-orthogonal correction where it is not zero
-    arm device_sheared_corrected refused "not orthogonal"     "-device" "$SHEAR"
+    # the non-orthogonal correction runs on the device now (tests/interfoam_dambreak_vs_openfoam.sh
+    # `sheared` holds it to OpenFOAM); `uncorrected` on a mesh that is not orthogonal is still refused
+    arm device_sheared_corrected runs    -                        "-device" "$SHEAR"
+    arm device_sheared_uncorrected refused "uncorrected"          "-device" "$SHEAR && $UNCORR"
     # the device loop moves no mesh and pins no pressure reference; both are refused by name there
     BASE="$BM"
     arm device_moving       refused "does not move one"       "-device" true

@@ -187,14 +187,11 @@ RunReport runInterFoamDevice(
             "brae interFoam -device: the case moves its mesh (" + f.dynamicMesh->motionType() + "). The "
             "device loop does not move one; the host loop does. Run without -device.");
     }
-    if ((f.laplacianScheme.corrected || f.snGradScheme.corrected) && maxNonOrthogonality(m, g) >= scalar(1e-10))
-    {
-        throw std::runtime_error(
-            "brae interFoam -device: fvSchemes asks for a non-orthogonal correction (laplacianSchemes `"
-            + f.laplacianScheme.raw + "`, snGradSchemes `" + f.snGradScheme.raw + "`) and the mesh is not "
-            "orthogonal. The device loop assembles the pressure laplacian and its snGrads orthogonal; the "
-            "host loop takes the case's scheme. Run without -device.");
-    }
+    // THE NON-ORTHOGONAL CORRECTION IS ON THE DEVICE NOW, module by module and each transcribed from the
+    // host: the pressure laplacian's loop and its face-flux correction (device_inter_pressure_step.cu),
+    // the viscous laplacian (the shared assembler, handed the case's flags in device_inter_step.cu), the
+    // three snGrads above, CorrectPhi's pcorr (host operators, cpc.correctedLaplacian) and the closure's
+    // k and epsilon (DeviceInterTurbulence). Gated end to end on laminar/damBreak `sheared`.
     if (f.pRef.needReference)
     {
         throw std::runtime_error(
@@ -456,7 +453,14 @@ RunReport runInterFoamDevice(
         std::vector<scalar> sK;
         interfaceProps::sigmaK(f.K, f.interface.sigma, sK);
         const SurfaceScalarField sKf = fvc::interpolate(sK, m, g, fvp);
-        const SurfaceScalarField snA = fvc::snGrad(f.alpha1, m, g, fvp, false);
+        // ...under the case's snGradSchemes, each correction through that field's own gradSchemes entry,
+        // as the host driver takes them (inter_driver_cpp.cu, the UEqn stage). This read `false` -- the
+        // orthogonal form -- whatever the case said; the mesh refusal below kept that from being a
+        // silent substitution, and the three calls here are what lifts it.
+        const bool snCorr = f.snGradScheme.corrected;
+        const scalar snLim = f.snGradScheme.limitCoeff;
+        const SurfaceScalarField snA = fvc::snGrad(f.alpha1, m, g, fvp, snCorr,
+                                                   f.gradAlpha1.leastSquares, f.gradAlpha1.cellLimitK, snLim);
         SurfaceScalarField t;
         t.internal.resize(static_cast<std::size_t>(nIf));
         for (label i = 0; i < nIf; ++i) t.internal[i] = sKf.internal[i]*snA.internal[i];
@@ -487,7 +491,8 @@ RunReport runInterFoamDevice(
             deviceCopy(dStepRhoBnd, rhoBd);
         }
         const GeometricField<scalar> rhoF = rhoWithPatchValues(f.rho, rb, fvp);
-        snRho.copyFrom(fullFace(fvc::snGrad(rhoF, m, g, fvp, false), fvp));
+        snRho.copyFrom(fullFace(fvc::snGrad(rhoF, m, g, fvp, snCorr, f.gradRho.leastSquares,
+                                            f.gradRho.cellLimitK, snLim), fvp));
 
         // the mixture's own nu. NOTE mixtureNu's second argument is mu, not alpha2.
         cpu::twoPhase::mixtureMu(f.alpha1.internal, f.mixture.phases, f.mu);
@@ -526,7 +531,9 @@ RunReport runInterFoamDevice(
                 f.p_rgh.boundary[pi]->updateSnGrad(
                     std::vector<scalar>(static_cast<std::size_t>(fvp[pi].size), scalar(0)));
             }
-            snP.copyFrom(fullFace(fvc::snGrad(f.p_rgh, m, g, fvp, false), fvp));
+            snP.copyFrom(fullFace(fvc::snGrad(f.p_rgh, m, g, fvp, f.snGradScheme.corrected,
+                                              f.gradPrgh.leastSquares, f.gradPrgh.cellLimitK,
+                                              f.snGradScheme.limitCoeff), fvp));
         }
         else snP.resize(0);
     };
