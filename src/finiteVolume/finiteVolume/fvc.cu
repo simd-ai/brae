@@ -24,7 +24,14 @@ std::vector<vector> gaussGrad(
     for (label f = 0; f < nIf; ++f)
     {
         const label o = own[f], n = nei[f];
-        const scalar pf = w[f] * internal[o] + (1.0 - w[f]) * internal[n];
+        // OpenFOAM's linear interpolation, in ITS arithmetic: lambda*(P - N) + N
+        // (surfaceInterpolationScheme.C:270, dotInterpolate). Not w*P + (1 - w)*N: on a face whose two
+        // cells hold the same value OpenFOAM's form returns that value exactly and this one can miss by
+        // an ulp -- and that ulp is the gradient of a uniform field, whose SIGN decides a TVD limiter at
+        // a face where the field does not change (NVDTVD::r's 1000x guard). Measured on LES/nozzleFlow2D:
+        // k is uniform 1e-11 across most of the mesh at step one, and limitedLinear chose upwind where
+        // OpenFOAM chose central on thousands of faces, 2.3e-03 of k after one step.
+        const scalar pf = w[f] * (internal[o] - internal[n]) + internal[n];
         const vector Sfssf = Sf[f] * pf;
         grad[o] += Sfssf;
         grad[n] = grad[n] - Sfssf;
@@ -76,7 +83,7 @@ std::vector<vector> gaussGrad(
     for (label f = 0; f < nIf; ++f)
     {
         const label o = own[f], n = nei[f];
-        const scalar pf = w[f] * p.internal[o] + (1.0 - w[f]) * p.internal[n];
+        const scalar pf = w[f] * (p.internal[o] - p.internal[n]) + p.internal[n];   // OpenFOAM's form, see above
         const vector Sfssf = Sf[f] * pf;
         grad[o] += Sfssf;
         grad[n] = grad[n] - Sfssf;
@@ -319,7 +326,7 @@ std::vector<tensor> gaussGrad(
     std::vector<tensor> grad(nC, tensor{0,0,0,0,0,0,0,0,0});
     for (label f = 0; f < nIf; ++f)
     {
-        const vector Uf = w[f] * internal[own[f]] + (1.0 - w[f]) * internal[nei[f]];
+        const vector Uf = w[f] * (internal[own[f]] - internal[nei[f]]) + internal[nei[f]];   // OpenFOAM's form
         const tensor SfUf = outer(Sf[f], Uf);
         grad[own[f]] += SfUf;
         grad[nei[f]] = grad[nei[f]] - SfUf;
@@ -547,6 +554,38 @@ std::vector<scalar> div(
     return d;
 }
 
+namespace {
+
+// OpenFOAM's transform(T, t) for a tensor: T & t & T^T
+tensor transformTensor(
+    const tensor& T,
+    const tensor& t)
+{
+    tensor Tt{};
+    const scalar A[3][3] = {{T.xx, T.xy, T.xz}, {T.yx, T.yy, T.yz}, {T.zx, T.zy, T.zz}};
+    const scalar B[3][3] = {{t.xx, t.xy, t.xz}, {t.yx, t.yy, t.yz}, {t.zx, t.zy, t.zz}};
+    scalar AB[3][3];
+    scalar R[3][3];
+    for (int i = 0; i < 3; ++i)
+    {
+        for (int j = 0; j < 3; ++j)
+        {
+            AB[i][j] = A[i][0]*B[0][j] + A[i][1]*B[1][j] + A[i][2]*B[2][j];
+        }
+    }
+    for (int i = 0; i < 3; ++i)
+    {
+        for (int j = 0; j < 3; ++j)
+        {
+            R[i][j] = AB[i][0]*A[j][0] + AB[i][1]*A[j][1] + AB[i][2]*A[j][2];
+        }
+    }
+    Tt = tensor{R[0][0], R[0][1], R[0][2], R[1][0], R[1][1], R[1][2], R[2][0], R[2][1], R[2][2]};
+    return Tt;
+}
+
+} // namespace
+
 std::vector<std::vector<tensor>> gradUBoundary(
     const GeometricField<vector>& U,
     const std::vector<tensor>& gradUcell,
@@ -580,12 +619,23 @@ std::vector<std::vector<tensor>> gradUBoundary(
         // gradient) and the mixed family, whose snGrad uses the CURRENT valueFraction while value() still
         // carries the blend of the previous one. See fv_patch_field.cuh's snGrad for the measurement.
         const std::vector<vector> sn = U.boundary[pi]->snGrad(U.internal);
+        // THE GRADIENT FIELD'S OWN PATCH VALUE, before the normal correction. gaussGrad builds grad(U)
+        // with extrapolatedCalculated patches, but fvPatchField::New puts a constraint patch's own type
+        // in their place (fvPatchFieldNew.C), and calcGrad ends in gGrad.correctBoundaryConditions()
+        // (gaussGrad.C:106) -- so on a WEDGE the value is transform(faceT, cell gradient),
+        // faceT & G & faceT^T, not the cell gradient itself. Measured on LES/nozzleFlow2D, where every
+        // cell touches the two wedge planes: without the rotation HbyA was 2e-06 out in every cell and
+        // 5.6e-06 in the axis corner at step two, against OpenFOAM's dumped HbyA.
+        // symmetryPlane and symmetry take THEIR constraint type the same way and are NOT transformed
+        // here yet -- an open finding, unreached by any gated case.
+        const tensor* faceT = U.boundary[pi]->wedgeFaceT();
         for (label i = 0; i < fp.size; ++i)
         {
             const label c  = fp.faceCells[i];
             const label gf = fp.start + i;
             const vector n = (1.0 / magSf[gf]) * Sf[gf];                       // unit normal
-            const tensor& gc = gradUcell[c];                                   // extrapolated cell grad
+            const tensor gc = faceT ? transformTensor(*faceT, gradUcell[c])
+                                    : gradUcell[c];                            // the gradient's patch value
             gb[pi][i] = gc + outer(n, sn[i] - dot(n, gc));                     // normal comp -> snGrad
         }
     }

@@ -42,7 +42,11 @@
 // omegaWallFunction and nutkWallFunction on every patch whose MESH type is `wall`, so the reader holds
 // the case to exactly that: each `wall` patch carries both, no other patch carries either.
 //
-// WHAT IS REFUSED, by name: every RASModel but kEpsilon and kOmegaSST, LES, `turbulence off`, a
+// LES kEqn (LES/nozzleFlow2D) is the UNIFORM lineage only, with the cubeRootVol or smooth filter width --
+// les_kEqn_cpp.cuh and les_delta_cpp.cuh carry the equation and the width. validate() is its correctNut,
+// nut = Ck*sqrt(k)*delta, and nothing on its walls is a wall function.
+//
+// WHAT IS REFUSED, by name: every RASModel but kEpsilon and kOmegaSST, every LESModel but kEqn, `turbulence off`, a
 // convection scheme on the turbulence scalars other than `Gauss upwind` (what every tutorial of either
 // model names), a nut wall function outside nutk/nutU/nutLowRe (kEpsilon) or other than nutk
 // (kOmegaSST) or on a patch that is not a `wall`, and a ddt scheme other than Euler. Under kOmegaSST
@@ -60,6 +64,8 @@
 #include "inter_solve_record.cuh"
 #include "kepsilon_coeffs.cuh"
 #include "komega_sst_coeffs.cuh"
+#include "les_delta_cpp.cuh"
+#include "les_kEqn_cpp.cuh"
 #include "primitive_mesh.cuh"
 #include <string>
 #include <vector>
@@ -85,7 +91,10 @@ struct EquationRelax
 enum class InterRasModel
 {
     KEpsilon,
-    KOmegaSST
+    KOmegaSST,
+    // simulationType LES, LESModel kEqn -- the one LES model wired in (LES/nozzleFlow2D); the enum keeps
+    // its RAS name because every consumer already switches on it
+    KEqnLES
 };
 
 struct InterTurbulence
@@ -106,6 +115,13 @@ struct InterTurbulence
     // distance the wall functions use. Taken once: kOmegaSST on a moving mesh is refused.
     std::vector<scalar> yCell;
     GeometricField<scalar> nut;
+    // kEqn's: its coefficients, the filter width (constant on a mesh that does not move), and k's
+    // solve on the final outer corrector
+    LESkEqn::Coeffs lesCoeffs;
+    LESdelta::Spec deltaSpec;
+    std::vector<scalar> delta;
+    // a gate's window into kEqn's stages at every correct(); null in a run
+    LESkEqn::Taps* lesTaps = nullptr;
     // per patch, a NutWall value; read where the dictionary TYPE still exists
     std::vector<int> nutWallKind;
     // THE Final ENTRIES, AND ONLY THOSE. fvMatrix::solve() and fvMatrix::relax() both select

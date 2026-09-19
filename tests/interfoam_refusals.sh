@@ -98,6 +98,21 @@ cp -r "$BB/0.orig" "$BB/0"
 sed -i 's/^endTime .*/endTime         0.0002;/; s/^deltaT .*/deltaT          1e-4;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
     "$BB/system/controlDict"
 
+# ...and LES/nozzleFlow2D, for LES kEqn on a wedge, meshed as its Allrun does, two steps at a fixed 1e-9
+SRCL="$TUT/multiphase/interFoam/LES/nozzleFlow2D"
+[ -d "$SRCL" ] || { echo "SKIP: nozzleFlow2D tutorial not found at $SRCL"; exit 77; }
+BL="$W/baseLES"
+cp -r "$SRCL" "$BL" || exit 1
+cp -r "$BL/0.orig" "$BL/0"
+( cd "$BL" && blockMesh > log.blockMesh 2>&1 \
+      && topoSet -dict system/topoSetDict.1 > log.topoSet.1 2>&1 \
+      && refineMesh -dict system/refineMeshDict -overwrite > log.refineMesh.1 2>&1 \
+      && topoSet -dict system/topoSetDict.2 > log.topoSet.2 2>&1 \
+      && refineMesh -dict system/refineMeshDict -overwrite > log.refineMesh.2 2>&1 ) \
+    || { echo "SKIP: meshing failed on nozzleFlow2D"; exit 77; }
+sed -i 's/^endTime .*/endTime         2e-09;/; s/^deltaT .*/deltaT          1e-9;/; s/^adjustTimeStep .*/adjustTimeStep  no;/; s/^startFrom .*/startFrom       startTime;/' \
+    "$BL/system/controlDict"
+
 HAVE_GPU=0
 if command -v nvidia-smi > /dev/null 2>&1 && nvidia-smi > /dev/null 2>&1; then HAVE_GPU=1; fi
 
@@ -359,7 +374,23 @@ BASE="$B"
 # substring match read as plain vanLeer and ran
 arm compressionNew_refused  refused "limited scheme with a compression coefficient" "" "sed -i 's/div(phi,alpha)  *Gauss vanLeer;/div(phi,alpha)  Gauss interfaceCompression vanLeer 1;/' system/fvSchemes"
 
+# LES kEqn is ported in the host loop (tests/interfoam_les_vs_openfoam.sh). What it refuses, by name:
+BASE="$BL"
+TP=constant/turbulenceProperties
+arm les_runs                runs    -                                  "" true
+arm les_smagorinsky         refused "LESModel \`Smagorinsky\`"         "" "sed -i 's/LESModel  *kEqn;/LESModel Smagorinsky;/' $TP"
+arm les_deltaVanDriest      refused "LES delta \`vanDriest\`"          "" "sed -i 's/^\\( *\\)delta  *smooth;/\\1delta vanDriest;/' $TP"
+arm les_smoothPrandtl       refused "smooths the LES delta \`Prandtl\`" "" "python3 -c \"import re; p='$TP'; t=open(p).read(); t=re.sub(r'(\\nsmoothCoeffs|\\n    smoothCoeffs)(\\s*\\{\\s*)delta\\s+cubeRootVol;', r'\\1\\2delta Prandtl;', t); open(p,'w').write(t)\""
+arm les_noMaxDeltaRatio     refused "no \`maxDeltaRatio\`"            "" "python3 -c \"import re; p='$TP'; t=open(p).read(); i=t.index('\\n    smoothCoeffs'); j=t.index('maxDeltaRatio', i); t=t[:j]+'// '+t[j:]; open(p,'w').write(t)\""
+arm les_densityVariable     refused "pairs \`density variable\` with LES" "" "sed -i 's/^simulationType .*/simulationType LES;\\ndensity variable;/' $TP"
+arm les_linearUpwindK       refused "neither \`Gauss upwind\` nor"     "" "sed -i 's/div(phi,k)  *Gauss limitedLinear 1;/div(phi,k) Gauss linearUpwind grad(k);/' system/fvSchemes"
+arm les_cellLimitedGradU    refused "Gauss linear 1\` is not ported"  "" "sed -i 's/^\\( *default  *\\)Gauss linear;/\\1cellLimited Gauss linear 1;/' system/fvSchemes"
+BASE="$B"
+
 if [ $HAVE_GPU = 1 ]; then
+    BASE="$BL"
+    arm device_les          refused "the case is LES kEqn" "-device" true
+    BASE="$B"
     # the device loop is handed the mesh WITHOUT the coupling attached, and refuses the pair by name
     BASE="$BB"
     arm device_baffle       refused "porous_half0" "-device" true

@@ -2654,6 +2654,60 @@ COMPONENTS = {
                   "and that gate's floor arm caught it (4e-15 to 1.4e-11). The device pressure equation has no "
                   "boundary half and its header said OpenFOAM has none; corrected, and the device loop refuses an "
                   "open patch whose U fixes no value. HOST ONLY SO FAR."),
+        dict(name="interFoam_LESkEqn", of_symbol="kEqn",
+             of_file="src/TurbulenceModels/turbulenceModels/LES/kEqn/kEqn.C",
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/TurbulenceModels/turbulenceModels/LES/kEqn/les_kEqn_cpp.cu",
+             validation="tests/interfoam_les_vs_openfoam.sh, real OpenFOAM on LES/nozzleFlow2D (Allrun's mesh: "
+                        "blockMesh and two topoSet/refineMesh passes, 20603 cells, an axisymmetric WEDGE, "
+                        "non-orthogonal to 40 degrees), 100 fixed steps of 1e-9. MEASURED: alpha 6.6e-12, p_rgh "
+                        "8.2e-11, U 4.5e-12, k 2.1e-12, nut 1.1e-12; all 400 p_rgh and 100 k iteration counts and "
+                        "every k final residual OpenFOAM's; the filter width 1.1e-15 before and after smoothing "
+                        "against the delta OpenFOAM writes, and 8.2e-16 on the same mesh made 3-D. THE CONTROL: "
+                        "OpenFOAM run laminar, 19% of U. tools/dumpKEqn is OpenFOAM's kEqn with its stages "
+                        "written; at step one G, divU, the convection and diffusion coefficients, the matrix "
+                        "and the solved k agree with it to 1e-12. BROKEN ONCE EACH, fourteen: every term of the "
+                        "equation, the delta's smoothing, its 2-D branch, the wave's tolerance, validate(), the "
+                        "limitedLinear scheme -- all red (the script tabulates U, k and the p_rgh counts). NOT "
+                        "DISCRIMINATED: Ce and kMin from the LES dictionary rather than kEqnCoeffs (the case "
+                        "leaves both at their defaults). NOT CLAIMED, each refused by name: every other LESModel "
+                        "and LESdelta, `density variable`, k schemes other than upwind and limitedLinear, "
+                        "gradients other than Gauss linear, nut wall functions under LES, a coupled patch under "
+                        "the smooth delta, and the device loop.",
+             note="kEqn in the uniform lineage: ddt(k) + div(phi,k) - laplacian(nut + nu, k) == nut*(grad(U) && "
+                  "devTwoSymm(grad(U))) - SuSp(2/3 divU, k) - Sp(Ce*sqrt(k)/delta, k); bound; nut = "
+                  "Ck*sqrt(k)*delta. The filter width is les_delta_cpp.cu: cubeRootVol (sqrt(V/thickness) on a "
+                  "2-D mesh, and a wedge is 2-D to it -- calcDirections knocks the wedge normal out of "
+                  "geometricD) and smooth, a FaceCellWave transcribed in OpenFOAM's visit order, since a "
+                  "value is taken only when it is 1% larger and so the order is part of the answer. WHAT THE "
+                  "GATE FOUND was outside the model, by running the case LAMINAR in both codes first: the host "
+                  "wedge had no vector matrix coefficients (see interFoam_wedgeCoefficients); grad(U)'s wedge "
+                  "value was not rotated; and fvc::gaussGrad interpolated as w*P + (1 - w)*N where OpenFOAM "
+                  "writes lambda*(P - N) + N -- on the uniform k of step one, limitedLinear's limiter is "
+                  "decided by the SIGN of a gradient of a uniform field, which is that ulp: k 2.3e-03 out "
+                  "after one step, 3.9e-14 with OpenFOAM's arithmetic. HOST ONLY SO FAR."),
+        dict(name="interFoam_wedgeCoefficients", of_symbol="wedgeFvPatchField",
+             of_file="src/finiteVolume/fields/fvPatchFields/constraint/wedge/wedgeFvPatchField.C",
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/finiteVolume/fields/fv_patch_field.cuh",
+             validation="tests/interfoam_les_vs_openfoam.sh (LES/nozzleFlow2D, every cell on the two wedge "
+                        "planes). BROKEN ONCE EACH (U after 100 steps): the host coefficients as the base "
+                        "class's 1.1e-04; grad(U)'s wedge value unrotated 2.9e-04. tests/test_wedge_patch.cu "
+                        "holds the geometry. NOT DISCRIMINATED: grad(alpha)'s wedge value rotated for the "
+                        "interface normal -- provably invisible, the normal correction removes the one component "
+                        "nHatf keeps. OPEN: symmetryPlane and symmetry give the gradient field THEIR constraint "
+                        "type the same way, and fvc::gradUBoundary does not transform for them yet; no gated case "
+                        "reaches it.",
+             note="The host WedgePatchField overrode evaluate() alone: a vector wedge assembled with the "
+                  "zeroGradient coefficients, where transformFvPatchField (.C:95-136) has valueInternalCoeffs 1 - "
+                  "d, gradientInternalCoeffs -deltaCoeffs*d, the boundary coefficients from snGrad and the patch "
+                  "internal field, d = 0.5*(1 - cellT_kk), and wedgeFvPatchField's snGrad (cellT & pif - pif)*"
+                  "0.5*deltaCoeffs. The device built the right coefficients from wedgeCellT() in its mixed slot, "
+                  "so only the host was wrong, and no host gate had a wedge until nozzleFlow2D: UEqn.A() 2e-05 "
+                  "low in every cell, 1.7e-04 in the axis corner, against OpenFOAM's dumped A(). SECOND: "
+                  "fvPatchField::New gives a constraint patch its own type in a DERIVED field too, so grad(U) "
+                  "has a wedge patch whose value is faceT & G & faceT^T; gaussGrad::correctBoundaryConditions "
+                  "starts from that, and fvc::gradUBoundary started from the cell gradient."),
         dict(name="interFoam_cyclic", of_symbol="cyclicFvPatchField",
              of_file="src/finiteVolume/fields/fvPatchFields/constraint/cyclic/cyclicFvPatchField.C",
              classification="GPU_REQUIRED", status="REIMPLEMENT",

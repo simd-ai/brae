@@ -118,6 +118,8 @@ add_library(brae_core STATIC
     src/TurbulenceModels/turbulenceModels/RAS/kOmegaSSTLM/kOmegaSSTLM_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/realizableKE/realizableKE_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon_cpp.cu
+    src/TurbulenceModels/turbulenceModels/LES/LESdeltas/les_delta_cpp.cu
+    src/TurbulenceModels/turbulenceModels/LES/kEqn/les_kEqn_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon.cu
     src/TurbulenceModels/turbulenceModels/RAS/SpalartAllmaras/SpalartAllmaras_cpp.cu
     src/finiteVolume/cfdTools/general/fvOptions/fvOptions_cpp.cu
@@ -3474,6 +3476,15 @@ add_executable(test_porous_baffle_pressure tests/test_porous_baffle_pressure.cu)
 target_include_directories(test_porous_baffle_pressure PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_porous_baffle_pressure PRIVATE brae_core)
 add_test(NAME porous_baffle_pressure COMMAND test_porous_baffle_pressure)
+
+# interFoam with LES kEqn on an axisymmetric wedge against real OpenFOAM on LES/nozzleFlow2D. The script
+# carries the measurements, the control and the fail-proofs.
+add_executable(test_inter_les_vs_openfoam tests/test_inter_les_vs_openfoam.cu)
+target_include_directories(test_inter_les_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_les_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_les_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_les_vs_openfoam.sh)
 
 # ...and the wave boundary conditions (waveAlpha, waveVelocity) on laminar/waves/stokesI: fields, the
 # patch values the wave model assigns, its two derived constants and the ORDER it updates in, all

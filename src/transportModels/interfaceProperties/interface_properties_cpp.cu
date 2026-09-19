@@ -311,7 +311,14 @@ void calculateK(const GeometricField<scalar>& alpha1,
                 continue;
             }
             const vector& n  = q.nf[i];
-            const vector  gc = gradAlpha[q.faceCells[i]];
+            // on a wedge grad(alpha)'s own patch value is the cell gradient ROTATED onto the plane,
+            // faceT & grad -- see fvc::gradUBoundary
+            const tensor* faceT = alpha1.boundary[pi]->wedgeFaceT();
+            const vector& gcell = gradAlpha[q.faceCells[i]];
+            const vector  gc = faceT ? vector{faceT->xx*gcell.x + faceT->xy*gcell.y + faceT->xz*gcell.z,
+                                              faceT->yx*gcell.x + faceT->yy*gcell.y + faceT->yz*gcell.z,
+                                              faceT->zx*gcell.x + faceT->zy*gcell.y + faceT->zz*gcell.z}
+                                     : gcell;
             const scalar  nn = n.x*gc.x + n.y*gc.y + n.z*gc.z;
             const scalar  d  = snA[i] - nn;
             gb[i] = vector{gc.x + n.x*d, gc.y + n.y*d, gc.z + n.z*d};

@@ -69,7 +69,12 @@
 // waves, kOmegaSST, a pair that is rotational or not orthogonal, and cyclicAMI/ACMI/processor patches.
 // `-device` refuses any cyclic, naming the patch.
 //
-// WHAT IT WILL NOT RUN. Every refusal the components carry is in force: LES and every RASModel but
+// AND LES kEqn, on the host: the uniform lineage, with the cubeRootVol or smooth filter width, on an
+// axisymmetric wedge -- whose host matrix coefficients and gradient patch value it took to get there.
+// tests/interfoam_les_vs_openfoam.sh holds LES/nozzleFlow2D against OpenFOAM; `-device` refuses LES.
+//
+// WHAT IT WILL NOT RUN. Every refusal the components carry is in force: every LESModel but kEqn, every
+// RASModel but
 // kEpsilon and kOmegaSST, `limitedLinear` on div(rhoPhi,U),
 // any ddtSchemes default but Euler, every fvOption but explicitPorositySource/DarcyForchheimer (host
 // only: tests/interfoam_angledduct_vs_openfoam.sh), MRF on the device or beside a moving mesh, RAS or a

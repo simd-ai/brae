@@ -1,0 +1,3 @@
+kEqnDumpModels.C
+
+LIB = $(FOAM_USER_LIBBIN)/libdumpKEqn

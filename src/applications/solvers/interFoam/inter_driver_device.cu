@@ -92,6 +92,12 @@ RunReport runInterFoamDevice(
             "(inter_turbulence_cpp.cu around kOmegaSST_cpp.cu) and gated there against OpenFOAM on "
             "RAS/waterChannel. Refused rather than run under kEpsilon's name or laminar.");
 
+    if (f.turbulence.on && f.turbulence.model == cpu::interFoam::InterRasModel::KEqnLES)
+        throw std::runtime_error(
+            "brae interFoam (device): the case is LES kEqn. The device loop runs kEpsilon's device twin "
+            "and nothing else; kEqn and its filter width are ported on the host (les_kEqn_cpp.cu, "
+            "les_delta_cpp.cu) and gated there against OpenFOAM on LES/nozzleFlow2D.");
+
     for (const fvOptions::Option& o : f.fvOptions.options)
     {
         if (!o.active) continue;

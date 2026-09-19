@@ -1320,13 +1320,23 @@ public:
     const tensor* wedgeFaceT() const override { return &faceT_; }
     const tensor* wedgeCellT() const override { return &cellT_; }
 
+    // declared for every T; specialised for vector below, where the rotation lives
+    std::vector<T> snGrad(const std::vector<T>& internal) const override { return fvPatchField<T>::snGrad(internal); }
+    std::vector<T> valueInternalCoeffs() const override { return fvPatchField<T>::valueInternalCoeffs(); }
+    std::vector<T> valueBoundaryCoeffs() const override { return fvPatchField<T>::valueBoundaryCoeffs(); }
+    std::vector<T> gradientInternalCoeffs() const override { return fvPatchField<T>::gradientInternalCoeffs(); }
+    std::vector<T> gradientBoundaryCoeffs() const override { return fvPatchField<T>::gradientBoundaryCoeffs(); }
+
 protected:
     tensor faceT_, cellT_;
+    std::vector<T> pif_;
 };
 
 // vector: the rotation is real. value = faceT & U_cell.
 template <> inline void WedgePatchField<vector>::evaluate(const std::vector<vector>& internal)
 {
+    // the patch internal field the boundary coefficients are built from, as of this evaluate
+    pif_ = this->patchInternalField(internal);
     for (label i = 0; i < this->patch_.size; ++i)
     {
         const vector& v = internal[this->patch_.faceCells[i]];
@@ -1339,6 +1349,92 @@ template <> inline void WedgePatchField<vector>::evaluate(const std::vector<vect
 // d_k = 0.5*(1 - cellT_kk) -- which reproduces OF's valueInternalCoeffs/gradientInternalCoeffs exactly
 // (mixed gives 1 - vf and -deltaCoeffs*vf). Category 5 is the device's mixed slot.
 template <> inline int WedgePatchField<vector>::bcCategory() const { return 5; }
+
+// THE HOST'S FOUR COEFFICIENTS AND snGrad, for a vector. These were missing: the class overrode
+// evaluate() alone, so the host operators assembled a vector wedge with the BASE class's coefficients
+// -- valueInternalCoeffs 1, gradientInternalCoeffs 0, the zeroGradient ones -- while the device built
+// the right ones from wedgeCellT() in its own mixed slot. No host gate had run a wedge until
+// LES/nozzleFlow2D: every one of its 20603 cells touches the two wedge planes, and UEqn.A() came out
+// 2e-05 low everywhere and 1.7e-04 low in the axis corner, against OpenFOAM's own dumped A().
+// transformFvPatchField.C:95-136 and wedgeFvPatchField.C (snGrad, snGradTransformDiag):
+//     d_k                    = 0.5*(1 - cellT_kk)
+//     snGrad                 = (cellT & pif - pif)*0.5*deltaCoeffs
+//     valueInternalCoeffs    = 1 - d
+//     valueBoundaryCoeffs    = value - cmptMultiply(valueInternalCoeffs, pif)
+//     gradientInternalCoeffs = -deltaCoeffs*d
+//     gradientBoundaryCoeffs = snGrad - cmptMultiply(gradientInternalCoeffs, pif)
+// pif is the CURRENT cell field; a caller evaluates the patch before it asks, as OpenFOAM's does.
+namespace wedgeDetail
+{
+inline vector diagD(const tensor& cT)
+{
+    return vector{scalar(0.5)*(scalar(1) - cT.xx), scalar(0.5)*(scalar(1) - cT.yy), scalar(0.5)*(scalar(1) - cT.zz)};
+}
+inline vector rotate(
+    const tensor& T,
+    const vector& v)
+{
+    return vector{T.xx*v.x + T.xy*v.y + T.xz*v.z, T.yx*v.x + T.yy*v.y + T.yz*v.z, T.zx*v.x + T.zy*v.y + T.zz*v.z};
+}
+}   // namespace wedgeDetail
+
+template <> inline std::vector<vector> WedgePatchField<vector>::snGrad(const std::vector<vector>& internal) const
+{
+    std::vector<vector> r(static_cast<std::size_t>(this->patch_.size));
+    for (label i = 0; i < this->patch_.size; ++i)
+    {
+        const vector& pif = internal[this->patch_.faceCells[i]];
+        const vector rot = wedgeDetail::rotate(cellT_, pif);
+        r[i] = (rot - pif)*(scalar(0.5)*this->patch_.deltaCoeffs[i]);
+    }
+    return r;
+}
+template <> inline std::vector<vector> WedgePatchField<vector>::valueInternalCoeffs() const
+{
+    const vector d = wedgeDetail::diagD(cellT_);
+    return std::vector<vector>(static_cast<std::size_t>(this->patch_.size),
+                               vector{scalar(1) - d.x, scalar(1) - d.y, scalar(1) - d.z});
+}
+template <> inline std::vector<vector> WedgePatchField<vector>::gradientInternalCoeffs() const
+{
+    const vector d = wedgeDetail::diagD(cellT_);
+    std::vector<vector> r(static_cast<std::size_t>(this->patch_.size));
+    for (label i = 0; i < this->patch_.size; ++i)
+    {
+        r[i] = d*(-this->patch_.deltaCoeffs[i]);
+    }
+    return r;
+}
+template <> inline std::vector<vector> WedgePatchField<vector>::valueBoundaryCoeffs() const
+{
+    if (pif_.size() != static_cast<std::size_t>(this->patch_.size))
+        throw std::runtime_error(
+            "brae: wedge patch '" + this->patch_.name + "' was asked for valueBoundaryCoeffs before it was ever evaluated.");
+    const std::vector<vector> vic = valueInternalCoeffs();
+    std::vector<vector> r(static_cast<std::size_t>(this->patch_.size));
+    for (label i = 0; i < this->patch_.size; ++i)
+    {
+        const vector& pif = pif_[static_cast<std::size_t>(i)];
+        r[i] = vector{this->value_[i].x - vic[i].x*pif.x, this->value_[i].y - vic[i].y*pif.y,
+                      this->value_[i].z - vic[i].z*pif.z};
+    }
+    return r;
+}
+template <> inline std::vector<vector> WedgePatchField<vector>::gradientBoundaryCoeffs() const
+{
+    if (pif_.size() != static_cast<std::size_t>(this->patch_.size))
+        throw std::runtime_error(
+            "brae: wedge patch '" + this->patch_.name + "' was asked for gradientBoundaryCoeffs before it was ever evaluated.");
+    const std::vector<vector> gic = gradientInternalCoeffs();
+    std::vector<vector> r(static_cast<std::size_t>(this->patch_.size));
+    for (label i = 0; i < this->patch_.size; ++i)
+    {
+        const vector& pif = pif_[static_cast<std::size_t>(i)];
+        const vector sn = (wedgeDetail::rotate(cellT_, pif) - pif)*(scalar(0.5)*this->patch_.deltaCoeffs[i]);
+        r[i] = vector{sn.x - gic[i].x*pif.x, sn.y - gic[i].y*pif.y, sn.z - gic[i].z*pif.z};
+    }
+    return r;
+}
 
 // Shared storage + read-and-hold value() for the OF calculated / inletOutlet / outletInlet /
 // pressureInletOutletVelocity / mixed family, they differ ONLY in which device category (bcCategory) claims the

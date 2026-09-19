@@ -2,6 +2,7 @@
 #include "inter_turbulence_cpp.cuh"
 #include "foam_field_reader.cuh"
 #include "cellLimitedGrad_cpp.cuh"
+#include "bound_cpp.cuh"
 #include "cell_wall_dist.cuh"
 #include "kEpsilon_cpp.cuh"
 #include "kOmegaSST_cpp.cuh"
@@ -290,10 +291,10 @@ InterTurbulence readInterTurbulence(
     const FoamDict d = readDict(p);
     const std::string sim = d.wordOr("simulationType", "laminar");
     if (sim == "laminar") return t;
-    if (sim != "RAS")
+    if (sim != "RAS" && sim != "LES")
         throw std::runtime_error(
             std::string(WHO) + file + " asks for simulationType `" + sim + "`. brae's interFoam has "
-            "laminar and RAS kEpsilon; LES is not ported here.");
+            "laminar, RAS (kEpsilon, kOmegaSST) and LES (kEqn).");
 
     // incompressibleInterPhaseTransportModel.C:61-84 -- `variable`, `uniform`, or a FatalError
     if (d.found("density"))
@@ -305,6 +306,92 @@ InterTurbulence readInterTurbulence(
                 "and `uniform` and stops on anything else (incompressibleInterPhaseTransportModel.C:"
                 "75-81).");
         t.variableDensity = (method == "variable");
+    }
+
+    const FoamDict* rfAll = fvSolution.subDict("relaxationFactors");
+    const FoamDict* eqAll = rfAll ? rfAll->subDict("equations") : nullptr;
+
+    if (sim == "LES")
+    {
+        if (t.variableDensity)
+            throw std::runtime_error(
+                std::string(WHO) + file + " pairs `density variable` with LES. That is kEqn.C with rho the "
+                "mixture density and rhoPhi its flux; no shipped tutorial pairs them. Refused rather than "
+                "run ungated.");
+        if (!mesh || !geometry)
+            throw std::runtime_error(std::string(WHO) + "LES needs the mesh for its filter width.");
+        const FoamDict* les = d.subDict("LES");
+        const std::string lesModel = les ? les->wordOr("LESModel", "") : "";
+        if (lesModel != "kEqn")
+            throw std::runtime_error(
+                std::string(WHO) + file + " asks for LESModel `" + lesModel + "`. kEqn is the LES model "
+                "wired into interFoam (LES/nozzleFlow2D); Smagorinsky, WALE, dynamicKEqn and the rest "
+                "are different models and are not substituted.");
+        const std::string lsw = les->wordOr("turbulence", "on");
+        if (lsw == "off" || lsw == "no" || lsw == "false")
+            throw std::runtime_error(
+                std::string(WHO) + file + " has `LES { turbulence off; }`, which no gate holds against "
+                "OpenFOAM yet.");
+        if (!eulerDdt)
+            throw std::runtime_error(
+                std::string(WHO) + "kEqn takes fvm::ddt(k) through ddtSchemes (kEqn.C:162) and the "
+                "closure carries Euler only.");
+        t.model = InterRasModel::KEqnLES;
+        // kEqn.C:88-96: Ck from coeffDict_ = optionalSubDict("kEqnCoeffs"); LESModel.C:81-100: Ce and
+        // kMin from the LES dictionary ITSELF, not from the coefficients
+        t.lesCoeffs.Ck = les->optionalSubDict("kEqnCoeffs")->scalarOr("Ck", t.lesCoeffs.Ck);
+        t.lesCoeffs.Ce = les->scalarOr("Ce", t.lesCoeffs.Ce);
+        t.lesCoeffs.kMin = les->scalarOr("kMin", t.lesCoeffs.kMin);
+        t.lesCoeffs.correctedLaplacian = laplacianCorrected;
+        t.lesCoeffs.snGradLimitCoeff = laplacianLimitCoeff;
+        t.deltaSpec = LESdelta::read(*les, file);
+        {
+            const FieldGradScheme gu = parseFieldGradScheme(caseDir, "U");
+            const FieldGradScheme gk = parseFieldGradScheme(caseDir, "k");
+            for (const FieldGradScheme* q : {&gu, &gk})
+            {
+                if (!q->gaussLinear || !q->unsupportedLimiter.empty() || q->cellLimitK > 0 || q->leastSquares)
+                    throw std::runtime_error(
+                        std::string(WHO) + "fvSchemes resolves a gradient kEqn takes to `" + q->raw
+                        + "`; the LES closure computes plain `Gauss linear` only.");
+            }
+        }
+        const FieldDivScheme fk = parseFieldDivScheme(caseDir, "k", false, "phi");
+        if (fk.bounded || fk.linearUpwind)
+            throw std::runtime_error(
+                std::string(WHO) + "fvSchemes `div(phi,k)` is neither `Gauss upwind` nor `Gauss "
+                "limitedLinear <k>`, the two the LES closure carries.");
+        t.lesCoeffs.limitedLinear = fk.limited;
+        t.lesCoeffs.limitedLinearCoeff = fk.coeff;
+
+        t.k = readTurbulenceField(startDir, "k", patches, nCells);
+        t.nut = readTurbulenceField(startDir, "nut", patches, nCells);
+        {
+            // nothing on a kEqn case is a wall function: nut is Ck*sqrt(k)*delta everywhere, and its
+            // patches evaluate as their own types
+            const FieldData<scalar> nutRaw = readField<scalar>(startDir + "/nut");
+            for (const auto& b : nutRaw.boundary)
+            {
+                if (b.type.rfind("nut", 0) == 0 || b.type.rfind("atmNut", 0) == 0)
+                    throw std::runtime_error(
+                        std::string(WHO) + "nut patch `" + b.name + "` carries `" + b.type + "` under LES "
+                        "kEqn. The wall functions are not wired into the LES closure.");
+            }
+        }
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (t.k.boundary[pi]->fluxName() != "phi")
+                throw std::runtime_error(
+                    std::string(WHO) + "patch `" + patches[pi].name + "` of k names the flux `"
+                    + t.k.boundary[pi]->fluxName() + "`; the LES closure hands its patches phi only.");
+        }
+        t.delta = LESdelta::compute(t.deltaSpec, *mesh, *geometry, patches);
+        // kEqn's constructor: bound(k_, kMin_)
+        bound(t.k, t.lesCoeffs.kMin, *mesh, *geometry, patches);
+        t.kSolveFinal = readFinalSolve(fvSolution, "k");
+        t.kRelaxFinal = EquationRelax::read(eqAll, "kFinal");
+        t.on = true;
+        return t;
     }
 
     const FoamDict* ras = d.subDict("RAS");
@@ -327,8 +414,6 @@ InterTurbulence readInterTurbulence(
             "(kEpsilon.C:254, :275; kOmegaSSTBase.C:558, :589) and the closures carry Euler only.");
     t.coeffs.correctedLaplacian = laplacianCorrected;
     t.coeffs.snGradLimitCoeff = laplacianLimitCoeff;
-    const FoamDict* rfAll = fvSolution.subDict("relaxationFactors");
-    const FoamDict* eqAll = rfAll ? rfAll->subDict("equations") : nullptr;
 
     if (t.model == InterRasModel::KOmegaSST)
     {
@@ -451,6 +536,12 @@ void validateInterTurbulence(
     // incompressibleInterPhaseTransportModel.C:99-109: validate() sits in the `else` branch, so the
     // variable lineage enters the first UEqn on the nut the case file holds.
     if (t.variableDensity) return;
+    if (t.model == InterRasModel::KEqnLES)
+    {
+        // eddyViscosity::validate() -> kEqn::correctNut
+        LESkEqn::correctNut(t.k, t.delta, t.lesCoeffs, t.nut);
+        return;
+    }
     if (t.model == InterRasModel::KOmegaSST)
     {
         // eddyViscosity::validate -> kOmegaSSTBase::correctNut() (kOmegaSSTBase.C:129-133), which
@@ -519,6 +610,27 @@ void correctInterTurbulence(
     if (!(in.deltaT > 0))
         throw std::runtime_error(std::string(WHO) + "correctInterTurbulence needs a positive deltaT.");
 
+    if (t.model == InterRasModel::KEqnLES)
+    {
+        const SmoothLinearSolve& ks = t.kSolveFinal;
+        LESkEqn::Solve sv;
+        sv.which.smoothSolver = true;
+        sv.which.symmetric = (ks.smoother == "symGaussSeidel");
+        sv.which.nSweeps = ks.nSweeps;
+        sv.tol = ks.tol;
+        sv.relTol = ks.relTol;
+        sv.maxIter = ks.maxIter;
+        sv.minIter = ks.minIter;
+        sv.relaxOn = t.kRelaxFinal.on;
+        sv.relax = t.kRelaxFinal.factor;
+        const SolverPerformance p = LESkEqn::correct(*in.U, t.k, t.nut, *in.phi, *in.nu, *in.nuBnd, t.delta,
+                                                     in.deltaT, t.lesCoeffs, sv, m, g, patches, t.lesTaps);
+        if (in.kLog)
+        {
+            in.kLog->push_back({p.initialResidual, p.finalResidual, p.nIterations});
+        }
+        return;
+    }
     if (t.model == InterRasModel::KOmegaSST)
     {
         // the ordinary incompressible kOmegaSST: alpha = rho = 1, the volumetric phi, the mixture's nu
