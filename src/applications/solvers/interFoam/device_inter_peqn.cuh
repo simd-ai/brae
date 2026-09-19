@@ -171,6 +171,8 @@ void deviceInterAddPhiHbyATerms(
 //     boundary  internalCoeffs*p[faceCell] - boundaryCoeffs      <- the face CELL's value, not the patch's
 // and `phi = phiHbyA - flux` is what makes phi conservative. The flux is ALSO what the velocity
 // correction reads, so it is returned rather than folded away.
+// `faceFluxCorrection`: the corrected laplacian's non-orthogonal flux on the internal faces, which
+// fvMatrix::flux() adds (fvMatrix.C:1688, the host's matrixFlux); null under an orthogonal assembly
 void deviceInterPEqnFlux(
     const DeviceMesh&           dm,
     const DevicePressureMatrix& P,
@@ -178,8 +180,13 @@ void deviceInterPEqnFlux(
     const DeviceBuffer<scalar>& bC,
     const DeviceBuffer<scalar>& pSolved,
     DeviceBuffer<scalar>&       fluxInt,
-    DeviceBuffer<scalar>&       fluxBnd);
+    DeviceBuffer<scalar>&       fluxBnd,
+    const DeviceBuffer<scalar>* faceFluxCorrection = nullptr);
 
+// `corrected`: the case's `Gauss linear corrected` -- nonOrthDeltaCoeffs on the internal faces -- and
+// `nonOrthSource`, deviceFaceDivSource of the correction flux (the host's laplacianNonOrthSource with its
+// sign flipped), added before div(phiHbyA) and the reference as the host's pressureCorrector does; null
+// under an orthogonal assembly
 void deviceInterAssemblePEqn(
     const DeviceMesh&           dm,
     const DeviceBuffer<scalar>& rAUfInt,       // fvc::interpolate(rAU) on the internal faces
@@ -188,6 +195,8 @@ void deviceInterAssemblePEqn(
     bool                        needReference,
     int                         pRefCell,
     scalar                      pRefValue,
-    DevicePressureMatrix&       P);
+    DevicePressureMatrix&       P,
+    bool                        corrected = false,
+    const DeviceBuffer<scalar>* nonOrthSource = nullptr);
 
 } // namespace brae

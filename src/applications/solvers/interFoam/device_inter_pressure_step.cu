@@ -4,6 +4,7 @@
 #include "device_blas.cuh"
 #include "device_ldu.cuh"
 #include "device_pcg.cuh"
+#include "device_mesh.cuh"
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <cstdlib>
@@ -94,68 +95,110 @@ scalar deviceInterPressureStep(
         ckS(cudaMemcpy(rAUfInt.data(), in.rAUfAll->data(), sizeof(scalar)*nIf,
                        cudaMemcpyDeviceToDevice), "rAUf, internal");
 
-    // constrainPressure, then the matrix.
-    DeviceBuffer<scalar> iC, bC;
-    hooks.pressureCoeffs(phiHbyAInt, phiHbyABnd, *in.rAUfAll, iC, bC);
+    if (in.correctedLaplacian && !hooks.boundaryValues)
+        throw std::runtime_error(
+            "brae interFoam device pEqn: the corrected laplacian's correction takes grad(p_rgh) from p_rgh's "
+            "stored patch values, and no boundaryValues hook was handed in.");
 
+    // THE NON-ORTHOGONAL LOOP (the host's pressureCorrector, inter_peqn_cpp.cu): each pass the fvMatrix
+    // constructor's updateCoeffs (pressureCoeffs), the laplacian, its explicit correction from the p_rgh
+    // the last pass left, the solve, and p_rgh.correctBoundaryConditions(). The LAST pass's matrix and
+    // correction flux make p_rghEqn.flux().
     DevicePressureMatrix P;
-    deviceInterAssemblePEqn(dm, rAUfInt, phiHbyAInt, phiHbyABnd,
-                            in.needReference, in.pRefCell, in.pRefValue, P);
-
-    if (taps)
-    {
-        deviceCopy(taps->diag,   P.diag);
-        deviceCopy(taps->upper,  P.upper);
-        deviceCopy(taps->lower,  P.lower);
-        deviceCopy(taps->source, P.source);
-        deviceCopy(taps->iC,     iC);
-        deviceCopy(taps->bC,     bC);
-    }
-
-    // fold the boundary in and solve.
-    DeviceBuffer<scalar> diagC, b;
-    deviceFold(dm, P.diag, P.source, iC, bC, diagC, b);
-    const DeviceLduView A = deviceLduView(dm, diagC, P.upper, P.lower);
+    DeviceBuffer<scalar> iC, bC;
+    DeviceBuffer<scalar> ffc;
     DeviceSolverPerf perf;
-    if (in.gamg)
+    for (int pass = 0; pass <= in.nNonOrthogonalCorrectors; ++pass)
     {
-        if (!in.dic || !in.gamgCache)
+        const bool lastPass = (pass == in.nNonOrthogonalCorrectors);
+
+        // constrainPressure, and the patches' updateCoeffs at this assembly
+        hooks.pressureCoeffs(phiHbyAInt, phiHbyABnd, *in.rAUfAll, iC, bC);
+
+        // the explicit correction: gradOf(p_rgh), laplacianCorrFlux, laplacianNonOrthSource
+        DeviceBuffer<scalar> corrSource;
+        if (in.correctedLaplacian)
         {
-            throw std::runtime_error(
-                "brae interFoam device pressure step: the case asks for GAMG and the caller handed in no "
-                "fine-level DIC schedule or no hierarchy cache. Build the first with buildDeviceDilu; "
-                "the second is a DeviceGamgCache that outlives the step.");
+            DeviceBuffer<scalar> bval, gx, gy, gz;
+            hooks.boundaryValues(bval);
+            deviceGaussGrad(dm, p_rgh, bval, gx, gy, gz);
+            // `limited <k>` for 0 < k < 1 (fvm.cuh laplacianCorrFlux); otherwise the correction unlimited
+            if (in.snGradLimitCoeff > scalar(0) && in.snGradLimitCoeff < scalar(1))
+            {
+                deviceLaplacianCorrFluxLimited(dm, rAUfInt, p_rgh, gx, gy, gz, in.snGradLimitCoeff, ffc);
+            }
+            else
+            {
+                deviceLaplacianCorrFlux(dm, rAUfInt, gx, gy, gz, ffc);
+            }
+            deviceFaceDivSource(dm, ffc, corrSource);
         }
-        DeviceGamgHierarchy& hierarchy = in.gamgCache->get(in.gamg->nCellsInCoarsestLevel);
-        perf = deviceGamgSolve(A, b, p_rgh, *in.dic, hierarchy, *in.gamg, in.gamgLog);
-    }
-    else if (in.pcgDIC)
-    {
-        if (!in.dic)
+
+        deviceInterAssemblePEqn(dm, rAUfInt, phiHbyAInt, phiHbyABnd,
+                                in.needReference, in.pRefCell, in.pRefValue, P,
+                                in.correctedLaplacian, in.correctedLaplacian ? &corrSource : nullptr);
+
+        if (taps && pass == 0)
         {
-            throw std::runtime_error(
-                "brae interFoam device pressure step: the case asks for PCG with DIC and no level "
-                "schedule was handed in. Build one from the mesh with buildDeviceDilu.");
+            deviceCopy(taps->diag,   P.diag);
+            deviceCopy(taps->upper,  P.upper);
+            deviceCopy(taps->lower,  P.lower);
+            deviceCopy(taps->source, P.source);
+            deviceCopy(taps->iC,     iC);
+            deviceCopy(taps->bC,     bC);
         }
-        const scalar nf = deviceNormFactor(A, p_rgh, b, deviceOnes(nC));
-        perf = deviceDICPCG(A, b, p_rgh, nf, in.solve.tol, in.solve.relTol, in.solve.maxIter, 0, *in.dic);
-    }
-    else
-    {
-        DeviceBuffer<scalar> dNf;
-        deviceNormFactorInto(A, p_rgh, b, deviceOnes(nC), dNf);
-        perf = deviceJacobiBiCGStab(A, b, p_rgh, dNf.data(),
-                                    in.solve.tol, in.solve.relTol, in.solve.maxIter);
-    }
-    if (in.solveLog)
-    {
-        in.solveLog->push_back(perf);
+
+        // fold the boundary in and solve, with the Final entry on the last pass only
+        const DeviceAlphaSolverControls& sv = lastPass ? in.solve : in.solveInner;
+        const bool pcgDIC = lastPass ? in.pcgDIC : in.pcgDICInner;
+        const GamgControls* gamg = lastPass ? in.gamg : in.gamgInner;
+        DeviceBuffer<scalar> diagC, b;
+        deviceFold(dm, P.diag, P.source, iC, bC, diagC, b);
+        const DeviceLduView A = deviceLduView(dm, diagC, P.upper, P.lower);
+        if (gamg)
+        {
+            if (!in.dic || !in.gamgCache)
+            {
+                throw std::runtime_error(
+                    "brae interFoam device pressure step: the case asks for GAMG and the caller handed in no "
+                    "fine-level DIC schedule or no hierarchy cache. Build the first with buildDeviceDilu; "
+                    "the second is a DeviceGamgCache that outlives the step.");
+            }
+            DeviceGamgHierarchy& hierarchy = in.gamgCache->get(gamg->nCellsInCoarsestLevel);
+            perf = deviceGamgSolve(A, b, p_rgh, *in.dic, hierarchy, *gamg, in.gamgLog);
+        }
+        else if (pcgDIC)
+        {
+            if (!in.dic)
+            {
+                throw std::runtime_error(
+                    "brae interFoam device pressure step: the case asks for PCG with DIC and no level "
+                    "schedule was handed in. Build one from the mesh with buildDeviceDilu.");
+            }
+            const scalar nf = deviceNormFactor(A, p_rgh, b, deviceOnes(nC));
+            perf = deviceDICPCG(A, b, p_rgh, nf, sv.tol, sv.relTol, sv.maxIter, 0, *in.dic);
+        }
+        else
+        {
+            DeviceBuffer<scalar> dNf;
+            deviceNormFactorInto(A, p_rgh, b, deviceOnes(nC), dNf);
+            perf = deviceJacobiBiCGStab(A, b, p_rgh, dNf.data(), sv.tol, sv.relTol, sv.maxIter);
+        }
+        if (in.solveLog)
+        {
+            in.solveLog->push_back(perf);
+        }
+        // p_rgh.correctBoundaryConditions() after every solve; after the last one the caller does it
+        if (!lastPass && hooks.updateBoundary)
+        {
+            hooks.updateBoundary(p_rgh);
+        }
     }
 
     // phi = phiHbyA - p_rghEqn.flux(). The flux is taken from the UNFOLDED matrix, because
     // fvMatrix::flux() reads upper/lower and the boundary coefficients, not the folded diagonal.
     DeviceBuffer<scalar> fluxInt, fluxBnd;
-    deviceInterPEqnFlux(dm, P, iC, bC, p_rgh, fluxInt, fluxBnd);
+    deviceInterPEqnFlux(dm, P, iC, bC, p_rgh, fluxInt, fluxBnd, in.correctedLaplacian ? &ffc : nullptr);
     phiInt.resize(static_cast<std::size_t>(nIf));
     phiBnd.resize(static_cast<std::size_t>(nBf));
     if (nIf > 0)

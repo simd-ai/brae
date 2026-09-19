@@ -500,7 +500,8 @@ if [ $HAVE_GPU = 1 ]; then
     arm device_gradNHat     refused "leastSquares or cellLimited" "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    nHat            cellLimited Gauss linear 1;/' system/fvSchemes"
     arm device_baseline     runs    -                        "-device" true
     arm device_nOuter2      refused "nOuterCorrectors 2"      "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' system/fvSolution"
-    arm device_nNonOrth1    refused "nNonOrthogonalCorrectors 1" "-device" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"
+    # the device pressure step runs the non-orthogonal loop (laminar/damBreak `nonorth` holds it)
+    arm device_nNonOrth1    runs    -                        "-device" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"
     arm device_mesh_dynamic refused "dynamicRefineFvMesh"     "-device" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
     # ...nor a non-orthogonal correction where it is not zero
     arm device_sheared_corrected refused "not orthogonal"     "-device" "$SHEAR"

@@ -61,15 +61,18 @@ scalar worstOf(const std::vector<scalar>& a, const std::vector<scalar>& b, scala
 }
 }   // namespace
 
-int main()
+// one fixture: `shear` skews the box (0 is orthogonal); `corrected` assembles the p_rgh laplacian as
+// `Gauss linear corrected` with `nNonOrth` non-orthogonal passes, on BOTH sides -- the host with its own
+// operators, the device through deviceInterPressureStep's loop
+void runFixture(
+    scalar shear,
+    bool corrected,
+    int nNonOrth)
 {
-    std::printf("== one pass of interFoam's pEqn: device vs host\n");
-    int nDev = 0;
-    if (cudaGetDeviceCount(&nDev) != cudaSuccess) { cudaGetLastError(); nDev = 0; }
-    if (nDev <= 0) { std::printf("  SKIP: no CUDA device\n"); return 77; }
-
+    std::printf("-- fixture: shear %.2f, %s, nNonOrthogonalCorrectors %d\n", (double)shear,
+                corrected ? "corrected" : "orthogonal", nNonOrth);
     const label N = 8;
-    PrimitiveMesh m = boxtest::boxMesh(N, N, N, scalar(0), scalar(2), scalar(1), scalar(0.5));
+    PrimitiveMesh m = boxtest::boxMesh(N, N, N, shear, scalar(2), scalar(1), scalar(0.5));
     FvGeometry g;
     g.build(m);
     const std::vector<FvPatch> fvp = buildPatches(m, g);
@@ -191,11 +194,24 @@ int main()
                     rAUfField.boundary[pi].push_back(rAUfAll[off++]);
         }
 
-        FvScalarMatrix pe = fvm::laplacian<scalar>(rAUfField, *prgh, m, g, fvp, false);
-        const std::vector<scalar> dv = fvc::div(phiH, m, g, fvp);
-        for (label c = 0; c < nC; ++c) pe.source[c] += dv[c]*g.V()[c];
-        pbicgstab(pe, prgh->internal, m, fvp, scalar(1e-13), scalar(0), 2000);
-        prgh->evaluateBoundary();
+        // the host's pressureCorrector loop (inter_peqn_cpp.cu), its own operators
+        FvScalarMatrix pe;
+        for (int pass = 0; pass <= nNonOrth; ++pass)
+        {
+            pe = fvm::laplacian<scalar>(rAUfField, *prgh, m, g, fvp, corrected);
+            if (corrected)
+            {
+                const std::vector<vector> gradP = fvc::gaussGrad(*prgh, m, g, fvp);
+                const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
+                    rAUfField, *prgh, gradP, m, g, fvp, 0.0);
+                for (label c = 0; c < nC; ++c) pe.source[c] -= corr[c];
+                pe.faceFluxCorrection = fvm::laplacianCorrFlux<scalar, vector>(rAUfField, gradP, m, g, 0.0, prgh.get());
+            }
+            const std::vector<scalar> dv = fvc::div(phiH, m, g, fvp);
+            for (label c = 0; c < nC; ++c) pe.source[c] += dv[c]*g.V()[c];
+            pbicgstab(pe, prgh->internal, m, fvp, scalar(1e-13), scalar(0), 2000);
+            prgh->evaluateBoundary();
+        }
 
         const SurfaceScalarField pFlux = matrixFlux(pe, prgh->internal, m, fvp);
         std::vector<scalar> ffInt(static_cast<std::size_t>(nIf));
@@ -243,6 +259,9 @@ int main()
     din.solve.tol = scalar(1e-13);
     din.solve.relTol = 0;
     din.solve.maxIter = 2000;
+    din.solveInner = din.solve;
+    din.nNonOrthogonalCorrectors = nNonOrth;
+    din.correctedLaplacian = corrected;
 
     // the host's per-patch dispatch, handed in as the hook
     auto prghForCoeffs = makePrgh();
@@ -275,13 +294,30 @@ int main()
         bC.copyFrom(b2);
     };
 
+    // p_rgh's patch values between the passes, as the driver's hooks keep f.p_rgh current
+    hooks.updateBoundary = [&](const DeviceBuffer<scalar>& pr)
+    {
+        pr.copyTo(prghForCoeffs->internal);
+        prghForCoeffs->evaluateBoundary();
+    };
+    hooks.boundaryValues = [&](DeviceBuffer<scalar>& bval)
+    {
+        std::vector<scalar> flat;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            const std::vector<scalar>& v = prghForCoeffs->boundary[pi]->value();
+            flat.insert(flat.end(), v.begin(), v.end());
+        }
+        bval.copyFrom(flat);
+    };
+
     DeviceBuffer<scalar> dPhiHI(phiHInt), dPhiHB(phiHBnd), dPrgh(p_rgh0);
     DeviceBuffer<scalar> phiI, phiB, ux, uy, uz, pOut;
     const scalar resid = deviceInterPressureStep(dm, din, hooks, dRAU, dHx, dHy, dHz,
                                                  dPhiHI, dPhiHB, dPrgh, phiI, phiB,
                                                  ux, uy, uz, pOut);
     if (cudaDeviceSynchronize() != cudaSuccess)
-    { std::printf("  FAIL: kernels did not complete\n"); return 1; }
+    { std::printf("  FAIL: kernels did not complete\n"); ++failures; return; }
 
     std::vector<scalar> gPrgh, gUx, gP;
     dPrgh.copyTo(gPrgh);
@@ -304,6 +340,33 @@ int main()
         check("...and so does the corrected velocity", wu <= scalar(1e-9)*std::fmax(s2, scalar(1e-30)));
         check("...and the rebuilt p", wq <= scalar(1e-9)*s3);
         check("the pressure solve converged", resid <= scalar(1e-13));
+    }
+
+    // ---- 1b. THE CONTROL, on a non-orthogonal fixture: the device assembling the same system
+    // ORTHOGONAL -- no correction, deltaCoeffs for nonOrthDeltaCoeffs -- must miss the host's corrected
+    // answer by far more than the tolerance above, or the arm could not tell the loop from its absence
+    if (corrected)
+    {
+        DeviceInterPressureInput dOrth = din;
+        dOrth.correctedLaplacian = false;
+        auto prghOrth = makePrgh();
+        DeviceInterPressureHooks hOrth = hooks;
+        hOrth.updateBoundary = [&](const DeviceBuffer<scalar>& pr)
+        {
+            pr.copyTo(prghOrth->internal);
+            prghOrth->evaluateBoundary();
+        };
+        DeviceBuffer<scalar> cPhiHI(phiHInt), cPhiHB(phiHBnd), cPrgh(p_rgh0);
+        DeviceBuffer<scalar> cPhiI, cPhiB, cUx, cUy, cUz, cP;
+        deviceInterPressureStep(dm, dOrth, hOrth, dRAU, dHx, dHy, dHz, cPhiHI, cPhiHB, cPrgh, cPhiI, cPhiB,
+                                cUx, cUy, cUz, cP);
+        std::vector<scalar> cp;
+        cPrgh.copyTo(cp);
+        scalar sc = 0;
+        const scalar d = worstOf(cp, host.prgh, sc);
+        std::printf("  CONTROL: the device assembled orthogonal is %.3e of %.3e from the host's corrected p_rgh\n",
+                    (double)d, (double)sc);
+        check("...which the tolerance above could not pass", d > scalar(1e-6)*sc);
     }
 
     // ---- 2. the fields actually moved -------------------------------------------------------------
@@ -349,6 +412,18 @@ int main()
               fromOld > scalar(1e-3));
     }
 
+}
+
+int main()
+{
+    std::printf("== one pass of interFoam's pEqn: device vs host\n");
+    int nDev = 0;
+    if (cudaGetDeviceCount(&nDev) != cudaSuccess) { cudaGetLastError(); nDev = 0; }
+    if (nDev <= 0) { std::printf("  SKIP: no CUDA device\n"); return 77; }
+    runFixture(scalar(0), false, 0);
+    // the non-orthogonal loop, transcribed from the host's pressureCorrector: a box sheared so the
+    // correction is not zero, `corrected`, and one non-orthogonal corrector
+    runFixture(scalar(0.35), true, 1);
     std::printf("test_device_inter_pressure_step: %d failures\n", failures);
     return failures ? 1 : 0;
 }

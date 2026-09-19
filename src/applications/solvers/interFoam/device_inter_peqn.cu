@@ -153,6 +153,14 @@ __global__ void pFluxBoundaryKernel(
     if (b < nBf) flux[b] = iC[b]*p[bndCell[b]] - bC[b];
 }
 
+// source += s, where s is deviceFaceDivSource's output -- the host's laplacianNonOrthSource negated, so
+// adding it is the host's `source -= corr`
+__global__ void addKernel(const scalar* __restrict__ s, int nC, scalar* __restrict__ source)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c < nC) source[c] += s[c];
+}
+
 __global__ void addDivSourceKernel(const scalar* __restrict__ div, const scalar* __restrict__ V,
                                    int nC, scalar* __restrict__ source)
 {
@@ -343,21 +351,32 @@ void deviceInterAssemblePEqn(
     bool                        needReference,
     int                         pRefCell,
     scalar                      pRefValue,
-    DevicePressureMatrix&       P)
+    DevicePressureMatrix&       P,
+    bool                        corrected,
+    const DeviceBuffer<scalar>* nonOrthSource)
 {
     const int nC = dm.nCells;
 
-    // fvm::laplacian(rAUf, p_rgh), UNCORRECTED -- interFoam's pEqn passes corrected=false, and the
-    // shipped tutorials' `laplacianSchemes default Gauss linear corrected` applies to the momentum
-    // equation, not to this one. A corrected laplacian here would need its deferred source AND the
-    // matching faceFluxCorrection, or phi comes out non-conservative while the equation still solves.
-    deviceLaplacianCoeffs(dm, rAUfInt, P.diag, P.upper, P.lower, /*nonOrth=*/false);
+    // fvm::laplacian(rAUf, p_rgh) under the case's laplacianSchemes, as the host's pressureCorrector
+    // (inter_peqn_cpp.cu) assembles it: nonOrthDeltaCoeffs on the internal faces when `corrected`.
+    // (This said pEqn passes corrected=false; the host takes the case's scheme, and so does this.)
+    deviceLaplacianCoeffs(dm, rAUfInt, P.diag, P.upper, P.lower, corrected);
 
+    // the source, in the host's order: the laplacian's own (zero), then `source -= corr` -- the
+    // explicit non-orthogonal correction -- then `source += div*V`
+    P.source.resize(static_cast<std::size_t>(nC));
+    cudaMemset(P.source.data(), 0, sizeof(scalar)*nC);
+    if (nonOrthSource)
+    {
+        if (!corrected)
+            throw std::runtime_error(
+                "brae interFoam device pEqn: a non-orthogonal correction was handed to an orthogonal assembly.");
+        addKernel<<<nBlocks(nC), TPB>>>(nonOrthSource->data(), nC, P.source.data());
+        ckP(cudaGetLastError(), "source -= laplacianNonOrthSource");
+    }
     // == fvc::div(phiHbyA): source += div*V, a PLUS.
     DeviceBuffer<scalar> div(static_cast<std::size_t>(nC));
     deviceDiv(dm, phiHbyAInt, phiHbyABnd, div);
-    P.source.resize(static_cast<std::size_t>(nC));
-    cudaMemset(P.source.data(), 0, sizeof(scalar)*nC);
     addDivSourceKernel<<<nBlocks(nC), TPB>>>(div.data(), dm.V.data(), nC, P.source.data());
     ckP(cudaGetLastError(), "source += div(phiHbyA)*V");
 
@@ -411,7 +430,8 @@ void deviceInterPEqnFlux(
     const DeviceBuffer<scalar>& bC,
     const DeviceBuffer<scalar>& pSolved,
     DeviceBuffer<scalar>&       fluxInt,
-    DeviceBuffer<scalar>&       fluxBnd)
+    DeviceBuffer<scalar>&       fluxBnd,
+    const DeviceBuffer<scalar>* faceFluxCorrection)
 {
     const int nBf = dm.nBndFaces;
     DeviceLduView A{};
@@ -426,6 +446,13 @@ void deviceInterPEqnFlux(
     A.losort = dm.losort.data();
     A.losortStart = dm.losortStart.data();
     deviceMatrixFluxInternal(A, pSolved, fluxInt);
+    // fvMatrix::flux(): `fieldFlux += *faceFluxCorrectionPtr_` (fvMatrix.C:1688, matrixFlux on the host)
+    if (faceFluxCorrection && dm.nInternalFaces > 0)
+    {
+        addKernel<<<nBlocks(dm.nInternalFaces), TPB>>>(faceFluxCorrection->data(), dm.nInternalFaces,
+                                                       fluxInt.data());
+        ckP(cudaGetLastError(), "pEqn.flux() += faceFluxCorrection");
+    }
 
     fluxBnd.resize(static_cast<std::size_t>(nBf));
     if (nBf > 0)

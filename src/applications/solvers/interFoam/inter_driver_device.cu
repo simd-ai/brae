@@ -207,22 +207,15 @@ RunReport runInterFoamDevice(
     label nBf = 0;
     for (const FvPatch& q : fvp) nBf += q.size;
 
-    // TWO PIMPLE CONTROLS THE HOST HONOURS AND THIS LOOP DOES NOT, refused rather than run as 1 and 0.
-    // deviceInterStep is one outer corrector with no non-orthogonal pass; 5 shipped tutorials ask for
-    // nOuterCorrectors 2 or 3 and 4 for nNonOrthogonalCorrectors 1, and until this was here `-device`
-    // would have taken every one of them at the smaller number without a word.
+    // A PIMPLE CONTROL THE HOST HONOURS AND THIS LOOP DOES NOT, refused rather than run as 1.
+    // deviceInterStep is one outer corrector; 5 shipped tutorials ask for nOuterCorrectors 2 or 3.
+    // (nNonOrthogonalCorrectors is the device pressure step's own loop now, transcribed from the host's
+    // pressureCorrector and gated on laminar/damBreak `nonorth`.)
     if (f.pimple.nOuterCorrectors > 1)
     {
         throw std::runtime_error(
             "brae interFoam (device): `nOuterCorrectors " + std::to_string(f.pimple.nOuterCorrectors)
             + "` is not wired into the device loop, which runs one. The host path (no -device) does.");
-    }
-    if (f.nNonOrthogonalCorrectors > 0)
-    {
-        throw std::runtime_error(
-            "brae interFoam (device): `nNonOrthogonalCorrectors "
-            + std::to_string(f.nNonOrthogonalCorrectors) + "` is not wired into the device pressure "
-              "step, which runs none. The host path (no -device) does.");
     }
 
     // ...AND A VELOCITY CONDITION THAT NAMES A FLUX OTHER THAN phi. p_rgh's and alpha's conditions are
@@ -585,6 +578,18 @@ RunReport runInterFoamDevice(
         iC.copyFrom(i2);
         bC.copyFrom(b2);
     };
+    // p_rgh's stored patch values, for the corrected laplacian's grad(p_rgh): what the host's
+    // gradOf(p_rgh) reads, after pressureCoeffs has run the patches' updates
+    H.pressure.boundaryValues = [&](DeviceBuffer<scalar>& bval)
+    {
+        std::vector<scalar> flat;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            const std::vector<scalar>& v = f.p_rgh.boundary[pi]->value();
+            flat.insert(flat.end(), v.begin(), v.end());
+        }
+        bval.copyFrom(flat);
+    };
     H.pressure.updateBoundary = [&](const DeviceBuffer<scalar>& pr)
     {
         pr.copyTo(f.p_rgh.internal);
@@ -673,6 +678,9 @@ RunReport runInterFoamDevice(
     }
     C.divSchemeCoeff = f.divRhoPhiUCoeff;
     C.nCorrectors = static_cast<int>(f.pimple.nCorrectors);
+    C.nNonOrthogonalCorrectors = static_cast<int>(f.nNonOrthogonalCorrectors);
+    C.correctedLaplacian = f.laplacianScheme.corrected;
+    C.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
     C.momentumPredictor = f.momentumPredictorOn;
     C.relaxU = f.relaxU;
     C.relaxEquationU = f.relaxEquationU;

@@ -359,6 +359,13 @@ void deviceInterStep(
         pi.gamgCache = ctl.gamgCache;
         pi.gamgLog = ctl.gamgLog;
         pi.solveLog = ctl.pressureSolveLog;
+        // the non-orthogonal passes before the last take the plain entry, whichever corrector this is
+        pi.nNonOrthogonalCorrectors = ctl.nNonOrthogonalCorrectors;
+        pi.solveInner = ctl.pressure;
+        pi.pcgDICInner = ctl.pressurePcgDIC;
+        pi.gamgInner = ctl.pressureGamg;
+        pi.correctedLaplacian = ctl.correctedLaplacian;
+        pi.snGradLimitCoeff = ctl.snGradLimitCoeff;
 
         DevicePressureTaps pt;
         deviceInterPressureStep(dm, pi, hooks.pressure, st.rAU, st.HbyA[0], st.HbyA[1], st.HbyA[2],

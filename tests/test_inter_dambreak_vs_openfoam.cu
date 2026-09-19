@@ -112,7 +112,9 @@ int main(int argc, char** argv)
     const bool nHatLimited = profileName == "nHatLimited";
     const bool pimpleProfile = nOuter || nonOrth || momPred || namedFlux || vanLeerV || linear || compression
                             || alphaMinIter || gradLsqLimited;
-    const bool deviceRefuses = nOuter || nonOrth || namedFlux || compression || alphaMinIter || gradLsqLimited
+    // `nonorth` RUNS on the device: its pressure step carries the non-orthogonal loop (transcribed from
+    // the host's pressureCorrector), and the device arm below holds it to OpenFOAM
+    const bool deviceRefuses = nOuter || namedFlux || compression || alphaMinIter || gradLsqLimited
                             || nHatLimited || sheared;
     const bool bigStep = (argc > 7 && std::string(argv[7]) == "bigstep") || prevCorr || pimpleProfile || sheared;
     // `inflow`: the atmosphere's inletValue set to 1, so water enters over air cells and rho's patch

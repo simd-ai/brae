@@ -143,6 +143,11 @@ struct DeviceInterStepControls
     // about one per cent of the gap. Written here because the first version of this comment claimed
     // the opposite before the measurement came back.
     int    nCorrectors       = 1;
+    // fvSolution's PIMPLE/nNonOrthogonalCorrectors, and laplacianSchemes' `corrected` (and `limited`
+    // coefficient, 0 = unlimited) for the p_rgh laplacian -- see DeviceInterPressureInput
+    int    nNonOrthogonalCorrectors = 0;
+    bool   correctedLaplacian = false;
+    scalar snGradLimitCoeff = 0;
     bool   momentumPredictor = true;         // damBreak sets this OFF
     scalar relaxU            = 1;
     bool   relaxEquationU    = false;        // the case NAMES a factor -- see gpu::MomentumInput

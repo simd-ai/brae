@@ -64,6 +64,11 @@ struct DeviceInterPressureHooks
                        const DeviceBuffer<scalar>& rAUfAll,
                        DeviceBuffer<scalar>&       iC,
                        DeviceBuffer<scalar>&       bC)> pressureCoeffs;
+
+    // p_rgh's STORED patch values, flattened in boundary-face order, as they stand after pressureCoeffs
+    // -- what the host's gradOf(p_rgh) reads for the corrected laplacian's non-orthogonal correction
+    // (inter_peqn_cpp.cu). Required when DeviceInterPressureInput::correctedLaplacian is set.
+    std::function<void(DeviceBuffer<scalar>& bval)> boundaryValues;
 };
 
 struct DeviceInterPressureInput
@@ -102,6 +107,22 @@ struct DeviceInterPressureInput
     // appended to, one record per solve -- the solver's own initial/final residual and iteration
     // count, which is what a gate compares with OpenFOAM's "Solving for p_rgh" lines; null = not kept
     std::vector<DeviceSolverPerf>* solveLog = nullptr;
+
+    // THE NON-ORTHOGONAL LOOP, as the host's pressureCorrector runs it (inter_peqn_cpp.cu):
+    // nNonOrthogonalCorrectors + 1 assemblies and solves of p_rgh, each pass's correction from the
+    // p_rgh the last one left. `solve`/`pcgDIC`/`gamg` above are the LAST pass's settings; every pass
+    // before it takes the plain `p_rgh` entry below, because p_rgh.select(finalInnerIter()) (pEqn.H:50)
+    // is Final only on the last non-orthogonal pass of the last corrector.
+    int nNonOrthogonalCorrectors = 0;
+    DeviceAlphaSolverControls solveInner;
+    bool pcgDICInner = false;
+    const GamgControls* gamgInner = nullptr;
+    // the case's laplacianSchemes for the p_rgh laplacian: `corrected` and a `limited` coefficient
+    // (0 = unlimited). Under `corrected` each pass adds the explicit correction from grad(p_rgh) --
+    // Gauss linear, the only gradSchemes entry the device takes -- and keeps its face flux for
+    // p_rghEqn.flux().
+    bool correctedLaplacian = false;
+    scalar snGradLimitCoeff = 0;
 };
 
 // `phiHbyAInt`/`phiHbyABnd` come in as fvc::flux(HbyA) -- what the shared pressure predictor left --
