@@ -150,6 +150,23 @@ RunReport runInterFoamDevice(
             "(ddtScheme.C, fvcDdtPhiCoeff). The host loop adds it to phiHbyA (gated on RAS/weirOverflow); "
             "the device loop's pressure equation does not. Refused rather than run without the term.");
     }
+    // A PLAIN inletOutlet ON U: OpenFOAM's updateCoeffs sets valueFraction = neg(phi) at EVERY momentum
+    // assembly, so an inflow face is fixedValue and an outflow face zeroGradient, and the matrix's
+    // boundary coefficients follow. The device loop builds U's boundary once and never applies that
+    // switch (deviceUpdateInletOutlet is called for nut and for the scalar fields, never for dbU).
+    // MEASURED on RAS/waterChannel, whose outlet carries one, with every solve tightened on both codes
+    // and the HOST closure in the device loop so the closure cannot be the cause: U 1.7e-03, nut 5.4e-01
+    // against OpenFOAM where the host loop is 7.7e-13 -- and 1.1e-02 of U with the schemes orthogonal, so
+    // it is not the non-orthogonal correction either. Refused rather than assembled from a stale switch.
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        if (!f.U.boundary[pi]->isInletOutlet()) continue;
+        throw std::runtime_error(
+            "brae interFoam (device): U patch `" + fvp[pi].name + "` is an inletOutlet. OpenFOAM sets its "
+            "valueFraction from the flux sign at every momentum assembly and the device loop assembles "
+            "the switch it was built with. The host path (no -device) does it. Refused rather than run a "
+            "stale boundary.");
+    }
     // A flowRateInletVelocity is RECOMPUTED at every momentum assembly (the host loop has it,
     // inter_driver_cpp.cu). The device loop uploads U's patch values once, so it is right only for the
     // inlet that never changes: a constant VOLUMETRIC rate whose constructor already built the value.

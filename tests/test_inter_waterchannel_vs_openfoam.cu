@@ -283,14 +283,14 @@ int main(
         catch (const std::exception& e)
         {
             const std::string w = e.what();
-            // either of the two things this case asks for that the device does not carry: nut's
-            // flux-conditional outlet, and the GAMG smoother the case names (the profiles differ in
-            // which comes first)
-            named = (w.find("inletOutlet") != std::string::npos && w.find("nut") != std::string::npos)
-                 || w.find("smoother") != std::string::npos;
+            // what is left of this case that the device does not carry: U's outlet is a plain
+            // inletOutlet, whose valueFraction OpenFOAM sets from the flux sign at every momentum
+            // assembly. MEASURED with that refusal lifted and nothing else changed: U 8.9e-02,
+            // nut 8.7e-01 against OpenFOAM, where the host loop on this same case is 4.3e-12.
+            named = w.find("inletOutlet") != std::string::npos && w.find("U patch") != std::string::npos;
             std::printf("  device: %s\n", e.what());
         }
-        check("the device loop refuses the case, naming the inletOutlet nut or the GAMG smoother", named);
+        check("the device loop refuses the case, naming U's inletOutlet outlet", named);
     }
 
     std::printf("test_inter_waterchannel_vs_openfoam: %d failures\n", failures);
