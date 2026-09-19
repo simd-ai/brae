@@ -201,6 +201,11 @@ void deviceInterStep(
     uin.schemeCoeff       = ctl.divSchemeCoeff;
     uin.linearUpwind      = (ctl.divScheme == brae::cpu::DivScheme::linearUpwind);
     uin.gradULimitK       = ctl.gradULimitK;
+    // the viscous laplacian under the case's laplacianSchemes, as the host's assembleUEqn hands
+    // addDivDevReff (inter_ueqn_cpp.cu): nonOrthDeltaCoeffs and the deferred correction when `corrected`,
+    // capped per face under `limited`. The shared assembler carries both; interFoam's step left them off.
+    uin.correctedLaplacian = ctl.correctedLaplacian;
+    uin.snGradLimitCoeff   = ctl.snGradLimitCoeff;
     uin.gradUSchemeLimitK = ctl.gradUSchemeLimitK;
     uin.relaxU        = ctl.relaxU;
     uin.relaxEquation = ctl.relaxEquationU;

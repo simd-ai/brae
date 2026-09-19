@@ -66,15 +66,18 @@ scalar relWorst(const std::vector<scalar>& a, const std::vector<scalar>& b, scal
 }
 }   // namespace
 
-int main()
+// one fixture: `shear` skews the box (0 is orthogonal); `corrected` and `limitCoeff` are the case's
+// laplacianSchemes for the viscous term, handed to BOTH sides -- the host's addDivDevReff and the
+// device's assembleUEqn, which interFoam's device step now passes them to
+void runFixture(
+    scalar shear,
+    bool corrected,
+    scalar limitCoeff)
 {
-    std::printf("== interFoam's momentum matrix: device vs host\n");
-    int nDev = 0;
-    if (cudaGetDeviceCount(&nDev) != cudaSuccess) { cudaGetLastError(); nDev = 0; }
-    if (nDev <= 0) { std::printf("  SKIP: no CUDA device\n"); return 77; }
-
+    std::printf("-- fixture: shear %.2f, %s, limited %.2f\n", (double)shear,
+                corrected ? "corrected" : "orthogonal", (double)limitCoeff);
     const label N = 8;
-    PrimitiveMesh m = boxtest::boxMesh(N, N, N, scalar(0), scalar(2), scalar(1), scalar(0.5));
+    PrimitiveMesh m = boxtest::boxMesh(N, N, N, shear, scalar(2), scalar(1), scalar(0.5));
     FvGeometry g;
     g.build(m);
     const std::vector<FvPatch> fvp = buildPatches(m, g);
@@ -110,7 +113,10 @@ int main()
         const scalar y = g.C()[c].y;
         rho[c]    = (y < scalar(4))        ? scalar(1000) : scalar(1);
         rhoOld[c] = (y < scalar(4) - scalar(1)) ? scalar(1000) : scalar(1);   // the interface moved
-        nuEff[c]  = (y < scalar(4)) ? scalar(1e-6) : scalar(1.48e-5);
+        // on the sheared fixtures the viscosity is 1e5x the fluids', so the viscous term -- and with it the
+        // non-orthogonal correction under test -- is a visible part of a source dominated by rho*U/dt:
+        // at the fluids' own viscosity the correction was 3.5e-10 of it and the control could not fail
+        nuEff[c]  = ((y < scalar(4)) ? scalar(1e-6) : scalar(1.48e-5)) * ((shear > scalar(0)) ? scalar(1e5) : scalar(1));
     }
     std::vector<vector> UOld(static_cast<std::size_t>(nC));
     for (label c = 0; c < nC; ++c)
@@ -167,6 +173,8 @@ int main()
     hin.scheme    = ifm::DivScheme::upwind;
     hin.relaxEquationU = true;      // damBreak's `equations { ".*" 1; }`
     hin.relaxU    = scalar(1);
+    hin.correctedLaplacian = corrected;
+    hin.snGradLimitCoeff   = limitCoeff;
     const FvVectorMatrix H = ifm::assembleUEqn(U, hin, m, g, fvp);
 
     // ---- the DEVICE matrix -----------------------------------------------------------------------
@@ -194,6 +202,8 @@ int main()
     din.scheme       = brae::cpu::DivScheme::upwind;
     din.relaxU       = scalar(1);
     din.relaxEquation = true;
+    din.correctedLaplacian = corrected;
+    din.snGradLimitCoeff   = limitCoeff;
     din.ddtRho       = &dRho;
     din.ddtRhoOld    = &dRhoOld;
     din.ddtUOld[0]   = &dUox;
@@ -206,7 +216,7 @@ int main()
     // kept for arm 6: the source BEFORE the face force is added
     std::vector<scalar> M_srcHost0;
     if (cudaDeviceSynchronize() != cudaSuccess)
-    { std::printf("  FAIL: kernels did not complete\n"); return 1; }
+    { std::printf("  FAIL: kernels did not complete\n"); ++failures; return; }
 
     for (label c = 0; c < nC; ++c) M_srcHost0.push_back(H.source[c].x);
 
@@ -265,6 +275,31 @@ int main()
             std::printf("  source[%d]: worst %.3e of %.3e\n", k, (double)w, (double)sc);
             check("the source matches the host", w <= scalar(1e-12)*sc);
         }
+    }
+
+    // ---- 3b. THE CONTROL, on a non-orthogonal fixture: the device assembling the viscous term
+    // ORTHOGONAL -- no deferred correction, deltaCoeffs for nonOrthDeltaCoeffs -- must miss the host's
+    // corrected source by far more than the bound above, or the arm could not tell the flag from its absence
+    if (corrected)
+    {
+        gpu::MomentumInput orth = din;
+        orth.correctedLaplacian = false;
+        gpu::MomentumMatrix O;
+        gpu::assembleUEqn(O, dm, dbU, dUx, dUy, dUz, orth);
+        scalar worstRel = 0;
+        for (int k = 0; k < 3; ++k)
+        {
+            std::vector<scalar> src, want(static_cast<std::size_t>(nC));
+            O.source[k].copyTo(src);
+            for (label c = 0; c < nC; ++c)
+                want[c] = (k == 0) ? H.source[c].x : (k == 1) ? H.source[c].y : H.source[c].z;
+            scalar sc = 0;
+            const scalar w = relWorst(src, want, sc);
+            worstRel = std::fmax(worstRel, w / std::fmax(sc, scalar(1e-300)));
+        }
+        std::printf("  CONTROL: the device assembled orthogonal misses the host's corrected source by %.3e "
+                    "relative\n", (double)worstRel);
+        check("...which the bound above could not pass", worstRel > scalar(1e-8));
     }
 
     // ---- 4. the boundary coefficients -------------------------------------------------------------
@@ -430,6 +465,19 @@ int main()
         check("the face force is a material part of the source", forceMag > scalar(0.1)*sc0);
     }
 
+}
+
+int main()
+{
+    std::printf("== interFoam's momentum matrix: device vs host\n");
+    int nDev = 0;
+    if (cudaGetDeviceCount(&nDev) != cudaSuccess) { cudaGetLastError(); nDev = 0; }
+    if (nDev <= 0) { std::printf("  SKIP: no CUDA device\n"); return 77; }
+    runFixture(scalar(0), false, scalar(0));
+    // the viscous term's non-orthogonal correction, which interFoam's device step hands the shared
+    // assembler from the case's laplacianSchemes: a sheared box, `corrected`, and `limited 0.5 corrected`
+    runFixture(scalar(0.35), true, scalar(0));
+    runFixture(scalar(0.35), true, scalar(0.5));
     std::printf("test_device_inter_ueqn_assembly: %d failures\n", failures);
     return failures ? 1 : 0;
 }
