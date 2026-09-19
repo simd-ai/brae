@@ -129,6 +129,12 @@ public:
     {
         return points0_;
     }
+    // zoneMotion::pointIDs(): the points a cellZone motion moves, ascending; empty when the whole mesh
+    // moves. Filled by attach().
+    const std::vector<label>& pointIDs() const
+    {
+        return pointIDs_;
+    }
     const std::vector<vector>& oldPoints() const
     {
         return oldPoints_;
@@ -158,6 +164,9 @@ private:
     std::unique_ptr<DisplacementLaplacianFvMotionSolver> displacement_;
     std::string motionType_;
     std::vector<vector> points0_;
+    std::string cellZone_;
+    std::vector<label> zoneCells_;
+    std::vector<label> pointIDs_;
     std::vector<vector> oldPoints_;
     std::vector<scalar> V0_;
     SurfaceScalarField meshPhi_;

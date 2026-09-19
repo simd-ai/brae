@@ -99,6 +99,7 @@ add_library(brae_core STATIC
     src/OpenFOAM/matrices/gamg.cu
     src/OpenFOAM/matrices/pbicgstab.cu
     src/OpenFOAM/matrices/pbicg.cu
+    src/meshTools/AMIInterpolation/faceAreaWeightAMI/face_area_weight_ami_cpp.cu
     src/OpenFOAM/matrices/smooth_solver_cpp.cu
     src/matrices/lduMatrix/solvers/GAMG/GAMGAgglomerations/pair_gamg_agglomeration_cpp.cu
     src/matrices/lduMatrix/solvers/GAMG/gamg_solver_cpp.cu
@@ -3516,6 +3517,12 @@ target_include_directories(test_inter_mangrove_vs_openfoam PRIVATE ${BRAE_HEADER
 target_link_libraries(test_inter_mangrove_vs_openfoam PRIVATE brae_core)
 add_test(NAME interfoam_mangrove_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_mangrove_vs_openfoam.sh)
+
+# OpenFOAM's faceAreaWeightAMI on the host, against the weights its own cyclicAMI holds on
+# RAS/mixerVesselAMI as the rotor turns (run by tests/interfoam_ami_vs_openfoam.sh)
+add_executable(test_face_area_weight_ami tests/test_face_area_weight_ami.cu)
+target_include_directories(test_face_area_weight_ami PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_face_area_weight_ami PRIVATE brae_core)
 
 # ...and the wave boundary conditions (waveAlpha, waveVelocity) on laminar/waves/stokesI: fields, the
 # patch values the wave model assigns, its two derived constants and the ORDER it updates in, all

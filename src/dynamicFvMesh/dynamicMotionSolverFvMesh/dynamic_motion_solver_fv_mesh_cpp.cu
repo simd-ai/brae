@@ -1,5 +1,6 @@
 #include "dynamic_motion_solver_fv_mesh_cpp.cuh"
 #include "foam_dict.cuh"
+#include "mrf_read.cuh"
 #include <cmath>
 #include <filesystem>
 #include <stdexcept>
@@ -107,17 +108,32 @@ std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::New(
 
     // motionSolver::coeffDict(): optionalSubDict(typeName + "Coeffs")
     const FoamDict& coeffs = *d.optionalSubDict(solver + "Coeffs");
+    // zoneMotion.C:47-94: a cellSet, a cellZone or neither; `none` is a placeholder for "no selection"
+    std::string cellZone;
     for (const char* key : {"cellZone", "cellSet"})
     {
-        const std::string name = coeffs.wordOr(key, "");
-        // zoneMotion.C:50, :70: `none` is a placeholder for "no selection"
-        if (!name.empty() && name != "none")
+        std::string name = coeffs.wordOr(key, "");
+        if (name == "none")
+        {
+            name.clear();
+        }
+        if (name.empty()) continue;
+        if (std::string(key) == "cellSet" || solver != "solidBody")
         {
             throw std::runtime_error(
-                std::string(WHO) + "the " + solver + " motion names `" + key + " " + name + "`. Only the "
-                "motion of the ENTIRE mesh is ported: moving part of one deforms the cells around it "
-                "or slides it on a coupled interface, and neither is here.");
+                std::string(WHO) + "the " + solver + " motion names `" + key + " " + name + "`. Only a "
+                "solidBody motion of a cellZone is ported: reading a cellSet from constant/polyMesh/sets "
+                "is not, and a displacement solver restricted to part of the mesh is not.");
         }
+        // zoneMotion.C:84: cellZones().indices(wordRe) matches a regular expression and zone groups
+        if (name.find_first_of(".*+?|[](){}^$\\") != std::string::npos)
+        {
+            throw std::runtime_error(
+                std::string(WHO) + "`cellZone " + name + "` looks like a regular expression. OpenFOAM "
+                "matches it as a wordRe against every zone and zone group; brae matches one zone by its "
+                "literal name only.");
+        }
+        cellZone = name;
     }
     for (const std::string& dir : {caseDir + "/constant/polyMesh", startDir + "/polyMesh"})
     {
@@ -149,6 +165,19 @@ std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::New(
         mesh->motionType_ = solver;
         return mesh;
     }
+    if (!cellZone.empty())
+    {
+        const std::map<std::string, std::vector<label>> zones = readCellZones(caseDir + "/constant/polyMesh");
+        const auto z = zones.find(cellZone);
+        // zoneMotion.C:86-96
+        if (z == zones.end())
+        {
+            throw std::runtime_error(
+                std::string(WHO) + "No matching cellZones: " + cellZone + " in constant/polyMesh/cellZones.");
+        }
+        mesh->zoneCells_ = z->second;
+        mesh->cellZone_ = cellZone;
+    }
     mesh->SBMF_ = SolidBodyMotionFunction::New(coeffs, caseDir);
     mesh->motionType_ = mesh->SBMF_->type();
     return mesh;
@@ -163,6 +192,37 @@ void DynamicMotionSolverFvMesh::attach(
     g_ = &g;
     patches_ = &patches;
     points0_ = m.points();
+    // zoneMotion.C:99-122: every point of every face of every zone cell, in ascending order. The
+    // syncPointList there exchanges across processor boundaries; serial, it marks nothing more
+    // (MEASURED on mixerVesselAMI at 82,510 cells: brae's moved points are OpenFOAM's written ones).
+    pointIDs_.clear();
+    if (!cellZone_.empty())
+    {
+        // mesh.cells()[celli] is every face whose owner or neighbour is celli
+        std::vector<char> inZone(static_cast<std::size_t>(m.nCells()), 0);
+        for (const label celli : zoneCells_)
+        {
+            inZone[static_cast<std::size_t>(celli)] = 1;
+        }
+        std::vector<char> movePts(m.points().size(), 0);
+        for (label facei = 0; facei < m.nFaces(); ++facei)
+        {
+            const bool own = inZone[static_cast<std::size_t>(m.owner()[facei])];
+            const bool nei = facei < m.nInternalFaces() && inZone[static_cast<std::size_t>(m.neighbour()[facei])];
+            if (!own && !nei) continue;
+            for (label j = 0; j < m.faceSize(facei); ++j)
+            {
+                movePts[static_cast<std::size_t>(m.faceVert(facei, j))] = 1;
+            }
+        }
+        for (std::size_t pointi = 0; pointi < movePts.size(); ++pointi)
+        {
+            if (movePts[pointi])
+            {
+                pointIDs_.push_back(static_cast<label>(pointi));
+            }
+        }
+    }
     if (displacement_)
     {
         displacement_->attach(m, g, patches);
@@ -206,8 +266,26 @@ void DynamicMotionSolverFvMesh::update(
     }
     else
     {
-        // solidBodyMotionSolver::curPoints, moveAllCells
-        newPoints = transformPoints(SBMF_->transformation(time), points0_);
+        // solidBodyMotionSolver::curPoints: moveAllCells() is pointIDs_.empty() (zoneMotion.C:127)
+        if (pointIDs_.empty())
+        {
+            newPoints = transformPoints(SBMF_->transformation(time), points0_);
+        }
+        else
+        {
+            // the mesh's CURRENT points, with the zone's points transformed from points0
+            newPoints = m.points();
+            std::vector<vector> zonePoints0(pointIDs_.size());
+            for (std::size_t i = 0; i < pointIDs_.size(); ++i)
+            {
+                zonePoints0[i] = points0_[static_cast<std::size_t>(pointIDs_[i])];
+            }
+            const std::vector<vector> moved = transformPoints(SBMF_->transformation(time), zonePoints0);
+            for (std::size_t i = 0; i < pointIDs_.size(); ++i)
+            {
+                newPoints[static_cast<std::size_t>(pointIDs_[i])] = moved[i];
+            }
+        }
     }
 
     // fvMesh::movePoints: grab old time volumes if the time has been incremented

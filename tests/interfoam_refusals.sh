@@ -344,7 +344,12 @@ BASE="$B"
 # refused by name -- and so is what the SOLVER does not do on one yet
 BASE="$BM"
 arm moving_baseline         runs    -                        "" true
-arm moving_cellZone         refused "cellZone rotor"          "" "sed -i 's/^motionSolver .*/motionSolver    solidBody;\ncellZone        rotor;/' constant/dynamicMeshDict"
+# a cellZone's solid-body motion is ported (tests/interfoam_ami_vs_openfoam.sh); a zone the mesh does not
+# have, a cellSet and a regular expression are refused by name
+arm moving_cellZoneMissing  refused "No matching cellZones: rotor" "" "sed -i 's/^motionSolver .*/motionSolver    solidBody;\ncellZone        rotor;/' constant/dynamicMeshDict"
+arm moving_cellZone         runs    -                        "" "$ZONE; sed -i 's/^motionSolver .*/motionSolver    solidBody;\ncellZone        rotor;/' constant/dynamicMeshDict"
+arm moving_cellZoneRegex    refused "regular expression"     "" "$ZONE; sed -i 's/^motionSolver .*/motionSolver    solidBody;\ncellZone        \\\"rot.*\\\";/' constant/dynamicMeshDict"
+arm moving_cellSet          refused "cellSet rotor"          "" "sed -i 's/^motionSolver .*/motionSolver    solidBody;\ncellSet         rotor;/' constant/dynamicMeshDict"
 arm moving_cellSetNone      runs    -                        "" "sed -i 's/^motionSolver .*/motionSolver    solidBody;\ncellSet         none;/' constant/dynamicMeshDict"
 # displacementLaplacian is ported (tests/displacement_laplacian_vs_openfoam.sh); a motion solver that is
 # not is still refused by name, and displacementLaplacian without its mandatory diffusivity by that

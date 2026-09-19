@@ -2839,6 +2839,30 @@ COMPONENTS = {
                   "(interFoam_wedgeCoefficients); the host loop's clock started at 0 on every restart. "
                   "buildPatches' ACMI refusal stays for every other driver; the interFoam host opts out "
                   "with mirrorACMI. HOST ONLY SO FAR."),
+        dict(name="interFoam_faceAreaWeightAMI", of_symbol="faceAreaWeightAMI",
+             of_file="src/meshTools/AMIInterpolation/AMIInterpolation/faceAreaWeightAMI/faceAreaWeightAMI.C",
+             classification="HOST_ONLY", status="REIMPLEMENT",
+             brae_reference="src/meshTools/AMIInterpolation/faceAreaWeightAMI/face_area_weight_ami_cpp.cu",
+             validation="tests/test_face_area_weight_ami.cu, run by tests/interfoam_ami_vs_openfoam.sh against the "
+                        "srcAddress/srcWeights/srcWeightsSum and tgt* OpenFOAM's own cyclicAMI holds after each of "
+                        "three steps of 2e-4 (a coded function object prints them): every partner set of all 8,872 "
+                        "faces a side OpenFOAM's, weights and sums 2.5e-14 and 4.3e-14, from OpenFOAM's points and "
+                        "from brae's own motion alike. CONTROL: OpenFOAM leaves 43 to 47 source faces a step less "
+                        "than 99% covered, which the test asserts -- an all-pairs search covers them in full, and "
+                        "BROKEN THAT WAY 47 source and 49 target partner sets differ, weight sums 3.8e-02 apart "
+                        "(and in the interFoam gate U 6.0e-05 after 100 steps). Also red: the weights normalised "
+                        "by the face area rather than their sum, 1.0e-01, and the interFoam run non-finite by "
+                        "step 6.",
+             note="THE WALK IS THE ANSWER, not an implementation detail: OpenFOAM reaches a target face only "
+                  "through the neighbours of a face it has already kept, so a partner can be missed -- one step "
+                  "in, face 2354 gets two partners covering 96.4% of it and its weights are normalised by that. "
+                  "Transcribed: the walk from source 0 against target 0, PrimitivePatch's faceFaces order, the "
+                  "89-degree neighbour filter, LIFO processing, the seeds setNextFaces leaves (first overlap "
+                  "chosen, last overlap stored), the octree's nearest face found by brute force over "
+                  "face::nearestPoint's distance, restartUncoveredSourceFace below 0.95; triangles by face::split, "
+                  "areas by faceAreaIntersect (tri sliced by each target edge plane, target vertices 2, 1, 0), "
+                  "area normalisation `project`. HOST_ONLY: recomputed once per mesh move from the points, a "
+                  "geometric preprocessing step like the mesh motion itself (0.1 s at 8,872 faces a side)."),
         dict(name="interFoam_codedPatchFunction1", of_symbol="CodedField",
              of_file="src/meshTools/PatchFunction1/CodedField/CodedField.C",
              classification="HOST_ONLY", status="REIMPLEMENT",
@@ -3220,8 +3244,14 @@ COMPONENTS = {
                         "four tanks as shipped, ten steps of 0.01 against their static controls: sloshingTank2D3DoF "
                         "U 4.4e-13, sloshingTank3D 2.7e-12, sloshingTank3D3DoF 6.8e-13, sloshingTank3D6DoF 5.4e-13, "
                         "the moved points exact; SDA without its lamda rescaling 8.2e-01, without its roll 9.9e-01, "
-                        "the 6DoF table's interpolation flipped 1.4e-02. WHAT IT DOES NOT CLAIM: a cellZone or cellSet "
-                        "(the motion of PART of a mesh), points0 read from a file, a restart of a moved mesh, any "
+                        "the 6DoF table's interpolation flipped 1.4e-02. A CELLZONE's motion (zoneMotion.C: the points of "
+                        "every face of every zone cell, ascending; the rest of the mesh held where it stands) is "
+                        "gated on RAS/mixerVesselAMI (tests/interfoam_ami_vs_openfoam.sh, test_face_area_weight_ami): "
+                        "the moved points bitwise OpenFOAM's at every step checked; the whole mesh moved 1.3e-03, the "
+                        "zone's points transformed from the CURRENT points 9.6e-04, the boundary faces left out of "
+                        "the marking 9.6e-04; the owner side of the faces alone NOT DISCRIMINATED (it marks the same "
+                        "points on that mesh). WHAT IT DOES NOT CLAIM: a cellSet, a cellZone named by a regular "
+                        "expression or a zone group, a zone under displacementLaplacian, points0 read from a file, a restart of a moved mesh, any "
                         "motionSolver but solidBody, drivenLinearMotion, a non-constant Function1 coefficient, "
                         "mergeLevels, and the device -- refused by name, fifteen arms in tests/interfoam_refusals.sh.",
              note="EVERY MOTION IS AN ABSOLUTE FUNCTION OF TIME ON THE ORIGINAL POINTS (points0MotionSolver), a "
