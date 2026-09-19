@@ -3178,6 +3178,15 @@ add_dependencies(brae brae_interFoam)
 add_test(NAME device_inter_step COMMAND test_device_inter_step)
 set_tests_properties(device_inter_step PROPERTIES SKIP_RETURN_CODE 77)
 
+# the device Gauss gradient against the host's fvc::gaussGrad, bit for bit, with the two forms the device
+# used to have as controls
+add_executable(test_device_gauss_grad tests/test_device_gauss_grad.cu)
+target_include_directories(test_device_gauss_grad PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_gauss_grad PRIVATE brae_core)
+add_test(NAME device_gauss_grad COMMAND test_device_gauss_grad)
+set_tests_properties(device_gauss_grad PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(test_device_inter_pressure_step tests/test_device_inter_pressure_step.cu)
 target_include_directories(test_device_inter_pressure_step PRIVATE ${BRAE_HEADER_DIRS}
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
