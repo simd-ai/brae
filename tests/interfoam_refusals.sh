@@ -539,8 +539,11 @@ if [ $HAVE_GPU = 1 ]; then
     arm device_ras          runs    -                        "-device" true
     arm device_ras_uniform  runs    -                        "-device" "sed -i 's/^density .*/density uniform;/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,k) /div(phi,k) /; s/div(rhoPhi,epsilon) /div(phi,epsilon) /' system/fvSchemes"
     arm device_ras_otherModel refused "realizableKE"         "-device" "sed -i 's/RASModel .*/RASModel        realizableKE;/' constant/turbulenceProperties"
-    # the device loop carries kEpsilon's twin only: a kOmegaSST case the HOST runs is refused by name
-    arm device_sst          refused "the case is RAS kOmegaSST" "-device" "$SSTBASE"
+    # the device loop carries kOmegaSST too now (tests/interfoam_ras_dambreak_vs_openfoam.sh `sst`), and
+    # an inletOutlet nut with it -- evaluated against the flux after the closure, as the host closure does
+    # (tests/interfoam_ras_dambreak_vs_openfoam.sh `nutAtmosphere`, on both closures)
+    arm device_sst          runs    -                        "-device" "$SSTBASE"
+    arm device_sstNutIO     runs    -                        "-device" "$SSTBASE; python3 -c \"import re; p='0/nut'; t=open(p).read(); t=re.sub(r'atmosphere\s*\{[^}]*\}', 'atmosphere { type inletOutlet; inletValue uniform 0.001; value uniform 0; }', t, count=1); open(p,'w').write(t)\""
     BASE="$B"
 else
     echo "  (no GPU: the -device arms are skipped)"
