@@ -63,9 +63,37 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
     d.dbEps = buildDeviceBoundary(second, patches, g, /*storedIoSeed=*/true);
     // nut's own: the closure writes every other kind of face, and this decides the inletOutlet ones
     d.dbNut = buildDeviceBoundary(t.nut, patches, g, /*storedIoSeed=*/false);
+    // correctBoundaryConditions on nut, the host closure's own loop (kOmegaSST_cpp.cu:946-984): every
+    // patch that is not a `wall` (the wall functions write those), not `empty` (OpenFOAM's
+    // emptyFvPatchField has size 0, so there is nothing there to evaluate) and not `calculated` (nut's
+    // field assignment fills those) is EVALUATED against the cell nut just written -- a zeroGradient or
+    // symmetry face takes the cell, a fixedValue face keeps what the case pinned, an inletOutlet face
+    // takes the flux switch first. Only the inletOutlet class was evaluated here, which left a
+    // zeroGradient nut patch at the value it was built with for the whole run: MEASURED on
+    // RAS/waterChannel with the inlet's nut zeroGradient, nut 5.5e-06 and U 1.9e-05 from OpenFOAM after
+    // ten steps, where the HOST closure in this same device loop is 2.3e-12.
+    std::vector<label> nutEval;
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
+        const bool eval = patches[pi].type != "wall"
+                       && patches[pi].type != "empty"
+                       && t.nut.boundary[pi]->bcCategory() != 2;
+        if (eval) d.nutEvalFaces += static_cast<int>(patches[pi].size);
         if (t.nut.boundary[pi]->isInletOutlet()) d.nutIoFaces += static_cast<int>(patches[pi].size);
+        for (label i = 0; i < patches[pi].size; ++i)
+        {
+            nutEval.push_back(eval ? 1 : 0);
+        }
+    }
+    d.nutEvalMask.copyFrom(nutEval);
+    // buildDeviceBoundary DROPS a coupled patch (its coupling is the interface off-diagonal), so its
+    // arrays are shorter than nut's face list and this evaluate would read past their end.
+    if (d.nutEvalFaces > 0 && static_cast<std::size_t>(d.dbNut.n) != nutEval.size())
+    {
+        throw std::runtime_error(
+            "brae interFoam (device): nut has a coupled patch, so its device boundary is shorter than its "
+            "face list and the closure cannot evaluate nut's patches by face. The host path (no -device) "
+            "runs it.");
     }
     d.wall = buildDeviceWallData(m, g, patches, U, wfPatch);
 
@@ -171,34 +199,34 @@ namespace {
 
 // nutBnd[f] = evaluated[f] on the inletOutlet faces alone: every other face carries what the closure
 // wrote (a wall function's value, or the field assignment's on a `calculated` patch).
-__global__ void nutIoCopyKernel(
+__global__ void nutEvalCopyKernel(
     int nBf,
-    const label* __restrict__ ioMask,
+    const label* __restrict__ evalMask,
     const scalar* __restrict__ evaluated,
     scalar* __restrict__ nutBnd)
 {
     const int f = blockIdx.x * blockDim.x + threadIdx.x;
-    if (f < nBf && ioMask[f]) nutBnd[f] = evaluated[f];
+    if (f < nBf && evalMask[f]) nutBnd[f] = evaluated[f];
 }
 
-// correctBoundaryConditions on nut's flux-conditional patches, where the host closure runs
-// updateFromFlux + evaluate (kEpsilon_cpp.cu:899-910, kOmegaSST_cpp.cu's correctNutField): the switch is
-// OpenFOAM's valueFraction = neg(phi), so an inflow face takes the inletValue and an outflow face the
-// cell nut the closure has just written.
-void evaluateNutInletOutlet(
+// nut.correctBoundaryConditions() after the closure wrote the cells, as the host closure runs it
+// (kOmegaSST_cpp.cu:946-984, kEpsilon_cpp.cu:899-910): the flux switch first on the flux-conditional
+// faces -- OpenFOAM's valueFraction = neg(phi), so an inflow face takes the inletValue -- then the
+// evaluate itself on every face the mask carries.
+void evaluateNutBoundary(
     DeviceInterTurbulence& d,
     const DeviceBuffer<scalar>& phiBnd)
 {
-    if (d.nutIoFaces <= 0) return;
-    deviceUpdateInletOutlet(d.dbNut, phiBnd);
+    if (d.nutEvalFaces <= 0) return;
+    if (d.nutIoFaces > 0) deviceUpdateInletOutlet(d.dbNut, phiBnd);
     DeviceBuffer<scalar> evaluated;
     deviceBCValue(d.dbNut, d.nut, evaluated);
     const int nBf = static_cast<int>(d.nutBnd.size());
     if (nBf <= 0) return;
     constexpr int TPB = 256;
-    nutIoCopyKernel<<<(nBf + TPB - 1) / TPB, TPB>>>(nBf, d.dbNut.ioMask.data(), evaluated.data(),
-                                                    d.nutBnd.data());
-    cudaCheck(cudaGetLastError(), "nut inletOutlet");
+    nutEvalCopyKernel<<<(nBf + TPB - 1) / TPB, TPB>>>(nBf, d.nutEvalMask.data(), evaluated.data(),
+                                                      d.nutBnd.data());
+    cudaCheck(cudaGetLastError(), "nut correctBoundaryConditions");
 }
 
 }   // namespace
@@ -302,7 +330,7 @@ void deviceCorrectInterTurbulence(
             in.kLog->push_back({sres.kPerf.initialResidual, sres.kPerf.finalResidual,
                                 sres.kPerf.nIterations});
         }
-        evaluateNutInletOutlet(d, *in.phiBnd);
+        evaluateNutBoundary(d, *in.phiBnd);
         return;
     }
 
@@ -379,7 +407,7 @@ void deviceCorrectInterTurbulence(
         in.kLog->push_back({d.stages.kPerf.initialResidual, d.stages.kPerf.finalResidual,
                             d.stages.kPerf.nIterations});
     }
-    evaluateNutInletOutlet(d, *in.phiBnd);
+    evaluateNutBoundary(d, *in.phiBnd);
 }
 
 

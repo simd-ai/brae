@@ -43,6 +43,17 @@ using namespace brae::cpu::interFoam;
 #define BOUND_K 1e-10
 #define BOUND_OMEGA 1e-10
 #define BOUND_NUT 1e-10
+// THE DEVICE ARM is held to the SAME bounds, which are OpenFOAM's and not the device's: worst of the
+// three profiles, ten steps of 0.1 -- alpha 2.8e-12, p_rgh 2.6e-12, U 5.9e-12, k 3.3e-12, omega 4.7e-12,
+// nut 3.5e-12, and every p_rgh iteration count OpenFOAM's. BROKEN ONCE EACH: U's inletOutlet outlet
+// assembled from the switch it was built with (a fixedValue wall at the inletValue) U 8.9e-02,
+// nut 8.7e-01; nut's zeroGradient inlet left unevaluated U 1.9e-05, nut 5.5e-06.
+#define DEV_BOUND_ALPHA BOUND_ALPHA
+#define DEV_BOUND_PRGH BOUND_PRGH
+#define DEV_BOUND_U BOUND_U
+#define DEV_BOUND_K BOUND_K
+#define DEV_BOUND_OMEGA BOUND_OMEGA
+#define DEV_BOUND_NUT BOUND_NUT
 
 namespace {
 int failures = 0;
@@ -274,23 +285,37 @@ int main(
     }
     else
     {
-        bool named = false;
-        try
-        {
-            InterFields dev;
-            runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
-        }
-        catch (const std::exception& e)
-        {
-            const std::string w = e.what();
-            // what is left of this case that the device does not carry: U's outlet is a plain
-            // inletOutlet, whose valueFraction OpenFOAM sets from the flux sign at every momentum
-            // assembly. MEASURED with that refusal lifted and nothing else changed: U 8.9e-02,
-            // nut 8.7e-01 against OpenFOAM, where the host loop on this same case is 4.3e-12.
-            named = w.find("inletOutlet") != std::string::npos && w.find("U patch") != std::string::npos;
-            std::printf("  device: %s\n", e.what());
-        }
-        check("the device loop refuses the case, naming U's inletOutlet outlet", named);
+        // THE DEVICE RUNS THIS CASE NOW, and it is the one fixture where the three device modules meet:
+        // kOmegaSST on the device, nut's inletOutlet outlet evaluated against the flux, and a GAMG whose
+        // smoother the case names GaussSeidel. Held to the host's own bounds, which are OpenFOAM's.
+        InterFields dev;
+        const RunReport rd = runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
+        check("the device driver ran the same number of steps", rd.steps == nSteps);
+        check("...with the closure ON THE DEVICE", rd.turbulenceOnDevice);
+        // the device's own solves against OpenFOAM's log: the case names GAMG with the GaussSeidel
+        // smoother, so this is where a different smoother or V-cycle shows first
+        const std::vector<LinearSolveRecord> ofPdev = brae::gatecheck::readOfPressureSolves(logPath);
+        failures += brae::gatecheck::compareSolves("device", rd.pSolves, ofPdev, nSteps);
+        failures += brae::gatecheck::nonFinite("device alpha", dev.alpha1.internal);
+        failures += brae::gatecheck::nonFinite("device U", dev.U.internal);
+        failures += brae::gatecheck::nonFinite("device k", dev.turbulence.k.internal);
+        failures += brae::gatecheck::nonFinite("device omega", dev.turbulence.omega.internal);
+        failures += brae::gatecheck::nonFinite("device nut", dev.turbulence.nut.internal);
+        const Diff eA = compare(dev.alpha1.internal, ofAlpha);
+        const Diff eP = compare(dev.p_rgh.internal, ofPrgh);
+        const Diff eU = compare(dev.U.internal, ofU);
+        const Diff eK = compare(dev.turbulence.k.internal, ofKf);
+        const Diff eO = compare(dev.turbulence.omega.internal, ofOf);
+        const Diff eN = compare(dev.turbulence.nut.internal, ofNut);
+        std::printf("  DEVICE vs OpenFOAM: alpha %.4e, p_rgh %.4e, U %.4e, k %.4e, omega %.4e, nut %.4e\n",
+                    (double)eA.linf, (double)eP.rel(), (double)eU.rel(), (double)eK.rel(),
+                    (double)eO.rel(), (double)eN.rel());
+        check("the DEVICE's alpha agrees with OpenFOAM's", eA.linf < scalar(DEV_BOUND_ALPHA));
+        check("...its p_rgh", eP.rel() < scalar(DEV_BOUND_PRGH));
+        check("...its U", eU.rel() < scalar(DEV_BOUND_U));
+        check("...its k", eK.rel() < scalar(DEV_BOUND_K));
+        check("...its omega", eO.rel() < scalar(DEV_BOUND_OMEGA));
+        check("...and its nut", eN.rel() < scalar(DEV_BOUND_NUT));
     }
 
     std::printf("test_inter_waterchannel_vs_openfoam: %d failures\n", failures);

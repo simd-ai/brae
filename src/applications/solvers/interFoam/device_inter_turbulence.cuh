@@ -85,6 +85,10 @@ struct DeviceInterTurbulence
     // many such faces the case has; zero leaves nut's boundary exactly as the closure left it.
     DeviceBoundary dbNut;
     int nutIoFaces = 0;
+    // ...and which faces correctBoundaryConditions evaluates at all: every patch that is not a wall, not
+    // `empty` and not `calculated` (kOmegaSST_cpp.cu:946-984)
+    DeviceBuffer<label> nutEvalMask;
+    int nutEvalFaces = 0;
 
     // per-step scratch
     DeviceBuffer<scalar> nuWall;

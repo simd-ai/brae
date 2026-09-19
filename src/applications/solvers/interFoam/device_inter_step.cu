@@ -172,6 +172,12 @@ void deviceInterStep(
     // its tangential components, an outflow face is zeroGradient. The hook rebuilds dbU from the host
     // patches' categories, which carry no flux, so without this every such face stayed zeroGradient for
     // the whole run -- which agreed with the host only while the host made the same omission.
+    // ...and inletOutlet's, FIRST, in the order rhoSimpleFoam's device arm takes them
+    // (rhoUEqn.cuh:72-79): the io switch off the flux registered now, then the switches that read this
+    // iteration's cell velocity. The hook rebuilds dbU from the host patches, and buildDeviceVectorBoundary
+    // seeds an inletOutlet as fixedValue at its inletValue on EVERY face (device_boundary.cuh, category 3),
+    // so without this the patch is a wall at the inlet value for the whole run.
+    deviceUpdateInletOutlet(dbU, phiBnd);
     deviceUpdatePressureInletOutletVelocity(dbU, phiBnd, UX, UY, UZ, /*directionMixed=*/true);
 
     DeviceBuffer<scalar> muCell, muFace, muBndFace;
@@ -298,6 +304,7 @@ void deviceInterStep(
             }
         }
         hooks.updateUBoundary(UX, UY, UZ, dbU, ub);
+        deviceUpdateInletOutlet(dbU, phiBnd);
         deviceUpdatePressureInletOutletVelocity(dbU, phiBnd, UX, UY, UZ, /*directionMixed=*/true);
         (void)A;
     }
@@ -398,6 +405,7 @@ void deviceInterStep(
         // laplacian, its flux and its HbyA all read them.
         if (hooks.pressure.updateBoundary) hooks.pressure.updateBoundary(p_rgh);
         hooks.updateUBoundary(UX, UY, UZ, dbU, ub);
+        deviceUpdateInletOutlet(dbU, phiBnd);
         deviceUpdatePressureInletOutletVelocity(dbU, phiBnd, UX, UY, UZ, /*directionMixed=*/true);
     }
     probe("p_rgh", p_rgh);

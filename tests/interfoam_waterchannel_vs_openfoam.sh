@@ -59,9 +59,25 @@
 # CONTROL: OpenFOAM with the patch pinned at 0 (brae's old answer), nut 1.4e-05 away. BROKEN (as brae
 # had it): U 8.7e-05.
 #
+# THE DEVICE RUNS ALL THREE PROFILES, held to the same bounds -- worst of the three, ten steps: alpha
+# 2.8e-12, p_rgh 2.6e-12, U 5.9e-12, k 3.3e-12, omega 4.7e-12, nut 3.5e-12, and all 20 p_rgh iteration
+# counts OpenFOAM's (the case names GAMG with a GaussSeidel smoother, so that is the device's GAMG taking
+# OpenFOAM's counts on a real case). THIS CASE IS WHERE FOUR DEVICE MODULES MEET: kOmegaSST, nut's
+# boundary, U's inletOutlet outlet and the GAMG smoother. WHAT IT FOUND, each with the HOST closure run
+# inside the device loop to say whether the loop or the closure owned it:
+#   U's inletOutlet outlet assembled from the switch dbU was BUILT with -- buildDeviceVectorBoundary
+#   seeds category 3 as fixedValue at its inletValue on every face, so the outlet was a wall at (0 0 0)
+#   for the whole run, and OpenFOAM's updateCoeffs sets valueFraction = neg(phi) at every assembly:
+#   U 8.9e-02, nut 8.7e-01 (host loop 4.3e-12 on the same case, alpha still exact to 5.3e-15, every solve
+#   tightened on both codes, and 1.1e-02 of U with the schemes forced orthogonal -- so neither the
+#   stopping point nor the non-orthogonal correction).
+#   nut's boundary evaluated on its flux-conditional faces ONLY, where the host closure evaluates every
+#   patch that is not a wall, not `empty` and not `calculated`: the zeroGradient inlet kept its built
+#   value, U 1.9e-05, nut 5.5e-06, with the host closure in the same loop at 2.3e-12.
+#
 # NOT CLAIMED: `density variable` with kOmegaSST, F3, decayControl, a wall-function blending other than
-# binomial n = 2, a moving mesh and the device -- all refused by name; the scalarTransport function
-# object `s`, which brae does not run (it does not feed back into the flow).
+# binomial n = 2, and a moving mesh -- all refused by name; the scalarTransport function object `s`,
+# which brae does not run (it does not feed back into the flow).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_waterchannel_vs_openfoam"
