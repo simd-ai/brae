@@ -278,23 +278,6 @@ int main(
     {
         std::printf("  (no CUDA device: the device arm is skipped)\n");
     }
-    else if (nutAtmosphere)
-    {
-        // the device closure carries no flux-conditional nut patch: it must refuse, by name
-        bool named = false;
-        try
-        {
-            InterFields dev;
-            runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
-        }
-        catch (const std::exception& e)
-        {
-            const std::string w = e.what();
-            named = w.find("atmosphere") != std::string::npos && w.find("inletOutlet") != std::string::npos;
-            std::printf("  device: %s\n", e.what());
-        }
-        check("the device loop refuses an inletOutlet nut and names the patch", named);
-    }
     else
     {
         InterFields dev;

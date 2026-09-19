@@ -2557,8 +2557,16 @@ COMPONENTS = {
                         "(device closure against host closure): the wall distance replaced by 1 -- nut 4.3e-02; nut's "
                         "`calculated` mask dropped 1.2e-01; the stored wall nut dropped 8.8e-05 of k. NOT "
                         "DISCRIMINATED: the F1-one mask -- dropping it changes no digit on this fixture, where F1 "
-                        "evaluates to 1 on those faces anyway. STILL REFUSED on the device: RAS/waterChannel, for nut's "
-                        "inletOutlet outlet and the GAMG smoother it names (both by name, asserted by that gate).",
+                        "evaluates to 1 on those faces anyway. AN INLETOUTLET nut RUNS ON THE DEVICE TOO (2026-09-20): "
+                        "nut carries its own DeviceBoundary and deviceCorrectInterTurbulence evaluates the "
+                        "flux-conditional faces after the closure, where the host closure does -- "
+                        "deviceUpdateInletOutlet's valueFraction = neg(phi), then deviceBCValue, copied onto the "
+                        "ioMask faces alone so a wall function's or a `calculated` patch's value is untouched. Gated as "
+                        "tests/interfoam_ras_dambreak_vs_openfoam.sh `nutAtmosphere` on BOTH closures: device against "
+                        "OpenFOAM alpha 5.3e-15, U 2.0e-13, k 2.1e-15, epsilon 2.9e-15, nut 2.7e-15, and the device "
+                        "closure against the host closure 1.5e-15 of nut; without the evaluation nut is 4.7e-02 out and "
+                        "U 2.7e-03. STILL REFUSED on the device: RAS/waterChannel, for the GAMG smoother it names "
+                        "(`GaussSeidel`, where the device's GAMG has DIC only), asserted by that gate.",
              note="WIRING, not a new closure: kOmegaSST_cpp.cu is the reference rhoSimpleFoam and simpleFoam already "
                   "gate, handed what incompressible::turbulenceModel::New(U, phi, mixture) hands OpenFOAM's -- the "
                   "mixture's nu as a field, the volumetric phi, 1/deltaT for fvm::ddt, wallDist's cell y -- by "

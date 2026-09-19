@@ -79,6 +79,13 @@ struct DeviceInterTurbulence
     DeviceBuffer<label>  f1OneMask;
     DeviceBuffer<label>  nutCalcMask;
 
+    // nut's OWN boundary, for the flux-conditional patches the closure's field assignment does not decide:
+    // correctBoundaryConditions evaluates an inletOutlet nut against the flux (valueFraction = neg(phi)),
+    // inflow faces taking the inletValue and outflow faces the cell nut just written. `nutIoFaces` is how
+    // many such faces the case has; zero leaves nut's boundary exactly as the closure left it.
+    DeviceBoundary dbNut;
+    int nutIoFaces = 0;
+
     // per-step scratch
     DeviceBuffer<scalar> nuWall;
     DeviceBuffer<scalar> nutBndIn;

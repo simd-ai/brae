@@ -61,6 +61,12 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
     // storedIoSeed: the closure reconstructs an inletOutlet patch's STORED value at its first step
     d.dbK = buildDeviceBoundary(t.k, patches, g, /*storedIoSeed=*/true);
     d.dbEps = buildDeviceBoundary(second, patches, g, /*storedIoSeed=*/true);
+    // nut's own: the closure writes every other kind of face, and this decides the inletOutlet ones
+    d.dbNut = buildDeviceBoundary(t.nut, patches, g, /*storedIoSeed=*/false);
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (t.nut.boundary[pi]->isInletOutlet()) d.nutIoFaces += static_cast<int>(patches[pi].size);
+    }
     d.wall = buildDeviceWallData(m, g, patches, U, wfPatch);
 
     const std::vector<std::vector<scalar>> yW = nearWallDist(m, g, patches);
@@ -161,6 +167,43 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
 }
 
 
+namespace {
+
+// nutBnd[f] = evaluated[f] on the inletOutlet faces alone: every other face carries what the closure
+// wrote (a wall function's value, or the field assignment's on a `calculated` patch).
+__global__ void nutIoCopyKernel(
+    int nBf,
+    const label* __restrict__ ioMask,
+    const scalar* __restrict__ evaluated,
+    scalar* __restrict__ nutBnd)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f < nBf && ioMask[f]) nutBnd[f] = evaluated[f];
+}
+
+// correctBoundaryConditions on nut's flux-conditional patches, where the host closure runs
+// updateFromFlux + evaluate (kEpsilon_cpp.cu:899-910, kOmegaSST_cpp.cu's correctNutField): the switch is
+// OpenFOAM's valueFraction = neg(phi), so an inflow face takes the inletValue and an outflow face the
+// cell nut the closure has just written.
+void evaluateNutInletOutlet(
+    DeviceInterTurbulence& d,
+    const DeviceBuffer<scalar>& phiBnd)
+{
+    if (d.nutIoFaces <= 0) return;
+    deviceUpdateInletOutlet(d.dbNut, phiBnd);
+    DeviceBuffer<scalar> evaluated;
+    deviceBCValue(d.dbNut, d.nut, evaluated);
+    const int nBf = static_cast<int>(d.nutBnd.size());
+    if (nBf <= 0) return;
+    constexpr int TPB = 256;
+    nutIoCopyKernel<<<(nBf + TPB - 1) / TPB, TPB>>>(nBf, d.dbNut.ioMask.data(), evaluated.data(),
+                                                    d.nutBnd.data());
+    cudaCheck(cudaGetLastError(), "nut inletOutlet");
+}
+
+}   // namespace
+
+
 void deviceCorrectInterTurbulence(
     DeviceInterTurbulence& d,
     const cpu::interFoam::InterTurbulence& t,
@@ -259,6 +302,7 @@ void deviceCorrectInterTurbulence(
             in.kLog->push_back({sres.kPerf.initialResidual, sres.kPerf.finalResidual,
                                 sres.kPerf.nIterations});
         }
+        evaluateNutInletOutlet(d, *in.phiBnd);
         return;
     }
 
@@ -335,6 +379,7 @@ void deviceCorrectInterTurbulence(
         in.kLog->push_back({d.stages.kPerf.initialResidual, d.stages.kPerf.finalResidual,
                             d.stages.kPerf.nIterations});
     }
+    evaluateNutInletOutlet(d, *in.phiBnd);
 }
 
 
