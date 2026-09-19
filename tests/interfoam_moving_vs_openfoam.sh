@@ -31,6 +31,15 @@
 #                  tutorial's `Gauss linear corrected` laplacian and `corrected` snGrad -- the first
 #                  fixture on which interFoam's non-orthogonal corrections are not zero -- 2-D with
 #                  empty front and back, nAlphaSubCycles 3, cAlpha 1.5, ten of its own steps of 0.01
+#   sloshing2D3DoF, sloshing3D, sloshing3D3DoF, sloshing3D6DoF
+#                  the rest of the sloshing tanks AS SHIPPED, ten steps of 0.01 each against its own
+#                  static control: the SDA motion with the 3DoF coefficients in 2-D, the SDA tank in 3-D
+#                  (19 x 40 x 34, 25,840 cells) with both coefficient sets, and tabulated6DoFMotion
+#                  reading constant/6DoF.dat. MEASURED: U 4.4e-13, 2.7e-12, 6.8e-13, 5.4e-13; alpha to
+#                  1.3e-14; the moved points exactly OpenFOAM's; the static control 100% of U on each.
+#                  BROKEN ONCE EACH (U, 2D3DoF / 3D / 3D6DoF): SDA without its lamda rescaling 8.2e-01 /
+#                  8.2e-01 / green; SDA without its roll 9.9e-01 / 9.9e-01 / green; the 6DoF table's
+#                  interpolation flipped green / green / 1.4e-02
 #   cylinder       laminar/sloshingCylinder: a snappyHexMesh cylinder
 #                  (polyhedra, 26 degrees) under an oscillatingLinearMotion and a rotatingMotion,
 #                  MULESCorr and nNonOrthogonalCorrectors 1 -- the corrector loop on a corrected
@@ -205,7 +214,7 @@ open(c, 'w').write(s)
 
 q = os.path.join(d, 'system/fvSolution')
 t = open(q).read()
-if profile.startswith('mixer') or profile.startswith('sloshing2D') or profile.startswith('cylinder'):
+if profile.startswith('mixer') or profile.startswith('sloshing') or profile.startswith('cylinder'):
     # the staging change the header declares
     m = re.search(r'p_rghFinal\s*\{.*?\n    \}', t, flags=re.S)
     assert m, 'no p_rghFinal entry'
@@ -344,6 +353,14 @@ stage mixerOuterOnce testTubeMixer 2e-4  10 mixerOuterOnce || rc=1
 stage mixerPred      testTubeMixer 2e-4  10 mixerPred      || rc=1
 stage sloshing2DStatic sloshingTank2D 0.01  10 sloshing2DStatic || rc=1
 stage sloshing2D     sloshingTank2D 0.01  10 sloshing2D     || rc=1
+stage sloshing2D3DoFStatic sloshingTank2D3DoF 0.01 10 sloshing2D3DoFStatic || rc=1
+stage sloshing2D3DoF       sloshingTank2D3DoF 0.01 10 sloshing2D3DoF       || rc=1
+stage sloshing3DStatic     sloshingTank3D     0.01 10 sloshing3DStatic     || rc=1
+stage sloshing3D           sloshingTank3D     0.01 10 sloshing3D           || rc=1
+stage sloshing3D3DoFStatic sloshingTank3D3DoF 0.01 10 sloshing3D3DoFStatic || rc=1
+stage sloshing3D3DoF       sloshingTank3D3DoF 0.01 10 sloshing3D3DoF       || rc=1
+stage sloshing3D6DoFStatic sloshingTank3D6DoF 0.01 10 sloshing3D6DoFStatic || rc=1
+stage sloshing3D6DoF       sloshingTank3D6DoF 0.01 10 sloshing3D6DoF       || rc=1
 stage cylinderStatic sloshingCylinder 0.001 10 cylinderStatic || rc=1
 stage cylinder       sloshingCylinder 0.001 10 cylinder      || rc=1
 stage mixerCorrectPhi      testTubeMixer    2e-4  10 mixerCorrectPhi      || rc=1
@@ -383,6 +400,10 @@ gate mixerOuter     2e-4  10 mixerOuter     mixerStatic  || rc=1
 gate mixerOuterOnce 2e-4  10 mixerOuterOnce mixerStatic  || rc=1
 gate mixerPred      2e-4  10 mixerPred      mixerStatic  || rc=1
 gate sloshing2D     0.01  10 sloshing2D     sloshing2DStatic || rc=1
+gate sloshing2D3DoF 0.01  10 sloshing2D3DoF sloshing2D3DoFStatic || rc=1
+gate sloshing3D     0.01  10 sloshing3D     sloshing3DStatic     || rc=1
+gate sloshing3D3DoF 0.01  10 sloshing3D3DoF sloshing3D3DoFStatic || rc=1
+gate sloshing3D6DoF 0.01  10 sloshing3D6DoF sloshing3D6DoFStatic || rc=1
 gate cylinder       0.001 10 cylinder       cylinderStatic   || rc=1
 gate mixerCorrectPhi      2e-4  10 mixerCorrectPhi      mixerStatic      || rc=1
 gate sloshing2DCorrectPhi 0.01  10 sloshing2DCorrectPhi sloshing2DStatic || rc=1

@@ -3213,7 +3213,12 @@ COMPONENTS = {
                         "rather than face::centre 6.7e-15; points rotated through the quaternion rather than the "
                         "tensor q.R() 4.4e-16 and 1.8e-14; septernion*septernion without normalising the product "
                         "rotation 6.1e-16 and 2.1e-14; the time as index*deltaT rather than accumulated 1.8e-16 and "
-                        "8.4e-15; oldPoints never refreshed 4.1e+00. WHAT IT DOES NOT CLAIM: a cellZone or cellSet "
+                        "8.4e-15; oldPoints never refreshed 4.1e+00. END TO END in interFoam "
+                        "(tests/interfoam_moving_vs_openfoam.sh), beside sloshingTank2D and the cylinder, the other "
+                        "four tanks as shipped, ten steps of 0.01 against their static controls: sloshingTank2D3DoF "
+                        "U 4.4e-13, sloshingTank3D 2.7e-12, sloshingTank3D3DoF 6.8e-13, sloshingTank3D6DoF 5.4e-13, "
+                        "the moved points exact; SDA without its lamda rescaling 8.2e-01, without its roll 9.9e-01, "
+                        "the 6DoF table's interpolation flipped 1.4e-02. WHAT IT DOES NOT CLAIM: a cellZone or cellSet "
                         "(the motion of PART of a mesh), points0 read from a file, a restart of a moved mesh, any "
                         "motionSolver but solidBody, drivenLinearMotion, a non-constant Function1 coefficient, "
                         "mergeLevels, and the device -- refused by name, fifteen arms in tests/interfoam_refusals.sh.",
