@@ -1,5 +1,6 @@
 #include "device_gamg_solver.cuh"
 #include "device_blas.cuh"
+#include "device_sym_gauss_seidel.cuh"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
@@ -203,6 +204,53 @@ void dicSmooth(
     }
 }
 
+// GAMGSolver's smoother, as the host's LduLevel::smooth dispatches it (gamg_solver_cpp.cu): DIC's sweeps
+// first, then Gauss-Seidel's, so `DICGaussSeidel` runs both -- which is what OpenFOAM's
+// DICGaussSeidelSmoother does. `symmetric` picks which of OpenFOAM's two Gauss-Seidel smoothers this is:
+// symGaussSeidel walks up and back down, GaussSeidel only up (GaussSeidelSmoother.C has no second half).
+// The sweep is the exact, level-scheduled one the smoothSolver already runs on the device
+// (device_sym_gauss_seidel.cuh, held to the host's in tests/gs_ladder.cu), so nothing new is computed
+// here -- only the dispatch the host file makes.
+struct GamgSmootherKind
+{
+    bool dic = false;
+    bool gaussSeidel = false;
+    bool symGaussSeidel = false;
+};
+
+GamgSmootherKind gamgSmootherKind(const std::string& smoother)
+{
+    GamgSmootherKind k;
+    k.dic = (smoother == "DIC" || smoother == "DICGaussSeidel");
+    k.gaussSeidel = (smoother == "GaussSeidel" || smoother == "DICGaussSeidel");
+    k.symGaussSeidel = (smoother == "symGaussSeidel");
+    return k;
+}
+
+void smoothLevel(
+    const DeviceLduView& A,
+    const DeviceDilu& dic,
+    DeviceBuffer<scalar>& psi,
+    const DeviceBuffer<scalar>& source,
+    DeviceBuffer<scalar>& rA,
+    DeviceBuffer<scalar>& wA,
+    int nSweeps,
+    const GamgSmootherKind& kind)
+{
+    if (kind.dic)
+    {
+        dicSmooth(A, dic, psi, source, rA, wA, nSweeps);
+    }
+    if (kind.gaussSeidel || kind.symGaussSeidel)
+    {
+        const DeviceGaussSeidelLevels& lv = gsLevelsFor(A);
+        for (int sweep = 0; sweep < nSweeps; ++sweep)
+        {
+            deviceSymGaussSeidelSweepExact(A, source, psi, lv, kind.symGaussSeidel);
+        }
+    }
+}
+
 // SolverPerformance::checkConvergence
 bool converged(
     const DeviceSolverPerf& perf,
@@ -320,7 +368,9 @@ DeviceGamgHierarchy& DeviceGamgCache::get(label nCellsInCoarsestLevel)
 
 bool deviceGamgSmootherPorted(const std::string& smoother)
 {
-    return smoother == "DIC";
+    // the host's four: DIC, and the two Gauss-Seidel smoothers with DIC's combination of them
+    return smoother == "DIC" || smoother == "DICGaussSeidel" || smoother == "GaussSeidel"
+        || smoother == "symGaussSeidel";
 }
 
 DeviceSolverPerf deviceGamgSolve(
@@ -335,8 +385,8 @@ DeviceSolverPerf deviceGamgSolve(
     if (!deviceGamgSmootherPorted(controls.smoother))
     {
         throw std::runtime_error(
-            "brae device GAMG: smoother `" + controls.smoother + "` is not ported to the device. The "
-            "host's GAMG has DIC, DICGaussSeidel, GaussSeidel and symGaussSeidel; the device's has DIC.");
+            "brae device GAMG: smoother `" + controls.smoother + "` is not ported. OpenFOAM's GAMG has "
+            "DIC, DICGaussSeidel, GaussSeidel, symGaussSeidel and others; this one has the first four.");
     }
     if (!h.host || h.level.empty())
     {
@@ -403,7 +453,9 @@ DeviceSolverPerf deviceGamgSolve(
     perf.finalResidual = perf.initialResidual;
     if (controls.minIter <= 0 && converged(perf, controls.tolerance, controls.relTol)) return perf;
 
-    // initVcycle: the smoothers. DIC's reciprocal diagonal, per level, for THIS matrix.
+    // initVcycle: the smoothers. DIC's reciprocal diagonal, per level, for THIS matrix -- refreshed even
+    // under a Gauss-Seidel smoother, which does not read it, because DICGaussSeidel runs both.
+    const GamgSmootherKind kind = gamgSmootherKind(controls.smoother);
     diluUpdate(A, fineDic);
     for (DeviceGamgLevel& L : h.level)
     {
@@ -423,7 +475,7 @@ DeviceSolverPerf deviceGamgSolve(
             if (controls.nPreSweeps)
             {
                 zero(L.corr);
-                dicSmooth(
+                smoothLevel(
                     L.view(),
                     L.dic,
                     L.corr,
@@ -432,7 +484,8 @@ DeviceSolverPerf deviceGamgSolve(
                     L.wA,
                     std::min(
                         controls.nPreSweeps + controls.preSweepsLevelMultiplier*leveli,
-                        controls.maxPreSweeps));
+                        controls.maxPreSweeps),
+                    kind);
                 // but not on the coarsest level because it evaluates to 1
                 if (controls.scaleCorrection && leveli < coarsestLevel - 1)
                 {
@@ -485,7 +538,7 @@ DeviceSolverPerf deviceGamgSolve(
             {
                 deviceAxpy(scalar(1), L.preSmoothed, L.corr);
             }
-            dicSmooth(
+            smoothLevel(
                 L.view(),
                 L.dic,
                 L.corr,
@@ -494,7 +547,8 @@ DeviceSolverPerf deviceGamgSolve(
                 L.wA,
                 std::min(
                     controls.nPostSweeps + controls.postSweepsLevelMultiplier*leveli,
-                    controls.maxPostSweeps));
+                    controls.maxPostSweeps),
+                kind);
         }
 
         // Prolong the finest level correction
@@ -504,7 +558,7 @@ DeviceSolverPerf deviceGamgSolve(
             scale(h.finestCorrection, h.Apsi, A, h.finestResidual);
         }
         deviceAxpy(scalar(1), h.finestCorrection, psi);
-        dicSmooth(A, fineDic, psi, b, h.rA, h.wA, controls.nFinestSweeps);
+        smoothLevel(A, fineDic, psi, b, h.rA, h.wA, controls.nFinestSweeps, kind);
 
         // Calculate finest level residual field
         deviceAmul(A, psi, h.Apsi);

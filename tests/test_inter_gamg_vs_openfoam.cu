@@ -328,14 +328,21 @@ int main(
     // the host's own code; what is under test is the V-cycle on the device: the coarse matrices and the
     // restriction by fixed-order gathers, DIC through the level schedule, the scaling's device
     // reductions. The device's GAMG has the DIC smoother only and REFUSES the rest, which
-    // tests/interfoam_refusals.sh holds; those three profiles have no device arm.
+    // tests/interfoam_refusals.sh holds. The three Gauss-Seidel profiles have a device arm now: the sweep is
+// the exact level-scheduled one of device_sym_gauss_seidel.cuh, dispatched as the host's LduLevel::smooth
+// dispatches its own (DIC's sweeps first, then Gauss-Seidel's, so DICGaussSeidel runs both).
     int nDev = 0;
     if (cudaGetDeviceCount(&nDev) != cudaSuccess)
     {
         cudaGetLastError();
         nDev = 0;
     }
-    const bool dicSmoother = (fin.pSolveFinal.gamg.smoother == "DIC");
+    // the device's GAMG runs the host's four smoothers now (DIC, DICGaussSeidel, GaussSeidel,
+    // symGaussSeidel), the Gauss-Seidel ones through the same exact level-scheduled sweep the
+    // smoothSolver uses; anything else it still refuses, which tests/interfoam_refusals.sh holds
+    const std::string& devSmoother = fin.pSolveFinal.gamg.smoother;
+    const bool deviceSmoother = (devSmoother == "DIC" || devSmoother == "DICGaussSeidel"
+                              || devSmoother == "GaussSeidel" || devSmoother == "symGaussSeidel");
     if (nDev <= 0)
     {
         std::printf("  (no CUDA device: the device arm is skipped)\n");
@@ -344,10 +351,10 @@ int main(
     {
         std::printf("  (the GAMG preconditioner is ported on the host only: no device arm)\n");
     }
-    else if (!dicSmoother)
+    else if (!deviceSmoother)
     {
         std::printf("  (smoother %s: the device's GAMG refuses it, so there is no device arm)\n",
-                    fin.pSolveFinal.gamg.smoother.c_str());
+                    devSmoother.c_str());
     }
     else
     {

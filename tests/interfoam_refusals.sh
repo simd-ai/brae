@@ -526,8 +526,11 @@ if [ $HAVE_GPU = 1 ]; then
     else
         echo "  ok:   device_waves                       no p_rgh substitution notice"
     fi
-    # the device's GAMG has the DIC smoother; the host's other three are refused there, and run here
-    arm device_gamg_GaussSeidel refused "DIC smoother only"   "-device" "sed -i '/p_rghFinal/,/}/ s/smoother  *DIC;/smoother        GaussSeidel;/' system/fvSolution"
+    # the device's GAMG runs the host's four smoothers now (tests/interfoam_gamg_vs_openfoam.sh's three
+    # Gauss-Seidel profiles have device arms); a smoother NONE of them names is still refused there
+    arm device_gamg_GaussSeidel runs    -                        "-device" "sed -i '/p_rghFinal/,/}/ s/smoother  *DIC;/smoother        GaussSeidel;/' system/fvSolution"
+    arm device_gamg_symGaussSeidel runs -                        "-device" "sed -i '/p_rghFinal/,/}/ s/smoother  *DIC;/smoother        symGaussSeidel;/' system/fvSolution"
+    arm device_gamg_smootherDILU refused "smoother DILU"         "-device" "sed -i '/p_rghFinal/,/}/ s/smoother  *DIC;/smoother        DILU;/' system/fvSolution"
     arm device_gamg_sweeps  runs    -                        "-device" "${GE}nPreSweeps 2; nFinestSweeps 3;/' system/fvSolution"
     # a p_rgh or alpha condition that names rhoPhi is evaluated on the host and handed rhoPhi; U's
     # pressureInletOutletVelocity switch runs ON the device and reads phi, so there the name is refused

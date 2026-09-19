@@ -106,7 +106,8 @@ WAVES="$TUT/multiphase/interFoam/laminar/waves"
 [ -d "$WAVES/stokesI" ]  || { echo "SKIP: waves/stokesI tutorial not found under $WAVES"; exit 77; }
 [ -f "$OFBASHRC" ]       || { echo "SKIP: real OpenFOAM not available"; exit 77; }
 
-W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+W=${KEEP_W:-$(mktemp -d)}
+[ -n "${KEEP_W:-}" ] || trap 'rm -rf "$W"' EXIT
 
 set +u
 # shellcheck disable=SC1091
