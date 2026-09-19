@@ -82,7 +82,7 @@ inline void updateCoupledInterfaces(
         for (label i = 0; i < fp.size; ++i)
         {
             const std::size_t k = static_cast<std::size_t>(i);
-            scalar pnf = x[static_cast<std::size_t>(fp.nbrFaceCells[k])];
+            scalar pnf = patchNeighbourValue(fp, i, x);
             if (jump)
             {
                 pnf -= (*jump)[k];

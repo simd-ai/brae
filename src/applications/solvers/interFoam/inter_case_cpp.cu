@@ -408,10 +408,11 @@ void refuseUncorrectedOnSkewMesh(
 
 // gradSchemes. interFoam's gradients -- grad(U) for the momentum scheme and the viscous term's
 // explicit half, grad(p_rgh), grad(rho) and grad(alpha) for the non-orthogonal corrections, and
-// grad(alpha) for the interface normal -- are all Gauss linear and unlimited here. 40 of the 44
-// tutorials write `default Gauss linear;` and nothing else; the four that name a cellLimited or a
-// leastSquares gradient are refused, because a gradient the case limits and brae does not is a
-// different discretisation that converges. This used to read nothing.
+// grad(alpha) for the interface normal -- are Gauss linear here, with ONE exception: `grad(U)` may be
+// `cellLimited Gauss linear <k>` (RAS/mixerVesselAMI), which InterFields::gradULimitK carries to every
+// consumer of that entry. 40 of the 44 tutorials write `default Gauss linear;` and nothing else; any
+// other limited or least-squares gradient is refused, because a gradient the case limits and brae does
+// not is a different discretisation that converges.
 void refuseUnportedGradSchemes(const std::string& fvSchemesText)
 {
     const std::string blk = fvSchemesBlock(fvSchemesText, "gradSchemes");
@@ -452,6 +453,10 @@ void refuseUnportedGradSchemes(const std::string& fvSchemesText)
             {
                 collapsed += ch;
             }
+        }
+        if (key == "grad(U)" && collapsed.rfind("cellLimited Gauss linear ", 0) == 0)
+        {
+            continue;
         }
         if (collapsed != "Gauss linear")
         {
@@ -684,6 +689,8 @@ InterFields buildInterFields(const std::string&          caseDir,
         f.snGradScheme = readNonOrthScheme(all, "snGradSchemes");
         refuseUncorrectedOnSkewMesh(f.laplacianScheme, f.snGradScheme, m, g);
         refuseUnportedGradSchemes(all);
+        const FieldGradScheme gu = parseFieldGradScheme(caseDir, "U");
+        f.gradULimitK = gu.cellLimitK;
     }
 
     // fvSolution's PIMPLE block -- see InterFields::pimple for why momentumPredictor is read rather
@@ -1086,12 +1093,16 @@ InterFields buildInterFields(const std::string&          caseDir,
             "MRF.relative(Sf & U_b) there (constrainPressureI.H), and this port's subtracts Sf & U_b; "
             "mixerVessel2D's walls are zeroGradient, so nothing gates the difference.");
     }
-    if (f.dynamicMesh && f.turbulence.on)
+    // A MOVING MESH UNDER kEpsilon: its fvm::ddt takes V0 in the source and its divU the absolute flux
+    // (kEpsilonRef::Compressible::V0, meshPhi), and the wall functions' y is recomputed from the moved
+    // geometry at every correct (nearWallDist::movePoints). kOmegaSST's wall distance is meshWave's
+    // wallDist, taken once here, and the LES closure's moving-mesh terms are not carried: both refused.
+    if (f.dynamicMesh && f.turbulence.on && f.turbulence.model != InterRasModel::KEpsilon)
     {
         throw std::runtime_error(
-            "brae interFoam: the mesh moves and the case is turbulent. The closure's wall distance "
-            "follows the mesh (wallDist::movePoints) and the closure's own moving-mesh terms are not "
-            "ported; refused rather than run the closure on the mesh as it started.");
+            "brae interFoam: the mesh moves and the closure is not kEpsilon. kEpsilon carries the moving "
+            "mesh's old volumes and absolute flux; the others' moving-mesh terms (kOmegaSST's wallDist, "
+            "the LES filter's) are not ported. Refused rather than run the closure on the mesh as it started.");
     }
     // A WAVE CONDITION ON A MOVING MESH IS NOT REFUSED. OpenFOAM's wave models take their geometry once,
     // at construction (waveModel::initialiseGeometry: the patch's orientation, each face's height and
@@ -1115,9 +1126,10 @@ InterFields buildInterFields(const std::string&          caseDir,
                 throw std::runtime_error(
                     "brae interFoam: patch `" + q.name + "` is " + q.type + " and its coupling is not "
                     "attached. The host loop couples a translational `cyclic` (a baffle pair included) "
-                    "once attachCyclicCoupling() has filled the mesh patch, and a coincident cyclicACMI "
-                    "pair once cpu::cyclicACMI::setup() has; cyclicAMI and processor patches are not "
-                    "ported here. Refused rather than run as two walls.");
+                    "once attachCyclicCoupling() has filled the mesh patch, a coincident cyclicACMI "
+                    "pair once cpu::cyclicACMI::setup() has, and a cyclicAMI pair once "
+                    "cpu::cyclicAMIFvPatch::setup() has; processor patches are not ported here. Refused "
+                    "rather than run as two walls.");
             }
             if (q.coupled && !firstCoupled)
             {
@@ -1138,7 +1150,14 @@ InterFields buildInterFields(const std::string&          caseDir,
         if (firstCoupled)
         {
             const std::string who = "brae interFoam: the case has the cyclic patch `" + firstCoupled->name + "` AND ";
-            if (f.dynamicMesh)
+            // a cyclicAMI pair is coupled again after every move (cyclic_ami_cpp, the driver's mesh
+            // update); a cyclic or cyclicACMI pair is coupled once
+            bool allAMI = true;
+            for (const FvPatch& q : patches)
+            {
+                allAMI = allAMI && (!q.coupled || q.type == "cyclicAMI");
+            }
+            if (f.dynamicMesh && !allAMI)
                 throw std::runtime_error(who + "a moving mesh. The pair's weights and deltas are taken once.");
             if (!f.mrfZones.empty())
                 throw std::runtime_error(who + "an active MRF zone. MRF's face lists do not carry coupled faces here.");
@@ -1148,20 +1167,26 @@ InterFields buildInterFields(const std::string&          caseDir,
                 throw std::runtime_error(who + "a wave condition. Nothing holds the two together against OpenFOAM.");
             if (f.turbulence.on && f.turbulence.model != InterRasModel::KEpsilon)
                 throw std::runtime_error(who + "a RAS model other than kEpsilon, the one closure carried across a cyclic.");
-            // gaussLaplacianScheme adds the deferred non-orthogonal correction on a coupled face too
-            // (its correction vectors are not zero there); fvm::laplacian here does not assemble it
+            // THE SEGREGATED MOMENTUM SOLVE AND THE LIMITED grad(U) carry a coupled patch through the
+            // interface stencil (solveVector, cellLimitedGrad) and are gated across a cyclicAMI
+            // (tests/interfoam_ami_vs_openfoam.sh); across a cyclic or cyclicACMI no gate holds them
             for (const FvPatch& q : patches)
             {
-                for (std::size_t i = 0; q.coupled && i < q.nonOrthCorrectionVectors.size(); ++i)
-                {
-                    if (mag(q.nonOrthCorrectionVectors[i]) > scalar(1e-10))
-                        throw std::runtime_error(
-                            "brae interFoam: cyclic patch `" + q.name + "` is non-orthogonal (|nf - delta*"
-                            "nonOrthDeltaCoeffs| = " + std::to_string((double)mag(q.nonOrthCorrectionVectors[i]))
-                            + " on face " + std::to_string(i) + "). The deferred correction of a laplacian on "
-                            "a coupled face is not assembled here.");
-                }
+                if (!q.coupled || q.type == "cyclicAMI") continue;
+                if (f.momentumPredictorOn)
+                    throw std::runtime_error(
+                        "brae interFoam: the case runs a momentum predictor across the coupled patch `" + q.name
+                        + "` (" + q.type + "). fvMatrix::solveSegregated's coupled source is gated across a "
+                        "cyclicAMI only; refused rather than run ungated.");
+                if (f.gradULimitK > 0)
+                    throw std::runtime_error(
+                        "brae interFoam: the case limits grad(U) across the coupled patch `" + q.name + "` ("
+                        + q.type + "). cellLimitedGrad's coupled range is gated across a cyclicAMI only; refused "
+                        "rather than run ungated.");
             }
+            // gaussLaplacianScheme adds the deferred non-orthogonal correction on a coupled face too (its
+            // correction vectors are not zero there): fvm::laplacianNonOrthSource assembles it and
+            // laplacianCorrFluxCoupled hands it to the pressure flux
         }
     }
 

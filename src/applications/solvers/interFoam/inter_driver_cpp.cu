@@ -172,6 +172,22 @@ RunReport runInterFoam(
             }
         }
     }
+    // A cyclicAMI pair is coupled by the caller; after every mesh move its AMI is recomputed and both
+    // patches coupled again, on the caller's mutable objects
+    cpu::cyclicAMIFvPatch::Interfaces* amiPairs = mutableMesh ? mutableMesh->ami : nullptr;
+    {
+        bool hasAMI = false;
+        for (const FvPatch& q : patches)
+        {
+            hasAMI = hasAMI || q.type == "cyclicAMI";
+        }
+        if (hasAMI && (!amiPairs || amiPairs->empty()))
+        {
+            throw std::runtime_error(
+                "brae interFoam: the mesh has a cyclicAMI pair and the caller handed the driver no AMI "
+                "state. Couple it with cpu::cyclicAMIFvPatch::setup and pass the result through MutableMesh.");
+        }
+    }
     RunReport rep;
     // THE CLOCK STARTS AT THE START TIME: the instant the fields are read from, which is where
     // OpenFOAM's Time begins (Time::setControls). It started at 0 whatever the case said, so a restart
@@ -307,6 +323,23 @@ RunReport runInterFoam(
                     // one p_rgh left, and the move marks it for rebuilding.
                     const bool finalIteration = (outerOfStep >= lc.nOuterCorrectors - 1);
                     dyn->update(rep.time, rep.deltaT, rep.steps, finalIteration, &gamgCache);
+                    // cyclicAMIPolyPatch::initMovePoints marks the AMI out of date, and the next AMI()
+                    // recomputes it on the moved points: before anything below interpolates across it
+                    if (amiPairs && !amiPairs->empty())
+                    {
+                        amiPairs->update(m, *mutableMesh->g, *mutableMesh->patches);
+                    }
+                    // the move rebuilt every patch uncoupled; a cyclicAMI left that way would be read
+                    // through an empty stencil by every coupled field
+                    for (const FvPatch& q : *mutableMesh->patches)
+                    {
+                        if (q.type == "cyclicAMI" && (!q.coupled || q.amiOffsets.size() != static_cast<std::size_t>(q.size) + 1))
+                        {
+                            throw std::runtime_error(
+                                "brae interFoam: the cyclicAMI patch `" + q.name + "` was not coupled again after "
+                                "the mesh moved.");
+                        }
+                    }
 
                     // dynamicMotionSolverFvMesh::update ends in U.correctBoundaryConditions(): a
                     // movingWallVelocity patch takes the wall's velocity from the motion of THIS
@@ -639,6 +672,8 @@ RunReport runInterFoam(
                     // laplacianSchemes' default, for the viscous term's fvm::laplacian(rho*nuEff, U)
                     mi.correctedLaplacian = f.laplacianScheme.corrected;
                     mi.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
+                    // gradSchemes' grad(U): cellLimited or not, for linearUpwind and the viscous term
+                    mi.gradULimitK = f.gradULimitK;
 
                     // THE CASE'S OWN SOLVE FOR U: UFinal on the last outer corrector, U on the others,
                     // its smoother where it names a Gauss-Seidel one, and only the components the
@@ -784,6 +819,12 @@ RunReport runInterFoam(
                     ti.nu = &f.nu;
                     ti.nuBnd = &f.nuBnd;
                     ti.deltaT = rep.deltaT;
+                    // a moving mesh's old volumes and mesh flux, for the closure's ddt and divU
+                    if (dyn && dyn->moving())
+                    {
+                        ti.V0 = &dyn->V0();
+                        ti.meshPhi = &dyn->meshPhi();
+                    }
                     ti.fvOptions = f.fvOptions.empty() ? nullptr : &f.fvOptions;
                     ti.epsilonLog = &rep.epsilonSolves;
                     ti.omegaLog = &rep.omegaSolves;

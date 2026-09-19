@@ -100,6 +100,7 @@ add_library(brae_core STATIC
     src/OpenFOAM/matrices/pbicgstab.cu
     src/OpenFOAM/matrices/pbicg.cu
     src/meshTools/AMIInterpolation/faceAreaWeightAMI/face_area_weight_ami_cpp.cu
+    src/finiteVolume/fvMesh/fvPatches/constraint/cyclicAMI/cyclic_ami_cpp.cu
     src/OpenFOAM/matrices/smooth_solver_cpp.cu
     src/matrices/lduMatrix/solvers/GAMG/GAMGAgglomerations/pair_gamg_agglomeration_cpp.cu
     src/matrices/lduMatrix/solvers/GAMG/gamg_solver_cpp.cu
@@ -3523,6 +3524,15 @@ add_test(NAME interfoam_mangrove_vs_openfoam
 add_executable(test_face_area_weight_ami tests/test_face_area_weight_ami.cu)
 target_include_directories(test_face_area_weight_ami PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_face_area_weight_ami PRIVATE brae_core)
+
+# interFoam across a rotating cyclicAMI against real OpenFOAM on RAS/mixerVesselAMI. The script carries
+# the measurements, the controls and the fail-proofs.
+add_executable(test_inter_ami_vs_openfoam tests/test_inter_ami_vs_openfoam.cu)
+target_include_directories(test_inter_ami_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_ami_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_ami_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_ami_vs_openfoam.sh)
 
 # ...and the wave boundary conditions (waveAlpha, waveVelocity) on laminar/waves/stokesI: fields, the
 # patch values the wave model assigns, its two derived constants and the ORDER it updates in, all

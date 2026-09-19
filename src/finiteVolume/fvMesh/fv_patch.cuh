@@ -50,7 +50,18 @@ struct FvPatch {
     // (syncToolsTemplates.C:1223), and cyclicAMIPolyPatch derives from coupledPolyPatch. So whatever
     // OpenFOAM syncs with syncFaceList -- MULES' limiter -- is NOT synced across this pair.
     bool                ami = false;
+    // a translational cyclic (and a coincident ACMI): the neighbour patch's face cells, face for face.
+    // EMPTY on a cyclicAMI, whose faces meet their neighbours through the stencil below -- read the
+    // neighbour's value through patchNeighbourValue, never through this.
     std::vector<label>  nbrFaceCells;
+    // cyclicAMI (cyclic_ami_cpp): face i's neighbour value is the AMI's weighted sum over the neighbour
+    // patch's face cells, slots amiOffsets[i] .. amiOffsets[i + 1] (AMIInterpolation::weightedSum with
+    // multiplyWeightedOp: the result starts at zero and takes += w*value, slot by slot). The owner side
+    // holds the AMI's src addressing, the other side its tgt addressing (interpolateToSource/-Target).
+    std::vector<label>  amiOffsets;
+    std::vector<label>  amiNbrFaces;
+    std::vector<label>  amiNbrCells;
+    std::vector<scalar> amiWeights;
     std::vector<scalar> weights;
     std::vector<vector> delta;
     std::vector<scalar> nonOrthDeltaCoeffs;
@@ -61,6 +72,49 @@ struct FvPatch {
 // (surfaceInterpolationScheme.C, the pLambda branch under vf.boundaryField()[pi].coupled()). Never from a
 // stored patch value -- HbyA's cyclic patch holds interpolate(rAU)*interpolate(H), and fvc::flux(HbyA)
 // does not read it.
+// patchNeighbourField at one face: the neighbour cell's value across a cyclic, the AMI's weighted sum of
+// the neighbour patch's cells across a cyclicAMI
+template <typename T>
+inline T patchNeighbourValue(
+    const FvPatch& p,
+    label i,
+    const std::vector<T>& cells)
+{
+    const std::size_t k = static_cast<std::size_t>(i);
+    if (p.amiOffsets.empty())
+    {
+        return cells[p.nbrFaceCells[k]];
+    }
+    T r{};
+    for (label s = p.amiOffsets[k]; s < p.amiOffsets[k + 1]; ++s)
+    {
+        r += p.amiWeights[static_cast<std::size_t>(s)]*cells[p.amiNbrCells[static_cast<std::size_t>(s)]];
+    }
+    return r;
+}
+
+// ...and of a field held on the NEIGHBOUR PATCH's faces (cyclicAMIPolyPatch::interpolate of a patch
+// field, as cyclicAMIFvPatch::delta and makeWeights take it). A cyclic's face i meets the neighbour's
+// face i.
+template <typename T>
+inline T patchNeighbourFaceValue(
+    const FvPatch& p,
+    label i,
+    const std::vector<T>& nbrFaces)
+{
+    const std::size_t k = static_cast<std::size_t>(i);
+    if (p.amiOffsets.empty())
+    {
+        return nbrFaces[k];
+    }
+    T r{};
+    for (label s = p.amiOffsets[k]; s < p.amiOffsets[k + 1]; ++s)
+    {
+        r += p.amiWeights[static_cast<std::size_t>(s)]*nbrFaces[p.amiNbrFaces[static_cast<std::size_t>(s)]];
+    }
+    return r;
+}
+
 template <typename T>
 inline T coupledLinear(
     const FvPatch& p,
@@ -68,7 +122,7 @@ inline T coupledLinear(
     const std::vector<T>& cells)
 {
     const std::size_t k = static_cast<std::size_t>(i);
-    return p.weights[k]*cells[p.faceCells[k]] + (scalar(1) - p.weights[k])*cells[p.nbrFaceCells[k]];
+    return p.weights[k]*cells[p.faceCells[k]] + (scalar(1) - p.weights[k])*patchNeighbourValue(p, i, cells);
 }
 
 // Fill the coupled half of `p` against its neighbour `q` (index `nbr`), a translational pair whose

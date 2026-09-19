@@ -90,7 +90,7 @@ void boundedDonorFlux(const SurfaceScalarField&     phi,
         {
             const scalar p = phi.boundary[pi][i];
             phiBD.boundary[pi][i] = p * ((p >= scalar(0)) ? psi.internal[q.faceCells[i]]
-                                                           : psi.internal[q.nbrFaceCells[i]]);
+                                                           : patchNeighbourValue(q, static_cast<label>(i), psi.internal));
         }
     }
 }
@@ -180,8 +180,8 @@ void limiter(Limiter&                      lambda,
             // contributes NOTHING -- its own extrema are already represented by the interior.
             if (q.coupled)
             {
-                psiMaxn[ci] = std::fmax(psiMaxn[ci], psiIf[q.nbrFaceCells[i]]);
-                psiMinn[ci] = std::fmin(psiMinn[ci], psiIf[q.nbrFaceCells[i]]);
+                psiMaxn[ci] = std::fmax(psiMaxn[ci], patchNeighbourValue(q, i, psiIf));
+                psiMinn[ci] = std::fmin(psiMinn[ci], patchNeighbourValue(q, i, psiIf));
             }
             else if (fixesValue)
             {
@@ -536,8 +536,8 @@ void limiterCorr(Limiter&                      lambda,
             if (q.coupled)
             {
                 // CMULESTemplates.C:327 -- the cell on the other side, as on an internal face
-                psiMaxn[ci] = std::fmax(psiMaxn[ci], psiIf[q.nbrFaceCells[i]]);
-                psiMinn[ci] = std::fmin(psiMinn[ci], psiIf[q.nbrFaceCells[i]]);
+                psiMaxn[ci] = std::fmax(psiMaxn[ci], patchNeighbourValue(q, i, psiIf));
+                psiMinn[ci] = std::fmin(psiMinn[ci], patchNeighbourValue(q, i, psiIf));
             }
             else if (fixesValue)
             {

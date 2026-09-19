@@ -90,8 +90,8 @@ FvMatrix<T> laplacian(
     // deltaCoeffs -- nonOrthDeltaCoeffs under `corrected`. So internalCoeffs = boundaryCoeffs =
     // -gamma*magSf*dc: the first goes on the diagonal and the second is the INTERFACE coefficient, which
     // Amul applies to the cell on the other side (result -= boundaryCoeffs*psi_nbr) and which is never a
-    // source. The deferred non-orthogonal correction on a coupled face is NOT assembled here; the
-    // interFoam case builder refuses a coupled patch whose correction vectors are not zero.
+    // source. The deferred non-orthogonal correction on a coupled face is the explicit half's
+    // (laplacianNonOrthSource, laplacianCorrFluxCoupled).
     M.internalCoeffs.resize(patches.size());
     M.boundaryCoeffs.resize(patches.size());
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
@@ -180,14 +180,63 @@ std::vector<T> laplacianCorrFlux(
     return ffc;
 }
 
+// ...and on the faces of a COUPLED patch (FvPatch::coupled, the OF-mirror cyclic and cyclicAMI), where
+// basicFvGeometryScheme makes the correction vectors nf - delta*nonOrthDeltaCoeffs rather than zero:
+//
+//     ffc_b = gamma_b * magSf_b * (corrVecs_b & (w*grad(P) + (1 - w)*patchNeighbourField(grad)))
+//
+// the linear interpolate of the gradient on a coupled patch. Under `limited` the orthogonal part the
+// correction is capped against is coupledFvPatchField::snGrad(nonOrthDeltaCoeffs) = dc*(pnf - pif), the
+// neighbour value the PATCH FIELD's (a jump included). Empty vectors on every uncoupled patch, whose
+// correction vectors are zero.
+template <typename T, typename G>
+std::vector<std::vector<T>> laplacianCorrFluxCoupled(
+    const SurfaceScalarField& gammaf,
+    const std::vector<G>& gradVf,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    scalar limitCoeff,
+    const GeometricField<T>& vf)
+{
+    const std::vector<scalar>& magSf = g.magSf();
+    const bool limited = (limitCoeff > 0.0 && limitCoeff < 1.0);
+    std::vector<std::vector<T>> ffc(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& fp = patches[pi];
+        if (!fp.coupled) continue;
+        const std::vector<T> pnf = limited ? vf.boundary[pi]->patchNeighbourField(vf.internal) : std::vector<T>{};
+        ffc[pi].resize(static_cast<std::size_t>(fp.size));
+        for (label i = 0; i < fp.size; ++i)
+        {
+            const std::size_t k = static_cast<std::size_t>(i);
+            const label own = fp.faceCells[k];
+            const G gf = fp.weights[k]*gradVf[own] + (1.0 - fp.weights[k])*patchNeighbourValue(fp, i, gradVf);
+            T corr = dotCorr(fp.nonOrthCorrectionVectors[k], gf);
+            if (limited)
+            {
+                const T orth = fp.nonOrthDeltaCoeffs[k]*(pnf[k] - vf.internal[own]);
+                const scalar lim =
+                    std::fmin(limitCoeff * magOf(orth)
+                                  / ((1.0 - limitCoeff) * magOf(corr) + 1e-15),
+                              1.0);
+                corr = lim * corr;
+            }
+            ffc[pi][k] = (gammaf.boundary[pi][k] * magSf[fp.start + i]) * corr;
+        }
+    }
+    return ffc;
+}
+
 // The EXPLICIT non-orthogonal correction, as an extensive per-cell source contribution:
 //     V * fvc::div( gamma*magSf * (corrVecs & interpolate(grad(vf))) )
 // which OpenFOAM SUBTRACTS from the laplacian's source (gaussLaplacianScheme.C). Returned rather than
 // applied so the caller supplies the sign for its own equation, and so it can be compared on its own.
 //
-// Boundary faces contribute nothing: OpenFOAM sets the correction vectors to zero there
-// (makeNonOrthCorrectionVectors). The 1/V of fvc::div and the V of the extensive source cancel, so no
-// volume factor appears below.
+// Uncoupled boundary faces contribute nothing: OpenFOAM sets the correction vectors to zero there
+// (makeNonOrthCorrectionVectors); a coupled patch's faces carry laplacianCorrFluxCoupled's flux onto
+// their own cells, as fvc::div sums a boundary flux. The 1/V of fvc::div and the V of the extensive
+// source cancel, so no volume factor appears below.
 //
 // G is the gradient's element type (vector for a scalar field, tensor for a vector field), taken as a
 // second template parameter -- deriving it with std::conditional puts it in a non-deduced context and
@@ -202,7 +251,6 @@ std::vector<T> laplacianNonOrthSource(
     const std::vector<FvPatch>& patches,
     scalar limitCoeff = 0.0)   // `limited <k> corrected`; 0 = unlimited. See laplacianCorrFlux.
 {
-    (void)patches;
     const label nC  = m.nCells();
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
@@ -217,6 +265,14 @@ std::vector<T> laplacianNonOrthSource(
     {
         src[own[f]] += ffc[f];
         src[nei[f]] -= ffc[f];
+    }
+    const std::vector<std::vector<T>> ffcb = laplacianCorrFluxCoupled<T, G>(gammaf, gradVf, g, patches, limitCoeff, vf);
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        for (std::size_t k = 0; k < ffcb[pi].size(); ++k)
+        {
+            src[patches[pi].faceCells[k]] += ffcb[pi][k];
+        }
     }
     (void)w; (void)magSf; (void)cv;
     return src;
@@ -375,7 +431,7 @@ void addLinearUpwindCorrectionCoupled(
             const vector dOwn = fp.Cf[i] - C[own];
             const T fc = (phi > 0.0)
                        ? phi * dotCorr(dOwn, gradVf[own])
-                       : phi * dotCorr(dOwn - fp.delta[i], gradVf[fp.nbrFaceCells[i]]);
+                       : phi * dotCorr(dOwn - fp.delta[i], patchNeighbourValue(fp, i, gradVf));
             corr[own] += fc;
         }
     }

@@ -143,6 +143,10 @@ struct InterFields
     // exist to REFUSE a corrected scheme on a mesh where the correction is not zero -- see
     // refuseUncorrectedOnSkewMesh -- and to hand the turbulence closure the case's own.
     NonOrthScheme laplacianScheme;
+    // the `k` of `grad(U) cellLimited Gauss linear <k>`, 0 unlimited: the gradient the momentum
+    // equation's linearUpwind, its viscous term and that term's non-orthogonal correction all take
+    // through gradSchemes' grad(U) entry
+    scalar gradULimitK = 0;
     NonOrthScheme snGradScheme;
 
     // fvSolution's PIMPLE block. READ, not assumed: damBreak sets `momentumPredictor no`, which means

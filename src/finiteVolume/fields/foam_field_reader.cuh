@@ -191,6 +191,11 @@ struct PatchFieldData
     // (variableHeightFlowRateInletVelocityFvPatchVectorField.C:57-58, both mandatory)
     bool           hasVhFlowRate = false;
     Function1      vhFlowRateFunction1;
+    // rotatingWallVelocity: origin, axis and a constant omega
+    vector         rwOrigin{0, 0, 0};
+    vector         rwAxis{0, 0, 0};
+    scalar         rwOmega = 0;
+    bool           hasRwOmega = false;
     std::string    vhAlphaName;
     // variableHeightFlowRate: `lowerBound` and `upperBound`, both mandatory (...FvPatchField.C:81-82)
     bool           hasLowerBound = false;
@@ -1151,6 +1156,31 @@ inline FieldData<T> readField(const std::string& path)
                             p.unsupportedFunction1 = m;
                             skipToSemicolon(ts, m == "(" ? 1 : 0);
                         }
+                        ts.expect(";");
+                    }
+                    // rotatingWallVelocity (rotatingWallVelocityFvPatchVectorField.C:52-54): origin and axis
+                    // are points read with lookup, omega a Function1 of time -- read here as `constant
+                    // <value>` or a bare value; any other form is refused rather than frozen
+                    else if ((key == "origin" || key == "axis") && p.type == "rotatingWallVelocity")
+                    {
+                        ts.expect("(");
+                        const vector v{ts.nextScalar(), ts.nextScalar(), ts.nextScalar()};
+                        ts.expect(")");
+                        ts.expect(";");
+                        if (key == "origin") p.rwOrigin = v;
+                        else p.rwAxis = v;
+                    }
+                    else if (key == "omega" && p.type == "rotatingWallVelocity")
+                    {
+                        std::string w = ts.next();
+                        if (w == "constant") w = ts.next();
+                        if (!isFoamNumber(w))
+                            throw std::runtime_error(
+                                "brae: rotatingWallVelocity on patch " + p.name + " gives `omega` starting `" + w
+                                + "`. It is a Function1 of time and brae reads `constant <value>` and a bare "
+                                "value; refusing rather than holding a varying rate fixed.");
+                        p.rwOmega = std::stod(w);
+                        p.hasRwOmega = true;
                         ts.expect(";");
                     }
                     else if (key == "value")

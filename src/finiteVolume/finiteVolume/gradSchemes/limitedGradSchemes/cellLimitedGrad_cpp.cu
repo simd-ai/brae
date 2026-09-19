@@ -48,17 +48,6 @@ void limitPass(
     const std::vector<FvPatch>& patches,
     const std::vector<std::vector<std::vector<scalar>>>& patchValues)   // [patch][face][cmpt]
 {
-    for (const FvPatch& fp : patches)
-    {
-        if (fp.coupled)
-        {
-            // cellLimitedGrad.C takes a coupled face's range from patchNeighbourField, the cell on the
-            // other side, where an uncoupled one gives its patch value
-            throw std::runtime_error(
-                "brae: a cellLimited gradient on a mesh with the coupled patch '" + fp.name
-                + "' is not ported in the OF-mirror operators.");
-        }
-    }
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
     const std::vector<label>& nei = m.neighbour();
@@ -87,10 +76,30 @@ void limitPass(
             // 0, so cellLimitedGrad's boundary loops never see those faces. brae keeps the mesh's face
             // count on an empty patch, and including them here is not harmless -- see the face loop below.
             if (patches[pi].type == "empty") continue;
-            for (label i = 0; i < patches[pi].size; ++i)
+            // ...and a COUPLED patch its patchNeighbourField (cellLimitedGrad.C, the psf.coupled()
+            // branch): the cell across a cyclic, the AMI's weighted sum across a cyclicAMI -- never a
+            // stored patch value
+            const FvPatch& fp = patches[pi];
+            for (label i = 0; i < fp.size; ++i)
             {
-                const label c = patches[pi].faceCells[i];
-                const scalar vb = patchValues[pi][i][cmpt];
+                const label c = fp.faceCells[i];
+                scalar vb = 0;
+                if (!fp.coupled)
+                {
+                    vb = patchValues[pi][i][cmpt];
+                }
+                else if (fp.amiOffsets.empty())
+                {
+                    vb = valueAt(fp.nbrFaceCells[static_cast<std::size_t>(i)], cmpt);
+                }
+                else
+                {
+                    for (label sl = fp.amiOffsets[i]; sl < fp.amiOffsets[i + 1]; ++sl)
+                    {
+                        vb += fp.amiWeights[static_cast<std::size_t>(sl)]
+                             *valueAt(fp.amiNbrCells[static_cast<std::size_t>(sl)], cmpt);
+                    }
+                }
                 maxVsf[c] = std::fmax(maxVsf[c], vb);
                 minVsf[c] = std::fmin(minVsf[c], vb);
             }
@@ -179,7 +188,18 @@ void cellLimitGrad(
 {
     if (k < SMALL_) return;
     std::vector<std::vector<scalar>> bnd(patches.size());
-    for (std::size_t pi = 0; pi < patches.size(); ++pi) bnd[pi] = vsf.boundary[pi]->value();
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        // a jump cyclic's patchNeighbourField is the cell LESS the jump, which the limiter's own
+        // neighbour stencil does not subtract
+        if (vsf.boundary[pi]->coupledJump())
+        {
+            throw std::runtime_error(
+                "brae: a cellLimited gradient of a field with a jump across the coupled patch '"
+                + patches[pi].name + "' is not ported.");
+        }
+        bnd[pi] = vsf.boundary[pi]->value();
+    }
     cellLimitGrad(grad, vsf.internal, bnd, k, m, g, patches);
 }
 
@@ -240,7 +260,18 @@ void cellLimitGrad(
 {
     if (k < SMALL_) return;
     std::vector<std::vector<vector>> bnd(patches.size());
-    for (std::size_t pi = 0; pi < patches.size(); ++pi) bnd[pi] = vsf.boundary[pi]->value();
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        // a jump cyclic's patchNeighbourField is the cell LESS the jump, which the limiter's own
+        // neighbour stencil does not subtract
+        if (vsf.boundary[pi]->coupledJump())
+        {
+            throw std::runtime_error(
+                "brae: a cellLimited gradient of a field with a jump across the coupled patch '"
+                + patches[pi].name + "' is not ported.");
+        }
+        bnd[pi] = vsf.boundary[pi]->value();
+    }
     cellLimitGrad(grad, vsf.internal, bnd, k, m, g, patches);
 }
 

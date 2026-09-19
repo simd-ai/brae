@@ -156,6 +156,12 @@ struct Compressible
     // which rho that is; psi.oldTime() is the field at entry, before the wall function writes it.
     scalar                                  rDeltaT  = 0.0;
     const std::vector<scalar>*              rhoOld   = nullptr;
+    // A MOVING MESH (EulerDdtScheme::fvmDdt under mesh().moving()): the source takes the old volumes,
+    // rDeltaT*psi.oldTime()*V0, where the diagonal keeps V; and divU is the divergence of the ABSOLUTE
+    // flux, fvc::div(fvc::absolute(phi, U)) = div(phi + mesh.phi()) (kEpsilon.C:232-235). Null on a
+    // static mesh, where both collapse to the forms above.
+    const std::vector<scalar>*              V0       = nullptr;
+    const SurfaceScalarField*               meshPhi  = nullptr;
     // EddyDiffusivity::correctNut -- alphat = rho*nut/Prt, which the energy equation needs and the
     // momentum equation does not. Written out when supplied.
     std::vector<scalar>*                    alphat   = nullptr;

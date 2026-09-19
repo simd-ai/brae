@@ -155,6 +155,7 @@ int main(int argc, char** argv)
         // same patches uncoupled, refuses it by name
         std::vector<FvPatch> patches = buildPatches(m, g, /*mirrorACMI=*/true);
         cpu::cyclicACMI::Interfaces acmi;
+        cpu::cyclicAMIFvPatch::Interfaces amiPairs;
         if (!onDevice)
         {
             // THE HOST LOOP COUPLES A CYCLIC: its operators branch on FvPatch::coupled. The device loop
@@ -163,6 +164,7 @@ int main(int argc, char** argv)
             // the cell geometry every patch is built from.
             acmi = cpu::cyclicACMI::setup(m, g, patches, startTime);
             attachCyclicCoupling(patches, m, g);
+            amiPairs = cpu::cyclicAMIFvPatch::setup(caseDir + "/constant/polyMesh", m, g, patches);
         }
         // ...handed to the host loop mutable as well, for a case whose mesh moves (MutableMesh)
         MutableMesh mutableMesh;
@@ -170,6 +172,7 @@ int main(int argc, char** argv)
         mutableMesh.g = &g;
         mutableMesh.patches = &patches;
         mutableMesh.acmi = &acmi;
+        mutableMesh.ami = &amiPairs;
 
         // The start directory OpenFOAM would use. `0` is written as `0` and not `0.000000`, which is
         // what every tutorial ships.

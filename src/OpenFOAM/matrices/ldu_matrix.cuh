@@ -29,6 +29,9 @@ struct FvMatrix
     // omits the correction while the source includes it leaves div(phi) != 0 on a non-orthogonal mesh --
     // silently, since the pressure equation itself still solves. gaussLaplacianScheme.C:186-199.
     std::vector<T>              faceFluxCorrection;      // nInternalFaces; empty if none
+    // ...and its values on the faces of COUPLED patches, [patch][face]; empty for every other patch
+    // (fvm::laplacianCorrFluxCoupled)
+    std::vector<std::vector<T>> faceFluxCorrectionBoundary;
 };
 
 using FvScalarMatrix = FvMatrix<scalar>;

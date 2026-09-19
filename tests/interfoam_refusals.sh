@@ -256,7 +256,10 @@ arm mesh_square_uncorrected runs    -                        "" "$UNCORR"
 arm mesh_square_corrected   runs    -                        "" true
 arm grad_cellLimited        refused "gradSchemes"            "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         cellLimited Gauss linear 1;/' system/fvSchemes"
 arm grad_leastSquares       refused "gradSchemes"            "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         leastSquares;/' system/fvSchemes"
-arm grad_namedU             refused "grad(U) cellLimited"    "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
+# grad(U) alone may be cellLimited (RAS/mixerVesselAMI, tests/interfoam_ami_vs_openfoam.sh); any other
+# gradient limited is refused
+arm grad_namedU             runs    -                        "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
+arm grad_namedPrgh          refused "grad(p_rgh) cellLimited" "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(p_rgh)     cellLimited Gauss linear 1;/' system/fvSchemes"
 
 # TURBULENCE. laminar damBreak made RAS carries no k, epsilon or nut, and OpenFOAM stops on it too.
 arm ras_noFields            refused "does not exist"          "" "sed -i 's/simulationType .*/simulationType RAS;\\nRAS { RASModel kEpsilon; turbulence on; }/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,U) .*/&\\n    div(phi,k) Gauss upwind;\\n    div(phi,epsilon) Gauss upwind;/' system/fvSchemes"
@@ -368,7 +371,9 @@ arm moving_noRefPoint       refused "neither pRefCell nor pRefPoint" "" "sed -i 
 arm moving_refPointOutside  refused "lies in no cell"         "" "sed -i 's/^\( *\)pRefPoint .*/\1pRefPoint (1 1 1);/' system/fvSolution"
 arm moving_refCell          runs    -                        "" "sed -i 's/^\( *\)pRefPoint .*/\1pRefCell 3;/' system/fvSolution"
 KEFIELDS='for n, dim, t, v in [("k", "[0 2 -2 0 0 0 0]", "kqRWallFunction", "0.1"), ("epsilon", "[0 2 -3 0 0 0 0]", "epsilonWallFunction", "0.1"), ("nut", "[0 2 -1 0 0 0 0]", "nutkWallFunction", "0")]: open("0/" + n, "w").write("FoamFile { version 2.0; format ascii; class volScalarField; object %s; }\ndimensions %s;\ninternalField uniform %s;\nboundaryField { walls { type %s; value uniform %s; } }\n" % (n, dim, v, t, v))'
-arm moving_RAS              refused "the mesh moves and the case is turbulent" "" "sed -i 's/^simulationType .*/simulationType RAS;\nRAS { RASModel kEpsilon; turbulence on; }/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,U) .*/&\n    div(phi,k) Gauss upwind;\n    div(phi,epsilon) Gauss upwind;/' system/fvSchemes; sed -i 's/(U|k|epsilon)/XX/; s/^    U$/    \"(U|k|epsilon).*\"/' system/fvSolution; python3 -c '$KEFIELDS'"
+# kEpsilon on a moving mesh is ported (tests/interfoam_ami_vs_openfoam.sh); kOmegaSST is refused
+arm moving_SST              refused "the closure is not kEpsilon" "" "sed -i 's/^simulationType .*/simulationType RAS;\nRAS { RASModel kOmegaSST; turbulence on; }/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,U) .*/&\n    div(phi,k) Gauss upwind;\n    div(phi,omega) Gauss upwind;/' system/fvSchemes; sed -i 's/(U|k|epsilon)/XX/; s/^    U$/    \"(U|k|omega).*\"/' system/fvSolution; python3 -c '${KEFIELDS//epsilon/omega}'"
+arm moving_RAS              runs    -                        "" "sed -i 's/^simulationType .*/simulationType RAS;\nRAS { RASModel kEpsilon; turbulence on; }/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,U) .*/&\n    div(phi,k) Gauss upwind;\n    div(phi,epsilon) Gauss upwind;/' system/fvSchemes; sed -i 's/(U|k|epsilon)/XX/; s/^    U$/    \"(U|k|epsilon).*\"/' system/fvSolution; python3 -c '$KEFIELDS'"
 # a dictionary-form preconditioner other than GAMG or DIC is substituted under a notice, not run silently
 arm moving_precondDILU      runs    "preconditioner { DILU ... }" "" "sed -i '/p_rghFinal/,/^    }/ s/preconditioner  *GAMG;/preconditioner DILU;/' system/fvSolution"
 arm moving_precondNoSmoother refused "names no \`smoother\`" "" "sed -i '/p_rghFinal/,/^    }/ {/smoother/d}' system/fvSolution"
@@ -406,7 +411,8 @@ arm baffle_DTable           refused "a Function1 other than"           "" "sed -
 arm baffle_noLength         refused "needs \`D\`, \`I\` and \`length\`"   "" "sed -i '/^ *length  *0.15;/d' 0/p_rgh"
 arm baffle_noJump           refused "has no \`jump\` entry"             "" "sed -i '/^ *jump  *uniform 0;/d' 0/p_rgh"
 arm baffle_GAMG             refused "GAMG does not carry the interface" "" "python3 -c \"import re; p='system/fvSolution'; t=open(p).read(); t=re.sub(r'(\\n    p_rgh\\s*\\{\\s*solver\\s+)PCG;\\s*preconditioner\\s+DIC;', r'\\1GAMG; smoother DIC;', t); open(p,'w').write(t)\""
-arm baffle_momentumPredictor refused "the segregated vector solve"     "" "sed -i 's/momentumPredictor  *no;/momentumPredictor   yes;/; /^ *minIter  *1;/d' system/fvSolution"
+arm baffle_momentumPredictor refused "a momentum predictor across the coupled patch" "" "sed -i 's/momentumPredictor  *no;/momentumPredictor   yes;/; /^ *minIter  *1;/d' system/fvSolution"
+arm baffle_cellLimitedGradU refused "grad(U) across the coupled patch" "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
 arm baffle_vanLeerV         refused "does not carry them onto the coupled patch" "" "sed -i 's/div(rhoPhi,U)  *Gauss linearUpwind grad(U);/div(rhoPhi,U)   Gauss vanLeerV;/' system/fvSchemes"
 arm baffle_compression      refused "\`interfaceCompression\` across the coupled patch" "" "sed -i 's/div(phirb,alpha)  *Gauss linear;/div(phirb,alpha) Gauss interfaceCompression;/' system/fvSchemes"
 BASE="$B"

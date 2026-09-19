@@ -677,6 +677,8 @@ void correctInterTurbulence(
     comp.nu = in.nu;
     comp.nuBnd = in.nuBnd;
     comp.rDeltaT = scalar(1) / in.deltaT;
+    comp.V0 = in.V0;
+    comp.meshPhi = in.meshPhi;
     // The equation's own flux. In the variable lineage that is rhoPhi, while divU and every
     // flux-conditional patch still read the volumetric phi.
     const SurfaceScalarField* eqnFlux = in.phi;

@@ -271,7 +271,9 @@ void fluxWithScheme(const SurfaceScalarField&     psi,
             for (std::size_t i = 0; i < vb.size(); ++i)
             {
                 const label P = fp.faceCells[i];
-                const label N = fp.nbrFaceCells[i];
+                // patchNeighbourField of alpha and of its gradient: the cell across a cyclic, the AMI's
+                // weighted sum across a cyclicAMI
+                const scalar vfN = patchNeighbourValue(fp, static_cast<label>(i), vf.internal);
                 const scalar pb = psi.boundary[pi][i];
                 const scalar up = (pb >= scalar(0)) ? scalar(1) : scalar(0);
                 scalar wf = fp.weights[i];
@@ -289,14 +291,16 @@ void fluxWithScheme(const SurfaceScalarField&     psi,
                     case AlphaFluxScheme::vanLeer:
                     default:
                     {
-                        const scalar r = limitedSchemes::detail::rScalar(pb, vf.internal[P], vf.internal[N],
-                                                                 gradVfLimited[P], gradVfLimited[N], fp.delta[i]);
+                        const scalar r = limitedSchemes::detail::rScalar(pb, vf.internal[P], vfN,
+                                                                 gradVfLimited[P],
+                                                                 patchNeighbourValue(fp, static_cast<label>(i), gradVfLimited),
+                                                                 fp.delta[i]);
                         const scalar lim = limitedSchemes::detail::vanLeerLimiter(r);
                         wf = lim*fp.weights[i] + (scalar(1) - lim)*up;
                         break;
                     }
                 }
-                out.boundary[pi][i] = pb * (wf*vf.internal[P] + (scalar(1) - wf)*vf.internal[N]);
+                out.boundary[pi][i] = pb * (wf*vf.internal[P] + (scalar(1) - wf)*vfN);
             }
             continue;
         }

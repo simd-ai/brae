@@ -37,10 +37,38 @@ inline SolverPerformance solveVector(
     SolverPerformance* perfCmpt = nullptr,
     const VectorLinearSolver* which = nullptr)
 {
-    // fvMatrix<Type>::solveSegregated moves a coupled patch's contribution between the components'
-    // sources before each solve; not ported, so a momentum predictor across a cyclic is refused
-    refuseCoupledPatches(patches, "the segregated vector solve");
     const label nC = m.nCells();
+    // fvMatrix<Type>::solveSegregated (fvMatrixSolve.C) on a COUPLED patch: addBoundarySource adds
+    // cmptMultiply(boundaryCoeffs, patchNeighbourField()) -- the neighbour's whole VECTOR -- to the
+    // source once, and each component's updateMatrixInterfaces(add = true) then takes back
+    // boundaryCoeffs_c*pnf_c, the interface's own interpolate of that component. Untransformed the two
+    // cancel but for round-off, which is OpenFOAM's: the sum is formed and then undone, not skipped.
+    // The component solver carries the interface from there. PBiCGStab here does not.
+    bool anyCoupled = false;
+    for (const FvPatch& fp : patches)
+    {
+        anyCoupled = anyCoupled || fp.coupled;
+    }
+    if (anyCoupled && !(which && which->smoothSolver))
+    {
+        refuseCoupledPatches(patches, "the segregated vector solve with PBiCGStab");
+    }
+    std::vector<vector> source = M.source;
+    if (anyCoupled)
+    {
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const FvPatch& fp = patches[pi];
+            if (!fp.coupled) continue;
+            const std::vector<vector> pnf = U.boundary[pi]->patchNeighbourField(U.internal);
+            for (label i = 0; i < fp.size; ++i)
+            {
+                const vector& bc = M.boundaryCoeffs[pi][i];
+                const vector& n = pnf[static_cast<std::size_t>(i)];
+                source[fp.faceCells[i]] += vector{bc.x*n.x, bc.y*n.y, bc.z*n.z};
+            }
+        }
+    }
     SolverPerformance perf;
     for (int cmpt = 0; cmpt < 3; ++cmpt)
     {
@@ -51,7 +79,7 @@ inline SolverPerformance solveVector(
         Mc.upper = M.upper;
         Mc.lower = M.lower;
         Mc.source.resize(nC);
-        for (label c = 0; c < nC; ++c) Mc.source[c] = component(M.source[c], cmpt);
+        for (label c = 0; c < nC; ++c) Mc.source[c] = component(source[c], cmpt);
         Mc.internalCoeffs.resize(patches.size());
         Mc.boundaryCoeffs.resize(patches.size());
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
@@ -66,6 +94,15 @@ inline SolverPerformance solveVector(
         }
         std::vector<scalar> psi(nC);
         for (label c = 0; c < nC; ++c) psi[c] = component(U.internal[c], cmpt);
+        for (std::size_t pi = 0; anyCoupled && pi < patches.size(); ++pi)
+        {
+            const FvPatch& fp = patches[pi];
+            if (!fp.coupled) continue;
+            for (label i = 0; i < fp.size; ++i)
+            {
+                Mc.source[fp.faceCells[i]] -= Mc.boundaryCoeffs[pi][i]*patchNeighbourValue(fp, i, psi);
+            }
+        }
         const SolverPerformance p = (which && which->smoothSolver)
             ? smoothSolver(Mc, psi, m, patches, which->symmetric, tolerance, relTol, maxIter, minIter,
                            which->nSweeps)

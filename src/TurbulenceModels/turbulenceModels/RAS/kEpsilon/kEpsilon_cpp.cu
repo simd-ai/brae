@@ -274,11 +274,31 @@ void correct(
     // is phi/interpolate(rho) and not the mass flux the div operator uses. `bounded` instead subtracts
     // the divergence of the EQUATION's own flux. In the incompressible lineage both are div(phi) and the
     // two lines below collapse to the one they replace.
-    const std::vector<scalar> divU =
-        (comp && comp->phiByRho) ? fvc::div(*comp->phiByRho, m, g, patches)
-                                 : fvc::div(phi, m, g, patches);
+    const SurfaceScalarField& phiVol = (comp && comp->phiByRho) ? *comp->phiByRho : phi;
+    std::vector<scalar> divU;
+    if (comp && comp->meshPhi)
+    {
+        // fvc::absolute(phi, U): phi + mesh.phi() on every face, the boundary included
+        SurfaceScalarField phiAbs = phiVol;
+        for (std::size_t f = 0; f < phiAbs.internal.size(); ++f)
+        {
+            phiAbs.internal[f] += comp->meshPhi->internal[f];
+        }
+        for (std::size_t pi = 0; pi < phiAbs.boundary.size(); ++pi)
+        {
+            for (std::size_t i = 0; i < phiAbs.boundary[pi].size(); ++i)
+            {
+                phiAbs.boundary[pi][i] += comp->meshPhi->boundary[pi][i];
+            }
+        }
+        divU = fvc::div(phiAbs, m, g, patches);
+    }
+    else
+    {
+        divU = fvc::div(phiVol, m, g, patches);
+    }
     const std::vector<scalar> divPhi =
-        (comp && comp->phiByRho) ? fvc::div(phi, m, g, patches) : divU;
+        ((comp && comp->phiByRho) || (comp && comp->meshPhi)) ? fvc::div(phi, m, g, patches) : divU;
 
     // the flux inletOutlet and its relatives look up -- see Compressible::bcPhi
     const SurfaceScalarField& patchFlux = (comp && comp->bcPhi) ? *comp->bcPhi : phi;
@@ -525,7 +545,7 @@ void correct(
             if (rDeltaT > 0.0)   // fvm::ddt(alpha, rho, epsilon_), kEpsilon.C:254
             {
                 M.diag[c]   += rDeltaT * rhoAt(c) * V;
-                M.source[c] += rDeltaT * rhoOldAt(c) * epsOld[c] * V;
+                M.source[c] += rDeltaT * rhoOldAt(c) * epsOld[c] * ((comp && comp->V0) ? (*comp->V0)[c] : V);
             }
 
             // `bounded`: - Sp(div(phi), epsilon). Vanishes where phi is conservative, so it cannot move
@@ -741,7 +761,7 @@ void correct(
             if (rDeltaT > 0.0)   // fvm::ddt(alpha, rho, k_), kEpsilon.C:275
             {
                 M.diag[c]   += rDeltaT * rhoAt(c) * V;
-                M.source[c] += rDeltaT * rhoOldAt(c) * kOld[c] * V;
+                M.source[c] += rDeltaT * rhoOldAt(c) * kOld[c] * ((comp && comp->V0) ? (*comp->V0)[c] : V);
             }
 
             if (bounded) M.diag[c] -= divPhi[c] * V;

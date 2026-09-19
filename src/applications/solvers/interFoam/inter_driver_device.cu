@@ -132,6 +132,13 @@ RunReport runInterFoamDevice(
                 "on RAS/weirOverflow) and the device loop uploads refValue once. Refused rather than run "
                 "it as an inletOutlet of zero.");
     }
+    // `grad(U) cellLimited`: the host momentum equation limits the gradient; the device's does not read
+    // the coefficient
+    if (f.gradULimitK > 0)
+        throw std::runtime_error(
+            "brae interFoam (device): fvSchemes limits grad(U) (cellLimited, k = "
+            + std::to_string((double)f.gradULimitK) + "). The host loop carries it into linearUpwind and the "
+            "viscous term; the device loop's momentum equation does not. Refused rather than run it unlimited.");
     // ddtCorr's BOUNDARY HALF is live on an open patch whose U does not fix a value (fvcDdtPhiCoeff zeroes
     // the coupling coefficient only where it does). The host pressure equation adds it; the device's
     // deviceInterAddPhiHbyATerms has no such term. A zero-flux patch -- a slip wall, a symmetry plane --

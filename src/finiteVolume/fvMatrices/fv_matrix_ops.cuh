@@ -59,9 +59,16 @@ inline SurfaceScalarField matrixFlux(
         {
             for (label i = 0; i < patches[pi].size; ++i)
             {
-                const scalar pnf = coupledPnf ? (*coupledPnf)[pi][i] : pInternal[patches[pi].nbrFaceCells[i]];
+                const scalar pnf = coupledPnf ? (*coupledPnf)[pi][i] : patchNeighbourValue(patches[pi], i, pInternal);
                 flux.boundary[pi][i] = M.internalCoeffs[pi][i] * pInternal[patches[pi].faceCells[i]]
                                      - M.boundaryCoeffs[pi][i] * pnf;
+            }
+            if (pi < M.faceFluxCorrectionBoundary.size() && !M.faceFluxCorrectionBoundary[pi].empty())
+            {
+                for (label i = 0; i < patches[pi].size; ++i)
+                {
+                    flux.boundary[pi][i] += M.faceFluxCorrectionBoundary[pi][i];
+                }
             }
             continue;
         }
@@ -304,7 +311,7 @@ inline std::vector<vector> matrixH(
             if (patches[pi].coupled)
             {
                 const vector& bc = M.boundaryCoeffs[pi][i];
-                const vector& un = U.internal[patches[pi].nbrFaceCells[i]];
+                const vector un = patchNeighbourValue(patches[pi], i, U.internal);
                 H[patches[pi].faceCells[i]] += vector{bc.x*un.x, bc.y*un.y, bc.z*un.z};
                 continue;
             }

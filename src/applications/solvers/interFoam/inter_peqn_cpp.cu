@@ -248,8 +248,8 @@ void ddtCorr(const DdtCorrInput&           in,
         out.internal[f] = coeff * rDeltaT * phiCorr;
     }
 
-    // note 2: zero on every patch where U fixes a value. brae has no cyclicAMI in a VoF case yet; the
-    // loop is per patch so adding one changes only that patch.
+    // note 2: zero on every patch where U fixes a value, and on every cyclicAMI patch
+    // (ddtScheme.C:178-181, isA<cyclicAMIFvPatch> -- a cyclicACMI patch is a coupledFvPatch, not one)
     out.boundary.assign(patches.size(), std::vector<scalar>{});
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
         out.boundary[pi].assign(static_cast<std::size_t>(patches[pi].size), scalar(0));
@@ -257,6 +257,7 @@ void ddtCorr(const DdtCorrInput&           in,
     {
         if (U.boundary[pi]->fixesValue()) continue;       // already zero, and stays zero
         const FvPatch& q = patches[pi];
+        if (q.type == "cyclicAMI") continue;
         for (label i = 0; i < q.size; ++i)
         {
             const bool havePatch = in.UOldBnd && pi < in.UOldBnd->size()
@@ -548,9 +549,21 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
                 {
                     // interpolate(rho*rAU) on a coupled face: the PRODUCT per cell, interpolated once
                     const label P = q.faceCells[i];
-                    const label N = q.nbrFaceCells[k];
-                    const scalar rr = q.weights[k]*((*in.rho)[P]*rAU[P])
-                                    + (scalar(1) - q.weights[k])*((*in.rho)[N]*rAU[N]);
+                    scalar rrN = 0;
+                    if (q.amiOffsets.empty())
+                    {
+                        const label N = q.nbrFaceCells[k];
+                        rrN = (*in.rho)[N]*rAU[N];
+                    }
+                    else
+                    {
+                        for (label s = q.amiOffsets[k]; s < q.amiOffsets[k + 1]; ++s)
+                        {
+                            const label N = q.amiNbrCells[static_cast<std::size_t>(s)];
+                            rrN += q.amiWeights[static_cast<std::size_t>(s)]*((*in.rho)[N]*rAU[N]);
+                        }
+                    }
+                    const scalar rr = q.weights[k]*((*in.rho)[P]*rAU[P]) + (scalar(1) - q.weights[k])*rrN;
                     phiHbyA.boundary[pi][k] += rr * corr.boundary[pi][k];
                     continue;
                 }
@@ -705,6 +718,8 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
             }
             pe.faceFluxCorrection = fvm::laplacianCorrFlux<scalar, vector>(
                 rAUfField, gradP, m, g, sc.snGradLimitCoeff, &p_rgh);
+            pe.faceFluxCorrectionBoundary = fvm::laplacianCorrFluxCoupled<scalar, vector>(
+                rAUfField, gradP, g, patches, sc.snGradLimitCoeff, p_rgh);
         }
         const std::vector<scalar> div = fvc::div(phiHbyA, m, g, patches);
         for (label c = 0; c < nC; ++c) pe.source[c] += div[c] * g.V()[c];

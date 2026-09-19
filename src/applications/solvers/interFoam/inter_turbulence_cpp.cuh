@@ -187,6 +187,10 @@ struct InterTurbulenceStepInput
     const std::vector<scalar>* nu = nullptr;
     const std::vector<std::vector<scalar>>* nuBnd = nullptr;
     scalar deltaT = 0;
+    // A MOVING MESH: the old volumes and the mesh flux (see kEpsilonRef::Compressible). Null on a
+    // static mesh.
+    const std::vector<scalar>* V0 = nullptr;
+    const SurfaceScalarField* meshPhi = nullptr;
     // every solve of the run, in order, for the solver-log gate
     // fvOptions(epsilon) and fvOptions(k), kEpsilon.C:258/279: the mangroves' turbulence source. Null
     // or empty is a case with none.

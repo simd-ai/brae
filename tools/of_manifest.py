@@ -2431,7 +2431,7 @@ COMPONENTS = {
                         "and nutLowRe are accepted because the shared closure gates them under rhoSimpleFoam, not here); "
                         "kMin/epsilonMin, which bound() never reaches on this case; a non-orthogonal mesh; more than one "
                         "outer corrector with the closure on.",
-             note="nut = Cmu*sqr(k)/epsilon DOES NOT REACH a fixedValue or mixed patch (their operator= is empty); correctBoundaryConditions then evaluates them. brae wrote Cmu*k^2/epsilon there: on RAS/mixerVesselAMI's fixedValue gasInlet 1.29e-03 where OpenFOAM keeps 0, U 2.7e-03 after one step. kOmegaSST's correctNutField has the same shape and is NOT fixed here (no gated case carries a fixed nut under it). "
+             note="nut = Cmu*sqr(k)/epsilon DOES NOT REACH a fixedValue or mixed patch (their operator= is empty); correctBoundaryConditions then evaluates them. brae wrote Cmu*k^2/epsilon there: on RAS/mixerVesselAMI's fixedValue gasInlet 1.29e-03 where OpenFOAM keeps 0, U 2.7e-03 after one step. kOmegaSST's correctNutField has the same shape and is NOT fixed here (no gated case carries a fixed nut under it). kEpsilon ON A MOVING MESH: V0 in the ddt source and divU from the absolute flux (kEpsilon.C:232-235), not discriminated by the rigid rotation that gates it. "
                   "incompressibleInterPhaseTransportModel IS TWO MODELS BEHIND ONE KEYWORD, and brae's own refusal "
                   "message had it wrong. It said interFoam's turbulence `selects a MIXTURE model and hands it the "
                   "blended rho -- not the single-phase model brae already has`; that was written from memory. The "
@@ -2839,6 +2839,46 @@ COMPONENTS = {
                   "(interFoam_wedgeCoefficients); the host loop's clock started at 0 on every restart. "
                   "buildPatches' ACMI refusal stays for every other driver; the interFoam host opts out "
                   "with mirrorACMI. HOST ONLY SO FAR."),
+        dict(name="interFoam_cyclicAMI", of_symbol="cyclicAMIFvPatch",
+             of_file="src/finiteVolume/fvMesh/fvPatches/constraint/cyclicAMI/cyclicAMIFvPatch.C",
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/finiteVolume/fvMesh/fvPatches/constraint/cyclicAMI/cyclic_ami_cpp.cu",
+             validation="tests/interfoam_ami_vs_openfoam.sh, real OpenFOAM on RAS/mixerVesselAMI as Allrun.pre "
+                        "meshes it with the background block (50 50 100) coarsened to (22 22 44): 82,510 cells, "
+                        "8,872 faces a side, the rotor's cellZone turned by solidBodyMotionSolver at omega -5; "
+                        "kEpsilon, explicit MULES in two sub-cycles, momentum predictor, two outer correctors, "
+                        "correctPhi, grad(U) cellLimited, limited corrected 0.33, a rotatingWallVelocity shaft. "
+                        "STAGED IN BOTH CODES: p_rgh and pcorr PCG/DIC for GAMG (not ported across an AMI), every "
+                        "solve pinned at 1e-13, fixed steps of 2e-4. MEASURED, 100 steps (0.1 rad): alpha 4.4e-13, "
+                        "p_rgh 5.4e-14, U 3.5e-12, k 9.5e-14, epsilon 1.2e-13, nut 2.1e-12, the flux across the "
+                        "pair 1.3e-11 of its largest, the moved points bitwise; all 200 p_rgh, 600 U, 100 k, 100 "
+                        "epsilon and 101 pcorr counts OpenFOAM's. At the case's own tolerances U 3.9e-07 and 14 of "
+                        "200 p_rgh counts apart -- where two Krylov solvers stopped. CONTROL: the rotor held still, "
+                        "U 1.1e-01. BROKEN ONCE EACH (U after 100 steps): the AMI not "
+                        "recomputed after the move, refused by name; delta without the neighbour's interpolated half "
+                        "9.7e-03; no non-orthogonal correction on coupled faces 4.0e-02; ddtCorr live on the "
+                        "cyclicAMI 8.7e-03; MULES synced across it 1.4e-04; cellLimited's coupled range from the "
+                        "stored value 1.3e-03; grad(U) unlimited 2.7e-01; rotatingWallVelocity's omega flipped "
+                        "1.2e-03. NOT DISCRIMINATED: the segregated solve's coupled source added and taken back "
+                        "(round-off), kEpsilon's V0 and absolute divU under a rigid rotation. NOT CLAIMED, refused by name: "
+                        "GAMG across the pair, a transform, a periodic AMI, lowWeightCorrection, requireMatch "
+                        "false, any AMI keyword not read, a momentum predictor or a cellLimited grad(U) across a "
+                        "cyclic or cyclicACMI (ungated there), and the device loop.",
+             note="THE COUPLING IS A STENCIL: FvPatch carries amiOffsets/amiNbrFaces/amiNbrCells/amiWeights, and "
+                  "every operator reads the neighbour through patchNeighbourValue -- the cell across a cyclic, the "
+                  "AMI's weighted sum (weightedSum, multiplyWeightedOp: zero, then += w*value slot by slot) across "
+                  "a cyclicAMI; nbrFaceCells is empty there. The owner side reads the AMI's src addressing, the "
+                  "other its tgt addressing (interpolateUntransformed). Geometry, cyclicAMIFvPatch.C: w = "
+                  "|dn|/(|d| + |dn|) with dn the AMI interpolate of the neighbour's nf & (Cf - Cn), delta = (Cf - "
+                  "Cn) - interpolate(neighbour's Cf - Cn), and basicFvGeometryScheme's coupled deltaCoeffs, "
+                  "nonOrthDeltaCoeffs and correction vectors from it. After every mesh move the AMI is recomputed "
+                  "and both patches coupled again (initMovePoints marks it stale; the next AMI() resets it). "
+                  "PORTED WITH IT, each found by the gate: the laplacian's non-orthogonal correction on coupled "
+                  "faces (fvm::laplacianCorrFluxCoupled, into the source and the pressure flux); "
+                  "fvMatrix::solveSegregated's coupled source (the vector bc*pnf added, each component's "
+                  "interface taken back); cellLimitedGrad's coupled range from patchNeighbourField; ddtCorr's "
+                  "coefficient zeroed on cyclicAMI; MULES left unsynced across it (syncTools does not reach an "
+                  "AMI). HOST ONLY SO FAR."),
         dict(name="interFoam_faceAreaWeightAMI", of_symbol="faceAreaWeightAMI",
              of_file="src/meshTools/AMIInterpolation/AMIInterpolation/faceAreaWeightAMI/faceAreaWeightAMI.C",
              classification="HOST_ONLY", status="REIMPLEMENT",

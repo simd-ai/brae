@@ -2609,7 +2609,7 @@ public:
         std::vector<T> pnf(static_cast<std::size_t>(p.size));
         for (std::size_t i = 0; i < pnf.size(); ++i)
         {
-            pnf[i] = internal[p.nbrFaceCells[i]];
+            pnf[i] = patchNeighbourValue(p, static_cast<label>(i), internal);
             if (!jump_.empty())
             {
                 pnf[i] = pnf[i] - jump_[i];
@@ -2765,6 +2765,66 @@ inline InletOrValue<T> inletOrValue(const PatchFieldData<T>& d)
     return d.hasInletValue ? InletOrValue<T>{d.inletUniform, d.inletUniformValue, d.inletValues}
                            : InletOrValue<T>{d.valueUniform, d.uniformValue,      d.values};
 }
+
+// rotatingWallVelocity (rotatingWallVelocityFvPatchVectorField.C updateCoeffs): the wall velocity of a
+// solid rotation about `axis` through `origin`, less its component normal to the face,
+//     Up = -omega*((Cf - origin) ^ axis/|axis|),   value = Up - n*(n & Up)
+// A fixedValue whose updateCoeffs reassigns it from the patch's CURRENT face centres and normals; brae
+// has no separate updateCoeffs for it, so every evaluate recomputes it, which with a constant omega is
+// the same value wherever the geometry stands still. The dictionary constructor runs updateCoeffs when
+// the file writes no `value` (:62-66), so the value exists from construction.
+class RotatingWallVelocityPatchField : public FixedValuePatchField<vector>
+{
+public:
+    RotatingWallVelocityPatchField(
+        const FvPatch& p,
+        const vector& origin,
+        const vector& axis,
+        scalar omega)
+        : FixedValuePatchField<vector>(p, false, vector{0, 0, 0}, wallVelocity(p, origin, axis, omega)),
+          origin_(origin),
+          axis_(axis),
+          omega_(omega)
+    {
+        this->value_ = wallVelocity(p, origin, axis, omega);
+    }
+    void evaluate(const std::vector<vector>& internal) override
+    {
+        // setStoredValues stores the new values and then evaluates, which lands back here: the inner
+        // call is the fixedValue's own evaluate of the values just stored
+        if (storing_)
+        {
+            FixedValuePatchField<vector>::evaluate(internal);
+            return;
+        }
+        storing_ = true;
+        this->setStoredValues(wallVelocity(this->patch_, origin_, axis_, omega_));
+        storing_ = false;
+    }
+
+private:
+    bool storing_ = false;
+    static std::vector<vector> wallVelocity(
+        const FvPatch& p,
+        const vector& origin,
+        const vector& axis,
+        scalar omega)
+    {
+        const vector a = axis/mag(axis);
+        std::vector<vector> v(static_cast<std::size_t>(p.size));
+        for (label i = 0; i < p.size; ++i)
+        {
+            const std::size_t k = static_cast<std::size_t>(i);
+            const vector up = (-omega)*cross(p.Cf[k] - origin, a);
+            const vector& n = p.nf[k];
+            v[k] = up - n*dot(n, up);
+        }
+        return v;
+    }
+    vector origin_;
+    vector axis_;
+    scalar omega_;
+};
 
 template <typename T>
 std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const PatchFieldData<T>& d);
@@ -3323,6 +3383,9 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
     // face onto its twin with weight 1, so cyclicACMIFvPatchField's value and coefficients are the
     // cyclic's, on the areas the mask scaled
     if (d.type == "cyclicACMI" && p.coupled)     return std::make_unique<CoupledCyclicPatchField<T>>(p);
+    // a cyclicAMI pair the interFoam host loop coupled (cyclic_ami_cpp): coupledFvPatchField's value and
+    // snGrad, with patchNeighbourField the AMI interpolate the patch's stencil carries
+    if (d.type == "cyclicAMI" && p.coupled)      return std::make_unique<CoupledCyclicPatchField<T>>(p);
     if (isCoupledInterfaceType(d.type))          return std::make_unique<ZeroGradientPatchField<T>>(p);
     if (d.type == "empty")           return std::make_unique<EmptyPatchField<T>>(p);
     if (d.type == "symmetryPlane" || d.type == "symmetry" || d.type == "slip")
@@ -3437,6 +3500,33 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
     {
         const auto v = inletOrValue(d);
         return std::make_unique<FixedValuePatchField<T>>(p, v.uniform, v.uniformValue, v.values);
+    }
+    if (d.type == "rotatingWallVelocity")
+    {
+        if constexpr (std::is_same<T, vector>::value)
+        {
+            if (!d.hasRwOmega || mag(d.rwAxis) <= scalar(0))
+            {
+                throw std::runtime_error(
+                    "brae: rotatingWallVelocity on patch " + p.name + " needs `origin`, a non-zero `axis` and "
+                    "`omega` (rotatingWallVelocityFvPatchVectorField.C:52-54).");
+            }
+            // OpenFOAM keeps a written `value` until the condition's first updateCoeffs; brae's host
+            // evaluates where that value would still stand, so a written value is refused rather than
+            // replaced early
+            if (d.hasValue)
+            {
+                throw std::runtime_error(
+                    "brae: rotatingWallVelocity on patch " + p.name + " carries a written `value`. OpenFOAM "
+                    "keeps it until the condition's first updateCoeffs; brae would recompute it at once. "
+                    "Refused rather than start from a different wall velocity.");
+            }
+            return std::make_unique<RotatingWallVelocityPatchField>(p, d.rwOrigin, d.rwAxis, d.rwOmega);
+        }
+        else
+        {
+            throw std::runtime_error("brae: rotatingWallVelocity is a vector condition (patch " + p.name + ").");
+        }
     }
     throw std::runtime_error("brae: unsupported BC type '" + d.type + "' on patch " + p.name);
 }

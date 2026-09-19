@@ -178,6 +178,8 @@ void correctPhi(
             }
             pe.faceFluxCorrection = fvm::laplacianCorrFlux<scalar, vector>(
                 *in.rAUf, gradP, m, g, c.snGradLimitCoeff, &pcorr);
+            pe.faceFluxCorrectionBoundary = fvm::laplacianCorrFluxCoupled<scalar, vector>(
+                *in.rAUf, gradP, g, patches, c.snGradLimitCoeff, pcorr);
         }
         // fvMatrix == volScalarField: source += V*su
         for (label cell = 0; cell < nC; ++cell)
