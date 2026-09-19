@@ -404,7 +404,60 @@ int main(int argc, char** argv)
               std::fabs(swapped.internal[0] - scalar(0.4) * rho2) < scalar(1e-12));
     }
 
-    // ---- 7. the scheme that is not ported ---------------------------------------------------------
+    // ---- 7. the PhiScheme `Gauss interfaceCompression` -------------------------------------------
+    // It was refused here until b60aa71 ported it (gated end to end by tests/interfoam_dambreak_vs_openfoam.sh
+    // `compression`); this section asserted the refusal and was never turned round. Now it holds the
+    // weights: interfaceCompressionLimiter's QUARTIC form (interfaceCompression.H:69-78) blended as every
+    // limitedSurfaceInterpolationScheme is, w = lim*cdWeight + (1 - lim)*pos0(faceFlux). A uniform alpha
+    // cannot see any of it -- every weight gives psi*alpha -- so the field is a ramp through the interface
+    // and the flux changes sign, which is what pos0 reads.
+    {
+        const std::vector<scalar> ramp{scalar(0), scalar(0.05), scalar(0.3), scalar(0.7), scalar(0.95), scalar(1)};
+        const GeometricField<scalar> a = makeAlpha(ramp, fvp);
+        SurfaceScalarField psi, out;
+        psi.internal.resize(static_cast<std::size_t>(nIf));
+        for (label f = 0; f < nIf; ++f)
+        {
+            psi.internal[f] = (f % 2 == 0) ? scalar(1) : scalar(-2);
+        }
+        psi.boundary.resize(fvp.size());
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            psi.boundary[pi].assign(static_cast<std::size_t>(fvp[pi].size), scalar(0));
+        }
+        fluxWithScheme(psi, a, AlphaFluxScheme::interfaceCompression, m, g, fvp, out);
+
+        // OpenFOAM's expression, and the quadratic form it leaves commented out beside it
+        std::vector<scalar> want(static_cast<std::size_t>(nIf)), quadratic(static_cast<std::size_t>(nIf));
+        for (label f = 0; f < nIf; ++f)
+        {
+            const scalar pP = a.internal[m.owner()[f]];
+            const scalar pN = a.internal[m.neighbour()[f]];
+            const scalar sP = (1 - 4*pP*(1 - pP))*(1 - 4*pP*(1 - pP));
+            const scalar sN = (1 - 4*pN*(1 - pN))*(1 - 4*pN*(1 - pN));
+            const scalar lim = std::fmin(std::fmax(1 - std::fmax(sP, sN), scalar(0)), scalar(1));
+            const scalar limQ = std::fmin(std::fmax(4*std::fmin(pP*(1 - pP), pN*(1 - pN)), scalar(0)), scalar(1));
+            const scalar up = psi.internal[f] >= 0 ? scalar(1) : scalar(0);
+            const scalar w = lim*g.weights()[f] + (1 - lim)*up;
+            const scalar wQ = limQ*g.weights()[f] + (1 - limQ)*up;
+            want[f] = psi.internal[f]*(w*pP + (1 - w)*pN);
+            quadratic[f] = psi.internal[f]*(wQ*pP + (1 - wQ)*pN);
+        }
+        const scalar dWant = worst(out.internal, want);
+        std::printf("  interfaceCompression: worst |brae - OpenFOAM's expression| = %.3e\n", (double)dWant);
+        check("`Gauss interfaceCompression` gives OpenFOAM's quartic-limited flux", dWant <= scalar(1e-14));
+
+        // CONTROLS: on this field the quadratic form and vanLeer are each far from it, so the bound above
+        // cannot be met by either
+        const scalar dQuad = worst(quadratic, want);
+        SurfaceScalarField vl;
+        fluxWithScheme(psi, a, AlphaFluxScheme::vanLeer, m, g, fvp, vl);
+        const scalar dVanLeer = worst(vl.internal, want);
+        std::printf("  ...the quadratic form is %.3e from it, vanLeer %.3e\n", (double)dQuad, (double)dVanLeer);
+        check("...which the quadratic form is not (control)", dQuad > scalar(1e-3));
+        check("...and vanLeer is not (control)", dVanLeer > scalar(1e-3));
+    }
+    // ...and the two schemes most tutorials use still reproduce a uniform field
     {
         const GeometricField<scalar> a = makeAlpha(std::vector<scalar>(N, scalar(0.5)), fvp);
         SurfaceScalarField psi, out;
@@ -412,11 +465,6 @@ int main(int argc, char** argv)
         psi.boundary.resize(fvp.size());
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             psi.boundary[pi].assign(static_cast<std::size_t>(fvp[pi].size), scalar(0));
-        bool threw = false;
-        try { fluxWithScheme(psi, a, AlphaFluxScheme::interfaceCompression, m, g, fvp, out); }
-        catch (const std::exception&) { threw = true; }
-        check("`Gauss interfaceCompression` is refused by name, not run as vanLeer", threw);
-        // CONTROL: the two schemes the tutorials actually use must work.
         fluxWithScheme(psi, a, AlphaFluxScheme::vanLeer, m, g, fvp, out);
         checkNum("vanLeer on a uniform alpha gives psi*alpha", out.internal[0], scalar(0.5));
         fluxWithScheme(psi, a, AlphaFluxScheme::linear, m, g, fvp, out);
