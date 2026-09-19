@@ -1,3 +1,8 @@
+#include "mrf_read.cuh"
+#include <unistd.h>
+#include <exception>
+#include <fstream>
+#include <filesystem>
 #include <algorithm>
 // fvOptions framework + explicitPorositySource/DarcyForchheimer, _cpp reference.
 //
@@ -121,6 +126,88 @@ int main(int argc, char** argv)
         for (const label c : po->cells) minDiag = std::fmin(minDiag, M.diag[c]);
         std::printf("  %-62s min=%.3e\n", "the resistance is a SINK (positive diagonal)", minDiag);
         check(minDiag > 0.0, "the porosity resists rather than accelerates (sign control)");
+    }
+
+    // ---- THE MANGROVES, read from a scratch case on this mesh ----------------------------------
+    // The pair waves/mangroveInteraction carries, over this fixture's first cellZone. What is held here
+    // is the reading and the refusals; the arithmetic is held against OpenFOAM by
+    // tests/interfoam_mangrove_vs_openfoam.sh.
+    {
+        namespace fs = std::filesystem;
+        const std::string polyMeshDir = caseDir + "/constant/polyMesh";
+        const auto zones = readCellZones(polyMeshDir);
+        check(!zones.empty(), "vacuity guard: the fixture has a cellZone");
+        const std::string zone = zones.empty() ? std::string() : zones.begin()->first;
+        const std::size_t zoneSize = zones.empty() ? 0 : zones.begin()->second.size();
+        const fs::path tmp = fs::temp_directory_path() / ("brae_fvoptions_mangrove_" + std::to_string(::getpid()));
+        fs::create_directories(tmp / "constant");
+        fs::create_directories(tmp / "system");
+        fs::create_directory_symlink(fs::absolute(polyMeshDir), tmp / "constant" / "polyMesh");
+        auto writeOptions = [&](const std::string& sourceRegion)
+        {
+            std::ofstream(tmp / "system" / "fvOptions")
+                << "FoamFile { version 2.0; format ascii; class dictionary; object fvOptions; }\n"
+                << "Mangroves { type multiphaseMangrovesSource; active yes; multiphaseMangrovesSourceCoeffs {\n"
+                << "  regions { region1 { cellZone " << zone << "; " << sourceRegion << " } } } }\n"
+                << "Turb { type multiphaseMangrovesTurbulenceModel; active yes; multiphaseMangrovesTurbulenceModelCoeffs {\n"
+                << "  regions { region1 { cellZone " << zone << "; a 0.01; N 560; Ckp 1; Cep 3.5; Cd 1.52; } } } }\n";
+        };
+        writeOptions("a 0.01; N 560; Cm 1; Cd 1.52;");
+        const fvOptions::OptionList mo = fvOptions::read(tmp.string(), m);
+        const fvOptions::Option* src = nullptr;
+        const fvOptions::Option* trb = nullptr;
+        for (const auto& o : mo.options)
+        {
+            if (o.mangroves == fvOptions::Option::Mangroves::source) src = &o;
+            if (o.mangroves == fvOptions::Option::Mangroves::turbulence) trb = &o;
+        }
+        check(src && trb, "both mangrove options are read");
+        check(src && src->mangroveRegions.size() == 1 && src->mangroveRegions[0].cells.size() == zoneSize
+              && std::fabs(src->mangroveRegions[0].Cd - 1.52) < 1e-15 && std::fabs(src->mangroveRegions[0].N - 560) < 1e-12,
+              "...the source's region over the zone, with its coefficients");
+        check(trb && std::fabs(trb->mangroveRegions[0].Cep - 3.5) < 1e-15, "...the turbulence model's Cep");
+        check(mo.firstUnsupported() == "multiphaseMangrovesSource",
+              "a driver that does not apply them is told they are not its own");
+        check(mo.firstUnsupported({"multiphaseMangrovesSource", "multiphaseMangrovesTurbulenceModel"}).empty(),
+              "...and one that names them is not");
+
+        // the momentum source refuses without the old velocity and the step
+        bool refusedNoOld = false;
+        {
+            FvVectorMatrix M;
+            M.diag.assign(nC, 0.0);
+            M.source.assign(nC, vector{0, 0, 0});
+            const std::vector<scalar> rho(static_cast<std::size_t>(nC), 1000.0);
+            try { fvOptions::addSup(mo, M, U, 0.0, g, true, &rho, &rho); }
+            catch (const std::exception& e)
+            {
+                refusedNoOld = std::string(e.what()).find("multiphaseMangrovesSource") != std::string::npos;
+            }
+        }
+        check(refusedNoOld, "the drag and added mass refuse without U.oldTime() and the step");
+
+        // the turbulence source: only the zone's cells, the density form refused
+        {
+            FvScalarMatrix K;
+            K.diag.assign(nC, 0.0);
+            K.source.assign(nC, 0.0);
+            fvOptions::addSup(mo, K, "k", U.internal, g, nullptr);
+            label touched = 0;
+            for (label c = 0; c < nC; ++c) touched += (K.diag[c] != 0.0) ? 1 : 0;
+            check(touched > 0 && touched <= (label)zoneSize, "k's source reaches the zone's cells and no others");
+            bool refusedRho = false;
+            const std::vector<scalar> rho(static_cast<std::size_t>(nC), 1000.0);
+            try { fvOptions::addSup(mo, K, "k", U.internal, g, &rho); }
+            catch (const std::exception&) { refusedRho = true; }
+            check(refusedRho, "the density-weighted form is refused");
+        }
+
+        // a region without a coefficient OpenFOAM reads with readEntry is refused by name
+        writeOptions("a 0.01; N 560; Cm 1;");
+        const fvOptions::OptionList bad = fvOptions::read(tmp.string(), m);
+        check(bad.firstUnsupported({"multiphaseMangrovesSource", "multiphaseMangrovesTurbulenceModel"}).find("has no `Cd`")
+              != std::string::npos, "a region without Cd is refused, naming it");
+        fs::remove_all(tmp);
     }
 
     std::printf("%s\n", g_fails == 0 ? "PASS" : "FAIL");

@@ -12,6 +12,21 @@ namespace fvOptions {
 
 namespace {
 
+// The tokens of a dictionary's own entry `key`, exactly as written, or null.
+const std::vector<std::string>* leafOf(
+    const FoamDict& d,
+    const std::string& key)
+{
+    for (const auto& l : d.leaves)
+    {
+        if (l.first == key)
+        {
+            return &l.second;
+        }
+    }
+    return nullptr;
+}
+
 // A `d [0 -2 0 0 0 0 0] (5e7 -1000 -1000)` entry: OpenFOAM's dimensioned<vector>. The dimension set is
 // skipped -- brae carries no dimension checking -- and the three numbers are the vector.
 bool readDimensionedVector(const FoamDict& d, const std::string& key, vector& out)
@@ -94,6 +109,18 @@ std::string OptionList::firstUnsupported(const std::vector<std::string>& impleme
 {
     for (const Option& o : options)
     {
+        // THE MANGROVES are implemented in this file but applied by interFoam's host loop only, which
+        // checks its options one by one. Every driver that asks this function treats an implemented
+        // option it does not recognise as a porosity (simpleFoamV2's device path builds one from D and
+        // F, zero here), so to them a mangrove option is reported as what it is: not theirs.
+        if (o.active && o.unsupported.empty() && o.mangroves != Option::Mangroves::none)
+        {
+            bool ok = false;
+            for (const std::string& t : implementedByCaller)
+                if (o.type == t) { ok = true; break; }
+            if (!ok) return o.type;
+            continue;
+        }
         if (!o.active || o.unsupported.empty()) continue;
         // Scanned rather than short-circuited on the FIRST match: a case can declare an option the
         // caller implements AND one it does not, and returning "" for the first would hide the second.
@@ -210,6 +237,88 @@ OptionList read(const std::string& caseDir, const PrimitiveMesh& m)
             list.options.push_back(o);
             continue;
         }
+        // THE MANGROVES. fv::option (not cellSetOption): the cells come from each region's cellZone,
+        // the coefficients from <type>Coeffs or the entry itself (fvOption.C, optionalSubDict), every one
+        // read with readEntry -- a missing one is fatal in OpenFOAM and refused here, by name.
+        if (o.type == "multiphaseMangrovesSource" || o.type == "multiphaseMangrovesTurbulenceModel")
+        {
+            const bool turb = (o.type == "multiphaseMangrovesTurbulenceModel");
+            const FoamDict* cc = d.subDict(o.type + "Coeffs");
+            const FoamDict& cs = cc ? *cc : d;
+            // the fields it applies to: U by default for the source (UNames, or `U`), epsilon AND k for
+            // the turbulence model (epsilonNames, or `epsilon`) -- an override names another field,
+            // which the caller would not know to hand it
+            if (!turb)
+            {
+                const std::vector<std::string>* un = leafOf(cs, "U");
+                if (leafOf(cs, "UNames") || (un && !(un->size() == 1 && (*un)[0] == "U")))
+                {
+                    o.unsupported = o.type + " applied to a field other than U (UNames/U)";
+                }
+            }
+            else if (leafOf(cs, "epsilonNames") || leafOf(cs, "epsilon"))
+            {
+                o.unsupported = o.type + " applied to named fields (epsilonNames/epsilon)";
+            }
+            const FoamDict* regions = cs.subDict("regions");
+            if (o.unsupported.empty() && !regions)
+            {
+                o.unsupported = o.type + " without `regions`";
+            }
+            if (o.unsupported.empty())
+            {
+                // regionsDict.toc(): the regions in the order they are written
+                for (const auto& r : regions->subs)
+                {
+                    Option::MangroveRegion mr;
+                    mr.name = r.first;
+                    const FoamDict& rd = r.second;
+                    const std::string zone = rd.wordOr("cellZone", "");
+                    const auto z = zones.find(zone);
+                    if (zone.empty() || z == zones.end())
+                    {
+                        o.unsupported = o.type + ": region `" + mr.name + "` names cellZone `" + zone
+                                      + "`, which the mesh does not have";
+                        break;
+                    }
+                    mr.cells = z->second;
+                    const std::vector<std::string> keys = turb
+                        ? std::vector<std::string>{"a", "N", "Ckp", "Cep", "Cd"}
+                        : std::vector<std::string>{"a", "N", "Cm", "Cd"};
+                    for (const std::string& k : keys)
+                    {
+                        if (!leafOf(rd, k))
+                        {
+                            o.unsupported = o.type + ": region `" + mr.name + "` has no `" + k + "`";
+                            break;
+                        }
+                    }
+                    if (!o.unsupported.empty())
+                    {
+                        break;
+                    }
+                    mr.a = rd.scalarOr("a", 1);
+                    mr.N = rd.scalarOr("N", 1);
+                    mr.Cd = rd.scalarOr("Cd", 1);
+                    if (turb)
+                    {
+                        mr.Ckp = rd.scalarOr("Ckp", 1);
+                        mr.Cep = rd.scalarOr("Cep", 1);
+                    }
+                    else
+                    {
+                        mr.Cm = rd.scalarOr("Cm", 1);
+                    }
+                    o.mangroveRegions.push_back(mr);
+                }
+            }
+            if (o.unsupported.empty())
+            {
+                o.mangroves = turb ? Option::Mangroves::turbulence : Option::Mangroves::source;
+            }
+            list.options.push_back(o);
+            continue;
+        }
         if (o.type != "explicitPorositySource")
         {
             o.unsupported = o.type.empty() ? std::string("(no type)") : o.type;
@@ -316,7 +425,9 @@ void addSup(
     const FvGeometry&             g,
     bool                          forceDimensions,
     const std::vector<scalar>*    rhoCell,
-    const std::vector<scalar>*    muCell)
+    const std::vector<scalar>*    muCell,
+    const std::vector<vector>*    UOld,
+    scalar                        deltaT)
 {
     // A force-dimensioned DarcyForchheimer without the per-cell fields cannot be computed -- the old
     // path took nu = 0 and no rho, which zeroes the Darcy half and under-weights the Forchheimer half
@@ -335,6 +446,51 @@ void addSup(
     {
         if (!o.active || !o.unsupported.empty()) continue;
         if (o.constraint != Option::Constraint::none) continue;   // constraints are not sources
+        if (o.mangroves == Option::Mangroves::turbulence) continue;  // k and epsilon, not U
+        if (o.mangroves == Option::Mangroves::source)
+        {
+            if (!rhoCell || !UOld || !(deltaT > scalar(0)))
+            {
+                throw std::runtime_error(
+                    "fvOptions addSup: `" + o.name + "` (multiphaseMangrovesSource) needs the density, "
+                    "U.oldTime() and the time step -- its added mass is rho*inertiaCoeff*ddt(U) "
+                    "(multiphaseMangrovesSource.C:125-143) -- and the caller supplied "
+                    + std::string(!rhoCell ? "no density" : !UOld ? "no old velocity" : "no time step") + ".");
+            }
+            // dragCoeff and inertiaCoeff: zero everywhere, then each region's cells ASSIGNED in order
+            // (a later region overwrites an earlier one on a shared cell, as OpenFOAM's loops do)
+            const std::size_t nC = U.internal.size();
+            std::vector<scalar> drag(nC, scalar(0));
+            std::vector<scalar> inertia(nC, scalar(0));
+            const scalar pi = 3.14159265358979323846;   // constant::mathematical::pi, M_PI
+            for (const Option::MangroveRegion& r : o.mangroveRegions)
+            {
+                for (const label c : r.cells)
+                {
+                    const vector& u = U.internal[c];
+                    drag[c] = 0.5*r.Cd*r.a*r.N*std::sqrt(u.x*u.x + u.y*u.y + u.z*u.z);
+                    inertia[c] = 0.25*(r.Cm + 1)*pi*r.a*r.a*r.N;
+                }
+            }
+            // eqn += -Sp(rho*drag, U) - rho*inertia*ddt(U), then UEqn == options: the two negations
+            // cancel, and -(A) - B == -(A + B) exactly, so the momentum matrix takes
+            //     diag   += V*(rho*drag) + (rDeltaT*V)*(rho*inertia)
+            //     source += ((rDeltaT*U0)*V)*(rho*inertia)
+            // with fvm::Sp's V*coeff and EulerDdtScheme::fvmDdt's rDeltaT*V and rDeltaT*U0*V, scaled
+            // after by the field the matrix is multiplied with
+            const scalar rDeltaT = scalar(1)/deltaT;
+            for (std::size_t c = 0; c < nC; ++c)
+            {
+                const scalar rd = (*rhoCell)[c]*drag[c];
+                const scalar ri = (*rhoCell)[c]*inertia[c];
+                const vector& u0 = (*UOld)[c];
+                UEqn.diag[c] += V[c]*rd + (rDeltaT*V[c])*ri;
+                UEqn.source[c].x += ((rDeltaT*u0.x)*V[c])*ri;
+                UEqn.source[c].y += ((rDeltaT*u0.y)*V[c])*ri;
+                UEqn.source[c].z += ((rDeltaT*u0.z)*V[c])*ri;
+            }
+            continue;
+        }
 
         // fixedCoeff's rho is the dict's rhoRef on a force-dimensioned equation and 1 otherwise -- it is
         // NOT the local density, which is easy to assume and wrong (fixedCoeff.C:202-207).
@@ -378,6 +534,51 @@ void addSup(
             UEqn.source[c].x -= V[c]*(a[0]*u.x + a[1]*u.y + a[2]*u.z);
             UEqn.source[c].y -= V[c]*(a[3]*u.x + a[4]*u.y + a[5]*u.z);
             UEqn.source[c].z -= V[c]*(a[6]*u.x + a[7]*u.y + a[8]*u.z);
+        }
+    }
+}
+
+void addSup(
+    const OptionList&           opts,
+    FvScalarMatrix&             eqn,
+    const std::string&          field,
+    const std::vector<vector>&  U,
+    const FvGeometry&           g,
+    const std::vector<scalar>*  rhoCell)
+{
+    const std::vector<scalar>& V = g.V();
+    for (const Option& o : opts.options)
+    {
+        if (!o.active || !o.unsupported.empty() || o.mangroves != Option::Mangroves::turbulence)
+        {
+            continue;
+        }
+        const bool eps = (field == "epsilon");
+        if (!eps && field != "k")
+        {
+            continue;   // fieldNames_ is epsilon and k (the read refuses any other)
+        }
+        if (rhoCell)
+        {
+            throw std::runtime_error(
+                "fvOptions addSup: `" + o.name + "` (multiphaseMangrovesTurbulenceModel) on a density-weighted "
+                "k-epsilon, addSup(rho, eqn) with -Sp(rho*coeff) -- no gate holds that lineage.");
+        }
+        // kCoeff = Ckp*Cd*a*N*|U|, epsilonCoeff = Cep*Cd*a*N*|U|, zero outside the regions
+        std::vector<scalar> coeff(U.size(), scalar(0));
+        for (const Option::MangroveRegion& r : o.mangroveRegions)
+        {
+            const scalar Cx = eps ? r.Cep : r.Ckp;
+            for (const label c : r.cells)
+            {
+                const vector& u = U[c];
+                coeff[c] = Cx*r.Cd*r.a*r.N*std::sqrt(u.x*u.x + u.y*u.y + u.z*u.z);
+            }
+        }
+        // eqn += -Sp(coeff, field): on the right of the equation, so the matrix takes +V*coeff
+        for (std::size_t c = 0; c < coeff.size(); ++c)
+        {
+            eqn.diag[c] += V[c]*coeff[c];
         }
     }
 }

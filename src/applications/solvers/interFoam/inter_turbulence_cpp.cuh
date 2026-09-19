@@ -54,6 +54,7 @@
 // wall-function blending other than the default binomial n = 2, wall-function coefficients other than
 // the defaults, and a moving mesh (y is taken once). The device loop runs kEpsilon's device twin,
 // device_inter_turbulence.cuh, and refuses kOmegaSST by name.
+#include "fvOptions_cpp.cuh"
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
 #include "fv_geometry.cuh"
@@ -187,6 +188,9 @@ struct InterTurbulenceStepInput
     const std::vector<std::vector<scalar>>* nuBnd = nullptr;
     scalar deltaT = 0;
     // every solve of the run, in order, for the solver-log gate
+    // fvOptions(epsilon) and fvOptions(k), kEpsilon.C:258/279: the mangroves' turbulence source. Null
+    // or empty is a case with none.
+    const cpu::fvOptions::OptionList* fvOptions = nullptr;
     std::vector<LinearSolveRecord>* epsilonLog = nullptr;
     std::vector<LinearSolveRecord>* kLog = nullptr;
     // kOmegaSST's first solve, omega before k as kOmegaSSTBase.C:555-607 has them

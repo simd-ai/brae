@@ -1,5 +1,6 @@
 // _cpp REFERENCE implementation -- see kEpsilon_cpp.cuh for the OpenFOAM provenance and the wall note.
 #include "kEpsilon_cpp.cuh"
+#include "pbicg.cuh"
 #include "bound_cpp.cuh"
 #include "limitedSchemes_cpp.cuh"
 #include "nut_wall_function.cuh"
@@ -289,6 +290,10 @@ void correct(
             return smoothSolver(A, psi, m, patches, which->symmetric, tol, relTol, maxIter, minIter,
                                 which->nSweeps);
         }
+        if (which && which->pbicgDILU)
+        {
+            return pbicgDILU(A, psi, m, patches, tol, relTol, maxIter, minIter);
+        }
         return pbicgstab(A, psi, m, patches, tol, relTol, maxIter, minIter);
     };
 
@@ -529,6 +534,9 @@ void correct(
             if (bounded) M.diag[c] -= divPhi[c] * V;
         }
 
+        // + fvOptions(alpha, rho, epsilon_), kEpsilon.C:258 -- the last term on the right. The density-
+        // weighted lineage is the rho form of addSup, which the option refuses.
+        if (fvOpts) cpu::fvOptions::addSup(*fvOpts, M, "epsilon", U.internal, g, comp ? comp->rho : nullptr);
         if (res && res->captureStages) captureSystem(M, patches, res->epsD0, res->epsSrc0);
         // kEpsilon.C:265-267 -- relax(), THEN fvOptions.constrain(), THEN boundaryManipulate(). These two
         // were the other way round here, and the difference is not the constrained cell itself: both
@@ -739,6 +747,8 @@ void correct(
             if (bounded) M.diag[c] -= divPhi[c] * V;
         }
 
+        // + fvOptions(alpha, rho, k_), kEpsilon.C:279
+        if (fvOpts) cpu::fvOptions::addSup(*fvOpts, M, "k", U.internal, g, comp ? comp->rho : nullptr);
         if (res && res->captureStages) captureSystem(M, patches, res->kD0, res->kSrc0);
         if (relaxEquationK) relaxMatrix(M, k, m, patches, relaxK);
         // fvOptions.constrain(kEqn), kEpsilon.C -- after relax(), as OpenFOAM has it.

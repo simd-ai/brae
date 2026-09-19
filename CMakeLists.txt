@@ -98,6 +98,7 @@ add_library(brae_core STATIC
     src/OpenFOAM/matrices/pcg.cu
     src/OpenFOAM/matrices/gamg.cu
     src/OpenFOAM/matrices/pbicgstab.cu
+    src/OpenFOAM/matrices/pbicg.cu
     src/OpenFOAM/matrices/smooth_solver_cpp.cu
     src/matrices/lduMatrix/solvers/GAMG/GAMGAgglomerations/pair_gamg_agglomeration_cpp.cu
     src/matrices/lduMatrix/solvers/GAMG/gamg_solver_cpp.cu
@@ -3506,6 +3507,15 @@ target_include_directories(test_inter_leakage_vs_openfoam PRIVATE ${BRAE_HEADER_
 target_link_libraries(test_inter_leakage_vs_openfoam PRIVATE brae_core)
 add_test(NAME interfoam_leakage_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_leakage_vs_openfoam.sh)
+
+# interFoam with the mangrove fvOptions against real OpenFOAM on waves/mangroveInteraction. The script
+# carries the measurements, the controls and the fail-proofs.
+add_executable(test_inter_mangrove_vs_openfoam tests/test_inter_mangrove_vs_openfoam.cu)
+target_include_directories(test_inter_mangrove_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_mangrove_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_mangrove_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_mangrove_vs_openfoam.sh)
 
 # ...and the wave boundary conditions (waveAlpha, waveVelocity) on laminar/waves/stokesI: fields, the
 # patch values the wave model assigns, its two derived constants and the ORDER it updates in, all

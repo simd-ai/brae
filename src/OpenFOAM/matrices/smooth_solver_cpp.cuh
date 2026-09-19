@@ -50,6 +50,8 @@ namespace brae {
 struct LinearSolverChoice
 {
     bool smoothSolver = false;
+    // OpenFOAM's PBiCG with DILU (pbicg.cuh); neither this nor smoothSolver means PBiCGStab
+    bool pbicgDILU = false;
     // symGaussSeidel (true) or GaussSeidel (false)
     bool symmetric = true;
     int nSweeps = 1;

@@ -2617,6 +2617,50 @@ COMPONENTS = {
                   "waterChannel's volumetric inlet carries no `value`, so its constructor had built the right one. "
                   "ALSO: the shared fvOptions reader looked in system/ before constant/, where "
                   "fv::options::createIOobject (fvOptions.C:46-84) looks in constant/ first. HOST ONLY SO FAR."),
+        dict(name="interFoam_mangroves", of_symbol="multiphaseMangrovesSource",
+             of_file="src/waveModels/fvOptions/multiphaseMangrovesSource/multiphaseMangrovesSource.C",
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/finiteVolume/cfdTools/general/fvOptions/fvOptions_cpp.cu",
+             validation="tests/interfoam_mangrove_vs_openfoam.sh, real OpenFOAM on laminar/waves/mangroveInteraction "
+                        "as Allrun meshes it (blockMesh, setFields, topoSet) with the block halved in each "
+                        "direction, 51,450 cells, the seaweed zone 14,700 of them; a Boussinesq paddle, "
+                        "shallowWaterAbsorption, kEpsilon with PBiCG/DILU; 450 fixed steps of 0.01 at the case's "
+                        "own tolerances. MEASURED: alpha 4.6e-14, p_rgh 3.8e-14, U 3.4e-12, k 1.7e-13, epsilon "
+                        "1.0e-13, nut 3.0e-13, every p_rgh, k and epsilon count and k's and epsilon's final "
+                        "residuals OpenFOAM's. CONTROLS: both options off, U 134%; the turbulence option off, k "
+                        "52%. BROKEN ONCE EACH (U / k): no added mass 2.2e-01; no drag 8.0e-01; drag without rho "
+                        "7.9e-01; Cm for Cm + 1 1.1e-01; Ckp and Cep swapped 9.9e-01; the turbulence sign flipped "
+                        "8.3e-01; no turbulence source 3.4e-01 / 5.2e-01. NOT DISCRIMINATED: the added mass on U "
+                        "rather than U.oldTime() (the same field at assembly with one outer corrector and no "
+                        "predictor). tests/test_fvoptions_cpp.cu holds the reading and the refusals. NOT CLAIMED, "
+                        "each refused: the density-weighted k-epsilon, any other closure under the turbulence "
+                        "option, a field-name override, and the device loop.",
+             note="TWO OPTIONS over each region's cellZone. multiphaseMangrovesSource: addSup(rho, eqn) adds "
+                  "-Sp(rho*0.5*Cd*a*N*|U|, U) - rho*0.25*(Cm + 1)*pi*a^2*N*ddt(U), which UEqn == options "
+                  "turns into diag += V*rho*drag + (rDeltaT*V)*rho*inertia and source += "
+                  "((rDeltaT*U0)*V)*rho*inertia, in OpenFOAM's operation order. "
+                  "multiphaseMangrovesTurbulenceModel: addSup(eqn) -- interFoam's k-epsilon is the "
+                  "incompressible lineage, alpha = rho = 1 -- adds -Sp(Ckp*Cd*a*N*|U|, k) and "
+                  "-Sp(Cep*Cd*a*N*|U|, epsilon), U looked up by name. Every region coefficient is readEntry "
+                  "in OpenFOAM and required here. firstUnsupported() still reports both types to every "
+                  "driver but interFoam's host loop, which checks its options itself: the drivers that ask "
+                  "treat an implemented option they do not recognise as a porosity. HOST ONLY SO FAR."),
+        dict(name="interFoam_PBiCG", of_symbol="PBiCG",
+             of_file="src/OpenFOAM/matrices/lduMatrix/solvers/PBiCG/PBiCG.C",
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/OpenFOAM/matrices/pbicg.cu",
+             validation="tests/interfoam_mangrove_vs_openfoam.sh: all 450 k and 450 epsilon solves take "
+                        "OpenFOAM's iteration count and end on its final residual. BROKEN ONCE EACH: "
+                        "PBiCGStab in its place, 76 of 450 k counts equal and U 9.2e-05; DILU's transpose sweep "
+                        "not transposed, the run fails. tests/interfoam_refusals.sh: PBiCGStab named for k is "
+                        "refused.",
+             note="PBiCG with the DILU preconditioner, transcribed from PBiCG.C and DILUPreconditioner.C: "
+                  "the direct and TRANSPOSE systems side by side (Amul/Tmul, precondition/preconditionT), "
+                  "the singularity break before the count moves. Not PBiCGStab, which brae already had and "
+                  "which stops at different iterates at the same tolerance. The sweeps run in face order: "
+                  "for any cell the subtractions arrive in the same face order as losortAddr's, so the bits "
+                  "are the same. Wired for interFoam's kEpsilon (LinearSolverChoice::pbicgDILU); the LES and "
+                  "kOmegaSST closures still refuse it. HOST ONLY SO FAR."),
         dict(name="interFoam_variableHeightFlowRate", of_symbol="variableHeightFlowRateInletVelocityFvPatchVectorField",
              of_file="src/finiteVolume/fields/fvPatchFields/derived/variableHeightFlowRateInletVelocity/"
                      "variableHeightFlowRateInletVelocityFvPatchVectorField.C",

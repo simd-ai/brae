@@ -254,7 +254,9 @@ FvVectorMatrix assembleUEqn(
         {
             mu[c] = rho[c] * (*in.nuLaminar)[c];
         }
-        fvOptions::addSup(*in.fvOptions, M, U, scalar(0), g, /*forceDimensions=*/true, &rho, &mu);
+        // ...and the mangroves' drag and added mass, whose ddt(U) reads U.oldTime() and the step
+        fvOptions::addSup(*in.fvOptions, M, U, scalar(0), g, /*forceDimensions=*/true, &rho, &mu,
+                          in.UOld, in.deltaT);
     }
 
     // UEqn.relax(). damBreak names `".*" 1`, which relaxEquation() finds, and relax(1) still applies the

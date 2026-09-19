@@ -64,7 +64,9 @@ GeometricField<scalar> readTurbulenceField(
 // The solver entry fvMatrix::solve() selects on the final outer corrector.
 SmoothLinearSolve readFinalSolve(
     const FoamDict& fvSolution,
-    const std::string& field)
+    const std::string& field,
+    // the kEpsilon closure also runs PBiCG with DILU (pbicg.cuh); the others do not
+    bool allowPBiCG = false)
 {
     const std::string name = field + "Final";
     const FoamDict* sv = fvSolution.subDict("solvers");
@@ -75,12 +77,13 @@ SmoothLinearSolve readFinalSolve(
             "runs on the final outer corrector, where fvMatrix::solve() selects the Final entry, and "
             "OpenFOAM stops without it.");
     SmoothLinearSolve s = SmoothLinearSolve::read(*d);
-    if (!s.gaussSeidel())
+    if (!s.gaussSeidel() && !(allowPBiCG && s.pbicgDILU()))
         throw std::runtime_error(
             std::string(WHO) + "`solvers/" + name + "` names `solver " + s.solver + "; smoother "
-            + s.smoother + ";`. brae's interFoam closure runs OpenFOAM's smoothSolver with the "
-            "GaussSeidel or symGaussSeidel smoother -- what every turbulent tutorial names -- and "
-            "nothing else: a substituted solver at the same tolerance stops somewhere else.");
+            + s.smoother + "; preconditioner " + s.preconditioner + ";`. brae's interFoam closure runs "
+            "OpenFOAM's smoothSolver with the GaussSeidel or symGaussSeidel smoother -- what every "
+            "turbulent tutorial names -- and, under kEpsilon, PBiCG with DILU; nothing else: a "
+            "substituted solver at the same tolerance stops somewhere else.");
     return s;
 }
 
@@ -513,8 +516,8 @@ InterTurbulence readInterTurbulence(
         }
     }
 
-    t.kSolveFinal = readFinalSolve(fvSolution, "k");
-    t.epsSolveFinal = readFinalSolve(fvSolution, "epsilon");
+    t.kSolveFinal = readFinalSolve(fvSolution, "k", /*allowPBiCG=*/true);
+    t.epsSolveFinal = readFinalSolve(fvSolution, "epsilon", /*allowPBiCG=*/true);
     t.kRelaxFinal = EquationRelax::read(eqAll, "kFinal");
     t.epsRelaxFinal = EquationRelax::read(eqAll, "epsilonFinal");
 
@@ -695,20 +698,22 @@ void correctInterTurbulence(
     // are read separately and must agree. Every tutorial writes them as one regex key.
     const SmoothLinearSolve& ks = t.kSolveFinal;
     const SmoothLinearSolve& es = t.epsSolveFinal;
-    if (ks.smoother != es.smoother || ks.tol != es.tol || ks.relTol != es.relTol
+    if (ks.solver != es.solver || ks.preconditioner != es.preconditioner
+     || ks.smoother != es.smoother || ks.tol != es.tol || ks.relTol != es.relTol
      || ks.maxIter != es.maxIter || ks.minIter != es.minIter || ks.nSweeps != es.nSweeps)
         throw std::runtime_error(
             std::string(WHO) + "fvSolution gives kFinal and epsilonFinal different solver settings; "
             "the closure takes one set for both equations.");
     LinearSolverChoice which;
-    which.smoothSolver = true;
+    which.pbicgDILU = ks.pbicgDILU();
+    which.smoothSolver = !which.pbicgDILU;
     which.symmetric = (ks.smoother == "symGaussSeidel");
     which.nSweeps = ks.nSweeps;
 
     kEpsilonRef::KEResiduals res;
     kEpsilonRef::correct(*in.U, t.k, t.epsilon, t.nut, *eqnFlux, scalar(0), m, g, patches,
                          t.epsRelaxFinal.factor, t.kRelaxFinal.factor, ks.tol, ks.relTol, ks.maxIter,
-                         t.coeffs, &res, /*bounded=*/false, /*dropTerm=*/0, &comp, /*fvOpts=*/nullptr,
+                         t.coeffs, &res, /*bounded=*/false, /*dropTerm=*/0, &comp, in.fvOptions,
                          t.epsRelaxFinal.on, t.kRelaxFinal.on, /*constrainBeforeWall=*/true,
                          /*limitedLinear=*/false, /*limiterCoeff=*/scalar(1), /*limGradK=*/scalar(0),
                          ks.minIter, &sel, /*linearUpwind=*/false, /*luGradK=*/scalar(0), &which);

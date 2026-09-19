@@ -73,6 +73,11 @@
 // axisymmetric wedge -- whose host matrix coefficients and gradient patch value it took to get there.
 // tests/interfoam_les_vs_openfoam.sh holds LES/nozzleFlow2D against OpenFOAM; `-device` refuses LES.
 //
+// AND the mangrove fvOptions, on the host -- multiphaseMangrovesSource on U, and
+// multiphaseMangrovesTurbulenceModel on k and epsilon under kEpsilon, whose k and epsilon may be solved
+// with PBiCG and DILU: waves/mangroveInteraction, held by tests/interfoam_mangrove_vs_openfoam.sh.
+// `-device` refuses them by name.
+//
 // AND a coincident cyclicACMI pair, on the host -- a createBaffles baffle whose `scale` (a constant, a
 // table or a coded per-face PatchFunction1) opens and shuts faces with time: RAS/damBreakLeakage, held by
 // tests/interfoam_leakage_vs_openfoam.sh. `-device` refuses it by name.

@@ -110,6 +110,20 @@ cp -r "$BK/0.orig" "$BK/0"
 sed -i 's/^endTime .*/endTime         0.0002;/; s/^deltaT .*/deltaT          1e-4;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
     "$BK/system/controlDict"
 
+# ...and laminar/waves/mangroveInteraction, for the mangrove fvOptions, meshed as Allrun does on a block
+# a fifth of the tutorial's in each direction
+SRCG="$TUT/multiphase/interFoam/laminar/waves/mangroveInteraction"
+[ -d "$SRCG" ] || { echo "SKIP: mangroveInteraction tutorial not found at $SRCG"; exit 77; }
+BG="$W/baseMangrove"
+cp -r "$SRCG" "$BG" || exit 1
+cp -r "$BG/0.orig" "$BG/0"
+sed -i 's/(350 28 42)/(70 6 8)/' "$BG/system/blockMeshDict"
+( cd "$BG" && blockMesh > log.blockMesh 2>&1 && setFields > log.setFields 2>&1 && topoSet > log.topoSet 2>&1 ) \
+    || { echo "SKIP: blockMesh/setFields/topoSet failed on mangroveInteraction"; exit 77; }
+sed -i 's/^startFrom .*/startFrom       startTime;/; s/^endTime .*/endTime         0.02;/; s/^deltaT .*/deltaT          0.01;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
+    "$BG/system/controlDict"
+python3 -c "import re; p='$BG/system/controlDict'; t=open(p).read(); t=re.sub(r'\nfunctions\s*\{.*\n\}\s*\n', '\n', t, flags=re.S); open(p,'w').write(t)"
+
 # ...and LES/nozzleFlow2D, for LES kEqn on a wedge, meshed as its Allrun does, two steps at a fixed 1e-9
 SRCL="$TUT/multiphase/interFoam/LES/nozzleFlow2D"
 [ -d "$SRCL" ] || { echo "SKIP: nozzleFlow2D tutorial not found at $SRCL"; exit 77; }
@@ -408,6 +422,19 @@ arm les_linearUpwindK       refused "neither \`Gauss upwind\` nor"     "" "sed -
 arm les_cellLimitedGradU    refused "Gauss linear 1\` is not ported"  "" "sed -i 's/^\\( *default  *\\)Gauss linear;/\\1cellLimited Gauss linear 1;/' system/fvSchemes"
 BASE="$B"
 
+# the mangrove fvOptions: they run under kEpsilon with PBiCG; each coefficient OpenFOAM reads with
+# readEntry is required, a missing zone is refused, a field-name override and another closure are not taken
+BASE="$BG"
+MG_SRC="python3 -c \"import re; p='system/fvOptions'; t=open(p).read(); i=t.index('TurbulenciaMangroves'); "
+arm mg_runs                 runs    -                        "" true
+arm mg_noZone               refused "names cellZone \`c9\`"   "" "sed -i '0,/cellZone        c0;/s//cellZone        c9;/' system/fvOptions"
+arm mg_noCd                 refused "has no \`Cd\`"           "" "sed -i '0,/Cd              1.52;/s///' system/fvOptions"
+arm mg_UNames               refused "UNames"                 "" "sed -i '0,/regions/s//UNames (U);\n        regions/' system/fvOptions"
+arm mg_epsilonNames         refused "epsilonNames"           "" "${MG_SRC}t=t[:i]+t[i:].replace('regions', 'epsilonNames (epsilon);\\n        regions', 1); open(p,'w').write(t)\""
+arm mg_laminar              refused "multiphaseMangrovesTurbulenceModel" "" "sed -i 's/^simulationType .*/simulationType laminar;/' constant/turbulenceProperties"
+arm mg_kPBiCGStab           refused "PBiCGStab"              "" "sed -i 's/solver  *PBiCG;/solver          PBiCGStab;/' system/fvSolution"
+BASE="$B"
+
 # the coded cyclicACMI baffle: it runs; the rescale point is ported for MULESCorr and one sub-cycle only;
 # the coded scale refuses what OpenFOAM would compile against its own headers, and a name its shim lacks
 BASE="$BK"
@@ -422,6 +449,9 @@ BASE="$B"
 if [ $HAVE_GPU = 1 ]; then
     BASE="$BL"
     arm device_les          refused "the case is LES kEqn" "-device" true
+    # the device loop's UEqn applies no fvOption, and refuses the mangroves by name
+    BASE="$BG"
+    arm device_mangrove     refused "Mangroves"             "-device" true
     # the device loop is handed the ACMI pair uncoupled, and refuses it by name
     BASE="$BK"
     arm device_leak         refused "coupled_half0"         "-device" true

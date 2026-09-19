@@ -20,6 +20,8 @@ struct SmoothLinearSolve
 {
     std::string solver;
     std::string smoother;
+    // a Krylov solver's preconditioner, when it is named as a word (`preconditioner DILU;`)
+    std::string preconditioner;
     scalar tol = 1e-6;
     scalar relTol = 0;
     int maxIter = 1000;
@@ -31,12 +33,18 @@ struct SmoothLinearSolve
     {
         return solver == "smoothSolver" && (smoother == "symGaussSeidel" || smoother == "GaussSeidel");
     }
+    // PBiCG with DILU (pbicg.cuh) -- waves/mangroveInteraction's k and epsilon
+    bool pbicgDILU() const
+    {
+        return solver == "PBiCG" && preconditioner == "DILU";
+    }
 
     static SmoothLinearSolve read(const FoamDict& d)
     {
         SmoothLinearSolve s;
         s.solver = d.wordOr("solver", "");
         s.smoother = d.wordOr("smoother", "");
+        s.preconditioner = d.wordOr("preconditioner", "");
         s.tol = d.scalarOr("tolerance", scalar(1e-6));
         s.relTol = d.scalarOr("relTol", scalar(0));
         s.maxIter = static_cast<int>(d.scalarOr("maxIter", scalar(1000)));

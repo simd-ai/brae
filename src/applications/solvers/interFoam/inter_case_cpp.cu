@@ -1024,8 +1024,25 @@ InterFields buildInterFields(const std::string&          caseDir,
     {
         if (!o.active) continue;
         const bool darcyForchheimer = o.unsupported.empty() && !o.rotorDisk && !o.actuationDisk
-                                   && !o.fixedCoeff && o.constraint == fvOptions::Option::Constraint::none;
+                                   && !o.fixedCoeff && o.constraint == fvOptions::Option::Constraint::none
+                                   && o.mangroves == fvOptions::Option::Mangroves::none;
         if (darcyForchheimer) continue;
+        // the mangroves: the drag and added mass on U, and the turbulence source on k and epsilon --
+        // laminar/waves/mangroveInteraction's pair. The turbulence one reaches k and epsilon through
+        // kEpsilon's fvOptions(k)/fvOptions(epsilon); under any other closure it would reach a k
+        // equation no gate holds, or none at all, so it is taken with kEpsilon only.
+        if (o.unsupported.empty() && o.mangroves == fvOptions::Option::Mangroves::source) continue;
+        if (o.unsupported.empty() && o.mangroves == fvOptions::Option::Mangroves::turbulence)
+        {
+            if (f.turbulence.on && f.turbulence.model == InterRasModel::KEpsilon)
+            {
+                continue;
+            }
+            throw std::runtime_error(
+                "brae interFoam: fvOptions has `" + o.name + "` (multiphaseMangrovesTurbulenceModel), which "
+                "adds to the k and epsilon equations; brae applies it under RAS kEpsilon only, and this case "
+                "runs " + std::string(f.turbulence.on ? "another closure" : "laminar") + ".");
+        }
         const std::string what = !o.unsupported.empty() ? o.unsupported
                                : o.fixedCoeff ? std::string("explicitPorositySource with the fixedCoeff model")
                                : o.type;
@@ -1033,7 +1050,8 @@ InterFields buildInterFields(const std::string&          caseDir,
             "brae interFoam: fvOptions has an active option `" + o.name + "` (" + what + "). interFoam "
             "applies fvOptions to UEqn as `== fvOptions(rho, U)`, constrains the matrix with them and "
             "corrects U after every corrector; brae's interFoam carries explicitPorositySource with "
-            "DarcyForchheimer -- RAS/angledDuct's, gated against OpenFOAM -- and nothing else.");
+            "DarcyForchheimer -- RAS/angledDuct's -- and the mangrove pair -- waves/mangroveInteraction's -- "
+            "both gated against OpenFOAM, and nothing else.");
     }
     bool anyFvOption = false;
     for (const fvOptions::Option& o : f.fvOptions.options)

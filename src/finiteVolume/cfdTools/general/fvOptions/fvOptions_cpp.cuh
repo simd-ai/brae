@@ -88,6 +88,29 @@ struct Option
     tensor alpha{};
     tensor beta{};
     scalar rhoRef = 1.0;
+
+    // THE MANGROVE PAIR (src/waveModels/fvOptions): a vegetation drag and added mass on U, and the
+    // turbulence it produces on k and epsilon, both over cellZones listed under `regions`.
+    //   multiphaseMangrovesSource.C:36-101      dragCoeff = 0.5*Cd*a*N*|U|, inertiaCoeff =
+    //                                           0.25*(Cm + 1)*pi*a^2*N, per region, assigned in order
+    //   multiphaseMangrovesSource.C:125-143     addSup(rho, eqn): eqn += -Sp(rho*dragCoeff, U)
+    //                                                                   - rho*inertiaCoeff*ddt(U)
+    //   multiphaseMangrovesTurbulenceModel.C    kCoeff = Ckp*Cd*a*N*|U|, epsilonCoeff = Cep*Cd*a*N*|U|;
+    //                                           addSup(eqn): eqn += -Sp(coeff, k or epsilon)
+    enum class Mangroves { none, source, turbulence };
+    Mangroves mangroves = Mangroves::none;
+    struct MangroveRegion
+    {
+        std::string        name;
+        std::vector<label> cells;
+        scalar a = 1;
+        scalar N = 1;
+        scalar Cm = 1;
+        scalar Cd = 1;
+        scalar Ckp = 1;
+        scalar Cep = 1;
+    };
+    std::vector<MangroveRegion> mangroveRegions;
 };
 
 struct OptionList
@@ -129,7 +152,24 @@ void addSup(
     // Passing forceDimensions=true with a DF option and NO muCell is refused -- the previous behaviour
     // was nu = 0, which zeroed the whole Darcy term and ran the Forchheimer half without rho, silently.
     const std::vector<scalar>*    rhoCell = nullptr,
-    const std::vector<scalar>*    muCell  = nullptr);
+    const std::vector<scalar>*    muCell  = nullptr,
+    // U.oldTime() and the time step, for the one source with a time derivative in it -- the mangroves'
+    // added mass, rho*inertiaCoeff*ddt(U) (Euler). A mangrove source without them, or without rhoCell,
+    // is refused: a steady driver has no ddt to give, and dropping the term would be a different case.
+    const std::vector<vector>*    UOld    = nullptr,
+    scalar                        deltaT  = 0);
+
+// fvOptions(k) / fvOptions(epsilon) for a SCALAR transport equation, `field` its name: the mangroves'
+// turbulence source, -Sp(coeff, field), moved to the matrix as diag += V*coeff. U is the registry's `U`,
+// as multiphaseMangrovesTurbulenceModel looks it up. `rhoCell` non-null is the density-weighted lineage
+// (addSup(rho, eqn)), which no gate holds and is refused.
+void addSup(
+    const OptionList&           opts,
+    FvScalarMatrix&             eqn,
+    const std::string&          field,
+    const std::vector<vector>&  U,
+    const FvGeometry&           g,
+    const std::vector<scalar>*  rhoCell = nullptr);
 
 // fvOptions.constrain(eqn) for a SCALAR equation. `field` is the name the equation solves ("e"/"h" for
 // energy, "k", "epsilon", ...); a constraint that does not name it does nothing. The energy equation

@@ -784,6 +784,7 @@ RunReport runInterFoam(
                     ti.nu = &f.nu;
                     ti.nuBnd = &f.nuBnd;
                     ti.deltaT = rep.deltaT;
+                    ti.fvOptions = f.fvOptions.empty() ? nullptr : &f.fvOptions;
                     ti.epsilonLog = &rep.epsilonSolves;
                     ti.omegaLog = &rep.omegaSolves;
                     ti.kLog = &rep.kSolves;
