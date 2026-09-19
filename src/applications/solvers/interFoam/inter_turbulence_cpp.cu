@@ -2,6 +2,7 @@
 #include "inter_turbulence_cpp.cuh"
 #include "foam_field_reader.cuh"
 #include "cellLimitedGrad_cpp.cuh"
+#include "patch_wave_cpp.cuh"
 #include "bound_cpp.cuh"
 #include "cell_wall_dist.cuh"
 #include "kEpsilon_cpp.cuh"
@@ -281,7 +282,8 @@ InterTurbulence readInterTurbulence(
     const std::vector<FvPatch>& patches,
     label nCells,
     const PrimitiveMesh* mesh,
-    const FvGeometry* geometry)
+    const FvGeometry* geometry,
+    const std::vector<label>* sharedWallDistPatches)
 {
     InterTurbulence t;
     const std::string path = caseDir + "/constant/momentumTransport";
@@ -470,7 +472,37 @@ InterTurbulence readInterTurbulence(
                     + *name + "` in its `phi` entry; the turbulence closure hands its patches phi only.");
             }
         }
-        t.yCell = cellWallDist(*mesh, *geometry, patches);
+        if (sharedWallDistPatches && !sharedWallDistPatches->empty())
+        {
+            // the motion solver's wallDist (InterTurbulence::wallDistPatchIDs): meshWave with correctWalls
+            // over its patches, read from fvSchemes' `patchDist`, which the motion solver has checked
+            t.wallDistPatchIDs = *sharedWallDistPatches;
+            t.yCell = patchWave(*mesh, *geometry, patches, t.wallDistPatchIDs, true).distance;
+        }
+        else
+        {
+            // kOmegaSST's own: wallDist(mesh) with no default method, so fvSchemes' wallDist dictionary
+            // MUST name one (patchDistMethod.C:64-76 reads `method` MUST_READ when the default is empty);
+            // meshWave's correctWalls defaults true; updateInterval (default 1) matters on a moving mesh
+            const FoamDict schemes = readDict(caseDir + "/system/fvSchemes");
+            const FoamDict* wd = schemes.subDict("wallDist");
+            const std::string method = wd ? wd->wordOr("method", "") : std::string();
+            if (method.empty())
+                throw std::runtime_error(
+                    std::string(WHO) + "kOmegaSST needs fvSchemes' `wallDist { method ...; }`; OpenFOAM reads it "
+                    "with no default and stops without it.");
+            if (method != "meshWave")
+                throw std::runtime_error(
+                    std::string(WHO) + "fvSchemes names `wallDist { method " + method + "; }`. kOmegaSST's "
+                    "wall distance is ported as meshWave (patchDistMethods/meshWave) only.");
+            const std::string cw = wd->wordOr("correctWalls", "true");
+            if (cw == "false" || cw == "no" || cw == "off")
+                throw std::runtime_error(
+                    std::string(WHO) + "fvSchemes sets `wallDist { correctWalls " + cw + "; }`; brae's "
+                    "meshWave always corrects the near-wall cells.");
+            t.wallDistUpdateInterval = static_cast<label>(wd->scalarOr("updateInterval", 1));
+            t.yCell = cellWallDist(*mesh, *geometry, patches);
+        }
 
         t.kSolveFinal = readFinalSolve(fvSolution, "k");
         t.omegaSolveFinal = readFinalSolve(fvSolution, "omega");
@@ -603,6 +635,28 @@ void interNuEff(
 }
 
 
+void moveInterTurbulence(
+    InterTurbulence&            t,
+    const PrimitiveMesh&        m,
+    const FvGeometry&           g,
+    const std::vector<FvPatch>& patches)
+{
+    if (!t.on || t.model != InterRasModel::KOmegaSST) return;
+    if (!t.wallDistPatchIDs.empty())
+    {
+        t.yCell = patchWave(m, g, patches, t.wallDistPatchIDs, true).distance;
+        return;
+    }
+    // updateInterval N recomputes on every Nth time index only, and keeps the stale distance between
+    if (t.wallDistUpdateInterval != 1)
+        throw std::runtime_error(
+            std::string(WHO) + "fvSchemes sets `wallDist { updateInterval "
+            + std::to_string(t.wallDistUpdateInterval) + "; }` on a moving mesh; only 1, the default, "
+            "is ported.");
+    t.yCell = cellWallDist(m, g, patches);
+}
+
+
 void correctInterTurbulence(
     InterTurbulence& t,
     const InterTurbulenceStepInput& in,
@@ -645,6 +699,8 @@ void correctInterTurbulence(
         sstComp.nuBnd = in.nuBnd;
         sstComp.rDeltaT = scalar(1) / in.deltaT;
         sstComp.nutPhi = in.phi;
+        sstComp.V0 = in.V0;
+        sstComp.meshPhi = in.meshPhi;
         const SmoothLinearSolve& ks = t.kSolveFinal;
         const SmoothLinearSolve& os = t.omegaSolveFinal;
         if (ks.smoother != os.smoother || ks.tol != os.tol || ks.relTol != os.relTol

@@ -162,6 +162,16 @@
 # V0 AGAINST V in fvm::ddt and MULES, and Vsc's interpolation inside a sub-cycle, change the rigid tanks'
 # answer by 1e-15 and no less -- every cell keeps its volume -- and are gated by `solitary`, whose
 # cells change theirs (the deforming-mesh arms above).
+#
+# PROFILE pistonSST: waves/waveMakerPiston made kOmegaSST -- the paddle a `wall`, so the closure's wall
+# distance moves with it, and the top an ordinary patch -- with k and omega solved to 1e-12; its control is
+# the laminar piston. kOmegaSST on a moving mesh takes the old volumes in fvm::ddt, the absolute flux in divU,
+# and y recomputed after every motion; and under displacementLaplacian y is NOT the distance to the walls:
+# the inverseDistance diffusivity registers the `wallDist` mesh object over its own patches first, and
+# kOmegaSSTBase's wallDist::New(mesh) finds that one (MeshObject::New looks up the type name alone).
+# MEASURED: k 8.6e-12, omega 2.4e-12, nut 3.0e-10, U 1.2e-10; the closure moves OpenFOAM's U by 1.9.
+# BROKEN ONCE EACH (nut): y from the wall patches 6.4e-01, V0 dropped 2.0e-03, divU relative 4.8e-03,
+# y not recomputed 9.5e-04.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_moving_vs_openfoam"
@@ -173,7 +183,8 @@ LAM="$TUT/multiphase/interFoam/laminar"
 [ -d "$LAM/testTubeMixer" ]   || { echo "SKIP: testTubeMixer tutorial not found under $LAM"; exit 77; }
 [ -f "$OFBASHRC" ]            || { echo "SKIP: real OpenFOAM not available"; exit 77; }
 
-W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+W=${KEEP_W:-$(mktemp -d)}
+[ -n "${KEEP_W:-}" ] || trap 'rm -rf "$W"' EXIT
 
 set +u
 # shellcheck disable=SC1091
@@ -320,6 +331,49 @@ else:
             assert k == 1, 'U internalField not found'
         open(p, 'w').write(t)
 PYEOF
+    if [ "$profile" = pistonSST ]; then
+        PROFILE="$profile" python3 - "$C" <<'PYEOF' || { echo "FAIL: staging kOmegaSST into $name"; return 1; }
+import os, re, sys
+d = sys.argv[1]
+def sub(path, pat, rep):
+    t = open(path).read()
+    t2, k = re.subn(pat, rep, t, count=1)
+    assert k == 1, (path, pat)
+    open(path, 'w').write(t2)
+# THE PADDLE A WALL, so kOmegaSST's wall distance moves with it -- and the top, a `wall` in the tutorial
+# with an atmosphere's conditions on it, an ordinary patch
+bm = os.path.join(d, 'system/blockMeshDict')
+sub(bm, r'(leftwall\s*\{\s*type\s+)patch;', r'\1wall;')
+sub(bm, r'(top\s*\{\s*type\s+)wall;', r'\1patch;')
+sub(os.path.join(d, 'constant/turbulenceProperties'), r'simulationType\s+laminar;',
+    'simulationType  RAS;\n\nRAS\n{\n    RASModel        kOmegaSST;\n    turbulence      on;\n}')
+sc = os.path.join(d, 'system/fvSchemes')
+sub(sc, r'(div\(rhoPhi,U\)[^\n]*\n)', r'\1    div(phi,k)      Gauss upwind;\n    div(phi,omega)  Gauss upwind;\n')
+open(sc, 'a').write('\nwallDist\n{\n    method meshWave;\n}\n')
+# k and omega converged, as p_rgh is: at 1e-14 both codes ran k to its 1000-sweep cap
+fs = os.path.join(d, 'system/fvSolution')
+sub(fs, r'\n    U\n', '\n    "(k|omega).*"\n    {\n        solver          smoothSolver;\n'
+    '        smoother        symGaussSeidel;\n        tolerance       1e-12;\n        relTol          0;\n'
+    '    }\n\n    U\n')
+hdr = ('FoamFile\n{\n    version 2.0;\n    format ascii;\n    class volScalarField;\n    object %s;\n}\n'
+       'dimensions %s;\ninternalField uniform %s;\nboundaryField\n{\n%s}\n')
+def bf(wall, top):
+    s = ''.join('    %s { %s }\n' % (w, wall) for w in ('bottom1', 'bottom2', 'leftwall'))
+    s += '    top { %s }\n    rightwall { type zeroGradient; }\n    "(front|back)" { type empty; }\n' % top
+    return s
+for name, dim, v, wall, top in [
+        ('k', '[0 2 -2 0 0 0 0]', '1e-4', 'type kqRWallFunction; value uniform 1e-4;',
+         'type inletOutlet; inletValue uniform 1e-4; value uniform 1e-4;'),
+        ('omega', '[0 0 -1 0 0 0 0]', '1', 'type omegaWallFunction; value uniform 1;',
+         'type inletOutlet; inletValue uniform 1; value uniform 1;'),
+        ('nut', '[0 2 -1 0 0 0 0]', '0', 'type nutkWallFunction; value uniform 0;',
+         'type calculated; value uniform 0;')]:
+    body = bf(wall, top)
+    if name == 'nut':
+        body = body.replace('rightwall { type zeroGradient; }', 'rightwall { type calculated; value uniform 0; }')
+    open(os.path.join(d, '0', name), 'w').write(hdr % (name, dim, v, body))
+PYEOF
+    fi
     ( cd "$C" && blockMesh > log.blockMesh 2>&1 ) || { echo "FAIL: blockMesh [$name]"; tail -20 "$C/log.blockMesh"; return 1; }
     if [ -f "$C/system/snappyHexMeshDict" ]; then
         mkdir -p "$C/constant/triSurface"
@@ -370,6 +424,7 @@ stage solitaryStatic waves/waveMakerSolitary 0.01 30 solitaryStatic || rc=1
 stage solitary       waves/waveMakerSolitary 0.01 30 solitary       || rc=1
 stage pistonStatic   waves/waveMakerPiston   0.01 30 pistonStatic   || rc=1
 stage piston         waves/waveMakerPiston   0.01 30 piston         || rc=1
+stage pistonSST      waves/waveMakerPiston   0.01 30 pistonSST      || rc=1
 stage flapStatic     waves/waveMakerFlap     0.01 30 flapStatic     || rc=1
 stage flap           waves/waveMakerFlap     0.01 30 flap           || rc=1
 stage multiPistonStatic waves/waveMakerMultiPaddlePiston 0.01 30 multiPistonStatic || rc=1
@@ -410,6 +465,7 @@ gate sloshing2DCorrectPhi 0.01  10 sloshing2DCorrectPhi sloshing2DStatic || rc=1
 gate cylinderCorrectPhi   0.001 10 cylinderCorrectPhi   cylinderStatic   || rc=1
 gate solitary       0.01  30 solitary       solitaryStatic || rc=1
 gate piston         0.01  30 piston         pistonStatic   || rc=1
+gate pistonSST      0.01  30 pistonSST      piston         || rc=1
 gate flap           0.01  30 flap           flapStatic     || rc=1
 gate multiPiston    0.01  30 multiPiston    multiPistonStatic || rc=1
 gate multiFlap      0.01  30 multiFlap      multiFlapStatic   || rc=1

@@ -7,6 +7,7 @@
 #include "mrf_read.cuh"   // readCellZones
 #include "read_surface_field.cuh"
 #include "scheme_parse.cuh"
+#include "patch_set.cuh"
 #include <filesystem>
 #include <utility>
 #include <map>
@@ -1023,9 +1024,16 @@ InterFields buildInterFields(const std::string&          caseDir,
 
     // Turbulence. createFields.H:78 constructs it AFTER the mixture, because validate() -- in the one
     // lineage that calls it -- evaluates the nut wall functions with the mixture's nu at the wall.
+    // the wallDist the motion solver registers first, under displacementLaplacian's inverseDistance
+    // diffusivity (InterTurbulence::wallDistPatchIDs)
+    std::vector<label> sharedWallDist;
+    if (f.dynamicMesh && f.dynamicMesh->displacementSolver())
+    {
+        sharedWallDist = patchSet(patches, f.dynamicMesh->displacementSolver()->diffusivityPatches());
+    }
     f.turbulence = readInterTurbulence(caseDir, startDir, fvSolution, f.ddtU == DdtScheme::Euler,
                                        f.laplacianScheme.corrected, f.laplacianScheme.limitCoeff,
-                                       patches, nC, &m, &g);
+                                       patches, nC, &m, &g, &sharedWallDist);
     if (f.turbulence.on && !f.pimple.turbOnFinalIterOnly && f.pimple.nOuterCorrectors > 1)
         throw std::runtime_error(
             "brae interFoam: `turbOnFinalIterOnly no` with nOuterCorrectors "
@@ -1125,16 +1133,16 @@ InterFields buildInterFields(const std::string&          caseDir,
             "MRF.relative(Sf & U_b) there (constrainPressureI.H), and this port's subtracts Sf & U_b; "
             "mixerVessel2D's walls are zeroGradient, so nothing gates the difference.");
     }
-    // A MOVING MESH UNDER kEpsilon: its fvm::ddt takes V0 in the source and its divU the absolute flux
-    // (kEpsilonRef::Compressible::V0, meshPhi), and the wall functions' y is recomputed from the moved
-    // geometry at every correct (nearWallDist::movePoints). kOmegaSST's wall distance is meshWave's
-    // wallDist, taken once here, and the LES closure's moving-mesh terms are not carried: both refused.
-    if (f.dynamicMesh && f.turbulence.on && f.turbulence.model != InterRasModel::KEpsilon)
+    // A MOVING MESH UNDER kEpsilon OR kOmegaSST: fvm::ddt takes V0 in the source and divU the absolute
+    // flux (the Compressible V0 and meshPhi of each), the wall functions' y is recomputed from the moved
+    // geometry at every correct (nearWallDist::movePoints), and kOmegaSST's meshWave wallDist after every
+    // motion (moveInterTurbulence). The LES closure's moving-mesh terms are not carried: refused.
+    if (f.dynamicMesh && f.turbulence.on && f.turbulence.model == InterRasModel::KEqnLES)
     {
         throw std::runtime_error(
-            "brae interFoam: the mesh moves and the closure is not kEpsilon. kEpsilon carries the moving "
-            "mesh's old volumes and absolute flux; the others' moving-mesh terms (kOmegaSST's wallDist, "
-            "the LES filter's) are not ported. Refused rather than run the closure on the mesh as it started.");
+            "brae interFoam: the mesh moves and the closure is LES kEqn. kEpsilon and kOmegaSST carry the "
+            "moving mesh's old volumes, absolute flux and wall distance; the LES filter's moving-mesh terms "
+            "are not ported. Refused rather than run the closure on the mesh as it started.");
     }
     // A WAVE CONDITION ON A MOVING MESH IS NOT REFUSED. OpenFOAM's wave models take their geometry once,
     // at construction (waveModel::initialiseGeometry: the patch's orientation, each face's height and

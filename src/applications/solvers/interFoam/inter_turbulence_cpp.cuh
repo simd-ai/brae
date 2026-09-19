@@ -113,8 +113,20 @@ struct InterTurbulence
     GeometricField<scalar> omega;
     KOmegaSSTCoeffs sstCoeffs;
     // wallDist::New(mesh).y(), the CELL wall distance F1 and F2 take -- not the near-wall face
-    // distance the wall functions use. Taken once: kOmegaSST on a moving mesh is refused.
+    // distance the wall functions use. Recomputed by moveInterTurbulence after every mesh motion, as
+    // fvMesh::movePoints has wallDist::movePoints do; fvSchemes' `wallDist { updateInterval }` is kept
+    // to refuse anything but 1 there.
     std::vector<scalar> yCell;
+    label wallDistUpdateInterval = 1;
+    // THE PATCHES y IS MEASURED FROM. Empty: kOmegaSST's own wallDist, every `wall` patch. Non-empty: the
+    // wallDist the motion solver's inverseDistance diffusivity registered first -- MeshObject::New finds
+    // an object by its TYPE name alone (MeshObject.C), the motion solver is built before the turbulence
+    // model (createDynamicFvMesh.H before createFields.H), and inverseDistanceDiffusivity::correct asks for
+    // wallDist::New(mesh, meshWave, patchSet(<its patches>)). kOmegaSSTBase's wallDist::New(mesh) then
+    // returns THAT object, and F1/F2 see the distance to the diffusivity's patches only. MEASURED on the
+    // piston made kOmegaSST (tests/interfoam_moving_vs_openfoam.sh `pistonSST`): OpenFOAM's y is 0.01,
+    // 0.03, 0.05 ... away from the paddle and 1.01 at x = 1, a cell whose bottom wall is 0.0025 below it.
+    std::vector<label> wallDistPatchIDs;
     GeometricField<scalar> nut;
     // kEqn's: its coefficients, the filter width (constant on a mesh that does not move), and k's
     // solve on the final outer corrector
@@ -152,7 +164,10 @@ InterTurbulence readInterTurbulence(
     label nCells,
     // kOmegaSST's cell wall distance needs the mesh; null is a caller that can only run kEpsilon
     const PrimitiveMesh* mesh = nullptr,
-    const FvGeometry* geometry = nullptr);
+    const FvGeometry* geometry = nullptr,
+    // the patches of a wallDist the motion solver registered first (InterTurbulence::wallDistPatchIDs);
+    // null or empty: kOmegaSST builds its own over the `wall` patches
+    const std::vector<label>* sharedWallDistPatches = nullptr);
 
 // turbulence->validate(), which incompressibleInterPhaseTransportModel's constructor calls in the
 // UNIFORM lineage only. Does nothing in the variable one, and nothing when laminar.
@@ -203,6 +218,15 @@ struct InterTurbulenceStepInput
 };
 
 // turbulence->correct(), interFoam.C:171.
+// The mesh has moved (fvMesh::movePoints): kOmegaSST's wall distance is an UpdateableMeshObject whose
+// movePoints re-runs its method on the moved points (wallDist.C:193-221). Does nothing for the other
+// closures, which build no wallDist.
+void moveInterTurbulence(
+    InterTurbulence&            t,
+    const PrimitiveMesh&        m,
+    const FvGeometry&           g,
+    const std::vector<FvPatch>& patches);
+
 void correctInterTurbulence(
     InterTurbulence& t,
     const InterTurbulenceStepInput& in,

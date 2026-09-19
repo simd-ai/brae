@@ -324,6 +324,8 @@ RunReport runInterFoam(
                     // one p_rgh left, and the move marks it for rebuilding.
                     const bool finalIteration = (outerOfStep >= lc.nOuterCorrectors - 1);
                     dyn->update(rep.time, rep.deltaT, rep.steps, finalIteration, &gamgCache);
+                    // ...and fvMesh::movePoints moves the mesh objects with it: kOmegaSST's wall distance
+                    moveInterTurbulence(f.turbulence, m, g, patches);
                     // cyclicAMIPolyPatch::initMovePoints marks the AMI out of date, and the next AMI()
                     // recomputes it on the moved points: before anything below interpolates across it
                     if (amiPairs && !amiPairs->empty())

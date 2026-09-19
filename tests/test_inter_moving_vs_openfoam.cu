@@ -393,6 +393,78 @@ int main(
         report("rho", fin.rho, ofDir + "/rho.dump", false);
     }
 
+    // THE CLOSURE ON THE MOVING MESH, under `pistonSST`: k, omega and nut against OpenFOAM's, and every
+    // k and omega solve. kOmegaSST's moving-mesh terms are the old volumes in fvm::ddt, the absolute flux
+    // in divU and the wall distance recomputed after every motion; the script's fixture makes the piston
+    // a wall so the last of these moves.
+    const bool sst = fin.turbulence.on && fin.turbulence.model == InterRasModel::KOmegaSST;
+    Diff dK;
+    Diff dOm;
+    Diff dNut;
+    if (sst)
+    {
+        const std::vector<scalar> ofK = cellValues(readField<scalar>(ofDir + "/k"), nC);
+        const std::vector<scalar> ofOm = cellValues(readField<scalar>(ofDir + "/omega"), nC);
+        const std::vector<scalar> ofNut = cellValues(readField<scalar>(ofDir + "/nut"), nC);
+        dK = compare(fin.turbulence.k.internal, ofK);
+        dOm = compare(fin.turbulence.omega.internal, ofOm);
+        dNut = compare(fin.turbulence.nut.internal, ofNut);
+        std::printf("  k:       relative %.4e   (k up to %.4e)\n", (double)dK.rel(), (double)dK.refMax);
+        std::printf("  omega:   relative %.4e   (omega up to %.4e)\n", (double)dOm.rel(), (double)dOm.refMax);
+        std::printf("  nut:     relative %.4e   (nut up to %.4e)\n", (double)dNut.rel(), (double)dNut.refMax);
+        // WHERE: the worst cell of each, and the patch it touches if any, for taking a gap apart
+        auto where = [&](const char* name, const std::vector<scalar>& mine, const std::vector<scalar>& of)
+        {
+            std::size_t at = 0;
+            scalar worst = -1;
+            for (std::size_t c = 0; c < of.size() && c < mine.size(); ++c)
+            {
+                const scalar e = std::fabs(mine[c] - of[c]);
+                if (e > worst)
+                {
+                    worst = e;
+                    at = c;
+                }
+            }
+            std::string touches = "interior";
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                for (label i = 0; i < patches[pi].size; ++i)
+                {
+                    if (static_cast<std::size_t>(patches[pi].faceCells[i]) == at)
+                    {
+                        touches = patches[pi].name;
+                    }
+                }
+            }
+            std::printf("    %-6s worst at cell %zu (%.4f %.4f %.4f), %s: brae %.10e OpenFOAM %.10e\n", name, at,
+                        (double)g.C()[at].x, (double)g.C()[at].y, (double)g.C()[at].z, touches.c_str(),
+                        (double)mine[at], (double)of[at]);
+        };
+        where("k", fin.turbulence.k.internal, ofK);
+        where("omega", fin.turbulence.omega.internal, ofOm);
+        where("nut", fin.turbulence.nut.internal, ofNut);
+        // ...and the wall distance, when `checkMesh -writeFields '(wallDistance)' -time <end>` has written
+        // OpenFOAM's for the moved mesh (a diagnostic; the script does not run it)
+        if (std::filesystem::exists(ofDir + "/wallDistance"))
+        {
+            const std::vector<scalar> ofY = cellValues(readField<scalar>(ofDir + "/wallDistance"), nC);
+            const Diff dY = compare(fin.turbulence.yCell, ofY);
+            std::printf("  y:       relative %.4e   (y up to %.4e)\n", (double)dY.rel(), (double)dY.refMax);
+            where("y", fin.turbulence.yCell, ofY);
+        }
+        const std::vector<LinearSolveRecord> ofKs = brae::gatecheck::readOfSolves(logPath, "k");
+        const std::vector<LinearSolveRecord> ofOms = brae::gatecheck::readOfSolves(logPath, "omega");
+        failures += brae::gatecheck::compareSolves("host", r.kSolves, ofKs, nSteps, "k",
+                                                   scalar(1e-10), scalar(1e-6));
+        failures += brae::gatecheck::compareSolves("host", r.omegaSolves, ofOms, nSteps, "omega",
+                                                   scalar(1e-10), scalar(1e-6));
+        // MEASURED over 30 steps: k 8.6e-12, omega 2.4e-12, nut 3.0e-10 relative; bounded at about 30x
+        check("k agrees with OpenFOAM's relatively", dK.rel() < scalar(3e-10));
+        check("omega agrees with OpenFOAM's relatively", dOm.rel() < scalar(1e-10));
+        check("nut agrees with OpenFOAM's relatively", dNut.rel() < scalar(1e-8));
+    }
+
     // BOUNDS: see the script for what was measured
     check("alpha agrees with OpenFOAM's absolutely", dA.linf < scalar(1e-9));
     check("p_rgh agrees with OpenFOAM's relatively", dP.rel() < scalar(1e-8));
@@ -405,9 +477,12 @@ int main(
     {
         const Diff cU = compare(cellValues(readField<vector>(staticDir + "/U"), nC), ofU);
         const Diff cA = compare(cellValues(readField<scalar>(staticDir + "/" + fin.alphaName), nC), ofAlpha);
-        std::printf("  CONTROL: OpenFOAM with a static mesh against OpenFOAM with the motion, U relative %.4e, "
-                    "alpha %.4e\n", (double)cU.rel(), (double)cA.linf);
-        check("the motion moves OpenFOAM's own U far more than brae is from it",
+        // under `pistonSST` the control is the laminar piston: what the closure itself moves
+        std::printf("  CONTROL: OpenFOAM %s against OpenFOAM %s, U relative %.4e, alpha %.4e\n",
+                    sst ? "laminar" : "with a static mesh", sst ? "with kOmegaSST" : "with the motion",
+                    (double)cU.rel(), (double)cA.linf);
+        check(sst ? "the closure moves OpenFOAM's own U far more than brae is from it"
+                  : "the motion moves OpenFOAM's own U far more than brae is from it",
               cU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)));
     }
     else

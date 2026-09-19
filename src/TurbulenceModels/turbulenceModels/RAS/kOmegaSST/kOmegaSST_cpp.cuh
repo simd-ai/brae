@@ -198,6 +198,13 @@ struct Compressible
     // neg(phi), then the mixed blend of the inletValue and the new cell nut. Null refuses a case that has
     // one rather than leave it stale.
     const SurfaceScalarField*               nutPhi   = nullptr;
+    // A MOVING MESH (EulerDdtScheme::fvmDdt under mesh().moving()): the ddt source takes the old volumes,
+    // rDeltaT*psi.oldTime()*V0, where the diagonal keeps V; and divU is the divergence of the ABSOLUTE
+    // flux, fvc::div(fvc::absolute(this->phi(), U)) = div(phi + mesh.phi()) (kOmegaSSTBase.C:517-520),
+    // while fvm::div and `bounded` keep the relative phi. Null on a static mesh. kEpsilon's are the same
+    // (kEpsilon_cpp.cuh Compressible).
+    const std::vector<scalar>*              V0       = nullptr;
+    const SurfaceScalarField*               meshPhi  = nullptr;
 };
 
 // kOmegaSSTLM's three virtual overrides of this model, supplied by the DERIVED model rather than

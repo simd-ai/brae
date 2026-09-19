@@ -4,6 +4,7 @@
 #include "fvc.cuh"
 #include "fvm.cuh"
 #include "geometric_field.cuh"
+#include "patch_set.cuh"
 #include "patch_wave_cpp.cuh"
 #include "primitive_patch_cpp.cuh"
 #include "solution_directions.cuh"
@@ -77,30 +78,6 @@ vector uniformVector(
         throw std::runtime_error(std::string(WHO) + where + "'s `" + key + "` is not a vector.");
     }
     return vector{c[0], c[1], c[2]};
-}
-
-bool patchMatches(
-    const FvPatch& p,
-    const std::string& key)
-{
-    if (key == p.name) return true;
-    for (const std::string& grp : p.inGroups)
-    {
-        if (key == grp) return true;
-    }
-    try
-    {
-        const std::regex re = compileFoamRegex(key);
-        if (std::regex_match(p.name, re)) return true;
-        for (const std::string& grp : p.inGroups)
-        {
-            if (std::regex_match(grp, re)) return true;
-        }
-    }
-    catch (...)
-    {
-    }
-    return false;
 }
 
 GamgControls readSolverEntry(
@@ -403,19 +380,9 @@ void DisplacementLaplacianFvMotionSolver::attach(
         cellDisplacementBoundary_[pi].assign(static_cast<std::size_t>(patches[pi].size), vector{0, 0, 0});
     }
 
-    // polyBoundaryMesh::patchSet(patchNames): names, groups and patterns
-    diffusivityPatchIDs_.clear();
-    for (std::size_t pi = 0; pi < patches.size(); ++pi)
-    {
-        for (const std::string& key : diffusivityPatches_)
-        {
-            if (patchMatches(patches[pi], key))
-            {
-                diffusivityPatchIDs_.push_back(static_cast<label>(pi));
-                break;
-            }
-        }
-    }
+    // polyBoundaryMesh::patchSet(patchNames): names, groups and patterns -- the same selection interFoam
+    // makes for kOmegaSST, which shares this wallDist (InterTurbulence::wallDistPatchIDs)
+    diffusivityPatchIDs_ = patchSet(patches, diffusivityPatches_);
     if (diffusivityPatchIDs_.empty())
     {
         throw std::runtime_error(

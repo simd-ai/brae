@@ -105,6 +105,11 @@ public:
         return cellDisplacementBoundary_;
     }
     // the wall distance the last solve's diffusivity came from
+    // `diffusivity inverseDistance (<patches>)`: the names, groups or patterns it lists
+    const std::vector<std::string>& diffusivityPatches() const
+    {
+        return diffusivityPatches_;
+    }
     const std::vector<scalar>& y() const
     {
         return y_;

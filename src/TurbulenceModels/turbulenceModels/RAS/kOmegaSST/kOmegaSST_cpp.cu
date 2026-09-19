@@ -441,8 +441,29 @@ void correct(
 
     // divU takes the VOLUMETRIC flux -- fvc::absolute(this->phi(), U) -- while fvm::div and the
     // `bounded` Sp below take the MASS flux. Two different fields in the compressible lineage.
-    const std::vector<scalar> divU =
-        fvc::div(comp && comp->phiByRho ? *comp->phiByRho : phi, m, g, patches);
+    const SurfaceScalarField& phiVol = (comp && comp->phiByRho) ? *comp->phiByRho : phi;
+    std::vector<scalar> divU;
+    if (comp && comp->meshPhi)
+    {
+        // fvc::absolute(phi, U): phi + mesh.phi() on every face, the boundary included
+        SurfaceScalarField phiAbs = phiVol;
+        for (std::size_t f = 0; f < phiAbs.internal.size(); ++f)
+        {
+            phiAbs.internal[f] += comp->meshPhi->internal[f];
+        }
+        for (std::size_t pi = 0; pi < phiAbs.boundary.size(); ++pi)
+        {
+            for (std::size_t i = 0; i < phiAbs.boundary[pi].size(); ++i)
+            {
+                phiAbs.boundary[pi][i] += comp->meshPhi->boundary[pi][i];
+            }
+        }
+        divU = fvc::div(phiAbs, m, g, patches);
+    }
+    else
+    {
+        divU = fvc::div(phiVol, m, g, patches);
+    }
     // fvc::div(alphaRhoPhi), for `bounded Gauss <scheme>`: boundedConvectionScheme subtracts
     // Sp(surfaceIntegrate(faceFlux), vf) with the flux the equation is CONVECTED by, which is the mass
     // flux. Identical to divU when comp is null.
@@ -675,7 +696,7 @@ void correct(
             if (rDeltaT > 0.0)   // fvm::ddt(alpha, rho, omega_), kOmegaSSTBase.C:572
             {
                 M.diag[c]   += rDeltaT * rc * V;
-                M.source[c] += rDeltaT * rhoOldAt(c) * omegaOld[c] * V;
+                M.source[c] += rDeltaT * rhoOldAt(c) * omegaOld[c] * ((comp && comp->V0) ? (*comp->V0)[c] : V);
             }
             // - SuSp((F1 - 1)*CDkOmega/omega, omega)
             const scalar sp2 = rc * (f1[c] - 1.0) * CD[c] / omega.internal[c];
@@ -828,7 +849,7 @@ void correct(
             if (rDeltaT > 0.0)   // fvm::ddt(alpha, rho, k_), kOmegaSSTBase.C:602
             {
                 M.diag[c]   += rDeltaT * rc * V;
-                M.source[c] += rDeltaT * rhoOldAt(c) * kOld[c] * V;
+                M.source[c] += rDeltaT * rhoOldAt(c) * kOld[c] * ((comp && comp->V0) ? (*comp->V0)[c] : V);
             }
             if (bounded) M.diag[c] -= divPhi[c] * V;                 // - Sp(fvc::div(alphaRhoPhi), k)
         }

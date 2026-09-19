@@ -277,9 +277,13 @@ arm ras_otherModel          refused "realizableKE"            "" "sed -i 's/RASM
 # OpenFOAM). RAS/damBreak made kOmegaSST: `density variable` with it is refused, and so is each thing
 # the closure does not carry -- on a base that RUNS, so a refusal is the one edit's.
 arm sst_variableDensity     refused "density variable"        "" "sed -i 's/RASModel .*/RASModel        kOmegaSST;/' constant/turbulenceProperties"
-SSTBASE="sed -i 's/RASModel .*/RASModel        kOmegaSST;/; /^density /d' constant/turbulenceProperties; sed -i 's/div(rhoPhi,k) .*/div(phi,k) Gauss upwind;/; s/div(rhoPhi,epsilon) .*/div(phi,omega) Gauss upwind;/' system/fvSchemes; sed -i 's/(U|k|epsilon)/(U|k|omega)/' system/fvSolution; sed 's/epsilonWallFunction/omegaWallFunction/; s/object  *epsilon;/object      omega;/; s/\\[0 2 -3 0 0 0 0\\]/[0 0 -1 0 0 0 0]/' 0/epsilon > 0/omega"
+SSTBASE="sed -i 's/RASModel .*/RASModel        kOmegaSST;/; /^density /d' constant/turbulenceProperties; sed -i 's/div(rhoPhi,k) .*/div(phi,k) Gauss upwind;/; s/div(rhoPhi,epsilon) .*/div(phi,omega) Gauss upwind;/' system/fvSchemes; sed -i 's/(U|k|epsilon)/(U|k|omega)/' system/fvSolution; sed 's/epsilonWallFunction/omegaWallFunction/; s/object  *epsilon;/object      omega;/; s/\\[0 2 -3 0 0 0 0\\]/[0 0 -1 0 0 0 0]/' 0/epsilon > 0/omega; printf '\\nwallDist { method meshWave; }\\n' >> system/fvSchemes"
 arm sst_baseline            runs    -                        "" "$SSTBASE"
 arm sst_noOmega             refused "does not exist"          "" "$SSTBASE; rm 0/omega"
+# kOmegaSST's own wallDist reads `method` with no default (patchDistMethod.C): OpenFOAM stops without it
+arm sst_noWallDist          refused "wallDist { method ...; }" "" "$SSTBASE; sed -i '/^wallDist/d' system/fvSchemes"
+arm sst_wallDistPoisson     refused "wallDist { method Poisson; }" "" "$SSTBASE; sed -i 's/^wallDist .*/wallDist { method Poisson; }/' system/fvSchemes"
+arm sst_wallDistNoCorrect   refused "correctWalls false"     "" "$SSTBASE; sed -i 's/^wallDist .*/wallDist { method meshWave; correctWalls false; }/' system/fvSchemes"
 arm sst_decayControl        refused "decayControl"            "" "$SSTBASE; sed -i 's/RASModel .*/&\\n    kOmegaSSTCoeffs { decayControl yes; kInf 1e-5; omegaInf 1; }/' constant/turbulenceProperties"
 arm sst_F3                  refused "F3"                      "" "$SSTBASE; sed -i 's/RASModel .*/&\\n    kOmegaSSTCoeffs { F3 yes; }/' constant/turbulenceProperties"
 arm sst_blending            refused "blending stepwise"       "" "$SSTBASE; sed -i '0,/omegaWallFunction;/ s/omegaWallFunction;/omegaWallFunction;\\n        blending        stepwise;/' 0/omega"
@@ -377,8 +381,11 @@ arm moving_noRefPoint       refused "neither pRefCell nor pRefPoint" "" "sed -i 
 arm moving_refPointOutside  refused "lies in no cell"         "" "sed -i 's/^\( *\)pRefPoint .*/\1pRefPoint (1 1 1);/' system/fvSolution"
 arm moving_refCell          runs    -                        "" "sed -i 's/^\( *\)pRefPoint .*/\1pRefCell 3;/' system/fvSolution"
 KEFIELDS='for n, dim, t, v in [("k", "[0 2 -2 0 0 0 0]", "kqRWallFunction", "0.1"), ("epsilon", "[0 2 -3 0 0 0 0]", "epsilonWallFunction", "0.1"), ("nut", "[0 2 -1 0 0 0 0]", "nutkWallFunction", "0")]: open("0/" + n, "w").write("FoamFile { version 2.0; format ascii; class volScalarField; object %s; }\ndimensions %s;\ninternalField uniform %s;\nboundaryField { walls { type %s; value uniform %s; } }\n" % (n, dim, v, t, v))'
-# kEpsilon on a moving mesh is ported (tests/interfoam_ami_vs_openfoam.sh); kOmegaSST is refused
-arm moving_SST              refused "the closure is not kEpsilon" "" "sed -i 's/^simulationType .*/simulationType RAS;\nRAS { RASModel kOmegaSST; turbulence on; }/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,U) .*/&\n    div(phi,k) Gauss upwind;\n    div(phi,omega) Gauss upwind;/' system/fvSchemes; sed -i 's/(U|k|epsilon)/XX/; s/^    U$/    \"(U|k|omega).*\"/' system/fvSolution; python3 -c '${KEFIELDS//epsilon/omega}'"
+# kEpsilon (tests/interfoam_ami_vs_openfoam.sh) and kOmegaSST (tests/interfoam_moving_vs_openfoam.sh
+# `pistonSST`) run on a moving mesh; a wallDist updateInterval other than 1 there is refused, and so is LES
+MOVSST="sed -i 's/^simulationType .*/simulationType RAS;\nRAS { RASModel kOmegaSST; turbulence on; }/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,U) .*/&\n    div(phi,k) Gauss upwind;\n    div(phi,omega) Gauss upwind;/' system/fvSchemes; printf '\\nwallDist { method meshWave; }\\n' >> system/fvSchemes; sed -i 's/(U|k|epsilon)/XX/; s/^    U$/    \"(U|k|omega).*\"/' system/fvSolution; python3 -c '${KEFIELDS//epsilon/omega}'"
+arm moving_SST              runs    -                        "" "$MOVSST"
+arm moving_SSTInterval      refused "updateInterval 2"       "" "$MOVSST; sed -i 's/^wallDist .*/wallDist { method meshWave; updateInterval 2; }/' system/fvSchemes"
 arm moving_RAS              runs    -                        "" "sed -i 's/^simulationType .*/simulationType RAS;\nRAS { RASModel kEpsilon; turbulence on; }/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,U) .*/&\n    div(phi,k) Gauss upwind;\n    div(phi,epsilon) Gauss upwind;/' system/fvSchemes; sed -i 's/(U|k|epsilon)/XX/; s/^    U$/    \"(U|k|epsilon).*\"/' system/fvSolution; python3 -c '$KEFIELDS'"
 # a dictionary-form preconditioner other than GAMG or DIC is substituted under a notice, not run silently
 arm moving_precondDILU      runs    "preconditioner { DILU ... }" "" "sed -i '/p_rghFinal/,/^    }/ s/preconditioner  *GAMG;/preconditioner DILU;/' system/fvSolution"
