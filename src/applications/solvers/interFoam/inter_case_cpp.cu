@@ -8,6 +8,7 @@
 #include "read_surface_field.cuh"
 #include "scheme_parse.cuh"
 #include <filesystem>
+#include <utility>
 #include <map>
 
 namespace brae {
@@ -406,13 +407,12 @@ void refuseUncorrectedOnSkewMesh(
         "differ on this mesh. Refused rather than run `orthogonal` under the name `uncorrected`.");
 }
 
-// gradSchemes. interFoam's gradients -- grad(U) for the momentum scheme and the viscous term's
-// explicit half, grad(p_rgh), grad(rho) and grad(alpha) for the non-orthogonal corrections, and
-// grad(alpha) for the interface normal -- are Gauss linear here, with ONE exception: `grad(U)` may be
-// `cellLimited Gauss linear <k>` (RAS/mixerVesselAMI), which InterFields::gradULimitK carries to every
-// consumer of that entry. 40 of the 44 tutorials write `default Gauss linear;` and nothing else; any
-// other limited or least-squares gradient is refused, because a gradient the case limits and brae does
-// not is a different discretisation that converges.
+// gradSchemes. Every entry must be one of the four shapes the host operators take -- `Gauss linear`,
+// `leastSquares`, or `cellLimited` over either -- and each gradient interFoam takes is resolved by the
+// name OpenFOAM asks for (InterFields::gradU, gradAlpha1/2, gradPrgh, gradPcorr, gradRho; the interface
+// normal's `nHat`), then `default`. Any other shape (cellMDLimited, faceLimited, pointCellsLeastSquares,
+// fourth, ...) is refused, because a gradient the case asks for and brae does not take is a different
+// discretisation that converges.
 void refuseUnportedGradSchemes(const std::string& fvSchemesText)
 {
     const std::string blk = fvSchemesBlock(fvSchemesText, "gradSchemes");
@@ -454,17 +454,23 @@ void refuseUnportedGradSchemes(const std::string& fvSchemesText)
                 collapsed += ch;
             }
         }
-        if (key == "grad(U)" && collapsed.rfind("cellLimited Gauss linear ", 0) == 0)
+        std::string base = collapsed;
+        if (base.rfind("cellLimited ", 0) == 0)
         {
-            continue;
+            // `cellLimited <base> <k>`: the coefficient is the last token
+            base = base.substr(12);
+            const std::size_t lastSp = base.find_last_of(' ');
+            const std::string k = (lastSp == std::string::npos) ? std::string() : base.substr(lastSp + 1);
+            char* end = nullptr;
+            std::strtod(k.c_str(), &end);
+            base = (!k.empty() && end && *end == '\0') ? base.substr(0, lastSp) : std::string("?");
         }
-        if (collapsed != "Gauss linear")
+        if (base != "Gauss linear" && base != "leastSquares")
         {
             throw std::runtime_error(
                 "brae interFoam: fvSchemes gradSchemes `" + key + " " + collapsed + "` is not ported. "
-                "Every gradient this solver takes -- grad(U), grad(p_rgh), grad(rho), grad(alpha) -- is "
-                "Gauss linear and unlimited; a limited or least-squares gradient is a different "
-                "discretisation. 40 of the 44 shipped tutorials write `default Gauss linear;` alone.");
+                "The host operators take `Gauss linear`, `leastSquares`, and `cellLimited` over either; "
+                "another scheme or limiter is a different discretisation.");
         }
     }
 }
@@ -689,8 +695,38 @@ InterFields buildInterFields(const std::string&          caseDir,
         f.snGradScheme = readNonOrthScheme(all, "snGradSchemes");
         refuseUncorrectedOnSkewMesh(f.laplacianScheme, f.snGradScheme, m, g);
         refuseUnportedGradSchemes(all);
+        // each gradient by the name its call site asks for (fvc::grad(vf) -> `grad(<vf.name()>)`)
+        auto choiceOf = [](const FieldGradScheme& s)
+        {
+            GradChoice c;
+            c.leastSquares = s.leastSquares;
+            c.cellLimitK = s.cellLimitK;
+            return c;
+        };
         const FieldGradScheme gu = parseFieldGradScheme(caseDir, "U");
         f.gradULimitK = gu.cellLimitK;
+        f.gradULeastSq = gu.leastSquares;
+        f.gradAlpha1 = choiceOf(parseFieldGradScheme(caseDir, f.alphaName));
+        f.gradAlpha2 = choiceOf(parseFieldGradScheme(caseDir, "alpha." + f.mixture.phase2Name));
+        f.gradPrgh = choiceOf(parseFieldGradScheme(caseDir, "p_rgh"));
+        f.gradPcorr = choiceOf(parseFieldGradScheme(caseDir, "pcorr"));
+        f.gradRho = choiceOf(parseFieldGradScheme(caseDir, "rho"));
+        // interfaceProperties.C:96: fvc::grad(alpha1_, "nHat") -- the entry NAMED nHat
+        f.interface.nHatGrad = choiceOf(parseNamedGradScheme(caseDir, "nHat"));
+        // limitedLinear on U limits on magSqr(U) and takes fvc::grad(lPhi) -- `grad(magSqr(U))`
+        // (LimitedScheme.C calcLimiter) -- which the momentum's limitedLinear branch computes Gauss
+        // linear only. Any other resolution of that entry is refused rather than run as Gauss.
+        if (f.divRhoPhiU == DivScheme::limitedLinear)
+        {
+            const FieldGradScheme gm = parseFieldGradScheme(caseDir, "magSqr(U)");
+            if (!gm.gaussLinear || !gm.unsupportedLimiter.empty() || gm.leastSquares || gm.cellLimitK > 0)
+            {
+                throw std::runtime_error(
+                    "brae interFoam: `div(rhoPhi,U) Gauss limitedLinear` takes its limiter's gradient "
+                    "through `grad(magSqr(U)) " + gm.raw + "`; that limiter's gradient is ported as "
+                    "`Gauss linear` only.");
+            }
+        }
     }
 
     // fvSolution's PIMPLE block -- see InterFields::pimple for why momentumPredictor is read rather
@@ -1180,6 +1216,39 @@ InterFields buildInterFields(const std::string&          caseDir,
                         + q.type + "). cellLimitedGrad's coupled range is gated across a cyclicAMI only; refused "
                         "rather than run ungated.");
             }
+            // THE OTHER GRADIENTS' ENTRIES. Every one is gated on damBreak (`gradLsqLimited`, `nHatLimited`),
+            // which has no coupled patch; the limiter's coupled range is the one limitPass that grad(U)'s
+            // cyclicAMI gate holds, and nothing holds a least-squares stencil across any coupled patch.
+            {
+                const std::pair<const char*, GradChoice> sites[] = {
+                    {"grad(alpha)", f.gradAlpha1},
+                    {"grad(alpha2)", f.gradAlpha2},
+                    {"grad(p_rgh)", f.gradPrgh},
+                    {"grad(pcorr)", f.gradPcorr},
+                    {"grad(rho)", f.gradRho},
+                    {"nHat", f.interface.nHatGrad},
+                };
+                for (const FvPatch& q : patches)
+                {
+                    if (!q.coupled) continue;
+                    const bool ami = q.type == "cyclicAMI";
+                    if (f.gradULeastSq)
+                        throw std::runtime_error(
+                            "brae interFoam: fvSchemes takes grad(U) leastSquares across the coupled patch `" + q.name
+                            + "` (" + q.type + "). No gate holds a least-squares stencil across a coupled patch; "
+                            "refused rather than run ungated.");
+                    for (const auto& site : sites)
+                    {
+                        if (site.second.leastSquares || (!ami && site.second.cellLimitK > scalar(0)))
+                            throw std::runtime_error(
+                                std::string("brae interFoam: fvSchemes takes ") + site.first + " "
+                                + (site.second.leastSquares ? "leastSquares" : "cellLimited")
+                                + " across the coupled patch `" + q.name + "` (" + q.type + "). The gradient "
+                                "entries are gated on damBreak, which has none, and the limiter's coupled range "
+                                "across a cyclicAMI only; refused rather than run ungated.");
+                    }
+                }
+            }
             // gaussLaplacianScheme adds the deferred non-orthogonal correction on a coupled face too (its
             // correction vectors are not zero there): fvm::laplacianNonOrthSource assembles it and
             // laplacianCorrFluxCoupled hands it to the pressure flux
@@ -1232,7 +1301,7 @@ InterFields buildInterFields(const std::string&          caseDir,
     // step, but UEqn would read it on the very first outer iteration if it did not exist.
     {
         SurfaceScalarField alphaPhi;
-        fluxWithScheme(f.phi, f.alpha1, f.divPhiAlpha, m, g, patches, alphaPhi);
+        fluxWithScheme(f.phi, f.alpha1, f.divPhiAlpha, m, g, patches, alphaPhi, f.gradAlpha1);
         massFlux(alphaPhi, f.phi, f.mixture.phases.rho1, f.mixture.phases.rho2, f.rhoPhi);
     }
     // ...and now that rhoPhi exists, the patches that NAME it learn it

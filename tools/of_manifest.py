@@ -3764,7 +3764,22 @@ COMPONENTS = {
                   "the ordinary single-phase model by default). solvers/p_rgh and p_rghFinal are read "
                   "as the case names them: PCG with DIC, or GAMG with its controls (interFoam_GAMG); "
                   "anything else still substitutes PBiCGStab under a notice. constant/dynamicMeshDict is read here "
-                  "too (interFoam_solidBodyMotion), and p_rgh's need for a reference (interFoam_pressureReference)."),
+                  "too (interFoam_solidBodyMotion), and p_rgh's need for a reference (interFoam_pressureReference). "
+                  "GRADIENT SCHEMES (2026-09-19): each fvc::grad is resolved by the name its call site asks for "
+                  "-- grad(U), grad(alpha.<phase1>), grad(alpha.<phase2>), grad(p_rgh), grad(pcorr), grad(rho), "
+                  "and interfaceProperties' `nHat` -- then `default`, and carried to that site as a GradChoice "
+                  "(gradSchemes/grad_choice.cuh): the vanLeer limiters, snGrad's and the laplacians' corrections, "
+                  "CorrectPhi and the curvature. The host takes `Gauss linear`, `leastSquares` and `cellLimited` "
+                  "over either; anything else is refused by name, and so is a non-Gauss grad(magSqr(U)) under "
+                  "limitedLinear (its limiter is ported Gauss only). GATED in tests/interfoam_dambreak_vs_openfoam.sh "
+                  "`gradLsqLimited` on a sheared, predictor-on, moving-start damBreak (every site live there, "
+                  "alpha 1.9e-14), each site broken once and red, and `nHatLimited` at the small step (alpha "
+                  "5.6e-13). A LIMITED nHat is not held at the big step, and not for a defect: brae's limited K "
+                  "from OpenFOAM's own 17-digit post-MULES alpha agrees to 3e-16 relative, but the limiter turns "
+                  "MULES' bulk round-off (alpha 1 +- 1e-7) into 1.1e-06 of p_rgh a step later. NOT CLAIMED: any "
+                  "non-Gauss entry across a cyclic or cyclicACMI, or leastSquares across any coupled patch "
+                  "(refused; grad(U) cellLimited alone is gated across a cyclicAMI); the device, whose operators "
+                  "are Gauss linear and which refuses every other entry."),
     ],
 
     "rhoSimpleFoam": [

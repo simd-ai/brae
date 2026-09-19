@@ -256,12 +256,16 @@ arm mesh_sheared_orthogonal runs    -                        "" "$SHEAR && $ORTH
 arm mesh_sheared_uncorrected refused "uncorrected"           "" "$SHEAR && $UNCORR"
 arm mesh_square_uncorrected runs    -                        "" "$UNCORR"
 arm mesh_square_corrected   runs    -                        "" true
-arm grad_cellLimited        refused "gradSchemes"            "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         cellLimited Gauss linear 1;/' system/fvSchemes"
-arm grad_leastSquares       refused "gradSchemes"            "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         leastSquares;/' system/fvSchemes"
-# grad(U) alone may be cellLimited (RAS/mixerVesselAMI, tests/interfoam_ami_vs_openfoam.sh); any other
-# gradient limited is refused
+# the host takes every gradient by its own entry -- Gauss linear, leastSquares, cellLimited over either
+# (tests/interfoam_dambreak_vs_openfoam.sh `gradLsqLimited` and `nHatLimited`); another scheme or limiter
+# is refused by name
+arm grad_cellLimited        runs    -                        "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         cellLimited Gauss linear 1;/' system/fvSchemes"
+arm grad_leastSquares       runs    -                        "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         leastSquares;/' system/fvSchemes"
 arm grad_namedU             runs    -                        "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
-arm grad_namedPrgh          refused "grad(p_rgh) cellLimited" "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(p_rgh)     cellLimited Gauss linear 1;/' system/fvSchemes"
+arm grad_namedPrgh          runs    -                        "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(p_rgh)     cellLimited Gauss linear 1;/' system/fvSchemes"
+arm grad_faceLimited        refused "faceLimited"            "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         faceLimited Gauss linear 1;/' system/fvSchemes"
+arm grad_cellMDLimited      refused "cellMDLimited"          "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    nHat            cellMDLimited Gauss linear 1;/' system/fvSchemes"
+arm grad_pointCells         refused "pointCellsLeastSquares" "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         pointCellsLeastSquares;/' system/fvSchemes"
 
 # TURBULENCE. laminar damBreak made RAS carries no k, epsilon or nut, and OpenFOAM stops on it too.
 arm ras_noFields            refused "does not exist"          "" "sed -i 's/simulationType .*/simulationType RAS;\\nRAS { RASModel kEpsilon; turbulence on; }/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,U) .*/&\\n    div(phi,k) Gauss upwind;\\n    div(phi,epsilon) Gauss upwind;/' system/fvSchemes"
@@ -391,6 +395,8 @@ arm ll_noCoeff              refused "with no coefficient"      "" "sed -i 's/div
 arm ll_coeffAboveOne        refused "outside [0, 1]"           "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear 1.5;/' system/fvSchemes"
 arm ll_coeffNegative        refused "outside [0, 1]"           "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear -0.1;/' system/fvSchemes"
 # its limiter's gradient is the case's grad(magSqr(U)) entry, and a least-squares one is not ported
+# ...nor a limited one reached through the default
+arm ll_gradMagSqrDefault    refused "grad(magSqr(U)) default" "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear 0.2;/' system/fvSchemes; sed -i '/^gradSchemes/,/^}/ s/default .*/default         cellLimited Gauss linear 1;/' system/fvSchemes"
 arm ll_gradMagSqrLSQ        refused "grad(magSqr(U)) leastSquares" "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear 0.2;/' system/fvSchemes; sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(magSqr(U)) leastSquares;/' system/fvSchemes"
 
 # PIMPLE controls the HOST honours...
@@ -417,6 +423,9 @@ arm baffle_momentumPredictor refused "a momentum predictor across the coupled pa
 arm baffle_cellLimitedGradU refused "grad(U) across the coupled patch" "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
 arm baffle_vanLeerV         refused "does not carry them onto the coupled patch" "" "sed -i 's/div(rhoPhi,U)  *Gauss linearUpwind grad(U);/div(rhoPhi,U)   Gauss vanLeerV;/' system/fvSchemes"
 arm baffle_compression      refused "\`interfaceCompression\` across the coupled patch" "" "sed -i 's/div(phirb,alpha)  *Gauss linear;/div(phirb,alpha) Gauss interfaceCompression;/' system/fvSchemes"
+# every other gradient entry is gated on damBreak, which has no coupled patch
+arm baffle_cellLimitedPrgh  refused "grad(p_rgh) cellLimited across the coupled patch" "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(p_rgh)     cellLimited Gauss linear 1;/' system/fvSchemes"
+arm baffle_leastSquaresNHat refused "nHat leastSquares across the coupled patch" "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    nHat            leastSquares;/' system/fvSchemes"
 BASE="$B"
 # ...and what writing that arm found: `Gauss interfaceCompression vanLeer 1` is ANOTHER scheme, which a
 # substring match read as plain vanLeer and ran
@@ -432,7 +441,7 @@ arm les_smoothPrandtl       refused "smooths the LES delta \`Prandtl\`" "" "pyth
 arm les_noMaxDeltaRatio     refused "no \`maxDeltaRatio\`"            "" "python3 -c \"import re; p='$TP'; t=open(p).read(); i=t.index('\\n    smoothCoeffs'); j=t.index('maxDeltaRatio', i); t=t[:j]+'// '+t[j:]; open(p,'w').write(t)\""
 arm les_densityVariable     refused "pairs \`density variable\` with LES" "" "sed -i 's/^simulationType .*/simulationType LES;\\ndensity variable;/' $TP"
 arm les_linearUpwindK       refused "neither \`Gauss upwind\` nor"     "" "sed -i 's/div(phi,k)  *Gauss limitedLinear 1;/div(phi,k) Gauss linearUpwind grad(k);/' system/fvSchemes"
-arm les_cellLimitedGradU    refused "Gauss linear 1\` is not ported"  "" "sed -i 's/^\\( *default  *\\)Gauss linear;/\\1cellLimited Gauss linear 1;/' system/fvSchemes"
+arm les_cellLimitedGradU    refused "the LES closure computes plain \`Gauss linear\` only" "" "sed -i 's/^\\( *default  *\\)Gauss linear;/\\1cellLimited Gauss linear 1;/' system/fvSchemes"
 BASE="$B"
 
 # the mangrove fvOptions: they run under kEpsilon with PBiCG; each coefficient OpenFOAM reads with
@@ -479,6 +488,9 @@ if [ $HAVE_GPU = 1 ]; then
     BASE="$BB"
     arm device_baffle       refused "porous_half0" "-device" true
     BASE="$B"
+    # the device's gradient operators are Gauss linear; a limited or least-squares one is refused
+    arm device_gradLsq      refused "leastSquares or cellLimited" "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         leastSquares;/' system/fvSchemes"
+    arm device_gradNHat     refused "leastSquares or cellLimited" "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    nHat            cellLimited Gauss linear 1;/' system/fvSchemes"
     arm device_baseline     runs    -                        "-device" true
     arm device_nOuter2      refused "nOuterCorrectors 2"      "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' system/fvSolution"
     arm device_nNonOrth1    refused "nNonOrthogonalCorrectors 1" "-device" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"

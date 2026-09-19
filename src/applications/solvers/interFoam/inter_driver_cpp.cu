@@ -207,6 +207,7 @@ RunReport runInterFoam(
     cpc.gamgCache = &gamgCache;
     cpc.correctedLaplacian = f.laplacianScheme.corrected;
     cpc.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
+    cpc.gradPcorr = f.gradPcorr;
     cpc.nNonOrthogonalCorrectors = f.nNonOrthogonalCorrectors;
 
     // initCorrectPhi.H, which runs for EVERY case, moving or not and with correctPhi or without: CorrectPhi
@@ -433,6 +434,8 @@ RunReport runInterFoam(
                     ai.relTolAlpha = f.aSolve.relTol;
                     ai.maxIterAlpha = f.aSolve.maxIter;
                     ai.minIterAlpha = f.aSolve.minIter;
+                    ai.gradAlpha1 = f.gradAlpha1;
+                    ai.gradAlpha2 = f.gradAlpha2;
                     // ...and the case's own smoother, which the host can now run
                     ai.smoothSolver = f.aSolve.gaussSeidel();
                     ai.symmetric = (f.aSolve.smoother == "symGaussSeidel");
@@ -585,8 +588,11 @@ RunReport runInterFoam(
                     // not orthogonal, through the fields' own Gauss linear gradients
                     const bool snCorr = f.snGradScheme.corrected;
                     const scalar snLim = f.snGradScheme.limitCoeff;
-                    const SurfaceScalarField snRho = fvc::snGrad(rhoF, m, g, patches, snCorr, false, 0, snLim);
-                    const SurfaceScalarField snA = fvc::snGrad(f.alpha1, m, g, patches, snCorr, false, 0, snLim);
+                    // each correction takes grad(<field>)'s own entry (correctedSnGrad.C:52-55)
+                    const SurfaceScalarField snRho = fvc::snGrad(rhoF, m, g, patches, snCorr, f.gradRho.leastSquares,
+                                                                 f.gradRho.cellLimitK, snLim);
+                    const SurfaceScalarField snA = fvc::snGrad(f.alpha1, m, g, patches, snCorr,
+                                                               f.gradAlpha1.leastSquares, f.gradAlpha1.cellLimitK, snLim);
 
                     SurfaceScalarField stf;
                     stf.internal.resize(static_cast<std::size_t>(m.nInternalFaces()));
@@ -622,7 +628,8 @@ RunReport runInterFoam(
                         f.p_rgh.boundary[pi]->updateSnGrad(
                             std::vector<scalar>(static_cast<std::size_t>(patches[pi].size), scalar(0)));
                     }
-                    const SurfaceScalarField snP = fvc::snGrad(f.p_rgh, m, g, patches, snCorr, false, 0, snLim);
+                    const SurfaceScalarField snP = fvc::snGrad(f.p_rgh, m, g, patches, snCorr, f.gradPrgh.leastSquares,
+                                                               f.gradPrgh.cellLimitK, snLim);
 
                     SurfaceScalarField force;
                     {
@@ -675,6 +682,7 @@ RunReport runInterFoam(
                     mi.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
                     // gradSchemes' grad(U): cellLimited or not, for linearUpwind and the viscous term
                     mi.gradULimitK = f.gradULimitK;
+                    mi.gradULeastSq = f.gradULeastSq;
 
                     // THE CASE'S OWN SOLVE FOR U: UFinal on the last outer corrector, U on the others,
                     // its smoother where it names a Gauss-Seidel one, and only the components the
@@ -764,6 +772,7 @@ RunReport runInterFoam(
                     psc.nNonOrthogonalCorrectors = f.nNonOrthogonalCorrectors;
                     psc.correctedLaplacian = f.laplacianScheme.corrected;
                     psc.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
+                    psc.gradPrgh = f.gradPrgh;
                     // p_rgh.needReference() and setRefCell, read with the case -- see InterFields::pRef
                     psc.needReference = f.pRef.needReference;
                     psc.pRefCell = f.pRef.pRefCell;

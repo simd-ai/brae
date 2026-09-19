@@ -98,10 +98,23 @@ int main(int argc, char** argv)
     // under its tolerance and takes no sweep; minIter forces one. The device's pre-solve does not honour
     // minIter and refuses the case.
     const bool alphaMinIter = profileName == "alphaminiter";
+    // `sheared`: the big step on damBreak with its upper blocks sheared six degrees, so the corrected
+    // laplacian and snGrad carry a non-zero correction, and with the momentum predictor on, so the
+    // predictor's snGrad(p_rgh) is read. It is `gradLsqLimited`'s control run. The device assembles
+    // orthogonal and refuses it.
+    const bool sheared = profileName == "sheared";
+    // `gradLsqLimited`: every gradient `cellLimited leastSquares 1` but nHat, which names `leastSquares`,
+    // on the sheared mesh with the predictor on. The device's operators are Gauss linear and refuse it.
+    const bool gradLsqLimited = profileName == "gradLsqLimited";
+    // `nHatLimited`: the interface normal alone `cellLimited Gauss linear 1`, at the SMALL step -- the
+    // big step's MULES leaves alpha 1 +- 1e-7 in the bulk, where the limiter turns round-off into
+    // 1e-06 of p_rgh (see the script). The device refuses it.
+    const bool nHatLimited = profileName == "nHatLimited";
     const bool pimpleProfile = nOuter || nonOrth || momPred || namedFlux || vanLeerV || linear || compression
-                            || alphaMinIter;
-    const bool deviceRefuses = nOuter || nonOrth || namedFlux || compression || alphaMinIter;
-    const bool bigStep = (argc > 7 && std::string(argv[7]) == "bigstep") || prevCorr || pimpleProfile;
+                            || alphaMinIter || gradLsqLimited;
+    const bool deviceRefuses = nOuter || nonOrth || namedFlux || compression || alphaMinIter || gradLsqLimited
+                            || nHatLimited || sheared;
+    const bool bigStep = (argc > 7 && std::string(argv[7]) == "bigstep") || prevCorr || pimpleProfile || sheared;
     // `inflow`: the atmosphere's inletValue set to 1, so water enters over air cells and rho's patch
     // value differs from the cell's on a patch where p_rgh fixes a value. It is the only fixture here
     // on which fvc::snGrad(rho) is non-zero on a boundary that does not cancel it. See the script.
@@ -118,6 +131,9 @@ int main(int argc, char** argv)
               : namedFlux ? "rhophi -- the atmosphere's conditions all name phi rhoPhi, at the big step"
               : compression ? "compression -- div(phirb,alpha) Gauss interfaceCompression, at the big step"
               : alphaMinIter ? "alphaminiter -- the alpha pre-solve names minIter 1, at the big step"
+              : gradLsqLimited ? "gradLsqLimited -- every gradient but nHat cellLimited leastSquares 1, sheared, at the big step"
+              : sheared ? "sheared -- the upper blocks sheared six degrees, at the big step"
+              : nHatLimited ? "nHatLimited -- nHat cellLimited Gauss linear 1, at the small step"
               : bigStep ? "bigstep -- the solver logs discriminate here"
               : inflow  ? "inflow -- snGrad(rho) is live on the atmosphere here"
               : outflow ? "outflow -- water leaves through the atmosphere with alphaApplyPrevCorr on"
@@ -297,7 +313,8 @@ int main(int argc, char** argv)
     // (fvMatrixSolve.C:162-164) -- and takes the `UFinal` entry, because with one outer corrector that
     // corrector is the final one.
     std::vector<LinearSolveRecord> ofUx, ofUy, ofUz;
-    if (momPred && argc > 5)
+    // ...and under the two sheared profiles, which run the predictor too
+    if ((momPred || sheared || gradLsqLimited) && argc > 5)
     {
         ofUx = brae::gatecheck::readOfSolves(argv[5], "Ux");
         ofUy = brae::gatecheck::readOfSolves(argv[5], "Uy");
@@ -335,7 +352,7 @@ int main(int argc, char** argv)
     // for `prevcorrsub` the same run without the second sub-cycle. If the two agreed to round-off that
     // setting would be doing nothing on this fixture, and a brae that ignored it would pass every
     // bound above -- as the device did, 1.07e-02 out, until it was given the switch at all.
-    if (prevCorr || pimpleProfile)
+    if (prevCorr || pimpleProfile || nHatLimited)
     {
         const char* what = prevCorrSub ? "nAlphaSubCycles 2"
                          : nOuter ? "nOuterCorrectors 2"
@@ -345,6 +362,8 @@ int main(int argc, char** argv)
                          : vanLeerV ? "div(rhoPhi,U) Gauss vanLeerV"
                          : linear ? "div(rhoPhi,U) Gauss linear"
                          : compression ? "div(phirb,alpha) Gauss interfaceCompression"
+                         : gradLsqLimited ? "default cellLimited leastSquares 1"
+                         : nHatLimited ? "nHat cellLimited Gauss linear 1"
                                   : "alphaApplyPrevCorr yes";
         check("the control was given OpenFOAM's answer without the setting under test", argc > 8);
         if (argc > 8 && alphaMinIter)
@@ -481,6 +500,8 @@ int main(int argc, char** argv)
                                   : nonOrth ? "nNonOrthogonalCorrectors"
                                   : compression ? "interfaceCompression"
                                   : alphaMinIter ? "minIter"
+                                  : (gradLsqLimited || nHatLimited) ? "cellLimited"
+                                  : sheared ? "non-orthogonal correction"
                                             : "names the flux";
                 std::printf("  DEVICE: %s\n", threw ? why.substr(0, 140).c_str() : "RAN -- it must not");
                 check("the DEVICE refuses this case rather than run it at a smaller count",

@@ -50,6 +50,8 @@ struct CorrectPhiControls
     // laplacianSchemes' default, for fvm::laplacian(rAUf, pcorr)
     bool correctedLaplacian = false;
     scalar snGradLimitCoeff = 0;
+    // grad(pcorr)'s gradSchemes entry, which the laplacian's correction takes
+    GradChoice gradPcorr;
     label nNonOrthogonalCorrectors = 0;
 };
 

@@ -604,6 +604,18 @@ RunReport runInterFoamDevice(
     C.alpha.alphaApplyPrevCorr = f.alphaCtl.alphaApplyPrevCorr;
     C.alpha.prevCorrInt = &dPrevCorrI;
     C.alpha.prevCorrBnd = &dPrevCorrB;
+    // gradSchemes: the device operators take Gauss linear and unlimited, apart from grad(U)'s cellLimited
+    // (refused above); the host takes leastSquares and cellLimited on every gradient
+    for (const GradChoice* gc : {&f.gradAlpha1, &f.gradAlpha2, &f.gradPrgh, &f.gradPcorr, &f.gradRho,
+                                 &f.interface.nHatGrad})
+    {
+        if (!gc->gaussLinear() || f.gradULeastSq)
+            throw std::runtime_error(
+                "brae interFoam (device): fvSchemes gradSchemes names a leastSquares or cellLimited "
+                "gradient for alpha, p_rgh, pcorr, rho, U or nHat. The host loop takes each by its own entry "
+                "(gated on laminar/damBreak `gradLsqLimited`); the device operators are Gauss linear. "
+                "Refused rather than run another gradient.");
+    }
     if (f.alphaCtl.MULESCorr && f.aSolve.minIter > 0)
         throw std::runtime_error(
             "brae interFoam (device): `solvers/" + f.alphaName + "` names `minIter "

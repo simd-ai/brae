@@ -169,7 +169,7 @@ void correctPhi(
         if (c.correctedLaplacian)
         {
             // the fluxRequired branch of gaussLaplacianSchemes.C: CorrectPhi.C:73 sets it for pcorr
-            const std::vector<vector> gradP = fvc::gaussGrad(pcorr, m, g, patches);
+            const std::vector<vector> gradP = gradOf(pcorr, c.gradPcorr, m, g, patches);
             const std::vector<scalar> corrSrc = fvm::laplacianNonOrthSource<scalar, vector>(
                 *in.rAUf, pcorr, gradP, m, g, patches, c.snGradLimitCoeff);
             for (label cell = 0; cell < nC; ++cell)

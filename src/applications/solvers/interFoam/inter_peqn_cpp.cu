@@ -709,7 +709,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
             // this solver admits) on the p_rgh of THIS pass, and the same flux kept for
             // p_rghEqn.flux(). The two are built from one face field so `phi = phiHbyA - flux` stays
             // conservative on a non-orthogonal mesh.
-            const std::vector<vector> gradP = fvc::gaussGrad(p_rgh, m, g, patches);
+            const std::vector<vector> gradP = gradOf(p_rgh, sc.gradPrgh, m, g, patches);
             const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
                 rAUfField, p_rgh, gradP, m, g, patches, sc.snGradLimitCoeff);
             for (label c = 0; c < nC; ++c)

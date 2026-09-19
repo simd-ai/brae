@@ -209,11 +209,13 @@ void calculateK(const GeometricField<scalar>& alpha1,
     //    gradSchemes entry NAMED nHat -- not grad(alpha.water) and not default. 43 of the 44 shipped
     //    tutorials say `default Gauss linear` and name no nHat entry, so they fall to that; the
     //    caller resolves which, and passing the wrong one changes the interface normal.
+    // the caller's flag, or the case's own `nHat` entry (InterfaceCoeffs::nHatGrad)
+    GradChoice nHatGrad = c.nHatGrad;
+    nHatGrad.leastSquares = nHatGrad.leastSquares || gradLeastSquares;
     std::vector<vector> gradAlpha;
     if (c.nAlphaSmoothCurvature < 1)
     {
-        gradAlpha = gradLeastSquares ? fvc::leastSquaresGrad(alpha1, m, g, patches)
-                                     : fvc::gaussGrad(alpha1, m, g, patches);
+        gradAlpha = gradOf(alpha1, nHatGrad, m, g, patches);
     }
     else
     {
@@ -221,9 +223,9 @@ void calculateK(const GeometricField<scalar>& alpha1,
         // of THAT (interfaceProperties.C:117-130). The gradient must therefore be built from the
         // smoothed values, which is what this branch exists to do; taking grad(alpha1) after smoothing
         // a local copy would make the smoothing a no-op that still costs its passes.
-        if (gradLeastSquares)
+        if (!nHatGrad.gaussLinear())
             throw std::runtime_error(
-                "brae interfaceProperties: nAlphaSmoothCurvature with a leastSquares gradient is not "
+                "brae interfaceProperties: nAlphaSmoothCurvature with a leastSquares or limited gradient is not "
                 "ported. The smoothed field needs its own least-squares stencil evaluation, and NO "
                 "shipped OpenFOAM tutorial sets nAlphaSmoothCurvature at all, so there is no case to "
                 "validate the combination against.");

@@ -211,7 +211,8 @@ void fluxWithScheme(const SurfaceScalarField&     psi,
                     const PrimitiveMesh&          m,
                     const FvGeometry&             g,
                     const std::vector<FvPatch>&   patches,
-                    SurfaceScalarField&           out)
+                    SurfaceScalarField&           out,
+                    const GradChoice&             gradVf)
 {
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
@@ -234,11 +235,9 @@ void fluxWithScheme(const SurfaceScalarField&     psi,
         case AlphaFluxScheme::vanLeer:
         default:
         {
-            // LimitedScheme::calcLimiter takes fvc::grad(vf) through the case's gradSchemes; 43 of the
-            // 44 shipped interFoam tutorials say `default Gauss linear`, and this takes that. The one
-            // that says `cellLimited leastSquares 1` is not served by this path yet and would need the
-            // scheme resolved at the call site, as rhoSimpleFoam does for grad(U).
-            gradVfLimited = fvc::gaussGrad(vf, m, g, patches);
+            // LimitedScheme::calcLimiter takes fvc::grad(vf) through the case's gradSchemes entry for
+            // `grad(<vf's name>)`, then `default` -- the caller resolves which (gradVf)
+            gradVfLimited = gradOf(vf, gradVf, m, g, patches);
             w = limitedSchemes::vanLeerWeights(psi.internal, vf, gradVfLimited, m, g);
             break;
         }
@@ -323,11 +322,13 @@ void alphaPhiUn(const SurfaceScalarField&     phi,
                 const PrimitiveMesh&          m,
                 const FvGeometry&             g,
                 const std::vector<FvPatch>&   patches,
-                SurfaceScalarField&           out)
+                SurfaceScalarField&           out,
+                const GradChoice&             gradAlpha1,
+                const GradChoice&             gradAlpha2)
 {
     // Term 1: fvc::flux(phi, alpha1, alphaScheme) -- plain advection.
     SurfaceScalarField adv;
-    fluxWithScheme(phi, alpha1, alphaScheme, m, g, patches, adv);
+    fluxWithScheme(phi, alpha1, alphaScheme, m, g, patches, adv, gradAlpha1);
 
     // Term 2, alphaEqn.H:171-176, TWO MINUS SIGNS DEEP:
     //
@@ -349,12 +350,12 @@ void alphaPhiUn(const SurfaceScalarField&     phi,
     }
 
     SurfaceScalarField inner;
-    fluxWithScheme(negPhir, alpha2, alpharScheme, m, g, patches, inner);
+    fluxWithScheme(negPhir, alpha2, alpharScheme, m, g, patches, inner, gradAlpha2);
     for (scalar& s : inner.internal) s = -s;                       // the OUTER minus
     for (std::vector<scalar>& b : inner.boundary) for (scalar& s : b) s = -s;
 
     SurfaceScalarField comp;
-    fluxWithScheme(inner, alpha1, alpharScheme, m, g, patches, comp);
+    fluxWithScheme(inner, alpha1, alpharScheme, m, g, patches, comp, gradAlpha1);
 
     out.internal.resize(adv.internal.size());
     for (std::size_t f = 0; f < adv.internal.size(); ++f)
@@ -606,7 +607,8 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
         alpha2.evaluateBoundary();
 
         SurfaceScalarField un;
-        alphaPhiUn(*in.phi, phir, alpha1, alpha2, in.alphaScheme, in.alpharScheme, m, g, patches, un);
+        alphaPhiUn(*in.phi, phir, alpha1, alpha2, in.alphaScheme, in.alpharScheme, m, g, patches, un,
+                   in.gradAlpha1, in.gradAlpha2);
 
         MULES::Fields mf;                       // all null: rho == 1, Sp == Su == 0, bounds [0,1]
         mf.Vsc = in.Vsc;                        // ...and the volumes of a mesh that moves

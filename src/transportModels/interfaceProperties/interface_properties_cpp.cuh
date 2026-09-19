@@ -37,6 +37,7 @@
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
 #include "fvc.cuh"
+#include "grad_choice.cuh"
 #include <cmath>
 #include <cstdlib>
 #include <stdexcept>
@@ -57,6 +58,8 @@ struct InterfaceCoeffs
     // the 44 shipped tutorials sets one (laminar/capillaryRise), and that is the case where surface
     // tension IS the answer -- so it is the one a missing contact angle cannot hide in.
     std::vector<scalar> contactAngleDeg;
+    // gradSchemes' `nHat` entry (interfaceProperties.C:96, fvc::grad(alpha1_, "nHat")), then `default`
+    GradChoice nHatGrad;
 };
 
 // solverDict(alpha1.name()) is the fvSolution `solvers` entry for the alpha field -- damBreak names it

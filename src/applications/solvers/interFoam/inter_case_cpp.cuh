@@ -43,6 +43,7 @@
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
 #include "fvc.cuh"
+#include "grad_choice.cuh"
 #include "time_controls.cuh"
 #include "two_phase_mixture_cpp.cuh"
 #include "interface_properties_cpp.cuh"
@@ -147,6 +148,14 @@ struct InterFields
     // equation's linearUpwind, its viscous term and that term's non-orthogonal correction all take
     // through gradSchemes' grad(U) entry
     scalar gradULimitK = 0;
+    // ...its base scheme, and the other gradients' resolved entries (grad(alpha.<phase1>),
+    // grad(alpha.<phase2>), grad(p_rgh), grad(pcorr), grad(rho)); interface.nHatGrad holds `nHat`'s
+    bool gradULeastSq = false;
+    GradChoice gradAlpha1;
+    GradChoice gradAlpha2;
+    GradChoice gradPrgh;
+    GradChoice gradPcorr;
+    GradChoice gradRho;
     NonOrthScheme snGradScheme;
 
     // fvSolution's PIMPLE block. READ, not assumed: damBreak sets `momentumPredictor no`, which means

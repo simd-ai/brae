@@ -151,7 +151,9 @@ void fluxWithScheme(const SurfaceScalarField&     psi,
                     const PrimitiveMesh&          m,
                     const FvGeometry&             g,
                     const std::vector<FvPatch>&   patches,
-                    SurfaceScalarField&           out);
+                    SurfaceScalarField&           out,
+                    // the limiter's fvc::grad(vf): gradSchemes' `grad(<vf's name>)`, then `default`
+                    const GradChoice&             gradVf = GradChoice{});
 
 // alphaPhiUn, alphaEqn.H:164-176 -- the advective flux plus the compressive one. See note 2.
 void alphaPhiUn(const SurfaceScalarField&     phi,
@@ -163,7 +165,10 @@ void alphaPhiUn(const SurfaceScalarField&     phi,
                 const PrimitiveMesh&          m,
                 const FvGeometry&             g,
                 const std::vector<FvPatch>&   patches,
-                SurfaceScalarField&           out);
+                SurfaceScalarField&           out,
+                // the limiters' gradients: grad(alpha.<phase1>) and grad(alpha.<phase2>)
+                const GradChoice&             gradAlpha1 = GradChoice{},
+                const GradChoice&             gradAlpha2 = GradChoice{});
 
 // rhoPhi = alphaPhi10*(rho1f - rho2f) + phiForRho2*rho2f, alphaEqn.H:248 / :260. `phiForRho2` is phiCN
 // on the Euler/localEuler branch and phi on the other -- see note 3; the caller picks, and this refuses
@@ -227,6 +232,9 @@ struct AlphaStepInput
     // `minIter`: the sweeps the solve takes even when its initial residual is already under tolerance
     // (smoothSolver.C: `if (minIter_ > 0 || !converged)`)
     int     minIterAlpha = 0;
+    // the limiters' gradSchemes entries, grad(alpha.<phase1>) and grad(alpha.<phase2>)
+    GradChoice gradAlpha1;
+    GradChoice gradAlpha2;
     // `solver smoothSolver; smoother symGaussSeidel|GaussSeidel;` -- run brae::smoothSolver, which is
     // OpenFOAM's, in place of the DILU-PBiCGStab this step grew up on. See smooth_solver_cpp.cuh.
     bool smoothSolver = false;

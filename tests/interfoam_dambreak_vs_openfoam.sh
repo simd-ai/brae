@@ -99,6 +99,27 @@
 # digit at alpha tolerances 1e-8, 1e-5, 1e-4, 1e-3) -- so the control is the sweep count: OpenFOAM without
 # minIter logs 1 of the 5 differently. BROKEN (minIter ignored, as brae had it): the first count 0 for 1.
 # The device refuses the profile by name.
+#
+# PROFILES sheared, gradLsqLimited, nHatLimited: THE GRADIENT SCHEMES. Every fvc::grad interFoam takes is
+# resolved by the name its call site asks for -- grad(U), grad(alpha.water), grad(alpha.air), grad(p_rgh),
+# grad(pcorr), grad(rho), and the interface normal's `nHat` -- then `default`, and the host runs `Gauss
+# linear`, `leastSquares` and `cellLimited` over either. `gradLsqLimited` is RAS/electrostaticDeposition's
+# `default cellLimited leastSquares 1` (nHat named `leastSquares`, see below) on the `sheared` fixture,
+# whose run is its control. On damBreak as shipped four of those gradients are inert (see run_at for the
+# settings that make each live). MEASURED at 5 big steps: sheared alpha 1.5e-14, U 7.9e-14 relative;
+# gradLsqLimited alpha 1.9e-14, U 3.5e-13, every p_rgh, Ux, Uy and alpha count OpenFOAM's; the entry moves
+# OpenFOAM's own alpha 3.5e-02. BROKEN ONCE EACH (the site given Gauss linear, gradLsqLimited alpha): the
+# pressure laplacian's grad(p_rgh) 4.9e-01, snGrad(rho)'s grad(rho) 2.4e-01, the alpha vanLeer limiter's
+# grad(alpha.water) 2.4e-02, the compression limiter's grad(alpha.air) 7.8e-03, the predictor's
+# snGrad(p_rgh) 2.4e-03, CorrectPhi's grad(pcorr) 1.5e-03, nHat's 1.5e-03, grad(U) leastSquares 9.7e-04,
+# the surface-tension snGrad(alpha)'s 3.4e-04.
+#   `nHatLimited` is `nHat cellLimited Gauss linear 1` alone, at the SMALL step: alpha 5.6e-13, p_rgh
+# 1.1e-10 and U 2.5e-10 relative (the entry moves OpenFOAM's alpha 6.3e-05; the limiter dropped, 6.3e-05).
+# At the big step it is 2.7e-09 after five steps and cannot be held to round-off, for a reason that is not
+# a defect: brae's limited K computed from OpenFOAM's own post-MULES alpha (dumped at 17 digits) agrees
+# with OpenFOAM's to 3e-16 relative, but MULES leaves alpha 1 +- 1e-7 in the bulk, where the limiter
+# divides round-off-sized neighbour ranges by round-off-sized extrapolations -- a 1.7e-13 alpha
+# difference after step 1 became 1.1e-06 of p_rgh at step 2 (Gauss linear: 1e-10).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_dambreak_vs_openfoam"
@@ -168,6 +189,61 @@ run_at()
                  sed -i 's/^\( *\)U$/\1"U.*"/' "$C/system/fvSolution"
                  grep -q '"U\.\*"' "$C/system/fvSolution" || { echo "FAIL: the U solver entry was not widened to UFinal"; return 1; } ;;
     esac
+    if [ "$profile" = sheared ] || [ "$profile" = gradLsqLimited ]; then
+        # A FIXTURE ON WHICH EVERY GRADIENT interFoam TAKES IS READ. On damBreak as shipped four of them
+        # are inert, and each setting below is there because it makes one of them live -- measured by
+        # dropping that site's scheme in brae (the fail-proofs in the manifest) and by OpenFOAM's own
+        # answer moving with the entry:
+        #   upper blocks sheared six degrees (as tests/interfoam_refusals.sh does) -- the non-orthogonal
+        #       corrections are zero on rectangles, so grad(p_rgh) and grad(rho) cellLimited leastSquares
+        #       moved OpenFOAM's own p_rgh by 1e-10 there, and by 2.9e+03 and 2.7e+04 here;
+        #   momentumPredictor yes -- snGrad(p_rgh), and grad(p_rgh)'s entry in its correction, reach only
+        #       the predictor's source: with it off, dropping that entry left every field bitwise equal;
+        #   U starting at (0.1 0 0), and nNonOrthogonalCorrectors 1 -- initCorrectPhi's pcorr solve is
+        #       then not a zero-iteration solve, and its second pass reads grad(pcorr) (with one pass the
+        #       explicit correction is built from pcorr's zero guess and vanishes);
+        #   div(phirb,alpha) Gauss vanLeer, as seven tutorials name it -- the compression flux of
+        #       alpha.air then goes through a limiter that reads grad(alpha.air).
+        sed -i 's/(0 4 /(0.4 4 /; s/(2 4 /(2.4 4 /; s/(2.16438 4 /(2.56438 4 /; s/(4 4 /(4.4 4 /' "$C/system/blockMeshDict"
+        grep -q "(0.4 4 " "$C/system/blockMeshDict" || { echo "FAIL: the blocks were not sheared"; return 1; }
+        # the "U.*" key: see `mompred`
+        sed -i 's/momentumPredictor  *no;/momentumPredictor yes;/' "$C/system/fvSolution"
+        sed -i 's/^\( *\)U$/\1"U.*"/' "$C/system/fvSolution"
+        grep -q "momentumPredictor yes;" "$C/system/fvSolution" && grep -q '"U\.\*"' "$C/system/fvSolution" \
+            || { echo "FAIL: the momentum predictor was not switched on"; return 1; }
+        sed -i 's/^internalField .*/internalField   uniform (0.1 0 0);/' "$C/0/U"
+        grep -q "uniform (0.1 0 0);" "$C/0/U" || { echo "FAIL: U was not started moving"; return 1; }
+        sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' "$C/system/fvSolution"
+        grep -q "nNonOrthogonalCorrectors 1;" "$C/system/fvSolution" \
+            || { echo "FAIL: nNonOrthogonalCorrectors was not raised"; return 1; }
+        sed -i 's/div(phirb,alpha) .*/div(phirb,alpha) Gauss vanLeer;/' "$C/system/fvSchemes"
+        grep -q "div(phirb,alpha) Gauss vanLeer;" "$C/system/fvSchemes" \
+            || { echo "FAIL: div(phirb,alpha) was not set to vanLeer"; return 1; }
+    fi
+    if [ "$profile" = gradLsqLimited ]; then
+        # EVERY GRADIENT cellLimited leastSquares, as RAS/electrostaticDeposition writes it: the viscous
+        # term's grad(U), the vanLeer limiters' grad(alpha.water) and grad(alpha.air), the corrected
+        # laplacians' and snGrads' grad(p_rgh), grad(rho), grad(alpha.water) and grad(pcorr) -- on the
+        # `sheared` fixture, whose run is its control
+        sed -i '/^gradSchemes/,/^}/ s/default .*/default         cellLimited leastSquares 1;\n    nHat            leastSquares;/' "$C/system/fvSchemes"
+        grep -q "default         cellLimited leastSquares 1;" "$C/system/fvSchemes" \
+            || { echo "FAIL: the gradient default was not rewritten"; return 1; }
+        # ...EXCEPT nHat, which names plain leastSquares. A LIMITED interface normal cannot be held to
+        # round-off at the big step: brae's limited K from OpenFOAM's own post-MULES alpha (17 digits)
+        # agrees to 3e-16 relative, but MULES leaves alpha 1 +- 1e-7 in the bulk, where the limiter
+        # divides round-off-sized neighbour ranges by round-off-sized extrapolations -- a 1.7e-13 alpha
+        # difference became 1.1e-06 in p_rgh one step later. The `nHatLimited` profile gates it at the
+        # small step. Naming nHat here also gates the lookup: the default would limit it.
+        grep -q "nHat            leastSquares;" "$C/system/fvSchemes" \
+            || { echo "FAIL: the nHat entry was not added"; return 1; }
+    fi
+    if [ "$profile" = nHatLimited ]; then
+        # THE INTERFACE NORMAL cellLimited, alone, at the small step (see gradLsqLimited for why not
+        # the big one). Every other gradient stays the tutorial's Gauss linear.
+        sed -i '/^gradSchemes/,/^}/ s/\(default .*\)/\1\n    nHat            cellLimited Gauss linear 1;/' "$C/system/fvSchemes"
+        grep -q "nHat            cellLimited Gauss linear 1;" "$C/system/fvSchemes" \
+            || { echo "FAIL: the nHat entry was not added"; return 1; }
+    fi
     if [ "$profile" = alphaminiter ]; then
         # THE ALPHA ENTRY NAMES `minIter 1` (DTCHull, DTCHullMoving and electrostaticDeposition do). At the
         # big step OpenFOAM's FIRST pre-solve starts under its tolerance and takes no sweep; minIter forces
@@ -267,6 +343,10 @@ PYEOF
     [ "$profile" = prevcorrsub ] && std="$W/prevcorr/$end"
     # ...and the three PIMPLE profiles read the big-step run without their setting
     case "$profile" in nouter|nonorth|mompred|rhophi|vanleerv|linear|compression|alphaminiter) std="$W/bigstep/$end" ;; esac
+    # ...and the gradient profile reads the sheared run it differs from in its gradSchemes alone
+    [ "$profile" = gradLsqLimited ] && std="$W/sheared/$end"
+    # ...and the small-step nHat profile reads the small-step run without its entry
+    [ "$profile" = nHatLimited ] && std="$W/small/$end"
     "$BIN" "$C" "$C/0" "$C/$end" "$STEPS" "$C/log.interFoam" "$C.control" "$profile" $std
 }
 
@@ -285,4 +365,7 @@ run_at "$DT_BIG" vanleerv || rc=1
 run_at "$DT_BIG" linear || rc=1
 run_at "$DT_BIG" compression || rc=1
 run_at "$DT_BIG" alphaminiter || rc=1
+run_at "$DT_BIG" sheared || rc=1
+run_at "$DT_BIG" gradLsqLimited || rc=1
+run_at "$DT" nHatLimited || rc=1
 exit $rc

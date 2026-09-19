@@ -63,6 +63,7 @@
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
 #include "fvc.cuh"
+#include "grad_choice.cuh"
 #include "ldu_matrix.cuh"
 #include "inter_solve_record.cuh"
 #include "gamg_solver_cpp.cuh"
@@ -224,6 +225,8 @@ struct PressureSolveControls
     // rebuilds the matrix each pass on the p_rgh the last one left.
     bool correctedLaplacian = false;
     scalar snGradLimitCoeff = 0;
+    // grad(p_rgh)'s gradSchemes entry, which the laplacian's correction takes
+    GradChoice gradPrgh;
     // pimpleControl::finalInnerIter() (pimpleControlI.H:98-111): corrPISO == nCorrPISO. The caller
     // knows which pass this is; pressureCorrector owns the non-orthogonal half of the test.
     bool finalCorrector = true;
