@@ -230,8 +230,22 @@ DivScheme parseMomentumDiv(const std::string& entry, scalar& coeff)
     }
     if (s == "limitedLinear")
     {
-        if (tok.size() > 2) coeff = std::stod(tok[2]);
-        return DivScheme::limitedLinear;    // refused downstream, by name, with the reason
+        // limitedLinear.H:67-76: the coefficient is read with no default, and 0 <= k <= 1 or OpenFOAM
+        // stops. A missing one used to fall to 1 here.
+        if (tok.size() < 3)
+        {
+            throw std::runtime_error(
+                "brae interFoam: `div(rhoPhi,U) " + entry + "` names limitedLinear with no coefficient; "
+                "OpenFOAM reads it with no default (limitedLinear.H:67).");
+        }
+        coeff = std::stod(tok[2]);
+        if (coeff < scalar(0) || coeff > scalar(1))
+        {
+            throw std::runtime_error(
+                "brae interFoam: `div(rhoPhi,U) " + entry + "` gives limitedLinear a coefficient outside "
+                "[0, 1], which OpenFOAM refuses (limitedLinear.H:69-76).");
+        }
+        return DivScheme::limitedLinear;
     }
     throw std::runtime_error(
         "brae interFoam: `div(rhoPhi,U) " + entry + "` is not ported. brae has upwind, linear, "

@@ -73,9 +73,13 @@
 // axisymmetric wedge -- whose host matrix coefficients and gradient patch value it took to get there.
 // tests/interfoam_les_vs_openfoam.sh holds LES/nozzleFlow2D against OpenFOAM; `-device` refuses LES.
 //
+// AND `Gauss limitedLinear` on div(rhoPhi,U), on the host: one magSqr limiter per face, as OpenFOAM's
+// vector form has it. tests/interfoam_limitedlinear_vs_openfoam.sh holds eulerianInjection against
+// OpenFOAM; `-device` refuses it.
+//
 // WHAT IT WILL NOT RUN. Every refusal the components carry is in force: every LESModel but kEqn, every
 // RASModel but
-// kEpsilon and kOmegaSST, `limitedLinear` on div(rhoPhi,U),
+// kEpsilon and kOmegaSST,
 // any ddtSchemes default but Euler, every fvOption but explicitPorositySource/DarcyForchheimer (host
 // only: tests/interfoam_angledduct_vs_openfoam.sh), MRF on the device or beside a moving mesh, RAS or a
 // fixedFluxPressure patch (the host runs it otherwise: tests/interfoam_mrf_vs_openfoam.sh), and a case that

@@ -75,14 +75,49 @@ FvVectorMatrix divWithScheme(const GeometricField<vector>& U,
             return fvm::div<vector>(phi, *in.rhoPhiBnd, U, g.weights(), m, patches);
 
         case DivScheme::limitedLinear:
-            // limitedLinear on a VECTOR is NVDTVD + limitFuncs::magSqr (LimitedScheme.H:188-189): the
-            // limiter is built on the scalar field magSqr(U), whose gradient resolves through the case's
-            // `grad(magSqr(U))` entry. rhoSimpleFoam carries that lookup; this solver's parser does not
-            // yet, and defaulting it to a Gauss gradient put rhoSimpleFoam's momentum matrix 4.63e-02 off
-            // OpenFOAM's own on a case whose default was leastSquares. One shipped tutorial asks for it.
-            throw std::runtime_error(
-                "brae interFoam UEqn: `Gauss limitedLinear` on div(rhoPhi,U) is not ported -- its limiter "
-                "needs the case's grad(magSqr(U)) scheme, which this solver does not resolve yet.");
+        {
+            // limitedLinear on a VECTOR is NVDTVD + limitFuncs::magSqr (LimitedScheme.H:188-189,
+            // LimitFuncs.C:34-39): NOT per component and NOT the V form. The limiter is the scalar one,
+            // built on lPhi = magSqr(U) and fvc::grad(lPhi) -- `grad(magSqr(U))`, which this solver's
+            // gradSchemes reader holds to Gauss linear with every other entry -- and the ONE weight it
+            // gives each face carries all three components. lPhi's patch values are magSqr of U's
+            // stored ones: the limiter is built inside gaussConvectionScheme::fvmDiv (.C:84), before the
+            // fvMatrix constructor runs updateCoeffs; the driver has refreshed U's patches by then, and
+            // on a pressureInletOutletVelocity -- eulerianInjection's sides -- the refresh reproduces
+            // the value the last U.correctBoundaryConditions() left, because phi has not moved since.
+            const label nC = m.nCells();
+            std::vector<scalar> mag2(static_cast<std::size_t>(nC));
+            for (label c = 0; c < nC; ++c)
+            {
+                const vector& u = U.internal[c];
+                mag2[c] = u.x*u.x + u.y*u.y + u.z*u.z;
+            }
+            std::vector<std::vector<scalar>> mag2b(patches.size());
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                const std::vector<vector>& ub = U.boundary[pi]->value();
+                mag2b[pi].resize(ub.size());
+                for (std::size_t i = 0; i < ub.size(); ++i)
+                {
+                    mag2b[pi][i] = ub[i].x*ub[i].x + ub[i].y*ub[i].y + ub[i].z*ub[i].z;
+                }
+            }
+            const std::vector<vector> gradM = fvc::gaussGrad(mag2, mag2b, m, g, patches);
+            GeometricField<scalar> lPhi;          // limitedLinearWeights reads only .internal
+            lPhi.internal = mag2;
+            const std::vector<scalar> w =
+                limitedSchemes::limitedLinearWeights(phi, lPhi, gradM, in.schemeCoeff, m, g);
+            for (const FvPatch& q : patches)
+            {
+                if (q.coupled)
+                {
+                    throw std::runtime_error(
+                        "brae interFoam UEqn: `Gauss limitedLinear` on div(rhoPhi,U) across the coupled patch `"
+                        + q.name + "` is not ported.");
+                }
+            }
+            return fvm::div<vector>(phi, *in.rhoPhiBnd, U, w, m, patches);
+        }
 
         case DivScheme::limitedLinearV:
         {

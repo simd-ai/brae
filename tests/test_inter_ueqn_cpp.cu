@@ -34,6 +34,7 @@
 #include "inter_ueqn_cpp.cuh"
 #include <cmath>
 #include <cstdio>
+#include <exception>
 #include <memory>
 #include <vector>
 
@@ -360,8 +361,52 @@ int main()
         check("a case declaring fvOptions is refused", refuses(opt));
         InterMomentumInput noOld = base; noOld.rhoOld = nullptr;
         check("rho.oldTime() missing is refused, not silently replaced by rho", refuses(noOld));
-        InterMomentumInput ll = base; ll.scheme = DivScheme::limitedLinear;
-        check("`Gauss limitedLinear` on div(rhoPhi,U) is refused, not run as upwind", refuses(ll));
+        // `Gauss limitedLinear` on div(rhoPhi,U) is ported (tests/interfoam_limitedlinear_vs_openfoam.sh
+        // holds it against OpenFOAM). Here: it assembles, and not as upwind. That needs a flux and a
+        // U that varies -- on the zero U and zero flux above the two matrices are the same one.
+        {
+            const std::vector<vector>& Cc = g.C();
+            GeometricField<vector> Uv;
+            Uv.internal.resize(static_cast<std::size_t>(nC));
+            for (label c = 0; c < nC; ++c)
+            {
+                Uv.internal[c] = vector{Cc[c].x*Cc[c].x, Cc[c].y, 0};
+            }
+            for (const FvPatch& q : fvp)
+            {
+                Uv.boundary.push_back(std::make_unique<FixedValuePatchField<vector>>(
+                    q, true, vector{0, 0, 0}, std::vector<vector>{}));
+            }
+            Uv.evaluateBoundary();
+            std::vector<scalar> flux(static_cast<std::size_t>(m.nInternalFaces()), scalar(1e-3));
+            InterMomentumInput up = base;
+            up.rhoPhi = &flux;
+            up.scheme = DivScheme::upwind;
+            InterMomentumInput ll = up;
+            ll.scheme = DivScheme::limitedLinear;
+            ll.schemeCoeff = scalar(0.2);
+            bool ran = true;
+            FvVectorMatrix Mu;
+            FvVectorMatrix Ml;
+            try
+            {
+                Mu = assembleUEqn(Uv, up, m, g, fvp);
+                Ml = assembleUEqn(Uv, ll, m, g, fvp);
+            }
+            catch (const std::exception& e)
+            {
+                std::printf("    threw: %s\n", e.what());
+                ran = false;
+            }
+            check("`Gauss limitedLinear` on div(rhoPhi,U) assembles", ran);
+            scalar dUpper = 0;
+            for (std::size_t f = 0; ran && f < Ml.upper.size(); ++f)
+            {
+                dUpper = std::fmax(dUpper, std::fabs(Ml.upper[f] - Mu.upper[f]));
+            }
+            std::printf("    limitedLinear 0.2 against upwind, largest upper-coefficient difference %.3e\n", dUpper);
+            check("...and not as upwind", dUpper > scalar(1e-6));
+        }
 
         // CONTROL: the ordinary damBreak configuration must assemble, or the refusals prove nothing.
         InterMomentumInput ok = base;

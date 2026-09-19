@@ -341,10 +341,19 @@ arm moving_RAS              refused "the mesh moves and the case is turbulent" "
 # a dictionary-form preconditioner other than GAMG or DIC is substituted under a notice, not run silently
 arm moving_precondDILU      runs    "preconditioner { DILU ... }" "" "sed -i '/p_rghFinal/,/^    }/ s/preconditioner  *GAMG;/preconditioner DILU;/' system/fvSolution"
 arm moving_precondNoSmoother refused "names no \`smoother\`" "" "sed -i '/p_rghFinal/,/^    }/ {/smoother/d}' system/fvSolution"
-# the tutorial's own vanLeerV runs (moving_baseline); the vector scheme brae still lacks does not
-arm moving_limitedLinear    refused "grad(magSqr(U))"          "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear 1;/' system/fvSchemes"
+# the tutorial's own vanLeerV runs (moving_baseline), and so does limitedLinear, gated on
+# eulerianInjection; the vector scheme brae still lacks does not
+arm moving_limitedLinear    runs    -                        "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear 1;/' system/fvSchemes"
 arm moving_unknownScheme    refused "Gauss QUICKV"             "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss QUICKV;/' system/fvSchemes"
 BASE="$B"
+
+# limitedLinear's coefficient has no default and must lie in [0, 1] (limitedLinear.H:67-76)
+arm ll_runs                 runs    -                        "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear 0.2;/' system/fvSchemes"
+arm ll_noCoeff              refused "with no coefficient"      "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear;/' system/fvSchemes"
+arm ll_coeffAboveOne        refused "outside [0, 1]"           "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear 1.5;/' system/fvSchemes"
+arm ll_coeffNegative        refused "outside [0, 1]"           "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear -0.1;/' system/fvSchemes"
+# its limiter's gradient is the case's grad(magSqr(U)) entry, and a least-squares one is not ported
+arm ll_gradMagSqrLSQ        refused "grad(magSqr(U)) leastSquares" "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear 0.2;/' system/fvSchemes; sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(magSqr(U)) leastSquares;/' system/fvSchemes"
 
 # PIMPLE controls the HOST honours...
 arm host_nOuter2            runs    -                        "" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' system/fvSolution"
@@ -390,6 +399,9 @@ BASE="$B"
 if [ $HAVE_GPU = 1 ]; then
     BASE="$BL"
     arm device_les          refused "the case is LES kEqn" "-device" true
+    # the device momentum's limitedLinear branch is 51% off OpenFOAM's U where the host agrees to 4e-12
+    BASE="$B"
+    arm device_limitedLinear refused "Gauss limitedLinear"    "-device" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear 0.2;/' system/fvSchemes"
     BASE="$B"
     # the device loop is handed the mesh WITHOUT the coupling attached, and refuses the pair by name
     BASE="$BB"

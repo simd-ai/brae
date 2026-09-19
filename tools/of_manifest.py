@@ -2173,8 +2173,8 @@ COMPONENTS = {
                   "interface crossed, so carrying one rho field is a 1000x error exactly at the interface. "
                   "(2) the momentum source is a reconstructed FACE flux, not a cell gradient, and "
                   "`solve(UEqn == R)` adds it with a PLUS where rhoSimpleFoam's twin carries the minus "
-                  "inside R. MRF, fvOptions, localEuler/CrankNicolson ddt and `Gauss limitedLinear` on "
-                  "div(rhoPhi,U) are refused by name."),
+                  "inside R. MRF, fvOptions and localEuler/CrankNicolson ddt are refused by name. `Gauss "
+                  "limitedLinear` on div(rhoPhi,U) was too, and runs now (interFoam_limitedLinear)."),
         dict(name="interFoam_pEqn", of_symbol="pEqn",
              of_file="applications/solvers/multiphase/interFoam/pEqn.H",
              classification="SHARED_NUMERICAL", status="REIMPLEMENT",
@@ -3423,6 +3423,35 @@ COMPONENTS = {
                   "it fell through the switch's `default` to upwind -- a -device run would have convected upwind "
                   "under the name `linear`. The shared cpu::DivScheme now has `linear` (deviceDivCentralCoeffs; "
                   "the mesh's own weights on the host) and the mapping names every scheme with no default."),
+        dict(name="interFoam_limitedLinear", of_symbol="limitedLinear",
+             of_file="src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedLinear/limitedLinear.C",
+             classification="SHARED_NUMERICAL", status="REIMPLEMENT",
+             brae_reference="src/applications/solvers/interFoam/inter_ueqn_cpp.cu",
+             validation="tests/interfoam_limitedlinear_vs_openfoam.sh, real OpenFOAM on "
+                        "laminar/vofToLagrangian/eulerianInjection AS ITS Allrun MESHES IT (blockMesh, topoSet, "
+                        "subsetMesh, the patch and collector sets, setFields) with the block at 45^3 in place of "
+                        "75^3, 90627 cells; its own `div(rhoPhi,U) Gauss limitedLinear 0.2`; 60 fixed steps of "
+                        "2e-5. MEASURED: alpha 9.2e-14, p_rgh 8.8e-12, U 2.7e-12, all 180 p_rgh counts OpenFOAM's; "
+                        "bounds at about 30x. THE CONTROLS, OpenFOAM against itself: `Gauss upwind` 8.0e-01, "
+                        "`Gauss limitedLinear 1` 7.8e-01. BROKEN ONCE EACH (U): the V form's weights 8.5e-01; "
+                        "magSqr's patch values taken from the face cells 4.3e-01; the coefficient ignored 7.8e-01; "
+                        "upwind in its place 8.0e-01; the limiter on mag(U) 8.2e-01. WHY 60 STEPS: the gap opens at "
+                        "step 68 in one near-air cell at the jet edge, where the density ratio of 1000 turns "
+                        "alpha's 4e-13 into rho's 3e-10, and reads U 1.2e-08 at 100; brae against itself with only "
+                        "the face interpolation's arithmetic reordered reads 2.9e-09 there, so that growth is the "
+                        "case's conditioning. NOT CLAIMED: the tutorial's 420k-cell mesh (a bench size), its "
+                        "Lagrangian function object (stripped), limitedLinear across a coupled patch (refused), "
+                        "and the device loop (refused by name).",
+             note="limitedLinear on a VECTOR is LimitedScheme<vector, limitedLinearLimiter<NVDTVD>, "
+                  "limitFuncs::magSqr> (LimitedScheme.H:185-189): ONE scalar limiter per face, computed on "
+                  "magSqr(U) with grad(magSqr(U)), carrying all three components -- not per component and not "
+                  "the V form. The host had the scalar weights already (limitedLinearWeights, k and epsilon); "
+                  "interFoam's momentum refused the scheme by name until now. The coefficient is read with no "
+                  "default and must lie in [0, 1] or OpenFOAM stops (limitedLinear.H:67-76); brae's reader "
+                  "used to default a missing one to 1, and now refuses both. THE DEVICE momentum has a "
+                  "limitedLinear branch that reads U 5.1e-01 against OpenFOAM on a DIC-smoother twin of this "
+                  "case at 50 steps, where the host reads 3.9e-12 and the device under upwind 1.1e-13; the "
+                  "device loop refuses the scheme and that branch is an open finding. HOST ONLY SO FAR."),
         dict(name="interFoam_nonOrthCorrection", of_symbol="correctedSnGrad",
              of_file="src/finiteVolume/finiteVolume/snGradSchemes/correctedSnGrad/correctedSnGrad.C",
              classification="SHARED_NUMERICAL", status="REIMPLEMENT",

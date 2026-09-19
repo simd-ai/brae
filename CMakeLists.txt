@@ -3486,6 +3486,15 @@ target_link_libraries(test_inter_les_vs_openfoam PRIVATE brae_core)
 add_test(NAME interfoam_les_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_les_vs_openfoam.sh)
 
+# interFoam with limitedLinear on div(rhoPhi,U) against real OpenFOAM on eulerianInjection. The script
+# carries the measurements, the controls and the fail-proofs.
+add_executable(test_inter_limitedlinear_vs_openfoam tests/test_inter_limitedlinear_vs_openfoam.cu)
+target_include_directories(test_inter_limitedlinear_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_limitedlinear_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_limitedlinear_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_limitedlinear_vs_openfoam.sh)
+
 # ...and the wave boundary conditions (waveAlpha, waveVelocity) on laminar/waves/stokesI: fields, the
 # patch values the wave model assigns, its two derived constants and the ORDER it updates in, all
 # against real OpenFOAM; the control is OpenFOAM's own answer with the wave switched off.
