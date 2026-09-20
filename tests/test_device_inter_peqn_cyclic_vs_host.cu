@@ -17,6 +17,12 @@
 //       that case; MEASURED, dropping the interface from the matrix leaves the row sums at 3.5e-17
 //       while arm (a) goes to 5.2e-02. What it does see is a diagonal added without its off-diagonal,
 //       or the reverse: 5.4e-02, measured. Both arms are here because neither covers the other.
+//   (a2) THE FLUX the solved pressure leaves on the pair, which is what pEqn.H:56 subtracts from
+//       phiHbyA. On a coupled patch fvMatrix::flux() is internalCoeffs*pif - boundaryCoeffs*pnf
+//       (fvMatrix.C:1483-1512), the same face flux an internal face gives. Device against host:
+//       1.4e-17 of fluxes up to 5.6e-02, both meshes, both schemes -- and the two schemes differ
+//       (5.16e-02 against 5.55e-02 on the skewed pair), so the flag is live here too. BROKEN once,
+//       the pressure gradient taken the other way round: 1.0e-01 to 1.1e-01, twice the flux itself.
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -165,6 +171,50 @@ int main(int argc, char** argv)
                     name, (double)worst, (double)scale);
         check("the device's assembled pressure operator IS the host's, interface included",
               worst <= scalar(1e-13)*std::fmax(scale, scalar(1e-300)));
+
+        // ---- (a2) the FLUX the solved pressure leaves on the pair ---------------------------------
+        // pEqn.H:56 writes phi = phiHbyA - p_rghEqn.flux(), and on a coupled patch fvMatrix::flux() is
+        // internalCoeffs*pif - boundaryCoeffs*pnf (fvMatrix.C:1483-1512, fv_matrix_ops.cuh:28-31) --
+        // the same face flux an internal face gives. The device subtracts ifCoeff*(p_nbr - p_own) from
+        // the pair's flux, which is that expression with the laplacian's own coefficient.
+        {
+            std::vector<scalar> phiIf(static_cast<std::size_t>(cyc.n), scalar(0));
+            DeviceCyclic cycF = buildDeviceCyclic(cyclics, g, fvp);
+            DevicePressureMatrix PF;
+            deviceInterAssemblePEqn(dm, dRAUf, zeroIf, zeroBf, /*needReference=*/false, 0, nullptr, PF,
+                                    corrected, nullptr, &cycF, &dRAU);
+            cycF.phi.copyFrom(phiIf);          // start from zero, so what is left IS the flux
+            DeviceBuffer<scalar> dP(psi);      // psi stands in for the solved p_rgh
+            deviceCyclicCorrectFlux(cycF, dP);
+            std::vector<scalar> devFlux;
+            cycF.phi.copyTo(devFlux);
+
+            std::vector<scalar> hostFlux;
+            for (const CyclicInterface& c : cyclics)
+            {
+                const FvPatch& Pp = fvp[c.patch];
+                for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+                {
+                    const scalar pif = psi[static_cast<std::size_t>(Pp.faceCells[i])];
+                    const scalar pnf = psi[static_cast<std::size_t>(c.nbrFaceCells[i])];
+                    hostFlux.push_back(-(host.internalCoeffs[c.patch][i]*pif
+                                       - host.boundaryCoeffs[c.patch][i]*pnf));
+                }
+            }
+            scalar worstF = 0, scaleF = 0;
+            for (std::size_t j = 0; j < devFlux.size() && j < hostFlux.size(); ++j)
+            {
+                worstF = std::fmax(worstF, std::fabs(devFlux[j] - hostFlux[j]));
+                scaleF = std::fmax(scaleF, std::fabs(hostFlux[j]));
+            }
+            std::printf("  %s: worst |flux device - host| %.4e (fluxes up to %.4e)\n",
+                        name, (double)worstF, (double)scaleF);
+            check("the flux the solved pressure leaves on the pair IS the host's",
+                  devFlux.size() == hostFlux.size()
+                  && worstF <= scalar(1e-14)*std::fmax(scaleF, scalar(1e-300)));
+            check("...and it is not identically zero, which a pair left out would be",
+                  scaleF > scalar(0));
+        }
 
         // ---- (b) the row sum ------------------------------------------------------------------------
         std::vector<scalar> ones(static_cast<std::size_t>(nC), scalar(1));
