@@ -254,6 +254,8 @@ void deviceInterStep(
         uin.porosityMu  = &porMu;
         uin.porosityRho = &rho;
     }
+    uin.cyc          = ctl.cyc;
+    uin.cycCorrected = ctl.correctedLaplacian;
     uin.mrf    = ctl.mrf;
     uin.mrfRho = ctl.mrf ? &rho : nullptr;
 
@@ -315,7 +317,12 @@ void deviceInterStep(
             DeviceBuffer<scalar> diagC, b;
             deviceFold(dm, UEqn.relaxed ? UEqn.relaxedDiag : UEqn.diag, *Sk[k],
                        UEqn.iC[k], UEqn.bC[k], diagC, b);
-            const DeviceLduView Ak = deviceLduView(dm, diagC, UEqn.upper, UEqn.lower);
+            // ...with the pair's off-diagonal, so the solve applies the operator that was assembled
+            const DeviceLduView Ak = (ctl.cyc && ctl.cyc->n > 0)
+                ? deviceLduViewCyclic(dm, diagC, UEqn.upper, UEqn.lower, ctl.cyc->n,
+                                      ctl.cyc->ownCell.data(), ctl.cyc->nbrCell.data(),
+                                      ctl.cyc->ifCoeff.data())
+                : deviceLduView(dm, diagC, UEqn.upper, UEqn.lower);
             DeviceBuffer<scalar> dNf;
             deviceNormFactorInto(Ak, *Uk[k], b, deviceOnes(nC), dNf);
             // the case's own smoother where it names one -- see deviceAlphaPreSolve for what a

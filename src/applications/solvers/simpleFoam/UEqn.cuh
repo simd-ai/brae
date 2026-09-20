@@ -35,7 +35,8 @@
 #include "rotor_disk.cuh"
 #include "actuation_disk.cuh"
 #include "device_ldu.cuh"
-#include "device_fvoptions.cuh"   // DevicePorosity + deviceFvoPorosityDiag/Source
+#include "device_fvoptions.cuh"
+#include "device_cyclic.cuh"   // DevicePorosity + deviceFvoPorosityDiag/Source
 #include "UEqn_cpp.cuh"   // cpu::DivScheme -- one enum shared by both paths
 
 namespace brae {
@@ -131,6 +132,13 @@ struct MomentumInput
     // ...and its mu and rho as FIELDS, for an equation in force units whose mixture varies by cell:
     // Cd = mu*D + rho*|U|*F with mu = rho*nu_laminar (DarcyForchheimer.C:214-217). Null keeps the
     // kinematic defaults, mu = nuLaminar and rho = 1.
+    // A PERIODIC PAIR. Its momentum coupling is an interface off-diagonal, not a boundary coefficient:
+    // deviceCyclicAssembleMomentum puts -(nuFace*dc*magSf) + min(phi,0) in ifCoeff and the matching
+    // diagonal in M.diag, and the relaxation's diagonal-dominance term has to count |ifCoeff| too or a
+    // periodic mesh relaxes against a diagonal it does not have. `cyc.phi` must hold the pair's CURRENT
+    // flux before this is called. Null = a mesh with no pair, which is every case that had one before.
+    DeviceCyclic* cyc = nullptr;
+    bool cycCorrected = true;          // the diffusion half's delta coefficients, as the laplacian's
     const DeviceBuffer<scalar>* porosityMu = nullptr;
     const DeviceBuffer<scalar>* porosityRho = nullptr;
     // rotorDiskSource. OF addSup is `eqn -= force` with force PER VOLUME, and operator-= is

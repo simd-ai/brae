@@ -118,6 +118,12 @@ struct DeviceInterStepControls
     // OptionList (its transformed D and F tensors). Every other option type stays host-only and the
     // driver refuses it by name.
     const DevicePorosity* porosity = nullptr;
+    // THE MESH'S PERIODIC PAIR. Every piece it needs is gated against the host on its own
+    // (tests/test_device_cyclic_laplacian_vs_host.cu, test_device_mules_cyclic_vs_host.cu,
+    // test_device_inter_peqn_cyclic_vs_host.cu). `cyc->phi` must hold the pair's CURRENT flux -- the
+    // momentum coupling reads it for its convective half -- which is why the alpha step has to fill it
+    // before the momentum matrix is assembled.
+    DeviceCyclic* cyc = nullptr;
     DeviceInterAlphaControls  alpha;
     DeviceMulesControls       mules;
     // The alpha equation's per-step settings -- cAlpha, deltaN and the two flux schemes. The flux

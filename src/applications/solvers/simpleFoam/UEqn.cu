@@ -340,6 +340,15 @@ void assembleUEqn(
                                     in.porosityMu, in.porosityRho);
     }
 
+    // ---- the PERIODIC PAIR's momentum coupling ----------------------------------------------
+    // Gated face by face against the host's own coupled coefficients in
+    // tests/test_device_cyclic_laplacian_vs_host.cu. It goes in before relax, with every other
+    // coefficient, because relax reads the diagonal it leaves.
+    if (in.cyc && in.cyc->n > 0)
+    {
+        deviceCyclicAssembleMomentum(*in.cyc, *in.nuEffCell, M.diag, nullptr, in.cycCorrected);
+    }
+
     // ---- fvm::ddt(rho, U), for a transient momentum equation --------------------------------
     // BEFORE relax(), as the fvMatrix constructor's `+` puts it. rho and rho.oldTime() are separate
     // fields on purpose -- see device_inter_ueqn.cuh.
@@ -368,8 +377,20 @@ void assembleUEqn(
         deviceCmptMin3   (M.iC[0], M.iC[1], M.iC[2], iCmin);
 
         const DeviceLduView A = M.view(dm);
+        // ...and the pair's off-diagonal in the dominance term: without it the clamp is computed
+        // against a row that is missing its periodic neighbour (device_simple.cuh, cycSumOff).
+        DeviceBuffer<scalar> cycSumOff;
+        if (in.cyc && in.cyc->n > 0)
+        {
+            cycSumOff.resize(static_cast<std::size_t>(dm.nCells));
+            cudaCheck(cudaMemsetAsync(cycSumOff.data(), 0,
+                                      static_cast<std::size_t>(dm.nCells)*sizeof(scalar),
+                                      cudaStreamPerThread), "cyclic sumOff zero");
+            deviceCyclicOffDiagSum(*in.cyc, cycSumOff);
+        }
         deviceRelaxDiag(A, dm, M.iC[0], in.relaxU, M.relaxedDiag, M.delta,
-                        nullptr, iCmaxMag.data(), iCmin.data());
+                        (in.cyc && in.cyc->n > 0) ? cycSumOff.data() : nullptr,
+                        iCmaxMag.data(), iCmin.data());
         M.relaxed = true;
 
         // source += (relaxedDiag - rawDiag) * psi, per component -- the reference's
