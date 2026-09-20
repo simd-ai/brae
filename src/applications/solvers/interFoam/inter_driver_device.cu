@@ -1308,6 +1308,9 @@ RunReport runInterFoamDevice(
                 ti.rhoPhiBnd = &dRpB;
                 ti.rho = &dRho;
                 ti.rhoBnd = &dStepRhoBnd;
+                ti.cyc       = (dCyc.n > 0) ? &dCyc : nullptr;
+                ti.cycPhi    = (dCyc.n > 0) ? &dCyc.phi : nullptr;
+                ti.cycRhoPhi = (dCyc.n > 0) ? &dRhoPhiIf : nullptr;
                 ti.rhoOld = &dRhoOld;
                 ti.nu = &dStepNu;
                 ti.nuBnd = &dStepNuBnd;
@@ -1337,6 +1340,31 @@ RunReport runInterFoamDevice(
                         const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
                         f.rhoPhi.boundary[pi].assign(rb.begin() + off, rb.begin() + off + n);
                         off += n;
+                    }
+                    // ...and the PAIR's own faces, which that array does not carry. The host
+                    // reference fills rhoPhi on every patch, coupled included
+                    // (alpha_eqn_cpp.cu:389-394), so leaving them here is a value from before the
+                    // step -- and this block is a GATE'S INSTRUMENT, whose whole job is to say
+                    // whether a disagreement is the closure's or the loop's.
+                    // NOT DISCRIMINATED by any gate in the tree: the closure reads rhoPhi only under
+                    // `density variable` (inter_turbulence_cpp.cu:531) and no coupled fixture sets
+                    // it, so the baffle gate's five profiles read identically with and without this
+                    // block, to every digit. It is here because the reference's contract says so.
+                    if (dCyc.n > 0 && !cyclics.empty())
+                    {
+                        std::vector<scalar> rif;
+                        dRhoPhiIf.copyTo(rif);
+                        std::size_t o = 0;
+                        for (const CyclicInterface& c : cyclics)
+                        {
+                            const std::size_t pi = static_cast<std::size_t>(c.patch);
+                            const std::size_t n = c.faceCells.size();
+                            if (pi < f.rhoPhi.boundary.size() && o + n <= rif.size())
+                            {
+                                f.rhoPhi.boundary[pi].assign(rif.begin() + o, rif.begin() + o + n);
+                            }
+                            o += n;
+                        }
                     }
                 }
                 InterTurbulenceStepInput ti;
@@ -1434,16 +1462,14 @@ RunReport runInterFoamDevice(
                                                + f.U.internal[c].y*f.U.internal[c].y
                                                + f.U.internal[c].z*f.U.internal[c].z));
     {
-        std::vector<scalar> pb;
-        dPhiB.copyTo(pb);
+        // dPhiB carries ONLY the non-coupled patches (device_mesh.cuh:41-44), and the pair's own faces
+        // come from the interface array. Walking fvp whole here shifted every patch after the first
+        // coupled one: MEASURED on damBreakPorousBaffle, this report read worst |div(phi)| 2.875e-01
+        // against the host's 7.932e-05 on a run whose max|U| agreed to every digit.
+        pushFlux();
         SurfaceScalarField phiOut;
         phiOut.internal = f.phi.internal;
-        phiOut.boundary.resize(fvp.size());
-        { label o = 0;
-          for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-          { for (label i = 0; i < fvp[pi].size; ++i) phiOut.boundary[pi].push_back(pb[o + i]);
-            o += fvp[pi].size; } }
-        f.phi.boundary = phiOut.boundary;
+        phiOut.boundary = f.phi.boundary;
         const std::vector<scalar> d = fvc::div(phiOut, m, g, fvp);
         rep.worstDivPhi = 0;
         for (label c = 0; c < nC; ++c) rep.worstDivPhi = std::fmax(rep.worstDivPhi, std::fabs(d[c]));

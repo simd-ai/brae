@@ -126,6 +126,13 @@ struct DeviceInterTurbulenceStepInput
     const DeviceBuffer<scalar>* rhoPhiBnd = nullptr;
     const DeviceBuffer<scalar>* rho = nullptr;
     const DeviceBuffer<scalar>* rhoBnd = nullptr;
+    // A PERIODIC PAIR, and the two fluxes on its own faces: the VOLUMETRIC one (phiByRho, which
+    // divU takes) and the EQUATION's (which the transport matrix and divPhi take). They are one
+    // field in the uniform lineage and two in the variable-density one, exactly as phiInt and
+    // phiByRhoInt are. Null = a mesh with no pair.
+    DeviceCyclic*               cyc          = nullptr;
+    const DeviceBuffer<scalar>* cycPhi       = nullptr;   // volumetric, on the pair
+    const DeviceBuffer<scalar>* cycRhoPhi    = nullptr;   // mass, on the pair
     // rho.oldTime(): the density the time step STARTED on
     const DeviceBuffer<scalar>* rhoOld = nullptr;
     const DeviceBuffer<scalar>* nu = nullptr;

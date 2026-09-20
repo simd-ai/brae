@@ -107,35 +107,23 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
               "other is not.");
     }
 
-    // WHAT A COUPLED PATCH STILL COSTS THIS CLOSURE. gpu::kEpsilonRAS refuses one at its own entry
-    // (kEpsilon.cu:504) and that refusal is right: this is not a missing argument but five sites, and
-    // the OF-mirror closure carries its own grad, div, assembly and solve rather than calling the
-    // legacy deviceKEpsilonCorrect -- which DOES take a `DeviceCyclic*` and is exercised through it
-    // by device_simple_foam.cu, so the kernels underneath are not the gap. What is:
-    //   1. gpu::turbulence::assembleScalarTransport (turbulence_transport.cuh:149) takes no pair, so
-    //      k's and epsilon's matrices have no interface off-diagonal: across a pair the two sides are
-    //      two walls for both the convection and the diffusion.
-    //   2. their solves build a plain deviceLduView, so even a correct matrix would be solved without
-    //      the interface (the same split the pressure step needed deviceLduViewCyclic for).
-    //   3. fvc::grad(U) for the production term (kEpsilon.cu:601-603) sums no coupled face.
-    //   4. divU and divPhi (kEpsilon.cu:608-609) likewise; interfaceAddDiv is what the legacy path
-    //      uses for exactly this.
-    //   5. correctNut's boundary assignment: OpenFOAM ends `nut_ = Cmu*sqr(k)/epsilon` with
-    //      correctLocalBoundaryConditions(), so a constraint patch gets the RESULT's two cells
-    //      interpolated, and Cmu*k_b^2/eps_b != interpolate(Cmu*k^2/eps). This one is a question for
-    //      the HOST closure too (kEpsilon_cpp.cu:918-924).
-    // MEASURED with the pair dropped, RAS/damBreakPorousBaffle, twenty steps against OpenFOAM: nut
-    // 1.8e-01 relative and U 1.1e-02. Refused rather than run the pair as a wall in the closure.
-    for (std::size_t pi = 0; pi < patches.size(); ++pi)
-    {
-        if (!patches[pi].coupled) continue;
-        throw std::runtime_error(
-            "brae interFoam (device): the case is RAS and patch `" + patches[pi].name + "` is a "
-            "coupled pair. k's and epsilon's transport across it is an interface off-diagonal the "
-            "device closure is not given, so they would be solved as if the pair were two walls. "
-            "The host closure runs it -- BRAE_INTER_HOST_CLOSURE=1 in this same device loop, or the "
-            "host path (no -device).");
-    }
+    // A COUPLED PATCH RUNS HERE NOW, and it took five sites, each of which is a number that is
+    // nearly right rather than a missing one:
+    //   1. the transport matrix -- k and epsilon are fvm::div - fvm::laplacian, the momentum's shape,
+    //      so across a pair they take the momentum's interface coefficient, with the diffusivity as
+    //      CELLS (a coupled face takes fvc::interpolate's value) and the pair's OWN convecting flux;
+    //   2. the solve, whose LDU view has to carry that off-diagonal or it runs a different operator
+    //      from the matrix;
+    //   3. fvc::grad(U) for the production term;
+    //   4. divU and divPhi, EACH with its own flux -- the volumetric one and the equation's, which
+    //      are one field only in the incompressible lineage;
+    //   5. correctNut's boundary: correctNut() ends with nut_.correctBoundaryConditions()
+    //      (kEpsilon.C:45-46), so a constraint patch takes lerp(pnf, pif, w) -- the two CELLS of the
+    //      nut just written -- and not Cmu*k_b^2/eps_b, which is a non-linear function of k's and
+    //      epsilon's own patch values.
+    // WHAT IS STILL REFUSED is a leastSquares grad(U) on a pair (deviceLeastSquaresGradU carries no
+    // interface) and a non-upwind div scheme for k or epsilon, both by name, at the sites themselves.
+
     d.wall = buildDeviceWallData(m, g, patches, U, wfPatch);
 
     const std::vector<std::vector<scalar>> yW = nearWallDist(m, g, patches);
@@ -439,11 +427,17 @@ void deviceCorrectInterTurbulence(
     // divU and the flux-conditional patches read the volumetric phi in BOTH lineages
     kin.phiByRhoInt = in.phiInt;
     kin.phiByRhoBnd = in.phiBnd;
+    // THE PAIR, with each flux going where its internal-face twin goes. Without this the closure
+    // solves k and epsilon as if the pair were two walls -- MEASURED on RAS/damBreakPorousBaffle,
+    // twenty steps against OpenFOAM: k 4.7e-01, epsilon 4.6e-01, nut 1.8e-01.
+    kin.cyc         = in.cyc;
+    kin.cycPhiByRho = in.cycPhi;
     kin.bcPhiBnd = in.phiBnd;
     if (t.variableDensity)
     {
         kin.phiInt = in.rhoPhiInt;
         kin.phiBnd = in.rhoPhiBnd;
+        kin.cycPhi = in.cycRhoPhi;
         kin.rhoCell = in.rho;
         kin.rhoBndFace = in.rhoBnd;
         kin.rhoOldCell = in.rhoOld;
@@ -452,6 +446,7 @@ void deviceCorrectInterTurbulence(
     {
         kin.phiInt = in.phiInt;
         kin.phiBnd = in.phiBnd;
+        kin.cycPhi = in.cycPhi;
         kin.rhoCell = &d.onesCell;
         kin.rhoBndFace = &d.onesBnd;
         kin.rhoOldCell = &d.onesCell;
@@ -541,6 +536,17 @@ void downloadDeviceInterTurbulence(
     std::size_t off = 0;
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
+        // A COUPLED PATCH IS NOT IN d.nutBnd (the device's boundary layout), so walking every patch
+        // here reads the next patch's faces and runs off the end at the last -- the same shape the
+        // driver's flattens had. What it takes instead is what OpenFOAM gives it: correctNut() ends
+        // with nut_.correctBoundaryConditions() (kEpsilon.C:45-46), and on a constraint patch that is
+        // coupledFvPatchField::evaluate, lerp(patchNeighbourField, patchInternalField, weights) --
+        // the two CELLS of the nut just written, and not Cmu*k_b^2/eps_b.
+        if (isCoupledInterfaceType(patches[pi].type))
+        {
+            t.nut.boundary[pi]->evaluate(t.nut.internal);
+            continue;
+        }
         const std::size_t n = static_cast<std::size_t>(patches[pi].size);
         t.nut.boundary[pi]->setValue(std::vector<scalar>(nb.begin() + off, nb.begin() + off + n));
         off += n;

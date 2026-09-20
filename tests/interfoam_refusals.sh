@@ -495,7 +495,11 @@ if [ $HAVE_GPU = 1 ]; then
     # (tests/interfoam_cyclic_vs_openfoam.sh's `jump` profile measures them), so what it refuses is
     # the one thing left: the case sets `nOuterCorrectors 3` and the device loop runs one.
     BASE="$BB"
-    arm device_baffle       refused "k's and epsilon's transport across it" "-device" true
+    # the baffle tutorial RUNS on the device now -- pair, jump, nOuterCorrectors 3 and a RAS closure
+    # whose k and epsilon cross the pair; tests/interfoam_baffle_vs_openfoam.sh measures it against
+    # OpenFOAM. The shipped binary attaches the coupling itself, so this arm runs; the mesh handed over
+    # UNCOUPLED is still refused by name, and test_inter_baffle_vs_openfoam.cu holds that refusal.
+    arm device_baffle       runs    -                        "-device" true
     BASE="$B"
     # the device's gradient operators are Gauss linear; a limited or least-squares one is refused
     arm device_gradLsq      refused "leastSquares or cellLimited" "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         leastSquares;/' system/fvSchemes"

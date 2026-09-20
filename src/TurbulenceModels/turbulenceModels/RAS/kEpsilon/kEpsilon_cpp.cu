@@ -896,6 +896,17 @@ void correctNutField(
         // cell nut just assigned, inflow faces taking the inletValue. MEASURED on RAS/waterChannel under
         // kOmegaSST with `outlet inletOutlet; inletValue 0.002`: skipped, nut 8.5e-04 from OpenFOAM after
         // ten steps and U 9.2e-07 (tests/interfoam_waterchannel_vs_openfoam.sh `nutOutlet`).
+        // A COUPLED PATCH TAKES THE TWO CELLS, not Cmu*k_b^2/eps_b. correctNut() ends with
+        // nut_.correctBoundaryConditions() (kEpsilon.C:45-46), and on a constraint patch that is
+        // coupledFvPatchField::evaluate -- lerp(patchNeighbourField, patchInternalField, weights),
+        // i.e. w*nut_own + (1 - w)*nut_nbr of the nut JUST ASSIGNED. It is not the same number as the
+        // assignment's: Cmu*k_b^2/eps_b is a non-linear function of k and epsilon's own interpolated
+        // patch values, and interpolate(Cmu*k^2/eps) is the interpolation of the result.
+        if (patches[pi].coupled)
+        {
+            nutField.boundary[pi]->evaluate(nutF);
+            continue;
+        }
         if (nutField.boundary[pi]->isInletOutlet())
         {
             if (!comp || !comp->nutPhi || comp->nutPhi->boundary.size() <= pi)
