@@ -50,13 +50,16 @@ void cyclicAmulKernel(
     const label* __restrict__ own,
     const label* __restrict__ nbr,
     const scalar* __restrict__ coeff,
+    const scalar* __restrict__ jump,        // already signed; null = no jump on this pair
     const scalar* __restrict__ psi,
     scalar* __restrict__ Apsi)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= nCyc) return;
 
-    atomicAdd(&Apsi[own[j]], coeff[j] * psi[nbr[j]]);
+    // jumpCyclicFvPatchField::updateInterfaceMatrix: the neighbour value is psi[nbr] - jump
+    const scalar pnf = jump ? (psi[nbr[j]] - jump[j]) : psi[nbr[j]];
+    atomicAdd(&Apsi[own[j]], coeff[j] * pnf);
 }
 
 
@@ -100,7 +103,8 @@ void amiAmulKernel(
 // and the coalescing won; in FP64 it trades 21 MB for 42 on top of a refill pass, and the extra bytes
 // eat the gain. The cost here is bandwidth, and a layout that doubles the bytes cannot fix bandwidth.
 
-void deviceAmul(const DeviceLduView& A, const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi)
+void deviceAmul(const DeviceLduView& A, const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi,
+                bool onField)
 {
     Apsi.resize(A.nCells);
     const int blocks = (A.nCells + TPB - 1) / TPB;
@@ -109,7 +113,9 @@ void deviceAmul(const DeviceLduView& A, const DeviceBuffer<scalar>& psi, DeviceB
     cudaCheck(cudaGetLastError(), "amul");
     if (A.nCyc > 0)
     {
-        cyclicAmulKernel<<<(A.nCyc + TPB - 1) / TPB, TPB>>>(A.nCyc, A.cycOwn, A.cycNbr, A.cycCoeff, psi.data(), Apsi.data());
+        cyclicAmulKernel<<<(A.nCyc + TPB - 1) / TPB, TPB>>>(A.nCyc, A.cycOwn, A.cycNbr, A.cycCoeff,
+                                                            onField ? A.cycJump : nullptr,
+                                                            psi.data(), Apsi.data());
         cudaCheck(cudaGetLastError(), "cyclicAmul");
     }
     if (A.nAmi > 0)

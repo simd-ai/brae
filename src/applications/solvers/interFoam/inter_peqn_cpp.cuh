@@ -259,6 +259,17 @@ struct PressureTaps
     std::vector<std::vector<scalar>> rAUfBnd;
     // (phig - p_rghEqn.flux()) per patch, the reconstruction's own input
     std::vector<std::vector<scalar>> ffBnd;
+    // phiHbyA per patch BEFORE `phiHbyA += phig`, i.e. fvc::flux(HbyA) + the ddtCorr term there
+    std::vector<std::vector<scalar>> phiHbyABndPrePhig;
+    // UEqn's boundary coefficients per patch, x component -- on a coupled patch this is the interface
+    // off-diagonal H() reads
+    std::vector<std::vector<scalar>> uEqnBCx;
+    // ...and the rest of UEqn, for bisecting H() term by term: H = (bdDiag*psi + lduH(psi) + source
+    // + boundarySource)/V, so every one of these is a separate question
+    std::vector<scalar> uEqnDiag, uEqnUpper, uEqnLower, uEqnSourceX;
+    // p_rgh's JUMP per patch, as the last assembly left it
+    std::vector<std::vector<scalar>> jumpBnd;
+    std::vector<std::vector<scalar>> uEqnICx;
 };
 
 // One p_rgh solve as the solver itself reports it -- see inter_solve_record.cuh.

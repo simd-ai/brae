@@ -252,7 +252,7 @@ int main()
     hooks.pressure.pressureCoeffs =
         [&](const DeviceBuffer<scalar>&, const DeviceBuffer<scalar>&,
             const DeviceBuffer<scalar>& rAUfInt, const DeviceBuffer<scalar>&,
-            DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC)
+            DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC, DeviceBuffer<scalar>&)
     {
         std::vector<scalar> rf;
         rAUfInt.copyTo(rf);

@@ -529,6 +529,12 @@ struct HostGSCache
     DeviceBuffer<scalar> Ax[GS_FUSED_MAX], r[GS_FUSED_MAX];
     DeviceBuffer<scalar> gRes, gNf;                       // sum|r| per component; the normFactors (device)
     scalar* hRes = nullptr;                               // pinned, GS_FUSED_MAX
+    // the COUPLED INTERFACE, brought down with the matrix. Its coefficients change with every
+    // assembly, so they come down per call like diag and b; the addressing comes with them because it
+    // is a handful of faces and keying it would be one more cache to get wrong.
+    std::vector<label>  cycOwn, cycNbr, amiOwn, amiOff, amiNbr;
+    std::vector<scalar> cycCoeff[GS_FUSED_MAX], amiW, amiIfc[GS_FUSED_MAX];
+    std::vector<scalar> cycJump[GS_FUSED_MAX];
 };
 __global__ void hostGsNormK(int n, const scalar* __restrict__ sum, const scalar* __restrict__ nf, scalar* __restrict__ out)
 {
@@ -544,6 +550,27 @@ void pinnedResize(scalar*& p, std::size_t n)
 // symGaussSeidelSmoother.C:143-198 / GaussSeidelSmoother.C:143-172, verbatim: bPrime = source, the
 // ascending walk gathering the upper side and distributing the lower, the descending walk re-reading
 // the bPrime the ascending one left. tests/gs_ladder LEG 1 holds this to OpenFOAM's residual ladder.
+// ONE COUPLED INTERFACE, as the sweep sees it. OpenFOAM's Gauss-Seidel does not sweep the interface:
+// every sweep starts `bPrime = source` and then calls updateMatrixInterfaces with the CURRENT psi
+// (GaussSeidelSmoother.C:117-143), which moves the interface's contribution to the right-hand side --
+// "the parallel boundary is treated as an effective jacobi interface in the boundary". Splitting
+// A = A_internal + A_interface, the sweep solves A_internal*psi = b - A_interface*psi_old, and
+// deviceAmul defines A_interface for this tree as Apsi[own] += coeff*psi[nbr] (device_ldu.cuh:28-33).
+struct HostGSInterface
+{
+    int nCyc = 0;
+    const label*  cycOwn = nullptr;
+    const label*  cycNbr = nullptr;
+    const scalar* cycCoeff = nullptr;
+    const scalar* cycJump = nullptr;      // already signed; the sweep's operand IS the solution field
+    int nAmi = 0;
+    const label*  amiOwn = nullptr;
+    const label*  amiOff = nullptr;
+    const label*  amiNbr = nullptr;
+    const scalar* amiW = nullptr;
+    const scalar* amiIfc = nullptr;
+};
+
 void hostSweep(
     const HostGSTopo& t,
     const scalar* __restrict__ upper,
@@ -552,12 +579,34 @@ void hostSweep(
     const scalar* __restrict__ b,
     scalar* __restrict__ psi,
     scalar* __restrict__ bPrime,
-    bool symmetric)
+    bool symmetric,
+    const HostGSInterface* ifc = nullptr)
 {
     const label nC = t.nC;
     const label* __restrict__ ownStart = t.ownStart.data();
     const label* __restrict__ nei      = t.nei.data();
     std::memcpy(bPrime, b, (std::size_t)nC*sizeof(scalar));
+    // ...and the interface, on the field as it stands at the TOP of this sweep
+    if (ifc)
+    {
+        for (int j = 0; j < ifc->nCyc; ++j)
+        {
+            // the sweep runs on psi itself, which is the one operand a jump cyclic subtracts its jump
+            // from (jumpCyclicFvPatchField.C:169-177)
+            const scalar pnf = ifc->cycJump ? (psi[ifc->cycNbr[j]] - ifc->cycJump[j])
+                                            : psi[ifc->cycNbr[j]];
+            bPrime[ifc->cycOwn[j]] -= ifc->cycCoeff[j]*pnf;
+        }
+        for (int i = 0; i < ifc->nAmi; ++i)
+        {
+            scalar acc = 0;
+            for (label k = ifc->amiOff[i]; k < ifc->amiOff[i + 1]; ++k)
+            {
+                acc += ifc->amiW[k]*psi[ifc->amiNbr[k]];
+            }
+            bPrime[ifc->amiOwn[i]] -= ifc->amiIfc[i]*acc;
+        }
+    }
     for (label c = 0; c < nC; ++c)
     {
         scalar psii = bPrime[c];
@@ -629,6 +678,47 @@ void hostSymGaussSeidelFused(
     // the folded system and the field, down (one sync); the initial residuals on the device meanwhile
     cudaMemcpyAsync(c.upper, A0.upper, (std::size_t)nF*sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread);
     cudaMemcpyAsync(c.lower, A0.lower, (std::size_t)nF*sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread);
+    // ...and the interface, whose contribution every sweep moves to the right-hand side
+    const int nCyc = A0.nCyc, nAmi = A0.nAmi;
+    if (nCyc > 0)
+    {
+        c.cycOwn.resize((std::size_t)nCyc);
+        c.cycNbr.resize((std::size_t)nCyc);
+        cudaMemcpyAsync(c.cycOwn.data(), A0.cycOwn, (std::size_t)nCyc*sizeof(label), cudaMemcpyDeviceToHost, cudaStreamPerThread);
+        cudaMemcpyAsync(c.cycNbr.data(), A0.cycNbr, (std::size_t)nCyc*sizeof(label), cudaMemcpyDeviceToHost, cudaStreamPerThread);
+        for (int k = 0; k < nComp; ++k)
+        {
+            c.cycCoeff[k].resize((std::size_t)nCyc);
+            cudaMemcpyAsync(c.cycCoeff[k].data(), comps[k].A->cycCoeff, (std::size_t)nCyc*sizeof(scalar),
+                            cudaMemcpyDeviceToHost, cudaStreamPerThread);
+            c.cycJump[k].clear();
+            if (comps[k].A->cycJump)
+            {
+                c.cycJump[k].resize((std::size_t)nCyc);
+                cudaMemcpyAsync(c.cycJump[k].data(), comps[k].A->cycJump, (std::size_t)nCyc*sizeof(scalar),
+                                cudaMemcpyDeviceToHost, cudaStreamPerThread);
+            }
+        }
+    }
+    if (nAmi > 0)
+    {
+        c.amiOwn.resize((std::size_t)nAmi);
+        c.amiOff.resize((std::size_t)nAmi + 1);
+        cudaMemcpyAsync(c.amiOwn.data(), A0.amiOwn, (std::size_t)nAmi*sizeof(label), cudaMemcpyDeviceToHost, cudaStreamPerThread);
+        cudaMemcpyAsync(c.amiOff.data(), A0.amiOff, ((std::size_t)nAmi + 1)*sizeof(label), cudaMemcpyDeviceToHost, cudaStreamPerThread);
+        cudaStreamSynchronize(cudaStreamPerThread);       // amiOff sizes the stencil below
+        const std::size_t nW = (std::size_t)c.amiOff[nAmi];
+        c.amiNbr.resize(nW);
+        c.amiW.resize(nW);
+        cudaMemcpyAsync(c.amiNbr.data(), A0.amiNbr, nW*sizeof(label), cudaMemcpyDeviceToHost, cudaStreamPerThread);
+        cudaMemcpyAsync(c.amiW.data(), A0.amiW, nW*sizeof(scalar), cudaMemcpyDeviceToHost, cudaStreamPerThread);
+        for (int k = 0; k < nComp; ++k)
+        {
+            c.amiIfc[k].resize((std::size_t)nAmi);
+            cudaMemcpyAsync(c.amiIfc[k].data(), comps[k].A->amiIfc, (std::size_t)nAmi*sizeof(scalar),
+                            cudaMemcpyDeviceToHost, cudaStreamPerThread);
+        }
+    }
     scalar nf[GS_FUSED_MAX], init[GS_FUSED_MAX], fin[GS_FUSED_MAX];
     int iter[GS_FUSED_MAX], active[GS_FUSED_MAX], startedActive[GS_FUSED_MAX];
     for (int k = 0; k < nComp; ++k)
@@ -679,9 +769,25 @@ void hostSymGaussSeidelFused(
             const scalar* bb = c.b[k];
             scalar* ps = c.psi[k];
             scalar* bp = c.bPrime[k].data();
+            HostGSInterface ifc;
+            ifc.nCyc = nCyc;
+            ifc.cycOwn = c.cycOwn.data();
+            ifc.cycNbr = c.cycNbr.data();
+            ifc.cycCoeff = c.cycCoeff[k].data();
+            ifc.cycJump = c.cycJump[k].empty() ? nullptr : c.cycJump[k].data();
+            ifc.nAmi = nAmi;
+            ifc.amiOwn = c.amiOwn.data();
+            ifc.amiOff = c.amiOff.data();
+            ifc.amiNbr = c.amiNbr.data();
+            ifc.amiW = c.amiW.data();
+            ifc.amiIfc = c.amiIfc[k].data();
+            const bool haveIfc = (nCyc > 0 || nAmi > 0);
             pool.emplace_back([=, &topo]()
             {
-                for (int sw = 0; sw < sweepsPer; ++sw) hostSweep(topo, up, lo, dg, bb, ps, bp, symmetric);
+                for (int sw = 0; sw < sweepsPer; ++sw)
+                {
+                    hostSweep(topo, up, lo, dg, bb, ps, bp, symmetric, haveIfc ? &ifc : nullptr);
+                }
             });
         }
         for (auto& th : pool) th.join();

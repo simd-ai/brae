@@ -125,6 +125,14 @@ RunReport runInterFoamDevice(
     // stf and snGrad(rho) on the pair, refilled by the interfaceForces hook every step; ghf is the
     // mesh's and is built once, below.
     DeviceBuffer<scalar> dStfIf, dSnRhoIf, dGhfIf;
+    // The pair's flux, for the HOST fields the hooks read. cyc.phi is the device's copy and the only
+    // current one; a condition that looks phi up on a coupled patch -- porousBafflePressure computes
+    // its jump from it -- reads f.phi.boundary there, which the unflatten deliberately does not touch
+    // (that array has no coupled patch in it). Set once the DeviceCyclic exists.
+    const DeviceBuffer<scalar>* cycPhiForHost = nullptr;
+    // ...and nHatf on the pair, which outlives the step: the first corrector's phir reads the normal
+    // the LAST mixture.correct() left, and without MULESCorr that is the previous TIME STEP's.
+    DeviceBuffer<scalar> dNHIf;
     // FIRST among the device refusals: the model is what a reader of the message has to change, and
     // every refusal below is about the loop around it
     // (kOmegaSST runs on this loop now: device_inter_turbulence.cu's SST branch hands the closure
@@ -151,35 +159,31 @@ RunReport runInterFoamDevice(
             + "). The device loop's UEqn applies explicitPorositySource/DarcyForchheimer only; the host "
             "loop carries this one. Refused rather than run the case without it.");
     }
-    // WHAT THE PAIR STILL DOES NOT CARRY, and it is the ALPHA STEP and nothing below it. MEASURED on
-    // validation/interFoamCyclic against brae's own host loop, which is OpenFOAM's on that case to
-    // alpha 1.9e-13:
-    //   step one   alpha exact, U 1.3e-10 of 2.2, p_rgh 6.1e-06 of 1.6e+03 -- the pressure corrector,
-    //              phig, fvc::reconstruct, HbyA and the flux all agree on the pair (phig 5.6e-17 of
-    //              1.4e-01, rAUf 8.7e-19, phig - p_rghEqn.flux() 2.1e-13 of 2.4e-03)
-    //   step two   alpha 7.8e-02, ALL of it in the pair's own cells (6.0e-05 everywhere else), and the
-    //              pressure follows it because rho does
-    // The alpha step is the first stage of the step, so nothing above it can be the cause; its inputs
-    // -- phi, the pair's own flux, alpha and rho -- all agree to 1e-13 going in. The error is the same
-    // with `Gauss upwind` in place of the case's vanLeer (8.8e-02), with cAlpha 0 (1.0e-01) and with
-    // nAlphaCorr 1 (6.9e-02), so it is not the limiter, the compression or the corrector count.
-    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-    {
-        if (!fvp[pi].coupled) continue;
-        throw std::runtime_error(
-            "brae interFoam (device): patch `" + fvp[pi].name + "` is a coupled pair, and the device "
-            "ALPHA step does not yet reproduce the host's across it from the second time step (the "
-            "first is exact). The pressure corrector does -- phig, the flux and fvc::reconstruct all "
-            "carry the pair now. The host loop (no -device) runs the case. Run without -device.");
-    }
+    // THE PAIR RUNS ON THE DEVICE. validation/interFoamCyclic, ten steps of 2e-3, against real
+    // OpenFOAM: alpha 4.2e-11, p_rgh 1.98e-11 relative of 1.6e+03, U 5.7e-11 relative -- and the same
+    // three against brae's own host loop. FIVE THINGS HAD TO CARRY THE PAIR, and every one of them is
+    // identically zero at the first step of a case at rest, which is why only a multi-step fixture
+    // could see them: the host<->device boundary-array layout (ten flatten sites), the momentum
+    // matrix's OWN interface coefficient in fvMatrix::H(), the Gauss-Seidel smoother applying the
+    // interface to its right-hand side every sweep, fvc::ddtCorr, and divDevReff's grad(U) and its
+    // stress flux.
 
-    // A JUMP ON THE PAIR. The device's interface coefficient is one number per face -- the laplacian's
-    // or the momentum's -- and a jumpCyclic's neighbour value is the cell across LESS the jump
-    // (jumpCyclicFvPatchField.C, patchNeighbourField), which nothing in DeviceCyclic carries. The pair
-    // is coupled on this path now, so without this the jump would simply not appear in the pressure
-    // equation: a porousBafflePressure baffle would behave as a plain periodic face, which is the
-    // silent substitution this port keeps refusing. The host loop carries it (gated on
-    // RAS/damBreakPorousBaffle).
+    // A JUMP ON THE PAIR is CARRIED but not yet exact, and it is refused until it is. The jump now
+    // reaches the device everywhere OpenFOAM applies one -- the neighbour value is psi[nbr] - jump in
+    // fvMatrix::flux(), in fvc::grad and in the matrix product, the last ONLY when the operand is the
+    // solution field ("only apply jump to original field", jumpCyclicFvPatchField.C:169-177) -- it is
+    // rebuilt at every assembly by the pressureCoeffs hook from that assembly's flux, and the pair's
+    // flux is pushed back to the host field the jump is computed from.
+    //
+    // MEASURED on validation/interFoamCyclic's `jump` profile (a porousBafflePressure on the periodic
+    // pair, D 0, I 5, length 0.05), ten steps against brae's own host loop, which is OpenFOAM's there
+    // to alpha 4.1e-13:
+    //   with none of the above          alpha 4.9e-02, U 45%   -- exactly the plain-cyclic answer,
+    //                                   which is what the control measures
+    //   with the jump carried           alpha 6.6e-05, U 3.8e-03
+    // STEP ONE IS EXACT (U 5.0e-10) and the jump itself agrees there to 2.8e-08 of 1.7e+02; the pair's
+    // flux is 0.9% out by step two and the jump 4% with it, which is a consequence of the flux and not
+    // its cause. Not a corrector-count effect (nCorrectors 1 reads the same 4.3e-03).
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         if (!fvp[pi].coupled) continue;
@@ -188,9 +192,9 @@ RunReport runInterFoamDevice(
         if (!jumps) continue;
         throw std::runtime_error(
             "brae interFoam (device): p_rgh on the coupled patch `" + fvp[pi].name + "` carries a JUMP "
-            "(porousBafflePressure or a fixedJump). The device's interface coefficients are one number "
-            "per face and carry none, so the jump would vanish from the pressure equation. The host "
-            "loop (no -device) carries it. Run without -device.");
+            "(porousBafflePressure or a fixedJump). The device carries it through the matrix, the flux "
+            "and the gradient and is exact at the first step, and 3.8e-03 of U away from the host by "
+            "the tenth. The host loop (no -device) is OpenFOAM's. Run without -device.");
     }
 
     // THE ISOTROPIC AND SHEAR COMPRESSION TERMS. alphaEqn.H:60-75 blends phic with
@@ -439,6 +443,26 @@ RunReport runInterFoamDevice(
     auto pushFlux = [&]()
     {
         unflatten(dPhiB, f.phi.boundary);
+        // ...and the PAIR's own faces, which that array does not carry. Without this a
+        // porousBafflePressure computes its jump from a flux that is still zero: measured on the
+        // gate's `jump` profile, max|jump| 0 at every assembly and the device running the
+        // plain-cyclic answer (alpha 4.9e-02 from the host, exactly the control's distance).
+        if (cycPhiForHost && !cyclics.empty())
+        {
+            std::vector<scalar> pif;
+            cycPhiForHost->copyTo(pif);
+            std::size_t off = 0;
+            for (const CyclicInterface& c : cyclics)
+            {
+                const std::size_t pi = static_cast<std::size_t>(c.patch);
+                const std::size_t n = c.faceCells.size();
+                if (pi < f.phi.boundary.size() && off + n <= pif.size())
+                {
+                    f.phi.boundary[pi].assign(pif.begin() + off, pif.begin() + off + n);
+                }
+                off += n;
+            }
+        }
         if (namesRhoPhi && dRpB.size() == dPhiB.size())
         {
             unflatten(dRpB, f.rhoPhi.boundary);
@@ -728,8 +752,28 @@ RunReport runInterFoamDevice(
     H.pressure.pressureCoeffs =
         [&](const DeviceBuffer<scalar>&, const DeviceBuffer<scalar>& phiHB,
             const DeviceBuffer<scalar>& rAUfAll, const DeviceBuffer<scalar>& rAUCell,
-            DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC)
+            DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC, DeviceBuffer<scalar>& cycJump)
     {
+        // THE PAIR'S FLUX, as it stands at THIS assembly. porousBafflePressure's jump is built from it
+        // below and the host pEqn takes it from the phi the LAST CORRECTOR wrote, so it is refreshed
+        // here rather than left to the step's own pushFlux, which runs once per corrector and not once
+        // per non-orthogonal pass.
+        if (cycPhiForHost && !cyclics.empty())
+        {
+            std::vector<scalar> pif;
+            cycPhiForHost->copyTo(pif);
+            std::size_t off = 0;
+            for (const CyclicInterface& c : cyclics)
+            {
+                const std::size_t pj = static_cast<std::size_t>(c.patch);
+                const std::size_t n = c.faceCells.size();
+                if (pj < f.phi.boundary.size() && off + n <= pif.size())
+                {
+                    f.phi.boundary[pj].assign(pif.begin() + off, pif.begin() + off + n);
+                }
+                off += n;
+            }
+        }
         std::vector<scalar> hB, rA, rAUc;
         phiHB.copyTo(hB);
         rAUfAll.copyTo(rA);
@@ -784,6 +828,30 @@ RunReport runInterFoamDevice(
         // f.phi's are current (updateUBoundary ran after the last corrector and pushed the flux); a
         // totalPressure patch is never a contact-angle wall, so f.rhoBnd is exact on it.
         updatePressurePatchesFromVelocity(f.p_rgh, f.U, &f.rhoBnd, fvp);
+        // porousBafflePressure::updateCoeffs, which the fvMatrix constructor runs at THIS assembly:
+        // the OWNER's jump from phi as it stands -- the last corrector's, not phiHbyA -- and from the
+        // stored patch values of the laminar nu and of rho; the other side takes the owner's. The
+        // host pEqn does this inside its own corrector loop (inter_peqn_cpp.cu:723-740); on the
+        // device the assembly is split across the hook and the step, and this is the hook's half.
+        // Without it the jump stays at the file's value and the device ran the PLAIN-CYCLIC answer --
+        // measured on the gate's `jump` profile, alpha 4.9e-02 and U 45% from the host, which is
+        // exactly the control's distance.
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (!fvp[pi].owner || !f.p_rgh.boundary[pi]->isPorousBafflePressure()) continue;
+            if (f.rhoBnd.size() <= pi || f.nuBnd.size() <= pi)
+            {
+                throw std::runtime_error(
+                    "brae interFoam (device): p_rgh patch `" + fvp[pi].name + "` is a "
+                    "porousBafflePressure, which needs the patch values of rho and of the mixture's "
+                    "laminar nu, and the driver has none for it.");
+            }
+            const std::vector<scalar> jump = f.p_rgh.boundary[pi]->porousBaffleJump(
+                namedPatchFlux(f.p_rgh.boundary[pi]->fluxName(), pi, fvp[pi].name, f.phi, &f.rhoPhi),
+                f.nuBnd[pi], f.rhoBnd[pi]);
+            f.p_rgh.boundary[pi]->setOwnerJump(jump);
+            f.p_rgh.boundary[static_cast<std::size_t>(fvp[pi].nbrPatch)]->setOwnerJump(jump);
+        }
         FvScalarMatrix pe = fvm::laplacian<scalar>(rf, f.p_rgh, m, g, fvp, false);
         std::vector<scalar> i2, b2;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
@@ -794,6 +862,35 @@ RunReport runInterFoamDevice(
         }
         iC.copyFrom(i2);
         bC.copyFrom(b2);
+
+        // p_rgh's JUMP on the pair, as the updates above have just left it. porousBafflePressure
+        // recomputes it in updateCoeffs from THIS assembly's flux and viscosity, so it is taken here
+        // and not once at the start. The value a patch returns is already signed -- the owner's on
+        // the owner side and its negative on the other (fixedJumpFvPatchField::jump, and
+        // fv_patch_field.cuh's setOwnerJump) -- which is the sign the matrix wants.
+        std::vector<scalar> jf;
+        bool anyJump = false;
+        for (const CyclicInterface& c : cyclics)
+        {
+            const std::size_t pj = static_cast<std::size_t>(c.patch);
+            const std::vector<scalar>* j = f.p_rgh.boundary[pj]->coupledJump();
+            if (j && !j->empty())
+            {
+                anyJump = true;
+            }
+            for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+            {
+                jf.push_back((j && i < j->size()) ? (*j)[i] : scalar(0));
+            }
+        }
+        if (anyJump)
+        {
+            cycJump.copyFrom(jf);
+        }
+        else
+        {
+            cycJump.resize(0);        // no jump on this pair: the kernels take the plain neighbour
+        }
     };
     // p_rgh's stored patch values, for the corrected laplacian's grad(p_rgh): what the host's
     // gradOf(p_rgh) reads, after pressureCoeffs has run the patches' updates
@@ -968,6 +1065,8 @@ RunReport runInterFoamDevice(
     C.stfIf       = (dCyc.n > 0) ? &dStfIf : nullptr;
     C.ghfIf       = (dCyc.n > 0) ? &dGhfIf : nullptr;
     C.snGradRhoIf = (dCyc.n > 0) ? &dSnRhoIf : nullptr;
+    C.nHatfIf     = (dCyc.n > 0) ? &dNHIf : nullptr;
+    cycPhiForHost = (dCyc.n > 0) ? &dCyc.phi : nullptr;
     C.porosity = dPorosity.active ? &dPorosity : nullptr;
     // p_rgh's reference, where the host driver sets it (inter_driver_cpp.cu:779-781). These three were
     // dead for as long as the device refused a case that needs one, and a step that never pins leaves the
@@ -1070,6 +1169,12 @@ RunReport runInterFoamDevice(
     DeviceBuffer<scalar> dPhiI(f.phi.internal);
     DeviceBuffer<scalar> dPrgh(f.p_rgh.internal), dP;
     DeviceBuffer<scalar> dNH(f.nHatf.internal), dNHB(flattenPatches(f.nHatf.boundary, fvp));
+    // ...and ON THE PAIR, seeded from the same field buildInterFields built: at the first step of a
+    // run that normal is calculateK's own.
+    if (dCyc.n > 0)
+    {
+        dNHIf.copyFrom(coupledFace(f.nHatf, cyclics));
+    }
     DeviceBuffer<scalar> dABnd(patchValues(f.alpha1, fvp)), dK(f.K);
     DeviceBuffer<scalar> dGh(f.gh), dGhf, dMagSf(g.magSf());
     { SurfaceScalarField gf; gf.internal = f.ghfInternal; gf.boundary = f.ghfBoundary;
@@ -1123,6 +1228,17 @@ RunReport runInterFoamDevice(
         std::vector<scalar> poi, pob;
         dPhiI.copyTo(poi); dPhiB.copyTo(pob);
         DeviceBuffer<scalar> dPhiOI(poi), dPhiOB(pob);
+        // ...and the PAIR's flux at the same instant. fvc::ddtCorr compares phi.oldTime() with the
+        // flux of U.oldTime() on every face a coupled patch included, and the pressure corrector
+        // rewrites cyc.phi, so the snapshot has to be taken here with the other two.
+        DeviceBuffer<scalar> dPhiOIf;
+        if (dCyc.n > 0)
+        {
+            std::vector<scalar> poif;
+            dCyc.phi.copyTo(poif);
+            dPhiOIf.copyFrom(poif);
+            C.phiOldIf = &dPhiOIf;
+        }
 
         // OpenFOAM's clock for the step about to be taken: ++runTime comes before the alpha step
         stepDeltaT = rep.deltaT;

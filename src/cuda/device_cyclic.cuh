@@ -281,12 +281,17 @@ void deviceCyclicAddDivFlux(const DeviceCyclic& cyc, const DeviceBuffer<scalar>&
 // epsilon setValues: zero the cyclic interface off-diagonal for wall-cell owners (their eps is fixed = eps0).
 void deviceCyclicZeroWallIfCoeff(DeviceCyclic& cyc, const DeviceBuffer<label>& isWallCell);
 // pressure-correction flux: phi[j] -= ifCoeff[j]*(p[nbr]-p[own])  (the snGrad(p) flux across the periodic face).
-void deviceCyclicCorrectFlux(DeviceCyclic& cyc, const DeviceBuffer<scalar>& p);
+void deviceCyclicCorrectFlux(DeviceCyclic& cyc, const DeviceBuffer<scalar>& p,
+                             // the pair's already-signed JUMP (fixedJump, porousBafflePressure), or
+                             // null. fvMatrix::flux() reads patchNeighbourField(), which on a jump
+                             // cyclic is the cell across LESS the jump.
+                             const DeviceBuffer<scalar>* jump = nullptr);
 // ...and the SAME flux as a value rather than a subtraction: out[j] = ifCoeff[j]*(p[nbr]-p[own]), which
 // is fvMatrix::flux() on that face. interFoam's velocity correction needs it, because
 // reconstruct((phig - p_rghEqn.flux())/rAUf) reads the flux and not the corrected phi.
 void deviceCyclicPressureFlux(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& p,
-                              DeviceBuffer<scalar>& out);
+                              DeviceBuffer<scalar>& out,
+                              const DeviceBuffer<scalar>* jump = nullptr);
 // gaussGrad contribution: grad[own] += Sf_j * (w*psi[own]+(1-w)*psi[nbr]) / V[own].
 // fvc::interpolate of a CELL field onto the cyclic faces: w*psi[own] + (1-w)*psi[nbr].
 void deviceCyclicFaceValue(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& cell, DeviceBuffer<scalar>& out);
@@ -297,7 +302,9 @@ void deviceCyclicNbrValue(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& c
                           const DeviceBuffer<scalar>& c2, int comp, DeviceBuffer<scalar>& out);
 
 void deviceCyclicAddGrad(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& psi, const DeviceBuffer<scalar>& V,
-                         DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz);
+                         DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz,
+                         // the pair's already-signed JUMP, or null -- see DeviceLduView::cycJump
+                         const DeviceBuffer<scalar>* jump = nullptr);
 // linearUpwind deferred correction at the cyclic interface (component comp). Mirrors deviceLinearUpwindCorr but
 // the neighbour reconstruction is ROTATED: per face, corr[own] += phi * (gradU_upwind . d_upwind)[comp] with
 //   phi>=0 (own upwind):  (grad(U_comp)[own] . dOwn)

@@ -64,12 +64,17 @@ struct DeviceInterPressureHooks
     // `rAUCell` is rAU itself, which the hook needs for one thing rAUfAll cannot give it: a COUPLED
     // patch's rAUf. The device's face arrays have no coupled patch in them, and fvm::laplacian reads
     // gammaf on every patch, so the pair's is interpolated from the two cells there.
+    // `cycJump` is an OUT parameter: p_rgh's JUMP on each coupled face, already signed, in the pair's
+    // own face order -- and EMPTY on a pair without one. It belongs to this hook because a
+    // porousBafflePressure recomputes its jump in updateCoeffs, from the flux and the viscosity at
+    // THIS assembly, so it is as fresh as the coefficients beside it.
     std::function<void(const DeviceBuffer<scalar>& phiHbyAInt,
                        const DeviceBuffer<scalar>& phiHbyABnd,
                        const DeviceBuffer<scalar>& rAUfAll,
                        const DeviceBuffer<scalar>& rAUCell,
                        DeviceBuffer<scalar>&       iC,
-                       DeviceBuffer<scalar>&       bC)> pressureCoeffs;
+                       DeviceBuffer<scalar>&       bC,
+                       DeviceBuffer<scalar>&       cycJump)> pressureCoeffs;
 
     // p_rgh's STORED patch values, flattened in boundary-face order, as they stand after pressureCoeffs
     // -- what the host's gradOf(p_rgh) reads for the corrected laplacian's non-orthogonal correction
@@ -108,6 +113,8 @@ struct DeviceInterPressureInput
     // other; the device's face arrays exclude coupled patches, so they arrive here separately. rAUf is
     // NOT among them: it is fvc::interpolate(rAU) on that face, which the step builds from the pair's
     // own weights (deviceCyclicFaceValue).
+    // fvc::ddtCorr ON THE PAIR, built by the caller beside the internal and boundary halves
+    const DeviceBuffer<scalar>* ddtCorrIf   = nullptr;
     const DeviceBuffer<scalar>* stfIf       = nullptr;
     const DeviceBuffer<scalar>* ghfIf       = nullptr;
     const DeviceBuffer<scalar>* snGradRhoIf = nullptr;
@@ -162,7 +169,7 @@ struct DevicePressureTaps
 {
     DeviceBuffer<scalar> diag, upper, lower, source, iC, bC;
     // phig and rAUf ON THE PAIR, for comparing the two arms across a coupled face
-    DeviceBuffer<scalar> phigIf, rAUfIf, ffIf, phiIf;
+    DeviceBuffer<scalar> phigIf, rAUfIf, ffIf, phiIf, phiHbyAIfPrePhig, cycJumpTap;
 };
 
 scalar deviceInterPressureStep(

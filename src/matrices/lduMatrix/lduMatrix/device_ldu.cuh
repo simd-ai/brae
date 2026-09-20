@@ -31,6 +31,14 @@ struct DeviceLduView
     const label* cycOwn = nullptr;
     const label* cycNbr = nullptr;
     const scalar* cycCoeff = nullptr;
+    // A JUMP ACROSS THE PAIR (fixedJump, porousBafflePressure), ALREADY SIGNED: the owner side holds the
+    // file's value and the other side its negative, as fixedJumpFvPatchField::jump() gives them. The
+    // neighbour value a jump cyclic hands the matrix is psi[nbr] - jump (jumpCyclicFvPatchField.C:94-125)
+    // and it is applied ONLY when the operand is the SOLUTION FIELD -- "only apply jump to original
+    // field", which in a Krylov solve is the one Amul that builds the initial residual and the
+    // normalisation, never the search directions. deviceAmul's `onField` says which call this is.
+    // Null = no jump on this pair.
+    const scalar* cycJump = nullptr;
     // optional cyclicAMI interface, OF cyclicAMIFvPatchField::updateInterfaceMatrix. Applied in deviceAmul as
     // Apsi[amiOwn[i]] += amiIfc[i] * sum_{k in [amiOff[i],amiOff[i+1])} amiW[k]*psi[amiNbr[k]] (weighted stencil).
     int nAmi = 0;
@@ -116,10 +124,13 @@ inline DeviceLduView deviceLduViewCyclic(
     int nCyc,
     const label* cycOwn,
     const label* cycNbr,
-    const scalar* cycCoeff)
+    const scalar* cycCoeff,
+    // the pair's already-signed jump, or null -- see DeviceLduView::cycJump
+    const scalar* cycJump = nullptr)
 {
     return {dm.nCells, dm.nInternalFaces, diag.data(), upper.data(), lower.data(), dm.owner.data(), dm.nei.data(),
-            dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), nCyc, cycOwn, cycNbr, cycCoeff};
+            dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), nCyc, cycOwn, cycNbr, cycCoeff,
+            cycJump};
 }
 // BOTH interfaces at once. A mesh may carry cyclic AND cyclicAMI patches -- pimpleFoam/RAS/
 // oscillatingInletPeriodicAMI2D has a y-periodic `cyclic` pair on the sliding channel and a
@@ -178,7 +189,11 @@ inline DeviceLduView deviceLduViewAmi(
     return v;
 }
 
-void deviceAmul(const DeviceLduView& A, const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi);
+// `onField` = the operand IS the solution field, the one case in which a jump cyclic subtracts its
+// jump from the neighbour cell. False everywhere else, which is every search direction in a Krylov
+// solve; see DeviceLduView::cycJump.
+void deviceAmul(const DeviceLduView& A, const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi,
+                bool onField = false);
 
 class DeviceHalo;      // forward (parallel/pstream/device_halo.cuh)
 struct DistributedAMI; // forward (cuda/distributed_ami.cuh) -- optional cyclicAMI coupling in the matvec

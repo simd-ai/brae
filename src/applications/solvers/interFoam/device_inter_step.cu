@@ -120,9 +120,19 @@ void deviceInterStep(
     DeviceInterAlphaControls actl = ctl.alpha;
     actl.alpha2BndOut = &alpha2Bnd;
     actl.rhoPhiIf     = ctl.rhoPhiIf;
+    actl.nHatfIf      = ctl.nHatfIf;
+    actl.preSolveAlphaOut      = taps ? &taps->preSolveAlpha : nullptr;
+    actl.preSolveAlphaPhiIfOut = taps ? &taps->preSolveAlphaPhiIf : nullptr;
     deviceInterAlphaStep(dm, alpha1, alpha1Old, deltaT, ain, ctl.mules, actl, props, hooks.alpha,
                          alpha1Bnd, nHatfBnd, bndAlphaFixesValue, bndAlphaFlag,
                          nHatfInt, K, rhoPhiInt, rhoPhiBnd, alpha2, rho, mu, nu);
+
+    if (taps)
+    {
+        deviceCopy(taps->alphaAfterAlphaStep, alpha1);
+        if (ctl.alphaPhiIf) deviceCopy(taps->alphaPhiIfTap, *ctl.alphaPhiIf);
+        if (ctl.rhoPhiIf)   deviceCopy(taps->rhoPhiIfTap,   *ctl.rhoPhiIf);
+    }
 
     probe("alpha", alpha1);
     probe("rho", rho);
@@ -287,6 +297,7 @@ void deviceInterStep(
         deviceCopy(taps->UEqnLower, UEqn.lower);
         deviceCopy(taps->UEqnIC, UEqn.iC[0]);
         deviceCopy(taps->UEqnBC, UEqn.bC[0]);
+        deviceCopy(taps->uEqnCycIfCoeff, UEqn.cycIfCoeff);
     }
 
     // 4. THE MOMENTUM PREDICTOR, if the case asks for one
@@ -399,7 +410,7 @@ void deviceInterStep(
         // fvc::ddtCorr(U, phi), Euler. The coefficient is OpenFOAM's DEFAULT LIMITER
         // (ddtPhiCoeff_ = -1), not a constant: it switches the correction off where it is large
         // compared with the flux, and it is zero on every patch where U fixes a value.
-        DeviceBuffer<scalar> ddtCorrI, ddtCorrB;
+        DeviceBuffer<scalar> ddtCorrI, ddtCorrB, ddtCorrIf;
         deviceDdtCorr(dm, phiOldInt, phiOldBnd, UOldX, UOldY, UOldZ, bndUFixesValue,
                       /*ddtPhiCoeff=*/scalar(-1), deltaT, ddtCorrI, ddtCorrB,
                       &UOldBndX, &UOldBndY, &UOldBndZ);
@@ -415,11 +426,21 @@ void deviceInterStep(
             deviceMrfZeroFilter(*ctl.mrf, ddtCorrI, ddtCorrB);
         }
 
+        // ...and the PAIR's half, which pEqn.H:16-18 builds with the rest of the surfaceScalarField.
+        // MRF.zeroFilter does not reach it: a zone's faces are the mesh's own, and a periodic pair is
+        // refused on an MRF case before this (the driver's MRF refusal).
+        if (ctl.cyc && ctl.cyc->n > 0 && ctl.phiOldIf)
+        {
+            deviceInterDdtCorrCyclic(*ctl.cyc, *ctl.phiOldIf, UOldX, UOldY, UOldZ,
+                                     /*ddtPhiCoeff=*/scalar(-1), deltaT, ddtCorrIf);
+        }
+
         DeviceInterPressureInput pi;
         pi.stf = &stf;
         pi.ghf = &ghf;
         pi.snGradRho = &snGradRho;
         // ...and their halves on the periodic pair, which the same three expressions cover there
+        pi.ddtCorrIf   = (ctl.cyc && ctl.cyc->n > 0 && ctl.phiOldIf) ? &ddtCorrIf : nullptr;
         pi.stfIf       = ctl.stfIf;
         pi.ghfIf       = ctl.ghfIf;
         pi.snGradRhoIf = ctl.snGradRhoIf;
@@ -465,6 +486,8 @@ void deviceInterStep(
             deviceCopy(taps->rAUfIf, pt.rAUfIf);
             deviceCopy(taps->ffIf, pt.ffIf);
             deviceCopy(taps->phiIf, pt.phiIf);
+            deviceCopy(taps->phiHbyAIfPrePhig, pt.phiHbyAIfPrePhig);
+            deviceCopy(taps->cycJumpTap, pt.cycJumpTap);
         }
         if (taps && corr == 0)
         {

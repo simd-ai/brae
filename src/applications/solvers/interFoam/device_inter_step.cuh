@@ -108,7 +108,12 @@ struct DeviceInterStepTaps
     // phig, rAUf, phig-flux and the flux itself on the periodic pair. Unlike the matrix taps above
     // these are taken on EVERY corrector, so they hold the LAST -- which is the state the host's own
     // taps hold and the only one the two arms can be compared in.
-    DeviceBuffer<scalar> phigIf, rAUfIf, ffIf, phiIf;
+    DeviceBuffer<scalar> phigIf, rAUfIf, ffIf, phiIf, phiHbyAIfPrePhig, cycJumpTap;
+    DeviceBuffer<scalar> uEqnCycIfCoeff;   // UEqn's interface off-diagonal on the pair
+    // ...and the ALPHA step's own two on the pair, taken as it leaves: alphaPhi10 and rhoPhi there
+    DeviceBuffer<scalar> alphaPhiIfTap, rhoPhiIfTap, alphaAfterAlphaStep;
+    // ...and the implicit pre-solve's own two, before the corrector loop
+    DeviceBuffer<scalar> preSolveAlpha, preSolveAlphaPhiIf;
 };
 
 struct DeviceInterStepControls
@@ -133,6 +138,12 @@ struct DeviceInterStepControls
     // both, because they outlive a step the way phi does.
     DeviceBuffer<scalar>* alphaPhiIf = nullptr;
     DeviceBuffer<scalar>* rhoPhiIf   = nullptr;
+    // the pair's flux at the TOP of the step -- phi.oldTime() there, which fvc::ddtCorr compares with
+    // the flux of U.oldTime(). The driver snapshots it beside dPhiOI/dPhiOB, before anything writes
+    // cyc->phi. Null on a mesh with no pair.
+    const DeviceBuffer<scalar>* phiOldIf = nullptr;
+    // nHatf on the pair, kept BY THE DRIVER across steps -- see DeviceInterAlphaControls::nHatfIf
+    DeviceBuffer<scalar>* nHatfIf = nullptr;
     // ...and the three fields phig is built from ON THE PAIR. The device's face arrays exclude coupled
     // patches (device_mesh.cuh:41-44), so these carry what the boundary half of stf, ghf and
     // snGrad(rho) would otherwise hold there. The interfaceForces hook fills the first and the third

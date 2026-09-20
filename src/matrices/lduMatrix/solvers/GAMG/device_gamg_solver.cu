@@ -197,7 +197,9 @@ void dicSmooth(
 {
     for (int sweep = 0; sweep < nSweeps; ++sweep)
     {
-        deviceAmul(A, psi, rA);
+        // psi IS the solution field here, so a jump cyclic subtracts its jump -- see
+        // DeviceLduView::cycJump. Every product below that takes psi does the same.
+        deviceAmul(A, psi, rA, /*onField=*/true);
         subtract(source, rA, rA);
         diluApply(A, dic, rA, wA);
         deviceAxpy(scalar(1), wA, psi);
@@ -444,7 +446,7 @@ DeviceSolverPerf deviceGamgSolve(
     const std::vector<scalar> coarsestUpper = LC.A.upper.host();
     const GamgLduAddressing& coarsestAddr = h.host->meshLevels[static_cast<std::size_t>(coarsestLevel)];
 
-    deviceAmul(A, psi, h.Apsi);
+    deviceAmul(A, psi, h.Apsi, /*onField=*/true);
     const scalar nf = deviceNormFactor(A, psi, b, deviceOnes(nCells));
     subtract(b, h.Apsi, h.finestResidual);
 
@@ -561,7 +563,7 @@ DeviceSolverPerf deviceGamgSolve(
         smoothLevel(A, fineDic, psi, b, h.rA, h.wA, controls.nFinestSweeps, kind);
 
         // Calculate finest level residual field
-        deviceAmul(A, psi, h.Apsi);
+        deviceAmul(A, psi, h.Apsi, /*onField=*/true);
         subtract(b, h.Apsi, h.finestResidual);
         perf.finalResidual = deviceSumMag(h.finestResidual)/nf;
     } while

@@ -611,6 +611,28 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
 
     // ...ON THE BOUNDARY TOO -- see PressureStepInput::ghfBnd. rAUf at an uncoupled patch is the face
     // cell's rAU, which is what fvc::interpolate gives there.
+    if (in.taps)
+    {
+        in.taps->phiHbyABndPrePhig = phiHbyA.boundary;
+        in.taps->uEqnDiag  = in.UEqn->diag;
+        in.taps->uEqnUpper = in.UEqn->upper;
+        in.taps->uEqnLower = in.UEqn->lower;
+        in.taps->uEqnSourceX.clear();
+        for (const vector& v : in.UEqn->source) in.taps->uEqnSourceX.push_back(v.x);
+        in.taps->uEqnICx.assign(patches.size(), std::vector<scalar>());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            for (const vector& v : in.UEqn->internalCoeffs[pi]) in.taps->uEqnICx[pi].push_back(v.x);
+        }
+        in.taps->uEqnBCx.assign(patches.size(), std::vector<scalar>());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            for (const vector& v : in.UEqn->boundaryCoeffs[pi])
+            {
+                in.taps->uEqnBCx[pi].push_back(v.x);
+            }
+        }
+    }
     std::vector<std::vector<scalar>> phigBnd(patches.size());
     if (in.ghfBnd)
     {
@@ -715,6 +737,17 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
                 (*in.nuBnd)[pi], (*in.rhoBnd)[pi]);
             p_rgh.boundary[pi]->setOwnerJump(jump);
             p_rgh.boundary[static_cast<std::size_t>(patches[pi].nbrPatch)]->setOwnerJump(jump);
+        }
+        if (in.taps)
+        {
+            in.taps->jumpBnd.assign(patches.size(), std::vector<scalar>());
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                if (const std::vector<scalar>* j = p_rgh.boundary[pi]->coupledJump())
+                {
+                    in.taps->jumpBnd[pi] = *j;
+                }
+            }
         }
         FvScalarMatrix pe = fvm::laplacian<scalar>(rAUfField, p_rgh, m, g, patches, sc.correctedLaplacian);
         if (sc.correctedLaplacian)

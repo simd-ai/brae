@@ -35,7 +35,7 @@ DeviceSolverPerf deviceJacobiPCG(
     const int nC = A.nCells;
     DeviceBuffer<scalar> wA(nC), rA(nC), pA(nC), Ax(nC);
 
-    deviceAmul(A, psi, Ax);                                  // rA = b - A*psi
+    deviceAmul(A, psi, Ax, /*onField=*/true);                // rA = b - A*psi, the field's own product
     deviceCopy(rA, b);
     deviceAxpy(-1.0, Ax, rA);
 
@@ -121,7 +121,10 @@ void deviceNormFactorInto(
     // the host (it scales the residual for the convergence check). Same kernels + same IEEE ops (the divide by nC,
     // the avg-multiply, and the (n1+n2)+1e-20 add are reproduced exactly) -> bit-identical, 3 D2H syncs -> 1.
     DeviceBuffer<scalar> dAvg(1), dN1(1), dN2(1);
-    deviceAmul(A, psi, Apsi);                                // A*psi
+    // A*psi with `onField`: psi IS the solution field, and that is the one product a jump cyclic
+    // subtracts its jump from (jumpCyclicFvPatchField.C:169-177, "only apply jump to original field").
+    // sumA is a ROW SUM -- lduMatrix::sumA, which carries no jump -- so it stays without one.
+    deviceAmul(A, psi, Apsi, /*onField=*/true);              // A*psi
     deviceAmul(A, ones, sumA);                               // sumA = rowSum(A) = A*1
     deviceDotInto(psi, ones, dAvg.data());                  // psi.ones
     deviceScalarDivConst(dAvg.data(), (scalar)nC, dAvg.data());   // avgPsi = gAverage(psi) = (psi.ones)/nC
@@ -363,7 +366,7 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
     auto converged = [&](scalar fr) { return (fr < tol) || (relTol > 0.0 && fr < relTol * perf.initialResidual); };
 
     // ---- the prologue: rA = b - A psi, the initial residual (sync 1 of 4) -----------------------------
-    deviceAmul(sA, psi, c.Ax);
+    deviceAmul(sA, psi, c.Ax, /*onField=*/true);
     deviceCopy(c.rA, rhs);
     deviceAxpy(-1.0, c.Ax, c.rA);
     deviceCopy(c.rA0, c.rA);
@@ -608,7 +611,7 @@ DeviceSolverPerf deviceJacobiBiCGStab(
     const int K = (checkEvery > 1) ? checkEvery : 1;             // convergence-read cadence (1 = exact per-iter)
     DeviceBuffer<scalar> rA(nC), rA0(nC), pA(nC), yA(nC), AyA(nC), sA(nC), zA(nC), tA(nC), Ax(nC);
 
-    deviceAmul(A, psi, Ax);                                  // rA = b - A*psi
+    deviceAmul(A, psi, Ax, /*onField=*/true);                // rA = b - A*psi, the field's own product
     deviceCopy(rA, b);
     deviceAxpy(-1.0, Ax, rA);
     deviceCopy(rA0, rA);

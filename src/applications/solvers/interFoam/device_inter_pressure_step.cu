@@ -115,12 +115,34 @@ scalar deviceInterPressureStep(
         }
         deviceCyclicFaceValue(*in.cyc, rAU, rAUfIf);
         deviceBuoyancyFlux(in.cyc->n, *in.stfIf, *in.ghfIf, *in.snGradRhoIf, rAUfIf, in.cyc->magSf, phigIf);
-        // phiHbyA += phig on the pair, as addPhigBoundaryKernel does it on the other patches. The
-        // caller's array is const and is the predictor's own, so the sum lives here, like the host's
-        // local phiHbyA.
         phiHbyAIfAll.resize(static_cast<std::size_t>(in.cyc->n));
         ckS(cudaMemcpy(phiHbyAIfAll.data(), in.phiHbyAIf->data(), sizeof(scalar)*in.cyc->n,
                        cudaMemcpyDeviceToDevice), "phiHbyA, interface");
+
+        // ...+ interpolate(rho*rAU)*fvc::ddtCorr(U, phi) ON THE PAIR, pEqn.H:16-18, which goes in
+        // BEFORE phig exactly as it does on every other face. It is identically zero at the first
+        // step of a case at rest -- U.oldTime() and phi.oldTime() are both zero -- and live from the
+        // second: MEASURED on validation/interFoamCyclic without it, p_rgh 2.1e+01 of 1.6e+03 at step
+        // two with alpha already exact to 4.2e-11, and 6.1e-06 at step one.
+        // interpolate(rho*rAU) on a coupled face is the two cells' PRODUCT interpolated, which is what
+        // rhoRAUfKernel does on an internal face (device_inter_peqn.cuh note 2).
+        if (in.ddtCorrIf && static_cast<int>(in.ddtCorrIf->size()) == in.cyc->n)
+        {
+            DeviceBuffer<scalar> rhoRAUCell(static_cast<std::size_t>(nC));
+            deviceHadamard(rhoRAUCell, *in.rho, rAU);
+            DeviceBuffer<scalar> rhoRAUfIf;
+            deviceCyclicFaceValue(*in.cyc, rhoRAUCell, rhoRAUfIf);
+            DeviceBuffer<scalar> term(static_cast<std::size_t>(in.cyc->n));
+            deviceHadamard(term, rhoRAUfIf, *in.ddtCorrIf);
+            addPhigIfKernel<<<nBlocks(in.cyc->n), TPB>>>(term.data(), in.cyc->n, phiHbyAIfAll.data());
+            ckS(cudaGetLastError(), "phiHbyA += rhoRAUf*ddtCorr, interface");
+        }
+
+        if (taps) deviceCopy(taps->phiHbyAIfPrePhig, phiHbyAIfAll);
+
+        // phiHbyA += phig on the pair, as addPhigBoundaryKernel does it on the other patches. The
+        // caller's array is const and is the predictor's own, so the sum lives here, like the host's
+        // local phiHbyA.
         addPhigIfKernel<<<nBlocks(in.cyc->n), TPB>>>(phigIf.data(), in.cyc->n, phiHbyAIfAll.data());
         ckS(cudaGetLastError(), "phiHbyA += phig, interface");
         if (taps)
@@ -159,6 +181,8 @@ scalar deviceInterPressureStep(
     // correction flux make p_rghEqn.flux().
     DevicePressureMatrix P;
     DeviceBuffer<scalar> iC, bC;
+    // p_rgh's jump on the pair, refreshed by the hook at every assembly; empty = no jump there
+    DeviceBuffer<scalar> cycJump;
     DeviceBuffer<scalar> ffc;
     DeviceSolverPerf perf;
     for (int pass = 0; pass <= in.nNonOrthogonalCorrectors; ++pass)
@@ -166,7 +190,8 @@ scalar deviceInterPressureStep(
         const bool lastPass = (pass == in.nNonOrthogonalCorrectors);
 
         // constrainPressure, and the patches' updateCoeffs at this assembly
-        hooks.pressureCoeffs(phiHbyAInt, phiHbyABnd, *in.rAUfAll, rAU, iC, bC);
+        hooks.pressureCoeffs(phiHbyAInt, phiHbyABnd, *in.rAUfAll, rAU, iC, bC, cycJump);
+        const bool haveJump = havePair && static_cast<int>(cycJump.size()) == in.cyc->n;
 
         // the explicit correction: gradOf(p_rgh), laplacianCorrFlux, laplacianNonOrthSource
         DeviceBuffer<scalar> corrSource;
@@ -175,6 +200,13 @@ scalar deviceInterPressureStep(
             DeviceBuffer<scalar> bval, gx, gy, gz;
             hooks.boundaryValues(bval);
             deviceGaussGrad(dm, p_rgh, bval, gx, gy, gz);
+            // ...and the PAIR's faces, which fvc::grad sums like any other patch's. On a jump cyclic
+            // the neighbour value is the cell across LESS the jump, as everywhere else it appears.
+            if (havePair)
+            {
+                deviceCyclicAddGrad(*in.cyc, p_rgh, dm.V, gx, gy, gz,
+                                    haveJump ? &cycJump : nullptr);
+            }
             // `limited <k>` for 0 < k < 1 (fvm.cuh laplacianCorrFlux); otherwise the correction unlimited
             if (in.snGradLimitCoeff > scalar(0) && in.snGradLimitCoeff < scalar(1))
             {
@@ -213,7 +245,8 @@ scalar deviceInterPressureStep(
         // operator from the matrix that was assembled.
         const DeviceLduView A = (in.cyc && in.cyc->n > 0)
             ? deviceLduViewCyclic(dm, diagC, P.upper, P.lower, in.cyc->n, in.cyc->ownCell.data(),
-                                  in.cyc->nbrCell.data(), in.cyc->ifCoeff.data())
+                                  in.cyc->nbrCell.data(), in.cyc->ifCoeff.data(),
+                                  haveJump ? cycJump.data() : nullptr)
             : deviceLduView(dm, diagC, P.upper, P.lower);
         if (gamg)
         {
@@ -298,13 +331,14 @@ scalar deviceInterPressureStep(
     {
         ckS(cudaMemcpy(in.cyc->phi.data(), phiHbyAIfAll.data(),
                        sizeof(scalar)*in.cyc->n, cudaMemcpyDeviceToDevice), "phi = phiHbyA, interface");
-        deviceCyclicCorrectFlux(*in.cyc, p_rgh);
+        const bool jumpNow = static_cast<int>(cycJump.size()) == in.cyc->n;
+        deviceCyclicCorrectFlux(*in.cyc, p_rgh, jumpNow ? &cycJump : nullptr);
 
         // ...and (phig - p_rghEqn.flux()) on the same faces, for the reconstruction. The flux is the
         // value deviceCyclicCorrectFlux just subtracted, taken through the shared arithmetic rather
         // than differenced back out of cyc->phi.
         DeviceBuffer<scalar> fluxIf;
-        deviceCyclicPressureFlux(*in.cyc, p_rgh, fluxIf);
+        deviceCyclicPressureFlux(*in.cyc, p_rgh, fluxIf, jumpNow ? &cycJump : nullptr);
         ffIf.resize(static_cast<std::size_t>(in.cyc->n));
         subKernel<<<nBlocks(in.cyc->n), TPB>>>(phigIf.data(), fluxIf.data(), in.cyc->n, ffIf.data());
         ckS(cudaGetLastError(), "phig - flux, interface");
@@ -312,6 +346,7 @@ scalar deviceInterPressureStep(
         {
             deviceCopy(taps->ffIf, ffIf);
             deviceCopy(taps->phiIf, in.cyc->phi);
+            deviceCopy(taps->cycJumpTap, cycJump);
         }
     }
 

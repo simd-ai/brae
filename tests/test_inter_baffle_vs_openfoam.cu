@@ -491,6 +491,12 @@ int main(
             std::printf("  device: %s\n", e.what());
         }
         check("the device loop refuses the case and names the patch", named);
+
+        // NO DEVICE ARM ON THIS CASE, and two separate reasons: the tutorial sets
+        // `nOuterCorrectors 3`, which the device loop does not run, and its p_rgh carries a JUMP,
+        // which the device carries but is not yet exact in. Both are refused by name. The periodic
+        // fixture's `jump` profile (tests/interfoam_cyclic_vs_openfoam.sh) is where the jump path is
+        // measured, on a case the device loop can otherwise run end to end.
     }
 
     std::printf("test_inter_baffle_vs_openfoam: %d failures\n", failures);

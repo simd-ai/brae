@@ -36,6 +36,16 @@ using namespace brae::cpu::interFoam;
 const scalar B_ALPHA = 6e-12;
 const scalar B_PRGH = 3e-10;
 const scalar B_U = 2e-11;
+// ...and the DEVICE arm's (about 30x again). MEASURED against OpenFOAM: alpha 4.2e-11, p_rgh 1.98e-11
+// relative, U 5.7e-11 relative; against brae's own host arm 4.2e-11, 1.02e-11, 5.8e-11. The alpha
+// figure is the device alpha solver's own stopping point -- with every solve pinned at 1e-16 the two
+// arms' alpha agrees to 6.1e-14 -- and not a discretisation difference.
+const scalar B_ALPHA_DEV = 1.5e-09;
+const scalar B_PRGH_DEV = 6e-10;
+const scalar B_U_DEV = 2e-09;
+const scalar B_ALPHA_DEV_HOST = 1.5e-09;
+const scalar B_PRGH_DEV_HOST = 6e-10;
+const scalar B_U_DEV_HOST = 2e-09;
 
 namespace {
 int failures = 0;
@@ -93,8 +103,8 @@ int main(
     std::printf("== brae interFoam vs OpenFOAM interFoam: a fully periodic two-phase channel ==\n");
     if (argc < 7)
     {
-        std::printf("  SKIP: usage: %s <caseDir> <startDir> <ofTimeDir> <nSteps> <log> <wallsOfTimeDir>\n",
-                    argv[0]);
+        std::printf("  SKIP: usage: %s <caseDir> <startDir> <ofTimeDir> <nSteps> <log> <wallsOfTimeDir>"
+                    " [<profile>]\n", argv[0]);
         return 77;
     }
     const std::string caseDir = argv[1];
@@ -103,7 +113,10 @@ int main(
     const label nSteps = static_cast<label>(std::atol(argv[4]));
     const std::string logPath = argv[5];
     const std::string wallsDir = argv[6];
+    const std::string profile = (argc > 7) ? argv[7] : "MULESCorr";
+    const bool jumpProfile = (profile == "jump");
 
+    std::printf("  profile: %s\n", profile.c_str());
     PrimitiveMesh m;
     m.read(caseDir + "/constant/polyMesh");
     FvGeometry g;
@@ -125,7 +138,7 @@ int main(
     check("the mesh carries a periodic pair at all", nCoupled > 0);
     if (!nCoupled)
     {
-        std::printf("test_inter_cyclic_vs_openfoam: %d failures\n", failures);
+        std::printf("test_inter_cyclic_vs_openfoam [%s]: %d failures\n", profile.c_str(), failures);
         return 1;
     }
 
@@ -209,21 +222,28 @@ int main(
         check("OpenFOAM moves fluid through the periodic pair", worstU > scalar(1e-3));
     }
 
-    // THE CONTROL, on the oracle: the same mesh with the pair replaced by two walls
+    // THE CONTROL, on the oracle. For the plain profiles it is the same mesh with the pair replaced by
+    // two WALLS; for `jump` it is OpenFOAM's own PLAIN-CYCLIC answer, which is the pair coupled and
+    // nothing else -- so what the comparison shows there is the jump itself and not the coupling.
     const std::vector<scalar> wAlpha = readCells(wallsDir + "/alpha.water");
     const std::vector<vector> wU = readVectorCells(wallsDir + "/U");
     const Diff cA = compare(wAlpha, ofAlpha);
     const Diff cU = compare(wU, ofU);
-    std::printf("  CONTROL: OpenFOAM with the pair two WALLS: alpha %.4e, U relative %.4e\n",
+    std::printf("  CONTROL: OpenFOAM with %s: alpha %.4e, U relative %.4e\n",
+                jumpProfile ? "the pair a PLAIN CYCLIC (no jump)" : "the pair two WALLS",
                 (double)cA.linf, (double)cU.rel());
-    check("walling the pair moves OpenFOAM's own alpha far more than brae is from it",
+    check(jumpProfile ? "the JUMP moves OpenFOAM's own alpha far more than brae is from it"
+                      : "walling the pair moves OpenFOAM's own alpha far more than brae is from it",
           cA.linf > scalar(1000)*std::fmax(dA.linf, scalar(1e-16)));
     check("...and its U", cU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-16)));
 
-    // THE DEVICE LOOP REFUSES, by name. Its pressure corrector DOES carry the pair now -- at step one
-    // the two arms agree to 1.3e-10 in U and 6.1e-06 of 1.6e+03 in p_rgh, with phig on the pair exact
-    // to 5.6e-17 -- but its ALPHA step does not, from the second step on: alpha 7.8e-02 from the host,
-    // all of it in the pair's own cells.
+    // THE DEVICE ARM, against the SAME OpenFOAM fields. It is not a refusal any more: the pressure
+    // corrector, the alpha step and the momentum source all carry the pair. What it took, in the order
+    // this fixture found it -- the host<->device boundary-array layout, the momentum matrix's own
+    // interface coefficient in fvMatrix::H(), the Gauss-Seidel smoother applying the interface to its
+    // right-hand side every sweep (OpenFOAM's GaussSeidelSmoother.C:117-143), fvc::ddtCorr on the pair,
+    // and divDevReff's grad(U) and stress flux there. EVERY ONE of them is identically zero at step one,
+    // where U and phi are zero at rest, which is why this gate has to run more than one step.
     int nDev = 0;
     if (cudaGetDeviceCount(&nDev) != cudaSuccess)
     {
@@ -232,10 +252,14 @@ int main(
     }
     if (nDev <= 0)
     {
-        std::printf("  (no CUDA device: the device refusal is not exercised)\n");
+        std::printf("  (no CUDA device: the device arm is not exercised)\n");
     }
-    else
+    else if (jumpProfile)
     {
+        // THE JUMP IS CARRIED BUT NOT YET EXACT on the device, so it refuses -- see the note in
+        // inter_driver_device.cu for what it reaches (alpha 6.6e-05, U 3.8e-03 from the host over ten
+        // steps, against alpha 4.9e-02 and U 45% with the jump absent, which is the control's own
+        // distance). The host arm above is the one gated here.
         bool named = false;
         try
         {
@@ -245,13 +269,39 @@ int main(
         catch (const std::exception& e)
         {
             const std::string w(e.what());
-            named = w.find("coupled pair") != std::string::npos
-                 && w.find("ALPHA step") != std::string::npos;
+            named = w.find("carries a JUMP") != std::string::npos;
             std::printf("  device: %s\n", e.what());
         }
-        check("the device loop refuses the pair and names the stage that does not carry it", named);
+        check("the device loop refuses a jump on the pair and names it", named);
+    }
+    else
+    {
+        InterFields dev;
+        const RunReport rd = runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
+        check("the device arm ran the same number of steps", rd.steps == nSteps);
+        failures += brae::gatecheck::nonFinite("device alpha", dev.alpha1.internal);
+        failures += brae::gatecheck::nonFinite("device p_rgh", dev.p_rgh.internal);
+        failures += brae::gatecheck::nonFinite("device U", dev.U.internal);
+        const Diff eA = compare(dev.alpha1.internal, ofAlpha);
+        const Diff eP = compare(dev.p_rgh.internal, ofPrgh);
+        const Diff eU = compare(dev.U.internal, ofU);
+        std::printf("  device alpha:   Linf %.4e\n", (double)eA.linf);
+        std::printf("  device p_rgh:   relative %.4e\n", (double)eP.rel());
+        std::printf("  device U:       relative %.4e\n", (double)eU.rel());
+        check("the device's alpha agrees with OpenFOAM's absolutely", eA.linf < B_ALPHA_DEV);
+        check("the device's p_rgh agrees with OpenFOAM's relatively", eP.rel() < B_PRGH_DEV);
+        check("the device's U agrees with OpenFOAM's relatively", eU.rel() < B_U_DEV);
+        // ...and against the HOST arm, which is the tighter question: the two run the same
+        // discretisation, so what separates them is the port and not the scheme.
+        const Diff hA = compare(dev.alpha1.internal, fin.alpha1.internal);
+        const Diff hP = compare(dev.p_rgh.internal, fin.p_rgh.internal);
+        const Diff hU = compare(dev.U.internal, fin.U.internal);
+        std::printf("  device vs HOST: alpha %.4e, p_rgh %.4e relative, U %.4e relative\n",
+                    (double)hA.linf, (double)hP.rel(), (double)hU.rel());
+        check("...and with brae's own host arm, which runs the same discretisation",
+              hA.linf < B_ALPHA_DEV_HOST && hP.rel() < B_PRGH_DEV_HOST && hU.rel() < B_U_DEV_HOST);
     }
 
-    std::printf("test_inter_cyclic_vs_openfoam: %d failures\n", failures);
+    std::printf("test_inter_cyclic_vs_openfoam [%s]: %d failures\n", profile.c_str(), failures);
     return failures == 0 ? 0 : 1;
 }

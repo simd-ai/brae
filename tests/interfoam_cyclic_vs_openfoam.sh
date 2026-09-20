@@ -13,19 +13,45 @@
 #
 # WHAT IT ASSERTS: brae's host loop is OpenFOAM's on this mesh; OpenFOAM moves fluid through the pair,
 # so the comparison is not vacuous; walling the pair is a different answer by orders of magnitude; and
-# the DEVICE loop refuses the pair by name. Its pressure corrector carries the pair now -- at step one
-# the two arms agree to 1.3e-10 in U and 6.1e-06 of 1.6e+03 in p_rgh -- and its ALPHA step does not,
-# from the second step on.
+# the DEVICE arm agrees with the same OpenFOAM fields, and with brae's own host arm.
 #
 # MEASURED, ten steps of 2e-3: alpha 1.9e-13, p_rgh 9.8e-12 relative of 1.7e+03, U 7.5e-13 relative of
 # 0.73, all 30 p_rgh iteration counts OpenFOAM's. CONTROL: OpenFOAM with the pair two walls, alpha
 # 2.1e-01 and U 100% away -- and its step one runs 64/50/1 iterations where the periodic case runs
 # 70/32/4, so the iteration-count arm sees the coupling too.
 #
-# BROKEN ONCE (at t = 0.02): the pair's laplacian deltaCoeffs 0.1% out -- alpha 2.1e-03, p_rgh 3.6e-03,
-# U 7.9e-03, and 2 of 30 iteration counts lost. NOT MEASURABLE, because brae refuses it outright: the
-# pair left uncoupled, which every other cyclic gate calls its control -- the host driver throws and
-# names the patch rather than running it as two walls.
+# TWO PROFILES, because they are two alpha equations: `MULESCorr` as the fixture ships, and `explicit`
+# with MULESCorr off -- no implicit pre-solve, and so no mixture.correct() before the first corrector,
+# which is what makes its phir read the nHatf the PREVIOUS TIME STEP left.
+#
+# MEASURED, ten steps, host then device against OpenFOAM:
+#   MULESCorr  host alpha 1.9e-13, p_rgh 9.8e-12, U 7.5e-13; device 4.2e-11, 1.98e-11, 5.7e-11
+#   explicit   host alpha 5.9e-14, p_rgh 2.9e-12, U 5.7e-13; device 4.3e-11, 3.1e-11, 3.0e-11
+#   jump       host alpha 4.1e-13, p_rgh 1.0e-11, U 4.4e-12; the DEVICE REFUSES -- it carries the jump
+#              through the matrix, the flux and the gradient and is exact at step one (U 5.0e-10), and
+#              is 3.8e-03 of U from the host by step ten. With the jump not carried at all it lands on
+#              the plain-cyclic answer, alpha 4.9e-02 and U 45%, which is this profile's control.
+# and the device against brae's own host arm, 4.2e-11 / 1.02e-11 / 5.8e-11 and 4.3e-11 / 2.9e-11 /
+# 3.0e-11. The alpha figure is the device alpha solver's stopping point: pinned at 1e-16 the two arms
+# agree to 6.1e-14.
+#
+# BROKEN ONCE EACH (at t = 0.02):
+#   the pair's laplacian deltaCoeffs 0.1% out          host alpha 2.1e-03, p_rgh 3.6e-03, U 7.9e-03,
+#                                                      and 2 of 30 iteration counts lost
+#   divDevReff handed a null pair (as it was)          device alpha 4.4e-06, p_rgh 6.2e-06, U 5.4e-04
+#   the Gauss-Seidel sweep not applying the interface  device alpha 6.6e-01, p_rgh 1.2e+00, U 1.6e+01
+#   the jump left out of the device entirely           device alpha 4.9e-02, U 45% -- the control's
+#                                                      own distance, i.e. the plain-cyclic answer
+#   the pair's nHatf in a buffer local to one step     the `explicit` profile ABORTS by name (its
+#                                                      first corrector asks for a normal nothing has
+#                                                      written yet); `MULESCorr` still passes, which
+#                                                      is why that profile alone did not cover it
+# NOT DISCRIMINATED, measured: the pair's nHatf SEEDED AT ZERO rather than from calculateK. This
+# fixture starts from rest, so phi and therefore phic are zero at step one and phir = phic*nHatf is
+# zero whatever the normal is; only a restart with a live flux would read that seed.
+# NOT MEASURABLE, because brae refuses it outright: the pair left uncoupled, which every other cyclic
+# gate calls its control -- the host driver throws and names the patch rather than running it as two
+# walls.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_cyclic_vs_openfoam"
@@ -63,7 +89,52 @@ stage()
     cp -r "$C/0.orig" "$C/0"
     grep -q "type cyclic; neighbourPatch right;" "$C/system/blockMeshDict" \
         || { echo "FAIL: the fixture's left patch is no longer the cyclic this gate stages"; return 1; }
-    if [ "$profile" = walls ]; then
+    if [ "$profile" = explicitMules ] || [ "$profile" = explicitWalls ]; then
+        # THE EXPLICIT MULES BRANCH. Without MULESCorr there is no implicit pre-solve and no
+        # mixture.correct() before the correctors, so the FIRST corrector's phir reads the nHatf the
+        # PREVIOUS TIME STEP left -- on the pair as everywhere else. The device kept that normal in a
+        # buffer local to one step, which is empty when the first corrector asks for it, and refused.
+        sed -i 's/MULESCorr       yes;/MULESCorr       no;/' "$C/system/fvSolution"
+        grep -q "MULESCorr       no;" "$C/system/fvSolution" \
+            || { echo "FAIL: the $profile profile did not turn MULESCorr off"; return 1; }
+    fi
+    if [ "$profile" = jump ]; then
+        # A POROUS BAFFLE ON THE PERIODIC BOUNDARY. p_rgh's pair becomes a porousBafflePressure -- a
+        # fixedJump cyclic whose jump is rebuilt at every assembly from that assembly's flux and
+        # laminar viscosity (porousBafflePressureFvPatchField.C:125-189). The coupling is unchanged;
+        # what is added is a pressure drop the matrix has to carry.
+        #
+        # THE COEFFICIENTS ARE NOT THE TUTORIAL'S, and the control is why. `uniformJump true` averages
+        # Un over the patch, and on a gravity-driven periodic boundary that average is ~0: with the
+        # tutorial's D 1000, I 500, length 0.15 the jump came out so small that OpenFOAM's own answer
+        # with it and without it differed by 1.1e-13 in alpha -- the gate would have passed on a jump
+        # that did nothing. Per-face (`uniformJump false`) at the tutorial's coefficients diverges in
+        # OPENFOAM ITSELF (alpha 1e+286 by step 10, then a `nan` in its own solver log). I 5 over
+        # length 0.05 is the one that is both live and stable, and the control below measures it.
+        python3 - "$C" <<'PYEOF' || { echo "FAIL: the jump profile was not staged"; return 1; }
+import sys
+p = sys.argv[1] + '/0/p_rgh'
+s = open(p).read()
+old = '    "(left|right)" { type cyclic; }'
+assert s.count(old) == 1, 'the fixture no longer writes p_rgh a plain cyclic'
+s = s.replace(old,
+"""    "(left|right)"
+    {
+        type            porousBafflePressure;
+        patchType       cyclic;
+        D               0;
+        I               5;
+        length          0.05;
+        uniformJump     false;
+        jump            uniform 0;
+        value           uniform 0;
+    }""")
+open(p, 'w').write(s)
+PYEOF
+        grep -q "porousBafflePressure" "$C/0/p_rgh" \
+            || { echo "FAIL: the jump profile did not reach p_rgh"; return 1; }
+    fi
+    if [ "$profile" = walls ] || [ "$profile" = explicitWalls ]; then
         # THE CONTROL: the pair replaced by two walls, in the mesh AND in every field that names it.
         # blockMesh numbers the cells from the block, so the two runs' cells are the same cells.
         sed -i 's/type cyclic; neighbourPatch right;/type wall;/; s/type cyclic; neighbourPatch left; */type wall;/' \
@@ -101,16 +172,31 @@ PYEOF
     echo "OpenFOAM ran $STEPS steps of deltaT $DT to t = $END   [$profile]"
 }
 
-stage cyclic || { echo "interfoam_cyclic_vs_openfoam: staging failed"; exit 1; }
-stage walls  || { echo "interfoam_cyclic_vs_openfoam: staging failed"; exit 1; }
+for p in cyclic walls explicitMules explicitWalls jump; do
+    stage "$p" || { echo "interfoam_cyclic_vs_openfoam: staging failed"; exit 1; }
+done
 
 # the oracle took the path: OpenFOAM's own mesh carries the pair on one arm and not on the other
 grep -q "type  *cyclic" "$W/cyclic/constant/polyMesh/boundary" \
     || { echo "FAIL: OpenFOAM's mesh has no cyclic patch"; exit 1; }
 grep -q "type  *cyclic" "$W/walls/constant/polyMesh/boundary" \
     && { echo "FAIL: the control's mesh still has a cyclic patch"; exit 1; }
+grep -q "MULESCorr       no;" "$W/explicitMules/system/fvSolution" \
+    || { echo "FAIL: the explicit profile ran with MULESCorr still on"; exit 1; }
+grep -q "MULESCorr       yes;" "$W/cyclic/system/fvSolution" \
+    || { echo "FAIL: the shipped profile no longer sets MULESCorr"; exit 1; }
 
-"$BIN" "$W/cyclic" "$W/cyclic/0" "$W/cyclic/$END" "$STEPS" "$W/cyclic/log.interFoam" "$W/walls/$END"
-rc=$?
+rc=0
+"$BIN" "$W/cyclic" "$W/cyclic/0" "$W/cyclic/$END" "$STEPS" "$W/cyclic/log.interFoam" \
+       "$W/walls/$END" MULESCorr || rc=1
+# ...and the same case with MULESCorr off, which is a different alpha equation and a different place
+# for the pair's nHatf to come from
+"$BIN" "$W/explicitMules" "$W/explicitMules/0" "$W/explicitMules/$END" "$STEPS" \
+       "$W/explicitMules/log.interFoam" "$W/explicitWalls/$END" explicit || rc=1
+# ...and with a JUMP on the pair: a porousBafflePressure, which the matrix, the flux and the gradient
+# all have to carry. ITS control is the PLAIN-CYCLIC run -- the pair coupled and nothing else -- so
+# what the control measures is the jump itself and not the coupling.
+"$BIN" "$W/jump" "$W/jump/0" "$W/jump/$END" "$STEPS" \
+       "$W/jump/log.interFoam" "$W/cyclic/$END" jump || rc=1
 echo "interfoam_cyclic_vs_openfoam: rc $rc"
 exit $rc
