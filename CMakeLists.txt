@@ -3187,6 +3187,17 @@ target_link_libraries(test_device_laplacian_vs_host PRIVATE brae_core)
 add_test(NAME device_laplacian_vs_host COMMAND test_device_laplacian_vs_host)
 set_tests_properties(device_laplacian_vs_host PROPERTIES SKIP_RETURN_CODE 77)
 
+# the device's CYCLIC-interface laplacian coefficients against the host's fvm::laplacian, the first
+# module of interFoam's cyclic path (it depends on nothing else in that loop)
+add_executable(test_device_cyclic_laplacian_vs_host tests/test_device_cyclic_laplacian_vs_host.cu)
+target_include_directories(test_device_cyclic_laplacian_vs_host PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_cyclic_laplacian_vs_host PRIVATE brae_core)
+add_test(NAME device_cyclic_laplacian_vs_host
+         COMMAND test_device_cyclic_laplacian_vs_host
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannel)
+set_tests_properties(device_cyclic_laplacian_vs_host PROPERTIES SKIP_RETURN_CODE 77)
+
 # the device Gauss gradient against the host's fvc::gaussGrad, bit for bit, with the two forms the device
 # used to have as controls
 add_executable(test_device_gauss_grad tests/test_device_gauss_grad.cu)
