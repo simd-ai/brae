@@ -30,6 +30,16 @@
 // faces, asserted). Both schemes, both meshes: 2.7e-20 on coefficients up to 2.1e-01. Its diffusion half
 // had the SAME defect as the laplacian's and it was fixed the same way -- BROKEN once, with the flag
 // ignored: 1.6e-05 on the skewed mesh's orthogonal pass.
+//
+// THE THREE EXPLICIT OPERATORS the pressure corrector needs across the pair are here too -- fvc::flux,
+// fvc::div's boundary sum and fvc::gaussGrad's interface contribution -- each against the host's own
+// coupled branch (fvc.cu:50-53, :399-402). div and grad agree to 1.8e-15 and 3.6e-15 of contributions
+// up to 8.2e+00 and 2.0e+01. The FLUX is asserted BIT FOR BIT, and the bits are the point: device and
+// host differ by 1.7e-18 plain, and all 20 of 20 faces reproduce the device EXACTLY once the host fuses
+// the same multiply-adds with std::fma -- so the difference is nvcc's contraction and the arithmetic
+// form is identical. That arm is what discriminates: BROKEN once, with the interpolation weight on the
+// wrong side, the value bound barely moves (1.9e-17, because this mesh's weights are near 0.5) while
+// the bitwise arm falls from 20 of 20 to 2 of 20 and the divergence goes 1.9e-14.
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -304,6 +314,170 @@ int main(int argc, char** argv)
         check("...and the momentum diagonal it writes is the host's",
               worstDiag <= scalar(1e-14)*std::fmax(diagScale, scalar(1e-300)));
         }
+    }
+
+    // ---- THE FLUX, THE DIVERGENCE AND THE GRADIENT ON THE PAIR ----------------------------------
+    // Three explicit operators the pressure corrector needs across a cyclic, each against the host's own
+    // coupled branch: fvc::flux (fvc.cu:399-402, dot(coupledLinear(H), Sf)), fvc::div's boundary sum
+    // (the owner cell gains phi_b/V) and fvc::gaussGrad (fvc.cu:50-53, Sf*coupledLinear(psi)/V).
+    // OpenFOAM's own coupled interpolation is lerp(patchNeighbourField, patchInternalField, lambda) =
+    // (1 - w)*N + w*P (surfaceInterpolationScheme.C:284-293 with VectorI.H:259-274), which is the form
+    // both arms already use -- unlike an INTERNAL face, where OF writes lambda*(P - N) + N and the two
+    // differ in the last bit.
+    {
+        std::vector<scalar> Hx(static_cast<std::size_t>(nC)), Hy(static_cast<std::size_t>(nC)),
+                            Hz(static_cast<std::size_t>(nC)), psi(static_cast<std::size_t>(nC));
+        std::vector<vector> H(static_cast<std::size_t>(nC));
+        for (label c = 0; c < nC; ++c)
+        {
+            const vector& C = g.C()[c];
+            const std::size_t k = static_cast<std::size_t>(c);
+            Hx[k] = std::sin(scalar(1.1)*C.x) + scalar(0.3)*C.y;
+            Hy[k] = std::cos(scalar(0.9)*C.y) - scalar(0.2)*C.x;
+            Hz[k] = scalar(0.05)*std::sin(scalar(2.0)*C.x + C.y);
+            H[k] = vector{Hx[k], Hy[k], Hz[k]};
+            psi[k] = scalar(1.3) + std::sin(scalar(1.7)*C.x)*std::cos(scalar(1.1)*C.y);
+        }
+
+        {   // WHICH WEIGHT does each arm interpolate with? The host patch's and the CyclicInterface's
+            // are the same quantity from two builders, and one ulp between them is a whole ulp in every
+            // flux across the pair.
+            scalar wDiff = 0;
+            for (const CyclicInterface& c : cyclics)
+            {
+                const FvPatch& P = fvp[c.patch];
+                for (std::size_t i = 0; i < c.weights.size(); ++i)
+                {
+                    wDiff = std::fmax(wDiff, std::fabs(c.weights[i] - P.weights[i]));
+                }
+            }
+            std::printf("  weights: worst |CyclicInterface - FvPatch| %.4e\n", (double)wDiff);
+        }
+        DeviceCyclic cyc = buildDeviceCyclic(cyclics, g, fvp);
+        DeviceBuffer<scalar> dHx(Hx), dHy(Hy), dHz(Hz), dPsi(psi), dV(g.V());
+        deviceCyclicFlux(cyc, dHx, dHy, dHz);
+        std::vector<scalar> devPhi;
+        cyc.phi.copyTo(devPhi);
+
+        // the host's flux on the same faces
+        std::vector<scalar> hostPhi;
+        for (const CyclicInterface& c : cyclics)
+        {
+            const FvPatch& P = fvp[c.patch];
+            for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+            {
+                hostPhi.push_back(dot(coupledLinear<vector>(P, static_cast<label>(i), H),
+                                      g.Sf()[P.start + static_cast<label>(i)]));
+            }
+        }
+        // IS THE DIFFERENCE THE COMPILER'S CONTRACTION? The device kernel writes
+        // `wj*Hx[o] + wn*Hx[nb]` and then a three-term dot; with -fmad=true nvcc fuses each into an
+        // fma, which rounds once where the host rounds twice. The host form is recomputed here WITH
+        // std::fma in the same places, and if that reproduces the device bit for bit the difference is
+        // the contraction and nothing else.
+        std::vector<scalar> hostFma;
+        for (const CyclicInterface& c : cyclics)
+        {
+            const FvPatch& P = fvp[c.patch];
+            for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+            {
+                const label o = P.faceCells[i];
+                const label nb = c.nbrFaceCells[i];
+                const scalar wj = P.weights[i], wn = scalar(1) - wj;
+                const std::size_t ok = static_cast<std::size_t>(o), nk = static_cast<std::size_t>(nb);
+                const scalar fx = std::fma(wj, Hx[ok], wn*Hx[nk]);
+                const scalar fy = std::fma(wj, Hy[ok], wn*Hy[nk]);
+                const scalar fz = std::fma(wj, Hz[ok], wn*Hz[nk]);
+                const vector& S = g.Sf()[P.start + static_cast<label>(i)];
+                hostFma.push_back(std::fma(fx, S.x, std::fma(fy, S.y, fz*S.z)));
+            }
+        }
+        std::size_t fmaExact = 0;
+        for (std::size_t j = 0; j < devPhi.size() && j < hostFma.size(); ++j)
+        {
+            if (devPhi[j] == hostFma[j]) ++fmaExact;
+        }
+        std::printf("  flux: %zu of %zu faces reproduce the device EXACTLY when the host contracts too\n",
+                    fmaExact, devPhi.size());
+
+        scalar worstPhi = 0, phiScale = 0;
+        for (std::size_t j = 0; j < devPhi.size() && j < hostPhi.size(); ++j)
+        {
+            worstPhi = std::fmax(worstPhi, std::fabs(devPhi[j] - hostPhi[j]));
+            phiScale = std::fmax(phiScale, std::fabs(hostPhi[j]));
+        }
+        std::printf("  flux: worst |device - host| %.4e over %zu faces (fluxes up to %.4e)\n",
+                    (double)worstPhi, devPhi.size(), (double)phiScale);
+        // THE STRONG ARM is the contraction one: every face bit-identical once the host fuses the same
+        // multiply-adds. A different weight, a different interpolation form or a different dot order
+        // would break it, and none of those is a rounding question.
+        check("the device's interface flux is the host's arithmetic, bit for bit under the same "
+              "contraction", devPhi.size() == hostPhi.size() && fmaExact == devPhi.size());
+        check("...and the two agree to a ulp without it",
+              worstPhi <= scalar(4e-16)*std::fmax(phiScale, scalar(1e-300)));
+
+        // ...the divergence that flux carries into the owner cell
+        DeviceBuffer<scalar> dDiv(std::vector<scalar>(static_cast<std::size_t>(nC), scalar(0)));
+        deviceCyclicAddDiv(cyc, dV, dDiv);
+        std::vector<scalar> devDiv;
+        dDiv.copyTo(devDiv);
+        std::vector<scalar> hostDiv(static_cast<std::size_t>(nC), scalar(0));
+        {
+            std::size_t j = 0;
+            for (const CyclicInterface& c : cyclics)
+            {
+                const FvPatch& P = fvp[c.patch];
+                for (std::size_t i = 0; i < c.faceCells.size(); ++i, ++j)
+                {
+                    const label o = P.faceCells[i];
+                    hostDiv[static_cast<std::size_t>(o)] += hostPhi[j]/g.V()[o];
+                }
+            }
+        }
+        scalar worstDiv = 0, divScale = 0;
+        for (label c = 0; c < nC; ++c)
+        {
+            const std::size_t k = static_cast<std::size_t>(c);
+            worstDiv = std::fmax(worstDiv, std::fabs(devDiv[k] - hostDiv[k]));
+            divScale = std::fmax(divScale, std::fabs(hostDiv[k]));
+        }
+        std::printf("  div: worst |device - host| %.4e (contributions up to %.4e)\n",
+                    (double)worstDiv, (double)divScale);
+        check("...and the divergence it adds to the owner cell is the host's",
+              worstDiv <= scalar(1e-15)*std::fmax(divScale, scalar(1e-300)));
+
+        // ...and gaussGrad's interface contribution
+        DeviceBuffer<scalar> gx(std::vector<scalar>(static_cast<std::size_t>(nC), scalar(0))),
+                             gy(std::vector<scalar>(static_cast<std::size_t>(nC), scalar(0))),
+                             gz(std::vector<scalar>(static_cast<std::size_t>(nC), scalar(0)));
+        deviceCyclicAddGrad(cyc, dPsi, dV, gx, gy, gz);
+        std::vector<scalar> dgx, dgy, dgz;
+        gx.copyTo(dgx); gy.copyTo(dgy); gz.copyTo(dgz);
+        std::vector<vector> hostGrad(static_cast<std::size_t>(nC), vector{0, 0, 0});
+        for (const CyclicInterface& c : cyclics)
+        {
+            const FvPatch& P = fvp[c.patch];
+            for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+            {
+                const label o = P.faceCells[i];
+                const scalar fv = coupledLinear<scalar>(P, static_cast<label>(i), psi)/g.V()[o];
+                hostGrad[static_cast<std::size_t>(o)] += g.Sf()[P.start + static_cast<label>(i)]*fv;
+            }
+        }
+        scalar worstGrad = 0, gradScale = 0;
+        for (label c = 0; c < nC; ++c)
+        {
+            const std::size_t k = static_cast<std::size_t>(c);
+            worstGrad = std::fmax(worstGrad,
+                                  std::fmax(std::fabs(dgx[k] - hostGrad[k].x),
+                                            std::fmax(std::fabs(dgy[k] - hostGrad[k].y),
+                                                      std::fabs(dgz[k] - hostGrad[k].z))));
+            gradScale = std::fmax(gradScale, mag(hostGrad[k]));
+        }
+        std::printf("  gaussGrad: worst |device - host| %.4e (contributions up to %.4e)\n",
+                    (double)worstGrad, (double)gradScale);
+        check("...and gaussGrad's interface contribution is the host's",
+              worstGrad <= scalar(1e-15)*std::fmax(gradScale, scalar(1e-300)));
     }
 
     std::printf("test_device_cyclic_laplacian_vs_host: %d failures\n", failures);
