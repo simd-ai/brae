@@ -24,13 +24,32 @@
 // and two DIFFERENT values where one wall function gives one -- while every pair-only cell agreed to
 // 1e-12. With the pair's coefficient zeroed they read the host's 1.98615292e+00 to 2.2e-16.
 //
-// WHAT IS LEFT IS NOT THE PAIR AND NOT THE CLOSURE, and it is an open finding rather than a bound
-// chosen to fit: with EVERY solve pinned at 1e-16 the device is 2.7743e-07 from the host in p_rgh at
-// STEP ONE (of a 2.8447e+03 scale), at cell 1305, which is not on the pair -- the pair's own cells
-// read 2.6308e-07, no worse. It tracks |U| 4.0292e-09 of 2.4872e-02, HbyA 5.6717e-09 of 6.6500e-03 and
-// the momentum source 6.7058e-11 of 6.3761e-04, which is where to pick it up. The momentum MATRIX is
-// not it: the device's diag equals the host's diag plus the pair's own internalCoeffs to 1.5583e-13 of
-// 2.4229e+01 (the device folds them in where OpenFOAM keeps them until addBoundaryDiag).
+// WHAT IS LEFT IS THE PAIR, AND IT NEEDS A SECOND OUTER CORRECTOR. With every solve pinned at 1e-16
+// the device is 2.7743e-07 from the host in p_rgh at STEP ONE (of a 2.8447e+03 scale) at cell 1305,
+// tracking |U| 4.0292e-09 of 2.4872e-02 and HbyA 5.6717e-09 of 6.6500e-03. Two controls place it:
+//
+//   the same case meshed WITHOUT createBaffles, so no pair exists    |U| 1.5959e-15, p_rgh 5.6843e-12
+//   the same case with the pair but nOuterCorrectors 1               |U| 2.2751e-15, p_rgh 4.0927e-12
+//   the case as shipped, pair + nOuterCorrectors 2                   |U| 3.6174e-09, p_rgh 2.4990e-07
+//
+// Five to six orders in either control, and it does not compound (nOuterCorrectors 3 reads 4.0292e-09).
+// The first corrector starts from U = 0 and phi = 0, so every term the pair carries is identically zero
+// there and the second corrector is the first that exercises any of them.
+//
+// RULED OUT BY MEASUREMENT, each with the number: relaxation (a no-op at alpha 1 on a dominant matrix --
+// deleting relaxationFactors changes no digit); surface tension and the curvature K (sigma 0 leaves
+// 3.6169e-09 against 3.6174e-09, so K's own 1.1e-05 split is a large relative error on a quantity too
+// small to reach U); the viscous stress (nu cut by 1e6 leaves the source gap at 9.9181e-11 against
+// 9.9156e-11); the closure (laminar leaves 6.2757e-09); nondeterminism (both arms are bit-reproducible
+// run to run, 0.0000e+00); the wall patch values H() multiplies (exactly equal, no-slip on both arms);
+// and the momentum MATRIX -- diag equals the host's plus the pair's own internalCoeffs to 1.5583e-13 of
+// 2.4229e+01 (the device folds them in where OpenFOAM keeps them until addBoundaryDiag), upper 2.6e-15,
+// lower 2.7e-15, iCx 4.3e-19, bCx 1.6e-25, rAU 7.9e-19.
+//
+// THE CARRIER IS HbyA, which moves 4.8e-07 relative where its own source moves 6.0e-08 -- so it is what
+// H() multiplies, not the coefficients. WHAT IS NOT TAPPED YET, and is the next measurement: H()'s own
+// pair contribution (deviceCyclicAddH) and the p_rgh system's coefficients, neither of which any tap in
+// this tree reads.
 //
 // WHAT LOOKED LIKE A SECOND GAP HERE WAS THE REPORT, not the solve: the device printed worst |div(phi)|
 // 2.875e-01 against the host's 7.932e-05 with max|U| agreeing to every digit, because the report read
