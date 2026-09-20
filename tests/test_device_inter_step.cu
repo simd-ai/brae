@@ -332,11 +332,28 @@ int main()
         std::vector<scalar> cx2, cy2, cz2;
         dUx.copyTo(cx2); dUy.copyTo(cy2); dUz.copyTo(cz2);
         dUox.copyFrom(cx2); dUoy.copyFrom(cy2); dUoz.copyFrom(cz2);
+        // U.oldTime()'s PATCH values, as the driver snapshots them: ddtCorr's boundary half
+        // interpolates the stored patch value on an uncoupled patch. This fixture's U boundary is the
+        // face cells', so the two coincide here and the arm below cannot tell them apart.
+        DeviceBuffer<scalar> dUobx, dUoby, dUobz;
+        {
+            std::vector<scalar> bx, by, bz;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                for (label i = 0; i < fvp[pi].size; ++i)
+                {
+                    const label c = fvp[pi].faceCells[i];
+                    bx.push_back(cx2[static_cast<std::size_t>(c)]);
+                    by.push_back(cy2[static_cast<std::size_t>(c)]);
+                    bz.push_back(cz2[static_cast<std::size_t>(c)]);
+                }
+            dUobx.copyFrom(bx); dUoby.copyFrom(by); dUobz.copyFrom(bz);
+        }
         std::vector<scalar> poi, pob;
         dPhiI.copyTo(poi);  dPhiB.copyTo(pob);
         DeviceBuffer<scalar> dPhiOI(poi), dPhiOB(pob);
         deviceInterStep(dm, dt, ctl, props, hooks, dGh, dGhf, dMagSf,
                         dAlpha, dAlphaOld, dUx, dUy, dUz, dUox, dUoy, dUoz,
+                        dUobx, dUoby, dUobz,
                         dPhiI, dPhiB, dPhiOI, dPhiOB, dUFix, dPrgh, dP, dNHatf, dNHatfB, dABnd, dK,
                         dFixes, dFlag, dbU, dRho, dMu, dNu, dRhoPhiI, dRhoPhiB);
     }

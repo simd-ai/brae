@@ -86,6 +86,10 @@ struct DeviceInterPressureInput
 
     // fvc::ddtCorr(U, phi). Null on a start from rest, where there is no old flux to correct against.
     const DeviceBuffer<scalar>* ddtCorrInt = nullptr;
+    // ...and its boundary half, with rho's patch values: live on any patch whose U fixes no value
+    const DeviceBuffer<scalar>* ddtCorrBnd = nullptr;
+    const DeviceBuffer<scalar>* rhoBndFace = nullptr;
+    const DeviceBuffer<int>*    bndUFixesValue = nullptr;
     // MRFZoneList::makeRelative(phiHbyA), pEqn.H:19
     const std::vector<DeviceMRFZone>* mrf = nullptr;
 

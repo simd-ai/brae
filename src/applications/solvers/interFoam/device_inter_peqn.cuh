@@ -72,7 +72,13 @@ void deviceDdtCorr(
     scalar                      ddtPhiCoeff,      // negative selects the limiter -- the default
     scalar                      deltaT,
     DeviceBuffer<scalar>&       outInt,
-    DeviceBuffer<scalar>&       outBnd);
+    DeviceBuffer<scalar>&       outBnd,
+    // U.oldTime()'s STORED PATCH values, which fvc::dotInterpolate uses on an uncoupled patch
+    // (surfaceInterpolationScheme.C:296-298). Null falls back to the face cell, which is the same only
+    // where the patch value follows the cell -- not on a slip wall.
+    const DeviceBuffer<scalar>* UOldBndX = nullptr,
+    const DeviceBuffer<scalar>* UOldBndY = nullptr,
+    const DeviceBuffer<scalar>* UOldBndZ = nullptr);
 
 // U = HbyA + rAU*fvc::reconstruct((phig - p_rghEqn.flux())/rAUf), pEqn.H:58. `faceFlux` is the
 // difference BEFORE the division; the division happens inside so the two operations cannot be
@@ -168,7 +174,15 @@ void deviceInterAddPhiHbyATerms(
     DeviceBuffer<scalar>&       phiHbyABnd,
     // MRFZoneList::makeRelative(phiHbyA), pEqn.H:19 -- BETWEEN the ddtCorr term and phig, which is why
     // it is applied in here rather than by the caller
-    const std::vector<DeviceMRFZone>* mrf = nullptr);
+    const std::vector<DeviceMRFZone>* mrf = nullptr,
+    // ddtCorr's BOUNDARY half and what interpolate(rho*rAU) needs for it: rho's patch values and rAU on
+    // cells (inter_peqn_cpp.cu:531-573). Null = the term is not added, which is right only where every
+    // open patch fixes U.
+    const DeviceBuffer<scalar>* ddtCorrBnd = nullptr,
+    const DeviceBuffer<scalar>* rhoBnd = nullptr,
+    const DeviceBuffer<scalar>* rAU = nullptr,
+    // ...and U's per-face fixesValue mask, because the host skips such a patch outright
+    const DeviceBuffer<int>*    uFixesValue = nullptr);
 
 // phi = phiHbyA - p_rghEqn.flux(), pEqn.H:56. fvMatrix::flux() is
 //     internal  upper*p[nei] - lower*p[own]

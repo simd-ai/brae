@@ -60,6 +60,33 @@
 #
 # NOT CLAIMED: a flowRate that varies in time (refused), and the device loop (refused by name -- for
 # the two conditions, and for ddtCorr's boundary half on any open patch whose U fixes no value).
+# THE DEVICE LOOP RUNS THIS CASE NOW, at the same bounds: alpha 2.4e-13, p_rgh 4.3e-13, U 5.1e-11, and
+# its inlet 5.6e-13 face by face. Three things it refused, each transcribed from the host arm:
+#   ddtCorr's BOUNDARY half. pEqn.H:16-17 adds a whole surfaceScalarField and fvcDdtPhiCoeff zeroes the
+#   coupling coefficient only where U FIXES a value; this outlet is a zeroGradient U, so the correction
+#   is live there. deviceDdtCorr already computed it (and already zeroed it where U fixes a value) and
+#   the step simply dropped it. Added with interpolate(rho*rAU)'s patch value -- rho's own boundary value
+#   and rAU's extrapolated one, 1/A of the face cell (inter_peqn_cpp.cu:531-573). BROKEN: U 3.6e-05,
+#   p_rgh 1.3e-06 against a bound of 5.0e-10.
+#   the variableHeightFlowRateInletVelocity, rebuilt at every momentum assembly from the phase fraction
+#   on its patch (variableHeightFlowRateInletVelocityFvPatchVectorField.C:103-139), where the host driver
+#   rebuilds it (inter_driver_cpp.cu:722-735). BROKEN: U 1.0000e+00, the inlet itself 3.6e+00 out.
+#   alpha's own variableHeightFlowRate, a mixed condition whose valueFraction is 1 on an inflow face and
+#   0 on the rest. The device's MULES mask was the patch's single fixesValue(), taken once.
+# AND ONE THE ARM FOUND ELSEWHERE. Adding the boundary half put RAS/angledDuct's `inactive` arm 1.4e-11
+# from OpenFOAM where it had been 7.6e-15: the device computed that half from the face CELL's
+# U.oldTime(), while fvc::dotInterpolate(Sf, U.oldTime()) on an uncoupled patch is
+# `pSf & vf.boundaryField()[pi]` -- the STORED patch value (surfaceInterpolationScheme.C:296-298), which
+# is what the host arm reads (inter_peqn_cpp.cu:263-270). The two coincide wherever the patch value
+# follows the cell and differ on a SLIP wall, which angledDuct's `porosityWall` is. The device now
+# snapshots U's patch values with its cells at the top of the step.
+# NOT CLAIMED: that last one. The mask does vary here (13 of 44 faces outflow at the end, asserted), but
+# the answer does not depend on it -- dropping the refresh changes no digit, and forcing the mask to zero
+# over the whole patch moves p_rgh from 4.2981e-13 to 4.3078e-13 and nothing else. The faithful form is
+# in; a fixture where MULES's limiter is live on that patch would be what tests it.
+# STILL RED, AND NOT FROM THIS WORK: the k FINAL-residual arm, where OpenFOAM reports 8.189e-14 and brae
+# 8.092e-14 -- both at round-off, the comparison is of two stopping points, and it awaits a decision.
+#
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_weiroverflow_vs_openfoam"

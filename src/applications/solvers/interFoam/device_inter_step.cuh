@@ -216,6 +216,10 @@ void deviceInterStep(
     const DeviceBuffer<scalar>&      UOldX,
     const DeviceBuffer<scalar>&      UOldY,
     const DeviceBuffer<scalar>&      UOldZ,
+    // ...and U.oldTime()'s PATCH values, which ddtCorr's boundary half interpolates with
+    const DeviceBuffer<scalar>&      UOldBndX,
+    const DeviceBuffer<scalar>&      UOldBndY,
+    const DeviceBuffer<scalar>&      UOldBndZ,
     DeviceBuffer<scalar>&            phiInt,
     DeviceBuffer<scalar>&            phiBnd,
     // phi.oldTime(), and U's per-face fixesValue mask. Both are fvc::ddtCorr's, which pEqn.H adds to

@@ -83,6 +83,7 @@ __global__ void ddtCorrBoundaryKernel(
     const scalar* __restrict__ Sfx, const scalar* __restrict__ Sfy, const scalar* __restrict__ Sfz,
     const scalar* __restrict__ phiOldBnd,
     const scalar* __restrict__ uox, const scalar* __restrict__ uoy, const scalar* __restrict__ uoz,
+    const scalar* __restrict__ uobx, const scalar* __restrict__ uoby, const scalar* __restrict__ uobz,
     int nBf, scalar given, scalar rDeltaT, scalar* __restrict__ out)
 {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
@@ -91,9 +92,16 @@ __global__ void ddtCorrBoundaryKernel(
     // no inconsistency to correct (ddtScheme.C:~275).
     if (fixesValue[b]) { out[b] = scalar(0); return; }
     const int c = bndCell[b], gf = bndGFace[b];
-    // the patch's own face value of U.oldTime() is the face CELL's -- fvcDdtPhiCorr takes
-    // patchInternalField there, not the stored patch value
-    const scalar interpFlux = uox[c]*Sfx[gf] + uoy[c]*Sfy[gf] + uoz[c]*Sfz[gf];
+    // fvc::dotInterpolate(Sf, U.oldTime()) on an UNCOUPLED patch is `pSf & vf.boundaryField()[pi]` --
+    // the STORED patch value (surfaceInterpolationScheme.C:296-298), not patchInternalField. This read
+    // the face cell, which is the same number only where the patch value follows the cell. On a SLIP
+    // wall it does not: MEASURED on RAS/angledDuct, whose `porosityWall` is one, the boundary half of
+    // ddtCorr put the `inactive` arm 1.4e-11 from OpenFOAM where it is 7.6e-15 with the patch value.
+    // The host arm reads it the same way (inter_peqn_cpp.cu:263-270).
+    const scalar uX = uobx ? uobx[b] : uox[c];
+    const scalar uY = uoby ? uoby[b] : uoy[c];
+    const scalar uZ = uobz ? uobz[b] : uoz[c];
+    const scalar interpFlux = uX*Sfx[gf] + uY*Sfy[gf] + uZ*Sfz[gf];
     const scalar pOld    = phiOldBnd[b];
     const scalar phiCorr = pOld - interpFlux;
     out[b] = ddtCoeff(phiCorr, pOld, given) * rDeltaT * phiCorr;
@@ -158,8 +166,31 @@ __global__ void addPhigBoundaryKernel(const scalar* __restrict__ phig, int n,
                                       scalar* __restrict__ phiHbyA)
 {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
-    // the boundary half of phig, WITHOUT ddtCorr -- see the header
     if (b < n) phiHbyA[b] += phig[b];
+}
+
+// ddtCorr's BOUNDARY half, the host's own loop (inter_peqn_cpp.cu:531-573) for an uncoupled patch:
+//     phiHbyA_b += rho_b * rAU[faceCell] * corr_b
+// with interpolate(rho*rAU) on the patch being rho's own boundary value and rAU's extrapolated one, which
+// is 1/A of the face cell (fvMatrix::A() is extrapolatedCalculated). corr_b is already ZERO wherever U
+// fixes a value, because fvcDdtPhiCoeff zeroed the coupling coefficient there (deviceDdtCorr takes that
+// mask), so no patch test is needed here -- the arithmetic is the test.
+__global__ void addDdtCorrBoundaryKernel(
+    const scalar* __restrict__ rhoBnd,
+    const scalar* __restrict__ rAU,
+    const label*  __restrict__ faceCell,
+    const scalar* __restrict__ corrBnd,
+    const int*    __restrict__ uFixesValue,
+    int n,
+    scalar* __restrict__ phiHbyA)
+{
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n) return;
+    // The host's own test, kept EXPLICIT (inter_peqn_cpp.cu:533): a patch whose U fixes a value is
+    // skipped outright. Relying on the correction being zero there instead was not the same thing --
+    // MEASURED on RAS/angledDuct, where it moved the `inactive` arm from 7.6e-15 to 1.4e-11.
+    if (uFixesValue[b]) return;
+    phiHbyA[b] += rhoBnd[b] * rAU[faceCell[b]] * corrBnd[b];
 }
 
 // fvMatrix::flux() at a boundary face: internalCoeffs*p[faceCell] - boundaryCoeffs.
@@ -298,7 +329,10 @@ void deviceDdtCorr(
     scalar                      ddtPhiCoeff,
     scalar                      deltaT,
     DeviceBuffer<scalar>&       outInt,
-    DeviceBuffer<scalar>&       outBnd)
+    DeviceBuffer<scalar>&       outBnd,
+    const DeviceBuffer<scalar>* UOldBndX,
+    const DeviceBuffer<scalar>* UOldBndY,
+    const DeviceBuffer<scalar>* UOldBndZ)
 {
     if (deltaT <= scalar(0))
         throw std::runtime_error("brae interFoam device ddtCorr: deltaT must be positive.");
@@ -320,7 +354,10 @@ void deviceDdtCorr(
         ddtCorrBoundaryKernel<<<nBlocks(nBf), TPB>>>(
             dm.bndCell.data(), dm.bndGFace.data(), bndUFixesValue.data(),
             dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(), phiOldBnd.data(),
-            UOldX.data(), UOldY.data(), UOldZ.data(), nBf, ddtPhiCoeff, rDeltaT, outBnd.data());
+            UOldX.data(), UOldY.data(), UOldZ.data(),
+            UOldBndX ? UOldBndX->data() : nullptr,
+            UOldBndY ? UOldBndY->data() : nullptr,
+            UOldBndZ ? UOldBndZ->data() : nullptr, nBf, ddtPhiCoeff, rDeltaT, outBnd.data());
         ckP(cudaGetLastError(), "ddtCorr, boundary");
     }
 }
@@ -467,7 +504,11 @@ void deviceInterAddPhiHbyATerms(
     bool                        haveDdtCorr,
     DeviceBuffer<scalar>&       phiHbyAInt,
     DeviceBuffer<scalar>&       phiHbyABnd,
-    const std::vector<DeviceMRFZone>* mrf)
+    const std::vector<DeviceMRFZone>* mrf,
+    const DeviceBuffer<scalar>* ddtCorrBnd,
+    const DeviceBuffer<scalar>* rhoBnd,
+    const DeviceBuffer<scalar>* rAU,
+    const DeviceBuffer<int>*    uFixesValue)
 {
     const int nIf = dm.nInternalFaces, nBf = dm.nBndFaces;
     if (static_cast<int>(phiHbyAInt.size()) != nIf || static_cast<int>(phiHbyABnd.size()) != nBf)
@@ -501,6 +542,14 @@ void deviceInterAddPhiHbyATerms(
     }
     if (nBf > 0)
     {
+        // the ddtCorr term goes in BEFORE phig on the boundary too, in the host's order
+        if (ddtCorrBnd && rhoBnd && rAU && uFixesValue)
+        {
+            addDdtCorrBoundaryKernel<<<nBlocks(nBf), TPB>>>(
+                rhoBnd->data(), rAU->data(), dm.bndCell.data(), ddtCorrBnd->data(),
+                uFixesValue->data(), nBf, phiHbyABnd.data());
+            ckP(cudaGetLastError(), "phiHbyA += rho_b*rAU*ddtCorr, boundary");
+        }
         addPhigBoundaryKernel<<<nBlocks(nBf), TPB>>>(phigBnd.data(), nBf, phiHbyABnd.data());
         ckP(cudaGetLastError(), "phiHbyA += phig, boundary");
     }

@@ -87,7 +87,8 @@ scalar deviceInterPressureStep(
     deviceInterAddPhiHbyATerms(dm, rhoRAUf,
                                in.ddtCorrInt ? *in.ddtCorrInt : zeroIf,
                                phigInt, phigBnd, in.ddtCorrInt != nullptr,
-                               phiHbyAInt, phiHbyABnd, in.mrf);
+                               phiHbyAInt, phiHbyABnd, in.mrf,
+                               in.ddtCorrBnd, in.rhoBndFace, &rAU, in.bndUFixesValue);
 
     // rAUf on the internal faces -- the head of the full array the caller passed.
     DeviceBuffer<scalar> rAUfInt(static_cast<std::size_t>(nIf));

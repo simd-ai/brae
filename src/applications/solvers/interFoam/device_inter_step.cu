@@ -61,6 +61,9 @@ void deviceInterStep(
     const DeviceBuffer<scalar>&      UOldX,
     const DeviceBuffer<scalar>&      UOldY,
     const DeviceBuffer<scalar>&      UOldZ,
+    const DeviceBuffer<scalar>&      UOldBndX,
+    const DeviceBuffer<scalar>&      UOldBndY,
+    const DeviceBuffer<scalar>&      UOldBndZ,
     DeviceBuffer<scalar>&            phiInt,
     DeviceBuffer<scalar>&            phiBnd,
     const DeviceBuffer<scalar>&      phiOldInt,
@@ -381,7 +384,8 @@ void deviceInterStep(
         // compared with the flux, and it is zero on every patch where U fixes a value.
         DeviceBuffer<scalar> ddtCorrI, ddtCorrB;
         deviceDdtCorr(dm, phiOldInt, phiOldBnd, UOldX, UOldY, UOldZ, bndUFixesValue,
-                      /*ddtPhiCoeff=*/scalar(-1), deltaT, ddtCorrI, ddtCorrB);
+                      /*ddtPhiCoeff=*/scalar(-1), deltaT, ddtCorrI, ddtCorrB,
+                      &UOldBndX, &UOldBndY, &UOldBndZ);
 
         // MRF.zeroFilter(interpolate(rho*rAU)*fvc::ddtCorr(U, phi)), pEqn.H:18. MRFZone::zero sets the
         // flux to Zero on the zone's internal faces and on its included AND excluded boundary faces
@@ -403,6 +407,11 @@ void deviceInterStep(
         pi.rho = &rho;
         pi.gh  = &gh;
         pi.ddtCorrInt = &ddtCorrI;
+        // ddtCorr's boundary half, which pEqn.H:16-17 adds as part of a whole surfaceScalarField and
+        // this step used to drop (inter_peqn_cpp.cu:522-530 has what dropping it cost)
+        pi.ddtCorrBnd = &ddtCorrB;
+        pi.rhoBndFace = &rhoBnd;
+        pi.bndUFixesValue = &bndUFixesValue;
         pi.mrf = ctl.mrf;
         pi.needReference = ctl.needReference;
         pi.pRefCell = ctl.pRefCell;

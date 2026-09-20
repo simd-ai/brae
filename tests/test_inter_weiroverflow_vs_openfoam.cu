@@ -322,7 +322,7 @@ int main(
     check("the velocity condition moves OpenFOAM's own U far more than brae is from it",
           dFrozenU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)) && dFrozenU.rel() > scalar(1e-2));
 
-    // THE DEVICE LOOP REFUSES, by name
+    // THE DEVICE LOOP RUNS IT, at the same bounds
     int nDev = 0;
     if (cudaGetDeviceCount(&nDev) != cudaSuccess)
     {
@@ -331,22 +331,64 @@ int main(
     }
     if (nDev <= 0)
     {
-        std::printf("  (no CUDA device: the device refusal is not exercised)\n");
+        std::printf("  (no CUDA device: the device arm is not exercised)\n");
     }
     else
     {
-        bool named = false;
-        try
+        // The two this case asks for that the device loop refused: ddtCorr's BOUNDARY half, live because
+        // the outlet's U is zeroGradient, and the variableHeightFlowRateInletVelocity rebuilt from the
+        // phase fraction on its patch at every momentum assembly. Both transcribed from the host arm.
+        InterFields dev;
+        const RunReport rd = runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
+        check("the device driver ran the same number of steps", rd.steps == nSteps);
+        failures += brae::gatecheck::nonFinite("device alpha", dev.alpha1.internal);
+        failures += brae::gatecheck::nonFinite("device U", dev.U.internal);
+        const Diff eA = compare(dev.alpha1.internal, ofAlpha);
+        const Diff eP = compare(dev.p_rgh.internal, ofPrgh);
+        const Diff eU = compare(dev.U.internal, ofU);
+        std::printf("  DEVICE vs OpenFOAM: alpha %.4e, p_rgh %.4e, U %.4e\n",
+                    (double)eA.linf, (double)eP.rel(), (double)eU.rel());
+        check("the DEVICE's alpha agrees with OpenFOAM's", eA.linf < B.alpha);
+        check("...its p_rgh", eP.rel() < B.prgh);
+        check("...and its U", eU.rel() < B.U);
+        // ...and its inlet, face by face, which is the condition this case exists for
+        scalar dDevInlet = 0;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
-            InterFields dev;
-            runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
+            if (!dev.U.boundary[pi]->isVariableHeightFlowRateInlet()) continue;
+            const PatchFieldData<vector>* b = findPatchEntry(ofUFd.boundary, patches[pi]);
+            if (!b || b->valueUniform) continue;
+            dDevInlet = std::fmax(dDevInlet, compare(dev.U.boundary[pi]->value(), b->values).linf);
         }
-        catch (const std::exception& e)
+        std::printf("  DEVICE inlet velocity: Linf %.4e\n", (double)dDevInlet);
+        check("the DEVICE's inlet carries OpenFOAM's written velocity, face by face",
+              nInlet > 0 && dDevInlet <= B.U*inletScale);
+        check("the velocity condition moves OpenFOAM's own U far more than the DEVICE is from it",
+              dFrozenU.rel() > scalar(1000)*std::fmax(eU.rel(), scalar(1e-14)));
+        // WHAT THIS FIXTURE CANNOT TELL, measured rather than assumed. alpha's variableHeightFlowRate is
+        // a mixed condition whose valueFraction is 1 on an INFLOW face and 0 on the rest, and the device
+        // rebuilds MULES's per-face fixesValue mask from it rather than from the patch's single
+        // fixesValue(). The mask DOES vary here -- 13 of 44 faces are outflow at the end, which the
+        // assertion below pins -- but this case's answer does not depend on it: dropping the refresh
+        // changes no digit of alpha, p_rgh or U, and FORCING the mask to zero on that whole patch moves
+        // p_rgh from 4.2981e-13 to 4.3078e-13 and nothing else. So the refresh is the faithful form and
+        // this gate does NOT claim to test it; a fixture where MULES's limiter is live on that patch
+        // would.
+        std::size_t nVf = 0, nVfOne = 0;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
-            named = std::string(e.what()).find("variableHeightFlowRate") != std::string::npos;
-            std::printf("  device: %s\n", e.what());
+            if (!dev.alpha1.boundary[pi]->isVariableHeightFlowRate()) continue;
+            const std::vector<scalar>* vf = dev.alpha1.boundary[pi]->valueFractionPtr();
+            if (!vf) continue;
+            for (const scalar v : *vf)
+            {
+                ++nVf;
+                if (v > scalar(0.5)) ++nVfOne;
+            }
         }
-        check("the device loop refuses the case and names the condition", named);
+        std::printf("  alpha's variableHeightFlowRate: %zu of %zu faces inflow at the end\n", nVfOne, nVf);
+        check("that patch's valueFraction varies face by face, so the per-face mask is NOT the patch's",
+              nVf > 0 && nVfOne > 0 && nVfOne < nVf);
     }
 
     std::printf("test_inter_weiroverflow_vs_openfoam: %d failures\n", failures);

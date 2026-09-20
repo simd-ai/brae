@@ -109,16 +109,11 @@ RunReport runInterFoamDevice(
             + "). The device loop's UEqn applies explicitPorositySource/DarcyForchheimer only; the host "
             "loop carries this one. Refused rather than run the case without it.");
     }
-    // Two conditions the host loop rebuilds from the solution as it goes and the device loop, which
-    // uploads patch values and refValues once, would freeze.
+    // A variableHeightFlowRateInletVelocity is rebuilt by the U-boundary hook now, from the phase
+    // fraction on its patch, as the host driver rebuilds it (inter_driver_cpp.cu:722-735). What is still
+    // refused here is the permeable-wall pair, which reads the phase field too but at another point.
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        if (f.U.boundary[pi]->isVariableHeightFlowRateInlet())
-            throw std::runtime_error(
-                "brae interFoam (device): U patch `" + fvp[pi].name + "` is a "
-                "variableHeightFlowRateInletVelocity. OpenFOAM rebuilds it at every momentum assembly "
-                "from the phase fraction on the patch; the host loop does (gated on RAS/weirOverflow) "
-                "and the device loop keeps the value it uploaded. Refused rather than run a frozen inlet.");
         if (f.U.boundary[pi]->needsAlphaPatchValues() || f.p_rgh.boundary[pi]->needsAlphaPatchValues()
          || f.p_rgh.boundary[pi]->isPrghPermeableAlphaTotalPressure())
             throw std::runtime_error(
@@ -127,12 +122,6 @@ RunReport runInterFoamDevice(
                 "switches face by face between a wall and an open boundary on the phase fraction at the "
                 "patch, at every update; the host loop carries that (gated on laminar/damBreakPermeable) "
                 "and the device loop uploads the blend once. Refused rather than run a wall that never opens.");
-        if (f.alpha1.boundary[pi]->isVariableHeightFlowRate())
-            throw std::runtime_error(
-                "brae interFoam (device): alpha patch `" + fvp[pi].name + "` is a variableHeightFlowRate. "
-                "Its refValue follows the face cell at every update; the host loop carries that (gated "
-                "on RAS/weirOverflow) and the device loop uploads refValue once. Refused rather than run "
-                "it as an inletOutlet of zero.");
     }
     // `grad(U) cellLimited`: the host momentum equation limits the gradient; the device's does not read
     // the coefficient
@@ -141,35 +130,14 @@ RunReport runInterFoamDevice(
             "brae interFoam (device): fvSchemes limits grad(U) (cellLimited, k = "
             + std::to_string((double)f.gradULimitK) + "). The host loop carries it into linearUpwind and the "
             "viscous term; the device loop's momentum equation does not. Refused rather than run it unlimited.");
-    // ddtCorr's BOUNDARY HALF is live on an open patch whose U does not fix a value (fvcDdtPhiCoeff zeroes
-    // the coupling coefficient only where it does). The host pressure equation adds it; the device's
-    // deviceInterAddPhiHbyATerms has no such term. A zero-flux patch -- a slip wall, a symmetry plane --
-    // is safe: with phi 0 there the limiter's coefficient is exactly 0.
-    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-    {
-        // slip, symmetry and symmetryPlane carry no normal flux, whatever the patch's mesh type says:
-        // waves/solitaryMcCowan's `sides` is a `patch` with a slip U
-        if (fvp[pi].type != "patch" || f.U.boundary[pi]->fixesValue() || f.U.boundary[pi]->isSymmetry()) continue;
-        throw std::runtime_error(
-            "brae interFoam (device): U on the open patch `" + fvp[pi].name + "` does not fix a value (a "
-            "zeroGradient outlet, say), so fvc::ddtCorr is live on that patch's faces "
-            "(ddtScheme.C, fvcDdtPhiCoeff). The host loop adds it to phiHbyA (gated on RAS/weirOverflow); "
-            "the device loop's pressure equation does not. Refused rather than run without the term.");
-    }
+    // ddtCorr's BOUNDARY HALF is on the device now: deviceDdtCorr already computed it (and already
+    // zeroed it wherever U fixes a value, as fvcDdtPhiCoeff does), and the pressure step adds it to
+    // phiHbyA with interpolate(rho*rAU)'s patch value, as the host does (inter_peqn_cpp.cu:531-573).
+    // Gated on RAS/weirOverflow, whose outlet is a zeroGradient U.
     // A flowRateInletVelocity is REBUILT at every momentum assembly, and the U-boundary hook below does
     // that now, from the mixture's boundary rho, as the host driver does. What is still refused is a rate
     // that is a Function1 of time, which this driver takes as one number for the whole run -- the patch
     // itself throws on that (flowRateValue) -- and the variableHeight form, which reads the phase field.
-    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-    {
-        const fvPatchField<vector>& ub = *f.U.boundary[pi];
-        if (!ub.isVariableHeightFlowRateInlet()) continue;
-        throw std::runtime_error(
-            "brae interFoam (device): U patch `" + fvp[pi].name + "` is a "
-            "variableHeightFlowRateInletVelocity. OpenFOAM rebuilds it at every momentum assembly from "
-            "the phase fraction on the patch; the host loop does (gated on RAS/weirOverflow) and the "
-            "device loop keeps the value it uploaded. Refused rather than run a frozen inlet.");
-    }
 
     // NOT ON THE DEVICE YET, refused rather than run on the mesh as it started or on a singular
     // pressure system: a mesh that moves (the host loop has it, inter_driver_cpp.cu), and a closed
@@ -301,6 +269,36 @@ RunReport runInterFoamDevice(
         }
     }
     DeviceBuffer<int> dAFixes(aFixes), dAFlag(aFlag), dTakeU(takeU), dUFixes(uFixes);
+    // ...and one of them is NOT a property of the patch but of the face and the instant. alpha's
+    // variableHeightFlowRate is a MIXED condition whose rebuild() sets valueFraction to 1 on an INFLOW
+    // face and 0 on the rest (fv_patch_field.cuh: `if (!(phi < -SMALL)) continue`), so a mask taken once
+    // from fixesValue() answers per patch a question OpenFOAM asks per face per update, and MULES limits
+    // with it. Refreshed wherever alpha's boundary is re-evaluated, from the patch's OWN valueFraction,
+    // and left alone for every other condition.
+    bool hasPerFaceAlphaFixes = false;
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        if (f.alpha1.boundary[pi]->isVariableHeightFlowRate()) hasPerFaceAlphaFixes = true;
+    }
+    auto refreshAlphaFixes = [&]()
+    {
+        if (!hasPerFaceAlphaFixes) return;
+        std::vector<int> fx;
+        fx.reserve(aFixes.size());
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            const std::vector<scalar>* vf = f.alpha1.boundary[pi]->isVariableHeightFlowRate()
+                                          ? f.alpha1.boundary[pi]->valueFractionPtr() : nullptr;
+            const int patchFx = f.alpha1.boundary[pi]->fixesValue() ? 1 : 0;
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                fx.push_back(vf && static_cast<std::size_t>(i) < vf->size()
+                             ? ((*vf)[static_cast<std::size_t>(i)] > scalar(0.5) ? 1 : 0)
+                             : patchFx);
+            }
+        }
+        dAFixes.copyFrom(fx);
+    };
 
     // THE BOUNDARY FLUX, declared above the hooks because they read it. OpenFOAM's flux-conditional
     // patches look phi up whenever they update; brae's are told, and the device path holds the only
@@ -382,6 +380,7 @@ RunReport runInterFoamDevice(
         // interfaceProperties::correct(). The last call of a step is the one UEqn reads. See the host
         // driver's mixtureCorrect stage for the measurement.
         updateMixtureBoundary(f, fvp);
+        refreshAlphaFixes();
         SurfaceScalarField nHb;
         std::vector<scalar> Kb;
         interfaceProps::calculateK(f.alpha1, f.interface, m, g, fvp, false, nHb, Kb);
@@ -449,6 +448,23 @@ RunReport runInterFoamDevice(
             if (f.U.boundary[pi]->isFlowRateInlet())
             {
                 f.U.boundary[pi]->updateFromDensity(f.rhoBnd[pi], stepTime);
+            }
+            // ...and a variableHeightFlowRateInletVelocity rebuilds itself there too, from the STORED
+            // values of the phase field it names on this patch
+            // (variableHeightFlowRateInletVelocityFvPatchVectorField.C:103-139), which is what the host
+            // driver does at the same point (inter_driver_cpp.cu:722-735). f.alpha1's patch values are
+            // the alpha hooks' last, which is the step's own alpha.
+            if (f.U.boundary[pi]->isVariableHeightFlowRateInlet())
+            {
+                if (f.U.boundary[pi]->alphaFieldName() != f.alphaName)
+                {
+                    throw std::runtime_error(
+                        "brae interFoam: U patch `" + fvp[pi].name + "` is a "
+                        "variableHeightFlowRateInletVelocity naming `alpha "
+                        + f.U.boundary[pi]->alphaFieldName() + "`, and this case's phase field is `"
+                        + f.alphaName + "`. OpenFOAM looks the named field up and stops without it.");
+                }
+                f.U.boundary[pi]->updateFromAlphaPatch(f.alpha1.boundary[pi]->value(), stepTime);
             }
         }
         // MRF.correctBoundaryVelocity(U), UEqn.H:1, where the host driver has it
@@ -858,6 +874,9 @@ RunReport runInterFoamDevice(
 
     DeviceBuffer<scalar> dA(f.alpha1.internal), dAOld(f.alpha1.internal);
     DeviceBuffer<scalar> dUx(ux), dUy(uy), dUz(uz), dUox(ux), dUoy(uy), dUoz(uz);
+    // U.oldTime()'s PATCH values, snapshotted with the cells below: ddtCorr's boundary half
+    // interpolates the STORED patch value on an uncoupled patch, not the face cell
+    DeviceBuffer<scalar> dUobx, dUoby, dUobz;
     DeviceBuffer<scalar> dPhiI(f.phi.internal);
     DeviceBuffer<scalar> dPrgh(f.p_rgh.internal), dP;
     DeviceBuffer<scalar> dNH(f.nHatf.internal), dNHB(flattenPatches(f.nHatf.boundary));
@@ -897,6 +916,17 @@ RunReport runInterFoamDevice(
         dA.copyTo(ca);   dAOld.copyFrom(ca);
         dUx.copyTo(cx);  dUy.copyTo(cy);  dUz.copyTo(cz);
         dUox.copyFrom(cx); dUoy.copyFrom(cy); dUoz.copyFrom(cz);
+        {
+            std::vector<scalar> bx, by, bz;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                for (const vector& v : f.U.boundary[pi]->value())
+                {
+                    bx.push_back(v.x); by.push_back(v.y); bz.push_back(v.z);
+                }
+            }
+            dUobx.copyFrom(bx); dUoby.copyFrom(by); dUobz.copyFrom(bz);
+        }
         std::vector<scalar> poi, pob;
         dPhiI.copyTo(poi); dPhiB.copyTo(pob);
         DeviceBuffer<scalar> dPhiOI(poi), dPhiOB(pob);
@@ -924,6 +954,7 @@ RunReport runInterFoamDevice(
 
         deviceInterStep(dm, rep.deltaT, C, props, H, dGh, dGhf, dMagSf,
                         dA, dAOld, dUx, dUy, dUz, dUox, dUoy, dUoz,
+                        dUobx, dUoby, dUobz,
                         dPhiI, dPhiB, dPhiOI, dPhiOB, dUFixes, dPrgh, dP,
                         dNH, dNHB, dABnd, dK, dAFixes, dAFlag, dbU,
                         dRho, dMu, dNu, dRpI, dRpB);
