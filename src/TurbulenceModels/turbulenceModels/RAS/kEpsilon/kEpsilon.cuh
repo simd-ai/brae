@@ -229,6 +229,12 @@ struct KEpsilonInput
 
     // --- refusals ---
     bool        hasCoupledPatches      = false;
+    // A PERIODIC PAIR, once the caller carries one. k's and epsilon's equations are
+    // fvm::div - fvm::laplacian, so across a pair they need the interface off-diagonal in the matrix
+    // AND in the solve -- see TransportScheme::cyc. `cycPhi` is the flux those equations convect with
+    // on the pair's own faces. Both null = no pair, which is what hasCoupledPatches still refuses.
+    DeviceCyclic*               cyc    = nullptr;
+    const DeviceBuffer<scalar>* cycPhi = nullptr;
     bool        hasUnportedFvOption    = false;
     bool        hasNonUpwindDivScheme  = false;
     bool        hasNonWallTurbWallFunc = false;

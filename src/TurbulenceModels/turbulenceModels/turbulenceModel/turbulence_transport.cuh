@@ -19,6 +19,7 @@
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
+#include "device_cyclic.cuh"
 #include <string>
 #include "device_dilu.cuh"    // DeviceDilu -- the case's preconditioner for these solves
 #include "device_colour_gauss_seidel.cuh"   // DeviceCellColouring -- the colour-order smoothSolver (FP-1)
@@ -77,6 +78,19 @@ struct TransportScheme
     // driver and the closure -- which is what the dropped snGradLimitCoeff was -- reached no gate.
     // Null by default and free when null.
     const char* stageTag      = nullptr;
+
+    // A PERIODIC PAIR. k's and epsilon's equations are fvm::div - fvm::laplacian like the momentum's,
+    // so across a pair they carry the SAME interface coefficient: -gamma_f*dc*magSf + phi*(1 - w),
+    // which is what deviceCyclicAssembleMomentum builds (device_cyclic.cu's momKernel). `gammaCell`
+    // is the diffusivity as a CELL field, because a coupled face takes fvc::interpolate's value --
+    // the two CELLS interpolated -- and not a patch value (kEpsilon_cpp.cu:152-158). Null = a mesh
+    // with no pair, which is every case this assembler ran on before.
+    DeviceCyclic*               cyc        = nullptr;
+    const DeviceBuffer<scalar>* gammaCell  = nullptr;
+    // ...and the flux the equation CONVECTS with on the pair's own faces. It is not phiInt, which is
+    // the internal-face array, and it is not always cyc->phi either: a compressible closure convects
+    // with the mass flux. Required when `cyc` is set.
+    const DeviceBuffer<scalar>* cycPhi     = nullptr;
     // The field's PATCH VALUES as the gradients below must read them, when they are not what a live
     // evaluate of `db` gives. OpenFOAM's gradients read the patch field's STORED values -- those of its
     // last evaluate, plus whatever updateCoeffs assigned since (epsilonWallFunction's
@@ -131,7 +145,11 @@ void solveScalarEqn(
     bool gs,
     // the solve WHOLE -- initial residual, final residual, iteration count -- which is what OpenFOAM's
     // log prints and so what a solver-log gate compares. Null = not kept.
-    DeviceSolverPerf* perfOut = nullptr);
+    DeviceSolverPerf* perfOut = nullptr,
+    // A PERIODIC PAIR's off-diagonal, which deviceAmul applies as Apsi[own] += ifCoeff*psi[nbr]. The
+    // assembly put its diagonal straight into M.diag, so the fold below adds nothing for it and the
+    // solve would otherwise run a different operator from the matrix. Null = no pair.
+    DeviceCyclic* cyc = nullptr);
 
 // bnd[f] = field[bndCell[f]] on every boundary face `wfMask` marks, and nothing elsewhere: the one
 // assignment the epsilon and omega wall functions make to their own patches inside updateCoeffs

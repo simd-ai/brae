@@ -697,6 +697,12 @@ void assembleTransport(
     sc.snGradLimitCoeff   = in.snGradLimitCoeff;
     sc.bndValues          = bndValues;
     sc.stageTag           = stageTag;
+    // THE PAIR, with the diffusivity as a CELL field: a coupled face takes fvc::interpolate's value,
+    // the two cells' (kEpsilon_cpp.cu:152-158), and gammaBnd above is built from nut's PATCH values,
+    // which is a different number there.
+    sc.cyc       = in.cyc;
+    sc.gammaCell = in.cyc ? &Dcell : nullptr;
+    sc.cycPhi    = in.cycPhi;
     turbulence::assembleScalarTransport(M, dm, db, field, gammaFace, gammaBnd, sc);
 }
 
@@ -1021,7 +1027,7 @@ void finishAndSolve(
     sv.gsColour    = in.gsColour;
     sv.colouring   = in.colouring;
     turbulence::solveScalarEqn(M, field, dm, relaxEquation, alpha, fvoMask, fvoVal, wallMask, wallVal,
-                               sv, residualOut, dumpPrefix, gs, perfOut);
+                               sv, residualOut, dumpPrefix, gs, perfOut, in.cyc);
 }
 
 } // namespace

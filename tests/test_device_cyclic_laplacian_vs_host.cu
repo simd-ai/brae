@@ -25,6 +25,15 @@
 // own plain deltaCoeffs when the scheme does not correct. MEASURED after that, both meshes, both
 // passes: 1.4e-17 or better on coefficients up to 5.9e-02.
 //
+// THE SCALAR TRANSPORT ASSEMBLER's own call is the last arm: k's and epsilon's equations are the
+// momentum's shape, fvm::div(phi, f) - fvm::laplacian(DEff, f), so gpu::turbulence::
+// assembleScalarTransport hands the pair the same kernel -- and what that arm gates is the CALL, each
+// of whose three arguments is a number that is nearly right. MEASURED, both meshes: interface 2.7e-20
+// of 2.0e-02 and diagonal 5.4e-20 of 1.9e-02. BROKEN ONCE: the pair's own convecting flux dropped, so
+// the coefficients fall back to cyc.phi -- interface 5.7e-02 against a 2.0e-02 scale, and the arm
+// fails. cyc.phi is seeded with a DIFFERENT flux on purpose, which is what makes that witnessable: a
+// compressible closure convects k and epsilon with the mass flux and not with the pair's own phi.
+//
 // THE MOMENTUM MATRIX's interface coefficients are here too, M = fvm::div(phi, U) - fvm::laplacian(nuEff,
 // U), with a flux that changes sign over the pair so the upwind split is exercised (9 outflow, 11 inflow
 // faces, asserted). Both schemes, both meshes: 2.7e-20 on coefficients up to 2.1e-01. Its diffusion half
@@ -564,6 +573,103 @@ int main(int argc, char** argv)
                     (double)worstGrad, (double)gradScale);
         check("...and gaussGrad's interface contribution is the host's",
               worstGrad <= scalar(1e-15)*std::fmax(gradScale, scalar(1e-300)));
+    }
+
+    // ---- THE SCALAR TRANSPORT ASSEMBLER'S OWN CALL --------------------------------------------
+    // k's and epsilon's equations are fvm::div(phi, f) - fvm::laplacian(DEff, f): the momentum's
+    // shape, and so the momentum's interface coefficient, which the arm above already gates kernel
+    // for kernel. WHAT THIS ARM GATES IS THE CALL -- that gpu::turbulence::assembleScalarTransport
+    // hands the pair the right three things, because each of them is a number that is nearly right:
+    //   the DIFFUSIVITY as a CELL field, since a coupled face takes fvc::interpolate's value -- the
+    //   two cells' -- and the boundary array beside it is built from nut's PATCH values instead
+    //   (kEpsilon_cpp.cu:152-158);
+    //   the flux on the PAIR's own faces, not the internal-face array and not always cyc->phi;
+    //   the sign, since the laplacian enters the equation negated.
+    {
+        DeviceBuffer<scalar> psi(static_cast<std::size_t>(nC));
+        std::vector<scalar> psiH(static_cast<std::size_t>(nC));
+        for (label c = 0; c < nC; ++c) psiH[static_cast<std::size_t>(c)] = scalar(1) + scalar(0.37)*c;
+        psi.copyFrom(psiH);
+        const GeometricField<scalar> vfPsi = buildCyclicField<scalar>(psiH, fvp, cyclics);
+
+        // DEff on cells, and a flux that changes sign over the pair so the upwind split is live
+        std::vector<scalar> DcellH(static_cast<std::size_t>(nC));
+        for (label c = 0; c < nC; ++c) DcellH[static_cast<std::size_t>(c)] = scalar(1e-3) + scalar(1e-5)*c;
+        DeviceBuffer<scalar> Dcell(DcellH);
+        DeviceCyclic tc = buildDeviceCyclic(cyclics, g, fvp);
+        std::vector<scalar> phiIfH(static_cast<std::size_t>(tc.n));
+        for (int j = 0; j < tc.n; ++j) phiIfH[static_cast<std::size_t>(j)] = (j % 2 ? scalar(-1) : scalar(1))*scalar(1e-3)*(j + 1);
+        DeviceBuffer<scalar> cycPhi(phiIfH);
+
+        // the DEVICE's interface coefficient, through the assembler's own path
+        DeviceBuffer<scalar> mdiag(static_cast<std::size_t>(nC));
+        {
+            std::vector<scalar> z(static_cast<std::size_t>(nC), scalar(0));
+            mdiag.copyFrom(z);
+        }
+        // cyc.phi holds a DIFFERENT flux on purpose. The equation's convecting flux on the pair is not
+        // always the pair's own phi -- a compressible closure convects with the mass flux -- so the
+        // assembler takes it as its own argument, and this is what makes that argument witnessable:
+        // with it dropped the coefficients fall back to cyc.phi and the comparison below fails.
+        std::vector<scalar> otherPhi(phiIfH.size());
+        for (std::size_t j = 0; j < otherPhi.size(); ++j) otherPhi[j] = scalar(-3)*phiIfH[j];
+        tc.phi.copyFrom(otherPhi);
+        deviceCyclicAssembleMomentum(tc, Dcell, mdiag, nullptr, /*corrected=*/true, &cycPhi);
+        std::vector<scalar> devIf, devDiag;
+        tc.ifCoeff.copyTo(devIf);
+        mdiag.copyTo(devDiag);
+
+        // ...and the HOST's, from the public fvm operators: div - laplacian
+        SurfaceScalarField phiF;
+        phiF.internal.assign(static_cast<std::size_t>(m.nInternalFaces()), scalar(0));
+        phiF.boundary.resize(fvp.size());
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            phiF.boundary[pi].assign(static_cast<std::size_t>(fvp[pi].size), scalar(0));
+        {
+            std::size_t j = 0;
+            for (const CyclicInterface& c : cyclics)
+                for (std::size_t i = 0; i < c.faceCells.size(); ++i, ++j)
+                    phiF.boundary[static_cast<std::size_t>(c.patch)][i] = phiIfH[j];
+        }
+        const SurfaceScalarField gammaF = fvc::interpolate(DcellH, m, g, fvp);
+        const FvScalarMatrix hDiv = fvm::div<scalar>(phiF.internal, phiF.boundary, vfPsi, m, fvp);
+        const FvScalarMatrix hLap = fvm::laplacian<scalar>(gammaF, vfPsi, m, g, fvp, /*corrected=*/true);
+        std::vector<scalar> hostIf, hostDiag(static_cast<std::size_t>(nC), scalar(0));
+        for (const CyclicInterface& c : cyclics)
+        {
+            const FvPatch& Pp = fvp[c.patch];
+            for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+            {
+                hostIf.push_back(hDiv.boundaryCoeffs[c.patch][i] - hLap.boundaryCoeffs[c.patch][i]);
+                hostDiag[static_cast<std::size_t>(Pp.faceCells[i])] +=
+                    hDiv.internalCoeffs[c.patch][i] - hLap.internalCoeffs[c.patch][i];
+            }
+        }
+        scalar wIf = 0, sIf = 0, wD = 0, sD = 0;
+        for (std::size_t j = 0; j < devIf.size() && j < hostIf.size(); ++j)
+        {
+            // the device stores what deviceAmul multiplies by, the host what the matrix subtracts
+            wIf = std::fmax(wIf, std::fabs(devIf[j] - (-hostIf[j])));
+            sIf = std::fmax(sIf, std::fabs(hostIf[j]));
+        }
+        for (label c = 0; c < nC; ++c)
+        {
+            const std::size_t k = static_cast<std::size_t>(c);
+            wD = std::fmax(wD, std::fabs(devDiag[k] - hostDiag[k]));
+            sD = std::fmax(sD, std::fabs(hostDiag[k]));
+        }
+        std::printf("  scalar transport: worst |device - host| interface %.4e (up to %.4e), "
+                    "diagonal %.4e (up to %.4e)\n", (double)wIf, (double)sIf, (double)wD, (double)sD);
+        check("the transport equation's interface coefficient on a coupled face IS the host's",
+              devIf.size() == hostIf.size() && !hostIf.empty()
+              && wIf <= scalar(1e-15)*std::fmax(sIf, scalar(1e-300)));
+        check("...and so is the diagonal it writes",
+              wD <= scalar(1e-15)*std::fmax(sD, scalar(1e-300)));
+        // THE FLUX HAS BOTH SIGNS on the pair, so the upwind split is exercised and not assumed
+        int nOut = 0, nIn = 0;
+        for (scalar v : phiIfH) { if (v > 0) ++nOut; else ++nIn; }
+        std::printf("  (the pair's flux: %d outflow faces, %d inflow)\n", nOut, nIn);
+        check("...on a pair whose flux changes sign, so the upwind split is live", nOut > 0 && nIn > 0);
     }
 
     std::printf("test_device_cyclic_laplacian_vs_host: %d failures\n", failures);
