@@ -183,6 +183,19 @@ void deviceAlphaCorrector(
     DeviceMulesFields mf;                       // all null: rho == 1, Sp == Su == 0, bounds [0,1]
 
     // phic = cAlpha*|phi/magSf|, zeroed on every non-coupled boundary face.
+    // THE COMPRESSION ON A PERIODIC PAIR IS NOT CARRIED. OpenFOAM leaves a coupled patch alone where it
+    // zeroes every uncoupled one (alphaEqn.H:79-89), so phic there is cAlpha*|phi_b/magSf| and the
+    // compressive flux needs nHatf ON THE PAIR -- which the interface-properties pass produces for the
+    // boundary patches the device holds and not for a cyclic one. Refused by name rather than
+    // compressed with a normal that is not there. The host loop (no -device) carries it.
+    if (in.cyc && in.cyc->n > 0 && in.cAlpha > scalar(0))
+    {
+        throw std::runtime_error(
+            "brae interFoam device alphaEqn: the mesh has a periodic pair and cAlpha is "
+            + std::to_string((double)in.cAlpha) + ". Interface compression across a coupled face needs "
+            "nHatf there: alphaEqn.H:79-89 zeroes every UNCOUPLED patch and leaves a coupled one compressed, and the "
+            "device interface-properties pass does not produce it on the pair. Run without -device.");
+    }
     deviceCompressionFlux(dm, nIf, nBf, *in.phiInt, in.cAlpha, phicInt, phicBnd);
 
     // phir = phic*nHatf, from the nHatf the PREVIOUS mixture.correct() left.
@@ -202,6 +215,16 @@ void deviceAlphaCorrector(
     //     fvc::flux(-fvc::flux(-phir, alpha2, alpharScheme), alpha1, alpharScheme)
     // and each negation changes which cell the interpolation reads, not just the result's sign.
     fluxWithScheme(dm, in.alphaScheme, *in.phiInt, *in.phiBnd, alpha1, *bnd.alpha1, advInt, advBnd);
+    // ...and on the pair, where the scheme's own weight applies as on an internal face. The limiter
+    // reads fvc::grad(alpha), which must carry the pair itself -- see device_alpha_flux.cuh.
+    DeviceBuffer<scalar> advIf;
+    if (in.cyc && in.cyc->n > 0)
+    {
+        DeviceBuffer<scalar> gx, gy, gz;
+        deviceGaussGrad(dm, alpha1, *bnd.alpha1, gx, gy, gz);
+        deviceCyclicAddGrad(*in.cyc, alpha1, dm.V, gx, gy, gz);
+        deviceAlphaCyclicFlux(*in.cyc, static_cast<int>(in.alphaScheme), alpha1, gx, gy, gz, advIf);
+    }
     deviceNegateFaces(nIf, phirInt, negPhirInt);
     deviceNegateFaces(nBf, phirBnd, negPhirBnd);
     fluxWithScheme(dm, in.alpharScheme, negPhirInt, negPhirBnd, alpha2, alpha2Bnd,
@@ -212,6 +235,9 @@ void deviceAlphaCorrector(
                    compInt, compBnd);
     addFaces(nIf, advInt, compInt, unInt);
     addFaces(nBf, advBnd, compBnd, unBnd);
+    // On the pair the compressive half is zero -- cAlpha > 0 with a pair is refused above -- so the
+    // high-order flux there IS the advective one.
+    DeviceBuffer<scalar>& unIf = advIf;
 
     if (in.MULESCorr)
     {
@@ -227,6 +253,19 @@ void deviceAlphaCorrector(
 
         deviceSubtractFaces(nIf, unInt, alphaPhi10Int, corrInt);
         deviceSubtractFaces(nBf, unBnd, alphaPhi10Bnd, corrBnd);
+        // ...and the pair's own correction, against the flux the pre-solve left there
+        DeviceBuffer<scalar> corrIf;
+        if (in.cyc && in.cyc->n > 0)
+        {
+            if (!in.alphaPhiIf || static_cast<int>(in.alphaPhiIf->size()) != in.cyc->n)
+            {
+                throw std::runtime_error(
+                    "brae interFoam device alphaEqn: on the MULESCorr path the pair's alphaPhi10 comes "
+                    "IN as the flux the pre-solve left there; an empty one would make the correction "
+                    "the whole high-order flux on those faces.");
+            }
+            deviceSubtractFaces(in.cyc->n, unIf, *in.alphaPhiIf, corrIf);
+        }
 
         // saved BEFORE the correction, for the relaxation below
         alpha10.resize(static_cast<std::size_t>(nC));
@@ -241,10 +280,12 @@ void deviceAlphaCorrector(
         // alphaPhiUn + phiCorr. Passing phiCN here was this file's first wiring and it is a different
         // quantity -- phiCN is the volumetric flux, alphaPhiUn is the alpha flux, and on a boundary
         // face holding alpha they differ by a factor of alpha.
+        const bool havePair = (in.cyc && in.cyc->n > 0);
         deviceMulesLimitCorr(dm, nIf, nBf, rDeltaT, alpha1, *bnd.alpha1, *bnd.fixesValue, *bnd.flag,
-                             unBnd, corrInt, corrBnd, mf, mulesCtl);
-        deviceMulesCorrect(dm, rDeltaT, corrInt, corrBnd, mf, alpha1);
-
+                             unBnd, corrInt, corrBnd, mf, mulesCtl, nullptr, nullptr,
+                             havePair ? in.cyc : nullptr, havePair ? &corrIf : nullptr);
+        deviceMulesCorrect(dm, rDeltaT, corrInt, corrBnd, mf, alpha1,
+                           havePair ? in.cyc : nullptr, havePair ? &corrIf : nullptr);
         // UNDER-RELAXED FOR EVERY CORRECTOR BUT THE FIRST, both halves (alphaEqn.H:195-205).
         const scalar w = (in.aCorr == 0) ? scalar(1) : scalar(0.5);
         if (in.aCorr != 0)
@@ -261,6 +302,14 @@ void deviceAlphaCorrector(
         {
             axpyKernel<<<nBlocks(nBf), TPB>>>(w, corrBnd.data(), nBf, alphaPhi10Bnd.data());
             ckS(cudaGetLastError(), "alphaPhi10 += w*corr, boundary");
+        }
+        // ...and the pair, with the SAME weight: the relaxation is of the flux, not of the faces the
+        // device happens to hold in one array rather than another.
+        if (havePair)
+        {
+            axpyKernel<<<nBlocks(in.cyc->n), TPB>>>(w, corrIf.data(), in.cyc->n,
+                                                    in.alphaPhiIf->data());
+            ckS(cudaGetLastError(), "alphaPhi10 += w*corr, interface");
         }
         return;
     }
@@ -281,12 +330,45 @@ void deviceAlphaCorrector(
     }
     deviceSubtractFaces(nIf, alphaPhi10Int, phiBDInt, corrInt);
     deviceSubtractFaces(nBf, alphaPhi10Bnd, phiBDBnd, corrBnd);
+    // THE PAIR takes the same three steps: its donor flux is upwind's own (a coupled face is not
+    // overwritten by phiPsi the way an uncoupled one is, MULESTemplates.C:605), its correction is the
+    // high-order flux less that, and both go into the limiter and the blend.
+    const bool havePairEx = (in.cyc && in.cyc->n > 0);
+    DeviceBuffer<scalar> phiBDIf, corrIfEx, lamIf, blendIf;
+    if (havePairEx)
+    {
+        deviceMulesDonorFluxCyclic(*in.cyc, alpha1, phiBDIf);
+        deviceSubtractFaces(in.cyc->n, unIf, phiBDIf, corrIfEx);
+    }
     deviceMulesLimiter(dm, nIf, nBf, rDeltaT, alpha1, alpha1Old, *bnd.alpha1,
                        *bnd.fixesValue, *bnd.flag, phiBDInt, phiBDBnd, corrInt, corrBnd,
-                       mf, mulesCtl, lamInt, lamBnd);
+                       mf, mulesCtl, lamInt, lamBnd,
+                       havePairEx ? in.cyc : nullptr,
+                       havePairEx ? &phiBDIf : nullptr,
+                       havePairEx ? &corrIfEx : nullptr,
+                       havePairEx ? &lamIf : nullptr);
     deviceMulesBlend(nIf, nBf, phiBDInt, phiBDBnd, lamInt, lamBnd, corrInt, corrBnd,
                      alphaPhi10Int, alphaPhi10Bnd);
-    deviceMulesExplicitSolve(dm, rDeltaT, alpha1Old, alphaPhi10Int, alphaPhi10Bnd, mf, alpha1);
+    if (havePairEx)
+    {
+        // phiPsi = phiBD + lambda*phiCorr on the pair too (MULESTemplates.C:634)
+        blendIf.resize(static_cast<std::size_t>(in.cyc->n));
+        ckS(cudaMemcpy(blendIf.data(), phiBDIf.data(), sizeof(scalar)*in.cyc->n,
+                       cudaMemcpyDeviceToDevice), "phiPsi = phiBD, interface");
+        DeviceBuffer<scalar> scaled;
+        scaled.resize(static_cast<std::size_t>(in.cyc->n));
+        ckS(cudaMemcpy(scaled.data(), corrIfEx.data(), sizeof(scalar)*in.cyc->n,
+                       cudaMemcpyDeviceToDevice), "phiCorr copy, interface");
+        deviceMultiplyFaces(in.cyc->n, scaled, lamIf, scaled);
+        DeviceBuffer<scalar> sum;
+        addFaces(in.cyc->n, blendIf, scaled, sum);
+        in.alphaPhiIf->resize(static_cast<std::size_t>(in.cyc->n));
+        ckS(cudaMemcpy(in.alphaPhiIf->data(), sum.data(), sizeof(scalar)*in.cyc->n,
+                       cudaMemcpyDeviceToDevice), "alphaPhi10 = phiPsi, interface");
+    }
+    deviceMulesExplicitSolve(dm, rDeltaT, alpha1Old, alphaPhi10Int, alphaPhi10Bnd, mf, alpha1,
+                             havePairEx ? in.cyc : nullptr,
+                             havePairEx ? in.alphaPhiIf : nullptr);
 }
 
 } // namespace brae

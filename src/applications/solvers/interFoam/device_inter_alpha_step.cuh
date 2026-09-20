@@ -106,6 +106,9 @@ struct DeviceInterAlphaControls
     bool alphaApplyPrevCorr = false;
     DeviceBuffer<scalar>* prevCorrInt = nullptr;
     DeviceBuffer<scalar>* prevCorrBnd = nullptr;
+    // THE PAIR's mass flux out, for the momentum equation. The pair itself, its flux and its alpha flux
+    // travel in DeviceAlphaStepInput, which is what the corrector reads.
+    DeviceBuffer<scalar>* rhoPhiIf = nullptr;
 };
 
 // `alpha1` is advanced in place from `alpha1Old`, which is never written. `rho`, `mu` and `nu` come out

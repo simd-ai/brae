@@ -203,7 +203,10 @@ void deviceMulesLimitCorr(
     const DeviceMulesFields&     f,
     const DeviceMulesControls&   c,
     DeviceBuffer<scalar>*        lambdaIntOut = nullptr,
-    DeviceBuffer<scalar>*        lambdaBndOut = nullptr);
+    DeviceBuffer<scalar>*        lambdaBndOut = nullptr,
+    // the pair: its correction is scaled in place like the other two
+    const DeviceCyclic*          cyc = nullptr,
+    DeviceBuffer<scalar>*        phiCorrIf = nullptr);
 
 // MULES::correct, CMULESTemplates.C:38-76:
 //     psi = (rho*psi*rDeltaT + Su - surfaceIntegrate(phiCorr)) / (rho*rDeltaT - Sp)
@@ -214,6 +217,9 @@ void deviceMulesCorrect(
     const DeviceBuffer<scalar>& phiCorrInt,
     const DeviceBuffer<scalar>& phiCorrBnd,
     const DeviceMulesFields&    f,
-    DeviceBuffer<scalar>&       psi);            // in and out
+    DeviceBuffer<scalar>&       psi,             // in and out
+    // ...and the pair's own correction, which surfaceIntegrate sums like any patch's
+    const DeviceCyclic*         cyc = nullptr,
+    const DeviceBuffer<scalar>* phiCorrIf = nullptr);
 
 } // namespace brae

@@ -140,7 +140,7 @@ void deviceInterAlphaStep(
             hooks.divCoeffs(alpha, iC, bC);
             DeviceSolverPerf pre;
             deviceAlphaPreSolve(dm, alpha, subOld, *li.phiCNInt, iC, bC, dtSub, ctl.preSolve,
-                                alphaPhiInt, alphaPhiBnd, &pre);
+                                alphaPhiInt, alphaPhiBnd, &pre, li.cyc, li.alphaPhiIf);
             if (ctl.preSolveLog)
             {
                 ctl.preSolveLog->push_back(pre);
@@ -228,6 +228,11 @@ void deviceInterAlphaStep(
         // from the flux the last corrector left. The sub-cycle then time-weights these.
         deviceMassFlux(nIf, alphaPhiInt, *li.phiCNInt, li.rho1, li.rho2, rpInt);
         deviceMassFlux(nBf, alphaPhiBnd, *li.phiCNBnd, li.rho1, li.rho2, rpBnd);
+        // ...and on the pair, whose mass flux the momentum equation reads like any other face's
+        if (li.cyc && li.cyc->n > 0 && ctl.rhoPhiIf && li.phiCNIf && li.alphaPhiIf)
+        {
+            deviceMassFlux(li.cyc->n, *li.alphaPhiIf, *li.phiCNIf, li.rho1, li.rho2, *ctl.rhoPhiIf);
+        }
     };
 
     deviceAlphaEqnSubCycle(ctl.nAlphaSubCycles, totalDeltaT, alpha1, alpha1Old,

@@ -860,15 +860,21 @@ void deviceMulesLimitCorr(
     const DeviceMulesFields&     f,
     const DeviceMulesControls&   c,
     DeviceBuffer<scalar>*        lambdaIntOut,
-    DeviceBuffer<scalar>*        lambdaBndOut)
+    DeviceBuffer<scalar>*        lambdaBndOut,
+    const DeviceCyclic*          cyc,
+    DeviceBuffer<scalar>*        phiCorrIf)
 {
     DeviceBuffer<scalar> li, lb;
     DeviceBuffer<scalar>& lambdaInt = lambdaIntOut ? *lambdaIntOut : li;
     DeviceBuffer<scalar>& lambdaBnd = lambdaBndOut ? *lambdaBndOut : lb;
 
+    DeviceBuffer<scalar> lambdaIf;
     deviceMulesLimiterCorr(dm, nInternalFaces, nBoundaryFaces, rDeltaT, psi, psiBndValue,
                            bndFixesValue, bndFlag, phiBnd, phiCorrInt, phiCorrBnd, f, c,
-                           lambdaInt, lambdaBnd);
+                           lambdaInt, lambdaBnd,
+                           (cyc && phiCorrIf) ? cyc : nullptr,
+                           (cyc && phiCorrIf) ? phiCorrIf : nullptr,
+                           (cyc && phiCorrIf) ? &lambdaIf : nullptr);
 
     // phiCorr *= lambda, in place. No blended flux: see B.
     if (nInternalFaces > 0)
@@ -881,6 +887,11 @@ void deviceMulesLimitCorr(
         scaleKernel<<<nBlocks(nBoundaryFaces), TPB>>>(lambdaBnd.data(), nBoundaryFaces, phiCorrBnd.data());
         ckM(cudaGetLastError(), "phiCorr *= lambda, boundary");
     }
+    if (cyc && phiCorrIf && cyc->n > 0)
+    {
+        scaleKernel<<<nBlocks(cyc->n), TPB>>>(lambdaIf.data(), cyc->n, phiCorrIf->data());
+        ckM(cudaGetLastError(), "phiCorr *= lambda, interface");
+    }
 }
 
 
@@ -890,10 +901,24 @@ void deviceMulesCorrect(
     const DeviceBuffer<scalar>& phiCorrInt,
     const DeviceBuffer<scalar>& phiCorrBnd,
     const DeviceMulesFields&    f,
-    DeviceBuffer<scalar>&       psi)
+    DeviceBuffer<scalar>&       psi,
+    const DeviceCyclic*         cyc,
+    const DeviceBuffer<scalar>* phiCorrIf)
 {
     DeviceBuffer<scalar> divPhiCorr(dm.nCells);
     deviceDiv(dm, phiCorrInt, phiCorrBnd, divPhiCorr);
+    // ...and the pair's correction, which surfaceIntegrate sums into its face cell like any patch's
+    // (fvc.cu:548-550). Leaving it out is the same wall the explicit solve's divergence would build.
+    if (cyc && cyc->n > 0)
+    {
+        if (!phiCorrIf)
+        {
+            throw std::runtime_error(
+                "brae deviceMules (CMULES correct): the mesh has a periodic pair and its limited "
+                "correction was not handed over. It is summed into the cells like any patch's.");
+        }
+        deviceCyclicAddDivFlux(*cyc, *phiCorrIf, dm.V, divPhiCorr);
+    }
     correctKernel<<<nBlocks(dm.nCells), TPB>>>(
         divPhiCorr.data(), f.rho, f.Sp, f.Su, dm.nCells, rDeltaT, psi.data());
     ckM(cudaGetLastError(), "CMULES correct");
