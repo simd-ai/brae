@@ -506,10 +506,26 @@ void deviceMulesExplicitSolve(
     const DeviceBuffer<scalar>& phiPsiInt,
     const DeviceBuffer<scalar>& phiPsiBnd,
     const DeviceMulesFields&    f,
-    DeviceBuffer<scalar>&       psi)
+    DeviceBuffer<scalar>&       psi,
+    const DeviceCyclic*         cyc,
+    const DeviceBuffer<scalar>* phiPsiIf)
 {
     DeviceBuffer<scalar> divPhiPsi(dm.nCells);
     deviceDiv(dm, phiPsiInt, phiPsiBnd, divPhiPsi);
+    // ...and the PAIR's flux, which fvc::div sums into its face cell like any patch's (fvc.cu:548-550)
+    // and which the device mesh's boundary gather does not contain. Without it a periodic face carries
+    // no alpha at all: the divergence is that of a mesh with a wall there.
+    if (cyc && cyc->n > 0)
+    {
+        if (!phiPsiIf)
+        {
+            throw std::runtime_error(
+                "brae deviceMules: the mesh has a periodic pair and its limited flux was not handed "
+                "over. fvc::div sums a coupled patch's flux into its face cell; dropping it is a wall.");
+        }
+        DeviceCyclic tmp;   // deviceCyclicAddDiv reads phi from the interface itself
+        deviceCyclicAddDivFlux(*cyc, *phiPsiIf, dm.V, divPhiPsi);
+    }
     psi.resize(static_cast<std::size_t>(dm.nCells));
     explicitSolveKernel<<<nBlocks(dm.nCells), TPB>>>(
         psiOld.data(), divPhiPsi.data(), f.rho, f.rhoOld, f.Sp, f.Su,

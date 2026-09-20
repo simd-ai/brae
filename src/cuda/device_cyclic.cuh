@@ -250,6 +250,10 @@ void deviceCyclicAddHDiag(const DeviceCyclic& cyc, int comp, const DeviceBuffer<
                           const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& H);
 // continuity: div[own] += phi[j]/V[own]  (deviceDiv returns the volume-normalized divergence Sum phi / V).
 void deviceCyclicAddDiv(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& div);
+// ...and the same for a flux that is NOT the interface's own phi: MULES divides its LIMITED flux, which
+// is a different array from the one the pair carries.
+void deviceCyclicAddDivFlux(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& phi,
+                            const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& div);
 // epsilon setValues: zero the cyclic interface off-diagonal for wall-cell owners (their eps is fixed = eps0).
 void deviceCyclicZeroWallIfCoeff(DeviceCyclic& cyc, const DeviceBuffer<label>& isWallCell);
 // pressure-correction flux: phi[j] -= ifCoeff[j]*(p[nbr]-p[own])  (the snGrad(p) flux across the periodic face).

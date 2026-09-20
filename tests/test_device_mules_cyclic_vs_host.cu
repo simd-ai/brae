@@ -42,6 +42,12 @@
 // contribution is the gradient of a mesh with a wall there -- linear and upwind stayed exact while
 // vanLeer went 1.6e-02 of a 3.9e-02 flux. deviceCyclicAddGrad after deviceGaussGrad is the fix, and
 // device_alpha_flux.cuh now says so where the caller will read it.
+//
+// AND THE EXPLICIT SOLVE, which is where those fluxes become an alpha update: MULES::explicitSolve
+// divides fvc::div(phiPsi), and fvc::div sums a coupled patch's flux into its face cell like any
+// patch's (fvc.cu:548-550). Device against host, both meshes: 4.4e-16 and 1.1e-16 of a psi reaching
+// 1.65. BROKEN once, the pair's flux left out of the divergence: 4.4e-01 -- alpha simply does not cross
+// the pair, which is a mesh with a wall there and not a slower answer.
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -411,6 +417,65 @@ int main(int argc, char** argv)
     check("the device's internal-face limiter is the host's", worstInt <= scalar(1e-12));
     check("...and its interface limiter is the host's",
           devIf.size() == hostIf.size() && worstIf <= scalar(1e-12));
+
+    // ---- THE EXPLICIT SOLVE on a periodic mesh ---------------------------------------------------
+    // MULES::explicitSolve divides fvc::div(phiPsi), and fvc::div sums a COUPLED patch's flux into its
+    // face cell exactly as it sums any patch's (fvc.cu:548-550). The device mesh's boundary arrays hold
+    // no cyclic face, so the pair's flux has to be added separately or the cells along it advance as if
+    // the mesh had a wall there -- alpha simply does not cross.
+    {
+        SurfaceScalarField phiPsi;
+        phiPsi.internal.assign(static_cast<std::size_t>(nIf), scalar(0));
+        phiPsi.boundary.resize(fvp.size());
+        for (label f = 0; f < nIf; ++f)
+        {
+            phiPsi.internal[static_cast<std::size_t>(f)] = scalar(0.02)*std::sin(scalar(1.3)*scalar(f));
+        }
+        std::vector<scalar> ifFlux;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            phiPsi.boundary[pi].assign(static_cast<std::size_t>(fvp[pi].size), scalar(0));
+        }
+        for (const CyclicInterface& c : cyclics)
+        {
+            for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+            {
+                const scalar v = scalar(0.05)*std::sin(scalar(2.1)*scalar(i) + scalar(c.patch));
+                phiPsi.boundary[static_cast<std::size_t>(c.patch)][i] = v;
+                ifFlux.push_back(v);
+            }
+        }
+
+        std::vector<scalar> hostPsi;
+        cpu::MULES::explicitSolve(rDeltaT, hostPsi, psiOld, phiPsi, hf, m, g, fvp);
+
+        DeviceCyclic cycE = buildDeviceCyclic(cyclics, g, fvp);
+        std::vector<scalar> bndFlux;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            for (label i = 0; i < fvp[pi].size; ++i) bndFlux.push_back(scalar(0));
+        }
+        DeviceBuffer<scalar> dPhiPsiInt(phiPsi.internal), dPhiPsiBnd(bndFlux), dIfFlux(ifFlux);
+        DeviceBuffer<scalar> dPsiOldE(psiOld), devPsi;
+        DeviceMulesFields dfE;
+        deviceMulesExplicitSolve(dmEarly, rDeltaT, dPsiOldE, dPhiPsiInt, dPhiPsiBnd, dfE, devPsi,
+                                 &cycE, &dIfFlux);
+        std::vector<scalar> dp;
+        devPsi.copyTo(dp);
+
+        scalar worst = 0, scale = 0;
+        for (label c = 0; c < nC; ++c)
+        {
+            const std::size_t k = static_cast<std::size_t>(c);
+            worst = std::fmax(worst, std::fabs(dp[k] - hostPsi[k]));
+            scale = std::fmax(scale, std::fabs(hostPsi[k]));
+        }
+        std::printf("  explicit solve: worst |device - host| %.4e (psi up to %.4e)\n",
+                    (double)worst, (double)scale);
+        check("the device's explicit solve IS the host's on a periodic mesh",
+              worst <= scalar(1e-15)*std::fmax(scale, scalar(1e-300)));
+    }
 
     std::printf("test_device_mules_cyclic_vs_host: %d failures\n", failures);
     return failures ? 1 : 0;

@@ -503,12 +503,21 @@ void deviceCyclicFlux(
 }
 
 
-void deviceCyclicAddDiv(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& div)
+void deviceCyclicAddDivFlux(const DeviceCyclic& cyc,
+    const DeviceBuffer<scalar>& phi, const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& div)
 {
     if (cyc.n == 0) return;
-    divAddKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.phi.data(), V.data(), div.data());
+    divAddKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), phi.data(), V.data(), div.data());
     cudaCheck(cudaGetLastError(), "cyclicDiv");
 }
+
+
+void deviceCyclicAddDiv(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& div)
+{
+    deviceCyclicAddDivFlux(cyc, cyc.phi, V, div);
+}
+
+
 
 
 namespace {

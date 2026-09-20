@@ -124,7 +124,11 @@ void deviceMulesExplicitSolve(
     const DeviceBuffer<scalar>& phiPsiInt,
     const DeviceBuffer<scalar>& phiPsiBnd,
     const DeviceMulesFields&    f,
-    DeviceBuffer<scalar>&       psi);
+    DeviceBuffer<scalar>&       psi,
+    // the periodic pair and its LIMITED flux: fvc::div sums a coupled patch's flux into its face cell
+    // (fvc.cu:548-550), and the device mesh's boundary arrays do not hold one
+    const DeviceCyclic*         cyc = nullptr,
+    const DeviceBuffer<scalar>* phiPsiIf = nullptr);
 
 // ---------------------------------------------------------------------------------------------------
 // CMULES on the device -- the SEMI-IMPLICIT path, `MULESCorr yes`, which damBreak and twelve other
