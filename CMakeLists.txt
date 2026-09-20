@@ -3242,6 +3242,17 @@ add_test(NAME interfoam_cyclic_nhatf_vs_openfoam
 set_tests_properties(interfoam_cyclic_nhatf_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77
                      ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}")
 
+# the device's epsilon at a wall-function-constrained cell that also touches a cyclic pair, against
+# REAL OpenFOAM's own epsilon after one step with every solve pinned
+add_executable(test_device_wallfn_cyclic_vs_openfoam tests/test_device_wallfn_cyclic_vs_openfoam.cu)
+target_include_directories(test_device_wallfn_cyclic_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_wallfn_cyclic_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_wallfn_cyclic_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_wallfn_cyclic_vs_openfoam.sh)
+set_tests_properties(interfoam_wallfn_cyclic_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}")
+
 # the device Gauss gradient against the host's fvc::gaussGrad, bit for bit, with the two forms the device
 # used to have as controls
 add_executable(test_device_gauss_grad tests/test_device_gauss_grad.cu)

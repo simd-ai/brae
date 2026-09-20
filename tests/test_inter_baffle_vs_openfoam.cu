@@ -15,12 +15,22 @@
 // closure the same three read k 4.8e-01, epsilon 4.6e-01, nut 1.8e-01 -- two orders -- which is what
 // these bounds gate.
 //
-// WHAT IS LEFT IS NOT THE PAIR AND NOT THE STOPPING POINT, and it is an open finding rather than a
-// bound chosen to fit: with EVERY solve pinned at 1e-16 the device is still 1.99e-05 from the host in
-// p_rgh at STEP ONE, at cell 1305, which is not on the pair (the pair's own cells read 1.96e-05, no
-// worse). alpha there is 3.6e-12 and the curvature K 1.5e-05. This tutorial is the first RAS case the
-// device loop has ever run -- it was refused on five separate grounds until now -- so a gap of its own
-// is not surprising; it belongs to this case, not to the cyclic path.
+// WHAT THE PAIR COST THE CLOSURE was a wall-function row still wired to its periodic neighbour.
+// fvMatrix::setValuesFromList walks every face of a constrained cell and zeroes internalCoeffs AND
+// boundaryCoeffs on the patch owning it, a cyclic included; the device's setValues zeroed the internal
+// faces and the non-coupled patches only, so the interface kept injecting psi[nbr] into a row
+// epsilonWallFunction had pinned. MEASURED at step one with every solve pinned at 1e-16: the two cells
+// touching BOTH the pair and lowerWall (1303, 1304) read epsilon 2.0234 against the host's 1.9862 --
+// and two DIFFERENT values where one wall function gives one -- while every pair-only cell agreed to
+// 1e-12. With the pair's coefficient zeroed they read the host's 1.98615292e+00 to 2.2e-16.
+//
+// WHAT IS LEFT IS NOT THE PAIR AND NOT THE CLOSURE, and it is an open finding rather than a bound
+// chosen to fit: with EVERY solve pinned at 1e-16 the device is 2.7743e-07 from the host in p_rgh at
+// STEP ONE (of a 2.8447e+03 scale), at cell 1305, which is not on the pair -- the pair's own cells
+// read 2.6308e-07, no worse. It tracks |U| 4.0292e-09 of 2.4872e-02, HbyA 5.6717e-09 of 6.6500e-03 and
+// the momentum source 6.7058e-11 of 6.3761e-04, which is where to pick it up. The momentum MATRIX is
+// not it: the device's diag equals the host's diag plus the pair's own internalCoeffs to 1.5583e-13 of
+// 2.4229e+01 (the device folds them in where OpenFOAM keeps them until addBoundaryDiag).
 //
 // WHAT LOOKED LIKE A SECOND GAP HERE WAS THE REPORT, not the solve: the device printed worst |div(phi)|
 // 2.875e-01 against the host's 7.932e-05 with max|U| agreeing to every digit, because the report read
@@ -67,14 +77,16 @@ struct Bounds
     scalar nut;
     scalar jump;
     // THE DEVICE ARM'S, and they are NOT at round-off -- see the note at the head of this file. They
-    // are set at about 3x what this arm measures, tight enough that the thing it gates moves it:
-    // with the pair dropped from the closure k reads 4.8e-01 against the 4.8e-03 here, two orders.
-    scalar alphaDev = 2e-02;
+    // are set at about 3x what this arm measures, tight enough that the things they gate move them:
+    // with the pair dropped from the closure k reads 4.8e-01 against the 8.1e-04 here, and with the
+    // pair left in a wall-function-constrained row (the setValues defect below) epsilon reads 1.6e-02
+    // against 8.5e-04. The device arm's numbers are now the HOST closure's, to every digit printed.
+    scalar alphaDev = 1e-02;
     scalar prghDev = 4e-02;
     scalar UDev = 7e-02;
-    scalar kDev = 1.5e-02;
-    scalar epsDev = 5e-02;
-    scalar nutDev = 5e-03;
+    scalar kDev = 8e-03;
+    scalar epsDev = 1.1e-02;
+    scalar nutDev = 2.6e-03;
 };
 const Bounds CYCLIC{2e-13, 2e-13, 1.5e-12, 6e-13, 1.5e-12, 4e-13, 0};
 const Bounds POROUS{3e-13, 3e-13, 3e-11, 2e-11, 2e-11, 1.5e-12, 5e-11};
