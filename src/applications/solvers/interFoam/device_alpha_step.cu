@@ -183,24 +183,30 @@ void deviceAlphaCorrector(
     DeviceMulesFields mf;                       // all null: rho == 1, Sp == Su == 0, bounds [0,1]
 
     // phic = cAlpha*|phi/magSf|, zeroed on every non-coupled boundary face.
-    // THE COMPRESSION ON A PERIODIC PAIR IS NOT CARRIED. OpenFOAM leaves a coupled patch alone where it
-    // zeroes every uncoupled one (alphaEqn.H:79-89), so phic there is cAlpha*|phi_b/magSf| and the
-    // compressive flux needs nHatf ON THE PAIR -- which the interface-properties pass produces for the
-    // boundary patches the device holds and not for a cyclic one. Refused by name rather than
-    // compressed with a normal that is not there. The host loop (no -device) carries it.
-    if (in.cyc && in.cyc->n > 0 && in.cAlpha > scalar(0))
-    {
-        throw std::runtime_error(
-            "brae interFoam device alphaEqn: the mesh has a periodic pair and cAlpha is "
-            + std::to_string((double)in.cAlpha) + ". Interface compression across a coupled face needs "
-            "nHatf there: alphaEqn.H:79-89 zeroes every UNCOUPLED patch and leaves a coupled one compressed, and the "
-            "device interface-properties pass does not produce it on the pair. Run without -device.");
-    }
+    // THE COMPRESSION ON A PERIODIC PAIR. OpenFOAM zeroes phic on every UNCOUPLED patch and leaves a
+    // coupled one alone (alphaEqn.H:79-89): the interface does pass through it, and phic there is
+    // cAlpha*|phi_b/magSf|, what it is on an internal face (alpha_eqn_cpp.cu:154-172). icAlpha and
+    // scAlpha across a coupled face are refused -- by the host arm and, below, here.
     deviceCompressionFlux(dm, nIf, nBf, *in.phiInt, in.cAlpha, phicInt, phicBnd);
 
     // phir = phic*nHatf, from the nHatf the PREVIOUS mixture.correct() left.
     deviceMultiplyFaces(nIf, phicInt, nHatfInt, phirInt);
     deviceMultiplyFaces(nBf, phicBnd, *bnd.nHatfBnd, phirBnd);
+    // ...and on the pair, whose nHatf the same mixture.correct() produced (gated against OpenFOAM's
+    // own written field in tests/interfoam_cyclic_nhatf_vs_openfoam.sh)
+    DeviceBuffer<scalar> phicIf, phirIf;
+    if (in.cyc && in.cyc->n > 0)
+    {
+        if (!in.nHatfIf || static_cast<int>(in.nHatfIf->size()) != in.cyc->n)
+        {
+            throw std::runtime_error(
+                "brae interFoam device alphaEqn: the mesh has a periodic pair and no nHatf was given "
+                "there. phir is phic*nHatf, and a coupled face is the one kind alphaEqn.H:79-89 leaves "
+                "compressed.");
+        }
+        deviceAlphaCyclicCompressionFlux(*in.cyc, in.cAlpha, phicIf);
+        deviceMultiplyFaces(in.cyc->n, phicIf, *in.nHatfIf, phirIf);
+    }
 
     complementKernel<<<nBlocks(nC), TPB>>>(alpha1.data(), nC, alpha2.data());
     ckS(cudaGetLastError(), "alpha2");
@@ -235,9 +241,25 @@ void deviceAlphaCorrector(
                    compInt, compBnd);
     addFaces(nIf, advInt, compInt, unInt);
     addFaces(nBf, advBnd, compBnd, unBnd);
-    // On the pair the compressive half is zero -- cAlpha > 0 with a pair is refused above -- so the
-    // high-order flux there IS the advective one.
-    DeviceBuffer<scalar>& unIf = advIf;
+    // ...and the pair's own compressive half, the same two nested negations: each changes which cell
+    // the interpolation reads, not just the result's sign.
+    DeviceBuffer<scalar> unIf;
+    if (in.cyc && in.cyc->n > 0)
+    {
+        DeviceBuffer<scalar> a2gx, a2gy, a2gz, negPhirIf, innerIf, negInnerIf, compIf;
+        deviceGaussGrad(dm, alpha2, alpha2Bnd, a2gx, a2gy, a2gz);
+        deviceCyclicAddGrad(*in.cyc, alpha2, dm.V, a2gx, a2gy, a2gz);
+        deviceNegateFaces(in.cyc->n, phirIf, negPhirIf);
+        deviceAlphaCyclicFluxWith(*in.cyc, negPhirIf, static_cast<int>(in.alpharScheme), alpha2,
+                                  a2gx, a2gy, a2gz, innerIf);
+        deviceNegateFaces(in.cyc->n, innerIf, negInnerIf);
+        DeviceBuffer<scalar> a1gx, a1gy, a1gz;
+        deviceGaussGrad(dm, alpha1, *bnd.alpha1, a1gx, a1gy, a1gz);
+        deviceCyclicAddGrad(*in.cyc, alpha1, dm.V, a1gx, a1gy, a1gz);
+        deviceAlphaCyclicFluxWith(*in.cyc, negInnerIf, static_cast<int>(in.alpharScheme), alpha1,
+                                  a1gx, a1gy, a1gz, compIf);
+        addFaces(in.cyc->n, advIf, compIf, unIf);
+    }
 
     if (in.MULESCorr)
     {

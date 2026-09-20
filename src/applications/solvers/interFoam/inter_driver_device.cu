@@ -109,6 +109,39 @@ RunReport runInterFoamDevice(
             + "). The device loop's UEqn applies explicitPorositySource/DarcyForchheimer only; the host "
             "loop carries this one. Refused rather than run the case without it.");
     }
+    // A JUMP ON THE PAIR. The device's interface coefficient is one number per face -- the laplacian's
+    // or the momentum's -- and a jumpCyclic's neighbour value is the cell across LESS the jump
+    // (jumpCyclicFvPatchField.C, patchNeighbourField), which nothing in DeviceCyclic carries. The pair
+    // is coupled on this path now, so without this the jump would simply not appear in the pressure
+    // equation: a porousBafflePressure baffle would behave as a plain periodic face, which is the
+    // silent substitution this port keeps refusing. The host loop carries it (gated on
+    // RAS/damBreakPorousBaffle).
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        if (!fvp[pi].coupled) continue;
+        const bool jumps = f.p_rgh.boundary[pi]->coupledJump() != nullptr
+                        || f.p_rgh.boundary[pi]->isPorousBafflePressure();
+        if (!jumps) continue;
+        throw std::runtime_error(
+            "brae interFoam (device): p_rgh on the coupled patch `" + fvp[pi].name + "` carries a JUMP "
+            "(porousBafflePressure or a fixedJump). The device's interface coefficients are one number "
+            "per face and carry none, so the jump would vanish from the pressure equation. The host "
+            "loop (no -device) carries it. Run without -device.");
+    }
+
+    // THE ISOTROPIC AND SHEAR COMPRESSION TERMS. alphaEqn.H:60-75 blends phic with
+    // cAlpha*icAlpha*interpolate(mag(U)) and then ADDS scAlpha*mag(delta() & interpolate(symm(grad(U)))).
+    // The device alpha step carries neither -- DeviceAlphaStepInput has cAlpha and nothing else -- so a
+    // case that sets either would run with its compression quietly reduced to the standard term. The
+    // host loop carries both (alpha_eqn_cpp.cu:140-147).
+    if (f.alphaCtl.icAlpha != scalar(0) || f.alphaCtl.scAlpha != scalar(0))
+    {
+        throw std::runtime_error(
+            "brae interFoam (device): the case sets icAlpha or scAlpha. The device alpha step carries "
+            "the standard interface compression only; the host loop (no -device) carries the isotropic "
+            "and shear terms. Refused rather than run a different compression.");
+    }
+
     // A variableHeightFlowRateInletVelocity is rebuilt by the U-boundary hook now, from the phase
     // fraction on its patch, as the host driver rebuilds it (inter_driver_cpp.cu:722-735). What is still
     // refused here is the permeable-wall pair, which reads the phase field too but at another point.

@@ -140,8 +140,30 @@ void deviceSubtractFaces(int n, const DeviceBuffer<scalar>& a, const DeviceBuffe
 }
 
 
-void deviceAlphaCyclicFlux(
+__global__ void cyclicPhicKernel(
+    const scalar* __restrict__ phi, const scalar* __restrict__ magSf,
+    int n, scalar cAlpha, scalar* __restrict__ phic)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < n) phic[j] = cAlpha * fabs(phi[j] / magSf[j]);
+}
+
+void deviceAlphaCyclicCompressionFlux(
     const DeviceCyclic&         cyc,
+    scalar                      cAlpha,
+    DeviceBuffer<scalar>&       phicIf)
+{
+    if (cyc.n == 0) { phicIf.resize(0); return; }
+    phicIf.resize(static_cast<std::size_t>(cyc.n));
+    cyclicPhicKernel<<<nBlocks(cyc.n), TPB>>>(cyc.phi.data(), cyc.magSf.data(), cyc.n, cAlpha,
+                                              phicIf.data());
+    cudaCheck(cudaGetLastError(), "phic, interface");
+}
+
+
+void deviceAlphaCyclicFluxWith(
+    const DeviceCyclic&         cyc,
+    const DeviceBuffer<scalar>& phi,
     int                         scheme,
     const DeviceBuffer<scalar>& field,
     const DeviceBuffer<scalar>& gx,
@@ -152,10 +174,23 @@ void deviceAlphaCyclicFlux(
     if (cyc.n == 0) { out.resize(0); return; }
     out.resize(static_cast<std::size_t>(cyc.n));
     cyclicFaceFluxKernel<<<nBlocks(cyc.n), TPB>>>(
-        cyc.ownCell.data(), cyc.nbrCell.data(), cyc.phi.data(), cyc.weights.data(), field.data(),
+        cyc.ownCell.data(), cyc.nbrCell.data(), phi.data(), cyc.weights.data(), field.data(),
         gx.data(), gy.data(), gz.data(), cyc.dX.data(), cyc.dY.data(), cyc.dZ.data(),
         scheme, cyc.n, out.data());
     cudaCheck(cudaGetLastError(), "alpha flux, interface");
+}
+
+
+void deviceAlphaCyclicFlux(
+    const DeviceCyclic&         cyc,
+    int                         scheme,
+    const DeviceBuffer<scalar>& field,
+    const DeviceBuffer<scalar>& gx,
+    const DeviceBuffer<scalar>& gy,
+    const DeviceBuffer<scalar>& gz,
+    DeviceBuffer<scalar>&       out)
+{
+    deviceAlphaCyclicFluxWith(cyc, cyc.phi, scheme, field, gx, gy, gz, out);
 }
 
 

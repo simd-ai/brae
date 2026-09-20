@@ -38,6 +38,26 @@ namespace brae {
 // gradient of a mesh with a WALL there, and the vanLeer limiter reads it in exactly the cells next to
 // the pair. MEASURED with the plain gradient: linear and upwind still exact, vanLeer 1.6e-02 of a
 // 3.9e-02 flux. There is nothing here that can check it, which is why it is stated.
+// ...with a flux that is NOT the pair's own phi. The compressive half interpolates against -phir and
+// then against its negation, neither of which is the volumetric flux the pair carries.
+void deviceAlphaCyclicFluxWith(
+    const DeviceCyclic&         cyc,
+    const DeviceBuffer<scalar>& phi,
+    int                         scheme,
+    const DeviceBuffer<scalar>& field,
+    const DeviceBuffer<scalar>& gx,
+    const DeviceBuffer<scalar>& gy,
+    const DeviceBuffer<scalar>& gz,
+    DeviceBuffer<scalar>&       out);
+
+// phic on the pair: cAlpha*|phi_b/magSf|, the one kind of patch alphaEqn.H:79-89 leaves compressed
+// (alpha_eqn_cpp.cu:154-172). icAlpha and scAlpha are refused there across a coupled face and so are
+// not arguments here.
+void deviceAlphaCyclicCompressionFlux(
+    const DeviceCyclic&         cyc,
+    scalar                      cAlpha,
+    DeviceBuffer<scalar>&       phicIf);
+
 void deviceAlphaCyclicFlux(
     const DeviceCyclic&         cyc,
     int                         scheme,

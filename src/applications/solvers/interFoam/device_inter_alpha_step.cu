@@ -76,6 +76,8 @@ void deviceInterAlphaStep(
     const int nBf = dm.nBndFaces;
 
     DeviceBuffer<scalar> alphaPhiInt, alphaPhiBnd, iC, bC;
+    // nHatf on the pair, rewritten by every mixture.correct() below and read by the corrector's phir
+    DeviceBuffer<scalar> nHatfIfBuf;
 
     // mixture.correct() at the BOTTOM of a corrector: the interface normal from alpha's new field, then
     // the mixture properties from it. interfaceProperties reads mu and nu right after, which is why the
@@ -93,7 +95,9 @@ void deviceInterAlphaStep(
             deviceMixtureCorrect(alpha1Bnd.data(), nBf, props,
                                  ctl.alpha2BndOut->data(), nullptr, nullptr, nullptr);
         }
-        deviceInterfaceCorrect(dm, a, alpha1Bnd, nHatfBnd, in.deltaN, nHatfInt, K);
+        // ...and nHatf ON THE PAIR from the same pass, which is where phir gets its normal there
+        deviceInterfaceCorrect(dm, a, alpha1Bnd, nHatfBnd, in.deltaN, nHatfInt, K,
+                               in.cyc, in.cyc ? &nHatfIfBuf : nullptr);
         alpha2.resize(static_cast<std::size_t>(nC));
         rho.resize(static_cast<std::size_t>(nC));
         mu.resize(static_cast<std::size_t>(nC));
@@ -110,6 +114,7 @@ void deviceInterAlphaStep(
     {
         ++subCycle;
         DeviceAlphaStepInput li = in;
+        li.nHatfIf = (in.cyc && in.cyc->n > 0) ? &nHatfIfBuf : nullptr;
         li.deltaT    = dtSub;
         li.MULESCorr = ctl.MULESCorr;
 

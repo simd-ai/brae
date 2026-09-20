@@ -156,14 +156,18 @@ int main(int argc, char** argv)
         std::vector<FvPatch> patches = buildPatches(m, g, /*mirrorACMI=*/true);
         cpu::cyclicACMI::Interfaces acmi;
         cpu::cyclicAMIFvPatch::Interfaces amiPairs;
+        // A PLAIN CYCLIC IS COUPLED ON BOTH PATHS. It used to be host-only, because the device loop
+        // branched on nothing and a coupled patch would have been run as a wall; the device loop now
+        // carries the pair -- its matrices, its fluxes, MULES and nHatf, each gated on its own -- so
+        // withholding the coupling here would refuse a case the loop can run.
+        attachCyclicCoupling(patches, m, g);
         if (!onDevice)
         {
-            // THE HOST LOOP COUPLES A CYCLIC: its operators branch on FvPatch::coupled. The device loop
-            // does not, and is handed the mesh as it was -- where a cyclic is refused by name. A
-            // coincident cyclicACMI pair is coupled first: its masks split the face areas, which moves
-            // the cell geometry every patch is built from.
+            // A coincident cyclicACMI pair is coupled FIRST: its masks split the face areas, which
+            // moves the cell geometry every patch is built from. Neither it nor a cyclicAMI is ported
+            // on the device, and both stay uncoupled there -- which is what the case-build refusal
+            // keys on, by name.
             acmi = cpu::cyclicACMI::setup(m, g, patches, startTime);
-            attachCyclicCoupling(patches, m, g);
             amiPairs = cpu::cyclicAMIFvPatch::setup(caseDir + "/constant/polyMesh", m, g, patches);
         }
         // ...handed to the host loop mutable as well, for a case whose mesh moves (MutableMesh)

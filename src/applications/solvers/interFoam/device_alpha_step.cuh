@@ -78,6 +78,9 @@ struct DeviceAlphaStepInput
     DeviceCyclic*               cyc        = nullptr;
     const DeviceBuffer<scalar>* phiCNIf    = nullptr;
     DeviceBuffer<scalar>*       alphaPhiIf = nullptr;
+    // nHatf on the pair, from the same mixture.correct() that produced nHatfInt: phir is phic*nHatf,
+    // and a coupled face is the one kind alphaEqn.H:79-89 leaves compressed.
+    const DeviceBuffer<scalar>* nHatfIf = nullptr;
 
     scalar cAlpha     = 0;
     scalar deltaT     = 0;
