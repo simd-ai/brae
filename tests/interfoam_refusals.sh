@@ -495,7 +495,7 @@ if [ $HAVE_GPU = 1 ]; then
     # (tests/interfoam_cyclic_vs_openfoam.sh's `jump` profile measures them), so what it refuses is
     # the one thing left: the case sets `nOuterCorrectors 3` and the device loop runs one.
     BASE="$BB"
-    arm device_baffle       refused "nut has a coupled patch" "-device" true
+    arm device_baffle       refused "k's and epsilon's transport across it" "-device" true
     BASE="$B"
     # the device's gradient operators are Gauss linear; a limited or least-squares one is refused
     arm device_gradLsq      refused "leastSquares or cellLimited" "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         leastSquares;/' system/fvSchemes"

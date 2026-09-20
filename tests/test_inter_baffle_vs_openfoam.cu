@@ -492,11 +492,11 @@ int main(
         }
         check("the device loop refuses the case and names the patch", named);
 
-        // NO DEVICE ARM ON THIS CASE YET. Its pair, its JUMP and its `nOuterCorrectors 3` all run on
-        // the device now; what stops it is RAS -- the device closure cannot evaluate nut's patches on
-        // a mesh with a coupled patch, because the device's boundary array does not hold one, and it
-        // refuses by name. tests/interfoam_cyclic_vs_openfoam.sh's `jump` and `outer` profiles measure
-        // the first two on a laminar case the device runs end to end.
+        // NO DEVICE ARM ON THIS CASE YET, and now for ONE reason: it is RAS, and k's and epsilon's
+        // transport across the pair is an interface off-diagonal the device closure is not given, so
+        // it refuses by name. Its pair, its JUMP, its `nOuterCorrectors 3` and its nut/k/epsilon
+        // boundary arrays all run on the device -- tests/interfoam_cyclic_vs_openfoam.sh's `jump` and
+        // `outer` profiles measure the first three on a laminar case the device runs end to end.
     }
 
     std::printf("test_inter_baffle_vs_openfoam: %d failures\n", failures);

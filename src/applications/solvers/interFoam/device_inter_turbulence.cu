@@ -17,6 +17,10 @@ std::vector<scalar> patchValuesOf(
     std::vector<scalar> v;
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
+        // THE DEVICE'S BOUNDARY LAYOUT holds the NON-COUPLED patches only (device_mesh.cuh:41-44),
+        // and so does buildDeviceBoundary. A flatten that walks every patch is longer than the arrays
+        // it is indexed with and shifts every patch after the first coupled one.
+        if (isCoupledInterfaceType(patches[pi].type)) continue;
         const std::vector<scalar>& b = f.boundary[pi]->value();
         v.insert(v.end(), b.begin(), b.end());
     }
@@ -75,6 +79,12 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
     std::vector<label> nutEval;
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
+        // A COUPLED PATCH IS NOT IN THE DEVICE'S BOUNDARY ARRAYS, so it is not in this mask either.
+        // It needs no evaluate: OpenFOAM ends every field assignment with
+        // correctLocalBoundaryConditions(), which gives a constraint patch the RESULT's own two cells
+        // interpolated (`localConsistency`, GeometricFieldFunctionsM.C) -- a value nothing on the
+        // device reads, because the device's nut boundary does not hold that face.
+        if (isCoupledInterfaceType(patches[pi].type)) continue;
         const bool eval = patches[pi].type != "wall"
                        && patches[pi].type != "empty"
                        && t.nut.boundary[pi]->bcCategory() != 2;
@@ -86,14 +96,34 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
         }
     }
     d.nutEvalMask.copyFrom(nutEval);
-    // buildDeviceBoundary DROPS a coupled patch (its coupling is the interface off-diagonal), so its
-    // arrays are shorter than nut's face list and this evaluate would read past their end.
+    // Every array above is now in the device's own boundary-face order, so this is a size check and
+    // no longer a refusal: it catches a builder that starts walking every patch again.
     if (d.nutEvalFaces > 0 && static_cast<std::size_t>(d.dbNut.n) != nutEval.size())
     {
         throw std::runtime_error(
-            "brae interFoam (device): nut has a coupled patch, so its device boundary is shorter than its "
-            "face list and the closure cannot evaluate nut's patches by face. The host path (no -device) "
-            "runs it.");
+            "brae interFoam (device): nut's evaluate mask is " + std::to_string(nutEval.size())
+            + " faces and its device boundary is " + std::to_string(d.dbNut.n)
+            + ". They index each other, so one of the two is walking the coupled patches and the "
+              "other is not.");
+    }
+
+    // WHAT A COUPLED PATCH STILL COSTS THIS CLOSURE, and it is the transport and not the boundary.
+    // k's and epsilon's equations are fvm::div + fvm::laplacian like any other, so across a pair they
+    // need the interface off-diagonal -- deviceKEpsilonStep and deviceKOmegaSSTStep both take a
+    // `DeviceCyclic*` for exactly that (device_kepsilon.cuh:58, :89, :104) and this driver passes
+    // none. Solved without it the two sides of the pair are two walls: k and epsilon do not cross,
+    // and nut follows them. MEASURED on RAS/damBreakPorousBaffle, twenty steps, device against
+    // OpenFOAM: nut 1.8e-01 relative, U 1.1e-02, with the host closure in the same device loop far
+    // closer. Refused rather than run the pair as a wall in the closure alone.
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (!patches[pi].coupled) continue;
+        throw std::runtime_error(
+            "brae interFoam (device): the case is RAS and patch `" + patches[pi].name + "` is a "
+            "coupled pair. k's and epsilon's transport across it is an interface off-diagonal the "
+            "device closure is not given, so they would be solved as if the pair were two walls. "
+            "The host closure runs it -- BRAE_INTER_HOST_CLOSURE=1 in this same device loop, or the "
+            "host path (no -device).");
     }
     d.wall = buildDeviceWallData(m, g, patches, U, wfPatch);
 
@@ -114,6 +144,9 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
     label bndIdx = 0;
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
+        // ...and neither is it in any of the per-face arrays below, which are indexed by the device's
+        // boundary-face number. A coupled patch is never a wall and never a turbulence inlet.
+        if (isCoupledInterfaceType(patches[pi].type)) continue;
         const bool isWF = isTurbWallPatch(patches, pi, wfPatch);
         // each wall function's OWN coefficients: the nut patch's for nutkWallFunction, the epsilon
         // patch's for epsilonWallFunction
@@ -175,6 +208,7 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
         label bi = 0;
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
+            if (isCoupledInterfaceType(patches[pi].type)) continue;   // the device's boundary layout
             const int  kk = t.k.boundary[pi]->turbulentInletKind();
             const int  ek = second.boundary[pi]->turbulentInletKind();
             const scalar kc = t.k.boundary[pi]->turbulentInletCoefficient();
