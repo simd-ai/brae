@@ -454,11 +454,15 @@ void deviceCyclicAddConvection(DeviceCyclic& cyc, DeviceBuffer<scalar>& diag, co
 
 
 void deviceCyclicAssembleMomentum(DeviceCyclic& cyc, const DeviceBuffer<scalar>& nuEffCell, DeviceBuffer<scalar>& diag,
-                                  const DeviceBuffer<scalar>* wsch)
+                                  const DeviceBuffer<scalar>* wsch,
+                                  bool corrected)
 {
     if (cyc.n == 0) return;
+    // the diffusion half's own choice, as the laplacian entry point above makes it
+    const scalar* dc = (corrected || cyc.orthDeltaCoeffs.size() != cyc.deltaCoeffs.size())
+                     ? cyc.deltaCoeffs.data() : cyc.orthDeltaCoeffs.data();
     momKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), nuEffCell.data(),
-        cyc.deltaCoeffs.data(), cyc.weights.data(), cyc.magSf.data(), cyc.phi.data(),
+        dc, cyc.weights.data(), cyc.magSf.data(), cyc.phi.data(),
         (wsch && (label)wsch->size() == cyc.n) ? wsch->data() : nullptr,
         cyc.ifCoeff.data(), diag.data());
     cudaCheck(cudaGetLastError(), "cyclicMom");

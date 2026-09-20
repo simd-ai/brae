@@ -24,6 +24,12 @@
 // 4.2e-03 out of 5.5e-02, 7.7% of it, while the corrected one was exact. It now takes the host patch's
 // own plain deltaCoeffs when the scheme does not correct. MEASURED after that, both meshes, both
 // passes: 1.4e-17 or better on coefficients up to 5.9e-02.
+//
+// THE MOMENTUM MATRIX's interface coefficients are here too, M = fvm::div(phi, U) - fvm::laplacian(nuEff,
+// U), with a flux that changes sign over the pair so the upwind split is exercised (9 outflow, 11 inflow
+// faces, asserted). Both schemes, both meshes: 2.7e-20 on coefficients up to 2.1e-01. Its diffusion half
+// had the SAME defect as the laplacian's and it was fixed the same way -- BROKEN once, with the flag
+// ignored: 1.6e-05 on the skewed mesh's orthogonal pass.
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -193,6 +199,111 @@ int main(int argc, char** argv)
                     name, (double)worstDiag, (double)diagScale);
         check("...and the diagonal it writes is the host's coupled internalCoeffs",
               worstDiag <= scalar(1e-14)*std::fmax(diagScale, scalar(1e-300)));
+    }
+
+    // ---- THE MOMENTUM MATRIX'S INTERFACE COEFFICIENTS ------------------------------------------
+    // M = fvm::div(phi, U) - fvm::laplacian(nuEff, U), which is what a segregated momentum equation
+    // puts on a coupled patch. The host gives each face
+    //     internalCoeffs = phi*w  -  ( -(nuEff_b*magSf_b)*dc_b )
+    //     boundaryCoeffs = -(phi*(1 - w))  -  ( -(nuEff_b*magSf_b)*dc_b )
+    // with w = pos0(phi), upwind's weight on a coupled patch as on an internal face (fvm.cuh:536-549).
+    // The device's twin is momKernel (device_cyclic.cu:59-83), which builds its own face nuEff from the
+    // two CELLS and its own split.
+    {
+        // a flux with BOTH SIGNS on the pair -- an upwind weight that is constant over the interface
+        // would let a wrong split through, so the arm asserts both occur
+        std::vector<std::vector<scalar>> phiB(fvp.size());
+        std::vector<scalar> phiIf(static_cast<std::size_t>(m.nInternalFaces()), scalar(0));
+        for (label f = 0; f < m.nInternalFaces(); ++f)
+        {
+            phiIf[static_cast<std::size_t>(f)] = scalar(0.13)*std::sin(scalar(0.7)*scalar(f));
+        }
+        std::size_t nPos = 0, nNeg = 0;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            phiB[pi].assign(static_cast<std::size_t>(fvp[pi].size), scalar(0));
+            if (!fvp[pi].coupled) continue;
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                const scalar v = scalar(0.21)*std::sin(scalar(1.9)*scalar(i) + scalar(0.4)*scalar(pi));
+                phiB[pi][static_cast<std::size_t>(i)] = v;
+                if (v > 0) ++nPos; else ++nNeg;
+            }
+        }
+        std::printf("  interface flux: %zu outflow faces, %zu inflow faces\n", nPos, nNeg);
+        check("the interface flux changes sign over the pair, so the upwind split is exercised",
+              nPos > 0 && nNeg > 0);
+
+        std::vector<scalar> nuCell(static_cast<std::size_t>(nC));
+        for (label c = 0; c < nC; ++c)
+        {
+            const vector& C = g.C()[c];
+            nuCell[static_cast<std::size_t>(c)] =
+                scalar(1e-3)*(scalar(1.4) + std::sin(scalar(2.1)*C.x)*std::cos(scalar(1.3)*C.y));
+        }
+        const SurfaceScalarField nuf = fvc::interpolate(nuCell, m, g, fvp);
+        DeviceBuffer<scalar> dNuCell(nuCell);
+
+        for (int mpass = 0; mpass < 2; ++mpass)
+        {
+        const bool mCorrected = (mpass == 1);
+        const char* mName = mCorrected ? "momentum, corrected" : "momentum, orthogonal";
+        const FvScalarMatrix hDiv = fvm::div<scalar>(phiIf, phiB, vf, m, fvp);
+        const FvScalarMatrix hLap = fvm::laplacian<scalar>(nuf, vf, m, g, fvp, mCorrected);
+
+        DeviceCyclic cyc = buildDeviceCyclic(cyclics, g, fvp);
+        {   // the interface flux, in buildDeviceCyclic's own face order
+            std::vector<scalar> flat;
+            for (const CyclicInterface& c : cyclics)
+            {
+                for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+                {
+                    flat.push_back(phiB[static_cast<std::size_t>(c.patch)][i]);
+                }
+            }
+            cyc.phi.copyFrom(flat);
+        }
+        DeviceBuffer<scalar> mdiag(std::vector<scalar>(static_cast<std::size_t>(nC), scalar(0)));
+        deviceCyclicAssembleMomentum(cyc, dNuCell, mdiag, nullptr, mCorrected);
+
+        std::vector<scalar> ifCoeff, diagAdd;
+        cyc.ifCoeff.copyTo(ifCoeff);
+        mdiag.copyTo(diagAdd);
+
+        std::vector<scalar> hostIf;
+        std::vector<scalar> hostDiag(static_cast<std::size_t>(nC), scalar(0));
+        for (const CyclicInterface& c : cyclics)
+        {
+            const FvPatch& P = fvp[c.patch];
+            for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+            {
+                const scalar bc = hDiv.boundaryCoeffs[c.patch][i] - hLap.boundaryCoeffs[c.patch][i];
+                const scalar ic = hDiv.internalCoeffs[c.patch][i] - hLap.internalCoeffs[c.patch][i];
+                hostIf.push_back(-bc);
+                hostDiag[static_cast<std::size_t>(P.faceCells[i])] += ic;
+            }
+        }
+        scalar worst = 0, scale = 0, worstDiag = 0, diagScale = 0;
+        for (std::size_t j = 0; j < ifCoeff.size() && j < hostIf.size(); ++j)
+        {
+            worst = std::fmax(worst, std::fabs(ifCoeff[j] - hostIf[j]));
+            scale = std::fmax(scale, std::fabs(hostIf[j]));
+        }
+        for (label c = 0; c < nC; ++c)
+        {
+            const std::size_t k = static_cast<std::size_t>(c);
+            worstDiag = std::fmax(worstDiag, std::fabs(diagAdd[k] - hostDiag[k]));
+            diagScale = std::fmax(diagScale, std::fabs(hostDiag[k]));
+        }
+        std::printf("  %s: worst |device - host| interface %.4e (up to %.4e), diagonal %.4e "
+                    "(up to %.4e)\n", mName, (double)worst, (double)scale, (double)worstDiag,
+                    (double)diagScale);
+        check("the device's momentum interface coefficient IS the host's",
+              ifCoeff.size() == hostIf.size()
+              && worst <= scalar(1e-14)*std::fmax(scale, scalar(1e-300)));
+        check("...and the momentum diagonal it writes is the host's",
+              worstDiag <= scalar(1e-14)*std::fmax(diagScale, scalar(1e-300)));
+        }
     }
 
     std::printf("test_device_cyclic_laplacian_vs_host: %d failures\n", failures);

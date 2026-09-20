@@ -156,8 +156,12 @@ void deviceCyclicAddConvection(DeviceCyclic& cyc, DeviceBuffer<scalar>& diag,
 //   diag[own] += (nuFace*dc*magSf) + max(phi,0)             (folded into the momentum diagonal)
 // with nuFace = w*nuEff[own]+(1-w)*nuEff[nbr]. Mirrors the interior (deviceDivUpwindCoeffs - deviceLaplacianCoeffs).
 // `wsch`: the div scheme's face interpolation weight; null = upwind (pos0(phi)), the previous behaviour.
+// `corrected` picks the delta coefficient of the DIFFUSION half exactly as the laplacian above does
+// (fvm.cuh:104-113): nonOrthDeltaCoeffs when the scheme corrects, the patch's plain deltaCoeffs when it
+// does not. Default true, the behaviour every caller before interFoam had.
 void deviceCyclicAssembleMomentum(DeviceCyclic& cyc, const DeviceBuffer<scalar>& nuEffCell, DeviceBuffer<scalar>& diag,
-                                  const DeviceBuffer<scalar>* wsch = nullptr);
+                                  const DeviceBuffer<scalar>* wsch = nullptr,
+                                  bool corrected = true);
 
 // add the cyclic off-diagonal to H (OF fvMatrix::H): H[own] -= ifCoeff[j]*psi[nbr]/V[own]. Call AFTER deviceMatrixH.
 void deviceCyclicAddH(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& psi, const DeviceBuffer<scalar>& V,
