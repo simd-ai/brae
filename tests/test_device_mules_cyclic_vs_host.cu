@@ -27,6 +27,13 @@
 // signature: the interface extrema and budgets dropped -- internal 3.9e-01, interface 2.5e-01; the
 // interface limiter dropped -- interface lambda stays at 1.0 and the internal faces go 9.1e-01; the
 // SYNC dropped -- the two sides of a face differ by 7.8e-01, which only the pair arm above sees.
+//
+// THE DONOR FLUX on the pair is gated here too, bit for bit: an uncoupled patch has phiBD overwritten
+// by phiPsi, and a coupled face keeps upwind's own flux from the cell the flux leaves
+// (MULESTemplates.C:605). BROKEN once, upwind taken from the wrong side: 2.9e-02 of a 3.9e-02 flux.
+// That number is the fixture's doing -- psi is TILTED so the pair's two sides hold different values;
+// with the interface running in y alone the same break moved the flux by 6.9e-18 and only the bitwise
+// arm could see it.
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -83,7 +90,12 @@ int main(int argc, char** argv)
     for (label c = 0; c < nC; ++c)
     {
         const vector& C = g.C()[c];
-        const scalar a = scalar(0.5) + scalar(0.5)*std::tanh(scalar(6)*(scalar(0.55) - C.y));
+        // TILTED, on purpose: the pair joins x = min to x = max, so an interface that ran in y alone
+        // would put nearly the same psi on both sides and the upwind branch would be unmeasurable in
+        // value terms. MEASURED with it running in y only: taking upwind from the wrong side moved the
+        // donor flux by 6.9e-18 and only the bitwise arm saw it.
+        const scalar a = scalar(0.5)
+                       + scalar(0.5)*std::tanh(scalar(6)*(scalar(0.55) - C.y + scalar(0.35)*C.x));
         psiCell[static_cast<std::size_t>(c)] = std::fmin(std::fmax(a, scalar(0)), scalar(1));
         psiOld[static_cast<std::size_t>(c)] =
             std::fmin(std::fmax(a + scalar(0.02)*std::sin(scalar(3)*C.x), scalar(0)), scalar(1));
@@ -113,6 +125,78 @@ int main(int argc, char** argv)
             phiBD.boundary[pi][k] = scalar(0.02)*std::sin(scalar(1.1)*scalar(i) + scalar(pi));
             phiCorr.boundary[pi][k] = scalar(0.06)*std::cos(scalar(0.8)*scalar(i) + scalar(pi));
         }
+    }
+
+    // ---- THE DONOR FLUX on the pair ---------------------------------------------------------------
+    // Before the limiter there is the flux it limits. On an uncoupled patch phiBD is overwritten by
+    // phiPsi, which is what makes phiCorr zero there; a COUPLED face keeps upwind's own flux from the
+    // cell the flux leaves (MULESTemplates.C:605, mules_cpp.cu:88-94), so its correction is real and the
+    // limiter has work to do on it.
+    {
+        SurfaceScalarField phiField, phiPsi;
+        phiField.internal.assign(static_cast<std::size_t>(nIf), scalar(0));
+        phiField.boundary.resize(fvp.size());
+        phiPsi.internal.assign(static_cast<std::size_t>(nIf), scalar(0));
+        phiPsi.boundary.resize(fvp.size());
+        for (label f = 0; f < nIf; ++f)
+        {
+            phiField.internal[static_cast<std::size_t>(f)] = scalar(0.03)*std::sin(scalar(0.7)*scalar(f));
+        }
+        std::size_t nPos = 0, nNeg = 0;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            phiField.boundary[pi].assign(static_cast<std::size_t>(fvp[pi].size), scalar(0));
+            phiPsi.boundary[pi].assign(static_cast<std::size_t>(fvp[pi].size), scalar(0));
+            if (!fvp[pi].coupled) continue;
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                const scalar v = scalar(0.04)*std::sin(scalar(1.7)*scalar(i) + scalar(0.5)*scalar(pi));
+                phiField.boundary[pi][static_cast<std::size_t>(i)] = v;
+                if (v >= 0) ++nPos; else ++nNeg;
+            }
+        }
+        check("the interface flux changes sign, so both sides of the upwind branch are taken",
+              nPos > 0 && nNeg > 0);
+
+        SurfaceScalarField hostBD;
+        cpu::MULES::boundedDonorFlux(phiField, psi, phiPsi, m, fvp, hostBD);
+
+        DeviceCyclic cycD = buildDeviceCyclic(cyclics, g, fvp);
+        {
+            std::vector<scalar> flat;
+            for (const CyclicInterface& c : cyclics)
+            {
+                for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+                {
+                    flat.push_back(phiField.boundary[static_cast<std::size_t>(c.patch)][i]);
+                }
+            }
+            cycD.phi.copyFrom(flat);
+        }
+        DeviceBuffer<scalar> dPsiCell(psiCell), devBD;
+        deviceMulesDonorFluxCyclic(cycD, dPsiCell, devBD);
+        std::vector<scalar> dbd;
+        devBD.copyTo(dbd);
+
+        std::vector<scalar> hbd;
+        for (const CyclicInterface& c : cyclics)
+        {
+            for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+            {
+                hbd.push_back(hostBD.boundary[static_cast<std::size_t>(c.patch)][i]);
+            }
+        }
+        scalar worst = 0, scale = 0;
+        for (std::size_t j = 0; j < dbd.size() && j < hbd.size(); ++j)
+        {
+            worst = std::fmax(worst, std::fabs(dbd[j] - hbd[j]));
+            scale = std::fmax(scale, std::fabs(hbd[j]));
+        }
+        std::printf("  donor flux on the pair: worst |device - host| %.4e (fluxes up to %.4e)\n",
+                    (double)worst, (double)scale);
+        check("the device's donor flux on a coupled face IS the host's, bit for bit",
+              dbd.size() == hbd.size() && worst == scalar(0));
+        check("...and it is not identically zero, which an overwritten patch would be", scale > scalar(0));
     }
 
     cpu::MULES::Fields hf;           // interFoam's: rho, Sp, Su, psiMax, psiMin all the constants

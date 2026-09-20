@@ -55,6 +55,21 @@ __global__ void donorBoundaryKernel(const scalar* __restrict__ phiPsiBnd, int nB
     phiBDBnd[b] = phiPsiBnd[b];
 }
 
+// ...and a COUPLED face, which is NOT overwritten: it keeps upwind's own flux, taken from the cell the
+// flux leaves (MULESTemplates.C:605 `if (!phiBDPf.coupled())`, and mules_cpp.cu:88-94). The neighbour
+// is a real cell on the other side of the pair, so this is the internal-face form with the interface's
+// own addressing -- not a patch value, of which a cyclic patch has none that MULES would read.
+__global__ void donorCyclicKernel(
+    const label* __restrict__ own, const label* __restrict__ nbr,
+    const scalar* __restrict__ phi, const scalar* __restrict__ psi,
+    int n, scalar* __restrict__ phiBD)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    const scalar p = phi[j];
+    phiBD[j] = p * ((p >= scalar(0)) ? psi[own[j]] : psi[nbr[j]]);
+}
+
 // THE SETUP, one gather per cell: the neighbourhood extrema, sumPhiBD, sumPhip and mSumPhim, then the
 // extremaCoeff/smoothLimiter relaxation and the transform into flux-space budgets.
 __global__ void setupKernel(
@@ -528,6 +543,19 @@ void deviceMulesDonorFlux(
             phiPsiBnd.data(), nBoundaryFaces, phiBDBnd.data());
         ckM(cudaGetLastError(), "donor boundary");
     }
+}
+
+
+void deviceMulesDonorFluxCyclic(
+    const DeviceCyclic&         cyc,
+    const DeviceBuffer<scalar>& psi,
+    DeviceBuffer<scalar>&       phiBDIf)
+{
+    if (cyc.n == 0) { phiBDIf.resize(0); return; }
+    phiBDIf.resize(static_cast<std::size_t>(cyc.n));
+    donorCyclicKernel<<<nBlocks(cyc.n), TPB>>>(
+        cyc.ownCell.data(), cyc.nbrCell.data(), cyc.phi.data(), psi.data(), cyc.n, phiBDIf.data());
+    ckM(cudaGetLastError(), "donor flux, interface");
 }
 
 

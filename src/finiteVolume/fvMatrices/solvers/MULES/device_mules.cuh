@@ -67,6 +67,14 @@ void deviceMulesDonorFlux(
     DeviceBuffer<scalar>&       phiBDInt,
     DeviceBuffer<scalar>&       phiBDBnd);
 
+// ...and the same for the faces of a periodic pair, whose flux the interface carries (cyc.phi) and
+// whose neighbour is a cell, not a patch value. A cyclic face is NOT overwritten by phiPsi the way an
+// uncoupled boundary face is, so its phiCorr is genuinely non-zero and the limiter has work to do on it.
+void deviceMulesDonorFluxCyclic(
+    const DeviceCyclic&         cyc,
+    const DeviceBuffer<scalar>& psi,
+    DeviceBuffer<scalar>&       phiBDIf);
+
 // MULES::limiter. `lambda` is sized and filled by this call: 1 on every face, then tightened.
 void deviceMulesLimiter(
     const DeviceMesh&            dm,
