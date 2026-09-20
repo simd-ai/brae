@@ -34,6 +34,12 @@
 // fails. cyc.phi is seeded with a DIFFERENT flux on purpose, which is what makes that witnessable: a
 // compressible closure convects k and epsilon with the mass flux and not with the pair's own phi.
 //
+// grad(U) ACROSS THE PAIR is the last arm, and it is the tensor kEpsilon's production term reads
+// (G = nut*(gradU && devTwoSymm(gradU)), kEpsilon.C:237). The scalar gaussGrad arm gates the
+// interface contribution itself; this one gates it on a VECTOR, where deviceGradU runs it per
+// component into a 9*nC tensor. MEASURED, cyclicChannel: 2.8e-14 of 1.1e+01, with the pair left out
+// -- the CONTROL -- 1.1e+02.
+//
 // THE MOMENTUM MATRIX's interface coefficients are here too, M = fvm::div(phi, U) - fvm::laplacian(nuEff,
 // U), with a flux that changes sign over the pair so the upwind split is exercised (9 outflow, 11 inflow
 // faces, asserted). Both schemes, both meshes: 2.7e-20 on coefficients up to 2.1e-01. Its diffusion half
@@ -64,6 +70,8 @@
 #include "cyclic_field.cuh"
 #include "device_mesh.cuh"
 #include "device_cyclic.cuh"
+#include "device_kepsilon.cuh"
+#include "device_boundary.cuh"
 #include "geometric_field.cuh"
 #include <cmath>
 #include <cstdio>
@@ -670,6 +678,62 @@ int main(int argc, char** argv)
         for (scalar v : phiIfH) { if (v > 0) ++nOut; else ++nIn; }
         std::printf("  (the pair's flux: %d outflow faces, %d inflow)\n", nOut, nIn);
         check("...on a pair whose flux changes sign, so the upwind split is live", nOut > 0 && nIn > 0);
+    }
+
+    // ---- grad(U) ACROSS THE PAIR, the tensor the production term reads ------------------------
+    // kEpsilon's G is nut*(gradU && devTwoSymm(gradU)) and that gradU is fvc::grad(U), which sums a
+    // coupled face like any other patch's. The scalar arm above gates the interface contribution
+    // itself; this one gates it on a VECTOR, where deviceGradU runs it per component into a 9*nC
+    // tensor and a component index is one more thing to get wrong.
+    {
+        std::vector<vector> Uc(static_cast<std::size_t>(nC));
+        for (label c = 0; c < nC; ++c)
+        {
+            Uc[static_cast<std::size_t>(c)] =
+                vector{scalar(0.3) + scalar(0.11)*c, scalar(-0.2) + scalar(0.07)*c, scalar(0.05)*c};
+        }
+        const GeometricField<vector> vfU = buildCyclicField<vector>(Uc, fvp, cyclics);
+        const std::vector<tensor> hostG = fvc::gaussGrad(vfU, m, g, fvp);
+
+        std::vector<scalar> ux(static_cast<std::size_t>(nC)), uy(static_cast<std::size_t>(nC)),
+                            uz(static_cast<std::size_t>(nC));
+        for (label c = 0; c < nC; ++c)
+        {
+            const std::size_t k = static_cast<std::size_t>(c);
+            ux[k] = Uc[k].x; uy[k] = Uc[k].y; uz[k] = Uc[k].z;
+        }
+        DeviceBuffer<scalar> dUx(ux), dUy(uy), dUz(uz);
+        DeviceVectorBoundary dbU = buildDeviceVectorBoundary(vfU, fvp, g);
+        DeviceCyclic gc = buildDeviceCyclic(cyclics, g, fvp);
+
+        DeviceBuffer<scalar> gradWith, gradWithout;
+        deviceGradU(dm, dbU, dUx, dUy, dUz, gradWith, /*ami=*/nullptr, &gc);
+        deviceGradU(dm, dbU, dUx, dUy, dUz, gradWithout, /*ami=*/nullptr, nullptr);
+        std::vector<scalar> gw, gwo;
+        gradWith.copyTo(gw);
+        gradWithout.copyTo(gwo);
+
+        scalar worst = 0, scale = 0, control = 0;
+        for (label c = 0; c < nC; ++c)
+        {
+            const tensor& h = hostG[static_cast<std::size_t>(c)];
+            const scalar hv[9] = {h.xx, h.xy, h.xz, h.yx, h.yy, h.yz, h.zx, h.zy, h.zz};
+            for (int q = 0; q < 9; ++q)
+            {
+                const std::size_t idx = static_cast<std::size_t>(q)*static_cast<std::size_t>(nC)
+                                      + static_cast<std::size_t>(c);
+                if (idx >= gw.size()) break;
+                worst   = std::fmax(worst,   std::fabs(gw[idx]  - hv[q]));
+                control = std::fmax(control, std::fabs(gwo[idx] - hv[q]));
+                scale   = std::fmax(scale,   std::fabs(hv[q]));
+            }
+        }
+        std::printf("  grad(U): worst |device - host| %.4e (components up to %.4e); CONTROL, the pair "
+                    "left out: %.4e\n", (double)worst, (double)scale, (double)control);
+        check("the device's grad(U) with the pair IS the host's fvc::grad",
+              worst <= scalar(1e-14)*std::fmax(scale, scalar(1e-300)));
+        check("...and leaving the pair out is a DIFFERENT tensor, so the arm can witness it",
+              control > scalar(1e3)*std::fmax(worst, scalar(1e-300)));
     }
 
     std::printf("test_device_cyclic_laplacian_vs_host: %d failures\n", failures);

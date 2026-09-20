@@ -235,6 +235,11 @@ struct KEpsilonInput
     // on the pair's own faces. Both null = no pair, which is what hasCoupledPatches still refuses.
     DeviceCyclic*               cyc    = nullptr;
     const DeviceBuffer<scalar>* cycPhi = nullptr;
+    // ...and the VOLUMETRIC flux on the pair, which is a different field from cycPhi in the
+    // compressible lineage: divU is the dilatation and comes from phiByRho, divPhi is the equation's
+    // own mass-flux divergence. In the incompressible lineage the two are one field and the caller
+    // passes the same buffer twice, exactly as it does for phiByRhoInt/phiInt.
+    const DeviceBuffer<scalar>* cycPhiByRho = nullptr;
     bool        hasUnportedFvOption    = false;
     bool        hasNonUpwindDivScheme  = false;
     bool        hasNonWallTurbWallFunc = false;

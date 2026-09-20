@@ -598,15 +598,47 @@ void production(
     // exactly these and are already gated.
     // ...through the case's grad(U) scheme (kEpsilon.C:237): leastSquares where it resolves so, then
     // cellLimited where fvSchemes says so (kEpsilon_cpp.cu:260-262 is the reference).
-    if (in.co.gradULeastSq) deviceLeastSquaresGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU);
-    else                    deviceGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU);
-    if (in.co.gradULimitK > scalar(0)) deviceCellLimitGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU, in.co.gradULimitK);
+    // ...WITH THE PAIR. fvc::grad sums a coupled face like any other patch's (fvc.cu's gaussGrad), and
+    // the production term reads this gradient in every cell -- including the pair's own, where a
+    // gradient built without it is the gradient of a field with a wall there.
+    if (in.co.gradULeastSq)
+    {
+        if (in.cyc && in.cyc->n > 0)
+        {
+            throw std::runtime_error(
+                "kEpsilon(cuda): the case asks for a leastSquares grad(U) and the mesh has a periodic "
+                "pair. deviceLeastSquaresGradU does not carry an interface, so the pair's cells would "
+                "get a gradient fitted without it. The Gauss form does; the host closure carries both.");
+        }
+        deviceLeastSquaresGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU);
+    }
+    else
+    {
+        deviceGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU, /*ami=*/nullptr, in.cyc);
+    }
+    if (in.co.gradULimitK > scalar(0))
+        deviceCellLimitGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU, in.co.gradULimitK, in.cyc);
     deviceGByNuFromGradU(st.gradU, nC, st.gByNu);
 
     // divU is the DILATATION and comes from the VOLUMETRIC flux; divPhi is the EQUATION's own mass-flux
     // divergence and is only read by `bounded`. In the incompressible lineage these are one field.
     deviceDiv(dm, *in.phiByRhoInt, *in.phiByRhoBnd, st.divU);
     deviceDiv(dm, *in.phiInt, *in.phiBnd, st.divPhi);
+    // ...and the PAIR's faces, which fvc::div sums into their own cell like any other patch's
+    // (fvc.cu:548-550). Each divergence takes ITS OWN flux there: divU the volumetric one and divPhi
+    // the equation's, which are one field only in the incompressible lineage.
+    if (in.cyc && in.cyc->n > 0)
+    {
+        if (!in.cycPhi || !in.cycPhiByRho)
+        {
+            throw std::runtime_error(
+                "kEpsilon(cuda): the mesh has a periodic pair and the caller gave no flux for it. "
+                "divU takes the VOLUMETRIC flux on those faces and divPhi the equation's own; the "
+                "internal-face arrays cannot stand in for either.");
+        }
+        deviceCyclicAddDivFlux(*in.cyc, *in.cycPhiByRho, dm.V, st.divU);
+        deviceCyclicAddDivFlux(*in.cyc, *in.cycPhi, dm.V, st.divPhi);
+    }
 
     // G = nut*GbyNu, captured BEFORE the wall replacement -- which is where OpenFOAM writes it too.
     deviceHadamard(st.G, nut, st.gByNu);
