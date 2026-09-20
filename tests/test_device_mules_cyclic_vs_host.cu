@@ -48,6 +48,12 @@
 // patch's (fvc.cu:548-550). Device against host, both meshes: 4.4e-16 and 1.1e-16 of a psi reaching
 // 1.65. BROKEN once, the pair's flux left out of the divergence: 4.4e-01 -- alpha simply does not cross
 // the pair, which is a mesh with a wall there and not a slower answer.
+//
+// CMULES's limiter is here too, and it is NOT the explicit one with a flag (notes A to D): no donor
+// flux, the budget measured against psi as it stands, and a COUPLED face limited whichever way its flux
+// goes -- the inlet test an uncoupled face gets does not apply to it (CMULESTemplates.C:516). Device
+// against host: internal 5.6e-17 and 2.8e-17, interface 1.1e-16 and 0.0, with the limiter reaching
+// 0.002 on the pair so it is biting. BROKEN once, the pair left out of its budgets: 5.6e-01 on both.
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -417,6 +423,99 @@ int main(int argc, char** argv)
     check("the device's internal-face limiter is the host's", worstInt <= scalar(1e-12));
     check("...and its interface limiter is the host's",
           devIf.size() == hostIf.size() && worstIf <= scalar(1e-12));
+
+    // ---- CMULES's LIMITER on a periodic mesh -------------------------------------------------------
+    // The corrected path is not the explicit one with a flag (device_mules.cuh, notes A to D): there is
+    // no donor flux, the budget is measured against psi as it stands, and a COUPLED face is limited
+    // whichever way its flux goes -- the inlet test an uncoupled face gets does not apply to it
+    // (CMULESTemplates.C:516). Everything else about the pair is the same: the neighbour cell's psi in
+    // the extrema, phiCorr in the budgets, this side's limiter on the face, then the sync.
+    {
+        SurfaceScalarField phiC, phiCorrC;
+        phiC.internal.assign(static_cast<std::size_t>(nIf), scalar(0));
+        phiCorrC.internal.assign(static_cast<std::size_t>(nIf), scalar(0));
+        phiC.boundary.resize(fvp.size());
+        phiCorrC.boundary.resize(fvp.size());
+        for (label f = 0; f < nIf; ++f)
+        {
+            phiC.internal[static_cast<std::size_t>(f)] = scalar(0.02)*std::sin(scalar(0.9)*scalar(f));
+            phiCorrC.internal[static_cast<std::size_t>(f)] = scalar(0.05)*std::cos(scalar(1.3)*scalar(f));
+        }
+        std::vector<scalar> ifCorr;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            phiC.boundary[pi].assign(static_cast<std::size_t>(fvp[pi].size), scalar(0));
+            phiCorrC.boundary[pi].assign(static_cast<std::size_t>(fvp[pi].size), scalar(0));
+        }
+        for (const CyclicInterface& c : cyclics)
+        {
+            for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+            {
+                const scalar v = scalar(0.06)*std::cos(scalar(0.8)*scalar(i) + scalar(c.patch));
+                phiCorrC.boundary[static_cast<std::size_t>(c.patch)][i] = v;
+                phiC.boundary[static_cast<std::size_t>(c.patch)][i] =
+                    scalar(0.02)*std::sin(scalar(1.1)*scalar(i) + scalar(c.patch));
+                ifCorr.push_back(v);
+            }
+        }
+
+        cpu::MULES::Limiter hostLam;
+        cpu::MULES::limiterCorr(hostLam, rDeltaT, psi, phiC, phiCorrC, hf, hc, m, g, fvp);
+
+        DeviceCyclic cycC = buildDeviceCyclic(cyclics, g, fvp);
+        std::vector<scalar> bndCorr;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                bndCorr.push_back(phiCorrC.boundary[pi][static_cast<std::size_t>(i)]);
+            }
+        }
+        DeviceBuffer<scalar> dPsiC2(psiCell), dPsiB2(bndPsiForGrad);
+        DeviceBuffer<scalar> dCorrInt(phiCorrC.internal), dCorrBnd(bndCorr), dCorrIf(ifCorr);
+        DeviceBuffer<int> dFix2(bndFixes), dFlag2(bndFlag);
+        DeviceMulesFields dfC;
+        DeviceMulesControls dcC;
+        dcC.nLimiterIter = hc.nLimiterIter;
+        DeviceBuffer<scalar> lamI, lamB, lamIf2;
+        // the boundary VOLUMETRIC flux the outlet test reads (note C)
+        std::vector<scalar> bndPhi;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                bndPhi.push_back(phiC.boundary[pi][static_cast<std::size_t>(i)]);
+            }
+        }
+        DeviceBuffer<scalar> dPhiBnd2(bndPhi);
+        deviceMulesLimiterCorr(dm, (int)nIf, (int)bndCorr.size(), rDeltaT, dPsiC2, dPsiB2, dFix2, dFlag2,
+                               dPhiBnd2, dCorrInt, dCorrBnd, dfC, dcC, lamI, lamB,
+                               &cycC, &dCorrIf, &lamIf2);
+        std::vector<scalar> dLamI, dLamIf;
+        lamI.copyTo(dLamI);
+        lamIf2.copyTo(dLamIf);
+
+        std::vector<scalar> hLamIf;
+        for (const CyclicInterface& c : cyclics)
+            for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+                hLamIf.push_back(hostLam.boundary[static_cast<std::size_t>(c.patch)][i]);
+        scalar wI = 0, wIf = 0, minLam = 1;
+        for (std::size_t f = 0; f < dLamI.size() && f < hostLam.internal.size(); ++f)
+            wI = std::fmax(wI, std::fabs(dLamI[f] - hostLam.internal[f]));
+        for (std::size_t j = 0; j < dLamIf.size() && j < hLamIf.size(); ++j)
+        {
+            wIf = std::fmax(wIf, std::fabs(dLamIf[j] - hLamIf[j]));
+            minLam = std::fmin(minLam, dLamIf[j]);
+        }
+        std::printf("  CMULES: vs the host internal %.4e, interface %.4e (lambda reaches %.4f on the "
+                    "pair)\n", (double)wI, (double)wIf, (double)minLam);
+        check("the device's CMULES limiter is the host's on the internal faces", wI <= scalar(1e-12));
+        check("...and on the pair", dLamIf.size() == hLamIf.size() && wIf <= scalar(1e-12));
+        check("...and it bites there, so the arm is not comparing two fields of ones",
+              minLam < scalar(0.999));
+    }
 
     // ---- THE EXPLICIT SOLVE on a periodic mesh ---------------------------------------------------
     // MULES::explicitSolve divides fvc::div(phiPsi), and fvc::div sums a COUPLED patch's flux into its

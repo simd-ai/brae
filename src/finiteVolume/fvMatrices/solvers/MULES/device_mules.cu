@@ -352,6 +352,11 @@ __global__ void setupCorrKernel(
     const scalar* __restrict__ psi,
     const scalar* __restrict__ psiBndValue,
     const scalar* __restrict__ phiCorr,  const scalar* __restrict__ phiCorrBnd,
+    // the pair, in none of the three lists above (device_mesh.cuh:41-44). CMULES has no donor flux
+    // (note B), so a coupled face brings its neighbour's psi to the extrema and its phiCorr to the
+    // budgets, and nothing else -- mules_cpp.cu:534-556, CMULESTemplates.C:327.
+    const label*  __restrict__ ifCellStart, const label* __restrict__ ifPerm,
+    const label*  __restrict__ ifNbrCell,   const scalar* __restrict__ ifPhiCorr,
     const scalar* __restrict__ V,
     const scalar* __restrict__ rho,
     const scalar* __restrict__ Sp,  const scalar* __restrict__ Su,
@@ -388,6 +393,20 @@ __global__ void setupCorrKernel(
         if (pc > scalar(0)) mSP += pc;
         else                sP  -= pc;
     }
+    if (ifCellStart)
+    {
+        for (int k = ifCellStart[c]; k < ifCellStart[c + 1]; ++k)
+        {
+            const int j = ifPerm[k];
+            const scalar pn = psi[ifNbrCell[j]];
+            mx = fmax(mx, pn);
+            mn = fmin(mn, pn);
+            const scalar pc = ifPhiCorr[j];
+            if (pc > scalar(0)) sP  += pc;
+            else                mSP -= pc;
+        }
+    }
+
     for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)
     {
         const int b = bndPerm[k];
@@ -433,6 +452,21 @@ __global__ void setupCorrKernel(
 // comment is "Limit outlet faces only" (CMULESTemplates.C:537-561). The threshold is SMALL*SMALL, not
 // zero, so a face whose flux is numerically nothing counts as an inlet and is left alone. Limiting an
 // inlet would throttle a prescribed inflow.
+// A COUPLED face is limited whichever way its flux goes -- the inlet test an uncoupled face gets
+// (total <= SMALL*SMALL) does not apply to it (CMULESTemplates.C:516, mules_cpp.cu:647-657).
+__global__ void iterIfFaceCorrKernel(
+    int n,
+    const label*  __restrict__ own,
+    const scalar* __restrict__ phiCorr,
+    const scalar* __restrict__ lambdam, const scalar* __restrict__ lambdap,
+    scalar* __restrict__ lambda)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    const int o = own[j];
+    lambda[j] = (phiCorr[j] > scalar(0)) ? fmin(lambda[j], lambdap[o]) : fmin(lambda[j], lambdam[o]);
+}
+
 __global__ void iterBoundaryCorrKernel(
     int nBf,
     const label*  __restrict__ bndCell,
@@ -711,9 +745,28 @@ void deviceMulesLimiterCorr(
     const DeviceMulesFields&     f,
     const DeviceMulesControls&   c,
     DeviceBuffer<scalar>&        lambdaInt,
-    DeviceBuffer<scalar>&        lambdaBnd)
+    DeviceBuffer<scalar>&        lambdaBnd,
+    const DeviceCyclic*          cyc,
+    const DeviceBuffer<scalar>*  phiCorrIf,
+    DeviceBuffer<scalar>*        lambdaIf)
 {
     const int nC = dm.nCells;
+
+    // the pair: all three together or none, as the explicit limiter has it
+    const int nIfC = (cyc && phiCorrIf && lambdaIf) ? cyc->n : 0;
+    if (cyc && cyc->n > 0 && nIfC == 0)
+    {
+        throw std::runtime_error(
+            "brae deviceMules (CMULES): a cyclic interface was given without its phiCorr and lambda. "
+            "A coupled face is limited whichever way its flux goes (CMULESTemplates.C:516); limiting "
+            "it with only some of them is not that.");
+    }
+    if (nIfC > 0)
+    {
+        lambdaIf->resize(static_cast<std::size_t>(nIfC));
+        fillKernel<<<nBlocks(nIfC), TPB>>>(lambdaIf->data(), nIfC, scalar(1));
+        ckM(cudaGetLastError(), "CMULES lambda init, interface");
+    }
 
     lambdaInt.resize(static_cast<std::size_t>(nInternalFaces));
     lambdaBnd.resize(static_cast<std::size_t>(nBoundaryFaces));
@@ -738,6 +791,8 @@ void deviceMulesLimiterCorr(
         dm.losort.data(), dm.losortStart.data(), dm.bndCellStart.data(), dm.bndPerm.data(),
         bndFlag.data(), bndFixesValue.data(),
         psi.data(), psiBndValue.data(), phiCorrInt.data(), phiCorrBnd.data(),
+        nIfC ? cyc->ifCellStart.data() : nullptr, nIfC ? cyc->ifPerm.data() : nullptr,
+        nIfC ? cyc->nbrCell.data() : nullptr,     nIfC ? phiCorrIf->data() : nullptr,
         dm.V.data(), f.rho, f.Sp, f.Su, f.psiMax, f.psiMin,
         rDeltaT, c.extremaCoeff, boundaryDelta, c.smoothLimiter,
         psiMaxn.data(), psiMinn.data(), sumPhip.data(), mSumPhim.data());
@@ -754,8 +809,8 @@ void deviceMulesLimiterCorr(
             bndFlag.data(), lambdaInt.data(), lambdaBnd.data(),
             phiCorrInt.data(), phiCorrBnd.data(),
             psiMaxn.data(), psiMinn.data(), sumPhip.data(), mSumPhim.data(),
-            // CMULES has no interface faces of its own yet -- the corrected path is a separate port
-            nullptr, nullptr, nullptr, nullptr,
+            nIfC ? cyc->ifCellStart.data() : nullptr, nIfC ? cyc->ifPerm.data() : nullptr,
+            nIfC ? lambdaIf->data() : nullptr, nIfC ? phiCorrIf->data() : nullptr,
             lambdam.data(), lambdap.data());
         ckM(cudaGetLastError(), "CMULES iteration, cells");
 
@@ -768,6 +823,19 @@ void deviceMulesLimiterCorr(
         }
         if (nBoundaryFaces > 0)
         {
+            if (nIfC > 0)
+            {
+                iterIfFaceCorrKernel<<<nBlocks(nIfC), TPB>>>(
+                    nIfC, cyc->ownCell.data(), phiCorrIf->data(),
+                    lambdam.data(), lambdap.data(), lambdaIf->data());
+                ckM(cudaGetLastError(), "CMULES iteration, interface face");
+                DeviceBuffer<scalar> snap(static_cast<std::size_t>(nIfC));
+                ckM(cudaMemcpy(snap.data(), lambdaIf->data(), sizeof(scalar)*nIfC,
+                               cudaMemcpyDeviceToDevice), "CMULES lambda snapshot");
+                syncIfLambdaKernel<<<nBlocks(nIfC), TPB>>>(
+                    nIfC, cyc->twin.data(), snap.data(), lambdaIf->data());
+                ckM(cudaGetLastError(), "CMULES sync, interface");
+            }
             iterBoundaryCorrKernel<<<nBlocks(nBoundaryFaces), TPB>>>(
                 nBoundaryFaces, dm.bndCell.data(), bndFlag.data(),
                 phiBnd.data(), phiCorrBnd.data(), lambdam.data(), lambdap.data(), lambdaBnd.data());

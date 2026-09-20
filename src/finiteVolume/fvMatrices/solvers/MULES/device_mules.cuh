@@ -180,7 +180,11 @@ void deviceMulesLimiterCorr(
     const DeviceMulesFields&     f,
     const DeviceMulesControls&   c,
     DeviceBuffer<scalar>&        lambdaInt,
-    DeviceBuffer<scalar>&        lambdaBnd);
+    DeviceBuffer<scalar>&        lambdaBnd,
+    // the pair, its phiCorr and its lambda -- a coupled face is limited whichever way its flux goes
+    const DeviceCyclic*          cyc = nullptr,
+    const DeviceBuffer<scalar>*  phiCorrIf = nullptr,
+    DeviceBuffer<scalar>*        lambdaIf = nullptr);
 
 // MULES::limitCorr: the limiter, then phiCorr *= lambda IN PLACE. No blended flux is formed -- there is
 // nothing to blend against, which is the shape difference B leaves behind.
