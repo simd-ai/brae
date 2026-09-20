@@ -24,16 +24,32 @@ struct DevicePorosity {
     scalar              fa[9] = {0,0,0,0,0,0,0,0,0};   // transformed alpha tensor
     scalar              fb[9] = {0,0,0,0,0,0,0,0,0};   // transformed beta  tensor
     scalar              rhoRef = 1.0;                  // fixedCoeff::correct: read only when the eqn is in force units
+    // THE FULL TENSOR FORM, for a rotated coordinateSystem and for an equation whose mu and rho are
+    // FIELDS. The vector d/f above hold the diagonal of an axis-aligned zone only, and the solvers that
+    // use them refuse a rotated system by name; interFoam cannot, because its one porosity tutorial
+    // (RAS/angledDuct) rotates e1 by 45 degrees, and its mu = rho*nu varies by a factor of 1000 across
+    // the interface. D and F are then the host Option's OWN transformed tensors, row-major, with no
+    // rescaling: the kernel is fvOptions_cpp.cu:502-537 transcribed.
+    bool                tensorForm = false;
+    scalar              dT[9] = {0,0,0,0,0,0,0,0,0};
+    scalar              fT[9] = {0,0,0,0,0,0,0,0,0};
 };
 
 // diag[c] += V*isoCd for the porous cells.  Call once (mDiag) before rAU.
+// muCell/rhoCell: the per-cell mu and rho of the TENSOR form (Cd = mu*D + rho*|U|*F). Null with
+// tensorForm reproduces the kinematic defaults OpenFOAM's incompressible instantiation has, mu = nu and
+// rho = 1 (fvOptions_cpp.cu:520-524).
 void deviceFvoPorosityDiag(const DevicePorosity& por, scalar nu, const DeviceBuffer<scalar>& V,
                            const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
-                           DeviceBuffer<scalar>& diag);
+                           DeviceBuffer<scalar>& diag,
+                           const DeviceBuffer<scalar>* muCell = nullptr,
+                           const DeviceBuffer<scalar>* rhoCell = nullptr);
 // relaxSrc[c] += V*(isoCd - c_comp)*U_comp for the porous cells (= the explicit -V*((Cd-I*isoCd).U)[comp]).
 void deviceFvoPorositySource(const DevicePorosity& por, int comp, scalar nu, const DeviceBuffer<scalar>& V,
                              const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
-                             DeviceBuffer<scalar>& src);
+                             DeviceBuffer<scalar>& src,
+                             const DeviceBuffer<scalar>* muCell = nullptr,
+                             const DeviceBuffer<scalar>* rhoCell = nullptr);
 
 // limitVelocity: clamp |U| <= max on the given cells (OF fv::limitVelocity::correct, U *= sqrt(max^2/|U|^2) where it
 // exceeds max, preserving direction).

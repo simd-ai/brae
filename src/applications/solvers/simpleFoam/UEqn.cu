@@ -333,9 +333,11 @@ void assembleUEqn(
 
     if (in.porosity && in.porosity->active)
     {
-        deviceFvoPorosityDiag(*in.porosity, in.nuLaminar, dm.V, Ux, Uy, Uz, M.diag);
+        deviceFvoPorosityDiag(*in.porosity, in.nuLaminar, dm.V, Ux, Uy, Uz, M.diag,
+                              in.porosityMu, in.porosityRho);
         for (int k = 0; k < 3; ++k)
-            deviceFvoPorositySource(*in.porosity, k, in.nuLaminar, dm.V, Ux, Uy, Uz, M.source[k]);
+            deviceFvoPorositySource(*in.porosity, k, in.nuLaminar, dm.V, Ux, Uy, Uz, M.source[k],
+                                    in.porosityMu, in.porosityRho);
     }
 
     // ---- fvm::ddt(rho, U), for a transient momentum equation --------------------------------

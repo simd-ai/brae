@@ -114,6 +114,10 @@ struct DeviceInterStepControls
     // MRF.makeRelative(phiHbyA) -- and the fourth, MRF.correctBoundaryVelocity(U) at UEqn.H:1, is the
     // driver's because it writes the HOST field the boundary snapshot is taken from.
     const std::vector<DeviceMRFZone>* mrf = nullptr;
+    // fvOptions' explicitPorositySource/DarcyForchheimer, built by the driver from the host's own
+    // OptionList (its transformed D and F tensors). Every other option type stays host-only and the
+    // driver refuses it by name.
+    const DevicePorosity* porosity = nullptr;
     DeviceInterAlphaControls  alpha;
     DeviceMulesControls       mules;
     // The alpha equation's per-step settings -- cAlpha, deltaN and the two flux schemes. The flux

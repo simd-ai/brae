@@ -306,7 +306,7 @@ int main(
                  : "...and so does switching it back on",
           dOffU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)) && dOffU.rel() > scalar(1e-3));
 
-    // THE DEVICE LOOP REFUSES, by name
+    // THE DEVICE LOOP RUNS IT, at the same bounds
     int nDev = 0;
     if (cudaGetDeviceCount(&nDev) != cudaSuccess)
     {
@@ -315,24 +315,39 @@ int main(
     }
     if (nDev <= 0)
     {
-        std::printf("  (no CUDA device: the device refusal is not exercised)\n");
+        std::printf("  (no CUDA device: the device arm is not exercised)\n");
     }
     else
     {
-        bool named = false;
-        try
-        {
-            InterFields dev;
-            runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
-        }
-        catch (const std::exception& e)
-        {
-            // with the option off the device loop meets the case's OTHER reason: a massFlowRate inlet it
-            // would freeze
-            named = std::string(e.what()).find(porous ? "porosity1" : "massFlowRate") != std::string::npos;
-            std::printf("  device: %s\n", e.what());
-        }
-        check("the device loop refuses the case, naming the option -- or, with it off, the massFlowRate inlet", named);
+        // fvOptions' explicitPorositySource/DarcyForchheimer in the device UEqn, and the massFlowRate
+        // inlet rebuilt from the mixture's boundary rho at every assembly -- the two the device loop
+        // refused. Both transcribed from the host arm's lines, and held to the host's OWN bounds.
+        InterFields dev;
+        const RunReport rd = runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
+        check("the device driver ran the same number of steps", rd.steps == nSteps);
+        // ...and the DEVICE's own p_rgh solves against OpenFOAM's log, as the host arm above is held:
+        // the case names GAMG with a GaussSeidel smoother and PCG with one on pcorr, so a substituted
+        // solver shows here before it shows in a field.
+        failures += brae::gatecheck::compareSolves("device", rd.pSolves, ofP, nSteps);
+        failures += brae::gatecheck::nonFinite("device alpha", dev.alpha1.internal);
+        failures += brae::gatecheck::nonFinite("device U", dev.U.internal);
+        const Diff eA = compare(dev.alpha1.internal, ofAlpha);
+        const Diff eP = compare(dev.p_rgh.internal, ofPrgh);
+        const Diff eU = compare(dev.U.internal, ofU);
+        const Diff eK = compare(dev.turbulence.k.internal, ofKf);
+        const Diff eE = compare(dev.turbulence.epsilon.internal, ofEf);
+        const Diff eN = compare(dev.turbulence.nut.internal, ofNut);
+        std::printf("  DEVICE vs OpenFOAM: alpha %.4e, p_rgh %.4e, U %.4e, k %.4e, epsilon %.4e, "
+                    "nut %.4e\n", (double)eA.linf, (double)eP.rel(), (double)eU.rel(), (double)eK.rel(),
+                    (double)eE.rel(), (double)eN.rel());
+        check("the DEVICE's alpha agrees with OpenFOAM's", eA.linf < B.alpha);
+        check("...its p_rgh", eP.rel() < B.prgh);
+        check("...its U", eU.rel() < B.U);
+        check("...its k", eK.rel() < B.k);
+        check("...its epsilon", eE.rel() < B.epsilon);
+        check("...and its nut", eN.rel() < B.nut);
+        check("the porosity moves OpenFOAM's own U far more than the DEVICE is from it",
+              dOffU.rel() > scalar(1000)*std::fmax(eU.rel(), scalar(1e-14)) && dOffU.rel() > scalar(1e-3));
     }
 
     std::printf("test_inter_angledduct_vs_openfoam: %d failures\n", failures);

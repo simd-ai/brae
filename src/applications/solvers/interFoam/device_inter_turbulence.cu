@@ -163,6 +163,38 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
         d.wallFaceOfBnd.copyFrom(wallFaceOfBnd);
     }
 
+    // The turbulent inlets, built exactly as rhoSimpleFoam's device arm builds them
+    // (rhoCreateFields.cu:478-500): the patch itself says which kind it is and what its coefficient is,
+    // so "no such patch" is told from "a coefficient that happens to be zero". Without these the device
+    // closure freezes both inlets at the case file's `value` where OpenFOAM recomputes them from U --
+    // MEASURED on RAS/angledDuct, whose inlet carries both: k 3.7e-01, epsilon 1.2e+00, U 9.0e-01
+    // against OpenFOAM, where the HOST closure in the same device loop is at round-off.
+    {
+        std::vector<label>  km(static_cast<std::size_t>(bndIdx), 0), em(static_cast<std::size_t>(bndIdx), 0);
+        std::vector<scalar> ki(static_cast<std::size_t>(bndIdx), scalar(0)), el(static_cast<std::size_t>(bndIdx), scalar(0));
+        label bi = 0;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const int  kk = t.k.boundary[pi]->turbulentInletKind();
+            const int  ek = second.boundary[pi]->turbulentInletKind();
+            const scalar kc = t.k.boundary[pi]->turbulentInletCoefficient();
+            const scalar ec = second.boundary[pi]->turbulentInletCoefficient();
+            for (label i = 0; i < patches[pi].size; ++i, ++bi)
+            {
+                if (bi >= bndIdx) break;
+                if (kk == 0) { km[static_cast<std::size_t>(bi)] = 1; ki[static_cast<std::size_t>(bi)] = kc; d.hasTurbulentInlet = true; }
+                if (ek == 1 || ek == 2) { em[static_cast<std::size_t>(bi)] = ek; el[static_cast<std::size_t>(bi)] = ec; d.hasTurbulentInlet = true; }
+            }
+        }
+        if (d.hasTurbulentInlet)
+        {
+            d.turbInletKMask.copyFrom(km);
+            d.turbInletEpsMask.copyFrom(em);
+            d.turbInletKInt.copyFrom(ki);
+            d.turbInletEpsLen.copyFrom(el);
+        }
+    }
+
     if (!t.variableDensity)
     {
         d.onesCell.copyFrom(std::vector<scalar>(static_cast<std::size_t>(m.nCells()), scalar(1)));
@@ -255,6 +287,21 @@ void deviceCorrectInterTurbulence(
         d.nutWallIn.resize(static_cast<std::size_t>(d.nWallFaces));
         deviceGatherWallNu(d.wallFaceOfBnd, *in.nuBnd, d.nuWall);
         deviceGatherWallNu(d.wallFaceOfBnd, d.nutBndIn, d.nutWallIn);
+        // THE WALL VELOCITY, refreshed here rather than kept from the build. The wall-function
+        // production reads (U_wall - U_cell)*deltaCoeffs, and the host closure takes U_wall from the
+        // patch's own values at every call (kEpsilon_cpp.cu:401). buildDeviceWallData snapshots it once,
+        // which is exact only while the wall's velocity never moves -- true of every noSlip wall, and
+        // false of a SLIP one. MEASURED on RAS/angledDuct, whose `porosityWall` is a 45-degree slip
+        // wall: epsilon 2.1e-02 against OpenFOAM with its worst cells on that patch, where the host
+        // closure in the same device loop is at round-off.
+        for (int k = 0; k < 3; ++k)
+        {
+            const DeviceBuffer<scalar>* Uk = (k == 0) ? in.Ux : (k == 1) ? in.Uy : in.Uz;
+            DeviceBuffer<scalar>& out = (k == 0) ? d.wall.wfUwx : (k == 1) ? d.wall.wfUwy : d.wall.wfUwz;
+            DeviceBuffer<scalar> ub;
+            deviceBCValue(dbU.comp[k], *Uk, ub);
+            deviceGatherWallNu(d.wallFaceOfBnd, ub, out);
+        }
     }
 
     if (t.model == cpu::interFoam::InterRasModel::KOmegaSST)
@@ -273,6 +320,15 @@ void deviceCorrectInterTurbulence(
         sin.rhoCell = &d.onesCell;
         sin.rhoBndFace = &d.onesBnd;
         sin.rhoOldCell = &d.onesCell;
+        // ...and its turbulent inlets, which kOmegaSST takes under the same names (kOmegaSST.cuh);
+        // the mask's 2 selects the frequency form, omega = sqrt(k)/(Cmu^0.25*L)
+        if (d.hasTurbulentInlet)
+        {
+            sin.turbInletKMask   = &d.turbInletKMask;
+            sin.turbInletKInt    = &d.turbInletKInt;
+            sin.turbInletOmegaMask = &d.turbInletEpsMask;
+            sin.turbInletOmegaLen  = &d.turbInletEpsLen;
+        }
         sin.rDeltaT = scalar(1) / in.deltaT;
         sin.nuCell = in.nu;
         sin.nuBndFace = in.nuBnd;
@@ -375,6 +431,16 @@ void deviceCorrectInterTurbulence(
     kin.correctedLaplacian = t.coeffs.correctedLaplacian;
     kin.snGradLimitCoeff = t.coeffs.snGradLimitCoeff;
     // the Final entries: the device loop runs one outer corrector, and that one is the final one
+    // The turbulent inlets, as rhoSimpleFoam's hook passes them (rhoTurbulenceHook.cu:128-136):
+    // passing null is not "no turbulent inlet", it is silently no turbulent inlet at all on a case whose
+    // 0/k asks for one.
+    if (d.hasTurbulentInlet)
+    {
+        kin.turbInletKMask   = &d.turbInletKMask;
+        kin.turbInletKInt    = &d.turbInletKInt;
+        kin.turbInletEpsMask = &d.turbInletEpsMask;
+        kin.turbInletEpsLen  = &d.turbInletEpsLen;
+    }
     kin.relaxEquationEps = t.epsRelaxFinal.on;
     kin.relaxEps = t.epsRelaxFinal.factor;
     kin.relaxEquationK = t.kRelaxFinal.on;

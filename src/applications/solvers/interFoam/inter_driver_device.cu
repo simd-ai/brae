@@ -94,14 +94,20 @@ RunReport runInterFoamDevice(
             "and nothing else; kEqn and its filter width are ported on the host (les_kEqn_cpp.cu, "
             "les_delta_cpp.cu) and gated there against OpenFOAM on LES/nozzleFlow2D.");
 
+    // fvOptions: the device UEqn applies explicitPorositySource/DarcyForchheimer, and nothing else. Each
+    // other type is refused BY ITS OWN NAME rather than by a blanket notice -- the mangroves pair, the
+    // constraints and the rest are host-only and gated there.
     for (const fvOptions::Option& o : f.fvOptions.options)
     {
         if (!o.active) continue;
+        const bool darcy = o.unsupported.empty()
+                        && (o.type == "explicitPorositySource")
+                        && !o.fixedCoeff;
+        if (darcy) continue;
         throw std::runtime_error(
             "brae interFoam (device): fvOptions has an active option `" + o.name + "` (" + o.type
-            + "). The host loop applies explicitPorositySource/DarcyForchheimer in UEqn (gated on "
-            "RAS/angledDuct); the device loop's UEqn applies no fvOption. Refused rather than run the "
-            "case without its resistance.");
+            + "). The device loop's UEqn applies explicitPorositySource/DarcyForchheimer only; the host "
+            "loop carries this one. Refused rather than run the case without it.");
     }
     // Two conditions the host loop rebuilds from the solution as it goes and the device loop, which
     // uploads patch values and refValues once, would freeze.
@@ -150,20 +156,19 @@ RunReport runInterFoamDevice(
             "(ddtScheme.C, fvcDdtPhiCoeff). The host loop adds it to phiHbyA (gated on RAS/weirOverflow); "
             "the device loop's pressure equation does not. Refused rather than run without the term.");
     }
-    // A flowRateInletVelocity is RECOMPUTED at every momentum assembly (the host loop has it,
-    // inter_driver_cpp.cu). The device loop uploads U's patch values once, so it is right only for the
-    // inlet that never changes: a constant VOLUMETRIC rate whose constructor already built the value.
+    // A flowRateInletVelocity is REBUILT at every momentum assembly, and the U-boundary hook below does
+    // that now, from the mixture's boundary rho, as the host driver does. What is still refused is a rate
+    // that is a Function1 of time, which this driver takes as one number for the whole run -- the patch
+    // itself throws on that (flowRateValue) -- and the variableHeight form, which reads the phase field.
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        const auto& ub = *f.U.boundary[pi];
-        if (!ub.isFlowRateInlet()) continue;
-        if (!ub.flowRateIsMass() && !ub.flowRateHadValue()) continue;
+        const fvPatchField<vector>& ub = *f.U.boundary[pi];
+        if (!ub.isVariableHeightFlowRateInlet()) continue;
         throw std::runtime_error(
-            "brae interFoam (device): U patch `" + fvp[pi].name + "` is a flowRateInletVelocity given as "
-            + (ub.flowRateIsMass() ? std::string("a massFlowRate") : std::string("a volumetricFlowRate beside a `value`"))
-            + ". OpenFOAM recomputes it at every momentum assembly -- from the mixture's rho on the "
-            "patch for a mass rate, and over the file's `value` for either -- and the device loop "
-            "keeps the value it uploaded. Refused rather than run a frozen inlet.");
+            "brae interFoam (device): U patch `" + fvp[pi].name + "` is a "
+            "variableHeightFlowRateInletVelocity. OpenFOAM rebuilds it at every momentum assembly from "
+            "the phase fraction on the patch; the host loop does (gated on RAS/weirOverflow) and the "
+            "device loop keeps the value it uploaded. Refused rather than run a frozen inlet.");
     }
 
     // NOT ON THE DEVICE YET, refused rather than run on the mesh as it started or on a singular
@@ -433,6 +438,19 @@ RunReport runInterFoamDevice(
         updateWaveVelocity(f.waves, f.alpha1, f.U, stepTime, stepIndex, m, g, fvp);
         f.U.evaluateBoundary();
         updateVelocityPatches(f.U, fvp);
+        // U.boundaryFieldRef().updateCoeffs() for a flowRateInletVelocity, which the fvMatrix constructor
+        // runs at every momentum assembly (fvMatrix.C:396): the rate at THIS time and, for a
+        // massFlowRate, the field named `rho` on the patch, which in interFoam is the mixture's
+        // (flowRateInletVelocity...C:201-237). The host driver does exactly this
+        // (inter_driver_cpp.cu:715-720) and f.rhoBnd is the same blended boundary rho the device step
+        // wrote; without it the inlet keeps the file's `value`, which on RAS/angledDuct is (0 0 0).
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (f.U.boundary[pi]->isFlowRateInlet())
+            {
+                f.U.boundary[pi]->updateFromDensity(f.rhoBnd[pi], stepTime);
+            }
+        }
         // MRF.correctBoundaryVelocity(U), UEqn.H:1, where the host driver has it
         // (inter_driver_cpp.cu:741-745): it overwrites U's values on the INCLUDED patches with the frame
         // velocity Omega x (Cf - origin) (MRFZone.C:499-526), so it has to run on the HOST field the
@@ -622,6 +640,39 @@ RunReport runInterFoamDevice(
     // a second face classification (device_MRF.cuh). The geometry is static and Omega constant, so the
     // per-face frame flux is precomputed once here. Three of interFoam's four MRF calls are the step's
     // (DDt, zeroFilter, makeRelative); the fourth is in the U-boundary hook above.
+    // fvOptions' porosity on the device, built from the HOST OptionList's own transformed tensors so
+    // there is no second reading of the dictionary and no second coordinate transform. RAS/angledDuct
+    // rotates e1 by 45 degrees, so D and F have off-diagonal entries and the diagonal d/f form the other
+    // device solvers use (and refuse a rotated system for) cannot carry them.
+    DevicePorosity dPorosity;
+    for (const fvOptions::Option& o : f.fvOptions.options)
+    {
+        if (!o.active || !o.unsupported.empty() || o.fixedCoeff) continue;
+        if (o.type != "explicitPorositySource") continue;
+        if (dPorosity.active)
+        {
+            throw std::runtime_error(
+                "brae interFoam (device): more than one active explicitPorositySource. The device step "
+                "carries one zone. The host loop carries them all.");
+        }
+        std::vector<label> cells = o.cells;
+        if (o.allCells)
+        {
+            cells.resize(static_cast<std::size_t>(m.nCells()));
+            for (label c = 0; c < m.nCells(); ++c) cells[static_cast<std::size_t>(c)] = c;
+        }
+        dPorosity.active = true;
+        dPorosity.tensorForm = true;
+        dPorosity.cells.copyFrom(cells);
+        const scalar* D = &o.D.xx;
+        const scalar* F = &o.F.xx;
+        for (int k = 0; k < 9; ++k)
+        {
+            dPorosity.dT[k] = D[k];
+            dPorosity.fT[k] = F[k];
+        }
+    }
+
     std::vector<DeviceMRFZone> dMrf;
     for (const cpu::MRF::Zone& z : f.mrfZones)
     {
@@ -711,6 +762,7 @@ RunReport runInterFoamDevice(
     C.divSchemeCoeff = f.divRhoPhiUCoeff;
     C.nCorrectors = static_cast<int>(f.pimple.nCorrectors);
     C.mrf = f.mrfZones.empty() ? nullptr : &dMrf;
+    C.porosity = dPorosity.active ? &dPorosity : nullptr;
     // p_rgh's reference, where the host driver sets it (inter_driver_cpp.cu:779-781). These three were
     // dead for as long as the device refused a case that needs one, and a step that never pins leaves the
     // singular system's level to the solver: MEASURED on laminar/mixerVessel2D before they were set, a

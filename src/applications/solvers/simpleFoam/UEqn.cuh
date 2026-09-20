@@ -128,6 +128,11 @@ struct MomentumInput
     // explicitPorositySource/DarcyForchheimer, evaluated on the device each iteration from the current U.
     // nuLaminar, not nuEff: DarcyForchheimer.C looks up the field NAMED "nu".
     const DevicePorosity* porosity = nullptr;
+    // ...and its mu and rho as FIELDS, for an equation in force units whose mixture varies by cell:
+    // Cd = mu*D + rho*|U|*F with mu = rho*nu_laminar (DarcyForchheimer.C:214-217). Null keeps the
+    // kinematic defaults, mu = nuLaminar and rho = 1.
+    const DeviceBuffer<scalar>* porosityMu = nullptr;
+    const DeviceBuffer<scalar>* porosityRho = nullptr;
     // rotorDiskSource. OF addSup is `eqn -= force` with force PER VOLUME, and operator-= is
     // source += V*su, so the extensive source GAINS the raw force. See rotorDiskSource_cpp.cuh.
     const DeviceRotorDisk* rotor = nullptr;

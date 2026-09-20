@@ -147,6 +147,14 @@ void deviceInterStep(
     // deltaCoeffs*(rho_b - rho_cell), and rho_b is this.
     DeviceBuffer<scalar> stf, snGradRho, nuEffCell, nuEffBnd, snGradPrgh;
     hooks.interfaceForces(alpha1, K, rho, rhoBnd, stf, snGradRho, nuEffCell, nuEffBnd, snGradPrgh);
+    // THE MIXTURE'S LAMINAR nu, kept before nut is added to it: fvOptions(rho, U)'s DarcyForchheimer
+    // takes mu = rho*nu and NOT rho*nuEff (DarcyForchheimer.C:214-217 looks the field named "nu" up),
+    // which is the host arm's own refusal if it is handed the wrong one (inter_ueqn_cpp.cu:246-250).
+    DeviceBuffer<scalar> nuLamCell;
+    if (ctl.porosity)
+    {
+        deviceCopy(nuLamCell, nuEffCell);
+    }
     // nuEff = nut + nu where the closure is the device's -- see DeviceInterStepControls::nutCell
     if (ctl.nutCell || ctl.nutBnd)
     {
@@ -179,6 +187,13 @@ void deviceInterStep(
     // so without this the patch is a wall at the inlet value for the whole run.
     deviceUpdateInletOutlet(dbU, phiBnd);
     deviceUpdatePressureInletOutletVelocity(dbU, phiBnd, UX, UY, UZ, /*directionMixed=*/true);
+    // ...and symmetry's, which is the same sequence's third step (rhoUEqn.cuh:76-78): a symmetry or slip
+    // patch's refValue is U - n(n & U) at THIS iteration's cell velocity, and the builder seeded it from
+    // the host field's last evaluate. MEASURED on RAS/angledDuct, whose `porosityWall` is a slip patch
+    // tilted 45 degrees, with the HOST closure in the device loop and the porosity off so neither can be
+    // the cause: U 2.7e-02 against OpenFOAM where the host loop is 4.1e-15, and that patch the only one
+    // whose values differed from the host's.
+    deviceUpdateSymmetry(dbU, UX, UY, UZ);
 
     DeviceBuffer<scalar> muCell, muFace, muBndFace;
     deviceInterMuEff(dm, rho, nuEffCell, rhoBnd, nuEffBnd, muCell, muFace, muBndFace);
@@ -225,6 +240,17 @@ void deviceInterStep(
     // + MRF.DDt(rho, U), UEqn.H:6, rho-weighted as MRFZoneList::DDt(rho, U) is (MRFZoneList.C:210-217)
     // and as the host arm forms it (inter_ueqn_cpp.cu:207-221). The shared assembler puts it in the
     // source before relax, which is where the fvMatrix expression has it.
+    // == fvOptions(rho, U), UEqn.H:9, in the source and diagonal before relax -- the slot the host arm
+    // puts it in (inter_ueqn_cpp.cu:245-260). mu is the mixture's rho*nu, formed per cell here because
+    // it spans three orders across the interface.
+    DeviceBuffer<scalar> porMu;
+    if (ctl.porosity)
+    {
+        deviceHadamard(porMu, rho, nuLamCell);
+        uin.porosity    = ctl.porosity;
+        uin.porosityMu  = &porMu;
+        uin.porosityRho = &rho;
+    }
     uin.mrf    = ctl.mrf;
     uin.mrfRho = ctl.mrf ? &rho : nullptr;
 
@@ -311,6 +337,7 @@ void deviceInterStep(
         hooks.updateUBoundary(UX, UY, UZ, dbU, ub);
         deviceUpdateInletOutlet(dbU, phiBnd);
         deviceUpdatePressureInletOutletVelocity(dbU, phiBnd, UX, UY, UZ, /*directionMixed=*/true);
+        deviceUpdateSymmetry(dbU, UX, UY, UZ);
         (void)A;
     }
 
@@ -424,6 +451,7 @@ void deviceInterStep(
         hooks.updateUBoundary(UX, UY, UZ, dbU, ub);
         deviceUpdateInletOutlet(dbU, phiBnd);
         deviceUpdatePressureInletOutletVelocity(dbU, phiBnd, UX, UY, UZ, /*directionMixed=*/true);
+        deviceUpdateSymmetry(dbU, UX, UY, UZ);
     }
     probe("p_rgh", p_rgh);
     probe("phi", phiInt);

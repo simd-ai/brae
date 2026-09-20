@@ -251,6 +251,76 @@ void porSrcKernel(
     const scalar Uc    = ((comp==0)?Ux:(comp==1)?Uy:Uz)[c];
     src[c] += V[c]*(iso - ccomp)*Uc;                                   // -= V*((Cd-I*iso).U)[comp]
 }
+// THE FULL TENSOR FORM, transcribed from the host's own loop (fvOptions_cpp.cu:502-537): Cd = mu*D +
+// (rho*|U|)*F per component, the isotropic trace into the diagonal and the off-isotropic remainder into
+// the source, with mu and rho read per cell where the caller has them.
+__device__ inline void cdTensor(
+    const scalar* __restrict__ dT,
+    const scalar* __restrict__ fT,
+    scalar muc,
+    scalar rhoc,
+    scalar magU,
+    scalar* cd)
+{
+    for (int k = 0; k < 9; ++k) cd[k] = muc * dT[k] + rhoc * magU * fT[k];
+}
+
+__global__
+void porTensorDiagKernel(
+    int n,
+    const label* __restrict__ cells,
+    const scalar* __restrict__ dT,
+    const scalar* __restrict__ fT,
+    scalar nu,
+    const scalar* __restrict__ muCell,
+    const scalar* __restrict__ rhoCell,
+    const scalar* __restrict__ V,
+    const scalar* __restrict__ Ux,
+    const scalar* __restrict__ Uy,
+    const scalar* __restrict__ Uz,
+    scalar* __restrict__ diag)
+{
+    const int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i >= n) return;
+    const int c = cells[i];
+    const scalar magU = sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);
+    scalar cd[9];
+    cdTensor(dT, fT, muCell ? muCell[c] : nu, rhoCell ? rhoCell[c] : scalar(1), magU, cd);
+    diag[c] += V[c]*(cd[0] + cd[4] + cd[8]);
+}
+
+__global__
+void porTensorSrcKernel(
+    int n,
+    const label* __restrict__ cells,
+    int comp,
+    const scalar* __restrict__ dT,
+    const scalar* __restrict__ fT,
+    scalar nu,
+    const scalar* __restrict__ muCell,
+    const scalar* __restrict__ rhoCell,
+    const scalar* __restrict__ V,
+    const scalar* __restrict__ Ux,
+    const scalar* __restrict__ Uy,
+    const scalar* __restrict__ Uz,
+    scalar* __restrict__ src)
+{
+    const int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i >= n) return;
+    const int c = cells[i];
+    const scalar magU = sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);
+    scalar cd[9];
+    cdTensor(dT, fT, muCell ? muCell[c] : nu, rhoCell ? rhoCell[c] : scalar(1), magU, cd);
+    const scalar iso = cd[0] + cd[4] + cd[8];
+    scalar a[9];
+    for (int k = 0; k < 9; ++k) a[k] = cd[k];
+    a[0] -= iso; a[4] -= iso; a[8] -= iso;
+    const int r = 3*comp;
+    // the host writes `source -= V*(a & u)`; this buffer is the NEGATED source the caller adds, as the
+    // diagonal form above has it (src[c] += V*(iso - ccomp)*Uc is the same sign convention)
+    src[c] -= V[c]*(a[r]*Ux[c] + a[r+1]*Uy[c] + a[r+2]*Uz[c]);
+}
+
 } // namespace
 
 
@@ -261,10 +331,24 @@ void deviceFvoPorosityDiag(
     const DeviceBuffer<scalar>& Ux,
     const DeviceBuffer<scalar>& Uy,
     const DeviceBuffer<scalar>& Uz,
-    DeviceBuffer<scalar>& diag)
+    DeviceBuffer<scalar>& diag,
+    const DeviceBuffer<scalar>* muCell,
+    const DeviceBuffer<scalar>* rhoCell)
 {
     const int n = static_cast<int>(por.cells.size());
     if (!por.active || !n) return;
+    if (por.tensorForm)
+    {
+        DeviceBuffer<scalar> dT, fT;
+        dT.copyFrom(std::vector<scalar>(por.dT, por.dT+9));
+        fT.copyFrom(std::vector<scalar>(por.fT, por.fT+9));
+        porTensorDiagKernel<<<nBlocks(n), TPB>>>(n, por.cells.data(), dT.data(), fT.data(), nu,
+                                                 muCell ? muCell->data() : nullptr,
+                                                 rhoCell ? rhoCell->data() : nullptr,
+                                                 V.data(), Ux.data(), Uy.data(), Uz.data(), diag.data());
+        cudaCheck(cudaGetLastError(), "porosityTensorDiag");
+        return;
+    }
     if (por.fixed)
     {
         DeviceBuffer<scalar> a, b; a.copyFrom(std::vector<scalar>(por.fa, por.fa+9)); b.copyFrom(std::vector<scalar>(por.fb, por.fb+9));
@@ -287,10 +371,24 @@ void deviceFvoPorositySource(
     const DeviceBuffer<scalar>& Ux,
     const DeviceBuffer<scalar>& Uy,
     const DeviceBuffer<scalar>& Uz,
-    DeviceBuffer<scalar>& src)
+    DeviceBuffer<scalar>& src,
+    const DeviceBuffer<scalar>* muCell,
+    const DeviceBuffer<scalar>* rhoCell)
 {
     const int n = static_cast<int>(por.cells.size());
     if (!por.active || !n) return;
+    if (por.tensorForm)
+    {
+        DeviceBuffer<scalar> dT, fT;
+        dT.copyFrom(std::vector<scalar>(por.dT, por.dT+9));
+        fT.copyFrom(std::vector<scalar>(por.fT, por.fT+9));
+        porTensorSrcKernel<<<nBlocks(n), TPB>>>(n, por.cells.data(), comp, dT.data(), fT.data(), nu,
+                                                muCell ? muCell->data() : nullptr,
+                                                rhoCell ? rhoCell->data() : nullptr,
+                                                V.data(), Ux.data(), Uy.data(), Uz.data(), src.data());
+        cudaCheck(cudaGetLastError(), "porosityTensorSource");
+        return;
+    }
     if (por.fixed)
     {
         DeviceBuffer<scalar> a, b; a.copyFrom(std::vector<scalar>(por.fa, por.fa+9)); b.copyFrom(std::vector<scalar>(por.fb, por.fb+9));

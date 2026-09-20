@@ -50,6 +50,31 @@
 # NOT CLAIMED, each refused by name: every other fvOption type, explicitPorositySource's fixedCoeff
 # model, an fvOption under a moving mesh or beside an MRF zone, and the device loop; the scalarTransport
 # function object `s`, which brae does not run.
+# THE DEVICE LOOP RUNS ALL THREE ARMS NOW, at the same bounds: inactive alpha 6.1e-16, p_rgh 4.3e-15,
+# U 7.6e-15; porous (as shipped) 1.1e-14, 1.3e-11, 1.8e-11; porousWater 5.9e-13, 2.9e-12, 2.6e-12 -- and
+# all 30 of its own p_rgh solves take OpenFOAM's iteration counts in every arm. Getting there took one
+# module and FOUR defects, each localised by running the HOST closure inside the device loop to say
+# whether the loop or the closure owned it, and each fixed by transcribing the host arm's own lines:
+#   fvOptions' explicitPorositySource on the device (the module): the full transformed D and F tensors,
+#   because this case rotates e1 by 45 degrees, and mu as a FIELD (rho*nu_laminar, three orders across
+#   the interface). Dropped: p_rgh 7.9e-01, U 2.3e-01. Handed the kinematic nu instead of rho*nu: the
+#   same, since the case's F is zero and its nuLaminar scalar is not the mixture's.
+#   the massFlowRate inlet never rebuilt on the device (fvMatrix.C:396 runs updateCoeffs at every
+#   assembly; inter_driver_cpp.cu:715-720 is the host's): U 1.0007e+00, a frozen (0 0 0) inlet.
+#   the SLIP wall's symmetry refValue never refreshed against this iteration's cells -- the third step of
+#   rhoSimpleFoam's own pre-assembly sequence (rhoUEqn.cuh:76-78), missing from interFoam's: U 2.7e-02
+#   with the host closure and the porosity off, where the host loop is 4.1e-15.
+#   the TURBULENT INLETS frozen at the file's `value`: this inlet carries both
+#   turbulentIntensityKineticEnergyInlet and turbulentMixingLengthDissipationRateInlet, which OpenFOAM
+#   recomputes from U at every updateCoeffs, and interFoam never handed the device closure their masks
+#   (rhoCreateFields.cu:478-500 builds them): U 1.3e+00, k 1.1e+00, epsilon 4.7e+00.
+#   the WALL VELOCITY kept from the closure's build: the wall-function production reads
+#   (U_wall - U_cell)*deltaCoeffs and the host reads U_wall live (kEpsilon_cpp.cu:401). Exact for every
+#   noSlip wall, wrong for a slip one: epsilon 1.5e-02, with its worst cells on `porosityWall`.
+# THE LAST TWO ARE NOT interFoam's ALONE -- they are the shared device closure's wiring and the shared
+# wall data. Every other gated case has only noSlip walls and un-recomputed inlets, which is why this
+# fixture is the one that shows them.
+#
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_angledduct_vs_openfoam"

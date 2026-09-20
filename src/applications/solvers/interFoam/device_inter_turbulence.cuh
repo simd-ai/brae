@@ -90,6 +90,14 @@ struct DeviceInterTurbulence
     DeviceBuffer<label> nutEvalMask;
     int nutEvalFaces = 0;
 
+    // The TURBULENT INLETS, which OpenFOAM recomputes at every updateCoeffs from U's current patch
+    // values: turbulentIntensityKineticEnergyInlet (k = 1.5*(I*|U|)^2) and the mixing-length pair
+    // (epsilon = Cmu^0.75*k^1.5/L, omega = sqrt(k)/(Cmu^0.25*L)). The mask CARRIES the kind, as
+    // rhoCreateFields.cu:478-495 builds it: 1 = epsilon, 2 = omega.
+    DeviceBuffer<label>  turbInletKMask, turbInletEpsMask;
+    DeviceBuffer<scalar> turbInletKInt,  turbInletEpsLen;
+    bool hasTurbulentInlet = false;
+
     // per-step scratch
     DeviceBuffer<scalar> nuWall;
     DeviceBuffer<scalar> nutBndIn;
