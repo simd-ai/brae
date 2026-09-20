@@ -224,6 +224,10 @@ void deviceCyclicOffDiagSum(const DeviceCyclic& cyc, DeviceBuffer<scalar>& sumOf
 // cyclic-face flux of an interpolated vector field: phi[j] = (w*Hx[own]+(1-w)*Hx[nbr])*Sfx + (y,z).
 void deviceCyclicFlux(DeviceCyclic& cyc, const DeviceBuffer<scalar>& Hx, const DeviceBuffer<scalar>& Hy,
                       const DeviceBuffer<scalar>& Hz);
+// ...into a caller's array rather than into cyc.phi. phiHbyA is not the pair's flux: phi there is state
+// the correctors rewrite, and computing phiHbyA over it would lose the flux the step began with.
+void deviceCyclicFluxTo(DeviceCyclic& cyc, const DeviceBuffer<scalar>& Hx, const DeviceBuffer<scalar>& Hy,
+                        const DeviceBuffer<scalar>& Hz, DeviceBuffer<scalar>& out);
 
 // ROTATIONAL (Phase 1), only the VECTOR (U/HbyA) couplings differ; scalars use the functions above
 // fill the per-component implicit off-diagonal ifCoeffC[kk] = ifCoeff * forwardT[kk][kk] (call after AssembleMomentum).

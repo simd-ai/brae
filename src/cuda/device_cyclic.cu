@@ -490,16 +490,28 @@ void deviceCyclicOffDiagSum(const DeviceCyclic& cyc, DeviceBuffer<scalar>& sumOf
 }
 
 
+void deviceCyclicFluxTo(
+    DeviceCyclic& cyc,
+    const DeviceBuffer<scalar>& Hx,
+    const DeviceBuffer<scalar>& Hy,
+    const DeviceBuffer<scalar>& Hz,
+    DeviceBuffer<scalar>& out)
+{
+    if (cyc.n == 0) { out.resize(0); return; }
+    out.resize(static_cast<std::size_t>(cyc.n));
+    fluxKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.weights.data(),
+        Hx.data(), Hy.data(), Hz.data(), cyc.Sfx.data(), cyc.Sfy.data(), cyc.Sfz.data(), out.data());
+    cudaCheck(cudaGetLastError(), "cyclicFlux");
+}
+
+
 void deviceCyclicFlux(
     DeviceCyclic& cyc,
     const DeviceBuffer<scalar>& Hx,
     const DeviceBuffer<scalar>& Hy,
     const DeviceBuffer<scalar>& Hz)
 {
-    if (cyc.n == 0) return;
-    fluxKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.weights.data(),
-        Hx.data(), Hy.data(), Hz.data(), cyc.Sfx.data(), cyc.Sfy.data(), cyc.Sfz.data(), cyc.phi.data());
-    cudaCheck(cudaGetLastError(), "cyclicFlux");
+    deviceCyclicFluxTo(cyc, Hx, Hy, Hz, cyc.phi);
 }
 
 

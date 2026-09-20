@@ -377,6 +377,7 @@ void deviceInterStep(
                 "brae interFoam device step: constrainHbyA needs the per-face `assignable` mask. "
                 "assignable() is NOT fixesValue() -- see DeviceInterStepControls.");
         pin.takeUAtBoundary = ctl.takeUAtBoundary;
+        pin.cyc = ctl.cyc;
         for (int k = 0; k < 3; ++k) pin.solutionD[k] = ctl.solutionD[k];
         gpu::pressurePredictor(st, dm, dbU, UEqn, UX, UY, UZ, pin, nullptr, nullptr);
         probe("rAU", st.rAU);
@@ -428,6 +429,7 @@ void deviceInterStep(
         pi.bndUFixesValue = &bndUFixesValue;
         pi.mrf = ctl.mrf;
         pi.cyc = ctl.cyc;
+        pi.phiHbyAIf = (ctl.cyc && ctl.cyc->n > 0) ? &st.phiHbyAIf : nullptr;
         pi.needReference = ctl.needReference;
         pi.pRefCell = ctl.pRefCell;
         pi.pRefValue = ctl.pRefValue;

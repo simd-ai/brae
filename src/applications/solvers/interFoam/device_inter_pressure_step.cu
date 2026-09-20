@@ -247,6 +247,17 @@ scalar deviceInterPressureStep(
         ckS(cudaMemcpy(rAUfBnd.data(), in.rAUfAll->data() + nIf, sizeof(scalar)*nBf,
                        cudaMemcpyDeviceToDevice), "rAUf, boundary");
     }
+    // ...and on the PAIR: phi = phiHbyA - p_rghEqn.flux(), the same line, with the flux the solved
+    // pressure leaves there (gated in tests/test_device_inter_peqn_cyclic_vs_host.cu). cyc->phi is the
+    // pair's flux for everything downstream -- the alpha step reads it as phiCN -- so this is where it
+    // is rewritten, exactly as phiInt and phiBnd are above.
+    if (in.cyc && in.cyc->n > 0 && in.phiHbyAIf)
+    {
+        ckS(cudaMemcpy(in.cyc->phi.data(), in.phiHbyAIf->data(),
+                       sizeof(scalar)*in.cyc->n, cudaMemcpyDeviceToDevice), "phi = phiHbyA, interface");
+        deviceCyclicCorrectFlux(*in.cyc, p_rgh);
+    }
+
     deviceCorrectVelocity(dm, HbyAX, HbyAY, HbyAZ, rAU, ffInt, rAUfInt, ffBnd, rAUfBnd, UX, UY, UZ);
 
     // p = p_rgh + rho*gh, rebuilt from the SOLVED p_rgh and never carried.
