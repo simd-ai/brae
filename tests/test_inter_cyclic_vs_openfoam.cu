@@ -220,9 +220,10 @@ int main(
           cA.linf > scalar(1000)*std::fmax(dA.linf, scalar(1e-16)));
     check("...and its U", cU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-16)));
 
-    // THE DEVICE LOOP REFUSES, by name. Its pressure corrector carries neither phig nor its share of
-    // fvc::reconstruct on the pair's faces: MEASURED on this fixture with everything else wired, the
-    // device reached a Courant number of 2.68 at step two where OpenFOAM and this host run read 0.05.
+    // THE DEVICE LOOP REFUSES, by name. Its pressure corrector DOES carry the pair now -- at step one
+    // the two arms agree to 1.3e-10 in U and 6.1e-06 of 1.6e+03 in p_rgh, with phig on the pair exact
+    // to 5.6e-17 -- but its ALPHA step does not, from the second step on: alpha 7.8e-02 from the host,
+    // all of it in the pair's own cells.
     int nDev = 0;
     if (cudaGetDeviceCount(&nDev) != cudaSuccess)
     {
@@ -245,10 +246,10 @@ int main(
         {
             const std::string w(e.what());
             named = w.find("coupled pair") != std::string::npos
-                 && w.find("reconstruct") != std::string::npos;
+                 && w.find("ALPHA step") != std::string::npos;
             std::printf("  device: %s\n", e.what());
         }
-        check("the device loop refuses the pair and names what it does not carry", named);
+        check("the device loop refuses the pair and names the stage that does not carry it", named);
     }
 
     std::printf("test_inter_cyclic_vs_openfoam: %d failures\n", failures);

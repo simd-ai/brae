@@ -254,6 +254,11 @@ struct PressureTaps
     std::vector<scalar> phiHbyA;
     std::vector<scalar> stf;
     std::vector<scalar> snGradRho;
+    // ...and the pair's halves, per patch, for comparing the two arms across a coupled face
+    std::vector<std::vector<scalar>> phigBnd;
+    std::vector<std::vector<scalar>> rAUfBnd;
+    // (phig - p_rghEqn.flux()) per patch, the reconstruction's own input
+    std::vector<std::vector<scalar>> ffBnd;
 };
 
 // One p_rgh solve as the solver itself reports it -- see inter_solve_record.cuh.

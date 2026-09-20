@@ -28,6 +28,7 @@
 #include "cf_types.cuh"
 #include "inter_case_cpp.cuh"
 #include "inter_peqn_cpp.cuh"
+#include "device_inter_step.cuh"
 #include <string>
 
 namespace brae {
@@ -145,7 +146,10 @@ RunReport runInterFoamDevice(
     label nSteps,
     bool verbose = true,
     InterFields* fieldsOut = nullptr,
-    scalar endTime = scalar(1.0e300));
+    scalar endTime = scalar(1.0e300),
+    // The step's intermediates, for a gate comparing the two arms stage by stage. Null in every
+    // production run; the LAST step's first corrector is what lands in it.
+    DeviceInterStepTaps* tapsOut = nullptr);
 
 } // namespace interFoam
 } // namespace cpu

@@ -131,7 +131,9 @@ void pressurePredictor(
         // HbyA is rAU*H and not rAU applied to a half-built H.
         if (in.cyc && in.cyc->n > 0)
         {
-            deviceCyclicAddH(*in.cyc, *U[k], dm.V, Hk);
+            // ...with the MOMENTUM matrix's own interface coefficient: cyc.ifCoeff has held the
+            // pressure laplacian's since the last corrector assembled it (MomentumMatrix::cycIfCoeff).
+            deviceCyclicAddH(*in.cyc, *U[k], dm.V, Hk, &UEqn.cycIfCoeff);
         }
         deviceHadamard(st.HbyA[k], st.rAU, Hk);
     }

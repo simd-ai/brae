@@ -52,6 +52,13 @@ struct MomentumMatrix
     // reference adds (diag - D0)*psi to the source, and having it explicitly makes that step checkable.
     DeviceBuffer<scalar> relaxedDiag, delta;
     bool relaxed = false;
+    // THE PAIR'S OFF-DIAGONAL, KEPT WITH THE MATRIX IT BELONGS TO. DeviceCyclic::ifCoeff is ONE array
+    // and every assembly overwrites it, so after the pressure laplacian has been assembled the pair
+    // carries the PRESSURE coefficient. fvMatrix::H() is the momentum matrix's and needs the
+    // momentum one. MEASURED on validation/interFoamCyclic: with nCorrectors 1 the two arms agree to
+    // 5.6e-11 in U, and from the SECOND corrector -- the first whose H sees a non-zero U across the
+    // pair -- to 6.9e-03, because H was weighted by p_rgh's coefficient.
+    DeviceBuffer<scalar> cycIfCoeff;
 
     DeviceLduView view(const DeviceMesh& dm) const
     {
@@ -139,6 +146,10 @@ struct MomentumInput
     // flux before this is called. Null = a mesh with no pair, which is every case that had one before.
     DeviceCyclic* cyc = nullptr;
     bool cycCorrected = true;          // the diffusion half's delta coefficients, as the laplacian's
+    // ...and the flux the CONVECTION half uses on the pair, when it is not the pair's own phi.
+    // interFoam's UEqn is fvm::div(rhoPhi, U) and cyc.phi is the volumetric flux; see
+    // deviceCyclicAssembleMomentum. Null = cyc.phi, which is what an incompressible solver wants.
+    const DeviceBuffer<scalar>* cycConvFlux = nullptr;
     const DeviceBuffer<scalar>* porosityMu = nullptr;
     const DeviceBuffer<scalar>* porosityRho = nullptr;
     // rotorDiskSource. OF addSup is `eqn -= force` with force PER VOLUME, and operator-= is

@@ -627,6 +627,21 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
                          rAUfb, q.magSf, phigBnd[pi]);
             for (label i = 0; i < q.size; ++i) phiHbyA.boundary[pi][i] += phigBnd[pi][i];
         }
+        if (in.taps)
+        {
+            in.taps->phigBnd = phigBnd;
+            in.taps->rAUfBnd.assign(patches.size(), std::vector<scalar>());
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                const FvPatch& q = patches[pi];
+                in.taps->rAUfBnd[pi].resize(static_cast<std::size_t>(q.size));
+                for (label i = 0; i < q.size; ++i)
+                {
+                    in.taps->rAUfBnd[pi][static_cast<std::size_t>(i)] =
+                        q.coupled ? coupledLinear(q, i, rAU) : rAU[q.faceCells[i]];
+                }
+            }
+        }
     }
     else
     {
@@ -854,6 +869,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
                     ffB[pi][i] = phigBnd[pi][i] - pFlux.boundary[pi][i];
                 }
             }
+            if (in.taps) in.taps->ffBnd = ffB;
             correctVelocity(HbyA, rAU, faceFlux, rAUfField.internal, ffB, rB, m, g, patches, U.internal);
             U.evaluateBoundary();
 

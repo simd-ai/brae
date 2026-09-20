@@ -346,7 +346,11 @@ void assembleUEqn(
     // coefficient, because relax reads the diagonal it leaves.
     if (in.cyc && in.cyc->n > 0)
     {
-        deviceCyclicAssembleMomentum(*in.cyc, *in.nuEffCell, M.diag, nullptr, in.cycCorrected);
+        deviceCyclicAssembleMomentum(*in.cyc, *in.nuEffCell, M.diag, nullptr, in.cycCorrected,
+                                     in.cycConvFlux);
+        // ...and kept, because the next assembly on this pair overwrites cyc.ifCoeff -- see the note
+        // on MomentumMatrix::cycIfCoeff.
+        deviceCopy(M.cycIfCoeff, in.cyc->ifCoeff);
     }
 
     // ---- fvm::ddt(rho, U), for a transient momentum equation --------------------------------

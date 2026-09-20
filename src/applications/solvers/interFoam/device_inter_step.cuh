@@ -105,6 +105,10 @@ struct DeviceInterStepTaps
     DeviceBuffer<scalar> rAUfAllTap;
     DeviceBuffer<scalar> pSolved;         // p_rgh after the FIRST corrector's solve
     DeviceBuffer<scalar> ddtRhoOld;       // rho.oldTime(), the field the ddt source is built on
+    // phig, rAUf, phig-flux and the flux itself on the periodic pair. Unlike the matrix taps above
+    // these are taken on EVERY corrector, so they hold the LAST -- which is the state the host's own
+    // taps hold and the only one the two arms can be compared in.
+    DeviceBuffer<scalar> phigIf, rAUfIf, ffIf, phiIf;
 };
 
 struct DeviceInterStepControls
@@ -129,6 +133,13 @@ struct DeviceInterStepControls
     // both, because they outlive a step the way phi does.
     DeviceBuffer<scalar>* alphaPhiIf = nullptr;
     DeviceBuffer<scalar>* rhoPhiIf   = nullptr;
+    // ...and the three fields phig is built from ON THE PAIR. The device's face arrays exclude coupled
+    // patches (device_mesh.cuh:41-44), so these carry what the boundary half of stf, ghf and
+    // snGrad(rho) would otherwise hold there. The interfaceForces hook fills the first and the third
+    // -- they change with alpha every step -- and ghf is the mesh's, built once.
+    const DeviceBuffer<scalar>* stfIf       = nullptr;
+    const DeviceBuffer<scalar>* ghfIf       = nullptr;
+    const DeviceBuffer<scalar>* snGradRhoIf = nullptr;
     DeviceInterAlphaControls  alpha;
     DeviceMulesControls       mules;
     // The alpha equation's per-step settings -- cAlpha, deltaN and the two flux schemes. The flux

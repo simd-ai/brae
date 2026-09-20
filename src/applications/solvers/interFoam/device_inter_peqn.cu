@@ -375,9 +375,20 @@ void deviceCorrectVelocity(
     const DeviceBuffer<scalar>& rAUfBnd,
     DeviceBuffer<scalar>&       UX,
     DeviceBuffer<scalar>&       UY,
-    DeviceBuffer<scalar>&       UZ)
+    DeviceBuffer<scalar>&       UZ,
+    const DeviceCyclic*         cyc,
+    const DeviceBuffer<scalar>* faceFluxIf,
+    const DeviceBuffer<scalar>* rAUfIf)
 {
     const int nC = dm.nCells, nIf = dm.nInternalFaces, nBf = dm.nBndFaces;
+    const bool havePair = cyc && cyc->n > 0;
+    if (havePair && (!faceFluxIf || !rAUfIf))
+    {
+        throw std::runtime_error(
+            "brae interFoam device pEqn: the mesh has a periodic pair and its (phig - flux) or its rAUf "
+            "was not handed to the velocity correction. fvc::reconstruct sums a coupled face like any "
+            "other patch face, so leaving it out gives a different U in every cell the pair touches.");
+    }
 
     // (phig - flux)/rAUf, face by face, BEFORE the reconstruction. The division here and the
     // multiplication by rAU below do not cancel on a non-uniform rAU.
@@ -393,8 +404,18 @@ void deviceCorrectVelocity(
         ckP(cudaGetLastError(), "faceFlux/rAUf, boundary");
     }
 
+    // ...and the pair's, the same divide on its own faces
+    DeviceBuffer<scalar> ssfIf;
+    if (havePair)
+    {
+        ssfIf.resize(static_cast<std::size_t>(cyc->n));
+        divideKernel<<<nBlocks(cyc->n), TPB>>>(faceFluxIf->data(), rAUfIf->data(), cyc->n, ssfIf.data());
+        ckP(cudaGetLastError(), "faceFlux/rAUf, interface");
+    }
+
     DeviceBuffer<scalar> rx, ry, rz;
-    deviceReconstruct(dm, ssfInt, ssfBnd, rx, ry, rz);
+    deviceReconstruct(dm, ssfInt, ssfBnd, rx, ry, rz, havePair ? cyc : nullptr,
+                      havePair ? &ssfIf : nullptr);
 
     UX.resize(static_cast<std::size_t>(nC));
     UY.resize(static_cast<std::size_t>(nC));

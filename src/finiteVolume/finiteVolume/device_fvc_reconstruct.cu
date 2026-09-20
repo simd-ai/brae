@@ -44,6 +44,9 @@ __global__ void reconstructKernel(
     const label*  __restrict__ bndIsEmpty,   const label* __restrict__ bndGFace,
     const scalar* __restrict__ Sfx, const scalar* __restrict__ Sfy, const scalar* __restrict__ Sfz,
     const scalar* __restrict__ ssfInt, const scalar* __restrict__ ssfBnd,
+    const label*  __restrict__ ifCellStart, const label* __restrict__ ifPerm,
+    const scalar* __restrict__ ifSfx, const scalar* __restrict__ ifSfy, const scalar* __restrict__ ifSfz,
+    const scalar* __restrict__ ssfIf,
     scalar* __restrict__ outX, scalar* __restrict__ outY, scalar* __restrict__ outZ)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -69,6 +72,18 @@ __global__ void reconstructKernel(
         const int gf = bndGFace[b];
         accumulate(Sfx[gf], Sfy[gf], Sfz[gf], ssfBnd[b],
                    Txx,Txy,Txz, Tyx,Tyy,Tyz, Tzx,Tzy,Tzz, vx,vy,vz);
+    }
+    // ...and the PERIODIC PAIR, which surfaceSum walks with the rest of mesh.boundary() and which the
+    // arrays above do not hold. Its Sf already points out of ownCell, so the accumulation is the
+    // boundary loop's, face for face.
+    if (ifCellStart)
+    {
+        for (int k = ifCellStart[c]; k < ifCellStart[c + 1]; ++k)
+        {
+            const int j = ifPerm[k];
+            accumulate(ifSfx[j], ifSfy[j], ifSfz[j], ssfIf[j],
+                       Txx,Txy,Txz, Tyx,Tyy,Tyz, Tzx,Tzy,Tzz, vx,vy,vz);
+        }
     }
 
     // OpenFOAM's Tensor::safeInv (TensorI.H:608-661), which is what inv(Field<tensor>) calls --
@@ -117,9 +132,20 @@ void deviceReconstruct(
     const DeviceBuffer<scalar>& ssfBnd,
     DeviceBuffer<scalar>&       outX,
     DeviceBuffer<scalar>&       outY,
-    DeviceBuffer<scalar>&       outZ)
+    DeviceBuffer<scalar>&       outZ,
+    const DeviceCyclic*         cyc,
+    const DeviceBuffer<scalar>* ssfIf)
 {
     const int nC = dm.nCells;
+    const bool havePair = cyc && cyc->n > 0;
+    if (havePair && !ssfIf)
+    {
+        throw std::runtime_error(
+            "brae deviceReconstruct: the mesh has a periodic pair and no face flux was given on it. "
+            "surfaceSum adds a coupled face to its own cell like any other patch face "
+            "(fvcSurfaceIntegrate.C:168-180); leaving it out reconstructs a different vector in every "
+            "cell the pair touches.");
+    }
     outX.resize(static_cast<std::size_t>(nC));
     outY.resize(static_cast<std::size_t>(nC));
     outZ.resize(static_cast<std::size_t>(nC));
@@ -129,7 +155,14 @@ void deviceReconstruct(
         dm.losort.data(), dm.losortStart.data(), dm.bndCellStart.data(), dm.bndPerm.data(),
         dm.bndIsEmpty.data(), dm.bndGFace.data(),
         dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
-        ssfInt.data(), ssfBnd.data(), outX.data(), outY.data(), outZ.data());
+        ssfInt.data(), ssfBnd.data(),
+        havePair ? cyc->ifCellStart.data() : nullptr,
+        havePair ? cyc->ifPerm.data()      : nullptr,
+        havePair ? cyc->Sfx.data()         : nullptr,
+        havePair ? cyc->Sfy.data()         : nullptr,
+        havePair ? cyc->Sfz.data()         : nullptr,
+        havePair ? ssfIf->data()           : nullptr,
+        outX.data(), outY.data(), outZ.data());
     ckR(cudaGetLastError(), "reconstruct");
 }
 

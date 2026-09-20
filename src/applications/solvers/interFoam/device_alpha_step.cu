@@ -92,7 +92,8 @@ void schemeWeights(const DeviceMesh&           dm,
                    const DeviceBuffer<scalar>& psiInt,
                    const DeviceBuffer<scalar>& field,
                    const DeviceBuffer<scalar>& fieldBnd,
-                   DeviceBuffer<scalar>&       w)
+                   DeviceBuffer<scalar>&       w,
+                   const DeviceCyclic*         cyc)
 {
     const int nIf = dm.nInternalFaces;
     switch (scheme)
@@ -118,6 +119,16 @@ void schemeWeights(const DeviceMesh&           dm,
         {
             DeviceBuffer<scalar> gx, gy, gz;
             deviceGaussGrad(dm, field, fieldBnd, gx, gy, gz);
+            // ...WITH THE PAIR IN IT. These are the INTERNAL faces' weights, but the limiter reads the
+            // cell gradient, and a cell on a periodic boundary has one of its faces in the pair. A
+            // gradient built without it is wrong in every such cell, so the limiter on that cell's
+            // ordinary faces is wrong too. MEASURED on validation/interFoamCyclic: alpha 7.8e-02 from
+            // the host at step two, all of it in the pair's own cells, with every gradient the pair's
+            // OWN flux uses already carrying it.
+            if (cyc && cyc->n > 0)
+            {
+                deviceCyclicAddGrad(*cyc, field, dm.V, gx, gy, gz);
+            }
             deviceLimitedFaceWeights(dm, psiInt, field, gx, gy, gz, kVanLeerTwoByk, w);
             break;
         }
@@ -134,10 +145,11 @@ void fluxWithScheme(const DeviceMesh&           dm,
                     const DeviceBuffer<scalar>& field,
                     const DeviceBuffer<scalar>& fieldBnd,
                     DeviceBuffer<scalar>&       outInt,
-                    DeviceBuffer<scalar>&       outBnd)
+                    DeviceBuffer<scalar>&       outBnd,
+                    const DeviceCyclic*         cyc)
 {
     DeviceBuffer<scalar> w;
-    schemeWeights(dm, scheme, psiInt, field, fieldBnd, w);
+    schemeWeights(dm, scheme, psiInt, field, fieldBnd, w, cyc);
     deviceAlphaFaceFlux(dm, dm.nInternalFaces, psiInt, w, field, outInt);
     deviceMultiplyFaces(dm.nBndFaces, psiBnd, fieldBnd, outBnd);
 }
@@ -220,7 +232,8 @@ void deviceAlphaCorrector(
     // alphaPhiUn, alphaEqn.H:164-176. Term 1 is plain advection; term 2 is TWO MINUS SIGNS deep,
     //     fvc::flux(-fvc::flux(-phir, alpha2, alpharScheme), alpha1, alpharScheme)
     // and each negation changes which cell the interpolation reads, not just the result's sign.
-    fluxWithScheme(dm, in.alphaScheme, *in.phiInt, *in.phiBnd, alpha1, *bnd.alpha1, advInt, advBnd);
+    fluxWithScheme(dm, in.alphaScheme, *in.phiInt, *in.phiBnd, alpha1, *bnd.alpha1, advInt, advBnd,
+                   in.cyc);
     // ...and on the pair, where the scheme's own weight applies as on an internal face. The limiter
     // reads fvc::grad(alpha), which must carry the pair itself -- see device_alpha_flux.cuh.
     DeviceBuffer<scalar> advIf;
@@ -234,11 +247,11 @@ void deviceAlphaCorrector(
     deviceNegateFaces(nIf, phirInt, negPhirInt);
     deviceNegateFaces(nBf, phirBnd, negPhirBnd);
     fluxWithScheme(dm, in.alpharScheme, negPhirInt, negPhirBnd, alpha2, alpha2Bnd,
-                   innerInt, innerBnd);
+                   innerInt, innerBnd, in.cyc);
     deviceNegateFaces(nIf, innerInt, negInnerInt);              // the OUTER minus
     deviceNegateFaces(nBf, innerBnd, negInnerBnd);
     fluxWithScheme(dm, in.alpharScheme, negInnerInt, negInnerBnd, alpha1, *bnd.alpha1,
-                   compInt, compBnd);
+                   compInt, compBnd, in.cyc);
     addFaces(nIf, advInt, compInt, unInt);
     addFaces(nBf, advBnd, compBnd, unBnd);
     // ...and the pair's own compressive half, the same two nested negations: each changes which cell

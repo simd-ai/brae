@@ -13,8 +13,9 @@
 #
 # WHAT IT ASSERTS: brae's host loop is OpenFOAM's on this mesh; OpenFOAM moves fluid through the pair,
 # so the comparison is not vacuous; walling the pair is a different answer by orders of magnitude; and
-# the DEVICE loop refuses the pair by name, because its pressure corrector carries neither phig nor its
-# share of fvc::reconstruct there.
+# the DEVICE loop refuses the pair by name. Its pressure corrector carries the pair now -- at step one
+# the two arms agree to 1.3e-10 in U and 6.1e-06 of 1.6e+03 in p_rgh -- and its ALPHA step does not,
+# from the second step on.
 #
 # MEASURED, ten steps of 2e-3: alpha 1.9e-13, p_rgh 9.8e-12 relative of 1.7e+03, U 7.5e-13 relative of
 # 0.73, all 30 p_rgh iteration counts OpenFOAM's. CONTROL: OpenFOAM with the pair two walls, alpha

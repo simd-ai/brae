@@ -154,6 +154,18 @@ void divAddKernel(
 }
 
 
+// fvMatrix::flux() on a coupled face is internalCoeffs*pif - boundaryCoeffs*pnf (fvMatrix.C:1483-1512),
+// and the laplacian gives that pair the SAME coefficient (fvm.cuh, the fp.coupled branch), so it reduces
+// to ifCoeff*(p_nbr - p_own). Written once here because two callers need it: the corrector, which
+// subtracts it from the pair's flux, and the velocity correction, which needs the value itself.
+__device__ __forceinline__ scalar cyclicPFlux(
+    scalar ifCoeff,
+    scalar pNbr,
+    scalar pOwn)
+{
+    return ifCoeff * (pNbr - pOwn);
+}
+
 __global__
 void fluxCorrKernel(
     int n,
@@ -166,7 +178,23 @@ void fluxCorrKernel(
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
 
-    phi[j] -= ifCoeff[j] * (p[nbr[j]] - p[own[j]]);     // snGrad(p) flux: -coeff*(p_nbr - p_own)
+    phi[j] -= cyclicPFlux(ifCoeff[j], p[nbr[j]], p[own[j]]);   // snGrad(p) flux: -coeff*(p_nbr - p_own)
+}
+
+
+__global__
+void fluxOfPKernel(
+    int n,
+    const label* __restrict__ own,
+    const label* __restrict__ nbr,
+    const scalar* __restrict__ ifCoeff,
+    const scalar* __restrict__ p,
+    scalar* __restrict__ out)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+
+    out[j] = cyclicPFlux(ifCoeff[j], p[nbr[j]], p[own[j]]);
 }
 
 
@@ -455,14 +483,16 @@ void deviceCyclicAddConvection(DeviceCyclic& cyc, DeviceBuffer<scalar>& diag, co
 
 void deviceCyclicAssembleMomentum(DeviceCyclic& cyc, const DeviceBuffer<scalar>& nuEffCell, DeviceBuffer<scalar>& diag,
                                   const DeviceBuffer<scalar>* wsch,
-                                  bool corrected)
+                                  bool corrected,
+                                  const DeviceBuffer<scalar>* convFlux)
 {
     if (cyc.n == 0) return;
     // the diffusion half's own choice, as the laplacian entry point above makes it
     const scalar* dc = (corrected || cyc.orthDeltaCoeffs.size() != cyc.deltaCoeffs.size())
                      ? cyc.deltaCoeffs.data() : cyc.orthDeltaCoeffs.data();
     momKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), nuEffCell.data(),
-        dc, cyc.weights.data(), cyc.magSf.data(), cyc.phi.data(),
+        dc, cyc.weights.data(), cyc.magSf.data(),
+        (convFlux && static_cast<int>(convFlux->size()) == cyc.n) ? convFlux->data() : cyc.phi.data(),
         (wsch && (label)wsch->size() == cyc.n) ? wsch->data() : nullptr,
         cyc.ifCoeff.data(), diag.data());
     cudaCheck(cudaGetLastError(), "cyclicMom");
@@ -473,10 +503,13 @@ void deviceCyclicAddH(
     const DeviceCyclic& cyc,
     const DeviceBuffer<scalar>& psi,
     const DeviceBuffer<scalar>& V,
-    DeviceBuffer<scalar>& H)
+    DeviceBuffer<scalar>& H,
+    const DeviceBuffer<scalar>* coeff)
 {
     if (cyc.n == 0) return;
-    addHKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.ifCoeff.data(),
+    const scalar* c = (coeff && static_cast<int>(coeff->size()) == cyc.n) ? coeff->data()
+                                                                         : cyc.ifCoeff.data();
+    addHKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), c,
         psi.data(), V.data(), H.data());
     cudaCheck(cudaGetLastError(), "cyclicAddH");
 }
@@ -557,6 +590,17 @@ void deviceCyclicCorrectFlux(DeviceCyclic& cyc, const DeviceBuffer<scalar>& p)
     fluxCorrKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.ifCoeff.data(),
         p.data(), cyc.phi.data());
     cudaCheck(cudaGetLastError(), "cyclicFluxCorr");
+}
+
+
+void deviceCyclicPressureFlux(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& p,
+                              DeviceBuffer<scalar>& out)
+{
+    out.resize(static_cast<std::size_t>(cyc.n));
+    if (cyc.n == 0) return;
+    fluxOfPKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(),
+        cyc.ifCoeff.data(), p.data(), out.data());
+    cudaCheck(cudaGetLastError(), "cyclicPressureFlux");
 }
 
 

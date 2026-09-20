@@ -74,6 +74,27 @@ std::vector<scalar> fullFace(const SurfaceScalarField& f, const std::vector<FvPa
     return v;
 }
 
+// ...and the halves fullFace drops: a surface field's values ON THE PERIODIC PAIR, in the order
+// buildDeviceCyclic lays the pair out -- the cyclics in the order buildCyclicInterfaces returns them,
+// each patch's faces in patch order. That is the order every DeviceCyclic array is in, so an array
+// built here indexes face for face with cyc.magSf and cyc.Sf.
+std::vector<scalar> coupledFace(
+    const SurfaceScalarField& f,
+    const std::vector<CyclicInterface>& cyclics)
+{
+    std::vector<scalar> v;
+    for (const CyclicInterface& c : cyclics)
+    {
+        const std::size_t pi = static_cast<std::size_t>(c.patch);
+        for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+        {
+            v.push_back(pi < f.boundary.size() && i < f.boundary[pi].size()
+                        ? f.boundary[pi][i] : scalar(0));
+        }
+    }
+    return v;
+}
+
 // OpenFOAM's directionMixed evaluate for the flux-conditional velocity patches. evaluateBoundary()
 // alone does not resolve them, and their matrix coefficients are built from the value it leaves --
 // see the note in pressureCorrector, and tools/dumpInterFoam for OpenFOAM's own numbers.
@@ -94,9 +115,16 @@ RunReport runInterFoamDevice(
     label nSteps,
     bool verbose,
     InterFields* fieldsOut,
-    scalar endTime)
+    scalar endTime,
+    DeviceInterStepTaps* tapsOut)
 {
     InterFields f = buildInterFields(caseDir, startDir, m, g, fvp);
+    // THE PAIR, built here and not at the device-mesh stage, because the hooks below fill its share of
+    // the surface fields and they are defined before the DeviceCyclic is.
+    const std::vector<CyclicInterface> cyclics = buildCyclicInterfaces(m, g, fvp);
+    // stf and snGrad(rho) on the pair, refilled by the interfaceForces hook every step; ghf is the
+    // mesh's and is built once, below.
+    DeviceBuffer<scalar> dStfIf, dSnRhoIf, dGhfIf;
     // FIRST among the device refusals: the model is what a reader of the message has to change, and
     // every refusal below is about the loop around it
     // (kOmegaSST runs on this loop now: device_inter_turbulence.cu's SST branch hands the closure
@@ -123,24 +151,26 @@ RunReport runInterFoamDevice(
             + "). The device loop's UEqn applies explicitPorositySource/DarcyForchheimer only; the host "
             "loop carries this one. Refused rather than run the case without it.");
     }
-    // WHAT THE PAIR STILL DOES NOT CARRY, and it is two terms, both in the pressure corrector:
-    //   phig -- (surfaceTensionForce - ghf*snGrad(rho))*rAUf*magSf -- is built over the device's face
-    //   array, which is [internal | non-cyclic boundary]; the pair's faces get none of it, so phiHbyA
-    //   there is missing the buoyancy the rest of the mesh has.
-    //   U = HbyA + rAU*fvc::reconstruct((phig - flux)/rAUf) sums face contributions per cell, and the
-    //   pair's faces are in neither of the lists deviceCorrectVelocity walks.
-    // MEASURED on validation/interFoamCyclic, ten steps of 2e-3 with everything else wired: the device
-    // reaches a Courant number of 2.68 at step two where OpenFOAM and brae's host loop read 0.05, and
-    // alpha leaves [0, 1] by step three. Refused rather than run a pair whose pressure corrector is
-    // missing two of its terms. Everything below the corrector -- the matrices, MULES, nHatf, the alpha
-    // fluxes -- is gated and in place; this is the last rung.
+    // WHAT THE PAIR STILL DOES NOT CARRY, and it is the ALPHA STEP and nothing below it. MEASURED on
+    // validation/interFoamCyclic against brae's own host loop, which is OpenFOAM's on that case to
+    // alpha 1.9e-13:
+    //   step one   alpha exact, U 1.3e-10 of 2.2, p_rgh 6.1e-06 of 1.6e+03 -- the pressure corrector,
+    //              phig, fvc::reconstruct, HbyA and the flux all agree on the pair (phig 5.6e-17 of
+    //              1.4e-01, rAUf 8.7e-19, phig - p_rghEqn.flux() 2.1e-13 of 2.4e-03)
+    //   step two   alpha 7.8e-02, ALL of it in the pair's own cells (6.0e-05 everywhere else), and the
+    //              pressure follows it because rho does
+    // The alpha step is the first stage of the step, so nothing above it can be the cause; its inputs
+    // -- phi, the pair's own flux, alpha and rho -- all agree to 1e-13 going in. The error is the same
+    // with `Gauss upwind` in place of the case's vanLeer (8.8e-02), with cAlpha 0 (1.0e-01) and with
+    // nAlphaCorr 1 (6.9e-02), so it is not the limiter, the compression or the corrector count.
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         if (!fvp[pi].coupled) continue;
         throw std::runtime_error(
             "brae interFoam (device): patch `" + fvp[pi].name + "` is a coupled pair, and the device "
-            "pressure corrector does not carry its phig or its share of fvc::reconstruct. The host loop "
-            "(no -device) does. Run without -device.");
+            "ALPHA step does not yet reproduce the host's across it from the second time step (the "
+            "first is exact). The pressure corrector does -- phig, the flux and fvc::reconstruct all "
+            "carry the pair now. The host loop (no -device) runs the case. Run without -device.");
     }
 
     // A JUMP ON THE PAIR. The device's interface coefficient is one number per face -- the laplacian's
@@ -325,6 +355,10 @@ RunReport runInterFoamDevice(
     std::vector<int> aFixes, aFlag, takeU, uFixes;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
+        // EVERY DEVICE BOUNDARY ARRAY IS [non-coupled patches, in patch order] (device_mesh.cuh:41-44).
+        // A loop over all of fvp here makes the mask longer than the device's boundary-face count and
+        // shifts every patch after the pair onto the wrong faces.
+        if (isCoupledInterfaceType(fvp[pi].type)) continue;
         const int fx = f.alpha1.boundary[pi]->fixesValue() ? 1 : 0;
         const int fl = (fvp[pi].type == "empty") ? 1 : ((fvp[pi].type == "wedge") ? 2 : 0);
         for (label i = 0; i < fvp[pi].size; ++i)
@@ -354,6 +388,7 @@ RunReport runInterFoamDevice(
         fx.reserve(aFixes.size());
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;
             const std::vector<scalar>* vf = f.alpha1.boundary[pi]->isVariableHeightFlowRate()
                                           ? f.alpha1.boundary[pi]->valueFractionPtr() : nullptr;
             const int patchFx = f.alpha1.boundary[pi]->fixesValue() ? 1 : 0;
@@ -388,10 +423,14 @@ RunReport runInterFoamDevice(
     {
         std::vector<scalar> flat;
         d.copyTo(flat);
-        out.assign(fvp.size(), std::vector<scalar>());
+        // ...and a coupled patch is NOT in the array, so its entry keeps whatever the host holds and
+        // the offset does not advance over it. Walking every patch here reads the faces of the next
+        // patch and runs off the end at the last.
+        out.resize(fvp.size());
         std::size_t off = 0;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;
             const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
             out[pi].assign(flat.begin() + off, flat.begin() + off + n);
             off += n;
@@ -554,8 +593,11 @@ RunReport runInterFoamDevice(
         if (!ubOut) return;
         std::vector<scalar> bx, by, bz;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;
             for (const vector& u : f.U.boundary[pi]->value())
             { bx.push_back(u.x); by.push_back(u.y); bz.push_back(u.z); }
+        }
         ubOut[0].copyFrom(bx);
         ubOut[1].copyFrom(by);
         ubOut[2].copyFrom(bz);
@@ -592,6 +634,10 @@ RunReport runInterFoamDevice(
             for (label i = 0; i < fvp[pi].size; ++i)
                 t.boundary[pi].push_back(sKf.boundary[pi][i]*snA.boundary[pi][i]);
         stf.copyFrom(fullFace(t, fvp));
+        // ...and its half ON THE PAIR, which fullFace drops because the device's boundary arrays
+        // exclude coupled patches. fvc::interpolate and fvc::snGrad both fill a coupled patch above,
+        // so this is the same number the host reference reads there.
+        if (!cyclics.empty()) dStfIf.copyFrom(coupledFace(t, cyclics));
 
         // rho's CALCULATED patch values, from the device's own blend (which carries alpha2's
         // one-pass-older patch values) -- not a zeroGradient copy. See rhoWithPatchValues.
@@ -599,10 +645,27 @@ RunReport runInterFoamDevice(
         rhoBd.copyTo(rbFlat);
         std::vector<std::vector<scalar>> rb(fvp.size());
         {
+            // THE DEVICE'S BOUNDARY ARRAY HAS NO COUPLED PATCHES IN IT (device_mesh.cuh:41-44), so
+            // walking every patch here reads the wrong faces for every patch after the first coupled
+            // one and past the end of the array at the last. MEASURED on validation/interFoamCyclic,
+            // where it put rho's wall values on the pair: p_rgh's shape 2.4e+02 of 1.6e+03 away from
+            // the host at the FIRST step, with alpha still identical; damBreak, which has no pair,
+            // read 5.3e-12 at the same point. A coupled patch's rho is its own two cells interpolated,
+            // which is what its patch field returns and what rhoWithPatchValues builds there.
             std::size_t off = 0;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+                const FvPatch& q = fvp[pi];
+                const std::size_t n = static_cast<std::size_t>(q.size);
+                if (isCoupledInterfaceType(q.type))
+                {
+                    rb[pi].resize(n);
+                    for (label i = 0; i < q.size; ++i)
+                    {
+                        rb[pi][static_cast<std::size_t>(i)] = coupledLinear(q, i, f.rho);
+                    }
+                    continue;
+                }
                 rb[pi].assign(rbFlat.begin() + off, rbFlat.begin() + off + n);
                 off += n;
             }
@@ -614,8 +677,10 @@ RunReport runInterFoamDevice(
             deviceCopy(dStepRhoBnd, rhoBd);
         }
         const GeometricField<scalar> rhoF = rhoWithPatchValues(f.rho, rb, fvp);
-        snRho.copyFrom(fullFace(fvc::snGrad(rhoF, m, g, fvp, snCorr, f.gradRho.leastSquares,
-                                            f.gradRho.cellLimitK, snLim), fvp));
+        const SurfaceScalarField snRhoF = fvc::snGrad(rhoF, m, g, fvp, snCorr, f.gradRho.leastSquares,
+                                                      f.gradRho.cellLimitK, snLim);
+        snRho.copyFrom(fullFace(snRhoF, fvp));
+        if (!cyclics.empty()) dSnRhoIf.copyFrom(coupledFace(snRhoF, cyclics));
 
         // the mixture's own nu. NOTE mixtureNu's second argument is mu, not alpha2.
         cpu::twoPhase::mixtureMu(f.alpha1.internal, f.mixture.phases, f.mu);
@@ -662,17 +727,22 @@ RunReport runInterFoamDevice(
     };
     H.pressure.pressureCoeffs =
         [&](const DeviceBuffer<scalar>&, const DeviceBuffer<scalar>& phiHB,
-            const DeviceBuffer<scalar>& rAUfAll, DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC)
+            const DeviceBuffer<scalar>& rAUfAll, const DeviceBuffer<scalar>& rAUCell,
+            DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC)
     {
-        std::vector<scalar> hB, rA;
+        std::vector<scalar> hB, rA, rAUc;
         phiHB.copyTo(hB);
         rAUfAll.copyTo(rA);
+        rAUCell.copyTo(rAUc);
         // constrainPressure: a fixedFluxPressure gradient is PRESCRIBED from phiHbyA, and brae refuses
         // to assemble one that has not been set. rAUf is taken PER FACE from the full array.
         label off = 0;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
             const FvPatch& q = fvp[pi];
+            // the device's phiHbyA and rAUf arrays have no coupled patch in them, and a cyclic never
+            // prescribes a gradient anyway
+            if (isCoupledInterfaceType(q.type)) continue;
             if (f.p_rgh.boundary[pi]->updateableSnGrad())
             {
                 // (phiHbyA_b - (Sf_b & U_b))/(magSf_b*rAUf_b): the VELOCITY's flux, not the stored
@@ -695,7 +765,21 @@ RunReport runInterFoamDevice(
         rf.boundary.resize(fvp.size());
         { label o = nIf;
           for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-            for (label i = 0; i < fvp[pi].size; ++i) rf.boundary[pi].push_back(rA[o++]); }
+          {
+              const FvPatch& q = fvp[pi];
+              // a coupled patch's rAUf is not in the device's array: it is fvc::interpolate(rAU)
+              // there, which is the two cells' rAU on the pair's own weights. fvm::laplacian reads
+              // gammaf.boundary on that patch, so it cannot be left empty.
+              if (isCoupledInterfaceType(q.type))
+              {
+                  for (label i = 0; i < q.size; ++i)
+                  {
+                      rf.boundary[pi].push_back(coupledLinear(q, i, rAUc));
+                  }
+                  continue;
+              }
+              for (label i = 0; i < q.size; ++i) rf.boundary[pi].push_back(rA[o++]);
+          } }
         // totalPressure's updateCoeffs, where the fvMatrix constructor runs it. f.U's patch values and
         // f.phi's are current (updateUBoundary ran after the last corrector and pushed the flux); a
         // totalPressure patch is never a contact-angle wall, so f.rhoBnd is exact on it.
@@ -703,8 +787,11 @@ RunReport runInterFoamDevice(
         FvScalarMatrix pe = fvm::laplacian<scalar>(rf, f.p_rgh, m, g, fvp, false);
         std::vector<scalar> i2, b2;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;   // the pair's are the interface's
             for (label i = 0; i < fvp[pi].size; ++i)
             { i2.push_back(pe.internalCoeffs[pi][i]); b2.push_back(pe.boundaryCoeffs[pi][i]); }
+        }
         iC.copyFrom(i2);
         bC.copyFrom(b2);
     };
@@ -715,6 +802,7 @@ RunReport runInterFoamDevice(
         std::vector<scalar> flat;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;
             const std::vector<scalar>& v = f.p_rgh.boundary[pi]->value();
             flat.insert(flat.end(), v.begin(), v.end());
         }
@@ -730,7 +818,6 @@ RunReport runInterFoamDevice(
     // patches over (attachCyclicCoupling, braeInterFoam.cu:166), so a coupled patch here is one whose
     // neighbour cells and weights are already filled. Its VOLUMETRIC FLUX is state of the same kind as
     // phi: seeded from the field the case started with, rewritten by every pressure corrector.
-    const std::vector<CyclicInterface> cyclics = buildCyclicInterfaces(m, g, fvp);
     DeviceCyclic dCyc = buildDeviceCyclic(cyclics, g, fvp);
     DeviceBuffer<scalar> dAlphaPhiIf, dRhoPhiIf;
     if (dCyc.n > 0)
@@ -877,6 +964,10 @@ RunReport runInterFoamDevice(
     C.cyc        = (dCyc.n > 0) ? &dCyc : nullptr;
     C.alphaPhiIf = (dCyc.n > 0) ? &dAlphaPhiIf : nullptr;
     C.rhoPhiIf   = (dCyc.n > 0) ? &dRhoPhiIf : nullptr;
+    // ...and phig's three fields on the pair. dGhfIf is filled below, before the first step.
+    C.stfIf       = (dCyc.n > 0) ? &dStfIf : nullptr;
+    C.ghfIf       = (dCyc.n > 0) ? &dGhfIf : nullptr;
+    C.snGradRhoIf = (dCyc.n > 0) ? &dSnRhoIf : nullptr;
     C.porosity = dPorosity.active ? &dPorosity : nullptr;
     // p_rgh's reference, where the host driver sets it (inter_driver_cpp.cu:779-781). These three were
     // dead for as long as the device refused a case that needs one, and a step that never pins leaves the
@@ -982,7 +1073,9 @@ RunReport runInterFoamDevice(
     DeviceBuffer<scalar> dABnd(patchValues(f.alpha1, fvp)), dK(f.K);
     DeviceBuffer<scalar> dGh(f.gh), dGhf, dMagSf(g.magSf());
     { SurfaceScalarField gf; gf.internal = f.ghfInternal; gf.boundary = f.ghfBoundary;
-      dGhf.copyFrom(fullFace(gf, fvp)); }
+      dGhf.copyFrom(fullFace(gf, fvp));
+      // ghf on the pair: gravity dotted with the face centre, which does not change with the solution
+      if (!cyclics.empty()) dGhfIf.copyFrom(coupledFace(gf, cyclics)); }
     DeviceBuffer<scalar> dRho, dMu, dNu;
     DeviceVectorBoundary dbU = buildDeviceVectorBoundary(f.U, fvp, g);
     // the io switch on the state the run starts from, as rhoSimpleFoam's device arm does right after its
@@ -1019,6 +1112,7 @@ RunReport runInterFoamDevice(
             std::vector<scalar> bx, by, bz;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
                 for (const vector& v : f.U.boundary[pi]->value())
                 {
                     bx.push_back(v.x); by.push_back(v.y); bz.push_back(v.z);
@@ -1056,7 +1150,7 @@ RunReport runInterFoamDevice(
                         dUobx, dUoby, dUobz,
                         dPhiI, dPhiB, dPhiOI, dPhiOB, dUFixes, dPrgh, dP,
                         dNH, dNHB, dABnd, dK, dAFixes, dAFlag, dbU,
-                        dRho, dMu, dNu, dRpI, dRpB);
+                        dRho, dMu, dNu, dRpI, dRpB, tapsOut);
 
         // turbulence->correct(), interFoam.C:169-172 -- after the last pressure corrector of the one
         // outer corrector this loop runs. dbU is current: the step's last updateUBoundary rebuilt it
@@ -1094,10 +1188,11 @@ RunReport runInterFoamDevice(
             {
                 std::vector<scalar> rb;
                 dRpB.copyTo(rb);
-                f.rhoPhi.boundary.assign(fvp.size(), std::vector<scalar>());
+                f.rhoPhi.boundary.resize(fvp.size());
                 std::size_t off = 0;
                 for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                 {
+                    if (isCoupledInterfaceType(fvp[pi].type)) continue;
                     const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
                     f.rhoPhi.boundary[pi].assign(rb.begin() + off, rb.begin() + off + n);
                     off += n;

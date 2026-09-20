@@ -24,19 +24,30 @@
 //
 // NO ATOMICS: the per-cell tensor and vector are built by the same ownerStart/losort/bndCellStart gather
 // deviceDiv and deviceGaussGrad use, so the summation order is deterministic and a run is reproducible.
+//
+// A PERIODIC PAIR IS IN surfaceSum LIKE ANY OTHER PATCH. fvcSurfaceIntegrate.C:168-180 walks
+// mesh.boundary() whole -- there is no coupled branch and no sign flip -- so a cyclic face adds its own
+// Sf and its own ssf to its own cell, once. The device's boundary arrays deliberately exclude coupled
+// patches (device_mesh.cuh:41-44), so the pair arrives separately, through `cyc`. Leaving it out is not
+// a small error: on validation/interFoamCyclic it put the Courant number at 2.68 by step two where
+// OpenFOAM reads 0.05.
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
+#include "device_cyclic.cuh"
 
 namespace brae {
 
-// `ssfInt`/`ssfBnd` are the face flux; the result is the cell vector field, SoA.
+// `ssfInt`/`ssfBnd` are the face flux; the result is the cell vector field, SoA. `cyc`/`ssfIf` carry a
+// periodic pair's faces, and are null on a mesh without one.
 void deviceReconstruct(
     const DeviceMesh&           dm,
     const DeviceBuffer<scalar>& ssfInt,
     const DeviceBuffer<scalar>& ssfBnd,
     DeviceBuffer<scalar>&       outX,
     DeviceBuffer<scalar>&       outY,
-    DeviceBuffer<scalar>&       outZ);
+    DeviceBuffer<scalar>&       outZ,
+    const DeviceCyclic*         cyc   = nullptr,
+    const DeviceBuffer<scalar>* ssfIf = nullptr);
 
 } // namespace brae

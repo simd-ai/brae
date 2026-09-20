@@ -96,7 +96,13 @@ void deviceCorrectVelocity(
     const DeviceBuffer<scalar>& rAUfBnd,
     DeviceBuffer<scalar>&       UX,
     DeviceBuffer<scalar>&       UY,
-    DeviceBuffer<scalar>&       UZ);
+    DeviceBuffer<scalar>&       UZ,
+    // ...and the PERIODIC PAIR's faces, which surfaceSum walks with the rest of mesh.boundary()
+    // (fvcSurfaceIntegrate.C:168-180). `faceFluxIf` is phig - p_rghEqn.flux() there and `rAUfIf` the
+    // interpolated rAU, exactly as the two boundary arrays above are. Null on a mesh without a pair.
+    const DeviceCyclic*         cyc         = nullptr,
+    const DeviceBuffer<scalar>* faceFluxIf  = nullptr,
+    const DeviceBuffer<scalar>* rAUfIf      = nullptr);
 
 // p = p_rgh + rho*gh, pEqn.H:72 -- the field interFoam writes and never solves.
 void deviceStaticPressure(

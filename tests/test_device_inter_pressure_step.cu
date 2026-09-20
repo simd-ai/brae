@@ -268,7 +268,8 @@ void runFixture(
     DeviceInterPressureHooks hooks;
     hooks.pressureCoeffs =
         [&](const DeviceBuffer<scalar>&, const DeviceBuffer<scalar>&,
-            const DeviceBuffer<scalar>& rAUfInt, DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC)
+            const DeviceBuffer<scalar>& rAUfInt, const DeviceBuffer<scalar>&,
+            DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC)
     {
         std::vector<scalar> rf;
         rAUfInt.copyTo(rf);

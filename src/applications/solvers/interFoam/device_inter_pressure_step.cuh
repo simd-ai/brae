@@ -61,9 +61,13 @@ struct DeviceInterPressureHooks
     // patch, and constrainPressure divides by it per face. A hook given only the internal half has to
     // invent the boundary values, and standing in the first internal face's value for all of them put
     // U 60% out on damBreak.
+    // `rAUCell` is rAU itself, which the hook needs for one thing rAUfAll cannot give it: a COUPLED
+    // patch's rAUf. The device's face arrays have no coupled patch in them, and fvm::laplacian reads
+    // gammaf on every patch, so the pair's is interpolated from the two cells there.
     std::function<void(const DeviceBuffer<scalar>& phiHbyAInt,
                        const DeviceBuffer<scalar>& phiHbyABnd,
                        const DeviceBuffer<scalar>& rAUfAll,
+                       const DeviceBuffer<scalar>& rAUCell,
                        DeviceBuffer<scalar>&       iC,
                        DeviceBuffer<scalar>&       bC)> pressureCoeffs;
 
@@ -99,6 +103,14 @@ struct DeviceInterPressureInput
     // a pair and no such array is refused below rather than solved against a source that is missing the
     // pair's own flux.
     const DeviceBuffer<scalar>* phiHbyAIf = nullptr;
+    // ...and the three fields phig is built from, ON THE PAIR. phig = (stf - ghf*snGrad(rho))*rAUf*magSf
+    // is a whole-surfaceScalarField expression in pEqn.H:28-36, so a coupled patch has it like any
+    // other; the device's face arrays exclude coupled patches, so they arrive here separately. rAUf is
+    // NOT among them: it is fvc::interpolate(rAU) on that face, which the step builds from the pair's
+    // own weights (deviceCyclicFaceValue).
+    const DeviceBuffer<scalar>* stfIf       = nullptr;
+    const DeviceBuffer<scalar>* ghfIf       = nullptr;
+    const DeviceBuffer<scalar>* snGradRhoIf = nullptr;
     // MRFZoneList::makeRelative(phiHbyA), pEqn.H:19
     const std::vector<DeviceMRFZone>* mrf = nullptr;
 
@@ -149,6 +161,8 @@ struct DeviceInterPressureInput
 struct DevicePressureTaps
 {
     DeviceBuffer<scalar> diag, upper, lower, source, iC, bC;
+    // phig and rAUf ON THE PAIR, for comparing the two arms across a coupled face
+    DeviceBuffer<scalar> phigIf, rAUfIf, ffIf, phiIf;
 };
 
 scalar deviceInterPressureStep(

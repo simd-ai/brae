@@ -32,6 +32,13 @@ __global__ void subKernel(const scalar* __restrict__ a, const scalar* __restrict
     if (i < n) out[i] = a[i] - b[i];
 }
 
+// phiHbyA += phig on the pair's faces, the interface twin of addPhigBoundaryKernel.
+__global__ void addPhigIfKernel(const scalar* __restrict__ phig, int n, scalar* __restrict__ phiHbyA)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) phiHbyA[i] += phig[i];
+}
+
 }   // namespace
 
 
@@ -89,6 +96,40 @@ scalar deviceInterPressureStep(
         ckS(cudaMemcpy(phigBnd.data(), phigAll.data() + nIf, sizeof(scalar)*nBf,
                        cudaMemcpyDeviceToDevice), "phig, boundary");
 
+    // ...AND ON THE PAIR, the same expression on its own faces. rAUf there is fvc::interpolate(rAU) on
+    // a coupled patch -- w*rAU[own] + (1-w)*rAU[nbr] -- which is what the host reference computes with
+    // coupledLinear (inter_peqn_cpp.cu:624, fv_patch.cuh:119-126), and deviceCyclicFaceValue is that
+    // same arithmetic. phig itself goes through deviceBuoyancyFlux, so the pair cannot drift from the
+    // faces around it: one kernel, three arrays.
+    const bool havePair = in.cyc && in.cyc->n > 0;
+    DeviceBuffer<scalar> rAUfIf, phigIf, phiHbyAIfAll;
+    if (havePair)
+    {
+        if (!in.stfIf || !in.ghfIf || !in.snGradRhoIf)
+        {
+            throw std::runtime_error(
+                "brae interFoam device pEqn: the mesh has a periodic pair and its surface-tension force, "
+                "gh or snGrad(rho) was not handed in. phig is a whole-surfaceScalarField expression "
+                "(pEqn.H:28-36) and a coupled patch carries it like any other; without those three the "
+                "pair's phiHbyA would be missing the buoyancy every other face has.");
+        }
+        deviceCyclicFaceValue(*in.cyc, rAU, rAUfIf);
+        deviceBuoyancyFlux(in.cyc->n, *in.stfIf, *in.ghfIf, *in.snGradRhoIf, rAUfIf, in.cyc->magSf, phigIf);
+        // phiHbyA += phig on the pair, as addPhigBoundaryKernel does it on the other patches. The
+        // caller's array is const and is the predictor's own, so the sum lives here, like the host's
+        // local phiHbyA.
+        phiHbyAIfAll.resize(static_cast<std::size_t>(in.cyc->n));
+        ckS(cudaMemcpy(phiHbyAIfAll.data(), in.phiHbyAIf->data(), sizeof(scalar)*in.cyc->n,
+                       cudaMemcpyDeviceToDevice), "phiHbyA, interface");
+        addPhigIfKernel<<<nBlocks(in.cyc->n), TPB>>>(phigIf.data(), in.cyc->n, phiHbyAIfAll.data());
+        ckS(cudaGetLastError(), "phiHbyA += phig, interface");
+        if (taps)
+        {
+            deviceCopy(taps->phigIf, phigIf);
+            deviceCopy(taps->rAUfIf, rAUfIf);
+        }
+    }
+
     // interpolate(rho*rAU) -- the PRODUCT, interpolated once; see device_inter_peqn.cuh note 2.
     DeviceBuffer<scalar> rhoRAUf;
     deviceRhoRAUf(dm, *in.rho, rAU, rhoRAUf);
@@ -125,7 +166,7 @@ scalar deviceInterPressureStep(
         const bool lastPass = (pass == in.nNonOrthogonalCorrectors);
 
         // constrainPressure, and the patches' updateCoeffs at this assembly
-        hooks.pressureCoeffs(phiHbyAInt, phiHbyABnd, *in.rAUfAll, iC, bC);
+        hooks.pressureCoeffs(phiHbyAInt, phiHbyABnd, *in.rAUfAll, rAU, iC, bC);
 
         // the explicit correction: gradOf(p_rgh), laplacianCorrFlux, laplacianNonOrthSource
         DeviceBuffer<scalar> corrSource;
@@ -149,7 +190,7 @@ scalar deviceInterPressureStep(
         deviceInterAssemblePEqn(dm, rAUfInt, phiHbyAInt, phiHbyABnd,
                                 in.needReference, in.pRefCell, &p_rgh, P,
                                 in.correctedLaplacian, in.correctedLaplacian ? &corrSource : nullptr,
-                                in.cyc, &rAU, in.phiHbyAIf);
+                                in.cyc, &rAU, havePair ? &phiHbyAIfAll : nullptr);
 
         if (taps && pass == 0)
         {
@@ -252,14 +293,32 @@ scalar deviceInterPressureStep(
     // pressure leaves there (gated in tests/test_device_inter_peqn_cyclic_vs_host.cu). cyc->phi is the
     // pair's flux for everything downstream -- the alpha step reads it as phiCN -- so this is where it
     // is rewritten, exactly as phiInt and phiBnd are above.
-    if (in.cyc && in.cyc->n > 0 && in.phiHbyAIf)
+    DeviceBuffer<scalar> ffIf;
+    if (havePair)
     {
-        ckS(cudaMemcpy(in.cyc->phi.data(), in.phiHbyAIf->data(),
+        ckS(cudaMemcpy(in.cyc->phi.data(), phiHbyAIfAll.data(),
                        sizeof(scalar)*in.cyc->n, cudaMemcpyDeviceToDevice), "phi = phiHbyA, interface");
         deviceCyclicCorrectFlux(*in.cyc, p_rgh);
+
+        // ...and (phig - p_rghEqn.flux()) on the same faces, for the reconstruction. The flux is the
+        // value deviceCyclicCorrectFlux just subtracted, taken through the shared arithmetic rather
+        // than differenced back out of cyc->phi.
+        DeviceBuffer<scalar> fluxIf;
+        deviceCyclicPressureFlux(*in.cyc, p_rgh, fluxIf);
+        ffIf.resize(static_cast<std::size_t>(in.cyc->n));
+        subKernel<<<nBlocks(in.cyc->n), TPB>>>(phigIf.data(), fluxIf.data(), in.cyc->n, ffIf.data());
+        ckS(cudaGetLastError(), "phig - flux, interface");
+        if (taps)
+        {
+            deviceCopy(taps->ffIf, ffIf);
+            deviceCopy(taps->phiIf, in.cyc->phi);
+        }
     }
 
-    deviceCorrectVelocity(dm, HbyAX, HbyAY, HbyAZ, rAU, ffInt, rAUfInt, ffBnd, rAUfBnd, UX, UY, UZ);
+    deviceCorrectVelocity(dm, HbyAX, HbyAY, HbyAZ, rAU, ffInt, rAUfInt, ffBnd, rAUfBnd, UX, UY, UZ,
+                          havePair ? in.cyc : nullptr,
+                          havePair ? &ffIf : nullptr,
+                          havePair ? &rAUfIf : nullptr);
 
     // p = p_rgh + rho*gh, rebuilt from the SOLVED p_rgh and never carried.
     deviceStaticPressure(nC, p_rgh, *in.rho, *in.gh, p);

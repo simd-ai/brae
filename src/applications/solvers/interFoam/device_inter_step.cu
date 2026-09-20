@@ -263,6 +263,8 @@ void deviceInterStep(
     }
     uin.cyc          = ctl.cyc;
     uin.cycCorrected = ctl.correctedLaplacian;
+    // fvm::div(rhoPhi, U) on the pair too -- the MASS flux, as uin.phiInt above is
+    uin.cycConvFlux  = ctl.rhoPhiIf;
     uin.mrf    = ctl.mrf;
     uin.mrfRho = ctl.mrf ? &rho : nullptr;
 
@@ -417,6 +419,10 @@ void deviceInterStep(
         pi.stf = &stf;
         pi.ghf = &ghf;
         pi.snGradRho = &snGradRho;
+        // ...and their halves on the periodic pair, which the same three expressions cover there
+        pi.stfIf       = ctl.stfIf;
+        pi.ghfIf       = ctl.ghfIf;
+        pi.snGradRhoIf = ctl.snGradRhoIf;
         pi.magSf = &magSf;
         pi.rAUfAll = &rAUfAll;
         pi.rho = &rho;
@@ -452,7 +458,14 @@ void deviceInterStep(
         DevicePressureTaps pt;
         deviceInterPressureStep(dm, pi, hooks.pressure, st.rAU, st.HbyA[0], st.HbyA[1], st.HbyA[2],
                                 st.phiHbyAInt, st.phiHbyABnd, p_rgh, phiInt, phiBnd,
-                                UX, UY, UZ, p, (taps && corr == 0) ? &pt : nullptr);
+                                UX, UY, UZ, p, taps ? &pt : nullptr);
+        if (taps)
+        {
+            deviceCopy(taps->phigIf, pt.phigIf);
+            deviceCopy(taps->rAUfIf, pt.rAUfIf);
+            deviceCopy(taps->ffIf, pt.ffIf);
+            deviceCopy(taps->phiIf, pt.phiIf);
+        }
         if (taps && corr == 0)
         {
             deviceCopy(taps->pDiag, pt.diag);

@@ -14,6 +14,7 @@
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "interface/cyclic_interface.cuh"
+#include <algorithm>
 #include <map>
 #include <vector>
 
@@ -122,9 +123,14 @@ inline DeviceCyclic buildDeviceCyclic(
             }
             off += c.faceCells.size();
         }
+        // THE CSR IS OVER EVERY CELL, not over the cells the pair happens to touch. Sizing it to the
+        // highest owner + 2 leaves every kernel that walks it by cell -- MULES's three, and the
+        // reconstruction -- reading ifCellStart[c + 1] past the end for every cell above that owner.
+        // g.V() is the cell count here, and the pair's owners are a subset of it.
+        const label nCellsAll = static_cast<label>(g.V().size());
         label maxCell = -1;
         for (const label cc : oc) maxCell = std::max(maxCell, cc);
-        std::vector<label> count(static_cast<std::size_t>(maxCell + 2), 0);
+        std::vector<label> count(static_cast<std::size_t>(std::max(maxCell + 1, nCellsAll) + 1), 0);
         for (const label cc : oc) ++count[static_cast<std::size_t>(cc) + 1];
         cellStart.assign(count.size(), 0);
         for (std::size_t i = 1; i < count.size(); ++i) cellStart[i] = cellStart[i - 1] + count[i];
@@ -208,13 +214,27 @@ void deviceCyclicAddConvection(DeviceCyclic& cyc, DeviceBuffer<scalar>& diag,
 // `corrected` picks the delta coefficient of the DIFFUSION half exactly as the laplacian above does
 // (fvm.cuh:104-113): nonOrthDeltaCoeffs when the scheme corrects, the patch's plain deltaCoeffs when it
 // does not. Default true, the behaviour every caller before interFoam had.
+// fvm::laplacian(nuEff, U) + fvm::div(<flux>, U) across the pair. `convFlux` is the flux the momentum
+// equation CONVECTS with, which is not always the pair's own phi: interFoam's UEqn is
+// fvm::div(rhoPhi, U), the MASS flux, and cyc.phi is the volumetric one. MEASURED on
+// validation/interFoamCyclic: with cyc.phi standing in, rAUf on the pair was 1.1e-03 of 2.0e-03 away
+// from the host at step two -- 57% -- and exact at step one, where both fluxes are zero. Null = cyc.phi.
+// `convFlux` is the flux the momentum equation CONVECTS with, which is not always the pair's own phi:
+// interFoam's UEqn is fvm::div(rhoPhi, U), the MASS flux, and cyc.phi is the volumetric one. MEASURED
+// on validation/interFoamCyclic with cyc.phi standing in: rAUf on the pair 1.1e-03 of 2.0e-03 from the
+// host at step two -- 57% -- and exact at step one, where both fluxes are zero. Null = cyc.phi.
 void deviceCyclicAssembleMomentum(DeviceCyclic& cyc, const DeviceBuffer<scalar>& nuEffCell, DeviceBuffer<scalar>& diag,
                                   const DeviceBuffer<scalar>* wsch = nullptr,
-                                  bool corrected = true);
+                                  bool corrected = true,
+                                  const DeviceBuffer<scalar>* convFlux = nullptr);
 
 // add the cyclic off-diagonal to H (OF fvMatrix::H): H[own] -= ifCoeff[j]*psi[nbr]/V[own]. Call AFTER deviceMatrixH.
+// fvMatrix::H(): H[own] -= coeff*psi[nbr]/V[own]. `coeff` is the MATRIX's own interface off-diagonal.
+// cyc.ifCoeff is one array that every assembly overwrites, so a caller whose matrix was assembled
+// before another one must pass its own copy; null falls back to cyc.ifCoeff.
 void deviceCyclicAddH(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& psi, const DeviceBuffer<scalar>& V,
-                      DeviceBuffer<scalar>& H);
+                      DeviceBuffer<scalar>& H,
+                      const DeviceBuffer<scalar>* coeff = nullptr);
 // per-owner sum of |ifCoeff| (the cyclic off-diagonal magnitude) for the relaxation's diagonal-dominance term.
 void deviceCyclicOffDiagSum(const DeviceCyclic& cyc, DeviceBuffer<scalar>& sumOff);
 
@@ -262,6 +282,11 @@ void deviceCyclicAddDivFlux(const DeviceCyclic& cyc, const DeviceBuffer<scalar>&
 void deviceCyclicZeroWallIfCoeff(DeviceCyclic& cyc, const DeviceBuffer<label>& isWallCell);
 // pressure-correction flux: phi[j] -= ifCoeff[j]*(p[nbr]-p[own])  (the snGrad(p) flux across the periodic face).
 void deviceCyclicCorrectFlux(DeviceCyclic& cyc, const DeviceBuffer<scalar>& p);
+// ...and the SAME flux as a value rather than a subtraction: out[j] = ifCoeff[j]*(p[nbr]-p[own]), which
+// is fvMatrix::flux() on that face. interFoam's velocity correction needs it, because
+// reconstruct((phig - p_rghEqn.flux())/rAUf) reads the flux and not the corrected phi.
+void deviceCyclicPressureFlux(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& p,
+                              DeviceBuffer<scalar>& out);
 // gaussGrad contribution: grad[own] += Sf_j * (w*psi[own]+(1-w)*psi[nbr]) / V[own].
 // fvc::interpolate of a CELL field onto the cyclic faces: w*psi[own] + (1-w)*psi[nbr].
 void deviceCyclicFaceValue(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& cell, DeviceBuffer<scalar>& out);
