@@ -430,11 +430,15 @@ void deviceCyclicAssembleLaplacian(
     DeviceCyclic& cyc,
     const DeviceBuffer<scalar>& gammaCell,
     DeviceBuffer<scalar>& diag,
-    bool addToDiag)
+    bool addToDiag,
+    bool corrected)
 {
     if (cyc.n == 0) return;
+    // the host's own choice (fvm.cuh:104-113): nonOrthDeltaCoeffs when corrected, deltaCoeffs when not
+    const scalar* dc = (corrected || cyc.orthDeltaCoeffs.size() != cyc.deltaCoeffs.size())
+                     ? cyc.deltaCoeffs.data() : cyc.orthDeltaCoeffs.data();
     laplKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), gammaCell.data(),
-        cyc.deltaCoeffs.data(), cyc.weights.data(), cyc.magSf.data(), cyc.ifCoeff.data(), diag.data(), addToDiag ? 1 : 0);
+        dc, cyc.weights.data(), cyc.magSf.data(), cyc.ifCoeff.data(), diag.data(), addToDiag ? 1 : 0);
     cudaCheck(cudaGetLastError(), "cyclicLapl");
 }
 

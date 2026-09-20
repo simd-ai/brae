@@ -3197,6 +3197,12 @@ add_test(NAME device_cyclic_laplacian_vs_host
          COMMAND test_device_cyclic_laplacian_vs_host
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannel)
 set_tests_properties(device_cyclic_laplacian_vs_host PROPERTIES SKIP_RETURN_CODE 77)
+# ...and again on a SKEWED periodic pair, where nonOrthDeltaCoeffs differs from deltaCoeffs, so the
+# `corrected` and orthogonal passes are two different matrices. cyclicChannel cannot tell them apart.
+add_test(NAME device_cyclic_laplacian_vs_host_skew
+         COMMAND test_device_cyclic_laplacian_vs_host
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannelSkew)
+set_tests_properties(device_cyclic_laplacian_vs_host_skew PROPERTIES SKIP_RETURN_CODE 77)
 
 # the device Gauss gradient against the host's fvc::gaussGrad, bit for bit, with the two forms the device
 # used to have as controls

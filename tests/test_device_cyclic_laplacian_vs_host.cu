@@ -13,6 +13,17 @@
 // WHAT THIS GATE ASSERTS, per face of the pair: the device's ifCoeff is the host's coefficient, and the
 // diagonal it writes is the host's diagonal contribution. WHAT IT DOES NOT: anything solved. A matching
 // matrix is the precondition for the rest of the path, not a substitute for it.
+//
+// IT RUNS ON TWO MESHES, and the second is why. validation/cyclicChannel's pair is axis-aligned, so its
+// nonOrthDeltaCoeffs and its deltaCoeffs are the SAME NUMBER (spread 0.0) and the two passes below
+// assert identical arithmetic -- the `corrected` arm could not see a device that ignored the flag.
+// validation/cyclicChannelSkew is the same channel sheared into a parallelogram, so the periodic faces
+// tilt while still matching by the pure translation (1 0 0): the spread is 7.7e-01 there, and it caught
+// the defect at once. DeviceCyclic carried CyclicInterface::deltaCoeffs, which IS OpenFOAM's
+// nonOrthDeltaCoeffs, and used it for both -- the ORTHOGONAL laplacian's interface coefficient was
+// 4.2e-03 out of 5.5e-02, 7.7% of it, while the corrected one was exact. It now takes the host patch's
+// own plain deltaCoeffs when the scheme does not correct. MEASURED after that, both meshes, both
+// passes: 1.4e-17 or better on coefficients up to 5.9e-02.
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -124,7 +135,7 @@ int main(int argc, char** argv)
         deviceLaplacianCoeffs(dm, dGf, diag, upper, lower, corrected);
         std::vector<scalar> diagBefore;
         diag.copyTo(diagBefore);
-        deviceCyclicAssembleLaplacian(cyc, dGammaCell, diag, /*addToDiag=*/true);
+        deviceCyclicAssembleLaplacian(cyc, dGammaCell, diag, /*addToDiag=*/true, corrected);
 
         std::vector<scalar> ifCoeff, diagAfter;
         cyc.ifCoeff.copyTo(ifCoeff);

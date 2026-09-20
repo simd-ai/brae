@@ -23,6 +23,12 @@ struct DeviceCyclic
     int n = 0;                                  // total cyclic faces (BOTH sides of every pair)
     DeviceBuffer<label>  ownCell, nbrCell;      // this-side cell, periodic-neighbour cell
     DeviceBuffer<scalar> deltaCoeffs, weights, magSf;   // face geometry (own weight w; |Sf|; 1/|delta|)
+    // ...and the ORTHOGONAL delta coefficient, taken from the host patch rather than re-derived.
+    // CyclicInterface::deltaCoeffs is OpenFOAM's nonOrthDeltaCoeffs, 1/(nf & delta), which is what a
+    // `corrected` laplacian wants; an `uncorrected` one wants the patch's plain 1/|delta|. MEASURED on a
+    // skewed periodic pair (validation/cyclicChannelSkew): using the non-orthogonal set for both put the
+    // orthogonal laplacian's interface coefficient 4.2e-03 out of 5.5e-02, 7.7% of it.
+    DeviceBuffer<scalar> orthDeltaCoeffs;
     DeviceBuffer<scalar> Sfx, Sfy, Sfz;         // face area vector, oriented OUT of ownCell
     DeviceBuffer<scalar> dOwnX, dOwnY, dOwnZ;   // Cf - C[own]          (linearUpwind face delta, own side)
     DeviceBuffer<scalar> dNbrX, dNbrY, dNbrZ;   // Cf_nbr - C[nbr]      (linearUpwind face delta, nbr side, UN-rotated)
@@ -46,7 +52,7 @@ inline DeviceCyclic buildDeviceCyclic(
     const std::vector<FvPatch>& fvp)
 {
     std::vector<label> oc, nc;
-    std::vector<scalar> dc, w, ms, sfx, sfy, sfz;
+    std::vector<scalar> dc, odc, w, ms, sfx, sfy, sfz;
     std::vector<scalar> dox, doy, doz, dnx, dny, dnz, cvx, cvy, cvz, dlx, dly, dlz;
     bool rot = false;
     for (const auto& c : cyclics)
@@ -62,6 +68,9 @@ inline DeviceCyclic buildDeviceCyclic(
             oc.push_back(c.faceCells[i]);
             nc.push_back(c.nbrFaceCells[i]);
             dc.push_back(c.deltaCoeffs[i]);
+            // the HOST PATCH's own orthogonal coefficient, so the two arms cannot drift apart
+            odc.push_back(static_cast<std::size_t>(i) < P.deltaCoeffs.size()
+                          ? P.deltaCoeffs[static_cast<std::size_t>(i)] : c.deltaCoeffs[i]);
             w.push_back(c.weights[i]);
             ms.push_back(g.magSf()[gf]);
             sfx.push_back(g.Sf()[gf].x);
@@ -87,6 +96,7 @@ inline DeviceCyclic buildDeviceCyclic(
     d.ownCell.copyFrom(oc);
     d.nbrCell.copyFrom(nc);
     d.deltaCoeffs.copyFrom(dc);
+    d.orthDeltaCoeffs.copyFrom(odc);
     d.weights.copyFrom(w);
     d.magSf.copyFrom(ms);
     d.Sfx.copyFrom(sfx);
@@ -129,8 +139,12 @@ inline DeviceCyclic buildDeviceCyclic(
 // (the implicit Laplacian off-diagonal); ALSO folds the diagonal contribution diag[own] -= ifCoeff[j].
 // gammaCell is a per-cell diffusivity (rAU for pressure, nuEff for momentum). Pass addToDiag=false to skip
 // the diag fold (e.g. when reusing ifCoeff only for the flux corrector).
+// `corrected` picks WHICH delta coefficient, as fvm::laplacian's coupled branch does (fvm.cuh:104-113):
+// nonOrthDeltaCoeffs when the scheme corrects, the patch's plain deltaCoeffs when it does not. Default
+// true, which is what every caller before interFoam was already getting.
 void deviceCyclicAssembleLaplacian(DeviceCyclic& cyc, const DeviceBuffer<scalar>& gammaCell,
-                                   DeviceBuffer<scalar>& diag, bool addToDiag = true);
+                                   DeviceBuffer<scalar>& diag, bool addToDiag = true,
+                                   bool corrected = true);
 
 // upwind convection on the interface: diag[own] += max(phi,0), ifCoeff[j] += min(phi,0). Adds to the existing
 // ifCoeff (call AFTER deviceCyclicAssembleLaplacian) so Apsi[own] += ifCoeff*psi[nbr] carries div-laplacian.
