@@ -30,6 +30,7 @@
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
+#include "device_cyclic.cuh"
 
 namespace brae {
 
@@ -84,7 +85,14 @@ void deviceMulesLimiter(
     const DeviceMulesFields&     f,
     const DeviceMulesControls&   c,
     DeviceBuffer<scalar>&        lambdaInt,
-    DeviceBuffer<scalar>&        lambdaBnd);
+    DeviceBuffer<scalar>&        lambdaBnd,
+    // THE COUPLED FACES. A cyclic patch is not in the boundary arrays at all (device_mesh.cuh:41-44),
+    // so without these MULES limits a mesh with a periodic pair as if the pair were a wall: its faces
+    // contribute no extrema, no budget and no limiter. All four together or none.
+    const DeviceCyclic*          cyc = nullptr,
+    const DeviceBuffer<scalar>*  phiBDIf = nullptr,
+    const DeviceBuffer<scalar>*  phiCorrIf = nullptr,
+    DeviceBuffer<scalar>*        lambdaIf = nullptr);
 
 // phiPsi = phiBD + lambda*phiCorr (MULESTemplates.C:634). The blend is separate from the limiter so a
 // caller can keep the limiter's lambda -- which a stock OpenFOAM run never writes and which every gate

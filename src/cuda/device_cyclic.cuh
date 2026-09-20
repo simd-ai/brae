@@ -14,6 +14,7 @@
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "interface/cyclic_interface.cuh"
+#include <map>
 #include <vector>
 
 namespace brae {
@@ -29,6 +30,13 @@ struct DeviceCyclic
     // skewed periodic pair (validation/cyclicChannelSkew): using the non-orthogonal set for both put the
     // orthogonal laplacian's interface coefficient 4.2e-03 out of 5.5e-02, 7.7% of it.
     DeviceBuffer<scalar> orthDeltaCoeffs;
+    // A PER-CELL MAP of this interface's faces, and each face's TWIN on the other side of the pair.
+    // The kernels above scatter with atomics, which is fine for a sum; MULES gathers, because its
+    // limiter is a per-cell budget and the explicit path is deliberately atomics-free
+    // (device_mules.cuh). ifCellStart is a CSR over cells into ifPerm, which holds interface-face
+    // indices; twin[j] is the index of the face j pairs with, or -1 where there is none (an AMI side,
+    // which OpenFOAM does NOT sync -- see MULES's sync note).
+    DeviceBuffer<label> ifCellStart, ifPerm, twin;
     DeviceBuffer<scalar> Sfx, Sfy, Sfz;         // face area vector, oriented OUT of ownCell
     DeviceBuffer<scalar> dOwnX, dOwnY, dOwnZ;   // Cf - C[own]          (linearUpwind face delta, own side)
     DeviceBuffer<scalar> dNbrX, dNbrY, dNbrZ;   // Cf_nbr - C[nbr]      (linearUpwind face delta, nbr side, UN-rotated)
@@ -90,6 +98,44 @@ inline DeviceCyclic buildDeviceCyclic(
             dlz.push_back(c.delta[i].z);
         }
     }
+    // the CSR over owner cells, and the twin map. Both sides of a pair are stored in patch order, so
+    // side A's face i twins with side B's face i; the offsets are what turns that into an index.
+    std::vector<label> cellStart, perm, twin(oc.size(), -1);
+    {
+        std::map<label, std::size_t> offsetOfPatch;
+        std::size_t off = 0;
+        for (const auto& c : cyclics)
+        {
+            offsetOfPatch[static_cast<label>(c.patch)] = off;
+            off += c.faceCells.size();
+        }
+        off = 0;
+        for (const auto& c : cyclics)
+        {
+            const auto it = offsetOfPatch.find(static_cast<label>(c.nbrPatch));
+            for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+            {
+                if (it != offsetOfPatch.end())
+                {
+                    twin[off + i] = static_cast<label>(it->second + i);
+                }
+            }
+            off += c.faceCells.size();
+        }
+        label maxCell = -1;
+        for (const label cc : oc) maxCell = std::max(maxCell, cc);
+        std::vector<label> count(static_cast<std::size_t>(maxCell + 2), 0);
+        for (const label cc : oc) ++count[static_cast<std::size_t>(cc) + 1];
+        cellStart.assign(count.size(), 0);
+        for (std::size_t i = 1; i < count.size(); ++i) cellStart[i] = cellStart[i - 1] + count[i];
+        std::vector<label> fill = cellStart;
+        perm.assign(oc.size(), 0);
+        for (std::size_t j = 0; j < oc.size(); ++j)
+        {
+            perm[static_cast<std::size_t>(fill[static_cast<std::size_t>(oc[j])]++)] = static_cast<label>(j);
+        }
+    }
+
     DeviceCyclic d;
     d.n = (int)oc.size();
     d.rotational = rot;
@@ -97,6 +143,9 @@ inline DeviceCyclic buildDeviceCyclic(
     d.nbrCell.copyFrom(nc);
     d.deltaCoeffs.copyFrom(dc);
     d.orthDeltaCoeffs.copyFrom(odc);
+    d.ifCellStart.copyFrom(cellStart);
+    d.ifPerm.copyFrom(perm);
+    d.twin.copyFrom(twin);
     d.weights.copyFrom(w);
     d.magSf.copyFrom(ms);
     d.Sfx.copyFrom(sfx);

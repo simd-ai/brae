@@ -3204,6 +3204,20 @@ add_test(NAME device_cyclic_laplacian_vs_host_skew
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannelSkew)
 set_tests_properties(device_cyclic_laplacian_vs_host_skew PROPERTIES SKIP_RETURN_CODE 77)
 
+# MULES's limiter across a cyclic pair: the device's lambda against the host's
+add_executable(test_device_mules_cyclic_vs_host tests/test_device_mules_cyclic_vs_host.cu)
+target_include_directories(test_device_mules_cyclic_vs_host PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_mules_cyclic_vs_host PRIVATE brae_core)
+add_test(NAME device_mules_cyclic_vs_host
+         COMMAND test_device_mules_cyclic_vs_host
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannel)
+set_tests_properties(device_mules_cyclic_vs_host PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME device_mules_cyclic_vs_host_skew
+         COMMAND test_device_mules_cyclic_vs_host
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannelSkew)
+set_tests_properties(device_mules_cyclic_vs_host_skew PROPERTIES SKIP_RETURN_CODE 77)
+
 # the device Gauss gradient against the host's fvc::gaussGrad, bit for bit, with the two forms the device
 # used to have as controls
 add_executable(test_device_gauss_grad tests/test_device_gauss_grad.cu)

@@ -72,6 +72,11 @@ __global__ void setupKernel(
     const scalar* __restrict__ rho, const scalar* __restrict__ rhoOld,
     const scalar* __restrict__ Sp,  const scalar* __restrict__ Su,
     const scalar* __restrict__ psiMaxF, const scalar* __restrict__ psiMinF,
+    // the COUPLED faces, which are in none of the three lists above: the device mesh keeps a cyclic
+    // patch out of its boundary gather entirely (device_mesh.cuh:41-44)
+    const label* __restrict__ ifCellStart, const label* __restrict__ ifPerm,
+    const label* __restrict__ ifNbrCell,
+    const scalar* __restrict__ ifPhiBD, const scalar* __restrict__ ifPhiCorr,
     scalar rDeltaT, scalar extremaCoeff, scalar boundaryDeltaExtremaCoeff, scalar smoothLimiter,
     scalar* __restrict__ psiMaxn, scalar* __restrict__ psiMinn,
     scalar* __restrict__ sumPhip, scalar* __restrict__ mSumPhim)
@@ -111,6 +116,24 @@ __global__ void setupKernel(
         if (pc > scalar(0)) mSP += pc;
         else                sP  -= pc;
     }
+    // COUPLED faces, transcribed from the host's patch loop (mules_cpp.cu:181-204): the neighbour
+    // CELL's value enters the extrema -- not a stored patch value, because psi really is that on the
+    // other side -- and phiBD/phiCorr enter the budgets with the owner-face sign, as any patch face does.
+    if (ifCellStart)
+    {
+        for (int k = ifCellStart[c]; k < ifCellStart[c + 1]; ++k)
+        {
+            const int j = ifPerm[k];
+            const scalar pn = psi[ifNbrCell[j]];
+            mx = fmax(mx, pn);
+            mn = fmin(mn, pn);
+            sBD += ifPhiBD[j];
+            const scalar pc = ifPhiCorr[j];
+            if (pc > scalar(0)) sP  += pc;
+            else                mSP -= pc;
+        }
+    }
+
     // boundary faces
     for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)
     {
@@ -163,6 +186,8 @@ __global__ void iterCellKernel(
     const scalar* __restrict__ phiCorr,  const scalar* __restrict__ phiCorrBnd,
     const scalar* __restrict__ psiMaxn,  const scalar* __restrict__ psiMinn,
     const scalar* __restrict__ sumPhip,  const scalar* __restrict__ mSumPhim,
+    const label*  __restrict__ ifCellStart, const label* __restrict__ ifPerm,
+    const scalar* __restrict__ ifLambda, const scalar* __restrict__ ifPhiCorr,
     scalar* __restrict__ lambdam, scalar* __restrict__ lambdap)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -191,12 +216,55 @@ __global__ void iterCellKernel(
         else                 msl -= lpc;
     }
 
+    if (ifCellStart)
+    {
+        for (int k = ifCellStart[c]; k < ifCellStart[c + 1]; ++k)
+        {
+            const int j = ifPerm[k];
+            const scalar lpc = ifLambda[j] * ifPhiCorr[j];
+            if (lpc > scalar(0)) sl  += lpc;
+            else                 msl -= lpc;
+        }
+    }
+
     // OpenFOAM reuses the accumulators as the limiters and then aliases them the other way round --
     // lambdam IS sumlPhip and lambdap IS mSumlPhim (MULESTemplates.C:501-502). The crossing is
     // deliberate: a face carrying a POSITIVE correction out of the owner is constrained by the owner's
     // lower-bound limiter and the neighbour's upper-bound one.
     lambdam[c] = clamp01d((sl  + psiMaxn[c]) / (mSumPhim[c] + kRootVSmall));
     lambdap[c] = clamp01d((msl + psiMinn[c]) / (sumPhip[c]  + kRootVSmall));
+}
+
+// ...part 2a: a COUPLED face takes THIS SIDE's per-cell limiter (mules_cpp.cu:311-318, and
+// MULESTemplates.C:543). The other side's arrives through the sync below, which is what makes the pair
+// behave as the one internal face it is.
+__global__ void iterIfFaceKernel(
+    int n,
+    const label*  __restrict__ own,
+    const scalar* __restrict__ phiCorr,
+    const scalar* __restrict__ lambdam, const scalar* __restrict__ lambdap,
+    scalar* __restrict__ lambda)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    const int o = own[j];
+    lambda[j] = (phiCorr[j] > scalar(0)) ? fmin(lambda[j], lambdap[o]) : fmin(lambda[j], lambdam[o]);
+}
+
+// ...part 2b: syncTools::syncFaceList with minEqOp -- NOT a no-op in serial, it leaves both sides of a
+// cyclic face with the SMALLER limiter (mules_cpp.cu:321-345). It does NOT sync an AMI pair, whose twin
+// is -1 here. Reads a snapshot so the two writes of a pair cannot race.
+__global__ void syncIfLambdaKernel(
+    int n,
+    const label*  __restrict__ twin,
+    const scalar* __restrict__ lambdaIn,
+    scalar* __restrict__ lambda)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    const label t = twin[j];
+    if (t < 0) return;
+    lambda[j] = fmin(lambdaIn[j], lambdaIn[t]);
 }
 
 // ...part 2: tighten each face against the two cells it joins.
@@ -480,7 +548,11 @@ void deviceMulesLimiter(
     const DeviceMulesFields&     f,
     const DeviceMulesControls&   c,
     DeviceBuffer<scalar>&        lambdaInt,
-    DeviceBuffer<scalar>&        lambdaBnd)
+    DeviceBuffer<scalar>&        lambdaBnd,
+    const DeviceCyclic*          cyc,
+    const DeviceBuffer<scalar>*  phiBDIf,
+    const DeviceBuffer<scalar>*  phiCorrIf,
+    DeviceBuffer<scalar>*        lambdaIf)
 {
     if (c.nLimiterIter < 1)
         throw std::runtime_error("brae deviceMules: nLimiterIter must be at least 1.");
@@ -499,6 +571,24 @@ void deviceMulesLimiter(
     { fillKernel<<<nBlocks(nBoundaryFaces), TPB>>>(lambdaBnd.data(), nBoundaryFaces, scalar(1)); }
     ckM(cudaGetLastError(), "lambda init");
 
+    // the COUPLED faces, if the caller has any. All four arrive together or none does: a limiter that
+    // saw the interface's extrema but not its fluxes would be a third thing, neither the host's nor a
+    // refusal.
+    const int nIf2 = (cyc && phiBDIf && phiCorrIf && lambdaIf) ? cyc->n : 0;
+    if ((cyc && cyc->n > 0) && nIf2 == 0)
+    {
+        throw std::runtime_error(
+            "brae deviceMules: a cyclic interface was given without its phiBD, phiCorr and lambda. "
+            "MULES limits a coupled face like an internal one (MULESTemplates.C:543 and the sync that "
+            "follows); limiting it with only some of them is not that.");
+    }
+    if (nIf2 > 0)
+    {
+        lambdaIf->resize(static_cast<std::size_t>(nIf2));
+        fillKernel<<<nBlocks(nIf2), TPB>>>(lambdaIf->data(), nIf2, scalar(1));
+        ckM(cudaGetLastError(), "lambda init, interface");
+    }
+
     DeviceBuffer<scalar> psiMaxn(nC), psiMinn(nC), sumPhip(nC), mSumPhim(nC), lambdam(nC), lambdap(nC);
 
     setupKernel<<<nBlocks(nC), TPB>>>(
@@ -508,6 +598,9 @@ void deviceMulesLimiter(
         psi.data(), psiOld.data(), psiBndValue.data(),
         phiBDInt.data(), phiBDBnd.data(), phiCorrInt.data(), phiCorrBnd.data(),
         dm.V.data(), f.rho, f.rhoOld, f.Sp, f.Su, f.psiMax, f.psiMin,
+        nIf2 ? cyc->ifCellStart.data() : nullptr, nIf2 ? cyc->ifPerm.data() : nullptr,
+        nIf2 ? cyc->nbrCell.data() : nullptr,
+        nIf2 ? phiBDIf->data() : nullptr, nIf2 ? phiCorrIf->data() : nullptr,
         rDeltaT, c.extremaCoeff, boundaryDeltaExtremaCoeff, c.smoothLimiter,
         psiMaxn.data(), psiMinn.data(), sumPhip.data(), mSumPhim.data());
     ckM(cudaGetLastError(), "setup");
@@ -520,6 +613,8 @@ void deviceMulesLimiter(
             bndFlag.data(), lambdaInt.data(), lambdaBnd.data(),
             phiCorrInt.data(), phiCorrBnd.data(),
             psiMaxn.data(), psiMinn.data(), sumPhip.data(), mSumPhim.data(),
+            nIf2 ? cyc->ifCellStart.data() : nullptr, nIf2 ? cyc->ifPerm.data() : nullptr,
+            nIf2 ? lambdaIf->data() : nullptr, nIf2 ? phiCorrIf->data() : nullptr,
             lambdam.data(), lambdap.data());
         ckM(cudaGetLastError(), "iter cell");
 
@@ -535,6 +630,21 @@ void deviceMulesLimiter(
             iterBoundaryKernel<<<nBlocks(nBoundaryFaces), TPB>>>(
                 nBoundaryFaces, bndFlag.data(), lambdaBnd.data());
             ckM(cudaGetLastError(), "iter boundary");
+        }
+        if (nIf2 > 0)
+        {
+            iterIfFaceKernel<<<nBlocks(nIf2), TPB>>>(
+                nIf2, cyc->ownCell.data(), phiCorrIf->data(),
+                lambdam.data(), lambdap.data(), lambdaIf->data());
+            ckM(cudaGetLastError(), "iter interface face");
+            // ...and the sync, off a snapshot, in the host's own order: the face limiter first, the
+            // pair's minimum after it (mules_cpp.cu:311-345)
+            DeviceBuffer<scalar> snapshot(static_cast<std::size_t>(nIf2));
+            ckM(cudaMemcpy(snapshot.data(), lambdaIf->data(), sizeof(scalar)*nIf2,
+                           cudaMemcpyDeviceToDevice), "lambda snapshot");
+            syncIfLambdaKernel<<<nBlocks(nIf2), TPB>>>(
+                nIf2, cyc->twin.data(), snapshot.data(), lambdaIf->data());
+            ckM(cudaGetLastError(), "sync interface lambda");
         }
     }
 }
@@ -600,6 +710,8 @@ void deviceMulesLimiterCorr(
             bndFlag.data(), lambdaInt.data(), lambdaBnd.data(),
             phiCorrInt.data(), phiCorrBnd.data(),
             psiMaxn.data(), psiMinn.data(), sumPhip.data(), mSumPhim.data(),
+            // CMULES has no interface faces of its own yet -- the corrected path is a separate port
+            nullptr, nullptr, nullptr, nullptr,
             lambdam.data(), lambdap.data());
         ckM(cudaGetLastError(), "CMULES iteration, cells");
 
