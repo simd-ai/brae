@@ -3232,6 +3232,16 @@ add_test(NAME device_inter_peqn_cyclic_vs_host_skew
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannelSkew)
 set_tests_properties(device_inter_peqn_cyclic_vs_host_skew PROPERTIES SKIP_RETURN_CODE 77)
 
+# the device's nHatf on a cyclic pair against REAL OpenFOAM's own written field
+add_executable(test_device_cyclic_nhatf_vs_openfoam tests/test_device_cyclic_nhatf_vs_openfoam.cu)
+target_include_directories(test_device_cyclic_nhatf_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_cyclic_nhatf_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_cyclic_nhatf_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_cyclic_nhatf_vs_openfoam.sh)
+set_tests_properties(interfoam_cyclic_nhatf_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}")
+
 # the device Gauss gradient against the host's fvc::gaussGrad, bit for bit, with the two forms the device
 # used to have as controls
 add_executable(test_device_gauss_grad tests/test_device_gauss_grad.cu)

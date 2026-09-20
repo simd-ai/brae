@@ -27,6 +27,7 @@
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
+#include "device_cyclic.cuh"
 
 namespace brae {
 
@@ -88,6 +89,22 @@ void deviceInterfaceCorrect(
     const DeviceBuffer<scalar>& nHatfBnd,       // contact angle already applied, where there is one
     scalar                      deltaN,
     DeviceBuffer<scalar>&       nHatfInt,
-    DeviceBuffer<scalar>&       K);
+    DeviceBuffer<scalar>&       K,
+    // THE PAIR: its faces carry an interface normal like any other, and the curvature's divergence sums
+    // them. interfaceProperties.C:134-150 -- gradAlphaf is fvc::interpolate(grad(alpha)), which on a
+    // coupled patch is the two CELLS' gradients weighted.
+    DeviceCyclic*               cyc = nullptr,
+    DeviceBuffer<scalar>*       nHatfIf = nullptr);
+
+// nHatf on the faces of a PERIODIC PAIR alone, from a gradient the caller has already given the pair's
+// own contribution. interfaceProperties.C:134-150, with fvc::interpolate's coupled branch as the face
+// gradient. Gated against OpenFOAM's OWN written nHatf in tests/interfoam_cyclic_nhatf_vs_openfoam.sh.
+void deviceInterfaceNormalFluxCyclic(
+    DeviceCyclic&               cyc,
+    const DeviceBuffer<scalar>& gx,
+    const DeviceBuffer<scalar>& gy,
+    const DeviceBuffer<scalar>& gz,
+    scalar                      deltaN,
+    DeviceBuffer<scalar>&       nHatfIf);
 
 } // namespace brae
