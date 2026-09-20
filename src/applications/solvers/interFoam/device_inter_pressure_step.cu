@@ -54,6 +54,17 @@ scalar deviceInterPressureStep(
     DeviceBuffer<scalar>&              p,
     DevicePressureTaps*                taps)
 {
+    // THE PAIR, if the mesh has one, needs its own phiHbyA before anything here is meaningful: the
+    // pressure source is fvc::div(phiHbyA), which sums a coupled face like any other (fvc.cu:548-550).
+    if (in.cyc && in.cyc->n > 0 && !in.phiHbyAIf)
+    {
+        throw std::runtime_error(
+            "brae interFoam device pEqn: the mesh has a periodic pair and no phiHbyA was given on it. "
+            "gpu::pressurePredictor builds HbyA and its flux on the internal and boundary faces only; "
+            "until it carries the pair, the pressure source would be missing those faces entirely. The "
+            "host loop (no -device) carries it.");
+    }
+
     if (!in.stf || !in.ghf || !in.snGradRho || !in.magSf || !in.rAUfAll || !in.rho || !in.gh)
         throw std::runtime_error("brae interFoam device pEqn: a required field is missing.");
     if (!hooks.pressureCoeffs)

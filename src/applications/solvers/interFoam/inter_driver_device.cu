@@ -652,6 +652,28 @@ RunReport runInterFoamDevice(
         f.p_rgh.evaluateBoundary();
     };
 
+    // THE MESH'S PERIODIC PAIR on the device. The caller attaches the coupling before it hands the
+    // patches over (attachCyclicCoupling, braeInterFoam.cu:166), so a coupled patch here is one whose
+    // neighbour cells and weights are already filled. Its VOLUMETRIC FLUX is state of the same kind as
+    // phi: seeded from the field the case started with, rewritten by every pressure corrector.
+    const std::vector<CyclicInterface> cyclics = buildCyclicInterfaces(m, g, fvp);
+    DeviceCyclic dCyc = buildDeviceCyclic(cyclics, g, fvp);
+    DeviceBuffer<scalar> dAlphaPhiIf, dRhoPhiIf;
+    if (dCyc.n > 0)
+    {
+        std::vector<scalar> seed;
+        for (const CyclicInterface& c : cyclics)
+        {
+            for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+            {
+                seed.push_back(f.phi.boundary[static_cast<std::size_t>(c.patch)][i]);
+            }
+        }
+        dCyc.phi.copyFrom(seed);
+        dAlphaPhiIf.copyFrom(std::vector<scalar>(static_cast<std::size_t>(dCyc.n), scalar(0)));
+        dRhoPhiIf.copyFrom(std::vector<scalar>(static_cast<std::size_t>(dCyc.n), scalar(0)));
+    }
+
     // THE CASE'S MRF ZONES on the device, built from the host's validated cpu::MRF::Zone rather than from
     // a second face classification (device_MRF.cuh). The geometry is static and Omega constant, so the
     // per-face frame flux is precomputed once here. Three of interFoam's four MRF calls are the step's
@@ -778,6 +800,9 @@ RunReport runInterFoamDevice(
     C.divSchemeCoeff = f.divRhoPhiUCoeff;
     C.nCorrectors = static_cast<int>(f.pimple.nCorrectors);
     C.mrf = f.mrfZones.empty() ? nullptr : &dMrf;
+    C.cyc        = (dCyc.n > 0) ? &dCyc : nullptr;
+    C.alphaPhiIf = (dCyc.n > 0) ? &dAlphaPhiIf : nullptr;
+    C.rhoPhiIf   = (dCyc.n > 0) ? &dRhoPhiIf : nullptr;
     C.porosity = dPorosity.active ? &dPorosity : nullptr;
     // p_rgh's reference, where the host driver sets it (inter_driver_cpp.cu:779-781). These three were
     // dead for as long as the device refused a case that needs one, and a step that never pins leaves the

@@ -94,6 +94,11 @@ struct DeviceInterPressureInput
     // the mesh's periodic pair: its laplacian coefficients go into the matrix and its off-diagonal into
     // every SpMV of the solve
     DeviceCyclic*               cyc = nullptr;
+    // ...and phiHbyA ON THE PAIR. fvc::flux(HbyA) there is the two cells' HbyA interpolated and dotted
+    // with Sf (deviceCyclicFlux), which gpu::pressurePredictor does not yet produce -- so a caller with
+    // a pair and no such array is refused below rather than solved against a source that is missing the
+    // pair's own flux.
+    const DeviceBuffer<scalar>* phiHbyAIf = nullptr;
     // MRFZoneList::makeRelative(phiHbyA), pEqn.H:19
     const std::vector<DeviceMRFZone>* mrf = nullptr;
 

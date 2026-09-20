@@ -106,6 +106,12 @@ void deviceInterStep(
     ain.phiBnd   = &phiBnd;
     ain.phiCNInt = &phiInt;                 // Euler: phiCN IS phi
     ain.phiCNBnd = &phiBnd;
+    // THE PAIR, whose faces are in neither array above. Its volumetric flux lives in cyc->phi and is
+    // the caller's to keep current -- the pressure corrector rewrites it at the end of every pass, as
+    // it rewrites phi -- and phiCN is that same flux under Euler, exactly as above.
+    ain.cyc        = ctl.cyc;
+    ain.phiCNIf    = ctl.cyc ? &ctl.cyc->phi : nullptr;
+    ain.alphaPhiIf = ctl.alphaPhiIf;
     ain.rho1 = props.rho1;
     ain.rho2 = props.rho2;
 
@@ -113,6 +119,7 @@ void deviceInterStep(
     DeviceBuffer<scalar> alpha2Bnd;
     DeviceInterAlphaControls actl = ctl.alpha;
     actl.alpha2BndOut = &alpha2Bnd;
+    actl.rhoPhiIf     = ctl.rhoPhiIf;
     deviceInterAlphaStep(dm, alpha1, alpha1Old, deltaT, ain, ctl.mules, actl, props, hooks.alpha,
                          alpha1Bnd, nHatfBnd, bndAlphaFixesValue, bndAlphaFlag,
                          nHatfInt, K, rhoPhiInt, rhoPhiBnd, alpha2, rho, mu, nu);
@@ -420,6 +427,7 @@ void deviceInterStep(
         pi.rhoBndFace = &rhoBnd;
         pi.bndUFixesValue = &bndUFixesValue;
         pi.mrf = ctl.mrf;
+        pi.cyc = ctl.cyc;
         pi.needReference = ctl.needReference;
         pi.pRefCell = ctl.pRefCell;
         pi.pRefValue = ctl.pRefValue;

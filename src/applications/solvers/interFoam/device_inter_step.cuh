@@ -124,6 +124,11 @@ struct DeviceInterStepControls
     // momentum coupling reads it for its convective half -- which is why the alpha step has to fill it
     // before the momentum matrix is assembled.
     DeviceCyclic* cyc = nullptr;
+    // ...and the two per-face arrays the pair needs that nothing else owns: the alpha flux the
+    // correctors carry between them, and the mass flux the momentum equation reads. The DRIVER owns
+    // both, because they outlive a step the way phi does.
+    DeviceBuffer<scalar>* alphaPhiIf = nullptr;
+    DeviceBuffer<scalar>* rhoPhiIf   = nullptr;
     DeviceInterAlphaControls  alpha;
     DeviceMulesControls       mules;
     // The alpha equation's per-step settings -- cAlpha, deltaN and the two flux schemes. The flux
