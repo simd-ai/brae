@@ -75,6 +75,31 @@ __global__ void svZeroFaceKernel(
 }
 
 
+// ...and so does a face on a COUPLED patch, which the boundary arrays above do not carry.
+// fvMatrix::setValuesFromList walks every face of a constrained cell and zeroes internalCoeffs AND
+// boundaryCoeffs on the patch owning it (fvMatrix.C), with no exemption for a cyclic. Only the
+// off-diagonal is zeroed here: brae folds the pair's diagonal half straight into M.diag and then sets
+// source = value*diag from that same diag, so the diagonal halves cancel and the row reads
+// diag*psi = value*diag either way -- what must go is the term that still injects psi[nbr].
+// MEASURED on damBreakPorousBaffle at step one, every solve pinned at 1e-16: the two cells touching
+// BOTH the baffle pair and lowerWall read epsilon 2.0234 against the host's 1.9862 while every
+// pair-only cell agreed to 1e-12, and the device gave those two cells DIFFERENT values where the wall
+// function gives one.
+__global__ void svCyclicKernel(
+    int           n,
+    const label*  ownCell,
+    const label*  mask,
+    scalar*       ifCoeff)
+{
+    const int j = blockIdx.x*blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    if (mask[ownCell[j]])
+    {
+        ifCoeff[j] = scalar(0.0);
+    }
+}
+
+
 // Every BOUNDARY face of a constrained cell loses its coefficients too -- including a face on a patch
 // that has nothing to do with the wall function. Without this an outlet div(phi) coefficient on a
 // wall/outlet corner cell is folded into the diagonal at solve time and pulls the pinned cell off its
@@ -546,7 +571,8 @@ void deviceSetValues(
     DeviceBuffer<scalar>&       source,
     DeviceBuffer<scalar>&       internalCoeffs,
     DeviceBuffer<scalar>&       boundaryCoeffs,
-    DeviceBuffer<scalar>&       psi)
+    DeviceBuffer<scalar>&       psi,
+    DeviceCyclic*               cyc)
 {
     const int nC  = dm.nCells;
     const int nIf = dm.nInternalFaces;
@@ -568,6 +594,12 @@ void deviceSetValues(
         svBndKernel<<<nBlocks(nB), TPB>>>(nB, dm.bndCell.data(), mask.data(),
                                           internalCoeffs.data(), boundaryCoeffs.data());
         cudaCheck(cudaGetLastError(), "fvOptions setValues zero boundary");
+    }
+    if (cyc && cyc->n > 0 && cyc->ifCoeff.size() == static_cast<std::size_t>(cyc->n))
+    {
+        svCyclicKernel<<<nBlocks(cyc->n), TPB>>>(cyc->n, cyc->ownCell.data(), mask.data(),
+                                                 cyc->ifCoeff.data());
+        cudaCheck(cudaGetLastError(), "fvOptions setValues zero the pair");
     }
     svCellKernel<<<nBlocks(nC), TPB>>>(nC, mask.data(), value.data(), diag.data(), psi.data(),
                                        source.data());

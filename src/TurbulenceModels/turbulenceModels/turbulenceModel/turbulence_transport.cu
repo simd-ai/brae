@@ -318,7 +318,7 @@ void solveScalarEqn(
     auto applySetValues = [&](const DeviceBuffer<label>* mask, const DeviceBuffer<scalar>* val)
     {
         if (!mask || !val) return;
-        deviceSetValues(dm, *mask, *val, M.diag, M.upper, M.lower, M.source, M.iC, M.bC, field);
+        deviceSetValues(dm, *mask, *val, M.diag, M.upper, M.lower, M.source, M.iC, M.bC, field, cyc);
     };
     applySetValues(fvoMask, fvoVal);
     applySetValues(wallMask, wallVal);

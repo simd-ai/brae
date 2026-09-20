@@ -9,6 +9,7 @@
 #include "device_boundary.cuh"   // DeviceBoundary, for the limitTemperature boundary clamp
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"      // DeviceMesh -- deviceSetValues walks the ldu addressing
+#include "device_cyclic.cuh"    // DeviceCyclic -- a constrained row loses the pair's coefficient too
 
 namespace brae {
 
@@ -77,6 +78,10 @@ void deviceFvoVelocityDamping(const DeviceBuffer<label>& cells, scalar UMax, sca
 
 // fvMatrix::setValues, the matrix manipulation OpenFOAM's fvOptions CONSTRAINTS and the turbulence wall
 // functions both end in. Shared: the kEpsilon closure and the energy equation apply the same one.
+// `cyc` is the PAIR whose off-diagonal the constrained rows must lose as well: fvMatrix.C zeroes a
+// coupled patch's coefficients for a constrained cell like any other patch's, and the device's boundary
+// arrays carry no coupled face. Null on a mesh without one, which is why it is defaulted rather than
+// required -- every caller on an uncoupled mesh is unchanged.
 void deviceSetValues(
     const DeviceMesh&           dm,
     const DeviceBuffer<label>&  mask,     // per CELL, non-zero = pinned
@@ -87,6 +92,7 @@ void deviceSetValues(
     DeviceBuffer<scalar>&       source,
     DeviceBuffer<scalar>&       internalCoeffs,
     DeviceBuffer<scalar>&       boundaryCoeffs,
-    DeviceBuffer<scalar>&       psi);
+    DeviceBuffer<scalar>&       psi,
+    DeviceCyclic*               cyc = nullptr);
 
 } // namespace brae
