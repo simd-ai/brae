@@ -40,6 +40,12 @@
 // form is identical. That arm is what discriminates: BROKEN once, with the interpolation weight on the
 // wrong side, the value bound barely moves (1.9e-17, because this mesh's weights are near 0.5) while
 // the bitwise arm falls from 20 of 20 to 2 of 20 and the divergence goes 1.9e-14.
+//
+// THE UPWIND CONVECTION coefficients are here too, because the alpha equation's implicit pre-solve
+// assembles them and a periodic mesh's pair is in neither of its face lists: internalCoeffs = phi*w,
+// boundaryCoeffs = -(phi*(1 - w)), w = pos0(phi) (fvm.cuh:536-549). Device against host, both meshes:
+// exactly 0.0 on the interface coefficient and on the diagonal, with the flux changing sign over the
+// pair so both upwind branches are taken and neither quantity identically zero.
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -314,6 +320,86 @@ int main(int argc, char** argv)
         check("...and the momentum diagonal it writes is the host's",
               worstDiag <= scalar(1e-14)*std::fmax(diagScale, scalar(1e-300)));
         }
+    }
+
+    // ---- THE UPWIND CONVECTION COEFFICIENTS on the pair ------------------------------------------
+    // fvm::div(phi, psi) with upwind weights gives a coupled face internalCoeffs = phi*w and
+    // boundaryCoeffs = -(phi*(1 - w)) with w = pos0(phi), as on an internal face (fvm.cuh:536-549).
+    // That is what the alpha equation's implicit pre-solve assembles, and deviceCyclicAddConvection is
+    // its device twin -- it ADDS to whatever the laplacian left, which is why it runs on a zeroed
+    // diagonal here.
+    {
+        std::vector<scalar> phiB;
+        std::size_t nPos = 0, nNeg = 0;
+        for (const CyclicInterface& c : cyclics)
+        {
+            for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+            {
+                const scalar v = scalar(0.07)*std::sin(scalar(1.3)*scalar(i) + scalar(c.patch));
+                phiB.push_back(v);
+                if (v >= 0) ++nPos; else ++nNeg;
+            }
+        }
+        check("the convection arm's flux changes sign, so both upwind branches are taken",
+              nPos > 0 && nNeg > 0);
+
+        DeviceCyclic cycC = buildDeviceCyclic(cyclics, g, fvp);
+        cycC.phi.copyFrom(phiB);
+        DeviceBuffer<scalar> cdiag(std::vector<scalar>(static_cast<std::size_t>(nC), scalar(0)));
+        {   // ifCoeff is ADDED to, so it starts at zero as the laplacian would have left it
+            std::vector<scalar> zeros(static_cast<std::size_t>(cycC.n), scalar(0));
+            cycC.ifCoeff.copyFrom(zeros);
+        }
+        deviceCyclicAddConvection(cycC, cdiag);
+        std::vector<scalar> devIf, devDiag;
+        cycC.ifCoeff.copyTo(devIf);
+        cdiag.copyTo(devDiag);
+
+        // the host's own, from its upwind div on the same faces
+        SurfaceScalarField phiF;
+        phiF.internal.assign(static_cast<std::size_t>(m.nInternalFaces()), scalar(0));
+        phiF.boundary.resize(fvp.size());
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            phiF.boundary[pi].assign(static_cast<std::size_t>(fvp[pi].size), scalar(0));
+        }
+        {
+            std::size_t j = 0;
+            for (const CyclicInterface& c : cyclics)
+                for (std::size_t i = 0; i < c.faceCells.size(); ++i, ++j)
+                    phiF.boundary[static_cast<std::size_t>(c.patch)][i] = phiB[j];
+        }
+        const FvScalarMatrix hDiv = fvm::div<scalar>(phiF.internal, phiF.boundary, vf, m, fvp);
+        std::vector<scalar> hostIf, hostDiag(static_cast<std::size_t>(nC), scalar(0));
+        for (const CyclicInterface& c : cyclics)
+        {
+            const FvPatch& Pp = fvp[c.patch];
+            for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+            {
+                hostIf.push_back(hDiv.boundaryCoeffs[c.patch][i]);
+                hostDiag[static_cast<std::size_t>(Pp.faceCells[i])] += hDiv.internalCoeffs[c.patch][i];
+            }
+        }
+        scalar wIf = 0, sIf = 0, wD = 0, sD = 0;
+        for (std::size_t j = 0; j < devIf.size() && j < hostIf.size(); ++j)
+        {
+            // the device stores the coefficient deviceAmul multiplies by; the host stores what the
+            // matrix subtracts, so they differ by the sign the laplacian arm above also carries
+            wIf = std::fmax(wIf, std::fabs(devIf[j] - (-hostIf[j])));
+            sIf = std::fmax(sIf, std::fabs(hostIf[j]));
+        }
+        for (label c = 0; c < nC; ++c)
+        {
+            const std::size_t k = static_cast<std::size_t>(c);
+            wD = std::fmax(wD, std::fabs(devDiag[k] - hostDiag[k]));
+            sD = std::fmax(sD, std::fabs(hostDiag[k]));
+        }
+        std::printf("  convection: worst |device - host| interface %.4e (up to %.4e), diagonal %.4e "
+                    "(up to %.4e)\n", (double)wIf, (double)sIf, (double)wD, (double)sD);
+        check("the device's upwind convection coefficient on a coupled face IS the host's",
+              devIf.size() == hostIf.size() && wIf == scalar(0));
+        check("...and so is the diagonal it adds", wD == scalar(0));
+        check("...and neither is identically zero", sIf > scalar(0) && sD > scalar(0));
     }
 
     // ---- THE FLUX, THE DIVERGENCE AND THE GRADIENT ON THE PAIR ----------------------------------

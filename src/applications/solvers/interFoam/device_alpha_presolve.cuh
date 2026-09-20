@@ -53,6 +53,7 @@
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
+#include "device_cyclic.cuh"
 #include "device_pcg.cuh"   // DeviceSolverPerf
 
 namespace brae {
@@ -91,6 +92,12 @@ scalar deviceAlphaPreSolve(
     DeviceBuffer<scalar>&         alphaPhi10Int,
     DeviceBuffer<scalar>&         alphaPhi10Bnd,
     // the solver's own report -- initial and final residual and the iteration count; null = not kept
-    DeviceSolverPerf*             perfOut = nullptr);
+    DeviceSolverPerf*             perfOut = nullptr,
+    // THE PAIR. `cyc->phi` must hold phiCN on its faces before the call; the matrix gains the upwind
+    // coupling and the solve applies it. `alphaPhi10If` comes out as the matrix's flux there, which for
+    // upwind coefficients is phi*(the upwind cell's alpha) -- internalCoeffs*pif - boundaryCoeffs*pnf
+    // with w = pos0(phi) reduces to exactly that, which is why it is the donor-flux kernel.
+    DeviceCyclic*                 cyc = nullptr,
+    DeviceBuffer<scalar>*         alphaPhi10If = nullptr);
 
 } // namespace brae

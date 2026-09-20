@@ -1,6 +1,7 @@
 // The implicit upwind pre-solve -- see device_alpha_presolve.cuh for the provenance and for why the
 // convection here is upwind and not the case's scheme.
 #include "device_alpha_presolve.cuh"
+#include "device_mules.cuh"
 #include "device_ldu.cuh"
 #include "device_pcg.cuh"
 #include "device_amg.cuh"   // deviceSymGaussSeidel
@@ -64,7 +65,9 @@ scalar deviceAlphaPreSolve(
     const DeviceAlphaSolverControls& sc,
     DeviceBuffer<scalar>&         alphaPhi10Int,
     DeviceBuffer<scalar>&         alphaPhi10Bnd,
-    DeviceSolverPerf*             perfOut)
+    DeviceSolverPerf*             perfOut,
+    DeviceCyclic*                 cyc,
+    DeviceBuffer<scalar>*         alphaPhi10If)
 {
     const int nC  = dm.nCells;
     const int nIf = dm.nInternalFaces;
@@ -79,6 +82,16 @@ scalar deviceAlphaPreSolve(
     // reading it from fvSchemes, and so does this.
     DeviceBuffer<scalar> rawDiag, upper, lower;
     deviceDivUpwindCoeffs(dm, phiCNInt, rawDiag, upper, lower);
+    // ...and the PAIR, whose faces are in neither the internal list nor the boundary one. Upwind gives
+    // a coupled face internalCoeffs = phi*w and boundaryCoeffs = -(phi*(1 - w)) with w = pos0(phi), as
+    // on an internal face (fvm.cuh:536-549); deviceCyclicAddConvection is that, gated face by face in
+    // tests/test_device_cyclic_laplacian_vs_host.cu. cyc->phi must already hold phiCN on the pair.
+    if (cyc && cyc->n > 0)
+    {
+        std::vector<scalar> zeros(static_cast<std::size_t>(cyc->n), scalar(0));
+        cyc->ifCoeff.copyFrom(zeros);      // ADDS to the interface coefficient, so it starts clean
+        deviceCyclicAddConvection(*cyc, rawDiag);
+    }
 
     DeviceBuffer<scalar> source(static_cast<std::size_t>(nC));
     eulerDdtKernel<<<nBlocks(nC), TPB>>>(dm.V.data(), alpha1Old.data(), nC, scalar(1)/deltaT,
@@ -90,7 +103,10 @@ scalar deviceAlphaPreSolve(
     DeviceBuffer<scalar> diagC, b;
     deviceFold(dm, rawDiag, source, iC, bC, diagC, b);
 
-    const DeviceLduView A = deviceLduView(dm, diagC, upper, lower);
+    const DeviceLduView A = (cyc && cyc->n > 0)
+        ? deviceLduViewCyclic(dm, diagC, upper, lower, cyc->n, cyc->ownCell.data(),
+                              cyc->nbrCell.data(), cyc->ifCoeff.data())
+        : deviceLduView(dm, diagC, upper, lower);
 
     // OpenFOAM's lduMatrix::solver::normFactor, not sum|b| -- it scales every residual the solver
     // reports and tests, so the absolute `tolerance` means something different under the other one.
@@ -120,6 +136,14 @@ scalar deviceAlphaPreSolve(
     // matrix that IS the upwind flux of the solved field, bit for bit; it is taken from the matrix
     // because that is what alphaEqn.H does and what stays right if the scheme ever changes.
     deviceMatrixFluxInternal(A, alpha1, alphaPhi10Int);
+    // ...and the pair's own face flux. fvMatrix::flux() on a coupled patch is
+    // internalCoeffs*pif - boundaryCoeffs*pnf (fvMatrix.C:1483-1512); with upwind's w = pos0(phi) that
+    // is phi*alpha[own] on an outflow face and phi*alpha[nbr] on an inflow one -- the upwind flux of
+    // the SOLVED alpha, which is what deviceMulesDonorFluxCyclic computes.
+    if (cyc && cyc->n > 0 && alphaPhi10If)
+    {
+        deviceMulesDonorFluxCyclic(*cyc, alpha1, *alphaPhi10If);
+    }
     alphaPhi10Bnd.resize(static_cast<std::size_t>(nBf));
     if (nBf > 0)
     {
