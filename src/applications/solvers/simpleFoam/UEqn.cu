@@ -164,9 +164,15 @@ void assembleUEqn(
     // ---- explicit divDevReff: -fvc::div(nuEff*dev2(T(grad U))) ------------------------------
     // The kernel returns the EXTENSIVE V*div(sigma), which is exactly what the reference adds to `source`
     // (it computes -div(sigma) per volume and then subtracts it times V). So this is the source, directly.
+    // ...WITH THE PAIR. divDevReff is an EXPLICIT term and a periodic face is in it twice: in the
+    // fvc::grad(U) the deviatoric stress is built from, and in the fvc::div of that stress. The
+    // function carries both already; this call handed it a null pair. It is identically zero on a case
+    // at rest -- grad(U) is zero -- and live from the second step: MEASURED on
+    // validation/interFoamCyclic, UEqn's source 2.4e-05 of 2.5e-01 from the host at step two, which is
+    // HbyA 5.3e-04 of 1.9e+00 at the pair's own cells and U 2.1e-04 by the end of the step.
     deviceDivDevReff(dm, dbU, Ux, Uy, Uz, *in.nuEffCell, *in.nuEffBndFace,
                      M.source[0], M.source[1], M.source[2],
-                     /*cyc*/nullptr, /*ami*/nullptr, /*proc*/nullptr, in.UbStored,
+                     in.cyc, /*ami*/nullptr, /*proc*/nullptr, in.UbStored,
                      // The gradSchemes `grad(U)` entry, which linearViscousStress.C:114's fvc::grad(U)
                      // resolves. These five arguments fell through to their defaults, so the case's
                      // limiter never reached the dev2 term on this driver -- the legacy one has passed
