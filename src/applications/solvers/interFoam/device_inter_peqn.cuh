@@ -36,6 +36,7 @@
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
+#include "device_MRF.cuh"
 
 namespace brae {
 
@@ -164,7 +165,10 @@ void deviceInterAddPhiHbyATerms(
     const DeviceBuffer<scalar>& phigBnd,
     bool                        haveDdtCorr,    // false on a start from rest
     DeviceBuffer<scalar>&       phiHbyAInt,
-    DeviceBuffer<scalar>&       phiHbyABnd);
+    DeviceBuffer<scalar>&       phiHbyABnd,
+    // MRFZoneList::makeRelative(phiHbyA), pEqn.H:19 -- BETWEEN the ddtCorr term and phig, which is why
+    // it is applied in here rather than by the caller
+    const std::vector<DeviceMRFZone>* mrf = nullptr);
 
 // phi = phiHbyA - p_rghEqn.flux(), pEqn.H:56. fvMatrix::flux() is
 //     internal  upper*p[nei] - lower*p[own]
@@ -194,9 +198,21 @@ void deviceInterAssemblePEqn(
     const DeviceBuffer<scalar>& phiHbyABnd,
     bool                        needReference,
     int                         pRefCell,
-    scalar                      pRefValue,
+    // p_rgh itself: setReference pins the cell at its CURRENT value (pEqn.H:47), not at pRefValue
+    const DeviceBuffer<scalar>* pRghForRef,
     DevicePressureMatrix&       P,
     bool                        corrected = false,
     const DeviceBuffer<scalar>* nonOrthSource = nullptr);
+
+// pEqn.H:74-83, after p = p_rgh + rho*gh: shift p so that p[pRefCell] is pRefValue, and REBUILD p_rgh
+// from the shifted p (applyPressureReference, inter_peqn_cpp.cu:179-196). Both fields move.
+void deviceInterPressureReference(
+    int                         nC,
+    int                         pRefCell,
+    scalar                      pRefValue,
+    const DeviceBuffer<scalar>& rho,
+    const DeviceBuffer<scalar>& gh,
+    DeviceBuffer<scalar>&       p,
+    DeviceBuffer<scalar>&       p_rgh);
 
 } // namespace brae

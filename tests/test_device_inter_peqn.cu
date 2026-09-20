@@ -416,7 +416,7 @@ int main()
 
         DeviceBuffer<scalar> dRAUf(rAUfInt), dPhiHI(phiHInt), dPhiHB(phiHBnd);
         DevicePressureMatrix P;
-        deviceInterAssemblePEqn(dm, dRAUf, dPhiHI, dPhiHB, /*needReference=*/false, 0, scalar(0), P);
+        deviceInterAssemblePEqn(dm, dRAUf, dPhiHI, dPhiHB, /*needReference=*/false, 0, nullptr, P);
         std::vector<scalar> dd, du, dl, ds;
         P.diag.copyTo(dd);
         failures += brae::gatecheck::nonFinite("dd", dd);
@@ -463,10 +463,18 @@ int main()
         check("the sign of fvMatrix::operator== is a plus, and a minus is a different equation",
               flipped > s4);
 
-        // setReference DOUBLES the diagonal entry rather than replacing the row.
+        // setReference DOUBLES the diagonal entry rather than replacing the row, AND it pins the cell at
+        // p_rgh's CURRENT value there -- getRefCellValue(p_rgh, pRefCell), pEqn.H:47 -- not at the
+        // case's pRefValue, which is p's level and is applied after the solve. The field handed over
+        // holds 7 in cell 3 and something else everywhere else, so a call that read the wrong cell, or a
+        // pRefValue, would not give 7 either.
+        std::vector<scalar> refField(static_cast<std::size_t>(nC));
+        for (label c = 0; c < nC; ++c) refField[c] = scalar(-3) + scalar(0.5)*scalar(c);
+        refField[3] = scalar(7);
+        DeviceBuffer<scalar> dRefField(refField);
         DevicePressureMatrix R;
         deviceInterAssemblePEqn(dm, dRAUf, dPhiHI, dPhiHB, /*needReference=*/true,
-                                /*pRefCell=*/3, /*pRefValue=*/scalar(7), R);
+                                /*pRefCell=*/3, &dRefField, R);
         std::vector<scalar> rd, rs;
         R.diag.copyTo(rd);
         failures += brae::gatecheck::nonFinite("rd", rd);
@@ -480,6 +488,14 @@ int main()
         int nOther = 0;
         for (label c = 0; c < nC; ++c) if (c != 3 && rd[c] != dd[c]) ++nOther;
         check("...and touches no other cell", nOther == 0);
+        // THE CONTROL: the value the device used to pin at, the case's pRefValue. On this fixture
+        // refField[3] is 7 and cell 3's own p_rgh is what OpenFOAM pins, so a pRefValue of 0 -- the
+        // usual entry in a closed case's fvSolution -- gives a different source, and the arm above can
+        // tell the two apart.
+        std::printf("  CONTROL: pinning at a pRefValue of 0 instead would give source %.6g, not %.6g\n",
+                    (double)ds[3], (double)rs[3]);
+        check("pinning at the case's pRefValue is a DIFFERENT source from pinning at the cell's p_rgh",
+              std::fabs(rs[3] - ds[3]) > scalar(1e-12)*std::fabs(rs[3]));
     }
 
     // ---- 7. phiHbyA's two interFoam terms, and phi = phiHbyA - pEqn.flux() -----------------------
@@ -616,7 +632,7 @@ int main()
             DeviceBuffer<scalar> dRAUfI(rAUfInt), dZI(std::vector<scalar>(nIf, scalar(0))),
                                  dZB(std::vector<scalar>(nBf, scalar(0)));
             DevicePressureMatrix P2;
-            deviceInterAssemblePEqn(dm, dRAUfI, dZI, dZB, false, 0, scalar(0), P2);
+            deviceInterAssemblePEqn(dm, dRAUfI, dZI, dZB, false, 0, nullptr, P2);
             DeviceBuffer<scalar> dIC(iCv), dBC(bCv), dP(p_rgh), fI, fB;
             deviceInterPEqnFlux(dm, P2, dIC, dBC, dP, fI, fB);
             std::vector<scalar> gI, gB, wB;

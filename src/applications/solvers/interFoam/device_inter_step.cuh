@@ -109,6 +109,11 @@ struct DeviceInterStepTaps
 
 struct DeviceInterStepControls
 {
+    // The case's MRF zones, built once by the driver (buildDeviceMRFZone). interFoam touches them in
+    // three places -- UEqn.H:6 MRF.DDt(rho, U), pEqn.H:18 MRF.zeroFilter(ddtCorr term) and pEqn.H:19
+    // MRF.makeRelative(phiHbyA) -- and the fourth, MRF.correctBoundaryVelocity(U) at UEqn.H:1, is the
+    // driver's because it writes the HOST field the boundary snapshot is taken from.
+    const std::vector<DeviceMRFZone>* mrf = nullptr;
     DeviceInterAlphaControls  alpha;
     DeviceMulesControls       mules;
     // The alpha equation's per-step settings -- cAlpha, deltaN and the two flux schemes. The flux

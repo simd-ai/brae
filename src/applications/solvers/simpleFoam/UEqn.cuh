@@ -120,6 +120,10 @@ struct MomentumInput
     // `limited <k> corrected` (OF limitedSnGrad). 0 = uncapped, which is what `corrected` means.
     scalar snGradLimitCoeff = 0.0;
     bool   hasMRF = false;
+    // MRF.DDt(rho, U) rather than MRF.DDt(U): MRFZoneList::DDt(rho, U) IS rho*DDt(U) (MRFZoneList.C:
+    // 210-217), so a solver whose momentum equation is rho-weighted (interFoam, rhoSimpleFoam) hands its
+    // rho here and the Coriolis source is weighted per cell. Null = the incompressible form.
+    const DeviceBuffer<scalar>* mrfRho = nullptr;
     bool   hasFvOptions = false;   // an UNIMPLEMENTED option -> refuse
     // explicitPorositySource/DarcyForchheimer, evaluated on the device each iteration from the current U.
     // nuLaminar, not nuEff: DarcyForchheimer.C looks up the field NAMED "nu".

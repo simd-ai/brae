@@ -377,17 +377,27 @@ int main()
     // p == p_rgh + rho*gh EXACTLY, from the fields the last step ended with -- which is what rebuilding
     // p rather than carrying it means.
     {
-        scalar exc = 0, pGap = 0;
+        // WHICH DIRECTION IS EXACT depends on the reference. Without one, p is rebuilt from p_rgh and
+        // `p == p_rgh + rho*gh` holds to the last bit. With one -- this fixture -- OpenFOAM's last
+        // assignment is the other way round: p takes the level shift and `p_rgh = p - rho*gh`
+        // (pEqn.H:83, applyPressureReference in inter_peqn_cpp.cu:179-196), so THAT is the exact
+        // relation and the reverse is exact only to round-off. Both are asserted at zero, in the
+        // direction the code establishes; the other is printed beside.
+        scalar exc = 0, pGap = 0, prghGap = 0, pMag = 0;
         for (label c = 0; c < nC; ++c)
         {
             exc = std::fmax(exc, std::fmax(-alpha[c], alpha[c] - scalar(1)));
-            const scalar want = prgh[c] + rhoV[c]*gh[c];
-            pGap = std::fmax(pGap, std::fabs(pV[c] - want));
+            pGap = std::fmax(pGap, std::fabs(pV[c] - (prgh[c] + rhoV[c]*gh[c])));
+            prghGap = std::fmax(prghGap, std::fabs(prgh[c] - (pV[c] - rhoV[c]*gh[c])));
+            pMag = std::fmax(pMag, std::fabs(pV[c]));
         }
-        std::printf("  alpha excursion %.3e;  |p - (p_rgh + rho*gh)| = %.3e\n",
-                    (double)exc, (double)pGap);
+        std::printf("  alpha excursion %.3e;  |p - (p_rgh + rho*gh)| = %.3e, "
+                    "|p_rgh - (p - rho*gh)| = %.3e\n",
+                    (double)exc, (double)pGap, (double)prghGap);
         check("alpha is still in [0,1] after five whole steps", exc <= scalar(1e-14));
-        check("p is consistent with the p_rgh and rho the step ends with", pGap == scalar(0));
+        check("p_rgh is the shifted p less rho*gh, to the last bit, as pEqn.H:83 leaves it",
+              ctl.needReference && prghGap == scalar(0));
+        check("...and the reverse holds to round-off", pGap <= scalar(1e-12)*std::fmax(scalar(1), pMag));
     }
 
     // ---- 3. THE LOOP ORDER: UEqn is built on the NEW density --------------------------------------

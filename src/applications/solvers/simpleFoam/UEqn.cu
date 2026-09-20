@@ -283,7 +283,30 @@ void assembleUEqn(
     {
         for (int k = 0; k < 3; ++k)
         {
-            deviceMrfCoriolisZone(*in.mrf, dm.V, Ux, Uy, Uz, k, M.source[k]);
+            if (!in.mrfRho)
+            {
+                deviceMrfCoriolisZone(*in.mrf, dm.V, Ux, Uy, Uz, k, M.source[k]);
+                continue;
+            }
+            // ...and rho*DDt(U) where the caller's equation is rho-weighted, as rhoSimpleFoam's device
+            // arm forms it (rhoUEqn.cu:769-777): the kernel writes -V*(Omega x U) into a zeroed
+            // accumulator, which is then multiplied by rho and added. acc already carries the volume and
+            // the sign, and rho is a cell field, so rho*(a*V) == (rho*a)*V -- a rearrangement, not another
+            // term, and the same bits as the host's `source += rho*acc` (inter_ueqn_cpp.cu:210-220).
+            // the accumulator is ACCUMULATED into, so it is memset first: DeviceBuffer's pool hands back
+            // a same-size block that still holds the last user's numbers (rhoUEqn.cu:28-43)
+            DeviceBuffer<scalar> acc, t;
+            acc.resize(static_cast<std::size_t>(dm.nCells));
+            if (dm.nCells > 0)
+            {
+                cudaCheck(cudaMemsetAsync(acc.data(), 0,
+                                          static_cast<std::size_t>(dm.nCells)*sizeof(scalar),
+                                          cudaStreamPerThread),
+                          "UEqn MRF acc zero");
+            }
+            deviceMrfCoriolisZone(*in.mrf, dm.V, Ux, Uy, Uz, k, acc);
+            deviceHadamard(t, acc, *in.mrfRho);
+            deviceAxpy(1.0, t, M.source[k]);
         }
     }
 

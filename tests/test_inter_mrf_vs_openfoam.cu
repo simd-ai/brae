@@ -216,7 +216,7 @@ int main(
     check("the zone moves OpenFOAM's own U far more than brae is from it",
           dOffU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)) && dOffU.rel() > scalar(0.1));
 
-    // THE DEVICE LOOP REFUSES, by name
+    // THE DEVICE LOOP RUNS IT, held to the same bounds
     int nDev = 0;
     if (cudaGetDeviceCount(&nDev) != cudaSuccess)
     {
@@ -225,22 +225,40 @@ int main(
     }
     if (nDev <= 0)
     {
-        std::printf("  (no CUDA device: the device refusal is not exercised)\n");
+        std::printf("  (no CUDA device: the device arm is not exercised)\n");
     }
     else
     {
-        bool named = false;
-        try
-        {
-            InterFields dev;
-            runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
-        }
-        catch (const std::exception& e)
-        {
-            named = std::string(e.what()).find("MRF") != std::string::npos;
-            std::printf("  device: %s\n", e.what());
-        }
-        check("the device loop refuses the case and names MRF", named);
+        // All four of interFoam's MRF calls on the device loop -- correctBoundaryVelocity in the
+        // U-boundary hook, DDt(rho, U) in the shared assembler, zeroFilter on the ddtCorr term and
+        // makeRelative on phiHbyA -- against OpenFOAM at the SAME bounds as the host arm. Each was
+        // transcribed from the host arm's own lines, cited where it is applied.
+        InterFields dev;
+        const RunReport rd = runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
+        check("the device driver ran the same number of steps", rd.steps == nSteps);
+        // ...and its OWN p_rgh solves against OpenFOAM's log.
+        //
+        // WHAT THIS FIXTURE CANNOT TELL: the VALUE setReference pins at. The tutorial's g is (0 0 0), so
+        // gh is zero, p == p_rgh, and the level shift makes p_rgh at the reference cell exactly
+        // pRefValue -- pinning at "the cell's current p_rgh" (pEqn.H:47) and pinning at pRefValue are the
+        // same number here, to the last digit, in the fields AND in all 60 iteration counts and initial
+        // residuals. It is asserted bit-level with a control in tests/test_device_inter_peqn.cu instead.
+        // What this fixture DOES see is the level shift itself: dropped, p_rgh is 3.1e-01 out.
+        failures += brae::gatecheck::compareSolves("device", rd.pSolves, ofP, nSteps);
+        failures += brae::gatecheck::nonFinite("device alpha", dev.alpha1.internal);
+        failures += brae::gatecheck::nonFinite("device U", dev.U.internal);
+        const Diff eA = compare(dev.alpha1.internal, ofAlpha);
+        const Diff eP = compare(dev.p_rgh.internal, ofPrgh);
+        const Diff eU = compare(dev.U.internal, ofU);
+        std::printf("  DEVICE vs OpenFOAM: alpha %.4e, p_rgh %.4e, U %.4e\n",
+                    (double)eA.linf, (double)eP.rel(), (double)eU.rel());
+        check("the DEVICE's alpha agrees with OpenFOAM's", eA.linf < scalar(BOUND_ALPHA));
+        check("...its p_rgh", eP.rel() < scalar(BOUND_PRGH));
+        check("...and its U", eU.rel() < scalar(BOUND_U));
+        // ...and the control again, now against the device's own answer: a fixture that cannot tell the
+        // frame from no frame would pass this arm whatever the four calls did.
+        check("the zone moves OpenFOAM's own U far more than the DEVICE is from it",
+              dOffU.rel() > scalar(1000)*std::fmax(eU.rel(), scalar(1e-14)) && dOffU.rel() > scalar(0.1));
     }
 
     std::printf("test_inter_mrf_vs_openfoam: %d failures\n", failures);

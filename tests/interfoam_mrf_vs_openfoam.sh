@@ -34,6 +34,31 @@
 # NOT CLAIMED, each refused by name: MRF under a moving mesh, MRF under RAS, MRF beside a
 # fixedFluxPressure patch (constrainPressure's MRF.relative), an omega that varies in time, and the
 # device loop.
+# THE DEVICE LOOP RUNS THIS CASE NOW, at the same bounds: alpha 7.3e-15, p_rgh 3.0e-14, U 2.1e-15, and
+# all 60 of its own p_rgh solves take OpenFOAM's iteration counts (initial residuals within 1.5e-11).
+# It took two modules, both transcribed from the host arm's lines:
+#   MRF, all four calls -- correctBoundaryVelocity(U) in the U-boundary hook (UEqn.H:1, on the HOST field
+#   the boundary snapshot is taken from), DDt(rho, U) rho-weighted in the shared assembler before relax
+#   (UEqn.H:6), zeroFilter on the ddtCorr term (pEqn.H:18) and makeRelative(phiHbyA) BETWEEN that term and
+#   phig (pEqn.H:19, which is why the device pEqn splits the two adds).
+#   THE PRESSURE REFERENCE -- setReference at the cell's CURRENT p_rgh (pEqn.H:47) and the level shift of p
+#   with p_rgh rebuilt from it (pEqn.H:74-83). Three controls in the device driver were never set while the
+#   case was refused, so the step never pinned at all: p_rgh was a constant -2.17e+01 out with a spread of
+#   only 1.5e-02 about it, which is how a missing reference reads.
+# BROKEN ONCE EACH, device against OpenFOAM (alpha, p_rgh, U):
+#   correctBoundaryVelocity skipped        8.5e-02, 6.1e-01, 1.6e-01
+#   MRF.DDt dropped                        1.7e-02, 2.9e-01, 2.7e-02
+#   MRF.DDt not rho-weighted               1.7e-02, 2.9e-01, 2.7e-02
+#   zeroFilter dropped                     1.7e-01, 2.2e-01, 1.7e-01
+#   makeRelative dropped                   9.9e-01, 8.7e-01, 1.1e+00
+#   the level shift dropped                    --  , 3.1e-01,   --
+# NOT DISCRIMINATED: the value setReference pins at -- g is (0 0 0) here, so p == p_rgh and the cell's own
+# p_rgh IS pRefValue, to the last digit of every field and every iteration count. test_device_inter_peqn.cu
+# asserts that one bit-level, with the old behaviour as its control.
+# STILL REFUSED on the device: a case that needs a reference AND has an adjustable boundary face, because
+# adjustPhi (pEqn.H:21-26) is not on the device. Every face of this closed vessel has its flux fixed by U,
+# where OpenFOAM's own massCorr stays 1, so the device matches it by doing nothing.
+#
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_mrf_vs_openfoam"

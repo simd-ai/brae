@@ -35,6 +35,7 @@
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
 #include "device_inter_peqn.cuh"
+#include "device_MRF.cuh"
 #include "device_alpha_presolve.cuh"   // DeviceAlphaSolverControls, the same shape of solver entry
 #include "device_dilu.cuh"
 #include "device_gamg_solver.cuh"
@@ -85,6 +86,8 @@ struct DeviceInterPressureInput
 
     // fvc::ddtCorr(U, phi). Null on a start from rest, where there is no old flux to correct against.
     const DeviceBuffer<scalar>* ddtCorrInt = nullptr;
+    // MRFZoneList::makeRelative(phiHbyA), pEqn.H:19
+    const std::vector<DeviceMRFZone>* mrf = nullptr;
 
     bool   needReference = false;
     int    pRefCell      = 0;

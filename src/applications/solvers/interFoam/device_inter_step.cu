@@ -222,6 +222,11 @@ void deviceInterStep(
     uin.ddtUOld[2]    = &UOldZ;
     uin.ddtDeltaT     = deltaT;
     uin.UbStored      = ubPtr;
+    // + MRF.DDt(rho, U), UEqn.H:6, rho-weighted as MRFZoneList::DDt(rho, U) is (MRFZoneList.C:210-217)
+    // and as the host arm forms it (inter_ueqn_cpp.cu:207-221). The shared assembler puts it in the
+    // source before relax, which is where the fvMatrix expression has it.
+    uin.mrf    = ctl.mrf;
+    uin.mrfRho = ctl.mrf ? &rho : nullptr;
 
     probe("muCell", muCell);
     probe("muFace", muFace);
@@ -351,6 +356,17 @@ void deviceInterStep(
         deviceDdtCorr(dm, phiOldInt, phiOldBnd, UOldX, UOldY, UOldZ, bndUFixesValue,
                       /*ddtPhiCoeff=*/scalar(-1), deltaT, ddtCorrI, ddtCorrB);
 
+        // MRF.zeroFilter(interpolate(rho*rAU)*fvc::ddtCorr(U, phi)), pEqn.H:18. MRFZone::zero sets the
+        // flux to Zero on the zone's internal faces and on its included AND excluded boundary faces
+        // (MRFZoneTemplates.C:213-247); the host zeroes the correction itself before the weighting,
+        // which is the same number either way (inter_peqn_cpp.cu:495-520). The correction compares
+        // phi.oldTime() with the flux of U.oldTime(), and inside the zone the first is relative to the
+        // frame and the second is not, so their difference there is the frame flux, not a correction.
+        if (ctl.mrf && !ctl.mrf->empty())
+        {
+            deviceMrfZeroFilter(*ctl.mrf, ddtCorrI, ddtCorrB);
+        }
+
         DeviceInterPressureInput pi;
         pi.stf = &stf;
         pi.ghf = &ghf;
@@ -360,6 +376,7 @@ void deviceInterStep(
         pi.rho = &rho;
         pi.gh  = &gh;
         pi.ddtCorrInt = &ddtCorrI;
+        pi.mrf = ctl.mrf;
         pi.needReference = ctl.needReference;
         pi.pRefCell = ctl.pRefCell;
         pi.pRefValue = ctl.pRefValue;

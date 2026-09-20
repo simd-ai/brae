@@ -136,6 +136,24 @@ __global__ void addPhiHbyATermsKernel(
     phiHbyA[f] += phig[f];
 }
 
+// The same two adds, SEPARATED, because MRF.makeRelative(phiHbyA) runs between them: pEqn.H:14-36 builds
+// phiHbyA from flux(HbyA) and the ddtCorr term, makes it relative, and only then adds phig. The
+// arithmetic is unchanged -- (phiHbyA + rhoRAUf*ddtCorr) + phig in that order either way.
+__global__ void addDdtCorrTermKernel(
+    const scalar* __restrict__ rhoRAUf, const scalar* __restrict__ ddtCorr,
+    int n, scalar* __restrict__ phiHbyA)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f < n) phiHbyA[f] += rhoRAUf[f]*ddtCorr[f];
+}
+
+__global__ void addPhigInternalKernel(const scalar* __restrict__ phig, int n,
+                                      scalar* __restrict__ phiHbyA)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f < n) phiHbyA[f] += phig[f];
+}
+
 __global__ void addPhigBoundaryKernel(const scalar* __restrict__ phig, int n,
                                       scalar* __restrict__ phiHbyA)
 {
@@ -170,14 +188,36 @@ __global__ void addDivSourceKernel(const scalar* __restrict__ div, const scalar*
 
 // fvMatrix::setReference: source += diag*refValue, then diag += diag. It DOUBLES the entry; replacing
 // the row instead gives a different matrix that still solves.
-__global__ void setReferenceKernel(int cell, scalar refValue,
+__global__ void setReferenceKernel(int cell, const scalar* __restrict__ pRgh,
                                    scalar* __restrict__ diag, scalar* __restrict__ source)
 {
     if (blockIdx.x == 0 && threadIdx.x == 0)
     {
-        source[cell] += diag[cell]*refValue;
+        // getRefCellValue(p_rgh, pRefCell), pEqn.H:47: the cell is pinned at ITS CURRENT p_rgh, not at
+        // pRefValue -- pRefValue is p's level and is applied after the solve (deviceInterPressureReference).
+        // The host arm reads it the same way (inter_peqn_cpp.cu:729-737).
+        source[cell] += diag[cell]*pRgh[cell];
         diag[cell]   += diag[cell];
     }
+}
+
+// applyPressureReference (inter_peqn_cpp.cu:179-196), pEqn.H:74-83: p += pRefValue - p[pRefCell], and
+// p_rgh is REBUILT from the shifted p rather than keeping what the solve gave it. Two passes, because
+// every cell reads p[pRefCell] and the reference cell's own thread writes it.
+__global__ void refShiftKernel(int cell, scalar pRefValue,
+                              const scalar* __restrict__ p, scalar* __restrict__ shift)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0) shift[0] = pRefValue - p[cell];
+}
+
+__global__ void applyRefShiftKernel(int nC, const scalar* __restrict__ shift,
+                                    const scalar* __restrict__ rho, const scalar* __restrict__ gh,
+                                    scalar* __restrict__ p, scalar* __restrict__ p_rgh)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    p[c] += shift[0];
+    p_rgh[c] = p[c] - rho[c]*gh[c];
 }
 
 __global__ void divideKernel(const scalar* __restrict__ a, const scalar* __restrict__ b,
@@ -350,7 +390,7 @@ void deviceInterAssemblePEqn(
     const DeviceBuffer<scalar>& phiHbyABnd,
     bool                        needReference,
     int                         pRefCell,
-    scalar                      pRefValue,
+    const DeviceBuffer<scalar>* pRghForRef,
     DevicePressureMatrix&       P,
     bool                        corrected,
     const DeviceBuffer<scalar>* nonOrthSource)
@@ -386,9 +426,35 @@ void deviceInterAssemblePEqn(
             throw std::runtime_error(
                 "brae interFoam device pEqn: pRefCell is outside the mesh. A case whose p_rgh has no "
                 "value-fixing patch is singular without it, so this cannot be defaulted away.");
-        setReferenceKernel<<<1, 1>>>(pRefCell, pRefValue, P.diag.data(), P.source.data());
+        if (!pRghForRef)
+            throw std::runtime_error(
+                "brae interFoam device pEqn: setReference pins the reference cell at p_rgh's CURRENT value "
+                "there (pEqn.H:47), and the field was not handed over.");
+        setReferenceKernel<<<1, 1>>>(pRefCell, pRghForRef->data(), P.diag.data(), P.source.data());
         ckP(cudaGetLastError(), "setReference");
     }
+}
+
+
+void deviceInterPressureReference(
+    int                         nC,
+    int                         pRefCell,
+    scalar                      pRefValue,
+    const DeviceBuffer<scalar>& rho,
+    const DeviceBuffer<scalar>& gh,
+    DeviceBuffer<scalar>&       p,
+    DeviceBuffer<scalar>&       p_rgh)
+{
+    if (nC <= 0) return;
+    if (pRefCell < 0 || pRefCell >= nC)
+        throw std::runtime_error(
+            "brae interFoam device pEqn: pRefCell is outside the mesh, and pEqn.H:74-83 reads p there.");
+    DeviceBuffer<scalar> shift(1);
+    refShiftKernel<<<1, 1>>>(pRefCell, pRefValue, p.data(), shift.data());
+    ckP(cudaGetLastError(), "the reference shift");
+    applyRefShiftKernel<<<nBlocks(nC), TPB>>>(nC, shift.data(), rho.data(), gh.data(),
+                                              p.data(), p_rgh.data());
+    ckP(cudaGetLastError(), "p += shift; p_rgh = p - rho*gh");
 }
 
 
@@ -400,7 +466,8 @@ void deviceInterAddPhiHbyATerms(
     const DeviceBuffer<scalar>& phigBnd,
     bool                        haveDdtCorr,
     DeviceBuffer<scalar>&       phiHbyAInt,
-    DeviceBuffer<scalar>&       phiHbyABnd)
+    DeviceBuffer<scalar>&       phiHbyABnd,
+    const std::vector<DeviceMRFZone>* mrf)
 {
     const int nIf = dm.nInternalFaces, nBf = dm.nBndFaces;
     if (static_cast<int>(phiHbyAInt.size()) != nIf || static_cast<int>(phiHbyABnd.size()) != nBf)
@@ -408,7 +475,24 @@ void deviceInterAddPhiHbyATerms(
             "brae interFoam device pEqn: phiHbyA must already hold fvc::flux(HbyA) on BOTH sides. The "
             "boundary half is not decoration -- fvc::div(phiHbyA) sums it, so it is how a wall's "
             "buoyancy and surface tension reach the pressure equation's source.");
-    if (nIf > 0)
+    // MRF.makeRelative(phiHbyA) sits BETWEEN the two adds (pEqn.H:19, before phig at :36), so with a zone
+    // the ddtCorr term goes in on its own first. Without one the fused kernel stands, unchanged.
+    if (mrf && !mrf->empty())
+    {
+        if (nIf > 0 && haveDdtCorr)
+        {
+            addDdtCorrTermKernel<<<nBlocks(nIf), TPB>>>(
+                rhoRAUfInt.data(), ddtCorrInt.data(), nIf, phiHbyAInt.data());
+            ckP(cudaGetLastError(), "phiHbyA += rhoRAUf*ddtCorr");
+        }
+        deviceMrfMakeRelative(*mrf, phiHbyAInt, phiHbyABnd);
+        if (nIf > 0)
+        {
+            addPhigInternalKernel<<<nBlocks(nIf), TPB>>>(phigInt.data(), nIf, phiHbyAInt.data());
+            ckP(cudaGetLastError(), "phiHbyA += phig");
+        }
+    }
+    else if (nIf > 0)
     {
         addPhiHbyATermsKernel<<<nBlocks(nIf), TPB>>>(
             rhoRAUfInt.data(), haveDdtCorr ? ddtCorrInt.data() : nullptr, phigInt.data(),

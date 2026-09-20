@@ -87,7 +87,7 @@ scalar deviceInterPressureStep(
     deviceInterAddPhiHbyATerms(dm, rhoRAUf,
                                in.ddtCorrInt ? *in.ddtCorrInt : zeroIf,
                                phigInt, phigBnd, in.ddtCorrInt != nullptr,
-                               phiHbyAInt, phiHbyABnd);
+                               phiHbyAInt, phiHbyABnd, in.mrf);
 
     // rAUf on the internal faces -- the head of the full array the caller passed.
     DeviceBuffer<scalar> rAUfInt(static_cast<std::size_t>(nIf));
@@ -135,7 +135,7 @@ scalar deviceInterPressureStep(
         }
 
         deviceInterAssemblePEqn(dm, rAUfInt, phiHbyAInt, phiHbyABnd,
-                                in.needReference, in.pRefCell, in.pRefValue, P,
+                                in.needReference, in.pRefCell, &p_rgh, P,
                                 in.correctedLaplacian, in.correctedLaplacian ? &corrSource : nullptr);
 
         if (taps && pass == 0)
@@ -233,6 +233,13 @@ scalar deviceInterPressureStep(
 
     // p = p_rgh + rho*gh, rebuilt from the SOLVED p_rgh and never carried.
     deviceStaticPressure(nC, p_rgh, *in.rho, *in.gh, p);
+
+    // ...and on a case that needs a reference, p's LEVEL is then set and p_rgh rebuilt from it
+    // (pEqn.H:74-83). The caller re-evaluates p_rgh's boundary after this step, as the host arm does.
+    if (in.needReference)
+    {
+        deviceInterPressureReference(nC, in.pRefCell, in.pRefValue, *in.rho, *in.gh, p, p_rgh);
+    }
 
     return perf.finalResidual;
 }

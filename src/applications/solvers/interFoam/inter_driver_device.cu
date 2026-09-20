@@ -165,12 +165,6 @@ RunReport runInterFoamDevice(
             "patch for a mass rate, and over the file's `value` for either -- and the device loop "
             "keeps the value it uploaded. Refused rather than run a frozen inlet.");
     }
-    if (!f.mrfZones.empty())
-        throw std::runtime_error(
-            "brae interFoam (device): the case has an active MRF zone. The host loop carries it "
-            "(MRF.correctBoundaryVelocity, MRF.DDt(rho, U), zeroFilter and makeRelative -- gated on "
-            "laminar/mixerVessel2D); the device loop's UEqn and pEqn carry none of the four. Refused "
-            "rather than run the case in an inertial frame.");
 
     // NOT ON THE DEVICE YET, refused rather than run on the mesh as it started or on a singular
     // pressure system: a mesh that moves (the host loop has it, inter_driver_cpp.cu), and a closed
@@ -188,12 +182,37 @@ RunReport runInterFoamDevice(
     // the viscous laplacian (the shared assembler, handed the case's flags in device_inter_step.cu), the
     // three snGrads above, CorrectPhi's pcorr (host operators, cpc.correctedLaplacian) and the closure's
     // k and epsilon (DeviceInterTurbulence). Gated end to end on laminar/damBreak `sheared`.
+    // A CASE THAT NEEDS A PRESSURE REFERENCE RUNS ON THE DEVICE NOW: setReference pins the cell at its
+    // CURRENT p_rgh (pEqn.H:47) and the level shift of p with p_rgh rebuilt from it (pEqn.H:74-83) are
+    // both in the device pressure step, transcribed from the host's own lines. What is NOT there is
+    // adjustPhi (pEqn.H:21-26), which scales the ADJUSTABLE outflow to balance continuity. On a case
+    // whose every boundary face has its flux fixed by U there is nothing for it to scale -- OpenFOAM's
+    // adjustableMassOut is then zero, its guard fails and massCorr stays 1 (adjustPhi.C:96-106), so the
+    // device matches by doing nothing. Anywhere else it is refused by name rather than skipped.
     if (f.pRef.needReference)
     {
-        throw std::runtime_error(
-            "brae interFoam -device: p_rgh fixes its value on no patch and needs a reference cell. The "
-            "device pressure step's reference is not OpenFOAM's (pEqn.H:47 pins the cell at its current "
-            "p_rgh and :74-83 shifts p's level); the host loop's is. Run without -device.");
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (fvp[pi].type == "empty" || isCoupledInterfaceType(fvp[pi].type)) continue;
+            // adjustPhi's own predicate, as the host arm has it (inter_peqn_cpp.cu:371) and as OpenFOAM
+            // writes it: a fixed outflow is not adjustable, an inletOutlet's is. mixedFvPatchField and
+            // directionMixedFvPatchField BOTH return fixesValue() = true (mixedFvPatchField.H:197,
+            // directionMixedFvPatchField.H:130), so a pressureInletOutletVelocity is a fixed outflow to
+            // adjustPhi -- brae's piov reports the same, and that is not a defect.
+            const bool fixed = f.U.boundary[pi]->fixesValue() && !f.U.boundary[pi]->isInletOutlet();
+            // ...but a patch the PRESSURE drives still leaves adjustPhi something to weigh: with nothing
+            // adjustable, OpenFOAM tests whether the FIXED fluxes balance and aborts when they do not
+            // (adjustPhi.C:106), and the device step carries neither the scaling nor that test. MEASURED
+            // on damBreak with its atmosphere turned into a fixedFluxPressure (interfoam_refusals
+            // `device_closed`): the device ran it to a worst |div(phi)| of 5.2e-02.
+            const bool pressureDriven = f.U.boundary[pi]->bcCategory() == 6;
+            if (fixed && !pressureDriven) continue;
+            throw std::runtime_error(
+                "brae interFoam -device: p_rgh needs a reference cell and U patch `" + fvp[pi].name
+                + "` is not a wall that fixes its flux, so pEqn.H:21-26 has adjustPhi weigh it -- "
+                "scaling the adjustable outflow, or aborting if the fixed fluxes do not balance. The "
+                "device pressure step carries neither. The host loop does. Run without -device.");
+        }
     }
     const label nC = m.nCells(), nIf = m.nInternalFaces();
     const label nFaces = static_cast<label>(g.magSf().size());
@@ -414,6 +433,15 @@ RunReport runInterFoamDevice(
         updateWaveVelocity(f.waves, f.alpha1, f.U, stepTime, stepIndex, m, g, fvp);
         f.U.evaluateBoundary();
         updateVelocityPatches(f.U, fvp);
+        // MRF.correctBoundaryVelocity(U), UEqn.H:1, where the host driver has it
+        // (inter_driver_cpp.cu:741-745): it overwrites U's values on the INCLUDED patches with the frame
+        // velocity Omega x (Cf - origin) (MRFZone.C:499-526), so it has to run on the HOST field the
+        // snapshot below is taken from -- once dbU exists the values are already copied. This is the
+        // same precondition rhoSimpleFoam's device arm states (rhoUEqn.cuh:72-75).
+        if (!f.mrfZones.empty())
+        {
+            MRF::correctBoundaryVelocity(f.U, f.mrfZones, fvp);
+        }
         db = buildDeviceVectorBoundary(f.U, fvp, g);
         if (!ubOut) return;
         std::vector<scalar> bx, by, bz;
@@ -590,6 +618,16 @@ RunReport runInterFoamDevice(
         f.p_rgh.evaluateBoundary();
     };
 
+    // THE CASE'S MRF ZONES on the device, built from the host's validated cpu::MRF::Zone rather than from
+    // a second face classification (device_MRF.cuh). The geometry is static and Omega constant, so the
+    // per-face frame flux is precomputed once here. Three of interFoam's four MRF calls are the step's
+    // (DDt, zeroFilter, makeRelative); the fourth is in the U-boundary hook above.
+    std::vector<DeviceMRFZone> dMrf;
+    for (const cpu::MRF::Zone& z : f.mrfZones)
+    {
+        dMrf.push_back(buildDeviceMRFZone(z, m, g, fvp));
+    }
+
     // ---- controls --------------------------------------------------------------------------------
     DeviceInterStepControls C;
     C.alpha.nAlphaSubCycles = static_cast<int>(f.alphaCtl.nAlphaSubCycles);
@@ -672,6 +710,14 @@ RunReport runInterFoamDevice(
     }
     C.divSchemeCoeff = f.divRhoPhiUCoeff;
     C.nCorrectors = static_cast<int>(f.pimple.nCorrectors);
+    C.mrf = f.mrfZones.empty() ? nullptr : &dMrf;
+    // p_rgh's reference, where the host driver sets it (inter_driver_cpp.cu:779-781). These three were
+    // dead for as long as the device refused a case that needs one, and a step that never pins leaves the
+    // singular system's level to the solver: MEASURED on laminar/mixerVessel2D before they were set, a
+    // constant -2.17e+01 in p_rgh with a spread of only 1.5e-02 about it.
+    C.needReference = f.pRef.needReference;
+    C.pRefCell      = static_cast<int>(f.pRef.pRefCell);
+    C.pRefValue     = f.pRef.pRefValue;
     C.nNonOrthogonalCorrectors = static_cast<int>(f.nNonOrthogonalCorrectors);
     C.correctedLaplacian = f.laplacianScheme.corrected;
     C.snGradLimitCoeff = f.laplacianScheme.limitCoeff;

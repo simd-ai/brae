@@ -512,7 +512,10 @@ if [ $HAVE_GPU = 1 ]; then
     BASE="$BM"
     arm device_moving       refused "does not move one"       "-device" true
     BASE="$B"
-    arm device_closed       refused "needs a reference cell"  "-device" "sed -i '/atmosphere/,/}/ s/type  *totalPressure;/type            fixedFluxPressure;/' 0/p_rgh; sed -i '/nNonOrthogonalCorrectors/a\    pRefPoint (0.292 0.292 0.0073);\n    pRefValue 0;' system/fvSolution"
+    # a case that needs a pressure reference RUNS on the device now (gated on laminar/mixerVessel2D,
+    # where every patch is a wall); this one keeps a pressure-driven atmosphere, which is what adjustPhi
+    # would have to weigh, so it stays refused -- by that name now, not by the reference's
+    arm device_closed       refused "adjustPhi"               "-device" "sed -i '/atmosphere/,/}/ s/type  *totalPressure;/type            fixedFluxPressure;/' 0/p_rgh; sed -i '/nNonOrthogonalCorrectors/a\    pRefPoint (0.292 0.292 0.0073);\n    pRefValue 0;' system/fvSolution"
     BASE="$B"
     # the device loop carries the kEpsilon closure now, in both lineages
     # the device loop drives the wave conditions through its alpha and velocity hooks
