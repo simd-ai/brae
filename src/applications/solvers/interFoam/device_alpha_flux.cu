@@ -1,6 +1,7 @@
 // interFoam's alpha fluxes on the device -- see the header for why the nested flux is composed on the
 // host rather than fused.
 #include "device_alpha_flux.cuh"
+#include "device_limiter.cuh"
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
@@ -30,6 +31,48 @@ __global__ void faceFluxKernel(
     if (f >= n) return;
     const scalar wf = w[f];
     out[f] = psi[f] * (wf*field[own[f]] + (scalar(1) - wf)*field[nei[f]]);
+}
+
+// fvc::flux(psi, vf, scheme) on a COUPLED face. The scheme's own weight applies there exactly as on an
+// internal face -- LimitedScheme.C's calcLimiter takes its bLim[patchi].coupled() branch -- with the
+// neighbour CELL across the pair and the patch's own delta and central weight, which is what the host
+// arm does (alpha_eqn_cpp.cu:263-303). An uncoupled patch has no second cell and takes its patch value
+// instead, which is why the boundary kernels above carry no weights.
+__global__ void cyclicFaceFluxKernel(
+    const label*  __restrict__ own, const label* __restrict__ nbr,
+    const scalar* __restrict__ phi, const scalar* __restrict__ w,
+    const scalar* __restrict__ field,
+    const scalar* __restrict__ gx, const scalar* __restrict__ gy, const scalar* __restrict__ gz,
+    const scalar* __restrict__ dx, const scalar* __restrict__ dy, const scalar* __restrict__ dz,
+    int scheme,                     // 0 linear, 1 upwind, 2 vanLeer
+    int n, scalar* __restrict__ out)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    const int P = own[j], N = nbr[j];
+    const scalar pb = phi[j];
+    const scalar vfN = field[N];
+    const scalar up = (pb >= scalar(0)) ? scalar(1) : scalar(0);
+    scalar wf = w[j];
+    if (scheme == 1)
+    {
+        wf = up;
+    }
+    else if (scheme == 2)
+    {
+        // NVDTVD::r with the pair's delta, then vanLeer -- the shared limiter, not a second copy
+        const int U = (pb > scalar(0)) ? P : N;
+        const scalar gradcf = dx[j]*gx[U] + dy[j]*gy[U] + dz[j]*gz[U];
+        const scalar gradf = vfN - field[P];
+        scalar r;
+        if (fabs(gradcf) >= 1000.0 * fabs(gradf))
+            r = 2.0 * 1000.0 * ((gradcf >= 0.0) ? 1.0 : -1.0) * ((gradf >= 0.0) ? 1.0 : -1.0) - 1.0;
+        else
+            r = 2.0 * (gradcf / gradf) - 1.0;
+        const scalar lim = limiterOfR(r, kVanLeerTwoByk);
+        wf = lim*w[j] + (scalar(1) - lim)*up;
+    }
+    out[j] = pb * (wf*field[P] + (scalar(1) - wf)*vfN);
 }
 
 __global__ void negateKernel(const scalar* __restrict__ in, int n, scalar* __restrict__ out)
@@ -94,6 +137,25 @@ void deviceSubtractFaces(int n, const DeviceBuffer<scalar>& a, const DeviceBuffe
     out.resize(static_cast<std::size_t>(n));
     subKernel<<<nBlocks(n), TPB>>>(a.data(), b.data(), n, out.data());
     ckA(cudaGetLastError(), "subtract faces");
+}
+
+
+void deviceAlphaCyclicFlux(
+    const DeviceCyclic&         cyc,
+    int                         scheme,
+    const DeviceBuffer<scalar>& field,
+    const DeviceBuffer<scalar>& gx,
+    const DeviceBuffer<scalar>& gy,
+    const DeviceBuffer<scalar>& gz,
+    DeviceBuffer<scalar>&       out)
+{
+    if (cyc.n == 0) { out.resize(0); return; }
+    out.resize(static_cast<std::size_t>(cyc.n));
+    cyclicFaceFluxKernel<<<nBlocks(cyc.n), TPB>>>(
+        cyc.ownCell.data(), cyc.nbrCell.data(), cyc.phi.data(), cyc.weights.data(), field.data(),
+        gx.data(), gy.data(), gz.data(), cyc.dX.data(), cyc.dY.data(), cyc.dZ.data(),
+        scheme, cyc.n, out.data());
+    cudaCheck(cudaGetLastError(), "alpha flux, interface");
 }
 
 

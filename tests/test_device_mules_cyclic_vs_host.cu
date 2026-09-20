@@ -34,6 +34,14 @@
 // That number is the fixture's doing -- psi is TILTED so the pair's two sides hold different values;
 // with the interface running in y alone the same break moved the flux by 6.9e-18 and only the bitwise
 // arm could see it.
+//
+// AND THE ALPHA FLUX ITSELF on the pair, all three schemes, bit for bit: a coupled face takes the
+// scheme's own weight as an internal face does (LimitedScheme's calcLimiter, bLim[patchi].coupled()),
+// with the neighbour CELL across the pair. What that arm found is a caller obligation, not a kernel
+// defect: the vanLeer limiter reads fvc::grad(alpha), and a device gradient without the pair's own
+// contribution is the gradient of a mesh with a wall there -- linear and upwind stayed exact while
+// vanLeer went 1.6e-02 of a 3.9e-02 flux. deviceCyclicAddGrad after deviceGaussGrad is the fix, and
+// device_alpha_flux.cuh now says so where the caller will read it.
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -44,6 +52,8 @@
 #include "device_cyclic.cuh"
 #include "mules_cpp.cuh"
 #include "device_mules.cuh"
+#include "device_alpha_flux.cuh"
+#include "alpha_eqn_cpp.cuh"
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -100,7 +110,32 @@ int main(int argc, char** argv)
         psiOld[static_cast<std::size_t>(c)] =
             std::fmin(std::fmax(a + scalar(0.02)*std::sin(scalar(3)*C.x), scalar(0)), scalar(1));
     }
-    const GeometricField<scalar> psi = buildCyclicField<scalar>(psiCell, fvp, cyclics);
+    // psi's patch fields, as interFoam's own buildInterFields makes them: a coupled cyclic patch gets a
+    // CoupledCyclicPatchField, which reads its neighbour THROUGH the attached FvPatch. The halo-based
+    // CyclicFvPatchField that buildCyclicField hands out overrides only the no-argument
+    // patchNeighbourField, and the limiter's gradient asks for the live one.
+    GeometricField<scalar> psi;
+    psi.internal = psiCell;
+    for (const FvPatch& q : fvp)
+    {
+        if (q.coupled)      psi.boundary.push_back(std::make_unique<CoupledCyclicPatchField<scalar>>(q));
+        else if (q.type == "empty") psi.boundary.push_back(std::make_unique<EmptyPatchField<scalar>>(q));
+        else                psi.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
+    }
+    psi.evaluateBoundary();
+    // psi's patch values in the DEVICE's boundary order (coupled patches skipped), for the gradient the
+    // vanLeer limiter takes
+    std::vector<scalar> bndPsiForGrad;
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+        const std::vector<scalar>& pv = psi.boundary[pi]->value();
+        for (label i = 0; i < fvp[pi].size; ++i)
+        {
+            bndPsiForGrad.push_back(static_cast<std::size_t>(i) < pv.size()
+                                    ? pv[static_cast<std::size_t>(i)] : scalar(0));
+        }
+    }
 
     // phiBD and phiCorr: a donor flux and an antidiffusive correction big enough that the limiter
     // actually bites somewhere -- a gate on a lambda that is 1 everywhere measures nothing.
@@ -197,6 +232,80 @@ int main(int argc, char** argv)
         check("the device's donor flux on a coupled face IS the host's, bit for bit",
               dbd.size() == hbd.size() && worst == scalar(0));
         check("...and it is not identically zero, which an overwritten patch would be", scale > scalar(0));
+    }
+
+    const DeviceMesh dmEarly = buildDeviceMesh(m, g, fvp);
+
+    // ---- THE ANTIDIFFUSIVE FLUX's higher-order half on the pair -------------------------------------
+    // fvc::flux(phi, alpha, vanLeer) on a coupled face takes the SCHEME's own weight, as on an internal
+    // face: LimitedScheme's calcLimiter has a bLim[patchi].coupled() branch, and the host arm follows it
+    // (alpha_eqn_cpp.cu:263-303) with the neighbour CELL across the pair, the patch's delta and its
+    // central weight. phiCorr is this flux less the donor one, so an interface that took the patch value
+    // instead -- which is what an UNCOUPLED patch does -- would make the correction wrong, not absent.
+    for (int sch = 0; sch < 3; ++sch)
+    {
+        const cpu::interFoam::AlphaFluxScheme hostScheme =
+            (sch == 0) ? cpu::interFoam::AlphaFluxScheme::linear
+                       : (sch == 1) ? cpu::interFoam::AlphaFluxScheme::upwind
+                                    : cpu::interFoam::AlphaFluxScheme::vanLeer;
+        const char* schemeName = (sch == 0) ? "linear" : (sch == 1) ? "upwind" : "vanLeer";
+
+        SurfaceScalarField phiF;
+        phiF.internal.assign(static_cast<std::size_t>(nIf), scalar(0));
+        phiF.boundary.resize(fvp.size());
+        for (label f = 0; f < nIf; ++f)
+        {
+            phiF.internal[static_cast<std::size_t>(f)] = scalar(0.03)*std::sin(scalar(0.7)*scalar(f));
+        }
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            phiF.boundary[pi].assign(static_cast<std::size_t>(fvp[pi].size), scalar(0));
+            if (!fvp[pi].coupled) continue;
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                phiF.boundary[pi][static_cast<std::size_t>(i)] =
+                    scalar(0.04)*std::sin(scalar(1.7)*scalar(i) + scalar(0.5)*scalar(pi));
+            }
+        }
+
+        SurfaceScalarField hostOut;
+        cpu::interFoam::fluxWithScheme(phiF, psi, hostScheme, m, g, fvp, hostOut);
+
+        DeviceCyclic cycF = buildDeviceCyclic(cyclics, g, fvp);
+        {
+            std::vector<scalar> flat;
+            for (const CyclicInterface& c : cyclics)
+                for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+                    flat.push_back(phiF.boundary[static_cast<std::size_t>(c.patch)][i]);
+            cycF.phi.copyFrom(flat);
+        }
+        // the limiter's gradient, the same fvc::grad(alpha) the host's fluxWithScheme takes
+        DeviceBuffer<scalar> dPsiC(psiCell), dPsiB(bndPsiForGrad), gx, gy, gz;
+        deviceGaussGrad(dmEarly, dPsiC, dPsiB, gx, gy, gz);
+        // ...AND the pair's own contribution to it. The device mesh keeps a cyclic patch out of the
+        // boundary gather, so deviceGaussGrad alone is the gradient of a mesh with a wall there, and the
+        // vanLeer limiter reads that gradient in the cells next to the pair. MEASURED without this:
+        // linear and upwind exact, vanLeer 1.6e-02 of a 3.9e-02 flux.
+        DeviceBuffer<scalar> dVcell(g.V());
+        deviceCyclicAddGrad(cycF, dPsiC, dVcell, gx, gy, gz);
+        DeviceBuffer<scalar> devOut;
+        deviceAlphaCyclicFlux(cycF, sch, dPsiC, gx, gy, gz, devOut);
+
+        std::vector<scalar> dv, hv;
+        devOut.copyTo(dv);
+        for (const CyclicInterface& c : cyclics)
+            for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+                hv.push_back(hostOut.boundary[static_cast<std::size_t>(c.patch)][i]);
+        scalar worst = 0, scale = 0;
+        for (std::size_t j = 0; j < dv.size() && j < hv.size(); ++j)
+        {
+            worst = std::fmax(worst, std::fabs(dv[j] - hv[j]));
+            scale = std::fmax(scale, std::fabs(hv[j]));
+        }
+        std::printf("  alpha flux on the pair (%s): worst |device - host| %.4e (up to %.4e)\n",
+                    schemeName, (double)worst, (double)scale);
+        check("the device's alpha flux on a coupled face IS the host's",
+              dv.size() == hv.size() && worst <= scalar(1e-15)*std::fmax(scale, scalar(1e-300)));
     }
 
     cpu::MULES::Fields hf;           // interFoam's: rho, Sp, Su, psiMax, psiMin all the constants

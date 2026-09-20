@@ -21,6 +21,7 @@
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
+#include "device_cyclic.cuh"
 
 namespace brae {
 
@@ -28,6 +29,24 @@ namespace brae {
 // THAT psi (deviceLimitedFaceWeights for vanLeer, the mesh's own for linear, pos0 for upwind). The
 // weights are an argument rather than a scheme enum so the caller cannot pass one flux to the weights
 // and another to the multiply -- which is a different operator, and the one mistake this call invites.
+// ...and on the faces of a periodic pair, where the scheme's weight applies as on an internal face.
+// `scheme`: 0 linear, 1 upwind, 2 vanLeer. interfaceCompression across a coupled patch is not ported --
+// the host arm refuses it by name (alpha_eqn_cpp.cu:286-289) and so must any caller of this.
+//
+// THE GRADIENT HANDED IN MUST ALREADY CARRY THE PAIR (deviceCyclicAddGrad after deviceGaussGrad). The
+// device mesh keeps a cyclic patch out of its boundary gather, so a plain deviceGaussGrad is the
+// gradient of a mesh with a WALL there, and the vanLeer limiter reads it in exactly the cells next to
+// the pair. MEASURED with the plain gradient: linear and upwind still exact, vanLeer 1.6e-02 of a
+// 3.9e-02 flux. There is nothing here that can check it, which is why it is stated.
+void deviceAlphaCyclicFlux(
+    const DeviceCyclic&         cyc,
+    int                         scheme,
+    const DeviceBuffer<scalar>& field,
+    const DeviceBuffer<scalar>& gx,
+    const DeviceBuffer<scalar>& gy,
+    const DeviceBuffer<scalar>& gz,
+    DeviceBuffer<scalar>&       out);
+
 void deviceAlphaFaceFlux(
     const DeviceMesh&           dm,
     int                         nInternalFaces,
