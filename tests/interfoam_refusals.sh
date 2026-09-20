@@ -495,13 +495,17 @@ if [ $HAVE_GPU = 1 ]; then
     # (tests/interfoam_cyclic_vs_openfoam.sh's `jump` profile measures them), so what it refuses is
     # the one thing left: the case sets `nOuterCorrectors 3` and the device loop runs one.
     BASE="$BB"
-    arm device_baffle       refused "nOuterCorrectors 3" "-device" true
+    arm device_baffle       refused "nut has a coupled patch" "-device" true
     BASE="$B"
     # the device's gradient operators are Gauss linear; a limited or least-squares one is refused
     arm device_gradLsq      refused "leastSquares or cellLimited" "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         leastSquares;/' system/fvSchemes"
     arm device_gradNHat     refused "leastSquares or cellLimited" "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    nHat            cellLimited Gauss linear 1;/' system/fvSchemes"
     arm device_baseline     runs    -                        "-device" true
-    arm device_nOuter2      refused "nOuterCorrectors 2"      "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' system/fvSolution"
+    # nOuterCorrectors IS the device loop now (tests/interfoam_cyclic_vs_openfoam.sh's `outer`
+    # profile measures it against OpenFOAM, with the one-corrector answer as its control); what is
+    # still refused is frozenFlow, which skips the momentum, the pressure AND the turbulence corrector
+    arm device_nOuter2      runs    -                        "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' system/fvSolution"
+    arm device_frozenFlow   refused "solveFlow no"           "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 1;\n    solveFlow       no;/' system/fvSolution"
     # the device pressure step runs the non-orthogonal loop (laminar/damBreak `nonorth` holds it)
     arm device_nNonOrth1    runs    -                        "-device" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"
     arm device_mesh_dynamic refused "dynamicRefineFvMesh"     "-device" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"

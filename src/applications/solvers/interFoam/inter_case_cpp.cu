@@ -744,7 +744,13 @@ InterFields buildInterFields(const std::string&          caseDir,
             static_cast<label>(pim->scalarOr("nNonOrthogonalCorrectors", scalar(0)));
         const std::string mp = pim->wordOr("momentumPredictor", "yes");
         f.momentumPredictorOn = !(mp == "no" || mp == "false" || mp == "off" || mp == "0");
-        f.pimple.frozenFlow = false;
+        // pimple.frozenFlow() is !solveFlow_, and solveFlow is `solveFlow` in the PIMPLE dict with a
+        // default of TRUE (pimpleControl.C:47). interFoam.C:163-166 uses it to `continue` past the
+        // momentum, the pressure AND the turbulence corrector for the whole outer iteration. This was
+        // hardcoded false, so a case asking for it was run with the flow solved -- the silent
+        // substitution this port refuses everywhere else.
+        const std::string sf = pim->wordOr("solveFlow", "yes");
+        f.pimple.frozenFlow = (sf == "no" || sf == "false" || sf == "off" || sf == "0");
         // pimpleControl.C:51-52
         const std::string tf = pim->wordOr("turbOnFinalIterOnly", "yes");
         f.pimple.turbOnFinalIterOnly = !(tf == "no" || tf == "false" || tf == "off" || tf == "0");

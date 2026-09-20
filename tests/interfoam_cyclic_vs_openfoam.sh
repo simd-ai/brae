@@ -28,6 +28,10 @@
 #   MULESCorr  host alpha 1.9e-13, p_rgh 9.8e-12, U 7.5e-13; device 4.2e-11, 1.98e-11, 5.7e-11
 #   explicit   host alpha 5.9e-14, p_rgh 2.9e-12, U 5.7e-13; device 4.3e-11, 3.1e-11, 3.0e-11
 #   jump       host alpha 4.1e-13, p_rgh 1.0e-11, U 4.4e-12; device 6.2e-12, 2.4e-11, 7.5e-11
+#   outer      nOuterCorrectors 3: host alpha 3.2e-14, p_rgh 6.7e-13, U 1.3e-13; device 1.9e-09,
+#              2.2e-09, 2.2e-07 -- LOOSER because the case's own `tolerance 1e-12` is reached three
+#              times per step and its slack compounds, not because the loop differs: with every solve
+#              pinned at 1e-16 the same device-vs-host comparison reads 3.8e-13 / 1.8e-11 / 9.2e-13
 # and the device against brae's own host arm, 4.2e-11 / 1.02e-11 / 5.8e-11 and 4.3e-11 / 2.9e-11 /
 # 3.0e-11. The alpha figure is the device alpha solver's stopping point: pinned at 1e-16 the two arms
 # agree to 6.1e-14.
@@ -39,6 +43,8 @@
 #   the Gauss-Seidel sweep not applying the interface  device alpha 6.6e-01, p_rgh 1.2e+00, U 1.6e+01
 #   the jump left out of the device entirely           device alpha 4.9e-02, U 45% -- the control's
 #                                                      own distance, i.e. the plain-cyclic answer
+#   the device running ONE outer corrector whatever    device alpha 2.2e-02, p_rgh 3.3e-02, U 54% --
+#   the case asks (as it did before this)              exactly the `outer` profile's own control
 #   the pair's mixture boundary one stage stale        device alpha 6.6e-05, p_rgh 1.1e-04, U 3.8e-03
 #                                                      (porousBafflePressure reads nu and rho THERE,
 #                                                      and they are the two cells' interpolated)
@@ -97,6 +103,17 @@ stage()
         sed -i 's/MULESCorr       yes;/MULESCorr       no;/' "$C/system/fvSolution"
         grep -q "MULESCorr       no;" "$C/system/fvSolution" \
             || { echo "FAIL: the $profile profile did not turn MULESCorr off"; return 1; }
+    fi
+    if [ "$profile" = outer ] || [ "$profile" = outerControl ]; then
+        # THE PIMPLE OUTER LOOP. `outer` runs nOuterCorrectors 3 -- alpha re-solved from the SAME
+        # alpha.oldTime() three times with the latest flux, the momentum matrix reassembled, the
+        # pressure correctors run again -- and `outerControl` is the same case with 1, which is what
+        # the device loop used to run whatever the case asked for.
+        n=3
+        [ "$profile" = outerControl ] && n=1
+        sed -i "s/^    nOuterCorrectors .*/    nOuterCorrectors    $n;/" "$C/system/fvSolution"
+        grep -q "nOuterCorrectors    $n;" "$C/system/fvSolution" \
+            || { echo "FAIL: the $profile profile did not set nOuterCorrectors $n"; return 1; }
     fi
     if [ "$profile" = jump ]; then
         # A POROUS BAFFLE ON THE PERIODIC BOUNDARY. p_rgh's pair becomes a porousBafflePressure -- a
@@ -172,7 +189,7 @@ PYEOF
     echo "OpenFOAM ran $STEPS steps of deltaT $DT to t = $END   [$profile]"
 }
 
-for p in cyclic walls explicitMules explicitWalls jump; do
+for p in cyclic walls explicitMules explicitWalls jump outer outerControl; do
     stage "$p" || { echo "interfoam_cyclic_vs_openfoam: staging failed"; exit 1; }
 done
 
@@ -198,5 +215,9 @@ rc=0
 # what the control measures is the jump itself and not the coupling.
 "$BIN" "$W/jump" "$W/jump/0" "$W/jump/$END" "$STEPS" \
        "$W/jump/log.interFoam" "$W/cyclic/$END" jump || rc=1
+# ...and with THREE PIMPLE OUTER CORRECTORS. Its control is the SAME case with one, which is a
+# different answer and is what the device loop ran before this was wired.
+"$BIN" "$W/outer" "$W/outer/0" "$W/outer/$END" "$STEPS" \
+       "$W/outer/log.interFoam" "$W/outerControl/$END" outer || rc=1
 echo "interfoam_cyclic_vs_openfoam: rc $rc"
 exit $rc

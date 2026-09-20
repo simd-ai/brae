@@ -492,11 +492,11 @@ int main(
         }
         check("the device loop refuses the case and names the patch", named);
 
-        // NO DEVICE ARM ON THIS CASE, and two separate reasons: the tutorial sets
-        // `nOuterCorrectors 3`, which the device loop does not run, and its p_rgh carries a JUMP,
-        // which the device carries but is not yet exact in. Both are refused by name. The periodic
-        // fixture's `jump` profile (tests/interfoam_cyclic_vs_openfoam.sh) is where the jump path is
-        // measured, on a case the device loop can otherwise run end to end.
+        // NO DEVICE ARM ON THIS CASE YET. Its pair, its JUMP and its `nOuterCorrectors 3` all run on
+        // the device now; what stops it is RAS -- the device closure cannot evaluate nut's patches on
+        // a mesh with a coupled patch, because the device's boundary array does not hold one, and it
+        // refuses by name. tests/interfoam_cyclic_vs_openfoam.sh's `jump` and `outer` profiles measure
+        // the first two on a laminar case the device runs end to end.
     }
 
     std::printf("test_inter_baffle_vs_openfoam: %d failures\n", failures);

@@ -274,15 +274,15 @@ RunReport runInterFoamDevice(
     label nBf = 0;
     for (const FvPatch& q : fvp) nBf += q.size;
 
-    // A PIMPLE CONTROL THE HOST HONOURS AND THIS LOOP DOES NOT, refused rather than run as 1.
-    // deviceInterStep is one outer corrector; 5 shipped tutorials ask for nOuterCorrectors 2 or 3.
-    // (nNonOrthogonalCorrectors is the device pressure step's own loop now, transcribed from the host's
-    // pressureCorrector and gated on laminar/damBreak `nonorth`.)
-    if (f.pimple.nOuterCorrectors > 1)
+    // nOuterCorrectors IS the loop below now, transcribed from the host's runTimeStep
+    // (inter_solve_cpp.cu:111-131). frozenFlow is not: pimple.frozenFlow() makes OpenFOAM `continue`
+    // past the momentum, the pressure AND the turbulence corrector, and this loop has no such branch.
+    if (f.pimple.frozenFlow)
     {
         throw std::runtime_error(
-            "brae interFoam (device): `nOuterCorrectors " + std::to_string(f.pimple.nOuterCorrectors)
-            + "` is not wired into the device loop, which runs one. The host path (no -device) does.");
+            "brae interFoam (device): `solveFlow no` skips the momentum, the pressure and the "
+            "turbulence corrector for the whole outer iteration (interFoam.C:163-166), and the device "
+            "loop has no branch for it. The host path (no -device) does.");
     }
 
     // ...AND A VELOCITY CONDITION THAT NAMES A FLUX OTHER THAN phi. p_rgh's and alpha's conditions are
@@ -1137,18 +1137,22 @@ RunReport runInterFoamDevice(
     C.pressureFinal.tol = f.pSolveFinal.tol;
     C.pressureFinal.relTol = f.pSolveFinal.relTol;
     C.pressureFinal.maxIter = f.pSolveFinal.maxIter;
-    // THE CASE'S OWN SOLVE FOR U, where a hardcoded 1e-12 on Jacobi-BiCGStab used to stand. The device
-    // loop runs ONE outer corrector (more are refused above), and that one is the final one, so the
-    // entry fvMatrix::solve() selects is UFinal.
-    if (f.momentumPredictorOn)
+    // THE CASE'S OWN SOLVE FOR U, where a hardcoded 1e-12 on Jacobi-BiCGStab used to stand. Which
+    // entry fvMatrix::solve() selects is the mesh's finalIteration flag: `UFinal` on the LAST outer
+    // corrector and `U` on the others (inter_driver_cpp.cu:697-698, and the note on
+    // InterFields::uSolve). Set per outer corrector in the loop below.
+    auto setMomentumSolve = [&](bool finalOuter)
     {
-        C.momentum.tol = f.uSolveFinal.tol;
-        C.momentum.relTol = f.uSolveFinal.relTol;
-        C.momentum.maxIter = f.uSolveFinal.maxIter;
-        C.momentum.smoothSolver = f.uSolveFinal.gaussSeidel();
-        C.momentum.symmetric = (f.uSolveFinal.smoother == "symGaussSeidel");
-        C.momentum.nSweeps = f.uSolveFinal.nSweeps;
-    }
+        if (!f.momentumPredictorOn) return;
+        const InterFields::AlphaLinearSolve& us = finalOuter ? f.uSolveFinal : f.uSolve;
+        C.momentum.tol = us.tol;
+        C.momentum.relTol = us.relTol;
+        C.momentum.maxIter = us.maxIter;
+        C.momentum.smoothSolver = us.gaussSeidel();
+        C.momentum.symmetric = (us.smoother == "symGaussSeidel");
+        C.momentum.nSweeps = us.nSweeps;
+    };
+    setMomentumSolve(true);
     C.takeUAtBoundary = &dTakeU;
     if (deviceClosure)
     {
@@ -1266,75 +1270,94 @@ RunReport runInterFoamDevice(
             }
         }
 
-        deviceInterStep(dm, rep.deltaT, C, props, H, dGh, dGhf, dMagSf,
-                        dA, dAOld, dUx, dUy, dUz, dUox, dUoy, dUoz,
-                        dUobx, dUoby, dUobz,
-                        dPhiI, dPhiB, dPhiOI, dPhiOB, dUFixes, dPrgh, dP,
-                        dNH, dNHB, dABnd, dK, dAFixes, dAFlag, dbU,
-                        dRho, dMu, dNu, dRpI, dRpB, tapsOut);
+        // THE PIMPLE OUTER LOOP, interFoam.C:107-176 and the host's runTimeStep
+        // (inter_solve_cpp.cu:111-131). Every outer corrector re-solves alpha from the SAME
+        // alpha.oldTime() with the latest flux, reassembles the momentum matrix and runs the pressure
+        // correctors again; the old-time fields above are the TIME STEP's and are snapshotted once,
+        // OUTSIDE this loop, which is what makes that true.
+        for (label outer = 0; outer < f.pimple.nOuterCorrectors; ++outer)
+        {
+            const bool finalOuter = (outer == f.pimple.nOuterCorrectors - 1);
+            setMomentumSolve(finalOuter);
 
-        // turbulence->correct(), interFoam.C:169-172 -- after the last pressure corrector of the one
-        // outer corrector this loop runs. dbU is current: the step's last updateUBoundary rebuilt it
-        // and the pressureInletOutletVelocity switch ran on it after that.
-        if (deviceClosure)
-        {
-            DeviceInterTurbulenceStepInput ti;
-            ti.Ux = &dUx;
-            ti.Uy = &dUy;
-            ti.Uz = &dUz;
-            ti.phiInt = &dPhiI;
-            ti.phiBnd = &dPhiB;
-            ti.rhoPhiInt = &dRpI;
-            ti.rhoPhiBnd = &dRpB;
-            ti.rho = &dRho;
-            ti.rhoBnd = &dStepRhoBnd;
-            ti.rhoOld = &dRhoOld;
-            ti.nu = &dStepNu;
-            ti.nuBnd = &dStepNuBnd;
-            ti.deltaT = rep.deltaT;
-            // the second field's log is omega's under kOmegaSST, as the host driver keeps it
-            ti.epsilonLog = (f.turbulence.model == cpu::interFoam::InterRasModel::KOmegaSST)
-                          ? &rep.omegaSolves : &rep.epsilonSolves;
-            ti.kLog = &rep.kSolves;
-            deviceCorrectInterTurbulence(dTurb, f.turbulence, ti, dm, dbU);
-        }
-        // ...or THE HOST CLOSURE in the same loop. f.U is current (the step's last updateUBoundary
-        // wrote it, patches included) and so are f.rho, f.nu and f.nuBnd (the hooks'); phi's interior
-        // and rhoPhi are the device's only.
-        if (hostClosure)
-        {
-            dPhiI.copyTo(f.phi.internal);
-            pushFlux();
-            dRpI.copyTo(f.rhoPhi.internal);
+            deviceInterStep(dm, rep.deltaT, C, props, H, dGh, dGhf, dMagSf,
+                            dA, dAOld, dUx, dUy, dUz, dUox, dUoy, dUoz,
+                            dUobx, dUoby, dUobz,
+                            dPhiI, dPhiB, dPhiOI, dPhiOB, dUFixes, dPrgh, dP,
+                            dNH, dNHB, dABnd, dK, dAFixes, dAFlag, dbU,
+                            dRho, dMu, dNu, dRpI, dRpB, tapsOut);
+
+            // turbulence->correct(), interFoam.C:169-172 -- after this outer corrector's last
+            // pressure corrector. dbU is current: the step's last updateUBoundary rebuilt it and the
+            // pressureInletOutletVelocity switch ran on it after that.
+            //
+            // pimple.turbCorr(): with turbOnFinalIterOnly -- OpenFOAM's default -- the closure
+            // advances ONCE per time step, on the final outer corrector. Running it on every one
+            // would advance k and epsilon nOuterCorrectors times per physical step.
+            if (!f.pimple.turbOnFinalIterOnly || finalOuter)
             {
-                std::vector<scalar> rb;
-                dRpB.copyTo(rb);
-                f.rhoPhi.boundary.resize(fvp.size());
-                std::size_t off = 0;
-                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-                {
-                    if (isCoupledInterfaceType(fvp[pi].type)) continue;
-                    const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
-                    f.rhoPhi.boundary[pi].assign(rb.begin() + off, rb.begin() + off + n);
-                    off += n;
-                }
+            if (deviceClosure)
+            {
+                DeviceInterTurbulenceStepInput ti;
+                ti.Ux = &dUx;
+                ti.Uy = &dUy;
+                ti.Uz = &dUz;
+                ti.phiInt = &dPhiI;
+                ti.phiBnd = &dPhiB;
+                ti.rhoPhiInt = &dRpI;
+                ti.rhoPhiBnd = &dRpB;
+                ti.rho = &dRho;
+                ti.rhoBnd = &dStepRhoBnd;
+                ti.rhoOld = &dRhoOld;
+                ti.nu = &dStepNu;
+                ti.nuBnd = &dStepNuBnd;
+                ti.deltaT = rep.deltaT;
+                // the second field's log is omega's under kOmegaSST, as the host driver keeps it
+                ti.epsilonLog = (f.turbulence.model == cpu::interFoam::InterRasModel::KOmegaSST)
+                              ? &rep.omegaSolves : &rep.epsilonSolves;
+                ti.kLog = &rep.kSolves;
+                deviceCorrectInterTurbulence(dTurb, f.turbulence, ti, dm, dbU);
             }
-            InterTurbulenceStepInput ti;
-            ti.U = &f.U;
-            ti.phi = &f.phi;
-            ti.rhoPhi = &f.rhoPhi;
-            ti.rho = &f.rho;
-            ti.rhoBnd = &stepRhoBnd;
-            ti.rhoOld = &rhoOldHost;
-            ti.nu = &f.nu;
-            ti.nuBnd = &f.nuBnd;
-            ti.deltaT = rep.deltaT;
-            // the host closure keeps the two second fields in separate logs and fills the model's own
-            ti.omegaLog = &rep.omegaSolves;
-            ti.epsilonLog = &rep.epsilonSolves;
-            ti.kLog = &rep.kSolves;
-            correctInterTurbulence(f.turbulence, ti, m, g, fvp);
-        }
+            // ...or THE HOST CLOSURE in the same loop. f.U is current (the step's last updateUBoundary
+            // wrote it, patches included) and so are f.rho, f.nu and f.nuBnd (the hooks'); phi's interior
+            // and rhoPhi are the device's only.
+            if (hostClosure)
+            {
+                dPhiI.copyTo(f.phi.internal);
+                pushFlux();
+                dRpI.copyTo(f.rhoPhi.internal);
+                {
+                    std::vector<scalar> rb;
+                    dRpB.copyTo(rb);
+                    f.rhoPhi.boundary.resize(fvp.size());
+                    std::size_t off = 0;
+                    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                    {
+                        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                        const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+                        f.rhoPhi.boundary[pi].assign(rb.begin() + off, rb.begin() + off + n);
+                        off += n;
+                    }
+                }
+                InterTurbulenceStepInput ti;
+                ti.U = &f.U;
+                ti.phi = &f.phi;
+                ti.rhoPhi = &f.rhoPhi;
+                ti.rho = &f.rho;
+                ti.rhoBnd = &stepRhoBnd;
+                ti.rhoOld = &rhoOldHost;
+                ti.nu = &f.nu;
+                ti.nuBnd = &f.nuBnd;
+                ti.deltaT = rep.deltaT;
+                // the host closure keeps the two second fields in separate logs and fills the model's own
+                ti.omegaLog = &rep.omegaSolves;
+                ti.epsilonLog = &rep.epsilonSolves;
+                ti.kLog = &rep.kSolves;
+                correctInterTurbulence(f.turbulence, ti, m, g, fvp);
+            }
+            }   // pimple.turbCorr()
+        }   // the outer corrector loop
+
         rep.steps = s + 1;
         rep.time += rep.deltaT;
         f.writeCadence.advance(rep.time, rep.deltaT);   // Time::operator++, Time.C:1046-1074
