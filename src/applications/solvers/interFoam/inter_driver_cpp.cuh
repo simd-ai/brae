@@ -122,7 +122,9 @@ RunReport runInterFoam(
     // every production run.
     PressureTaps* pressureTaps = nullptr,
     // see MutableMesh: required by a case whose mesh moves, ignored by one whose mesh does not
-    const MutableMesh* mutableMesh = nullptr);
+    const MutableMesh* mutableMesh = nullptr,
+    // the alpha step's own intermediates, for a gate bisecting its pre-solve against its corrector
+    AlphaTaps* alphaTaps = nullptr);
 
 // ...and the SAME run on the GPU. Every operator, every corrector and every loop is the device code
 // gated in tests/test_device_inter_dambreak_alpha.cu, which tracks this host driver on damBreak's own

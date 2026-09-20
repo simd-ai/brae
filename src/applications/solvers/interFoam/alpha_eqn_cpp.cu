@@ -526,6 +526,11 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
         // are not (1, 0), flux() carries the prescribed value where a rebuilt flux carries the cell's.
         upwindFlux = matrixFlux(M, alpha1.internal, m, patches);
         alphaPhi10 = upwindFlux;
+        if (in.taps)
+        {
+            in.taps->preSolveAlpha = alpha1.internal;
+            in.taps->preSolveAlphaPhiBnd = upwindFlux.boundary;
+        }
 
         // alphaApplyPrevCorr: the previous step's compression flux as a first guess, limited against
         // the field the pre-solve has just produced.

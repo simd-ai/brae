@@ -77,6 +77,29 @@ __global__ void ddtCorrInternalKernel(
     out[f] = ddtCoeff(phiCorr, phiOld[f], given) * rDeltaT * phiCorr;
 }
 
+// ...and on a PERIODIC PAIR, which is the internal kernel with the pair's own arrays: OpenFOAM's
+// fvc::ddtCorr is a whole surfaceScalarField and a coupled patch is live in it, because ddtScheme.C's
+// exclusions are `U fixes a value` and cyclicAMI, and a plain cyclic is neither
+// (inter_peqn_cpp.cu:252-283). fvc::dotInterpolate(Sf, U.oldTime()) there is the two CELLS' old
+// velocities interpolated, never a stored patch value -- which is why this is the internal form.
+__global__ void ddtCorrCyclicKernel(
+    const label* __restrict__ own, const label* __restrict__ nbr, const scalar* __restrict__ w,
+    const scalar* __restrict__ Sfx, const scalar* __restrict__ Sfy, const scalar* __restrict__ Sfz,
+    const scalar* __restrict__ phiOld,
+    const scalar* __restrict__ uox, const scalar* __restrict__ uoy, const scalar* __restrict__ uoz,
+    int n, scalar given, scalar rDeltaT, scalar* __restrict__ out)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    const int o = own[j], nb = nbr[j];
+    const scalar wf = w[j], wm = scalar(1) - w[j];
+    const scalar ux = wf*uox[o] + wm*uox[nb];
+    const scalar uy = wf*uoy[o] + wm*uoy[nb];
+    const scalar uz = wf*uoz[o] + wm*uoz[nb];
+    const scalar phiCorr = phiOld[j] - (ux*Sfx[j] + uy*Sfy[j] + uz*Sfz[j]);
+    out[j] = ddtCoeff(phiCorr, phiOld[j], given) * rDeltaT * phiCorr;
+}
+
 __global__ void ddtCorrBoundaryKernel(
     const label* __restrict__ bndCell, const label* __restrict__ bndGFace,
     const int* __restrict__ fixesValue,
@@ -280,6 +303,34 @@ __global__ void staticPressureKernel(
 }
 
 }   // namespace
+
+
+void deviceInterDdtCorrCyclic(
+    const DeviceCyclic&         cyc,
+    const DeviceBuffer<scalar>& phiOldIf,
+    const DeviceBuffer<scalar>& UOldX,
+    const DeviceBuffer<scalar>& UOldY,
+    const DeviceBuffer<scalar>& UOldZ,
+    scalar                      ddtPhiCoeff,
+    scalar                      deltaT,
+    DeviceBuffer<scalar>&       outIf)
+{
+    if (deltaT <= scalar(0))
+        throw std::runtime_error("brae interFoam device ddtCorr: deltaT must be positive.");
+    outIf.resize(static_cast<std::size_t>(cyc.n));
+    if (cyc.n == 0) return;
+    if (static_cast<int>(phiOldIf.size()) != cyc.n)
+        throw std::runtime_error(
+            "brae interFoam device ddtCorr: the pair's OLD flux is the wrong length. ddtCorr compares "
+            "phi.oldTime() with the flux of U.oldTime(), so the caller must snapshot the pair's flux "
+            "at the top of the step, before the pressure corrector rewrites it.");
+    ddtCorrCyclicKernel<<<nBlocks(cyc.n), TPB>>>(
+        cyc.ownCell.data(), cyc.nbrCell.data(), cyc.weights.data(),
+        cyc.Sfx.data(), cyc.Sfy.data(), cyc.Sfz.data(), phiOldIf.data(),
+        UOldX.data(), UOldY.data(), UOldZ.data(), cyc.n, ddtPhiCoeff,
+        scalar(1)/deltaT, outIf.data());
+    ckP(cudaGetLastError(), "ddtCorr, interface");
+}
 
 
 void deviceBuoyancyFlux(

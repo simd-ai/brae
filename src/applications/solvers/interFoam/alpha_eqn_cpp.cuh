@@ -202,8 +202,19 @@ void massFlux(const SurfaceScalarField& alphaPhi10,
 //     which converges, to a slightly stale interface, and nAlphaCorr is 2 or 3 in 11 of the 44
 //     shipped tutorials.
 //   * alpha1 is updated IN PLACE by each corrector. The correctors are a sequence, not an average.
+// The alpha step's intermediates, for a gate bisecting the implicit pre-solve against the corrector.
+// Null in every production run.
+struct AlphaTaps
+{
+    // alpha as the MULESCorr pre-solve leaves it, BEFORE the corrector loop (alphaEqn.H:103-155)
+    std::vector<scalar> preSolveAlpha;
+    // ...and the flux that pre-solve's own matrix gives, per patch -- a coupled patch included
+    std::vector<std::vector<scalar>> preSolveAlphaPhiBnd;
+};
+
 struct AlphaStepInput
 {
+    AlphaTaps* taps = nullptr;
     // OUT, optional: alpha2's patch values as `alpha2 = 1.0 - alpha1` leaves them (alphaEqn.H:223),
     // which is BEFORE the corrector's mixture.correct() moves alpha1's. See InterFields::alpha2Bnd.
     std::vector<std::vector<scalar>>* alpha2BndOut = nullptr;

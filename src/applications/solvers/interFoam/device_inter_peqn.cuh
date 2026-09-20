@@ -41,6 +41,18 @@
 
 namespace brae {
 
+// fvc::ddtCorr(U, phi) ON A PERIODIC PAIR -- the internal form on the pair's own arrays. `phiOldIf` is
+// the pair's flux at the TOP of the step, which the caller snapshots before the corrector rewrites it.
+void deviceInterDdtCorrCyclic(
+    const DeviceCyclic&         cyc,
+    const DeviceBuffer<scalar>& phiOldIf,
+    const DeviceBuffer<scalar>& UOldX,
+    const DeviceBuffer<scalar>& UOldY,
+    const DeviceBuffer<scalar>& UOldZ,
+    scalar                      ddtPhiCoeff,
+    scalar                      deltaT,
+    DeviceBuffer<scalar>&       outIf);
+
 // phig = (surfaceTensionForce - ghf*snGrad(rho)) * rAUf * magSf, pEqn.H:28-34. No p_rgh -- see 1.
 // `magSf` and the three face fields are the mesh's FULL face arrays, internal faces first.
 void deviceBuoyancyFlux(

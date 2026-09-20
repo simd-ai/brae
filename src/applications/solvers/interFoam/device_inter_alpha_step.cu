@@ -76,8 +76,19 @@ void deviceInterAlphaStep(
     const int nBf = dm.nBndFaces;
 
     DeviceBuffer<scalar> alphaPhiInt, alphaPhiBnd, iC, bC;
-    // nHatf on the pair, rewritten by every mixture.correct() below and read by the corrector's phir
-    DeviceBuffer<scalar> nHatfIfBuf;
+    // nHatf on the pair, rewritten by every mixture.correct() below and read by the corrector's phir.
+    // The caller's buffer when it keeps one (it must -- see DeviceInterAlphaControls::nHatfIf); the
+    // local is only the no-pair case, where nothing reads it.
+    DeviceBuffer<scalar> nHatfIfLocal;
+    DeviceBuffer<scalar>& nHatfIfBuf = ctl.nHatfIf ? *ctl.nHatfIf : nHatfIfLocal;
+    if (in.cyc && in.cyc->n > 0 && !ctl.nHatfIf)
+    {
+        throw std::runtime_error(
+            "brae interFoam device alpha step: the mesh has a periodic pair and the caller kept no "
+            "nHatf for it. The first corrector's phir reads the normal the LAST mixture.correct() "
+            "left, which without MULESCorr is the previous time step's, so the buffer has to outlive "
+            "the call -- as nHatfInt and nHatfBnd do.");
+    }
 
     // mixture.correct() at the BOTTOM of a corrector: the interface normal from alpha's new field, then
     // the mixture properties from it. interfaceProperties reads mu and nu right after, which is why the
@@ -149,6 +160,14 @@ void deviceInterAlphaStep(
             if (ctl.preSolveLog)
             {
                 ctl.preSolveLog->push_back(pre);
+            }
+            if (ctl.preSolveAlphaOut)
+            {
+                deviceCopy(*ctl.preSolveAlphaOut, alpha);
+            }
+            if (ctl.preSolveAlphaPhiIfOut && li.alphaPhiIf)
+            {
+                deviceCopy(*ctl.preSolveAlphaPhiIfOut, *li.alphaPhiIf);
             }
 
             // talphaPhi1UD, the upwind flux the pre-solve left, kept for the cache at the bottom

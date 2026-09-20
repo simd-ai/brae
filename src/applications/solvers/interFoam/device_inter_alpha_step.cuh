@@ -95,6 +95,10 @@ struct DeviceInterAlphaControls
     DeviceBuffer<scalar>* alpha2BndOut = nullptr;
     // appended to, one record per pre-solve; null = not kept
     std::vector<DeviceSolverPerf>* preSolveLog = nullptr;
+    // ...and the field that pre-solve LEAVES, plus its flux on the pair, for a gate bisecting the
+    // implicit half against the corrector. Null in every production run.
+    DeviceBuffer<scalar>* preSolveAlphaOut = nullptr;
+    DeviceBuffer<scalar>* preSolveAlphaPhiIfOut = nullptr;
     // `alphaApplyPrevCorr yes` (alphaEqn.H:133-150, :228-236): the compression flux the correctors
     // ENDED on is cached, and the next pre-solve applies it, limited, before its own correctors run.
     // The cache is talphaPhi1Corr0 and it outlives the call -- it carries across SUB-CYCLES as well as
@@ -109,6 +113,12 @@ struct DeviceInterAlphaControls
     // THE PAIR's mass flux out, for the momentum equation. The pair itself, its flux and its alpha flux
     // travel in DeviceAlphaStepInput, which is what the corrector reads.
     DeviceBuffer<scalar>* rhoPhiIf = nullptr;
+    // nHatf ON THE PAIR, and it is the CALLER's buffer because it has to outlive the call. The first
+    // corrector's phir reads the normal the LAST mixture.correct() left (alphaEqn.H:162) -- which,
+    // without MULESCorr, is the previous TIME STEP's, since nothing runs between the two. Held here
+    // for the same reason nHatfInt and nHatfBnd are the driver's: a buffer local to one step is empty
+    // when the first corrector of a `MULESCorr no` case asks for it, and that was a refusal.
+    DeviceBuffer<scalar>* nHatfIf = nullptr;
 };
 
 // `alpha1` is advanced in place from `alpha1Old`, which is never written. `rho`, `mu` and `nu` come out

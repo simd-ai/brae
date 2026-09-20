@@ -98,7 +98,8 @@ RunReport runInterFoam(
     InterFields* fieldsOut,
     scalar endTime,
     PressureTaps* pressureTaps,
-    const MutableMesh* mutableMesh)
+    const MutableMesh* mutableMesh,
+    AlphaTaps* alphaTaps)
 {
     InterFields f = buildInterFields(caseDir, startDir, m, g, patches);
     const label nC = m.nCells();
@@ -505,6 +506,7 @@ RunReport runInterFoam(
                             };
                         }
                         SurfaceScalarField aPhi;
+                        sub.taps = alphaTaps;
                         alphaEqnStep(f.alpha1, aOld, sub, f.interface, f.mulesCtl,
                                      m, g, patches, aPhi, rPhi, f.nHatf, f.K, &prevCorr);
                         aNew = f.alpha1.internal;
