@@ -107,14 +107,25 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
               "other is not.");
     }
 
-    // WHAT A COUPLED PATCH STILL COSTS THIS CLOSURE, and it is the transport and not the boundary.
-    // k's and epsilon's equations are fvm::div + fvm::laplacian like any other, so across a pair they
-    // need the interface off-diagonal -- deviceKEpsilonStep and deviceKOmegaSSTStep both take a
-    // `DeviceCyclic*` for exactly that (device_kepsilon.cuh:58, :89, :104) and this driver passes
-    // none. Solved without it the two sides of the pair are two walls: k and epsilon do not cross,
-    // and nut follows them. MEASURED on RAS/damBreakPorousBaffle, twenty steps, device against
-    // OpenFOAM: nut 1.8e-01 relative, U 1.1e-02, with the host closure in the same device loop far
-    // closer. Refused rather than run the pair as a wall in the closure alone.
+    // WHAT A COUPLED PATCH STILL COSTS THIS CLOSURE. gpu::kEpsilonRAS refuses one at its own entry
+    // (kEpsilon.cu:504) and that refusal is right: this is not a missing argument but five sites, and
+    // the OF-mirror closure carries its own grad, div, assembly and solve rather than calling the
+    // legacy deviceKEpsilonCorrect -- which DOES take a `DeviceCyclic*` and is exercised through it
+    // by device_simple_foam.cu, so the kernels underneath are not the gap. What is:
+    //   1. gpu::turbulence::assembleScalarTransport (turbulence_transport.cuh:149) takes no pair, so
+    //      k's and epsilon's matrices have no interface off-diagonal: across a pair the two sides are
+    //      two walls for both the convection and the diffusion.
+    //   2. their solves build a plain deviceLduView, so even a correct matrix would be solved without
+    //      the interface (the same split the pressure step needed deviceLduViewCyclic for).
+    //   3. fvc::grad(U) for the production term (kEpsilon.cu:601-603) sums no coupled face.
+    //   4. divU and divPhi (kEpsilon.cu:608-609) likewise; interfaceAddDiv is what the legacy path
+    //      uses for exactly this.
+    //   5. correctNut's boundary assignment: OpenFOAM ends `nut_ = Cmu*sqr(k)/epsilon` with
+    //      correctLocalBoundaryConditions(), so a constraint patch gets the RESULT's two cells
+    //      interpolated, and Cmu*k_b^2/eps_b != interpolate(Cmu*k^2/eps). This one is a question for
+    //      the HOST closure too (kEpsilon_cpp.cu:918-924).
+    // MEASURED with the pair dropped, RAS/damBreakPorousBaffle, twenty steps against OpenFOAM: nut
+    // 1.8e-01 relative and U 1.1e-02. Refused rather than run the pair as a wall in the closure.
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         if (!patches[pi].coupled) continue;
