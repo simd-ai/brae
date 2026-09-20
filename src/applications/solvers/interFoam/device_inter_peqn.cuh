@@ -37,6 +37,7 @@
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
 #include "device_MRF.cuh"
+#include "device_cyclic.cuh"
 
 namespace brae {
 
@@ -216,7 +217,10 @@ void deviceInterAssemblePEqn(
     const DeviceBuffer<scalar>* pRghForRef,
     DevicePressureMatrix&       P,
     bool                        corrected = false,
-    const DeviceBuffer<scalar>* nonOrthSource = nullptr);
+    const DeviceBuffer<scalar>* nonOrthSource = nullptr,
+    // the periodic pair, and rAU as a CELL field for the interpolation the interface does itself
+    DeviceCyclic*               cyc = nullptr,
+    const DeviceBuffer<scalar>* rAUCell = nullptr);
 
 // pEqn.H:74-83, after p = p_rgh + rho*gh: shift p so that p[pRefCell] is pRefValue, and REBUILD p_rgh
 // from the shifted p (applyPressureReference, inter_peqn_cpp.cu:179-196). Both fields move.

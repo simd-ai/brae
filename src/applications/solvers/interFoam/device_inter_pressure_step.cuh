@@ -36,6 +36,7 @@
 #include "device_mesh.cuh"
 #include "device_inter_peqn.cuh"
 #include "device_MRF.cuh"
+#include "device_cyclic.cuh"
 #include "device_alpha_presolve.cuh"   // DeviceAlphaSolverControls, the same shape of solver entry
 #include "device_dilu.cuh"
 #include "device_gamg_solver.cuh"
@@ -90,6 +91,9 @@ struct DeviceInterPressureInput
     const DeviceBuffer<scalar>* ddtCorrBnd = nullptr;
     const DeviceBuffer<scalar>* rhoBndFace = nullptr;
     const DeviceBuffer<int>*    bndUFixesValue = nullptr;
+    // the mesh's periodic pair: its laplacian coefficients go into the matrix and its off-diagonal into
+    // every SpMV of the solve
+    DeviceCyclic*               cyc = nullptr;
     // MRFZoneList::makeRelative(phiHbyA), pEqn.H:19
     const std::vector<DeviceMRFZone>* mrf = nullptr;
 

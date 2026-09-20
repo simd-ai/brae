@@ -430,7 +430,9 @@ void deviceInterAssemblePEqn(
     const DeviceBuffer<scalar>* pRghForRef,
     DevicePressureMatrix&       P,
     bool                        corrected,
-    const DeviceBuffer<scalar>* nonOrthSource)
+    const DeviceBuffer<scalar>* nonOrthSource,
+    DeviceCyclic*               cyc,
+    const DeviceBuffer<scalar>* rAUCell)
 {
     const int nC = dm.nCells;
 
@@ -456,6 +458,22 @@ void deviceInterAssemblePEqn(
     deviceDiv(dm, phiHbyAInt, phiHbyABnd, div);
     addDivSourceKernel<<<nBlocks(nC), TPB>>>(div.data(), dm.V.data(), nC, P.source.data());
     ckP(cudaGetLastError(), "source += div(phiHbyA)*V");
+
+    // THE COUPLED FACES' laplacian coefficients. rAU is a CELL field here and the interface kernel
+    // interpolates it with the pair's own weight, which is what interpolate(rAU) gives on a coupled
+    // patch (fvc.cu:472, coupledLinear) -- the same number the host's gammaf.boundary carries. Gated
+    // face by face in tests/test_device_cyclic_laplacian_vs_host.cu.
+    if (cyc && cyc->n > 0)
+    {
+        if (!rAUCell)
+        {
+            throw std::runtime_error(
+                "brae interFoam device pEqn: the mesh has a periodic pair and the laplacian's gamma was "
+                "not handed over as a cell field. interpolate(rAU) on a coupled patch is the two cells' "
+                "rAU interpolated; there is nothing on the patch to read instead.");
+        }
+        deviceCyclicAssembleLaplacian(*cyc, *rAUCell, P.diag, /*addToDiag=*/true, corrected);
+    }
 
     if (needReference)
     {

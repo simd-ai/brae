@@ -155,7 +155,13 @@ scalar deviceInterPressureStep(
         const GamgControls* gamg = lastPass ? in.gamg : in.gamgInner;
         DeviceBuffer<scalar> diagC, b;
         deviceFold(dm, P.diag, P.source, iC, bC, diagC, b);
-        const DeviceLduView A = deviceLduView(dm, diagC, P.upper, P.lower);
+        // ...and the periodic pair's off-diagonal, which deviceAmul applies as
+        // Apsi[own] += ifCoeff*psi[nbr] (device_ldu.cuh:28-33). Without it the solve is a different
+        // operator from the matrix that was assembled.
+        const DeviceLduView A = (in.cyc && in.cyc->n > 0)
+            ? deviceLduViewCyclic(dm, diagC, P.upper, P.lower, in.cyc->n, in.cyc->ownCell.data(),
+                                  in.cyc->nbrCell.data(), in.cyc->ifCoeff.data())
+            : deviceLduView(dm, diagC, P.upper, P.lower);
         if (gamg)
         {
             if (!in.dic || !in.gamgCache)
