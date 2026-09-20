@@ -741,13 +741,22 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
         if (in.taps)
         {
             in.taps->jumpBnd.assign(patches.size(), std::vector<scalar>());
+            std::vector<scalar> flatJump;
             for (std::size_t pi = 0; pi < patches.size(); ++pi)
             {
                 if (const std::vector<scalar>* j = p_rgh.boundary[pi]->coupledJump())
                 {
                     in.taps->jumpBnd[pi] = *j;
                 }
+                if (!patches[pi].coupled) continue;
+                for (label i = 0; i < patches[pi].size; ++i)
+                {
+                    const std::vector<scalar>* j = p_rgh.boundary[pi]->coupledJump();
+                    flatJump.push_back((j && static_cast<std::size_t>(i) < j->size())
+                                       ? (*j)[static_cast<std::size_t>(i)] : scalar(0));
+                }
             }
+            in.taps->jumpHistory.push_back(flatJump);
         }
         FvScalarMatrix pe = fvm::laplacian<scalar>(rAUfField, p_rgh, m, g, patches, sc.correctedLaplacian);
         if (sc.correctedLaplacian)

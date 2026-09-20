@@ -269,6 +269,9 @@ struct PressureTaps
     std::vector<scalar> uEqnDiag, uEqnUpper, uEqnLower, uEqnSourceX;
     // p_rgh's JUMP per patch, as the last assembly left it
     std::vector<std::vector<scalar>> jumpBnd;
+    // ...and one entry per ASSEMBLY, flattened over the coupled patches in patch order, so the two
+    // arms can be compared pass by pass rather than only at the end of a step
+    std::vector<std::vector<scalar>> jumpHistory;
     std::vector<std::vector<scalar>> uEqnICx;
 };
 

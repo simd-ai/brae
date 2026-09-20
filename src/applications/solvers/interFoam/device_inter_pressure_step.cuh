@@ -170,6 +170,7 @@ struct DevicePressureTaps
     DeviceBuffer<scalar> diag, upper, lower, source, iC, bC;
     // phig and rAUf ON THE PAIR, for comparing the two arms across a coupled face
     DeviceBuffer<scalar> phigIf, rAUfIf, ffIf, phiIf, phiHbyAIfPrePhig, cycJumpTap;
+    std::vector<std::vector<scalar>> jumpHistory;   // one entry per assembly
 };
 
 scalar deviceInterPressureStep(

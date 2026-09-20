@@ -482,6 +482,10 @@ void deviceInterStep(
                                 UX, UY, UZ, p, taps ? &pt : nullptr);
         if (taps)
         {
+            for (const std::vector<scalar>& jh : pt.jumpHistory)
+            {
+                taps->jumpHistory.push_back(jh);
+            }
             deviceCopy(taps->phigIf, pt.phigIf);
             deviceCopy(taps->rAUfIf, pt.rAUfIf);
             deviceCopy(taps->ffIf, pt.ffIf);

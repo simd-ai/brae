@@ -168,34 +168,15 @@ RunReport runInterFoamDevice(
     // interface to its right-hand side every sweep, fvc::ddtCorr, and divDevReff's grad(U) and its
     // stress flux.
 
-    // A JUMP ON THE PAIR is CARRIED but not yet exact, and it is refused until it is. The jump now
-    // reaches the device everywhere OpenFOAM applies one -- the neighbour value is psi[nbr] - jump in
-    // fvMatrix::flux(), in fvc::grad and in the matrix product, the last ONLY when the operand is the
-    // solution field ("only apply jump to original field", jumpCyclicFvPatchField.C:169-177) -- it is
-    // rebuilt at every assembly by the pressureCoeffs hook from that assembly's flux, and the pair's
-    // flux is pushed back to the host field the jump is computed from.
-    //
-    // MEASURED on validation/interFoamCyclic's `jump` profile (a porousBafflePressure on the periodic
-    // pair, D 0, I 5, length 0.05), ten steps against brae's own host loop, which is OpenFOAM's there
-    // to alpha 4.1e-13:
-    //   with none of the above          alpha 4.9e-02, U 45%   -- exactly the plain-cyclic answer,
-    //                                   which is what the control measures
-    //   with the jump carried           alpha 6.6e-05, U 3.8e-03
-    // STEP ONE IS EXACT (U 5.0e-10) and the jump itself agrees there to 2.8e-08 of 1.7e+02; the pair's
-    // flux is 0.9% out by step two and the jump 4% with it, which is a consequence of the flux and not
-    // its cause. Not a corrector-count effect (nCorrectors 1 reads the same 4.3e-03).
-    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-    {
-        if (!fvp[pi].coupled) continue;
-        const bool jumps = f.p_rgh.boundary[pi]->coupledJump() != nullptr
-                        || f.p_rgh.boundary[pi]->isPorousBafflePressure();
-        if (!jumps) continue;
-        throw std::runtime_error(
-            "brae interFoam (device): p_rgh on the coupled patch `" + fvp[pi].name + "` carries a JUMP "
-            "(porousBafflePressure or a fixedJump). The device carries it through the matrix, the flux "
-            "and the gradient and is exact at the first step, and 3.8e-03 of U away from the host by "
-            "the tenth. The host loop (no -device) is OpenFOAM's. Run without -device.");
-    }
+    // A JUMP ON THE PAIR runs here. It reaches the device everywhere OpenFOAM applies one -- the
+    // neighbour value is psi[nbr] - jump in fvMatrix::flux(), in fvc::grad and in the matrix product,
+    // the last ONLY when the operand is the solution field ("only apply jump to original field",
+    // jumpCyclicFvPatchField.C:169-177, so never a Krylov search direction) -- it is rebuilt at every
+    // assembly by the pressureCoeffs hook from that assembly's flux, and the pair's flux is pushed
+    // back to the host field the jump is computed from. MEASURED on validation/interFoamCyclic's
+    // `jump` profile, ten steps against brae's own host loop: alpha 1.1e-12, p_rgh 3.8e-08 of
+    // 1.7e+03, U 4.7e-11. With the jump absent the device lands on the PLAIN-CYCLIC answer, alpha
+    // 4.9e-02 and U 45%, which is what that profile's control measures.
 
     // THE ISOTROPIC AND SHEAR COMPRESSION TERMS. alphaEqn.H:60-75 blends phic with
     // cAlpha*icAlpha*interpolate(mag(U)) and then ADDS scAlpha*mag(delta() & interpolate(symm(grad(U)))).
@@ -709,6 +690,30 @@ RunReport runInterFoamDevice(
         // the mixture's own nu. NOTE mixtureNu's second argument is mu, not alpha2.
         cpu::twoPhase::mixtureMu(f.alpha1.internal, f.mixture.phases, f.mu);
         cpu::twoPhase::mixtureNu(f.alpha1.internal, f.mu, f.mixture.phases, f.nu);
+        // ...and the COUPLED patches' share of the mixture boundary, which is the two CELLS'
+        // interpolated (updateMixtureBoundary's coupled branch, inter_case_cpp.cu:141-163) and so is
+        // only as current as f.rho, f.mu and f.nu -- which this hook has just rebuilt. The alpha hook
+        // ran updateMixtureBoundary one stage earlier, on the PREVIOUS step's cell fields, and its
+        // ordering there is deliberate: a contact-angle wall must be blended before the curvature
+        // pass moves alpha's patch value. So only the pair is refreshed here, where the host's single
+        // call already has current cells (inter_driver_cpp.cu:552).
+        //
+        // MEASURED on validation/interFoamCyclic's `jump` profile, where porousBafflePressure reads
+        // exactly these patch values: without this the device's nu and rho on the pair stayed at their
+        // step-one values (nu 7.90e-06 against the host's 1.08e-06 at step two), the jump came out 1%
+        // wrong on its largest face, and U was 3.8e-03 from the host by step ten.
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (!fvp[pi].coupled) continue;
+            const std::size_t n = f.rhoBnd.size() > pi ? f.rhoBnd[pi].size() : 0;
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                const label k = static_cast<label>(i);
+                f.rhoBnd[pi][i] = coupledLinear(fvp[pi], k, f.rho);
+                f.muBnd[pi][i]  = coupledLinear(fvp[pi], k, f.mu);
+                f.nuBnd[pi][i]  = coupledLinear(fvp[pi], k, f.nu);
+            }
+        }
         // f.nuBnd is the alpha hook's, taken BEFORE its curvature pass. Rebuilding it here would read
         // alpha's patch values one contact-angle pass too late.
         // nuEff = nut + nu: the mixture's nu alone on a laminar case. nut is the closure's, as the

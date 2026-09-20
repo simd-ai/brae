@@ -109,6 +109,7 @@ struct DeviceInterStepTaps
     // these are taken on EVERY corrector, so they hold the LAST -- which is the state the host's own
     // taps hold and the only one the two arms can be compared in.
     DeviceBuffer<scalar> phigIf, rAUfIf, ffIf, phiIf, phiHbyAIfPrePhig, cycJumpTap;
+    std::vector<std::vector<scalar>> jumpHistory;
     DeviceBuffer<scalar> uEqnCycIfCoeff;   // UEqn's interface off-diagonal on the pair
     // ...and the ALPHA step's own two on the pair, taken as it leaves: alphaPhi10 and rhoPhi there
     DeviceBuffer<scalar> alphaPhiIfTap, rhoPhiIfTap, alphaAfterAlphaStep;

@@ -491,9 +491,11 @@ if [ $HAVE_GPU = 1 ]; then
     BASE="$B"
     arm device_limitedLinear refused "Gauss limitedLinear"    "-device" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear 0.2;/' system/fvSchemes"
     BASE="$B"
-    # the device loop is handed the mesh WITHOUT the coupling attached, and refuses the pair by name
+    # THE BAFFLE TUTORIAL on the device. Its pair and its JUMP both run now
+    # (tests/interfoam_cyclic_vs_openfoam.sh's `jump` profile measures them), so what it refuses is
+    # the one thing left: the case sets `nOuterCorrectors 3` and the device loop runs one.
     BASE="$BB"
-    arm device_baffle       refused "porous_half0" "-device" true
+    arm device_baffle       refused "nOuterCorrectors 3" "-device" true
     BASE="$B"
     # the device's gradient operators are Gauss linear; a limited or least-squares one is refused
     arm device_gradLsq      refused "leastSquares or cellLimited" "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         leastSquares;/' system/fvSchemes"

@@ -27,10 +27,7 @@
 # MEASURED, ten steps, host then device against OpenFOAM:
 #   MULESCorr  host alpha 1.9e-13, p_rgh 9.8e-12, U 7.5e-13; device 4.2e-11, 1.98e-11, 5.7e-11
 #   explicit   host alpha 5.9e-14, p_rgh 2.9e-12, U 5.7e-13; device 4.3e-11, 3.1e-11, 3.0e-11
-#   jump       host alpha 4.1e-13, p_rgh 1.0e-11, U 4.4e-12; the DEVICE REFUSES -- it carries the jump
-#              through the matrix, the flux and the gradient and is exact at step one (U 5.0e-10), and
-#              is 3.8e-03 of U from the host by step ten. With the jump not carried at all it lands on
-#              the plain-cyclic answer, alpha 4.9e-02 and U 45%, which is this profile's control.
+#   jump       host alpha 4.1e-13, p_rgh 1.0e-11, U 4.4e-12; device 6.2e-12, 2.4e-11, 7.5e-11
 # and the device against brae's own host arm, 4.2e-11 / 1.02e-11 / 5.8e-11 and 4.3e-11 / 2.9e-11 /
 # 3.0e-11. The alpha figure is the device alpha solver's stopping point: pinned at 1e-16 the two arms
 # agree to 6.1e-14.
@@ -42,6 +39,9 @@
 #   the Gauss-Seidel sweep not applying the interface  device alpha 6.6e-01, p_rgh 1.2e+00, U 1.6e+01
 #   the jump left out of the device entirely           device alpha 4.9e-02, U 45% -- the control's
 #                                                      own distance, i.e. the plain-cyclic answer
+#   the pair's mixture boundary one stage stale        device alpha 6.6e-05, p_rgh 1.1e-04, U 3.8e-03
+#                                                      (porousBafflePressure reads nu and rho THERE,
+#                                                      and they are the two cells' interpolated)
 #   the pair's nHatf in a buffer local to one step     the `explicit` profile ABORTS by name (its
 #                                                      first corrector asks for a normal nothing has
 #                                                      written yet); `MULESCorr` still passes, which

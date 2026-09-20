@@ -192,6 +192,12 @@ scalar deviceInterPressureStep(
         // constrainPressure, and the patches' updateCoeffs at this assembly
         hooks.pressureCoeffs(phiHbyAInt, phiHbyABnd, *in.rAUfAll, rAU, iC, bC, cycJump);
         const bool haveJump = havePair && static_cast<int>(cycJump.size()) == in.cyc->n;
+        if (taps && haveJump)
+        {
+            std::vector<scalar> jh;
+            cycJump.copyTo(jh);
+            taps->jumpHistory.push_back(jh);
+        }
 
         // the explicit correction: gradOf(p_rgh), laplacianCorrFlux, laplacianNonOrthSource
         DeviceBuffer<scalar> corrSource;

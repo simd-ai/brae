@@ -115,6 +115,7 @@ int main(
     const std::string wallsDir = argv[6];
     const std::string profile = (argc > 7) ? argv[7] : "MULESCorr";
     const bool jumpProfile = (profile == "jump");
+    (void)jumpProfile;
 
     std::printf("  profile: %s\n", profile.c_str());
     PrimitiveMesh m;
@@ -253,26 +254,6 @@ int main(
     if (nDev <= 0)
     {
         std::printf("  (no CUDA device: the device arm is not exercised)\n");
-    }
-    else if (jumpProfile)
-    {
-        // THE JUMP IS CARRIED BUT NOT YET EXACT on the device, so it refuses -- see the note in
-        // inter_driver_device.cu for what it reaches (alpha 6.6e-05, U 3.8e-03 from the host over ten
-        // steps, against alpha 4.9e-02 and U 45% with the jump absent, which is the control's own
-        // distance). The host arm above is the one gated here.
-        bool named = false;
-        try
-        {
-            InterFields dev;
-            runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
-        }
-        catch (const std::exception& e)
-        {
-            const std::string w(e.what());
-            named = w.find("carries a JUMP") != std::string::npos;
-            std::printf("  device: %s\n", e.what());
-        }
-        check("the device loop refuses a jump on the pair and names it", named);
     }
     else
     {
