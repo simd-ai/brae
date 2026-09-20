@@ -34,10 +34,20 @@ namespace interFoam {
 
 namespace {
 
-std::vector<scalar> flattenPatches(const std::vector<std::vector<scalar>>& b)
+// EVERY ONE OF THESE FEEDS A DEVICE BOUNDARY ARRAY, and the device mesh keeps a COUPLED patch out of
+// its boundary gather entirely (device_mesh.cuh:41-44): its Sf layout is [internal | non-cyclic
+// boundary] and its bndCell list matches. Flattening every patch here makes each array longer than the
+// device's boundary-face count, which is how a periodic mesh first failed -- the alpha pre-solve
+// refused its coefficients by size, and the momentum assembly refused rho and nuEff the same way.
+std::vector<scalar> flattenPatches(const std::vector<std::vector<scalar>>& b,
+                                   const std::vector<FvPatch>& fvp)
 {
     std::vector<scalar> v;
-    for (const auto& p : b) v.insert(v.end(), p.begin(), p.end());
+    for (std::size_t pi = 0; pi < b.size(); ++pi)
+    {
+        if (pi < fvp.size() && isCoupledInterfaceType(fvp[pi].type)) continue;
+        v.insert(v.end(), b[pi].begin(), b[pi].end());
+    }
     return v;
 }
 
@@ -46,6 +56,7 @@ std::vector<scalar> patchValues(const GeometricField<scalar>& f, const std::vect
     std::vector<scalar> v;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
+        if (isCoupledInterfaceType(fvp[pi].type)) continue;
         const std::vector<scalar>& b = f.boundary[pi]->value();
         v.insert(v.end(), b.begin(), b.end());
     }
@@ -56,7 +67,10 @@ std::vector<scalar> fullFace(const SurfaceScalarField& f, const std::vector<FvPa
 {
     std::vector<scalar> v(f.internal);
     for (std::size_t pi = 0; pi < fvp.size() && pi < f.boundary.size(); ++pi)
+    {
+        if (isCoupledInterfaceType(fvp[pi].type)) continue;   // the device's Sf layout, see above
         v.insert(v.end(), f.boundary[pi].begin(), f.boundary[pi].end());
+    }
     return v;
 }
 
@@ -109,6 +123,26 @@ RunReport runInterFoamDevice(
             + "). The device loop's UEqn applies explicitPorositySource/DarcyForchheimer only; the host "
             "loop carries this one. Refused rather than run the case without it.");
     }
+    // WHAT THE PAIR STILL DOES NOT CARRY, and it is two terms, both in the pressure corrector:
+    //   phig -- (surfaceTensionForce - ghf*snGrad(rho))*rAUf*magSf -- is built over the device's face
+    //   array, which is [internal | non-cyclic boundary]; the pair's faces get none of it, so phiHbyA
+    //   there is missing the buoyancy the rest of the mesh has.
+    //   U = HbyA + rAU*fvc::reconstruct((phig - flux)/rAUf) sums face contributions per cell, and the
+    //   pair's faces are in neither of the lists deviceCorrectVelocity walks.
+    // MEASURED on validation/interFoamCyclic, ten steps of 2e-3 with everything else wired: the device
+    // reaches a Courant number of 2.68 at step two where OpenFOAM and brae's host loop read 0.05, and
+    // alpha leaves [0, 1] by step three. Refused rather than run a pair whose pressure corrector is
+    // missing two of its terms. Everything below the corrector -- the matrices, MULES, nHatf, the alpha
+    // fluxes -- is gated and in place; this is the last rung.
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        if (!fvp[pi].coupled) continue;
+        throw std::runtime_error(
+            "brae interFoam (device): patch `" + fvp[pi].name + "` is a coupled pair, and the device "
+            "pressure corrector does not carry its phig or its share of fvc::reconstruct. The host loop "
+            "(no -device) does. Run without -device.");
+    }
+
     // A JUMP ON THE PAIR. The device's interface coefficient is one number per face -- the laplacian's
     // or the momentum's -- and a jumpCyclic's neighbour value is the cell across LESS the jump
     // (jumpCyclicFvPatchField.C, patchNeighbourField), which nothing in DeviceCyclic carries. The pair
@@ -336,7 +370,7 @@ RunReport runInterFoamDevice(
     // THE BOUNDARY FLUX, declared above the hooks because they read it. OpenFOAM's flux-conditional
     // patches look phi up whenever they update; brae's are told, and the device path holds the only
     // current copy. See pushFluxToPatches for what not telling them cost on capillaryRise.
-    DeviceBuffer<scalar> dPhiB(flattenPatches(f.phi.boundary));
+    DeviceBuffer<scalar> dPhiB(flattenPatches(f.phi.boundary, fvp));
     // rhoPhi, which the alpha step writes. Declared HERE because pushFlux reads its boundary: a
     // condition may name `phi rhoPhi;` (three tutorials' totalPressure top does), and the device holds
     // the only current copy. Empty until the first alpha step, when the host's -- built at rest by
@@ -417,7 +451,7 @@ RunReport runInterFoamDevice(
         SurfaceScalarField nHb;
         std::vector<scalar> Kb;
         interfaceProps::calculateK(f.alpha1, f.interface, m, g, fvp, false, nHb, Kb);
-        nBnd.copyFrom(flattenPatches(nHb.boundary));
+        nBnd.copyFrom(flattenPatches(nHb.boundary, fvp));
     };
     H.alpha.refreshBoundary =
         [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& aBnd)
@@ -449,9 +483,16 @@ RunReport runInterFoamDevice(
         f.alpha1.evaluateBoundary();
         FvScalarMatrix M = fvm::div<scalar>(f.phi.internal, f.phi.boundary, f.alpha1, m, fvp);
         std::vector<scalar> i2, b2;
+        // The device's boundary arrays hold the UNCOUPLED patches only, as its mesh does
+        // (device_mesh.cuh:41-44): a coupled patch's coefficients are the interface's, and the alpha
+        // pre-solve adds those itself from the pair. Flattening every patch here made the array longer
+        // than the device's boundary-face count and the pre-solve refused it by size.
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;
             for (label i = 0; i < fvp[pi].size; ++i)
             { i2.push_back(M.internalCoeffs[pi][i]); b2.push_back(M.boundaryCoeffs[pi][i]); }
+        }
         iC.copyFrom(i2);
         bC.copyFrom(b2);
     };
@@ -587,7 +628,7 @@ RunReport runInterFoamDevice(
         {
             // the mixture's nu alone: the step adds the device's nut (DeviceInterStepControls::nutCell)
             nuC.copyFrom(f.nu);
-            nuB.copyFrom(flattenPatches(f.nuBnd));
+            nuB.copyFrom(flattenPatches(f.nuBnd, fvp));
             deviceCopy(dStepNu, nuC);
             deviceCopy(dStepNuBnd, nuB);
         }
@@ -597,7 +638,7 @@ RunReport runInterFoamDevice(
             std::vector<std::vector<scalar>> nuEffB;
             interNuEff(f.turbulence, f.nu, f.nuBnd, nuEff, nuEffB);
             nuC.copyFrom(nuEff);
-            nuB.copyFrom(flattenPatches(nuEffB));
+            nuB.copyFrom(flattenPatches(nuEffB, fvp));
         }
 
         // snGrad(p_rgh) is read ONLY when the case runs a momentum predictor; it is explicit there and
@@ -937,7 +978,7 @@ RunReport runInterFoamDevice(
     DeviceBuffer<scalar> dUobx, dUoby, dUobz;
     DeviceBuffer<scalar> dPhiI(f.phi.internal);
     DeviceBuffer<scalar> dPrgh(f.p_rgh.internal), dP;
-    DeviceBuffer<scalar> dNH(f.nHatf.internal), dNHB(flattenPatches(f.nHatf.boundary));
+    DeviceBuffer<scalar> dNH(f.nHatf.internal), dNHB(flattenPatches(f.nHatf.boundary, fvp));
     DeviceBuffer<scalar> dABnd(patchValues(f.alpha1, fvp)), dK(f.K);
     DeviceBuffer<scalar> dGh(f.gh), dGhf, dMagSf(g.magSf());
     { SurfaceScalarField gf; gf.internal = f.ghfInternal; gf.boundary = f.ghfBoundary;

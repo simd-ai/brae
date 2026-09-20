@@ -20,6 +20,12 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_device_cyclic_nhatf_vs_openfoam"
 [ -x "$BIN" ] || { echo "SKIP: $BIN not built"; exit 77; }
 
+OFBASHRC=${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
+[ -f "$OFBASHRC" ] || { echo "SKIP: real OpenFOAM not available"; exit 77; }
+set +u
+# shellcheck disable=SC1091
+source "$OFBASHRC" > /dev/null 2>&1 || true
+set -u
 command -v blockMesh > /dev/null 2>&1     || { echo "SKIP: blockMesh not on PATH"; exit 77; }
 command -v createBaffles > /dev/null 2>&1 || { echo "SKIP: createBaffles not on PATH"; exit 77; }
 command -v interFoam > /dev/null 2>&1     || { echo "SKIP: interFoam not on PATH"; exit 77; }

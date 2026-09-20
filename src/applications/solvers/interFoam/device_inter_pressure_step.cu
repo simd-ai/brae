@@ -148,7 +148,8 @@ scalar deviceInterPressureStep(
 
         deviceInterAssemblePEqn(dm, rAUfInt, phiHbyAInt, phiHbyABnd,
                                 in.needReference, in.pRefCell, &p_rgh, P,
-                                in.correctedLaplacian, in.correctedLaplacian ? &corrSource : nullptr);
+                                in.correctedLaplacian, in.correctedLaplacian ? &corrSource : nullptr,
+                                in.cyc, &rAU, in.phiHbyAIf);
 
         if (taps && pass == 0)
         {

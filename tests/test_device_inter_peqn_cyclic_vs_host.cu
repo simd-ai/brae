@@ -95,6 +95,11 @@ int main(int argc, char** argv)
         if (!isCoupledInterfaceType(q.type)) nBf += static_cast<std::size_t>(q.size);
     }
     DeviceBuffer<scalar> zeroBf(std::vector<scalar>(nBf, scalar(0)));
+    // ...and the PAIR's phiHbyA, which the assembly now requires because fvc::div(phiHbyA) sums a
+    // coupled face like any other. This gate's phiHbyA is zero everywhere, so the pair's is too.
+    std::size_t nIfFaces = 0;
+    for (const CyclicInterface& c : cyclics) nIfFaces += c.faceCells.size();
+    DeviceBuffer<scalar> zeroCycIf(std::vector<scalar>(nIfFaces, scalar(0)));
 
     for (int pass = 0; pass < 2; ++pass)
     {
@@ -104,7 +109,7 @@ int main(int argc, char** argv)
         DeviceCyclic cyc = buildDeviceCyclic(cyclics, g, fvp);
         DevicePressureMatrix P;
         deviceInterAssemblePEqn(dm, dRAUf, zeroIf, zeroBf, /*needReference=*/false, 0, nullptr, P,
-                                corrected, nullptr, &cyc, &dRAU);
+                                corrected, nullptr, &cyc, &dRAU, &zeroCycIf);
 
         // psi: something that is NOT periodic-symmetric, so the interface term cannot cancel itself
         std::vector<scalar> psi(static_cast<std::size_t>(nC));
@@ -182,7 +187,7 @@ int main(int argc, char** argv)
             DeviceCyclic cycF = buildDeviceCyclic(cyclics, g, fvp);
             DevicePressureMatrix PF;
             deviceInterAssemblePEqn(dm, dRAUf, zeroIf, zeroBf, /*needReference=*/false, 0, nullptr, PF,
-                                    corrected, nullptr, &cycF, &dRAU);
+                                    corrected, nullptr, &cycF, &dRAU, &zeroCycIf);
             cycF.phi.copyFrom(phiIf);          // start from zero, so what is left IS the flux
             DeviceBuffer<scalar> dP(psi);      // psi stands in for the solved p_rgh
             deviceCyclicCorrectFlux(cycF, dP);

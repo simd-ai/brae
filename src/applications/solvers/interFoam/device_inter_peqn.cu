@@ -432,7 +432,8 @@ void deviceInterAssemblePEqn(
     bool                        corrected,
     const DeviceBuffer<scalar>* nonOrthSource,
     DeviceCyclic*               cyc,
-    const DeviceBuffer<scalar>* rAUCell)
+    const DeviceBuffer<scalar>* rAUCell,
+    const DeviceBuffer<scalar>* phiHbyAIf)
 {
     const int nC = dm.nCells;
 
@@ -456,6 +457,20 @@ void deviceInterAssemblePEqn(
     // == fvc::div(phiHbyA): source += div*V, a PLUS.
     DeviceBuffer<scalar> div(static_cast<std::size_t>(nC));
     deviceDiv(dm, phiHbyAInt, phiHbyABnd, div);
+    // ...and the PAIR's phiHbyA, which fvc::div sums into its face cell like any patch's
+    // (fvc.cu:548-550). The matrix's own coupling was already here; leaving the SOURCE without the
+    // pair's flux is a different equation, not a smaller one -- MEASURED on validation/interFoamCyclic,
+    // the first pressure solve then put the Courant number at 2.9 and alpha at 1.53 by step two.
+    if (cyc && cyc->n > 0)
+    {
+        if (!phiHbyAIf)
+        {
+            throw std::runtime_error(
+                "brae interFoam device pEqn: the mesh has a periodic pair and its phiHbyA was not "
+                "handed to the assembly. fvc::div(phiHbyA) sums a coupled face like any other.");
+        }
+        deviceCyclicAddDivFlux(*cyc, *phiHbyAIf, dm.V, div);
+    }
     addDivSourceKernel<<<nBlocks(nC), TPB>>>(div.data(), dm.V.data(), nC, P.source.data());
     ckP(cudaGetLastError(), "source += div(phiHbyA)*V");
 
