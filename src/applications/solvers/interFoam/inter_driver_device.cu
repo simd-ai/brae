@@ -263,12 +263,18 @@ RunReport runInterFoamDevice(
         //     deltaCoeffs and magSf, and dbU is rebuilt), surfaceInterpolation::clearOut's four
         //     fields, and meshObject::movePoints (the turbulence's, via interMeshUpdate).
         //
-        // WHAT IS LEFT TO LOOK AT, in order: the BOUNDARY half of the flux. The device's phi on a
-        // moving wall has to come out relative -- OpenFOAM's wall moves WITH the mesh, so its
-        // relative flux is zero -- and the meshPhi this loop subtracts is laid out by fullFace()
-        // while phiBnd is the device's own boundary array. If those two orderings disagree on a case
-        // with empty patches (this one is 2D), the subtraction lands on the wrong faces. That is a
-        // layout question with a definite answer, not a guess, and it is the next measurement.
+        //   * and it is NOT a layout mismatch between the meshPhi this loop subtracts and the flux it
+        //     subtracts it from. fullFace() and flattenPatches() both skip COUPLED patches and only
+        //     those -- an `empty` patch is in both, in patch order -- so the two arrays index face for
+        //     face. The pressure step's own size guard (meshPhiAll->size() != nIf + nBf) says the same
+        //     thing and has never fired on this case, which is 2D and does have empty patches.
+        //
+        // FIVE HYPOTHESES ARE NOW DEAD, each by measurement: makeRelative (rigid motion, so
+        // div(meshPhi) = 0), Uf and ddtCorr (the gap is there at step one, from rest), the solver's
+        // stopping point (pinning moves the host to 5.181e-11 and this arm the other way), the
+        // geometry refresh, and this layout. WHAT IS NEEDED NEXT is not another guess but the stage
+        // dump: run the moving case on both arms with a mesh copy each -- they move their own -- and
+        // compare phiHbyA, the p_rgh system and phi, as the cyclic gaps were localised.
         //
         // THE MESH FLUX IS CARRIED NOW (DeviceInterStepControls::meshPhiAll -> the pressure step's
         // fvc::makeRelative at the host's own site), and it is necessary -- the alpha equation must
