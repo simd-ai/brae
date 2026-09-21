@@ -234,23 +234,37 @@ RunReport runInterFoamDevice(
     DynamicMotionSolverFvMesh* dyn = f.dynamicMesh.get();
     if (dyn)
     {
-        // THE MOVE RUNS BUT DOES NOT AGREE WITH THE HOST YET, so it stays refused. The call site below
-        // is wired -- interMeshUpdate moves the mesh through the host stage, refreshDeviceMeshGeometry
-        // and the re-uploads follow it, and the ddt takes V0 -- and the first end-to-end run on
-        // laminar/sloshingTank2D (two steps, deltaT 0.01) measured the gap that is left:
+        // THE MOVE RUNS BUT THE FLUX IS NOT RELATIVE YET, so it stays refused. The call site below is
+        // wired -- interMeshUpdate moves the mesh through the host stage, refreshDeviceMeshGeometry
+        // and the re-uploads follow it, and the ddt takes V0 -- and sloshingTank2D localises what is
+        // left, ONE step at deltaT 0.01:
         //
-        //     host    max|U| 10.2  m/s, worst |div(phi)| 1.071e-07
-        //     device  max|U| 10.48 m/s, worst |div(phi)| 7.282e-01
+        //     host                          max|U| 10.38 m/s, worst |div(phi)| 9.173e-07
+        //     device, mesh clock one late   max|U|  0.014 m/s, worst |div(phi)| 5.924e-03
+        //     device, clock fixed           max|U| 10.45 m/s, worst |div(phi)| 1.573e-01
         //
-        // 2.7% in the velocity and seven orders in the continuity error. Something the move owes this
-        // loop is still missing -- the mesh flux the alpha step and ddtCorr read is the first place to
-        // look, since the pressure corrector's phi is relative on both arms. Refusing rather than
-        // shipping a moving case whose answer is not the host's.
-        throw std::runtime_error(
+        // The first gap was this loop handing the motion rep.time, which it keeps at the step it is
+        // LEAVING (the host advances it in its advanceTime stage, ahead of this one) -- so the mesh
+        // moved one step late and the tank barely drove the flow. interMeshUpdate takes the clock
+        // explicitly now.
+        //
+        // WHAT REMAINS IS THE MESH FLUX IN THE PRESSURE CORRECTOR. The host's pEqn carries meshPhi --
+        // inter_peqn_cpp.cu:600-607 wraps ddtCorr in makeRelative/makeAbsolute and :955-980 makes the
+        // final phi relative -- and this device step carries none of it, so its phi stays ABSOLUTE
+        // where the host's is relative. That is what a 1.6e-01 divergence on a moving mesh looks like.
+        if (std::getenv("BRAE_LOCALISE_MOVING"))
+        {
+            // the escape announces itself: a quiet bypass of a refusal is the thing this project
+            // refuses to ship
+            std::printf("  *** BRAE_LOCALISE_MOVING: running a moving mesh whose flux is NOT relative. "
+                        "This answer is not the host's. ***\n");
+        }
+        if (!std::getenv("BRAE_LOCALISE_MOVING")) throw std::runtime_error(
             "brae interFoam -device: the case moves its mesh (" + dyn->motionType() + "). This loop now "
-            "moves it, but the answer does not match the host arm yet -- measured on sloshingTank2D, "
-            "max|U| 10.48 against 10.2 m/s and worst |div(phi)| 7.282e-01 against 1.071e-07. Refusing "
-            "rather than running a moving case whose answer is not the host's. Run without -device.");
+            "moves it, but its pressure corrector does not carry the mesh flux, so phi stays absolute "
+            "-- measured on sloshingTank2D, worst |div(phi)| 1.573e-01 against the host's 9.173e-07. "
+            "Refusing rather than running a moving case whose flux is not relative. Run without "
+            "-device.");
 
         // A COUPLED PAIR ON A MOVING MESH is not ported: buildDeviceCyclic lays the interface out from
         // the geometry, and every hook in this loop holds a pointer into that layout, so rebuilding it
@@ -1375,7 +1389,8 @@ RunReport runInterFoamDevice(
                 dV0.copyFrom(dm.V.host());
                 C.V0 = &dV0;
                 interMeshUpdate(dyn, f, m, g, fvp, mutableMesh, /*amiPairs=*/nullptr,
-                                motionCache, meshCpc, rep, outer, f.pimple.nOuterCorrectors);
+                                motionCache, meshCpc, rep, stepTime, stepIndex, outer,
+                                f.pimple.nOuterCorrectors);
                 // ...and now every buffer this loop uploaded from the geometry. clearGeom +
                 // clearOut on the device side: the addressing is untouched, as the move keeps the
                 // topology fixed (device_mesh.cuh).
