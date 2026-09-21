@@ -126,6 +126,7 @@ add_library(brae_core STATIC
     src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon_cpp.cu
     src/TurbulenceModels/turbulenceModels/LES/LESdeltas/les_delta_cpp.cu
     src/TurbulenceModels/turbulenceModels/LES/kEqn/les_kEqn_cpp.cu
+    src/TurbulenceModels/turbulenceModels/LES/kEqn/device_les_keqn.cu
     src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon.cu
     src/TurbulenceModels/turbulenceModels/RAS/SpalartAllmaras/SpalartAllmaras_cpp.cu
     src/finiteVolume/cfdTools/general/fvOptions/fvOptions_cpp.cu

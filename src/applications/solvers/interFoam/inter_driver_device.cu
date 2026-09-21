@@ -139,11 +139,24 @@ RunReport runInterFoamDevice(
     // (kOmegaSST runs on this loop now: device_inter_turbulence.cu's SST branch hands the closure
     // rhoSimpleFoam gates what the host's SST branch hands its reference. Gated against OpenFOAM on
     // RAS/waterChannel.)
+    // LES kEqn's EQUATION is ported (device_les_keqn.cu, a transcription of les_kEqn_cpp.cu, with the
+    // filter width taken once from the host's LESdelta::compute), and the case still does not run:
+    // MEASURED on LES/nozzleFlow2D at the gate's own step, ONE step, against OpenFOAM --
+    //
+    //     alpha 1.1796e-16 (the host's, exactly), p_rgh 5.9941e-01, U 1.7186e-01, k 4.5070e-02
+    //
+    // -- and at one step the closure has not touched U yet (interFoam.C runs turbulence->correct()
+    // AFTER the pressure corrector, so the momentum of step one reads the nut the 0 directory holds,
+    // which is the same field on both arms). So the gap that has to be localised first is the
+    // MOMENTUM AND PRESSURE path on this case, not the closure: k follows the U it is given. Refused
+    // by name until that is found, rather than run at 17% of U.
     if (f.turbulence.on && f.turbulence.model == cpu::interFoam::InterRasModel::KEqnLES)
         throw std::runtime_error(
-            "brae interFoam (device): the case is LES kEqn. The device loop runs kEpsilon's device twin "
-            "and nothing else; kEqn and its filter width are ported on the host (les_kEqn_cpp.cu, "
-            "les_delta_cpp.cu) and gated there against OpenFOAM on LES/nozzleFlow2D.");
+            "brae interFoam (device): the case is LES kEqn. The equation itself is ported "
+            "(device_les_keqn.cu) and the loop around it is not: on LES/nozzleFlow2D it reads U "
+            "1.7e-01 and p_rgh 6.0e-01 from OpenFOAM after ONE step, with alpha exact and before the "
+            "closure has touched U at all. The host loop runs it and is gated on that case. Run "
+            "without -device.");
 
     // fvOptions: the device UEqn applies explicitPorositySource/DarcyForchheimer, and nothing else. Each
     // other type is refused BY ITS OWN NAME rather than by a blanket notice -- the mangroves pair, the

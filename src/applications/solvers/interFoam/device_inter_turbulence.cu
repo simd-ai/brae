@@ -1,5 +1,6 @@
 // interFoam's turbulence on the device. See device_inter_turbulence.cuh for what each input is.
 #include "device_inter_turbulence.cuh"
+#include "device_les_keqn.cuh"
 #include "device_blas.cuh"
 #include "near_wall_dist.cuh"
 #include "nut_wall_function.cuh"
@@ -45,9 +46,13 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
     // agree on every shipped tutorial, and where they would not the device must say so.
     // kOmegaSST keeps its second field in ::omega; every slot below is that field's under SST
     const bool sst = (t.model == cpu::interFoam::InterRasModel::KOmegaSST);
+    // LES kEqn HAS NO SECOND FIELD: the host closure reads k and nut and nothing else, so t.epsilon
+    // here is a default-constructed field with no patches at all. Walking it built a wall set from
+    // null boundary pointers.
+    const bool les = (t.model == cpu::interFoam::InterRasModel::KEqnLES);
     const GeometricField<scalar>& second = sst ? t.omega : t.epsilon;
     std::vector<char> wfPatch(patches.size(), 0);
-    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    for (std::size_t pi = 0; pi < patches.size() && !les; ++pi)
     {
         const bool wf = second.boundary[pi]->isTurbulenceWallFunction();
         wfPatch[pi] = wf ? 1 : 0;
@@ -59,12 +64,12 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
     }
 
     d.k.copyFrom(t.k.internal);
-    d.epsilon.copyFrom(second.internal);
+    if (!les) d.epsilon.copyFrom(second.internal);
     d.nut.copyFrom(t.nut.internal);
     d.nutBnd.copyFrom(patchValuesOf(t.nut, patches));
     // storedIoSeed: the closure reconstructs an inletOutlet patch's STORED value at its first step
     d.dbK = buildDeviceBoundary(t.k, patches, g, /*storedIoSeed=*/true);
-    d.dbEps = buildDeviceBoundary(second, patches, g, /*storedIoSeed=*/true);
+    if (!les) d.dbEps = buildDeviceBoundary(second, patches, g, /*storedIoSeed=*/true);
     // nut's own: the closure writes every other kind of face, and this decides the inletOutlet ones
     d.dbNut = buildDeviceBoundary(t.nut, patches, g, /*storedIoSeed=*/false);
     // correctBoundaryConditions on nut, the host closure's own loop (kOmegaSST_cpp.cu:946-984): every
@@ -150,7 +155,10 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
         // each wall function's OWN coefficients: the nut patch's for nutkWallFunction, the epsilon
         // patch's for epsilonWallFunction
         const WallFunctionCoeffs& nc = t.nut.boundary[pi]->wallCoeffs();
-        const WallFunctionCoeffs& ec = second.boundary[pi]->wallCoeffs();
+        // ...and the second field's, which a kEqn case does not have (and whose wall functions the
+        // host reader refuses under that model, so there is nothing here to read)
+        static const WallFunctionCoeffs noWf{};
+        const WallFunctionCoeffs& ec = les ? noWf : second.boundary[pi]->wallCoeffs();
         for (label i = 0; i < patches[pi].size; ++i)
         {
             // this face's index in boundary-face order; taken here because the loop has an early exit
@@ -162,7 +170,11 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
             nKappa.push_back(nc.kappa);
             nE.push_back(nc.E);
             nYpl.push_back(nc.yPlusLam());
-            kind.push_back(t.nutWallKind[pi] >= 0 ? t.nutWallKind[pi] : static_cast<int>(NutWall::Nutk));
+            // ...and nut's wall-function kind, which the host reader fills on the RAS path ONLY: a
+            // kEqn case has no such patch (it refuses a `nut*` type under that model), so the list is
+            // empty there and indexing it walked off the end.
+            const int nwk = (pi < t.nutWallKind.size()) ? t.nutWallKind[pi] : -1;
+            kind.push_back(nwk >= 0 ? nwk : static_cast<int>(NutWall::Nutk));
             if (!isWF) continue;
             eCmu25.push_back(std::pow(ec.Cmu, 0.25));
             eCmu75.push_back(std::pow(ec.Cmu, 0.75));
@@ -209,9 +221,9 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
         {
             if (isCoupledInterfaceType(patches[pi].type)) continue;   // the device's boundary layout
             const int  kk = t.k.boundary[pi]->turbulentInletKind();
-            const int  ek = second.boundary[pi]->turbulentInletKind();
+            const int  ek = les ? -1 : second.boundary[pi]->turbulentInletKind();
             const scalar kc = t.k.boundary[pi]->turbulentInletCoefficient();
-            const scalar ec = second.boundary[pi]->turbulentInletCoefficient();
+            const scalar ec = les ? scalar(0) : second.boundary[pi]->turbulentInletCoefficient();
             for (label i = 0; i < patches[pi].size; ++i, ++bi)
             {
                 if (bi >= bndIdx) break;
@@ -232,6 +244,19 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
     {
         d.onesCell.copyFrom(std::vector<scalar>(static_cast<std::size_t>(m.nCells()), scalar(1)));
         d.onesBnd.copyFrom(std::vector<scalar>(static_cast<std::size_t>(bndIdx), scalar(1)));
+    }
+
+    // the LES filter width, from the host's own LESdelta::compute -- once, on a mesh that does not
+    // move (the driver refuses a kEqn case whose mesh does)
+    if (t.model == cpu::interFoam::InterRasModel::KEqnLES)
+    {
+        if (t.delta.size() != static_cast<std::size_t>(m.nCells()))
+        {
+            throw std::runtime_error(
+                "brae interFoam (device): the LES filter width was not computed for this mesh. It is "
+                "LESdelta::compute's, taken once by the host closure's own build.");
+        }
+        d.lesDelta.copyFrom(t.delta);
     }
 
     if (sst)
@@ -335,6 +360,50 @@ void deviceCorrectInterTurbulence(
             deviceBCValue(dbU.comp[k], *Uk, ub);
             deviceGatherWallNu(d.wallFaceOfBnd, ub, out);
         }
+    }
+
+    if (t.model == cpu::interFoam::InterRasModel::KEqnLES)
+    {
+        // A TRANSCRIPTION of the host's kEqn branch (inter_turbulence_cpp.cu, correctInterTurbulence):
+        // alpha = rho = 1, the VOLUMETRIC phi as the equation's flux and as divU's, the mixture's nu,
+        // and the Final entries for the solve -- one outer corrector, so that is the entry in force.
+        // Nothing here is a wall function: nut is Ck*sqrt(k)*delta everywhere.
+        gpu::LESkEqn::Input lin;
+        lin.Ux = in.Ux;
+        lin.Uy = in.Uy;
+        lin.Uz = in.Uz;
+        lin.phiInt = in.phiInt;
+        lin.phiBnd = in.phiBnd;
+        lin.nu = in.nu;
+        lin.nuBnd = in.nuBnd;
+        lin.nutBnd = &d.nutBndIn;      // the nut patch values the LAST correctNut left, as DkEff reads
+        lin.delta = &d.lesDelta;
+        lin.rDeltaT = scalar(1) / in.deltaT;
+        lin.co = t.lesCoeffs;
+        const cpu::interFoam::SmoothLinearSolve& ks = t.kSolveFinal;
+        lin.symmetric = (ks.smoother == "symGaussSeidel");
+        lin.nSweeps = ks.nSweeps;
+        lin.tol = ks.tol;
+        lin.relTol = ks.relTol;
+        lin.maxIter = ks.maxIter;
+        lin.minIter = ks.minIter;
+        lin.relaxOn = t.kRelaxFinal.on;
+        lin.relax = t.kRelaxFinal.factor;
+        // k.oldTime(): the field as it enters this call, which is what fvm::ddt reads
+        DeviceBuffer<scalar> kOld;
+        deviceCopy(kOld, d.k);
+        lin.kOld = &kOld;
+        const DeviceSolverPerf p = gpu::LESkEqn::correct(dm, d.dbK, dbU, d.k, d.nut, lin);
+        if (in.kLog)
+        {
+            in.kLog->push_back({p.initialResidual, p.finalResidual, p.nIterations});
+        }
+        // nut.correctBoundaryConditions(), through the same call the RAS branches make -- the flux
+        // switch on the flux-conditional faces, then the evaluate on every face the mask carries.
+        // Nothing on a kEqn case is a wall function (the host reader refuses a `nut*` patch type
+        // under this model), so what it leaves is each patch's own evaluate.
+        evaluateNutBoundary(d, *in.phiBnd);
+        return;
     }
 
     if (t.model == cpu::interFoam::InterRasModel::KOmegaSST)
@@ -527,10 +596,11 @@ void downloadDeviceInterTurbulence(
     GeometricField<scalar>& second = (t.model == cpu::interFoam::InterRasModel::KOmegaSST) ? t.omega
                                                                                           : t.epsilon;
     d.k.copyTo(t.k.internal);
-    d.epsilon.copyTo(second.internal);
+    // ...and the second field, which a kEqn case does not have
+    if (t.model != cpu::interFoam::InterRasModel::KEqnLES) d.epsilon.copyTo(second.internal);
     d.nut.copyTo(t.nut.internal);
     t.k.evaluateBoundary();
-    second.evaluateBoundary();
+    if (t.model != cpu::interFoam::InterRasModel::KEqnLES) second.evaluateBoundary();
     std::vector<scalar> nb;
     d.nutBnd.copyTo(nb);
     std::size_t off = 0;

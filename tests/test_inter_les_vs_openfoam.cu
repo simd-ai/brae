@@ -263,6 +263,10 @@ int main(
     }
     else
     {
+        // THE DEVICE LOOP REFUSES, by name. kEqn's own equation IS ported (device_les_keqn.cu); what
+        // is not is the loop around it on this case -- one step reads U 1.7e-01 and p_rgh 6.0e-01
+        // from OpenFOAM with alpha exact, and at one step the closure has not touched U yet, so the
+        // momentum and pressure path is what has to be localised first. The refusal names that.
         bool named = false;
         try
         {

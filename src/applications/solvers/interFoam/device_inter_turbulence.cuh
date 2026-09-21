@@ -68,6 +68,10 @@ struct DeviceInterTurbulence
     int nWallFaces = 0;
 
     // rho = 1 for the uniform lineage, cells and boundary faces
+    // the LES filter width, one per cell, computed once on the host by LESdelta::compute and uploaded
+    // here: kEqn's nut and its destruction term both read it. Empty on a RAS case.
+    DeviceBuffer<scalar> lesDelta;
+
     DeviceBuffer<scalar> onesCell;
     DeviceBuffer<scalar> onesBnd;
 
