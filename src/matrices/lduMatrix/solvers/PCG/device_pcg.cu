@@ -30,7 +30,8 @@ DeviceSolverPerf deviceJacobiPCG(
     scalar relTol,
     int maxIter,
     int minIter,
-    const DeviceDilu* precon)
+    const DeviceDilu* precon,
+    const DevicePreconApply* apply)
 {
     const int nC = A.nCells;
     DeviceBuffer<scalar> wA(nC), rA(nC), pA(nC), Ax(nC);
@@ -53,7 +54,11 @@ DeviceSolverPerf deviceJacobiPCG(
         do
         {
             wArAold = wArA;
-            if (precon)
+            if (apply)
+            {
+                (*apply)(wA, rA);                          // wA = M^-1 rA  (the caller's preconditioner)
+            }
+            else if (precon)
             {
                 diluApply(A, *precon, rA, wA);              // wA = M^-1 rA  (DIC on a symmetric A)
             }

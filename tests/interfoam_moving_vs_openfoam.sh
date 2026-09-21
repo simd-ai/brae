@@ -17,7 +17,16 @@
 # PROFILES, ten steps of deltaT 2e-4 (the tutorial's is 1e-4 under maxCo 0.5; at 2e-4 the Courant
 # number reaches 0.16 and the walls move a cell width in about thirty steps):
 #   mixer          as above, with the tutorial's nAlphaSubCycles 3 -- the sub-cycle reads fvMesh::Vsc
-#                  and Vsc0 at its own clock
+#                  and Vsc0 at its own clock. ON BOTH ARMS, AS SHIPPED: p_rgh is `solver GAMG;
+#                  smoother DIC` and p_rghFinal is `solver PCG; preconditioner { preconditioner GAMG;
+#                  ... smoother DICGaussSeidel; nPreSweeps 2; nVcycles 2 }`, and the device runs both
+#                  (deviceGamgSolve and devicePcgGamgSolve). It ran neither when the device arm was
+#                  first added here, so that arm was a `mixerDevice` profile with the pressure solver
+#                  staged to PCG/DIC; the staging is gone and the arm runs the case's own entries.
+#                  MEASURED, device against OpenFOAM: 20 of 20 p_rgh counts, alpha 1.3e-12, p_rgh
+#                  4.1e-14, U 1.2e-11, Uf 7.2e-12, the walls 7.0e-14 -- the host arm's own distances
+#                  being 6.1e-12, 1.0e-13, 3.2e-11 and 3.1e-11. With the solver staged away it read
+#                  2.2e-12, 1.2e-13, 1.2e-10 and 8.8e-11
 #   mixerCorr      MULESCorr yes, nAlphaSubCycles 1: the implicit pre-solve's fvm::ddt and CMULES on
 #                  the moving mesh
 #   mixerOuter     nOuterCorrectors 2 with moveMeshOuterCorrectors yes: mesh.update() TWICE in one
@@ -26,31 +35,6 @@
 #   mixerOuterOnce nOuterCorrectors 2 without it: the second corrector must NOT move the mesh
 #   mixerPred      momentumPredictor yes: U solved on the moving mesh (smoothSolver GaussSeidel, the
 #                  tutorial's own U entry), with UFinal added because the tutorial names none
-#   mixerDevice    THE DEVICE ARM: the same mixer run on the GPU as well as the host, every field
-#                  checked against the same OpenFOAM oracle and bounded by the host arm's own
-#                  distance from it. WHAT IT DOES NOT COVER: the tutorial's own pressure solver. The
-#                  profile rewrites p_rgh and p_rghFinal to PCG with DIC, the path BOTH arms run
-#                  natively; the shipped entry is PCG with a GAMG PRECONDITIONER, and the device
-#                  loop substitutes Jacobi-BiCGStab for a GAMG pressure solve, which on a moving
-#                  mesh does not reach the tolerance it is given (sloshingTank2D, against the host:
-#                  p_rgh 2.5406e+05 of 5.2780e+06). brae refuses that combination by name -- the
-#                  refusal is held in tests/interfoam_refusals.sh (device_moving) and the GAMG
-#                  pressure path itself in tests/interfoam_gamg_vs_openfoam.sh. Nor does it cover
-#                  the profiles below it: only the mixer runs on the device here, so the
-#                  non-orthogonal tanks, the deforming paddles, correctPhi and the closed-tank
-#                  reference are gated on the HOST arm alone.
-#                  MEASURED: alpha 2.2e-12, p_rgh 1.2e-13, U 1.2e-10, Uf 8.8e-11, the moving walls
-#                  7.0e-14 of 1.8 m/s -- the host arm's own distances on the same profile being
-#                  4.5e-12, 1.0e-13, 3.2e-11 and 2.3e-11, which is what the device checks are bounded
-#                  by. Both arms end on the same mesh (|V_host - V_device| 0 of 8e-09).
-#                  BROKEN ONCE EACH, on the device arm: fvc::correctUf handed the flux already made
-#                  RELATIVE to the motion instead of the absolute one pEqn.H:66 reads -- Uf 4.2e-01,
-#                  alpha 8.7e-02, U 2.5e-01; and (Sf & Uf.oldTime()) built on the mesh BEFORE the
-#                  step's move rather than after it (EulerDdtScheme.C:527 dots the stored old Uf with
-#                  mesh().Sf()) -- Uf 2.7e-02, alpha 1.0e-03, U 3.3e-02. BOTH WERE REAL DEFECTS, and
-#                  the Uf check is the only one that sees either at step one: Uf is written at the end
-#                  of the pressure corrector and read only by the NEXT step's ddtCorr, so with the
-#                  first defect in place alpha agreed to 5.6e-15 and U to 1.6e-11 after one step.
 #   sloshing2D     laminar/sloshingTank2D AS SHIPPED: the SDA roll-sway-heave of a
 #                  tank whose chamfered corners make its cells NON-ORTHOGONAL by 44 degrees, with the
 #                  tutorial's `Gauss linear corrected` laplacian and `corrected` snGrad -- the first
@@ -141,7 +125,7 @@
 #                  under correctPhi (its default), with an absorbing waveVelocity outlet and a
 #                  totalPressure atmosphere; an OPEN tank, so no reference; the control holds its mesh
 #                  still. BOTH ARMS: the tutorial's p_rgh and pcorr are PCG with DIC, which the device
-#                  runs natively, so unlike mixerDevice NOTHING is staged away for it -- the device arm
+#                  runs natively, so NOTHING is staged away for it -- the device arm
 #                  runs the case's own fvSolution. What it does not cover is the tolerance those solves
 #                  are given: 1e-6 with relTol 0, the tutorial's own, which is where two Krylov
 #                  implementations stop rather than what they discretise -- though on this case it is
@@ -306,25 +290,6 @@ if profile.startswith('mixer') or profile.startswith('sloshing') or profile.star
     else:
         # the cylinder: `$p_rgh; relTol 0; maxIter 20;` on a GAMG/DIC p_rgh, run as shipped
         assert '$p_rgh' in m.group(0), 'p_rghFinal is neither the preconditioner form nor $p_rgh'
-    if profile == 'mixerDevice':
-        # THE DEVICE ARM'S PROFILE. Every pressure solve becomes PCG with DIC, which BOTH arms run
-        # natively. The tutorial ships p_rghFinal as PCG with a GAMG PRECONDITIONER, and the device
-        # loop substitutes Jacobi-BiCGStab for a GAMG pressure solve -- on a moving mesh that
-        # substitute does not reach the tolerance it is given (measured on sloshingTank2D: p_rgh
-        # 2.5406e+05 of 5.2780e+06 against the host), so brae REFUSES the combination by name.
-        # THIS PROFILE THEREFORE HOLDS THE MOTION ON THE DEVICE, NOT THE CASE'S OWN SOLVER: the
-        # GAMG pressure path is held by that refusal (interfoam_refusals.sh, device_moving) and by
-        # tests/interfoam_gamg_vs_openfoam.sh, and the host profiles above run the shipped entry.
-        t = re.sub(r'p_rghFinal\s*\{.*?\n    \}',
-                   'p_rghFinal\n    {\n        solver          PCG;\n'
-                   '        preconditioner  DIC;\n        tolerance       1e-13;\n'
-                   '        relTol          0;\n    }', t, flags=re.S)
-        t = re.sub(r'\n    p_rgh\n    \{.*?\n    \}',
-                   '\n    p_rgh\n    {\n        solver          PCG;\n'
-                   '        preconditioner  DIC;\n        tolerance       1e-13;\n'
-                   '        relTol          0;\n    }', t, flags=re.S)
-        assert 'preconditioner  DIC' in t, 'the device profile did not take'
-
     if profile == 'mixerCorr':
         # the pre-solve is solved with the Final entry, and the tutorial's key is the bare name
         t, k = re.subn(r'\n    alpha\.water\n    \{', '\n    "alpha.water.*"\n    {', t)
@@ -507,7 +472,6 @@ rc=0
 stage mixerStatic    testTubeMixer 2e-4  10 mixerStatic    || rc=1
 stage mixer          testTubeMixer 2e-4  10 mixer          || rc=1
 stage mixerCorr      testTubeMixer 2e-4  10 mixerCorr      || rc=1
-stage mixerDevice    testTubeMixer 2e-4  10 mixerDevice    || rc=1
 stage mixerOuter     testTubeMixer 2e-4  10 mixerOuter     || rc=1
 stage mixerOuterOnce testTubeMixer 2e-4  10 mixerOuterOnce || rc=1
 stage mixerPred      testTubeMixer 2e-4  10 mixerPred      || rc=1
@@ -568,8 +532,6 @@ gate sloshing3D3DoF 0.01  10 sloshing3D3DoF sloshing3D3DoFStatic || rc=1
 gate sloshing3D6DoF 0.01  10 sloshing3D6DoF sloshing3D6DoFStatic || rc=1
 gate cylinder       0.001 10 cylinder       cylinderStatic   || rc=1
 gate mixerCorrectPhi      2e-4  10 mixerCorrectPhi      mixerStatic      || rc=1
-# the DEVICE arm on the moving mesh -- see the mixerDevice staging above for what it does not cover
-gate mixerDevice          2e-4  10 mixerDevice          mixerStatic      || rc=1
 gate sloshing2DCorrectPhi 0.01  10 sloshing2DCorrectPhi sloshing2DStatic || rc=1
 gate cylinderCorrectPhi   0.001 10 cylinderCorrectPhi   cylinderStatic   || rc=1
 gate solitary       0.01  30 solitary       solitaryStatic || rc=1

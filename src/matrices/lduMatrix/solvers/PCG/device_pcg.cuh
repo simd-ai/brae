@@ -9,6 +9,7 @@
 #include "device_dilu.cuh"   // optional DILU preconditioner (nullptr -> Jacobi, the historical behaviour)
 #include "device_buffer.cuh"
 #include <cuda_runtime.h>
+#include <functional>
 #include <vector>
 
 namespace brae {
@@ -49,10 +50,17 @@ void announceNormFactorMode();              // once per process, from every poin
 
 // `precon` non-null replaces the Jacobi step with diluApply, which the caller must have brought up to
 // date with diluUpdate for THIS matrix. Prefer deviceDICPCG below, which does both.
+// `apply` replaces the preconditioner step outright -- w = M^-1 r for a preconditioner this file knows
+// nothing about. It exists for the GAMG one (device_gamg_solver.cu), which is nVcycles V-cycles from
+// zero and needs the hierarchy; everything around it is the same recurrence, which is the point of
+// passing a function rather than writing a second PCG. `precon` is ignored when it is set.
+using DevicePreconApply = std::function<void(DeviceBuffer<scalar>& w, const DeviceBuffer<scalar>& r)>;
+
 DeviceSolverPerf deviceJacobiPCG(const DeviceLduView& A, const DeviceBuffer<scalar>& b,
                                  DeviceBuffer<scalar>& psi, scalar normFactor,
                                  scalar tol, scalar relTol, int maxIter, int minIter = 0,
-                                 const DeviceDilu* precon = nullptr);
+                                 const DeviceDilu* precon = nullptr,
+                                 const DevicePreconApply* apply = nullptr);
 
 // `solver PCG; preconditioner DIC;` -- OpenFOAM's own pair, and what every interFoam tutorial names for
 // p_rgh. THE HEADER OF THIS FILE USED TO CALL DIC "a later phase" because its sweeps are sequential; the

@@ -263,6 +263,7 @@ scalar deviceInterPressureStep(
         const DeviceAlphaSolverControls& sv = lastPass ? in.solve : in.solveInner;
         const bool pcgDIC = lastPass ? in.pcgDIC : in.pcgDICInner;
         const GamgControls* gamg = lastPass ? in.gamg : in.gamgInner;
+        const GamgPreconditionerControls* pcgGamg = lastPass ? in.pcgGamg : in.pcgGamgInner;
         DeviceBuffer<scalar> diagC, b;
         deviceFold(dm, P.diag, P.source, iC, bC, diagC, b);
         // ...and the periodic pair's off-diagonal, which deviceAmul applies as
@@ -284,6 +285,24 @@ scalar deviceInterPressureStep(
             }
             DeviceGamgHierarchy& hierarchy = in.gamgCache->get(gamg->nCellsInCoarsestLevel);
             perf = deviceGamgSolve(A, b, p_rgh, *in.dic, hierarchy, *gamg, in.gamgLog);
+        }
+        else if (pcgGamg)
+        {
+            if (!in.dic || !in.gamgCache)
+            {
+                throw std::runtime_error(
+                    "brae interFoam device pressure step: the case asks for PCG with a GAMG "
+                    "preconditioner and the caller handed in no fine-level DIC schedule or no "
+                    "hierarchy cache. Build the first with buildDeviceDilu; the second is a "
+                    "DeviceGamgCache that outlives the step.");
+            }
+            // the hierarchy's coarsest level comes from the SUB-DICTIONARY's entry, as the host's
+            // pcgGamgSolve reads it there -- and, like every other GAMG solve of the run, it is the
+            // mesh's one hierarchy and is built by whichever solve needs it first
+            DeviceGamgHierarchy& hierarchy =
+                in.gamgCache->get(pcgGamg->gamg.nCellsInCoarsestLevel);
+            perf = devicePcgGamgSolve(A, b, p_rgh, *in.dic, hierarchy, sv.tol, sv.relTol, sv.maxIter,
+                                      0, *pcgGamg, in.gamgLog);
         }
         else if (pcgDIC)
         {

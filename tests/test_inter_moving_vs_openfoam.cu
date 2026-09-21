@@ -161,15 +161,14 @@ int main(
     const RunReport r = runInterFoam(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/false, &fin,
                                      scalar(1.0e300), &taps, &mutableMesh);
 
-    // THE DEVICE ARM, on the `mixerDevice` profile only. It gets its OWN mesh, geometry and patches:
-    // both arms MOVE the one they are handed, so sharing would make the host's motion the device's
-    // initial condition and every number after that fiction. What this profile does NOT cover is the
-    // case's own pressure solver -- see the staging note in interfoam_moving_vs_openfoam.sh.
-    // THE PROFILES THAT RUN BOTH ARMS. `mixerDevice` is the mixer with its pressure solver staged to
-    // one the device runs natively (the staging script says what that leaves out); `solitary` is the
-    // deforming-mesh paddle AS SHIPPED -- its p_rgh and pcorr are already PCG with DIC, so nothing is
-    // staged away there and the device arm runs the tutorial's own fvSolution.
-    const bool deviceArm = (profile == "mixerDevice" || profile == "solitary"
+    // THE PROFILES THAT RUN BOTH ARMS, all four AS SHIPPED: the solid-body mixer (GAMG for p_rgh and
+    // a GAMG PRECONDITIONER for p_rghFinal), the deforming-mesh paddle (PCG with DIC), the
+    // non-orthogonal cylinder (GAMG) -- and `solitaryGamg`, the one staged entry, which gives the
+    // paddle a GAMG p_rgh with a coarsest level of its own to hold the shared hierarchy.
+    // The device arm gets its OWN mesh, geometry and patches: both arms MOVE the one they are handed,
+    // so sharing would make the host's motion the device's initial condition and every number after
+    // that fiction.
+    const bool deviceArm = (profile == "mixer" || profile == "solitary"
                          || profile == "cylinder" || profile == "solitaryGamg");
     PrimitiveMesh mD;
     FvGeometry gD;

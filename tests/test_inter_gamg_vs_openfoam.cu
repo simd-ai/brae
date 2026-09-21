@@ -326,11 +326,15 @@ int main(
 
     // THE DEVICE LOOP, against OpenFOAM directly -- what `brae_interFoam -device` runs. The hierarchy is
     // the host's own code; what is under test is the V-cycle on the device: the coarse matrices and the
-    // restriction by fixed-order gathers, DIC through the level schedule, the scaling's device
-    // reductions. The device's GAMG has the DIC smoother only and REFUSES the rest, which
-    // tests/interfoam_refusals.sh holds. The three Gauss-Seidel profiles have a device arm now: the sweep is
-// the exact level-scheduled one of device_sym_gauss_seidel.cuh, dispatched as the host's LduLevel::smooth
-// dispatches its own (DIC's sweeps first, then Gauss-Seidel's, so DICGaussSeidel runs both).
+    // restriction by fixed-order gathers, the smoothers through the level schedule, the scaling's
+    // device reductions. It runs the host's four smoothers (the Gauss-Seidel sweep is the exact
+    // level-scheduled one of device_sym_gauss_seidel.cuh, dispatched as the host's LduLevel::smooth
+    // dispatches its own: DIC's sweeps first, then Gauss-Seidel's, so DICGaussSeidel runs both), and
+    // REFUSES the rest -- which tests/interfoam_refusals.sh holds.
+    //
+    // ...AND THE GAMG PRECONDITIONER (`pcgGamg`, `pcgGamgTol`): devicePcgGamgSolve, the same PCG as
+    // every other device solve with that sub-dictionary's V-cycles in place of DIC's sweeps. Its
+    // smoother is the SUB-DICTIONARY's, which is where the entry writes it.
     int nDev = 0;
     if (cudaGetDeviceCount(&nDev) != cudaSuccess)
     {
@@ -340,16 +344,13 @@ int main(
     // the device's GAMG runs the host's four smoothers now (DIC, DICGaussSeidel, GaussSeidel,
     // symGaussSeidel), the Gauss-Seidel ones through the same exact level-scheduled sweep the
     // smoothSolver uses; anything else it still refuses, which tests/interfoam_refusals.sh holds
-    const std::string& devSmoother = fin.pSolveFinal.gamg.smoother;
+    const std::string& devSmoother = preconditioned ? fin.pSolveFinal.gamgPrecond.gamg.smoother
+                                                    : fin.pSolveFinal.gamg.smoother;
     const bool deviceSmoother = (devSmoother == "DIC" || devSmoother == "DICGaussSeidel"
                               || devSmoother == "GaussSeidel" || devSmoother == "symGaussSeidel");
     if (nDev <= 0)
     {
         std::printf("  (no CUDA device: the device arm is skipped)\n");
-    }
-    else if (preconditioned)
-    {
-        std::printf("  (the GAMG preconditioner is ported on the host only: no device arm)\n");
     }
     else if (!deviceSmoother)
     {
@@ -371,9 +372,13 @@ int main(
         // final residuals 4.4e-07: the host's bounds hold both.
         failures += brae::gatecheck::compareSolves("device", rd.pSolves, ofP, nSteps, "p_rgh",
                                                    scalar(5e-9), runBound, runBound);
+        // the coarsest arm takes the HOST arm's bounds, the same two on the same profile: on a
+        // preconditioned entry they are 1e-3, for the reason the host's comment gives (the coarsest
+        // source is the aggregate's net flux imbalance, about 1e-26, and a residual normalised by
+        // sum|source| + 1e-20 is then read to its last digits). The counts stay exact.
         failures += brae::gatecheck::compareSolves("device", rd.gamgCoarsestSolves, ofC, nSteps,
-                                                   "coarsestLevelCorr", scalar(1e-10), scalar(1e-10),
-                                                   scalar(1e-5));
+                                                   "coarsestLevelCorr", scalar(1e-10),
+                                                   coarseResidualBound, coarseFinalBound);
         const Diff eA = compare(dev.alpha1.internal, ofAlpha);
         const Diff eP = compare(dev.p_rgh.internal, ofPrgh);
         const Diff eU = compare(dev.U.internal, ofU);

@@ -247,23 +247,11 @@ RunReport runInterFoamDevice(
         // (GAMGAgglomeration.C:311-330, :498-516). The smoother is checked below, where a static-mesh
         // case's is.
         //
-        // WHAT IS STILL NOT PORTED is the GAMG PRECONDITIONER -- `solver PCG; preconditioner {
-        // preconditioner GAMG; ... }`, which the solid-body tanks write. On a static mesh this loop
-        // substitutes Jacobi-BiCGStab under a notice; on a MOVING one that substitute does not reach
-        // the tolerance it is given, measured on sloshingTank2D: p_rgh 2.5406e+05 of 5.2780e+06
-        // against the host, worst |div(phi)| 3.274e-01 against 9.173e-07. A quarter of a percent in
-        // p_rgh is not "where the solve stops", so here it is a refusal and not a notice.
-        if (f.pSolve.pcgGamg() || f.pSolveFinal.pcgGamg())
-        {
-            throw std::runtime_error(
-                "brae interFoam -device: the case moves its mesh AND asks for `solver PCG; "
-                "preconditioner { preconditioner GAMG; ... }` for the pressure, which this loop "
-                "substitutes with Jacobi-BiCGStab -- the GAMG PRECONDITIONER is ported on the host "
-                "loop only (pcgGamgSolve). On a moving mesh that substitute does not reach the "
-                "tolerance it is given: measured on sloshingTank2D, p_rgh 2.5406e+05 of 5.2780e+06 "
-                "against the host. `solver GAMG` itself this arm runs. Run without -device, or give "
-                "p_rgh a solver this arm implements.");
-        }
+        // The GAMG PRECONDITIONER runs here as well (devicePcgGamgSolve). It was refused on a moving
+        // mesh while this loop substituted Jacobi-BiCGStab for it, because the substitute did not
+        // reach the tolerance it was given: measured on sloshingTank2D, p_rgh 2.5406e+05 of
+        // 5.2780e+06 against the host, worst |div(phi)| 3.274e-01 against 9.173e-07. With the
+        // preconditioner itself there is nothing left to substitute.
 
         // A COUPLED PAIR ON A MOVING MESH is not ported: buildDeviceCyclic lays the interface out from
         // the geometry, and every hook in this loop holds a pointer into that layout, so rebuilding it
@@ -1193,22 +1181,18 @@ RunReport runInterFoamDevice(
     // three the host runs are refused here rather than run as DIC.
     for (const InterFields::PressureLinearSolve* entry : {&f.pSolve, &f.pSolveFinal})
     {
-        // the GAMG PRECONDITIONER is the host's only: the reader no longer declares it, so the
-        // device does, and says what it runs instead
-        if (entry->pcgGamg())
-        {
-            noticeApproximated("interFoam p_rgh solve on the device",
-                "the case asks for `solver PCG; preconditioner { preconditioner GAMG; ... }` and the "
-                "device loop runs Jacobi-BiCGStab at the same tolerance; the GAMG preconditioner is "
-                "ported on the host loop only (pcgGamgSolve). The difference is where the solve stops.");
-        }
-        if (entry->gamgSolver() && !deviceGamgSmootherPorted(entry->gamg.smoother))
+        // ...and the GAMG PRECONDITIONER, which this loop runs too (devicePcgGamgSolve): the same
+        // PCG, with that sub-dictionary's V-cycles in place of DIC's sweeps. Its smoother is checked
+        // like the solver's, on the SUB-DICTIONARY's entry, because that is where it is written.
+        const std::string& smoother = entry->pcgGamg() ? entry->gamgPrecond.gamg.smoother
+                                                       : entry->gamg.smoother;
+        if ((entry->gamgSolver() || entry->pcgGamg()) && !deviceGamgSmootherPorted(smoother))
         {
             throw std::runtime_error(
                 "brae interFoam -device: fvSolution's GAMG entry for p_rgh asks for `smoother "
-                + entry->gamg.smoother + "`. The device's GAMG has the DIC smoother only "
-                "(device_gamg_solver.cuh); the host loop runs DIC, DICGaussSeidel, GaussSeidel and "
-                "symGaussSeidel. Refused rather than smoothed with something the case did not name.");
+                + smoother + "`, which the device's GAMG does not run (device_gamg_solver.cuh has "
+                "DIC, DICGaussSeidel, GaussSeidel and symGaussSeidel). Refused rather than smoothed "
+                "with something the case did not name.");
         }
     }
     DeviceDilu dic = buildDeviceDilu(m.owner(), m.neighbour(), nC);
@@ -1226,6 +1210,8 @@ RunReport runInterFoamDevice(
     GamgSolveLog gamgLog;
     C.pressureGamg = f.pSolve.gamgSolver() ? &f.pSolve.gamg : nullptr;
     C.pressureFinalGamg = f.pSolveFinal.gamgSolver() ? &f.pSolveFinal.gamg : nullptr;
+    C.pressurePcgGamg = f.pSolve.pcgGamg() ? &f.pSolve.gamgPrecond : nullptr;
+    C.pressureFinalPcgGamg = f.pSolveFinal.pcgGamg() ? &f.pSolveFinal.gamgPrecond : nullptr;
     C.gamgCache = &gamgCache;
     C.gamgLog = &gamgLog;
     C.pressure.tol = f.pSolve.tol;

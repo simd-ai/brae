@@ -201,6 +201,9 @@ struct DeviceInterStepControls
     // ...or `solver GAMG;`, each entry with its own controls, and the mesh's hierarchy both share
     const GamgControls* pressureGamg = nullptr;
     const GamgControls* pressureFinalGamg = nullptr;
+    // ...and the same two for `solver PCG; preconditioner { preconditioner GAMG; ... }`
+    const GamgPreconditionerControls* pressurePcgGamg = nullptr;
+    const GamgPreconditionerControls* pressureFinalPcgGamg = nullptr;
     DeviceGamgCache* gamgCache = nullptr;
     GamgSolveLog* gamgLog = nullptr;
     // every p_rgh solve's own report, appended in order; null = not kept

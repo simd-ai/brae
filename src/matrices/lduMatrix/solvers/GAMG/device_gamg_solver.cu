@@ -300,6 +300,218 @@ void invertMap(
     listD.copyFrom(list);
 }
 
+
+// WHAT GAMGSolver's CONSTRUCTOR AND initVcycle DO, shared by the solver below and by the GAMG
+// PRECONDITIONER: the checks, the coarse matrices by Galerkin from the fine one, the coarsest level's
+// matrix brought down once for the host solve, and the smoothers' diagonals per level. Split out
+// verbatim -- every expression and every order is the one the solve ran before it moved, which is
+// what tests/interfoam_gamg_vs_openfoam.sh's nineteen profiles hold.
+struct GamgSetup
+{
+    DeviceLduView A;
+    label coarsestLevel = 0;
+    std::vector<scalar> coarsestDiag;
+    std::vector<scalar> coarsestUpper;
+    const GamgLduAddressing* coarsestAddr = nullptr;
+    GamgSmootherKind kind;
+};
+
+GamgSetup gamgSetup(
+    const DeviceLduView& Ain,
+    DeviceDilu& fineDic,
+    DeviceGamgHierarchy& h,
+    const GamgControls& controls)
+{
+    GamgSetup S;
+    if (!deviceGamgSmootherPorted(controls.smoother))
+    {
+        throw std::runtime_error(
+            "brae device GAMG: smoother `" + controls.smoother + "` is not ported. OpenFOAM's GAMG has "
+            "DIC, DICGaussSeidel, GaussSeidel, symGaussSeidel and others; this one has the first four.");
+    }
+    if (!h.host || h.level.empty())
+    {
+        throw std::runtime_error(
+            "brae device GAMG: no coarse levels created, either matrix too small for GAMG or "
+            "nCellsInCoarsestLevel too large. OpenFOAM stops on the same condition (GAMGSolver.C:333).");
+    }
+    const int nCells = Ain.nCells;
+    const int nFaces = Ain.nInternalFaces;
+    if (h.host->fineMesh.nCells != nCells)
+    {
+        throw std::runtime_error("brae device GAMG: the hierarchy was built for a different mesh.");
+    }
+    // only the symmetric branch of GAMGSolver is ported, and nothing downstream would notice
+    if (Ain.lower != Ain.upper && nFaces > 0)
+    {
+        DeviceBuffer<scalar> d(static_cast<std::size_t>(nFaces));
+        subtractK<<<nBlocks(nFaces), TPB>>>(nFaces, Ain.upper, Ain.lower, d.data());
+        launchCheck("symmetry check");
+        if (deviceSumMag(d) != scalar(0))
+        {
+            throw std::runtime_error(
+                "brae device GAMG: the matrix is asymmetric. GAMGSolver then agglomerates upper and lower "
+                "separately, turns scaleCorrection off, and solves the coarsest level with PBiCGStab and "
+                "DILU; only the symmetric branch is ported.");
+        }
+    }
+    DeviceLduView A = Ain;
+    A.lower = A.upper;
+
+    // the constructor: one coarse matrix per level, each from the one above
+    const label nLevels = static_cast<label>(h.level.size());
+    const label coarsestLevel = nLevels - 1;
+    for (label leveli = 0; leveli < nLevels; ++leveli)
+    {
+        DeviceGamgLevel& L = h.level[static_cast<std::size_t>(leveli)];
+        const scalar* fineDiag = leveli == 0 ? A.diag : h.level[static_cast<std::size_t>(leveli) - 1].A.diag.data();
+        const scalar* fineUpper = leveli == 0 ? A.upper : h.level[static_cast<std::size_t>(leveli) - 1].A.upper.data();
+        const int nCoarse = L.A.nCells;
+        galerkinDiagK<<<nBlocks(nCoarse), TPB>>>(
+            nCoarse,
+            L.cellStart.data(),
+            L.cellList.data(),
+            L.innerFaceStart.data(),
+            L.innerFaceList.data(),
+            fineDiag,
+            fineUpper,
+            L.A.diag.data());
+        launchCheck("coarse diagonal");
+        gatherSum(L.faceStart, L.faceList, fineUpper, L.A.upper);
+    }
+    // the coarsest level is solved on the host: its matrix comes down once per solve
+    DeviceGamgLevel& LC = h.level[static_cast<std::size_t>(coarsestLevel)];
+    S.coarsestDiag = LC.A.diag.host();
+    S.coarsestUpper = LC.A.upper.host();
+    S.coarsestAddr = &h.host->meshLevels[static_cast<std::size_t>(coarsestLevel)];
+
+    // initVcycle: the smoothers. DIC's reciprocal diagonal, per level, for THIS matrix -- refreshed even
+    // under a Gauss-Seidel smoother, which does not read it, because DICGaussSeidel runs both.
+    S.kind = gamgSmootherKind(controls.smoother);
+    diluUpdate(A, fineDic);
+    for (DeviceGamgLevel& L : h.level)
+    {
+        diluUpdate(L.view(), L.dic);
+    }
+    S.A = A;
+    S.coarsestLevel = coarsestLevel;
+    return S;
+}
+
+// ONE V-CYCLE, GAMGSolver::Vcycle. The caller sets h.finestResidual to the residual this cycle is to
+// reduce and psi to the field it corrects; `controls` is the entry the cycle runs under -- the
+// solver's own, or the PRECONDITIONER's sub-dictionary, which is what decides the coarsest solve's
+// tolerance (GAMGSolver.C, and the `pcgGamgTol` profile of the gate).
+void vCycle(
+    const GamgSetup& S,
+    DeviceGamgHierarchy& h,
+    DeviceDilu& fineDic,
+    DeviceBuffer<scalar>& psi,
+    const DeviceBuffer<scalar>& b,
+    const GamgControls& controls,
+    GamgSolveLog* log)
+{
+    const DeviceLduView& A = S.A;
+    const label coarsestLevel = S.coarsestLevel;
+    const GamgSmootherKind& kind = S.kind;
+    DeviceGamgLevel& LC = h.level[static_cast<std::size_t>(coarsestLevel)];
+    // Vcycle. Restrict finest grid residual for the next level up.
+    gatherSum(h.level[0].cellStart, h.level[0].cellList, h.finestResidual.data(), h.level[0].source);
+
+    // Residual restriction (going to coarser levels)
+    for (label leveli = 0; leveli < coarsestLevel; ++leveli)
+    {
+        DeviceGamgLevel& L = h.level[static_cast<std::size_t>(leveli)];
+        DeviceGamgLevel& next = h.level[static_cast<std::size_t>(leveli) + 1];
+        if (controls.nPreSweeps)
+        {
+            zero(L.corr);
+            smoothLevel(
+                L.view(),
+                L.dic,
+                L.corr,
+                L.source,
+                L.rA,
+                L.wA,
+                std::min(
+                    controls.nPreSweeps + controls.preSweepsLevelMultiplier*leveli,
+                    controls.maxPreSweeps),
+                kind);
+            // but not on the coarsest level because it evaluates to 1
+            if (controls.scaleCorrection && leveli < coarsestLevel - 1)
+            {
+                scale(L.corr, L.ACf, L.view(), L.source);
+            }
+            // Correct the residual with the new solution
+            deviceAmul(L.view(), L.corr, L.ACf);
+            subtract(L.source, L.ACf, L.source);
+        }
+        // Residual is equal to source
+        gatherSum(next.cellStart, next.cellList, L.source.data(), next.source);
+    }
+
+    // solveCoarsestLevel, on the host, from zero
+    {
+        const std::vector<scalar> coarsestSource = LC.source.host();
+        std::vector<scalar> coarsestCorr(coarsestSource.size(), scalar(0));
+        const SolverPerformance coarsePerf = gamgCoarsestPcgDic(
+            *S.coarsestAddr,
+            S.coarsestDiag,
+            S.coarsestUpper,
+            coarsestCorr,
+            coarsestSource,
+            controls.tolerance,
+            controls.relTol);
+        LC.corr.copyFrom(coarsestCorr);
+        if (log)
+        {
+            log->coarsest.push_back(coarsePerf);
+        }
+    }
+
+    // Smoothing and prolongation of the coarse correction fields (going to finer levels)
+    for (label leveli = coarsestLevel - 1; leveli >= 0; --leveli)
+    {
+        DeviceGamgLevel& L = h.level[static_cast<std::size_t>(leveli)];
+        DeviceGamgLevel& next = h.level[static_cast<std::size_t>(leveli) + 1];
+        // Only store the preSmoothedCoarseCorrField if pre-smoothing is used
+        if (controls.nPreSweeps)
+        {
+            deviceCopy(L.preSmoothed, L.corr);
+        }
+        prolong(next.restrictMap, next.corr, L.corr);
+        // but not on the coarsest level because it evaluates to 1
+        if (controls.scaleCorrection && leveli < coarsestLevel - 1)
+        {
+            scale(L.corr, L.ACf, L.view(), L.source);
+        }
+        if (controls.nPreSweeps)
+        {
+            deviceAxpy(scalar(1), L.preSmoothed, L.corr);
+        }
+        smoothLevel(
+            L.view(),
+            L.dic,
+            L.corr,
+            L.source,
+            L.rA,
+            L.wA,
+            std::min(
+                controls.nPostSweeps + controls.postSweepsLevelMultiplier*leveli,
+                controls.maxPostSweeps),
+            kind);
+    }
+
+    // Prolong the finest level correction
+    prolong(h.level[0].restrictMap, h.level[0].corr, h.finestCorrection);
+    if (controls.scaleCorrection)
+    {
+        scale(h.finestCorrection, h.Apsi, A, h.finestResidual);
+    }
+    deviceAxpy(scalar(1), h.finestCorrection, psi);
+    smoothLevel(A, fineDic, psi, b, h.rA, h.wA, controls.nFinestSweeps, kind);
+}
+
 } // namespace
 
 DeviceGamgHierarchy& DeviceGamgCache::get(label nCellsInCoarsestLevel)
@@ -389,67 +601,9 @@ DeviceSolverPerf deviceGamgSolve(
     const GamgControls& controls,
     GamgSolveLog* log)
 {
-    if (!deviceGamgSmootherPorted(controls.smoother))
-    {
-        throw std::runtime_error(
-            "brae device GAMG: smoother `" + controls.smoother + "` is not ported. OpenFOAM's GAMG has "
-            "DIC, DICGaussSeidel, GaussSeidel, symGaussSeidel and others; this one has the first four.");
-    }
-    if (!h.host || h.level.empty())
-    {
-        throw std::runtime_error(
-            "brae device GAMG: no coarse levels created, either matrix too small for GAMG or "
-            "nCellsInCoarsestLevel too large. OpenFOAM stops on the same condition (GAMGSolver.C:333).");
-    }
-    const int nCells = Ain.nCells;
-    const int nFaces = Ain.nInternalFaces;
-    if (h.host->fineMesh.nCells != nCells)
-    {
-        throw std::runtime_error("brae device GAMG: the hierarchy was built for a different mesh.");
-    }
-    // only the symmetric branch of GAMGSolver is ported, and nothing downstream would notice
-    if (Ain.lower != Ain.upper && nFaces > 0)
-    {
-        DeviceBuffer<scalar> d(static_cast<std::size_t>(nFaces));
-        subtractK<<<nBlocks(nFaces), TPB>>>(nFaces, Ain.upper, Ain.lower, d.data());
-        launchCheck("symmetry check");
-        if (deviceSumMag(d) != scalar(0))
-        {
-            throw std::runtime_error(
-                "brae device GAMG: the matrix is asymmetric. GAMGSolver then agglomerates upper and lower "
-                "separately, turns scaleCorrection off, and solves the coarsest level with PBiCGStab and "
-                "DILU; only the symmetric branch is ported.");
-        }
-    }
-    DeviceLduView A = Ain;
-    A.lower = A.upper;
-
-    // the constructor: one coarse matrix per level, each from the one above
-    const label nLevels = static_cast<label>(h.level.size());
-    const label coarsestLevel = nLevels - 1;
-    for (label leveli = 0; leveli < nLevels; ++leveli)
-    {
-        DeviceGamgLevel& L = h.level[static_cast<std::size_t>(leveli)];
-        const scalar* fineDiag = leveli == 0 ? A.diag : h.level[static_cast<std::size_t>(leveli) - 1].A.diag.data();
-        const scalar* fineUpper = leveli == 0 ? A.upper : h.level[static_cast<std::size_t>(leveli) - 1].A.upper.data();
-        const int nCoarse = L.A.nCells;
-        galerkinDiagK<<<nBlocks(nCoarse), TPB>>>(
-            nCoarse,
-            L.cellStart.data(),
-            L.cellList.data(),
-            L.innerFaceStart.data(),
-            L.innerFaceList.data(),
-            fineDiag,
-            fineUpper,
-            L.A.diag.data());
-        launchCheck("coarse diagonal");
-        gatherSum(L.faceStart, L.faceList, fineUpper, L.A.upper);
-    }
-    // the coarsest level is solved on the host: its matrix comes down once per solve
-    DeviceGamgLevel& LC = h.level[static_cast<std::size_t>(coarsestLevel)];
-    const std::vector<scalar> coarsestDiag = LC.A.diag.host();
-    const std::vector<scalar> coarsestUpper = LC.A.upper.host();
-    const GamgLduAddressing& coarsestAddr = h.host->meshLevels[static_cast<std::size_t>(coarsestLevel)];
+    const GamgSetup S = gamgSetup(Ain, fineDic, h, controls);
+    const DeviceLduView& A = S.A;
+    const int nCells = A.nCells;
 
     deviceAmul(A, psi, h.Apsi, /*onField=*/true);
     const scalar nf = deviceNormFactor(A, psi, b, deviceOnes(nCells));
@@ -460,112 +614,9 @@ DeviceSolverPerf deviceGamgSolve(
     perf.finalResidual = perf.initialResidual;
     if (controls.minIter <= 0 && converged(perf, controls.tolerance, controls.relTol)) return perf;
 
-    // initVcycle: the smoothers. DIC's reciprocal diagonal, per level, for THIS matrix -- refreshed even
-    // under a Gauss-Seidel smoother, which does not read it, because DICGaussSeidel runs both.
-    const GamgSmootherKind kind = gamgSmootherKind(controls.smoother);
-    diluUpdate(A, fineDic);
-    for (DeviceGamgLevel& L : h.level)
-    {
-        diluUpdate(L.view(), L.dic);
-    }
-
     do
     {
-        // Vcycle. Restrict finest grid residual for the next level up.
-        gatherSum(h.level[0].cellStart, h.level[0].cellList, h.finestResidual.data(), h.level[0].source);
-
-        // Residual restriction (going to coarser levels)
-        for (label leveli = 0; leveli < coarsestLevel; ++leveli)
-        {
-            DeviceGamgLevel& L = h.level[static_cast<std::size_t>(leveli)];
-            DeviceGamgLevel& next = h.level[static_cast<std::size_t>(leveli) + 1];
-            if (controls.nPreSweeps)
-            {
-                zero(L.corr);
-                smoothLevel(
-                    L.view(),
-                    L.dic,
-                    L.corr,
-                    L.source,
-                    L.rA,
-                    L.wA,
-                    std::min(
-                        controls.nPreSweeps + controls.preSweepsLevelMultiplier*leveli,
-                        controls.maxPreSweeps),
-                    kind);
-                // but not on the coarsest level because it evaluates to 1
-                if (controls.scaleCorrection && leveli < coarsestLevel - 1)
-                {
-                    scale(L.corr, L.ACf, L.view(), L.source);
-                }
-                // Correct the residual with the new solution
-                deviceAmul(L.view(), L.corr, L.ACf);
-                subtract(L.source, L.ACf, L.source);
-            }
-            // Residual is equal to source
-            gatherSum(next.cellStart, next.cellList, L.source.data(), next.source);
-        }
-
-        // solveCoarsestLevel, on the host, from zero
-        {
-            const std::vector<scalar> coarsestSource = LC.source.host();
-            std::vector<scalar> coarsestCorr(coarsestSource.size(), scalar(0));
-            const SolverPerformance coarsePerf = gamgCoarsestPcgDic(
-                coarsestAddr,
-                coarsestDiag,
-                coarsestUpper,
-                coarsestCorr,
-                coarsestSource,
-                controls.tolerance,
-                controls.relTol);
-            LC.corr.copyFrom(coarsestCorr);
-            if (log)
-            {
-                log->coarsest.push_back(coarsePerf);
-            }
-        }
-
-        // Smoothing and prolongation of the coarse correction fields (going to finer levels)
-        for (label leveli = coarsestLevel - 1; leveli >= 0; --leveli)
-        {
-            DeviceGamgLevel& L = h.level[static_cast<std::size_t>(leveli)];
-            DeviceGamgLevel& next = h.level[static_cast<std::size_t>(leveli) + 1];
-            // Only store the preSmoothedCoarseCorrField if pre-smoothing is used
-            if (controls.nPreSweeps)
-            {
-                deviceCopy(L.preSmoothed, L.corr);
-            }
-            prolong(next.restrictMap, next.corr, L.corr);
-            // but not on the coarsest level because it evaluates to 1
-            if (controls.scaleCorrection && leveli < coarsestLevel - 1)
-            {
-                scale(L.corr, L.ACf, L.view(), L.source);
-            }
-            if (controls.nPreSweeps)
-            {
-                deviceAxpy(scalar(1), L.preSmoothed, L.corr);
-            }
-            smoothLevel(
-                L.view(),
-                L.dic,
-                L.corr,
-                L.source,
-                L.rA,
-                L.wA,
-                std::min(
-                    controls.nPostSweeps + controls.postSweepsLevelMultiplier*leveli,
-                    controls.maxPostSweeps),
-                kind);
-        }
-
-        // Prolong the finest level correction
-        prolong(h.level[0].restrictMap, h.level[0].corr, h.finestCorrection);
-        if (controls.scaleCorrection)
-        {
-            scale(h.finestCorrection, h.Apsi, A, h.finestResidual);
-        }
-        deviceAxpy(scalar(1), h.finestCorrection, psi);
-        smoothLevel(A, fineDic, psi, b, h.rA, h.wA, controls.nFinestSweeps, kind);
+        vCycle(S, h, fineDic, psi, b, controls, log);
 
         // Calculate finest level residual field
         deviceAmul(A, psi, h.Apsi, /*onField=*/true);
@@ -577,6 +628,54 @@ DeviceSolverPerf deviceGamgSolve(
      || perf.nIterations < controls.minIter
     );
     return perf;
+}
+
+
+DeviceSolverPerf devicePcgGamgSolve(
+    const DeviceLduView& Ain,
+    const DeviceBuffer<scalar>& b,
+    DeviceBuffer<scalar>& psi,
+    DeviceDilu& fineDic,
+    DeviceGamgHierarchy& h,
+    scalar tolerance,
+    scalar relTol,
+    int maxIter,
+    int minIter,
+    const GamgPreconditionerControls& precond,
+    GamgSolveLog* log)
+{
+    if (precond.nVcycles < 1)
+    {
+        throw std::runtime_error("brae device GAMG preconditioner: nVcycles must be at least 1.");
+    }
+    const GamgSetup S = gamgSetup(Ain, fineDic, h, precond.gamg);
+    const DeviceLduView& A = S.A;
+    const int nCells = A.nCells;
+
+    // PCG::scalarSolve's normFactor, taken on the matrix the solve runs on and the psi it starts from
+    DeviceBuffer<scalar> Apsi(nCells);
+    deviceAmul(A, psi, Apsi, /*onField=*/true);
+    const scalar nf = deviceNormFactor(A, psi, b, deviceOnes(nCells));
+
+    // GAMGPreconditioner::precondition, GAMGPreconditioner.C:79-150. w starts at ZERO on every
+    // application -- not at the last one's -- and between cycles the residual is recomputed from the
+    // w this one left, which is what makes the second cycle reduce anything.
+    DevicePreconApply apply =
+        [&](DeviceBuffer<scalar>& w, const DeviceBuffer<scalar>& r)
+    {
+        zero(w);
+        deviceCopy(h.finestResidual, r);
+        for (int cycle = 0; cycle < precond.nVcycles; ++cycle)
+        {
+            vCycle(S, h, fineDic, w, r, precond.gamg, log);
+            if (cycle < precond.nVcycles - 1)
+            {
+                deviceAmul(A, w, h.Apsi, /*onField=*/true);
+                subtract(r, h.Apsi, h.finestResidual);
+            }
+        }
+    };
+    return deviceJacobiPCG(A, b, psi, nf, tolerance, relTol, maxIter, minIter, nullptr, &apply);
 }
 
 } // namespace brae

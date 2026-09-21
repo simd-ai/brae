@@ -149,6 +149,10 @@ struct DeviceInterPressureInput
     // entry's controls; null on an entry that names another solver. The hierarchy is the mesh's and
     // the caller owns it across steps. `dic` is required here too: it is the FINE level's schedule.
     const GamgControls* gamg = nullptr;
+    // ...and `solver PCG; preconditioner { preconditioner GAMG; ... }`, which is a PCG whose
+    // preconditioner is that entry's V-cycles (devicePcgGamgSolve). Null on an entry that names
+    // another preconditioner; `gamg` and this one are never both set, since the entry names one solver.
+    const GamgPreconditionerControls* pcgGamg = nullptr;
     DeviceGamgCache* gamgCache = nullptr;
     // the coarsest-level solve of every V-cycle, in order; null = not kept
     GamgSolveLog* gamgLog = nullptr;
@@ -165,6 +169,7 @@ struct DeviceInterPressureInput
     DeviceAlphaSolverControls solveInner;
     bool pcgDICInner = false;
     const GamgControls* gamgInner = nullptr;
+    const GamgPreconditionerControls* pcgGamgInner = nullptr;
     // the case's laplacianSchemes for the p_rgh laplacian: `corrected` and a `limited` coefficient
     // (0 = unlimited). Under `corrected` each pass adds the explicit correction from grad(p_rgh) --
     // Gauss linear, the only gradSchemes entry the device takes -- and keeps its face flux for

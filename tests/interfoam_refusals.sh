@@ -541,15 +541,15 @@ if [ $HAVE_GPU = 1 ]; then
     # the reason is now the SPECIFIC one -- the mesh-update stage is on the host loop only -- because
     # the device loop carries the pieces around it (the ddt's V0, refreshDeviceMeshGeometry) and a
     # caller passing a MutableMesh must not get a silent run on the mesh as it started
-    # a moving mesh RUNS on the device now, and so does `solver GAMG` for the pressure (the arm below,
-    # and tests/interfoam_moving_vs_openfoam.sh profiles `cylinder` and `solitaryGamg`). What is left
-    # is the GAMG PRECONDITIONER, which this loop substitutes with Jacobi-BiCGStab and which on a
-    # moving mesh does not reach the tolerance it is given -- testTubeMixer writes p_rghFinal that way
-    arm device_moving       refused "GAMG PRECONDITIONER"  "-device" true
-    # ...and the same mesh with p_rgh as a GAMG SOLVER, which it runs: the hierarchy is the mesh's and
-    # is rebuilt on every move. A refusal here would be a blanket one, which is what this arm forbids.
-    # (the mixer's p_rgh is ALREADY `solver GAMG; smoother DIC`; only p_rghFinal is the preconditioner
-    # form, so this arm swaps that one and changes nothing else)
+    # a moving mesh RUNS on the device now, AS SHIPPED: testTubeMixer's p_rgh is `solver GAMG` and its
+    # p_rghFinal is `solver PCG; preconditioner { preconditioner GAMG; ... }`, and the loop runs both
+    # (tests/interfoam_moving_vs_openfoam.sh profiles `mixer`, `cylinder` and `solitaryGamg`). This
+    # arm is here because each of the three was a refusal in turn, and a blanket one would pass every
+    # other arm on this page
+    arm device_moving       runs    -                      "-device" true
+    # ...and the same mesh with p_rghFinal as a plain GAMG SOLVER rather than the preconditioner form,
+    # so that BOTH device GAMG entry points are held on a moving mesh (the hierarchy is the mesh's and
+    # is rebuilt on every move for either)
     arm device_moving_gamg  runs    -                      "-device" "python3 '$W/setSolver.py' p_rghFinal '        solver          GAMG;\n        smoother        DIC;\n        tolerance       2e-09;\n        relTol          0;\n'"
     BASE="$B"
     # a case that needs a pressure reference RUNS on the device now (gated on laminar/mixerVessel2D,

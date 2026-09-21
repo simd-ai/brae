@@ -479,6 +479,7 @@ void deviceInterStep(
         pi.pcgDIC = finalCorr ? ctl.pressureFinalPcgDIC : ctl.pressurePcgDIC;
         pi.dic = ctl.dic;
         pi.gamg = finalCorr ? ctl.pressureFinalGamg : ctl.pressureGamg;
+        pi.pcgGamg = finalCorr ? ctl.pressureFinalPcgGamg : ctl.pressurePcgGamg;
         pi.gamgCache = ctl.gamgCache;
         pi.gamgLog = ctl.gamgLog;
         pi.solveLog = ctl.pressureSolveLog;
@@ -487,6 +488,7 @@ void deviceInterStep(
         pi.solveInner = ctl.pressure;
         pi.pcgDICInner = ctl.pressurePcgDIC;
         pi.gamgInner = ctl.pressureGamg;
+        pi.pcgGamgInner = ctl.pressurePcgGamg;
         pi.correctedLaplacian = ctl.correctedLaplacian;
         pi.snGradLimitCoeff = ctl.snGradLimitCoeff;
 

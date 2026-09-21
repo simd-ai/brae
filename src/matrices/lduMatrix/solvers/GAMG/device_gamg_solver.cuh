@@ -106,6 +106,27 @@ bool deviceGamgSmootherPorted(const std::string& smoother);
 // GAMGSolver::solve on an already FOLDED symmetric system. `fineDic` is the fine level's schedule
 // (buildDeviceDilu on the mesh's own addressing); it is updated here for this matrix. Throws if the
 // matrix is not symmetric or the smoother is not DIC.
+// `solver PCG; preconditioner { preconditioner GAMG; ... }` ON THE DEVICE -- the host's pcgGamgSolve.
+// The PCG is the one every other device solve runs (deviceJacobiPCG's recurrence); what this adds is
+// its preconditioner: GAMGPreconditioner::precondition, nVcycles V-cycles FROM ZERO per application
+// with the finest residual recomputed between them (GAMGPreconditioner.C:79-150).
+//
+// THE SUB-DICTIONARY IS THE CYCLE'S OWN ENTRY. `precond.gamg` carries the tolerance, relTol, sweeps
+// and smoother the V-cycle runs under -- including the COARSEST level's tolerance, which is the
+// preconditioner's and not the PCG's; `tolerance`/`relTol`/`maxIter`/`minIter` are the PCG's.
+DeviceSolverPerf devicePcgGamgSolve(
+    const DeviceLduView& A,
+    const DeviceBuffer<scalar>& b,
+    DeviceBuffer<scalar>& psi,
+    DeviceDilu& fineDic,
+    DeviceGamgHierarchy& h,
+    scalar tolerance,
+    scalar relTol,
+    int maxIter,
+    int minIter,
+    const GamgPreconditionerControls& precond,
+    GamgSolveLog* log = nullptr);
+
 DeviceSolverPerf deviceGamgSolve(
     const DeviceLduView& A,
     const DeviceBuffer<scalar>& b,
