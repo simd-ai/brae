@@ -283,21 +283,26 @@ RunReport runInterFoamDevice(
         // side. The two arms assemble DIFFERENT SYSTEMS, and the difference enters between phiHbyA
         // pre-phig (which agrees) and div(phiHbyA).
         //
-        // AND THE DUMP HAS NAMED IT: the NON-ORTHOGONAL CORRECTION of the `corrected` laplacian.
+        // WHERE THE DUMP HAS GOT TO. Every stage into the pressure equation agrees:
         //
-        //     phiHbyA internal 8.9e-16, phiHbyA BOUNDARY 0.0e+00, phig 7.8e-14   -- all agree
-        //     pEqn diag 2.1e-17, upper 1.0e-17, lower 1.0e-17                    -- all agree
-        //     nonOrth source   1.3886e+01 of 6.9430e+00   at cell 200
-        //     pEqn source      6.9430e+00 of 3.4921e+03   at cell 200
+        //     phiHbyA internal 8.9e-16, phiHbyA BOUNDARY 0.0e+00, phig internal 7.8e-14
+        //     pEqn diag 2.1e-17, upper 1.0e-17, lower 1.0e-17
+        //     pEqn SOURCE 6.9430e+00 of 3.4921e+03 at cell 200      <-- the break
         //
-        // The correction differs by TWICE its own value at the same cell the source breaks on, which
-        // is the signature of an opposite SIGN, and the source then differs by exactly the host's
-        // correction there. It is not the adjustPhi wrap (makeRelative then makeAbsolute is an
-        // identity unless adjustPhi moves something, and this loop only reaches that path where every
-        // patch fixes its flux, where adjustPhi is a no-op), and it is not a moving-mesh term at all:
-        // the move only EXPOSES it, by tilting this mesh to 44.27 degrees of non-orthogonality --
-        // brae refuses `uncorrected` on it for that very reason. Settle the sign against the host's
-        // fvm::laplacianNonOrthSource and OpenFOAM's own correction before touching anything else.
+        // IT IS NOT THE NON-ORTHOGONAL CORRECTION, though the raw taps make it look like it: the host
+        // computes +corr and does source -= corr (OpenFOAM's fvm.source() -= V*div(faceFluxCorrection),
+        // gaussLaplacianScheme.C:193), while this arm computes -corr and does source += it. The two
+        // taps are exact negatives BY DESIGN, cell for cell. Take each arm's own correction back out
+        // of its source and the difference is unchanged -- 6.9430e+00 at the same cell -- so the
+        // correction contributes nothing to it.
+        //
+        // IT IS NOT the adjustPhi wrap either: makeRelative then makeAbsolute is an identity unless
+        // adjustPhi moves something, and this loop only reaches that path where every patch fixes its
+        // flux, where adjustPhi is a no-op (massCorr stays 1).
+        //
+        // WHAT IS LEFT is div(phiHbyA + phig) itself. The internal halves of both agree and phiHbyA's
+        // boundary agrees exactly; phig's BOUNDARY half is the one thing in that divergence this dump
+        // has not compared yet. That is the next tap, not another guess.
         //
         // THE MESH FLUX IS CARRIED NOW (DeviceInterStepControls::meshPhiAll -> the pressure step's
         // fvc::makeRelative at the host's own site), and it is necessary -- the alpha equation must
