@@ -122,6 +122,12 @@ void interMeshUpdate(
     label                                  outerOfStep,
     label                                  nOuterCorrectors);
 
+// The time the start directory names -- OpenFOAM's time directories ARE their times. A directory whose
+// name is not one cannot tell a loop when it starts, and is refused rather than read as 0. BOTH loops
+// start their clock here: the host's did from the day a restart gate existed, the device's started at 0
+// whatever the directory said, which no from-zero run can see.
+scalar startTimeOf(const std::string& startDir);
+
 // Run `nSteps` of interFoam on a prepared case. Returns the state at the end; `verbose` prints the
 // per-step line OpenFOAM's own solver prints.
 RunReport runInterFoam(

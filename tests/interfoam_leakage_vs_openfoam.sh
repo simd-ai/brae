@@ -36,6 +36,38 @@
 #   the non-overlap patch keeping its full area        7.0e-01 / 6.8e-01
 #   the areas never rescaled                           1.0     / 1.0
 #   the patches' |Sf| not reset                        1.8     / 1.8
+# THE DEVICE ARM runs both arms of this gate -- the run from 0 and the restart -- on the pair COUPLED,
+# from its own fresh geometry, patches and ACMI state (the rescale is in place, so the host run's
+# objects are at the END state). The harness still asserts that the pair handed over UNCOUPLED is
+# refused by name. What the device loop needed, each grounded in the file it cites:
+#   the pair in the interface list, OPT-IN (the legacy drivers couple an ACMI through DeviceAMI), with
+#   no MULES limiter sync across it -- syncFaceList covers processor and cyclicPolyPatch only
+#   the rescale through the alpha step's geometryUpdate, after phic and before the pre-solve, once per
+#   TIME STEP, with phic formed ahead of it; then the mesh's areas and the pair's OWN areas re-uploaded
+#   IN PLACE and nothing else -- OpenFOAM keeps the cached weights and deltaCoeffs across a rescale
+#   the symmetry mirror of grad(U) on the non-overlap patches, keyed on the MESH patch type
+#   (tests/test_device_grad_symmetry.cu holds the kernel on its own)
+#   the clock started at the start directory, which only the restart arm can see
+# MEASURED, device against OpenFOAM (leak / restart): alpha 3.4e-11 / 3.6e-11, p_rgh 1.9e-11 / 2.0e-11,
+# U 1.3e-09 / 1.3e-09, k 8.9e-11 / 1.0e-10, the baffle's flux 9.2e-12 of itself; the clock and the
+# opened faces the host loop's, bit for bit. The device is DETERMINISTIC here (a second run differs by
+# exactly 0), so those are its arithmetic and not noise: the test file says where they enter (one
+# near-dry cell under the jet, MULES' gather order, then the density ratio).
+# FAIL-PROOFS ON THE DEVICE ARM, each broken once (U unless it says otherwise):
+#   MULES' limiter synced across the pair              1.7e-01          (the host arm's own number)
+#   the pair's areas not re-uploaded                   1.0
+#   the mesh geometry not re-uploaded                  7.5e-01
+#   the clock starting at 0                            1.0 on the restart, and the baffle never opens
+#   no symmetry mirror in grad(U)                      7.8e-02          (the host arm's own number)
+#   phic formed AFTER the rescale                      k 5.8e-10 and the baffle's flux 2.9e-11 -- RED
+#                                                      by those two checks ONLY; U reads 1.6e-09, inside
+#                                                      this arm's floor. The narrowest of the set.
+# NOT DISCRIMINATED on the device arm, and claimed as nothing more than correct by construction:
+#   the grad(U) memo's fingerprint carrying the boundary areas (no digit moves without it: the one stale
+#   hit it prevents is a single outer corrector at rest-state velocities), and |Sf| for phig laid out
+#   in the device's face order rather than the mesh's (the fifth digit moves; phig is zero on every
+#   patch that follows the pair here).
+#
 # NOT DISCRIMINATED: recomputing the face cells' volumes and centres after the rescale -- the pair's two
 # areas sum to the same face, and the recomputed cells come out bitwise the same on this mesh.
 # NOT CLAIMED: an ACMI pair that is not coincident face for face (OpenFOAM's AMI weights are then

@@ -60,10 +60,7 @@ void updateMovingWallVelocity(
 }   // namespace
 
 
-namespace {
-
-// The time the start directory names -- OpenFOAM's time directories ARE their times. A directory whose
-// name is not one cannot tell the loop when it starts, and is refused rather than read as 0.
+// The time the start directory names -- see inter_driver_cpp.cuh.
 scalar startTimeOf(const std::string& startDir)
 {
     std::filesystem::path p(startDir);
@@ -83,8 +80,6 @@ scalar startTimeOf(const std::string& startDir)
     }
     return static_cast<scalar>(v);
 }
-
-} // namespace
 
 
 // interFoam.C:112-149 -- THE MESH UPDATE both loops make at the top of an outer corrector, in

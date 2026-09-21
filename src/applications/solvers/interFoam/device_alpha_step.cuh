@@ -111,6 +111,17 @@ struct DeviceAlphaStepInput
     // :397-417, fvcSurfaceIntegrate.C:77). Null == a mesh that does not move; both or neither.
     const DeviceBuffer<scalar>* Vsc  = nullptr;
     const DeviceBuffer<scalar>* Vsc0 = nullptr;
+
+    // phic FORMED BY THE CALLER, ahead of a geometry change inside the step. alphaEqn.H forms
+    // phic = cAlpha*|phi/magSf| ONCE, at :59, before the pre-solve and before anything interpolates
+    // across the mesh; with fixed geometry it is the same field wherever it is formed, which is why
+    // this corrector forms it itself. A cyclicACMI whose scale moves is the exception: OpenFOAM
+    // rescales the areas lazily, INSIDE the pre-solve, so phic is the one built on the areas the step
+    // started with (the host's alphaEqnStep says what that is worth on the face that just opened: 41.7
+    // for 4e-9). All three or none; null = form it here, which is every case but that one.
+    const DeviceBuffer<scalar>* phicIntPre = nullptr;
+    const DeviceBuffer<scalar>* phicBndPre = nullptr;
+    const DeviceBuffer<scalar>* phicIfPre  = nullptr;
 };
 
 // alpha1's boundary, evaluated by the caller. `nHatf` is the interface flux the previous

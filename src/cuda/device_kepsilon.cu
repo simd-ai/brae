@@ -541,6 +541,16 @@ const GradUMemo& deviceGradUShared(
         // has to be in the fingerprint: a mesh move changes gaussGrad without touching U, and V is the
         // cheapest witness of OF's primitiveMesh::clearGeom.
         add(dm.V.data(), nC, 0);
+        // ...and the BOUNDARY FACE AREAS, which V does not witness: a cyclicACMI whose scale moves
+        // hands area between the pair and its non-overlap patches at a step's rescale, and on a
+        // coincident baffle the face cells' volumes come out bitwise unchanged (the host gate's header
+        // says so). gaussGrad's boundary half is Sf (x) U_b, so the gradient moves while U, V and every
+        // boundary coefficient below stay put -- a stale hit on exactly the step the baffle opens.
+        // One component's array: the three share their geometry.
+        if (dbU.comp[0].n > 0 && dbU.comp[0].magSf.size())
+        {
+            add(dbU.comp[0].magSf.data(), dbU.comp[0].n, 0);
+        }
         for (int k = 0; k < 3; ++k)
         {
             const DeviceBoundary& db = dbU.comp[k];

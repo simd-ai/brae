@@ -156,6 +156,13 @@ int main(int argc, char** argv)
         std::vector<FvPatch> patches = buildPatches(m, g, /*mirrorACMI=*/true);
         cpu::cyclicACMI::Interfaces acmi;
         cpu::cyclicAMIFvPatch::Interfaces amiPairs;
+        // A COINCIDENT cyclicACMI PAIR IS COUPLED FIRST, ON BOTH PATHS: its masks split the face
+        // areas, which moves the cell geometry every patch is built from, and setup() REBUILDS
+        // `patches` (cyclic_acmi_cpp.cu) -- so a plain cyclic attached before it would lose its
+        // coupling. That was the order here, the reverse of the contract cyclic_acmi_cpp.cuh states
+        // and of the gate's harness; it was loud rather than silent (the case-build refusal named the
+        // uncoupled cyclic) and no shipped case carries both.
+        acmi = cpu::cyclicACMI::setup(m, g, patches, startTime);
         // A PLAIN CYCLIC IS COUPLED ON BOTH PATHS. It used to be host-only, because the device loop
         // branched on nothing and a coupled patch would have been run as a wall; the device loop now
         // carries the pair -- its matrices, its fluxes, MULES and nHatf, each gated on its own -- so
@@ -163,11 +170,8 @@ int main(int argc, char** argv)
         attachCyclicCoupling(patches, m, g);
         if (!onDevice)
         {
-            // A coincident cyclicACMI pair is coupled FIRST: its masks split the face areas, which
-            // moves the cell geometry every patch is built from. Neither it nor a cyclicAMI is ported
-            // on the device, and both stay uncoupled there -- which is what the case-build refusal
-            // keys on, by name.
-            acmi = cpu::cyclicACMI::setup(m, g, patches, startTime);
+            // a cyclicAMI is the host's only: the device loop is handed it uncoupled, which is what
+            // the case-build refusal keys on, by name
             amiPairs = cpu::cyclicAMIFvPatch::setup(caseDir + "/constant/polyMesh", m, g, patches);
         }
         // ...handed to the host loop mutable as well, for a case whose mesh moves (MutableMesh)

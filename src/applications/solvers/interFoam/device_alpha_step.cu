@@ -1,5 +1,6 @@
 // The device alpha step -- see device_alpha_step.cuh for the provenance and for what is NOT here.
 #include "device_alpha_step.cuh"
+#include "device_blas.cuh"       // deviceCopy
 #include "device_alpha_flux.cuh"
 #include "device_mules.cuh"
 #include <stdexcept>
@@ -209,7 +210,15 @@ void deviceAlphaCorrector(
     // coupled one alone (alphaEqn.H:79-89): the interface does pass through it, and phic there is
     // cAlpha*|phi_b/magSf|, what it is on an internal face (alpha_eqn_cpp.cu:154-172). icAlpha and
     // scAlpha across a coupled face are refused -- by the host arm and, below, here.
-    deviceCompressionFlux(dm, nIf, nBf, *in.phiInt, in.cAlpha, phicInt, phicBnd);
+    if (in.phicIntPre && in.phicBndPre)
+    {
+        deviceCopy(phicInt, *in.phicIntPre);
+        deviceCopy(phicBnd, *in.phicBndPre);
+    }
+    else
+    {
+        deviceCompressionFlux(dm, nIf, nBf, *in.phiInt, in.cAlpha, phicInt, phicBnd);
+    }
 
     // phir = phic*nHatf, from the nHatf the PREVIOUS mixture.correct() left.
     deviceMultiplyFaces(nIf, phicInt, nHatfInt, phirInt);
@@ -226,7 +235,14 @@ void deviceAlphaCorrector(
                 "there. phir is phic*nHatf, and a coupled face is the one kind alphaEqn.H:79-89 leaves "
                 "compressed.");
         }
-        deviceAlphaCyclicCompressionFlux(*in.cyc, in.cAlpha, phicIf);
+        if (in.phicIfPre)
+        {
+            deviceCopy(phicIf, *in.phicIfPre);
+        }
+        else
+        {
+            deviceAlphaCyclicCompressionFlux(*in.cyc, in.cAlpha, phicIf);
+        }
         deviceMultiplyFaces(in.cyc->n, phicIf, *in.nHatfIf, phirIf);
     }
 

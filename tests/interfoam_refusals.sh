@@ -505,9 +505,14 @@ if [ $HAVE_GPU = 1 ]; then
     # the device's alpha pre-solve does not honour minIter (the host's does)
     BASE="$B"
     arm device_alphaMinIter    refused "minIter 1"               "-device" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       yes;\\n\\1minIter 1;/' system/fvSolution"
-    # the device loop is handed the ACMI pair uncoupled, and refuses it by name
+    # the device loop RUNS the coded cyclicACMI baffle now: the binary couples the pair for it as for
+    # the host loop, and tests/interfoam_leakage_vs_openfoam.sh holds the numbers (its harness still
+    # asserts that the pair handed over UNCOUPLED is refused, which this binary can no longer do)
     BASE="$BK"
-    arm device_leak         refused "coupled_half0"         "-device" true
+    arm device_leak         runs    -                       "-device" true
+    # ...but only at the rescale point both loops gate -- `MULESCorr yes`, one alpha sub-cycle, no
+    # icAlpha or scAlpha -- so the explicit path is refused on the device as it is on the host
+    arm device_leak_explicit refused "MULESCorr"            "-device" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       no;/' system/fvSolution"
     # the device momentum runs limitedLinear now -- one magSqr limiter per face, as OpenFOAM's, gated on
     # eulerianInjection in tests/interfoam_limitedlinear_vs_openfoam.sh. It was refused here while its
     # branch accumulated magSqr(U) into a buffer resize() had not zeroed

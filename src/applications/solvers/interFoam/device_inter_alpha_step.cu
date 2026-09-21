@@ -121,6 +121,8 @@ void deviceInterAlphaStep(
     int subCycle = 0;
     // ...and the volumes it runs on, refilled per sub-cycle on a mesh that moves
     DeviceBuffer<scalar> VscBuf, Vsc0Buf;
+    // ...and phic, when the step's geometry changes under it (DeviceInterAlphaHooks::geometryUpdate)
+    DeviceBuffer<scalar> phicIntPre, phicBndPre, phicIfPre;
     DeviceAlphaEqnStep step =
         [&](const DeviceBuffer<scalar>& subOld, scalar dtSub, DeviceBuffer<scalar>& alpha,
             DeviceBuffer<scalar>& rpInt, DeviceBuffer<scalar>& rpBnd)
@@ -151,6 +153,24 @@ void deviceInterAlphaStep(
         else
         {
             hooks.updateBoundary(alpha, alpha1Bnd, nHatfBnd);
+        }
+
+        // phic, ONCE and FIRST, and then the step's geometry change -- alphaEqn.H:59 and the lazy
+        // cyclicACMI rescale that follows it inside the pre-solve. Only under a geometryUpdate hook:
+        // without one the corrector forms phic itself, on geometry that does not change under it.
+        if (hooks.geometryUpdate)
+        {
+            const int nIfP = dm.nInternalFaces;
+            const int nBfP = dm.nBndFaces;
+            deviceCompressionFlux(dm, nIfP, nBfP, *li.phiInt, li.cAlpha, phicIntPre, phicBndPre);
+            li.phicIntPre = &phicIntPre;
+            li.phicBndPre = &phicBndPre;
+            if (li.cyc && li.cyc->n > 0)
+            {
+                deviceAlphaCyclicCompressionFlux(*li.cyc, li.cAlpha, phicIfPre);
+                li.phicIfPre = &phicIfPre;
+            }
+            hooks.geometryUpdate();
         }
 
         if (ctl.MULESCorr)

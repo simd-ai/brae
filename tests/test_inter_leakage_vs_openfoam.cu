@@ -43,6 +43,29 @@ const scalar B_K = 3e-11;
 const scalar B_EPSILON = 7e-12;
 const scalar B_NUT = 1e-11;
 const scalar B_PHI = 1e-12;
+// THE DEVICE ARM'S OWN BOUNDS -- not the host's, and the reason is measured, not assumed. The device is
+// DETERMINISTIC on this case (a second run from fresh state differs by exactly 0) and every stage of the
+// pair agrees with the host loop to 1e-13 on the opening step (phiHbyA, phig, the flux correction and
+// phi on the pair's own faces). What separates the arms enters one step later, in ONE near-dry cell
+// under the jet: alpha 2.483113e-09 on the device against 2.483522e-09 on the host, 4e-13 apart -- the
+// device's MULES gathers its limiter budgets in another order (device_mules.cuh says what cannot be
+// bit-identical) -- and the density ratio of 1000 turns that into 4e-10 of rho in a cell of air, which
+// is the momentum diagonal there and so U. It is not the pressure solve's stopping point (the gap is
+// the same to four digits with p_rgh at 1e-11) and not rest noise carried through the opening (host
+// against host under that perturbation grows 18x across it; this grows 2900x). MEASURED against
+// OpenFOAM: alpha 3.6e-11, p_rgh 2.0e-11, U 1.3e-09, k 1.0e-10, epsilon 3.9e-11, nut 5.6e-11, the flux
+// through the baffle 9.2e-12 of itself -- the same on the run from 0 and on the restart. The bounds are
+// five times that, EXCEPT k and the baffle's flux, which are 2.5 and 2.2 times: those two are what
+// witnesses the step's rescale POINT on this arm (phic formed after the rescale reads k 5.8e-10 and the
+// flux 2.9e-11, with U at 1.6e-09 -- inside this arm's own floor, where the host arm sees it in U).
+// WHAT THE BOUNDS CANNOT SEE is said in the script's header, fail-proof by fail-proof.
+const scalar D_ALPHA = 2e-10;
+const scalar D_PRGH = 1e-10;
+const scalar D_U = 7e-9;
+const scalar D_K = 2.5e-10;
+const scalar D_EPSILON = 2e-10;
+const scalar D_NUT = 3e-10;
+const scalar D_PHI = 2e-11;
 const scalar B_PRES_CLOSED = 8e-13;
 const scalar B_PRES_OPEN = 7e-9;
 
@@ -426,7 +449,79 @@ int main(
             named = std::string(e.what()).find("coupled_half0") != std::string::npos;
             std::printf("  device: %s\n", e.what());
         }
-        check("the device loop refuses the case and names the patch", named);
+        check("the device loop refuses the pair handed to it UNCOUPLED, and names the patch", named);
+
+        // THE DEVICE ARM, on the pair COUPLED. The host run above has moved g, patches and acmi to
+        // the END state -- the rescale is in place -- so this arm starts from its own: the geometry
+        // and patches as they stood before any coupling, set up again at the start time.
+        FvGeometry gD = gRaw;
+        std::vector<FvPatch> patchesD = uncoupled;
+        cpu::cyclicACMI::Interfaces acmiD = cpu::cyclicACMI::setup(m, gD, patchesD, t0);
+        attachCyclicCoupling(patchesD, m, gD);
+        MutableMesh mmD;
+        mmD.m = &m;
+        mmD.g = &gD;
+        mmD.patches = &patchesD;
+        mmD.acmi = &acmiD;
+        InterFields dev;
+        const RunReport rd = runInterFoamDevice(caseDir, startDir, m, gD, patchesD, nSteps, false, &dev,
+                                                scalar(1e30), nullptr, &mmD);
+        check("the device driver ran the same number of steps", rd.steps == nSteps);
+        std::printf("  the device's time after %d steps: %.17g (host %.17g)\n", (int)rd.steps,
+                    (double)rd.time, (double)r.time);
+        check("...to the host loop's clock, bit for bit", rd.time == r.time);
+        // both arms opened the same faces: the masks after the run
+        bool sameMasks = acmiD.sides().size() == acmi.sides().size();
+        for (std::size_t si = 0; sameMasks && si < acmi.sides().size(); ++si)
+        {
+            sameMasks = acmiD.sides()[si].scaledMask == acmi.sides()[si].scaledMask;
+        }
+        check("...and opened the faces the host loop opened", sameMasks);
+        failures += brae::gatecheck::nonFinite("device alpha", dev.alpha1.internal);
+        failures += brae::gatecheck::nonFinite("device p_rgh", dev.p_rgh.internal);
+        failures += brae::gatecheck::nonFinite("device U", dev.U.internal);
+        const Diff eA = compare(dev.alpha1.internal, ofAlpha);
+        const Diff eP = compare(dev.p_rgh.internal, ofPrgh);
+        const Diff eU = compare(dev.U.internal, ofU);
+        const Diff eK = compare(dev.turbulence.k.internal, ofKf);
+        const Diff eE = compare(dev.turbulence.epsilon.internal, ofEf);
+        const Diff eN = compare(dev.turbulence.nut.internal, ofNut);
+        std::printf("  DEVICE:  alpha %.4e, p_rgh %.4e, U %.4e, k %.4e, epsilon %.4e, nut %.4e\n",
+                    (double)eA.linf, (double)eP.rel(), (double)eU.rel(), (double)eK.rel(),
+                    (double)eE.rel(), (double)eN.rel());
+        std::printf("  host:    alpha %.4e, p_rgh %.4e, U %.4e, k %.4e, epsilon %.4e, nut %.4e\n",
+                    (double)dA.linf, (double)dP.rel(), (double)dU.rel(), (double)dK.rel(),
+                    (double)dE.rel(), (double)dN.rel());
+        // the flux through the baffle, on the device's own patches
+        scalar ePhi = 0;
+        for (const cpu::cyclicACMI::Side& sd : acmiD.sides())
+        {
+            for (const label pi : {sd.patch, sd.nonOverlap})
+            {
+                const FvPatch& q = patchesD[static_cast<std::size_t>(pi)];
+                const PatchFieldData<scalar>* b = findPatchEntry(ofPhi.boundary, q);
+                if (!b)
+                {
+                    continue;
+                }
+                const std::size_t nf = static_cast<std::size_t>(q.size);
+                const std::vector<scalar> ofb = b->valueUniform ? std::vector<scalar>(nf, b->uniformValue)
+                                                                : b->values;
+                ePhi = std::fmax(ePhi, compare(dev.phi.boundary[static_cast<std::size_t>(pi)], ofb).linf);
+            }
+        }
+        std::printf("  DEVICE phi through the baffle: Linf %.4e of %.4e (host %.4e)\n", (double)ePhi,
+                    (double)phiScale, (double)dPhi);
+        // held to the device arm's OWN bounds (D_*, at the top of this file, with the measurement)
+        check("the device's alpha agrees with OpenFOAM's absolutely", eA.linf < D_ALPHA);
+        check("...its p_rgh", eP.rel() < D_PRGH);
+        check("...its U", eU.rel() < D_U);
+        check("...its k", eK.rel() < D_K);
+        check("...its epsilon", eE.rel() < D_EPSILON);
+        check("...its nut", eN.rel() < D_NUT);
+        check("...and its flux through the baffle, face by face", ePhi <= D_PHI*phiScale);
+        check("opening the baffle moves OpenFOAM's own U far more than the device is from it",
+              dClosed.rel() > scalar(1000)*std::fmax(eU.rel(), scalar(1e-14)));
     }
 
     std::printf("test_inter_leakage_vs_openfoam: %d failures\n", failures);

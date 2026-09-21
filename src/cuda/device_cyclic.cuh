@@ -116,7 +116,11 @@ inline DeviceCyclic buildDeviceCyclic(
             const auto it = offsetOfPatch.find(static_cast<label>(c.nbrPatch));
             for (std::size_t i = 0; i < c.faceCells.size(); ++i)
             {
-                if (it != offsetOfPatch.end())
+                // ...except across an AMI-family pair, which MULES' limiter sync does not cover
+                // (CyclicInterface::ami says why): its faces keep twin = -1 and their own lambda. The
+                // host measured what syncing one costs on RAS/damBreakLeakage -- U 1.7e-01, and only
+                // on the step the baffle opens.
+                if (it != offsetOfPatch.end() && !c.ami)
                 {
                     twin[off + i] = static_cast<label>(it->second + i);
                 }
@@ -188,6 +192,46 @@ inline DeviceCyclic buildDeviceCyclic(
             d.ifCoeffC[k].resize(d.n);
     }
     return d;
+}
+
+// THE PAIR'S FACE AREAS, refreshed IN PLACE after a cyclicACMI rescale: magSf and Sf, in the order
+// buildDeviceCyclic laid them out, and NOTHING ELSE. OpenFOAM's rescale (cyclicACMIPolyPatch::
+// scalePatchFaceAreas, cyclicACMIFvPatch::resetPatchAreas) moves the areas and leaves the cached
+// surfaceInterpolation weights and deltaCoeffs alone -- a static mesh never clears them
+// (surfaceInterpolation.C:105-112, cleared only by movePoints/updateGeom) -- and the host's rescale does
+// the same, so rebuilding the interface from the rescaled geometry would recompute what neither of them
+// does. copyFrom at an unchanged size keeps each buffer's device address, so the layout, the twin map,
+// the CSR, phi and ifCoeff -- and every pointer the driver's hooks hold -- stay as they were.
+inline void refreshDeviceCyclicAreas(
+    DeviceCyclic& d,
+    const std::vector<CyclicInterface>& cyclics,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp)
+{
+    std::vector<scalar> ms, sfx, sfy, sfz;
+    for (const auto& c : cyclics)
+    {
+        const FvPatch& P = fvp[c.patch];
+        for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+        {
+            const label gf = P.start + (label)i;
+            ms.push_back(g.magSf()[gf]);
+            sfx.push_back(g.Sf()[gf].x);
+            sfy.push_back(g.Sf()[gf].y);
+            sfz.push_back(g.Sf()[gf].z);
+        }
+    }
+    if (static_cast<int>(ms.size()) != d.n)
+    {
+        throw std::runtime_error(
+            "brae device cyclic: the pair's layout changed under an area refresh (" +
+            std::to_string(ms.size()) + " faces for " + std::to_string(d.n) + "). The refresh rewrites "
+            "areas in place and cannot follow a change of topology.");
+    }
+    d.magSf.copyFrom(ms);
+    d.Sfx.copyFrom(sfx);
+    d.Sfy.copyFrom(sfy);
+    d.Sfz.copyFrom(sfz);
 }
 
 // ifCoeff[j] = gammaFace_j * deltaCoeffs_j * magSf_j  with gammaFace = w*gamma[own] + (1-w)*gamma[nbr]

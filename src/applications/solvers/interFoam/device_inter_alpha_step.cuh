@@ -91,6 +91,16 @@ struct DeviceInterAlphaHooks
         int subCycle,
         DeviceBuffer<scalar>& Vsc,
         DeviceBuffer<scalar>& Vsc0)> subCycleVolumes;
+
+    // THE STEP'S GEOMETRY CHANGE, where the host's alphaEqnStep has it (alpha_eqn_cpp.cu,
+    // geometryUpdate): AFTER phic is formed and BEFORE the pre-solve assembles. It exists for a
+    // cyclicACMI whose `scale` moves with time -- OpenFOAM rescales the pair's areas lazily, at the
+    // pre-solve's first updateCoeffs -- and the callee both rescales and re-uploads whatever this step
+    // reads from the mesh and the pair, IN PLACE (`dm` and the pair are held by reference here). It is
+    // called at every sub-step and every outer corrector; landing once per TIME STEP is the callee's
+    // job, as it is the host hook's. Null on every other case, and the step is then bit for bit what it
+    // was: phic stays the corrector's own.
+    std::function<void()> geometryUpdate;
 };
 
 struct DeviceInterAlphaControls

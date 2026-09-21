@@ -122,7 +122,31 @@ RunReport runInterFoamDevice(
     InterFields f = buildInterFields(caseDir, startDir, m, g, fvp);
     // THE PAIR, built here and not at the device-mesh stage, because the hooks below fill its share of
     // the surface fields and they are defined before the DeviceCyclic is.
-    const std::vector<CyclicInterface> cyclics = buildCyclicInterfaces(m, g, fvp);
+    // ...INCLUDING a cyclicACMI the caller has coupled as a coincident pair (cpu::cyclicACMI::setup):
+    // on the mask-scaled areas it IS a cyclic, with one difference this loop has to honour -- MULES
+    // does not sync its limiter across it (CyclicInterface::ami).
+    const std::vector<CyclicInterface> cyclics =
+        buildCyclicInterfaces(m, g, fvp, /*includeCoupledACMI=*/true);
+    // A COUPLED PATCH THAT IS NOT IN THAT LIST WOULD BE IN NOTHING: the device mesh and every boundary
+    // flatten skip the coupled types (device_mesh.cuh:41-44), so its faces would be neither boundary
+    // nor interface, silently. A cyclicAMI coupled by a harness is the live case; refused by name.
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        if (!fvp[pi].coupled) continue;
+        bool carried = false;
+        for (const CyclicInterface& c : cyclics)
+        {
+            carried = carried || static_cast<std::size_t>(c.patch) == pi;
+        }
+        if (!carried)
+        {
+            throw std::runtime_error(
+                "brae interFoam -device: patch `" + fvp[pi].name + "` of type `" + fvp[pi].type +
+                "` is coupled and this loop carries no interface for it -- it couples a translational "
+                "`cyclic` and a coincident `cyclicACMI`. Its faces would be in no operator at all. "
+                "Run without -device.");
+        }
+    }
     // stf and snGrad(rho) on the pair, refilled by the interfaceForces hook every step; ghf is the
     // mesh's and is built once, below.
     DeviceBuffer<scalar> dStfIf, dSnRhoIf, dGhfIf;
@@ -242,6 +266,56 @@ RunReport runInterFoamDevice(
     // so the device loop moves the mesh exactly as the host loop does (inter_driver_cpp.cu's
     // Stage::meshUpdate) and then refreshes the buffers it had uploaded from the geometry.
     DynamicMotionSolverFvMesh* dyn = f.dynamicMesh.get();
+    // A cyclicACMI PAIR WHOSE `scale` MOVES WITH TIME is rescaled at every step, in place, on the
+    // caller's mutable objects -- the host loop's guards, transcribed (inter_driver_cpp.cu:256-302),
+    // because the rescale point this loop carries is the one that loop gates and no other.
+    cpu::cyclicACMI::Interfaces* acmi = mutableMesh ? mutableMesh->acmi : nullptr;
+    {
+        bool hasACMI = false;
+        for (const FvPatch& q : fvp)
+        {
+            hasACMI = hasACMI || q.type == "cyclicACMI";
+        }
+        if (hasACMI && (!acmi || acmi->empty()))
+        {
+            throw std::runtime_error(
+                "brae interFoam -device: the mesh has a cyclicACMI pair and the caller handed the driver "
+                "no ACMI state. Couple it with cpu::cyclicACMI::setup and pass the result through "
+                "MutableMesh.");
+        }
+        if (acmi && acmi->scaled())
+        {
+            if (mutableMesh->m != &m || mutableMesh->g != &g || mutableMesh->patches != &fvp)
+            {
+                throw std::runtime_error(
+                    "brae interFoam -device: MutableMesh names different objects from the mesh, geometry "
+                    "and patches the fields were built against; the cyclicACMI rescale would move a copy.");
+            }
+            if (dyn)
+            {
+                throw std::runtime_error(
+                    "brae interFoam -device: the case scales a cyclicACMI interface AND moves its mesh. "
+                    "OpenFOAM then re-runs the AMI and rescales the mesh flux in "
+                    "cyclicACMIFvPatch::movePoints; that is not ported.");
+            }
+            // WHERE IN THE STEP the rescale lands is part of the answer (cyclic_acmi_cpp.cuh): after
+            // alphaEqn.H forms phic and before the pre-solve. That point is gated for the pre-solving
+            // path with no isotropic or shear compression and one alpha sub-cycle; each of the others
+            // moves OpenFOAM's first interpolation across the pair, and none is gated on either arm.
+            if (!f.alphaCtl.MULESCorr || f.alphaCtl.icAlpha != scalar(0) || f.alphaCtl.scAlpha != scalar(0)
+             || f.alphaCtl.nAlphaSubCycles != 1)
+            {
+                throw std::runtime_error(
+                    "brae interFoam -device: the case scales a cyclicACMI interface with time, and the "
+                    "step's rescale point is ported for `MULESCorr yes`, icAlpha 0, scAlpha 0 and "
+                    "nAlphaSubCycles 1 only; this case sets MULESCorr "
+                    + std::string(f.alphaCtl.MULESCorr ? "yes" : "no") + ", icAlpha "
+                    + std::to_string((double)f.alphaCtl.icAlpha) + ", scAlpha "
+                    + std::to_string((double)f.alphaCtl.scAlpha) + ", nAlphaSubCycles "
+                    + std::to_string((long)f.alphaCtl.nAlphaSubCycles) + ".");
+            }
+        }
+    }
     if (dyn)
     {
         // THIS LOOP MOVES A MESH, and it agrees with the host arm when both run the SAME linear
@@ -1272,7 +1346,27 @@ RunReport runInterFoamDevice(
         dNHIf.copyFrom(coupledFace(f.nHatf, cyclics));
     }
     DeviceBuffer<scalar> dABnd(patchValues(f.alpha1, fvp)), dK(f.K);
-    DeviceBuffer<scalar> dGh(f.gh), dGhf, dMagSf(g.magSf());
+    // |Sf| over the full face array IN THE DEVICE'S ORDER -- internal faces, then the boundary patches
+    // with the coupled ones LEFT OUT, as every array the pressure step indexes it beside is laid out
+    // (fullFace). It was uploaded in MESH order, which is the same array only while no coupled patch
+    // precedes another patch: on damBreakLeakage the two symmetry blocks follow the pair and read each
+    // other's neighbours' areas. NOT DISCRIMINATED by any gate -- phig is zero on every patch that
+    // could see it there (snGrad(rho) and stf both vanish on a symmetry or a wall) -- so this is a
+    // correction by construction and is claimed as nothing more.
+    auto magSfAll = [&]()
+    {
+        SurfaceScalarField a;
+        const label nIfA = m.nInternalFaces();
+        a.internal.assign(g.magSf().begin(), g.magSf().begin() + nIfA);
+        a.boundary.resize(fvp.size());
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            a.boundary[pi].assign(g.magSf().begin() + fvp[pi].start,
+                                  g.magSf().begin() + fvp[pi].start + fvp[pi].size);
+        }
+        return fullFace(a, fvp);
+    };
+    DeviceBuffer<scalar> dGh(f.gh), dGhf, dMagSf(magSfAll());
     { SurfaceScalarField gf; gf.internal = f.ghfInternal; gf.boundary = f.ghfBoundary;
       dGhf.copyFrom(fullFace(gf, fvp));
       // ghf on the pair: gravity dotted with the face centre, which does not change with the solution
@@ -1314,10 +1408,67 @@ RunReport runInterFoamDevice(
     // correctPhi.H) on a case that asks for it
     DeviceBuffer<scalar> dRAU;
 
+    // THE cyclicACMI RESCALE, through the alpha step's geometryUpdate -- after phic, before the
+    // pre-solve, ONCE PER TIME STEP -- with the same host call the host loop makes and at the same
+    // clock: `stepTime` is rep.time + rep.deltaT, the ACCUMULATED sum the host hands rescale(), and
+    // the baffle opens on the step where that sum first passes the scale's threshold (500 additions of
+    // 1e-3 are 0.50000000000000033, not 0.5). What follows it re-uploads what the device holds of the
+    // geometry that moved, IN PLACE:
+    //   the mesh's areas, volumes and centres        refreshDeviceMeshGeometry, from the host's g --
+    //                                                which keeps its cached weights and deltaCoeffs
+    //                                                across a rescale, as OpenFOAM's static mesh does
+    //   the pair's own areas                         refreshDeviceCyclicAreas, and ONLY the areas
+    //   |Sf| for phig                                dMagSf
+    // dbU is rebuilt by the momentum's updateUBoundary before anything reads it, and the grad(U) memo
+    // carries the boundary areas in its fingerprint for exactly this step (device_kepsilon.cu).
+    bool acmiRescaledThisStep = false;
+    if (acmi && acmi->scaled())
+    {
+        // the closure's boundary arrays are built once and keep the OLD areas on the non-overlap
+        // patches. That is inert while k, epsilon and nut are zero-gradient there -- a coefficient of
+        // zero times an area -- which is what a symmetry patch gives them; anything else is refused
+        if (deviceClosure)
+        {
+            for (const cpu::cyclicACMI::Side& side : acmi->sides())
+            {
+                const std::size_t no = static_cast<std::size_t>(side.nonOverlap);
+                const bool flat = f.turbulence.k.boundary[no]->bcCategory() == 0
+                               && f.turbulence.nut.boundary[no]->bcCategory() == 0;
+                if (!flat)
+                {
+                    throw std::runtime_error(
+                        "brae interFoam -device: the cyclicACMI's non-overlap patch `" + fvp[no].name +
+                        "` carries a turbulence condition that is not zero-gradient, and the device "
+                        "closure's boundary areas are built once -- they would keep the area the patch "
+                        "had before the interface moved. Run without -device.");
+                }
+            }
+        }
+        H.alpha.geometryUpdate = [&]()
+        {
+            if (acmiRescaledThisStep)
+            {
+                return;
+            }
+            acmi->rescale(stepTime, m, *mutableMesh->g, *mutableMesh->patches);
+            acmiRescaledThisStep = true;
+            refreshDeviceMeshGeometry(dm, m, g, fvp);
+            refreshDeviceCyclicAreas(dCyc, cyclics, g, fvp);
+            dMagSf.copyFrom(magSfAll());
+        };
+    }
+
     RunReport rep;
     rep.pcorrSolves = initPcorrSolves;
     rep.deltaT = f.deltaT;
     rep.turbulenceOnDevice = deviceClosure;
+    // THE CLOCK STARTS WHERE THE START DIRECTORY SAYS, as the host loop's does (startTimeOf). This one
+    // started at 0 whatever the directory was named, which a run from 0 cannot see and a RESTART
+    // cannot survive: every time-dependent input -- a cyclicACMI's scale, a wave, a table, the mesh
+    // motion -- was evaluated `startTime` early. adjustDeltaT and the write cadence measure from the
+    // start (Time.C:1150), so they take rep.time - startTime, exactly rep.time when the start is 0.
+    const scalar startTime = startTimeOf(startDir);
+    rep.time = startTime;
     for (label s = 0; s < nSteps; ++s)
     {
         if (!(rep.time < endTime - scalar(0.5)*rep.deltaT)) break;   // Time::run(), Time.C:1000
@@ -1332,7 +1483,7 @@ RunReport runInterFoamDevice(
         rep.CoNum = deviceAlphaCourantNo(dm, dPhiI, dPhiB, nullptr, rep.deltaT).CoNum;
         rep.alphaCoNum = deviceAlphaCourantNo(dm, dPhiI, dPhiB, &dA, rep.deltaT).CoNum;
         rep.deltaT = setDeltaTVoF(rep.deltaT, rep.CoNum, rep.alphaCoNum, f.timeCtl,
-                                  rep.time, &f.writeCadence);
+                                  rep.time - startTime, &f.writeCadence);
 
         // Uf.oldTime(), snapshotted where the host driver snapshots it (inter_driver_cpp.cu:897,
         // alongside UOld and phiOld). The FLUX off it is built after this step's move, below: the
@@ -1388,6 +1539,7 @@ RunReport runInterFoamDevice(
         // OpenFOAM's clock for the step about to be taken: ++runTime comes before the alpha step
         stepDeltaT = rep.deltaT;
         stepTime = rep.time + rep.deltaT;
+        acmiRescaledThisStep = false;   // once per TIME STEP, not per outer corrector
         stepIndex = s + 1;
 
         // rho.oldTime() for the closure's ddt: f.rho still holds what the LAST step's hook left, and
@@ -1434,7 +1586,7 @@ RunReport runInterFoamDevice(
                 // clearOut on the device side: the addressing is untouched, as the move keeps the
                 // topology fixed (device_mesh.cuh).
                 refreshDeviceMeshGeometry(dm, m, g, fvp);
-                dMagSf.copyFrom(g.magSf());
+                dMagSf.copyFrom(magSfAll());
                 dGh.copyFrom(f.gh);
                 {
                     SurfaceScalarField gf;
@@ -1627,7 +1779,7 @@ RunReport runInterFoamDevice(
 
         rep.steps = s + 1;
         rep.time += rep.deltaT;
-        f.writeCadence.advance(rep.time, rep.deltaT);   // Time::operator++, Time.C:1046-1074
+        f.writeCadence.advance(rep.time - startTime, rep.deltaT);   // Time::operator++, Time.C:1046-1074
 
         if (verbose)
         {
