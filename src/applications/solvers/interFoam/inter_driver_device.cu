@@ -248,6 +248,28 @@ RunReport runInterFoamDevice(
         // moved one step late and the tank barely drove the flow. interMeshUpdate takes the clock
         // explicitly now.
         //
+        // WHERE THE GAP IS NOT: two controls, both measured on sloshingTank2D, one step.
+        //   * the SAME case with `dynamicFvMesh staticFvMesh` is EXACT on this arm -- device max|U|
+        //     2.712e-12, worst |div(phi)| 9.630e-12, against the host's 4.282e-12 and 1.568e-11. So
+        //     the case, its schemes and this loop's static path are not it; the move is.
+        //   * it is not the solver's stopping point either: with every solve pinned at 1e-14 the HOST
+        //     goes to 5.181e-11 and this arm goes the other way, to 3.274e-01.
+        //
+        //   * and it is NOT the geometry refresh, nor a pointer left stale by it. A/B on
+        //     refreshDeviceMeshGeometry itself: with it 3.274e-01, with it SKIPPED ENTIRELY
+        //     3.291e-01 -- half a percent. Stale geometry would have moved that by orders. The
+        //     refresh also covers what OpenFOAM's fvMesh::movePoints invalidates: storeOldVol,
+        //     polyMesh::movePoints, updateGeomNotOldVol, boundary_.movePoints (DeviceBoundary carries
+        //     deltaCoeffs and magSf, and dbU is rebuilt), surfaceInterpolation::clearOut's four
+        //     fields, and meshObject::movePoints (the turbulence's, via interMeshUpdate).
+        //
+        // WHAT IS LEFT TO LOOK AT, in order: the BOUNDARY half of the flux. The device's phi on a
+        // moving wall has to come out relative -- OpenFOAM's wall moves WITH the mesh, so its
+        // relative flux is zero -- and the meshPhi this loop subtracts is laid out by fullFace()
+        // while phiBnd is the device's own boundary array. If those two orderings disagree on a case
+        // with empty patches (this one is 2D), the subtraction lands on the wrong faces. That is a
+        // layout question with a definite answer, not a guess, and it is the next measurement.
+        //
         // THE MESH FLUX IS CARRIED NOW (DeviceInterStepControls::meshPhiAll -> the pressure step's
         // fvc::makeRelative at the host's own site), and it is necessary -- the alpha equation must
         // convect the RELATIVE flux -- but it is NOT what the 1.573e-01 is. Measured A/B with the term
@@ -1302,6 +1324,11 @@ RunReport runInterFoamDevice(
     DeviceBuffer<scalar> dV0;
     // ...and the mesh flux the move produced, which the pressure corrector makes phi relative to
     DeviceBuffer<scalar> dMeshPhi;
+    // Uf.oldTime() and the face flux ddtCorr reads off it, (Sf & Uf.oldTime()) per internal face.
+    // The host driver keeps the same pair (UfOld, dc.UfOld); on a moving mesh OpenFOAM's ddtCorr
+    // takes this in phi.oldTime()'s place (EulerDdtScheme's fvcDdtUfCorr).
+    SurfaceVectorField UfOld = f.Uf;
+    DeviceBuffer<scalar> dPhiUfOld;
 
     RunReport rep;
     rep.pcorrSolves = initPcorrSolves;
@@ -1322,6 +1349,21 @@ RunReport runInterFoamDevice(
         rep.alphaCoNum = deviceAlphaCourantNo(dm, dPhiI, dPhiB, &dA, rep.deltaT).CoNum;
         rep.deltaT = setDeltaTVoF(rep.deltaT, rep.CoNum, rep.alphaCoNum, f.timeCtl,
                                   rep.time, &f.writeCadence);
+
+        // Uf.oldTime(), snapshotted where the host driver snapshots it (inter_driver_cpp.cu:897,
+        // alongside UOld and phiOld), and the face flux ddtCorr reads off it. Both are the mesh's
+        // CURRENT Sf: fvcDdtUfCorr dots Uf.oldTime() with mesh().Sf(), not with the old geometry.
+        if (dyn)
+        {
+            UfOld = f.Uf;
+            std::vector<scalar> pu(static_cast<std::size_t>(nIf));
+            for (label fc = 0; fc < nIf; ++fc)
+            {
+                pu[static_cast<std::size_t>(fc)] = dot(g.Sf()[fc], UfOld.internal[fc]);
+            }
+            dPhiUfOld.copyFrom(pu);
+            C.phiUfOldInt = &dPhiUfOld;
+        }
 
         std::vector<scalar> ca, cx, cy, cz;
         dA.copyTo(ca);   dAOld.copyFrom(ca);
@@ -1534,6 +1576,22 @@ RunReport runInterFoamDevice(
                 correctInterTurbulence(f.turbulence, ti, m, g, fvp);
             }
             }   // pimple.turbCorr()
+
+            // fvc::correctUf(Uf, U, phi), pEqn.H:70-72 -- the END of the pressure corrector on a
+            // moving mesh. Uf is a HOST field (next step's ddtCorr reads (Sf & Uf.oldTime()) off it),
+            // so the device's U and phi come back for it. One copy of the arithmetic, shared with the
+            // host loop (correctUf, inter_peqn_cpp.cu).
+            if (dyn)
+            {
+                { std::vector<scalar> ux, uy, uz;
+                  dUx.copyTo(ux); dUy.copyTo(uy); dUz.copyTo(uz);
+                  for (label c = 0; c < nC; ++c)
+                      f.U.internal[c] = vector{ux[c], uy[c], uz[c]};
+                  f.U.evaluateBoundary(); }
+                dPhiI.copyTo(f.phi.internal);
+                pushFlux();
+                correctUf(f.Uf, f.U, f.phi, m, g, fvp);
+            }
         }   // the outer corrector loop
 
         rep.steps = s + 1;
