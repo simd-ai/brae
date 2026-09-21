@@ -419,7 +419,9 @@ void deviceInterStep(
         DeviceBuffer<scalar> ddtCorrI, ddtCorrB, ddtCorrIf;
         deviceDdtCorr(dm, phiOldInt, phiOldBnd, UOldX, UOldY, UOldZ, bndUFixesValue,
                       /*ddtPhiCoeff=*/scalar(-1), deltaT, ddtCorrI, ddtCorrB,
-                      &UOldBndX, &UOldBndY, &UOldBndZ);
+                      &UOldBndX, &UOldBndY, &UOldBndZ,
+                      // on a moving mesh (Sf & Uf.oldTime()) takes phi.oldTime()'s place
+                      ctl.phiUfOldInt);
 
         // MRF.zeroFilter(interpolate(rho*rAU)*fvc::ddtCorr(U, phi)), pEqn.H:18. MRFZone::zero sets the
         // flux to Zero on the zone's internal faces and on its included AND excluded boundary faces
@@ -499,6 +501,7 @@ void deviceInterStep(
             deviceCopy(taps->ffIf, pt.ffIf);
             deviceCopy(taps->phiIf, pt.phiIf);
             deviceCopy(taps->phiHbyAIfPrePhig, pt.phiHbyAIfPrePhig);
+            deviceCopy(taps->phiHbyAIntPrePhig, pt.phiHbyAIntPrePhig);
             deviceCopy(taps->cycJumpTap, pt.cycJumpTap);
         }
         if (taps && corr == 0)

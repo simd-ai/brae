@@ -1362,6 +1362,18 @@ RunReport runInterFoamDevice(
         if (dyn)
         {
             UfOld = f.Uf;
+            // Uf is built for a dynamic mesh only (inter_case_cpp.cu, createUfIfPresent.H), and this
+            // loop reads it face by face -- so its size is checked rather than assumed. Reading past
+            // it is what a missing Uf would do QUIETLY, and phiHbyA is six orders larger than the
+            // field it feeds when that happens.
+            if (UfOld.internal.size() != static_cast<std::size_t>(nIf))
+            {
+                throw std::runtime_error(
+                    "brae interFoam -device: the case moves its mesh but Uf has " +
+                    std::to_string(UfOld.internal.size()) + " internal faces, not " +
+                    std::to_string(nIf) + ". ddtCorr reads (Sf & Uf.oldTime()) off it on a moving "
+                    "mesh (EulerDdtScheme's fvcDdtUfCorr); refusing rather than reading past it.");
+            }
             std::vector<scalar> pu(static_cast<std::size_t>(nIf));
             for (label fc = 0; fc < nIf; ++fc)
             {

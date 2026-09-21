@@ -158,6 +158,11 @@ scalar deviceInterPressureStep(
 
     DeviceBuffer<scalar> zeroIf(static_cast<std::size_t>(nIf));
     if (nIf > 0) ckS(cudaMemset(zeroIf.data(), 0, sizeof(scalar)*nIf), "zero");
+    // phiHbyA BEFORE phig, which is where the host reference's tap is taken (PressureTaps::phiHbyA,
+    // "BEFORE `phiHbyA += phig`"). The tap below this call is AFTER it, and comparing the two across
+    // arms compares different quantities -- it read 2.3534e+01 of a 3.5419e-05 field before this was
+    // separated out.
+    if (taps) deviceCopy(taps->phiHbyAIntPrePhig, phiHbyAInt);
     deviceInterAddPhiHbyATerms(dm, rhoRAUf,
                                in.ddtCorrInt ? *in.ddtCorrInt : zeroIf,
                                phigInt, phigBnd, in.ddtCorrInt != nullptr,

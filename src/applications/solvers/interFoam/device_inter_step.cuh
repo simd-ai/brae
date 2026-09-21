@@ -112,6 +112,8 @@ struct DeviceInterStepTaps
     // these are taken on EVERY corrector, so they hold the LAST -- which is the state the host's own
     // taps hold and the only one the two arms can be compared in.
     DeviceBuffer<scalar> phigIf, rAUfIf, ffIf, phiIf, phiHbyAIfPrePhig, cycJumpTap;
+    // phiHbyA on the internal faces BEFORE phig -- the host's PressureTaps::phiHbyA is at that point
+    DeviceBuffer<scalar> phiHbyAIntPrePhig;
     std::vector<std::vector<scalar>> jumpHistory;
     DeviceBuffer<scalar> uEqnCycIfCoeff;   // UEqn's interface off-diagonal on the pair
     // ...and the ALPHA step's own two on the pair, taken as it leaves: alphaPhi10 and rhoPhi there
@@ -128,6 +130,9 @@ struct DeviceInterStepControls
     // ...and the mesh flux over the FULL face array, for fvc::makeRelative(phi, U) at the end of the
     // pressure corrector. Null on a static mesh, where OpenFOAM's makeRelative is a no-op.
     const DeviceBuffer<scalar>* meshPhiAll = nullptr;
+    // (Sf & Uf.oldTime()) per internal face, which ddtCorr takes in phi.oldTime()'s place on a moving
+    // mesh (fvcDdt.C:220-227 -> EulerDdtScheme's fvcDdtUfCorr). Null on a static mesh.
+    const DeviceBuffer<scalar>* phiUfOldInt = nullptr;
 
     // The case's MRF zones, built once by the driver (buildDeviceMRFZone). interFoam touches them in
     // three places -- UEqn.H:6 MRF.DDt(rho, U), pEqn.H:18 MRF.zeroFilter(ddtCorr term) and pEqn.H:19
