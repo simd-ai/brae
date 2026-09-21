@@ -68,10 +68,12 @@
 //   p_rgh off the pair              2.4990e-07      4.5493e-09
 //
 // THE OTHER HALF was deviceCyclicAddLinUpwindCorr -- linearUpwind's deferred correction across a pair,
-// which this case asks for by name (`div(rhoPhi,U) Gauss linearUpwind grad(U)`). The kernel had been in
-// the tree since the legacy driver and had NO caller anywhere; it now runs from the same loop, weighted
-// by the flux the matrix was assembled with (rhoPhi, not the interface's volumetric phi). With both
-// halves wired the two arms agree at round-off on this tutorial:
+// which this case asks for by name (`div(rhoPhi,U) Gauss linearUpwind grad(U)`). The LEGACY simpleFoam
+// driver has called it since it was written (device_simple_foam.cu:1808, through the
+// interfaceAddLinUpwindCorr wrapper); no OF-mirror driver did. It now runs from the same loop, weighted
+// by the flux the matrix was assembled with (rhoPhi, not the interface's volumetric phi -- the legacy
+// caller is incompressible and takes the default). With both halves wired the two arms agree at
+// round-off on this tutorial:
 //
 //                          original      + grad(U)     + correction
 //   |U| (nOuterCorrectors 3)  4.0292e-09    5.0309e-10    5.7543e-14
