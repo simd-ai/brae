@@ -115,6 +115,10 @@ void interMeshUpdate(
     GamgAgglomerationCache&                gamgCache,
     const CorrectPhiControls&              cpc,
     RunReport&                             rep,
+    // the clock of the step being taken: the host advances rep.time before this stage, the device
+    // keeps it and carries the new instant separately, so it is passed rather than read off `rep`
+    scalar                                 time,
+    label                                  timeIndex,
     label                                  outerOfStep,
     label                                  nOuterCorrectors);
 

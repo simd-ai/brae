@@ -107,6 +107,13 @@ void interMeshUpdate(
     GamgAgglomerationCache&                gamgCache,
     const CorrectPhiControls&              cpc,
     RunReport&                             rep,
+    // THE CLOCK OF THE STEP BEING TAKEN, passed rather than read off `rep`: the host driver advances
+    // rep.time in its advanceTime stage before this one (interFoam.C does ++runTime before the PIMPLE
+    // loop), while the device loop keeps rep.time at the step it is leaving and carries the new
+    // instant separately. Reading rep.time here evaluated the motion one step late on the device --
+    // measured on sloshingTank2D, max|U| 0.014 against the host's 10.38 after one step.
+    scalar                                 time,
+    label                                  timeIndex,
     label                                  outerOfStep,
     label                                  nOuterCorrectors)
 {
@@ -119,7 +126,7 @@ void interMeshUpdate(
     // The GAMG hierarchy is the mesh's: a displacement solve builds it or reuses the
     // one p_rgh left, and the move marks it for rebuilding.
     const bool finalIteration = (outerOfStep >= nOuterCorrectors - 1);
-    dyn->update(rep.time, rep.deltaT, rep.steps, finalIteration, &gamgCache);
+    dyn->update(time, rep.deltaT, timeIndex, finalIteration, &gamgCache);
     // ...and fvMesh::movePoints moves the mesh objects with it: kOmegaSST's wall distance
     moveInterTurbulence(f.turbulence, m, g, patches);
     // cyclicAMIPolyPatch::initMovePoints marks the AMI out of date, and the next AMI()
@@ -152,7 +159,7 @@ void interMeshUpdate(
     // time index, as OpenFOAM's is. Measured on waveMakerSolitary with pcorr converged:
     // updated in UEqn instead, from the alpha the sub-cycles left, U went from 7.1e-12 of
     // OpenFOAM after step one to 1.1e-07 after step two, the gap at the outlet.
-    updateWaveVelocity(f.waves, f.alpha1, f.U, rep.time, rep.steps, m, g, patches);
+    updateWaveVelocity(f.waves, f.alpha1, f.U, time, timeIndex, m, g, patches);
     f.U.evaluateBoundary();
 
     // interFoam.C:130-131: gh and ghf follow the cell and face centres
@@ -439,7 +446,7 @@ RunReport runInterFoam(
                     ++outerOfStep;
                     // interFoam.C:112-149, one copy shared with the device loop: see interMeshUpdate.
                     interMeshUpdate(dyn, f, m, g, patches, mutableMesh, amiPairs, gamgCache, cpc,
-                                    rep, outerOfStep, lc.nOuterCorrectors);
+                                    rep, rep.time, rep.steps, outerOfStep, lc.nOuterCorrectors);
                     break;
                 }
 
