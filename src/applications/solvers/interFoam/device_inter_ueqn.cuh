@@ -57,7 +57,10 @@ void deviceInterEulerDdtRhoU(
     DeviceBuffer<scalar>&       diag,
     DeviceBuffer<scalar>&       srcX,
     DeviceBuffer<scalar>&       srcY,
-    DeviceBuffer<scalar>&       srcZ);
+    DeviceBuffer<scalar>&       srcZ,
+    // the cell volumes BEFORE a mesh move (OF fvMesh::movePoints stores them); null on a static mesh,
+    // where OpenFOAM's Vsc0() is V and the reference takes its other branch
+    const DeviceBuffer<scalar>* V0 = nullptr);
 
 // (surfaceTensionForce - ghf*snGrad(rho) - snGrad(p_rgh)) * magSf, per face.
 //

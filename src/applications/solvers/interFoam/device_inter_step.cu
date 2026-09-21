@@ -252,6 +252,7 @@ void deviceInterStep(
     uin.relaxEquation = ctl.relaxEquationU;
     uin.ddtRho        = &rho;
     uin.ddtRhoOld     = &rhoOld;
+    uin.ddtV0         = ctl.V0;
     uin.ddtUOld[0]    = &UOldX;
     uin.ddtUOld[1]    = &UOldY;
     uin.ddtUOld[2]    = &UOldZ;

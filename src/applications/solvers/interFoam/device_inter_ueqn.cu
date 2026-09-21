@@ -22,7 +22,7 @@ void ckU(cudaError_t e, const char* what)
 __global__ void ddtRhoUKernel(
     const scalar* __restrict__ rho, const scalar* __restrict__ rhoOld,
     const scalar* __restrict__ uox, const scalar* __restrict__ uoy, const scalar* __restrict__ uoz,
-    const scalar* __restrict__ V, int nC, scalar rDeltaT,
+    const scalar* __restrict__ V, const scalar* __restrict__ V0, int nC, scalar rDeltaT,
     scalar* __restrict__ diag,
     scalar* __restrict__ sx, scalar* __restrict__ sy, scalar* __restrict__ sz)
 {
@@ -30,6 +30,19 @@ __global__ void ddtRhoUKernel(
     if (c >= nC) return;
     diag[c] += rDeltaT * rho[c] * V[c];
     // rhoOld, NOT rho. At a VoF interface these differ by the density ratio.
+    // ...and on a MOVING mesh the old-time term belongs to the volume the old-time field was stored
+    // in: EulerDdtScheme's source is rDeltaT*rho.oldTime()*vf.oldTime()*mesh().Vsc0(), where V0 is the
+    // volume BEFORE the move (fvMesh::movePoints stores it). V0 == V on a static mesh, but the
+    // multiplication ORDER differs between the two branches and the host reference keeps both, so
+    // this keeps both too (inter_ueqn_cpp.cuh, addEulerDdtRhoU).
+    if (V0)
+    {
+        const scalar w = rDeltaT * rhoOld[c];
+        sx[c] += w * uox[c] * V0[c];
+        sy[c] += w * uoy[c] * V0[c];
+        sz[c] += w * uoz[c] * V0[c];
+        return;
+    }
     const scalar w = rDeltaT * rhoOld[c] * V[c];
     sx[c] += w * uox[c];
     sy[c] += w * uoy[c];
@@ -88,7 +101,8 @@ void deviceInterEulerDdtRhoU(
     DeviceBuffer<scalar>&       diag,
     DeviceBuffer<scalar>&       srcX,
     DeviceBuffer<scalar>&       srcY,
-    DeviceBuffer<scalar>&       srcZ)
+    DeviceBuffer<scalar>&       srcZ,
+    const DeviceBuffer<scalar>* V0)
 {
     if (deltaT <= scalar(0))
         throw std::runtime_error(
@@ -98,9 +112,14 @@ void deviceInterEulerDdtRhoU(
         throw std::runtime_error(
             "brae interFoam device UEqn: the ddt adds INTO an existing diagonal and source, so both "
             "must already be sized to the cell count -- the div and stress terms are assembled first.");
+    if (V0 && static_cast<int>(V0->size()) != nC)
+        throw std::runtime_error(
+            "brae interFoam device UEqn: the old-time volumes are not this mesh's cells. A mesh move "
+            "must not change the cell count (polyMesh::movePoints keeps the topology fixed).");
     ddtRhoUKernel<<<nBlocks(nC), TPB>>>(
         rho.data(), rhoOld.data(), UOldX.data(), UOldY.data(), UOldZ.data(),
-        dm.V.data(), nC, scalar(1)/deltaT, diag.data(), srcX.data(), srcY.data(), srcZ.data());
+        dm.V.data(), V0 ? V0->data() : nullptr, nC, scalar(1)/deltaT,
+        diag.data(), srcX.data(), srcY.data(), srcZ.data());
     ckU(cudaGetLastError(), "ddt(rho, U)");
 }
 

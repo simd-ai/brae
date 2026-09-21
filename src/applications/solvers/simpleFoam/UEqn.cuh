@@ -100,6 +100,9 @@ struct MomentumInput
 
     const DeviceBuffer<scalar>* ddtRho    = nullptr;
     const DeviceBuffer<scalar>* ddtRhoOld = nullptr;
+    // the cell volumes BEFORE a mesh move (OF fvMesh::movePoints stores them, and EulerDdtScheme's
+    // source is rho.oldTime()*vf.oldTime()*Vsc0()). Null on a static mesh, where Vsc0() is V.
+    const DeviceBuffer<scalar>* ddtV0 = nullptr;
     const DeviceBuffer<scalar>* ddtUOld[3] = {nullptr, nullptr, nullptr};
     scalar ddtDeltaT = 0;
     bool   bounded = false;   // `bounded Gauss <scheme>`: diag -= V*div(phi); see UEqn_cpp.cuh

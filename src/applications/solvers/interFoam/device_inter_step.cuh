@@ -122,6 +122,10 @@ struct DeviceInterStepTaps
 
 struct DeviceInterStepControls
 {
+    // the cell volumes the mesh had BEFORE this step's move, for the ddt's old-time term
+    // (OF EulerDdtScheme: rho.oldTime()*U.oldTime()*Vsc0()). Null on a static mesh.
+    const DeviceBuffer<scalar>* V0 = nullptr;
+
     // The case's MRF zones, built once by the driver (buildDeviceMRFZone). interFoam touches them in
     // three places -- UEqn.H:6 MRF.DDt(rho, U), pEqn.H:18 MRF.zeroFilter(ddtCorr term) and pEqn.H:19
     // MRF.makeRelative(phiHbyA) -- and the fourth, MRF.correctBoundaryVelocity(U) at UEqn.H:1, is the

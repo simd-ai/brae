@@ -435,7 +435,7 @@ void assembleUEqn(
                 "ratio -- so it is a separate argument and cannot be defaulted to the first.");
         deviceInterEulerDdtRhoU(dm, *in.ddtRho, *in.ddtRhoOld,
                                 *in.ddtUOld[0], *in.ddtUOld[1], *in.ddtUOld[2], in.ddtDeltaT,
-                                M.diag, M.source[0], M.source[1], M.source[2]);
+                                M.diag, M.source[0], M.source[1], M.source[2], in.ddtV0);
     }
 
     // ---- UEqn.relax() -----------------------------------------------------------------------
