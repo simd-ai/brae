@@ -314,9 +314,19 @@ RunReport runInterFoamDevice(
         // emptyFvPatch::size() == 0 makes OpenFOAM skip them, and the host must too or every static
         // 2D gate would fail.
         //
-        // THE ONE ARRAY THE DUMP HAS NOT COMPARED is div itself -- deviceDiv's output against the
-        // host's fvc::div, before either is multiplied by V. That is the next tap. Everything else in
-        // this source has been measured and agrees.
+        // div ITSELF NOW AGREES TOO: 8.5265e-14 of 2.4843e+01, pre-V, and V agrees exactly. So does
+        // the laplacian's own source -- the host's is 0.0000e+00, which is what this arm's assembly
+        // assumes when it memsets. Every TERM of that source has now been measured and agrees:
+        //
+        //     phiHbyA (both halves), phig (both halves), div pre-V, V, the laplacian's own source,
+        //     diag/upper/lower, the pressure reference cell and value, and the non-orthogonal
+        //     correction (exact negatives, both arms applying +=)
+        //
+        // and the assembled source still differs by 6.9430e+00 of 3.4921e+03 on one cell. When every
+        // term agrees and the sum does not, the next thing to doubt is the COMPARISON, not another
+        // term: this case runs more than one pressure call per step and both arms' taps are
+        // overwritten on each, so the two may not be from the same corrector. Print the corrector
+        // index beside each tap before reading anything else into these numbers.
         //
         // THE MESH FLUX IS CARRIED NOW (DeviceInterStepControls::meshPhiAll -> the pressure step's
         // fvc::makeRelative at the host's own site), and it is necessary -- the alpha equation must

@@ -814,6 +814,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
             in.taps->jumpHistory.push_back(flatJump);
         }
         FvScalarMatrix pe = fvm::laplacian<scalar>(rAUfField, p_rgh, m, g, patches, sc.correctedLaplacian);
+        if (in.taps && corr == 0) in.taps->pLaplacianSource = pe.source;
         if (sc.correctedLaplacian)
         {
             // gaussLaplacianSchemes.C: source -= V*div(gammaMagSf*snGradCorrection(p_rgh)), the
@@ -835,6 +836,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
                 rAUfField, gradP, g, patches, sc.snGradLimitCoeff, p_rgh);
         }
         const std::vector<scalar> div = fvc::div(phiHbyA, m, g, patches);
+        if (in.taps && corr == 0) in.taps->pDivPhiHbyA = div;
         for (label c = 0; c < nC; ++c) pe.source[c] += div[c] * g.V()[c];
 
         if (sc.needReference)

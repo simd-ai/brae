@@ -116,6 +116,7 @@ struct DeviceInterStepTaps
     DeviceBuffer<scalar> nonOrthSource;
     DeviceBuffer<scalar> phigIntTap;
     DeviceBuffer<scalar> phigBndTap;
+    DeviceBuffer<scalar> divPhiHbyA;
     DeviceBuffer<scalar> phiHbyAIntPrePhig;
     DeviceBuffer<scalar> phiHbyABndPrePhig;
     std::vector<std::vector<scalar>> jumpHistory;

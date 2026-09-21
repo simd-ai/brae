@@ -277,6 +277,13 @@ struct PressureTaps
     // that MOVES this is not a small term: sloshingTank2D's is non-orthogonal by 44 degrees once the
     // tank tilts, and brae refuses `uncorrected` there for exactly that reason.
     std::vector<scalar> pNonOrthSource;
+    // fvc::div(phiHbyA) BEFORE it is multiplied by V -- the last array of the p_rgh source this dump
+    // had not compared. phiHbyA here already carries phig, on both halves.
+    std::vector<scalar> pDivPhiHbyA;
+    // pe.source as fvm::laplacian ITSELF leaves it, before the non-orthogonal correction and before
+    // div(phiHbyA)*V. The device assembly memsets its source to zero at this point, on the stated
+    // assumption that the laplacian's own is zero -- this tap is what tests that assumption.
+    std::vector<scalar> pLaplacianSource;
     // p_rgh's JUMP per patch, as the last assembly left it
     std::vector<std::vector<scalar>> jumpBnd;
     // ...and one entry per ASSEMBLY, flattened over the coupled patches in patch order, so the two

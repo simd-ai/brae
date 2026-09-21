@@ -511,7 +511,8 @@ void deviceInterAssemblePEqn(
     const DeviceBuffer<scalar>* nonOrthSource,
     DeviceCyclic*               cyc,
     const DeviceBuffer<scalar>* rAUCell,
-    const DeviceBuffer<scalar>* phiHbyAIf)
+    const DeviceBuffer<scalar>* phiHbyAIf,
+    DeviceBuffer<scalar>*       divTapOut)
 {
     const int nC = dm.nCells;
 
@@ -535,6 +536,12 @@ void deviceInterAssemblePEqn(
     // == fvc::div(phiHbyA): source += div*V, a PLUS.
     DeviceBuffer<scalar> div(static_cast<std::size_t>(nC));
     deviceDiv(dm, phiHbyAInt, phiHbyABnd, div);
+    if (divTapOut)
+    {
+        divTapOut->resize(static_cast<std::size_t>(nC));
+        ckP(cudaMemcpy(divTapOut->data(), div.data(), sizeof(scalar)*nC, cudaMemcpyDeviceToDevice),
+            "div tap");
+    }
     // ...and the PAIR's phiHbyA, which fvc::div sums into its face cell like any patch's
     // (fvc.cu:548-550). The matrix's own coupling was already here; leaving the SOURCE without the
     // pair's flux is a different equation, not a smaller one -- MEASURED on validation/interFoamCyclic,

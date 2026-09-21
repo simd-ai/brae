@@ -504,6 +504,7 @@ void deviceInterStep(
             deviceCopy(taps->nonOrthSource, pt.nonOrthSource);
             deviceCopy(taps->phigIntTap, pt.phigIntTap);
             deviceCopy(taps->phigBndTap, pt.phigBndTap);
+            deviceCopy(taps->divPhiHbyA, pt.divPhiHbyA);
             deviceCopy(taps->phiHbyAIntPrePhig, pt.phiHbyAIntPrePhig);
             deviceCopy(taps->phiHbyABndPrePhig, pt.phiHbyABndPrePhig);
             deviceCopy(taps->cycJumpTap, pt.cycJumpTap);

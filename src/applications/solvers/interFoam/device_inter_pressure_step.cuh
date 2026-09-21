@@ -179,7 +179,8 @@ struct DevicePressureTaps
     // phiHbyA on the INTERNAL faces before phig, the same point the host's PressureTaps::phiHbyA is
     DeviceBuffer<scalar> nonOrthSource;       // the corrected laplacian's source correction
     DeviceBuffer<scalar> phigIntTap;
-    DeviceBuffer<scalar> phigBndTap;          // phig on the internal faces, as the host taps it
+    DeviceBuffer<scalar> phigBndTap;
+    DeviceBuffer<scalar> divPhiHbyA;   // fvc::div(phiHbyA), before the multiply by V          // phig on the internal faces, as the host taps it
     DeviceBuffer<scalar> phiHbyAIntPrePhig;
     DeviceBuffer<scalar> phiHbyABndPrePhig;
     std::vector<std::vector<scalar>> jumpHistory;   // one entry per assembly
