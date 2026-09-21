@@ -165,6 +165,10 @@ scalar deviceInterPressureStep(
     if (taps)
     {
         deviceCopy(taps->phigIntTap, phigInt);
+        // ...and phig's BOUNDARY half, the last term of div(phiHbyA + phig) this dump had not
+        // compared. A 2D case's largest faces are its EMPTY ones, so a divergence that sums them
+        // differs from one that does not by a lot.
+        deviceCopy(taps->phigBndTap, phigBnd);
         deviceCopy(taps->phiHbyAIntPrePhig, phiHbyAInt);
         // ...AND ITS BOUNDARY HALF. The p_rgh source is div(phiHbyA), which sums the boundary faces
         // too, so comparing only the internal ones can show agreement while the source differs -- on

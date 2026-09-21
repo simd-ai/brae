@@ -115,6 +115,7 @@ struct DeviceInterStepTaps
     // phiHbyA on the internal faces BEFORE phig -- the host's PressureTaps::phiHbyA is at that point
     DeviceBuffer<scalar> nonOrthSource;
     DeviceBuffer<scalar> phigIntTap;
+    DeviceBuffer<scalar> phigBndTap;
     DeviceBuffer<scalar> phiHbyAIntPrePhig;
     DeviceBuffer<scalar> phiHbyABndPrePhig;
     std::vector<std::vector<scalar>> jumpHistory;

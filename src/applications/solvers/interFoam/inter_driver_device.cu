@@ -300,9 +300,23 @@ RunReport runInterFoamDevice(
         // adjustPhi moves something, and this loop only reaches that path where every patch fixes its
         // flux, where adjustPhi is a no-op (massCorr stays 1).
         //
-        // WHAT IS LEFT is div(phiHbyA + phig) itself. The internal halves of both agree and phiHbyA's
-        // boundary agrees exactly; phig's BOUNDARY half is the one thing in that divergence this dump
-        // has not compared yet. That is the next tap, not another guess.
+        // EVERY TERM ENTERING THAT SOURCE NOW AGREES, measured:
+        //     phiHbyA internal 8.9e-16   phiHbyA BOUNDARY 0.0e+00 (exact)
+        //     phig internal    7.8e-14   phig BOUNDARY    3.1e-16 of a 2.2e-16 scale (both zero)
+        //     pEqn diag 2.1e-17, upper 1.0e-17, lower 1.0e-17
+        //     the pressure reference: BOTH arms resolve pRefPoint (0 0 0.15) to cell 459, value 1e5
+        //     the non-orthogonal correction: cleared (see above -- the taps are negatives by design,
+        //     and taking each arm's own back out leaves the difference unchanged)
+        // and the source still differs by 6.9430e+00 of 3.4921e+03, on ONE cell (200).
+        //
+        // The empty patches are not it either: a 2D mesh's largest faces are its empty ones, but the
+        // device's divKernel skips them (device_fvc.cu, `if (bndIsEmpty[bk]) continue`) as
+        // emptyFvPatch::size() == 0 makes OpenFOAM skip them, and the host must too or every static
+        // 2D gate would fail.
+        //
+        // THE ONE ARRAY THE DUMP HAS NOT COMPARED is div itself -- deviceDiv's output against the
+        // host's fvc::div, before either is multiplied by V. That is the next tap. Everything else in
+        // this source has been measured and agrees.
         //
         // THE MESH FLUX IS CARRIED NOW (DeviceInterStepControls::meshPhiAll -> the pressure step's
         // fvc::makeRelative at the host's own site), and it is necessary -- the alpha equation must
