@@ -52,6 +52,15 @@ struct DeviceMulesFields
     const scalar* Su     = nullptr;   // null == 0
     const scalar* psiMax = nullptr;   // null == 1
     const scalar* psiMin = nullptr;   // null == 0
+
+    // A MOVING MESH: mesh.Vsc() and mesh.Vsc0(), the cell volumes at the end and at the start of the
+    // (sub-)step -- the host's MULES::Fields carries the same pair (mules_cpp.cuh:103-109). Null ==
+    // a mesh that does not move, where Vsc is the mesh's V and the old volume is V as well. BOTH OR
+    // NEITHER: the limiter's budgets take the old volume outside the bracket (MULESTemplates.C:
+    // 397-417) and every surfaceIntegrate divides by Vsc (fvcSurfaceIntegrate.C:77), so half the
+    // pair is a third scheme that is neither OpenFOAM's moving form nor its fixed one.
+    const DeviceBuffer<scalar>* Vsc  = nullptr;   // null == dm.V
+    const DeviceBuffer<scalar>* Vsc0 = nullptr;   // null == dm.V
 };
 
 // phiBD = upwind(phi).flux(psi), with the boundary OVERWRITTEN by phiPsi on every non-coupled patch --

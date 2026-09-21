@@ -83,7 +83,8 @@ __global__ void setupKernel(
     const scalar* __restrict__ psiBndValue,
     const scalar* __restrict__ phiBD,    const scalar* __restrict__ phiBDBnd,
     const scalar* __restrict__ phiCorr,  const scalar* __restrict__ phiCorrBnd,
-    const scalar* __restrict__ V,
+    const scalar* __restrict__ V,        // mesh.Vsc()
+    const scalar* __restrict__ V0,       // mesh.Vsc0(); null on a mesh that does not move
     const scalar* __restrict__ rho, const scalar* __restrict__ rhoOld,
     const scalar* __restrict__ Sp,  const scalar* __restrict__ Su,
     const scalar* __restrict__ psiMaxF, const scalar* __restrict__ psiMinF,
@@ -181,8 +182,20 @@ __global__ void setupKernel(
 
     // ...into flux-space budgets (MULESTemplates.C:418-436, the fixed-mesh branch).
     const scalar a = at(rho, c, scalar(1))*rDeltaT - at(Sp, c, scalar(0));
-    const scalar b = at(rhoOld, c, scalar(1))*rDeltaT*psiOld[c];
     const scalar SuC = at(Su, c, scalar(0));
+    if (V0)
+    {
+        // MULESTemplates.C:397-417, the MOVING branch: the old value's term carries the OLD volume
+        // and stands OUTSIDE the bracket. Written as the host writes it (mules_cpp.cu:232-238) so the
+        // two contract the same multiply-adds.
+        const scalar b = (V0[c]*rDeltaT)*at(rhoOld, c, scalar(1))*psiOld[c];
+        psiMaxn[c]  = V[c]*(a*mx - SuC) - b + sBD;
+        psiMinn[c]  = V[c]*(SuC - a*mn) + b - sBD;
+        sumPhip[c]  = sP;
+        mSumPhim[c] = mSP;
+        return;
+    }
+    const scalar b = at(rhoOld, c, scalar(1))*rDeltaT*psiOld[c];
     psiMaxn[c]  = V[c]*(a*mx - SuC - b) + sBD;
     psiMinn[c]  = V[c]*(SuC - a*mn + b) - sBD;
     sumPhip[c]  = sP;
@@ -326,13 +339,18 @@ __global__ void explicitSolveKernel(
     const scalar* __restrict__ psiOld, const scalar* __restrict__ divPhiPsi,
     const scalar* __restrict__ rho, const scalar* __restrict__ rhoOld,
     const scalar* __restrict__ Sp, const scalar* __restrict__ Su,
+    const scalar* __restrict__ V,        // mesh.Vsc(), read only on a moving mesh
+    const scalar* __restrict__ V0,       // mesh.Vsc0(); null on a mesh that does not move
     int nC, scalar rDeltaT, scalar* __restrict__ psi)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
     // rho.oldTime() in the numerator and rho in the denominator -- not the same field on a VoF
     // interface, where the two differ by the density ratio in every cell the interface crossed.
-    const scalar num = at(rhoOld, c, scalar(1))*psiOld[c]*rDeltaT + at(Su, c, scalar(0)) - divPhiPsi[c];
+    // ON A MOVING MESH the old value is weighted by Vsc0/Vsc as well (MULESTemplates.C:60-68).
+    const scalar old = V0 ? V0[c]*at(rhoOld, c, scalar(1))*psiOld[c]*rDeltaT/V[c]
+                          : at(rhoOld, c, scalar(1))*psiOld[c]*rDeltaT;
+    const scalar num = old + at(Su, c, scalar(0)) - divPhiPsi[c];
     const scalar den = at(rho, c, scalar(1))*rDeltaT - at(Sp, c, scalar(0));
     psi[c] = num / den;
 }
@@ -545,7 +563,8 @@ void deviceMulesExplicitSolve(
     const DeviceBuffer<scalar>* phiPsiIf)
 {
     DeviceBuffer<scalar> divPhiPsi(dm.nCells);
-    deviceDiv(dm, phiPsiInt, phiPsiBnd, divPhiPsi);
+    // fvc::surfaceIntegrate divides by mesh.Vsc(), not mesh.V() (fvcSurfaceIntegrate.C:77)
+    deviceDiv(dm, phiPsiInt, phiPsiBnd, divPhiPsi, f.Vsc);
     // ...and the PAIR's flux, which fvc::div sums into its face cell like any patch's (fvc.cu:548-550)
     // and which the device mesh's boundary gather does not contain. Without it a periodic face carries
     // no alpha at all: the divergence is that of a mesh with a wall there.
@@ -558,11 +577,12 @@ void deviceMulesExplicitSolve(
                 "over. fvc::div sums a coupled patch's flux into its face cell; dropping it is a wall.");
         }
         DeviceCyclic tmp;   // deviceCyclicAddDiv reads phi from the interface itself
-        deviceCyclicAddDivFlux(*cyc, *phiPsiIf, dm.V, divPhiPsi);
+        deviceCyclicAddDivFlux(*cyc, *phiPsiIf, f.Vsc ? *f.Vsc : dm.V, divPhiPsi);
     }
     psi.resize(static_cast<std::size_t>(dm.nCells));
     explicitSolveKernel<<<nBlocks(dm.nCells), TPB>>>(
         psiOld.data(), divPhiPsi.data(), f.rho, f.rhoOld, f.Sp, f.Su,
+        f.Vsc ? f.Vsc->data() : dm.V.data(), f.Vsc0 ? f.Vsc0->data() : nullptr,
         dm.nCells, rDeltaT, psi.data());
     ckM(cudaGetLastError(), "explicit solve");
 }
@@ -675,7 +695,8 @@ void deviceMulesLimiter(
         bndFlag.data(), bndFixesValue.data(),
         psi.data(), psiOld.data(), psiBndValue.data(),
         phiBDInt.data(), phiBDBnd.data(), phiCorrInt.data(), phiCorrBnd.data(),
-        dm.V.data(), f.rho, f.rhoOld, f.Sp, f.Su, f.psiMax, f.psiMin,
+        f.Vsc ? f.Vsc->data() : dm.V.data(), f.Vsc0 ? f.Vsc0->data() : nullptr,
+        f.rho, f.rhoOld, f.Sp, f.Su, f.psiMax, f.psiMin,
         nIf2 ? cyc->ifCellStart.data() : nullptr, nIf2 ? cyc->ifPerm.data() : nullptr,
         nIf2 ? cyc->nbrCell.data() : nullptr,
         nIf2 ? phiBDIf->data() : nullptr, nIf2 ? phiCorrIf->data() : nullptr,
@@ -793,7 +814,7 @@ void deviceMulesLimiterCorr(
         psi.data(), psiBndValue.data(), phiCorrInt.data(), phiCorrBnd.data(),
         nIfC ? cyc->ifCellStart.data() : nullptr, nIfC ? cyc->ifPerm.data() : nullptr,
         nIfC ? cyc->nbrCell.data() : nullptr,     nIfC ? phiCorrIf->data() : nullptr,
-        dm.V.data(), f.rho, f.Sp, f.Su, f.psiMax, f.psiMin,
+        f.Vsc ? f.Vsc->data() : dm.V.data(), f.rho, f.Sp, f.Su, f.psiMax, f.psiMin,
         rDeltaT, c.extremaCoeff, boundaryDelta, c.smoothLimiter,
         psiMaxn.data(), psiMinn.data(), sumPhip.data(), mSumPhim.data());
     ckM(cudaGetLastError(), "CMULES setup");
@@ -906,7 +927,8 @@ void deviceMulesCorrect(
     const DeviceBuffer<scalar>* phiCorrIf)
 {
     DeviceBuffer<scalar> divPhiCorr(dm.nCells);
-    deviceDiv(dm, phiCorrInt, phiCorrBnd, divPhiCorr);
+    // ...by mesh.Vsc() again (fvcSurfaceIntegrate.C:77)
+    deviceDiv(dm, phiCorrInt, phiCorrBnd, divPhiCorr, f.Vsc);
     // ...and the pair's correction, which surfaceIntegrate sums into its face cell like any patch's
     // (fvc.cu:548-550). Leaving it out is the same wall the explicit solve's divergence would build.
     if (cyc && cyc->n > 0)
@@ -917,7 +939,7 @@ void deviceMulesCorrect(
                 "brae deviceMules (CMULES correct): the mesh has a periodic pair and its limited "
                 "correction was not handed over. It is summed into the cells like any patch's.");
         }
-        deviceCyclicAddDivFlux(*cyc, *phiCorrIf, dm.V, divPhiCorr);
+        deviceCyclicAddDivFlux(*cyc, *phiCorrIf, f.Vsc ? *f.Vsc : dm.V, divPhiCorr);
     }
     correctKernel<<<nBlocks(dm.nCells), TPB>>>(
         divPhiCorr.data(), f.rho, f.Sp, f.Su, dm.nCells, rDeltaT, psi.data());

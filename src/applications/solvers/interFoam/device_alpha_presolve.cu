@@ -29,12 +29,21 @@ void ckP(cudaError_t e, const char* what)
 //     source += V*alpha.oldTime()/dt
 // The source is BUILT here rather than added to an existing one because Su is zeroField for interFoam
 // -- there is nothing else in it.
-__global__ void eulerDdtKernel(const scalar* __restrict__ V, const scalar* __restrict__ psiOld,
+__global__ void eulerDdtKernel(const scalar* __restrict__ V,      // mesh.Vsc()
+                               const scalar* __restrict__ V0,     // mesh.Vsc0(), null if not moving
+                               const scalar* __restrict__ psiOld,
                                int nC, scalar rDeltaT,
                                scalar* __restrict__ diag, scalar* __restrict__ source)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
+    if (V0)
+    {
+        // the moving branch, in the host's own order (alpha_eqn_cpp.cu:497-501)
+        diag[c]  += rDeltaT * V[c];
+        source[c] = rDeltaT * psiOld[c] * V0[c];
+        return;
+    }
     diag[c]  += rDeltaT * V[c];
     source[c] = rDeltaT * V[c] * psiOld[c];
 }
@@ -67,7 +76,9 @@ scalar deviceAlphaPreSolve(
     DeviceBuffer<scalar>&         alphaPhi10Bnd,
     DeviceSolverPerf*             perfOut,
     DeviceCyclic*                 cyc,
-    DeviceBuffer<scalar>*         alphaPhi10If)
+    DeviceBuffer<scalar>*         alphaPhi10If,
+    const DeviceBuffer<scalar>*   Vsc,
+    const DeviceBuffer<scalar>*   Vsc0)
 {
     const int nC  = dm.nCells;
     const int nIf = dm.nInternalFaces;
@@ -94,7 +105,9 @@ scalar deviceAlphaPreSolve(
     }
 
     DeviceBuffer<scalar> source(static_cast<std::size_t>(nC));
-    eulerDdtKernel<<<nBlocks(nC), TPB>>>(dm.V.data(), alpha1Old.data(), nC, scalar(1)/deltaT,
+    eulerDdtKernel<<<nBlocks(nC), TPB>>>(Vsc ? Vsc->data() : dm.V.data(),
+                                         Vsc0 ? Vsc0->data() : nullptr,
+                                         alpha1Old.data(), nC, scalar(1)/deltaT,
                                          rawDiag.data(), source.data());
     ckP(cudaGetLastError(), "Euler ddt");
 

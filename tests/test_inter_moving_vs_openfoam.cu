@@ -165,7 +165,11 @@ int main(
     // both arms MOVE the one they are handed, so sharing would make the host's motion the device's
     // initial condition and every number after that fiction. What this profile does NOT cover is the
     // case's own pressure solver -- see the staging note in interfoam_moving_vs_openfoam.sh.
-    const bool deviceArm = (profile == "mixerDevice");
+    // THE PROFILES THAT RUN BOTH ARMS. `mixerDevice` is the mixer with its pressure solver staged to
+    // one the device runs natively (the staging script says what that leaves out); `solitary` is the
+    // deforming-mesh paddle AS SHIPPED -- its p_rgh and pcorr are already PCG with DIC, so nothing is
+    // staged away there and the device arm runs the tutorial's own fvSolution.
+    const bool deviceArm = (profile == "mixerDevice" || profile == "solitary");
     PrimitiveMesh mD;
     FvGeometry gD;
     std::vector<FvPatch> patchesD;

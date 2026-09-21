@@ -119,12 +119,21 @@ void deviceInterAlphaStep(
 
     // which sub-cycle this is, 1-based -- the wave conditions' clock
     int subCycle = 0;
+    // ...and the volumes it runs on, refilled per sub-cycle on a mesh that moves
+    DeviceBuffer<scalar> VscBuf, Vsc0Buf;
     DeviceAlphaEqnStep step =
         [&](const DeviceBuffer<scalar>& subOld, scalar dtSub, DeviceBuffer<scalar>& alpha,
             DeviceBuffer<scalar>& rpInt, DeviceBuffer<scalar>& rpBnd)
     {
         ++subCycle;
         DeviceAlphaStepInput li = in;
+        // the volumes THIS sub-cycle runs on, before anything reads them
+        if (hooks.subCycleVolumes)
+        {
+            hooks.subCycleVolumes(subCycle, VscBuf, Vsc0Buf);
+            li.Vsc  = &VscBuf;
+            li.Vsc0 = &Vsc0Buf;
+        }
         li.nHatfIf = (in.cyc && in.cyc->n > 0) ? &nHatfIfBuf : nullptr;
         li.deltaT    = dtSub;
         li.MULESCorr = ctl.MULESCorr;
@@ -156,7 +165,8 @@ void deviceInterAlphaStep(
             hooks.divCoeffs(alpha, iC, bC);
             DeviceSolverPerf pre;
             deviceAlphaPreSolve(dm, alpha, subOld, *li.phiCNInt, iC, bC, dtSub, ctl.preSolve,
-                                alphaPhiInt, alphaPhiBnd, &pre, li.cyc, li.alphaPhiIf);
+                                alphaPhiInt, alphaPhiBnd, &pre, li.cyc, li.alphaPhiIf,
+                                li.Vsc, li.Vsc0);
             if (ctl.preSolveLog)
             {
                 ctl.preSolveLog->push_back(pre);

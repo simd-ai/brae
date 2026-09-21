@@ -81,6 +81,16 @@ struct DeviceInterAlphaHooks
         int subCycle,
         const DeviceBuffer<scalar>& alpha1,
         DeviceBuffer<scalar>& alpha1Bnd)> updateModelledBoundary;
+
+    // fvMesh::Vsc() and Vsc0() at the clock of the sub-cycle it is called in (1-based), filled into
+    // the two buffers the step then hands MULES and the pre-solve. A sub-cycle is its own time index
+    // to OpenFOAM, and Vsc interpolates between V0 and V by where in the step that index falls
+    // (fvMeshGeometry.C) -- so the volumes change WITHIN a step, which is why this is a call and not
+    // a pair of pointers. Null on a mesh that does not move, where Vsc is V and Vsc0 is V.
+    std::function<void(
+        int subCycle,
+        DeviceBuffer<scalar>& Vsc,
+        DeviceBuffer<scalar>& Vsc0)> subCycleVolumes;
 };
 
 struct DeviceInterAlphaControls

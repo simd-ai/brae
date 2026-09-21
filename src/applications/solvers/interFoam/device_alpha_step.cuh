@@ -102,6 +102,12 @@ struct DeviceAlphaStepInput
     // corrector onward (alphaEqn.H:195-205), and it is the caller's loop index rather than a scalar
     // because the 0.5 is OpenFOAM's number and not a tunable.
     int aCorr = 0;
+
+    // A MOVING MESH: mesh.Vsc() and mesh.Vsc0() at this sub-cycle's clock -- the volumes MULES limits
+    // and solves with and the pre-solve's fvm::ddt takes (fvMeshGeometry.C, MULESTemplates.C:248 and
+    // :397-417, fvcSurfaceIntegrate.C:77). Null == a mesh that does not move; both or neither.
+    const DeviceBuffer<scalar>* Vsc  = nullptr;
+    const DeviceBuffer<scalar>* Vsc0 = nullptr;
 };
 
 // alpha1's boundary, evaluated by the caller. `nHatf` is the interface flux the previous

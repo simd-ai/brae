@@ -98,6 +98,11 @@ scalar deviceAlphaPreSolve(
     // upwind coefficients is phi*(the upwind cell's alpha) -- internalCoeffs*pif - boundaryCoeffs*pnf
     // with w = pos0(phi) reduces to exactly that, which is why it is the donor-flux kernel.
     DeviceCyclic*                 cyc = nullptr,
-    DeviceBuffer<scalar>*         alphaPhi10If = nullptr);
+    DeviceBuffer<scalar>*         alphaPhi10If = nullptr,
+    // A MOVING MESH: fvm::ddt takes mesh.Vsc() on the diagonal and mesh.Vsc0() in the source
+    // (EulerDdtScheme.C:383-392). Null == a mesh that does not move, where both are dm.V. Both or
+    // neither, for the reason DeviceMulesFields gives.
+    const DeviceBuffer<scalar>*   Vsc = nullptr,
+    const DeviceBuffer<scalar>*   Vsc0 = nullptr);
 
 } // namespace brae

@@ -294,11 +294,13 @@ void deviceInterpolate(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol, De
 }
 
 
-void deviceDiv(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& bval, DeviceBuffer<scalar>& d)
+void deviceDiv(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& bval, DeviceBuffer<scalar>& d,
+               const DeviceBuffer<scalar>* V)
 {
     d.resize(dm.nCells);
     divKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
-                                           phiInt.data(), dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), bval.data(), dm.V.data(), d.data());
+                                           phiInt.data(), dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), bval.data(),
+                                           V ? V->data() : dm.V.data(), d.data());
     cudaCheck(cudaGetLastError(), "div");
 }
 

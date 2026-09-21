@@ -253,7 +253,11 @@ inline std::vector<scalar> flattenBoundary(const std::vector<std::vector<scalar>
 }
 
 void deviceInterpolate(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol, DeviceBuffer<scalar>& sfInt);
-void deviceDiv(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& bval, DeviceBuffer<scalar>& d);
+// fvc::surfaceIntegrate divides by mesh.Vsc(), which is mesh.V() unless the mesh MOVES and the caller
+// is inside a sub-cycle (fvcSurfaceIntegrate.C:77, fvMeshGeometry.C). Pass that volume as `V` there;
+// null takes dm.V, which is every static-mesh caller.
+void deviceDiv(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& bval, DeviceBuffer<scalar>& d,
+               const DeviceBuffer<scalar>* V = nullptr);
 void deviceGaussGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol, const DeviceBuffer<scalar>& bval,
                      DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz,
                      const int* skipIf = nullptr);

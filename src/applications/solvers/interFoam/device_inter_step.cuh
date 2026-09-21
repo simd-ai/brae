@@ -143,6 +143,11 @@ struct DeviceInterStepControls
     // ...and where the pressure step leaves the ABSOLUTE flux for the driver's fvc::correctUf.
     DeviceBuffer<scalar>* phiAbsIntOut = nullptr;
     DeviceBuffer<scalar>* phiAbsBndOut = nullptr;
+    // ...and rAU, which is not this loop's to keep but the NEXT mesh update's: under `correctPhi`
+    // CorrectPhi is solved with fvc::interpolate(rAU) of the LAST corrector (correctPhi.H, and
+    // interFoam.C:138), and that call is a host one on either arm. Null when the caller does not
+    // need it, which is every case with a mesh that does not move.
+    DeviceBuffer<scalar>* rAUOut = nullptr;
 
     // The case's MRF zones, built once by the driver (buildDeviceMRFZone). interFoam touches them in
     // three places -- UEqn.H:6 MRF.DDt(rho, U), pEqn.H:18 MRF.zeroFilter(ddtCorr term) and pEqn.H:19

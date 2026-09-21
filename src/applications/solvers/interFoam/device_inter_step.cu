@@ -400,6 +400,8 @@ void deviceInterStep(
         }
         gpu::pressurePredictor(st, dm, dbU, UEqn, UX, UY, UZ, pin, nullptr, nullptr);
         probe("rAU", st.rAU);
+        // the next mesh update's CorrectPhi reads this on the host; see DeviceInterStepControls
+        if (ctl.rAUOut) deviceCopy(*ctl.rAUOut, st.rAU);
         probe("HbyA.x", st.HbyA[0]);
         probe("phiHbyA", st.phiHbyAInt);
         if (taps && corr == 0)

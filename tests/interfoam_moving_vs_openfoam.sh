@@ -118,7 +118,31 @@
 #                  case whose cells CHANGE VOLUME -- displacementLaplacian from a solitary-wave paddle --
 #                  under correctPhi (its default), with an absorbing waveVelocity outlet and a
 #                  totalPressure atmosphere; an OPEN tank, so no reference; the control holds its mesh
-#                  still
+#                  still. BOTH ARMS: the tutorial's p_rgh and pcorr are PCG with DIC, which the device
+#                  runs natively, so unlike mixerDevice NOTHING is staged away for it -- the device arm
+#                  runs the case's own fvSolution. What it does not cover is the tolerance those solves
+#                  are given: 1e-6 with relTol 0, the tutorial's own, which is where two Krylov
+#                  implementations stop rather than what they discretise -- though on this case it is
+#                  not what separates the arms: tightened to 1e-13/relTol 0 the device moved from
+#                  8.4e-10 to 8.4e-10 in alpha, and the three defects below were found instead.
+#                  MEASURED, device against OpenFOAM: alpha 2.9e-12, p_rgh 3.3e-13, U 2.2e-11, Uf
+#                  2.5e-11, the paddle's wall velocity 1.1e-14 -- the host arm's own distances being
+#                  2.9e-12, 3.3e-13, 1.8e-10 and 2.2e-10, which is what the device checks are bounded
+#                  by. Both arms end on the same mesh.
+#                  BROKEN ONCE EACH, on the device arm -- all three are DEFORMING-MESH defects that the
+#                  solid-body mixer cannot see, because there V == V0 and Vsc == V:
+#                    mesh.V() in mesh.Vsc()'s and Vsc0()'s place, in MULES' limiter budgets, its
+#                    explicit solve, every surfaceIntegrate and the pre-solve's fvm::ddt
+#                    (MULESTemplates.C:248 and :397-417, fvcSurfaceIntegrate.C:77, EulerDdtScheme.C:
+#                    383-392)                                    alpha 2.6e-03, U 5.1e-02, Uf 5.7e-02
+#                    rAU left at the value createFields wrote, where the NEXT mesh update solves
+#                    CorrectPhi with fvc::interpolate(rAU) of the LAST corrector (interFoam.C:138)
+#                                                                alpha 2.5e-02, U 3.9e-01, Uf 3.9e-01
+#                    mixture.correct() on the MOVED mesh not carried to the device, so the alpha
+#                    equation convected with the interface normal of the mesh as it stood BEFORE the
+#                    move (interFoam.C:141)                       alpha 8.4e-10, U 7.6e-09, Uf 5.6e-09
+#                  THE LAST ONE IS WHY THE DEVICE CHECKS ARE BOUNDED BY THE HOST ARM AND NOT BY A FIXED
+#                  NUMBER: at alpha 8.4e-10 and U 7.6e-09 it passes every fixed bound on this page.
 #
 # CORRECTPHI, BROKEN ONCE EACH (the three *CorrectPhi tanks; closedDamBreakInitU where it says so):
 #   correctUphiBCs skipped -- phi on the walls left at Sf & Uf       adjustPhi STOPS THE RUN on all three

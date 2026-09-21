@@ -193,6 +193,8 @@ void deviceAlphaCorrector(
     DeviceBuffer<scalar> phiBDInt, phiBDBnd, corrInt, corrBnd, lamInt, lamBnd;
     DeviceBuffer<scalar> unInt, unBnd, alpha10;
     DeviceMulesFields mf;                       // all null: rho == 1, Sp == Su == 0, bounds [0,1]
+    mf.Vsc  = in.Vsc;                           // ...except the volumes of a mesh that moves
+    mf.Vsc0 = in.Vsc0;
 
     // phic = cAlpha*|phi/magSf|, zeroed on every non-coupled boundary face.
     // THE COMPRESSION ON A PERIODIC PAIR. OpenFOAM zeroes phic on every UNCOUPLED patch and leaves a

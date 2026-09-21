@@ -594,6 +594,27 @@ RunReport runInterFoamDevice(
             aBnd.copyFrom(patchValues(f.alpha1, fvp));
         };
     }
+    if (dyn)
+    {
+        // fvMesh::Vsc() and Vsc0() at this sub-cycle's clock, from the SAME call the host loop makes
+        // (inter_driver_cpp.cu:514-532). On a mesh whose cells change volume these are not V: the
+        // deforming-mesh tutorial reads alpha 1.8e-02 and U 5.8e-02 against the host arm with V in
+        // their place, after five steps.
+        H.alpha.subCycleVolumes =
+            [&](int subCycle, DeviceBuffer<scalar>& Vsc, DeviceBuffer<scalar>& Vsc0)
+        {
+            SubCycleTimeState ts;
+            ts.subCycling = f.alphaCtl.nAlphaSubCycles > 1;
+            const SubCycleClock clock = subCycleClock(stepTime, stepDeltaT, stepIndex,
+                                                      f.alphaCtl.nAlphaSubCycles, subCycle);
+            ts.value   = clock.t;
+            ts.deltaT  = stepDeltaT / static_cast<scalar>(f.alphaCtl.nAlphaSubCycles);
+            ts.value0  = stepTime;
+            ts.deltaT0 = stepDeltaT;
+            Vsc.copyFrom(dyn->Vsc(ts));
+            Vsc0.copyFrom(dyn->Vsc0(ts));
+        };
+    }
     H.alpha.divCoeffs =
         [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC)
     {
@@ -1298,6 +1319,9 @@ RunReport runInterFoamDevice(
     // one line before makeRelative turns it relative (pEqn.H:66 and :69).
     DeviceBuffer<scalar> dPhiAbsI, dPhiAbsB;
     SurfaceScalarField phiAbs;
+    // ...and rAU, which the NEXT step's mesh update solves CorrectPhi with (interFoam.C:138,
+    // correctPhi.H) on a case that asks for it
+    DeviceBuffer<scalar> dRAU;
 
     RunReport rep;
     rep.pcorrSolves = initPcorrSolves;
@@ -1439,6 +1463,15 @@ RunReport runInterFoamDevice(
                 {
                     dPhiI.copyFrom(f.phi.internal);
                     dPhiB.copyFrom(flattenPatches(f.phi.boundary, fvp));
+                    // ...and mixture.correct() ON THE MOVED MESH, which interFoam.C:141 runs inside
+                    // this same `if (correctPhi)` and interMeshUpdate has just done on the host. The
+                    // alpha equation below reads nHatf at the TOP of its first corrector, before any
+                    // mixture.correct() of its own, so the device would otherwise convect with the
+                    // interface normal of the mesh as it stood BEFORE the move. K is left to the
+                    // alpha step, whose own mixture.correct() rewrites it before the pressure
+                    // corrector reads it.
+                    dNH.copyFrom(f.nHatf.internal);
+                    dNHB.copyFrom(flattenPatches(f.nHatf.boundary, fvp));
                 }
                 // ...and THE MESH FLUX the move produced, which the pressure corrector makes phi
                 // relative to (fvc::makeRelative, pEqn.H:73). Over the full face array, as phi is.
@@ -1446,6 +1479,7 @@ RunReport runInterFoamDevice(
                 C.meshPhiAll = &dMeshPhi;
                 C.phiAbsIntOut = &dPhiAbsI;
                 C.phiAbsBndOut = &dPhiAbsB;
+                C.rAUOut       = &dRAU;
                 // ...and (Sf & Uf.oldTime()), the flux ddtCorr takes in phi.oldTime()'s place, on
                 // the mesh AS IT STANDS NOW. fvcDdtUfCorr dots the STORED old Uf with mesh().Sf()
                 // (EulerDdtScheme.C:527-531), which the move above has just changed, so this cannot
@@ -1592,6 +1626,11 @@ RunReport runInterFoamDevice(
                 dPhiAbsI.copyTo(phiAbs.internal);
                 unflatten(dPhiAbsB, phiAbs.boundary);
                 correctUf(f.Uf, f.U, phiAbs, m, g, fvp);
+                // ...and rAU, for the same reason and with the same blindness: the NEXT mesh update
+                // interpolates it for CorrectPhi's laplacian, and nothing THIS step does reads it.
+                // Left at the value buildInterFields wrote, step one is exact (both arms start there)
+                // and step two is 2.3e-02 of |U| on waveMakerSolitary.
+                if (dRAU.size()) dRAU.copyTo(f.rAU);
             }
         }   // the outer corrector loop
 
