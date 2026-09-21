@@ -67,20 +67,30 @@
 //   |U| (nOuterCorrectors 2)        3.6174e-09      4.2732e-10
 //   p_rgh off the pair              2.4990e-07      4.5493e-09
 //
-// WHAT IS STILL MISSING is the other half of the same term: deviceCyclicAddLinUpwindCorr --
-// linearUpwind's deferred correction across a pair, whose own header says it needs a "cyclic-inclusive"
-// gradient -- has NO caller anywhere in the tree, and this case asks for it by name
-// (`div(rhoPhi,U) Gauss linearUpwind grad(U)`). The residual now sits ON the pair's cells, 5.0595e-06
-// against 4.8004e-11 elsewhere, which is that term's signature.
+// THE OTHER HALF was deviceCyclicAddLinUpwindCorr -- linearUpwind's deferred correction across a pair,
+// which this case asks for by name (`div(rhoPhi,U) Gauss linearUpwind grad(U)`). The kernel had been in
+// the tree since the legacy driver and had NO caller anywhere; it now runs from the same loop, weighted
+// by the flux the matrix was assembled with (rhoPhi, not the interface's volumetric phi). With both
+// halves wired the two arms agree at round-off on this tutorial:
+//
+//                          original      + grad(U)     + correction
+//   |U| (nOuterCorrectors 3)  4.0292e-09    5.0309e-10    5.7543e-14
+//   p_rgh                     2.8607e-07    1.7967e-08    1.9588e-10
+//   momentum source           6.7058e-11    6.7482e-12    1.0719e-15
 //
 // THE ORDER MATTERS, and a measurement settled it: wiring the correction on top of the non-cyclic
 // gradient made the pair's cells WORSE, 4.8067e-05 to 1.0909e-04, while every other cell stayed at
 // 5.3135e-05. The gradient had to come first.
 //
-// THESE BOUNDS CANNOT SEE ANY OF IT. Twenty steps at the case's own tolerances measure the trajectory:
-// the device numbers below read alpha 4.9021e-05 and U 1.1369e-02 both with and without the gradient
-// fix, to every digit. tests/interfoam_wallfn_cyclic_vs_openfoam.sh gates it on a pinned single step
-// instead, and that is where it must be tightened when the correction lands.
+// BOTH HALVES MOVE THESE BOUNDS, and cyclicWet's p_rgh measures each of them:
+//
+//   neither wired   1.2403e-02      grad(U) only   1.1460e-03      both   7.5004e-06
+//
+// so the bounds below are retightened around what the arm now measures. They are NOT this unit's
+// discriminating control, though: the floor across the five profiles is set by cyclicWetExplicit, and
+// removing the coupled correction alone leaves every profile inside them. What holds both halves is
+// tests/interfoam_wallfn_cyclic_vs_openfoam.sh, on a pinned single step, where the device reaches the
+// host's own distance from OpenFOAM and either half's removal is orders away.
 //
 // WHAT LOOKED LIKE A SECOND GAP HERE WAS THE REPORT, not the solve: the device printed worst |div(phi)|
 // 2.875e-01 against the host's 7.932e-05 with max|U| agreeing to every digit, because the report read
@@ -128,15 +138,15 @@ struct Bounds
     scalar jump;
     // THE DEVICE ARM'S, and they are NOT at round-off -- see the note at the head of this file. They
     // are set at about 3x what this arm measures, tight enough that the things they gate move them:
-    // with the pair dropped from the closure k reads 4.8e-01 against the 8.1e-04 here, and with the
-    // pair left in a wall-function-constrained row (the setValues defect below) epsilon reads 1.6e-02
-    // against 8.5e-04. The device arm's numbers are now the HOST closure's, to every digit printed.
-    scalar alphaDev = 1e-02;
-    scalar prghDev = 4e-02;
-    scalar UDev = 7e-02;
-    scalar kDev = 8e-03;
-    scalar epsDev = 1.1e-02;
-    scalar nutDev = 2.6e-03;
+    // with the pair dropped from the closure k reads 4.8e-01 against the 8.1e-04 here; with the pair
+    // left in a wall-function-constrained row epsilon reads 1.6e-02 against 8.5e-04; and with
+    // linearUpwind's coupled correction left out, cyclicWet's p_rgh reads 1.2403e-02 against 7.5e-06.
+    scalar alphaDev = 6e-03;
+    scalar prghDev = 1.7e-03;
+    scalar UDev = 8e-03;
+    scalar kDev = 2.5e-03;
+    scalar epsDev = 4.6e-03;
+    scalar nutDev = 7e-04;
 };
 const Bounds CYCLIC{2e-13, 2e-13, 1.5e-12, 6e-13, 1.5e-12, 4e-13, 0};
 const Bounds POROUS{3e-13, 3e-13, 3e-11, 2e-11, 2e-11, 1.5e-12, 5e-11};

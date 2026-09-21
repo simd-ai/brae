@@ -216,19 +216,18 @@ int main(int argc, char** argv)
                     "(wall-touching / not, |U| up to %.4e)\n",
                     (double)hUw.first, (double)hUf.first, (double)dUw.first, (double)dUf.first,
                     (double)std::fmax(hUw.second, hUf.second));
-        // THE BOUND IS NOT THE HOST'S LEVEL, AND THIS SAYS SO. The host reaches OpenFOAM at 3.9e-17
-        // here; the device does not, and pretending otherwise would be a bound that cannot hold. With
-        // the pair summed into grad(U) the device reads 5.6e-10 at the wall-touching cells and 4.2e-10
-        // at the rest, of a 9.3e-04 |U|; with the pair taken back out of the gradient, 3.4071e-09 and
-        // 2.7336e-09 -- so 2e-09 separates the two and fails the moment the pair leaves it again.
+        // THE BOUND IS THE HOST ARM'S OWN DISTANCE at the same cells: both arms solve the same pinned
+        // systems, so what the comparison can reach is the arithmetic, and the host reaches it
+        // (3.8906e-17 / 7.8366e-17 of a 9.2585e-04 |U|). The device is now there too -- 2.9180e-16 /
+        // 4.2479e-16, a ratio of 5 -- and both halves of the pair's momentum term are what put it
+        // there. Taking either back out is orders past this bound:
         //
-        // WHAT KEEPS THE DEVICE OFF THE HOST'S LEVEL is the OTHER half of the same term:
-        // deviceCyclicAddLinUpwindCorr -- linearUpwind's deferred correction across a pair, which this
-        // case asks for by name (`div(rhoPhi,U) Gauss linearUpwind grad(U)`) -- has no caller in the
-        // tree. The residual sits ON the pair's cells, which is its signature. Tighten this bound when
-        // that is wired; it is an open finding, not a tolerance chosen to fit.
-        check("the device's U at the pair's cells carries the pair's gradient",
-              dUw.first < scalar(2e-09) && dUf.first < scalar(2e-09));
+        //   the pair left out of grad(U)                     3.4071e-09 / 2.7336e-09
+        //   grad(U) whole, linearUpwind's coupled correction  5.5585e-10 / 4.2480e-10
+        //   both wired                                        2.9180e-16 / 4.2479e-16
+        check("the device's U at the pair's cells is as close to OpenFOAM as the host's",
+              dUw.first <= scalar(20)*std::fmax(hUw.first, scalar(1e-300))
+           && dUf.first <= scalar(20)*std::fmax(hUf.first, scalar(1e-300)));
         check("OpenFOAM's U is not zero at those cells, so the comparison means something",
               std::fmax(hUw.second, hUf.second) > scalar(0));
     }
