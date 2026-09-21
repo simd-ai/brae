@@ -383,7 +383,8 @@ void deviceDdtCorr(
     DeviceBuffer<scalar>&       outBnd,
     const DeviceBuffer<scalar>* UOldBndX,
     const DeviceBuffer<scalar>* UOldBndY,
-    const DeviceBuffer<scalar>* UOldBndZ)
+    const DeviceBuffer<scalar>* UOldBndZ,
+    const DeviceBuffer<scalar>* phiUfOldInt)
 {
     if (deltaT <= scalar(0))
         throw std::runtime_error("brae interFoam device ddtCorr: deltaT must be positive.");
@@ -395,7 +396,12 @@ void deviceDdtCorr(
     {
         ddtCorrInternalKernel<<<nBlocks(nIf), TPB>>>(
             dm.owner.data(), dm.nei.data(), dm.w.data(),
-            dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(), phiOldInt.data(),
+            dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
+            // ON A MOVING MESH (Sf & Uf.oldTime()) takes phi.oldTime()'s place, in phiCorr AND in the
+            // limiter's denominator -- the host reference's own ternary (inter_peqn_cpp.cu:237), and
+            // OpenFOAM's fvcDdtUfCorr. The kernel is unchanged; only which array it is handed is.
+            (phiUfOldInt && static_cast<int>(phiUfOldInt->size()) == nIf) ? phiUfOldInt->data()
+                                                                         : phiOldInt.data(),
             UOldX.data(), UOldY.data(), UOldZ.data(), nIf, ddtPhiCoeff, rDeltaT, outInt.data());
         ckP(cudaGetLastError(), "ddtCorr, internal");
     }

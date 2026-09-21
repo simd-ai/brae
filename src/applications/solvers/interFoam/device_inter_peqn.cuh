@@ -91,7 +91,15 @@ void deviceDdtCorr(
     // where the patch value follows the cell -- not on a slip wall.
     const DeviceBuffer<scalar>* UOldBndX = nullptr,
     const DeviceBuffer<scalar>* UOldBndY = nullptr,
-    const DeviceBuffer<scalar>* UOldBndZ = nullptr);
+    const DeviceBuffer<scalar>* UOldBndZ = nullptr,
+    // ON A MOVING MESH, (Sf & Uf.oldTime()) per INTERNAL face, which takes phi.oldTime()'s place in
+    // both phiCorr and the limiter's denominator. fvc::ddtCorr(U, phi, Uf) dispatches on
+    // mesh.dynamic() to fvcDdtUfCorr (fvcDdt.C:220-227), whose Euler form is
+    //     phiUf0  = Sf & Uf.oldTime()
+    //     phiCorr = phiUf0 - dotInterpolate(Sf, U.oldTime())
+    //     result  = fvcDdtPhiCoeff(U.oldTime(), phiUf0, phiCorr)*rDeltaT*phiCorr
+    // (EulerDdtScheme.C). Null on a static mesh, where phi.oldTime() is what OpenFOAM uses.
+    const DeviceBuffer<scalar>* phiUfOldInt = nullptr);
 
 // U = HbyA + rAU*fvc::reconstruct((phig - p_rghEqn.flux())/rAUf), pEqn.H:58. `faceFlux` is the
 // difference BEFORE the division; the division happens inside so the two operations cannot be
