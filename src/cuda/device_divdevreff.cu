@@ -85,6 +85,10 @@ void gradBKernel(
     BndSnGradView bx,
     BndSnGradView by,
     BndSnGradView bz,
+    const label* __restrict__ wedgeMask,   // 1 on a wedge face; null when the mesh has none
+    const scalar* __restrict__ wedgeT,     // that face's faceT, 9 per face, row-major
+    const label* __restrict__ gradSymMask, // 1 on a symmetry / symmetryPlane MESH patch face; null = none
+    const scalar* __restrict__ gradSymN,   // that face's mirror normal, 3 per face
     scalar* __restrict__ gradB)
 {
     const int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -101,6 +105,52 @@ void gradBKernel(
     scalar gc[9];
     for (int q = 0; q < 9; ++q)
         gc[q] = gradU[q * nC + c];
+
+    // THE GRADIENT FIELD'S OWN PATCH VALUE ON A WEDGE, before the normal correction -- the host's
+    // boundaryGradU (fvc.cu:637-672) and OpenFOAM's: gaussGrad builds grad(U) with
+    // extrapolatedCalculated patches, but fvPatchField::New puts a constraint patch's own type in
+    // their place (fvPatchFieldNew.C) and calcGrad ends in gGrad.correctBoundaryConditions()
+    // (gaussGrad.C:106), so on a WEDGE the value is transform(faceT, cell gradient) = faceT & G &
+    // faceT^T and not the cell gradient. The host measured what leaving it out costs on
+    // LES/nozzleFlow2D, where every cell touches both wedge planes: HbyA 2e-06 out in every cell at
+    // step two. This kernel left it out, and read the same: |U| 3.6e-06 from the host arm at step
+    // two on that case's laminar twin, with step one exact because U starts at rest.
+    const bool wedge = wedgeMask && wedgeMask[bi];
+    if (wedge)
+    {
+        // the host's transformTensor, in its loop order: AB = T & G, then R = AB & T^T
+        const scalar* T = wedgeT + 9*bi;
+        scalar AB[9];
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                AB[i*3+j] = T[i*3+0]*gc[0*3+j] + T[i*3+1]*gc[1*3+j] + T[i*3+2]*gc[2*3+j];
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                gc[i*3+j] = AB[i*3+0]*T[j*3+0] + AB[i*3+1]*T[j*3+1] + AB[i*3+2]*T[j*3+2];
+    }
+
+    else if (gradSymMask && gradSymMask[bi])
+    {
+        // ...and on a SYMMETRY PLANE the gradient's patch value is the cell gradient averaged with its
+        // mirror image, (G + R G R^T)/2 with R = I - 2 nn -- the host's symmetryValue (fvc.cu:589-601),
+        // in its expressions and its loop order. The normal correction below then replaces the normal
+        // row; what the mirror adds is the tangential rows' NORMAL column, dU_n/dt, zeroed. The host
+        // measured what leaving it out costs on RAS/damBreakLeakage, whose cyclicACMI hands its closed
+        // area to two symmetry patches: HbyA 3% out beside the baffle on the opening step.
+        const scalar mx = gradSymN[3*bi + 0], my = gradSymN[3*bi + 1], mz = gradSymN[3*bi + 2];
+        const scalar R[9] = { scalar(1) - 2.0*(mx*mx), scalar(0) - 2.0*(mx*my), scalar(0) - 2.0*(mx*mz),
+                              scalar(0) - 2.0*(my*mx), scalar(1) - 2.0*(my*my), scalar(0) - 2.0*(my*mz),
+                              scalar(0) - 2.0*(mz*mx), scalar(0) - 2.0*(mz*my), scalar(1) - 2.0*(mz*mz) };
+        scalar AB[9], T[9];
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                AB[i*3+j] = R[i*3+0]*gc[0*3+j] + R[i*3+1]*gc[1*3+j] + R[i*3+2]*gc[2*3+j];
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                T[i*3+j] = AB[i*3+0]*R[j*3+0] + AB[i*3+1]*R[j*3+1] + AB[i*3+2]*R[j*3+2];
+        for (int q = 0; q < 9; ++q)
+            gc[q] = (gc[q] + T[q])/2.0;
+    }
 
     // A coupled face keeps the extrapolated cell gradient: OF's correction runs only on !coupled().
     if (bx.type[bi] == 8)
@@ -122,6 +172,24 @@ void gradBKernel(
         else if (t == 5)        sn[k] = bv[k].vf[bi] * (bv[k].ref[bi] - uc[k]) * dc[bi]     // mixed
                                       + (scalar(1) - bv[k].vf[bi]) * rg;
         else                    sn[k] = rg;                       // zeroGradient (0) / fixedGradient
+    }
+    if (wedge)
+    {
+        // wedgeFvPatchField::snGrad is NOT the mixed slot's vf*(ref - uc)*dc. That form carries the
+        // VALUE's rotation, faceT, where OpenFOAM's snGrad takes cellT = faceT & faceT
+        // (wedgePolyPatch.C:128) and HALF the deltaCoeffs:
+        //     snGrad = (cellT & pif - pif)*0.5*deltaCoeffs
+        // The two agree to first order in the wedge angle and differ at second.
+        const scalar* T = wedgeT + 9*bi;
+        scalar cT[9];
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                cT[i*3+j] = T[i*3+0]*T[0*3+j] + T[i*3+1]*T[1*3+j] + T[i*3+2]*T[2*3+j];
+        for (int k = 0; k < 3; ++k)
+        {
+            const scalar rot = cT[k*3+0]*uc[0] + cT[k*3+1]*uc[1] + cT[k*3+2]*uc[2];
+            sn[k] = (rot - uc[k]) * (scalar(0.5)*dc[bi]);
+        }
     }
 
     // (n & gradC)_j = sum_i n_i gc[i][j]
@@ -253,6 +321,10 @@ void deviceBoundaryGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                                       gradU.data(), nC, uxb.data(), uyb.data(), uzb.data(), Ux.data(), Uy.data(), Uz.data(),
                                       dbU.comp[0].deltaCoeffs.data(),
                                       snGradView(dbU.comp[0]), snGradView(dbU.comp[1]), snGradView(dbU.comp[2]),
+                                      dbU.comp[0].wedgeMask.size() ? dbU.comp[0].wedgeMask.data() : nullptr,
+                                      dbU.comp[0].wedgeT.size() ? dbU.comp[0].wedgeT.data() : nullptr,
+                                      dbU.comp[0].gradSymMask.size() ? dbU.comp[0].gradSymMask.data() : nullptr,
+                                      dbU.comp[0].gradSymN.size() ? dbU.comp[0].gradSymN.data() : nullptr,
                                       gradB.data());
     cudaCheck(cudaGetLastError(), "boundaryGradU");
 }
@@ -428,6 +500,10 @@ void deviceDivDevReff(
                                       gradU.data(), nC, uxb.data(), uyb.data(), uzb.data(), Ux.data(), Uy.data(), Uz.data(),
                                       /* bnd deltaCoeffs */ dbU.comp[0].deltaCoeffs.data(),
                                       snGradView(dbU.comp[0]), snGradView(dbU.comp[1]), snGradView(dbU.comp[2]),
+                                      dbU.comp[0].wedgeMask.size() ? dbU.comp[0].wedgeMask.data() : nullptr,
+                                      dbU.comp[0].wedgeT.size() ? dbU.comp[0].wedgeT.data() : nullptr,
+                                      dbU.comp[0].gradSymMask.size() ? dbU.comp[0].gradSymMask.data() : nullptr,
+                                      dbU.comp[0].gradSymN.size() ? dbU.comp[0].gradSymN.data() : nullptr,
                                       gradB.data());
     cudaCheck(cudaGetLastError(), "ddr gradB");
     DeviceBuffer<scalar>& sigmaB = ws.sigmaB;

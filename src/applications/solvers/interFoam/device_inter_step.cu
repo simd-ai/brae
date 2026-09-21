@@ -214,6 +214,15 @@ void deviceInterStep(
     // the cause: U 2.7e-02 against OpenFOAM where the host loop is 4.1e-15, and that patch the only one
     // whose values differed from the host's.
     deviceUpdateSymmetry(dbU, UX, UY, UZ);
+    // ...AND THE WEDGE'S, the fourth step of that sequence and the one this loop never took. The
+    // builder seeds a wedge face's refValue with the host patch VALUE, which is not what the mixed
+    // kernels need: they blend d*ref + (1 - d)*U_cell, and the ref that reproduces OpenFOAM's
+    // transform(faceT, U_cell) is deviceUpdateWedge's, from THIS iteration's cell velocity
+    // (device_boundary.cuh). Every other driver in the tree calls the two as a pair. While U is
+    // zero the two refs agree, which is why it hid: MEASURED on LES/nozzleFlow2D's laminar twin,
+    // ONE step -- the first corrector's two p_rgh solves OpenFOAM's to every digit, the second
+    // corrector's initial residual 6.5e-03 for 3.1e-04, p_rgh 5.3e+08 of 8.9e+08, |U| 17%.
+    deviceUpdateWedge(dbU, UX, UY, UZ);
 
     DeviceBuffer<scalar> muCell, muFace, muBndFace;
     deviceInterMuEff(dm, rho, nuEffCell, rhoBnd, nuEffBnd, muCell, muFace, muBndFace);
@@ -369,6 +378,7 @@ void deviceInterStep(
         deviceUpdateInletOutlet(dbU, phiBnd);
         deviceUpdatePressureInletOutletVelocity(dbU, phiBnd, UX, UY, UZ, /*directionMixed=*/true);
         deviceUpdateSymmetry(dbU, UX, UY, UZ);
+        deviceUpdateWedge(dbU, UX, UY, UZ);
         (void)A;
     }
 
@@ -546,6 +556,7 @@ void deviceInterStep(
         deviceUpdateInletOutlet(dbU, phiBnd);
         deviceUpdatePressureInletOutletVelocity(dbU, phiBnd, UX, UY, UZ, /*directionMixed=*/true);
         deviceUpdateSymmetry(dbU, UX, UY, UZ);
+        deviceUpdateWedge(dbU, UX, UY, UZ);
     }
     probe("p_rgh", p_rgh);
     probe("phi", phiInt);

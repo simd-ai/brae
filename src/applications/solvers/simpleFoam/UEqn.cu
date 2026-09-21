@@ -199,6 +199,8 @@ void assembleUEqn(
         deviceBCDivCoeffs(dbU.comp[k], *in.phiBnd, M.iC[k], M.bC[k]);
         DeviceBuffer<scalar> lIC, lBC;
         deviceBCLaplacianCoeffsFace(dbU.comp[k], *in.nuEffBndFace, lIC, lBC);
+        // ...and the wedge's OWN gradientBoundaryCoeffs on its faces (device_boundary.cuh)
+        deviceWedgeLaplacianBC(dbU, k, *in.nuEffBndFace, Ux, Uy, Uz, lBC);
         deviceAxpy(-1.0, lIC, M.iC[k]);
         deviceAxpy(-1.0, lBC, M.bC[k]);
     }

@@ -71,7 +71,31 @@
 # NOT CLAIMED, each refused by name (tests/interfoam_refusals.sh): every LESModel but kEqn, every LESdelta
 # but cubeRootVol and smooth around it, `density variable` with LES, a k convection scheme other than
 # upwind and limitedLinear, a gradient scheme other than Gauss linear, nut wall functions under LES, a
-# coupled patch under the smooth delta; the device loop, which refuses LES by name.
+# coupled patch under the smooth delta; LES kEqn on a mesh that MOVES, on the device (its filter width
+# is taken once).
+#
+# THE DEVICE ARM runs the case AS SHIPPED: kEqn (device_les_keqn.cu, a transcription of the host file
+# this gate holds), `delta smooth`, GAMG for p_rgh and the GAMG preconditioner for p_rghFinal, on a
+# WEDGE. MEASURED against OpenFOAM, 100 steps: alpha 6.6213e-12, p_rgh 8.2519e-11, U 4.5231e-12, k
+# 2.1028e-12, nut 1.0508e-12 -- the host arm's 6.6214e-12, 8.2335e-11, 4.5224e-12, 2.1046e-12 and
+# 1.0518e-12, which is what bounds it.
+#
+# IT WAS REFUSED TWICE, and the second refusal hid three defects that were none of them the closure's.
+# With kEqn ported the case read U 1.7e-01 from OpenFOAM after ONE step with alpha exact -- and
+# interFoam.C runs turbulence->correct() AFTER the pressure corrector, so step one's momentum reads the
+# nut the 0 directory holds. The LAMINAR twin this script already stages reproduced the gap with no
+# closure at all, and the four p_rgh solves of step one localised it: the first corrector's two took
+# OpenFOAM's residuals to every digit, the second corrector's started at 6.5e-03 for 3.1e-04. All three
+# are WEDGE defects, invisible while U is at rest, and this is the only gated case on a wedge:
+#   the wedge's refValue never refreshed -- every other driver calls deviceUpdateWedge with
+#   deviceUpdateSymmetry as a pair, and interFoam's device step called the second alone
+#                                                   BROKEN ONCE: alpha 5.7e-01, U 6.8e-01
+#   grad(U)'s OWN patch value on a wedge, faceT & G & faceT^T, not rotated, and the wedge's snGrad
+#   taken in the mixed slot's form rather than (cellT & pif - pif)*0.5*deltaCoeffs -- the fix the
+#   HOST needed on this same case (fvc.cu:637-672)  BROKEN ONCE: alpha 4.1e-04, U 2.9e-04, k 4.5e-04
+#   the wedge's laplacian gradientBoundaryCoeffs: the mixed slot's one refValue is spent reproducing
+#   the VALUE (faceT), and OpenFOAM's gradient coefficient takes cellT and half the deltaCoeffs --
+#   second order in the wedge angle            BROKEN ONCE: alpha 3.5e-05, U 4.2e-05, k 6.6e-06
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_les_vs_openfoam"

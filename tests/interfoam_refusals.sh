@@ -495,7 +495,10 @@ BASE="$B"
 
 if [ $HAVE_GPU = 1 ]; then
     BASE="$BL"
-    arm device_les          refused "the case is LES kEqn" "-device" true
+    # LES kEqn RUNS on the device now, on a WEDGE mesh (tests/interfoam_les_vs_openfoam.sh holds the
+    # numbers). It was refused twice -- for the closure, then for a momentum gap that turned out to be
+    # three wedge defects -- so this arm is a `runs`, and a blanket refusal coming back fails it
+    arm device_les          runs    -                      "-device" true
     # the device loop's UEqn applies no fvOption, and refuses the mangroves by name
     BASE="$BG"
     arm device_mangrove     refused "Mangroves"             "-device" true

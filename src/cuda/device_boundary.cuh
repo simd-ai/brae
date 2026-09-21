@@ -75,6 +75,18 @@ struct DeviceBoundary
     // recomputed each step, from the rotated cell velocity -- see deviceUpdateWedge.
     DeviceBuffer<label>  wedgeMask;
     DeviceBuffer<scalar> wedgeT;             // 9*n, faceT
+    // THE GRADIENT FIELD'S CONSTRAINT TYPE ON A SYMMETRY PLANE. fvc::grad(U) is built with
+    // extrapolatedCalculated patches, but fvPatchField::New puts a constraint patch's OWN type in their
+    // place -- keyed on the MESH patch type, not on U's condition (fvPatchFieldNew.C:57-64) -- and
+    // gaussGrad ends in correctBoundaryConditions, so on a `symmetry` or `symmetryPlane` patch the
+    // gradient's value is the cell gradient averaged with its mirror image, (G + R G R^T)/2 with
+    // R = I - 2 nn (basicSymmetryFvPatchField::evaluate). gradSymMask is 1 on those faces and gradSymN
+    // the normal the mirror takes, three per face: the face's own Sf/magSf on a `symmetry`, the
+    // patch's ONE area-weighted normal on a `symmetryPlane` (symmetryPlanePolyPatch.C:48-57).
+    // NOT symMask: that one follows U's BC and is 1 on a `slip` wall too, where OpenFOAM's gradient
+    // keeps the plain cell value.
+    DeviceBuffer<label>  gradSymMask;
+    DeviceBuffer<scalar> gradSymN;           // 3*n, row per face
     DeviceBuffer<label>  tpMask;             // 1 if the face is totalPressure (fixedValue-p, refValue recomputed each step)
     DeviceBuffer<scalar> valueFraction;     // per-face vf for mixed faces (deviceUpdateMixedFreestream); blends 0->1
     // fixedGradient's prescribed normal gradient, per face. ZERO for every other BC, which is what makes
@@ -288,6 +300,14 @@ void deviceWedgeFaceValue(const DeviceVectorBoundary& dbU,
                           const DeviceBuffer<scalar>& fx, const DeviceBuffer<scalar>& fy,
                           const DeviceBuffer<scalar>& fz,
                           DeviceBuffer<scalar>& bx, DeviceBuffer<scalar>& by, DeviceBuffer<scalar>& bz);
+// A laplacian's boundaryCoeffs on the WEDGE faces, component k, overwritten with OpenFOAM's own
+// -gamma*magSf*gradientBoundaryCoeffs -- which the mixed slot's single refValue cannot carry, because it
+// is spent reproducing the wedge's VALUE (faceT) and OpenFOAM's gradient coefficient takes cellT and
+// half the deltaCoeffs. Call it right after deviceBCLaplacianCoeffsFace on the same bC, with the field
+// the coefficients are for. A mesh with no wedge returns at once.
+void deviceWedgeLaplacianBC(const DeviceVectorBoundary& dbU, int k, const DeviceBuffer<scalar>& gammaFace,
+                            const DeviceBuffer<scalar>& fx, const DeviceBuffer<scalar>& fy,
+                            const DeviceBuffer<scalar>& fz, DeviceBuffer<scalar>& bC);
 void deviceUpdateSymmetry(DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy,
                           const DeviceBuffer<scalar>& Uz);
 // OF correctUphiBCs: overwrite phiB on the faces where `adjustable` is 0 (i.e. U fixesValue) with phiFixed.
@@ -346,11 +366,36 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
     const FvGeometry& g,
     bool storedIoSeed = false)   // as the scalar builder's
 {
-    std::vector<label> ty[3], fc, io, oio, mx, pv, sm, wdg, iofr;
-    std::vector<scalar> dc, ms, ref[3], vf[3], nrm[3], rg[3], wdgT, iost[3];   // rg = fixedGradient, per component
+    std::vector<label> ty[3], fc, io, oio, mx, pv, sm, wdg, iofr, gsm;
+    std::vector<scalar> dc, ms, ref[3], vf[3], nrm[3], rg[3], wdgT, iost[3], gsn;   // rg = fixedGradient, per component
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         if (isCoupledInterfaceType(fvp[pi].type)) continue;                     // cyclic = internal-like (handled by appended faces)
+        // the gradient's mirror normal, in the host reference's own arithmetic (fvc.cu, boundaryGradU):
+        // Sf/magSf by DIVISION per face on a `symmetry`; sumA/mag(sumA) once per patch on a
+        // `symmetryPlane`, summed in face order from zero and (0,0,0) below 1e-150
+        const bool gradSym = (fvp[pi].type == "symmetry");
+        const bool gradSymPlane = (fvp[pi].type == "symmetryPlane");
+        vector planeN{0, 0, 0};
+        if (gradSymPlane)
+        {
+            vector sumA{0, 0, 0};
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                sumA = sumA + g.Sf()[fvp[pi].start + i];
+            }
+            const scalar a = mag(sumA);
+            planeN = (a > scalar(1.0e-150)) ? sumA/a : vector{0, 0, 0};
+        }
+        for (label i = 0; i < fvp[pi].size; ++i)
+        {
+            const label gf = fvp[pi].start + i;
+            const vector n = gradSym ? g.Sf()[gf]/g.magSf()[gf] : planeN;
+            gsm.push_back((gradSym || gradSymPlane) ? 1 : 0);
+            gsn.push_back(n.x);
+            gsn.push_back(n.y);
+            gsn.push_back(n.z);
+        }
         // A processor patch is COUPLED: it stays in the boundary gather (the explicit operators need its bval
         // slot, filled with the halo-interpolated face value by DeviceHalo::scatterBoundaryValues), but must
         // contribute NO matrix coefficients -- its coupling is the interface off-diagonal. bcCategory() is NOT
@@ -471,6 +516,8 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
         db.comp[k].symMask.copyFrom(sm);
         db.comp[k].wedgeMask.copyFrom(wdg);
         db.comp[k].wedgeT.copyFrom(wdgT);
+        db.comp[k].gradSymMask.copyFrom(gsm);
+        db.comp[k].gradSymN.copyFrom(gsn);
         db.comp[k].valueFraction.copyFrom(vf[k]);
         db.comp[k].refValue.copyFrom(ref[k]);
         db.comp[k].refGrad.copyFrom(rg[k]);

@@ -645,6 +645,68 @@ void deviceWedgeFaceValue(
 
 
 namespace {
+// THE WEDGE'S gradientBoundaryCoeffs, which the mixed slot cannot carry. A wedge is emulated here as a
+// mixed condition with ONE refValue, chosen by deviceUpdateWedge to reproduce OpenFOAM's VALUE,
+// transform(faceT, pif). OpenFOAM's gradient coefficients come from a DIFFERENT expression
+// (transformFvPatchField.C:95-136, wedgeFvPatchField.C snGrad):
+//     gradientInternalCoeffs = -deltaCoeffs*d,                 d_k = 0.5*(1 - cellT_kk)
+//     gradientBoundaryCoeffs = snGrad - gradientInternalCoeffs*pif
+//                            = 0.5*deltaCoeffs*((cellT & pif)_k - cellT_kk*pif_k)
+// with cellT = faceT & faceT (wedgePolyPatch.C:128). The mixed slot's explicit half, vf*ref*dc, is
+// dc*((faceT & pif)_k - (1 - d_k)*pif_k) instead -- the two agree to first order in the wedge angle
+// and differ at second, in the components the rotation mixes. The implicit half is already OpenFOAM's.
+// This overwrites a laplacian's boundaryCoeffs on the wedge faces with OpenFOAM's, component k:
+//     bC = -gamma*magSf*gradientBoundaryCoeffs_k
+__global__
+void wedgeLaplacianBCKernel(
+    int n,
+    int k,
+    const label* __restrict__ wdg,
+    const label* __restrict__ fc,
+    const scalar* __restrict__ T,     // 9*n, row-major faceT per face
+    const scalar* __restrict__ dc,
+    const scalar* __restrict__ magSf,
+    const scalar* __restrict__ gammaFace,
+    const scalar* __restrict__ fx, const scalar* __restrict__ fy, const scalar* __restrict__ fz,
+    scalar* __restrict__ bC)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || !wdg[i]) return;
+
+    const int c = fc[i];
+    const scalar v[3] = { fx[c], fy[c], fz[c] };
+    const scalar* F = T + 9*i;
+    // row k of cellT = faceT & faceT
+    scalar cTk[3];
+    for (int j = 0; j < 3; ++j)
+        cTk[j] = F[3*k + 0]*F[0*3 + j] + F[3*k + 1]*F[1*3 + j] + F[3*k + 2]*F[2*3 + j];
+    const scalar rot = cTk[0]*v[0] + cTk[1]*v[1] + cTk[2]*v[2];
+    const scalar gradBC = (scalar(0.5)*dc[i])*(rot - cTk[k]*v[k]);
+    bC[i] = -(gammaFace[i]*magSf[i])*gradBC;
+}
+} // namespace
+
+void deviceWedgeLaplacianBC(
+    const DeviceVectorBoundary& dbU,
+    int k,
+    const DeviceBuffer<scalar>& gammaFace,
+    const DeviceBuffer<scalar>& fx,
+    const DeviceBuffer<scalar>& fy,
+    const DeviceBuffer<scalar>& fz,
+    DeviceBuffer<scalar>& bC)
+{
+    const int n = dbU.n;
+    if (n == 0 || dbU.comp[0].wedgeMask.size() == 0) return;
+    const DeviceBoundary& b = dbU.comp[k];
+    wedgeLaplacianBCKernel<<<nBlocks(n), TPB>>>(n, k, dbU.comp[0].wedgeMask.data(), b.faceCell.data(),
+                                                dbU.comp[0].wedgeT.data(), b.deltaCoeffs.data(),
+                                                b.magSf.data(), gammaFace.data(),
+                                                fx.data(), fy.data(), fz.data(), bC.data());
+    cudaCheck(cudaGetLastError(), "wedgeLaplacianBC");
+}
+
+
+namespace {
 // OF correctUphiBCs: phi_b = U_b & Sf on every patch whose U field FIXES its value. `adjustable` is the
 // adjustPhi mask, which is already !fixesValue() over the same face order -- so the faces to overwrite
 // are exactly the zeros. Kept as its own kernel rather than folded into the flux computation: the

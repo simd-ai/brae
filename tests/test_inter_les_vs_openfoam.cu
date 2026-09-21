@@ -259,26 +259,41 @@ int main(
     }
     if (nDev <= 0)
     {
-        std::printf("  (no CUDA device: the device refusal is not exercised)\n");
+        std::printf("  (no CUDA device: the device arm is skipped)\n");
     }
     else
     {
-        // THE DEVICE LOOP REFUSES, by name. kEqn's own equation IS ported (device_les_keqn.cu); what
-        // is not is the loop around it on this case -- one step reads U 1.7e-01 and p_rgh 6.0e-01
-        // from OpenFOAM with alpha exact, and at one step the closure has not touched U yet, so the
-        // momentum and pressure path is what has to be localised first. The refusal names that.
-        bool named = false;
-        try
-        {
-            InterFields dev;
-            runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
-        }
-        catch (const std::exception& e)
-        {
-            named = std::string(e.what()).find("LES kEqn") != std::string::npos;
-            std::printf("  device: %s\n", e.what());
-        }
-        check("the device loop refuses the case and names the model", named);
+        // THE DEVICE ARM, on the case AS SHIPPED -- kEqn, its `delta smooth` filter width, GAMG for
+        // p_rgh and the GAMG preconditioner for p_rghFinal, and a WEDGE mesh. It was a refusal arm
+        // twice over; the script's header says what each refusal was hiding.
+        InterFields dev;
+        const RunReport rd = runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
+        check("the device driver ran the same number of steps", rd.steps == nSteps);
+        failures += brae::gatecheck::nonFinite("device alpha", dev.alpha1.internal);
+        failures += brae::gatecheck::nonFinite("device k", dev.turbulence.k.internal);
+        failures += brae::gatecheck::nonFinite("device nut", dev.turbulence.nut.internal);
+        const Diff eA = compare(dev.alpha1.internal, ofAlpha);
+        const Diff eP = compare(dev.p_rgh.internal, ofPrgh);
+        const Diff eU = compare(dev.U.internal, ofU);
+        const Diff eK = compare(dev.turbulence.k.internal, ofKf);
+        const Diff eN = compare(dev.turbulence.nut.internal, ofNut);
+        std::printf("  DEVICE:  alpha %.4e, p_rgh %.4e, U %.4e, k %.4e, nut %.4e\n",
+                    (double)eA.linf, (double)eP.rel(), (double)eU.rel(), (double)eK.rel(),
+                    (double)eN.rel());
+        std::printf("  host:    alpha %.4e, p_rgh %.4e, U %.4e, k %.4e, nut %.4e\n",
+                    (double)dA.linf, (double)dP.rel(), (double)dU.rel(), (double)dK.rel(),
+                    (double)dN.rel());
+        // bounded by the HOST arm's own distance on this case: both arms solve the same equations on
+        // the same mesh, flux and filter width
+        check("the device's alpha is as close to OpenFOAM as the host's",
+              eA.linf <= scalar(20)*std::fmax(dA.linf, scalar(1e-300)));
+        check("...its p_rgh", eP.rel() <= scalar(20)*std::fmax(dP.rel(), scalar(1e-300)));
+        check("...its U", eU.rel() <= scalar(20)*std::fmax(dU.rel(), scalar(1e-300)));
+        check("...its k", eK.rel() <= scalar(20)*std::fmax(dK.rel(), scalar(1e-300)));
+        check("...and its nut", eN.rel() <= scalar(20)*std::fmax(dN.rel(), scalar(1e-300)));
+        // ...against the oracle's own control: OpenFOAM laminar, which is the model's whole effect
+        check("the LES model moves OpenFOAM's own U far more than the device is from it",
+              dLamU.rel() > scalar(1000)*std::fmax(eU.rel(), scalar(1e-300)));
     }
 
     std::printf("test_inter_les_vs_openfoam: %d failures\n", failures);

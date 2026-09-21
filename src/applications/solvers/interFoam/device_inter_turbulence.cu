@@ -90,7 +90,14 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
         // interpolated (`localConsistency`, GeometricFieldFunctionsM.C) -- a value nothing on the
         // device reads, because the device's nut boundary does not hold that face.
         if (isCoupledInterfaceType(patches[pi].type)) continue;
-        const bool eval = patches[pi].type != "wall"
+        // "not a `wall`" stands for "not written by a wall function", which is true of every RAS
+        // case this loop runs and FALSE under LES kEqn: there nothing is a wall function (the host
+        // reader refuses a `nut*` patch type under that model), and a wall's nut is an ordinary
+        // condition that correctBoundaryConditions evaluates like any other. LES/nozzleFlow2D's
+        // `walls` is zeroGradient. Skipped, it kept the 0 directory's value for the whole run --
+        // exact for one step, since both arms start there, and U 4.8e-06 from OpenFOAM at step two.
+        const bool wallFunctionWrites = !les && patches[pi].type == "wall";
+        const bool eval = !wallFunctionWrites
                        && patches[pi].type != "empty"
                        && t.nut.boundary[pi]->bcCategory() != 2;
         if (eval) d.nutEvalFaces += static_cast<int>(patches[pi].size);
