@@ -22,9 +22,18 @@
 # brae against brae with only the face-interpolation arithmetic reordered reads U 2.9e-09 at 100 steps,
 # so the growth is the case's conditioning, not the scheme; 60 steps measures the scheme before it.
 #
-# THE DEVICE LOOP REFUSES the scheme: its limitedLinear branch reads U 5.1e-01 against OpenFOAM on a
-# DIC-smoother twin of this case at 50 steps, where the host reads 3.9e-12 and the device under upwind
-# 1.1e-13. That is an open device finding, not ported here.
+# THE DEVICE ARM runs the case AS SHIPPED -- `solver GAMG; smoother GaussSeidel` for p_rgh, which that
+# loop runs, and the scheme itself. MEASURED against OpenFOAM: alpha 6.3e-14, p_rgh 9.6e-12, U 1.8e-12,
+# bounded by the host arm's own distances above (9.2e-14, 8.8e-12, 2.7e-12) and with the same `Gauss
+# upwind` control, 8.0e-01 of OpenFOAM's own U.
+#
+# IT WAS A REFUSAL ARM, reading U 5.1e-01 where the host reads 2.7e-12. The branch (shared with
+# simpleFoam, UEqn.cu) accumulated magSqr(U) and its boundary half into buffers resize() had not
+# zeroed, and resize() hands back a RECYCLED block (device_buffer.cuh:134-141) -- so from the second
+# assembly onward the limiter was built on the pool's leavings. The compressible twin (rhoUEqn.cu) had
+# carried a zeroBuffer helper and a comment naming this exact defect in the incompressible one since
+# its own port. BROKEN ONCE EACH, on the device arm: mag2 sized and not zeroed, U 5.3e-01 and alpha
+# 1.4e-01; the BOUNDARY half sized and not zeroed, U 1.7e-01 and alpha 4.7e-02.
 #
 # NOT CLAIMED: the tutorial's own 75^3 mesh (420k cells, a bench size), its Lagrangian function object
 # (stripped, brae runs none), and limitedLinear across a coupled patch (refused).

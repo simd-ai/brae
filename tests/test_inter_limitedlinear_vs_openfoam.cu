@@ -173,7 +173,11 @@ int main(
           dUp.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)));
     check("...and so does its coefficient", dL1.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)));
 
-    // THE DEVICE LOOP REFUSES, by name
+    // THE DEVICE ARM, on the case AS SHIPPED -- `solver GAMG; smoother GaussSeidel` for p_rgh, which
+    // this loop runs, and the scheme itself. This was a REFUSAL arm: the device's limitedLinear branch
+    // accumulated magSqr(U) into a buffer resize() had not zeroed, and resize() recycles
+    // (device_buffer.cuh:134-141), so from the second assembly onward the limiter was built on the
+    // pool's leavings. It read U 5.1e-01 from OpenFOAM where the host reads 2.7e-12.
     int nDev = 0;
     if (cudaGetDeviceCount(&nDev) != cudaSuccess)
     {
@@ -182,23 +186,31 @@ int main(
     }
     if (nDev <= 0)
     {
-        std::printf("  (no CUDA device: the device refusal is not exercised)\n");
+        std::printf("  (no CUDA device: the device arm is skipped)\n");
     }
     else
     {
-        bool named = false;
-        try
-        {
-            InterFields dev;
-            runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
-        }
-        catch (const std::exception& e)
-        {
-            // the shipped case's GAMG smoother is refused first; the scheme is held by the refusals script
-            named = std::string(e.what()).find("-device") != std::string::npos;
-            std::printf("  device: %s\n", e.what());
-        }
-        check("the device loop refuses the case by name", named);
+        InterFields dev;
+        const RunReport rd = runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
+        check("the device driver ran the same number of steps", rd.steps == nSteps);
+        failures += brae::gatecheck::nonFinite("device alpha", dev.alpha1.internal);
+        failures += brae::gatecheck::nonFinite("device p_rgh", dev.p_rgh.internal);
+        failures += brae::gatecheck::nonFinite("device U", dev.U.internal);
+        const Diff eA = compare(dev.alpha1.internal, ofAlpha);
+        const Diff eP = compare(dev.p_rgh.internal, ofPrgh);
+        const Diff eU = compare(dev.U.internal, ofU);
+        std::printf("  DEVICE:  alpha %.4e, p_rgh %.4e, U %.4e   (host %.4e, %.4e, %.4e)\n",
+                    (double)eA.linf, (double)eP.rel(), (double)eU.rel(),
+                    (double)dA.linf, (double)dP.rel(), (double)dU.rel());
+        // bounded by the HOST arm's own distance on this case, not by a number picked to fit: both
+        // arms build the same one limiter per face from magSqr(U), on the same mesh and flux
+        check("the device's alpha is as close to OpenFOAM as the host's",
+              eA.linf <= scalar(20)*std::fmax(dA.linf, scalar(1e-300)));
+        check("...its p_rgh", eP.rel() <= scalar(20)*std::fmax(dP.rel(), scalar(1e-300)));
+        check("...and its U", eU.rel() <= scalar(20)*std::fmax(dU.rel(), scalar(1e-300)));
+        // ...and the CONTROL stays the oracle's own: `Gauss upwind` moves OpenFOAM's U by 8.0e-01
+        check("the scheme moves OpenFOAM's own U far more than the device is from it",
+              dUp.rel() > scalar(1000)*std::fmax(eU.rel(), scalar(1e-300)));
     }
 
     std::printf("test_inter_limitedlinear_vs_openfoam: %d failures\n", failures);

@@ -505,9 +505,11 @@ if [ $HAVE_GPU = 1 ]; then
     # the device loop is handed the ACMI pair uncoupled, and refuses it by name
     BASE="$BK"
     arm device_leak         refused "coupled_half0"         "-device" true
-    # the device momentum's limitedLinear branch is 51% off OpenFOAM's U where the host agrees to 4e-12
+    # the device momentum runs limitedLinear now -- one magSqr limiter per face, as OpenFOAM's, gated on
+    # eulerianInjection in tests/interfoam_limitedlinear_vs_openfoam.sh. It was refused here while its
+    # branch accumulated magSqr(U) into a buffer resize() had not zeroed
     BASE="$B"
-    arm device_limitedLinear refused "Gauss limitedLinear"    "-device" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear 0.2;/' system/fvSchemes"
+    arm device_limitedLinear runs    -                        "-device" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear 0.2;/' system/fvSchemes"
     BASE="$B"
     # THE BAFFLE TUTORIAL on the device. Its pair and its JUMP both run now
     # (tests/interfoam_cyclic_vs_openfoam.sh's `jump` profile measures them), so what it refuses is

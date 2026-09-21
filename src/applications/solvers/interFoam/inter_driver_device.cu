@@ -1131,16 +1131,7 @@ RunReport runInterFoamDevice(
     {
         case DivScheme::linearUpwind:   C.divScheme = brae::cpu::DivScheme::linearUpwind;   break;
         case DivScheme::linearUpwindV:  C.divScheme = brae::cpu::DivScheme::linearUpwindV;  break;
-        case DivScheme::limitedLinear:
-            // REFUSED, with the measurement. The device momentum's limitedLinear branch (shared with
-            // simpleFoam, UEqn.cu) runs laminar/vofToLagrangian/eulerianInjection -- with its GAMG
-            // smoother switched to DIC so the device accepts it -- to a U 5.1e-01 away from OpenFOAM
-            // after 50 steps, where the same case under `Gauss upwind` agrees to 1.1e-13 and the host's
-            // limitedLinear to 3.9e-12. The defect is in that branch; it is not ported here yet.
-            throw std::runtime_error(
-                "brae interFoam -device: `div(rhoPhi,U) Gauss limitedLinear` runs the device momentum's "
-                "limitedLinear branch, which is 51% off OpenFOAM's U on eulerianInjection where the host "
-                "loop agrees to 4e-12. Run without -device.");
+        case DivScheme::limitedLinear:  C.divScheme = brae::cpu::DivScheme::limitedLinear;  break;
         case DivScheme::limitedLinearV: C.divScheme = brae::cpu::DivScheme::limitedLinearV; break;
         case DivScheme::LUST:           C.divScheme = brae::cpu::DivScheme::LUST;           break;
         case DivScheme::vanLeerV:       C.divScheme = brae::cpu::DivScheme::vanLeerV;       break;

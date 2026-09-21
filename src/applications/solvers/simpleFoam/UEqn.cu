@@ -13,6 +13,20 @@ namespace gpu {
 
 namespace {
 
+// resize() does NOT zero: DevicePool::take hands back a RECYCLED block, the same contract as cudaMalloc
+// (device_buffer.cuh:134-141). A buffer this file ACCUMULATES into rather than assigns must therefore be
+// memset first. The limitedLinear branch below did not, and read the pool's leavings as part of
+// magSqr(U) from the second assembly onward -- U 5.1e-01 from OpenFOAM on eulerianInjection where the
+// host reads 3.9e-12. The compressible twin has carried this helper since its own port (rhoUEqn.cu).
+void zeroBuffer(
+    DeviceBuffer<scalar>& b,
+    int n)
+{
+    b.resize(static_cast<std::size_t>(n));
+    if (n <= 0) return;
+    cudaCheck(cudaMemsetAsync(b.data(), 0, static_cast<std::size_t>(n)*sizeof(scalar)), "zero buffer");
+}
+
 void refuseUnsupported(const MomentumInput& in)
 {
     // Identical wording and citations to the reference: a component that is out of scope must say so, not
@@ -118,13 +132,14 @@ void assembleUEqn(
             // as NVDTVD + limitFuncs::magSqr), not per component and not the V form.
             DeviceBuffer<scalar> mag2, t, ub, gx, gy, gz, m2b;
             const DeviceBuffer<scalar>* U3[3] = {&Ux, &Uy, &Uz};
-            mag2.resize(dm.nCells);
+            // ZEROED, not merely sized: these two are accumulated into, and resize() recycles
+            zeroBuffer(mag2, dm.nCells);
             for (int k = 0; k < 3; ++k)
             {
                 deviceHadamard(t, *U3[k], *U3[k]);
                 deviceAxpy(1.0, t, mag2);
             }
-            m2b.resize(dm.nBndFaces);
+            zeroBuffer(m2b, dm.nBndFaces);
             for (int k = 0; k < 3; ++k)
             {
                 deviceBCValue(dbU.comp[k], *U3[k], ub);
