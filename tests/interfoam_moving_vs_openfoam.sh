@@ -65,12 +65,34 @@
 #                  BROKEN ONCE EACH (U, 2D3DoF / 3D / 3D6DoF): SDA without its lamda rescaling 8.2e-01 /
 #                  8.2e-01 / green; SDA without its roll 9.9e-01 / 9.9e-01 / green; the 6DoF table's
 #                  interpolation flipped green / green / 1.4e-02
-#   cylinder       laminar/sloshingCylinder: a snappyHexMesh cylinder
+#   cylinder       laminar/sloshingCylinder, ON BOTH ARMS: a snappyHexMesh cylinder
 #                  (polyhedra, 26 degrees) under an oscillatingLinearMotion and a rotatingMotion,
 #                  MULESCorr and nNonOrthogonalCorrectors 1 -- the corrector loop on a corrected
 #                  laplacian -- ten of its own steps of 0.001, with the oscillation's phase and
 #                  vertical shifts zeroed (the staging says why: as shipped the mesh jumps 6.9 cm at
-#                  the first update and OpenFOAM itself blows up at any fixed step)
+#                  the first update and OpenFOAM itself blows up at any fixed step).
+#                  ITS p_rgh IS `solver GAMG; smoother DIC` AS SHIPPED, which is why the device arm is
+#                  here: a moving mesh with the case's own GAMG. MEASURED, device against OpenFOAM:
+#                  40 of 40 p_rgh V-cycle counts, alpha 8.8e-11, p_rgh 6.3e-12, U 9.8e-09, Uf 6.2e-09
+#                  -- the host arm's own distances being 6.3e-11, 7.6e-12, 1.7e-08 and 1.1e-08.
+#   solitaryGamg   waveMakerSolitary with p_rgh and p_rghFinal as `solver GAMG; smoother DIC;
+#                  nCellsInCoarsestLevel 200`, ON BOTH ARMS: a DEFORMING mesh with a GAMG pressure
+#                  solve, and a case whose MOTION solver is GAMG too (`cellDisplacement`,
+#                  nCellsInCoarsestLevel 10). OpenFOAM keeps ONE GAMGAgglomeration per mesh, so the
+#                  displacement solve at the first mesh update builds the hierarchy and p_rgh reuses
+#                  it -- the 200 is never read. MEASURED: 60 of 60 counts on both arms, device alpha
+#                  2.9e-12, p_rgh 3.4e-13, U 2.2e-11, Uf 2.7e-11 (host 3.0e-12, 3.4e-13, 2.3e-11,
+#                  2.7e-11).
+#                  THE DEVICE GAMG ON A MOVING MESH, BROKEN ONCE EACH:
+#                    the hierarchy uploaded once and kept for the run, where OpenFOAM's
+#                    GAMGAgglomeration::movePoints sets requireUpdate_ and the next New builds it
+#                    again (GAMGAgglomeration.C:311-330, :498-516)
+#                                              `cylinder`: 38 of 40 counts, alpha 2.9e-04, U 4.1e-03
+#                    p_rgh building a hierarchy of its OWN instead of sharing the run's
+#                                          `solitaryGamg`: 48 of 60 counts, alpha 3.3e-04, U 4.0e-01
+#                                              (`cylinder` cannot see this one: its pcorr is PCG and
+#                                              its motion is solid-body, so p_rgh builds the only
+#                                              hierarchy there whether it shares or not)
 #   closedDamBreak laminar/damBreak with its atmosphere WALLED OFF (U fixedValue 0, p_rgh
 #                  fixedFluxPressure, alpha zeroGradient) and `pRefPoint (0.292 0.292 0.0073);
 #                  pRefValue 0;` -- the pressure reference on a mesh that does not move, twenty of the
@@ -334,7 +356,22 @@ if profile.startswith('mixer') or profile.startswith('sloshing') or profile.star
         assert k == 1, 'the U entry was not found'
 elif profile.startswith('solitary') or profile.startswith('multi'):
     # waves/waveMakerSolitary and the two multi-paddle tanks AS SHIPPED: nothing to stage in fvSolution
-    pass
+    if profile == 'solitaryGamg':
+        # ...except p_rgh, which this profile gives the case's OTHER GAMG entry -- the motion
+        # solver's is `nCellsInCoarsestLevel 10` -- with a COARSEST LEVEL OF ITS OWN. OpenFOAM keeps
+        # one GAMGAgglomeration per mesh (a MeshObject, found by type name), so the displacement
+        # solve at the first mesh update builds the hierarchy and p_rgh reuses THAT one: the 200
+        # below is never read. An arm that built a second hierarchy from this entry would solve on
+        # a different one and read different V-cycle counts.
+        for key in ('p_rgh', 'p_rghFinal'):
+            m = re.search(r'\n    %s\s*\{[^}]*\}' % re.escape(key), t)
+            assert m, 'the %s entry was not found' % key
+            t = t.replace(m.group(0),
+                          '\n    %s\n    {\n        solver          GAMG;\n'
+                          '        smoother        DIC;\n        tolerance       1e-8;\n'
+                          '        relTol          0;\n'
+                          '        nCellsInCoarsestLevel 200;\n    }' % key)
+        assert 'solver          GAMG' in t, 'the GAMG profile did not take' 
 elif profile.startswith('piston') or profile.startswith('flap'):
     # the pressure solves converged: p_rgh, p_rghFinal and pcorr at tolerance 1e-13, relTol 0. As shipped
     # (p_rgh relTol 0.05, pcorr 1e-10) the piston's third corrector takes 135 PCG iterations and pcorr
@@ -491,6 +528,7 @@ stage sloshing2DCorrectPhi sloshingTank2D   0.01  10 sloshing2DCorrectPhi || rc=
 stage cylinderCorrectPhi   sloshingCylinder 0.001 10 cylinderCorrectPhi   || rc=1
 stage solitaryStatic waves/waveMakerSolitary 0.01 30 solitaryStatic || rc=1
 stage solitary       waves/waveMakerSolitary 0.01 30 solitary       || rc=1
+stage solitaryGamg   waves/waveMakerSolitary 0.01 30 solitaryGamg   || rc=1
 stage pistonStatic   waves/waveMakerPiston   0.01 30 pistonStatic   || rc=1
 stage piston         waves/waveMakerPiston   0.01 30 piston         || rc=1
 stage pistonSST      waves/waveMakerPiston   0.01 30 pistonSST      || rc=1
@@ -535,6 +573,8 @@ gate mixerDevice          2e-4  10 mixerDevice          mixerStatic      || rc=1
 gate sloshing2DCorrectPhi 0.01  10 sloshing2DCorrectPhi sloshing2DStatic || rc=1
 gate cylinderCorrectPhi   0.001 10 cylinderCorrectPhi   cylinderStatic   || rc=1
 gate solitary       0.01  30 solitary       solitaryStatic || rc=1
+# the deforming mesh with a GAMG pressure solve, on BOTH arms -- see the solitaryGamg staging
+gate solitaryGamg   0.01  30 solitaryGamg   solitaryStatic || rc=1
 gate piston         0.01  30 piston         pistonStatic   || rc=1
 gate pistonSST      0.01  30 pistonSST      piston         || rc=1
 gate flap           0.01  30 flap           flapStatic     || rc=1

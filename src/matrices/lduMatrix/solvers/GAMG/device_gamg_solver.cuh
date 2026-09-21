@@ -88,7 +88,12 @@ struct DeviceGamgCache
     // the host mesh the hierarchy is built from; the caller sets both before the first solve
     const PrimitiveMesh* mesh = nullptr;
     const FvGeometry* geometry = nullptr;
-    GamgAgglomerationCache host;
+    // THE MESH'S agglomeration cache, the caller's and not this struct's. OpenFOAM keeps ONE per mesh
+    // -- GAMGAgglomeration is a MeshObject found by type name -- and every GAMG solve of the run
+    // shares it: the motion solver's, pcorr's and p_rgh's. A cache of this struct's own would build a
+    // second hierarchy from a second entry's nCellsInCoarsestLevel, which is not what any of them
+    // would then be solving on.
+    GamgAgglomerationCache* host = nullptr;
     bool uploaded = false;
     DeviceGamgHierarchy device;
 

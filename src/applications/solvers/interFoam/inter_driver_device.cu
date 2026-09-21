@@ -241,22 +241,28 @@ RunReport runInterFoamDevice(
         //     end to end, shipped binary:     host max|U| 10.32, div(phi) 4.814e-11
         //                                     device       10.32,            4.278e-11
         //
-        // What is NOT ported is the case's own pressure SOLVER. sloshingTank2D asks for GAMG, this
-        // loop substitutes Jacobi-BiCGStab, and on this mesh -- 44 degrees non-orthogonal once the
-        // tank tilts -- the substitute does not reach the tolerance it was given: p_rgh came out
-        // 2.5406e+05 of 5.2780e+06 and worst |div(phi)| 3.274e-01 against the host's 9.173e-07. That
-        // is a solver gap, not a moving-mesh one, and it is refused HERE rather than left to the
-        // substitution notice because a quarter of a percent in p_rgh is not "where the solve stops".
-        if (f.pSolve.gamgSolver() || f.pSolve.pcgGamg()
-         || f.pSolveFinal.gamgSolver() || f.pSolveFinal.pcgGamg())
+        // The case's own GAMG SOLVER runs here: the hierarchy is the mesh's, shared with the motion
+        // solve and with pcorr, and it is rebuilt on every move -- OpenFOAM's GAMGAgglomeration is a
+        // MeshObject whose movePoints sets requireUpdate_ and whose next New builds it again
+        // (GAMGAgglomeration.C:311-330, :498-516). The smoother is checked below, where a static-mesh
+        // case's is.
+        //
+        // WHAT IS STILL NOT PORTED is the GAMG PRECONDITIONER -- `solver PCG; preconditioner {
+        // preconditioner GAMG; ... }`, which the solid-body tanks write. On a static mesh this loop
+        // substitutes Jacobi-BiCGStab under a notice; on a MOVING one that substitute does not reach
+        // the tolerance it is given, measured on sloshingTank2D: p_rgh 2.5406e+05 of 5.2780e+06
+        // against the host, worst |div(phi)| 3.274e-01 against 9.173e-07. A quarter of a percent in
+        // p_rgh is not "where the solve stops", so here it is a refusal and not a notice.
+        if (f.pSolve.pcgGamg() || f.pSolveFinal.pcgGamg())
         {
             throw std::runtime_error(
-                "brae interFoam -device: the case moves its mesh AND asks for a GAMG pressure solve, "
-                "which this loop substitutes with Jacobi-BiCGStab. On a moving mesh that substitute "
-                "does not reach the tolerance it is given -- measured on sloshingTank2D, p_rgh "
-                "2.5406e+05 of 5.2780e+06 against the host. With a solver this arm runs natively "
-                "(PCG with DIC) the two agree at round-off. Run without -device, or give p_rgh a "
-                "solver this arm implements.");
+                "brae interFoam -device: the case moves its mesh AND asks for `solver PCG; "
+                "preconditioner { preconditioner GAMG; ... }` for the pressure, which this loop "
+                "substitutes with Jacobi-BiCGStab -- the GAMG PRECONDITIONER is ported on the host "
+                "loop only (pcgGamgSolve). On a moving mesh that substitute does not reach the "
+                "tolerance it is given: measured on sloshingTank2D, p_rgh 2.5406e+05 of 5.2780e+06 "
+                "against the host. `solver GAMG` itself this arm runs. Run without -device, or give "
+                "p_rgh a solver this arm implements.");
         }
 
         // A COUPLED PAIR ON A MOVING MESH is not ported: buildDeviceCyclic lays the interface out from
@@ -372,17 +378,21 @@ RunReport runInterFoamDevice(
             "(no -device) hands each patch the flux it names.");
     }
 
+    // THE MESH'S GAMG HIERARCHY, one for the whole run, as OpenFOAM keeps one GAMGAgglomeration per
+    // mesh and every GAMG solve shares it -- the motion solver's, pcorr's and p_rgh's. It is built by
+    // the FIRST of them, from ITS entry's nCellsInCoarsestLevel, and a mesh move sends it un-built
+    // (dynamic_motion_solver_fv_mesh_cpp.cu, GAMGAgglomeration::movePoints).
+    GamgAgglomerationCache meshAgglomeration;
+
     // initCorrectPhi.H, on the host and before anything is uploaded -- see runInterFoam. A GAMG pcorr
-    // SOLVER builds the mesh's hierarchy even at rest (the GAMGSolver constructor builds it before the
-    // first residual), and OpenFOAM's p_rgh GAMG then reuses that one; the device builds its own from
-    // p_rgh's entry, which is the same hierarchy only when the two ask for the same coarsest level.
+    // SOLVER builds the hierarchy even at rest (the GAMGSolver constructor builds it before the first
+    // residual), and OpenFOAM's p_rgh GAMG then reuses that one.
     std::vector<LinearSolveRecord> initPcorrSolves;
     {
-        GamgAgglomerationCache initCache;
         CorrectPhiControls cpc;
         cpc.pcorr = &f.pcorrSolve;
         cpc.pcorrFinal = &f.pcorrSolveFinal;
-        cpc.gamgCache = &initCache;
+        cpc.gamgCache = &meshAgglomeration;
         cpc.correctedLaplacian = f.laplacianScheme.corrected;
         cpc.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
         cpc.nNonOrthogonalCorrectors = f.nNonOrthogonalCorrectors;
@@ -393,19 +403,10 @@ RunReport runInterFoamDevice(
         cin.solveLog = &initPcorrSolves;
         correctPhi(f.U, f.phi, f.p_rgh, cin, cpc, m, g, fvp);
         pushFluxToPatches(f, fvp);
-        for (const InterFields::PressureLinearSolve* ps : {&f.pSolve, &f.pSolveFinal})
-        {
-            if (initCache.built && ps->gamgSolver()
-                && ps->gamg.nCellsInCoarsestLevel != f.pcorrSolveFinal.gamg.nCellsInCoarsestLevel)
-            {
-                throw std::runtime_error(
-                    "brae interFoam -device: pcorrFinal is GAMG with nCellsInCoarsestLevel " +
-                    std::to_string(f.pcorrSolveFinal.gamg.nCellsInCoarsestLevel) + " and p_rgh with " +
-                    std::to_string(ps->gamg.nCellsInCoarsestLevel) + ". OpenFOAM's p_rgh reuses the "
-                    "hierarchy pcorr built at the start; the device builds its own from p_rgh's entry. "
-                    "Run without -device.");
-            }
-        }
+        // (a pcorr GAMG with a different nCellsInCoarsestLevel from p_rgh's was refused here while
+        // the device built a hierarchy of its own. It shares the run's now, so the first solve's
+        // entry decides it and the second entry's number is never read -- which is what OpenFOAM
+        // does, and what the `both` profile of tests/interfoam_gamg_vs_openfoam.sh holds.)
     }
 
     DeviceMesh dm = buildDeviceMesh(m, g, fvp);
@@ -1221,6 +1222,7 @@ RunReport runInterFoamDevice(
     DeviceGamgCache gamgCache;
     gamgCache.mesh = &m;
     gamgCache.geometry = &g;
+    gamgCache.host = &meshAgglomeration;
     GamgSolveLog gamgLog;
     C.pressureGamg = f.pSolve.gamgSolver() ? &f.pSolve.gamg : nullptr;
     C.pressureFinalGamg = f.pSolveFinal.gamgSolver() ? &f.pSolveFinal.gamg : nullptr;
@@ -1296,11 +1298,10 @@ RunReport runInterFoamDevice(
     // THE MESH UPDATE'S OWN OBJECTS, as the host driver keeps them (inter_driver_cpp.cu): the mesh's
     // GAMG hierarchy, which the motion solve builds and the run keeps, and the case's CorrectPhi
     // controls, which interMeshUpdate uses when `correctPhi` is on.
-    GamgAgglomerationCache motionCache;
     CorrectPhiControls meshCpc;
     meshCpc.pcorr = &f.pcorrSolve;
     meshCpc.pcorrFinal = &f.pcorrSolveFinal;
-    meshCpc.gamgCache = &motionCache;
+    meshCpc.gamgCache = &meshAgglomeration;
     meshCpc.correctedLaplacian = f.laplacianScheme.corrected;
     meshCpc.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
     meshCpc.gradPcorr = f.gradPcorr;
@@ -1437,7 +1438,7 @@ RunReport runInterFoamDevice(
                 dV0.copyFrom(dm.V.host());
                 C.V0 = &dV0;
                 interMeshUpdate(dyn, f, m, g, fvp, mutableMesh, /*amiPairs=*/nullptr,
-                                motionCache, meshCpc, rep, stepTime, stepIndex, outer,
+                                meshAgglomeration, meshCpc, rep, stepTime, stepIndex, outer,
                                 f.pimple.nOuterCorrectors);
                 // ...and now every buffer this loop uploaded from the geometry. clearGeom +
                 // clearOut on the device side: the addressing is untouched, as the move keeps the
@@ -1651,9 +1652,9 @@ RunReport runInterFoamDevice(
         }
     }
 
-    if (gamgCache.host.built)
+    if (meshAgglomeration.built)
     {
-        const GamgAgglomeration& a = gamgCache.host.agglomeration;
+        const GamgAgglomeration& a = meshAgglomeration.agglomeration;
         for (label leveli = 0; leveli <= a.size(); ++leveli)
         {
             const GamgLduAddressing& addr = a.meshLevel(leveli);

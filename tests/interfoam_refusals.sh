@@ -77,6 +77,24 @@ sed -i 's/^endTime .*/endTime         0.02;/; s/^deltaT .*/deltaT          0.01;
 # ...and laminar/testTubeMixer, for the moving mesh, AS SHIPPED
 SRCM="$TUT/multiphase/interFoam/laminar/testTubeMixer"
 [ -d "$SRCM" ] || { echo "SKIP: testTubeMixer tutorial not found at $SRCM"; exit 77; }
+# a brace-aware rewrite of one fvSolution entry, for the arms below that swap a pressure SOLVER.
+# A regex cannot do it: `p_rghFinal` on the mixer holds a nested `preconditioner { ... }`.
+cat > "$W/setSolver.py" <<'PYEOF'
+import sys
+key, path = sys.argv[1], 'system/fvSolution'
+body = sys.argv[2].replace('\\n', '\n')   # the caller writes the entry on one shell line
+t = open(path).read()
+i = t.index('\n    ' + key + '\n    {')
+j = t.index('{', i)
+depth, k = 0, j
+while True:
+    if t[k] == '{': depth += 1
+    elif t[k] == '}': depth -= 1
+    if depth == 0: break
+    k += 1
+open(path, 'w').write(t[:j] + '{\n' + body + '    }' + t[k + 1:])
+PYEOF
+
 BM="$W/baseMoving"
 cp -r "$SRCM" "$BM" || exit 1
 cp -r "$BM/0.orig" "$BM/0"
@@ -523,9 +541,16 @@ if [ $HAVE_GPU = 1 ]; then
     # the reason is now the SPECIFIC one -- the mesh-update stage is on the host loop only -- because
     # the device loop carries the pieces around it (the ddt's V0, refreshDeviceMeshGeometry) and a
     # caller passing a MutableMesh must not get a silent run on the mesh as it started
-    # a moving mesh RUNS on the device now; what it refuses is the case's GAMG pressure solve, which
-    # this arm substitutes and which on a moving mesh does not reach the tolerance it is given
-    arm device_moving       refused "GAMG pressure solve"  "-device" true
+    # a moving mesh RUNS on the device now, and so does `solver GAMG` for the pressure (the arm below,
+    # and tests/interfoam_moving_vs_openfoam.sh profiles `cylinder` and `solitaryGamg`). What is left
+    # is the GAMG PRECONDITIONER, which this loop substitutes with Jacobi-BiCGStab and which on a
+    # moving mesh does not reach the tolerance it is given -- testTubeMixer writes p_rghFinal that way
+    arm device_moving       refused "GAMG PRECONDITIONER"  "-device" true
+    # ...and the same mesh with p_rgh as a GAMG SOLVER, which it runs: the hierarchy is the mesh's and
+    # is rebuilt on every move. A refusal here would be a blanket one, which is what this arm forbids.
+    # (the mixer's p_rgh is ALREADY `solver GAMG; smoother DIC`; only p_rghFinal is the preconditioner
+    # form, so this arm swaps that one and changes nothing else)
+    arm device_moving_gamg  runs    -                      "-device" "python3 '$W/setSolver.py' p_rghFinal '        solver          GAMG;\n        smoother        DIC;\n        tolerance       2e-09;\n        relTol          0;\n'"
     BASE="$B"
     # a case that needs a pressure reference RUNS on the device now (gated on laminar/mixerVessel2D,
     # where every patch is a wall); this one keeps a pressure-driven atmosphere, which is what adjustPhi

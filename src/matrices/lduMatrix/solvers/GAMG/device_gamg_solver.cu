@@ -304,14 +304,19 @@ void invertMap(
 
 DeviceGamgHierarchy& DeviceGamgCache::get(label nCellsInCoarsestLevel)
 {
-    if (uploaded) return device;
-    if (!mesh || !geometry)
+    // A MESH THAT HAS MOVED: OpenFOAM's GAMGAgglomeration::movePoints sets requireUpdate_, and the
+    // next GAMGAgglomeration::New checks the object out and builds the hierarchy again on the moved
+    // mesh (GAMGAgglomeration.C:311-330, :498-516). The host cache says so by going un-built, and
+    // this upload is stale with it -- the coarse levels' face areas and the pairing they decide are
+    // the OLD mesh's.
+    if (uploaded && host && host->built) return device;
+    if (!mesh || !geometry || !host)
     {
         throw std::runtime_error(
             "brae device GAMG: the hierarchy cache was handed no host mesh. It is built on the host, from "
             "the mesh's own addressing and face areas, by the first GAMG solve of the run.");
     }
-    const GamgAgglomeration& a = host.get(*mesh, *geometry, nCellsInCoarsestLevel);
+    const GamgAgglomeration& a = host->get(*mesh, *geometry, nCellsInCoarsestLevel);
     device.host = &a;
     device.level.resize(static_cast<std::size_t>(a.size()));
     for (label leveli = 0; leveli < a.size(); ++leveli)

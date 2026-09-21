@@ -169,12 +169,14 @@ int main(
     // one the device runs natively (the staging script says what that leaves out); `solitary` is the
     // deforming-mesh paddle AS SHIPPED -- its p_rgh and pcorr are already PCG with DIC, so nothing is
     // staged away there and the device arm runs the tutorial's own fvSolution.
-    const bool deviceArm = (profile == "mixerDevice" || profile == "solitary");
+    const bool deviceArm = (profile == "mixerDevice" || profile == "solitary"
+                         || profile == "cylinder" || profile == "solitaryGamg");
     PrimitiveMesh mD;
     FvGeometry gD;
     std::vector<FvPatch> patchesD;
     MutableMesh mutableD;
     InterFields finD;
+    RunReport rD;
     if (deviceArm)
     {
         int nDev = 0;
@@ -190,8 +192,8 @@ int main(
         mutableD.m = &mD;
         mutableD.g = &gD;
         mutableD.patches = &patchesD;
-        runInterFoamDevice(caseDir, startDir, mD, gD, patchesD, nSteps, /*verbose=*/false, &finD,
-                           scalar(1.0e300), nullptr, &mutableD);
+        rD = runInterFoamDevice(caseDir, startDir, mD, gD, patchesD, nSteps, /*verbose=*/false, &finD,
+                                scalar(1.0e300), nullptr, &mutableD);
         // the two arms must have moved the mesh the same way, or nothing below is about the solver
         scalar wv = 0, sv = 0;
         for (label c = 0; c < nC; ++c)
@@ -294,6 +296,25 @@ int main(
     {
         failures += brae::gatecheck::compareSolves("host", r.pSolves, ofP, nSteps, "p_rgh", scalar(1e-10),
                                                    scalar(1e-6));
+    }
+
+    // THE DEVICE ARM'S OWN p_rgh SOLVES. This is the arm that says the device ran the solver the case
+    // NAMED: `cylinder` asks for GAMG with the DIC smoother, and a V-cycle's iteration count is not a
+    // Krylov method's. Run with the substitute this loop used to make here, the counts are 20 of 20
+    // wrong and p_rgh is 2.5406e+05 of 5.2780e+06 (sloshingTank2D, measured against the host).
+    if (deviceArm)
+    {
+        if (longSolves)
+        {
+            brae::gatecheck::compareSolves("device", rD.pSolves, ofP, nSteps, "p_rgh", scalar(1e-10),
+                                           scalar(1e-6), scalar(-1), nullptr, false);
+            countsAgree("p_rgh", rD.pSolves, ofP);
+        }
+        else
+        {
+            failures += brae::gatecheck::compareSolves("device", rD.pSolves, ofP, nSteps, "p_rgh",
+                                                       scalar(1e-10), scalar(1e-6));
+        }
     }
 
     // ...AND EVERY pcorr LINE: initCorrectPhi's at the start of every profile -- moving or not, with
