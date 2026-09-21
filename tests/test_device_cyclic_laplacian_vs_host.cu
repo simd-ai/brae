@@ -736,6 +736,100 @@ int main(int argc, char** argv)
               control > scalar(1e3)*std::fmax(worst, scalar(1e-300)));
     }
 
+    // ---- linearUpwind's DEFERRED CORRECTION on the pair ------------------------------------------
+    // linearUpwind.C's coupled boundary branch: per face, flux > 0 takes (Cf - C[own]) & grad[own] and
+    // flux < 0 takes (Cf - d - C[own]) & grad[neighbour], and fvm::div multiplies by the face flux and
+    // sums into the OWN cell. The host reference is fvm::addLinearUpwindCorrectionCoupled; the device's
+    // is deviceCyclicAddLinUpwindCorr, which the legacy simpleFoam driver has called since it was
+    // written (device_simple_foam.cu:1808) and the OF-mirror interFoam momentum now calls too. Nothing
+    // in the tree compared the two until this arm.
+    //
+    // BOTH ARMS ARE HANDED THE SAME GRADIENT, so what is gated here is the correction's own arithmetic
+    // -- the d-vectors, the upwind branch and the flux weighting -- and not fvc::grad, which the arm
+    // above already holds.
+    {
+        std::vector<vector> Uc(static_cast<std::size_t>(nC));
+        for (label c = 0; c < nC; ++c)
+        {
+            Uc[static_cast<std::size_t>(c)] =
+                vector{scalar(0.4) + scalar(0.09)*c, scalar(-0.3) + scalar(0.05)*c, scalar(0.03)*c};
+        }
+        const GeometricField<vector> vfU = buildCyclicField<vector>(Uc, fvp, cyclics);
+        const std::vector<tensor> hostG = fvc::gaussGrad(vfU, m, g, fvp);
+
+        // grad(U_l) per component, as the device kernel indexes it: gU{x,y,z}[l] = dU_l/d{x,y,z},
+        // which is the tensor's (x,l), (y,l), (z,l) entries -- the transpose of the row-major reading,
+        // and the one place a component index would silently go wrong.
+        DeviceBuffer<scalar> gUx[3], gUy[3], gUz[3];
+        for (int l = 0; l < 3; ++l)
+        {
+            std::vector<scalar> cx(static_cast<std::size_t>(nC)), cy(static_cast<std::size_t>(nC)),
+                                cz(static_cast<std::size_t>(nC));
+            for (label c = 0; c < nC; ++c)
+            {
+                const tensor& t = hostG[static_cast<std::size_t>(c)];
+                const scalar row[9] = {t.xx, t.xy, t.xz, t.yx, t.yy, t.yz, t.zx, t.zy, t.zz};
+                cx[static_cast<std::size_t>(c)] = row[0*3 + l];
+                cy[static_cast<std::size_t>(c)] = row[1*3 + l];
+                cz[static_cast<std::size_t>(c)] = row[2*3 + l];
+            }
+            gUx[l].copyFrom(cx);
+            gUy[l].copyFrom(cy);
+            gUz[l].copyFrom(cz);
+        }
+
+        // a flux that changes sign over the pair, so both upwind branches are taken
+        std::vector<scalar> phiB;
+        std::size_t nPos = 0, nNeg = 0;
+        for (const CyclicInterface& c : cyclics)
+        {
+            for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+            {
+                const scalar v = scalar(0.05)*std::sin(scalar(0.9)*scalar(i) + scalar(2*c.patch));
+                phiB.push_back(v);
+                if (v > 0) ++nPos; else ++nNeg;
+            }
+        }
+        check("the correction arm's flux changes sign, so both upwind branches are taken",
+              nPos > 0 && nNeg > 0);
+
+        std::vector<std::vector<scalar>> phiBnd(fvp.size());
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            phiBnd[pi].assign(static_cast<std::size_t>(fvp[pi].size), scalar(0));
+        {
+            std::size_t j = 0;
+            for (const CyclicInterface& c : cyclics)
+                for (std::size_t i = 0; i < c.faceCells.size(); ++i, ++j)
+                    phiBnd[static_cast<std::size_t>(c.patch)][i] = phiB[j];
+        }
+        std::vector<vector> hostCorr(static_cast<std::size_t>(nC), vector{0, 0, 0});
+        fvm::addLinearUpwindCorrectionCoupled<vector, tensor>(hostCorr, phiBnd, hostG, g, fvp);
+
+        DeviceCyclic cycL = buildDeviceCyclic(cyclics, g, fvp);
+        DeviceBuffer<scalar> fluxIf(phiB);
+        scalar worst = 0, scale = 0;
+        for (int comp = 0; comp < 3; ++comp)
+        {
+            DeviceBuffer<scalar> corrD(std::vector<scalar>(static_cast<std::size_t>(nC), scalar(0)));
+            deviceCyclicAddLinUpwindCorr(cycL, comp, gUx, gUy, gUz, corrD, &fluxIf);
+            std::vector<scalar> dv;
+            corrD.copyTo(dv);
+            for (label c = 0; c < nC; ++c)
+            {
+                const std::size_t k = static_cast<std::size_t>(c);
+                const vector& h = hostCorr[k];
+                const scalar hv = (comp == 0) ? h.x : (comp == 1) ? h.y : h.z;
+                worst = std::fmax(worst, std::fabs(dv[k] - hv));
+                scale = std::fmax(scale, std::fabs(hv));
+            }
+        }
+        std::printf("  linearUpwind correction on the pair: worst |device - host| %.4e of %.4e\n",
+                    (double)worst, (double)scale);
+        check("the device's coupled linearUpwind correction IS the host's",
+              worst <= scalar(1e-14)*std::fmax(scale, scalar(1e-300)));
+        check("...and it is not identically zero, so the comparison means something", scale > scalar(0));
+    }
+
     std::printf("test_device_cyclic_laplacian_vs_host: %d failures\n", failures);
     return failures ? 1 : 0;
 }
