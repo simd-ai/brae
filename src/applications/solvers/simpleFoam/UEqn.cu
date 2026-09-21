@@ -43,6 +43,43 @@ void assembleUEqn(
 {
     refuseUnsupported(in);
 
+    // fvc::grad(U) ON A COUPLED MESH. gaussGrad sums EVERY face of a cell and a cyclic face is a face,
+    // but deviceGradUShared walks the internal faces and the device's boundary arrays, which carry no
+    // coupled face (device_mesh.cuh:41-44) -- so the pair's half was missing from every gradient this
+    // assembly takes. The CLOSURE's grad(U) was given the same half in #28 (commit 44a8ba6); this is
+    // the momentum path's, and it is applied to the LOCAL copies rather than to the shared memo, which
+    // other sites and other iterations read.
+    //
+    // MEASURED on damBreakPorousBaffle with every solve pinned at 1e-16, at the second outer corrector
+    // (the first starts from rest, where grad(U) is zero and this term cannot be seen): the momentum
+    // source was 5.9392e-11 of 9.9062e-04 from the host arm, H 5.3135e-05 of 8.6143e+02 once divided
+    // by V, HbyA 5.0952e-09 and U 3.6174e-09 -- against 1.5959e-15 for the same case meshed with no
+    // pair at all.
+    const DeviceBuffer<scalar>* UForGrad[3] = {&Ux, &Uy, &Uz};
+    if (in.cyc && in.cyc->n > 0)
+    {
+        if (in.cyc->rotational)
+            throw std::runtime_error(
+                "brae device UEqn: grad(U) across a ROTATIONAL cyclic needs the neighbour rotated by "
+                "forwardT (deviceCyclicAddGradRot, which takes all three components at once); this "
+                "assembly adds the pair per component. Refusing rather than summing an un-rotated "
+                "neighbour into the gradient.");
+        if (in.gradULimitK > 0.0)
+            throw std::runtime_error(
+                "brae device UEqn: a cellLimited grad(U) across a coupled patch would limit against a "
+                "neighbour it cannot see -- OF's cellLimitedGrad treats a cyclic face as internal, and "
+                "this arm's limiter walks the internal faces and the non-coupled patches only. The "
+                "Gauss half is summed across the pair here; the limiter's is not ported. Refusing.");
+    }
+    auto addPairToGrad = [&](int k,
+                             DeviceBuffer<scalar>& gx,
+                             DeviceBuffer<scalar>& gy,
+                             DeviceBuffer<scalar>& gz)
+    {
+        if (!in.cyc || in.cyc->n == 0) return;
+        deviceCyclicAddGrad(*in.cyc, *UForGrad[k], dm.V, gx, gy, gz);
+    };
+
     // ---- fvm::div(phi, U) -------------------------------------------------------------------
     // Upwind implicit weights, matching the reference's fvm::div. The weights of this operator are where
     // brae's LUST defect lived, which is why the CUDA-vs-reference test compares them coefficient by
@@ -67,6 +104,7 @@ void assembleUEqn(
                 deviceCopy(gx[k], gm.gx[k]);
                 deviceCopy(gy[k], gm.gy[k]);
                 deviceCopy(gz[k], gm.gz[k]);
+                addPairToGrad(k, gx[k], gy[k], gz[k]);
             }
             const scalar twoByk = (in.scheme == cpu::DivScheme::vanLeerV)
                 ? kVanLeerTwoByk
@@ -197,6 +235,7 @@ void assembleUEqn(
             deviceCopy(gxc[k], gm.gx[k]);
             deviceCopy(gyc[k], gm.gy[k]);
             deviceCopy(gzc[k], gm.gz[k]);
+            addPairToGrad(k, gxc[k], gyc[k], gzc[k]);
         }
         if (in.snGradLimitCoeff > 0.0)
         {
@@ -249,6 +288,7 @@ void assembleUEqn(
             deviceCopy(gx[k], gm.gx[k]);
             deviceCopy(gy[k], gm.gy[k]);
             deviceCopy(gz[k], gm.gz[k]);
+            addPairToGrad(k, gx[k], gy[k], gz[k]);
             if (in.gradULimitK > 0.0)
                 deviceCellLimitGrad(dm, *Usrc[k], gm.ub[k], gx[k], gy[k], gz[k], in.gradULimitK);
         }
@@ -270,6 +310,7 @@ void assembleUEqn(
             deviceCopy(gx, gm.gx[k]);
             deviceCopy(gy, gm.gy[k]);
             deviceCopy(gz, gm.gz[k]);
+            addPairToGrad(k, gx, gy, gz);
             // `linearUpwind <name>` where <name> resolves to `cellLimited Gauss linear <k>`.
             if (in.gradULimitK > 0.0)
                 deviceCellLimitGrad(dm, *U[k], gm.ub[k], gx, gy, gz, in.gradULimitK);
