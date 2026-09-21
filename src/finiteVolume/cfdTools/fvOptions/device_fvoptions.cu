@@ -2,6 +2,7 @@
 // (incompressible: mu=nu, rho=1), implicit isotropic resistance into the diagonal + explicit anisotropic remainder.
 #include "device_fvoptions.cuh"
 #include <cuda_runtime.h>
+#include <stdexcept>
 
 namespace brae {
 namespace {
@@ -347,6 +348,108 @@ void porTensorSrcKernel(
 }
 
 } // namespace
+
+
+namespace {
+
+__global__ void mangrovesMomentumKernel(
+    int nC,
+    const scalar* dragFac,
+    const scalar* inertia,
+    const scalar* rho,
+    const scalar* V,
+    scalar rDeltaT,
+    const scalar* Ux,
+    const scalar* Uy,
+    const scalar* Uz,
+    const scalar* U0x,
+    const scalar* U0y,
+    const scalar* U0z,
+    scalar* diag,
+    scalar* sx,
+    scalar* sy,
+    scalar* sz)
+{
+    const int c = blockDim.x*blockIdx.x + threadIdx.x;
+    if (c >= nC) return;
+    // the host's expressions, term for term (fvOptions_cpp.cu): drag and inertia are zero outside
+    // the regions, where every line below adds zero
+    const scalar drag = dragFac[c]*sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);
+    const scalar rd = rho[c]*drag;
+    const scalar ri = rho[c]*inertia[c];
+    diag[c] += V[c]*rd + (rDeltaT*V[c])*ri;
+    sx[c] += ((rDeltaT*U0x[c])*V[c])*ri;
+    sy[c] += ((rDeltaT*U0y[c])*V[c])*ri;
+    sz[c] += ((rDeltaT*U0z[c])*V[c])*ri;
+}
+
+__global__ void mangrovesCoeffKernel(
+    int nC,
+    const scalar* fac,
+    const scalar* Ux,
+    const scalar* Uy,
+    const scalar* Uz,
+    scalar* coeff)
+{
+    const int c = blockDim.x*blockIdx.x + threadIdx.x;
+    if (c >= nC) return;
+    coeff[c] = fac[c]*sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);
+}
+
+} // namespace
+
+
+void deviceMangrovesMomentum(
+    const DeviceMangroves& mg,
+    const DeviceBuffer<scalar>& rho,
+    const DeviceBuffer<scalar>& V,
+    scalar rDeltaT,
+    const DeviceBuffer<scalar>& Ux,
+    const DeviceBuffer<scalar>& Uy,
+    const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>& U0x,
+    const DeviceBuffer<scalar>& U0y,
+    const DeviceBuffer<scalar>& U0z,
+    DeviceBuffer<scalar>& diag,
+    DeviceBuffer<scalar>& srcX,
+    DeviceBuffer<scalar>& srcY,
+    DeviceBuffer<scalar>& srcZ)
+{
+    const int nC = static_cast<int>(diag.size());
+    if (!mg.source || nC == 0) return;
+    const std::size_t n = static_cast<std::size_t>(nC);
+    if (mg.dragFac.size() != n || mg.inertia.size() != n || rho.size() != n || V.size() != n
+     || Ux.size() != n || U0x.size() != n || U0y.size() != n || U0z.size() != n || srcX.size() != n)
+    {
+        throw std::runtime_error(
+            "brae deviceMangrovesMomentum: the coefficients, rho, V, U, U.oldTime() and the matrix must "
+            "all be one value per cell.");
+    }
+    mangrovesMomentumKernel<<<nBlocks(nC), TPB>>>(nC, mg.dragFac.data(), mg.inertia.data(), rho.data(),
+                                                  V.data(), rDeltaT, Ux.data(), Uy.data(), Uz.data(),
+                                                  U0x.data(), U0y.data(), U0z.data(), diag.data(),
+                                                  srcX.data(), srcY.data(), srcZ.data());
+    cudaCheck(cudaGetLastError(), "mangrovesMomentum");
+}
+
+
+void deviceMangrovesCoeff(
+    const DeviceBuffer<scalar>& fac,
+    const DeviceBuffer<scalar>& Ux,
+    const DeviceBuffer<scalar>& Uy,
+    const DeviceBuffer<scalar>& Uz,
+    DeviceBuffer<scalar>& coeff)
+{
+    const int nC = static_cast<int>(fac.size());
+    coeff.resize(fac.size());
+    if (nC == 0) return;
+    if (Ux.size() != fac.size() || Uy.size() != fac.size() || Uz.size() != fac.size())
+    {
+        throw std::runtime_error("brae deviceMangrovesCoeff: U must be one value per cell, as the coefficient is.");
+    }
+    mangrovesCoeffKernel<<<nBlocks(nC), TPB>>>(nC, fac.data(), Ux.data(), Uy.data(), Uz.data(), coeff.data());
+    cudaCheck(cudaGetLastError(), "mangrovesCoeff");
+}
 
 
 void deviceFvoPorosityDiag(

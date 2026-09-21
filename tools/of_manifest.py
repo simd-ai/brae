@@ -2753,7 +2753,13 @@ COMPONENTS = {
                         "rather than U.oldTime() (the same field at assembly with one outer corrector and no "
                         "predictor). tests/test_fvoptions_cpp.cu holds the reading and the refusals. NOT CLAIMED, "
                         "each refused: the density-weighted k-epsilon, any other closure under the turbulence "
-                        "option, a field-name override, and the device loop.",
+                        "option, a field-name override, more than one option of either type on the device loop. "
+                        "THE DEVICE LOOP RUNS IT TOO (2026-09-22), by its own bounds over the same 450 steps: "
+                        "alpha 6.4e-14, p_rgh 4.8e-14, U 3.9e-11, k 3.2e-12, epsilon 3.5e-12, nut 1.7e-12, all "
+                        "900 p_rgh and all 450 k and 450 epsilon counts OpenFOAM's and their final residuals "
+                        "with them; the seven U/k fail-proofs above read the SAME numbers to two digits when "
+                        "broken on the device arm, and the added mass on U for U.oldTime() is not discriminated "
+                        "there either.",
              note="TWO OPTIONS over each region's cellZone. multiphaseMangrovesSource: addSup(rho, eqn) adds "
                   "-Sp(rho*0.5*Cd*a*N*|U|, U) - rho*0.25*(Cm + 1)*pi*a^2*N*ddt(U), which UEqn == options "
                   "turns into diag += V*rho*drag + (rDeltaT*V)*rho*inertia and source += "
@@ -2762,8 +2768,12 @@ COMPONENTS = {
                   "incompressible lineage, alpha = rho = 1 -- adds -Sp(Ckp*Cd*a*N*|U|, k) and "
                   "-Sp(Cep*Cd*a*N*|U|, epsilon), U looked up by name. Every region coefficient is readEntry "
                   "in OpenFOAM and required here. firstUnsupported() still reports both types to every "
-                  "driver but interFoam's host loop, which checks its options itself: the drivers that ask "
-                  "treat an implemented option they do not recognise as a porosity. HOST ONLY SO FAR."),
+                  "driver but interFoam's two loops, which check their options themselves: the drivers that "
+                  "ask treat an implemented option they do not recognise as a porosity. ON THE DEVICE the "
+                  "per-cell coefficients WITHOUT their |U| are built once from the host OptionList's regions, "
+                  "in the host's multiplication order, and |U| is taken on the device at each assembly: "
+                  "deviceMangrovesMomentum in the shared assembler's fvOptions slot (UEqn.cu), and "
+                  "KEpsilonInput::fvoSpK/fvoSpEps as diag += V*coeff ahead of relax()."),
         dict(name="interFoam_PBiCG", of_symbol="PBiCG",
              of_file="src/OpenFOAM/matrices/lduMatrix/solvers/PBiCG/PBiCG.C",
              classification="GPU_REQUIRED", status="REIMPLEMENT",
@@ -2772,14 +2782,27 @@ COMPONENTS = {
                         "OpenFOAM's iteration count and end on its final residual. BROKEN ONCE EACH: "
                         "PBiCGStab in its place, 76 of 450 k counts equal and U 9.2e-05; DILU's transpose sweep "
                         "not transposed, the run fails. tests/interfoam_refusals.sh: PBiCGStab named for k is "
-                        "refused.",
+                        "refused. ON THE DEVICE: tests/test_device_pbicg.cu holds devicePBiCGDilu to the host "
+                        "reference on an asymmetric 5760-cell system -- Tmul 1.6e-15, preconditionT bit for bit, "
+                        "the iterate at relTol 0.01 1.1e-14 apart in five iterations where PBiCGStab takes three "
+                        "and lands 2.6e-03 away, 25 iterations in both converged -- and the mangrove gate's "
+                        "device arm holds every one of its 900 k and epsilon solves to OpenFOAM's log. BROKEN "
+                        "ONCE EACH on the device: preconditionT or Tmul on the direct view, beta inverted (the "
+                        "unit gate, 8 checks each); PBiCGStab in its place, 76 of 450 k counts and U 9.2e-05; the "
+                        "Gauss-Seidel sweep the closure used to set unconditionally, 0 of 450 and U 1.1e-04.",
              note="PBiCG with the DILU preconditioner, transcribed from PBiCG.C and DILUPreconditioner.C: "
                   "the direct and TRANSPOSE systems side by side (Amul/Tmul, precondition/preconditionT), "
                   "the singularity break before the count moves. Not PBiCGStab, which brae already had and "
                   "which stops at different iterates at the same tolerance. The sweeps run in face order: "
                   "for any cell the subtractions arrive in the same face order as losortAddr's, so the bits "
                   "are the same. Wired for interFoam's kEpsilon (LinearSolverChoice::pbicgDILU); the LES and "
-                  "kOmegaSST closures still refuse it. HOST ONLY SO FAR."),
+                  "kOmegaSST closures still refuse it. ON THE DEVICE "
+                  "(src/matrices/lduMatrix/solvers/PBiCG/device_pbicg.cu) the transpose system is a VIEW -- "
+                  "deviceAmul and diluApply on the same matrix with upper and lower exchanged, one rD for "
+                  "both since calcReciprocalD reads only their product -- and a coupled interface is refused "
+                  "as the host refuses it. FOUND BY THIS PORT: the device closure set its Gauss-Seidel sweep "
+                  "unconditionally, so a case naming PBiCG would have run a smoothSolver under that entry in "
+                  "silence; it selects by name now and refuses what it does not run."),
         dict(name="interFoam_variableHeightFlowRate", of_symbol="variableHeightFlowRateInletVelocityFvPatchVectorField",
              of_file="src/finiteVolume/fields/fvPatchFields/derived/variableHeightFlowRateInletVelocity/"
                      "variableHeightFlowRateInletVelocityFvPatchVectorField.C",

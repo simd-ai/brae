@@ -179,9 +179,11 @@ RunReport runInterFoamDevice(
             "the filter width once, from the host's LESdelta::compute on the mesh as it starts; a mesh "
             "that moves changes it at every update. Run without -device.");
 
-    // fvOptions: the device UEqn applies explicitPorositySource/DarcyForchheimer, and nothing else. Each
-    // other type is refused BY ITS OWN NAME rather than by a blanket notice -- the mangroves pair, the
-    // constraints and the rest are host-only and gated there.
+    // fvOptions: the device loop applies explicitPorositySource/DarcyForchheimer on U and THE MANGROVE
+    // PAIR -- multiphaseMangrovesSource on U, multiphaseMangrovesTurbulenceModel on k and epsilon under
+    // kEpsilon (the case reader has already refused it under any other closure). Each other type is
+    // refused BY ITS OWN NAME rather than by a blanket notice: the constraints and the rest are
+    // host-only and gated there.
     for (const fvOptions::Option& o : f.fvOptions.options)
     {
         if (!o.active) continue;
@@ -189,10 +191,24 @@ RunReport runInterFoamDevice(
                         && (o.type == "explicitPorositySource")
                         && !o.fixedCoeff;
         if (darcy) continue;
+        if (o.unsupported.empty() && o.mangroves == fvOptions::Option::Mangroves::source) continue;
+        if (o.unsupported.empty() && o.mangroves == fvOptions::Option::Mangroves::turbulence)
+        {
+            // OpenFOAM's density-weighted k-epsilon calls addSup(rho, eqn), -Sp(rho*coeff); the host
+            // reference refuses that lineage inside its closure (fvOptions_cpp.cu: no gate holds it),
+            // and this loop says so before the first step rather than in the middle of it
+            if (f.turbulence.variableDensity)
+                throw std::runtime_error(
+                    "brae interFoam (device): fvOptions has `" + o.name + "` "
+                    "(multiphaseMangrovesTurbulenceModel) and the closure is the `density variable` "
+                    "lineage, where OpenFOAM adds -Sp(rho*coeff) to k and epsilon. No gate holds that "
+                    "form on either loop.");
+            continue;
+        }
         throw std::runtime_error(
             "brae interFoam (device): fvOptions has an active option `" + o.name + "` (" + o.type
-            + "). The device loop's UEqn applies explicitPorositySource/DarcyForchheimer only; the host "
-            "loop carries this one. Refused rather than run the case without it.");
+            + "). The device loop applies explicitPorositySource/DarcyForchheimer and the mangrove pair "
+            "only; the host loop carries this one. Refused rather than run the case without it.");
     }
     // THE PAIR RUNS ON THE DEVICE. validation/interFoamCyclic, ten steps of 2e-3, against real
     // OpenFOAM: alpha 4.2e-11, p_rgh 1.98e-11 relative of 1.6e+03, U 5.7e-11 relative -- and the same
@@ -1182,6 +1198,60 @@ RunReport runInterFoamDevice(
         }
     }
 
+    // THE MANGROVE PAIR, from the HOST OptionList's own regions: each coefficient without its |U|, per
+    // cell, in the host reference's multiplication order -- zero everywhere, then each region's cells
+    // ASSIGNED in order, so a later region overwrites an earlier one on a shared cell as OpenFOAM's
+    // loops do (fvOptions_cpp.cu, multiphaseMangrovesSource.C:36-101).
+    DeviceMangroves dMangroves;
+    {
+        const std::size_t nCz = static_cast<std::size_t>(m.nCells());
+        const scalar pi = 3.14159265358979323846;   // constant::mathematical::pi, M_PI
+        for (const fvOptions::Option& o : f.fvOptions.options)
+        {
+            if (!o.active || !o.unsupported.empty()) continue;
+            if (o.mangroves == fvOptions::Option::Mangroves::source)
+            {
+                if (dMangroves.source)
+                    throw std::runtime_error(
+                        "brae interFoam (device): more than one active multiphaseMangrovesSource. The "
+                        "device step carries one; the host loop carries them all.");
+                std::vector<scalar> dragFac(nCz, scalar(0));
+                std::vector<scalar> inertia(nCz, scalar(0));
+                for (const fvOptions::Option::MangroveRegion& r : o.mangroveRegions)
+                {
+                    for (const label c : r.cells)
+                    {
+                        dragFac[static_cast<std::size_t>(c)] = 0.5*r.Cd*r.a*r.N;
+                        inertia[static_cast<std::size_t>(c)] = 0.25*(r.Cm + 1)*pi*r.a*r.a*r.N;
+                    }
+                }
+                dMangroves.source = true;
+                dMangroves.dragFac.copyFrom(dragFac);
+                dMangroves.inertia.copyFrom(inertia);
+            }
+            if (o.mangroves == fvOptions::Option::Mangroves::turbulence)
+            {
+                if (dMangroves.turbulence)
+                    throw std::runtime_error(
+                        "brae interFoam (device): more than one active multiphaseMangrovesTurbulenceModel. "
+                        "The device closure carries one; the host loop carries them all.");
+                std::vector<scalar> kFac(nCz, scalar(0));
+                std::vector<scalar> epsFac(nCz, scalar(0));
+                for (const fvOptions::Option::MangroveRegion& r : o.mangroveRegions)
+                {
+                    for (const label c : r.cells)
+                    {
+                        kFac[static_cast<std::size_t>(c)] = r.Ckp*r.Cd*r.a*r.N;
+                        epsFac[static_cast<std::size_t>(c)] = r.Cep*r.Cd*r.a*r.N;
+                    }
+                }
+                dMangroves.turbulence = true;
+                dMangroves.kFac.copyFrom(kFac);
+                dMangroves.epsFac.copyFrom(epsFac);
+            }
+        }
+    }
+
     std::vector<DeviceMRFZone> dMrf;
     for (const cpu::MRF::Zone& z : f.mrfZones)
     {
@@ -1275,6 +1345,7 @@ RunReport runInterFoamDevice(
     C.nHatfIf     = (dCyc.n > 0) ? &dNHIf : nullptr;
     cycPhiForHost = (dCyc.n > 0) ? &dCyc.phi : nullptr;
     C.porosity = dPorosity.active ? &dPorosity : nullptr;
+    C.mangroves = dMangroves.source ? &dMangroves : nullptr;
     // p_rgh's reference, where the host driver sets it (inter_driver_cpp.cu:779-781). These three were
     // dead for as long as the device refused a case that needs one, and a step that never pins leaves the
     // singular system's level to the solver: MEASURED on laminar/mixerVessel2D before they were set, a
@@ -1720,6 +1791,7 @@ RunReport runInterFoamDevice(
                 ti.epsilonLog = (f.turbulence.model == cpu::interFoam::InterRasModel::KOmegaSST)
                               ? &rep.omegaSolves : &rep.epsilonSolves;
                 ti.kLog = &rep.kSolves;
+                ti.mangroves = dMangroves.turbulence ? &dMangroves : nullptr;
                 deviceCorrectInterTurbulence(dTurb, f.turbulence, ti, dm, dbU);
             }
             // ...or THE HOST CLOSURE in the same loop. f.U is current (the step's last updateUBoundary
@@ -1778,6 +1850,9 @@ RunReport runInterFoamDevice(
                 ti.nu = &f.nu;
                 ti.nuBnd = &f.nuBnd;
                 ti.deltaT = rep.deltaT;
+                // fvOptions(k) and fvOptions(epsilon), as the host loop hands them (inter_driver_cpp.cu):
+                // without this the instrument ran the mangroves' case with no turbulence source at all
+                ti.fvOptions = f.fvOptions.empty() ? nullptr : &f.fvOptions;
                 // the host closure keeps the two second fields in separate logs and fills the model's own
                 ti.omegaLog = &rep.omegaSolves;
                 ti.epsilonLog = &rep.epsilonSolves;

@@ -499,9 +499,16 @@ if [ $HAVE_GPU = 1 ]; then
     # numbers). It was refused twice -- for the closure, then for a momentum gap that turned out to be
     # three wedge defects -- so this arm is a `runs`, and a blanket refusal coming back fails it
     arm device_les          runs    -                      "-device" true
-    # the device loop's UEqn applies no fvOption, and refuses the mangroves by name
+    # the MANGROVE PAIR RUNS on the device now, with k and epsilon under the PBiCG/DILU the case names
+    # (tests/interfoam_mangrove_vs_openfoam.sh holds both arms to OpenFOAM, solve by solve). It was a
+    # refusal by the option's name, and behind that refusal the closure would have run a Gauss-Seidel
+    # sweep under PBiCG's entry -- so this arm is a `runs`, and a blanket refusal coming back fails it
     BASE="$BG"
-    arm device_mangrove     refused "Mangroves"             "-device" true
+    arm device_mangrove     runs    -                       "-device" true
+    # ...and the turbulence option under the `density variable` k-epsilon, where OpenFOAM's addSup is
+    # -Sp(rho*coeff): the device names it before the first step (the host closure refuses the same
+    # lineage where it meets it)
+    arm device_mangrove_rhoKE refused "density variable"    "-device" "sed -i 's/^simulationType .*/density variable;\nsimulationType RAS;/' constant/turbulenceProperties; sed -i 's/div(phi,k) /div(rhoPhi,k) /; s/div(phi,epsilon) /div(rhoPhi,epsilon) /' system/fvSchemes"
     # the device's alpha pre-solve does not honour minIter (the host's does)
     BASE="$B"
     arm device_alphaMinIter    refused "minIter 1"               "-device" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       yes;\\n\\1minIter 1;/' system/fvSolution"

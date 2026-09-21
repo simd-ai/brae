@@ -27,6 +27,8 @@
 //   nu                    the mixture's, cells and patches, in both lineages
 //   validate()            the host's, at buildInterFields: nut arrives here already validated or not
 #include "cf_types.cuh"
+#include "device_fvoptions.cuh"   // DeviceMangroves
+#include "device_dilu.cuh"
 #include "device_boundary.cuh"
 #include "device_buffer.cuh"
 #include "device_kepsilon.cuh"
@@ -74,6 +76,13 @@ struct DeviceInterTurbulence
 
     DeviceBuffer<scalar> onesCell;
     DeviceBuffer<scalar> onesBnd;
+    // the mesh's DILU level schedule, built only when kFinal/epsilonFinal name `PBiCG` with `DILU`
+    // (waves/mangroveInteraction): the closure then runs OpenFOAM's PBiCG (device_pbicg.cuh) and not
+    // the smoothSolver sweep every other turbulent tutorial names
+    DeviceDilu dilu;
+    // kCoeff and epsilonCoeff of multiphaseMangrovesTurbulenceModel at this step's U, per cell
+    DeviceBuffer<scalar> mangroveK;
+    DeviceBuffer<scalar> mangroveEps;
 
     // kOmegaSST's own, when the case names it: the CELL wall distance F1 and F2 read (wallDist::New's y,
     // not the wall functions' near-wall face distance), the faces where F1 is 1 by construction, and
@@ -145,6 +154,10 @@ struct DeviceInterTurbulenceStepInput
     // every solve of the run, in order, for the solver-log gate
     std::vector<cpu::interFoam::LinearSolveRecord>* epsilonLog = nullptr;
     std::vector<cpu::interFoam::LinearSolveRecord>* kLog = nullptr;
+    // fvOptions(k) and fvOptions(epsilon): multiphaseMangrovesTurbulenceModel's -Sp(Cx*Cd*a*N*|U|, .),
+    // with U the closure's own -- OpenFOAM looks `U` up when the equation is built. Under kEpsilon
+    // only; the case reader refuses the option under any other closure. Null = no such option.
+    const DeviceMangroves* mangroves = nullptr;
 };
 
 // turbulence->correct(), interFoam.C:171.

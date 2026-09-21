@@ -180,6 +180,9 @@ struct DeviceInterStepControls
     // OptionList (its transformed D and F tensors). Every other option type stays host-only and the
     // driver refuses it by name.
     const DevicePorosity* porosity = nullptr;
+    // ...and multiphaseMangrovesSource, the drag and added mass of waves/mangroveInteraction, which the
+    // shared assembler adds in the same slot from this step's rho, U.oldTime() and deltaT.
+    const DeviceMangroves* mangroves = nullptr;
     // THE MESH'S PERIODIC PAIR. Every piece it needs is gated against the host on its own
     // (tests/test_device_cyclic_laplacian_vs_host.cu, test_device_mules_cyclic_vs_host.cu,
     // test_device_inter_peqn_cyclic_vs_host.cu). `cyc->phi` must hold the pair's CURRENT flux -- the

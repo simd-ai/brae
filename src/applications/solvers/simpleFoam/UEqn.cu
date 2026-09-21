@@ -427,6 +427,22 @@ void assembleUEqn(
                                     in.porosityMu, in.porosityRho);
     }
 
+    // == fvOptions(rho, U): multiphaseMangrovesSource, in the slot the porosity takes -- after every
+    // other coefficient, before relax() (inter_ueqn_cpp.cu has it there)
+    if (in.mangroves && in.mangroves->source)
+    {
+        if (!in.mangrovesRho || !in.ddtUOld[0] || !in.ddtUOld[1] || !in.ddtUOld[2] || !(in.ddtDeltaT > 0.0))
+            throw std::runtime_error(
+                "brae momentum: multiphaseMangrovesSource needs the density, U.oldTime() and the time "
+                "step -- its added mass is rho*inertiaCoeff*ddt(U) (multiphaseMangrovesSource.C:125-143) "
+                "-- and the caller supplied "
+                + std::string(!in.mangrovesRho ? "no density" : !(in.ddtDeltaT > 0.0) ? "no time step"
+                                                                                      : "no old velocity") + ".");
+        deviceMangrovesMomentum(*in.mangroves, *in.mangrovesRho, dm.V, 1.0/in.ddtDeltaT, Ux, Uy, Uz,
+                                *in.ddtUOld[0], *in.ddtUOld[1], *in.ddtUOld[2],
+                                M.diag, M.source[0], M.source[1], M.source[2]);
+    }
+
     // ---- the PERIODIC PAIR's momentum coupling ----------------------------------------------
     // Gated face by face against the host's own coupled coefficients in
     // tests/test_device_cyclic_laplacian_vs_host.cu. It goes in before relax, with every other

@@ -159,6 +159,12 @@ struct MomentumInput
     const DeviceBuffer<scalar>* cycConvFlux = nullptr;
     const DeviceBuffer<scalar>* porosityMu = nullptr;
     const DeviceBuffer<scalar>* porosityRho = nullptr;
+    // multiphaseMangrovesSource, `== fvOptions(rho, U)` on a rho-weighted TRANSIENT equation: a drag
+    // and an added mass whose ddt(U) reads U.oldTime() and the step, so it takes ddtUOld and ddtDeltaT
+    // below and is refused without them, as the host reference refuses it (fvOptions_cpp.cu). The rho
+    // is the equation's own, handed separately because a steady solver has none to give.
+    const DeviceMangroves* mangroves = nullptr;
+    const DeviceBuffer<scalar>* mangrovesRho = nullptr;
     // rotorDiskSource. OF addSup is `eqn -= force` with force PER VOLUME, and operator-= is
     // source += V*su, so the extensive source GAINS the raw force. See rotorDiskSource_cpp.cuh.
     const DeviceRotorDisk* rotor = nullptr;

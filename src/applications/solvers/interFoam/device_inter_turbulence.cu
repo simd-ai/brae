@@ -40,6 +40,11 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
 {
     DeviceInterTurbulence d;
     if (!t.on) return d;
+    // PBiCG's preconditioner needs the mesh's level schedule, once (see DeviceInterTurbulence::dilu)
+    if (t.model == cpu::interFoam::InterRasModel::KEpsilon && t.kSolveFinal.pbicgDILU())
+    {
+        d.dilu = buildDeviceDilu(m.owner(), m.neighbour(), m.nCells());
+    }
 
     // The device closure builds its wall set from patches that are BOTH a `wall` and carry the
     // wall function (isTurbWallPatch); the host reference asks the boundary condition alone. They
@@ -563,13 +568,49 @@ void deviceCorrectInterTurbulence(
     kin.relaxK = t.kRelaxFinal.factor;
     const cpu::interFoam::SmoothLinearSolve& ks = t.kSolveFinal;
     const cpu::interFoam::SmoothLinearSolve& es = t.epsSolveFinal;
-    if (ks.smoother != es.smoother || ks.tol != es.tol || ks.relTol != es.relTol
+    if (ks.solver != es.solver || ks.preconditioner != es.preconditioner
+     || ks.smoother != es.smoother || ks.tol != es.tol || ks.relTol != es.relTol
      || ks.maxIter != es.maxIter || ks.minIter != es.minIter || ks.nSweeps != es.nSweeps)
         throw std::runtime_error(
             "brae interFoam (device): fvSolution gives kFinal and epsilonFinal different solver "
             "settings; the closure takes one set for both equations.");
-    kin.gsK = true;
-    kin.gsEps = true;
+    // THE SOLVER THE CASE NAMES, and only that. The host reader admits two for kEpsilon: a
+    // Gauss-Seidel smoothSolver and PBiCG with DILU. This branch set the first unconditionally, so a
+    // case naming PBiCG -- waves/mangroveInteraction -- would have run symGaussSeidel sweeps under
+    // PBiCG's tolerance and said nothing; it was only ever refused for its fvOptions.
+    if (ks.pbicgDILU())
+    {
+        if (!d.dilu.valid)
+            throw std::runtime_error(
+                "brae interFoam (device): kFinal names PBiCG with DILU and the closure was built with no "
+                "DILU schedule for this mesh.");
+        kin.pbicgKE = true;
+        kin.precon = &d.dilu;
+    }
+    else if (ks.gaussSeidel())
+    {
+        kin.gsK = true;
+        kin.gsEps = true;
+    }
+    else
+    {
+        throw std::runtime_error(
+            "brae interFoam (device): kFinal names `solver " + ks.solver + "`, which the device kEpsilon "
+            "does not run: a Gauss-Seidel smoothSolver, or PBiCG with DILU, and nothing else.");
+    }
+    // + fvOptions(epsilon) and + fvOptions(k): the mangroves' turbulence source at the U this closure
+    // was handed, which is the one OpenFOAM's lookupObject finds when kEpsilon::correct builds them
+    if (in.mangroves && in.mangroves->turbulence)
+    {
+        if (t.variableDensity)
+            throw std::runtime_error(
+                "brae interFoam (device): multiphaseMangrovesTurbulenceModel under the `density variable` "
+                "k-epsilon is -Sp(rho*coeff) in OpenFOAM, and no gate holds that form.");
+        deviceMangrovesCoeff(in.mangroves->kFac, *in.Ux, *in.Uy, *in.Uz, d.mangroveK);
+        deviceMangrovesCoeff(in.mangroves->epsFac, *in.Ux, *in.Uy, *in.Uz, d.mangroveEps);
+        kin.fvoSpK = &d.mangroveK;
+        kin.fvoSpEps = &d.mangroveEps;
+    }
     kin.gsSymmetric = (ks.smoother == "symGaussSeidel");
     kin.nSweepsKE = ks.nSweeps;
     kin.tol = ks.tol;

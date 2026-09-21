@@ -281,6 +281,13 @@ void deviceInterStep(
         uin.porosityMu  = &porMu;
         uin.porosityRho = &rho;
     }
+    // ...and the mangroves' drag and added mass, on the same rho: multiphaseMangrovesSource's
+    // addSup(rho, eqn) takes the field UEqn is weighted with (inter_ueqn_cpp.cu hands it `rho` too)
+    if (ctl.mangroves)
+    {
+        uin.mangroves    = ctl.mangroves;
+        uin.mangrovesRho = &rho;
+    }
     uin.cyc          = ctl.cyc;
     uin.cycCorrected = ctl.correctedLaplacian;
     // fvm::div(rhoPhi, U) on the pair too -- the MASS flux, as uin.phiInt above is

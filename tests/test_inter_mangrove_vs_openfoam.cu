@@ -9,7 +9,8 @@
 // TWO CONTROLS, both OpenFOAM's own answer at the same instant: both options off, and the turbulence
 // option off alone.
 //
-// THE DEVICE LOOP MUST REFUSE the case, naming the option.
+// THE DEVICE LOOP runs the same case from the same start and is held to OpenFOAM by its own bounds,
+// and to OpenFOAM's log solve by solve -- PBiCG's counts and final residuals for k and epsilon.
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -37,6 +38,21 @@ const scalar B_U = 1e-10;
 const scalar B_K = 5e-12;
 const scalar B_EPSILON = 3e-12;
 const scalar B_NUT = 1e-11;
+
+// THE DEVICE ARM'S OWN BOUNDS, each about 30x its measurement over the same 450 steps: alpha 6.4e-14,
+// p_rgh 4.8e-14, U 3.9e-11, k 3.2e-12, epsilon 3.5e-12, nut 1.7e-12. All 900 p_rgh counts and all 450
+// k and 450 epsilon PBiCG counts OpenFOAM's; initial residuals within 2.5e-11 (p_rgh), 5.0e-11 (k) and
+// 1.2e-12 (epsilon); k's and epsilon's FINAL residuals OpenFOAM's to the floor a normalised residual
+// has (inter_solve_log.cuh), which is why that bound is the host arm's and not thirty times nothing.
+const scalar D_ALPHA = 2e-12;
+const scalar D_PRGH = 1.5e-12;
+const scalar D_U = 1.2e-9;
+const scalar D_K = 1e-10;
+const scalar D_EPSILON = 1e-10;
+const scalar D_NUT = 5e-11;
+const scalar D_PRES = 8e-10;
+const scalar D_KE_RES = 1.5e-9;
+const scalar D_KE_FINAL = 1e-5;
 
 namespace {
 int failures = 0;
@@ -248,7 +264,7 @@ int main(
     check("...and their turbulence source moves its k far more than brae is from it",
           dTurbK.rel() > scalar(1000)*std::fmax(dK.rel(), scalar(1e-14)) && dTurbK.rel() > scalar(1e-6));
 
-    // THE DEVICE LOOP REFUSES, by name
+    // THE DEVICE LOOP, on the same case from the same start, held to OpenFOAM by its OWN bounds
     int nDev = 0;
     if (cudaGetDeviceCount(&nDev) != cudaSuccess)
     {
@@ -257,22 +273,49 @@ int main(
     }
     if (nDev <= 0)
     {
-        std::printf("  (no CUDA device: the device refusal is not exercised)\n");
+        std::printf("  (no CUDA device: the device arm is not exercised)\n");
     }
     else
     {
-        bool named = false;
-        try
-        {
-            InterFields dev;
-            runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
-        }
-        catch (const std::exception& e)
-        {
-            named = std::string(e.what()).find("Mangroves") != std::string::npos;
-            std::printf("  device: %s\n", std::string(e.what()).substr(0, 200).c_str());
-        }
-        check("the device loop refuses the case and names the option", named);
+        InterFields dev;
+        const RunReport rd = runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
+        check("the device driver ran the same number of steps", rd.steps == nSteps);
+        failures += brae::gatecheck::nonFinite("device alpha", dev.alpha1.internal);
+        failures += brae::gatecheck::nonFinite("device p_rgh", dev.p_rgh.internal);
+        failures += brae::gatecheck::nonFinite("device U", dev.U.internal);
+        failures += brae::gatecheck::nonFinite("device k", dev.turbulence.k.internal);
+        failures += brae::gatecheck::nonFinite("device epsilon", dev.turbulence.epsilon.internal);
+        failures += brae::gatecheck::nonFinite("device nut", dev.turbulence.nut.internal);
+        // THE SOLVER THE CASE NAMES, on the device: PBiCG's counts and FINAL residuals against
+        // OpenFOAM's log. The final residual is the arm that tells PBiCG from any other method that
+        // happens to take as many iterations.
+        failures += brae::gatecheck::compareSolves("device", rd.pSolves, ofP, nSteps, "p_rgh", D_PRES, D_PRES);
+        failures += brae::gatecheck::compareSolves("device", rd.epsilonSolves, ofE, nSteps, "epsilon",
+                                                   D_KE_RES, D_KE_RES, D_KE_FINAL);
+        failures += brae::gatecheck::compareSolves("device", rd.kSolves, ofK, nSteps, "k",
+                                                   D_KE_RES, D_KE_RES, D_KE_FINAL);
+        const Diff eA = compare(dev.alpha1.internal, ofAlpha);
+        const Diff eP = compare(dev.p_rgh.internal, ofPrgh);
+        const Diff eU = compare(dev.U.internal, ofU);
+        const Diff eK = compare(dev.turbulence.k.internal, ofKf);
+        const Diff eE = compare(dev.turbulence.epsilon.internal, ofEf);
+        const Diff eN = compare(dev.turbulence.nut.internal, ofNut);
+        std::printf("  DEVICE:  alpha %.4e, p_rgh %.4e, U %.4e, k %.4e, epsilon %.4e, nut %.4e\n",
+                    (double)eA.linf, (double)eP.rel(), (double)eU.rel(), (double)eK.rel(),
+                    (double)eE.rel(), (double)eN.rel());
+        std::printf("  host:    alpha %.4e, p_rgh %.4e, U %.4e, k %.4e, epsilon %.4e, nut %.4e\n",
+                    (double)dA.linf, (double)dP.rel(), (double)dU.rel(), (double)dK.rel(),
+                    (double)dE.rel(), (double)dN.rel());
+        check("the device's alpha agrees with OpenFOAM's absolutely", eA.linf < D_ALPHA);
+        check("...its p_rgh", eP.rel() < D_PRGH);
+        check("...its U", eU.rel() < D_U);
+        check("...its k", eK.rel() < D_K);
+        check("...its epsilon", eE.rel() < D_EPSILON);
+        check("...its nut", eN.rel() < D_NUT);
+        check("the mangroves move OpenFOAM's own U far more than the device is from it",
+              dOffU.rel() > scalar(1000)*std::fmax(eU.rel(), scalar(1e-14)));
+        check("...and their turbulence source moves its k far more than the device is from it",
+              dTurbK.rel() > scalar(1000)*std::fmax(eK.rel(), scalar(1e-14)));
     }
 
     std::printf("test_inter_mangrove_vs_openfoam: %d failures\n", failures);

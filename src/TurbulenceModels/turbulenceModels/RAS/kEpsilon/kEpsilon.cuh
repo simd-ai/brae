@@ -141,6 +141,16 @@ struct KEpsilonInput
     // variant and ONE nSweeps for the pair, which linear_solver_setup refuses to resolve when they differ.
     bool   gsK = false, gsEps = false, gsSymmetric = true;
     int    nSweepsKE = 1;
+    // ...or `solver PBiCG; preconditioner DILU;` for BOTH equations (device_pbicg.cuh): NOT PBiCGStab,
+    // and it needs `precon` below to carry the mesh's DILU schedule. waves/mangroveInteraction names it.
+    bool   pbicgKE = false;
+    // + fvOptions(epsilon) and + fvOptions(k) for an option whose addSup is -fvm::Sp(coeff, field): one
+    // coefficient per cell, which the matrix takes as diag += V*coeff after every other term and before
+    // relax() (kEpsilon.C:258 and :279). The CALLER forms the coefficient, from whatever the option
+    // reads -- the mangroves' is Cx*Cd*a*N*|U|. Null = no such option. The incompressible lineage
+    // only: OpenFOAM's density-weighted form is -Sp(rho*coeff) and no gate holds it.
+    const DeviceBuffer<scalar>* fvoSpEps = nullptr;
+    const DeviceBuffer<scalar>* fvoSpK   = nullptr;
     // FP-1: sweep the honoured smoothSolver in COLOUR order over `colouring` (turbulence_transport.cuh
     // SolveControls::gsColour); the driver announces the order per field.
     bool   gsColour = false;

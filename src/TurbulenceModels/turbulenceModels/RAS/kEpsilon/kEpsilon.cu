@@ -480,6 +480,19 @@ __global__ void wallLaplacianCoeffKernel(
     iC[f] += gammaBnd[f] * deltaCoeffs[f] * magSf[f];
 }
 
+// `+ fvOptions(epsilon)` / `+ fvOptions(k)` for an option whose addSup is -fvm::Sp(coeff, field): on the
+// right of the equation, so the matrix takes diag += V*coeff (fvOptions_cpp.cu, the scalar addSup)
+__global__ void fvOptionsSpKernel(
+    int nC,
+    const scalar* V,
+    const scalar* coeff,
+    scalar* diag)
+{
+    const int c = blockDim.x*blockIdx.x + threadIdx.x;
+    if (c >= nC) return;
+    diag[c] += V[c]*coeff[c];
+}
+
 __global__ void copyMaskKernel(int nC, const label* src, label* dst)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1058,6 +1071,7 @@ void finishAndSolve(
     sv.polyDeg     = in.polyDeg;
     sv.gsColour    = in.gsColour;
     sv.colouring   = in.colouring;
+    sv.pbicg       = in.pbicgKE;
     turbulence::solveScalarEqn(M, field, dm, relaxEquation, alpha, fvoMask, fvoVal, wallMask, wallVal,
                                sv, residualOut, dumpPrefix, gs, perfOut, in.cyc);
 }
@@ -1160,6 +1174,15 @@ void correct(
         PressureMatrix& E = turbulenceMatrix(dm, 0);
         assembleEpsEqn(E, st, dm, dbEps, dbK, epsilon, k, nut, in, dbEps.n ? &epsBndLast : nullptr,
                        epsOld.size() ? &epsOld : nullptr);
+        // + fvOptions(alpha, rho, epsilon_), kEpsilon.C:258: the last term on the right, ahead of relax()
+        if (in.fvoSpEps)
+        {
+            if (in.fvoSpEps->size() != static_cast<std::size_t>(dm.nCells))
+                throw std::runtime_error("brae kEpsilon (device): fvoSpEps must be one coefficient per cell.");
+            fvOptionsSpKernel<<<nBlk(dm.nCells), TPB>>>(dm.nCells, dm.V.data(), in.fvoSpEps->data(),
+                                                        E.diag.data());
+            cudaCheck(cudaGetLastError(), "kEpsilon fvOptions(epsilon)");
+        }
 
         // The wall constraint's VALUE IS THE CURRENT FIELD, not the eps0 array -- OpenFOAM's
         // epsilonWallFunction::manipulateMatrix is
@@ -1201,6 +1224,15 @@ void correct(
         PressureMatrix& K = turbulenceMatrix(dm, 1);      // FP-10: persistent, see the epsilon equation
         assembleKEqn(K, st, dm, dbK, dbU, k, epsilon, nut, in, dbK.n ? &kBndLast : nullptr,
                      kOld.size() ? &kOld : nullptr);
+        // + fvOptions(alpha, rho, k_), kEpsilon.C:279
+        if (in.fvoSpK)
+        {
+            if (in.fvoSpK->size() != static_cast<std::size_t>(dm.nCells))
+                throw std::runtime_error("brae kEpsilon (device): fvoSpK must be one coefficient per cell.");
+            fvOptionsSpKernel<<<nBlk(dm.nCells), TPB>>>(dm.nCells, dm.V.data(), in.fvoSpK->data(),
+                                                        K.diag.data());
+            cudaCheck(cudaGetLastError(), "kEpsilon fvOptions(k)");
+        }
 
         // No wall mask: see finishAndSolve.
         finishAndSolve(K, k, dm, in.relaxEquationK, in.relaxK,

@@ -52,6 +52,44 @@ void deviceFvoPorositySource(const DevicePorosity& por, int comp, scalar nu, con
                              const DeviceBuffer<scalar>* muCell = nullptr,
                              const DeviceBuffer<scalar>* rhoCell = nullptr);
 
+// THE MANGROVE PAIR on the device (src/waveModels/fvOptions), transcribed from the host reference
+// (fvOptions_cpp.cu, which tests/interfoam_mangrove_vs_openfoam.sh holds to OpenFOAM):
+//   multiphaseMangrovesSource            dragCoeff = 0.5*Cd*a*N*|U|, inertiaCoeff = 0.25*(Cm + 1)*pi*a^2*N;
+//                                        addSup(rho, eqn): eqn += -Sp(rho*dragCoeff, U) - rho*inertiaCoeff*ddt(U)
+//   multiphaseMangrovesTurbulenceModel   kCoeff = Ckp*Cd*a*N*|U|, epsilonCoeff = Cep*Cd*a*N*|U|;
+//                                        addSup(eqn): eqn += -Sp(coeff, k or epsilon)
+// What is per CELL and fixed for the run is uploaded once: each coefficient WITHOUT its |U|, in the
+// host's own multiplication order (((0.5*Cd)*a)*N and so on), zero outside every region, a later
+// region overwriting an earlier one on a shared cell as OpenFOAM's loops assign. |U| is the current
+// field's, taken on the device at every assembly.
+struct DeviceMangroves
+{
+    bool                 source = false;       // an active multiphaseMangrovesSource
+    bool                 turbulence = false;   // an active multiphaseMangrovesTurbulenceModel
+    DeviceBuffer<scalar> dragFac;              // 0.5*Cd*a*N
+    DeviceBuffer<scalar> inertia;              // 0.25*(Cm + 1)*pi*a*a*N
+    DeviceBuffer<scalar> kFac;                 // Ckp*Cd*a*N
+    DeviceBuffer<scalar> epsFac;               // Cep*Cd*a*N
+};
+
+// `UEqn == fvOptions(rho, U)` for the source option. The two negations cancel and the momentum matrix
+// takes, per cell (fvOptions_cpp.cu, the same expressions in the same order):
+//     diag   += V*(rho*drag) + (rDeltaT*V)*(rho*inertia)
+//     source += ((rDeltaT*U0)*V)*(rho*inertia)
+// fvm::Sp's V*coeff and EulerDdtScheme::fvmDdt's rDeltaT*V and rDeltaT*U0*V, on a mesh that does not
+// move (the case reader refuses an fvOption beside a moving mesh).
+void deviceMangrovesMomentum(const DeviceMangroves& mg, const DeviceBuffer<scalar>& rho,
+                             const DeviceBuffer<scalar>& V, scalar rDeltaT,
+                             const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+                             const DeviceBuffer<scalar>& U0x, const DeviceBuffer<scalar>& U0y, const DeviceBuffer<scalar>& U0z,
+                             DeviceBuffer<scalar>& diag,
+                             DeviceBuffer<scalar>& srcX, DeviceBuffer<scalar>& srcY, DeviceBuffer<scalar>& srcZ);
+// coeff[c] = fac[c]*|U[c]|: kCoeff or epsilonCoeff from kFac or epsFac, for a closure's
+// `+ fvOptions(k)` / `+ fvOptions(epsilon)`, which then takes diag += V*coeff.
+void deviceMangrovesCoeff(const DeviceBuffer<scalar>& fac,
+                          const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+                          DeviceBuffer<scalar>& coeff);
+
 // limitVelocity: clamp |U| <= max on the given cells (OF fv::limitVelocity::correct, U *= sqrt(max^2/|U|^2) where it
 // exceeds max, preserving direction).
 void deviceFvoLimitVelocity(const DeviceBuffer<label>& cells, scalar maxU,

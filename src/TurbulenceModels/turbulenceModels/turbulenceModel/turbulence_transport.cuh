@@ -115,6 +115,9 @@ struct SolveControls
     // the Neumann series' degree that policy derived from the case's relaxation factor.
     const DeviceDilu* precon = nullptr;
     int    polyDeg  = 0;
+    // ...or OpenFOAM's PBiCG with that DILU (device_pbicg.cuh), when the case names it: a different
+    // method from BiCGStab that stops at different iterates. `precon` must be set; refused otherwise.
+    bool   pbicg    = false;
     // FP-1 (bench/rhoSimpleFoam/FASTPATH.md): when the case's smoothSolver is honoured (gs), sweep it in
     // COLOUR order through deviceColourGaussSeidelFused with one component over `colouring` -- the
     // momentum engine, the same stop rule, a different iterate after n sweeps, which the driver

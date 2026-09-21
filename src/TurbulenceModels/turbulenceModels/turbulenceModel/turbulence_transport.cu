@@ -1,4 +1,5 @@
 #include "turbulence_transport.cuh"
+#include "device_pbicg.cuh"
 #include <algorithm>
 #include <memory>   // FieldGrad: one gradient per (scheme, limiter) pair an assembly asks for (FP-3)
 #include <vector>   // std::max
@@ -403,6 +404,20 @@ void solveScalarEqn(
     else if (gs)
         deviceSymGaussSeidel(A, b, field, dnf.data(), sv.tol, sv.relTol, sv.maxIter, &perf, sv.minIter,
                              sv.nSweeps, sv.gsSymmetric);
+    else if (sv.pbicg)
+    {
+        if (!sv.precon || !sv.precon->valid)
+            throw std::runtime_error(
+                "brae turbulence: PBiCG was selected for a transported scalar and SolveControls::precon "
+                "carries no DILU schedule; PBiCG here is OpenFOAM's PBiCG WITH DILU and nothing else.");
+        // the normFactor is on the device for the other two solvers; this one's recurrence runs on
+        // host scalars (device_pbicg.cu), so it is read once. rD is rebuilt from THIS matrix inside
+        // the solve, which is why the schedule is not const there (device_pcg.cu:604 does the same).
+        std::vector<scalar> nf;
+        dnf.copyTo(nf);
+        perf = devicePBiCGDilu(A, b, field, nf.at(0), sv.tol, sv.relTol, sv.maxIter, sv.minIter,
+                               *const_cast<DeviceDilu*>(sv.precon));
+    }
     else
         perf = deviceJacobiBiCGStab(A, b, field, dnf.data(), sv.tol, sv.relTol, sv.maxIter, /*checkEvery=*/1, sv.minIter,
                                     sv.precon, /*amg=*/nullptr, sv.polyDeg);

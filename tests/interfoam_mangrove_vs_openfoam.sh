@@ -26,9 +26,39 @@
 #                                                   solve refuses its matrix
 # NOT DISCRIMINATED: the added mass reading U where OpenFOAM reads U.oldTime() -- with one outer
 # corrector and no momentum predictor the two are the same field when UEqn is assembled.
+#
+# THE DEVICE LOOP runs the same 450 steps from the same start and is held to OpenFOAM by its OWN bounds
+# (D_* in the .cu): alpha 6.4e-14, p_rgh 4.8e-14, U 3.9e-11, k 3.2e-12, epsilon 3.5e-12, nut 1.7e-12; all
+# 900 p_rgh counts and all 450 k and 450 epsilon PBiCG counts OpenFOAM's, their final residuals
+# OpenFOAM's to the floor a normalised residual has. Two runs print the same digits. THREE MODULES, each
+# transcribed from the host reference and taken one at a time against it (twenty steps, U 3.9e-12 with
+# the HOST closure inside the device loop, 4.0e-12 with the device's own):
+#   the drag and added mass on U      device_fvoptions.cu, in the shared assembler's fvOptions slot
+#   PBiCG with DILU                   device_pbicg.cu: the transpose system is a VIEW with upper and
+#                                     lower exchanged; tests/test_device_pbicg.cu holds it to the host's
+#   the k and epsilon sink            kEpsilon.cu, diag += V*coeff ahead of relax(), kEpsilon.C:258/279
+# WHAT THE PORT FOUND: the device closure set its Gauss-Seidel sweep UNCONDITIONALLY, whatever solver
+# kFinal named. Only the fvOptions refusal stood between this case and a smoothSolver run under PBiCG's
+# entry, with no notice -- 0 of 450 k counts equal and U 1.1e-04, measured below. It names the solver
+# now and refuses any it does not run.
+# BROKEN ONCE EACH ON THE DEVICE ARM (U / k) -- the first seven are the host arm's numbers to two digits,
+# which is what a transcription should give:
+#   no added mass                                   2.2e-01 / 1.2e-01
+#   no drag                                         8.0e-01 / 1.0
+#   drag without rho                                7.9e-01 / 1.1
+#   the added mass with Cm in place of Cm + 1       1.1e-01 / 6.0e-02
+#   Ckp and Cep swapped                             9.9e-01 / 7.5e-01
+#   the turbulence source's sign flipped            8.3e-01 / 6.9e-01
+#   no turbulence source                            3.4e-01 / 5.2e-01
+#   PBiCGStab (with DILU) in place of PBiCG         9.2e-05 / 1.2e-04, 76 of 450 k counts and 33 of 450
+#                                                   epsilon counts equal
+#   the Gauss-Seidel sweep in place of PBiCG        1.1e-04 / 1.6e-04, 0 of 450 counts of either
+# NOT DISCRIMINATED there either: the added mass on U for U.oldTime() -- every digit the same.
+#
 # NOT CLAIMED: the tutorial's 411,600-cell mesh (a bench size), its sampled line sets (stripped), the
-# density-weighted k-epsilon (refused), any closure but kEpsilon under the turbulence option (refused),
-# a field-name override on either option (refused), and the device loop (refused).
+# density-weighted k-epsilon (refused on both loops), any closure but kEpsilon under the turbulence
+# option (refused), a field-name override on either option (refused), more than one option of either
+# type on the device loop (refused), and either option beside a moving mesh (refused by the reader).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_mangrove_vs_openfoam"
