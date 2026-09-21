@@ -314,6 +314,19 @@ RunReport runInterFoamDevice(
         // emptyFvPatch::size() == 0 makes OpenFOAM skip them, and the host must too or every static
         // 2D gate would fail.
         //
+        // RETRACTION, and it is the whole story. The 6.9430e+00 "source defect" above was the DUMP,
+        // not the solver: this arm copied pSource at corrector 0 and the rest of its pressure taps at
+        // the last corrector, while the host wrote its taps on every corrector and kept the last. With
+        // nCorrectors 2 that compared corrector 0's source with corrector 1's correction. Pinned to
+        // the same corrector on both arms, pEqn source reads 7.8160e-14 of 3.4921e+03 -- EXACT. The
+        // matrix was already exact. So the device assembles the same pressure system as the host.
+        //
+        // WHICH PUTS THE SOLVER BACK IN THE FRAME, and the earlier note ruling it out was drawn from
+        // that same mis-tapped source. The system agrees and the SOLUTION does not: p_rgh 2.5406e+05
+        // of 5.2780e+06, phi 4.1320e-01, |U| 5.8215e-01 -- and this case asks for PCG with a GAMG
+        // preconditioner where this loop runs Jacobi-BiCGStab (it says so on every run). Same matrix,
+        // same right-hand side, different answer is what a different solver looks like.
+        //
         // div ITSELF NOW AGREES TOO: 8.5265e-14 of 2.4843e+01, pre-V, and V agrees exactly. So does
         // the laplacian's own source -- the host's is 0.0000e+00, which is what this arm's assembly
         // assumes when it memsets. Every TERM of that source has now been measured and agrees:

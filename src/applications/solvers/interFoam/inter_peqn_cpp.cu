@@ -814,7 +814,13 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
             in.taps->jumpHistory.push_back(flatJump);
         }
         FvScalarMatrix pe = fvm::laplacian<scalar>(rAUfField, p_rgh, m, g, patches, sc.correctedLaplacian);
-        if (in.taps && corr == 0) in.taps->pLaplacianSource = pe.source;
+        // corrector 0 on BOTH arms: the device copies its pressure taps there, and a dump that
+        // compares different correctors reads as a defect in whichever term moves between them.
+        if (in.taps && corr == 0 && in.correctorIndex <= 0)
+        {
+            in.taps->pLaplacianSource = pe.source;
+            in.taps->tapCorrector = in.correctorIndex;
+        }
         if (sc.correctedLaplacian)
         {
             // gaussLaplacianSchemes.C: source -= V*div(gammaMagSf*snGradCorrection(p_rgh)), the
@@ -825,7 +831,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
             const std::vector<vector> gradP = gradOf(p_rgh, sc.gradPrgh, m, g, patches);
             const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
                 rAUfField, p_rgh, gradP, m, g, patches, sc.snGradLimitCoeff);
-            if (in.taps) in.taps->pNonOrthSource = corr;
+            if (in.taps && in.correctorIndex <= 0) in.taps->pNonOrthSource = corr;
             for (label c = 0; c < nC; ++c)
             {
                 pe.source[c] -= corr[c];
@@ -836,7 +842,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
                 rAUfField, gradP, g, patches, sc.snGradLimitCoeff, p_rgh);
         }
         const std::vector<scalar> div = fvc::div(phiHbyA, m, g, patches);
-        if (in.taps && corr == 0) in.taps->pDivPhiHbyA = div;
+        if (in.taps && corr == 0 && in.correctorIndex <= 0) in.taps->pDivPhiHbyA = div;
         for (label c = 0; c < nC; ++c) pe.source[c] += div[c] * g.V()[c];
 
         if (sc.needReference)
@@ -854,7 +860,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
 
         // the assembled system, at the device arm's tap point: after the source, before the solve,
         // and on the FIRST non-orthogonal pass only
-        if (in.taps && corr == 0)
+        if (in.taps && corr == 0 && in.correctorIndex <= 0)
         {
             in.taps->pDiag = pe.diag;
             in.taps->pUpper = pe.upper;

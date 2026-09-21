@@ -502,15 +502,21 @@ void deviceInterStep(
             deviceCopy(taps->phiIf, pt.phiIf);
             deviceCopy(taps->phiHbyAIfPrePhig, pt.phiHbyAIfPrePhig);
             deviceCopy(taps->nonOrthSource, pt.nonOrthSource);
+            deviceCopy(taps->cycJumpTap, pt.cycJumpTap);
+        }
+        if (taps && corr == 0)
+        {
+            // EVERY pressure tap from the SAME corrector. These were split across two blocks with
+            // different guards -- pSource from corrector 0 and the rest from the last -- and on a case
+            // with nCorrectors 2 that made a dump compare corrector 0's source against corrector 1's
+            // correction. It read as a 6.9430e+00 defect in a source that is in fact exact.
+            taps->tapCorrector = corr;
             deviceCopy(taps->phigIntTap, pt.phigIntTap);
             deviceCopy(taps->phigBndTap, pt.phigBndTap);
             deviceCopy(taps->divPhiHbyA, pt.divPhiHbyA);
             deviceCopy(taps->phiHbyAIntPrePhig, pt.phiHbyAIntPrePhig);
             deviceCopy(taps->phiHbyABndPrePhig, pt.phiHbyABndPrePhig);
-            deviceCopy(taps->cycJumpTap, pt.cycJumpTap);
-        }
-        if (taps && corr == 0)
-        {
+            deviceCopy(taps->nonOrthSource, pt.nonOrthSource);
             deviceCopy(taps->pDiag, pt.diag);
             deviceCopy(taps->pUpper, pt.upper);
             deviceCopy(taps->pLower, pt.lower);

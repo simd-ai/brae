@@ -284,6 +284,11 @@ struct PressureTaps
     // div(phiHbyA)*V. The device assembly memsets its source to zero at this point, on the stated
     // assumption that the laplacian's own is zero -- this tap is what tests that assumption.
     std::vector<scalar> pLaplacianSource;
+    // WHICH CALL THESE CAME FROM. The host writes this block on every pressure corrector, so it holds
+    // the LAST one; the device arm fills its step taps at corr == 0, the FIRST. Comparing the two
+    // without knowing that compares different correctors, which is how a dump can show every term
+    // agreeing and the sum not.
+    label tapCorrector = -1;
     // p_rgh's JUMP per patch, as the last assembly left it
     std::vector<std::vector<scalar>> jumpBnd;
     // ...and one entry per ASSEMBLY, flattened over the coupled patches in patch order, so the two
@@ -328,6 +333,9 @@ const std::vector<scalar>& namedPatchFlux(
 
 struct PressureStepInput
 {
+    // the pressure corrector this call is, for stamping the taps above
+    label correctorIndex = -1;
+
     const FvVectorMatrix*      UEqn      = nullptr;   // the RELAXED momentum matrix, before the force
     const std::vector<scalar>* rho       = nullptr;
     const std::vector<scalar>* gh        = nullptr;

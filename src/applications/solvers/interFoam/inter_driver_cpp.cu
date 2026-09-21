@@ -847,6 +847,7 @@ RunReport runInterFoam(
                         psc.finalCorrector = (c == lc.nCorrectors - 1);
                         // a predictor's solve ends in U.correctBoundaryConditions(), which clears the flag
                         pin.uPatchesUpdatedAtEntry = (c == 0) && !f.momentumPredictorOn;
+                        pin.correctorIndex = c;
                         pressureCorrector(f.p_rgh, f.U, f.phi, f.p, pin, psc, m, g, patches);
                     }
                     // alpha1's inletOutlet reads the flux the step ended on, at the next MULES pass.

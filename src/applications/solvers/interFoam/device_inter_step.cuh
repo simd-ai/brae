@@ -117,6 +117,8 @@ struct DeviceInterStepTaps
     DeviceBuffer<scalar> phigIntTap;
     DeviceBuffer<scalar> phigBndTap;
     DeviceBuffer<scalar> divPhiHbyA;
+    // which pressure corrector these came from -- this arm fills them at corr == 0, the FIRST
+    int tapCorrector = -1;
     DeviceBuffer<scalar> phiHbyAIntPrePhig;
     DeviceBuffer<scalar> phiHbyABndPrePhig;
     std::vector<std::vector<scalar>> jumpHistory;
