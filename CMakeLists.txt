@@ -3949,6 +3949,11 @@ target_include_directories(test_wedge_device_coeffs PRIVATE ${BRAE_HEADER_DIRS} 
 target_link_libraries(test_wedge_device_coeffs PRIVATE brae_core)
 add_test(NAME wedge_device_coeffs COMMAND test_wedge_device_coeffs)
 
+add_executable(test_device_grad_symmetry tests/test_device_grad_symmetry.cu)
+target_include_directories(test_device_grad_symmetry PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_grad_symmetry PRIVATE brae_core)
+add_test(NAME device_grad_symmetry COMMAND test_device_grad_symmetry ${CMAKE_CURRENT_SOURCE_DIR}/validation)
+
 add_executable(test_vol_point_interp tests/test_vol_point_interp.cu)
 target_include_directories(test_vol_point_interp PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_vol_point_interp PRIVATE brae_core)
