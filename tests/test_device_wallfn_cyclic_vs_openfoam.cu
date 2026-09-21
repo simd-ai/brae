@@ -124,6 +124,7 @@ int main(int argc, char** argv)
     }
 
     const FieldData<scalar> ofEps = readField<scalar>(timeDir + "/epsilon");
+    const FieldData<vector> ofU = readField<vector>(timeDir + "/U");
     check("OpenFOAM's epsilon has one value per cell",
           ofEps.internalField.size() == static_cast<std::size_t>(nC));
     if (ofEps.internalField.size() != static_cast<std::size_t>(nC))
@@ -178,6 +179,63 @@ int main(int argc, char** argv)
     // is at that floor too -- so the oracle, the reference and the arm under test all agree here.
     check("the host arm is at the same floor at those cells",
           hWallRel <= scalar(10)*std::fmax(dFreeRel, scalar(1e-15)));
+
+    // ...AND grad(U) ACROSS THE PAIR, on the same two pinned runs. fvc::grad sums every face of a cell
+    // and a cyclic face is a face, but the device's gradient walked the internal faces and the
+    // non-coupled patches only, so the momentum assembly's grad(U) was missing the pair's half -- and
+    // with it linearUpwind's deferred correction, the non-orthogonal correction and dev2(T(grad U)).
+    // It is invisible at the FIRST corrector, where this case starts from rest and grad(U) is zero, so
+    // it needs a case with nOuterCorrectors > 1: the tutorial's own 3.
+    //
+    // THE TUTORIAL GATE CANNOT SEE THIS. tests/interfoam_baffle_vs_openfoam.sh runs 20 steps at the
+    // case's own tolerances, where the distance to OpenFOAM is the trajectory's: its device numbers
+    // read alpha 4.9021e-05 and U 1.1369e-02 both WITH and WITHOUT the fix, to every digit. That is
+    // why this assertion lives here, on a pinned single step, and why those bounds were left alone.
+    if (ofU.internalField.size() == static_cast<std::size_t>(nC))
+    {
+        auto worstU = [&](const std::set<label>& cells, const std::vector<vector>& a)
+        {
+            scalar w = 0;
+            scalar sc = 0;
+            for (label c : cells)
+            {
+                const std::size_t i = static_cast<std::size_t>(c);
+                const vector e{a[i].x - ofU.internalField[i].x,
+                               a[i].y - ofU.internalField[i].y,
+                               a[i].z - ofU.internalField[i].z};
+                w = std::fmax(w, mag(e));
+                sc = std::fmax(sc, mag(ofU.internalField[i]));
+            }
+            return std::pair<scalar, scalar>(w, sc);
+        };
+        const auto hUw = worstU(pairAndWall, fh.U.internal);
+        const auto dUw = worstU(pairAndWall, fd.U.internal);
+        const auto hUf = worstU(pairOnly, fh.U.internal);
+        const auto dUf = worstU(pairOnly, fd.U.internal);
+        std::printf("  U on the pair's cells vs OpenFOAM: host %.4e / %.4e, device %.4e / %.4e "
+                    "(wall-touching / not, |U| up to %.4e)\n",
+                    (double)hUw.first, (double)hUf.first, (double)dUw.first, (double)dUf.first,
+                    (double)std::fmax(hUw.second, hUf.second));
+        // THE BOUND IS NOT THE HOST'S LEVEL, AND THIS SAYS SO. The host reaches OpenFOAM at 3.9e-17
+        // here; the device does not, and pretending otherwise would be a bound that cannot hold. With
+        // the pair summed into grad(U) the device reads 5.6e-10 at the wall-touching cells and 4.2e-10
+        // at the rest, of a 9.3e-04 |U|; with the pair taken back out of the gradient, 3.4071e-09 and
+        // 2.7336e-09 -- so 2e-09 separates the two and fails the moment the pair leaves it again.
+        //
+        // WHAT KEEPS THE DEVICE OFF THE HOST'S LEVEL is the OTHER half of the same term:
+        // deviceCyclicAddLinUpwindCorr -- linearUpwind's deferred correction across a pair, which this
+        // case asks for by name (`div(rhoPhi,U) Gauss linearUpwind grad(U)`) -- has no caller in the
+        // tree. The residual sits ON the pair's cells, which is its signature. Tighten this bound when
+        // that is wired; it is an open finding, not a tolerance chosen to fit.
+        check("the device's U at the pair's cells carries the pair's gradient",
+              dUw.first < scalar(2e-09) && dUf.first < scalar(2e-09));
+        check("OpenFOAM's U is not zero at those cells, so the comparison means something",
+              std::fmax(hUw.second, hUf.second) > scalar(0));
+    }
+    else
+    {
+        check("OpenFOAM wrote U for this step", false);
+    }
 
     std::printf("test_device_wallfn_cyclic_vs_openfoam: %d failures\n", failures);
     return failures ? 1 : 0;

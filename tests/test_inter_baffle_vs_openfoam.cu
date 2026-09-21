@@ -56,19 +56,31 @@
 // and that second number is the momentum source's own 5.9392e-11 divided by V. So the chain closes on
 // M.source, and the pressure system never enters it.
 //
-// WHAT IS MISSING IS IN THE MOMENTUM PATH'S grad(U), and the tree already holds both halves of the fix:
-//   * UEqn.cu's four gradient sites take deviceGradUShared, which has NO cyclic argument -- grad(U) on
-//     this driver never sums the pair's faces, the omission commit 44a8ba6 fixed for the CLOSURE's
-//     grad(U). deviceCyclicAddGrad is called for alpha, p_rgh and the interface properties, never for U.
-//   * deviceCyclicAddLinUpwindCorr -- linearUpwind's deferred correction across a pair, whose own header
-//     says it needs a "cyclic-inclusive" gradient -- has NO caller anywhere in the tree, and this case
-//     asks for `div(rhoPhi,U) Gauss linearUpwind grad(U)`.
-// Both terms are identically zero at the first corrector, where the case starts from rest and grad(U) is
-// zero, and both need the pair -- which is exactly the on/off pattern the controls above measure.
+// WHAT WAS MISSING WAS THE MOMENTUM PATH'S grad(U), and half of it is now fixed. UEqn.cu's four
+// gradient sites take deviceGradUShared, which has NO cyclic argument, so grad(U) on this driver never
+// summed the pair's faces -- the omission commit 44a8ba6 fixed for the CLOSURE's grad(U).
+// deviceCyclicAddGrad now runs at all four, on the local copies rather than the shared memo, and the
+// global error goes with it:
 //
-// MEASURED, and the reason the gradient is the UPSTREAM term: adding a coupled linearUpwind correction
-// on top of the non-cyclic gradient made the pair's cells WORSE, 4.8067e-05 to 1.0909e-04, while every
-// other cell stayed at 5.3135e-05. The correction must not be wired before the gradient sees the pair.
+//                                   before          after
+//   H no-pair.x, cells off the pair 5.3135e-05      4.8004e-11
+//   |U| (nOuterCorrectors 2)        3.6174e-09      4.2732e-10
+//   p_rgh off the pair              2.4990e-07      4.5493e-09
+//
+// WHAT IS STILL MISSING is the other half of the same term: deviceCyclicAddLinUpwindCorr --
+// linearUpwind's deferred correction across a pair, whose own header says it needs a "cyclic-inclusive"
+// gradient -- has NO caller anywhere in the tree, and this case asks for it by name
+// (`div(rhoPhi,U) Gauss linearUpwind grad(U)`). The residual now sits ON the pair's cells, 5.0595e-06
+// against 4.8004e-11 elsewhere, which is that term's signature.
+//
+// THE ORDER MATTERS, and a measurement settled it: wiring the correction on top of the non-cyclic
+// gradient made the pair's cells WORSE, 4.8067e-05 to 1.0909e-04, while every other cell stayed at
+// 5.3135e-05. The gradient had to come first.
+//
+// THESE BOUNDS CANNOT SEE ANY OF IT. Twenty steps at the case's own tolerances measure the trajectory:
+// the device numbers below read alpha 4.9021e-05 and U 1.1369e-02 both with and without the gradient
+// fix, to every digit. tests/interfoam_wallfn_cyclic_vs_openfoam.sh gates it on a pinned single step
+// instead, and that is where it must be tightened when the correction lands.
 //
 // WHAT LOOKED LIKE A SECOND GAP HERE WAS THE REPORT, not the solve: the device printed worst |div(phi)|
 // 2.875e-01 against the host's 7.932e-05 with max|U| agreeing to every digit, because the report read
