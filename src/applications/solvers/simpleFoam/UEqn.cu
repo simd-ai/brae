@@ -111,7 +111,7 @@ void assembleUEqn(
             // the kernel selects by the sentinel (device_mesh.cuh, kVanLeerTwoByk).
             const DeviceBuffer<scalar>* Usrc[3] = {&Ux, &Uy, &Uz};
             DeviceBuffer<scalar> Uarr[3], gx[3], gy[3], gz[3];
-            const GradUMemo& gm = deviceGradUShared(dm, dbU, Ux, Uy, Uz);   // grad(U) at this U, once (item 65)
+            const GradUMemo& gm = deviceGradUShared(dm, dbU, Ux, Uy, Uz, in.UbStored);   // grad(U) at this U, once (item 65)
             for (int k = 0; k < 3; ++k)
             {
                 deviceCopy(Uarr[k], *Usrc[k]);
@@ -246,7 +246,7 @@ void assembleUEqn(
     {
         const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
         DeviceBuffer<scalar> gxc[3], gyc[3], gzc[3];
-        const GradUMemo& gm = deviceGradUShared(dm, dbU, Ux, Uy, Uz);       // the same grad(U) as the sites below
+        const GradUMemo& gm = deviceGradUShared(dm, dbU, Ux, Uy, Uz, in.UbStored);       // the same grad(U) as the sites below
         for (int k = 0; k < 3; ++k)
         {
             deviceCopy(gxc[k], gm.gx[k]);
@@ -299,7 +299,7 @@ void assembleUEqn(
     {
         const DeviceBuffer<scalar>* Usrc[3] = {&Ux, &Uy, &Uz};
         DeviceBuffer<scalar> gx[3], gy[3], gz[3], cx, cy, cz;
-        const GradUMemo& gm = deviceGradUShared(dm, dbU, Ux, Uy, Uz);
+        const GradUMemo& gm = deviceGradUShared(dm, dbU, Ux, Uy, Uz, in.UbStored);
         for (int k = 0; k < 3; ++k)
         {
             deviceCopy(gx[k], gm.gx[k]);
@@ -320,7 +320,7 @@ void assembleUEqn(
     if (corrFac != 0.0)
     {
         const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
-        const GradUMemo& gm = deviceGradUShared(dm, dbU, Ux, Uy, Uz);
+        const GradUMemo& gm = deviceGradUShared(dm, dbU, Ux, Uy, Uz, in.UbStored);
         // ALL THREE components' gradients are built first, because the pair's correction reconstructs
         // the neighbour in the NEIGHBOUR's frame: on a rotational cyclic the component that comes back
         // is forwardT . (gradU[nbr] . dNbr), which mixes all three (device_cyclic.cuh). Per-component

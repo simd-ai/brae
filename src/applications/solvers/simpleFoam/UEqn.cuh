@@ -96,6 +96,10 @@ struct MomentumInput
     // re-derive it. Null makes deviceDivDevReff re-derive with deviceBCValue, which is the same number
     // only while the caller evaluates U's boundary the same way; at a flux-conditional patch like
     // damBreak's pressureInletOutletVelocity atmosphere it is not.
+    // The SAME values feed every other fvc::grad(U) of the assembly -- linearUpwind's deferred
+    // correction, the corrected laplacian's -- through deviceGradUShared: one field, one set of patch
+    // values. They did not until laminar/damBreakPermeable, where a wall face going dry moves the
+    // patch's coefficients at the assembly while its stored value stays a wall's.
     const DeviceBuffer<scalar>* const* UbStored = nullptr;
 
     const DeviceBuffer<scalar>* ddtRho    = nullptr;

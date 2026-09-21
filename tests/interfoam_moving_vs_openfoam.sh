@@ -112,6 +112,26 @@
 #                  below 1e-13 in both codes, which is why the device arm is allowed ONE iteration
 #                  where OpenFOAM took at least twenty (the test says so at countsAgree). The HOST's
 #                  rule is untouched: exact below a hundred, 2% above.
+#                  THE RESIDUAL CURVES ARE COMPARED TOO, on every p_rgh solve of these profiles: the
+#                  staging gives p_rgh `log 2;`, OpenFOAM prints its residual at every iteration
+#                  (SolverPerformance.C:70-76), and brae's final residual must be within 15% of
+#                  OpenFOAM's AT THE ITERATION BRAE STOPPED ON. MEASURED worst over a run: piston 2.2%
+#                  host and 9.1% device, pistonSST 4.3%, flap 3.2% and 6.7%; the medians 0.0% to 1.8%.
+#                  THE CONTROL is the same statistic one iteration EARLIER, which must break the bound:
+#                  19% to 27% -- the curve falls about 8% an iteration, so it resolves a shift of one.
+#                  It is here because a count cannot tell a defect from OpenFOAM's own plateau. On
+#                  flap's step 7 OpenFOAM reads 1.0167e-13 at iteration 242, 1.0046e-13 at 243, climbs to
+#                  1.0981e-13 and ends at 250; the device arm ended at 242 on 9.993e-14, 1.7% from
+#                  OpenFOAM's residual THERE and eight iterations from its count. That arm started doing
+#                  so when linearUpwind's grad(U) began reading U's stored patch values (the permeable
+#                  wall's unit): its alpha went from 8.8e-13 to 9.9e-13, its U from 1.2e-10 to 5.5e-11 of
+#                  OpenFOAM, its worst initial residual from 6.5e-05 to 2.6e-05. A count outside the rule
+#                  is therefore accepted ONLY where brae stopped EARLIER and within 5% of OpenFOAM's
+#                  residual at that iteration, on at most ONE solve of a run. BROKEN ONCE: the device's
+#                  p_rgh tolerance 30% loose -- 61 of 90 counts apart by up to 11, eleven of them on a
+#                  "plateau", and the at-most-one check, the count check and the convergence check all
+#                  fail; the oracle WITHOUT `log 2` -- the parse check and the control both fail, and
+#                  the count rule fails alone, as it did before there was a history.
 #                  BROKEN ONCE EACH, on the device arm (piston):
 #                    the QUADRATIC compression form, interfaceCompression.H's commented-out line,
 #                    for the quartic one it ships        alpha 1.8e-02, U 1.1e-02, Uf 1.1e-02
@@ -367,6 +387,11 @@ elif profile.startswith('piston') or profile.startswith('flap'):
         body = re.sub(r'relTol\s+[^;]+;', 'relTol          0;', body)
         if 'tolerance' not in body:
             body = body.replace('}', '    tolerance       1e-13;\n        relTol          0;\n    }')
+        if key == 'p_rgh':
+            # `log 2;` makes OpenFOAM print its residual at EVERY iteration (SolverPerformance.C:70-76),
+            # and p_rghFinal takes it through `$p_rgh;`. It changes no arithmetic; the gate reads the
+            # history to compare the two residual CURVES where a count alone cannot -- see countsAgree.
+            body = body.replace('}', '    log             2;\n    }')
         t = t.replace(m.group(0), body)
 elif profile.startswith('closedDamBreak'):
     ref = '1e5' if profile == 'closedDamBreakRef' else '0'
