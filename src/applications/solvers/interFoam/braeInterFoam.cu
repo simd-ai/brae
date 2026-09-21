@@ -205,7 +205,7 @@ int main(int argc, char** argv)
         // copy here would be the defect this file's header names.
         const RunReport r = onDevice
             ? runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/true,
-                                 /*fieldsOut=*/nullptr, endTime)
+                                 /*fieldsOut=*/nullptr, endTime, /*tapsOut=*/nullptr, &mutableMesh)
             : runInterFoam(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/true,
                            /*fieldsOut=*/nullptr, endTime, /*pressureTaps=*/nullptr, &mutableMesh);
 

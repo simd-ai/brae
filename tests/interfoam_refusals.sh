@@ -520,7 +520,10 @@ if [ $HAVE_GPU = 1 ]; then
     arm device_sheared_uncorrected refused "uncorrected"          "-device" "$SHEAR && $UNCORR"
     # the device loop moves no mesh and pins no pressure reference; both are refused by name there
     BASE="$BM"
-    arm device_moving       refused "does not move one"       "-device" true
+    # the reason is now the SPECIFIC one -- the mesh-update stage is on the host loop only -- because
+    # the device loop carries the pieces around it (the ddt's V0, refreshDeviceMeshGeometry) and a
+    # caller passing a MutableMesh must not get a silent run on the mesh as it started
+    arm device_moving       refused "does not match the host arm yet"  "-device" true
     BASE="$B"
     # a case that needs a pressure reference RUNS on the device now (gated on laminar/mixerVessel2D,
     # where every patch is a wall); this one keeps a pressure-driven atmosphere, which is what adjustPhi

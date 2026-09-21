@@ -116,7 +116,8 @@ RunReport runInterFoamDevice(
     bool verbose,
     InterFields* fieldsOut,
     scalar endTime,
-    DeviceInterStepTaps* tapsOut)
+    DeviceInterStepTaps* tapsOut,
+    const MutableMesh* mutableMesh)
 {
     InterFields f = buildInterFields(caseDir, startDir, m, g, fvp);
     // THE PAIR, built here and not at the device-mesh stage, because the hooks below fill its share of
@@ -226,11 +227,77 @@ RunReport runInterFoamDevice(
     // case -- one whose p_rgh fixes its value on no patch -- whose pressure reference the device
     // step pins at pRefValue where OpenFOAM pins it at the cell's current p_rgh, with neither the
     // level shift of p nor adjustPhi.
-    if (f.dynamicMesh)
+    // A MESH THAT MOVES. The motion solve itself is a host operation on both arms -- OpenFOAM's
+    // motion solver is a Laplacian on the point field, and brae has one host implementation of it --
+    // so the device loop moves the mesh exactly as the host loop does (inter_driver_cpp.cu's
+    // Stage::meshUpdate) and then refreshes the buffers it had uploaded from the geometry.
+    DynamicMotionSolverFvMesh* dyn = f.dynamicMesh.get();
+    if (dyn)
     {
+        // THE MOVE RUNS BUT DOES NOT AGREE WITH THE HOST YET, so it stays refused. The call site below
+        // is wired -- interMeshUpdate moves the mesh through the host stage, refreshDeviceMeshGeometry
+        // and the re-uploads follow it, and the ddt takes V0 -- and the first end-to-end run on
+        // laminar/sloshingTank2D (two steps, deltaT 0.01) measured the gap that is left:
+        //
+        //     host    max|U| 10.2  m/s, worst |div(phi)| 1.071e-07
+        //     device  max|U| 10.48 m/s, worst |div(phi)| 7.282e-01
+        //
+        // 2.7% in the velocity and seven orders in the continuity error. Something the move owes this
+        // loop is still missing -- the mesh flux the alpha step and ddtCorr read is the first place to
+        // look, since the pressure corrector's phi is relative on both arms. Refusing rather than
+        // shipping a moving case whose answer is not the host's.
         throw std::runtime_error(
-            "brae interFoam -device: the case moves its mesh (" + f.dynamicMesh->motionType() + "). The "
-            "device loop does not move one; the host loop does. Run without -device.");
+            "brae interFoam -device: the case moves its mesh (" + dyn->motionType() + "). This loop now "
+            "moves it, but the answer does not match the host arm yet -- measured on sloshingTank2D, "
+            "max|U| 10.48 against 10.2 m/s and worst |div(phi)| 7.282e-01 against 1.071e-07. Refusing "
+            "rather than running a moving case whose answer is not the host's. Run without -device.");
+
+        // A COUPLED PAIR ON A MOVING MESH is not ported: buildDeviceCyclic lays the interface out from
+        // the geometry, and every hook in this loop holds a pointer into that layout, so rebuilding it
+        // mid-run would leave them addressing the old one. Refused by name rather than run on a pair
+        // whose geometry has moved out from under it.
+        for (const FvPatch& q : fvp)
+        {
+            if (q.coupled)
+            {
+                throw std::runtime_error(
+                    "brae interFoam -device: the case moves its mesh AND carries the coupled patch `"
+                    + q.name + "`. The pair's device interface is built from the geometry once and the "
+                    "step's hooks hold pointers into it; this loop does not rebuild it after a move. "
+                    "Run without -device.");
+            }
+        }
+        if (!mutableMesh || !mutableMesh->m || !mutableMesh->g || !mutableMesh->patches)
+        {
+            throw std::runtime_error(
+                "brae interFoam -device: the case moves its mesh (" + dyn->motionType() + ") and the "
+                "caller handed the driver a mesh it may not move. Pass the same mesh, geometry and "
+                "patches through MutableMesh; the fields hold references to those patches and must "
+                "see every move.");
+        }
+        if (mutableMesh->m != &m || mutableMesh->g != &g || mutableMesh->patches != &fvp)
+        {
+            throw std::runtime_error(
+                "brae interFoam -device: MutableMesh names different objects from the mesh, geometry "
+                "and patches the fields were built against. Moving a copy would leave every field on "
+                "the old mesh.");
+        }
+        // WHAT IS NOT PORTED YET, refused by name rather than run on a stale interface. A moving AMI
+        // has to re-run the overlap and re-upload it (the legacy simpleFoam driver does both in
+        // DeviceSimpleSolver::moveMesh); this loop refreshes the mesh geometry and the pair, not an
+        // AMI's weights.
+        for (const FvPatch& q : fvp)
+        {
+            if (q.type == "cyclicAMI" || q.type == "cyclicACMI")
+            {
+                throw std::runtime_error(
+                    "brae interFoam -device: the case moves its mesh AND carries the patch `" + q.name
+                    + "` of type `" + q.type + "`. A moving AMI's weights are a function of the moved "
+                      "geometry and this loop does not recompute them; it would interpolate across "
+                      "faces that have moved away. Run without -device.");
+            }
+        }
+        dyn->attach(*mutableMesh->m, *mutableMesh->g, *mutableMesh->patches);
     }
     // THE NON-ORTHOGONAL CORRECTION IS ON THE DEVICE NOW, module by module and each transcribed from the
     // host: the pressure laplacian's loop and its face-flux correction (device_inter_pressure_step.cu),
@@ -1198,6 +1265,22 @@ RunReport runInterFoamDevice(
     // fixedValue wall at its inletValue.
     deviceUpdateInletOutlet(dbU, dPhiB);
 
+    // THE MESH UPDATE'S OWN OBJECTS, as the host driver keeps them (inter_driver_cpp.cu): the mesh's
+    // GAMG hierarchy, which the motion solve builds and the run keeps, and the case's CorrectPhi
+    // controls, which interMeshUpdate uses when `correctPhi` is on.
+    GamgAgglomerationCache motionCache;
+    CorrectPhiControls meshCpc;
+    meshCpc.pcorr = &f.pcorrSolve;
+    meshCpc.pcorrFinal = &f.pcorrSolveFinal;
+    meshCpc.gamgCache = &motionCache;
+    meshCpc.correctedLaplacian = f.laplacianScheme.corrected;
+    meshCpc.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
+    meshCpc.gradPcorr = f.gradPcorr;
+    meshCpc.nNonOrthogonalCorrectors = f.nNonOrthogonalCorrectors;
+    // the volumes the mesh had before this step's move; empty on a static mesh, where the ddt's
+    // other branch runs
+    DeviceBuffer<scalar> dV0;
+
     RunReport rep;
     rep.pcorrSolves = initPcorrSolves;
     rep.deltaT = f.deltaT;
@@ -1279,6 +1362,39 @@ RunReport runInterFoamDevice(
         {
             const bool finalOuter = (outer == f.pimple.nOuterCorrectors - 1);
             setMomentumSolve(finalOuter);
+
+            // interFoam.C:112-149, THE MESH UPDATE, through the same host stage the host loop calls
+            // (interMeshUpdate). The motion solve, CorrectPhi and mixture.correct() are host
+            // operations on either arm; what this loop owes afterwards is the geometry it had
+            // uploaded. A moving mesh with an AMI or a coupled pair is refused above, so the
+            // interfaces below it do not move.
+            if (dyn)
+            {
+                // storeOldVol BEFORE the geometry is recomputed -- OF fvMesh::movePoints:944. The
+                // ddt's old-time term belongs to the volume the old-time field was stored in.
+                dV0.copyFrom(dm.V.host());
+                C.V0 = &dV0;
+                interMeshUpdate(dyn, f, m, g, fvp, mutableMesh, /*amiPairs=*/nullptr,
+                                motionCache, meshCpc, rep, outer, f.pimple.nOuterCorrectors);
+                // ...and now every buffer this loop uploaded from the geometry. clearGeom +
+                // clearOut on the device side: the addressing is untouched, as the move keeps the
+                // topology fixed (device_mesh.cuh).
+                refreshDeviceMeshGeometry(dm, m, g, fvp);
+                dMagSf.copyFrom(g.magSf());
+                dGh.copyFrom(f.gh);
+                {
+                    SurfaceScalarField gf;
+                    gf.internal = f.ghfInternal;
+                    gf.boundary = f.ghfBoundary;
+                    dGhf.copyFrom(fullFace(gf, fvp));
+                }
+                // the patch geometry moved with the cells, and dbU carries the patch deltas and
+                // normals every boundary evaluation reads
+                dbU = buildDeviceVectorBoundary(f.U, fvp, g);
+                // CorrectPhi and makeRelative rewrote phi on the host; the device holds its own copy
+                dPhiI.copyFrom(f.phi.internal);
+                dPhiB.copyFrom(flattenPatches(f.phi.boundary, fvp));
+            }
 
             deviceInterStep(dm, rep.deltaT, C, props, H, dGh, dGhf, dMagSf,
                             dA, dAOld, dUx, dUy, dUz, dUox, dUoy, dUoz,
