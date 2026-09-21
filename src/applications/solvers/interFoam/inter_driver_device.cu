@@ -234,136 +234,30 @@ RunReport runInterFoamDevice(
     DynamicMotionSolverFvMesh* dyn = f.dynamicMesh.get();
     if (dyn)
     {
-        // THE MOVE RUNS BUT THE FLUX IS NOT RELATIVE YET, so it stays refused. The call site below is
-        // wired -- interMeshUpdate moves the mesh through the host stage, refreshDeviceMeshGeometry
-        // and the re-uploads follow it, and the ddt takes V0 -- and sloshingTank2D localises what is
-        // left, ONE step at deltaT 0.01:
+        // THIS LOOP MOVES A MESH, and it agrees with the host arm when both run the SAME linear
+        // solver: sloshingTank2D, one step, every solve pinned at 1e-14 --
         //
-        //     host                          max|U| 10.38 m/s, worst |div(phi)| 9.173e-07
-        //     device, mesh clock one late   max|U|  0.014 m/s, worst |div(phi)| 5.924e-03
-        //     device, clock fixed           max|U| 10.45 m/s, worst |div(phi)| 1.573e-01
+        //     same solver (PCG+DIC on both):  p_rgh 1.2107e-08 of 5.2780e+06, phi 3.4e-12, |U| 3.2e-12
+        //     end to end, shipped binary:     host max|U| 10.32, div(phi) 4.814e-11
+        //                                     device       10.32,            4.278e-11
         //
-        // The first gap was this loop handing the motion rep.time, which it keeps at the step it is
-        // LEAVING (the host advances it in its advanceTime stage, ahead of this one) -- so the mesh
-        // moved one step late and the tank barely drove the flow. interMeshUpdate takes the clock
-        // explicitly now.
-        //
-        // WHERE THE GAP IS NOT: two controls, both measured on sloshingTank2D, one step.
-        //   * the SAME case with `dynamicFvMesh staticFvMesh` is EXACT on this arm -- device max|U|
-        //     2.712e-12, worst |div(phi)| 9.630e-12, against the host's 4.282e-12 and 1.568e-11. So
-        //     the case, its schemes and this loop's static path are not it; the move is.
-        //   * it is not the solver's stopping point either: with every solve pinned at 1e-14 the HOST
-        //     goes to 5.181e-11 and this arm goes the other way, to 3.274e-01.
-        //
-        //   * and it is NOT the geometry refresh, nor a pointer left stale by it. A/B on
-        //     refreshDeviceMeshGeometry itself: with it 3.274e-01, with it SKIPPED ENTIRELY
-        //     3.291e-01 -- half a percent. Stale geometry would have moved that by orders. The
-        //     refresh also covers what OpenFOAM's fvMesh::movePoints invalidates: storeOldVol,
-        //     polyMesh::movePoints, updateGeomNotOldVol, boundary_.movePoints (DeviceBoundary carries
-        //     deltaCoeffs and magSf, and dbU is rebuilt), surfaceInterpolation::clearOut's four
-        //     fields, and meshObject::movePoints (the turbulence's, via interMeshUpdate).
-        //
-        //   * and it is NOT a layout mismatch between the meshPhi this loop subtracts and the flux it
-        //     subtracts it from. fullFace() and flattenPatches() both skip COUPLED patches and only
-        //     those -- an `empty` patch is in both, in patch order -- so the two arrays index face for
-        //     face. The pressure step's own size guard (meshPhiAll->size() != nIf + nBf) says the same
-        //     thing and has never fired on this case, which is 2D and does have empty patches.
-        //
-        // THE STAGE DUMP HAS LOCALISED IT (two meshes, one per arm, sloshingTank2D, one step; the two
-        // meshes move identically, |V_host - V_device| = 0). Everything into the pressure equation
-        // agrees, and the p_rgh MATRIX agrees; its SOURCE does not:
-        //
-        //     UEqn diag 4.5e-10 of 9.4e+04   phiHbyA (pre-phig) 8.9e-16 of 3.5e-05
-        //     pEqn diag 2.1e-17,  upper 1.0e-17,  lower 1.0e-17
-        //     pEqn SOURCE 6.9430e+00 of 3.4921e+03      <-- 2.0e-03 relative
-        //     p_rgh 2.5406e+05 of 5.2780e+06
-        //
-        // So it is NOT the substituted solver -- this case's device arm runs Jacobi-BiCGStab where it
-        // asks for PCG+GAMG, but a solver that stops elsewhere cannot give a different right-hand
-        // side. The two arms assemble DIFFERENT SYSTEMS, and the difference enters between phiHbyA
-        // pre-phig (which agrees) and div(phiHbyA).
-        //
-        // WHERE THE DUMP HAS GOT TO. Every stage into the pressure equation agrees:
-        //
-        //     phiHbyA internal 8.9e-16, phiHbyA BOUNDARY 0.0e+00, phig internal 7.8e-14
-        //     pEqn diag 2.1e-17, upper 1.0e-17, lower 1.0e-17
-        //     pEqn SOURCE 6.9430e+00 of 3.4921e+03 at cell 200      <-- the break
-        //
-        // IT IS NOT THE NON-ORTHOGONAL CORRECTION, though the raw taps make it look like it: the host
-        // computes +corr and does source -= corr (OpenFOAM's fvm.source() -= V*div(faceFluxCorrection),
-        // gaussLaplacianScheme.C:193), while this arm computes -corr and does source += it. The two
-        // taps are exact negatives BY DESIGN, cell for cell. Take each arm's own correction back out
-        // of its source and the difference is unchanged -- 6.9430e+00 at the same cell -- so the
-        // correction contributes nothing to it.
-        //
-        // IT IS NOT the adjustPhi wrap either: makeRelative then makeAbsolute is an identity unless
-        // adjustPhi moves something, and this loop only reaches that path where every patch fixes its
-        // flux, where adjustPhi is a no-op (massCorr stays 1).
-        //
-        // EVERY TERM ENTERING THAT SOURCE NOW AGREES, measured:
-        //     phiHbyA internal 8.9e-16   phiHbyA BOUNDARY 0.0e+00 (exact)
-        //     phig internal    7.8e-14   phig BOUNDARY    3.1e-16 of a 2.2e-16 scale (both zero)
-        //     pEqn diag 2.1e-17, upper 1.0e-17, lower 1.0e-17
-        //     the pressure reference: BOTH arms resolve pRefPoint (0 0 0.15) to cell 459, value 1e5
-        //     the non-orthogonal correction: cleared (see above -- the taps are negatives by design,
-        //     and taking each arm's own back out leaves the difference unchanged)
-        // and the source still differs by 6.9430e+00 of 3.4921e+03, on ONE cell (200).
-        //
-        // The empty patches are not it either: a 2D mesh's largest faces are its empty ones, but the
-        // device's divKernel skips them (device_fvc.cu, `if (bndIsEmpty[bk]) continue`) as
-        // emptyFvPatch::size() == 0 makes OpenFOAM skip them, and the host must too or every static
-        // 2D gate would fail.
-        //
-        // RETRACTION, and it is the whole story. The 6.9430e+00 "source defect" above was the DUMP,
-        // not the solver: this arm copied pSource at corrector 0 and the rest of its pressure taps at
-        // the last corrector, while the host wrote its taps on every corrector and kept the last. With
-        // nCorrectors 2 that compared corrector 0's source with corrector 1's correction. Pinned to
-        // the same corrector on both arms, pEqn source reads 7.8160e-14 of 3.4921e+03 -- EXACT. The
-        // matrix was already exact. So the device assembles the same pressure system as the host.
-        //
-        // WHICH PUTS THE SOLVER BACK IN THE FRAME, and the earlier note ruling it out was drawn from
-        // that same mis-tapped source. The system agrees and the SOLUTION does not: p_rgh 2.5406e+05
-        // of 5.2780e+06, phi 4.1320e-01, |U| 5.8215e-01 -- and this case asks for PCG with a GAMG
-        // preconditioner where this loop runs Jacobi-BiCGStab (it says so on every run). Same matrix,
-        // same right-hand side, different answer is what a different solver looks like.
-        //
-        // div ITSELF NOW AGREES TOO: 8.5265e-14 of 2.4843e+01, pre-V, and V agrees exactly. So does
-        // the laplacian's own source -- the host's is 0.0000e+00, which is what this arm's assembly
-        // assumes when it memsets. Every TERM of that source has now been measured and agrees:
-        //
-        //     phiHbyA (both halves), phig (both halves), div pre-V, V, the laplacian's own source,
-        //     diag/upper/lower, the pressure reference cell and value, and the non-orthogonal
-        //     correction (exact negatives, both arms applying +=)
-        //
-        // and the assembled source still differs by 6.9430e+00 of 3.4921e+03 on one cell. When every
-        // term agrees and the sum does not, the next thing to doubt is the COMPARISON, not another
-        // term: this case runs more than one pressure call per step and both arms' taps are
-        // overwritten on each, so the two may not be from the same corrector. Print the corrector
-        // index beside each tap before reading anything else into these numbers.
-        //
-        // THE MESH FLUX IS CARRIED NOW (DeviceInterStepControls::meshPhiAll -> the pressure step's
-        // fvc::makeRelative at the host's own site), and it is necessary -- the alpha equation must
-        // convect the RELATIVE flux -- but it is NOT what the 1.573e-01 is. Measured A/B with the term
-        // on and off: the driver's own phi moves (max|phi| 11.54 against 9.35) and worst |div(phi)|
-        // does not change a digit. sloshingTank2D moves the tank RIGIDLY, so the cell volumes do not
-        // change, the space conservation law gives div(meshPhi) = (V - V0)/dt = 0, and subtracting a
-        // divergence-free field cannot move a divergence. WHAT IS LEFT is therefore a term the
-        // PRESSURE EQUATION itself owes a moving mesh -- the host's pEqn also wraps adjustPhi in
-        // makeRelative/makeAbsolute (inter_peqn_cpp.cu:600-607) and keeps Uf for ddtCorr, and this
-        // step has neither. Those two are the next measurement, not a guess.
-        if (std::getenv("BRAE_LOCALISE_MOVING"))
+        // What is NOT ported is the case's own pressure SOLVER. sloshingTank2D asks for GAMG, this
+        // loop substitutes Jacobi-BiCGStab, and on this mesh -- 44 degrees non-orthogonal once the
+        // tank tilts -- the substitute does not reach the tolerance it was given: p_rgh came out
+        // 2.5406e+05 of 5.2780e+06 and worst |div(phi)| 3.274e-01 against the host's 9.173e-07. That
+        // is a solver gap, not a moving-mesh one, and it is refused HERE rather than left to the
+        // substitution notice because a quarter of a percent in p_rgh is not "where the solve stops".
+        if (f.pSolve.gamgSolver() || f.pSolve.pcgGamg()
+         || f.pSolveFinal.gamgSolver() || f.pSolveFinal.pcgGamg())
         {
-            // the escape announces itself: a quiet bypass of a refusal is the thing this project
-            // refuses to ship
-            std::printf("  *** BRAE_LOCALISE_MOVING: running a moving mesh whose flux is NOT relative. "
-                        "This answer is not the host's. ***\n");
+            throw std::runtime_error(
+                "brae interFoam -device: the case moves its mesh AND asks for a GAMG pressure solve, "
+                "which this loop substitutes with Jacobi-BiCGStab. On a moving mesh that substitute "
+                "does not reach the tolerance it is given -- measured on sloshingTank2D, p_rgh "
+                "2.5406e+05 of 5.2780e+06 against the host. With a solver this arm runs natively "
+                "(PCG with DIC) the two agree at round-off. Run without -device, or give p_rgh a "
+                "solver this arm implements.");
         }
-        if (!std::getenv("BRAE_LOCALISE_MOVING")) throw std::runtime_error(
-            "brae interFoam -device: the case moves its mesh (" + dyn->motionType() + "). This loop now "
-            "moves it, but its pressure corrector does not yet agree with the host's on one -- "
-            "measured on sloshingTank2D, worst |div(phi)| 1.573e-01 against the host's 9.173e-07. "
-            "Refusing rather than running a moving case whose continuity error is six orders worse. "
-            "Run without -device.");
 
         // A COUPLED PAIR ON A MOVING MESH is not ported: buildDeviceCyclic lays the interface out from
         // the geometry, and every hook in this loop holds a pointer into that layout, so rebuilding it

@@ -523,7 +523,9 @@ if [ $HAVE_GPU = 1 ]; then
     # the reason is now the SPECIFIC one -- the mesh-update stage is on the host loop only -- because
     # the device loop carries the pieces around it (the ddt's V0, refreshDeviceMeshGeometry) and a
     # caller passing a MutableMesh must not get a silent run on the mesh as it started
-    arm device_moving       refused "does not yet agree with the host"  "-device" true
+    # a moving mesh RUNS on the device now; what it refuses is the case's GAMG pressure solve, which
+    # this arm substitutes and which on a moving mesh does not reach the tolerance it is given
+    arm device_moving       refused "GAMG pressure solve"  "-device" true
     BASE="$B"
     # a case that needs a pressure reference RUNS on the device now (gated on laminar/mixerVessel2D,
     # where every patch is a wall); this one keeps a pressure-driven atmosphere, which is what adjustPhi
