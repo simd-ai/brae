@@ -1105,22 +1105,25 @@ RunReport runInterFoamDevice(
                                   f.mulesCtl.extremaCoeff, f.mulesCtl.boundaryExtremaCoeff};
     C.alphaInput.cAlpha = f.interface.cAlpha;
     C.alphaInput.deltaN = interfaceProps::deltaN(g.V());
-    // `Gauss interfaceCompression` runs on the host (limitedSchemes_cpp.cuh). The device has no such
-    // scheme, and the two mappings below would take it as vanLeer and as linear without a word.
-    if (f.divPhiAlpha == AlphaFluxScheme::interfaceCompression
-        || f.divPhirbAlpha == AlphaFluxScheme::interfaceCompression)
+    // The alpha fluxes' schemes, EVERY ONE NAMED and neither mapping ending in a fall-through: both
+    // used to, and `Gauss interfaceCompression` would have been taken as vanLeer on one flux and as
+    // linear on the other without a word.
+    auto alphaScheme = [](AlphaFluxScheme s, const char* which) -> DeviceAlphaScheme
     {
+        switch (s)
+        {
+            case AlphaFluxScheme::linear:  return DeviceAlphaScheme::linear;
+            case AlphaFluxScheme::upwind:  return DeviceAlphaScheme::upwind;
+            case AlphaFluxScheme::vanLeer: return DeviceAlphaScheme::vanLeer;
+            case AlphaFluxScheme::interfaceCompression:
+                return DeviceAlphaScheme::interfaceCompression;
+        }
         throw std::runtime_error(
-            "brae interFoam -device: the case names `Gauss interfaceCompression` for an alpha flux. The "
-            "device alpha step has linear, upwind and vanLeer; the host loop has interfaceCompression. "
-            "Run without -device.");
-    }
-    C.alphaInput.alphaScheme  = (f.divPhiAlpha == AlphaFluxScheme::linear) ? DeviceAlphaScheme::linear
-                              : (f.divPhiAlpha == AlphaFluxScheme::upwind) ? DeviceAlphaScheme::upwind
-                              : DeviceAlphaScheme::vanLeer;
-    C.alphaInput.alpharScheme = (f.divPhirbAlpha == AlphaFluxScheme::vanLeer) ? DeviceAlphaScheme::vanLeer
-                              : (f.divPhirbAlpha == AlphaFluxScheme::upwind) ? DeviceAlphaScheme::upwind
-                              : DeviceAlphaScheme::linear;
+            std::string("brae interFoam -device: the case's ") + which + " scheme is not one this "
+            "loop implements (linear, upwind, vanLeer, interfaceCompression).");
+    };
+    C.alphaInput.alphaScheme  = alphaScheme(f.divPhiAlpha, "div(phi,alpha)");
+    C.alphaInput.alpharScheme = alphaScheme(f.divPhirbAlpha, "div(phirb,alpha)");
     // EVERY SCHEME NAMED, NO default: this switch used to end in `default: upwind`, and interFoam's
     // `linear` -- which its own enum carries and three shipped tutorials name -- fell through it, so
     // a -device run of such a case would have convected upwind under the name `linear`.

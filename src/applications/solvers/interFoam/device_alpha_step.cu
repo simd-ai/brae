@@ -114,6 +114,14 @@ void schemeWeights(const DeviceMesh&           dm,
             ckS(cudaGetLastError(), "upwind weights");
             break;
         }
+        case DeviceAlphaScheme::interfaceCompression:
+        {
+            // a PhiScheme: the limiter is the two cells' own values, so no gradient is built here and
+            // a periodic pair needs none either (the pair's own faces are weighted the same way, in
+            // deviceAlphaCyclicFluxWith).
+            deviceInterfaceCompressionWeights(dm, psiInt, field, w);
+            break;
+        }
         case DeviceAlphaScheme::vanLeer:
         default:
         {

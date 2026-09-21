@@ -382,6 +382,11 @@ void deviceDivLimitedCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& ph
 // where the scheme changes the face value rather than any matrix coefficient. Same limiter as
 // deviceDivLimitedCoeffs, through the same device function, and the same currency: twoByk = 2/max(k,SMALL),
 // NOT the raw k the case writes. Face value is then w*field[own] + (1-w)*field[nei].
+// `Gauss interfaceCompression`, the PhiScheme four of the waveMaker tutorials name for the alpha
+// fluxes: its limiter is the quartic function of the TWO CELL VALUES alone, so it takes no gradient.
+// Face value is then w*field[own] + (1-w)*field[nei], as with the limited weights below.
+void deviceInterfaceCompressionWeights(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt,
+                                       const DeviceBuffer<scalar>& field, DeviceBuffer<scalar>& w);
 void deviceLimitedFaceWeights(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& field,
                               const DeviceBuffer<scalar>& gx, const DeviceBuffer<scalar>& gy, const DeviceBuffer<scalar>& gz,
                               scalar twoByk, DeviceBuffer<scalar>& w);

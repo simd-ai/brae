@@ -44,7 +44,7 @@ __global__ void cyclicFaceFluxKernel(
     const scalar* __restrict__ field,
     const scalar* __restrict__ gx, const scalar* __restrict__ gy, const scalar* __restrict__ gz,
     const scalar* __restrict__ dx, const scalar* __restrict__ dy, const scalar* __restrict__ dz,
-    int scheme,                     // 0 linear, 1 upwind, 2 vanLeer
+    int scheme,                     // 0 linear, 1 upwind, 2 vanLeer, 3 interfaceCompression
     int n, scalar* __restrict__ out)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -70,6 +70,18 @@ __global__ void cyclicFaceFluxKernel(
         else
             r = 2.0 * (gradcf / gradf) - 1.0;
         const scalar lim = limiterOfR(r, kVanLeerTwoByk);
+        wf = lim*w[j] + (scalar(1) - lim)*up;
+    }
+    else if (scheme == 3)
+    {
+        // interfaceCompression's quartic limiter, on the pair's two CELLS -- the same expression the
+        // internal faces take (device_fvm.cu, interfaceCompressionWeightsKernel). It reads no
+        // gradient, so the pair costs nothing the internal faces do not.
+        const scalar phiP = field[P];
+        const scalar aP = scalar(1) - scalar(4)*phiP*(scalar(1) - phiP);
+        const scalar aN = scalar(1) - scalar(4)*vfN*(scalar(1) - vfN);
+        scalar lim = scalar(1) - fmax(aP*aP, aN*aN);
+        lim = fmin(fmax(lim, scalar(0)), scalar(1));
         wf = lim*w[j] + (scalar(1) - lim)*up;
     }
     out[j] = pb * (wf*field[P] + (scalar(1) - wf)*vfN);

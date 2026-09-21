@@ -85,6 +85,35 @@ void divFaceKernel(int nIf, const scalar* __restrict__ phi, scalar* __restrict__
 // always > 0. Every interFoam tutorial names `div(phi,alpha) Gauss vanLeer`, which is why it is here.
 
 
+// interfaceCompression's face weights. A PhiScheme, not an NVD/TVD one: its limiter reads the TWO CELL
+// VALUES and nothing else -- no gradient, no r --
+//     limiter = clamp(1 - max(sqr(1 - 4 phiP (1 - phiP)), sqr(1 - 4 phiN (1 - phiN))), 0, 1)
+// (interfaceCompression.H, the quartic form), blended as every limited scheme is:
+// w = limiter*cdWeight + (1 - limiter)*pos0(phi) (limitedSurfaceInterpolationScheme.C). It is 1 where
+// both cells are half full and 0 where either is empty or full, so the face value is central across
+// the interface and upwind away from it. Written as the host reference writes it
+// (limitedSchemes_cpp.cu:96-119) so the two contract the same multiply-adds.
+__global__
+void interfaceCompressionWeightsKernel(
+    int nIf,
+    const label* __restrict__ own,
+    const label* __restrict__ nei,
+    const scalar* __restrict__ cdw,
+    const scalar* __restrict__ phi,
+    const scalar* __restrict__ field,
+    scalar* __restrict__ w)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= nIf) return;
+    const scalar phiP = field[own[f]];
+    const scalar phiN = field[nei[f]];
+    const scalar aP = scalar(1) - scalar(4)*phiP*(scalar(1) - phiP);
+    const scalar aN = scalar(1) - scalar(4)*phiN*(scalar(1) - phiN);
+    scalar lim = scalar(1) - fmax(aP*aP, aN*aN);
+    lim = fmin(fmax(lim, scalar(0)), scalar(1));
+    w[f] = lim*cdw[f] + (scalar(1) - lim)*((phi[f] >= scalar(0)) ? scalar(1) : scalar(0));
+}
+
 // The face weights alone, for a caller assembling an EXPLICIT divergence rather than matrix
 // coefficients -- rhoSimpleFoam's fvc::div(phi, Ekp). Same limiter, same currency (twoByk, not raw k).
 __global__
@@ -621,6 +650,21 @@ void deviceDivLimitedCoeffs(
     cudaCheck(cudaGetLastError(), "divLimitedFace");
     diagGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), upper.data(), lower.data(), diag.data());
     cudaCheck(cudaGetLastError(), "diagGather");
+}
+
+
+void deviceInterfaceCompressionWeights(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& phiInt,
+    const DeviceBuffer<scalar>& field,
+    DeviceBuffer<scalar>&       w)
+{
+    const int nIf = dm.nInternalFaces;
+    w.resize(nIf);
+    if (!nIf) return;
+    interfaceCompressionWeightsKernel<<<nBlocks(nIf), TPB>>>(
+        nIf, dm.owner.data(), dm.nei.data(), dm.w.data(), phiInt.data(), field.data(), w.data());
+    cudaCheck(cudaGetLastError(), "interfaceCompressionWeights");
 }
 
 

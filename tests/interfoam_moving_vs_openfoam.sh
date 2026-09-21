@@ -94,7 +94,8 @@
 #                  and an unconverged Krylov iterate carries every last-bit difference forward --
 #                  as shipped 22 of 22 counts and alpha 7.6e-09; converged (150 to 176 iterations, the
 #                  same in both) alpha 1.2e-10
-#   piston, flap   laminar/waves/waveMakerPiston and waveMakerFlap, thirty steps of 0.01: the paddle
+#   piston, flap   laminar/waves/waveMakerPiston and waveMakerFlap, ON BOTH ARMS, thirty steps of
+#                  0.01: the paddle
 #                  deforming the mesh, `Gauss interfaceCompression` on div(phirb,alpha), correctPhi, an
 #                  absorbing outlet -- with p_rgh, p_rghFinal and pcorr CONVERGED to 1e-13 (the staging
 #                  says why: as shipped the piston's final corrector takes 135 PCG iterations and pcorr
@@ -103,6 +104,22 @@
 #                  piston's last step, both below 1e-13 -- so for these two profiles every solve must end
 #                  below its tolerance in both codes and the counts must match on short solves and be
 #                  within 2% on long ones. MEASURED: alpha 1.5e-12 and 1.0e-11, U 1.6e-09 and 1.1e-09.
+#                  THE DEVICE ARM IS HERE FOR `div(phirb,alpha) Gauss interfaceCompression`, the
+#                  PhiScheme four waveMakers name and the last alpha scheme that was host-only.
+#                  MEASURED on the piston, device against OpenFOAM: alpha 3.2e-12, p_rgh 5.1e-12, U
+#                  1.5e-09, Uf 1.6e-09, the paddle 1.1e-14 -- the host arm's own distances on the same
+#                  profile. Its p_rgh counts: 17 of 90 one or two iterations apart, every solve ending
+#                  below 1e-13 in both codes, which is why the device arm is allowed ONE iteration
+#                  where OpenFOAM took at least twenty (the test says so at countsAgree). The HOST's
+#                  rule is untouched: exact below a hundred, 2% above.
+#                  BROKEN ONCE EACH, on the device arm (piston):
+#                    the QUADRATIC compression form, interfaceCompression.H's commented-out line,
+#                    for the quartic one it ships        alpha 1.8e-02, U 1.1e-02, Uf 1.1e-02
+#                    vanLeer in its place, which is what the mapping took before it named every
+#                    scheme                              alpha 1.9e-02, U 1.2e-02, Uf 1.1e-02
+#                    the limiter alone, without the (1 - limiter)*pos0(phi) half of
+#                    limitedSurfaceInterpolationScheme's blend
+#                                                        alpha 6.2e-02, U 3.8e-02, Uf 3.7e-02
 #   multiPiston,   laminar/waves/waveMakerMultiPaddlePiston and waveMakerMultiPaddleFlap AS SHIPPED, on
 #   multiFlap      their own 448000-cell 3-D mesh, thirty steps of 0.01: four paddles at 45 degrees,
 #                  interfaceCompression, correctPhi, and GAMG (DICGaussSeidel) AS THE SOLVER of pcorr and

@@ -56,11 +56,14 @@ namespace brae {
 // not a limiter variant but a different scheme entirely, the host runs it and the device driver refuses
 // it by name -- a device enum that mapped it to vanLeer, or to linear as the driver's mapping did until
 // the host ported it, would be the exact substitution this project keeps finding.
+// The integer values matter: deviceAlphaCyclicFlux takes the scheme as an int, and a pair's face must
+// take the same weight an internal face does.
 enum class DeviceAlphaScheme
 {
-    linear,
-    upwind,
-    vanLeer
+    linear  = 0,
+    upwind  = 1,
+    vanLeer = 2,
+    interfaceCompression = 3
 };
 
 struct DeviceAlphaStepInput

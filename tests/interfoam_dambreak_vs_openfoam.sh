@@ -62,8 +62,12 @@
 # linear`) as the control. MEASURED: alpha 6.6e-14, p_rgh 3.1e-14, U 2.2e-13, every count OpenFOAM's; the
 # scheme moves OpenFOAM's own alpha by 1.03e-01. BROKEN ONCE EACH: the quadratic form OpenFOAM leaves
 # commented out, 1.0e-02 of alpha; min for max, 8.1e-02; pos for pos0 in the blend, no change -- no face
-# where the limiter is below 1 carries exactly zero flux, so that one is not claimed. The device REFUSES
-# the scheme, and the test asserts the refusal.
+# where the limiter is below 1 carries exactly zero flux, so that one is not claimed. THE DEVICE ARM
+# RUNS IT TOO now (device_fvm.cu, interfaceCompressionWeightsKernel): alpha 2.0e-13, p_rgh 1.8e-13, U
+# 9.0e-12 against OpenFOAM. This is the STILL fixture for that scheme -- its four tutorials all move
+# their mesh, and tests/interfoam_moving_vs_openfoam.sh's `piston` and `flap` are the moving ones.
+# This arm asserted the device's REFUSAL until the scheme was ported, and the refusal failing here is
+# how the port was noticed.
 #
 # AND `rhophi`: every flux-conditional condition of the atmosphere -- U's pressureInletOutletVelocity,
 # p_rgh's totalPressure, alpha's inletOutlet -- given `phi rhoPhi;`. OpenFOAM's conditions look their

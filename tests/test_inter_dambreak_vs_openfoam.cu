@@ -92,7 +92,10 @@ int main(int argc, char** argv)
     const bool vanLeerV = profileName == "vanleerv";
     const bool linear = profileName == "linear";
     // `compression`: div(phirb,alpha) as `Gauss interfaceCompression`, the PhiScheme four waveMaker
-    // tutorials name, on a mesh that does not move. The device has no such scheme and refuses it.
+    // tutorials name, on a mesh that does not move -- the still fixture for a scheme whose four
+    // tutorials all move their mesh. It was a REFUSAL arm here while the device had no such scheme;
+    // the device runs it now (device_fvm.cu, interfaceCompressionWeightsKernel) and it is compared
+    // like any other profile.
     const bool compression = profileName == "compression";
     // `alphaminiter`: the alpha entry names `minIter 1`. At the big step OpenFOAM's first pre-solve starts
     // under its tolerance and takes no sweep; minIter forces one. The device's pre-solve does not honour
@@ -120,7 +123,7 @@ int main(int argc, char** argv)
     // (inter_driver_device.cu), measured against OpenFOAM on validation/interFoamCyclic's `outer`
     // profile with the one-corrector answer as its control. It is compared here like any other
     // profile, on a case whose every other control the device already runs.
-    const bool deviceRefuses = namedFlux || compression || alphaMinIter || gradLsqLimited
+    const bool deviceRefuses = namedFlux || alphaMinIter || gradLsqLimited
                             || nHatLimited;
     const bool bigStep = (argc > 7 && std::string(argv[7]) == "bigstep") || prevCorr || pimpleProfile || sheared;
     // `inflow`: the atmosphere's inletValue set to 1, so water enters over air cells and rho's patch
@@ -515,7 +518,6 @@ int main(int argc, char** argv)
                     why = e.what();
                 }
                 const char* named = nonOrth ? "nNonOrthogonalCorrectors"
-                                  : compression ? "interfaceCompression"
                                   : alphaMinIter ? "minIter"
                                   : (gradLsqLimited || nHatLimited) ? "cellLimited"
                     
