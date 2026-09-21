@@ -140,6 +140,9 @@ struct DeviceInterStepControls
     // (Sf & Uf.oldTime()) per internal face, which ddtCorr takes in phi.oldTime()'s place on a moving
     // mesh (fvcDdt.C:220-227 -> EulerDdtScheme's fvcDdtUfCorr). Null on a static mesh.
     const DeviceBuffer<scalar>* phiUfOldInt = nullptr;
+    // ...and where the pressure step leaves the ABSOLUTE flux for the driver's fvc::correctUf.
+    DeviceBuffer<scalar>* phiAbsIntOut = nullptr;
+    DeviceBuffer<scalar>* phiAbsBndOut = nullptr;
 
     // The case's MRF zones, built once by the driver (buildDeviceMRFZone). interFoam touches them in
     // three places -- UEqn.H:6 MRF.DDt(rho, U), pEqn.H:18 MRF.zeroFilter(ddtCorr term) and pEqn.H:19

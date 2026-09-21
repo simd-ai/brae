@@ -160,6 +160,46 @@ int main(
     PressureTaps taps;
     const RunReport r = runInterFoam(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/false, &fin,
                                      scalar(1.0e300), &taps, &mutableMesh);
+
+    // THE DEVICE ARM, on the `mixerDevice` profile only. It gets its OWN mesh, geometry and patches:
+    // both arms MOVE the one they are handed, so sharing would make the host's motion the device's
+    // initial condition and every number after that fiction. What this profile does NOT cover is the
+    // case's own pressure solver -- see the staging note in interfoam_moving_vs_openfoam.sh.
+    const bool deviceArm = (profile == "mixerDevice");
+    PrimitiveMesh mD;
+    FvGeometry gD;
+    std::vector<FvPatch> patchesD;
+    MutableMesh mutableD;
+    InterFields finD;
+    if (deviceArm)
+    {
+        int nDev = 0;
+        if (cudaGetDeviceCount(&nDev) != cudaSuccess) { cudaGetLastError(); nDev = 0; }
+        if (nDev <= 0)
+        {
+            std::printf("  SKIP: no CUDA device for the %s profile\n", profile.c_str());
+            return 77;
+        }
+        mD.read(caseDir + "/constant/polyMesh");
+        gD.build(mD);
+        patchesD = buildPatches(mD, gD);
+        mutableD.m = &mD;
+        mutableD.g = &gD;
+        mutableD.patches = &patchesD;
+        runInterFoamDevice(caseDir, startDir, mD, gD, patchesD, nSteps, /*verbose=*/false, &finD,
+                           scalar(1.0e300), nullptr, &mutableD);
+        // the two arms must have moved the mesh the same way, or nothing below is about the solver
+        scalar wv = 0, sv = 0;
+        for (label c = 0; c < nC; ++c)
+        {
+            wv = std::fmax(wv, std::fabs(g.V()[c] - gD.V()[c]));
+            sv = std::fmax(sv, std::fabs(g.V()[c]));
+        }
+        std::printf("  the two arms' meshes: worst |V_host - V_device| %.4e of %.4e\n",
+                    (double)wv, (double)sv);
+        check("both arms moved the mesh the same way",
+              wv <= scalar(1e-13)*std::fmax(sv, scalar(1e-300)));
+    }
     // `closed*`: a closed tank whose mesh does NOT move -- the pressure reference alone
     const bool moving = profile.rfind("closed", 0) != 0;
     check("brae ran the same number of steps", r.steps == nSteps);
@@ -288,6 +328,28 @@ int main(
     std::printf("  p:       relative %.4e   (|p| up to %.4e)\n", (double)dPp.rel(), (double)dPp.refMax);
     std::printf("  U:       relative %.4e   (|U| up to %.4e)\n", (double)dU.rel(), (double)dU.refMax);
 
+    // THE DEVICE ARM AGAINST THE SAME ORACLE. Its bound is the HOST arm's own distance from OpenFOAM
+    // on this profile, not a number picked to fit: both arms solve the same pinned systems on the same
+    // moved mesh, so what the comparison can reach is the arithmetic, and the host reaches it. The
+    // controls are the profile's own -- `mixerStatic` (the tank held still) is what the checks above
+    // measure the motion against, and it moves these fields far more than either arm is from OpenFOAM.
+    if (deviceArm)
+    {
+        const Diff eA = compare(finD.alpha1.internal, ofAlpha);
+        const Diff eP = compare(finD.p_rgh.internal, ofPrgh);
+        const Diff eU = compare(finD.U.internal, ofU);
+        std::printf("  DEVICE:  alpha %.4e, p_rgh %.4e, U %.4e\n",
+                    (double)eA.linf, (double)eP.rel(), (double)eU.rel());
+        std::printf("  host:    alpha %.4e, p_rgh %.4e, U %.4e\n",
+                    (double)dA.linf, (double)dP.rel(), (double)dU.rel());
+        check("the device's alpha is as close to OpenFOAM as the host's",
+              eA.linf <= scalar(20)*std::fmax(dA.linf, scalar(1e-300)));
+        check("...its p_rgh", eP.rel() <= scalar(20)*std::fmax(dP.rel(), scalar(1e-300)));
+        check("...and its U", eU.rel() <= scalar(20)*std::fmax(dU.rel(), scalar(1e-300)));
+        check("OpenFOAM's own fields are not zero here, so the comparison means something",
+              dU.refMax > scalar(0) && dP.refMax > scalar(0));
+    }
+
     // Uf and the wall velocity, face by face, against what OpenFOAM wrote
     if (moving)
     {
@@ -296,6 +358,19 @@ int main(
         const Diff dUf = compare(fin.Uf.internal, ofUf.internalField);
         std::printf("  Uf:      relative %.4e   (|Uf| up to %.4e)\n", (double)dUf.rel(), (double)dUf.refMax);
         check("Uf on the internal faces is OpenFOAM's", dUf.rel() < scalar(2e-7) && !ofUf.internalField.empty());
+        // ...AND THE DEVICE ARM'S Uf, which is the one field a step's own output cannot witness: Uf
+        // is written at the end of the pressure corrector and read only by the NEXT step's ddtCorr.
+        // The device arm handed fvc::correctUf the flux it had already made relative to the motion,
+        // and after one step its Uf was 1.5004e+00 of 3.3328e+00 from the host's while alpha agreed
+        // to 5.6e-15 and U to 1.6e-11 -- every other check on this page green.
+        if (deviceArm)
+        {
+            const Diff eUf = compare(finD.Uf.internal, ofUf.internalField);
+            std::printf("  DEVICE Uf: relative %.4e   (host %.4e)\n",
+                        (double)eUf.rel(), (double)dUf.rel());
+            check("...and the device's Uf is as close to OpenFOAM as the host's",
+                  eUf.rel() <= scalar(20)*std::fmax(dUf.rel(), scalar(1e-300)));
+        }
         scalar dWall = 0;
         scalar wallScale = 0;
         std::size_t nWall = 0;
@@ -312,6 +387,21 @@ int main(
         std::printf("  wall velocity: Linf %.4e on %zu moving-wall faces (|U_wall| up to %.4e)\n",
                     (double)dWall, nWall, (double)wallScale);
         check("the moving walls carry OpenFOAM's velocity", nWall > 0 && dWall <= scalar(1e-12)*wallScale);
+        if (deviceArm)
+        {
+            scalar eWall = 0;
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                if (!finD.movingWallVelocityPatch[pi]) continue;
+                const PatchFieldData<vector>* b = findPatchEntry(ofUFd, patches[pi]);
+                if (!b || b->valueUniform) continue;
+                eWall = std::fmax(eWall, compare(finD.U.boundary[pi]->value(), b->values).linf);
+            }
+            std::printf("  DEVICE wall velocity: Linf %.4e (host %.4e)\n",
+                        (double)eWall, (double)dWall);
+            check("...and the device's moving walls carry it too",
+                  eWall <= scalar(20)*std::fmax(dWall, scalar(1e-300)));
+        }
     }
 
     // THE PRESSURE CORRECTOR TERM BY TERM, when the case was run with tools/dumpInterFoam rather than

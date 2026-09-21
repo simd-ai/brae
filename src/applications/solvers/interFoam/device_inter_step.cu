@@ -456,6 +456,8 @@ void deviceInterStep(
         pi.rAUfAll = &rAUfAll;
         // the mesh flux on a moving mesh, for fvc::makeRelative(phi, U) at the end of pEqn
         pi.meshPhiAll = ctl.meshPhiAll;
+        pi.phiAbsIntOut = ctl.phiAbsIntOut;
+        pi.phiAbsBndOut = ctl.phiAbsBndOut;
         pi.rho = &rho;
         pi.gh  = &gh;
         pi.ddtCorrInt = &ddtCorrI;

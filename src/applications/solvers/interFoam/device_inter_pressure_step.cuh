@@ -90,6 +90,13 @@ struct DeviceInterPressureInput
     // reference does it at inter_peqn_cpp.cu:980, after the velocity correction.
     const DeviceBuffer<scalar>* meshPhiAll = nullptr;
 
+    // ...and where the step hands BACK the flux as it stands one line EARLIER, still absolute.
+    // fvc::correctUf(Uf, U, phi) reads the absolute flux (pEqn.H:66, with makeRelative on the line
+    // after it), and Uf is a host field, so the driver does that call -- from these, not from the
+    // flux this step leaves behind. Null when the caller does not want them.
+    DeviceBuffer<scalar>* phiAbsIntOut = nullptr;
+    DeviceBuffer<scalar>* phiAbsBndOut = nullptr;
+
     // the face fields the buoyancy flux is built from, over the mesh's FULL face array
     const DeviceBuffer<scalar>* stf       = nullptr;   // surfaceTensionForce
     const DeviceBuffer<scalar>* ghf       = nullptr;

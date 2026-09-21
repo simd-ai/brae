@@ -380,6 +380,13 @@ scalar deviceInterPressureStep(
                           havePair ? &ffIf : nullptr,
                           havePair ? &rAUfIf : nullptr);
 
+    // THE ABSOLUTE FLUX, handed back before the line below makes it relative. pEqn.H runs
+    // fvc::correctUf(Uf, U, phi) at :66 and fvc::makeRelative(phi, U) at :69, in that order, so the
+    // normal component correctUf writes into Uf is the ABSOLUTE flux's. Uf is a host field, so the
+    // driver makes that call -- and it must not read the flux this step leaves behind.
+    if (in.phiAbsIntOut) deviceCopy(*in.phiAbsIntOut, phiInt);
+    if (in.phiAbsBndOut) deviceCopy(*in.phiAbsBndOut, phiBnd);
+
     // fvc::makeRelative(phi, U) ON A MOVING MESH -- phi -= meshPhi, fvcMeshPhi.C:76, at the point the
     // host reference does it (inter_peqn_cpp.cu:980): after the velocity correction and before p is
     // rebuilt. The flux that leaves here is the RELATIVE one, which is what the next alpha equation

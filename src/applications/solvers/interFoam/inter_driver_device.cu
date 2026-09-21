@@ -1294,6 +1294,10 @@ RunReport runInterFoamDevice(
     // takes this in phi.oldTime()'s place (EulerDdtScheme's fvcDdtUfCorr).
     SurfaceVectorField UfOld = f.Uf;
     DeviceBuffer<scalar> dPhiUfOld;
+    // ...and the ABSOLUTE flux the pressure step leaves for fvc::correctUf below, which reads phi
+    // one line before makeRelative turns it relative (pEqn.H:66 and :69).
+    DeviceBuffer<scalar> dPhiAbsI, dPhiAbsB;
+    SurfaceScalarField phiAbs;
 
     RunReport rep;
     rep.pcorrSolves = initPcorrSolves;
@@ -1316,15 +1320,15 @@ RunReport runInterFoamDevice(
                                   rep.time, &f.writeCadence);
 
         // Uf.oldTime(), snapshotted where the host driver snapshots it (inter_driver_cpp.cu:897,
-        // alongside UOld and phiOld), and the face flux ddtCorr reads off it. Both are the mesh's
-        // CURRENT Sf: fvcDdtUfCorr dots Uf.oldTime() with mesh().Sf(), not with the old geometry.
+        // alongside UOld and phiOld). The FLUX off it is built after this step's move, below: the
+        // field is the step's, the geometry it is dotted with is the mesh's as it stands then.
         if (dyn)
         {
             UfOld = f.Uf;
-            // Uf is built for a dynamic mesh only (inter_case_cpp.cu, createUfIfPresent.H), and this
-            // loop reads it face by face -- so its size is checked rather than assumed. Reading past
-            // it is what a missing Uf would do QUIETLY, and phiHbyA is six orders larger than the
-            // field it feeds when that happens.
+            // Uf is built for a dynamic mesh only (inter_case_cpp.cu, createUfIfPresent.H), and the
+            // loop below reads it face by face -- so its size is checked rather than assumed.
+            // Reading past it is what a missing Uf would do QUIETLY, and phiHbyA is six orders
+            // larger than the field it feeds when that happens.
             if (UfOld.internal.size() != static_cast<std::size_t>(nIf))
             {
                 throw std::runtime_error(
@@ -1333,13 +1337,6 @@ RunReport runInterFoamDevice(
                     std::to_string(nIf) + ". ddtCorr reads (Sf & Uf.oldTime()) off it on a moving "
                     "mesh (EulerDdtScheme's fvcDdtUfCorr); refusing rather than reading past it.");
             }
-            std::vector<scalar> pu(static_cast<std::size_t>(nIf));
-            for (label fc = 0; fc < nIf; ++fc)
-            {
-                pu[static_cast<std::size_t>(fc)] = dot(g.Sf()[fc], UfOld.internal[fc]);
-            }
-            dPhiUfOld.copyFrom(pu);
-            C.phiUfOldInt = &dPhiUfOld;
         }
 
         std::vector<scalar> ca, cx, cy, cz;
@@ -1447,6 +1444,24 @@ RunReport runInterFoamDevice(
                 // relative to (fvc::makeRelative, pEqn.H:73). Over the full face array, as phi is.
                 dMeshPhi.copyFrom(fullFace(dyn->meshPhi(), fvp));
                 C.meshPhiAll = &dMeshPhi;
+                C.phiAbsIntOut = &dPhiAbsI;
+                C.phiAbsBndOut = &dPhiAbsB;
+                // ...and (Sf & Uf.oldTime()), the flux ddtCorr takes in phi.oldTime()'s place, on
+                // the mesh AS IT STANDS NOW. fvcDdtUfCorr dots the STORED old Uf with mesh().Sf()
+                // (EulerDdtScheme.C:527-531), which the move above has just changed, so this cannot
+                // be built before it. Built before it, the error is INVISIBLE in step one -- Uf
+                // starts at zero and so does the flux, whatever the geometry -- and by step two it
+                // is 13% of |U| on testTubeMixer (measured: |U| 4.8e-01 of 3.6e+00 against the host
+                // arm, alpha still 6e-13; step one 1.6e-11).
+                {
+                    std::vector<scalar> pu(static_cast<std::size_t>(nIf));
+                    for (label fc = 0; fc < nIf; ++fc)
+                    {
+                        pu[static_cast<std::size_t>(fc)] = dot(g.Sf()[fc], UfOld.internal[fc]);
+                    }
+                    dPhiUfOld.copyFrom(pu);
+                    C.phiUfOldInt = &dPhiUfOld;
+                }
             }
 
             deviceInterStep(dm, rep.deltaT, C, props, H, dGh, dGhf, dMagSf,
@@ -1567,7 +1582,16 @@ RunReport runInterFoamDevice(
                   f.U.evaluateBoundary(); }
                 dPhiI.copyTo(f.phi.internal);
                 pushFlux();
-                correctUf(f.Uf, f.U, f.phi, m, g, fvp);
+                // ...with the flux as it stood BEFORE makeRelative, which is the one pEqn.H:66 hands
+                // fvc::correctUf. Handing it the relative flux instead puts the MESH's normal
+                // velocity into Uf, and nothing in the step that wrote it can see the error: Uf is
+                // read only by the NEXT step's ddtCorr. MEASURED on testTubeMixer against the host
+                // arm, one step: |Uf| 1.5004e+00 of 3.3328e+00 while U was 1.6e-11 and alpha 5.6e-15;
+                // by step two that Uf was |U| 4.8e-01 of 3.6e+00.
+                phiAbs.boundary = f.phi.boundary;
+                dPhiAbsI.copyTo(phiAbs.internal);
+                unflatten(dPhiAbsB, phiAbs.boundary);
+                correctUf(f.Uf, f.U, phiAbs, m, g, fvp);
             }
         }   // the outer corrector loop
 
