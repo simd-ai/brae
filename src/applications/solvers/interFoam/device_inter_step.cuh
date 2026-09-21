@@ -92,6 +92,9 @@ struct DeviceInterStepTaps
 {
     DeviceBuffer<scalar> rAU;
     DeviceBuffer<scalar> HbyA[3];
+    // H()'s two halves, x component: before the pair's off-diagonal, and the pair's own contribution
+    DeviceBuffer<scalar> HNoPairX;
+    DeviceBuffer<scalar> HPairX;
     DeviceBuffer<scalar> phiHbyAInt;      // AFTER the two interFoam terms
     DeviceBuffer<scalar> phiHbyABnd;      // ...and its BOUNDARY, which fvc::div sums too
     DeviceBuffer<scalar> UEqnDiag;        // relaxed, as A() takes it

@@ -129,11 +129,22 @@ void pressurePredictor(
         // ...and the pair's off-diagonal, which deviceMatrixH's face loops do not reach:
         // H[own] -= ifCoeff*psi[nbr]/V[own] (deviceCyclicAddH), BEFORE the rAU weighting, because
         // HbyA is rAU*H and not rAU applied to a half-built H.
+        if (k == 0 && in.hNoPairTap)
+        {
+            deviceCopy(*in.hNoPairTap, Hk);
+        }
         if (in.cyc && in.cyc->n > 0)
         {
             // ...with the MOMENTUM matrix's own interface coefficient: cyc.ifCoeff has held the
             // pressure laplacian's since the last corrector assembled it (MomentumMatrix::cycIfCoeff).
             deviceCyclicAddH(*in.cyc, *U[k], dm.V, Hk, &UEqn.cycIfCoeff);
+        }
+        if (k == 0 && in.hPairTap && in.hNoPairTap)
+        {
+            // the pair's own contribution, by difference -- so the tap is what the call DID, not a
+            // second copy of its arithmetic that could drift from it
+            deviceCopy(*in.hPairTap, Hk);
+            deviceAxpy(-1.0, *in.hNoPairTap, *in.hPairTap);
         }
         deviceHadamard(st.HbyA[k], st.rAU, Hk);
     }

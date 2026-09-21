@@ -27,6 +27,12 @@ namespace gpu {
 
 struct PressureInput
 {
+    // H()'s TWO HALVES at a coupled mesh, x component, for bisecting HbyA: what the face loops build
+    // before the pair's off-diagonal is added, and the pair's own contribution alone. A gate sets
+    // these; they are null on every shipped run and cost nothing then.
+    DeviceBuffer<scalar>* hNoPairTap = nullptr;
+    DeviceBuffer<scalar>* hPairTap   = nullptr;
+
     // MRF.makeRelative(phiHbyA), pEqn.H:5 -- between fvc::flux(HbyA) and adjustPhi.
     const std::vector<DeviceMRFZone>* mrf = nullptr;
 

@@ -271,12 +271,16 @@ std::vector<scalar> matrixH1(
     return H1;
 }
 
+// `coupledOut`, when given, receives the COUPLED patches' boundarySource alone, per cell and before
+// the division by V -- the pair's own half of H(), which a gate bisecting HbyA needs separated from
+// the rest. Null on every shipped call.
 inline std::vector<vector> matrixH(
     const FvVectorMatrix& M,
     const GeometricField<vector>& U,
     const PrimitiveMesh& m,
     const FvGeometry& g,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    std::vector<vector>* coupledOut = nullptr)
 {
     const label nC = m.nCells(), nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
@@ -312,7 +316,18 @@ inline std::vector<vector> matrixH(
             {
                 const vector& bc = M.boundaryCoeffs[pi][i];
                 const vector un = patchNeighbourValue(patches[pi], i, U.internal);
+                // THIS LINE IS LEFT EXACTLY AS IT WAS. Hoisting the three products into a named
+                // `term` and adding that instead stops the compiler contracting H + bc*un into an
+                // FMA, which rounds the multiply before the add -- one ulp per face, and MEASURED
+                // enough to move a marginal p_rgh iteration count on the cyclicWet profile and fail
+                // this gate. A tap may not change what it measures, so the tap repeats the multiply.
                 H[patches[pi].faceCells[i]] += vector{bc.x*un.x, bc.y*un.y, bc.z*un.z};
+                if (coupledOut)
+                {
+                    if (coupledOut->size() != static_cast<std::size_t>(nC))
+                        coupledOut->assign(static_cast<std::size_t>(nC), vector{0, 0, 0});
+                    (*coupledOut)[patches[pi].faceCells[i]] += vector{bc.x*un.x, bc.y*un.y, bc.z*un.z};
+                }
                 continue;
             }
             H[patches[pi].faceCells[i]] += M.boundaryCoeffs[pi][i];

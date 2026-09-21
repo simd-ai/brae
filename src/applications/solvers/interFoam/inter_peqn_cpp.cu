@@ -458,7 +458,23 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
     const SurfaceScalarField rAUfField = fvc::interpolate(rAU, m, g, patches);
 
     // HbyA = constrainHbyA(rAU*UEqn.H(), U, p_rgh).
-    const std::vector<vector> H = matrixH(*in.UEqn, U, m, g, patches);
+    std::vector<vector> hCoupled;
+    const std::vector<vector> H = matrixH(*in.UEqn, U, m, g, patches,
+                                          in.taps ? &hCoupled : nullptr);
+    if (in.taps)
+    {
+        in.taps->hPairX.assign(static_cast<std::size_t>(nC), scalar(0));
+        in.taps->hNoPairX.assign(static_cast<std::size_t>(nC), scalar(0));
+        for (label c = 0; c < nC; ++c)
+        {
+            // the pair's half divided by V, as H() divides it, so the two arms' taps are the same
+            // quantity (the device's addHKernel divides by V inside the kernel)
+            const scalar pair = (static_cast<std::size_t>(c) < hCoupled.size())
+                              ? hCoupled[static_cast<std::size_t>(c)].x/g.V()[c] : scalar(0);
+            in.taps->hPairX[static_cast<std::size_t>(c)] = pair;
+            in.taps->hNoPairX[static_cast<std::size_t>(c)] = H[static_cast<std::size_t>(c)].x - pair;
+        }
+    }
     std::vector<vector> HbyA(static_cast<std::size_t>(nC));
     for (label c = 0; c < nC; ++c)
         HbyA[c] = vector{rAU[c]*H[c].x, rAU[c]*H[c].y, rAU[c]*H[c].z};

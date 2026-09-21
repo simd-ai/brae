@@ -273,6 +273,10 @@ struct PressureTaps
     // arms can be compared pass by pass rather than only at the end of a step
     std::vector<std::vector<scalar>> jumpHistory;
     std::vector<std::vector<scalar>> uEqnICx;
+    // H()'s two halves, x component: what the face loops build BEFORE the pair's off-diagonal is
+    // added, and the pair's own contribution alone. HbyA is rAU*H and rAU agrees to 7.9e-19, so a
+    // disagreement in HbyA is a disagreement in one of these two.
+    std::vector<scalar> hNoPairX, hPairX;
 };
 
 // One p_rgh solve as the solver itself reports it -- see inter_solve_record.cuh.

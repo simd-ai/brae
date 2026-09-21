@@ -47,9 +47,28 @@
 // lower 2.7e-15, iCx 4.3e-19, bCx 1.6e-25, rAU 7.9e-19.
 //
 // THE CARRIER IS HbyA, which moves 4.8e-07 relative where its own source moves 6.0e-08 -- so it is what
-// H() multiplies, not the coefficients. WHAT IS NOT TAPPED YET, and is the next measurement: H()'s own
-// pair contribution (deviceCyclicAddH) and the p_rgh system's coefficients, neither of which any tap in
-// this tree reads.
+// H() multiplies, not the coefficients. H() IS NOW TAPPED IN HALVES (PressureTaps::hPairX/hNoPairX and
+// DevicePressureTaps::HPairX/HNoPairX), and they settle it:
+//
+//   H pair.x, the pair's own contribution (deviceCyclicAddH)   6.1340e-15 of 2.1309e-01  -- EXONERATED
+//   H no-pair.x, everything else H is built from               5.3135e-05 of 8.6143e+02
+//
+// and that second number is the momentum source's own 5.9392e-11 divided by V. So the chain closes on
+// M.source, and the pressure system never enters it.
+//
+// WHAT IS MISSING IS IN THE MOMENTUM PATH'S grad(U), and the tree already holds both halves of the fix:
+//   * UEqn.cu's four gradient sites take deviceGradUShared, which has NO cyclic argument -- grad(U) on
+//     this driver never sums the pair's faces, the omission commit 44a8ba6 fixed for the CLOSURE's
+//     grad(U). deviceCyclicAddGrad is called for alpha, p_rgh and the interface properties, never for U.
+//   * deviceCyclicAddLinUpwindCorr -- linearUpwind's deferred correction across a pair, whose own header
+//     says it needs a "cyclic-inclusive" gradient -- has NO caller anywhere in the tree, and this case
+//     asks for `div(rhoPhi,U) Gauss linearUpwind grad(U)`.
+// Both terms are identically zero at the first corrector, where the case starts from rest and grad(U) is
+// zero, and both need the pair -- which is exactly the on/off pattern the controls above measure.
+//
+// MEASURED, and the reason the gradient is the UPSTREAM term: adding a coupled linearUpwind correction
+// on top of the non-cyclic gradient made the pair's cells WORSE, 4.8067e-05 to 1.0909e-04, while every
+// other cell stayed at 5.3135e-05. The correction must not be wired before the gradient sees the pair.
 //
 // WHAT LOOKED LIKE A SECOND GAP HERE WAS THE REPORT, not the solve: the device printed worst |div(phi)|
 // 2.875e-01 against the host's 7.932e-05 with max|U| agreeing to every digit, because the report read

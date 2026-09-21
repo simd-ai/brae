@@ -392,6 +392,11 @@ void deviceInterStep(
         pin.takeUAtBoundary = ctl.takeUAtBoundary;
         pin.cyc = ctl.cyc;
         for (int k = 0; k < 3; ++k) pin.solutionD[k] = ctl.solutionD[k];
+        if (taps && corr == 0)
+        {
+            pin.hNoPairTap = &taps->HNoPairX;
+            pin.hPairTap   = &taps->HPairX;
+        }
         gpu::pressurePredictor(st, dm, dbU, UEqn, UX, UY, UZ, pin, nullptr, nullptr);
         probe("rAU", st.rAU);
         probe("HbyA.x", st.HbyA[0]);
