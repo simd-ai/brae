@@ -162,7 +162,15 @@ scalar deviceInterPressureStep(
     // "BEFORE `phiHbyA += phig`"). The tap below this call is AFTER it, and comparing the two across
     // arms compares different quantities -- it read 2.3534e+01 of a 3.5419e-05 field before this was
     // separated out.
-    if (taps) deviceCopy(taps->phiHbyAIntPrePhig, phiHbyAInt);
+    if (taps)
+    {
+        deviceCopy(taps->phigIntTap, phigInt);
+        deviceCopy(taps->phiHbyAIntPrePhig, phiHbyAInt);
+        // ...AND ITS BOUNDARY HALF. The p_rgh source is div(phiHbyA), which sums the boundary faces
+        // too, so comparing only the internal ones can show agreement while the source differs -- on
+        // a moving mesh the wall flux is not zero, the wall moves.
+        deviceCopy(taps->phiHbyABndPrePhig, phiHbyABnd);
+    }
     deviceInterAddPhiHbyATerms(dm, rhoRAUf,
                                in.ddtCorrInt ? *in.ddtCorrInt : zeroIf,
                                phigInt, phigBnd, in.ddtCorrInt != nullptr,
@@ -228,6 +236,7 @@ scalar deviceInterPressureStep(
                 deviceLaplacianCorrFlux(dm, rAUfInt, gx, gy, gz, ffc);
             }
             deviceFaceDivSource(dm, ffc, corrSource);
+            if (taps && pass == 0) deviceCopy(taps->nonOrthSource, corrSource);
         }
 
         deviceInterAssemblePEqn(dm, rAUfInt, phiHbyAInt, phiHbyABnd,

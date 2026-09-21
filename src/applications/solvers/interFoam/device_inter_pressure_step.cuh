@@ -177,7 +177,10 @@ struct DevicePressureTaps
     // phig and rAUf ON THE PAIR, for comparing the two arms across a coupled face
     DeviceBuffer<scalar> phigIf, rAUfIf, ffIf, phiIf, phiHbyAIfPrePhig, cycJumpTap;
     // phiHbyA on the INTERNAL faces before phig, the same point the host's PressureTaps::phiHbyA is
+    DeviceBuffer<scalar> nonOrthSource;       // the corrected laplacian's source correction
+    DeviceBuffer<scalar> phigIntTap;          // phig on the internal faces, as the host taps it
     DeviceBuffer<scalar> phiHbyAIntPrePhig;
+    DeviceBuffer<scalar> phiHbyABndPrePhig;
     std::vector<std::vector<scalar>> jumpHistory;   // one entry per assembly
 };
 

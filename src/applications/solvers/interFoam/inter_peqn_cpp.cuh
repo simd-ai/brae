@@ -273,6 +273,10 @@ struct PressureTaps
     // an unfolded one compares two different matrices; this unit has already lost time to two taps
     // that were not the same quantity.
     std::vector<scalar> pDiag, pUpper, pLower, pSource;
+    // the non-orthogonal correction the `corrected` laplacian subtracts from that source. On a mesh
+    // that MOVES this is not a small term: sloshingTank2D's is non-orthogonal by 44 degrees once the
+    // tank tilts, and brae refuses `uncorrected` there for exactly that reason.
+    std::vector<scalar> pNonOrthSource;
     // p_rgh's JUMP per patch, as the last assembly left it
     std::vector<std::vector<scalar>> jumpBnd;
     // ...and one entry per ASSEMBLY, flattened over the coupled patches in patch order, so the two

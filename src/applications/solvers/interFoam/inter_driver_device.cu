@@ -283,10 +283,21 @@ RunReport runInterFoamDevice(
         // side. The two arms assemble DIFFERENT SYSTEMS, and the difference enters between phiHbyA
         // pre-phig (which agrees) and div(phiHbyA).
         //
-        // WHAT THE HOST DOES THERE AND THIS LOOP DOES NOT is the moving-mesh wrap around adjustPhi:
-        // makeRelativeFlux(phiHbyA) -> adjustPhi -> makeAbsoluteFlux(phiHbyA), inter_peqn_cpp.cu:
-        // 600-607, which OpenFOAM does under p_rgh.needReference() (pEqn.H:19-24) -- and a closed
-        // tank needs a reference. That is the next term, named by the dump rather than guessed.
+        // AND THE DUMP HAS NAMED IT: the NON-ORTHOGONAL CORRECTION of the `corrected` laplacian.
+        //
+        //     phiHbyA internal 8.9e-16, phiHbyA BOUNDARY 0.0e+00, phig 7.8e-14   -- all agree
+        //     pEqn diag 2.1e-17, upper 1.0e-17, lower 1.0e-17                    -- all agree
+        //     nonOrth source   1.3886e+01 of 6.9430e+00   at cell 200
+        //     pEqn source      6.9430e+00 of 3.4921e+03   at cell 200
+        //
+        // The correction differs by TWICE its own value at the same cell the source breaks on, which
+        // is the signature of an opposite SIGN, and the source then differs by exactly the host's
+        // correction there. It is not the adjustPhi wrap (makeRelative then makeAbsolute is an
+        // identity unless adjustPhi moves something, and this loop only reaches that path where every
+        // patch fixes its flux, where adjustPhi is a no-op), and it is not a moving-mesh term at all:
+        // the move only EXPOSES it, by tilting this mesh to 44.27 degrees of non-orthogonality --
+        // brae refuses `uncorrected` on it for that very reason. Settle the sign against the host's
+        // fvm::laplacianNonOrthSource and OpenFOAM's own correction before touching anything else.
         //
         // THE MESH FLUX IS CARRIED NOW (DeviceInterStepControls::meshPhiAll -> the pressure step's
         // fvc::makeRelative at the host's own site), and it is necessary -- the alpha equation must

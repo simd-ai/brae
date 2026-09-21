@@ -113,7 +113,10 @@ struct DeviceInterStepTaps
     // taps hold and the only one the two arms can be compared in.
     DeviceBuffer<scalar> phigIf, rAUfIf, ffIf, phiIf, phiHbyAIfPrePhig, cycJumpTap;
     // phiHbyA on the internal faces BEFORE phig -- the host's PressureTaps::phiHbyA is at that point
+    DeviceBuffer<scalar> nonOrthSource;
+    DeviceBuffer<scalar> phigIntTap;
     DeviceBuffer<scalar> phiHbyAIntPrePhig;
+    DeviceBuffer<scalar> phiHbyABndPrePhig;
     std::vector<std::vector<scalar>> jumpHistory;
     DeviceBuffer<scalar> uEqnCycIfCoeff;   // UEqn's interface off-diagonal on the pair
     // ...and the ALPHA step's own two on the pair, taken as it leaves: alphaPhi10 and rhoPhi there

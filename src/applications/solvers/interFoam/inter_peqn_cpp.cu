@@ -824,6 +824,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
             const std::vector<vector> gradP = gradOf(p_rgh, sc.gradPrgh, m, g, patches);
             const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
                 rAUfField, p_rgh, gradP, m, g, patches, sc.snGradLimitCoeff);
+            if (in.taps) in.taps->pNonOrthSource = corr;
             for (label c = 0; c < nC; ++c)
             {
                 pe.source[c] -= corr[c];
