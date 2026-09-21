@@ -207,6 +207,7 @@ add_library(brae_core STATIC
     src/applications/solvers/simpleFoam/simpleFoam_cpp.cu
     src/finiteVolume/cfdTools/general/solutionControl/simpleControl/simpleControl_cpp.cu
     src/matrices/lduMatrix/solvers/PCG/device_pcg.cu
+    src/matrices/lduMatrix/solvers/PBiCG/device_pbicg.cu
     src/cuda/device_fvc.cu
     src/cuda/device_fvm.cu
     src/cuda/device_simple.cu
@@ -3852,6 +3853,13 @@ target_include_directories(test_device_dic PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_C
 target_link_libraries(test_device_dic PRIVATE brae_core)
 add_test(NAME device_dic COMMAND test_device_dic)
 set_tests_properties(device_dic PROPERTIES SKIP_RETURN_CODE 77)
+
+# PBiCG with DILU on the device against the host reference (waves/mangroveInteraction's k and epsilon)
+add_executable(test_device_pbicg tests/test_device_pbicg.cu)
+target_include_directories(test_device_pbicg PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_pbicg PRIVATE brae_core)
+add_test(NAME device_pbicg COMMAND test_device_pbicg)
+set_tests_properties(device_pbicg PROPERTIES SKIP_RETURN_CODE 77)
 
 # brae::smoothSolver, the host reference: smoothSolver::solve's loop (what nIterations counts, nSweeps,
 # minIter, the negative-sweep branch, the mesh-order refusal) against the device's OpenFOAM-held solver,
