@@ -12,7 +12,8 @@
 // same instant. TWO PROFILES: `shipped`, where the wall is dry for the whole gated run, and `wetWall`,
 // the water column staged against it, where it is wet and faces go dry as the column falls.
 //
-// THE DEVICE LOOP MUST REFUSE the case, naming the condition.
+// THE DEVICE LOOP runs the same case from the same start and is held to OpenFOAM by its own bounds,
+// to OpenFOAM's p_rgh solves one by one, and to the wall's own written values.
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -49,6 +50,23 @@ struct Bounds
 };
 const Bounds SHIPPED{3e-13, 3e-13, 1e-13, 1e-13, 2e-13, 1e-13};
 const Bounds WETWALL{1e-11, 2e-12, 5e-13, 1e-12, 1e-12, 4e-13};
+
+// THE DEVICE ARM'S OWN BOUNDS, each about 30x its measurement. The arm is deterministic: two runs of
+// either profile print the same digits.
+//   shipped   alpha 6.9e-15, p_rgh 4.7e-15, U 4.3e-13, k 6.8e-15, epsilon 6.4e-15, nut 2.2e-14; all 60
+//             p_rgh counts OpenFOAM's, initial residuals within 5.8e-13 in step one and 3.0e-11 over the run
+//   wetWall   alpha 1.6e-13, p_rgh 4.3e-14, U 9.9e-14, k 1.1e-13, epsilon 6.2e-14, nut 1.1e-13; all 420
+//             counts, initial residuals within 1.1e-09; the same 25 faces wet at the end as the host loop
+// shipped's U is a hundred times the host arm's 3.9e-15 and is not a defect of this wall: it is the
+// device arm's floor on a VoF case, where MULES gathers in another order and the density ratio is 1000.
+struct DeviceBounds
+{
+    Bounds f;
+    scalar pStepOne;
+    scalar pRun;
+};
+const DeviceBounds DEV_SHIPPED{{2e-13, 1.5e-13, 1.5e-11, 2e-13, 2e-13, 7e-13}, 2e-11, 1e-9};
+const DeviceBounds DEV_WETWALL{{5e-12, 1.5e-12, 3e-12, 3.5e-12, 2e-12, 3.5e-12}, 2e-11, 4e-8};
 
 namespace {
 int failures = 0;
@@ -118,6 +136,7 @@ int main(
     const std::string closedDir = argv[6];
     const bool wetWall = (std::string(argv[7]) == "wetWall");
     const Bounds& B = wetWall ? WETWALL : SHIPPED;
+    const DeviceBounds& DB = wetWall ? DEV_WETWALL : DEV_SHIPPED;
     std::printf("  profile: %s\n", wetWall ? "wetWall -- the water column staged against the permeable wall" : "shipped -- the wall stays dry for the gated run");
 
     PrimitiveMesh m;
@@ -368,7 +387,7 @@ int main(
     check("the permeable wall moves OpenFOAM's own U far more than brae is from it",
           dClosedU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)) && dClosedU.rel() > scalar(1e-3));
 
-    // THE DEVICE LOOP REFUSES, by name
+    // THE DEVICE LOOP, on the same case from the same start, held to OpenFOAM by its OWN bounds
     int nDev = 0;
     if (cudaGetDeviceCount(&nDev) != cudaSuccess)
     {
@@ -377,22 +396,74 @@ int main(
     }
     if (nDev <= 0)
     {
-        std::printf("  (no CUDA device: the device refusal is not exercised)\n");
+        std::printf("  (no CUDA device: the device arm is not exercised)\n");
     }
     else
     {
-        bool named = false;
-        try
+        InterFields dev;
+        const RunReport rd = runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
+        check("the device driver ran the same number of steps", rd.steps == nSteps);
+        failures += brae::gatecheck::nonFinite("device alpha", dev.alpha1.internal);
+        failures += brae::gatecheck::nonFinite("device p_rgh", dev.p_rgh.internal);
+        failures += brae::gatecheck::nonFinite("device U", dev.U.internal);
+        failures += brae::gatecheck::nonFinite("device k", dev.turbulence.k.internal);
+        failures += brae::gatecheck::nonFinite("device epsilon", dev.turbulence.epsilon.internal);
+        failures += brae::gatecheck::nonFinite("device nut", dev.turbulence.nut.internal);
+        const Diff eA = compare(dev.alpha1.internal, ofAlpha);
+        const Diff eP = compare(dev.p_rgh.internal, ofPrgh);
+        const Diff eU = compare(dev.U.internal, ofU);
+        const Diff eK = compare(dev.turbulence.k.internal, ofKf);
+        const Diff eE = compare(dev.turbulence.epsilon.internal, ofEf);
+        const Diff eN = compare(dev.turbulence.nut.internal, ofNut);
+        std::printf("  DEVICE:  alpha %.4e, p_rgh %.4e, U %.4e, k %.4e, epsilon %.4e, nut %.4e\n",
+                    (double)eA.linf, (double)eP.rel(), (double)eU.rel(), (double)eK.rel(),
+                    (double)eE.rel(), (double)eN.rel());
+        std::printf("  host:    alpha %.4e, p_rgh %.4e, U %.4e, k %.4e, epsilon %.4e, nut %.4e\n",
+                    (double)dA.linf, (double)dP.rel(), (double)dU.rel(), (double)dK.rel(),
+                    (double)dE.rel(), (double)dN.rel());
+        // every p_rgh solve of the run, against OpenFOAM's log
+        failures += brae::gatecheck::compareSolves("device", rd.pSolves, ofP, nSteps, "p_rgh", DB.pStepOne,
+                                                   DB.pRun);
+        // THE WALL ITSELF on the device arm: the same faces wet, and both conditions' written values
+        std::size_t wetEndDev = 0;
+        scalar eWallU = 0;
+        scalar eWallP = 0;
+        std::size_t nComparedDev = 0;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
-            InterFields dev;
-            runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
+            if (!dev.p_rgh.boundary[pi]->isPrghPermeableAlphaTotalPressure()) continue;
+            for (label i = 0; i < patches[pi].size; ++i)
+            {
+                wetEndDev += (dev.alpha1.boundary[pi]->value()[static_cast<std::size_t>(i)] > scalar(0.01)) ? 1 : 0;
+            }
+            const PatchFieldData<vector>* bu = findPatchEntry(ofUFd.boundary, patches[pi]);
+            const PatchFieldData<scalar>* bp = findPatchEntry(ofPFd.boundary, patches[pi]);
+            if (!bu || !bp || !bu->hasValue || !bp->hasValue) continue;
+            const std::size_t nf = static_cast<std::size_t>(patches[pi].size);
+            const std::vector<vector> ofUb = bu->valueUniform ? std::vector<vector>(nf, bu->uniformValue) : bu->values;
+            const std::vector<scalar> ofPb = bp->valueUniform ? std::vector<scalar>(nf, bp->uniformValue) : bp->values;
+            eWallU = compare(dev.U.boundary[pi]->value(), ofUb).linf;
+            eWallP = compare(dev.p_rgh.boundary[pi]->value(), ofPb).linf;
+            nComparedDev = nf;
         }
-        catch (const std::exception& e)
-        {
-            named = std::string(e.what()).find("permeable-wall condition") != std::string::npos;
-            std::printf("  device: %s\n", e.what());
-        }
-        check("the device loop refuses the case and names the condition", named);
+        std::printf("  DEVICE on the wall: %zu faces wet at the end (host %zu), U_b Linf %.4e, p_rgh_b Linf %.4e\n",
+                    wetEndDev, wetEnd, (double)eWallU, (double)eWallP);
+        check("the device left the faces wet that the host loop left wet", wetEndDev == wetEnd);
+        // held to the device arm's OWN bounds (DEV_*, at the top of this file, with the measurement)
+        check("the device's alpha agrees with OpenFOAM's absolutely", eA.linf < DB.f.alpha);
+        check("...its p_rgh", eP.rel() < DB.f.prgh);
+        check("...its U", eU.rel() < DB.f.U);
+        check("...its k", eK.rel() < DB.f.k);
+        check("...its epsilon", eE.rel() < DB.f.epsilon);
+        check("...its nut", eN.rel() < DB.f.nut);
+        // the wall's own values are held to the HOST arm's bounds: measured 9.0e-16 and 4.9e-15 on
+        // shipped, exactly 0 and 1.3e-11 (of 2.6e+03) on wetWall
+        check("...the wall's U, face by face",
+              nComparedDev > 0 && eWallU <= B.U*std::fmax(dU.refMax, scalar(1e-300)));
+        check("...and the wall's p_rgh",
+              nComparedDev > 0 && eWallP <= B.prgh*std::fmax(dP.refMax, scalar(1e-300)));
+        check("the permeable wall moves OpenFOAM's own U far more than the device is from it",
+              dClosedU.rel() > scalar(1000)*std::fmax(eU.rel(), scalar(1e-14)));
     }
 
     std::printf("test_inter_permeable_vs_openfoam: %d failures\n", failures);

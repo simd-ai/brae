@@ -195,7 +195,7 @@ void deviceInterStep(
 
     // 3. THE MOMENTUM MATRIX
     DeviceBuffer<scalar> ub[3];
-    hooks.updateUBoundary(UX, UY, UZ, dbU, ub);
+    hooks.updateUBoundary(UX, UY, UZ, dbU, ub, DeviceUBoundaryCall::assembly);
     // pressureInletOutletVelocity's updateCoeffs, from the flux registered NOW: an inflow face fixes
     // its tangential components, an outflow face is zeroGradient. The hook rebuilds dbU from the host
     // patches' categories, which carry no flux, so without this every such face stayed zeroGradient for
@@ -374,7 +374,8 @@ void deviceInterStep(
                 ctl.momentumSolveLog[k].push_back(perf);
             }
         }
-        hooks.updateUBoundary(UX, UY, UZ, dbU, ub);
+        // the predictor's solve ends in U.correctBoundaryConditions(), which clears updated()
+        hooks.updateUBoundary(UX, UY, UZ, dbU, ub, DeviceUBoundaryCall::evaluate);
         deviceUpdateInletOutlet(dbU, phiBnd);
         deviceUpdatePressureInletOutletVelocity(dbU, phiBnd, UX, UY, UZ, /*directionMixed=*/true);
         deviceUpdateSymmetry(dbU, UX, UY, UZ);
@@ -552,7 +553,13 @@ void deviceInterStep(
         // p_rgh.correctBoundaryConditions() at the end of pEqn.H, and U's with it: the next pass's
         // laplacian, its flux and its HbyA all read them.
         if (hooks.pressure.updateBoundary) hooks.pressure.updateBoundary(p_rgh);
-        hooks.updateUBoundary(UX, UY, UZ, dbU, ub);
+        // ...U's with the ASSEMBLY-TIME coefficients in the first corrector of a pass that ran no
+        // predictor: its patches are still updated() there, as the host loop's
+        // `uPatchesUpdatedAtEntry = (c == 0) && !momentumPredictor` has it (inter_driver_cpp.cu).
+        const bool stillUpdated = (corr == 0) && !ctl.momentumPredictor;
+        hooks.updateUBoundary(UX, UY, UZ, dbU, ub,
+                              stillUpdated ? DeviceUBoundaryCall::evaluateStillUpdated
+                                           : DeviceUBoundaryCall::evaluate);
         deviceUpdateInletOutlet(dbU, phiBnd);
         deviceUpdatePressureInletOutletVelocity(dbU, phiBnd, UX, UY, UZ, /*directionMixed=*/true);
         deviceUpdateSymmetry(dbU, UX, UY, UZ);

@@ -43,6 +43,26 @@
 
 namespace brae {
 
+// The step calls the U-boundary hook at three points, and they are NOT one operation in OpenFOAM.
+enum class DeviceUBoundaryCall
+{
+    // The fvMatrix constructor's U.boundaryFieldRef().updateCoeffs() at the momentum assembly
+    // (fvMatrix.C:396): the patches' COEFFICIENTS move to the flux and the phase fraction as they
+    // stand, and the STORED patch values do not -- updateCoeffs is not an evaluate, except in a class
+    // whose updateCoeffs ends in one (pressureInletOutletVelocity). fvc::grad(U) inside divDevRhoReff
+    // reads the stored values.
+    assembly,
+    // U.correctBoundaryConditions(): updateCoeffs where the patch is not updated(), then the evaluate.
+    evaluate,
+    // ...the same, at the ONE call where OpenFOAM's patches are still updated(): after the first
+    // pressure corrector of a pass that ran no momentum predictor. The constructor's updateCoeffs set
+    // the flag and nothing has evaluated U since, so the evaluate skips updateCoeffs and blends with
+    // the ASSEMBLY-TIME valueFraction (mixedFvPatchField.C). The hook must keep the new flux from
+    // U's flux-conditional patches, as the host pEqn does (inter_peqn_cpp.cu, uPatchesUpdatedAtEntry,
+    // with what it cost).
+    evaluateStillUpdated
+};
+
 struct DeviceInterStepHooks
 {
     DeviceInterAlphaHooks    alpha;      // alpha's patch values + contact angle, and fvm::div's coeffs
@@ -56,11 +76,13 @@ struct DeviceInterStepHooks
     // and fvc::grad(U) inside divDevRhoReff reads the STORED ones. MEASURED with the re-derived value
     // standing in: the dev2 term's contribution was 100% wrong on that patch's 46 cells (2.24e-06 of
     // 2.24e-06) while the three walls were between exact and 0.8%.
+    // `call` says WHICH of OpenFOAM's operations the call stands for -- see DeviceUBoundaryCall.
     std::function<void(const DeviceBuffer<scalar>& Ux,
                        const DeviceBuffer<scalar>& Uy,
                        const DeviceBuffer<scalar>& Uz,
                        DeviceVectorBoundary&       dbU,
-                       DeviceBuffer<scalar>*       UbStored)> updateUBoundary;
+                       DeviceBuffer<scalar>*       UbStored,
+                       DeviceUBoundaryCall         call)> updateUBoundary;
 
     // The face fields that depend on the NEW alpha, over the mesh's FULL face array:
     // surfaceTensionForce() = interpolate(sigma*K)*snGrad(alpha1), and snGrad(rho). Both are rebuilt

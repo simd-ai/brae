@@ -173,7 +173,7 @@ int main()
     hooks.updateUBoundary =
         [&](const DeviceBuffer<scalar>& dx, const DeviceBuffer<scalar>& dy,
             const DeviceBuffer<scalar>& dz, DeviceVectorBoundary& db,
-                DeviceBuffer<scalar>* ubOut)
+                DeviceBuffer<scalar>* ubOut, DeviceUBoundaryCall)
     {
         std::vector<scalar> a, b, c;
         dx.copyTo(a); dy.copyTo(b); dz.copyTo(c);

@@ -306,9 +306,15 @@ GeometricField<scalar> rhoWithPatchValues(
 
 // Tell every flux-conditional patch of U, p_rgh and alpha1 the current phi -- see the definition.
 // Call it whenever phi changes, before the next boundary evaluation reads it.
+// `uPatchesStillUpdated` is the FIRST pressure corrector of a pass with no momentum predictor, where
+// OpenFOAM's U patches are still updated() from the momentum assembly and their evaluate blends with
+// the assembly-time coefficients: U's patches are then NOT told, except a class whose updateCoeffs
+// ends in evaluate(). The host pEqn carries the same rule in its own loop (inter_peqn_cpp.cu, where
+// the measurements are); this argument is for the device loop, whose hand-over is this function.
 void pushFluxToPatches(
     InterFields& f,
-    const std::vector<FvPatch>& patches);
+    const std::vector<FvPatch>& patches,
+    bool uPatchesStillUpdated = false);
 
 // ...and the phase field's stored patch values, to the conditions that look ALPHA up (the two
 // permeable-wall ones). pushFluxToPatches ends with it; call it again after any evaluate of alpha's

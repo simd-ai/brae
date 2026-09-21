@@ -227,18 +227,27 @@ RunReport runInterFoamDevice(
     }
 
     // A variableHeightFlowRateInletVelocity is rebuilt by the U-boundary hook now, from the phase
-    // fraction on its patch, as the host driver rebuilds it (inter_driver_cpp.cu:722-735). What is still
-    // refused here is the permeable-wall pair, which reads the phase field too but at another point.
+    // fraction on its patch, as the host driver rebuilds it (inter_driver_cpp.cu:722-735).
+    // THE PERMEABLE-WALL PAIR runs here too: both halves are host patches, told the flux and the phase
+    // field's patch values by pushFlux at every hook, the pressure half rebuilt inside the pressure
+    // hook's constrainPressure, and the velocity half kept off the new flux in the one corrector
+    // OpenFOAM keeps it off (DeviceInterStepHooks::updateUBoundary). What is still refused is the pair
+    // on a MOVING mesh: prghPermeableAlphaTotalPressure reads phi as it stands at constrainPressure,
+    // and on a moving mesh that is a flux this loop makes relative at a different point from the host
+    // loop. No tutorial ships the combination and neither arm has measured it.
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        if (f.U.boundary[pi]->needsAlphaPatchValues() || f.p_rgh.boundary[pi]->needsAlphaPatchValues()
-         || f.p_rgh.boundary[pi]->isPrghPermeableAlphaTotalPressure())
+        const bool permeable = f.U.boundary[pi]->needsAlphaPatchValues()
+                            || f.p_rgh.boundary[pi]->needsAlphaPatchValues()
+                            || f.p_rgh.boundary[pi]->isPrghPermeableAlphaTotalPressure();
+        if (permeable && f.dynamicMesh)
             throw std::runtime_error(
                 "brae interFoam (device): patch `" + fvp[pi].name + "` carries a permeable-wall condition "
-                "(permeableAlphaPressureInletOutletVelocity or prghPermeableAlphaTotalPressure). Each "
-                "switches face by face between a wall and an open boundary on the phase fraction at the "
-                "patch, at every update; the host loop carries that (gated on laminar/damBreakPermeable) "
-                "and the device loop uploads the blend once. Refused rather than run a wall that never opens.");
+                "(permeableAlphaPressureInletOutletVelocity or prghPermeableAlphaTotalPressure) and the "
+                "mesh moves. The pressure half reads the flux as it stands when constrainPressure runs, "
+                "and the device loop has not been measured against OpenFOAM on a moving mesh with that "
+                "condition. Refused rather than run an unmeasured flux; a static mesh runs (gated on "
+                "laminar/damBreakPermeable).");
     }
     // `grad(U) cellLimited`: the host momentum equation limits the gradient; the device's does not read
     // the coefficient
@@ -568,7 +577,7 @@ RunReport runInterFoamDevice(
             off += n;
         }
     };
-    auto pushFlux = [&]()
+    auto pushFlux = [&](bool uPatchesStillUpdated = false)
     {
         unflatten(dPhiB, f.phi.boundary);
         // ...and the PAIR's own faces, which that array does not carry. Without this a
@@ -595,7 +604,7 @@ RunReport runInterFoamDevice(
         {
             unflatten(dRpB, f.rhoPhi.boundary);
         }
-        pushFluxToPatches(f, fvp);
+        pushFluxToPatches(f, fvp, uPatchesStillUpdated);
     };
 
     // THE WAVE CONDITIONS' CLOCK: OpenFOAM's time and time index for the step being taken, which the
@@ -710,9 +719,12 @@ RunReport runInterFoamDevice(
     };
     H.updateUBoundary =
         [&](const DeviceBuffer<scalar>& ux, const DeviceBuffer<scalar>& uy,
-            const DeviceBuffer<scalar>& uz, DeviceVectorBoundary& db, DeviceBuffer<scalar>* ubOut)
+            const DeviceBuffer<scalar>& uz, DeviceVectorBoundary& db, DeviceBuffer<scalar>* ubOut,
+            DeviceUBoundaryCall call)
     {
-        pushFlux();
+        // p_rgh's and alpha's patches take the new flux at every call; U's do not at the one call
+        // where OpenFOAM's are still updated() -- see DeviceUBoundaryCall
+        pushFlux(call == DeviceUBoundaryCall::evaluateStillUpdated);
         std::vector<scalar> x, y, z;
         ux.copyTo(x); uy.copyTo(y); uz.copyTo(z);
         for (label c = 0; c < nC; ++c) f.U.internal[c] = vector{x[c], y[c], z[c]};
@@ -721,7 +733,18 @@ RunReport runInterFoamDevice(
         // left (f.alpha1 is the alpha hooks' last copy) and the U the step started on. Every later
         // call of the step is the same time index and re-assigns the same values.
         updateWaveVelocity(f.waves, f.alpha1, f.U, stepTime, stepIndex, m, g, fvp);
-        f.U.evaluateBoundary();
+        // THE ASSEMBLY IS NOT AN EVALUATE. At the momentum assembly OpenFOAM's patches update their
+        // coefficients and keep their STORED values, which is what the host loop does at the same
+        // point (inter_driver_cpp.cu:602-611: the wave model, then the classes whose updateCoeffs
+        // ends in evaluate(), and nothing else). Evaluating here is the same value bit for bit while
+        // nothing a patch reads has moved since the last corrector's evaluate -- and the phase
+        // fraction HAS, on a permeable wall: MEASURED on damBreakPermeable's staged wet wall, at the
+        // step where the first face goes dry (81 of 140), U 1.3e-03 and p_rgh 1.5e-01 from the host
+        // loop in that one step, from 2e-13 the step before.
+        if (call != DeviceUBoundaryCall::assembly)
+        {
+            f.U.evaluateBoundary();
+        }
         updateVelocityPatches(f.U, fvp);
         // U.boundaryFieldRef().updateCoeffs() for a flowRateInletVelocity, which the fvMatrix constructor
         // runs at every momentum assembly (fvMatrix.C:396): the rate at THIS time and, for a
@@ -972,6 +995,23 @@ RunReport runInterFoamDevice(
                 {
                     const scalar SfU = dot(g.Sf()[q.start + i], ub[i]);
                     sn[i] = (hB[off + i] - SfU) / (q.magSf[i] * rA[nIf + off + i]);
+                }
+                // prghPermeableAlphaTotalPressure rebuilds its refValue and valueFraction INSIDE
+                // updateSnGrad, from rho, phi and U on the patch and gh at the face centres
+                // (...FvPatchScalarField.C:151-212), which the host pEqn does at this same point
+                // (inter_peqn_cpp.cu:761-771). The phi is the field as it stands -- the last
+                // corrector's, which the step's last pushFlux unflattened into f.phi -- not phiHbyA.
+                if (f.p_rgh.boundary[pi]->isPrghPermeableAlphaTotalPressure())
+                {
+                    if (f.rhoBnd.size() <= pi || f.ghfBoundary.size() <= pi || f.phi.boundary.size() <= pi)
+                    {
+                        throw std::runtime_error(
+                            "brae interFoam (device): p_rgh patch `" + q.name + "` is a "
+                            "prghPermeableAlphaTotalPressure, which needs rho's patch values, gh at the "
+                            "patch's face centres and phi on the patch, and the driver has none for it.");
+                    }
+                    f.p_rgh.boundary[pi]->updatePermeableTotalPressure(f.rhoBnd[pi], f.phi.boundary[pi], ub,
+                                                                       f.ghfBoundary[pi]);
                 }
                 f.p_rgh.boundary[pi]->updateSnGrad(sn);
             }

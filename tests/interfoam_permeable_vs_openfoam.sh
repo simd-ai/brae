@@ -85,8 +85,38 @@
 # The solution is the same (epsilon 7e-15) and the residual's normalisation is not: 1.8e-06 per step,
 # against 0.0 with the wall closed. The iteration counts are asserted.
 #
+# THE DEVICE LOOP runs both profiles from the same start and is held to OpenFOAM by its OWN bounds
+# (DEV_SHIPPED and DEV_WETWALL in the .cu, with the measurements): shipped alpha 6.9e-15, p_rgh 4.7e-15,
+# U 4.3e-13; wetWall alpha 1.6e-13, p_rgh 4.3e-14, U 9.9e-14, all 420 p_rgh counts OpenFOAM's, the same
+# 25 faces wet at the end, the wall's U exactly OpenFOAM's zero. Both halves of the wall are HOST
+# patches there: the flux and the phase fraction reach them at every hook, the pressure half is rebuilt
+# inside the pressure hook's constrainPressure, and the device's boundary arrays are rebuilt from them.
+# WHAT THE DEVICE ARM FOUND, both at the step where the first face goes dry (81 of 140) and both the
+# same defect -- a patch value RE-DERIVED where OpenFOAM reads the STORED one:
+#   (1) the U-boundary hook EVALUATED U's patches at the momentum assembly. OpenFOAM's assembly is
+#       updateCoeffs, not an evaluate: the wall's coefficients open with the new phase fraction while
+#       its stored value is still a wall's zero, and divDevRhoReff's grad(U) reads the stored one.
+#   (2) linearUpwind's grad(U) came from the shared memo, which re-derived the patch value from the
+#       boundary coefficients -- the ones that had just opened -- while divDevReff beside it already
+#       took the stored values. One field, two sets of patch values.
+# U 1.3e-03 and p_rgh 1.5e-01 from the host loop in that one step, from 2e-13 the step before; `shipped`
+# sees neither, because its wall never switches.
+# BROKEN ONCE EACH ON THE DEVICE ARM (U on shipped, U on wetWall, wetWall's p_rgh counts equal):
+#   the pressure half not rebuilt inside constrainPressure       9.9e-01, 9.9e-01, 181 of 420
+#   U's patches handed the new flux in EVERY corrector           8.6e-08, 3.4e-06, 420 of 420
+#   U evaluated at the momentum assembly                         nothing, 8.6e-05, 420 of 420
+#   linearUpwind's grad(U) re-deriving the patch value           nothing, 2.3e-05, 420 of 420
+#   the first corrector's lag applied to pressureInletOutletVelocity too
+#                                                                nothing, 3.9e-02, 407 of 420
+# The second and fifth lines are the host arm's own numbers to two digits: the same rule, transcribed.
+# NOT DISCRIMINATED: the stored patch values' entry in the grad(U) memo's fingerprint. Both profiles
+# read the same digits without it, because wherever the stored value differs from the re-derived one
+# the boundary coefficients differ too and they are already fingerprinted; the entry guarantees that a
+# stored call never returns a re-derived call's bits, and nothing here can tell.
+#
 # NOT CLAIMED: a `p` that varies in space or time, a mass flux named in `phi` (both refused), the
-# conditions without an `alpha` entry (implemented, ungated), and the device loop (refused by name).
+# conditions without an `alpha` entry (implemented, ungated), and the pair on a MOVING mesh on the
+# device loop (refused by name: tests/interfoam_refusals.sh, device_permeable_moving).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_permeable_vs_openfoam"
