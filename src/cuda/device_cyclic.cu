@@ -842,10 +842,17 @@ void deviceCyclicAddLinUpwindCorr(
     const DeviceBuffer<scalar>* gUx,
     const DeviceBuffer<scalar>* gUy,
     const DeviceBuffer<scalar>* gUz,
-    DeviceBuffer<scalar>& corr)
+    DeviceBuffer<scalar>& corr,
+    const DeviceBuffer<scalar>* flux)
 {
     if (cyc.n == 0) return;
-    cycLinUpwindKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.phi.data(),
+    // THE EQUATION'S OWN FLUX, not the volumetric one this interface happens to carry. interFoam's
+    // momentum is div(rhoPhi,U), so its deferred correction is weighted by the SAME rhoPhi the matrix
+    // was assembled with (MomentumInput::cycConvFlux); an incompressible driver passes nothing and
+    // takes cyc.phi, which is what it assembled with.
+    const scalar* f = (flux && static_cast<int>(flux->size()) == cyc.n) ? flux->data()
+                                                                       : cyc.phi.data();
+    cycLinUpwindKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), f,
         gUx[0].data(), gUy[0].data(), gUz[0].data(), gUx[1].data(), gUy[1].data(), gUz[1].data(),
         gUx[2].data(), gUy[2].data(), gUz[2].data(),
         cyc.dOwnX.data(), cyc.dOwnY.data(), cyc.dOwnZ.data(), cyc.dNbrX.data(), cyc.dNbrY.data(), cyc.dNbrZ.data(),

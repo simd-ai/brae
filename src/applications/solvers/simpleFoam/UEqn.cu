@@ -304,17 +304,40 @@ void assembleUEqn(
     {
         const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
         const GradUMemo& gm = deviceGradUShared(dm, dbU, Ux, Uy, Uz);
+        // ALL THREE components' gradients are built first, because the pair's correction reconstructs
+        // the neighbour in the NEIGHBOUR's frame: on a rotational cyclic the component that comes back
+        // is forwardT . (gradU[nbr] . dNbr), which mixes all three (device_cyclic.cuh). Per-component
+        // buffers cannot express that, so they are hoisted out of the loop below.
+        DeviceBuffer<scalar> gxA[3], gyA[3], gzA[3];
         for (int k = 0; k < 3; ++k)
         {
-            DeviceBuffer<scalar> gx, gy, gz, lu;
-            deviceCopy(gx, gm.gx[k]);
-            deviceCopy(gy, gm.gy[k]);
-            deviceCopy(gz, gm.gz[k]);
-            addPairToGrad(k, gx, gy, gz);
+            deviceCopy(gxA[k], gm.gx[k]);
+            deviceCopy(gyA[k], gm.gy[k]);
+            deviceCopy(gzA[k], gm.gz[k]);
+            addPairToGrad(k, gxA[k], gyA[k], gzA[k]);
             // `linearUpwind <name>` where <name> resolves to `cellLimited Gauss linear <k>`.
             if (in.gradULimitK > 0.0)
-                deviceCellLimitGrad(dm, *U[k], gm.ub[k], gx, gy, gz, in.gradULimitK);
-            deviceLinearUpwindCorr(dm, *in.phiInt, gx, gy, gz, lu);
+                deviceCellLimitGrad(dm, *U[k], gm.ub[k], gxA[k], gyA[k], gzA[k], in.gradULimitK);
+        }
+        for (int k = 0; k < 3; ++k)
+        {
+            DeviceBuffer<scalar> lu;
+            deviceLinearUpwindCorr(dm, *in.phiInt, gxA[k], gyA[k], gzA[k], lu);
+            // ...and the PAIR's faces, which that kernel's internal-face loop does not reach. The host
+            // reference adds them (fvm::addLinearUpwindCorrectionCoupled, called from every interFoam
+            // UEqn assembly); this arm had the kernel for it since the legacy driver and never called
+            // it. It accumulates into the SAME buffer, so both halves leave through one axpy with the
+            // scheme's share -- 1 for linearUpwind, 0.25 for LUST.
+            if (in.cyc && in.cyc->n > 0)
+            {
+                if (!in.cycConvFlux)
+                    throw std::runtime_error(
+                        "brae device UEqn: linearUpwind's deferred correction across a coupled patch "
+                        "must be weighted by the SAME flux the matrix was assembled with "
+                        "(MomentumInput::cycConvFlux). Refusing rather than weighting it with the "
+                        "interface's volumetric phi on an equation that convects with rhoPhi.");
+                deviceCyclicAddLinUpwindCorr(*in.cyc, k, gxA, gyA, gzA, lu, in.cycConvFlux);
+            }
             deviceAxpy(-corrFac, lu, M.source[k]);
         }
     }

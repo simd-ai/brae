@@ -310,9 +310,12 @@ void deviceCyclicAddGrad(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& ps
 //   phi>=0 (own upwind):  (grad(U_comp)[own] . dOwn)
 //   phi< 0 (nbr upwind):  (forwardT . (gradU[nbr] . dNbr))[comp]  = sum_l forwardT[comp][l] * (grad(U_l)[nbr].dNbr)
 // gU{x,y,z}[l] = grad(U_l) (all 3 components, cyclic-inclusive). Caller does relaxSrc[comp] -= corr (as for internal).
+// `flux` is the equation's own face flux on the pair -- rhoPhi where the matrix was assembled with
+// rhoPhi -- or null to take the interface's volumetric cyc.phi.
 void deviceCyclicAddLinUpwindCorr(const DeviceCyclic& cyc, int comp,
                                   const DeviceBuffer<scalar>* gUx, const DeviceBuffer<scalar>* gUy,
-                                  const DeviceBuffer<scalar>* gUz, DeviceBuffer<scalar>& corr);
+                                  const DeviceBuffer<scalar>* gUz, DeviceBuffer<scalar>& corr,
+                                  const DeviceBuffer<scalar>* flux = nullptr);
 // non-orth laplacian "corrected" correction at the cyclic interface (component comp). Per face the explicit face-flux
 // correction is ffc = gammaFace*magSf*(corrVec . grad(U_comp)_face), gathered as src[own] -= ffc (owner side), and the
 // caller does relaxSrc -= src (mirrors the internal deviceLaplacianCorr). The neighbour gradient ROTATES as a tensor:
