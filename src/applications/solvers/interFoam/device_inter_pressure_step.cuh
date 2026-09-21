@@ -84,6 +84,12 @@ struct DeviceInterPressureHooks
 
 struct DeviceInterPressureInput
 {
+    // THE MESH FLUX, over the mesh's FULL face array, on a moving mesh only (null otherwise). pEqn.H
+    // ends with fvc::makeRelative(phi, U) on a mesh that moves -- phi -= meshPhi (fvcMeshPhi.C:76) --
+    // so the flux the next alpha equation convects with is the one relative to the motion. The host
+    // reference does it at inter_peqn_cpp.cu:980, after the velocity correction.
+    const DeviceBuffer<scalar>* meshPhiAll = nullptr;
+
     // the face fields the buoyancy flux is built from, over the mesh's FULL face array
     const DeviceBuffer<scalar>* stf       = nullptr;   // surfaceTensionForce
     const DeviceBuffer<scalar>* ghf       = nullptr;

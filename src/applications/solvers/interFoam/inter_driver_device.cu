@@ -248,10 +248,16 @@ RunReport runInterFoamDevice(
         // moved one step late and the tank barely drove the flow. interMeshUpdate takes the clock
         // explicitly now.
         //
-        // WHAT REMAINS IS THE MESH FLUX IN THE PRESSURE CORRECTOR. The host's pEqn carries meshPhi --
-        // inter_peqn_cpp.cu:600-607 wraps ddtCorr in makeRelative/makeAbsolute and :955-980 makes the
-        // final phi relative -- and this device step carries none of it, so its phi stays ABSOLUTE
-        // where the host's is relative. That is what a 1.6e-01 divergence on a moving mesh looks like.
+        // THE MESH FLUX IS CARRIED NOW (DeviceInterStepControls::meshPhiAll -> the pressure step's
+        // fvc::makeRelative at the host's own site), and it is necessary -- the alpha equation must
+        // convect the RELATIVE flux -- but it is NOT what the 1.573e-01 is. Measured A/B with the term
+        // on and off: the driver's own phi moves (max|phi| 11.54 against 9.35) and worst |div(phi)|
+        // does not change a digit. sloshingTank2D moves the tank RIGIDLY, so the cell volumes do not
+        // change, the space conservation law gives div(meshPhi) = (V - V0)/dt = 0, and subtracting a
+        // divergence-free field cannot move a divergence. WHAT IS LEFT is therefore a term the
+        // PRESSURE EQUATION itself owes a moving mesh -- the host's pEqn also wraps adjustPhi in
+        // makeRelative/makeAbsolute (inter_peqn_cpp.cu:600-607) and keeps Uf for ddtCorr, and this
+        // step has neither. Those two are the next measurement, not a guess.
         if (std::getenv("BRAE_LOCALISE_MOVING"))
         {
             // the escape announces itself: a quiet bypass of a refusal is the thing this project
@@ -261,10 +267,10 @@ RunReport runInterFoamDevice(
         }
         if (!std::getenv("BRAE_LOCALISE_MOVING")) throw std::runtime_error(
             "brae interFoam -device: the case moves its mesh (" + dyn->motionType() + "). This loop now "
-            "moves it, but its pressure corrector does not carry the mesh flux, so phi stays absolute "
-            "-- measured on sloshingTank2D, worst |div(phi)| 1.573e-01 against the host's 9.173e-07. "
-            "Refusing rather than running a moving case whose flux is not relative. Run without "
-            "-device.");
+            "moves it, but its pressure corrector does not yet agree with the host's on one -- "
+            "measured on sloshingTank2D, worst |div(phi)| 1.573e-01 against the host's 9.173e-07. "
+            "Refusing rather than running a moving case whose continuity error is six orders worse. "
+            "Run without -device.");
 
         // A COUPLED PAIR ON A MOVING MESH is not ported: buildDeviceCyclic lays the interface out from
         // the geometry, and every hook in this loop holds a pointer into that layout, so rebuilding it
@@ -1294,6 +1300,8 @@ RunReport runInterFoamDevice(
     // the volumes the mesh had before this step's move; empty on a static mesh, where the ddt's
     // other branch runs
     DeviceBuffer<scalar> dV0;
+    // ...and the mesh flux the move produced, which the pressure corrector makes phi relative to
+    DeviceBuffer<scalar> dMeshPhi;
 
     RunReport rep;
     rep.pcorrSolves = initPcorrSolves;
@@ -1406,9 +1414,20 @@ RunReport runInterFoamDevice(
                 // the patch geometry moved with the cells, and dbU carries the patch deltas and
                 // normals every boundary evaluation reads
                 dbU = buildDeviceVectorBoundary(f.U, fvp, g);
-                // CorrectPhi and makeRelative rewrote phi on the host; the device holds its own copy
-                dPhiI.copyFrom(f.phi.internal);
-                dPhiB.copyFrom(flattenPatches(f.phi.boundary, fvp));
+                // CorrectPhi and makeRelative rewrote phi on the host -- but ONLY under `correctPhi`
+                // (interFoam.C:130, and interMeshUpdate does nothing to phi without it). Taking the
+                // host's phi unconditionally overwrote the flux THIS loop had just computed with a
+                // stale copy at every outer corrector after the first, which is why carrying meshPhi
+                // into the pressure step changed no digit until this guard went in.
+                if (f.correctPhi)
+                {
+                    dPhiI.copyFrom(f.phi.internal);
+                    dPhiB.copyFrom(flattenPatches(f.phi.boundary, fvp));
+                }
+                // ...and THE MESH FLUX the move produced, which the pressure corrector makes phi
+                // relative to (fvc::makeRelative, pEqn.H:73). Over the full face array, as phi is.
+                dMeshPhi.copyFrom(fullFace(dyn->meshPhi(), fvp));
+                C.meshPhiAll = &dMeshPhi;
             }
 
             deviceInterStep(dm, rep.deltaT, C, props, H, dGh, dGhf, dMagSf,

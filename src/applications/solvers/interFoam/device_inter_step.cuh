@@ -125,6 +125,9 @@ struct DeviceInterStepControls
     // the cell volumes the mesh had BEFORE this step's move, for the ddt's old-time term
     // (OF EulerDdtScheme: rho.oldTime()*U.oldTime()*Vsc0()). Null on a static mesh.
     const DeviceBuffer<scalar>* V0 = nullptr;
+    // ...and the mesh flux over the FULL face array, for fvc::makeRelative(phi, U) at the end of the
+    // pressure corrector. Null on a static mesh, where OpenFOAM's makeRelative is a no-op.
+    const DeviceBuffer<scalar>* meshPhiAll = nullptr;
 
     // The case's MRF zones, built once by the driver (buildDeviceMRFZone). interFoam touches them in
     // three places -- UEqn.H:6 MRF.DDt(rho, U), pEqn.H:18 MRF.zeroFilter(ddtCorr term) and pEqn.H:19

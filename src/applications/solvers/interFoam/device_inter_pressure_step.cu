@@ -361,6 +361,31 @@ scalar deviceInterPressureStep(
                           havePair ? &ffIf : nullptr,
                           havePair ? &rAUfIf : nullptr);
 
+    // fvc::makeRelative(phi, U) ON A MOVING MESH -- phi -= meshPhi, fvcMeshPhi.C:76, at the point the
+    // host reference does it (inter_peqn_cpp.cu:980): after the velocity correction and before p is
+    // rebuilt. The flux that leaves here is the RELATIVE one, which is what the next alpha equation
+    // convects with and what the continuity error is measured on. Without it this loop's phi stayed
+    // ABSOLUTE: measured on sloshingTank2D, worst |div(phi)| 1.573e-01 against the host's 9.173e-07.
+    if (in.meshPhiAll)
+    {
+        const int nFaceAll = nIf + nBf;
+        if (static_cast<int>(in.meshPhiAll->size()) != nFaceAll)
+            throw std::runtime_error(
+                "brae interFoam device pEqn: the mesh flux must cover the mesh's FULL face array "
+                "(internal faces then the boundary patches in order), as phi does.");
+        if (nIf > 0)
+        {
+            subKernel<<<nBlocks(nIf), TPB>>>(phiInt.data(), in.meshPhiAll->data(), nIf, phiInt.data());
+            ckS(cudaGetLastError(), "makeRelative(phi), internal");
+        }
+        if (nBf > 0)
+        {
+            subKernel<<<nBlocks(nBf), TPB>>>(phiBnd.data(), in.meshPhiAll->data() + nIf, nBf,
+                                             phiBnd.data());
+            ckS(cudaGetLastError(), "makeRelative(phi), boundary");
+        }
+    }
+
     // p = p_rgh + rho*gh, rebuilt from the SOLVED p_rgh and never carried.
     deviceStaticPressure(nC, p_rgh, *in.rho, *in.gh, p);
 
