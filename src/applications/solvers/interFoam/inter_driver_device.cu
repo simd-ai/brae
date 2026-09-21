@@ -269,12 +269,24 @@ RunReport runInterFoamDevice(
         //     face. The pressure step's own size guard (meshPhiAll->size() != nIf + nBf) says the same
         //     thing and has never fired on this case, which is 2D and does have empty patches.
         //
-        // FIVE HYPOTHESES ARE NOW DEAD, each by measurement: makeRelative (rigid motion, so
-        // div(meshPhi) = 0), Uf and ddtCorr (the gap is there at step one, from rest), the solver's
-        // stopping point (pinning moves the host to 5.181e-11 and this arm the other way), the
-        // geometry refresh, and this layout. WHAT IS NEEDED NEXT is not another guess but the stage
-        // dump: run the moving case on both arms with a mesh copy each -- they move their own -- and
-        // compare phiHbyA, the p_rgh system and phi, as the cyclic gaps were localised.
+        // THE STAGE DUMP HAS LOCALISED IT (two meshes, one per arm, sloshingTank2D, one step; the two
+        // meshes move identically, |V_host - V_device| = 0). Everything into the pressure equation
+        // agrees, and the p_rgh MATRIX agrees; its SOURCE does not:
+        //
+        //     UEqn diag 4.5e-10 of 9.4e+04   phiHbyA (pre-phig) 8.9e-16 of 3.5e-05
+        //     pEqn diag 2.1e-17,  upper 1.0e-17,  lower 1.0e-17
+        //     pEqn SOURCE 6.9430e+00 of 3.4921e+03      <-- 2.0e-03 relative
+        //     p_rgh 2.5406e+05 of 5.2780e+06
+        //
+        // So it is NOT the substituted solver -- this case's device arm runs Jacobi-BiCGStab where it
+        // asks for PCG+GAMG, but a solver that stops elsewhere cannot give a different right-hand
+        // side. The two arms assemble DIFFERENT SYSTEMS, and the difference enters between phiHbyA
+        // pre-phig (which agrees) and div(phiHbyA).
+        //
+        // WHAT THE HOST DOES THERE AND THIS LOOP DOES NOT is the moving-mesh wrap around adjustPhi:
+        // makeRelativeFlux(phiHbyA) -> adjustPhi -> makeAbsoluteFlux(phiHbyA), inter_peqn_cpp.cu:
+        // 600-607, which OpenFOAM does under p_rgh.needReference() (pEqn.H:19-24) -- and a closed
+        // tank needs a reference. That is the next term, named by the dump rather than guessed.
         //
         // THE MESH FLUX IS CARRIED NOW (DeviceInterStepControls::meshPhiAll -> the pressure step's
         // fvc::makeRelative at the host's own site), and it is necessary -- the alpha equation must

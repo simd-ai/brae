@@ -267,6 +267,12 @@ struct PressureTaps
     // ...and the rest of UEqn, for bisecting H() term by term: H = (bdDiag*psi + lduH(psi) + source
     // + boundarySource)/V, so every one of these is a separate question
     std::vector<scalar> uEqnDiag, uEqnUpper, uEqnLower, uEqnSourceX;
+    // ...and the p_rgh SYSTEM as assembled, at the device arm's own tap point: right after the
+    // laplacian and its div(phiHbyA) source, on the FIRST non-orthogonal pass, RAW -- internalCoeffs
+    // and boundaryCoeffs still separate, not folded into the diagonal. Comparing a folded system with
+    // an unfolded one compares two different matrices; this unit has already lost time to two taps
+    // that were not the same quantity.
+    std::vector<scalar> pDiag, pUpper, pLower, pSource;
     // p_rgh's JUMP per patch, as the last assembly left it
     std::vector<std::vector<scalar>> jumpBnd;
     // ...and one entry per ASSEMBLY, flattened over the coupled patches in patch order, so the two
@@ -278,6 +284,17 @@ struct PressureTaps
     // disagreement in HbyA is a disagreement in one of these two.
     std::vector<scalar> hNoPairX, hPairX;
 };
+
+// fvc::correctUf(Uf, U, phi), pEqn.H:70-72: Uf = interpolate(U) with its normal component replaced by
+// the flux's. Shared with the device loop, whose pressure step computes U and phi on the GPU and hands
+// them back -- Uf is a host field and next step's ddtCorr reads (Sf & Uf.oldTime()) off it.
+void correctUf(
+    SurfaceVectorField&           Uf,
+    const GeometricField<vector>& U,
+    const SurfaceScalarField&     phi,
+    const PrimitiveMesh&          m,
+    const FvGeometry&             g,
+    const std::vector<FvPatch>&   patches);
 
 // One p_rgh solve as the solver itself reports it -- see inter_solve_record.cuh.
 using PressureSolveRecord = LinearSolveRecord;

@@ -431,6 +431,45 @@ bool adjustPhi(
         && std::fabs(adjustableMassOut)/totalFlux < scalar(1e-15);
 }
 
+// fvc::correctUf(Uf, U, phi), pEqn.H:70-72 on a moving mesh: Uf = interpolate(U), then its NORMAL
+// component is replaced by the flux's, Uf += n*(phi/magSf - (n & Uf)). ONE COPY, shared with the
+// device loop: Uf is a host field, and next step's ddtCorr reads (Sf & Uf.oldTime()) off it
+// (EulerDdtScheme's fvcDdtUfCorr), so the device arm has to keep it too.
+void correctUf(
+    SurfaceVectorField&           Uf,
+    const GeometricField<vector>& U,
+    const SurfaceScalarField&     phi,
+    const PrimitiveMesh&          m,
+    const FvGeometry&             g,
+    const std::vector<FvPatch>&   patches)
+{
+    const label nIf = m.nInternalFaces();
+    std::vector<std::vector<vector>> Ub(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        Ub[pi] = U.boundary[pi]->value();
+    }
+    Uf = fvc::interpolate(U.internal, Ub, m, g, patches);
+    for (label f = 0; f < nIf; ++f)
+    {
+        const vector n = g.Sf()[f]/g.magSf()[f];
+        vector& uf = Uf.internal[f];
+        uf += n*(phi.internal[f]/g.magSf()[f] - dot(n, uf));
+    }
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& q = patches[pi];
+        if (q.type == "empty") continue;
+        for (label i = 0; i < q.size; ++i)
+        {
+            const vector n = g.Sf()[q.start + i]/q.magSf[i];
+            vector& uf = Uf.boundary[pi][i];
+            uf += n*(phi.boundary[pi][i]/q.magSf[i] - dot(n, uf));
+        }
+    }
+}
+
+
 void pressureCorrector(GeometricField<scalar>&      p_rgh,
                        GeometricField<vector>&      U,
                        SurfaceScalarField&          phi,
@@ -810,6 +849,16 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
             pe.diag[sc.pRefCell]   += pe.diag[sc.pRefCell];
         }
 
+        // the assembled system, at the device arm's tap point: after the source, before the solve,
+        // and on the FIRST non-orthogonal pass only
+        if (in.taps && corr == 0)
+        {
+            in.taps->pDiag = pe.diag;
+            in.taps->pUpper = pe.upper;
+            in.taps->pLower = pe.lower;
+            in.taps->pSource = pe.source;
+        }
+
         // p_rgh.select(pimple.finalInnerIter()) (pEqn.H:50): the Final entry on the last
         // non-orthogonal pass of the last corrector, the plain entry everywhere else. And the case's
         // own solver where brae has OpenFOAM's -- the choice is not cosmetic. On damBreak the over-1
@@ -954,29 +1003,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
     // next alpha equation convects with.
     if (in.meshPhi)
     {
-        std::vector<std::vector<vector>> Ub(patches.size());
-        for (std::size_t pi = 0; pi < patches.size(); ++pi)
-        {
-            Ub[pi] = U.boundary[pi]->value();
-        }
-        *in.Uf = fvc::interpolate(U.internal, Ub, m, g, patches);
-        for (label f = 0; f < nIf; ++f)
-        {
-            const vector n = g.Sf()[f]/g.magSf()[f];
-            vector& uf = in.Uf->internal[f];
-            uf += n*(phi.internal[f]/g.magSf()[f] - dot(n, uf));
-        }
-        for (std::size_t pi = 0; pi < patches.size(); ++pi)
-        {
-            const FvPatch& q = patches[pi];
-            if (q.type == "empty") continue;
-            for (label i = 0; i < q.size; ++i)
-            {
-                const vector n = g.Sf()[q.start + i]/q.magSf[i];
-                vector& uf = in.Uf->boundary[pi][i];
-                uf += n*(phi.boundary[pi][i]/q.magSf[i] - dot(n, uf));
-            }
-        }
+        correctUf(*in.Uf, U, phi, m, g, patches);
         makeRelativeFlux(phi, *in.meshPhi);
     }
 
