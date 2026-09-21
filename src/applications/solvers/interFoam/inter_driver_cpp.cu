@@ -87,6 +87,128 @@ scalar startTimeOf(const std::string& startDir)
 } // namespace
 
 
+// interFoam.C:112-149 -- THE MESH UPDATE both loops make at the top of an outer corrector, in
+// OpenFOAM's own order: mesh.update(), and then, if the mesh changed, gh and ghf off the moved
+// centres, the MRF, and under `correctPhi` the absolute flux rebuilt from the face velocity,
+// CorrectPhi, fvc::makeRelative(phi, U) and mixture.correct().
+//
+// ONE COPY, called by both drivers. The device loop moves the mesh through this same host code --
+// the motion solve is a host operation on either arm -- and then refreshes the buffers it uploaded
+// from the geometry. A second copy in the device driver would drift from this one, and this one is
+// the arm the tutorial gates hold.
+void interMeshUpdate(
+    DynamicMotionSolverFvMesh*             dyn,
+    InterFields&                           f,
+    const PrimitiveMesh&                   m,
+    const FvGeometry&                      g,
+    const std::vector<FvPatch>&            patches,
+    const MutableMesh*                     mutableMesh,
+    cpu::cyclicAMIFvPatch::Interfaces*     amiPairs,
+    GamgAgglomerationCache&                gamgCache,
+    const CorrectPhiControls&              cpc,
+    RunReport&                             rep,
+    label                                  outerOfStep,
+    label                                  nOuterCorrectors)
+{
+    if (!dyn) return;
+    // interFoam.C:118: on the first outer corrector, or on every one under
+    // moveMeshOuterCorrectors
+    if (outerOfStep != 0 && !f.moveMeshOuterCorrectors) return;
+    // pimpleControl sets "finalIteration" on the mesh before the last outer
+    // corrector's body runs, so a displacement solve there takes the Final entry.
+    // The GAMG hierarchy is the mesh's: a displacement solve builds it or reuses the
+    // one p_rgh left, and the move marks it for rebuilding.
+    const bool finalIteration = (outerOfStep >= nOuterCorrectors - 1);
+    dyn->update(rep.time, rep.deltaT, rep.steps, finalIteration, &gamgCache);
+    // ...and fvMesh::movePoints moves the mesh objects with it: kOmegaSST's wall distance
+    moveInterTurbulence(f.turbulence, m, g, patches);
+    // cyclicAMIPolyPatch::initMovePoints marks the AMI out of date, and the next AMI()
+    // recomputes it on the moved points: before anything below interpolates across it
+    if (amiPairs && !amiPairs->empty())
+    {
+        amiPairs->update(m, *mutableMesh->g, *mutableMesh->patches);
+    }
+    // the move rebuilt every patch uncoupled; a cyclicAMI left that way would be read
+    // through an empty stencil by every coupled field
+    for (const FvPatch& q : *mutableMesh->patches)
+    {
+        if (q.type == "cyclicAMI" && (!q.coupled || q.amiOffsets.size() != static_cast<std::size_t>(q.size) + 1))
+        {
+            throw std::runtime_error(
+                "brae interFoam: the cyclicAMI patch `" + q.name + "` was not coupled again after "
+                "the mesh moved.");
+        }
+    }
+
+    // dynamicMotionSolverFvMesh::update ends in U.correctBoundaryConditions(): a
+    // movingWallVelocity patch takes the wall's velocity from the motion of THIS
+    // step (movingWallVelocityFvPatchVectorField.C, Uwall), every other patch is
+    // evaluated as it stands
+    updateMovingWallVelocity(f, *dyn, m, g, patches, rep.deltaT);
+    // ...and a wave condition's model, whose FIRST update of the step is this one on a
+    // moving mesh: OpenFOAM's log prints "Updating ... wave model" right after the
+    // motion solve, ahead of pcorr and the alpha sub-cycles, so the absorber reads the
+    // water level the last step left. The UEqn stage's update is then a no-op for this
+    // time index, as OpenFOAM's is. Measured on waveMakerSolitary with pcorr converged:
+    // updated in UEqn instead, from the alpha the sub-cycles left, U went from 7.1e-12 of
+    // OpenFOAM after step one to 1.1e-07 after step two, the gap at the outlet.
+    updateWaveVelocity(f.waves, f.alpha1, f.U, rep.time, rep.steps, m, g, patches);
+    f.U.evaluateBoundary();
+
+    // interFoam.C:130-131: gh and ghf follow the cell and face centres
+    ghField(f.g, f.ghRefValue, g.C(), f.gh);
+    {
+        std::vector<vector> Cf(g.Cf().begin(), g.Cf().begin() + m.nInternalFaces());
+        ghField(f.g, f.ghRefValue, Cf, f.ghfInternal);
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const FvPatch& q = patches[pi];
+            std::vector<vector> bCf(g.Cf().begin() + q.start, g.Cf().begin() + q.start + q.size);
+            ghField(f.g, f.ghRefValue, bCf, f.ghfBoundary[pi]);
+        }
+    }
+    // interFoam.C:136-146 under `correctPhi`: the ABSOLUTE flux rebuilt from the face
+    // velocity on the moved mesh, CorrectPhi against it with the last corrector's rAU,
+    // the result made relative, and the mixture corrected on the new geometry --
+    // which moves nHatf, and nHatf is what the alpha step compresses along
+    if (f.correctPhi)
+    {
+        // phi = mesh.Sf() & Uf()
+        for (label face = 0; face < m.nInternalFaces(); ++face)
+        {
+            f.phi.internal[face] = dot(g.Sf()[face], f.Uf.internal[face]);
+        }
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const FvPatch& q = patches[pi];
+            if (q.type == "empty") continue;
+            for (label i = 0; i < q.size; ++i)
+            {
+                f.phi.boundary[pi][i] = dot(g.Sf()[q.start + i], f.Uf.boundary[pi][i]);
+            }
+        }
+        // correctPhi.H: CorrectPhi(U, phi, p_rgh, interpolate(rAU), 0, pimple)
+        const SurfaceScalarField rAUf = fvc::interpolate(f.rAU, m, g, patches);
+        CorrectPhiInput cin;
+        cin.rAUf = &rAUf;
+        cin.meshChanging = true;
+        cin.meshPhi = &dyn->meshPhi();
+        cin.rhoPhi = &f.rhoPhi;
+        cin.solveLog = &rep.pcorrSolves;
+        correctPhi(f.U, f.phi, f.p_rgh, cin, cpc, m, g, patches);
+        // fvc::makeRelative(phi, U)
+        makeRelativeFlux(f.phi, dyn->meshPhi());
+        pushFluxToPatches(f, patches);
+        // mixture.correct(): calcNu, whose values alpha has not moved, then
+        // interfaceProperties::correct() on the moved mesh
+        cpu::twoPhase::mixtureMu(f.alpha1.internal, f.mixture.phases, f.mu);
+        cpu::twoPhase::mixtureNu(f.alpha1.internal, f.mu, f.mixture.phases, f.nu);
+        updateMixtureBoundary(f, patches);
+        interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, f.nHatf, f.K);
+    }
+}
+
+
 RunReport runInterFoam(
     const std::string& caseDir,
     const std::string& startDir,
@@ -315,102 +437,9 @@ RunReport runInterFoam(
                 case Stage::meshUpdate:
                 {
                     ++outerOfStep;
-                    if (!dyn) break;
-                    // interFoam.C:118: on the first outer corrector, or on every one under
-                    // moveMeshOuterCorrectors
-                    if (outerOfStep != 0 && !f.moveMeshOuterCorrectors) break;
-                    // pimpleControl sets "finalIteration" on the mesh before the last outer
-                    // corrector's body runs, so a displacement solve there takes the Final entry.
-                    // The GAMG hierarchy is the mesh's: a displacement solve builds it or reuses the
-                    // one p_rgh left, and the move marks it for rebuilding.
-                    const bool finalIteration = (outerOfStep >= lc.nOuterCorrectors - 1);
-                    dyn->update(rep.time, rep.deltaT, rep.steps, finalIteration, &gamgCache);
-                    // ...and fvMesh::movePoints moves the mesh objects with it: kOmegaSST's wall distance
-                    moveInterTurbulence(f.turbulence, m, g, patches);
-                    // cyclicAMIPolyPatch::initMovePoints marks the AMI out of date, and the next AMI()
-                    // recomputes it on the moved points: before anything below interpolates across it
-                    if (amiPairs && !amiPairs->empty())
-                    {
-                        amiPairs->update(m, *mutableMesh->g, *mutableMesh->patches);
-                    }
-                    // the move rebuilt every patch uncoupled; a cyclicAMI left that way would be read
-                    // through an empty stencil by every coupled field
-                    for (const FvPatch& q : *mutableMesh->patches)
-                    {
-                        if (q.type == "cyclicAMI" && (!q.coupled || q.amiOffsets.size() != static_cast<std::size_t>(q.size) + 1))
-                        {
-                            throw std::runtime_error(
-                                "brae interFoam: the cyclicAMI patch `" + q.name + "` was not coupled again after "
-                                "the mesh moved.");
-                        }
-                    }
-
-                    // dynamicMotionSolverFvMesh::update ends in U.correctBoundaryConditions(): a
-                    // movingWallVelocity patch takes the wall's velocity from the motion of THIS
-                    // step (movingWallVelocityFvPatchVectorField.C, Uwall), every other patch is
-                    // evaluated as it stands
-                    updateMovingWallVelocity(f, *dyn, m, g, patches, rep.deltaT);
-                    // ...and a wave condition's model, whose FIRST update of the step is this one on a
-                    // moving mesh: OpenFOAM's log prints "Updating ... wave model" right after the
-                    // motion solve, ahead of pcorr and the alpha sub-cycles, so the absorber reads the
-                    // water level the last step left. The UEqn stage's update is then a no-op for this
-                    // time index, as OpenFOAM's is. Measured on waveMakerSolitary with pcorr converged:
-                    // updated in UEqn instead, from the alpha the sub-cycles left, U went from 7.1e-12 of
-                    // OpenFOAM after step one to 1.1e-07 after step two, the gap at the outlet.
-                    updateWaveVelocity(f.waves, f.alpha1, f.U, rep.time, rep.steps, m, g, patches);
-                    f.U.evaluateBoundary();
-
-                    // interFoam.C:130-131: gh and ghf follow the cell and face centres
-                    ghField(f.g, f.ghRefValue, g.C(), f.gh);
-                    {
-                        std::vector<vector> Cf(g.Cf().begin(), g.Cf().begin() + m.nInternalFaces());
-                        ghField(f.g, f.ghRefValue, Cf, f.ghfInternal);
-                        for (std::size_t pi = 0; pi < patches.size(); ++pi)
-                        {
-                            const FvPatch& q = patches[pi];
-                            std::vector<vector> bCf(g.Cf().begin() + q.start, g.Cf().begin() + q.start + q.size);
-                            ghField(f.g, f.ghRefValue, bCf, f.ghfBoundary[pi]);
-                        }
-                    }
-                    // interFoam.C:136-146 under `correctPhi`: the ABSOLUTE flux rebuilt from the face
-                    // velocity on the moved mesh, CorrectPhi against it with the last corrector's rAU,
-                    // the result made relative, and the mixture corrected on the new geometry --
-                    // which moves nHatf, and nHatf is what the alpha step compresses along
-                    if (f.correctPhi)
-                    {
-                        // phi = mesh.Sf() & Uf()
-                        for (label face = 0; face < m.nInternalFaces(); ++face)
-                        {
-                            f.phi.internal[face] = dot(g.Sf()[face], f.Uf.internal[face]);
-                        }
-                        for (std::size_t pi = 0; pi < patches.size(); ++pi)
-                        {
-                            const FvPatch& q = patches[pi];
-                            if (q.type == "empty") continue;
-                            for (label i = 0; i < q.size; ++i)
-                            {
-                                f.phi.boundary[pi][i] = dot(g.Sf()[q.start + i], f.Uf.boundary[pi][i]);
-                            }
-                        }
-                        // correctPhi.H: CorrectPhi(U, phi, p_rgh, interpolate(rAU), 0, pimple)
-                        const SurfaceScalarField rAUf = fvc::interpolate(f.rAU, m, g, patches);
-                        CorrectPhiInput cin;
-                        cin.rAUf = &rAUf;
-                        cin.meshChanging = true;
-                        cin.meshPhi = &dyn->meshPhi();
-                        cin.rhoPhi = &f.rhoPhi;
-                        cin.solveLog = &rep.pcorrSolves;
-                        correctPhi(f.U, f.phi, f.p_rgh, cin, cpc, m, g, patches);
-                        // fvc::makeRelative(phi, U)
-                        makeRelativeFlux(f.phi, dyn->meshPhi());
-                        pushFluxToPatches(f, patches);
-                        // mixture.correct(): calcNu, whose values alpha has not moved, then
-                        // interfaceProperties::correct() on the moved mesh
-                        cpu::twoPhase::mixtureMu(f.alpha1.internal, f.mixture.phases, f.mu);
-                        cpu::twoPhase::mixtureNu(f.alpha1.internal, f.mu, f.mixture.phases, f.nu);
-                        updateMixtureBoundary(f, patches);
-                        interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, f.nHatf, f.K);
-                    }
+                    // interFoam.C:112-149, one copy shared with the device loop: see interMeshUpdate.
+                    interMeshUpdate(dyn, f, m, g, patches, mutableMesh, amiPairs, gamgCache, cpc,
+                                    rep, outerOfStep, lc.nOuterCorrectors);
                     break;
                 }
 

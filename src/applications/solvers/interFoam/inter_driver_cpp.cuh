@@ -27,6 +27,7 @@
 #include "cyclic_ami_cpp.cuh"
 #include "cf_types.cuh"
 #include "inter_case_cpp.cuh"
+#include "inter_correct_phi_cpp.cuh"   // CorrectPhiControls, which interMeshUpdate takes
 #include "inter_peqn_cpp.cuh"
 #include "device_inter_step.cuh"
 #include <string>
@@ -97,6 +98,26 @@ struct MutableMesh
     cpu::cyclicAMIFvPatch::Interfaces* ami = nullptr;
 };
 
+// interFoam.C:112-149 -- the mesh update at the top of an outer corrector, in OpenFOAM's order:
+// mesh.update(), then, if the mesh changed, gh and ghf off the moved centres, the MRF, and under
+// `correctPhi` the absolute flux from the face velocity, CorrectPhi, fvc::makeRelative(phi, U) and
+// mixture.correct(). Shared so the device loop moves the mesh through the same code the host does
+// rather than a second copy of it; it returns without doing anything when `dyn` is null or this is a
+// later outer corrector of a case that does not set moveMeshOuterCorrectors.
+void interMeshUpdate(
+    DynamicMotionSolverFvMesh*             dyn,
+    InterFields&                           f,
+    const PrimitiveMesh&                   m,
+    const FvGeometry&                      g,
+    const std::vector<FvPatch>&            patches,
+    const MutableMesh*                     mutableMesh,
+    cpu::cyclicAMIFvPatch::Interfaces*     amiPairs,
+    GamgAgglomerationCache&                gamgCache,
+    const CorrectPhiControls&              cpc,
+    RunReport&                             rep,
+    label                                  outerOfStep,
+    label                                  nOuterCorrectors);
+
 // Run `nSteps` of interFoam on a prepared case. Returns the state at the end; `verbose` prints the
 // per-step line OpenFOAM's own solver prints.
 RunReport runInterFoam(
@@ -151,7 +172,12 @@ RunReport runInterFoamDevice(
     scalar endTime = scalar(1.0e300),
     // The step's intermediates, for a gate comparing the two arms stage by stage. Null in every
     // production run; the LAST step's first corrector is what lands in it.
-    DeviceInterStepTaps* tapsOut = nullptr);
+    DeviceInterStepTaps* tapsOut = nullptr,
+    // ...and the same MutableMesh the host driver takes, for a case whose mesh moves: the device loop
+    // moves it through the HOST motion solver (the move is a host operation either way) and then
+    // refreshes the geometric buffers it uploaded. Null is a static mesh, and a moving case without it
+    // is refused rather than run on the mesh as it started.
+    const MutableMesh* mutableMesh = nullptr);
 
 } // namespace interFoam
 } // namespace cpu
