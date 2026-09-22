@@ -16,7 +16,87 @@ InterTurbulenceStepInput ti cn      # BRAE_INTER_HOST_CLOSURE under CrankNicolso
 InterTurbulenceStepInput ti rhoOO   # same refusal
 
 # RunReport is an OUTPUT the drivers fill as they go, not a control read from the case
-RunReport rep CoNum
-RunReport rep alphaCoNum
+RunReport rep alphaSolves
+RunReport rep pSolves
+RunReport rep steps
 RunReport rep pcorrSolves
 RunReport rep turbulenceOnDevice
+
+# ---- the shared closure inputs (kEpsilon.cuh KEpsilonInput, kOmegaSST.cuh KOmegaSSTInput) -------------
+# interFoam's device closure (device_inter_turbulence.cu, `kin` at the kEpsilon site, `sin` at the SST
+# site) against rhoSimpleFoam's hook (rhoTurbulenceHook.cu). Reasons per family:
+#   alphat: the compressible EddyDiffusivity (alphat = rho*nut/Prt) has no counterpart in interFoam --
+#     incompressible::turbulenceModel and interFoam's `density variable` lineage carry no energy equation
+#     (interFoam/createFields.H builds no alphat; compressibleInterPhaseTransportModel.H has none)
+#   div schemes: interFoam's reader admits `Gauss upwind` only for div(phi,k|epsilon|omega) --
+#     requireUpwind, inter_turbulence_cpp.cu:94-104 ("is not plain `Gauss upwind`... refusing")
+#   fvOptions on k/epsilon/omega (scalarFixedValue-type masks): every option type but the ported ones is
+#     refused by its own name before the loop runs (inter_driver_device.cu, "fvOptions has an active
+#     option `...`")
+#   colouring/gsColour/polyDeg/precon: brae's solver VARIANTS (coloured Gauss-Seidel, polynomial
+#     preconditioning); off = OpenFOAM's own symGaussSeidel smoother / PBiCG-DILU, which is what the
+#     interFoam reader admits (readFinalSolve, inter_turbulence_cpp.cu:78-88) and what kin/sin select
+#   notices (hasNonUpwindDivScheme, divSchemeUnsupported, hasUnportedFvOption, fvOptionUnsupported,
+#     hasNonWallTurbWallFunc): rhoSimpleFoam's hook fills them for the closure's own refuseUnsupported;
+#     interFoam refuses each condition itself before the closure is built (requireUpwind; the fvOptions
+#     refusal; device_inter_turbulence.cu:65 "carries an epsilon or omega wall function and is a `...`,
+#     not a `wall`")
+KEpsilonInput kin alphatPrtFace
+KEpsilonInput kin alphatWallMask
+KEpsilonInput kin Prt
+KEpsilonInput kin boundedK
+KEpsilonInput kin boundedEps
+KEpsilonInput kin limitedLinear
+KEpsilonInput kin limiterCoeff
+KEpsilonInput kin limGradK
+KEpsilonInput kin limGradLeastSq
+KEpsilonInput kin linearUpwind
+KEpsilonInput kin luGradK
+KEpsilonInput kin hasNonUpwindDivScheme
+KEpsilonInput kin divSchemeUnsupported
+KEpsilonInput kin fvoKMask
+KEpsilonInput kin fvoKVal
+KEpsilonInput kin fvoEpsMask
+KEpsilonInput kin fvoEpsVal
+KEpsilonInput kin colouring
+KEpsilonInput kin gsColour
+KEpsilonInput kin polyDeg
+KOmegaSSTInput sin alphatPrtFace
+KOmegaSSTInput sin alphatWallMask
+KOmegaSSTInput sin Prt
+KOmegaSSTInput sin boundedK
+KOmegaSSTInput sin boundedOmega
+KOmegaSSTInput sin limitedLinear
+KOmegaSSTInput sin limiterCoeff
+KOmegaSSTInput sin limGradK
+KOmegaSSTInput sin limGradLeastSq
+KOmegaSSTInput sin linearUpwind
+KOmegaSSTInput sin luGradK
+KOmegaSSTInput sin hasNonUpwindDivScheme
+KOmegaSSTInput sin divSchemeUnsupported
+KOmegaSSTInput sin fvoKMask
+KOmegaSSTInput sin fvoKVal
+KOmegaSSTInput sin fvoOmegaMask
+KOmegaSSTInput sin fvoOmegaVal
+KOmegaSSTInput sin hasUnportedFvOption
+KOmegaSSTInput sin fvOptionUnsupported
+KOmegaSSTInput sin hasNonWallTurbWallFunc
+KOmegaSSTInput sin colouring
+KOmegaSSTInput sin gsColour
+KOmegaSSTInput sin polyDeg
+KOmegaSSTInput sin precon           # interFoam admits PBiCG under kEpsilon only (readFinalSolve allowPBiCG); SST runs the GS smoother, so no DILU schedule
+KOmegaSSTInput sin gradULimitK      # cellLimited grad(U) is refused on the device before the closure is built (inter_driver_device.cu:284-290)
+# rhoSimpleFoam's hook (rhoTurbulenceHook.cu `kin`): steady/Euler only, no pair on the device, no mangroves
+KEpsilonInput kin cn                # ddtSchemes other than steadyState/Euler are refused (scheme_parse.cuh:304-310, names CrankNicolson)
+KEpsilonInput kin cnDdt0Eps         # same refusal
+KEpsilonInput kin cnDdt0K           # same refusal
+KEpsilonInput kin kOO               # same refusal
+KEpsilonInput kin epsOO             # same refusal
+KEpsilonInput kin rhoOOCell         # same refusal
+KEpsilonInput kin cyc               # the hook sets hasCoupledPatches instead, and the closure's refuseUnsupported fires on it (kEpsilon.cu); the pair port is interFoam's
+KEpsilonInput kin cycPhi            # same
+KEpsilonInput kin cycPhiByRho       # same
+KEpsilonInput kin fvoSpK            # multiphaseMangrovesTurbulenceModel is interFoam's; every other driver refuses the option type by name (firstUnsupported, rhoSimpleFoamDriver.cu:80)
+KEpsilonInput kin fvoSpEps          # same
+KEpsilonInput kin pbicgKE           # the rho mirror selects the closure's solver through TurbulenceHookOptions (gsK/precon), a declared selection of its own (rhoSimpleFoamDriver.cu:553-570)
+KEpsilonInput kin bcPhiBnd          # null = the equation's own flux, which the consumer takes (kEpsilon.cu:796,850 `in.bcPhiBnd ? ... : *in.phiBnd`); the separate flux is interFoam's `density variable` case, kEpsilon.cuh:82-86

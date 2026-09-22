@@ -529,6 +529,15 @@ if [ $HAVE_GPU = 1 ]; then
     # -Sp(rho*coeff): the device names it before the first step (the host closure refuses the same
     # lineage where it meets it)
     arm device_mangrove_rhoKE refused "density variable"    "-device" "sed -i 's/^simulationType .*/density variable;\nsimulationType RAS;/' constant/turbulenceProperties; sed -i 's/div(phi,k) /div(rhoPhi,k) /; s/div(phi,epsilon) /div(rhoPhi,epsilon) /' system/fvSchemes"
+    # kOmegaSST across a CYCLIC PAIR: the case reader refuses it by name on both arms (kEpsilon is the
+    # one closure carried across a pair, validation/interFoamCyclic). Behind that refusal the device SST
+    # closure has its own (`hasCoupledPatches`, kOmegaSST.cu), whose flag the interFoam site never set --
+    # tools/default_audit.py found it; the site sets it now, so lifting the reader's refusal cannot leave
+    # the pair contributing nothing to k and omega. Staged from the porous-baffle case: kOmegaSST for
+    # kEpsilon, omega from epsilon, div(phi,omega), the wallDist method SST needs.
+    BASE="$BB"
+    BSST="sed -i 's/^\( *RASModel  *\)kEpsilon;/\1kOmegaSST;/' constant/turbulenceProperties; sed -i 's/^\( *div(phi,epsilon) .*\)/\1\n    div(phi,omega)  Gauss upwind;/' system/fvSchemes; printf '\nwallDist { method meshWave; }\n' >> system/fvSchemes; sed -i 's/(U|k|epsilon)/(U|k|epsilon|omega)/' system/fvSolution; sed 's/object  *epsilon;/object      omega;/; s/dimensions  *\[0 2 -3 0 0 0 0\];/dimensions      [0 0 -1 0 0 0 0];/; s/epsilonWallFunction/omegaWallFunction/' 0/epsilon > 0/omega"
+    arm device_baffle_SST   refused "RAS model other than kEpsilon" "-device" "$BSST"
     # a RAS closure on a MOVING mesh is refused on the device: its closure's input carries neither the
     # old volumes nor the mesh flux the host closure takes (moving_SST above runs the same staging on
     # the host). Found by auditing hand-built control structs, not by a case -- no runnable tutorial

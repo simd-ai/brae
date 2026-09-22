@@ -47,6 +47,40 @@ def parse_structs(text):
     return out
 
 
+def enclosing_scope(s, start):
+    """The text from `start` to the close of the block the declaration sits in: what a hand-built
+    struct can still be assigned in. A fixed window missed assignments 6000 characters down a long
+    site and reported them as omissions."""
+    depth = 0
+    i = start
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == '/' and s.startswith('//', i):
+            i = s.find('\n', i)
+            if i < 0:
+                break
+            continue
+        if c == '/' and s.startswith('/*', i):
+            j = s.find('*/', i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        if c == '"':
+            j = i + 1
+            while j < n and s[j] != '"':
+                j += 2 if s[j] == '\\' else 1
+            i = j + 1
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth < 0:
+                return s[start:i]
+        i += 1
+    return s[start:]
+
+
 def hand_built_sites(name, text):
     """[(file, line, var, assigned fields)] where `Type var;` is followed by var.field = ... ."""
     inst_re = re.compile(r'\b%s\s+(\w+)\s*(?:\{\s*\})?;' % re.escape(name))
@@ -54,7 +88,7 @@ def hand_built_sites(name, text):
     for f, s in text.items():
         for m in inst_re.finditer(s):
             var = m.group(1)
-            window = s[m.end(): m.end() + 6000]
+            window = enclosing_scope(s, m.end())
             assigned = set(re.findall(r'\b%s\.(\w+)\s*=' % re.escape(var), window))
             assigned |= set(re.findall(r'\b%s\.(\w+)\s*\.(?:push_back|assign|resize)' % re.escape(var), window))
             if assigned:
@@ -91,11 +125,13 @@ def main(argv):
 
     structs = parse_structs(text)
     unlisted = []
+    evaluated = set()          # structs with >= 2 sites INSIDE this scan: the only ones whose ledger lines can be stale
     for name, (_, fields) in sorted(structs.items()):
         fieldnames = {n for n, _ in fields}
         sites = hand_built_sites(name, text)
         if len(sites) < 2:
             continue
+        evaluated.add(name)
         union = set().union(*[a for _, _, _, a in sites])
         for f, line, var, assigned in sites:
             for missing in sorted((union - assigned) & fieldnames):
@@ -108,7 +144,9 @@ def main(argv):
     for name, f, line, var, missing, n in unlisted:
         print("UNLISTED  %-26s %s:%d  %-10s field `%s` set at another of the %d sites, not here"
               % (name, f, line, var, missing, n))
-    stale = sorted(set(allow) - used)
+    # a ledger line for a struct this scan did not evaluate (its other sites live outside the directories
+    # given) is out of scope, not stale; the tree-wide run is the one that retires entries
+    stale = sorted(k for k in set(allow) - used if k[0] in evaluated)
     for key in stale:
         print("STALE     %s -- no such omission any more; remove the entry" % allow[key])
     print("default_audit: %d structs with defaults, %d unlisted omissions, %d stale entries"

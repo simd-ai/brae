@@ -431,6 +431,14 @@ void deviceCorrectInterTurbulence(
         sin.phiBnd = in.phiBnd;
         sin.phiByRhoInt = in.phiInt;
         sin.phiByRhoBnd = in.phiBnd;
+        // THE PAIR. The kEpsilon branch below hands the closure the coupled pair (kin.cyc) and it is
+        // gated across it (validation/interFoamCyclic); this closure takes no pair, and its own refusal
+        // (kOmegaSST.cu refuseUnsupported) keys on `hasCoupledPatches` -- a flag rhoSimpleFoam's hook
+        // sets and this site never did. The case reader refuses a pair under any RAS model but kEpsilon
+        // before this runs (inter_case_cpp.cu), so nothing reached the gap; the flag is set so that
+        // lifting that refusal cannot leave the pair contributing nothing to k and omega. Found by
+        // tools/default_audit.py (tests/interfoam_refusals.sh `device_baffle_SST`).
+        sin.hasCoupledPatches = (in.cyc && in.cyc->n > 0);
         sin.rhoCell = &d.onesCell;
         sin.rhoBndFace = &d.onesBnd;
         sin.rhoOldCell = &d.onesCell;
