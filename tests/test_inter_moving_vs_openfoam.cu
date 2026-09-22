@@ -218,14 +218,17 @@ int main(
     // addressing from the new hierarchy: heap corruption in the first step's first p_rgh on
     // multiFlap, where multiPiston's translated mesh happened to agglomerate to the same level sizes
     // and ran on the OLD pairing (GamgAgglomerationCache::buildCount). These two arms hold the fix.
+    // ...and `pistonSST`, A RAS CLOSURE ON A MESH THAT MOVES, which took three terms, each measured
+    // on this arm: kOmegaSST's ddt source on the OLD volumes (V for V0 reads U 1.8155e-05), divU as
+    // the divergence of the ABSOLUTE flux (a relative divU, 4.4704e-05) and every DISTANCE the
+    // closure holds recomputed after the move (a stale wall distance, the third; the two terms
+    // without it read alpha 4.2494e-08, p_rgh 4.2660e-08, U 1.7353e-05 against the host's 1.3849e-12,
+    // 1.4704e-12 and 1.1909e-10).
     const bool deviceArm = (profile == "mixer" || profile == "solitary"
                          || profile == "cylinder" || profile == "solitaryGamg"
                          || profile == "piston" || profile == "flap"
+                         || profile == "pistonSST"
                          || profile == "multiPiston" || profile == "multiFlap");
-    // NOT `pistonSST`: a RAS closure on a moving mesh is still refused on the device. Two of its terms
-    // are ported (kOmegaSST's ddt V0 and its absolute-flux divU) and measured insufficient -- with the
-    // arm switched on this profile reads device U 1.7353e-05 against host 1.1909e-10. The refusal in
-    // inter_driver_device.cu carries the numbers and the next suspect.
     PrimitiveMesh mD;
     FvGeometry gD;
     std::vector<FvPatch> patchesD;

@@ -62,6 +62,19 @@ SurfaceScalarField effectiveDiffusivity(
     SurfaceScalarField sf = fvc::interpolate(DRho, m, g, patches);
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
+        if (patches[pi].coupled)
+        {
+            // A COUPLED FACE KEEPS fvc::interpolate's VALUE, which is the two CELLS' DEff:
+            // surfaceInterpolationScheme::interpolate takes pLambda*patchInternalField +
+            // pY*patchNeighbourField wherever the patch field is coupled
+            // (surfaceInterpolationScheme.C:186-191), and only there does it read the patch value.
+            // Rebuilding it here as blend(F1_b)*nut_b + nu_b is a different number because the blend
+            // is non-linear in F1: interp(alphaK(F1)*nut) is not alphaK(interp(F1))*interp(nut).
+            // MEASURED on validation/interFoamCyclic `sst`, ten steps: omega 4.7e-11 against
+            // OpenFOAM where keeping the interpolated value reads 8.8e-14, nut 7.7e-11 against
+            // 2.4e-12, k 1.3e-11 against 4.8e-13. The kEpsilon closure has always kept it.
+            continue;
+        }
         const std::vector<scalar>& nb = nutField.boundary[pi]->value();
         for (label i = 0; i < patches[pi].size; ++i)
         {
@@ -298,6 +311,9 @@ void captureSSTSystem(
         {
             const label c = patches[pi].faceCells[i];
             D[c] += M.internalCoeffs[pi][i];
+            // a coupled patch's boundaryCoeffs are INTERFACE coefficients, not a source: the solver
+            // multiplies them by the neighbour's psi every sweep. Folded in here they would be a
+            // constant built from the psi the matrix was assembled at.
             S[c] += M.boundaryCoeffs[pi][i];
         }
 }
@@ -400,7 +416,24 @@ void correct(
     // fvm::ddt(alpha, rho, psi), EulerDdtScheme::fvmDdt: diag = rho*V/deltaT, source =
     // rho.oldTime()*psi.oldTime()*V/deltaT; psi.oldTime() is the field as this iteration started, taken
     // here before anything writes it. Zero under steadyState.
-    const scalar rDeltaT = (comp) ? comp->rDeltaT : scalar(0);
+    // ...and under CRANKNICOLSON the term is the scheme's own, added where the Euler line would have
+    // gone with rDeltaT left at zero; the caller keeps the old-old levels. Transcribed from the
+    // kEpsilon reference's block (kEpsilon_cpp.cu:326-341), which is the gated shape for it.
+    const bool cn = comp && comp->cn;
+    if (cn)
+    {
+        if (!comp->cnDdt0Omega || !comp->cnDdt0K || !comp->omegaOO || !comp->kOO
+         || (comp->rho && !comp->rhoOO) || (comp->rhoOld && !comp->rhoOO))
+            throw std::runtime_error(
+                "brae kOmegaSST: CrankNicolson needs the two ddt0 fields, k.oldTime().oldTime(), "
+                "omega.oldTime().oldTime() and, with a density, rho.oldTime().oldTime(); the caller "
+                "supplied fewer.");
+        if (comp->V0)
+            throw std::runtime_error(
+                "brae kOmegaSST: CrankNicolson's fvm::ddt on a moving mesh is the scheme's moving "
+                "branch, which brae does not carry.");
+    }
+    const scalar rDeltaT = (comp && !cn) ? comp->rDeltaT : scalar(0);
     const std::vector<scalar> kOld     = k.internal;
     const std::vector<scalar> omegaOld = omega.internal;
     auto rhoOldAt = [&](label cc) { return (comp && comp->rhoOld) ? (*comp->rhoOld)[cc] : rhoAt(cc); };
@@ -706,6 +739,12 @@ void correct(
             // move a converged answer -- it is there to keep the transported scalar bounded on the way.
             if (bounded) M.diag[c] -= divPhi[c] * V;
         }
+        // fvm::ddt(alpha, rho, omega_) under CrankNicolson: "ddt0(rho,omega)" is the equation's own
+        if (cn)
+        {
+            fv::fvmDdt(*comp->cn, *comp->cnDdt0Omega, comp->rho, comp->rhoOld ? comp->rhoOld : comp->rho,
+                       comp->rhoOO, omegaOld, *comp->omegaOO, g.V(), M);
+        }
         if (linearUpwind)
         {
             // linearUpwind's deferred correction. The caller SUBTRACTS what linearUpwindCorrection
@@ -852,6 +891,12 @@ void correct(
                 M.source[c] += rDeltaT * rhoOldAt(c) * kOld[c] * ((comp && comp->V0) ? (*comp->V0)[c] : V);
             }
             if (bounded) M.diag[c] -= divPhi[c] * V;                 // - Sp(fvc::div(alphaRhoPhi), k)
+        }
+        // fvm::ddt(alpha, rho, k_) under CrankNicolson: "ddt0(rho,k)" is this equation's own
+        if (cn)
+        {
+            fv::fvmDdt(*comp->cn, *comp->cnDdt0K, comp->rho, comp->rhoOld ? comp->rhoOld : comp->rho,
+                       comp->rhoOO, kOld, *comp->kOO, g.V(), M);
         }
         if (linearUpwind)
         {

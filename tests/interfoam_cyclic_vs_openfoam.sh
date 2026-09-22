@@ -20,6 +20,31 @@
 # 2.1e-01 and U 100% away -- and its step one runs 64/50/1 iterations where the periodic case runs
 # 70/32/4, so the iteration-count arm sees the coupling too.
 #
+# FOUR TURBULENT PROFILES, added when the closures learned the pair. kEpsilon was the ONE closure the
+# case reader let across a cyclic; `sst` is kOmegaSST with the wall-function family on the walls,
+# `les` is LES kEqn, and `sstCN`/`lesCN` are those two under `CrankNicolson 0.9` with the SAME case
+# under Euler as their control. The closure's own fields are compared, not only the three the other
+# profiles share: a defect confined to k reaches U through nuEff alone.
+# MEASURED, ten steps, host then device:
+#   sst    host  alpha 2.5e-13, p_rgh 5.3e-14, U 4.0e-13, k 4.8e-13, omega 8.8e-14, nut 2.4e-12
+#          device      7.2e-12,       4.4e-11,   7.5e-11,   2.4e-11,        7.0e-12,     5.0e-10
+#   les    host  alpha 3.7e-13, p_rgh 5.4e-12, U 4.9e-13, k 1.8e-13,               nut 1.8e-13
+#          device      3.8e-12,       5.9e-11,   8.3e-11,   1.3e-11,                    1.3e-11
+#   sstCN  host  alpha 3.5e-13, p_rgh 5.8e-11, U 1.4e-12, k 6.6e-13, omega 1.4e-13, nut 3.6e-12
+#   lesCN  host  at the same floor. CONTROL for both: OpenFOAM's own Euler answer, alpha 3.2e-02 and
+#          U 39% away. Their DEVICE arm is not here -- the loop refuses CrankNicolson's end-of-step
+#          alpha flux across a coupled pair by name -- and lives in interfoam_cn_vs_openfoam instead.
+# BROKEN ONCE EACH, on these four:
+#   DkEff rebuilt on the pair's faces from the   host k 1.3e-11, omega 4.7e-11, nut 7.7e-11 (which is
+#   patch's own nut instead of keeping           why B_TURB is 4x the measurement and not 30x --
+#   fvc::interpolate's two CELLS                 a 1e-10 bound passed every one of them)
+#   CDkOmega's grad(k)/grad(omega) built         device k 4.8e-05, omega 6.7e-04, nut 3.6e-03,
+#   without the interface                        U 7.8e-05
+#   the LES closure handed no pair at all        device k 4.3e-01, nut 2.8e-01, U 8.7e-03
+# NOT A DEFECT, checked in OpenFOAM's own source: the coupled skip in the effective diffusivity.
+# surfaceInterpolationScheme::interpolate takes pLambda*patchInternalField + pY*patchNeighbourField
+# wherever the patch field is coupled (:186-191), and reads the patch value only where it is not.
+#
 # TWO PROFILES, because they are two alpha equations: `MULESCorr` as the fixture ships, and `explicit`
 # with MULESCorr off -- no implicit pre-solve, and so no mixture.correct() before the first corrector,
 # which is what makes its phir read the nHatf the PREVIOUS TIME STEP left.
@@ -151,7 +176,72 @@ PYEOF
         grep -q "porousBafflePressure" "$C/0/p_rgh" \
             || { echo "FAIL: the jump profile did not reach p_rgh"; return 1; }
     fi
-    if [ "$profile" = walls ] || [ "$profile" = explicitWalls ]; then
+    if [ "$profile" = sstCN ] || [ "$profile" = lesCN ]; then
+        # ...AND UNDER CRANKNICOLSON. The closure's equations take fvm::ddt through ddtSchemes
+        # (kOmegaSSTBase.C:572 and :602, kEqn.C:172), so `default CrankNicolson 0.9` reaches k, omega
+        # and every other ddt on the loop. THE CONTROL for these two is the SAME case under Euler --
+        # OpenFOAM's own `sst` and `les` output -- so what the comparison measures is the scheme.
+        sed -i 's/^ddtSchemes .*/ddtSchemes      { default CrankNicolson 0.9; }/' "$C/system/fvSchemes"
+        grep -q "CrankNicolson 0.9" "$C/system/fvSchemes" \
+            || { echo "FAIL: the $profile profile did not set CrankNicolson"; return 1; }
+    fi
+    if [ "$profile" = sst ] || [ "$profile" = sstWalls ] || [ "$profile" = sstCN ] \
+    || [ "$profile" = les ] || [ "$profile" = lesWalls ] || [ "$profile" = lesCN ]; then
+        # A TURBULENCE CLOSURE ACROSS THE PAIR. kEpsilon was the one closure carried across a cyclic
+        # (the case reader refused every other by name); these two profiles are kOmegaSST and LES kEqn
+        # on the same mesh, with the same step and the same control. The walls are a real `wall`
+        # patch, so the SST profile runs the wall-function family too -- kqRWallFunction on k,
+        # omegaWallFunction on omega, nutkWallFunction on nut -- and the pair has to stay OUT of
+        # every one of those face sets.
+        MODEL=$profile PROF="$profile" python3 - "$C" <<'PYEOF' || { echo "FAIL: the $profile profile was not staged"; return 1; }
+import os, re, sys
+d = sys.argv[1]
+prof = os.environ['PROF']
+les = prof.startswith('les')
+def sub(path, pat, rep, n=1):
+    t = open(path).read()
+    t2, k = re.subn(pat, rep, t, count=n)
+    assert k == n, (path, pat)
+    open(path, 'w').write(t2)
+tp = os.path.join(d, 'constant/turbulenceProperties')
+if les:
+    sub(tp, r'simulationType\s+laminar;',
+        'simulationType  LES;\n\nLES\n{\n    LESModel        kEqn;\n    turbulence      on;\n'
+        '    printCoeffs     on;\n    delta           cubeRootVol;\n'
+        '    cubeRootVolCoeffs { deltaCoeff 1; }\n}')
+else:
+    sub(tp, r'simulationType\s+laminar;',
+        'simulationType  RAS;\n\nRAS\n{\n    RASModel        kOmegaSST;\n    turbulence      on;\n}')
+sc = os.path.join(d, 'system/fvSchemes')
+sub(sc, r'(\s+div\(phi,alpha\)[^\n]*\n)',
+    r'\1    "div\\(phi,(k|omega)\\)"  Gauss upwind;\n')
+if not les:
+    open(sc, 'a').write('\nwallDist\n{\n    method meshWave;\n}\n')
+fs = os.path.join(d, 'system/fvSolution')
+sub(fs, r'"\(U\|k\|epsilon\)\.\*"', '"(U|k|epsilon|omega).*"')
+# THE FIELDS. The pair is a plain `cyclic` on each, exactly as U and alpha carry it.
+hdr = ('FoamFile { version 2.0; format ascii; class volScalarField; object %s; }\n'
+       'dimensions      %s;\ninternalField   uniform %s;\nboundaryField\n{\n')
+def write(name, dims, value, wallEntry):
+    body = hdr % (name, dims, value)
+    body += '    walls        { %s }\n' % wallEntry
+    body += '    "(left|right)" { type cyclic; }\n'
+    body += '    frontAndBack { type empty; }\n}\n'
+    open(os.path.join(d, '0.orig', name), 'w').write(body)
+    open(os.path.join(d, '0', name), 'w').write(body)
+write('k', '[0 2 -2 0 0 0 0]', '0.0001',
+      'type zeroGradient;' if les else 'type kqRWallFunction; value uniform 0.0001;')
+if not les:
+    write('omega', '[0 0 -1 0 0 0 0]', '3',
+          'type omegaWallFunction; value uniform 3;')
+write('nut', '[0 2 -1 0 0 0 0]', '0',
+      'type zeroGradient;' if les else 'type nutkWallFunction; value uniform 0;')
+PYEOF
+        grep -q "type cyclic" "$C/0/k" \
+            || { echo "FAIL: the $profile profile did not give k the pair"; return 1; }
+    fi
+    if [ "$profile" = walls ] || [ "$profile" = explicitWalls ] \
+    || [ "$profile" = sstWalls ] || [ "$profile" = lesWalls ]; then
         # THE CONTROL: the pair replaced by two walls, in the mesh AND in every field that names it.
         # blockMesh numbers the cells from the block, so the two runs' cells are the same cells.
         sed -i 's/type cyclic; neighbourPatch right;/type wall;/; s/type cyclic; neighbourPatch left; */type wall;/' \
@@ -162,7 +252,22 @@ PYEOF
         sed -i 's/"(left|right)" { type cyclic; }/"(left|right)" { type zeroGradient; }/' "$C/0/alpha.water"
         sed -i 's/"(left|right)" { type cyclic; }/"(left|right)" { type fixedFluxPressure; value uniform 0; }/' \
             "$C/0/p_rgh"
-        grep -q "type cyclic" "$C/0/U" "$C/0/alpha.water" "$C/0/p_rgh" \
+        # ...and the turbulence fields, where the control has them. A walled pair gets the walls'
+        # own condition, so the control is the same closure with the periodic faces closed off.
+        for fld in k omega nut; do
+            [ -f "$C/0/$fld" ] || continue
+            wall=$(sed -n 's/^    walls  *{ \(.*\) }$/\1/p' "$C/0/$fld")
+            [ -n "$wall" ] || { echo "FAIL: the control cannot read $fld's wall entry"; return 1; }
+            python3 - "$C/0/$fld" "$wall" <<'PYEOF' || return 1
+import sys
+p, w = sys.argv[1], sys.argv[2]
+s = open(p).read()
+old = '    "(left|right)" { type cyclic; }'
+assert s.count(old) == 1, p
+open(p, 'w').write(s.replace(old, '    "(left|right)" { %s }' % w))
+PYEOF
+        done
+        grep -q "type cyclic" "$C/0/U" "$C/0/alpha.water" "$C/0/p_rgh" "$C"/0/k "$C"/0/omega "$C"/0/nut 2>/dev/null \
             && { echo "FAIL: the control's fields still name a cyclic"; return 1; }
     fi
     STEPS="$STEPS" DT="$DT" python3 - "$C" <<'PYEOF' || { echo "FAIL: staging $profile"; return 1; }
@@ -189,7 +294,8 @@ PYEOF
     echo "OpenFOAM ran $STEPS steps of deltaT $DT to t = $END   [$profile]"
 }
 
-for p in cyclic walls explicitMules explicitWalls jump outer outerControl; do
+for p in cyclic walls explicitMules explicitWalls jump outer outerControl \
+         sst sstWalls les lesWalls sstCN lesCN; do
     stage "$p" || { echo "interfoam_cyclic_vs_openfoam: staging failed"; exit 1; }
 done
 
@@ -219,5 +325,19 @@ rc=0
 # different answer and is what the device loop ran before this was wired.
 "$BIN" "$W/outer" "$W/outer/0" "$W/outer/$END" "$STEPS" \
        "$W/outer/log.interFoam" "$W/outerControl/$END" outer || rc=1
+# ...and A TURBULENCE CLOSURE ACROSS THE PAIR, one profile per closure. kEpsilon was the only one the
+# case reader let through; these are kOmegaSST and LES kEqn, each against its own walled control, and
+# each comparing k (and omega, and nut) as well as the three shared fields -- the closure is what is
+# under test here, and a defect confined to it reaches U only through nuEff.
+"$BIN" "$W/sst" "$W/sst/0" "$W/sst/$END" "$STEPS" \
+       "$W/sst/log.interFoam" "$W/sstWalls/$END" sst || rc=1
+"$BIN" "$W/les" "$W/les/0" "$W/les/$END" "$STEPS" \
+       "$W/les/log.interFoam" "$W/lesWalls/$END" les || rc=1
+# ...and the same two under CRANKNICOLSON, whose control is the Euler run of the same case: the
+# closure's ddt comes through ddtSchemes, so the scheme has to reach k and omega and not only U.
+"$BIN" "$W/sstCN" "$W/sstCN/0" "$W/sstCN/$END" "$STEPS" \
+       "$W/sstCN/log.interFoam" "$W/sst/$END" sstCN || rc=1
+"$BIN" "$W/lesCN" "$W/lesCN/0" "$W/lesCN/$END" "$STEPS" \
+       "$W/lesCN/log.interFoam" "$W/les/$END" lesCN || rc=1
 echo "interfoam_cyclic_vs_openfoam: rc $rc"
 exit $rc

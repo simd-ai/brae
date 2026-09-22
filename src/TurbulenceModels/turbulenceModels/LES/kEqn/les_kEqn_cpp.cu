@@ -67,7 +67,10 @@ SolverPerformance correct(
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& patches,
-    Taps* taps)
+    Taps* taps,
+    const fv::CrankNicolsonClock* cn,
+    fv::CrankNicolsonDdt0<scalar>* cnDdt0K,
+    const std::vector<scalar>* kOO)
 {
     if (!(deltaT > scalar(0)))
     {
@@ -166,10 +169,18 @@ SolverPerformance correct(
         addEqual(M, L, scalar(-1));
     }
 
-    const scalar rDeltaT = scalar(1)/deltaT;
+    // ...and under CRANKNICOLSON the ddt is the scheme's own, added after this loop with the Euler
+    // lines skipped; the caller keeps k's old-old level. The kEpsilon reference's shape.
+    if (cn && (!cnDdt0K || !kOO))
+    {
+        throw std::runtime_error(
+            std::string(WHO) + "CrankNicolson needs k's ddt0 field and k.oldTime().oldTime(); the "
+            "caller supplied fewer.");
+    }
+    const scalar rDeltaT = cn ? scalar(0) : scalar(1)/deltaT;
     for (label c = 0; c < nC; ++c)
     {
-        // fvm::ddt(k), Euler
+        // fvm::ddt(k), Euler -- inert under CrankNicolson, where rDeltaT is zero
         M.diag[c] += rDeltaT*V[c];
         M.source[c] += rDeltaT*kOld[c]*V[c];
         // == G
@@ -182,6 +193,11 @@ SolverPerformance correct(
         M.diag[c] += V[c]*(co.Ce*std::sqrt(k.internal[c])/delta[c]);
     }
 
+    // fvm::ddt(k) under CrankNicolson: "ddt0(k)", with no density at any level
+    if (cn)
+    {
+        fv::fvmDdt(*cn, *cnDdt0K, nullptr, nullptr, nullptr, kOld, *kOO, g.V(), M);
+    }
     if (taps)
     {
         taps->diag = M.diag;

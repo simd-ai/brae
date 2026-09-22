@@ -35,6 +35,8 @@
 #include "device_komega_sst.cuh"    // the shared SST physics kernels
 #include "device_dilu.cuh"
 #include "device_colour_gauss_seidel.cuh"   // DeviceCellColouring (FP-1)
+#include "device_crank_nicolson_ddt.cuh"   // DeviceCnDdt0, deviceCnFvmDdt
+#include "device_cyclic.cuh"               // DeviceCyclic, the periodic pair
 #include "komega_sst_coeffs.cuh"
 #include "pEqn.cuh"
 #include <string>
@@ -163,6 +165,27 @@ struct KOmegaSSTInput
 
     KOmegaSSTCoeffs co;
     scalar Prt = 1.0;
+
+    // fvm::ddt(alpha, rho, psi) under CRANKNICOLSON, as KEpsilonInput carries it: the scheme's clock,
+    // the two equations' OWN ddt0 fields kept by the caller across the run, and the old-old level of
+    // each field (and of rho in the variable-density lineage). Null runs the Euler branch, which is
+    // what `rDeltaT` drives. kOmegaSSTBase.C takes fvm::ddt through ddtSchemes at :572 and :602, so
+    // a case naming CrankNicolson gets it on both equations or on neither.
+    const cpu::fv::CrankNicolsonClock* cn = nullptr;
+    DeviceCnDdt0*               cnDdt0Omega = nullptr;
+    DeviceCnDdt0*               cnDdt0K     = nullptr;
+    const DeviceBuffer<scalar>* rhoOOCell   = nullptr;
+    const DeviceBuffer<scalar>* omegaOO     = nullptr;
+    const DeviceBuffer<scalar>* kOO         = nullptr;
+
+    // A PERIODIC PAIR, exactly as KEpsilonInput carries it: the pair's own off-diagonal for the
+    // transport matrix AND for the solve (TransportScheme::cyc, solveScalarEqn's last argument),
+    // the flux those equations convect with on those faces, and -- in the variable-density lineage --
+    // the VOLUMETRIC flux there, which is what divU takes and is a different field from cycPhi.
+    // Null is a mesh with no pair; `hasCoupledPatches` below then refuses one that has.
+    DeviceCyclic*               cyc         = nullptr;
+    const DeviceBuffer<scalar>* cycPhi      = nullptr;
+    const DeviceBuffer<scalar>* cycPhiByRho = nullptr;
 
     // --- refusals, the same set the kEpsilon closure carries ---
     bool        hasCoupledPatches      = false;

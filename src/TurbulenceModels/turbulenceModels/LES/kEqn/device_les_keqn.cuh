@@ -21,6 +21,8 @@
 #include "device_boundary.cuh"
 #include "device_buffer.cuh"
 #include "device_kepsilon.cuh"     // DeviceSolverPerf, deviceGByNuFromGradU, deviceGradUShared
+#include "device_crank_nicolson_ddt.cuh"   // DeviceCnDdt0, deviceCnFvmDdt
+#include "device_cyclic.cuh"               // DeviceCyclic, the periodic pair
 #include "device_mesh.cuh"
 #include "les_kEqn_cpp.cuh"        // cpu::LESkEqn::Coeffs -- one struct for both arms
 
@@ -41,6 +43,21 @@ struct Input
     const DeviceBuffer<scalar>* delta = nullptr;    // the LES filter width, one per cell
     const DeviceBuffer<scalar>* kOld = nullptr;     // k.oldTime(), for fvm::ddt under Euler
     scalar rDeltaT = 0;
+
+    // A PERIODIC PAIR, as KEpsilonInput and KOmegaSSTInput carry it: the pair's off-diagonal for the
+    // transport matrix AND for the solve, and the flux k convects with on those faces. This lineage
+    // is the uniform one, so there is one flux and no cycPhiByRho. Null is a mesh with no pair.
+    DeviceCyclic*               cyc    = nullptr;
+    const DeviceBuffer<scalar>* cycPhi = nullptr;
+
+    // fvm::ddt(k) under CRANKNICOLSON, as KEpsilonInput and KOmegaSSTInput carry it: the scheme's
+    // clock, the equation's OWN ddt0 field kept by the caller across the run, and k's old-old level.
+    // kEqn.C:172 takes fvm::ddt through ddtSchemes like every other term, so a case naming
+    // CrankNicolson gets it here. Null runs the Euler branch, which `rDeltaT` drives. This lineage is
+    // the uniform one -- alpha = rho = 1 -- so there is no rho old-old to carry.
+    const cpu::fv::CrankNicolsonClock* cn = nullptr;
+    DeviceCnDdt0*               cnDdt0K = nullptr;
+    const DeviceBuffer<scalar>* kOO     = nullptr;
 
     cpu::LESkEqn::Coeffs co;
 

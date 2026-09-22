@@ -54,6 +54,18 @@ const Bounds H_FULL{1e-12, 3e-11, 4e-9, 2e-10, 1.5e-11, 2e-10, 3e-8};
 const Bounds D_CN{3e-13, 3e-13, 6e-11, 3e-13, 3e-13, 4e-13, 2e-9};
 const Bounds D_OUTER{3e-13, 3e-13, 6e-11, 4e-13, 4e-13, 7e-13, 2e-9};
 const Bounds D_FULL{1e-12, 2e-11, 3e-9, 1e-10, 1e-11, 1.2e-10, 2e-8};
+// ...and the OTHER TWO CLOSURES under CrankNicolson 0.5, on the same tutorial with the same step.
+// The `epsilon` slot is OMEGA's bound on the SST profile and unread on the LES one, which solves k
+// alone. MEASURED, 20 steps:
+//   cnSST  host  alpha 6.4e-15, p_rgh 6.5e-15, U 2.7e-14, k 9.9e-15, omega 4.1e-15, nut 3.9e-13
+//          device      6.0e-15,       7.0e-15,   8.8e-13,   5.6e-14,        4.1e-15,     8.5e-13
+//   cnLES  host  alpha 7.3e-15, p_rgh 5.6e-15, U 2.7e-14, k 4.4e-15,                nut 9.5e-15
+//          device      6.2e-15,       3.9e-15,   8.4e-13,   3.2e-15,                     8.5e-15
+// against a control -- OpenFOAM's own Euler answer -- of U 4.8e-02 and alpha 1.2e-02.
+const Bounds H_SST{3e-14, 3e-14, 3e-13, 5e-14, 3e-14, 4e-12, 1e-9};
+const Bounds H_LES{3e-14, 3e-14, 3e-13, 3e-14, 1e-12, 1e-13, 1e-9};
+const Bounds D_SST{3e-14, 3e-14, 1e-11, 3e-13, 3e-14, 5e-12, 2e-9};
+const Bounds D_LES{3e-14, 3e-14, 1e-11, 3e-14, 1e-12, 1e-13, 2e-9};
 
 namespace {
 int failures = 0;
@@ -121,13 +133,24 @@ void holdArm(
     failures += brae::gatecheck::nonFinite("p_rgh", f.p_rgh.internal);
     failures += brae::gatecheck::nonFinite("U", f.U.internal);
     failures += brae::gatecheck::nonFinite("k", f.turbulence.k.internal);
-    failures += brae::gatecheck::nonFinite("epsilon", f.turbulence.epsilon.internal);
+    // THE CLOSURE'S SECOND FIELD lives in ::epsilon under kEpsilon and in ::omega under kOmegaSST --
+    // two different members, and reading the empty one made this whole comparison vacuous: it printed
+    // `epsilon 0.0000e+00` and passed with nothing on either side of it.
+    const std::vector<scalar>& second = f.turbulence.omega.internal.empty()
+                                      ? f.turbulence.epsilon.internal : f.turbulence.omega.internal;
+    if (!ofE.empty())
+    {
+        check("...and brae HAS that field to compare", second.size() == ofE.size() && !ofE.empty());
+        failures += brae::gatecheck::nonFinite("the closure's second field", second);
+    }
     failures += brae::gatecheck::nonFinite("nut", f.turbulence.nut.internal);
     const Diff dA = compare(f.alpha1.internal, ofAlpha);
     const Diff dP = compare(f.p_rgh.internal, ofPrgh);
     const Diff dU = compare(f.U.internal, ofU);
     const Diff dK = compare(f.turbulence.k.internal, ofK);
-    const Diff dE = compare(f.turbulence.epsilon.internal, ofE);
+    // the closure's SECOND field, which is epsilon under kEpsilon, omega under kOmegaSST (it lives
+    // in the same slot) and nothing at all under LES kEqn -- an empty oracle there.
+    const Diff dE = ofE.empty() ? Diff{} : compare(second, ofE);
     const Diff dN = compare(f.turbulence.nut.internal, ofNut);
     std::printf("  %-7s alpha %.4e, p_rgh %.4e, U %.4e, k %.4e, epsilon %.4e, nut %.4e\n", who,
                 (double)dA.linf, (double)dP.rel(), (double)dU.rel(), (double)dK.rel(), (double)dE.rel(),
@@ -136,7 +159,8 @@ void holdArm(
     check("p_rgh agrees with OpenFOAM's relatively", dP.rel() < B.prgh);
     check("U agrees with OpenFOAM's relatively", dU.rel() < B.U);
     check("k agrees with OpenFOAM's relatively", dK.rel() < B.k);
-    check("epsilon agrees with OpenFOAM's relatively", dE.rel() < B.epsilon);
+    if (!ofE.empty()) check("the closure's second field agrees with OpenFOAM's relatively",
+                            dE.rel() < B.epsilon);
     check("nut agrees with OpenFOAM's relatively", dN.rel() < B.nut);
     check("CrankNicolson moves OpenFOAM's own U far more than this arm is from it",
           controlU > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)) && controlU > scalar(1e-3));
@@ -164,10 +188,20 @@ int main(
     const std::string profile = argv[7];
     const bool outer = (profile == "cnOuter");
     const bool full = (profile == "cnFull");
-    const Bounds& HB = outer ? H_OUTER : full ? H_FULL : H_CN;
-    const Bounds& DB = outer ? D_OUTER : full ? D_FULL : D_CN;
+    // THE OTHER TWO CLOSURES under the same scheme, on the same tutorial: kOmegaSST, whose second
+    // field is omega, and LES kEqn, which has none. kEpsilon carried CrankNicolson from the start;
+    // these two form their own fvm::ddt through ddtSchemes (kOmegaSSTBase.C:572, :602; kEqn.C:172)
+    // and each now adds the scheme's term with its Euler line inert. Both run the UNIFORM lineage:
+    // `density variable` is refused under either, so the staging takes it out.
+    const bool sst = (profile == "cnSST");
+    const bool les = (profile == "cnLES");
+    const char* secondName = les ? nullptr : (sst ? "omega" : "epsilon");
+    const Bounds& HB = outer ? H_OUTER : full ? H_FULL : (sst ? H_SST : les ? H_LES : H_CN);
+    const Bounds& DB = outer ? D_OUTER : full ? D_FULL : (sst ? D_SST : les ? D_LES : D_CN);
     std::printf("  profile: %s\n", outer ? "cnOuter -- CrankNicolson 0.5 with nOuterCorrectors 2"
                                  : full ? "cnFull -- CrankNicolson 1, the un-off-centred scheme"
+                                 : sst ? "cnSST -- CrankNicolson 0.5 under kOmegaSST"
+                                 : les ? "cnLES -- CrankNicolson 0.5 under LES kEqn"
                                         : "cn -- CrankNicolson 0.5, the tutorial's PIMPLE");
 
     PrimitiveMesh m;
@@ -186,11 +220,16 @@ int main(
     check("...with the case's off-centring coefficient",
           std::fabs(fin.ddtOcCoeff - (full ? scalar(1) : scalar(0.5))) == scalar(0)
        && std::fabs(fin.ddtAlphaOcCoeff - (full ? scalar(1) : scalar(0.5))) == scalar(0));
-    check("brae ran the case turbulent, under kEpsilon, in the `density variable` lineage",
-          fin.turbulence.on && fin.turbulence.model == InterRasModel::KEpsilon && fin.turbulence.variableDensity);
+    check("brae ran the case turbulent, under the profile's own closure and lineage",
+          fin.turbulence.on
+       && fin.turbulence.model == (sst ? InterRasModel::KOmegaSST
+                                       : les ? InterRasModel::KEqnLES : InterRasModel::KEpsilon)
+       && fin.turbulence.variableDensity == (!sst && !les));
     check("...with nOuterCorrectors as the profile set it", fin.pimple.nOuterCorrectors == (outer ? 2 : 1));
     // the closure's own ddt0 fields exist and were advanced on the last step: created at step one
     // (start index 1) and evaluated once per step since
+    // ...and the closure kept its OWN ddt0 field for k, under every model: this is the term the two
+    // new profiles add, so a run that formed Euler instead would leave it unborn.
     check("the closure's k ddt0 field exists, born on step one and advanced on the last",
           fin.turbulence.cn.ddt0K.exists && fin.turbulence.cn.ddt0K.startTimeIndex == 1
        && fin.turbulence.cn.ddt0K.timeIndex == nSteps);
@@ -226,18 +265,24 @@ int main(
 
     const std::vector<LinearSolveRecord> ofP = brae::gatecheck::readOfPressureSolves(logPath);
     const std::vector<LinearSolveRecord> ofA = brae::gatecheck::readOfSolves(logPath, fin.alphaName);
-    const std::vector<LinearSolveRecord> ofE = brae::gatecheck::readOfSolves(logPath, "epsilon");
+    const std::vector<LinearSolveRecord> ofE = secondName
+        ? brae::gatecheck::readOfSolves(logPath, secondName) : std::vector<LinearSolveRecord>{};
     const std::vector<LinearSolveRecord> ofK = brae::gatecheck::readOfSolves(logPath, "k");
     // the FAIL-PROOF: nothing in compareSolves can pass on an empty parse
-    check("OpenFOAM's log gave one epsilon and one k solve per step",
-          ofE.size() == static_cast<std::size_t>(nSteps) && ofK.size() == ofE.size());
+    check("OpenFOAM's log gave one solve per step for each of the closure's fields",
+          ofK.size() == static_cast<std::size_t>(nSteps)
+       && (!secondName || ofE.size() == static_cast<std::size_t>(nSteps)));
     check("...and the profile's number of p_rgh solves",
           ofP.size() == static_cast<std::size_t>(nSteps)*static_cast<std::size_t>(outer ? 6 : 3));
     failures += brae::gatecheck::compareSolves("host", r.pSolves, ofP, nSteps, "p_rgh", HB.pResidual, HB.pResidual);
     failures += brae::gatecheck::compareSolves("host", r.alphaSolves, ofA, nSteps, fin.alphaName.c_str(),
                                                scalar(1e-10), scalar(1e-9));
-    failures += brae::gatecheck::compareSolves("host", r.epsilonSolves, ofE, nSteps, "epsilon",
-                                               scalar(1e-10), scalar(1e-8), scalar(1e-5));
+    // ...and the SECOND FIELD's solves, which the driver keeps in omegaSolves under kOmegaSST and in
+    // epsilonSolves under kEpsilon -- two different lists, as the two fields are two members
+    if (secondName)
+        failures += brae::gatecheck::compareSolves(
+            "host", sst ? r.omegaSolves : r.epsilonSolves, ofE, nSteps, secondName,
+            scalar(1e-10), scalar(1e-8), scalar(1e-5));
     failures += brae::gatecheck::compareSolves("host", r.kSolves, ofK, nSteps, "k",
                                                scalar(1e-10), scalar(1e-8), scalar(1e-5));
 
@@ -245,11 +290,12 @@ int main(
     const std::vector<scalar> ofPrgh = readCells(ofDir + "/p_rgh");
     const std::vector<vector> ofU = readVectorCells(ofDir + "/U");
     const std::vector<scalar> ofKf = readCells(ofDir + "/k");
-    const std::vector<scalar> ofEf = readCells(ofDir + "/epsilon");
+    const std::vector<scalar> ofEf = secondName ? readCells(ofDir + "/" + secondName)
+                                                : std::vector<scalar>{};
     const std::vector<scalar> ofNut = readCells(ofDir + "/nut");
     check("OpenFOAM's fields have one value per cell",
           ofAlpha.size() == static_cast<std::size_t>(nC) && ofKf.size() == ofAlpha.size()
-       && ofEf.size() == ofAlpha.size() && ofNut.size() == ofAlpha.size());
+       && (!secondName || ofEf.size() == ofAlpha.size()) && ofNut.size() == ofAlpha.size());
 
     // THE CONTROL, on the oracle: OpenFOAM under Euler against OpenFOAM under CrankNicolson
     const Diff dCtlU = compare(readVectorCells(eulerDir + "/U"), ofU);
@@ -285,7 +331,9 @@ int main(
         // on all twenty second passes alike; every count OpenFOAM's; every first pass at the floor.
         failures += brae::gatecheck::compareSolves("device", rd.alphaSolves, ofA, nSteps, dev.alphaName.c_str(),
                                                    scalar(1e-10), outer ? scalar(1e-5) : scalar(1e-8));
-        failures += brae::gatecheck::compareSolves("device", rd.epsilonSolves, ofE, nSteps, "epsilon",
+        if (secondName)
+        failures += brae::gatecheck::compareSolves("device", sst ? rd.omegaSolves : rd.epsilonSolves,
+                                                   ofE, nSteps, secondName,
                                                    scalar(1e-9), scalar(1e-8));
         failures += brae::gatecheck::compareSolves("device", rd.kSolves, ofK, nSteps, "k",
                                                    scalar(1e-9), scalar(1e-8));

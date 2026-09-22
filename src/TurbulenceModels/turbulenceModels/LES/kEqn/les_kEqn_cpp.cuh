@@ -29,6 +29,7 @@
 #include "geometric_field.cuh"
 #include "pcg.cuh"                  // SolverPerformance
 #include "primitive_mesh.cuh"
+#include "crank_nicolson_ddt_scheme_cpp.cuh"
 #include "smooth_solver_cpp.cuh"    // LinearSolverChoice
 #include <vector>
 
@@ -101,7 +102,14 @@ SolverPerformance correct(
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& patches,
-    Taps* taps = nullptr);
+    Taps* taps = nullptr,
+    // CRANKNICOLSON in Euler's place (crank_nicolson_ddt_scheme_cpp.cuh): the scheme's clock, k's own
+    // ddt0 field kept by the caller across the run, and k.oldTime().oldTime(). kEqn.C:172 takes
+    // fvm::ddt through ddtSchemes like every other term. Null runs Euler, which `deltaT` drives; this
+    // lineage is the uniform one, so there is no density at any level.
+    const fv::CrankNicolsonClock* cn = nullptr,
+    fv::CrankNicolsonDdt0<scalar>* cnDdt0K = nullptr,
+    const std::vector<scalar>* kOO = nullptr);
 
 } // namespace LESkEqn
 } // namespace cpu

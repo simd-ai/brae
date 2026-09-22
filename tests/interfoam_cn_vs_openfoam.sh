@@ -37,6 +37,20 @@
 # MEASURED, host and device: see the .cu's bounds, each with its number. Both arms sit at the round-off
 # floor on every profile (U 1.5e-14 host, 1.9e-12 device on `cn`), against a control of 3.2e-02.
 #
+# ...AND TWO MORE, one per closure, because the closure's fvm::ddt comes through ddtSchemes like every
+# other term and kEpsilon was the only one that took CrankNicolson:
+#   cnSST     the same tutorial with kOmegaSST in kEpsilon's place (and the UNIFORM lineage, which is
+#             what the reader admits under that model), CrankNicolson 0.5.  Control: eulerSST.
+#   cnLES     ...and with LES kEqn, which solves k alone.                   Control: eulerLES.
+# MEASURED, 20 steps: cnSST host k 9.9e-15 / omega 4.1e-15 / nut 3.9e-13, device 5.6e-14 / 4.1e-15 /
+# 8.5e-13; cnLES host k 4.4e-15 / nut 9.5e-15, device 3.2e-15 / 8.5e-15. Control 4.8e-02 in U.
+# BROKEN ONCE, on the device arm of both (the scheme's term dropped, so the closure forms Euler):
+# cnSST k 2.0233e-02, omega 2.7456e-03, nut 1.7637e-03, U 1.4934e-04, 12 failures; cnLES k 9.3629e-02,
+# nut 4.5767e-02, U 1.5009e-03, 10 failures.
+# AND A VACUITY THIS GATE FOUND IN ITSELF: the closure's second field is ::epsilon under kEpsilon and
+# ::omega under kOmegaSST, and the SST arm first read the empty one -- it printed `epsilon 0.0000e+00`
+# and passed with nothing on either side. The arm now asserts brae HAS the field before comparing it.
+#
 # WHAT THE GATE FOUND. (1) phi's old-old level is CREATED on the second step, as a copy of
 # phi.oldTime(): fvcDdtPhiCorr asks for phi.oldTime().oldTime() only inside its evaluate branch, and
 # GeometricField::oldTime() creates a level that does not exist from the one it hangs off -- so the
@@ -130,12 +144,64 @@ s = re.sub(r'^writeFormat .*',    'writeFormat     ascii;',     s, flags=re.M)
 s = re.sub(r'^writePrecision .*', 'writePrecision  15;',        s, flags=re.M)
 s = re.sub(r'^writeCompression .*', 'writeCompression off;',    s, flags=re.M)
 open(c, 'w').write(s)
-if p != 'euler':
+if not p.startswith('euler'):
     q = os.path.join(d, 'system/fvSchemes')
     t = open(q).read()
     oc = '1' if p == 'cnFull' else '0.5'
     t, k = re.subn(r'(ddtSchemes\s*\{[^}]*default\s+)Euler;', r'\1CrankNicolson %s;' % oc, t)
     assert k == 1, 'the ddtSchemes default was not replaced'
+    open(q, 'w').write(t)
+if p in ('cnSST', 'cnLES', 'eulerSST', 'eulerLES'):
+    # THE OTHER TWO CLOSURES UNDER THE SCHEME. kEpsilon carried CrankNicolson from the start; this
+    # stages the tutorial's own damBreak with kOmegaSST and with LES kEqn in its place, so the
+    # closure's own fvm::ddt -- kOmegaSSTBase.C:572 and :602, kEqn.C:172 -- is the term under test.
+    # The `density variable` lineage is refused under both, so it goes back to the uniform one.
+    q = os.path.join(d, 'constant/turbulenceProperties')
+    t = open(q).read()
+    t, k = re.subn(r'^\s*density\s+variable;\s*$', '', t, flags=re.M)
+    assert k == 1, 'the tutorial no longer ships `density variable`'
+    if p.endswith('LES'):
+        t, k = re.subn(r'simulationType\s+RAS;', 'simulationType  LES;', t)
+        assert k == 1
+        t, k = re.subn(r'RAS\s*\{[^}]*\}',
+                       'LES\n{\n    LESModel        kEqn;\n    turbulence      on;\n'
+                       '    printCoeffs     on;\n    delta           cubeRootVol;\n'
+                       '    cubeRootVolCoeffs { deltaCoeff 1; }\n}', t, flags=re.S)
+        assert k == 1
+    else:
+        t, k = re.subn(r'RASModel\s+\w+;', 'RASModel        kOmegaSST;', t)
+        assert k == 1
+    open(q, 'w').write(t)
+    # the tutorial convects k and epsilon with rhoPhi, which is the `density variable` lineage's
+    # flux; the uniform one convects with phi, and OpenFOAM looks the entry up under that name
+    q = os.path.join(d, 'system/fvSchemes')
+    t = open(q).read()
+    t, k = re.subn(r'div\(rhoPhi,(k|epsilon)\)(\s+)(\S+ \S+);',
+                   r'div(phi,\1)\2\3;', t)
+    assert k == 2, 'the tutorial no longer names div(rhoPhi,k) and div(rhoPhi,epsilon)'
+    t, k = re.subn(r'div\(phi,epsilon\)', 'div(phi,omega)', t)
+    assert k == 1
+    open(q, 'w').write(t)
+    if p.endswith('SST'):
+        open(q, 'a').write('\nwallDist\n{\n    method meshWave;\n}\n')
+    for fld, dims, val, wall in [
+            ('k', '[0 2 -2 0 0 0 0]', '0.0001',
+             'type zeroGradient;' if p.endswith('LES') else 'type kqRWallFunction; value uniform 0.0001;'),
+            ('omega', '[0 0 -1 0 0 0 0]', '3', 'type omegaWallFunction; value uniform 3;'),
+            ('nut', '[0 2 -1 0 0 0 0]', '0',
+             'type zeroGradient;' if p.endswith('LES') else 'type nutkWallFunction; value uniform 0;')]:
+        if fld == 'omega' and p.endswith('LES'):
+            continue
+        body = ('FoamFile { version 2.0; format ascii; class volScalarField; object %s; }\n'
+                'dimensions      %s;\ninternalField   uniform %s;\nboundaryField\n{\n'
+                '    "(leftWall|rightWall|lowerWall)" { %s }\n'
+                '    atmosphere   { type zeroGradient; }\n'
+                '    defaultFaces { type empty; }\n}\n') % (fld, dims, val, wall)
+        open(os.path.join(d, '0', fld), 'w').write(body)
+        open(os.path.join(d, '0.orig', fld), 'w').write(body)
+    q = os.path.join(d, 'system/fvSolution')
+    t = open(q).read()
+    t = t.replace('"(U|k|epsilon).*"', '"(U|k|epsilon|omega).*"')
     open(q, 'w').write(t)
 if p == 'cnOuter':
     q = os.path.join(d, 'system/fvSolution')
@@ -149,7 +215,7 @@ PYEOF
     ( cd "$C" && interFoam > log.interFoam 2>&1 ) || { echo "FAIL: interFoam [$profile]"; tail -30 "$C/log.interFoam"; return 1; }
     [ -d "$C/$END" ] || { echo "FAIL: OpenFOAM wrote no $END directory [$profile]"; ls "$C"; return 1; }
     # the oracle took the path: the ddt0 fields exist only under CrankNicolson
-    if [ "$profile" = euler ]; then
+    if [ "${profile#euler}" != "$profile" ]; then
         [ ! -e "$C/$END/ddt0(rho,U)" ] || { echo "FAIL: the Euler control wrote a ddt0 field"; return 1; }
     else
         [ -e "$C/$END/ddt0(rho,U)" ] || { echo "FAIL: OpenFOAM wrote no ddt0(rho,U) under CrankNicolson [$profile]"; ls "$C/$END"; return 1; }
@@ -158,13 +224,20 @@ PYEOF
 }
 
 rc=0
-for p in euler cn cnOuter cnFull; do
+for p in euler cn cnOuter cnFull eulerSST cnSST eulerLES cnLES; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_cn_vs_openfoam: staging failed"; exit 1; }
 
 for p in cn cnOuter cnFull; do
     "$BIN" "$W/$p" "$W/$p/0" "$W/$p/$END" "$STEPS" "$W/$p/log.interFoam" "$W/euler/$END" "$p" || rc=1
+done
+# ...and the OTHER TWO CLOSURES under the scheme, each against the SAME closure under Euler. This is
+# where the DEVICE arm holds CrankNicolson in kOmegaSST and in kEqn: the cyclic fixture's `sstCN` and
+# `lesCN` profiles hold the host arm but refuse the device one, because CrankNicolson's end-of-step
+# alpha flux across a COUPLED PAIR is a separate thing this loop does not carry.
+for p in cnSST cnLES; do
+    "$BIN" "$W/$p" "$W/$p/0" "$W/$p/$END" "$STEPS" "$W/$p/log.interFoam" "$W/euler${p#cn}/$END" "$p" || rc=1
 done
 
 echo "interfoam_cn_vs_openfoam: rc $rc"

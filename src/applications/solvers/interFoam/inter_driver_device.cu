@@ -178,24 +178,13 @@ RunReport runInterFoamDevice(
             "brae interFoam (device): the case is LES kEqn AND moves its mesh. The device closure takes "
             "the filter width once, from the host's LESdelta::compute on the mesh as it starts; a mesh "
             "that moves changes it at every update. Run without -device.");
-    // ...and LES kEqn ACROSS A COUPLED PAIR. k's equation is fvm::div - fvm::laplacian like the
-    // momentum's, so across a pair it needs the interface's off-diagonal and the pair's own flux --
-    // TransportScheme::cyc and ::cycPhi, which the kEpsilon closure is handed and gated on
-    // (validation/interFoamCyclic). LESkEqnInput carries NEITHER, so the device LES closure cannot be
-    // given a pair at all: k would convect and diffuse across the periodic faces as if they were
-    // walls, silently, while every other equation on the loop couples them. The host kEqn does not
-    // have that hole (les_kEqn_cpp.cu assembles the patch itself). Found by tools/default_audit.py --
-    // the shared TransportScheme is built without `cyc` at the LES site and with it everywhere else.
-    // The case reader refuses any model but kEpsilon with a pair before this runs
-    // (inter_case_cpp.cu:1285), so nothing reaches it today; it is here so that lifting the reader's
-    // blanket refusal cannot make this loop drop the interface silently (arm `device_les_cyclic`).
-    if (f.turbulence.on && f.turbulence.model == cpu::interFoam::InterRasModel::KEqnLES
-        && !cyclics.empty())
-        throw std::runtime_error(
-            "brae interFoam (device): the case is LES kEqn AND carries a coupled pair. The device LES "
-            "closure takes no interface for k's transport (LESkEqnInput has no cyclic pair), so the "
-            "pair's faces would contribute nothing to k's convection or diffusion. Run without "
-            "-device.");
+    // EVERY CLOSURE ON THIS LOOP CROSSES A PAIR NOW. kEpsilon carried one; kOmegaSST and LES kEqn
+    // refused, because k's equation is fvm::div - fvm::laplacian like the momentum's and across a
+    // pair it needs the interface's off-diagonal in the matrix AND in the solve, the pair's own flux
+    // in both divergences, its cells' grad(U), and the diffusivity there as the two CELLS
+    // interpolated. All five are transcribed from the kEpsilon closure into KOmegaSSTInput::cyc and
+    // LESkEqn::Input::cyc, and gated on validation/interFoamCyclic (`sst` and `les`), each against
+    // its own walled control.
     // ...and so is a RAS closure on a mesh that moves. The host closure takes the moved mesh's old
     // volumes for fvm::ddt and the mesh flux for the convection's relative phi
     // (InterTurbulenceStepInput::V0, meshPhi; gated on waves/waveMakerPiston `pistonSST`, host arm);
@@ -205,22 +194,24 @@ RunReport runInterFoamDevice(
     // structs (fields set at one construction site and not another), not by a case: no runnable
     // tutorial moves its mesh under a RAS closure on the device without an AMI, which is refused
     // separately. Refused until V0 and meshPhi are ported into the device closure and gated.
-    // STILL REFUSED, and the refusal now says how far the port got. kOmegaSST's device kernels take
-    // TWO of the moving-mesh terms -- the Euler source reads V0 where the diagonal keeps V (ddtKernel,
-    // kOmegaSST.cu) and divU is the divergence of the ABSOLUTE flux, both transcribed from the host
-    // reference -- and that is NOT ENOUGH. MEASURED on waves/waveMakerPiston `pistonSST`, thirty steps
-    // of 0.01, with the device arm switched on: alpha 4.2494e-08, p_rgh 4.2660e-08, U 1.7353e-05
-    // against the host's 1.3849e-12, 1.4704e-12 and 1.1909e-10 on the same case. Both terms are
-    // load-bearing -- V for V0 reads 1.8155e-05 and a relative divU 4.4704e-05 -- so what is missing
-    // is a THIRD thing. The prime suspect is the wall distance: kOmegaSST's F1/F2 blends take y, the
-    // device closure takes it ONCE from the mesh as it starts (buildDeviceInterTurbulence), and
-    // OpenFOAM's wallDist is a MeshObject that is recomputed when the mesh moves.
-    if (f.turbulence.on && f.dynamicMesh)
+    // THE THIRD TERM WAS THE WALL DISTANCE, and it is ported now: the loop's move branch re-runs the
+    // host block's moveInterTurbulence and re-uploads what moved with it -- wallDist::New(mesh).y()
+    // for F1 and F2, nearWallDist for the wall functions, and DeviceWallData's own y/deltaCoeffs/wall
+    // velocity (refreshDeviceInterTurbulenceGeometry). MEASURED on waves/waveMakerPiston `pistonSST`,
+    // thirty steps of 0.01: the device arm went from alpha 4.2494e-08, p_rgh 4.2660e-08, U 1.7353e-05
+    // to the host's own floor. Each of the three terms is load-bearing on its own -- V for V0 reads
+    // 1.8155e-05, a relative divU 4.4704e-05, and the stale wall distance is the fail-proof the gate
+    // carries. What is still refused is a moving mesh under LES kEqn (the filter width moves with the
+    // volumes and the LES closure does not refresh it) and one carrying a coupled pair or an AMI,
+    // both by name below.
+    if (f.turbulence.on
+     && f.dynamicMesh
+     && f.turbulence.model == cpu::interFoam::InterRasModel::KEqnLES)
         throw std::runtime_error(
-            "brae interFoam (device): the case runs a RAS closure AND moves its mesh. Two of the "
-            "moving-mesh terms are ported (kOmegaSST's ddt V0 and its absolute-flux divU) and they are "
-            "not enough -- `pistonSST` reads U 1.7e-05 on the device against 1.2e-10 on the host, with "
-            "the wall distance the likely third term. Run without -device.");
+            "brae interFoam (device): the case runs LES kEqn AND moves its mesh. kEqn's filter width "
+            "is LESdelta::compute over the cell volumes and the device closure takes it once at "
+            "start-up (DeviceInterTurbulence::lesDelta); on a moving mesh it would keep the width the "
+            "cells had before the first step. The RAS closures carry the move. Run without -device.");
 
     // fvOptions: the device loop applies explicitPorositySource/DarcyForchheimer on U and THE MANGROVE
     // PAIR -- multiphaseMangrovesSource on U, multiphaseMangrovesTurbulenceModel on k and epsilon under
@@ -1869,6 +1860,20 @@ RunReport runInterFoamDevice(
                 // the patch geometry moved with the cells, and dbU carries the patch deltas and
                 // normals every boundary evaluation reads
                 dbU = buildDeviceVectorBoundary(f.U, fvp, g);
+                // EVERY DISTANCE THE CLOSURE HOLDS WAS MEASURED ON THE OLD MESH. OpenFOAM's wallDist
+                // and nearWallDist are MeshObjects that fvMesh::movePoints updates; this loop ran
+                // neither, on either closure path, so kOmegaSST's F1/F2 blended on the distance the
+                // cells had at time zero and every wall function read a y the wall had moved away
+                // from. The host block goes first -- moveInterTurbulence re-runs wallDist's own
+                // method on the moved points -- and the device arrays follow it.
+                if (f.turbulence.on)
+                {
+                    moveInterTurbulence(f.turbulence, m, g, fvp);
+                    if (deviceClosure)
+                    {
+                        refreshDeviceInterTurbulenceGeometry(dTurb, f.turbulence, f.U, m, g, fvp);
+                    }
+                }
                 // CorrectPhi and makeRelative rewrote phi on the host -- but ONLY under `correctPhi`
                 // (interFoam.C:130, and interMeshUpdate does nothing to phi without it). Taking the
                 // host's phi unconditionally overwrote the flux THIS loop had just computed with a

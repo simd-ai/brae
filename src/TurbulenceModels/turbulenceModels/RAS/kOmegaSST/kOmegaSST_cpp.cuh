@@ -51,6 +51,7 @@
 #include "ldu_matrix.cuh"
 #include "fvm.cuh"
 #include "fvc.cuh"
+#include "crank_nicolson_ddt_scheme_cpp.cuh"
 #include "fv_matrix_ops.cuh"
 #include "smooth_solver_cpp.cuh"   // LinearSolverChoice, SolverPerformance
 #include <vector>
@@ -205,6 +206,17 @@ struct Compressible
     // (kEpsilon_cpp.cuh Compressible).
     const std::vector<scalar>*              V0       = nullptr;
     const SurfaceScalarField*               meshPhi  = nullptr;
+    // ...or CRANKNICOLSON (crank_nicolson_ddt_scheme_cpp.cuh) in Euler's place: the scheme's clock,
+    // each equation's own ddt0 field kept by the caller across the run, and the old-old level of each
+    // field (psi.oldTime() is still the field at entry, as under Euler). With `cn` set rDeltaT is not
+    // read. kOmegaSSTBase takes fvm::ddt through ddtSchemes at :572 and :602, so a case naming
+    // CrankNicolson gets it on both equations. The kEpsilon port carries the same six members.
+    const fv::CrankNicolsonClock*           cn         = nullptr;
+    fv::CrankNicolsonDdt0<scalar>*          cnDdt0Omega = nullptr;
+    fv::CrankNicolsonDdt0<scalar>*          cnDdt0K     = nullptr;
+    const std::vector<scalar>*              rhoOO       = nullptr;
+    const std::vector<scalar>*              omegaOO     = nullptr;
+    const std::vector<scalar>*              kOO         = nullptr;
 };
 
 // kOmegaSSTLM's three virtual overrides of this model, supplied by the DERIVED model rather than

@@ -28,6 +28,31 @@ std::vector<scalar> patchValuesOf(
     return v;
 }
 
+// GeometricField::storeOldTimes for the closure's fields under CrankNicolson: the old-old level is
+// rotated ONCE per time index, and at the first step oldTime().oldTime() is a copy of oldTime() --
+// OpenFOAM creates the missing level lazily. `second` is false under LES kEqn, which solves k alone.
+// One function for all three closures so they cannot drift on when the rotation happens.
+void rotateCnOldOld(
+    DeviceInterTurbulence& d,
+    const cpu::fv::CrankNicolsonClock& cn,
+    bool second)
+{
+    if (d.cnTimeIndex == cn.timeIndex) return;
+    if (d.cnKEntry.size() == 0)
+    {
+        deviceCopy(d.cnKOO, d.k);
+        if (second) deviceCopy(d.cnEpsOO, d.epsilon);
+    }
+    else
+    {
+        deviceCopy(d.cnKOO, d.cnKEntry);
+        if (second) deviceCopy(d.cnEpsOO, d.cnEpsEntry);
+    }
+    deviceCopy(d.cnKEntry, d.k);
+    if (second) deviceCopy(d.cnEpsEntry, d.epsilon);
+    d.cnTimeIndex = cn.timeIndex;
+}
+
 } // namespace
 
 
@@ -297,6 +322,65 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
 }
 
 
+void refreshDeviceInterTurbulenceGeometry(
+    DeviceInterTurbulence& d,
+    const cpu::interFoam::InterTurbulence& t,
+    const GeometricField<vector>& U,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    if (!t.on) return;
+    const bool sst = (t.model == cpu::interFoam::InterRasModel::KOmegaSST);
+    const bool les = (t.model == cpu::interFoam::InterRasModel::KEqnLES);
+    const GeometricField<scalar>& second = sst ? t.omega : t.epsilon;
+
+    // The SAME predicate the build walked, recomputed rather than stored: a stored copy is one more
+    // thing that can go stale, and the two walks have to agree face for face or the arrays below
+    // index each other wrongly.
+    std::vector<char> wfPatch(patches.size(), 0);
+    for (std::size_t pi = 0; pi < patches.size() && !les; ++pi)
+    {
+        wfPatch[pi] = second.boundary[pi]->isTurbulenceWallFunction() ? 1 : 0;
+    }
+
+    // The wall faces' y, deltaCoeffs and wall velocity. The wall velocity comes from the host U as it
+    // stands, which is what the build took and what this driver's dbU is rebuilt from after a move.
+    d.wall = buildDeviceWallData(m, g, patches, U, wfPatch);
+
+    // ...and the per-boundary-face near-wall distance the nut and epsilon/omega wall functions read.
+    const std::vector<std::vector<scalar>> yW = nearWallDist(m, g, patches);
+    std::vector<scalar> yBnd;
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (isCoupledInterfaceType(patches[pi].type)) continue;
+        const bool isWF = isTurbWallPatch(patches, pi, wfPatch);
+        for (label i = 0; i < patches[pi].size; ++i)
+        {
+            yBnd.push_back(isWF ? yW[pi][i] : scalar(0));
+        }
+    }
+    if (yBnd.size() != d.wallYBndFace.size())
+        throw std::runtime_error(
+            "brae interFoam (device): the mesh move changed the boundary-face count of the turbulence "
+            "closure (" + std::to_string(d.wallYBndFace.size()) + " -> " + std::to_string(yBnd.size())
+            + "). A move keeps the topology fixed; this is a topology change.");
+    d.wallYBndFace.copyFrom(yBnd);
+
+    // kOmegaSST's CELL wall distance, which F1 and F2 blend on. The host block's moveInterTurbulence
+    // has already re-run wallDist's method on the moved points; this uploads what it produced.
+    if (sst)
+    {
+        if (t.yCell.size() != d.yCell.size())
+            throw std::runtime_error(
+                "brae interFoam (device): the host wall distance is " + std::to_string(t.yCell.size())
+                + " cells and the device holds " + std::to_string(d.yCell.size())
+                + "; moveInterTurbulence did not run on this mesh.");
+        d.yCell.copyFrom(t.yCell);
+    }
+}
+
+
 namespace {
 
 // nutBnd[f] = evaluated[f] on the inletOutlet faces alone: every other face carries what the closure
@@ -392,6 +476,20 @@ void deviceCorrectInterTurbulence(
         lin.delta = &d.lesDelta;
         lin.rDeltaT = scalar(1) / in.deltaT;
         lin.co = t.lesCoeffs;
+        // THE PAIR, as the two RAS branches carry it. One flux: this lineage is the uniform one, and
+        // k convects with the volumetric phi like every other equation on it.
+        lin.cyc    = in.cyc;
+        lin.cycPhi = in.cycPhi;
+        // ...and fvm::ddt(k) under CrankNicolson, with k's old-old level rotated once per time index.
+        // alpha = rho = 1 in this lineage, so there is no rho old-old to carry.
+        if (in.cn)
+        {
+            rotateCnOldOld(d, *in.cn, /*second=*/false);
+            d.cnDdt0K.name = "ddt0(k)";
+            lin.cn      = in.cn;
+            lin.cnDdt0K = &d.cnDdt0K;
+            lin.kOO     = &d.cnKOO;
+        }
         const cpu::interFoam::SmoothLinearSolve& ks = t.kSolveFinal;
         lin.symmetric = (ks.smoother == "symGaussSeidel");
         lin.nSweeps = ks.nSweeps;
@@ -431,14 +529,31 @@ void deviceCorrectInterTurbulence(
         sin.phiBnd = in.phiBnd;
         sin.phiByRhoInt = in.phiInt;
         sin.phiByRhoBnd = in.phiBnd;
-        // THE PAIR. The kEpsilon branch below hands the closure the coupled pair (kin.cyc) and it is
-        // gated across it (validation/interFoamCyclic); this closure takes no pair, and its own refusal
-        // (kOmegaSST.cu refuseUnsupported) keys on `hasCoupledPatches` -- a flag rhoSimpleFoam's hook
-        // sets and this site never did. The case reader refuses a pair under any RAS model but kEpsilon
-        // before this runs (inter_case_cpp.cu), so nothing reached the gap; the flag is set so that
-        // lifting that refusal cannot leave the pair contributing nothing to k and omega. Found by
-        // tools/default_audit.py (tests/interfoam_refusals.sh `device_baffle_SST`).
-        sin.hasCoupledPatches = (in.cyc && in.cyc->n > 0);
+        // THE PAIR, exactly as the kEpsilon branch below hands it: the off-diagonal for the transport
+        // matrix and for the solve, and the flux each equation convects with on those faces. This
+        // closure refused a pair outright until the five sites the kEpsilon closure carries were
+        // transcribed into it -- grad(U), the two divergences, each equation's gammaCell, and the
+        // solve's interface -- so `hasCoupledPatches` is no longer set here. The uniform lineage has
+        // one flux, so the volumetric and the equation's are the same array.
+        sin.cyc         = in.cyc;
+        sin.cycPhi      = in.cycPhi;
+        sin.cycPhiByRho = in.cycPhi;
+        // ...and fvm::ddt under CrankNicolson on BOTH equations, which is how kOmegaSSTBase takes it
+        // (ddtSchemes at :572 and :602). The second field is omega here and lives in the kEpsilon
+        // slots -- d.epsilon, d.cnEpsOO, d.cnDdt0Eps -- as every other slot on this branch does.
+        if (in.cn)
+        {
+            rotateCnOldOld(d, *in.cn, /*second=*/true);
+            d.cnDdt0K.name   = "ddt0(k)";
+            d.cnDdt0Eps.name = "ddt0(omega)";
+            sin.cn          = in.cn;
+            sin.cnDdt0K     = &d.cnDdt0K;
+            sin.cnDdt0Omega = &d.cnDdt0Eps;
+            sin.kOO         = &d.cnKOO;
+            sin.omegaOO     = &d.cnEpsOO;
+            // the uniform lineage: rho is 1 at every level, and the variable one is refused below
+            sin.rhoOOCell   = &d.onesCell;
+        }
         sin.rhoCell = &d.onesCell;
         sin.rhoBndFace = &d.onesBnd;
         sin.rhoOldCell = &d.onesCell;
@@ -628,22 +743,7 @@ void deviceCorrectInterTurbulence(
     // -- and hand the closure its two ddt0 fields
     if (in.cn)
     {
-        if (d.cnTimeIndex != in.cn->timeIndex)
-        {
-            if (d.cnKEntry.size() == 0)
-            {
-                deviceCopy(d.cnKOO, d.k);
-                deviceCopy(d.cnEpsOO, d.epsilon);
-            }
-            else
-            {
-                deviceCopy(d.cnKOO, d.cnKEntry);
-                deviceCopy(d.cnEpsOO, d.cnEpsEntry);
-            }
-            deviceCopy(d.cnKEntry, d.k);
-            deviceCopy(d.cnEpsEntry, d.epsilon);
-            d.cnTimeIndex = in.cn->timeIndex;
-        }
+        rotateCnOldOld(d, *in.cn, /*second=*/true);
         d.cnDdt0K.name = t.variableDensity ? "ddt0(rho,k)" : "ddt0(k)";
         d.cnDdt0Eps.name = t.variableDensity ? "ddt0(rho,epsilon)" : "ddt0(epsilon)";
         kin.cn = in.cn;

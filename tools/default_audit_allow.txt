@@ -173,9 +173,16 @@ Compressible sc nutPhi          # same
 #   rhoSimpleFoam : any ddt but steadyState and Euler is refused by name, CrankNicolson among them --
 #                   "brae: fvSchemes ddtSchemes default is `...` ... backward and CrankNicolson have
 #                   coefficients that this closure port does not yet take" (scheme_parse.cuh:304-310)
-#   interFoam SST : "this closure carries Euler only" (inter_turbulence_cpp.cu:418-421), the case
-#                   reader refusing any non-Euler ddt under kOmegaSST
-#   the two validateTurbulence sites (593, 602) run correctNut ONLY -- no ddt at all
+#   interFoam SST : the LIVE site sets the family now -- kOmegaSST and LES kEqn take CrankNicolson
+#                   (gated, interfoam_cn_vs_openfoam `cnSST`/`cnLES`), and the refusal this entry
+#                   used to cite ("this closure carries Euler only") is lifted. What is left here is
+#                   the two validateTurbulence sites (593, 602), which run correctNut ONLY -- no ddt
+#                   at all, so no scheme of any kind reaches them.
+# A NAME IS NOT A TYPE, and this block is where it bites: `Compressible` is kEpsilonRef's AND
+# kOmegaSST's, the two differ in their second field's name (cnDdt0Eps/epsOO against
+# cnDdt0Omega/omegaOO), and the tool matches a site that assigns only the shared fields to both
+# definitions. So `comp` gets lines for omega's members and `sstComp` for epsilon's; neither struct
+# has the other's field at all. Recorded rather than papered over -- see interFoam/PORT.md.
 # bcPhi is the flux a flux-conditional patch looks up when that is not the equation's own: null means
 # the equation's flux, which the struct's own note says is right wherever the equation convects with
 # what the patches read (kEpsilon_cpp.cuh:145-154 -- it is interFoam's `density variable` lineage that
@@ -198,6 +205,12 @@ Compressible sc cn
 Compressible sc cnDdt0Eps
 Compressible sc cnDdt0K
 Compressible sc rhoOO
+Compressible comp cnDdt0Omega   # kEpsilonRef::Compressible HAS NO SUCH FIELD -- see the note above; the tool cannot tell the two `Compressible` definitions apart at a site that assigns only what they share
+Compressible comp omegaOO       # same
+Compressible sstComp cnDdt0Omega  # the validateTurbulence site (593) runs correctNutField ONLY: it forms no matrix, so no fvm::ddt of any scheme reaches it
+Compressible sstComp omegaOO      # same
+Compressible sc cnDdt0Omega     # rhoSimpleFoam refuses CrankNicolson by name -- "backward and CrankNicolson have coefficients that this closure port does not yet take" (scheme_parse.cuh:304-310), ARMED in tests/rho_step_cuda_refusals.sh
+Compressible sc omegaOO         # same refusal
 Compressible sc epsOO
 Compressible sc kOO
 Compressible sc bcPhi
@@ -249,8 +262,6 @@ PressureInput pi takeUAtBoundary
 #   the gradient/limiter family at the LES site: kEqn's k convects by upwind or limitedLinear, and the
 #                  case reader refuses anything else ("neither `Gauss upwind` nor `Gauss limitedLinear
 #                  <k>`, the two the LES closure carries", inter_turbulence_cpp.cu:365-368)
-TransportScheme sc cyc
-TransportScheme sc cycPhi
 TransportScheme sc gammaCell
 TransportScheme sc bndValues
 TransportScheme sc stageTag

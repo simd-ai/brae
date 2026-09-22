@@ -122,13 +122,28 @@ DeviceSolverPerf correct(
     // divU = fvc::div(fvc::absolute(phi, U)); a static mesh, so phi itself
     DeviceBuffer<scalar> divU;
     deviceDiv(dm, *in.phiInt, *in.phiBnd, divU);
+    // ...and THE PAIR's faces, which fvc::div sums into their own cell like any other patch's. One
+    // flux here: this lineage is the uniform one, where the volumetric and the equation's coincide.
+    if (in.cyc && in.cyc->n > 0)
+    {
+        if (!in.cycPhi)
+        {
+            throw std::runtime_error(
+                "brae LES kEqn (device): the mesh has a periodic pair and the caller gave no flux "
+                "for it. The internal-face array cannot stand in for the pair's own.");
+        }
+        deviceCyclicAddDivFlux(*in.cyc, *in.cycPhi, dm.V, divU);
+    }
 
     // G = nut*(gradU && devTwoSymm(gradU)), with the nut the previous correctNut left
     // `Gauss linear` for grad(U): the only gradScheme the caller accepts on a kEqn case, and what
     // LES/nozzleFlow2D names. deviceGradU packs the tensor as OpenFOAM's column convention, which is
     // what deviceGByNuFromGradU reads.
     DeviceBuffer<scalar> gradU, gByNu, G;
-    deviceGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, gradU, /*ami=*/nullptr, /*cyc=*/nullptr);
+    // ...WITH THE PAIR, which fvc::grad sums like any other patch's: the production term reads this
+    // gradient in the pair's own cells, where a gradient built without it is the gradient of a field
+    // with a wall there.
+    deviceGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, gradU, /*ami=*/nullptr, in.cyc);
     deviceGByNuFromGradU(gradU, nC, gByNu);
     deviceHadamard(G, nut, gByNu);
 
@@ -157,12 +172,38 @@ DeviceSolverPerf correct(
     sc.limiterCoeff       = in.co.limitedLinearCoeff;
     sc.correctedLaplacian = in.co.correctedLaplacian;
     sc.snGradLimitCoeff   = in.co.snGradLimitCoeff;
+    // THE PAIR: its off-diagonal, the flux k convects with there, and the diffusivity as a CELL
+    // field -- a coupled face takes surfaceInterpolationScheme's pLambda*patchInternalField +
+    // pY*patchNeighbourField (:186-191), the two cells' DkEff, and gammaBnd above is built from
+    // nut's PATCH values, which is a different number there.
+    sc.cyc                = in.cyc;
+    sc.cycPhi             = in.cycPhi;
+    sc.gammaCell          = in.cyc ? &Dcell : nullptr;
     turbulence::assembleScalarTransport(M, dm, dbK, k, gammaFace, gammaBnd, sc);
 
+    // ...with the Euler fvm::ddt folded in, UNLESS the scheme is CrankNicolson: rDeltaT 0 leaves the
+    // kernel's two ddt lines inert and the scheme's own term is added below, which is the shape the
+    // kEpsilon closure uses for the same switch.
     reactionKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), in.kOld->data(), k.data(), G.data(),
-                                      divU.data(), in.delta->data(), in.rDeltaT, in.co.Ce,
+                                      divU.data(), in.delta->data(),
+                                      in.cn ? scalar(0) : in.rDeltaT, in.co.Ce,
                                       M.diag.data(), M.source.data());
     cudaCheck(cudaGetLastError(), "kEqn reaction");
+    if (in.cn)
+    {
+        // fvm::ddt(k) under CrankNicolson, "ddt0(k)". alpha = rho = 1 in this lineage, so the three
+        // density arguments are null and deviceCnFvmDdt takes its unit-density branch.
+        if (!in.cnDdt0K || !in.kOO)
+        {
+            throw std::runtime_error(
+                "brae LES kEqn (device): CrankNicolson needs k's ddt0 field and its old-old level.");
+        }
+        const DeviceBuffer<scalar>* old[1] = {in.kOld};
+        const DeviceBuffer<scalar>* oo[1]  = {in.kOO};
+        DeviceBuffer<scalar>* src[1] = {&M.source};
+        deviceCnFvmDdt(*in.cn, *in.cnDdt0K, nullptr, nullptr, nullptr,
+                       1, old, oo, dm.V, M.diag, src);
+    }
 
     turbulence::SolveControls sv;
     sv.tol = in.tol;
@@ -174,7 +215,10 @@ DeviceSolverPerf correct(
     DeviceSolverPerf perf;
     scalar residual = 0;
     turbulence::solveScalarEqn(M, k, dm, in.relaxOn, in.relax, nullptr, nullptr, nullptr, nullptr,
-                               sv, residual, std::string(), /*gs=*/true, &perf);
+                               sv, residual, std::string(), /*gs=*/true, &perf,
+                               // the pair's off-diagonal, which deviceAmul applies every sweep:
+                               // without it the solve runs a different operator from the matrix
+                               in.cyc);
 
     // bound(k, kMin), then correctNut from the bounded k -- kEqn.C:186-188 in that order
     deviceBoundField(dm, k, in.co.kMin, "k", &dbK);

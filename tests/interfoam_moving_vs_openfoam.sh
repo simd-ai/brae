@@ -264,6 +264,14 @@
 # MEASURED: k 8.6e-12, omega 2.4e-12, nut 3.0e-10, U 1.2e-10; the closure moves OpenFOAM's U by 1.9.
 # BROKEN ONCE EACH (nut): y from the wall patches 6.4e-01, V0 dropped 2.0e-03, divU relative 4.8e-03,
 # y not recomputed 9.5e-04.
+# THE DEVICE ARM RUNS THIS PROFILE TOO, and it is the only arm here with a RAS closure on a mesh that
+# moves. It took three terms, and the third is every DISTANCE the closure holds, recomputed after the
+# motion: wallDist::New(mesh).y() for F1/F2, nearWallDist for the wall functions, and DeviceWallData's
+# own y, deltaCoeffs and wall velocity (refreshDeviceInterTurbulenceGeometry, called after the host
+# block's moveInterTurbulence). MEASURED, device: alpha 3.8e-12, p_rgh 3.7e-12, U 3.4e-10, Uf 3.3e-10,
+# all four bounded BY THE HOST ARM and not by a constant.
+# BROKEN ONCE, on the device arm: the refresh skipped (the host's kept, so this is the device's own
+# stale distance and nothing else) -- alpha 4.2494e-08, p_rgh 4.2660e-08, U 1.7353e-05, 4 failures.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_moving_vs_openfoam"

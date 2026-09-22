@@ -46,6 +46,19 @@ const scalar B_U_DEV = 2e-09;
 const scalar B_ALPHA_DEV_HOST = 1.5e-09;
 const scalar B_PRGH_DEV_HOST = 6e-10;
 const scalar B_U_DEV_HOST = 2e-09;
+// THE CLOSURE'S OWN FIELDS on the `sst` and `les` profiles. MEASURED, ten steps: `sst` k 4.8e-13,
+// omega 8.8e-14, nut 2.4e-12; `les` k 1.8e-13, nut 1.8e-13. The bound is 4x the worst of those and
+// not the usual 30x, BECAUSE IT HAS TO WITNESS THE DEFECT IT WAS WRITTEN FOR: rebuilding DkEff on the
+// pair's faces from the patch's own nut instead of keeping fvc::interpolate's value reads k 1.3e-11,
+// omega 4.7e-11 and nut 7.7e-11, every one of which passes at 1e-10. Both arms are host runs of a
+// fixed mesh from a fixed start, so there is no run-to-run spread to leave room for.
+const scalar B_TURB = 1e-11;
+// ...and the DEVICE arm's. MEASURED, ten steps: `sst` k 2.4e-11, omega 7.0e-12, nut 5.0e-10; `les`
+// k and nut both 1.3e-11. The bound is 10x the worst, and it WITNESSES every way the pair has been
+// dropped inside a closure so far: k 4.8e-05 / omega 6.7e-04 / nut 3.6e-03 with CDkOmega's two
+// gradients built without the interface, and k 4.3e-01 / nut 2.8e-01 (and U 8.7e-03) with the LES
+// closure handed no pair at all.
+const scalar B_TURB_DEV = 5e-09;
 // THE `outer` PROFILE'S ARE LOOSER, and the reason is the stopping point and not the loop. Three
 // PIMPLE outer correctors run the p_rgh solve three times as often, each starting from where the last
 // one stopped, so the case's own `tolerance 1e-12` is reached three times per step and its slack
@@ -126,6 +139,18 @@ int main(
     const std::string profile = (argc > 7) ? argv[7] : "MULESCorr";
     const bool jumpProfile = (profile == "jump");
     const bool outerProfile = (profile == "outer");
+    // A CLOSURE ACROSS THE PAIR. `sst` is kOmegaSST with the wall-function family on the walls,
+    // `les` is kEqn with the filter width the fixture's uniform cells give. The closure is what is
+    // under test in those two, so its OWN fields are compared and not only the three the other
+    // profiles share: a defect confined to k reaches U through nuEff alone and arrives divided by the
+    // Reynolds number.
+    const bool sstProfile = (profile == "sst" || profile == "sstCN");
+    const bool lesProfile = (profile == "les" || profile == "lesCN");
+    const bool turbProfile = sstProfile || lesProfile;
+    // ...and the two CRANKNICOLSON profiles, whose control is the SAME case under Euler rather than a
+    // walled pair: what they measure is that the scheme reaches the closure's own ddt and not only
+    // the loop's.
+    const bool cnProfile = (profile == "sstCN" || profile == "lesCN");
 
     std::printf("  profile: %s\n", profile.c_str());
     PrimitiveMesh m;
@@ -197,8 +222,18 @@ int main(
     // ...and with THREE outer correctors the same collapse happens three times per step, so the worst
     // over the run is 1.88e-06 where one corrector reads 1.64e-08. The ITERATION COUNTS are exact in
     // both -- 90 of 90 here -- which is what discriminates.
-    failures += brae::gatecheck::compareSolves("host", r.pSolves, ofP, nSteps, "p_rgh",
-                                               scalar(5e-7), outerProfile ? scalar(6e-5) : scalar(5e-7));
+    // ...and the two CLOSURE profiles go one order deeper again, for the same reason and no other.
+    // A closure raises nuEff, so the momentum matrix is better conditioned and the third corrector
+    // starts from further down: OpenFOAM's step-one solves are 1 / 1.066e-06 / 2.071e-09 under
+    // kOmegaSST and 1 / 7.785e-07 / 1.075e-09 under kEqn, where the laminar case reads
+    // 1 / 9.916e-08 / 7.359e-12. The worst difference on those is 8.155e-07 and 2.096e-06 RELATIVE,
+    // which is 1.69e-15 and 2.25e-15 ABSOLUTE -- one or two ulp of the O(1) the residual is
+    // normalised to, on both arms of both profiles. The ITERATION COUNTS are what discriminates and
+    // they are exact: 30 of 30 on each.
+    const scalar stepOneBound = turbProfile ? scalar(5e-6) : scalar(5e-7);
+    failures += brae::gatecheck::compareSolves(
+        "host", r.pSolves, ofP, nSteps, "p_rgh", stepOneBound,
+        outerProfile ? scalar(6e-5) : stepOneBound);
 
     failures += brae::gatecheck::nonFinite("brae alpha", fin.alpha1.internal);
     failures += brae::gatecheck::nonFinite("brae p_rgh", fin.p_rgh.internal);
@@ -216,6 +251,36 @@ int main(
     check("alpha agrees with OpenFOAM's absolutely", dA.linf < B_ALPHA);
     check("p_rgh agrees with OpenFOAM's relatively", dP.rel() < B_PRGH);
     check("U agrees with OpenFOAM's relatively", dU.rel() < B_U);
+
+    // ...AND THE CLOSURE'S OWN FIELDS, where the profile has one. k, omega and nut are read from
+    // OpenFOAM's write and from brae's turbulence block, which is where the host closure leaves them.
+    if (turbProfile)
+    {
+        check("brae built the closure this profile asks for", fin.turbulence.on);
+        failures += brae::gatecheck::nonFinite("brae k", fin.turbulence.k.internal);
+        const std::vector<scalar> ofK = readCells(ofDir + "/k");
+        const Diff dK = compare(fin.turbulence.k.internal, ofK);
+        std::printf("  k:       relative %.4e   (k up to %.4e)\n", (double)dK.rel(), (double)dK.refMax);
+        check("k agrees with OpenFOAM's relatively", dK.rel() < B_TURB);
+        const std::vector<scalar> ofNut = readCells(ofDir + "/nut");
+        const Diff dN = compare(fin.turbulence.nut.internal, ofNut);
+        std::printf("  nut:     relative %.4e   (nut up to %.4e)\n", (double)dN.rel(), (double)dN.refMax);
+        check("nut agrees with OpenFOAM's relatively", dN.rel() < B_TURB);
+        if (sstProfile)
+        {
+            const std::vector<scalar> ofW = readCells(ofDir + "/omega");
+            const Diff dW = compare(fin.turbulence.omega.internal, ofW);
+            std::printf("  omega:   relative %.4e   (omega up to %.4e)\n",
+                        (double)dW.rel(), (double)dW.refMax);
+            check("omega agrees with OpenFOAM's relatively", dW.rel() < B_TURB);
+        }
+        // ...and the closure is not inert here: OpenFOAM's own nut has to be doing something to the
+        // momentum, or every number above would pass with the closure's convection dropped.
+        scalar nutMax = 0;
+        for (const scalar v : ofNut) nutMax = std::fmax(nutMax, std::fabs(v));
+        std::printf("  OpenFOAM's own nut reaches %.4e against a laminar nu of 1e-06\n", (double)nutMax);
+        check("the closure is live on this fixture", nutMax > scalar(1e-7));
+    }
 
     // THE FIXTURE CARRIES SOMETHING ACROSS THE PAIR, in OpenFOAM's own numbers: without a flux there
     // the coupling could be dropped entirely and every comparison above would still pass.
@@ -245,11 +310,13 @@ int main(
     const Diff cU = compare(wU, ofU);
     std::printf("  CONTROL: OpenFOAM with %s: alpha %.4e, U relative %.4e\n",
                 outerProfile ? "nOuterCorrectors 1 (this case has 3)"
-                             : (jumpProfile ? "the pair a PLAIN CYCLIC (no jump)" : "the pair two WALLS"),
+                : (cnProfile ? "the Euler ddt (this case runs CrankNicolson 0.9)"
+                : (jumpProfile ? "the pair a PLAIN CYCLIC (no jump)" : "the pair two WALLS")),
                 (double)cA.linf, (double)cU.rel());
     check(outerProfile ? "the OUTER CORRECTORS move OpenFOAM's own alpha far more than brae is from it"
+          : (cnProfile ? "CRANKNICOLSON moves OpenFOAM's own alpha far more than brae is from it"
           : (jumpProfile ? "the JUMP moves OpenFOAM's own alpha far more than brae is from it"
-                         : "walling the pair moves OpenFOAM's own alpha far more than brae is from it"),
+                         : "walling the pair moves OpenFOAM's own alpha far more than brae is from it")),
           cA.linf > scalar(1000)*std::fmax(dA.linf, scalar(1e-16)));
     check("...and its U", cU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-16)));
 
@@ -266,7 +333,20 @@ int main(
         cudaGetLastError();
         nDev = 0;
     }
-    if (nDev <= 0)
+    // ...AND ON THE TWO CLOSURE PROFILES, which is what makes them worth running twice: kOmegaSST and
+    // LES kEqn refused a pair on the device until the five sites the kEpsilon closure carries were
+    // transcribed into them.
+    // ...NOT on the two CRANKNICOLSON profiles, and not because of the closure: the device loop
+    // refuses CrankNicolson's end-of-step alpha flux across a COUPLED PAIR by name, which is a
+    // property of the alpha step and not of k's ddt. The DEVICE arm of those two closures under the
+    // scheme is held by tests/interfoam_cn_vs_openfoam.sh (`cnSST`, `cnLES`), on a mesh with no pair.
+    if (nDev > 0 && cnProfile)
+    {
+        std::printf("  (the device loop refuses CrankNicolson across a coupled pair; its arm for this "
+                    "closure under the scheme is interfoam_cn_vs_openfoam %s)\n",
+                    sstProfile ? "cnSST" : "cnLES");
+    }
+    else if (nDev <= 0)
     {
         std::printf("  (no CUDA device: the device arm is not exercised)\n");
     }
@@ -290,6 +370,29 @@ int main(
         check("the device's alpha agrees with OpenFOAM's absolutely", eA.linf < bA);
         check("the device's p_rgh agrees with OpenFOAM's relatively", eP.rel() < bP);
         check("the device's U agrees with OpenFOAM's relatively", eU.rel() < bU);
+        // ...and THE CLOSURE'S OWN FIELDS, which is where a pair dropped inside the closure shows
+        // first: k and omega reach U only through nuEff, so a gap of 1e-05 in U is a much larger one
+        // in k. Compared against OpenFOAM and printed beside the host arm's, so a reader can tell a
+        // closure defect from a loop defect without another run.
+        if (turbProfile)
+        {
+            const std::vector<scalar> ofK = readCells(ofDir + "/k");
+            const std::vector<scalar> ofNut = readCells(ofDir + "/nut");
+            const Diff dvK = compare(dev.turbulence.k.internal, ofK);
+            const Diff dvN = compare(dev.turbulence.nut.internal, ofNut);
+            std::printf("  device k:       relative %.4e\n", (double)dvK.rel());
+            std::printf("  device nut:     relative %.4e\n", (double)dvN.rel());
+            check("the device's k agrees with OpenFOAM's relatively", dvK.rel() < B_TURB_DEV);
+            check("...and its nut", dvN.rel() < B_TURB_DEV);
+            if (sstProfile)
+            {
+                const std::vector<scalar> ofW = readCells(ofDir + "/omega");
+                const Diff dvW = compare(dev.turbulence.omega.internal, ofW);
+                std::printf("  device omega:   relative %.4e\n", (double)dvW.rel());
+                check("...and its omega", dvW.rel() < B_TURB_DEV);
+            }
+        }
+
         // ...and against the HOST arm, which is the tighter question: the two run the same
         // discretisation, so what separates them is the port and not the scheme.
         const Diff hA = compare(dev.alpha1.internal, fin.alpha1.internal);

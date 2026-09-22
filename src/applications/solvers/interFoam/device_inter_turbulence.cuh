@@ -138,6 +138,24 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
     const FvGeometry& g,
     const std::vector<FvPatch>& patches);
 
+// THE MESH HAS MOVED: every distance the closure holds was measured on the mesh as it stood before,
+// and each one is a MeshObject OpenFOAM recomputes on a move. Call it after fvMesh::movePoints and
+// after the host block's own moveInterTurbulence, which is what refills t.yCell:
+//   wallDist::New(mesh).y()   -- per cell, F1 and F2 (wallDist is an UpdateableMeshObject,
+//                                wallDist.C:193-221)
+//   nearWallDist              -- per boundary face, every turbulence wall function's y
+//                                (nearWallDist::correct, called from fvMesh::movePoints)
+//   DeviceWallData            -- the wall faces' y, deltaCoeffs and wall velocity
+// The topology is fixed by a move, so every array keeps its length and its face order; this asserts
+// that rather than trusting it.
+void refreshDeviceInterTurbulenceGeometry(
+    DeviceInterTurbulence& d,
+    const cpu::interFoam::InterTurbulence& t,
+    const GeometricField<vector>& U,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches);
+
 struct DeviceInterTurbulenceStepInput
 {
     const DeviceBuffer<scalar>* Ux = nullptr;

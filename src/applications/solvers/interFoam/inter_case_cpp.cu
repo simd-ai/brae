@@ -1164,11 +1164,12 @@ InterFields buildInterFields(const std::string&          caseDir,
                     "case's scheme -- a ddt0 field of its own that brae's option does not keep (it forms "
                     "the Euler term). Refused rather than run one scheme under another's name.");
         }
-        if (f.turbulence.on && f.turbulence.model != InterRasModel::KEpsilon)
-            throw std::runtime_error(
-                "brae interFoam: ddtSchemes names CrankNicolson and the closure is not kEpsilon. The "
-                "kOmegaSST and LES kEqn closures form their fvm::ddt as Euler; refused rather than run "
-                "them under CrankNicolson's name.");
+        // EVERY CLOSURE FORMS THE SCHEME'S OWN fvm::ddt NOW. This refused anything but kEpsilon;
+        // kOmegaSST's two equations (kOmegaSSTBase.C:572, :602) and kEqn's one (kEqn.C:172) take
+        // fvm::ddt through ddtSchemes like every other term, and each now adds the CrankNicolson
+        // term with its Euler line left inert and keeps its own ddt0 field. Gated on
+        // validation/interFoamCyclic, profiles `sstCN` and `lesCN`, whose control is the SAME case
+        // under Euler -- on both arms.
         // a restart from a directory OpenFOAM wrote under CrankNicolson: the ddt0 fields and alphaPhi0
         // are read back there (ddt0_ with startTimeIndex -2, createAlphaFluxes.H's alphaRestart), and
         // the scheme is CrankNicolson from the first step. brae reads neither.
@@ -1281,8 +1282,14 @@ InterFields buildInterFields(const std::string&          caseDir,
                 throw std::runtime_error(who + "an active fvOption. Nothing holds the two together against OpenFOAM.");
             if (f.waves.any)
                 throw std::runtime_error(who + "a wave condition. Nothing holds the two together against OpenFOAM.");
-            if (f.turbulence.on && f.turbulence.model != InterRasModel::KEpsilon)
-                throw std::runtime_error(who + "a RAS model other than kEpsilon, the one closure carried across a cyclic.");
+            // EVERY CLOSURE THE READER BUILDS IS CARRIED ACROSS A PAIR NOW. This refused anything but
+            // kEpsilon; what it hid was that the host kOmegaSST folded the pair's boundaryCoeffs into
+            // its source (they are interface coefficients the solver multiplies by the neighbour's
+            // psi, not a constant) and rebuilt DkEff/DomegaEff on those faces from a `calculated` nut
+            // instead of keeping fvc::interpolate's value. Both are fixed and all three closures are
+            // gated on validation/interFoamCyclic -- profiles `sst` and `les`, each against its own
+            // walled control. The DEVICE closure is a separate question and refuses by name
+            // (inter_driver_device.cu).
             // THE SEGREGATED MOMENTUM SOLVE AND THE LIMITED grad(U) carry a coupled patch through the
             // interface stencil (solveVector, cellLimitedGrad) and are gated across a cyclicAMI
             // (tests/interfoam_ami_vs_openfoam.sh); across a cyclic or cyclicACMI no gate holds them

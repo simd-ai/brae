@@ -415,10 +415,10 @@ InterTurbulence readInterTurbulence(
             "and no gate holds that against OpenFOAM yet. Refused rather than run ungated.");
     // kEpsilon carries CrankNicolson too (InterTurbulenceStepInput::cn); kOmegaSST does not, and the
     // case reader has already said so by name where the two meet
-    if (!eulerDdt && t.model != InterRasModel::KEpsilon)
-        throw std::runtime_error(
-            std::string(WHO) + "the closure's two equations take fvm::ddt through ddtSchemes "
-            "(kOmegaSSTBase.C:558, :589) and this closure carries Euler only.");
+    // EVERY CLOSURE TAKES CrankNicolson NOW -- kEpsilon always did; kOmegaSST's two equations and
+    // kEqn's one take fvm::ddt through ddtSchemes (kOmegaSSTBase.C:572, :602; kEqn.C:172) and each
+    // now carries the scheme's own term with the Euler line left inert. Gated on
+    // validation/interFoamCyclic (`sstCN`, `lesCN`), both arms, against real OpenFOAM.
     t.coeffs.correctedLaplacian = laplacianCorrected;
     t.coeffs.snGradLimitCoeff = laplacianLimitCoeff;
 
@@ -637,6 +637,31 @@ void interNuEff(
 }
 
 
+// GeometricField::storeOldTimes for the closure's fields under CrankNicolson: the old-old level is
+// rotated ONCE per time index, and at the first step of a cold start oldTime().oldTime() is created
+// as a copy of oldTime() -- the scheme does not read it that step. `second` is false under LES kEqn,
+// which solves k alone. One function for all three closures so they cannot drift on when it happens.
+namespace {
+void rotateCnOldOld(
+    InterTurbulence&                   t,
+    const fv::CrankNicolsonClock&      cn,
+    bool                               second)
+{
+    InterTurbulenceCrankNicolson& c = t.cn;
+    if (c.timeIndex == cn.timeIndex) return;
+    c.kOO = c.kEntry.empty() ? t.k.internal : c.kEntry;
+    c.kEntry = t.k.internal;
+    if (second)
+    {
+        const std::vector<scalar>& sec = (t.model == InterRasModel::KOmegaSST) ? t.omega.internal
+                                                                               : t.epsilon.internal;
+        c.epsOO = c.epsEntry.empty() ? sec : c.epsEntry;
+        c.epsEntry = sec;
+    }
+    c.timeIndex = cn.timeIndex;
+}
+}
+
 void moveInterTurbulence(
     InterTurbulence&            t,
     const PrimitiveMesh&        m,
@@ -685,8 +710,17 @@ void correctInterTurbulence(
         sv.minIter = ks.minIter;
         sv.relaxOn = t.kRelaxFinal.on;
         sv.relax = t.kRelaxFinal.factor;
+        // fvm::ddt(k) under CrankNicolson, with k's old-old level rotated once per time index. This
+        // lineage is the uniform one, so there is no density at any level.
+        if (in.cn)
+        {
+            rotateCnOldOld(t, *in.cn, /*second=*/false);
+            t.cn.ddt0K.name = "ddt0(k)";
+        }
         const SolverPerformance p = LESkEqn::correct(*in.U, t.k, t.nut, *in.phi, *in.nu, *in.nuBnd, t.delta,
-                                                     in.deltaT, t.lesCoeffs, sv, m, g, patches, t.lesTaps);
+                                                     in.deltaT, t.lesCoeffs, sv, m, g, patches, t.lesTaps,
+                                                     in.cn, in.cn ? &t.cn.ddt0K : nullptr,
+                                                     in.cn ? &t.cn.kOO : nullptr);
         if (in.kLog)
         {
             in.kLog->push_back({p.initialResidual, p.finalResidual, p.nIterations});
@@ -703,6 +737,20 @@ void correctInterTurbulence(
         sstComp.nutPhi = in.phi;
         sstComp.V0 = in.V0;
         sstComp.meshPhi = in.meshPhi;
+        // ...and fvm::ddt through ddtSchemes on BOTH equations under CrankNicolson (kOmegaSSTBase.C
+        // :572 and :602). The second field is omega, and it uses the kEpsilon slots of the shared
+        // CrankNicolson block, as every other per-model slot on this branch does.
+        if (in.cn)
+        {
+            rotateCnOldOld(t, *in.cn, /*second=*/true);
+            t.cn.ddt0K.name = "ddt0(k)";
+            t.cn.ddt0Eps.name = "ddt0(omega)";
+            sstComp.cn = in.cn;
+            sstComp.cnDdt0K = &t.cn.ddt0K;
+            sstComp.cnDdt0Omega = &t.cn.ddt0Eps;
+            sstComp.kOO = &t.cn.kOO;
+            sstComp.omegaOO = &t.cn.epsOO;
+        }
         const SmoothLinearSolve& ks = t.kSolveFinal;
         const SmoothLinearSolve& os = t.omegaSolveFinal;
         if (ks.smoother != os.smoother || ks.tol != os.tol || ks.relTol != os.relTol
@@ -745,14 +793,7 @@ void correctInterTurbulence(
         // index, on the first access of the step. At the first step of a cold start oldTime().oldTime()
         // is created as a copy of oldTime(), and the scheme does not read it that step.
         InterTurbulenceCrankNicolson& c = t.cn;
-        if (c.timeIndex != in.cn->timeIndex)
-        {
-            c.kOO = c.kEntry.empty() ? t.k.internal : c.kEntry;
-            c.epsOO = c.epsEntry.empty() ? t.epsilon.internal : c.epsEntry;
-            c.kEntry = t.k.internal;
-            c.epsEntry = t.epsilon.internal;
-            c.timeIndex = in.cn->timeIndex;
-        }
+        rotateCnOldOld(t, *in.cn, /*second=*/true);
         c.ddt0K.name = t.variableDensity ? "ddt0(rho,k)" : "ddt0(k)";
         c.ddt0Eps.name = t.variableDensity ? "ddt0(rho,epsilon)" : "ddt0(epsilon)";
         comp.cn = in.cn;
