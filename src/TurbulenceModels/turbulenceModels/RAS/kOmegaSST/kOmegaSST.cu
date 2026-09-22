@@ -120,6 +120,12 @@ __global__
 void ddtKernel(
     int                        nC,
     const scalar* __restrict__ V,
+    // A MOVING MESH's OLD volumes, or null on a mesh that does not move. EulerDdtScheme::fvmDdt under
+    // mesh().moving() keeps V in the DIAGONAL and takes V0 in the SOURCE
+    // (EulerDdtScheme.C: rDeltaT*rho.oldTime()*vf.oldTime()*mesh().V0()), which is exactly what the
+    // host reference does -- kEpsilon_cpp.cu:564 and :786, `(comp && comp->V0) ? (*comp->V0)[c] : V`.
+    // Transcribed from it rather than reasoned about: the two must round the same way.
+    const scalar* __restrict__ V0,
     const scalar* __restrict__ rho,
     const scalar* __restrict__ rhoOld,
     const scalar* __restrict__ psiOld,
@@ -132,7 +138,7 @@ void ddtKernel(
     const scalar r  = rho    ? rho[c]    : scalar(1);
     const scalar r0 = rhoOld ? rhoOld[c] : r;
     diag[c]   += rDeltaT * r * V[c];
-    source[c] += rDeltaT * r0 * psiOld[c] * V[c];
+    source[c] += rDeltaT * r0 * psiOld[c] * (V0 ? V0[c] : V[c]);
 }
 
 
@@ -379,6 +385,8 @@ void correct(
         deviceCopy(kOld, k);
         deviceCopy(omegaOld, omega);
     }
+    // the moved mesh's old volumes, null on a static one -- see ddtKernel
+    const scalar* v0P = (in.V0 && in.V0->size() == static_cast<std::size_t>(nC)) ? in.V0->data() : nullptr;
     const scalar* rhoOldP = (in.rhoOldCell && in.rhoOldCell->size()) ? in.rhoOldCell->data()
                           : (in.rhoCell ? in.rhoCell->data() : nullptr);
 
@@ -440,6 +448,22 @@ void correct(
     deviceDiv(dm, *in.phiInt, *in.phiBnd, divPhi);
     if (in.phiByRhoInt && in.phiByRhoBnd) deviceDiv(dm, *in.phiByRhoInt, *in.phiByRhoBnd, divU);
     else                                  deviceCopy(divU, divPhi);
+    // ...and on a MOVING mesh that divergence is of the ABSOLUTE flux: OpenFOAM's divU is
+    // fvc::div(fvc::absolute(phi, U)) = div(phi + mesh.phi()) (kOmegaSSTBase.C, and the host
+    // reference at kEpsilon_cpp.cu:279-291 adds meshPhi face by face before taking the divergence).
+    // Added to the VOLUMETRIC flux's divergence only: `bounded`'s divPhi is the equation's own mass
+    // flux, which OpenFOAM leaves relative.
+    if (in.meshPhiInt && in.meshPhiBnd)
+    {
+        const DeviceBuffer<scalar>* vi = (in.phiByRhoInt && in.phiByRhoBnd) ? in.phiByRhoInt : in.phiInt;
+        const DeviceBuffer<scalar>* vb = (in.phiByRhoInt && in.phiByRhoBnd) ? in.phiByRhoBnd : in.phiBnd;
+        DeviceBuffer<scalar> absInt, absBnd;
+        deviceCopy(absInt, *vi);
+        deviceCopy(absBnd, *vb);
+        deviceAxpy(scalar(1), *in.meshPhiInt, absInt);
+        deviceAxpy(scalar(1), *in.meshPhiBnd, absBnd);
+        deviceDiv(dm, absInt, absBnd, divU);
+    }
 
     // ---- omegaWallFunction FIRST: OpenFOAM's order --------------------------------------------
     // kOmegaSSTBase::correct() calls omega_.boundaryFieldRef().updateCoeffs() (kOmegaSSTBase.C:541)
@@ -606,7 +630,7 @@ void correct(
                                 M.diag, M.source, in.rhoCell);
             if (in.rDeltaT > scalar(0))   // fvm::ddt(alpha, rho, omega_), kOmegaSSTBase.C:572
             {
-                ddtKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), in.rhoCell ? in.rhoCell->data() : nullptr,
+                ddtKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), v0P, in.rhoCell ? in.rhoCell->data() : nullptr,
                                              rhoOldP, omegaOld.data(), in.rDeltaT,
                                              M.diag.data(), M.source.data());
                 cudaCheck(cudaGetLastError(), "kOmegaSST omega ddt");
@@ -683,7 +707,7 @@ void correct(
                                /*gammaIntEff=*/nullptr, /*FDES=*/nullptr, in.rhoCell);
             if (in.rDeltaT > scalar(0))   // fvm::ddt(alpha, rho, k_), kOmegaSSTBase.C:602
             {
-                ddtKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), in.rhoCell ? in.rhoCell->data() : nullptr,
+                ddtKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), v0P, in.rhoCell ? in.rhoCell->data() : nullptr,
                                              rhoOldP, kOld.data(), in.rDeltaT,
                                              M.diag.data(), M.source.data());
                 cudaCheck(cudaGetLastError(), "kOmegaSST k ddt");

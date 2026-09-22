@@ -161,6 +161,14 @@ struct DeviceInterTurbulenceStepInput
     const DeviceBuffer<scalar>* nu = nullptr;
     const DeviceBuffer<scalar>* nuBnd = nullptr;
     scalar deltaT = 0;
+    // A MOVING MESH, which the closures' ddt and divU both need: the volumes the cells had BEFORE this
+    // step's move (the Euler source takes V0 while the diagonal keeps V) and the mesh flux (divU is
+    // the divergence of the ABSOLUTE flux, phi + meshPhi). Null on a mesh that does not move. The HOST
+    // closure has carried the pair since it was ported (InterTurbulenceStepInput::V0/meshPhi, gated on
+    // waves/waveMakerPiston `pistonSST`); the device arm refused a moving RAS closure until it did too.
+    const DeviceBuffer<scalar>* V0 = nullptr;
+    const DeviceBuffer<scalar>* meshPhiInt = nullptr;
+    const DeviceBuffer<scalar>* meshPhiBnd = nullptr;
     // every solve of the run, in order, for the solver-log gate
     std::vector<cpu::interFoam::LinearSolveRecord>* epsilonLog = nullptr;
     std::vector<cpu::interFoam::LinearSolveRecord>* kLog = nullptr;

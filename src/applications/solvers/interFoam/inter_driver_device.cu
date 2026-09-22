@@ -205,13 +205,22 @@ RunReport runInterFoamDevice(
     // structs (fields set at one construction site and not another), not by a case: no runnable
     // tutorial moves its mesh under a RAS closure on the device without an AMI, which is refused
     // separately. Refused until V0 and meshPhi are ported into the device closure and gated.
-    if (f.turbulence.on && f.turbulence.model != cpu::interFoam::InterRasModel::KEqnLES
-        && f.dynamicMesh)
+    // STILL REFUSED, and the refusal now says how far the port got. kOmegaSST's device kernels take
+    // TWO of the moving-mesh terms -- the Euler source reads V0 where the diagonal keeps V (ddtKernel,
+    // kOmegaSST.cu) and divU is the divergence of the ABSOLUTE flux, both transcribed from the host
+    // reference -- and that is NOT ENOUGH. MEASURED on waves/waveMakerPiston `pistonSST`, thirty steps
+    // of 0.01, with the device arm switched on: alpha 4.2494e-08, p_rgh 4.2660e-08, U 1.7353e-05
+    // against the host's 1.3849e-12, 1.4704e-12 and 1.1909e-10 on the same case. Both terms are
+    // load-bearing -- V for V0 reads 1.8155e-05 and a relative divU 4.4704e-05 -- so what is missing
+    // is a THIRD thing. The prime suspect is the wall distance: kOmegaSST's F1/F2 blends take y, the
+    // device closure takes it ONCE from the mesh as it starts (buildDeviceInterTurbulence), and
+    // OpenFOAM's wallDist is a MeshObject that is recomputed when the mesh moves.
+    if (f.turbulence.on && f.dynamicMesh)
         throw std::runtime_error(
-            "brae interFoam (device): the case runs a RAS closure AND moves its mesh. The device "
-            "closure does not take the moved mesh's old volumes (fvm::ddt's V0) or the mesh flux (the "
-            "relative phi its convection needs); the host closure does (tests/"
-            "interfoam_moving_vs_openfoam.sh `pistonSST`). Run without -device.");
+            "brae interFoam (device): the case runs a RAS closure AND moves its mesh. Two of the "
+            "moving-mesh terms are ported (kOmegaSST's ddt V0 and its absolute-flux divU) and they are "
+            "not enough -- `pistonSST` reads U 1.7e-05 on the device against 1.2e-10 on the host, with "
+            "the wall distance the likely third term. Run without -device.");
 
     // fvOptions: the device loop applies explicitPorositySource/DarcyForchheimer on U and THE MANGROVE
     // PAIR -- multiphaseMangrovesSource on U, multiphaseMangrovesTurbulenceModel on k and epsilon under
@@ -1957,6 +1966,22 @@ RunReport runInterFoamDevice(
                 ti.nu = &dStepNu;
                 ti.nuBnd = &dStepNuBnd;
                 ti.deltaT = rep.deltaT;
+                // A MOVING MESH's two terms, the pair the HOST closure has always taken
+                // (InterTurbulenceStepInput::V0/meshPhi at inter_driver_cpp.cu): the volumes the cells
+                // had BEFORE this step's move -- dV0 above, filled from dm.V before interMeshUpdate
+                // recomputes the geometry, which is OF fvMesh::movePoints:944's storeOldVol -- and the
+                // mesh flux, split back into the internal and boundary arrays the closure's deviceDiv
+                // takes (dMeshPhi is the FULL face array, as phi is).
+                DeviceBuffer<scalar> dMeshPhiI, dMeshPhiB;
+                if (dyn && dMeshPhi.size() == static_cast<std::size_t>(nFaces))
+                {
+                    const std::vector<scalar> mp = dMeshPhi.host();
+                    dMeshPhiI.copyFrom(std::vector<scalar>(mp.begin(), mp.begin() + nIf));
+                    dMeshPhiB.copyFrom(std::vector<scalar>(mp.begin() + nIf, mp.end()));
+                    ti.V0         = &dV0;
+                    ti.meshPhiInt = &dMeshPhiI;
+                    ti.meshPhiBnd = &dMeshPhiB;
+                }
                 // the second field's log is omega's under kOmegaSST, as the host driver keeps it
                 ti.epsilonLog = (f.turbulence.model == cpu::interFoam::InterRasModel::KOmegaSST)
                               ? &rep.omegaSolves : &rep.epsilonSolves;

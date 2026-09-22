@@ -222,6 +222,10 @@ int main(
                          || profile == "cylinder" || profile == "solitaryGamg"
                          || profile == "piston" || profile == "flap"
                          || profile == "multiPiston" || profile == "multiFlap");
+    // NOT `pistonSST`: a RAS closure on a moving mesh is still refused on the device. Two of its terms
+    // are ported (kOmegaSST's ddt V0 and its absolute-flux divU) and measured insufficient -- with the
+    // arm switched on this profile reads device U 1.7353e-05 against host 1.1909e-10. The refusal in
+    // inter_driver_device.cu carries the numbers and the next suspect.
     PrimitiveMesh mD;
     FvGeometry gD;
     std::vector<FvPatch> patchesD;

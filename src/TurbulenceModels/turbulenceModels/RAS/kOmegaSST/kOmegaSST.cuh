@@ -64,6 +64,15 @@ struct KOmegaSSTInput
     // rhoCell, the host closure's rhoOldAt. Same contract as KEpsilonInput's.
     scalar                      rDeltaT    = 0.0;
     const DeviceBuffer<scalar>* rhoOldCell = nullptr;
+    // A MOVING MESH. `V0` is the volume the cells had BEFORE this step's move, which OpenFOAM's Euler
+    // ddt takes in the SOURCE while the diagonal keeps V (EulerDdtScheme::fvmDdt under
+    // mesh().moving()); `meshPhiInt`/`meshPhiBnd` are the mesh flux, which makes the divU the closure's
+    // SuSp terms read the ABSOLUTE flux -- fvc::div(fvc::absolute(phi, U)) = div(phi + mesh.phi()),
+    // kOmegaSSTBase.C's divU. Null on a mesh that does not move, where both collapse to the static
+    // forms. The host reference carries the same pair as Compressible::V0 / ::meshPhi.
+    const DeviceBuffer<scalar>* V0         = nullptr;
+    const DeviceBuffer<scalar>* meshPhiInt = nullptr;
+    const DeviceBuffer<scalar>* meshPhiBnd = nullptr;
     const DeviceBuffer<scalar>* nuCell     = nullptr;    // mu(T)/rho per cell.       REQUIRED here
     const DeviceBuffer<scalar>* nuBndFace  = nullptr;    // mu_b/rho_b per bnd face.  REQUIRED here
     const DeviceBuffer<scalar>* nuWallFace = nullptr;    // the same, in WALL-face order

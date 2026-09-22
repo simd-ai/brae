@@ -452,6 +452,10 @@ void deviceCorrectInterTurbulence(
             sin.turbInletOmegaLen  = &d.turbInletEpsLen;
         }
         sin.rDeltaT = scalar(1) / in.deltaT;
+        // the moved mesh's old volumes and its flux -- see DeviceInterTurbulenceStepInput::V0
+        sin.V0         = in.V0;
+        sin.meshPhiInt = in.meshPhiInt;
+        sin.meshPhiBnd = in.meshPhiBnd;
         sin.nuCell = in.nu;
         sin.nuBndFace = in.nuBnd;
         sin.nuWallFace = &d.nuWall;
