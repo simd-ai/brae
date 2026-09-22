@@ -4,6 +4,8 @@
 #include "device_blas.cuh"
 #include "near_wall_dist.cuh"
 #include "nut_wall_function.cuh"
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <stdexcept>
 
@@ -606,12 +608,32 @@ void deviceCorrectInterTurbulence(
         sin.Uz = in.Uz;
         sin.yCell = &d.yCell;
         sin.co = t.sstCoeffs;
+        // THE CASE'S CONVECTION SCHEME for the pair, and the LIMITER's own gradient entry. Every one
+        // of these is a field this site never filled, so the device closure convected with upwind
+        // where the case said `Gauss limitedLinear <k>` and the host limited it -- the substitution
+        // this project keeps finding, and the third time this struct has had a coefficient carried
+        // twice. `limGradK`/`limGradLeastSq` are the gradient the LIMITER takes (the host hands
+        // divWithScheme co.gradKLimitK/gradKLeastSq); they are the same fvSchemes entry as
+        // co.gradKLimitK below, and the closure refuses the two disagreeing.
+        sin.limitedLinear   = t.closureLimitedLinear;
+        sin.limiterCoeff    = t.closureLimiterCoeff;
+        sin.limGradK        = t.sstCoeffs.gradKLimitK;
+        sin.limGradLeastSq  = t.sstCoeffs.gradKLeastSq;
         // ...and the CONVECTION scheme. The host closure runs `Gauss limitedLinear <k>` and is gated
         // on it (RAS/waterChannel `limitedLinear`, fields at 7.2e-12); the DEVICE closure is not.
         // MEASURED on that same profile with the device arm on: k 1.4724e-05, omega 1.7822e-04,
         // nut 1.6747e-05, while alpha, p_rgh and U sit at round-off -- so it is the closure, and it
         // is NOT the limiter's bit-flip, which the host carries too and which costs it 7.2e-12.
-        if (t.closureLimitedLinear)
+        // BRAE_SST_DIAG_LIMITED bypasses the refusal below FOR DIAGNOSIS ONLY and says so on every
+        // run that sets it. It exists because localising this needs the device to assemble the matrix
+        // it is refused for; it is not a way to run the scheme.
+        if (t.closureLimitedLinear && std::getenv("BRAE_SST_DIAG_LIMITED"))
+        {
+            std::printf("  *** BRAE_SST_DIAG_LIMITED: the device closure's `Gauss limitedLinear` "
+                        "refusal is BYPASSED. Its omega convection is wrong (18,619 of 79,800 faces "
+                        "against the host). Diagnostic only -- the answer is not to be trusted. ***\n");
+        }
+        if (t.closureLimitedLinear && !std::getenv("BRAE_SST_DIAG_LIMITED"))
         {
             sin.hasNonUpwindDivScheme = true;
             sin.divSchemeUnsupported =
@@ -678,8 +700,11 @@ void deviceCorrectInterTurbulence(
     kin.cyc         = in.cyc;
     kin.cycPhiByRho = in.cycPhi;
     kin.bcPhiBnd = in.phiBnd;
+    // ...and the same for kEpsilon's device closure.
+    kin.limitedLinear  = t.closureLimitedLinear;
+    kin.limiterCoeff   = t.closureLimiterCoeff;
     // ...and the same for kEpsilon's device closure, which has no gate for the scheme either.
-    if (t.closureLimitedLinear)
+    if (t.closureLimitedLinear && !std::getenv("BRAE_SST_DIAG_LIMITED"))
     {
         kin.hasNonUpwindDivScheme = true;
         kin.divSchemeUnsupported = "Gauss limitedLinear on the device kEpsilon closure: ungated";

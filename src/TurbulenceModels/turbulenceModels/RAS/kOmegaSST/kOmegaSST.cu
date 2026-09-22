@@ -363,6 +363,20 @@ void dumpTerms(const char* fieldName, int nC, const DeviceBuffer<scalar>& field,
     };
     std::printf("  [sst] %-5s |upper| %.10g  |lower| %.10g  |iC| %.10g  |bC| %.10g\n",
                 fieldName, l2(M.upper), l2(M.lower), l2(M.iC), l2(M.bC));
+    // ...and the off-diagonals FACE BY FACE, in the same one-value-per-line form the host capture
+    // writes (inter_turbulence_cpp.cu's captureStages block). A norm says the two differ; only the
+    // faces say which, and on this closure the answer has twice been a handful of faces out of
+    // eighty thousand.
+    auto dumpVec = [&](const char* suffix, const DeviceBuffer<scalar>& b)
+    {
+        char fn2[512];
+        std::snprintf(fn2, sizeof fn2, "%s/%s_%s_%04d", termDir, fieldName, suffix, myCall);
+        std::ofstream o2(fn2);
+        o2.precision(17);
+        for (const scalar v : b.host()) o2 << v << "\n";
+    };
+    dumpVec("upper", M.upper);
+    dumpVec("lower", M.lower);
 }
 
 } // namespace
@@ -709,6 +723,17 @@ void correct(
         deviceInterpolate(dm, DomegaEff, gammaFace);
 
         PressureMatrix M;
+        // the boundary the LIMITER's gradient will read, dumped beside the host's `omegaB_*`
+        if (sd.on && omegaBndLast.size()) sd.scalars("omegaBndLast", omegaBndLast.host());
+        if (sd.on)
+        {
+            sd.scalars("omegaAsm", omega.host());
+            const std::vector<scalar> hx = ogx.host(), hy = ogy.host(), hz = ogz.host();
+            std::vector<scalar> flat(hx.size()*3);
+            for (std::size_t c = 0; c < hx.size(); ++c)
+            { flat[c*3+0]=hx[c]; flat[c*3+1]=hy[c]; flat[c*3+2]=hz[c]; }
+            sd.components("gradOmega", flat, 3);
+        }
         turbulence::TransportScheme scOmega = sc;
         scOmega.bndValues = omegaBndLast.size() ? &omegaBndLast : nullptr;
         // the pair's diffusivity is DomegaEff's two CELLS interpolated, which is what
@@ -811,6 +836,7 @@ void correct(
         if (in.phiBnd) deviceUpdateInletOutlet(dbK, *in.phiBnd);
 
         PressureMatrix M;
+        if (sd.on && kBndLast.size()) sd.scalars("kBndLast", kBndLast.host());
         turbulence::TransportScheme scK = sc;
         scK.bndValues = kBndLast.size() ? &kBndLast : nullptr;
         scK.gammaCell = in.cyc ? &DkEff : nullptr;   // as scOmega.gammaCell, k's own DEff
