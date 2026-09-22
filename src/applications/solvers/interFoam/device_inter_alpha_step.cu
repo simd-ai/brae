@@ -140,11 +140,21 @@ void deviceInterAlphaStep(
         li.deltaT    = dtSub;
         li.MULESCorr = ctl.MULESCorr;
 
-        // alphaEqn.H:97 -- alpha1 is reset to the sub-step's old time ONCE per sub-step, not once per
-        // corrector. `alpha` is the sub-cycle's output buffer; it is written here rather than aliased
-        // to alpha1, so this lambda never assumes the two are the same object.
-        alpha.resize(static_cast<std::size_t>(nC));
-        cudaMemcpy(alpha.data(), subOld.data(), sizeof(scalar)*nC, cudaMemcpyDeviceToDevice);
+        // alpha1 COMES IN AS IT STANDS AND IS NOT RESET TO ITS OLD TIME -- the host reference's rule
+        // (alpha_eqn_cpp.cu, alphaEqnStep), which alphaEqn.H has no assignment to contradict: the old
+        // time enters through the pre-solve's ddt source and MULES' psi.oldTime(), and the CURRENT
+        // alpha1 is the pre-solve's initial guess and the field alphaPhiUn is built from. With one outer
+        // corrector the two are the same field, which is how a `cudaMemcpy(alpha, subOld)` here passed
+        // every gate. With `nOuterCorrectors 2` OpenFOAM's second pass starts from the first pass's
+        // result: MEASURED on RAS/damBreak with nOuterCorrectors 2, two steps, the second pass's first
+        // p_rgh residual 1.2e-06 from OpenFOAM's (the host's 1e-12), k 6.7e-06 and U 2.0e-06 after
+        // two steps -- and the same numbers under CrankNicolson, which is where it was found. In a
+        // sub-cycle `alpha` already holds the previous sub-step's result (deviceAlphaEqnSubCycle
+        // carries it), so nothing is copied on that path either.
+        if (alpha.size() != static_cast<std::size_t>(nC))
+            throw std::runtime_error(
+                "brae interFoam device alpha step: alpha1 must arrive one value per cell; the step "
+                "continues from it and does not reset it.");
         // patch values only -- NOT a mixture.correct(); see DeviceInterAlphaHooks::refreshBoundary
         if (hooks.refreshBoundary)
         {
@@ -182,7 +192,7 @@ void deviceInterAlphaStep(
             {
                 hooks.updateModelledBoundary(subCycle, alpha, alpha1Bnd);
             }
-            hooks.divCoeffs(alpha, iC, bC);
+            hooks.divCoeffs(alpha, iC, bC, (li.phiCNBnd != li.phiBnd) ? li.phiCNBnd : nullptr);
             DeviceSolverPerf pre;
             deviceAlphaPreSolve(dm, alpha, subOld, *li.phiCNInt, iC, bC, dtSub, ctl.preSolve,
                                 alphaPhiInt, alphaPhiBnd, &pre, li.cyc, li.alphaPhiIf,
@@ -278,6 +288,35 @@ void deviceInterAlphaStep(
             deviceCopy(*ctl.prevCorrBnd, tBnd);
         }
 
+        if (ctl.rhoPhiFromPhi)
+        {
+            // alphaEqn.H:253-262, the branch a non-Euler ddt(rho,U) takes: un-blend the end-of-step
+            // flux, then rhoPhi with phi beside rho2 -- the host driver's step1 (inter_driver_cpp.cu)
+            if (li.cyc && li.cyc->n > 0)
+                throw std::runtime_error(
+                    "brae interFoam device alpha step: CrankNicolson's end-of-step alpha flux on a "
+                    "coupled pair is not carried. Refused rather than leave the pair's flux blended.");
+            if (ctl.cnCoeffUnblend < scalar(1))
+            {
+                DeviceBuffer<scalar> createdI, createdB;
+                if (!ctl.alphaPhiOldInt)
+                {
+                    deviceCopy(createdI, alphaPhiInt);
+                    deviceCopy(createdB, alphaPhiBnd);
+                    if (ctl.alphaPhiCreatedInt) deviceCopy(*ctl.alphaPhiCreatedInt, alphaPhiInt);
+                    if (ctl.alphaPhiCreatedBnd) deviceCopy(*ctl.alphaPhiCreatedBnd, alphaPhiBnd);
+                }
+                const DeviceBuffer<scalar>& oldI = ctl.alphaPhiOldInt ? *ctl.alphaPhiOldInt : createdI;
+                const DeviceBuffer<scalar>& oldB = ctl.alphaPhiOldBnd ? *ctl.alphaPhiOldBnd : createdB;
+                deviceUnblendAlphaFlux(nIf, ctl.cnCoeffUnblend, oldI, alphaPhiInt);
+                deviceUnblendAlphaFlux(nBf, ctl.cnCoeffUnblend, oldB, alphaPhiBnd);
+            }
+            deviceMassFlux(nIf, alphaPhiInt, *li.phiInt, li.rho1, li.rho2, rpInt);
+            deviceMassFlux(nBf, alphaPhiBnd, *li.phiBnd, li.rho1, li.rho2, rpBnd);
+            if (ctl.alphaPhiOutInt) deviceCopy(*ctl.alphaPhiOutInt, alphaPhiInt);
+            if (ctl.alphaPhiOutBnd) deviceCopy(*ctl.alphaPhiOutBnd, alphaPhiBnd);
+            return;
+        }
         // rhoPhi = alphaPhi10*(rho1 - rho2) + phiCN*rho2, alphaEqn.H:248 -- built once per SUB-STEP,
         // from the flux the last corrector left. The sub-cycle then time-weights these.
         deviceMassFlux(nIf, alphaPhiInt, *li.phiCNInt, li.rho1, li.rho2, rpInt);

@@ -12,10 +12,9 @@ namespace {
 
 void refuseUnsupported(const InterMomentumInput& in)
 {
-    if (in.ddtScheme != DdtScheme::Euler)
+    if (in.ddtScheme != DdtScheme::Euler && in.ddtScheme != DdtScheme::CrankNicolson)
     {
         const char* name = (in.ddtScheme == DdtScheme::backward)      ? "backward"
-                         : (in.ddtScheme == DdtScheme::CrankNicolson) ? "CrankNicolson"
                          : (in.ddtScheme == DdtScheme::localEuler)    ? "localEuler"
                                                                       : "steadyState";
         throw std::runtime_error(
@@ -24,6 +23,15 @@ void refuseUnsupported(const InterMomentumInput& in)
             "scheme (alphaEqn.H:44-50 accepts only Euler and CrankNicolson, and refuses CrankNicolson "
             "under sub-cycling), so the two would advance the same field by different rules.");
     }
+    if (in.ddtScheme == DdtScheme::CrankNicolson && (!in.cn || !in.cnDdt0 || !in.rhoOO || !in.UOO))
+        throw std::runtime_error(
+            "brae interFoam UEqn: ddtSchemes asks for CrankNicolson, whose fvm::ddt(rho, U) reads the "
+            "scheme's clock, its own ddt0 field, rho.oldTime().oldTime() and U.oldTime().oldTime(); the "
+            "caller supplied fewer. Refused rather than run Euler under the scheme's name.");
+    if (in.ddtScheme == DdtScheme::CrankNicolson && in.V0)
+        throw std::runtime_error(
+            "brae interFoam UEqn: CrankNicolson's fvm::ddt on a moving mesh (V0 given) is the scheme's "
+            "moving branch, which brae does not carry.");
     if (in.hasMRF && (!in.mrf || in.mrf->empty()))
         throw std::runtime_error(
             "brae interFoam UEqn: the case declares MRF, and UEqn.H adds MRF.DDt(rho, U). brae has "
@@ -199,7 +207,14 @@ FvVectorMatrix assembleUEqn(
     }
 
     // fvm::ddt(rho, U). Added to the SAME matrix, before relax, exactly as the constructor's `+` does.
-    addEulerDdtRhoU(M, *in.rho, *in.rhoOld, *in.UOld, g.V(), in.deltaT, in.V0);
+    if (in.ddtScheme == DdtScheme::CrankNicolson)
+    {
+        fv::fvmDdt(*in.cn, *in.cnDdt0, in.rho, in.rhoOld, in.rhoOO, *in.UOld, *in.UOO, g.V(), M);
+    }
+    else
+    {
+        addEulerDdtRhoU(M, *in.rho, *in.rhoOld, *in.UOld, g.V(), in.deltaT, in.V0);
+    }
 
     // + MRF.DDt(rho, U), UEqn.H:6. MRFZoneList::DDt(rho, U) is rho*DDt(U) (MRFZoneList.C), and DDt(U)
     // the volVectorField Omega x U on the zone's cells, built from the CURRENT U -- explicit, lagged

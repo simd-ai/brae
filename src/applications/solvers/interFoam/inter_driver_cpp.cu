@@ -372,6 +372,44 @@ RunReport runInterFoam(
     std::vector<std::vector<vector>> UOldBnd = patchValuesOf(f.U);
     std::vector<scalar> rhoOld   = f.rho;
     SurfaceScalarField  phiOld   = f.phi;
+    // CRANKNICOLSON's state. The scheme reads the OLD-OLD level of every operand -- U, rho and phi,
+    // U's patch values too -- which GeometricField::oldTime().oldTime() creates as a copy of the old
+    // level on the first step (nothing reads it then) and storeOldTimes rotates from the second. And
+    // it keeps a ddt0 field per operand set (crank_nicolson_ddt_scheme_cpp.cuh): the momentum's, and
+    // ddtCorr's two. Its clock is Time's: the step index, this step's deltaT and the previous step's.
+    const bool cnDdt = (f.ddtU == DdtScheme::CrankNicolson);
+    std::vector<vector> UOO = UOld;
+    std::vector<std::vector<vector>> UOOBnd = UOldBnd;
+    std::vector<scalar> rhoOO = rhoOld;
+    // phi's old-old level is DIFFERENT. U's and rho's are asked for on the first step, unconditionally,
+    // at the top of fvmDdt (`vf.oldTime().oldTime(); rho.oldTime().oldTime();`), so they exist as copies
+    // of U^0 and rho^0 and rotate from the second step. phi.oldTime().oldTime() is asked for ONLY inside
+    // fvcDdtPhiCorr's evaluate branch, which first runs on the second step -- and GeometricField::
+    // oldTime() CREATES a level that does not exist as a copy of the one it hangs off, phi.oldTime(),
+    // which by then is phi^1. So dphidt0's first estimate is rDtCoef0*(phi^1 - phi^1) = 0, and the
+    // level rotates only from the third step. MEASURED with phi^0 in its place: U 2.3e-01 from
+    // OpenFOAM after two steps, alpha 5e-15 -- the alpha step, which reads no old-old level, exact.
+    SurfaceScalarField phiOO;
+    bool phiOOExists = false;
+    scalar deltaTPrev = f.deltaT;   // Time::deltaT0_ starts equal to deltaT_ (Time.C, the constructor)
+    fv::CrankNicolsonClock cnClock;
+    cnClock.ocCoeff = f.ddtOcCoeff;
+    fv::CrankNicolsonDdt0<vector> cnDdt0RhoU;
+    cnDdt0RhoU.name = "ddt0(rho,U)";
+    fv::CrankNicolsonDdt0<vector> cnDdtCorrU;
+    cnDdtCorrU.name = "ddtCorrDdt0(U)";
+    fv::CrankNicolsonDdt0<scalar> cnDdtCorrPhi;
+    cnDdtCorrPhi.name = "ddtCorrDdt0(phi)";
+    // alphaEqn.H:236-262 under a non-Euler ddt(rho,U): the MULES flux is un-blended at the end of the
+    // step with alphaPhi10.oldTime(), and alphaPhi10 is a field whose old time is CREATED, as a copy
+    // of the current value, by that very first call (GeometricField::oldTime() on a field that has
+    // never been asked for one) -- on the first step the blend is on, the un-blend divides a flux by
+    // itself; storeOldTimes rotates it from the next step on. `alphaPhi10End` is the flux the last
+    // pass left, which is what the first access of a new step stores.
+    SurfaceScalarField alphaPhi10End;
+    SurfaceScalarField alphaPhi10Old;
+    bool alphaPhi10OldExists = false;
+    label alphaPhi10OldIndex = -1;
     // ...and a fifth on a moving mesh: Uf.oldTime(), which ddtCorr reads in phi.oldTime()'s place
     SurfaceVectorField UfOld = f.Uf;
 
@@ -429,6 +467,11 @@ RunReport runInterFoam(
                 case Stage::advanceTime:
                     rep.time += rep.deltaT;
                     ++rep.steps;
+                    // Time::operator++: deltaT0_ = deltaTSave_; deltaTSave_ = deltaT_ -- the step
+                    // before this one, and this one, as the CrankNicolson coefficients read them
+                    cnClock.timeIndex = rep.steps;
+                    cnClock.deltaT = rep.deltaT;
+                    cnClock.deltaT0 = deltaTPrev;
                     acmiRescaledThisStep = false;
                     outerOfStep = -1;
                     // Time::operator++ moves writeTimeIndex_ AFTER the time, with the step that took
@@ -452,7 +495,17 @@ RunReport runInterFoam(
                 case Stage::alphaEqnSubCycle:
                 {
                     AlphaStepInput ai;
-                    ai.phi = &f.phi; ai.phiCN = &f.phi;   // Euler: ocCoeff 0, so phiCN IS phi
+                    // alphaEqn.H:18-56: the off-centring coefficient the scheme constructed for
+                    // ddt(alpha) gives -- 0 for Euler, and 0 on the first step of a cold start under
+                    // CrankNicolson (timeIndex > startTimeIndex + 1 is false), the scheme's own after
+                    // -- and the blended flux phiCN = cnCoeff*phi + (1 - cnCoeff)*phi.oldTime(), which
+                    // IS phi when ocCoeff is 0
+                    const scalar ocAlpha = offCentringCoeff(f.ddtAlpha, f.alphaCtl.nAlphaSubCycles,
+                                                            f.ddtAlphaOcCoeff, rep.steps > 1);
+                    const scalar cnAlpha = blendingCoeff(ocAlpha);
+                    SurfaceScalarField phiCN;
+                    offCentredFlux(f.phi, phiOld, cnAlpha, ocAlpha, phiCN);
+                    ai.phi = &f.phi; ai.phiCN = &phiCN;
                     ai.cAlpha = f.interface.cAlpha;
                     ai.nAlphaCorr = f.alphaCtl.nAlphaCorr;
                     ai.icAlpha = f.alphaCtl.icAlpha;
@@ -540,6 +593,40 @@ RunReport runInterFoam(
                         sub.taps = alphaTaps;
                         alphaEqnStep(f.alpha1, aOld, sub, f.interface, f.mulesCtl,
                                      m, g, patches, aPhi, rPhi, f.nHatf, f.K, &prevCorr);
+                        // alphaEqn.H:236-262: with ddt(rho,U) neither Euler nor localEuler the
+                        // end-of-step alpha flux is un-blended -- alphaPhi10 = (alphaPhi10 - (1 -
+                        // cnCoeff)*alphaPhi10.oldTime())/cnCoeff when ocCoeff > 0 -- and rhoPhi takes
+                        // phi, not phiCN, beside rho2. alphaEqnStep formed the Euler branch's rhoPhi;
+                        // this is the other branch, on top of it.
+                        if (cnDdt)
+                        {
+                            if (ocAlpha > scalar(0))
+                            {
+                                if (alphaPhi10OldIndex != rep.steps)
+                                {
+                                    // the step's first oldTime(): storeOldTimes on a field that has
+                                    // one, or the creating copy on a field that has none
+                                    alphaPhi10Old = alphaPhi10OldExists ? alphaPhi10End : aPhi;
+                                    alphaPhi10OldExists = true;
+                                    alphaPhi10OldIndex = rep.steps;
+                                }
+                                const scalar oneMinusCn = scalar(1) - cnAlpha;
+                                for (std::size_t q = 0; q < aPhi.internal.size(); ++q)
+                                {
+                                    aPhi.internal[q] = (aPhi.internal[q] - oneMinusCn*alphaPhi10Old.internal[q])/cnAlpha;
+                                }
+                                for (std::size_t pi = 0; pi < aPhi.boundary.size(); ++pi)
+                                {
+                                    for (std::size_t q = 0; q < aPhi.boundary[pi].size(); ++q)
+                                    {
+                                        aPhi.boundary[pi][q] = (aPhi.boundary[pi][q]
+                                                              - oneMinusCn*alphaPhi10Old.boundary[pi][q])/cnAlpha;
+                                    }
+                                }
+                            }
+                            massFlux(aPhi, f.phi, f.mixture.phases.rho1, f.mixture.phases.rho2, rPhi);
+                            alphaPhi10End = aPhi;
+                        }
                         aNew = f.alpha1.internal;
                     };
                     alphaEqnSubCycle(f.alphaCtl.nAlphaSubCycles, rep.deltaT,
@@ -701,6 +788,16 @@ RunReport runInterFoam(
                     mi.rhoPhi = &f.rhoPhi.internal; mi.rhoPhiBnd = &phB;
                     mi.rho = &f.rho; mi.rhoOld = &rhoOld; mi.rhoBnd = &rhoB;
                     mi.UOld = &UOld;
+                    // the case's ddt scheme -- read into f.ddtU and, until CrankNicolson was ported,
+                    // never handed on (the input's default is Euler)
+                    mi.ddtScheme = f.ddtU;
+                    if (cnDdt)
+                    {
+                        mi.cn = &cnClock;
+                        mi.cnDdt0 = &cnDdt0RhoU;
+                        mi.rhoOO = &rhoOO;
+                        mi.UOO = &UOO;
+                    }
                     mi.V0 = dyn ? &dyn->V0() : nullptr;
                     // nuEff = nut + nu: the mixture's nu alone when the case is laminar
                     std::vector<scalar> nuEff;
@@ -784,6 +881,27 @@ RunReport runInterFoam(
                     DdtCorrInput dc;
                     dc.phiOld = &phiOld; dc.UOld = &UOld; dc.deltaT = rep.deltaT;
                     dc.UOldBnd = &UOldBnd;
+                    if (cnDdt)
+                    {
+                        // the step's first ddtCorr will evaluate dphidt0 and ask for
+                        // phi.oldTime().oldTime(): created here, as a copy of phi.oldTime(), the
+                        // first time it is asked for -- see phiOOExists
+                        if (!phiOOExists && cnDdtCorrPhi.exists && cnDdtCorrPhi.timeIndex != rep.steps)
+                        {
+                            phiOO = phiOld;
+                            phiOOExists = true;
+                        }
+                        if (!phiOOExists)
+                        {
+                            phiOO = phiOld;   // read by nothing on the step the field is created
+                        }
+                        dc.cn = &cnClock;
+                        dc.cnDdt0U = &cnDdtCorrU;
+                        dc.cnDdt0Phi = &cnDdtCorrPhi;
+                        dc.UOO = &UOO;
+                        dc.UOOBnd = &UOOBnd;
+                        dc.phiOO = &phiOO;
+                    }
                     // ddtCorr(U, phi, Uf) is ddtCorr(U, Uf) when the mesh is dynamic
                     dc.UfOld = dyn ? &UfOld : nullptr;
 
@@ -862,6 +980,11 @@ RunReport runInterFoam(
                     ti.rho = &f.rho;
                     ti.rhoBnd = &f.rhoBnd;
                     ti.rhoOld = &rhoOld;
+                    if (cnDdt)
+                    {
+                        ti.cn = &cnClock;
+                        ti.rhoOO = &rhoOO;
+                    }
                     ti.nu = &f.nu;
                     ti.nuBnd = &f.nuBnd;
                     ti.deltaT = rep.deltaT;
@@ -884,7 +1007,16 @@ RunReport runInterFoam(
 
         runTimeStep(lc, hooks);
 
-        // ...and the old-time set moves forward, all four together -- five on a moving mesh.
+        // ...and the old-time set moves forward, all four together -- five on a moving mesh -- with
+        // the old-old level CrankNicolson reads taking the old one first
+        UOO      = UOld;
+        UOOBnd   = UOldBnd;
+        rhoOO    = rhoOld;
+        if (phiOOExists)
+        {
+            phiOO = phiOld;
+        }
+        deltaTPrev = rep.deltaT;
         alphaOld = f.alpha1.internal;
         UOld     = f.U.internal;
         UOldBnd  = patchValuesOf(f.U);

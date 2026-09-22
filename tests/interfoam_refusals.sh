@@ -253,9 +253,29 @@ arm fo_harmless             runs    -                        "" "sed -i 's|^// \
 # already refused before this gate; here so they stay refused
 arm nonNewtonian            refused "CrossPowerLaw"           "" "sed -i '0,/transportModel  *Newtonian;/s//transportModel  CrossPowerLaw;/' constant/transportProperties"
 
-# the time scheme: read into f.ddtU and then handed to nobody, so these ran as Euler
-arm ddt_CrankNicolson       refused "CrankNicolson"           "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson 0.5;/' system/fvSchemes"
+# the time scheme: read into f.ddtU and then handed to nobody, so these ran as Euler. CRANKNICOLSON RUNS
+# now, on both loops (tests/interfoam_cn_vs_openfoam.sh holds RAS/damBreak under it); what it refuses,
+# by name: a Function1 ocCoeff (the ramp form), a coefficient outside [0, 1], the scheme on one of the two
+# operand sets and Euler on the other, the scheme beside a moving mesh, beside a mangrove source (whose
+# added mass takes fvm::ddt(U) under the case's scheme), beside a closure other than kEpsilon, with alpha
+# sub-cycling (OpenFOAM's own FatalError), and a restart directory that holds the ddt0 fields or alphaPhi0
+CNSET="sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson 0.5;/' system/fvSchemes"
+arm ddt_CrankNicolson       runs    -                        "" "$CNSET"
+arm ddt_cnFull              runs    -                        "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson 1;/' system/fvSchemes"
+arm ddt_cnBare              runs    -                        "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson;/' system/fvSchemes"
+arm ddt_cnRamp              refused "Function1 of time"      "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson ocCoeff { type scale; scale linearRamp; duration 0.01; value 0.9; };/' system/fvSchemes"
+arm ddt_cnOutOfRange        refused "should be >= 0 and <= 1" "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson 1.5;/' system/fvSchemes"
+arm ddt_cnAlphaOnly         refused "mixed case"              "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         Euler;\n    ddt(alpha)      CrankNicolson 0.5;/' system/fvSchemes"
+arm ddt_cnSubCycles         refused "nAlphaSubCycles > 1"    "" "$CNSET; sed -i 's/nAlphaSubCycles  *1;/nAlphaSubCycles 2;/' system/fvSolution"
+arm ddt_cnDdt0Present       refused "ddt0(rho,U)"             "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class volVectorField; object ddt0(rho,U); }\ndimensions [1 -2 -2 0 0 0 0];\ninternalField uniform (0 0 0);\nboundaryField { \".*\" { type calculated; value uniform (0 0 0); } }\n' > '0/ddt0(rho,U)'"
+arm ddt_cnAlphaPhi0Present  refused "alphaPhi0"               "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class surfaceScalarField; object alphaPhi0.water; }\ndimensions [0 3 -1 0 0 0 0];\ninternalField uniform 0;\nboundaryField { \".*\" { type calculated; value uniform 0; } }\n' > 0/alphaPhi0.water"
 arm ddt_localEuler          refused "localEuler"              "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         localEuler;/' system/fvSchemes"
+arm ddt_backward            refused "backward"                "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         backward;/' system/fvSchemes"
+BASE="$BM"
+arm ddt_cnMoving            refused "the mesh moves"          "" "$CNSET"
+BASE="$BG"
+arm ddt_cnMangroves         refused "multiphaseMangrovesSource" "" "$CNSET"
+BASE="$B"
 
 # a solver-entry floor neither the alpha pre-solve nor the momentum predictor honours yet
 # the host's alpha pre-solve honours minIter (tests/interfoam_dambreak_vs_openfoam.sh `alphaminiter`); the
@@ -540,6 +560,12 @@ if [ $HAVE_GPU = 1 ]; then
     arm device_gradLsq      refused "leastSquares or cellLimited" "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         leastSquares;/' system/fvSchemes"
     arm device_gradNHat     refused "leastSquares or cellLimited" "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    nHat            cellLimited Gauss linear 1;/' system/fvSchemes"
     arm device_baseline     runs    -                        "-device" true
+    # CrankNicolson RUNS on the device loop (tests/interfoam_cn_vs_openfoam.sh holds RAS/damBreak under it
+    # on both arms); a coupled pair under it is refused by name there, where the host loop carries it
+    arm device_cn           runs    -                        "-device" "$CNSET"
+    BASE="$BB"
+    arm device_cn_baffle    refused "coupled pair"            "-device" "$CNSET"
+    BASE="$B"
     # the permeable-wall pair RUNS on the device loop now (tests/interfoam_permeable_vs_openfoam.sh holds
     # it to OpenFOAM on both profiles); this arm is here because it was a blanket refusal
     arm device_permeable    runs    -                        "-device" "${PERMU/PHI /}; ${PERMP/PENTRY/p uniform 0;}"

@@ -140,6 +140,11 @@ struct InterFields
     AlphaFluxScheme              divPhirbAlpha  = AlphaFluxScheme::linear;
     AlphaDdt                     ddtAlpha       = AlphaDdt::Euler;
     DdtScheme                    ddtU           = DdtScheme::Euler;
+    // CrankNicolson's off-centring coefficient, from the entry each operand set resolves to: `ddt(alpha)`
+    // for alphaEqn.H's own blend (it asks the scheme it constructs for ddt(alpha)), `default` for
+    // fvm::ddt(rho, U), fvm::ddt(k) and ddtCorr. 1 is OpenFOAM's when the entry names none.
+    scalar                       ddtAlphaOcCoeff = 1;
+    scalar                       ddtOcCoeff      = 1;
     // laplacianSchemes and snGradSchemes `default`. brae's interFoam assembles orthogonal, so these
     // exist to REFUSE a corrected scheme on a mesh where the correction is not zero -- see
     // refuseUncorrectedOnSkewMesh -- and to hand the turbulence closure the case's own.

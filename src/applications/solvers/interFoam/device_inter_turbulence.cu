@@ -611,6 +611,46 @@ void deviceCorrectInterTurbulence(
         kin.fvoSpK = &d.mangroveK;
         kin.fvoSpEps = &d.mangroveEps;
     }
+    // fvm::ddt under CrankNicolson (the host wrapper's block, inter_turbulence_cpp.cu): rotate the
+    // old-old levels once per time index -- at the first step oldTime().oldTime() is a copy of oldTime()
+    // -- and hand the closure its two ddt0 fields
+    if (in.cn)
+    {
+        if (d.cnTimeIndex != in.cn->timeIndex)
+        {
+            if (d.cnKEntry.size() == 0)
+            {
+                deviceCopy(d.cnKOO, d.k);
+                deviceCopy(d.cnEpsOO, d.epsilon);
+            }
+            else
+            {
+                deviceCopy(d.cnKOO, d.cnKEntry);
+                deviceCopy(d.cnEpsOO, d.cnEpsEntry);
+            }
+            deviceCopy(d.cnKEntry, d.k);
+            deviceCopy(d.cnEpsEntry, d.epsilon);
+            d.cnTimeIndex = in.cn->timeIndex;
+        }
+        d.cnDdt0K.name = t.variableDensity ? "ddt0(rho,k)" : "ddt0(k)";
+        d.cnDdt0Eps.name = t.variableDensity ? "ddt0(rho,epsilon)" : "ddt0(epsilon)";
+        kin.cn = in.cn;
+        kin.cnDdt0K = &d.cnDdt0K;
+        kin.cnDdt0Eps = &d.cnDdt0Eps;
+        kin.kOO = &d.cnKOO;
+        kin.epsOO = &d.cnEpsOO;
+        if (t.variableDensity)
+        {
+            if (!in.rhoOO)
+                throw std::runtime_error(
+                    "brae interFoam (device): CrankNicolson under `density variable` needs rho.oldTime().oldTime().");
+            kin.rhoOOCell = in.rhoOO;
+        }
+        else
+        {
+            kin.rhoOOCell = &d.onesCell;
+        }
+    }
     kin.gsSymmetric = (ks.smoother == "symGaussSeidel");
     kin.nSweepsKE = ks.nSweeps;
     kin.tol = ks.tol;

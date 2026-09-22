@@ -68,9 +68,15 @@ struct DeviceInterAlphaHooks
 
     // fvm::div(phiCN, alpha1)'s internalCoeffs and boundaryCoeffs, flattened in boundary-face order.
     // Only reached when MULESCorr is on; a case without it never needs them and passing none is fine.
+    // `phiCNBnd` is phiCN on the boundary faces, in the device's layout: the flux the coefficients
+    // are built from, which under CrankNicolson is NOT the patch flux the hook's host field holds
+    // (phiCN = cnCoeff*phi + (1 - cnCoeff)*phi.oldTime(), alphaEqn.H:96 and :114). NOT DISCRIMINATED
+    // by any gate in the tree: on RAS/damBreak the one flux-conditional alpha patch is the atmosphere,
+    // whose cells hold exactly 0, and a coefficient on a zero row moves nothing. Null = phi itself.
     std::function<void(const DeviceBuffer<scalar>& alpha1,
                        DeviceBuffer<scalar>&       iC,
-                       DeviceBuffer<scalar>&       bC)> divCoeffs;
+                       DeviceBuffer<scalar>&       bC,
+                       const DeviceBuffer<scalar>* phiCNBnd)> divCoeffs;
 
     // waveAlpha: the patch values a wave MODEL supplies, at the clock of the sub-cycle it is called in
     // (1-based). A sub-cycle is its own time index to OpenFOAM, so the model updates in each -- see
@@ -133,6 +139,22 @@ struct DeviceInterAlphaControls
     // THE PAIR's mass flux out, for the momentum equation. The pair itself, its flux and its alpha flux
     // travel in DeviceAlphaStepInput, which is what the corrector reads.
     DeviceBuffer<scalar>* rhoPhiIf = nullptr;
+    // alphaEqn.H:236-262 under a ddt(rho,U) that is neither Euler nor localEuler (CrankNicolson): the
+    // end-of-step alpha flux is un-blended against alphaPhi10.oldTime() when ocCoeff > 0, and rhoPhi
+    // takes phi, not phiCN, beside rho2. `cnCoeffUnblend` 1 skips the un-blend; `alphaPhiOld*` null
+    // with it below 1 means the old level is CREATED by this call as a copy of the current flux, which
+    // is what GeometricField::oldTime() does on the first blended step; `alphaPhiOut*` is where the
+    // caller keeps the flux the step ends on, for the next step's old level. A pair is refused.
+    bool rhoPhiFromPhi = false;
+    scalar cnCoeffUnblend = 1;
+    const DeviceBuffer<scalar>* alphaPhiOldInt = nullptr;
+    const DeviceBuffer<scalar>* alphaPhiOldBnd = nullptr;
+    DeviceBuffer<scalar>* alphaPhiOutInt = nullptr;
+    DeviceBuffer<scalar>* alphaPhiOutBnd = nullptr;
+    // ...and, when the old level is created by this call, the copy it was created as (the flux BEFORE
+    // the un-blend), which every later pass of the same time step reads
+    DeviceBuffer<scalar>* alphaPhiCreatedInt = nullptr;
+    DeviceBuffer<scalar>* alphaPhiCreatedBnd = nullptr;
     // nHatf ON THE PAIR, and it is the CALLER's buffer because it has to outlive the call. The first
     // corrector's phir reads the normal the LAST mixture.correct() left (alphaEqn.H:162) -- which,
     // without MULESCorr, is the previous TIME STEP's, since nothing runs between the two. Held here

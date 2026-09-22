@@ -47,6 +47,7 @@
 #include "cf_types.cuh"
 #include "kepsilon_coeffs.cuh"
 #include "fvOptions_cpp.cuh"
+#include "crank_nicolson_ddt_scheme_cpp.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -156,6 +157,17 @@ struct Compressible
     // which rho that is; psi.oldTime() is the field at entry, before the wall function writes it.
     scalar                                  rDeltaT  = 0.0;
     const std::vector<scalar>*              rhoOld   = nullptr;
+    // ...or CrankNicolson (crank_nicolson_ddt_scheme_cpp.cuh): the scheme's clock, the two equations'
+    // OWN ddt0 fields ("ddt0(rho,epsilon)" and "ddt0(rho,k)", or "ddt0(epsilon)"/"ddt0(k)" when rho
+    // is null), rho.oldTime().oldTime() and the two fields' old-old levels, which the caller keeps
+    // (psi.oldTime() is the field at entry, as under Euler). With `cn` set rDeltaT is not read, and
+    // a moving mesh (V0) is refused.
+    const fv::CrankNicolsonClock*           cn       = nullptr;
+    fv::CrankNicolsonDdt0<scalar>*          cnDdt0Eps = nullptr;
+    fv::CrankNicolsonDdt0<scalar>*          cnDdt0K   = nullptr;
+    const std::vector<scalar>*              rhoOO    = nullptr;
+    const std::vector<scalar>*              epsOO    = nullptr;
+    const std::vector<scalar>*              kOO      = nullptr;
     // A MOVING MESH (EulerDdtScheme::fvmDdt under mesh().moving()): the source takes the old volumes,
     // rDeltaT*psi.oldTime()*V0, where the diagonal keeps V; and divU is the divergence of the ABSOLUTE
     // flux, fvc::div(fvc::absolute(phi, U)) = div(phi + mesh.phi()) (kEpsilon.C:232-235). Null on a

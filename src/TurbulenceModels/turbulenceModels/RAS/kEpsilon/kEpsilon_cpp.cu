@@ -323,7 +323,23 @@ void correct(
     // rho.oldTime()*psi.oldTime()*V/deltaT. psi.oldTime() is the field as this iteration started -- taken
     // HERE, before the wall function overwrites epsilon in its cells (those rows are pinned by setValues
     // afterwards, so what the source holds there is not seen by the solve). Zero under steadyState.
-    const scalar rDeltaT = (comp) ? comp->rDeltaT : scalar(0);
+    // ...and under CrankNicolson the term is the scheme's own, added after the loops below with the
+    // Euler line skipped; the caller keeps the old-old levels
+    const bool cn = comp && comp->cn;
+    if (cn)
+    {
+        if (!comp->cnDdt0Eps || !comp->cnDdt0K || !comp->epsOO || !comp->kOO
+         || (comp->rho && !comp->rhoOO) || (comp->rhoOld && !comp->rhoOO))
+            throw std::runtime_error(
+                "brae kEpsilon: CrankNicolson needs the two ddt0 fields, k.oldTime().oldTime(), "
+                "epsilon.oldTime().oldTime() and, with a density, rho.oldTime().oldTime(); the caller "
+                "supplied fewer.");
+        if (comp->V0)
+            throw std::runtime_error(
+                "brae kEpsilon: CrankNicolson's fvm::ddt on a moving mesh is the scheme's moving branch, "
+                "which brae does not carry.");
+    }
+    const scalar rDeltaT = (comp && !cn) ? comp->rDeltaT : scalar(0);
     const std::vector<scalar> kOld   = k.internal;
     const std::vector<scalar> epsOld = epsilon.internal;
     auto rhoOldAt = [&](label c) { return (comp && comp->rhoOld) ? (*comp->rhoOld)[c] : rhoAt(c); };
@@ -554,6 +570,12 @@ void correct(
             if (bounded) M.diag[c] -= divPhi[c] * V;
         }
 
+        // fvm::ddt(alpha, rho, epsilon_) under CrankNicolson: "ddt0(rho,epsilon)" is the equation's own
+        if (cn)
+        {
+            fv::fvmDdt(*comp->cn, *comp->cnDdt0Eps, comp->rho, comp->rhoOld ? comp->rhoOld : comp->rho,
+                       comp->rhoOO, epsOld, *comp->epsOO, g.V(), M);
+        }
         // + fvOptions(alpha, rho, epsilon_), kEpsilon.C:258 -- the last term on the right. The density-
         // weighted lineage is the rho form of addSup, which the option refuses.
         if (fvOpts) cpu::fvOptions::addSup(*fvOpts, M, "epsilon", U.internal, g, comp ? comp->rho : nullptr);
@@ -767,6 +789,12 @@ void correct(
             if (bounded) M.diag[c] -= divPhi[c] * V;
         }
 
+        // fvm::ddt(alpha, rho, k_) under CrankNicolson: "ddt0(rho,k)"
+        if (cn)
+        {
+            fv::fvmDdt(*comp->cn, *comp->cnDdt0K, comp->rho, comp->rhoOld ? comp->rhoOld : comp->rho,
+                       comp->rhoOO, kOld, *comp->kOO, g.V(), M);
+        }
         // + fvOptions(alpha, rho, k_), kEpsilon.C:279
         if (fvOpts) cpu::fvOptions::addSup(*fvOpts, M, "k", U.internal, g, comp ? comp->rho : nullptr);
         if (res && res->captureStages) captureSystem(M, patches, res->kD0, res->kSrc0);

@@ -36,6 +36,7 @@
 #include "actuation_disk.cuh"
 #include "device_ldu.cuh"
 #include "device_fvoptions.cuh"
+#include "device_crank_nicolson_ddt.cuh"
 #include "device_cyclic.cuh"   // DevicePorosity + deviceFvoPorosityDiag/Source
 #include "UEqn_cpp.cuh"   // cpu::DivScheme -- one enum shared by both paths
 
@@ -109,6 +110,13 @@ struct MomentumInput
     const DeviceBuffer<scalar>* ddtV0 = nullptr;
     const DeviceBuffer<scalar>* ddtUOld[3] = {nullptr, nullptr, nullptr};
     scalar ddtDeltaT = 0;
+    // ...or CrankNicolson's fvm::ddt(rho, U) in Euler's place (device_crank_nicolson_ddt.cuh): the
+    // scheme's clock, the equation's OWN ddt0 field kept by the caller across steps, and the old-old
+    // levels of rho and U. All or none; with `ddtCn` set, ddtV0 (a moving mesh) is refused.
+    const cpu::fv::CrankNicolsonClock* ddtCn = nullptr;
+    DeviceCnDdt0*               ddtCnDdt0 = nullptr;
+    const DeviceBuffer<scalar>* ddtRhoOO  = nullptr;
+    const DeviceBuffer<scalar>* ddtUOO[3] = {nullptr, nullptr, nullptr};
     bool   bounded = false;   // `bounded Gauss <scheme>`: diag -= V*div(phi); see UEqn_cpp.cuh
     // `Gauss linearUpwind grad(U)`: the matrix stays pure upwind and the whole scheme is a deferred
     // source correction -- see UEqn_cpp.cuh. Unlike `bounded` it does NOT vanish at convergence.

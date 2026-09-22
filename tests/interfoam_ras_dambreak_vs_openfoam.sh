@@ -36,6 +36,15 @@
 # announces) it is the oracle for the first: against OpenFOAM a disagreement could be the loop's or the
 # closure's, between those two only the closure's. MEASURED: device closure against host closure in the
 # same loop, U 3.3e-14, k 1.1e-15, epsilon 1.6e-15, nut 1.9e-15, the same sweep counts solve for solve.
+# THE `outer` PROFILE (nOuterCorrectors 2, 2026-09-22) is where the device ALPHA STEP's defect showed: it
+# reset alpha1 to its old time at the start of every outer pass, which alphaEqn.H never does (the host
+# reference had stopped doing it and measured why); the second pass's first p_rgh residual sat 1.2e-06
+# from OpenFOAM's, k 6.7e-06 and U 2.0e-06 after two steps, with every first-pass number at the floor.
+# It was found under CrankNicolson (tests/interfoam_cn_vs_openfoam.sh), where the same reset reads the
+# same numbers. The device arm's alpha-solve bound is wider on this profile alone: the second pass's
+# pre-solve starts from the first pass's alpha, its initial residual is 1e-5 of the normFactor, and
+# the device's 1e-12 in phi (its VoF floor) reads as 1e-07 relative there.
+#
 # The `custom` profile is where the device closure's one defect showed: it left the wall laplacian
 # coefficient out of relax(), as the host reference had, and every epsilon residual was 1.1e-04 from
 # OpenFOAM's with the fields unmoved. 5.3e-14 with it.
@@ -134,6 +143,16 @@ e = e.replace('[0 2 -3 0 0 0 0]', '[0 0 -1 0 0 0 0]')
 open(os.path.join(d, '0/omega'), 'w').write(e)
 SSTEOF
     fi
+    # `outer`: the shipped case with nOuterCorrectors 2 -- the second pass starts from the first pass's
+    # alpha, U and phi, and every once-per-step update must stay once per step. The DEVICE alpha step
+    # reset alpha1 to its old time at the start of every pass until this profile measured it: the
+    # second pass's first p_rgh residual 1.2e-06 from OpenFOAM's, k 6.7e-06 and U 2.0e-06 after two
+    # steps, while every first-pass number matched (2026-09-22, found under CrankNicolson, where the
+    # same reset read the same numbers).
+    if [ "$profile" = outer ]; then
+        sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' "$C/system/fvSolution"
+        grep -q "nOuterCorrectors 2;" "$C/system/fvSolution" || { echo "FAIL: nOuterCorrectors 1 was not found to replace"; return 1; }
+    fi
     if [ "$profile" = custom ]; then
         python3 - "$C" <<'PYEOF' || { echo "FAIL: the custom profile was not staged"; return 1; }
 import os, re, sys
@@ -196,7 +215,7 @@ PYEOF
 }
 
 rc=0
-for p in laminar variable uniform custom nutAtmosphere sst; do
+for p in laminar variable uniform custom nutAtmosphere sst outer; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_ras_dambreak_vs_openfoam: staging failed"; exit 1; }
@@ -212,6 +231,8 @@ done
        nutAtmosphere uniform "$W/laminar/$END" "$W/uniform/$END" || rc=1
 "$BIN" "$W/sst" "$W/sst/0" "$W/sst/$END" "$STEPS" "$W/sst/log.interFoam" \
        sst uniform "$W/laminar/$END" "$W/uniform/$END" || rc=1
+"$BIN" "$W/outer" "$W/outer/0" "$W/outer/$END" "$STEPS" "$W/outer/log.interFoam" \
+       outer variable "$W/laminar/$END" "$W/variable/$END" || rc=1
 
 echo "interfoam_ras_dambreak_vs_openfoam: rc $rc"
 exit $rc

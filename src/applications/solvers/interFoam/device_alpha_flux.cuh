@@ -108,6 +108,14 @@ void deviceMultiplyFaces(int n, const DeviceBuffer<scalar>& a, const DeviceBuffe
                          DeviceBuffer<scalar>& out);
 
 // out = a - b, per face. phiCorr = phiPsi - phiBD.
+// alphaEqn.H:253-258 under a non-Euler ddt(rho,U): the end-of-time-step alpha flux,
+//     alphaPhi10 = (alphaPhi10 - (1 - cnCoeff)*alphaPhi10.oldTime())/cnCoeff
+// in place. `old` may be `alphaPhi` itself, which is what OpenFOAM reads on the first blended step
+// (the old level is created by that very call, as a copy of the current).
+void deviceUnblendAlphaFlux(int n, scalar cnCoeff, const DeviceBuffer<scalar>& old, DeviceBuffer<scalar>& alphaPhi);
+// phiCN = cnCoeff*phi + (1 - cnCoeff)*phi.oldTime(), alphaEqn.H:96
+void deviceOffCentredFlux(int n, scalar cnCoeff, const DeviceBuffer<scalar>& phi, const DeviceBuffer<scalar>& phiOld,
+                          DeviceBuffer<scalar>& phiCN);
 void deviceSubtractFaces(int n, const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& b,
                          DeviceBuffer<scalar>& out);
 

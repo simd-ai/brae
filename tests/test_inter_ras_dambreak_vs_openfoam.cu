@@ -116,9 +116,11 @@ int main(
     // `sst`: RAS/damBreak made kOmegaSST, whose second field is omega and whose closure runs on the
     // device through device_inter_turbulence's SST branch
     const bool sst = (profile == "sst");
+    const bool outer = (profile == "outer");
     const char* secondName = sst ? "omega" : "epsilon";
     std::printf("  profile: %s\n",
-                nutAtmosphere ? "nutAtmosphere -- uniform, the atmosphere's nut an inletOutlet"
+                outer ? "outer -- variable, with nOuterCorrectors 2"
+              : nutAtmosphere ? "nutAtmosphere -- uniform, the atmosphere's nut an inletOutlet"
               : custom ? "custom -- its own coefficients, relaxation 0.7, and minIter forcing each sweep"
               : variable ? "variable -- `density variable`, as the tutorial ships"
                          : "uniform -- the ordinary single-phase lineage");
@@ -261,10 +263,12 @@ int main(
     check("turbulence moves OpenFOAM's own U by more than 10%", dLamU.rel() > scalar(0.1));
     // MEASURED for nutAtmosphere against plain uniform: U 2.7e-03, nut 4.7e-02 -- 20 of the atmosphere's
     // 46 faces take air IN at t = 0.005, where the inletValue stands in for the cell's nut
-    check(nutAtmosphere ? "...and the atmosphere's inletOutlet nut moves it by more than 1e-3"
+    // ...and the second outer corrector against one: MEASURED U 4.6e-02 at t = 0.005
+    check(outer ? "...and the second outer corrector moves it by more than 1%"
+          : nutAtmosphere ? "...and the atmosphere's inletOutlet nut moves it by more than 1e-3"
           : custom ? "...and the custom settings move it by more than 1%"
                    : "...and the lineage moves it by more than 10%, so `density` is live on this fixture",
-          dOtherU.rel() > (nutAtmosphere ? scalar(1e-3) : custom ? scalar(0.01) : scalar(0.1)));
+          dOtherU.rel() > (nutAtmosphere ? scalar(1e-3) : (custom || outer) ? scalar(0.01) : scalar(0.1)));
 
     // THE DEVICE LOOP, against OpenFOAM directly and at the case's own tolerances -- what
     // `brae_interFoam -device` runs on this tutorial.
@@ -296,8 +300,12 @@ int main(
         failures += brae::gatecheck::nonFinite("device second field", devSecond);
         failures += brae::gatecheck::nonFinite("device nut", dev.turbulence.nut.internal);
         failures += brae::gatecheck::compareSolves("device", rd.pSolves, ofP, nSteps);
+        // `outer`: the second pass's alpha pre-solve starts from the first pass's alpha and its initial
+        // residual is 1e-5 of the normFactor, so the device's 1e-12 in phi (its VoF floor) reads as
+        // 1e-07 relative there -- see tests/test_inter_cn_vs_openfoam.cu, where it was measured
         failures += brae::gatecheck::compareSolves("device", rd.alphaSolves, ofA, nSteps,
-                                                   dev.alphaName.c_str(), scalar(1e-10), scalar(1e-9));
+                                                   dev.alphaName.c_str(), scalar(1e-10),
+                                                   outer ? scalar(1e-5) : scalar(1e-9));
         // MEASURED: initial residuals 1.8e-13 (epsilon) and 4.0e-13 (k) from OpenFOAM's over the run.
         // THE CONTROL IS ON `custom`: with the wall laplacian coefficient left out of relax() -- what
         // the device closure did until this gate -- epsilon's fields do not move (9.8e-14) and its

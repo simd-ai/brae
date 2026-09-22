@@ -29,6 +29,7 @@
 #include "cf_types.cuh"
 #include "device_fvoptions.cuh"   // DeviceMangroves
 #include "device_dilu.cuh"
+#include "device_crank_nicolson_ddt.cuh"
 #include "device_boundary.cuh"
 #include "device_buffer.cuh"
 #include "device_kepsilon.cuh"
@@ -83,6 +84,15 @@ struct DeviceInterTurbulence
     // kCoeff and epsilonCoeff of multiphaseMangrovesTurbulenceModel at this step's U, per cell
     DeviceBuffer<scalar> mangroveK;
     DeviceBuffer<scalar> mangroveEps;
+    // CrankNicolson's state (the host closure's InterTurbulenceCrankNicolson): the two ddt0 fields and
+    // the old-old level of each field, rotated once per time index as storeOldTimes does
+    DeviceCnDdt0 cnDdt0K;
+    DeviceCnDdt0 cnDdt0Eps;
+    DeviceBuffer<scalar> cnKEntry;
+    DeviceBuffer<scalar> cnEpsEntry;
+    DeviceBuffer<scalar> cnKOO;
+    DeviceBuffer<scalar> cnEpsOO;
+    label cnTimeIndex = -1;
 
     // kOmegaSST's own, when the case names it: the CELL wall distance F1 and F2 read (wallDist::New's y,
     // not the wall functions' near-wall face distance), the faces where F1 is 1 by construction, and
@@ -154,6 +164,10 @@ struct DeviceInterTurbulenceStepInput
     // every solve of the run, in order, for the solver-log gate
     std::vector<cpu::interFoam::LinearSolveRecord>* epsilonLog = nullptr;
     std::vector<cpu::interFoam::LinearSolveRecord>* kLog = nullptr;
+    // CrankNicolson: the scheme's clock and rho.oldTime().oldTime() (read in the `density variable`
+    // lineage; null in the other, where the ones vector stands in). Null runs the closure's ddt as Euler.
+    const cpu::fv::CrankNicolsonClock* cn = nullptr;
+    const DeviceBuffer<scalar>* rhoOO = nullptr;
     // fvOptions(k) and fvOptions(epsilon): multiphaseMangrovesTurbulenceModel's -Sp(Cx*Cd*a*N*|U|, .),
     // with U the closure's own -- OpenFOAM looks `U` up when the equation is built. Under kEpsilon
     // only; the case reader refuses the option under any other closure. Null = no such option.

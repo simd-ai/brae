@@ -802,9 +802,21 @@ void assembleEpsEqn(
                                          epsilon.data(), st.divU.data(), st.divPhi.data(),
                                          in.co.C1, in.co.C2, in.co.C3, in.co.Cmu,
                                          in.boundedEps ? 1 : 0,
-                                         in.rDeltaT, rhoOldP, epsOld ? epsOld->data() : nullptr,
+                                         // the Euler ddt term, unless the scheme is CrankNicolson's
+                                         in.cn ? scalar(0) : in.rDeltaT, rhoOldP, epsOld ? epsOld->data() : nullptr,
                                          E.diag.data(), E.source.data());
     cudaCheck(cudaGetLastError(), "kEpsilon eps reaction");
+    if (in.cn)
+    {
+        // fvm::ddt(alpha, rho, epsilon_) under CrankNicolson, "ddt0(rho,epsilon)"
+        if (!in.cnDdt0Eps || !in.epsOO || !epsOld || !in.rhoOOCell)
+            throw std::runtime_error("brae kEpsilon (device): CrankNicolson needs epsilon's ddt0 field, its old-old level and rho's.");
+        const DeviceBuffer<scalar>* old[1] = {epsOld};
+        const DeviceBuffer<scalar>* oo[1] = {in.epsOO};
+        DeviceBuffer<scalar>* src[1] = {&E.source};
+        deviceCnFvmDdt(*in.cn, *in.cnDdt0Eps, in.rhoCell, in.rhoOldCell ? in.rhoOldCell : in.rhoCell, in.rhoOOCell,
+                       1, old, oo, dm.V, E.diag, src);
+    }
 }
 
 
@@ -843,9 +855,20 @@ void assembleKEqn(
     kReactionKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), in.rhoCell->data(), st.G.data(), k.data(),
                                        epsilon.data(), st.divU.data(), st.divPhi.data(),
                                        in.boundedK ? 1 : 0,
-                                       in.rDeltaT, rhoOldP, kOld ? kOld->data() : nullptr,
+                                       in.cn ? scalar(0) : in.rDeltaT, rhoOldP, kOld ? kOld->data() : nullptr,
                                        K.diag.data(), K.source.data());
     cudaCheck(cudaGetLastError(), "kEpsilon k reaction");
+    if (in.cn)
+    {
+        // fvm::ddt(alpha, rho, k_) under CrankNicolson, "ddt0(rho,k)"
+        if (!in.cnDdt0K || !in.kOO || !kOld || !in.rhoOOCell)
+            throw std::runtime_error("brae kEpsilon (device): CrankNicolson needs k's ddt0 field, its old-old level and rho's.");
+        const DeviceBuffer<scalar>* old[1] = {kOld};
+        const DeviceBuffer<scalar>* oo[1] = {in.kOO};
+        DeviceBuffer<scalar>* src[1] = {&K.source};
+        deviceCnFvmDdt(*in.cn, *in.cnDdt0K, in.rhoCell, in.rhoOldCell ? in.rhoOldCell : in.rhoCell, in.rhoOOCell,
+                       1, old, oo, dm.V, K.diag, src);
+    }
 }
 
 

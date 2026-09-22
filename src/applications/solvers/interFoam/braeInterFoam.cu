@@ -73,6 +73,12 @@
 // axisymmetric wedge -- whose host matrix coefficients and gradient patch value it took to get there.
 // tests/interfoam_les_vs_openfoam.sh holds LES/nozzleFlow2D against OpenFOAM; `-device` refuses LES.
 //
+// AND the CrankNicolson ddt scheme, on BOTH loops -- the momentum equation, ddtCorr and the kEpsilon
+// closure under it, alphaEqn.H's own off-centred flux and end-of-step un-blend, on a mesh that does not
+// move: RAS/damBreak with `default CrankNicolson 0.5`, held by tests/interfoam_cn_vs_openfoam.sh. The one
+// shipped tutorial that names the scheme, RAS/floatingObject, also moves its mesh under rigidBodyMotion,
+// which neither loop carries: that is what it is refused for now.
+//
 // AND the mangrove fvOptions, on BOTH loops -- multiphaseMangrovesSource on U, and
 // multiphaseMangrovesTurbulenceModel on k and epsilon under kEpsilon, whose k and epsilon may be solved
 // with PBiCG and DILU: waves/mangroveInteraction, held by tests/interfoam_mangrove_vs_openfoam.sh.

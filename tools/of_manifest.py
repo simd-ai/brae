@@ -2803,6 +2803,50 @@ COMPONENTS = {
                   "as the host refuses it. FOUND BY THIS PORT: the device closure set its Gauss-Seidel sweep "
                   "unconditionally, so a case naming PBiCG would have run a smoothSolver under that entry in "
                   "silence; it selects by name now and refuses what it does not run."),
+        dict(name="interFoam_CrankNicolson", of_symbol="CrankNicolsonDdtScheme",
+             of_file="src/finiteVolume/finiteVolume/ddtSchemes/CrankNicolsonDdtScheme/CrankNicolsonDdtScheme.C",
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/finiteVolume/finiteVolume/ddtSchemes/CrankNicolsonDdtScheme/crank_nicolson_ddt_scheme_cpp.cu",
+             validation="tests/interfoam_cn_vs_openfoam.sh, real OpenFOAM on RAS/damBreak with `default CrankNicolson 0.5` "
+                        "in the shipped Euler's place, 20 fixed steps of 1e-3, BOTH ARMS, three profiles: `cn` (the "
+                        "tutorial's PIMPLE), `cnOuter` (nOuterCorrectors 2: every ddt0 asked for twice a step, advanced "
+                        "once), `cnFull` (CrankNicolson 1, offCentre_'s other branch). MEASURED host: cn alpha 9.3e-15, "
+                        "p_rgh 8.0e-15, U 1.5e-14, k 8.9e-15, epsilon 6.0e-15; cnOuter 1.0e-14, 1.2e-14, 1.0e-14, 6.5e-15, "
+                        "6.3e-15; cnFull 2.4e-14, 9.8e-13, 1.3e-10, 5.3e-12, 4.3e-13; every p_rgh, alpha, k and epsilon "
+                        "count OpenFOAM's (60, 120 and 60 p_rgh solves). Device: cn 8.2e-15, 7.5e-15, 1.9e-12, 7.6e-15, "
+                        "7.3e-15; cnOuter 5.8e-15, 7.5e-15, 1.7e-12, 1.3e-14, 1.4e-14; cnFull 1.2e-14, 5.8e-13, 7.8e-11, "
+                        "3.1e-12, 2.6e-13; every count. THE CONTROL is OpenFOAM's own Euler against its CrankNicolson, U "
+                        "3.2e-02 (cn), 5.6e-02 (cnOuter), 5.4e-02 (cnFull). WHAT THE GATE FOUND: (1) phi's old-old level "
+                        "is CREATED on the second step as a copy of phi.oldTime() -- fvcDdtPhiCorr asks for it only inside "
+                        "its evaluate branch, and GeometricField::oldTime() creates a missing level from the one it hangs "
+                        "off -- so dphidt0's first estimate is 0; with phi^0 in its place U 2.3e-01 after two steps, alpha "
+                        "5e-15 (the alpha step reads no old-old level). U's and rho's levels are asked for on the first step "
+                        "at the top of fvmDdt and rotate normally. (2) The DEVICE alpha step reset alpha1 to its old time at "
+                        "the start of every outer pass, which OpenFOAM's alphaEqn.H never does: with nOuterCorrectors 2 the "
+                        "second pass's first p_rgh residual 1.2e-06 from OpenFOAM's, k 6.7e-06 and U 2.0e-06 after two "
+                        "steps, under Euler as under CrankNicolson (tests/interfoam_ras_dambreak_vs_openfoam.sh's new `outer` "
+                        "profile holds it). BROKEN ONCE EACH: see the gate script's table. NOT CLAIMED, each refused by name: "
+                        "a Function1 ocCoeff (the ramp), the scheme on one operand set and Euler on the other, a moving mesh "
+                        "(the V0/V00 branch and fvcDdtUfCorr), a mangrove source under it, a closure other than kEpsilon, "
+                        "alpha sub-cycling (OpenFOAM's own FatalError), a restart directory holding ddt0 fields or alphaPhi0, "
+                        "a coupled pair on the device loop, fvc::ddt.",
+             note="THE SCHEME IS A STATE. Every fvm::ddt keeps the previous step's ddt as a registry field named after its "
+                  "operands (ddt0(rho,U), ddt0(rho,k), ddt0(rho,epsilon), ddtCorrDdt0(U), ddtCorrDdt0(phi)), created zero "
+                  "at its first assembly and advanced once per time index by the first assembly of the step (evaluate()); "
+                  "coef = 1 + oc once timeIndex > startTimeIndex, coef0 = 1 + oc once timeIndex > startTimeIndex + 1, "
+                  "offCentre(x) = oc*x below 1 and x at 1: Euler for one step, an Euler-estimated ddt0 for the next, the "
+                  "scheme from the third. Static mesh: diag = (rDtCoef*rho)*V, source = ((rDtCoef*rhoOld)*vfOld + "
+                  "offCentre(ddt0))*V, ddt0 <- rDtCoef0*(rhoOld*vfOld - rhoOO*vfOO) - offCentre(ddt0), with rDtCoef = "
+                  "coef/deltaT and rDtCoef0 = coef0/deltaT0 as single divisions. fvcDdtPhiCorr(U, phi) is the two-argument "
+                  "fvcDdtPhiCoeff times ((rDtCoef*phiOld + offCentre(dphidt0)) - (Sf & interpolate(rDtCoef*UOld + "
+                  "offCentre(ddt0)))) with dotInterpolate's lambda*(P - N) + N. alphaEqn.H's own blend: phiCN = "
+                  "cnCoeff*phi + (1 - cnCoeff)*phi.oldTime() once timeIndex > startTimeIndex + 1, cnCoeff = 1/(1 + oc); "
+                  "with ddt(rho,U) not Euler the end-of-step alpha flux is un-blended against alphaPhi10.oldTime() -- a "
+                  "level CREATED by that first call as a copy of the current flux -- and rhoPhi takes phi beside rho2. "
+                  "The device transcribes the host module (device_crank_nicolson_ddt.cu) and its state lives in the "
+                  "driver (DeviceInterCrankNicolson) and the closure (DeviceInterTurbulence). Why RAS/damBreak and not "
+                  "floatingObject: the one shipped tutorial naming CrankNicolson also moves its mesh under rigidBodyMotion "
+                  "(rigidBodyDynamics, a Newmark solver), which brae does not carry; its refusal now names the body."),
         dict(name="interFoam_variableHeightFlowRate", of_symbol="variableHeightFlowRateInletVelocityFvPatchVectorField",
              of_file="src/finiteVolume/fields/fvPatchFields/derived/variableHeightFlowRateInletVelocity/"
                      "variableHeightFlowRateInletVelocityFvPatchVectorField.C",

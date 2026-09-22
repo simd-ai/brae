@@ -1,6 +1,7 @@
 // interFoam's createFields -- see inter_case_cpp.cuh for the provenance and for the four things the
 // order of this file encodes.
 #include "inter_case_cpp.cuh"
+#include "crank_nicolson_ddt_scheme_cpp.cuh"
 #include "inter_peqn_cpp.cuh"
 #include "brae_notice.cuh"
 #include "foam_field_reader.cuh"
@@ -690,11 +691,30 @@ InterFields buildInterFields(const std::string&          caseDir,
         // READ AND THEN NEVER USED: neither driver handed ddtU to the momentum equation, whose
         // input defaults to Euler, so `CrankNicolson 0.5` (RAS/floatingObject) and `localEuler`
         // (RAS/DTCHull) would have run as Euler. Both tutorials were being stopped for other reasons.
-        if (f.ddtU != DdtScheme::Euler)
+        // CrankNicolson runs now -- the momentum equation, ddtCorr and the k-epsilon closure carry it
+        // (crank_nicolson_ddt_scheme_cpp.cuh), and alphaEqn.H's own blend follows ddt(alpha).
+        if (f.ddtU != DdtScheme::Euler && f.ddtU != DdtScheme::CrankNicolson)
             throw std::runtime_error(
                 "brae interFoam: ddtSchemes default is `" + dflt + "`. The momentum equation, the "
-                "ddt flux correction in pEqn and the turbulence closure carry Euler only; refusing "
-                "rather than running Euler under another scheme's name.");
+                "ddt flux correction in pEqn and the turbulence closure carry Euler and CrankNicolson; "
+                "refusing rather than running Euler under another scheme's name.");
+        if (f.ddtU == DdtScheme::CrankNicolson)
+        {
+            f.ddtOcCoeff = fv::readOcCoeff(dflt);
+        }
+        if (f.ddtAlpha == AlphaDdt::CrankNicolson)
+        {
+            f.ddtAlphaOcCoeff = fv::readOcCoeff(ddtEntry("ddt(alpha)", dflt));
+        }
+        // ...and the two must agree on the SCHEME: alphaEqn.H:236-262 forms rhoPhi one way when
+        // ddt(rho,U) is Euler and another when it is not, and the CrankNicolson blend of alpha's flux
+        // is what that other way un-blends. A case naming CrankNicolson for one and Euler for the
+        // other runs in OpenFOAM; no gate holds it.
+        if ((f.ddtU == DdtScheme::CrankNicolson) != (f.ddtAlpha == AlphaDdt::CrankNicolson))
+            throw std::runtime_error(
+                "brae interFoam: ddtSchemes names `" + dflt + "` for the default and `"
+                + ddtEntry("ddt(alpha)", dflt) + "` for ddt(alpha). brae runs the two under one scheme "
+                "(both Euler, or both CrankNicolson); the mixed case is not gated.");
 
         f.laplacianScheme = readNonOrthScheme(all, "laplacianSchemes");
         f.snGradScheme = readNonOrthScheme(all, "snGradSchemes");
@@ -1041,7 +1061,8 @@ InterFields buildInterFields(const std::string&          caseDir,
     {
         sharedWallDist = patchSet(patches, f.dynamicMesh->displacementSolver()->diffusivityPatches());
     }
-    f.turbulence = readInterTurbulence(caseDir, startDir, fvSolution, f.ddtU == DdtScheme::Euler,
+    f.turbulence = readInterTurbulence(caseDir, startDir, fvSolution,
+                                       f.ddtU == DdtScheme::Euler || f.ddtU == DdtScheme::CrankNicolson,
                                        f.laplacianScheme.corrected, f.laplacianScheme.limitCoeff,
                                        patches, nC, &m, &g, &sharedWallDist);
     if (f.turbulence.on && !f.pimple.turbOnFinalIterOnly && f.pimple.nOuterCorrectors > 1)
@@ -1124,6 +1145,51 @@ InterFields buildInterFields(const std::string&          caseDir,
         throw std::runtime_error(
             "brae interFoam: the case has an active fvOption AND an active MRF zone. Each is gated on "
             "its own tutorial and nothing holds the two together against OpenFOAM.");
+    // CrankNicolson, what it is NOT ported with. Each is a different branch of the scheme or a
+    // different consumer of it that no gate holds.
+    if (f.ddtU == DdtScheme::CrankNicolson)
+    {
+        if (f.dynamicMesh)
+            throw std::runtime_error(
+                "brae interFoam: ddtSchemes names CrankNicolson AND the mesh moves. The scheme's moving "
+                "branch weights ddt0 by V0 and V00 (CrankNicolsonDdtScheme.C:1025-1055) and ddtCorr by "
+                "Uf.oldTime().oldTime(); brae carries the static branch only. Refused rather than run the "
+                "static form on a moving mesh.");
+        for (const fvOptions::Option& o : f.fvOptions.options)
+        {
+            if (o.active && o.mangroves == fvOptions::Option::Mangroves::source)
+                throw std::runtime_error(
+                    "brae interFoam: ddtSchemes names CrankNicolson AND fvOptions has `" + o.name + "` "
+                    "(multiphaseMangrovesSource), whose added mass is inertiaCoeff*fvm::ddt(U) under the "
+                    "case's scheme -- a ddt0 field of its own that brae's option does not keep (it forms "
+                    "the Euler term). Refused rather than run one scheme under another's name.");
+        }
+        if (f.turbulence.on && f.turbulence.model != InterRasModel::KEpsilon)
+            throw std::runtime_error(
+                "brae interFoam: ddtSchemes names CrankNicolson and the closure is not kEpsilon. The "
+                "kOmegaSST and LES kEqn closures form their fvm::ddt as Euler; refused rather than run "
+                "them under CrankNicolson's name.");
+        // a restart from a directory OpenFOAM wrote under CrankNicolson: the ddt0 fields and alphaPhi0
+        // are read back there (ddt0_ with startTimeIndex -2, createAlphaFluxes.H's alphaRestart), and
+        // the scheme is CrankNicolson from the first step. brae reads neither.
+        for (const char* name : {"ddt0(rho,U)", "ddtCorrDdt0(U)", "ddtCorrDdt0(phi)", "ddt0(rho,k)",
+                                 "ddt0(k)", "ddt0(rho,epsilon)", "ddt0(epsilon)"})
+        {
+            if (std::filesystem::exists(startDir + "/" + name))
+                throw std::runtime_error(
+                    "brae interFoam: ddtSchemes names CrankNicolson and the start directory holds `"
+                    + std::string(name) + "`, which OpenFOAM reads back as the scheme's previous-step "
+                    "ddt and runs CrankNicolson from the first step. brae starts the scheme cold. Refused "
+                    "rather than run a different first step.");
+        }
+        if (std::filesystem::exists(startDir + "/alphaPhi0." + f.alphaName.substr(f.alphaName.find('.') + 1))
+         || std::filesystem::exists(startDir + "/alphaPhi0"))
+            throw std::runtime_error(
+                "brae interFoam: ddtSchemes names CrankNicolson and the start directory holds alphaPhi0, "
+                "which OpenFOAM reads back (createAlphaFluxes.H, alphaRestart) and then off-centres "
+                "alpha's flux from the first step. brae starts cold. Refused rather than run a different "
+                "first step.");
+    }
     if (!f.mrfZones.empty() && f.dynamicMesh)
         throw std::runtime_error(
             "brae interFoam: the case has an active MRF zone AND a moving mesh. MRF.update() rebuilds "

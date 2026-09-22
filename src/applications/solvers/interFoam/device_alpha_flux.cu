@@ -262,6 +262,60 @@ void deviceCompressionFlux(
 }
 
 
+namespace {
+__global__ void unblendKernel(
+    int n,
+    scalar oneMinusCn,
+    scalar cn,
+    const scalar* old,
+    scalar* a)
+{
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= n) return;
+    a[i] = (a[i] - oneMinusCn*old[i])/cn;
+}
+__global__ void offCentredKernel(
+    int n,
+    scalar cn,
+    scalar oneMinusCn,
+    const scalar* phi,
+    const scalar* phiOld,
+    scalar* phiCN)
+{
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= n) return;
+    phiCN[i] = cn*phi[i] + oneMinusCn*phiOld[i];
+}
+}   // namespace
+
+void deviceUnblendAlphaFlux(
+    int n,
+    scalar cnCoeff,
+    const DeviceBuffer<scalar>& old,
+    DeviceBuffer<scalar>& alphaPhi)
+{
+    if (n <= 0) return;
+    if (old.size() < static_cast<std::size_t>(n) || alphaPhi.size() < static_cast<std::size_t>(n))
+        throw std::runtime_error("brae deviceUnblendAlphaFlux: the two fluxes are shorter than the face count.");
+    unblendKernel<<<nBlocks(n), TPB>>>(n, scalar(1) - cnCoeff, cnCoeff, old.data(), alphaPhi.data());
+    ckA(cudaGetLastError(), "unblend alpha flux");
+}
+
+void deviceOffCentredFlux(
+    int n,
+    scalar cnCoeff,
+    const DeviceBuffer<scalar>& phi,
+    const DeviceBuffer<scalar>& phiOld,
+    DeviceBuffer<scalar>& phiCN)
+{
+    phiCN.resize(static_cast<std::size_t>(n));
+    if (n <= 0) return;
+    if (phi.size() < static_cast<std::size_t>(n) || phiOld.size() < static_cast<std::size_t>(n))
+        throw std::runtime_error("brae deviceOffCentredFlux: phi or phi.oldTime() is shorter than the face count.");
+    offCentredKernel<<<nBlocks(n), TPB>>>(n, cnCoeff, scalar(1) - cnCoeff, phi.data(), phiOld.data(), phiCN.data());
+    ckA(cudaGetLastError(), "off-centred flux");
+}
+
 void deviceMassFlux(
     int                         n,
     const DeviceBuffer<scalar>& alphaPhi,

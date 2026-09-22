@@ -30,6 +30,7 @@
 // patch values and its contact angle, fvm::div's per-patch coefficients for the alpha pre-solve, U's
 // boundary for the momentum matrix, and p_rgh's for the pressure laplacian. All four arrive through
 // `hooks`. Everything that scales with the CELL COUNT runs on the device.
+#include "device_crank_nicolson_ddt.cuh"
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
@@ -151,8 +152,41 @@ struct DeviceInterStepTaps
     DeviceBuffer<scalar> preSolveAlpha, preSolveAlphaPhiIf;
 };
 
+// CRANKNICOLSON on the device loop (device_crank_nicolson_ddt.cuh), owned by the driver because every
+// piece of it outlives a step: the scheme's clock, the three ddt0 fields the step's equations keep --
+// the momentum's "ddt0(rho,U)", ddtCorr's "ddtCorrDdt0(U)" and "ddtCorrDdt0(phi)" -- and the old-old
+// levels they read. alpha1's old-old level stands for rho.oldTime().oldTime(): the step rebuilds that
+// density from it exactly as it rebuilds rho.oldTime() from alpha1.oldTime(). phi's is the driver's to
+// create when OpenFOAM creates it (inter_driver_cpp.cu, phiOOExists). alphaEqn.H's own blend and the
+// un-blend of the end-of-step alpha flux travel here too, with alphaPhi10's old level and where to
+// leave the new one. The turbulence closure keeps its own (DeviceInterTurbulence).
+struct DeviceInterCrankNicolson
+{
+    const cpu::fv::CrankNicolsonClock* clock = nullptr;
+    DeviceCnDdt0 ddt0RhoU;
+    DeviceCnDdt0 ddtCorrU;
+    DeviceCnDdt0 ddtCorrPhi;
+    const DeviceBuffer<scalar>* UOO[3] = {nullptr, nullptr, nullptr};
+    const DeviceBuffer<scalar>* UOOBnd[3] = {nullptr, nullptr, nullptr};
+    const DeviceBuffer<scalar>* alpha1OO = nullptr;
+    const DeviceBuffer<scalar>* phiOOInt = nullptr;
+    const DeviceBuffer<scalar>* phiOOBnd = nullptr;
+    // alphaEqn.H:18-56, :91-97, :236-262 -- the off-centring coefficient the scheme constructed for
+    // ddt(alpha) gives on THIS step (0 before the scheme is warm), its cnCoeff, and alphaPhi10's levels
+    scalar ocAlpha = 0;
+    scalar cnAlpha = 1;
+    const DeviceBuffer<scalar>* alphaPhiOldInt = nullptr;   // null with ocAlpha > 0: created by this step
+    const DeviceBuffer<scalar>* alphaPhiOldBnd = nullptr;
+    DeviceBuffer<scalar>* alphaPhiOutInt = nullptr;
+    DeviceBuffer<scalar>* alphaPhiOutBnd = nullptr;
+    DeviceBuffer<scalar>* alphaPhiCreatedInt = nullptr;
+    DeviceBuffer<scalar>* alphaPhiCreatedBnd = nullptr;
+};
+
 struct DeviceInterStepControls
 {
+    // CrankNicolson, or null for Euler -- see DeviceInterCrankNicolson
+    DeviceInterCrankNicolson* cn = nullptr;
     // the cell volumes the mesh had BEFORE this step's move, for the ddt's old-time term
     // (OF EulerDdtScheme: rho.oldTime()*U.oldTime()*Vsc0()). Null on a static mesh.
     const DeviceBuffer<scalar>* V0 = nullptr;

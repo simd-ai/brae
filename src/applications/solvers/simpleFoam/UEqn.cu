@@ -466,9 +466,27 @@ void assembleUEqn(
                 "brae momentum: a transient ddt needs rho, rho.oldTime() and all three components of "
                 "U.oldTime(). rho.oldTime() is NOT rho at a VoF interface -- they differ by the density "
                 "ratio -- so it is a separate argument and cannot be defaulted to the first.");
-        deviceInterEulerDdtRhoU(dm, *in.ddtRho, *in.ddtRhoOld,
-                                *in.ddtUOld[0], *in.ddtUOld[1], *in.ddtUOld[2], in.ddtDeltaT,
-                                M.diag, M.source[0], M.source[1], M.source[2], in.ddtV0);
+        if (in.ddtCn)
+        {
+            // CrankNicolson, transcribed from the host reference (crank_nicolson_ddt_scheme_cpp.cu)
+            if (!in.ddtCnDdt0 || !in.ddtRhoOO || !in.ddtUOO[0] || !in.ddtUOO[1] || !in.ddtUOO[2])
+                throw std::runtime_error(
+                    "brae momentum: CrankNicolson's fvm::ddt(rho, U) needs its ddt0 field, "
+                    "rho.oldTime().oldTime() and all three components of U.oldTime().oldTime().");
+            if (in.ddtV0)
+                throw std::runtime_error(
+                    "brae momentum: CrankNicolson's fvm::ddt on a moving mesh is the scheme's moving "
+                    "branch, which brae does not carry.");
+            DeviceBuffer<scalar>* src[3] = {&M.source[0], &M.source[1], &M.source[2]};
+            deviceCnFvmDdt(*in.ddtCn, *in.ddtCnDdt0, in.ddtRho, in.ddtRhoOld, in.ddtRhoOO, 3,
+                           in.ddtUOld, in.ddtUOO, dm.V, M.diag, src);
+        }
+        else
+        {
+            deviceInterEulerDdtRhoU(dm, *in.ddtRho, *in.ddtRhoOld,
+                                    *in.ddtUOld[0], *in.ddtUOld[1], *in.ddtUOld[2], in.ddtDeltaT,
+                                    M.diag, M.source[0], M.source[1], M.source[2], in.ddtV0);
+        }
     }
 
     // ---- UEqn.relax() -----------------------------------------------------------------------

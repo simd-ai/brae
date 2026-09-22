@@ -63,6 +63,7 @@
 #include "device_colour_gauss_seidel.cuh"   // DeviceCellColouring: the colour-order smoothSolver (FP-1)
 #include "kepsilon_coeffs.cuh"
 #include "pEqn.cuh"               // PressureMatrix -- the assembled scalar object, shared not redefined
+#include "device_crank_nicolson_ddt.cuh"
 #include <string>
 
 namespace brae {
@@ -144,6 +145,19 @@ struct KEpsilonInput
     // ...or `solver PBiCG; preconditioner DILU;` for BOTH equations (device_pbicg.cuh): NOT PBiCGStab,
     // and it needs `precon` below to carry the mesh's DILU schedule. waves/mangroveInteraction names it.
     bool   pbicgKE = false;
+    // ...or CrankNicolson's fvm::ddt in Euler's place (device_crank_nicolson_ddt.cuh), transcribed from
+    // the host closure: the scheme's clock, the two equations' OWN ddt0 fields kept by the caller across
+    // steps, rho.oldTime().oldTime() (the ones vector in the incompressible lineage, as rhoCell is) and
+    // the fields' old-old levels (k.oldTime().oldTime(), which the caller rotates once per time index).
+    // rDeltaT must still be positive -- it marks the equation transient and the old levels are taken
+    // -- but the Euler term is not added. The static form only; the interFoam driver refuses
+    // CrankNicolson beside a moving mesh before the closure is built.
+    const cpu::fv::CrankNicolsonClock* cn = nullptr;
+    DeviceCnDdt0*               cnDdt0Eps = nullptr;
+    DeviceCnDdt0*               cnDdt0K   = nullptr;
+    const DeviceBuffer<scalar>* rhoOOCell = nullptr;
+    const DeviceBuffer<scalar>* epsOO     = nullptr;
+    const DeviceBuffer<scalar>* kOO       = nullptr;
     // + fvOptions(epsilon) and + fvOptions(k) for an option whose addSup is -fvm::Sp(coeff, field): one
     // coefficient per cell, which the matrix takes as diag += V*coeff after every other term and before
     // relax() (kEpsilon.C:258 and :279). The CALLER forms the coefficient, from whatever the option

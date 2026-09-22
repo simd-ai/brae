@@ -106,6 +106,21 @@ void deviceInterStep(
     ain.phiBnd   = &phiBnd;
     ain.phiCNInt = &phiInt;                 // Euler: phiCN IS phi
     ain.phiCNBnd = &phiBnd;
+    // ...and under CrankNicolson the off-centred flux, alphaEqn.H:91-97: phiCN = cnCoeff*phi +
+    // (1 - cnCoeff)*phi.oldTime() once the scheme is warm, phi itself before (ocAlpha 0). The host
+    // driver forms it the same way (offCentredFlux, inter_driver_cpp.cu).
+    DeviceBuffer<scalar> phiCNInt, phiCNBnd;
+    if (ctl.cn && ctl.cn->ocAlpha > scalar(0))
+    {
+        if (ctl.cyc && ctl.cyc->n > 0)
+            throw std::runtime_error(
+                "brae interFoam device step: CrankNicolson on a mesh with a coupled pair is not carried "
+                "(the pair's off-centred flux and end-of-step alpha flux).");
+        deviceOffCentredFlux(nIf, ctl.cn->cnAlpha, phiInt, phiOldInt, phiCNInt);
+        deviceOffCentredFlux(nBf, ctl.cn->cnAlpha, phiBnd, phiOldBnd, phiCNBnd);
+        ain.phiCNInt = &phiCNInt;
+        ain.phiCNBnd = &phiCNBnd;
+    }
     // THE PAIR, whose faces are in neither array above. Its volumetric flux lives in cyc->phi and is
     // the caller's to keep current -- the pressure corrector rewrites it at the end of every pass, as
     // it rewrites phi -- and phiCN is that same flux under Euler, exactly as above.
@@ -123,6 +138,19 @@ void deviceInterStep(
     actl.nHatfIf      = ctl.nHatfIf;
     actl.preSolveAlphaOut      = taps ? &taps->preSolveAlpha : nullptr;
     actl.preSolveAlphaPhiIfOut = taps ? &taps->preSolveAlphaPhiIf : nullptr;
+    if (ctl.cn)
+    {
+        // alphaEqn.H:236-262: ddt(rho,U) is not Euler, so rhoPhi takes phi beside rho2 and the
+        // end-of-step alpha flux is un-blended when the scheme is warm
+        actl.rhoPhiFromPhi = true;
+        actl.cnCoeffUnblend = (ctl.cn->ocAlpha > scalar(0)) ? ctl.cn->cnAlpha : scalar(1);
+        actl.alphaPhiOldInt = ctl.cn->alphaPhiOldInt;
+        actl.alphaPhiOldBnd = ctl.cn->alphaPhiOldBnd;
+        actl.alphaPhiOutInt = ctl.cn->alphaPhiOutInt;
+        actl.alphaPhiOutBnd = ctl.cn->alphaPhiOutBnd;
+        actl.alphaPhiCreatedInt = ctl.cn->alphaPhiCreatedInt;
+        actl.alphaPhiCreatedBnd = ctl.cn->alphaPhiCreatedBnd;
+    }
     deviceInterAlphaStep(dm, alpha1, alpha1Old, deltaT, ain, ctl.mules, actl, props, hooks.alpha,
                          alpha1Bnd, nHatfBnd, bndAlphaFixesValue, bndAlphaFlag,
                          nHatfInt, K, rhoPhiInt, rhoPhiBnd, alpha2, rho, mu, nu);
@@ -236,6 +264,17 @@ void deviceInterStep(
         rhoOld.resize(static_cast<std::size_t>(nC));
         deviceMixtureCorrect(alpha1Old.data(), nC, props, nullptr, rhoOld.data(), nullptr, nullptr);
     }
+    // ...and rho.oldTime().oldTime() for CrankNicolson, from alpha1's old-old level the same way
+    DeviceBuffer<scalar> rhoOO;
+    if (ctl.cn)
+    {
+        if (!ctl.cn->clock || !ctl.cn->alpha1OO || ctl.cn->alpha1OO->size() != static_cast<std::size_t>(nC))
+            throw std::runtime_error(
+                "brae interFoam device step: CrankNicolson needs the scheme's clock and alpha1's old-old "
+                "level, one value per cell, for rho.oldTime().oldTime().");
+        rhoOO.resize(static_cast<std::size_t>(nC));
+        deviceMixtureCorrect(ctl.cn->alpha1OO->data(), nC, props, nullptr, rhoOO.data(), nullptr, nullptr);
+    }
 
     // U's STORED boundary values, filled by the hook from the host's evaluate -- see the hook's own
     // comment for why deviceBCValue is not a substitute.
@@ -266,6 +305,13 @@ void deviceInterStep(
     uin.ddtUOld[1]    = &UOldY;
     uin.ddtUOld[2]    = &UOldZ;
     uin.ddtDeltaT     = deltaT;
+    if (ctl.cn)
+    {
+        uin.ddtCn = ctl.cn->clock;
+        uin.ddtCnDdt0 = &ctl.cn->ddt0RhoU;
+        uin.ddtRhoOO = &rhoOO;
+        for (int k = 0; k < 3; ++k) uin.ddtUOO[k] = ctl.cn->UOO[k];
+    }
     uin.UbStored      = ubPtr;
     // + MRF.DDt(rho, U), UEqn.H:6, rho-weighted as MRFZoneList::DDt(rho, U) is (MRFZoneList.C:210-217)
     // and as the host arm forms it (inter_ueqn_cpp.cu:207-221). The shared assembler puts it in the
@@ -437,11 +483,28 @@ void deviceInterStep(
         // (ddtPhiCoeff_ = -1), not a constant: it switches the correction off where it is large
         // compared with the flux, and it is zero on every patch where U fixes a value.
         DeviceBuffer<scalar> ddtCorrI, ddtCorrB, ddtCorrIf;
-        deviceDdtCorr(dm, phiOldInt, phiOldBnd, UOldX, UOldY, UOldZ, bndUFixesValue,
-                      /*ddtPhiCoeff=*/scalar(-1), deltaT, ddtCorrI, ddtCorrB,
-                      &UOldBndX, &UOldBndY, &UOldBndZ,
-                      // on a moving mesh (Sf & Uf.oldTime()) takes phi.oldTime()'s place
-                      ctl.phiUfOldInt);
+        if (ctl.cn)
+        {
+            // CrankNicolson's fvcDdtPhiCorr, with its two ddt0 fields, transcribed from the host
+            // reference; a moving mesh (phiUfOldInt) is the scheme's other operator and is refused
+            if (ctl.phiUfOldInt || !ctl.cn->phiOOInt || !ctl.cn->phiOOBnd)
+                throw std::runtime_error(
+                    "brae interFoam device step: CrankNicolson's ddtCorr needs phi.oldTime().oldTime() "
+                    "and a mesh that does not move.");
+            const DeviceBuffer<scalar>* uo[3] = {&UOldX, &UOldY, &UOldZ};
+            const DeviceBuffer<scalar>* uob[3] = {&UOldBndX, &UOldBndY, &UOldBndZ};
+            deviceCnDdtCorr(dm, *ctl.cn->clock, ctl.cn->ddtCorrU, ctl.cn->ddtCorrPhi, uo, ctl.cn->UOO,
+                            uob, ctl.cn->UOOBnd, phiOldInt, phiOldBnd, *ctl.cn->phiOOInt, *ctl.cn->phiOOBnd,
+                            bndUFixesValue, /*ddtPhiCoeff=*/scalar(-1), ddtCorrI, ddtCorrB);
+        }
+        else
+        {
+            deviceDdtCorr(dm, phiOldInt, phiOldBnd, UOldX, UOldY, UOldZ, bndUFixesValue,
+                          /*ddtPhiCoeff=*/scalar(-1), deltaT, ddtCorrI, ddtCorrB,
+                          &UOldBndX, &UOldBndY, &UOldBndZ,
+                          // on a moving mesh (Sf & Uf.oldTime()) takes phi.oldTime()'s place
+                          ctl.phiUfOldInt);
+        }
 
         // MRF.zeroFilter(interpolate(rho*rAU)*fvc::ddtCorr(U, phi)), pEqn.H:18. MRFZone::zero sets the
         // flux to Zero on the zone's internal faces and on its included AND excluded boundary faces

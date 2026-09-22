@@ -714,11 +714,20 @@ RunReport runInterFoamDevice(
         };
     }
     H.alpha.divCoeffs =
-        [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC)
+        [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC,
+            const DeviceBuffer<scalar>* phiCNBnd)
     {
         a.copyTo(f.alpha1.internal);
         f.alpha1.evaluateBoundary();
-        FvScalarMatrix M = fvm::div<scalar>(f.phi.internal, f.phi.boundary, f.alpha1, m, fvp);
+        // the flux the coefficients are built from: phiCN's patch values under CrankNicolson (a
+        // coupled patch keeps the host's -- the device array holds none, and the pre-solve adds the
+        // pair's coefficients itself), phi's otherwise
+        std::vector<std::vector<scalar>> fluxBnd = f.phi.boundary;
+        if (phiCNBnd)
+        {
+            unflatten(*phiCNBnd, fluxBnd);
+        }
+        FvScalarMatrix M = fvm::div<scalar>(f.phi.internal, fluxBnd, f.alpha1, m, fvp);
         std::vector<scalar> i2, b2;
         // The device's boundary arrays hold the UNCOUPLED patches only, as its mesh does
         // (device_mesh.cuh:41-44): a coupled patch's coefficients are the interface's, and the alpha
@@ -1259,6 +1268,28 @@ RunReport runInterFoamDevice(
     }
 
     // ---- controls --------------------------------------------------------------------------------
+    // CRANKNICOLSON's state, the host driver's set on the device (inter_driver_cpp.cu, `cnDdt`): the
+    // old-old level of U (cells and patches) and of alpha1 -- rho.oldTime().oldTime() is the mixture
+    // at it -- rotated with the old ones; phi's, created when OpenFOAM creates it; the three ddt0
+    // fields; and alphaPhi10's levels for alphaEqn.H's un-blend. The closure keeps its own.
+    const bool cnDdt = (f.ddtU == DdtScheme::CrankNicolson);
+    DeviceBuffer<scalar> dAOO(f.alpha1.internal);
+    DeviceBuffer<scalar> dUoox(f.U.internal.size()), dUooy(f.U.internal.size()), dUooz(f.U.internal.size());
+    DeviceBuffer<scalar> dUoobx, dUooby, dUoobz;
+    DeviceBuffer<scalar> dPhiOOI, dPhiOOB;
+    std::vector<scalar> phiOldPrevI, phiOldPrevB;
+    bool phiOOExists = false;
+    scalar deltaTPrev = f.deltaT;
+    cpu::fv::CrankNicolsonClock cnClock;
+    cnClock.ocCoeff = f.ddtOcCoeff;
+    DeviceInterCrankNicolson dCn;
+    dCn.clock = &cnClock;
+    dCn.ddt0RhoU.name = "ddt0(rho,U)";
+    dCn.ddtCorrU.name = "ddtCorrDdt0(U)";
+    dCn.ddtCorrPhi.name = "ddtCorrDdt0(phi)";
+    DeviceBuffer<scalar> dAlphaPhiEndI, dAlphaPhiEndB, dAlphaPhiOldI, dAlphaPhiOldB, dAlphaPhiOutI, dAlphaPhiOutB;
+    bool alphaPhiOldExists = false;
+    label alphaPhiOldIndex = -1;
     DeviceInterStepControls C;
     C.alpha.nAlphaSubCycles = static_cast<int>(f.alphaCtl.nAlphaSubCycles);
     C.alpha.nAlphaCorr      = static_cast<int>(f.alphaCtl.nAlphaCorr);
@@ -1346,6 +1377,7 @@ RunReport runInterFoamDevice(
     cycPhiForHost = (dCyc.n > 0) ? &dCyc.phi : nullptr;
     C.porosity = dPorosity.active ? &dPorosity : nullptr;
     C.mangroves = dMangroves.source ? &dMangroves : nullptr;
+    C.cn = cnDdt ? &dCn : nullptr;
     // p_rgh's reference, where the host driver sets it (inter_driver_cpp.cu:779-781). These three were
     // dead for as long as the device refused a case that needs one, and a step that never pins leaves the
     // singular system's level to the solver: MEASURED on laminar/mixerVessel2D before they were set, a
@@ -1616,6 +1648,21 @@ RunReport runInterFoamDevice(
             }
         }
 
+        // the old-old levels CrankNicolson reads take the old ones first (GeometricField::storeOldTime
+        // recurses into the old level before overwriting it)
+        if (cnDdt)
+        {
+            deviceCopy(dAOO, dAOld);
+            deviceCopy(dUoox, dUox);
+            deviceCopy(dUooy, dUoy);
+            deviceCopy(dUooz, dUoz);
+            if (dUobx.size())
+            {
+                deviceCopy(dUoobx, dUobx);
+                deviceCopy(dUooby, dUoby);
+                deviceCopy(dUoobz, dUobz);
+            }
+        }
         std::vector<scalar> ca, cx, cy, cz;
         dA.copyTo(ca);   dAOld.copyFrom(ca);
         dUx.copyTo(cx);  dUy.copyTo(cy);  dUz.copyTo(cz);
@@ -1631,10 +1678,77 @@ RunReport runInterFoamDevice(
                 }
             }
             dUobx.copyFrom(bx); dUoby.copyFrom(by); dUobz.copyFrom(bz);
+            // ...and at the first step the old-old patch values, which are the old ones (a copy)
+            if (cnDdt && dUoobx.size() == 0)
+            {
+                dUoobx.copyFrom(bx); dUooby.copyFrom(by); dUoobz.copyFrom(bz);
+            }
         }
         std::vector<scalar> poi, pob;
         dPhiI.copyTo(poi); dPhiB.copyTo(pob);
         DeviceBuffer<scalar> dPhiOI(poi), dPhiOB(pob);
+        if (cnDdt)
+        {
+            // phi.oldTime().oldTime(): rotated once it exists; CREATED, as a copy of phi.oldTime(), on
+            // the step whose first ddtCorr evaluates dphidt0 and so asks for it -- the host driver's
+            // phiOOExists, with the measurement
+            const label thisIndex = s + 1;
+            if (phiOOExists)
+            {
+                dPhiOOI.copyFrom(phiOldPrevI);
+                dPhiOOB.copyFrom(phiOldPrevB);
+            }
+            else if (dCn.ddtCorrPhi.exists && dCn.ddtCorrPhi.timeIndex != thisIndex)
+            {
+                dPhiOOI.copyFrom(poi);
+                dPhiOOB.copyFrom(pob);
+                phiOOExists = true;
+            }
+            else
+            {
+                dPhiOOI.copyFrom(poi);   // read by nothing on the step the field is created
+                dPhiOOB.copyFrom(pob);
+            }
+            phiOldPrevI = poi;
+            phiOldPrevB = pob;
+            dCn.phiOOInt = &dPhiOOI;
+            dCn.phiOOBnd = &dPhiOOB;
+            dCn.alpha1OO = &dAOO;
+            dCn.UOO[0] = &dUoox; dCn.UOO[1] = &dUooy; dCn.UOO[2] = &dUooz;
+            dCn.UOOBnd[0] = &dUoobx; dCn.UOOBnd[1] = &dUooby; dCn.UOOBnd[2] = &dUoobz;
+            // Time::operator++: deltaT0_ = deltaTSave_; deltaTSave_ = deltaT_
+            cnClock.timeIndex = thisIndex;
+            cnClock.deltaT = rep.deltaT;
+            cnClock.deltaT0 = deltaTPrev;
+            deltaTPrev = rep.deltaT;
+            // alphaEqn.H:18-56: the off-centring the scheme constructed for ddt(alpha) gives on this
+            // step -- 0 before the scheme is warm -- and alphaPhi10.oldTime(), created by the first
+            // un-blend as a copy of the current flux, then the flux the previous step ended on
+            dCn.ocAlpha = offCentringCoeff(f.ddtAlpha, f.alphaCtl.nAlphaSubCycles, f.ddtAlphaOcCoeff,
+                                           thisIndex > 1);
+            dCn.cnAlpha = blendingCoeff(dCn.ocAlpha);
+            dCn.alphaPhiOldInt = nullptr;
+            dCn.alphaPhiOldBnd = nullptr;
+            if (dCn.ocAlpha > scalar(0))
+            {
+                if (alphaPhiOldExists)
+                {
+                    if (alphaPhiOldIndex != thisIndex)
+                    {
+                        deviceCopy(dAlphaPhiOldI, dAlphaPhiEndI);
+                        deviceCopy(dAlphaPhiOldB, dAlphaPhiEndB);
+                        alphaPhiOldIndex = thisIndex;
+                    }
+                    dCn.alphaPhiOldInt = &dAlphaPhiOldI;
+                    dCn.alphaPhiOldBnd = &dAlphaPhiOldB;
+                }
+                // ...else null: the step's first un-blend creates the level from the current flux
+            }
+            dCn.alphaPhiOutInt = &dAlphaPhiOutI;
+            dCn.alphaPhiOutBnd = &dAlphaPhiOutB;
+            dCn.alphaPhiCreatedInt = &dAlphaPhiOldI;
+            dCn.alphaPhiCreatedBnd = &dAlphaPhiOldB;
+        }
         // ...and the PAIR's flux at the same instant. fvc::ddtCorr compares phi.oldTime() with the
         // flux of U.oldTime() on every face a coupled patch included, and the pressure corrector
         // rewrites cyc.phi, so the snapshot has to be taken here with the other two.
@@ -1668,6 +1782,18 @@ RunReport runInterFoamDevice(
                 dRhoOld.copyFrom(f.rho);
             }
         }
+        // ...and rho.oldTime().oldTime() for its CrankNicolson ddt: the mixture at alpha1's old-old
+        // level, rebuilt as the step rebuilds rho.oldTime() from alpha1.oldTime()
+        DeviceBuffer<scalar> dRhoOO;
+        if (cnDdt && deviceClosure && f.turbulence.variableDensity)
+        {
+            dRhoOO.resize(static_cast<std::size_t>(nC));
+            deviceMixtureCorrect(dAOO.data(), nC, props, nullptr, dRhoOO.data(), nullptr, nullptr);
+        }
+        if (cnDdt && hostClosure)
+            throw std::runtime_error(
+                "brae interFoam (device): BRAE_INTER_HOST_CLOSURE under CrankNicolson is not carried "
+                "(the instrument keeps no rho.oldTime().oldTime() for the host closure).");
 
         // THE PIMPLE OUTER LOOP, interFoam.C:107-176 and the host's runTimeStep
         // (inter_solve_cpp.cu:111-131). Every outer corrector re-solves alpha from the SAME
@@ -1758,6 +1884,24 @@ RunReport runInterFoamDevice(
                             dPhiI, dPhiB, dPhiOI, dPhiOB, dUFixes, dPrgh, dP,
                             dNH, dNHB, dABnd, dK, dAFixes, dAFlag, dbU,
                             dRho, dMu, dNu, dRpI, dRpB, tapsOut);
+            if (cnDdt && dCn.ocAlpha > scalar(0))
+            {
+                // the flux this pass ended on is alphaPhi10 as it stands: the next step's oldTime()
+                // stores it
+                deviceCopy(dAlphaPhiEndI, dAlphaPhiOutI);
+                deviceCopy(dAlphaPhiEndB, dAlphaPhiOutB);
+                if (!alphaPhiOldExists)
+                {
+                    // GeometricField::oldTime() on the first blended step: the level was created by this
+                    // pass as a copy of the flux BEFORE the un-blend (alphaPhiCreated*, written into the
+                    // old level's buffer), and the step's other passes read that same copy --
+                    // storeOldTimes stores nothing within a time index
+                    alphaPhiOldExists = true;
+                    alphaPhiOldIndex = s + 1;
+                    dCn.alphaPhiOldInt = &dAlphaPhiOldI;
+                    dCn.alphaPhiOldBnd = &dAlphaPhiOldB;
+                }
+            }
 
             // turbulence->correct(), interFoam.C:169-172 -- after this outer corrector's last
             // pressure corrector. dbU is current: the step's last updateUBoundary rebuilt it and the
@@ -1792,6 +1936,11 @@ RunReport runInterFoamDevice(
                               ? &rep.omegaSolves : &rep.epsilonSolves;
                 ti.kLog = &rep.kSolves;
                 ti.mangroves = dMangroves.turbulence ? &dMangroves : nullptr;
+                if (cnDdt)
+                {
+                    ti.cn = &cnClock;
+                    ti.rhoOO = &dRhoOO;
+                }
                 deviceCorrectInterTurbulence(dTurb, f.turbulence, ti, dm, dbU);
             }
             // ...or THE HOST CLOSURE in the same loop. f.U is current (the step's last updateUBoundary

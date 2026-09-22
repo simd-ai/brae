@@ -55,6 +55,7 @@
 // the defaults, and a moving mesh (y is taken once). The device loop runs kEpsilon's device twin,
 // device_inter_turbulence.cuh, and refuses kOmegaSST by name.
 #include "fvOptions_cpp.cuh"
+#include "crank_nicolson_ddt_scheme_cpp.cuh"
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
 #include "fv_geometry.cuh"
@@ -98,10 +99,25 @@ enum class InterRasModel
     KEqnLES
 };
 
+// The closure's CrankNicolson state: the two ddt0 fields OpenFOAM keeps on the registry, and the
+// old-old level of each field, which GeometricField::storeOldTimes rotates once per time index --
+// `entry` is the field at this step's first correct() (its oldTime()), `oo` the previous step's.
+struct InterTurbulenceCrankNicolson
+{
+    fv::CrankNicolsonDdt0<scalar> ddt0K;
+    fv::CrankNicolsonDdt0<scalar> ddt0Eps;
+    std::vector<scalar> kEntry;
+    std::vector<scalar> epsEntry;
+    std::vector<scalar> kOO;
+    std::vector<scalar> epsOO;
+    label timeIndex = -1;
+};
+
 struct InterTurbulence
 {
     // simulationType RAS. False is laminar: no fields, nuEff = nu, correct() does nothing.
     bool on = false;
+    InterTurbulenceCrankNicolson cn;
     InterRasModel model = InterRasModel::KEpsilon;
     // `density variable` -- see the header
     bool variableDensity = false;
@@ -215,6 +231,12 @@ struct InterTurbulenceStepInput
     std::vector<LinearSolveRecord>* kLog = nullptr;
     // kOmegaSST's first solve, omega before k as kOmegaSSTBase.C:555-607 has them
     std::vector<LinearSolveRecord>* omegaLog = nullptr;
+    // CrankNicolson: the scheme's clock and rho.oldTime().oldTime() (the `density variable` lineage
+    // reads it; null in the other). The closure keeps its own ddt0 fields and old-old levels
+    // (InterTurbulence::cn). Null runs the closure's fvm::ddt as Euler, which is what every other
+    // scheme entry the reader admits is.
+    const fv::CrankNicolsonClock* cn = nullptr;
+    const std::vector<scalar>* rhoOO = nullptr;
 };
 
 // turbulence->correct(), interFoam.C:171.

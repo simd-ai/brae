@@ -83,6 +83,7 @@
 //    R = -grad(p); it is written out again here because getting it backwards still converges.
 #include "fvOptions_cpp.cuh"
 #include "MRF_cpp.cuh"
+#include "crank_nicolson_ddt_scheme_cpp.cuh"
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
@@ -150,6 +151,13 @@ struct InterMomentumInput
 
     scalar    deltaT             = 0.0;          // > 0 always; interFoam has no steady path
     DdtScheme ddtScheme          = DdtScheme::Euler;
+    // CrankNicolson: the scheme's clock, the equation's OWN ddt0 field ("ddt0(rho,U)", kept by the
+    // driver across steps), and the old-old levels of rho and U it reads. Required together when
+    // ddtScheme is CrankNicolson; refused otherwise.
+    const fv::CrankNicolsonClock*   cn       = nullptr;
+    fv::CrankNicolsonDdt0<vector>*  cnDdt0   = nullptr;
+    const std::vector<scalar>*      rhoOO    = nullptr;
+    const std::vector<vector>*      UOO      = nullptr;
 
     DivScheme scheme             = DivScheme::upwind;
     scalar    schemeCoeff        = 1.0;          // limitedLinear's k

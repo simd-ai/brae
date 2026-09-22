@@ -151,7 +151,8 @@ int main()
         nBnd.copyFrom(flatten(nHb.boundary));
     };
     hooks.alpha.divCoeffs =
-        [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC)
+        [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC,
+            const DeviceBuffer<scalar>*)
     {
         a.copyTo(work.internal);
         work.evaluateBoundary();

@@ -188,6 +188,8 @@ add_library(brae_core STATIC
     src/applications/solvers/interFoam/device_inter_turbulence.cu
     src/applications/solvers/interFoam/inter_driver_device.cu
     src/applications/solvers/interFoam/inter_ueqn_cpp.cu
+    src/finiteVolume/finiteVolume/ddtSchemes/CrankNicolsonDdtScheme/crank_nicolson_ddt_scheme_cpp.cu
+    src/finiteVolume/finiteVolume/ddtSchemes/CrankNicolsonDdtScheme/device_crank_nicolson_ddt.cu
     src/applications/solvers/rhoSimpleFoam/rhoCreateFields_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoUEqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoUEqn.cu
@@ -3613,6 +3615,15 @@ target_include_directories(test_inter_mangrove_vs_openfoam PRIVATE ${BRAE_HEADER
 target_link_libraries(test_inter_mangrove_vs_openfoam PRIVATE brae_core)
 add_test(NAME interfoam_mangrove_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_mangrove_vs_openfoam.sh)
+
+# CrankNicolson ddt on RAS/damBreak, both arms (run by tests/interfoam_cn_vs_openfoam.sh)
+add_executable(test_inter_cn_vs_openfoam tests/test_inter_cn_vs_openfoam.cu)
+target_include_directories(test_inter_cn_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_cn_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_cn_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_cn_vs_openfoam.sh)
+set_tests_properties(interfoam_cn_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
 # OpenFOAM's faceAreaWeightAMI on the host, against the weights its own cyclicAMI holds on
 # RAS/mixerVesselAMI as the rotor turns (run by tests/interfoam_ami_vs_openfoam.sh)

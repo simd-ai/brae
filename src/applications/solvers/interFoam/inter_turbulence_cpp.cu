@@ -413,10 +413,12 @@ InterTurbulence readInterTurbulence(
             std::string(WHO) + file + " has `RAS { turbulence off; }`. The frozen model keeps the nut "
             "its construction left -- validate()'s in one lineage, the case file's in the other -- "
             "and no gate holds that against OpenFOAM yet. Refused rather than run ungated.");
-    if (!eulerDdt)
+    // kEpsilon carries CrankNicolson too (InterTurbulenceStepInput::cn); kOmegaSST does not, and the
+    // case reader has already said so by name where the two meet
+    if (!eulerDdt && t.model != InterRasModel::KEpsilon)
         throw std::runtime_error(
             std::string(WHO) + "the closure's two equations take fvm::ddt through ddtSchemes "
-            "(kEpsilon.C:254, :275; kOmegaSSTBase.C:558, :589) and the closures carry Euler only.");
+            "(kOmegaSSTBase.C:558, :589) and this closure carries Euler only.");
     t.coeffs.correctedLaplacian = laplacianCorrected;
     t.coeffs.snGradLimitCoeff = laplacianLimitCoeff;
 
@@ -737,6 +739,35 @@ void correctInterTurbulence(
     comp.nu = in.nu;
     comp.nuBnd = in.nuBnd;
     comp.rDeltaT = scalar(1) / in.deltaT;
+    if (in.cn)
+    {
+        // k.oldTime().oldTime(): GeometricField::storeOldTimes rotates the levels once per time
+        // index, on the first access of the step. At the first step of a cold start oldTime().oldTime()
+        // is created as a copy of oldTime(), and the scheme does not read it that step.
+        InterTurbulenceCrankNicolson& c = t.cn;
+        if (c.timeIndex != in.cn->timeIndex)
+        {
+            c.kOO = c.kEntry.empty() ? t.k.internal : c.kEntry;
+            c.epsOO = c.epsEntry.empty() ? t.epsilon.internal : c.epsEntry;
+            c.kEntry = t.k.internal;
+            c.epsEntry = t.epsilon.internal;
+            c.timeIndex = in.cn->timeIndex;
+        }
+        c.ddt0K.name = t.variableDensity ? "ddt0(rho,k)" : "ddt0(k)";
+        c.ddt0Eps.name = t.variableDensity ? "ddt0(rho,epsilon)" : "ddt0(epsilon)";
+        comp.cn = in.cn;
+        comp.cnDdt0K = &c.ddt0K;
+        comp.cnDdt0Eps = &c.ddt0Eps;
+        comp.kOO = &c.kOO;
+        comp.epsOO = &c.epsOO;
+        if (t.variableDensity)
+        {
+            if (!in.rhoOO)
+                throw std::runtime_error(
+                    std::string(WHO) + "CrankNicolson under `density variable` needs rho.oldTime().oldTime().");
+            comp.rhoOO = in.rhoOO;
+        }
+    }
     comp.nutPhi = in.phi;
     comp.V0 = in.V0;
     comp.meshPhi = in.meshPhi;

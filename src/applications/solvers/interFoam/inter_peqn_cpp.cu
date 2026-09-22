@@ -210,6 +210,27 @@ void ddtCorr(const DdtCorrInput&           in,
             "correction is the difference between them, at the OLD time (note 3).");
     if (in.deltaT <= scalar(0))
         throw std::runtime_error("brae interFoam ddtCorr: deltaT must be positive.");
+    // CrankNicolson's fvcDdtPhiCorr, a different operator with two ddt0 fields of its own
+    if (in.cn)
+    {
+        if (!in.cnDdt0U || !in.cnDdt0Phi || !in.UOO || !in.UOOBnd || !in.phiOO || !in.UOldBnd)
+            throw std::runtime_error(
+                "brae interFoam ddtCorr: CrankNicolson needs its two ddt0 fields, U.oldTime().oldTime() "
+                "(cells and patches), U.oldTime()'s patches and phi.oldTime().oldTime(); the caller "
+                "supplied fewer.");
+        if (in.UfOld)
+            throw std::runtime_error(
+                "brae interFoam ddtCorr: CrankNicolson on a moving mesh is fvcDdtUfCorr with "
+                "Uf.oldTime().oldTime(), which brae does not carry.");
+        std::vector<bool> fixes(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            fixes[pi] = U.boundary[pi]->fixesValue();
+        }
+        fv::fvcDdtPhiCorr(*in.cn, *in.cnDdt0U, *in.cnDdt0Phi, *in.UOld, *in.UOO, *in.UOldBnd, *in.UOOBnd,
+                          *in.phiOld, *in.phiOO, fixes, in.ddtPhiCoeff, m, g, patches, out);
+        return;
+    }
 
     const label nIf = m.nInternalFaces();
     const std::vector<label>&  own = m.owner();

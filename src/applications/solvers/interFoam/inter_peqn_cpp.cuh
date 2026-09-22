@@ -57,6 +57,7 @@
 //    totalPressure, which fixes a value -- but 8 of the shipped tutorials have no value-fixing p_rgh
 //    patch at all, and those all do.
 #include "MRF_cpp.cuh"
+#include "crank_nicolson_ddt_scheme_cpp.cuh"
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
@@ -172,6 +173,16 @@ struct DdtCorrInput
     // value is used verbatim as a constant coefficient.
     scalar ddtPhiCoeff = -1;
     scalar deltaT = 0;
+    // CrankNicolson: the scheme's clock, the two ddt0 fields of this correction ("ddtCorrDdt0(U)" and
+    // "ddtCorrDdt0(phi)", kept by the driver), and the old-old levels of U (cells and patches) and phi.
+    // All or none; with `cn` set the correction is fvcDdtPhiCorr's CrankNicolson form
+    // (crank_nicolson_ddt_scheme_cpp.cuh) and a moving mesh (UfOld) is refused.
+    const fv::CrankNicolsonClock*           cn       = nullptr;
+    fv::CrankNicolsonDdt0<vector>*          cnDdt0U  = nullptr;
+    fv::CrankNicolsonDdt0<scalar>*          cnDdt0Phi = nullptr;
+    const std::vector<vector>*              UOO      = nullptr;
+    const std::vector<std::vector<vector>>* UOOBnd   = nullptr;
+    const SurfaceScalarField*               phiOO    = nullptr;
 };
 
 // adjustPhi(phi, U, p): on a case that needs a pressure reference, scale the OUTFLOW of the patches
