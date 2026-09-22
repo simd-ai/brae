@@ -593,7 +593,7 @@ RunReport runInterFoamDevice(
             off += n;
         }
     };
-    auto pushFlux = [&](bool uPatchesStillUpdated = false)
+    auto pushFlux = [&](bool uCoefficientsKept = false)
     {
         unflatten(dPhiB, f.phi.boundary);
         // ...and the PAIR's own faces, which that array does not carry. Without this a
@@ -620,7 +620,7 @@ RunReport runInterFoamDevice(
         {
             unflatten(dRpB, f.rhoPhi.boundary);
         }
-        pushFluxToPatches(f, fvp, uPatchesStillUpdated);
+        pushFluxToPatches(f, fvp, uCoefficientsKept);
     };
 
     // THE WAVE CONDITIONS' CLOCK: OpenFOAM's time and time index for the step being taken, which the

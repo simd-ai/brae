@@ -963,8 +963,12 @@ RunReport runInterFoam(
                         pin.correctorIndex = c;
                         pressureCorrector(f.p_rgh, f.U, f.phi, f.p, pin, psc, m, g, patches);
                     }
-                    // alpha1's inletOutlet reads the flux the step ended on, at the next MULES pass.
-                    pushFluxToPatches(f, patches);
+                    // alpha1's inletOutlet reads the flux the step ended on, at the next MULES pass;
+                    // U's patches keep their coefficients until the next momentum assembly (the alpha
+                    // stage's push, above), as OpenFOAM's do -- the turbulence correct below reads
+                    // their snGrad() with the switch the assembly set. pushFluxToPatches' declaration
+                    // has the measurement.
+                    pushFluxToPatches(f, patches, /*uCoefficientsKept=*/true);
                     break;
                 }
 

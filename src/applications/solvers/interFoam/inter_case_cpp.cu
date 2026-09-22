@@ -28,7 +28,7 @@ namespace interFoam {
 void pushFluxToPatches(
     InterFields& f,
     const std::vector<FvPatch>& patches,
-    bool uPatchesStillUpdated)
+    bool uCoefficientsKept)
 {
     // rhoPhi does not exist yet at the first call, from buildInterFields before the mixture is built;
     // nothing reads a flux that early, and the call that closes buildInterFields hands it over
@@ -41,9 +41,9 @@ void pushFluxToPatches(
             if (name == "rhoPhi" && !rhoPhi) return nullptr;
             return &namedPatchFlux(name, pi, patches[pi].name, f.phi, rhoPhi);
         };
-        // NOT U's while its patches are still updated(), unless the class evaluates inside
-        // updateCoeffs -- the rule and its measurements are inter_peqn_cpp.cu's, at the same call
-        const bool tellU = !uPatchesStillUpdated || f.U.boundary[pi]->updateCoeffsEvaluates();
+        // NOT U's where OpenFOAM runs no updateCoeffs before the next read (the declaration names the
+        // two moments), unless the class evaluates inside updateCoeffs
+        const bool tellU = !uCoefficientsKept || f.U.boundary[pi]->updateCoeffsEvaluates();
         if (const std::vector<scalar>* q = tellU ? fluxFor(f.U.boundary[pi]->fluxName()) : nullptr)
         {
             f.U.boundary[pi]->updateFromFlux(*q);

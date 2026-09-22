@@ -49,6 +49,10 @@ struct BndSnGradView
     const scalar* vf;
     const scalar* ref;
     const scalar* rgr;   // may be null: no fixedGradient face on this component
+    // 1 on an inletOutlet / outletInlet face: a MIXED patch whose valueFraction the device keeps as the
+    // type code itself (1 = inflow fixed at the inletValue, 0 = outflow zeroGradient) -- see the kernel
+    const label*  io;
+    const label*  oio;
 };
 
 // boundary gradient: gradB = gradC + n (x) (snGrad - n & gradC), OF gaussGrad::correctBoundaryConditions.
@@ -168,7 +172,19 @@ void gradBKernel(
     {
         const label t = bv[k].type[bi];
         const scalar rg = bv[k].rgr ? bv[k].rgr[bi] : scalar(0);
-        if (t == 1 || t == 2)   sn[k] = (ub[k] - uc[k]) * dc[bi];                          // fvPatchField
+        // inletOutlet and outletInlet ARE mixed patches (inletOutletFvPatchField.H derives from
+        // mixedFvPatchField), so their snGrad is the mixed one with the switch as the valueFraction and
+        // refGrad zero: vf*(inletValue - pif)*deltaCoeffs. The type code the io switch writes IS that
+        // valueFraction, and the base formula (ub - uc)*dc below gives the same number only while the
+        // stored value was blended with the CURRENT switch. It was not on the one corrector where
+        // OpenFOAM's patch is still updated() and keeps the assembly's valueFraction: with one pressure
+        // corrector that lagged value is the step's last, and at the next assembly the switch has moved
+        // where the value has not. MEASURED on RAS/waterChannel with an inletOutlet atmosphere and
+        // nCorrectors 1, laminar: HbyA.z 6.7e-07 in the atmosphere cells at step 2 (1e-12 elsewhere),
+        // U 6.2e-09 against OpenFOAM, 7.8e-14 at step 1; the SST run of the same case 1.3e-07.
+        const bool io = (bv[k].io && bv[k].io[bi]) || (bv[k].oio && bv[k].oio[bi]);
+        if (io)                 sn[k] = scalar(t) * (bv[k].ref[bi] - uc[k]) * dc[bi];      // mixed, vf = the switch
+        else if (t == 1 || t == 2) sn[k] = (ub[k] - uc[k]) * dc[bi];                       // fvPatchField
         else if (t == 5)        sn[k] = bv[k].vf[bi] * (bv[k].ref[bi] - uc[k]) * dc[bi]     // mixed
                                       + (scalar(1) - bv[k].vf[bi]) * rg;
         else                    sn[k] = rg;                       // zeroGradient (0) / fixedGradient
@@ -209,6 +225,8 @@ inline BndSnGradView snGradView(const DeviceBoundary& db)
     v.vf   = db.valueFraction.data();
     v.ref  = db.refValue.data();
     v.rgr  = db.refGrad.size() ? db.refGrad.data() : nullptr;
+    v.io   = db.ioMask.size() ? db.ioMask.data() : nullptr;
+    v.oio  = db.oioMask.size() ? db.oioMask.data() : nullptr;
     return v;
 }
 

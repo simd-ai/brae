@@ -234,6 +234,11 @@ void deviceInterStep(
     // seeds an inletOutlet as fixedValue at its inletValue on EVERY face (device_boundary.cuh, category 3),
     // so without this the patch is a wall at the inlet value for the whole run.
     deviceUpdateInletOutlet(dbU, phiBnd);
+    // ...and the flux that switch read, kept for the first corrector of a pass with no predictor: the
+    // patch is still updated() there and its evaluate keeps THIS valueFraction (the corrector loop
+    // below has the rule and the measurement).
+    DeviceBuffer<scalar> phiBndAtUpdateCoeffs;
+    deviceCopy(phiBndAtUpdateCoeffs, phiBnd);
     deviceUpdatePressureInletOutletVelocity(dbU, phiBnd, UX, UY, UZ, /*directionMixed=*/true);
     // ...and symmetry's, which is the same sequence's third step (rhoUEqn.cuh:76-78): a symmetry or slip
     // patch's refValue is U - n(n & U) at THIS iteration's cell velocity, and the builder seeded it from
@@ -630,7 +635,17 @@ void deviceInterStep(
         hooks.updateUBoundary(UX, UY, UZ, dbU, ub,
                               stillUpdated ? DeviceUBoundaryCall::evaluateStillUpdated
                                            : DeviceUBoundaryCall::evaluate);
-        deviceUpdateInletOutlet(dbU, phiBnd);
+        // The io switch IS inletOutlet's valueFraction (neg(phi), inletOutletFvPatchField.C:114-127,
+        // outletInlet's pos0, outletInletFvPatchField.C:124), and a still-updated() patch keeps the one the assembly set:
+        // mixedFvPatchField::evaluate runs updateCoeffs only `if (!this->updated())`
+        // (mixedFvPatchField.C:234-237), and neither class evaluates inside updateCoeffs. The hook has
+        // just rebuilt dbU with every such face seeded fixedValue, so the switch has to be replayed
+        // here -- off the flux the ASSEMBLY read on that one corrector, off the new flux otherwise.
+        // Switching on the new flux here was the lag the host loop carries and this loop did not: the
+        // device kOmegaSST closure reads U's outlet through dbU for its grad(U) (device_komega_sst.cu),
+        // where OpenFOAM's tgradU reads the stored, lagged value. pressureInletOutletVelocity is
+        // exempt, as on the host: its updateCoeffs ends in evaluate() and clears the flag.
+        deviceUpdateInletOutlet(dbU, stillUpdated ? phiBndAtUpdateCoeffs : phiBnd);
         deviceUpdatePressureInletOutletVelocity(dbU, phiBnd, UX, UY, UZ, /*directionMixed=*/true);
         deviceUpdateSymmetry(dbU, UX, UY, UZ);
         deviceUpdateWedge(dbU, UX, UY, UZ);

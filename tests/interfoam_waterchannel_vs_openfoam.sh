@@ -75,6 +75,28 @@
 #   patch that is not a wall, not `empty` and not `calculated`: the zeroGradient inlet kept its built
 #   value, U 1.9e-05, nut 5.5e-06, with the host closure in the same loop at 2.3e-12.
 #
+# PROFILE oneCorrector (and its laminar twin oneCorrectorLaminar, the control): the atmosphere's U an
+# inletOutlet in place of pressureInletOutletVelocity, `nCorrectors 1`, twenty steps of 0.01 (Courant
+# 0.1; at the tutorial's 0.1 one corrector runs at Courant 54 and both codes follow the same blow-up).
+# This is the one shape where OpenFOAM's `updated_` lag is the step's LAST evaluate: with no momentum
+# predictor the first corrector's U.correctBoundaryConditions() keeps the valueFraction the assembly
+# set (mixedFvPatchField.C:234-237), and with one corrector nothing re-evaluates U before the closure and
+# the next assembly read it -- on 700 of the 1400 atmosphere faces the switch has moved by then (713
+# inflow faces at t = 1, none at round-off). No tutorial pairs an inletOutlet U with a corrector count
+# of one; the shipped profiles cannot see it. MEASURED, both arms: alpha 1.1e-12, p_rgh 3.5e-12,
+# U 5.3e-12, k 9.4e-14, omega 1.8e-12, nut 6.1e-13, all 20 p_rgh counts OpenFOAM's. WHAT IT FOUND,
+# each at step 2 exactly (step 1 to 1e-13 in every field):
+#   HOST: the flux pushed to U's patches after the corrector loop moved inletOutlet's valueFraction
+#   where OpenFOAM's stays until the next assembly's updateCoeffs, and kOmegaSST's grad(U) read the
+#   patch snGrad() with the new switch: UEqn.A 3.2e-02 in the atmosphere cells (5e-10 elsewhere),
+#   U 2.7e-05, nut 2.4e-03. The laminar twin, whose closure reads nothing, stayed at 8.9e-12.
+#   DEVICE: the io switch at the corrector's end taken from the new flux (the host lags it): U 1.3e-07;
+#   and the boundary gradient's snGrad on an inletOutlet face formed as (stored value - cell)*dc where
+#   the class is MIXED and OpenFOAM's is vf*(inletValue - cell)*dc with the CURRENT switch -- the two
+#   agree only while the stored value was blended with that switch: laminar U 6.2e-09, HbyA.z 6.7e-07
+#   in the atmosphere cells.
+# CONTROL: OpenFOAM laminar against OpenFOAM kOmegaSST on the same staging, U 4.3e-03.
+#
 # NOT CLAIMED: `density variable` with kOmegaSST, F3, decayControl, a wall-function blending other than
 # binomial n = 2, and a moving mesh -- all refused by name; the scalarTransport function object `s`,
 # which brae does not run (it does not feed back into the flow).
@@ -86,6 +108,9 @@ TUT=${BRAE_OF_TUTORIALS:-/usr/lib/openfoam/openfoam2412/tutorials}
 SRC="$TUT/multiphase/interFoam/RAS/waterChannel"
 STEPS=${STEPS:-10}
 DT=${DT:-0.1}
+# the oneCorrector pair's step -- see the header
+STEPS1=${STEPS1:-20}
+DT1=${DT1:-0.01}
 
 [ -x "$BIN" ]      || { echo "SKIP: $BIN not built"; exit 77; }
 [ -d "$SRC" ]      || { echo "SKIP: RAS/waterChannel tutorial not found at $SRC"; exit 77; }
@@ -104,12 +129,16 @@ command -v extrudeMesh > /dev/null 2>&1 || { echo "SKIP: extrudeMesh not on PATH
 command -v interFoam > /dev/null 2>&1   || { echo "SKIP: interFoam not on PATH"; exit 77; }
 
 END=$(python3 -c "print('%.10g' % ($STEPS*float('$DT')))")
+END1=$(python3 -c "print('%.10g' % ($STEPS1*float('$DT1')))")
 
 # stage <profile>: copy the tutorial, apply the profile, fix the step, mesh it as Allrun.pre does, run
 stage()
 {
     local profile="$1"
     local C="$W/$profile"
+    # the oneCorrector pair runs at its own step: one corrector at the tutorial's 0.1 is Courant 54
+    local steps="$STEPS" dt="$DT"
+    case "$profile" in oneCorrector|oneCorrectorLaminar) steps="$STEPS1" dt="$DT1" ;; esac
     rm -rf "$C"
     cp -r "$SRC" "$C" || return 1
     rm -rf "$C"/[1-9]* "$C"/0 "$C"/processor* "$C"/log.*
@@ -120,8 +149,27 @@ stage()
         && { echo "FAIL: the tutorial now carries a \`density\` line, so the lineage is another"; return 1; }
     grep -q '"div\\(phi,(k|omega)\\)"' "$C/system/fvSchemes" \
         || { echo "FAIL: the tutorial no longer names div(phi,k) through a pattern key"; return 1; }
-    if [ "$profile" = laminar ]; then
+    if [ "$profile" = laminar ] || [ "$profile" = oneCorrectorLaminar ]; then
         sed -i 's/^simulationType .*/simulationType laminar;/' "$C/constant/turbulenceProperties"
+    fi
+    # oneCorrector: the atmosphere's U an inletOutlet, one pressure corrector -- see the header
+    if [ "$profile" = oneCorrector ] || [ "$profile" = oneCorrectorLaminar ]; then
+        python3 - "$C" <<'PYEOF' || { echo "FAIL: the $profile profile was not staged"; return 1; }
+import sys
+d = sys.argv[1]
+p = d + '/0/U'
+s = open(p).read()
+a = ('    atmosphere\n    {\n        type            pressureInletOutletVelocity;\n'
+     '        value           uniform (0 0 0);\n    }')
+b = ('    atmosphere\n    {\n        type            inletOutlet;\n        inletValue      uniform (0 0 0);\n'
+     '        value           uniform (0 0 0);\n    }')
+assert s.count(a) == 1, 'the tutorial no longer has the pressureInletOutletVelocity atmosphere this edit expects'
+open(p, 'w').write(s.replace(a, b))
+p = d + '/system/fvSolution'
+s = open(p).read()
+assert s.count('    nCorrectors     2;') == 1, 'the tutorial no longer asks for nCorrectors 2'
+open(p, 'w').write(s.replace('    nCorrectors     2;', '    nCorrectors     1;'))
+PYEOF
     fi
     # nutPatches: nut pinned at the inlet (fixedValue) and flux-conditional at the outlet (inletOutlet),
     # the two patch kinds kOmegaSST's field assignment does not write
@@ -152,7 +200,7 @@ open(p, 'w').write(s)
 PYEOF
     fi
 
-    STEPS="$STEPS" DT="$DT" python3 - "$C" <<'PYEOF' || { echo "FAIL: staging $profile"; return 1; }
+    STEPS="$steps" DT="$dt" python3 - "$C" <<'PYEOF' || { echo "FAIL: staging $profile"; return 1; }
 import os, re, sys
 d = sys.argv[1]
 n = int(os.environ['STEPS'])
@@ -178,12 +226,14 @@ PYEOF
     done
     ( cd "$C" && setFields > log.setFields 2>&1 ) || { echo "FAIL: setFields [$profile]"; tail -20 "$C/log.setFields"; return 1; }
     ( cd "$C" && interFoam > log.interFoam 2>&1 ) || { echo "FAIL: interFoam [$profile]"; tail -30 "$C/log.interFoam"; return 1; }
-    [ -d "$C/$END" ] || { echo "FAIL: OpenFOAM wrote no $END directory [$profile]"; ls "$C"; return 1; }
-    echo "OpenFOAM ran $STEPS steps of deltaT $DT to t = $END   [$profile]"
+    local end
+    end=$(python3 -c "print('%.10g' % ($steps*float('$dt')))")
+    [ -d "$C/$end" ] || { echo "FAIL: OpenFOAM wrote no $end directory [$profile]"; ls "$C"; return 1; }
+    echo "OpenFOAM ran $steps steps of deltaT $dt to t = $end   [$profile]"
 }
 
 rc=0
-for p in laminar sst nutPatches nutInletZeroGrad nutInletZero; do
+for p in laminar sst nutPatches nutInletZeroGrad nutInletZero oneCorrector oneCorrectorLaminar; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_waterchannel_vs_openfoam: staging failed"; exit 1; }
@@ -203,6 +253,21 @@ grep -q "Solving for omega" "$W/laminar/log.interFoam" \
 # orders above the round-off both codes reach)
 "$BIN" "$W/nutInletZeroGrad" "$W/nutInletZeroGrad/0" "$W/nutInletZeroGrad/$END" "$STEPS" \
        "$W/nutInletZeroGrad/log.interFoam" "$W/laminar/$END" "$W/nutInletZero/$END" 1e-6 || rc=1
+# the switch has to have MOVED on the atmosphere for this profile to test anything: the fail-proof for
+# a staging that lost the inletOutlet atmosphere or the corrector count
+python3 - "$W/oneCorrector/$END1/phi" <<'PYEOF' || rc=1
+import re, sys
+s = open(sys.argv[1]).read()
+m = re.search(r"atmosphere\s*\{[^}]*?value\s+nonuniform List<scalar>\s*(\d+)\s*\(([^)]*)\)", s, re.S)
+v = [float(x) for x in m.group(2).split()] if m else []
+n = sum(1 for x in v if x < 0)
+ok = len(v) > 0 and n > 100 and len(v) - n > 100
+print("  oneCorrector: %d of %d atmosphere faces inflow at the end -- %s" % (n, len(v), "ok" if ok else "FAIL: the switch never moved"))
+sys.exit(0 if ok else 1)
+PYEOF
+grep -q "nCorrectors     1;" "$W/oneCorrector/system/fvSolution" || { echo "FAIL: oneCorrector was not staged with one corrector"; rc=1; }
+"$BIN" "$W/oneCorrector" "$W/oneCorrector/0" "$W/oneCorrector/$END1" "$STEPS1" \
+       "$W/oneCorrector/log.interFoam" "$W/oneCorrectorLaminar/$END1" || rc=1
 
 echo "interfoam_waterchannel_vs_openfoam: rc $rc"
 exit $rc

@@ -311,15 +311,24 @@ GeometricField<scalar> rhoWithPatchValues(
 
 // Tell every flux-conditional patch of U, p_rgh and alpha1 the current phi -- see the definition.
 // Call it whenever phi changes, before the next boundary evaluation reads it.
-// `uPatchesStillUpdated` is the FIRST pressure corrector of a pass with no momentum predictor, where
-// OpenFOAM's U patches are still updated() from the momentum assembly and their evaluate blends with
-// the assembly-time coefficients: U's patches are then NOT told, except a class whose updateCoeffs
-// ends in evaluate(). The host pEqn carries the same rule in its own loop (inter_peqn_cpp.cu, where
-// the measurements are); this argument is for the device loop, whose hand-over is this function.
+// `uCoefficientsKept`: U's patches are NOT told (a class whose updateCoeffs ends in evaluate() still
+// is), because OpenFOAM's inletOutlet family moves its valueFraction only inside updateCoeffs, and
+// there are two moments where phi has moved and no updateCoeffs of U's follows before the next read:
+//   - the FIRST pressure corrector of a pass with no momentum predictor, where the patches are still
+//     updated() from the momentum assembly and their evaluate blends with the assembly-time
+//     coefficients (the host pEqn carries this rule in its own loop, inter_peqn_cpp.cu, where the
+//     measurements are; the device loop's hand-over is this function);
+//   - the END of the corrector loop: nothing runs updateCoeffs on U until the next momentum assembly,
+//     and the turbulence correct in between reads the patch's snGrad() -- vf*(refValue - pif)*dc --
+//     through gaussGrad's boundary correction. Told early, the closure saw the new switch where
+//     OpenFOAM's still held the assembly's: MEASURED on RAS/waterChannel with an inletOutlet
+//     atmosphere and nCorrectors 1 (the lagged evaluate is then the step's last), kOmegaSST, 20 steps
+//     of 0.01: UEqn.A 3.2e-02 in the atmosphere cells at step 2 (5e-10 elsewhere), U 2.7e-05 and
+//     nut 2.4e-03 against OpenFOAM; the laminar twin, whose closure reads nothing, 8.9e-12.
 void pushFluxToPatches(
     InterFields& f,
     const std::vector<FvPatch>& patches,
-    bool uPatchesStillUpdated = false);
+    bool uCoefficientsKept = false);
 
 // ...and the phase field's stored patch values, to the conditions that look ALPHA up (the two
 // permeable-wall ones). pushFluxToPatches ends with it; call it again after any evaluate of alpha's
