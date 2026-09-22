@@ -296,6 +296,9 @@ void amgFineCoeffKernel(
                 hasSym_ = true;
                 break;
             }
+        // ...and the SHARED DIAGONAL's question, which is a different one: does any patch give the
+        // three components DIFFERENT boundary coefficients? See DeviceSimpleSolver::hasCmptBC_.
+        hasCmptBC_ = hasSym_ || hasWedge_ || hasPiov_;
         // flowRateInletVelocity, EITHER form: one masked-magSf buffer per such patch, plus the outward
         // normals over all boundary faces. Both are geometric and built once.
         {
@@ -1095,7 +1098,7 @@ void amgFineCoeffKernel(
         // mixed freestreamVelocity/Pressure: recompute the per-face valueFraction from the (lagged) flow angle.
         if (hasMixed_) deviceUpdateMixedFreestream(dbU_, dbP_, phiBnd_, Uk_[0], Uk_[1], Uk_[2],
                                                   compressible_ ? &rhoBnd_ : nullptr);   // phiBnd_ is a MASS flux
-        if (hasPiov_)  deviceUpdatePressureInletOutletVelocity(dbU_, phiBnd_, Uk_[0], Uk_[1], Uk_[2]);
+        if (hasPiov_)  deviceUpdatePressureInletOutletVelocity(dbU_, phiBnd_, Uk_[0], Uk_[1], Uk_[2], /*directionMixed=*/true);
         if (hasSym_)   deviceUpdateSymmetry(dbU_, Uk_[0], Uk_[1], Uk_[2]);
         if (hasWedge_) deviceUpdateWedge(dbU_, Uk_[0], Uk_[1], Uk_[2]);   // axisymmetric: the rotated cell velocity
         // totalPressure p: recompute refValue = p0 - 0.5*neg(phi)|U_b|^2 from the boundary velocity (deviceBCValue
@@ -1610,7 +1613,7 @@ void amgFineCoeffKernel(
         // must use OF's cmptMax(cmptMag(iC0,iC1,iC2)), not comp[0] alone (== comp[0] when components are equal, so
         // every other BC is unaffected). Compute the per-component boundary iC and the per-face max magnitude.
         DeviceBuffer<scalar> iCmaxMag, iCmin;
-        if (hasSym_)
+        if (hasCmptBC_)
         {
             DeviceBuffer<scalar> r1IC,r1BC,r1lIC,r1lBC, r2IC,r2BC,r2lIC,r2lBC;
             deviceBCDivCoeffs(dbU_.comp[1], phiBnd_, r1IC, r1BC);
@@ -1628,8 +1631,8 @@ void amgFineCoeffKernel(
         DeviceBuffer<scalar> delta;   // mDiagR is now a member
         deviceRelaxDiag(deviceLduView(dm,mDiag,mUp,mLo), dm, r0IC, ctl_.uRelax(), mDiagR, delta,
                         hasCyclic_ ? cycSumOff.data() : (hasAMI_ ? amiSumOff.data() : nullptr),
-                        hasSym_ ? iCmaxMag.data() : nullptr,
-                        hasSym_ ? iCmin.data() : nullptr);
+                        hasCmptBC_ ? iCmaxMag.data() : nullptr,
+                        hasCmptBC_ ? iCmin.data() : nullptr);
         if (stageDumpActive() && stageDumpFirstOnly("mommat"))
         {
             stageDump("stage_mDiag0", mDiag);     // assembled momentum diagonal BEFORE relax (OF D0)
@@ -1986,7 +1989,7 @@ void amgFineCoeffKernel(
         // misses the constrained-component diagonal (bottom symmetry iC=(0,iC_v,0): iC[0]=0 but cmptAv=iC_v/3), which
         // on high-AR cells made rAU wildly too large -> catastrophic slip blowup. Reused below as the H() cmptAv term.
         DeviceBuffer<scalar> cmptAvIC;
-        if (hasSym_)
+        if (hasCmptBC_)
         {
             deviceCopy(cmptAvIC, iC[0]);
             deviceAxpy(1.0, iC[1], cmptAvIC);
@@ -1994,7 +1997,7 @@ void amgFineCoeffKernel(
             deviceScale(cmptAvIC, 1.0/3.0);
         }
         DeviceBuffer<scalar> diagA,dumb,rAU;
-        deviceFold(dm,mDiagR,zeroSrc_, hasSym_ ? cmptAvIC : iC[0], zeroBndU_,diagA,dumb);
+        deviceFold(dm,mDiagR,zeroSrc_, hasCmptBC_ ? cmptAvIC : iC[0], zeroBndU_,diagA,dumb);
         deviceReciprocalV(dm,diagA,rAU);
         // SIMPLEC: rAtU = 1/(1/rAU - H1) = V/max(A*1, 0.1*diagA) (A*1 = row sum = deviceAmul with ones). drAtU = rAtU - rAU.
         DeviceBuffer<scalar> rAtU, drAtU;
@@ -2058,13 +2061,16 @@ void amgFineCoeffKernel(
             DeviceBuffer<scalar>* UN[3] = { &UNx, &UNy, &UNz };
             for (int kk = 0; kk < 3; ++kk)
             {
-                DeviceBuffer<scalar> bdH;   // slip: bdDiag = cmptAv(iC) - iC[kk] (OF H() term); else zero (bit-identical)
-                if (hasSym_)
+                // OF's H() carries the SAME per-component correction as A(): bdDiag = cmptAv(iC) -
+                // iC[kk], zero only while the three agree. Keyed on hasCmptBC_ with the fold above --
+                // a wedge or a directionMixed piov needs it exactly as a slip patch does.
+                DeviceBuffer<scalar> bdH;
+                if (hasCmptBC_)
                 {
                     deviceCopy(bdH, cmptAvH);
                     deviceAxpy(-1.0, iC[kk], bdH);
                 }
-                deviceMatrixH(Uview, dm, Uk_[kk], relaxSrc[kk], hasSym_ ? bdH : zeroBndU_, bCb[kk], Hk[kk]);
+                deviceMatrixH(Uview, dm, Uk_[kk], relaxSrc[kk], hasCmptBC_ ? bdH : zeroBndU_, bCb[kk], Hk[kk]);
                 if (hasCyclic_ && !cyc_.rotational) interfaceAddH(cyc_, Uk_[kk], dm.V, Hk[kk]);   // translational off-diag
                 if (hasAMI_) interfaceAddH(ami_, *UN[kk], dm.V, Hk[kk]);
             }
