@@ -806,10 +806,12 @@ set_tests_properties(manifest_interfoam_not_drifted PROPERTIES SKIP_RETURN_CODE 
 # the device's start-up CorrectPhi ran grad(pcorr) as Gauss linear that way, and its closure would have
 # run a moving mesh on the current volumes. Every justified omission is in tools/default_audit_allow.txt
 # with its reason; an unlisted one, or a listed one that no longer exists, fails here.
+# ...over the WHOLE of src now: the backlog the first run found (341 across 28 structs) is closed, so
+# a new omission anywhere is a new finding rather than one of a crowd.
 add_test(NAME default_audit_interfoam
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/default_audit.py
                  --allow ${CMAKE_CURRENT_SOURCE_DIR}/tools/default_audit_allow.txt
-                 ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/interFoam)
+                 ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 add_executable(test_rho_kepsilon_cuda tests/test_rho_kepsilon_cuda.cu)
 target_include_directories(test_rho_kepsilon_cuda PRIVATE ${BRAE_HEADER_DIRS})

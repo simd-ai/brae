@@ -260,3 +260,80 @@ TransportScheme sc limGradK
 TransportScheme sc limGradLeastSq
 TransportScheme sc linearUpwind
 TransportScheme sc luGradK
+
+# ---- SpalartAllmarasCoeffs (spalart_coeffs.cuh:8) at simpleFoamV2's two wall-function sites ----------
+# Both sites (`dsp`, `dsaW`) build the struct ONLY to carry the Spalding wall function's two constants
+# into deviceBoundaryNutSpalding, whose body and kernel read `E` and `kappa` and nothing else (checked
+# by extracting them). The MODEL's constants are read from the case where the model runs:
+# cpu::SA::readCoeffs(rasDict, saCoeffs) at simpleFoamV2.cu:1265 and the DES/DDES/IDDES entries at
+# turbulence_setup.cuh:360-375, both from `RAS/SpalartAllmarasCoeffs` as OpenFOAM's own
+# getOrAddToDict does -- so no coefficient is silently defaulted anywhere it is used.
+SpalartAllmarasCoeffs dsp sigmaNut
+SpalartAllmarasCoeffs dsp Cb1
+SpalartAllmarasCoeffs dsp Cb2
+SpalartAllmarasCoeffs dsp Cw2
+SpalartAllmarasCoeffs dsp Cw3
+SpalartAllmarasCoeffs dsp Cv1
+SpalartAllmarasCoeffs dsp Cs
+SpalartAllmarasCoeffs dsaW sigmaNut
+SpalartAllmarasCoeffs dsaW Cb1
+SpalartAllmarasCoeffs dsaW Cb2
+SpalartAllmarasCoeffs dsaW Cw2
+SpalartAllmarasCoeffs dsaW Cw3
+SpalartAllmarasCoeffs dsaW Cv1
+SpalartAllmarasCoeffs dsaW Cs
+
+# ---- Val (patchExprFunction1.cu:39) -- a VARIANT, not a controls struct ------------------------------
+# The expression evaluator's value record: a uniform scalar, a scalar field, a uniform vector or a
+# vector field, one shape per static factory (scalarUniform / scalarField / vectorField, :48-50), each
+# of which sets the members ITS shape uses and leaves the others at the defaults that say "not this
+# shape" (`uniform` true, `isVector` false). `at(i)` reads only the pair the flags select.
+Val r *
+
+# ---- SolverRunsAs (linear_solver_setup.cuh:59) -- what a driver RUNS, per driver ---------------------
+# This struct is a DESCRIPTION of the arm holding it, so two arms differ by construction and the reader
+# uses it to decide which substitution notices to print. The host reference arm "solves every field
+# through pbicgstab.cuh, which is a DILU-preconditioned BiCGStab whatever the dict says"
+# (rhoSimpleFoamDriver_cpp.cu:632-640), so it runs NO smoothSolver and the smoothSolverOn* flags are
+# false for it; the mirror sets them from BRAE_RHO_SMOOTHSOLVER and does not force DILU everywhere, so
+# `alwaysDilu` is the host arm's alone. Each site's omissions ARE its own description.
+SolverRunsAs runsAs alwaysDilu
+SolverRunsAs runsAs smoothSolverOnEnergy
+SolverRunsAs runsAs smoothSolverOnMomentum
+SolverRunsAs runsAs smoothSolverOnTurbulence
+SolverRunsAs runsAs fixedSweepsField
+SolverRunsAs runsAs momentumNoticedByCaller
+
+# ---- SolveControls (turbulence_transport.cuh:105) at the LES and kOmegaSST sites ---------------------
+# The same family already ledgered for KEpsilonInput: `pbicg` is PBiCG with DILU, which the interFoam
+# reader admits under kEpsilon ALONE (readFinalSolve's allowPBiCG is true for k/epsilon and false for
+# the SST pair and kEqn, inter_turbulence_cpp.cu:78-88, so anything else is refused by name); and
+# colouring/gsColour/polyDeg/precon are brae's own solver accelerations, whose `off` IS OpenFOAM's own
+# symGaussSeidel smoother -- what every turbulent tutorial names and what these two closures run.
+SolveControls sv pbicg
+SolveControls sv colouring
+SolveControls sv gsColour
+SolveControls sv polyDeg
+SolveControls sv precon
+
+# ---- the tail: four records that are not case controls ----------------------------------------------
+# Tok (patchExprFunction1.cu:54) is the expression lexer's TOKEN variant, like Val above: a number
+# token carries `num`, a name/operator token carries `text`, and each site fills its own shape.
+Tok t *
+Tok e *
+# SolverPerformance (pcg.cuh:16) is an OUTPUT record the solvers fill as they run: a site that reports
+# a converged-at-entry solve writes the residuals and leaves nIterations at 0, which IS the count.
+SolverPerformance perf nIterations
+# HeToTResult (nsrds_functions.cuh:147) is the energy inversion's output: the sites that return an
+# EXACT inversion (no Newton loop) leave `iterations` and `residual` at 0, which is that result.
+HeToTResult r iterations
+HeToTResult r residual
+# GSFusedComponent (device_amg.cuh:362) carries the normFactor EITHER as a host scalar or as a device
+# pointer -- two entry points for the same solve (device_amg.cuh:256 and :261, item 66) -- so a site
+# using one leaves the other null by construction.
+GSFusedComponent one normFactor
+GSFusedComponent one dNormFactor
+# LinearSolverChoice (smooth_solver_cpp.cuh:50): the kOmegaSST site selects the smoothSolver, and
+# `pbicgDILU` is the kEpsilon-only alternative the interFoam reader refuses under SST by name
+# (readFinalSolve's allowPBiCG, inter_turbulence_cpp.cu:78-88).
+LinearSolverChoice which pbicgDILU
