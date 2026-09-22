@@ -1,5 +1,6 @@
 // interFoam's turbulence, the host reference. See inter_turbulence_cpp.cuh for the two lineages.
 #include "inter_turbulence_cpp.cuh"
+#include <fstream>
 #include "foam_field_reader.cuh"
 #include "cellLimitedGrad_cpp.cuh"
 #include "patch_wave_cpp.cuh"
@@ -88,23 +89,19 @@ SmoothLinearSolve readFinalSolve(
     return s;
 }
 
-// div(<flux>,<field>) for a RAS closure: `Gauss upwind` and nothing else, AND THAT IS NOW A MEASURED
-// REFUSAL rather than an untested one. Both arms of both closures carry `Gauss limitedLinear <k>`
-// (the shared TransportScheme's limitedLinear half, the host twins' divWithScheme), and every shipped
-// interFoam tutorial names upwind, so the scheme had never been asked for here. Admitting it and
-// staging RAS/waterChannel under `"div\(phi,(k|omega)\)" Gauss limitedLinear 1` found BOTH arms
-// wrong, ten steps against real OpenFOAM:
+// div(<flux>,<field>) for a RAS closure: `Gauss upwind` and nothing else, AND THAT IS A MEASURED
+// REFUSAL, not an untested one. Both arms of both closures carry `Gauss limitedLinear <k>` and no
+// interFoam tutorial names it, so it was admitted and staged on RAS/waterChannel to gate it. It is
+// wrong, and the instrument says exactly where -- see interFoam/PORT.md for the full localisation:
 //
-//   DEVICE fields:  k 1.4724e-05, omega 1.7822e-04, nut 1.6747e-05 -- while alpha (1.2413e-12),
-//                   p_rgh (1.1675e-12) and U (6.3609e-12) are at round-off, so it is the closure
-//   HOST solve log: omega's initial residual 3.190e-05 from OpenFOAM's in step one and its final
-//                   residuals differ too, while omega's FIELD agrees to 7.1991e-12. omega converges
-//                   in one or two iterations here, so the field hides a matrix that is not
-//                   OpenFOAM's -- the residual trace is what sees it.
+//   every upstream stage is EXACT against tools/dumpKOmegaSST (CD 3.4e-15, G 6.9e-14, S2 7.2e-14),
+//   k's whole system is exact (kUpper/kLower 7.8e-14), and omega's off-diagonals differ on
+//   26 of 79,800 FACES by up to 2.5e-02 -- the TVD limiter flipping between central and upwind on
+//   faces whose two cells hold the same value, where `gradf` is exactly zero and the branch is
+//   decided by the SIGN of a near-zero `gradcf`.
 //
-// So the refusal stays, and it is worth more than it was: it now names what is wrong rather than what
-// is untested. Porting it is its own unit -- start from the host's omega weights, since the host is
-// the device's reference and its matrix is already off.
+// Refused until that sign is chased down. k is unaffected because its field is still uniform at the
+// assembly; omega's is not, because omegaWallFunction::updateCoeffs has overwritten its wall cells.
 void requireUpwind(
     const std::string& caseDir,
     const std::string& field,
@@ -114,9 +111,9 @@ void requireUpwind(
     if (fs.bounded || fs.limited || fs.linearUpwind)
         throw std::runtime_error(
             std::string(WHO) + "fvSchemes `div(" + fluxName + "," + field + ")` is not plain `Gauss "
-            "upwind`. The closures carry limitedLinear, and MEASURED on RAS/waterChannel it is wrong "
-            "on both arms -- the device closure reads omega 1.8e-04 and k 1.5e-05 from OpenFOAM, and "
-            "the host's omega matrix leaves a residual trace 3.2e-05 from OpenFOAM's. Refused.");
+            "upwind`. The closures carry limitedLinear and MEASURED on RAS/waterChannel omega's "
+            "convection coefficients differ from OpenFOAM's on 26 faces by 2.5e-02, where the TVD "
+            "limiter's branch turns on the sign of a near-zero gradient. Refused.");
 }
 
 // grad(U), which the production GbyNu takes (kEpsilon.C:237, kOmegaSSTBase.C:520)
@@ -791,12 +788,32 @@ void correctInterTurbulence(
         which.symmetric = (ks.smoother == "symGaussSeidel");
         which.nSweeps = ks.nSweeps;
         kOmegaSST::SSTResiduals res;
+        // THE CLOSURE'S ASSEMBLED SYSTEM, for the of-instrument comparison against
+        // tools/dumpKOmegaSST's stage_sstOmD / OmSrc / OmDUpper / OmDLower. Writes only, gated on the
+        // same variable the stage dump uses, and OFF unless it is set -- rhoSimpleFoam's SST site has
+        // carried the same capture since its own port (rhoSimpleFoam_cpp.cu:1316).
+        res.captureStages = (std::getenv("BRAE_SST_DUMP_DIR") != nullptr);
         kOmegaSST::correct(*in.U, t.k, t.omega, t.nut, *in.phi, t.yCell, scalar(0), m, g, patches,
                            t.omegaRelaxFinal.factor, t.kRelaxFinal.factor, ks.tol, ks.relTol, ks.maxIter,
                            t.sstCoeffs, &res, /*bounded=*/false, /*limitedLinear=*/false,
                            /*limiterCoeff=*/scalar(1), /*linearUpwind=*/false,
                            t.coeffs.correctedLaplacian, t.coeffs.snGradLimitCoeff, /*lm=*/nullptr,
                            &sstComp, ks.minIter, t.omegaRelaxFinal.on, t.kRelaxFinal.on, &which);
+        if (res.captureStages)
+        {
+            const std::string dd = std::string(std::getenv("BRAE_SST_DUMP_DIR")) + "/host";
+            auto dumpv = [&](const char* name, const std::vector<scalar>& v)
+            {
+                std::ofstream o(dd + "/" + name);
+                o.precision(17);
+                for (const scalar x : v) o << x << "\n";
+            };
+            dumpv("omD", res.omD);      dumpv("omSrc", res.omSrc);
+            dumpv("omUpper", res.omUpper); dumpv("omLower", res.omLower);
+            dumpv("omD0", res.omD0);    dumpv("omSrc0", res.omSrc0);
+            dumpv("kD", res.kD);        dumpv("kSrc", res.kSrc);
+            dumpv("kUpper", res.kUpper); dumpv("kLower", res.kLower);
+        }
         if (in.omegaLog)
         {
             in.omegaLog->push_back({res.omegaPerf.initialResidual, res.omegaPerf.finalResidual,
