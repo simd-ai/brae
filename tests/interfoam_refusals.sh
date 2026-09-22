@@ -538,6 +538,14 @@ if [ $HAVE_GPU = 1 ]; then
     BASE="$BB"
     BSST="sed -i 's/^\( *RASModel  *\)kEpsilon;/\1kOmegaSST;/' constant/turbulenceProperties; sed -i 's/^\( *div(phi,epsilon) .*\)/\1\n    div(phi,omega)  Gauss upwind;/' system/fvSchemes; printf '\nwallDist { method meshWave; }\n' >> system/fvSchemes; sed -i 's/(U|k|epsilon)/(U|k|epsilon|omega)/' system/fvSolution; sed 's/object  *epsilon;/object      omega;/; s/dimensions  *\[0 2 -3 0 0 0 0\];/dimensions      [0 0 -1 0 0 0 0];/; s/epsilonWallFunction/omegaWallFunction/' 0/epsilon > 0/omega"
     arm device_baffle_SST   refused "RAS model other than kEpsilon" "-device" "$BSST"
+    # LES kEqn across a COUPLED PAIR: the case reader refuses any model but kEpsilon with a pair, on
+    # both arms (inter_case_cpp.cu:1285), and BEHIND that the device LES closure has its own refusal --
+    # LESkEqnInput carries no interface, so k would convect and diffuse across the periodic faces as if
+    # they were walls while every other equation couples them. The reader's is what fires, and the
+    # device's is what keeps lifting it from being silent. Staged from the porous-baffle case.
+    BASE="$BB"
+    BLESC="sed -i 's/^simulationType .*/simulationType LES;\nLES { LESModel kEqn; delta cubeRootVol; turbulence on; printCoeffs on; cubeRootVolCoeffs { deltaCoeff 1; } }/' constant/turbulenceProperties; sed -i '/^RAS$/,/^}/d' constant/turbulenceProperties; sed -i 's/div(phi,epsilon) .*//' system/fvSchemes; rm -f 0/epsilon; sed -i 's/nutkWallFunction/calculated/' 0/nut"
+    arm device_les_cyclic   refused "RAS model other than kEpsilon" "-device" "$BLESC"
     # a RAS closure on a MOVING mesh is refused on the device: its closure's input carries neither the
     # old volumes nor the mesh flux the host closure takes (moving_SST above runs the same staging on
     # the host). Found by auditing hand-built control structs, not by a case -- no runnable tutorial

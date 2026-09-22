@@ -178,6 +178,24 @@ RunReport runInterFoamDevice(
             "brae interFoam (device): the case is LES kEqn AND moves its mesh. The device closure takes "
             "the filter width once, from the host's LESdelta::compute on the mesh as it starts; a mesh "
             "that moves changes it at every update. Run without -device.");
+    // ...and LES kEqn ACROSS A COUPLED PAIR. k's equation is fvm::div - fvm::laplacian like the
+    // momentum's, so across a pair it needs the interface's off-diagonal and the pair's own flux --
+    // TransportScheme::cyc and ::cycPhi, which the kEpsilon closure is handed and gated on
+    // (validation/interFoamCyclic). LESkEqnInput carries NEITHER, so the device LES closure cannot be
+    // given a pair at all: k would convect and diffuse across the periodic faces as if they were
+    // walls, silently, while every other equation on the loop couples them. The host kEqn does not
+    // have that hole (les_kEqn_cpp.cu assembles the patch itself). Found by tools/default_audit.py --
+    // the shared TransportScheme is built without `cyc` at the LES site and with it everywhere else.
+    // The case reader refuses any model but kEpsilon with a pair before this runs
+    // (inter_case_cpp.cu:1285), so nothing reaches it today; it is here so that lifting the reader's
+    // blanket refusal cannot make this loop drop the interface silently (arm `device_les_cyclic`).
+    if (f.turbulence.on && f.turbulence.model == cpu::interFoam::InterRasModel::KEqnLES
+        && !cyclics.empty())
+        throw std::runtime_error(
+            "brae interFoam (device): the case is LES kEqn AND carries a coupled pair. The device LES "
+            "closure takes no interface for k's transport (LESkEqnInput has no cyclic pair), so the "
+            "pair's faces would contribute nothing to k's convection or diffusion. Run without "
+            "-device.");
     // ...and so is a RAS closure on a mesh that moves. The host closure takes the moved mesh's old
     // volumes for fvm::ddt and the mesh flux for the convection's relative phi
     // (InterTurbulenceStepInput::V0, meshPhi; gated on waves/waveMakerPiston `pistonSST`, host arm);

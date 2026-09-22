@@ -201,3 +201,62 @@ Compressible sc rhoOO
 Compressible sc epsOO
 Compressible sc kOO
 Compressible sc bcPhi
+
+# ---- PressureInput (gpu::simpleFoam, pEqn.cuh:28) ---------------------------------------------------
+# interFoam's device step builds this ONLY for gpu::pressurePredictor -- rAU, HbyA, phiHbyA -- and
+# assembles and solves its own p_rgh in device_inter_pressure_step.cu, which carries the reference, the
+# MRF and the schemes in its OWN input (DeviceInterPressureInput: pi.mrf, pi.needReference, pi.pRefCell,
+# pi.pRefValue at device_inter_step.cu:557-562). The p-equation fields are left null so the shared code
+# does not apply them a SECOND time: `mrf` set here would run deviceMrfMakeRelative on phiHbyA
+# (pEqn.cu:179-181) beside interFoam's own, and `pRefCell >= 0` would adjustPhi (pEqn.cu:189-193) beside
+# interFoam's. `consistent` is SIMPLEC, which PIMPLE has no entry for; `correctedLaplacian` and
+# `snGradLimitCoeff` are read only inside the `consistent` block and inside assemblePEqn, neither of
+# which interFoam calls; `hasMRF`/`hasFvOptions` drive refuseUnsupported for the SIMPLE p solve that is
+# not run here -- interFoam refuses both by its own name (inter_driver_device.cu).
+PressureInput pin adjustable
+PressureInput pin consistent
+PressureInput pin correctedLaplacian
+PressureInput pin snGradLimitCoeff
+PressureInput pin hasFvOptions
+PressureInput pin hasMRF
+PressureInput pin mrf
+PressureInput pin pRefCell
+PressureInput pin pRefValue
+PressureInput pin relaxP            # SIMPLE's p relaxation; interFoam relaxes p_rgh in its own step (relax() at the case's factor), and OF's pimpleFoam relaxes on the non-final corrector only
+# the two simpleFoam sites: the taps are a GATE's instrument (null = not tapping), and `cyc`/`adjustable`/
+# `takeUAtBoundary` are the coupled-pair and constrainHbyA masks a case without a pair has nothing to give
+PressureInput pin cyc
+PressureInput pin hNoPairTap
+PressureInput pin hPairTap
+PressureInput pi cyc
+PressureInput pi hNoPairTap
+PressureInput pi hPairTap
+PressureInput pi adjustable
+PressureInput pi takeUAtBoundary
+
+# ---- TransportScheme (turbulence_transport.cuh:35, the scalar-transport scheme block) ----------------
+# Built by each closure for its own equations. The omissions are one of three things:
+#   cyc / cycPhi : a coupled pair. The device kOmegaSST refuses one outright (kOmegaSST.cu:38-42, "the
+#                  mesh has cyclic/AMI/processor patches"), and LESkEqnInput carries no interface at
+#                  all -- now refused by name on the interFoam device loop ("LES kEqn AND carries a
+#                  coupled pair"), behind the case reader's own blanket refusal of any model but
+#                  kEpsilon with a pair (inter_case_cpp.cu:1285). Arm `device_les_cyclic`.
+#   gammaCell    : the pair's cell diffusivity, "required when `cyc` is set" and read only then
+#   bndValues    : the field's STORED patch values, "null = evaluate `db` live, which is what every
+#                  caller did before stage H3.5" (turbulence_transport.cuh:94-99) -- the stored-value
+#                  path is the interFoam kEpsilon site's
+#   stageTag     : a gate's instrument, "null by default and free when null" (:80)
+#   the gradient/limiter family at the LES site: kEqn's k convects by upwind or limitedLinear, and the
+#                  case reader refuses anything else ("neither `Gauss upwind` nor `Gauss limitedLinear
+#                  <k>`, the two the LES closure carries", inter_turbulence_cpp.cu:365-368)
+TransportScheme sc cyc
+TransportScheme sc cycPhi
+TransportScheme sc gammaCell
+TransportScheme sc bndValues
+TransportScheme sc stageTag
+TransportScheme sc gradFieldLeastSq
+TransportScheme sc gradFieldLimitK
+TransportScheme sc limGradK
+TransportScheme sc limGradLeastSq
+TransportScheme sc linearUpwind
+TransportScheme sc luGradK
