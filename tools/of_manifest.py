@@ -3733,7 +3733,14 @@ COMPONENTS = {
                         "counts OpenFOAM's, alpha 5.7e-13 and 2.9e-12, p_rgh 5.6e-13 and 2.6e-12, U 2.2e-10 and "
                         "1.8e-09, the moved points 1.1e-16 of the extent; the control, OpenFOAM with its mesh held "
                         "still, U 100%. BROKEN ONCE, the pattern lookup taken out of the dictionary reader: 48 of "
-                        "90 p_rgh counts, alpha 9.7e-04, U 1.0e-01.",
+                        "90 p_rgh counts, alpha 9.7e-04, U 1.0e-01. AND THE DEVICE ARM on both, same script, same "
+                        "thirty steps as shipped: all 90 p_rgh counts OpenFOAM's, alpha 7.7e-14 and 1.7e-13, p_rgh "
+                        "7.7e-14 and 1.7e-13, U 6.7e-11 and 6.7e-11, Uf 5.8e-11 and 5.5e-11 -- and a second device "
+                        "run in the same process reproduces the first to the bit. BROKEN ONCE EACH: the device GAMG "
+                        "upload kept while the host hierarchy was rebuilt on the moved mesh, a heap corruption "
+                        "(free(): invalid next size) the sweep had reported as the flap's TIMEOUT; the Gauss-Seidel "
+                        "level cache keyed on the owner pointer and the sizes alone, which the pool recycles across "
+                        "the per-step rebuild: piston U 3.0e-02, 89 of 90 counts.",
              note="A PhiScheme (interfaceCompression.C:33-41), so the limiter reads the two cell values of the field "
                   "and nothing else: clamp(1 - max(sqr(1 - 4 phiP (1 - phiP)), sqr(1 - 4 phiN (1 - phiN))), 0, 1), "
                   "the quartic form -- 1 where both cells are half full, 0 where either is empty or full -- blended "

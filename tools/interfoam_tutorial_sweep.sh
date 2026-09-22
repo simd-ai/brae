@@ -15,11 +15,11 @@ BIN="${BRAE_BIN:-$ROOT/build/brae}"
 TUT=${BRAE_OF_TUTORIALS:-/usr/lib/openfoam/openfoam2412/tutorials}/multiphase/interFoam
 OFBASHRC=${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
 STEPS=${STEPS:-2}
-# 600 and 600: the two multi-paddle tutorials mesh 448,000 cells and the device arm's first step pays
-# for the hierarchy and the DIC schedule on that mesh. At 180/240 they read TIMEOUT, which is a budget
-# and not a refusal -- and a sweep that reports a budget as a gap is what this whole file is against.
-# waveMakerMultiPaddleFlap's device arm still reads TIMEOUT inside a full sweep and RUNS when given the
-# same budget on its own (MEASURED, both ways): it sits on the boundary, so read that line as a budget.
+# 600 and 600: the two multi-paddle tutorials mesh 448,000 cells and meshing them is most of the budget.
+# The device arm runs their two steps in about 7 s. waveMakerMultiPaddleFlap's device arm used to read
+# TIMEOUT here, and the earlier note called that a budget: it was a CRASH (free(): invalid next size, a
+# stale device GAMG upload after the hierarchy was rebuilt on the moved mesh) spending its time writing
+# a core. A TIMEOUT on a case that runs elsewhere is a gap to localise, not a budget to read past.
 CASE_TIMEOUT=${CASE_TIMEOUT:-600}
 MESH_TIMEOUT=${MESH_TIMEOUT:-600}
 W=${KEEP_W:-$(mktemp -d)}

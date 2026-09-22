@@ -15,9 +15,24 @@
 
 namespace brae {
 
+// A process-wide serial handed to every LDU addressing uploaded to the device (a DeviceMesh, a
+// DeviceLduMatrix), carried by the views over it. The device pool recycles blocks of equal size, so
+// the ADDRESS of an owner array is not the identity of its CONTENT: the GAMG hierarchy of a moving
+// mesh is rebuilt every step and its coarse levels come back at the same pointers with the same cell
+// counts (224000 112000 56000 ... on waveMakerMultiPaddlePiston, 448k cells) but a different pairing,
+// and the pointer-keyed Gauss-Seidel level cache replayed the previous step's schedule inside the
+// DICGaussSeidel smoother: device U 3.0e-02 vs OpenFOAM at 30 steps where the PCG twin read 6.4e-11,
+// and a second run in one process not reproducing the first (1.9e-04). The caches compare this id.
+inline unsigned long long nextDeviceAddressingId()
+{
+    static unsigned long long n = 0;
+    return ++n;
+}
+
 struct DeviceMesh
 {
     int nCells = 0, nInternalFaces = 0, nBndFaces = 0;
+    unsigned long long addressingId = 0;                // see nextDeviceAddressingId
     DeviceBuffer<label>  owner, nei;                    // internal faces
     DeviceBuffer<scalar> w, V, Sfx, Sfy, Sfz;           // weights(nIf), V(nC), Sf components(all faces)
     DeviceBuffer<scalar> dc, magSf;                     // deltaCoeffs(nIf), |Sf|(all faces), for fvm assembly
@@ -171,6 +186,7 @@ inline DeviceMesh buildDeviceMesh(
     dm.nCells = nC;
     dm.nInternalFaces = nIf;
     dm.nBndFaces = nB;
+    dm.addressingId = nextDeviceAddressingId();
     dm.owner.copyFrom(ownI);
     dm.nei.copyFrom(neiI);
     dm.w.copyFrom(wI);
@@ -239,7 +255,8 @@ inline void refreshDeviceMeshGeometry(
     // -- w, magSf, Sf, dOwn, dNei, dBnd -- has just been replaced above, so dropping it here is what
     // keeps the cache from serving a pre-move fit on a moving mesh (FP-3).
     dm.lsqInvDd.resize(0);
-    // owner/nei, ownerStart/losort/losortStart, bnd* deliberately NOT touched: topology, unchanged.
+    // owner/nei, ownerStart/losort/losortStart, bnd* and addressingId deliberately NOT touched:
+    // topology, unchanged, so the caches keyed on the id keep serving this mesh.
 }
 
 

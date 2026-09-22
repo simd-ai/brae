@@ -520,8 +520,11 @@ DeviceGamgHierarchy& DeviceGamgCache::get(label nCellsInCoarsestLevel)
     // next GAMGAgglomeration::New checks the object out and builds the hierarchy again on the moved
     // mesh (GAMGAgglomeration.C:311-330, :498-516). The host cache says so by going un-built, and
     // this upload is stale with it -- the coarse levels' face areas and the pairing they decide are
-    // the OLD mesh's.
-    if (uploaded && host && host->built) return device;
+    // the OLD mesh's. The test is the BUILD COUNT, not `built`: a host GAMG solve between the move and
+    // this call (CorrectPhi's pcorr) rebuilds the host hierarchy and leaves it built, and an upload
+    // keyed on `built` alone was kept across it -- GamgAgglomerationCache::buildCount has the
+    // measurement.
+    if (uploaded && host && host->built && host->buildCount == uploadedBuild) return device;
     if (!mesh || !geometry || !host)
     {
         throw std::runtime_error(
@@ -582,6 +585,7 @@ DeviceGamgHierarchy& DeviceGamgCache::get(label nCellsInCoarsestLevel)
     device.rA.resize(nFine);
     device.wA.resize(nFine);
     uploaded = true;
+    uploadedBuild = host->buildCount;
     return device;
 }
 

@@ -211,9 +211,17 @@ int main(
     // The device arm gets its OWN mesh, geometry and patches: both arms MOVE the one they are handed,
     // so sharing would make the host's motion the device's initial condition and every number after
     // that fiction.
+    // ...and the two multi-paddle tutorials, 448,000 cells with GAMG for pcorr AND p_rgh on a mesh that
+    // moves: the one shape where a host GAMG solve (CorrectPhi's pcorr) rebuilds the shared hierarchy
+    // between the move and the device's pressure solve. The device kept its upload across that rebuild
+    // -- keyed on `built`, which the host solve had set again -- and read the coarsest level's
+    // addressing from the new hierarchy: heap corruption in the first step's first p_rgh on
+    // multiFlap, where multiPiston's translated mesh happened to agglomerate to the same level sizes
+    // and ran on the OLD pairing (GamgAgglomerationCache::buildCount). These two arms hold the fix.
     const bool deviceArm = (profile == "mixer" || profile == "solitary"
                          || profile == "cylinder" || profile == "solitaryGamg"
-                         || profile == "piston" || profile == "flap");
+                         || profile == "piston" || profile == "flap"
+                         || profile == "multiPiston" || profile == "multiFlap");
     PrimitiveMesh mD;
     FvGeometry gD;
     std::vector<FvPatch> patchesD;

@@ -94,6 +94,18 @@ struct GamgAgglomerationCache
     bool built = false;
     bool forward = true;
     GamgAgglomeration agglomeration;
+    // HOW MANY TIMES the hierarchy has been built: what a copy of it elsewhere -- the device's upload
+    // -- must key its validity on. `built` alone cannot say: on a moving mesh the motion solve leaves
+    // the mesh moved and the cache un-built, and CorrectPhi's GAMG pcorr, a host solve on either arm,
+    // builds it again on the moved mesh before the device's pressure solve asks. The device then saw
+    // `built` and kept its upload from the mesh BEFORE the move, while reading the coarsest level's
+    // addressing from the rebuilt host hierarchy. MEASURED on laminar/waves/waveMakerMultiPaddleFlap
+    // (448,000 cells, GAMG pcorr AND p_rgh, paddles that rotate): heap corruption in the coarsest
+    // solve of the first step's first p_rgh -- `free(): invalid next size` -- where the piston twin,
+    // whose translated mesh happens to agglomerate to the same level sizes, ran. The single-paddle
+    // gates never met it: their pcorr is PCG, so nothing rebuilt the hierarchy between the move and
+    // the device's own rebuild.
+    label buildCount = 0;
 
     const GamgAgglomeration& get(
         const PrimitiveMesh& m,
@@ -104,6 +116,7 @@ struct GamgAgglomerationCache
         {
             agglomeration = faceAreaPairGamgAgglomeration(m, g, nCellsInCoarsestLevel, forward);
             built = true;
+            ++buildCount;
         }
         return agglomeration;
     }

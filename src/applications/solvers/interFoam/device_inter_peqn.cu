@@ -696,6 +696,7 @@ void deviceInterPEqnFlux(
     A.ownerStart = dm.ownerStart.data();
     A.losort = dm.losort.data();
     A.losortStart = dm.losortStart.data();
+    A.addressingId = dm.addressingId;
     deviceMatrixFluxInternal(A, pSolved, fluxInt);
     // fvMatrix::flux(): `fieldFlux += *faceFluxCorrectionPtr_` (fvMatrix.C:1688, matrixFlux on the host)
     if (faceFluxCorrection && dm.nInternalFaces > 0)

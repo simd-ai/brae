@@ -33,6 +33,13 @@ static const GridColoring& gsColoringFor(const DeviceLduView& A)
     static std::map<const label*, GridColoring> colorCache;
     cacheStat("gs-coloring", colorCache.size());
     auto it = colorCache.find(A.owner);
+    // the pointer is recycled by the pool; the addressing id and the sizes say whether it is the same graph
+    if (it != colorCache.end()
+     && (it->second.nCells != A.nCells || it->second.addressingId != A.addressingId))
+    {
+        colorCache.erase(it);
+        it = colorCache.end();
+    }
     if (it == colorCache.end())
     {
         const int nF = A.nInternalFaces;
@@ -42,6 +49,8 @@ static const GridColoring& gsColoringFor(const DeviceLduView& A)
         Coloring c = greedyColor(ownerH, neiH, A.nCells);
         GridColoring gc;
         gc.nColors=c.nColors;
+        gc.nCells = A.nCells;
+        gc.addressingId = A.addressingId;
         gc.cells.copyFrom(c.cells);
         gc.start.copyFrom(c.start);
         gc.startH=c.start;
@@ -95,6 +104,7 @@ struct GSGraphCache
     int scratchEpoch = -1;        // deviceReductionScratchEpoch() at capture
     const void* owner = nullptr;  // the mesh the baked levels, CSR and buffer sizes belong to
     int nC = -1, nF = -1;
+    unsigned long long addressingId = 0;   // ...and its content's identity, since the pointer is recycled
     // tol/relTol/maxIter/minIter/nSweeps/symmetric are ARGUMENTS of the captured kernels, so a solve
     // that changes any of them on the same field (kFinal after k, a tightened arm in a gate) must
     // re-capture. Keying on psi alone replayed the previous solve's rule.
@@ -193,7 +203,8 @@ static void deviceSymGaussSeidelGraph(
     const bool recapture = !c.exec || c.key != psi.data() || c.tol != tol || c.relTol != relTol
                         || c.maxIter != maxIter || c.minIter != minIter || c.sweepsPer != sweepsPer
                         || c.symmetric != symmetric || c.scratchEpoch != epoch
-                        || c.owner != (const void*)A.owner || c.nC != nC || c.nF != nF;
+                        || c.owner != (const void*)A.owner || c.nC != nC || c.nF != nF
+                        || c.addressingId != A.addressingId;
     if (recapture)
     {
         if (c.exec)
@@ -230,7 +241,7 @@ static void deviceSymGaussSeidelGraph(
         cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &tmp), "gs capture end");
         cudaCheck(cudaGraphInstantiate(&c.exec, c.graph, 0), "gs graph instantiate");
         c.key = psi.data(); c.scratchEpoch = epoch;
-        c.owner = A.owner; c.nC = nC; c.nF = nF;
+        c.owner = A.owner; c.nC = nC; c.nF = nF; c.addressingId = A.addressingId;
         c.tol = tol; c.relTol = relTol; c.maxIter = maxIter; c.minIter = minIter;
         c.sweepsPer = sweepsPer; c.symmetric = symmetric;
     }
@@ -304,6 +315,7 @@ struct GSFusedGraphCache
     const void* psiKey[GS_FUSED_MAX] = {};
     const void* owner = nullptr;
     int nC = -1, nF = -1, scratchEpoch = -1;
+    unsigned long long addressingId = 0;
     scalar tol = -1, relTol = -1;
     int    maxIter = -1, minIter = -1, sweepsPer = -1;
     bool   symmetric = true;
@@ -411,7 +423,8 @@ static void deviceSymGaussSeidelGraphFused(
     const int epoch = deviceReductionScratchEpoch();
     bool same = c.exec && c.nComp == nComp && c.tol == tol && c.relTol == relTol && c.maxIter == maxIter
              && c.minIter == minIter && c.sweepsPer == sweepsPer && c.symmetric == symmetric
-             && c.scratchEpoch == epoch && c.owner == (const void*)A0.owner && c.nC == nC && c.nF == nF;
+             && c.scratchEpoch == epoch && c.owner == (const void*)A0.owner && c.nC == nC && c.nF == nF
+             && c.addressingId == A0.addressingId;
     for (int k = 0; k < nComp; ++k) same = same && c.psiKey[k] == (const void*)comps[k].psi->data();
     if (!same)
     {
@@ -453,7 +466,7 @@ static void deviceSymGaussSeidelGraphFused(
         cudaCheck(cudaGraphInstantiate(&c.exec, c.graph, 0), "gs fused graph instantiate");
         c.nComp = nComp;
         for (int k = 0; k < nComp; ++k) c.psiKey[k] = comps[k].psi->data();
-        c.owner = A0.owner; c.nC = nC; c.nF = nF; c.scratchEpoch = epoch;
+        c.owner = A0.owner; c.nC = nC; c.nF = nF; c.scratchEpoch = epoch; c.addressingId = A0.addressingId;
         c.tol = tol; c.relTol = relTol; c.maxIter = maxIter; c.minIter = minIter;
         c.sweepsPer = sweepsPer; c.symmetric = symmetric;
     }
@@ -492,6 +505,7 @@ namespace
 struct HostGSTopo
 {
     int nC = 0, nF = 0;
+    unsigned long long addressingId = 0;                  // DeviceLduView::addressingId it was read from
     std::vector<label> ownStart, nei;
 };
 const HostGSTopo& hostGsTopoFor(const DeviceLduView& A)
@@ -499,7 +513,10 @@ const HostGSTopo& hostGsTopoFor(const DeviceLduView& A)
     static auto& cache = *new std::map<const void*, HostGSTopo>();
     cacheStat("host-gs-topo", cache.size());
     auto it = cache.find(A.owner);
-    if (it != cache.end() && (it->second.nC != A.nCells || it->second.nF != A.nInternalFaces))
+    // pointer + sizes are not the addressing's identity (a recycled pool block, see gsLevelsFor): the id is
+    if (it != cache.end()
+     && (it->second.nC != A.nCells || it->second.nF != A.nInternalFaces
+      || it->second.addressingId != A.addressingId))
     {
         cache.erase(it);
         it = cache.end();
@@ -509,6 +526,7 @@ const HostGSTopo& hostGsTopoFor(const DeviceLduView& A)
         HostGSTopo t;
         t.nC = A.nCells;
         t.nF = A.nInternalFaces;
+        t.addressingId = A.addressingId;
         t.ownStart.resize((std::size_t)t.nC + 1);
         t.nei.resize((std::size_t)t.nF);
         cudaCheck(cudaMemcpy(t.ownStart.data(), A.ownerStart, ((std::size_t)t.nC + 1)*sizeof(label), cudaMemcpyDeviceToHost), "gs host ownerStart");

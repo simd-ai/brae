@@ -95,6 +95,9 @@ struct DeviceGamgCache
     // would then be solving on.
     GamgAgglomerationCache* host = nullptr;
     bool uploaded = false;
+    // the host hierarchy's build count this upload was taken from -- see GamgAgglomerationCache::
+    // buildCount for why `built` is not enough
+    label uploadedBuild = -1;
     DeviceGamgHierarchy device;
 
     DeviceGamgHierarchy& get(label nCellsInCoarsestLevel);

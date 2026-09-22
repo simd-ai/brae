@@ -70,6 +70,7 @@ struct MomentumMatrix
         A.owner = dm.owner.data(); A.nei = dm.nei.data();
         A.ownerStart = dm.ownerStart.data();
         A.losort = dm.losort.data(); A.losortStart = dm.losortStart.data();
+        A.addressingId = dm.addressingId;
         return A;
     }
 };

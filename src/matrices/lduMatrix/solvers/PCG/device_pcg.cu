@@ -277,6 +277,7 @@ struct BiCGGraphCache
     // everything else the captured kernels bake in: the topology, the cell count (which sizes the
     // cache-owned vectors), the DILU factor's buffers and level count, and the reduction scratch epoch
     const void* owner = nullptr;
+    unsigned long long addressingId = 0;      // the owner pointer's content identity (recycled pool blocks)
     int nC = -1, diluLevels = -1, scratchEpoch = -1;
     const void* diluRD = nullptr;
     // ...and, when the preconditioner is an AMG V-cycle, the hierarchy: the captured body references its
@@ -451,7 +452,8 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
                         || c.direct != stable
                         || (stable && (c.capSrc[0] != src[0] || c.capSrc[1] != src[1]
                                     || c.capSrc[2] != src[2] || c.capSrc[3] != src[3]))
-                        || c.owner != (const void*)A.owner || c.nC != nC || c.diluRD != diluRD || c.diluLevels != diluLv
+                        || c.owner != (const void*)A.owner || c.nC != nC || c.addressingId != A.addressingId
+                        || c.diluRD != diluRD || c.diluLevels != diluLv
                         || c.scratchEpoch != epoch || c.amg != (const void*)amg || c.amgCoarseDiag != amgCD
                         || c.generation != deviceGraphGeneration();
     if (recapture)
@@ -525,7 +527,7 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
         c.key = psi.data(); c.tol = tol; c.relTol = relTol; c.maxIter = maxIter; c.minIter = minIter;
         c.precon = useDilu ? (const void*)precon : nullptr;
         c.polyDeg = polyDeg;
-        c.owner = A.owner; c.nC = nC; c.diluRD = diluRD; c.diluLevels = diluLv; c.scratchEpoch = epoch; c.generation = deviceGraphGeneration();
+        c.owner = A.owner; c.nC = nC; c.addressingId = A.addressingId; c.diluRD = diluRD; c.diluLevels = diluLv; c.scratchEpoch = epoch; c.generation = deviceGraphGeneration();
         c.amg = amg; c.amgCoarseDiag = amgCD;
     }
     static bool announced = false;
