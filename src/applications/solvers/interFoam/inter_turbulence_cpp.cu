@@ -88,9 +88,23 @@ SmoothLinearSolve readFinalSolve(
     return s;
 }
 
-// div(<flux>,<field>): `Gauss upwind` and nothing else. The closures have limitedLinear and
-// linearUpwind, but no interFoam case gates them here: all 11 kEpsilon tutorials name upwind, and so
-// does waterChannel for k and omega.
+// div(<flux>,<field>) for a RAS closure: `Gauss upwind` and nothing else, AND THAT IS NOW A MEASURED
+// REFUSAL rather than an untested one. Both arms of both closures carry `Gauss limitedLinear <k>`
+// (the shared TransportScheme's limitedLinear half, the host twins' divWithScheme), and every shipped
+// interFoam tutorial names upwind, so the scheme had never been asked for here. Admitting it and
+// staging RAS/waterChannel under `"div\(phi,(k|omega)\)" Gauss limitedLinear 1` found BOTH arms
+// wrong, ten steps against real OpenFOAM:
+//
+//   DEVICE fields:  k 1.4724e-05, omega 1.7822e-04, nut 1.6747e-05 -- while alpha (1.2413e-12),
+//                   p_rgh (1.1675e-12) and U (6.3609e-12) are at round-off, so it is the closure
+//   HOST solve log: omega's initial residual 3.190e-05 from OpenFOAM's in step one and its final
+//                   residuals differ too, while omega's FIELD agrees to 7.1991e-12. omega converges
+//                   in one or two iterations here, so the field hides a matrix that is not
+//                   OpenFOAM's -- the residual trace is what sees it.
+//
+// So the refusal stays, and it is worth more than it was: it now names what is wrong rather than what
+// is untested. Porting it is its own unit -- start from the host's omega weights, since the host is
+// the device's reference and its matrix is already off.
 void requireUpwind(
     const std::string& caseDir,
     const std::string& field,
@@ -100,8 +114,9 @@ void requireUpwind(
     if (fs.bounded || fs.limited || fs.linearUpwind)
         throw std::runtime_error(
             std::string(WHO) + "fvSchemes `div(" + fluxName + "," + field + ")` is not plain `Gauss "
-            "upwind`. That is the one convection scheme the interFoam turbulence port is gated on; "
-            "refusing rather than running an ungated one.");
+            "upwind`. The closures carry limitedLinear, and MEASURED on RAS/waterChannel it is wrong "
+            "on both arms -- the device closure reads omega 1.8e-04 and k 1.5e-05 from OpenFOAM, and "
+            "the host's omega matrix leaves a residual trace 3.2e-05 from OpenFOAM's. Refused.");
 }
 
 // grad(U), which the production GbyNu takes (kEpsilon.C:237, kOmegaSSTBase.C:520)

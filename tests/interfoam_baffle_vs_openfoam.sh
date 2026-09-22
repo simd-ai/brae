@@ -132,6 +132,11 @@ PTOL_WET=${PTOL_WET:-1e-13}
 DT=${DT:-1e-3}
 PROFILES=${PROFILES:-"walls cyclic porous wallsWet cyclicWet porousWet wallsWetExplicit cyclicWetExplicit"}
 
+# shellcheck disable=SC1091
+. "$(dirname "$0")/of_oracle_cache.sh"
+command -v oracleKey > /dev/null \
+    || { echo "FAIL: of_oracle_cache.sh did not define oracleKey -- the gate would run uncached"; exit 1; }
+
 [ -x "$BIN" ]      || { echo "SKIP: $BIN not built"; exit 77; }
 [ -d "$SRC" ]      || { echo "SKIP: RAS/damBreakPorousBaffle tutorial not found at $SRC"; exit 77; }
 [ -f "$OFBASHRC" ] || { echo "SKIP: real OpenFOAM not available"; exit 77; }
@@ -253,8 +258,17 @@ elif profile == 'walls':
         assert k == 1, name
         open(p, 'w').write(t)
 PYEOF
+    # THE ORACLE IS CACHED FROM HERE -- tests/of_oracle_cache.sh. The key is a hash of every
+    # staged byte INCLUDING the mesh, because this gate edits after it meshes.
+    local key
+    key=$(oracleKey "$C" "interfoam_baffle" "$profile" "$N" "$DT")
+    if oracleRestore "$C" "$key" "$END"; then
+    echo "OpenFOAM's $N steps of deltaT $DT to t = $END reused from the oracle cache   [$profile]"
+        return 0
+    fi
     ( cd "$C" && interFoam > log.interFoam 2>&1 ) || { echo "FAIL: interFoam [$profile]"; tail -30 "$C/log.interFoam"; return 1; }
     [ -d "$C/$END" ] || { echo "FAIL: OpenFOAM wrote no $END directory [$profile]"; ls "$C"; return 1; }
+    oracleStore "$C" "$key"
     echo "OpenFOAM ran $N steps of deltaT $DT to t = $END   [$profile]"
 }
 

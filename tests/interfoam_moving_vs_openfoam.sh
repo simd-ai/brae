@@ -295,6 +295,9 @@ LAM="$TUT/multiphase/interFoam/laminar"
 . "$(dirname "$0")/require_fresh_binary.sh"
 # shellcheck disable=SC1091
 . "$(dirname "$0")/of_oracle_cache.sh"
+command -v oracleKey > /dev/null \
+    || { echo "FAIL: of_oracle_cache.sh did not define oracleKey -- the gate would run uncached"; exit 1; }
+
 [ -x "$BIN" ]                 || { echo "SKIP: $BIN not built"; exit 77; }
 [ -d "$LAM/testTubeMixer" ]   || { echo "SKIP: testTubeMixer tutorial not found under $LAM"; exit 77; }
 [ -f "$OFBASHRC" ]            || { echo "SKIP: real OpenFOAM not available"; exit 77; }

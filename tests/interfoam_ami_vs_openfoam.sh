@@ -71,6 +71,11 @@ WEIGHT_STEPS=3
 # the tutorial's (50 50 100) background block meshes 1.1M cells -- a bench size, not a validation one
 BLOCK=${BLOCK:-"22 22 44"}
 
+# shellcheck disable=SC1091
+. "$(dirname "$0")/of_oracle_cache.sh"
+command -v oracleKey > /dev/null \
+    || { echo "FAIL: of_oracle_cache.sh did not define oracleKey -- the gate would run uncached"; exit 1; }
+
 [ -x "$BIN" ]      || { echo "SKIP: $BIN not built"; exit 77; }
 [ -x "$WBIN" ]     || { echo "SKIP: $WBIN not built"; exit 77; }
 [ -d "$SRC" ]      || { echo "SKIP: mixerVesselAMI tutorial not found at $SRC"; exit 77; }
@@ -202,7 +207,16 @@ if p == 'still':
     assert k == 1, 'omega'
     open(mdict, 'w').write(s)
 PYEOF
+    # THE ORACLE IS CACHED FROM HERE -- tests/of_oracle_cache.sh. The key is a hash of every
+    # staged byte INCLUDING the mesh, because this gate edits after it meshes.
+    local key
+    key=$(oracleKey "$C" "interfoam_ami" "$profile" "$n" "$DT" "$every")
+    if oracleRestore "$C" "$key" "$(timeAfter "$n")"; then
+    echo "OpenFOAM's $n steps of deltaT $DT reused from the oracle cache   [$profile]"
+        return 0
+    fi
     ( cd "$C" && interFoam > log.interFoam 2>&1 ) || { echo "FAIL: interFoam [$profile]"; tail -30 "$C/log.interFoam"; return 1; }
+    oracleStore "$C" "$key"
     echo "OpenFOAM ran $n steps of deltaT $DT   [$profile]"
 }
 

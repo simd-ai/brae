@@ -30,8 +30,14 @@ oracleKey()
     local ofbin
     ofbin=$(command -v interFoam 2>/dev/null)
     {
-        # every staged byte, in a stable order, contents AND path
-        find "$C" -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum 2>/dev/null \
+        # every staged byte, in a stable order, contents AND path -- EXCEPT the solver LOGS. A log is
+        # pure output and carries `Date`, `Time`, `Host` and `PID`, so a case hashed after blockMesh
+        # gets a new key on every run and the cache can never hit. MEASURED: the three gates that hook
+        # AFTER meshing (les, baffle, ami) reused 0 of 14 oracles until this exclusion went in; the
+        # moving gate hooks before blockMesh, where no log exists yet, which is why it hit from the
+        # start. Excluding them weakens nothing -- no log is an input to OpenFOAM.
+        find "$C" -type f ! -name 'log.*' ! -name '.brae-oracle-key' -print0 \
+            | LC_ALL=C sort -z | xargs -0 sha256sum 2>/dev/null \
             | sed "s|$C/||"
         # ...and which OpenFOAM would run it
         [ -n "$ofbin" ] && stat -c '%s %Y %n' "$ofbin" 2>/dev/null
