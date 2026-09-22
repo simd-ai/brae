@@ -279,6 +279,40 @@ try
     GeometricField<vector> U = buildField<vector>(readField<vector>(fieldDir + "/U"), fvp, nC); U.evaluateBoundary();
     const FieldData<scalar> pFd = readField<scalar>(fieldDir + "/p");
     GeometricField<scalar> p = buildField<scalar>(pFd, fvp, nC); p.evaluateBoundary();
+    // THE PRESSURE REFERENCE, which this driver never set. pimpleFoam/createFields.H:34-36 runs
+    // setRefCell(p, pimple.dict(), pRefCell, pRefValue) and pEqn.H:13-16,46 then drives adjustPhi and
+    // pEqn.setReference off p.needReference() -- exactly as simpleFoam does. DeviceSimpleSolver, which
+    // this driver constructs with `ctl`, reads ctl_.needRef at all four of those points
+    // (device_simple_foam.cu:2347, 2704, 3164-3170, 3214); with the field left at its default a case
+    // whose pressure fixes no value -- every closed or wholly periodic domain, nine of OpenFOAM's own
+    // pimpleFoam tutorials among them (LES/decayIsoTurb, LES/periodicHill, laminar/mixerVesselAMI2D,
+    // laminar/sloshing2D ...) -- would have run its singular all-Neumann system with neither the flux
+    // adjustment nor the reference, and said nothing. The PIMPLE preflight whitelists pRefCell and
+    // pRefValue on the stated ground that they are "read only when the pressure needs a reference"
+    // (dict_audit.cuh:105-107), which was the condition this omission removed. Found by
+    // tools/default_audit.py (the field is set at simpleFoam's site and at the rho drivers', not here).
+    // Transcribed from gpuSimpleFoam.cu's block so the two drivers decide it the same way.
+    ctl.needRef = true;
+    for (const auto& bf : p.boundary)
+        if (bf->fixesValue() || bf->bcCategory() == 4)   // fixedValue, or freestreamPressure at outflow
+        {
+            ctl.needRef = false;
+            break;
+        }
+    // ...and the CONTROL this driver's behaviour before the fix, for the gate that holds it
+    // (tests/pimple_pressure_reference_vs_openfoam.sh). An instrument, not a mode.
+    if (ctl.needRef && std::getenv("BRAE_NO_PREF"))
+    {
+        ctl.needRef = false;
+        std::printf("  *** BRAE_NO_PREF: the pressure reference is SUPPRESSED (a gate's control). ***\n");
+    }
+    if (ctl.needRef)
+    {
+        ctl.pRefCell  = pimple ? (label)pimple->intOr("pRefCell", 0) : 0;
+        ctl.pRefValue = pimple ? pimple->scalarOr("pRefValue", 0.0) : 0.0;
+        std::printf("  pressure needs reference (no fixedValue-p): pRefCell=%d pRefValue=%.4g\n",
+                    (int)ctl.pRefCell, ctl.pRefValue);
+    }
     // phi: on restart READ the previously-written conservative face flux (surfaceScalarField) so the resumed run
     // continues the EXACT flux state (the >=17-digit write makes the phi write->read round-trip bit-identical) -- no
     // first-step continuity transient. The overall restart is seamless to ~1e-10 (nut re-validated at startup, like OF),

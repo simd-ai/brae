@@ -81,16 +81,58 @@ def enclosing_scope(s, start):
     return s[start:]
 
 
-def hand_built_sites(name, text):
-    """[(file, line, var, assigned fields)] where `Type var;` is followed by var.field = ... ."""
+def filler_functions(name, text):
+    """{function name: fields it assigns} for every function taking a `Name& param`: the readers a site
+    hands its struct to (parseFvSchemesControls(caseDir, ctl), readLinearSolverControls(dict, ctl)) --
+    the one-builder shape, which a count of `var.field =` at the site alone cannot see."""
+    # a default argument may be a brace-initialised value (`= SolverRunsAs{}`), so braces are allowed
+    # inside the parameter list; a `;` is not
+    sig_re = re.compile(r'\b(\w+)\s*\(([^;]*?\b%s\s*&\s*(\w+)\b[^;]*?)\)\s*(?:const\s*)?\{' % re.escape(name))
+    fillers, bodies, params = {}, {}, {}
+    for s in text.values():
+        for m in sig_re.finditer(s):
+            fname, param = m.group(1), m.group(3)
+            if fname in ('if', 'for', 'while', 'switch'):
+                continue
+            body = enclosing_scope(s, m.end())
+            fields = set(re.findall(r'\b%s\.(\w+)\s*=(?!=)' % re.escape(param), body))
+            fields |= set(re.findall(r'\b%s\.(\w+)\s*\.(?:push_back|assign|resize)' % re.escape(param), body))
+            fillers.setdefault(fname, set()).update(fields)
+            bodies[fname] = bodies.get(fname, '') + body
+            params[fname] = param
+    # ...and TRANSITIVELY: a reader that hands the struct on to another reader sets what that one sets
+    # (readTurbulenceModel -> readLaminarModel, which is where `maxwell` and the generalizedNewtonian
+    # coefficients are filled). Without this the callers of the outer reader read as omitting them.
+    changed = True
+    while changed:
+        changed = False
+        for fname, body in bodies.items():
+            for other, fields in list(fillers.items()):
+                if other == fname or not fields:
+                    continue
+                for call in re.finditer(r'\b%s\s*\(([^;]*?)\)\s*;' % re.escape(other), body):
+                    if re.search(r'(^|[^\w.])%s\b' % re.escape(params[fname]), call.group(1)):
+                        if not fields <= fillers[fname]:
+                            fillers[fname] |= fields
+                            changed = True
+    return {k: v for k, v in fillers.items() if v}
+
+
+def hand_built_sites(name, text, fillers):
+    """[(file, line, var, assigned fields)] where `Type var;` is followed by var.field = ... or by a
+    call that hands var to a filler function."""
     inst_re = re.compile(r'\b%s\s+(\w+)\s*(?:\{\s*\})?;' % re.escape(name))
     sites = []
     for f, s in text.items():
         for m in inst_re.finditer(s):
             var = m.group(1)
             window = enclosing_scope(s, m.end())
-            assigned = set(re.findall(r'\b%s\.(\w+)\s*=' % re.escape(var), window))
+            assigned = set(re.findall(r'\b%s\.(\w+)\s*=(?!=)' % re.escape(var), window))
             assigned |= set(re.findall(r'\b%s\.(\w+)\s*\.(?:push_back|assign|resize)' % re.escape(var), window))
+            for fname, fields in fillers.items():
+                for call in re.finditer(r'\b%s\s*\(([^;]*?)\)\s*;' % re.escape(fname), window):
+                    if re.search(r'(^|[^\w.])%s\b' % re.escape(var), call.group(1)):
+                        assigned |= fields
             if assigned:
                 sites.append((f, s[:m.start()].count('\n') + 1, var, assigned))
     return sites
@@ -128,7 +170,7 @@ def main(argv):
     evaluated = set()          # structs with >= 2 sites INSIDE this scan: the only ones whose ledger lines can be stale
     for name, (_, fields) in sorted(structs.items()):
         fieldnames = {n for n, _ in fields}
-        sites = hand_built_sites(name, text)
+        sites = hand_built_sites(name, text, filler_functions(name, text))
         if len(sites) < 2:
             continue
         evaluated.add(name)

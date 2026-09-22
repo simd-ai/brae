@@ -100,3 +100,19 @@ KEpsilonInput kin fvoSpK            # multiphaseMangrovesTurbulenceModel is inte
 KEpsilonInput kin fvoSpEps          # same
 KEpsilonInput kin pbicgKE           # the rho mirror selects the closure's solver through TurbulenceHookOptions (gsK/precon), a declared selection of its own (rhoSimpleFoamDriver.cu:553-570)
 KEpsilonInput kin bcPhiBnd          # null = the equation's own flux, which the consumer takes (kEpsilon.cu:796,850 `in.bcPhiBnd ? ... : *in.phiBnd`); the separate flux is interFoam's `density variable` case, kEpsilon.cuh:82-86
+
+# ---- DeviceSimpleControls (solver_controls.cuh) at the two INCOMPRESSIBLE driver sites ---------------
+# gpuSimpleFoam.cu (steady) and gpuPimpleFoam.cu (transient) build the same struct the compressible
+# drivers do; what each leaves at its default is either a control OpenFOAM's own solver never reads on
+# that path, or one the other ALGORITHM owns. `needRef`/`pRefCell`/`pRefValue` used to be here for
+# pimpleFoam and were NOT of this kind -- they are wired now (tests/pimple_pressure_reference_vs_openfoam.sh).
+DeviceSimpleControls ctl transonic               # incompressible: OF's simpleFoam/pimpleFoam pEqn has no transonic branch (the compressible pEqn does); dict_audit.cuh:108-109 says so to the preflight
+DeviceSimpleControls ctl simpleRho               # SIMPLErho is the compressible rho cadence; inert on an incompressible path (solver_controls.cuh:149)
+DeviceSimpleControls ctl correctPhi              # PIMPLE's, read on a MOVING mesh (pimpleFoam sets it from the PIMPLE dict); steady simpleFoam does not move its mesh
+DeviceSimpleControls ctl meshUpdateControl       # same: the mesh-update cadence is the transient driver's
+DeviceSimpleControls ctl meshUpdateInterval      # same
+DeviceSimpleControls ctl moveMeshOuterCorrectors # same (PIMPLE moveMeshOuterCorrectors)
+DeviceSimpleControls ctl momentumPredictor       # a PISO/PIMPLE switch: OF's SIMPLE always predicts momentum, so the default `true` IS simpleFoam's behaviour
+DeviceSimpleControls ctl solveFlow               # PIMPLE's `solveFlow no`; SIMPLE has no such entry, and the preflight would report an unread one
+DeviceSimpleControls ctl turbOnFinalIterOnly     # PIMPLE's turbOnFinalIterOnly: the steady loop corrects turbulence every iteration, as OF's simpleFoam does
+DeviceSimpleControls ctl outerResidualControl    # PIMPLE's residualControl over OUTER correctors; SIMPLE's own residualControl is read separately (gpuSimpleFoam.cu:368)
