@@ -553,6 +553,11 @@ if [ $HAVE_GPU = 1 ]; then
     BASE="$BM"
     arm device_moving_SST   refused "RAS closure AND moves its mesh" "-device" "$MOVSST"
     # the device's alpha pre-solve does not honour minIter (the host's does)
+    # cellLimited grad(U) is refused on the device (the host carries it into linearUpwind and the
+    # viscous term; this loop does not). The host arm `grad_namedU` above RUNS the same staging, which
+    # is what says the two answers differ by the refusal and not by the staging.
+    BASE="$B"
+    arm device_gradULimited refused "fvSchemes limits grad(U)" "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
     BASE="$B"
     arm device_alphaMinIter    refused "minIter 1"               "-device" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       yes;\\n\\1minIter 1;/' system/fvSolution"
     # the device loop RUNS the coded cyclicACMI baffle now: the binary couples the pair for it as for

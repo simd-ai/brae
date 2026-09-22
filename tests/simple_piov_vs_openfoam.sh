@@ -76,6 +76,26 @@
 #      root. The two coincide on an axis-aligned patch, which this outlet is, so that is not yet the
 #      answer -- but it is the one place the two typings are fed different arithmetic, and the next
 #      step is OpenFOAM's own numbers for those nine cells (the of-instrument route).
+#   6. AND OPENFOAM'S OWN NUMBERS SAY THE MOMENTUM SYSTEM IS RIGHT. Both codes were run ONE iteration
+#      from OpenFOAM's converged 393 -- identical inputs -- with tools/dumpSimpleFoam (extended here to
+#      dump the y and z solve systems: internalCoeffs and boundaryCoeffs are VECTORS, so the three
+#      components solve three different systems and an x-only dump cannot see a defect that lives in
+#      y) and brae's BRAE_DUMP_STAGE. At the nine inflow faces, EVERY piece of the y-momentum equation
+#      agrees: internalCoeffs to six digits, boundaryCoeffs 0 = 0, the patch value Uy_b = 0 = 0, the
+#      diagonal to 1e-10, and the assembled residual itself -- OF 1.7473e-10 against brae 1.7472e-10
+#      over those cells, ratio 1.00 on every one, and 2.2860e-07 against 2.2860e-07 over the whole
+#      field. So the 2.74669e-04 is not an assembly defect: it is the residual of brae's OWN fixed
+#      point, which is a different one.
+#   7. WHAT IS ACTUALLY WRONG IS HbyA AT THE PATCH. At that same instant, HbyA's boundary value on the
+#      nine inflow faces is off by a NEARLY CONSTANT absolute amount -- 7.1e-04, 9.9e-04, ... 5.5e-04
+#      where the values themselves span 2.6e-02 to 1.2e-01, so 2.78e-02 relative on the smallest face
+#      and 4.2e-03 on the largest -- and phiHbyA inherits EXACTLY those percentages (2.78e-02,
+#      1.47e-02, 9.09e-03, ... face for face). The pressure equation is therefore built on a flux that
+#      is ~1% wrong at the backflow faces while the momentum matrix is exact, which is what walks the
+#      SIMPLE iteration to a different fixed point.
+#      NEXT: brae's constrainHbyA leaves HbyA_b untouched where the patch is assignable (piov is), so
+#      compare what it leaves against OpenFOAM's rAU_b*H_b there -- a constant offset is an additive
+#      term present in one and not the other, not a scheme.
 #
 # The comparison is CONVERGED (both runs stop on the case's own residualControl), so it cannot see an
 # ordering defect -- only a boundary-condition or matrix-coefficient one, which is what it is here for.

@@ -288,6 +288,34 @@
         s0.primitiveFieldRef() = U.component(0)();
         sD.write(); sS.write(); s0.write();
 
+        // ...AND THE OTHER TWO COMPONENTS. internalCoeffs and boundaryCoeffs are VECTORS -- a
+        // directionMixed patch (pressureInletOutletVelocity) fixes one direction and frees another, so
+        // the three components solve three DIFFERENT systems and an x-only dump cannot see a defect
+        // that lives in y. Added while hunting the piov compensating defect, where the whole imbalance
+        // is in Uy on the outlet's backflow cells (tests/simple_piov_vs_openfoam.sh's header).
+        for (direction cmpt = 1; cmpt < 3; ++cmpt)
+        {
+            const word sfx(Foam::name(cmpt));
+            volScalarField cD(sD); cD.rename("stage_UsolveDiag" + sfx);
+            volScalarField cS(sD); cS.rename("stage_UsolveSrc" + sfx);
+            volScalarField c0(sD); c0.rename("stage_Usolve" + sfx);
+            scalarField dc(UEqnP.diag());
+            scalarField bc(UEqnP.source().component(cmpt));
+            forAll(mesh.boundary(), pj)
+            {
+                const labelUList& fc = mesh.boundary()[pj].faceCells();
+                forAll(fc, i)
+                {
+                    dc[fc[i]] += UEqnP.internalCoeffs()[pj][i].component(cmpt);
+                    bc[fc[i]] += UEqnP.boundaryCoeffs()[pj][i].component(cmpt);
+                }
+            }
+            cD.primitiveFieldRef() = dc;
+            cS.primitiveFieldRef() = bc;
+            c0.primitiveFieldRef() = U.component(cmpt)();
+            cD.write(); cS.write(); c0.write();
+        }
+
         surfaceScalarField sU
         (
             IOobject("stage_UsolveUpper", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
