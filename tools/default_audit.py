@@ -23,7 +23,12 @@ from collections import defaultdict
 
 
 def parse_structs(text):
-    """{name: (file, [(field, defaulted)])} for structs with >= 3 data members and a default."""
+    """{name: [(file, [(field, defaulted)]), ...]} for structs with >= 3 data members and a default.
+
+    A NAME IS NOT A TYPE: `StepInput` is defined three times in this tree (cpu::simpleFoam,
+    gpu::simpleFoam, cpu::rhoSimple), and comparing a site that builds one against a site that builds
+    another reported every field the two do not share. Each definition is kept, and a site is matched
+    to the definitions whose fields COVER what it assigns."""
     struct_re = re.compile(r'\bstruct\s+(\w+)\s*(?::\s*[^{]+)?\{(.*?)\n\};', re.S)
     field_re = re.compile(r'(?:mutable\s+|static\s+|const\s+)*[\w:<>\*&]+(?:\s*[\*&])?\s+'
                           r'(\w+(?:\s*,\s*\w+)*)\s*(=|\{|;)')
@@ -43,7 +48,7 @@ def parse_structs(text):
                     for n in fm.group(1).split(','):
                         fields.append((n.strip(), fm.group(2) in '={'))
             if len(fields) >= 3 and any(d for _, d in fields):
-                out[name] = (f, fields)
+                out.setdefault(name, []).append((f, fields))
     return out
 
 
@@ -168,27 +173,34 @@ def main(argv):
     structs = parse_structs(text)
     unlisted = []
     evaluated = set()          # structs with >= 2 sites INSIDE this scan: the only ones whose ledger lines can be stale
-    for name, (_, fields) in sorted(structs.items()):
-        fieldnames = {n for n, _ in fields}
-        sites = hand_built_sites(name, text, filler_functions(name, text))
-        if len(sites) < 2:
-            continue
-        evaluated.add(name)
-        union = set().union(*[a for _, _, _, a in sites])
-        for f, line, var, assigned in sites:
-            for missing in sorted((union - assigned) & fieldnames):
-                key = (name, var, missing)
-                # `<Struct> <var> *` covers EVERY field at that variable name. It is for a site that is
-                # not a controls object at all -- an out-parameter buffer a reader fills and the site
-                # copies a few fields out of -- where the reason is a property of the site, not of any
-                # one field, and listing sixty fields would bury it. Never use it on a real site.
-                star = (name, var, '*')
-                if key in allow:
-                    used.add(key)
-                elif star in allow:
-                    used.add(star)
-                else:
-                    unlisted.append((name, os.path.relpath(f), line, var, missing, len(sites)))
+    seen = set()
+    for name, defs in sorted(structs.items()):
+        all_sites = hand_built_sites(name, text, filler_functions(name, text))
+        for _, fields in defs:
+            fieldnames = {n for n, _ in fields}
+            # only the sites that COULD be building this definition: one assigning a field the
+            # definition does not have is building another type of the same name
+            sites = [s for s in all_sites if s[3] <= fieldnames]
+            if len(sites) < 2:
+                continue
+            evaluated.add(name)
+            union = set().union(*[a for _, _, _, a in sites])
+            for f, line, var, assigned in sites:
+                for missing in sorted((union - assigned) & fieldnames):
+                    key = (name, var, missing)
+                    # `<Struct> <var> *` covers EVERY field at that variable name. It is for a site
+                    # that is not a controls object at all -- an out-parameter buffer a reader fills
+                    # and the site copies a few fields out of -- where the reason is a property of the
+                    # site, not of any one field, and listing sixty fields would bury it. Never use it
+                    # on a real site.
+                    star = (name, var, '*')
+                    if key in allow:
+                        used.add(key)
+                    elif star in allow:
+                        used.add(star)
+                    elif (name, os.path.relpath(f), line, var, missing) not in seen:
+                        seen.add((name, os.path.relpath(f), line, var, missing))
+                        unlisted.append((name, os.path.relpath(f), line, var, missing, len(sites)))
 
     for name, f, line, var, missing, n in unlisted:
         print("UNLISTED  %-26s %s:%d  %-10s field `%s` set at another of the %d sites, not here"

@@ -137,3 +137,67 @@ DeviceSimpleControls sctl *   # out-parameter buffer for parseFvSchemesControls;
 # so it is a cold start, not a substitution. The legacy driver is frozen and must not be edited.
 DeviceSimpleControls ctl caseDir
 DeviceSimpleControls ctl writeCache
+
+# ---- Compressible (kEpsilon_cpp.cuh:138, the closures' optional compressible half) -------------------
+# Built at four interFoam sites (inter_turbulence_cpp.cu: `comp`/`sstComp` at 593 and 602 inside
+# validateTurbulence, which only runs correctNut, and at 699/738 on the live path) and four
+# rhoSimpleFoam sites (`comp`/`sc` in rhoSimpleFoam_cpp.cu and rhoCreateFields_cpp.cu). The struct's
+# own contract is that a null pointer MEANS something -- "null => the incompressible 1" for rho, and
+# for nutPhi "null refuses a case that has one rather than leave it stale" -- so most omissions here
+# are the contract being used, not forgotten. Each line says which.
+Compressible comp alphat        # interFoam has no energy equation in either lineage (createFields.H builds no alphat), so EddyDiffusivity's alphat = rho*nut/Prt has nothing to write into; the rho sites set it when the case has one
+Compressible comp Prt           # same: read only beside alphat (correctNutField), and 1.0 is OpenFOAM's own default
+Compressible sstComp alphat     # same, at the kOmegaSST site
+Compressible sstComp Prt        # same
+Compressible comp rho           # NULL IS THE INCOMPRESSIBLE 1 (kEpsilon_cpp.cuh:140) -- interFoam's UNIFORM lineage, where the closure's rho is exactly 1; the `density variable` lineage sets it, and validateTurbulence returns before this for that lineage (inter_turbulence_cpp.cu:576)
+Compressible comp rhoBnd        # same
+Compressible comp rhoOld        # same: the ddt's rho.oldTime() is 1 in the uniform lineage
+Compressible comp phiByRho      # the VOLUMETRIC flux for divU: in the uniform lineage the equation already convects with phi, so the separate field is the variable lineage's
+Compressible sstComp rho        # kOmegaSST + `density variable` is REFUSED by name -- "pairs `density variable` with kOmegaSST ... Refused rather than run ungated" (inter_turbulence_cpp.cu:427-433) -- so this site is the uniform lineage only
+Compressible sstComp rhoBnd     # same refusal
+Compressible sstComp rhoOld     # same refusal
+Compressible sstComp phiByRho   # same refusal
+Compressible comp rDeltaT       # the validate site runs correctNut ONLY (no ddt); on the live rho path the ddt is steadyState, where OpenFOAM's term vanishes and rDeltaT 0 IS that (kEpsilon.C:254 under steadyState), and Euler sets it
+Compressible sstComp rDeltaT    # same
+Compressible comp V0            # a MOVING mesh: OpenFOAM's rhoSimpleFoam is built on createMesh.H, not createDynamicFvMesh.H (rhoSimpleFoam.C:58) -- its mesh cannot move; interFoam's live sites DO set it, and the validate sites run no ddt
+Compressible comp meshPhi       # same
+Compressible sstComp V0         # same
+Compressible sstComp meshPhi    # same
+Compressible sc V0              # `sc` is the rhoSimpleFoam kOmegaSST instantiation: same static-mesh fact
+Compressible sc meshPhi         # same
+Compressible comp nutPhi        # NULL IS A REFUSAL, not a default: a flux-conditional nut patch with no flux throws by name ("nut on patch `...` is flux-conditional (inletOutlet) and the caller handed the closure no flux to decide inflow by", kEpsilon_cpp.cu:940-945). The rho path never sets it, so such a case is refused there; interFoam sets it at every site
+Compressible sc nutPhi          # same
+
+# ...and the CrankNicolson family + bcPhi, which only the LIVE interFoam kEpsilon site sets
+# (inter_turbulence_cpp.cu:738). CrankNicolson is READ ONLY when the case's ddt is CrankNicolson:
+#   rhoSimpleFoam : any ddt but steadyState and Euler is refused by name, CrankNicolson among them --
+#                   "brae: fvSchemes ddtSchemes default is `...` ... backward and CrankNicolson have
+#                   coefficients that this closure port does not yet take" (scheme_parse.cuh:304-310)
+#   interFoam SST : "this closure carries Euler only" (inter_turbulence_cpp.cu:418-421), the case
+#                   reader refusing any non-Euler ddt under kOmegaSST
+#   the two validateTurbulence sites (593, 602) run correctNut ONLY -- no ddt at all
+# bcPhi is the flux a flux-conditional patch looks up when that is not the equation's own: null means
+# the equation's flux, which the struct's own note says is right wherever the equation convects with
+# what the patches read (kEpsilon_cpp.cuh:145-154 -- it is interFoam's `density variable` lineage that
+# needs the separate field, and that lineage is refused under kOmegaSST).
+Compressible comp cn
+Compressible comp cnDdt0Eps
+Compressible comp cnDdt0K
+Compressible comp rhoOO
+Compressible comp epsOO
+Compressible comp kOO
+Compressible comp bcPhi
+Compressible sstComp cn
+Compressible sstComp cnDdt0Eps
+Compressible sstComp cnDdt0K
+Compressible sstComp rhoOO
+Compressible sstComp epsOO
+Compressible sstComp kOO
+Compressible sstComp bcPhi
+Compressible sc cn
+Compressible sc cnDdt0Eps
+Compressible sc cnDdt0K
+Compressible sc rhoOO
+Compressible sc epsOO
+Compressible sc kOO
+Compressible sc bcPhi
