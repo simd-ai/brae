@@ -178,6 +178,22 @@ RunReport runInterFoamDevice(
             "brae interFoam (device): the case is LES kEqn AND moves its mesh. The device closure takes "
             "the filter width once, from the host's LESdelta::compute on the mesh as it starts; a mesh "
             "that moves changes it at every update. Run without -device.");
+    // ...and so is a RAS closure on a mesh that moves. The host closure takes the moved mesh's old
+    // volumes for fvm::ddt and the mesh flux for the convection's relative phi
+    // (InterTurbulenceStepInput::V0, meshPhi; gated on waves/waveMakerPiston `pistonSST`, host arm);
+    // the device closure's input has neither, and the instrument that runs the host closure inside
+    // this loop is not handed them either -- both would run the ddt on the current volumes and
+    // convect with the absolute flux, with nothing saying so. Found by an audit of hand-built control
+    // structs (fields set at one construction site and not another), not by a case: no runnable
+    // tutorial moves its mesh under a RAS closure on the device without an AMI, which is refused
+    // separately. Refused until V0 and meshPhi are ported into the device closure and gated.
+    if (f.turbulence.on && f.turbulence.model != cpu::interFoam::InterRasModel::KEqnLES
+        && f.dynamicMesh)
+        throw std::runtime_error(
+            "brae interFoam (device): the case runs a RAS closure AND moves its mesh. The device "
+            "closure does not take the moved mesh's old volumes (fvm::ddt's V0) or the mesh flux (the "
+            "relative phi its convection needs); the host closure does (tests/"
+            "interfoam_moving_vs_openfoam.sh `pistonSST`). Run without -device.");
 
     // fvOptions: the device loop applies explicitPorositySource/DarcyForchheimer on U and THE MANGROVE
     // PAIR -- multiphaseMangrovesSource on U, multiphaseMangrovesTurbulenceModel on k and epsilon under

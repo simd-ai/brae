@@ -1,0 +1,22 @@
+# Defaults knowingly kept -- tools/default_audit.py's ledger. One line per justified omission:
+#     <Struct> <variable> <field>    # why the default IS the case's value at that site
+# An entry leaves when the field is wired, the site is folded into a builder, or the refusal that
+# makes it unreachable is lifted (then the field must be set and gated). A stale entry fails the gate.
+
+# start-up CorrectPhi (initCorrectPhi.H) runs before any mesh update: polyMesh::changing() is false and
+# there is no mesh flux; the mesh-update site sets both
+CorrectPhiInput cin meshChanging    # inter_driver_device.cu, start-up: OpenFOAM's mesh.changing() is false at t0
+CorrectPhiInput cin meshPhi         # inter_driver_cpp.cu + inter_driver_device.cu, start-up: no motion yet, makeRelative is a no-op
+
+# the instrument that runs the HOST closure inside the device loop (BRAE_INTER_HOST_CLOSURE): the four
+# inputs it does not set are each behind a refusal by name in inter_driver_device.cu
+InterTurbulenceStepInput ti V0      # a RAS closure on a moving mesh is refused on the device ("RAS closure AND moves its mesh")
+InterTurbulenceStepInput ti meshPhi # same refusal
+InterTurbulenceStepInput ti cn      # BRAE_INTER_HOST_CLOSURE under CrankNicolson is refused
+InterTurbulenceStepInput ti rhoOO   # same refusal
+
+# RunReport is an OUTPUT the drivers fill as they go, not a control read from the case
+RunReport rep CoNum
+RunReport rep alphaCoNum
+RunReport rep pcorrSolves
+RunReport rep turbulenceOnDevice

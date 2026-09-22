@@ -529,6 +529,12 @@ if [ $HAVE_GPU = 1 ]; then
     # -Sp(rho*coeff): the device names it before the first step (the host closure refuses the same
     # lineage where it meets it)
     arm device_mangrove_rhoKE refused "density variable"    "-device" "sed -i 's/^simulationType .*/density variable;\nsimulationType RAS;/' constant/turbulenceProperties; sed -i 's/div(phi,k) /div(rhoPhi,k) /; s/div(phi,epsilon) /div(rhoPhi,epsilon) /' system/fvSchemes"
+    # a RAS closure on a MOVING mesh is refused on the device: its closure's input carries neither the
+    # old volumes nor the mesh flux the host closure takes (moving_SST above runs the same staging on
+    # the host). Found by auditing hand-built control structs, not by a case -- no runnable tutorial
+    # reaches it -- and refused rather than left to run ddt(k) on the current volumes.
+    BASE="$BM"
+    arm device_moving_SST   refused "RAS closure AND moves its mesh" "-device" "$MOVSST"
     # the device's alpha pre-solve does not honour minIter (the host's does)
     BASE="$B"
     arm device_alphaMinIter    refused "minIter 1"               "-device" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       yes;\\n\\1minIter 1;/' system/fvSolution"

@@ -285,7 +285,17 @@ COMPONENTS = {
              brae_target="src/TurbulenceModels/turbulenceModels/linearViscousStress/",
              validation="tests/test_divdevreff_cpp.cu -- 7.4e-16 vs OpenFOAM dumpDivDevReff over 12225 "
                         "cells (validation/kEpsCorrect), with a wrong-sign check and a wall-nuEff "
-                        "negative control that both fire",
+                        "negative control that both fire. THE BOUNDARY GRADIENT'S snGrad by patch class "
+                        "(gradBKernel): inletOutlet/outletInlet are MIXED with the switch as their "
+                        "valueFraction, gated on RAS/waterChannel `oneCorrector` (tests/"
+                        "interfoam_waterchannel_vs_openfoam.sh) where the stored-value form read U 1.3e-07; "
+                        "pressureInletOutletVelocity is typed per component (piovUpdateKernel, 5 on inflow "
+                        "with a ref that reproduces n(n.U), 0 on outflow), so the mixed branch gives "
+                        "(value - pif)*deltaCoeffs = -(I - nn)&pif*deltaCoeffs, directionMixedFvPatchField."
+                        "C:139-155 with refValue and refGrad zero -- READ, and NOT DISCRIMINATED by any "
+                        "gated fixture: the branch zeroed moves waterChannel's device U from 5.7e-12 to "
+                        "6.1e-12 (air's muEff on the atmosphere) and validation/rhoTP's CUDA mirror by "
+                        "exactly 0 (a normal inflow has no tangential component to differentiate).",
              note="FIRST component extracted onto the mirrored architecture; the template for the rest. "
                   "The _cpp reference is host-only and reuses brae existing transpose/dev2/operator* "
                   "rather than restating them. SPEED, FP-10 (2026-09-13): the device form copied each "

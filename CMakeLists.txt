@@ -801,6 +801,15 @@ add_test(NAME manifest_interfoam_not_drifted
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/of_manifest.py interFoam
                  --check ${CMAKE_CURRENT_SOURCE_DIR}/manifest/interFoam.yaml)
 set_tests_properties(manifest_interfoam_not_drifted PROPERTIES SKIP_RETURN_CODE 77)
+# Defaults left over from porting, in the interFoam mirror: a controls struct built by hand at several
+# sites with a field set at some and not at others runs the default where the case said otherwise --
+# the device's start-up CorrectPhi ran grad(pcorr) as Gauss linear that way, and its closure would have
+# run a moving mesh on the current volumes. Every justified omission is in tools/default_audit_allow.txt
+# with its reason; an unlisted one, or a listed one that no longer exists, fails here.
+add_test(NAME default_audit_interfoam
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/default_audit.py
+                 --allow ${CMAKE_CURRENT_SOURCE_DIR}/tools/default_audit_allow.txt
+                 ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/interFoam)
 
 add_executable(test_rho_kepsilon_cuda tests/test_rho_kepsilon_cuda.cu)
 target_include_directories(test_rho_kepsilon_cuda PRIVATE ${BRAE_HEADER_DIRS})
