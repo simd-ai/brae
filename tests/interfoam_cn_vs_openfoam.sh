@@ -98,6 +98,8 @@ DT=${DT:-1e-3}
 
 # shellcheck disable=SC1091
 . "$(dirname "$0")/require_fresh_binary.sh"
+# shellcheck disable=SC1091
+. "$(dirname "$0")/of_oracle_cache.sh"
 [ -x "$BIN" ]      || { echo "SKIP: $BIN not built"; exit 77; }
 [ -d "$SRC" ]      || { echo "SKIP: RAS/damBreak tutorial not found at $SRC"; exit 77; }
 [ -f "$OFBASHRC" ] || { echo "SKIP: real OpenFOAM not available"; exit 77; }
@@ -213,6 +215,14 @@ if p == 'cnOuter':
     assert k == 1, 'nOuterCorrectors 1 was not found'
     open(q, 'w').write(t)
 PYEOF
+    # THE ORACLE IS CACHED FROM HERE -- see tests/of_oracle_cache.sh. Everything above is staging;
+    # everything below is real OpenFOAM, which is what a re-run should not pay for twice.
+    local key
+    key=$(oracleKey "$C" "interfoam_cn" "$profile" "$STEPS" "$DT")
+    if oracleRestore "$C" "$key" "$END"; then
+        echo "OpenFOAM's $STEPS steps of deltaT $DT to t = $END reused from the oracle cache   [$profile]"
+        return 0
+    fi
     ( cd "$C" && blockMesh > log.blockMesh 2>&1 ) || { echo "FAIL: blockMesh [$profile]"; tail -20 "$C/log.blockMesh"; return 1; }
     ( cd "$C" && setFields > log.setFields 2>&1 ) || { echo "FAIL: setFields [$profile]"; tail -20 "$C/log.setFields"; return 1; }
     ( cd "$C" && interFoam > log.interFoam 2>&1 ) || { echo "FAIL: interFoam [$profile]"; tail -30 "$C/log.interFoam"; return 1; }
@@ -223,6 +233,7 @@ PYEOF
     else
         [ -e "$C/$END/ddt0(rho,U)" ] || { echo "FAIL: OpenFOAM wrote no ddt0(rho,U) under CrankNicolson [$profile]"; ls "$C/$END"; return 1; }
     fi
+    oracleStore "$C" "$key"
     echo "OpenFOAM ran $STEPS steps of deltaT $DT to t = $END   [$profile]"
 }
 

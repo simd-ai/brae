@@ -293,6 +293,8 @@ LAM="$TUT/multiphase/interFoam/laminar"
 
 # shellcheck disable=SC1091
 . "$(dirname "$0")/require_fresh_binary.sh"
+# shellcheck disable=SC1091
+. "$(dirname "$0")/of_oracle_cache.sh"
 [ -x "$BIN" ]                 || { echo "SKIP: $BIN not built"; exit 77; }
 [ -d "$LAM/testTubeMixer" ]   || { echo "SKIP: testTubeMixer tutorial not found under $LAM"; exit 77; }
 [ -f "$OFBASHRC" ]            || { echo "SKIP: real OpenFOAM not available"; exit 77; }
@@ -543,6 +545,17 @@ for name, dim, v, wall, top in [
     open(os.path.join(d, '0', name), 'w').write(hdr % (name, dim, v, body))
 PYEOF
     fi
+    # THE ORACLE IS CACHED FROM HERE. Everything above is the profile's staging -- copies and text
+    # edits, cheap -- and everything below is real OpenFOAM, which is this gate's whole wall clock.
+    # The key is a hash of every staged byte, so a profile whose staging changes by one character
+    # misses. See tests/of_oracle_cache.sh for why a hit is verified rather than trusted.
+    local end key
+    end=$(python3 -c "print('%.10g' % ($n*float('$dt')))")
+    key=$(oracleKey "$C" "interfoam_moving" "$name" "$tutorial" "$dt" "$n" "$profile")
+    if oracleRestore "$C" "$key" "$end"; then
+        echo "OpenFOAM's $n steps of deltaT $dt to t = $end reused from the oracle cache   [$name]"
+        return 0
+    fi
     ( cd "$C" && blockMesh > log.blockMesh 2>&1 ) || { echo "FAIL: blockMesh [$name]"; tail -20 "$C/log.blockMesh"; return 1; }
     if [ -f "$C/system/snappyHexMeshDict" ]; then
         mkdir -p "$C/constant/triSurface"
@@ -551,9 +564,8 @@ PYEOF
     fi
     ( cd "$C" && setFields > log.setFields 2>&1 ) || { echo "FAIL: setFields [$name]"; tail -20 "$C/log.setFields"; return 1; }
     ( cd "$C" && interFoam > log.interFoam 2>&1 ) || { echo "FAIL: interFoam [$name]"; tail -30 "$C/log.interFoam"; return 1; }
-    local end
-    end=$(python3 -c "print('%.10g' % ($n*float('$dt')))")
     [ -d "$C/$end" ] || { echo "FAIL: OpenFOAM wrote no $end directory [$name]"; ls "$C"; return 1; }
+    oracleStore "$C" "$key"
     echo "OpenFOAM ran $n steps of deltaT $dt to t = $end   [$name]"
 }
 
