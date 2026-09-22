@@ -96,6 +96,18 @@
 #   the wedge's laplacian gradientBoundaryCoeffs: the mixed slot's one refValue is spent reproducing
 #   the VALUE (faceT), and OpenFOAM's gradient coefficient takes cellT and half the deltaCoeffs --
 #   second order in the wedge angle            BROKEN ONCE: alpha 3.5e-05, U 4.2e-05, k 6.6e-06
+#
+# PROFILE pcorrGrad: the shipped case with `grad(pcorr) leastSquares;` named on its own. The start-up
+# CorrectPhi (initCorrectPhi.H, every case) solves a pcorr from the inlet's flux against a field at rest,
+# and with one non-orthogonal pass its second pass takes the laplacian's correction from grad(pcorr) --
+# on this 40-degree mesh the entry moves OpenFOAM's own U by 1.7e-05 at t = 1e-07 (the CONTROL, asserted
+# above a floor of 1e-6). CorrectPhi runs on the HOST on both arms, and the device driver had refused a
+# non-Gauss-linear grad(pcorr) outright while its start-up controls, assembled by hand, left the entry
+# at its default -- the two together were a refusal in front of a silent substitution. One builder
+# (correctPhiControlsOf) now serves the three callers and the refusal names alpha, p_rgh, rho, U and
+# nHat only. MEASURED, both arms: alpha 6.6e-12, p_rgh 8.3e-11, U 4.5e-12, k 2.1e-12, nut 1.1e-12, all
+# 400 p_rgh counts. BROKEN ONCE, the entry dropped from the builder: both arms U 1.79e-05, p_rgh
+# 1.6e-05, the first p_rgh residual 1.5e-04 out -- the scheme's own distance, i.e. Gauss linear run.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_les_vs_openfoam"
@@ -163,6 +175,19 @@ PYEOF
         # THE CONTROL: the same case with no turbulence model
         sed -i 's/^simulationType .*/simulationType      laminar;/' "$C/constant/turbulenceProperties"
     fi
+    if [ "$profile" = pcorrGrad ]; then
+        # grad(pcorr) named on its own, away from the default: what the start-up CorrectPhi's second
+        # non-orthogonal pass takes for the laplacian's correction -- see the header
+        python3 - "$C" <<'PYEOF' || { echo "FAIL: staging $profile"; return 1; }
+import sys
+p = sys.argv[1] + '/system/fvSchemes'
+s = open(p).read()
+a = 'gradSchemes\n{\n    default         Gauss linear;\n'
+assert s.count(a) == 1, 'the tutorial no longer has a plain gradSchemes block'
+open(p, 'w').write(s.replace(a, a + '    grad(pcorr)     leastSquares;\n'))
+PYEOF
+        grep -q "grad(pcorr)     leastSquares;" "$C/system/fvSchemes" || { echo "FAIL: grad(pcorr) not staged"; return 1; }
+    fi
     if [ "$profile" = delta3d ]; then
         # THE 3-D BRANCH of cubeRootVol, which the wedge never reaches: the same mesh with its two wedge
         # planes made ordinary patches, so no patch knocks a direction out and nGeometricD is 3
@@ -198,7 +223,7 @@ PYEOF
 }
 
 rc=0
-for p in delta delta3d laminar les; do
+for p in delta delta3d laminar les pcorrGrad; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_les_vs_openfoam: staging failed"; exit 1; }
@@ -211,6 +236,21 @@ grep -q "Selecting LES delta type smooth" "$W/les/log.interFoam" \
 
 "$BIN" "$W/les" "$W/les/0" "$W/les/$END" "$STEPS" "$W/les/log.interFoam" "$W/laminar/$END" "$W/delta/0" \
        "$W/delta3d" || rc=1
+# pcorrGrad: the scheme has to have MOVED OpenFOAM's own answer, or the profile tests nothing
+python3 - "$W/les/$END/U" "$W/pcorrGrad/$END/U" <<'PYEOF' || rc=1
+import re, sys
+def cells(path):
+    s = open(path).read()
+    m = re.search(r"internalField\s+nonuniform List<vector>\s*(\d+)\s*\((.*?)\n\)\s*;", s, re.S)
+    return [tuple(float(x) for x in v.split()) for v in re.findall(r"\(([^()]*)\)", m.group(2))]
+a, b = cells(sys.argv[1]), cells(sys.argv[2])
+d = max(max(abs(p - q) for p, q in zip(u, v)) for u, v in zip(a, b))
+ref = max(max(abs(x) for x in u) for u in a)
+print("  pcorrGrad CONTROL: OpenFOAM with grad(pcorr) leastSquares against OpenFOAM as shipped, U %.3e (floor 1e-6)" % (d/ref))
+sys.exit(0 if d/ref > 1e-6 else 1)
+PYEOF
+"$BIN" "$W/pcorrGrad" "$W/pcorrGrad/0" "$W/pcorrGrad/$END" "$STEPS" "$W/pcorrGrad/log.interFoam" "$W/laminar/$END" \
+       "$W/delta/0" "$W/delta3d" || rc=1
 
 echo "interfoam_les_vs_openfoam: rc $rc"
 exit $rc

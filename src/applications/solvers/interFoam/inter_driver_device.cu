@@ -486,13 +486,8 @@ RunReport runInterFoamDevice(
     // residual), and OpenFOAM's p_rgh GAMG then reuses that one.
     std::vector<LinearSolveRecord> initPcorrSolves;
     {
-        CorrectPhiControls cpc;
-        cpc.pcorr = &f.pcorrSolve;
-        cpc.pcorrFinal = &f.pcorrSolveFinal;
-        cpc.gamgCache = &meshAgglomeration;
-        cpc.correctedLaplacian = f.laplacianScheme.corrected;
-        cpc.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
-        cpc.nNonOrthogonalCorrectors = f.nNonOrthogonalCorrectors;
+        // the same controls the host driver and the mesh update take, grad(pcorr)'s entry included
+        const CorrectPhiControls cpc = correctPhiControlsOf(f, meshAgglomeration);
         const SurfaceScalarField one = unitFaceField(m, fvp);
         CorrectPhiInput cin;
         cin.rAUf = &one;
@@ -1303,14 +1298,18 @@ RunReport runInterFoamDevice(
     C.alpha.prevCorrInt = &dPrevCorrI;
     C.alpha.prevCorrBnd = &dPrevCorrB;
     // gradSchemes: the device operators take Gauss linear and unlimited, apart from grad(U)'s cellLimited
-    // (refused above); the host takes leastSquares and cellLimited on every gradient
-    for (const GradChoice* gc : {&f.gradAlpha1, &f.gradAlpha2, &f.gradPrgh, &f.gradPcorr, &f.gradRho,
+    // (refused above); the host takes leastSquares and cellLimited on every gradient. NOT grad(pcorr):
+    // CorrectPhi runs on the host on both arms (correctPhi, inter_correct_phi_cpp.cu) and takes the entry
+    // through correctPhiControlsOf -- gated on LES/nozzleFlow2D `pcorrGrad`, grad(pcorr) leastSquares on
+    // a mesh non-orthogonal to 40 degrees with one non-orthogonal pass, where the entry moves OpenFOAM's
+    // own U by 1.7e-05.
+    for (const GradChoice* gc : {&f.gradAlpha1, &f.gradAlpha2, &f.gradPrgh, &f.gradRho,
                                  &f.interface.nHatGrad})
     {
         if (!gc->gaussLinear() || f.gradULeastSq)
             throw std::runtime_error(
                 "brae interFoam (device): fvSchemes gradSchemes names a leastSquares or cellLimited "
-                "gradient for alpha, p_rgh, pcorr, rho, U or nHat. The host loop takes each by its own entry "
+                "gradient for alpha, p_rgh, rho, U or nHat. The host loop takes each by its own entry "
                 "(gated on laminar/damBreak `gradLsqLimited`); the device operators are Gauss linear. "
                 "Refused rather than run another gradient.");
     }
@@ -1525,14 +1524,7 @@ RunReport runInterFoamDevice(
     // THE MESH UPDATE'S OWN OBJECTS, as the host driver keeps them (inter_driver_cpp.cu): the mesh's
     // GAMG hierarchy, which the motion solve builds and the run keeps, and the case's CorrectPhi
     // controls, which interMeshUpdate uses when `correctPhi` is on.
-    CorrectPhiControls meshCpc;
-    meshCpc.pcorr = &f.pcorrSolve;
-    meshCpc.pcorrFinal = &f.pcorrSolveFinal;
-    meshCpc.gamgCache = &meshAgglomeration;
-    meshCpc.correctedLaplacian = f.laplacianScheme.corrected;
-    meshCpc.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
-    meshCpc.gradPcorr = f.gradPcorr;
-    meshCpc.nNonOrthogonalCorrectors = f.nNonOrthogonalCorrectors;
+    const CorrectPhiControls meshCpc = correctPhiControlsOf(f, meshAgglomeration);
     // the volumes the mesh had before this step's move; empty on a static mesh, where the ddt's
     // other branch runs
     DeviceBuffer<scalar> dV0;

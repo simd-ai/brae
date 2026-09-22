@@ -12,6 +12,24 @@ namespace brae {
 namespace cpu {
 namespace interFoam {
 
+CorrectPhiControls correctPhiControlsOf(
+    const InterFields& f,
+    GamgAgglomerationCache& gamgCache)
+{
+    CorrectPhiControls c;
+    c.pcorr = &f.pcorrSolve;
+    c.pcorrFinal = &f.pcorrSolveFinal;
+    c.gamgCache = &gamgCache;
+    c.correctedLaplacian = f.laplacianScheme.corrected;
+    c.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
+    c.gradPcorr = f.gradPcorr;
+    c.nNonOrthogonalCorrectors = f.nNonOrthogonalCorrectors;
+    return c;
+}
+
+}   // namespace interFoam
+namespace interFoam {
+
 namespace {
 
 const char* const WHO = "brae interFoam CorrectPhi: ";

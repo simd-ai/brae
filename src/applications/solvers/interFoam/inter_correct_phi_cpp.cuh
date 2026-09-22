@@ -55,6 +55,18 @@ struct CorrectPhiControls
     label nNonOrthogonalCorrectors = 0;
 };
 
+// The case's own CorrectPhi controls, from the fields the case reader filled: pcorr and pcorrFinal,
+// laplacianSchemes' default, grad(pcorr)'s entry and PIMPLE's non-orthogonal correctors, sharing
+// `gamgCache` with every other GAMG solve on the mesh. ONE builder for the three callers (the host
+// driver's, the device driver's start-up CorrectPhi and its mesh update's): the device's start-up
+// controls were assembled by hand and left gradPcorr at its default, so a second non-orthogonal pass
+// there would have taken Gauss linear whatever the case named -- unreachable only because the device
+// driver refused every non-Gauss-linear grad(pcorr) outright, a refusal CorrectPhi never needed since it
+// runs on the host on both arms.
+CorrectPhiControls correctPhiControlsOf(
+    const InterFields& f,
+    GamgAgglomerationCache& gamgCache);
+
 struct CorrectPhiInput
 {
     // rAUf: interpolate(rAU) under correctPhi, or 1 on every face

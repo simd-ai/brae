@@ -3696,7 +3696,17 @@ COMPONENTS = {
                         "rather than at the mesh update U 2.0e-05. NOT CLAIMED: the curvature pass after "
                         "CorrectPhi (under 3e-13 on these tanks), the corrected flux handed to flux-conditional "
                         "patches (a closed tank has none), a divU, and the device (it runs initCorrectPhi on the "
-                        "host and refuses a moving mesh).",
+                        "host and refuses a moving mesh). GRAD(pcorr)'S ENTRY, tests/interfoam_les_vs_openfoam.sh "
+                        "`pcorrGrad`: LES/nozzleFlow2D with `grad(pcorr) leastSquares;` named on its own, a mesh "
+                        "non-orthogonal to 40 degrees with one non-orthogonal pass, where the start-up pcorr's "
+                        "second pass takes its correction from that gradient and the entry moves OpenFOAM's own U "
+                        "by 1.7e-05 (the control). MEASURED on BOTH arms: U 4.5e-12, p_rgh 8.3e-11, alpha 6.6e-12, "
+                        "all 400 p_rgh counts. FOUND: the device driver's start-up controls were assembled by hand "
+                        "without the entry -- Gauss linear whatever the case named -- behind a refusal of every "
+                        "non-Gauss-linear grad(pcorr) that CorrectPhi, a host operator on both arms, never needed. "
+                        "One builder (correctPhiControlsOf) now serves the host driver, the device's start-up and "
+                        "its mesh update; the refusal keeps alpha, p_rgh, rho, U and nHat. BROKEN ONCE, the entry "
+                        "dropped from the builder: both arms U 1.79e-05, the scheme's own distance.",
              note="ONE CorrectPhi (CorrectPhi.C:36-117): correctUphiBCs when the mesh is changing -- every velocity "
                   "patch that FIXES A VALUE evaluated again, a pressureInletOutletVelocity against the Sf & Uf "
                   "flux, and phi there set to U_b & Sf; pcorr zero, fixedValue where p_rgh fixes a value and "

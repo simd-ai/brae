@@ -324,16 +324,9 @@ RunReport runInterFoam(
     // motion's -- and kept for the run
     GamgAgglomerationCache gamgCache;
 
-    // THE CASE'S OWN CorrectPhi CONTROLS: pcorr and pcorrFinal, the laplacian's default and PIMPLE's
-    // non-orthogonal correctors
-    CorrectPhiControls cpc;
-    cpc.pcorr = &f.pcorrSolve;
-    cpc.pcorrFinal = &f.pcorrSolveFinal;
-    cpc.gamgCache = &gamgCache;
-    cpc.correctedLaplacian = f.laplacianScheme.corrected;
-    cpc.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
-    cpc.gradPcorr = f.gradPcorr;
-    cpc.nNonOrthogonalCorrectors = f.nNonOrthogonalCorrectors;
+    // THE CASE'S OWN CorrectPhi CONTROLS: pcorr and pcorrFinal, the laplacian's default, grad(pcorr)'s
+    // entry and PIMPLE's non-orthogonal correctors
+    const CorrectPhiControls cpc = correctPhiControlsOf(f, gamgCache);
 
     // initCorrectPhi.H, which runs for EVERY case, moving or not and with correctPhi or without: CorrectPhi
     // on the phi createFields built, with rAUf exactly 1. At rest it is exact and costs one solve of
