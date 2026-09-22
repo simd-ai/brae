@@ -51,6 +51,7 @@ inline const std::vector<BraeSolver>& braeSolvers()
         {"simpleFoam", "brae",            false, "steady incompressible, RAS/laminar"},
         {"pimpleFoam", "brae_pimpleFoam", true,  "transient incompressible, URANS/DES/LES/laminar"},
         {"rhoSimpleFoam", "brae_rhoSimpleFoam", false, "steady compressible (subsonic, laminar, perfectGas+hConst)"},
+        {"interFoam", "brae_interFoam", true, "transient two-phase VoF (laminar; MULES and CMULES, contact angle)"},
     };
     return reg;
 }

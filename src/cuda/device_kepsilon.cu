@@ -490,7 +490,8 @@ const GradUMemo& deviceGradUShared(
     const DeviceVectorBoundary& dbU,
     const DeviceBuffer<scalar>& Ux,
     const DeviceBuffer<scalar>& Uy,
-    const DeviceBuffer<scalar>& Uz)
+    const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>* const* UbStored)
 {
     // Keyed on the MESH, never on the field. What makes a reuse legal is the device fingerprint below,
     // not the key; and the legacy driver hands this a U whose address MOVES every outer iteration, so a
@@ -504,6 +505,12 @@ const GradUMemo& deviceGradUShared(
     cacheStat("gradu-memo", cache.size());
     const int nC = dm.nCells;
     const DeviceBuffer<scalar>* Uc[3] = { &Ux, &Uy, &Uz };
+    // the caller's STORED patch values stand in for deviceBCValue only when all three are whole
+    bool useStored = UbStored != nullptr;
+    for (int k = 0; useStored && k < 3; ++k)
+    {
+        useStored = UbStored[k] && UbStored[k]->size() == static_cast<std::size_t>(dm.nBndFaces);
+    }
     const int mode = gradUMemoMode();
     static bool announced = false;
     if (!announced && mode != 0)
@@ -541,6 +548,16 @@ const GradUMemo& deviceGradUShared(
         // has to be in the fingerprint: a mesh move changes gaussGrad without touching U, and V is the
         // cheapest witness of OF's primitiveMesh::clearGeom.
         add(dm.V.data(), nC, 0);
+        // ...and the BOUNDARY FACE AREAS, which V does not witness: a cyclicACMI whose scale moves
+        // hands area between the pair and its non-overlap patches at a step's rescale, and on a
+        // coincident baffle the face cells' volumes come out bitwise unchanged (the host gate's header
+        // says so). gaussGrad's boundary half is Sf (x) U_b, so the gradient moves while U, V and every
+        // boundary coefficient below stay put -- a stale hit on exactly the step the baffle opens.
+        // One component's array: the three share their geometry.
+        if (dbU.comp[0].n > 0 && dbU.comp[0].magSf.size())
+        {
+            add(dbU.comp[0].magSf.data(), dbU.comp[0].n, 0);
+        }
         for (int k = 0; k < 3; ++k)
         {
             const DeviceBoundary& db = dbU.comp[k];
@@ -549,6 +566,14 @@ const GradUMemo& deviceGradUShared(
             if (db.refValue.size())      add(db.refValue.data(), db.n, 0);
             if (db.valueFraction.size()) add(db.valueFraction.data(), db.n, 0);
             if (db.refGrad.size())       add(db.refGrad.data(), db.n, 0);
+        }
+        // ...and the STORED patch values where they are what the gradient reads, so that a stored
+        // call never returns the bits a re-derived one left. NOT DISCRIMINATED by the gate that
+        // brought the stored values here (laminar/damBreakPermeable reads the same digits without
+        // this entry): wherever the two values differ, the coefficients above differ as well.
+        for (int k = 0; useStored && k < 3; ++k)
+        {
+            add(UbStored[k]->data(), dm.nBndFaces, 0);
         }
         const int total = L.start[L.n];
         if (!full)
@@ -576,7 +601,15 @@ const GradUMemo& deviceGradUShared(
     // buffers keep the bits the last computation left there
     for (int k = 0; k < 3; ++k)
     {
-        deviceBCValue(dbU.comp[k], *Uc[k], m.ub[k], skip);
+        if (useStored)
+        {
+            // on a hit these are the bits already there: the fingerprint covers them
+            deviceCopy(m.ub[k], *UbStored[k]);
+        }
+        else
+        {
+            deviceBCValue(dbU.comp[k], *Uc[k], m.ub[k], skip);
+        }
     }
     // ONE pass for the three components: the gradient kernel re-reads the whole mesh addressing and
     // geometry per launch and the field it differentiates is a small part of that traffic, so three

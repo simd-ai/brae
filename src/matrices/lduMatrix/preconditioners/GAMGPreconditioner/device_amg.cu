@@ -913,6 +913,7 @@ AMGData buildAMG(
             L.nCoarse = a.nCoarse;
             L.nCoarseFaces = a.nCoarseFaces;
             L.map.copyFrom(a.map);
+            L.addressingId = nextDeviceAddressingId();
             L.cOwn.copyFrom(a.cOwn);
             L.cNei.copyFrom(a.cNei);
             L.cOwnerStart.copyFrom(a.cOS);
@@ -945,6 +946,7 @@ AMGData buildAMG(
             L.nCoarse = a.nCoarse;
             L.nCoarseFaces = nCF;
             L.map.copyFrom(a.map);                              // retained for uniformity (SA uses the sparse P, not map)
+            L.addressingId = nextDeviceAddressingId();
             L.cOwn.copyFrom(C.lowerAddr);
             L.cNei.copyFrom(C.upperAddr);   // coarse SpMV addressing from RAP faces (owner<nbr)
             std::vector<label> cOS(a.nCoarse+1, 0), cLS(a.nCoarse+1, 0), cLosort(nCF);

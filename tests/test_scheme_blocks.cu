@@ -259,6 +259,119 @@ int main()
         checkFlag("D5 no divSchemes default and no div(phi,U) is refused", threw, true);
     }
 
+    // ---- interFoam's alpha transport -----------------------------------------------------------
+    // The div(phi,sigma) defect this file already documents was a limiter that was PLUMBED but never
+    // SELECTED: the flag existed, defaulted false, and nothing assigned it, so the case's vanAlbada ran
+    // unlimited. These arms exist so div(phi,alpha) cannot repeat it -- the parse is asserted, not the
+    // presence of a field.
+    {
+        const std::string base = "/tmp/brae_scheme_blocks_alpha";
+        std::filesystem::remove_all(base);
+        const std::string TAIL = std::string(LAP_ORTHOGONAL) + "gradSchemes { default Gauss linear; }\n"
+                                 "ddtSchemes { default Euler; }\n";
+
+        // Every interFoam tutorial, verbatim: vanLeer on the transport, linear on the compression flux.
+        {
+            const DeviceSimpleControls c = parse(base + "/vanleer",
+                "divSchemes { default none; div(phi,U) Gauss upwind;\n"
+                "             div(phi,alpha) Gauss vanLeer;\n"
+                "             div(phirb,alpha) Gauss linear; }\n" + TAIL);
+            // BOTH halves, and the found-flag is the load-bearing one: the DEFAULT is already vanLeer,
+            // so asserting the value alone passes even if the parser never selected anything.
+            checkFlag("div(phi,alpha) Gauss vanLeer was actually SELECTED", c.foundDivAlpha, true);
+            checkNum ("div(phi,alpha) Gauss vanLeer -> kVanLeerTwoByk", c.divAlphaTwoByk, scalar(-1.0));
+            checkFlag("div(phirb,alpha) Gauss linear was SELECTED", c.foundDivAlphaRb, true);
+            checkFlag("div(phirb,alpha) Gauss linear", c.divAlphaRbLinear, true);
+        }
+        // The other two limiters brae has, so the selector is read rather than defaulted.
+        {
+            const DeviceSimpleControls c = parse(base + "/valbada",
+                "divSchemes { default none; div(phi,U) Gauss upwind;\n"
+                "             div(phi,alpha) Gauss vanAlbada; }\n" + TAIL);
+            checkFlag("vanAlbada selected", c.foundDivAlpha, true);
+            checkNum ("div(phi,alpha) Gauss vanAlbada -> 0", c.divAlphaTwoByk, scalar(0.0));
+        }
+        {
+            const DeviceSimpleControls c = parse(base + "/limlin",
+                "divSchemes { default none; div(phi,U) Gauss upwind;\n"
+                "             div(phi,alpha) Gauss limitedLinear 1; }\n" + TAIL);
+            checkFlag("limitedLinear selected", c.foundDivAlpha, true);
+            checkNum ("div(phi,alpha) Gauss limitedLinear 1 -> twoByk 2", c.divAlphaTwoByk, scalar(2.0));
+        }
+        // REFUSALS. An unimplemented limiter on the VoF transport moves the interface, so it is named.
+        {
+            bool threw = false;
+            try {
+                parse(base + "/bad", "divSchemes { default none; div(phi,U) Gauss upwind;\n"
+                                     "             div(phi,alpha) Gauss MUSCL; }\n" + TAIL);
+            } catch (const std::exception&) { threw = true; }
+            checkFlag("div(phi,alpha) Gauss MUSCL is refused by name", threw, true);
+        }
+        {
+            bool threw = false;
+            try {
+                parse(base + "/badrb", "divSchemes { default none; div(phi,U) Gauss upwind;\n"
+                                       "             div(phirb,alpha) Gauss vanLeer; }\n" + TAIL);
+            } catch (const std::exception&) { threw = true; }
+            checkFlag("div(phirb,alpha) Gauss vanLeer is refused (compression flux is linear)", threw, true);
+        }
+        // CONTROL: a case with no alpha entry at all must not be refused, and keeps the defaults.
+        {
+            const DeviceSimpleControls c = parse(base + "/none",
+                "divSchemes { default none; div(phi,U) Gauss upwind; }\n" + TAIL);
+            checkFlag("no div(phi,alpha) entry -> NOT marked as found", c.foundDivAlpha, false);
+            checkFlag("no div(phirb,alpha) entry -> NOT marked as found", c.foundDivAlphaRb, false);
+        }
+    }
+
+    // ---- A PATTERN KEY names the scheme: fvSchemes is a dictionary, and OpenFOAM looks a scheme up as
+    // it looks anything up -- the literal key, else the last pattern that matches. interFoam's
+    // RAS/waterChannel writes `"div\(phi,(k|omega)\)" Gauss upwind;` under `default none`, and the
+    // per-field parser, which searched the text for the literal key, refused the case.
+    {
+        const std::string dir = tmp + "/patternKey";
+        std::filesystem::create_directories(dir + "/system");
+        std::ofstream(dir + "/system/fvSchemes")
+            << "ddtSchemes { default Euler; }\n"
+            << "gradSchemes { default Gauss linear; }\n"
+            << "divSchemes\n{\n    default none;\n"
+            << "    div(phi,k) bounded Gauss limitedLinear 1;\n"
+            << "    \"div\\(phi,(k|omega)\\)\" Gauss upwind;\n}\n"
+            << LAP_ORTHOGONAL;
+        bool omegaOk = false;
+        try
+        {
+            const FieldDivScheme fo = parseFieldDivScheme(dir, "omega");
+            omegaOk = !fo.bounded && !fo.limited && !fo.linearUpwind;
+        }
+        catch (const std::exception& e)
+        {
+            std::printf("  div(phi,omega) through the pattern threw: %s\n", e.what());
+        }
+        checkFlag("div(phi,omega) resolves through \"div\\(phi,(k|omega)\\)\" to plain upwind", omegaOk, true);
+        bool literalWins = false;
+        try
+        {
+            const FieldDivScheme fk = parseFieldDivScheme(dir, "k");
+            literalWins = fk.bounded && fk.limited;
+        }
+        catch (const std::exception&)
+        {
+        }
+        checkFlag("...and the LITERAL div(phi,k) wins over the pattern that also matches it", literalWins, true);
+        bool refused = false;
+        try
+        {
+            parseFieldDivScheme(dir, "epsilon");
+        }
+        catch (const std::exception&)
+        {
+            refused = true;
+        }
+        checkFlag("...while div(phi,epsilon), which no key names, is still refused under `default none`",
+                  refused, true);
+    }
+
     std::printf("scheme_blocks: %d failures\n", failures);
     return failures ? 1 : 0;
 }

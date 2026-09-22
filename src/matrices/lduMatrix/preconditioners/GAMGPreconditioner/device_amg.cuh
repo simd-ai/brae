@@ -40,6 +40,7 @@ struct PCGGraphCache {
     // The whole solve is captured now (item 72), so the graph also holds the MESH pointers and the sizes
     // it was built for; a different matrix on the same psi must rebuild rather than replay.
     const void* keyOwner = nullptr; int keyNC = -1; int keyNF = -1;
+    unsigned long long keyAddressingId = 0;   // the owner pointer's content identity (recycled pool blocks)
     DeviceBuffer<scalar> pA, Ax, sNormF, sInit, sRes; DeviceBuffer<int> sIter;   // persistent (graph-referenced)
     // ...and the right-hand side and the fine matrix, copied in per solve, because a captured prologue
     // bakes their pointers and the callers hand in fresh buffers each time.
@@ -52,6 +53,7 @@ struct AMGLevel {
     int nFine = 0, nCoarse = 0, nCoarseFaces = 0;
     DeviceBuffer<label>  map;                                   // grid-k cell -> grid-(k+1) cell
     DeviceBuffer<label>  cOwn, cNei, cOwnerStart, cLosort, cLosortStart;  // grid-(k+1) addressing (SpMV gather)
+    unsigned long long   addressingId = 0;                      // of cOwn/cNei's content, see nextDeviceAddressingId
     DeviceBuffer<label>  faceRestrict, faceFlip;               // grid-k face -> grid-(k+1) face (>=0) / -1-coarseCell
     DeviceBuffer<scalar> cDiag, cUpper, cLower;                // grid-(k+1) matrix (rebuilt by Galerkin)
     // DETERMINISTIC GALERKIN GATHER (see the note above galDiagGatherK in device_amg.cu).
@@ -74,8 +76,10 @@ struct AMGLevel {
     DeviceBuffer<label>  rapSrcKind, rapSrcIdx, rapDstKind, rapDstIdx;
     DeviceBuffer<scalar> rapW;
     DeviceLduView coarseView() const {
-        return {nCoarse, nCoarseFaces, cDiag.data(), cUpper.data(), cLower.data(), cOwn.data(), cNei.data(),
-                cOwnerStart.data(), cLosort.data(), cLosortStart.data()};
+        DeviceLduView v{nCoarse, nCoarseFaces, cDiag.data(), cUpper.data(), cLower.data(), cOwn.data(), cNei.data(),
+                        cOwnerStart.data(), cLosort.data(), cLosortStart.data()};
+        v.addressingId = addressingId;
+        return v;
     }
 };
 
@@ -84,6 +88,8 @@ struct AMGLevel {
 // The standard cure for high-aspect-ratio anisotropy where point Jacobi/Chebyshev stall (see cf-airfoil-aero-test).
 struct GridColoring {
     int nColors = 0;
+    int nCells = 0;                        // of the graph coloured, with its addressing id: gsColoringFor's stale check
+    unsigned long long addressingId = 0;
     DeviceBuffer<label> cells;   // grid cells reordered by color (size = grid nCells)
     DeviceBuffer<label> start;   // color offsets into cells[] (size nColors+1, host-readable copy below)
     std::vector<label>  startH;  // host copy of start (the smoother loops colors on the host, launching per color)
@@ -341,6 +347,11 @@ scalar deviceSymGaussSeidel(const DeviceLduView& A, const DeviceBuffer<scalar>& 
 scalar deviceSymGaussSeidel(const DeviceLduView& A, const DeviceBuffer<scalar>& b, DeviceBuffer<scalar>& psi,
                             const scalar* dNormFactor, scalar tol, scalar relTol, int maxIter,
                             DeviceSolverPerf* perf = nullptr, int minIter = 0, int nSweeps = 1, bool symmetric = true);
+
+// Which sweep deviceSymGaussSeidel runs in THIS process: OpenFOAM's sequential one on the CPU (the
+// default, by measurement) or the level-scheduled device loop (BRAE_GS_HOST_SMOOTHER=0). Both are the
+// same arithmetic; an identity gate needs to know which of them it compared.
+bool deviceGaussSeidelUsesHostSmoother();
 
 // The components of ONE vector matrix, solved together (item 60a): their systems share topology, upper
 // and lower; each has its own folded diagonal, source, normFactor, residual, sweep count and stop. One

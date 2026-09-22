@@ -31,6 +31,10 @@ struct DeviceMRFZone
     DeviceBuffer<scalar> frameFluxInt;   // (Omega x (Cf - origin)) & Sf, 0 off the zone's internal faces
     DeviceBuffer<scalar> frameFluxBnd;   // the same, on EXCLUDED boundary faces only
     DeviceBuffer<label>  zeroBnd;        // 1 on INCLUDED boundary faces: OF sets these to zero outright
+    // MRFZone::zero's face set (MRFZoneTemplates.C:213-247), which is NOT the makeRelative one: it zeroes
+    // the zone's internal faces and BOTH its included and excluded boundary faces.
+    DeviceBuffer<label>  filterInt;
+    DeviceBuffer<label>  filterBnd;
     bool active = false;
 };
 
@@ -49,6 +53,13 @@ void deviceMrfCoriolisZone(
     const DeviceBuffer<scalar>&       Uz,
     int                               cmpt,
     DeviceBuffer<scalar>&             src);
+
+// MRFZoneList::zeroFilter(phi) -> MRFZone::zero (MRFZoneTemplates.C:213-247): the flux is set to Zero on
+// the zone's internal faces and on its included AND excluded boundary faces.
+void deviceMrfZeroFilter(
+    const std::vector<DeviceMRFZone>& zones,
+    DeviceBuffer<scalar>&             phiInt,
+    DeviceBuffer<scalar>&             phiBnd);
 
 // MRFZoneList::makeRelative(phi): subtract the frame flux on internal and excluded faces, ZERO the
 // included ones.

@@ -15,9 +15,24 @@
 
 namespace brae {
 
+// A process-wide serial handed to every LDU addressing uploaded to the device (a DeviceMesh, a
+// DeviceLduMatrix), carried by the views over it. The device pool recycles blocks of equal size, so
+// the ADDRESS of an owner array is not the identity of its CONTENT: the GAMG hierarchy of a moving
+// mesh is rebuilt every step and its coarse levels come back at the same pointers with the same cell
+// counts (224000 112000 56000 ... on waveMakerMultiPaddlePiston, 448k cells) but a different pairing,
+// and the pointer-keyed Gauss-Seidel level cache replayed the previous step's schedule inside the
+// DICGaussSeidel smoother: device U 3.0e-02 vs OpenFOAM at 30 steps where the PCG twin read 6.4e-11,
+// and a second run in one process not reproducing the first (1.9e-04). The caches compare this id.
+inline unsigned long long nextDeviceAddressingId()
+{
+    static unsigned long long n = 0;
+    return ++n;
+}
+
 struct DeviceMesh
 {
     int nCells = 0, nInternalFaces = 0, nBndFaces = 0;
+    unsigned long long addressingId = 0;                // see nextDeviceAddressingId
     DeviceBuffer<label>  owner, nei;                    // internal faces
     DeviceBuffer<scalar> w, V, Sfx, Sfy, Sfz;           // weights(nIf), V(nC), Sf components(all faces)
     DeviceBuffer<scalar> dc, magSf;                     // deltaCoeffs(nIf), |Sf|(all faces), for fvm assembly
@@ -171,6 +186,7 @@ inline DeviceMesh buildDeviceMesh(
     dm.nCells = nC;
     dm.nInternalFaces = nIf;
     dm.nBndFaces = nB;
+    dm.addressingId = nextDeviceAddressingId();
     dm.owner.copyFrom(ownI);
     dm.nei.copyFrom(neiI);
     dm.w.copyFrom(wI);
@@ -239,7 +255,8 @@ inline void refreshDeviceMeshGeometry(
     // -- w, magSf, Sf, dOwn, dNei, dBnd -- has just been replaced above, so dropping it here is what
     // keeps the cache from serving a pre-move fit on a moving mesh (FP-3).
     dm.lsqInvDd.resize(0);
-    // owner/nei, ownerStart/losort/losortStart, bnd* deliberately NOT touched: topology, unchanged.
+    // owner/nei, ownerStart/losort/losortStart, bnd* and addressingId deliberately NOT touched:
+    // topology, unchanged, so the caches keyed on the id keep serving this mesh.
 }
 
 
@@ -253,7 +270,11 @@ inline std::vector<scalar> flattenBoundary(const std::vector<std::vector<scalar>
 }
 
 void deviceInterpolate(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol, DeviceBuffer<scalar>& sfInt);
-void deviceDiv(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& bval, DeviceBuffer<scalar>& d);
+// fvc::surfaceIntegrate divides by mesh.Vsc(), which is mesh.V() unless the mesh MOVES and the caller
+// is inside a sub-cycle (fvcSurfaceIntegrate.C:77, fvMeshGeometry.C). Pass that volume as `V` there;
+// null takes dm.V, which is every static-mesh caller.
+void deviceDiv(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& bval, DeviceBuffer<scalar>& d,
+               const DeviceBuffer<scalar>* V = nullptr);
 void deviceGaussGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol, const DeviceBuffer<scalar>& bval,
                      DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz,
                      const int* skipIf = nullptr);
@@ -357,6 +378,13 @@ void deviceFaceDivSource(const DeviceMesh& dm, const DeviceBuffer<scalar>& ffc, 
 void deviceDivUpwindCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt,
                            DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& upper, DeviceBuffer<scalar>& lower);
 // limitedLinear convection (OF "Gauss limitedLinear k_"): implicit limited face weight W_f = limiter*CDweight +
+// THE LIMITER SELECTOR carried in `twoByk` everywhere below. It is a real coefficient for limitedLinear
+// (2/max(k,SMALL), always > 0); 0 already means vanAlbada; and kVanLeerTwoByk selects vanLeer. A sentinel
+// rather than a sign convention, because device_ami.cu reads `twoByk <= 0` as vanAlbada and a negative
+// RANGE would have changed the AMI path's meaning without a word. vanLeer is what every interFoam
+// tutorial names for div(phi,alpha) -- OF vanLeer.H:70, limiter = (r + |r|)/(1 + |r|).
+constexpr scalar kVanLeerTwoByk = -1.0;
+
 // (1-limiter)*pos0(phi), limiter = clamp(twoByk*r, 0, 1), r = NVDTVD ratio from grad(field). twoByk = 2/max(k_,SMALL)
 // (k_=1 -> twoByk=2). gx/gy/gz = cell grad(field) (Gauss). Reduces to deviceDivUpwindCoeffs at limiter=0.
 void deviceDivCentralCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt,
@@ -371,6 +399,11 @@ void deviceDivLimitedCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& ph
 // where the scheme changes the face value rather than any matrix coefficient. Same limiter as
 // deviceDivLimitedCoeffs, through the same device function, and the same currency: twoByk = 2/max(k,SMALL),
 // NOT the raw k the case writes. Face value is then w*field[own] + (1-w)*field[nei].
+// `Gauss interfaceCompression`, the PhiScheme four of the waveMaker tutorials name for the alpha
+// fluxes: its limiter is the quartic function of the TWO CELL VALUES alone, so it takes no gradient.
+// Face value is then w*field[own] + (1-w)*field[nei], as with the limited weights below.
+void deviceInterfaceCompressionWeights(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt,
+                                       const DeviceBuffer<scalar>& field, DeviceBuffer<scalar>& w);
 void deviceLimitedFaceWeights(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& field,
                               const DeviceBuffer<scalar>& gx, const DeviceBuffer<scalar>& gy, const DeviceBuffer<scalar>& gz,
                               scalar twoByk, DeviceBuffer<scalar>& w);

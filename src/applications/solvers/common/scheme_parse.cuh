@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <map>
+#include <regex>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -354,7 +355,15 @@ inline FieldGradScheme parseNamedGradScheme(const std::string& caseDir, const st
 }
 
 
-inline FieldDivScheme parseFieldDivScheme(const std::string& caseDir, const std::string& field, bool vectorField = false)
+// `fluxName` is the flux the equation is WRITTEN with, which is part of the dictionary key: interFoam's
+// `density variable` turbulence convects k with rhoPhi and looks up `div(rhoPhi,k)`, where every other
+// caller's key is `div(phi,<field>)`. The two are different entries and a case names the one its
+// lineage reads -- RAS/damBreak ships div(rhoPhi,k) and no div(phi,k) at all.
+inline FieldDivScheme parseFieldDivScheme(
+    const std::string& caseDir,
+    const std::string& field,
+    bool vectorField = false,
+    const std::string& fluxName = "phi")
 {
     // Same source as parseFvSchemesControls: $-expanded, so `div(phi,tracer0) $turbulence;` resolves.
     const std::string all = readFvSchemesText(caseDir);
@@ -363,11 +372,53 @@ inline FieldDivScheme parseFieldDivScheme(const std::string& caseDir, const std:
     // first and misreports why a lookup failed -- every fvSchemes has several `default` lines.
     std::string raw = fvSchemesBlock(all, "divSchemes");
     if (raw.empty()) raw = all;
-    const std::string key = "div(phi," + field + ")";
+    const std::string key = "div(" + fluxName + "," + field + ")";
 
     // Find the statement for this field: from the key to its terminating ';'.
     const std::size_t k = raw.find(key);
+    // A PATTERN KEY, when no literal one names the field. fvSchemes is a dictionary and OpenFOAM looks
+    // a scheme up as it looks anything up: the literal key, else the LAST pattern that matches
+    // (dictionarySearch.C, csearch). RAS/waterChannel writes
+    //     "div\(phi,(k|omega)\)"      Gauss upwind;
+    // and this parser, which searches the text for the literal key, refused the case as having no
+    // div(phi,k) under `default none`.
+    std::string patternStatement;
     if (k == std::string::npos)
+    {
+        std::size_t pos = 0;
+        while (pos < raw.size())
+        {
+            const std::size_t semi = raw.find(';', pos);
+            if (semi == std::string::npos)
+            {
+                break;
+            }
+            std::size_t q0 = pos;
+            while (q0 < semi && std::isspace(static_cast<unsigned char>(raw[q0])))
+            {
+                ++q0;
+            }
+            const std::size_t q1 = (q0 < semi && raw[q0] == '"') ? raw.find('"', q0 + 1) : std::string::npos;
+            if (q1 != std::string::npos && q1 < semi)
+            {
+                bool matches = false;
+                try
+                {
+                    matches = std::regex_match(key, compileFoamRegex(raw.substr(q0 + 1, q1 - q0 - 1)));
+                }
+                catch (...)
+                {
+                }
+                if (matches)
+                {
+                    // the key in the pattern's place, so everything below reads one shape of statement
+                    patternStatement = key + raw.substr(q1 + 1, semi - q1 - 1);
+                }
+            }
+            pos = semi + 1;
+        }
+    }
+    if (k == std::string::npos && patternStatement.empty())
     {
         // OF: `default none` means an unlisted scheme is a fatal error, not a silent fallback.
         const std::size_t d = raw.find("default");
@@ -383,8 +434,10 @@ inline FieldDivScheme parseFieldDivScheme(const std::string& caseDir, const std:
             "brae: fvSchemes divSchemes has no `" + key + "` entry and brae does not resolve the "
             "divSchemes `default`; add the entry explicitly.");
     }
-    const std::size_t end = raw.find(';', k);
-    const std::string st = raw.substr(k, end == std::string::npos ? std::string::npos : end - k);
+    const std::size_t end = (k == std::string::npos) ? std::string::npos : raw.find(';', k);
+    const std::string st = !patternStatement.empty()
+                         ? patternStatement
+                         : raw.substr(k, end == std::string::npos ? std::string::npos : end - k);
 
     FieldDivScheme fs;
     divSchemesConsumed().insert(key);   // recorded here too: the tracer's own div(phi,<field>)
@@ -788,6 +841,38 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                 // Found by the coverage manifest, not by a case: `vanAlbada` appeared as a type the
                 // tutorials DEMAND and brae never names in a quoted comparison, which is exactly the
                 // signature of a control that is plumbed but never selected.
+                // interFoam's alpha transport. Two entries, two different jobs: div(phi,alpha) carries
+                // the VoF field and every tutorial limits it with vanLeer, while div(phirb,alpha) is the
+                // INTERFACE COMPRESSION flux and every tutorial leaves it linear. Getting either wrong
+                // changes where the interface sits, so neither is substituted silently.
+                if (inDiv && ln.find("div(phi,alpha)") != std::string::npos)
+                {
+                    const std::string sw = divSchemeWord(ln);
+                    ctl.foundDivAlpha = true;
+                    if      (sw == "vanLeer")   ctl.divAlphaTwoByk = scalar(-1.0);          // kVanLeerTwoByk
+                    else if (sw == "vanAlbada") ctl.divAlphaTwoByk = scalar(0.0);
+                    else if (sw == "limitedLinear")
+                    {
+                        const scalar t = limitedTwoByk(ln);
+                        ctl.divAlphaTwoByk = (t > 0.0) ? t : scalar(2.0);
+                    }
+                    else if (!sw.empty())
+                        throw std::runtime_error(
+                            "brae: div(phi,alpha) scheme 'Gauss " + sw + "' is not implemented (brae has "
+                            "`vanLeer`, `vanAlbada` and `limitedLinear <k>`). This entry limits the VoF "
+                            "transport itself, so running another limiter moves the interface:\n  " + ln);
+                }
+                if (inDiv && ln.find("div(phirb,alpha)") != std::string::npos)
+                {
+                    const std::string sw = divSchemeWord(ln);
+                    ctl.foundDivAlphaRb = true;
+                    if (sw == "linear") ctl.divAlphaRbLinear = true;
+                    else if (!sw.empty())
+                        throw std::runtime_error(
+                            "brae: div(phirb,alpha) scheme 'Gauss " + sw + "' is not implemented (brae has "
+                            "`linear`, which is what every interFoam tutorial names). This entry is the "
+                            "INTERFACE COMPRESSION flux, not the transport:\n  " + ln);
+                }
                 if (inDiv && ln.find("div(phi,sigma)") != std::string::npos)
                 {
                     const std::string sw = divSchemeWord(ln);

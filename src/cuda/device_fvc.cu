@@ -46,11 +46,28 @@ void divKernel(
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
 
+    // A TRANSCRIPTION of the host's fvc::div (fvc.cu): `d[own] += phi; d[nei] -= phi` in FACE ORDER from
+    // zero, so this cell's owner and neighbour lists (each ascending) are merged by face index, then the
+    // boundary faces in patch order, then the division by V. Summed owner-first it differed from the
+    // host's in the last bit (tests/test_device_laplacian_vs_host.cu holds the two to memcmp).
     scalar s = 0.0;
-    for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)
-        s += phiInt[f];              // +owner internal
-    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
-        s -= phiInt[losort[k]];    // -neighbour internal
+    int fo = ownerStart[c];
+    const int foEnd = ownerStart[c + 1];
+    int kn = losortStart[c];
+    const int knEnd = losortStart[c + 1];
+    while (fo < foEnd || kn < knEnd)
+    {
+        if ((kn >= knEnd) || (fo < foEnd && fo < losort[kn]))
+        {
+            s += phiInt[fo];            // +owner internal
+            ++fo;
+        }
+        else
+        {
+            s -= phiInt[losort[kn]];    // -neighbour internal
+            ++kn;
+        }
+    }
     for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)
     {
         const int bk = bndPerm[k];
@@ -214,21 +231,39 @@ void gradKernel(
     if (c >= nC) return;
     if (skipIf && *skipIf) return;
 
+    // A TRANSCRIPTION of the host's fvc::gaussGrad (fvc.cu), which is OpenFOAM's gaussGrad::gradf:
+    //   the face value in OpenFOAM's arithmetic, lambda*(P - N) + N (surfaceInterpolationScheme.C:270),
+    //   not w*P + (1 - w)*N -- on a face whose two cells hold the same value it returns that value
+    //   exactly, and the other form can miss by an ulp whose SIGN is the gradient of a uniform field;
+    //   and this cell's internal faces summed in FACE ORDER, as the host's face loop reaches them --
+    //   the owner and neighbour lists are each ascending, so they are merged by face index. MEASURED
+    //   before, on a sheared 960-cell box: 912 cells differed from the host in some bit on a smooth
+    //   field, 934 on a uniform one, where the difference (3.9e-27) was the size of the gradient itself.
+    //   tests/test_device_gauss_grad.cu holds the two to memcmp.
     scalar sx = 0.0, sy = 0.0, sz = 0.0;
-    for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)   // +owner internal
+    int fo = ownerStart[c];
+    const int foEnd = ownerStart[c + 1];
+    int kn = losortStart[c];
+    const int knEnd = losortStart[c + 1];
+    while (fo < foEnd || kn < knEnd)
     {
-        const scalar pf = w[f] * vol[own[f]] + (1.0 - w[f]) * vol[nei[f]];
-        sx += Sfx[f] * pf;
-        sy += Sfy[f] * pf;
-        sz += Sfz[f] * pf;
-    }
-    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)   // -neighbour internal
-    {
-        const int f = losort[k];
-        const scalar pf = w[f] * vol[own[f]] + (1.0 - w[f]) * vol[nei[f]];
-        sx -= Sfx[f] * pf;
-        sy -= Sfy[f] * pf;
-        sz -= Sfz[f] * pf;
+        const bool takeOwner = (kn >= knEnd) || (fo < foEnd && fo < losort[kn]);
+        const int f = takeOwner ? fo : losort[kn];
+        const scalar pf = w[f] * (vol[own[f]] - vol[nei[f]]) + vol[nei[f]];
+        if (takeOwner)   // +owner internal
+        {
+            sx += Sfx[f] * pf;
+            sy += Sfy[f] * pf;
+            sz += Sfz[f] * pf;
+            ++fo;
+        }
+        else             // -neighbour internal
+        {
+            sx -= Sfx[f] * pf;
+            sy -= Sfy[f] * pf;
+            sz -= Sfz[f] * pf;
+            ++kn;
+        }
     }
     for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)   // +boundary
     {
@@ -259,11 +294,13 @@ void deviceInterpolate(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol, De
 }
 
 
-void deviceDiv(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& bval, DeviceBuffer<scalar>& d)
+void deviceDiv(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& bval, DeviceBuffer<scalar>& d,
+               const DeviceBuffer<scalar>* V)
 {
     d.resize(dm.nCells);
     divKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
-                                           phiInt.data(), dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), bval.data(), dm.V.data(), d.data());
+                                           phiInt.data(), dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), bval.data(),
+                                           V ? V->data() : dm.V.data(), d.data());
     cudaCheck(cudaGetLastError(), "div");
 }
 
@@ -584,33 +621,43 @@ void gradFusedKernel(
         sy[i] = 0.0;
         sz[i] = 0.0;
     }
-    for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)   // +owner internal
+    // gradKernel's transcription of the host's gaussGrad, per field: OpenFOAM's face arithmetic and the
+    // internal faces merged into face order (see gradKernel)
+    int fo = ownerStart[c];
+    const int foEnd = ownerStart[c + 1];
+    int kn = losortStart[c];
+    const int knEnd = losortStart[c + 1];
+    while (fo < foEnd || kn < knEnd)
     {
+        const bool takeOwner = (kn >= knEnd) || (fo < foEnd && fo < losort[kn]);
+        const int f = takeOwner ? fo : losort[kn];
         const scalar wf = w[f];
         const label o = own[f], n = nei[f];
         const scalar sfx = Sfx[f], sfy = Sfy[f], sfz = Sfz[f];
 #pragma unroll
         for (int i = 0; i < N; ++i)
         {
-            const scalar pf = wf * fld.vol[i][o] + (1.0 - wf) * fld.vol[i][n];
-            sx[i] += sfx * pf;
-            sy[i] += sfy * pf;
-            sz[i] += sfz * pf;
+            const scalar pf = wf * (fld.vol[i][o] - fld.vol[i][n]) + fld.vol[i][n];
+            if (takeOwner)
+            {
+                sx[i] += sfx * pf;
+                sy[i] += sfy * pf;
+                sz[i] += sfz * pf;
+            }
+            else
+            {
+                sx[i] -= sfx * pf;
+                sy[i] -= sfy * pf;
+                sz[i] -= sfz * pf;
+            }
         }
-    }
-    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)   // -neighbour internal
-    {
-        const int f = losort[k];
-        const scalar wf = w[f];
-        const label o = own[f], n = nei[f];
-        const scalar sfx = Sfx[f], sfy = Sfy[f], sfz = Sfz[f];
-#pragma unroll
-        for (int i = 0; i < N; ++i)
+        if (takeOwner)
         {
-            const scalar pf = wf * fld.vol[i][o] + (1.0 - wf) * fld.vol[i][n];
-            sx[i] -= sfx * pf;
-            sy[i] -= sfy * pf;
-            sz[i] -= sfz * pf;
+            ++fo;
+        }
+        else
+        {
+            ++kn;
         }
     }
     for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)   // +boundary

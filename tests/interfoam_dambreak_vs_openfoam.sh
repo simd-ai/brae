@@ -1,0 +1,375 @@
+#!/usr/bin/env bash
+# brae's interFoam against REAL OpenFOAM's interFoam, on damBreak, field by field.
+#
+# THE METHOD IS "EXACTLY N IDENTICAL STEPS", not "run both to the end". An adaptive time step makes the
+# two solvers take DIFFERENT steps the moment their Courant numbers differ by anything at all, and then
+# every field is compared at a different physical time -- which produces a disagreement that looks like
+# a discretisation error and is actually a clock. So the case is rewritten with `adjustTimeStep no` and
+# a fixed deltaT, both run the same count, and the comparison is at one instant.
+#
+# The case is damBreak's own, prepared the way the tutorial does (blockMesh, then setFields), because
+# it ships 0.orig and no mesh.
+#
+# IT RUNS AT TWO TIME STEPS, because the two things it measures want opposite fixtures. At dt 1e-4 the
+# interface barely moves (3.7e-03) and the fields agree to 3.6e-14, which is where the tight FIELD
+# bounds live -- but the alpha pre-solve is then so diagonally dominant (Co ~ 1e-3) that every solver
+# lands on the exact solution in one iteration: measured, PBiCGStab's final residuals were 2.6e-03 from
+# OpenFOAM's symGaussSeidel's, beside the device's honest 1.5e-03, so a solver-log arm there cannot
+# tell solvers apart. At dt 5e-3 the interface moves 0.69, OpenFOAM's smoother takes 0, 5, 2, 2, 2
+# sweeps, brae takes the same and leaves its final residuals to 9e-10 -- and the PBiCGStab CONTROL gets
+# two counts of five and is 100% out. The `bigstep` profile is where those arms are asserted.
+#
+# AND A THIRD PROFILE, `inflow`, for a term neither shipped tutorial exercises. rho is built from an
+# expression, so its patches are `calculated` and fvc::snGrad(rho) on a patch is
+# deltaCoeffs*(rho_b - rho_cell); brae took it from a zeroGradient copy, which is 0 everywhere. On a
+# fixedFluxPressure wall that cancels through constrainPressure, and everywhere else on damBreak and
+# capillaryRise alpha's patch value equals the cell's -- so it was carried as LATENT. Setting the
+# atmosphere's inletValue to 1 makes water enter over air cells: OpenFOAM's boundary snGrad(rho) is then
+# 1.57e+05 on 19 of 46 faces, phig there is 1.66e-02 against a phiHbyA of 2.5e-06, max|U| goes 0.19 ->
+# 20 m/s in ONE step, and brae was 100% out in alpha, p_rgh and U from the second step on.
+# THREE steps only: the fixture is violent enough that round-off grows 700x a step (device against
+# host, every solve tightened: 1e-12 after two steps, 7e-10 after three), so a longer run measures the
+# conditioning and not the term.
+#
+# AND A FOURTH, `prevcorr`: `alphaApplyPrevCorr yes`, which caches the compression flux the correctors
+# ended on and applies it, limited, as the NEXT step's first guess (alphaEqn.H:133-150, :228-236). Three
+# shipped tutorials set it and brae refuses all three for other reasons (RAS, moving meshes, LTS), so
+# no tutorial can gate it; OpenFOAM honours the switch on any MULESCorr case, and damBreak is one. It
+# runs at the big step, where the interface moves enough for last step's correction to matter, and the
+# staging asserts OpenFOAM's log says "Applying the previous iteration compression flux" -- an oracle
+# that never took the path would agree with a brae that ignored the switch.
+#
+# AND `outflow`, for ONE ARGUMENT of that path. MULES::correct's flux argument feeds a single test, the
+# boundary outlet test `(phi_b + phiCorr_b) > 0`, and OpenFOAM passes the ALPHA flux alphaPhi10 where
+# brae's host passed the volumetric phiCN. It took three fixtures to measure. On damBreak the two agree
+# to five digits (the cached correction's boundary half is zero unless water LEAVES through an outflow
+# face). With the water column raised to the atmosphere it does leave, and at dt 5e-3 the two tests
+# decide differently on up to 13 faces a step -- and the answer is STILL bit-identical, because the cell
+# limiter returns 1 there. It needs the limiter biting as well: the same fixture at dt 1e-2, four steps,
+# where brae with phiCN is 5.5e-03 of alpha and 2.2% of U from OpenFOAM and with alphaPhi10 4.6e-13.
+# The test re-runs the host with BRAE_CONTROL_PREVCORR_PHICN set and requires THAT to fail.
+#
+# AND THREE PIMPLE CONTROLS damBreak DOES NOT USE: `nouter` (nOuterCorrectors 2), `nonorth`
+# (nNonOrthogonalCorrectors 1) and `mompred` (momentumPredictor yes). brae's host RAN all three and
+# nothing held any of them against OpenFOAM -- which is the position alphaApplyPrevCorr was in while it
+# carried a wrong limiter argument. 5, 4 and 5 of the 44 shipped tutorials set them. Each profile's
+# control is the big-step run without the setting: the setting has to move OpenFOAM's own answer, or a
+# brae that ignored it would pass. The device loop runs neither outer nor non-orthogonal correctors and
+# REFUSES both, so on those two profiles the test asserts the refusal instead of a run.
+#
+# AND `compression`: div(phirb,alpha) as `Gauss interfaceCompression`, the PhiScheme four waveMaker
+# tutorials name and none on a mesh that does not move, at the big step with the big-step run (`Gauss
+# linear`) as the control. MEASURED: alpha 6.6e-14, p_rgh 3.1e-14, U 2.2e-13, every count OpenFOAM's; the
+# scheme moves OpenFOAM's own alpha by 1.03e-01. BROKEN ONCE EACH: the quadratic form OpenFOAM leaves
+# commented out, 1.0e-02 of alpha; min for max, 8.1e-02; pos for pos0 in the blend, no change -- no face
+# where the limiter is below 1 carries exactly zero flux, so that one is not claimed. THE DEVICE ARM
+# RUNS IT TOO now (device_fvm.cu, interfaceCompressionWeightsKernel): alpha 2.0e-13, p_rgh 1.8e-13, U
+# 9.0e-12 against OpenFOAM. This is the STILL fixture for that scheme -- its four tutorials all move
+# their mesh, and tests/interfoam_moving_vs_openfoam.sh's `piston` and `flap` are the moving ones.
+# This arm asserted the device's REFUSAL until the scheme was ported, and the refusal failing here is
+# how the port was noticed.
+#
+# AND `rhophi`: every flux-conditional condition of the atmosphere -- U's pressureInletOutletVelocity,
+# p_rgh's totalPressure, alpha's inletOutlet -- given `phi rhoPhi;`. OpenFOAM's conditions look their
+# flux up BY NAME, three shipped tutorials name rhoPhi on a totalPressure top, and brae's reader kept
+# no `phi` entry at all (tests/interfoam_waves_vs_openfoam.sh found it, on the two solitary-wave cases
+# that write it). Those cases put the name on p_rgh only; this profile puts it on all three, so the
+# velocity's and alpha's switches are held against OpenFOAM too. The DEVICE runs U's switch itself and
+# reads phi there, so it REFUSES this profile, and the test asserts the refusal.
+# AND TWO MOMENTUM SCHEMES the tutorial does not name, `vanleerv` and `linear`, each on div(rhoPhi,U)
+# at the big step with the big-step run as the control: `Gauss vanLeerV`, the V-limited vanLeer every
+# closed-tank tutorial names (one limiter per face from the vector difference, vanLeer's unclamped
+# function -- limitedSchemes_cpp.cuh), and `Gauss linear`, which interFoam's own scheme enum carried
+# and whose DEVICE mapping fell through a switch's `default` to upwind until this profile existed. Both
+# run on both paths.
+#
+# IT FAILED THE FIRST TIME IT RAN, on two things a condition naming `phi` can never see, because
+# nothing moves phi between the end of one step's pressure correctors and the next step's UEqn -- and
+# the ALPHA step moves rhoPhi exactly there:
+#   the push.   brae's conditions are TOLD their flux, and were last told at the end of the previous
+#               step; OpenFOAM's look it up at every updateCoeffs, so UEqn's U and the first corrector's
+#               p_rgh read THIS step's rhoPhi. Naming it on p_rgh alone: alpha 4.7e-10 -> 1.2e-12.
+#   the value.  pressureInletOutletVelocity::updateCoeffs ends in directionMixed::evaluate(), which
+#               REWRITES THE PATCH VALUE and clears the updated flag -- so UEqn's fvMatrix constructor
+#               re-evaluates U's atmosphere from the new flux. brae refreshed the coefficients and kept
+#               the value. Naming it on U alone: alpha 2.5e-09 before the push, 8.4e-11 after it,
+#               1.2e-12 with the value re-evaluated as well.
+# The control: naming rhoPhi moves OpenFOAM's OWN alpha by 1.0e-06 over these five steps.
+#
+# PROFILE alphaminiter: the alpha entry names `minIter 1`, at the big step. OpenFOAM's first pre-solve
+# starts under its tolerance and takes no sweep; minIter forces one. MEASURED: all 5 alpha sweep counts
+# OpenFOAM's (1 5 2 2 2), alpha 7.3e-14, U 2.6e-13. THE FIELDS CANNOT WITNESS IT on damBreak -- that first
+# pre-solve starts on an exact solution, so the forced sweep changes nothing (alpha identical to the last
+# digit at alpha tolerances 1e-8, 1e-5, 1e-4, 1e-3) -- so the control is the sweep count: OpenFOAM without
+# minIter logs 1 of the 5 differently. BROKEN (minIter ignored, as brae had it): the first count 0 for 1.
+# The device refuses the profile by name.
+#
+# PROFILES sheared, gradLsqLimited, nHatLimited: THE GRADIENT SCHEMES. Every fvc::grad interFoam takes is
+# resolved by the name its call site asks for -- grad(U), grad(alpha.water), grad(alpha.air), grad(p_rgh),
+# grad(pcorr), grad(rho), and the interface normal's `nHat` -- then `default`, and the host runs `Gauss
+# linear`, `leastSquares` and `cellLimited` over either. `gradLsqLimited` is RAS/electrostaticDeposition's
+# `default cellLimited leastSquares 1` (nHat named `leastSquares`, see below) on the `sheared` fixture,
+# whose run is its control. On damBreak as shipped four of those gradients are inert (see run_at for the
+# settings that make each live). MEASURED at 5 big steps: sheared alpha 1.5e-14, U 7.9e-14 relative;
+# gradLsqLimited alpha 1.9e-14, U 3.5e-13, every p_rgh, Ux, Uy and alpha count OpenFOAM's; the entry moves
+# OpenFOAM's own alpha 3.5e-02. BROKEN ONCE EACH (the site given Gauss linear, gradLsqLimited alpha): the
+# pressure laplacian's grad(p_rgh) 4.9e-01, snGrad(rho)'s grad(rho) 2.4e-01, the alpha vanLeer limiter's
+# grad(alpha.water) 2.4e-02, the compression limiter's grad(alpha.air) 7.8e-03, the predictor's
+# snGrad(p_rgh) 2.4e-03, CorrectPhi's grad(pcorr) 1.5e-03, nHat's 1.5e-03, grad(U) leastSquares 9.7e-04,
+# the surface-tension snGrad(alpha)'s 3.4e-04.
+#   `nHatLimited` is `nHat cellLimited Gauss linear 1` alone, at the SMALL step: alpha 5.6e-13, p_rgh
+# 1.1e-10 and U 2.5e-10 relative (the entry moves OpenFOAM's alpha 6.3e-05; the limiter dropped, 6.3e-05).
+# At the big step it is 2.7e-09 after five steps and cannot be held to round-off, for a reason that is not
+# a defect: brae's limited K computed from OpenFOAM's own post-MULES alpha (dumped at 17 digits) agrees
+# with OpenFOAM's to 3e-16 relative, but MULES leaves alpha 1 +- 1e-7 in the bulk, where the limiter
+# divides round-off-sized neighbour ranges by round-off-sized extrapolations -- a 1.7e-13 alpha
+# difference after step 1 became 1.1e-06 of p_rgh at step 2 (Gauss linear: 1e-10).
+set -u
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BIN="${BUILD:-$ROOT/build}/test_inter_dambreak_vs_openfoam"
+OFBASHRC=${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
+TUT=${BRAE_OF_TUTORIALS:-/usr/lib/openfoam/openfoam2412/tutorials}
+SRC="$TUT/multiphase/interFoam/laminar/damBreak/damBreak"
+STEPS=${STEPS:-5}
+STEPS_INFLOW=${STEPS_INFLOW:-3}
+DT=${DT:-1e-4}
+DT_BIG=${DT_BIG:-5e-3}
+DT_OUT=${DT_OUT:-1e-2}
+STEPS_OUT=${STEPS_OUT:-4}
+
+[ -x "$BIN" ]      || { echo "SKIP: $BIN not built"; exit 77; }
+[ -d "$SRC" ]      || { echo "SKIP: damBreak tutorial not found at $SRC"; exit 77; }
+[ -f "$OFBASHRC" ] || { echo "SKIP: real OpenFOAM not available"; exit 77; }
+
+W=${KEEP_W:-$(mktemp -d)}
+[ -n "${KEEP_W:-}" ] || trap 'rm -rf "$W"' EXIT
+mkdir -p "$W"
+
+set +u
+# shellcheck disable=SC1091
+source "$OFBASHRC" > /dev/null 2>&1 || true
+set -u
+command -v blockMesh > /dev/null 2>&1 || { echo "SKIP: blockMesh not on PATH"; exit 77; }
+command -v interFoam > /dev/null 2>&1 || { echo "SKIP: interFoam not on PATH"; exit 77; }
+
+# run_at <deltaT> <profile> [nSteps]: stage the tutorial at a FIXED step, run real OpenFOAM, run the gate.
+run_at()
+{
+    local dt="$1" profile="$2" STEPS="${3:-$STEPS}"
+    local C="$W/$profile"
+    cp -r "$SRC" "$C" || return 1
+    rm -rf "$C"/[1-9]* "$C"/0 "$C"/processor* "$C"/log.*
+    cp -r "$C/0.orig" "$C/0"
+    if [ "$profile" = inflow ]; then
+        # WATER ENTERS OVER AIR CELLS: the one change that makes rho_b differ from rho_cell on a patch
+        # where p_rgh fixes a value. setFields rewrites only the internal field, so the patch entry
+        # survives it.
+        sed -i 's/inletValue *uniform 0;/inletValue      uniform 1;/' "$C/0/alpha.water"
+        grep -q "inletValue *uniform 1;" "$C/0/alpha.water" \
+            || { echo "FAIL: the inflow fixture's inletValue was not rewritten"; return 1; }
+    fi
+    if [ "$profile" = rhophi ]; then
+        for fld in U p_rgh alpha.water; do
+            sed -i '/^ *atmosphere/,/}/ s/^\( *\)type\( .*\)$/\1type\2\n\1phi             rhoPhi;/' "$C/0/$fld"
+            grep -q "phi  *rhoPhi;" "$C/0/$fld" || { echo "FAIL: $fld's atmosphere was not given phi rhoPhi"; return 1; }
+        done
+    fi
+    case "$profile" in
+        nouter)  sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' "$C/system/fvSolution"
+                 grep -q "nOuterCorrectors 2;" "$C/system/fvSolution" || { echo "FAIL: nOuterCorrectors was not raised"; return 1; } ;;
+        nonorth) sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' "$C/system/fvSolution"
+                 grep -q "nNonOrthogonalCorrectors 1;" "$C/system/fvSolution" || { echo "FAIL: nNonOrthogonalCorrectors was not raised"; return 1; } ;;
+        vanleerv) sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss vanLeerV;/' "$C/system/fvSchemes"
+                 grep -q "Gauss vanLeerV;" "$C/system/fvSchemes" || { echo "FAIL: div(rhoPhi,U) was not set to vanLeerV"; return 1; } ;;
+        compression) sed -i 's/div(phirb,alpha) .*/div(phirb,alpha) Gauss interfaceCompression;/' "$C/system/fvSchemes"
+                 grep -q "div(phirb,alpha) Gauss interfaceCompression;" "$C/system/fvSchemes" || { echo "FAIL: div(phirb,alpha) was not set to interfaceCompression"; return 1; } ;;
+        linear)  sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss linear;/' "$C/system/fvSchemes"
+                 grep -q "div(rhoPhi,U)  Gauss linear;" "$C/system/fvSchemes" || { echo "FAIL: div(rhoPhi,U) was not set to linear"; return 1; } ;;
+        mompred) sed -i 's/momentumPredictor  *no;/momentumPredictor yes;/' "$C/system/fvSolution"
+                 grep -q "momentumPredictor yes;" "$C/system/fvSolution" || { echo "FAIL: momentumPredictor was not switched on"; return 1; }
+                 # damBreak names `U` only, and with one outer corrector fvMatrix::solve() selects
+                 # `UFinal`: real OpenFOAM stops on this case, "Entry 'UFinal' not found". The key
+                 # becomes the regex "U.*", which is how the tutorials that DO run a predictor write it.
+                 sed -i 's/^\( *\)U$/\1"U.*"/' "$C/system/fvSolution"
+                 grep -q '"U\.\*"' "$C/system/fvSolution" || { echo "FAIL: the U solver entry was not widened to UFinal"; return 1; } ;;
+    esac
+    if [ "$profile" = sheared ] || [ "$profile" = gradLsqLimited ]; then
+        # A FIXTURE ON WHICH EVERY GRADIENT interFoam TAKES IS READ. On damBreak as shipped four of them
+        # are inert, and each setting below is there because it makes one of them live -- measured by
+        # dropping that site's scheme in brae (the fail-proofs in the manifest) and by OpenFOAM's own
+        # answer moving with the entry:
+        #   upper blocks sheared six degrees (as tests/interfoam_refusals.sh does) -- the non-orthogonal
+        #       corrections are zero on rectangles, so grad(p_rgh) and grad(rho) cellLimited leastSquares
+        #       moved OpenFOAM's own p_rgh by 1e-10 there, and by 2.9e+03 and 2.7e+04 here;
+        #   momentumPredictor yes -- snGrad(p_rgh), and grad(p_rgh)'s entry in its correction, reach only
+        #       the predictor's source: with it off, dropping that entry left every field bitwise equal;
+        #   U starting at (0.1 0 0), and nNonOrthogonalCorrectors 1 -- initCorrectPhi's pcorr solve is
+        #       then not a zero-iteration solve, and its second pass reads grad(pcorr) (with one pass the
+        #       explicit correction is built from pcorr's zero guess and vanishes);
+        #   div(phirb,alpha) Gauss vanLeer, as seven tutorials name it -- the compression flux of
+        #       alpha.air then goes through a limiter that reads grad(alpha.air).
+        sed -i 's/(0 4 /(0.4 4 /; s/(2 4 /(2.4 4 /; s/(2.16438 4 /(2.56438 4 /; s/(4 4 /(4.4 4 /' "$C/system/blockMeshDict"
+        grep -q "(0.4 4 " "$C/system/blockMeshDict" || { echo "FAIL: the blocks were not sheared"; return 1; }
+        # the "U.*" key: see `mompred`
+        sed -i 's/momentumPredictor  *no;/momentumPredictor yes;/' "$C/system/fvSolution"
+        sed -i 's/^\( *\)U$/\1"U.*"/' "$C/system/fvSolution"
+        grep -q "momentumPredictor yes;" "$C/system/fvSolution" && grep -q '"U\.\*"' "$C/system/fvSolution" \
+            || { echo "FAIL: the momentum predictor was not switched on"; return 1; }
+        sed -i 's/^internalField .*/internalField   uniform (0.1 0 0);/' "$C/0/U"
+        grep -q "uniform (0.1 0 0);" "$C/0/U" || { echo "FAIL: U was not started moving"; return 1; }
+        sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' "$C/system/fvSolution"
+        grep -q "nNonOrthogonalCorrectors 1;" "$C/system/fvSolution" \
+            || { echo "FAIL: nNonOrthogonalCorrectors was not raised"; return 1; }
+        sed -i 's/div(phirb,alpha) .*/div(phirb,alpha) Gauss vanLeer;/' "$C/system/fvSchemes"
+        grep -q "div(phirb,alpha) Gauss vanLeer;" "$C/system/fvSchemes" \
+            || { echo "FAIL: div(phirb,alpha) was not set to vanLeer"; return 1; }
+    fi
+    if [ "$profile" = gradLsqLimited ]; then
+        # EVERY GRADIENT cellLimited leastSquares, as RAS/electrostaticDeposition writes it: the viscous
+        # term's grad(U), the vanLeer limiters' grad(alpha.water) and grad(alpha.air), the corrected
+        # laplacians' and snGrads' grad(p_rgh), grad(rho), grad(alpha.water) and grad(pcorr) -- on the
+        # `sheared` fixture, whose run is its control
+        sed -i '/^gradSchemes/,/^}/ s/default .*/default         cellLimited leastSquares 1;\n    nHat            leastSquares;/' "$C/system/fvSchemes"
+        grep -q "default         cellLimited leastSquares 1;" "$C/system/fvSchemes" \
+            || { echo "FAIL: the gradient default was not rewritten"; return 1; }
+        # ...EXCEPT nHat, which names plain leastSquares. A LIMITED interface normal cannot be held to
+        # round-off at the big step: brae's limited K from OpenFOAM's own post-MULES alpha (17 digits)
+        # agrees to 3e-16 relative, but MULES leaves alpha 1 +- 1e-7 in the bulk, where the limiter
+        # divides round-off-sized neighbour ranges by round-off-sized extrapolations -- a 1.7e-13 alpha
+        # difference became 1.1e-06 in p_rgh one step later. The `nHatLimited` profile gates it at the
+        # small step. Naming nHat here also gates the lookup: the default would limit it.
+        grep -q "nHat            leastSquares;" "$C/system/fvSchemes" \
+            || { echo "FAIL: the nHat entry was not added"; return 1; }
+    fi
+    if [ "$profile" = nHatLimited ]; then
+        # THE INTERFACE NORMAL cellLimited, alone, at the small step (see gradLsqLimited for why not
+        # the big one). Every other gradient stays the tutorial's Gauss linear.
+        sed -i '/^gradSchemes/,/^}/ s/\(default .*\)/\1\n    nHat            cellLimited Gauss linear 1;/' "$C/system/fvSchemes"
+        grep -q "nHat            cellLimited Gauss linear 1;" "$C/system/fvSchemes" \
+            || { echo "FAIL: the nHat entry was not added"; return 1; }
+    fi
+    if [ "$profile" = alphaminiter ]; then
+        # THE ALPHA ENTRY NAMES `minIter 1` (DTCHull, DTCHullMoving and electrostaticDeposition do). At the
+        # big step OpenFOAM's FIRST pre-solve starts under its tolerance and takes no sweep; minIter forces
+        # one. Its control is the `bigstep` run, which is the same case without it.
+        python3 - "$C" <<'PYEOF' || { echo "FAIL: the $profile profile was not staged"; return 1; }
+import os, re, sys
+q = os.path.join(sys.argv[1], 'system/fvSolution')
+t = open(q).read()
+m = re.search(r'("alpha\.water\.\*"\s*\{)([^}]*)\}', t)
+assert m, 'no alpha.water.* entry'
+body = m.group(2)
+assert 'minIter' not in body, 'the tutorial names minIter already'
+body = body + '    minIter         1;\n    '
+t = t[:m.start(2)] + body + t[m.end(2):]
+open(q, 'w').write(t)
+PYEOF
+    fi
+    if [ "$profile" = outflow ]; then
+        # THE WATER COLUMN REACHES THE ATMOSPHERE, whose faces over it turn out to be OUTFLOW (the patch
+        # fixes p_rgh, not p, so the column top sees the lower pressure): water leaves through them.
+        sed -i 's/box (0 0 -1) (0.1461 0.292 1);/box (0 0 -1) (0.1461 1 1);/' "$C/system/setFieldsDict"
+        grep -q "box (0 0 -1) (0.1461 1 1);" "$C/system/setFieldsDict" \
+            || { echo "FAIL: the outflow fixture's water column was not raised"; return 1; }
+    fi
+    if [ "$profile" = prevcorr ] || [ "$profile" = prevcorrsub ] || [ "$profile" = outflow ]; then
+        sed -i 's/^\( *\)MULESCorr  *yes;/\1MULESCorr       yes;\n\1alphaApplyPrevCorr yes;/' "$C/system/fvSolution"
+        grep -q "alphaApplyPrevCorr yes;" "$C/system/fvSolution" \
+            || { echo "FAIL: alphaApplyPrevCorr was not switched on in the staged case"; return 1; }
+    fi
+    if [ "$profile" = prevcorrsub ]; then
+        # ...AND TWO SUB-CYCLES, because talphaPhi1Corr0 outlives the sub-cycle as well as the time step:
+        # the second sub-cycle's pre-solve applies the correction the FIRST one ended on. damBreak's own
+        # nAlphaSubCycles is 1, which cannot tell a cache that crosses sub-cycles from one that is reset.
+        sed -i 's/nAlphaSubCycles  *1;/nAlphaSubCycles 2;/' "$C/system/fvSolution"
+        grep -q "nAlphaSubCycles 2;" "$C/system/fvSolution" \
+            || { echo "FAIL: nAlphaSubCycles was not raised in the staged case"; return 1; }
+    fi
+
+    # A FIXED time step, and write exactly once at step N. writePrecision 15 because the comparison is
+    # against brae's fp64 and an ascii round-trip at the default 6 digits would dominate the difference.
+    STEPS="$STEPS" DT="$dt" python3 - "$C" <<'PYEOF'
+import os, re, sys
+d = sys.argv[1]
+n  = int(os.environ['STEPS'])
+dt = os.environ['DT']
+c = os.path.join(d, 'system/controlDict')
+s = open(c).read()
+s = re.sub(r'^adjustTimeStep .*', 'adjustTimeStep  no;',        s, flags=re.M)
+s = re.sub(r'^deltaT .*',         'deltaT          %s;' % dt,   s, flags=re.M)
+s = re.sub(r'^endTime .*',        'endTime         %.10g;' % (n*float(dt)), s, flags=re.M)
+s = re.sub(r'^writeControl .*',   'writeControl    timeStep;',  s, flags=re.M)
+# every step is written, so the `inflow` control can read the STANDARD case at its own end time
+s = re.sub(r'^writeInterval .*',  'writeInterval   1;',         s, flags=re.M)
+s = re.sub(r'^writeFormat .*',    'writeFormat     ascii;',     s, flags=re.M)
+s = re.sub(r'^writePrecision .*', 'writePrecision  15;',        s, flags=re.M)
+open(c, 'w').write(s)
+PYEOF
+    ( cd "$C" && blockMesh > log.blockMesh 2>&1 ) || { echo "FAIL: blockMesh"; tail -20 "$C/log.blockMesh"; return 1; }
+    ( cd "$C" && setFields > log.setFields 2>&1 ) || { echo "FAIL: setFields"; tail -20 "$C/log.setFields"; return 1; }
+    ( cd "$C" && interFoam > log.interFoam 2>&1 ) || { echo "FAIL: interFoam"; tail -30 "$C/log.interFoam"; return 1; }
+
+    if [ "$profile" = prevcorr ] || [ "$profile" = prevcorrsub ] || [ "$profile" = outflow ]; then
+        grep -q "Applying the previous iteration compression flux" "$C/log.interFoam" \
+            || { echo "FAIL: OpenFOAM never applied the previous correction, so this oracle cannot gate it"; return 1; }
+    fi
+
+    local end
+    end=$(python3 -c "print('%.10g' % ($STEPS*float('$dt')))")
+    [ -d "$C/$end" ] || { echo "FAIL: OpenFOAM wrote no $end directory"; ls "$C"; return 1; }
+    echo "OpenFOAM ran $STEPS steps of deltaT $dt to t = $end   [$profile]"
+
+    # THE CONTROL CASE for the alpha solve-log arm: identical, except that the alpha entry names
+    # PBiCGStab -- the solver brae's host ran in place of the case's symGaussSeidel until it had one.
+    # OpenFOAM is NOT re-run on it; the test compares brae-on-PBiCGStab against
+    # OpenFOAM-on-symGaussSeidel and, under `bigstep`, requires that comparison to FAIL.
+    cp -r "$C" "$C.control"
+    python3 - "$C.control" <<'PYEOF'
+import os, re, sys
+q = os.path.join(sys.argv[1], 'system/fvSolution')
+t = open(q).read()
+m = re.search(r'("alpha\.water\.\*"\s*\{)([^}]*)\}', t)
+assert m, 'no alpha.water.* entry'
+body = m.group(2)
+body = re.sub(r'solver\s+\w+;', 'solver          PBiCGStab;', body)
+body = re.sub(r'smoother\s+\w+;', 'preconditioner  DILU;', body)
+t = t[:m.start(2)] + body + t[m.end(2):]
+open(q, 'w').write(t)
+PYEOF
+    grep -q "PBiCGStab" "$C.control/system/fvSolution" || { echo "FAIL: the control case was not rewritten"; return 1; }
+
+    # the `inflow` control reads the STANDARD case's OpenFOAM answer at the same instant
+    local std=""
+    [ "$profile" = inflow ] && std="$W/small/$end"
+    # ...and the `prevcorr` control reads the SAME run without the switch
+    [ "$profile" = prevcorr ] && std="$W/bigstep/$end"
+    # ...and the sub-cycled one reads the un-sub-cycled one: the sub-cycle count has to be live too
+    [ "$profile" = prevcorrsub ] && std="$W/prevcorr/$end"
+    # ...and the three PIMPLE profiles read the big-step run without their setting
+    case "$profile" in nouter|nonorth|mompred|rhophi|vanleerv|linear|compression|alphaminiter) std="$W/bigstep/$end" ;; esac
+    # ...and the gradient profile reads the sheared run it differs from in its gradSchemes alone
+    [ "$profile" = gradLsqLimited ] && std="$W/sheared/$end"
+    # ...and the small-step nHat profile reads the small-step run without its entry
+    [ "$profile" = nHatLimited ] && std="$W/small/$end"
+    "$BIN" "$C" "$C/0" "$C/$end" "$STEPS" "$C/log.interFoam" "$C.control" "$profile" $std
+}
+
+rc=0
+run_at "$DT" small || rc=1
+run_at "$DT_BIG" bigstep || rc=1
+run_at "$DT" inflow "$STEPS_INFLOW" || rc=1
+run_at "$DT_BIG" prevcorr || rc=1
+run_at "$DT_BIG" prevcorrsub || rc=1
+run_at "$DT_OUT" outflow "$STEPS_OUT" || rc=1
+run_at "$DT_BIG" nouter || rc=1
+run_at "$DT_BIG" nonorth || rc=1
+run_at "$DT_BIG" mompred || rc=1
+run_at "$DT_BIG" rhophi || rc=1
+run_at "$DT_BIG" vanleerv || rc=1
+run_at "$DT_BIG" linear || rc=1
+run_at "$DT_BIG" compression || rc=1
+run_at "$DT_BIG" alphaminiter || rc=1
+run_at "$DT_BIG" sheared || rc=1
+run_at "$DT_BIG" gradLsqLimited || rc=1
+run_at "$DT" nHatLimited || rc=1
+exit $rc

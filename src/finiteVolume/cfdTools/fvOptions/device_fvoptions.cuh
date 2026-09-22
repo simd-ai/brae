@@ -9,6 +9,7 @@
 #include "device_boundary.cuh"   // DeviceBoundary, for the limitTemperature boundary clamp
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"      // DeviceMesh -- deviceSetValues walks the ldu addressing
+#include "device_cyclic.cuh"    // DeviceCyclic -- a constrained row loses the pair's coefficient too
 
 namespace brae {
 
@@ -24,16 +25,70 @@ struct DevicePorosity {
     scalar              fa[9] = {0,0,0,0,0,0,0,0,0};   // transformed alpha tensor
     scalar              fb[9] = {0,0,0,0,0,0,0,0,0};   // transformed beta  tensor
     scalar              rhoRef = 1.0;                  // fixedCoeff::correct: read only when the eqn is in force units
+    // THE FULL TENSOR FORM, for a rotated coordinateSystem and for an equation whose mu and rho are
+    // FIELDS. The vector d/f above hold the diagonal of an axis-aligned zone only, and the solvers that
+    // use them refuse a rotated system by name; interFoam cannot, because its one porosity tutorial
+    // (RAS/angledDuct) rotates e1 by 45 degrees, and its mu = rho*nu varies by a factor of 1000 across
+    // the interface. D and F are then the host Option's OWN transformed tensors, row-major, with no
+    // rescaling: the kernel is fvOptions_cpp.cu:502-537 transcribed.
+    bool                tensorForm = false;
+    scalar              dT[9] = {0,0,0,0,0,0,0,0,0};
+    scalar              fT[9] = {0,0,0,0,0,0,0,0,0};
 };
 
 // diag[c] += V*isoCd for the porous cells.  Call once (mDiag) before rAU.
+// muCell/rhoCell: the per-cell mu and rho of the TENSOR form (Cd = mu*D + rho*|U|*F). Null with
+// tensorForm reproduces the kinematic defaults OpenFOAM's incompressible instantiation has, mu = nu and
+// rho = 1 (fvOptions_cpp.cu:520-524).
 void deviceFvoPorosityDiag(const DevicePorosity& por, scalar nu, const DeviceBuffer<scalar>& V,
                            const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
-                           DeviceBuffer<scalar>& diag);
+                           DeviceBuffer<scalar>& diag,
+                           const DeviceBuffer<scalar>* muCell = nullptr,
+                           const DeviceBuffer<scalar>* rhoCell = nullptr);
 // relaxSrc[c] += V*(isoCd - c_comp)*U_comp for the porous cells (= the explicit -V*((Cd-I*isoCd).U)[comp]).
 void deviceFvoPorositySource(const DevicePorosity& por, int comp, scalar nu, const DeviceBuffer<scalar>& V,
                              const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
-                             DeviceBuffer<scalar>& src);
+                             DeviceBuffer<scalar>& src,
+                             const DeviceBuffer<scalar>* muCell = nullptr,
+                             const DeviceBuffer<scalar>* rhoCell = nullptr);
+
+// THE MANGROVE PAIR on the device (src/waveModels/fvOptions), transcribed from the host reference
+// (fvOptions_cpp.cu, which tests/interfoam_mangrove_vs_openfoam.sh holds to OpenFOAM):
+//   multiphaseMangrovesSource            dragCoeff = 0.5*Cd*a*N*|U|, inertiaCoeff = 0.25*(Cm + 1)*pi*a^2*N;
+//                                        addSup(rho, eqn): eqn += -Sp(rho*dragCoeff, U) - rho*inertiaCoeff*ddt(U)
+//   multiphaseMangrovesTurbulenceModel   kCoeff = Ckp*Cd*a*N*|U|, epsilonCoeff = Cep*Cd*a*N*|U|;
+//                                        addSup(eqn): eqn += -Sp(coeff, k or epsilon)
+// What is per CELL and fixed for the run is uploaded once: each coefficient WITHOUT its |U|, in the
+// host's own multiplication order (((0.5*Cd)*a)*N and so on), zero outside every region, a later
+// region overwriting an earlier one on a shared cell as OpenFOAM's loops assign. |U| is the current
+// field's, taken on the device at every assembly.
+struct DeviceMangroves
+{
+    bool                 source = false;       // an active multiphaseMangrovesSource
+    bool                 turbulence = false;   // an active multiphaseMangrovesTurbulenceModel
+    DeviceBuffer<scalar> dragFac;              // 0.5*Cd*a*N
+    DeviceBuffer<scalar> inertia;              // 0.25*(Cm + 1)*pi*a*a*N
+    DeviceBuffer<scalar> kFac;                 // Ckp*Cd*a*N
+    DeviceBuffer<scalar> epsFac;               // Cep*Cd*a*N
+};
+
+// `UEqn == fvOptions(rho, U)` for the source option. The two negations cancel and the momentum matrix
+// takes, per cell (fvOptions_cpp.cu, the same expressions in the same order):
+//     diag   += V*(rho*drag) + (rDeltaT*V)*(rho*inertia)
+//     source += ((rDeltaT*U0)*V)*(rho*inertia)
+// fvm::Sp's V*coeff and EulerDdtScheme::fvmDdt's rDeltaT*V and rDeltaT*U0*V, on a mesh that does not
+// move (the case reader refuses an fvOption beside a moving mesh).
+void deviceMangrovesMomentum(const DeviceMangroves& mg, const DeviceBuffer<scalar>& rho,
+                             const DeviceBuffer<scalar>& V, scalar rDeltaT,
+                             const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+                             const DeviceBuffer<scalar>& U0x, const DeviceBuffer<scalar>& U0y, const DeviceBuffer<scalar>& U0z,
+                             DeviceBuffer<scalar>& diag,
+                             DeviceBuffer<scalar>& srcX, DeviceBuffer<scalar>& srcY, DeviceBuffer<scalar>& srcZ);
+// coeff[c] = fac[c]*|U[c]|: kCoeff or epsilonCoeff from kFac or epsFac, for a closure's
+// `+ fvOptions(k)` / `+ fvOptions(epsilon)`, which then takes diag += V*coeff.
+void deviceMangrovesCoeff(const DeviceBuffer<scalar>& fac,
+                          const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+                          DeviceBuffer<scalar>& coeff);
 
 // limitVelocity: clamp |U| <= max on the given cells (OF fv::limitVelocity::correct, U *= sqrt(max^2/|U|^2) where it
 // exceeds max, preserving direction).
@@ -61,6 +116,10 @@ void deviceFvoVelocityDamping(const DeviceBuffer<label>& cells, scalar UMax, sca
 
 // fvMatrix::setValues, the matrix manipulation OpenFOAM's fvOptions CONSTRAINTS and the turbulence wall
 // functions both end in. Shared: the kEpsilon closure and the energy equation apply the same one.
+// `cyc` is the PAIR whose off-diagonal the constrained rows must lose as well: fvMatrix.C zeroes a
+// coupled patch's coefficients for a constrained cell like any other patch's, and the device's boundary
+// arrays carry no coupled face. Null on a mesh without one, which is why it is defaulted rather than
+// required -- every caller on an uncoupled mesh is unchanged.
 void deviceSetValues(
     const DeviceMesh&           dm,
     const DeviceBuffer<label>&  mask,     // per CELL, non-zero = pinned
@@ -71,6 +130,7 @@ void deviceSetValues(
     DeviceBuffer<scalar>&       source,
     DeviceBuffer<scalar>&       internalCoeffs,
     DeviceBuffer<scalar>&       boundaryCoeffs,
-    DeviceBuffer<scalar>&       psi);
+    DeviceBuffer<scalar>&       psi,
+    DeviceCyclic*               cyc = nullptr);
 
 } // namespace brae

@@ -29,12 +29,14 @@ DeviceSolverPerf deviceJacobiPCG(
     scalar tol,
     scalar relTol,
     int maxIter,
-    int minIter)
+    int minIter,
+    const DeviceDilu* precon,
+    const DevicePreconApply* apply)
 {
     const int nC = A.nCells;
     DeviceBuffer<scalar> wA(nC), rA(nC), pA(nC), Ax(nC);
 
-    deviceAmul(A, psi, Ax);                                  // rA = b - A*psi
+    deviceAmul(A, psi, Ax, /*onField=*/true);                // rA = b - A*psi, the field's own product
     deviceCopy(rA, b);
     deviceAxpy(-1.0, Ax, rA);
 
@@ -52,7 +54,18 @@ DeviceSolverPerf deviceJacobiPCG(
         do
         {
             wArAold = wArA;
-            deviceJacobi(wA, rA, A.diag);                   // wA = M^-1 rA  (Jacobi)
+            if (apply)
+            {
+                (*apply)(wA, rA);                          // wA = M^-1 rA  (the caller's preconditioner)
+            }
+            else if (precon)
+            {
+                diluApply(A, *precon, rA, wA);              // wA = M^-1 rA  (DIC on a symmetric A)
+            }
+            else
+            {
+                deviceJacobi(wA, rA, A.diag);               // wA = M^-1 rA  (Jacobi)
+            }
             wArA = deviceDot(wA, rA);
             if (nIter == 0) deviceCopy(pA, wA);             // pA = wA
             else                                            // pA = wA + beta*pA
@@ -74,6 +87,31 @@ DeviceSolverPerf deviceJacobiPCG(
     return perf;
 }
 
+DeviceSolverPerf deviceDICPCG(
+    const DeviceLduView& A,
+    const DeviceBuffer<scalar>& b,
+    DeviceBuffer<scalar>& psi,
+    scalar normFactor,
+    scalar tol,
+    scalar relTol,
+    int maxIter,
+    int minIter,
+    DeviceDilu& dic)
+{
+    if (!dic.valid || dic.nCells != A.nCells)
+    {
+        throw std::runtime_error(
+            "brae deviceDICPCG: the DIC level schedule was not built for this mesh "
+            "(buildDeviceDilu, once, from the mesh addressing).");
+    }
+    // a symmetric lduMatrix has no lower: everything below reads `upper`, as OpenFOAM's DIC and its
+    // symmetric Amul do
+    DeviceLduView S = A;
+    S.lower = A.upper;
+    diluUpdate(S, dic);
+    return deviceJacobiPCG(S, b, psi, normFactor, tol, relTol, maxIter, minIter, &dic);
+}
+
 void deviceNormFactorInto(
     const DeviceLduView& A,
     const DeviceBuffer<scalar>& psi,
@@ -88,7 +126,10 @@ void deviceNormFactorInto(
     // the host (it scales the residual for the convergence check). Same kernels + same IEEE ops (the divide by nC,
     // the avg-multiply, and the (n1+n2)+1e-20 add are reproduced exactly) -> bit-identical, 3 D2H syncs -> 1.
     DeviceBuffer<scalar> dAvg(1), dN1(1), dN2(1);
-    deviceAmul(A, psi, Apsi);                                // A*psi
+    // A*psi with `onField`: psi IS the solution field, and that is the one product a jump cyclic
+    // subtracts its jump from (jumpCyclicFvPatchField.C:169-177, "only apply jump to original field").
+    // sumA is a ROW SUM -- lduMatrix::sumA, which carries no jump -- so it stays without one.
+    deviceAmul(A, psi, Apsi, /*onField=*/true);              // A*psi
     deviceAmul(A, ones, sumA);                               // sumA = rowSum(A) = A*1
     deviceDotInto(psi, ones, dAvg.data());                  // psi.ones
     deviceScalarDivConst(dAvg.data(), (scalar)nC, dAvg.data());   // avgPsi = gAverage(psi) = (psi.ones)/nC
@@ -236,6 +277,7 @@ struct BiCGGraphCache
     // everything else the captured kernels bake in: the topology, the cell count (which sizes the
     // cache-owned vectors), the DILU factor's buffers and level count, and the reduction scratch epoch
     const void* owner = nullptr;
+    unsigned long long addressingId = 0;      // the owner pointer's content identity (recycled pool blocks)
     int nC = -1, diluLevels = -1, scratchEpoch = -1;
     const void* diluRD = nullptr;
     // ...and, when the preconditioner is an AMG V-cycle, the hierarchy: the captured body references its
@@ -330,7 +372,7 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
     auto converged = [&](scalar fr) { return (fr < tol) || (relTol > 0.0 && fr < relTol * perf.initialResidual); };
 
     // ---- the prologue: rA = b - A psi, the initial residual (sync 1 of 4) -----------------------------
-    deviceAmul(sA, psi, c.Ax);
+    deviceAmul(sA, psi, c.Ax, /*onField=*/true);
     deviceCopy(c.rA, rhs);
     deviceAxpy(-1.0, c.Ax, c.rA);
     deviceCopy(c.rA0, c.rA);
@@ -410,7 +452,8 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
                         || c.direct != stable
                         || (stable && (c.capSrc[0] != src[0] || c.capSrc[1] != src[1]
                                     || c.capSrc[2] != src[2] || c.capSrc[3] != src[3]))
-                        || c.owner != (const void*)A.owner || c.nC != nC || c.diluRD != diluRD || c.diluLevels != diluLv
+                        || c.owner != (const void*)A.owner || c.nC != nC || c.addressingId != A.addressingId
+                        || c.diluRD != diluRD || c.diluLevels != diluLv
                         || c.scratchEpoch != epoch || c.amg != (const void*)amg || c.amgCoarseDiag != amgCD
                         || c.generation != deviceGraphGeneration();
     if (recapture)
@@ -484,7 +527,7 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
         c.key = psi.data(); c.tol = tol; c.relTol = relTol; c.maxIter = maxIter; c.minIter = minIter;
         c.precon = useDilu ? (const void*)precon : nullptr;
         c.polyDeg = polyDeg;
-        c.owner = A.owner; c.nC = nC; c.diluRD = diluRD; c.diluLevels = diluLv; c.scratchEpoch = epoch; c.generation = deviceGraphGeneration();
+        c.owner = A.owner; c.nC = nC; c.addressingId = A.addressingId; c.diluRD = diluRD; c.diluLevels = diluLv; c.scratchEpoch = epoch; c.generation = deviceGraphGeneration();
         c.amg = amg; c.amgCoarseDiag = amgCD;
     }
     static bool announced = false;
@@ -575,7 +618,7 @@ DeviceSolverPerf deviceJacobiBiCGStab(
     const int K = (checkEvery > 1) ? checkEvery : 1;             // convergence-read cadence (1 = exact per-iter)
     DeviceBuffer<scalar> rA(nC), rA0(nC), pA(nC), yA(nC), AyA(nC), sA(nC), zA(nC), tA(nC), Ax(nC);
 
-    deviceAmul(A, psi, Ax);                                  // rA = b - A*psi
+    deviceAmul(A, psi, Ax, /*onField=*/true);                // rA = b - A*psi, the field's own product
     deviceCopy(rA, b);
     deviceAxpy(-1.0, Ax, rA);
     deviceCopy(rA0, rA);

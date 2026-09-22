@@ -106,6 +106,14 @@ inline void applyACMIAreaScaling(
         // scale of 0 leaves tol (not 0) coupled and 1 - tol blocked -- the interface closes but the
         // patch never becomes degenerate.
         const PatchInfo& pinfo = m.patches()[ai.patch];
+        // a per-face coded scale is evaluated by the interFoam host loop only (cyclic_acmi_cpp); here
+        // an empty acmiScale would read as "no scale" and the interface would run fully open
+        if (pinfo.acmiScaleCoded)
+            throw std::runtime_error(
+                "brae: cyclicACMI '" + cpl.name + "' has `scale { type coded; }`, a per-face PatchFunction1. "
+                "This solver path evaluates a scale that is one number per time step (`constant`, "
+                "`table`); the coded one is carried by interFoam's host loop only. Refused rather than "
+                "run with the interface fully open.");
         const scalar sc = pinfo.acmiScale.empty() ? scalar(1) : pinfo.acmiScale.value(t);
 
         for (label i = 0; i < cpl.size; ++i)
@@ -204,7 +212,7 @@ inline void rebuildGeometryWithACMI(
 inline bool hasACMITimeScale(const PrimitiveMesh& m)
 {
     for (const PatchInfo& p : m.patches())
-        if (p.type == "cyclicACMI" && !p.acmiScale.empty()) return true;
+        if (p.type == "cyclicACMI" && (!p.acmiScale.empty() || p.acmiScaleCoded)) return true;
     return false;
 }
 

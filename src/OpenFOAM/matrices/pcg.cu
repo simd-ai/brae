@@ -11,7 +11,8 @@ SolverPerformance pcg(
     scalar tolerance,
     scalar relTol,
     int maxIter,
-    int minIter)
+    int minIter,
+    const CoupledJumps* jumps)
 {
     const label nC  = m.nCells();
     const label nIf = m.nInternalFaces();
@@ -28,10 +29,14 @@ SolverPerformance pcg(
         {
             const label c = patches[pi].faceCells[i];
             diagC[c] += M.internalCoeffs[pi][i];
-            b[c]     += M.boundaryCoeffs[pi][i];
+            // a coupled patch's boundaryCoeffs are interface coefficients, not a source
+            if (!patches[pi].coupled)
+            {
+                b[c] += M.boundaryCoeffs[pi][i];
+            }
         }
 
-    auto Amul = [&](const std::vector<scalar>& x, std::vector<scalar>& Ax)
+    auto Amul = [&](const std::vector<scalar>& x, std::vector<scalar>& Ax, bool isField)
     {
         for (label c = 0; c < nC; ++c)
             Ax[c] = diagC[c] * x[c];
@@ -40,6 +45,7 @@ SolverPerformance pcg(
             Ax[nei[f]] += lower[f] * x[own[f]];
             Ax[own[f]] += upper[f] * x[nei[f]];
         }
+        updateCoupledInterfaces(M, patches, x, Ax, scalar(-1), isField, jumps);
     };
     auto sumMag = [&](const std::vector<scalar>& x)
     {
@@ -56,7 +62,7 @@ SolverPerformance pcg(
 
     std::vector<scalar> pA(nC, 0.0), wA(nC, 0.0), rA(nC);
 
-    Amul(psi, wA);
+    Amul(psi, wA, true);
     for (label c = 0; c < nC; ++c) rA[c] = b[c] - wA[c];
 
     // normFactor = sum(|A.psi - sumA*xRef| + |b - sumA*xRef|) + small
@@ -66,6 +72,18 @@ SolverPerformance pcg(
     {
         sumA[nei[f]] += lower[f];
         sumA[own[f]] += upper[f];
+    }
+    // lduMatrix::sumA: sumA[faceCell] -= interfaceBouCoeffs
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (!patches[pi].coupled)
+        {
+            continue;
+        }
+        for (label i = 0; i < patches[pi].size; ++i)
+        {
+            sumA[patches[pi].faceCells[i]] -= M.boundaryCoeffs[pi][i];
+        }
     }
     scalar xRef = 0.0;
     for (label c = 0; c < nC; ++c) xRef += psi[c];
@@ -113,7 +131,7 @@ SolverPerformance pcg(
                 for (label c = 0; c < nC; ++c) pA[c] = wA[c] + beta * pA[c];
             }
 
-            Amul(pA, wA);
+            Amul(pA, wA, false);
             const scalar wApA  = sumProd(wA, pA);
             const scalar alpha = wArA / wApA;
             for (label c = 0; c < nC; ++c)

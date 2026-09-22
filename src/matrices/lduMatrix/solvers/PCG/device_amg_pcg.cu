@@ -186,7 +186,8 @@ static DeviceSolverPerf deviceAMGPCGGraph(
     const int epoch = deviceReductionScratchEpoch();
     if (!c.exec || c.key != psi.data() || c.keyTol != tol || c.keyRelTol != relTol || c.keyMaxIter != maxIter
         || c.keyMinIter != minIter || c.keyEpoch != epoch
-        || c.keyOwner != (const void*)A.owner || c.keyNC != nC || c.keyNF != nF)
+        || c.keyOwner != (const void*)A.owner || c.keyNC != nC || c.keyNF != nF
+        || c.keyAddressingId != A.addressingId)
     {
         // PRE-SIZE everything the capture will touch (the V-cycle scratch, pA/Ax, the reduction
         // partials): a capture must allocate nothing. ON THE CAPTURE ONLY -- doing it per solve, as the
@@ -260,6 +261,7 @@ static DeviceSolverPerf deviceAMGPCGGraph(
         c.keyMinIter = minIter;
         c.keyEpoch = epoch;
         c.keyOwner = A.owner;
+        c.keyAddressingId = A.addressingId;
         c.keyNC = nC;
         c.keyNF = nF;
     }

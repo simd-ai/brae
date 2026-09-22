@@ -20,6 +20,7 @@ cd yourCase && brae
 
 Your existing OpenFOAM case. Standard OpenFOAM output. No `decomposePar`, no OpenFOAM install required.
 
+
 ---
 
 ## ⚡ Speed

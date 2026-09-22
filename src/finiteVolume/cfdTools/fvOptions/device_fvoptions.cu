@@ -2,6 +2,7 @@
 // (incompressible: mu=nu, rho=1), implicit isotropic resistance into the diagonal + explicit anisotropic remainder.
 #include "device_fvoptions.cuh"
 #include <cuda_runtime.h>
+#include <stdexcept>
 
 namespace brae {
 namespace {
@@ -71,6 +72,31 @@ __global__ void svZeroFaceKernel(
     {
         upper[f] = scalar(0.0);
         lower[f] = scalar(0.0);
+    }
+}
+
+
+// ...and so does a face on a COUPLED patch, which the boundary arrays above do not carry.
+// fvMatrix::setValuesFromList walks every face of a constrained cell and zeroes internalCoeffs AND
+// boundaryCoeffs on the patch owning it (fvMatrix.C), with no exemption for a cyclic. Only the
+// off-diagonal is zeroed here: brae folds the pair's diagonal half straight into M.diag and then sets
+// source = value*diag from that same diag, so the diagonal halves cancel and the row reads
+// diag*psi = value*diag either way -- what must go is the term that still injects psi[nbr].
+// MEASURED on damBreakPorousBaffle at step one, every solve pinned at 1e-16: the two cells touching
+// BOTH the baffle pair and lowerWall read epsilon 2.0234 against the host's 1.9862 while every
+// pair-only cell agreed to 1e-12, and the device gave those two cells DIFFERENT values where the wall
+// function gives one.
+__global__ void svCyclicKernel(
+    int           n,
+    const label*  ownCell,
+    const label*  mask,
+    scalar*       ifCoeff)
+{
+    const int j = blockIdx.x*blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    if (mask[ownCell[j]])
+    {
+        ifCoeff[j] = scalar(0.0);
     }
 }
 
@@ -251,7 +277,179 @@ void porSrcKernel(
     const scalar Uc    = ((comp==0)?Ux:(comp==1)?Uy:Uz)[c];
     src[c] += V[c]*(iso - ccomp)*Uc;                                   // -= V*((Cd-I*iso).U)[comp]
 }
+// THE FULL TENSOR FORM, transcribed from the host's own loop (fvOptions_cpp.cu:502-537): Cd = mu*D +
+// (rho*|U|)*F per component, the isotropic trace into the diagonal and the off-isotropic remainder into
+// the source, with mu and rho read per cell where the caller has them.
+__device__ inline void cdTensor(
+    const scalar* __restrict__ dT,
+    const scalar* __restrict__ fT,
+    scalar muc,
+    scalar rhoc,
+    scalar magU,
+    scalar* cd)
+{
+    for (int k = 0; k < 9; ++k) cd[k] = muc * dT[k] + rhoc * magU * fT[k];
+}
+
+__global__
+void porTensorDiagKernel(
+    int n,
+    const label* __restrict__ cells,
+    const scalar* __restrict__ dT,
+    const scalar* __restrict__ fT,
+    scalar nu,
+    const scalar* __restrict__ muCell,
+    const scalar* __restrict__ rhoCell,
+    const scalar* __restrict__ V,
+    const scalar* __restrict__ Ux,
+    const scalar* __restrict__ Uy,
+    const scalar* __restrict__ Uz,
+    scalar* __restrict__ diag)
+{
+    const int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i >= n) return;
+    const int c = cells[i];
+    const scalar magU = sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);
+    scalar cd[9];
+    cdTensor(dT, fT, muCell ? muCell[c] : nu, rhoCell ? rhoCell[c] : scalar(1), magU, cd);
+    diag[c] += V[c]*(cd[0] + cd[4] + cd[8]);
+}
+
+__global__
+void porTensorSrcKernel(
+    int n,
+    const label* __restrict__ cells,
+    int comp,
+    const scalar* __restrict__ dT,
+    const scalar* __restrict__ fT,
+    scalar nu,
+    const scalar* __restrict__ muCell,
+    const scalar* __restrict__ rhoCell,
+    const scalar* __restrict__ V,
+    const scalar* __restrict__ Ux,
+    const scalar* __restrict__ Uy,
+    const scalar* __restrict__ Uz,
+    scalar* __restrict__ src)
+{
+    const int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i >= n) return;
+    const int c = cells[i];
+    const scalar magU = sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);
+    scalar cd[9];
+    cdTensor(dT, fT, muCell ? muCell[c] : nu, rhoCell ? rhoCell[c] : scalar(1), magU, cd);
+    const scalar iso = cd[0] + cd[4] + cd[8];
+    scalar a[9];
+    for (int k = 0; k < 9; ++k) a[k] = cd[k];
+    a[0] -= iso; a[4] -= iso; a[8] -= iso;
+    const int r = 3*comp;
+    // the host writes `source -= V*(a & u)`; this buffer is the NEGATED source the caller adds, as the
+    // diagonal form above has it (src[c] += V*(iso - ccomp)*Uc is the same sign convention)
+    src[c] -= V[c]*(a[r]*Ux[c] + a[r+1]*Uy[c] + a[r+2]*Uz[c]);
+}
+
 } // namespace
+
+
+namespace {
+
+__global__ void mangrovesMomentumKernel(
+    int nC,
+    const scalar* dragFac,
+    const scalar* inertia,
+    const scalar* rho,
+    const scalar* V,
+    scalar rDeltaT,
+    const scalar* Ux,
+    const scalar* Uy,
+    const scalar* Uz,
+    const scalar* U0x,
+    const scalar* U0y,
+    const scalar* U0z,
+    scalar* diag,
+    scalar* sx,
+    scalar* sy,
+    scalar* sz)
+{
+    const int c = blockDim.x*blockIdx.x + threadIdx.x;
+    if (c >= nC) return;
+    // the host's expressions, term for term (fvOptions_cpp.cu): drag and inertia are zero outside
+    // the regions, where every line below adds zero
+    const scalar drag = dragFac[c]*sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);
+    const scalar rd = rho[c]*drag;
+    const scalar ri = rho[c]*inertia[c];
+    diag[c] += V[c]*rd + (rDeltaT*V[c])*ri;
+    sx[c] += ((rDeltaT*U0x[c])*V[c])*ri;
+    sy[c] += ((rDeltaT*U0y[c])*V[c])*ri;
+    sz[c] += ((rDeltaT*U0z[c])*V[c])*ri;
+}
+
+__global__ void mangrovesCoeffKernel(
+    int nC,
+    const scalar* fac,
+    const scalar* Ux,
+    const scalar* Uy,
+    const scalar* Uz,
+    scalar* coeff)
+{
+    const int c = blockDim.x*blockIdx.x + threadIdx.x;
+    if (c >= nC) return;
+    coeff[c] = fac[c]*sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);
+}
+
+} // namespace
+
+
+void deviceMangrovesMomentum(
+    const DeviceMangroves& mg,
+    const DeviceBuffer<scalar>& rho,
+    const DeviceBuffer<scalar>& V,
+    scalar rDeltaT,
+    const DeviceBuffer<scalar>& Ux,
+    const DeviceBuffer<scalar>& Uy,
+    const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>& U0x,
+    const DeviceBuffer<scalar>& U0y,
+    const DeviceBuffer<scalar>& U0z,
+    DeviceBuffer<scalar>& diag,
+    DeviceBuffer<scalar>& srcX,
+    DeviceBuffer<scalar>& srcY,
+    DeviceBuffer<scalar>& srcZ)
+{
+    const int nC = static_cast<int>(diag.size());
+    if (!mg.source || nC == 0) return;
+    const std::size_t n = static_cast<std::size_t>(nC);
+    if (mg.dragFac.size() != n || mg.inertia.size() != n || rho.size() != n || V.size() != n
+     || Ux.size() != n || U0x.size() != n || U0y.size() != n || U0z.size() != n || srcX.size() != n)
+    {
+        throw std::runtime_error(
+            "brae deviceMangrovesMomentum: the coefficients, rho, V, U, U.oldTime() and the matrix must "
+            "all be one value per cell.");
+    }
+    mangrovesMomentumKernel<<<nBlocks(nC), TPB>>>(nC, mg.dragFac.data(), mg.inertia.data(), rho.data(),
+                                                  V.data(), rDeltaT, Ux.data(), Uy.data(), Uz.data(),
+                                                  U0x.data(), U0y.data(), U0z.data(), diag.data(),
+                                                  srcX.data(), srcY.data(), srcZ.data());
+    cudaCheck(cudaGetLastError(), "mangrovesMomentum");
+}
+
+
+void deviceMangrovesCoeff(
+    const DeviceBuffer<scalar>& fac,
+    const DeviceBuffer<scalar>& Ux,
+    const DeviceBuffer<scalar>& Uy,
+    const DeviceBuffer<scalar>& Uz,
+    DeviceBuffer<scalar>& coeff)
+{
+    const int nC = static_cast<int>(fac.size());
+    coeff.resize(fac.size());
+    if (nC == 0) return;
+    if (Ux.size() != fac.size() || Uy.size() != fac.size() || Uz.size() != fac.size())
+    {
+        throw std::runtime_error("brae deviceMangrovesCoeff: U must be one value per cell, as the coefficient is.");
+    }
+    mangrovesCoeffKernel<<<nBlocks(nC), TPB>>>(nC, fac.data(), Ux.data(), Uy.data(), Uz.data(), coeff.data());
+    cudaCheck(cudaGetLastError(), "mangrovesCoeff");
+}
 
 
 void deviceFvoPorosityDiag(
@@ -261,10 +459,24 @@ void deviceFvoPorosityDiag(
     const DeviceBuffer<scalar>& Ux,
     const DeviceBuffer<scalar>& Uy,
     const DeviceBuffer<scalar>& Uz,
-    DeviceBuffer<scalar>& diag)
+    DeviceBuffer<scalar>& diag,
+    const DeviceBuffer<scalar>* muCell,
+    const DeviceBuffer<scalar>* rhoCell)
 {
     const int n = static_cast<int>(por.cells.size());
     if (!por.active || !n) return;
+    if (por.tensorForm)
+    {
+        DeviceBuffer<scalar> dT, fT;
+        dT.copyFrom(std::vector<scalar>(por.dT, por.dT+9));
+        fT.copyFrom(std::vector<scalar>(por.fT, por.fT+9));
+        porTensorDiagKernel<<<nBlocks(n), TPB>>>(n, por.cells.data(), dT.data(), fT.data(), nu,
+                                                 muCell ? muCell->data() : nullptr,
+                                                 rhoCell ? rhoCell->data() : nullptr,
+                                                 V.data(), Ux.data(), Uy.data(), Uz.data(), diag.data());
+        cudaCheck(cudaGetLastError(), "porosityTensorDiag");
+        return;
+    }
     if (por.fixed)
     {
         DeviceBuffer<scalar> a, b; a.copyFrom(std::vector<scalar>(por.fa, por.fa+9)); b.copyFrom(std::vector<scalar>(por.fb, por.fb+9));
@@ -287,10 +499,24 @@ void deviceFvoPorositySource(
     const DeviceBuffer<scalar>& Ux,
     const DeviceBuffer<scalar>& Uy,
     const DeviceBuffer<scalar>& Uz,
-    DeviceBuffer<scalar>& src)
+    DeviceBuffer<scalar>& src,
+    const DeviceBuffer<scalar>* muCell,
+    const DeviceBuffer<scalar>* rhoCell)
 {
     const int n = static_cast<int>(por.cells.size());
     if (!por.active || !n) return;
+    if (por.tensorForm)
+    {
+        DeviceBuffer<scalar> dT, fT;
+        dT.copyFrom(std::vector<scalar>(por.dT, por.dT+9));
+        fT.copyFrom(std::vector<scalar>(por.fT, por.fT+9));
+        porTensorSrcKernel<<<nBlocks(n), TPB>>>(n, por.cells.data(), comp, dT.data(), fT.data(), nu,
+                                                muCell ? muCell->data() : nullptr,
+                                                rhoCell ? rhoCell->data() : nullptr,
+                                                V.data(), Ux.data(), Uy.data(), Uz.data(), src.data());
+        cudaCheck(cudaGetLastError(), "porosityTensorSource");
+        return;
+    }
     if (por.fixed)
     {
         DeviceBuffer<scalar> a, b; a.copyFrom(std::vector<scalar>(por.fa, por.fa+9)); b.copyFrom(std::vector<scalar>(por.fb, por.fb+9));
@@ -448,7 +674,8 @@ void deviceSetValues(
     DeviceBuffer<scalar>&       source,
     DeviceBuffer<scalar>&       internalCoeffs,
     DeviceBuffer<scalar>&       boundaryCoeffs,
-    DeviceBuffer<scalar>&       psi)
+    DeviceBuffer<scalar>&       psi,
+    DeviceCyclic*               cyc)
 {
     const int nC  = dm.nCells;
     const int nIf = dm.nInternalFaces;
@@ -470,6 +697,12 @@ void deviceSetValues(
         svBndKernel<<<nBlocks(nB), TPB>>>(nB, dm.bndCell.data(), mask.data(),
                                           internalCoeffs.data(), boundaryCoeffs.data());
         cudaCheck(cudaGetLastError(), "fvOptions setValues zero boundary");
+    }
+    if (cyc && cyc->n > 0 && cyc->ifCoeff.size() == static_cast<std::size_t>(cyc->n))
+    {
+        svCyclicKernel<<<nBlocks(cyc->n), TPB>>>(cyc->n, cyc->ownCell.data(), mask.data(),
+                                                 cyc->ifCoeff.data());
+        cudaCheck(cudaGetLastError(), "fvOptions setValues zero the pair");
     }
     svCellKernel<<<nBlocks(nC), TPB>>>(nC, mask.data(), value.data(), diag.data(), psi.data(),
                                        source.data());

@@ -13,6 +13,7 @@ SolverPerformance pbicgstab(
     int maxIter,
     int minIter)
 {
+    refuseCoupledPatches(patches, "PBiCGStab");
     const label nC  = m.nCells();
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();

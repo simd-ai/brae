@@ -52,6 +52,7 @@
 #include "fvm.cuh"
 #include "fvc.cuh"
 #include "fv_matrix_ops.cuh"
+#include "smooth_solver_cpp.cuh"   // LinearSolverChoice, SolverPerformance
 #include <vector>
 
 namespace brae {
@@ -151,6 +152,11 @@ void correctNutField(
 struct SSTResiduals
 {
     scalar omega = 0, k = 0;
+    // The two solves WHOLE -- initial residual, final residual, iteration count -- which is what
+    // OpenFOAM's log prints per solve and so what a solver-log gate compares. `omega` and `k` above are
+    // the initial residuals alone and predate these.
+    SolverPerformance omegaPerf;
+    SolverPerformance kPerf;
 
     // OPT-IN diagnostics, compared against tools/dumpKOmegaSST's stage_sst* writes. The solver asks for
     // the residuals every outer iteration and would otherwise pay to copy every intermediate with them.
@@ -187,6 +193,18 @@ struct Compressible
     // the field at entry. The same term the kEpsilon port carries (kEpsilon_cpp.cuh Compressible).
     scalar                                  rDeltaT  = 0.0;
     const std::vector<scalar>*              rhoOld   = nullptr;
+    // THE FLUX nut's flux-conditional patches read (inletOutlet's phiName, `phi` by default). After the
+    // field assignment OpenFOAM's nut.correctBoundaryConditions() evaluates such a patch: valueFraction =
+    // neg(phi), then the mixed blend of the inletValue and the new cell nut. Null refuses a case that has
+    // one rather than leave it stale.
+    const SurfaceScalarField*               nutPhi   = nullptr;
+    // A MOVING MESH (EulerDdtScheme::fvmDdt under mesh().moving()): the ddt source takes the old volumes,
+    // rDeltaT*psi.oldTime()*V0, where the diagonal keeps V; and divU is the divergence of the ABSOLUTE
+    // flux, fvc::div(fvc::absolute(this->phi(), U)) = div(phi + mesh.phi()) (kOmegaSSTBase.C:517-520),
+    // while fvm::div and `bounded` keep the relative phi. Null on a static mesh. kEpsilon's are the same
+    // (kEpsilon_cpp.cuh Compressible).
+    const std::vector<scalar>*              V0       = nullptr;
+    const SurfaceScalarField*               meshPhi  = nullptr;
 };
 
 // kOmegaSSTLM's three virtual overrides of this model, supplied by the DERIVED model rather than
@@ -258,7 +276,12 @@ void correct(
     // 1.0 still applies the dominance clamp. Defaulted true so every positional caller keeps its
     // arithmetic; the compressible driver passes what the case says. Same shape as kEpsilon_cpp.
     bool                           relaxEquationOmega = true,
-    bool                           relaxEquationK = true);
+    bool                           relaxEquationK = true,
+    // THE CASE'S LINEAR SOLVER for both equations, as kEpsilon_cpp takes it. Null keeps PBiCGStab,
+    // which every caller before interFoam ran; interFoam's waterChannel names `smoothSolver;
+    // symGaussSeidel;` for k and omega, and a substituted solver at the same tolerance stops somewhere
+    // else. Last, so no positional caller moves.
+    const LinearSolverChoice*      which = nullptr);
 
 } // namespace kOmegaSST
 } // namespace cpu

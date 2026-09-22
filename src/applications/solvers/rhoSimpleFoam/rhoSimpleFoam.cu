@@ -39,6 +39,7 @@ DeviceLduView foldedView(const DeviceMesh& dm, const PressureMatrix& P, const De
     A.ownerStart = dm.ownerStart.data();
     A.losort = dm.losort.data();
     A.losortStart = dm.losortStart.data();
+    A.addressingId = dm.addressingId;
     return A;
 }
 
@@ -55,6 +56,7 @@ DeviceLduView foldedViewM(const DeviceMesh& dm, const MomentumMatrix& M, const D
     A.ownerStart = dm.ownerStart.data();
     A.losort = dm.losort.data();
     A.losortStart = dm.losortStart.data();
+    A.addressingId = dm.addressingId;
     return A;
 }
 

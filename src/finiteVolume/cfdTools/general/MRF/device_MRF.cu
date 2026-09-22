@@ -60,6 +60,16 @@ void mrfBoundaryKernel(
     else             phi[f] -= ff[f];
 }
 
+__global__
+void mrfZeroKernel(
+    int n,
+    const label* __restrict__ mask,
+    scalar* __restrict__ phi)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f < n && mask[f]) phi[f] = scalar(0);
+}
+
 } // namespace
 
 DeviceMRFZone buildDeviceMRFZone(
@@ -81,15 +91,18 @@ DeviceMRFZone buildDeviceMRFZone(
     d.zoneCell.copyFrom(zc);
 
     std::vector<scalar> ffi(nIf, 0.0);
+    std::vector<label>  fli(nIf, 0);
     for (label f : z.internalFaces)
     {
         ffi[f] = dot(cross(z.Omega, g.Cf()[f] - z.origin), g.Sf()[f]);
+        fli[f] = 1;
     }
     d.frameFluxInt.copyFrom(ffi);
 
     // The boundary arrays are flat over ALL patch faces, in patch order, matching the driver's phiBnd.
     std::vector<scalar> ffb;
     std::vector<label>  zb;
+    std::vector<label>  flb;
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         std::vector<char> included(patches[pi].size, 0), excluded(patches[pi].size, 0);
@@ -106,10 +119,13 @@ DeviceMRFZone buildDeviceMRFZone(
             const label f = patches[pi].start + i;
             ffb.push_back(excluded[i] ? dot(cross(z.Omega, g.Cf()[f] - z.origin), g.Sf()[f]) : 0.0);
             zb.push_back(included[i] ? 1 : 0);
+            flb.push_back((included[i] || excluded[i]) ? 1 : 0);
         }
     }
     d.frameFluxBnd.copyFrom(ffb);
     d.zeroBnd.copyFrom(zb);
+    d.filterInt.copyFrom(fli);
+    d.filterBnd.copyFrom(flb);
     return d;
 }
 
@@ -132,6 +148,21 @@ void deviceMrfCoriolisZone(
                                                z.Omega.x, z.Omega.y, z.Omega.z, cmpt, src.data());
     }
     cudaCheck(cudaGetLastError(), "mrfCoriolisZone");
+}
+
+void deviceMrfZeroFilter(
+    const std::vector<DeviceMRFZone>& zones,
+    DeviceBuffer<scalar>&             phiInt,
+    DeviceBuffer<scalar>&             phiBnd)
+{
+    for (const DeviceMRFZone& z : zones)
+    {
+        if (!z.active) continue;
+        const int nIf = static_cast<int>(z.filterInt.size());
+        const int nBf = static_cast<int>(z.filterBnd.size());
+        if (nIf) mrfZeroKernel<<<nBlocks(nIf), TPB>>>(nIf, z.filterInt.data(), phiInt.data());
+        if (nBf) mrfZeroKernel<<<nBlocks(nBf), TPB>>>(nBf, z.filterBnd.data(), phiBnd.data());
+    }
 }
 
 void deviceMrfMakeRelative(

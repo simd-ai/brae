@@ -18,6 +18,11 @@ SurfaceScalarField effectiveFaceViscosity(
     SurfaceScalarField gf = fvc::interpolate(nuEff, m, g, patches);
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
+        if (patches[pi].coupled)
+        {
+            // a coupled face keeps fvc::interpolate's value, from the two cells
+            continue;
+        }
         if (pi < nuEffBnd.size() && nuEffBnd[pi].size() == gf.boundary[pi].size())
         {
             gf.boundary[pi] = nuEffBnd[pi];

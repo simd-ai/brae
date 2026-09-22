@@ -25,7 +25,8 @@ void FvGeometry::makeFaceCentresAndAreas(const PrimitiveMesh& m)
             const vector& a = P[m.faceVert(f, 0)];
             const vector& b = P[m.faceVert(f, 1)];
             const vector& c = P[m.faceVert(f, 2)];
-            Cf_[f] = (a + b + c) / 3.0;
+            // triangle::centre and areaNormal (triangleI.H:150-190): (1/3)*(sum), not sum/3
+            Cf_[f] = (1.0 / 3.0) * (a + b + c);
             Sf_[f] = 0.5 * cross(b - a, c - a);
         }
         else
@@ -57,7 +58,11 @@ void FvGeometry::makeFaceCentresAndAreas(const PrimitiveMesh& m)
             }
             else
             {
-                Cf_[f] = (1.0 / 3.0) * (sumAc / sumA);
+                // primitiveMeshTools.C: (1.0/3.0)*sumAc/sumA, the scaling BEFORE the division. This
+                // was (1/3)*(sumAc/sumA), which differs in the last bit -- enough to move a cell centre
+                // by 1e-16 and, on sloshingTank2D, to pin p_rgh's reference in the cell OpenFOAM did
+                // not: pRefPoint (0 0 0.15) lies on a face, and findCell takes the nearer centre.
+                Cf_[f] = ((1.0 / 3.0) * sumAc) / sumA;
                 Sf_[f] = 0.5 * sumN;
             }
         }
@@ -180,6 +185,17 @@ void FvGeometry::applyAreaScaling(const std::vector<std::pair<label, scalar>>& f
         magSf_[fs.first] = magSf_[fs.first]*fs.second;
     }
     areaScaled_ = true;
+}
+
+void FvGeometry::setFaceArea(label f, const vector& Sf)
+{
+    Sf_[f] = Sf;
+    magSf_[f] = mag(Sf);
+}
+
+void FvGeometry::updateCellCentresAndVols(const PrimitiveMesh& m)
+{
+    makeCellCentresAndVols(m);
 }
 
 void FvGeometry::build(const PrimitiveMesh& m)

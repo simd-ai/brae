@@ -1,0 +1,17 @@
+FoamFile { version 2.0; format ascii; class dictionary; object blockMeshDict; }
+// A PARALLELOGRAM channel: the top edge is shifted by 0.4 in x, so the periodic left/right faces are
+// TILTED with respect to the x-axis while still matching each other by the pure translation (1 0 0).
+// That makes the pair NON-ORTHOGONAL -- the face normal is not parallel to the owner-to-neighbour
+// delta -- so nonOrthDeltaCoeffs differs from deltaCoeffs on it and a `corrected` laplacian is a
+// different matrix from an orthogonal one. cyclicChannel, whose pair is axis-aligned, cannot tell them
+// apart: see tests/test_device_cyclic_laplacian_vs_host.cu.
+scale 1;
+vertices ( (0 0 0)(1 0 0)(1.4 1 0)(0.4 1 0) (0 0 0.1)(1 0 0.1)(1.4 1 0.1)(0.4 1 0.1) );
+blocks ( hex (0 1 2 3 4 5 6 7) (10 10 1) simpleGrading (1 1 1) );
+edges ();
+boundary (
+    left  { type cyclic; neighbourPatch right; faces ( (0 4 7 3) ); }
+    right { type cyclic; neighbourPatch left;  faces ( (1 2 6 5) ); }
+    walls { type wall;  faces ( (0 1 5 4) (3 7 6 2) ); }
+    frontAndBack { type empty; faces ( (0 3 2 1) (4 5 6 7) ); }
+);

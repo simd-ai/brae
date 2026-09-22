@@ -31,6 +31,14 @@ struct DeviceLduView
     const label* cycOwn = nullptr;
     const label* cycNbr = nullptr;
     const scalar* cycCoeff = nullptr;
+    // A JUMP ACROSS THE PAIR (fixedJump, porousBafflePressure), ALREADY SIGNED: the owner side holds the
+    // file's value and the other side its negative, as fixedJumpFvPatchField::jump() gives them. The
+    // neighbour value a jump cyclic hands the matrix is psi[nbr] - jump (jumpCyclicFvPatchField.C:94-125)
+    // and it is applied ONLY when the operand is the SOLUTION FIELD -- "only apply jump to original
+    // field", which in a Krylov solve is the one Amul that builds the initial residual and the
+    // normalisation, never the search directions. deviceAmul's `onField` says which call this is.
+    // Null = no jump on this pair.
+    const scalar* cycJump = nullptr;
     // optional cyclicAMI interface, OF cyclicAMIFvPatchField::updateInterfaceMatrix. Applied in deviceAmul as
     // Apsi[amiOwn[i]] += amiIfc[i] * sum_{k in [amiOff[i],amiOff[i+1])} amiW[k]*psi[amiNbr[k]] (weighted stencil).
     int nAmi = 0;
@@ -39,6 +47,11 @@ struct DeviceLduView
     const label* amiNbr = nullptr;
     const scalar* amiW = nullptr;
     const scalar* amiIfc = nullptr;
+    // The identity of owner/nei's CONTENT, from nextDeviceAddressingId (device_mesh.cuh): what the
+    // topology caches (Gauss-Seidel levels, colouring, captured graphs) compare, since the pointer alone
+    // is recycled by the pool. Trailing so the brace initialisers above stay valid; 0 = not stamped,
+    // which every cache treats as "match on the pointer and the sizes alone", as they always did.
+    unsigned long long addressingId = 0;
 };
 
 struct DeviceLduMatrix
@@ -47,11 +60,14 @@ struct DeviceLduMatrix
     DeviceBuffer<scalar> diag, upper, lower;
     DeviceBuffer<label>  owner, nei;
     DeviceBuffer<label>  ownerStart, losort, losortStart;
+    unsigned long long addressingId = 0;                // stamped by buildDeviceLdu
 
     DeviceLduView view() const
     {
-        return {nCells, nFaces, diag.data(), upper.data(), lower.data(), owner.data(), nei.data(),
-                ownerStart.data(), losort.data(), losortStart.data()};
+        DeviceLduView v{nCells, nFaces, diag.data(), upper.data(), lower.data(), owner.data(), nei.data(),
+                        ownerStart.data(), losort.data(), losortStart.data()};
+        v.addressingId = addressingId;
+        return v;
     }
 };
 
@@ -85,6 +101,7 @@ inline DeviceLduMatrix buildDeviceLdu(
     DeviceLduMatrix A;
     A.nCells = nCells;
     A.nFaces = nF;
+    A.addressingId = nextDeviceAddressingId();
     A.diag.copyFrom(diag);
     A.upper.copyFrom(upper);
     A.lower.copyFrom(lower);
@@ -103,8 +120,11 @@ inline DeviceLduView deviceLduView(
     const DeviceBuffer<scalar>& upper,
     const DeviceBuffer<scalar>& lower)
 {
-    return {dm.nCells, dm.nInternalFaces, diag.data(), upper.data(), lower.data(), dm.owner.data(), dm.nei.data(),
-            dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), 0, nullptr, nullptr, nullptr};
+    DeviceLduView v{dm.nCells, dm.nInternalFaces, diag.data(), upper.data(), lower.data(), dm.owner.data(),
+                    dm.nei.data(), dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
+                    0, nullptr, nullptr, nullptr};
+    v.addressingId = dm.addressingId;
+    return v;
 }
 // Same view, augmented with a cyclic interface (cycOwn/cycNbr/cycCoeff over nCyc periodic faces). deviceAmul
 // applies the interface off-diagonal; the matching diagonal contribution must already be folded into `diag`.
@@ -116,10 +136,15 @@ inline DeviceLduView deviceLduViewCyclic(
     int nCyc,
     const label* cycOwn,
     const label* cycNbr,
-    const scalar* cycCoeff)
+    const scalar* cycCoeff,
+    // the pair's already-signed jump, or null -- see DeviceLduView::cycJump
+    const scalar* cycJump = nullptr)
 {
-    return {dm.nCells, dm.nInternalFaces, diag.data(), upper.data(), lower.data(), dm.owner.data(), dm.nei.data(),
-            dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), nCyc, cycOwn, cycNbr, cycCoeff};
+    DeviceLduView v{dm.nCells, dm.nInternalFaces, diag.data(), upper.data(), lower.data(), dm.owner.data(),
+                    dm.nei.data(), dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
+                    nCyc, cycOwn, cycNbr, cycCoeff, cycJump};
+    v.addressingId = dm.addressingId;
+    return v;
 }
 // BOTH interfaces at once. A mesh may carry cyclic AND cyclicAMI patches -- pimpleFoam/RAS/
 // oscillatingInletPeriodicAMI2D has a y-periodic `cyclic` pair on the sliding channel and a
@@ -178,7 +203,11 @@ inline DeviceLduView deviceLduViewAmi(
     return v;
 }
 
-void deviceAmul(const DeviceLduView& A, const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi);
+// `onField` = the operand IS the solution field, the one case in which a jump cyclic subtracts its
+// jump from the neighbour cell. False everywhere else, which is every search direction in a Krylov
+// solve; see DeviceLduView::cycJump.
+void deviceAmul(const DeviceLduView& A, const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi,
+                bool onField = false);
 
 class DeviceHalo;      // forward (parallel/pstream/device_halo.cuh)
 struct DistributedAMI; // forward (cuda/distributed_ami.cuh) -- optional cyclicAMI coupling in the matvec

@@ -5,6 +5,7 @@
 // patch. owner is non-decreasing (upper-triangular face ordering).
 #include "cf_types.cuh"
 #include "function1.cuh"   // cyclicACMI `scale`: the interface open-area fraction as a function of time
+#include "codedPatchFunction1.cuh"   // ...or a per-face coded one
 #include "foam_token_reader.cuh"
 #include <string>
 #include <stdexcept>
@@ -41,6 +42,11 @@ struct PatchInfo
     // TJunctionSwitching closes a branch with `table ((0 1)(0.2 1)(0.3 0))`. Empty = no scaling, and
     // then the interface is the geometric overlap alone, exactly as before.
     Function1   acmiScale;
+    // ...or `scale { type coded; code #{ ... #}; }`, a PatchFunction1 evaluated per FACE (RAS/
+    // damBreakLeakage opens two faces of its baffle at t > 0.5). Only captured here: the one consumer
+    // that evaluates it is the interFoam host loop's cyclic_acmi_cpp; applyACMIAreaScaling refuses it.
+    bool                     acmiScaleCoded = false;
+    CodedPatchFunction1Spec  acmiScaleCodedSpec;
 };
 
 // A cyclicACMI's `scale` belongs to the PAIR, not to one patch. OF keeps it on the OWNER (the half with
@@ -60,6 +66,14 @@ inline void propagateACMIScale(std::vector<PatchInfo>& patches)
         if (i < nbr)                                     // this half is the owner
         {
             if (!patches[i].acmiScale.empty()) patches[nbr].acmiScale = patches[i].acmiScale;
+            // a coded scale is cloned onto the neighbour PATCH (tgtScalePtr_ = srcScalePtr_.clone(
+            // neighbPatch())), so the neighbour evaluates the same code on its own faces
+            if (patches[i].acmiScaleCoded)
+            {
+                patches[nbr].acmiScaleCoded = true;
+                patches[nbr].acmiScaleCodedSpec = patches[i].acmiScaleCodedSpec;
+                patches[nbr].acmiScale = Function1();
+            }
         }
         else if (!patches[i].acmiScale.empty() && !patches[nbr].acmiScale.empty())
         {

@@ -1,5 +1,6 @@
 // _cpp REFERENCE implementation -- see kEpsilon_cpp.cuh for the OpenFOAM provenance and the wall note.
 #include "kEpsilon_cpp.cuh"
+#include "pbicg.cuh"
 #include "bound_cpp.cuh"
 #include "limitedSchemes_cpp.cuh"
 #include "nut_wall_function.cuh"
@@ -37,7 +38,8 @@ void captureSystem(
         {
             const label c = patches[pi].faceCells[i];
             D[c] += M.internalCoeffs[pi][i];
-            S[c] += M.boundaryCoeffs[pi][i];
+            // a coupled patch's boundaryCoeffs are interface coefficients, not a source
+            if (!patches[pi].coupled) S[c] += M.boundaryCoeffs[pi][i];
         }
 }
 
@@ -83,7 +85,8 @@ FvScalarMatrix divWithScheme(
         // The caller SUBTRACTS what linearUpwindCorrection returns -- the sign note is in fvm.cuh. The
         // flux is the equation's own (compressibly the MASS flux), and it picks the upwind cell by
         // `faceFlux > 0` exactly as linearUpwind.C:74-79 does.
-        const std::vector<scalar> corr = fvm::linearUpwindCorrection<scalar, vector>(phi.internal, gradVf, m, g);
+        std::vector<scalar> corr = fvm::linearUpwindCorrection<scalar, vector>(phi.internal, gradVf, m, g);
+        fvm::addLinearUpwindCorrectionCoupled<scalar, vector>(corr, phi.boundary, gradVf, g, patches);
         for (label c = 0; c < m.nCells(); ++c) M.source[c] -= corr[c];
         return M;
     }
@@ -150,6 +153,11 @@ SurfaceScalarField effectiveDiffusivity(
     SurfaceScalarField sf = fvc::interpolate(D, m, g, patches);
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
+        if (patches[pi].coupled)
+        {
+            // a coupled face keeps fvc::interpolate's value: DkEff's two CELLS, interpolated
+            continue;
+        }
         const std::vector<scalar>& nb = nutField.boundary[pi]->value();
         for (label i = 0; i < patches[pi].size; ++i)
         {
@@ -245,7 +253,8 @@ void correct(
     int    minIter,
     const NutWallSelection* nutSel,
     bool   linearUpwind,
-    scalar luGradK)
+    scalar luGradK,
+    const LinearSolverChoice* which)
 {
     if (linearUpwind && limitedLinear)
         throw std::runtime_error(
@@ -265,11 +274,48 @@ void correct(
     // is phi/interpolate(rho) and not the mass flux the div operator uses. `bounded` instead subtracts
     // the divergence of the EQUATION's own flux. In the incompressible lineage both are div(phi) and the
     // two lines below collapse to the one they replace.
-    const std::vector<scalar> divU =
-        (comp && comp->phiByRho) ? fvc::div(*comp->phiByRho, m, g, patches)
-                                 : fvc::div(phi, m, g, patches);
+    const SurfaceScalarField& phiVol = (comp && comp->phiByRho) ? *comp->phiByRho : phi;
+    std::vector<scalar> divU;
+    if (comp && comp->meshPhi)
+    {
+        // fvc::absolute(phi, U): phi + mesh.phi() on every face, the boundary included
+        SurfaceScalarField phiAbs = phiVol;
+        for (std::size_t f = 0; f < phiAbs.internal.size(); ++f)
+        {
+            phiAbs.internal[f] += comp->meshPhi->internal[f];
+        }
+        for (std::size_t pi = 0; pi < phiAbs.boundary.size(); ++pi)
+        {
+            for (std::size_t i = 0; i < phiAbs.boundary[pi].size(); ++i)
+            {
+                phiAbs.boundary[pi][i] += comp->meshPhi->boundary[pi][i];
+            }
+        }
+        divU = fvc::div(phiAbs, m, g, patches);
+    }
+    else
+    {
+        divU = fvc::div(phiVol, m, g, patches);
+    }
     const std::vector<scalar> divPhi =
-        (comp && comp->phiByRho) ? fvc::div(phi, m, g, patches) : divU;
+        ((comp && comp->phiByRho) || (comp && comp->meshPhi)) ? fvc::div(phi, m, g, patches) : divU;
+
+    // the flux inletOutlet and its relatives look up -- see Compressible::bcPhi
+    const SurfaceScalarField& patchFlux = (comp && comp->bcPhi) ? *comp->bcPhi : phi;
+    // the case's linear solver for both equations -- see the `which` parameter
+    auto solveScalar = [&](const FvScalarMatrix& A, std::vector<scalar>& psi)
+    {
+        if (which && which->smoothSolver)
+        {
+            return smoothSolver(A, psi, m, patches, which->symmetric, tol, relTol, maxIter, minIter,
+                                which->nSweeps);
+        }
+        if (which && which->pbicgDILU)
+        {
+            return pbicgDILU(A, psi, m, patches, tol, relTol, maxIter, minIter);
+        }
+        return pbicgstab(A, psi, m, patches, tol, relTol, maxIter, minIter);
+    };
 
     // alpha*rho on a cell: 1 in the incompressible lineage.
     auto rhoAt = [&](label c) { return (comp && comp->rho) ? (*comp->rho)[c] : scalar(1.0); };
@@ -277,7 +323,23 @@ void correct(
     // rho.oldTime()*psi.oldTime()*V/deltaT. psi.oldTime() is the field as this iteration started -- taken
     // HERE, before the wall function overwrites epsilon in its cells (those rows are pinned by setValues
     // afterwards, so what the source holds there is not seen by the solve). Zero under steadyState.
-    const scalar rDeltaT = (comp) ? comp->rDeltaT : scalar(0);
+    // ...and under CrankNicolson the term is the scheme's own, added after the loops below with the
+    // Euler line skipped; the caller keeps the old-old levels
+    const bool cn = comp && comp->cn;
+    if (cn)
+    {
+        if (!comp->cnDdt0Eps || !comp->cnDdt0K || !comp->epsOO || !comp->kOO
+         || (comp->rho && !comp->rhoOO) || (comp->rhoOld && !comp->rhoOO))
+            throw std::runtime_error(
+                "brae kEpsilon: CrankNicolson needs the two ddt0 fields, k.oldTime().oldTime(), "
+                "epsilon.oldTime().oldTime() and, with a density, rho.oldTime().oldTime(); the caller "
+                "supplied fewer.");
+        if (comp->V0)
+            throw std::runtime_error(
+                "brae kEpsilon: CrankNicolson's fvm::ddt on a moving mesh is the scheme's moving branch, "
+                "which brae does not carry.");
+    }
+    const scalar rDeltaT = (comp && !cn) ? comp->rDeltaT : scalar(0);
     const std::vector<scalar> kOld   = k.internal;
     const std::vector<scalar> epsOld = epsilon.internal;
     auto rhoOldAt = [&](label c) { return (comp && comp->rhoOld) ? (*comp->rhoOld)[c] : rhoAt(c); };
@@ -441,7 +503,7 @@ void correct(
             // (kEpsilon.C:102-108 getOrAddToDict; dimensionedType.C:389 adds the default). So the dict
             // always has it, and a patch `Cmu` entry is dead under this model.
             epsilon.boundary[pi]->updateTurbulentInlet({}, k.boundary[pi]->value(), co.Cmu, true);
-            epsilon.boundary[pi]->updateFromFlux(phi.boundary[pi]);
+            epsilon.boundary[pi]->updateFromFlux(patchFlux.boundary[pi]);
         }
 
         FvScalarMatrix M = divWithScheme(phi, epsilon, limitedLinear, limiterCoeff, limGradK, m, g, patches,
@@ -499,7 +561,7 @@ void correct(
             if (rDeltaT > 0.0)   // fvm::ddt(alpha, rho, epsilon_), kEpsilon.C:254
             {
                 M.diag[c]   += rDeltaT * rhoAt(c) * V;
-                M.source[c] += rDeltaT * rhoOldAt(c) * epsOld[c] * V;
+                M.source[c] += rDeltaT * rhoOldAt(c) * epsOld[c] * ((comp && comp->V0) ? (*comp->V0)[c] : V);
             }
 
             // `bounded`: - Sp(div(phi), epsilon). Vanishes where phi is conservative, so it cannot move
@@ -508,6 +570,15 @@ void correct(
             if (bounded) M.diag[c] -= divPhi[c] * V;
         }
 
+        // fvm::ddt(alpha, rho, epsilon_) under CrankNicolson: "ddt0(rho,epsilon)" is the equation's own
+        if (cn)
+        {
+            fv::fvmDdt(*comp->cn, *comp->cnDdt0Eps, comp->rho, comp->rhoOld ? comp->rhoOld : comp->rho,
+                       comp->rhoOO, epsOld, *comp->epsOO, g.V(), M);
+        }
+        // + fvOptions(alpha, rho, epsilon_), kEpsilon.C:258 -- the last term on the right. The density-
+        // weighted lineage is the rho form of addSup, which the option refuses.
+        if (fvOpts) cpu::fvOptions::addSup(*fvOpts, M, "epsilon", U.internal, g, comp ? comp->rho : nullptr);
         if (res && res->captureStages) captureSystem(M, patches, res->epsD0, res->epsSrc0);
         // kEpsilon.C:265-267 -- relax(), THEN fvOptions.constrain(), THEN boundaryManipulate(). These two
         // were the other way round here, and the difference is not the constrained cell itself: both
@@ -532,7 +603,32 @@ void correct(
         // An earlier version of this note said the discriminating fixture "does not exist yet". It did;
         // it was simply not under validation/, and saying it did not exist is what kept the number at
         // 2.1e-01 unmeasured for as long as it was.
-        if (relaxEquationEps) relaxMatrix(M, epsilon, m, patches, relaxEps);
+        if (relaxEquationEps)
+        {
+            // epsilonWallFunction IS A fixedValue PATCH in OpenFOAM
+            // (epsilonWallFunctionFvPatchScalarField.H:97-99), so when relax() runs its faces still
+            // carry the laplacian's fixedValue coefficient ic = gamma_b*deltaCoeffs*magSf, and relax()
+            // leaves max(|D0 + ic|, sumOff)/alpha - ic on the diagonal (fvMatrix.C relax():
+            // += cmptMax(cmptMag(iCoeffs)), /= alpha, -= cmptMin(iCoeffs)). brae's factory maps the
+            // patch to zeroGradient, so ic was 0 here and the diagonal came out D0/alpha. The rows
+            // concerned are exactly the ones setValues pins next -- it zeroes these coefficients again
+            // and writes source = value*D -- so the SOLUTION cannot see the difference. The diagonal
+            // survives into normFactor, though: measured on interFoam's RAS/damBreak at relaxation
+            // 0.7, epsilon agreed with OpenFOAM to 1e-13 while every one of its initial and final
+            // residuals sat 1.1e-04 away, and k's -- kqRWallFunction IS zeroGradient -- at 1e-13.
+            // A residual is what the stopping rule reads, so it decides where a solve stops. With a
+            // factor of 1 the two expressions are equal, which is why no unrelaxed gate saw it.
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                if (!epsilon.boundary[pi]->isTurbulenceWallFunction()) continue;
+                for (label i = 0; i < patches[pi].size; ++i)
+                {
+                    M.internalCoeffs[pi][i] +=
+                        Df.boundary[pi][i] * patches[pi].deltaCoeffs[i] * patches[pi].magSf[i];
+                }
+            }
+            relaxMatrix(M, epsilon, m, patches, relaxEps);
+        }
         // THE WALL VALUE IS READ FROM THE FIELD, at the moment the wall pass runs -- OpenFOAM's
         // epsilonWallFunction::manipulateMatrix is
         // `matrix.setValues(patch().faceCells(), patchInternalField())`
@@ -598,8 +694,12 @@ void correct(
         {
             captureSystem(M, patches, res->epsD, res->epsSrc, &res->epsUpper, &res->epsLower);
         }
-        const SolverPerformance p = pbicgstab(M, epsilon.internal, m, patches, tol, relTol, maxIter, minIter);
-        if (res) res->epsilon = p.initialResidual;
+        const SolverPerformance p = solveScalar(M, epsilon.internal);
+        if (res)
+        {
+            res->epsilon = p.initialResidual;
+            res->epsPerf = p;
+        }
 
         // Foam::bound(epsilon_, epsilonMin_): a cell that solved NEGATIVE takes its neighbours'
         // average, not a floor. Inert under upwind convection, which does not produce one -- see
@@ -636,7 +736,7 @@ void correct(
         {
             // turbulentIntensityKineticEnergyInlet reads U's patch values (and no Cmu at all).
             k.boundary[pi]->updateTurbulentInlet(U.boundary[pi]->value(), {}, co.Cmu, true);
-            k.boundary[pi]->updateFromFlux(phi.boundary[pi]);
+            k.boundary[pi]->updateFromFlux(patchFlux.boundary[pi]);
         }
 
         FvScalarMatrix M = divWithScheme(phi, k, limitedLinear, limiterCoeff, limGradK, m, g, patches,
@@ -683,12 +783,20 @@ void correct(
             if (rDeltaT > 0.0)   // fvm::ddt(alpha, rho, k_), kEpsilon.C:275
             {
                 M.diag[c]   += rDeltaT * rhoAt(c) * V;
-                M.source[c] += rDeltaT * rhoOldAt(c) * kOld[c] * V;
+                M.source[c] += rDeltaT * rhoOldAt(c) * kOld[c] * ((comp && comp->V0) ? (*comp->V0)[c] : V);
             }
 
             if (bounded) M.diag[c] -= divPhi[c] * V;
         }
 
+        // fvm::ddt(alpha, rho, k_) under CrankNicolson: "ddt0(rho,k)"
+        if (cn)
+        {
+            fv::fvmDdt(*comp->cn, *comp->cnDdt0K, comp->rho, comp->rhoOld ? comp->rhoOld : comp->rho,
+                       comp->rhoOO, kOld, *comp->kOO, g.V(), M);
+        }
+        // + fvOptions(alpha, rho, k_), kEpsilon.C:279
+        if (fvOpts) cpu::fvOptions::addSup(*fvOpts, M, "k", U.internal, g, comp ? comp->rho : nullptr);
         if (res && res->captureStages) captureSystem(M, patches, res->kD0, res->kSrc0);
         if (relaxEquationK) relaxMatrix(M, k, m, patches, relaxK);
         // fvOptions.constrain(kEqn), kEpsilon.C -- after relax(), as OpenFOAM has it.
@@ -697,8 +805,12 @@ void correct(
         {
             captureSystem(M, patches, res->kD, res->kSrc, &res->kUpper, &res->kLower);
         }
-        const SolverPerformance p = pbicgstab(M, k.internal, m, patches, tol, relTol, maxIter, minIter);
-        if (res) res->k = p.initialResidual;
+        const SolverPerformance p = solveScalar(M, k.internal);
+        if (res)
+        {
+            res->k = p.initialResidual;
+            res->kPerf = p;
+        }
 
         k.evaluateBoundary();
         bound(k, co.kMin, m, g, patches, "k");   // Foam::bound(k_, kMin_)
@@ -802,6 +914,44 @@ void correctNutField(
             continue;
         }
 
+        // ...EXCEPT where the patch's operator= is empty: fixedValue (fixedValueFvPatchField.H:202-216)
+        // and mixed (mixedFvPatchField.H:303-317) ignore a field assignment, so nut there is what
+        // correctBoundaryConditions then evaluates -- a fixedValue keeps its own value, a mixed blends
+        // with the new cell nut. MEASURED on RAS/mixerVesselAMI, whose gasInlet writes `nut fixedValue
+        // 0`: brae put Cmu*k^2/epsilon = 1.29e-03 there where OpenFOAM keeps 0, and U was 2.7e-03 from
+        // OpenFOAM after one step.
+        // an inletOutlet nut (or a relative): OpenFOAM's correctBoundaryConditions evaluates it against the
+        // cell nut just assigned, inflow faces taking the inletValue. MEASURED on RAS/waterChannel under
+        // kOmegaSST with `outlet inletOutlet; inletValue 0.002`: skipped, nut 8.5e-04 from OpenFOAM after
+        // ten steps and U 9.2e-07 (tests/interfoam_waterchannel_vs_openfoam.sh `nutOutlet`).
+        // A COUPLED PATCH TAKES THE TWO CELLS, not Cmu*k_b^2/eps_b. correctNut() ends with
+        // nut_.correctBoundaryConditions() (kEpsilon.C:45-46), and on a constraint patch that is
+        // coupledFvPatchField::evaluate -- lerp(patchNeighbourField, patchInternalField, weights),
+        // i.e. w*nut_own + (1 - w)*nut_nbr of the nut JUST ASSIGNED. It is not the same number as the
+        // assignment's: Cmu*k_b^2/eps_b is a non-linear function of k and epsilon's own interpolated
+        // patch values, and interpolate(Cmu*k^2/eps) is the interpolation of the result.
+        if (patches[pi].coupled)
+        {
+            nutField.boundary[pi]->evaluate(nutF);
+            continue;
+        }
+        if (nutField.boundary[pi]->isInletOutlet())
+        {
+            if (!comp || !comp->nutPhi || comp->nutPhi->boundary.size() <= pi)
+            {
+                throw std::runtime_error(
+                    "brae kEpsilon: nut on patch `" + patches[pi].name + "` is flux-conditional (inletOutlet) and the "
+                    "caller handed the closure no flux to decide inflow by (Compressible::nutPhi).");
+            }
+            nutField.boundary[pi]->updateFromFlux(comp->nutPhi->boundary[pi]);
+            nutField.boundary[pi]->evaluate(nutF);
+            continue;
+        }
+        if (nutField.boundary[pi]->fixesValue() && !nutField.boundary[pi]->assignable())
+        {
+            nutField.boundary[pi]->evaluate(nutF);
+            continue;
+        }
         const std::vector<scalar>& kb = k.boundary[pi]->value();
         const std::vector<scalar>& eb = epsilon.boundary[pi]->value();
         std::vector<scalar> nb(patches[pi].size);

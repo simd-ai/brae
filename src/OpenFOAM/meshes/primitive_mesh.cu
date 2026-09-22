@@ -268,12 +268,114 @@ void PrimitiveMesh::readBoundary(const std::string& dir)
         std::string acmiScaleType;
         std::vector<std::pair<scalar, scalar>> acmiScaleTable;
         scalar acmiScaleConst = 1;
+        // `type coded;`: the keys CodedField.C reads -- `name` (default the entry name, :158) and `code`;
+        // codeInclude, localCode, codeOptions and codeLibs are collected so the coded object refuses them
+        CodedPatchFunction1Spec acmiCoded;
+        acmiCoded.name = "scale";
         pi.name = ts.next();
         ts.expect("{");
         while (ts.peek() != "}")
         {
             const std::string key = ts.next();
-            if      (key == "scale")
+            if      (key == "scale" && ts.peek() == "{")
+            {
+                // THE DICTIONARY FORM, `scale { type coded; code #{ ... #}; }`. OpenFOAM reads `scale` as a
+                // PatchFunction1 (cyclicACMIPolyPatch.C:625), so the selector may sit inside a block, and
+                // RAS/damBreakLeakage writes a per-face coded one there. This branch took `{` for the
+                // selector word and the parse died on "expected ';' got 'type'", naming nothing. `constant`
+                // and `table` are read as their inline forms are; any other type reaches the refusal below
+                // under its own name.
+                ts.expect("{");
+                while (ts.peek() != "}")
+                {
+                    const std::string k2 = ts.next();
+                    if (k2 == "type")
+                    {
+                        acmiScaleType = ts.next();
+                        ts.expect(";");
+                    }
+                    else if (k2 == "value" && ts.peek() != "{")
+                    {
+                        acmiScaleConst = ts.nextScalar();
+                        ts.expect(";");
+                    }
+                    else if (k2 == "values")
+                    {
+                        acmiScaleTable = readAcmiScaleTable(ts);
+                        ts.expect(";");
+                    }
+                    else if (k2 == "code")
+                    {
+                        // the verbatim #{ ... #} token; a quoted string is a legal `code` too
+                        const std::string tok = ts.next();
+                        if (!ts.verbatim(tok, acmiCoded.code))
+                        {
+                            acmiCoded.code = tok;
+                        }
+                        ts.expect(";");
+                    }
+                    else if (k2 == "name")
+                    {
+                        acmiCoded.name = ts.next();
+                        ts.expect(";");
+                    }
+                    else if (k2 == "codeInclude" || k2 == "localCode" || k2 == "codeOptions" || k2 == "codeLibs")
+                    {
+                        acmiCoded.unsupportedKeys += (acmiCoded.unsupportedKeys.empty() ? "`" : ", `") + k2 + "`";
+                        if (ts.peek() == "{")
+                        {
+                            ts.expect("{");
+                            for (int depth = 1; depth > 0; )
+                            {
+                                const std::string t = ts.next();
+                                if (t == "{")
+                                {
+                                    ++depth;
+                                }
+                                else if (t == "}")
+                                {
+                                    --depth;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            while (ts.peek() != ";")
+                            {
+                                ts.next();
+                            }
+                            ts.expect(";");
+                        }
+                    }
+                    else if (ts.peek() == "{")
+                    {
+                        ts.expect("{");
+                        for (int depth = 1; depth > 0; )
+                        {
+                            const std::string t = ts.next();
+                            if (t == "{")
+                            {
+                                ++depth;
+                            }
+                            else if (t == "}")
+                            {
+                                --depth;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        while (ts.peek() != ";")
+                        {
+                            ts.next();
+                        }
+                        ts.expect(";");
+                    }
+                }
+                ts.expect("}");
+                continue;
+            }
+            else if (key == "scale")
             {
                 acmiScaleType = ts.next();
                 // `scale constant 0.5;` carries its value inline; `scale table;` defers to scaleCoeffs.
@@ -354,10 +456,19 @@ void PrimitiveMesh::readBoundary(const std::string& dir)
             if (acmiScaleType == "constant")        pi.acmiScale = Function1::constant(acmiScaleConst);
             else if (acmiScaleType == "table" && !acmiScaleTable.empty())
                                                     pi.acmiScale = Function1::table(acmiScaleTable);
+            else if (acmiScaleType == "coded")
+            {
+                acmiCoded.origin = dir + "/boundary: patch '" + pi.name + "', scale";
+                // <case>/dynamicCode, where OpenFOAM builds its own (a brae/ subdirectory keeps the two apart)
+                acmiCoded.codeDir =
+                    (std::filesystem::path(dir).parent_path().parent_path() / "dynamicCode" / "brae").string();
+                pi.acmiScaleCoded = true;
+                pi.acmiScaleCodedSpec = acmiCoded;
+            }
             else
                 throw std::runtime_error(
                     "brae: cyclicACMI '" + pi.name + "' has `scale " + acmiScaleType + "`, which brae "
-                    "does not evaluate (it reads `constant` and `table`). The scale sets how far the "
+                    "does not evaluate (it reads `constant`, `table` and `coded`). The scale sets how far the "
                     "interface is open at each time, so substituting another function solves a "
                     "different case.");
         }

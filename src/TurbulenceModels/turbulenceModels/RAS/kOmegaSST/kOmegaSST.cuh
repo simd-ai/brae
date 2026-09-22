@@ -169,6 +169,10 @@ struct KOmegaSSTResiduals
 {
     scalar omega = 0.0;
     scalar k     = 0.0;
+    // ...and each solve's full record -- initial and final residual and iteration count -- which is what
+    // a gate compares with OpenFOAM's "Solving for omega" lines (interFoam's device arm reads these)
+    DeviceSolverPerf omegaPerf;
+    DeviceSolverPerf kPerf;
 };
 
 // One kOmegaSSTBase::correct(): production -> omega wall function -> CDkOmega/F1/F2 -> omega eqn ->

@@ -126,6 +126,26 @@ void pressurePredictor(
         DeviceBuffer<scalar> Hk;
         deviceMatrixH(A, dm, *U[k], UEqn.source[k], bdDiagK, UEqn.bC[k], Hk,
                       in.solutionD[k] > 0);
+        // ...and the pair's off-diagonal, which deviceMatrixH's face loops do not reach:
+        // H[own] -= ifCoeff*psi[nbr]/V[own] (deviceCyclicAddH), BEFORE the rAU weighting, because
+        // HbyA is rAU*H and not rAU applied to a half-built H.
+        if (k == 0 && in.hNoPairTap)
+        {
+            deviceCopy(*in.hNoPairTap, Hk);
+        }
+        if (in.cyc && in.cyc->n > 0)
+        {
+            // ...with the MOMENTUM matrix's own interface coefficient: cyc.ifCoeff has held the
+            // pressure laplacian's since the last corrector assembled it (MomentumMatrix::cycIfCoeff).
+            deviceCyclicAddH(*in.cyc, *U[k], dm.V, Hk, &UEqn.cycIfCoeff);
+        }
+        if (k == 0 && in.hPairTap && in.hNoPairTap)
+        {
+            // the pair's own contribution, by difference -- so the tap is what the call DID, not a
+            // second copy of its arithmetic that could drift from it
+            deviceCopy(*in.hPairTap, Hk);
+            deviceAxpy(-1.0, *in.hNoPairTap, *in.hPairTap);
+        }
         deviceHadamard(st.HbyA[k], st.rAU, Hk);
     }
 
@@ -147,6 +167,12 @@ void pressurePredictor(
     // ---- phiHbyA = fvc::flux(HbyA) -----------------------------------------------------------
     deviceVectorFlux(dm, st.HbyA[0], st.HbyA[1], st.HbyA[2], st.phiHbyAInt);
     deviceBoundaryFlux(dm, st.HbyAb[0], st.HbyAb[1], st.HbyAb[2], st.phiHbyABnd);
+    // ...and on the pair, where fvc::flux is the two CELLS' HbyA interpolated and dotted with Sf --
+    // gated against the host's dot(coupledLinear(H), Sf) in test_device_cyclic_laplacian_vs_host.cu.
+    if (in.cyc && in.cyc->n > 0)
+    {
+        deviceCyclicFluxTo(*in.cyc, st.HbyA[0], st.HbyA[1], st.HbyA[2], st.phiHbyAIf);
+    }
 
     // ---- MRF.makeRelative(phiHbyA) -- pEqn.H:5, BEFORE adjustPhi -----------------------------
     // adjustPhi balances the flux it is handed, so the frame flux has to be out of it first.

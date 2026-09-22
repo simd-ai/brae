@@ -47,6 +47,7 @@
 #include "cf_types.cuh"
 #include "kepsilon_coeffs.cuh"
 #include "fvOptions_cpp.cuh"
+#include "crank_nicolson_ddt_scheme_cpp.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -55,6 +56,7 @@
 #include "fvm.cuh"
 #include "fvc.cuh"
 #include "fv_matrix_ops.cuh"
+#include "smooth_solver_cpp.cuh"   // LinearSolverChoice, SolverPerformance
 #include <vector>
 
 namespace brae {
@@ -69,6 +71,11 @@ struct KEResiduals
     scalar epsilon = 0;
     scalar k = 0;
     label  wallCells = 0;
+    // The two solves WHOLE -- initial residual, final residual, iteration count -- which is what
+    // OpenFOAM's log prints per solve and so what a solver-log gate compares. `epsilon` and `k` above
+    // are the initial residuals alone and predate these.
+    SolverPerformance epsPerf;
+    SolverPerformance kPerf;
     // Per-cell |b - A.psi| for the epsilon equation, so the residual can be located rather than only
     // measured. A residual concentrated at the wall means the wall treatment; at the inlet or outlet, a
     // boundary condition; spread through the interior, the operator.
@@ -135,11 +142,43 @@ struct Compressible
     const std::vector<scalar>*              nu       = nullptr;   // cells, mu/rho; null => the scalar nu
     const std::vector<std::vector<scalar>>* nuBnd    = nullptr;
     const SurfaceScalarField*               phiByRho = nullptr;   // VOLUMETRIC flux, for divU only
+    // THE FLUX A FLUX-CONDITIONAL PATCH LOOKS UP, when that is not the equation's own. inletOutlet
+    // reads the registry's `phi` (inletOutletFvPatchField.C, phiName_ default "phi"). In rhoSimpleFoam
+    // that IS the mass flux the equation convects with, so null -- the equation's flux -- is right.
+    // In interFoam's `density variable` lineage the equation convects with rhoPhi, and rhoPhi is NOT
+    // rho*phi at the moment the closure runs: the ALPHA step built it from the phi the time step
+    // started on, and the pressure correctors have moved phi since. An earlier version of this note
+    // argued the two must share a sign wherever rho_b > 0; measured on RAS/damBreak at step one,
+    // rhoPhi is exactly 0 on all 46 atmosphere faces (the case starts at rest) while phi is not, and
+    // handing the patches rhoPhi is 4.9e-04 of U after five steps.
+    const SurfaceScalarField* bcPhi = nullptr;
     // fvm::ddt(alpha, rho, k|epsilon) (kEpsilon.C:254,275): rDeltaT = 1/deltaT under Euler, 0 under
     // steadyState (the term vanishes). rhoOld is rho.oldTime() -- see StepInput::firstIteration for
     // which rho that is; psi.oldTime() is the field at entry, before the wall function writes it.
     scalar                                  rDeltaT  = 0.0;
     const std::vector<scalar>*              rhoOld   = nullptr;
+    // ...or CrankNicolson (crank_nicolson_ddt_scheme_cpp.cuh): the scheme's clock, the two equations'
+    // OWN ddt0 fields ("ddt0(rho,epsilon)" and "ddt0(rho,k)", or "ddt0(epsilon)"/"ddt0(k)" when rho
+    // is null), rho.oldTime().oldTime() and the two fields' old-old levels, which the caller keeps
+    // (psi.oldTime() is the field at entry, as under Euler). With `cn` set rDeltaT is not read, and
+    // a moving mesh (V0) is refused.
+    const fv::CrankNicolsonClock*           cn       = nullptr;
+    fv::CrankNicolsonDdt0<scalar>*          cnDdt0Eps = nullptr;
+    fv::CrankNicolsonDdt0<scalar>*          cnDdt0K   = nullptr;
+    const std::vector<scalar>*              rhoOO    = nullptr;
+    const std::vector<scalar>*              epsOO    = nullptr;
+    const std::vector<scalar>*              kOO      = nullptr;
+    // A MOVING MESH (EulerDdtScheme::fvmDdt under mesh().moving()): the source takes the old volumes,
+    // rDeltaT*psi.oldTime()*V0, where the diagonal keeps V; and divU is the divergence of the ABSOLUTE
+    // flux, fvc::div(fvc::absolute(phi, U)) = div(phi + mesh.phi()) (kEpsilon.C:232-235). Null on a
+    // static mesh, where both collapse to the forms above.
+    // THE FLUX nut's flux-conditional patches read (inletOutlet's phiName, `phi` by default). After the
+    // field assignment OpenFOAM's nut.correctBoundaryConditions() evaluates such a patch: valueFraction =
+    // neg(phi), then the mixed blend of the inletValue and the new cell nut. Null refuses a case that has
+    // one rather than leave it stale.
+    const SurfaceScalarField*               nutPhi   = nullptr;
+    const std::vector<scalar>*              V0       = nullptr;
+    const SurfaceScalarField*               meshPhi  = nullptr;
     // EddyDiffusivity::correctNut -- alphat = rho*nut/Prt, which the energy equation needs and the
     // momentum equation does not. Written out when supplied.
     std::vector<scalar>*                    alphat   = nullptr;
@@ -248,7 +287,12 @@ void correct(
     // the entry NAMES (0 => unlimited Gauss linear), which is not grad(<field>)'s -- see
     // FieldDivScheme::luGradName. Appended after nutSel for the same reason everything else was.
     bool   linearUpwind  = false,
-    scalar luGradK       = 0.0);
+    scalar luGradK = 0.0,
+    // THE CASE'S LINEAR SOLVER for both equations. Null keeps PBiCGStab, which every caller before
+    // interFoam ran; interFoam's tutorials name `smoothSolver; symGaussSeidel;` for k and epsilon, and
+    // a substituted solver at the same tolerance stops somewhere else (measured three times in the
+    // interFoam port: p_rgh, alpha, U). Last, so no positional caller moves.
+    const LinearSolverChoice* which = nullptr);
 
 } // namespace kEpsilonRef
 } // namespace cpu

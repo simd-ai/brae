@@ -7,6 +7,8 @@
 //   div(phi, vf): Gauss upwind convection
 //     w=pos0(phi); lower=-w*phi; upper=lower+phi; diag=negSumDiag;
 //     internalCoeffs = phi_pf * valueInternalCoeffs;  boundaryCoeffs = -phi_pf * valueBoundaryCoeffs
+#include <stdexcept>
+#include <string>
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
@@ -83,10 +85,13 @@ FvMatrix<T> laplacian(
     // on pvf.coupled() and passes the corrected deltaCoeffs ONLY on the coupled side, calling the
     // argument-less gradientInternalCoeffs()/gradientBoundaryCoeffs() otherwise.
     //
-    // GAP, recorded here because it is invisible today: the coupled branch is NOT implemented. It is
-    // unreachable while coupled patches are refused outright by the envelope guard, and must be revisited
-    // the moment cyclic or processor patches are admitted -- on those, `corrected` changes the boundary
-    // coefficients too.
+    // THE COUPLED BRANCH (FvPatch::coupled, the OF-mirror cyclic): coupledFvPatchField's
+    // gradientInternalCoeffs(dc) is -dc and gradientBoundaryCoeffs(dc) is +dc, with dc the SCHEME's
+    // deltaCoeffs -- nonOrthDeltaCoeffs under `corrected`. So internalCoeffs = boundaryCoeffs =
+    // -gamma*magSf*dc: the first goes on the diagonal and the second is the INTERFACE coefficient, which
+    // Amul applies to the cell on the other side (result -= boundaryCoeffs*psi_nbr) and which is never a
+    // source. The deferred non-orthogonal correction on a coupled face is the explicit half's
+    // (laplacianNonOrthSource, laplacianCorrFluxCoupled).
     M.internalCoeffs.resize(patches.size());
     M.boundaryCoeffs.resize(patches.size());
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
@@ -96,6 +101,17 @@ FvMatrix<T> laplacian(
         const std::vector<T> gBC = vf.boundary[pi]->gradientBoundaryCoeffs();
         M.internalCoeffs[pi].resize(fp.size);
         M.boundaryCoeffs[pi].resize(fp.size);
+        if (fp.coupled)
+        {
+            for (label i = 0; i < fp.size; ++i)
+            {
+                const scalar pGamma = gammaf.boundary[pi][i] * magSf[fp.start + i];
+                const scalar dcb = corrected ? fp.nonOrthDeltaCoeffs[i] : fp.deltaCoeffs[i];
+                M.internalCoeffs[pi][i] = (-(pGamma * dcb)) * tUniform<T>(1);
+                M.boundaryCoeffs[pi][i] = (-(pGamma * dcb)) * tUniform<T>(1);
+            }
+            continue;
+        }
         for (label i = 0; i < fp.size; ++i)
         {
             const scalar pGamma = gammaf.boundary[pi][i] * magSf[fp.start + i];
@@ -164,14 +180,63 @@ std::vector<T> laplacianCorrFlux(
     return ffc;
 }
 
+// ...and on the faces of a COUPLED patch (FvPatch::coupled, the OF-mirror cyclic and cyclicAMI), where
+// basicFvGeometryScheme makes the correction vectors nf - delta*nonOrthDeltaCoeffs rather than zero:
+//
+//     ffc_b = gamma_b * magSf_b * (corrVecs_b & (w*grad(P) + (1 - w)*patchNeighbourField(grad)))
+//
+// the linear interpolate of the gradient on a coupled patch. Under `limited` the orthogonal part the
+// correction is capped against is coupledFvPatchField::snGrad(nonOrthDeltaCoeffs) = dc*(pnf - pif), the
+// neighbour value the PATCH FIELD's (a jump included). Empty vectors on every uncoupled patch, whose
+// correction vectors are zero.
+template <typename T, typename G>
+std::vector<std::vector<T>> laplacianCorrFluxCoupled(
+    const SurfaceScalarField& gammaf,
+    const std::vector<G>& gradVf,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    scalar limitCoeff,
+    const GeometricField<T>& vf)
+{
+    const std::vector<scalar>& magSf = g.magSf();
+    const bool limited = (limitCoeff > 0.0 && limitCoeff < 1.0);
+    std::vector<std::vector<T>> ffc(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& fp = patches[pi];
+        if (!fp.coupled) continue;
+        const std::vector<T> pnf = limited ? vf.boundary[pi]->patchNeighbourField(vf.internal) : std::vector<T>{};
+        ffc[pi].resize(static_cast<std::size_t>(fp.size));
+        for (label i = 0; i < fp.size; ++i)
+        {
+            const std::size_t k = static_cast<std::size_t>(i);
+            const label own = fp.faceCells[k];
+            const G gf = fp.weights[k]*gradVf[own] + (1.0 - fp.weights[k])*patchNeighbourValue(fp, i, gradVf);
+            T corr = dotCorr(fp.nonOrthCorrectionVectors[k], gf);
+            if (limited)
+            {
+                const T orth = fp.nonOrthDeltaCoeffs[k]*(pnf[k] - vf.internal[own]);
+                const scalar lim =
+                    std::fmin(limitCoeff * magOf(orth)
+                                  / ((1.0 - limitCoeff) * magOf(corr) + 1e-15),
+                              1.0);
+                corr = lim * corr;
+            }
+            ffc[pi][k] = (gammaf.boundary[pi][k] * magSf[fp.start + i]) * corr;
+        }
+    }
+    return ffc;
+}
+
 // The EXPLICIT non-orthogonal correction, as an extensive per-cell source contribution:
 //     V * fvc::div( gamma*magSf * (corrVecs & interpolate(grad(vf))) )
 // which OpenFOAM SUBTRACTS from the laplacian's source (gaussLaplacianScheme.C). Returned rather than
 // applied so the caller supplies the sign for its own equation, and so it can be compared on its own.
 //
-// Boundary faces contribute nothing: OpenFOAM sets the correction vectors to zero there
-// (makeNonOrthCorrectionVectors). The 1/V of fvc::div and the V of the extensive source cancel, so no
-// volume factor appears below.
+// Uncoupled boundary faces contribute nothing: OpenFOAM sets the correction vectors to zero there
+// (makeNonOrthCorrectionVectors); a coupled patch's faces carry laplacianCorrFluxCoupled's flux onto
+// their own cells, as fvc::div sums a boundary flux. The 1/V of fvc::div and the V of the extensive
+// source cancel, so no volume factor appears below.
 //
 // G is the gradient's element type (vector for a scalar field, tensor for a vector field), taken as a
 // second template parameter -- deriving it with std::conditional puts it in a non-deduced context and
@@ -186,7 +251,6 @@ std::vector<T> laplacianNonOrthSource(
     const std::vector<FvPatch>& patches,
     scalar limitCoeff = 0.0)   // `limited <k> corrected`; 0 = unlimited. See laplacianCorrFlux.
 {
-    (void)patches;
     const label nC  = m.nCells();
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
@@ -201,6 +265,14 @@ std::vector<T> laplacianNonOrthSource(
     {
         src[own[f]] += ffc[f];
         src[nei[f]] -= ffc[f];
+    }
+    const std::vector<std::vector<T>> ffcb = laplacianCorrFluxCoupled<T, G>(gammaf, gradVf, g, patches, limitCoeff, vf);
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        for (std::size_t k = 0; k < ffcb[pi].size(); ++k)
+        {
+            src[patches[pi].faceCells[k]] += ffcb[pi][k];
+        }
     }
     (void)w; (void)magSf; (void)cv;
     return src;
@@ -257,6 +329,17 @@ FvMatrix<T> laplacian(
         const std::vector<T> gBC = vf.boundary[pi]->gradientBoundaryCoeffs();
         M.internalCoeffs[pi].resize(fp.size);
         M.boundaryCoeffs[pi].resize(fp.size);
+        if (fp.coupled)
+        {
+            // the uncorrected scheme: the patch's own deltaCoeffs, 1/|delta| across the pair
+            for (label i = 0; i < fp.size; ++i)
+            {
+                const scalar c = gamma * magSf[fp.start + i] * fp.deltaCoeffs[i];
+                M.internalCoeffs[pi][i] = (-c) * tUniform<T>(1);
+                M.boundaryCoeffs[pi][i] = (-c) * tUniform<T>(1);
+            }
+            continue;
+        }
         for (label i = 0; i < fp.size; ++i)
         {
             const scalar pGamma = gamma * magSf[fp.start + i];
@@ -318,6 +401,42 @@ std::vector<T> linearUpwindCorrection(
 //     lower = -weights*faceFlux;  upper = lower + faceFlux;  negSumDiag
 // which is gaussConvectionScheme.C:29-31 verbatim. `upwind` is the special case weights = pos0(phi), and
 // the plain overload below keeps that, so every existing call site is unchanged.
+// ...and its COUPLED-PATCH half (linearUpwind.C, the pSfCorr.coupled() branch): the same upwind-cell
+// extrapolation across a coupled face, taking the cell on the other side and ITS gradient where the
+// flux enters,
+//     phi > 0:  (Cf - C_own) & grad_own          else:  (Cf - delta - C_own) & grad_nbr
+// where Cf - delta - C_own is the face seen from the neighbour cell. Added to what the function above
+// returns, per cell, with the same sign: only the face's owner side is on this patch, and the other
+// side adds its own from the paired patch.
+template <typename T, typename G>
+void addLinearUpwindCorrectionCoupled(
+    std::vector<T>&                          corr,
+    const std::vector<std::vector<scalar>>&  phiBoundary,
+    const std::vector<G>&                    gradVf,
+    const FvGeometry&                        g,
+    const std::vector<FvPatch>&              patches)
+{
+    const std::vector<vector>& C = g.C();
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& fp = patches[pi];
+        if (!fp.coupled)
+        {
+            continue;
+        }
+        for (label i = 0; i < fp.size; ++i)
+        {
+            const scalar phi = phiBoundary[pi][i];
+            const label own = fp.faceCells[i];
+            const vector dOwn = fp.Cf[i] - C[own];
+            const T fc = (phi > 0.0)
+                       ? phi * dotCorr(dOwn, gradVf[own])
+                       : phi * dotCorr(dOwn - fp.delta[i], patchNeighbourValue(fp, i, gradVf));
+            corr[own] += fc;
+        }
+    }
+}
+
 template <typename T>
 FvMatrix<T> div(
     const std::vector<scalar>& phiInternal,
@@ -354,6 +473,17 @@ FvMatrix<T> div(
         const std::vector<T> vBC = vf.boundary[pi]->valueBoundaryCoeffs();
         M.internalCoeffs[pi].resize(fp.size);
         M.boundaryCoeffs[pi].resize(fp.size);
+        if (fp.coupled)
+        {
+            // gaussConvectionScheme::fvmDiv gives a coupled patch the SCHEME's weights on it
+            // (valueInternalCoeffs(w) = w, valueBoundaryCoeffs(w) = 1 - w), and `weights` here holds the
+            // internal faces only. upwind's are known without them -- the overload below -- and any
+            // other scheme's are not carried yet.
+            throw std::runtime_error(
+                "brae: fvm::div with a limited or linear scheme's face weights does not carry them onto "
+                "the coupled patch '" + fp.name + "'. Only upwind-weighted convection (upwind, "
+                "linearUpwind) is ported across a coupled patch.");
+        }
         for (label i = 0; i < fp.size; ++i)
         {
             const scalar pf = (pi < phiBoundary.size() && i < (label)phiBoundary[pi].size())
@@ -403,6 +533,20 @@ FvMatrix<T> div(
         const std::vector<T> vBC = vf.boundary[pi]->valueBoundaryCoeffs();
         M.internalCoeffs[pi].resize(fp.size);
         M.boundaryCoeffs[pi].resize(fp.size);
+        if (fp.coupled)
+        {
+            // gaussConvectionScheme::fvmDiv on a coupled patch: internalCoeffs = phi*w and
+            // boundaryCoeffs = -phi*(1 - w), with upwind's w = pos0(phi) as on an internal face. The
+            // second is the interface coefficient, applied to the cell on the other side.
+            for (label i = 0; i < fp.size; ++i)
+            {
+                const scalar pf = phiBoundary[pi][i];
+                const scalar w = (pf >= 0.0) ? 1.0 : 0.0;
+                M.internalCoeffs[pi][i] = (pf * w) * tUniform<T>(1);
+                M.boundaryCoeffs[pi][i] = (-(pf * (scalar(1) - w))) * tUniform<T>(1);
+            }
+            continue;
+        }
         for (label i = 0; i < fp.size; ++i)
         {
             const scalar pf = phiBoundary[pi][i];

@@ -79,8 +79,15 @@ struct GradUMemo
     DeviceBuffer<unsigned long long> dev;         // device state: acc, stored fingerprint, valid, hit, nHit, nMiss
     unsigned long long computed = 0, reused = 0;  // read only under BRAE_GRADU_MEMO_STATS
 };
+// UbStored: U's STORED patch values, one buffer per component, for a caller that keeps them. OpenFOAM's
+// fvc::grad(U) reads the stored values, and at a momentum ASSEMBLY those are the last evaluate's while
+// dbU already carries the coefficients updateCoeffs has just moved -- re-deriving the value from dbU
+// there evaluates a patch OpenFOAM has not. Null re-derives (deviceBCValue), which is the same number
+// wherever the caller evaluates U's boundary before the call. The stored values are part of the
+// fingerprint, so a stored call and a re-derived one never share a result.
 const GradUMemo& deviceGradUShared(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
-                                   const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz);
+                                   const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+                                   const DeviceBuffer<scalar>* const* UbStored = nullptr);
 
 // gradU tensor (9*nC, OF convention column i = gaussGrad(U_i)) + GbyNu from a prebuilt gradU. Shared by k-eps
 // (GbyNu) and kOmegaSST (which also needs gradU for S2 = 2 magSqr(symm(gradU))).

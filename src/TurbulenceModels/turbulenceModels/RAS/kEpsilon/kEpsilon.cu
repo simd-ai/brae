@@ -464,6 +464,35 @@ __global__ void alphatKernel(
 // The wall-cell mask, from the per-wall-face cell list DeviceWallData already carries. isWallCell in
 // that struct answers "is this cell's epsilon fixed by a wall function", which is the same question --
 // it is copied rather than recomputed so the two cannot drift.
+// iC[f] += gamma_b*deltaCoeffs*magSf on the wall-function faces: the laplacian's fixedValue
+// internalCoeff, which OpenFOAM's epsilonWallFunction patch carries into relax()
+__global__ void wallLaplacianCoeffKernel(
+    int nB,
+    const label* __restrict__ wfMask,
+    const scalar* __restrict__ gammaBnd,
+    const scalar* __restrict__ deltaCoeffs,
+    const scalar* __restrict__ magSf,
+    scalar* __restrict__ iC)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= nB) return;
+    if (!wfMask[f]) return;
+    iC[f] += gammaBnd[f] * deltaCoeffs[f] * magSf[f];
+}
+
+// `+ fvOptions(epsilon)` / `+ fvOptions(k)` for an option whose addSup is -fvm::Sp(coeff, field): on the
+// right of the equation, so the matrix takes diag += V*coeff (fvOptions_cpp.cu, the scalar addSup)
+__global__ void fvOptionsSpKernel(
+    int nC,
+    const scalar* V,
+    const scalar* coeff,
+    scalar* diag)
+{
+    const int c = blockDim.x*blockIdx.x + threadIdx.x;
+    if (c >= nC) return;
+    diag[c] += V[c]*coeff[c];
+}
+
 __global__ void copyMaskKernel(int nC, const label* src, label* dst)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -582,15 +611,47 @@ void production(
     // exactly these and are already gated.
     // ...through the case's grad(U) scheme (kEpsilon.C:237): leastSquares where it resolves so, then
     // cellLimited where fvSchemes says so (kEpsilon_cpp.cu:260-262 is the reference).
-    if (in.co.gradULeastSq) deviceLeastSquaresGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU);
-    else                    deviceGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU);
-    if (in.co.gradULimitK > scalar(0)) deviceCellLimitGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU, in.co.gradULimitK);
+    // ...WITH THE PAIR. fvc::grad sums a coupled face like any other patch's (fvc.cu's gaussGrad), and
+    // the production term reads this gradient in every cell -- including the pair's own, where a
+    // gradient built without it is the gradient of a field with a wall there.
+    if (in.co.gradULeastSq)
+    {
+        if (in.cyc && in.cyc->n > 0)
+        {
+            throw std::runtime_error(
+                "kEpsilon(cuda): the case asks for a leastSquares grad(U) and the mesh has a periodic "
+                "pair. deviceLeastSquaresGradU does not carry an interface, so the pair's cells would "
+                "get a gradient fitted without it. The Gauss form does; the host closure carries both.");
+        }
+        deviceLeastSquaresGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU);
+    }
+    else
+    {
+        deviceGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU, /*ami=*/nullptr, in.cyc);
+    }
+    if (in.co.gradULimitK > scalar(0))
+        deviceCellLimitGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU, in.co.gradULimitK, in.cyc);
     deviceGByNuFromGradU(st.gradU, nC, st.gByNu);
 
     // divU is the DILATATION and comes from the VOLUMETRIC flux; divPhi is the EQUATION's own mass-flux
     // divergence and is only read by `bounded`. In the incompressible lineage these are one field.
     deviceDiv(dm, *in.phiByRhoInt, *in.phiByRhoBnd, st.divU);
     deviceDiv(dm, *in.phiInt, *in.phiBnd, st.divPhi);
+    // ...and the PAIR's faces, which fvc::div sums into their own cell like any other patch's
+    // (fvc.cu:548-550). Each divergence takes ITS OWN flux there: divU the volumetric one and divPhi
+    // the equation's, which are one field only in the incompressible lineage.
+    if (in.cyc && in.cyc->n > 0)
+    {
+        if (!in.cycPhi || !in.cycPhiByRho)
+        {
+            throw std::runtime_error(
+                "kEpsilon(cuda): the mesh has a periodic pair and the caller gave no flux for it. "
+                "divU takes the VOLUMETRIC flux on those faces and divPhi the equation's own; the "
+                "internal-face arrays cannot stand in for either.");
+        }
+        deviceCyclicAddDivFlux(*in.cyc, *in.cycPhiByRho, dm.V, st.divU);
+        deviceCyclicAddDivFlux(*in.cyc, *in.cycPhi, dm.V, st.divPhi);
+    }
 
     // G = nut*GbyNu, captured BEFORE the wall replacement -- which is where OpenFOAM writes it too.
     deviceHadamard(st.G, nut, st.gByNu);
@@ -681,6 +742,12 @@ void assembleTransport(
     sc.snGradLimitCoeff   = in.snGradLimitCoeff;
     sc.bndValues          = bndValues;
     sc.stageTag           = stageTag;
+    // THE PAIR, with the diffusivity as a CELL field: a coupled face takes fvc::interpolate's value,
+    // the two cells' (kEpsilon_cpp.cu:152-158), and gammaBnd above is built from nut's PATCH values,
+    // which is a different number there.
+    sc.cyc       = in.cyc;
+    sc.gammaCell = in.cyc ? &Dcell : nullptr;
+    sc.cycPhi    = in.cycPhi;
     turbulence::assembleScalarTransport(M, dm, db, field, gammaFace, gammaBnd, sc);
 }
 
@@ -726,7 +793,7 @@ void assembleEpsEqn(
         deviceUpdateTurbulentInletSecond(dbK, *in.turbInletEpsMask, *in.turbInletEpsLen,
                                          in.co.Cmu, dbEps);
     }
-    deviceUpdateInletOutlet(dbEps, *in.phiBnd);
+    deviceUpdateInletOutlet(dbEps, in.bcPhiBnd ? *in.bcPhiBnd : *in.phiBnd);
 
     assembleTransport(E, st.DepsilonEff, st.gammaEpsFace, st.gammaEpsBnd, dm, dbEps, epsilon, nut,
                       in.co.sigmaEps, in, epsBndValues, /*stageTag=*/"eps");
@@ -735,9 +802,21 @@ void assembleEpsEqn(
                                          epsilon.data(), st.divU.data(), st.divPhi.data(),
                                          in.co.C1, in.co.C2, in.co.C3, in.co.Cmu,
                                          in.boundedEps ? 1 : 0,
-                                         in.rDeltaT, rhoOldP, epsOld ? epsOld->data() : nullptr,
+                                         // the Euler ddt term, unless the scheme is CrankNicolson's
+                                         in.cn ? scalar(0) : in.rDeltaT, rhoOldP, epsOld ? epsOld->data() : nullptr,
                                          E.diag.data(), E.source.data());
     cudaCheck(cudaGetLastError(), "kEpsilon eps reaction");
+    if (in.cn)
+    {
+        // fvm::ddt(alpha, rho, epsilon_) under CrankNicolson, "ddt0(rho,epsilon)"
+        if (!in.cnDdt0Eps || !in.epsOO || !epsOld || !in.rhoOOCell)
+            throw std::runtime_error("brae kEpsilon (device): CrankNicolson needs epsilon's ddt0 field, its old-old level and rho's.");
+        const DeviceBuffer<scalar>* old[1] = {epsOld};
+        const DeviceBuffer<scalar>* oo[1] = {in.epsOO};
+        DeviceBuffer<scalar>* src[1] = {&E.source};
+        deviceCnFvmDdt(*in.cn, *in.cnDdt0Eps, in.rhoCell, in.rhoOldCell ? in.rhoOldCell : in.rhoCell, in.rhoOOCell,
+                       1, old, oo, dm.V, E.diag, src);
+    }
 }
 
 
@@ -768,7 +847,7 @@ void assembleKEqn(
     {
         deviceUpdateTurbulentInletK(dbU, *in.turbInletKMask, *in.turbInletKInt, dbK);
     }
-    deviceUpdateInletOutlet(dbK, *in.phiBnd);
+    deviceUpdateInletOutlet(dbK, in.bcPhiBnd ? *in.bcPhiBnd : *in.phiBnd);
 
     assembleTransport(K, st.DkEff, st.gammaKFace, st.gammaKBnd, dm, dbK, k, nut, in.co.sigmaK, in, kBndValues,
                       /*stageTag=*/"k");
@@ -776,9 +855,20 @@ void assembleKEqn(
     kReactionKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), in.rhoCell->data(), st.G.data(), k.data(),
                                        epsilon.data(), st.divU.data(), st.divPhi.data(),
                                        in.boundedK ? 1 : 0,
-                                       in.rDeltaT, rhoOldP, kOld ? kOld->data() : nullptr,
+                                       in.cn ? scalar(0) : in.rDeltaT, rhoOldP, kOld ? kOld->data() : nullptr,
                                        K.diag.data(), K.source.data());
     cudaCheck(cudaGetLastError(), "kEpsilon k reaction");
+    if (in.cn)
+    {
+        // fvm::ddt(alpha, rho, k_) under CrankNicolson, "ddt0(rho,k)"
+        if (!in.cnDdt0K || !in.kOO || !kOld || !in.rhoOOCell)
+            throw std::runtime_error("brae kEpsilon (device): CrankNicolson needs k's ddt0 field, its old-old level and rho's.");
+        const DeviceBuffer<scalar>* old[1] = {kOld};
+        const DeviceBuffer<scalar>* oo[1] = {in.kOO};
+        DeviceBuffer<scalar>* src[1] = {&K.source};
+        deviceCnFvmDdt(*in.cn, *in.cnDdt0K, in.rhoCell, in.rhoOldCell ? in.rhoOldCell : in.rhoCell, in.rhoOOCell,
+                       1, old, oo, dm.V, K.diag, src);
+    }
 }
 
 
@@ -990,7 +1080,8 @@ void finishAndSolve(
     const KEpsilonInput&        in,
     scalar&                     residualOut,
     const std::string&          dumpPrefix,
-    bool                        gs)
+    bool gs,
+    DeviceSolverPerf* perfOut)
 {
     turbulence::SolveControls sv;
     sv.tol         = in.tol;
@@ -1003,8 +1094,9 @@ void finishAndSolve(
     sv.polyDeg     = in.polyDeg;
     sv.gsColour    = in.gsColour;
     sv.colouring   = in.colouring;
+    sv.pbicg       = in.pbicgKE;
     turbulence::solveScalarEqn(M, field, dm, relaxEquation, alpha, fvoMask, fvoVal, wallMask, wallVal,
-                               sv, residualOut, dumpPrefix, gs);
+                               sv, residualOut, dumpPrefix, gs, perfOut, in.cyc);
 }
 
 } // namespace
@@ -1105,6 +1197,15 @@ void correct(
         PressureMatrix& E = turbulenceMatrix(dm, 0);
         assembleEpsEqn(E, st, dm, dbEps, dbK, epsilon, k, nut, in, dbEps.n ? &epsBndLast : nullptr,
                        epsOld.size() ? &epsOld : nullptr);
+        // + fvOptions(alpha, rho, epsilon_), kEpsilon.C:258: the last term on the right, ahead of relax()
+        if (in.fvoSpEps)
+        {
+            if (in.fvoSpEps->size() != static_cast<std::size_t>(dm.nCells))
+                throw std::runtime_error("brae kEpsilon (device): fvoSpEps must be one coefficient per cell.");
+            fvOptionsSpKernel<<<nBlk(dm.nCells), TPB>>>(dm.nCells, dm.V.data(), in.fvoSpEps->data(),
+                                                        E.diag.data());
+            cudaCheck(cudaGetLastError(), "kEpsilon fvOptions(epsilon)");
+        }
 
         // The wall constraint's VALUE IS THE CURRENT FIELD, not the eps0 array -- OpenFOAM's
         // epsilonWallFunction::manipulateMatrix is
@@ -1119,10 +1220,24 @@ void correct(
         //
         // wallTreatment has already written eps0 into epsilon for every wall cell, so on a case with no
         // constraint this reads exactly what it read before.
+        // epsilonWallFunction IS A fixedValue PATCH in OpenFOAM, so at relax() its faces still carry
+        // the laplacian's fixedValue coefficient and the relaxed diagonal is
+        // max(|D0 + ic|, sumOff)/alpha - ic, not D0/alpha. See kEpsilon_cpp.cu, where it was found and
+        // measured (interFoam RAS/damBreak at relaxation 0.7: epsilon equal to 1e-13 while every
+        // residual of its solve sat 1.1e-04 from OpenFOAM's). The rows are the ones setValues pins
+        // next, so only normFactor -- and so where the solve stops -- can see it.
+        if (in.relaxEquationEps && in.relaxEps > scalar(0) && dbEps.n && in.wfBndMask)
+        {
+            wallLaplacianCoeffKernel<<<nBlk(dbEps.n), TPB>>>(dbEps.n, in.wfBndMask->data(),
+                                                             st.gammaEpsBnd.data(),
+                                                             dbEps.deltaCoeffs.data(),
+                                                             dbEps.magSf.data(), E.iC.data());
+            cudaCheck(cudaGetLastError(), "kEpsilon wall laplacian coefficient");
+        }
         finishAndSolve(E, epsilon, dm, in.relaxEquationEps, in.relaxEps,
                        in.fvoEpsMask, in.fvoEpsVal,
                        &st.isWallCell, &epsilon, in, st.epsResidual,
-                       dumpDir.empty() ? std::string() : dumpDir + "eps", in.gsEps);
+                       dumpDir.empty() ? std::string() : dumpDir + "eps", in.gsEps, &st.epsPerf);
 
         boundField(epsilon, dm, dbEps, in.co.epsilonMin, "epsilon");
     }
@@ -1132,12 +1247,21 @@ void correct(
         PressureMatrix& K = turbulenceMatrix(dm, 1);      // FP-10: persistent, see the epsilon equation
         assembleKEqn(K, st, dm, dbK, dbU, k, epsilon, nut, in, dbK.n ? &kBndLast : nullptr,
                      kOld.size() ? &kOld : nullptr);
+        // + fvOptions(alpha, rho, k_), kEpsilon.C:279
+        if (in.fvoSpK)
+        {
+            if (in.fvoSpK->size() != static_cast<std::size_t>(dm.nCells))
+                throw std::runtime_error("brae kEpsilon (device): fvoSpK must be one coefficient per cell.");
+            fvOptionsSpKernel<<<nBlk(dm.nCells), TPB>>>(dm.nCells, dm.V.data(), in.fvoSpK->data(),
+                                                        K.diag.data());
+            cudaCheck(cudaGetLastError(), "kEpsilon fvOptions(k)");
+        }
 
         // No wall mask: see finishAndSolve.
         finishAndSolve(K, k, dm, in.relaxEquationK, in.relaxK,
                        in.fvoKMask, in.fvoKVal,
                        nullptr, nullptr, in, st.kResidual,
-                       dumpDir.empty() ? std::string() : dumpDir + "k", in.gsK);
+                       dumpDir.empty() ? std::string() : dumpDir + "k", in.gsK, &st.kPerf);
 
         boundField(k, dm, dbK, in.co.kMin, "k");
     }

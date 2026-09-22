@@ -35,7 +35,9 @@
 #include "rotor_disk.cuh"
 #include "actuation_disk.cuh"
 #include "device_ldu.cuh"
-#include "device_fvoptions.cuh"   // DevicePorosity + deviceFvoPorosityDiag/Source
+#include "device_fvoptions.cuh"
+#include "device_crank_nicolson_ddt.cuh"
+#include "device_cyclic.cuh"   // DevicePorosity + deviceFvoPorosityDiag/Source
 #include "UEqn_cpp.cuh"   // cpu::DivScheme -- one enum shared by both paths
 
 namespace brae {
@@ -51,6 +53,13 @@ struct MomentumMatrix
     // reference adds (diag - D0)*psi to the source, and having it explicitly makes that step checkable.
     DeviceBuffer<scalar> relaxedDiag, delta;
     bool relaxed = false;
+    // THE PAIR'S OFF-DIAGONAL, KEPT WITH THE MATRIX IT BELONGS TO. DeviceCyclic::ifCoeff is ONE array
+    // and every assembly overwrites it, so after the pressure laplacian has been assembled the pair
+    // carries the PRESSURE coefficient. fvMatrix::H() is the momentum matrix's and needs the
+    // momentum one. MEASURED on validation/interFoamCyclic: with nCorrectors 1 the two arms agree to
+    // 5.6e-11 in U, and from the SECOND corrector -- the first whose H sees a non-zero U across the
+    // pair -- to 6.9e-03, because H was weighted by p_rgh's coefficient.
+    DeviceBuffer<scalar> cycIfCoeff;
 
     DeviceLduView view(const DeviceMesh& dm) const
     {
@@ -61,6 +70,7 @@ struct MomentumMatrix
         A.owner = dm.owner.data(); A.nei = dm.nei.data();
         A.ownerStart = dm.ownerStart.data();
         A.losort = dm.losort.data(); A.losortStart = dm.losortStart.data();
+        A.addressingId = dm.addressingId;
         return A;
     }
 };
@@ -73,6 +83,41 @@ struct MomentumInput
     const DeviceBuffer<scalar>* nuEffFace = nullptr;     // internal faces (interpolated)
     const DeviceBuffer<scalar>* nuEffBndFace = nullptr;  // boundary faces -- the PATCH value, not the cell's
     scalar relaxU = 1.0;
+    // THE GUARD IS "THE CASE NAMES A FACTOR", NOT "THE FACTOR IS BELOW 1". relaxEquation() FINDS
+    // `equations { ".*" 1; }` -- damBreak's fvSolution says exactly that -- and relax(1) still runs the
+    // diagonal-dominance clamp D = max(|D|, sumOff)/alpha (fvMatrix.C:1102-1107). Skipping relax at
+    // alpha == 1 would differ from OpenFOAM on every shipped interFoam tutorial. It defaults to false,
+    // which leaves simpleFoam on the `0 < relaxU < 1` condition it has always used.
+    bool   relaxEquation = false;
+
+    // interFoam's fvm::ddt(rho, U), Euler: rho on the DIAGONAL and rho.oldTime() in the SOURCE, which
+    // at a VoF interface differ by a factor of 1000. Added BEFORE relax(), as the matrix constructor's
+    // `+` does. All null means a steady equation, which is what simpleFoam has.
+    // U's STORED boundary values, one buffer per component. OF's fvc::grad(U) inside
+    // linearViscousStress reads U.boundaryField() -- the value the LAST evaluate left -- and does not
+    // re-derive it. Null makes deviceDivDevReff re-derive with deviceBCValue, which is the same number
+    // only while the caller evaluates U's boundary the same way; at a flux-conditional patch like
+    // damBreak's pressureInletOutletVelocity atmosphere it is not.
+    // The SAME values feed every other fvc::grad(U) of the assembly -- linearUpwind's deferred
+    // correction, the corrected laplacian's -- through deviceGradUShared: one field, one set of patch
+    // values. They did not until laminar/damBreakPermeable, where a wall face going dry moves the
+    // patch's coefficients at the assembly while its stored value stays a wall's.
+    const DeviceBuffer<scalar>* const* UbStored = nullptr;
+
+    const DeviceBuffer<scalar>* ddtRho    = nullptr;
+    const DeviceBuffer<scalar>* ddtRhoOld = nullptr;
+    // the cell volumes BEFORE a mesh move (OF fvMesh::movePoints stores them, and EulerDdtScheme's
+    // source is rho.oldTime()*vf.oldTime()*Vsc0()). Null on a static mesh, where Vsc0() is V.
+    const DeviceBuffer<scalar>* ddtV0 = nullptr;
+    const DeviceBuffer<scalar>* ddtUOld[3] = {nullptr, nullptr, nullptr};
+    scalar ddtDeltaT = 0;
+    // ...or CrankNicolson's fvm::ddt(rho, U) in Euler's place (device_crank_nicolson_ddt.cuh): the
+    // scheme's clock, the equation's OWN ddt0 field kept by the caller across steps, and the old-old
+    // levels of rho and U. All or none; with `ddtCn` set, ddtV0 (a moving mesh) is refused.
+    const cpu::fv::CrankNicolsonClock* ddtCn = nullptr;
+    DeviceCnDdt0*               ddtCnDdt0 = nullptr;
+    const DeviceBuffer<scalar>* ddtRhoOO  = nullptr;
+    const DeviceBuffer<scalar>* ddtUOO[3] = {nullptr, nullptr, nullptr};
     bool   bounded = false;   // `bounded Gauss <scheme>`: diag -= V*div(phi); see UEqn_cpp.cuh
     // `Gauss linearUpwind grad(U)`: the matrix stays pure upwind and the whole scheme is a deferred
     // source correction -- see UEqn_cpp.cuh. Unlike `bounded` it does NOT vanish at convergence.
@@ -99,10 +144,36 @@ struct MomentumInput
     // `limited <k> corrected` (OF limitedSnGrad). 0 = uncapped, which is what `corrected` means.
     scalar snGradLimitCoeff = 0.0;
     bool   hasMRF = false;
+    // MRF.DDt(rho, U) rather than MRF.DDt(U): MRFZoneList::DDt(rho, U) IS rho*DDt(U) (MRFZoneList.C:
+    // 210-217), so a solver whose momentum equation is rho-weighted (interFoam, rhoSimpleFoam) hands its
+    // rho here and the Coriolis source is weighted per cell. Null = the incompressible form.
+    const DeviceBuffer<scalar>* mrfRho = nullptr;
     bool   hasFvOptions = false;   // an UNIMPLEMENTED option -> refuse
     // explicitPorositySource/DarcyForchheimer, evaluated on the device each iteration from the current U.
     // nuLaminar, not nuEff: DarcyForchheimer.C looks up the field NAMED "nu".
     const DevicePorosity* porosity = nullptr;
+    // ...and its mu and rho as FIELDS, for an equation in force units whose mixture varies by cell:
+    // Cd = mu*D + rho*|U|*F with mu = rho*nu_laminar (DarcyForchheimer.C:214-217). Null keeps the
+    // kinematic defaults, mu = nuLaminar and rho = 1.
+    // A PERIODIC PAIR. Its momentum coupling is an interface off-diagonal, not a boundary coefficient:
+    // deviceCyclicAssembleMomentum puts -(nuFace*dc*magSf) + min(phi,0) in ifCoeff and the matching
+    // diagonal in M.diag, and the relaxation's diagonal-dominance term has to count |ifCoeff| too or a
+    // periodic mesh relaxes against a diagonal it does not have. `cyc.phi` must hold the pair's CURRENT
+    // flux before this is called. Null = a mesh with no pair, which is every case that had one before.
+    DeviceCyclic* cyc = nullptr;
+    bool cycCorrected = true;          // the diffusion half's delta coefficients, as the laplacian's
+    // ...and the flux the CONVECTION half uses on the pair, when it is not the pair's own phi.
+    // interFoam's UEqn is fvm::div(rhoPhi, U) and cyc.phi is the volumetric flux; see
+    // deviceCyclicAssembleMomentum. Null = cyc.phi, which is what an incompressible solver wants.
+    const DeviceBuffer<scalar>* cycConvFlux = nullptr;
+    const DeviceBuffer<scalar>* porosityMu = nullptr;
+    const DeviceBuffer<scalar>* porosityRho = nullptr;
+    // multiphaseMangrovesSource, `== fvOptions(rho, U)` on a rho-weighted TRANSIENT equation: a drag
+    // and an added mass whose ddt(U) reads U.oldTime() and the step, so it takes ddtUOld and ddtDeltaT
+    // below and is refused without them, as the host reference refuses it (fvOptions_cpp.cu). The rho
+    // is the equation's own, handed separately because a steady solver has none to give.
+    const DeviceMangroves* mangroves = nullptr;
+    const DeviceBuffer<scalar>* mangrovesRho = nullptr;
     // rotorDiskSource. OF addSup is `eqn -= force` with force PER VOLUME, and operator-= is
     // source += V*su, so the extensive source GAINS the raw force. See rotorDiskSource_cpp.cuh.
     const DeviceRotorDisk* rotor = nullptr;

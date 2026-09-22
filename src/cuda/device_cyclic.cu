@@ -49,7 +49,10 @@ void convKernel(
 
     const scalar p = phi[j];
     // Same split as momKernel: the div scheme's weight, upwind when none is given.
-    const scalar ws = wsch ? wsch[j] : ((p > 0.0) ? scalar(1) : scalar(0));
+    // upwind's weight is OpenFOAM's pos0(phi) -- (phi >= 0), not (phi > 0). The host's coupled branch
+    // spells it `(pf >= 0.0)` (fvm.cuh, the fp.coupled branch of fvm::div); the two differ on a face
+    // whose flux is exactly zero, where pos0 takes the OWN cell and `>` takes the neighbour's.
+    const scalar ws = wsch ? wsch[j] : ((p >= 0.0) ? scalar(1) : scalar(0));
     ifCoeff[j] += p * (1.0 - ws);                       // off-diag += phi*(1-w)
     atomicAdd(&diag[own[j]], p * ws);                   // diag    += phi*w
 }
@@ -78,7 +81,10 @@ void momKernel(
     // The convective split is the DIV SCHEME's, not always upwind -- see amiMomKernel for the
     // OpenFOAM derivation. wsch == null is upwind (pos0(phi)) and reproduces the previous
     // min(phi,0)/max(phi,0) form exactly.
-    const scalar ws = wsch ? wsch[j] : ((p > 0.0) ? scalar(1) : scalar(0));
+    // upwind's weight is OpenFOAM's pos0(phi) -- (phi >= 0), not (phi > 0). The host's coupled branch
+    // spells it `(pf >= 0.0)` (fvm.cuh, the fp.coupled branch of fvm::div); the two differ on a face
+    // whose flux is exactly zero, where pos0 takes the OWN cell and `>` takes the neighbour's.
+    const scalar ws = wsch ? wsch[j] : ((p >= 0.0) ? scalar(1) : scalar(0));
     ifCoeff[j] = -lap + p * (1.0 - ws);                 // off-diag: -laplacian + phi*(1-w)
     atomicAdd(&diag[own[j]], lap + p * ws);             // diag: +laplacian + phi*w
 }
@@ -154,19 +160,54 @@ void divAddKernel(
 }
 
 
+// fvMatrix::flux() on a coupled face is internalCoeffs*pif - boundaryCoeffs*pnf (fvMatrix.C:1483-1512),
+// and the laplacian gives that pair the SAME coefficient (fvm.cuh, the fp.coupled branch), so it reduces
+// to ifCoeff*(p_nbr - p_own). Written once here because two callers need it: the corrector, which
+// subtracts it from the pair's flux, and the velocity correction, which needs the value itself.
+__device__ __forceinline__ scalar cyclicPFlux(
+    scalar ifCoeff,
+    scalar pNbr,
+    scalar pOwn)
+{
+    return ifCoeff * (pNbr - pOwn);
+}
+
 __global__
 void fluxCorrKernel(
     int n,
     const label* __restrict__ own,
     const label* __restrict__ nbr,
     const scalar* __restrict__ ifCoeff,
+    const scalar* __restrict__ jump,        // already signed; null = no jump on this pair
     const scalar* __restrict__ p,
     scalar* __restrict__ phi)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
 
-    phi[j] -= ifCoeff[j] * (p[nbr[j]] - p[own[j]]);     // snGrad(p) flux: -coeff*(p_nbr - p_own)
+    const scalar pnf = jump ? (p[nbr[j]] - jump[j]) : p[nbr[j]];
+    phi[j] -= cyclicPFlux(ifCoeff[j], pnf, p[own[j]]);   // snGrad(p) flux: -coeff*(pnf - p_own)
+}
+
+
+__global__
+void fluxOfPKernel(
+    int n,
+    const label* __restrict__ own,
+    const label* __restrict__ nbr,
+    const scalar* __restrict__ ifCoeff,
+    const scalar* __restrict__ jump,        // already signed; null = no jump on this pair
+    const scalar* __restrict__ p,
+    scalar* __restrict__ out)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+
+    // fvMatrix::flux() reads patchNeighbourField(), which on a jump cyclic is the cell across LESS
+    // the jump (jumpCyclicFvPatchField.C:94-125). Unlike updateInterfaceMatrix there is no "only on
+    // the original field" test here: flux() is always the field's own.
+    const scalar pnf = jump ? (p[nbr[j]] - jump[j]) : p[nbr[j]];
+    out[j] = cyclicPFlux(ifCoeff[j], pnf, p[own[j]]);
 }
 
 
@@ -245,6 +286,7 @@ void gradAddKernel(
     const label* __restrict__ nbr,
     const scalar* __restrict__ w,
     const scalar* __restrict__ psi,
+    const scalar* __restrict__ jump,        // already signed; null = no jump on this pair
     const scalar* __restrict__ Sfx,
     const scalar* __restrict__ Sfy,
     const scalar* __restrict__ Sfz,
@@ -257,7 +299,10 @@ void gradAddKernel(
     if (j >= n) return;
 
     const label o = own[j];
-    const scalar fv = (w[j] * psi[o] + (1.0 - w[j]) * psi[nbr[j]]) / V[o];
+    // fvc::grad interpolates the patch's own value, and on a jump cyclic the neighbour half of that
+    // interpolation is the cell across LESS the jump (jumpCyclicFvPatchField::patchNeighbourField)
+    const scalar pnf = jump ? (psi[nbr[j]] - jump[j]) : psi[nbr[j]];
+    const scalar fv = (w[j] * psi[o] + (1.0 - w[j]) * pnf) / V[o];
     atomicAdd(&gx[o], Sfx[j] * fv);
     atomicAdd(&gy[o], Sfy[j] * fv);
     atomicAdd(&gz[o], Sfz[j] * fv);
@@ -430,11 +475,15 @@ void deviceCyclicAssembleLaplacian(
     DeviceCyclic& cyc,
     const DeviceBuffer<scalar>& gammaCell,
     DeviceBuffer<scalar>& diag,
-    bool addToDiag)
+    bool addToDiag,
+    bool corrected)
 {
     if (cyc.n == 0) return;
+    // the host's own choice (fvm.cuh:104-113): nonOrthDeltaCoeffs when corrected, deltaCoeffs when not
+    const scalar* dc = (corrected || cyc.orthDeltaCoeffs.size() != cyc.deltaCoeffs.size())
+                     ? cyc.deltaCoeffs.data() : cyc.orthDeltaCoeffs.data();
     laplKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), gammaCell.data(),
-        cyc.deltaCoeffs.data(), cyc.weights.data(), cyc.magSf.data(), cyc.ifCoeff.data(), diag.data(), addToDiag ? 1 : 0);
+        dc, cyc.weights.data(), cyc.magSf.data(), cyc.ifCoeff.data(), diag.data(), addToDiag ? 1 : 0);
     cudaCheck(cudaGetLastError(), "cyclicLapl");
 }
 
@@ -450,11 +499,17 @@ void deviceCyclicAddConvection(DeviceCyclic& cyc, DeviceBuffer<scalar>& diag, co
 
 
 void deviceCyclicAssembleMomentum(DeviceCyclic& cyc, const DeviceBuffer<scalar>& nuEffCell, DeviceBuffer<scalar>& diag,
-                                  const DeviceBuffer<scalar>* wsch)
+                                  const DeviceBuffer<scalar>* wsch,
+                                  bool corrected,
+                                  const DeviceBuffer<scalar>* convFlux)
 {
     if (cyc.n == 0) return;
+    // the diffusion half's own choice, as the laplacian entry point above makes it
+    const scalar* dc = (corrected || cyc.orthDeltaCoeffs.size() != cyc.deltaCoeffs.size())
+                     ? cyc.deltaCoeffs.data() : cyc.orthDeltaCoeffs.data();
     momKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), nuEffCell.data(),
-        cyc.deltaCoeffs.data(), cyc.weights.data(), cyc.magSf.data(), cyc.phi.data(),
+        dc, cyc.weights.data(), cyc.magSf.data(),
+        (convFlux && static_cast<int>(convFlux->size()) == cyc.n) ? convFlux->data() : cyc.phi.data(),
         (wsch && (label)wsch->size() == cyc.n) ? wsch->data() : nullptr,
         cyc.ifCoeff.data(), diag.data());
     cudaCheck(cudaGetLastError(), "cyclicMom");
@@ -465,10 +520,13 @@ void deviceCyclicAddH(
     const DeviceCyclic& cyc,
     const DeviceBuffer<scalar>& psi,
     const DeviceBuffer<scalar>& V,
-    DeviceBuffer<scalar>& H)
+    DeviceBuffer<scalar>& H,
+    const DeviceBuffer<scalar>* coeff)
 {
     if (cyc.n == 0) return;
-    addHKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.ifCoeff.data(),
+    const scalar* c = (coeff && static_cast<int>(coeff->size()) == cyc.n) ? coeff->data()
+                                                                         : cyc.ifCoeff.data();
+    addHKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), c,
         psi.data(), V.data(), H.data());
     cudaCheck(cudaGetLastError(), "cyclicAddH");
 }
@@ -482,25 +540,46 @@ void deviceCyclicOffDiagSum(const DeviceCyclic& cyc, DeviceBuffer<scalar>& sumOf
 }
 
 
+void deviceCyclicFluxTo(
+    DeviceCyclic& cyc,
+    const DeviceBuffer<scalar>& Hx,
+    const DeviceBuffer<scalar>& Hy,
+    const DeviceBuffer<scalar>& Hz,
+    DeviceBuffer<scalar>& out)
+{
+    if (cyc.n == 0) { out.resize(0); return; }
+    out.resize(static_cast<std::size_t>(cyc.n));
+    fluxKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.weights.data(),
+        Hx.data(), Hy.data(), Hz.data(), cyc.Sfx.data(), cyc.Sfy.data(), cyc.Sfz.data(), out.data());
+    cudaCheck(cudaGetLastError(), "cyclicFlux");
+}
+
+
 void deviceCyclicFlux(
     DeviceCyclic& cyc,
     const DeviceBuffer<scalar>& Hx,
     const DeviceBuffer<scalar>& Hy,
     const DeviceBuffer<scalar>& Hz)
 {
+    deviceCyclicFluxTo(cyc, Hx, Hy, Hz, cyc.phi);
+}
+
+
+void deviceCyclicAddDivFlux(const DeviceCyclic& cyc,
+    const DeviceBuffer<scalar>& phi, const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& div)
+{
     if (cyc.n == 0) return;
-    fluxKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.weights.data(),
-        Hx.data(), Hy.data(), Hz.data(), cyc.Sfx.data(), cyc.Sfy.data(), cyc.Sfz.data(), cyc.phi.data());
-    cudaCheck(cudaGetLastError(), "cyclicFlux");
+    divAddKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), phi.data(), V.data(), div.data());
+    cudaCheck(cudaGetLastError(), "cyclicDiv");
 }
 
 
 void deviceCyclicAddDiv(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& div)
 {
-    if (cyc.n == 0) return;
-    divAddKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.phi.data(), V.data(), div.data());
-    cudaCheck(cudaGetLastError(), "cyclicDiv");
+    deviceCyclicAddDivFlux(cyc, cyc.phi, V, div);
 }
+
+
 
 
 namespace {
@@ -522,12 +601,27 @@ void deviceCyclicZeroWallIfCoeff(DeviceCyclic& cyc, const DeviceBuffer<label>& i
 }
 
 
-void deviceCyclicCorrectFlux(DeviceCyclic& cyc, const DeviceBuffer<scalar>& p)
+void deviceCyclicCorrectFlux(DeviceCyclic& cyc, const DeviceBuffer<scalar>& p,
+                             const DeviceBuffer<scalar>* jump)
 {
     if (cyc.n == 0) return;
+    const scalar* j = (jump && static_cast<int>(jump->size()) == cyc.n) ? jump->data() : nullptr;
     fluxCorrKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.ifCoeff.data(),
-        p.data(), cyc.phi.data());
+        j, p.data(), cyc.phi.data());
     cudaCheck(cudaGetLastError(), "cyclicFluxCorr");
+}
+
+
+void deviceCyclicPressureFlux(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& p,
+                              DeviceBuffer<scalar>& out,
+                              const DeviceBuffer<scalar>* jump)
+{
+    out.resize(static_cast<std::size_t>(cyc.n));
+    if (cyc.n == 0) return;
+    const scalar* j = (jump && static_cast<int>(jump->size()) == cyc.n) ? jump->data() : nullptr;
+    fluxOfPKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(),
+        cyc.ifCoeff.data(), j, p.data(), out.data());
+    cudaCheck(cudaGetLastError(), "cyclicPressureFlux");
 }
 
 
@@ -593,11 +687,13 @@ void deviceCyclicAddGrad(
     const DeviceBuffer<scalar>& V,
     DeviceBuffer<scalar>& gx,
     DeviceBuffer<scalar>& gy,
-    DeviceBuffer<scalar>& gz)
+    DeviceBuffer<scalar>& gz,
+    const DeviceBuffer<scalar>* jump)
 {
     if (cyc.n == 0) return;
+    const scalar* j = (jump && static_cast<int>(jump->size()) == cyc.n) ? jump->data() : nullptr;
     gradAddKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.weights.data(),
-        psi.data(), cyc.Sfx.data(), cyc.Sfy.data(), cyc.Sfz.data(), V.data(), gx.data(), gy.data(), gz.data());
+        psi.data(), j, cyc.Sfx.data(), cyc.Sfy.data(), cyc.Sfz.data(), V.data(), gx.data(), gy.data(), gz.data());
     cudaCheck(cudaGetLastError(), "cyclicGrad");
 }
 
@@ -746,10 +842,17 @@ void deviceCyclicAddLinUpwindCorr(
     const DeviceBuffer<scalar>* gUx,
     const DeviceBuffer<scalar>* gUy,
     const DeviceBuffer<scalar>* gUz,
-    DeviceBuffer<scalar>& corr)
+    DeviceBuffer<scalar>& corr,
+    const DeviceBuffer<scalar>* flux)
 {
     if (cyc.n == 0) return;
-    cycLinUpwindKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.phi.data(),
+    // THE EQUATION'S OWN FLUX, not the volumetric one this interface happens to carry. interFoam's
+    // momentum is div(rhoPhi,U), so its deferred correction is weighted by the SAME rhoPhi the matrix
+    // was assembled with (MomentumInput::cycConvFlux); an incompressible driver passes nothing and
+    // takes cyc.phi, which is what it assembled with.
+    const scalar* f = (flux && static_cast<int>(flux->size()) == cyc.n) ? flux->data()
+                                                                       : cyc.phi.data();
+    cycLinUpwindKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), f,
         gUx[0].data(), gUy[0].data(), gUz[0].data(), gUx[1].data(), gUy[1].data(), gUz[1].data(),
         gUx[2].data(), gUy[2].data(), gUz[2].data(),
         cyc.dOwnX.data(), cyc.dOwnY.data(), cyc.dOwnZ.data(), cyc.dNbrX.data(), cyc.dNbrY.data(), cyc.dNbrZ.data(),

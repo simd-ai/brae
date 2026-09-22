@@ -63,6 +63,7 @@
 #include "device_colour_gauss_seidel.cuh"   // DeviceCellColouring: the colour-order smoothSolver (FP-1)
 #include "kepsilon_coeffs.cuh"
 #include "pEqn.cuh"               // PressureMatrix -- the assembled scalar object, shared not redefined
+#include "device_crank_nicolson_ddt.cuh"
 #include <string>
 
 namespace brae {
@@ -76,6 +77,13 @@ struct KEpsilonInput
     const DeviceBuffer<scalar>* phiBnd      = nullptr;
     const DeviceBuffer<scalar>* phiByRhoInt = nullptr;   // VOLUMETRIC flux -- divU ONLY
     const DeviceBuffer<scalar>* phiByRhoBnd = nullptr;
+    // THE FLUX A FLUX-CONDITIONAL PATCH LOOKS UP, when that is not the equation's own -- the host
+    // reference's Compressible::bcPhi. inletOutlet reads the registry's `phi`. In rhoSimpleFoam that IS
+    // the mass flux above, so null (the equation's flux) is right. In interFoam's `density variable`
+    // lineage the equation convects with rhoPhi, which the ALPHA step built from the phi the time step
+    // started on; `phi` has been through the pressure correctors since. Measured on RAS/damBreak at
+    // step one: rhoPhi is exactly 0 on all 46 atmosphere faces (phi started at rest) and phi is not.
+    const DeviceBuffer<scalar>* bcPhiBnd = nullptr;
 
     // --- the compressible instantiation: alpha = 1, rho = the solver's relaxed density ---
     const DeviceBuffer<scalar>* rhoCell    = nullptr;
@@ -134,6 +142,29 @@ struct KEpsilonInput
     // variant and ONE nSweeps for the pair, which linear_solver_setup refuses to resolve when they differ.
     bool   gsK = false, gsEps = false, gsSymmetric = true;
     int    nSweepsKE = 1;
+    // ...or `solver PBiCG; preconditioner DILU;` for BOTH equations (device_pbicg.cuh): NOT PBiCGStab,
+    // and it needs `precon` below to carry the mesh's DILU schedule. waves/mangroveInteraction names it.
+    bool   pbicgKE = false;
+    // ...or CrankNicolson's fvm::ddt in Euler's place (device_crank_nicolson_ddt.cuh), transcribed from
+    // the host closure: the scheme's clock, the two equations' OWN ddt0 fields kept by the caller across
+    // steps, rho.oldTime().oldTime() (the ones vector in the incompressible lineage, as rhoCell is) and
+    // the fields' old-old levels (k.oldTime().oldTime(), which the caller rotates once per time index).
+    // rDeltaT must still be positive -- it marks the equation transient and the old levels are taken
+    // -- but the Euler term is not added. The static form only; the interFoam driver refuses
+    // CrankNicolson beside a moving mesh before the closure is built.
+    const cpu::fv::CrankNicolsonClock* cn = nullptr;
+    DeviceCnDdt0*               cnDdt0Eps = nullptr;
+    DeviceCnDdt0*               cnDdt0K   = nullptr;
+    const DeviceBuffer<scalar>* rhoOOCell = nullptr;
+    const DeviceBuffer<scalar>* epsOO     = nullptr;
+    const DeviceBuffer<scalar>* kOO       = nullptr;
+    // + fvOptions(epsilon) and + fvOptions(k) for an option whose addSup is -fvm::Sp(coeff, field): one
+    // coefficient per cell, which the matrix takes as diag += V*coeff after every other term and before
+    // relax() (kEpsilon.C:258 and :279). The CALLER forms the coefficient, from whatever the option
+    // reads -- the mangroves' is Cx*Cd*a*N*|U|. Null = no such option. The incompressible lineage
+    // only: OpenFOAM's density-weighted form is -Sp(rho*coeff) and no gate holds it.
+    const DeviceBuffer<scalar>* fvoSpEps = nullptr;
+    const DeviceBuffer<scalar>* fvoSpK   = nullptr;
     // FP-1: sweep the honoured smoothSolver in COLOUR order over `colouring` (turbulence_transport.cuh
     // SolveControls::gsColour); the driver announces the order per field.
     bool   gsColour = false;
@@ -222,6 +253,17 @@ struct KEpsilonInput
 
     // --- refusals ---
     bool        hasCoupledPatches      = false;
+    // A PERIODIC PAIR, once the caller carries one. k's and epsilon's equations are
+    // fvm::div - fvm::laplacian, so across a pair they need the interface off-diagonal in the matrix
+    // AND in the solve -- see TransportScheme::cyc. `cycPhi` is the flux those equations convect with
+    // on the pair's own faces. Both null = no pair, which is what hasCoupledPatches still refuses.
+    DeviceCyclic*               cyc    = nullptr;
+    const DeviceBuffer<scalar>* cycPhi = nullptr;
+    // ...and the VOLUMETRIC flux on the pair, which is a different field from cycPhi in the
+    // compressible lineage: divU is the dilatation and comes from phiByRho, divPhi is the equation's
+    // own mass-flux divergence. In the incompressible lineage the two are one field and the caller
+    // passes the same buffer twice, exactly as it does for phiByRhoInt/phiInt.
+    const DeviceBuffer<scalar>* cycPhiByRho = nullptr;
     bool        hasUnportedFvOption    = false;
     bool        hasNonUpwindDivScheme  = false;
     bool        hasNonWallTurbWallFunc = false;
@@ -249,6 +291,9 @@ struct KEpsilonStages
     scalar epsResidual = 0.0;
     scalar kResidual   = 0.0;
     label  wallCells   = 0;
+    // the two solves whole, for a solver-log gate; the two residuals above are their initial ones
+    DeviceSolverPerf epsPerf;
+    DeviceSolverPerf kPerf;
 };
 
 // Stage 1: gradU, gByNu, divU, divPhi and G. Touches no matrix. G is left PRE-wall, which is the state

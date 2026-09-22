@@ -34,6 +34,11 @@ struct CyclicInterface
     std::vector<vector> delta;
     std::vector<vector> corrVec;            // non-orth correction vector nf - delta*deltaCoeffs (laplacian "corrected")
     bool                translational = true;
+    // An AMI-family pair (cyclicAMI, cyclicACMI). ONE thing reads it: MULES' limiter sync, which is
+    // syncTools::syncFaceList and covers processor and cyclicPolyPatch ONLY (syncToolsTemplates.C:
+    // 1225-1234; cyclicAMIPolyPatch derives from coupledPolyPatch, cyclicAMIPolyPatch.H:70-72), so the
+    // two sides of such a pair keep their OWN lambda. The host carries the same flag as FvPatch::ami.
+    bool                ami = false;
     vector              separation{0, 0, 0};   // translational: period vector Cf_nbr - Cf_own
     tensor              forwardT{1, 0, 0, 0, 1, 0, 0, 0, 1};   // rotational: nbr->own rotation (identity if translational)
 };
@@ -51,10 +56,17 @@ inline tensor rotationTensor(const vector& axis, scalar angle)
 // Build the cyclic interfaces from the mesh. Faces are matched by stored order (OpenFOAM orders cyclic
 // patches so face i pairs with neighbour face i); the constant separation vector is recorded so callers
 // can verify the match geometrically.
+//
+// `includeCoupledACMI`: also take a cyclicACMI pair the caller has ALREADY COUPLED as a coincident
+// translational pair (cpu::cyclicACMI::setup -- every face lies on one twin, AMI weight 1, so the AMI
+// interpolate is a copy and the pair is a cyclic on the mask-scaled areas). OPT-IN, because the legacy
+// drivers call this same function and couple an ACMI through AMIInterface/DeviceAMI instead; taking it
+// here as well would couple it twice there.
 inline std::vector<CyclicInterface> buildCyclicInterfaces(
     const PrimitiveMesh& m,
     const FvGeometry& g,
-    const std::vector<FvPatch>& fvp)
+    const std::vector<FvPatch>& fvp,
+    bool includeCoupledACMI = false)
 {
     std::map<std::string, label> nameToIdx;
     for (label pi = 0; pi < (label)fvp.size(); ++pi) nameToIdx[fvp[pi].name] = pi;
@@ -63,9 +75,11 @@ inline std::vector<CyclicInterface> buildCyclicInterfaces(
     std::vector<CyclicInterface> out;
     for (label pi = 0; pi < (label)fvp.size(); ++pi)
     {
-        if (fvp[pi].type != "cyclic") continue;
+        const bool acmi = includeCoupledACMI && fvp[pi].type == "cyclicACMI" && fvp[pi].coupled;
+        if (fvp[pi].type != "cyclic" && !acmi) continue;
         CyclicInterface ci;
         ci.patch = pi;
+        ci.ami = acmi;
         const std::string nbrName = pinfo[pi].neighbourPatch;
         const auto it = nameToIdx.find(nbrName);
         if (it == nameToIdx.end()) throw std::runtime_error("cyclic: neighbourPatch '" + nbrName + "' not found");

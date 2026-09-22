@@ -1,4 +1,5 @@
 #include "turbulence_transport.cuh"
+#include "device_pbicg.cuh"
 #include <algorithm>
 #include <memory>   // FieldGrad: one gradient per (scheme, limiter) pair an assembly asks for (FP-3)
 #include <vector>   // std::max
@@ -154,6 +155,41 @@ void assembleScalarTransport(
         deviceAxpy(-1.0, lu, M.source);
     }
 
+    // ...AND THE PAIR'S OWN COEFFICIENT, for both halves at once. The equation is
+    // fvm::div(phi, field) - fvm::laplacian(gamma, field), which is the momentum equation's shape, so
+    // the interface coefficient is the momentum's: -gamma_f*dc*magSf + phi*(1 - w) into ifCoeff and
+    // +gamma_f*dc*magSf + phi*w into the diagonal (device_cyclic.cu's momKernel). gamma_f there is the
+    // two CELLS interpolated, which is what a coupled face takes (kEpsilon_cpp.cu:152-158) -- a patch
+    // value would be a different number. The div scheme's weights reach it the same way they reach the
+    // internal faces: null is upwind.
+    //
+    // It goes in BEFORE the laplacian block below because that block SUBTRACTS its own arrays from M,
+    // and the pair's contribution is already signed for the assembled equation.
+    if (sc.cyc && sc.cyc->n > 0)
+    {
+        if (!sc.gammaCell || !sc.cycPhi)
+        {
+            throw std::runtime_error(
+                "brae turbulence transport: the mesh has a periodic pair and the caller gave no CELL "
+                "diffusivity or no flux for it. A coupled face takes fvc::interpolate's value -- the "
+                "two cells' -- so the face array cannot stand in for the first, and the equation's own "
+                "flux on those faces is not the internal-face array.");
+        }
+        // THE PAIR TAKES UPWIND'S WEIGHT, so a case whose div scheme is not upwind is refused rather
+        // than run with one scheme inside and another across the pair. deviceCyclicLimitedWeights
+        // exists for the alpha flux and would serve here; nothing has needed it yet.
+        if (sc.limitedLinear || sc.linearUpwind)
+        {
+            throw std::runtime_error(
+                "brae turbulence transport: the mesh has a periodic pair and the case's div scheme for "
+                "this field is not upwind. The pair's interface coefficient is built with upwind's "
+                "weight, so running it would put one scheme on the internal faces and another across "
+                "the pair. The host closure carries the case's scheme on both.");
+        }
+        deviceCyclicAssembleMomentum(*sc.cyc, *sc.gammaCell, M.diag, /*wsch=*/nullptr,
+                                     sc.correctedLaplacian, sc.cycPhi);
+    }
+
     // - fvm::laplacian(gamma, field).
     {
         DeviceBuffer<scalar> lDiag, lUp, lLo, lIC, lBC, lapSrc;
@@ -256,7 +292,10 @@ void solveScalarEqn(
     const SolveControls&        sv,
     scalar&                     residualOut,
     const std::string&          dumpPrefix,   // "" = no dump; else <dir>/<name> path prefix
-    bool                        gs)           // this field's own solver: the case's smoothSolver, or BiCGStab
+    // this field's own solver: the case's smoothSolver, or BiCGStab
+    bool gs,
+    DeviceSolverPerf* perfOut,
+    DeviceCyclic* cyc)
 {
     const int nC  = dm.nCells;
     const int nIf = dm.nInternalFaces;
@@ -280,7 +319,7 @@ void solveScalarEqn(
     auto applySetValues = [&](const DeviceBuffer<label>* mask, const DeviceBuffer<scalar>* val)
     {
         if (!mask || !val) return;
-        deviceSetValues(dm, *mask, *val, M.diag, M.upper, M.lower, M.source, M.iC, M.bC, field);
+        deviceSetValues(dm, *mask, *val, M.diag, M.upper, M.lower, M.source, M.iC, M.bC, field, cyc);
     };
     applySetValues(fvoMask, fvoVal);
     applySetValues(wallMask, wallVal);
@@ -309,6 +348,18 @@ void solveScalarEqn(
     A.ownerStart = dm.ownerStart.data();
     A.losort = dm.losort.data();
     A.losortStart = dm.losortStart.data();
+    // ...and the PAIR's off-diagonal, which deviceAmul applies as Apsi[own] += ifCoeff*psi[nbr]. The
+    // fold above adds the boundary diagonal only; a coupled patch has none there (deviceFold walks
+    // the device's boundary arrays, which hold no coupled face) because its diagonal went straight
+    // into M.diag with the coefficient. Without this the matrix and the solve are different
+    // operators -- the defect the pressure step's own view note records.
+    if (cyc && cyc->n > 0)
+    {
+        A.nCyc = cyc->n;
+        A.cycOwn = cyc->ownCell.data();
+        A.cycNbr = cyc->nbrCell.data();
+        A.cycCoeff = cyc->ifCoeff.data();
+    }
 
     // Instrument (BRAE_STAGE_DUMP_DIR, see correct()): the FOLDED system as the solver sees it -- diag
     // with the boundary diagonal folded in, source with the boundary source folded in, the two
@@ -353,10 +404,28 @@ void solveScalarEqn(
     else if (gs)
         deviceSymGaussSeidel(A, b, field, dnf.data(), sv.tol, sv.relTol, sv.maxIter, &perf, sv.minIter,
                              sv.nSweeps, sv.gsSymmetric);
+    else if (sv.pbicg)
+    {
+        if (!sv.precon || !sv.precon->valid)
+            throw std::runtime_error(
+                "brae turbulence: PBiCG was selected for a transported scalar and SolveControls::precon "
+                "carries no DILU schedule; PBiCG here is OpenFOAM's PBiCG WITH DILU and nothing else.");
+        // the normFactor is on the device for the other two solvers; this one's recurrence runs on
+        // host scalars (device_pbicg.cu), so it is read once. rD is rebuilt from THIS matrix inside
+        // the solve, which is why the schedule is not const there (device_pcg.cu:604 does the same).
+        std::vector<scalar> nf;
+        dnf.copyTo(nf);
+        perf = devicePBiCGDilu(A, b, field, nf.at(0), sv.tol, sv.relTol, sv.maxIter, sv.minIter,
+                               *const_cast<DeviceDilu*>(sv.precon));
+    }
     else
         perf = deviceJacobiBiCGStab(A, b, field, dnf.data(), sv.tol, sv.relTol, sv.maxIter, /*checkEvery=*/1, sv.minIter,
                                     sv.precon, /*amg=*/nullptr, sv.polyDeg);
     residualOut = perf.initialResidual;
+    if (perfOut)
+    {
+        *perfOut = perf;
+    }
     dump("SolveOut", field);
 }
 

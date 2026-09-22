@@ -287,8 +287,23 @@ inline std::string expandDictVariables(const std::string& rawIn)
     // 2. tokenize with { } ; as separate tokens (parens stay inside their token, e.g. div(phi,U))
     std::string padded;
     padded.reserve(raw.size() * 2);
-    for (char c : raw)
+    for (std::size_t i = 0; i < raw.size(); ++i)
     {
+        const char c = raw[i];
+        // `${name}` is ONE token, a reference, and not a block named `$` holding an empty `name`. Read
+        // that way it defined `name` as nothing, and the flat map then expanded every later `$name` to
+        // nothing: blockMesh/pipe's four `${__edgeSlipDisplacement};` patch entries expanded empty.
+        // `${{ expr }}` is an inline #eval and keeps the padding.
+        if (c == '$' && i + 1 < raw.size() && raw[i + 1] == '{')
+        {
+            const std::size_t close = raw.find_first_of("{}; \t\n", i + 2);
+            if (close != std::string::npos && close > i + 2 && raw[close] == '}')
+            {
+                padded += raw.substr(i, close + 1 - i);
+                i = close;
+                continue;
+            }
+        }
         if (c == '{' || c == '}' || c == ';') { padded += ' '; padded += c; padded += ' '; }
         else padded += c;
     }
@@ -335,6 +350,31 @@ inline std::string expandDictVariables(const std::string& rawIn)
         full += name;
         scoped[full] = val;
     };
+    // ...AND THE PATTERN KEYS -- `"(pcorr|pcorrFinal)" { ... }` -- under the scope they are defined in,
+    // in the order they appear. A `$name;` ENTRY may resolve to one: dictionary::substituteScopedKeyword
+    // searches REGEX_RECURSIVE (dictionary.C:415-443), and the two multi-paddle waveMakers write
+    // `p_rgh { $pcorr; ... }` against exactly that key. A `$name` VALUE may not (below).
+    struct PatternDef
+    {
+        std::string scope;
+        std::string pattern;
+        std::string value;
+    };
+    std::vector<PatternDef> patternDefs;
+    auto scopeOf = [](const std::vector<std::string>& p, std::size_t depth)
+    {
+        std::string sc;
+        for (std::size_t k = 0; k < depth; ++k) { if (k) sc += '/'; sc += p[k]; }
+        return sc;
+    };
+    auto isQuoted = [](const std::string& s)
+    {
+        return s.size() >= 2 && s.front() == '"' && s.back() == '"';
+    };
+    auto recordPattern = [&](const std::string& key, const std::string& val)
+    {
+        patternDefs.push_back(PatternDef{scopeOf(path, path.size()), key.substr(1, key.size() - 2), val});
+    };
     bool atKey = true;
     for (std::size_t i = 0; i < toks.size(); )
     {
@@ -364,6 +404,7 @@ inline std::string expandDictVariables(const std::string& rawIn)
                 ++j;
             }
             if (isIdent(tk)) record(tk, val);
+            else if (isQuoted(tk)) recordPattern(tk, val);
             // DESCEND into the block (step past name + "{") rather than skip it, so sibling entries DEFINED inside
             // (e.g. `turbulence ...;` inside divSchemes, referenced as $turbulence by div(phi,k)) also register as vars.
             path.push_back(tk);
@@ -411,13 +452,19 @@ inline std::string expandDictVariables(const std::string& rawIn)
         // name -- OF scoping). In brae's flat var map this would overwrite the real outer value with an unresolvable
         // self-ref, so keep the outer definition (e.g. `z0 uniform 0.1;` from an #include'd ABLConditions).
         if (isIdent(tk) && val != "$" + tk && val != "${" + tk + "}") record(tk, val);
+        else if (isQuoted(tk)) recordPattern(tk, val);
         i = j;
         atKey = true;
     }
     // 4. substitute $name / ${name} in the (comment-stripped) text, preserving newlines; a few passes for nesting
     std::string text = raw;
-    for (int pass = 0; pass < 5; ++pass)
+    // The last pass is the one that finds nothing left to expand, and only that pass may DROP: a
+    // reference unresolved on an earlier pass can still be produced by a later one.
+    bool dropUnresolved = false;
+    for (int pass = 0; pass < 6; ++pass)
     {
+        // five expanding passes, as before; the sixth exists only to drop
+        if (pass == 5 && !dropUnresolved) break;
         std::string out;
         out.reserve(text.size());
         bool changed = false;
@@ -427,11 +474,106 @@ inline std::string expandDictVariables(const std::string& rawIn)
         // the flat map (a name defined somewhere else entirely -- an #include'd fragment, say).
         std::vector<std::string> useScope;
         std::string lastWord;
+        // whether the next token opens an ENTRY -- a `$name` there is a keyword substitution, which
+        // OpenFOAM resolves through pattern keys too; anywhere else it is a value, which it does not
+        bool atEntry = true;
+        // The pattern keys whose entries are COMPLETE at this point of the scan, as (scope, pattern).
+        // OpenFOAM substitutes a keyword while it reads (entryIO.C:274), so the search sees only the
+        // entries already added -- a block is added when its closing brace is read, never from inside
+        // itself. Without this rule a trailing catch-all captured every reference above it:
+        // blockMesh/pipe's `boundaryField { ... ".*" { ${__surfaceSlipDisplacement}; } }` turned the
+        // three edge patches' `${__edgeSlipDisplacement};` into the surface condition.
+        std::set<std::pair<std::string, std::string>> seenPatterns;
+        // ...and what a pattern block HOLDS once it is complete is its EXPANDED content: OpenFOAM
+        // resolved the references inside it as it read them, where the pattern could not yet see
+        // itself. Substituting the raw text re-searched them at the USE site, below the pattern:
+        //     boundaryField { ".*" { ${__surf}; }  late { ${__edge}; } }
+        // gave `late` the text `${__surf};`, which the ".*" captured again, and again -- five passes on,
+        // `late { ${__surf} ; ; ; ; ;; }` against foamDictionary -expand's `type surfaceSlip;`.
+        // blockOpen holds where in `out` each open block's content starts.
+        std::vector<std::size_t> blockOpen;
+        std::map<std::pair<std::string, std::string>, std::size_t> patternSeenCount;
+        // a quoted key that opened a leaf entry, until that entry's ';'
+        std::string pendingPattern;
         for (std::size_t i = 0; i < text.size(); )
         {
-            if (text[i] == '{')      { useScope.push_back(lastWord); lastWord.clear(); out += text[i++]; continue; }
-            if (text[i] == '}')      { if (!useScope.empty()) useScope.pop_back(); lastWord.clear(); out += text[i++]; continue; }
-            if (text[i] == ';')      { lastWord.clear(); out += text[i++]; continue; }
+            if (text[i] == '{')
+            {
+                useScope.push_back(lastWord);
+                lastWord.clear();
+                pendingPattern.clear();
+                atEntry = true;
+                out += text[i++];
+                blockOpen.push_back(out.size());
+                continue;
+            }
+            if (text[i] == '}')
+            {
+                if (!useScope.empty())
+                {
+                    const std::string closed = useScope.back();
+                    useScope.pop_back();
+                    const std::size_t open = blockOpen.empty() ? out.size() : blockOpen.back();
+                    if (!blockOpen.empty())
+                    {
+                        blockOpen.pop_back();
+                    }
+                    if (isQuoted(closed))
+                    {
+                        const std::pair<std::string, std::string> key
+                        {
+                            scopeOf(useScope, useScope.size()),
+                            closed.substr(1, closed.size() - 2)
+                        };
+                        seenPatterns.insert(key);
+                        // the n-th block under this key in the text is the n-th definition recorded
+                        // under it; a block a substitution brought in has none and is left alone
+                        const std::size_t nth = patternSeenCount[key]++;
+                        std::size_t k = 0;
+                        for (PatternDef& def : patternDefs)
+                        {
+                            if (def.scope != key.first || def.pattern != key.second)
+                            {
+                                continue;
+                            }
+                            if (k++ == nth)
+                            {
+                                std::string body = out.substr(open);
+                                for (char& c : body)
+                                {
+                                    if (c == '\n')
+                                    {
+                                        c = ' ';
+                                    }
+                                }
+                                def.value = body;
+                                break;
+                            }
+                        }
+                    }
+                }
+                lastWord.clear();
+                pendingPattern.clear();
+                atEntry = true;
+                out += text[i++];
+                continue;
+            }
+            if (text[i] == ';')
+            {
+                if (!pendingPattern.empty())
+                {
+                    seenPatterns.emplace
+                    (
+                        scopeOf(useScope, useScope.size()),
+                        pendingPattern.substr(1, pendingPattern.size() - 2)
+                    );
+                }
+                lastWord.clear();
+                pendingPattern.clear();
+                atEntry = true;
+                out += text[i++];
+                continue;
+            }
             if (std::isspace((unsigned char)text[i]))
             {
                 // a run of whitespace ends the current word only if something follows on this line;
@@ -451,6 +593,11 @@ inline std::string expandDictVariables(const std::string& rawIn)
                        && text[i] != '{' && text[i] != '}' && text[i] != ';'
                        && text[i] != '$') { out += text[i]; ++i; }
                 lastWord = text.substr(w0, i - w0);
+                if (atEntry && isQuoted(lastWord))
+                {
+                    pendingPattern = lastWord;
+                }
+                atEntry = false;
                 continue;
             }
             {
@@ -487,11 +634,56 @@ inline std::string expandDictVariables(const std::string& rawIn)
                        && (std::isalnum((unsigned char)text[j]) || text[j] == '_'
                            || text[j] == '-' || text[j] == '.')) ++j;
                 const std::string name = text.substr(s, j - s);
-                if (brace && j < text.size() && text[j] == '}') ++j;
-                const std::string* hit = nullptr;
-                if (!name.empty())
+                // `${a/b}` and every other braced form this does not resolve stays as it is. Looking up
+                // `a` alone left `/b}` behind: sphereDrop's `${/__blockMeshDict/sphereCentreHeight}`
+                // expanded to `#include "<system>/blockMeshDict"/sphereCentreHeight}`.
+                if (brace && !name.empty() && (j >= text.size() || text[j] != '}'))
                 {
-                    // the current dictionary, then each ancestor, then the flat map
+                    const std::size_t close = text.find('}', j);
+                    const std::size_t end = (close == std::string::npos) ? text.size() : close + 1;
+                    out += text.substr(i, end - i);
+                    i = end;
+                    lastWord.clear();
+                    atEntry = false;
+                    continue;
+                }
+                if (brace) ++j;
+                const std::string* hit = nullptr;
+                const bool keyword = atEntry;
+                atEntry = false;
+                if (!name.empty() && keyword)
+                {
+                    // A KEYWORD: dictionary::csearch, level by level from the current dictionary out --
+                    // the literal key there, then that level's patterns, the latest first (patterns_ is
+                    // pushed to the front), and only then the parent. The root is a level too.
+                    for (std::size_t depth = useScope.size() + 1; depth > 0 && !hit; --depth)
+                    {
+                        const std::string sc = scopeOf(useScope, depth - 1);
+                        const auto sit = scoped.find(sc.empty() ? name : sc + '/' + name);
+                        if (sit != scoped.end())
+                        {
+                            hit = &sit->second;
+                            break;
+                        }
+                        for (auto pit = patternDefs.rbegin(); pit != patternDefs.rend() && !hit; ++pit)
+                        {
+                            if (pit->scope != sc) continue;
+                            if (!seenPatterns.count({sc, pit->pattern})) continue;
+                            try
+                            {
+                                if (std::regex_match(name, compileFoamRegex(pit->pattern))) hit = &pit->value;
+                            }
+                            catch (...)
+                            {
+                            }
+                        }
+                    }
+                }
+                if (!name.empty() && !keyword)
+                {
+                    // A VALUE: primitiveEntry::expandVariable searches LITERAL_RECURSIVE
+                    // (primitiveEntry.C:127-139) -- the current dictionary, then each ancestor, never a
+                    // pattern, so `".*" { ... }` cannot capture `value $internalField;`
                     for (std::size_t depth = useScope.size(); depth > 0 && !hit; --depth)
                     {
                         std::string full;
@@ -500,6 +692,9 @@ inline std::string expandDictVariables(const std::string& rawIn)
                         const auto sit = scoped.find(full);
                         if (sit != scoped.end()) hit = &sit->second;
                     }
+                }
+                if (!name.empty())
+                {
                     if (!hit)
                     {
                         const auto it = vars.find(name);
@@ -513,12 +708,44 @@ inline std::string expandDictVariables(const std::string& rawIn)
                     changed = true;
                     continue;
                 }
+                // AN UNDEFINED KEYWORD REFERENCE IS DROPPED. entry::New ignores what
+                // substituteScopedKeyword returns (entryIO.C:274), and that returns false without a
+                // word when the search finds nothing (dictionary.C:415-443). Left in the text,
+                // `${name};` reached the tokenizer as a block called `$` holding an empty `name`:
+                // read alone, gasMixing's avg-tracer0 grew a `$ { __settings_avg; }` in each of its
+                // six function objects. ONLY a plain name: a path this does not resolve
+                // (`${a/b}`, `${../a}`) is one OpenFOAM may well resolve, and stays to be refused.
+                // A VALUE reference stays too -- OpenFOAM makes that one fatal
+                // (primitiveEntry.C:156-162), it does not drop it.
+                if (dropUnresolved && keyword && !name.empty() && s == i + (brace ? 2 : 1))
+                {
+                    // `$name` and then a '{' is a different construct -- the variable NAMES a block --
+                    // and OpenFOAM makes an undefined one fatal (entryIO.C:239-262), so it stays
+                    std::size_t e = j;
+                    while (e < text.size() && std::isspace((unsigned char)text[e])) ++e;
+                    const bool namesBlock = e < text.size() && text[e] == '{';
+                    e = j;
+                    while (e < text.size() && (text[e] == ' ' || text[e] == '\t')) ++e;
+                    const bool endsEntry = e >= text.size()
+                                        || text[e] == ';'
+                                        || text[e] == '}'
+                                        || text[e] == '\n';
+                    if (endsEntry && !namesBlock)
+                    {
+                        if (e < text.size() && text[e] == ';') ++e;
+                        i = e;
+                        atEntry = true;
+                        lastWord.clear();
+                        continue;
+                    }
+                }
             }
             out += text[i++];
             lastWord.clear();
         }
         text = std::move(out);
-        if (!changed) break;
+        if (dropUnresolved) break;
+        if (!changed) dropUnresolved = true;
     }
     return text;
 }
