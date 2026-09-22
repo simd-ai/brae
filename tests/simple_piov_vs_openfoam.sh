@@ -47,6 +47,19 @@
 #      1.005e+00 against -1.196e-01 to 1.006e+00. The boundary is right and the interior does not
 #      settle, which says the defect is in what the FREED NORMAL COMPONENT exposes -- the outlet's flux
 #      and the pressure equation that now has to set it -- not in the typing.
+#   4. AND IT IS THE BACKFLOW FACES, in Uy, in the cells that touch the outlet. At the fixed point the
+#      whole field error is the TANGENTIAL component (|dU| == |dUy| in every one of the worst cells),
+#      it sits in the outlet's own cells and decays one cell inward (1.512e-02, then 5.180e-03), and it
+#      is four times larger on the faces that take flow IN than on the ones that let it out: mean
+#      |dUy| 6.105e-03 over the 9 inflow faces against 1.447e-03 over the 39 outflow ones, the worst
+#      four cells being the four strongest backflow faces in order. That is the vf = 1 branch of the
+#      directionMixed typing -- where OpenFOAM pins the tangential velocity to zero and frees the
+#      normal one -- and it is NOT the coefficients: bcDivKernel and bcLaplacianFaceKernel give a
+#      vf = 1 mixed face exactly what they give a fixedValue face, read line by line to check it.
+#      The residual agrees with that picture: Uy DECAYS smoothly to 2.74669e-04 over some 600
+#      iterations and then holds it, each solve cutting it 13x and the next assembly restoring it --
+#      a steady state of the OUTER iteration whose Uy equation carries a constant imbalance, not an
+#      oscillation.
 #
 # The comparison is CONVERGED (both runs stop on the case's own residualControl), so it cannot see an
 # ordering defect -- only a boundary-condition or matrix-coefficient one, which is what it is here for.

@@ -2850,7 +2850,24 @@ void amgFineCoeffKernel(
         // the assembly, so its patches are still updated() and keep the assembly's coefficients -- the
         // rule interFoam's loop carries as DeviceUBoundaryCall::evaluateStillUpdated. With a momentum
         // predictor its solve ends in an evaluate, which clears the flag, so every corrector switches.
-        if (ctl_.innerCorrector > 0 || ctl_.momentumPredictor)
+        // BRAE_IO_NO_CORRECTOR_REFRESH=1 restores the behaviour before this correction -- the switch
+        // left at the momentum assembly's flux for the whole pass. An instrument, not a mode, and it
+        // is the CONTROL a gate for this needs: THERE IS NO SUCH GATE YET, and here is why, measured
+        // on RAS/TJunction (two inletOutlet outlets, nCorrectors 2) with the flips COUNTED. Of the 50
+        // io faces, exactly 25 ever change type, once, at corrector 0 of the FIRST step -- and they
+        // change from the zeroGradient the assembly's phi = 0 implies to fixedValue at the inletValue,
+        // with the case starting from rest, so U_cell is itself ~0 = inletValue and the two states
+        // COINCIDE. Every later step: 0 of 50. Three stagings were built to force more (a p0 table
+        // crossing the outlet's own pressure, and a large reversal at ten times the step) and each
+        // read the same digits with the refresh and without it.
+        // WHAT A DISCRIMINATING CASE NEEDS, from that: the flip must happen WITHIN a step, between
+        // correctors -- a flip between steps is caught by the assembly call above and this one never
+        // sees it -- AND the patch's velocity must be far from the inletValue when it happens, which
+        // means a developed flow reversing at an outlet face that still carries a large tangential
+        // velocity. Until such a case exists this correction is faithful-but-unwitnessed, and saying
+        // so is the point of this comment.
+        static const bool ioRefreshOff = (std::getenv("BRAE_IO_NO_CORRECTOR_REFRESH") != nullptr);
+        if (!ioRefreshOff && (ctl_.innerCorrector > 0 || ctl_.momentumPredictor))
         {
             deviceUpdateInletOutlet(dbU_, phiBnd_);
             // NOT pressureInletOutletVelocity, though OpenFOAM's updateCoeffs moves it here too: this
