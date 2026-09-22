@@ -93,6 +93,13 @@ struct DeviceSimpleControls
     //
     // Neither is ever set on the steady path: OF's simpleControl has no Final concept either.
     bool   finalInner = false;   // p        -- last pressure corrector, last non-orth pass
+    // WHICH inner (pressure) corrector this is, 0-based. OpenFOAM's pEqn.H ends every corrector with
+    // U.correctBoundaryConditions(), where a flux-conditional patch re-runs updateCoeffs on the flux
+    // that corrector just produced -- EXCEPT on the first one of a pass that ran no momentum predictor,
+    // where the patches are still updated() from the momentum assembly and mixedFvPatchField::evaluate
+    // skips updateCoeffs (mixedFvPatchField.C:234-237). The interFoam loop carries the same rule
+    // (DeviceUBoundaryCall::evaluateStillUpdated).
+    int    innerCorrector = 0;
     bool   finalIter  = false;   // U, k/eps -- anywhere in the last outer corrector
     int    pMaxIter() const { return finalInner ? maxIterPFinal : maxIterP; }
     int    pMinIter() const { return finalInner ? minIterPFinal : minIterP; }

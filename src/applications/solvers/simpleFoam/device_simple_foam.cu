@@ -2840,6 +2840,28 @@ void amgFineCoeffKernel(
         }
         if (hasWedge_) deviceUpdateWedge(dbU_, Uk_[0], Uk_[1], Uk_[2]);   // pEqn.H's U.correctBoundaryConditions()
         if (hasSym_)   deviceUpdateSymmetry(dbU_, Uk_[0], Uk_[1], Uk_[2]); // ...for the symmetry patches too (item 13)
+        // ...AND THE FLUX-CONDITIONAL CLASSES, which that same correctBoundaryConditions moves.
+        // inletOutlet's valueFraction is neg(phi) and pressureInletOutletVelocity's typing is the flux
+        // sign, both set inside updateCoeffs -- which evaluate() runs whenever the patch is not still
+        // updated() (mixedFvPatchField.C:234-237). This loop applied them ONCE per outer iteration, at
+        // the momentum assembly, so correctors 2..N ran on the switch the assembly left while
+        // OpenFOAM's had moved to the flux each corrector produced. THE FIRST corrector of a pass with
+        // no momentum predictor is the exception, and is OpenFOAM's own: nothing has evaluated U since
+        // the assembly, so its patches are still updated() and keep the assembly's coefficients -- the
+        // rule interFoam's loop carries as DeviceUBoundaryCall::evaluateStillUpdated. With a momentum
+        // predictor its solve ends in an evaluate, which clears the flag, so every corrector switches.
+        if (ctl_.innerCorrector > 0 || ctl_.momentumPredictor)
+        {
+            deviceUpdateInletOutlet(dbU_, phiBnd_);
+            // NOT pressureInletOutletVelocity, though OpenFOAM's updateCoeffs moves it here too: this
+            // driver types a piov face in the LEGACY form (deviceUpdatePressureInletOutletVelocity's
+            // `directionMixed=false`, every inflow component fixedValue at n(n.U_cell)), which the
+            // frozen incompressible path's fluxes and matrix grew around and which validation/piov is
+            // held to at its recorded numbers (tests/simple_piov_vs_openfoam.sh). Re-applying THAT form
+            // per corrector is not OpenFOAM's directionMixed either: MEASURED on RAS/TJunction, ten
+            // steps of 0.002, it moves U from 7.078e-03 to 7.690e-02 against OpenFOAM -- ten times
+            // further. The piov half of this correction belongs with the directionMixed port.
+        }
         // limitVelocity (fvOptions.correct): clamp |U| <= max on the corrected (output) velocity. OF clamps after the
         // momentum predictor; cf clamps the post-corrector U so the WRITTEN field is bounded (matches OF's output).
         if (limUActive_) deviceFvoLimitVelocity(limUCells_, limUMax_, Uk_[0], Uk_[1], Uk_[2]);
@@ -3964,6 +3986,7 @@ void amgFineCoeffKernel(
                 // finalOnLastPimpleIterOnly. The non-orth half of finalInnerIter() is applied inside
                 // correctPressureVelocity, which owns that loop.
                 ctl_.finalInner = (pc == nCorr - 1) && (!ctl_.finalOnLastPimpleIterOnly || ctl_.finalIter);
+                ctl_.innerCorrector = pc;   // the flux-conditional patches' lag -- see correctPressureVelocity
                 correctPressureVelocity(res);
             }
             }   // solveFlow
