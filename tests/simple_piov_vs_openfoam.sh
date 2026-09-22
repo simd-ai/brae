@@ -93,9 +93,27 @@
 #      1.47e-02, 9.09e-03, ... face for face). The pressure equation is therefore built on a flux that
 #      is ~1% wrong at the backflow faces while the momentum matrix is exact, which is what walks the
 #      SIMPLE iteration to a different fixed point.
-#      NEXT: brae's constrainHbyA leaves HbyA_b untouched where the patch is assignable (piov is), so
-#      compare what it leaves against OpenFOAM's rAU_b*H_b there -- a constant offset is an additive
-#      term present in one and not the other, not a scheme.
+#   8. AND HERE IT IS: rAU FOLDS THE BOUNDARY DIAGONAL WITH ONE COMPONENT. HbyA was compared over the
+#      WHOLE field at OpenFOAM's own state: the interior agrees to round-off (median 6.6e-11, max
+#      5.8e-06) and so do most outlet cells (median 5.5e-11) -- only the BACKFLOW ones are out, and
+#      they are the five worst cells in the field (2.78e-02, 2.03e-02, 1.47e-02, 9.09e-03, 7.08e-03).
+#      In both codes HbyA's patch value EQUALS its cell value, so it is not a patch-value defect; and
+#      the momentum matrix at those cells is OpenFOAM's to round-off. What is left is rAU, and
+#      device_simple_foam.cu folds the boundary diagonal into A() as
+#          hasSym_ ? cmptAvIC : iC[0]
+#      -- the per-component average ONLY when the mesh has a symmetry/slip U patch (hasSym_ is set by
+#      isSymmetry() alone). A directionMixed pressureInletOutletVelocity has exactly the same
+#      per-component asymmetry -- x zeroGradient, y and z fixed: at these faces iC.x = -5.63e-05
+#      against iC.y = +8.33e-04, a factor of fifteen -- and it does not set hasSym_, so this fixture
+#      folds the X component into a diagonal all three share. rAU is wrong there, HbyA inherits it,
+#      phiHbyA inherits HbyA face for face, and SIMPLE settles somewhere else.
+#      THAT IS THE COMPENSATION: under the LEGACY typing all three components are fixedValue with the
+#      same iC, so iC[0] IS the average and none of this shows. The legacy typing is not "closer" --
+#      it is hiding a diagonal that is only ever right when every component agrees.
+#      THE FIX belongs with the directionMixed port (the two must land together): the fold has to key
+#      on "any U patch whose boundary coefficients differ per component" -- symmetry, wedge AND
+#      directionMixed -- not on isSymmetry(). A wedge mesh with no symmetry patch is the same hazard
+#      and no fixture on this driver has one, so it is unmeasured rather than safe.
 #
 # The comparison is CONVERGED (both runs stop on the case's own residualControl), so it cannot see an
 # ordering defect -- only a boundary-condition or matrix-coefficient one, which is what it is here for.
