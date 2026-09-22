@@ -178,8 +178,15 @@ def main(argv):
         for f, line, var, assigned in sites:
             for missing in sorted((union - assigned) & fieldnames):
                 key = (name, var, missing)
+                # `<Struct> <var> *` covers EVERY field at that variable name. It is for a site that is
+                # not a controls object at all -- an out-parameter buffer a reader fills and the site
+                # copies a few fields out of -- where the reason is a property of the site, not of any
+                # one field, and listing sixty fields would bury it. Never use it on a real site.
+                star = (name, var, '*')
                 if key in allow:
                     used.add(key)
+                elif star in allow:
+                    used.add(star)
                 else:
                     unlisted.append((name, os.path.relpath(f), line, var, missing, len(sites)))
 

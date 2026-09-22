@@ -116,3 +116,24 @@ DeviceSimpleControls ctl momentumPredictor       # a PISO/PIMPLE switch: OF's SI
 DeviceSimpleControls ctl solveFlow               # PIMPLE's `solveFlow no`; SIMPLE has no such entry, and the preflight would report an unread one
 DeviceSimpleControls ctl turbOnFinalIterOnly     # PIMPLE's turbOnFinalIterOnly: the steady loop corrects turbulence every iteration, as OF's simpleFoam does
 DeviceSimpleControls ctl outerResidualControl    # PIMPLE's residualControl over OUTER correctors; SIMPLE's own residualControl is read separately (gpuSimpleFoam.cu:368)
+
+# ---- DeviceSimpleControls at the rhoSimpleFoam sites -------------------------------------------------
+# `lctl` and `sctl` are NOT case-controls objects: each is a scratch struct handed to a reader as an
+# OUT PARAMETER, from which the site copies the few fields it wanted -- readLinearSolverControls fills
+# lctl and the site takes tol/relTol/maxIter/minIter for U, p, he and the turbulence pair
+# (rhoSimpleFoamDriver.cu:697-700); parseFvSchemesControls fills sctl and the site takes the
+# laplacian/snGrad/limited-gradient flags (rhoSimpleFoamDriver_cpp.cu:203-224). VERIFIED that neither
+# reader CONSUMES a field it does not also write, so no default of theirs reaches the answer:
+# readLinearSolverControls reads only what it writes (plus `turbulent`, which both sites set), and
+# parseFvSchemesControls' three read-looking fields (nonOrth, nonOrthLimit, desCoeffs) are its own
+# by-reference out-parameters. The wildcard says the SITE is not a controls object; see the tool.
+DeviceSimpleControls lctl *   # out-parameter buffer for readLinearSolverControls; the site copies the solver tolerances out
+DeviceSimpleControls sctl *   # out-parameter buffer for parseFvSchemesControls; the site copies the scheme flags out
+# The three smaller rho drivers (gpuRhoSimpleFoam, legacy, slice) leave the AMG hierarchy cache path and
+# its write switch at their defaults, which is a RECORDED open finding, not a new one: "nothing in the
+# compressible lineage threads amgCacheDir ... every compressible run re-agglomerates from scratch"
+# (rhoPEqn.cuh:58-63, PORT.md's open findings). It changes no answer -- device_amg.cuh:115-117 caches
+# the STRUCTURE only and Galerkin-rebuilds the coefficients from the current fine matrix every step --
+# so it is a cold start, not a substitution. The legacy driver is frozen and must not be edited.
+DeviceSimpleControls ctl caseDir
+DeviceSimpleControls ctl writeCache
