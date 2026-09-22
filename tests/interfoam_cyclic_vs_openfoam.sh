@@ -186,6 +186,7 @@ PYEOF
             || { echo "FAIL: the $profile profile did not set CrankNicolson"; return 1; }
     fi
     if [ "$profile" = sst ] || [ "$profile" = sstWalls ] || [ "$profile" = sstCN ] \
+    || [ "${profile#sstLim}" != "$profile" ] \
     || [ "$profile" = les ] || [ "$profile" = lesWalls ] || [ "$profile" = lesCN ]; then
         # A TURBULENCE CLOSURE ACROSS THE PAIR. kEpsilon was the one closure carried across a cyclic
         # (the case reader refused every other by name); these two profiles are kOmegaSST and LES kEqn
@@ -240,8 +241,37 @@ PYEOF
         grep -q "type cyclic" "$C/0/k" \
             || { echo "FAIL: the $profile profile did not give k the pair"; return 1; }
     fi
+    if [ "${profile#sstLim}" != "$profile" ]; then
+        # A CELL-LIMITED GRADIENT ACROSS THE PAIR. `cellLimited Gauss linear 1` on grad(k) and
+        # grad(omega) reaches the closure at TWO sites, and both were built without the interface:
+        #   * CDkOmega takes fvc::grad(k) & fvc::grad(omega) (kOmegaSSTBase.C:555-558), and F1 blends
+        #     every coefficient of the omega equation on the result;
+        #   * the CORRECTED laplacian's non-orthogonal correction takes the field's own grad scheme
+        #     (correctedSnGrad.C:52-55), which is the shared assembler's `fieldGrad`.
+        # OF's cellLimitedGrad folds a coupled patch's patchNeighbourField into its range and clips
+        # the extrapolation to that face, so a limiter built without the pair treats those cells as
+        # boundary cells. The fixture's laplacianSchemes are `Gauss linear corrected`, which is what
+        # makes the second site live; every other profile here leaves the gradients unlimited.
+        GU=""
+        [ "${profile#sstLimU}" != "$profile" ] && GU="grad(U) cellLimited Gauss linear 1; "
+        sed -i "s/^gradSchemes .*/gradSchemes     { default Gauss linear; ${GU}grad(k) cellLimited Gauss linear 1; grad(omega) cellLimited Gauss linear 1; }/" \
+            "$C/system/fvSchemes"
+        grep -q "cellLimited Gauss linear 1" "$C/system/fvSchemes" \
+            || { echo "FAIL: the $profile profile did not set cellLimited"; return 1; }
+        grep -q "corrected" "$C/system/fvSchemes" \
+            || { echo "FAIL: the fixture's laplacian is no longer corrected, so one of the two sites is dead"; return 1; }
+        # ...and `sstLimU` adds grad(U) to them. Its DEVICE arm is refused by name: the momentum
+        # assembler sums the Gauss half of grad(U) across the pair but its LIMITER walks the internal
+        # faces and the non-coupled patches only (UEqn.cu). The host arm is what this profile gates,
+        # and the host's own reader refused it until this fixture could hold it.
+        if [ "${profile#sstLimU}" != "$profile" ]; then
+            grep -q "grad(U) cellLimited" "$C/system/fvSchemes" \
+                || { echo "FAIL: the $profile profile did not limit grad(U)"; return 1; }
+        fi
+    fi
     if [ "$profile" = walls ] || [ "$profile" = explicitWalls ] \
-    || [ "$profile" = sstWalls ] || [ "$profile" = lesWalls ]; then
+    || [ "$profile" = sstWalls ] || [ "$profile" = lesWalls ] \
+    || [ "$profile" = sstLimWalls ] || [ "$profile" = sstLimUWalls ]; then
         # THE CONTROL: the pair replaced by two walls, in the mesh AND in every field that names it.
         # blockMesh numbers the cells from the block, so the two runs' cells are the same cells.
         sed -i 's/type cyclic; neighbourPatch right;/type wall;/; s/type cyclic; neighbourPatch left; */type wall;/' \
@@ -295,7 +325,7 @@ PYEOF
 }
 
 for p in cyclic walls explicitMules explicitWalls jump outer outerControl \
-         sst sstWalls les lesWalls sstCN lesCN; do
+         sst sstWalls les lesWalls sstCN lesCN sstLim sstLimWalls sstLimU sstLimUWalls; do
     stage "$p" || { echo "interfoam_cyclic_vs_openfoam: staging failed"; exit 1; }
 done
 
@@ -339,5 +369,14 @@ rc=0
        "$W/sstCN/log.interFoam" "$W/sst/$END" sstCN || rc=1
 "$BIN" "$W/lesCN" "$W/lesCN/0" "$W/lesCN/$END" "$STEPS" \
        "$W/lesCN/log.interFoam" "$W/les/$END" lesCN || rc=1
+# ...and the LIMITED schemes across the pair, which nothing else here exercises: `Gauss limitedLinear
+# 1` for k and omega (the limiter's own gradient) and `cellLimited Gauss linear 1` on grad(k) and
+# grad(omega) (the limiter's range). Its control is the same case with the pair two walls.
+"$BIN" "$W/sstLim" "$W/sstLim/0" "$W/sstLim/$END" "$STEPS" \
+       "$W/sstLim/log.interFoam" "$W/sstLimWalls/$END" sstLim || rc=1
+# ...and the same with grad(U) limited too, HOST ONLY: the device momentum's limiter does not carry
+# the pair and refuses by name (armed in tests/interfoam_refusals.sh).
+"$BIN" "$W/sstLimU" "$W/sstLimU/0" "$W/sstLimU/$END" "$STEPS" \
+       "$W/sstLimU/log.interFoam" "$W/sstLimUWalls/$END" sstLimU || rc=1
 echo "interfoam_cyclic_vs_openfoam: rc $rc"
 exit $rc

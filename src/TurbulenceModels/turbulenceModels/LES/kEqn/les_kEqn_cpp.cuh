@@ -109,7 +109,15 @@ SolverPerformance correct(
     // lineage is the uniform one, so there is no density at any level.
     const fv::CrankNicolsonClock* cn = nullptr,
     fv::CrankNicolsonDdt0<scalar>* cnDdt0K = nullptr,
-    const std::vector<scalar>* kOO = nullptr);
+    const std::vector<scalar>* kOO = nullptr,
+    // A MOVING MESH, the same pair the RAS closures take: the volumes the cells had BEFORE this
+    // step's move, which EulerDdtScheme::fvmDdt puts in the SOURCE while the diagonal keeps V, and
+    // the mesh flux, which makes divU the divergence of the ABSOLUTE flux -- LESModel's
+    // fvc::div(fvc::absolute(phi, U)). Null on a mesh that does not move. The filter width is the
+    // caller's `delta`, and LESdelta::correct recomputes it on a changing mesh
+    // (cubeRootVolDelta.C:128-134) -- see moveInterTurbulence.
+    const std::vector<scalar>* V0 = nullptr,
+    const SurfaceScalarField* meshPhi = nullptr);
 
 } // namespace LESkEqn
 } // namespace cpu

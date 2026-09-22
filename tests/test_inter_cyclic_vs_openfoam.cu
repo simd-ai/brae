@@ -66,6 +66,16 @@ const scalar B_TURB_DEV = 5e-09;
 // U 2.2e-07 -- and with every solve pinned at 1e-16 the SAME comparison reads alpha 3.8e-13,
 // p_rgh 1.8e-11 relative, U 9.2e-13. The host arm is OpenFOAM's to 3.2e-14 / 6.7e-13 / 1.3e-13
 // either way, which is what says the loop is right.
+// ...and the two CRANKNICOLSON profiles', which sit one order above the Euler ones for the reason
+// `cnFull` does in interfoam_cn_vs_openfoam: the scheme's two-step recurrence carries round-off
+// undamped, so the two arms' stopping points compound rather than cancel. MEASURED, ten steps:
+// sstCN alpha 7.9e-12, p_rgh 5.7e-10, U 1.2e-10 (against the host arm 7.6e-12 / 6.3e-10 / 1.2e-10);
+// lesCN 4.5e-12 / 4.4e-10 / 9.8e-11. The bound is ~5x, and it witnesses what it was written for by
+// seven orders: with the pair's ddtCorr left at the EULER form these read alpha 2.7612e-03,
+// p_rgh 7.8874e-03, U 8.2265e-02.
+const scalar B_ALPHA_DEV_CN = 5e-11;
+const scalar B_PRGH_DEV_CN = 3e-09;
+const scalar B_U_DEV_CN = 1e-09;
 const scalar B_ALPHA_DEV_OUTER = 6e-08;
 const scalar B_PRGH_DEV_OUTER = 7e-08;
 const scalar B_U_DEV_OUTER = 7e-06;
@@ -144,7 +154,14 @@ int main(
     // under test in those two, so its OWN fields are compared and not only the three the other
     // profiles share: a defect confined to k reaches U through nuEff alone and arrives divided by the
     // Reynolds number.
-    const bool sstProfile = (profile == "sst" || profile == "sstCN");
+    const bool sstProfile = (profile == "sst" || profile == "sstCN" || profile == "sstLim"
+                          || profile == "sstLimU");
+    // `sstLimU` adds `cellLimited grad(U)` to the two the closure limits. Its device arm is refused
+    // by name -- the momentum assembler sums the Gauss half of grad(U) across the pair, its LIMITER
+    // does not -- so this profile holds the HOST arm, which the case reader refused until now.
+    // MEASURED with the device arm forced on: U 8.9149e-03, k 3.3383e-02, nut 4.1315e-01, against a
+    // host arm at 8.8697e-13, 6.4243e-13 and 2.6965e-12.
+    const bool hostOnlyProfile = (profile == "sstLimU");
     const bool lesProfile = (profile == "les" || profile == "lesCN");
     const bool turbProfile = sstProfile || lesProfile;
     // ...and the two CRANKNICOLSON profiles, whose control is the SAME case under Euler rather than a
@@ -336,15 +353,16 @@ int main(
     // ...AND ON THE TWO CLOSURE PROFILES, which is what makes them worth running twice: kOmegaSST and
     // LES kEqn refused a pair on the device until the five sites the kEpsilon closure carries were
     // transcribed into them.
-    // ...NOT on the two CRANKNICOLSON profiles, and not because of the closure: the device loop
-    // refuses CrankNicolson's end-of-step alpha flux across a COUPLED PAIR by name, which is a
-    // property of the alpha step and not of k's ddt. The DEVICE arm of those two closures under the
-    // scheme is held by tests/interfoam_cn_vs_openfoam.sh (`cnSST`, `cnLES`), on a mesh with no pair.
-    if (nDev > 0 && cnProfile)
+    // ...AND ON THE TWO CRANKNICOLSON PROFILES, which took the scheme's two flux terms on the pair's
+    // own array: phiCN = cnCoeff*phi + (1 - cnCoeff)*phi.oldTime() on the coupled faces
+    // (alphaEqn.H:91-97), and the end-of-step un-blend of alphaPhi10 against ITS old level there
+    // (:253-262), with the pair's rhoPhi taken beside the raw phi as the branch requires. The host
+    // arm gets both for free: it walks phi.boundary and alphaPhi10.boundary whole, coupled patch
+    // included, and the device keeps those faces in a third array.
+    if (nDev > 0 && hostOnlyProfile)
     {
-        std::printf("  (the device loop refuses CrankNicolson across a coupled pair; its arm for this "
-                    "closure under the scheme is interfoam_cn_vs_openfoam %s)\n",
-                    sstProfile ? "cnSST" : "cnLES");
+        std::printf("  (the device momentum's grad(U) limiter carries no pair: refused by name, and "
+                    "armed in interfoam_refusals)\n");
     }
     else if (nDev <= 0)
     {
@@ -364,9 +382,9 @@ int main(
         std::printf("  device alpha:   Linf %.4e\n", (double)eA.linf);
         std::printf("  device p_rgh:   relative %.4e\n", (double)eP.rel());
         std::printf("  device U:       relative %.4e\n", (double)eU.rel());
-        const scalar bA = outerProfile ? B_ALPHA_DEV_OUTER : B_ALPHA_DEV;
-        const scalar bP = outerProfile ? B_PRGH_DEV_OUTER : B_PRGH_DEV;
-        const scalar bU = outerProfile ? B_U_DEV_OUTER : B_U_DEV;
+        const scalar bA = outerProfile ? B_ALPHA_DEV_OUTER : cnProfile ? B_ALPHA_DEV_CN : B_ALPHA_DEV;
+        const scalar bP = outerProfile ? B_PRGH_DEV_OUTER : cnProfile ? B_PRGH_DEV_CN : B_PRGH_DEV;
+        const scalar bU = outerProfile ? B_U_DEV_OUTER : cnProfile ? B_U_DEV_CN : B_U_DEV;
         check("the device's alpha agrees with OpenFOAM's absolutely", eA.linf < bA);
         check("the device's p_rgh agrees with OpenFOAM's relatively", eP.rel() < bP);
         check("the device's U agrees with OpenFOAM's relatively", eU.rel() < bU);

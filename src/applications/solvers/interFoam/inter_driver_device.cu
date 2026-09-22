@@ -172,12 +172,10 @@ RunReport runInterFoamDevice(
     //
     // A MOVING mesh is still refused: LESdelta is a MeshObject in OpenFOAM and moves with the mesh,
     // and the device closure takes the width once.
-    if (f.turbulence.on && f.turbulence.model == cpu::interFoam::InterRasModel::KEqnLES
-        && f.dynamicMesh)
-        throw std::runtime_error(
-            "brae interFoam (device): the case is LES kEqn AND moves its mesh. The device closure takes "
-            "the filter width once, from the host's LESdelta::compute on the mesh as it starts; a mesh "
-            "that moves changes it at every update. Run without -device.");
+    // ...AND A MOVING MESH IS CARRIED NOW. LESModel::correct() calls delta_().correct() first
+    // (LESModel.C:251) and cubeRootVolDelta::correct() recomputes the width whenever the mesh is
+    // changing (cubeRootVolDelta.C:128-134); the move branch of this loop re-runs the host's
+    // LESdelta::compute and re-uploads what it produced, beside the wall distances.
     // EVERY CLOSURE ON THIS LOOP CROSSES A PAIR NOW. kEpsilon carried one; kOmegaSST and LES kEqn
     // refused, because k's equation is fvm::div - fvm::laplacian like the momentum's and across a
     // pair it needs the interface's off-diagonal in the matrix AND in the solve, the pair's own flux
@@ -204,14 +202,7 @@ RunReport runInterFoamDevice(
     // carries. What is still refused is a moving mesh under LES kEqn (the filter width moves with the
     // volumes and the LES closure does not refresh it) and one carrying a coupled pair or an AMI,
     // both by name below.
-    if (f.turbulence.on
-     && f.dynamicMesh
-     && f.turbulence.model == cpu::interFoam::InterRasModel::KEqnLES)
-        throw std::runtime_error(
-            "brae interFoam (device): the case runs LES kEqn AND moves its mesh. kEqn's filter width "
-            "is LESdelta::compute over the cell volumes and the device closure takes it once at "
-            "start-up (DeviceInterTurbulence::lesDelta); on a moving mesh it would keep the width the "
-            "cells had before the first step. The RAS closures carry the move. Run without -device.");
+
 
     // fvOptions: the device loop applies explicitPorositySource/DarcyForchheimer on U and THE MANGROVE
     // PAIR -- multiphaseMangrovesSource on U, multiphaseMangrovesTurbulenceModel on k and epsilon under
@@ -299,13 +290,22 @@ RunReport runInterFoamDevice(
                 "condition. Refused rather than run an unmeasured flux; a static mesh runs (gated on "
                 "laminar/damBreakPermeable).");
     }
-    // `grad(U) cellLimited`: the host momentum equation limits the gradient; the device's does not read
-    // the coefficient
+    // `grad(U) cellLimited` ON THE DEVICE. The refusal here said the momentum "does not read the
+    // coefficient", and that has not been true for some time: the shared assembler limits both
+    // gradients it forms -- linearUpwind's reconstruction (UEqn.cu:309-310, MomentumInput::
+    // gradULimitK) and divDevReff's dev2 term (:235, ::gradUSchemeLimitK) -- and this loop passes
+    // both. What is still missing is a GATE: the one fixture that could hold it here carries a
+    // periodic pair, and across a pair the momentum's limiter is a separate hole that refuses by name
+    // (UEqn.cu, measured U 8.9149e-03 on validation/interFoamCyclic `sstLimU`). So the refusal stays,
+    // with the right reason on it -- ungated, not unimplemented. The HOST arm runs it and is gated
+    // (`sstLimU`, U 8.8697e-13).
     if (f.gradULimitK > 0)
         throw std::runtime_error(
             "brae interFoam (device): fvSchemes limits grad(U) (cellLimited, k = "
-            + std::to_string((double)f.gradULimitK) + "). The host loop carries it into linearUpwind and the "
-            "viscous term; the device loop's momentum equation does not. Refused rather than run it unlimited.");
+            + std::to_string((double)f.gradULimitK) + "). The device momentum does limit both gradients "
+            "it forms, and no gate holds that on this loop -- the fixture that could carries a "
+            "periodic pair, where the limiter is a hole of its own. Refused as ungated, not as "
+            "unported; the host loop runs it.");
     // ddtCorr's BOUNDARY HALF is on the device now: deviceDdtCorr already computed it (and already
     // zeroed it wherever U fixes a value, as fvcDdtPhiCoeff does), and the pressure step adds it to
     // phiHbyA with interpolate(rho*rAU)'s patch value, as the host does (inter_peqn_cpp.cu:531-573).
@@ -1308,6 +1308,10 @@ RunReport runInterFoamDevice(
     DeviceBuffer<scalar> dPhiOOI, dPhiOOB;
     std::vector<scalar> phiOldPrevI, phiOldPrevB;
     bool phiOOExists = false;
+    // ...and the PAIR's, kept beside them for the same reason its old level is
+    DeviceBuffer<scalar> dPhiOOIf;
+    std::vector<scalar> phiOldPrevIf;
+    bool phiOOIfExists = false;
     scalar deltaTPrev = f.deltaT;
     cpu::fv::CrankNicolsonClock cnClock;
     cnClock.ocCoeff = f.ddtOcCoeff;
@@ -1319,6 +1323,10 @@ RunReport runInterFoamDevice(
     DeviceBuffer<scalar> dAlphaPhiEndI, dAlphaPhiEndB, dAlphaPhiOldI, dAlphaPhiOldB, dAlphaPhiOutI, dAlphaPhiOutB;
     bool alphaPhiOldExists = false;
     label alphaPhiOldIndex = -1;
+    // ...and the PAIR's three, kept beside them: alphaPhi10 on the coupled faces lives in its own
+    // array, so its old level and its end-of-step copy do too.
+    DeviceBuffer<scalar> dAlphaPhiEndIf, dAlphaPhiOldIf, dAlphaPhiOutIf;
+    label alphaPhiOldIfIndex = -1;
     DeviceInterStepControls C;
     C.alpha.nAlphaSubCycles = static_cast<int>(f.alphaCtl.nAlphaSubCycles);
     C.alpha.nAlphaCorr      = static_cast<int>(f.alphaCtl.nAlphaCorr);
@@ -1331,8 +1339,9 @@ RunReport runInterFoamDevice(
     C.alpha.alphaApplyPrevCorr = f.alphaCtl.alphaApplyPrevCorr;
     C.alpha.prevCorrInt = &dPrevCorrI;
     C.alpha.prevCorrBnd = &dPrevCorrB;
-    // gradSchemes: the device operators take Gauss linear and unlimited, apart from grad(U)'s cellLimited
-    // (refused above); the host takes leastSquares and cellLimited on every gradient. NOT grad(pcorr):
+    // gradSchemes: the device operators take Gauss linear and unlimited on THESE fields; grad(U),
+    // grad(k) and grad(omega) carry cellLimited. The host takes leastSquares and cellLimited on every
+    // gradient. NOT grad(pcorr):
     // CorrectPhi runs on the host on both arms (correctPhi, inter_correct_phi_cpp.cu) and takes the entry
     // through correctPhiControlsOf -- gated on LES/nozzleFlow2D `pcorrGrad`, grad(pcorr) leastSquares on
     // a mesh non-orthogonal to 40 degrees with one non-orthogonal pass, where the entry moves OpenFOAM's
@@ -1713,6 +1722,17 @@ RunReport runInterFoamDevice(
         std::vector<scalar> poi, pob;
         dPhiI.copyTo(poi); dPhiB.copyTo(pob);
         DeviceBuffer<scalar> dPhiOI(poi), dPhiOB(pob);
+        // ...and the PAIR's flux at the same instant. fvc::ddtCorr compares phi.oldTime() with the
+        // flux of U.oldTime() on every face a coupled patch included, and the pressure corrector
+        // rewrites cyc.phi, so the snapshot has to be taken here with the other two.
+        std::vector<scalar> poif;
+        DeviceBuffer<scalar> dPhiOIf;
+        if (dCyc.n > 0)
+        {
+            dCyc.phi.copyTo(poif);
+            dPhiOIf.copyFrom(poif);
+            C.phiOldIf = &dPhiOIf;
+        }
         if (cnDdt)
         {
             // phi.oldTime().oldTime(): rotated once it exists; CREATED, as a copy of phi.oldTime(), on
@@ -1734,6 +1754,25 @@ RunReport runInterFoamDevice(
             {
                 dPhiOOI.copyFrom(poi);   // read by nothing on the step the field is created
                 dPhiOOB.copyFrom(pob);
+            }
+            // ...and the PAIR's old-old level, rotated by the SAME test: one surfaceScalarField's
+            // levels, split across two arrays because the device keeps the coupled faces apart.
+            if (dCyc.n > 0)
+            {
+                if (phiOOIfExists)
+                {
+                    dPhiOOIf.copyFrom(phiOldPrevIf);
+                }
+                else
+                {
+                    dPhiOOIf.copyFrom(poif);
+                    if (dCn.ddtCorrPhi.exists && dCn.ddtCorrPhi.timeIndex != thisIndex)
+                    {
+                        phiOOIfExists = true;
+                    }
+                }
+                phiOldPrevIf = poif;
+                dCn.phiOOIf = &dPhiOOIf;
             }
             phiOldPrevI = poi;
             phiOldPrevB = pob;
@@ -1774,17 +1813,23 @@ RunReport runInterFoamDevice(
             dCn.alphaPhiOutBnd = &dAlphaPhiOutB;
             dCn.alphaPhiCreatedInt = &dAlphaPhiOldI;
             dCn.alphaPhiCreatedBnd = &dAlphaPhiOldB;
-        }
-        // ...and the PAIR's flux at the same instant. fvc::ddtCorr compares phi.oldTime() with the
-        // flux of U.oldTime() on every face a coupled patch included, and the pressure corrector
-        // rewrites cyc.phi, so the snapshot has to be taken here with the other two.
-        DeviceBuffer<scalar> dPhiOIf;
-        if (dCyc.n > 0)
-        {
-            std::vector<scalar> poif;
-            dCyc.phi.copyTo(poif);
-            dPhiOIf.copyFrom(poif);
-            C.phiOldIf = &dPhiOIf;
+            // ...and the PAIR's own level of the same field, rotated at the same instant. Its faces
+            // are in neither of the two arrays above, and the un-blend is face-local.
+            if (dCyc.n > 0)
+            {
+                dCn.alphaPhiOldIf = nullptr;
+                if (dCn.ocAlpha > scalar(0) && alphaPhiOldExists)
+                {
+                    if (alphaPhiOldIfIndex != thisIndex)
+                    {
+                        deviceCopy(dAlphaPhiOldIf, dAlphaPhiEndIf);
+                        alphaPhiOldIfIndex = thisIndex;
+                    }
+                    dCn.alphaPhiOldIf = &dAlphaPhiOldIf;
+                }
+                dCn.alphaPhiOutIf = &dAlphaPhiOutIf;
+                dCn.alphaPhiCreatedIf = &dAlphaPhiOldIf;
+            }
         }
 
         // OpenFOAM's clock for the step about to be taken: ++runTime comes before the alpha step
@@ -1930,6 +1975,7 @@ RunReport runInterFoamDevice(
                 // stores it
                 deviceCopy(dAlphaPhiEndI, dAlphaPhiOutI);
                 deviceCopy(dAlphaPhiEndB, dAlphaPhiOutB);
+                if (dCyc.n > 0) deviceCopy(dAlphaPhiEndIf, dAlphaPhiOutIf);
                 if (!alphaPhiOldExists)
                 {
                     // GeometricField::oldTime() on the first blended step: the level was created by this
@@ -1940,6 +1986,11 @@ RunReport runInterFoamDevice(
                     alphaPhiOldIndex = s + 1;
                     dCn.alphaPhiOldInt = &dAlphaPhiOldI;
                     dCn.alphaPhiOldBnd = &dAlphaPhiOldB;
+                    if (dCyc.n > 0)
+                    {
+                        alphaPhiOldIfIndex = s + 1;
+                        dCn.alphaPhiOldIf = &dAlphaPhiOldIf;
+                    }
                 }
             }
 

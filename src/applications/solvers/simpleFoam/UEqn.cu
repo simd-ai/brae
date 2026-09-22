@@ -78,7 +78,14 @@ void assembleUEqn(
                 "forwardT (deviceCyclicAddGradRot, which takes all three components at once); this "
                 "assembly adds the pair per component. Refusing rather than summing an un-rotated "
                 "neighbour into the gradient.");
-        if (in.gradULimitK > 0.0)
+        // BOTH COEFFICIENTS, and the second is why this refusal did not fire when it should have:
+        // `gradULimitK` is the limiter linearUpwind NAMES and `gradUSchemeLimitK` is the gradSchemes
+        // `grad(U)` ENTRY, which divDevReff's dev2 term takes. A case with `div(rhoPhi,U) Gauss
+        // upwind` and `grad(U) cellLimited Gauss linear 1` sets the second and not the first, so it
+        // walked straight past a refusal written for it. MEASURED on validation/interFoamCyclic
+        // `sstLimU`, ten steps: device U 8.9149e-03, k 3.3383e-02, nut 4.1315e-01 against a host arm
+        // that reads 8.8697e-13, 6.4243e-13 and 2.6965e-12 on the same case.
+        if (in.gradULimitK > 0.0 || in.gradUSchemeLimitK > 0.0)
             throw std::runtime_error(
                 "brae device UEqn: a cellLimited grad(U) across a coupled patch would limit against a "
                 "neighbour it cannot see -- OF's cellLimitedGrad treats a cyclic face as internal, and "

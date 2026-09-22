@@ -572,23 +572,41 @@ void correct(
             "kOmegaSST(cuda): the case asks for a leastSquares grad(k)/grad(omega) and the mesh has "
             "a periodic pair. deviceLeastSquaresGrad does not carry an interface, so CDkOmega would "
             "read a gradient fitted without it. The Gauss form does.");
-    if (pair && in.co.gradKLimitK > scalar(0))
-        throw std::runtime_error(
-            "kOmegaSST(cuda): the case asks for a cellLimited grad(k)/grad(omega) and the mesh has a "
-            "periodic pair. deviceCellLimitGrad's interface form takes a CellLimitInterface list this "
-            "closure does not build, so the limiter would see the pair's cells as boundary cells.");
+    // ...and the LIMITER sees the pair too where the case names cellLimited: OF's cellLimitedGrad
+    // folds a coupled patch's patchNeighbourField into its range and clips the extrapolation to that
+    // face. A scalar is never rotated across the interface, so the neighbour value is the raw cell
+    // value (CellLimitInterface).
+    DeviceBuffer<scalar> cycKNbr, cycONbr, cycEmpty;
+    CellLimitInterface kIfs[1], oIfs[1];
+    int nKIfs = 0, nOIfs = 0;
     if (in.co.gradKLeastSq) deviceLeastSquaresGrad(dm, k, kbv, kgx, kgy, kgz);
     else                    deviceGaussGrad(dm, k, kbv, kgx, kgy, kgz);
     if (pair) deviceCyclicAddGrad(*in.cyc, k, dm.V, kgx, kgy, kgz);
     if (in.co.gradKLimitK > scalar(0))
-        deviceCellLimitGrad(dm, k, kbv, kgx, kgy, kgz, in.co.gradKLimitK);
+    {
+        if (pair)
+        {
+            deviceCyclicNbrValue(*in.cyc, k, cycEmpty, cycEmpty, cycEmpty, 0, cycKNbr);
+            kIfs[nKIfs++] = { in.cyc->n, in.cyc->ownCell.data(), cycKNbr.data(),
+                              in.cyc->dOwnX.data(), in.cyc->dOwnY.data(), in.cyc->dOwnZ.data() };
+        }
+        deviceCellLimitGrad(dm, k, kbv, kgx, kgy, kgz, in.co.gradKLimitK, kIfs, nKIfs);
+    }
     if (omegaBndLast.size()) deviceCopy(obv, omegaBndLast);
     else                     deviceBCValue(dbOmega, omega, obv);
     if (in.co.gradKLeastSq) deviceLeastSquaresGrad(dm, omega, obv, ogx, ogy, ogz);
     else                    deviceGaussGrad(dm, omega, obv, ogx, ogy, ogz);
     if (pair) deviceCyclicAddGrad(*in.cyc, omega, dm.V, ogx, ogy, ogz);
     if (in.co.gradKLimitK > scalar(0))
-        deviceCellLimitGrad(dm, omega, obv, ogx, ogy, ogz, in.co.gradKLimitK);
+    {
+        if (pair)
+        {
+            deviceCyclicNbrValue(*in.cyc, omega, cycEmpty, cycEmpty, cycEmpty, 0, cycONbr);
+            oIfs[nOIfs++] = { in.cyc->n, in.cyc->ownCell.data(), cycONbr.data(),
+                              in.cyc->dOwnX.data(), in.cyc->dOwnY.data(), in.cyc->dOwnZ.data() };
+        }
+        deviceCellLimitGrad(dm, omega, obv, ogx, ogy, ogz, in.co.gradKLimitK, oIfs, nOIfs);
+    }
     // F1/F2 blend on the KINEMATIC laminar viscosity, per cell -- the compressible lineage has no
     // case-constant nu, and arg1/arg2 are written in nu, not mu. FP-2: CDkOmega, F1 and F2 in one launch
     // (deviceSstCdF1F2; F1 reads the CD its own thread formed; bit-identical to the three kernels).

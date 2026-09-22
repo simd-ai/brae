@@ -120,9 +120,36 @@ void assembleScalarTransport(
         auto g = std::make_unique<FieldGrad>();
         g->leastSq = leastSq;
         g->limitK = limitK;
+        // ...WITH THE PAIR. This gradient is the LIMITER's -- OpenFOAM builds it through
+        // fvc::grad(lPhi) (LimitedScheme.C:56-59) and fvc::grad sums a coupled face like any other
+        // patch's -- so a gradient built without the interface limits the pair's cells as if there
+        // were a wall there. Inert on every fixture gated so far, all of which name `Gauss upwind`
+        // for the closure's transport: a finding of the audit's class, not of a measurement.
+        const bool pair = sc.cyc && sc.cyc->n > 0;
+        if (pair && leastSq)
+            throw std::runtime_error(
+                "brae turbulence transport: the case asks for a leastSquares gradient for the "
+                "limiter and the mesh has a periodic pair. deviceLeastSquaresGrad carries no "
+                "interface, so the pair's cells would get a gradient fitted without it.");
         if (leastSq) deviceLeastSquaresGrad(dm, field, bv, g->gx, g->gy, g->gz);
         else         deviceGaussGrad(dm, field, bv, g->gx, g->gy, g->gz);
-        if (limitK > scalar(0)) deviceCellLimitGrad(dm, field, bv, g->gx, g->gy, g->gz, limitK);
+        if (pair) deviceCyclicAddGrad(*sc.cyc, field, dm.V, g->gx, g->gy, g->gz);
+        if (limitK > scalar(0))
+        {
+            // cellLimitedGrad folds a coupled patch's patchNeighbourField into its range and clips
+            // the extrapolation to that face. A SCALAR is never rotated across the interface, so the
+            // neighbour value is the raw cell value -- the same list device_scalar_transport builds.
+            CellLimitInterface ifs[1];
+            int nIfs = 0;
+            DeviceBuffer<scalar> cycNbr, empty;
+            if (pair)
+            {
+                deviceCyclicNbrValue(*sc.cyc, field, empty, empty, empty, 0, cycNbr);
+                ifs[nIfs++] = { sc.cyc->n, sc.cyc->ownCell.data(), cycNbr.data(),
+                                sc.cyc->dOwnX.data(), sc.cyc->dOwnY.data(), sc.cyc->dOwnZ.data() };
+            }
+            deviceCellLimitGrad(dm, field, bv, g->gx, g->gy, g->gz, limitK, ifs, nIfs);
+        }
         grads.push_back(std::move(g));
         return *grads.back();
     };

@@ -6,6 +6,7 @@
 #include "cf_types.cuh"
 #include "crank_nicolson_ddt_scheme_cpp.cuh"   // CrankNicolsonClock
 #include "device_buffer.cuh"
+#include "device_cyclic.cuh"
 #include "device_mesh.cuh"
 #include <string>
 
@@ -81,6 +82,14 @@ void deviceCnDdtCorr(
     const DeviceBuffer<int>& bndUFixesValue,
     scalar ddtPhiCoeff,
     DeviceBuffer<scalar>& outInt,
-    DeviceBuffer<scalar>& outBnd);
+    DeviceBuffer<scalar>& outBnd,
+    // ...and THE PERIODIC PAIR, whose faces are in neither array: its own dphidt0 level, phi's two
+    // old levels there, and where to write. All null is a mesh with no pair; a pair with any of them
+    // missing is refused, because the Euler twin would otherwise stand in silently.
+    const DeviceCyclic* cyc = nullptr,
+    DeviceCnDdt0* dphidt0If = nullptr,
+    const DeviceBuffer<scalar>* phiOldIf = nullptr,
+    const DeviceBuffer<scalar>* phiOOIf = nullptr,
+    DeviceBuffer<scalar>* outIf = nullptr);
 
 }   // namespace brae

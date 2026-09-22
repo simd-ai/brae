@@ -70,7 +70,9 @@ SolverPerformance correct(
     Taps* taps,
     const fv::CrankNicolsonClock* cn,
     fv::CrankNicolsonDdt0<scalar>* cnDdt0K,
-    const std::vector<scalar>* kOO)
+    const std::vector<scalar>* kOO,
+    const std::vector<scalar>* V0,
+    const SurfaceScalarField* meshPhi)
 {
     if (!(deltaT > scalar(0)))
     {
@@ -80,8 +82,24 @@ SolverPerformance correct(
     const std::vector<scalar>& V = g.V();
     const std::vector<scalar> kOld = k.internal;
 
-    // divU = fvc::div(fvc::absolute(phi, U)): a static mesh, so phi itself
-    const std::vector<scalar> divU = fvc::div(phi, m, g, patches);
+    // divU = fvc::div(fvc::absolute(phi, U)) = fvc::div(phi + mesh.phi()). On a mesh that does not
+    // move meshPhi is null and the absolute flux IS phi; on one that does, adding it face by face
+    // before the divergence is what the RAS closures do (kEpsilon_cpp.cu:279-291).
+    std::vector<scalar> divU;
+    if (meshPhi)
+    {
+        SurfaceScalarField absPhi = phi;
+        for (std::size_t f = 0; f < absPhi.internal.size(); ++f)
+            absPhi.internal[f] += meshPhi->internal[f];
+        for (std::size_t pi = 0; pi < absPhi.boundary.size(); ++pi)
+            for (std::size_t i = 0; i < absPhi.boundary[pi].size(); ++i)
+                absPhi.boundary[pi][i] += meshPhi->boundary[pi][i];
+        divU = fvc::div(absPhi, m, g, patches);
+    }
+    else
+    {
+        divU = fvc::div(phi, m, g, patches);
+    }
 
     // G = nut*(gradU && devTwoSymm(gradU)), with the nut the previous correctNut left
     const std::vector<tensor> gradU = fvc::gaussGrad(U, m, g, patches);
@@ -180,9 +198,10 @@ SolverPerformance correct(
     const scalar rDeltaT = cn ? scalar(0) : scalar(1)/deltaT;
     for (label c = 0; c < nC; ++c)
     {
-        // fvm::ddt(k), Euler -- inert under CrankNicolson, where rDeltaT is zero
+        // fvm::ddt(k), Euler -- inert under CrankNicolson, where rDeltaT is zero. Under
+        // mesh().moving() the diagonal keeps V and the SOURCE takes V0 (EulerDdtScheme.C).
         M.diag[c] += rDeltaT*V[c];
-        M.source[c] += rDeltaT*kOld[c]*V[c];
+        M.source[c] += rDeltaT*kOld[c]*(V0 ? (*V0)[c] : V[c]);
         // == G
         M.source[c] += G[c]*V[c];
         // - fvm::SuSp((2/3)*divU, k)

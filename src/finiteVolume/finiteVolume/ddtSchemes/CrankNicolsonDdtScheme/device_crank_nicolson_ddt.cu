@@ -129,6 +129,47 @@ __global__ void cnDdtCorrInternalKernel(
     out[f] = ddtCoeffOf(phiOld[f], phiCorr, given)*corr;
 }
 
+// THE PERIODIC PAIR's half of the same expression. Its faces are in neither the internal nor the
+// boundary array -- they carry their own owner/neighbour cells, weights and Sf (DeviceCyclic) -- and
+// the arithmetic is the internal kernel's, face for face. The Euler twin is
+// deviceInterDdtCorrCyclic; without this one the pair silently took THAT under CrankNicolson's name.
+__global__ void cnDdtCorrCyclicKernel(
+    int nIf,
+    const label* own,
+    const label* nbr,
+    const scalar* lambda,
+    const scalar* Sfx,
+    const scalar* Sfy,
+    const scalar* Sfz,
+    const scalar* phiOld,
+    const scalar* dphidt0,
+    const scalar* uox,
+    const scalar* uoy,
+    const scalar* uoz,
+    const scalar* Wx,
+    const scalar* Wy,
+    const scalar* Wz,
+    scalar rDtCoef,
+    scalar oc,
+    scalar given,
+    scalar* out)
+{
+    const int f = blockDim.x*blockIdx.x + threadIdx.x;
+    if (f >= nIf) return;
+    const int P = own[f];
+    const int N = nbr[f];
+    const scalar l = lambda[f];
+    const scalar ux = l*(uox[P] - uox[N]) + uox[N];
+    const scalar uy = l*(uoy[P] - uoy[N]) + uoy[N];
+    const scalar uz = l*(uoz[P] - uoz[N]) + uoz[N];
+    const scalar phiCorr = phiOld[f] - (Sfx[f]*ux + Sfy[f]*uy + Sfz[f]*uz);
+    const scalar wx = l*(Wx[P] - Wx[N]) + Wx[N];
+    const scalar wy = l*(Wy[P] - Wy[N]) + Wy[N];
+    const scalar wz = l*(Wz[P] - Wz[N]) + Wz[N];
+    const scalar corr = (rDtCoef*phiOld[f] + offCentre(oc, dphidt0[f])) - (Sfx[f]*wx + Sfy[f]*wy + Sfz[f]*wz);
+    out[f] = ddtCoeffOf(phiOld[f], phiCorr, given)*corr;
+}
+
 __global__ void cnDdtCorrBoundaryKernel(
     int nBf,
     const label* bndGFace,
@@ -277,7 +318,12 @@ void deviceCnDdtCorr(
     const DeviceBuffer<int>& bndUFixesValue,
     scalar ddtPhiCoeff,
     DeviceBuffer<scalar>& outInt,
-    DeviceBuffer<scalar>& outBnd)
+    DeviceBuffer<scalar>& outBnd,
+    const DeviceCyclic* cyc,
+    DeviceCnDdt0* dphidt0If,
+    const DeviceBuffer<scalar>* phiOldIf,
+    const DeviceBuffer<scalar>* phiOOIf,
+    DeviceBuffer<scalar>* outIf)
 {
     const int nC = dm.nCells;
     const int nIf = dm.nInternalFaces;
@@ -356,6 +402,38 @@ void deviceCnDdtCorr(
                                                        Wb[0].data(), Wb[1].data(), Wb[2].data(),
                                                        rDtCoef, clock.ocCoeff, ddtPhiCoeff, outBnd.data());
         cudaCheck(cudaGetLastError(), "cn ddtCorr boundary");
+    }
+    // ...and THE PAIR, with W and the coefficients built above: the same face expression on a third
+    // array. dphidt0's level for those faces is its own object, which sees the same clock and so
+    // carries the same startTimeIndex and the same two coefficients -- splitting the storage of one
+    // OpenFOAM surfaceScalarField's levels, not splitting the scheme.
+    if (cyc && cyc->n > 0)
+    {
+        if (!dphidt0If || !phiOldIf || !phiOOIf || !outIf
+         || static_cast<int>(phiOldIf->size()) != cyc->n
+         || static_cast<int>(phiOOIf->size()) != cyc->n)
+            throw std::runtime_error(
+                "brae CrankNicolson (device) ddtCorr: the mesh has a periodic pair and the caller gave "
+                "no dphidt0 level, no phi.oldTime()/oldTime().oldTime() on its faces, or nowhere to "
+                "write. Those faces are in neither the internal nor the boundary array.");
+        dphidt0If->lookupOrCreate(clock, 1, static_cast<std::size_t>(cyc->n), 0);
+        if (dphidt0If->evaluate(clock))
+        {
+            const scalar rDtCoef0 = dphidt0If->rDtCoef0(clock);
+            cnDdt0UpdateKernel<<<nBlocks(cyc->n), TPB>>>(cyc->n, rDtCoef0, clock.ocCoeff, nullptr, nullptr,
+                                                         phiOldIf->data(), phiOOIf->data(),
+                                                         dphidt0If->internal[0].data());
+            cudaCheck(cudaGetLastError(), "cn ddtCorr dphidt0, interface");
+        }
+        outIf->resize(static_cast<std::size_t>(cyc->n));
+        cnDdtCorrCyclicKernel<<<nBlocks(cyc->n), TPB>>>(cyc->n, cyc->ownCell.data(), cyc->nbrCell.data(),
+                                                        cyc->weights.data(),
+                                                        cyc->Sfx.data(), cyc->Sfy.data(), cyc->Sfz.data(),
+                                                        phiOldIf->data(), dphidt0If->internal[0].data(),
+                                                        UOld[0]->data(), UOld[1]->data(), UOld[2]->data(),
+                                                        W[0].data(), W[1].data(), W[2].data(),
+                                                        rDtCoef, clock.ocCoeff, ddtPhiCoeff, outIf->data());
+        cudaCheck(cudaGetLastError(), "cn ddtCorr, interface");
     }
 }
 

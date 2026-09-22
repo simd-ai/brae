@@ -1214,13 +1214,10 @@ InterFields buildInterFields(const std::string&          caseDir,
     // flux (the Compressible V0 and meshPhi of each), the wall functions' y is recomputed from the moved
     // geometry at every correct (nearWallDist::movePoints), and kOmegaSST's meshWave wallDist after every
     // motion (moveInterTurbulence). The LES closure's moving-mesh terms are not carried: refused.
-    if (f.dynamicMesh && f.turbulence.on && f.turbulence.model == InterRasModel::KEqnLES)
-    {
-        throw std::runtime_error(
-            "brae interFoam: the mesh moves and the closure is LES kEqn. kEpsilon and kOmegaSST carry the "
-            "moving mesh's old volumes, absolute flux and wall distance; the LES filter's moving-mesh terms "
-            "are not ported. Refused rather than run the closure on the mesh as it started.");
-    }
+    // ...AND THE LES CLOSURE CARRIES IT NOW, with a third term the RAS ones do not have: the FILTER
+    // WIDTH. LESModel::correct() calls delta_().correct() first (LESModel.C:251) and
+    // cubeRootVolDelta::correct() recomputes (deltaCoeff*V)^(1/3) whenever the mesh is changing
+    // (cubeRootVolDelta.C:128-134). Gated on waves/waveMakerPiston `pistonLES`, both arms.
     // A WAVE CONDITION ON A MOVING MESH IS NOT REFUSED. OpenFOAM's wave models take their geometry once,
     // at construction (waveModel::initialiseGeometry: the patch's orientation, each face's height and
     // paddle), and read only its magSf and its face cells' alpha as the run goes (waveModel::waterLevel);
@@ -1301,11 +1298,11 @@ InterFields buildInterFields(const std::string&          caseDir,
                         "brae interFoam: the case runs a momentum predictor across the coupled patch `" + q.name
                         + "` (" + q.type + "). fvMatrix::solveSegregated's coupled source is gated across a "
                         "cyclicAMI only; refused rather than run ungated.");
-                if (f.gradULimitK > 0)
-                    throw std::runtime_error(
-                        "brae interFoam: the case limits grad(U) across the coupled patch `" + q.name + "` ("
-                        + q.type + "). cellLimitedGrad's coupled range is gated across a cyclicAMI only; refused "
-                        "rather than run ungated.");
+                // `cellLimited grad(U)` ACROSS A PLAIN CYCLIC runs now. The refusal said
+                // cellLimitedGrad's coupled range was gated across a cyclicAMI only, which was true:
+                // the code walked the patch, nothing held it on a translational pair.
+                // validation/interFoamCyclic `sstLim` holds it -- grad(U), grad(k) and grad(omega)
+                // all `cellLimited Gauss linear 1` on a `corrected` laplacian, both arms.
             }
             // THE OTHER GRADIENTS' ENTRIES. Every one is gated on damBreak (`gradLsqLimited`, `nHatLimited`),
             // which has no coupled patch; the limiter's coupled range is the one limitPass that grad(U)'s

@@ -369,6 +369,18 @@ void refreshDeviceInterTurbulenceGeometry(
 
     // kOmegaSST's CELL wall distance, which F1 and F2 blend on. The host block's moveInterTurbulence
     // has already re-run wallDist's method on the moved points; this uploads what it produced.
+    // ...and the LES filter width, which is the same MeshObject story: the host block's
+    // moveInterTurbulence has just re-run LESdelta::compute on the moved cells.
+    if (les)
+    {
+        if (t.delta.size() != d.lesDelta.size())
+            throw std::runtime_error(
+                "brae interFoam (device): the host LES filter width is " + std::to_string(t.delta.size())
+                + " cells and the device holds " + std::to_string(d.lesDelta.size())
+                + "; moveInterTurbulence did not run on this mesh.");
+        d.lesDelta.copyFrom(t.delta);
+    }
+
     if (sst)
     {
         if (t.yCell.size() != d.yCell.size())
@@ -480,6 +492,10 @@ void deviceCorrectInterTurbulence(
         // k convects with the volumetric phi like every other equation on it.
         lin.cyc    = in.cyc;
         lin.cycPhi = in.cycPhi;
+        // ...and a MOVING mesh's two terms, as the RAS branches take them
+        lin.V0         = in.V0;
+        lin.meshPhiInt = in.meshPhiInt;
+        lin.meshPhiBnd = in.meshPhiBnd;
         // ...and fvm::ddt(k) under CrankNicolson, with k's old-old level rotated once per time index.
         // alpha = rho = 1 in this lineage, so there is no rho old-old to carry.
         if (in.cn)

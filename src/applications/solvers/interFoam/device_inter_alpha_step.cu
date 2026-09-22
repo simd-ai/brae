@@ -292,13 +292,19 @@ void deviceInterAlphaStep(
         {
             // alphaEqn.H:253-262, the branch a non-Euler ddt(rho,U) takes: un-blend the end-of-step
             // flux, then rhoPhi with phi beside rho2 -- the host driver's step1 (inter_driver_cpp.cu)
-            if (li.cyc && li.cyc->n > 0)
+            // THE PAIR IS CARRIED HERE TOO. Its faces are in neither of the two arrays above, so the
+            // un-blend and the mass flux both need the pair's own buffers -- alphaPhi10 on those
+            // faces, its old level, and rhoPhi's slot. The host arm walks the coupled patch with
+            // every other one (inter_driver_cpp.cu:606-617), so this is the same arithmetic on a
+            // third array and not a third formula.
+            const bool pair = li.cyc && li.cyc->n > 0;
+            if (pair && !li.alphaPhiIf)
                 throw std::runtime_error(
-                    "brae interFoam device alpha step: CrankNicolson's end-of-step alpha flux on a "
-                    "coupled pair is not carried. Refused rather than leave the pair's flux blended.");
+                    "brae interFoam device alpha step: CrankNicolson on a coupled pair needs the "
+                    "pair's own alpha flux; the caller gave none.");
             if (ctl.cnCoeffUnblend < scalar(1))
             {
-                DeviceBuffer<scalar> createdI, createdB;
+                DeviceBuffer<scalar> createdI, createdB, createdIf;
                 if (!ctl.alphaPhiOldInt)
                 {
                     deviceCopy(createdI, alphaPhiInt);
@@ -310,11 +316,29 @@ void deviceInterAlphaStep(
                 const DeviceBuffer<scalar>& oldB = ctl.alphaPhiOldBnd ? *ctl.alphaPhiOldBnd : createdB;
                 deviceUnblendAlphaFlux(nIf, ctl.cnCoeffUnblend, oldI, alphaPhiInt);
                 deviceUnblendAlphaFlux(nBf, ctl.cnCoeffUnblend, oldB, alphaPhiBnd);
+                if (pair)
+                {
+                    // the pair's level is created by this same pass when it does not exist, exactly
+                    // as the other two are: GeometricField::oldTime() on a field never asked for one
+                    if (!ctl.alphaPhiOldIf)
+                    {
+                        deviceCopy(createdIf, *li.alphaPhiIf);
+                        if (ctl.alphaPhiCreatedIf) deviceCopy(*ctl.alphaPhiCreatedIf, *li.alphaPhiIf);
+                    }
+                    const DeviceBuffer<scalar>& oldIf = ctl.alphaPhiOldIf ? *ctl.alphaPhiOldIf : createdIf;
+                    deviceUnblendAlphaFlux(li.cyc->n, ctl.cnCoeffUnblend, oldIf, *li.alphaPhiIf);
+                }
             }
             deviceMassFlux(nIf, alphaPhiInt, *li.phiInt, li.rho1, li.rho2, rpInt);
             deviceMassFlux(nBf, alphaPhiBnd, *li.phiBnd, li.rho1, li.rho2, rpBnd);
+            // ...and the pair's rhoPhi, which this branch takes beside the RAW phi and not phiCN
+            if (pair && ctl.rhoPhiIf)
+            {
+                deviceMassFlux(li.cyc->n, *li.alphaPhiIf, li.cyc->phi, li.rho1, li.rho2, *ctl.rhoPhiIf);
+            }
             if (ctl.alphaPhiOutInt) deviceCopy(*ctl.alphaPhiOutInt, alphaPhiInt);
             if (ctl.alphaPhiOutBnd) deviceCopy(*ctl.alphaPhiOutBnd, alphaPhiBnd);
+            if (pair && ctl.alphaPhiOutIf) deviceCopy(*ctl.alphaPhiOutIf, *li.alphaPhiIf);
             return;
         }
         // rhoPhi = alphaPhi10*(rho1 - rho2) + phiCN*rho2, alphaEqn.H:248 -- built once per SUB-STEP,

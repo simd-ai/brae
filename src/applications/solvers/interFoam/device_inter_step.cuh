@@ -171,6 +171,9 @@ struct DeviceInterCrankNicolson
     const DeviceBuffer<scalar>* alpha1OO = nullptr;
     const DeviceBuffer<scalar>* phiOOInt = nullptr;
     const DeviceBuffer<scalar>* phiOOBnd = nullptr;
+    // ...and the PAIR's own old-old flux and its dphidt0 level, which ddtCorr needs there
+    const DeviceBuffer<scalar>* phiOOIf = nullptr;
+    DeviceCnDdt0 ddtCorrPhiIf;
     // alphaEqn.H:18-56, :91-97, :236-262 -- the off-centring coefficient the scheme constructed for
     // ddt(alpha) gives on THIS step (0 before the scheme is warm), its cnCoeff, and alphaPhi10's levels
     scalar ocAlpha = 0;
@@ -181,6 +184,10 @@ struct DeviceInterCrankNicolson
     DeviceBuffer<scalar>* alphaPhiOutBnd = nullptr;
     DeviceBuffer<scalar>* alphaPhiCreatedInt = nullptr;
     DeviceBuffer<scalar>* alphaPhiCreatedBnd = nullptr;
+    // ...and the same three on the PAIR's own faces, which are in neither of the arrays above
+    const DeviceBuffer<scalar>* alphaPhiOldIf = nullptr;
+    DeviceBuffer<scalar>*       alphaPhiOutIf = nullptr;
+    DeviceBuffer<scalar>*       alphaPhiCreatedIf = nullptr;
 };
 
 struct DeviceInterStepControls

@@ -36,6 +36,8 @@ __global__
 void reactionKernel(
     int nC,
     const scalar* __restrict__ V,
+    // a MOVING mesh's OLD volumes, or null: the Euler source takes V0 where the diagonal keeps V
+    const scalar* __restrict__ V0,
     const scalar* __restrict__ kOld,
     const scalar* __restrict__ k,
     const scalar* __restrict__ G,
@@ -53,7 +55,7 @@ void reactionKernel(
     scalar s = source[c];
     // fvm::ddt(k), Euler
     d += rDeltaT*Vc;
-    s += rDeltaT*kOld[c]*Vc;
+    s += rDeltaT*kOld[c]*(V0 ? V0[c] : Vc);
     // == G
     s += G[c]*Vc;
     // - fvm::SuSp((2/3)*divU, k)
@@ -122,6 +124,17 @@ DeviceSolverPerf correct(
     // divU = fvc::div(fvc::absolute(phi, U)); a static mesh, so phi itself
     DeviceBuffer<scalar> divU;
     deviceDiv(dm, *in.phiInt, *in.phiBnd, divU);
+    // ...and on a MOVING mesh the divergence is of the ABSOLUTE flux, phi + mesh.phi(), which is
+    // what LESModel's fvc::div(fvc::absolute(phi, U)) is (the RAS closures take the same branch).
+    if (in.meshPhiInt && in.meshPhiBnd)
+    {
+        DeviceBuffer<scalar> absInt, absBnd;
+        deviceCopy(absInt, *in.phiInt);
+        deviceCopy(absBnd, *in.phiBnd);
+        deviceAxpy(scalar(1), *in.meshPhiInt, absInt);
+        deviceAxpy(scalar(1), *in.meshPhiBnd, absBnd);
+        deviceDiv(dm, absInt, absBnd, divU);
+    }
     // ...and THE PAIR's faces, which fvc::div sums into their own cell like any other patch's. One
     // flux here: this lineage is the uniform one, where the volumetric and the equation's coincide.
     if (in.cyc && in.cyc->n > 0)
@@ -184,7 +197,8 @@ DeviceSolverPerf correct(
     // ...with the Euler fvm::ddt folded in, UNLESS the scheme is CrankNicolson: rDeltaT 0 leaves the
     // kernel's two ddt lines inert and the scheme's own term is added below, which is the shape the
     // kEpsilon closure uses for the same switch.
-    reactionKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), in.kOld->data(), k.data(), G.data(),
+    reactionKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), in.V0 ? in.V0->data() : nullptr,
+                                      in.kOld->data(), k.data(), G.data(),
                                       divU.data(), in.delta->data(),
                                       in.cn ? scalar(0) : in.rDeltaT, in.co.Ce,
                                       M.diag.data(), M.source.data());

@@ -272,6 +272,18 @@
 # all four bounded BY THE HOST ARM and not by a constant.
 # BROKEN ONCE, on the device arm: the refresh skipped (the host's kept, so this is the device's own
 # stale distance and nothing else) -- alpha 4.2494e-08, p_rgh 4.2660e-08, U 1.7353e-05, 4 failures.
+#
+# PROFILE pistonLES: the SAME paddle under LES kEqn, on BOTH arms. Its third moving-mesh term is the
+# one the RAS closures do not have -- the FILTER WIDTH. cubeRootVolDelta is (deltaCoeff*V)^(1/3) per
+# cell; LESModel::correct() calls delta_().correct() first (LESModel.C:251) and
+# cubeRootVolDelta::correct() recomputes it whenever the mesh is changing (cubeRootVolDelta.C:128-134).
+# Both brae arms took it once, at start-up, and the host LES closure was also missing the other two
+# terms (V0 in the ddt source, the absolute flux in divU). k reaches U through nut alone, so this
+# profile compares k and nut and not only the three shared fields.
+# MEASURED: host alpha 1.4e-12, p_rgh 1.4e-12, U 3.9e-10; device 1.7e-12, 1.7e-12, 1.7e-10;
+# k 7.7e-11, nut 3.2e-11, with OpenFOAM's own nut reaching 1.1e-05.
+# BROKEN ONCE: the width frozen at start-up -- nut 1.1913e-02, k 9.1652e-04, U 8.8578e-04, alpha
+# 1.0770e-07, 8 failures on both arms at once.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_moving_vs_openfoam"
@@ -451,6 +463,40 @@ else:
             assert k == 1, 'U internalField not found'
         open(p, 'w').write(t)
 PYEOF
+    if [ "$profile" = pistonLES ]; then
+        # THE SAME PADDLE UNDER LES kEqn. What this profile holds that `pistonSST` cannot is the
+        # FILTER WIDTH: cubeRootVolDelta is (deltaCoeff*V)^(1/3) per cell, LESModel::correct() calls
+        # delta_().correct() first (LESModel.C:251) and cubeRootVolDelta::correct() recomputes it
+        # whenever the mesh is changing (cubeRootVolDelta.C:128-134). Both brae arms took it once, at
+        # start-up. Nothing is a wall function here -- kEqn's nut is Ck*sqrt(k)*delta everywhere.
+        PROFILE="$profile" python3 - "$C" <<'PYEOF' || { echo "FAIL: staging LES kEqn into $name"; return 1; }
+import os, re, sys
+d = sys.argv[1]
+def sub(path, pat, rep):
+    t = open(path).read()
+    t2, k = re.subn(pat, rep, t, count=1)
+    assert k == 1, (path, pat)
+    open(path, 'w').write(t2)
+sub(os.path.join(d, 'constant/turbulenceProperties'), r'simulationType\s+laminar;',
+    'simulationType  LES;\n\nLES\n{\n    LESModel        kEqn;\n    turbulence      on;\n'
+    '    printCoeffs     on;\n    delta           cubeRootVol;\n'
+    '    cubeRootVolCoeffs { deltaCoeff 1; }\n}')
+sc = os.path.join(d, 'system/fvSchemes')
+sub(sc, r'(div\(rhoPhi,U\)[^\n]*\n)', r'\1    div(phi,k)      Gauss upwind;\n')
+fs = os.path.join(d, 'system/fvSolution')
+sub(fs, r'\n    U\n', '\n    "k.*"\n    {\n        solver          smoothSolver;\n'
+    '        smoother        symGaussSeidel;\n        tolerance       1e-12;\n        relTol          0;\n'
+    '    }\n\n    U\n')
+hdr = ('FoamFile { version 2.0; format ascii; class volScalarField; object %s; }\n'
+       'dimensions      %s;\ninternalField   uniform %s;\nboundaryField\n{\n'
+       '    "(.*)"       { type zeroGradient; }\n}\n')
+for fld, dims, val in [('k', '[0 2 -2 0 0 0 0]', '0.0001'), ('nut', '[0 2 -1 0 0 0 0]', '0')]:
+    for t in ('0', '0.orig'):
+        p = os.path.join(d, t)
+        if os.path.isdir(p):
+            open(os.path.join(p, fld), 'w').write(hdr % (fld, dims, val))
+PYEOF
+    fi
     if [ "$profile" = pistonSST ]; then
         PROFILE="$profile" python3 - "$C" <<'PYEOF' || { echo "FAIL: staging kOmegaSST into $name"; return 1; }
 import os, re, sys
@@ -546,6 +592,7 @@ stage solitaryGamg   waves/waveMakerSolitary 0.01 30 solitaryGamg   || rc=1
 stage pistonStatic   waves/waveMakerPiston   0.01 30 pistonStatic   || rc=1
 stage piston         waves/waveMakerPiston   0.01 30 piston         || rc=1
 stage pistonSST      waves/waveMakerPiston   0.01 30 pistonSST      || rc=1
+stage pistonLES      waves/waveMakerPiston   0.01 30 pistonLES      || rc=1
 stage flapStatic     waves/waveMakerFlap     0.01 30 flapStatic     || rc=1
 stage flap           waves/waveMakerFlap     0.01 30 flap           || rc=1
 stage multiPistonStatic waves/waveMakerMultiPaddlePiston 0.01 30 multiPistonStatic || rc=1
@@ -589,6 +636,9 @@ gate solitary       0.01  30 solitary       solitaryStatic || rc=1
 gate solitaryGamg   0.01  30 solitaryGamg   solitaryStatic || rc=1
 gate piston         0.01  30 piston         pistonStatic   || rc=1
 gate pistonSST      0.01  30 pistonSST      piston         || rc=1
+# ...and the same paddle under LES kEqn, whose FILTER WIDTH moves with the cells. Control: the
+# laminar piston, as pistonSST's is.
+gate pistonLES      0.01  30 pistonLES      piston         || rc=1
 gate flap           0.01  30 flap           flapStatic     || rc=1
 gate multiPiston    0.01  30 multiPiston    multiPistonStatic || rc=1
 gate multiFlap      0.01  30 multiFlap      multiFlapStatic   || rc=1

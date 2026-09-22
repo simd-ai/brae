@@ -668,7 +668,17 @@ void moveInterTurbulence(
     const FvGeometry&           g,
     const std::vector<FvPatch>& patches)
 {
-    if (!t.on || t.model != InterRasModel::KOmegaSST) return;
+    if (!t.on) return;
+    if (t.model == InterRasModel::KEqnLES)
+    {
+        // LESModel::correct() calls delta_().correct() FIRST (LESModel.C:251), and
+        // cubeRootVolDelta::correct() recomputes the width whenever the mesh is changing
+        // (cubeRootVolDelta.C:128-134). The width is (deltaCoeff*V)^(1/3) per cell, so on a mesh that
+        // moves it changes at every update and the start-up value is a different filter.
+        t.delta = LESdelta::compute(t.deltaSpec, m, g, patches);
+        return;
+    }
+    if (t.model != InterRasModel::KOmegaSST) return;
     if (!t.wallDistPatchIDs.empty())
     {
         t.yCell = patchWave(m, g, patches, t.wallDistPatchIDs, true).distance;
@@ -720,7 +730,10 @@ void correctInterTurbulence(
         const SolverPerformance p = LESkEqn::correct(*in.U, t.k, t.nut, *in.phi, *in.nu, *in.nuBnd, t.delta,
                                                      in.deltaT, t.lesCoeffs, sv, m, g, patches, t.lesTaps,
                                                      in.cn, in.cn ? &t.cn.ddt0K : nullptr,
-                                                     in.cn ? &t.cn.kOO : nullptr);
+                                                     in.cn ? &t.cn.kOO : nullptr,
+                                                     // ...and a MOVING mesh's two terms, the pair
+                                                     // the RAS closures already take
+                                                     in.V0, in.meshPhi);
         if (in.kLog)
         {
             in.kLog->push_back({p.initialResidual, p.finalResidual, p.nIterations});

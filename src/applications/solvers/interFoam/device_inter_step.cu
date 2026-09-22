@@ -109,13 +109,10 @@ void deviceInterStep(
     // ...and under CrankNicolson the off-centred flux, alphaEqn.H:91-97: phiCN = cnCoeff*phi +
     // (1 - cnCoeff)*phi.oldTime() once the scheme is warm, phi itself before (ocAlpha 0). The host
     // driver forms it the same way (offCentredFlux, inter_driver_cpp.cu).
-    DeviceBuffer<scalar> phiCNInt, phiCNBnd;
-    if (ctl.cn && ctl.cn->ocAlpha > scalar(0))
+    DeviceBuffer<scalar> phiCNInt, phiCNBnd, phiCNIf;
+    const bool offCentred = ctl.cn && ctl.cn->ocAlpha > scalar(0);
+    if (offCentred)
     {
-        if (ctl.cyc && ctl.cyc->n > 0)
-            throw std::runtime_error(
-                "brae interFoam device step: CrankNicolson on a mesh with a coupled pair is not carried "
-                "(the pair's off-centred flux and end-of-step alpha flux).");
         deviceOffCentredFlux(nIf, ctl.cn->cnAlpha, phiInt, phiOldInt, phiCNInt);
         deviceOffCentredFlux(nBf, ctl.cn->cnAlpha, phiBnd, phiOldBnd, phiCNBnd);
         ain.phiCNInt = &phiCNInt;
@@ -126,6 +123,18 @@ void deviceInterStep(
     // it rewrites phi -- and phiCN is that same flux under Euler, exactly as above.
     ain.cyc        = ctl.cyc;
     ain.phiCNIf    = ctl.cyc ? &ctl.cyc->phi : nullptr;
+    // ...and OFF-CENTRED on the pair too when the scheme is warm. The host arm blends phi's coupled
+    // patch with every other one (offCentredFlux walks phi.boundary whole), and the pair's faces are
+    // in neither of the two arrays above -- they are cyc->phi, with ctl.phiOldIf its old level.
+    if (offCentred && ctl.cyc && ctl.cyc->n > 0)
+    {
+        if (!ctl.phiOldIf)
+            throw std::runtime_error(
+                "brae interFoam device step: CrankNicolson's off-centred flux on a coupled pair needs "
+                "the pair's phi.oldTime(); the caller gave none.");
+        deviceOffCentredFlux(ctl.cyc->n, ctl.cn->cnAlpha, ctl.cyc->phi, *ctl.phiOldIf, phiCNIf);
+        ain.phiCNIf = &phiCNIf;
+    }
     ain.alphaPhiIf = ctl.alphaPhiIf;
     ain.rho1 = props.rho1;
     ain.rho2 = props.rho2;
@@ -148,6 +157,9 @@ void deviceInterStep(
         actl.alphaPhiOldBnd = ctl.cn->alphaPhiOldBnd;
         actl.alphaPhiOutInt = ctl.cn->alphaPhiOutInt;
         actl.alphaPhiOutBnd = ctl.cn->alphaPhiOutBnd;
+        actl.alphaPhiOldIf = ctl.cn->alphaPhiOldIf;
+        actl.alphaPhiOutIf = ctl.cn->alphaPhiOutIf;
+        actl.alphaPhiCreatedIf = ctl.cn->alphaPhiCreatedIf;
         actl.alphaPhiCreatedInt = ctl.cn->alphaPhiCreatedInt;
         actl.alphaPhiCreatedBnd = ctl.cn->alphaPhiCreatedBnd;
     }
@@ -500,7 +512,10 @@ void deviceInterStep(
             const DeviceBuffer<scalar>* uob[3] = {&UOldBndX, &UOldBndY, &UOldBndZ};
             deviceCnDdtCorr(dm, *ctl.cn->clock, ctl.cn->ddtCorrU, ctl.cn->ddtCorrPhi, uo, ctl.cn->UOO,
                             uob, ctl.cn->UOOBnd, phiOldInt, phiOldBnd, *ctl.cn->phiOOInt, *ctl.cn->phiOOBnd,
-                            bndUFixesValue, /*ddtPhiCoeff=*/scalar(-1), ddtCorrI, ddtCorrB);
+                            bndUFixesValue, /*ddtPhiCoeff=*/scalar(-1), ddtCorrI, ddtCorrB,
+                            // ...and the PAIR's half, in the SAME call: the Euler form below runs
+                            // only when the scheme is Euler, and it silently stood in for this one
+                            ctl.cyc, &ctl.cn->ddtCorrPhiIf, ctl.phiOldIf, ctl.cn->phiOOIf, &ddtCorrIf);
         }
         else
         {
@@ -525,7 +540,7 @@ void deviceInterStep(
         // ...and the PAIR's half, which pEqn.H:16-18 builds with the rest of the surfaceScalarField.
         // MRF.zeroFilter does not reach it: a zone's faces are the mesh's own, and a periodic pair is
         // refused on an MRF case before this (the driver's MRF refusal).
-        if (ctl.cyc && ctl.cyc->n > 0 && ctl.phiOldIf)
+        if (!ctl.cn && ctl.cyc && ctl.cyc->n > 0 && ctl.phiOldIf)
         {
             deviceInterDdtCorrCyclic(*ctl.cyc, *ctl.phiOldIf, UOldX, UOldY, UOldZ,
                                      /*ddtPhiCoeff=*/scalar(-1), deltaT, ddtCorrIf);

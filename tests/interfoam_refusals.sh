@@ -465,7 +465,11 @@ arm baffle_noLength         refused "needs \`D\`, \`I\` and \`length\`"   "" "se
 arm baffle_noJump           refused "has no \`jump\` entry"             "" "sed -i '/^ *jump  *uniform 0;/d' 0/p_rgh"
 arm baffle_GAMG             refused "GAMG does not carry the interface" "" "python3 -c \"import re; p='system/fvSolution'; t=open(p).read(); t=re.sub(r'(\\n    p_rgh\\s*\\{\\s*solver\\s+)PCG;\\s*preconditioner\\s+DIC;', r'\\1GAMG; smoother DIC;', t); open(p,'w').write(t)\""
 arm baffle_momentumPredictor refused "a momentum predictor across the coupled patch" "" "sed -i 's/momentumPredictor  *no;/momentumPredictor   yes;/; /^ *minIter  *1;/d' system/fvSolution"
-arm baffle_cellLimitedGradU refused "grad(U) across the coupled patch" "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
+# `cellLimited grad(U)` ACROSS A CYCLIC RUNS on the host now: the refusal said cellLimitedGrad's
+# coupled range was gated across a cyclicAMI only, which was true until validation/interFoamCyclic
+# `sstLimU` held it on a translational pair (host U 8.8697e-13). A blanket refusal coming back
+# fails this arm.
+arm baffle_cellLimitedGradU runs    - "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
 arm baffle_vanLeerV         refused "does not carry them onto the coupled patch" "" "sed -i 's/div(rhoPhi,U)  *Gauss linearUpwind grad(U);/div(rhoPhi,U)   Gauss vanLeerV;/' system/fvSchemes"
 arm baffle_compression      refused "\`interfaceCompression\` across the coupled patch" "" "sed -i 's/div(phirb,alpha)  *Gauss linear;/div(phirb,alpha) Gauss interfaceCompression;/' system/fvSchemes"
 # every other gradient entry is gated on damBreak, which has no coupled patch
@@ -537,7 +541,10 @@ if [ $HAVE_GPU = 1 ]; then
     # kEpsilon, omega from epsilon, div(phi,omega), the wallDist method SST needs.
     BASE="$BB"
     BSST="sed -i 's/^\( *RASModel  *\)kEpsilon;/\1kOmegaSST;/' constant/turbulenceProperties; sed -i 's/^\( *div(phi,epsilon) .*\)/\1\n    div(phi,omega)  Gauss upwind;/' system/fvSchemes; printf '\nwallDist { method meshWave; }\n' >> system/fvSchemes; sed -i 's/(U|k|epsilon)/(U|k|epsilon|omega)/' system/fvSolution; sed 's/object  *epsilon;/object      omega;/; s/dimensions  *\[0 2 -3 0 0 0 0\];/dimensions      [0 0 -1 0 0 0 0];/; s/epsilonWallFunction/omegaWallFunction/' 0/epsilon > 0/omega"
-    arm device_baffle_SST   refused "RAS model other than kEpsilon" "-device" "$BSST"
+    # ...and it RUNS now, on both arms: the SST closure carries the pair (grad(U), both divergences,
+    # each equation's gammaCell, the solve's interface, and CDkOmega's two gradients), gated on
+    # validation/interFoamCyclic `sst`. A blanket refusal coming back fails this arm.
+    arm device_baffle_SST   runs    -                              "-device" "$BSST"
     # LES kEqn across a COUPLED PAIR: the case reader refuses any model but kEpsilon with a pair, on
     # both arms (inter_case_cpp.cu:1285), and BEHIND that the device LES closure has its own refusal --
     # LESkEqnInput carries no interface, so k would convect and diffuse across the periodic faces as if
@@ -545,13 +552,19 @@ if [ $HAVE_GPU = 1 ]; then
     # device's is what keeps lifting it from being silent. Staged from the porous-baffle case.
     BASE="$BB"
     BLESC="sed -i 's/^simulationType .*/simulationType LES;\nLES { LESModel kEqn; delta cubeRootVol; turbulence on; printCoeffs on; cubeRootVolCoeffs { deltaCoeff 1; } }/' constant/turbulenceProperties; sed -i '/^RAS$/,/^}/d' constant/turbulenceProperties; sed -i 's/div(phi,epsilon) .*//' system/fvSchemes; rm -f 0/epsilon; sed -i 's/nutkWallFunction/calculated/' 0/nut"
-    arm device_les_cyclic   refused "RAS model other than kEpsilon" "-device" "$BLESC"
+    # ...and it RUNS now: LESkEqn::Input carries the pair, gated on validation/interFoamCyclic
+    # `les` (the closure handed no pair read k 4.3e-01, nut 2.8e-01). A blanket refusal coming back
+    # fails this arm.
+    arm device_les_cyclic   runs    -                              "-device" "$BLESC"
     # a RAS closure on a MOVING mesh is refused on the device: its closure's input carries neither the
     # old volumes nor the mesh flux the host closure takes (moving_SST above runs the same staging on
     # the host). Found by auditing hand-built control structs, not by a case -- no runnable tutorial
     # reaches it -- and refused rather than left to run ddt(k) on the current volumes.
     BASE="$BM"
-    arm device_moving_SST   refused "RAS closure AND moves its mesh" "-device" "$MOVSST"
+    # ...and it RUNS now: the device closure takes the old volumes, the absolute flux and every
+    # distance the move invalidated, gated on waves/waveMakerPiston `pistonSST` (the wall distance
+    # left stale reads U 1.7353e-05). A blanket refusal coming back fails this arm.
+    arm device_moving_SST   runs    -                               "-device" "$MOVSST"
     # the device's alpha pre-solve does not honour minIter (the host's does)
     # cellLimited grad(U) is refused on the device (the host carries it into linearUpwind and the
     # viscous term; this loop does not). The host arm `grad_namedU` above RUNS the same staging, which
@@ -592,7 +605,10 @@ if [ $HAVE_GPU = 1 ]; then
     # on both arms); a coupled pair under it is refused by name there, where the host loop carries it
     arm device_cn           runs    -                        "-device" "$CNSET"
     BASE="$BB"
-    arm device_cn_baffle    refused "coupled pair"            "-device" "$CNSET"
+    # ...and it RUNS now: the pair carries the off-centred flux, the end-of-step un-blend and
+    # ddtCorr under the scheme, gated on validation/interFoamCyclic `sstCN`/`lesCN` (the pair left
+    # on the EULER ddtCorr read U 8.2265e-02). A blanket refusal coming back fails this arm.
+    arm device_cn_baffle    runs    -                         "-device" "$CNSET"
     BASE="$B"
     # the permeable-wall pair RUNS on the device loop now (tests/interfoam_permeable_vs_openfoam.sh holds
     # it to OpenFOAM on both profiles); this arm is here because it was a blanket refusal

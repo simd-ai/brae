@@ -139,6 +139,14 @@ struct DeviceInterAlphaControls
     // THE PAIR's mass flux out, for the momentum equation. The pair itself, its flux and its alpha flux
     // travel in DeviceAlphaStepInput, which is what the corrector reads.
     DeviceBuffer<scalar>* rhoPhiIf = nullptr;
+    // A PERIODIC PAIR UNDER CRANKNICOLSON. alphaPhi10's own old level and its out slot on the PAIR's
+    // faces, which live in their own array and not in the boundary one: the end-of-step un-blend
+    // (alphaEqn.H:253-262) is face-local, so the pair needs exactly the same two buffers the interior
+    // and the boundary get. Null with a pair and ocCoeff > 0 means the level does not exist yet --
+    // OpenFOAM creates it lazily, as a copy of the flux as it stands.
+    const DeviceBuffer<scalar>* alphaPhiOldIf = nullptr;
+    DeviceBuffer<scalar>*       alphaPhiOutIf = nullptr;
+    DeviceBuffer<scalar>*       alphaPhiCreatedIf = nullptr;
     // alphaEqn.H:236-262 under a ddt(rho,U) that is neither Euler nor localEuler (CrankNicolson): the
     // end-of-step alpha flux is un-blended against alphaPhi10.oldTime() when ocCoeff > 0, and rhoPhi
     // takes phi, not phiCN, beside rho2. `cnCoeffUnblend` 1 skips the un-blend; `alphaPhiOld*` null

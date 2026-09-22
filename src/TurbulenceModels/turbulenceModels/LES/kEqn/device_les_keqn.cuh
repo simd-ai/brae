@@ -59,6 +59,14 @@ struct Input
     DeviceCnDdt0*               cnDdt0K = nullptr;
     const DeviceBuffer<scalar>* kOO     = nullptr;
 
+    // A MOVING MESH, the pair the RAS closures take: the volumes the cells had BEFORE this step's
+    // move (the Euler source takes V0 while the diagonal keeps V) and the mesh flux, which makes
+    // divU the divergence of the ABSOLUTE flux. Null on a mesh that does not move. The filter width
+    // is `delta`, which the caller re-uploads after a move.
+    const DeviceBuffer<scalar>* V0         = nullptr;
+    const DeviceBuffer<scalar>* meshPhiInt = nullptr;
+    const DeviceBuffer<scalar>* meshPhiBnd = nullptr;
+
     cpu::LESkEqn::Coeffs co;
 
     // the smoothSolver the case names for k, and fvMatrix::relax when it asks for one
