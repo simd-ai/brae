@@ -89,31 +89,43 @@ SmoothLinearSolve readFinalSolve(
     return s;
 }
 
-// div(<flux>,<field>) for a RAS closure: `Gauss upwind` and nothing else, AND THAT IS A MEASURED
-// REFUSAL, not an untested one. Both arms of both closures carry `Gauss limitedLinear <k>` and no
-// interFoam tutorial names it, so it was admitted and staged on RAS/waterChannel to gate it. It is
-// wrong, and the instrument says exactly where -- see interFoam/PORT.md for the full localisation:
+// div(<flux>,<field>) for a RAS closure: `Gauss upwind` or `Gauss limitedLinear <k>`. Both arms of
+// both closures carry the second and no interFoam tutorial names it, so it is gated by a staged
+// profile (tests/interfoam_waterchannel_vs_openfoam.sh `limitedLinear`). `bounded` and `linearUpwind`
+// stay refused: nothing holds either here. Both equations must name the SAME scheme -- the closures
+// carry one flag for the pair, as `bounded` does.
 //
-//   every upstream stage is EXACT against tools/dumpKOmegaSST (CD 3.4e-15, G 6.9e-14, S2 7.2e-14),
-//   k's whole system is exact (kUpper/kLower 7.8e-14), and omega's off-diagonals differ on
-//   26 of 79,800 FACES by up to 2.5e-02 -- the TVD limiter flipping between central and upwind on
-//   faces whose two cells hold the same value, where `gradf` is exactly zero and the branch is
-//   decided by the SIGN of a near-zero `gradcf`.
-//
-// Refused until that sign is chased down. k is unaffected because its field is still uniform at the
-// assembly; omega's is not, because omegaWallFunction::updateCoeffs has overwritten its wall cells.
-void requireUpwind(
-    const std::string& caseDir,
-    const std::string& field,
-    const std::string& fluxName)
+// THE PROFILE GATES FIELDS AND NOT MATRIX COEFFICIENTS, and the reason is in the scheme. Where the
+// two cells of a face hold the same value, `gradf = phiN - phiP` is EXACTLY zero, OpenFOAM takes
+// NVDTVD's `mag(gradcf) >= 1000*mag(gradf)` branch, and `r = 2*1000*sign(gradcf)*sign(gradf) - 1`
+// turns entirely on the SIGN of `gradcf` -- which is 1e-18 there, eighteen orders below the field's
+// own scale. MEASURED on RAS/waterChannel: brae's omega and grad(omega) are OpenFOAM's to 7.3e-15
+// and 5.7e-15, and the limiter still lands on the other side on 2 of 79,800 faces, each worth an
+// O(1) coefficient. OpenFOAM's own answer there is arbitrary at the bit level. The FIELDS are not:
+// host omega 7.2e-12, k 5.9e-11, U 4.2e-12.
+void readClosureDivScheme(
+    const std::string&  caseDir,
+    const std::string&  field,
+    const std::string&  fluxName,
+    InterTurbulence&    t,
+    bool                first)
 {
     const FieldDivScheme fs = parseFieldDivScheme(caseDir, field, false, fluxName);
-    if (fs.bounded || fs.limited || fs.linearUpwind)
+    if (fs.bounded || fs.linearUpwind)
         throw std::runtime_error(
-            std::string(WHO) + "fvSchemes `div(" + fluxName + "," + field + ")` is not plain `Gauss "
-            "upwind`. The closures carry limitedLinear and MEASURED on RAS/waterChannel omega's "
-            "convection coefficients differ from OpenFOAM's on 26 faces by 2.5e-02, where the TVD "
-            "limiter's branch turns on the sign of a near-zero gradient. Refused.");
+            std::string(WHO) + "fvSchemes `div(" + fluxName + "," + field + ")` is neither `Gauss "
+            "upwind` nor `Gauss limitedLinear <k>`, the two the closure carries.");
+    if (first)
+    {
+        t.closureLimitedLinear = fs.limited;
+        t.closureLimiterCoeff  = fs.limited ? fs.coeff : scalar(1);
+        return;
+    }
+    if (fs.limited != t.closureLimitedLinear
+     || (fs.limited && fs.coeff != t.closureLimiterCoeff))
+        throw std::runtime_error(
+            std::string(WHO) + "fvSchemes gives the closure's two equations different convection "
+            "schemes. This closure carries one flag for the pair, as `bounded` does.");
 }
 
 // grad(U), which the production GbyNu takes (kEpsilon.C:237, kOmegaSSTBase.C:520)
@@ -464,8 +476,8 @@ InterTurbulence readInterTurbulence(
                 "changes the eddy-viscosity limiter and the production limiter; not ported.");
         readGradU(caseDir, t.sstCoeffs);
         readGradK(caseDir, "omega", t.sstCoeffs);
-        requireUpwind(caseDir, "k", "phi");
-        requireUpwind(caseDir, "omega", "phi");
+        readClosureDivScheme(caseDir, "k", "phi", t, /*first=*/true);
+        readClosureDivScheme(caseDir, "omega", "phi", t, /*first=*/false);
 
         t.k = readTurbulenceField(startDir, "k", patches, nCells);
         t.omega = readTurbulenceField(startDir, "omega", patches, nCells);
@@ -543,8 +555,8 @@ InterTurbulence readInterTurbulence(
 
     // THE KEY CARRIES THE FLUX'S NAME: div(rhoPhi,k) in the variable lineage, div(phi,k) in the other
     const std::string flux = t.variableDensity ? "rhoPhi" : "phi";
-    requireUpwind(caseDir, "k", flux);
-    requireUpwind(caseDir, "epsilon", flux);
+    readClosureDivScheme(caseDir, "k", flux, t, /*first=*/true);
+    readClosureDivScheme(caseDir, "epsilon", flux, t, /*first=*/false);
 
     t.k = readTurbulenceField(startDir, "k", patches, nCells);
     t.epsilon = readTurbulenceField(startDir, "epsilon", patches, nCells);
@@ -795,8 +807,8 @@ void correctInterTurbulence(
         res.captureStages = (std::getenv("BRAE_SST_DUMP_DIR") != nullptr);
         kOmegaSST::correct(*in.U, t.k, t.omega, t.nut, *in.phi, t.yCell, scalar(0), m, g, patches,
                            t.omegaRelaxFinal.factor, t.kRelaxFinal.factor, ks.tol, ks.relTol, ks.maxIter,
-                           t.sstCoeffs, &res, /*bounded=*/false, /*limitedLinear=*/false,
-                           /*limiterCoeff=*/scalar(1), /*linearUpwind=*/false,
+                           t.sstCoeffs, &res, /*bounded=*/false, t.closureLimitedLinear,
+                           t.closureLimiterCoeff, /*linearUpwind=*/false,
                            t.coeffs.correctedLaplacian, t.coeffs.snGradLimitCoeff, /*lm=*/nullptr,
                            &sstComp, ks.minIter, t.omegaRelaxFinal.on, t.kRelaxFinal.on, &which);
         if (res.captureStages)
@@ -895,7 +907,7 @@ void correctInterTurbulence(
                          t.epsRelaxFinal.factor, t.kRelaxFinal.factor, ks.tol, ks.relTol, ks.maxIter,
                          t.coeffs, &res, /*bounded=*/false, /*dropTerm=*/0, &comp, in.fvOptions,
                          t.epsRelaxFinal.on, t.kRelaxFinal.on, /*constrainBeforeWall=*/true,
-                         /*limitedLinear=*/false, /*limiterCoeff=*/scalar(1), /*limGradK=*/scalar(0),
+                         t.closureLimitedLinear, t.closureLimiterCoeff, /*limGradK=*/scalar(0),
                          ks.minIter, &sel, /*linearUpwind=*/false, /*luGradK=*/scalar(0), &which);
     if (in.epsilonLog)
     {

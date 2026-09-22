@@ -622,6 +622,23 @@ void correct(
         cellLimitGrad(gradK,  k,     co.gradKLimitK, m, g, patches);
         cellLimitGrad(gradOm, omega, co.gradKLimitK, m, g, patches);
     }
+    // THE LIMITER'S OWN GRADIENT, dumped. CDkOmega is grad(k) & grad(omega) and grad(k) is exactly
+    // zero while k is uniform, so CD matching says nothing about grad(omega) -- and grad(omega) is
+    // what the TVD limiter's branch turns on. See interFoam/PORT.md, the 26-face finding.
+    if (sd.on)
+    {
+        std::vector<scalar> fo(gradOm.size()*3), fk(gradK.size()*3);
+        for (std::size_t c = 0; c < gradOm.size(); ++c)
+        {
+            fo[c*3+0] = gradOm[c].x; fo[c*3+1] = gradOm[c].y; fo[c*3+2] = gradOm[c].z;
+            fk[c*3+0] = gradK[c].x;  fk[c*3+1] = gradK[c].y;  fk[c*3+2] = gradK[c].z;
+        }
+        sd.components("gradOmega", fo, 3);
+        sd.components("gradKfield", fk, 3);
+        sd.scalars("omegaAsm", omega.internal);
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            sd.scalars(("omegaB_" + patches[pi].name).c_str(), obv[pi]);
+    }
     const std::vector<scalar> CD  = CDkOmega(gradK, gradOm, omega.internal, co);
     // A per-cell nu, so F1/F2's viscous cross-over terms see the field the compressible lineage has.
     std::vector<scalar> nuCell(nC);

@@ -121,6 +121,9 @@ struct InterTurbulence
     InterRasModel model = InterRasModel::KEpsilon;
     // `density variable` -- see the header
     bool variableDensity = false;
+    // div(<flux>,k) and div(<flux>,<second field>): `Gauss upwind` or `Gauss limitedLinear <k>`.
+    bool   closureLimitedLinear = false;
+    scalar closureLimiterCoeff  = 1;
     KEpsilonCoeffs coeffs;
     GeometricField<scalar> k;
     // kEpsilon's second scalar; empty under kOmegaSST

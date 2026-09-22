@@ -606,6 +606,19 @@ void deviceCorrectInterTurbulence(
         sin.Uz = in.Uz;
         sin.yCell = &d.yCell;
         sin.co = t.sstCoeffs;
+        // ...and the CONVECTION scheme. The host closure runs `Gauss limitedLinear <k>` and is gated
+        // on it (RAS/waterChannel `limitedLinear`, fields at 7.2e-12); the DEVICE closure is not.
+        // MEASURED on that same profile with the device arm on: k 1.4724e-05, omega 1.7822e-04,
+        // nut 1.6747e-05, while alpha, p_rgh and U sit at round-off -- so it is the closure, and it
+        // is NOT the limiter's bit-flip, which the host carries too and which costs it 7.2e-12.
+        if (t.closureLimitedLinear)
+        {
+            sin.hasNonUpwindDivScheme = true;
+            sin.divSchemeUnsupported =
+                "Gauss limitedLinear on the device closure: the host runs it and is gated (fields "
+                "7.2e-12); this arm reads omega 1.7822e-04 on RAS/waterChannel";
+        }
+
         // ...and the grad(U) LIMITER, which this struct carries TWICE -- `co.gradULimitK` and a
         // top-level `gradULimitK`, both the case's one `grad(U)` entry -- and the production site
         // reads the top-level one. This site set only `co`, so a case naming `grad(U) cellLimited`
@@ -665,6 +678,13 @@ void deviceCorrectInterTurbulence(
     kin.cyc         = in.cyc;
     kin.cycPhiByRho = in.cycPhi;
     kin.bcPhiBnd = in.phiBnd;
+    // ...and the same for kEpsilon's device closure, which has no gate for the scheme either.
+    if (t.closureLimitedLinear)
+    {
+        kin.hasNonUpwindDivScheme = true;
+        kin.divSchemeUnsupported = "Gauss limitedLinear on the device kEpsilon closure: ungated";
+    }
+
     if (t.variableDensity)
     {
         kin.phiInt = in.rhoPhiInt;

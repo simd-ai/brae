@@ -613,6 +613,20 @@ void kOmegaSSTDumpBase<BasicEddyViscosityModel>::correct()
     const volScalarField F1(this->F1(CDkOmega));
     const volScalarField F23(this->F23());
 
+    // THE LIMITER'S OWN GRADIENT, and the field it is taken from. CDkOmega above is
+    // grad(k) & grad(omega), and on a case whose k is still uniform grad(k) is exactly zero -- so
+    // CDkOmega matching says nothing about grad(omega), which is what a TVD limiter's branch turns
+    // on. Writes only; nothing here is read back by the model.
+    if (this->mesh_.time().timeIndex() == braeDumpSSTIter())
+    {
+        volVectorField gOm(fvc::grad(omega_));  gOm.rename("stage_sstGradOmega");
+        gOm.write();
+        volVectorField gKf(fvc::grad(k_));      gKf.rename("stage_sstGradKfield");
+        gKf.write();
+        volScalarField omAsm(omega_);           omAsm.rename("stage_sstOmegaAsm");
+        omAsm.write();
+    }
+
     if (this->mesh_.time().timeIndex() == braeDumpSSTIter())
     {
         const fvMesh& mesh = this->mesh_;

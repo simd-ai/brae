@@ -187,6 +187,26 @@ s = s[:i] + '    inlet\n    {\n' + body + '    }\n\n' + s[i:]
 open(p, 'w').write(s)
 PYEOF
     fi
+    # limitedLinear: `Gauss limitedLinear 1` for k and omega. The closures have carried the scheme
+    # since they were ported and no interFoam tutorial names it, so nothing gated it. THIS PROFILE
+    # GATES FIELDS, not matrix coefficients: where a face's two cells hold the same omega, gradf is
+    # EXACTLY zero, NVDTVD takes its 1000x branch and r turns on sign(gradcf) -- which is 1e-18
+    # there. brae's omega and grad(omega) are OpenFOAM's to 7.3e-15 and 5.7e-15 and the limiter still
+    # lands the other way on 2 of 79,800 faces, each worth an O(1) coefficient. The fields are not
+    # affected: host omega 7.2e-12, k 5.9e-11, U 4.2e-12. The DEVICE closure refuses the scheme by
+    # name (omega 1.7822e-04) and its arm is skipped.
+    if [ "$profile" = limitedLinear ]; then
+        python3 - "$C" <<'PYEOF' || { echo "FAIL: the limitedLinear profile was not staged"; return 1; }
+import sys
+p = sys.argv[1] + '/system/fvSchemes'
+s = open(p).read()
+old = '"div\\(phi,(k|omega)\\)"      Gauss upwind;'
+assert s.count(old) == 1, 'the tutorial no longer names div(phi,(k|omega)) Gauss upwind'
+open(p, 'w').write(s.replace(old, '"div\\(phi,(k|omega)\\)"      Gauss limitedLinear 1;'))
+PYEOF
+        grep -q "Gauss limitedLinear 1" "$C/system/fvSchemes" \
+            || { echo "FAIL: the limitedLinear profile did not reach div(phi,k)"; return 1; }
+    fi
     if [ "$profile" = nutPatches ]; then
         python3 - "$C" <<'PYEOF' || { echo "FAIL: the nutPatches profile was not staged"; return 1; }
 import sys
@@ -233,7 +253,8 @@ PYEOF
 }
 
 rc=0
-for p in laminar sst nutPatches nutInletZeroGrad nutInletZero oneCorrector oneCorrectorLaminar; do
+for p in laminar sst nutPatches nutInletZeroGrad nutInletZero oneCorrector oneCorrectorLaminar \
+         limitedLinear; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_waterchannel_vs_openfoam: staging failed"; exit 1; }
@@ -247,6 +268,17 @@ grep -q "Solving for omega" "$W/laminar/log.interFoam" \
     && { echo "FAIL: OpenFOAM's laminar control solved omega"; exit 1; }
 
 "$BIN" "$W/sst" "$W/sst/0" "$W/sst/$END" "$STEPS" "$W/sst/log.interFoam" "$W/laminar/$END" || rc=1
+# ...and the closure convected with `Gauss limitedLinear 1`. Its control is the LAMINAR run, as the
+# shipped profile's is: what the model is worth on this case, against how far brae is from OpenFOAM.
+# MEASURED, both arms where both run: host alpha 1.5e-12, p_rgh 1.4e-12, U 4.2e-12, k 5.9e-11,
+# omega 7.2e-12, nut 2.4e-12. BROKEN ONCE: the scheme READ but not applied (the closure handed
+# `false`) -- omega 1.2992e-01, k 1.0489e-01, nut 3.7393e-02, U 2.6309e-04.
+# ...with TWO controls: the laminar run (what the model is worth) and the `sst` profile's own
+# OpenFOAM output, which is THIS case under `Gauss upwind` at the same instant -- what the SCHEME is
+# worth. MEASURED at one step: the scheme moves OpenFOAM's own omega by 2.56e-02 and k by 4.01e-03,
+# against brae's 7.2e-12 from OpenFOAM, so the profile is not measuring nothing.
+"$BIN" "$W/limitedLinear" "$W/limitedLinear/0" "$W/limitedLinear/$END" "$STEPS" \
+       "$W/limitedLinear/log.interFoam" "$W/laminar/$END" "$W/sst/$END" 1e-6 || rc=1
 "$BIN" "$W/nutPatches" "$W/nutPatches/0" "$W/nutPatches/$END" "$STEPS" "$W/nutPatches/log.interFoam" \
        "$W/laminar/$END" "$W/sst/$END" || rc=1
 # the control is OpenFOAM's answer with the patch pinned at 0: nut 1.4e-05 away, a floor of 1e-6 (six

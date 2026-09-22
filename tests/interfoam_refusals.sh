@@ -337,7 +337,12 @@ arm ras_densityBad          refused "density mixture"         "" "sed -i 's/^den
 # `density uniform` looks up div(phi,k), which this tutorial does not carry: OpenFOAM stops there too
 arm ras_uniform_noDivPhiK   refused "div(phi,k)"              "" "sed -i 's/^density .*/density uniform;/' constant/turbulenceProperties"
 arm ras_uniform             runs    -                        "" "sed -i 's/^density .*/density uniform;/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,k) /div(phi,k) /; s/div(rhoPhi,epsilon) /div(phi,epsilon) /' system/fvSchemes"
-arm ras_limitedLinear       refused "Gauss upwind"            "" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss limitedLinear 1;/' system/fvSchemes"
+# `Gauss limitedLinear <k>` RUNS on the host closure now (gated on RAS/waterChannel `limitedLinear`,
+# fields at 7.2e-12). What is refused is ONE equation limited and the other not -- the closure carries
+# a single flag for the pair, as `bounded` does -- and the scheme on the DEVICE closure, which reads
+# omega 1.7822e-04 where the host reads 7.2e-12.
+arm ras_limitedLinearOne    refused "different convection schemes" "" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss limitedLinear 1;/' system/fvSchemes"
+arm ras_limitedLinearBoth   runs    -                        "" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss limitedLinear 1;/; s/div(rhoPhi,epsilon) .*/div(rhoPhi,epsilon) Gauss limitedLinear 1;/' system/fvSchemes"
 arm ras_nutSpalding         refused "nutUSpaldingWallFunction" "" "sed -i 's/nutkWallFunction/nutUSpaldingWallFunction/' 0/nut"
 arm ras_nutCalculatedWall   refused "no nut wall function"    "" "sed -i '/leftWall/,/}/ s/nutkWallFunction/calculated/' 0/nut"
 # a wall function on a patch that is not a `wall`: OpenFOAM's nutWallFunction::checkType stops on it
@@ -579,6 +584,13 @@ if [ $HAVE_GPU = 1 ]; then
     # 1.2822e-02 after the first fix); and UEqn.cu's own refusal keyed on the coefficient rather than
     # the scheme, so it blocked `Gauss upwind` with a cellLimited gradSchemes entry. Gated on
     # validation/interFoamCyclic `sstLimU`, both arms. A blanket refusal coming back fails this arm.
+    # ...and `Gauss limitedLinear` for the CLOSURE, which the host runs and this arm does not: the
+    # device closure reads omega 1.7822e-04 on RAS/waterChannel where the host reads 7.2e-12, while
+    # alpha, p_rgh and U sit at round-off there -- so it is the closure and not the limiter's
+    # bit-decided branch, which the host carries too and which costs it 7.2e-12.
+    BASE="$BR"
+    arm device_limitedLinearTurb refused "limitedLinear"            "-device" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss limitedLinear 1;/; s/div(rhoPhi,epsilon) .*/div(rhoPhi,epsilon) Gauss limitedLinear 1;/' system/fvSchemes"
+    BASE="$B"
     arm device_gradULimited runs    -                           "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
     BASE="$B"
     arm device_alphaMinIter    refused "minIter 1"               "-device" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       yes;\\n\\1minIter 1;/' system/fvSolution"
