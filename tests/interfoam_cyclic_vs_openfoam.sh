@@ -91,9 +91,12 @@ SRC="$ROOT/validation/interFoamCyclic"
 STEPS=${STEPS:-10}
 DT=${DT:-0.002}
 
+# shellcheck disable=SC1091
+. "$(dirname "$0")/require_fresh_binary.sh"
 [ -x "$BIN" ]      || { echo "SKIP: $BIN not built"; exit 77; }
 [ -d "$SRC" ]      || { echo "SKIP: $SRC not found"; exit 77; }
 [ -f "$OFBASHRC" ] || { echo "SKIP: real OpenFOAM not available"; exit 77; }
+requireFresh "$BIN" || exit 1
 
 W=${KEEP_W:-$(mktemp -d)}
 [ -n "${KEEP_W:-}" ] || trap 'rm -rf "$W"' EXIT

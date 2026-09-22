@@ -78,14 +78,18 @@ void assembleUEqn(
                 "forwardT (deviceCyclicAddGradRot, which takes all three components at once); this "
                 "assembly adds the pair per component. Refusing rather than summing an un-rotated "
                 "neighbour into the gradient.");
-        // BOTH COEFFICIENTS, and the second is why this refusal did not fire when it should have:
-        // `gradULimitK` is the limiter linearUpwind NAMES and `gradUSchemeLimitK` is the gradSchemes
-        // `grad(U)` ENTRY, which divDevReff's dev2 term takes. A case with `div(rhoPhi,U) Gauss
-        // upwind` and `grad(U) cellLimited Gauss linear 1` sets the second and not the first, so it
-        // walked straight past a refusal written for it. MEASURED on validation/interFoamCyclic
-        // `sstLimU`, ten steps: device U 8.9149e-03, k 3.3383e-02, nut 4.1315e-01 against a host arm
-        // that reads 8.8697e-13, 6.4243e-13 and 2.6965e-12 on the same case.
-        if (in.gradULimitK > 0.0 || in.gradUSchemeLimitK > 0.0)
+        // THE LIMITER OF THE DEFERRED CORRECTION, and only that. Two sites below rebuild grad(U) for
+        // linearUpwind / linearUpwindV / LUST and limit it with `deviceCellLimitGrad` and NO
+        // interface list; divDevReff's dev2 gradient goes through deviceCellLimitGradU, which takes
+        // the pair (device_komega_sst.cu:838-846), and the limitedLinearV/vanLeerV branch limits
+        // nothing. So the refusal has to key on the SCHEME and not on the coefficient: keyed on the
+        // coefficient it also blocks `Gauss upwind` with a cellLimited gradSchemes entry, which is a
+        // case this arm runs to the host's floor (validation/interFoamCyclic `sstLimU`).
+        const bool limitsCorrection = in.scheme == cpu::DivScheme::linearUpwind
+                                   || in.scheme == cpu::DivScheme::linearUpwindV
+                                   || in.scheme == cpu::DivScheme::LUST
+                                   || in.linearUpwind;
+        if (in.gradULimitK > 0.0 && limitsCorrection)
             throw std::runtime_error(
                 "brae device UEqn: a cellLimited grad(U) across a coupled patch would limit against a "
                 "neighbour it cannot see -- OF's cellLimitedGrad treats a cyclic face as internal, and "

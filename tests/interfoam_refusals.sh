@@ -31,9 +31,12 @@ OFBASHRC=${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
 TUT=${BRAE_OF_TUTORIALS:-/usr/lib/openfoam/openfoam2412/tutorials}
 SRC="$TUT/multiphase/interFoam/laminar/damBreak/damBreak"
 
+# shellcheck disable=SC1091
+. "$(dirname "$0")/require_fresh_binary.sh"
 [ -x "$BIN" ]      || { echo "SKIP: $BIN not built"; exit 77; }
 [ -d "$SRC" ]      || { echo "SKIP: damBreak tutorial not found at $SRC"; exit 77; }
 [ -f "$OFBASHRC" ] || { echo "SKIP: real OpenFOAM not available (blockMesh is needed)"; exit 77; }
+requireFresh "$BIN" || exit 1
 
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 set +u
@@ -570,7 +573,13 @@ if [ $HAVE_GPU = 1 ]; then
     # viscous term; this loop does not). The host arm `grad_namedU` above RUNS the same staging, which
     # is what says the two answers differ by the refusal and not by the staging.
     BASE="$B"
-    arm device_gradULimited refused "fvSchemes limits grad(U)" "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
+    # ...and it RUNS now. The refusal hid THREE things, each found by lifting it: KOmegaSSTInput carries
+    # the grad(U) limiter twice and the interFoam site filled only the coeffs half (nut 4.1315e-01);
+    # this loop set NEITHER momentum coefficient, so the viscous dev2 term ran unlimited (nut
+    # 1.2822e-02 after the first fix); and UEqn.cu's own refusal keyed on the coefficient rather than
+    # the scheme, so it blocked `Gauss upwind` with a cellLimited gradSchemes entry. Gated on
+    # validation/interFoamCyclic `sstLimU`, both arms. A blanket refusal coming back fails this arm.
+    arm device_gradULimited runs    -                           "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
     BASE="$B"
     arm device_alphaMinIter    refused "minIter 1"               "-device" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       yes;\\n\\1minIter 1;/' system/fvSolution"
     # the device loop RUNS the coded cyclicACMI baffle now: the binary couples the pair for it as for

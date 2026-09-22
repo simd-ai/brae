@@ -606,6 +606,14 @@ void deviceCorrectInterTurbulence(
         sin.Uz = in.Uz;
         sin.yCell = &d.yCell;
         sin.co = t.sstCoeffs;
+        // ...and the grad(U) LIMITER, which this struct carries TWICE -- `co.gradULimitK` and a
+        // top-level `gradULimitK`, both the case's one `grad(U)` entry -- and the production site
+        // reads the top-level one. This site set only `co`, so a case naming `grad(U) cellLimited`
+        // ran the device closure's production on an UNLIMITED gradient while the host limited it:
+        // MEASURED on validation/interFoamCyclic `sstLimU`, nut 4.1315e-01 and k 3.3383e-02 against
+        // a host arm at 2.6965e-12 and 6.4243e-13. rhoSimpleFoam's hook has always set it
+        // (rhoTurbulenceHook.cu:210); the closure now refuses the two disagreeing.
+        sin.gradULimitK = t.sstCoeffs.gradULimitK;
         sin.correctedLaplacian = t.coeffs.correctedLaplacian;
         sin.snGradLimitCoeff = t.coeffs.snGradLimitCoeff;
         // the Final entries, as the kEpsilon branch below takes them: one outer corrector, so that one

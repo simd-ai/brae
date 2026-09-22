@@ -156,12 +156,11 @@ int main(
     // Reynolds number.
     const bool sstProfile = (profile == "sst" || profile == "sstCN" || profile == "sstLim"
                           || profile == "sstLimU");
-    // `sstLimU` adds `cellLimited grad(U)` to the two the closure limits. Its device arm is refused
-    // by name -- the momentum assembler sums the Gauss half of grad(U) across the pair, its LIMITER
-    // does not -- so this profile holds the HOST arm, which the case reader refused until now.
-    // MEASURED with the device arm forced on: U 8.9149e-03, k 3.3383e-02, nut 4.1315e-01, against a
-    // host arm at 8.8697e-13, 6.4243e-13 and 2.6965e-12.
-    const bool hostOnlyProfile = (profile == "sstLimU");
+    // `sstLimU` adds `cellLimited grad(U)` to the two the closure limits, ON BOTH ARMS. It read
+    // U 8.9149e-03, k 3.3383e-02, nut 4.1315e-01 on the device before the defect it found was named:
+    // KOmegaSSTInput carries the grad(U) limiter TWICE and the interFoam site filled only the coeffs
+    // half, so the device closure's production ran on an unlimited gradient.
+    const bool hostOnlyProfile = false;
     const bool lesProfile = (profile == "les" || profile == "lesCN");
     const bool turbProfile = sstProfile || lesProfile;
     // ...and the two CRANKNICOLSON profiles, whose control is the SAME case under Euler rather than a

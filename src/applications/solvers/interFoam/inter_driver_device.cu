@@ -290,22 +290,14 @@ RunReport runInterFoamDevice(
                 "condition. Refused rather than run an unmeasured flux; a static mesh runs (gated on "
                 "laminar/damBreakPermeable).");
     }
-    // `grad(U) cellLimited` ON THE DEVICE. The refusal here said the momentum "does not read the
-    // coefficient", and that has not been true for some time: the shared assembler limits both
-    // gradients it forms -- linearUpwind's reconstruction (UEqn.cu:309-310, MomentumInput::
-    // gradULimitK) and divDevReff's dev2 term (:235, ::gradUSchemeLimitK) -- and this loop passes
-    // both. What is still missing is a GATE: the one fixture that could hold it here carries a
-    // periodic pair, and across a pair the momentum's limiter is a separate hole that refuses by name
-    // (UEqn.cu, measured U 8.9149e-03 on validation/interFoamCyclic `sstLimU`). So the refusal stays,
-    // with the right reason on it -- ungated, not unimplemented. The HOST arm runs it and is gated
-    // (`sstLimU`, U 8.8697e-13).
-    if (f.gradULimitK > 0)
-        throw std::runtime_error(
-            "brae interFoam (device): fvSchemes limits grad(U) (cellLimited, k = "
-            + std::to_string((double)f.gradULimitK) + "). The device momentum does limit both gradients "
-            "it forms, and no gate holds that on this loop -- the fixture that could carries a "
-            "periodic pair, where the limiter is a hole of its own. Refused as ungated, not as "
-            "unported; the host loop runs it.");
+    // `grad(U) cellLimited` RUNS on this loop, and what the refusal here hid was not the momentum:
+    // the shared assembler limits divDevReff's dev2 gradient through deviceCellLimitGradU, WITH the
+    // pair (device_komega_sst.cu:838-846). What was actually wrong sat in the TURBULENCE closure --
+    // KOmegaSSTInput carries the grad(U) limiter twice and this loop filled only the coeffs half, so
+    // the production ran unlimited (nut 4.1315e-01). Gated on validation/interFoamCyclic `sstLimU`,
+    // both arms, with grad(U), grad(k) and grad(omega) all cellLimited on a corrected laplacian.
+    // What is still refused, at its own site, is the V-scheme reconstruction's limiter, which takes
+    // no interface list (UEqn.cu).
     // ddtCorr's BOUNDARY HALF is on the device now: deviceDdtCorr already computed it (and already
     // zeroed it wherever U fixes a value, as fvcDdtPhiCoeff does), and the pressure step adds it to
     // phiHbyA with interpolate(rho*rAU)'s patch value, as the host does (inter_peqn_cpp.cu:531-573).
@@ -1428,6 +1420,14 @@ RunReport runInterFoamDevice(
     C.pRefCell      = static_cast<int>(f.pRef.pRefCell);
     C.pRefValue     = f.pRef.pRefValue;
     C.nNonOrthogonalCorrectors = static_cast<int>(f.nNonOrthogonalCorrectors);
+    // gradSchemes' `grad(U)`, which the momentum takes at TWO sites -- linearUpwind's reconstruction
+    // and divDevReff's dev2 term -- and which this loop set at NEITHER. The host hands the same one
+    // entry to both (inter_driver_cpp.cu:809, `mi.gradULimitK = f.gradULimitK`), and the case struct
+    // carries one field because interFoam's tutorials name it once. Left at 0 the device ran the
+    // viscous term on an unlimited gradient while the host limited it, which the refusal in front of
+    // it made unreachable: the refusal-in-front-of-a-substitution shape again.
+    C.gradULimitK       = f.gradULimitK;
+    C.gradUSchemeLimitK = f.gradULimitK;
     C.correctedLaplacian = f.laplacianScheme.corrected;
     C.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
     C.momentumPredictor = f.momentumPredictorOn;

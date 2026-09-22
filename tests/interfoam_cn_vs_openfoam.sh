@@ -96,9 +96,12 @@ SRC="$TUT/multiphase/interFoam/RAS/damBreak/damBreak"
 STEPS=${STEPS:-20}
 DT=${DT:-1e-3}
 
+# shellcheck disable=SC1091
+. "$(dirname "$0")/require_fresh_binary.sh"
 [ -x "$BIN" ]      || { echo "SKIP: $BIN not built"; exit 77; }
 [ -d "$SRC" ]      || { echo "SKIP: RAS/damBreak tutorial not found at $SRC"; exit 77; }
 [ -f "$OFBASHRC" ] || { echo "SKIP: real OpenFOAM not available"; exit 77; }
+requireFresh "$BIN" || exit 1
 
 W=${KEEP_W:-$(mktemp -d)}
 [ -n "${KEEP_W:-}" ] || trap 'rm -rf "$W"' EXIT
