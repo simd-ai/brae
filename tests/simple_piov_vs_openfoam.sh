@@ -14,7 +14,39 @@
 # 1.1459e-04 / 1.0915e-03, exactly the fixture's record). The kernel now carries a `directionMixed` mode
 # the mirror asks for and the frozen driver does not, and this gate holds the driver at its record:
 # bounds ~3.5x it. Fail-proof: the directionMixed form forced on the legacy call site reads
-# U 1.4911e-03 / p 1.2878e-02 and FAILS both rows.
+# U 1.4911e-03 / p 1.2878e-02 and FAILS both rows -- and re-measured 2026-09-22 it is worse than that:
+# the run does not reach residualControl at all within the case's cap ("brae did not report
+# convergence").
+#
+# AND THE TWO FORMS DISAGREE IN OPPOSITE DIRECTIONS, which is what says a COMPENSATING defect is in
+# here somewhere. On incompressible/pimpleFoam/RAS/TJunction -- a TRANSIENT case whose inlet is a piov,
+# run laminar for ten steps of 0.002 against real pimpleFoam, every solver pinned at 1e-14/relTol 0 so
+# the stopping point is out of it -- the legacy typing reads U 3.863e-03 / p 2.119e-03 and the
+# directionMixed form reads U 1.165e-03 / p 1.072e-03: three times CLOSER, where on this fixture it
+# does not converge. The same experiment says the TJunction gap IS the inlet: with a plain fixedValue
+# inlet in both codes it falls to U 5.631e-04 / p 3.259e-05 (65x on p), and it is NOT the convection
+# scheme (`Gauss upwind` for the case's limitedLinearV: 3.810e-03, unchanged) nor the closure (the
+# turbulent run is 7.078e-03 against this laminar 3.863e-03).
+# So the directionMixed typing is OpenFOAM's and this driver cannot take it yet: something around it --
+# its flux and matrix machinery, which grew up on the legacy typing -- carries an error the legacy form
+# partly cancels. Finding THAT is the unit; until then this gate holds the driver where it is.
+#
+# WHERE IT IS, narrowed 2026-09-22 (the next person starts here):
+#   1. ON AN AXIS-ALIGNED PATCH THE TWO TYPINGS DIFFER IN EXACTLY ONE THING. The tangential components
+#      are identical -- d_k = sqrt(1 - n_k^2) = 1 there, so the mixed face is a fixedValue face, and
+#      bcDivKernel and bcLaplacianFaceKernel were read side by side to confirm they compute the same
+#      coefficients for vf = 1 as for type 1. The NORMAL component is the difference: fixedValue at
+#      n(n.U_cell) under the legacy typing, d_x = sqrt(1 - 1) = 0 -> pure zeroGradient under
+#      directionMixed, which is what OpenFOAM's `neg(phip)*(I - sqr(nf()))` gives.
+#   2. THE RUN DOES NOT SETTLE, it LIMIT-CYCLES. With directionMixed, Ux converges (initial residual
+#      4.3e-12) and p converges (5.8e-09), while Uy's initial residual freezes at 2.74669e-04 -- the
+#      same digits every iteration to 2000 -- so residualControl is never met. The field it cycles
+#      around is 1.3495e-02 from OpenFOAM's converged answer in U (the legacy record is 1.1459e-04).
+#   3. AND YET THE PATCH IS CLOSER. On that same run the outlet's own values are nearer OpenFOAM's than
+#      the legacy typing's: max|Uy| 1.447e-01 against OpenFOAM's 1.435e-01, Ux from -1.148e-01 to
+#      1.005e+00 against -1.196e-01 to 1.006e+00. The boundary is right and the interior does not
+#      settle, which says the defect is in what the FREED NORMAL COMPONENT exposes -- the outlet's flux
+#      and the pressure equation that now has to set it -- not in the typing.
 #
 # The comparison is CONVERGED (both runs stop on the case's own residualControl), so it cannot see an
 # ordering defect -- only a boundary-condition or matrix-coefficient one, which is what it is here for.
