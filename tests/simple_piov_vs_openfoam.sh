@@ -60,6 +60,22 @@
 #      iterations and then holds it, each solve cutting it 13x and the next assembly restoring it --
 #      a steady state of the OUTER iteration whose Uy equation carries a constant imbalance, not an
 #      oscillation.
+#   5. THE IMBALANCE IS NINE CELLS. Restarting that fixed point for one iteration with BRAE_DUMP_STAGE
+#      writes the per-cell momentum residual the solver itself normalises (stage_mResid1 and its
+#      normFactor; sum|r|/normFactor = 2.74669e-04, the reported number to every digit). Of that sum,
+#      84.5% is in the 48 outlet cells and 79% is in the NINE that take flow in -- 7.5797e-05 against
+#      5.0498e-06 over the 39 outflow ones -- and every one of the nine has the SAME SIGN
+#      (signed sum +7.5754e-05 on inflow against -5.0498e-06 on outflow). The freed NORMAL component
+#      over those same cells is exact: Ux's residual there is 7.3089e-12.
+#      So it is the vf = 1 branch, the TANGENTIAL component, on INFLOW faces, and nothing else.
+#      Where to look next, given the coefficients are identical to a fixedValue face at vf = 1: what
+#      differs is only the two numbers the mixed slot is fed -- the per-component `d` and the `ref`
+#      built from it (piovComponent, device_boundary_flow.cu). brae takes d_k = sqrt(1 - n_k^2), which
+#      is OpenFOAM's snGradTransformDiag (directionMixedFvPatchField.C:180-200) -- the GRADIENT half --
+#      while OF's VALUE half uses (I - valueFraction) itself, whose diagonal is 1 - n_k^2 without the
+#      root. The two coincide on an axis-aligned patch, which this outlet is, so that is not yet the
+#      answer -- but it is the one place the two typings are fed different arithmetic, and the next
+#      step is OpenFOAM's own numbers for those nine cells (the of-instrument route).
 #
 # The comparison is CONVERGED (both runs stop on the case's own residualControl), so it cannot see an
 # ordering defect -- only a boundary-condition or matrix-coefficient one, which is what it is here for.

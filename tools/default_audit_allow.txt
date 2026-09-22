@@ -165,7 +165,7 @@ Compressible sstComp V0         # same
 Compressible sstComp meshPhi    # same
 Compressible sc V0              # `sc` is the rhoSimpleFoam kOmegaSST instantiation: same static-mesh fact
 Compressible sc meshPhi         # same
-Compressible comp nutPhi        # NULL IS A REFUSAL, not a default: a flux-conditional nut patch with no flux throws by name ("nut on patch `...` is flux-conditional (inletOutlet) and the caller handed the closure no flux to decide inflow by", kEpsilon_cpp.cu:940-945). The rho path never sets it, so such a case is refused there; interFoam sets it at every site
+Compressible comp nutPhi        # NULL IS A REFUSAL, not a default: a flux-conditional nut patch with no flux throws by name ("nut on patch `...` is flux-conditional (inletOutlet) and the caller handed the closure no flux to decide inflow by", kEpsilon_cpp.cu:940-945). The rho path never sets it, so such a case is refused there -- ARMED in tests/rho_step_cuda_turbulent.sh, rhoKE's outlet nut made inletOutlet; interFoam sets it at every site
 Compressible sc nutPhi          # same
 
 # ...and the CrankNicolson family + bcPhi, which only the LIVE interFoam kEpsilon site sets

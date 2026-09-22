@@ -46,4 +46,31 @@ grep -q 'kEpsilon' "$W/c/constant/turbulenceProperties" || { echo "FAIL: rhoKE i
 grep -q 'epsilonWallFunction' "$W/c/0.orig/epsilon"      || { echo "FAIL: rhoKE lost its epsilon wall function"; exit 1; }
 grep -q 'calculated' "$W/c/0.orig/alphat"                 || { echo "FAIL: rhoKE lost its calculated alphat patches"; exit 1; }
 
-"$BIN" "$W/c" 0.orig "$ITERS" --turbulent
+rc=0
+"$BIN" "$W/c" 0.orig "$ITERS" --turbulent || rc=1
+
+# ---- nut's FLUX-CONDITIONAL patches: refused by name on this path -------------------------------
+# The closure decides an inletOutlet nut face from the flux its `phi` entry names, and the compressible
+# caller hands it none (Compressible::nutPhi is null here -- interFoam sets it at every site, this path
+# never does). kEpsilon_cpp.cu:940-945 therefore THROWS rather than leave such a patch at the value it
+# was built with, which is the defect the waterChannel gate found on the interFoam device arm: a
+# zeroGradient nut inlet that kept its seed read nut 5.5e-06 and U 1.9e-05 from OpenFOAM. The refusal
+# had no arm until now, and tools/default_audit.py's ledger CITES it for `Compressible comp nutPhi` --
+# a cited refusal that nothing exercises is a claim, not a guarantee.
+python3 - "$W/c/0.orig/nut" <<'PYNUT' || { echo "FAIL: the nut arm was not staged"; exit 1; }
+import sys
+p = sys.argv[1]
+s = open(p).read()
+a = "    outlet    { type calculated; value uniform 0; }"
+assert s.count(a) == 1, "rhoKE's outlet nut is no longer the `calculated` this arm rewrites"
+s = s.replace(a, "    outlet    { type inletOutlet; inletValue uniform 0; value uniform 0; }")
+open(p, "w").write(s)
+PYNUT
+out=$("$BIN" "$W/c" 0.orig 2 --turbulent 2>&1) && { echo "FAIL: an inletOutlet nut RAN on the device path"; rc=1; }
+if echo "$out" | grep -qE "flux-conditional .inletOutlet.*no flux to decide inflow by"; then
+    echo "  nut inletOutlet refused by name                  ok"
+else
+    echo "$out" | tail -3; echo "FAIL: no nut REFUSAL fired (a log line is not a refusal)"; rc=1
+fi
+
+exit $rc
