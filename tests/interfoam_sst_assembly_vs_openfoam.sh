@@ -105,6 +105,12 @@ command -v blockMesh   > /dev/null 2>&1 || { echo "SKIP: blockMesh not on PATH";
 command -v extrudeMesh > /dev/null 2>&1 || { echo "SKIP: extrudeMesh not on PATH"; exit 77; }
 command -v interFoam   > /dev/null 2>&1 || { echo "SKIP: interFoam not on PATH"; exit 77; }
 
+# EVERY arm this gate asserts is a device arm -- the host arm is here to keep the two honest, not as
+# the claim -- so with no GPU there is nothing left to run and the gate skips rather than passing on
+# the host alone.
+command -v nvidia-smi > /dev/null 2>&1 && nvidia-smi > /dev/null 2>&1 \
+    || { echo "SKIP: no GPU -- this gate's subject is the device closure"; exit 77; }
+
 DUMPLIB="${FOAM_USER_LIBBIN:-}/libdumpKOmegaSST.so"
 [ -f "$DUMPLIB" ] || { echo "SKIP: the oracle library is not built -- (cd $ROOT/tools/dumpKOmegaSST && wmake libso)"; exit 77; }
 
