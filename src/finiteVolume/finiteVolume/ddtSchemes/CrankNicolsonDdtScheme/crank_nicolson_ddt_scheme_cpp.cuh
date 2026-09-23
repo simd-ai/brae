@@ -127,7 +127,12 @@ void fvmDdt(
     const std::vector<vector>& vfOld,
     const std::vector<vector>& vfOO,
     const std::vector<scalar>& V,
-    FvVectorMatrix& M);
+    FvVectorMatrix& M,
+    // a MOVING mesh: mesh().V0() and mesh().V00(), which the scheme's moving branch
+    // weights ddt0 and the source by (CrankNicolsonDdtScheme.C:1029-1065). Null together
+    // means the static branch.
+    const std::vector<scalar>* V0 = nullptr,
+    const std::vector<scalar>* V00 = nullptr);
 void fvmDdt(
     const CrankNicolsonClock& clock,
     CrankNicolsonDdt0<scalar>& ddt0,
@@ -137,7 +142,12 @@ void fvmDdt(
     const std::vector<scalar>& vfOld,
     const std::vector<scalar>& vfOO,
     const std::vector<scalar>& V,
-    FvScalarMatrix& M);
+    FvScalarMatrix& M,
+    // a MOVING mesh: mesh().V0() and mesh().V00(), which the scheme's moving branch
+    // weights ddt0 and the source by (CrankNicolsonDdtScheme.C:1029-1065). Null together
+    // means the static branch.
+    const std::vector<scalar>* V0 = nullptr,
+    const std::vector<scalar>* V00 = nullptr);
 
 // fvc::ddtCorr(U, phi) on a static mesh (fvcDdtPhiCorr):
 //     ddt0    <- rDtCoef0*(U.oldTime() - U.oldTime().oldTime()) - offCentre(ddt0)      cells AND patches
@@ -160,6 +170,40 @@ void fvcDdtPhiCorr(
     const std::vector<std::vector<vector>>& UOOBnd,
     const SurfaceScalarField& phiOld,
     const SurfaceScalarField& phiOO,
+    const std::vector<bool>& patchFixesU,
+    scalar ddtPhiCoeff,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    SurfaceScalarField& out);
+
+// fvc::ddtCorr(U, Uf) on a MOVING mesh (fvcDdtUfCorr, CrankNicolsonDdtScheme.C:1201-1257). A moving
+// mesh carries Uf -- the face velocity the solver stores and moves with the mesh -- and OpenFOAM's
+// correction is then built from Uf.oldTime() rather than from phi.oldTime():
+//
+//     ddt0   <- rDtCoef0*(U.oldTime()  - U.oldTime().oldTime())  - offCentre(ddt0)     cells AND patches
+//     dUfdt0 <- rDtCoef0*(Uf.oldTime() - Uf.oldTime().oldTime()) - offCentre(dUfdt0)   a SURFACE vector
+//     out = fvcDdtPhiCoeff(U.oldTime(), Sf & Uf.oldTime())
+//          *(Sf & ((rDtCoef*Uf.oldTime() + offCentre(dUfdt0)) - interpolate(rDtCoef*U.oldTime() + offCentre(ddt0))))
+//
+// THREE DIFFERENCES from the static twin above, each of which changes the answer on a moving mesh:
+//   * the flux side is `Sf & Uf.oldTime()`, not phi.oldTime() -- on a moving mesh those are not the
+//     same number, because phi carries the mesh flux and Uf does not;
+//   * the second ddt0 is a SURFACE VECTOR field (ddtCorrDdt0(Uf)), so it needs Uf.oldTime().oldTime();
+//   * the interpolation is subtracted as a VECTOR and dotted with Sf once, rather than each term being
+//     dotted separately -- the same arithmetic, in OpenFOAM's order.
+//
+// `UfOld`/`UfOO` are surface VECTOR fields: internal faces and patch faces, as Uf is stored.
+void fvcDdtUfCorr(
+    const CrankNicolsonClock& clock,
+    CrankNicolsonDdt0<vector>& ddt0,
+    CrankNicolsonDdt0<vector>& dUfdt0,
+    const std::vector<vector>& UOld,
+    const std::vector<vector>& UOO,
+    const std::vector<std::vector<vector>>& UOldBnd,
+    const std::vector<std::vector<vector>>& UOOBnd,
+    const SurfaceVectorField& UfOld,
+    const SurfaceVectorField& UfOO,
     const std::vector<bool>& patchFixesU,
     scalar ddtPhiCoeff,
     const PrimitiveMesh& m,

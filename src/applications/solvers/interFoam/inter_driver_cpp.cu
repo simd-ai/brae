@@ -405,6 +405,14 @@ RunReport runInterFoam(
     label alphaPhi10OldIndex = -1;
     // ...and a fifth on a moving mesh: Uf.oldTime(), which ddtCorr reads in phi.oldTime()'s place
     SurfaceVectorField UfOld = f.Uf;
+    // ...and under CrankNicolson a SIXTH: Uf.oldTime().oldTime(), which fvcDdtUfCorr's second ddt0
+    // field is built from (CrankNicolsonDdtScheme.C:1230-1235). Created as a copy of Uf.oldTime() the
+    // first time it is asked for, exactly as phiOO is -- GeometricField::oldTime() on a level that has
+    // never been stored returns the current one.
+    SurfaceVectorField UfOO = f.Uf;
+    bool UfOOExists = false;
+    fv::CrankNicolsonDdt0<vector> cnDdtCorrUf;
+    cnDdtCorrUf.name = "ddtCorrDdt0(Uf)";
 
     SurfaceScalarField prevCorr;                 // alphaApplyPrevCorr's cache
     // cyclicACMIPolyPatch::updateAreas runs once per time index (prevTimeIndex_)
@@ -894,6 +902,22 @@ RunReport runInterFoam(
                         dc.UOO = &UOO;
                         dc.UOOBnd = &UOOBnd;
                         dc.phiOO = &phiOO;
+                        // ...and on a MOVING mesh the Uf pair, which fvcDdtUfCorr takes in phi's
+                        // place. Same lazy creation as phiOO above.
+                        if (dyn)
+                        {
+                            if (!UfOOExists && cnDdtCorrUf.exists && cnDdtCorrUf.timeIndex != rep.steps)
+                            {
+                                UfOO = UfOld;
+                                UfOOExists = true;
+                            }
+                            if (!UfOOExists)
+                            {
+                                UfOO = UfOld;   // read by nothing on the step the field is created
+                            }
+                            dc.cnDdt0Uf = &cnDdtCorrUf;
+                            dc.UfOO = &UfOO;
+                        }
                     }
                     // ddtCorr(U, phi, Uf) is ddtCorr(U, Uf) when the mesh is dynamic
                     dc.UfOld = dyn ? &UfOld : nullptr;
@@ -1019,6 +1043,10 @@ RunReport runInterFoam(
         UOldBnd  = patchValuesOf(f.U);
         rhoOld   = f.rho;
         phiOld   = f.phi;
+        if (UfOOExists)
+        {
+            UfOO = UfOld;
+        }
         UfOld = f.Uf;
 
         if (verbose)

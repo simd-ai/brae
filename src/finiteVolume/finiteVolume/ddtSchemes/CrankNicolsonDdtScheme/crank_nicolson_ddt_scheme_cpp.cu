@@ -65,7 +65,11 @@ void fvmDdtBody(
     const std::vector<T>& vfOO,
     const std::vector<scalar>& V,
     std::vector<scalar>& diag,
-    std::vector<T>& source)
+    std::vector<T>& source,
+    // A MOVING MESH: mesh().V0() and mesh().V00(). Null together means the static branch, which is
+    // what every caller before the moving CrankNicolson port passed.
+    const std::vector<scalar>* V0 = nullptr,
+    const std::vector<scalar>* V00 = nullptr)
 {
     const std::size_t nC = V.size();
     if (clock.deltaT <= scalar(0) || clock.deltaT0 <= scalar(0))
@@ -94,26 +98,49 @@ void fvmDdtBody(
         diag[c] += (rDtCoef*r)*V[c];
     }
     // vf.oldTime().oldTime(), rho.oldTime().oldTime(): ensure the old-old levels exist -- the caller's
+    const bool moving = (V0 && V00);
     if (ddt0.evaluate(clock))
     {
-        // ddt0 = rDtCoef0*(rho.oldTime()*vf.oldTime() - rho.oldTime().oldTime()*vf.oldTime().oldTime())
-        //      - offCentre_(ddt0())
         const scalar rDtCoef0 = ddt0.rDtCoef0(clock);
-        for (std::size_t c = 0; c < nC; ++c)
+        if (moving)
         {
-            const scalar ro = withRho ? (*rhoOld)[c] : scalar(1);
-            const scalar roo = withRho ? (*rhoOO)[c] : scalar(1);
-            ddt0.internal[c] = minus(times(rDtCoef0, minus(times(ro, vfOld[c]), times(roo, vfOO[c]))),
-                                     offCentre(clock, ddt0.internal[c]));
+            // THE MOVING BRANCH (CrankNicolsonDdtScheme.C:1029-1047). Every term is weighted by the
+            // volume it belongs to and the whole is divided by V0 -- a cell that grew between the two
+            // old levels does not carry the same ddt0 as one that did not, and the static form above
+            // would give it V's weight at both levels:
+            //   ddt0 = (rDtCoef0*(V0*rhoOld*vfOld - V00*rhoOO*vfOO) - V00*offCentre(ddt0))/V0
+            for (std::size_t c = 0; c < nC; ++c)
+            {
+                const scalar ro = withRho ? (*rhoOld)[c] : scalar(1);
+                const scalar roo = withRho ? (*rhoOO)[c] : scalar(1);
+                const T a = times((*V0)[c]*ro, vfOld[c]);
+                const T b = times((*V00)[c]*roo, vfOO[c]);
+                const T num = minus(times(rDtCoef0, minus(a, b)),
+                                    times((*V00)[c], offCentre(clock, ddt0.internal[c])));
+                ddt0.internal[c] = times(scalar(1)/(*V0)[c], num);
+            }
+        }
+        else
+        {
+            // ddt0 = rDtCoef0*(rho.oldTime()*vf.oldTime() - rho.oldTime().oldTime()*vf.oldTime().oldTime())
+            //      - offCentre_(ddt0())
+            for (std::size_t c = 0; c < nC; ++c)
+            {
+                const scalar ro = withRho ? (*rhoOld)[c] : scalar(1);
+                const scalar roo = withRho ? (*rhoOO)[c] : scalar(1);
+                ddt0.internal[c] = minus(times(rDtCoef0, minus(times(ro, vfOld[c]), times(roo, vfOO[c]))),
+                                         offCentre(clock, ddt0.internal[c]));
+            }
         }
     }
-    // fvm.source() = (rDtCoef*rho.oldTime().primitiveField()*vf.oldTime().primitiveField()
-    //               + offCentre_(ddt0.primitiveField()))*mesh().V()
+    // fvm.source() = (rDtCoef*rho.oldTime()*vf.oldTime() + offCentre_(ddt0))*mesh().V(), and on a
+    // moving mesh the same expression times mesh().V0() -- the OLD volumes, because that is where the
+    // old-time field lives (CrankNicolsonDdtScheme.C:1060-1065 against :1077-1082).
     for (std::size_t c = 0; c < nC; ++c)
     {
         const scalar ro = withRho ? (*rhoOld)[c] : scalar(1);
         const T term = plus(times(rDtCoef*ro, vfOld[c]), offCentre(clock, ddt0.internal[c]));
-        source[c] = plus(source[c], times(V[c], term));
+        source[c] = plus(source[c], times(moving ? (*V0)[c] : V[c], term));
     }
 }
 
@@ -159,9 +186,14 @@ void fvmDdt(
     const std::vector<vector>& vfOld,
     const std::vector<vector>& vfOO,
     const std::vector<scalar>& V,
-    FvVectorMatrix& M)
+    FvVectorMatrix& M,
+    // a MOVING mesh: mesh().V0() and mesh().V00(), which the scheme's moving branch
+    // weights ddt0 and the source by (CrankNicolsonDdtScheme.C:1029-1065). Null together
+    // means the static branch.
+    const std::vector<scalar>* V0,
+    const std::vector<scalar>* V00)
 {
-    fvmDdtBody<vector>(clock, ddt0, rho, rhoOld, rhoOO, vfOld, vfOO, V, M.diag, M.source);
+    fvmDdtBody<vector>(clock, ddt0, rho, rhoOld, rhoOO, vfOld, vfOO, V, M.diag, M.source, V0, V00);
 }
 
 void fvmDdt(
@@ -173,9 +205,14 @@ void fvmDdt(
     const std::vector<scalar>& vfOld,
     const std::vector<scalar>& vfOO,
     const std::vector<scalar>& V,
-    FvScalarMatrix& M)
+    FvScalarMatrix& M,
+    // a MOVING mesh: mesh().V0() and mesh().V00(), which the scheme's moving branch
+    // weights ddt0 and the source by (CrankNicolsonDdtScheme.C:1029-1065). Null together
+    // means the static branch.
+    const std::vector<scalar>* V0,
+    const std::vector<scalar>* V00)
 {
-    fvmDdtBody<scalar>(clock, ddt0, rho, rhoOld, rhoOO, vfOld, vfOO, V, M.diag, M.source);
+    fvmDdtBody<scalar>(clock, ddt0, rho, rhoOld, rhoOO, vfOld, vfOO, V, M.diag, M.source, V0, V00);
 }
 
 
@@ -322,6 +359,156 @@ void fvcDdtPhiCorr(
             const scalar corr = (rDtCoef*phiOld.boundary[pi][k] + offCentre(clock, dphidt0.boundary[pi][k]))
                               - (S.x*wf.x + S.y*wf.y + S.z*wf.z);
             out.boundary[pi][k] = coeffOf(phiOld.boundary[pi][k], phiCorr)*corr;
+        }
+    }
+}
+
+
+void fvcDdtUfCorr(
+    const CrankNicolsonClock& clock,
+    CrankNicolsonDdt0<vector>& ddt0,
+    CrankNicolsonDdt0<vector>& dUfdt0,
+    const std::vector<vector>& UOld,
+    const std::vector<vector>& UOO,
+    const std::vector<std::vector<vector>>& UOldBnd,
+    const std::vector<std::vector<vector>>& UOOBnd,
+    const SurfaceVectorField& UfOld,
+    const SurfaceVectorField& UfOO,
+    const std::vector<bool>& patchFixesU,
+    scalar ddtPhiCoeff,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    SurfaceScalarField& out)
+{
+    const label nIf = m.nInternalFaces();
+    const std::size_t nC = static_cast<std::size_t>(m.nCells());
+    if (clock.deltaT <= scalar(0) || clock.deltaT0 <= scalar(0))
+        throw std::runtime_error("brae CrankNicolson ddtCorr(U, Uf): deltaT and deltaT0 must both be positive.");
+    if (UOld.size() != nC || UOO.size() != nC || UOldBnd.size() != patches.size()
+     || UOOBnd.size() != patches.size() || patchFixesU.size() != patches.size()
+     || UfOld.internal.size() != static_cast<std::size_t>(nIf)
+     || UfOO.internal.size() != static_cast<std::size_t>(nIf)
+     || UfOld.boundary.size() != patches.size() || UfOO.boundary.size() != patches.size())
+        throw std::runtime_error(
+            "brae CrankNicolson ddtCorr(U, Uf): U.oldTime(), U.oldTime().oldTime() (cells and patches), "
+            "Uf.oldTime(), Uf.oldTime().oldTime() and the fixes-value mask must all be the mesh's.");
+    std::vector<std::size_t> patchSizes(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        patchSizes[pi] = static_cast<std::size_t>(patches[pi].size);
+        if (UOldBnd[pi].size() != patchSizes[pi] || UOOBnd[pi].size() != patchSizes[pi]
+         || UfOld.boundary[pi].size() != patchSizes[pi] || UfOO.boundary[pi].size() != patchSizes[pi])
+            throw std::runtime_error(
+                "brae CrankNicolson ddtCorr(U, Uf): patch `" + patches[pi].name + "` has "
+                + std::to_string(patchSizes[pi]) + " faces and an old-time field disagrees.");
+    }
+    ddt0.lookupOrCreate(clock, nC, patchSizes);
+    dUfdt0.lookupOrCreate(clock, static_cast<std::size_t>(nIf), patchSizes);
+
+    // rDtCoef = rDtCoef_(ddt0) -- ddt0's, as the static twin does; dUfdt0's is never asked for
+    const scalar rDtCoef = ddt0.rDtCoef(clock);
+    if (ddt0.evaluate(clock))
+    {
+        const scalar rDtCoef0 = ddt0.rDtCoef0(clock);
+        for (std::size_t c = 0; c < nC; ++c)
+        {
+            ddt0.internal[c] = minus(times(rDtCoef0, minus(UOld[c], UOO[c])), offCentre(clock, ddt0.internal[c]));
+        }
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            for (std::size_t i = 0; i < patchSizes[pi]; ++i)
+            {
+                ddt0.boundary[pi][i] = minus(times(rDtCoef0, minus(UOldBnd[pi][i], UOOBnd[pi][i])),
+                                             offCentre(clock, ddt0.boundary[pi][i]));
+            }
+        }
+    }
+    if (dUfdt0.evaluate(clock))
+    {
+        const scalar rDtCoef0 = dUfdt0.rDtCoef0(clock);
+        for (label f = 0; f < nIf; ++f)
+        {
+            const std::size_t k = static_cast<std::size_t>(f);
+            dUfdt0.internal[k] = minus(times(rDtCoef0, minus(UfOld.internal[k], UfOO.internal[k])),
+                                       offCentre(clock, dUfdt0.internal[k]));
+        }
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            for (std::size_t i = 0; i < patchSizes[pi]; ++i)
+            {
+                dUfdt0.boundary[pi][i] = minus(times(rDtCoef0, minus(UfOld.boundary[pi][i], UfOO.boundary[pi][i])),
+                                               offCentre(clock, dUfdt0.boundary[pi][i]));
+            }
+        }
+    }
+
+    // W = rDtCoef*U.oldTime() + offCentre_(ddt0()), the vol field interpolate is handed
+    std::vector<vector> W(nC);
+    for (std::size_t c = 0; c < nC; ++c)
+    {
+        W[c] = plus(times(rDtCoef, UOld[c]), offCentre(clock, ddt0.internal[c]));
+    }
+    std::vector<std::vector<vector>> Wb(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        Wb[pi].resize(patchSizes[pi]);
+        for (std::size_t i = 0; i < patchSizes[pi]; ++i)
+        {
+            Wb[pi][i] = plus(times(rDtCoef, UOldBnd[pi][i]), offCentre(clock, ddt0.boundary[pi][i]));
+        }
+    }
+
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    const std::vector<scalar>& lambda = g.weights();
+    const std::vector<vector>& Sf = g.Sf();
+    const scalar kSmall = scalar(1e-15);   // doubleScalar.H's SMALL
+    // surfaceInterpolationScheme::interpolate, lambda*(P - N) + N -- the VECTOR, dotted with Sf after
+    // the subtraction, which is the order fvcDdtUfCorr writes it in
+    auto interpV = [&](label f, const std::vector<vector>& vf)
+    {
+        const vector& P = vf[own[f]];
+        const vector& N = vf[nei[f]];
+        return plus(times(lambda[f], minus(P, N)), N);
+    };
+    auto dot = [](const vector& a, const vector& b) { return a.x*b.x + a.y*b.y + a.z*b.z; };
+    auto coeffOf = [&](scalar phi, scalar phiCorr)
+    {
+        return (ddtPhiCoeff < scalar(0))
+             ? scalar(1) - std::fmin(std::fabs(phiCorr)/(std::fabs(phi) + kSmall), scalar(1))
+             : ddtPhiCoeff;
+    };
+
+    out.internal.resize(static_cast<std::size_t>(nIf));
+    for (label f = 0; f < nIf; ++f)
+    {
+        const std::size_t k = static_cast<std::size_t>(f);
+        // the coefficient's two arguments are U.oldTime() and `Sf & Uf.oldTime()` -- the flux the FACE
+        // velocity carries, which on a moving mesh is not phi.oldTime()
+        const scalar phiOld = dot(Sf[f], UfOld.internal[k]);
+        const scalar phiCorr = phiOld - dot(Sf[f], interpV(f, UOld));
+        const vector lhs = plus(times(rDtCoef, UfOld.internal[k]), offCentre(clock, dUfdt0.internal[k]));
+        const vector rhs = interpV(f, W);
+        out.internal[k] = coeffOf(phiOld, phiCorr)*dot(Sf[f], minus(lhs, rhs));
+    }
+    out.boundary.assign(patches.size(), std::vector<scalar>{});
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& q = patches[pi];
+        out.boundary[pi].assign(patchSizes[pi], scalar(0));
+        if (patchFixesU[pi] || q.type == "cyclicAMI") continue;
+        for (label i = 0; i < q.size; ++i)
+        {
+            const std::size_t k = static_cast<std::size_t>(i);
+            const vector& S = Sf[q.start + i];
+            const vector uo = q.coupled ? coupledLinear(q, i, UOld) : UOldBnd[pi][k];
+            const vector wf = q.coupled ? coupledLinear(q, i, W) : Wb[pi][k];
+            const scalar phiOld = dot(S, UfOld.boundary[pi][k]);
+            const scalar phiCorr = phiOld - dot(S, uo);
+            const vector lhs = plus(times(rDtCoef, UfOld.boundary[pi][k]),
+                                    offCentre(clock, dUfdt0.boundary[pi][k]));
+            out.boundary[pi][k] = coeffOf(phiOld, phiCorr)*dot(S, minus(lhs, wf));
         }
     }
 }

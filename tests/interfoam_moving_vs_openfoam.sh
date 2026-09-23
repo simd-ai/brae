@@ -320,6 +320,10 @@ stage()
 {
     local name="$1" tutorial="$2" dt="$3" n="$4" profile="$5"
     local C="$W/$name"
+    # CLEAR IT FIRST: `cp -r src dst` copies INTO dst when dst exists, so a re-run under KEEP_W staged
+    # the tutorial as a subdirectory and then edited the PREVIOUS run's already-staged files -- every
+    # profile-specific assertion then failed on a case that was already correct.
+    rm -rf "$C"
     cp -r "$LAM/$tutorial" "$C" || return 1
     rm -rf "$C"/[1-9]* "$C"/0 "$C"/processor* "$C"/log.*
     cp -r "$C/0.orig" "$C/0"
@@ -342,6 +346,25 @@ for key, val in [('startFrom', 'startTime'), ('startTime', '0'), ('adjustTimeSte
     assert k == 1, key
 s = re.sub(r'^writeCompression\s.*', 'writeCompression off;', s, flags=re.M)
 open(c, 'w').write(s)
+
+# ...and the CN profiles' own change: `ddtSchemes default CrankNicolson 0.9` on a MOVING mesh, where
+# ddtCorr is a different operator from the static one -- fvcDdtUfCorr, built from Uf.oldTime() and an
+# old-old level of it, rather than fvcDdtPhiCorr's phi.oldTime() (CrankNicolsonDdtScheme.C:1201-1257).
+if profile.endswith('CN'):
+    sc = os.path.join(d, 'system/fvSchemes')
+    t = open(sc).read()
+    t, k = re.subn(r'(ddtSchemes\s*\{\s*\n\s*default\s+)[^;]+;', r'\1CrankNicolson 0.9;', t)
+    assert k == 1, 'no ddtSchemes default to make CrankNicolson'
+    open(sc, 'w').write(t)
+    # ...and ONE alpha sub-cycle, because OPENFOAM ITSELF refuses the combination: "Sub-cycling is not
+    # supported with the CrankNicolson ddt scheme" (VoF/alphaEqn.H:30). The tutorial ships 3, so the
+    # profile is the tank with CrankNicolson and no sub-cycling -- not the tutorial with one entry
+    # changed -- and the gate's control is the EULER run of this same staging.
+    q2 = os.path.join(d, 'system/fvSolution')
+    u = open(q2).read()
+    u, k = re.subn(r'^(\s*nAlphaSubCycles\s+)\d+;', r'\g<1>1;', u, flags=re.M)
+    assert k == 1, 'no nAlphaSubCycles to set to 1'
+    open(q2, 'w').write(u)
 
 q = os.path.join(d, 'system/fvSolution')
 t = open(q).read()
@@ -643,6 +666,10 @@ stage mixerOuterOnce testTubeMixer 2e-4  10 mixerOuterOnce || rc=1
 stage mixerPred      testTubeMixer 2e-4  10 mixerPred      || rc=1
 stage sloshing2DStatic sloshingTank2D 0.01  10 sloshing2DStatic || rc=1
 stage sloshing2D     sloshingTank2D 0.01  10 sloshing2D     || rc=1
+# ...and the same tank under CRANKNICOLSON, where ddtCorr is fvcDdtUfCorr rather than fvcDdtPhiCorr:
+# built from Uf.oldTime() and an old-old level of Uf, with its own ddt0 surface field. brae refused the
+# combination by name until that operator was ported. Its control is the EULER run of the same case.
+stage sloshing2DCN   sloshingTank2D 0.01  10 sloshing2DCN   || rc=1
 stage sloshing2D3DoFStatic sloshingTank2D3DoF 0.01 10 sloshing2D3DoFStatic || rc=1
 stage sloshing2D3DoF       sloshingTank2D3DoF 0.01 10 sloshing2D3DoF       || rc=1
 stage sloshing3DStatic     sloshingTank3D     0.01 10 sloshing3DStatic     || rc=1
@@ -693,6 +720,7 @@ gate mixerOuter     2e-4  10 mixerOuter     mixerStatic  || rc=1
 gate mixerOuterOnce 2e-4  10 mixerOuterOnce mixerStatic  || rc=1
 gate mixerPred      2e-4  10 mixerPred      mixerStatic  || rc=1
 gate sloshing2D     0.01  10 sloshing2D     sloshing2DStatic || rc=1
+gate sloshing2DCN   0.01  10 sloshing2DCN   sloshing2D       || rc=1
 gate sloshing2D3DoF 0.01  10 sloshing2D3DoF sloshing2D3DoFStatic || rc=1
 gate sloshing3D     0.01  10 sloshing3D     sloshing3DStatic     || rc=1
 gate sloshing3D3DoF 0.01  10 sloshing3D3DoF sloshing3D3DoFStatic || rc=1

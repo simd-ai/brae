@@ -149,6 +149,17 @@ public:
     {
         return V0_;
     }
+    // fvMesh::V00(): the volumes two steps back, created on first use as a copy of V0 and rotated
+    // from then on (fvMesh.C:1015-1040). Only the CrankNicolson ddt's moving branch reads it.
+    const std::vector<scalar>& V00()
+    {
+        if (!V00Exists_)
+        {
+            V00_ = V0_;
+            V00Exists_ = true;
+        }
+        return V00_;
+    }
     // fvMesh::Vsc() and Vsc0(): V and V0 outside a sub-cycle, and inside one the volumes at the end
     // and at the start of THAT sub-cycle, linear in time between V0 and V
     std::vector<scalar> Vsc(const SubCycleTimeState& ts) const;
@@ -169,6 +180,8 @@ private:
     std::vector<label> pointIDs_;
     std::vector<vector> oldPoints_;
     std::vector<scalar> V0_;
+    std::vector<scalar> V00_;
+    bool                V00Exists_ = false;
     SurfaceScalarField meshPhi_;
     bool moving_ = false;
     // fvMesh::curTimeIndex_ and polyMesh::curMotionTimeIndex_

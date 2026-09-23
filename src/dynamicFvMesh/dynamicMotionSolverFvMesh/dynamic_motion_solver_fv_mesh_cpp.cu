@@ -291,6 +291,11 @@ void DynamicMotionSolverFvMesh::update(
     // fvMesh::movePoints: grab old time volumes if the time has been incremented
     if (!haveTimeIndex_ || curTimeIndex_ < timeIndex)
     {
+        // ...and the level BEFORE that, which fvMesh::V00() keeps (fvMesh.C:1015-1040) and the
+        // CrankNicolson ddt's moving branch weights its ddt0 by. OpenFOAM creates V00 lazily, as a
+        // copy of V0 the first time it is asked for, and rotates it from then on -- so the step that
+        // creates it reads V0 in its place, which is what an unmoved mesh would give anyway.
+        if (V00Exists_) V00_ = V0_;
         V0_ = g.V();
         curTimeIndex_ = timeIndex;
     }

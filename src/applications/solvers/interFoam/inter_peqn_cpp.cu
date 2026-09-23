@@ -218,14 +218,25 @@ void ddtCorr(const DdtCorrInput&           in,
                 "brae interFoam ddtCorr: CrankNicolson needs its two ddt0 fields, U.oldTime().oldTime() "
                 "(cells and patches), U.oldTime()'s patches and phi.oldTime().oldTime(); the caller "
                 "supplied fewer.");
-        if (in.UfOld)
-            throw std::runtime_error(
-                "brae interFoam ddtCorr: CrankNicolson on a moving mesh is fvcDdtUfCorr with "
-                "Uf.oldTime().oldTime(), which brae does not carry.");
         std::vector<bool> fixes(patches.size());
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
             fixes[pi] = U.boundary[pi]->fixesValue();
+        }
+        // ON A MOVING MESH it is a DIFFERENT OPERATOR: fvcDdtUfCorr, built from Uf.oldTime() and its
+        // own old-old level rather than from phi.oldTime() (CrankNicolsonDdtScheme.C:1201-1257).
+        // interFoam calls ddtCorr(U, phi) on a static mesh and ddtCorr(U, Uf) on a moving one
+        // (pEqn.H:23-27), and under CrankNicolson those two resolve to different member functions --
+        // the same distinction the Euler branch below makes with `UfOld`.
+        if (in.UfOld)
+        {
+            if (!in.UfOO || !in.cnDdt0Uf)
+                throw std::runtime_error(
+                    "brae interFoam ddtCorr: CrankNicolson on a moving mesh needs Uf.oldTime().oldTime() "
+                    "and its own ddt0 field; the caller supplied the mesh's Uf.oldTime() alone.");
+            fv::fvcDdtUfCorr(*in.cn, *in.cnDdt0U, *in.cnDdt0Uf, *in.UOld, *in.UOO, *in.UOldBnd, *in.UOOBnd,
+                             *in.UfOld, *in.UfOO, fixes, in.ddtPhiCoeff, m, g, patches, out);
+            return;
         }
         fv::fvcDdtPhiCorr(*in.cn, *in.cnDdt0U, *in.cnDdt0Phi, *in.UOld, *in.UOO, *in.UOldBnd, *in.UOOBnd,
                           *in.phiOld, *in.phiOO, fixes, in.ddtPhiCoeff, m, g, patches, out);

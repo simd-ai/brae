@@ -169,6 +169,10 @@ struct DdtCorrInput
     // -- the NEW Sf, and the interpolation of U.oldTime() with the NEW weights. Null on a mesh that
     // does not move.
     const SurfaceVectorField* UfOld = nullptr;
+    // ...and, under CrankNicolson on a moving mesh, Uf.oldTime().oldTime() with its own ddt0 field:
+    // fvcDdtUfCorr's second operand set (CrankNicolsonDdtScheme.C:1201-1257)
+    const SurfaceVectorField* UfOO = nullptr;
+    fv::CrankNicolsonDdt0<vector>* cnDdt0Uf = nullptr;
     // fvSchemes' ddtPhiCoeff. NEGATIVE (the default) selects the limiter in note 1; a non-negative
     // value is used verbatim as a constant coefficient.
     scalar ddtPhiCoeff = -1;
