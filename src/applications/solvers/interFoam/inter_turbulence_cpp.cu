@@ -67,7 +67,8 @@ GeometricField<scalar> readTurbulenceField(
 SmoothLinearSolve readFinalSolve(
     const FoamDict& fvSolution,
     const std::string& field,
-    // the kEpsilon closure also runs PBiCG with DILU (pbicg.cuh); the others do not
+    // the kEpsilon, kOmegaSST and LES kEqn closures all run PBiCG with DILU (pbicg.cuh) as well as
+    // the smoothSolver; a caller that passes false still refuses it
     bool allowPBiCG = false)
 {
     const std::string name = field + "Final";
@@ -84,8 +85,8 @@ SmoothLinearSolve readFinalSolve(
             std::string(WHO) + "`solvers/" + name + "` names `solver " + s.solver + "; smoother "
             + s.smoother + "; preconditioner " + s.preconditioner + ";`. brae's interFoam closure runs "
             "OpenFOAM's smoothSolver with the GaussSeidel or symGaussSeidel smoother -- what every "
-            "turbulent tutorial names -- and, under kEpsilon, PBiCG with DILU; nothing else: a "
-            "substituted solver at the same tolerance stops somewhere else.");
+            "turbulent tutorial names -- and, under kEpsilon, kOmegaSST and the LES kEqn, PBiCG with "
+            "DILU; nothing else: a substituted solver at the same tolerance stops somewhere else.");
     return s;
 }
 
@@ -417,7 +418,7 @@ InterTurbulence readInterTurbulence(
         t.delta = LESdelta::compute(t.deltaSpec, *mesh, *geometry, patches);
         // kEqn's constructor: bound(k_, kMin_)
         bound(t.k, t.lesCoeffs.kMin, *mesh, *geometry, patches);
-        t.kSolveFinal = readFinalSolve(fvSolution, "k");
+        t.kSolveFinal = readFinalSolve(fvSolution, "k", /*allowPBiCG=*/true);
         t.kRelaxFinal = EquationRelax::read(eqAll, "kFinal");
         t.on = true;
         return t;
@@ -737,7 +738,9 @@ void correctInterTurbulence(
     {
         const SmoothLinearSolve& ks = t.kSolveFinal;
         LESkEqn::Solve sv;
-        sv.which.smoothSolver = true;
+        // the case's own solver, as both RAS branches take it -- PBiCG with DILU where it names one
+        sv.which.pbicgDILU = ks.pbicgDILU();
+        sv.which.smoothSolver = !sv.which.pbicgDILU;
         sv.which.symmetric = (ks.smoother == "symGaussSeidel");
         sv.which.nSweeps = ks.nSweeps;
         sv.tol = ks.tol;

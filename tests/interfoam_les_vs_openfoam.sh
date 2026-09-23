@@ -108,6 +108,19 @@
 # nHat only. MEASURED, both arms: alpha 6.6e-12, p_rgh 8.3e-11, U 4.5e-12, k 2.1e-12, nut 1.1e-12, all
 # 400 p_rgh counts. BROKEN ONCE, the entry dropped from the builder: both arms U 1.79e-05, p_rgh
 # 1.6e-05, the first p_rgh residual 1.5e-04 out -- the scheme's own distance, i.e. Gauss linear run.
+#
+# PROFILE pbicg: k SOLVED BY PBiCG WITH DILU instead of the tutorial's smoothSolver, on both arms. The
+# pattern `"(U|k)"` is narrowed to U and k given entries of its own, so no dictionary reader has to
+# prefer a literal over a pattern for the profile to mean what it says. Until this unit BOTH loops ran
+# the smoothSolver here: the host refused every other solver outright, and the device swept Gauss-Seidel
+# under whatever entry the case named.
+# MEASURED: all 100 k counts OpenFOAM's and its FINAL residuals with them; host alpha 6.6e-12,
+# p_rgh 8.2e-11, U 4.5e-12, k 2.1e-12, nut 1.1e-12; device alpha 6.6e-12, p_rgh 8.2e-11, U 4.5e-12,
+# k 2.1e-12, nut 1.1e-12 -- the shipped profile's bounds, unchanged.
+# BROKEN ONCE EACH, the smoothSolver left in place under PBiCG's entry:
+#   host     14 of 100 k counts equal, initial residuals 7.8e-06 out
+#   device   alpha 4.4e-08, p_rgh 1.1e-07, U 1.6e-07, k 4.3e-06, nut 1.9e-05 -- five orders, five arms red
+# Neither moves the `les` or `pcorrGrad` profiles, which name the smoothSolver and get it.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_les_vs_openfoam"
@@ -193,6 +206,40 @@ open(p, 'w').write(s.replace(a, a + '    grad(pcorr)     leastSquares;\n'))
 PYEOF
         grep -q "grad(pcorr)     leastSquares;" "$C/system/fvSchemes" || { echo "FAIL: grad(pcorr) not staged"; return 1; }
     fi
+    if [ "$profile" = pbicg ]; then
+        # k SOLVED BY PBiCG WITH DILU instead of the tutorial's smoothSolver. The pattern "(U|k)" covers
+        # both fields, so it is narrowed to U and k is given entries of its own -- no reliance on a
+        # literal beating a pattern in either dictionary reader.
+        python3 - "$C" <<'PYEOF' || { echo "FAIL: staging $profile"; return 1; }
+import sys
+p = sys.argv[1] + '/system/fvSolution'
+s = open(p).read()
+for a, b in [('"(U|k)"', '"U"'), ('"(U|k)Final"', '"UFinal"')]:
+    assert s.count(a) == 1, a
+    s = s.replace(a, b)
+k = '''
+    k
+    {
+        solver          PBiCG;
+        preconditioner  DILU;
+        tolerance       1e-06;
+        relTol          0.1;
+    }
+
+    kFinal
+    {
+        solver          PBiCG;
+        preconditioner  DILU;
+        tolerance       1e-08;
+        relTol          0;
+    }
+'''
+i = s.index('"UFinal"')
+j = s.index('}', s.index('{', i)) + 1
+open(p, 'w').write(s[:j] + '\n' + k + s[j:])
+PYEOF
+        grep -q "solver          PBiCG;" "$C/system/fvSolution" || { echo "FAIL: PBiCG not staged"; return 1; }
+    fi
     if [ "$profile" = delta3d ]; then
         # THE 3-D BRANCH of cubeRootVol, which the wedge never reaches: the same mesh with its two wedge
         # planes made ordinary patches, so no patch knocks a direction out and nGeometricD is 3
@@ -237,7 +284,7 @@ PYEOF
 }
 
 rc=0
-for p in delta delta3d laminar les pcorrGrad; do
+for p in delta delta3d laminar les pcorrGrad pbicg; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_les_vs_openfoam: staging failed"; exit 1; }
@@ -264,6 +311,14 @@ print("  pcorrGrad CONTROL: OpenFOAM with grad(pcorr) leastSquares against OpenF
 sys.exit(0 if d/ref > 1e-6 else 1)
 PYEOF
 "$BIN" "$W/pcorrGrad" "$W/pcorrGrad/0" "$W/pcorrGrad/$END" "$STEPS" "$W/pcorrGrad/log.interFoam" "$W/laminar/$END" \
+       "$W/delta/0" "$W/delta3d" || rc=1
+
+# pbicg: OpenFOAM has to have TAKEN PBiCG for k, or the profile tests nothing
+grep -q "PBiCG:  Solving for k" "$W/pbicg/log.interFoam" \
+    || { echo "FAIL: OpenFOAM's log does not solve k with PBiCG"; rc=1; }
+grep -q "smoothSolver:  Solving for k" "$W/pbicg/log.interFoam" \
+    && { echo "FAIL: OpenFOAM still solved k with the smoothSolver somewhere"; rc=1; }
+"$BIN" "$W/pbicg" "$W/pbicg/0" "$W/pbicg/$END" "$STEPS" "$W/pbicg/log.interFoam" "$W/laminar/$END" \
        "$W/delta/0" "$W/delta3d" || rc=1
 
 echo "interfoam_les_vs_openfoam: rc $rc"

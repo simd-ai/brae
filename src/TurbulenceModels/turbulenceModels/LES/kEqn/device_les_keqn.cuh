@@ -17,6 +17,7 @@
 // THE FILTER WIDTH is the host's: `delta` is computed once by LESdelta::compute on a mesh that does
 // not move and uploaded by the caller. A moving mesh would have to recompute it, and the driver
 // refuses that combination by name.
+#include "device_dilu.cuh"   // DeviceDilu -- PBiCG's preconditioner, where the case names it
 #include "cf_types.cuh"
 #include "device_boundary.cuh"
 #include "device_buffer.cuh"
@@ -70,6 +71,10 @@ struct Input
     cpu::LESkEqn::Coeffs co;
 
     // the smoothSolver the case names for k, and fvMatrix::relax when it asks for one
+    // ...or OpenFOAM's PBiCG with DILU where the case names that instead (device_pbicg.cuh). `precon`
+    // must be set with it; the driver refuses the pair half-built.
+    bool   pbicg = false;
+    const DeviceDilu* precon = nullptr;
     bool   symmetric = true;
     int    nSweeps = 1;
     scalar tol = 1e-6;

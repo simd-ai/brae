@@ -1,3 +1,4 @@
+#include "pbicg.cuh"   // OpenFOAM's PBiCG with DILU, where the case names it for k
 #include "les_kEqn_cpp.cuh"
 #include "bound_cpp.cuh"
 #include "fv_matrix_ops.cuh"
@@ -226,13 +227,21 @@ SolverPerformance correct(
     {
         relaxMatrix(M, k, m, patches, solve.relax);
     }
-    if (!solve.which.smoothSolver)
+    if (!solve.which.smoothSolver && !solve.which.pbicgDILU)
     {
         throw std::runtime_error(
-            std::string(WHO) + "k is solved with OpenFOAM's smoothSolver only; the case names another solver.");
+            std::string(WHO) + "k is solved with OpenFOAM's smoothSolver (GaussSeidel or symGaussSeidel) "
+            "or PBiCG with DILU; the case names another solver.");
     }
-    const SolverPerformance perf = smoothSolver(M, k.internal, m, patches, solve.which.symmetric, solve.tol,
-                                                solve.relTol, solve.maxIter, solve.minIter, solve.which.nSweeps);
+    // `solver PBiCG; preconditioner DILU;` -- OpenFOAM's PBiCG, not PBiCGStab, which is a different
+    // recurrence and stops somewhere else at the same tolerance. Both RAS closures carry this branch;
+    // this one refused every solver but the smoothSolver, so an LES case naming PBiCG for k could not
+    // run here at all.
+    const SolverPerformance perf =
+        solve.which.pbicgDILU
+            ? pbicgDILU(M, k.internal, m, patches, solve.tol, solve.relTol, solve.maxIter, solve.minIter)
+            : smoothSolver(M, k.internal, m, patches, solve.which.symmetric, solve.tol,
+                           solve.relTol, solve.maxIter, solve.minIter, solve.which.nSweeps);
     k.evaluateBoundary();
     if (taps)
     {

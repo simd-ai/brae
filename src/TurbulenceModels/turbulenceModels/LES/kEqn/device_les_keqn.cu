@@ -226,10 +226,16 @@ DeviceSolverPerf correct(
     sv.minIter = in.minIter;
     sv.nSweeps = in.nSweeps;
     sv.gsSymmetric = in.symmetric;
+    // ...or PBiCG with the case's DILU, which is not a smoothSolver sweep: `gs` has to go off with it,
+    // or the shared solve runs Gauss-Seidel under PBiCG's stopping rule and says nothing.
+    sv.pbicg = in.pbicg;
+    sv.precon = in.precon;
+    if (sv.pbicg && !sv.precon)
+        throw std::runtime_error("brae LES kEqn (device): PBiCG is selected for k with no DILU preconditioner.");
     DeviceSolverPerf perf;
     scalar residual = 0;
     turbulence::solveScalarEqn(M, k, dm, in.relaxOn, in.relax, nullptr, nullptr, nullptr, nullptr,
-                               sv, residual, std::string(), /*gs=*/true, &perf,
+                               sv, residual, std::string(), /*gs=*/!in.pbicg, &perf,
                                // the pair's off-diagonal, which deviceAmul applies every sweep:
                                // without it the solve runs a different operator from the matrix
                                in.cyc);
