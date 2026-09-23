@@ -1,3 +1,4 @@
 kEpsilonDumpModels.C
+kEpsilonDumpVoFModels.C
 
 LIB = $(FOAM_USER_LIBBIN)/libdumpKEpsilon

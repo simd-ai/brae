@@ -584,15 +584,15 @@ if [ $HAVE_GPU = 1 ]; then
     # 1.2822e-02 after the first fix); and UEqn.cu's own refusal keyed on the coefficient rather than
     # the scheme, so it blocked `Gauss upwind` with a cellLimited gradSchemes entry. Gated on
     # validation/interFoamCyclic `sstLimU`, both arms. A blanket refusal coming back fails this arm.
-    # ...and `Gauss limitedLinear` for the CLOSURE -- the kEpsilon half, which is what this base case
-    # runs (RAS/damBreak names div(rhoPhi,epsilon)). The kOmegaSST half was LIFTED: its assembled
-    # system is OpenFOAM's own at the first closure call, 3.4e-14 on the off-diagonals against a
-    # control that misses by 5.0e-01 (tests/interfoam_sst_assembly_vs_openfoam.sh). No oracle here
-    # writes kEpsilon's assembled system, so that closure stays refused and this arm holds it; the
-    # bypass for its localisation is BRAE_KE_DIAG_LIMITED. An SST case reaching this refusal again --
-    # the two closures share the assembler -- fails the gate above, which runs one without a bypass.
+    # ...and `Gauss limitedLinear` for the CLOSURE, which RUNS now on BOTH closures. Each was lifted
+    # on its ASSEMBLED SYSTEM against OpenFOAM's own at the first closure call, because the fields of
+    # an interFoam RAS case cannot witness the scheme (one ulp of the initial omega is worth 4.3e-02
+    # after ten steps on RAS/waterChannel): kOmegaSST 3.4e-14 on the off-diagonals
+    # (tests/interfoam_sst_assembly_vs_openfoam.sh) and kEpsilon 3.6e-15 on this very tutorial
+    # (tests/interfoam_kepsilon_assembly_vs_openfoam.sh), each against a `Gauss upwind` control that
+    # misses by 5.0e-01 and 2.0e-01. A refusal coming back fails this arm.
     BASE="$BR"
-    arm device_limitedLinearTurb refused "limitedLinear"            "-device" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss limitedLinear 1;/; s/div(rhoPhi,epsilon) .*/div(rhoPhi,epsilon) Gauss limitedLinear 1;/' system/fvSchemes"
+    arm device_limitedLinearTurb runs    -                          "-device" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss limitedLinear 1;/; s/div(rhoPhi,epsilon) .*/div(rhoPhi,epsilon) Gauss limitedLinear 1;/' system/fvSchemes"
     BASE="$B"
     arm device_gradULimited runs    -                           "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
     BASE="$B"

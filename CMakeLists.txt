@@ -3512,6 +3512,12 @@ add_test(NAME interfoam_sst_assembly_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_sst_assembly_vs_openfoam.sh)
 set_tests_properties(interfoam_sst_assembly_vs_openfoam PROPERTIES LABELS slow)
 
+# ...and its kEpsilon twin, on RAS/damBreak, sharing the comparator (tests/assembly_compare.py). The
+# oracle had to reach interFoam's lineage first: tools/dumpKEpsilon registers the VoF-phase table now.
+add_test(NAME interfoam_kepsilon_assembly_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_kepsilon_assembly_vs_openfoam.sh)
+set_tests_properties(interfoam_kepsilon_assembly_vs_openfoam PROPERTIES LABELS slow)
+
 # ...whose first run found pressureInletOutletVelocity's snGrad() reading the stored value where
 # OpenFOAM's directionMixed builds it from the valueFraction and the cell. Held on its own here.
 add_executable(test_piov_sngrad tests/test_piov_sngrad.cu)

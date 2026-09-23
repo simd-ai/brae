@@ -217,126 +217,16 @@ runBrae()
     return 0
 }
 
-# compare <oracle case> <brae case> <arm> <expect: match|differ> <label>
+# compare <oracle case> <brae case> <arm> <expect: match|differ> <label> -- through the comparator
+# every assembly gate shares (tests/assembly_compare.py), so the rule about which rows carry the claim
+# is written once and cannot drift between the kOmegaSST gate and the kEpsilon one.
 compare()
 {
     local ofc="$W/$1" brc="$W/$2" arm="$3" expect="$4" label="$5"
-    local sub=host
-    [ "$arm" = device ] && sub=cuda
-    python3 - "$ofc/$END" "$brc/dump.$arm/$sub" "$ofc/constant/polyMesh" "$sub" "$expect" "$label" <<'PYEOF'
-import sys
-
-OFD, BRD, MESH, SUB, EXPECT, LABEL = sys.argv[1:7]
-MATCH_BOUND = 1e-10     # two orders above the worst measured agreement (8.0e-13)
-DIFFER_FLOOR = 1e-3     # two orders below the smallest control (1.2e-01)
-
-
-def ofField(p, n):
-    s = open(p).read()
-    i = s.index('internalField')
-    head = s[i:s.index('\n', i)]
-    if 'nonuniform' not in head and 'uniform' in head:
-        return [float(head.split('uniform')[1].strip().rstrip(';'))] * n
-    k = s.index('(', i)
-    return [float(x) for x in s[k + 1:s.index(')', k)].split()]
-
-
-def col(p):
-    return [float(x) for x in open(p).read().split()]
-
-
-def ofList(p):
-    s = open(p).read()
-    i = s.index('(', s.index('//'))
-    return [int(x) for x in s[i + 1:s.rindex(')')].split()]
-
-
-own = ofList(MESH + "/owner")
-nei = ofList(MESH + "/neighbour")
-nIf = len(nei)
-nC = max(own) + 1
-
-names = {"host": dict(U="omUpper", L="omLower", D="omD", S="omSrc",
-                      kU="kUpper", kL="kLower", kD="kD", kS="kSrc"),
-         "cuda": dict(U="omegaSysUpper", L="omegaSysLower", D="omegaSysD", S="omegaSysSrc",
-                      kU="kSysUpper", kL="kSysLower", kD="kSysD", kS="kSysSrc")}[SUB]
-
-of = {k: ofField(OFD + "/" + v, n) for k, v, n in
-      [("U", "stage_sstOmDUpper", nIf), ("L", "stage_sstOmDLower", nIf),
-       ("D", "stage_sstOmD", nC), ("S", "stage_sstOmSrc", nC),
-       ("kU", "stage_sstKDUpper", nIf), ("kL", "stage_sstKDLower", nIf),
-       ("kD", "stage_sstKD", nC), ("kS", "stage_sstKSrc", nC)]}
-br = {k: col(BRD + "/" + v) for k, v in names.items()}
-
-# a column of the wrong length is a vacuous comparison, not a pass
-for k, want in [("U", nIf), ("L", nIf), ("kU", nIf), ("kL", nIf),
-                ("D", nC), ("S", nC), ("kD", nC), ("kS", nC)]:
-    if len(br[k]) != want or len(of[k]) != want:
-        print("  FAIL: %s: %s has %d values against the mesh's %d"
-              % (LABEL, names[k], len(br[k]), want))
-        sys.exit(1)
-
-# the rows setValues eliminated: every off-diagonal touching them is exactly zero
-touch = {}
-for f, (o, n) in enumerate(zip(own, nei)):
-    touch.setdefault(o, []).append(f)
-    touch.setdefault(n, []).append(f)
-pinned = {c for c, fs in touch.items() if all(of["U"][f] == 0.0 and of["L"][f] == 0.0 for f in fs)}
-free = [c for c in range(nC) if c not in pinned]
-if not pinned or not free:
-    print("  FAIL: %s: %d pinned and %d free rows -- the split cannot be right"
-          % (LABEL, len(pinned), len(free)))
-    sys.exit(1)
-
-
-def rel(a, b, idx):
-    scale = max(abs(a[i]) for i in idx) or 1.0
-    return max(abs(a[i] - b[i]) for i in idx) / scale
-
-
-allf = range(nIf)
-d = {"omega upper": rel(of["U"], br["U"], allf),
-     "omega lower": rel(of["L"], br["L"], allf),
-     "k upper": rel(of["kU"], br["kU"], allf),
-     "k lower": rel(of["kL"], br["kL"], allf),
-     "omega D": rel(of["D"], br["D"], free),
-     "omega Src": rel(of["S"], br["S"], free),
-     "k D": rel(of["kD"], br["kD"], free),
-     "k Src": rel(of["kS"], br["kS"], free)}
-
-# the eliminated rows: what the solve reads there is Src/D, whatever the diagonal is
-worstValue = 0.0
-for i in pinned:
-    if of["D"][i] == 0.0 or br["D"][i] == 0.0:
-        continue
-    va, vb = of["S"][i] / of["D"][i], br["S"][i] / br["D"][i]
-    worstValue = max(worstValue, abs(va - vb) / max(abs(va), 1e-30))
-
-print("  %s: %s" % (LABEL, "  ".join("%s %.3e" % (k, v) for k, v in d.items())))
-print("     %d rows eliminated by setValues, their value %.3e; %d rows carry the scheme"
-      % (len(pinned), worstValue, len(free)))
-
-ok = True
-if EXPECT == "match":
-    for k, v in d.items():
-        if not (v < MATCH_BOUND):
-            print("  FAIL: %s: %s is %.3e, above %.1e" % (LABEL, k, v, MATCH_BOUND))
-            ok = False
-    if not (worstValue < MATCH_BOUND):
-        print("  FAIL: %s: an eliminated row's value is %.3e, above %.1e"
-              % (LABEL, worstValue, MATCH_BOUND))
-        ok = False
-else:
-    # the CONTROL. Only the parts that carry convection have to move; the eliminated rows do not
-    # carry it and do not move, which is why they are not what proves the scheme.
-    moved = max(d["omega upper"], d["omega lower"], d["k upper"], d["k lower"],
-                d["omega D"], d["omega Src"], d["k D"], d["k Src"])
-    if not (moved > DIFFER_FLOOR):
-        print("  FAIL: %s: the two schemes' systems differ by only %.3e -- this comparison cannot "
-              "witness the scheme, so the matching arms above prove nothing" % (LABEL, moved))
-        ok = False
-sys.exit(0 if ok else 1)
-PYEOF
+    local sub=host flavour=sstHost
+    [ "$arm" = device ] && { sub=cuda; flavour=sstCuda; }
+    python3 "$(dirname "$0")/assembly_compare.py" \
+        "$ofc/$END" "$brc/dump.$arm/$sub" "$ofc/constant/polyMesh" "$flavour" "$expect" "$label"
 }
 
 echo "== brae's kOmegaSST assembled system vs OpenFOAM's own, first closure call =="

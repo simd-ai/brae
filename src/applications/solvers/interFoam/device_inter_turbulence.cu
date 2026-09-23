@@ -701,26 +701,18 @@ void deviceCorrectInterTurbulence(
     // ...and the same for kEpsilon's device closure.
     kin.limitedLinear  = t.closureLimitedLinear;
     kin.limiterCoeff   = t.closureLimiterCoeff;
-    // ...and the same for kEpsilon's device closure, which is still REFUSED: the SST half was lifted
-    // by holding its assembled system against tools/dumpKOmegaSST's
-    // (tests/interfoam_sst_assembly_vs_openfoam.sh), and no oracle here writes kEpsilon's. The two
-    // closures share the assembler this gate exercises, so the scheme itself is very likely right --
-    // "very likely" is what a refusal is for. BRAE_KE_DIAG_LIMITED bypasses it for the localisation
-    // that will lift it, and says so on every run.
-    if (t.closureLimitedLinear && std::getenv("BRAE_KE_DIAG_LIMITED"))
-    {
-        std::printf("  *** BRAE_KE_DIAG_LIMITED: the device kEpsilon closure's `Gauss limitedLinear` "
-                    "refusal is BYPASSED. Nothing gates that closure's assembled system. Diagnostic "
-                    "only. ***\n");
-    }
-    if (t.closureLimitedLinear && !std::getenv("BRAE_KE_DIAG_LIMITED"))
-    {
-        kin.hasNonUpwindDivScheme = true;
-        kin.divSchemeUnsupported =
-            "Gauss limitedLinear on the device kEpsilon closure: ungated -- the SST closure runs it "
-            "and is gated on its assembled system against OpenFOAM's own "
-            "(tests/interfoam_sst_assembly_vs_openfoam.sh); no oracle writes kEpsilon's";
-    }
+    // ...and the same for kEpsilon's device closure, which RUNS it now too. It was refused as
+    // "ungated", and that is what it was: the kOmegaSST half was lifted on its assembled system and
+    // this half had no oracle at all, because tools/dumpKEpsilon registered only the compressible
+    // table and interFoam's RAS lineage is PhaseIncompressibleTurbulenceModel<transportModel>.
+    //
+    // WHAT LIFTED IT: tests/interfoam_kepsilon_assembly_vs_openfoam.sh, on RAS/damBreak with
+    // `Gauss limitedLinear 1` for div(rhoPhi,(k|epsilon)) -- this arm's assembled epsilon and k
+    // systems against OpenFOAM's own at the first closure call, 1.8e-15 on the off-diagonals and
+    // 1.3e-14 on the diagonals of the rows setValues leaves alive, as close as the host's own
+    // 1.8e-15 / 1.7e-14. Its controls are OpenFOAM's `Gauss upwind` system (missed by far more than
+    // the floor, both ways round) and this arm's own upwind against OpenFOAM's upwind, so the gap in
+    // the first is the LIMITER and not a broken upwind path.
 
     if (t.variableDensity)
     {

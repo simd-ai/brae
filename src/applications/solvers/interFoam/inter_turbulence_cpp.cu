@@ -891,12 +891,51 @@ void correctInterTurbulence(
     which.nSweeps = ks.nSweeps;
 
     kEpsilonRef::KEResiduals res;
+    // Instrument: BRAE_STAGE_DUMP_DIR=<dir> (+ BRAE_STAGE_DUMP_ITER=n, default 1) writes this
+    // closure's as-solved epsilon and k systems, at ONE call, under the SAME names the DEVICE closure
+    // writes through solveScalarEqn's dumpPrefix (kEpsilon.cu:1240) and the same names rhoSimpleFoam's
+    // host driver uses -- so the two arms' columns, and OpenFOAM's own from tools/dumpKEpsilon, diff
+    // directly. The latch is here and not in the closure because the capture already is
+    // (KEResiduals::captureStages); writing on every call is what left the SST dump comparing step ten
+    // against step one, so this one counts its calls.
+    struct KeDump
+    {
+        std::string dir;
+        bool on = false;
+        void scalars(const char* name, const std::vector<scalar>& v) const
+        {
+            if (!on) return;
+            std::ofstream o(dir + "/" + name);
+            o.precision(17);
+            for (const scalar x : v) o << x << "\n";
+        }
+    } kd;
+    if (const char* dd = std::getenv("BRAE_STAGE_DUMP_DIR"))
+    {
+        static int calls = 0;
+        const char* it = std::getenv("BRAE_STAGE_DUMP_ITER");
+        if (++calls == (it && *it ? std::atoi(it) : 1))
+        {
+            std::error_code ec;
+            std::filesystem::create_directories(dd, ec);
+            kd.dir = dd;
+            kd.on = !ec;
+        }
+    }
+    res.captureStages = kd.on;
     kEpsilonRef::correct(*in.U, t.k, t.epsilon, t.nut, *eqnFlux, scalar(0), m, g, patches,
                          t.epsRelaxFinal.factor, t.kRelaxFinal.factor, ks.tol, ks.relTol, ks.maxIter,
                          t.coeffs, &res, /*bounded=*/false, /*dropTerm=*/0, &comp, in.fvOptions,
                          t.epsRelaxFinal.on, t.kRelaxFinal.on, /*constrainBeforeWall=*/true,
                          t.closureLimitedLinear, t.closureLimiterCoeff, /*limGradK=*/scalar(0),
                          ks.minIter, &sel, /*linearUpwind=*/false, /*luGradK=*/scalar(0), &which);
+    if (kd.on)
+    {
+        kd.scalars("epsD", res.epsD);     kd.scalars("epsSrc", res.epsSrc);
+        kd.scalars("epsUpper", res.epsUpper); kd.scalars("epsLower", res.epsLower);
+        kd.scalars("kD", res.kD);         kd.scalars("kSrc", res.kSrc);
+        kd.scalars("kUpper", res.kUpper); kd.scalars("kLower", res.kLower);
+    }
     if (in.epsilonLog)
     {
         in.epsilonLog->push_back({res.epsPerf.initialResidual, res.epsPerf.finalResidual,
