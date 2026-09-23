@@ -715,5 +715,29 @@ else
     echo "  (no GPU: the -device arms are skipped)"
 fi
 
+# THE SOLVER'S OWN HEADER, held against these arms. braeInterFoam.cu tells a reader what `-device`
+# refuses; nine of its sentences said it refuses something it had run for units (LES, a cyclic, a
+# moving mesh, kOmegaSST, interfaceCompression, the leakage pair, limitedLinear, the non-orthogonal
+# corrections, nOuterCorrectors above 1). A paragraph that contradicts the code is worse than none --
+# a reader believes it and stops -- so the header carries the list between BEGIN/END markers and this
+# compares the two SETS. It runs with or without a GPU: it reads files, it does not run the solver.
+HDRFILE="$ROOT/src/applications/solvers/interFoam/braeInterFoam.cu"
+if [ -f "$HDRFILE" ]; then
+    claimed=$(awk '/BEGIN DEVICE REFUSALS/{f=1;next} /END DEVICE REFUSALS/{f=0} f' "$HDRFILE" \
+              | tr -s ' \n' '\n' | grep '^device_' | sort -u)
+    actual=$(awk '$1=="arm" && $2 ~ /^device/ && $3=="refused" {print $2}' "$0" | sort -u)
+    if [ "$claimed" = "$actual" ]; then
+        echo "  ok:   the solver header's device-refusal list is these arms ($(echo "$actual" | wc -w) of them)"
+    else
+        echo "  FAIL: braeInterFoam.cu's device-refusal list does not match this gate's arms"
+        echo "    in the header but not refused here: $(comm -23 <(echo "$claimed") <(echo "$actual") | tr '\n' ' ')"
+        echo "    refused here but not in the header: $(comm -13 <(echo "$claimed") <(echo "$actual") | tr '\n' ' ')"
+        fails=$((fails + 1))
+    fi
+else
+    echo "  FAIL: $HDRFILE is not where the header check expects it"
+    fails=$((fails + 1))
+fi
+
 echo "interfoam_refusals: $fails failures"
 [ $fails = 0 ]

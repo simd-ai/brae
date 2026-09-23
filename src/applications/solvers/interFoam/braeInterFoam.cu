@@ -13,8 +13,10 @@
 // WHAT IT RUNS TURBULENT: RAS kEpsilon, host and `-device`, in both of interFoam's lineages -- the
 // ordinary single-phase model, and under `density variable` the rho-weighted one
 // (inter_turbulence_cpp.cuh; device_inter_turbulence.cuh for what the device closure is handed).
-// And RAS kOmegaSST, on the HOST and in the ordinary lineage only: RAS/waterChannel, gated in
-// tests/interfoam_waterchannel_vs_openfoam.sh. `-device` refuses it by name.
+// And RAS kOmegaSST, host and `-device`, in the ordinary lineage: RAS/waterChannel, gated in
+// tests/interfoam_waterchannel_vs_openfoam.sh, and its ASSEMBLED SYSTEM against OpenFOAM's own in
+// tests/interfoam_sst_assembly_vs_openfoam.sh. Under `density variable` the SST is refused
+// (device_mangrove_rhoKE).
 // An earlier version of this header said interFoam's turbulence "is a MIXTURE model, not the
 // single-phase one brae has". That was written from memory and is wrong for 15 of the 17 turbulent
 // tutorials: incompressibleInterPhaseTransportModel.C:99-106 constructs the ordinary one by default.
@@ -40,21 +42,24 @@
 // movingWallVelocity walls, the relative flux, Uf and the old volumes where interFoam.C and pEqn.H
 // read them; CorrectPhi after every update under `correctPhi` (the default on a moving mesh) and at
 // the start of EVERY case (initCorrectPhi.H); a wave absorber on a moving mesh; and a CLOSED tank's
-// pressure reference (pRefCell or pRefPoint, pRefValue, adjustPhi). `-device` refuses a moving mesh
-// and a closed tank. Still refused by name: a cellZone or cellSet, every other motionSolver, a
+// pressure reference (pRefCell or pRefPoint, pRefValue, adjustPhi). `-device` RUNS the moving mesh too
+// (device_moving, device_moving_gamg, device_moving_SST) and refuses the closed tank (device_closed)
+// and a permeable wall on a moving mesh (device_permeable_moving). Still refused by name: a cellZone or cellSet, every other motionSolver, a
 // turbulent case on a moving mesh, points0, and a restart of a moved mesh. testTubeMixer, the five
 // sloshing tanks and the five waveMakers run -- waveMakerPiston and waveMakerFlap gated with their
 // pressure solves converged, and the two multi-paddle ones approximating p_rgh under a notice, since
 // their `p_rgh { $pcorr; }` names a pattern-keyed entry brae's dictionary expansion does not resolve.
 //
-// AND `Gauss interfaceCompression` on the alpha fluxes, on the host: the PhiScheme four waveMakers name
-// for div(phirb,alpha). `-device` refuses it.
+// AND `Gauss interfaceCompression` on the alpha fluxes, on BOTH paths: the PhiScheme four waveMakers
+// name for div(phirb,alpha) -- two cell values and no gradient, so it carries onto the device whole.
 //
 // AND THE CASE'S NON-ORTHOGONAL CORRECTIONS, on the host: `corrected` and `limited` laplacians and
 // snGrads on a mesh that is not orthogonal (the tanks' 44 degrees), through the pressure equation,
 // the viscous term and the three snGrads. `uncorrected` on such a mesh is refused, and so is every
-// gradSchemes entry but `Gauss linear` -- gradSchemes were not read at all before. `-device` refuses a
-// correction that is not zero.
+// gradSchemes entry but `Gauss linear` -- gradSchemes were not read at all before. `-device` RUNS the
+// corrections (device_sheared_corrected) and refuses the same two: `uncorrected` on a sheared mesh
+// (device_sheared_uncorrected) and a leastSquares or cellLimited gradient (device_gradLsq,
+// device_gradNHat).
 //
 // AND div(rhoPhi,U) AS THE CASE NAMES IT, on both paths: upwind, linear, linearUpwind, linearUpwindV,
 // limitedLinearV, LUST and vanLeerV -- the last the V-limited vanLeer the closed-tank tutorials use.
@@ -67,11 +72,14 @@
 // OpenFOAM. Refused by name across a cyclic: GAMG and PBiCGStab, a momentum predictor, every
 // div(rhoPhi,U) scheme but upwind and linearUpwind, interfaceCompression, a moving mesh, MRF, fvOptions,
 // waves, kOmegaSST, a pair that is rotational or not orthogonal, and cyclicAMI/ACMI/processor patches.
-// `-device` refuses any cyclic, naming the patch.
+// `-device` RUNS the pair too -- validation/interFoamCyclic holds both arms against OpenFOAM
+// (tests/interfoam_cyclic_vs_openfoam.sh), and device_baffle/device_baffle_SST/device_les_cyclic hold
+// the baffle. What is refused across a pair is refused on both paths, by the list above.
 //
 // AND LES kEqn, on the host: the uniform lineage, with the cubeRootVol or smooth filter width, on an
 // axisymmetric wedge -- whose host matrix coefficients and gradient patch value it took to get there.
-// tests/interfoam_les_vs_openfoam.sh holds LES/nozzleFlow2D against OpenFOAM; `-device` refuses LES.
+// tests/interfoam_les_vs_openfoam.sh holds LES/nozzleFlow2D against OpenFOAM, on BOTH arms (device_les)
+// -- the wedge took three device defects of its own to get there.
 //
 // AND the CrankNicolson ddt scheme, on BOTH loops -- the momentum equation, ddtCorr and the kEpsilon
 // closure under it, alphaEqn.H's own off-centred flux and end-of-step un-blend, on a mesh that does not
@@ -85,18 +93,22 @@
 //
 // AND a coincident cyclicACMI pair, on the host -- a createBaffles baffle whose `scale` (a constant, a
 // table or a coded per-face PatchFunction1) opens and shuts faces with time: RAS/damBreakLeakage, held by
-// tests/interfoam_leakage_vs_openfoam.sh. `-device` refuses it by name.
+// tests/interfoam_leakage_vs_openfoam.sh, on both arms (device_leak). Its EXPLICIT MULES branch is
+// refused on the device (device_leak_explicit).
 //
 // AND `Gauss limitedLinear` on div(rhoPhi,U), on the host: one magSqr limiter per face, as OpenFOAM's
 // vector form has it. tests/interfoam_limitedlinear_vs_openfoam.sh holds eulerianInjection against
-// OpenFOAM; `-device` refuses it.
+// OpenFOAM, on both arms (device_limitedLinear) -- the device branch accumulated magSqr(U) into a pool
+// block resize() had not zeroed until that arm was lifted.
 //
 // WHAT IT WILL NOT RUN. Every refusal the components carry is in force: every LESModel but kEqn, every
-// RASModel but
-// kEpsilon and kOmegaSST,
-// any ddtSchemes default but Euler, every fvOption but explicitPorositySource/DarcyForchheimer (host
-// only: tests/interfoam_angledduct_vs_openfoam.sh), MRF on the device or beside a moving mesh, RAS or a
-// fixedFluxPressure patch (the host runs it otherwise: tests/interfoam_mrf_vs_openfoam.sh), and a case that
+// RASModel but kEpsilon and kOmegaSST, any ddtSchemes default but Euler and CrankNicolson (the second
+// on both loops now -- tests/interfoam_cn_vs_openfoam.sh, device_cn), every fvOption but
+// explicitPorositySource/DarcyForchheimer (host only: tests/interfoam_angledduct_vs_openfoam.sh) and
+// the two mangrove sources (both loops), MRF beside a moving mesh, RAS or a
+// fixedFluxPressure patch -- BOTH loops run it otherwise, all four of interFoam's MRF calls
+// (tests/interfoam_mrf_vs_openfoam.sh holds laminar/mixerVessel2D on the host arm and the device arm
+// at the same bounds) -- and a case that
 // omits nAlphaCorr, nAlphaSubCycles, cAlpha, maxAlphaCo or -- under MULESCorr -- nLimiterIter. Each
 // throws by name.
 //
@@ -104,10 +116,24 @@
 // and a moving or refining mesh was not even named. brae was run over all 44 shipped tutorials and the
 // ones that reached `End:` were counted -- two did that should not have, both on `dynamicRefineFvMesh`.
 // Also refused now: any `dynamicFvMesh` but staticFvMesh and the solid-body motion above, a dictionary-form `sigma` and a
-// missing one (both used to become ZERO surface tension), a setTimeStep function object, and on
-// `-device` nOuterCorrectors above 1 and nNonOrthogonalCorrectors above 0, which that loop does not run.
+// missing one (both used to become ZERO surface tension), and a setTimeStep function object. The
+// device loop runs nOuterCorrectors above 1 and nNonOrthogonalCorrectors above 0 now (device_nOuter2,
+// device_nNonOrth1); it used to refuse both.
 // tests/interfoam_refusals.sh holds every one of them, each beside the form OpenFOAM treats as nothing
 // -- `staticFvMesh`, `active no` -- which must still RUN.
+//
+// WHAT `-device` REFUSES, by the arm that holds each one. This list is CHECKED: interfoam_refusals.sh
+// compares it against its own `device_*` arms and fails if the two disagree, so a refusal that is
+// lifted or added without editing this header stops the gate. Nine of the sentences above said
+// `-device` refuses something it had run for units -- LES, a cyclic, a moving mesh, kOmegaSST,
+// interfaceCompression, the leakage pair, limitedLinear, the non-orthogonal corrections,
+// nOuterCorrectors above 1 -- which is why the list is machine-checked rather than described.
+//
+// BEGIN DEVICE REFUSALS
+//   device_alphaMinIter device_closed device_frozenFlow device_gamg_smootherDILU device_gradLsq
+//   device_gradNHat device_leak_explicit device_mangrove_rhoKE device_mesh_dynamic
+//   device_permeable_moving device_ras_otherModel device_sheared_uncorrected device_Uflux_rhoPhi
+// END DEVICE REFUSALS
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
