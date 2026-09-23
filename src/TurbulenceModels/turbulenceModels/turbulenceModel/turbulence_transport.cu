@@ -154,12 +154,14 @@ void assembleScalarTransport(
         return *grads.back();
     };
 
+    // 2/max(k,SMALL), once: the internal faces and the pair's own faces must limit with the SAME
+    // number, and computing it twice is how they would drift.
+    const scalar twoByk = scalar(2) / std::fmax(sc.limiterCoeff, scalar(1e-15));
     if (sc.limitedLinear)
     {
         // The limiter's gradient takes the case's OWN gradScheme for this field -- OpenFOAM builds it
         // through fvc::grad(lPhi) (LimitedScheme.C:56-59), not through a scheme the closure chooses.
         const FieldGrad& g = fieldGrad(sc.limGradLeastSq, sc.limGradK);
-        const scalar twoByk = scalar(2) / std::fmax(sc.limiterCoeff, scalar(1e-15));
         deviceDivLimitedCoeffs(dm, *sc.phiInt, field, g.gx, g.gy, g.gz, twoByk,
                                M.diag, M.upper, M.lower);
 
@@ -229,19 +231,67 @@ void assembleScalarTransport(
                 "two cells' -- so the face array cannot stand in for the first, and the equation's own "
                 "flux on those faces is not the internal-face array.");
         }
-        // THE PAIR TAKES UPWIND'S WEIGHT, so a case whose div scheme is not upwind is refused rather
-        // than run with one scheme inside and another across the pair. deviceCyclicLimitedWeights
-        // exists for the alpha flux and would serve here; nothing has needed it yet.
-        if (sc.limitedLinear || sc.linearUpwind)
+        // THE PAIR TAKES THE CASE'S OWN WEIGHT. OpenFOAM's weights are a surfaceScalarField and a
+        // coupled patch takes its boundaryField (gaussConvectionScheme.C:105-108); the limiter there is
+        // the same limiter with the patch's two sides, which deviceCyclicLimitedWeights builds from the
+        // interface's own neighbour values -- the same call device_scalar_transport.cuh:421 has always
+        // made on the legacy path. Null stays upwind, which is what pos0(phi) IS.
+        //
+        // `linearUpwind` is still refused: its WEIGHTS are upwind's, but its explicit correction
+        // (deviceLinearUpwindCorr) is built on internal faces only, so the pair would carry the
+        // implicit half of the scheme and not the other.
+        if (sc.linearUpwind)
         {
             throw std::runtime_error(
                 "brae turbulence transport: the mesh has a periodic pair and the case's div scheme for "
-                "this field is not upwind. The pair's interface coefficient is built with upwind's "
-                "weight, so running it would put one scheme on the internal faces and another across "
-                "the pair. The host closure carries the case's scheme on both.");
+                "this field is `Gauss linearUpwind`. Its weights across the pair are upwind's, which is "
+                "right, but its explicit correction is assembled on the internal faces only -- so the "
+                "pair would get half the scheme. limitedLinear IS carried across the pair.");
         }
-        deviceCyclicAssembleMomentum(*sc.cyc, *sc.gammaCell, M.diag, /*wsch=*/nullptr,
+        // ...AND IT RUNS ON THIS ARM, gated on the system it assembles. The fixture's ten-step FIELDS
+        // cannot witness it: at t = 0 this case's k and omega are uniform, NVDTVD's `gradf` is a
+        // cancellation on every face, and the two arms then differ on 4 of 40 pair faces by up to 0.5 --
+        // the last bit deciding the scheme, worth nut 7.1e-04 downstream. From a SPUN-UP field the
+        // question is answerable and answered: MEASURED on validation/interFoamCyclic, host arm against
+        // device arm at the first closure call, internal-face off-diagonals 1.3e-10 relative, the PAIR's
+        // own off-diagonal 1.7e-10 (negated: brae applies it as Apsi[own] += ifCoeff*psi[nbr] where
+        // OpenFOAM keeps boundaryCoeffs), D and Src identical on every row setValues does not pin, and
+        // the four it does pin holding the same value. The host arm is OpenFOAM's on fields (2.0e-13).
+        //
+        // tests/interfoam_cyclic_vs_openfoam.sh's `assembly` arm holds it, with the device's own UPWIND
+        // run of the same fixture as the control that must miss.
+        DeviceBuffer<scalar> ifWsch;
+        const DeviceBuffer<scalar>* wsch = nullptr;
+        if (sc.limitedLinear)
+        {
+            // the limiter with the PAIR's own two sides, from the same gradient the internal faces
+            // limited with (deviceCyclicLimitedWeights, device_cyclic.cu -- the call the legacy
+            // scalar transport has always made)
+            const FieldGrad& g = fieldGrad(sc.limGradLeastSq, sc.limGradK);
+            deviceCyclicLimitedWeights(*sc.cyc, field, g.gx, g.gy, g.gz, twoByk, ifWsch);
+            wsch = &ifWsch;
+        }
+        if (sc.dump && sc.dump->scalars && ifWsch.size())
+        {
+            sc.dump->scalars(sc.dump->ctx, "CycW", ifWsch.host());
+            sc.dump->scalars(sc.dump->ctx, "CycPhi", sc.cyc->phi.host());
+            sc.dump->scalars(sc.dump->ctx, "CycCd",  sc.cyc->weights.host());
+            // the two sides' FIELD values and the delta, per interface entry: the limiter's inputs
+            {
+                const std::vector<label> own = sc.cyc->ownCell.host();
+                const std::vector<label> nbr = sc.cyc->nbrCell.host();
+                const std::vector<scalar> fh = field.host();
+                std::vector<scalar> fo(own.size()), fn(own.size());
+                for (std::size_t j = 0; j < own.size(); ++j)
+                { fo[j] = fh[own[j]]; fn[j] = fh[nbr[j]]; }
+                sc.dump->scalars(sc.dump->ctx, "CycFOwn", fo);
+                sc.dump->scalars(sc.dump->ctx, "CycFNbr", fn);
+                sc.dump->scalars(sc.dump->ctx, "CycDX", sc.cyc->dX.host());
+            }
+        }
+        deviceCyclicAssembleMomentum(*sc.cyc, *sc.gammaCell, M.diag, wsch,
                                      sc.correctedLaplacian, sc.cycPhi);
+
     }
 
     // - fvm::laplacian(gamma, field).
@@ -434,6 +484,12 @@ void solveScalarEqn(
     dump("Upper", M.upper);
     dump("Lower", M.lower);
     dump("SolveIn", field);
+    // ...and the PAIR's off-diagonal, HERE and not at the assembly: setValues zeroes the interface
+    // coefficient of every row it pins, and the host's capture is taken after it. Dumped before, the
+    // two columns differ on exactly the wall-function rows -- which is a difference in the instrument,
+    // not in the system, and cost an afternoon once already (the omega pair read 1.3e-04 against the
+    // host while k, which has no pinned rows, read 6.6e-14).
+    if (cyc && cyc->n > 0) dump("Ifc", cyc->ifCoeff);
 
     // the ones vector kept across calls (item 63) and the normFactor kept on the device (item 66)
     DeviceBuffer<scalar> dnf;

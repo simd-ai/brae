@@ -149,6 +149,25 @@ std::vector<scalar> limitedLinearWeightsCoupled(
     const std::vector<vector>& gN,    // grad's patchNeighbourField (rotated when the patch transforms)
     scalar                     k);
 
+// ...and the whole boundaryField of the scheme's weights, patch by patch, which is what
+// gaussConvectionScheme::fvmDiv hands fvm::div for a COUPLED patch (gaussConvectionScheme.C:105-108).
+// Uncoupled patches get an empty entry: their coefficients come from the field's own
+// valueInternalCoeffs/valueBoundaryCoeffs, which take no weight.
+//
+// It exists so the two closures (and any other caller of fvm::div with weights) share ONE assembly of
+// the coupled side. Doing it at each call site is how a scheme ends up carried on one path and not the
+// other -- which is exactly what this function is fixing: a limited div scheme on a mesh with a pair
+// was refused outright, because the pair's coefficient was only ever built with upwind's weight.
+//
+// A ROTATIONAL pair would need the neighbour's GRADIENT rotated (patchNeighbourField transforms a
+// vector); brae refuses one before this is reached, and this asserts nothing about it.
+std::vector<std::vector<scalar>> limitedLinearPatchWeights(
+    const std::vector<std::vector<scalar>>& phiBoundary,
+    const std::vector<scalar>&              vf,        // the CELL values
+    const std::vector<vector>&              gradVf,    // the limiter's gradient, per cell
+    scalar                                  k,
+    const std::vector<FvPatch>&             patches);
+
 // The V form. gP/gN use OPENFOAM's packing, gradc_ij = d(U_j)/d(x_i) -- see detail::rVector.
 std::vector<scalar> limitedLinearVWeightsCoupled(
     const std::vector<scalar>& phi,

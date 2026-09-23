@@ -449,7 +449,15 @@ FvMatrix<T> div(
     const GeometricField<T>& vf,
     const std::vector<scalar>& weights,
     const PrimitiveMesh& m,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    // THE SCHEME'S WEIGHTS ON EACH PATCH. OpenFOAM's weights are a surfaceScalarField and
+    // gaussConvectionScheme::fvmDiv reads its boundaryField per patch (gaussConvectionScheme.C:105-108,
+    // `const fvsPatchScalarField& pw = weights.boundaryField()[patchi]`), which a coupled patch fills
+    // from its own two sides. `weights` above is the internal faces only, so a coupled patch needs this
+    // as well; null (or an empty entry) means the caller has none, and a coupled patch is then refused
+    // rather than given upwind's. Uncoupled patches ignore it -- their coefficients come from the
+    // field's own valueInternalCoeffs/valueBoundaryCoeffs, which take no weight.
+    const std::vector<std::vector<scalar>>* patchWeights = nullptr)
 {
     const label nC  = m.nCells();
     const label nIf = m.nInternalFaces();
@@ -480,14 +488,28 @@ FvMatrix<T> div(
         M.boundaryCoeffs[pi].resize(fp.size);
         if (fp.coupled)
         {
-            // gaussConvectionScheme::fvmDiv gives a coupled patch the SCHEME's weights on it
-            // (valueInternalCoeffs(w) = w, valueBoundaryCoeffs(w) = 1 - w), and `weights` here holds the
-            // internal faces only. upwind's are known without them -- the overload below -- and any
-            // other scheme's are not carried yet.
-            throw std::runtime_error(
-                "brae: fvm::div with a limited or linear scheme's face weights does not carry them onto "
-                "the coupled patch '" + fp.name + "'. Only upwind-weighted convection (upwind, "
-                "linearUpwind) is ported across a coupled patch.");
+            // coupledFvPatchField::valueInternalCoeffs(w) = w and valueBoundaryCoeffs(w) = 1 - w
+            // (coupledFvPatchField.C:157-174), which fvmDiv multiplies by +patchFlux and -patchFlux.
+            // The weight is the SCHEME's on this patch -- for upwind it is pos0(phi) and the overload
+            // below knows it without being told; for a limited scheme it is the limiter evaluated with
+            // the patch's own two sides, which only the caller can compute.
+            if (!patchWeights || pi >= patchWeights->size()
+                || (*patchWeights)[pi].size() != static_cast<std::size_t>(fp.size))
+            {
+                throw std::runtime_error(
+                    "brae: fvm::div was given a scheme's INTERNAL face weights and no weights for the "
+                    "coupled patch '" + fp.name + "'. OpenFOAM's weights are a surfaceScalarField and "
+                    "its boundaryField is what a coupled patch takes (gaussConvectionScheme.C:105-108); "
+                    "using upwind's there would run one scheme inside and another across the pair.");
+            }
+            for (label i = 0; i < fp.size; ++i)
+            {
+                const scalar pf = phiBoundary[pi][i];
+                const scalar w  = (*patchWeights)[pi][static_cast<std::size_t>(i)];
+                M.internalCoeffs[pi][i] = (pf * w) * tUniform<T>(1);
+                M.boundaryCoeffs[pi][i] = (-(pf * (scalar(1) - w))) * tUniform<T>(1);
+            }
+            continue;
         }
         for (label i = 0; i < fp.size; ++i)
         {

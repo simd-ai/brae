@@ -66,6 +66,36 @@ std::vector<scalar> limitedLinearWeights(
 }
 
 
+std::vector<std::vector<scalar>> limitedLinearPatchWeights(
+    const std::vector<std::vector<scalar>>& phiBoundary,
+    const std::vector<scalar>&              vf,
+    const std::vector<vector>&              gradVf,
+    scalar                                  k,
+    const std::vector<FvPatch>&             patches)
+{
+    std::vector<std::vector<scalar>> out(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& fp = patches[pi];
+        if (!fp.coupled || fp.size == 0) continue;
+        const std::size_t n = static_cast<std::size_t>(fp.size);
+        std::vector<scalar> vfP(n), vfN(n);
+        std::vector<vector> gP(n), gN(n);
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const label c = fp.faceCells[i];
+            vfP[i] = vf[static_cast<std::size_t>(c)];
+            vfN[i] = patchNeighbourValue(fp, static_cast<label>(i), vf);
+            gP[i]  = gradVf[static_cast<std::size_t>(c)];
+            gN[i]  = patchNeighbourValue(fp, static_cast<label>(i), gradVf);
+        }
+        out[pi] = limitedLinearWeightsCoupled(phiBoundary[pi], fp.weights, fp.delta,
+                                              vfP, vfN, gP, gN, k);
+    }
+    return out;
+}
+
+
 std::vector<scalar> vanLeerWeights(
     const std::vector<scalar>&    phi,
     const GeometricField<scalar>& vf,

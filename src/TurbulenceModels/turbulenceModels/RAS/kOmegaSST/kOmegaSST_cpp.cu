@@ -159,7 +159,40 @@ FvScalarMatrix divWithScheme(
         sd->scalars((t + "AsmDY").c_str(), dy);
         sd->scalars((t + "AsmDZ").c_str(), dz);
     }
-    return fvm::div(phi.internal, phi.boundary, vf, w, m, patches);
+    // ...and the coupled patches' own weights, from the same limiter with the patch's two sides
+    // (gaussConvectionScheme.C:105-108). fvm::div refuses a pair without them.
+    const std::vector<std::vector<scalar>> pw =
+        ls::limitedLinearPatchWeights(phi.boundary, vf.internal, gradVf, limiterCoeff, patches);
+    if (sd && sd->on)
+    {
+        std::vector<scalar> flat, fphi, fcd;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (!patches[pi].coupled) continue;
+            flat.insert(flat.end(), pw[pi].begin(), pw[pi].end());
+            fphi.insert(fphi.end(), phi.boundary[pi].begin(), phi.boundary[pi].end());
+            fcd.insert(fcd.end(), patches[pi].weights.begin(), patches[pi].weights.end());
+        }
+        sd->scalars((std::string(pre) + "CycW").c_str(), flat);
+        sd->scalars((std::string(pre) + "CycPhi").c_str(), fphi);
+        sd->scalars((std::string(pre) + "CycCd").c_str(), fcd);
+        std::vector<scalar> fo, fn, fdx;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const FvPatch& fp = patches[pi];
+            if (!fp.coupled) continue;
+            for (label i = 0; i < fp.size; ++i)
+            {
+                fo.push_back(vf.internal[static_cast<std::size_t>(fp.faceCells[i])]);
+                fn.push_back(patchNeighbourValue(fp, i, vf.internal));
+                fdx.push_back(fp.delta[i].x);
+            }
+        }
+        sd->scalars((std::string(pre) + "CycFOwn").c_str(), fo);
+        sd->scalars((std::string(pre) + "CycFNbr").c_str(), fn);
+        sd->scalars((std::string(pre) + "CycDX").c_str(), fdx);
+    }
+    return fvm::div(phi.internal, phi.boundary, vf, w, m, patches, &pw);
 }
 
 
@@ -334,7 +367,10 @@ void captureSSTSystem(
     std::vector<scalar>&        D,
     std::vector<scalar>&        S,
     std::vector<scalar>*        up = nullptr,
-    std::vector<scalar>*        lo = nullptr)
+    std::vector<scalar>*        lo = nullptr,
+    // the COUPLED patches' boundaryCoeffs, flattened in patch order: the pair's off-diagonal, which
+    // is where a div scheme reaches the interface
+    std::vector<scalar>*        ifc = nullptr)
 {
     if (up) *up = M.upper;
     if (lo) *lo = M.lower;
@@ -345,11 +381,24 @@ void captureSSTSystem(
         {
             const label c = patches[pi].faceCells[i];
             D[c] += M.internalCoeffs[pi][i];
-            // a coupled patch's boundaryCoeffs are INTERFACE coefficients, not a source: the solver
-            // multiplies them by the neighbour's psi every sweep. Folded in here they would be a
-            // constant built from the psi the matrix was assembled at.
-            S[c] += M.boundaryCoeffs[pi][i];
+            // A COUPLED PATCH'S boundaryCoeffs ARE NOT A SOURCE: the solver multiplies them by the
+            // NEIGHBOUR's psi every sweep, so folding them in here makes a constant out of the psi the
+            // matrix happened to be assembled at -- and the device arm cannot do the same, because its
+            // pair lives in cyc.ifCoeff and never reaches the boundary arrays deviceFold walks. The two
+            // arms' source columns would then differ on every coupled face by construction, which is a
+            // difference in the INSTRUMENT and not in the system. They are reported on their own
+            // instead (`ifc` below), which is also the column that carries the div scheme across a pair.
+            if (!patches[pi].coupled) S[c] += M.boundaryCoeffs[pi][i];
         }
+    if (ifc)
+    {
+        ifc->clear();
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (!patches[pi].coupled) continue;
+            ifc->insert(ifc->end(), M.boundaryCoeffs[pi].begin(), M.boundaryCoeffs[pi].end());
+        }
+    }
 }
 
 }
@@ -855,7 +904,8 @@ void correct(
         if (relaxEquationOmega) relaxMatrix(M, omega, m, patches, relaxOmega);
         setValues(M, omega.internal, m, patches, wallCells, omVals);
         if (res && res->captureStages)
-            captureSSTSystem(M, patches, res->omD, res->omSrc, &res->omUpper, &res->omLower);
+            captureSSTSystem(M, patches, res->omD, res->omSrc, &res->omUpper, &res->omLower,
+                             &res->omIfc);
         // ...and WRITTEN HERE, at the call the stage dump latched, not at every call from the driver.
         // The driver's own write overwrote its files on every closure call, so a ten-step run left the
         // system of step TEN beside device columns latched at step ONE: the comparison then reported
@@ -864,6 +914,7 @@ void correct(
         {
             sd.scalars("omD", res->omD);       sd.scalars("omSrc", res->omSrc);
             sd.scalars("omUpper", res->omUpper); sd.scalars("omLower", res->omLower);
+            sd.scalars("omIfc", res->omIfc);
             sd.scalars("omD0", res->omD0);     sd.scalars("omSrc0", res->omSrc0);
         }
         const SolverPerformance po = solveScalar(M, omega.internal);
@@ -989,11 +1040,13 @@ void correct(
             captureSSTSystem(M, patches, res->kD0, res->kSrc0);
         if (relaxEquationK) relaxMatrix(M, k, m, patches, relaxK);
         if (res && res->captureStages)
-            captureSSTSystem(M, patches, res->kD, res->kSrc, &res->kUpper, &res->kLower);
+            captureSSTSystem(M, patches, res->kD, res->kSrc, &res->kUpper, &res->kLower,
+                             &res->kIfc);
         if (sd.on && res)
         {
             sd.scalars("kD", res->kD);       sd.scalars("kSrc", res->kSrc);
             sd.scalars("kUpper", res->kUpper); sd.scalars("kLower", res->kLower);
+            sd.scalars("kIfc", res->kIfc);
         }
         const SolverPerformance pk = solveScalar(M, k.internal);
         if (res)

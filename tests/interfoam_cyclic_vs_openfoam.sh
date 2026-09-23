@@ -86,6 +86,11 @@
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_cyclic_vs_openfoam"
+# ...and the SOLVER itself, which the assembled-system arm at the end runs twice per case (the test
+# binary drives its own two arms in one process and cannot dump them into separate directories)
+BIN_SOLVER="${BUILD:-$ROOT/build}/brae_interFoam"
+HAVE_GPU=0
+command -v nvidia-smi > /dev/null 2>&1 && nvidia-smi > /dev/null 2>&1 && HAVE_GPU=1
 OFBASHRC=${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
 SRC="$ROOT/validation/interFoamCyclic"
 STEPS=${STEPS:-10}
@@ -193,6 +198,13 @@ PYEOF
         grep -q "CrankNicolson 0.9" "$C/system/fvSchemes" \
             || { echo "FAIL: the $profile profile did not set CrankNicolson"; return 1; }
     fi
+    # `Gauss limitedLinear 1` for div(phi,k) and div(phi,omega) ACROSS THE PAIR. OpenFOAM's weights
+    # are a surfaceScalarField and a coupled patch takes its boundaryField
+    # (gaussConvectionScheme.C:105-108); brae refused the combination outright until the limiter was
+    # carried onto the pair on both arms, because the interface coefficient was built with upwind's
+    # weight whatever the case said.
+    export CLOSUREDIV="Gauss upwind"
+    [ "${profile#sstLimDiv}" != "$profile" ] && export CLOSUREDIV="Gauss limitedLinear 1"
     if [ "$profile" = sst ] || [ "$profile" = sstWalls ] || [ "$profile" = sstCN ] \
     || [ "${profile#sstLim}" != "$profile" ] \
     || [ "$profile" = les ] || [ "$profile" = lesWalls ] || [ "$profile" = lesCN ]; then
@@ -222,8 +234,9 @@ else:
     sub(tp, r'simulationType\s+laminar;',
         'simulationType  RAS;\n\nRAS\n{\n    RASModel        kOmegaSST;\n    turbulence      on;\n}')
 sc = os.path.join(d, 'system/fvSchemes')
+div = os.environ.get('CLOSUREDIV', 'Gauss upwind')
 sub(sc, r'(\s+div\(phi,alpha\)[^\n]*\n)',
-    r'\1    "div\\(phi,(k|omega)\\)"  Gauss upwind;\n')
+    r'\1    "div\\(phi,(k|omega)\\)"  ' + div + ';\n')
 if not les:
     open(sc, 'a').write('\nwallDist\n{\n    method meshWave;\n}\n')
 fs = os.path.join(d, 'system/fvSolution')
@@ -249,7 +262,7 @@ PYEOF
         grep -q "type cyclic" "$C/0/k" \
             || { echo "FAIL: the $profile profile did not give k the pair"; return 1; }
     fi
-    if [ "${profile#sstLim}" != "$profile" ]; then
+    if [ "${profile#sstLim}" != "$profile" ] && [ "${profile#sstLimDiv}" = "$profile" ]; then
         # A CELL-LIMITED GRADIENT ACROSS THE PAIR. `cellLimited Gauss linear 1` on grad(k) and
         # grad(omega) reaches the closure at TWO sites, and both were built without the interface:
         #   * CDkOmega takes fvc::grad(k) & fvc::grad(omega) (kOmegaSSTBase.C:555-558), and F1 blends
@@ -279,7 +292,8 @@ PYEOF
     fi
     if [ "$profile" = walls ] || [ "$profile" = explicitWalls ] \
     || [ "$profile" = sstWalls ] || [ "$profile" = lesWalls ] \
-    || [ "$profile" = sstLimWalls ] || [ "$profile" = sstLimUWalls ]; then
+    || [ "$profile" = sstLimWalls ] || [ "$profile" = sstLimUWalls ] \
+    || [ "$profile" = sstLimDivWalls ]; then
         # THE CONTROL: the pair replaced by two walls, in the mesh AND in every field that names it.
         # blockMesh numbers the cells from the block, so the two runs' cells are the same cells.
         sed -i 's/type cyclic; neighbourPatch right;/type wall;/; s/type cyclic; neighbourPatch left; */type wall;/' \
@@ -342,7 +356,8 @@ PYEOF
 }
 
 for p in cyclic walls explicitMules explicitWalls jump outer outerControl \
-         sst sstWalls les lesWalls sstCN lesCN sstLim sstLimWalls sstLimU sstLimUWalls; do
+         sst sstWalls les lesWalls sstCN lesCN sstLim sstLimWalls sstLimU sstLimUWalls \
+         sstLimDiv sstLimDivWalls; do
     stage "$p" || { echo "interfoam_cyclic_vs_openfoam: staging failed"; exit 1; }
 done
 
@@ -391,9 +406,90 @@ rc=0
 # grad(omega) (the limiter's range). Its control is the same case with the pair two walls.
 "$BIN" "$W/sstLim" "$W/sstLim/0" "$W/sstLim/$END" "$STEPS" \
        "$W/sstLim/log.interFoam" "$W/sstLimWalls/$END" sstLim || rc=1
+# ...and the limited DIV SCHEME across the pair, which is a different thing from the limited gradient
+# above: `Gauss limitedLinear 1` on div(phi,k) and div(phi,omega). OpenFOAM computes the scheme's
+# weights as a surfaceScalarField and a coupled patch takes its boundaryField
+# (gaussConvectionScheme.C:105-108, `const fvsPatchScalarField& pw = weights.boundaryField()[patchi]`),
+# with coupledFvPatchField's valueInternalCoeffs(w) = w and valueBoundaryCoeffs(w) = 1 - w. brae had
+# neither half: fvm::div threw on a coupled patch the moment it was given a scheme's weights, and the
+# device assembler refused the combination by name -- so a case naming the scheme could not run at all
+# on a mesh with a pair. Its control is the same case with the pair two walls.
+"$BIN" "$W/sstLimDiv" "$W/sstLimDiv/0" "$W/sstLimDiv/$END" "$STEPS" \
+       "$W/sstLimDiv/log.interFoam" "$W/sstLimDivWalls/$END" sstLimDiv || rc=1
 # ...and the same with grad(U) limited too, HOST ONLY: the device momentum's limiter does not carry
 # the pair and refuses by name (armed in tests/interfoam_refusals.sh).
 "$BIN" "$W/sstLimU" "$W/sstLimU/0" "$W/sstLimU/$END" "$STEPS" \
        "$W/sstLimU/log.interFoam" "$W/sstLimUWalls/$END" sstLimU || rc=1
+# ...AND THE ASSEMBLED SYSTEM ACROSS THE PAIR, host arm against device arm, at the first closure call.
+#
+# WHY NOT AGAINST OPENFOAM DIRECTLY, as the waterChannel and damBreak assembly gates are: OpenFOAM's
+# instrument writes the internal faces and the folded boundary, and a coupled patch's coefficient is
+# neither -- it lives in boundaryCoeffs and is multiplied by the NEIGHBOUR's psi every sweep. The chain
+# here is the host arm == OpenFOAM (the sstLimDiv arm above, fields at 2.0e-13) plus the device arm ==
+# the host arm (this).
+#
+# WHY FROM A SPUN-UP FIELD: at t = 0 this fixture's k and omega are uniform, so NVDTVD's `gradf` is a
+# cancellation on every face and the limiter is decided by the last bit -- the two arms then differ on
+# 4 of 40 pair faces by up to 0.5 and the comparison measures the tie rather than the port. OpenFOAM's
+# own ten steps above are the spin-up; its last write becomes the `0` of this one-step case.
+#
+# WHAT IT COMPARES: the internal-face off-diagonals, D and Src on the rows setValues does not pin,
+# those rows' implied value, and THE PAIR'S OWN off-diagonal -- negated, because brae applies it as
+# Apsi[own] += ifCoeff*psi[nbr] where OpenFOAM keeps boundaryCoeffs. Its CONTROL is the same comparison
+# against the device's UPWIND run of the same fixture, which must miss.
+assembly()
+{
+    local dev="$W/assembly"
+    rm -rf "$dev"
+    cp -r "$W/sstLimDiv" "$dev" || return 1
+    rm -rf "$dev/0"
+    mv "$dev/$END" "$dev/0" || { echo "FAIL: the spin-up wrote no $END to promote"; return 1; }
+    rm -rf "$dev/0/uniform"
+    # OpenFOAM WRITES the wall functions' full dictionaries, including entries brae refuses by name
+    # (`blending stepwise` on nut). They are defaults restated, not a change of case.
+    sed -i '/blending/d' "$dev/0/nut" "$dev/0/omega" 2>/dev/null
+    ASMEND=$(python3 -c "print('%.10g' % float('$DT'))") python3 - "$dev" <<'PYEOF' || { echo "FAIL: the one-step controlDict"; return 1; }
+import os, re, sys
+c = sys.argv[1] + '/system/controlDict'
+s = open(c).read()
+s, n = re.subn(r'^endTime\s.*', 'endTime         %s;' % os.environ['ASMEND'], s, flags=re.M)
+assert n == 1
+open(c, 'w').write(s)
+PYEOF
+    # ...and the same case with the scheme back to upwind, for the control
+    local up="$W/assemblyUpwind"
+    rm -rf "$up"
+    cp -r "$dev" "$up" || return 1
+    sed -i 's/"div\\(phi,(k|omega)\\)".*/"div\\(phi,(k|omega)\\)"  Gauss upwind;/' "$up/system/fvSchemes"
+    grep -q "Gauss upwind;" "$up/system/fvSchemes" || { echo "FAIL: the control did not go back to upwind"; return 1; }
+
+    local hd="$dev/dump.host" dd="$dev/dump.device" ud="$up/dump.device"
+    rm -rf "$hd" "$dd" "$ud"
+    ( cd "$dev" && BRAE_SST_DUMP_DIR="$hd" BRAE_SST_DUMP_ITER=1 "$BIN_SOLVER" -case "$dev" > log.asm.host 2>&1 ) \
+        || { echo "FAIL: the host arm did not run [assembly]"; tail -5 "$dev/log.asm.host"; return 1; }
+    ( cd "$dev" && BRAE_SST_DUMP_DIR="$dd" BRAE_SST_DUMP_ITER=1 "$BIN_SOLVER" -case "$dev" -device > log.asm.dev 2>&1 ) \
+        || { echo "FAIL: the device arm did not run [assembly]"; tail -5 "$dev/log.asm.dev"; return 1; }
+    ( cd "$up" && BRAE_SST_DUMP_DIR="$ud" BRAE_SST_DUMP_ITER=1 "$BIN_SOLVER" -case "$up" -device > log.asm.dev 2>&1 ) \
+        || { echo "FAIL: the upwind control did not run [assembly]"; tail -5 "$up/log.asm.dev"; return 1; }
+    grep -qi "BRAE_CYC_LIMITED_DIAG" "$dev/log.asm.dev" \
+        && { echo "FAIL: the device arm ran under the diagnostic bypass, not on its own"; return 1; }
+
+    python3 "$(dirname "$0")/assembly_compare.py" "$hd/host" "$dd/cuda" "$dev/constant/polyMesh" \
+        sstHostCuda match "A DEVICE against the HOST arm, limitedLinear across the pair" \
+        && echo "  ok:   the device assembles the host's system, pair included" \
+        || { echo "  FAIL: the device assembles the host's system, pair included"; return 1; }
+    python3 "$(dirname "$0")/assembly_compare.py" "$hd/host" "$ud/cuda" "$dev/constant/polyMesh" \
+        sstHostCuda differ "B CONTROL: the host's limitedLinear against the device's UPWIND" \
+        && echo "  ok:   CONTROL: the comparison can witness the scheme across the pair" \
+        || { echo "  FAIL: CONTROL: the comparison can witness the scheme across the pair"; return 1; }
+    return 0
+}
+
+if [ "$HAVE_GPU" = 1 ]; then
+    assembly || rc=1
+else
+    echo "  (no GPU: the assembled-system arm is not exercised)"
+fi
+
 echo "interfoam_cyclic_vs_openfoam: rc $rc"
 exit $rc

@@ -155,12 +155,29 @@ int main(
     // profiles share: a defect confined to k reaches U through nuEff alone and arrives divided by the
     // Reynolds number.
     const bool sstProfile = (profile == "sst" || profile == "sstCN" || profile == "sstLim"
-                          || profile == "sstLimU");
+                          || profile == "sstLimU" || profile == "sstLimDiv");
+    // `sstLimDiv` names `Gauss limitedLinear 1` for div(phi,k) and div(phi,omega) on a mesh with a
+    // PAIR -- a combination brae could not run at all: fvm::div threw the moment it was handed a
+    // scheme's weights and a coupled patch, and the device assembler refused it by name. OpenFOAM
+    // gives the coupled patch the scheme's own weights there (gaussConvectionScheme.C:105-108).
     // `sstLimU` adds `cellLimited grad(U)` to the two the closure limits, ON BOTH ARMS. It read
     // U 8.9149e-03, k 3.3383e-02, nut 4.1315e-01 on the device before the defect it found was named:
     // KOmegaSSTInput carries the grad(U) limiter TWICE and the interFoam site filled only the coeffs
     // half, so the device closure's production ran on an unlimited gradient.
-    const bool hostOnlyProfile = false;
+    // `sstLimDiv` is HOST ONLY. The device closure computes the pair's limited weights from inputs
+    // measured identical to the host's (flux 4.1e-14, CD weights exactly, both cells' field 4.4e-16,
+    // delta exactly, gradient 7.1e-14) and still lands the other way on 4 of 40 pair faces for omega
+    // and 6 for k -- every one of them a face where gradf is exactly zero (NVDTVD's 1000x branch, the
+    // scheme decided by the sign of a round-off gradcf) or one ulp. That is worth nut 7.1e-04 here, so
+    // these fields cannot tell the tie from a defect; the arm is refused by name until its assembled
+    // system is held against OpenFOAM's own, as RAS/waterChannel's is.
+    // `sstLimDiv` runs on BOTH arms now, but its device arm is not asserted on FIELDS: at t = 0 this
+    // fixture's k and omega are uniform, so NVDTVD's gradf is a cancellation on every face and the
+    // limiter is decided by the last bit -- the two arms differ on 4 of 40 pair faces by up to 0.5,
+    // worth nut 7.1e-04 after ten steps. What holds the device here is the ASSEMBLED SYSTEM from a
+    // spun-up field (the `assembly` arm of tests/interfoam_cyclic_vs_openfoam.sh): the pair's own
+    // off-diagonal 1.7e-10 against the host's, with the device's upwind run as the control.
+    const bool hostOnlyProfile = (profile == "sstLimDiv");
     const bool lesProfile = (profile == "les" || profile == "lesCN");
     const bool turbProfile = sstProfile || lesProfile;
     // ...and the two CRANKNICOLSON profiles, whose control is the SAME case under Euler rather than a
@@ -360,8 +377,10 @@ int main(
     // included, and the device keeps those faces in a third array.
     if (nDev > 0 && hostOnlyProfile)
     {
-        std::printf("  (the device momentum's grad(U) limiter carries no pair: refused by name, and "
-                    "armed in interfoam_refusals)\n");
+        std::printf("  (this profile is HOST ONLY -- see the note at hostOnlyProfile above: the device\n"
+                    "   closure's limited weights across the pair differ from the host's only where\n"
+                    "   OpenFOAM's own limiter is decided by the last bit, and this fixture's fields\n"
+                    "   cannot tell that from a defect. Refused by name.)\n");
     }
     else if (nDev <= 0)
     {

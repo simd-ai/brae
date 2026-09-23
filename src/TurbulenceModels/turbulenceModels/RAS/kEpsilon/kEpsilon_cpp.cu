@@ -106,10 +106,16 @@ FvScalarMatrix divWithScheme(
     // gradient too. This took the raw Gauss gradient whatever the case said; the driver refuses a
     // gradient scheme brae does not compute, and passes the cellLimited coefficient through here.
     if (limGradK > 0.0) cpu::cellLimitGrad(gradVf, vf.internal, vfb, limGradK, m, g, patches);
+    // ...and the SCHEME'S WEIGHTS ON EVERY COUPLED PATCH, which OpenFOAM takes from the same
+    // surfaceScalarField's boundaryField (gaussConvectionScheme.C:105-108). Without them fvm::div
+    // refuses a pair rather than giving it upwind's weight under the case's scheme name.
+    const std::vector<std::vector<scalar>> pw =
+        cpu::limitedSchemes::limitedLinearPatchWeights(phi.boundary, vf.internal, gradVf,
+                                                       limiterCoeff, patches);
     return fvm::div(phi.internal, phi.boundary, vf,
                     cpu::limitedSchemes::limitedLinearWeights(phi.internal, vf, gradVf,
                                                               limiterCoeff, m, g),
-                    m, patches);
+                    m, patches, &pw);
 }
 
 
