@@ -584,10 +584,13 @@ if [ $HAVE_GPU = 1 ]; then
     # 1.2822e-02 after the first fix); and UEqn.cu's own refusal keyed on the coefficient rather than
     # the scheme, so it blocked `Gauss upwind` with a cellLimited gradSchemes entry. Gated on
     # validation/interFoamCyclic `sstLimU`, both arms. A blanket refusal coming back fails this arm.
-    # ...and `Gauss limitedLinear` for the CLOSURE, which the host runs and this arm does not: the
-    # device closure reads omega 1.7822e-04 on RAS/waterChannel where the host reads 7.2e-12, while
-    # alpha, p_rgh and U sit at round-off there -- so it is the closure and not the limiter's
-    # bit-decided branch, which the host carries too and which costs it 7.2e-12.
+    # ...and `Gauss limitedLinear` for the CLOSURE -- the kEpsilon half, which is what this base case
+    # runs (RAS/damBreak names div(rhoPhi,epsilon)). The kOmegaSST half was LIFTED: its assembled
+    # system is OpenFOAM's own at the first closure call, 3.4e-14 on the off-diagonals against a
+    # control that misses by 5.0e-01 (tests/interfoam_sst_assembly_vs_openfoam.sh). No oracle here
+    # writes kEpsilon's assembled system, so that closure stays refused and this arm holds it; the
+    # bypass for its localisation is BRAE_KE_DIAG_LIMITED. An SST case reaching this refusal again --
+    # the two closures share the assembler -- fails the gate above, which runs one without a bypass.
     BASE="$BR"
     arm device_limitedLinearTurb refused "limitedLinear"            "-device" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss limitedLinear 1;/; s/div(rhoPhi,epsilon) .*/div(rhoPhi,epsilon) Gauss limitedLinear 1;/' system/fvSchemes"
     BASE="$B"

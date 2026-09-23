@@ -178,9 +178,10 @@ int main(
           ofO.size() == static_cast<std::size_t>(nSteps) && ofK.size() == ofO.size());
     failures += brae::gatecheck::compareSolves("host", r.pSolves, ofP, nSteps);
     // `Gauss limitedLinear` FOR THE CLOSURE: read from the case, not from an argument, so no caller
-    // changes. The HOST runs it and this gate holds its FIELDS. The DEVICE closure refuses it by name
-    // (device_inter_turbulence.cu) -- it reads omega 1.7822e-04 where the host reads 7.2e-12 -- so
-    // its arm is skipped here and the refusal is armed in tests/interfoam_refusals.sh.
+    // changes. The HOST runs it and this gate holds its FIELDS. The DEVICE arm RUNS it too now, and
+    // this gate holds its alpha, p_rgh and U -- but not its k, omega and nut, which on this profile
+    // cannot witness the scheme at all (the block at the device arm below has the measurement).
+    // Their claim is tests/interfoam_sst_assembly_vs_openfoam.sh, on the assembled system.
     bool closureLimitedLinear = false;
     {
         std::ifstream fs(caseDir + "/system/fvSchemes");
@@ -309,18 +310,7 @@ int main(
         cudaGetLastError();
         nDev = 0;
     }
-    // BRAE_SST_DIAG_LIMITED runs the device arm anyway, for the localisation that lifts the refusal.
-    if (nDev > 0 && closureLimitedLinear && !std::getenv("BRAE_SST_DIAG_LIMITED"))
-    {
-        std::printf("  (the device closure refuses `Gauss limitedLinear` by name -- armed in\n"
-                    "   interfoam_refusals. NOT because a defect was measured: at the first closure\n"
-                    "   call its assembled omega and k systems are the host's to 2.6e-13 on the\n"
-                    "   off-diagonals, every differing diagonal being a wall row setValues pins to the\n"
-                    "   same value. It reads omega 1.7822e-04 at t = 1, and ONE ULP on the initial\n"
-                    "   omega field, run on the HOST, reads 4.3e-02 there -- so these fields cannot\n"
-                    "   witness the scheme, and no gate yet compares the assembled system.)\n");
-    }
-    else if (nDev <= 0)
+    if (nDev <= 0)
     {
         std::printf("  (no CUDA device: the device refusal is not exercised)\n");
     }
@@ -354,9 +344,32 @@ int main(
         check("the DEVICE's alpha agrees with OpenFOAM's", eA.linf < scalar(DEV_BOUND_ALPHA));
         check("...its p_rgh", eP.rel() < scalar(DEV_BOUND_PRGH));
         check("...its U", eU.rel() < scalar(DEV_BOUND_U));
-        check("...its k", eK.rel() < scalar(DEV_BOUND_K));
-        check("...its omega", eO.rel() < scalar(DEV_BOUND_OMEGA));
-        check("...and its nut", eN.rel() < scalar(DEV_BOUND_NUT));
+        // THE TURBULENCE FIELDS ARE NOT ASSERTED UNDER `Gauss limitedLinear`, and the reason is a
+        // measurement rather than an allowance. This profile amplifies the last bit of the
+        // turbulence fields by fourteen orders over ten steps: one ulp on the initial omega field,
+        // run on the HOST, reads k 4.5e-02, omega 4.3e-02, nut 1.7e-02 here (one ulp in ONE cell
+        // reads 3.1e-07 / 1.1e-07 / 1.6e-07). The device arm reads 1.4724e-05 / 1.7822e-04 /
+        // 1.6747e-05 -- two orders BELOW the whole-field ulp figure, and the same numbers it read
+        // while it was silently convecting with upwind. A bound loose enough to pass could not fail
+        // for that substitution either, so asserting one here would be a gate that cannot witness
+        // what it names. The device's claim on this scheme is
+        // tests/interfoam_sst_assembly_vs_openfoam.sh, which holds the matrix it assembles against
+        // OpenFOAM's own at the first closure call, with OpenFOAM's `Gauss upwind` system as the
+        // control. alpha, p_rgh and U ARE asserted above: they sit at 1e-12 on this profile and a
+        // wrong closure moves them.
+        if (closureLimitedLinear)
+        {
+            std::printf("  (k, omega and nut are NOT asserted on this profile: one ulp of the initial\n"
+                        "   omega is worth 4.3e-02 here after ten steps, so no field bound can tell the\n"
+                        "   scheme from the last bit. The device's assembled system carries the claim --\n"
+                        "   tests/interfoam_sst_assembly_vs_openfoam.sh, 3.4e-14 against OpenFOAM's own.)\n");
+        }
+        else
+        {
+            check("...its k", eK.rel() < scalar(DEV_BOUND_K));
+            check("...its omega", eO.rel() < scalar(DEV_BOUND_OMEGA));
+            check("...and its nut", eN.rel() < scalar(DEV_BOUND_NUT));
+        }
     }
 
     std::printf("test_inter_waterchannel_vs_openfoam: %d failures\n", failures);

@@ -619,44 +619,25 @@ void deviceCorrectInterTurbulence(
         sin.limiterCoeff    = t.closureLimiterCoeff;
         sin.limGradK        = t.sstCoeffs.gradKLimitK;
         sin.limGradLeastSq  = t.sstCoeffs.gradKLeastSq;
-        // ...and the CONVECTION scheme. The host closure runs `Gauss limitedLinear <k>` and is gated
-        // on it (RAS/waterChannel `limitedLinear`, fields at 7.2e-12); the DEVICE closure is not, and
-        // the only case that names the scheme CANNOT gate it.
+        // ...and the CONVECTION scheme, which this arm now RUNS. It was refused by name, and the
+        // refusal was for want of a gate rather than for a measured defect: the only case that names
+        // the scheme -- RAS/waterChannel `limitedLinear` -- cannot witness it on fields, because it
+        // amplifies the last bit of the turbulence fields by fourteen orders over ten steps. ONE ULP
+        // on the initial omega field, run on the HOST, reads k 4.5e-02, omega 4.3e-02, nut 1.7e-02
+        // there; this arm reads 1.4724e-05 / 1.7822e-04 / 1.6747e-05, two orders BELOW that, and the
+        // same numbers it read while it was silently convecting with upwind. No field bound on that
+        // profile can separate the scheme from the last bit.
         //
-        // MEASURED at the first closure call, device against host, on that profile: omega's and k's
-        // assembled off-diagonals agree to 2.6e-13 and 4.5e-13, and every differing diagonal -- 354
-        // cells of 28,000 -- is a wall-function row that setValues pins to a value the two arms hold
-        // bit for bit. The systems the two arms solve are the same system. Call ONE is the only call
-        // that can say so: from call 2 the two arms no longer hold the same fields (omega at the
-        // assembly is 6.1e-14 apart at call 2, 4.7e-11 at call 5, each solve being its own
-        // arithmetic), and their systems then differ by what their fields differ by -- k's diagonal
-        // 2.5e-08 at call 2 and 1.5e-07 at call 5, on unpinned cells.
+        // WHAT LIFTED IT: tests/interfoam_sst_assembly_vs_openfoam.sh, which holds this arm's
+        // ASSEMBLED SYSTEM against OpenFOAM's own (tools/dumpKOmegaSST) at the first closure call --
+        // omega and k, both off-diagonals, and D and Src on the 21,690 rows setValues does not
+        // eliminate: 3.4e-14, 3.9e-14 and 5.4e-13, as close as the host's own 3.2e-14. Its CONTROL is
+        // OpenFOAM's `Gauss upwind` system, which the same comparison misses by 5.0e-01, and its
+        // second control is this arm's own upwind against OpenFOAM's upwind (3.6e-14), so the gap in
+        // the first is the LIMITER and not a broken upwind path.
         //
-        // MEASURED at t = 1: the device's fields sit at k 1.4724e-05, omega 1.7822e-04, nut 1.6747e-05.
-        // And the CONTROL for what that number is worth: one ulp on the initial omega field, run on
-        // the HOST, lands at k 4.5e-02, omega 4.3e-02, nut 1.7e-02 -- with U at 5.0e-05 and alpha at
-        // 2.3e-06. This case amplifies the last bit of the turbulence fields by fourteen orders over
-        // ten steps, so its ten-step fields cannot tell a port defect from round-off; the host passes
-        // it because it is bitwise OpenFOAM's, not because the bound is discriminating.
-        //
-        // So the refusal stands on the gate, not on a measured defect: nothing here compares the
-        // device's ASSEMBLED SYSTEM against OpenFOAM's, and that is the only comparison this case can
-        // carry. BRAE_SST_DIAG_LIMITED bypasses it FOR DIAGNOSIS ONLY and says so on every run.
-        if (t.closureLimitedLinear && std::getenv("BRAE_SST_DIAG_LIMITED"))
-        {
-            std::printf("  *** BRAE_SST_DIAG_LIMITED: the device closure's `Gauss limitedLinear` "
-                        "refusal is BYPASSED. No gate covers this arm: its assembled system matches "
-                        "the host's at the first call, and this case's ten-step fields cannot witness "
-                        "the scheme (one ulp there is worth 4.3e-02). Diagnostic only. ***\n");
-        }
-        if (t.closureLimitedLinear && !std::getenv("BRAE_SST_DIAG_LIMITED"))
-        {
-            sin.hasNonUpwindDivScheme = true;
-            sin.divSchemeUnsupported =
-                "Gauss limitedLinear on the device closure: the host runs it and is gated (fields "
-                "7.2e-12); no gate covers this arm -- on RAS/waterChannel one ulp of the initial "
-                "omega is worth 4.3e-02 after ten steps, so its fields cannot witness the scheme";
-        }
+        // Still refused below: the device kEpsilon closure under the same scheme -- no oracle here
+        // writes its assembled system, so nothing gates it.
 
         // ...and the grad(U) LIMITER, which this struct carries TWICE -- `co.gradULimitK` and a
         // top-level `gradULimitK`, both the case's one `grad(U)` entry -- and the production site
@@ -720,11 +701,25 @@ void deviceCorrectInterTurbulence(
     // ...and the same for kEpsilon's device closure.
     kin.limitedLinear  = t.closureLimitedLinear;
     kin.limiterCoeff   = t.closureLimiterCoeff;
-    // ...and the same for kEpsilon's device closure, which has no gate for the scheme either.
-    if (t.closureLimitedLinear && !std::getenv("BRAE_SST_DIAG_LIMITED"))
+    // ...and the same for kEpsilon's device closure, which is still REFUSED: the SST half was lifted
+    // by holding its assembled system against tools/dumpKOmegaSST's
+    // (tests/interfoam_sst_assembly_vs_openfoam.sh), and no oracle here writes kEpsilon's. The two
+    // closures share the assembler this gate exercises, so the scheme itself is very likely right --
+    // "very likely" is what a refusal is for. BRAE_KE_DIAG_LIMITED bypasses it for the localisation
+    // that will lift it, and says so on every run.
+    if (t.closureLimitedLinear && std::getenv("BRAE_KE_DIAG_LIMITED"))
+    {
+        std::printf("  *** BRAE_KE_DIAG_LIMITED: the device kEpsilon closure's `Gauss limitedLinear` "
+                    "refusal is BYPASSED. Nothing gates that closure's assembled system. Diagnostic "
+                    "only. ***\n");
+    }
+    if (t.closureLimitedLinear && !std::getenv("BRAE_KE_DIAG_LIMITED"))
     {
         kin.hasNonUpwindDivScheme = true;
-        kin.divSchemeUnsupported = "Gauss limitedLinear on the device kEpsilon closure: ungated";
+        kin.divSchemeUnsupported =
+            "Gauss limitedLinear on the device kEpsilon closure: ungated -- the SST closure runs it "
+            "and is gated on its assembled system against OpenFOAM's own "
+            "(tests/interfoam_sst_assembly_vs_openfoam.sh); no oracle writes kEpsilon's";
     }
 
     if (t.variableDensity)

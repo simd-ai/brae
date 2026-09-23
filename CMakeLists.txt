@@ -3504,6 +3504,14 @@ target_link_libraries(test_inter_waterchannel_vs_openfoam PRIVATE brae_core)
 add_test(NAME interfoam_waterchannel_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_waterchannel_vs_openfoam.sh)
 
+# ...and the closure's ASSEMBLED SYSTEM against OpenFOAM's own, at the first call, under
+# `Gauss limitedLinear 1`. The fields of that profile cannot witness the scheme -- one ulp of the
+# initial omega is worth 4.3e-02 there after ten steps -- so the device arm is gated on the matrix it
+# assembles, with OpenFOAM's `Gauss upwind` system as the control that must NOT match.
+add_test(NAME interfoam_sst_assembly_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_sst_assembly_vs_openfoam.sh)
+set_tests_properties(interfoam_sst_assembly_vs_openfoam PROPERTIES LABELS slow)
+
 # ...whose first run found pressureInletOutletVelocity's snGrad() reading the stored value where
 # OpenFOAM's directionMixed builds it from the valueFraction and the cell. Held on its own here.
 add_executable(test_piov_sngrad tests/test_piov_sngrad.cu)
