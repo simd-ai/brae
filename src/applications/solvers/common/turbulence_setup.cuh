@@ -294,6 +294,26 @@ inline void readLaminarModel(
 
 // RAS/LES selection, plus the laminar table above when the case is not turbulent. The envelope is
 // carried through rather than defaulted -- see LaminarEnvelope.
+// `RAS { kEpsilonCoeffs { ... } }` -- OpenFOAM's own names and its own defaults, read into the one
+// coefficients struct the closures take. Shared because a second solver reading the same block its own
+// way is how a coefficient ends up honoured on one path and defaulted on another: simpleFoamV2 read
+// `realizableKECoeffs` and never read this one at all, so a case naming `Cmu 0.12` ran 0.09 under its
+// own name. Returns the dict (or null) so a caller can say whether it came from the case.
+inline const FoamDict* readKEpsilonCoeffsDict(const FoamDict* ras, KEpsilonCoeffs& c)
+{
+    const FoamDict* kec = ras ? ras->subDict("kEpsilonCoeffs") : nullptr;
+    if (!kec) return nullptr;
+    c.Cmu      = kec->scalarOr("Cmu",      c.Cmu);
+    c.C1       = kec->scalarOr("C1",       c.C1);
+    c.C2       = kec->scalarOr("C2",       c.C2);
+    c.C3       = kec->scalarOr("C3",       c.C3);
+    c.sigmaK   = kec->scalarOr("sigmak",   c.sigmaK);
+    c.sigmaEps = kec->scalarOr("sigmaEps", c.sigmaEps);
+    c.kappa    = kec->scalarOr("kappa",    c.kappa);
+    c.E        = kec->scalarOr("E",        c.E);
+    return kec;
+}
+
 inline void readTurbulenceModel(
     const FoamDict&        turbProps,
     DeviceSimpleControls&  ctl,
@@ -553,18 +573,7 @@ inline void readTurbulenceModel(
                 }
                 else
                 {
-                    const FoamDict* kec = ras ? ras->subDict("kEpsilonCoeffs") : nullptr;
-                    if (kec)
-                    {
-                        c.Cmu = kec->scalarOr("Cmu", c.Cmu);
-                        c.C1 = kec->scalarOr("C1", c.C1);
-                        c.C2 = kec->scalarOr("C2", c.C2);
-                        c.C3 = kec->scalarOr("C3", c.C3);
-                        c.sigmaK = kec->scalarOr("sigmak", c.sigmaK);
-                        c.sigmaEps = kec->scalarOr("sigmaEps", c.sigmaEps);
-                        c.kappa = kec->scalarOr("kappa", c.kappa);
-                        c.E = kec->scalarOr("E", c.E);
-                    }
+                    const FoamDict* kec = readKEpsilonCoeffsDict(ras, c);
                     std::printf("  kEpsilonCoeffs%s: Cmu=%.4g C1=%.4g C2=%.4g C3=%.4g sigmak=%.4g sigmaEps=%.4g kappa=%.4g E=%.4g\n",
                                 kec ? " (from dict)" : " (OF defaults)", c.Cmu, c.C1, c.C2, c.C3, c.sigmaK, c.sigmaEps, c.kappa, c.E);
                 }

@@ -1261,6 +1261,14 @@ int runSimpleFoamV2(const std::string& caseDir)
             keCoeffs.sigmaK = rc.sigmak;  keCoeffs.sigmaEps = rc.sigmaEps;
             keCoeffs.kappa = rc.kappa;  keCoeffs.E = rc.E;
         }
+        else
+        {
+            // ...and the STANDARD model's own coefficients, which this driver never read: it read
+            // `realizableKECoeffs` above and nothing for plain kEpsilon, so a case naming
+            // `kEpsilonCoeffs { Cmu 0.12; }` ran OpenFOAM's 0.09 under its own name. The same reader
+            // the legacy driver and rhoSimpleFoam use (turbulence_setup.cuh).
+            readKEpsilonCoeffsDict(rasDict, keCoeffs);
+        }
         saModel = rasDict && rasDict->wordOr("RASModel", "") == "SpalartAllmaras";
         if (saModel) cpu::SA::readCoeffs(rasDict, saCoeffs);
 

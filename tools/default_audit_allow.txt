@@ -46,10 +46,6 @@ KEpsilonInput kin alphatWallMask
 KEpsilonInput kin Prt
 KEpsilonInput kin boundedK
 KEpsilonInput kin boundedEps
-KEpsilonInput kin limitedLinear
-KEpsilonInput kin limiterCoeff
-KEpsilonInput kin limGradK
-KEpsilonInput kin limGradLeastSq
 KEpsilonInput kin linearUpwind
 KEpsilonInput kin luGradK
 KEpsilonInput kin hasNonUpwindDivScheme
@@ -66,10 +62,6 @@ KOmegaSSTInput sin alphatWallMask
 KOmegaSSTInput sin Prt
 KOmegaSSTInput sin boundedK
 KOmegaSSTInput sin boundedOmega
-KOmegaSSTInput sin limitedLinear
-KOmegaSSTInput sin limiterCoeff
-KOmegaSSTInput sin limGradK
-KOmegaSSTInput sin limGradLeastSq
 KOmegaSSTInput sin linearUpwind
 KOmegaSSTInput sin luGradK
 KOmegaSSTInput sin hasNonUpwindDivScheme
@@ -85,7 +77,6 @@ KOmegaSSTInput sin colouring
 KOmegaSSTInput sin gsColour
 KOmegaSSTInput sin polyDeg
 KOmegaSSTInput sin precon           # interFoam admits PBiCG under kEpsilon only (readFinalSolve allowPBiCG); SST runs the GS smoother, so no DILU schedule
-KOmegaSSTInput sin gradULimitK      # cellLimited grad(U) is refused on the device before the closure is built (inter_driver_device.cu:304-308) -- ARM device_gradULimited
 # rhoSimpleFoam's hook (rhoTurbulenceHook.cu `kin`): steady/Euler only, no pair on the device, no mangroves
 KEpsilonInput kin cn                # ddtSchemes other than steadyState/Euler are refused (scheme_parse.cuh:304-310, names CrankNicolson) -- ARM tests/rho_step_cuda_refusals.sh's CrankNicolson arm
 KEpsilonInput kin cnDdt0Eps         # same refusal
@@ -334,7 +325,6 @@ Tok t *
 Tok e *
 # SolverPerformance (pcg.cuh:16) is an OUTPUT record the solvers fill as they run: a site that reports
 # a converged-at-entry solve writes the residuals and leaves nIterations at 0, which IS the count.
-SolverPerformance perf nIterations
 # HeToTResult (nsrds_functions.cuh:147) is the energy inversion's output: the sites that return an
 # EXACT inversion (no Newton loop) leave `iterations` and `residual` at 0, which is that result.
 HeToTResult r iterations
@@ -356,3 +346,49 @@ LinearSolverChoice which pbicgDILU
 #   KEpsilonInput kin cyc / cycPhi / cycPhiByRho -- the rho path hands the closure hasCoupledPatches
 #     and kEpsilon.cu refuses a pair; validation/rhoBox has no cyclic, so an arm needs a fixture that
 #     does. Both are in the pending list rather than in this file's silence.
+
+# ---- the closure inputs, now that the audit can SEE them (2026-09-23) -------------------------------
+# These two structs were silently unevaluated until the parser learned to read `bool a = false, b = true;`
+# as three fields: every site assigning gsEps/gsOmega/gsSymmetric was dropped from the comparison, both
+# sites were dropped, and a struct with fewer than two sites is skipped. Thirty ledger lines were never
+# checked and no omission in either struct could be reported -- including the four fields interFoam's
+# site left unset under `Gauss limitedLinear` (#28). The lines below are the omissions that survive
+# with a reason, each verified in the code named.
+#
+# rhoSimpleFoam's SST site (rhoTurbulenceHook.cu) against interFoam's (device_inter_turbulence.cu):
+#   cyc/cycPhi/cycPhiByRho: rho sets `hasCoupledPatches` instead, and the closure REFUSES a mesh with
+#     coupled patches and no pair (kOmegaSST.cu:57-64) rather than running those faces as walls
+#   V0/meshPhiInt/meshPhiBnd: OpenFOAM's rhoSimpleFoam never moves the mesh -- no mesh.update() in the
+#     solver at all -- so V0 == V and meshPhi == 0 by construction
+#   cn/cnDdt0K/cnDdt0Omega/kOO/omegaOO/rhoOOCell: CrankNicolson is refused by name on this path --
+#     parseDdtScheme (scheme_parse.cuh:279-306) admits `steadyState` and `Euler` and throws otherwise
+KOmegaSSTInput sstIn cyc
+KOmegaSSTInput sstIn cycPhi
+KOmegaSSTInput sstIn cycPhiByRho
+KOmegaSSTInput sstIn V0
+KOmegaSSTInput sstIn meshPhiInt
+KOmegaSSTInput sstIn meshPhiBnd
+KOmegaSSTInput sstIn cn
+KOmegaSSTInput sstIn cnDdt0K
+KOmegaSSTInput sstIn cnDdt0Omega
+KOmegaSSTInput sstIn kOO
+KOmegaSSTInput sstIn omegaOO
+KOmegaSSTInput sstIn rhoOOCell
+# ...and the other way round: interFoam hands the closure a REAL pair, so the flag that says "there are
+# coupled patches and no pair" must stay false -- the closure refuses if both are set (kOmegaSST.cu:65-68)
+KOmegaSSTInput sin hasCoupledPatches
+# The incompressible simpleFoam device path has no energy equation, so the residual struct's energy
+# fields are the ones it never fills (he, heFinal, heIters).
+DeviceSimpleResidual res he
+DeviceSimpleResidual res heFinal
+DeviceSimpleResidual res heIters
+# rhoCreateFields' CONSTRUCTION-TIME coefficients (`keCase`), read for the first correctNut and the
+# bounds, against the coefficients the run uses:
+#   A0/realizable: realizableKE is refused by name on this solver (rhoSimpleFoam_cpp.cuh:43-47 --
+#     "every other model is refused by name"), so its coefficients are unreachable here
+#   kappa/E: the wall functions' Cmu/kappa/E are PER PATCH, from each field's own entry
+#     (WallFunctionCoeffs, kEpsilon_cpp.cu:263), not from the model dictionary's copy
+KEpsilonCoeffs keCase A0
+KEpsilonCoeffs keCase realizable
+KEpsilonCoeffs keCase kappa
+KEpsilonCoeffs keCase E

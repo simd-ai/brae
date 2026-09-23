@@ -30,8 +30,17 @@ def parse_structs(text):
     another reported every field the two do not share. Each definition is kept, and a site is matched
     to the definitions whose fields COVER what it assigns."""
     struct_re = re.compile(r'\bstruct\s+(\w+)\s*(?::\s*[^{]+)?\{(.*?)\n\};', re.S)
+    # ONE DECLARATION, SEVERAL DECLARATORS, each with its own initialiser:
+    #     bool gsK = false, gsEps = false, gsSymmetric = true;
+    # The old pattern captured a comma list only when NONE of them was initialised, so it saw `gsK`
+    # and missed the other two. That is not a cosmetic miss: a site assigning a field the parser does
+    # not know about is dropped from the comparison (`site fields <= struct fields`), and a struct
+    # with fewer than two surviving sites is never evaluated at all. KEpsilonInput and KOmegaSSTInput
+    # -- the two structs at the centre of the #28 closure defects, with 30 ledger entries between
+    # them -- were silently unevaluated for exactly this reason, so no omission in them could ever be
+    # reported and no ledger line of theirs could ever go stale.
     field_re = re.compile(r'(?:mutable\s+|static\s+|const\s+)*[\w:<>\*&]+(?:\s*[\*&])?\s+'
-                          r'(\w+(?:\s*,\s*\w+)*)\s*(=|\{|;)')
+                          r'((?:\w+\s*(?:=[^,;]+)?)(?:\s*,\s*\w+\s*(?:=[^,;]+)?)*)\s*(=|\{|;)')
     out = {}
     for f, s in text.items():
         for m in struct_re.finditer(s):
@@ -45,8 +54,15 @@ def parse_structs(text):
                     continue                                  # a method
                 fm = re.match(field_re, line)
                 if fm:
-                    for n in fm.group(1).split(','):
-                        fields.append((n.strip(), fm.group(2) in '={'))
+                    # each declarator carries its own initialiser: `bool a = false, b = true;`
+                    for decl in fm.group(1).split(','):
+                        decl = decl.strip()
+                        if not decl:
+                            continue
+                        nm = decl.split('=')[0].strip()
+                        if not nm:
+                            continue
+                        fields.append((nm, ('=' in decl) or fm.group(2) in '={'))
             if len(fields) >= 3 and any(d for _, d in fields):
                 out.setdefault(name, []).append((f, fields))
     return out
@@ -86,15 +102,58 @@ def enclosing_scope(s, start):
     return s[start:]
 
 
+def returning_builders(name, text):
+    """{function name: fields it assigns} for every function RETURNING a Name -- the `var = buildX(...)`
+    shape, which is the one the of-defaults skill asks for and which this audit used to be blind to.
+
+    A site that takes its whole struct from a builder and then overrides three fields was reported as
+    omitting everything the builder filled (24 fields at rhoSimpleFoamDriver.cu:1012, all of them
+    `buildTurbulenceHookOptions`'s), so the audit penalised exactly the shape it exists to encourage."""
+    sig_re = re.compile(r'\b%s\s+(\w+)\s*\(([^;{}]*)\)\s*(?:const\s*)?\{' % re.escape(name))
+    out = {}
+    for s in text.values():
+        for m in sig_re.finditer(s):
+            fname = m.group(1)
+            if fname in ('if', 'for', 'while', 'switch', 'return'):
+                continue
+            body = enclosing_scope(s, m.end())
+            # the local it builds and returns
+            local = re.search(r'\b%s\s+(\w+)\s*(?:\{\s*\})?;' % re.escape(name), body)
+            if not local:
+                continue
+            var = local.group(1)
+            fields = set(re.findall(r'\b%s\.(\w+)\s*=(?!=)' % re.escape(var), body))
+            fields |= set(re.findall(r'\b%s\.(\w+)\s*\.(?:push_back|assign|resize)' % re.escape(var), body))
+            if fields:
+                out.setdefault(fname, set()).update(fields)
+    return out
+
+
+def blank_comments(s):
+    """`//` comments replaced by spaces -- same length, so every offset still points where it did.
+
+    A signature's parameter list is matched with a pattern that forbids parentheses (it must not run
+    across an inner call into the next function), and a COMMENT inside the list carries them:
+    `// The energy field's name (h or e), for the compressible callers.` cost the audit its view of
+    readLinearSolverControls, the filler every SIMPLE driver takes nNonOrthogonalCorrectors from."""
+    return re.sub(r'//[^\n]*', lambda m: ' ' * len(m.group(0)), s)
+
+
 def filler_functions(name, text):
     """{function name: fields it assigns} for every function taking a `Name& param`: the readers a site
     hands its struct to (parseFvSchemesControls(caseDir, ctl), readLinearSolverControls(dict, ctl)) --
     the one-builder shape, which a count of `var.field =` at the site alone cannot see."""
     # a default argument may be a brace-initialised value (`= SolverRunsAs{}`), so braces are allowed
     # inside the parameter list; a `;` is not
-    sig_re = re.compile(r'\b(\w+)\s*\(([^;]*?\b%s\s*&\s*(\w+)\b[^;]*?)\)\s*(?:const\s*)?\{' % re.escape(name))
+    # NO PARENTHESES INSIDE THE PARAMETER LIST. With `[^;]*?` the match could start at any earlier
+    # `word(` -- an inner call such as `ras->subDict("kEpsilonCoeffs")` -- and run across a whole
+    # function body to the next `{`, so the filler was recorded under the name `dict` and no call site
+    # could ever be credited to it. MEASURED: readKEpsilonCoeffsDict, the shared kEpsilon coefficient
+    # reader, was invisible and its callers looked like they set nothing.
+    sig_re = re.compile(r'\b(\w+)\s*\(([^;()]*?\b%s\s*&\s*(\w+)\b[^;()]*?)\)\s*(?:const\s*)?\{' % re.escape(name))
     fillers, bodies, params = {}, {}, {}
     for s in text.values():
+        s = blank_comments(s)
         for m in sig_re.finditer(s):
             fname, param = m.group(1), m.group(3)
             if fname in ('if', 'for', 'while', 'switch'):
@@ -123,7 +182,25 @@ def filler_functions(name, text):
     return {k: v for k, v in fillers.items() if v}
 
 
-def hand_built_sites(name, text, fillers):
+def in_builder(s, pos, name):
+    """True when this instance is the local of a function that RETURNS the struct -- the builder
+    itself, not one of its callers.
+
+    The builder deliberately leaves fields to the caller (rhoSimpleFoam's leaves the solver VARIANTS:
+    the colouring, the preconditioner, the sweep count), and comparing it against its own callers
+    reports every one of those as an omission. It is the one site that cannot be omitting anything:
+    whatever it does not set is what its callers set."""
+    head = s.rfind('\n%s ' % name, 0, pos)
+    if head == -1:
+        return False
+    # a function signature `Name f(...)` whose body contains this position
+    m = re.match(r'\n%s\s+\w+\s*\([^;{}]*\)\s*(?:const\s*)?\{' % re.escape(name), s[head:])
+    if not m:
+        return False
+    return head + m.end() <= pos
+
+
+def hand_built_sites(name, text, fillers, builders=None):
     """[(file, line, var, assigned fields)] where `Type var;` is followed by var.field = ... or by a
     call that hands var to a filler function."""
     inst_re = re.compile(r'\b%s\s+(\w+)\s*(?:\{\s*\})?;' % re.escape(name))
@@ -138,7 +215,11 @@ def hand_built_sites(name, text, fillers):
                 for call in re.finditer(r'\b%s\s*\(([^;]*?)\)\s*;' % re.escape(fname), window):
                     if re.search(r'(^|[^\w.])%s\b' % re.escape(var), call.group(1)):
                         assigned |= fields
-            if assigned:
+            # ...and `var = buildX(...)`, which fills every field buildX fills
+            for fname, fields in (builders or {}).items():
+                if re.search(r'\b%s\s*=\s*%s\s*\(' % (re.escape(var), re.escape(fname)), window):
+                    assigned |= fields
+            if assigned and not in_builder(s, m.start(), name):
                 sites.append((f, s[:m.start()].count('\n') + 1, var, assigned))
     return sites
 
@@ -175,7 +256,8 @@ def main(argv):
     evaluated = set()          # structs with >= 2 sites INSIDE this scan: the only ones whose ledger lines can be stale
     seen = set()
     for name, defs in sorted(structs.items()):
-        all_sites = hand_built_sites(name, text, filler_functions(name, text))
+        all_sites = hand_built_sites(name, text, filler_functions(name, text),
+                                     returning_builders(name, text))
         for _, fields in defs:
             fieldnames = {n for n, _ in fields}
             # only the sites that COULD be building this definition: one assigning a field the
