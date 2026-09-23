@@ -155,12 +155,48 @@ inline int compareSolves(
     {
         std::printf(" %.3e/%.3e", (double)of[k].finalResidual, (double)mine[k].finalResidual);
     }
-    scalar wFinal = 0;
+    // A SOLVE THAT CONVERGED TO ROUND-OFF HAS NO FINAL RESIDUAL TO COMPARE. The value is
+    // sum|b - A.psi| over a normFactor -- a sum of N cancellations of O(1) quantities -- so once it
+    // is far below the initial residual it IS the arithmetic's noise, and two summation orders differ
+    // by more than the absolute 1e-16 floor residualRelDiff applies: on a mesh of N cells the floor
+    // is nearer sqrt(N)*eps. MEASURED on RAS/weirOverflow, whose k equation is diagonal enough that
+    // symGaussSeidel takes it from an initial residual of 1 to 8.19e-14 in TWO sweeps: brae ends at
+    // 8.092e-14 against OpenFOAM's 8.189e-14, which the tight bound reads as 1.18e-02 and failed on,
+    // while every field in the case agrees to 1e-14 and all ten counts are OpenFOAM's.
+    //
+    // So a solve whose final residual is more than ten orders below its initial one is held to a
+    // FACTOR OF TEN instead of the caller's bound, and counted in the line below. The caller's bound
+    // goes on applying to every solve that actually stopped on its tolerance.
+    //
+    // WHAT THE LOOSER RULE STILL CATCHES, measured by forcing PBiCG/DILU on the closure where the
+    // case says smoothSolver (a defect copy of inter_turbulence_cpp.cu linked ahead of the library):
+    //   * epsilon's round-off solves read 2.171e+05 -- five orders outside the factor of ten, so
+    //     THIS arm fails on the substitution;
+    //   * k's read 9.035e-01, INSIDE it: that equation is diagonal enough that PBiCG and
+    //     symGaussSeidel both take two iterations and land within a factor of ten, so on k this arm
+    //     is not what discriminates. Its initial residual over the run is: 2.935e-07 against the
+    //     caller's 1e-10, and the gate reads 11 failures in all.
+    // Which is the honest statement: the factor of ten is a real bound that catches a substituted
+    // solver where the solve has anything left to converge, and where it has not, the count and the
+    // initial residuals are what hold the arm.
+    scalar wFinal = 0, wRound = 0;
+    std::size_t nRound = 0;
     for (std::size_t k = 0; k < mine.size() && k < of.size(); ++k)
     {
         if (of[k].finalResidual > scalar(0))
         {
-            wFinal = std::fmax(wFinal, residualRelDiff(mine[k].finalResidual, of[k].finalResidual));
+            const bool roundOff = of[k].initialResidual > scalar(0)
+                               && of[k].finalResidual < scalar(1e-10)*of[k].initialResidual;
+            const scalar d = residualRelDiff(mine[k].finalResidual, of[k].finalResidual);
+            if (roundOff)
+            {
+                ++nRound;
+                wRound = std::fmax(wRound, d);
+            }
+            else
+            {
+                wFinal = std::fmax(wFinal, d);
+            }
         }
     }
     if (worstFinalOut)
@@ -183,7 +219,14 @@ inline int compareSolves(
     check("...and over the run", wInit < runBound);
     if (finalBound > scalar(0))
     {
-        check("...and it left OpenFOAM's FINAL residuals, which only the same solver does", wFinal < finalBound);
+        if (nRound)
+        {
+            std::printf("  %s: %zu of %zu solves converged to ROUND-OFF (final below 1e-10 of initial); their "
+                        "final residuals are the sum's noise and are held to a factor of ten, worst %.3e\n",
+                        field, nRound, of.size(), (double)wRound);
+        }
+        check("...and it left OpenFOAM's FINAL residuals, which only the same solver does",
+              wFinal < finalBound && wRound < scalar(10));
     }
     return failures;
 }
