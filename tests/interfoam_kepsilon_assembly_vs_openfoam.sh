@@ -99,7 +99,7 @@ fail() { echo "  FAIL: $1"; rc=1; }
 # stage <name> <scheme text>
 stage()
 {
-    local name="$1" scheme="$2"
+    local name="$1" scheme="$2" gradEntry="${3:-}"
     local C="$W/$name"
     rm -rf "$C"
     cp -r "$SRC" "$C" || return 1
@@ -108,7 +108,7 @@ stage()
     grep -q "RASModel  *kEpsilon;" "$C/constant/turbulenceProperties" \
         || { echo "FAIL: the tutorial no longer names kEpsilon"; return 1; }
 
-    SCHEME="$scheme" python3 - "$C" <<'PYEOF' || { echo "FAIL: staging $name"; return 1; }
+    SCHEME="$scheme" GRADENTRY="$gradEntry" python3 - "$C" <<'PYEOF' || { echo "FAIL: staging $name"; return 1; }
 import os, re, sys
 d, scheme = sys.argv[1], os.environ['SCHEME']
 p = os.path.join(d, 'system/fvSchemes')
@@ -119,6 +119,13 @@ for eqn in ('k', 'epsilon'):
                    lambda m: m.group(1) + 'Gauss ' + scheme + ';', s, flags=re.M)
     assert k == 1, 'the tutorial no longer carries one div(rhoPhi,%s) entry' % eqn
     n += k
+# ...and grad(k)/grad(epsilon), which is what the LIMITER's gradient resolves
+grad = os.environ.get('GRADENTRY', '')
+if grad:
+    s, k = re.subn(r'^(gradSchemes\s*\n\{\n)',
+                   lambda m: m.group(1) + '    grad(k)         %s;\n    grad(epsilon)   %s;\n' % (grad, grad),
+                   s, flags=re.M)
+    assert k == 1, 'no gradSchemes block to add grad(k) to'
 open(p, 'w').write(s)
 
 c = os.path.join(d, 'system/controlDict')
@@ -202,6 +209,11 @@ PYEOF
 
 stage limitedLinear "limitedLinear 1" || { echo "interfoam_kepsilon_assembly_vs_openfoam: staging failed"; exit 1; }
 stage upwind        "upwind"          || { echo "interfoam_kepsilon_assembly_vs_openfoam: staging failed"; exit 1; }
+# ...and the same scheme with the LIMITER'S OWN GRADIENT limited, which is a second fvSchemes entry
+# (`grad(k)`) that the limiter resolves through gradSchemes like any other gradient
+# (LimitedScheme.C:56-59). interFoam's site passed a literal 0 for it and limited nothing.
+stage gradLimited   "limitedLinear 1" "cellLimited Gauss linear 1" \
+    || { echo "interfoam_kepsilon_assembly_vs_openfoam: staging failed"; exit 1; }
 
 # runBrae <case> <arm> -- both arms write the SAME eight column names, so each gets its own directory
 runBrae()
@@ -236,6 +248,8 @@ runBrae limitedLinear host   || rc=1
 runBrae limitedLinear device || rc=1
 runBrae upwind       host    || rc=1
 runBrae upwind       device  || rc=1
+runBrae gradLimited  host    || rc=1
+runBrae gradLimited  device  || rc=1
 
 if [ $rc = 0 ]; then
     compare limitedLinear limitedLinear host   match  "A host  limitedLinear vs OpenFOAM's own" \
@@ -257,6 +271,21 @@ if [ $rc = 0 ]; then
     compare limitedLinear upwind device differ "E DEVICE upwind vs OpenFOAM's limitedLinear" \
         && pass "CONTROL: ...and the other way round" \
         || fail "CONTROL: ...and the other way round"
+
+    compare gradLimited gradLimited host   match  "F host  cellLimited grad(k) vs OpenFOAM's own" \
+        && pass "the HOST limits the LIMITER's own gradient as the case says" \
+        || fail "the HOST limits the LIMITER's own gradient as the case says"
+
+    compare gradLimited gradLimited device match  "G DEVICE cellLimited grad(k) vs OpenFOAM's own" \
+        && pass "...and so does the DEVICE" \
+        || fail "...and so does the DEVICE"
+
+    # ...and the control for THAT: the same scheme with the limiter's gradient UNLIMITED. This is the
+    # defect both arms carried -- interFoam's host site passed a literal 0 for the coefficient and the
+    # device site never set it at all -- and it is worth 1.9e-01 on the off-diagonals.
+    compare limitedLinear gradLimited device differ "H DEVICE cellLimited grad(k) vs OpenFOAM's UNLIMITED" \
+        && pass "CONTROL: the gate can witness the limiter's own gradient entry" \
+        || fail "CONTROL: the gate can witness the limiter's own gradient entry"
 fi
 
 echo "interfoam_kepsilon_assembly_vs_openfoam: rc $rc"

@@ -271,9 +271,13 @@ void correct(
     // caller keeps the arithmetic it was gated with.
     bool   limitedLinear = false,
     scalar limiterCoeff  = 1.0,
-    // cellLimited k of the case's grad(<field>), which limits the LIMITER's gradient.
-    // 0 => unlimited, which is what this closure did unconditionally.
-    scalar limGradK      = 0.0,
+    // NO limGradK PARAMETER. The cellLimited coefficient of the case's grad(<field>) -- which limits
+    // the LIMITER's gradient -- is `co.gradKLimitK`, beside `co.gradKLeastSq`, which this closure has
+    // always read from `co`. It used to be a parameter as well: interFoam's site passed a literal 0
+    // and so limited nothing, MEASURED 1.9e-01 off OpenFOAM on the assembled off-diagonals of
+    // RAS/damBreak with `grad(k) cellLimited Gauss linear 1` and `Gauss limitedLinear 1`
+    // (tests/interfoam_kepsilon_assembly_vs_openfoam.sh, the `gradLimited` case). One entry, one
+    // field, and no site left that can forget it.
     // fvSolution solvers/<field>/minIter, OF's lduMatrix::solver floor on the iteration count
     // (PBiCGStab.C:262-265: the loop continues while nIterations < minIter even when converged).
     int    minIter       = 0,

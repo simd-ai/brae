@@ -249,7 +249,6 @@ void correct(
     bool constrainBeforeWall,
     bool   limitedLinear,
     scalar limiterCoeff,
-    scalar limGradK,
     int    minIter,
     const NutWallSelection* nutSel,
     bool   linearUpwind,
@@ -506,8 +505,8 @@ void correct(
             epsilon.boundary[pi]->updateFromFlux(patchFlux.boundary[pi]);
         }
 
-        FvScalarMatrix M = divWithScheme(phi, epsilon, limitedLinear, limiterCoeff, limGradK, m, g, patches,
-                                         linearUpwind, luGradK, co.gradKLeastSq);
+        FvScalarMatrix M = divWithScheme(phi, epsilon, limitedLinear, limiterCoeff, co.gradKLimitK,
+                                         m, g, patches, linearUpwind, luGradK, co.gradKLeastSq);
         if (res && res->captureStages)
         {
             captureSystem(M, patches, res->epsDivD, res->epsDivSrc, &res->epsDivUpper, &res->epsDivLower);
@@ -739,8 +738,8 @@ void correct(
             k.boundary[pi]->updateFromFlux(patchFlux.boundary[pi]);
         }
 
-        FvScalarMatrix M = divWithScheme(phi, k, limitedLinear, limiterCoeff, limGradK, m, g, patches,
-                                         linearUpwind, luGradK, co.gradKLeastSq);
+        FvScalarMatrix M = divWithScheme(phi, k, limitedLinear, limiterCoeff, co.gradKLimitK,
+                                         m, g, patches, linearUpwind, luGradK, co.gradKLeastSq);
         {
             // `Gauss linear corrected` changes TWO things, and kOmegaSST in this same directory already
             // does both: the implicit face coefficient becomes gamma*nonOrthDeltaCoeffs*magSf, and the

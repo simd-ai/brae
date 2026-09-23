@@ -1419,7 +1419,8 @@ Residuals rhoSimpleStep(
                              in.relaxEpsilon, in.relaxK, in.tolTurb, in.relTolTurb, in.maxIterTurb,
                              keco, &kres, in.boundedTurb, /*dropTerm=*/0, &comp, in.fvOpts,
                              in.relaxEquationEps, in.relaxEquationK, /*constrainBeforeWall=*/true,
-                             in.limitedLinearTurb, in.turbLimiterCoeff, in.turbLimGradK,
+                             // `keco.gradKLimitK` carries the limiter's gradient limiter (one field)
+                             in.limitedLinearTurb, in.turbLimiterCoeff,
                              in.minIterTurb, &nsel, in.linearUpwindTurb, in.turbLUGradK);
         res["epsilon"] = kres.epsilon;
         res["k"]       = kres.k;

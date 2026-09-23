@@ -927,7 +927,10 @@ void correctInterTurbulence(
                          t.epsRelaxFinal.factor, t.kRelaxFinal.factor, ks.tol, ks.relTol, ks.maxIter,
                          t.coeffs, &res, /*bounded=*/false, /*dropTerm=*/0, &comp, in.fvOptions,
                          t.epsRelaxFinal.on, t.kRelaxFinal.on, /*constrainBeforeWall=*/true,
-                         t.closureLimitedLinear, t.closureLimiterCoeff, /*limGradK=*/scalar(0),
+                         // the limiter's gradient limiter is `t.coeffs.gradKLimitK`, which the closure
+                         // reads from the coeffs it was handed -- this site used to pass a literal 0
+                         // here and limited nothing (1.9e-01 off OpenFOAM, gated on RAS/damBreak)
+                         t.closureLimitedLinear, t.closureLimiterCoeff,
                          ks.minIter, &sel, /*linearUpwind=*/false, /*luGradK=*/scalar(0), &which);
     if (kd.on)
     {
