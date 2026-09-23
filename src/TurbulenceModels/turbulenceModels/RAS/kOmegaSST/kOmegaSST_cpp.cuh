@@ -167,6 +167,10 @@ struct SSTResiduals
     std::vector<tensor> gradU;
     // the assembled systems, before relax and after, plus the off-diagonals a per-cell view misses
     std::vector<scalar> omD0, omSrc0, omD, omSrc, omUpper, omLower;
+    // the PAIR's off-diagonal (the coupled patches' boundaryCoeffs, flattened in patch order). It is
+    // not folded into omSrc/kSrc: see captureSSTSystem for why an interface coefficient in a source
+    // column is a difference in the instrument rather than in the system.
+    std::vector<scalar> omIfc, kIfc;
     std::vector<scalar> kD0,  kSrc0,  kD,  kSrc,  kUpper,  kLower;
 };
 
