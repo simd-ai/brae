@@ -5,6 +5,8 @@
 //   openfoam: src/OpenFOAM/db/IOstreams/IOstreams/IOstream.H (precision_, default 6)
 //             src/OpenFOAM/db/Time/TimeIO.C:375-383 (writePrecision -> defaultPrecision -> Sout)
 //   brae:     src/OpenFOAM/db/IOstreams/io_precision.cu
+//   tests:    tests/bound_at_construction_vs_openfoam.sh -- every gate that compares brae's WRITTEN fields
+//             against OpenFOAM's reads them back at this precision; a narrower one shows there first.
 //
 // OpenFOAM keeps ONE global for this: Time::readDict sets IOstream::defaultPrecision() from the case's
 // `writePrecision` and re-points Sout, Serr, Pout and Perr at it, and Info writes through Sout. So every

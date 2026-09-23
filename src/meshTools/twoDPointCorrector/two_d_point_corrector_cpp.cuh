@@ -9,6 +9,9 @@
 //             src/meshTools/meshTools/meshTools.C:628-646 (constrainToMeshCentre)
 //             src/OpenFOAM/meshes/primitiveMesh/primitiveMeshEdges.C (the edges it walks)
 //             src/dynamicMesh/motionSolvers/motionSolver/motionSolver.C:207-210 (twoDCorrectPoints)
+//   tests:    tests/displacement_laplacian_vs_openfoam.sh -- its only caller is the displacement motion
+//             solver, and that gate runs the 2D cases where this correction is what keeps the
+//             empty direction flat.
 //
 // THE PLANE NORMAL IS TAKEN ONCE, from the first face of the first non-empty `empty` patch, when the
 // corrector is first used, and kept: the corrector is a MeshObject whose movePoints() keeps its

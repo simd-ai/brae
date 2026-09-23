@@ -8,6 +8,8 @@
 //             src/finiteVolume/cfdTools/general/CorrectPhi/correctUphiBCs.C:34-66
 //             applications/solvers/multiphase/interFoam/initCorrectPhi.H, correctPhi.H
 //             applications/solvers/multiphase/interFoam/interFoam.C:130-148
+//   tests:    tests/test_correct_phi.cu (the solve itself), tests/interfoam_moving_vs_openfoam.sh (where
+//             CorrectPhi runs after every mesh update) and tests/interfoam_ami_vs_openfoam.sh.
 //
 // WHY IT LIVES HERE. OpenFOAM's CorrectPhi is general cfdTools, and the mirror's place for it is
 // src/finiteVolume/cfdTools/general/CorrectPhi/. What it calls -- adjustPhi, makeRelative and

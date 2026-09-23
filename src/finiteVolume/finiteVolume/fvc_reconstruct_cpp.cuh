@@ -6,6 +6,9 @@
 //              src/finiteVolume/finiteVolume/fvc/fvcSurfaceIntegrate.C:160-170 (surfaceSum)
 //   cuda:      src/finiteVolume/finiteVolume/device_fvc_reconstruct.cu -- same gather addressing as
 //              deviceDiv but with the SAME SIGN on the neighbour; the identity below is its gate too.
+//   tests:    tests/test_fvc_reconstruct.cu (against OpenFOAM's own reconstruct), and
+//             tests/test_device_inter_ueqn.cu / tests/test_inter_peqn_cpp.cu where its result feeds
+//             the momentum and pressure steps.
 //
 //     SfHat = Sf/magSf
 //     reconstruct(ssf) = inv(surfaceSum(SfHat (x) Sf)) & surfaceSum(SfHat*ssf)

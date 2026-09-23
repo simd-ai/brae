@@ -5,6 +5,9 @@
 //   openfoam: applications/solvers/multiphase/interFoam/interFoam.C:90-176
 //   brae:     the stage ORDER is inter_solve_cpp.cuh's runTimeStep, which this fills in; the case-to-
 //             fields translation is inter_case_cpp.cuh's buildInterFields, which the gate also calls.
+//   tests:    every interFoam gate runs this driver -- tests/interfoam_dambreak_vs_openfoam.sh is the
+//             plainest, tests/interfoam_moving_vs_openfoam.sh the widest (24 profiles), and
+//             tests/interfoam_refusals.sh holds what it must NOT run.
 //
 // WHY THE DRIVER OWNS NO NUMERICS. Every stage below is one call into a component that has its own
 // gate: alphaEqnStep, momentumPredictor, pressureCorrector, alphaCourantNo, setDeltaTVoF. What this

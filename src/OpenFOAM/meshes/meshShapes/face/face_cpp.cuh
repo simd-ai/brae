@@ -8,6 +8,8 @@
 //             src/OpenFOAM/meshes/meshShapes/face/faceIntersection.C:193-300 (nearestPoint,
 //                 nearestPointClassify)
 //             src/OpenFOAM/meshes/primitiveShapes/triangle/triangleI.H:747-900 (nearestPointClassify)
+//   tests:    tests/test_mesh_geometry.cu -- the face centres and areas this builds, against
+//             OpenFOAM's own on the same polyMesh.
 //
 // face::centre IS NOT THE MESH'S Cf. primitiveMesh computes Cf with its own sums
 // (primitiveMeshFaceCentresAndAreas.C) and the two differ in the last digits on any face that is not a

@@ -22,6 +22,9 @@
 //                 evaluate both write the patch's values into the point field)
 //             src/finiteVolume/fvMatrices/fvMatrix/fvMatrixSolve.C (solveSegregated)
 //             src/finiteVolume/finiteVolume/laplacianSchemes/gaussLaplacianScheme/gaussLaplacianSchemes.C
+//   tests:    tests/test_displacement_laplacian_vs_openfoam.cu and
+//             tests/displacement_laplacian_vs_openfoam.sh (the motion solve against OpenFOAM's),
+//             with tests/interfoam_moving_vs_openfoam.sh running it inside the solver.
 //
 // ONE newPoints(), IN OpenFOAM's ORDER, all of it on the mesh as it stands BEFORE the move:
 //   1. the diffusivity: 1/interpolate(y), y the meshWave distance to the named patches. y's boundary

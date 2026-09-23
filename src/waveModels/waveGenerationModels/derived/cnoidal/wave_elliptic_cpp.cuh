@@ -4,6 +4,9 @@
 //
 // provenance:
 //   openfoam:  src/waveModels/waveGenerationModels/derived/cnoidal/Elliptic.H:60-163
+//   tests:    tests/test_inter_waves_vs_openfoam.cu and tests/interfoam_waves_vs_openfoam.sh -- the
+//             cnoidal model that uses these elliptic integrals, against OpenFOAM's own surface
+//             elevation and velocity.
 //
 // Both are the arithmetic-geometric mean: K and E from its limit, the amplitude by the descending
 // Landen recurrence. The stopping test is |a - g| < SMALL (1e-15) in both, with the amplitude's

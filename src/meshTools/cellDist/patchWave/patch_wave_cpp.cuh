@@ -11,6 +11,8 @@
 //             src/meshTools/cellDist/cellDistFuncs.C:42 (useCombinedWallPatch = true), :244-420
 //                 (correctBoundaryCells)
 //             src/meshTools/cellDist/cellDistFuncsTemplates.C (smallestDist, getPointNeighbours)
+//   tests:    tests/test_cell_wall_dist.cu (the wall distance this computes, against OpenFOAM's own) and
+//             tests/interfoam_moving_vs_openfoam.sh, where it is recomputed after every mesh update.
 //
 // THE WAVE IS NOT A NEAREST-FACE SEARCH. Each wall face seeds its own centre; the centre travels face
 // to cell to face, and a cell takes a new one only when it is nearer by more than 1% of the squared

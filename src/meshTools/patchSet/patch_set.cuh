@@ -6,6 +6,9 @@
 //   openfoam: src/OpenFOAM/meshes/polyMesh/polyBoundaryMesh/polyBoundaryMesh.C (patchSet)
 //   used by:  the inverseDistance diffusivity (displacement_laplacian_fv_motion_solver_cpp.cu) and, through
 //             the wallDist it registers, interFoam's kOmegaSST (inter_case_cpp.cu)
+//   tests:    tests/displacement_laplacian_vs_openfoam.sh and tests/interfoam_moving_vs_openfoam.sh --
+//             the motion solver and interFoam's case reader resolve their patch groups through this,
+//             and a wrong set moves (or freezes) the wrong patch there.
 #include "cf_types.cuh"
 #include "foam_dict.cuh"   // compileFoamRegex
 #include "fv_patch.cuh"

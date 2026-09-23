@@ -5,6 +5,8 @@
 //   openfoam:  src/OpenFOAM/matrices/lduMatrix/lduMatrix/lduMatrixSolver.C:195-205 (readControls:
 //              tolerance 1e-6, relTol 0, maxIter 1000, minIter 0 when absent)
 //              src/OpenFOAM/matrices/lduMatrix/solvers/smoothSolver/smoothSolver.C:78 (nSweeps 1)
+//   tests:    tests/test_inter_gamg_vs_openfoam.cu and tests/interfoam_gamg_vs_openfoam.sh (the solver
+//             this dispatches to, against OpenFOAM's own iteration counts and residuals).
 //
 // Hoisted out of InterFields, where it was the nested AlphaLinearSolve, because the turbulence block
 // reads the same entry for k and epsilon and InterFields holds that block.

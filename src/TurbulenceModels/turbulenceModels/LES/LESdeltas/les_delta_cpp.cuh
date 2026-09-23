@@ -14,6 +14,8 @@
 //                  iterate, updateCell, updateFace), FaceCellWaveBase.C:42 (propagationTol_ = 0.01)
 //              src/OpenFOAM/meshes/polyMesh/polyMesh.C calcDirections (nGeometricD: empty AND wedge
 //                  patches knock directions out)
+//   tests:    tests/interfoam_les_vs_openfoam.sh and tests/test_inter_les_vs_openfoam.cu -- the filter
+//             width on LES/nozzleFlow2D, both arms, including its recompute on a moving mesh.
 //
 // cubeRootVol:  3-D   delta = deltaCoeff*cbrt(V)
 //               2-D   delta = deltaCoeff*sqrt(V/thickness), thickness = the mesh's bounding-box span in the

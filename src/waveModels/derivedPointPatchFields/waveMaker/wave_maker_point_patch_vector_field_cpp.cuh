@@ -8,6 +8,9 @@
 //                 (initialiseGeometry), :174-235 (the dictionary constructor), :278-436 (updateCoeffs)
 //             src/waveModels/derivedPointPatchFields/waveMaker/waveMakerPointPatchVectorField.H:201
 //                 (firstTime)
+//   tests:    tests/interfoam_moving_vs_openfoam.sh -- the waveMakerPiston and waveMakerFlap profiles,
+//             whose paddle displacement this condition writes, gated against OpenFOAM with their
+//             pressure solves converged.
 //
 // THE PADDLE GEOMETRY IS THE PATCH'S AT CONSTRUCTION: its bounding box, the paddle centres and every
 // point's paddle are taken from the points the mesh had then and never again. updateCoeffs reads the

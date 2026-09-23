@@ -7,6 +7,9 @@
 //                :170-196  the constructor, where deltaN_ and the two coefficients come from
 //                :~165     surfaceTensionForce()
 //   cuda:      src/transportModels/interfaceProperties/device_interface_properties.cu  (not written yet)
+//   tests:    tests/test_interface_properties.cu, tests/test_interface_curvature_cpp.cu and
+//             tests/interfoam_curvature_vs_openfoam.sh (nHat, curvature and the surface-tension
+//             force against OpenFOAM); tests/test_device_interface_properties.cu holds the device twin.
 //
 // calculateK(), step by step, because every line of it is a place a VoF port goes quietly wrong:
 //

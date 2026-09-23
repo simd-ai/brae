@@ -116,6 +116,9 @@ SurfaceScalarField rhoFlux(const std::vector<scalar>& rho,
 // fvc::snGrad(vf) -- the explicit surface-normal gradient, needed by SIMPLEC's phiHbyA correction.
 //
 // provenance: snGradScheme.C (snGrad(vf, deltaCoeffs)) and correctedSnGrad.C (the correction).
+//   tests:    tests/test_divdevreff.cu, tests/test_fvc_reconstruct.cu, tests/rho_ueqn_vs_openfoam.sh --
+//             the explicit operators against OpenFOAM's own; tests/test_peqn_cuda.cu and
+//             tests/test_gpu_resident_turb.cu hold the device twins against them.
 //
 // `corrected` and `limitCoeff` come from snGradSchemes (fvcSnGrad.C:56-64 -> schemesLookup.C:249),
 // NOT from the laplacian's entry. The two were one flag in brae until 2026-09-15.

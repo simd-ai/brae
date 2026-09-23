@@ -8,6 +8,8 @@
 //             src/OpenFOAM/db/dynamicLibrary/dynamicCode/dynamicCode.C:71-79 (checkSecurity: no dynamic
 //             code as root)
 //   brae:     codedFunction1.cu (the first user; its generated file names and keys are unchanged)
+//   tests:    tests/test_frozen_bc_guard.cu and tests/brae_subcommands.sh -- the coded boundary conditions
+//             this compiles at run time, and the guard that refuses a stale one.
 //
 // WHY brae DOES NOT CALL wmake. The snippet is compiled against a SHIM of OpenFOAM's scope, never
 // against OpenFOAM's headers, so the result does not depend on an OpenFOAM installation. What the shim

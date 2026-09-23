@@ -9,6 +9,8 @@
 //             src/OpenFOAM/meshes/primitiveMesh/PrimitivePatch/PrimitivePatchMeshData.C (calcMeshData)
 //             src/OpenFOAM/meshes/primitiveMesh/PrimitivePatch/PrimitivePatchPointAddressing.C
 //                 (calcPointFaces)
+//   tests:    tests/test_mesh_geometry.cu and tests/test_face_area_weight_ami.cu -- the patch
+//             addressing and local points this builds, which the AMI weights are computed on.
 //
 // WHY THE ORDER IS THE CONTENT. Every list here is a SET in the mathematics and a SEQUENCE in the code
 // that reads it: a wall-distance wave visits a cell's faces in cells() order and keeps the first of two

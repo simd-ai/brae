@@ -8,6 +8,9 @@
 //   openfoam: src/finiteVolume/finiteVolume/gradSchemes/gaussGrad, leastSquaresGrad,
 //             limitedGradSchemes/cellLimitedGrad
 //   brae:     fvc.cu (gaussGrad, leastSquaresGrad), cellLimitedGrad_cpp.cu
+//   tests:    tests/leastsquares_grad_vs_openfoam.sh, tests/test_celllimited_cpp.cu (each scheme this
+//             chooses between, against OpenFOAM), tests/test_empty_face_grad.cu and
+//             tests/test_empty_patch_inert.cu (the empty-direction cases the choice must not change).
 #include "cellLimitedGrad_cpp.cuh"
 #include "fvc.cuh"
 #include "geometric_field.cuh"

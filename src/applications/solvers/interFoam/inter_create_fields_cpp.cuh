@@ -7,6 +7,8 @@
 //              src/finiteVolume/cfdTools/general/include/readhRef.H   (READ_IF_PRESENT)
 //              src/finiteVolume/cfdTools/general/include/gh.H:2-12
 //   cuda:      src/applications/solvers/interFoam/interCreateFields.cu   (not written yet)
+//   tests:    tests/test_inter_create_fields.cu (field by field against OpenFOAM's createFields.H) and
+//             tests/interfoam_createfields_vs_openfoam.sh.
 //
 //     ghRef = mag(g) > SMALL ? g & (cmptMag(g)/mag(g))*hRef : 0      gh.H:2-7
 //     gh    = (g & C)  - ghRef                                      gh.H:11   cell centres

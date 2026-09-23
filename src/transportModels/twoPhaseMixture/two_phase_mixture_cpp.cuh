@@ -7,6 +7,8 @@
 //                  incompressibleTwoPhaseMixture.C:43-56 (calcNu), :126-141 (mu)
 //              applications/solvers/multiphase/interFoam/createFields.H:44-54 (rho)
 //   cuda:      src/transportModels/twoPhaseMixture/device_two_phase_mixture.cu   (not written yet)
+//   tests:    tests/test_two_phase_mixture.cu and tests/test_device_two_phase_mixture.cu (rho, mu and the
+//             mixture's limited alpha on both arms).
 //
 // RHO AND MU DO NOT CLAMP THE SAME WAY, and that asymmetry is the whole reason this file is separate
 // from a one-line blend:

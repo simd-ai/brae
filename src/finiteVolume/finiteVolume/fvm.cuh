@@ -354,6 +354,11 @@ FvMatrix<T> laplacian(
 //
 // provenance: linearUpwind.C (the `vector` specialisation, which is the one U takes) and
 //             gaussConvectionScheme.C:112-115.
+//   tests:    tests/test_device_laplacian_vs_host.cu, tests/test_device_cyclic_laplacian_vs_host.cu (the
+//             laplacian's coefficients against the host reference, with and without a pair),
+//             tests/test_peqn_cpp.cu and tests/test_rho_kepsilon_cpp.cu (div and ddt inside an
+//             assembled equation). Every solver gate runs these operators; these are the ones that
+//             compare the OPERATOR rather than the answer.
 //
 // linearUpwind derives from `upwind`, so its WEIGHTS are the upwind weights -- the matrix built by
 // fvm::div above is already exactly right and does not change. The whole of the scheme is this explicit

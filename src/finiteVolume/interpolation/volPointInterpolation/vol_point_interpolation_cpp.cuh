@@ -8,6 +8,7 @@
 //                 :349-472 (makeWeights), :500-505 (movePoints: the weights are remade)
 //             src/finiteVolume/interpolation/volPointInterpolation/volPointInterpolate.C:129-164
 //                 (interpolateInternalField), :226-322 (flatBoundaryField, interpolateBoundaryField)
+//   tests:    tests/test_vol_point_interp.cu (against OpenFOAM's volPointInterpolation on the same mesh).
 //
 // TWO KINDS OF POINT, and the split is the whole of the scheme:
 //   a point on no face of a real patch   the cells around it, weighted 1/|p - C|
