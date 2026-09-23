@@ -573,13 +573,65 @@ PYEOF
 }
 
 # gate <name> <deltaT> <nSteps> <profile> <control case>
+#
+# THE 24 OF THESE ARE THE GATE'S CLOCK. With the oracle cached, OpenFOAM's staging is 32% of this
+# gate's wall time and brae's own two arms are 68% -- 24 runs of the test binary, each running a HOST
+# arm and a DEVICE arm on its own staged case, one after another. They are independent: each reads its
+# own case and its own control's written fields, which `stage` finished before any of them started.
+# So they are queued here and run through a bounded pool (MOVING_JOBS, default 4).
+#
+# WHY A POOL AND NOT `&` FOR ALL 24: one GPU. The device arms serialise on it whatever the shell does,
+# and 24 processes would also hold 24 cases' fields in memory at once. Four keeps the host arms (which
+# are CPU-bound and are most of the time) overlapped while the device arms queue.
+#
+# THE OUTPUT IS NOT INTERLEAVED: each job writes to its own log and the logs are printed in the order
+# the gate declares them, so a failure still reads exactly as it did when this was a serial loop.
+# MOVING_JOBS=1 restores that loop, which is what to set if a failure needs to be watched live.
+JOBS=${MOVING_JOBS:-4}
+QUEUE=()
 gate()
 {
-    local name="$1" dt="$2" n="$3" profile="$4" control="$5"
+    QUEUE+=("$1|$2|$3|$4|$5")
+}
+
+runOne()
+{
+    local name="$1" dt="$2" n="$3" profile="$4" control="$5" out="$6"
     local end
     end=$(python3 -c "print('%.10g' % ($n*float('$dt')))")
     "$BIN" "$W/$name" "$W/$name/0" "$W/$name/$end" "$n" "$W/$name/log.interFoam" "$profile" \
-           "$W/$control/$end"
+           "$W/$control/$end" > "$out" 2>&1
+}
+
+runQueue()
+{
+    local running=0 outs=() names=()
+    for spec in "${QUEUE[@]}"; do
+        IFS='|' read -r name dt n profile control <<< "$spec"
+        local out="$W/.gate.$name.log"
+        outs+=("$out")
+        names+=("$name")
+        # the STATUS goes to a file beside the log: `wait` cannot be asked twice about one pid, and a
+        # status read from the wrong place is how a parallel gate reports green while an arm failed
+        ( runOne "$name" "$dt" "$n" "$profile" "$control" "$out"; echo $? > "$out.rc" ) &
+        running=$((running + 1))
+        if [ "$running" -ge "$JOBS" ]; then
+            wait -n 2>/dev/null || wait
+            running=$((running - 1))
+        fi
+    done
+    wait
+    local k=0
+    for name in "${names[@]}"; do
+        cat "${outs[$k]}"
+        local st
+        st=$(cat "${outs[$k]}.rc" 2>/dev/null || echo 1)
+        if [ "$st" != 0 ]; then
+            echo "  FAIL: the $name arm exited $st"
+            rc=1
+        fi
+        k=$((k + 1))
+    done
 }
 
 rc=0
@@ -662,6 +714,8 @@ gate multiPiston    0.01  30 multiPiston    multiPistonStatic || rc=1
 gate multiFlap      0.01  30 multiFlap      multiFlapStatic   || rc=1
 gate closedDamBreak 0.001 20 closedDamBreak closedRef1e5 || rc=1
 gate closedDamBreakInitU 0.001 20 closedDamBreakInitU closedDamBreak || rc=1
+
+runQueue
 
 echo "interfoam_moving_vs_openfoam: rc $rc"
 exit $rc
