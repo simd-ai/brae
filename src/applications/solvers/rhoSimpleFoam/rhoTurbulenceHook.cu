@@ -143,8 +143,6 @@ void correctTurbulence(
     kin.divSchemeUnsupported  = opt.divSchemeUnsupported;
     kin.limitedLinear         = opt.limitedLinear;
     kin.limiterCoeff          = opt.limiterCoeff;
-    kin.limGradK              = opt.limGradK;
-    kin.limGradLeastSq        = opt.limGradLeastSq;
     kin.rDeltaT               = opt.rDeltaT;
     if (opt.rDeltaT > scalar(0))
     {
@@ -202,12 +200,10 @@ void correctTurbulence(
         sstIn.alphatWallMask = kin.alphatWallMask;  sstIn.alphatPrtFace = kin.alphatPrtFace;
         sstIn.boundedK = kin.boundedK;   sstIn.boundedOmega = kin.boundedEps;
         sstIn.limitedLinear = kin.limitedLinear;  sstIn.limiterCoeff = kin.limiterCoeff;
-        sstIn.limGradK = kin.limGradK;   sstIn.limGradLeastSq = kin.limGradLeastSq;
         sstIn.rDeltaT = kin.rDeltaT;     sstIn.rhoOldCell = kin.rhoOldCell;
         sstIn.linearUpwind = kin.linearUpwind;  sstIn.luGradK = kin.luGradK;
         sstIn.correctedLaplacian = kin.correctedLaplacian;
         sstIn.snGradLimitCoeff   = kin.snGradLimitCoeff;
-        sstIn.gradULimitK        = opt.co.gradULimitK;
         sstIn.relaxEquationOmega = kin.relaxEquationEps;  sstIn.relaxOmega = kin.relaxEps;
         sstIn.relaxEquationK     = kin.relaxEquationK;    sstIn.relaxK     = kin.relaxK;
         sstIn.tol = kin.tol;  sstIn.relTol = kin.relTol;  sstIn.maxIter = kin.maxIter;  sstIn.minIter = kin.minIter;

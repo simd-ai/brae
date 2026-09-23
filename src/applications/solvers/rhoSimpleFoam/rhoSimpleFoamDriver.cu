@@ -369,8 +369,6 @@ TurbulenceHookOptions buildTurbulenceHookOptions(
     opt.luGradK              = hin.turbLUGradK;
     opt.limitedLinear        = hin.limitedLinearTurb;
     opt.limiterCoeff         = hin.turbLimiterCoeff;
-    opt.limGradK             = hin.turbLimGradK;
-    opt.limGradLeastSq       = hin.turbLimGradLeastSq;
     opt.relaxEquationK   = hin.relaxEquationK;
     opt.relaxK           = hin.relaxK;
     // THE SECOND SCALAR'S OWN relaxation key -- `omega` under kOmegaSST, `epsilon` otherwise. The driver

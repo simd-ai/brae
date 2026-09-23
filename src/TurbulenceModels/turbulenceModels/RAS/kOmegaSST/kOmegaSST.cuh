@@ -134,13 +134,15 @@ struct KOmegaSSTInput
     bool   boundedOmega = false;
     bool   limitedLinear = false;      // ONE flag for the pair, as the host closure carries
     scalar limiterCoeff  = 1.0;        // RAW k; the transport helper converts to 2/max(k,SMALL)
-    scalar limGradK      = 0.0;        // the LIMITER's gradient limiter, from grad(<field>)
-    bool   limGradLeastSq = false;     // ...and its SCHEME, when the case names leastSquares
     bool   linearUpwind  = false;      // `Gauss linearUpwind <name>` on the pair (TransportScheme)
     scalar luGradK       = 0.0;        // ...the cellLimited coefficient of the gradient it NAMES
     bool   correctedLaplacian = false;
     scalar snGradLimitCoeff   = 0.0;
-    scalar gradULimitK        = 0.0;   // grad(U) cellLimited, for the production strain
+    // grad(U)'s cellLimited coefficient lives in `co` and NOWHERE ELSE. It used to be here as well --
+    // one fvSchemes entry in two fields of one struct -- and interFoam's site filled the coeffs half
+    // only, so the production strain ran on an UNLIMITED gradient while the host limited it (nut
+    // 4.1315e-01 on validation/interFoamCyclic `sstLimU`). The refusal that caught the two
+    // disagreeing is gone with the second field: there is nothing left to disagree.
     bool   relaxEquationOmega = false;
     scalar relaxOmega         = 1.0;
     bool   relaxEquationK     = false;

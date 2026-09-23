@@ -209,8 +209,6 @@ struct StepInput
     scalar turbLimiterCoeff  = 1.0;
     // cellLimited k of the LIMITER's gradient for k/epsilon|omega -- grad(k) through gradSchemes, which
     // is a different lookup from KEpsilonCoeffs::gradKLimitK's use in the corrected laplacian.
-    scalar turbLimGradK      = 0.0;
-    bool   turbLimGradLeastSq = false;
     // `Gauss linearUpwind <name>` on BOTH turbulence scalars, and the cellLimited coefficient of the
     // gradient scheme <name> resolves to (0 => unlimited Gauss linear). Both host closures assemble it;
     // the device closure does not, and the CUDA driver refuses it there by name.

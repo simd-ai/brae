@@ -62,16 +62,6 @@ void refuseUnsupported(const KOmegaSSTInput& in)
             "correctNut's boundary assignment is wrong there too: OpenFOAM's "
             "correctBoundaryConditions() overwrites a coupled face with the interpolated value, and "
             "a1*k_b/max(...) is not the interpolation of the same expression on the two cells.");
-    // ONE fvSchemes ENTRY, TWO FIELDS. `co.gradULimitK` and `gradULimitK` are both the case's
-    // `grad(U)` cellLimited coefficient; the production site reads the second. A caller that fills
-    // one and not the other runs a different scheme from the one the case named, silently -- which
-    // is what interFoam's site did until `sstLimU` measured it. Refused rather than picked.
-    if (in.co.gradULimitK != in.gradULimitK)
-        throw std::runtime_error(
-            "kOmegaSST(cuda): the caller gave two different cellLimited coefficients for grad(U) ("
-            + std::to_string((double)in.co.gradULimitK) + " in the coeffs, "
-            + std::to_string((double)in.gradULimitK) + " at the top level). They are the same "
-            "fvSchemes entry read twice; one of the two sites is stale.");
     if (in.hasCoupledPatches && in.cyc)
         throw std::runtime_error(
             "kOmegaSST(cuda): the caller both set `hasCoupledPatches` and handed a pair. One of the "
@@ -117,8 +107,14 @@ turbulence::TransportScheme schemeOf(const KOmegaSSTInput& in)
     sc.phiBnd             = in.phiBnd;
     sc.limitedLinear      = in.limitedLinear;
     sc.limiterCoeff       = in.limiterCoeff;
-    sc.limGradK           = in.limGradK;
-    sc.limGradLeastSq     = in.limGradLeastSq;
+    // the LIMITER's gradient: the case's grad(<field>) entry, which lives in `co` and only there.
+    // It used to be a second pair of fields on this input struct, and interFoam's site filled
+    // neither -- so a case naming `grad(k) cellLimited` limited nothing (1.9e-01 off OpenFOAM's
+    // assembled system on RAS/damBreak). Same entry as gradFieldLimitK below: OpenFOAM resolves the
+    // limiter's gradient (LimitedScheme.C:56-59) and correctedSnGrad's (correctedSnGrad.C:52-55)
+    // through the same gradSchemes lookup.
+    sc.limGradK           = in.co.gradKLimitK;
+    sc.limGradLeastSq     = in.co.gradKLeastSq;
     sc.linearUpwind       = in.linearUpwind;
     sc.luGradK            = in.luGradK;
     sc.correctedLaplacian = in.correctedLaplacian;
@@ -491,8 +487,9 @@ void correct(
     {
         deviceGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, gradU, /*ami=*/nullptr, in.cyc);
     }
-    if (in.gradULimitK > scalar(0))
-        deviceCellLimitGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, gradU, in.gradULimitK, in.cyc);
+    // `co.gradULimitK`, the case's ONE grad(U) entry (this struct used to carry it twice)
+    if (in.co.gradULimitK > scalar(0))
+        deviceCellLimitGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, gradU, in.co.gradULimitK, in.cyc);
     // FP-2: s2 + gByNu + G = nut*GbyNu0 in one read of the tensor (deviceSstProduction, bit-identical
     // to the three kernels it replaces).
     deviceSstProduction(gradU, nut, nC, S2, GbyNu0, G);

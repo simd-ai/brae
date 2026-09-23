@@ -174,7 +174,6 @@ struct RhoStepInput
     scalar schemeCoeffHe = 1.0, schemeCoeffKE = 1.0;
     scalar limGradHeK    = 0.0, limGradKEK    = 0.0;
     bool   limGradHeLeastSq = false, limGradKELeastSq = false;
-    bool   turbLimGradLeastSq = false;
     // grad(p)'s own gradSchemes entry resolving to leastSquares (fvcGrad.C:149): the momentum source
     // -grad(p)*V, U = HbyA - rAtU*grad(p), SIMPLEC's HbyA correction and each pressure branch's
     // non-orthogonal correction all take it. The host reference's StepInput::gradPLeastSq.

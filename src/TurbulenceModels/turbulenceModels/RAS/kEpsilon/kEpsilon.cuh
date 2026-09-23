@@ -244,8 +244,6 @@ struct KEpsilonInput
     // KEpsilonCoeffs::gradKLimitK's use in the corrected laplacian.
     bool        limitedLinear = false;
     scalar      limiterCoeff  = 1.0;
-    scalar      limGradK      = 0.0;
-    bool        limGradLeastSq = false;
     // `Gauss linearUpwind <name>` on the pair, and the cellLimited coefficient of the gradient it names
     // (turbulence_transport.cuh, TransportScheme::linearUpwind).
     bool        linearUpwind  = false;

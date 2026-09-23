@@ -77,8 +77,6 @@ struct TurbulenceHookOptions
     KOmegaSSTCoeffs sstCo;
     bool           limitedLinear = false;
     scalar         limiterCoeff  = 1.0;
-    scalar         limGradK      = 0.0;
-    bool           limGradLeastSq = false;
     // fvm::ddt(alpha, rho, k|epsilon|omega) under `ddtSchemes default Euler`: 1/deltaT, else 0 (the
     // term is an empty matrix under steadyState). rho.oldTime() comes from RhoSolverFields::rhoOld.
     scalar         rDeltaT       = 0.0;

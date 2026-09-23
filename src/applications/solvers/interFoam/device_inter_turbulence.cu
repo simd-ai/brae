@@ -617,8 +617,6 @@ void deviceCorrectInterTurbulence(
         // co.gradKLimitK below, and the closure refuses the two disagreeing.
         sin.limitedLinear   = t.closureLimitedLinear;
         sin.limiterCoeff    = t.closureLimiterCoeff;
-        sin.limGradK        = t.sstCoeffs.gradKLimitK;
-        sin.limGradLeastSq  = t.sstCoeffs.gradKLeastSq;
         // ...and the CONVECTION scheme, which this arm now RUNS. It was refused by name, and the
         // refusal was for want of a gate rather than for a measured defect: the only case that names
         // the scheme -- RAS/waterChannel `limitedLinear` -- cannot witness it on fields, because it
@@ -636,17 +634,15 @@ void deviceCorrectInterTurbulence(
         // second control is this arm's own upwind against OpenFOAM's upwind (3.6e-14), so the gap in
         // the first is the LIMITER and not a broken upwind path.
         //
-        // Still refused below: the device kEpsilon closure under the same scheme -- no oracle here
-        // writes its assembled system, so nothing gates it.
+        // The kEpsilon closure below runs it too, gated the same way on RAS/damBreak
+        // (tests/interfoam_kepsilon_assembly_vs_openfoam.sh).
+        //
+        // NOTHING IS SET HERE FOR grad(U)'s LIMITER any more. This site used to have to fill
+        // `sin.gradULimitK` as well as `sin.co.gradULimitK` -- one fvSchemes entry in two fields of
+        // one struct -- and filling only the second ran the production strain on an UNLIMITED
+        // gradient while the host limited it (nut 4.1315e-01 on validation/interFoamCyclic
+        // `sstLimU`). The second field is gone; `sin.co = t.sstCoeffs` above carries the entry once.
 
-        // ...and the grad(U) LIMITER, which this struct carries TWICE -- `co.gradULimitK` and a
-        // top-level `gradULimitK`, both the case's one `grad(U)` entry -- and the production site
-        // reads the top-level one. This site set only `co`, so a case naming `grad(U) cellLimited`
-        // ran the device closure's production on an UNLIMITED gradient while the host limited it:
-        // MEASURED on validation/interFoamCyclic `sstLimU`, nut 4.1315e-01 and k 3.3383e-02 against
-        // a host arm at 2.6965e-12 and 6.4243e-13. rhoSimpleFoam's hook has always set it
-        // (rhoTurbulenceHook.cu:210); the closure now refuses the two disagreeing.
-        sin.gradULimitK = t.sstCoeffs.gradULimitK;
         sin.correctedLaplacian = t.coeffs.correctedLaplacian;
         sin.snGradLimitCoeff = t.coeffs.snGradLimitCoeff;
         // the Final entries, as the kEpsilon branch below takes them: one outer corrector, so that one

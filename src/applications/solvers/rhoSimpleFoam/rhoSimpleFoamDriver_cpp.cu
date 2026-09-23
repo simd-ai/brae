@@ -489,8 +489,15 @@ StepInput buildStepInput(
                     "would be a substituted discretisation)";
             else
             {
-                in.turbLimGradK      = gK.cellLimitK;
-                in.turbLimGradLeastSq = gK.leastSquares;
+                // THE SAME TWO FIELDS the block above wrote, on purpose. grad(k) is ONE fvSchemes
+                // entry and the closures now carry it once (`co.gradKLimitK`, `co.gradKLeastSq`);
+                // this used to be a second pair (`turbLimGradK`/`turbLimGradLeastSq`) carried in
+                // parallel, and a site that filled one and not the other ran a scheme the case did
+                // not name. The block above guards `leastSquares` on whether a gradient is taken at
+                // all, which is false for a case whose ONLY reader is the limiter -- so when the
+                // limiter is on, the unguarded parse is written here, after it.
+                in.gradKLimitK  = gK.cellLimitK;
+                in.gradKLeastSq = gK.leastSquares;
             }
         }
     }

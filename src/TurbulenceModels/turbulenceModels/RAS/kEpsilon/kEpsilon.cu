@@ -732,8 +732,14 @@ void assembleTransport(
     sc.phiBnd             = in.phiBnd;
     sc.limitedLinear      = in.limitedLinear;
     sc.limiterCoeff       = in.limiterCoeff;
-    sc.limGradK           = in.limGradK;
-    sc.limGradLeastSq     = in.limGradLeastSq;
+    // the LIMITER's gradient: the case's grad(<field>) entry, which lives in `co` and only there.
+    // It used to be a second pair of fields on this input struct, and interFoam's site filled
+    // neither -- so a case naming `grad(k) cellLimited` limited nothing (1.9e-01 off OpenFOAM's
+    // assembled system on RAS/damBreak). Same entry as gradFieldLimitK below: OpenFOAM resolves the
+    // limiter's gradient (LimitedScheme.C:56-59) and correctedSnGrad's (correctedSnGrad.C:52-55)
+    // through the same gradSchemes lookup.
+    sc.limGradK           = in.co.gradKLimitK;
+    sc.limGradLeastSq     = in.co.gradKLeastSq;
     sc.linearUpwind       = in.linearUpwind;
     sc.luGradK            = in.luGradK;
     sc.correctedLaplacian = in.correctedLaplacian;
