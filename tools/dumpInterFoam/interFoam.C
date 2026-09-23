@@ -237,6 +237,18 @@ int main(int argc, char *argv[])
             #include "alphaControls.H"
             #include "alphaEqnSubCycle.H"
 
+            // ...and what the alpha step LEAVES for the momentum: the interface normal flux and the
+            // curvature. Written HERE and not in the mesh-update block, because a case with
+            // `correctPhi no` -- RAS/electrostaticDeposition -- never reaches that block.
+            if (getenv("BRAE_DUMP_ITER")
+             && runTime.timeIndex() == atoi(getenv("BRAE_DUMP_ITER")))
+            {
+                surfaceScalarField("nHatfA.dump", mixture.nHatf()).write();
+                volScalarField("sigmaKA.dump", mixture.sigmaK()()).write();
+                Info<< "[brae] dumped nHatf and sigmaK after the alpha step at timeIndex "
+                    << runTime.timeIndex() << endl;
+            }
+
             mixture.correct();
 
             if (pimple.frozenFlow())
