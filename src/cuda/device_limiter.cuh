@@ -8,6 +8,10 @@
 // provenance:
 //   openfoam: src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes (NVDTVD::r, vanLeer.H)
 //   brae:     src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedSchemes_cpp.cuh
+//   tests:    tests/interfoam_limitedlinear_vs_openfoam.sh (vector limitedLinear on div(rhoPhi,U),
+//             both arms), tests/interfoam_kepsilon_assembly_vs_openfoam.sh and
+//             tests/interfoam_sst_assembly_vs_openfoam.sh (the scalar limiter inside the closures'
+//             assembled system, against OpenFOAM's own, with a `Gauss upwind` control)
 #include "cf_types.cuh"
 
 namespace brae {

@@ -6,7 +6,7 @@
 //              src/finiteVolume/finiteVolume/fvc/fvcSurfaceIntegrate.C:160-170 (surfaceSum)
 //   host:      src/finiteVolume/finiteVolume/fvc_reconstruct_cpp.cuh -- the ORACLE, gated on the
 //              IDENTITY reconstruct(V & Sf) == V in tests/test_fvc_reconstruct.cu.
-//   tests:     tests/test_device_fvc_reconstruct.cu
+//   tests:     tests/test_fvc_reconstruct.cu
 //
 //     SfHat = Sf/magSf
 //     reconstruct(ssf) = inv(surfaceSum(SfHat (x) Sf)) & surfaceSum(SfHat*ssf)

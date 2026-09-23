@@ -808,6 +808,13 @@ set_tests_properties(manifest_interfoam_not_drifted PROPERTIES SKIP_RETURN_CODE 
 # with its reason; an unlisted one, or a listed one that no longer exists, fails here.
 # ...over the WHOLE of src now: the backlog the first run found (341 across 28 structs) is closed, so
 # a new omission anywhere is a new finding rather than one of a crowd.
+# ...and the other half of the same question: what each ported file SAYS holds it. Every provenance
+# block's `tests:` line names paths; this fails when one of them does not exist, which is the rot that
+# let braeInterFoam.cu keep saying `-device` refuses LES for units after it ran. `--gaps` (not run here)
+# lists the files that declare provenance and name no test at all.
+add_test(NAME mirror_coverage
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/mirror_coverage.py --check)
+
 add_test(NAME default_audit_interfoam
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/default_audit.py
                  --allow ${CMAKE_CURRENT_SOURCE_DIR}/tools/default_audit_allow.txt

@@ -4,7 +4,7 @@
 // provenance:
 //   openfoam: src/finiteVolume/cfdTools/general/bound/bound.C
 //   brae:     src/finiteVolume/cfdTools/general/bound/bound_cpp.cu
-//   tests:    tests/test_bound_cpp.cu
+//   tests:    tests/bound_at_construction_vs_openfoam.sh, tests/bound_message_vs_openfoam.sh
 //
 // THIS IS NOT A CLAMP, and the difference is not cosmetic. OpenFOAM writes
 //

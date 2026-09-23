@@ -8,7 +8,7 @@
 //   brae:
 //     reference: src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/kOmegaSST_cpp.cu
 //     cuda:      src/cuda/device_komega_sst.cu   (deviceKOmegaSSTCorrect)
-//     tests:     tests/test_komegasst_cpp.cu, tests/komegasst_vs_openfoam.sh
+//     tests:     tests/test_komegasst_cpp.cu, tests/test_komegasst_cpp.cu, tests/rho_komegasst_vs_openfoam.sh
 //
 // WHY A HOST REFERENCE AT ALL, when a validated CUDA kOmegaSST already exists: the same reason every other
 // component of this port has one. The device model is a single fused entry point; a disagreement with

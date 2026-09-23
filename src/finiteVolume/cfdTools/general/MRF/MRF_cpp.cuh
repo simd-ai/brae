@@ -6,7 +6,7 @@
 //             src/finiteVolume/cfdTools/general/MRF/MRFZoneList.C
 //             src/finiteVolume/cfdTools/general/MRF/MRFZoneTemplates.C
 //   brae:     src/finiteVolume/cfdTools/general/MRF/MRF_cpp.cu
-//   tests:    tests/test_mrf_cpp.cu, tests/mrf_cpp_vs_openfoam.sh
+//   tests:    tests/mrf_cpp_vs_openfoam.sh, tests/mrf_cuda_vs_openfoam.sh, tests/interfoam_mrf_vs_openfoam.sh, tests/mrf_cpp_vs_openfoam.sh
 //
 // simpleFoam reaches it in exactly three places that do arithmetic (UEqn.H:3,8 and pEqn.H:5):
 //

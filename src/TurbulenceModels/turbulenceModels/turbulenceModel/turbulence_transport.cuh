@@ -4,7 +4,10 @@
 // provenance:
 //   openfoam: fvm::div(phi, vf) - fvm::laplacian(DEff, vf), as every RAS model's correct() writes it
 //   brae:     src/TurbulenceModels/turbulenceModels/turbulenceModel/turbulence_transport.cu
-//   tests:    every gate covering the mirror device closures -- it is the same code they already ran
+//   tests:    tests/interfoam_sst_assembly_vs_openfoam.sh, tests/interfoam_kepsilon_assembly_vs_openfoam.sh
+//             -- both hold the system THIS assembles against OpenFOAM's own at the first closure
+//             call, with a `Gauss upwind` oracle as the control; and every other gate covering the
+//             mirror device closures runs the same code
 //
 // This lived inside the kEpsilon device closure, in an anonymous namespace, taking a KEpsilonInput. It
 // is not kEpsilon-specific: k, epsilon, omega, nuTilda and the Langtry-Menter pair all transport the
