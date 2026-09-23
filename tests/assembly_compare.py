@@ -24,6 +24,13 @@ import sys
 
 MATCH_BOUND = 1e-10     # two orders above the worst measured agreement on either gate (8.0e-13)
 DIFFER_FLOOR = 1e-3     # two orders below the smallest control measured (1.2e-01)
+# ...and per flavour where the floor is a different thing. brae's HOST arm against brae's DEVICE arm is
+# not brae against OpenFOAM: the two arms sum the same terms in different orders (a device gather
+# against a host loop), and on a developed field that is worth 1.7e-10 -- three orders more than the
+# 8.0e-13 an arm reaches against OpenFOAM's own instrument, which is one sum against one sum. The bound
+# is two orders above the worst measured, and the control still misses by 4.8e-01: seven orders of
+# margin. It is NOT a loosening of the bound above -- that one still holds every OpenFOAM comparison.
+FLAVOUR_BOUND = {"sstHostCuda": 1e-8}
 
 # flavour -> (OpenFOAM's eight, brae's eight), in the order
 # upper, lower, D, Src, kUpper, kLower, kD, kSrc
@@ -41,7 +48,19 @@ FLAVOURS = {
     "ke": (["stage_epsDUpper", "stage_epsDLower", "stage_epsD", "stage_epsSrc",
             "stage_kDUpper", "stage_kDLower", "stage_kD", "stage_kSrc"],
            ["epsUpper", "epsLower", "epsD", "epsSrc", "kUpper", "kLower", "kD", "kSrc"]),
+    # kOmegaSST, brae's HOST arm against brae's DEVICE arm -- both sides plain columns, no OpenFOAM
+    # oracle. It exists for a mesh with a PERIODIC PAIR, where OpenFOAM's own instrument cannot be the
+    # left-hand side: its stage_sstOm* are the internal faces and the folded boundary, and the pair's
+    # coefficient is neither. The chain is host == OpenFOAM (fields, gated) + device == host (here).
+    "sstHostCuda": (["omUpper", "omLower", "omD", "omSrc", "kUpper", "kLower", "kD", "kSrc"],
+                    ["omegaSysUpper", "omegaSysLower", "omegaSysD", "omegaSysSrc",
+                     "kSysUpper", "kSysLower", "kSysD", "kSysSrc"]),
 }
+# the flavours whose LEFT side is a brae dump (plain columns) rather than an OpenFOAM field
+PLAIN_LEFT = {"sstHostCuda"}
+# ...and the interface column they also compare: brae applies the pair's off-diagonal as
+# Apsi[own] += ifCoeff*psi[nbr] while the host keeps OpenFOAM's boundaryCoeffs, which is its NEGATIVE
+IFC = {"sstHostCuda": [("omIfc", "omegaSysIfc"), ("kIfc", "kSysIfc")]}
 # the labels the report prints, in the same order
 COLS = ["upper", "lower", "D", "Src", "k upper", "k lower", "k D", "k Src"]
 
@@ -69,6 +88,7 @@ def ofList(path):
 def main():
     ofDir, brDir, meshDir, flavour, expect, label = sys.argv[1:7]
     ofNames, brNames = FLAVOURS[flavour]
+    bound = FLAVOUR_BOUND.get(flavour, MATCH_BOUND)
 
     own = ofList(meshDir + "/owner")
     nei = ofList(meshDir + "/neighbour")
@@ -76,7 +96,10 @@ def main():
     nC = max(own) + 1
     want = [nIf, nIf, nC, nC, nIf, nIf, nC, nC]
 
-    of = [ofField(ofDir + "/" + n, w) for n, w in zip(ofNames, want)]
+    if flavour in PLAIN_LEFT:
+        of = [column(ofDir + "/" + n) for n in ofNames]
+    else:
+        of = [ofField(ofDir + "/" + n, w) for n, w in zip(ofNames, want)]
     br = [column(brDir + "/" + n) for n in brNames]
 
     # a column of the wrong length is a vacuous comparison, not a pass
@@ -115,6 +138,29 @@ def main():
         va, vb = of[3][i] / of[2][i], br[3][i] / br[2][i]
         worstValue = max(worstValue, abs(va - vb) / max(abs(va), 1e-30))
 
+    # ...and the PAIR's own off-diagonal, which is where a div scheme reaches a coupled patch and the
+    # one column the internal-face arrays cannot show. Compared NEGATED, and the sign is asserted: if
+    # the two agreed as-is, the convention would have changed under us.
+    for left, right in IFC.get(flavour, []):
+        try:
+            a = column(ofDir + "/" + left)
+            b = column(brDir + "/" + right)
+        except OSError:
+            print("  FAIL: %s: %s / %s is missing -- the pair's coefficient is not being written"
+                  % (label, left, right))
+            return 1
+        n = min(len(a), len(b))
+        if not n:
+            continue
+        scale = max(abs(x) for x in a) or 1.0
+        neg = max(abs(a[i] + b[i]) for i in range(n)) / scale
+        asis = max(abs(a[i] - b[i]) for i in range(n)) / scale
+        d["pair " + left] = neg
+        if expect == "match" and asis < neg:
+            print("  FAIL: %s: %s matches the device's %s WITHOUT negating (%.3e against %.3e) -- the "
+                  "interface sign convention has changed" % (label, left, right, asis, neg))
+            return 1
+
     print("  %s: %s" % (label, "  ".join("%s %.3e" % (k, v) for k, v in d.items())))
     print("     %d rows eliminated by setValues, their value %.3e; %d rows carry the scheme"
           % (len(pinned), worstValue, len(free)))
@@ -122,12 +168,12 @@ def main():
     ok = True
     if expect == "match":
         for k, v in d.items():
-            if not (v < MATCH_BOUND):
-                print("  FAIL: %s: %s is %.3e, above %.1e" % (label, k, v, MATCH_BOUND))
+            if not (v < bound):
+                print("  FAIL: %s: %s is %.3e, above %.1e" % (label, k, v, bound))
                 ok = False
-        if not (worstValue < MATCH_BOUND):
+        if not (worstValue < bound):
             print("  FAIL: %s: an eliminated row's value is %.3e, above %.1e"
-                  % (label, worstValue, MATCH_BOUND))
+                  % (label, worstValue, bound))
             ok = False
     else:
         moved = max(d.values())
