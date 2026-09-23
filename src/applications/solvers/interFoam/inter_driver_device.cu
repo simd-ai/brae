@@ -1330,6 +1330,9 @@ RunReport runInterFoamDevice(
     DeviceBuffer<scalar> dPhiOOI, dPhiOOB;
     std::vector<scalar> phiOldPrevI, phiOldPrevB;
     bool phiOOExists = false;
+    // ...and whether anything has asked for phi.oldTime() yet -- the static ddtCorr does, the moving
+    // one does not (it reads Uf.oldTime()), and the alpha blend asks last. See the host driver.
+    bool phiOldRequested = false;
     // ...and the PAIR's, kept beside them for the same reason its old level is
     DeviceBuffer<scalar> dPhiOOIf;
     std::vector<scalar> phiOldPrevIf;
@@ -1393,7 +1396,9 @@ RunReport runInterFoamDevice(
     C.mules = DeviceMulesControls{f.mulesCtl.nLimiterIter, f.mulesCtl.smoothLimiter,
                                   f.mulesCtl.extremaCoeff, f.mulesCtl.boundaryExtremaCoeff};
     C.alphaInput.cAlpha = f.interface.cAlpha;
-    C.alphaInput.deltaN = interfaceProps::deltaN(g.V());
+    // the CONSTRUCTOR's deltaN, which buildInterFields took off the mesh before any motion -- the
+    // same number the host arm's calculateK uses, and not this mesh's (InterfaceCoeffs::deltaN)
+    C.alphaInput.deltaN = f.interface.deltaN;
     // The alpha fluxes' schemes, EVERY ONE NAMED and neither mapping ending in a fall-through: both
     // used to, and `Gauss interfaceCompression` would have been taken as vanLeer on one flux and as
     // linear on the other without a word.
@@ -1859,6 +1864,15 @@ RunReport runInterFoamDevice(
             dCn.ocAlpha = offCentringCoeff(f.ddtAlpha, f.alphaCtl.nAlphaSubCycles, f.ddtAlphaOcCoeff,
                                            thisIndex > 1);
             dCn.cnAlpha = blendingCoeff(dCn.ocAlpha);
+            // ...and whether phi HAS an old-time level for that blend to use. On a MOVING mesh
+            // ddtCorr is fvcDdtUfCorr and reads Uf.oldTime(), so nothing requests phi.oldTime()
+            // before the alpha step -- which then creates it as a copy of the flux beside it, making
+            // the blend inert for that one step (see the host driver's note at offCentredFlux).
+            dCn.phiOldExists = phiOldRequested;
+            if (dCn.ocAlpha > scalar(0)) phiOldRequested = true;
+            // ...and on a STATIC mesh the pressure corrector's own ddtCorr (fvcDdtPhiCorr) asks for
+            // phi.oldTime() later in this same step, so the level exists from the next one
+            if (!dyn) phiOldRequested = true;
             dCn.alphaPhiOldInt = nullptr;
             dCn.alphaPhiOldBnd = nullptr;
             if (dCn.ocAlpha > scalar(0))

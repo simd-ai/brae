@@ -133,12 +133,98 @@ int main(int argc, char *argv[])
                         // from the mapped surface velocity
                         phi = mesh.Sf() & Uf();
 
+                        // ---- INSTRUMENTATION: writes only ------------------------------------
+                        // The mesh-update block's three flux stages. brae is exact on this case
+                        // with `correctPhi no` and 1.2e-03 out at step two with it on, so the gap
+                        // is between these three writes. Gated on BRAE_DUMP_ITER.
+                        const bool braeDump =
+                            getenv("BRAE_DUMP_ITER")
+                         && runTime.timeIndex() == atoi(getenv("BRAE_DUMP_ITER"));
+                        if (braeDump)
+                        {
+                            surfaceScalarField("phiAbsPre.dump", phi).write();
+                            surfaceScalarField("rAUfCorr.dump",
+                                               fvc::interpolate(rAU())()).write();
+                            surfaceScalarField("meshPhiU.dump", fvc::meshPhi(U)()).write();
+                            surfaceVectorField("UfIn.dump", Uf()).write();
+                        }
+                        // ----------------------------------------------------------------------
+
                         #include "correctPhi.H"
+
+                        if (braeDump)
+                        {
+                            surfaceScalarField("phiAbsPost.dump", phi).write();
+                        }
 
                         // Make the flux relative to the mesh motion
                         fvc::makeRelative(phi, U);
 
+                        if (braeDump)
+                        {
+                            surfaceScalarField("phiRel.dump", phi).write();
+                        }
+
                         mixture.correct();
+
+                        // ...and what mixture.correct() LEAVES for the alpha step: the interface
+                        // normal it compresses along and the curvature the surface tension force is
+                        // built from. calculateK is a fixed point -- it reads the wall gradient the
+                        // previous call wrote -- so an extra call here is not a no-op.
+                        if (braeDump)
+                        {
+                            // ...and alpha AS calculateK SAW IT, boundary values included: the only
+                            // other input it has once the mesh is fixed
+                            volScalarField("alphaAtK.dump", alpha1).write();
+                            surfaceScalarField("nHatf.dump", mixture.nHatf()).write();
+                            volScalarField("sigmaK.dump", mixture.sigmaK()()).write();
+                            // ...and THE MOVED MESH'S OWN GEOMETRY, which is what calculateK is a
+                            // function of once alpha is fixed. A deforming mesh makes faces
+                            // non-planar, where the face-centre/area decomposition is a choice.
+                            surfaceScalarField("weights.dump", mesh.weights()).write();
+                            surfaceScalarField("deltaCoeffs.dump", mesh.deltaCoeffs()).write();
+                            {
+                                surfaceVectorField Sfd
+                                (
+                                    IOobject("Sf.dump", runTime.timeName(), mesh),
+                                    mesh,
+                                    dimensionedVector(dimArea, Zero)
+                                );
+                                Sfd.primitiveFieldRef() = mesh.Sf().primitiveField();
+                                forAll(Sfd.boundaryField(), pi)
+                                {
+                                    Sfd.boundaryFieldRef()[pi] == mesh.Sf().boundaryField()[pi];
+                                }
+                                Sfd.write();
+
+                                volVectorField Cd
+                                (
+                                    IOobject("C.dump", runTime.timeName(), mesh),
+                                    mesh,
+                                    dimensionedVector(dimLength, Zero)
+                                );
+                                Cd.primitiveFieldRef() = mesh.C().primitiveField();
+                                Cd.write();
+                            }
+                            volScalarField
+                            (
+                                IOobject("V.dump", runTime.timeName(), mesh),
+                                mesh,
+                                dimensionedScalar(dimVolume, Zero)
+                            ).write();
+                            {
+                                volScalarField Vf
+                                (
+                                    IOobject("V.dump", runTime.timeName(), mesh),
+                                    mesh,
+                                    dimensionedScalar(dimVolume, Zero)
+                                );
+                                Vf.primitiveFieldRef() = mesh.V();
+                                Vf.write();
+                            }
+                            Info<< "[brae] dumped the mesh-update stages at timeIndex "
+                                << runTime.timeIndex() << endl;
+                        }
                     }
 
                     if (checkMeshCourantNo)

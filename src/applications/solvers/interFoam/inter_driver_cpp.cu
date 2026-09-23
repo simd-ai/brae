@@ -419,6 +419,11 @@ RunReport runInterFoam(
     // OpenFOAM after two steps, alpha 5e-15 -- the alpha step, which reads no old-old level, exact.
     SurfaceScalarField phiOO;
     bool phiOOExists = false;
+    // ...and whether ANYTHING has asked for phi.oldTime() yet, which is what decides whether the level
+    // exists (GeometricField::oldTime() creates it on the first request). On a static mesh ddtCorr
+    // asks in step one's pEqn; on a moving mesh ddtCorr reads Uf.oldTime() and never asks, so the
+    // alpha step's off-centred flux is the first request -- see the note at that line.
+    bool phiOldRequested = false;
     scalar deltaTPrev = f.deltaT;   // Time::deltaT0_ starts equal to deltaT_ (Time.C, the constructor)
     fv::CrankNicolsonClock cnClock;
     cnClock.ocCoeff = f.ddtOcCoeff;
@@ -541,7 +546,24 @@ RunReport runInterFoam(
                                                             f.ddtAlphaOcCoeff, rep.steps > 1);
                     const scalar cnAlpha = blendingCoeff(ocAlpha);
                     SurfaceScalarField phiCN;
-                    offCentredFlux(f.phi, phiOld, cnAlpha, ocAlpha, phiCN);
+                    // WHICH phi.oldTime() -- and whether there IS one yet. GeometricField::oldTime()
+                    // CREATES the level on the first request, as a copy of the field as it stands
+                    // then (GeometricField.C:940-980), and who requests it first depends on the mesh:
+                    //   * a STATIC mesh: ddtCorr is fvcDdtPhiCorr and asks for phi.oldTime() in step
+                    //     one's pEqn, so by this line in step two the level is step one's flux;
+                    //   * a MOVING mesh: ddtCorr is fvcDdtUfCorr and reads Uf.oldTime() INSTEAD
+                    //     (fvcDdt.C, the three-argument ddtCorr picks by mesh.dynamic()), so nothing
+                    //     has asked -- and THIS line is the first request. The level is then a copy
+                    //     of the flux beside it and the blend is inert for that one step.
+                    // Blending with the previous step's flux there is a different equation: measured
+                    // on waves/waveMakerSolitary under `CrankNicolson 0.9` with correctPhi on, brae's
+                    // phiCN was 1.17 RELATIVE from OpenFOAM's at step two (whose phiCN is its phi to
+                    // 2.1e-22), and that carried into alpha 4.7e-05, U 1.2e-03 at step two and 1.06 at
+                    // thirty. It is invisible without correctPhi, where the flux this line sees IS
+                    // last step's, and invisible under Euler, where ocAlpha is 0.
+                    const SurfaceScalarField& phiForBlend = phiOldRequested ? phiOld : f.phi;
+                    offCentredFlux(f.phi, phiForBlend, cnAlpha, ocAlpha, phiCN);
+                    if (ocAlpha > scalar(0)) phiOldRequested = true;
                     ai.phi = &f.phi; ai.phiCN = &phiCN;
                     ai.cAlpha = f.interface.cAlpha;
                     ai.nAlphaCorr = f.alphaCtl.nAlphaCorr;
@@ -961,6 +983,9 @@ RunReport runInterFoam(
                     }
                     // ddtCorr(U, phi, Uf) is ddtCorr(U, Uf) when the mesh is dynamic
                     dc.UfOld = dyn ? &UfOld : nullptr;
+                    // ...and the static form READS phi.oldTime(), which creates the level: from here
+                    // on the alpha step's blend has one to use (see phiOldRequested)
+                    if (!dyn) phiOldRequested = true;
 
                     PressureStepInput pin;
                     pin.UEqn = &UEqn; pin.rho = &f.rho; pin.gh = &f.gh; pin.ghf = &f.ghfInternal;

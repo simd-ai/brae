@@ -631,6 +631,9 @@ InterFields buildInterFields(const std::string&          caseDir,
     // 1: the alpha field's NAME comes from `phases (water air)`, not from a convention.
     f.alphaName = "alpha." + f.mixture.phase1Name;
     f.interface = interfaceProps::readInterfaceCoeffs(fvSolution, f.alphaName, f.mixture.sigma);
+    // ...and interfaceProperties' CONSTRUCTOR value of deltaN, taken here because here is where the
+    // object is constructed, off the mesh as it stands before any motion (interfaceProperties.C:190)
+    f.interface.deltaN = interfaceProps::deltaN(g.V());
     f.alphaCtl  = readAlphaControls(fvSolution, f.alphaName);
     f.mulesCtl  = f.alphaCtl.MULESCorr ? MULES::readControlsCorr(fvSolution, f.alphaName)
                                        : MULES::readControls(fvSolution, f.alphaName);
@@ -1149,24 +1152,15 @@ InterFields buildInterFields(const std::string&          caseDir,
     // different consumer of it that no gate holds.
     if (f.ddtU == DdtScheme::CrankNicolson)
     {
-        // A MESH THAT DEFORMS IS NOT. The branches below are held on a mesh that moves as a RIGID
-        // BODY (`sloshing2DCN`, solidBodyMotionFunction SDA), where V == V0 == V00 and the ddt's
-        // volume weights are arithmetically the static form's. On waves/waveMakerSolitary, whose
-        // displacementLaplacian mesh DEFORMS, both arms leave OpenFOAM: step one is exact (U 8.2e-12,
-        // alpha 3.0e-12, p_rgh 3.3e-13, phi 8.5e-12), step two reads U 1.2e-03 and the alpha flux
-        // 2.6e-02, and thirty steps read U 1.06e+00 -- host and device alike, so it is not the
-        // transcription. The scheme's own state is NOT the gap: at step two brae's `ddt0(rho,U)`,
-        // `ddtCorrDdt0(U)` and `meshPhiCN_0` each match the field OpenFOAM writes under that name to
-        // 1e-12, and the SAME case under Euler is exact (U 2.0e-11). Refused by name rather than run
-        // 1.06 out; `solitaryCN` in tests/interfoam_moving_vs_openfoam.sh holds the refusal and is
-        // what lifting it must turn green.
-        if (f.dynamicMesh && f.dynamicMesh->motionType() == "displacementLaplacian")
-            throw std::runtime_error(
-                "brae interFoam: ddtSchemes names CrankNicolson and constant/dynamicMeshDict names a "
-                "motion solver whose mesh DEFORMS (`displacementLaplacian`). The scheme's moving "
-                "branches are gated on a mesh that moves rigidly, where V == V0 == V00; where the "
-                "volumes change, brae reads U 1.2e-03 of OpenFOAM after two steps and 1.06 after "
-                "thirty, on both arms. Refused rather than run that.");
+        // A MESH THAT DEFORMS RUNS TOO, on both arms (`solitaryCN`, waves/waveMakerSolitary under
+        // `CrankNicolson 0.9`). It was refused for one unit, on a measurement that turned out to name
+        // a defect of brae's rather than a gap in the scheme: phi.oldTime()'s LAZY CREATION. See the
+        // note at the host driver's offCentredFlux call -- on a moving mesh nothing asks for
+        // phi.oldTime() until alphaEqn's own blend does, so the level is born a copy of the flux
+        // beside it and the blend is inert for that one step. brae blended with the previous step's
+        // flux: phiCN 1.17 RELATIVE from OpenFOAM's at step two, U 1.2e-03 there and 1.06 at thirty.
+        // With it modelled, two steps read U 1.5e-11 and alpha 2.5e-14 against OpenFOAM's own
+        // one-ulp floor of 5.2e-12 and 6.9e-15.
         // A MOVING MESH IS PORTED NOW, in both the places the scheme branches on it:
         //   * fvm::ddt weights ddt0 by V0 and V00 and its source by V0 rather than V
         //     (CrankNicolsonDdtScheme.C:1029-1065) -- a cell that grew between the two old levels does

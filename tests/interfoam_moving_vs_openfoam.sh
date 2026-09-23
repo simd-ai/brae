@@ -364,6 +364,18 @@ if profile.endswith('CN'):
     u = open(q2).read()
     u, k = re.subn(r'^(\s*nAlphaSubCycles\s+)\d+;', r'\g<1>1;', u, flags=re.M)
     assert k == 1, 'no nAlphaSubCycles to set to 1'
+    if profile == 'solitaryCN':
+        # ...and CONVERGED pressure solves, as `piston` and `flap` have. This case amplifies: its own
+        # one-ulp control reads U 2.0e-04 over thirty steps as shipped and 1.8e-06 converged, so the
+        # stopping point is most of what a loose run would be measuring.
+        u, k = re.subn(r'tolerance\s+1e-6;', 'tolerance       1e-13;', u)
+        assert k >= 3, 'the pressure solvers were not tightened (%d)' % k
+        # ...and `log 2;` on p_rgh, which makes OpenFOAM print its residual at EVERY iteration
+        # (SolverPerformance.C:70-76) so the gate can compare the two CURVES rather than a count.
+        for key in ('p_rgh', 'p_rghFinal'):
+            m = re.search(r'\n    %s\s*\{[^}]*\}' % key, u)
+            assert m, 'no %s entry to give `log 2`' % key
+            u = u.replace(m.group(0), m.group(0).replace('}', '    log             2;\n    }'))
     open(q2, 'w').write(u)
 
 q = os.path.join(d, 'system/fvSolution')
@@ -695,18 +707,26 @@ stage sloshing2DCorrectPhi sloshingTank2D   0.01  10 sloshing2DCorrectPhi || rc=
 stage cylinderCorrectPhi   sloshingCylinder 0.001 10 cylinderCorrectPhi   || rc=1
 stage solitaryStatic waves/waveMakerSolitary 0.01 30 solitaryStatic || rc=1
 stage solitary       waves/waveMakerSolitary 0.01 30 solitary       || rc=1
-# ...and the CrankNicolson profile on a mesh that DEFORMS, which is a REFUSAL arm: see the block at the
-# top of test_inter_moving_vs_openfoam.cu. It is staged and its oracle is run like any other profile,
-# because lifting the refusal means deleting that block and letting this profile gate.
+# ...and the SAME SCHEME ON A MESH THAT DEFORMS, which is a different question from the tank above and
+# found a different defect.
 #
 # WHY IT EXISTS. sloshing2DCN cannot witness the scheme's moving ddt at all: the tank's motion is SOLID
 # BODY (`solidBodyMotionFunction SDA`), so V == V0 == V00 in every cell and ddt0's volume weights are
 # arithmetically the static form's. MEASURED -- with V0 and V00 dropped from the device's fvm::ddt,
 # sloshing2DCN's device arm still reads U 6.3e-13 (against 3.3e-13 with them): blind. waveMakerSolitary
-# DEFORMS (displacementLaplacian, inverseDistance), and there BOTH arms leave OpenFOAM: step one exact
-# (U 8.2e-12), step two U 1.2e-03 and the alpha flux 2.6e-02, thirty steps U 1.06e+00 -- while the same
-# case under EULER is exact (U 2.0e-11) and the scheme's own state matches OpenFOAM's written
-# `ddt0(rho,U)`, `ddtCorrDdt0(U)` and `meshPhiCN_0` to 1e-12 at step two. So the reader refuses it.
+# DEFORMS (displacementLaplacian, inverseDistance), and it found phi.oldTime()'s LAZY CREATION: on a
+# moving mesh ddtCorr is fvcDdtUfCorr and reads Uf.oldTime(), so NOTHING asks for phi.oldTime() until
+# alphaEqn's own off-centred blend does -- and the level is then born a copy of the flux beside it,
+# leaving the blend inert for that one step. brae blended with the previous step's flux instead:
+# phiCN 1.17 RELATIVE off at step two (OpenFOAM's phiCN IS its phi there, to 2.1e-22), alpha 4.7e-05,
+# U 1.2e-03 at step two and 1.06e+00 at thirty. Invisible under Euler (ocAlpha is 0) and invisible
+# without correctPhi (the flux the blend sees IS last step's there) -- which is why this profile, and
+# not the tank, is what holds it. With it modelled: two steps U 1.5e-11, alpha 2.5e-14.
+#
+# THE CASE AMPLIFIES, so the profile carries its own bounds and its own control. OpenFOAM against
+# ITSELF, one ulp of one alpha cell, thirty steps, converged solves: U 1.752e-06, alpha 7.764e-09,
+# p_rgh 7.933e-09. brae reads 4.077e-06, 3.960e-08, 2.929e-08 -- a small multiple of OpenFOAM's own
+# last bit. The solves are converged here for the same reason `piston` and `flap` are.
 stage solitaryCN     waves/waveMakerSolitary 0.01 30 solitaryCN     || rc=1
 stage solitaryGamg   waves/waveMakerSolitary 0.01 30 solitaryGamg   || rc=1
 stage pistonStatic   waves/waveMakerPiston   0.01 30 pistonStatic   || rc=1

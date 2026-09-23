@@ -114,6 +114,8 @@ int main()
     const scalar nu1 = scalar(1e-6), nu2 = scalar(1.48e-5);
     ip::InterfaceCoeffs ic;
     ic.cAlpha = scalar(1);
+    // the CONSTRUCTOR's deltaN, off a mesh that does not move here (InterfaceCoeffs::deltaN)
+    ic.deltaN = ip::deltaN(g.V());
     const scalar totalDt = scalar(0.02);
     const int nSub = 3, nAlphaCorr = 2, nSteps = 6;
 

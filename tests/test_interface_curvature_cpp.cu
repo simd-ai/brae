@@ -132,6 +132,8 @@ int main()
 
             InterfaceCoeffs ic;
             ic.cAlpha = scalar(1);
+            // the CONSTRUCTOR's deltaN, off the mesh these cases hold still (InterfaceCoeffs::deltaN)
+            ic.deltaN = deltaN(c.g.V());
             SurfaceScalarField nHatf;
             std::vector<scalar> K;
             calculateK(a, ic, c.m, c.g, c.fvp, /*gradLeastSquares=*/false, nHatf, K);
@@ -188,6 +190,7 @@ int main()
             const GeometricField<scalar> a = fieldFrom(c, v);
 
             InterfaceCoeffs ic; ic.cAlpha = scalar(1);
+            ic.deltaN = deltaN(c.g.V());
             SurfaceScalarField nHatf;
             std::vector<scalar> K;
             calculateK(a, ic, c.m, c.g, c.fvp, false, nHatf, K);
@@ -355,6 +358,7 @@ int main()
         // all, so there is no case to validate leastSquares-plus-smoothing against.
         const GeometricField<scalar> a = fieldFrom(c, v);
         InterfaceCoeffs ic; ic.cAlpha = scalar(1); ic.nAlphaSmoothCurvature = 2;
+        ic.deltaN = deltaN(c.g.V());
         SurfaceScalarField nHatf;
         std::vector<scalar> K;
         bool threw = false;

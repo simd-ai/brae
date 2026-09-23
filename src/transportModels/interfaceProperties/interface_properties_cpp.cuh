@@ -63,6 +63,14 @@ struct InterfaceCoeffs
     std::vector<scalar> contactAngleDeg;
     // gradSchemes' `nHat` entry (interfaceProperties.C:96, fvc::grad(alpha1_, "nHat")), then `default`
     GradChoice nHatGrad;
+    // deltaN = 1e-8/cbrt(average(mesh.V())), THE CONSTRUCTOR'S VALUE and never recomputed
+    // (interfaceProperties.C:190-195: `deltaN_` is a dimensionedScalar member initialised in the
+    // member-initialiser list). On a mesh that does not move, or one that moves rigidly, recomputing
+    // it per call gives the same number. ON A MESH THAT DEFORMS IT DOES NOT, and brae recomputed it:
+    // measured on waves/waveMakerSolitary, nHatf and K were 8.5e-09 from OpenFOAM's after the FIRST
+    // mesh update, which a curvature fixed point then carries forward. 0 means "never set", which
+    // calculateK refuses rather than running without the stabiliser.
+    scalar deltaN = 0;
 };
 
 // solverDict(alpha1.name()) is the fvSolution `solvers` entry for the alpha field -- damBreak names it
@@ -89,7 +97,9 @@ inline InterfaceCoeffs readInterfaceCoeffs(const FoamDict& fvSolution,
     return c;
 }
 
-// deltaN = 1e-8/cbrt(average(V)) -- interfaceProperties.C:194. Mesh-dependent on purpose.
+// deltaN = 1e-8/cbrt(average(V)) -- interfaceProperties.C:194. CALLED ONCE, where OpenFOAM's
+// constructor calls it, and the result kept in InterfaceCoeffs::deltaN; see the note there for what
+// recomputing it costs on a mesh that deforms.
 inline scalar deltaN(const std::vector<scalar>& cellVolumes)
 {
     if (cellVolumes.empty()) return scalar(0);

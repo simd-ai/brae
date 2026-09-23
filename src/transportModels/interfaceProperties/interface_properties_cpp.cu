@@ -203,7 +203,15 @@ void calculateK(const GeometricField<scalar>& alpha1,
                 SurfaceScalarField&           nHatf,
                 std::vector<scalar>&          K)
 {
-    const scalar dN = deltaN(g.V());
+    // THE CONSTRUCTOR'S deltaN, not this mesh's: OpenFOAM's is a member set once and a deforming
+    // mesh does not move it (interfaceProperties.C:190-195, and the note on InterfaceCoeffs::deltaN)
+    if (!(c.deltaN > scalar(0)))
+        throw std::runtime_error(
+            "brae interfaceProperties::calculateK: InterfaceCoeffs::deltaN is unset. It is "
+            "1e-8/cbrt(average(mesh.V())) AT CONSTRUCTION -- the caller has to take it once, from the "
+            "mesh as it stands then, because on a mesh that deforms recomputing it is a different "
+            "number from OpenFOAM's.");
+    const scalar dN = c.deltaN;
 
     // 1. the cell gradient, optionally smoothed first. `fvc::grad(alpha1, "nHat")` looks up the
     //    gradSchemes entry NAMED nHat -- not grad(alpha.water) and not default. 43 of the 44 shipped

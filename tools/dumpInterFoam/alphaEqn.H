@@ -205,6 +205,17 @@
         }
         else
         {
+            // ---- INSTRUMENTATION: writes only -------------------------------------------------
+            if (getenv("BRAE_DUMP_ITER") && runTime.timeIndex() == atoi(getenv("BRAE_DUMP_ITER")))
+            {
+                surfaceScalarField("phiCN.dump", phiCN()).write();
+                surfaceScalarField("phic.dump", phic).write();
+                surfaceScalarField("phir.dump", phir).write();
+                surfaceScalarField("alphaPhiUn.dump", alphaPhiUn).write();
+                volScalarField("alphaPreMULES.dump", alpha1).write();
+            }
+            // -----------------------------------------------------------------------------------
+
             alphaPhi10 = alphaPhiUn;
 
             MULES::explicitSolve
@@ -218,6 +229,12 @@
                 oneField(),
                 zeroField()
             );
+        }
+
+        if (getenv("BRAE_DUMP_ITER") && runTime.timeIndex() == atoi(getenv("BRAE_DUMP_ITER")))
+        {
+            volScalarField("alphaPostMULES.dump", alpha1).write();
+            surfaceScalarField("alphaPhi10Post.dump", alphaPhi10).write();
         }
 
         alpha2 = 1.0 - alpha1;

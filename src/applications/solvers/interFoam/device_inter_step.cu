@@ -113,8 +113,12 @@ void deviceInterStep(
     const bool offCentred = ctl.cn && ctl.cn->ocAlpha > scalar(0);
     if (offCentred)
     {
-        deviceOffCentredFlux(nIf, ctl.cn->cnAlpha, phiInt, phiOldInt, phiCNInt);
-        deviceOffCentredFlux(nBf, ctl.cn->cnAlpha, phiBnd, phiOldBnd, phiCNBnd);
+        // ...blended with the level that EXISTS: on the step where phi.oldTime() is created the level
+        // is a copy of phi itself, so the blend is inert (DeviceInterCrankNicolson::phiOldExists)
+        const DeviceBuffer<scalar>& phiOldI = ctl.cn->phiOldExists ? phiOldInt : phiInt;
+        const DeviceBuffer<scalar>& phiOldB = ctl.cn->phiOldExists ? phiOldBnd : phiBnd;
+        deviceOffCentredFlux(nIf, ctl.cn->cnAlpha, phiInt, phiOldI, phiCNInt);
+        deviceOffCentredFlux(nBf, ctl.cn->cnAlpha, phiBnd, phiOldB, phiCNBnd);
         ain.phiCNInt = &phiCNInt;
         ain.phiCNBnd = &phiCNBnd;
     }
@@ -132,7 +136,8 @@ void deviceInterStep(
             throw std::runtime_error(
                 "brae interFoam device step: CrankNicolson's off-centred flux on a coupled pair needs "
                 "the pair's phi.oldTime(); the caller gave none.");
-        deviceOffCentredFlux(ctl.cyc->n, ctl.cn->cnAlpha, ctl.cyc->phi, *ctl.phiOldIf, phiCNIf);
+        deviceOffCentredFlux(ctl.cyc->n, ctl.cn->cnAlpha, ctl.cyc->phi,
+                             ctl.cn->phiOldExists ? *ctl.phiOldIf : ctl.cyc->phi, phiCNIf);
         ain.phiCNIf = &phiCNIf;
     }
     ain.alphaPhiIf = ctl.alphaPhiIf;

@@ -84,6 +84,8 @@ int main()
     // --- host ---
     brae::cpu::interfaceProps::InterfaceCoeffs ic;
     ic.cAlpha = scalar(1);
+    // the CONSTRUCTOR's deltaN; this mesh does not move, so it is the same number either way
+    ic.deltaN = brae::cpu::interfaceProps::deltaN(g.V());
     SurfaceScalarField hNHatf;
     std::vector<scalar> hK;
     brae::cpu::interfaceProps::calculateK(a, ic, m, g, fvp, /*gradLeastSquares=*/false, hNHatf, hK);

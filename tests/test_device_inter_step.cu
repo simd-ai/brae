@@ -122,6 +122,8 @@ int main()
 
     ip::InterfaceCoeffs ic;
     ic.cAlpha = scalar(1);
+    // the CONSTRUCTOR's deltaN, off a mesh that does not move here (InterfaceCoeffs::deltaN)
+    ic.deltaN = ip::deltaN(g.V());
     ic.sigma  = sigma;
 
     GeometricField<vector> Uh;

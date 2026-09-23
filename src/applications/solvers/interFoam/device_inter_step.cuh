@@ -187,6 +187,12 @@ struct DeviceInterCrankNicolson
     // ddt(alpha) gives on THIS step (0 before the scheme is warm), its cnCoeff, and alphaPhi10's levels
     scalar ocAlpha = 0;
     scalar cnAlpha = 1;
+    // ...and whether phi HAS an old-time level yet. GeometricField::oldTime() creates it on the first
+    // request, as a copy of the field as it stands then; on a MOVING mesh ddtCorr reads Uf.oldTime()
+    // instead and never asks, so the alpha step's own blend is the first request and is inert for
+    // that one step. False here means "the level does not exist yet, blend with phi itself" -- see
+    // the note in inter_driver_cpp.cu at the host's offCentredFlux call.
+    bool phiOldExists = false;
     const DeviceBuffer<scalar>* alphaPhiOldInt = nullptr;   // null with ocAlpha > 0: created by this step
     const DeviceBuffer<scalar>* alphaPhiOldBnd = nullptr;
     DeviceBuffer<scalar>* alphaPhiOutInt = nullptr;
