@@ -478,7 +478,12 @@ arm baffle_momentumPredictor refused "a momentum predictor across the coupled pa
 # `sstLimU` held it on a translational pair (host U 8.8697e-13). A blanket refusal coming back
 # fails this arm.
 arm baffle_cellLimitedGradU runs    - "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
-arm baffle_vanLeerV         refused "does not carry them onto the coupled patch" "" "sed -i 's/div(rhoPhi,U)  *Gauss linearUpwind grad(U);/div(rhoPhi,U)   Gauss vanLeerV;/' system/fvSchemes"
+# ...and the MOMENTUM's own limited scheme across the pair, which is still refused. fvm::div carries a
+# scheme onto a coupled patch now -- the two turbulence closures hand it the patch's own weights and
+# validation/interFoamCyclic `sstLimDiv` holds them -- but the momentum does not compute them, so it
+# reaches the same refusal by the other door. The message says what is MISSING rather than what is
+# unimplemented, and this arm keys on that.
+arm baffle_vanLeerV         refused "no weights for the coupled patch" "" "sed -i 's/div(rhoPhi,U)  *Gauss linearUpwind grad(U);/div(rhoPhi,U)   Gauss vanLeerV;/' system/fvSchemes"
 arm baffle_compression      refused "\`interfaceCompression\` across the coupled patch" "" "sed -i 's/div(phirb,alpha)  *Gauss linear;/div(phirb,alpha) Gauss interfaceCompression;/' system/fvSchemes"
 # every other gradient entry is gated on damBreak, which has no coupled patch
 arm baffle_cellLimitedPrgh  refused "grad(p_rgh) cellLimited across the coupled patch" "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(p_rgh)     cellLimited Gauss linear 1;/' system/fvSchemes"
