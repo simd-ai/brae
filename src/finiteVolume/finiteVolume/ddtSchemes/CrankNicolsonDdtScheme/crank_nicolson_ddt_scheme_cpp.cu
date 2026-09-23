@@ -514,6 +514,60 @@ void fvcDdtUfCorr(
 }
 
 
+void meshPhi(
+    const CrankNicolsonClock& clock,
+    CrankNicolsonDdt0<scalar>& meshPhi0,
+    const SurfaceScalarField& phi,
+    const SurfaceScalarField& phiOld,
+    SurfaceScalarField& out)
+{
+    const std::size_t nIf = phi.internal.size();
+    std::vector<std::size_t> patchSizes(phi.boundary.size());
+    for (std::size_t pi = 0; pi < phi.boundary.size(); ++pi)
+    {
+        patchSizes[pi] = phi.boundary[pi].size();
+    }
+    meshPhi0.lookupOrCreate(clock, nIf, patchSizes);
+
+    // evaluate(): once per time index, and it reads the PREVIOUS move's flux
+    if (meshPhi0.evaluate(clock))
+    {
+        if (phiOld.internal.size() != nIf || phiOld.boundary.size() != phi.boundary.size())
+            throw std::runtime_error(
+                "brae CrankNicolson fvc::meshPhi: mesh().phi().oldTime() is not the shape of "
+                "mesh().phi() -- the previous step's mesh flux was not kept.");
+        const scalar c0 = meshPhi0.coef0(clock);
+        for (std::size_t f = 0; f < nIf; ++f)
+        {
+            meshPhi0.internal[f] = c0*phiOld.internal[f] - offCentre(clock, meshPhi0.internal[f]);
+        }
+        for (std::size_t pi = 0; pi < phi.boundary.size(); ++pi)
+        {
+            for (std::size_t i = 0; i < patchSizes[pi] && i < phiOld.boundary[pi].size(); ++i)
+            {
+                meshPhi0.boundary[pi][i] =
+                    c0*phiOld.boundary[pi][i] - offCentre(clock, meshPhi0.boundary[pi][i]);
+            }
+        }
+    }
+
+    const scalar c = meshPhi0.coef(clock);
+    out.internal.resize(nIf);
+    out.boundary.resize(phi.boundary.size());
+    for (std::size_t f = 0; f < nIf; ++f)
+    {
+        out.internal[f] = c*phi.internal[f] - offCentre(clock, meshPhi0.internal[f]);
+    }
+    for (std::size_t pi = 0; pi < phi.boundary.size(); ++pi)
+    {
+        out.boundary[pi].resize(patchSizes[pi]);
+        for (std::size_t i = 0; i < patchSizes[pi]; ++i)
+        {
+            out.boundary[pi][i] = c*phi.boundary[pi][i] - offCentre(clock, meshPhi0.boundary[pi][i]);
+        }
+    }
+}
+
 scalar readOcCoeff(const std::string& entry)
 {
     // the entry as fvSchemes hands it: "CrankNicolson 0.5", "CrankNicolson", or "CrankNicolson { ... }"

@@ -197,6 +197,18 @@ struct InterFields
     // (createUfIfPresent.H, pEqn.H:70): the face velocity a moving mesh's ddtCorr reads at its OLD
     // time. Empty on a mesh that does not move.
     SurfaceVectorField Uf;
+    // fvc::meshPhi(U) AS THE RUN'S ddt SCHEME GIVES IT. Euler answers with mesh().phi() itself, so
+    // nothing here is used; CrankNicolson answers with an off-centred combination of this move's flux
+    // and the previous one's (crank_nicolson_ddt_scheme_cpp.cuh, meshPhi), and EVERY consumer of the
+    // mesh flux goes through fvc::meshPhi: fvc::makeRelative and makeAbsolute, the movingWallVelocity
+    // patches, CorrectPhi's adjustPhi, and the closure's divU. Refreshed by interMeshUpdate at each
+    // move and read through fvcMeshPhi(); empty on a mesh that does not move.
+    SurfaceScalarField meshPhiCN;
+    fv::CrankNicolsonDdt0<scalar> cnMeshPhi0;      // OpenFOAM's registry field `meshPhiCN_0`
+    // mesh().phi().oldTime(): the flux of the PREVIOUS move, taken before this one overwrites it and
+    // only when the time index has advanced, as fvMesh::movePoints does (fvMesh.C:971-978)
+    SurfaceScalarField meshPhiPrev;
+    label              meshPhiPrevIndex = -1;
 
     // THE PRESSURE REFERENCE. p_rgh.needReference() is true when NO patch fixes its value -- a
     // closed tank -- and then createFields.H:104-124 reads pRefCell or pRefPoint and pRefValue from

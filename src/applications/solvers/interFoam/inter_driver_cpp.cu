@@ -32,6 +32,9 @@ namespace {
 void updateMovingWallVelocity(
     InterFields& f,
     const DynamicMotionSolverFvMesh& dyn,
+    // fvc::meshPhi(U) -- the SCHEME's mesh flux. Uwall's normal component IS this number, so under
+    // CrankNicolson a moving wall carries the off-centred flux and not mesh().phi()
+    const SurfaceScalarField& meshPhiU,
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& patches,
@@ -50,7 +53,7 @@ void updateMovingWallVelocity(
             const vector Up = (newFc - oldFc)/deltaT;
             const vector n = g.Sf()[facei]/q.magSf[i];
             // VSMALL
-            const scalar Un = dyn.meshPhi().boundary[pi][i]/(q.magSf[i] + scalar(1e-300));
+            const scalar Un = meshPhiU.boundary[pi][i]/(q.magSf[i] + scalar(1e-300));
             uwall[i] = Up + n*(Un - dot(n, Up));
         }
         f.U.boundary[pi]->setStoredValues(std::move(uwall));
@@ -58,6 +61,22 @@ void updateMovingWallVelocity(
 }
 
 }   // namespace
+
+
+const SurfaceScalarField& fvcMeshPhi(
+    const DynamicMotionSolverFvMesh& dyn,
+    const InterFields& f)
+{
+    // fvc::meshPhi(U) asks the ddt scheme named for `ddt(U)`: EulerDdtScheme::meshPhi returns
+    // mesh().phi() itself (EulerDdtScheme.C:759-765), CrankNicolson's is off-centred
+    if (f.ddtU != DdtScheme::CrankNicolson) return dyn.meshPhi();
+    if (f.meshPhiCN.internal.size() != dyn.meshPhi().internal.size())
+        throw std::runtime_error(
+            "brae interFoam: fvc::meshPhi under CrankNicolson was read before the mesh moved. The "
+            "scheme's mesh flux is built at every move (interMeshUpdate); mesh().phi() is NOT it from "
+            "the second step on.");
+    return f.meshPhiCN;
+}
 
 
 // The time the start directory names -- see inter_driver_cpp.cuh.
@@ -110,7 +129,8 @@ void interMeshUpdate(
     scalar                                 time,
     label                                  timeIndex,
     label                                  outerOfStep,
-    label                                  nOuterCorrectors)
+    label                                  nOuterCorrectors,
+    const fv::CrankNicolsonClock*          cn)
 {
     if (!dyn) return;
     // interFoam.C:118: on the first outer corrector, or on every one under
@@ -121,7 +141,22 @@ void interMeshUpdate(
     // The GAMG hierarchy is the mesh's: a displacement solve builds it or reuses the
     // one p_rgh left, and the move marks it for rebuilding.
     const bool finalIteration = (outerOfStep >= nOuterCorrectors - 1);
+    // fvMesh::movePoints grabs mesh().phi().oldTime() when the time index has advanced, BEFORE the
+    // new flux overwrites it (fvMesh.C:971-978) -- so a second move in the same step under
+    // moveMeshOuterCorrectors leaves the old level where it is, as OpenFOAM does.
+    if (cn && dyn->moving() && f.meshPhiPrevIndex != timeIndex)
+    {
+        f.meshPhiPrev = dyn->meshPhi();
+        f.meshPhiPrevIndex = timeIndex;
+    }
     dyn->update(time, rep.deltaT, timeIndex, finalIteration, &gamgCache);
+    // ...and fvc::meshPhi(U) follows the move: the scheme's off-centred flux, which everything below
+    // and the pressure corrector, the closure and CorrectPhi read through fvcMeshPhi()
+    if (cn)
+    {
+        fv::meshPhi(*cn, f.cnMeshPhi0, dyn->meshPhi(), f.meshPhiPrev, f.meshPhiCN);
+    }
+    const SurfaceScalarField& meshPhiU = fvcMeshPhi(*dyn, f);
     // ...and fvMesh::movePoints moves the mesh objects with it: kOmegaSST's wall distance
     moveInterTurbulence(f.turbulence, m, g, patches);
     // cyclicAMIPolyPatch::initMovePoints marks the AMI out of date, and the next AMI()
@@ -146,7 +181,7 @@ void interMeshUpdate(
     // movingWallVelocity patch takes the wall's velocity from the motion of THIS
     // step (movingWallVelocityFvPatchVectorField.C, Uwall), every other patch is
     // evaluated as it stands
-    updateMovingWallVelocity(f, *dyn, m, g, patches, rep.deltaT);
+    updateMovingWallVelocity(f, *dyn, meshPhiU, m, g, patches, rep.deltaT);
     // ...and a wave condition's model, whose FIRST update of the step is this one on a
     // moving mesh: OpenFOAM's log prints "Updating ... wave model" right after the
     // motion solve, ahead of pcorr and the alpha sub-cycles, so the absorber reads the
@@ -194,12 +229,12 @@ void interMeshUpdate(
         CorrectPhiInput cin;
         cin.rAUf = &rAUf;
         cin.meshChanging = true;
-        cin.meshPhi = &dyn->meshPhi();
+        cin.meshPhi = &meshPhiU;
         cin.rhoPhi = &f.rhoPhi;
         cin.solveLog = &rep.pcorrSolves;
         correctPhi(f.U, f.phi, f.p_rgh, cin, cpc, m, g, patches);
         // fvc::makeRelative(phi, U)
-        makeRelativeFlux(f.phi, dyn->meshPhi());
+        makeRelativeFlux(f.phi, meshPhiU);
         pushFluxToPatches(f, patches);
         // mixture.correct(): calcNu, whose values alpha has not moved, then
         // interfaceProperties::correct() on the moved mesh
@@ -485,7 +520,8 @@ RunReport runInterFoam(
                     ++outerOfStep;
                     // interFoam.C:112-149, one copy shared with the device loop: see interMeshUpdate.
                     interMeshUpdate(dyn, f, m, g, patches, mutableMesh, amiPairs, gamgCache, cpc,
-                                    rep, rep.time, rep.steps, outerOfStep, lc.nOuterCorrectors);
+                                    rep, rep.time, rep.steps, outerOfStep, lc.nOuterCorrectors,
+                                    cnDdt ? &cnClock : nullptr);
                     break;
                 }
 
@@ -800,6 +836,10 @@ RunReport runInterFoam(
                         mi.UOO = &UOO;
                     }
                     mi.V0 = dyn ? &dyn->V0() : nullptr;
+                    // ...and V00 only under CrankNicolson, which is the only scheme that reads it:
+                    // asking for it creates the level (fvMesh::V00() is lazy), and a mesh that never
+                    // needs it should not have one.
+                    mi.V00 = (dyn && cnDdt) ? &dyn->V00() : nullptr;
                     // nuEff = nut + nu: the mixture's nu alone when the case is laminar
                     std::vector<scalar> nuEff;
                     std::vector<std::vector<scalar>> nuEffB;
@@ -932,7 +972,7 @@ RunReport runInterFoam(
                     pin.taps = pressureTaps;
                     pin.solveLog = &rep.pSolves;
                     pin.mrf = f.mrfZones.empty() ? nullptr : &f.mrfZones;
-                    pin.meshPhi = dyn ? &dyn->meshPhi() : nullptr;
+                    pin.meshPhi = dyn ? &fvcMeshPhi(*dyn, f) : nullptr;
                     pin.Uf = dyn ? &f.Uf : nullptr;
                     // pEqn.H:4, rAU.ref() = 1/UEqn.A(): kept for the next mesh update's CorrectPhi
                     pin.rAUOut = &f.rAU;
@@ -1013,7 +1053,7 @@ RunReport runInterFoam(
                     if (dyn && dyn->moving())
                     {
                         ti.V0 = &dyn->V0();
-                        ti.meshPhi = &dyn->meshPhi();
+                        ti.meshPhi = &fvcMeshPhi(*dyn, f);
                     }
                     ti.fvOptions = f.fvOptions.empty() ? nullptr : &f.fvOptions;
                     ti.epsilonLog = &rep.epsilonSolves;

@@ -28,10 +28,15 @@ void refuseUnsupported(const InterMomentumInput& in)
             "brae interFoam UEqn: ddtSchemes asks for CrankNicolson, whose fvm::ddt(rho, U) reads the "
             "scheme's clock, its own ddt0 field, rho.oldTime().oldTime() and U.oldTime().oldTime(); the "
             "caller supplied fewer. Refused rather than run Euler under the scheme's name.");
-    if (in.ddtScheme == DdtScheme::CrankNicolson && in.V0)
+    // CrankNicolson ON A MOVING MESH takes the scheme's moving branch, which fv::fvmDdt carries now --
+    // ddt0 weighted by V0 and V00 and the source by V0 (CrankNicolsonDdtScheme.C:1029-1065). What is
+    // still refused is HALF a moving mesh: V0 without V00 means the caller did not ask the mesh for
+    // its second old level, and the static form would then be run under the scheme's name.
+    if (in.ddtScheme == DdtScheme::CrankNicolson && in.V0 && !in.V00)
         throw std::runtime_error(
-            "brae interFoam UEqn: CrankNicolson's fvm::ddt on a moving mesh (V0 given) is the scheme's "
-            "moving branch, which brae does not carry.");
+            "brae interFoam UEqn: CrankNicolson's fvm::ddt on a moving mesh needs mesh().V00() as well "
+            "as V0 -- the scheme's moving branch weights the two old levels by their own volumes. The "
+            "caller gave V0 alone.");
     if (in.hasMRF && (!in.mrf || in.mrf->empty()))
         throw std::runtime_error(
             "brae interFoam UEqn: the case declares MRF, and UEqn.H adds MRF.DDt(rho, U). brae has "
@@ -209,7 +214,10 @@ FvVectorMatrix assembleUEqn(
     // fvm::ddt(rho, U). Added to the SAME matrix, before relax, exactly as the constructor's `+` does.
     if (in.ddtScheme == DdtScheme::CrankNicolson)
     {
-        fv::fvmDdt(*in.cn, *in.cnDdt0, in.rho, in.rhoOld, in.rhoOO, *in.UOld, *in.UOO, g.V(), M);
+        // ...with the mesh's OLD volumes when it moves: the scheme's moving branch weights ddt0 by V0
+        // and V00 and its source by V0, where the static one uses V throughout.
+        fv::fvmDdt(*in.cn, *in.cnDdt0, in.rho, in.rhoOld, in.rhoOO, *in.UOld, *in.UOO, g.V(), M,
+                   in.V0, in.V00);
     }
     else
     {

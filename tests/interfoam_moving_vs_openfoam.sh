@@ -666,9 +666,19 @@ stage mixerOuterOnce testTubeMixer 2e-4  10 mixerOuterOnce || rc=1
 stage mixerPred      testTubeMixer 2e-4  10 mixerPred      || rc=1
 stage sloshing2DStatic sloshingTank2D 0.01  10 sloshing2DStatic || rc=1
 stage sloshing2D     sloshingTank2D 0.01  10 sloshing2D     || rc=1
-# ...and the same tank under CRANKNICOLSON, where ddtCorr is fvcDdtUfCorr rather than fvcDdtPhiCorr:
-# built from Uf.oldTime() and an old-old level of Uf, with its own ddt0 surface field. brae refused the
-# combination by name until that operator was ported. Its control is the EULER run of the same case.
+# ...and the same tank under CRANKNICOLSON, which is THREE branches of the scheme a static case never
+# reaches, and this arm holds all three:
+#   * fvm::ddt's moving branch -- ddt0 weighted by V0 and V00, the source by V0 (:1029-1065);
+#   * ddtCorr is fvcDdtUfCorr (:1201-1257) rather than fvcDdtPhiCorr: built from Uf.oldTime() and an
+#     old-old level of Uf, with its own ddt0 surface field;
+#   * fvc::meshPhi is the SCHEME's (:1626-1661), so the mesh flux every makeRelative, movingWallVelocity
+#     and divU reads is off-centred against the previous move's.
+# MEASURED with the third missing and the first two in place -- the state this profile was written in:
+# p_rgh 4.4802e-01, alpha 1.1834e-03, U 4.7460e-03, the moving walls 5.0988e-02 out, and 3 of 20 p_rgh
+# iteration counts wrong, against 6.1e-14 / 5.6e-15 / 2.7e-13 / 2.7e-13 and 20 of 20 with it. Step ONE
+# agrees either way (2.7e-14): the off-centring is born at the second step, which is why a one-step
+# comparison cannot hold this scheme.
+# Its control is the EULER run of the same case: a static control would be blind to all three.
 stage sloshing2DCN   sloshingTank2D 0.01  10 sloshing2DCN   || rc=1
 stage sloshing2D3DoFStatic sloshingTank2D3DoF 0.01 10 sloshing2D3DoFStatic || rc=1
 stage sloshing2D3DoF       sloshingTank2D3DoF 0.01 10 sloshing2D3DoF       || rc=1

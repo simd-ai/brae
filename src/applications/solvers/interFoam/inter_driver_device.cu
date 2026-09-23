@@ -1889,7 +1889,8 @@ RunReport runInterFoamDevice(
                 C.V0 = &dV0;
                 interMeshUpdate(dyn, f, m, g, fvp, mutableMesh, /*amiPairs=*/nullptr,
                                 meshAgglomeration, meshCpc, rep, stepTime, stepIndex, outer,
-                                f.pimple.nOuterCorrectors);
+                                f.pimple.nOuterCorrectors,
+                                f.ddtU == DdtScheme::CrankNicolson ? &cnClock : nullptr);
                 // ...and now every buffer this loop uploaded from the geometry. clearGeom +
                 // clearOut on the device side: the addressing is untouched, as the move keeps the
                 // topology fixed (device_mesh.cuh).
@@ -1940,7 +1941,7 @@ RunReport runInterFoamDevice(
                 }
                 // ...and THE MESH FLUX the move produced, which the pressure corrector makes phi
                 // relative to (fvc::makeRelative, pEqn.H:73). Over the full face array, as phi is.
-                dMeshPhi.copyFrom(fullFace(dyn->meshPhi(), fvp));
+                dMeshPhi.copyFrom(fullFace(fvcMeshPhi(*dyn, f), fvp));
                 C.meshPhiAll = &dMeshPhi;
                 C.phiAbsIntOut = &dPhiAbsI;
                 C.phiAbsBndOut = &dPhiAbsB;

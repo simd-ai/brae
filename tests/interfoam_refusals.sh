@@ -257,10 +257,12 @@ arm fo_harmless             runs    -                        "" "sed -i 's|^// \
 arm nonNewtonian            refused "CrossPowerLaw"           "" "sed -i '0,/transportModel  *Newtonian;/s//transportModel  CrossPowerLaw;/' constant/transportProperties"
 
 # the time scheme: read into f.ddtU and then handed to nobody, so these ran as Euler. CRANKNICOLSON RUNS
-# now, on both loops (tests/interfoam_cn_vs_openfoam.sh holds RAS/damBreak under it); what it refuses,
+# now, on both loops (tests/interfoam_cn_vs_openfoam.sh holds RAS/damBreak under it), and ON A MOVING
+# MESH -- its three moving branches (fvm::ddt's V0/V00 weights, fvcDdtUfCorr, the off-centred
+# fvc::meshPhi) are held by tests/interfoam_moving_vs_openfoam.sh's `sloshing2DCN`. What it refuses,
 # by name: a Function1 ocCoeff (the ramp form), a coefficient outside [0, 1], the scheme on one of the two
-# operand sets and Euler on the other, the scheme beside a moving mesh, beside a mangrove source (whose
-# added mass takes fvm::ddt(U) under the case's scheme), beside a closure other than kEpsilon, with alpha
+# operand sets and Euler on the other, beside a mangrove source (whose
+# added mass takes fvm::ddt(U) under the case's scheme), with alpha
 # sub-cycling (OpenFOAM's own FatalError), and a restart directory that holds the ddt0 fields or alphaPhi0
 CNSET="sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson 0.5;/' system/fvSchemes"
 arm ddt_CrankNicolson       runs    -                        "" "$CNSET"
@@ -275,7 +277,11 @@ arm ddt_cnAlphaPhi0Present  refused "alphaPhi0"               "" "$CNSET; printf
 arm ddt_localEuler          refused "localEuler"              "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         localEuler;/' system/fvSchemes"
 arm ddt_backward            refused "backward"                "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         backward;/' system/fvSchemes"
 BASE="$BM"
-arm ddt_cnMoving            refused "the mesh moves"          "" "$CNSET"
+# ...on the MOVING base, which is the arm that says the moving branches are reachable and not refused.
+# testTubeMixer names nAlphaSubCycles 3, and CrankNicolson with sub-cycling is OpenFOAM's own
+# FatalError (ddt_cnSubCycles above holds that), so this arm sets 1 -- otherwise it reaches the
+# sub-cycle refusal and says nothing about the mesh.
+arm ddt_cnMoving            runs    -                         "" "$CNSET; sed -i 's/nAlphaSubCycles  *[0-9]*;/nAlphaSubCycles 1;/' system/fvSolution"
 BASE="$BG"
 arm ddt_cnMangroves         refused "multiphaseMangrovesSource" "" "$CNSET"
 BASE="$B"
@@ -578,6 +584,11 @@ if [ $HAVE_GPU = 1 ]; then
     # distance the move invalidated, gated on waves/waveMakerPiston `pistonSST` (the wall distance
     # left stale reads U 1.7353e-05). A blanket refusal coming back fails this arm.
     arm device_moving_SST   runs    -                               "-device" "$MOVSST"
+    # ...and CRANKNICOLSON ON A MOVING MESH, which is a HOST capability: the host arm runs it
+    # (ddt_cnMoving above, gated by `sloshing2DCN` in tests/interfoam_moving_vs_openfoam.sh) and the
+    # shared device momentum assembler forms the scheme's STATIC branch, so it refuses. The two arms
+    # on the same staging are what says the device's answer is a refusal and not the staging's.
+    arm device_cnMoving     refused "moving branch"                 "-device" "$CNSET; sed -i 's/nAlphaSubCycles  *[0-9]*;/nAlphaSubCycles 1;/' system/fvSolution"
     # the device's alpha pre-solve does not honour minIter (the host's does)
     # cellLimited grad(U) is refused on the device (the host carries it into linearUpwind and the
     # viscous term; this loop does not). The host arm `grad_namedU` above RUNS the same staging, which

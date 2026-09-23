@@ -211,6 +211,29 @@ void fvcDdtUfCorr(
     const std::vector<FvPatch>& patches,
     SurfaceScalarField& out);
 
+// fvc::meshPhi(U) under CrankNicolson (CrankNicolsonDdtScheme.C:1626-1661). THE MESH FLUX IS
+// OFF-CENTRED TOO, and this is the half of the scheme a moving mesh reaches without any ddt term of
+// its own: every fvc::makeRelative / makeAbsolute and every movingWallVelocity patch asks
+// fvc::meshPhi for the flux, fvc::meshPhi asks the ddt scheme named for `ddt(U)`, and Euler answers
+// with mesh().phi() itself while CrankNicolson answers with
+//
+//     meshPhi0 <- coef0*mesh().phi().oldTime() - offCentre(meshPhi0)      (once per time step)
+//     out       = coef *mesh().phi()           - offCentre(meshPhi0)
+//
+// The field is `meshPhiCN_0` on OpenFOAM's registry, born zero at the first move, so the first step
+// returns mesh().phi() unchanged (coef = 1) and the off-centring appears from the second -- which is
+// exactly where sloshing2DCN left OpenFOAM: step one 2.7e-14, step two 4.6e-04 with the raw mesh flux
+// in its place, and the moving walls 5.1e-02 out because Uwall's normal component IS this flux.
+//
+// `phiOld` is mesh().phi().oldTime(): the flux of the PREVIOUS move, which fvMesh::movePoints grabs
+// before overwriting phi (fvMesh.C:971-978) and only when the time index has advanced.
+void meshPhi(
+    const CrankNicolsonClock& clock,
+    CrankNicolsonDdt0<scalar>& meshPhi0,
+    const SurfaceScalarField& phi,
+    const SurfaceScalarField& phiOld,
+    SurfaceScalarField& out);
+
 // The coefficient after `CrankNicolson` in an fvSchemes entry: a bare number in [0, 1] is the constant
 // Function1 (CrankNicolsonDdtScheme.C:288-303); a dictionary is a Function1 of time and is refused by
 // name; nothing at all is OpenFOAM's default of 1.

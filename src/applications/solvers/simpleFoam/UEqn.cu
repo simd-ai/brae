@@ -484,10 +484,17 @@ void assembleUEqn(
                 throw std::runtime_error(
                     "brae momentum: CrankNicolson's fvm::ddt(rho, U) needs its ddt0 field, "
                     "rho.oldTime().oldTime() and all three components of U.oldTime().oldTime().");
+            // THE MOVING BRANCH IS A HOST CAPABILITY. ddt0 weighted by V0 and V00 and the source by
+            // V0 (CrankNicolsonDdtScheme.C:1029-1065): the host reference carries it and
+            // tests/interfoam_moving_vs_openfoam.sh's `sloshing2DCN` profile holds it. THIS
+            // assembler is given V0 and never V00, and forms the static branch -- so it refuses
+            // rather than run the static form under the scheme's name.
             if (in.ddtV0)
                 throw std::runtime_error(
-                    "brae momentum: CrankNicolson's fvm::ddt on a moving mesh is the scheme's moving "
-                    "branch, which brae does not carry.");
+                    "brae momentum (device): CrankNicolson's fvm::ddt on a moving mesh is the scheme's "
+                    "moving branch -- ddt0 weighted by V0 and V00, the source by V0. The HOST arm "
+                    "carries it (crank_nicolson_ddt_scheme_cpp.cu, gated by `sloshing2DCN`); this "
+                    "device assembler forms the static branch and is given no V00.");
             DeviceBuffer<scalar>* src[3] = {&M.source[0], &M.source[1], &M.source[2]};
             deviceCnFvmDdt(*in.ddtCn, *in.ddtCnDdt0, in.ddtRho, in.ddtRhoOld, in.ddtRhoOO, 3,
                            in.ddtUOld, in.ddtUOO, dm.V, M.diag, src);

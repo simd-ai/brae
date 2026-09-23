@@ -1149,12 +1149,19 @@ InterFields buildInterFields(const std::string&          caseDir,
     // different consumer of it that no gate holds.
     if (f.ddtU == DdtScheme::CrankNicolson)
     {
-        if (f.dynamicMesh)
-            throw std::runtime_error(
-                "brae interFoam: ddtSchemes names CrankNicolson AND the mesh moves. The scheme's moving "
-                "branch weights ddt0 by V0 and V00 (CrankNicolsonDdtScheme.C:1025-1055) and ddtCorr by "
-                "Uf.oldTime().oldTime(); brae carries the static branch only. Refused rather than run the "
-                "static form on a moving mesh.");
+        // A MOVING MESH IS PORTED NOW, in both the places the scheme branches on it:
+        //   * fvm::ddt weights ddt0 by V0 and V00 and its source by V0 rather than V
+        //     (CrankNicolsonDdtScheme.C:1029-1065) -- a cell that grew between the two old levels does
+        //     not carry the static form's weight;
+        //   * ddtCorr(U, Uf) is fvcDdtUfCorr (:1201-1257), a different member function from the static
+        //     ddtCorr(U, phi): built from Uf.oldTime() and an old-old level of Uf, with its own surface
+        //     ddt0 field, and its coefficient taken against `Sf & Uf.oldTime()` rather than phi;
+        //   * and THE MESH FLUX ITSELF is off-centred (:1626-1661) -- fvc::meshPhi asks the ddt
+        //     scheme, so makeRelative, makeAbsolute, every movingWallVelocity patch and the closure's
+        //     divU read a combination of this move's flux and the previous one's, not mesh().phi().
+        // fvMesh::V00 is carried for the first, created on first use as OpenFOAM creates it.
+        // Held by tests/interfoam_moving_vs_openfoam.sh's `sloshing2DCN` profile, whose control is the
+        // EULER run of the same staging.
         for (const fvOptions::Option& o : f.fvOptions.options)
         {
             if (o.active && o.mangroves == fvOptions::Option::Mangroves::source)
@@ -1173,7 +1180,8 @@ InterFields buildInterFields(const std::string&          caseDir,
         // a restart from a directory OpenFOAM wrote under CrankNicolson: the ddt0 fields and alphaPhi0
         // are read back there (ddt0_ with startTimeIndex -2, createAlphaFluxes.H's alphaRestart), and
         // the scheme is CrankNicolson from the first step. brae reads neither.
-        for (const char* name : {"ddt0(rho,U)", "ddtCorrDdt0(U)", "ddtCorrDdt0(phi)", "ddt0(rho,k)",
+        for (const char* name : {"ddt0(rho,U)", "ddtCorrDdt0(U)", "ddtCorrDdt0(phi)", "ddtCorrDdt0(Uf)",
+                                 "meshPhiCN_0", "ddt0(rho,k)",
                                  "ddt0(k)", "ddt0(rho,epsilon)", "ddt0(epsilon)"})
         {
             if (std::filesystem::exists(startDir + "/" + name))

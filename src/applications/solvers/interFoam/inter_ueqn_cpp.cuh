@@ -137,6 +137,9 @@ struct InterMomentumInput
     const std::vector<vector>*              UOld      = nullptr;   // cells
     // ...and the cell volumes at that level, on a mesh that moves; null on one that does not
     const std::vector<scalar>* V0 = nullptr;   // cells
+    // ...and V00, the volumes two steps back, which only the CrankNicolson ddt's MOVING branch reads
+    // (CrankNicolsonDdtScheme.C:1029-1047). Null with V0 means the static branch.
+    const std::vector<scalar>* V00 = nullptr;
 
     // The mixture KINEMATIC effective viscosity, nu + nut. Multiplied by rho here, because the
     // multiplication is the one decision this component owns (see note 2 in the header).

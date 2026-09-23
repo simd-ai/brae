@@ -687,6 +687,8 @@ int main(
     // in divU and the wall distance recomputed after every motion; the script's fixture makes the piston
     // a wall so the last of these moves.
     const bool sst = fin.turbulence.on && fin.turbulence.model == InterRasModel::KOmegaSST;
+    // ...and whether the case's ddt scheme is the one under test, which picks the control's meaning
+    const bool cn = (fin.ddtU == DdtScheme::CrankNicolson);
     // ...and `pistonLES`, the SAME paddle under LES kEqn, which has k and nut and no second field.
     // Its third moving-mesh term is the one the RAS closures do not have: the FILTER WIDTH,
     // (deltaCoeff*V)^(1/3) per cell, which LESModel::correct recomputes on a changing mesh
@@ -789,12 +791,18 @@ int main(
     {
         const Diff cU = compare(cellValues(readField<vector>(staticDir + "/U"), nC), ofU);
         const Diff cA = compare(cellValues(readField<scalar>(staticDir + "/" + fin.alphaName), nC), ofAlpha);
-        // under `pistonSST` the control is the laminar piston: what the closure itself moves
+        // under `pistonSST` the control is the laminar piston: what the closure itself moves. Under
+        // `sloshing2DCN` it is the SAME MOVING TANK under Euler, because what that profile is holding
+        // is the ddt scheme and a static control would be blind to it: the mesh flux itself is
+        // off-centred under CrankNicolson (fvc::meshPhi), so Euler-vs-CrankNicolson is the only
+        // comparison that moves when the scheme is wrong.
+        const char* controlIs = sst ? "laminar" : (cn ? "under Euler" : "with a static mesh");
+        const char* againstIs = sst ? "with kOmegaSST" : (cn ? "under CrankNicolson" : "with the motion");
         std::printf("  CONTROL: OpenFOAM %s against OpenFOAM %s, U relative %.4e, alpha %.4e\n",
-                    sst ? "laminar" : "with a static mesh", sst ? "with kOmegaSST" : "with the motion",
-                    (double)cU.rel(), (double)cA.linf);
+                    controlIs, againstIs, (double)cU.rel(), (double)cA.linf);
         check(sst ? "the closure moves OpenFOAM's own U far more than brae is from it"
-                  : "the motion moves OpenFOAM's own U far more than brae is from it",
+                  : (cn ? "the ddt scheme moves OpenFOAM's own U far more than brae is from it"
+                        : "the motion moves OpenFOAM's own U far more than brae is from it"),
               cU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)));
     }
     else

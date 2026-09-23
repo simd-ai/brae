@@ -123,7 +123,17 @@ void interMeshUpdate(
     scalar                                 time,
     label                                  timeIndex,
     label                                  outerOfStep,
-    label                                  nOuterCorrectors);
+    label                                  nOuterCorrectors,
+    // the CrankNicolson clock, when that is the run's ddt scheme: fvc::meshPhi is the scheme's, and
+    // the off-centred mesh flux is rebuilt here at every move. Null under Euler.
+    const fv::CrankNicolsonClock*          cn = nullptr);
+
+// fvc::meshPhi(U) (fvcMeshPhi.C:35-45): the mesh flux the ddt scheme named for `ddt(U)` gives, which
+// is mesh().phi() under Euler and the off-centred combination under CrankNicolson. Every makeRelative,
+// makeAbsolute, movingWallVelocity and divU reads it through here rather than mesh().phi() directly.
+const SurfaceScalarField& fvcMeshPhi(
+    const DynamicMotionSolverFvMesh& dyn,
+    const InterFields& f);
 
 // The time the start directory names -- OpenFOAM's time directories ARE their times. A directory whose
 // name is not one cannot tell a loop when it starts, and is refused rather than read as 0. BOTH loops
