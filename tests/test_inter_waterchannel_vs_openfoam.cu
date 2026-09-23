@@ -309,10 +309,16 @@ int main(
         cudaGetLastError();
         nDev = 0;
     }
-    if (nDev > 0 && closureLimitedLinear)
+    // BRAE_SST_DIAG_LIMITED runs the device arm anyway, for the localisation that lifts the refusal.
+    if (nDev > 0 && closureLimitedLinear && !std::getenv("BRAE_SST_DIAG_LIMITED"))
     {
-        std::printf("  (the device closure refuses `Gauss limitedLinear` by name: omega 1.7822e-04\n"
-                    "   against the host's 7.2e-12 -- armed in interfoam_refusals)\n");
+        std::printf("  (the device closure refuses `Gauss limitedLinear` by name -- armed in\n"
+                    "   interfoam_refusals. NOT because a defect was measured: at the first closure\n"
+                    "   call its assembled omega and k systems are the host's to 2.6e-13 on the\n"
+                    "   off-diagonals, every differing diagonal being a wall row setValues pins to the\n"
+                    "   same value. It reads omega 1.7822e-04 at t = 1, and ONE ULP on the initial\n"
+                    "   omega field, run on the HOST, reads 4.3e-02 there -- so these fields cannot\n"
+                    "   witness the scheme, and no gate yet compares the assembled system.)\n");
     }
     else if (nDev <= 0)
     {

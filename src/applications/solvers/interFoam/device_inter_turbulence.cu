@@ -620,25 +620,42 @@ void deviceCorrectInterTurbulence(
         sin.limGradK        = t.sstCoeffs.gradKLimitK;
         sin.limGradLeastSq  = t.sstCoeffs.gradKLeastSq;
         // ...and the CONVECTION scheme. The host closure runs `Gauss limitedLinear <k>` and is gated
-        // on it (RAS/waterChannel `limitedLinear`, fields at 7.2e-12); the DEVICE closure is not.
-        // MEASURED on that same profile with the device arm on: k 1.4724e-05, omega 1.7822e-04,
-        // nut 1.6747e-05, while alpha, p_rgh and U sit at round-off -- so it is the closure, and it
-        // is NOT the limiter's bit-flip, which the host carries too and which costs it 7.2e-12.
-        // BRAE_SST_DIAG_LIMITED bypasses the refusal below FOR DIAGNOSIS ONLY and says so on every
-        // run that sets it. It exists because localising this needs the device to assemble the matrix
-        // it is refused for; it is not a way to run the scheme.
+        // on it (RAS/waterChannel `limitedLinear`, fields at 7.2e-12); the DEVICE closure is not, and
+        // the only case that names the scheme CANNOT gate it.
+        //
+        // MEASURED at the first closure call, device against host, on that profile: omega's and k's
+        // assembled off-diagonals agree to 2.6e-13 and 4.5e-13, and every differing diagonal -- 354
+        // cells of 28,000 -- is a wall-function row that setValues pins to a value the two arms hold
+        // bit for bit. The systems the two arms solve are the same system. Call ONE is the only call
+        // that can say so: from call 2 the two arms no longer hold the same fields (omega at the
+        // assembly is 6.1e-14 apart at call 2, 4.7e-11 at call 5, each solve being its own
+        // arithmetic), and their systems then differ by what their fields differ by -- k's diagonal
+        // 2.5e-08 at call 2 and 1.5e-07 at call 5, on unpinned cells.
+        //
+        // MEASURED at t = 1: the device's fields sit at k 1.4724e-05, omega 1.7822e-04, nut 1.6747e-05.
+        // And the CONTROL for what that number is worth: one ulp on the initial omega field, run on
+        // the HOST, lands at k 4.5e-02, omega 4.3e-02, nut 1.7e-02 -- with U at 5.0e-05 and alpha at
+        // 2.3e-06. This case amplifies the last bit of the turbulence fields by fourteen orders over
+        // ten steps, so its ten-step fields cannot tell a port defect from round-off; the host passes
+        // it because it is bitwise OpenFOAM's, not because the bound is discriminating.
+        //
+        // So the refusal stands on the gate, not on a measured defect: nothing here compares the
+        // device's ASSEMBLED SYSTEM against OpenFOAM's, and that is the only comparison this case can
+        // carry. BRAE_SST_DIAG_LIMITED bypasses it FOR DIAGNOSIS ONLY and says so on every run.
         if (t.closureLimitedLinear && std::getenv("BRAE_SST_DIAG_LIMITED"))
         {
             std::printf("  *** BRAE_SST_DIAG_LIMITED: the device closure's `Gauss limitedLinear` "
-                        "refusal is BYPASSED. Its omega convection is wrong (18,619 of 79,800 faces "
-                        "against the host). Diagnostic only -- the answer is not to be trusted. ***\n");
+                        "refusal is BYPASSED. No gate covers this arm: its assembled system matches "
+                        "the host's at the first call, and this case's ten-step fields cannot witness "
+                        "the scheme (one ulp there is worth 4.3e-02). Diagnostic only. ***\n");
         }
         if (t.closureLimitedLinear && !std::getenv("BRAE_SST_DIAG_LIMITED"))
         {
             sin.hasNonUpwindDivScheme = true;
             sin.divSchemeUnsupported =
                 "Gauss limitedLinear on the device closure: the host runs it and is gated (fields "
-                "7.2e-12); this arm reads omega 1.7822e-04 on RAS/waterChannel";
+                "7.2e-12); no gate covers this arm -- on RAS/waterChannel one ulp of the initial "
+                "omega is worth 4.3e-02 after ten steps, so its fields cannot witness the scheme";
         }
 
         // ...and the grad(U) LIMITER, which this struct carries TWICE -- `co.gradULimitK` and a

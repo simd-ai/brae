@@ -19,6 +19,20 @@ namespace brae {
 namespace gpu {
 namespace kOmegaSSTRAS {
 
+// The assembly's own instrument sink (TransportScheme::dump). `pre` keeps omega's columns and k's
+// apart under the same dump directory.
+struct AsmDumpCtx
+{
+    const brae::turbulence::SstStageDump* sd;
+    const char*                     pre;
+};
+static void asmDumpScalars(void* c, const char* name, const std::vector<scalar>& v)
+{
+    const AsmDumpCtx* x = static_cast<const AsmDumpCtx*>(c);
+    x->sd->scalars((std::string(x->pre) + name).c_str(), v);
+}
+
+
 namespace {
 
 int nBlk(int n) { return (n + 255) / 256; }
@@ -723,6 +737,17 @@ void correct(
         deviceInterpolate(dm, DomegaEff, gammaFace);
 
         PressureMatrix M;
+        // THE LIMITER'S WEIGHTS THEMSELVES, which is the one quantity the assembled matrix cannot
+        // show: that carries the laplacian and the relaxation with it. Same call, same gradient and
+        // same twoByk the assembly uses.
+        if (sd.on && in.limitedLinear)
+        {
+            DeviceBuffer<scalar> wLim;
+            deviceLimitedFaceWeights(dm, *in.phiInt, omega, ogx, ogy, ogz,
+                                     scalar(2) / std::fmax(in.limiterCoeff, scalar(1e-15)), wLim);
+            sd.scalars("omegaLimW", wLim.host());
+            sd.scalars("phiAsm", in.phiInt->host());
+        }
         // the boundary the LIMITER's gradient will read, dumped beside the host's `omegaB_*`
         if (sd.on && omegaBndLast.size()) sd.scalars("omegaBndLast", omegaBndLast.host());
         if (sd.on)
@@ -736,6 +761,16 @@ void correct(
         }
         turbulence::TransportScheme scOmega = sc;
         scOmega.bndValues = omegaBndLast.size() ? &omegaBndLast : nullptr;
+        // ...and the assembly's OWN limiter weights, beside the recomputed pair above: the two are
+        // the same number only if the gradient the limiter uses is the gradient CDkOmega built.
+        const AsmDumpCtx omegaAsmCtx{ &sd, "omega" };
+        turbulence::TransportDump omegaAsmDump;
+        if (sd.on)
+        {
+            omegaAsmDump.ctx     = const_cast<AsmDumpCtx*>(&omegaAsmCtx);
+            omegaAsmDump.scalars = &asmDumpScalars;
+            scOmega.dump = &omegaAsmDump;
+        }
         // the pair's diffusivity is DomegaEff's two CELLS interpolated, which is what
         // surfaceInterpolationScheme::interpolate gives a coupled patch (:186-191); DomB is built from
         // nut's PATCH values and blends an F1 the pair does not have -- a different number there.
@@ -785,7 +820,14 @@ void correct(
                                    // constraint value is the current field.
                                    wall.nWF > 0 ? &wall.isWallCell : nullptr,
                                    wall.nWF > 0 ? &omega0 : nullptr,
-                                   sv, res.omega, std::string(), in.gsOmega, &res.omegaPerf,
+                                   // ...and the FOLDED system at the solve, under the dump. The host
+                                   // capture (captureSSTSystem) runs after relax and setValues; this
+                                   // arm's dumpTerms runs BEFORE both, and comparing the two put
+                                   // 18,511 faces in the report that were only the host's setValues
+                                   // zeroing a pinned row. Same point, same convention, directly
+                                   // diffable.
+                                   sv, res.omega, sd.on ? sd.dir + "/omegaSys" : std::string(),
+                                   in.gsOmega, &res.omegaPerf,
                                    // ...and the pair's off-diagonal, which deviceAmul applies as
                                    // Apsi[own] += ifCoeff*psi[nbr]: without it the solve runs a
                                    // different operator from the matrix it was handed
@@ -839,6 +881,14 @@ void correct(
         if (sd.on && kBndLast.size()) sd.scalars("kBndLast", kBndLast.host());
         turbulence::TransportScheme scK = sc;
         scK.bndValues = kBndLast.size() ? &kBndLast : nullptr;
+        const AsmDumpCtx kAsmCtx{ &sd, "k" };
+        turbulence::TransportDump kAsmDump;
+        if (sd.on)
+        {
+            kAsmDump.ctx     = const_cast<AsmDumpCtx*>(&kAsmCtx);
+            kAsmDump.scalars = &asmDumpScalars;
+            scK.dump = &kAsmDump;
+        }
         scK.gammaCell = in.cyc ? &DkEff : nullptr;   // as scOmega.gammaCell, k's own DEff
         turbulence::assembleScalarTransport(M, dm, dbK, k, gammaFace,
                                             DkB.size() ? DkB : gammaFace, scK);
@@ -881,7 +931,8 @@ void correct(
         // equation.
         turbulence::solveScalarEqn(M, k, dm, in.relaxEquationK, in.relaxK,
                                    in.fvoKMask, in.fvoKVal, nullptr, nullptr,
-                                   sv, res.k, std::string(), in.gsK, &res.kPerf, in.cyc);
+                                   sv, res.k, sd.on ? sd.dir + "/kSys" : std::string(),
+                                   in.gsK, &res.kPerf, in.cyc);
         kEpsilonRAS::boundField(k, dm, dbK, in.co.kMin, "k");
         if (std::getenv("BRAE_SST_DEBUG"))
             std::printf("  [sst] k     solve: initialResidual %.6g\n", (double)res.k);

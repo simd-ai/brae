@@ -159,9 +159,36 @@ void assembleScalarTransport(
         // The limiter's gradient takes the case's OWN gradScheme for this field -- OpenFOAM builds it
         // through fvc::grad(lPhi) (LimitedScheme.C:56-59), not through a scheme the closure chooses.
         const FieldGrad& g = fieldGrad(sc.limGradLeastSq, sc.limGradK);
-        deviceDivLimitedCoeffs(dm, *sc.phiInt, field, g.gx, g.gy, g.gz,
-                               scalar(2) / std::fmax(sc.limiterCoeff, scalar(1e-15)),
+        const scalar twoByk = scalar(2) / std::fmax(sc.limiterCoeff, scalar(1e-15));
+        deviceDivLimitedCoeffs(dm, *sc.phiInt, field, g.gx, g.gy, g.gz, twoByk,
                                M.diag, M.upper, M.lower);
+
+        // INSTRUMENT (TransportScheme::dump, free when null): the weights THIS assembly limited with,
+        // the gradient that built them, and the patch values that gradient read -- read off the
+        // buffers the coefficients above were written from, not recomputed from a caller's copy.
+        if (sc.dump && sc.dump->scalars)
+        {
+            DeviceBuffer<scalar> w;
+            deviceLimitedFaceWeights(dm, *sc.phiInt, field, g.gx, g.gy, g.gz, twoByk, w);
+            sc.dump->scalars(sc.dump->ctx, "AsmLimW",   w.host());
+            sc.dump->scalars(sc.dump->ctx, "AsmGradX",  g.gx.host());
+            sc.dump->scalars(sc.dump->ctx, "AsmGradY",  g.gy.host());
+            sc.dump->scalars(sc.dump->ctx, "AsmGradZ",  g.gz.host());
+            sc.dump->scalars(sc.dump->ctx, "AsmBval",   fieldBval().host());
+            sc.dump->scalars(sc.dump->ctx, "AsmField",  field.host());
+            sc.dump->scalars(sc.dump->ctx, "AsmPhi",    sc.phiInt->host());
+            // ...and the GEOMETRY the limiter reads: the CD weight and the two half-deltas it forms
+            // d = C[N] - C[P] from. The two arms compute these from the same mesh but not by the same
+            // route, and a face where the limiter sits on its clamp turns a round-off difference in d
+            // into a whole scheme.
+            sc.dump->scalars(sc.dump->ctx, "AsmCd",    dm.w.host());
+            sc.dump->scalars(sc.dump->ctx, "AsmDOwnX", dm.dOwnX.host());
+            sc.dump->scalars(sc.dump->ctx, "AsmDOwnY", dm.dOwnY.host());
+            sc.dump->scalars(sc.dump->ctx, "AsmDOwnZ", dm.dOwnZ.host());
+            sc.dump->scalars(sc.dump->ctx, "AsmDNeiX", dm.dNeiX.host());
+            sc.dump->scalars(sc.dump->ctx, "AsmDNeiY", dm.dNeiY.host());
+            sc.dump->scalars(sc.dump->ctx, "AsmDNeiZ", dm.dNeiZ.host());
+        }
     }
     else
     {

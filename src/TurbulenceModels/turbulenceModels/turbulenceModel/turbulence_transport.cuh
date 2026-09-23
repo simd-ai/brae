@@ -21,6 +21,7 @@
 #include "device_boundary.cuh"
 #include "device_cyclic.cuh"
 #include <string>
+#include <vector>   // TransportDump's sink takes a host column
 #include "device_dilu.cuh"    // DeviceDilu -- the case's preconditioner for these solves
 #include "device_colour_gauss_seidel.cuh"   // DeviceCellColouring -- the colour-order smoothSolver (FP-1)
 #include "pEqn.cuh"               // PressureMatrix -- the assembled scalar object, shared not redefined
@@ -28,6 +29,24 @@
 namespace brae {
 namespace gpu {
 namespace turbulence {
+
+// An INSTRUMENT sink: when set, the assembly writes the objects it actually assembled with -- the
+// limiter's weights, the gradient that built them, and the patch values that gradient read -- through
+// the caller's own dump.
+//
+// WHY THE ASSEMBLY AND NOT BESIDE IT. The device closure dumped the weights by RECOMPUTING them next to
+// this call, from CDkOmega's gradient. That dump cannot witness a disagreement between the gradient the
+// limiter uses and the one the dump recomputes with, which is exactly the class of gap being chased
+// (omega's weights differ from the host's on 357 of 79,800 faces while every input compared identical).
+// A number read from the assembly's own buffers can.
+//
+// A function pointer and a void* rather than std::function: this header is included by every device
+// closure, and the sink is the caller's stage dump, which knows its own file layout.
+struct TransportDump
+{
+    void* ctx = nullptr;
+    void (*scalars)(void* ctx, const char* name, const std::vector<scalar>& v) = nullptr;
+};
 
 // The case's schemes for this one field. Every member is read from the case, never defaulted into a
 // substitution: a closure that leaves `limitedLinear` false when the case named it runs upwind under
@@ -97,6 +116,9 @@ struct TransportScheme
     // `epf == epsilon0`) -- while `db` carries the coefficients updateCoeffs has JUST refreshed for this
     // assembly. Null = evaluate `db` live, which is what every caller did before stage H3.5.
     const DeviceBuffer<scalar>* bndValues = nullptr;
+
+    // Null by default and free when null (see TransportDump above).
+    const TransportDump* dump = nullptr;
 };
 
 // The linear solve for ONE transported scalar: relax() -> fvOptions.constrain() -> setValues(wall), in

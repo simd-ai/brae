@@ -108,7 +108,12 @@ FvScalarMatrix divWithScheme(
     // OpenFOAM's own iteration 5 with `grad(k) leastSquares; grad(omega) leastSquares;` and limitedLinear
     // on both: exact at iteration 6, k 3.1e-06 / omega 6.4e-05 at iteration 7 with the Gauss gradient here.
     scalar                           limGradK = 0.0,
-    bool                             limGradLeastSq = false)
+    bool                             limGradLeastSq = false,
+    // INSTRUMENT: when set, the weights and the gradient THIS call limited with, under <pre>Asm*,
+    // beside the device's columns of the same name. Recomputing them at the call site cannot witness
+    // a gradient built differently in here, which is the class of gap being chased.
+    const turbulence::SstStageDump*  sd = nullptr,
+    const char*                      pre = "")
 {
     if (!limitedLinear)
     {
@@ -123,9 +128,38 @@ FvScalarMatrix divWithScheme(
     std::vector<vector> gradVf = limGradLeastSq ? fvc::leastSquaresGrad(vf.internal, vfb, m, g, patches)
                                                 : fvc::gaussGrad(vf.internal, vfb, m, g, patches);
     if (limGradK > 0.0) cellLimitGrad(gradVf, vf.internal, vfb, limGradK, m, g, patches);
-    return fvm::div(phi.internal, phi.boundary, vf,
-                    ls::limitedLinearWeights(phi.internal, vf, gradVf, limiterCoeff, m, g),
-                    m, patches);
+    const std::vector<scalar> w = ls::limitedLinearWeights(phi.internal, vf, gradVf, limiterCoeff, m, g);
+    if (sd && sd->on)
+    {
+        const std::string t(pre);
+        sd->scalars((t + "AsmLimW").c_str(), w);
+        std::vector<scalar> gx(gradVf.size()), gy(gradVf.size()), gz(gradVf.size());
+        for (std::size_t c = 0; c < gradVf.size(); ++c)
+        { gx[c] = gradVf[c].x; gy[c] = gradVf[c].y; gz[c] = gradVf[c].z; }
+        sd->scalars((t + "AsmGradX").c_str(), gx);
+        sd->scalars((t + "AsmGradY").c_str(), gy);
+        sd->scalars((t + "AsmGradZ").c_str(), gz);
+        std::vector<scalar> bv;
+        for (const auto& pb : vfb) bv.insert(bv.end(), pb.begin(), pb.end());
+        sd->scalars((t + "AsmBval").c_str(),  bv);
+        sd->scalars((t + "AsmField").c_str(), vf.internal);
+        sd->scalars((t + "AsmPhi").c_str(),   phi.internal);
+        // ...and the geometry, beside the device's columns of the same name (see turbulence_transport.cu).
+        sd->scalars((t + "AsmCd").c_str(), g.weights());
+        const label nIf = m.nInternalFaces();
+        std::vector<scalar> dx(nIf), dy(nIf), dz(nIf);
+        for (label f = 0; f < nIf; ++f)
+        {
+            const label P = m.owner()[f], N = m.neighbour()[f];
+            dx[f] = g.C()[N].x - g.C()[P].x;
+            dy[f] = g.C()[N].y - g.C()[P].y;
+            dz[f] = g.C()[N].z - g.C()[P].z;
+        }
+        sd->scalars((t + "AsmDX").c_str(), dx);
+        sd->scalars((t + "AsmDY").c_str(), dy);
+        sd->scalars((t + "AsmDZ").c_str(), dz);
+    }
+    return fvm::div(phi.internal, phi.boundary, vf, w, m, patches);
 }
 
 
@@ -708,8 +742,23 @@ void correct(
             omega.boundary[pi]->updateFromFlux(phi.boundary[pi]);
         }
 
+        // THE LIMITER'S WEIGHTS, beside the device's `omegaLimW`. Recomputed here with exactly what
+        // divWithScheme computes internally -- its gradient is the field's own Gauss gradient from
+        // the STORED patch values -- because the assembled matrix carries the laplacian and the
+        // relaxation and cannot show the weights on their own.
+        if (sd.on && limitedLinear)
+        {
+            std::vector<std::vector<scalar>> ob(patches.size());
+            for (std::size_t pi = 0; pi < patches.size(); ++pi) ob[pi] = omega.boundary[pi]->value();
+            const std::vector<vector> go = co.gradKLeastSq
+                ? fvc::leastSquaresGrad(omega.internal, ob, m, g, patches)
+                : fvc::gaussGrad(omega.internal, ob, m, g, patches);
+            sd.scalars("omegaLimW",
+                       ls::limitedLinearWeights(phi.internal, omega, go, limiterCoeff, m, g));
+            sd.scalars("phiAsm", phi.internal);
+        }
         FvScalarMatrix M = divWithScheme(phi, omega, limitedLinear, limiterCoeff, m, g, patches,
-                                         co.gradKLimitK, co.gradKLeastSq);
+                                         co.gradKLimitK, co.gradKLeastSq, &sd, "omega");
         {
             // The laplacian with BOTH halves of `corrected`, then subtracted from the equation. The
             // explicit correction goes into the LAPLACIAN's own source first, so the -1.0 below carries
@@ -807,6 +856,16 @@ void correct(
         setValues(M, omega.internal, m, patches, wallCells, omVals);
         if (res && res->captureStages)
             captureSSTSystem(M, patches, res->omD, res->omSrc, &res->omUpper, &res->omLower);
+        // ...and WRITTEN HERE, at the call the stage dump latched, not at every call from the driver.
+        // The driver's own write overwrote its files on every closure call, so a ten-step run left the
+        // system of step TEN beside device columns latched at step ONE: the comparison then reported
+        // 28,000 differing diagonals that were only two different iterations.
+        if (sd.on && res)
+        {
+            sd.scalars("omD", res->omD);       sd.scalars("omSrc", res->omSrc);
+            sd.scalars("omUpper", res->omUpper); sd.scalars("omLower", res->omLower);
+            sd.scalars("omD0", res->omD0);     sd.scalars("omSrc0", res->omSrc0);
+        }
         const SolverPerformance po = solveScalar(M, omega.internal);
         if (res)
         {
@@ -859,7 +918,7 @@ void correct(
         }
 
         FvScalarMatrix M = divWithScheme(phi, k, limitedLinear, limiterCoeff, m, g, patches,
-                                         co.gradKLimitK, co.gradKLeastSq);
+                                         co.gradKLimitK, co.gradKLeastSq, &sd, "k");
         {
             // The laplacian with BOTH halves of `corrected`, then subtracted from the equation. The
             // explicit correction goes into the LAPLACIAN's own source first, so the -1.0 below carries
@@ -931,6 +990,11 @@ void correct(
         if (relaxEquationK) relaxMatrix(M, k, m, patches, relaxK);
         if (res && res->captureStages)
             captureSSTSystem(M, patches, res->kD, res->kSrc, &res->kUpper, &res->kLower);
+        if (sd.on && res)
+        {
+            sd.scalars("kD", res->kD);       sd.scalars("kSrc", res->kSrc);
+            sd.scalars("kUpper", res->kUpper); sd.scalars("kLower", res->kLower);
+        }
         const SolverPerformance pk = solveScalar(M, k.internal);
         if (res)
         {

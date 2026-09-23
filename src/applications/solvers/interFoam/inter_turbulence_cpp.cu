@@ -811,21 +811,9 @@ void correctInterTurbulence(
                            t.closureLimiterCoeff, /*linearUpwind=*/false,
                            t.coeffs.correctedLaplacian, t.coeffs.snGradLimitCoeff, /*lm=*/nullptr,
                            &sstComp, ks.minIter, t.omegaRelaxFinal.on, t.kRelaxFinal.on, &which);
-        if (res.captureStages)
-        {
-            const std::string dd = std::string(std::getenv("BRAE_SST_DUMP_DIR")) + "/host";
-            auto dumpv = [&](const char* name, const std::vector<scalar>& v)
-            {
-                std::ofstream o(dd + "/" + name);
-                o.precision(17);
-                for (const scalar x : v) o << x << "\n";
-            };
-            dumpv("omD", res.omD);      dumpv("omSrc", res.omSrc);
-            dumpv("omUpper", res.omUpper); dumpv("omLower", res.omLower);
-            dumpv("omD0", res.omD0);    dumpv("omSrc0", res.omSrc0);
-            dumpv("kD", res.kD);        dumpv("kSrc", res.kSrc);
-            dumpv("kUpper", res.kUpper); dumpv("kLower", res.kLower);
-        }
+        // The assembled systems are WRITTEN BY THE CLOSURE (kOmegaSST_cpp.cu), at the call its stage
+        // dump latched. This site wrote them on every call instead, so the files held the LAST
+        // closure call while every other column in the directory held the first.
         if (in.omegaLog)
         {
             in.omegaLog->push_back({res.omegaPerf.initialResidual, res.omegaPerf.finalResidual,
