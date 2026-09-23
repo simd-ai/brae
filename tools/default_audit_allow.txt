@@ -73,10 +73,16 @@ KOmegaSSTInput sin fvoOmegaVal
 KOmegaSSTInput sin hasUnportedFvOption
 KOmegaSSTInput sin fvOptionUnsupported
 KOmegaSSTInput sin hasNonWallTurbWallFunc
+# rhoSimpleFoam offers no PBiCG for the closure AT ALL -- linear_solver_setup reads `gsK` as
+# "smoothSolver named" and otherwise ANNOUNCES the substitute it runs (noticeSolverChoice("k",
+# "PBiCGStab", ...)), which is a declared substitution and not a silent one. interFoam's two sites set
+# `pbicgKE` because its reader admits `solver PBiCG; preconditioner DILU;` for k and omega
+# (tests/interfoam_waterchannel_vs_openfoam.sh `pbicg`). The entry leaves the day rhoSimpleFoam reads
+# the entry too.
+KOmegaSSTInput sstIn pbicgKE
 KOmegaSSTInput sin colouring
 KOmegaSSTInput sin gsColour
 KOmegaSSTInput sin polyDeg
-KOmegaSSTInput sin precon           # interFoam admits PBiCG under kEpsilon only (readFinalSolve allowPBiCG); SST runs the GS smoother, so no DILU schedule
 # rhoSimpleFoam's hook (rhoTurbulenceHook.cu `kin`): steady/Euler only, no pair on the device, no mangroves
 KEpsilonInput kin cn                # ddtSchemes other than steadyState/Euler are refused (scheme_parse.cuh:304-310, names CrankNicolson) -- ARM tests/rho_step_cuda_refusals.sh's CrankNicolson arm
 KEpsilonInput kin cnDdt0Eps         # same refusal
@@ -334,10 +340,6 @@ HeToTResult r residual
 # using one leaves the other null by construction.
 GSFusedComponent one normFactor
 GSFusedComponent one dNormFactor
-# LinearSolverChoice (smooth_solver_cpp.cuh:50): the kOmegaSST site selects the smoothSolver, and
-# `pbicgDILU` is the kEpsilon-only alternative the interFoam reader refuses under SST by name
-# (readFinalSolve's allowPBiCG, inter_turbulence_cpp.cu:78-88).
-LinearSolverChoice which pbicgDILU
 
 # UNARMED, and named so rather than left to look armed: two cited refusals still have no arm.
 #   InterTurbulenceStepInput ti cn / rhoOO -- "BRAE_INTER_HOST_CLOSURE under CrankNicolson is not

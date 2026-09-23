@@ -1,0 +1,9 @@
+# Cache guards that are KNOWINGLY keyed on a device pointer alone -- tools/cache_key_audit.py's
+# ledger. One line per justified guard:
+#     <file> <object>.<field>    # why the pointer IS the identity there
+#
+# It is EMPTY. A guard belongs here only when the cache cannot outlive what the pointer points into --
+# and note that "it is owned by the object" was the argument for the two AMG V-cycle graphs, which
+# this audit found keyed on A.diag alone while their PCG twins next door compared the scratch epoch.
+# A stale entry fails the gate, so the ledger cannot rot into a suppression file, and
+# tests/cache_key_audit_selftest.sh is what says the audit can still fail.

@@ -1144,8 +1144,35 @@ template <typename T>
 class SymmetryPlanePatchField : public fvPatchField<T>
 {
 public:
-    bool assignable() const override { return false; }   // OF: symmetry is a transform patch field
-    explicit SymmetryPlanePatchField(const FvPatch& p) : fvPatchField<T>(p) {}
+    // THIS RETURNS FALSE WHERE OPENFOAM'S RETURNS TRUE, deliberately, and the pair is why.
+    //
+    // OpenFOAM: symmetry and symmetryPlane are basicSymmetryFvPatchField -> transformFvPatchField,
+    // whose assignable() is TRUE (transformFvPatchField.H:120) and which neither overrides; `slip`
+    // is the same transform and DOES override it to false (slipFvPatchField.H:135-139), as
+    // partialSlip does (partialSlipFvPatchField.H:167). So of the three BCs this class serves, only
+    // slip is non-assignable there.
+    //
+    // WHAT assignable() DECIDES HERE is constrainHbyA (pEqn.H:3): HbyA's patch value is replaced by
+    // U's on a NON-assignable patch. OpenFOAM does not need that on a symmetry patch because HbyA
+    // CARRIES THE CONSTRAINT PATCH TYPE -- the field algebra keeps it -- so its own symmetry patch
+    // evaluates to the tangential projection and the normal flux is zero. brae's HbyA has no patch
+    // fields: `HbyAb[pi][i] = takeU ? ub[i] : HbyA[faceCells[i]]` (inter_peqn_cpp.cu, and the same
+    // three lines in simpleFoam and rhoSimpleFoam), so the alternative here is the raw CELL value,
+    // whose normal component is not zero.
+    //
+    // The two differences compose to the same number: `Sf & U_b` on a symmetry patch is zero, and so
+    // is `Sf & (tangential HbyA)`, and the flux is the only thing HbyAb feeds. Correcting this one
+    // alone is what a reading of the class hierarchy suggests, and it is wrong: MEASURED, with
+    // assignable() returning OpenFOAM's true and the rest unchanged, RAS/damBreakLeakage reads U
+    // 6.1507e-01, p_rgh 1.0143e+00, alpha 5.4567e-01 and LES/nozzleFlow2D fails with it -- the
+    // spurious normal flux of an unprojected HbyA on every symmetry face.
+    //
+    // Lifting it means giving HbyA the constraint patch fields OpenFOAM gives it, in all four
+    // solvers and both arms, and then this becomes `return slip_` -- which is why the flag is here.
+    // tests/test_symmetry_assignable.cu pins the composition, so neither half moves alone.
+    explicit SymmetryPlanePatchField(const FvPatch& p, bool slip = false)
+        : fvPatchField<T>(p), slip_(slip) {}
+    bool assignable() const override { return false; }
 
     // OF basicSymmetryFvPatchField. For a SCALAR the normal gradient is zero and this is zeroGradient,
     // which is what the base coefficients already give. For a VECTOR it is a TRANSFORM patch field and
@@ -1273,6 +1300,8 @@ public:
     bool isSymmetry() const override { return true; }
 
 private:
+    // which of the three BCs this is: `slip` alone is not assignable (see the class note)
+    bool slip_ = false;
     // The patch internal field, cached at evaluate(). OpenFOAM's coefficient methods call
     // patchInternalField() directly; brae's take no arguments, so it is kept here instead.
     std::vector<T> pif_;
@@ -1308,7 +1337,10 @@ template <typename T>
 class WedgePatchField : public fvPatchField<T>
 {
 public:
-    bool assignable() const override { return false; }   // OF: wedge is a transform patch field
+    // ...and a WEDGE is assignable in OpenFOAM too -- wedgeFvPatchField derives from
+    // transformFvPatchField and does not override assignable() (transformFvPatchField.H:120) -- and
+    // false here for the same reason, and with the same measurement: see SymmetryPlanePatchField.
+    bool assignable() const override { return false; }
     WedgePatchField(const FvPatch& p, const tensor& faceT, const tensor& cellT)
         : fvPatchField<T>(p), faceT_(faceT), cellT_(cellT) {}
     void evaluate(const std::vector<T>& internal) override
@@ -3389,7 +3421,8 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
     if (isCoupledInterfaceType(d.type))          return std::make_unique<ZeroGradientPatchField<T>>(p);
     if (d.type == "empty")           return std::make_unique<EmptyPatchField<T>>(p);
     if (d.type == "symmetryPlane" || d.type == "symmetry" || d.type == "slip")
-        return std::make_unique<SymmetryPlanePatchField<T>>(p);  // slip = OF basicSymmetry
+        // slip = OF basicSymmetry, with assignable() false where symmetry's is true -- see the class
+        return std::make_unique<SymmetryPlanePatchField<T>>(p, /*slip=*/d.type == "slip");
     if (d.type == "wedge")   // axisymmetric constraint: the geometry IS the boundary condition
     {
         const WedgeGeometry w = wedgeGeometry(p);

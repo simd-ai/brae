@@ -207,6 +207,54 @@ PYEOF
         grep -q "Gauss limitedLinear 1" "$C/system/fvSchemes" \
             || { echo "FAIL: the limitedLinear profile did not reach div(phi,k)"; return 1; }
     fi
+    # PROFILE pbicg: `solver PBiCG; preconditioner DILU;` for k and omega, where the tutorial names a
+    # symGaussSeidel smoothSolver. NEITHER ARM READ IT. The host SST driver set
+    # `which.smoothSolver = true` whatever fvSolution gave and the device branch set gsK and gsOmega
+    # the same way, so a case naming PBiCG ran symGaussSeidel sweeps under PBiCG's tolerance and said
+    # nothing -- the substitution the kEpsilon twin was fixed for on waves/mangroveInteraction, in the
+    # twin nobody had looked at. The reader refused PBiCG for k and omega under SST on top of that,
+    # which is what kept it invisible: the case could not run at all, so no gate could hold it.
+    # MEASURED with the substitution put back, both arms: k 1.2575e-01, omega 1.3608e-01, nut
+    # 3.0634e-02, U 4.4383e-04, alpha 1.9940e-05, 4 of 10 omega counts, 22 failures. With the entry
+    # read: host k 2.4249e-12 / omega 2.9758e-12, device 2.1456e-12 / 4.0655e-12, every count
+    # OpenFOAM's on both.
+    if [ "$profile" = pbicg ]; then
+        python3 - "$C" <<'PYEOF' || { echo "FAIL: the pbicg profile was not staged"; return 1; }
+import re, sys
+p = sys.argv[1] + '/system/fvSolution'
+s = open(p).read()
+old = '''    "(U|k|omega|s).*"
+    {
+        solver          smoothSolver;
+        smoother        symGaussSeidel;
+        nSweeps         1;
+        tolerance       1e-6;
+        relTol          0.1;
+    };'''
+assert s.count(old) == 1, 'the tutorial no longer names one smoothSolver for U, k and omega'
+new = '''    "U.*"
+    {
+        solver          smoothSolver;
+        smoother        symGaussSeidel;
+        nSweeps         1;
+        tolerance       1e-6;
+        relTol          0.1;
+    };
+
+    "(k|omega|s).*"
+    {
+        solver          PBiCG;
+        preconditioner  DILU;
+        tolerance       1e-6;
+        relTol          0.1;
+    };'''
+open(p, 'w').write(s.replace(old, new))
+PYEOF
+        grep -q "solver          PBiCG" "$C/system/fvSolution" \
+            || { echo "FAIL: the pbicg profile did not name PBiCG for the closure"; return 1; }
+        grep -q "preconditioner  DILU" "$C/system/fvSolution" \
+            || { echo "FAIL: the pbicg profile did not name DILU"; return 1; }
+    fi
     if [ "$profile" = nutPatches ]; then
         python3 - "$C" <<'PYEOF' || { echo "FAIL: the nutPatches profile was not staged"; return 1; }
 import sys
@@ -254,7 +302,7 @@ PYEOF
 
 rc=0
 for p in laminar sst nutPatches nutInletZeroGrad nutInletZero oneCorrector oneCorrectorLaminar \
-         limitedLinear; do
+         limitedLinear pbicg; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_waterchannel_vs_openfoam: staging failed"; exit 1; }
@@ -279,6 +327,14 @@ grep -q "Solving for omega" "$W/laminar/log.interFoam" \
 # against brae's 7.2e-12 from OpenFOAM, so the profile is not measuring nothing.
 "$BIN" "$W/limitedLinear" "$W/limitedLinear/0" "$W/limitedLinear/$END" "$STEPS" \
        "$W/limitedLinear/log.interFoam" "$W/laminar/$END" "$W/sst/$END" 1e-6 || rc=1
+# ...and the SOLVER THE CASE NAMES for the closure: PBiCG with DILU on k and omega, where the
+# tutorial names a symGaussSeidel smoothSolver. Both arms ran the smoothSolver whatever fvSolution
+# said; the reader refused the combination on top of that, so nothing could hold it. Its controls are
+# the profile's own: the laminar run (the closure is live at all) and the `sst` run at the tutorial's
+# own solver -- which is a DIFFERENT answer, because a substituted solver at the same tolerance stops
+# somewhere else, and that is the whole point of reading the entry.
+"$BIN" "$W/pbicg" "$W/pbicg/0" "$W/pbicg/$END" "$STEPS" "$W/pbicg/log.interFoam" \
+       "$W/laminar/$END" "$W/sst/$END" || rc=1
 "$BIN" "$W/nutPatches" "$W/nutPatches/0" "$W/nutPatches/$END" "$STEPS" "$W/nutPatches/log.interFoam" \
        "$W/laminar/$END" "$W/sst/$END" || rc=1
 # the control is OpenFOAM's answer with the patch pinned at 0: nut 1.4e-05 away, a floor of 1e-6 (six

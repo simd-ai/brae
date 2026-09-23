@@ -530,8 +530,10 @@ InterTurbulence readInterTurbulence(
             t.yCell = cellWallDist(*mesh, *geometry, patches);
         }
 
-        t.kSolveFinal = readFinalSolve(fvSolution, "k");
-        t.omegaSolveFinal = readFinalSolve(fvSolution, "omega");
+        // ...and PBiCG for k and omega too: the SST closure runs it now, as kEpsilon's has since
+        // waves/mangroveInteraction (kOmegaSST_cpp.cu, solveScalar)
+        t.kSolveFinal = readFinalSolve(fvSolution, "k", /*allowPBiCG=*/true);
+        t.omegaSolveFinal = readFinalSolve(fvSolution, "omega", /*allowPBiCG=*/true);
         t.kRelaxFinal = EquationRelax::read(eqAll, "kFinal");
         t.omegaRelaxFinal = EquationRelax::read(eqAll, "omegaFinal");
         t.on = true;
@@ -790,13 +792,18 @@ void correctInterTurbulence(
         }
         const SmoothLinearSolve& ks = t.kSolveFinal;
         const SmoothLinearSolve& os = t.omegaSolveFinal;
-        if (ks.smoother != os.smoother || ks.tol != os.tol || ks.relTol != os.relTol
+        if (ks.solver != os.solver || ks.preconditioner != os.preconditioner
+         || ks.smoother != os.smoother || ks.tol != os.tol || ks.relTol != os.relTol
          || ks.maxIter != os.maxIter || ks.minIter != os.minIter || ks.nSweeps != os.nSweeps)
             throw std::runtime_error(
                 std::string(WHO) + "fvSolution gives kFinal and omegaFinal different solver settings; "
                 "the closure takes one set for both equations.");
+        // THE SOLVER THE CASE NAMES. This said `smoothSolver = true` whatever fvSolution gave, so a
+        // case naming PBiCG ran symGaussSeidel sweeps under PBiCG's tolerance -- the substitution the
+        // kEpsilon branch below was fixed for, in the twin nobody looked at.
         LinearSolverChoice which;
-        which.smoothSolver = true;
+        which.pbicgDILU = ks.pbicgDILU();
+        which.smoothSolver = !which.pbicgDILU;
         which.symmetric = (ks.smoother == "symGaussSeidel");
         which.nSweeps = ks.nSweeps;
         kOmegaSST::SSTResiduals res;

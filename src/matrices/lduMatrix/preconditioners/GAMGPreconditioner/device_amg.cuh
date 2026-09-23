@@ -20,6 +20,14 @@ namespace brae {
 struct AMGGraphCache {
     cudaGraphExec_t exec = nullptr; cudaGraph_t graph = nullptr; const void* key = nullptr;
     int keyEpoch = -1;   // deviceReductionScratchEpoch() at capture: the V-cycle captures reductions, whose scratch is regrown by freeing
+    // ...and the ADDRESSING the graph was captured against. `key` is A.diag, a pointer, and the pool
+    // hands equal-sized blocks back at the same address: on a moving mesh the hierarchy is rebuilt
+    // every step and its levels return at the same pointers with the same counts and a different
+    // pairing, so a pointer-only guard replays the previous step's V-cycle. That is the defect
+    // measured on waveMakerMultiPaddlePiston (device U 3.0057e-02, and a second run in the same
+    // process differing from the first), fixed there by stamping the addressing --
+    // nextDeviceAddressingId(), device_mesh.cuh -- and compared here for the same reason.
+    long long keyAddressingId = 0;
     ~AMGGraphCache();
 };
 

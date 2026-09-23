@@ -68,7 +68,9 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
     DeviceInterTurbulence d;
     if (!t.on) return d;
     // PBiCG's preconditioner needs the mesh's level schedule, once (see DeviceInterTurbulence::dilu)
-    if (t.model == cpu::interFoam::InterRasModel::KEpsilon && t.kSolveFinal.pbicgDILU())
+    // ...for EITHER closure. Keyed on kEpsilon alone, the SST branch below would have found no
+    // schedule and refused a case it can run.
+    if (t.kSolveFinal.pbicgDILU())
     {
         d.dilu = buildDeviceDilu(m.owner(), m.neighbour(), m.nCells());
     }
@@ -653,13 +655,37 @@ void deviceCorrectInterTurbulence(
         sin.relaxK = t.kRelaxFinal.factor;
         const cpu::interFoam::SmoothLinearSolve& ks = t.kSolveFinal;
         const cpu::interFoam::SmoothLinearSolve& os = t.omegaSolveFinal;
-        if (ks.smoother != os.smoother || ks.tol != os.tol || ks.relTol != os.relTol
+        if (ks.solver != os.solver || ks.preconditioner != os.preconditioner
+         || ks.smoother != os.smoother || ks.tol != os.tol || ks.relTol != os.relTol
          || ks.maxIter != os.maxIter || ks.minIter != os.minIter || ks.nSweeps != os.nSweeps)
             throw std::runtime_error(
                 "brae interFoam (device): fvSolution gives kFinal and omegaFinal different solver "
                 "settings; the closure takes one set for both equations.");
-        sin.gsK = true;
-        sin.gsOmega = true;
+        // THE SOLVER THE CASE NAMES, and only that -- the kEpsilon branch below has read it since
+        // waves/mangroveInteraction, and this one did not: it set gsK and gsOmega unconditionally, so
+        // `solver PBiCG; preconditioner DILU;` on kFinal and omegaFinal ran symGaussSeidel sweeps
+        // under PBiCG's tolerance and said nothing.
+        if (ks.pbicgDILU())
+        {
+            if (!d.dilu.valid)
+                throw std::runtime_error(
+                    "brae interFoam (device): kFinal names PBiCG with DILU and the SST closure was "
+                    "built with no DILU schedule for this mesh.");
+            sin.pbicgKE = true;
+            sin.precon = &d.dilu;
+        }
+        else if (ks.gaussSeidel())
+        {
+            sin.gsK = true;
+            sin.gsOmega = true;
+        }
+        else
+        {
+            throw std::runtime_error(
+                "brae interFoam (device): kFinal names `solver " + ks.solver + "`, which the device "
+                "kOmegaSST does not run: a Gauss-Seidel smoothSolver, or PBiCG with DILU, and nothing "
+                "else.");
+        }
         sin.gsSymmetric = (ks.smoother == "symGaussSeidel");
         sin.nSweepsKE = ks.nSweeps;
         sin.tol = ks.tol;

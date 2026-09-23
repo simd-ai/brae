@@ -563,7 +563,8 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
     {
         const LduF A0 = lduF(A, amg.fDiag[0], amg.fUpper[0], amg.fLower[0]);
         AMGGraphCache& gcf = *amg.gcacheF;
-        if (!gcf.exec || gcf.key != A.diag)
+        if (!gcf.exec || gcf.key != A.diag || gcf.keyEpoch != deviceReductionScratchEpoch()
+            || gcf.keyAddressingId != A.addressingId)
         {
             if (gcf.exec)  { cudaGraphExecDestroy(gcf.exec);  gcf.exec  = nullptr; }
             if (gcf.graph) { cudaGraphDestroy(gcf.graph);     gcf.graph = nullptr; }
@@ -574,13 +575,16 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
             cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &gcf.graph), "amgF capture end");
             cudaCheck(cudaGraphInstantiate(&gcf.exec, gcf.graph, 0), "amgF graph instantiate");
             gcf.key = A.diag;
+            gcf.keyEpoch = deviceReductionScratchEpoch();
+            gcf.keyAddressingId = A.addressingId;
         }
         cudaCheck(cudaGraphLaunch(gcf.exec, cudaStreamPerThread), "amgF graph launch");
     }
     else
     {
         AMGGraphCache& gc = *amg.gcache;
-        if (!gc.exec || gc.key != A.diag)
+        if (!gc.exec || gc.key != A.diag || gc.keyEpoch != deviceReductionScratchEpoch()
+            || gc.keyAddressingId != A.addressingId)
         {
             if (gc.exec)  { cudaGraphExecDestroy(gc.exec);  gc.exec  = nullptr; }
             if (gc.graph) { cudaGraphDestroy(gc.graph);     gc.graph = nullptr; }
@@ -589,6 +593,8 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
             cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &gc.graph), "amg capture end");
             cudaCheck(cudaGraphInstantiate(&gc.exec, gc.graph, 0), "amg graph instantiate");
             gc.key = A.diag;
+            gc.keyEpoch = deviceReductionScratchEpoch();
+            gc.keyAddressingId = A.addressingId;
         }
         cudaCheck(cudaGraphLaunch(gc.exec, cudaStreamPerThread), "amg graph launch");
     }

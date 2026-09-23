@@ -155,6 +155,12 @@ struct KOmegaSSTInput
     int    polyDeg = 1;
     bool   gsK = false, gsOmega = false, gsSymmetric = true;
     int    nSweepsKE = 1;
+    // ...or `solver PBiCG; preconditioner DILU;` for BOTH equations (device_pbicg.cuh): NOT
+    // PBiCGStab, and it needs `precon` above to carry the mesh's DILU schedule. The kEpsilon twin has
+    // carried this since waves/mangroveInteraction (KEpsilonInput::pbicgKE); this branch set gsK and
+    // gsOmega UNCONDITIONALLY, so a case naming PBiCG ran symGaussSeidel sweeps under PBiCG's
+    // tolerance and said nothing -- the same silent substitution, in the twin that was not looked at.
+    bool   pbicgKE = false;
     // FP-1: sweep the honoured smoothSolver in COLOUR order over `colouring` (SolveControls::gsColour).
     bool   gsColour = false;
     const DeviceCellColouring* colouring = nullptr;

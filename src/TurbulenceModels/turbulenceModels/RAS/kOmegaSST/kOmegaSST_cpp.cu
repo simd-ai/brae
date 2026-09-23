@@ -4,6 +4,7 @@
 #include "cellLimitedGrad_cpp.cuh"
 #include "nut_wall_function.cuh"
 #include "near_wall_dist.cuh"
+#include "pbicg.cuh"
 #include "pbicgstab.cuh"
 #include "limitedSchemes_cpp.cuh"
 #include "bound_cpp.cuh"
@@ -441,6 +442,13 @@ void correct(
         {
             return smoothSolver(A, psi, m, patches, which->symmetric, tol, relTol, maxIter, minIter,
                                 which->nSweeps);
+        }
+        // `solver PBiCG; preconditioner DILU;` -- OpenFOAM's PBiCG, not PBiCGStab, which is a
+        // different recurrence and stops somewhere else at the same tolerance. The kEpsilon twin has
+        // carried this branch since waves/mangroveInteraction; this one fell through to PBiCGStab.
+        if (which && which->pbicgDILU)
+        {
+            return pbicgDILU(A, psi, m, patches, tol, relTol, maxIter, minIter);
         }
         return pbicgstab(A, psi, m, patches, tol, relTol, maxIter, minIter);
     };

@@ -832,10 +832,35 @@ add_test(NAME resize_audit
 # ...and the proof that it fails when the defect is there: it cuts the zeroing out of two real sites
 # (one same-function, one across a call) and checks each is named, plus that a memset written in a
 # COMMENT does not count -- which is how the audit's own first run reported a comment as a defect.
+# A device cache keyed on a POINTER: the pool hands equal-sized blocks back at the same address, so
+# `A.diag` or `A.owner` is not the identity of an addressing. On a moving mesh the GAMG hierarchy is
+# rebuilt every step and its levels return at the same pointers with the same counts and a different
+# pairing -- device U 3.0057e-02 on waveMakerMultiPaddlePiston, and a second run in one process
+# differing from the first. Every such guard must also compare an identity that survives recycling.
+add_test(NAME cache_key_audit
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/cache_key_audit.py
+                 --allow ${CMAKE_CURRENT_SOURCE_DIR}/tools/cache_key_audit_allow.txt
+                 ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_test(NAME cache_key_audit_selftest
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/cache_key_audit_selftest.sh)
+
 # gradBKernel's type-code branches, one patch per branch, against the host reference. Only two of them
 # had a fixture (symmetry, and the flux-conditional ones through waterChannel's oneCorrector profile);
 # the rest were held by whole-case gates, where `snGrad = the prescribed gradient` against
 # `(value - internal)*deltaCoeffs` can hide behind everything else in the step.
+# assignable() on a transform patch: brae returns false where OpenFOAM returns true, as one half of a
+# pair with HbyA having no constraint patch fields -- both give a ZERO NORMAL FLUX, which is all the
+# boundary of HbyA feeds. This pins the composition, so neither half moves alone (correcting
+# assignable() by itself reads U 6.1507e-01 on RAS/damBreakLeakage).
+add_executable(test_symmetry_assignable tests/test_symmetry_assignable.cu)
+target_include_directories(test_symmetry_assignable PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_symmetry_assignable PRIVATE brae_core)
+add_test(NAME symmetry_assignable
+         COMMAND test_symmetry_assignable
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/windAroundBuildingsBox
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/halfChannel)
+set_tests_properties(symmetry_assignable PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(test_device_grad_boundary tests/test_device_grad_boundary.cu)
 target_include_directories(test_device_grad_boundary PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_device_grad_boundary PRIVATE brae_core)
