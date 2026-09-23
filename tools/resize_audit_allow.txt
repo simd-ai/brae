@@ -1,0 +1,11 @@
+# Accumulations into an unzeroed device buffer that are KNOWINGLY kept -- tools/resize_audit.py's
+# ledger. One line per justified site:
+#     <file> <kernel-or-function> <buffer>    # why the buffer's contents cannot matter there
+#
+# It is EMPTY, and that is the finding: the tree has no such site. The one it had is the measurement
+# in the audit's header (interFoam's vector limitedLinear magSqr buffer, U 5.1e-01).
+#
+# An entry belongs here only when the accumulation genuinely cannot see the old contents -- not when
+# "it seems to work". A stale entry, one whose site no longer exists, fails the gate, so the ledger
+# cannot rot into a suppression file. tests/resize_audit_selftest.sh is what says the audit can still
+# fail: it cuts the zeroing out of two real sites and checks each is named.

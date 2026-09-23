@@ -820,6 +820,32 @@ add_test(NAME default_audit_interfoam
                  --allow ${CMAKE_CURRENT_SOURCE_DIR}/tools/default_audit_allow.txt
                  ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+# DeviceBuffer::resize does not zero -- it hands the old block back to a pool and takes one out, and
+# `resize(n)` with n unchanged returns at once, keeping the LAST call's values. A kernel that
+# accumulates (`out[i] +=`, atomicAdd) into such a buffer adds to whatever was there: interFoam's
+# vector limitedLinear built its magSqr limiter that way and read U 5.1e-01 of OpenFOAM's. The audit
+# asks it of every accumulating kernel in the tree, in the same function and across one call.
+add_test(NAME resize_audit
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/resize_audit.py
+                 --allow ${CMAKE_CURRENT_SOURCE_DIR}/tools/resize_audit_allow.txt
+                 ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# ...and the proof that it fails when the defect is there: it cuts the zeroing out of two real sites
+# (one same-function, one across a call) and checks each is named, plus that a memset written in a
+# COMMENT does not count -- which is how the audit's own first run reported a comment as a defect.
+# gradBKernel's type-code branches, one patch per branch, against the host reference. Only two of them
+# had a fixture (symmetry, and the flux-conditional ones through waterChannel's oneCorrector profile);
+# the rest were held by whole-case gates, where `snGrad = the prescribed gradient` against
+# `(value - internal)*deltaCoeffs` can hide behind everything else in the step.
+add_executable(test_device_grad_boundary tests/test_device_grad_boundary.cu)
+target_include_directories(test_device_grad_boundary PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_device_grad_boundary PRIVATE brae_core)
+add_test(NAME device_grad_boundary
+         COMMAND test_device_grad_boundary ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb)
+set_tests_properties(device_grad_boundary PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(NAME resize_audit_selftest
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/resize_audit_selftest.sh)
+
 add_executable(test_rho_kepsilon_cuda tests/test_rho_kepsilon_cuda.cu)
 target_include_directories(test_rho_kepsilon_cuda PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_rho_kepsilon_cuda PRIVATE brae_core)
