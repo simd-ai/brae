@@ -484,20 +484,18 @@ void assembleUEqn(
                 throw std::runtime_error(
                     "brae momentum: CrankNicolson's fvm::ddt(rho, U) needs its ddt0 field, "
                     "rho.oldTime().oldTime() and all three components of U.oldTime().oldTime().");
-            // THE MOVING BRANCH IS A HOST CAPABILITY. ddt0 weighted by V0 and V00 and the source by
-            // V0 (CrankNicolsonDdtScheme.C:1029-1065): the host reference carries it and
-            // tests/interfoam_moving_vs_openfoam.sh's `sloshing2DCN` profile holds it. THIS
-            // assembler is given V0 and never V00, and forms the static branch -- so it refuses
-            // rather than run the static form under the scheme's name.
-            if (in.ddtV0)
+            // THE MOVING BRANCH (CrankNicolsonDdtScheme.C:1029-1065): ddt0 weighted by V0 and V00
+            // and the source by V0. What is refused is HALF a moving mesh -- V0 without V00 means
+            // the caller never asked the mesh for its second old level, and the static branch would
+            // then run under the scheme's name on a mesh whose volumes changed.
+            if (in.ddtV0 && !in.ddtV00)
                 throw std::runtime_error(
-                    "brae momentum (device): CrankNicolson's fvm::ddt on a moving mesh is the scheme's "
-                    "moving branch -- ddt0 weighted by V0 and V00, the source by V0. The HOST arm "
-                    "carries it (crank_nicolson_ddt_scheme_cpp.cu, gated by `sloshing2DCN`); this "
-                    "device assembler forms the static branch and is given no V00.");
+                    "brae momentum (device): CrankNicolson's fvm::ddt on a moving mesh needs "
+                    "mesh().V00() as well as V0 -- the moving branch weights the two old levels by "
+                    "their own volumes. The caller gave V0 alone.");
             DeviceBuffer<scalar>* src[3] = {&M.source[0], &M.source[1], &M.source[2]};
             deviceCnFvmDdt(*in.ddtCn, *in.ddtCnDdt0, in.ddtRho, in.ddtRhoOld, in.ddtRhoOO, 3,
-                           in.ddtUOld, in.ddtUOO, dm.V, M.diag, src);
+                           in.ddtUOld, in.ddtUOO, dm.V, M.diag, src, in.ddtV0, in.ddtV00);
         }
         else
         {

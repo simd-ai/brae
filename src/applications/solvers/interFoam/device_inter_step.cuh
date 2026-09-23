@@ -174,6 +174,15 @@ struct DeviceInterCrankNicolson
     // ...and the PAIR's own old-old flux and its dphidt0 level, which ddtCorr needs there
     const DeviceBuffer<scalar>* phiOOIf = nullptr;
     DeviceCnDdt0 ddtCorrPhiIf;
+    // ON A MOVING MESH ddtCorr is fvcDdtUfCorr, a different operator: its flux side is Uf.oldTime()
+    // and its second ddt0 is a SURFACE VECTOR field over the same faces (CrankNicolsonDdtScheme.C:
+    // 1201-1257). Uf's two old levels are the driver's, as phi's are, three components each over the
+    // internal faces and the boundary faces.
+    DeviceCnDdt0 ddtCorrUf;
+    const DeviceBuffer<scalar>* UfOld[3] = {nullptr, nullptr, nullptr};
+    const DeviceBuffer<scalar>* UfOldBnd[3] = {nullptr, nullptr, nullptr};
+    const DeviceBuffer<scalar>* UfOO[3] = {nullptr, nullptr, nullptr};
+    const DeviceBuffer<scalar>* UfOOBnd[3] = {nullptr, nullptr, nullptr};
     // alphaEqn.H:18-56, :91-97, :236-262 -- the off-centring coefficient the scheme constructed for
     // ddt(alpha) gives on THIS step (0 before the scheme is warm), its cnCoeff, and alphaPhi10's levels
     scalar ocAlpha = 0;
@@ -197,6 +206,9 @@ struct DeviceInterStepControls
     // the cell volumes the mesh had BEFORE this step's move, for the ddt's old-time term
     // (OF EulerDdtScheme: rho.oldTime()*U.oldTime()*Vsc0()). Null on a static mesh.
     const DeviceBuffer<scalar>* V0 = nullptr;
+    // ...and the volumes TWO steps back (fvMesh::V00), which only CrankNicolson's moving branch reads
+    // (CrankNicolsonDdtScheme.C:1029-1047). Required with V0 under that scheme, null under Euler.
+    const DeviceBuffer<scalar>* V00 = nullptr;
     // ...and the mesh flux over the FULL face array, for fvc::makeRelative(phi, U) at the end of the
     // pressure corrector. Null on a static mesh, where OpenFOAM's makeRelative is a no-op.
     const DeviceBuffer<scalar>* meshPhiAll = nullptr;

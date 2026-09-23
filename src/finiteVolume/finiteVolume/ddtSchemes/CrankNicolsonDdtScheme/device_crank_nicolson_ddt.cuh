@@ -47,9 +47,14 @@ struct DeviceCnDdt0
     scalar rDtCoef0(const cpu::fv::CrankNicolsonClock& clock) const { return coef0(clock)/clock.deltaT0; }
 };
 
-// fvm::ddt(rho, vf), static mesh, added INTO diag and the per-component sources. `rho`, `rhoOld` and
+// fvm::ddt(rho, vf), added INTO diag and the per-component sources. `rho`, `rhoOld` and
 // `rhoOO` null together is fvm::ddt(vf). `nComp` is 1 (k, epsilon) or 3 (U); the arrays are indexed
 // by component, and unused slots may be null.
+//
+// V0 and V00 TOGETHER take the scheme's MOVING branch (CrankNicolsonDdtScheme.C:1029-1065), which the
+// host reference carries and this transcribes: ddt0 weighted by the volume each old level belongs to
+// and the source by V0 rather than V. The diagonal takes V either way -- that is the volume the new
+// field lives in. Null together is the static branch.
 void deviceCnFvmDdt(
     const cpu::fv::CrankNicolsonClock& clock,
     DeviceCnDdt0& ddt0,
@@ -61,7 +66,38 @@ void deviceCnFvmDdt(
     const DeviceBuffer<scalar>* const* vfOO,
     const DeviceBuffer<scalar>& V,
     DeviceBuffer<scalar>& diag,
-    DeviceBuffer<scalar>* const* src);
+    DeviceBuffer<scalar>* const* src,
+    const DeviceBuffer<scalar>* V0 = nullptr,
+    const DeviceBuffer<scalar>* V00 = nullptr);
+
+// fvc::ddtCorr(U, Uf) on a MOVING mesh (fvcDdtUfCorr, CrankNicolsonDdtScheme.C:1201-1257),
+// transcribed from the host reference. A DIFFERENT OPERATOR from the static twin below, not a variant
+// of it:
+//   * the flux side is `Sf & Uf.oldTime()`, not phi.oldTime() -- on a moving mesh those are two
+//     numbers, because phi carries the mesh flux and Uf does not;
+//   * the second ddt0 is a SURFACE VECTOR field (ddtCorrDdt0(Uf)), so it needs Uf.oldTime().oldTime();
+//   * the interpolation is subtracted as a VECTOR and dotted with Sf once, rather than each term
+//     being dotted separately -- the same arithmetic, in OpenFOAM's order.
+// A periodic pair is refused by name: those faces are in neither array, and no moving case with one
+// is gated on this arm.
+void deviceCnDdtUfCorr(
+    const DeviceMesh& dm,
+    const cpu::fv::CrankNicolsonClock& clock,
+    DeviceCnDdt0& ddt0,
+    DeviceCnDdt0& dUfdt0,
+    const DeviceBuffer<scalar>* const* UOld,
+    const DeviceBuffer<scalar>* const* UOO,
+    const DeviceBuffer<scalar>* const* UOldBnd,
+    const DeviceBuffer<scalar>* const* UOOBnd,
+    const DeviceBuffer<scalar>* const* UfOld,      // three components, internal faces
+    const DeviceBuffer<scalar>* const* UfOldBnd,   // ...and boundary faces
+    const DeviceBuffer<scalar>* const* UfOO,
+    const DeviceBuffer<scalar>* const* UfOOBnd,
+    const DeviceBuffer<int>& bndUFixesValue,
+    scalar ddtPhiCoeff,
+    DeviceBuffer<scalar>& outInt,
+    DeviceBuffer<scalar>& outBnd,
+    const DeviceCyclic* cyc = nullptr);
 
 // fvc::ddtCorr(U, phi), static mesh, no coupled patch (the device's boundary arrays hold none, and the
 // caller refuses a pair under CrankNicolson by name). `bndUFixesValue` is 1 on every boundary face

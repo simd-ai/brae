@@ -318,6 +318,7 @@ void deviceInterStep(
     uin.ddtRho        = &rho;
     uin.ddtRhoOld     = &rhoOld;
     uin.ddtV0         = ctl.V0;
+    uin.ddtV00        = ctl.V00;
     uin.ddtUOld[0]    = &UOldX;
     uin.ddtUOld[1]    = &UOldY;
     uin.ddtUOld[2]    = &UOldZ;
@@ -502,20 +503,40 @@ void deviceInterStep(
         DeviceBuffer<scalar> ddtCorrI, ddtCorrB, ddtCorrIf;
         if (ctl.cn)
         {
-            // CrankNicolson's fvcDdtPhiCorr, with its two ddt0 fields, transcribed from the host
-            // reference; a moving mesh (phiUfOldInt) is the scheme's other operator and is refused
-            if (ctl.phiUfOldInt || !ctl.cn->phiOOInt || !ctl.cn->phiOOBnd)
-                throw std::runtime_error(
-                    "brae interFoam device step: CrankNicolson's ddtCorr needs phi.oldTime().oldTime() "
-                    "and a mesh that does not move.");
             const DeviceBuffer<scalar>* uo[3] = {&UOldX, &UOldY, &UOldZ};
             const DeviceBuffer<scalar>* uob[3] = {&UOldBndX, &UOldBndY, &UOldBndZ};
-            deviceCnDdtCorr(dm, *ctl.cn->clock, ctl.cn->ddtCorrU, ctl.cn->ddtCorrPhi, uo, ctl.cn->UOO,
-                            uob, ctl.cn->UOOBnd, phiOldInt, phiOldBnd, *ctl.cn->phiOOInt, *ctl.cn->phiOOBnd,
-                            bndUFixesValue, /*ddtPhiCoeff=*/scalar(-1), ddtCorrI, ddtCorrB,
-                            // ...and the PAIR's half, in the SAME call: the Euler form below runs
-                            // only when the scheme is Euler, and it silently stood in for this one
-                            ctl.cyc, &ctl.cn->ddtCorrPhiIf, ctl.phiOldIf, ctl.cn->phiOOIf, &ddtCorrIf);
+            // ON A MOVING MESH the scheme resolves ddtCorr(U, Uf) to fvcDdtUfCorr, a DIFFERENT member
+            // function from the static ddtCorr(U, phi) (CrankNicolsonDdtScheme.C:1201-1257) -- the
+            // same distinction the Euler branch below makes with phiUfOldInt, and the host arm with
+            // `in.UfOld` (inter_peqn_cpp.cu:231). Uf's two old levels come from the driver.
+            if (ctl.V0)
+            {
+                if (!ctl.cn->UfOld[0] || !ctl.cn->UfOO[0] || !ctl.cn->UfOldBnd[0] || !ctl.cn->UfOOBnd[0])
+                    throw std::runtime_error(
+                        "brae interFoam device step: CrankNicolson's ddtCorr on a moving mesh is "
+                        "fvcDdtUfCorr, which needs Uf.oldTime() and Uf.oldTime().oldTime() on the "
+                        "internal and the boundary faces; the caller gave fewer.");
+                deviceCnDdtUfCorr(dm, *ctl.cn->clock, ctl.cn->ddtCorrU, ctl.cn->ddtCorrUf,
+                                  uo, ctl.cn->UOO, uob, ctl.cn->UOOBnd,
+                                  ctl.cn->UfOld, ctl.cn->UfOldBnd, ctl.cn->UfOO, ctl.cn->UfOOBnd,
+                                  bndUFixesValue, /*ddtPhiCoeff=*/scalar(-1), ddtCorrI, ddtCorrB,
+                                  ctl.cyc);
+            }
+            else
+            {
+                // CrankNicolson's fvcDdtPhiCorr, with its two ddt0 fields, transcribed from the host
+                // reference
+                if (!ctl.cn->phiOOInt || !ctl.cn->phiOOBnd)
+                    throw std::runtime_error(
+                        "brae interFoam device step: CrankNicolson's ddtCorr needs phi.oldTime().oldTime().");
+                deviceCnDdtCorr(dm, *ctl.cn->clock, ctl.cn->ddtCorrU, ctl.cn->ddtCorrPhi, uo, ctl.cn->UOO,
+                                uob, ctl.cn->UOOBnd, phiOldInt, phiOldBnd, *ctl.cn->phiOOInt,
+                                *ctl.cn->phiOOBnd,
+                                bndUFixesValue, /*ddtPhiCoeff=*/scalar(-1), ddtCorrI, ddtCorrB,
+                                // ...and the PAIR's half, in the SAME call: the Euler form below runs
+                                // only when the scheme is Euler, and it silently stood in for this one
+                                ctl.cyc, &ctl.cn->ddtCorrPhiIf, ctl.phiOldIf, ctl.cn->phiOOIf, &ddtCorrIf);
+            }
         }
         else
         {

@@ -113,11 +113,15 @@ struct MomentumInput
     scalar ddtDeltaT = 0;
     // ...or CrankNicolson's fvm::ddt(rho, U) in Euler's place (device_crank_nicolson_ddt.cuh): the
     // scheme's clock, the equation's OWN ddt0 field kept by the caller across steps, and the old-old
-    // levels of rho and U. All or none; with `ddtCn` set, ddtV0 (a moving mesh) is refused.
+    // levels of rho and U. All or none.
     const cpu::fv::CrankNicolsonClock* ddtCn = nullptr;
     DeviceCnDdt0*               ddtCnDdt0 = nullptr;
     const DeviceBuffer<scalar>* ddtRhoOO  = nullptr;
     const DeviceBuffer<scalar>* ddtUOO[3] = {nullptr, nullptr, nullptr};
+    // ...and on a MOVING mesh under that scheme, mesh().V00() beside ddtV0: the volumes two steps
+    // back, which the moving branch weights the old-old level by. Required whenever `ddtCn` and
+    // `ddtV0` are both set -- the static branch under a moving mesh is what the refusal below stops.
+    const DeviceBuffer<scalar>* ddtV00 = nullptr;
     bool   bounded = false;   // `bounded Gauss <scheme>`: diag -= V*div(phi); see UEqn_cpp.cuh
     // `Gauss linearUpwind grad(U)`: the matrix stays pure upwind and the whole scheme is a deferred
     // source correction -- see UEqn_cpp.cuh. Unlike `bounded` it does NOT vanish at convergence.

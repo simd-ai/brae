@@ -198,6 +198,84 @@ int main(
     mutableMesh.g = &g;
     mutableMesh.patches = &patches;
 
+    // THE PROFILE THAT MUST REFUSE. CrankNicolson on a mesh that DEFORMS is not held by any gate:
+    // both arms leave OpenFOAM at step two (U 1.2e-03, the alpha flux 2.6e-02) and read 1.06 after
+    // thirty, while the same case under Euler is exact (U 2.0e-11) and the scheme's own state --
+    // `ddt0(rho,U)`, `ddtCorrDdt0(U)`, `meshPhiCN_0` -- matches OpenFOAM's written fields to 1e-12.
+    // So the reader refuses it, and this arm is what says the refusal is REACHABLE and names the
+    // mesh. Lifting it means deleting this block and letting the profile gate like any other.
+    if (profile == "solitaryCN")
+    {
+        int failures = 0;
+        for (const char* arm : {"host", "device"})
+        {
+            std::string what;
+            try
+            {
+                InterFields fx;
+                PrimitiveMesh mx;
+                mx.read(caseDir + "/constant/polyMesh");
+                FvGeometry gx;
+                gx.build(mx);
+                std::vector<FvPatch> px = buildPatches(mx, gx);
+                MutableMesh mmx;
+                mmx.m = &mx;
+                mmx.g = &gx;
+                mmx.patches = &px;
+                if (std::string(arm) == "host")
+                {
+                    runInterFoam(caseDir, startDir, mx, gx, px, 2, false, &fx, scalar(1.0e300),
+                                 nullptr, &mmx);
+                }
+                else
+                {
+                    runInterFoamDevice(caseDir, startDir, mx, gx, px, 2, false, &fx, scalar(1.0e300),
+                                       nullptr, &mmx);
+                }
+            }
+            catch (const std::exception& e)
+            {
+                what = e.what();
+            }
+            const bool named = what.find("DEFORMS") != std::string::npos;
+            if (named)
+            {
+                std::printf("  ok:   the %s arm refuses CrankNicolson on a mesh that deforms\n", arm);
+            }
+            else
+            {
+                std::printf("  FAIL: the %s arm did not refuse a deforming mesh under CrankNicolson: "
+                            "%s\n", arm, what.empty() ? "it ran" : what.c_str());
+                ++failures;
+            }
+        }
+        // ...and the CONTROL: the same staging under Euler must RUN, so the refusal is the scheme's
+        // and not the case's
+        try
+        {
+            InterFields fx;
+            PrimitiveMesh mx;
+            mx.read(std::string(staticDir).substr(0, staticDir.rfind('/')) + "/constant/polyMesh");
+            FvGeometry gx;
+            gx.build(mx);
+            std::vector<FvPatch> px = buildPatches(mx, gx);
+            MutableMesh mmx;
+            mmx.m = &mx;
+            mmx.g = &gx;
+            mmx.patches = &px;
+            const std::string euCase = std::string(staticDir).substr(0, staticDir.rfind('/'));
+            runInterFoam(euCase, euCase + "/0", mx, gx, px, 2, false, &fx, scalar(1.0e300), nullptr, &mmx);
+            std::printf("  ok:   the same deforming case under Euler runs\n");
+        }
+        catch (const std::exception& e)
+        {
+            std::printf("  FAIL: the Euler control of the deforming case does not run: %s\n", e.what());
+            ++failures;
+        }
+        std::printf("test_inter_moving_vs_openfoam: %d failures\n", failures);
+        return failures ? 1 : 0;
+    }
+
     InterFields fin;
     PressureTaps taps;
     const RunReport r = runInterFoam(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/false, &fin,
@@ -224,11 +302,22 @@ int main(
     // closure holds recomputed after the move (a stale wall distance, the third; the two terms
     // without it read alpha 4.2494e-08, p_rgh 4.2660e-08, U 1.7353e-05 against the host's 1.3849e-12,
     // 1.4704e-12 and 1.1909e-10).
+    // ...and `sloshing2DCN`, THE SCHEME on a moving mesh: the device arm forms CrankNicolson's own
+    // moving ddt and fvcDdtUfCorr, both transcribed from the host reference, and reads the off-centred
+    // fvc::meshPhi the shared mesh update builds. It refused the combination by name until those were
+    // written. WHAT THIS ARM WITNESSES, measured by injecting each defect into the device build:
+    //   * fvcDdtUfCorr -- take the STATIC ddtCorr(U, phi) instead: alpha 7.6e-02, p_rgh 9.1e+00,
+    //     U 2.7e-01, Uf 2.8e-01, six failures;
+    //   * the ddt's V0/V00 weights -- drop them, i.e. the static branch: U 6.3e-13 against 3.3e-13.
+    //     BLIND, and not a fault of the arm: this tank moves as a SOLID BODY, so V == V0 == V00 and
+    //     the two branches are the same arithmetic here. The deforming case that would witness them
+    //     is `solitaryCN`, which is refused above.
     const bool deviceArm = (profile == "mixer" || profile == "solitary"
                          || profile == "cylinder" || profile == "solitaryGamg"
                          || profile == "piston" || profile == "flap"
                          || profile == "pistonSST" || profile == "pistonLES"
-                         || profile == "multiPiston" || profile == "multiFlap");
+                         || profile == "multiPiston" || profile == "multiFlap"
+                         || profile == "sloshing2DCN");
     PrimitiveMesh mD;
     FvGeometry gD;
     std::vector<FvPatch> patchesD;

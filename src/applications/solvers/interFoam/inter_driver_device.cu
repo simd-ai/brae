@@ -51,6 +51,36 @@ std::vector<scalar> flattenPatches(const std::vector<std::vector<scalar>>& b,
     return v;
 }
 
+// A SURFACE VECTOR FIELD onto the device, component by component: the internal faces into `into[k]`
+// and the boundary faces into `intoB[k]`, in the device's layout (a coupled patch's faces are in
+// neither array -- see flattenPatches). Uf's two old levels are the only surface vector fields this
+// loop uploads, and fvcDdtUfCorr reads both.
+void uploadSurfaceVector(
+    const SurfaceVectorField& f,
+    const std::vector<FvPatch>& fvp,
+    DeviceBuffer<scalar>* into,
+    DeviceBuffer<scalar>* intoB)
+{
+    std::vector<scalar> c[3], b[3];
+    for (const vector& v : f.internal)
+    {
+        c[0].push_back(v.x); c[1].push_back(v.y); c[2].push_back(v.z);
+    }
+    for (std::size_t pi = 0; pi < fvp.size() && pi < f.boundary.size(); ++pi)
+    {
+        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+        for (const vector& v : f.boundary[pi])
+        {
+            b[0].push_back(v.x); b[1].push_back(v.y); b[2].push_back(v.z);
+        }
+    }
+    for (int k = 0; k < 3; ++k)
+    {
+        into[k].copyFrom(c[k]);
+        intoB[k].copyFrom(b[k]);
+    }
+}
+
 std::vector<scalar> patchValues(const GeometricField<scalar>& f, const std::vector<FvPatch>& fvp)
 {
     std::vector<scalar> v;
@@ -1571,6 +1601,8 @@ RunReport runInterFoamDevice(
     // the volumes the mesh had before this step's move; empty on a static mesh, where the ddt's
     // other branch runs
     DeviceBuffer<scalar> dV0;
+    // ...and the volumes two steps back (fvMesh::V00), which only CrankNicolson's moving branch reads
+    DeviceBuffer<scalar> dV00;
     // ...and the mesh flux the move produced, which the pressure corrector makes phi relative to
     DeviceBuffer<scalar> dMeshPhi;
     // Uf.oldTime() and the face flux ddtCorr reads off it, (Sf & Uf.oldTime()) per internal face.
@@ -1578,6 +1610,13 @@ RunReport runInterFoamDevice(
     // takes this in phi.oldTime()'s place (EulerDdtScheme's fvcDdtUfCorr).
     SurfaceVectorField UfOld = f.Uf;
     DeviceBuffer<scalar> dPhiUfOld;
+    // ...and UNDER CRANKNICOLSON its old-old level and the four component arrays each of them needs on
+    // the device: fvcDdtUfCorr is built from Uf.oldTime() and Uf.oldTime().oldTime() as VECTORS, on
+    // the internal faces and the boundary faces. `UfOOExists` is the host driver's lazy creation --
+    // GeometricField::oldTime() on a level that has never been stored returns the current one.
+    SurfaceVectorField UfOO = f.Uf;
+    bool UfOOExists = false;
+    DeviceBuffer<scalar> dUfOld[3], dUfOldB[3], dUfOO[3], dUfOOB[3];
     // ...and the ABSOLUTE flux the pressure step leaves for fvc::correctUf below, which reads phi
     // one line before makeRelative turns it relative (pEqn.H:66 and :69).
     DeviceBuffer<scalar> dPhiAbsI, dPhiAbsB;
@@ -1668,6 +1707,10 @@ RunReport runInterFoamDevice(
         // field is the step's, the geometry it is dotted with is the mesh's as it stands then.
         if (dyn)
         {
+            // storeOldTime rotates the level that EXISTS, before the old one is overwritten -- the
+            // host driver does it at the end of the step, which is the same place: between the last
+            // read of UfOld and its reassignment
+            if (UfOOExists) UfOO = UfOld;
             UfOld = f.Uf;
             // Uf is built for a dynamic mesh only (inter_case_cpp.cu, createUfIfPresent.H), and the
             // loop below reads it face by face -- so its size is checked rather than assumed.
@@ -1778,6 +1821,30 @@ RunReport runInterFoamDevice(
             phiOldPrevB = pob;
             dCn.phiOOInt = &dPhiOOI;
             dCn.phiOOBnd = &dPhiOOB;
+            // ...and ON A MOVING MESH the Uf pair fvcDdtUfCorr takes in phi's place, with the same
+            // lazy creation (the host driver's UfOOExists): the level is CREATED, as a copy of
+            // Uf.oldTime(), on the step whose first ddtCorr evaluates dUfdt0 and so asks for it.
+            if (dyn)
+            {
+                if (!UfOOExists && dCn.ddtCorrUf.exists && dCn.ddtCorrUf.timeIndex != thisIndex)
+                {
+                    UfOO = UfOld;
+                    UfOOExists = true;
+                }
+                if (!UfOOExists)
+                {
+                    UfOO = UfOld;   // read by nothing on the step the field is created
+                }
+                uploadSurfaceVector(UfOld, fvp, dUfOld, dUfOldB);
+                uploadSurfaceVector(UfOO, fvp, dUfOO, dUfOOB);
+                for (int k = 0; k < 3; ++k)
+                {
+                    dCn.UfOld[k] = &dUfOld[k];
+                    dCn.UfOldBnd[k] = &dUfOldB[k];
+                    dCn.UfOO[k] = &dUfOO[k];
+                    dCn.UfOOBnd[k] = &dUfOOB[k];
+                }
+            }
             dCn.alpha1OO = &dAOO;
             dCn.UOO[0] = &dUoox; dCn.UOO[1] = &dUooy; dCn.UOO[2] = &dUooz;
             dCn.UOOBnd[0] = &dUoobx; dCn.UOOBnd[1] = &dUooby; dCn.UOOBnd[2] = &dUoobz;
@@ -1894,6 +1961,15 @@ RunReport runInterFoamDevice(
                 // ...and now every buffer this loop uploaded from the geometry. clearGeom +
                 // clearOut on the device side: the addressing is untouched, as the move keeps the
                 // topology fixed (device_mesh.cuh).
+                // ...and mesh().V00(), which CrankNicolson's moving branch weights the old-old level
+                // by. Asked for AFTER the move, as the host arm asks at its momentum assembly: the
+                // mesh rotates V00 <- V0 inside update() and creates it on first use, so the two arms
+                // get the same array whichever asks first.
+                if (cnDdt)
+                {
+                    dV00.copyFrom(dyn->V00());
+                    C.V00 = &dV00;
+                }
                 refreshDeviceMeshGeometry(dm, m, g, fvp);
                 dMagSf.copyFrom(magSfAll());
                 dGh.copyFrom(f.gh);

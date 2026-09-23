@@ -695,6 +695,19 @@ stage sloshing2DCorrectPhi sloshingTank2D   0.01  10 sloshing2DCorrectPhi || rc=
 stage cylinderCorrectPhi   sloshingCylinder 0.001 10 cylinderCorrectPhi   || rc=1
 stage solitaryStatic waves/waveMakerSolitary 0.01 30 solitaryStatic || rc=1
 stage solitary       waves/waveMakerSolitary 0.01 30 solitary       || rc=1
+# ...and the CrankNicolson profile on a mesh that DEFORMS, which is a REFUSAL arm: see the block at the
+# top of test_inter_moving_vs_openfoam.cu. It is staged and its oracle is run like any other profile,
+# because lifting the refusal means deleting that block and letting this profile gate.
+#
+# WHY IT EXISTS. sloshing2DCN cannot witness the scheme's moving ddt at all: the tank's motion is SOLID
+# BODY (`solidBodyMotionFunction SDA`), so V == V0 == V00 in every cell and ddt0's volume weights are
+# arithmetically the static form's. MEASURED -- with V0 and V00 dropped from the device's fvm::ddt,
+# sloshing2DCN's device arm still reads U 6.3e-13 (against 3.3e-13 with them): blind. waveMakerSolitary
+# DEFORMS (displacementLaplacian, inverseDistance), and there BOTH arms leave OpenFOAM: step one exact
+# (U 8.2e-12), step two U 1.2e-03 and the alpha flux 2.6e-02, thirty steps U 1.06e+00 -- while the same
+# case under EULER is exact (U 2.0e-11) and the scheme's own state matches OpenFOAM's written
+# `ddt0(rho,U)`, `ddtCorrDdt0(U)` and `meshPhiCN_0` to 1e-12 at step two. So the reader refuses it.
+stage solitaryCN     waves/waveMakerSolitary 0.01 30 solitaryCN     || rc=1
 stage solitaryGamg   waves/waveMakerSolitary 0.01 30 solitaryGamg   || rc=1
 stage pistonStatic   waves/waveMakerPiston   0.01 30 pistonStatic   || rc=1
 stage piston         waves/waveMakerPiston   0.01 30 piston         || rc=1
@@ -740,6 +753,7 @@ gate mixerCorrectPhi      2e-4  10 mixerCorrectPhi      mixerStatic      || rc=1
 gate sloshing2DCorrectPhi 0.01  10 sloshing2DCorrectPhi sloshing2DStatic || rc=1
 gate cylinderCorrectPhi   0.001 10 cylinderCorrectPhi   cylinderStatic   || rc=1
 gate solitary       0.01  30 solitary       solitaryStatic || rc=1
+gate solitaryCN     0.01  30 solitaryCN     solitary       || rc=1
 # the deforming mesh with a GAMG pressure solve, on BOTH arms -- see the solitaryGamg staging
 gate solitaryGamg   0.01  30 solitaryGamg   solitaryStatic || rc=1
 gate piston         0.01  30 piston         pistonStatic   || rc=1

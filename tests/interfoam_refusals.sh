@@ -584,11 +584,11 @@ if [ $HAVE_GPU = 1 ]; then
     # distance the move invalidated, gated on waves/waveMakerPiston `pistonSST` (the wall distance
     # left stale reads U 1.7353e-05). A blanket refusal coming back fails this arm.
     arm device_moving_SST   runs    -                               "-device" "$MOVSST"
-    # ...and CRANKNICOLSON ON A MOVING MESH, which is a HOST capability: the host arm runs it
-    # (ddt_cnMoving above, gated by `sloshing2DCN` in tests/interfoam_moving_vs_openfoam.sh) and the
-    # shared device momentum assembler forms the scheme's STATIC branch, so it refuses. The two arms
-    # on the same staging are what says the device's answer is a refusal and not the staging's.
-    arm device_cnMoving     refused "moving branch"                 "-device" "$CNSET; sed -i 's/nAlphaSubCycles  *[0-9]*;/nAlphaSubCycles 1;/' system/fvSolution"
+    # ...and CRANKNICOLSON ON A MOVING MESH, which this loop RUNS now: the scheme's moving ddt (V0 and
+    # V00 weights) and fvcDdtUfCorr are transcribed from the host reference and gated beside the host
+    # arm by `sloshing2DCN` in tests/interfoam_moving_vs_openfoam.sh. It refused by name until they
+    # were written, and `ddt_cnMoving` above is the same staging on the host.
+    arm device_cnMoving     runs    -                               "-device" "$CNSET; sed -i 's/nAlphaSubCycles  *[0-9]*;/nAlphaSubCycles 1;/' system/fvSolution"
     # the device's alpha pre-solve does not honour minIter (the host's does)
     # cellLimited grad(U) is refused on the device (the host carries it into linearUpwind and the
     # viscous term; this loop does not). The host arm `grad_namedU` above RUNS the same staging, which
