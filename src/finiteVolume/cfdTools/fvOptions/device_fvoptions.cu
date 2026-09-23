@@ -389,11 +389,16 @@ __global__ void mangrovesCoeffKernel(
     const scalar* Ux,
     const scalar* Uy,
     const scalar* Uz,
+    // NULL on the uniform lineage. On the density-weighted one OpenFOAM's addSup is
+    // -Sp(rho*coeff, psi) and the product is formed BEFORE fvm::Sp multiplies by V, so rho belongs
+    // here and not beside the volume.
+    const scalar* rho,
     scalar* coeff)
 {
     const int c = blockDim.x*blockIdx.x + threadIdx.x;
     if (c >= nC) return;
-    coeff[c] = fac[c]*sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);
+    const scalar x = fac[c]*sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);
+    coeff[c] = rho ? rho[c]*x : x;
 }
 
 } // namespace
@@ -449,6 +454,7 @@ void deviceMangrovesCoeff(
     const DeviceBuffer<scalar>& Ux,
     const DeviceBuffer<scalar>& Uy,
     const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>* rho,
     DeviceBuffer<scalar>& coeff)
 {
     const int nC = static_cast<int>(fac.size());
@@ -458,7 +464,11 @@ void deviceMangrovesCoeff(
     {
         throw std::runtime_error("brae deviceMangrovesCoeff: U must be one value per cell, as the coefficient is.");
     }
-    mangrovesCoeffKernel<<<nBlocks(nC), TPB>>>(nC, fac.data(), Ux.data(), Uy.data(), Uz.data(), coeff.data());
+    if (rho && rho->size() != static_cast<std::size_t>(nC))
+        throw std::runtime_error(
+            "brae deviceMangrovesCoeff: rho must be one value per cell, as the coefficient is.");
+    mangrovesCoeffKernel<<<nBlocks(nC), TPB>>>(nC, fac.data(), Ux.data(), Uy.data(), Uz.data(),
+                                               rho ? rho->data() : nullptr, coeff.data());
     cudaCheck(cudaGetLastError(), "mangrovesCoeff");
 }
 

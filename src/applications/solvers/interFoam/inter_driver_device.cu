@@ -247,19 +247,11 @@ RunReport runInterFoamDevice(
                         && !o.fixedCoeff;
         if (darcy) continue;
         if (o.unsupported.empty() && o.mangroves == fvOptions::Option::Mangroves::source) continue;
-        if (o.unsupported.empty() && o.mangroves == fvOptions::Option::Mangroves::turbulence)
-        {
-            // OpenFOAM's density-weighted k-epsilon calls addSup(rho, eqn), -Sp(rho*coeff); the host
-            // reference refuses that lineage inside its closure (fvOptions_cpp.cu: no gate holds it),
-            // and this loop says so before the first step rather than in the middle of it
-            if (f.turbulence.variableDensity)
-                throw std::runtime_error(
-                    "brae interFoam (device): fvOptions has `" + o.name + "` "
-                    "(multiphaseMangrovesTurbulenceModel) and the closure is the `density variable` "
-                    "lineage, where OpenFOAM adds -Sp(rho*coeff) to k and epsilon. No gate holds that "
-                    "form on either loop.");
-            continue;
-        }
+        // ...and the turbulence option on EITHER lineage: the uniform one takes addSup(eqn),
+        // -Sp(coeff), and the density-weighted one addSup(rho, eqn), -Sp(rho*coeff)
+        // (fvOptionListTemplates.C:283-289 picks between them). Both arms carry both now, gated by the
+        // `mangrove` and `densityVariable` profiles of tests/interfoam_mangrove_vs_openfoam.sh.
+        if (o.unsupported.empty() && o.mangroves == fvOptions::Option::Mangroves::turbulence) continue;
         throw std::runtime_error(
             "brae interFoam (device): fvOptions has an active option `" + o.name + "` (" + o.type
             + "). The device loop applies explicitPorositySource/DarcyForchheimer and the mangrove pair "

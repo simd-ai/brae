@@ -186,7 +186,7 @@ int main(int argc, char** argv)
         }
         check(refusedNoOld, "the drag and added mass refuse without U.oldTime() and the step");
 
-        // the turbulence source: only the zone's cells, the density form refused
+        // the turbulence source: only the zone's cells, and the density-weighted form weighted
         {
             FvScalarMatrix K;
             K.diag.assign(nC, 0.0);
@@ -195,11 +195,34 @@ int main(int argc, char** argv)
             label touched = 0;
             for (label c = 0; c < nC; ++c) touched += (K.diag[c] != 0.0) ? 1 : 0;
             check(touched > 0 && touched <= (label)zoneSize, "k's source reaches the zone's cells and no others");
-            bool refusedRho = false;
+
+            // `fvOptions(alpha, rho, k_)` with alpha one dispatches to addSup(rho, eqn), which is
+            // -Sp(rho*kCoeff(U), k) rather than -Sp(kCoeff(U), k) (multiphaseMangrovesTurbulenceModel.C:
+            // 185-210). With rho UNIFORM at 1000 the diagonal it adds is the uniform one times 1000 on
+            // every cell the zone reaches -- to round-off, because V*(rho*coeff) and rho*(V*coeff)
+            // associate the same three doubles differently. Dropping rho leaves the ratio at 1.
+            FvScalarMatrix Kr;
+            Kr.diag.assign(nC, 0.0);
+            Kr.source.assign(nC, 0.0);
             const std::vector<scalar> rho(static_cast<std::size_t>(nC), 1000.0);
-            try { fvOptions::addSup(mo, K, "k", U.internal, g, &rho); }
-            catch (const std::exception&) { refusedRho = true; }
-            check(refusedRho, "the density-weighted form is refused");
+            fvOptions::addSup(mo, Kr, "k", U.internal, g, &rho);
+            scalar worst = 0;
+            label weighted = 0;
+            for (label c = 0; c < nC; ++c)
+            {
+                if (K.diag[c] == 0.0)
+                {
+                    worst = std::fmax(worst, std::fabs(Kr.diag[c]));   // zero outside the zone stays zero
+                    continue;
+                }
+                ++weighted;
+                worst = std::fmax(worst, std::fabs(Kr.diag[c] - scalar(1000)*K.diag[c])
+                                       / std::fabs(scalar(1000)*K.diag[c]));
+            }
+            std::printf("  density-weighted k source: %ld cells, worst relative %.3e\n",
+                        (long)weighted, (double)worst);
+            check(weighted == touched && worst < scalar(1e-15),
+                  "the density-weighted form carries rho into the coefficient");
         }
 
         // a region without a coefficient OpenFOAM reads with readEntry is refused by name

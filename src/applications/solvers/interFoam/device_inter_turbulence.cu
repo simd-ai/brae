@@ -834,10 +834,14 @@ void deviceCorrectInterTurbulence(
     // was handed, which is the one OpenFOAM's lookupObject finds when kEpsilon::correct builds them
     if (in.mangroves && in.mangroves->turbulence())
     {
-        if (t.variableDensity)
+        // -Sp(rho*coeff) on the DENSITY-WEIGHTED lineage, -Sp(coeff) on the uniform one: `fvOptions
+        // (alpha, rho, k_)` with alpha one dispatches to the rho overload (fvOptionListTemplates.C:
+        // 283-289). rho multiplies the coefficient, not the volume, as the host reference has it.
+        const DeviceBuffer<scalar>* mgRho = t.variableDensity ? in.rho : nullptr;
+        if (t.variableDensity && !mgRho)
             throw std::runtime_error(
                 "brae interFoam (device): multiphaseMangrovesTurbulenceModel under the `density variable` "
-                "k-epsilon is -Sp(rho*coeff) in OpenFOAM, and no gate holds that form.");
+                "k-epsilon needs the mixture's rho, and the caller supplied none.");
         // ONE COEFFICIENT FIELD PER OPTION -- each option's Ckp*Cd*a*N*|U| stands on its own, because
         // the k equation takes -Sp from each of them in turn (kEpsilon.C:279 sums the list)
         const std::size_t nOpt = in.mangroves->turbulences.size();
@@ -852,8 +856,8 @@ void deviceCorrectInterTurbulence(
         kin.fvoSpEps.clear();
         for (std::size_t i = 0; i < nOpt; ++i)
         {
-            deviceMangrovesCoeff(in.mangroves->turbulences[i].kFac, *in.Ux, *in.Uy, *in.Uz, d.mangroveK[i]);
-            deviceMangrovesCoeff(in.mangroves->turbulences[i].epsFac, *in.Ux, *in.Uy, *in.Uz, d.mangroveEps[i]);
+            deviceMangrovesCoeff(in.mangroves->turbulences[i].kFac, *in.Ux, *in.Uy, *in.Uz, mgRho, d.mangroveK[i]);
+            deviceMangrovesCoeff(in.mangroves->turbulences[i].epsFac, *in.Ux, *in.Uy, *in.Uz, mgRho, d.mangroveEps[i]);
             kin.fvoSpK.push_back(&d.mangroveK[i]);
             kin.fvoSpEps.push_back(&d.mangroveEps[i]);
         }

@@ -558,12 +558,6 @@ void addSup(
         {
             continue;   // fieldNames_ is epsilon and k (the read refuses any other)
         }
-        if (rhoCell)
-        {
-            throw std::runtime_error(
-                "fvOptions addSup: `" + o.name + "` (multiphaseMangrovesTurbulenceModel) on a density-weighted "
-                "k-epsilon, addSup(rho, eqn) with -Sp(rho*coeff) -- no gate holds that lineage.");
-        }
         // kCoeff = Ckp*Cd*a*N*|U|, epsilonCoeff = Cep*Cd*a*N*|U|, zero outside the regions
         std::vector<scalar> coeff(U.size(), scalar(0));
         for (const Option::MangroveRegion& r : o.mangroveRegions)
@@ -575,10 +569,27 @@ void addSup(
                 coeff[c] = Cx*r.Cd*r.a*r.N*std::sqrt(u.x*u.x + u.y*u.y + u.z*u.z);
             }
         }
-        // eqn += -Sp(coeff, field): on the right of the equation, so the matrix takes +V*coeff
-        for (std::size_t c = 0; c < coeff.size(); ++c)
+        // eqn += -Sp(coeff, field): on the right of the equation, so the matrix takes +V*coeff.
+        //
+        // ...and -Sp(rho*coeff, field) on the DENSITY-WEIGHTED lineage. `fvOptions(alpha, rho, k_)`
+        // with alpha one dispatches to addSup(rho, eqn) (fvOptionListTemplates.C:283-289), and that
+        // overload is `-fvm::Sp(rho*kCoeff(U), eqn.psi())` (multiphaseMangrovesTurbulenceModel.C:
+        // 185-210): the product is formed as a FIELD and fvm::Sp then multiplies by V, so the matrix
+        // takes V*(rho*coeff) -- not (V*rho)*coeff, which rounds differently. Two loops rather than a
+        // branch inside one, so the uniform lineage keeps the expression it always had.
+        if (rhoCell)
         {
-            eqn.diag[c] += V[c]*coeff[c];
+            for (std::size_t c = 0; c < coeff.size(); ++c)
+            {
+                eqn.diag[c] += V[c]*((*rhoCell)[c]*coeff[c]);
+            }
+        }
+        else
+        {
+            for (std::size_t c = 0; c < coeff.size(); ++c)
+            {
+                eqn.diag[c] += V[c]*coeff[c];
+            }
         }
     }
 }

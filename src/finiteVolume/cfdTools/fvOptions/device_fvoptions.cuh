@@ -104,8 +104,13 @@ void deviceMangrovesMomentum(const DeviceMangroves& mg, const DeviceBuffer<scala
                              DeviceBuffer<scalar>& srcX, DeviceBuffer<scalar>& srcY, DeviceBuffer<scalar>& srcZ);
 // coeff[c] = fac[c]*|U[c]|: kCoeff or epsilonCoeff from kFac or epsFac, for a closure's
 // `+ fvOptions(k)` / `+ fvOptions(epsilon)`, which then takes diag += V*coeff.
+//
+// `rho` NULL is the uniform lineage. Non-null is the density-weighted one, where OpenFOAM's addSup is
+// -Sp(rho*coeff, psi) (multiphaseMangrovesTurbulenceModel.C:185-210) -- rho multiplies the coefficient
+// HERE, before fvm::Sp multiplies by the volume, which is the order the host reference takes too.
 void deviceMangrovesCoeff(const DeviceBuffer<scalar>& fac,
                           const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+                          const DeviceBuffer<scalar>* rho,
                           DeviceBuffer<scalar>& coeff);
 
 // limitVelocity: clamp |U| <= max on the given cells (OF fv::limitVelocity::correct, U *= sqrt(max^2/|U|^2) where it

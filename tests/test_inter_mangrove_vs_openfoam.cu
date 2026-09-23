@@ -53,6 +53,15 @@ const scalar D_NUT = 5e-11;
 const scalar D_PRES = 8e-10;
 const scalar D_KE_RES = 1.5e-9;
 const scalar D_KE_FINAL = 1e-5;
+// ...and k's alone on the DENSITY-WEIGHTED lineage, where the matrix carries rho. Under `density
+// uniform` both arms reproduce OpenFOAM's k and epsilon final residuals to every digit its log prints
+// (0.000e+00 on all four); under `density variable` epsilon still does, and k reads 6.975e-06 on the
+// host and 2.621e-05 on the device -- a final residual near 1e-08, so an absolute difference around
+// 2.6e-13, the size of the k field's own 3.7e-12 agreement. It is the arithmetic of a residual sum
+// whose terms are a thousand times larger, not a different solver: all 450 counts are OpenFOAM's and
+// epsilon's residuals are exact. The bound is this profile's measurement with room to the substituted
+// solver, which this arm still catches -- see the header's fail-proof line.
+const scalar D_KE_FINAL_RHO = 8e-5;
 
 namespace {
 int failures = 0;
@@ -121,10 +130,20 @@ int main(
     const std::string logPath = argv[5];
     const std::string offDir = argv[6];
     const std::string turbOffDir = argv[7];
-    // WHAT argv[7] IS, for the printed line and the check's wording -- nothing else. On the `twoOptions`
-    // profile it is OpenFOAM's own ONE-option-of-each answer, which is the control for the second
-    // option of each type counting at all.
-    const std::string ctlLabel = argc > 8 ? argv[8] : "the turbulence option off";
+    // WHICH PROFILE the script staged. It decides three things and nothing else: the wording of the
+    // argv[7] control line, how many options of each type the case is expected to declare, and the
+    // final-residual bound for k (see D_KE_FINAL_RHO).
+    const std::string profile = argc > 8 ? argv[8] : "mangrove";
+    const bool twoOptions = profile == "twoOptions";
+    const bool rhoLineage = profile == "densityVariable";
+    if (profile != "mangrove" && !twoOptions && !rhoLineage)
+    {
+        std::printf("FAIL: unknown profile `%s`\n", profile.c_str());
+        return 1;
+    }
+    const std::string ctlLabel = twoOptions  ? "one option of each instead of two"
+                               : rhoLineage  ? "the uniform-density k-epsilon instead"
+                                             : "the turbulence option off";
 
     PrimitiveMesh m;
     m.read(caseDir + "/constant/polyMesh");
@@ -157,7 +176,7 @@ int main(
     // The `twoOptions` profile declares a SECOND option of each type over the same zone, and the point
     // of it is that both of each count -- so the expected number comes from the profile, and a run that
     // silently dropped one would fail here before any field is compared.
-    const std::size_t wantEach = (ctlLabel == "one option of each instead of two") ? 2u : 1u;
+    const std::size_t wantEach = twoOptions ? 2u : 1u;
     check("every mangrove option the case declares is active, over a zone of cells",
           nSource == wantEach && nTurb == wantEach && zoneCells > 0);
 
@@ -302,7 +321,7 @@ int main(
         failures += brae::gatecheck::compareSolves("device", rd.epsilonSolves, ofE, nSteps, "epsilon",
                                                    D_KE_RES, D_KE_RES, D_KE_FINAL);
         failures += brae::gatecheck::compareSolves("device", rd.kSolves, ofK, nSteps, "k",
-                                                   D_KE_RES, D_KE_RES, D_KE_FINAL);
+                                                   D_KE_RES, D_KE_RES, rhoLineage ? D_KE_FINAL_RHO : D_KE_FINAL);
         const Diff eA = compare(dev.alpha1.internal, ofAlpha);
         const Diff eP = compare(dev.p_rgh.internal, ofPrgh);
         const Diff eU = compare(dev.U.internal, ofU);

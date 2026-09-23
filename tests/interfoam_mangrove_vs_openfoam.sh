@@ -72,10 +72,32 @@
 #   only the last multiphaseMangrovesTurbulenceModel   alpha 1.5e-01, U 3.3e-01, k 4.5e-01  (16 arms red)
 # The host arm is unmoved by either, which is what says the defect is the device's alone.
 #
-# NOT CLAIMED: the tutorial's 411,600-cell mesh (a bench size), its sampled line sets (stripped), the
-# density-weighted k-epsilon (refused on both loops), any closure but kEpsilon under the turbulence
-# option (refused), a field-name override on either option (refused), and either option beside a moving
-# mesh (refused by the reader).
+# PROFILE densityVariable: the same two options beside the DENSITY-WEIGHTED k-epsilon (`density
+# variable`, with div(rhoPhi,k) and div(rhoPhi,epsilon) to match the flux that lineage transports with).
+# `fvOptions(alpha, rho, k_)` with alpha one dispatches to addSup(rho, eqn), which is
+# -Sp(rho*kCoeff(U), k) rather than -Sp(kCoeff(U), k) (multiphaseMangrovesTurbulenceModel.C:185-210):
+# the product is formed as a FIELD and fvm::Sp then multiplies by V, so the matrix takes V*(rho*coeff)
+# and rho belongs in the coefficient, not beside the volume. BOTH loops refused this lineage before --
+# the host inside fvOptions_cpp.cu, the device twice over, in its case reader and in its closure.
+# THE CONTROLS are OpenFOAM against itself on the same lineage: both options off moves U 1.5e+00, and
+# the UNIFORM-density run moves k 1.5e+00.
+# MEASURED: host alpha 7.1e-14, p_rgh 6.0e-14, U 5.2e-12, k 1.8e-13, epsilon 1.6e-13, nut 7.8e-14;
+# device alpha 7.7e-14, p_rgh 6.0e-14, U 3.7e-11, k 3.7e-12, epsilon 3.8e-12, nut 1.1e-12; all 900
+# p_rgh, 450 k and 450 epsilon counts OpenFOAM's on both arms.
+# BROKEN ONCE EACH, rho dropped from the coefficient:
+#   host     k 3.8e-01, epsilon 4.8e-01, 397 of 450 k counts (16 arms red), the device untouched
+#   device   k 9.2e-01, epsilon 2.8e+00, 356 of 450 k counts (16 arms red), the host untouched
+# The device REFUSES a null rho outright, so that second defect had to be injected past the guard --
+# which is the guard doing its job.
+# ONE BOUND IS THIS PROFILE'S OWN: k's final residual on the device, D_KE_FINAL_RHO. Under `density
+# uniform` both arms reproduce k's and epsilon's final residuals to every digit OpenFOAM's log prints;
+# under `density variable` epsilon still does and k reads 6.975e-06 (host) and 2.621e-05 (device) on a
+# residual near 1e-08 -- an absolute 2.6e-13, the size of the k field's own agreement. The arm still
+# catches a substituted solver: PBiCGStab on the device reads k 1.1e-04 with 7 of 450 counts.
+#
+# NOT CLAIMED: the tutorial's 411,600-cell mesh (a bench size), its sampled line sets (stripped), any
+# closure but kEpsilon under the turbulence option (refused), a field-name override on either option
+# (refused), and either option beside a moving mesh (refused by the reader).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_mangrove_vs_openfoam"
@@ -154,6 +176,28 @@ elif p == 'turbOff':
     tail, k = re.subn(r'active\s+yes;', 'active          no;', tail, count=1)
     assert k == 1, 'turbOff'
     s = head + tail
+elif p.startswith('densityVariable'):
+    # THE DENSITY-WEIGHTED k-epsilon beside the same two options. `fvOptions(alpha, rho, k_)` with
+    # alpha one dispatches to addSup(rho, eqn), which is -Sp(rho*kCoeff(U), k) rather than
+    # -Sp(kCoeff(U), k) -- a different matrix on every cell of the zone, and the one lineage both
+    # arms refused until now. The convection scheme has to follow the flux the lineage transports
+    # with, or OpenFOAM stops on a missing div(rhoPhi,k) entry.
+    t = os.path.join(d, 'constant/turbulenceProperties')
+    ts = open(t).read()
+    assert ts.count('simulationType') == 1, 'turbulenceProperties'
+    ts = re.sub(r'^simulationType.*$', 'density             variable;\n\nsimulationType      RAS;', ts, flags=re.M)
+    open(t, 'w').write(ts)
+    f = os.path.join(d, 'system/fvSchemes')
+    fs = open(f).read()
+    for a, b in [('div(phi,k)', 'div(rhoPhi,k)'), ('div(phi,epsilon)', 'div(rhoPhi,epsilon)')]:
+        assert fs.count(a) == 1, a
+        fs = fs.replace(a, b)
+    open(f, 'w').write(fs)
+    if p == 'densityVariableOff':
+        # ...and the same lineage with both options off, so the control for `densityVariable` differs
+        # from it by the OPTIONS alone and not by the density weighting as well
+        s, k = re.subn(r'active\s+yes;', 'active          no;', s)
+        assert k == 2, 'densityVariableOff'
 elif p == 'twoOptions':
     # A SECOND OPTION OF EACH TYPE, over the SAME cellZone as the first. OpenFOAM constructs one source
     # object per entry and `fvOptions(U)` sums the list, so the two overlap and both count; an
@@ -214,7 +258,7 @@ PYEOF
 }
 
 rc=0
-for p in off turbOff mangrove twoOptions; do
+for p in off turbOff mangrove twoOptions densityVariable densityVariableOff; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_mangrove_vs_openfoam: staging failed"; exit 1; }
@@ -224,7 +268,15 @@ done
 # twoOptions: TWO options of each type over the same cellZone, with the ONE-of-each run as the control --
 # the second option has to have moved OpenFOAM's own answer, or the profile tests nothing
 "$BIN" "$W/twoOptions" "$W/twoOptions/0" "$W/twoOptions/$END" "$STEPS" "$W/twoOptions/log.interFoam" \
-       "$W/off/$END" "$W/mangrove/$END" "one option of each instead of two" || rc=1
+       "$W/off/$END" "$W/mangrove/$END" twoOptions || rc=1
+
+# densityVariable: the density-weighted k-epsilon, with the UNIFORM run as the control -- the weighting
+# has to have moved OpenFOAM's own k, or the profile tests nothing
+grep -q "Selecting turbulence model type RAS" "$W/densityVariable/log.interFoam" \
+    || { echo "FAIL: OpenFOAM's log does not select a RAS model on densityVariable"; rc=1; }
+"$BIN" "$W/densityVariable" "$W/densityVariable/0" "$W/densityVariable/$END" "$STEPS" \
+       "$W/densityVariable/log.interFoam" "$W/densityVariableOff/$END" "$W/mangrove/$END" \
+       densityVariable || rc=1
 
 echo "interfoam_mangrove_vs_openfoam: rc $rc"
 exit $rc

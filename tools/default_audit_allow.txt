@@ -313,16 +313,14 @@ SolverRunsAs runsAs fixedSweepsField
 SolverRunsAs runsAs momentumNoticedByCaller
 
 # ---- SolveControls (turbulence_transport.cuh:105) at the LES and kOmegaSST sites ---------------------
-# The same family already ledgered for KEpsilonInput: `pbicg` is PBiCG with DILU, which the interFoam
-# reader admits under kEpsilon ALONE (readFinalSolve's allowPBiCG is true for k/epsilon and false for
-# the SST pair and kEqn, inter_turbulence_cpp.cu:78-88, so anything else is refused by name); and
-# colouring/gsColour/polyDeg/precon are brae's own solver accelerations, whose `off` IS OpenFOAM's own
-# symGaussSeidel smoother -- what every turbulent tutorial names and what these two closures run.
-SolveControls sv pbicg
+# `pbicg` and `precon` came OFF this ledger when the LES kEqn learned to run the PBiCG the case names
+# (both arms, gated by the `pbicg` profile in tests/interfoam_les_vs_openfoam.sh): the LES site now
+# fills them from the case's kFinal entry instead of leaving them at their defaults, so an entry here
+# would be a stale exemption. colouring/gsColour/polyDeg are brae's own solver accelerations, whose
+# `off` IS OpenFOAM's own symGaussSeidel smoother -- what every turbulent tutorial names.
 SolveControls sv colouring
 SolveControls sv gsColour
 SolveControls sv polyDeg
-SolveControls sv precon
 
 # ---- the tail: four records that are not case controls ----------------------------------------------
 # Tok (patchExprFunction1.cu:54) is the expression lexer's TOKEN variant, like Val above: a number

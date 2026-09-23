@@ -551,7 +551,10 @@ if [ $HAVE_GPU = 1 ]; then
     # ...and the turbulence option under the `density variable` k-epsilon, where OpenFOAM's addSup is
     # -Sp(rho*coeff): the device names it before the first step (the host closure refuses the same
     # lineage where it meets it)
-    arm device_mangrove_rhoKE refused "density variable"    "-device" "sed -i 's/^simulationType .*/density variable;\nsimulationType RAS;/' constant/turbulenceProperties; sed -i 's/div(phi,k) /div(rhoPhi,k) /; s/div(phi,epsilon) /div(rhoPhi,epsilon) /' system/fvSchemes"
+    # the DENSITY-WEIGHTED lineage runs on both loops now: `fvOptions(alpha, rho, k_)` with alpha one
+    # dispatches to addSup(rho, eqn), -Sp(rho*coeff), and both arms build the coefficient with rho in it
+    # (tests/interfoam_mangrove_vs_openfoam.sh `densityVariable` holds them to OpenFOAM solve by solve)
+    arm device_mangrove_rhoKE runs    -                     "-device" "sed -i 's/^simulationType .*/density variable;\nsimulationType RAS;/' constant/turbulenceProperties; sed -i 's/div(phi,k) /div(rhoPhi,k) /; s/div(phi,epsilon) /div(rhoPhi,epsilon) /' system/fvSchemes"
     # kOmegaSST across a CYCLIC PAIR: the case reader refuses it by name on both arms (kEpsilon is the
     # one closure carried across a pair, validation/interFoamCyclic). Behind that refusal the device SST
     # closure has its own (`hasCoupledPatches`, kOmegaSST.cu), whose flag the interFoam site never set --
@@ -612,7 +615,11 @@ if [ $HAVE_GPU = 1 ]; then
     BASE="$B"
     arm device_gradULimited runs    -                           "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
     BASE="$B"
-    arm device_alphaMinIter    refused "minIter 1"               "-device" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       yes;\\n\\1minIter 1;/' system/fvSolution"
+    # the device's alpha pre-solve honours the case's minIter now, as the host's always has
+    # (DeviceAlphaSolverControls::minIter; tests/interfoam_dambreak_vs_openfoam.sh `alphaminiter` holds
+    # BOTH arms to OpenFOAM's five sweep counts, the only thing on damBreak that can witness it), so a
+    # refusal coming back fails this arm
+    arm device_alphaMinIter    runs    -                         "-device" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       yes;\\n\\1minIter 1;/' system/fvSolution"
     # the device loop RUNS the coded cyclicACMI baffle now: the binary couples the pair for it as for
     # the host loop, and tests/interfoam_leakage_vs_openfoam.sh holds the numbers (its harness still
     # asserts that the pair handed over UNCOUPLED is refused, which this binary can no longer do)
