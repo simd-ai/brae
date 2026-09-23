@@ -232,8 +232,14 @@ int main(
     //     U 2.7e-01, Uf 2.8e-01, six failures;
     //   * the ddt's V0/V00 weights -- drop them, i.e. the static branch: U 6.3e-13 against 3.3e-13.
     //     BLIND, and not a fault of the arm: this tank moves as a SOLID BODY, so V == V0 == V00 and
-    //     the two branches are the same arithmetic here. `solitaryCN` is the deforming twin that can
-    //     witness them -- and the one that found phi.oldTime()'s lazy creation.
+    //     the two branches are the same arithmetic here.
+    // `solitaryCN` is the deforming twin, and it witnesses BOTH halves of that weight. The same two
+    // injections there, measured: the host reference forced to its static branch reads alpha
+    // 3.3427e-03, p_rgh 3.5760e-03, U 2.1938e-01, and the device's deviceCnFvmDdt with V0/V00
+    // dropped reads the same three numbers -- one term, one arithmetic, both arms landing on the
+    // same wrong answer, three to four orders above this profile's bounds. The identical host
+    // injection on the tank above reads alpha 5.8e-15 and U 3.9e-13 with ZERO failures, which is
+    // what "a rigid mesh cannot witness a volume weight" looks like.
     // THE PROFILE THAT AMPLIFIES: see the bounds block below, and the script's note. Its own one-ulp
     // control is measured, and every bound on it is anchored there rather than on round-off.
     const bool amplifies = (profile == "solitaryCN");
