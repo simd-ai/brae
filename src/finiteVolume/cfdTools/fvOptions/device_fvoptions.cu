@@ -416,20 +416,31 @@ void deviceMangrovesMomentum(
     DeviceBuffer<scalar>& srcZ)
 {
     const int nC = static_cast<int>(diag.size());
-    if (!mg.source || nC == 0) return;
+    if (!mg.source() || nC == 0) return;
     const std::size_t n = static_cast<std::size_t>(nC);
-    if (mg.dragFac.size() != n || mg.inertia.size() != n || rho.size() != n || V.size() != n
+    if (rho.size() != n || V.size() != n
      || Ux.size() != n || U0x.size() != n || U0y.size() != n || U0z.size() != n || srcX.size() != n)
     {
         throw std::runtime_error(
-            "brae deviceMangrovesMomentum: the coefficients, rho, V, U, U.oldTime() and the matrix must "
+            "brae deviceMangrovesMomentum: rho, V, U, U.oldTime() and the matrix must "
             "all be one value per cell.");
     }
-    mangrovesMomentumKernel<<<nBlocks(nC), TPB>>>(nC, mg.dragFac.data(), mg.inertia.data(), rho.data(),
-                                                  V.data(), rDeltaT, Ux.data(), Uy.data(), Uz.data(),
-                                                  U0x.data(), U0y.data(), U0z.data(), diag.data(),
-                                                  srcX.data(), srcY.data(), srcZ.data());
-    cudaCheck(cudaGetLastError(), "mangrovesMomentum");
+    // ONE PASS PER OPTION, in the list's order. The kernel accumulates into the diagonal and the source,
+    // so the matrix ends with the sum of the options' terms -- which is what `UEqn == fvOptions(rho, U)`
+    // is when the list holds more than one of them, and what the host's loop over `opts.options` leaves.
+    for (const DeviceMangroves::Source& src : mg.sources)
+    {
+        if (src.dragFac.size() != n || src.inertia.size() != n)
+        {
+            throw std::runtime_error(
+                "brae deviceMangrovesMomentum: each option's coefficients must be one value per cell.");
+        }
+        mangrovesMomentumKernel<<<nBlocks(nC), TPB>>>(nC, src.dragFac.data(), src.inertia.data(), rho.data(),
+                                                      V.data(), rDeltaT, Ux.data(), Uy.data(), Uz.data(),
+                                                      U0x.data(), U0y.data(), U0z.data(), diag.data(),
+                                                      srcX.data(), srcY.data(), srcZ.data());
+        cudaCheck(cudaGetLastError(), "mangrovesMomentum");
+    }
 }
 
 

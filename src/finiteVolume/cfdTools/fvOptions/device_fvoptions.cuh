@@ -10,6 +10,7 @@
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"      // DeviceMesh -- deviceSetValues walks the ldu addressing
 #include "device_cyclic.cuh"    // DeviceCyclic -- a constrained row loses the pair's coefficient too
+#include <vector>
 
 namespace brae {
 
@@ -62,18 +63,35 @@ void deviceFvoPorositySource(const DevicePorosity& por, int comp, scalar nu, con
 // host's own multiplication order (((0.5*Cd)*a)*N and so on), zero outside every region, a later
 // region overwriting an earlier one on a shared cell as OpenFOAM's loops assign. |U| is the current
 // field's, taken on the device at every assembly.
+//
+// ONE ENTRY PER ACTIVE OPTION, in the fvOptions list's order. OpenFOAM constructs a source object per
+// option and each adds its own term to the equation, so two options that name the same cell contribute
+// TWICE -- `fvOptions(U)` is a sum over the list (fvOptionList.C). Merging them into one coefficient
+// array would keep only the last option's number on a shared cell, which is a different case; keeping
+// them apart also reproduces the host's per-option `diag += V*coeff_i` sum term for term rather than
+// V*(coeff_1 + coeff_2), which rounds differently.
 struct DeviceMangroves
 {
-    bool                 source = false;       // an active multiphaseMangrovesSource
-    bool                 turbulence = false;   // an active multiphaseMangrovesTurbulenceModel
-    DeviceBuffer<scalar> dragFac;              // 0.5*Cd*a*N
-    DeviceBuffer<scalar> inertia;              // 0.25*(Cm + 1)*pi*a*a*N
-    DeviceBuffer<scalar> kFac;                 // Ckp*Cd*a*N
-    DeviceBuffer<scalar> epsFac;               // Cep*Cd*a*N
+    struct Source
+    {
+        DeviceBuffer<scalar> dragFac;          // 0.5*Cd*a*N
+        DeviceBuffer<scalar> inertia;          // 0.25*(Cm + 1)*pi*a*a*N
+    };
+    struct Turbulence
+    {
+        DeviceBuffer<scalar> kFac;             // Ckp*Cd*a*N
+        DeviceBuffer<scalar> epsFac;           // Cep*Cd*a*N
+    };
+    std::vector<Source>     sources;           // the active multiphaseMangrovesSource options
+    std::vector<Turbulence> turbulences;       // the active multiphaseMangrovesTurbulenceModel options
+
+    bool source() const     { return !sources.empty(); }
+    bool turbulence() const { return !turbulences.empty(); }
 };
 
-// `UEqn == fvOptions(rho, U)` for the source option. The two negations cancel and the momentum matrix
-// takes, per cell (fvOptions_cpp.cu, the same expressions in the same order):
+// `UEqn == fvOptions(rho, U)` for the source options, EACH IN TURN -- the kernel accumulates, so N
+// options leave the same sum the host's N-pass loop does. The two negations cancel and the momentum
+// matrix takes, per cell and per option (fvOptions_cpp.cu, the same expressions in the same order):
 //     diag   += V*(rho*drag) + (rDeltaT*V)*(rho*inertia)
 //     source += ((rDeltaT*U0)*V)*(rho*inertia)
 // fvm::Sp's V*coeff and EulerDdtScheme::fvmDdt's rDeltaT*V and rDeltaT*U0*V, on a mesh that does not

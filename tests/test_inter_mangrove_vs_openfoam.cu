@@ -121,6 +121,10 @@ int main(
     const std::string logPath = argv[5];
     const std::string offDir = argv[6];
     const std::string turbOffDir = argv[7];
+    // WHAT argv[7] IS, for the printed line and the check's wording -- nothing else. On the `twoOptions`
+    // profile it is OpenFOAM's own ONE-option-of-each answer, which is the control for the second
+    // option of each type counting at all.
+    const std::string ctlLabel = argc > 8 ? argv[8] : "the turbulence option off";
 
     PrimitiveMesh m;
     m.read(caseDir + "/constant/polyMesh");
@@ -150,7 +154,12 @@ int main(
     }
     std::printf("  mangrove options: %zu source, %zu turbulence; the zone holds %zu of %d cells\n",
                 nSource, nTurb, zoneCells, (int)nC);
-    check("both mangrove options are active, over a zone of cells", nSource == 1 && nTurb == 1 && zoneCells > 0);
+    // The `twoOptions` profile declares a SECOND option of each type over the same zone, and the point
+    // of it is that both of each count -- so the expected number comes from the profile, and a run that
+    // silently dropped one would fail here before any field is compared.
+    const std::size_t wantEach = (ctlLabel == "one option of each instead of two") ? 2u : 1u;
+    check("every mangrove option the case declares is active, over a zone of cells",
+          nSource == wantEach && nTurb == wantEach && zoneCells > 0);
 
     auto readCells = [&](const std::string& path)
     {
@@ -258,10 +267,10 @@ int main(
     const Diff dOffU = compare(readVectorCells(offDir + "/U"), ofU);
     const Diff dTurbK = compare(readCells(turbOffDir + "/k"), ofKf);
     std::printf("  CONTROL: OpenFOAM with both mangrove options off, U relative %.4e\n", (double)dOffU.rel());
-    std::printf("  CONTROL: OpenFOAM with the turbulence option off, k relative %.4e\n", (double)dTurbK.rel());
+    std::printf("  CONTROL: OpenFOAM with %s, k relative %.4e\n", ctlLabel.c_str(), (double)dTurbK.rel());
     check("the mangroves move OpenFOAM's own U far more than brae is from it",
           dOffU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)) && dOffU.rel() > scalar(1e-6));
-    check("...and their turbulence source moves its k far more than brae is from it",
+    check("...and the second control moves its k far more than brae is from it",
           dTurbK.rel() > scalar(1000)*std::fmax(dK.rel(), scalar(1e-14)) && dTurbK.rel() > scalar(1e-6));
 
     // THE DEVICE LOOP, on the same case from the same start, held to OpenFOAM by its OWN bounds

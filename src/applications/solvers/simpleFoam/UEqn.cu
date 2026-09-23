@@ -440,7 +440,7 @@ void assembleUEqn(
 
     // == fvOptions(rho, U): multiphaseMangrovesSource, in the slot the porosity takes -- after every
     // other coefficient, before relax() (inter_ueqn_cpp.cu has it there)
-    if (in.mangroves && in.mangroves->source)
+    if (in.mangroves && in.mangroves->source())
     {
         if (!in.mangrovesRho || !in.ddtUOld[0] || !in.ddtUOld[1] || !in.ddtUOld[2] || !(in.ddtDeltaT > 0.0))
             throw std::runtime_error(

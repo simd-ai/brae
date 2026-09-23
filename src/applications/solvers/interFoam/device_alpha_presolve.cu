@@ -137,12 +137,13 @@ scalar deviceAlphaPreSolve(
     if (sc.smoothSolver)
     {
         deviceSymGaussSeidel(A, b, alpha1, dNf.data(), sc.tol, sc.relTol, sc.maxIter,
-                             &perf, /*minIter=*/0, sc.nSweeps, sc.symmetric);
+                             &perf, sc.minIter, sc.nSweeps, sc.symmetric);
     }
     else
     {
         // BiCGStab because the matrix is ASYMMETRIC: upwind convection gives upper != lower.
-        perf = deviceJacobiBiCGStab(A, b, alpha1, dNf.data(), sc.tol, sc.relTol, sc.maxIter);
+        perf = deviceJacobiBiCGStab(A, b, alpha1, dNf.data(), sc.tol, sc.relTol, sc.maxIter,
+                                    /*checkEvery=*/1, sc.minIter);
     }
 
     // alphaPhi10 = alpha1Eqn.flux(), the CONSERVATIVE flux of the solved matrix. For a pure upwind

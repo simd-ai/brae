@@ -1204,11 +1204,13 @@ void correct(
         assembleEpsEqn(E, st, dm, dbEps, dbK, epsilon, k, nut, in, dbEps.n ? &epsBndLast : nullptr,
                        epsOld.size() ? &epsOld : nullptr);
         // + fvOptions(alpha, rho, epsilon_), kEpsilon.C:258: the last term on the right, ahead of relax()
-        if (in.fvoSpEps)
+        // ONE PASS PER OPTION, in the list's order: the sum over the list, added the way the host's
+        // loop adds it (one diag += V*coeff per option, never V*(sum of coeffs))
+        for (const DeviceBuffer<scalar>* sp : in.fvoSpEps)
         {
-            if (in.fvoSpEps->size() != static_cast<std::size_t>(dm.nCells))
+            if (!sp || sp->size() != static_cast<std::size_t>(dm.nCells))
                 throw std::runtime_error("brae kEpsilon (device): fvoSpEps must be one coefficient per cell.");
-            fvOptionsSpKernel<<<nBlk(dm.nCells), TPB>>>(dm.nCells, dm.V.data(), in.fvoSpEps->data(),
+            fvOptionsSpKernel<<<nBlk(dm.nCells), TPB>>>(dm.nCells, dm.V.data(), sp->data(),
                                                         E.diag.data());
             cudaCheck(cudaGetLastError(), "kEpsilon fvOptions(epsilon)");
         }
@@ -1254,11 +1256,11 @@ void correct(
         assembleKEqn(K, st, dm, dbK, dbU, k, epsilon, nut, in, dbK.n ? &kBndLast : nullptr,
                      kOld.size() ? &kOld : nullptr);
         // + fvOptions(alpha, rho, k_), kEpsilon.C:279
-        if (in.fvoSpK)
+        for (const DeviceBuffer<scalar>* sp : in.fvoSpK)   // one pass per option, as for epsilon
         {
-            if (in.fvoSpK->size() != static_cast<std::size_t>(dm.nCells))
+            if (!sp || sp->size() != static_cast<std::size_t>(dm.nCells))
                 throw std::runtime_error("brae kEpsilon (device): fvoSpK must be one coefficient per cell.");
-            fvOptionsSpKernel<<<nBlk(dm.nCells), TPB>>>(dm.nCells, dm.V.data(), in.fvoSpK->data(),
+            fvOptionsSpKernel<<<nBlk(dm.nCells), TPB>>>(dm.nCells, dm.V.data(), sp->data(),
                                                         K.diag.data());
             cudaCheck(cudaGetLastError(), "kEpsilon fvOptions(k)");
         }

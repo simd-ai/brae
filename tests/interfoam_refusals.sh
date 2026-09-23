@@ -286,9 +286,9 @@ BASE="$BG"
 arm ddt_cnMangroves         refused "multiphaseMangrovesSource" "" "$CNSET"
 BASE="$B"
 
-# a solver-entry floor neither the alpha pre-solve nor the momentum predictor honours yet
-# the host's alpha pre-solve honours minIter (tests/interfoam_dambreak_vs_openfoam.sh `alphaminiter`); the
-# device's does not, and refuses it
+# a solver-entry floor the momentum predictor does not honour yet. BOTH alpha pre-solves honour it now
+# (tests/interfoam_dambreak_vs_openfoam.sh `alphaminiter`, compared on the host AND the device arm), so
+# this arm asserts the case RUNS rather than that either loop refuses it.
 arm alpha_minIter           runs    -                        "" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       yes;\\n\\1minIter 1;/' system/fvSolution"
 
 # the non-orthogonal correction: damBreak says `corrected`, brae assembles orthogonal. SHEAR holds the

@@ -98,8 +98,10 @@ int main(int argc, char** argv)
     // like any other profile.
     const bool compression = profileName == "compression";
     // `alphaminiter`: the alpha entry names `minIter 1`. At the big step OpenFOAM's first pre-solve starts
-    // under its tolerance and takes no sweep; minIter forces one. The device's pre-solve does not honour
-    // minIter and refuses the case.
+    // under its tolerance and takes no sweep; minIter forces one. The device's pre-solve honours it now
+    // (DeviceAlphaSolverControls::minIter, carried into deviceSymGaussSeidel and deviceJacobiBiCGStab
+    // alike), so this profile is COMPARED on the device arm instead of refused -- which is what makes
+    // the lift visible: the count and the residuals of the first pre-solve are what minIter moves.
     const bool alphaMinIter = profileName == "alphaminiter";
     // `sheared`: the big step on damBreak with its upper blocks sheared six degrees, so the corrected
     // laplacian and snGrad carry a non-zero correction, and with the momentum predictor on, so the
@@ -123,7 +125,7 @@ int main(int argc, char** argv)
     // (inter_driver_device.cu), measured against OpenFOAM on validation/interFoamCyclic's `outer`
     // profile with the one-corrector answer as its control. It is compared here like any other
     // profile, on a case whose every other control the device already runs.
-    const bool deviceRefuses = namedFlux || alphaMinIter || gradLsqLimited
+    const bool deviceRefuses = namedFlux || gradLsqLimited
                             || nHatLimited;
     const bool bigStep = (argc > 7 && std::string(argv[7]) == "bigstep") || prevCorr || pimpleProfile || sheared;
     // `inflow`: the atmosphere's inletValue set to 1, so water enters over air cells and rho's patch
@@ -518,9 +520,7 @@ int main(int argc, char** argv)
                     why = e.what();
                 }
                 const char* named = nonOrth ? "nNonOrthogonalCorrectors"
-                                  : alphaMinIter ? "minIter"
                                   : (gradLsqLimited || nHatLimited) ? "cellLimited"
-                    
                                             : "names the flux";
                 std::printf("  DEVICE: %s\n", threw ? why.substr(0, 140).c_str() : "RAN -- it must not");
                 check("the DEVICE refuses this case rather than run it at a smaller count",

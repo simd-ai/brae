@@ -82,8 +82,9 @@ struct DeviceInterTurbulence
     // the smoothSolver sweep every other turbulent tutorial names
     DeviceDilu dilu;
     // kCoeff and epsilonCoeff of multiphaseMangrovesTurbulenceModel at this step's U, per cell
-    DeviceBuffer<scalar> mangroveK;
-    DeviceBuffer<scalar> mangroveEps;
+    // one per active multiphaseMangrovesTurbulenceModel, in the option list's order
+    std::vector<DeviceBuffer<scalar>> mangroveK;
+    std::vector<DeviceBuffer<scalar>> mangroveEps;
     // CrankNicolson's state (the host closure's InterTurbulenceCrankNicolson): the two ddt0 fields and
     // the old-old level of each field, rotated once per time index as storeOldTimes does
     DeviceCnDdt0 cnDdt0K;

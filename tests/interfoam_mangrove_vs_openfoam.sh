@@ -55,10 +55,27 @@
 #   the Gauss-Seidel sweep in place of PBiCG        1.1e-04 / 1.6e-04, 0 of 450 counts of either
 # NOT DISCRIMINATED there either: the added mass on U for U.oldTime() -- every digit the same.
 #
+# PROFILE twoOptions: a SECOND option of each type over the SAME cellZone as the first (a 0.008, N 300,
+# Cm 2, Cd 1.1; Ckp 0.7, Cep 3.5 -> 2.0). OpenFOAM builds one source object per entry and `fvOptions(U)`
+# sums the list, so the two overlap and BOTH count -- which is what the device loop refused to do until
+# now, and what a single merged coefficient array per type cannot do (it would keep the last entry's
+# numbers alone on every shared cell). The device now carries one coefficient set per option and applies
+# them in the list's order, so its matrix takes diag += V*coeff_1 then diag += V*coeff_2, term for term
+# what the host's loop over the option list leaves rather than V*(coeff_1 + coeff_2).
+# THE CONTROL is the `mangrove` run itself -- one option of each instead of two, OpenFOAM against itself:
+# the second pair moves its own k by 1.3e-01, against brae's 1.6e-13.
+# MEASURED on twoOptions: host alpha 6.0e-14, p_rgh 4.9e-14, U 4.2e-12, k 1.6e-13, epsilon 1.1e-13,
+# nut 2.3e-13; device alpha 7.6e-14, p_rgh 5.7e-14, U 3.9e-11, k 3.0e-12, epsilon 3.5e-12, nut 1.8e-12 --
+# the one-option run's bounds, unchanged.
+# BROKEN ONCE EACH on the device, keeping ONE coefficient array per type as the loop did before:
+#   only the last multiphaseMangrovesSource            alpha 3.7e-01, U 7.0e-01, k 6.6e-01  (18 arms red)
+#   only the last multiphaseMangrovesTurbulenceModel   alpha 1.5e-01, U 3.3e-01, k 4.5e-01  (16 arms red)
+# The host arm is unmoved by either, which is what says the defect is the device's alone.
+#
 # NOT CLAIMED: the tutorial's 411,600-cell mesh (a bench size), its sampled line sets (stripped), the
 # density-weighted k-epsilon (refused on both loops), any closure but kEpsilon under the turbulence
-# option (refused), a field-name override on either option (refused), more than one option of either
-# type on the device loop (refused), and either option beside a moving mesh (refused by the reader).
+# option (refused), a field-name override on either option (refused), and either option beside a moving
+# mesh (refused by the reader).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_mangrove_vs_openfoam"
@@ -137,6 +154,55 @@ elif p == 'turbOff':
     tail, k = re.subn(r'active\s+yes;', 'active          no;', tail, count=1)
     assert k == 1, 'turbOff'
     s = head + tail
+elif p == 'twoOptions':
+    # A SECOND OPTION OF EACH TYPE, over the SAME cellZone as the first. OpenFOAM constructs one source
+    # object per entry and `fvOptions(U)` sums the list, so the two overlap and both count; an
+    # implementation that keeps one coefficient array per type would keep only this one's numbers.
+    s += '''
+Mangroves2
+{
+    type            multiphaseMangrovesSource;
+    active          yes;
+
+    multiphaseMangrovesSourceCoeffs
+    {
+        regions
+        {
+            region1
+            {
+                cellZone        c0;
+                a               0.008;
+                N               300;
+                Cm              2;
+                Cd              1.1;
+            }
+        }
+    }
+}
+
+
+TurbulenciaMangroves2
+{
+    type            multiphaseMangrovesTurbulenceModel;
+    active          yes;
+
+    multiphaseMangrovesTurbulenceModelCoeffs
+    {
+        regions
+        {
+            region1
+            {
+                cellZone        c0;
+                a               0.008;
+                N               300;
+                Ckp             0.7;
+                Cep             2.0;
+                Cd              1.1;
+            }
+        }
+    }
+}
+'''
 open(o, 'w').write(s)
 PYEOF
     ( cd "$C" && cp -r 0.orig 0 && blockMesh > log.blockMesh 2>&1 && setFields > log.setFields 2>&1 \
@@ -148,12 +214,17 @@ PYEOF
 }
 
 rc=0
-for p in off turbOff mangrove; do
+for p in off turbOff mangrove twoOptions; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_mangrove_vs_openfoam: staging failed"; exit 1; }
 
 "$BIN" "$W/mangrove" "$W/mangrove/0" "$W/mangrove/$END" "$STEPS" "$W/mangrove/log.interFoam" "$W/off/$END" "$W/turbOff/$END" || rc=1
+
+# twoOptions: TWO options of each type over the same cellZone, with the ONE-of-each run as the control --
+# the second option has to have moved OpenFOAM's own answer, or the profile tests nothing
+"$BIN" "$W/twoOptions" "$W/twoOptions/0" "$W/twoOptions/$END" "$STEPS" "$W/twoOptions/log.interFoam" \
+       "$W/off/$END" "$W/mangrove/$END" "one option of each instead of two" || rc=1
 
 echo "interfoam_mangrove_vs_openfoam: rc $rc"
 exit $rc

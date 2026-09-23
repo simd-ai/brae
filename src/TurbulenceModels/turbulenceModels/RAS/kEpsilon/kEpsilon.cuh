@@ -65,6 +65,7 @@
 #include "pEqn.cuh"               // PressureMatrix -- the assembled scalar object, shared not redefined
 #include "device_crank_nicolson_ddt.cuh"
 #include <string>
+#include <vector>
 
 namespace brae {
 namespace gpu {
@@ -161,10 +162,14 @@ struct KEpsilonInput
     // + fvOptions(epsilon) and + fvOptions(k) for an option whose addSup is -fvm::Sp(coeff, field): one
     // coefficient per cell, which the matrix takes as diag += V*coeff after every other term and before
     // relax() (kEpsilon.C:258 and :279). The CALLER forms the coefficient, from whatever the option
-    // reads -- the mangroves' is Cx*Cd*a*N*|U|. Null = no such option. The incompressible lineage
+    // reads -- the mangroves' is Cx*Cd*a*N*|U|. Empty = no such option. The incompressible lineage
     // only: OpenFOAM's density-weighted form is -Sp(rho*coeff) and no gate holds it.
-    const DeviceBuffer<scalar>* fvoSpEps = nullptr;
-    const DeviceBuffer<scalar>* fvoSpK   = nullptr;
+    //
+    // ONE ENTRY PER OPTION: `fvOptions(k)` is a sum over the list, so two options that name the same
+    // cell each add their own -Sp, and the matrix takes diag += V*coeff_1 then diag += V*coeff_2 --
+    // term for term what the host's loop over the option list leaves, not V*(coeff_1 + coeff_2).
+    std::vector<const DeviceBuffer<scalar>*> fvoSpEps;
+    std::vector<const DeviceBuffer<scalar>*> fvoSpK;
     // FP-1: sweep the honoured smoothSolver in COLOUR order over `colouring` (turbulence_transport.cuh
     // SolveControls::gsColour); the driver announces the order per field.
     bool   gsColour = false;

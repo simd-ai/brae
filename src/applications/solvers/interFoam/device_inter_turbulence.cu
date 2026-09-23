@@ -511,6 +511,16 @@ void deviceCorrectInterTurbulence(
             lin.kOO     = &d.cnKOO;
         }
         const cpu::interFoam::SmoothLinearSolve& ks = t.kSolveFinal;
+        // the case's own solver for k, as the two RAS branches read it
+        if (ks.pbicgDILU())
+        {
+            if (!d.dilu.valid)
+                throw std::runtime_error(
+                    "brae interFoam (device): kFinal names PBiCG with DILU and the closure was built "
+                    "with no DILU schedule for this mesh.");
+            lin.pbicg = true;
+            lin.precon = &d.dilu;
+        }
         lin.symmetric = (ks.smoother == "symGaussSeidel");
         lin.nSweeps = ks.nSweeps;
         lin.tol = ks.tol;
@@ -822,16 +832,31 @@ void deviceCorrectInterTurbulence(
     }
     // + fvOptions(epsilon) and + fvOptions(k): the mangroves' turbulence source at the U this closure
     // was handed, which is the one OpenFOAM's lookupObject finds when kEpsilon::correct builds them
-    if (in.mangroves && in.mangroves->turbulence)
+    if (in.mangroves && in.mangroves->turbulence())
     {
         if (t.variableDensity)
             throw std::runtime_error(
                 "brae interFoam (device): multiphaseMangrovesTurbulenceModel under the `density variable` "
                 "k-epsilon is -Sp(rho*coeff) in OpenFOAM, and no gate holds that form.");
-        deviceMangrovesCoeff(in.mangroves->kFac, *in.Ux, *in.Uy, *in.Uz, d.mangroveK);
-        deviceMangrovesCoeff(in.mangroves->epsFac, *in.Ux, *in.Uy, *in.Uz, d.mangroveEps);
-        kin.fvoSpK = &d.mangroveK;
-        kin.fvoSpEps = &d.mangroveEps;
+        // ONE COEFFICIENT FIELD PER OPTION -- each option's Ckp*Cd*a*N*|U| stands on its own, because
+        // the k equation takes -Sp from each of them in turn (kEpsilon.C:279 sums the list)
+        const std::size_t nOpt = in.mangroves->turbulences.size();
+        if (d.mangroveK.size() != nOpt)
+        {
+            d.mangroveK.clear();
+            d.mangroveEps.clear();
+            d.mangroveK.resize(nOpt);
+            d.mangroveEps.resize(nOpt);
+        }
+        kin.fvoSpK.clear();
+        kin.fvoSpEps.clear();
+        for (std::size_t i = 0; i < nOpt; ++i)
+        {
+            deviceMangrovesCoeff(in.mangroves->turbulences[i].kFac, *in.Ux, *in.Uy, *in.Uz, d.mangroveK[i]);
+            deviceMangrovesCoeff(in.mangroves->turbulences[i].epsFac, *in.Ux, *in.Uy, *in.Uz, d.mangroveEps[i]);
+            kin.fvoSpK.push_back(&d.mangroveK[i]);
+            kin.fvoSpEps.push_back(&d.mangroveEps[i]);
+        }
     }
     // fvm::ddt under CrankNicolson (the host wrapper's block, inter_turbulence_cpp.cu): rotate the
     // old-old levels once per time index -- at the first step oldTime().oldTime() is a copy of oldTime()

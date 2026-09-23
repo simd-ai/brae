@@ -1269,12 +1269,10 @@ RunReport runInterFoamDevice(
         for (const fvOptions::Option& o : f.fvOptions.options)
         {
             if (!o.active || !o.unsupported.empty()) continue;
+            // ONE ENTRY PER OPTION. The list is a sum in OpenFOAM, so two options over the same
+            // cellZone each contribute; one merged array would keep the last option's number alone.
             if (o.mangroves == fvOptions::Option::Mangroves::source)
             {
-                if (dMangroves.source)
-                    throw std::runtime_error(
-                        "brae interFoam (device): more than one active multiphaseMangrovesSource. The "
-                        "device step carries one; the host loop carries them all.");
                 std::vector<scalar> dragFac(nCz, scalar(0));
                 std::vector<scalar> inertia(nCz, scalar(0));
                 for (const fvOptions::Option::MangroveRegion& r : o.mangroveRegions)
@@ -1285,16 +1283,13 @@ RunReport runInterFoamDevice(
                         inertia[static_cast<std::size_t>(c)] = 0.25*(r.Cm + 1)*pi*r.a*r.a*r.N;
                     }
                 }
-                dMangroves.source = true;
-                dMangroves.dragFac.copyFrom(dragFac);
-                dMangroves.inertia.copyFrom(inertia);
+                DeviceMangroves::Source src;
+                src.dragFac.copyFrom(dragFac);
+                src.inertia.copyFrom(inertia);
+                dMangroves.sources.push_back(std::move(src));
             }
             if (o.mangroves == fvOptions::Option::Mangroves::turbulence)
             {
-                if (dMangroves.turbulence)
-                    throw std::runtime_error(
-                        "brae interFoam (device): more than one active multiphaseMangrovesTurbulenceModel. "
-                        "The device closure carries one; the host loop carries them all.");
                 std::vector<scalar> kFac(nCz, scalar(0));
                 std::vector<scalar> epsFac(nCz, scalar(0));
                 for (const fvOptions::Option::MangroveRegion& r : o.mangroveRegions)
@@ -1305,9 +1300,10 @@ RunReport runInterFoamDevice(
                         epsFac[static_cast<std::size_t>(c)] = r.Cep*r.Cd*r.a*r.N;
                     }
                 }
-                dMangroves.turbulence = true;
-                dMangroves.kFac.copyFrom(kFac);
-                dMangroves.epsFac.copyFrom(epsFac);
+                DeviceMangroves::Turbulence t;
+                t.kFac.copyFrom(kFac);
+                t.epsFac.copyFrom(epsFac);
+                dMangroves.turbulences.push_back(std::move(t));
             }
         }
     }
@@ -1381,12 +1377,7 @@ RunReport runInterFoamDevice(
                 "(gated on laminar/damBreak `gradLsqLimited`); the device operators are Gauss linear. "
                 "Refused rather than run another gradient.");
     }
-    if (f.alphaCtl.MULESCorr && f.aSolve.minIter > 0)
-        throw std::runtime_error(
-            "brae interFoam (device): `solvers/" + f.alphaName + "` names `minIter "
-            + std::to_string(f.aSolve.minIter) + "`, which the device's alpha pre-solve does not honour. "
-            "The host loop does (gated on laminar/damBreak `alphaminiter`). Refused rather than stop a "
-            "sweep earlier than OpenFOAM does.");
+    C.alpha.preSolve.minIter = f.aSolve.minIter;   // gated on laminar/damBreak `alphaminiter`
     C.alpha.preSolve.tol = f.aSolve.tol;
     C.alpha.preSolve.relTol = f.aSolve.relTol;
     C.alpha.preSolve.maxIter = f.aSolve.maxIter;
@@ -1445,7 +1436,7 @@ RunReport runInterFoamDevice(
     C.nHatfIf     = (dCyc.n > 0) ? &dNHIf : nullptr;
     cycPhiForHost = (dCyc.n > 0) ? &dCyc.phi : nullptr;
     C.porosity = dPorosity.active ? &dPorosity : nullptr;
-    C.mangroves = dMangroves.source ? &dMangroves : nullptr;
+    C.mangroves = dMangroves.source() ? &dMangroves : nullptr;
     C.cn = cnDdt ? &dCn : nullptr;
     // p_rgh's reference, where the host driver sets it (inter_driver_cpp.cu:779-781). These three were
     // dead for as long as the device refused a case that needs one, and a step that never pins leaves the
@@ -2133,7 +2124,7 @@ RunReport runInterFoamDevice(
                 ti.epsilonLog = (f.turbulence.model == cpu::interFoam::InterRasModel::KOmegaSST)
                               ? &rep.omegaSolves : &rep.epsilonSolves;
                 ti.kLog = &rep.kSolves;
-                ti.mangroves = dMangroves.turbulence ? &dMangroves : nullptr;
+                ti.mangroves = dMangroves.turbulence() ? &dMangroves : nullptr;
                 if (cnDdt)
                 {
                     ti.cn = &cnClock;

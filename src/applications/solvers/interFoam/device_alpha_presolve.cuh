@@ -73,6 +73,11 @@ struct DeviceAlphaSolverControls
     bool symmetric = true;
     // smoothSolver.C:78 -- sweeps between residual evaluations
     int nSweeps = 1;
+    // lduMatrix::solver::stop -- the loop runs on while nIterations_ < minIter_ EVEN WHEN the residual
+    // is already under the tolerance (lduMatrixSolver.C). Three tutorials name it for alpha (DTCHull,
+    // DTCHullMoving, electrostaticDeposition); on damBreak's big step OpenFOAM's first pre-solve starts
+    // inside its own tolerance and `minIter 1` makes it sweep anyway, which moves alpha.
+    int minIter = 0;
 };
 
 // `alpha1` goes in as the initial guess -- the sub-step's old time, which is what OpenFOAM hands the

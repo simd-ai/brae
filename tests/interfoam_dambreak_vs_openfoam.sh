@@ -102,7 +102,12 @@
 # pre-solve starts on an exact solution, so the forced sweep changes nothing (alpha identical to the last
 # digit at alpha tolerances 1e-8, 1e-5, 1e-4, 1e-3) -- so the control is the sweep count: OpenFOAM without
 # minIter logs 1 of the 5 differently. BROKEN (minIter ignored, as brae had it): the first count 0 for 1.
-# The device refuses the profile by name.
+# THE DEVICE ARM runs it too now -- its pre-solve carries the same floor (DeviceAlphaSolverControls::
+# minIter, into deviceSymGaussSeidel and deviceJacobiBiCGStab alike) where it used to refuse the case by
+# name. MEASURED: all 5 device alpha counts OpenFOAM's, alpha 6.2e-14, p_rgh 5.3e-14, U 8.5e-12. BROKEN
+# ONCE on the device (the case's minIter dropped for 0, as the device had it): 4 of 5 counts equal, the
+# first 0 for 1, and the gate red -- with the FIELDS identical to the last digit, which is why the count
+# is the arm that has to be there.
 #
 # PROFILES sheared, gradLsqLimited, nHatLimited: THE GRADIENT SCHEMES. Every fvc::grad interFoam takes is
 # resolved by the name its call site asks for -- grad(U), grad(alpha.water), grad(alpha.air), grad(p_rgh),
