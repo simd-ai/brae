@@ -9,6 +9,98 @@
         fvOptions(rho, U)
     );
 
+    // ---- INSTRUMENTATION: writes only, nothing above or below is altered ----------------------
+    // UEqn's SOURCE, TERM BY TERM, and BEFORE relax(). With the matrix, V, rAU and psi all measured
+    // exact on permeable-moving, the source is the only term of UEqn.H() still out (3.82e-04
+    // relative, 6.526e-10 absolute against a field whose largest value is 1.710e-06) -- so which of
+    // the three terms carries a quantity of that size is the question, and the assembled source
+    // cannot answer it.
+    //
+    // THE PRE-RELAX SOURCE IS TAKEN FROM THE REAL MATRIX, not rebuilt: fvMatrix::relax adds
+    // (D - D0)*psi to it, and this case gets that contribution even at `"U.*" 1` because relax runs
+    // max(D, D, sumOff) before dividing by alpha (fvMatrix.C). The difference between this dump and
+    // UEqnSource.dump below IS the relaxation contribution.
+    //
+    // THE THREE PIECES ARE RE-EVALUATED, which is safe for fvm::div and divDevRhoReff (both are pure
+    // functions of their arguments) but NOT for every ddt scheme: CrankNicolsonDdtScheme keeps a
+    // stored ddt0 field. The ddt piece is therefore dumped only under a stateless scheme, and the log
+    // says so when it is skipped rather than leaving the file silently absent.
+    if (getenv("BRAE_DUMP_ITER") && runTime.timeIndex() == atoi(getenv("BRAE_DUMP_ITER")))
+    {
+        const fvVectorMatrix& UEqnPre = UEqn;
+
+        volVectorField srcPreRelax
+        (
+            IOobject("UEqnSourcePreRelax.dump", runTime.timeName(), mesh,
+                     IOobject::NO_READ, IOobject::NO_WRITE),
+            mesh,
+            dimensionedVector(dimless, Zero)
+        );
+        srcPreRelax.primitiveFieldRef() = UEqnPre.source();
+        srcPreRelax.write();
+
+        auto dumpSource = [&](const word& name, const fvVectorMatrix& mtx)
+        {
+            volVectorField f
+            (
+                IOobject(name, runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+                mesh,
+                dimensionedVector(dimless, Zero)
+            );
+            f.primitiveFieldRef() = mtx.source();
+            f.write();
+            scalar mx = 0;
+            forAll(mtx.source(), celli) mx = max(mx, mag(mtx.source()[celli]));
+            Info<< "[brae] " << name << "  max|source| " << mx << endl;
+        };
+
+        {
+            const tmp<fvVectorMatrix> tdiv(fvm::div(rhoPhi, U));
+            dumpSource("UEqnSourceDiv.dump", tdiv());
+        }
+        {
+            const tmp<fvVectorMatrix> tdev(turbulence->divDevRhoReff(rho, U));
+            dumpSource("UEqnSourceDev.dump", tdev());
+        }
+
+        // ONE LEVEL DEEPER INTO divDevRhoReff, which the bisection above lands on: brae's dev source
+        // is 9.330e-10 of OpenFOAM's 2.167e-09 at step two, 43 per cent, while ddt is exact to
+        // 5.3e-14 and div(rhoPhi,U) contributes no source at all. Its explicit half is
+        //     - fvc::div((alpha*rho*nuEff)*dev2(T(fvc::grad(U))))    linearViscousStress.C:127-131
+        // so grad(U), the viscosity it is weighted by, and the divergence of the product are the
+        // three things that can carry it. This case is `simulationType laminar`, where nuEff() is
+        // the mixture's own nu and alpha is one, so rho*mixture.nu() IS the weight OpenFOAM uses.
+        {
+            // NAMED `(rho*nuEff)` DELIBERATELY: fvc::div looks its scheme up by the composed field
+            // name, and this case's divSchemes lists
+            // `div(((rho*nuEff)*dev2(T(grad(U))))) Gauss linear` with NO default entry -- any other
+            // name is a fatal lookup, not a silent fallback.
+            const volScalarField muA("(rho*nuEff)", rho*mixture.nu());
+            volScalarField("muEffAsm.dump", muA).write();
+            volTensorField("gradUasm.dump", fvc::grad(U)()).write();
+            volVectorField("divDevExpl.dump", fvc::div(muA*dev2(T(fvc::grad(U))))()).write();
+        }
+
+        const token& ddtTok = mesh.ddtScheme("ddt(rho,U)").peekFirst();
+        const word ddtName(ddtTok.isWord() ? ddtTok.wordToken() : word("<not-a-word>"));
+        if (ddtName == "Euler" || ddtName == "backward" || ddtName == "steadyState")
+        {
+            const tmp<fvVectorMatrix> tddt(fvm::ddt(rho, U));
+            dumpSource("UEqnSourceDdt.dump", tddt());
+        }
+        else
+        {
+            Info<< "[brae] UEqnSourceDdt.dump SKIPPED: ddt scheme `" << ddtName
+                << "` keeps stored state, and re-evaluating it here would move it" << endl;
+        }
+
+        scalar mxPre = 0;
+        forAll(UEqnPre.source(), celli) mxPre = max(mxPre, mag(UEqnPre.source()[celli]));
+        Info<< "[brae] UEqnSourcePreRelax.dump  max|source| " << mxPre
+            << "  (ddt scheme " << ddtName << ")" << endl;
+    }
+    // ------------------------------------------------------------------------------------------
+
     UEqn.relax();
 
     // ---- INSTRUMENTATION: writes only, nothing above or below is altered ----------------------

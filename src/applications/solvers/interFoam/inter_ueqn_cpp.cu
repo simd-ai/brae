@@ -3,6 +3,11 @@
 #include "inter_ueqn_cpp.cuh"
 #include "inter_peqn_cpp.cuh"
 #include "solve_vector.cuh"
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <system_error>
 
 namespace brae {
 namespace cpu {
@@ -162,6 +167,66 @@ FvVectorMatrix divWithScheme(const GeometricField<vector>& U,
     }
 }
 
+// Instrument: BRAE_STAGE_DUMP_DIR=<dir> (+ BRAE_STAGE_DUMP_ITER=n, default 1) writes UEqn's SOURCE
+// after each term is added, at ONE call, in the same shape tools/dumpInterFoam writes OpenFOAM's
+// (UEqnSourceDiv/Ddt/Dev/PreRelax.dump). The assembled source is the only term of UEqn.H() still out
+// on permeable-moving -- 3.82e-04 relative -- and the terms behind it are three orders apart in size
+// (OpenFOAM at step two: div EXACTLY 0, divDevRhoReff 2.227e-09, ddt 1.259e-06, and relax adds
+// another 4.5e-07), so the assembled number cannot say which one carries it.
+//
+// THE DIAGONAL EITHER SIDE OF relax(), because the relaxation contribution is (D - D0)*psi and the
+// case reaches it even at `"U.*" 1`: relax runs max(D, D, sumOff) before dividing by alpha.
+struct UEqnStageDump
+{
+    std::string dir;
+    bool on = false;
+
+    void vectors(const char* name, const std::vector<vector>& v) const
+    {
+        if (!on) return;
+        std::ofstream o(dir + "/" + name);
+        o.precision(17);
+        for (const vector& x : v) o << x.x << " " << x.y << " " << x.z << "\n";
+    }
+
+    void scalars(const char* name, const std::vector<scalar>& v) const
+    {
+        if (!on) return;
+        std::ofstream o(dir + "/" + name);
+        o.precision(17);
+        for (const scalar x : v) o << x << "\n";
+    }
+
+    void tensors(const char* name, const std::vector<tensor>& v) const
+    {
+        if (!on) return;
+        std::ofstream o(dir + "/" + name);
+        o.precision(17);
+        for (const tensor& t : v)
+        {
+            o << t.xx << " " << t.xy << " " << t.xz << " "
+              << t.yx << " " << t.yy << " " << t.yz << " "
+              << t.zx << " " << t.zy << " " << t.zz << "\n";
+        }
+    }
+};
+
+
+UEqnStageDump openStageDump()
+{
+    UEqnStageDump d;
+    const char* dd = std::getenv("BRAE_STAGE_DUMP_DIR");
+    if (!dd) return d;
+    static int calls = 0;
+    const char* it = std::getenv("BRAE_STAGE_DUMP_ITER");
+    if (++calls != (it && *it ? std::atoi(it) : 1)) return d;
+    std::error_code ec;
+    std::filesystem::create_directories(dd, ec);
+    d.dir = dd;
+    d.on = !ec;
+    return d;
+}
+
 }   // namespace
 
 
@@ -211,6 +276,9 @@ FvVectorMatrix assembleUEqn(
         }
     }
 
+    const UEqnStageDump stage = openStageDump();
+    stage.vectors("ueqnSrcDiv", M.source);
+
     // fvm::ddt(rho, U). Added to the SAME matrix, before relax, exactly as the constructor's `+` does.
     if (in.ddtScheme == DdtScheme::CrankNicolson)
     {
@@ -223,6 +291,8 @@ FvVectorMatrix assembleUEqn(
     {
         addEulerDdtRhoU(M, *in.rho, *in.rhoOld, *in.UOld, g.V(), in.deltaT, in.V0);
     }
+
+    stage.vectors("ueqnSrcDdt", M.source);
 
     // + MRF.DDt(rho, U), UEqn.H:6. MRFZoneList::DDt(rho, U) is rho*DDt(U) (MRFZoneList.C), and DDt(U)
     // the volVectorField Omega x U on the zone's cells, built from the CURRENT U -- explicit, lagged
@@ -260,6 +330,49 @@ FvVectorMatrix assembleUEqn(
     addDivDevReff(M, U, *muEff, *muEffBnd, m, g, patches, in.correctedLaplacian, in.snGradLimitCoeff,
                   in.gradULimitK, in.gradULeastSq);
 
+    stage.vectors("ueqnSrcDev", M.source);
+    // ...and the three things divDevRhoReff's explicit half is built from, because that half is where
+    // the permeable-moving source gap sits (43 per cent of the term at step two). All three calls are
+    // pure functions of arguments already in hand, so re-evaluating them here moves nothing.
+    if (stage.on)
+    {
+        stage.scalars("ueqnMuEff", *muEff);
+        // ...and U's PATCH values as the assembly sees them, which is the only input gaussGrad has on
+        // a boundary cell that the internal field does not give it.
+        {
+            std::vector<vector> ub;
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                for (label i = 0; i < patches[pi].size; ++i)
+                {
+                    ub.push_back(U.boundary[pi]->value()[static_cast<std::size_t>(i)]);
+                }
+            }
+            stage.vectors("ueqnUbnd", ub);
+            std::vector<vector> rv;
+            std::vector<scalar> vf;
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                const std::vector<vector> r = U.boundary[pi]->refValues();
+                const std::vector<scalar>* f = U.boundary[pi]->valueFractionPtr();
+                for (label i = 0; i < patches[pi].size; ++i)
+                {
+                    const std::size_t k = static_cast<std::size_t>(i);
+                    rv.push_back(k < r.size() ? r[k] : vector{0, 0, 0});
+                    vf.push_back((f && k < f->size()) ? (*f)[k] : scalar(-1));
+                }
+            }
+            stage.vectors("ueqnUbndRef", rv);
+            stage.scalars("ueqnUbndVf", vf);
+        }
+        stage.tensors("ueqnGradU", in.gradULeastSq
+                                       ? fvc::leastSquaresGrad(U, m, g, patches)
+                                       : fvc::gaussGrad(U, m, g, patches));
+        stage.vectors("ueqnDivDevExpl",
+                      divDevReffExplicit(U, *muEff, *muEffBnd, m, g, patches,
+                                         in.gradULimitK, in.gradULeastSq));
+    }
+
     // == fvOptions(rho, U), UEqn.H:9. explicitPorositySource builds a porosityEqn and does
     // `eqn -= porosityEqn`, and `UEqn == options` subtracts that again, so the NET effect is the
     // porosity equation as written: diag += V*tr(Cd)/3, source -= V*((Cd - I*tr(Cd)/3) & U), with
@@ -284,8 +397,12 @@ FvVectorMatrix assembleUEqn(
 
     // UEqn.relax(). damBreak names `".*" 1`, which relaxEquation() finds, and relax(1) still applies the
     // diagonal-dominance clamp -- see InterMomentumInput::relaxEquationU.
+    stage.vectors("ueqnSrcPreRelax", M.source);
+    stage.scalars("ueqnDiagPreRelax", M.diag);
     if (in.relaxEquationU && in.relaxU > scalar(0))
         relaxMatrix<vector>(M, U, m, patches, in.relaxU);
+    stage.vectors("ueqnSrcRelax", M.source);
+    stage.scalars("ueqnDiagRelax", M.diag);
 
     return M;
 }

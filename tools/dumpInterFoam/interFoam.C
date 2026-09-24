@@ -109,9 +109,28 @@ int main(int argc, char *argv[])
         // --- Pressure-velocity PIMPLE corrector loop
         while (pimple.loop())
         {
+            // U's STORED PATCH VALUES AT THREE POINTS OF THE STEP. brae holds the value its last
+            // evaluate left and OpenFOAM does not agree with it at the momentum assembly -- 346 of the
+            // 1050 permeable faces, OpenFOAM exactly zero where brae carries the extrapolation -- while
+            // refValue and valueFraction agree on every face. So something between the previous step's
+            // pEqn and this assembly evaluates the patch in OpenFOAM and not in brae, and only a dump
+            // on each side of the mesh update and the alpha step can say which.
+            if (getenv("BRAE_DUMP_ITER")
+             && runTime.timeIndex() == atoi(getenv("BRAE_DUMP_ITER")))
+            {
+                volVectorField(IOobject("UloopEntry.dump", runTime.timeName(), mesh,
+                                        IOobject::NO_READ, IOobject::NO_WRITE), U).write();
+            }
+
             if (pimple.firstIter() || moveMeshOuterCorrectors)
             {
                 mesh.update();
+                if (getenv("BRAE_DUMP_ITER")
+                 && runTime.timeIndex() == atoi(getenv("BRAE_DUMP_ITER")))
+                {
+                    volVectorField(IOobject("UafterMove.dump", runTime.timeName(), mesh,
+                                            IOobject::NO_READ, IOobject::NO_WRITE), U).write();
+                }
 
                 if (mesh.changing())
                 {
@@ -244,6 +263,8 @@ int main(int argc, char *argv[])
              && runTime.timeIndex() == atoi(getenv("BRAE_DUMP_ITER")))
             {
                 surfaceScalarField("nHatfA.dump", mixture.nHatf()).write();
+                volVectorField(IOobject("UafterAlpha.dump", runTime.timeName(), mesh,
+                                        IOobject::NO_READ, IOobject::NO_WRITE), U).write();
                 volScalarField("sigmaKA.dump", mixture.sigmaK()()).write();
                 // THE OLD CELL VOLUMES, which the moving-mesh ddt's source is built on
                 // (rho*V0/dt*U.oldTime()). Nothing written at the end of a step can show them, which

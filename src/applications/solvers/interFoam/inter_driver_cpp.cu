@@ -190,6 +190,37 @@ void interMeshUpdate(
     // updated in UEqn instead, from the alpha the sub-cycles left, U went from 7.1e-12 of
     // OpenFOAM after step one to 1.1e-07 after step two, the gap at the outlet.
     updateWaveVelocity(f.waves, f.alpha1, f.U, time, timeIndex, m, g, patches);
+    // ...AND THE FLUX AND PHASE FRACTION THAT EVALUATE READS, as they stand HERE.
+    // dynamicMotionSolverFvMesh::update ends in U.correctBoundaryConditions()
+    // (dynamicMotionSolverFvMesh.C:101-114) and OpenFOAM's updateCoeffs LOOKS phi UP: at this instant
+    // phi is the RELATIVE flux the previous step's pEqn left (fvc::makeRelative, pEqn.H:71), not the
+    // ABSOLUTE one that step's last U evaluate read. brae's patches are told rather than looking up,
+    // and this site used to evaluate them with the flux they were last handed -- the absolute one.
+    // The two have OPPOSITE SIGNS on a wall that moves, and
+    // pressurePermeableAlphaInletOutletVelocity's valueFraction is neg(phi). MEASURED on
+    // laminar/testTubeMixer at step two: 346 of the 1050 wall faces held the extrapolated value where
+    // OpenFOAM holds exactly zero, with refValue and valueFraction agreeing on every face -- the
+    // stored value alone, from an evaluate made against the wrong flux. It reaches the momentum
+    // through grad(U)'s boundary values as a 43 per cent error in divDevRhoReff's explicit term,
+    // which is the only term of UEqn's source that is out (ddt agrees to 5.3e-14, div(rhoPhi,U)
+    // contributes no source, the relaxation contribution to 1.3e-10).
+    {
+        const SurfaceScalarField* rhoPhi =
+            (f.rhoPhi.boundary.size() == patches.size()) ? &f.rhoPhi : nullptr;
+        for (std::size_t pi = 0; pi < patches.size() && pi < f.phi.boundary.size(); ++pi)
+        {
+            const std::string& fluxName = f.U.boundary[pi]->fluxName();
+            if (fluxName != "rhoPhi" || rhoPhi)
+            {
+                f.U.boundary[pi]->updateFromFlux(
+                    namedPatchFlux(fluxName, pi, patches[pi].name, f.phi, rhoPhi));
+            }
+            if (f.U.boundary[pi]->needsAlphaPatchValues())
+            {
+                f.U.boundary[pi]->updateFromAlphaValues(f.alpha1.boundary[pi]->value());
+            }
+        }
+    }
     f.U.evaluateBoundary();
 
     // interFoam.C:130-131: gh and ghf follow the cell and face centres
@@ -268,96 +299,38 @@ RunReport runInterFoam(
     DynamicMotionSolverFvMesh* dyn = f.dynamicMesh.get();
     if (dyn)
     {
-        // THE PERMEABLE-WALL PAIR ON A MOVING MESH, which this loop ran and got wrong. MEASURED on
-        // laminar/testTubeMixer, 20 fixed steps of 5e-4, its `walls` given
-        // permeableAlphaPressureInletOutletVelocity and prghPermeableAlphaTotalPressure: U 6.144e-02
-        // from OpenFOAM, p_rgh 9.451e-04, alpha 2.147e-04. THE CONTROL is the same case with the
-        // tutorial's own movingWallVelocity, where this loop reads U 2.715e-10, p_rgh 1.005e-12,
-        // alpha 2.730e-11 -- so it is the pair and not the moving mesh.
+        // THE PERMEABLE-WALL PAIR ON A MOVING MESH -- SOLVED, and the refusal that stood here is
+        // gone. What it accused was never the pressure half: it was the ORDER of one evaluate.
+        // dynamicMotionSolverFvMesh::update ends in U.correctBoundaryConditions()
+        // (dynamicMotionSolverFvMesh.C:101-114), whose updateCoeffs LOOKS phi UP, and at that instant
+        // phi is the RELATIVE flux the previous step's pEqn left. This loop evaluated the same patches
+        // there with the flux they were last TOLD, which is the ABSOLUTE one its own
+        // U.correctBoundaryConditions read inside pEqn -- and on a wall that moves the two have
+        // opposite signs, while pressurePermeableAlphaInletOutletVelocity's valueFraction is neg(phi).
+        // interMeshUpdate now hands U's patches the flux and the phase fraction as they stand before
+        // that evaluate; see the note there for the measurement.
         //
-        // WHERE IT GOES WRONG, per step: step 1 reads U 4.077e-13, step 2 U 1.494e-01, step 5
-        // U 1.740e-02 -- exact once, then catastrophic. p_rgh stays small (2.458e-04 at step 2) and
-        // alpha never leaves the floor (5.107e-15), so it is the VELOCITY half, and it is something
-        // step 1 writes that only step 2 reads.
-        //
-        // FIVE CAUSES RULED OUT by measurement, so the next unit does not spend the afternoon on them:
-        //   * the flux STATE. pEqn.H:70 makes phi relative after the pressure solve and
-        //     interFoam.C:139 after the mesh update, and this loop does both at the same two points
-        //     (inter_peqn_cpp.cu:1048, and the correctPhi branch below). Both codes read a RELATIVE
-        //     phi at constrainPressure.
-        //   * the patch GEOMETRY. pressurePermeableAlphaInletOutletVelocity builds its refValue as
-        //     `(phip/patch().magSf())*patch().nf()`, looked up live; brae's class caches them at
-        //     rebuild(), but fvPatchField holds `const FvPatch&` and the move updates that object in
-        //     place, so they are live too. Re-telling the patch its flux after the move -- which
-        //     rebuilds both -- changed not one digit.
-        //   * Uf, the field step 1 writes and only step 2 reads. At the end of step 1 it agrees with
-        //     OpenFOAM's own written Uf to 3.911e-13 inside and 3.083e-13 on the wall.
-        //   * U's PATCH VALUE on the wall, 3.789e-13 at the same instant.
-        //   * the in-corrector flux push. OpenFOAM's pEqn.H sets `phi = phiHbyA - p_rghEqn.flux()`
-        //     and then calls U.correctBoundaryConditions(); this loop pushes the new flux to the
-        //     flux-conditional patches in the same place, with the lag rule uPatchesUpdatedAtEntry
-        //     measured on damBreakPermeable.
-        //
-        // SO EVERY FIELD AND EVERY PATCH VALUE AT THE END OF STEP ONE IS EXACT -- U 4.077e-13 inside,
-        // U on the wall 3.789e-13, Uf 3.911e-13, alpha 4.663e-15, p_rgh 1.733e-15 -- and step two is
-        // still 1.494e-01. What step two starts from that is NOT a field value is the patch's own
-        // carried COEFFICIENTS: a mixed condition contributes internalCoeffs and boundaryCoeffs built
-        // from its valueFraction, and two patches can hold the same VALUE with different fractions.
-        // THE PATCH'S CARRIED STATE IS EXACT TOO, and OpenFOAM writes it: mixedFvPatchField::write
-        // emits refValue and valueFraction, so U's own file has them. At the end of step one
-        // refValue is 1.353e-13 from OpenFOAM's and valueFraction is EQUAL on all 1050 faces. So
-        // nothing step one leaves behind is wrong -- it is step two's own arithmetic.
-        //
-        // WHERE IN STEP TWO -- and the first three readings of this were NOT the corrector they said
-        // they were. The host pressure taps sat under a bare `if (in.taps)` and were overwritten by
-        // every corrector while `tapCorrector` was set only on the first, and tools/dumpInterFoam
-        // wrote the same eleven names on each corrector so the files left on disk were the last
-        // one's. On this case, nCorrectors 2, that put a corrector-2 HbyA against a corrector-1 HbyA
-        // and read 3.556e-01. Both are fixed -- inter_peqn_cpp.cu pins its taps to the first
-        // corrector as the device loop already did, and the tool suffixes the later ones -- and with
-        // both sides on the FIRST corrector of step two the momentum hand-off reads:
-        //     rAU           3.06e-10      the diagonal
-        //     U as H() multiplies it
-        //                   1.02e-13      psi, the one input to H() that is not the matrix
-        //     UEqn upper    1.50e-09      the off-diagonals, both halves
-        //     UEqn lower    9.15e-10
-        //     UEqn diag     3.71e-10
-        //     UEqn sourceX  3.82e-04      <-- the only term of UEqn.H() still out
-        //     HbyA          1.39e-03 x, 1.75e-03 y, 3.22e-03 z
-        //     phiHbyA       1.87e-03
-        // THE OFF-DIAGONALS ARE NOT IT. The note that stood here pointing at lduMatrix::H(psi) is
-        // withdrawn: it was written from a number that compared two different correctors.
-        //
-        // WHAT IS LEFT is UEqn's SOURCE, and it is not the permeable patch's: 6.526e-10 on the cells
-        // touching `walls` against 4.667e-10 everywhere else, spread over the mesh rather than sitting
-        // on the patch. Three terms build it and the first is already ruled out: the ddt's
-        // rho*V0/dt*U.oldTime() (V0 and V agree to 6.204e-16, rho and U.oldTime() were exact), the
-        // relaxation contribution S += (D - D0)*psi -- which this case still gets with `"U.*" 1`,
-        // because fvMatrix::relax enforces diagonal dominance with max(D, D, sumOff) BEFORE dividing
-        // by alpha -- and the explicit viscous div, `div(((rho*nuEff)*dev2(T(grad(U)))))`, which is
-        // the case's own scheme entry. `div(rhoPhi,U) Gauss vanLeerV` contributes no source: a
-        // limited scheme reaches fvm::div through its weights alone.
-        //
-        // AND THE GROWTH IS AFTER THE HAND-OFF. The step still ends 1.33e-01 from OpenFOAM while HbyA
-        // leaves the momentum 1.4e-03 out, so between them lie the p_rgh system, the velocity
-        // correction and the second corrector -- none of which this unit has compared at a matched
-        // corrector, because until now it could not. The device loop refuses it at its own site.
-        for (std::size_t pi = 0; pi < patches.size() && pi < f.U.boundary.size(); ++pi)
-        {
-            const bool permeable = f.U.boundary[pi]->needsAlphaPatchValues()
-                                || f.p_rgh.boundary[pi]->needsAlphaPatchValues()
-                                || f.p_rgh.boundary[pi]->isPrghPermeableAlphaTotalPressure();
-            if (permeable)
-                throw std::runtime_error(
-                    "brae interFoam: patch `" + patches[pi].name + "` carries a permeable-wall condition "
-                    "(permeableAlphaPressureInletOutletVelocity or prghPermeableAlphaTotalPressure) and "
-                    "the mesh moves (" + dyn->motionType() + "). The pressure half reads the patch flux "
-                    "for the sign of its dynamic-pressure term, and on a moving mesh that flux is "
-                    "relative at some points of the step and absolute at others; this loop read the "
-                    "wrong one and left U 6.1e-02 from OpenFOAM on testTubeMixer, against 2.7e-10 for "
-                    "the same case with its own movingWallVelocity. Refused rather than run it. A "
-                    "static mesh runs, gated on laminar/damBreakPermeable.");
-        }
+        // HOW IT WAS FOUND, because six earlier readings pointed elsewhere. The chain was walked from
+        // the outside in, each step measured against tools/dumpInterFoam at a MATCHED corrector (the
+        // taps used to compare corrector 2 against corrector 1 and read HbyA 4.66e-01, which is what
+        // sent three units after terms that were exact):
+        //     rAU 3.1e-10, U as H() multiplies it 1.0e-13, UEqn upper/lower/diag 1.5e-09 -- so the
+        //     matrix and psi were right and the SOURCE was not (3.8e-04)
+        //     the source bisected by term: ddt 5.3e-14, div(rhoPhi,U) no source at all, the relaxation
+        //     contribution 1.3e-10, divDevRhoReff 4.3e-01 -- one term left
+        //     its explicit half bisected: muEff 1.1e-15, and grad(U) differing on 312 of 1250 cells
+        //     U's PATCH VALUES at the assembly: 346 of 1050 faces holding the extrapolation where
+        //     OpenFOAM holds exactly zero, with refValue AND valueFraction agreeing on every face --
+        //     so the coefficients were right and the stored value was from the wrong evaluate
+        //     U dumped at three points of the step: equal at the loop entry, different immediately
+        //     after mesh.update()
+        // MEASURED after the fix, laminar/testTubeMixer with the permeable pair, two steps:
+        //     U at the end of the step   1.33e-01 -> 8.66e-11
+        //     UEqn source                3.82e-04 -> 1.76e-10
+        //     HbyA                       1.39e-03 -> 1.68e-10
+        //     phiHbyA                    1.87e-03 -> 7.68e-11
+        // The DEVICE loop still refuses it at its own site: it evaluates U's boundary in its own
+        // kernels and nothing here has tested that half.
         if (!mutableMesh || !mutableMesh->m || !mutableMesh->g || !mutableMesh->patches)
         {
             throw std::runtime_error(

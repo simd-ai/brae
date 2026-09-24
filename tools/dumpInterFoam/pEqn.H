@@ -89,6 +89,18 @@
             p_rgh.relax();
 
             U = HbyA + rAU()*fvc::reconstruct((phig - p_rghEqn.flux())/rAUf);
+            // THE FLUX U's PATCHES LOOK UP HERE, written before the evaluate that reads it.
+            // pressurePermeableAlphaInletOutletVelocity's valueFraction is neg(phi) and phi is still
+            // ABSOLUTE at this point -- fvc::makeRelative(phi, U) is after the corrector loop -- so on
+            // a mesh that moves the sign the wall takes is the sign of the MESH flux, not of a flux
+            // through the wall. Nothing written at the end of a step can show this: by then phi is
+            // relative.
+            if (getenv("BRAE_DUMP_ITER") && runTime.timeIndex() == atoi(getenv("BRAE_DUMP_ITER")))
+            {
+                const Foam::word sfx2 =
+                    (pimple.corrPISO() <= 1) ? Foam::word() : ("c" + Foam::name(pimple.corrPISO()));
+                surfaceScalarField("phiAtUcbc" + sfx2 + ".dump", phi).write();
+            }
             U.correctBoundaryConditions();
             fvOptions.correct(U);
         }

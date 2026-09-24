@@ -289,11 +289,16 @@ int main(
     check("brae ran the same number of steps", r.steps == nSteps);
     check("the case moves its mesh, and brae read it so", (fin.dynamicMesh != nullptr) == moving);
     // the waveMaker tutorials are OPEN: a totalPressure atmosphere fixes p_rgh's level
+    // ...and `mixerPermeable` is open too, by its WALLS: prghPermeableAlphaTotalPressure fixes
+    // p_rgh's value on every face the phase fraction leaves dry, so the closed tube stops needing a
+    // reference. OpenFOAM's own run agrees -- its log prints no pRefCell -- and reading it the other
+    // way would add a reference OpenFOAM does not apply.
     const bool open = profile.rfind("solitary", 0) == 0 || profile.rfind("piston", 0) == 0
-                   || profile.rfind("flap", 0) == 0 || profile.rfind("multi", 0) == 0;
+                   || profile.rfind("flap", 0) == 0 || profile.rfind("multi", 0) == 0
+                   || profile == "mixerPermeable";
     if (open)
     {
-        check("p_rgh is fixed at the atmosphere, and brae read it so", !fin.pRef.needReference);
+        check("p_rgh is fixed at a patch, and brae read it so", !fin.pRef.needReference);
     }
     else
     {
@@ -620,7 +625,20 @@ int main(
         }
         std::printf("  wall velocity: Linf %.4e on %zu moving-wall faces (|U_wall| up to %.4e)\n",
                     (double)dWall, nWall, (double)wallScale);
-        check("the moving walls carry OpenFOAM's velocity", nWall > 0 && dWall <= scalar(1e-12)*wallScale);
+        // `mixerPermeable` replaces the tutorial's movingWallVelocity with the permeable pair, so it
+        // has NO moving wall to carry a velocity -- and that is asserted rather than skipped, because
+        // an arm that quietly passes on an empty set is the vacuous shape this suite keeps finding.
+        // What that profile holds instead is U's own comparison above and the permeable control.
+        if (profile == "mixerPermeable")
+        {
+            check("this profile put the permeable pair where the moving wall was, so there is none",
+                  nWall == 0 && !fin.movingWallVelocityPatch[0]);
+        }
+        else
+        {
+            check("the moving walls carry OpenFOAM's velocity",
+                  nWall > 0 && dWall <= scalar(1e-12)*wallScale);
+        }
         if (deviceArm)
         {
             scalar eWall = 0;
@@ -841,13 +859,25 @@ int main(
         // is the ddt scheme and a static control would be blind to it: the mesh flux itself is
         // off-centred under CrankNicolson (fvc::meshPhi), so Euler-vs-CrankNicolson is the only
         // comparison that moves when the scheme is wrong.
-        const char* controlIs = sst ? "laminar" : (cn ? "under Euler" : "with a static mesh");
-        const char* againstIs = sst ? "with kOmegaSST" : (cn ? "under CrankNicolson" : "with the motion");
+        // ...and under `mixerPermeable` the control is the SAME MOTION under the tutorial's own
+        // movingWallVelocity, because what that profile holds is the permeable pair and a static
+        // control would be answering for the motion instead. mesh.update() ends in
+        // U.correctBoundaryConditions() and the flux phi holds THERE is the relative one, where the
+        // flux pEqn's own evaluate reads is absolute: reading the absolute one at both left U
+        // 1.33e-01 from OpenFOAM after two steps.
+        const bool perm = (profile == "mixerPermeable");
+        const char* controlIs = sst ? "laminar"
+                                    : (cn ? "under Euler"
+                                          : (perm ? "with movingWallVelocity" : "with a static mesh"));
+        const char* againstIs = sst ? "with kOmegaSST"
+                                    : (cn ? "under CrankNicolson"
+                                          : (perm ? "with the permeable pair" : "with the motion"));
         std::printf("  CONTROL: OpenFOAM %s against OpenFOAM %s, U relative %.4e, alpha %.4e\n",
                     controlIs, againstIs, (double)cU.rel(), (double)cA.linf);
         check(sst ? "the closure moves OpenFOAM's own U far more than brae is from it"
                   : (cn ? "the ddt scheme moves OpenFOAM's own U far more than brae is from it"
-                        : "the motion moves OpenFOAM's own U far more than brae is from it"),
+                        : (perm ? "the permeable pair moves OpenFOAM's own U far more than brae is from it"
+                                : "the motion moves OpenFOAM's own U far more than brae is from it")),
               cU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)));
     }
     else

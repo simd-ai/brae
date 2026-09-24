@@ -33,6 +33,12 @@
 #                  step, where V0 and oldPoints must be taken once (the once-per-time-index rule of
 #                  fvMesh::movePoints and polyMesh::movePoints)
 #   mixerOuterOnce nOuterCorrectors 2 without it: the second corrector must NOT move the mesh
+#   mixerPermeable the same tube with permeableAlphaPressureInletOutletVelocity and
+#                  prghPermeableAlphaTotalPressure on its walls, its control the SAME MOTION under the
+#                  tutorial's own movingWallVelocity. mesh.update() ends in
+#                  U.correctBoundaryConditions() and phi is RELATIVE there and ABSOLUTE at pEqn's;
+#                  brae read the absolute one at both and left U 1.33e-01 from OpenFOAM after two
+#                  steps, 8.66e-11 with it fixed
 #   mixerPred      momentumPredictor yes: U solved on the moving mesh (smoothSolver GaussSeidel, the
 #                  tutorial's own U entry), with UFinal added because the tutorial names none
 #   sloshing2D     laminar/sloshingTank2D AS SHIPPED: the SDA roll-sway-heave of a
@@ -505,6 +511,35 @@ else:
             t, k = re.subn(r'internalField\s+uniform\s*\(0 0 0\);', 'internalField   uniform (0.1 0 0);', t)
             assert k == 1, 'U internalField not found'
         open(p, 'w').write(t)
+
+# THE PERMEABLE-WALL PAIR ON A MOVING MESH: the same tube with its `walls` given
+# permeableAlphaPressureInletOutletVelocity and prghPermeableAlphaTotalPressure. Both rebuild their
+# valueFraction from the flux AND the phase fraction on their own patch at every updateCoeffs, and
+# dynamicMotionSolverFvMesh::update ends in U.correctBoundaryConditions()
+# (dynamicMotionSolverFvMesh.C:101-114) -- where phi is the RELATIVE flux the previous step's pEqn
+# left, not the ABSOLUTE one that step's own U evaluate read. brae read the absolute flux at both and
+# held the extrapolated value on 346 of the 1050 faces where OpenFOAM holds exactly zero: U 1.33e-01
+# from OpenFOAM after two steps, 8.66e-11 with it fixed. alphaMin 0.01 is the tutorials' own.
+if profile == 'mixerPermeable':
+    PERM = {
+        '0/U': ('walls\n    {\n'
+                '        type            permeableAlphaPressureInletOutletVelocity;\n'
+                '        alpha           alpha.water;\n'
+                '        alphaMin        0.01;\n'
+                '        value           uniform (0 0 0);\n    }'),
+        '0/p_rgh': ('walls\n    {\n'
+                    '        type            prghPermeableAlphaTotalPressure;\n'
+                    '        alpha           alpha.water;\n'
+                    '        alphaMin        0.01;\n'
+                    '        p               uniform 0;\n'
+                    '        value           uniform 0;\n    }'),
+    }
+    for fname, entry in PERM.items():
+        fp = os.path.join(d, fname)
+        u = open(fp).read()
+        u, k = re.subn(r'walls\s*\{[^}]*\}', lambda _m, e=entry: e, u, count=1)
+        assert k == 1, 'no walls entry in ' + fname
+        open(fp, 'w').write(u)
 PYEOF
     if [ "$profile" = pistonLES ]; then
         # THE SAME PADDLE UNDER LES kEqn. What this profile holds that `pistonSST` cannot is the
@@ -676,6 +711,7 @@ stage mixerCorr      testTubeMixer 2e-4  10 mixerCorr      || rc=1
 stage mixerOuter     testTubeMixer 2e-4  10 mixerOuter     || rc=1
 stage mixerOuterOnce testTubeMixer 2e-4  10 mixerOuterOnce || rc=1
 stage mixerPred      testTubeMixer 2e-4  10 mixerPred      || rc=1
+stage mixerPermeable testTubeMixer 2e-4  10 mixerPermeable || rc=1
 stage sloshing2DStatic sloshingTank2D 0.01  10 sloshing2DStatic || rc=1
 stage sloshing2D     sloshingTank2D 0.01  10 sloshing2D     || rc=1
 # ...and the same tank under CRANKNICOLSON, which is THREE branches of the scheme a static case never
@@ -762,6 +798,7 @@ gate mixerCorr      2e-4  10 mixerCorr      mixerStatic  || rc=1
 gate mixerOuter     2e-4  10 mixerOuter     mixerStatic  || rc=1
 gate mixerOuterOnce 2e-4  10 mixerOuterOnce mixerStatic  || rc=1
 gate mixerPred      2e-4  10 mixerPred      mixerStatic  || rc=1
+gate mixerPermeable 2e-4  10 mixerPermeable mixer        || rc=1
 gate sloshing2D     0.01  10 sloshing2D     sloshing2DStatic || rc=1
 gate sloshing2DCN   0.01  10 sloshing2DCN   sloshing2D       || rc=1
 gate sloshing2D3DoF 0.01  10 sloshing2D3DoF sloshing2D3DoFStatic || rc=1
