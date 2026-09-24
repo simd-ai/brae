@@ -196,6 +196,48 @@ void constrainPointDisplacement(
 }
 
 
+void newmarkSolve(
+    const ModelState&    s0,
+    const NewmarkCoeffs& c,
+    ModelState&          s)
+{
+    if (s.q.size() != s0.q.size() || s.qDot.size() != s0.qDot.size()
+     || s.qDdot.size() != s0.qDdot.size())
+    {
+        throw std::runtime_error("brae RBD::newmarkSolve: the two states have different sizes.");
+    }
+    // Newmark.C:91-97, in OpenFOAM's own order: qDot FIRST, then q -- and q reads qDot0, not the qDot
+    // this line has just written, so swapping them changes the answer.
+    const scalar dt = s.deltaT;
+    for (std::size_t i = 0; i < s.q.size(); ++i)
+    {
+        s.qDot[i] = s0.qDot[i] + dt*(c.gamma*s.qDdot[i] + (scalar(1) - c.gamma)*s0.qDdot[i]);
+    }
+    for (std::size_t i = 0; i < s.q.size(); ++i)
+    {
+        s.q[i] = s0.q[i] + dt*s0.qDot[i]
+               + dt*dt*(c.beta*s.qDdot[i] + (scalar(0.5) - c.beta)*s0.qDdot[i]);
+    }
+}
+
+
+void relaxAcceleration(
+    std::vector<scalar>&       qDdot,
+    const std::vector<scalar>& qDdotPrev,
+    scalar                     aRelax,
+    scalar                     aDamp)
+{
+    if (qDdot.size() != qDdotPrev.size())
+    {
+        throw std::runtime_error("brae RBD::relaxAcceleration: the two accelerations differ in size.");
+    }
+    for (std::size_t i = 0; i < qDdot.size(); ++i)
+    {
+        qDdot[i] = aDamp*(aRelax*qDdot[i] + (scalar(1) - aRelax)*qDdotPrev[i]);
+    }
+}
+
+
 MotionSpec readMotionSpec(const std::string& dictPath)
 {
     // A DEDICATED READER, and not FoamDict, for one reason: the joint chain is a LIST OF
@@ -258,6 +300,7 @@ MotionSpec readMotionSpec(const std::string& dictPath)
     std::vector<JointType> joints;
     SpatialTransform bodyXT;
     bool haveBody = false;
+    bool haveSolver = false;
 
     // inside rigidBodyMotionCoeffs
     label depth = 1;
@@ -347,6 +390,87 @@ MotionSpec readMotionSpec(const std::string& dictPath)
             depth += 2;
             continue;
         }
+        if (key == "solver")
+        {
+            // DESCENDED INTO, not skipped: it names the integrator and may set gamma and beta.
+            ts.expect("{");
+            std::string type;
+            scalar gamma = scalar(0.5);
+            scalar betaEntry = scalar(0.25);
+            while (!ts.eof() && ts.peek() != "}")
+            {
+                const std::string k = ts.next();
+                if (k == "type")       { type = ts.next(); }
+                else if (k == "gamma") { gamma = ts.nextScalar(); }
+                else if (k == "beta")  { betaEntry = ts.nextScalar(); }
+                else if (ts.peek() != "}") { ts.next(); }
+                if (ts.peek() == ";") ts.next();
+            }
+            ts.expect("}");
+            if (ts.peek() == ";") ts.next();
+            if (type != "Newmark")
+            {
+                throw std::runtime_error(
+                    "brae RBD::readMotionSpec: the rigid-body solver `" + type + "` is not ported. "
+                    "Only Newmark is: `symplectic` half-steps the velocity with the PREVIOUS step's "
+                    "deltaT and `CrankNicolson` carries its own off-centring, and neither is the same "
+                    "integrator.");
+            }
+            spec.newmark = newmarkCoeffs(gamma, betaEntry);
+            haveSolver = true;
+            continue;
+        }
+        if (key == "accelerationRelaxation")
+        {
+            // a Function1: a bare constant, or the `table ( (t v) ... )` the tutorial writes
+            if (ts.peek() == "table")
+            {
+                ts.next();
+                ts.expect("(");
+                std::vector<std::pair<scalar, scalar>> pts;
+                while (!ts.eof() && ts.peek() != ")")
+                {
+                    ts.expect("(");
+                    const scalar tt = ts.nextScalar();
+                    const scalar vv = ts.nextScalar();
+                    ts.expect(")");
+                    pts.emplace_back(tt, vv);
+                }
+                ts.expect(")");
+                spec.accelerationRelaxation = Function1::table(std::move(pts));
+            }
+            else
+            {
+                if (ts.peek() == "constant") ts.next();
+                spec.accelerationRelaxation = Function1::constant(ts.nextScalar());
+            }
+            if (ts.peek() == ";") ts.next();
+            continue;
+        }
+        if (key == "accelerationDamping")
+        {
+            spec.accelerationDamping = ts.nextScalar();
+            if (ts.peek() == ";") ts.next();
+            continue;
+        }
+        if (key == "report")
+        {
+            const std::string v = ts.next();
+            spec.report = (v == "on" || v == "yes" || v == "true" || v == "1");
+            if (ts.peek() == ";") ts.next();
+            continue;
+        }
+        if (key == "ramp" || key == "cOfGdisplacement" || key == "bodyIdCofG" || key == "test"
+         || key == "nIter" || key == "restraints")
+        {
+            throw std::runtime_error(
+                "brae RBD::readMotionSpec: `" + key + "` is set in " + dictPath + ", and this port "
+                "does not carry it. `ramp` scales BOTH gravity and the fluid spatial force; "
+                "`cOfGdisplacement` accumulates the body's travel into a registered field; `test` "
+                "runs the dynamics with no fluid force at all; `nIter` iterates the force and the "
+                "relaxation within one mesh update; `restraints` add their own forces inside the "
+                "solver. Each changes the answer and none is ported.");
+        }
         if (key == "joint")
         {
             // DESCENDED INTO, not skipped: the composite's `joints` list is inside it
@@ -370,6 +494,17 @@ MotionSpec readMotionSpec(const std::string& dictPath)
     if (!haveBody)
     {
         throw std::runtime_error("brae RBD::readMotionSpec: " + dictPath + " names no body.");
+    }
+    if (!haveSolver)
+    {
+        throw std::runtime_error(
+            "brae RBD::readMotionSpec: " + dictPath + " names no `solver`. OpenFOAM's default is "
+            "`Newmark` (rigidBodySolver::New), but an unstated integrator is a choice this port will "
+            "not make for a case.");
+    }
+    if (spec.accelerationRelaxation.empty())
+    {
+        spec.accelerationRelaxation = Function1::constant(scalar(1));
     }
     if (joints.empty())
     {

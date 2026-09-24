@@ -33,8 +33,10 @@
 // through Py with the body's `transform`, then jointBody -> the body through Ry with the identity.
 // Reading it as a single body with two degrees of freedom gives a different X0 and a different mesh.
 #include "cf_types.cuh"
+#include "function1.cuh"
 #include "fv_patch.cuh"
 #include "primitive_mesh.cuh"
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -92,7 +94,58 @@ struct Model
         const std::vector<vector>& points0) const;
 };
 
-// The one body of a `rigidBodyMotionCoeffs` dictionary, its joint chain and its two mesh distances.
+// rigidBodyModelState (rigidBodyModelState.H:63-81): the joint position, velocity and acceleration,
+// and the clock the state was integrated to. `deltaT` is the step that REACHED this state, which is
+// the previous step's when it is read as `motionState0_`.
+struct ModelState
+{
+    std::vector<scalar> q;
+    std::vector<scalar> qDot;
+    std::vector<scalar> qDdot;
+    // rigidBodyModelState.C:46-71 -- every entry is optional and these are its defaults
+    scalar t = -1;
+    scalar deltaT = 0;
+};
+
+// Newmark (rigidBodySolvers/Newmark/Newmark.C:56-64). `beta` is CLAMPED FROM BELOW by gamma, which is
+// what makes the scheme unconditionally stable; the dictionary's beta is a floor, not the value.
+struct NewmarkCoeffs
+{
+    scalar gamma = scalar(0.5);
+    scalar beta = scalar(0.25);
+};
+
+inline NewmarkCoeffs newmarkCoeffs(scalar gamma, scalar betaEntry)
+{
+    NewmarkCoeffs c;
+    c.gamma = gamma;
+    const scalar g = gamma + scalar(0.5);
+    c.beta = std::fmax(scalar(0.25)*g*g, betaEntry);
+    return c;
+}
+
+// Newmark.C:86-104. BOTH updates read qDdot at the new state AND at the old one -- and `s0` is the
+// state at the START OF THE TIME STEP, not the previous corrector's, so re-solving within a step is
+// an iteration and not a sub-step. At the defaults gamma 0.5 / beta 0.25 the two weights of each pair
+// are equal, so this case cannot tell them apart; the gate's `gamma 0.9` arm can.
+void newmarkSolve(
+    const ModelState&    s0,
+    const NewmarkCoeffs& c,
+    ModelState&          s);
+
+// rigidBodyMotion::forwardDynamics (rigidBodyMotion.C:150-170): the acceleration the dynamics just
+// produced is relaxed IN PLACE against the one the state carried at entry -- which is the PREVIOUS
+// CORRECTOR's relaxed value, not the start-of-step one. Measured on floatingObject: with
+// accelerationRelaxation 0.7 the written qDdot is 0.7 of the value an otherwise identical run with 1.0
+// leaves, to a relative difference of 0.
+void relaxAcceleration(
+    std::vector<scalar>&       qDdot,
+    const std::vector<scalar>& qDdotPrev,
+    scalar                     aRelax,
+    scalar                     aDamp);
+
+// The one body of a `rigidBodyMotionCoeffs` dictionary, its joint chain, its two mesh distances and
+// the solver that integrates it.
 struct MotionSpec
 {
     Model model;
@@ -100,6 +153,16 @@ struct MotionSpec
     std::vector<std::string> patches;
     scalar innerDistance = 0;
     scalar outerDistance = 0;
+    // `solver { type Newmark; gamma; beta; }` -- the only integrator ported; the others are refused
+    // by name where the dictionary is read.
+    NewmarkCoeffs newmark;
+    // rigidBodyMotion.C:80-82 -- `accelerationRelaxation` (default 1) and `accelerationDamping`
+    // (default 1). The tutorial writes the first as a table that is ZERO until t = 4, which is why a
+    // gate that ran the shipped case would be measuring a body that never moves.
+    Function1 accelerationRelaxation;
+    scalar accelerationDamping = 1;
+    // `report` -- the status block the log carries, which is the cheapest oracle for a body's state
+    bool report = false;
 };
 
 // pointConstraints::constrainDisplacement, which rigidBodyMeshMotion::solve runs on the displacement
