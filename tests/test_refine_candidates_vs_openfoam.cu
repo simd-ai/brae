@@ -45,8 +45,9 @@ void check(const char* what, bool ok)
 struct Dump
 {
     std::vector<scalar> cellToPoint, error, maxPointField, maxCellField;
-    std::vector<label>  candidate, consistent, selected;
-    std::vector<label>  cellLevel;
+    std::vector<label>  candidate, consistent, selected, protectedCells;
+    std::vector<label>  cellLevel, pointLevel, nFacesOfCell;
+    std::vector<label>  extended1, extended2;
     label nCells = -1, nPoints = -1, nCandidates = -1;
     label nConsistent = -1, nSelected = -1, nProtectedCells = -1;
     label maxCells = -1, maxRefinement = -1, nTotalCells = -1;
@@ -81,6 +82,30 @@ Dump readDump(const std::string& path)
         else if (tag == "maxCellField")  indexed(d.maxCellField);
         else if (tag == "candidate")     { label c = 0; is >> c; d.candidate.push_back(c); }
         else if (tag == "consistent")    { label c = 0; is >> c; d.consistent.push_back(c); }
+        else if (tag == "protected")     { label c = 0; is >> c; d.protectedCells.push_back(c); }
+        else if (tag == "extended")
+        {
+            label n = 0, c = 0;
+            is >> n >> c;
+            if (n == 1) d.extended1.push_back(c);
+            else if (n == 2) d.extended2.push_back(c);
+        }
+        else if (tag == "pointLevel")
+        {
+            label i = 0, v = 0;
+            is >> i >> v;
+            if (static_cast<std::size_t>(i) >= d.pointLevel.size())
+                d.pointLevel.resize(static_cast<std::size_t>(i) + 1);
+            d.pointLevel[static_cast<std::size_t>(i)] = v;
+        }
+        else if (tag == "nFacesOfCell")
+        {
+            label i = 0, v = 0;
+            is >> i >> v;
+            if (static_cast<std::size_t>(i) >= d.nFacesOfCell.size())
+                d.nFacesOfCell.resize(static_cast<std::size_t>(i) + 1);
+            d.nFacesOfCell[static_cast<std::size_t>(i)] = v;
+        }
         else if (tag == "selected")      { label c = 0; is >> c; d.selected.push_back(c); }
         else if (tag == "cellLevel")
         {
@@ -289,7 +314,13 @@ int main(int argc, char** argv)
             std::printf("  (no protected cells on this mesh, so the protected-cell path is NOT "
                         "discriminated by this arm)\n");
         }
-        const std::vector<char> noProtected;
+        // THE PROTECTED SET selectRefineCells is given is `protectedCell_`, as init() computed it --
+        // not an empty list. Passing an empty one here made this block pass on every all-hex arm and
+        // fail only on the wedge, which is precisely what the wedge fixture exists for.
+        const std::vector<char> protectedSet =
+            of.pointLevel.empty()
+          ? std::vector<char>()
+          : dynamicRefine::initProtectedCells(of.cellLevel, of.pointLevel, pcCells, cells, m, patches);
 
         // the closure on the RAW candidate set, with the budget out of the way
         std::vector<label> candList;
@@ -310,7 +341,7 @@ int main(int argc, char** argv)
         // ...and the whole selection
         const std::vector<label> mineSelected =
             dynamicRefine::selectRefineCells(of.maxCells, of.maxRefinement, aCells.candidate,
-                                             of.cellLevel, noProtected, of.nTotalCells, m, patches);
+                                             of.cellLevel, protectedSet, of.nTotalCells, m, patches);
         std::printf("  selectRefineCells: brae %zu, OpenFOAM %d (maxCells %d, maxRefinement %d, "
                     "budget %d)\n",
                     mineSelected.size(), (int)of.nSelected, (int)of.maxCells, (int)of.maxRefinement,
@@ -341,11 +372,131 @@ int main(int argc, char** argv)
         // CONTROL: the level cap. Raising maxRefinement can only admit more cells, never fewer.
         const std::vector<label> higherCap =
             dynamicRefine::selectRefineCells(of.maxCells, of.maxRefinement + 1, aCells.candidate,
-                                             of.cellLevel, noProtected, of.nTotalCells, m, patches);
+                                             of.cellLevel, protectedSet, of.nTotalCells, m, patches);
         std::printf("  CONTROL: maxRefinement %d instead of %d selects %zu instead of %zu\n",
                     (int)of.maxRefinement + 1, (int)of.maxRefinement, higherCap.size(),
                     mineSelected.size());
         check("...and the cap only ever removes cells", higherCap.size() >= mineSelected.size());
+    }
+
+    // UNIT 3: the buffer-layer dilation, and the cells refinement must not touch.
+    if (!of.extended1.empty() || !of.extended2.empty())
+    {
+        // ONE layer, then TWO, each against OpenFOAM's own. The dilation is cell-face-cell, so a port
+        // that walked points instead would be right on a structured hex mesh's interior and wrong at
+        // every diagonal -- which is most of a refined mesh.
+        for (int layers = 1; layers <= 2; ++layers)
+        {
+            const std::vector<label>& ofExt = (layers == 1) ? of.extended1 : of.extended2;
+            if (ofExt.empty()) continue;
+            std::vector<char> mine = aCells.candidate;
+            for (int i = 0; i < layers; ++i)
+            {
+                dynamicRefine::extendMarkedCells(m, patches, cells, mine);
+            }
+            std::vector<label> mineList;
+            for (std::size_t c = 0; c < mine.size(); ++c)
+            {
+                if (mine[c]) mineList.push_back(static_cast<label>(c));
+            }
+            std::printf("  buffer layers x%d: brae %zu cells, OpenFOAM %zu (from %zu candidates)\n",
+                        layers, mineList.size(), ofExt.size(), aCells.nCandidates);
+            check(layers == 1 ? "brae's one-layer buffer is OpenFOAM's, cell for cell"
+                              : "...and its two-layer buffer",
+                  mineList == ofExt);
+            const std::size_t before = (layers == 1) ? aCells.nCandidates : of.extended1.size();
+            if (before < static_cast<std::size_t>(nCells))
+            {
+                check(layers == 1 ? "...and it actually grew the set, so the dilation is measured"
+                                  : "...and the second layer grew it again",
+                      ofExt.size() > before);
+            }
+            else
+            {
+                // the `budget` arm makes EVERY cell a candidate, so there is nothing left to dilate
+                // into and this arm cannot witness the growth
+                std::printf("  (every cell is already marked, so the dilation has nowhere to grow "
+                            "and this arm cannot witness it)\n");
+            }
+        }
+
+        // CONTROL: the dilation must be MONOTONE -- two layers contain one layer contains the
+        // candidates. A port that rebuilt the marker instead of extending it would break this while
+        // still producing a plausible count.
+        if (!of.extended1.empty() && !of.extended2.empty())
+        {
+            std::vector<char> two(static_cast<std::size_t>(nCells), 0);
+            for (const label c : of.extended2) two[static_cast<std::size_t>(c)] = 1;
+            bool nested = true;
+            for (const label c : of.extended1)
+            {
+                nested = nested && (two[static_cast<std::size_t>(c)] != 0);
+            }
+            for (std::size_t c = 0; c < aCells.candidate.size(); ++c)
+            {
+                nested = nested && (!aCells.candidate[c] || two[c]);
+            }
+            check("CONTROL: the buffers nest -- candidates inside one layer inside two", nested);
+        }
+    }
+
+    // THE PROTECTED CELLS: brae's whole init() scan against the set OpenFOAM detected.
+    if (!of.pointLevel.empty())
+    {
+        check("the oracle printed a point level per point",
+              of.pointLevel.size() == static_cast<std::size_t>(nPoints));
+        const std::vector<char> mine =
+            dynamicRefine::initProtectedCells(of.cellLevel, of.pointLevel, pcCells, cells, m, patches);
+        std::vector<label> mineList;
+        for (std::size_t c = 0; c < mine.size(); ++c)
+        {
+            if (mine[c]) mineList.push_back(static_cast<label>(c));
+        }
+        const std::size_t nProt = of.protectedCells.size();
+        std::printf("  protected cells: brae %zu, OpenFOAM %zu (it printed %d)\n",
+                    mineList.size(), nProt, (int)of.nProtectedCells);
+        check("OpenFOAM's protected list is the length it printed",
+              of.nProtectedCells < 0 || nProt == static_cast<std::size_t>(of.nProtectedCells));
+        check("brae's init scan finds exactly OpenFOAM's protected cells", mineList == of.protectedCells);
+        // ...and the SENTINEL: OpenFOAM clears the marker to size ZERO when nothing is protected, and
+        // four other sites read that size rather than the bits. A port that returned a zeroed array
+        // of the mesh's size would take the wrong branch in all four.
+        check("...and an empty result is EMPTY, not a zeroed array of the mesh's size",
+              nProt != 0 || mine.empty());
+
+        if (nProt == 0)
+        {
+            std::printf("  (every cell here is a hex with eight anchor points and six quad faces, so "
+                        "the protected path is NOT discriminated by this arm)\n");
+        }
+        else
+        {
+            // the 2:1 cascade selectRefineCells applies internally
+            const std::vector<char> cascade =
+                dynamicRefine::calculateProtectedCells(mine, of.cellLevel, m, patches);
+            std::size_t nCascade = 0;
+            for (const char c : cascade) nCascade += (c != 0);
+            std::printf("  ...and the 2:1 cascade of them reaches %zu cells\n", nCascade);
+            check("the cascade never shrinks the protected set", nCascade >= nProt);
+
+            // CONTROL: the `less than hex` pass alone. On a mesh whose only non-hexes are prisms it
+            // is what finds them, and dropping it must lose cells -- if it does not, this fixture is
+            // protecting cells for some other reason and the arm is not measuring what it says.
+            std::size_t nFewFaces = 0, nManyFaces = 0;
+            for (std::size_t c = 0; c < cells.size(); ++c)
+            {
+                if (cells[c].size() < 6) ++nFewFaces;
+                else if (cells[c].size() > 6) ++nManyFaces;
+            }
+            std::printf("  CONTROL: %zu cells have fewer than six faces, %zu have more\n",
+                        nFewFaces, nManyFaces);
+            // The two fixtures protect cells for DIFFERENT reasons and the gate says which: a prism
+            // trips the `< 6 faces` pass, a split hex trips the >4-anchor FACE pass and the under-8
+            // anchor count. If neither kind of cell is present the protected set came from somewhere
+            // this arm is not describing.
+            check("...and the mesh carries the non-hex cells that explain it",
+                  nFewFaces > 0 || nManyFaces > 0);
+        }
     }
 
     // CONTROL 1: the band edge. `error` writes an exact edge as 0 (`>= 0`) and selectRefineCandidates

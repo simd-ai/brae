@@ -11,6 +11,12 @@
         maxCellField(vFld)                     dynamicRefineFvMesh.C:736-751
         selectRefineCandidates(...)            dynamicRefineFvMesh.C:795-827
 
+    ...plus the PROTECTED CELLS path, which is not a field operation at all: the
+    scan init() runs once over the two level arrays and the mesh's own faces
+    (dynamicRefineFvMesh.C:1103-1268, checkEightAnchorPoints :1039-1079), and
+    the cell-face-cell dilation the buffer layers use (extendMarkedCells,
+    :1005-1036).
+
     None of these is a private static: they are PROTECTED const member functions
     of dynamicRefineFvMesh (dynamicRefineFvMesh.H:145-166). So this instrument
     does not transcribe them -- it derives a mesh class from dynamicRefineFvMesh
@@ -47,6 +53,12 @@
         [brae] maxCellField  <pointi> <value>
         [brae] candidate     <celli>
         [brae] nCandidates <n>
+        [brae] pointLevel   <pointi> <level>
+        [brae] nFacesOfCell <celli> <nFaces>
+        [brae] protected    <celli>
+        [brae] extended     <nBufferLayers> <celli>
+        [brae] nExtended    <nBufferLayers> <count>
+        [brae] nProtectedCells <n>
         [brae] END
 \*---------------------------------------------------------------------------*/
 
@@ -85,6 +97,7 @@ public:
 
     using dynamicRefineFvMesh::cellToPoint;
     using dynamicRefineFvMesh::error;
+    using dynamicRefineFvMesh::extendMarkedCells;
     using dynamicRefineFvMesh::maxCellField;
     using dynamicRefineFvMesh::maxPointField;
     using dynamicRefineFvMesh::selectRefineCandidates;
@@ -294,6 +307,64 @@ int main(int argc, char *argv[])
             Info<< "[brae] selected " << selected[i] << nl;
         }
         Info<< "[brae] nSelected " << selected.size() << nl;
+    }
+
+    // UNIT 3: the PROTECTED CELLS path. protectedCell_ is filled once, by
+    // init()'s scan (dynamicRefineFvMesh.C:1103-1268), from the two level
+    // arrays and the mesh's own face/point counts -- no field is involved --
+    // and the buffer layers are a separate cell-face-cell dilation
+    // (extendMarkedCells, :1005-1036).
+    {
+        // Half of every anchor-point test (:1119-1150, checkEightAnchorPoints
+        // :1039-1079): a point anchors a cell when its level is <= that cell's
+        // level, so a port needs pointLevel next to the cellLevel above.
+        const labelList& pointLevel = mesh.meshCutter().pointLevel();
+        forAll(pointLevel, pointi)
+        {
+            Info<< "[brae] pointLevel " << pointi << ' '
+                << pointLevel[pointi] << nl;
+        }
+
+        // What the "less than hex" test reads (:1216-1236): fewer than 6 faces
+        // protects the cell outright. It is also the cheapest thing that tells
+        // a port which cells are not hexes, which is the whole discriminator
+        // between a fixture with protected cells and one without.
+        forAll(mesh.cells(), celli)
+        {
+            Info<< "[brae] nFacesOfCell " << celli << ' '
+                << mesh.cells()[celli].size() << nl;
+        }
+
+        // protectedCell_ as init() left it. It is CLEARED when nothing is
+        // protected (:1243-1246), so an all-hex mesh prints no row here and
+        // nProtectedCells 0 below -- the two must be read together.
+        for (const label celli : mesh.protectedCell())
+        {
+            Info<< "[brae] protected " << celli << nl;
+        }
+
+        // The dilation, printed per layer count, because update() applies it
+        // nBufferLayers times in succession (:1415-1418) and a port has to
+        // match each dilation separately and not only the last. The function
+        // MUTATES its argument, so every count starts from a fresh copy of the
+        // candidate set.
+        for (label nLayers = 1; nLayers <= 2; ++nLayers)
+        {
+            bitSet extendedCell(candidateCell);
+
+            for (label layeri = 0; layeri < nLayers; ++layeri)
+            {
+                mesh.extendMarkedCells(extendedCell);
+            }
+
+            for (const label celli : extendedCell)
+            {
+                Info<< "[brae] extended " << nLayers << ' ' << celli << nl;
+            }
+
+            Info<< "[brae] nExtended " << nLayers << ' '
+                << extendedCell.count() << nl;
+        }
     }
 
     // The levels the next unit will need, and the only thing on this mesh that

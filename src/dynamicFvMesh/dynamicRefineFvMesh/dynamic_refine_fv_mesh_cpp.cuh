@@ -133,8 +133,9 @@ std::vector<label> consistentRefinement(
 //     comment there is "Sort by error? For now just truncate."
 // Then hexRef8's 2:1 closure with maxSet TRUE, which can ADD cells and so overshoot `maxCells` again.
 //
-// `protectedCell` is empty where no cell is protected, and OpenFOAM's bitSet reads out of range as
-// false, so an empty list here means nothing is protected -- it is not an error.
+// `protectedCell` is the RAW protected set (dynamicRefineFvMesh's `protectedCell_`), not the cascade:
+// this calls calculateProtectedCells on it itself, as OpenFOAM does at :845. Empty means nothing is
+// protected and is not an error.
 std::vector<label> selectRefineCells(
     label                                  maxCells,
     label                                  maxRefinement,
@@ -142,6 +143,87 @@ std::vector<label> selectRefineCells(
     const std::vector<label>&              cellLevel,
     const std::vector<char>&               protectedCell,
     label                                  nTotalCells,
+    const PrimitiveMesh&                   m,
+    const std::vector<FvPatch>&            patches);
+
+// ---------------------------------------------------------------------------------------------
+// UNIT 3: the cells refinement must not touch, and the buffer that keeps unrefinement away from the
+// cells it will. Still a fixed mesh.
+//
+// OF v2412: src/dynamicFvMesh/dynamicRefineFvMesh/dynamicRefineFvMesh.C
+//   extendMarkedCells        :1005-1036
+//   checkEightAnchorPoints   :1039-1079
+//   calculateProtectedCells  :52-163
+
+// :1005-1036. ONE face-layer dilation: cell -> its own faces -> owner and neighbour of those faces.
+// Cell-face-cell, NOT point or edge connectivity, and `nBufferLayers` of them is `nBufferLayers`
+// calls. It marks IN PLACE and never clears.
+//
+// What it is FOR is easy to get backwards: it does not widen the refinement band. It widens the set
+// of cells that block UNREFINEMENT (dynamicRefineFvMesh.C:1414-1419, then the marked-cell veto in
+// selectUnrefinePoints), so it is hysteresis.
+//
+// REFUSES a coupled patch: OpenFOAM ORs the face marks across cyclic and processor pairs
+// (syncTools::syncFaceList, :1018) and brae has no sync here.
+void extendMarkedCells(
+    const PrimitiveMesh&                   m,
+    const std::vector<FvPatch>&            patches,
+    const std::vector<std::vector<label>>& cells,
+    std::vector<char>&                     markedCell);
+
+// dynamicRefineFvMesh::init's own scan (:1110-1248), the thing that FILLS protectedCell_. Four passes,
+// cumulative and monotone -- nothing here ever clears a bit -- and then one sentinel:
+//
+//   a  :1131-1150  a cell with MORE THAN 8 points at pointLevel <= its cellLevel. The guard
+//                  `!protected[c]` is OUTER, wrapping the level test itself, and the increment comes
+//                  BEFORE the `> 8`, so the counter reaches 9 on the point that protects the cell.
+//   b  :1158-1217  a FACE with more than 4 points at max(ownLevel, neiLevel) protects BOTH its cells
+//                  (only the owner on a boundary face). The `faceLevel` here is a local max, NOT
+//                  hexRef8::faceLevel(), which is a different quantity with the same name.
+//   c  :1220-1239  a cell with FEWER than 6 faces, or any face of fewer than 4 points -- pure
+//                  topology, no levels read at all. This is the one a prism trips.
+//   d  :1242       checkEightAnchorPoints, the only pass that catches the UNDER-8 cells.
+//
+// ...and then :1245-1248: if nothing was set, the marker is CLEARED TO SIZE ZERO, not left as an
+// array of falses. That size is the sentinel `calculateProtectedCells` (:57) and three other sites
+// read, so returning a zeroed nCells array here would take the wrong branch in all four.
+//
+// REFUSES a coupled patch: pass b swaps face levels and ORs the face marks across pairs (:1169,
+// :1201), and those are NOT no-ops in serial when the mesh has cyclics.
+std::vector<char> initProtectedCells(
+    const std::vector<label>&              cellLevel,
+    const std::vector<label>&              pointLevel,
+    const std::vector<std::vector<label>>& pointCells,
+    const std::vector<std::vector<label>>& cells,
+    const PrimitiveMesh&                   m,
+    const std::vector<FvPatch>&            patches);
+
+// :1039-1079. Counts each cell's ANCHOR points -- points whose level is at or below the cell's -- and
+// protects every cell that does not have exactly eight. The two `if`s inside are ordered: the `== 8`
+// protect test runs BEFORE the increment, so it is the NINTH anchor that protects a cell and the
+// count then freezes at 8. The final pass is an index loop over every cell, not over the marked ones.
+//
+// Only ever sets; never clears.
+void checkEightAnchorPoints(
+    const std::vector<label>&              cellLevel,
+    const std::vector<label>&              pointLevel,
+    const std::vector<std::vector<label>>& pointCells,
+    label                                  nCells,
+    std::vector<char>&                     protectedCell);
+
+// :52-163. The 2:1 cascade closure of the protected set: a protected cell cannot be refined, so any
+// FINER neighbour of one cannot be either, and that propagates to a fixed point. Both level tests are
+// STRICT and both compare the other side against the protected side.
+//
+// An EMPTY `protectedCell` returns an empty result rather than a cleared array of the mesh's size --
+// OpenFOAM's `unrefineableCell.clear()` leaves a bitSet of size 0, and every `test()` on it reads
+// false, which is what makes `selectRefineCells` exclude nothing.
+//
+// REFUSES a coupled patch: the boundary half needs OpenFOAM's level swap (:74) and its face sync
+// (:125).
+std::vector<char> calculateProtectedCells(
+    const std::vector<char>&               protectedCell,
+    const std::vector<label>&              cellLevel,
     const PrimitiveMesh&                   m,
     const std::vector<FvPatch>&            patches);
 

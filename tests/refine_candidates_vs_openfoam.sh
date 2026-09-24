@@ -40,6 +40,23 @@
 # VoF field whose values are mostly exactly 0 and exactly 1 the two orders can agree bitwise, and the
 # binary SAYS SO rather than claiming the arm discriminated an ordering it could not see.
 #
+# WHAT THE PROTECTED-CELL ARMS DO AND DO NOT ISOLATE, measured with five separate defects rather
+# than argued. brae reproduces OpenFOAM's protected sets exactly on both fixtures -- 8 on the wedge,
+# 1,886 on the split hex -- but init()'s four passes are REDUNDANT on them: every protected cell there
+# is caught by at least two, so removing any ONE changes nothing and the gate stays green.
+#   * `cells[c].size() < 6` weakened to `< 5`            -> green (the same pass's `face < 4 points`
+#                                                           else-branch catches the prisms instead)
+#   * the face-anchor pass removed entirely               -> green (pass a's `> 8` catches the same cells)
+#   * checkEightAnchorPoints' `!= 8` weakened to `> 8`    -> green (pass a catches them)
+#   * the face-anchor threshold `> 4` raised to `> 5`     -> green (those faces carry 9 anchors)
+# What IS caught, and so what these arms measure: the ANCHOR TEST ITSELF and the composition --
+# `pointLevel <= cellLevel` made strict reads 40 protected against 8 on the wedge and 17,080 against
+# 1,886 on the split hex, and fails selectRefineCells with it. Isolating the four passes needs a
+# fixture where each is the only one that fires, and no OpenFOAM tutorial mesh here provides one.
+#
+# THE BUFFER DILATION IS independently discriminated: setting only the owner on an internal face reads
+# 7,815 cells against OpenFOAM's 11,981 on the split hex and fails both layers on the wedge too.
+#
 # NOT DISCRIMINATED by this gate, each stated rather than implied: the 2:1 consistency closure, the
 # cellLevel cap, protected cells, the buffer layers, unrefinement, and the mesh change itself. None of
 # it is ported and all of it is still refused.
@@ -108,16 +125,24 @@ grep -q "^Selected 374 cells for refinement out of 4032." "$C/log.interFoam" \
 echo "OpenFOAM ran 5 steps and refined: $(grep -c '^Refined from' "$C/log.interFoam") refinements"
 
 rc=0
-# arm <name> <time> <mesh dir> [extra oracle options...]
+# armIn <name> <case dir> <time> <mesh dir> [extra oracle options...]
+armIn()
+{
+    local name="$1" case="$2" t="$3" meshDir="$4"
+    shift 4
+    local dump="$W/dump.$name.txt"
+    ( cd "$case" && dumpRefineCandidates -case "$case" -time "$t" "$@" > "$dump" 2>&1 ) \
+        || { echo "FAIL: dumpRefineCandidates [$name]"; tail -20 "$dump"; rc=1; return; }
+    echo "--- $name (t = $t)${*:+ [$*]}"
+    "$BIN" "$case" "$case/$meshDir" "$case/$t" "$dump" || rc=1
+}
+
+# arm <name> <time> <mesh dir> [extra oracle options...] -- on the damBreak case
 arm()
 {
     local name="$1" t="$2" meshDir="$3"
     shift 3
-    local dump="$W/dump.$name.txt"
-    ( cd "$C" && dumpRefineCandidates -case "$C" -time "$t" "$@" > "$dump" 2>&1 ) \
-        || { echo "FAIL: dumpRefineCandidates [$name]"; tail -20 "$dump"; rc=1; return; }
-    echo "--- $name (t = $t)${*:+ [$*]}"
-    "$BIN" "$C" "$C/$meshDir" "$C/$t" "$dump" || rc=1
+    armIn "$name" "$C" "$t" "$meshDir" "$@"
 }
 
 arm t0     0     constant/polyMesh
@@ -130,6 +155,135 @@ arm t0.002 0.002 0.002/polyMesh
 # ceiling and 3,658 with this one -- exactly the level-0 cells, because the branch takes WHOLE LEVELS
 # coarsest first and stops after the first one that carries it past the budget.
 arm budget 0.002 0.002/polyMesh -lower -1 -upper 2 -maxRefinement 3 -maxCells 17100
+
+
+# THE PROTECTED CELLS need a mesh that is not all hexes, and damBreakWithObstacle is. Two fixtures are
+# built here, and they cover different branches of init()'s scan:
+#
+#   wedge     a 2.5-degree axisymmetric wedge, 40 cells, whose innermost radial row collapses to
+#             PRISMS -- five faces, two of them triangles. `mergeType points` is what makes blockMesh
+#             merge the axis vertices; without it the axis cells stay collapsed hexes with zero-area
+#             faces and nothing is protected. MEASURED: 8 protected cells, exactly the 8 prisms, and
+#             OpenFOAM writes constant/polyMesh/sets/protectedCells.
+#             ...and it is the ONLY arm here where the protected set CHANGES THE ANSWER: two of its
+#             fourteen candidates are protected prisms, so OpenFOAM selects twelve. A port that
+#             computes protectedCell_ correctly but never feeds it through calculateProtectedCells
+#             into selectRefineCells passes every other arm and fails this one. That defect was real:
+#             selectRefineCells took the raw set until this fixture existed.
+#   splitHex  the refined 17,080-cell mesh with its cellLevel/pointLevel/refinementHistory/level0Edge
+#             files REMOVED, so every cell reads level 0 and a split hex stops being a legal refined
+#             hex: 1,886 protected, covering the >4-anchor FACE branch and its owner/neighbour
+#             propagation, which the wedge cannot reach.
+WC="$W/wedge"
+rm -rf "$WC"
+mkdir -p "$WC/system" "$WC/constant" "$WC/0"
+python3 - "$WC" <<'PYEOF' || { echo "FAIL: staging the wedge fixture"; exit 1; }
+import os, sys
+d = sys.argv[1]
+hdr = ("FoamFile\n{\n    version     2.0;\n    format      ascii;\n"
+       "    class       %s;\n    object      %s;\n}\n")
+# tan(2.5 deg) = 0.0436609. `mergeType points` is mandatory: without it the axis hexes stay
+# collapsed instead of becoming prisms, and nothing is protected.
+open(d + '/system/blockMeshDict', 'w').write(
+    hdr % ('dictionary', 'blockMeshDict') + """
+mergeType points;
+scale   1;
+vertices
+(
+    (0 0 0)
+    (1 0 0)
+    (0 1 -0.0436609)
+    (1 1 -0.0436609)
+    (0 1  0.0436609)
+    (1 1  0.0436609)
+);
+blocks
+(
+    hex (0 1 3 2 0 1 5 4) (8 5 1) simpleGrading (1 1 1)
+);
+edges ();
+boundary
+(
+    inlet  { type patch; faces ((0 2 4 0)); }
+    outlet { type patch; faces ((1 3 5 1)); }
+    top    { type wall;  faces ((2 3 5 4)); }
+    front  { type wedge; faces ((0 1 5 4)); }
+    back   { type wedge; faces ((0 2 3 1)); }
+);
+mergePatchPairs ();
+""")
+open(d + '/system/controlDict', 'w').write(
+    hdr % ('dictionary', 'controlDict') + """
+application     interFoam;
+startFrom       startTime;
+startTime       0;
+stopAt          endTime;
+endTime         0;
+deltaT          1;
+writeControl    timeStep;
+writeInterval   1;
+writeFormat     ascii;
+writePrecision  18;
+""")
+open(d + '/system/fvSchemes', 'w').write(
+    hdr % ('dictionary', 'fvSchemes') + """
+ddtSchemes      { default Euler; }
+gradSchemes     { default Gauss linear; }
+divSchemes      { default none; }
+laplacianSchemes{ default Gauss linear corrected; }
+interpolationSchemes { default linear; }
+snGradSchemes   { default corrected; }
+""")
+open(d + '/system/fvSolution', 'w').write(hdr % ('dictionary', 'fvSolution') + "\nsolvers { }\n")
+open(d + '/constant/dynamicMeshDict', 'w').write(
+    hdr % ('dictionary', 'dynamicMeshDict') + """
+dynamicFvMesh   dynamicRefineFvMesh;
+refineInterval  1;
+field           alpha.water;
+lowerRefineLevel 0.001;
+upperRefineLevel 0.999;
+unrefineLevel   10;
+nBufferLayers   1;
+maxRefinement   2;
+maxCells        200000;
+correctFluxes ( (phi none) );
+dumpLevel       true;
+""")
+# a fixed pattern, chosen so the candidate set INTERSECTS the protected prisms
+vals = ['1' if (i < 24 and i % 8 < 4) else '0' for i in range(40)]
+open(d + '/0/alpha.water', 'w').write(
+    hdr % ('volScalarField', 'alpha.water')
+    + "\ndimensions      [0 0 0 0 0 0 0];\n\ninternalField   nonuniform List<scalar>\n40\n(\n"
+    + "\n".join(vals)
+    + "\n)\n;\n\nboundaryField\n{\n"
+    # a wedge PATCH demands a wedge patchFIELD -- zeroGradient there is a fatal, not a warning
+    + "    front { type wedge; }\n    back  { type wedge; }\n"
+    + "    \".*\"\n    {\n        type            zeroGradient;\n    }\n}\n")
+PYEOF
+( cd "$WC" && blockMesh > log.blockMesh 2>&1 ) \
+    || { echo "FAIL: blockMesh [wedge]"; tail -20 "$WC/log.blockMesh"; exit 1; }
+grep -q "prisms:" "$WC/log.blockMesh" 2>/dev/null || ( cd "$WC" && checkMesh > log.checkMesh 2>&1 || true )
+armIn wedge "$WC" 0 constant/polyMesh
+grep -q "^\[brae\] nProtectedCells 8$" "$W/dump.wedge.txt" \
+    || { echo "FAIL: the wedge fixture no longer protects 8 cells -- the mesh is not prisms"; rc=1; }
+[ -f "$WC/constant/polyMesh/sets/protectedCells" ] \
+    || { echo "FAIL: OpenFOAM wrote no protectedCells cellSet on the wedge"; rc=1; }
+
+SC="$W/splitHex"
+rm -rf "$SC"
+mkdir -p "$SC/constant/polyMesh" "$SC/system" "$SC/0"
+cp "$C/0.002/polyMesh/points" "$C/0.002/polyMesh/faces" "$C/0.002/polyMesh/owner" \
+   "$C/0.002/polyMesh/neighbour" "$C/0.002/polyMesh/boundary" "$SC/constant/polyMesh/" \
+    || { echo "FAIL: the refined mesh is not where splitHex expects it"; exit 1; }
+cp "$C/0.002/alpha.water" "$SC/0/alpha.water"
+cp "$WC/system/controlDict" "$WC/system/fvSchemes" "$WC/system/fvSolution" "$SC/system/"
+cp "$WC/constant/dynamicMeshDict" "$SC/constant/"
+# the level files are deliberately NOT copied: with them the split hexes are legal refined hexes and
+# nothing is protected (the same mesh at t = 0.002 reports 0), without them every cell reads level 0
+# and the nine-faced ones stop being hexes
+armIn splitHex "$SC" 0 constant/polyMesh
+grep -q "^\[brae\] nProtectedCells 1886$" "$W/dump.splitHex.txt" \
+    || { echo "FAIL: the splitHex fixture no longer protects 1886 cells"; rc=1; }
 
 echo "refine_candidates_vs_openfoam: rc $rc"
 exit $rc
