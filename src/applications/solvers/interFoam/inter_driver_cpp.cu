@@ -268,6 +268,35 @@ RunReport runInterFoam(
     DynamicMotionSolverFvMesh* dyn = f.dynamicMesh.get();
     if (dyn)
     {
+        // THE PERMEABLE-WALL PAIR ON A MOVING MESH, which this loop ran and got wrong. MEASURED on
+        // laminar/testTubeMixer, 20 fixed steps of 5e-4, its `walls` given
+        // permeableAlphaPressureInletOutletVelocity and prghPermeableAlphaTotalPressure: U 6.144e-02
+        // from OpenFOAM, p_rgh 9.451e-04, alpha 2.147e-04. THE CONTROL is the same case with the
+        // tutorial's own movingWallVelocity, where this loop reads U 2.715e-10, p_rgh 1.005e-12,
+        // alpha 2.730e-11 -- so it is the pair and not the moving mesh.
+        //
+        // prghPermeableAlphaTotalPressure reads the PATCH FLUX for the sign of its dynamic-pressure
+        // term (`-0.5*rhop*neg(phip)*magSqr(Up)`, prghPermeableAlphaTotalPressureFvPatchScalarField.C:
+        // 208-212), and on a moving mesh that flux is relative at some points of the step and absolute
+        // at others. Which state OpenFOAM's is in when constrainPressure calls updateCoeffs(snGradp)
+        // is what has to be established before either loop runs this. The device loop refuses it at
+        // its own site (inter_driver_device.cu); this arm is the host's, and it was missing.
+        for (std::size_t pi = 0; pi < patches.size() && pi < f.U.boundary.size(); ++pi)
+        {
+            const bool permeable = f.U.boundary[pi]->needsAlphaPatchValues()
+                                || f.p_rgh.boundary[pi]->needsAlphaPatchValues()
+                                || f.p_rgh.boundary[pi]->isPrghPermeableAlphaTotalPressure();
+            if (permeable)
+                throw std::runtime_error(
+                    "brae interFoam: patch `" + patches[pi].name + "` carries a permeable-wall condition "
+                    "(permeableAlphaPressureInletOutletVelocity or prghPermeableAlphaTotalPressure) and "
+                    "the mesh moves (" + dyn->motionType() + "). The pressure half reads the patch flux "
+                    "for the sign of its dynamic-pressure term, and on a moving mesh that flux is "
+                    "relative at some points of the step and absolute at others; this loop read the "
+                    "wrong one and left U 6.1e-02 from OpenFOAM on testTubeMixer, against 2.7e-10 for "
+                    "the same case with its own movingWallVelocity. Refused rather than run it. A "
+                    "static mesh runs, gated on laminar/damBreakPermeable.");
+        }
         if (!mutableMesh || !mutableMesh->m || !mutableMesh->g || !mutableMesh->patches)
         {
             throw std::runtime_error(

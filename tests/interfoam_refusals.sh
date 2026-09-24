@@ -282,6 +282,14 @@ BASE="$BM"
 # FatalError (ddt_cnSubCycles above holds that), so this arm sets 1 -- otherwise it reaches the
 # sub-cycle refusal and says nothing about the mesh.
 arm ddt_cnMoving            runs    -                         "" "$CNSET; sed -i 's/nAlphaSubCycles  *[0-9]*;/nAlphaSubCycles 1;/' system/fvSolution"
+PERMUW="python3 -c \"import re; p='0/U'; t=open(p).read(); t=re.sub(r'walls\\s*\\{[^}]*\\}', 'walls { type permeableAlphaPressureInletOutletVelocity; alpha alpha.water; alphaMin 0.01; value uniform (0 0 0); }', t, count=1); open(p,'w').write(t)\""
+PERMPW="python3 -c \"import re; p='0/p_rgh'; t=open(p).read(); t=re.sub(r'walls\\s*\\{[^}]*\\}', 'walls { type prghPermeableAlphaTotalPressure; alpha alpha.water; alphaMin 0.01; p uniform 0; value uniform 0; }', t, count=1); open(p,'w').write(t)\""
+# THE PERMEABLE-WALL PAIR ON A MOVING MESH, on the same base. The host loop RAN this and got it wrong:
+# MEASURED on testTubeMixer at 20 fixed steps of 5e-4, U 6.144e-02 from OpenFOAM, p_rgh 9.451e-04,
+# alpha 2.147e-04, where the same case with its own movingWallVelocity reads U 2.715e-10. The device
+# loop refused it already (device_permeable_moving, below); this is the host's arm, added with the
+# measurement that justifies it. The pair on a STATIC mesh runs -- permeable_runs, above.
+arm permeable_moving        refused "and the mesh moves"      "" "$PERMUW; $PERMPW"
 BASE="$BG"
 arm ddt_cnMangroves         refused "multiphaseMangrovesSource" "" "$CNSET"
 BASE="$B"
@@ -691,9 +699,7 @@ if [ $HAVE_GPU = 1 ]; then
     # ...and the PERMEABLE-WALL pair on it is refused, by name: the pressure half reads the flux as it
     # stands at constrainPressure, which on a moving mesh this loop makes relative at another point
     # than the host loop. On a static mesh the pair runs -- device_permeable, below, on the base case.
-    PERMUW="python3 -c \"import re; p='0/U'; t=open(p).read(); t=re.sub(r'walls\\s*\\{[^}]*\\}', 'walls { type permeableAlphaPressureInletOutletVelocity; alpha alpha.water; alphaMin 0.01; value uniform (0 0 0); }', t, count=1); open(p,'w').write(t)\""
-    PERMPW="python3 -c \"import re; p='0/p_rgh'; t=open(p).read(); t=re.sub(r'walls\\s*\\{[^}]*\\}', 'walls { type prghPermeableAlphaTotalPressure; alpha alpha.water; alphaMin 0.01; p uniform 0; value uniform 0; }', t, count=1); open(p,'w').write(t)\""
-    arm device_permeable_moving refused "and the mesh moves" "-device" "$PERMUW; $PERMPW"
+        arm device_permeable_moving refused "and the mesh moves" "-device" "$PERMUW; $PERMPW"
     BASE="$B"
     # a case that needs a pressure reference RUNS on the device now (gated on laminar/mixerVessel2D,
     # where every patch is a wall); this one keeps a pressure-driven atmosphere, which is what adjustPhi
