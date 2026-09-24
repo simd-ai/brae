@@ -1,0 +1,4 @@
+# Ledger for a function that must keep EXTERNAL linkage although it is defined in a .cuh.
+# One entry per line: <header basename> <function name>, with the reason above it. A stale entry
+# fails the audit, so this cannot rot into a suppression file. Empty today: every such definition
+# in the tree is inline, static, constexpr or a template.

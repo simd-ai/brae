@@ -70,7 +70,7 @@ namespace {
 //   faces where c is NEIGHBOUR  f = losort[k], k in [losortStart[c], losortStart[c+1])
 //                                                                      ->  -lower[f]*eps0[own[f]]
 // which is the same set of terms the scatter produced, just accumulated in a fixed sequence.
-__global__
+static __global__
 void svGatherKernel(
     int nC,
     const label* __restrict__ own,
@@ -101,7 +101,7 @@ void svGatherKernel(
     if (s != 0.0) source[c] += s;
 }
 // Zeroing pass: independent per face, no accumulation, so it needs no ordering guarantee of its own.
-__global__
+static __global__
 void svZeroFaceKernel(
     int nIf,
     const label* __restrict__ own,
@@ -116,7 +116,7 @@ void svZeroFaceKernel(
 }
 
 
-__global__
+static __global__
 void svBndKernel(
     int nB,
     const label* __restrict__ faceCell,
@@ -129,7 +129,7 @@ void svBndKernel(
 }
 
 
-__global__
+static __global__
 void svCellKernel(
     int nC,
     const label* __restrict__ isW,
@@ -140,6 +140,9 @@ void svCellKernel(
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c < nC && isW[c]) source[c] = relaxedDiag[c] * eps0[c];
 }
+// STATIC, like the two below and every kernel this header defines: twenty-four objects include it, and a
+// __global__ without internal linkage is a strong definition in each of them -- a duplicate the moment
+// two are linked together. tools/header_odr_audit.py asks this of every function defined in a .cuh.
 // shared turbulence-common kernels (effective diffusivity D + OF bound override); used by k/eps + k-omega.
 static __global__
 void depsKernel(int nC, const scalar* __restrict__ nut, scalar sigma, scalar nu, scalar* __restrict__ D)

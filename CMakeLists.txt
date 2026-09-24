@@ -844,6 +844,19 @@ add_test(NAME cache_key_audit
 add_test(NAME cache_key_audit_selftest
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/cache_key_audit_selftest.sh)
 
+# A function DEFINED in a .cuh without inline/static/constexpr is a strong symbol in every object that
+# includes the header, and the link fails the moment two of them are put together. `readSurfaceField`
+# was that for six translation units -- the ordinary build survived only because the archive handed out
+# one of them, while a localiser that pulled the other could not be linked at all.
+add_test(NAME header_odr_audit
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/header_odr_audit.py
+                 --allow ${CMAKE_CURRENT_SOURCE_DIR}/tools/header_odr_audit_allow.txt
+                 ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# ...and the proof that it names them: it restores both real defects in scratch copies, and checks that
+# a declaration, a braced default argument, a template and a class member are NOT reported.
+add_test(NAME header_odr_audit_selftest
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/header_odr_audit_selftest.sh)
+
 # gradBKernel's type-code branches, one patch per branch, against the host reference. Only two of them
 # had a fixture (symmetry, and the flux-conditional ones through waterChannel's oneCorrector profile);
 # the rest were held by whole-case gates, where `snGrad = the prescribed gradient` against

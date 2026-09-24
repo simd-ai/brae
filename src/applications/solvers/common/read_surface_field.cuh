@@ -24,7 +24,12 @@ namespace brae
 // length against nCells -- that check lives only in buildField, which we bypass). Values come from `calculated` patches;
 // zeros stand in for empty/cyclic/cyclicAMI/no-value patches (the ctor recomputes cyclic/AMI flux from U + skips them,
 // and an empty face flux is 0). Used only for a seamless restart (resume the exact written flux state).
-SurfaceScalarField readSurfaceField(const std::string& path, const std::vector<FvPatch>& patches, label nInternalFaces)
+// INLINE, because six translation units include this header and two of them -- interFoam's case
+// reader and simpleFoam's driver -- end up in the same binary. Without it each emits a strong
+// definition and the link fails the moment both objects are pulled (`multiple definition of
+// brae::readSurfaceField`); the ordinary build survives only because the archive hands out one of
+// them. tools/header_odr_audit.py asks this of every function defined in a .cuh.
+inline SurfaceScalarField readSurfaceField(const std::string& path, const std::vector<FvPatch>& patches, label nInternalFaces)
 {
     const FieldData<scalar> fd = readField<scalar>(path);
     SurfaceScalarField ssf;
