@@ -857,6 +857,12 @@ add_test(NAME header_odr_audit
 add_test(NAME header_odr_audit_selftest
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/header_odr_audit_selftest.sh)
 
+# ...and the default ledger's own keys: `Compressible` is defined in kEpsilonRef AND kOmegaSST with the
+# same field names, so a line keyed on the struct name alone exempted the field in both types and a
+# line stale in one was held alive by the other. The key carries the namespace now.
+add_test(NAME default_audit_selftest
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/default_audit_selftest.sh)
+
 # gradBKernel's type-code branches, one patch per branch, against the host reference. Only two of them
 # had a fixture (symmetry, and the flux-conditional ones through waterChannel's oneCorrector profile);
 # the rest were held by whole-case gates, where `snGrad = the prescribed gradient` against

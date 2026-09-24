@@ -45,6 +45,9 @@ def parse_structs(text):
     for f, s in text.items():
         for m in struct_re.finditer(s):
             name, body = m.group(1), re.sub(r'//.*', '', m.group(2))
+            # the innermost `namespace X {` opened before this struct and not yet closed
+            nsopen = [g.group(1) for g in re.finditer(r'\bnamespace\s+(\w+)\s*\{', s[:m.start()])]
+            defns = nsopen[-1] if nsopen else None
             fields = []
             for line in body.split('\n'):
                 line = line.strip()
@@ -64,7 +67,7 @@ def parse_structs(text):
                             continue
                         fields.append((nm, ('=' in decl) or fm.group(2) in '={'))
             if len(fields) >= 3 and any(d for _, d in fields):
-                out.setdefault(name, []).append((f, fields))
+                out.setdefault(name, []).append((f, fields, defns))
     return out
 
 
@@ -203,11 +206,17 @@ def in_builder(s, pos, name):
 def hand_built_sites(name, text, fillers, builders=None):
     """[(file, line, var, assigned fields)] where `Type var;` is followed by var.field = ... or by a
     call that hands var to a filler function."""
-    inst_re = re.compile(r'\b%s\s+(\w+)\s*(?:\{\s*\})?;' % re.escape(name))
+    # THE NAMESPACE THE SITE WROTE, when it wrote one. A NAME IS NOT A TYPE and the file it is
+    # defined in is not the discriminator either: `Compressible` is defined in kEpsilonRef and in
+    # kOmegaSST, both TUs include both headers, and the two structs have overlapping field sets -- so
+    # matching a site to a definition by "its fields fit" put the kOmegaSST site (`kOmegaSST::
+    # Compressible sstComp`) against the kEpsilonRef definition as well. Every site in this tree
+    # qualifies the type, which is what C++ itself uses to tell them apart, so the audit does too.
+    inst_re = re.compile(r'(?:(\w+)\s*::\s*)?\b%s\s+(\w+)\s*(?:\{\s*\})?;' % re.escape(name))
     sites = []
     for f, s in text.items():
         for m in inst_re.finditer(s):
-            var = m.group(1)
+            ns, var = m.group(1), m.group(2)
             window = enclosing_scope(s, m.end())
             assigned = set(re.findall(r'\b%s\.(\w+)\s*=(?!=)' % re.escape(var), window))
             assigned |= set(re.findall(r'\b%s\.(\w+)\s*\.(?:push_back|assign|resize)' % re.escape(var), window))
@@ -220,7 +229,7 @@ def hand_built_sites(name, text, fillers, builders=None):
                 if re.search(r'\b%s\s*=\s*%s\s*\(' % (re.escape(var), re.escape(fname)), window):
                     assigned |= fields
             if assigned and not in_builder(s, m.start(), name):
-                sites.append((f, s[:m.start()].count('\n') + 1, var, assigned))
+                sites.append((f, s[:m.start()].count('\n') + 1, var, assigned, ns))
     return sites
 
 
@@ -253,48 +262,66 @@ def main(argv):
 
     structs = parse_structs(text)
     unlisted = []
+    ambiguous = []
     evaluated = set()          # structs with >= 2 sites INSIDE this scan: the only ones whose ledger lines can be stale
     seen = set()
     for name, defs in sorted(structs.items()):
         all_sites = hand_built_sites(name, text, filler_functions(name, text),
                                      returning_builders(name, text))
-        for _, fields in defs:
+        # A NAME IS NOT A TYPE, and the LEDGER has to say which one. `Compressible` is defined in
+        # kEpsilonRef AND in kOmegaSST, and both structs carry alphat/Prt/rho/rhoBnd -- so "the site's
+        # fields fit this definition" matched the kOmegaSST site against the kEpsilonRef definition
+        # too, and one ledger line exempted the field in both. Where a name has more than one
+        # definition the key carries the NAMESPACE, which is what C++ uses and what every site in this
+        # tree writes: `kEpsilonRef::Compressible comp rho`. The bare form is reported, not matched.
+        qualify = len({ns for _, _, ns in defs if ns}) > 1
+        for deffile, fields, defns in defs:
+            qual = ("%s::%s" % (defns, name)) if (qualify and defns) else name
             fieldnames = {n for n, _ in fields}
             # only the sites that COULD be building this definition: one assigning a field the
             # definition does not have is building another type of the same name
-            sites = [s for s in all_sites if s[3] <= fieldnames]
+            sites = [s for s in all_sites if s[3] <= fieldnames
+                     and (not qualify or s[4] is None or s[4] == defns)]
             if len(sites) < 2:
                 continue
-            evaluated.add(name)
-            union = set().union(*[a for _, _, _, a in sites])
-            for f, line, var, assigned in sites:
+            evaluated.add(qual)
+            union = set().union(*[a for _, _, _, a, _ in sites])
+            for f, line, var, assigned, _ in sites:
                 for missing in sorted((union - assigned) & fieldnames):
-                    key = (name, var, missing)
+                    key = (qual, var, missing)
+                    if qualify and (name, var, missing) in allow:
+                        ambiguous.append((name, var, missing,
+                                          sorted({dn for _, _, dn in defs if dn})))
+                        used.add((name, var, missing))
                     # `<Struct> <var> *` covers EVERY field at that variable name. It is for a site
                     # that is not a controls object at all -- an out-parameter buffer a reader fills
                     # and the site copies a few fields out of -- where the reason is a property of the
                     # site, not of any one field, and listing sixty fields would bury it. Never use it
                     # on a real site.
-                    star = (name, var, '*')
+                    star = (qual, var, '*')
                     if key in allow:
                         used.add(key)
                     elif star in allow:
                         used.add(star)
-                    elif (name, os.path.relpath(f), line, var, missing) not in seen:
-                        seen.add((name, os.path.relpath(f), line, var, missing))
-                        unlisted.append((name, os.path.relpath(f), line, var, missing, len(sites)))
+                    elif (qual, os.path.relpath(f), line, var, missing) not in seen:
+                        seen.add((qual, os.path.relpath(f), line, var, missing))
+                        unlisted.append((qual, os.path.relpath(f), line, var, missing, len(sites)))
 
     for name, f, line, var, missing, n in unlisted:
-        print("UNLISTED  %-26s %s:%d  %-10s field `%s` set at another of the %d sites, not here"
+        print("UNLISTED  %-40s %s:%d  %-10s field `%s` set at another of the %d sites, not here"
               % (name, f, line, var, missing, n))
+    for name, var, missing, where in ambiguous:
+        print("AMBIGUOUS %s %s %s -- `%s` is defined in namespace %s; name the one this line is "
+              "about, as `<namespace>::%s %s %s`"
+              % (name, var, missing, name, " and ".join(where), name, var, missing))
     # a ledger line for a struct this scan did not evaluate (its other sites live outside the directories
     # given) is out of scope, not stale; the tree-wide run is the one that retires entries
     stale = sorted(k for k in set(allow) - used if k[0] in evaluated)
     for key in stale:
         print("STALE     %s -- no such omission any more; remove the entry" % allow[key])
-    print("default_audit: %d structs with defaults, %d unlisted omissions, %d stale entries"
-          % (len(structs), len(unlisted), len(stale)))
-    return 1 if unlisted or stale else 0
+    print("default_audit: %d structs with defaults, %d unlisted omissions, %d ambiguous entries, "
+          "%d stale entries" % (len(structs), len(unlisted), len(ambiguous), len(stale)))
+    return 1 if unlisted or ambiguous or stale else 0
 
 
 if __name__ == '__main__':
