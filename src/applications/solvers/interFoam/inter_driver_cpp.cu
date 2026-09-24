@@ -275,12 +275,24 @@ RunReport runInterFoam(
         // tutorial's own movingWallVelocity, where this loop reads U 2.715e-10, p_rgh 1.005e-12,
         // alpha 2.730e-11 -- so it is the pair and not the moving mesh.
         //
-        // prghPermeableAlphaTotalPressure reads the PATCH FLUX for the sign of its dynamic-pressure
-        // term (`-0.5*rhop*neg(phip)*magSqr(Up)`, prghPermeableAlphaTotalPressureFvPatchScalarField.C:
-        // 208-212), and on a moving mesh that flux is relative at some points of the step and absolute
-        // at others. Which state OpenFOAM's is in when constrainPressure calls updateCoeffs(snGradp)
-        // is what has to be established before either loop runs this. The device loop refuses it at
-        // its own site (inter_driver_device.cu); this arm is the host's, and it was missing.
+        // WHERE IT GOES WRONG, per step: step 1 reads U 4.077e-13, step 2 U 1.494e-01, step 5
+        // U 1.740e-02 -- exact once, then catastrophic. p_rgh stays small (2.458e-04 at step 2) and
+        // alpha never leaves the floor (5.107e-15), so it is the VELOCITY half, and it is something
+        // step 1 writes that only step 2 reads.
+        //
+        // TWO CAUSES RULED OUT by measurement, so the next unit does not spend the afternoon on them:
+        //   * the flux STATE. pEqn.H:70 makes phi relative after the pressure solve and
+        //     interFoam.C:139 after the mesh update, and this loop does both at the same two points
+        //     (inter_peqn_cpp.cu:1048, and the correctPhi branch below). Both codes read a RELATIVE
+        //     phi at constrainPressure.
+        //   * the patch GEOMETRY. pressurePermeableAlphaInletOutletVelocity builds its refValue as
+        //     `(phip/patch().magSf())*patch().nf()`, looked up live; brae's class caches them at
+        //     rebuild(), but fvPatchField holds `const FvPatch&` and the move updates that object in
+        //     place, so they are live too. Re-telling the patch its flux after the move -- which
+        //     rebuilds both -- changed not one digit.
+        // What is left is a field step 1 writes and step 2 reads: Uf is the candidate (fvc::correctUf
+        // takes the ABSOLUTE phi and the patch's own U, which on this patch is the mixed blend the
+        // condition set). The device loop refuses it at its own site (inter_driver_device.cu).
         for (std::size_t pi = 0; pi < patches.size() && pi < f.U.boundary.size(); ++pi)
         {
             const bool permeable = f.U.boundary[pi]->needsAlphaPatchValues()
