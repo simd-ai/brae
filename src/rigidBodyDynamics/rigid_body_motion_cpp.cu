@@ -9,29 +9,6 @@
 namespace brae {
 namespace RBD {
 
-namespace {
-
-// TENSOR PRODUCTS, local rather than added to cf_types.cuh: spatialTransform is the only caller in the
-// tree and the shared header is included by every translation unit.
-// OF's inner products: (A & B)_ij = A_ik B_kj, (T & v)_i = T_ij v_j.
-tensor tdot(const tensor& a, const tensor& b)
-{
-    return tensor{
-        a.xx*b.xx + a.xy*b.yx + a.xz*b.zx,  a.xx*b.xy + a.xy*b.yy + a.xz*b.zy,  a.xx*b.xz + a.xy*b.yz + a.xz*b.zz,
-        a.yx*b.xx + a.yy*b.yx + a.yz*b.zx,  a.yx*b.xy + a.yy*b.yy + a.yz*b.zy,  a.yx*b.xz + a.yy*b.yz + a.yz*b.zz,
-        a.zx*b.xx + a.zy*b.yx + a.zz*b.zx,  a.zx*b.xy + a.zy*b.yy + a.zz*b.zy,  a.zx*b.xz + a.zy*b.yz + a.zz*b.zz};
-}
-
-vector tdotv(const tensor& t, const vector& v)
-{
-    return vector{t.xx*v.x + t.xy*v.y + t.xz*v.z,
-                  t.yx*v.x + t.yy*v.y + t.yz*v.z,
-                  t.zx*v.x + t.zy*v.y + t.zz*v.z};
-}
-
-}   // namespace
-
-
 SpatialTransform operator&(const SpatialTransform& a, const SpatialTransform& b)
 {
     // spatialTransformI.H:137-143: spatialTransform(E_ & X.E_, X.r_ + (r_ & X.E_))
@@ -76,6 +53,181 @@ SpatialTransform Xry(scalar omega)
     out.E = tensor{c, 0, -s, 0, 1, 0, s, 0, c};
     out.r = vector{0, 0, 0};
     return out;
+}
+
+
+SpatialVector motionAction(const SpatialTransform& X, const SpatialVector& v)
+{
+    return SpatialVector{tdotv(X.E, v.w), tdotv(X.E, v.l - cross(X.r, v.w))};
+}
+
+
+SpatialVector dualAction(const SpatialTransform& X, const SpatialVector& f)
+{
+    return SpatialVector{tdotv(X.E, f.w - cross(X.r, f.l)), tdotv(X.E, f.l)};
+}
+
+
+SpatialVector transposeAction(const SpatialTransform& X, const SpatialVector& f)
+{
+    const tensor ET = transpose(X.E);
+    const vector ETfl = tdotv(ET, f.l);
+    return SpatialVector{tdotv(ET, f.w) + cross(X.r, ETfl), ETfl};
+}
+
+
+SpatialTensor motionTensor(const SpatialTransform& X)
+{
+    const tensor Erx = tdot(X.E, skew(X.r));
+    return blockTensor(X.E, tensor{0, 0, 0, 0, 0, 0, 0, 0, 0}, scalar(-1)*Erx, X.E);
+}
+
+
+SpatialTensor transposeTensor(const SpatialTransform& X)
+{
+    const tensor ET = transpose(X.E);
+    const tensor Erx = tdot(X.E, skew(X.r));
+    return blockTensor(ET, scalar(-1)*transpose(Erx), tensor{0, 0, 0, 0, 0, 0, 0, 0, 0}, ET);
+}
+
+
+symmTensor inertiaIo(const RigidBodyInertia& rbi)
+{
+    // Ioc(m, c) = m*(I*magSqr(c) - sqr(c)); Io = Ic + Ioc
+    const scalar mc = magSqr(rbi.c);
+    const symmTensor cc = sqr(rbi.c);
+    const symmTensor ioc{rbi.m*(mc - cc.xx), rbi.m*(scalar(0) - cc.xy), rbi.m*(scalar(0) - cc.xz),
+                         rbi.m*(mc - cc.yy), rbi.m*(scalar(0) - cc.yz), rbi.m*(mc - cc.zz)};
+    return rbi.Ic + ioc;
+}
+
+
+SpatialTensor inertiaTensor(const RigidBodyInertia& rbi)
+{
+    const symmTensor io = inertiaIo(rbi);
+    const tensor ioT{io.xx, io.xy, io.xz, io.xy, io.yy, io.yz, io.xz, io.yz, io.zz};
+    const tensor mcStar = rbi.m*skew(rbi.c);
+    const tensor mI{rbi.m, 0, 0, 0, rbi.m, 0, 0, 0, rbi.m};
+    return blockTensor(ioT, mcStar, scalar(-1)*mcStar, mI);
+}
+
+
+SpatialVector inertiaAction(const RigidBodyInertia& rbi, const SpatialVector& v)
+{
+    // rigidBodyInertiaI.H:192-206, transcribed: m*l - m*(c ^ w) is TWO multiplications by m
+    const symmTensor io = inertiaIo(rbi);
+    return SpatialVector{(io & v.w) + rbi.m*cross(rbi.c, v.l),
+                         rbi.m*v.l - rbi.m*cross(rbi.c, v.w)};
+}
+
+
+RigidBodyInertia cuboidInertia(scalar mass, const vector& centreOfMass, const vector& L)
+{
+    const scalar mBy12 = mass/scalar(12.0);
+    const scalar mSqrLx = mBy12*L.x*L.x;
+    const scalar mSqrLy = mBy12*L.y*L.y;
+    const scalar mSqrLz = mBy12*L.z*L.z;
+    RigidBodyInertia rbi;
+    rbi.m = mass;
+    rbi.c = centreOfMass;
+    rbi.Ic = symmTensor{mSqrLy + mSqrLz, 0, 0, mSqrLx + mSqrLz, 0, mSqrLx + mSqrLy};
+    return rbi;
+}
+
+
+std::vector<scalar> Model::forwardDynamics(
+    const std::vector<scalar>&        q,
+    const std::vector<scalar>&        qDot,
+    const std::vector<SpatialVector>& fx,
+    const vector&                     g) const
+{
+    const std::size_t nB = links.size() + 1;
+    if (q.size() != static_cast<std::size_t>(nDoF()) || qDot.size() != q.size())
+    {
+        throw std::runtime_error("brae RBD::forwardDynamics: the joint state is the wrong size.");
+    }
+    if (!fx.empty() && fx.size() != nB)
+    {
+        throw std::runtime_error("brae RBD::forwardDynamics: fx must carry one spatial force per BODY, "
+                                 "the root included.");
+    }
+    std::vector<SpatialTransform> Xlambda(nB), X0v(nB);
+    std::vector<SpatialVector> vv(nB), cc(nB), pA(nB), S1(nB), U1(nB), uu(nB), aa(nB);
+    std::vector<SpatialTensor> IA(nB);
+    std::vector<scalar> Dinv(nB, scalar(0));
+    std::vector<scalar> qDdot(static_cast<std::size_t>(nDoF()), scalar(0));
+
+    // PASS 1, forward: the kinematics, the articulated inertia seed and the bias force
+    for (std::size_t i = 1; i < nB; ++i)
+    {
+        const Link& L = links[i - 1];
+        const std::size_t qi = static_cast<std::size_t>(L.qIndex);
+        SpatialTransform JX;
+        SpatialVector JS1;
+        SpatialVector Jv;
+        if (L.joint == JointType::Py)
+        {
+            // Py.C:92-95 -- Xt(S_[0].l()*q), S_[0] = (0 0 0  0 1 0), so the translation is (0, q, 0)
+            // built by SCALING the axis: 0*q carries q's sign bit, which a literal 0 would not.
+            const vector axis{0, 1, 0};
+            JX = Xt(axis*q[qi]);
+            JS1 = SpatialVector{vector{0, 0, 0}, axis};
+            Jv = JS1*qDot[qi];
+        }
+        else
+        {
+            // Ry.C:92-96 -- Xry(q), S_[0] = (0 1 0  0 0 0), and J.v is built by setting wy alone
+            JX = Xry(q[qi]);
+            JS1 = SpatialVector{vector{0, 1, 0}, vector{0, 0, 0}};
+            Jv = SpatialVector{};
+            Jv.w.y = qDot[qi];
+        }
+        S1[i] = JS1;
+        Xlambda[i] = JX & L.XT;
+        const std::size_t lam = static_cast<std::size_t>(L.lambda);
+        X0v[i] = (lam != 0) ? (Xlambda[i] & X0v[lam]) : Xlambda[i];
+        vv[i] = motionAction(Xlambda[i], vv[lam]) + Jv;
+        cc[i] = crossMotion(vv[i], Jv);                     // J.c is Zero for both joints
+        IA[i] = inertiaTensor(L.inertia);
+        pA[i] = crossDual(vv[i], inertiaAction(L.inertia, vv[i]));
+        if (!fx.empty())
+        {
+            // forwardDynamics.C:105 -- MINUS, through the DUAL transform
+            pA[i] = pA[i] - dualAction(X0v[i], fx[i]);
+        }
+    }
+
+    // PASS 2, backward: the articulated inertia and bias force folded onto the parent
+    for (std::size_t i = nB - 1; i >= 1; --i)
+    {
+        const Link& L = links[i - 1];
+        const std::size_t qi = static_cast<std::size_t>(L.qIndex);
+        U1[i] = IA[i] & S1[i];
+        Dinv[i] = scalar(1)/doubleInner(S1[i], U1[i]);
+        uu[i].w.x = scalar(0) - doubleInner(S1[i], pA[i]);      // tau is zero on this path
+        const std::size_t lam = static_cast<std::size_t>(L.lambda);
+        if (lam != 0)
+        {
+            const SpatialTensor Ia = IA[i] - outerSpatial(U1[i], U1[i]*Dinv[i]);
+            const SpatialVector pa = pA[i] + (Ia & cc[i]) + U1[i]*(Dinv[i]*uu[i].w.x);
+            IA[lam] += (transposeTensor(Xlambda[i]) & Ia) & motionTensor(Xlambda[i]);
+            pA[lam] = pA[lam] + transposeAction(Xlambda[i], pa);
+        }
+        if (i == 1) break;
+    }
+
+    // PASS 3, forward: gravity as a base acceleration, then the joint accelerations
+    aa[0] = SpatialVector{vector{0, 0, 0}, scalar(-1)*g};
+    for (std::size_t i = 1; i < nB; ++i)
+    {
+        const Link& L = links[i - 1];
+        const std::size_t qi = static_cast<std::size_t>(L.qIndex);
+        const std::size_t lam = static_cast<std::size_t>(L.lambda);
+        aa[i] = motionAction(Xlambda[i], aa[lam]) + cc[i];
+        qDdot[qi] = Dinv[i]*(uu[i].w.x - doubleInner(U1[i], aa[i]));
+        aa[i] = aa[i] + S1[i]*qDdot[qi];
+    }
+    return qDdot;
 }
 
 
@@ -301,6 +453,11 @@ MotionSpec readMotionSpec(const std::string& dictPath)
     SpatialTransform bodyXT;
     bool haveBody = false;
     bool haveSolver = false;
+    std::string bodyType;
+    scalar bodyMass = 0;
+    vector bodyCofM{0, 0, 0};
+    vector bodyL{0, 0, 0};
+    bool haveL = false;
 
     // inside rigidBodyMotionCoeffs
     label depth = 1;
@@ -329,7 +486,18 @@ MotionSpec readMotionSpec(const std::string& dictPath)
             if (ts.peek() == ";") ts.next();
             continue;
         }
-        if (key == "type" && !joints.empty()) { ts.next(); if (ts.peek() == ";") ts.next(); continue; }
+        if (key == "type")
+        {
+            const std::string v = ts.next();
+            // the BODY's type, which appears before its `joint` sub-dictionary; the joint's own
+            // `type` entries are consumed inside the `joints` list above
+            if (joints.empty() && bodyType.empty()) bodyType = v;
+            if (ts.peek() == ";") ts.next();
+            continue;
+        }
+        if (key == "mass")         { bodyMass = ts.nextScalar(); if (ts.peek() == ";") ts.next(); continue; }
+        if (key == "centreOfMass") { bodyCofM = readVectorParen(); if (ts.peek() == ";") ts.next(); continue; }
+        if (key == "L")            { bodyL = readVectorParen(); haveL = true; if (ts.peek() == ";") ts.next(); continue; }
         if (key == "parent")
         {
             const std::string p = ts.next();
@@ -513,6 +681,21 @@ MotionSpec readMotionSpec(const std::string& dictPath)
             "single-joint body is a different chain (no jointBody is inserted) and is not ported.");
     }
 
+    if (bodyType != "cuboid")
+    {
+        throw std::runtime_error(
+            "brae RBD::readMotionSpec: body `" + spec.bodyName + "` is `" + bodyType + "`. Only "
+            "`cuboid` is ported -- each rigidBody type builds its own inertia about the centre of "
+            "mass (bodies/), and reading the wrong one gives a body of the right mass and the wrong "
+            "resistance to rotation.");
+    }
+    if (!haveL || bodyMass <= scalar(0))
+    {
+        throw std::runtime_error(
+            "brae RBD::readMotionSpec: body `" + spec.bodyName + "` gives no `L` or no positive "
+            "`mass`; cuboid reads exactly L, mass and centreOfMass (cuboidI.H:65-77).");
+    }
+
     // rigidBodyModel::join for a composite: a massless jointBody for every joint but the last, the
     // body's own transform on the FIRST link and the identity on the rest
     spec.model.links.resize(joints.size());
@@ -523,6 +706,10 @@ MotionSpec readMotionSpec(const std::string& dictPath)
         l.qIndex = static_cast<label>(j);
         l.lambda = static_cast<label>(j);          // body j + 1's parent is body j (root is 0)
         l.XT = (j == 0) ? bodyXT : SpatialTransform();
+        // ...and the REAL body only on the last link: every one before it is a massless jointBody
+        // (rigidBodyModel.C:279-290), which contributes a degree of freedom and no inertia.
+        l.inertia = (j + 1 == joints.size()) ? cuboidInertia(bodyMass, bodyCofM, bodyL)
+                                             : RigidBodyInertia();
     }
     return spec;
 }

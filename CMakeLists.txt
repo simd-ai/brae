@@ -3703,6 +3703,14 @@ target_link_libraries(test_inter_limitedlinear_vs_openfoam PRIVATE brae_core)
 add_test(NAME interfoam_limitedlinear_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_limitedlinear_vs_openfoam.sh)
 
+# brae's articulated-body dynamics against real OpenFOAM's own rigidBodyMotion::solve.
+add_executable(test_rigid_body_dynamics_vs_openfoam tests/test_rigid_body_dynamics_vs_openfoam.cu)
+target_include_directories(test_rigid_body_dynamics_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_rigid_body_dynamics_vs_openfoam PRIVATE brae_core)
+add_test(NAME rigid_body_dynamics_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rigid_body_dynamics_vs_openfoam.sh)
+
 # brae's Newmark integrator and acceleration relaxation against real OpenFOAM's own joint state.
 add_executable(test_rigid_body_newmark_vs_openfoam tests/test_rigid_body_newmark_vs_openfoam.cu)
 target_include_directories(test_rigid_body_newmark_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}

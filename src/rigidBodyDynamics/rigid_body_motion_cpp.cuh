@@ -34,6 +34,7 @@
 // Reading it as a single body with two degrees of freedom gives a different X0 and a different mesh.
 #include "cf_types.cuh"
 #include "function1.cuh"
+#include "spatial_algebra_cpp.cuh"
 #include "fv_patch.cuh"
 #include "primitive_mesh.cuh"
 #include <cmath>
@@ -64,6 +65,47 @@ enum class JointType
     Ry      // revolute about y:   X = Xry(q),      S = (0 1 0  0 0 0)
 };
 
+// THE FOUR ACTIONS a spatialTransform has, which are four different pieces of arithmetic and not one
+// with a flag (spatialTransformI.H). Reading a force through the motion action, or a motion through
+// the dual, is silent -- both give a six-vector of plausible size.
+//     X & v        motion:  ( E & v.w,  E & (v.l - (r ^ v.w)) )                        :146-156
+//     *X & f       dual:    ( E & (f.w - (r ^ f.l)),  E & f.l )                         :216-226
+//     X.T() & f    transpose, with ETfl = E^T & f.l:                                    :191-203
+//                           ( (E^T & f.w) + (r ^ ETfl),  ETfl )
+//     spatialTensor(X)     = [ E, 0 ; -Erx(), E ]     with Erx() = E & (*r)             :120-127
+//     spatialTensor(X.T()) = [ E^T, -(Erx())^T ; 0, E^T ]                               :181-188
+SpatialVector motionAction(const SpatialTransform& X, const SpatialVector& v);
+SpatialVector dualAction(const SpatialTransform& X, const SpatialVector& f);
+SpatialVector transposeAction(const SpatialTransform& X, const SpatialVector& f);
+SpatialTensor motionTensor(const SpatialTransform& X);
+SpatialTensor transposeTensor(const SpatialTransform& X);
+
+// rigidBodyInertia (rigidBodyInertiaI.H): the mass, the centre of mass IN THE BODY FRAME, and the
+// inertia ABOUT THE CENTRE OF MASS.
+struct RigidBodyInertia
+{
+    scalar m = 0;
+    vector c{0, 0, 0};
+    symmTensor Ic{0, 0, 0, 0, 0, 0};
+};
+
+// Io = Ic + m*(I*|c|^2 - c (x) c)   (rigidBodyInertiaI.H:35-42, :119-122). REBUILT ON EVERY CALL,
+// as OpenFOAM does: caching it changes the rounding of the line that reads it.
+symmTensor inertiaIo(const RigidBodyInertia& rbi);
+
+// The 6x6 form (rigidBodyInertiaI.H:127-136): [ Io, m*skew(c) ; -m*skew(c), m*I ].
+SpatialTensor inertiaTensor(const RigidBodyInertia& rbi);
+
+// I & v, the SPECIALISED overload (rigidBodyInertiaI.H:192-206) -- NOT the 6x6 product, which is
+// algebraically the same and arithmetically different:
+//     ( (Io & w) + m*(c ^ l),   m*l - m*(c ^ w) )
+// Note `m*l - m*(c ^ w)`: two separate multiplications by m, not m*(l - c^w).
+SpatialVector inertiaAction(const RigidBodyInertia& rbi, const SpatialVector& v);
+
+// cuboid (bodies/cuboid/cuboidI.H:30-47): Ic = diag(m/12 * (Ly^2 + Lz^2), ...). The dictionary's
+// `rho` and `Lx`/`Ly`/`Lz` are NOT read by the body -- they exist to feed the #eval for `mass`.
+RigidBodyInertia cuboidInertia(scalar mass, const vector& centreOfMass, const vector& L);
+
 // One link of the chain: the joint that reaches this body, the q it reads, the fixed transform from
 // the parent's frame (XT_) and which body is the parent (lambda_).
 struct Link
@@ -72,6 +114,9 @@ struct Link
     label     qIndex = 0;
     SpatialTransform XT;
     label     lambda = 0;
+    // the body this joint reaches. A composite joint's intermediate links are massless `jointBody`s
+    // (bodies/jointBody/jointBodyI.H), which contribute nothing but a link and a degree of freedom.
+    RigidBodyInertia inertia;
 };
 
 struct Model
@@ -84,6 +129,16 @@ struct Model
 
     // rigidBodyModel::X0, through forwardDynamics' Xlambda_ = J.X & XT_ and X0_ = Xlambda_ & X0_[lambda]
     std::vector<SpatialTransform> X0(const std::vector<scalar>& q) const;
+
+    // rigidBodyModel::forwardDynamics (forwardDynamics.C:56-206) -- the articulated-body algorithm,
+    // three passes over the chain. `fx` is per BODY (index 0 is the root and is never read), a spatial
+    // force in the GLOBAL frame about the global origin, which is where the mesh motion's `forces`
+    // object puts it. Gravity enters as a base acceleration a[0] = (0, -g) and nowhere else.
+    std::vector<scalar> forwardDynamics(
+        const std::vector<scalar>&       q,
+        const std::vector<scalar>&       qDot,
+        const std::vector<SpatialVector>& fx,
+        const vector&                    g) const;
 
     // rigidBodyMotion::transformPoints(bodyID, weight, points0): the transform from the INITIAL state
     // in the global frame to the current one, applied whole where the weight is 1 and slerped where it
