@@ -108,20 +108,28 @@ grep -q "^Selected 374 cells for refinement out of 4032." "$C/log.interFoam" \
 echo "OpenFOAM ran 5 steps and refined: $(grep -c '^Refined from' "$C/log.interFoam") refinements"
 
 rc=0
-# arm <time> <mesh dir>
+# arm <name> <time> <mesh dir> [extra oracle options...]
 arm()
 {
-    local t="$1" meshDir="$2"
-    local dump="$W/dump.$t.txt"
-    ( cd "$C" && dumpRefineCandidates -case "$C" -time "$t" > "$dump" 2>&1 ) \
-        || { echo "FAIL: dumpRefineCandidates at t = $t"; tail -20 "$dump"; rc=1; return; }
-    echo "--- t = $t"
+    local name="$1" t="$2" meshDir="$3"
+    shift 3
+    local dump="$W/dump.$name.txt"
+    ( cd "$C" && dumpRefineCandidates -case "$C" -time "$t" "$@" > "$dump" 2>&1 ) \
+        || { echo "FAIL: dumpRefineCandidates [$name]"; tail -20 "$dump"; rc=1; return; }
+    echo "--- $name (t = $t)${*:+ [$*]}"
     "$BIN" "$C" "$C/$meshDir" "$C/$t" "$dump" || rc=1
 }
 
-arm 0     constant/polyMesh
-arm 0.001 0.001/polyMesh
-arm 0.002 0.002/polyMesh
+arm t0     0     constant/polyMesh
+arm t0.001 0.001 0.001/polyMesh
+arm t0.002 0.002 0.002/polyMesh
+# THE BUDGET, which the tutorial as shipped can never exercise: `maxCells 200000` against 17,080 cells
+# leaves a budget of 26,131 and the whole-level truncation branch is unreachable. Widening the band to
+# the field's own extremes makes EVERY cell a candidate at three different levels, and a ceiling just
+# above the current count makes the budget bind. MEASURED: OpenFOAM selects 17,080 with the shipped
+# ceiling and 3,658 with this one -- exactly the level-0 cells, because the branch takes WHOLE LEVELS
+# coarsest first and stops after the first one that carries it past the budget.
+arm budget 0.002 0.002/polyMesh -lower -1 -upper 2 -maxRefinement 3 -maxCells 17100
 
 echo "refine_candidates_vs_openfoam: rc $rc"
 exit $rc

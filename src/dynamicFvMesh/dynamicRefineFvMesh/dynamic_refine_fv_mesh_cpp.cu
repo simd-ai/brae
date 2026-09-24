@@ -126,5 +126,148 @@ void selectRefineCandidates(
     }
 }
 
+label faceConsistentRefinement(
+    bool                        maxSet,
+    const std::vector<label>&   cellLevel,
+    const PrimitiveMesh&        m,
+    const std::vector<FvPatch>& patches,
+    std::vector<char>&          refineCell)
+{
+    label nChanged = 0;
+    // hexRef8.C:1578-1610, internal faces
+    const label nInternal = m.nInternalFaces();
+    for (label facei = 0; facei < nInternal; ++facei)
+    {
+        const label own = m.owner()[static_cast<std::size_t>(facei)];
+        const label nei = m.neighbour()[static_cast<std::size_t>(facei)];
+        const label ownLevel = cellLevel[static_cast<std::size_t>(own)]
+                             + refineCell[static_cast<std::size_t>(own)];
+        const label neiLevel = cellLevel[static_cast<std::size_t>(nei)]
+                             + refineCell[static_cast<std::size_t>(nei)];
+        if (ownLevel > neiLevel + 1)
+        {
+            if (maxSet) refineCell[static_cast<std::size_t>(nei)] = 1;
+            else        refineCell[static_cast<std::size_t>(own)] = 0;
+            ++nChanged;
+        }
+        else if (neiLevel > ownLevel + 1)
+        {
+            if (maxSet) refineCell[static_cast<std::size_t>(own)] = 1;
+            else        refineCell[static_cast<std::size_t>(nei)] = 0;
+            ++nChanged;
+        }
+    }
+
+    // hexRef8.C:1613-1649, coupled faces. The swap is what makes the boundary loop do anything: on an
+    // uncoupled patch neiLevel keeps the OWNER's own level, both tests are false, and nothing moves.
+    for (const FvPatch& q : patches)
+    {
+        if (!q.coupled) continue;
+        throw std::runtime_error(
+            std::string(WHO) + "the mesh carries the coupled patch `" + q.name + "`, and the 2:1 "
+            "refinement closure swaps cell levels across it (hexRef8.C:1625, "
+            "syncTools::swapBoundaryFaceList). brae has no swap here, so a cell on the far side of "
+            "that pair would keep a level it does not have and the closure would be wrong in a "
+            "direction nothing reports.");
+    }
+    return nChanged;
+}
+
+
+std::vector<label> consistentRefinement(
+    const std::vector<label>&   cellLevel,
+    const std::vector<label>&   cellsToRefine,
+    bool                        maxSet,
+    const PrimitiveMesh&        m,
+    const std::vector<FvPatch>& patches)
+{
+    // hexRef8.C:2246 -- bitSet(nCells, cellsToRefine)
+    std::vector<char> refineCell(static_cast<std::size_t>(m.nCells()), 0);
+    for (const label c : cellsToRefine)
+    {
+        if (c < 0 || c >= m.nCells())
+        {
+            throw std::runtime_error(
+                std::string(WHO) + "a cell to refine is outside the mesh: " + std::to_string(c));
+        }
+        refineCell[static_cast<std::size_t>(c)] = 1;
+    }
+    // :2248-2270 -- to a fixed point
+    while (faceConsistentRefinement(maxSet, cellLevel, m, patches, refineCell) != 0)
+    {
+    }
+    // :2273 -- bitSet::toc(), the on bits ASCENDING
+    std::vector<label> out;
+    for (std::size_t c = 0; c < refineCell.size(); ++c)
+    {
+        if (refineCell[c]) out.push_back(static_cast<label>(c));
+    }
+    return out;
+}
+
+
+std::vector<label> selectRefineCells(
+    label                       maxCells,
+    label                       maxRefinement,
+    const std::vector<char>&    candidateCell,
+    const std::vector<label>&   cellLevel,
+    const std::vector<char>&    protectedCell,
+    label                       nTotalCells,
+    const PrimitiveMesh&        m,
+    const std::vector<FvPatch>& patches)
+{
+    // dynamicRefineFvMesh.C:838. INTEGER division: each refined hex becomes eight, so seven extra.
+    const label nTotToRefine = (maxCells - nTotalCells)/7;
+
+    // :848-849. Serial, so the local count IS the global one.
+    label nCandidates = 0;
+    for (const char c : candidateCell) nCandidates += (c != 0);
+
+    // :844-845. An empty protected list means nothing is protected: OpenFOAM's bitSet reads out of
+    // range as false, and calculateProtectedCells clears its output when protectedCell_ is empty.
+    auto unrefineable = [&](std::size_t c)
+    {
+        return c < protectedCell.size() && protectedCell[c] != 0;
+    };
+
+    std::vector<label> candidates;
+    if (nCandidates < nTotToRefine)
+    {
+        // :856-866 -- every candidate under the level cap, ascending, no truncation
+        for (std::size_t c = 0; c < candidateCell.size(); ++c)
+        {
+            if (!candidateCell[c]) continue;
+            if (!unrefineable(c) && cellLevel[c] < maxRefinement)
+            {
+                candidates.push_back(static_cast<label>(c));
+            }
+        }
+    }
+    else
+    {
+        // :871-889 -- WHOLE LEVELS, coarsest first, and the budget is tested only after a level is
+        // finished, so the list can overshoot by up to one level's worth
+        for (label level = 0; level < maxRefinement; ++level)
+        {
+            for (std::size_t c = 0; c < candidateCell.size(); ++c)
+            {
+                if (!candidateCell[c]) continue;
+                if (!unrefineable(c) && cellLevel[c] == level)
+                {
+                    candidates.push_back(static_cast<label>(c));
+                }
+            }
+            if (static_cast<label>(candidates.size()) > nTotToRefine)
+            {
+                break;
+            }
+        }
+    }
+
+    // :893-900 -- the 2:1 closure, maxSet TRUE, which ADDS cells
+    return consistentRefinement(cellLevel, candidates, /*maxSet=*/true, m, patches);
+}
+
+
 }   // namespace dynamicRefine
 }   // namespace brae

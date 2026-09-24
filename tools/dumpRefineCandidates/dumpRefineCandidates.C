@@ -88,6 +88,7 @@ public:
     using dynamicRefineFvMesh::maxCellField;
     using dynamicRefineFvMesh::maxPointField;
     using dynamicRefineFvMesh::selectRefineCandidates;
+    using dynamicRefineFvMesh::selectRefineCells;
 };
 
 
@@ -117,6 +118,8 @@ int main(int argc, char *argv[])
     argList::addOption("field", "name", "the volScalarField to refine on");
     argList::addOption("lower", "scalar", "lowerRefineLevel");
     argList::addOption("upper", "scalar", "upperRefineLevel");
+    argList::addOption("maxCells", "label", "the cell ceiling the budget uses");
+    argList::addOption("maxRefinement", "label", "the refinement level cap");
 
     timeSelector::addOptions();
 
@@ -242,6 +245,56 @@ int main(int argc, char *argv[])
         Info<< "[brae] candidate " << celli << nl;
     }
     Info<< "[brae] nCandidates " << candidateCell.count() << nl;
+
+    // UNIT 2: from the candidates to the cells that will actually be refined --
+    // hexRef8's 2:1 closure and dynamicRefineFvMesh's budget/level selection.
+    // Both are printed, and separately, because they are different selections:
+    // the closure ADDS cells (maxSet true) where the budget only removes them.
+    {
+        const labelList& cellLevel = mesh.meshCutter().cellLevel();
+        forAll(cellLevel, celli)
+        {
+            Info<< "[brae] cellLevel " << celli << ' ' << cellLevel[celli] << nl;
+        }
+
+        // ...overridable, because the case's own maxCells is 200000 against 4032 cells: the budget
+        // is never binding here, so the whole-level truncation branch (dynamicRefineFvMesh.C:871-889)
+        // is unreachable on the tutorial as shipped and a gate on it needs a smaller ceiling.
+        const label maxCells
+        (
+            args.getOrDefault<label>("maxCells", refineDict.get<label>("maxCells"))
+        );
+        const label maxRefinement
+        (
+            args.getOrDefault<label>("maxRefinement", refineDict.get<label>("maxRefinement"))
+        );
+        Info<< "[brae] maxCells " << maxCells << nl
+            << "[brae] maxRefinement " << maxRefinement << nl
+            << "[brae] nTotalCells " << mesh.globalData().nTotalCells() << nl;
+
+        // the closure on the RAW candidate set, so a port is held against it
+        // without the budget in the way
+        const labelList consistentSet
+        (
+            mesh.meshCutter().consistentRefinement(candidateCell.toc(), true)
+        );
+        forAll(consistentSet, i)
+        {
+            Info<< "[brae] consistent " << consistentSet[i] << nl;
+        }
+        Info<< "[brae] nConsistent " << consistentSet.size() << nl;
+
+        // ...and the whole selection OpenFOAM would act on
+        const labelList selected
+        (
+            mesh.selectRefineCells(maxCells, maxRefinement, candidateCell)
+        );
+        forAll(selected, i)
+        {
+            Info<< "[brae] selected " << selected[i] << nl;
+        }
+        Info<< "[brae] nSelected " << selected.size() << nl;
+    }
 
     // The levels the next unit will need, and the only thing on this mesh that
     // says whether it has been refined already.

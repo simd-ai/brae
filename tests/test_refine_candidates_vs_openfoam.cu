@@ -18,6 +18,8 @@
 // usage: test_refine_candidates_vs_openfoam <caseDir> <meshDir> <fieldDir> <oracleDump>
 #include "primitive_mesh.cuh"
 #include "primitive_patch_cpp.cuh"
+#include "fv_geometry.cuh"
+#include "fv_patch.cuh"
 #include "dynamic_refine_fv_mesh_cpp.cuh"
 #include "foam_field_reader.cuh"
 #include <algorithm>
@@ -43,8 +45,11 @@ void check(const char* what, bool ok)
 struct Dump
 {
     std::vector<scalar> cellToPoint, error, maxPointField, maxCellField;
-    std::vector<label>  candidate;
+    std::vector<label>  candidate, consistent, selected;
+    std::vector<label>  cellLevel;
     label nCells = -1, nPoints = -1, nCandidates = -1;
+    label nConsistent = -1, nSelected = -1, nProtectedCells = -1;
+    label maxCells = -1, maxRefinement = -1, nTotalCells = -1;
     scalar lower = 0, upper = 0;
     std::string field;
     bool complete = false;
@@ -75,6 +80,22 @@ Dump readDump(const std::string& path)
         else if (tag == "maxPointField") indexed(d.maxPointField);
         else if (tag == "maxCellField")  indexed(d.maxCellField);
         else if (tag == "candidate")     { label c = 0; is >> c; d.candidate.push_back(c); }
+        else if (tag == "consistent")    { label c = 0; is >> c; d.consistent.push_back(c); }
+        else if (tag == "selected")      { label c = 0; is >> c; d.selected.push_back(c); }
+        else if (tag == "cellLevel")
+        {
+            label i = 0, v = 0;
+            is >> i >> v;
+            if (static_cast<std::size_t>(i) >= d.cellLevel.size())
+                d.cellLevel.resize(static_cast<std::size_t>(i) + 1);
+            d.cellLevel[static_cast<std::size_t>(i)] = v;
+        }
+        else if (tag == "nConsistent")   is >> d.nConsistent;
+        else if (tag == "nSelected")     is >> d.nSelected;
+        else if (tag == "nProtectedCells") is >> d.nProtectedCells;
+        else if (tag == "maxCells")      is >> d.maxCells;
+        else if (tag == "maxRefinement") is >> d.maxRefinement;
+        else if (tag == "nTotalCells")   is >> d.nTotalCells;
         else if (tag == "nCells")        is >> d.nCells;
         else if (tag == "nPoints")       is >> d.nPoints;
         else if (tag == "nCandidates")   is >> d.nCandidates;
@@ -177,6 +198,11 @@ int main(int argc, char** argv)
                 (double)of.lower, (double)of.upper);
     check("the band is the case's own, not a default", of.lower < of.upper);
 
+    // the patch list, for the 2:1 closure's coupled-patch refusal
+    FvGeometry g;
+    g.build(m);
+    const std::vector<FvPatch> patches = buildPatches(m, g);
+
     // THE TWO ORDERS. brae carries the pointFaces branch already; the cells branch is new here.
     const std::vector<std::vector<label>> cells = meshCells(m);
     const std::vector<std::vector<label>> pcCells = pointCellsFromCells(m, cells);
@@ -247,6 +273,81 @@ int main(int argc, char** argv)
         check("brae selects exactly OpenFOAM's cells", nDiff == 0);
     }
 
+    // UNIT 2: the 2:1 closure and the selection the solver would act on.
+    {
+        check("the oracle printed the levels and the budget",
+              of.cellLevel.size() == static_cast<std::size_t>(nCells)
+           && of.maxCells > 0 && of.maxRefinement > 0 && of.nTotalCells == nCells);
+        check("...and its protected-cell count",  of.nProtectedCells >= 0);
+        if (of.nProtectedCells != 0)
+        {
+            std::printf("  (%d protected cells -- this arm DOES exercise the protected path)\n",
+                        (int)of.nProtectedCells);
+        }
+        else
+        {
+            std::printf("  (no protected cells on this mesh, so the protected-cell path is NOT "
+                        "discriminated by this arm)\n");
+        }
+        const std::vector<char> noProtected;
+
+        // the closure on the RAW candidate set, with the budget out of the way
+        std::vector<label> candList;
+        for (std::size_t c = 0; c < aCells.candidate.size(); ++c)
+        {
+            if (aCells.candidate[c]) candList.push_back(static_cast<label>(c));
+        }
+        const std::vector<label> mineConsistent =
+            dynamicRefine::consistentRefinement(of.cellLevel, candList, /*maxSet=*/true, m, patches);
+        std::printf("  2:1 closure: brae %zu, OpenFOAM %d (from %zu candidates, so it added %d)\n",
+                    mineConsistent.size(), (int)of.nConsistent, candList.size(),
+                    (int)(of.nConsistent - static_cast<label>(candList.size())));
+        check("OpenFOAM's closure list is the length it printed",
+              of.consistent.size() == static_cast<std::size_t>(of.nConsistent));
+        check("brae's 2:1 closure is OpenFOAM's, cell for cell and in order",
+              mineConsistent == of.consistent);
+
+        // ...and the whole selection
+        const std::vector<label> mineSelected =
+            dynamicRefine::selectRefineCells(of.maxCells, of.maxRefinement, aCells.candidate,
+                                             of.cellLevel, noProtected, of.nTotalCells, m, patches);
+        std::printf("  selectRefineCells: brae %zu, OpenFOAM %d (maxCells %d, maxRefinement %d, "
+                    "budget %d)\n",
+                    mineSelected.size(), (int)of.nSelected, (int)of.maxCells, (int)of.maxRefinement,
+                    (int)((of.maxCells - of.nTotalCells)/7));
+        check("OpenFOAM's selection is the length it printed",
+              of.selected.size() == static_cast<std::size_t>(of.nSelected));
+        check("brae selects exactly the cells OpenFOAM would refine", mineSelected == of.selected);
+
+        // CONTROL: the closure with maxSet FALSE must REMOVE where the other ADDS. The two directions
+        // are the whole difference between the refinement superset and the unrefinement subset, and a
+        // port that ignored the flag would pass the arm above on any already-consistent set.
+        const std::vector<label> shrunk =
+            dynamicRefine::consistentRefinement(of.cellLevel, candList, /*maxSet=*/false, m, patches);
+        std::printf("  CONTROL: the same closure with maxSet false: %zu cells against %zu\n",
+                    shrunk.size(), mineConsistent.size());
+        check("...never grows the set", shrunk.size() <= candList.size());
+        if (mineConsistent.size() != candList.size())
+        {
+            check("...and is a DIFFERENT set from the maxSet-true one, so the flag is measured here",
+                  shrunk != mineConsistent);
+        }
+        else
+        {
+            std::printf("  (the candidate set was already 2:1 consistent, so the closure added "
+                        "nothing and this arm cannot separate the two directions)\n");
+        }
+
+        // CONTROL: the level cap. Raising maxRefinement can only admit more cells, never fewer.
+        const std::vector<label> higherCap =
+            dynamicRefine::selectRefineCells(of.maxCells, of.maxRefinement + 1, aCells.candidate,
+                                             of.cellLevel, noProtected, of.nTotalCells, m, patches);
+        std::printf("  CONTROL: maxRefinement %d instead of %d selects %zu instead of %zu\n",
+                    (int)of.maxRefinement + 1, (int)of.maxRefinement, higherCap.size(),
+                    mineSelected.size());
+        check("...and the cap only ever removes cells", higherCap.size() >= mineSelected.size());
+    }
+
     // CONTROL 1: the band edge. `error` writes an exact edge as 0 (`>= 0`) and selectRefineCandidates
     // rejects it (`> 0`), so the band is OPEN. A port that wrote `>= 0` at the second test would
     // select every cell whose points sit exactly on an edge -- and on a VoF field, where whole
@@ -289,8 +390,21 @@ int main(int argc, char** argv)
             return e;
         }();
         const Diff dz = compare(errZero, of.error);
-        std::printf("  CONTROL: `error` seeded 0 instead of -1: worst %.4e\n", (double)dz.worst);
-        check("...is a different field", dz.worst > scalar(0));
+        std::size_t nOutside = 0;
+        for (const scalar x : aCells.error) nOutside += (x < scalar(0));
+        std::printf("  CONTROL: `error` seeded 0 instead of -1: worst %.4e (%zu of %zu points lie "
+                    "outside the band)\n", (double)dz.worst, nOutside, aCells.error.size());
+        if (nOutside > 0)
+        {
+            check("...is a different field", dz.worst > scalar(0));
+        }
+        else
+        {
+            // the `budget` arm widens the band to [-1, 2], so every point is inside it and the
+            // sentinel is never written -- the control has nothing to change and says so
+            std::printf("  (every point is inside the band on this arm, so the sentinel is never "
+                        "written and this control cannot witness it here)\n");
+        }
     }
 
     std::printf("test_refine_candidates_vs_openfoam: %d failures\n", failures);
