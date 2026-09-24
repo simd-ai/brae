@@ -601,13 +601,11 @@ void correct(
     // ...AND THE PAIR, which gaussGrad sums like any other patch's face. CDkOmega is
     // 2*alphaOmega2/omega*(grad(k) & grad(omega)) and F1 blends every coefficient of the omega
     // equation on it, so a gradient built without the pair is a different model in the pair's cells.
-    // A leastSquares gradient is refused there: deviceLeastSquaresGrad carries no interface.
+    // ...and the LEAST-SQUARES form carries it too now: the pair's faces go into the dd tensor with
+    // the coupled weight and the patch's own delta, and into the fit with the NEIGHBOUR CELL's value
+    // (leastSquaresVectors.C:131-140, leastSquaresGrad.C:108-119). A scalar is never rotated across
+    // the interface, so k and omega need no transform -- grad(U) does, and stays refused below.
     const bool pair = in.cyc && in.cyc->n > 0;
-    if (pair && in.co.gradKLeastSq)
-        throw std::runtime_error(
-            "kOmegaSST(cuda): the case asks for a leastSquares grad(k)/grad(omega) and the mesh has "
-            "a periodic pair. deviceLeastSquaresGrad does not carry an interface, so CDkOmega would "
-            "read a gradient fitted without it. The Gauss form does.");
     // ...and the LIMITER sees the pair too where the case names cellLimited: OF's cellLimitedGrad
     // folds a coupled patch's patchNeighbourField into its range and clips the extrapolation to that
     // face. A scalar is never rotated across the interface, so the neighbour value is the raw cell
@@ -615,9 +613,12 @@ void correct(
     DeviceBuffer<scalar> cycKNbr, cycONbr, cycEmpty;
     CellLimitInterface kIfs[1], oIfs[1];
     int nKIfs = 0, nOIfs = 0;
-    if (in.co.gradKLeastSq) deviceLeastSquaresGrad(dm, k, kbv, kgx, kgy, kgz);
+    if (in.co.gradKLeastSq) deviceLeastSquaresGrad(dm, k, kbv, kgx, kgy, kgz, in.cyc);
     else                    deviceGaussGrad(dm, k, kbv, kgx, kgy, kgz);
-    if (pair) deviceCyclicAddGrad(*in.cyc, k, dm.V, kgx, kgy, kgz);
+    // deviceCyclicAddGrad is the GAUSS form of the pair's face -- Sf*value/V. The least-squares fit
+    // carries its own coupled term inside the kernel, so adding this one there would be a second,
+    // differently normalised copy of the same face.
+    if (pair && !in.co.gradKLeastSq) deviceCyclicAddGrad(*in.cyc, k, dm.V, kgx, kgy, kgz);
     if (in.co.gradKLimitK > scalar(0))
     {
         if (pair)
@@ -630,9 +631,9 @@ void correct(
     }
     if (omegaBndLast.size()) deviceCopy(obv, omegaBndLast);
     else                     deviceBCValue(dbOmega, omega, obv);
-    if (in.co.gradKLeastSq) deviceLeastSquaresGrad(dm, omega, obv, ogx, ogy, ogz);
+    if (in.co.gradKLeastSq) deviceLeastSquaresGrad(dm, omega, obv, ogx, ogy, ogz, in.cyc);
     else                    deviceGaussGrad(dm, omega, obv, ogx, ogy, ogz);
-    if (pair) deviceCyclicAddGrad(*in.cyc, omega, dm.V, ogx, ogy, ogz);
+    if (pair && !in.co.gradKLeastSq) deviceCyclicAddGrad(*in.cyc, omega, dm.V, ogx, ogy, ogz);   // as for k
     if (in.co.gradKLimitK > scalar(0))
     {
         if (pair)

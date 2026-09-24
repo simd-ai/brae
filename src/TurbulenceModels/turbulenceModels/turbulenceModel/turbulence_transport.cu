@@ -125,15 +125,15 @@ void assembleScalarTransport(
         // patch's -- so a gradient built without the interface limits the pair's cells as if there
         // were a wall there. Inert on every fixture gated so far, all of which name `Gauss upwind`
         // for the closure's transport: a finding of the audit's class, not of a measurement.
+        // ...and the LEAST-SQUARES form carries the pair itself now (device_fvc.cu): the coupled
+        // face goes into the dd tensor with the owner weight and the patch's delta, and into the fit
+        // against the neighbour CELL's value. deviceCyclicAddGrad is the GAUSS face term -- Sf*value/V
+        // -- so it belongs to the Gauss branch alone; adding it to the fit would be a second,
+        // differently normalised copy of the same face.
         const bool pair = sc.cyc && sc.cyc->n > 0;
-        if (pair && leastSq)
-            throw std::runtime_error(
-                "brae turbulence transport: the case asks for a leastSquares gradient for the "
-                "limiter and the mesh has a periodic pair. deviceLeastSquaresGrad carries no "
-                "interface, so the pair's cells would get a gradient fitted without it.");
-        if (leastSq) deviceLeastSquaresGrad(dm, field, bv, g->gx, g->gy, g->gz);
+        if (leastSq) deviceLeastSquaresGrad(dm, field, bv, g->gx, g->gy, g->gz, sc.cyc);
         else         deviceGaussGrad(dm, field, bv, g->gx, g->gy, g->gz);
-        if (pair) deviceCyclicAddGrad(*sc.cyc, field, dm.V, g->gx, g->gy, g->gz);
+        if (pair && !leastSq) deviceCyclicAddGrad(*sc.cyc, field, dm.V, g->gx, g->gy, g->gz);
         if (limitK > scalar(0))
         {
             // cellLimitedGrad folds a coupled patch's patchNeighbourField into its range and clips

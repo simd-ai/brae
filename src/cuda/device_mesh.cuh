@@ -48,6 +48,10 @@ struct DeviceMesh
     // Measured before, gasMixing/injectorPipe at 74,650 cells: the tensor was rebuilt at every one of
     // the 10 least-squares gradients of an iteration, 2.0 of the iteration's 15.8 GPU ms.
     mutable DeviceBuffer<scalar> lsqInvDd;
+    // ...and WHAT IT WAS BUILT WITH. The tensor folds a periodic pair's faces in (leastSquaresVectors.C:
+    // 131-140), so one built without the pair is a different tensor on the pair's cells and the cache
+    // cannot be keyed on the cell count alone. -1 = nothing built yet.
+    mutable int lsqInvDdCycN = -1;
     // non-orthogonal correction (OF "corrected" laplacian/snGrad): nonOrthDc = 1/max(n.delta, 0.05|delta|)
     // is the implicit deltaCoeffs; corrVec = n - delta*nonOrthDc the explicit deferred-correction vector.
     DeviceBuffer<scalar> nonOrthDc, corrVecX, corrVecY, corrVecZ;   // per internal face
@@ -286,9 +290,13 @@ void deviceGaussGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol, cons
 // cells, 16 launches of which nine were velocity components in threes.
 // leastSquares gradient -- the same signature as deviceGaussGrad, so a caller switches on the case's
 // gradScheme and nothing else. See the kernels in device_fvc.cu for why no volume division appears.
+// `cyc` non-null carries the PERIODIC PAIR: the neighbour cell's value across the interface with the
+// coupled fit vector (leastSquaresGrad.C:108-119). SCALARS only -- a scalar is never rotated across the
+// interface, so no transform appears; grad(U) across a pair is refused at its own site.
 void deviceLeastSquaresGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol,
                             const DeviceBuffer<scalar>& bval,
-                            DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz);
+                            DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz,
+                            const struct DeviceCyclic* cyc = nullptr);
 
 void deviceGaussGradFused(const DeviceMesh& dm, int n,
                           const DeviceBuffer<scalar>* const* vol, const DeviceBuffer<scalar>* const* bval,
@@ -306,7 +314,9 @@ void deviceLeastSquaresGradFusedRaw(const DeviceMesh& dm, int n,
                                     scalar* const* gx, scalar* const* gy, scalar* const* gz);
 // The mesh's inverted dd tensor, built on the first request and cached on the mesh (see DeviceMesh).
 // BRAE_LSQ_INVDD=recompute rebuilds it at every request: the control that restores the old path.
-const scalar* lsqInvDdFor(const DeviceMesh& dm);
+// `cyc` non-null folds the periodic pair's faces into the tensor, as leastSquaresVectors.C:131-140
+// does for any coupled patch; the cache remembers which it was built with.
+const scalar* lsqInvDdFor(const DeviceMesh& dm, const struct DeviceCyclic* cyc = nullptr);
 
 // The COUPLED-PATCH half of cellLimitedGrad, which brae's addressing cannot see on its own.
 //

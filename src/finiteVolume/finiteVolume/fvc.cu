@@ -147,15 +147,10 @@ std::vector<symmTensor> leastSquaresInvDd(
     const std::vector<scalar>& w     = g.weights();
     const std::vector<scalar>& magSf = g.magSf();
     const std::vector<vector>& C     = g.C();
-    for (const FvPatch& fp : patches)
-    {
-        if (fp.coupled)
-        {
-            throw std::runtime_error(
-                "brae: a leastSquares gradient on a mesh with the coupled patch '" + fp.name + "' is not "
-                "ported: leastSquaresVectors.C weights a coupled face by the cell on the other side.");
-        }
-    }
+    // A COUPLED patch is folded in below, with the coupled weight and the patch's own delta, where it
+    // used to be refused outright. A ROTATIONAL pair would need the neighbour value transformed into
+    // this side's frame before the fit reads it; attachCyclicCoupling refuses one by name already, so
+    // no patch that reaches here carries a transform.
     std::vector<symmTensor> dd(nC, symmTensor{0, 0, 0, 0, 0, 0});
     for (label f = 0; f < nIf; ++f)
     {
@@ -181,6 +176,17 @@ std::vector<symmTensor> leastSquaresInvDd(
             // On gasMixing/injectorPipe's snappyHexMesh mesh the boundary faces are skewed and it is
             // 5.8e-02 of OpenFOAM's own grad(p), with 90% of the squared error in 77 of 74650 cells,
             // every one of them touching a boundary patch.
+            // ...and a COUPLED face takes the OWNER WEIGHT and fvPatch::delta() as it stands --
+            // `((1 - w)*magSf/magSqr(d))*sqr(d)` (leastSquaresVectors.C:131-140) -- where an uncoupled
+            // one takes the whole face. delta() across a pair is the cell-to-cell vector, not a
+            // patch-normal projection, so lsBoundaryDelta is not the right d there.
+            if (fp.coupled)
+            {
+                const vector d = fp.delta[static_cast<std::size_t>(i)];
+                dd[c] = dd[c] + ((1.0 - fp.weights[static_cast<std::size_t>(i)])
+                                 * (fp.magSf[i] / magSqr(d))) * sqr(d);
+                continue;
+            }
             const vector d = lsBoundaryDelta(fp, i, C[c]);
             dd[c] = dd[c] + (fp.magSf[i] / magSqr(d)) * sqr(d);
         }
@@ -231,6 +237,16 @@ std::vector<vector> leastSquaresGrad(
         for (label i = 0; i < fp.size; ++i)
         {
             const label c = fp.faceCells[i];
+            // the coupled half: the NEIGHBOUR CELL's value, with the coupled fit vector
+            // (leastSquaresGrad.C:108-119). A scalar crosses the interface untransformed.
+            if (fp.coupled)
+            {
+                const vector d = fp.delta[static_cast<std::size_t>(i)];
+                const vector lsP = ((1.0 - fp.weights[static_cast<std::size_t>(i)])
+                                    * (fp.magSf[i] / magSqr(d))) * (invDd[c] & d);
+                grad[c] += lsP * (patchNeighbourValue(fp, i, internal) - internal[c]);
+                continue;
+            }
             const vector d = lsBoundaryDelta(fp, i, C[c]);   // fvPatch::delta(), patch-normal
             const vector lsP = (fp.magSf[i] / magSqr(d)) * (invDd[c] & d);
             grad[c] += lsP * (pv[i] - internal[c]);

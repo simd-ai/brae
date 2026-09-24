@@ -206,7 +206,7 @@ PYEOF
     export CLOSUREDIV="Gauss upwind"
     [ "${profile#sstLimDiv}" != "$profile" ] && export CLOSUREDIV="Gauss limitedLinear 1"
     if [ "$profile" = sst ] || [ "$profile" = sstWalls ] || [ "$profile" = sstCN ] \
-    || [ "${profile#sstLim}" != "$profile" ] \
+    || [ "${profile#sstLim}" != "$profile" ] || [ "${profile#sstLsq}" != "$profile" ] \
     || [ "$profile" = les ] || [ "$profile" = lesWalls ] || [ "$profile" = lesCN ]; then
         # A TURBULENCE CLOSURE ACROSS THE PAIR. kEpsilon was the one closure carried across a cyclic
         # (the case reader refused every other by name); these two profiles are kOmegaSST and LES kEqn
@@ -290,10 +290,25 @@ PYEOF
                 || { echo "FAIL: the $profile profile did not limit grad(U)"; return 1; }
         fi
     fi
+    if [ "${profile#sstLsq}" != "$profile" ]; then
+        # A LEAST-SQUARES GRADIENT ACROSS THE PAIR. leastSquaresVectors.C:131-140 folds a COUPLED face
+        # into the dd tensor with the OWNER WEIGHT and the patch's own delta() -- the cell-to-cell
+        # vector, not the patch-normal projection an uncoupled face takes -- and leastSquaresGrad.C:
+        # 108-119 fits it against the NEIGHBOUR CELL's value. Both arms refused this outright: the host
+        # at fvc.cu's `leastSquaresInvDd`, the device because deviceLeastSquaresGrad carried no
+        # interface. It reaches the closure at the same two sites the cellLimited profile names --
+        # CDkOmega, and the corrected laplacian's non-orthogonal correction.
+        sed -i "s/^gradSchemes .*/gradSchemes     { default Gauss linear; grad(k) leastSquares; grad(omega) leastSquares; }/" \
+            "$C/system/fvSchemes"
+        grep -q "grad(k) leastSquares" "$C/system/fvSchemes" \
+            || { echo "FAIL: the $profile profile did not set leastSquares"; return 1; }
+        grep -q "corrected" "$C/system/fvSchemes" \
+            || { echo "FAIL: the fixture's laplacian is no longer corrected"; return 1; }
+    fi
     if [ "$profile" = walls ] || [ "$profile" = explicitWalls ] \
     || [ "$profile" = sstWalls ] || [ "$profile" = lesWalls ] \
     || [ "$profile" = sstLimWalls ] || [ "$profile" = sstLimUWalls ] \
-    || [ "$profile" = sstLimDivWalls ]; then
+    || [ "$profile" = sstLimDivWalls ] || [ "$profile" = sstLsqWalls ]; then
         # THE CONTROL: the pair replaced by two walls, in the mesh AND in every field that names it.
         # blockMesh numbers the cells from the block, so the two runs' cells are the same cells.
         sed -i 's/type cyclic; neighbourPatch right;/type wall;/; s/type cyclic; neighbourPatch left; */type wall;/' \
@@ -357,7 +372,7 @@ PYEOF
 
 for p in cyclic walls explicitMules explicitWalls jump outer outerControl \
          sst sstWalls les lesWalls sstCN lesCN sstLim sstLimWalls sstLimU sstLimUWalls \
-         sstLimDiv sstLimDivWalls; do
+         sstLimDiv sstLimDivWalls sstLsq sstLsqWalls; do
     stage "$p" || { echo "interfoam_cyclic_vs_openfoam: staging failed"; exit 1; }
 done
 
@@ -416,6 +431,11 @@ rc=0
 # on a mesh with a pair. Its control is the same case with the pair two walls.
 "$BIN" "$W/sstLimDiv" "$W/sstLimDiv/0" "$W/sstLimDiv/$END" "$STEPS" \
        "$W/sstLimDiv/log.interFoam" "$W/sstLimDivWalls/$END" sstLimDiv || rc=1
+# ...and the LEAST-SQUARES gradient across the pair, on both arms: `grad(k) leastSquares` and
+# `grad(omega) leastSquares`, which each loop refused outright until this unit. Its control is the same
+# case with the pair two walls.
+"$BIN" "$W/sstLsq" "$W/sstLsq/0" "$W/sstLsq/$END" "$STEPS" \
+       "$W/sstLsq/log.interFoam" "$W/sstLsqWalls/$END" sstLsq || rc=1
 # ...and the same with grad(U) limited too, HOST ONLY: the device momentum's limiter does not carry
 # the pair and refuses by name (armed in tests/interfoam_refusals.sh).
 "$BIN" "$W/sstLimU" "$W/sstLimU/0" "$W/sstLimU/$END" "$STEPS" \

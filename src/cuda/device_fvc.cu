@@ -1,6 +1,7 @@
 // cf GPU offload (G3): fvc explicit operators on device. interpolate is per-internal-face; div and
 // gaussGrad are per-cell gathers (internal owner/neighbour faces via ownerStart/losort, boundary faces via
 // bndCellStart), race-free, deterministic, matching the CPU fvc to machine precision.
+#include "device_cyclic.cuh"   // DeviceCyclic -- the periodic pair the least-squares fit folds in
 #include "device_mesh.cuh"
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -116,6 +117,16 @@ void lsqInvDdKernel(
     const label* __restrict__ bndIsEmpty,
     const label* __restrict__ bndGFace,
     const scalar* __restrict__ dBndX, const scalar* __restrict__ dBndY, const scalar* __restrict__ dBndZ,
+    // THE PERIODIC PAIR, or null. leastSquaresVectors.C:131-140 folds a COUPLED patch into dd with the
+    // owner weight and the patch's own delta -- `((1 - w)*magSf/magSqr(d))*sqr(d)` -- where an
+    // uncoupled one takes the whole face (`(magSf/magSqr(d))*sqr(d)`). brae's boundary arrays skip
+    // coupled patches by construction, so without this loop the pair's cells were fitted from a
+    // stencil missing a face each.
+    const label* __restrict__ cycCellStart,
+    const label* __restrict__ cycPerm,
+    const scalar* __restrict__ cycW,
+    const scalar* __restrict__ cycMagSf,
+    const scalar* __restrict__ cycDX, const scalar* __restrict__ cycDY, const scalar* __restrict__ cycDZ,
     scalar* __restrict__ idd)     // 6*nC, component-major
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -140,6 +151,15 @@ void lsqInvDdKernel(
         const int gf = bndGFace[bk];
         const vector d = lsqBndDelta(dBndX[bk], dBndY[bk], dBndZ[bk], Sfx[gf], Sfy[gf], Sfz[gf], magSf[gf]);
         dd = dd + (magSf[gf] / magSqr(d)) * sqr(d);
+    }
+    if (cycCellStart)
+    {
+        for (int k = cycCellStart[c]; k < cycCellStart[c + 1]; ++k)
+        {
+            const int j = cycPerm[k];
+            const vector d{cycDX[j], cycDY[j], cycDZ[j]};   // fvPatch::delta(), OF's pd
+            dd = dd + ((1.0 - cycW[j]) * (cycMagSf[j] / magSqr(d))) * sqr(d);
+        }
     }
     const symmTensor r = safeInv(dd);
     idd[0 * nC + c] = r.xx; idd[1 * nC + c] = r.xy; idd[2 * nC + c] = r.xz;
@@ -167,6 +187,15 @@ void lsqGradKernel(
     const scalar* __restrict__ dBndX, const scalar* __restrict__ dBndY, const scalar* __restrict__ dBndZ,
     const scalar* __restrict__ bval,
     const scalar* __restrict__ idd,
+    // the pair, or null: leastSquaresGrad.C:108-119 takes the NEIGHBOUR CELL's value across a coupled
+    // patch, with the coupled fit vector `((1 - w)*magSf/magSqr(d))*(invDd & d)`. A SCALAR is never
+    // rotated across the interface, which is why this form serves k and omega and not grad(U).
+    const label* __restrict__ cycCellStart,
+    const label* __restrict__ cycPerm,
+    const label* __restrict__ cycNbrCell,
+    const scalar* __restrict__ cycW,
+    const scalar* __restrict__ cycMagSf,
+    const scalar* __restrict__ cycDX, const scalar* __restrict__ cycDY, const scalar* __restrict__ cycDZ,
     scalar* __restrict__ gx, scalar* __restrict__ gy, scalar* __restrict__ gz)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -196,6 +225,16 @@ void lsqGradKernel(
         const int gf = bndGFace[bk];
         const vector d = lsqBndDelta(dBndX[bk], dBndY[bk], dBndZ[bk], Sfx[gf], Sfy[gf], Sfz[gf], magSf[gf]);
         s += ((magSf[gf] / magSqr(d)) * (bval[bk] - vc)) * (iv & d);
+    }
+    if (cycCellStart)
+    {
+        for (int k = cycCellStart[c]; k < cycCellStart[c + 1]; ++k)
+        {
+            const int j = cycPerm[k];
+            const vector d{cycDX[j], cycDY[j], cycDZ[j]};
+            const scalar msd = cycMagSf[j] / magSqr(d);
+            s += ((1.0 - cycW[j]) * msd * (vf[cycNbrCell[j]] - vc)) * (iv & d);
+        }
     }
     // No division by V: the fit vectors already carry the normalisation.
     gx[c] = s.x; gy[c] = s.y; gz[c] = s.z;
@@ -432,7 +471,7 @@ void launchLsqFused(
 } // namespace
 
 
-const scalar* lsqInvDdFor(const DeviceMesh& dm)
+const scalar* lsqInvDdFor(const DeviceMesh& dm, const DeviceCyclic* cyc)
 {
     // The control: rebuild at every request, which is what every gradient did before FP-3.
     static const bool recompute = []()
@@ -441,8 +480,11 @@ const scalar* lsqInvDdFor(const DeviceMesh& dm)
         return e && std::string(e) == "recompute";
     }();
     const int nC = dm.nCells;
+    const int cycN = (cyc && cyc->n > 0) ? cyc->n : 0;
     const std::size_t want = static_cast<std::size_t>(6) * nC;
-    if (dm.lsqInvDd.size() == want && !recompute) return dm.lsqInvDd.data();
+    // the pair is PART of the tensor, so a cached one built without it (or with a different one) is
+    // not this mesh's -- see DeviceMesh::lsqInvDdCycN
+    if (dm.lsqInvDd.size() == want && dm.lsqInvDdCycN == cycN && !recompute) return dm.lsqInvDd.data();
     static bool announced = false;
     if (!announced)
     {
@@ -457,17 +499,24 @@ const scalar* lsqInvDdFor(const DeviceMesh& dm)
         dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
         dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
         dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), dm.bndGFace.data(),
-        dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), dm.lsqInvDd.data());
+        dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(),
+        cycN ? cyc->ifCellStart.data() : nullptr, cycN ? cyc->ifPerm.data() : nullptr,
+        cycN ? cyc->weights.data() : nullptr, cycN ? cyc->magSf.data() : nullptr,
+        cycN ? cyc->dX.data() : nullptr, cycN ? cyc->dY.data() : nullptr, cycN ? cyc->dZ.data() : nullptr,
+        dm.lsqInvDd.data());
     cudaCheck(cudaGetLastError(), "lsqInvDd");
+    dm.lsqInvDdCycN = cycN;
     return dm.lsqInvDd.data();
 }
 
 
 void deviceLeastSquaresGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol,
                             const DeviceBuffer<scalar>& bval,
-                            DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz)
+                            DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz,
+                            const DeviceCyclic* cyc)
 {
     const int nC = dm.nCells;
+    const int cycN = (cyc && cyc->n > 0) ? cyc->n : 0;
     gx.resize(nC); gy.resize(nC); gz.resize(nC);
     // The single-field kernel stays the reference the fused one is held against; it does NOT forward
     // to the fused path (the same reason deviceGaussGrad does not).
@@ -478,7 +527,11 @@ void deviceLeastSquaresGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vo
         dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
         dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(), vol.data(),
         dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), dm.bndGFace.data(),
-        dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), bval.data(), lsqInvDdFor(dm),
+        dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), bval.data(), lsqInvDdFor(dm, cyc),
+        cycN ? cyc->ifCellStart.data() : nullptr, cycN ? cyc->ifPerm.data() : nullptr,
+        cycN ? cyc->nbrCell.data() : nullptr,
+        cycN ? cyc->weights.data() : nullptr, cycN ? cyc->magSf.data() : nullptr,
+        cycN ? cyc->dX.data() : nullptr, cycN ? cyc->dY.data() : nullptr, cycN ? cyc->dZ.data() : nullptr,
         gx.data(), gy.data(), gz.data());
     cudaCheck(cudaGetLastError(), "lsqGrad");
 }
