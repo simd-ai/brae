@@ -131,6 +131,62 @@ inline ForceResult wallForces(
     return R;
 }
 
+// functionObjects::forces on a BODY's patches, which is the shape rigidBodyMeshMotion::solve asks for
+// (rigidBodyMeshMotion.C:296-307: type forces, the body's patches, rhoInf, rho, CofR (0 0 0)) and NOT
+// the shape wallForces above carries. Three things differ and each is measured, not assumed:
+//   * the pressure is REAL. forces::rho(const volScalarField& p) returns 1 whenever p carries pressure
+//     dimensions (forces.C), which is interFoam's p -- so fP is Sf*(p - pRef) with no density in it,
+//     where the kinematic branch multiplies by rhoInf.
+//   * the viscous stress carries the PER-FACE density and effective viscosity the fields hold:
+//     devRhoReff = -rho(patchi)*nuEff(patchi)*devTwoSymm(gradU) (forces.C, the incompressible
+//     turbulence branch). A two-phase wall has water on one face and air on the next, a thousand to
+//     one, and a single rhoInf cannot stand for both.
+//   * nut is the closure's own at the patch, not a wall function recomputed here.
+// The sums are accumulated per patch and then added, as addToPatchFields does with sum(fP).
+inline ForceResult bodyForces(
+    const GeometricField<vector>&           U,
+    const std::vector<std::vector<scalar>>& pB,       // per patch, per face
+    const std::vector<std::vector<scalar>>& rhoB,
+    const std::vector<std::vector<scalar>>& nuEffB,
+    const PrimitiveMesh&                    m,
+    const FvGeometry&                       g,
+    const std::vector<FvPatch>&             patches,
+    const std::vector<label>&               bodyPatches,
+    const vector&                           CofR,
+    scalar                                  pRef)
+{
+    const std::vector<tensor> gradC = fvc::gaussGrad(U, m, g, patches);
+    const std::vector<std::vector<tensor>> gradB = fvc::gradUBoundary(U, gradC, m, g, patches);
+    ForceResult R;
+    for (const label pi : bodyPatches)
+    {
+        const std::size_t k = static_cast<std::size_t>(pi);
+        const FvPatch& wp = patches[k];
+        vector sfP{0, 0, 0};
+        vector sfV{0, 0, 0};
+        vector smP{0, 0, 0};
+        vector smV{0, 0, 0};
+        for (label i = 0; i < wp.size; ++i)
+        {
+            const std::size_t f = static_cast<std::size_t>(i);
+            const vector Sf = g.Sf()[wp.start + i];
+            const vector Md = g.Cf()[wp.start + i] - CofR;
+            const tensor devReff = (-rhoB[k][f]*nuEffB[k][f])*devTwoSymm(gradB[k][f]);
+            const vector fP = (pB[k][f] - pRef)*Sf;
+            const vector fV = dot(Sf, devReff);
+            sfP = sfP + fP;
+            sfV = sfV + fV;
+            smP = smP + cross(Md, fP);
+            smV = smV + cross(Md, fV);
+        }
+        R.pressure = R.pressure + sfP;
+        R.viscous = R.viscous + sfV;
+        R.momentP = R.momentP + smP;
+        R.momentV = R.momentV + smV;
+    }
+    return R;
+}
+
 // forceCoeffs: Cd/Cl along drag/lift dirs, CmPitch about the pitch axis. q = 0.5*rhoRef*magUInf^2.
 // OF forceCoeffs builds a cartesian coordinate system cartesian(origin, e3=liftDir, e1=dragDir) and reports
 // CmPitch = moment . e2 with e2 = e3 x e1 = liftDir x dragDir (the DERIVED side axis), NOT the dict `pitchAxis`

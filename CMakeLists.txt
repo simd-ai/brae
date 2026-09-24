@@ -3703,6 +3703,14 @@ target_link_libraries(test_inter_limitedlinear_vs_openfoam PRIVATE brae_core)
 add_test(NAME interfoam_limitedlinear_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_limitedlinear_vs_openfoam.sh)
 
+# brae's fluid force and moment on a body's patches against real OpenFOAM's functionObjects::forces.
+add_executable(test_rigid_body_forces_vs_openfoam tests/test_rigid_body_forces_vs_openfoam.cu)
+target_include_directories(test_rigid_body_forces_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_rigid_body_forces_vs_openfoam PRIVATE brae_core)
+add_test(NAME rigid_body_forces_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rigid_body_forces_vs_openfoam.sh)
+
 # brae's rigid-body point transform against real OpenFOAM's pointDisplacement, with the joint state
 # taken from OpenFOAM's own. The script carries the measurements and the controls.
 add_executable(test_rigid_body_transform_vs_openfoam tests/test_rigid_body_transform_vs_openfoam.cu)
