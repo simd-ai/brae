@@ -533,12 +533,18 @@ SolverPerformance gamgCoarsestPcgDic(
     std::vector<scalar>& psi,
     const std::vector<scalar>& source,
     scalar tolerance,
-    scalar relTol)
+    scalar relTol,
+    const std::vector<label>& ifOwn,
+    const std::vector<label>& ifNbr,
+    const std::vector<scalar>& ifCoeff)
 {
     LduLevel A;
     A.addr = &addr;
     A.diag = diag;
     A.upper = upper;
+    A.ifOwn = ifOwn;
+    A.ifNbr = ifNbr;
+    A.ifCoeff = ifCoeff;
     return pcgDic(A, psi, source, tolerance, relTol);
 }
 

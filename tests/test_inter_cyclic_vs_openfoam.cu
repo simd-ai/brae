@@ -178,12 +178,13 @@ int main(
     // worth nut 7.1e-04 after ten steps. What holds the device here is the ASSEMBLED SYSTEM from a
     // spun-up field (the `assembly` arm of tests/interfoam_cyclic_vs_openfoam.sh): the pair's own
     // off-diagonal 1.7e-10 against the host's, with the device's upwind run as the control.
-    // `gamg` is HOST ONLY, and its device arm is asserted to REFUSE rather than skipped: the device
-    // hierarchy carries no interface at any level, and a GAMG without the interface coefficients
-    // solves the two sides of a pair as unconnected walls AND CONVERGES -- it ran and read alpha
-    // 2.9722e-03 from OpenFOAM against the host's 2.6402e-13 on the same case. The refusal is at
-    // deviceGamgSolve's entry, and this arm is what says it is still there.
-    const bool gamgProfile = (profile == "gamg");
+    // `gamg` runs on BOTH arms: every coarse level of either hierarchy agglomerates the pair as
+    // cyclicGAMGInterface does. What the device arm is really holding is the sign: deviceAmul applies
+    // Apsi[cycOwn] += cycCoeff*psi[cycNbr] where the host reference subtracts its own boundaryCoeffs,
+    // so the device agglomerates ITS OWN level-0 coefficients rather than transcribing the host's --
+    // a flipped interface converges to something plausible. Before the port this arm ran unrefused and
+    // read alpha 2.9722e-03 from OpenFOAM against the host's 2.6402e-13 on the same case.
+    const bool gamgProfile = false;
     const bool hostOnlyProfile = (profile == "sstLimDiv");
     const bool lesProfile = (profile == "les" || profile == "lesCN");
     const bool turbProfile = sstProfile || lesProfile;

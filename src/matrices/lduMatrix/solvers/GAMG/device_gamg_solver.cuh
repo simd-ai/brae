@@ -60,11 +60,31 @@ struct DeviceGamgLevel
     DeviceBuffer<scalar> rA;
     DeviceBuffer<scalar> wA;
 
+    // THE COUPLED PAIR at this level, agglomerated as cyclicGAMGInterface does: coarse faces keyed on
+    // the coarse cell pair, and a CSR from each coarse interface face to the fine ones that merged
+    // into it, so the coefficients restrict by the same deterministic gather the upper coefficients
+    // use. The device's sign convention is kept throughout -- deviceAmul applies
+    // Apsi[cycOwn] += cycCoeff*psi[cycNbr], where the host reference subtracts its own
+    // boundaryCoeffs; transcribing the host's numbers across would flip the interface and still
+    // converge, which is exactly how the unrefused device GAMG read alpha 2.97e-03 and looked
+    // plausible.
+    int nCyc = 0;
+    DeviceBuffer<label>  cycOwn, cycNbr;
+    DeviceBuffer<scalar> cycCoeff;
+    DeviceBuffer<label>  cycStart, cycList;   // coarse interface face -> the fine ones
+
     // the symmetric view: DIC is DILU with lower aliased to upper
     DeviceLduView view() const
     {
         DeviceLduView v = A.view();
         v.lower = v.upper;
+        if (nCyc > 0)
+        {
+            v.nCyc = nCyc;
+            v.cycOwn = cycOwn.data();
+            v.cycNbr = cycNbr.data();
+            v.cycCoeff = cycCoeff.data();
+        }
         return v;
     }
 };
@@ -79,6 +99,9 @@ struct DeviceGamgHierarchy
     DeviceBuffer<scalar> finestResidual;
     DeviceBuffer<scalar> rA;
     DeviceBuffer<scalar> wA;
+    // the addressingId of the finest matrix the coarse interfaces were built from, or 0. The pair's
+    // own/neighbour cells are the mesh's, so they outlive a solve; the coefficients do not.
+    unsigned long long cycBuiltFor = 0;
 };
 
 // THE MESH'S HIERARCHY, host and device, built by the first GAMG solve of the run from THAT entry's

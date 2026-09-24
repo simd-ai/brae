@@ -1,3 +1,4 @@
+#include <map>
 #include "device_gamg_solver.cuh"
 #include "device_blas.cuh"
 #include "device_sym_gauss_seidel.cuh"
@@ -312,9 +313,79 @@ struct GamgSetup
     label coarsestLevel = 0;
     std::vector<scalar> coarsestDiag;
     std::vector<scalar> coarsestUpper;
+    std::vector<label>  coarsestIfOwn, coarsestIfNbr;
+    std::vector<scalar> coarsestIfCoeff;
     const GamgLduAddressing* coarsestAddr = nullptr;
     GamgSmootherKind kind;
 };
+
+
+// THE COARSE INTERFACES, built once per hierarchy from the finest matrix's pair. This is
+// cyclicGAMGInterface's constructor on the host side of the upload: each fine interface face is keyed
+// on the COARSE CELL PAIR it now joins, an existing pair reuses that coarse face, a new one appends
+// a face whose cells are the two coarse cells. The fine->coarse map is then inverted into the CSR the
+// per-solve gather reads, so the coefficients restrict without atomics and in a fixed order.
+//
+// The pair's cells are read back ONCE, at build: they are the mesh's addressing, not a solve's, and
+// the pair is small (tens of faces where the mesh has thousands of cells). The COEFFICIENTS never
+// come back to the host -- they are gathered on the device at every solve, like the upper ones.
+void buildGamgInterfaces(
+    DeviceGamgHierarchy& h,
+    const DeviceLduView& fine)
+{
+    if (fine.nCyc <= 0 || h.cycBuiltFor == fine.addressingId) return;
+    const std::size_t nFine = static_cast<std::size_t>(fine.nCyc);
+    std::vector<label> own(nFine), nbr(nFine);
+    cudaMemcpy(own.data(), fine.cycOwn, nFine*sizeof(label), cudaMemcpyDeviceToHost);
+    cudaMemcpy(nbr.data(), fine.cycNbr, nFine*sizeof(label), cudaMemcpyDeviceToHost);
+    cudaCheck(cudaGetLastError(), "gamg interface read-back");
+
+    const GamgAgglomeration& a = *h.host;
+    // level 0's "fine" interface is the matrix's own; each level restricts the one above it
+    std::vector<label> fineOwn = own, fineNbr = nbr;
+    for (label leveli = 0; leveli < a.size(); ++leveli)
+    {
+        const std::size_t li = static_cast<std::size_t>(leveli);
+        DeviceGamgLevel& L = h.level[li];
+        const std::vector<label>& cellMap = a.restrictAddressing[li];
+        std::map<std::pair<label, label>, label> seen;
+        std::vector<label> cOwn, cNbr, mapToCoarse(fineOwn.size());
+        for (std::size_t f = 0; f < fineOwn.size(); ++f)
+        {
+            const label co = cellMap[static_cast<std::size_t>(fineOwn[f])];
+            const label cn = cellMap[static_cast<std::size_t>(fineNbr[f])];
+            const std::pair<label, label> key(co, cn);
+            auto it = seen.find(key);
+            if (it == seen.end())
+            {
+                it = seen.emplace(key, static_cast<label>(cOwn.size())).first;
+                cOwn.push_back(co);
+                cNbr.push_back(cn);
+            }
+            mapToCoarse[f] = it->second;
+        }
+        // invert into the CSR the gather reads, fine faces ASCENDING within each coarse face
+        std::vector<label> start(cOwn.size() + 1, 0);
+        for (const label cf : mapToCoarse) ++start[static_cast<std::size_t>(cf) + 1];
+        for (std::size_t i = 1; i < start.size(); ++i) start[i] += start[i - 1];
+        std::vector<label> list(mapToCoarse.size());
+        std::vector<label> fill(start.begin(), start.end() - 1);
+        for (std::size_t f = 0; f < mapToCoarse.size(); ++f)
+        {
+            list[static_cast<std::size_t>(fill[static_cast<std::size_t>(mapToCoarse[f])]++)] =
+                static_cast<label>(f);
+        }
+        L.nCyc = static_cast<int>(cOwn.size());
+        L.cycOwn.copyFrom(cOwn);
+        L.cycNbr.copyFrom(cNbr);
+        L.cycCoeff.resize(cOwn.size());
+        L.cycStart.copyFrom(start);
+        L.cycList.copyFrom(list);
+        fineOwn = cOwn;
+        fineNbr = cNbr;
+    }
+    h.cycBuiltFor = fine.addressingId;
+}
 
 GamgSetup gamgSetup(
     const DeviceLduView& Ain,
@@ -378,11 +449,33 @@ GamgSetup gamgSetup(
             L.A.diag.data());
         launchCheck("coarse diagonal");
         gatherSum(L.faceStart, L.faceList, fineUpper, L.A.upper);
+        // ...and the interface's, through the CSR buildGamgInterfaces inverted: the same gather, so a
+        // coarse interface coefficient is the sum of its fine ones in a fixed order
+        if (L.nCyc > 0)
+        {
+            const scalar* fineCyc = leveli == 0
+                ? A.cycCoeff
+                : h.level[static_cast<std::size_t>(leveli) - 1].cycCoeff.data();
+            gatherSum(L.cycStart, L.cycList, fineCyc, L.cycCoeff);
+        }
     }
     // the coarsest level is solved on the host: its matrix comes down once per solve
     DeviceGamgLevel& LC = h.level[static_cast<std::size_t>(coarsestLevel)];
     S.coarsestDiag = LC.A.diag.host();
     S.coarsestUpper = LC.A.upper.host();
+    // ...and the coarsest level's PAIR, brought down with it: the direct solve there is the host's,
+    // and a coarsest level solved without the interface leaves the two sides of the pair uncoupled on
+    // the one level where every cell of the mesh is a few cells away. MEASURED with it missing:
+    // device alpha 2.1007e-09 against OpenFOAM where the host arm reads 2.6401e-13.
+    // NEGATED on the way: deviceAmul ADDS cycCoeff*psi[nbr], gamg_solver_cpp.cu's Amul SUBTRACTS its
+    // own, so the same interface is the same numbers with the opposite sign.
+    if (LC.nCyc > 0)
+    {
+        S.coarsestIfOwn = LC.cycOwn.host();
+        S.coarsestIfNbr = LC.cycNbr.host();
+        S.coarsestIfCoeff = LC.cycCoeff.host();
+        for (scalar& c : S.coarsestIfCoeff) c = -c;
+    }
     S.coarsestAddr = &h.host->meshLevels[static_cast<std::size_t>(coarsestLevel)];
 
     // initVcycle: the smoothers. DIC's reciprocal diagonal, per level, for THIS matrix -- refreshed even
@@ -461,7 +554,10 @@ void vCycle(
             coarsestCorr,
             coarsestSource,
             controls.tolerance,
-            controls.relTol);
+            controls.relTol,
+            S.coarsestIfOwn,
+            S.coarsestIfNbr,
+            S.coarsestIfCoeff);
         LC.corr.copyFrom(coarsestCorr);
         if (log)
         {
@@ -605,20 +701,20 @@ DeviceSolverPerf deviceGamgSolve(
     const GamgControls& controls,
     GamgSolveLog* log)
 {
-    // THE HIERARCHY CARRIES NO INTERFACE on this arm yet. The host reference does now (every coarse
-    // level agglomerates the pair as cyclicGAMGInterface does, gated by the `gamg` profile in
-    // tests/interfoam_cyclic_vs_openfoam.sh); this loop does not, and a solver without the interface
-    // coefficients solves the two sides of a pair as unconnected walls AND CONVERGES. MEASURED on
-    // validation/interFoamCyclic with GAMG on p_rgh: alpha 2.9722e-03 and p_rgh 9.1531e-04 from
-    // OpenFOAM, against the host's 2.6e-13 and 3.4e-12 on the same case. Refused rather than run it.
-    if (Ain.nCyc > 0 || Ain.nAmi > 0)
+    // A CYCLIC PAIR is carried at every level now (buildGamgInterfaces). An AMI is not: its neighbour
+    // is a weighted sum of several cells, which a coarse face of one neighbour cell cannot hold --
+    // cyclicGAMGInterface keys on a coarse CELL PAIR -- and the host reference refuses it for the same
+    // reason. Without the interface a GAMG solves the two sides as unconnected walls AND CONVERGES,
+    // so this stays a refusal and not a silent run: MEASURED before the port, alpha 2.9722e-03 from
+    // OpenFOAM against the host's 2.6e-13 on the same case.
+    if (Ain.nAmi > 0)
     {
         throw std::runtime_error(
-            "brae device GAMG: the matrix carries a coupled interface ("
-            + std::to_string(Ain.nCyc) + " cyclic, " + std::to_string(Ain.nAmi) + " AMI faces) and "
-            "the device hierarchy holds no interface coefficients at any level -- it would solve the "
-            "two sides as unconnected walls and converge. The host loop runs it (gamg_solver_cpp.cu).");
+            "brae device GAMG: the matrix carries an AMI interface (" + std::to_string(Ain.nAmi)
+            + " faces). Its neighbour value is a weighted sum of several cells, which a coarse "
+            "interface face of one neighbour cell cannot carry. A plain cyclic runs.");
     }
+    buildGamgInterfaces(h, Ain);
     const GamgSetup S = gamgSetup(Ain, fineDic, h, controls);
     const DeviceLduView& A = S.A;
     const int nCells = A.nCells;
@@ -666,6 +762,16 @@ DeviceSolverPerf devicePcgGamgSolve(
     {
         throw std::runtime_error("brae device GAMG preconditioner: nVcycles must be at least 1.");
     }
+    // the same two as deviceGamgSolve: an AMI cannot be agglomerated onto a coarse cell pair, a
+    // cyclic is carried at every level
+    if (Ain.nAmi > 0)
+    {
+        throw std::runtime_error(
+            "brae device GAMG preconditioner: the matrix carries an AMI interface ("
+            + std::to_string(Ain.nAmi) + " faces). Its neighbour value is a weighted sum of several "
+            "cells, which a coarse interface face of one neighbour cell cannot carry.");
+    }
+    buildGamgInterfaces(h, Ain);
     const GamgSetup S = gamgSetup(Ain, fineDic, h, precond.gamg);
     const DeviceLduView& A = S.A;
     const int nCells = A.nCells;

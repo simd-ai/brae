@@ -485,7 +485,11 @@ arm baffle_massFlux         refused "MASS flux"                        "" "${PRG
 arm baffle_DTable           refused "a Function1 other than"           "" "sed -i 's/^\\( *D  *\\)1000;/\\1table ((0 1000) (1 2000));/' 0/p_rgh"
 arm baffle_noLength         refused "needs \`D\`, \`I\` and \`length\`"   "" "sed -i '/^ *length  *0.15;/d' 0/p_rgh"
 arm baffle_noJump           refused "has no \`jump\` entry"             "" "sed -i '/^ *jump  *uniform 0;/d' 0/p_rgh"
-arm baffle_GAMG             refused "GAMG does not carry the interface" "" "python3 -c \"import re; p='system/fvSolution'; t=open(p).read(); t=re.sub(r'(\\n    p_rgh\\s*\\{\\s*solver\\s+)PCG;\\s*preconditioner\\s+DIC;', r'\\1GAMG; smoother DIC;', t); open(p,'w').write(t)\""
+# GAMG ACROSS THE PAIR RUNS on the host now: every coarse level agglomerates the interface as
+# cyclicGAMGInterface does, and tests/interfoam_cyclic_vs_openfoam.sh `gamg` holds it to OpenFOAM
+# (30 of 30 p_rgh counts, alpha 2.6e-13). A refusal coming back fails this arm. The DEVICE still
+# refuses it, asserted in that gate rather than here.
+arm baffle_GAMG             runs    -                                 "" "python3 -c \"import re; p='system/fvSolution'; t=open(p).read(); t=re.sub(r'(\\n    p_rgh\\s*\\{\\s*solver\\s+)PCG;\\s*preconditioner\\s+DIC;', r'\\1GAMG; smoother DIC;', t); open(p,'w').write(t)\""
 arm baffle_momentumPredictor refused "a momentum predictor across the coupled patch" "" "sed -i 's/momentumPredictor  *no;/momentumPredictor   yes;/; /^ *minIter  *1;/d' system/fvSolution"
 # `cellLimited grad(U)` ACROSS A CYCLIC RUNS on the host now: the refusal said cellLimitedGrad's
 # coupled range was gated across a cyclicAMI only, which was true until validation/interFoamCyclic

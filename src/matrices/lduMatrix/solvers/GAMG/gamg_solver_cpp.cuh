@@ -154,6 +154,9 @@ struct GamgSolveLog
 // (GAMGSolverSolve.C:530-544). Public because the device V-cycle runs this level on the HOST: it has
 // at least nCellsInCoarsestLevel cells -- ten by default, twelve on the wave tank -- which is a pair of
 // short copies against dozens of kernel launches and a read-back per iteration.
+// `ifOwn`/`ifNbr`/`ifCoeff` are the coarsest level's coupled pair, in THIS file's sign convention --
+// Amul subtracts ifCoeff*psi[neighbour]. The device arm brings its coarsest level down to be solved
+// here and must negate its own coefficients on the way (deviceAmul adds them). Empty = no pair.
 SolverPerformance gamgCoarsestPcgDic(
     const GamgLduAddressing& addr,
     const std::vector<scalar>& diag,
@@ -161,7 +164,10 @@ SolverPerformance gamgCoarsestPcgDic(
     std::vector<scalar>& psi,
     const std::vector<scalar>& source,
     scalar tolerance,
-    scalar relTol);
+    scalar relTol,
+    const std::vector<label>& ifOwn = {},
+    const std::vector<label>& ifNbr = {},
+    const std::vector<scalar>& ifCoeff = {});
 
 // GAMGSolver::solve. Folds the boundary like fvMatrix::solve and solves A*psi = b in place. Throws
 // if M is not symmetric, or names a smoother gamgSmootherPorted() does not list.
