@@ -263,7 +263,27 @@ Interfaces setup(
     }
     // centres, volumes and the interpolation factors from the split areas, then the patches from them
     g.buildCellGeometry(m);
-    patches = buildPatches(m, g, /*mirrorACMI=*/true);
+    // IN PLACE, element by element. `patches = buildPatches(...)` MOVE-ASSIGNS, which steals the
+    // returned vector's buffer and leaves the old storage freed -- even when the size is unchanged.
+    // Every fvPatchField holds `const FvPatch&` into this vector, so on a mesh that MOVES (where this
+    // runs again with the fields already built) every one of those references dangles. MEASURED: a
+    // scaled cyclicACMI on a moving mesh segfaulted in PressureInletOutletVelocityPatchField::evaluate
+    // at the first U.evaluateBoundary() after the move, with the vector's data pointer moving from
+    // 0xaaaaab7c9150 to 0xaaaaab8d3590 across this line at size 9 both sides.
+    {
+        std::vector<FvPatch> rebuilt = buildPatches(m, g, /*mirrorACMI=*/true);
+        if (rebuilt.size() != patches.size())
+        {
+            throw std::runtime_error(
+                "brae cyclicACMI::setup: the rebuilt patch list has " + std::to_string(rebuilt.size())
+                + " patches where the mesh had " + std::to_string(patches.size())
+                + ". The fields hold references into this vector; it cannot change length under them.");
+        }
+        for (std::size_t i = 0; i < rebuilt.size(); ++i)
+        {
+            patches[i] = std::move(rebuilt[i]);
+        }
+    }
     for (const auto& pr : pairs)
     {
         FvPatch& p = patches[static_cast<std::size_t>(pr.first)];

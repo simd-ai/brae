@@ -366,6 +366,24 @@ RunReport runInterFoam(
                     "brae interFoam: the case scales a cyclicACMI interface AND moves its mesh. OpenFOAM "
                     "then re-runs the AMI and rescales the mesh flux in cyclicACMIFvPatch::movePoints; "
                     "that is not ported.");
+                // WHAT THAT PORT NEEDS, measured rather than guessed. Calling
+                // cpu::cyclicACMI::setup(m, g, patches, time) at the move IS the right shape -- it is
+                // resetAMI() then scalePatchFaceAreas(), which is what initMovePoints does -- and with
+                // attachCyclicCoupling behind it (the move leaves every patch uncoupled, and only a
+                // cyclicAMI is re-coupled today) the case runs. Three things stood in the way:
+                //   * `patches = buildPatches(...)` inside setup MOVE-ASSIGNED, stealing the returned
+                //     vector's buffer and freeing the old one even at equal size. Every fvPatchField
+                //     holds `const FvPatch&` into that vector, so the first U.evaluateBoundary() after
+                //     the move read freed memory. gdb: SIGSEGV in
+                //     PressureInletOutletVelocityPatchField<vector>::evaluate, the vector's data moving
+                //     0xaaaaab7c9150 -> 0xaaaaab8d3590 at size 9 both sides. setup assigns element by
+                //     element now, so it is safe to call on a live mesh -- that part is done.
+                //   * the only cyclicACMI fixture in the tree is RAS/damBreakLeakage, and ACMI beside a
+                //     turbulence closure is refused for its own reason (k/epsilon 1.2e-03 static).
+                //   * with the motion staged on it, MEASURED laminar against OpenFOAM: p_rgh 3.5e-12
+                //     and alpha 6.8e-12 at ten steps, but max|U| is 7.3e-06 and stays near 2.7e-04 at a
+                //     hundred, so no velocity comparison on this fixture discriminates anything. A
+                //     fixture whose flow actually develops with the mesh moving is the first unit.
             }
             // WHERE IN THE STEP the rescale lands is part of the answer (cyclic_acmi_cpp.cuh): after
             // alphaEqn.H forms phic and before the pre-solve. That point is gated for the pre-solving
