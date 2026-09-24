@@ -1284,14 +1284,25 @@ InterFields buildInterFields(const std::string&          caseDir,
         if (firstCoupled)
         {
             const std::string who = "brae interFoam: the case has the cyclic patch `" + firstCoupled->name + "` AND ";
-            // a cyclicAMI pair is coupled again after every move (cyclic_ami_cpp, the driver's mesh
-            // update); a cyclic or cyclicACMI pair is coupled once
-            bool allAMI = true;
+            // WHICH PAIRS ARE COUPLED AGAIN AFTER A MOVE. A cyclicAMI is (cyclic_ami_cpp, through the
+            // driver's mesh update). A cyclicACMI is too, now: interMeshUpdate re-runs
+            // cpu::cyclicACMI::setup on the moved points -- resetAMI() then scalePatchFaceAreas(),
+            // which is what cyclicACMIFvPatch::movePoints does -- and attachCyclicCoupling behind it,
+            // so a PLAIN CYCLIC in the same mesh is re-coupled with it and its weights and deltas are
+            // the moved geometry's. Without an ACMI nothing re-runs attachCyclicCoupling, so a plain
+            // cyclic on a mesh that moves is still refused: its weights would be the start's.
+            bool hasACMI = false;
             for (const FvPatch& q : patches)
             {
-                allAMI = allAMI && (!q.coupled || q.type == "cyclicAMI");
+                hasACMI = hasACMI || q.type == "cyclicACMI";
             }
-            if (f.dynamicMesh && !allAMI)
+            bool allRecoupled = true;
+            for (const FvPatch& q : patches)
+            {
+                allRecoupled = allRecoupled
+                            && (!q.coupled || q.type == "cyclicAMI" || q.type == "cyclicACMI" || hasACMI);
+            }
+            if (f.dynamicMesh && !allRecoupled)
                 throw std::runtime_error(who + "a moving mesh. The pair's weights and deltas are taken once.");
             if (!f.mrfZones.empty())
                 throw std::runtime_error(who + "an active MRF zone. MRF's face lists do not carry coupled faces here.");

@@ -141,6 +141,15 @@ public:
     }
     // fvMesh::phi(): the mesh-motion flux of the current step. Empty patches carry zeros here;
     // OpenFOAM's have no faces.
+    // MUTABLE, for cyclicACMIFvPatch::movePoints alone: fvMesh::movePoints runs the boundary's own
+    // movePoints as part of the move, and an ACMI's scales the mesh flux to the face areas its
+    // updateAreas just changed (cyclicACMIFvPatch.C). The swept volume computed above is the face's
+    // FULL geometric flux, so the pair's two halves must be weighted by the mask afterwards or the
+    // mesh flux and the face area disagree by it.
+    SurfaceScalarField& meshPhiRef()
+    {
+        return meshPhi_;
+    }
     const SurfaceScalarField& meshPhi() const
     {
         return meshPhi_;

@@ -150,6 +150,46 @@ void interMeshUpdate(
         f.meshPhiPrevIndex = timeIndex;
     }
     dyn->update(time, rep.deltaT, timeIndex, finalIteration, &gamgCache);
+    // cyclicACMIFvPatch::movePoints, HERE and not later: fvMesh::movePoints runs the boundary's own
+    // movePoints as part of the move, so it lands before fvc::meshPhi is read -- and under
+    // CrankNicolson the off-centred mesh flux is built from it, so a scaling applied after that blend
+    // would be blended out of the flux the step actually uses.
+    //
+    // It is two things (cyclicACMIFvPatch.C):
+    //   1. updateAreas() -- the AMI re-run on the moved points, the mask re-applied, the face areas
+    //      rescaled. cpu::cyclicACMI::setup IS that: it also rebuilds `g` from the scaled areas and
+    //      `patches` from `g`, in place on the caller's objects. attachCyclicCoupling follows, as at
+    //      the start, because rebuilding the patch list leaves a plain cyclic uncoupled and
+    //      damBreakLeakage carries one beside the ACMI pair.
+    //   2. THE MESH FLUX SCALED to the areas that just changed:
+    //          the coupled face   phip *= magSf/geomArea, which scalePatchFaceAreas makes
+    //                             max(tolerance, mask)
+    //          the non-overlap    phip *= 1 - mask
+    //      The swept volume dyn->update() just computed is the face's FULL geometric flux, so without
+    //      this the mesh flux and the face area disagree by the mask and the discrete space
+    //      conservation law breaks. MEASURED on damBreakLeakage shaken from t = 0.49: worst
+    //      |div(phi)| 2.630e+01 and alpha reaching 1.89 without it, against OpenFOAM's
+    //      1.00000000000037, and 1.5e-10 / 1.0000000000005 with it.
+    //      OpenFOAM zeroes a coupled face whose AMI found no partner; this loop couples a COINCIDENT
+    //      pair only (cpu::cyclicACMI::setup refuses any other), where every face has its twin, so
+    //      that branch cannot be reached here.
+    if (mutableMesh && mutableMesh->acmi && !mutableMesh->acmi->empty())
+    {
+        *mutableMesh->acmi = cpu::cyclicACMI::setup(*mutableMesh->m, *mutableMesh->g,
+                                                   *mutableMesh->patches, time);
+        attachCyclicCoupling(*mutableMesh->patches, *mutableMesh->m, *mutableMesh->g);
+        SurfaceScalarField& mphi = dyn->meshPhiRef();
+        for (const cpu::cyclicACMI::Side& s : mutableMesh->acmi->sides())
+        {
+            std::vector<scalar>& cpl = mphi.boundary[static_cast<std::size_t>(s.patch)];
+            std::vector<scalar>& nov = mphi.boundary[static_cast<std::size_t>(s.nonOverlap)];
+            for (std::size_t k = 0; k < s.scaledMask.size(); ++k)
+            {
+                cpl[k] *= std::max(cpu::cyclicACMI::tolerance, s.scaledMask[k]);
+                nov[k] *= scalar(1) - s.scaledMask[k];
+            }
+        }
+    }
     // ...and fvc::meshPhi(U) follows the move: the scheme's off-centred flux, which everything below
     // and the pressure corrector, the closure and CorrectPhi read through fvcMeshPhi()
     if (cn)
@@ -369,31 +409,33 @@ RunReport runInterFoam(
                     "brae interFoam: MutableMesh names different objects from the mesh, geometry and "
                     "patches the fields were built against; the cyclicACMI rescale would move a copy.");
             }
-            if (dyn)
-            {
-                throw std::runtime_error(
-                    "brae interFoam: the case scales a cyclicACMI interface AND moves its mesh. OpenFOAM "
-                    "then re-runs the AMI and rescales the mesh flux in cyclicACMIFvPatch::movePoints; "
-                    "that is not ported.");
-                // WHAT THAT PORT NEEDS, measured rather than guessed. Calling
-                // cpu::cyclicACMI::setup(m, g, patches, time) at the move IS the right shape -- it is
-                // resetAMI() then scalePatchFaceAreas(), which is what initMovePoints does -- and with
-                // attachCyclicCoupling behind it (the move leaves every patch uncoupled, and only a
-                // cyclicAMI is re-coupled today) the case runs. Three things stood in the way:
-                //   * `patches = buildPatches(...)` inside setup MOVE-ASSIGNED, stealing the returned
-                //     vector's buffer and freeing the old one even at equal size. Every fvPatchField
-                //     holds `const FvPatch&` into that vector, so the first U.evaluateBoundary() after
-                //     the move read freed memory. gdb: SIGSEGV in
-                //     PressureInletOutletVelocityPatchField<vector>::evaluate, the vector's data moving
-                //     0xaaaaab7c9150 -> 0xaaaaab8d3590 at size 9 both sides. setup assigns element by
-                //     element now, so it is safe to call on a live mesh -- that part is done.
-                //   * the only cyclicACMI fixture in the tree is RAS/damBreakLeakage, and ACMI beside a
-                //     turbulence closure is refused for its own reason (k/epsilon 1.2e-03 static).
-                //   * with the motion staged on it, MEASURED laminar against OpenFOAM: p_rgh 3.5e-12
-                //     and alpha 6.8e-12 at ten steps, but max|U| is 7.3e-06 and stays near 2.7e-04 at a
-                //     hundred, so no velocity comparison on this fixture discriminates anything. A
-                //     fixture whose flow actually develops with the mesh moving is the first unit.
-            }
+            // A cyclicACMI PAIR ON A MOVING MESH RUNS. The refusal that stood here read "OpenFOAM
+            // then re-runs the AMI and rescales the mesh flux in cyclicACMIFvPatch::movePoints; that
+            // is not ported" -- and naming both halves is what made the port short. interMeshUpdate
+            // does them, in the order fvMesh::movePoints does (see the note there).
+            //
+            // WHAT HELD IT, three things, each measured rather than guessed:
+            //   * `patches = buildPatches(...)` inside cpu::cyclicACMI::setup MOVE-ASSIGNED, stealing
+            //     the returned vector's buffer and freeing the old one even at equal size. Every
+            //     fvPatchField holds `const FvPatch&` into that vector, so the first
+            //     U.evaluateBoundary() after the move read freed memory. gdb: SIGSEGV in
+            //     PressureInletOutletVelocityPatchField<vector>::evaluate, the vector's data moving
+            //     0xaaaaab7c9150 -> 0xaaaaab8d3590 at size 9 both sides. setup assigns element by
+            //     element now.
+            //   * the mesh move rebuilt the patch list with buildPatches(m, g) and NO mirrorACMI, so
+            //     it threw the cyclicACMI refusal the start had legitimately passed -- with the mesh
+            //     already moved. It carries the exemption now, keyed on the list already holding such
+            //     a patch (dynamic_motion_solver_fv_mesh_cpp.cu).
+            //   * THE MESH FLUX was never scaled to the areas the rescale had just changed, so the
+            //     discrete space conservation law broke by exactly the mask: worst |div(phi)|
+            //     2.630e+01 and alpha reaching 1.89 against OpenFOAM's 1.00000000000037.
+            //
+            // AND THE FIXTURE, which is half of why this took three units. The tutorial shaken from
+            // t = 0 reads max|U| 7.3e-06 at ten steps and 2.7e-04 at a hundred -- nothing a velocity
+            // comparison can discriminate. damBreakLeakage started at t = 0.49, where the baffle is
+            // about to open, with the tank shaking, reaches max|U| 1.18. MEASURED there, 40 steps:
+            // alpha 1.00000000000035 against OpenFOAM's 1.00000000000037 and worst |div(phi)|
+            // 9.378e-11. Gated as the `moving` arm of tests/interfoam_leakage_vs_openfoam.sh.
             // WHERE IN THE STEP the rescale lands is part of the answer (cyclic_acmi_cpp.cuh): after
             // alphaEqn.H forms phic and before the pre-solve. That point is gated for the pre-solving
             // (MULESCorr) path with no isotropic or shear compression and one alpha sub-cycle. Each of

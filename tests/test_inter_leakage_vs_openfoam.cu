@@ -68,6 +68,23 @@ const scalar D_NUT = 3e-10;
 const scalar D_PHI = 2e-11;
 const scalar B_PRES_CLOSED = 8e-13;
 const scalar B_PRES_OPEN = 7e-9;
+// THE MOVING ARM'S SOLVE-HISTORY BOUNDS. Its FIELDS are held to the same numbers as the static arms
+// and pass them -- alpha 3.0e-12, p_rgh 1.0e-12, U 5.1e-12 of |U| 1.1755, k 9.0e-13, epsilon 1.2e-12,
+// nut 1.3e-12, the baffle's flux face for face -- and 115 of its 120 p_rgh counts are OpenFOAM's with
+// the other five one apart at an edge stop. What is larger is the per-solve INITIAL RESIDUAL at the
+// ONE step the baffle opens: 1.229e-07 relative there against 9.153e-11 for the same restart with the
+// mesh held still, and alpha 2.195e-08 against 4.1e-12. Every other solve of the run is at 1e-11 or
+// below on both. The opening step is where the pair's mask jumps from the tolerance to 1 - tolerance,
+// and on a MOVING mesh that jump lands inside cyclicACMIFvPatch::movePoints rather than at
+// alphaEqn.H's lazy rescale, so the two codes form that step's transient from areas that changed at a
+// different point of the step.
+// NOT THE CASE'S OWN CHAOS: OpenFOAM against itself with one initial alpha nudged by one ulp leaves
+// every one of the 120 p_rgh and 120 alpha initial residuals identical to the six digits its log
+// prints, so this fixture does not amplify a last-bit difference into a visible one over 40 steps.
+// The bounds are five times the measurement, as the device arm's are, and the residue is stated in
+// the script's header as open.
+const scalar M_PRES_OPEN = 6e-7;
+const scalar M_ALPHA_RUN = 1e-7;
 
 namespace {
 int failures = 0;
@@ -136,6 +153,13 @@ int main(
     const std::string logPath = argv[5];
     const std::string closedDir = argv[6];
     const std::string allOpenDir = argv[7];
+    // THE MOVING ARM is this same fixture SHAKEN, started where the baffle opens. What it holds is
+    // cyclicACMIFvPatch::movePoints -- the AMI re-run on the moved points, the areas rescaled, and the
+    // MESH FLUX scaled to them -- and its controls are shaken too, so they still answer for the
+    // baffle; argv[9] is the STATIC twin, which answers for the motion.
+    const std::string profile = (argc > 8) ? argv[8] : "static";
+    const std::string staticDir = (argc > 9) ? argv[9] : std::string();
+    const bool movingArm = (profile == "moving");
 
     PrimitiveMesh m;
     m.read(caseDir + "/constant/polyMesh");
@@ -164,6 +188,9 @@ int main(
     check("brae ran the semi-implicit limiter: MULESCorr is on", fin.alphaCtl.MULESCorr);
     check("brae ran the case turbulent, under kEpsilon",
           fin.turbulence.on && fin.turbulence.model == InterRasModel::KEpsilon);
+    check(movingArm ? "the moving arm's mesh MOVES, and brae read it so"
+                    : "the static arms' mesh does not move, and brae read it so",
+          (fin.dynamicMesh != nullptr) == movingArm);
 
     // THE PATH: one coded pair, coupled in every field, its masks where the code puts them
     check("the mesh has ONE cyclicACMI pair, scaled by a coded PatchFunction1",
@@ -308,10 +335,11 @@ int main(
         check("the baffle opened inside the run", openStep > 0 && openStep < nSteps);
         check("every p_rgh count is OpenFOAM's, or one apart at an edge stop", nOther == 0 && nSame > nEdge);
         check("...from OpenFOAM's round-off residuals while the baffle is shut", closedAbs < B_PRES_CLOSED);
-        check("...and from its initial residuals once it is open", openRel < B_PRES_OPEN);
+        check("...and from its initial residuals once it is open",
+              openRel < (movingArm ? M_PRES_OPEN : B_PRES_OPEN));
     }
     failures += brae::gatecheck::compareSolves("host", r.alphaSolves, ofA, nSteps, fin.alphaName.c_str(),
-                                               scalar(1e-10), scalar(1e-9));
+                                               scalar(1e-10), movingArm ? M_ALPHA_RUN : scalar(1e-9));
     failures += brae::gatecheck::compareSolves("host", r.epsilonSolves, ofE, nSteps, "epsilon",
                                                scalar(1e-10), scalar(1e-10), scalar(1e-5));
     // k's FINAL residual is not held: pinned at 1e-13, it ends near 5.7e-14, where round-off sets the
@@ -424,6 +452,16 @@ int main(
           dClosed.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)) && dClosed.rel() > scalar(1e-6));
     check("...and so does WHICH faces it opens",
           dAll.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)) && dAll.rel() > scalar(1e-6));
+    if (movingArm)
+    {
+        // ...AND THE MOTION ITSELF, against the same fixture with a static mesh. Without it the two
+        // controls above would both be satisfied by a run that ignored the motion entirely.
+        const Diff dStatic = compare(readVectorCells(staticDir + "/U"), ofU);
+        std::printf("  CONTROL: OpenFOAM with the tank NOT shaken, U relative %.4e\n", (double)dStatic.rel());
+        check("shaking the tank moves OpenFOAM's own U far more than brae is from it",
+              dStatic.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14))
+           && dStatic.rel() > scalar(1e-6));
+    }
 
     // THE DEVICE LOOP REFUSES, by name
     int nDev = 0;
@@ -450,6 +488,40 @@ int main(
             std::printf("  device: %s\n", e.what());
         }
         check("the device loop refuses the pair handed to it UNCOUPLED, and names the patch", named);
+
+        // ...AND ON THE MOVING ARM IT REFUSES THE COUPLED PAIR TOO, because the port under test is
+        // the host loop's: the mesh flux scaling that cyclicACMIFvPatch::movePoints does lives in
+        // interMeshUpdate, and the device step evaluates its own boundaries from its own buffers.
+        // Asserted rather than skipped: a device arm that quietly stopped running here is how a
+        // refusal turns into a gap nothing holds.
+        if (movingArm)
+        {
+            bool refusedMoving = false;
+            try
+            {
+                FvGeometry gM = gRaw;
+                std::vector<FvPatch> patchesM = uncoupled;
+                cpu::cyclicACMI::Interfaces acmiM = cpu::cyclicACMI::setup(m, gM, patchesM, t0);
+                attachCyclicCoupling(patchesM, m, gM);
+                MutableMesh mmM;
+                mmM.m = &m;
+                mmM.g = &gM;
+                mmM.patches = &patchesM;
+                mmM.acmi = &acmiM;
+                InterFields devM;
+                runInterFoamDevice(caseDir, startDir, m, gM, patchesM, nSteps, false, &devM,
+                                   scalar(1e30), nullptr, &mmM);
+            }
+            catch (const std::exception& e)
+            {
+                refusedMoving = std::string(e.what()).find("moves its mesh") != std::string::npos;
+                std::printf("  device (moving): %s\n", e.what());
+            }
+            check("the device loop refuses a scaled cyclicACMI on a mesh that MOVES, and says so",
+                  refusedMoving);
+            std::printf("test_inter_leakage_vs_openfoam: %d failures\n", failures);
+            return failures == 0 ? 0 : 1;
+        }
 
         // THE DEVICE ARM, on the pair COUPLED. The host run above has moved g, patches and acmi to
         // the END state -- the rescale is in place -- so this arm starts from its own: the geometry

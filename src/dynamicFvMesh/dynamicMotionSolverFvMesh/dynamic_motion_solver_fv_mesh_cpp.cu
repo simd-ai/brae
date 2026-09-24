@@ -331,7 +331,17 @@ void DynamicMotionSolverFvMesh::update(
     // ...and the geometry from the new points, each patch's copy in place
     m.movePoints(std::move(newPoints));
     g.build(m);
-    const std::vector<FvPatch> rebuilt = buildPatches(m, g);
+    // ...WITH THE cyclicACMI EXEMPTION THE CALLER ALREADY HELD. buildPatches refuses a cyclicACMI
+    // unless it is told the caller is the OF-mirror interFoam loop, which couples the pair itself
+    // (fv_patch.cu, `mirrorACMI`). A list that already HOLDS a cyclicACMI patch was built with that
+    // flag -- it could not exist otherwise -- so rebuilding it without one made the move throw the
+    // refusal the start had legitimately passed, with the mesh already moved.
+    bool mirrorACMI = false;
+    for (const FvPatch& q : *patches_)
+    {
+        mirrorACMI = mirrorACMI || q.type == "cyclicACMI";
+    }
+    const std::vector<FvPatch> rebuilt = buildPatches(m, g, mirrorACMI);
     if (rebuilt.size() != patches_->size())
     {
         throw std::runtime_error(std::string(WHO) + "the patch list changed size under a point motion.");

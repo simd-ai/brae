@@ -68,11 +68,31 @@
 #   in the device's face order rather than the mesh's (the fifth digit moves; phig is zero on every
 #   patch that follows the pair here).
 #
+# THE MOVING ARM: the same case SHAKEN -- a solid-body oscillatingLinearMotion of 2 cm at 20 rad/s and
+# movingWallVelocity walls -- started at t = 0.49, eleven steps before the baffle opens, and run 40
+# steps. What it holds is cyclicACMIFvPatch::movePoints: the AMI re-run on the moved points, the face
+# areas rescaled (cpu::cyclicACMI::setup), and THE MESH FLUX scaled to them -- the coupled face by
+# magSf/geomArea, the non-overlap by 1 - mask. MEASURED, brae's host loop against OpenFOAM:
+#   alpha 3.0e-12, p_rgh 1.0e-12, U 5.1e-12 of |U| 1.1755, k 9.0e-13, epsilon 1.2e-12, nut 1.3e-12,
+#   the baffle's flux face for face, 115 of 120 p_rgh counts equal with five one apart at an edge stop.
+# CONTROLS, OpenFOAM against itself: the baffle never opened 1.8e-01, opened on every face 4.6e-01, and
+# THE TANK NOT SHAKEN 1.0053e+00 -- the third is what makes this an arm about the motion.
+# FAIL-PROOFS: the mesh-flux scaling removed reads alpha 1.89, p_rgh 1.08, U 6.1e-01 and 21 red arms;
+# the ACMI setup not re-run at the move throws ("its coupling is not attached") before the first pcorr.
+# OPEN, and bracketed rather than hidden: the per-solve INITIAL RESIDUAL at the one step the baffle
+# opens is 1.229e-07 relative against 9.153e-11 for the same restart held still, and alpha's 2.195e-08
+# against 4.1e-12. Every other solve of the run is at 1e-11 or below. On a moving mesh the mask's jump
+# lands inside movePoints rather than at alphaEqn.H's lazy rescale, so the two codes build that one
+# step's transient from areas that changed at a different point of the step. It is NOT the fixture's
+# own chaos: OpenFOAM against itself with one initial alpha nudged by one ulp leaves all 240 initial
+# residuals identical to the six digits its log prints.
+#
 # NOT DISCRIMINATED: recomputing the face cells' volumes and centres after the rescale -- the pair's two
 # areas sum to the same face, and the recomputed cells come out bitwise the same on this mesh.
 # NOT CLAIMED: an ACMI pair that is not coincident face for face (OpenFOAM's AMI weights are then
-# fractions -- refused), a moving mesh, the explicit MULES path, icAlpha/scAlpha and alpha sub-cycling
-# with a moving scale (each moves the rescale point -- refused), and the device loop (refused).
+# fractions -- refused), the explicit MULES path, icAlpha/scAlpha and alpha sub-cycling with a moving
+# scale (each moves the rescale point -- refused), and the device loop, which refuses a moving mesh at
+# its own site and is asserted to do so by the moving arm.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_leakage_vs_openfoam"
@@ -86,6 +106,17 @@ RESTART_STEPS=${RESTART_STEPS:-30}
 # ...so the runs write every gcd(restart index, end index) steps: OpenFOAM's time index carries on from
 # the restart (read back from <start>/uniform/time), and a timeStep writeInterval counts that index
 WRITE_EVERY=$(python3 -c "import math; print(math.gcd($STEPS - $RESTART_STEPS, $STEPS))")
+# THE MOVING ARM: the same case SHAKEN. It does not restart from the 520-step run -- for 500 of those
+# steps the column stands at rest behind the shut baffle, so its state at t = 0.49 is the initial one
+# with a hydrostatic p_rgh, and starting there directly from 0.orig is the same case for a fraction of
+# the wall time. The baffle opens at t > 0.5, which is step 11 of MOV_STEPS.
+MOV_STEPS=${MOV_STEPS:-40}
+MOV_START=0.49
+MOV_END=$(python3 -c "
+t = float('$MOV_START')
+for i in range($MOV_STEPS):
+    t += float('$DT')
+print('%.10g' % t)")
 
 [ -x "$BIN" ]      || { echo "SKIP: $BIN not built"; exit 77; }
 [ -d "$SRC" ]      || { echo "SKIP: damBreakLeakage tutorial not found at $SRC"; exit 77; }
@@ -166,6 +197,88 @@ PYEOF
     echo "OpenFOAM ran $STEPS steps of deltaT $DT to t = $END   [$profile]"
 }
 
+# stageMoving <name> <moving 0|1> <scale profile>: the same tutorial, meshed the same way, started at
+# MOV_START from 0.orig, with a solid-body shake and movingWallVelocity walls when <moving> is 1.
+#
+# WHY A SHAKE AND NOT THE LEAK ALONE. The port under test is what OpenFOAM does to a cyclicACMI when
+# the points move -- cyclicACMIFvPatch::movePoints: the AMI re-run, the areas rescaled and THE MESH
+# FLUX scaled to them. A fixture whose velocities are round-off cannot tell any of that from nothing:
+# the tutorial shaken from t = 0 reads max|U| 7.3e-06 at ten steps and 2.7e-04 at a hundred. Started
+# where the baffle opens, with the tank shaking, it reaches max|U| 1.18 -- and the mesh-flux scaling
+# left out reads worst |div(phi)| 2.630e+01 and alpha 1.89 against OpenFOAM's 1.00000000000037.
+stageMoving()
+{
+    local name="$1" moving="$2" profile="$3"
+    local C="$W/$name"
+    rm -rf "$C"
+    cp -r "$SRC" "$C" || return 1
+    rm -rf "$C"/[1-9]* "$C"/0 "$C"/processor* "$C"/log.* "$C"/dynamicCode
+    case "$profile" in
+        closed)  sed -i 's/if (tm > 0.5)/if (tm > 1e9)/' "$C/system/createBafflesDict" ;;
+        allOpen) sed -i 's/if(Fy\[i\] > 0.07 \&\& Fy\[i\] < 0.1)/if(true)/' "$C/system/createBafflesDict" ;;
+    esac
+    MOV_START="$MOV_START" MOV_STEPS="$MOV_STEPS" DT="$DT" MOVING="$moving" \
+        python3 - "$C" <<'PYEOF' || { echo "FAIL: staging $name"; return 1; }
+import os, re, sys
+d = sys.argv[1]
+n = int(os.environ['MOV_STEPS']); dt = os.environ['DT']
+start = float(os.environ['MOV_START']); moving = os.environ['MOVING'] == '1'
+end = start
+for _ in range(n):
+    end += float(dt)
+c = os.path.join(d, 'system/controlDict')
+s = open(c).read()
+# startTime 0 while the mesh is built; the run's own start is set after createBaffles, which reads the
+# time directory named by THIS entry and would not find one called 0.49
+for key, val in [('startFrom', 'startTime'), ('startTime', '0'), ('adjustTimeStep', 'no'), ('deltaT', dt),
+                 ('endTime', '%.10g' % end), ('writeControl', 'timeStep'), ('writeInterval', str(n)),
+                 ('writeFormat', 'ascii'), ('writePrecision', '15'), ('timePrecision', '12')]:
+    s, k = re.subn(r'^%s\s.*' % key, '%s %s;' % (key.ljust(15), val), s, flags=re.M)
+    assert k == 1, key
+open(c, 'w').write(s)
+# the same pinned solves as the static arms, for the same reason
+v = os.path.join(d, 'system/fvSolution')
+s = open(v).read()
+for pat, val in [(r'(\n    p_rgh\s*\{[^}]*?tolerance\s+)[^;]+;', '1e-13'),
+                 (r'(\n    p_rgh\s*\{[^}]*?relTol\s+)[^;]+;', '0'),
+                 (r'("\(U\|k\|epsilon\)\.\*"\s*\{[^}]*?tolerance\s+)[^;]+;', '1e-13'),
+                 (r'("alpha\.water\.\*"\s*\{[^}]*?tolerance\s+)[^;]+;', '1e-14')]:
+    s, k = re.subn(pat, r'\g<1>' + val + ';', s)
+    assert k == 1, pat
+open(v, 'w').write(s)
+dm = os.path.join(d, 'constant/dynamicMeshDict')
+head = ('FoamFile\n{\n    version 2.0;\n    format ascii;\n    class dictionary;\n'
+        '    object dynamicMeshDict;\n}\n\n')
+if moving:
+    # a HORIZONTAL shake of the whole tank: 2 cm at 20 rad/s, so the walls reach 0.4 m/s, the same
+    # order as the leak itself. The tank is 0.584 m wide, so the amplitude is 3% of it.
+    open(dm, 'w').write(head + 'dynamicFvMesh   dynamicMotionSolverFvMesh;\n'
+                               'motionSolver    solidBody;\n'
+                               'solidBodyMotionFunction oscillatingLinearMotion;\n'
+                               'oscillatingLinearMotionCoeffs\n{\n'
+                               '    amplitude (0.02 0 0);\n    omega 20;\n}\n')
+    # ...and walls that carry the tank with them, or the fluid is held at rest in the absolute frame
+    # while the mesh slides past it and nothing develops
+    u = os.path.join(d, '0.orig/U')
+    t = open(u).read()
+    t, k = re.subn(r'type\s+noSlip;',
+                   'type            movingWallVelocity;\n        value           uniform (0 0 0);', t)
+    assert k == 3, 'expected three noSlip walls, found %d' % k
+    open(u, 'w').write(t)
+else:
+    open(dm, 'w').write(head + 'dynamicFvMesh   staticFvMesh;\n')
+PYEOF
+    ( cd "$C" && cp -r 0.orig 0 && blockMesh > log.blockMesh 2>&1 && setFields > log.setFields 2>&1 \
+          && createBaffles -overwrite > log.createBaffles 2>&1 ) \
+        || { echo "FAIL: meshing [$name]"; return 1; }
+    ( cd "$C" && mv 0 "$MOV_START" \
+          && sed -i "s/^startTime .*/startTime       $MOV_START;/" system/controlDict \
+          && interFoam > log.interFoam 2>&1 ) \
+        || { echo "FAIL: interFoam [$name]"; tail -30 "$C/log.interFoam"; return 1; }
+    [ -d "$C/$MOV_END" ] || { echo "FAIL: OpenFOAM wrote no $MOV_END directory [$name]"; ls "$C"; return 1; }
+    echo "OpenFOAM ran $MOV_STEPS steps of deltaT $DT from t = $MOV_START to t = $MOV_END   [$name]"
+}
+
 rc=0
 for p in closed allOpen leak; do
     stage "$p" || { rc=1; break; }
@@ -191,6 +304,17 @@ sed -i "s/^startTime .*/startTime       $RESTART;/" "$R/system/controlDict"
 [ -d "$R/$END" ] || { echo "FAIL: the restarted OpenFOAM wrote no $END directory"; ls "$R"; exit 1; }
 echo "OpenFOAM restarted at t = $RESTART and ran $RESTART_STEPS steps to t = $END   [restart]"
 "$BIN" "$R" "$R/$RESTART" "$R/$END" "$RESTART_STEPS" "$R/log.interFoam" "$W/closed/$END" "$W/allOpen/$END" || rc=1
+
+# THE MOVING ARM. Its controls are shaken too -- the baffle never opening and opening on every face --
+# so they answer for the baffle and not for the motion; the STATIC twin of the same fixture is passed
+# beside them and answers for the motion.
+stageMoving moving       1 leak    || rc=1
+stageMoving movingClosed 1 closed  || rc=1
+stageMoving movingOpen   1 allOpen || rc=1
+stageMoving movingStatic 0 leak    || rc=1
+[ $rc = 0 ] || { echo "interfoam_leakage_vs_openfoam: moving staging failed"; exit 1; }
+"$BIN" "$W/moving" "$W/moving/$MOV_START" "$W/moving/$MOV_END" "$MOV_STEPS" "$W/moving/log.interFoam" \
+       "$W/movingClosed/$MOV_END" "$W/movingOpen/$MOV_END" moving "$W/movingStatic/$MOV_END" || rc=1
 
 echo "interfoam_leakage_vs_openfoam: rc $rc"
 exit $rc
