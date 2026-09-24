@@ -107,6 +107,39 @@
 # ROTATIONAL pair, refused upstream in attachCyclicCoupling -- the neighbour value would have to be
 # transformed into this side's frame before the fit reads it.
 #
+# PROFILE gamg: GAMG ON p_rgh ACROSS THE PAIR, both arms. The hierarchy carried no interface at any
+# level, so a coupled matrix was refused outright (pcg.cuh's refuseCoupledPatches) -- without the
+# interface coefficients a GAMG solves the two sides as unconnected walls AND CONVERGES. Every coarse
+# level now agglomerates the pair as cyclicGAMGInterface does: each fine interface face keyed on the
+# COARSE CELL PAIR it joins, an existing pair reusing that coarse face, a new one appending one, the
+# coefficients summed onto it.
+# THREE DEFECTS THE REFUSAL WAS HIDING, each measured on this fixture:
+#   * foldBoundary added boundaryCoeffs into the SOURCE on a coupled patch. OpenFOAM's
+#     addBoundarySource skips them (`if (!ptf.coupled())`) -- there they are the interface's, not a
+#     source. alpha ran to 1.96 and worst |div(phi)| to 4.8e+01.
+#   * normFactor's sumA left the interface out. lduMatrix::sumA takes sumA[own] -= coeff, and that row
+#     sum is what every residual the level reports is scaled by. Worth 1.9e-10 -> 4.9e-13, and
+#     23 of 30 -> 30 of 30 iteration counts.
+#   * the DEVICE ran it unrefused and wrong: alpha 2.9722e-03 from OpenFOAM against the host's
+#     2.6401e-13 on the same case -- converged, bounded and plausible-looking.
+# THE SIGN IS THE TRAP: deviceAmul applies Apsi[cycOwn] += cycCoeff*psi[cycNbr] where the host's Amul
+# SUBTRACTS its own boundaryCoeffs. The device agglomerates its OWN level-0 coefficients rather than
+# transcribing the host's, and negates them only where it hands its coarsest level to the host solve.
+# THE COARSEST LEVEL is solved on the host on both arms and needs the pair too: without it the device
+# read 2.1007e-09 where it now reads 1.3673e-10 -- that is the one level on which every cell of the
+# mesh is a few cells from every other.
+# MEASURED, 10 steps: host alpha 2.6401e-13, p_rgh 3.4304e-12, U 4.6846e-13, 30 of 30 p_rgh counts
+# OpenFOAM's; device alpha 1.3673e-10, p_rgh 2.0467e-10, U 1.2054e-10.
+# THE CONTROL is gamgWalls, which moves OpenFOAM's own alpha 2.1364e-01 and its U 9.9980e-01.
+# BROKEN ONCE on the device, the coarse interfaces dropped (the state before this unit): alpha
+# 2.9722e-03, p_rgh 9.1531e-04, U 1.6813e-03 -- four arms red, the host arm unmoved.
+# ONE SOLVE ARRIVES ALREADY CONVERGED: OpenFOAM's third p_rgh of step one enters at 7.27e-12 against
+# its own `tolerance 1e-12` and takes one iteration. Its initial residual is a cancellation and is not
+# held to the bound -- the rule and its measurement are in inter_solve_log.cuh. Its ITERATION COUNT is
+# held like every other solve's.
+# STILL REFUSED: an AMI, on both arms. Its neighbour is a weighted sum of several cells, which a
+# coarse interface face of one neighbour cell cannot carry.
+#
 # PROFILE sstLimUpw: THE LIMITER OF THE DEFERRED CORRECTION across the pair. `cellLimited Gauss linear 1`
 # on grad(U) with the momentum on `Gauss linearUpwind grad(U)` -- the fixture ships `Gauss upwind`, which
 # has no correction to limit, so no profile here could reach this limiter before. OF's cellLimitedGrad

@@ -280,7 +280,7 @@ RunReport runInterFoam(
         // alpha never leaves the floor (5.107e-15), so it is the VELOCITY half, and it is something
         // step 1 writes that only step 2 reads.
         //
-        // TWO CAUSES RULED OUT by measurement, so the next unit does not spend the afternoon on them:
+        // FIVE CAUSES RULED OUT by measurement, so the next unit does not spend the afternoon on them:
         //   * the flux STATE. pEqn.H:70 makes phi relative after the pressure solve and
         //     interFoam.C:139 after the mesh update, and this loop does both at the same two points
         //     (inter_peqn_cpp.cu:1048, and the correctPhi branch below). Both codes read a RELATIVE
@@ -290,9 +290,22 @@ RunReport runInterFoam(
         //     rebuild(), but fvPatchField holds `const FvPatch&` and the move updates that object in
         //     place, so they are live too. Re-telling the patch its flux after the move -- which
         //     rebuilds both -- changed not one digit.
-        // What is left is a field step 1 writes and step 2 reads: Uf is the candidate (fvc::correctUf
-        // takes the ABSOLUTE phi and the patch's own U, which on this patch is the mixed blend the
-        // condition set). The device loop refuses it at its own site (inter_driver_device.cu).
+        //   * Uf, the field step 1 writes and only step 2 reads. At the end of step 1 it agrees with
+        //     OpenFOAM's own written Uf to 3.911e-13 inside and 3.083e-13 on the wall.
+        //   * U's PATCH VALUE on the wall, 3.789e-13 at the same instant.
+        //   * the in-corrector flux push. OpenFOAM's pEqn.H sets `phi = phiHbyA - p_rghEqn.flux()`
+        //     and then calls U.correctBoundaryConditions(); this loop pushes the new flux to the
+        //     flux-conditional patches in the same place, with the lag rule uPatchesUpdatedAtEntry
+        //     measured on damBreakPermeable.
+        //
+        // SO EVERY FIELD AND EVERY PATCH VALUE AT THE END OF STEP ONE IS EXACT -- U 4.077e-13 inside,
+        // U on the wall 3.789e-13, Uf 3.911e-13, alpha 4.663e-15, p_rgh 1.733e-15 -- and step two is
+        // still 1.494e-01. What step two starts from that is NOT a field value is the patch's own
+        // carried COEFFICIENTS: a mixed condition contributes internalCoeffs and boundaryCoeffs built
+        // from its valueFraction, and two patches can hold the same VALUE with different fractions.
+        // The next unit instruments OpenFOAM's own pressurePermeableAlphaInletOutletVelocity to write
+        // valueFraction and refValue at the end of step one and compares those, which is the one thing
+        // here that no field can show. The device loop refuses it at its own site.
         for (std::size_t pi = 0; pi < patches.size() && pi < f.U.boundary.size(); ++pi)
         {
             const bool permeable = f.U.boundary[pi]->needsAlphaPatchValues()
