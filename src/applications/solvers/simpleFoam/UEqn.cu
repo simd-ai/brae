@@ -89,13 +89,25 @@ void assembleUEqn(
                                    || in.scheme == cpu::DivScheme::linearUpwindV
                                    || in.scheme == cpu::DivScheme::LUST
                                    || in.linearUpwind;
-        if (in.gradULimitK > 0.0 && limitsCorrection)
-            throw std::runtime_error(
-                "brae device UEqn: a cellLimited grad(U) across a coupled patch would limit against a "
-                "neighbour it cannot see -- OF's cellLimitedGrad treats a cyclic face as internal, and "
-                "this arm's limiter walks the internal faces and the non-coupled patches only. The "
-                "Gauss half is summed across the pair here; the limiter's is not ported. Refusing.");
+        // ...and the limiter of the deferred correction carries the pair NOW (pairLimitInterface
+        // below), which is what this refusal stood in for.
     }
+    // THE LIMITER'S RANGE ACROSS THE PAIR, per component. OF's cellLimitedGrad treats a coupled face
+    // as internal: the neighbour CELL joins the cell's min/max and the extrapolation to that face is
+    // clipped to it. The neighbour value comes back through deviceCyclicNbrValue, which applies the
+    // pair's transform on a rotational cyclic -- a vector component crossing the interface is not the
+    // same component on the other side. The same list the dev2 gradient already builds
+    // (device_komega_sst.cu:838-848).
+    auto pairLimitInterface = [&](int k,
+                                  DeviceBuffer<scalar>& nbrOut,
+                                  CellLimitInterface* ifs) -> int
+    {
+        if (!(in.cyc && in.cyc->n > 0)) return 0;
+        deviceCyclicNbrValue(*in.cyc, *(k == 0 ? &Ux : k == 1 ? &Uy : &Uz), Ux, Uy, Uz, k, nbrOut);
+        ifs[0] = { in.cyc->n, in.cyc->ownCell.data(), nbrOut.data(),
+                   in.cyc->dOwnX.data(), in.cyc->dOwnY.data(), in.cyc->dOwnZ.data() };
+        return 1;
+    };
     auto addPairToGrad = [&](int k,
                              DeviceBuffer<scalar>& gx,
                              DeviceBuffer<scalar>& gy,
@@ -318,7 +330,12 @@ void assembleUEqn(
             deviceCopy(gz[k], gm.gz[k]);
             addPairToGrad(k, gx[k], gy[k], gz[k]);
             if (in.gradULimitK > 0.0)
-                deviceCellLimitGrad(dm, *Usrc[k], gm.ub[k], gx[k], gy[k], gz[k], in.gradULimitK);
+            {
+                CellLimitInterface ifs[1];
+                DeviceBuffer<scalar> nbr;
+                const int nIfs = pairLimitInterface(k, nbr, ifs);
+                deviceCellLimitGrad(dm, *Usrc[k], gm.ub[k], gx[k], gy[k], gz[k], in.gradULimitK, ifs, nIfs);
+            }
         }
         deviceLinearUpwindVCorr(dm, *in.phiInt, gx, gy, gz, Ux, Uy, Uz, cx, cy, cz);
         const DeviceBuffer<scalar>* cc[3] = {&cx, &cy, &cz};
@@ -345,7 +362,12 @@ void assembleUEqn(
             addPairToGrad(k, gxA[k], gyA[k], gzA[k]);
             // `linearUpwind <name>` where <name> resolves to `cellLimited Gauss linear <k>`.
             if (in.gradULimitK > 0.0)
-                deviceCellLimitGrad(dm, *U[k], gm.ub[k], gxA[k], gyA[k], gzA[k], in.gradULimitK);
+            {
+                CellLimitInterface ifs[1];
+                DeviceBuffer<scalar> nbr;
+                const int nIfs = pairLimitInterface(k, nbr, ifs);
+                deviceCellLimitGrad(dm, *U[k], gm.ub[k], gxA[k], gyA[k], gzA[k], in.gradULimitK, ifs, nIfs);
+            }
         }
         for (int k = 0; k < 3; ++k)
         {

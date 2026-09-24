@@ -155,7 +155,8 @@ int main(
     // profiles share: a defect confined to k reaches U through nuEff alone and arrives divided by the
     // Reynolds number.
     const bool sstProfile = (profile == "sst" || profile == "sstCN" || profile == "sstLim"
-                          || profile == "sstLimU" || profile == "sstLimDiv" || profile == "sstLsq");
+                          || profile == "sstLimU" || profile == "sstLimDiv" || profile == "sstLsq"
+                          || profile == "sstLimUpw");
     // `sstLimDiv` names `Gauss limitedLinear 1` for div(phi,k) and div(phi,omega) on a mesh with a
     // PAIR -- a combination brae could not run at all: fvm::div threw the moment it was handed a
     // scheme's weights and a coupled patch, and the device assembler refused it by name. OpenFOAM

@@ -106,6 +106,24 @@
 # STILL REFUSED: a vector least-squares gradient across a pair (grad(U), at its own site), and a
 # ROTATIONAL pair, refused upstream in attachCyclicCoupling -- the neighbour value would have to be
 # transformed into this side's frame before the fit reads it.
+#
+# PROFILE sstLimUpw: THE LIMITER OF THE DEFERRED CORRECTION across the pair. `cellLimited Gauss linear 1`
+# on grad(U) with the momentum on `Gauss linearUpwind grad(U)` -- the fixture ships `Gauss upwind`, which
+# has no correction to limit, so no profile here could reach this limiter before. OF's cellLimitedGrad
+# treats a coupled face as internal: the neighbour CELL joins the cell's min/max and the extrapolation to
+# that face is clipped to it. The device arm limited against the internal faces and the non-coupled
+# patches only and refused the combination by name; it builds the pair's CellLimitInterface now, with
+# the neighbour value through deviceCyclicNbrValue so a rotational pair's transform is applied -- a
+# vector component crossing the interface is not the same component on the other side. It is the list
+# the dev2 gradient already built (device_komega_sst.cu:838-848), at the two momentum sites that were
+# missing it.
+# MEASURED, 10 steps: host alpha 3.3196e-14, p_rgh 3.4942e-13, U 3.4660e-13, k 2.8037e-13,
+# nut 2.5188e-12, omega 8.3613e-14; device alpha 7.5446e-12, p_rgh 5.5283e-11, U 6.9677e-11,
+# k 2.3476e-11, nut 4.5411e-10, omega 8.4689e-12.
+# THE CONTROL is sstLimUpwWalls, which moves OpenFOAM's own alpha 2.4717e-01 and its U 9.9995e-01.
+# BROKEN ONCE on the device, the pair dropped from the correction's limiter (the state this unit found):
+# alpha 3.5622e-02, p_rgh 6.2502e-02, U 3.6401e-01, k 3.0206e-02, nut 5.6639e-01, omega 8.2720e-03 --
+# six arms red, and the host arm unmoved.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_cyclic_vs_openfoam"
@@ -312,6 +330,16 @@ PYEOF
             grep -q "grad(U) cellLimited" "$C/system/fvSchemes" \
                 || { echo "FAIL: the $profile profile did not limit grad(U)"; return 1; }
         fi
+        # ...and `sstLimUpw` puts the momentum on `Gauss linearUpwind grad(U)` as well, which is what
+        # makes the LIMITER OF THE DEFERRED CORRECTION live. That limiter walked the internal faces and
+        # the non-coupled patches only, so the device arm refused the combination by name; the fixture's
+        # own scheme is `Gauss upwind`, which has no correction to limit and could not reach it.
+        if [ "${profile#sstLimUpw}" != "$profile" ]; then
+            sed -i 's|div(rhoPhi,U)  *Gauss upwind;|div(rhoPhi,U)    Gauss linearUpwind grad(U);|' \
+                "$C/system/fvSchemes"
+            grep -q "div(rhoPhi,U)    Gauss linearUpwind grad(U);" "$C/system/fvSchemes" \
+                || { echo "FAIL: the $profile profile did not set linearUpwind on the momentum"; return 1; }
+        fi
     fi
     if [ "${profile#sstLsq}" != "$profile" ]; then
         # A LEAST-SQUARES GRADIENT ACROSS THE PAIR. leastSquaresVectors.C:131-140 folds a COUPLED face
@@ -330,7 +358,7 @@ PYEOF
     fi
     if [ "$profile" = walls ] || [ "$profile" = explicitWalls ] \
     || [ "$profile" = sstWalls ] || [ "$profile" = lesWalls ] \
-    || [ "$profile" = sstLimWalls ] || [ "$profile" = sstLimUWalls ] \
+    || [ "$profile" = sstLimWalls ] || [ "$profile" = sstLimUWalls ] || [ "$profile" = sstLimUpwWalls ] \
     || [ "$profile" = sstLimDivWalls ] || [ "$profile" = sstLsqWalls ]; then
         # THE CONTROL: the pair replaced by two walls, in the mesh AND in every field that names it.
         # blockMesh numbers the cells from the block, so the two runs' cells are the same cells.
@@ -395,7 +423,7 @@ PYEOF
 
 for p in cyclic walls explicitMules explicitWalls jump outer outerControl \
          sst sstWalls les lesWalls sstCN lesCN sstLim sstLimWalls sstLimU sstLimUWalls \
-         sstLimDiv sstLimDivWalls sstLsq sstLsqWalls; do
+         sstLimDiv sstLimDivWalls sstLsq sstLsqWalls sstLimUpw sstLimUpwWalls; do
     stage "$p" || { echo "interfoam_cyclic_vs_openfoam: staging failed"; exit 1; }
 done
 
@@ -463,6 +491,11 @@ rc=0
 # the pair and refuses by name (armed in tests/interfoam_refusals.sh).
 "$BIN" "$W/sstLimU" "$W/sstLimU/0" "$W/sstLimU/$END" "$STEPS" \
        "$W/sstLimU/log.interFoam" "$W/sstLimUWalls/$END" sstLimU || rc=1
+# ...and the LIMITER OF THE DEFERRED CORRECTION across the pair: the same limited grad(U) with the
+# momentum on `Gauss linearUpwind grad(U)`, so the correction exists and is limited. The device arm
+# refused this by name until the limiter was given the pair's neighbour cells.
+"$BIN" "$W/sstLimUpw" "$W/sstLimUpw/0" "$W/sstLimUpw/$END" "$STEPS" \
+       "$W/sstLimUpw/log.interFoam" "$W/sstLimUpwWalls/$END" sstLimUpw || rc=1
 # ...AND THE ASSEMBLED SYSTEM ACROSS THE PAIR, host arm against device arm, at the first closure call.
 #
 # WHY NOT AGAINST OPENFOAM DIRECTLY, as the waterChannel and damBreak assembly gates are: OpenFOAM's
