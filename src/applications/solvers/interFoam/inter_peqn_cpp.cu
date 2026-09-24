@@ -518,6 +518,18 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
     const label nC  = m.nCells();
     const label nIf = m.nInternalFaces();
 
+    // EVERY PRESSURE TAP FROM THE SAME CORRECTOR, the first. The device loop already pins its own
+    // there (device_inter_step.cu:494 and :640, with the reason written out); this one did not. Its
+    // HbyA, phiHbyA, rAU, phig and the rest sat under a bare `if (in.taps)` and were overwritten by
+    // every corrector, so `tapCorrector` reported 0 while the fields it labelled were the LAST
+    // corrector's. On a case running nCorrectors 2 that made every host-against-device and
+    // host-against-OpenFOAM dump compare two different correctors.
+    // MEASURED on the permeable-moving case: it read HbyA 4.66e-01 and phiHbyA 3.64e-01 from
+    // OpenFOAM while the momentum matrix those are built from -- upper, lower, diag and source --
+    // agrees to 1.5e-09, and rAU to 3.1e-10. tools/dumpInterFoam now suffixes its own per-corrector
+    // writes for the same reason, so a bare `<name>.dump` is the first corrector on both sides.
+    const bool tapHere = (in.taps != nullptr) && (in.correctorIndex <= 0);
+
     // rAU = 1/UEqn.A(), rAUf = interpolate(rAU).
     const std::vector<scalar> A = matrixA(*in.UEqn, m, g, patches);
     std::vector<scalar> rAU(static_cast<std::size_t>(nC));
@@ -532,8 +544,9 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
     std::vector<vector> hCoupled;
     const std::vector<vector> H = matrixH(*in.UEqn, U, m, g, patches,
                                           in.taps ? &hCoupled : nullptr);
-    if (in.taps)
+    if (tapHere)
     {
+        in.taps->uAtH = U.internal;
         in.taps->hPairX.assign(static_cast<std::size_t>(nC), scalar(0));
         in.taps->hNoPairX.assign(static_cast<std::size_t>(nC), scalar(0));
         for (label c = 0; c < nC; ++c)
@@ -683,7 +696,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
     // the laplacian below. phiHbyA += phig.
     std::vector<scalar> phig;
     buoyancyFlux(in.stf->internal, *in.ghf, in.snGradRho->internal, rAUfField.internal, g.magSf(), phig);
-    if (in.taps)
+    if (tapHere)
     {
         in.taps->A = A;
         in.taps->rAU = rAU;
@@ -698,7 +711,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
 
     // ...ON THE BOUNDARY TOO -- see PressureStepInput::ghfBnd. rAUf at an uncoupled patch is the face
     // cell's rAU, which is what fvc::interpolate gives there.
-    if (in.taps)
+    if (tapHere)
     {
         in.taps->phiHbyABndPrePhig = phiHbyA.boundary;
         in.taps->uEqnDiag  = in.UEqn->diag;
@@ -736,7 +749,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
                          rAUfb, q.magSf, phigBnd[pi]);
             for (label i = 0; i < q.size; ++i) phiHbyA.boundary[pi][i] += phigBnd[pi][i];
         }
-        if (in.taps)
+        if (tapHere)
         {
             in.taps->phigBnd = phigBnd;
             in.taps->rAUfBnd.assign(patches.size(), std::vector<scalar>());
@@ -827,13 +840,15 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
         }
         if (in.taps)
         {
-            in.taps->jumpBnd.assign(patches.size(), std::vector<scalar>());
+            // jumpBnd is this corrector's, jumpHistory is every corrector's by design -- it is the
+            // one tap here that a single corrector cannot answer, and the cyclic gates read it.
+            if (tapHere) in.taps->jumpBnd.assign(patches.size(), std::vector<scalar>());
             std::vector<scalar> flatJump;
             for (std::size_t pi = 0; pi < patches.size(); ++pi)
             {
                 if (const std::vector<scalar>* j = p_rgh.boundary[pi]->coupledJump())
                 {
-                    in.taps->jumpBnd[pi] = *j;
+                    if (tapHere) in.taps->jumpBnd[pi] = *j;
                 }
                 if (!patches[pi].coupled) continue;
                 for (label i = 0; i < patches[pi].size; ++i)
@@ -1017,7 +1032,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
                     ffB[pi][i] = phigBnd[pi][i] - pFlux.boundary[pi][i];
                 }
             }
-            if (in.taps) in.taps->ffBnd = ffB;
+            if (tapHere) in.taps->ffBnd = ffB;
             correctVelocity(HbyA, rAU, faceFlux, rAUfField.internal, ffB, rB, m, g, patches, U.internal);
             U.evaluateBoundary();
 

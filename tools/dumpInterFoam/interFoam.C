@@ -248,6 +248,11 @@ int main(int argc, char *argv[])
                 // THE OLD CELL VOLUMES, which the moving-mesh ddt's source is built on
                 // (rho*V0/dt*U.oldTime()). Nothing written at the end of a step can show them, which
                 // is why six comparisons of step-one state missed the permeable-moving gap.
+                // ONLY ON A MESH THAT MOVES: fvMesh::V0() has no field to return otherwise and
+                // aborts with "V0 is not available" (fvMeshGeometry.C:208-215), which is how this
+                // block took interfoam_capillaryrise_vs_openfoam down -- a static case whose gate
+                // runs this tool, and which the scoped run that unit chose did not cover.
+                if (mesh.moving())
                 {
                     volScalarField V0dump
                     (

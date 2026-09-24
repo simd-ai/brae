@@ -39,18 +39,30 @@
     // alpha, an exact curvature and a converged pressure solve has to be in one of these.
     if (getenv("BRAE_DUMP_ITER") && runTime.timeIndex() == atoi(getenv("BRAE_DUMP_ITER")))
     {
-        volScalarField("rAU.dump", rAU()).write();
-        volVectorField("HbyA.dump", HbyA).write();
-        surfaceScalarField("rAUf.dump", rAUf).write();
-        surfaceScalarField("phig.dump", phig).write();
-        surfaceScalarField("phiHbyA.dump", phiHbyA).write();
-        surfaceScalarField("stf.dump", mixture.surfaceTensionForce()()).write();
-        surfaceScalarField("snGradRho.dump", fvc::snGrad(rho)()).write();
-        volScalarField("rho.dump", rho).write();
-        volScalarField("UEqnA.dump", UEqn.A()()).write();
-        volScalarField("muEff.dump", rho*mixture.nu()).write();
-        volScalarField("nuMix.dump", mixture.nu()()).write();
-        Info<< "[brae] dumped pEqn stage at timeIndex " << runTime.timeIndex() << endl;
+        // ONE SUFFIX PER PRESSURE CORRECTOR. Every field written here is rebuilt by each corrector,
+        // and this block used to write the same eleven names on all of them -- so the files left on
+        // disk were the LAST corrector's while brae's own taps are the FIRST's (inter_peqn_cpp.cu:851
+        // pins them to corrector 0 for exactly this reason, between the two brae arms). Comparing
+        // those two reads as a defect in whichever term moves between correctors: it put HbyA
+        // 3.556e-01 and phiHbyA 1.786e-01 out on permeable-moving while the momentum MATRIX behind
+        // them agrees to 1.5e-09. corrPISO() is 1 on the first corrector
+        // (pimpleControlI.H:59), and that one keeps the bare name so every existing probe now reads
+        // the corrector its brae side tapped.
+        const Foam::word sfx =
+            (pimple.corrPISO() <= 1) ? Foam::word() : ("c" + Foam::name(pimple.corrPISO()));
+        volScalarField("rAU" + sfx + ".dump", rAU()).write();
+        volVectorField("HbyA" + sfx + ".dump", HbyA).write();
+        surfaceScalarField("rAUf" + sfx + ".dump", rAUf).write();
+        surfaceScalarField("phig" + sfx + ".dump", phig).write();
+        surfaceScalarField("phiHbyA" + sfx + ".dump", phiHbyA).write();
+        surfaceScalarField("stf" + sfx + ".dump", mixture.surfaceTensionForce()()).write();
+        surfaceScalarField("snGradRho" + sfx + ".dump", fvc::snGrad(rho)()).write();
+        volScalarField("rho" + sfx + ".dump", rho).write();
+        volScalarField("UEqnA" + sfx + ".dump", UEqn.A()()).write();
+        volScalarField("muEff" + sfx + ".dump", rho*mixture.nu()).write();
+        volScalarField("nuMix" + sfx + ".dump", mixture.nu()()).write();
+        Info<< "[brae] dumped pEqn stage at timeIndex " << runTime.timeIndex()
+            << " corrector " << pimple.corrPISO() << endl;
     }
     // ------------------------------------------------------------------------------------------
 

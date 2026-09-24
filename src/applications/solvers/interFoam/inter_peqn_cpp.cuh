@@ -279,6 +279,10 @@ struct PressureTaps
     // UEqn's boundary coefficients per patch, x component -- on a coupled patch this is the interface
     // off-diagonal H() reads
     std::vector<std::vector<scalar>> uEqnBCx;
+    // U AS H() MULTIPLIES IT. H(psi) is the one input to UEqn.H() that is not the matrix: with the
+    // matrix, the source, V and rAU all measured exact, a difference in HbyA can only be psi, and
+    // nothing written at the end of a step shows the value the pressure corrector read.
+    std::vector<vector> uAtH;
     // ...and the rest of UEqn, for bisecting H() term by term: H = (bdDiag*psi + lduH(psi) + source
     // + boundarySource)/V, so every one of these is a separate question
     std::vector<scalar> uEqnDiag, uEqnUpper, uEqnLower, uEqnSourceX;

@@ -302,7 +302,7 @@ int main(int argc, char** argv)
                         (double)(std::fmax(wW, wI)/std::fmax(sc, scalar(1e-300))),
                         faces ? "face" : "cell", at, (double)brae[at], (double)of[at]);
         };
-        std::printf("  pressure corrector against tools/dumpInterFoam, last corrector of step %ld:\n",
+        std::printf("  pressure corrector against tools/dumpInterFoam, first corrector of step %ld:\n",
                     (long)nSteps);
         report("UEqn.A", taps.A, ofDir + "/UEqnA.dump", false);
         report("rAU", taps.rAU, ofDir + "/rAU.dump", false);
@@ -312,6 +312,63 @@ int main(int argc, char** argv)
         report("phig", taps.phig, ofDir + "/phig.dump", true);
         report("phiHbyA", taps.phiHbyA, ofDir + "/phiHbyA.dump", true);
         report("rho", fin.rho, ofDir + "/rho.dump", false);
+
+        // WHICH CORRECTOR THE TAP IS, asserted and not assumed. capillaryRise runs nCorrectors 3, so
+        // OpenFOAM builds phiHbyA three times in the step and tools/dumpInterFoam now writes each one
+        // under its own name -- the first bare, the rest suffixed. brae's host taps are pinned to the
+        // first (inter_peqn_cpp.cu, `tapHere`). They were not: they sat under a bare `if (in.taps)`
+        // and every corrector overwrote them while `tapCorrector` was set only on the first, so the
+        // tap said 0 and held the LAST corrector's field. That is what put HbyA 4.66e-01 and phiHbyA
+        // 3.64e-01 from OpenFOAM on the permeable-moving case with the momentum matrix behind them
+        // exact to 1.5e-09. This arm fails if the pinning is ever undone.
+        {
+            std::string lastFile;
+            for (int k = 9; k >= 2; --k)
+            {
+                const std::string f = ofDir + "/phiHbyAc" + std::to_string(k) + ".dump";
+                if (std::filesystem::exists(f)) { lastFile = f; break; }
+            }
+            if (lastFile.empty())
+            {
+                check("the oracle wrote a second corrector's phiHbyA, so this case can tell the two "
+                      "apart at all", false);
+            }
+            else
+            {
+                auto faces = [&](const std::string& f)
+                {
+                    const FieldData<scalar> fd = readField<scalar>(f);
+                    return fd.internalUniform
+                         ? std::vector<scalar>(static_cast<std::size_t>(nIf), fd.internalUniformValue)
+                         : fd.internalField;
+                };
+                const std::vector<scalar> c1 = faces(ofDir + "/phiHbyA.dump");
+                const std::vector<scalar> cL = faces(lastFile);
+                scalar dFirst = 0, dLast = 0, spread = 0, sc = 0;
+                for (label f = 0; f < nIf; ++f)
+                {
+                    const std::size_t k = static_cast<std::size_t>(f);
+                    dFirst = std::fmax(dFirst, std::fabs(taps.phiHbyA[k] - c1[k]));
+                    dLast  = std::fmax(dLast,  std::fabs(taps.phiHbyA[k] - cL[k]));
+                    spread = std::fmax(spread, std::fabs(c1[k] - cL[k]));
+                    sc     = std::fmax(sc, std::fabs(c1[k]));
+                }
+                std::printf("  corrector identity: |tap - OF first| %.3e, |tap - OF last| %.3e, "
+                            "OF first-to-last %.3e of %.3e\n",
+                            (double)dFirst, (double)dLast, (double)spread, (double)sc);
+                // THE ARM'S OWN VACUITY GUARD FIRST. If OpenFOAM's correctors held the same field
+                // there would be nothing to be right or wrong about, and the arm below would pass
+                // whatever brae tapped.
+                // ...against the CLOSER of the two, not against dFirst: a guard keyed on dFirst
+                // fails alongside the arm below when the tap is wrong, and then it is no longer
+                // saying anything about the fixture.
+                check("OpenFOAM's first and last pressure correctors hold DIFFERENT phiHbyA, so this "
+                      "arm can witness which one brae tapped",
+                      spread > scalar(1e3)*std::fmax(std::fmin(dFirst, dLast), scalar(1e-300)));
+                check("the host pressure taps are the FIRST corrector's, not the last",
+                      dFirst < dLast);
+            }
+        }
     }
 
     // THE OPEN DISCREPANCY, recorded at its measured size. 2.66e-02 against |U| 2.59e-01 after one

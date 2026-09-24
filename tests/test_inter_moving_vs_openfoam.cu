@@ -639,7 +639,10 @@ int main(
     }
 
     // THE PRESSURE CORRECTOR TERM BY TERM, when the case was run with tools/dumpInterFoam rather than
-    // interFoam (BRAE_DUMP_ITER = the last step): both sides hold the last corrector of the last step.
+    // interFoam (BRAE_DUMP_ITER = the last step): both sides hold the FIRST pressure corrector of
+    // that step. They used to hold the last on both sides by accident -- the host taps were written
+    // by every corrector and the tool's writes overwrote each other -- and the two are now pinned,
+    // because on a case with nCorrectors 2 the accident does not survive one side being fixed.
     // Cells beside a moving wall are split from the rest. A diagnostic, not an arm: the staging script
     // runs interFoam, and this block is how a gap on a moving mesh is taken apart.
     if (std::filesystem::exists(ofDir + "/rAU.dump"))
@@ -705,7 +708,7 @@ int main(
                         (double)(std::fmax(wW, wI)/std::fmax(sc, scalar(1e-300))),
                         faces ? "face" : "cell", at, (double)brae[at], (double)of[at]);
         };
-        std::printf("  pressure corrector against tools/dumpInterFoam, last corrector of step %ld:\n",
+        std::printf("  pressure corrector against tools/dumpInterFoam, first corrector of step %ld:\n",
                     (long)nSteps);
         report("UEqn.A", taps.A, ofDir + "/UEqnA.dump", false);
         report("rAU", taps.rAU, ofDir + "/rAU.dump", false);

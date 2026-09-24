@@ -308,39 +308,40 @@ RunReport runInterFoam(
         // refValue is 1.353e-13 from OpenFOAM's and valueFraction is EQUAL on all 1050 faces. So
         // nothing step one leaves behind is wrong -- it is step two's own arithmetic.
         //
-        // WHERE IN STEP TWO, from the pressure taps against tools/dumpInterFoam at BRAE_DUMP_ITER=2:
-        //     rAU       3.063e-10      the momentum DIAGONAL is right
-        //     HbyA      3.556e-01      UEqn.H() is not
-        //     phiHbyA   1.786e-01, and 3.741e-01 on the wall
-        // rAU is 1/UEqn.A(), so A -- and with it every internalCoeffs the patch contributes -- is
-        // exact, and the whole error is on the SOURCE side of the momentum equation. Two terms live
-        // there and no others: the ddt's rho*V0/dt*U.oldTime(), and the boundaryCoeffs of the
-        // permeable patch.
+        // WHERE IN STEP TWO -- and the first three readings of this were NOT the corrector they said
+        // they were. The host pressure taps sat under a bare `if (in.taps)` and were overwritten by
+        // every corrector while `tapCorrector` was set only on the first, and tools/dumpInterFoam
+        // wrote the same eleven names on each corrector so the files left on disk were the last
+        // one's. On this case, nCorrectors 2, that put a corrector-2 HbyA against a corrector-1 HbyA
+        // and read 3.556e-01. Both are fixed -- inter_peqn_cpp.cu pins its taps to the first
+        // corrector as the device loop already did, and the tool suffixes the later ones -- and with
+        // both sides on the FIRST corrector of step two the momentum hand-off reads:
+        //     rAU           3.06e-10      the diagonal
+        //     U as H() multiplies it
+        //                   1.02e-13      psi, the one input to H() that is not the matrix
+        //     UEqn upper    1.50e-09      the off-diagonals, both halves
+        //     UEqn lower    9.15e-10
+        //     UEqn diag     3.71e-10
+        //     UEqn sourceX  3.82e-04      <-- the only term of UEqn.H() still out
+        //     HbyA          1.39e-03 x, 1.75e-03 y, 3.22e-03 z
+        //     phiHbyA       1.87e-03
+        // THE OFF-DIAGONALS ARE NOT IT. The note that stood here pointing at lduMatrix::H(psi) is
+        // withdrawn: it was written from a number that compared two different correctors.
         //
-        // THE ddt IS NOT IT. tools/dumpInterFoam writes mesh.V0() and mesh.V() at the dump iteration
-        // for exactly this question, and at step two both agree with this loop's to 6.204e-16. rho and
-        // U.oldTime() were already exact, so the whole ddt source is.
+        // WHAT IS LEFT is UEqn's SOURCE, and it is not the permeable patch's: 6.526e-10 on the cells
+        // touching `walls` against 4.667e-10 everywhere else, spread over the mesh rather than sitting
+        // on the patch. Three terms build it and the first is already ruled out: the ddt's
+        // rho*V0/dt*U.oldTime() (V0 and V agree to 6.204e-16, rho and U.oldTime() were exact), the
+        // relaxation contribution S += (D - D0)*psi -- which this case still gets with `"U.*" 1`,
+        // because fvMatrix::relax enforces diagonal dominance with max(D, D, sumOff) BEFORE dividing
+        // by alpha -- and the explicit viscous div, `div(((rho*nuEff)*dev2(T(grad(U)))))`, which is
+        // the case's own scheme entry. `div(rhoPhi,U) Gauss vanLeerV` contributes no source: a
+        // limited scheme reaches fvm::div through its weights alone.
         //
-        // THE PATCH IS NOT IT EITHER, measured at the ASSEMBLY of step two and not at the end of the
-        // step (tools/dumpInterFoam writes `Uasm.dump`, a copy of U taken there, and a mixed condition
-        // writes its own refValue and valueFraction):
-        //     refValue       3.185e-15   against a max of 1.534e+00 -- an order of magnitude larger
-        //                                than the 5.9e-03 the end of step one shows, so this is the
-        //                                moment that matters and it agrees
-        //     valueFraction  EQUAL on all 1050 faces
-        // and the ASSEMBLED momentum coefficients with them: OpenFOAM prints |bC| 0 and
-        // |iC| 1.59244463781161e-05 on that patch, this loop 0 and 1.59244463781161196e-05 -- every
-        // digit OpenFOAM prints. So the boundary treatment of the momentum matrix is exact.
-        //
-        // WHAT IS LEFT is the only part of UEqn.H() not yet compared: lduMatrix::H(psi), the
-        // OFF-DIAGONAL product. H = (H(psi) + source + boundarySource)/V, and source, boundarySource,
-        // V and A are now all exact, so the off-diagonals are. They come from div(rhoPhi,U) and
-        // laplacian(muEff,U), which makes rhoPhi and muEff at step two the next two dumps --
-        // tools/dumpInterFoam already writes muEff.dump, nuMix.dump and rho.dump.
-        // WHY THE DIAGONAL CAN BE RIGHT WHILE THEY ARE NOT: A is D/V, and D carries the ddt's
-        // rho*V/dt, which on this case is far larger than the convective and viscous off-diagonals --
-        // an error in those is visible in H and buried in A. The device loop refuses it at its own
-        // site.
+        // AND THE GROWTH IS AFTER THE HAND-OFF. The step still ends 1.33e-01 from OpenFOAM while HbyA
+        // leaves the momentum 1.4e-03 out, so between them lie the p_rgh system, the velocity
+        // correction and the second corrector -- none of which this unit has compared at a matched
+        // corrector, because until now it could not. The device loop refuses it at its own site.
         for (std::size_t pi = 0; pi < patches.size() && pi < f.U.boundary.size(); ++pi)
         {
             const bool permeable = f.U.boundary[pi]->needsAlphaPatchValues()

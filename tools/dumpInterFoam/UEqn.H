@@ -89,3 +89,69 @@
 
         fvOptions.correct(U);
     }
+
+    // ---- INSTRUMENTATION: writes only, nothing above is altered -------------------------------
+    // THE MOMENTUM MATRIX ITSELF, as pEqn.H reads it. UEqn.H() = (lduMatrix::H(psi) + source
+    // + boundarySource)/V. On the permeable-moving case every other term of that expression has
+    // been measured exact -- V, A, the ddt source, the patch's refValue/valueFraction and the
+    // assembled internalCoeffs/boundaryCoeffs -- while HbyA is still 3.556e-01 out. What is left is
+    // the OFF-DIAGONALS and the explicit half of the source, and nothing written at the end of a
+    // step can show either.
+    //
+    // THROUGH A CONST REFERENCE, deliberately. The non-const lduMatrix::lower() ALLOCATES lowerPtr_
+    // as a copy of upper (lduMatrix.C:333-342), which turns a symmetric matrix asymmetric and
+    // changes the solver chosen for it. An instrument must not move the thing it measures.
+    if (getenv("BRAE_DUMP_ITER") && runTime.timeIndex() == atoi(getenv("BRAE_DUMP_ITER")))
+    {
+        const fvVectorMatrix& UEqnC = UEqn;
+
+        surfaceScalarField UEqnUpper
+        (
+            IOobject("UEqnUpper.dump", runTime.timeName(), mesh,
+                     IOobject::NO_READ, IOobject::NO_WRITE),
+            mesh,
+            dimensionedScalar(dimless, Zero)
+        );
+        UEqnUpper.primitiveFieldRef() = UEqnC.upper();
+        UEqnUpper.write();
+
+        surfaceScalarField UEqnLower
+        (
+            IOobject("UEqnLower.dump", runTime.timeName(), mesh,
+                     IOobject::NO_READ, IOobject::NO_WRITE),
+            mesh,
+            dimensionedScalar(dimless, Zero)
+        );
+        UEqnLower.primitiveFieldRef() = UEqnC.lower();
+        UEqnLower.write();
+
+        volScalarField UEqnDiag
+        (
+            IOobject("UEqnDiag.dump", runTime.timeName(), mesh,
+                     IOobject::NO_READ, IOobject::NO_WRITE),
+            mesh,
+            dimensionedScalar(dimless, Zero)
+        );
+        UEqnDiag.primitiveFieldRef() = UEqnC.diag();
+        UEqnDiag.write();
+
+        volVectorField UEqnSource
+        (
+            IOobject("UEqnSource.dump", runTime.timeName(), mesh,
+                     IOobject::NO_READ, IOobject::NO_WRITE),
+            mesh,
+            dimensionedVector(dimless, Zero)
+        );
+        UEqnSource.primitiveFieldRef() = UEqnC.source();
+        UEqnSource.write();
+
+        // ...and the two FACE COEFFICIENTS the off-diagonals are built from, so a difference in
+        // upper can be told from a difference in what it was assembled out of: rhoPhi carries the
+        // div, muEff the laplacian. muEff.dump is already written by pEqn.H.
+        surfaceScalarField("rhoPhi.dump", rhoPhi).write();
+
+        Info<< "[brae] dumped the UEqn matrix at timeIndex " << runTime.timeIndex()
+            << " (symmetric " << UEqnC.symmetric() << ", asymmetric " << UEqnC.asymmetric() << ")"
+            << endl;
+    }
+    // ------------------------------------------------------------------------------------------
