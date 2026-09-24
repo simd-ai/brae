@@ -245,6 +245,35 @@ int main(int argc, char *argv[])
             {
                 surfaceScalarField("nHatfA.dump", mixture.nHatf()).write();
                 volScalarField("sigmaKA.dump", mixture.sigmaK()()).write();
+                // THE OLD CELL VOLUMES, which the moving-mesh ddt's source is built on
+                // (rho*V0/dt*U.oldTime()). Nothing written at the end of a step can show them, which
+                // is why six comparisons of step-one state missed the permeable-moving gap.
+                {
+                    volScalarField V0dump
+                    (
+                        IOobject
+                        (
+                            "V0.dump",
+                            runTime.timeName(),
+                            mesh,
+                            IOobject::NO_READ,
+                            IOobject::NO_WRITE
+                        ),
+                        mesh,
+                        dimensionedScalar(dimVolume, Zero)
+                    );
+                    V0dump.primitiveFieldRef() = mesh.V0();
+                    V0dump.write();
+                    volScalarField Vdump
+                    (
+                        IOobject("V.dump", runTime.timeName(), mesh,
+                                 IOobject::NO_READ, IOobject::NO_WRITE),
+                        mesh,
+                        dimensionedScalar(dimVolume, Zero)
+                    );
+                    Vdump.primitiveFieldRef() = mesh.V();
+                    Vdump.write();
+                }
                 Info<< "[brae] dumped nHatf and sigmaK after the alpha step at timeIndex "
                     << runTime.timeIndex() << endl;
             }
