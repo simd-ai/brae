@@ -72,6 +72,45 @@ std::vector<std::vector<label>> pointCellsFromPointFaces(
     return pointCellAddr;
 }
 
+std::vector<std::vector<label>> pointCellsFromCells(
+    const PrimitiveMesh& m,
+    const std::vector<std::vector<label>>& cells)
+{
+    // primitiveMeshPointCells.C:114-186. OpenFOAM counts first and fills second, with a `usedPoints`
+    // marker cleared by walking the points it just set rather than by clearing the whole list. The
+    // two passes exist to size each row exactly; the ORDER they produce is what matters here, and it
+    // is ascending cell index because the outer loop is `for (celli = 0; celli < nCells; ++celli)`.
+    const std::size_t nPoints = static_cast<std::size_t>(m.nPoints());
+    std::vector<std::vector<label>> pointCells(nPoints);
+    std::vector<char> usedPoints(nPoints, 0);
+    std::vector<label> currPoints;
+    for (std::size_t celli = 0; celli < cells.size(); ++celli)
+    {
+        for (const label p : currPoints)
+        {
+            usedPoints[static_cast<std::size_t>(p)] = 0;
+        }
+        currPoints.clear();
+        for (const label facei : cells[celli])
+        {
+            const label n = m.faceSize(facei);
+            for (label k = 0; k < n; ++k)
+            {
+                const label pointi = m.faceVert(facei, k);
+                char& used = usedPoints[static_cast<std::size_t>(pointi)];
+                if (!used)
+                {
+                    used = 1;
+                    currPoints.push_back(pointi);
+                    pointCells[static_cast<std::size_t>(pointi)].push_back(static_cast<label>(celli));
+                }
+            }
+        }
+    }
+    return pointCells;
+}
+
+
 PrimitivePatchAddressing primitivePatch(
     const PrimitiveMesh& m,
     const std::vector<label>& faces)

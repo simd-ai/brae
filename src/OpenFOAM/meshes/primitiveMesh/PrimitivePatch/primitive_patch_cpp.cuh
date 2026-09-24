@@ -41,6 +41,15 @@ std::vector<std::vector<label>> pointCellsFromPointFaces(
     const PrimitiveMesh& m,
     const std::vector<std::vector<label>>& pointFaces);
 
+// primitiveMesh::calcPointCells' CELLS branch (primitiveMeshPointCells.C:114-186), the one taken when
+// neither cellPoints() nor pointFaces() has been computed yet: two passes over cells() in ascending
+// cell order, each point counted once per cell, so every point's list comes out ASCENDING IN CELL
+// INDEX. That is a different order from pointCellsFromPointFaces above, and the order is the content
+// wherever a sum is taken in it -- dynamicRefineFvMesh::cellToPoint is such a sum.
+std::vector<std::vector<label>> pointCellsFromCells(
+    const PrimitiveMesh& m,
+    const std::vector<std::vector<label>>& cells);
+
 // A PrimitivePatch over a list of the mesh's faces
 struct PrimitivePatchAddressing
 {

@@ -1,0 +1,80 @@
+// dynamicRefineFvMesh's REFINEMENT CANDIDATE SELECTION: which cells an adaptive mesh would refine,
+// given a field and a band. This is the one part of AMR that is pure arithmetic on a FIXED mesh --
+// it reads the point-cell addressing and a cell field and returns a marker per cell, and it touches
+// no topology, allocates no polyTopoChange and calls nothing on hexRef8. So it is portable, and
+// gateable against real OpenFOAM, before any of the mesh-changing machinery exists.
+//
+// OF v2412: src/dynamicFvMesh/dynamicRefineFvMesh/dynamicRefineFvMesh.C
+//   cellToPoint            :754-771
+//   error                  :774-793
+//   maxPointField          :718-733
+//   maxCellField           :736-751
+//   selectRefineCandidates :796-827
+//
+// WHAT IS NOT HERE, and why: `selectRefineCells` (:830-907) needs hexRef8's cellLevel and its
+// consistentRefinement 2:1 closure, `calculateProtectedCells` (:52-163) needs cellLevel and a face
+// sync, and `selectUnrefinePoints` (:910-1002) needs getSplitPoints off an active refinementHistory.
+// Each is its own unit. `extendMarkedCells` (:1005-1036) is pure except for one syncFaceList, which
+// is a no-op only on a mesh with no coupled or cyclic patches.
+//
+// THE ORDER IS THE CONTENT. `cellToPoint` accumulates in pointCells order from 0.0, so a different
+// order is a different last digit. OpenFOAM's primitiveMesh::calcPointCells has THREE orders and
+// picks by what the mesh has already computed (see primitive_patch_cpp.cuh) -- so the addressing is
+// taken as an argument here and the caller, and the gate, own that choice.
+#pragma once
+
+#include "cf_types.cuh"
+#include <vector>
+
+namespace brae {
+namespace dynamicRefine {
+
+// dynamicRefineFvMesh.C:754-771. UNWEIGHTED arithmetic mean of the cell values over each point's
+// cells -- no volume, no distance, no inverse-distance weighting -- accumulated in pointCells order
+// from `sum = 0.0` and divided ONCE by pointCells[pointi].size(). OpenFOAM does not guard a point
+// with no cells; this does not either, and says so rather than returning a quiet zero.
+std::vector<scalar> cellToPoint(
+    const std::vector<scalar>&                  vFld,
+    const std::vector<std::vector<label>>&      pointCells);
+
+// dynamicRefineFvMesh.C:774-793. `err = min(fld - minLevel, maxLevel - fld)` -- the distance to the
+// NEARER band edge: positive strictly inside, exactly 0 on an edge, negative outside. The result
+// starts at the sentinel -1 and `err` is written back under `err >= 0` (NON-strict), so a value
+// sitting exactly on an edge is written as 0 and not left at -1. Both differences are formed in
+// OpenFOAM's operand order.
+std::vector<scalar> error(
+    const std::vector<scalar>& fld,
+    scalar                     minLevel,
+    scalar                     maxLevel);
+
+// dynamicRefineFvMesh.C:718-733. Point field -> cell field: each cell takes the MAX over its points.
+// The cell field starts at -GREAT (1.0e+15), so a cell no point names keeps it.
+std::vector<scalar> maxPointField(
+    const std::vector<scalar>&                  pFld,
+    const std::vector<std::vector<label>>&      pointCells,
+    label                                       nCells);
+
+// dynamicRefineFvMesh.C:736-751. Cell field -> point field: each point takes the MAX over its cells,
+// from the INTERNAL field only. Starts at -GREAT. This is the field selectUnrefinePoints tests, and
+// it is deliberately NOT the average above.
+std::vector<scalar> maxCellField(
+    const std::vector<scalar>&                  vFld,
+    const std::vector<std::vector<label>>&      pointCells);
+
+// dynamicRefineFvMesh.C:796-827: maxPointField(error(cellToPoint(vFld), lower, upper)), marked where
+// the result is STRICTLY > 0. The two strictnesses do not agree and that is the point: `error`
+// writes a band edge as 0 (`>= 0`) and this rejects it (`> 0`), so the refinement band is OPEN. A
+// cell is a candidate only if one of its points is strictly inside it.
+//
+// Marks IN PLACE and never clears, as OpenFOAM's bitSet does: the caller hands in a marker sized
+// nCells, and bits already set stay set.
+void selectRefineCandidates(
+    scalar                                      lowerRefineLevel,
+    scalar                                      upperRefineLevel,
+    const std::vector<scalar>&                  vFld,
+    const std::vector<std::vector<label>>&      pointCells,
+    label                                       nCells,
+    std::vector<char>&                          candidateCell);
+
+}   // namespace dynamicRefine
+}   // namespace brae

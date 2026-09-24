@@ -109,6 +109,7 @@ add_library(brae_core STATIC
     src/OpenFOAM/meshes/primitiveMesh/PrimitivePatch/primitive_patch_cpp.cu
     src/meshTools/cellDist/patchWave/patch_wave_cpp.cu
     src/OpenFOAM/meshes/primitiveMesh/edges/mesh_edges_cpp.cu
+    src/dynamicFvMesh/dynamicRefineFvMesh/dynamic_refine_fv_mesh_cpp.cu
     src/dynamicMesh/pointPatchDist/point_patch_dist_cpp.cu
     src/rigidBodyDynamics/rigid_body_motion_cpp.cu
     src/rigidBodyMeshMotion/rigid_body_mesh_motion_cpp.cu
@@ -3711,6 +3712,7 @@ target_include_directories(test_rigid_body_dynamics_vs_openfoam PRIVATE ${BRAE_H
 target_link_libraries(test_rigid_body_dynamics_vs_openfoam PRIVATE brae_core)
 add_test(NAME rigid_body_dynamics_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rigid_body_dynamics_vs_openfoam.sh)
+set_tests_properties(rigid_body_dynamics_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
 # brae's Newmark integrator and acceleration relaxation against real OpenFOAM's own joint state.
 add_executable(test_rigid_body_newmark_vs_openfoam tests/test_rigid_body_newmark_vs_openfoam.cu)
@@ -3719,6 +3721,7 @@ target_include_directories(test_rigid_body_newmark_vs_openfoam PRIVATE ${BRAE_HE
 target_link_libraries(test_rigid_body_newmark_vs_openfoam PRIVATE brae_core)
 add_test(NAME rigid_body_newmark_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rigid_body_newmark_vs_openfoam.sh)
+set_tests_properties(rigid_body_newmark_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
 # brae's fluid force and moment on a body's patches against real OpenFOAM's functionObjects::forces.
 add_executable(test_rigid_body_forces_vs_openfoam tests/test_rigid_body_forces_vs_openfoam.cu)
@@ -3727,6 +3730,7 @@ target_include_directories(test_rigid_body_forces_vs_openfoam PRIVATE ${BRAE_HEA
 target_link_libraries(test_rigid_body_forces_vs_openfoam PRIVATE brae_core)
 add_test(NAME rigid_body_forces_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rigid_body_forces_vs_openfoam.sh)
+set_tests_properties(rigid_body_forces_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
 # brae's rigid-body point transform against real OpenFOAM's pointDisplacement, with the joint state
 # taken from OpenFOAM's own. The script carries the measurements and the controls.
@@ -3736,6 +3740,16 @@ target_include_directories(test_rigid_body_transform_vs_openfoam PRIVATE ${BRAE_
 target_link_libraries(test_rigid_body_transform_vs_openfoam PRIVATE brae_core)
 add_test(NAME rigid_body_transform_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rigid_body_transform_vs_openfoam.sh)
+set_tests_properties(rigid_body_transform_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# brae's refinement candidate selection against real OpenFOAM's own dynamicRefineFvMesh members.
+add_executable(test_refine_candidates_vs_openfoam tests/test_refine_candidates_vs_openfoam.cu)
+target_include_directories(test_refine_candidates_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_refine_candidates_vs_openfoam PRIVATE brae_core)
+add_test(NAME refine_candidates_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/refine_candidates_vs_openfoam.sh)
+set_tests_properties(refine_candidates_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
 # brae's pointPatchDist and the rigidBodyMeshMotion scale against real OpenFOAM, on the mesh
 # RAS/floatingObject builds. The script carries the measurements and the controls.
@@ -3745,6 +3759,7 @@ target_include_directories(test_point_patch_dist_vs_openfoam PRIVATE ${BRAE_HEAD
 target_link_libraries(test_point_patch_dist_vs_openfoam PRIVATE brae_core)
 add_test(NAME point_patch_dist_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/point_patch_dist_vs_openfoam.sh)
+set_tests_properties(point_patch_dist_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
 # interFoam across a coded cyclicACMI baffle against real OpenFOAM on damBreakLeakage. The script carries
 # the measurements, the controls and the fail-proofs.
