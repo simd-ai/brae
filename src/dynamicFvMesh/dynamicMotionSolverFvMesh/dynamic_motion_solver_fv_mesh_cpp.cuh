@@ -39,8 +39,8 @@
 // swept_volume.cuh uses a third arrangement of the same cross product; this file transcribes face.C.
 //
 // NOT PORTED, refused by name where the dictionary is read: every dynamicFvMesh but
-// dynamicMotionSolverFvMesh (and staticFvMesh, which is no motion); every motionSolver but solidBody
-// and displacementLaplacian;
+// dynamicMotionSolverFvMesh (and staticFvMesh, which is no motion); every motionSolver but solidBody,
+// displacementLaplacian and rigidBodyMotion;
 // a `cellZone` or `cellSet` (the motion of part of a mesh deforms the cells around it, and the
 // interFoam tutorial that asks for one slides it on an AMI); a `points0` file; and a start from a
 // time directory that carries its own polyMesh/points.
@@ -52,6 +52,7 @@
 #include "fv_patch.cuh"
 #include "fvc.cuh"
 #include "primitive_mesh.cuh"
+#include "rigid_body_mesh_motion_cpp.cuh"
 #include "solid_body_motion_function_cpp.cuh"
 #include <memory>
 #include <string>
@@ -104,12 +105,16 @@ public:
     // mesh.update() at the new time. finalIteration is PIMPLE's "finalIteration" flag, which selects
     // the displacement equation's Final solver entry; agglomeration is the run's GAMG hierarchy, which a
     // displacement solver shares with every other GAMG solve and which a move invalidates.
+    // `load` is the fluid's pressure and shear on the body's patches, which ONLY a rigidBodyMotion
+    // needs: its points come from equations of motion the flow drives. A prescribed motion ignores it
+    // and the rigid body refuses to move without it, rather than integrating a body with no load.
     void update(
         scalar time,
         scalar deltaT,
         label timeIndex,
         bool finalIteration = false,
-        GamgAgglomerationCache* agglomeration = nullptr);
+        GamgAgglomerationCache* agglomeration = nullptr,
+        const BodyLoad* load = nullptr);
 
     // polyMesh::moving(): false until the first update
     bool moving() const
@@ -124,6 +129,11 @@ public:
     const DisplacementLaplacianFvMotionSolver* displacementSolver() const
     {
         return displacement_.get();
+    }
+    // the rigid body this motion integrates, or null for a prescribed motion
+    const RigidBodyMeshMotion* rigidBody() const
+    {
+        return rigidBody_.get();
     }
     const std::vector<vector>& points0() const
     {
@@ -182,6 +192,7 @@ private:
     std::vector<FvPatch>* patches_ = nullptr;
     std::unique_ptr<SolidBodyMotionFunction> SBMF_;
     std::unique_ptr<DisplacementLaplacianFvMotionSolver> displacement_;
+    std::unique_ptr<RigidBodyMeshMotion> rigidBody_;
     std::string motionType_;
     std::vector<vector> points0_;
     std::string cellZone_;

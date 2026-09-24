@@ -236,6 +236,13 @@ void constrainPointDisplacement(
     const std::vector<FvPatch>& patches,
     std::vector<vector>&        displacement);
 
+// <time>/uniform/rigidBodyMotionState: `q 2 ( a b );` and the same for qDot and qDdot, then the two
+// scalars. rigidBodyModelState.C:46-71 reads every entry with readIfPresent, so a missing one is the
+// default and NOT an error -- which is how a cold start from a coeffDict holding none of them works.
+// One reader for the motion solver and for every gate that reads OpenFOAM's written state.
+std::vector<scalar> readJointStateList(const std::string& path, const char* key);
+scalar readJointStateScalar(const std::string& path, const char* key, scalar fallback);
+
 // Read constant/dynamicMeshDict. Refuses anything this unit does not carry, by name: a motionSolver
 // that is not rigidBodyMotion, more than one body, a joint other than Py or Ry, a `mergeWith` body,
 // and a parent that is not `root`.

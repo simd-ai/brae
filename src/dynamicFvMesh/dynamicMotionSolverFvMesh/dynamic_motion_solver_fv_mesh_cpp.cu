@@ -96,14 +96,14 @@ std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::New(
     {
         solver = d.wordOr("solver", "");
     }
-    if (solver != "solidBody" && solver != "displacementLaplacian")
+    if (solver != "solidBody" && solver != "displacementLaplacian" && solver != "rigidBodyMotion")
     {
         throw std::runtime_error(
             std::string(WHO) + "constant/dynamicMeshDict asks for `motionSolver " + solver + "`. Only "
-            "solidBody -- a prescribed rigid transformation of the points -- and displacementLaplacian "
-            "are ported. The others solve for the point motion another way (velocityLaplacian, "
-            "displacementSBRStress, ...) or integrate a body's equations of motion (rigidBodyMotion, "
-            "sixDoFRigidBodyMotion).");
+            "solidBody -- a prescribed rigid transformation of the points -- displacementLaplacian and "
+            "rigidBodyMotion are ported. The others solve for the point motion another way "
+            "(velocityLaplacian, displacementSBRStress, ...) or integrate a body's equations of motion "
+            "another way (sixDoFRigidBodyMotion).");
     }
 
     // motionSolver::coeffDict(): optionalSubDict(typeName + "Coeffs")
@@ -162,6 +162,12 @@ std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::New(
     if (solver == "displacementLaplacian")
     {
         mesh->displacement_ = DisplacementLaplacianFvMotionSolver::New(coeffs, caseDir, startDir);
+        mesh->motionType_ = solver;
+        return mesh;
+    }
+    if (solver == "rigidBodyMotion")
+    {
+        mesh->rigidBody_ = RigidBodyMeshMotion::New(caseDir, startDir);
         mesh->motionType_ = solver;
         return mesh;
     }
@@ -227,6 +233,11 @@ void DynamicMotionSolverFvMesh::attach(
     {
         displacement_->attach(m, g, patches);
     }
+    if (rigidBody_)
+    {
+        // rigidBodyMeshMotion.C:172-206: the blend is built ONCE, on points0
+        rigidBody_->attach(m, g, patches, points0_);
+    }
     oldPoints_ = m.points();
     meshPhi_.internal.assign(static_cast<std::size_t>(m.nInternalFaces()), scalar(0));
     meshPhi_.boundary.resize(patches.size());
@@ -241,7 +252,8 @@ void DynamicMotionSolverFvMesh::update(
     scalar deltaT,
     label timeIndex,
     bool finalIteration,
-    GamgAgglomerationCache* agglomeration)
+    GamgAgglomerationCache* agglomeration,
+    const BodyLoad* load)
 {
     if (!attached())
     {
@@ -254,7 +266,18 @@ void DynamicMotionSolverFvMesh::update(
     // stands. A displacement solver's GAMG hierarchy is the MESH's, shared with every other GAMG solve
     // of the run, so the caller hands in the one it keeps.
     std::vector<vector> newPoints;
-    if (displacement_)
+    if (rigidBody_)
+    {
+        if (!load)
+        {
+            throw std::runtime_error(
+                std::string(WHO) + "a rigidBodyMotion mesh was asked to move without the fluid load. "
+                "The driver must hand the body the pressure and the shear on its patches: a body "
+                "moved without them is a body with no weight on it.");
+        }
+        newPoints = rigidBody_->newPoints(time, deltaT, timeIndex, m, g, *patches_, *load);
+    }
+    else if (displacement_)
     {
         if (!agglomeration)
         {

@@ -425,6 +425,23 @@ RunReport runInterFoamDevice(
                     "Run without -device.");
             }
         }
+        // A BODY THE FLUID MOVES, refused by name. The motion is a host stage on either arm, but what
+        // it is handed is not: rigidBodyMeshMotion takes the pressure and the shear on the body's
+        // patches from InterFields' own boundary arrays, and this loop keeps the live fields on the
+        // device and refreshes those arrays at its own stages, not before the mesh update. A force
+        // built from a stale patch value would move the body by the wrong amount with nothing saying
+        // so -- and the body's own position is the case. Gated on the HOST arm only
+        // (interfoam_moving_vs_openfoam `floating`); refused here until the device loop hands the
+        // motion the fields it actually solved with, and that is gated too.
+        if (dyn->rigidBody())
+        {
+            throw std::runtime_error(
+                "brae interFoam -device: the case moves its mesh with a rigidBodyMotion -- a body the "
+                "FLUID drives. The force on it is taken from the pressure and the shear on its own "
+                "patches, and this loop holds those on the device: the host arrays the motion reads "
+                "are refreshed at this loop's own stages, not before the mesh update, so the body "
+                "would be moved by a stale load with nothing saying so. Run without -device.");
+        }
         if (!mutableMesh || !mutableMesh->m || !mutableMesh->g || !mutableMesh->patches)
         {
             throw std::runtime_error(

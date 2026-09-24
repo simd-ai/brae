@@ -111,6 +111,7 @@ add_library(brae_core STATIC
     src/OpenFOAM/meshes/primitiveMesh/edges/mesh_edges_cpp.cu
     src/dynamicMesh/pointPatchDist/point_patch_dist_cpp.cu
     src/rigidBodyDynamics/rigid_body_motion_cpp.cu
+    src/rigidBodyMeshMotion/rigid_body_mesh_motion_cpp.cu
     src/meshTools/twoDPointCorrector/two_d_point_corrector_cpp.cu
     src/finiteVolume/interpolation/volPointInterpolation/vol_point_interpolation_cpp.cu
     src/waveModels/derivedPointPatchFields/waveMaker/wave_maker_point_patch_vector_field_cpp.cu

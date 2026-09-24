@@ -56,22 +56,6 @@ Diff compare(const std::vector<vector>& a, const std::vector<vector>& b, scalar 
     return d;
 }
 
-// <time>/uniform/rigidBodyMotionState holds `q 2 ( a b );`
-std::vector<scalar> readJointState(const std::string& path, const char* key)
-{
-    TokenStream ts(path);
-    while (!ts.eof())
-    {
-        if (ts.next() != key) continue;
-        const label n = ts.nextLabel();
-        ts.expect("(");
-        std::vector<scalar> q(static_cast<std::size_t>(n));
-        for (scalar& x : q) x = ts.nextScalar();
-        ts.expect(")");
-        return q;
-    }
-    return {};
-}
 
 }   // namespace
 
@@ -125,7 +109,7 @@ int main(int argc, char** argv)
     const std::vector<scalar> weight =
         rigidBodyMeshMotionScale(pd.distance, spec.innerDistance, spec.outerDistance);
 
-    const std::vector<scalar> q = readJointState(ofDir + "/uniform/rigidBodyMotionState", "q");
+    const std::vector<scalar> q = RBD::readJointStateList(ofDir + "/uniform/rigidBodyMotionState", "q");
     check("OpenFOAM's state file gives a q of the chain's size",
           q.size() == static_cast<std::size_t>(spec.model.nDoF()));
     if (q.size() != static_cast<std::size_t>(spec.model.nDoF()))

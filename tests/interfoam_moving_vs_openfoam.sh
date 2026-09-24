@@ -90,6 +90,18 @@
 #   closedDamBreakInitU  the same tank STARTED MOVING, U (0.1 0 0) in every cell against walls at rest:
 #                  the phi createFields builds is not divergence-free, so initCorrectPhi's pcorr solve
 #                  has work to do (79 iterations in both codes); the control is the tank at rest
+#   floating       RAS/floatingObject: the first fixture here whose mesh is moved by the FLUID and not
+#                  by a prescribed function -- rigidBodyMeshMotion integrating a cuboid on a
+#                  `composite (Py Ry)` joint from the pressure and shear on its own patches, with
+#                  `nOuterCorrectors 3` and `moveMeshOuterCorrectors yes`, so the body is solved three
+#                  times per step from one frozen start state. Its SECOND oracle is the joint state
+#                  OpenFOAM writes every step, which the static control cannot produce at all.
+#                  STAGED, and each change measured: `ddt Euler` (the tutorial's CrankNicolson on a
+#                  DEFORMING mesh is refused on both arms and held separately), `accelerationRelaxation
+#                  0.7` (the shipped table is zero until t = 4, so the body would never leave rest),
+#                  and converged pressure solves. MEASURED: alpha 1.3e-14, p_rgh 7.9e-14, U 6.0e-14,
+#                  the body's q 8.3e-17 -- and the case AMPLIFIES, one ulp on every mesh point's y
+#                  reaching U 3.3e-09 and q 2.0e-08 against OpenFOAM itself in the same ten steps.
 #   mixerCorrectPhi, sloshing2DCorrectPhi, cylinderCorrectPhi
 #                  the three solid-body tanks with `correctPhi yes`: phi rebuilt as Sf & Uf after every
 #                  mesh update and CorrectPhi solved against it with the last corrector's rAU -- closed
@@ -462,6 +474,33 @@ elif profile.startswith('piston') or profile.startswith('flap'):
             # history to compare the two residual CURVES where a count alone cannot -- see countsAgree.
             body = body.replace('}', '    log             2;\n    }')
         t = t.replace(m.group(0), body)
+elif profile.startswith('floating'):
+    # CONVERGED PRESSURE SOLVES, in BOTH codes. The case ships `pcorr` at tolerance 1e-5 and `p_rgh`
+    # at relTol 0.01, and pcorr sets phi directly: at those settings the last iteration is where each
+    # code stops, not what it computes. MEASURED, at the case's own settings: brae tracks OpenFOAM's
+    # joint state to 2e-13 for six steps, then jumps four orders in ONE step -- at exactly the step
+    # where the two codes' pcorr took a different iteration count (OpenFOAM 4, brae 5) -- and ends at
+    # 8.8e-07. Converged to 1e-13 with relTol 0, the same comparison is 5.3e-13 at step one and
+    # 2.5e-12 at step ten, growing smoothly with no jump. The case AMPLIFIES: ONE ULP added to every
+    # mesh point's y, run against OpenFOAM itself, reaches U 3.3e-09 and q 2.0e-08 in these same ten
+    # steps, so a bound near round-off would be measuring the tank's own chaos.
+    # ...and pcorr to 1e-11 and NOT 1e-13. The FIRST pcorr of the run has an identically zero source
+    # -- the mesh has not moved yet -- so its initial residual is a cancellation: OpenFOAM enters at
+    # 8.0e-12 and brae below 1e-13. At a tolerance of 1e-13 that solve is BELOW it in one code and
+    # above it in the other, and OpenFOAM iterates three times where brae iterates none; at 1e-11 both
+    # enter converged and take none. MEASURED, end of run: at 1e-13 the body reads 2.5e-12 with 30 of
+    # 31 pcorr counts equal, at 1e-11 it reads 8.3e-17 with 31 of 31.
+    for old, new in [(r'tolerance\s+1e-0?5;', 'tolerance       1e-11;'),
+                     (r'tolerance\s+1e-8;', 'tolerance       1e-13;'),
+                     (r'relTol\s+0\.01;', 'relTol          0;'),
+                     (r'maxIter\s+(20|100);', 'maxIter         500;')]:
+        t, k = re.subn(old, new, t)
+        assert k >= 1, 'floating: nothing matched %s' % old
+    # `log 2;` makes OpenFOAM print its residual at EVERY iteration, so the gate can compare the two
+    # CURVES where a count alone cannot
+    m = re.search(r'\n    p_rgh\s*\{[^}]*\}', t)
+    assert m, 'no p_rgh entry to give `log 2`'
+    t = t.replace(m.group(0), m.group(0).replace('}', '    log             2;\n    }'))
 elif profile.startswith('closedDamBreak'):
     ref = '1e5' if profile == 'closedDamBreakRef' else '0'
     t, k = re.subn(r'(nNonOrthogonalCorrectors\s+0;)', r'\1\n    pRefPoint       (0.292 0.292 0.0073);\n    pRefValue       %s;' % ref, t)
@@ -477,8 +516,29 @@ if not profile.startswith('closedDamBreak'):
             'div(phirb,alpha) is no longer Gauss interfaceCompression'
     elif not profile.startswith('solitary'):
         assert re.search(r'div\(rhoPhi,U\)\s+Gauss vanLeerV;', t), 'div(rhoPhi,U) is no longer Gauss vanLeerV'
+    if profile.startswith('floating'):
+        # THE CASE'S OWN ddt IS `CrankNicolson 0.5`, and a DEFORMING mesh under CrankNicolson is
+        # refused on both arms -- localised, 1.06 off OpenFOAM, and held on its own (PORT.md). This
+        # profile is the body, not the ddt scheme, so BOTH codes run the same case under Euler.
+        assert re.search(r'default\s+CrankNicolson 0\.5;', t), \
+            'floatingObject no longer ships CrankNicolson 0.5'
+        t = re.sub(r'default\s+CrankNicolson 0\.5;', 'default         Euler;', t)
+        # ...and WRITTEN BACK. Everything else this block does to fvSchemes is an assertion, so the
+        # file was never reopened for writing and a substitution here would have been thrown away --
+        # which it was, and OpenFOAM ran the tutorial's own CrankNicolson while the gate said Euler.
+        open(f, 'w').write(t)
     p = os.path.join(d, 'constant/dynamicMeshDict')
     t = open(p).read()
+    if profile.startswith('floating'):
+        # `accelerationRelaxation` is a table that is ZERO until t = 4, and with aRelax 0 the
+        # relaxation returns the PREVIOUS acceleration -- which starts at zero -- so over ten steps of
+        # 5e-3 the body would not leave rest and the gate would be measuring a mesh that never moves.
+        # The table's own final value, 0.7, applied from t = 0.
+        assert re.search(r'accelerationRelaxation\s+table', t), \
+            'floatingObject no longer relaxes the acceleration by a table'
+        t, k = re.subn(r'accelerationRelaxation\s+table\s*\((?:[^()]|\([^()]*\))*\)\s*;',
+                       'accelerationRelaxation 0.7;', t, flags=re.S)
+        assert k == 1, 'accelerationRelaxation table not matched'
     if profile.endswith('Static'):
         t, k = re.subn(r'dynamicFvMesh\s+dynamicMotionSolverFvMesh;', 'dynamicFvMesh   staticFvMesh;', t)
         assert k == 1, 'dynamicFvMesh not found'
@@ -635,6 +695,16 @@ PYEOF
         cp -f "$TUT/resources/geometry/$tutorial.obj.gz" "$C/constant/triSurface/" || { echo "FAIL: no surface for $tutorial"; return 1; }
         ( cd "$C" && snappyHexMesh -overwrite > log.snappyHexMesh 2>&1 ) || { echo "FAIL: snappyHexMesh [$name]"; tail -20 "$C/log.snappyHexMesh"; return 1; }
     fi
+    # floatingObject's mesh is blockMesh MINUS the body: topoSet selects the cells outside it and
+    # `subsetMesh -patch floatingObject` turns the cut faces into the body's own patch. Without this
+    # the case has no floatingObject patch at all and nothing for the body's force to be read from.
+    case "$profile" in floating*)
+        ( cd "$C" && topoSet > log.topoSet 2>&1 ) || { echo "FAIL: topoSet [$name]"; tail -20 "$C/log.topoSet"; return 1; }
+        ( cd "$C" && subsetMesh -overwrite c0 -patch floatingObject > log.subsetMesh 2>&1 ) \
+            || { echo "FAIL: subsetMesh [$name]"; tail -20 "$C/log.subsetMesh"; return 1; }
+        grep -q "floatingObject" "$C/constant/polyMesh/boundary" || { echo "FAIL: subsetMesh made no floatingObject patch [$name]"; return 1; }
+        ;;
+    esac
     ( cd "$C" && setFields > log.setFields 2>&1 ) || { echo "FAIL: setFields [$name]"; tail -20 "$C/log.setFields"; return 1; }
     ( cd "$C" && interFoam > log.interFoam 2>&1 ) || { echo "FAIL: interFoam [$name]"; tail -30 "$C/log.interFoam"; return 1; }
     [ -d "$C/$end" ] || { echo "FAIL: OpenFOAM wrote no $end directory [$name]"; ls "$C"; return 1; }
@@ -775,6 +845,8 @@ stage multiPistonStatic waves/waveMakerMultiPaddlePiston 0.01 30 multiPistonStat
 stage multiPiston       waves/waveMakerMultiPaddlePiston 0.01 30 multiPiston       || rc=1
 stage multiFlapStatic   waves/waveMakerMultiPaddleFlap   0.01 30 multiFlapStatic   || rc=1
 stage multiFlap         waves/waveMakerMultiPaddleFlap   0.01 30 multiFlap         || rc=1
+stage floatingStatic ../RAS/floatingObject 5e-3 10 floatingStatic || rc=1
+stage floating       ../RAS/floatingObject 5e-3 10 floating       || rc=1
 stage closedRef1e5   damBreak/damBreak 0.001 20 closedDamBreakRef || rc=1
 stage closedDamBreak damBreak/damBreak 0.001 20 closedDamBreak    || rc=1
 stage closedDamBreakInitU damBreak/damBreak 0.001 20 closedDamBreakInitU || rc=1
@@ -787,6 +859,21 @@ grep -q "Selecting dynamicFvMesh staticFvMesh" "$W/mixerStatic/log.interFoam" \
     || { echo "FAIL: OpenFOAM's control did not hold the mesh still"; exit 1; }
 grep -q "^Courant Number mean: 0.0[1-9]" "$W/mixer/log.interFoam" \
     || { echo "FAIL: OpenFOAM's mixer never moved its fluid"; exit 1; }
+grep -q "Selecting motion solver: rigidBodyMotion" "$W/floating/log.interFoam" \
+    || { echo "FAIL: OpenFOAM's floatingObject did not select rigidBodyMotion"; exit 1; }
+grep -q "Selecting dynamicFvMesh staticFvMesh" "$W/floatingStatic/log.interFoam" \
+    || { echo "FAIL: OpenFOAM's floating control did not hold the mesh still"; exit 1; }
+grep -q "default         Euler;" "$W/floating/system/fvSchemes" \
+    || { echo "FAIL: the floating staging did not put the case on Euler"; exit 1; }
+# ...AND THE BODY MOVED. `accelerationRelaxation` is zero until t = 4, so a staging that failed to
+# replace the table leaves a body that never leaves rest -- and every field of that run is the static
+# control's, so the gate would pass while measuring nothing. MEASURED, when the fvSchemes staging was
+# silently discarded and the mesh was built without `subsetMesh`: thirty reports of
+# `Linear velocity: (0 0 0)` and a written `q 2 { 0 }`.
+grep -q "{ 0 }" "$W/floating/0.05/uniform/rigidBodyMotionState" \
+    && { echo "FAIL: OpenFOAM's body never moved -- the gate would be vacuous"; exit 1; }
+grep -q "floatingObject" "$W/floating/constant/polyMesh/boundary" \
+    || { echo "FAIL: the staged mesh has no floatingObject patch for the force to act on"; exit 1; }
 
 for c in multiPiston multiFlap; do
     grep -q "^GAMG:  Solving for p_rgh" "$W/$c/log.interFoam" \
@@ -821,6 +908,10 @@ gate pistonLES      0.01  30 pistonLES      piston         || rc=1
 gate flap           0.01  30 flap           flapStatic     || rc=1
 gate multiPiston    0.01  30 multiPiston    multiPistonStatic || rc=1
 gate multiFlap      0.01  30 multiFlap      multiFlapStatic   || rc=1
+# RAS/floatingObject: a BODY the fluid moves, not a prescribed motion -- rigidBodyMeshMotion driving
+# the mesh from the load on its own patches, with the joint state as the second oracle. Control: the
+# same tank with the mesh held still.
+gate floating       5e-3  10 floating       floatingStatic || rc=1
 gate closedDamBreak 0.001 20 closedDamBreak closedRef1e5 || rc=1
 gate closedDamBreakInitU 0.001 20 closedDamBreakInitU closedDamBreak || rc=1
 

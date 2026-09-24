@@ -149,7 +149,43 @@ void interMeshUpdate(
         f.meshPhiPrev = dyn->meshPhi();
         f.meshPhiPrevIndex = timeIndex;
     }
-    dyn->update(time, rep.deltaT, timeIndex, finalIteration, &gamgCache);
+    // THE FLUID LOAD ON THE BODY, for a rigidBodyMotion mesh alone. OpenFOAM builds a `forces`
+    // function object inside rigidBodyMeshMotion::solve (rigidBodyMeshMotion.C:299-307) and it looks
+    // the fields up in the registry, which is to say it takes them AS THEY STAND at the moment the
+    // mesh is moved -- the previous outer corrector's, or the previous step's on the first. They are
+    // gathered here, where the solver has them, rather than given to the mesh to own.
+    //
+    // `p` is the TOTAL pressure, p_rgh + rho*gh, and its boundary is p_rgh's plus the live mixture
+    // density times gh at the boundary FACE CENTRES (`p == p_rgh + rho*gh` in pEqn.H forces the patch
+    // values; `mesh.C()`'s boundary field is Cf). p_rgh's own boundary would leave out exactly the
+    // buoyancy the body floats on.
+    std::vector<std::vector<scalar>> bodyP, bodyNuEff;
+    std::vector<scalar> bodyNuEffCells;
+    BodyLoad load;
+    const bool needLoad = (dyn->rigidBody() != nullptr);
+    if (needLoad)
+    {
+        bodyP.resize(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const std::vector<scalar>& prghB = f.p_rgh.boundary[pi]->value();
+            const std::vector<scalar>& rb = f.rhoBnd[pi];
+            const std::vector<scalar>& gb = f.ghfBoundary[pi];
+            bodyP[pi].assign(prghB.size(), scalar(0));
+            for (std::size_t k = 0; k < prghB.size() && k < rb.size() && k < gb.size(); ++k)
+            {
+                bodyP[pi][k] = prghB[k] + rb[k]*gb[k];
+            }
+        }
+        // eddyViscosity::nuEff = nut + nu, which is what forces::devRhoReff takes the shear from
+        interNuEff(f.turbulence, f.nu, f.nuBnd, bodyNuEffCells, bodyNuEff);
+        load.U = &f.U;
+        load.p = &bodyP;
+        load.rho = &f.rhoBnd;
+        load.nuEff = &bodyNuEff;
+    }
+    dyn->update(time, rep.deltaT, timeIndex, finalIteration, &gamgCache,
+                needLoad ? &load : nullptr);
     // cyclicACMIFvPatch::movePoints, HERE and not later: fvMesh::movePoints runs the boundary's own
     // movePoints as part of the move, so it lands before fvc::meshPhi is read -- and under
     // CrankNicolson the off-centred mesh flux is built from it, so a scaling applied after that blend

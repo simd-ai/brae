@@ -284,6 +284,50 @@ int main(
         check("both arms moved the mesh the same way",
               wv <= scalar(1e-13)*std::fmax(sv, scalar(1e-300)));
     }
+    // THE DEVICE ARM'S REFUSAL, gated rather than trusted. The motion is a host stage on either arm,
+    // but the LOAD it is handed is not: this loop keeps the live fields on the device and refreshes
+    // InterFields' boundary arrays at its own stages, not before the mesh update, so a body moved
+    // from them would be moved by a stale force with nothing saying so. A refusal nobody runs is a
+    // refusal that stops firing, which is how a port surfaces silently.
+    if (profile.rfind("floating", 0) == 0)
+    {
+        int nDev = 0;
+        if (cudaGetDeviceCount(&nDev) != cudaSuccess) { cudaGetLastError(); nDev = 0; }
+        if (nDev <= 0)
+        {
+            std::printf("  (no CUDA device, so the device arm's refusal is not exercised here)\n");
+        }
+        else
+        {
+            PrimitiveMesh mR;
+            mR.read(caseDir + "/constant/polyMesh");
+            FvGeometry gR;
+            gR.build(mR);
+            std::vector<FvPatch> patchesR = buildPatches(mR, gR);
+            MutableMesh mutableR;
+            mutableR.m = &mR;
+            mutableR.g = &gR;
+            mutableR.patches = &patchesR;
+            std::string msg;
+            bool threw = false;
+            try
+            {
+                InterFields finR;
+                runInterFoamDevice(caseDir, startDir, mR, gR, patchesR, 1, /*verbose=*/false, &finR,
+                                   scalar(1.0e300), nullptr, &mutableR);
+            }
+            catch (const std::exception& e)
+            {
+                threw = true;
+                msg = e.what();
+            }
+            std::printf("  the device arm: %s\n",
+                        threw ? msg.substr(0, 110).c_str() : "IT RAN");
+            check("the device arm refuses a body the fluid drives", threw);
+            check("...and names rigidBodyMotion in saying so",
+                  msg.find("rigidBodyMotion") != std::string::npos);
+        }
+    }
     // `closed*`: a closed tank whose mesh does NOT move -- the pressure reference alone
     const bool moving = profile.rfind("closed", 0) != 0;
     check("brae ran the same number of steps", r.steps == nSteps);
@@ -295,7 +339,7 @@ int main(
     // way would add a reference OpenFOAM does not apply.
     const bool open = profile.rfind("solitary", 0) == 0 || profile.rfind("piston", 0) == 0
                    || profile.rfind("flap", 0) == 0 || profile.rfind("multi", 0) == 0
-                   || profile == "mixerPermeable";
+                   || profile == "mixerPermeable" || profile.rfind("floating", 0) == 0;
     if (open)
     {
         check("p_rgh is fixed at a patch, and brae read it so", !fin.pRef.needReference);
@@ -327,6 +371,43 @@ int main(
                     (double)(dPoint/std::fmax(lengthScale, scalar(1e-300))), ofPoints.size());
         check("OpenFOAM wrote the moved mesh", ofPoints.size() == m.points().size() && !ofPoints.empty());
         check("brae's mesh ended where OpenFOAM's did", dPoint <= scalar(1e-15)*lengthScale);
+    }
+
+    // THE BODY, which the mesh alone cannot fully witness: the blend spreads the joint state over
+    // thirteen thousand points, so a q that is wrong in the last digits reads as round-off there. Its
+    // own state is written every step, so it is compared directly -- and it is the ONLY field here
+    // that the static control cannot produce at all.
+    if (profile.rfind("floating", 0) == 0)
+    {
+        check("brae read the case as a rigid-body motion",
+              fin.dynamicMesh && fin.dynamicMesh->rigidBody() != nullptr);
+        if (fin.dynamicMesh && fin.dynamicMesh->rigidBody())
+        {
+            const RBD::ModelState& st = fin.dynamicMesh->rigidBody()->state();
+            const std::string sp = ofDir + "/uniform/rigidBodyMotionState";
+            const std::vector<scalar> ofQ = RBD::readJointStateList(sp, "q");
+            const std::vector<scalar> ofV = RBD::readJointStateList(sp, "qDot");
+            const std::vector<scalar> ofA = RBD::readJointStateList(sp, "qDdot");
+            check("OpenFOAM wrote the joint state", ofQ.size() == st.q.size() && !ofQ.empty());
+            scalar wq = 0, wv = 0, wa = 0, rq = 0, rv = 0, ra = 0;
+            for (std::size_t i = 0; i < st.q.size() && i < ofQ.size(); ++i)
+            {
+                wq = std::fmax(wq, std::fabs(st.q[i] - ofQ[i]));
+                rq = std::fmax(rq, std::fabs(ofQ[i]));
+                wv = std::fmax(wv, std::fabs(st.qDot[i] - ofV[i]));
+                rv = std::fmax(rv, std::fabs(ofV[i]));
+                wa = std::fmax(wa, std::fabs(st.qDdot[i] - ofA[i]));
+                ra = std::fmax(ra, std::fabs(ofA[i]));
+            }
+            std::printf("  the body: q %.4e of %.4e, qDot %.4e of %.4e, qDdot %.4e of %.4e\n",
+                        (double)wq, (double)rq, (double)wv, (double)rv, (double)wa, (double)ra);
+            check("the body has moved, so the comparison is not one of zeros", rq > scalar(1e-9));
+            check("brae's joint position is OpenFOAM's",
+                  wq <= scalar(1e-10)*std::fmax(rq, scalar(1e-300)));
+            check("...its joint velocity", wv <= scalar(1e-10)*std::fmax(rv, scalar(1e-300)));
+            check("...and its joint acceleration",
+                  wa <= scalar(1e-10)*std::fmax(ra, scalar(1e-300)));
+        }
     }
 
     // THE SOLVES: every p_rgh line, iteration counts and residuals
@@ -633,6 +714,23 @@ int main(
         {
             check("this profile put the permeable pair where the moving wall was, so there is none",
                   nWall == 0 && !fin.movingWallVelocityPatch[0]);
+        }
+        else if (profile.rfind("floating", 0) == 0)
+        {
+            // THE ONLY FIXTURE HERE WHOSE WALL CREEPS WHILE ITS FLUID MOVES. movingWallVelocity's
+            // value is the internal field with its normal component replaced by the mesh flux
+            // (movingWallVelocityFvPatchVectorField.C), so its ABSOLUTE error is the internal field's
+            // -- and on this case the body drifts at 4.1e-03 m/s while the water reaches 1.16 m/s,
+            // 280 times more. Scaling the bound by the wall's own velocity would be holding the
+            // internal field to 3.6e-15, which is under its round-off. MEASURED: the wall is 9.0e-14
+            // where U itself is 6.0e-14 of 1.16 -- the same absolute distance, as the expression says
+            // it must be. Every other profile's wall moves with its fluid and keeps the bound above.
+            scalar uScale = 0;
+            for (const vector& u : fin.U.internal) uScale = std::fmax(uScale, mag(u));
+            std::printf("    (the wall creeps at %.3e while the fluid reaches %.3e, so the wall value "
+                        "is held to the field's scale)\n", (double)wallScale, (double)uScale);
+            check("the moving walls carry OpenFOAM's velocity",
+                  nWall > 0 && dWall <= scalar(1e-12)*uScale);
         }
         else
         {

@@ -390,6 +390,35 @@ void relaxAcceleration(
 }
 
 
+std::vector<scalar> readJointStateList(const std::string& path, const char* key)
+{
+    TokenStream ts(path);
+    while (!ts.eof())
+    {
+        if (ts.next() != key) continue;
+        const label n = ts.nextLabel();
+        ts.expect("(");
+        std::vector<scalar> v(static_cast<std::size_t>(n));
+        for (scalar& x : v) x = ts.nextScalar();
+        ts.expect(")");
+        return v;
+    }
+    return {};
+}
+
+
+scalar readJointStateScalar(const std::string& path, const char* key, scalar fallback)
+{
+    TokenStream ts(path);
+    while (!ts.eof())
+    {
+        if (ts.next() != key) continue;
+        return ts.nextScalar();
+    }
+    return fallback;
+}
+
+
 MotionSpec readMotionSpec(const std::string& dictPath)
 {
     // A DEDICATED READER, and not FoamDict, for one reason: the joint chain is a LIST OF
