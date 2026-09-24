@@ -83,6 +83,29 @@
 # NOT MEASURABLE, because brae refuses it outright: the pair left uncoupled, which every other cyclic
 # gate calls its control -- the host driver throws and names the patch rather than running it as two
 # walls.
+#
+# PROFILE sstLsq: a LEAST-SQUARES gradient for grad(k) and grad(omega) ACROSS THE PAIR, both arms.
+# leastSquaresVectors.C:131-140 folds a COUPLED face into the dd tensor with the OWNER WEIGHT and the
+# patch's own delta() -- the cell-to-cell vector, where an uncoupled face takes the patch-normal
+# projection -- and leastSquaresGrad.C:108-119 fits it against the NEIGHBOUR CELL's value. Both loops
+# refused the combination outright until this unit: the host in leastSquaresInvDd ("leastSquaresVectors.C
+# weights a coupled face by the cell on the other side"), the device at two sites, because
+# deviceLeastSquaresGrad carried no interface. It reaches the closure where the cellLimited profile's
+# gradient does -- CDkOmega, and the corrected laplacian's non-orthogonal correction.
+# THE TRAP: deviceCyclicAddGrad is the GAUSS face term, Sf*value/V. The fit carries its own coupled
+# term inside the kernel, so on the least-squares branch that call is a second, differently normalised
+# copy of the same face; it is gated to the Gauss branch at all three call sites.
+# MEASURED, 10 steps: host alpha 2.5169e-13, p_rgh 5.3333e-14, U 4.0271e-13, k 4.8462e-13,
+# nut 2.3931e-12, omega 8.8188e-14, all 30 p_rgh counts OpenFOAM's; device alpha 7.1961e-12,
+# p_rgh 4.3689e-11, U 7.4830e-11, k 2.4271e-11, nut 5.0209e-10, omega 7.0367e-12.
+# THE CONTROL is sstLsqWalls -- the pair replaced by two walls -- which moves OpenFOAM's own alpha
+# 2.1132e-01 and its U 9.9993e-01.
+# BROKEN ONCE on the device, the pair's faces dropped from both least-squares kernels (the state this
+# unit found): U 1.7464e-08, k 9.3003e-09, nut 6.6245e-07, omega 2.0564e-07 -- five arms red, with the
+# HOST arm unmoved, which is what says the defect is the device's own.
+# STILL REFUSED: a vector least-squares gradient across a pair (grad(U), at its own site), and a
+# ROTATIONAL pair, refused upstream in attachCyclicCoupling -- the neighbour value would have to be
+# transformed into this side's frame before the fit reads it.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_cyclic_vs_openfoam"
