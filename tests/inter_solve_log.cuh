@@ -113,6 +113,22 @@ inline int compareSolves(
     std::size_t nSame = 0;
     std::size_t nEdge = 0;
     scalar wInit = 0, wInitFirst = 0;
+    // A SOLVE THAT ARRIVES ALREADY CONVERGED. Its initial residual is a cancellation, not a
+    // measurement: the same sum in two orders differs in its last bits, and the relative difference of
+    // a number that small is large. This is the initial-residual twin of the final-residual rule
+    // below, and it is recognised the same way -- a residual more than ten orders under the largest
+    // this field's solves report cannot be anything else.
+    // MEASURED on validation/interFoamCyclic `gamg`: OpenFOAM's third p_rgh solve of step one enters
+    // at 7.2657897714740034e-12 against its own `tolerance 1e-12`, takes ONE iteration and stops.
+    // brae takes the same one iteration and lands 8.6e-05 away in relative terms -- 6e-16 absolute.
+    // Every other solve of that run is 0.0e+00 or ~1e-12.
+    // WHAT STILL HOLDS: the ITERATION COUNT of such a solve (30 of 30 there), and every solve that
+    // actually had something to converge -- the bound below applies to all of them unchanged.
+    scalar maxInit = 0;
+    for (std::size_t k = 0; k < of.size(); ++k) maxInit = std::fmax(maxInit, of[k].initialResidual);
+    const scalar convergedOnEntry = scalar(1e-10)*maxInit;
+    std::size_t nOnEntry = 0;
+    scalar wOnEntry = 0;
     const std::size_t perStep = nSteps > 0 ? of.size()/static_cast<std::size_t>(nSteps) : 0;
     for (std::size_t k = 0; k < mine.size() && k < of.size(); ++k)
     {
@@ -135,6 +151,12 @@ inline int compareSolves(
             }
         }
         const scalar e = residualRelDiff(mine[k].initialResidual, of[k].initialResidual);
+        if (maxInit > 0 && of[k].initialResidual < convergedOnEntry)
+        {
+            ++nOnEntry;
+            wOnEntry = std::fmax(wOnEntry, e);
+            continue;
+        }
         wInit = std::fmax(wInit, e);
         if (k < perStep)
         {
@@ -145,6 +167,14 @@ inline int compareSolves(
                 "residual worst %.3e in step one, %.3e over the run\n",
                 who, field, nSame, of.size(), nEdge ? " (one of them an edge stop)" : "",
                 (double)wInitFirst, (double)wInit);
+    if (nOnEntry)
+    {
+        std::printf("    (%zu solve(s) arrived already converged -- initial residual under %.1e, ten "
+                    "orders below this field's largest; their initial residuals differ by up to %.3e, "
+                    "which is round-off on a cancellation and is not held to the bound. Their "
+                    "ITERATION COUNTS are held like every other solve's.)\n",
+                    nOnEntry, (double)convergedOnEntry, (double)wOnEntry);
+    }
     std::printf("    iterations (OpenFOAM/%s):", who);
     for (std::size_t k = 0; k < mine.size() && k < of.size(); ++k)
     {

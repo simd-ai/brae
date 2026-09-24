@@ -1,6 +1,7 @@
 #include "gamg_solver_cpp.cuh"
 #include "foam_dict.cuh"
 #include "smooth_solver_cpp.cuh"
+#include <map>
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -22,7 +23,39 @@ struct LduLevel
     const GamgLduAddressing* addr = nullptr;
     std::vector<scalar> diag;
     std::vector<scalar> upper;
+    // THE COUPLED PAIR at this level, empty where there is none. One entry per interface face, as
+    // cyclicGAMGInterface holds it: the cell on this side, the cell on the other, and the coefficient
+    // lduMatrix::updateMatrixInterfaces multiplies the neighbour's psi by. Both sides of a pair are in
+    // this one list, each face once from its own side -- which is what OpenFOAM's two patch objects
+    // hold between them.
+    std::vector<label>  ifOwn;
+    std::vector<label>  ifNbr;
+    std::vector<scalar> ifCoeff;
+    std::size_t nIf() const { return ifCoeff.size(); }
 };
+
+// WHAT A COUPLED PATCH WOULD TAKE HERE, established from OpenFOAM's source against a staged oracle
+// (validation/interFoamCyclic with `p_rgh { solver GAMG; smoother DIC; }`, which OpenFOAM runs and
+// brae refuses in pcg.cuh's refuseCoupledPatches). The hierarchy below has no interface at any level,
+// so the note is what the port needs, not a description of what is here:
+//
+//   1. THE COARSE INTERFACE, per level (cyclicGAMGInterface.C, the constructor). For each fine
+//      interface face ffi take the pair (localRestrict[ffi], neighbourRestrict[ffi]) -- swapped on the
+//      slave side so both sides agree -- and look it up in a coarse-cell-pair map: an existing entry
+//      gives the coarse face, a new one appends a coarse face whose faceCell is localRestrict[ffi].
+//      That yields the level's faceCells and its fine->coarse faceRestrictAddressing.
+//   2. THE COEFFICIENTS, summed onto the coarse face through that addressing
+//      (GAMGInterface::agglomerateCoeffs).
+//   3. amul and residual below: Apsi[ifOwn[f]] -= ifCoeff[f]*psi[ifNbr[f]], the form
+//      lduMatrix::updateMatrixInterfaces applies and that pcg.cuh already carries for level 0.
+//   4. THE SMOOTHER. The DIC branch reaches the interface through residual() and needs nothing more;
+//      the Gauss-Seidel branch does NOT -- OpenFOAM folds the interface contribution into bPrime once
+//      before the sweeps (GaussSeidelSmoother::smooth), which is the shape the level-0 smoothSolver
+//      here already uses. DIC's own factorisation ignores interfaces in OpenFOAM too, so
+//      dicReciprocalD and dicSubstitute stay as they are.
+//
+// Every loop it adds runs zero times when the level carries no interface, so the hierarchies gated
+// today keep their arithmetic exactly.
 
 // lduMatrix::Amul, symmetric and with no interfaces
 void amul(
@@ -43,6 +76,13 @@ void amul(
         const std::size_t lf = static_cast<std::size_t>(l[face]);
         Apsi[uf] += A.upper[face]*psi[lf];
         Apsi[lf] += A.upper[face]*psi[uf];
+    }
+    // ...and the interface, which lduMatrix::Amul applies through updateMatrixInterfaces:
+    // Apsi[faceCell] -= coeff*psi[neighbour]. Zero iterations where the level has no pair, so every
+    // hierarchy without one keeps the arithmetic above exactly.
+    for (std::size_t f = 0; f < A.nIf(); ++f)
+    {
+        Apsi[static_cast<std::size_t>(A.ifOwn[f])] -= A.ifCoeff[f]*psi[static_cast<std::size_t>(A.ifNbr[f])];
     }
 }
 
@@ -67,6 +107,11 @@ void residual(
         rA[uf] -= A.upper[face]*psi[lf];
         rA[lf] -= A.upper[face]*psi[uf];
     }
+    // the residual is source - A*psi, so the interface enters with the sign Amul's term does not
+    for (std::size_t f = 0; f < A.nIf(); ++f)
+    {
+        rA[static_cast<std::size_t>(A.ifOwn[f])] += A.ifCoeff[f]*psi[static_cast<std::size_t>(A.ifNbr[f])];
+    }
 }
 
 // lduMatrix::solver::normFactor, L1 scaled
@@ -88,6 +133,14 @@ scalar normFactor(
     {
         tmpField[static_cast<std::size_t>(u[face])] += A.upper[face];
         tmpField[static_cast<std::size_t>(l[face])] += A.upper[face];
+    }
+    // ...and the interface, which lduMatrix::sumA takes with the SIGN Amul applies it with: the row
+    // sum that normFactor scales by is the row of the matrix the solver actually multiplies, and a
+    // coupled row has one more coefficient in it. Leaving it out scales every residual this level
+    // reports by a slightly different number from OpenFOAM's, which is what the solver stops on.
+    for (std::size_t f = 0; f < A.nIf(); ++f)
+    {
+        tmpField[static_cast<std::size_t>(A.ifOwn[f])] -= A.ifCoeff[f];
     }
     scalar average = 0;
     for (std::size_t cell = 0; cell < nCells; ++cell)
@@ -230,6 +283,24 @@ struct Smoother
         }
         if (gaussSeidel || symGaussSeidel)
         {
+            // THE INTERFACE ENTERS THROUGH bPrime, once per smooth() and not once per sweep:
+            // GaussSeidelSmoother::smooth copies the source, has the interfaces add their
+            // coeff*psi[neighbour] into it with psi AS IT STANDS AT ENTRY, and sweeps against that.
+            // The lag is OpenFOAM's -- a sweep does not see the other side move until the next call.
+            // The DIC branch above needs nothing: it reaches the interface through residual().
+            if (A->nIf() > 0)
+            {
+                std::vector<scalar> bPrime(source);
+                for (std::size_t f = 0; f < A->nIf(); ++f)
+                {
+                    bPrime[static_cast<std::size_t>(A->ifOwn[f])] +=
+                        A->ifCoeff[f]*psi[static_cast<std::size_t>(A->ifNbr[f])];
+                }
+                gaussSeidelSmoothFolded(
+                    ownStart, A->addr->upperAddr, A->diag, A->upper, A->upper,
+                    bPrime, psi, nSweeps, symGaussSeidel);
+                return;
+            }
             gaussSeidelSmoothFolded(
                 ownStart,
                 A->addr->upperAddr,
@@ -359,6 +430,45 @@ void prolongField(
     }
 }
 
+// THE FINEST LEVEL'S INTERFACE, from the matrix the solver was handed. boundaryCoeffs on a coupled
+// patch ARE the interface coefficients (see pcg.cuh's note): Amul ends with
+// result[faceCell] -= coeff*pnf, and pnf on a plain cyclic is the neighbour CELL's value. What is
+// refused here is what that one line cannot express -- an AMI, whose neighbour is a weighted sum of
+// several cells, and a jump, which subtracts a per-face constant from the neighbour before the
+// coefficient multiplies it.
+LduLevel gamgLevel0Interface(
+    const FvScalarMatrix& M,
+    const std::vector<FvPatch>& patches)
+{
+    LduLevel iface;
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& fp = patches[pi];
+        if (!fp.coupled) continue;
+        if (!fp.amiOffsets.empty())
+        {
+            throw std::runtime_error(
+                "brae GAMG: the coupled patch '" + fp.name + "' is an AMI. Its neighbour value is a "
+                "weighted sum of several cells, which a coarse interface face of one neighbour cell "
+                "cannot carry (cyclicGAMGInterface keys on a coarse CELL PAIR). A plain cyclic runs.");
+        }
+        if (fp.nbrFaceCells.size() != static_cast<std::size_t>(fp.size))
+        {
+            throw std::runtime_error(
+                "brae GAMG: the coupled patch '" + fp.name + "' was not coupled face for face; its "
+                "neighbour cells are missing, so no interface can be built for the hierarchy.");
+        }
+        for (label i = 0; i < fp.size; ++i)
+        {
+            const std::size_t k = static_cast<std::size_t>(i);
+            iface.ifOwn.push_back(fp.faceCells[k]);
+            iface.ifNbr.push_back(fp.nbrFaceCells[k]);
+            iface.ifCoeff.push_back(M.boundaryCoeffs[pi][k]);
+        }
+    }
+    return iface;
+}
+
 // GAMGSolver::agglomerateMatrix, symmetric branch
 LduLevel agglomerateMatrix(
     const LduLevel& fineMatrix,
@@ -383,6 +493,32 @@ LduLevel agglomerateMatrix(
         {
             // Add the fine face coefficient into the diagonal.
             coarse.diag[static_cast<std::size_t>(-1 - cFace)] += 2*fineMatrix.upper[fineFacei];
+        }
+    }
+    // THE COARSE INTERFACE (cyclicGAMGInterface.C, the constructor). Each fine interface face is keyed
+    // on the COARSE CELL PAIR it now joins; a pair already seen reuses that coarse face, a new one
+    // appends a face whose cells are the two coarse cells. The coefficients sum onto it
+    // (GAMGInterface::agglomerateCoeffs). Two fine faces whose owner cells merged AND whose
+    // neighbour cells merged become one coarse face -- which is the whole point: without it a coarse
+    // level would carry as many interface faces as the finest, against a much smaller cell count.
+    if (fineMatrix.nIf() > 0)
+    {
+        const std::vector<label>& restrict = agglomeration.restrictAddressing[li];
+        std::map<std::pair<label, label>, label> seen;
+        for (std::size_t f = 0; f < fineMatrix.nIf(); ++f)
+        {
+            const label co = restrict[static_cast<std::size_t>(fineMatrix.ifOwn[f])];
+            const label cn = restrict[static_cast<std::size_t>(fineMatrix.ifNbr[f])];
+            const std::pair<label, label> key(co, cn);
+            auto it = seen.find(key);
+            if (it == seen.end())
+            {
+                it = seen.emplace(key, static_cast<label>(coarse.ifCoeff.size())).first;
+                coarse.ifOwn.push_back(co);
+                coarse.ifNbr.push_back(cn);
+                coarse.ifCoeff.push_back(scalar(0));
+            }
+            coarse.ifCoeff[static_cast<std::size_t>(it->second)] += fineMatrix.ifCoeff[f];
         }
     }
     return coarse;
@@ -440,12 +576,21 @@ struct GamgHierarchy
         const GamgAgglomeration& a,
         const std::vector<scalar>& fineDiag,
         const std::vector<scalar>& fineUpper,
-        const std::string& smoother)
+        const std::string& smoother,
+        // the finest level's coupled pair, or null: gamgLevel0Interface builds it from the matrix's
+        // boundaryCoeffs on the coupled patches. Every coarse level's is agglomerated from it.
+        const LduLevel* fineInterface = nullptr)
     {
         agglomeration = &a;
         fine.addr = &a.fineMesh;
         fine.diag = fineDiag;
         fine.upper = fineUpper;
+        if (fineInterface)
+        {
+            fine.ifOwn = fineInterface->ifOwn;
+            fine.ifNbr = fineInterface->ifNbr;
+            fine.ifCoeff = fineInterface->ifCoeff;
+        }
         const label nLevels = a.size();
         matrixLevels.clear();
         matrixLevels.reserve(static_cast<std::size_t>(nLevels));
@@ -624,8 +769,19 @@ void foldBoundary(
         for (label i = 0; i < patches[pi].size; ++i)
         {
             const std::size_t c = static_cast<std::size_t>(patches[pi].faceCells[i]);
+            // addBoundaryDiag takes every patch's internalCoeffs, coupled or not...
             diag[c] += M.internalCoeffs[pi][static_cast<std::size_t>(i)];
-            source[c] += M.boundaryCoeffs[pi][static_cast<std::size_t>(i)];
+            // ...but addBoundarySource takes boundaryCoeffs only where the patch is NOT coupled
+            // (fvMatrix.C, `if (!ptf.coupled())`; the `couples` branch is off in solveSegregated).
+            // On a coupled patch those coefficients are the INTERFACE's -- they multiply the other
+            // cell's psi, and the solver applies them. Adding them to the source as well put a
+            // constant where an interface belongs: unreachable while GAMG refused a coupled matrix,
+            // live the moment it stopped. MEASURED on validation/interFoamCyclic with GAMG on p_rgh:
+            // alpha ran to 1.96 and worst |div(phi)| to 4.8e+01.
+            if (!patches[pi].coupled)
+            {
+                source[c] += M.boundaryCoeffs[pi][static_cast<std::size_t>(i)];
+            }
         }
     }
 }
@@ -739,15 +895,16 @@ SolverPerformance gamgSolve(
     const GamgControls& controls,
     GamgSolveLog* log)
 {
-    refuseCoupledPatches(patches, "GAMG");
     checkGamgInputs(M, m, agglomeration, controls);
     std::vector<scalar> diag;
     std::vector<scalar> source;
     foldBoundary(M, patches, diag, source);
+    // ...and the pair, which foldBoundary cannot fold: its coefficient multiplies the OTHER cell's psi
+    const LduLevel iface = gamgLevel0Interface(M, patches);
 
     // the constructor: one coarse matrix per agglomeration level, each from the one above
     GamgHierarchy h;
-    h.build(agglomeration, diag, M.upper, controls.smoother);
+    h.build(agglomeration, diag, M.upper, controls.smoother, &iface);
     const LduLevel& fine = h.fine;
 
     const std::size_t nCells = psi.size();

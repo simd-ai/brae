@@ -178,6 +178,12 @@ int main(
     // worth nut 7.1e-04 after ten steps. What holds the device here is the ASSEMBLED SYSTEM from a
     // spun-up field (the `assembly` arm of tests/interfoam_cyclic_vs_openfoam.sh): the pair's own
     // off-diagonal 1.7e-10 against the host's, with the device's upwind run as the control.
+    // `gamg` is HOST ONLY, and its device arm is asserted to REFUSE rather than skipped: the device
+    // hierarchy carries no interface at any level, and a GAMG without the interface coefficients
+    // solves the two sides of a pair as unconnected walls AND CONVERGES -- it ran and read alpha
+    // 2.9722e-03 from OpenFOAM against the host's 2.6402e-13 on the same case. The refusal is at
+    // deviceGamgSolve's entry, and this arm is what says it is still there.
+    const bool gamgProfile = (profile == "gamg");
     const bool hostOnlyProfile = (profile == "sstLimDiv");
     const bool lesProfile = (profile == "les" || profile == "lesCN");
     const bool turbProfile = sstProfile || lesProfile;
@@ -376,7 +382,25 @@ int main(
     // (:253-262), with the pair's rhoPhi taken beside the raw phi as the branch requires. The host
     // arm gets both for free: it walks phi.boundary and alphaPhi10.boundary whole, coupled patch
     // included, and the device keeps those faces in a third array.
-    if (nDev > 0 && hostOnlyProfile)
+    if (nDev > 0 && gamgProfile)
+    {
+        bool threw = false;
+        std::string why;
+        try
+        {
+            InterFields unused;
+            runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &unused);
+        }
+        catch (const std::exception& e)
+        {
+            threw = true;
+            why = e.what();
+        }
+        std::printf("  DEVICE: %s\n", threw ? why.substr(0, 150).c_str() : "RAN -- it must not");
+        check("the DEVICE refuses GAMG across the pair rather than solving it as two walls",
+              threw && why.find("coupled interface") != std::string::npos);
+    }
+    else if (nDev > 0 && hostOnlyProfile)
     {
         std::printf("  (this profile is HOST ONLY -- see the note at hostOnlyProfile above: the device\n"
                     "   closure's limited weights across the pair differ from the host's only where\n"

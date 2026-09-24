@@ -356,10 +356,20 @@ PYEOF
         grep -q "corrected" "$C/system/fvSchemes" \
             || { echo "FAIL: the fixture's laplacian is no longer corrected"; return 1; }
     fi
+    if [ "$profile" = gamg ] || [ "$profile" = gamgWalls ]; then
+        # GAMG ACROSS THE PAIR. The hierarchy carried no interface at any level, so the solver was
+        # refused a coupled matrix outright (pcg.cuh's refuseCoupledPatches) -- it would have solved
+        # the two sides as unconnected walls and converged. Every coarse level now carries the pair,
+        # agglomerated as cyclicGAMGInterface does.
+        sed -i 's|p_rgh       { solver PCG; preconditioner DIC; tolerance 1e-12; relTol 0; }|p_rgh       { solver GAMG; smoother DIC; tolerance 1e-12; relTol 0; }|' \
+            "$C/system/fvSolution"
+        grep -q "solver GAMG" "$C/system/fvSolution" \
+            || { echo "FAIL: the $profile profile did not set GAMG on p_rgh"; return 1; }
+    fi
     if [ "$profile" = walls ] || [ "$profile" = explicitWalls ] \
     || [ "$profile" = sstWalls ] || [ "$profile" = lesWalls ] \
     || [ "$profile" = sstLimWalls ] || [ "$profile" = sstLimUWalls ] || [ "$profile" = sstLimUpwWalls ] \
-    || [ "$profile" = sstLimDivWalls ] || [ "$profile" = sstLsqWalls ]; then
+    || [ "$profile" = sstLimDivWalls ] || [ "$profile" = sstLsqWalls ] || [ "$profile" = gamgWalls ]; then
         # THE CONTROL: the pair replaced by two walls, in the mesh AND in every field that names it.
         # blockMesh numbers the cells from the block, so the two runs' cells are the same cells.
         sed -i 's/type cyclic; neighbourPatch right;/type wall;/; s/type cyclic; neighbourPatch left; */type wall;/' \
@@ -423,7 +433,7 @@ PYEOF
 
 for p in cyclic walls explicitMules explicitWalls jump outer outerControl \
          sst sstWalls les lesWalls sstCN lesCN sstLim sstLimWalls sstLimU sstLimUWalls \
-         sstLimDiv sstLimDivWalls sstLsq sstLsqWalls sstLimUpw sstLimUpwWalls; do
+         sstLimDiv sstLimDivWalls sstLsq sstLsqWalls sstLimUpw sstLimUpwWalls gamg gamgWalls; do
     stage "$p" || { echo "interfoam_cyclic_vs_openfoam: staging failed"; exit 1; }
 done
 
@@ -496,6 +506,10 @@ rc=0
 # refused this by name until the limiter was given the pair's neighbour cells.
 "$BIN" "$W/sstLimUpw" "$W/sstLimUpw/0" "$W/sstLimUpw/$END" "$STEPS" \
        "$W/sstLimUpw/log.interFoam" "$W/sstLimUpwWalls/$END" sstLimUpw || rc=1
+# ...and GAMG on p_rgh across the pair, which the solver refused outright until every coarse level
+# carried the interface.
+"$BIN" "$W/gamg" "$W/gamg/0" "$W/gamg/$END" "$STEPS" \
+       "$W/gamg/log.interFoam" "$W/gamgWalls/$END" gamg || rc=1
 # ...AND THE ASSEMBLED SYSTEM ACROSS THE PAIR, host arm against device arm, at the first closure call.
 #
 # WHY NOT AGAINST OPENFOAM DIRECTLY, as the waterChannel and damBreak assembly gates are: OpenFOAM's

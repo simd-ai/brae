@@ -605,6 +605,20 @@ DeviceSolverPerf deviceGamgSolve(
     const GamgControls& controls,
     GamgSolveLog* log)
 {
+    // THE HIERARCHY CARRIES NO INTERFACE on this arm yet. The host reference does now (every coarse
+    // level agglomerates the pair as cyclicGAMGInterface does, gated by the `gamg` profile in
+    // tests/interfoam_cyclic_vs_openfoam.sh); this loop does not, and a solver without the interface
+    // coefficients solves the two sides of a pair as unconnected walls AND CONVERGES. MEASURED on
+    // validation/interFoamCyclic with GAMG on p_rgh: alpha 2.9722e-03 and p_rgh 9.1531e-04 from
+    // OpenFOAM, against the host's 2.6e-13 and 3.4e-12 on the same case. Refused rather than run it.
+    if (Ain.nCyc > 0 || Ain.nAmi > 0)
+    {
+        throw std::runtime_error(
+            "brae device GAMG: the matrix carries a coupled interface ("
+            + std::to_string(Ain.nCyc) + " cyclic, " + std::to_string(Ain.nAmi) + " AMI faces) and "
+            "the device hierarchy holds no interface coefficients at any level -- it would solve the "
+            "two sides as unconnected walls and converge. The host loop runs it (gamg_solver_cpp.cu).");
+    }
     const GamgSetup S = gamgSetup(Ain, fineDic, h, controls);
     const DeviceLduView& A = S.A;
     const int nCells = A.nCells;
