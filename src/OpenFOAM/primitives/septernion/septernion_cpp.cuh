@@ -84,6 +84,38 @@ struct Quaternion
         *this *= Quaternion(vector{0, 0, 1}, angles.z);
     }
 
+    // quaternion(const tensor& R): the rotation a tensor holds, by the branch of Shepperd's method
+    // OpenFOAM picks (quaternionI.H:206-280). The branches are not equivalent in floating point --
+    // each divides by a different square root -- so the one OpenFOAM would take is the one taken here.
+    explicit Quaternion(const tensor& R)
+    {
+        const scalar trace = R.xx + R.yy + R.zz;
+        if (trace > 0)
+        {
+            const scalar s = scalar(0.5)/std::sqrt(trace + scalar(1));
+            w = scalar(0.25)/s;
+            v = vector{(R.zy - R.yz)*s, (R.xz - R.zx)*s, (R.yx - R.xy)*s};
+        }
+        else if (R.xx > R.yy && R.xx > R.zz)
+        {
+            const scalar s = scalar(2)*std::sqrt(scalar(1) + R.xx - R.yy - R.zz);
+            w = (R.zy - R.yz)/s;
+            v = vector{scalar(0.25)*s, (R.xy + R.yx)/s, (R.xz + R.zx)/s};
+        }
+        else if (R.yy > R.zz)
+        {
+            const scalar s = scalar(2)*std::sqrt(scalar(1) + R.yy - R.xx - R.zz);
+            w = (R.xz - R.zx)/s;
+            v = vector{(R.xy + R.yx)/s, scalar(0.25)*s, (R.yz + R.zy)/s};
+        }
+        else
+        {
+            const scalar s = scalar(2)*std::sqrt(scalar(1) + R.zz - R.xx - R.yy);
+            w = (R.yx - R.xy)/s;
+            v = vector{(R.xz + R.zx)/s, (R.yz + R.zy)/s, scalar(0.25)*s};
+        }
+    }
+
     Quaternion& operator*=(const Quaternion& q)
     {
         const scalar w0 = w;
@@ -137,6 +169,63 @@ inline Quaternion operator*(
 inline Quaternion conjugate(const Quaternion& q)
 {
     return Quaternion(q.w, scalar(-1)*q.v);
+}
+
+// quaternionI.H:736 -- the four-component dot product, which slerp reads for the sign
+inline scalar operator&(const Quaternion& a, const Quaternion& b)
+{
+    return a.w*b.w + dot(a.v, b.v);
+}
+
+inline scalar magSqr(const Quaternion& q) { return q.w*q.w + dot(q.v, q.v); }
+inline scalar mag(const Quaternion& q)    { return std::sqrt(magSqr(q)); }
+
+inline Quaternion operator*(scalar s, const Quaternion& q) { return Quaternion(s*q.w, s*q.v); }
+
+// quaternionI.H: inv(q) = (w/magSqr, -v/magSqr), and Zero below VSMALL.
+// NAMED quatInv, quatExp, quatPow and not inv/exp/pow: a free function of those names declared in
+// namespace brae HIDES ::exp and ::pow for every unqualified call inside the namespace, and
+// nut_wall_function.cuh's `exp(kUu)` on a scalar stopped compiling the moment `exp` existed here.
+inline Quaternion quatInv(const Quaternion& q)
+{
+    const scalar s = magSqr(q);
+    if (s < scalar(1e-300)) return Quaternion(scalar(0), vector{0, 0, 0});
+    return Quaternion(q.w/s, scalar(-1)*q.v/s);
+}
+
+// quaternion.C:110-128
+inline Quaternion quatExp(const Quaternion& q)
+{
+    const scalar magV = mag(q.v);
+    if (magV == scalar(0)) return Quaternion(scalar(1), vector{0, 0, 0});
+    const scalar expW = std::exp(q.w);
+    return Quaternion(expW*std::cos(magV), (expW*std::sin(magV)/magV)*q.v);
+}
+
+// quaternion.C:160-175. The intermediate `powq` is the PURE quaternion of q's vector part, scaled --
+// writing it any other way changes which of exp's two branches is taken.
+inline Quaternion quatPow(const Quaternion& q, scalar power)
+{
+    const scalar magQ = mag(q);
+    const scalar magV = mag(q.v);
+    Quaternion powq(scalar(0), q.v);
+    if (magV != scalar(0) && magQ != scalar(0))
+    {
+        powq.w /= magV;
+        powq.v = powq.v/magV;
+        const scalar f = power*std::acos(q.w/magQ);
+        powq.w *= f;
+        powq.v = f*powq.v;
+    }
+    return std::pow(magQ, power)*quatExp(powq);
+}
+
+// quaternion.C:81-96 -- the SIGN is taken from the four-component dot product, so the interpolation
+// takes the short way round
+inline Quaternion slerp(const Quaternion& qa, const Quaternion& qb, scalar t)
+{
+    const scalar sign = ((qa & qb) < scalar(0)) ? scalar(-1) : scalar(1);
+    return qa*quatPow(quatInv(qa)*(sign*qb), t);
 }
 
 inline Quaternion normalised(const Quaternion& q)
@@ -206,6 +295,13 @@ inline Septernion operator*(
     return Septernion(
         tr2.r.invTransform(tr1.t) + tr2.t,
         normalised(tr1.r*tr2.r));
+}
+
+// septernion.C:63-71 -- the translation interpolates LINEARLY and the rotation through the quaternion
+// slerp; they are not the same interpolation and swapping them moves every blended point.
+inline Septernion slerp(const Septernion& sa, const Septernion& sb, scalar t)
+{
+    return Septernion((scalar(1) - t)*sa.t + t*sb.t, slerp(sa.r, sb.r, t));
 }
 
 // transformPoints(const septernion&, const vectorField&)

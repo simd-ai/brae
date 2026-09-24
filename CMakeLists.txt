@@ -110,6 +110,7 @@ add_library(brae_core STATIC
     src/meshTools/cellDist/patchWave/patch_wave_cpp.cu
     src/OpenFOAM/meshes/primitiveMesh/edges/mesh_edges_cpp.cu
     src/dynamicMesh/pointPatchDist/point_patch_dist_cpp.cu
+    src/rigidBodyDynamics/rigid_body_motion_cpp.cu
     src/meshTools/twoDPointCorrector/two_d_point_corrector_cpp.cu
     src/finiteVolume/interpolation/volPointInterpolation/vol_point_interpolation_cpp.cu
     src/waveModels/derivedPointPatchFields/waveMaker/wave_maker_point_patch_vector_field_cpp.cu
@@ -3701,6 +3702,15 @@ target_include_directories(test_inter_limitedlinear_vs_openfoam PRIVATE ${BRAE_H
 target_link_libraries(test_inter_limitedlinear_vs_openfoam PRIVATE brae_core)
 add_test(NAME interfoam_limitedlinear_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_limitedlinear_vs_openfoam.sh)
+
+# brae's rigid-body point transform against real OpenFOAM's pointDisplacement, with the joint state
+# taken from OpenFOAM's own. The script carries the measurements and the controls.
+add_executable(test_rigid_body_transform_vs_openfoam tests/test_rigid_body_transform_vs_openfoam.cu)
+target_include_directories(test_rigid_body_transform_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_rigid_body_transform_vs_openfoam PRIVATE brae_core)
+add_test(NAME rigid_body_transform_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rigid_body_transform_vs_openfoam.sh)
 
 # brae's pointPatchDist and the rigidBodyMeshMotion scale against real OpenFOAM, on the mesh
 # RAS/floatingObject builds. The script carries the measurements and the controls.
