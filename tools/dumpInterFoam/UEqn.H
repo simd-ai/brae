@@ -23,6 +23,15 @@
     // (fvMatrix.C:1102-1107) and a dump taken before it would be a different matrix.
     if (getenv("BRAE_DUMP_ITER") && runTime.timeIndex() == atoi(getenv("BRAE_DUMP_ITER")))
     {
+        // U AS THE ASSEMBLY SEES IT. A mixed condition writes its refValue, refGradient and
+        // valueFraction (mixedFvPatchField::write), so a copy written here carries the pair the
+        // boundaryCoeffs above were built from -- which is what nothing written at the END of a step
+        // can show, because the patch is evaluated again between the two moments.
+        volVectorField
+        (
+            IOobject("Uasm.dump", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+            U
+        ).write();
         forAll(mesh.boundary(), patchi)
         {
             const fvPatch& pp = mesh.boundary()[patchi];

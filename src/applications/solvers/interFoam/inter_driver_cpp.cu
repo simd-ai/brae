@@ -321,14 +321,26 @@ RunReport runInterFoam(
         // for exactly this question, and at step two both agree with this loop's to 6.204e-16. rho and
         // U.oldTime() were already exact, so the whole ddt source is.
         //
-        // WHAT IS LEFT IS ONE TERM: the permeable patch's boundaryCoeffs AT THE MOMENTUM ASSEMBLY of
-        // step two. Its refValue is `(phip/magSf)*nf` and its valueFraction `neg(phip)` blended with
-        // `pos(alpha - alphaMin)` -- all of nf, magSf and phip move with the mesh, and this class
-        // CACHES the pair at rebuild() rather than recomputing it per read. At the END of step one it
-        // is exact (refValue 1.353e-13, valueFraction equal on all 1050 faces); the question is what
-        // it holds when step two assembles, which is after the move and after the flux push. The next
-        // unit dumps it there on both sides -- OpenFOAM's through the same instrument, whose
-        // mixedFvPatchField::write already emits both. The device loop refuses it at its own site.
+        // THE PATCH IS NOT IT EITHER, measured at the ASSEMBLY of step two and not at the end of the
+        // step (tools/dumpInterFoam writes `Uasm.dump`, a copy of U taken there, and a mixed condition
+        // writes its own refValue and valueFraction):
+        //     refValue       3.185e-15   against a max of 1.534e+00 -- an order of magnitude larger
+        //                                than the 5.9e-03 the end of step one shows, so this is the
+        //                                moment that matters and it agrees
+        //     valueFraction  EQUAL on all 1050 faces
+        // and the ASSEMBLED momentum coefficients with them: OpenFOAM prints |bC| 0 and
+        // |iC| 1.59244463781161e-05 on that patch, this loop 0 and 1.59244463781161196e-05 -- every
+        // digit OpenFOAM prints. So the boundary treatment of the momentum matrix is exact.
+        //
+        // WHAT IS LEFT is the only part of UEqn.H() not yet compared: lduMatrix::H(psi), the
+        // OFF-DIAGONAL product. H = (H(psi) + source + boundarySource)/V, and source, boundarySource,
+        // V and A are now all exact, so the off-diagonals are. They come from div(rhoPhi,U) and
+        // laplacian(muEff,U), which makes rhoPhi and muEff at step two the next two dumps --
+        // tools/dumpInterFoam already writes muEff.dump, nuMix.dump and rho.dump.
+        // WHY THE DIAGONAL CAN BE RIGHT WHILE THEY ARE NOT: A is D/V, and D carries the ddt's
+        // rho*V/dt, which on this case is far larger than the convective and viscous off-diagonals --
+        // an error in those is visible in H and buried in A. The device loop refuses it at its own
+        // site.
         for (std::size_t pi = 0; pi < patches.size() && pi < f.U.boundary.size(); ++pi)
         {
             const bool permeable = f.U.boundary[pi]->needsAlphaPatchValues()
