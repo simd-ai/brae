@@ -50,6 +50,14 @@ std::vector<std::vector<label>> pointCellsFromCells(
     const PrimitiveMesh& m,
     const std::vector<std::vector<label>>& cells);
 
+// primitiveMesh::cellPoints(): each cell's points, once each, in the order its faces name them
+// (primitiveMeshCellPoints.C's cells() branch). hexRef8::getSplitPoints is the only consumer here and
+// it visits each point of a cell exactly once, deciding by which CELL reaches a point first -- so the
+// order WITHIN a cell does not change its answer, and the set is what matters.
+std::vector<std::vector<label>> cellPointsFromCells(
+    const PrimitiveMesh& m,
+    const std::vector<std::vector<label>>& cells);
+
 // A PrimitivePatch over a list of the mesh's faces
 struct PrimitivePatchAddressing
 {

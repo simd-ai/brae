@@ -48,6 +48,9 @@ struct Dump
     std::vector<label>  candidate, consistent, selected, protectedCells;
     std::vector<label>  cellLevel, pointLevel, nFacesOfCell;
     std::vector<label>  extended1, extended2;
+    std::vector<label>  splitPoint, unrefinePoint;
+    label nSplitPoints = -1, nUnrefinePoints = -1;
+    scalar unrefineLevel = 0;
     label nCells = -1, nPoints = -1, nCandidates = -1;
     label nConsistent = -1, nSelected = -1, nProtectedCells = -1;
     label maxCells = -1, maxRefinement = -1, nTotalCells = -1;
@@ -83,6 +86,11 @@ Dump readDump(const std::string& path)
         else if (tag == "candidate")     { label c = 0; is >> c; d.candidate.push_back(c); }
         else if (tag == "consistent")    { label c = 0; is >> c; d.consistent.push_back(c); }
         else if (tag == "protected")     { label c = 0; is >> c; d.protectedCells.push_back(c); }
+        else if (tag == "splitPoint")    { label c = 0; is >> c; d.splitPoint.push_back(c); }
+        else if (tag == "unrefinePoint") { label c = 0; is >> c; d.unrefinePoint.push_back(c); }
+        else if (tag == "nSplitPoints")     is >> d.nSplitPoints;
+        else if (tag == "nUnrefinePoints")  is >> d.nUnrefinePoints;
+        else if (tag == "unrefineLevel")    is >> d.unrefineLevel;
         else if (tag == "extended")
         {
             label n = 0, c = 0;
@@ -496,6 +504,100 @@ int main(int argc, char** argv)
             // this arm is not describing.
             check("...and the mesh carries the non-hex cells that explain it",
                   nFewFaces > 0 || nManyFaces > 0);
+        }
+    }
+
+    // UNIT 4: which points can be UNSPLIT. Needs the refinement HISTORY off disk, which is the one
+    // thing units 1-3 did not read.
+    if (of.nSplitPoints >= 0)
+    {
+        const std::string historyPath = meshDir + "/refinementHistory";
+        const dynamicRefine::RefinementHistory history =
+            dynamicRefine::readRefinementHistory(historyPath, nCells);
+        const std::vector<std::vector<label>> cellPoints = cellPointsFromCells(m, cells);
+        const std::vector<label> mineSplit =
+            dynamicRefine::getSplitPoints(history, of.cellLevel, pcCells, cellPoints, m);
+        std::printf("  split points: brae %zu, OpenFOAM %d\n",
+                    mineSplit.size(), (int)of.nSplitPoints);
+        check("OpenFOAM's split-point list is the length it printed",
+              of.splitPoint.size() == static_cast<std::size_t>(of.nSplitPoints));
+        check("brae finds exactly OpenFOAM's split points", mineSplit == of.splitPoint);
+
+        if (of.nSplitPoints == 0)
+        {
+            std::printf("  (this mesh has never been refined, so there is nothing to unsplit and "
+                        "the unrefinement selection is NOT discriminated by this arm)\n");
+        }
+        else
+        {
+            const std::vector<char> protectedSet2 =
+                of.pointLevel.empty()
+              ? std::vector<char>()
+              : dynamicRefine::initProtectedCells(of.cellLevel, of.pointLevel, pcCells, cells, m,
+                                                  patches);
+            const std::vector<label> mineUnrefine =
+                dynamicRefine::selectUnrefinePoints(of.unrefineLevel, aCells.candidate,
+                                                    aCells.maxCellField, mineSplit, protectedSet2,
+                                                    of.cellLevel, pcCells, m, patches);
+            std::printf("  unrefine points: brae %zu, OpenFOAM %d (of %zu split points, "
+                        "unrefineLevel %.17g)\n",
+                        mineUnrefine.size(), (int)of.nUnrefinePoints, mineSplit.size(),
+                        (double)of.unrefineLevel);
+            check("OpenFOAM's unrefine list is the length it printed",
+                  of.unrefinePoint.size() == static_cast<std::size_t>(of.nUnrefinePoints));
+            check("brae selects exactly the points OpenFOAM would unsplit",
+                  mineUnrefine == of.unrefinePoint);
+            if (of.nUnrefinePoints == 0)
+            {
+                // a mesh WITH a history whose every split point is still vetoed: the comparison above
+                // is 0 against 0, so this arm holds getSplitPoints and not the selection below it
+                std::printf("  (this arm has %zu split points and unsplits NONE of them -- the "
+                            "marked-cell veto covers them all -- so the selection is not "
+                            "discriminated here, only getSplitPoints is)\n", mineSplit.size());
+            }
+
+            // CONTROL: the 2:1 closure skipped. It can only REMOVE points, so skipping it must give
+            // at least as many -- and on this fixture strictly more, or the closure did nothing and
+            // this arm is not measuring it.
+            std::vector<char> markedSet = aCells.candidate;
+            std::vector<label> preClosure;
+            for (const label pointi : mineSplit)
+            {
+                const std::size_t pp = static_cast<std::size_t>(pointi);
+                if (!(aCells.maxCellField[pp] < of.unrefineLevel)) continue;
+                bool hasMarked = false;
+                for (const label celli : pcCells[pp])
+                {
+                    hasMarked = hasMarked || markedSet[static_cast<std::size_t>(celli)] != 0;
+                }
+                if (!hasMarked) preClosure.push_back(pointi);
+            }
+            std::printf("  CONTROL: before the 2:1 closure there are %zu points, after it %zu\n",
+                        preClosure.size(), mineUnrefine.size());
+            check("...the closure only ever removes points", mineUnrefine.size() <= preClosure.size());
+            if (preClosure.empty())
+            {
+                std::printf("  (nothing survived the veto, so the closure has nothing to remove and "
+                            "this control cannot witness it here)\n");
+            }
+            else
+            {
+                check("...and it removed some here, so it is measured",
+                      mineUnrefine.size() < preClosure.size());
+            }
+
+            // CONTROL: the markedCell veto dropped. The buffer's whole job is this veto, so without
+            // it the set must grow.
+            std::vector<label> noVeto;
+            for (const label pointi : mineSplit)
+            {
+                const std::size_t pp = static_cast<std::size_t>(pointi);
+                if (aCells.maxCellField[pp] < of.unrefineLevel) noVeto.push_back(pointi);
+            }
+            std::printf("  CONTROL: without the marked-cell veto, %zu points pass the field test\n",
+                        noVeto.size());
+            check("...so the veto is what keeps the interface refined",
+                  noVeto.size() >= preClosure.size());
         }
     }
 

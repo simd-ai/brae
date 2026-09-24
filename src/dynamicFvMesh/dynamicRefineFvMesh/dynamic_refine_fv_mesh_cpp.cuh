@@ -227,5 +227,83 @@ std::vector<char> calculateProtectedCells(
     const PrimitiveMesh&                   m,
     const std::vector<FvPatch>&            patches);
 
+// ---------------------------------------------------------------------------------------------
+// UNIT 4: which points can be UNSPLIT. Still a fixed mesh -- none of this touches polyTopoChange,
+// mapPolyMesh or hexRef8::setUnrefinement -- but it needs one thing the units above did not: the
+// refinement HISTORY, read off disk.
+//
+// OF v2412: src/dynamicMesh/polyTopoChange/polyTopoChange/hexRef8/hexRef8.C
+//   getSplitPoints           :5180-5318
+//   consistentUnrefinement   :5383-5603
+//   src/dynamicFvMesh/dynamicRefineFvMesh/dynamicRefineFvMesh.C
+//   selectUnrefinePoints     :910-1002
+
+// refinementHistory, as much of it as unit 4 reads: the parent of each split entry and the entry each
+// current cell is visible through. `addedCellsPtr_` is parsed to advance the stream and discarded --
+// nothing here reads it.
+//
+// THE ON-DISK FORM IS ALWAYS THE COMPACTED ONE: operator<< calls compact() before writing
+// (refinementHistory.C:1739), so a reader never meets a freed entry (`parent_ == -2`) or the free
+// list. A never-refined mesh writes `0()` for the splits and `N{-1}` for the visible cells, so the
+// uniform list form has to be parsed too.
+struct RefinementHistory
+{
+    std::vector<label> parent;          // splitCells_[i].parent_, -1 at the top level
+    std::vector<label> visibleCells;    // per CURRENT cell: -1, or an index into `parent`
+    bool active = false;
+
+    // refinementHistory.H:302-313. The caller must have checked visibleCells[celli] != -1 first --
+    // OpenFOAM fatals here otherwise, and getSplitPoints' short-circuit at :5228 is load-bearing.
+    label parentIndex(label celli) const;
+};
+
+RefinementHistory readRefinementHistory(
+    const std::string& path,
+    label              nCells);
+
+// hexRef8.C:5180-5318. A point can be unsplit when it is the centre of one top-level split: it must
+// have EXACTLY eight cells, all of them visible children of the SAME parent at the same level, and it
+// must not lie on a boundary face.
+//
+// On a never-refined mesh every cell is its own top-level entry, `parentIndex` is -1 for all of them,
+// and this returns EMPTY -- not an error. `pointLevel` is not read here at all.
+std::vector<label> getSplitPoints(
+    const RefinementHistory&               history,
+    const std::vector<label>&              cellLevel,
+    const std::vector<std::vector<label>>& pointCells,
+    const std::vector<std::vector<label>>& cellPoints,
+    const PrimitiveMesh&                   m);
+
+// hexRef8.C:5383-5603, maxSet FALSE only -- OpenFOAM's own maxSet=true half FATALS at entry (:5395),
+// so the function can only ever SHRINK the set. That is the mirror of consistentRefinement's
+// superset, and the asymmetry is OpenFOAM's, not a simplification here.
+//
+// The tests are on the levels that would result AFTER unrefinement (`cellLevel - unrefineCell`), and
+// they are the opposite direction from the refinement closure: `ownLevel < neiLevel - 1`.
+std::vector<label> consistentUnrefinement(
+    const std::vector<label>&              pointsToUnrefine,
+    bool                                   maxSet,
+    const std::vector<label>&              cellLevel,
+    const std::vector<std::vector<label>>& pointCells,
+    const PrimitiveMesh&                   m,
+    const std::vector<FvPatch>&            patches);
+
+// dynamicRefineFvMesh.C:910-1002. A split point survives when no cell of it is protected, the field
+// at it is STRICTLY below `unrefineLevel`, and none of its cells is in `markedCell` -- which is the
+// refinement candidate set after the buffer layers, so the buffer's whole job is to veto here.
+//
+// `pFld` is maxCellField(vFld), NOT the cell-to-point average: a point is unrefinable only if the
+// LARGEST neighbouring cell value is below the level.
+std::vector<label> selectUnrefinePoints(
+    scalar                                 unrefineLevel,
+    const std::vector<char>&               markedCell,
+    const std::vector<scalar>&             pFld,
+    const std::vector<label>&              splitPoints,
+    const std::vector<char>&               protectedCell,
+    const std::vector<label>&              cellLevel,
+    const std::vector<std::vector<label>>& pointCells,
+    const PrimitiveMesh&                   m,
+    const std::vector<FvPatch>&            patches);
+
 }   // namespace dynamicRefine
 }   // namespace brae

@@ -57,6 +57,16 @@
 # THE BUFFER DILATION IS independently discriminated: setting only the owner on an internal face reads
 # 7,815 cells against OpenFOAM's 11,981 on the split hex and fails both layers on the wedge too.
 #
+# WHAT THE UNREFINEMENT ARMS ISOLATE, measured the same way. brae reproduces OpenFOAM exactly --
+# 2,595 and 2,534 split points, 53 and 55 unrefine points -- and the 2:1 CLOSURE is isolated: running
+# it for one pass instead of to a fixed point reads 279 against 53 and 272 against 55. Three other
+# defects were absorbed by the fixture's geometry and are recorded rather than claimed:
+#   * the boundary-face unmarking dropped       -> green (a boundary point cannot have eight cells,
+#                                                   so the `!= 8` filter already excluded it)
+#   * the splitMasterLevel half of the test cut -> green (the parent index alone separates them here)
+#   * `pCells.size() != 8` weakened to `< 8`    -> green (no interior point of a hex mesh has nine)
+# So these arms hold getSplitPoints AS A WHOLE and the closure, not the individual filters.
+#
 # NOT DISCRIMINATED by this gate, each stated rather than implied: the 2:1 consistency closure, the
 # cellLevel cap, protected cells, the buffer layers, unrefinement, and the mesh change itself. None of
 # it is ported and all of it is still refused.
@@ -284,6 +294,57 @@ cp "$WC/constant/dynamicMeshDict" "$SC/constant/"
 armIn splitHex "$SC" 0 constant/polyMesh
 grep -q "^\[brae\] nProtectedCells 1886$" "$W/dump.splitHex.txt" \
     || { echo "FAIL: the splitHex fixture no longer protects 1886 cells"; rc=1; }
+
+# UNREFINEMENT needs a mesh that has been refined AND a step on which nothing is refined. The second
+# half is not optional: on a step that refines, dynamicRefineFvMesh::update remaps refineCell through
+# the mapPolyMesh and then extends it by nBufferLayers (:1388-1419), and neither is reproducible from
+# written data -- so `markedCell` would be a fiction. On a step with `Selected 0 cells for refinement`
+# that block is skipped entirely and refineCell IS selectRefineCandidates' output on the written mesh.
+#
+# The fixture is the same tutorial with the water given an initial velocity, so the interface sweeps
+# out of cells instead of waiting for gravity: without it a just-refined octet can never unsplit,
+# because one of its children always still carries the interface and vetoes the point. MEASURED, twelve
+# steps of 1e-3: it refines for three steps and then alternates, and the steps that unrefine are
+# 0.003 -> 0.004 (53 points of 2,595) and 0.010 -> 0.011 (55 of 2,534). The gate reads the mesh and
+# the field at 0.003 and at 0.01 and reproduces what the NEXT step selected.
+UC="$W/unrefine"
+rm -rf "$UC"
+cp -r "$SRC" "$UC" || exit 1
+chmod -R u+w "$UC"
+rm -rf "$UC"/[1-9]* "$UC"/0 "$UC"/processor* "$UC"/log.*
+sed -i 's/(32 32 32)/(16 16 16)/' "$UC/system/blockMeshDict"
+python3 - "$UC" <<'PYEOF' || { echo "FAIL: staging the unrefinement fixture"; exit 1; }
+import re, sys
+d = sys.argv[1]
+c = d + '/system/controlDict'
+s = open(c).read()
+for key, val in [('endTime', '0.012'), ('deltaT', '0.001'), ('adjustTimeStep', 'no'),
+                 ('writeControl', 'timeStep'), ('writeInterval', '1'),
+                 ('writeFormat', 'ascii'), ('writePrecision', '18'), ('timePrecision', '12')]:
+    s, k = re.subn(r'^%s\s.*' % key, '%s %s;' % (key.ljust(15), val), s, flags=re.M)
+    assert k == 1, key
+open(c, 'w').write(s)
+# the one essential edit: the water starts moving, so the interface leaves cells
+f = d + '/system/setFieldsDict'
+t = open(f).read()
+t, k = re.subn(r'(volScalarFieldValue alpha\.water 1)',
+               r'\1\n                volVectorFieldValue U (2 0 0)', t)
+assert k == 1, 'the setFields water block was not found'
+open(f, 'w').write(t)
+PYEOF
+( cd "$UC" && cp -r 0.orig 0 && blockMesh > log.blockMesh 2>&1 && topoSet > log.topoSet 2>&1 \
+      && subsetMesh -overwrite c0 -patch walls > log.subsetMesh 2>&1 \
+      && setFields > log.setFields 2>&1 && interFoam > log.interFoam 2>&1 ) \
+    || { echo "FAIL: running the unrefinement fixture"; tail -30 "$UC"/log.interFoam 2>/dev/null; exit 1; }
+grep -q "^Selected 53 split points out of a possible 2595.$" "$UC/log.interFoam" \
+    || { echo "FAIL: the unrefinement fixture no longer unsplits 53 of 2595 points"; \
+         grep -c "split points" "$UC/log.interFoam"; exit 1; }
+grep -q "^Unrefined from 24815 to 24444 cells.$" "$UC/log.interFoam" \
+    || { echo "FAIL: OpenFOAM did not actually unrefine the fixture"; exit 1; }
+echo "OpenFOAM unrefined: $(grep -c '^Unrefined from' "$UC/log.interFoam") unrefinements in 12 steps"
+
+armIn unrefine1 "$UC" 0.003 0.003/polyMesh
+armIn unrefine2 "$UC" 0.01  0.01/polyMesh
 
 echo "refine_candidates_vs_openfoam: rc $rc"
 exit $rc

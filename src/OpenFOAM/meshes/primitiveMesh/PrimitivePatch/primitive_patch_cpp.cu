@@ -111,6 +111,38 @@ std::vector<std::vector<label>> pointCellsFromCells(
 }
 
 
+std::vector<std::vector<label>> cellPointsFromCells(
+    const PrimitiveMesh& m,
+    const std::vector<std::vector<label>>& cells)
+{
+    std::vector<std::vector<label>> cellPoints(cells.size());
+    std::vector<char> usedPoints(static_cast<std::size_t>(m.nPoints()), 0);
+    for (std::size_t celli = 0; celli < cells.size(); ++celli)
+    {
+        std::vector<label>& out = cellPoints[celli];
+        for (const label facei : cells[celli])
+        {
+            const label n = m.faceSize(facei);
+            for (label k = 0; k < n; ++k)
+            {
+                const label pointi = m.faceVert(facei, k);
+                char& used = usedPoints[static_cast<std::size_t>(pointi)];
+                if (!used)
+                {
+                    used = 1;
+                    out.push_back(pointi);
+                }
+            }
+        }
+        for (const label p : out)
+        {
+            usedPoints[static_cast<std::size_t>(p)] = 0;
+        }
+    }
+    return cellPoints;
+}
+
+
 PrimitivePatchAddressing primitivePatch(
     const PrimitiveMesh& m,
     const std::vector<label>& faces)

@@ -102,6 +102,7 @@ public:
     using dynamicRefineFvMesh::maxPointField;
     using dynamicRefineFvMesh::selectRefineCandidates;
     using dynamicRefineFvMesh::selectRefineCells;
+    using dynamicRefineFvMesh::selectUnrefinePoints;
 };
 
 
@@ -365,6 +366,45 @@ int main(int argc, char *argv[])
             Info<< "[brae] nExtended " << nLayers << ' '
                 << extendedCell.count() << nl;
         }
+    }
+
+    // UNIT 4: which points can be UNSPLIT. getSplitPoints needs the refinement
+    // HISTORY, so on a never-refined mesh this is empty and says so rather than
+    // failing -- refinementHistory defaults to every cell its own top-level
+    // entry (hexRef8.C:1953-1965), which is active() but has no parents.
+    //
+    // selectUnrefinePoints is called with the CANDIDATE set as markedCell. That
+    // is what dynamicRefineFvMesh::update passes on a step where nothing was
+    // refined (:1425-1435): the buffer-layer extension at :1414-1419 sits
+    // inside `if (returnReduceOr(cellsToRefine.size()))`, so on such a step
+    // refineCell is exactly selectRefineCandidates' output, with no remap
+    // through a mapPolyMesh. A gate may only use such a step.
+    {
+        const scalar unrefineLevel =
+            refineDict.getOrDefault<scalar>("unrefineLevel", GREAT);
+        Info<< "[brae] unrefineLevel " << unrefineLevel << nl;
+
+        const labelList splitPoints(mesh.meshCutter().getSplitPoints());
+        for (const label pointi : splitPoints)
+        {
+            Info<< "[brae] splitPoint " << pointi << nl;
+        }
+        Info<< "[brae] nSplitPoints " << splitPoints.size() << nl;
+
+        const labelList unrefinePoints
+        (
+            mesh.selectUnrefinePoints
+            (
+                unrefineLevel,
+                candidateCell,
+                mesh.maxCellField(vFld)
+            )
+        );
+        for (const label pointi : unrefinePoints)
+        {
+            Info<< "[brae] unrefinePoint " << pointi << nl;
+        }
+        Info<< "[brae] nUnrefinePoints " << unrefinePoints.size() << nl;
     }
 
     // The levels the next unit will need, and the only thing on this mesh that

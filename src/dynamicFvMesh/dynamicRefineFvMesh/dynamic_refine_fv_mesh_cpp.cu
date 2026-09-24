@@ -1,6 +1,8 @@
 #include "dynamic_refine_fv_mesh_cpp.cuh"
 
+#include "foam_token_reader.cuh"
 #include <algorithm>
+#include <filesystem>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -572,6 +574,349 @@ std::vector<char> calculateProtectedCells(
         }
     }
     return unrefineableCell;
+}
+
+
+label RefinementHistory::parentIndex(label celli) const
+{
+    const label index = visibleCells[static_cast<std::size_t>(celli)];
+    if (index < 0)
+    {
+        throw std::runtime_error(
+            std::string(WHO) + "cell " + std::to_string(celli) + " is not visible, so it has no "
+            "parent. OpenFOAM fatals here too (refinementHistory.H:308); the caller must test "
+            "visibleCells != -1 first, as getSplitPoints does at hexRef8.C:5228.");
+    }
+    return parent[static_cast<std::size_t>(index)];
+}
+
+
+namespace {
+
+// A labelList in one of OpenFOAM's three written forms: `N ( a b ... )`, `N { v }` (uniform) and the
+// empty `0 ( )`. A pristine history writes `0()` for the splits and `N{-1}` for the visible cells, so
+// a reader that only knows the bracket form cannot open a never-refined mesh.
+std::vector<label> readLabelList(TokenStream& ts)
+{
+    const label n = ts.nextLabel();
+    const std::string open = ts.next();
+    std::vector<label> out;
+    if (open == "{")
+    {
+        const label v = ts.nextLabel();
+        ts.expect("}");
+        out.assign(static_cast<std::size_t>(n), v);
+        return out;
+    }
+    if (open != "(")
+    {
+        throw std::runtime_error(
+            std::string(WHO) + "a label list of " + std::to_string(n) + " entries is followed by `"
+            + open + "`, which is neither `(` nor `{`.");
+    }
+    out.resize(static_cast<std::size_t>(n));
+    for (label& x : out) x = ts.nextLabel();
+    ts.expect(")");
+    return out;
+}
+
+}   // namespace
+
+
+RefinementHistory readRefinementHistory(
+    const std::string& path,
+    label              nCells)
+{
+    RefinementHistory h;
+    if (!std::filesystem::exists(path))
+    {
+        // hexRef8.C:1953-1965 -- the object is NO_READ and defaults to every cell its own top-level
+        // entry, so a missing file is a mesh that has never been refined, not an error. active() is
+        // TRUE in that state and getSplitPoints returns empty.
+        h.parent.assign(static_cast<std::size_t>(nCells), label(-1));
+        h.visibleCells.resize(static_cast<std::size_t>(nCells));
+        for (label c = 0; c < nCells; ++c)
+        {
+            h.visibleCells[static_cast<std::size_t>(c)] = c;
+        }
+        h.active = (nCells > 0);
+        return h;
+    }
+
+    TokenStream ts(path);
+    // refinementHistory.C:1741-1744 -- splitCells_ then visibleCells_, the `//` markers being
+    // comments the tokenizer drops
+    const label nSplit = ts.nextLabel();
+    ts.expect("(");
+    h.parent.resize(static_cast<std::size_t>(nSplit));
+    for (label i = 0; i < nSplit; ++i)
+    {
+        h.parent[static_cast<std::size_t>(i)] = ts.nextLabel();
+        // the eight added cells, parsed to advance the stream and discarded: unit 4 never reads them
+        (void)readLabelList(ts);
+    }
+    ts.expect(")");
+    h.visibleCells = readLabelList(ts);
+    h.active = !h.visibleCells.empty();
+
+    if (h.active && static_cast<label>(h.visibleCells.size()) != nCells)
+    {
+        throw std::runtime_error(
+            std::string(WHO) + path + " holds " + std::to_string(h.visibleCells.size())
+            + " visible cells where the mesh has " + std::to_string(nCells)
+            + ". OpenFOAM fatals on the same mismatch (hexRef8.C:1980-1988).");
+    }
+    return h;
+}
+
+
+std::vector<label> getSplitPoints(
+    const RefinementHistory&               history,
+    const std::vector<label>&              cellLevel,
+    const std::vector<std::vector<label>>& pointCells,
+    const std::vector<std::vector<label>>& cellPoints,
+    const PrimitiveMesh&                   m)
+{
+    if (!history.active)
+    {
+        throw std::runtime_error(
+            std::string(WHO) + "getSplitPoints needs a refinement history, and this one is not "
+            "active. OpenFOAM aborts with \"Only call if constructed with history capability\" "
+            "(hexRef8.C:5194-5199).");
+    }
+    const std::size_t nPoints = static_cast<std::size_t>(m.nPoints());
+
+    // :5205-5206. -1 undetermined, -2 certainly not a split point, >= 0 the master cell.
+    std::vector<label> splitMaster(nPoints, label(-1));
+    std::vector<label> splitMasterLevel(nPoints, 0);
+
+    // :5211-5219 -- a split point has EXACTLY eight cells
+    for (std::size_t pointi = 0; pointi < nPoints; ++pointi)
+    {
+        if (pointCells[pointi].size() != 8)
+        {
+            splitMaster[pointi] = -2;
+        }
+    }
+
+    // :5224-5275. The `visibleCells != -1` test short-circuits parentIndex, which fatals otherwise.
+    for (std::size_t celli = 0; celli < history.visibleCells.size(); ++celli)
+    {
+        const bool refined = (history.visibleCells[celli] != -1)
+                          && (history.parentIndex(static_cast<label>(celli)) >= 0);
+        if (refined)
+        {
+            const label parentIndex = history.parentIndex(static_cast<label>(celli));
+            for (const label pointi : cellPoints[celli])
+            {
+                const std::size_t p = static_cast<std::size_t>(pointi);
+                const label masterCelli = splitMaster[p];
+                if (masterCelli == -1)
+                {
+                    // first visit: store the parent AND the level, so a point shared by two
+                    // refinement patterns at different levels is caught below
+                    splitMaster[p] = parentIndex;
+                    splitMasterLevel[p] = cellLevel[celli] - 1;
+                }
+                else if (masterCelli == -2)
+                {
+                }
+                else if (masterCelli != parentIndex || splitMasterLevel[p] != cellLevel[celli] - 1)
+                {
+                    splitMaster[p] = -2;
+                }
+            }
+        }
+        else
+        {
+            for (const label pointi : cellPoints[celli])
+            {
+                splitMaster[static_cast<std::size_t>(pointi)] = -2;
+            }
+        }
+    }
+
+    // :5278-5291 -- nothing on a boundary face can be unsplit
+    for (label facei = m.nInternalFaces(); facei < m.nFaces(); ++facei)
+    {
+        const label n = m.faceSize(facei);
+        for (label k = 0; k < n; ++k)
+        {
+            splitMaster[static_cast<std::size_t>(m.faceVert(facei, k))] = -2;
+        }
+    }
+
+    // :5298-5315 -- ascending
+    std::vector<label> splitPoints;
+    for (std::size_t pointi = 0; pointi < nPoints; ++pointi)
+    {
+        if (splitMaster[pointi] >= 0) splitPoints.push_back(static_cast<label>(pointi));
+    }
+    return splitPoints;
+}
+
+
+std::vector<label> consistentUnrefinement(
+    const std::vector<label>&              pointsToUnrefine,
+    bool                                   maxSet,
+    const std::vector<label>&              cellLevel,
+    const std::vector<std::vector<label>>& pointCells,
+    const PrimitiveMesh&                   m,
+    const std::vector<FvPatch>&            patches)
+{
+    if (maxSet)
+    {
+        // :5395-5400 -- OpenFOAM's own "maxSet not implemented yet."
+        throw std::runtime_error(
+            std::string(WHO) + "consistentUnrefinement was asked for maxSet, which OpenFOAM itself "
+            "aborts on (hexRef8.C:5395-5400, \"maxSet not implemented yet\"). This closure can only "
+            "remove points.");
+    }
+    refuseCoupled(patches, "the unrefinement closure", "hexRef8.C:5503");
+
+    const std::size_t nPoints = static_cast<std::size_t>(m.nPoints());
+    const std::size_t nCells = static_cast<std::size_t>(m.nCells());
+    std::vector<char> unrefinePoint(nPoints, 0);
+    for (const label p : pointsToUnrefine)
+    {
+        unrefinePoint[static_cast<std::size_t>(p)] = 1;
+    }
+
+    while (true)
+    {
+        // :5415-5425 -- rebuilt from the points every pass, so it can only shrink across passes
+        std::vector<char> unrefineCell(nCells, 0);
+        for (std::size_t pointi = 0; pointi < nPoints; ++pointi)
+        {
+            if (!unrefinePoint[pointi]) continue;
+            for (const label celli : pointCells[pointi])
+            {
+                unrefineCell[static_cast<std::size_t>(celli)] = 1;
+            }
+        }
+
+        // :5435-5489. The levels AFTER unrefinement, and the test is the opposite direction from the
+        // refinement closure's.
+        label nChanged = 0;
+        const label nInternal = m.nInternalFaces();
+        for (label facei = 0; facei < nInternal; ++facei)
+        {
+            const std::size_t own = static_cast<std::size_t>(m.owner()[static_cast<std::size_t>(facei)]);
+            const std::size_t nei = static_cast<std::size_t>(m.neighbour()[static_cast<std::size_t>(facei)]);
+            const label ownLevel = cellLevel[own] - unrefineCell[own];
+            const label neiLevel = cellLevel[nei] - unrefineCell[nei];
+            if (ownLevel < neiLevel - 1)
+            {
+                if (!unrefineCell[own])
+                {
+                    throw std::runtime_error(
+                        std::string(WHO) + "the unrefinement closure met a 2:1 conflict it cannot "
+                        "resolve: cell " + std::to_string(own) + " is finer than its neighbour by "
+                        "more than one level and is not marked. OpenFOAM aborts here too "
+                        "(hexRef8.C:5461-5465).");
+                }
+                unrefineCell[own] = 0;
+                ++nChanged;
+            }
+            else if (neiLevel < ownLevel - 1)
+            {
+                if (!unrefineCell[nei])
+                {
+                    throw std::runtime_error(
+                        std::string(WHO) + "the unrefinement closure met a 2:1 conflict it cannot "
+                        "resolve at cell " + std::to_string(nei) + " (hexRef8.C:5479-5483).");
+                }
+                unrefineCell[nei] = 0;
+                ++nChanged;
+            }
+        }
+        // :5492-5539 -- the boundary half needs the swapped level; without a coupled patch the swap
+        // leaves the owner's own value and both tests are false.
+
+        if (nChanged == 0)
+        {
+            break;
+        }
+
+        // :5561-5576 -- knock out any point one of whose cells can no longer be unrefined
+        for (std::size_t pointi = 0; pointi < nPoints; ++pointi)
+        {
+            if (!unrefinePoint[pointi]) continue;
+            for (const label celli : pointCells[pointi])
+            {
+                if (!unrefineCell[static_cast<std::size_t>(celli)])
+                {
+                    unrefinePoint[pointi] = 0;
+                    break;
+                }
+            }
+        }
+    }
+
+    std::vector<label> out;
+    for (std::size_t pointi = 0; pointi < nPoints; ++pointi)
+    {
+        if (unrefinePoint[pointi]) out.push_back(static_cast<label>(pointi));
+    }
+    return out;
+}
+
+
+std::vector<label> selectUnrefinePoints(
+    scalar                                 unrefineLevel,
+    const std::vector<char>&               markedCell,
+    const std::vector<scalar>&             pFld,
+    const std::vector<label>&              splitPoints,
+    const std::vector<char>&               protectedCell,
+    const std::vector<label>&              cellLevel,
+    const std::vector<std::vector<label>>& pointCells,
+    const PrimitiveMesh&                   m,
+    const std::vector<FvPatch>&            patches)
+{
+    const std::size_t nPoints = static_cast<std::size_t>(m.nPoints());
+
+    // :926-956. Guarded by protectedCell_.size(), which is ZERO when nothing is protected -- the
+    // sentinel initProtectedCells returns, not an array of falses.
+    std::vector<char> protectedPoint(nPoints, 0);
+    if (!protectedCell.empty())
+    {
+        for (std::size_t pointi = 0; pointi < nPoints; ++pointi)
+        {
+            for (const label celli : pointCells[pointi])
+            {
+                if (protectedCell[static_cast<std::size_t>(celli)])
+                {
+                    protectedPoint[pointi] = 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    // :961-982. The field test is STRICT, and `markedCell` vetoes: a point any of whose cells is a
+    // refinement candidate (after the buffer layers) is not unsplit.
+    std::vector<label> newSplitPoints;
+    for (const label pointi : splitPoints)
+    {
+        const std::size_t p = static_cast<std::size_t>(pointi);
+        if (protectedPoint[p] || !(pFld[p] < unrefineLevel)) continue;
+        bool hasMarked = false;
+        for (const label celli : pointCells[p])
+        {
+            if (markedCell[static_cast<std::size_t>(celli)])
+            {
+                hasMarked = true;
+                break;
+            }
+        }
+        if (!hasMarked)
+        {
+            newSplitPoints.push_back(pointi);
+        }
+    }
+
+    // :988-995
+    return consistentUnrefinement(newSplitPoints, /*maxSet=*/false, cellLevel, pointCells, m, patches);
 }
 
 
