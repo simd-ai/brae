@@ -303,9 +303,21 @@ RunReport runInterFoam(
         // still 1.494e-01. What step two starts from that is NOT a field value is the patch's own
         // carried COEFFICIENTS: a mixed condition contributes internalCoeffs and boundaryCoeffs built
         // from its valueFraction, and two patches can hold the same VALUE with different fractions.
-        // The next unit instruments OpenFOAM's own pressurePermeableAlphaInletOutletVelocity to write
-        // valueFraction and refValue at the end of step one and compares those, which is the one thing
-        // here that no field can show. The device loop refuses it at its own site.
+        // THE PATCH'S CARRIED STATE IS EXACT TOO, and OpenFOAM writes it: mixedFvPatchField::write
+        // emits refValue and valueFraction, so U's own file has them. At the end of step one
+        // refValue is 1.353e-13 from OpenFOAM's and valueFraction is EQUAL on all 1050 faces. So
+        // nothing step one leaves behind is wrong -- it is step two's own arithmetic.
+        //
+        // WHERE IN STEP TWO, from the pressure taps against tools/dumpInterFoam at BRAE_DUMP_ITER=2:
+        //     rAU       3.063e-10      the momentum DIAGONAL is right
+        //     HbyA      3.556e-01      UEqn.H() is not
+        //     phiHbyA   1.786e-01, and 3.741e-01 on the wall
+        // rAU is 1/UEqn.A(), so A -- and with it every internalCoeffs the patch contributes -- is
+        // exact, and the whole error is on the SOURCE side of the momentum equation. Two terms live
+        // there and no others: the ddt's rho*V0/dt*U.oldTime(), where V0 is the volumes the mesh had
+        // BEFORE this step's move, and the boundaryCoeffs of the permeable patch. The next unit tells
+        // those two apart -- V0 is a field the step-one state cannot expose, which is why six
+        // comparisons of step-one state found nothing. The device loop refuses it at its own site.
         for (std::size_t pi = 0; pi < patches.size() && pi < f.U.boundary.size(); ++pi)
         {
             const bool permeable = f.U.boundary[pi]->needsAlphaPatchValues()
