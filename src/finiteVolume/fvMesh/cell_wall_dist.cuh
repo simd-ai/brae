@@ -47,7 +47,15 @@ inline std::vector<scalar> cellWallDist(
     // normal pointing OUT of the domain -- away from the fluid, i.e. roughly opposite to (C - origin).
     // ZDES2020 takes max(grad(nuTilda) & n, 0) with this n, so the sign is load-bearing: get it backwards
     // and the shielding fires where it should be dormant.
-    std::vector<vector>* wallNormal = nullptr)
+    std::vector<vector>* wallNormal = nullptr,
+    // meshWavePatchDistMethod.C:59 reads `correctWalls` (default true) and hands it to
+    // `patchWave(mesh, patchIDs, correctWalls_)` at :84. patchWave::correct() (patchWave.C:178-236)
+    // always runs the wave and takes the cell value from it, and only THEN, `if (correctWalls_)`,
+    // overwrites the wall-adjacent cells with the exact distance to the face POLYGON. So `false` skips
+    // that block entirely and those cells keep the wave's face-CENTRE distance -- strictly less work,
+    // and it changes only cells that own or touch a wall face. Hardcoded true until now, and the
+    // interFoam reader refused a case that asked for false. Last, so no positional caller moves.
+    bool correctWalls = true)
 {
     const std::vector<vector>& C   = g.C();
     const std::vector<vector>& Cf  = g.Cf();
@@ -181,6 +189,8 @@ inline std::vector<scalar> cellWallDist(
     for (label c = 0; c < nCells; ++c)
         if (cellSet[c]) y[c] = std::sqrt(cellD2[c]);
 
+    if (correctWalls)
+    {
     // correctWalls = correctBoundaryFaceCells THEN correctBoundaryPointCells (cellDistFuncs.C), in that order:
     // a cell already corrected by its own wall face is NOT overwritten by the point pass.
     const std::vector<vector>& pts = m.points();
@@ -278,6 +288,8 @@ inline std::vector<scalar> cellWallDist(
             }
         }
     }
+
+    }   // correctWalls -- patchWave.C:203
 
     // the wave's nearest wall-face centre per reached cell -> the IDDES wall-normal direction (C - origin). Cells the
     // wave never reached keep the default (C, degenerate). Does not alter y (the correctWalls override above is intact).

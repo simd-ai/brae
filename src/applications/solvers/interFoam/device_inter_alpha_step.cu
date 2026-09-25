@@ -33,16 +33,16 @@ void deviceInterAlphaStep(
     DeviceBuffer<scalar>&            mu,
     DeviceBuffer<scalar>&            nu)
 {
-    if (ctl.alphaApplyPrevCorr)
+    // `alphaApplyPrevCorr` IS A NO-OP WITHOUT `MULESCorr`, so the pair is what gates these checks.
+    // alphaEqn.H APPLIES the previous correction only at :133, inside the `if (MULESCorr)` block opened
+    // at :99, and STORES it only at :228 under `alphaApplyPrevCorr && MULESCorr`; without MULESCorr
+    // talphaPhi1Corr0 is cleared every step and the switch does nothing. The host path already reads it
+    // that way (alpha_eqn_cpp.cu:552, :731); this REFUSED instead, stopping on a case OpenFOAM runs.
+    //
+    // NOT an early `return` -- this is the top of deviceInterAlphaStep, and returning here would skip
+    // the whole alpha equation.
+    if (ctl.alphaApplyPrevCorr && ctl.MULESCorr)
     {
-        if (!ctl.MULESCorr)
-        {
-            // alphaEqn.H:228 tests `alphaApplyPrevCorr && MULESCorr`; without MULESCorr the switch does
-            // nothing in OpenFOAM either, and saying so beats a cache nobody reads
-            throw std::runtime_error(
-                "brae interFoam device alpha step: `alphaApplyPrevCorr yes` without `MULESCorr yes`. "
-                "OpenFOAM only ever applies the previous correction inside the MULESCorr block.");
-        }
         if (!ctl.prevCorrInt || !ctl.prevCorrBnd)
         {
             throw std::runtime_error(

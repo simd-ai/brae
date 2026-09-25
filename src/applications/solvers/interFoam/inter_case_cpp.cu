@@ -663,6 +663,13 @@ InterFields buildInterFields(const std::string&          caseDir,
     InterFields f;
     const label nC = m.nCells();
 
+    // THIS SOLVER HONOURS Cmu/kappa/E PER PATCH on both closures -- kEpsilon has since its port
+    // (kEpsilon_cpp.cu:443, :912) and kOmegaSST does now -- so the reader must not announce those entries
+    // as unhonoured. The flag was set by rhoSimpleFoam alone, so every interFoam case printed a notice
+    // saying brae applies a model-wide value where it does not. A patch `beta1` IS still model-wide on
+    // the DEVICE arm, and that is a refusal there rather than a notice here.
+    brae::perPatchWallCoeffsHonoured() = true;
+
     // --- the dictionaries ---------------------------------------------------------------------
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
     refuseUnportedCaseInputs(caseDir, controlDict);
@@ -838,17 +845,41 @@ InterFields buildInterFields(const std::string&          caseDir,
         // initCorrectPhi.H: under correctPhi, rAU is a field kept across steps, READ_IF_PRESENT and
         // 1 when absent; pEqn.H:4 then assigns 1/UEqn.A() into it and never clears it, so every mesh
         // update's CorrectPhi interpolates the LAST corrector's rAU
+        // initCorrectPhi.H:5-17 -- READ_IF_PRESENT with a default of 1, and `#include "correctPhi.H"`
+        // immediately after, so on a RESTART the very FIRST CorrectPhi interpolates the file's rAU and
+        // not 1. It is AUTO_WRITE, so any case that wrote a time directory under `correctPhi` has one.
+        // This used to refuse the file's presence; brae now reads it, as OpenFOAM does.
         f.rAU.assign(static_cast<std::size_t>(m.nCells()), scalar(1));
-        if (f.correctPhi
-            && (std::filesystem::exists(startDir + "/rAU") || std::filesystem::exists(startDir + "/rAU.gz")))
+        if (f.correctPhi)
         {
-            throw std::runtime_error(
-                "brae interFoam: " + startDir + "/rAU exists. initCorrectPhi.H reads it (READ_IF_PRESENT) "
-                "as the rAU the first CorrectPhi interpolates; brae starts from 1, which is what "
-                "OpenFOAM does only without the file.");
+            const std::string rAUpath = std::filesystem::exists(startDir + "/rAU")
+                                      ? startDir + "/rAU"
+                                      : (std::filesystem::exists(startDir + "/rAU.gz")
+                                         ? startDir + "/rAU.gz" : std::string());
+            if (!rAUpath.empty())
+            {
+                const FieldData<scalar> rAUdata = readField<scalar>(rAUpath);
+                if (rAUdata.internalUniform)
+                {
+                    f.rAU.assign(static_cast<std::size_t>(m.nCells()), rAUdata.internalUniformValue);
+                }
+                else
+                {
+                    if (rAUdata.internalField.size() != static_cast<std::size_t>(m.nCells()))
+                        throw std::runtime_error(
+                            "brae interFoam: " + rAUpath + " holds "
+                            + std::to_string(rAUdata.internalField.size()) + " values for "
+                            + std::to_string(m.nCells()) + " cells.");
+                    f.rAU = rAUdata.internalField;
+                }
+            }
         }
     }
 
+    // `minIter` on U reaches the momentum solve on BOTH arms now, but the DEVICE honours it only on the
+    // Gauss-Seidel branch: deviceJacobiBiCGStab takes no minIter argument, so a case naming `minIter`
+    // beside a solver that is not smoothSolver would silently stop a sweep short there. Refused in the
+    // driver rather than here, because it is a device-arm limit and the host runs it.
     // solvers/<alpha> -- the linear solve of the MULESCorr pre-solve. A case without MULESCorr never
     // solves for alpha and need not name a solver (capillaryRise does not).
     {
@@ -896,11 +927,6 @@ InterFields buildInterFields(const std::string&          caseDir,
                       "on the last outer corrector, U on the others -- and OpenFOAM stops without it.");
             }
             out = SmoothLinearSolve::read(*d);
-            if (out.minIter > 0)
-                throw std::runtime_error(
-                    std::string("brae interFoam: `solvers/") + name + "` names `minIter "
-                    + std::to_string(out.minIter) + "`, which the momentum predictor does not honour "
-                    "yet. Refused rather than stop a sweep earlier than OpenFOAM does.");
             if (!out.gaussSeidel())
             {
                 noticeApproximated(std::string("interFoam ") + name + " solve",

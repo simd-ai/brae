@@ -544,14 +544,22 @@ RunReport runInterFoam(
     const CorrectPhiControls cpc = correctPhiControlsOf(f, gamgCache);
 
     // initCorrectPhi.H, which runs for EVERY case, moving or not and with correctPhi or without: CorrectPhi
-    // on the phi createFields built, with rAUf exactly 1. At rest it is exact and costs one solve of
-    // zero iterations; on a case that starts moving it makes the first alpha step convect a flux that
-    // is divergence-free. It runs BEFORE the old-time copies below, so phi.oldTime() is the corrected
-    // flux, and before the first Courant number reads it.
+    // on the phi createFields built. It runs BEFORE the old-time copies below, so phi.oldTime() is the
+    // corrected flux, and before the first Courant number reads it.
+    //
+    // ITS rAUf IS NOT ALWAYS 1, and this site used to pass 1 unconditionally. initCorrectPhi.H's two
+    // branches are identical except for that argument: under `correctPhi` it is
+    // `fvc::interpolate(rAU())` (correctPhi.H:6) where rAU is the READ_IF_PRESENT field, and only the
+    // `else` branch passes a literal 1 (initCorrectPhi.H:28). On a COLD start rAU defaults to 1 and the
+    // two coincide, which is why every gate agreed; on a RESTART rAU is the file's -- MEASURED on a
+    // static damBreak with `correctPhi yes`, 9.9e-07 .. 1.0e-03 -- and passing 1 instead put brae's
+    // p_rgh initial residuals 2.5e-04 from OpenFOAM's for the whole run, with every iteration count
+    // still matching. Found by the rAU restart arm of tests/interfoam_dambreak_vs_openfoam.sh.
     {
         const SurfaceScalarField one = unitFaceField(m, patches);
+        const SurfaceScalarField rAUfStart = f.correctPhi ? fvc::interpolate(f.rAU, m, g, patches) : one;
         CorrectPhiInput cin;
-        cin.rAUf = &one;
+        cin.rAUf = &rAUfStart;
         cin.meshChanging = false;
         cin.rhoPhi = &f.rhoPhi;
         cin.solveLog = &rep.pcorrSolves;
@@ -1078,6 +1086,7 @@ RunReport runInterFoam(
                         msc.tolU = us.tol;
                         msc.relTolU = us.relTol;
                         msc.maxIterU = us.maxIter;
+                        msc.minIterU = us.minIter;
                         msc.which.smoothSolver = us.gaussSeidel();
                         msc.which.symmetric = (us.smoother == "symGaussSeidel");
                         msc.which.nSweeps = us.nSweeps;

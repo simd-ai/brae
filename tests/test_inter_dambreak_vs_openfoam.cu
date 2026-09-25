@@ -82,7 +82,18 @@ int main(int argc, char** argv)
     // nNonOrthogonalCorrectors 1, momentumPredictor yes. The device REFUSES the first two.
     const std::string profileName = argc > 7 ? argv[7] : "";
     const bool nOuter = profileName == "nouter", nonOrth = profileName == "nonorth";
-    const bool momPred = profileName == "mompred";
+    // `momminiter`: the momentum entry names `minIter 1` at a loose tolerance, the twin of
+    // `alphaminiter`. lduMatrix::solver::stop runs the loop on while nIterations_ < minIter_ even when
+    // the residual is already under the tolerance, so a U solve that enters converged still sweeps.
+    // brae hardcoded 0 at the momentum solve and the reader refused a case naming one.
+    // `raurestart`: a STATIC mesh with `correctPhi yes`, restarted from the directory OpenFOAM wrote.
+    // initCorrectPhi.H:5-17 reads rAU READ_IF_PRESENT with a default of 1 and includes correctPhi.H
+    // immediately after, so the FIRST CorrectPhi of a restart interpolates the file's rAU. brae REFUSED
+    // the file's presence. A MOVING restart is blocked by a different refusal that stands (brae reads the
+    // mesh from constant/polyMesh only), which is why the fixture's mesh does not move.
+    const bool rauRestart = profileName == "raurestart";
+    const bool momMinIter = profileName == "momminiter";
+    const bool momPred = profileName == "mompred" || momMinIter;
     // `rhophi`: the atmosphere's three flux-conditional conditions all name `phi rhoPhi;`. The device
     // runs U's switch itself and reads phi there, so it refuses the case.
     const bool namedFlux = profileName == "rhophi";
@@ -116,7 +127,7 @@ int main(int argc, char** argv)
     // 1e-06 of p_rgh (see the script). The device refuses it.
     const bool nHatLimited = profileName == "nHatLimited";
     const bool pimpleProfile = nOuter || nonOrth || momPred || namedFlux || vanLeerV || linear || compression
-                            || alphaMinIter || gradLsqLimited;
+                            || alphaMinIter || momMinIter || gradLsqLimited;
     // `nonorth` RUNS on the device: its pressure step carries the non-orthogonal loop (transcribed from
     // the host's pressureCorrector), and the device arm below holds it to OpenFOAM
     // `sheared` RUNS on the device too: the non-orthogonal correction is on that path now, and the
@@ -140,6 +151,7 @@ int main(int argc, char** argv)
               : prevCorr ? "prevcorr -- alphaApplyPrevCorr yes, at the big step"
               : nOuter ? "nouter -- nOuterCorrectors 2, at the big step"
               : nonOrth ? "nonorth -- nNonOrthogonalCorrectors 1, at the big step"
+              : momMinIter ? "momminiter -- momentumPredictor yes with `minIter 1` at tolerance 0.5"
               : momPred ? "mompred -- momentumPredictor yes, at the big step"
               : namedFlux ? "rhophi -- the atmosphere's conditions all name phi rhoPhi, at the big step"
               : compression ? "compression -- div(phirb,alpha) Gauss interfaceCompression, at the big step"
@@ -169,6 +181,26 @@ int main(int argc, char** argv)
     InterFields fin;
     const RunReport r = runInterFoam(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/true, &fin);
     check("brae ran the same number of steps", r.steps == nSteps);
+    if (rauRestart)
+    {
+        // WHAT IS ON DISK, and that it can witness the fix. argv[8] is the directory the restart starts
+        // FROM -- where OpenFOAM wrote the rAU under test.
+        check("the restart was given the directory it started from", argc > 8);
+        if (argc > 8)
+        {
+            const FieldData<scalar> onDisk = readField<scalar>(std::string(argv[8]) + "/rAU");
+            check("...which holds a NON-UNIFORM rAU", !onDisk.internalUniform);
+            scalar wMax = 0;
+            for (const scalar v : onDisk.internalField) wMax = std::fmax(wMax, std::fabs(v));
+            std::printf("  rAU on disk: %zu cells, max %.6g   (a cold start would use 1)\n",
+                        onDisk.internalField.size(), (double)wMax);
+            check("...with one value per cell",
+                  onDisk.internalField.size() == static_cast<std::size_t>(nC));
+            // THE ARM CANNOT WITNESS THE DEFAULT unless the file is far from it. MEASURED on this
+            // fixture: 9.9e-07 .. 1.0e-03, three to six orders below 1.
+            check("...far enough from 1 that using the default instead is visible", wMax < scalar(0.5));
+        }
+    }
 
     // THE SOLVER'S OWN LOG AGAINST OpenFOAM'S. The field bounds below tightened by four orders when the
     // host took the case's PCG with DIC and its per-corrector p_rgh/p_rghFinal selection; this arm is
@@ -380,6 +412,7 @@ int main(int argc, char** argv)
         const char* what = prevCorrSub ? "nAlphaSubCycles 2"
                          : nOuter ? "nOuterCorrectors 2"
                          : nonOrth ? "nNonOrthogonalCorrectors 1"
+                         : momMinIter ? "minIter 1 on the momentum solve"
                          : momPred ? "momentumPredictor yes"
                          : namedFlux ? "phi rhoPhi"
                          : vanLeerV ? "div(rhoPhi,U) Gauss vanLeerV"
@@ -389,7 +422,39 @@ int main(int argc, char** argv)
                          : nHatLimited ? "nHat cellLimited Gauss linear 1"
                                   : "alphaApplyPrevCorr yes";
         check("the control was given OpenFOAM's answer without the setting under test", argc > 8);
-        if (argc > 8 && alphaMinIter)
+        if (argc > 8 && momMinIter)
+        {
+            // THE CASE SETTING, in brae's own struct first -- without this the arm would pass on a brae
+            // that never saw the entry.
+            std::printf("  READ: UFinal tolerance %.3g minIter %d\n",
+                        (double)fin.uSolveFinal.tol, fin.uSolveFinal.minIter);
+            check("brae read `minIter 1` on the momentum solver entry", fin.uSolveFinal.minIter == 1);
+            check("...at the loose tolerance that makes it the only reason to sweep",
+                  fin.uSolveFinal.tol == scalar(0.5));
+            // AND THE ORACLE HAS TO HAVE TAKEN A SWEEP IT DID NOT NEED: a U solve whose initial residual
+            // is already under 0.5 and which still reports one iteration.
+            std::size_t forced = 0;
+            for (const LinearSolveRecord& q : ofUx)
+            {
+                forced += (q.initialResidual < scalar(0.5) && q.nIterations == 1) ? 1 : 0;
+            }
+            std::printf("  OpenFOAM took %zu Ux sweeps that only minIter asked for\n", forced);
+            check("...and OpenFOAM took at least one sweep only minIter asked for", forced > 0);
+            // THE CONTROL is the same case with the predictor on and NO minIter: its sweep counts must
+            // differ, or the counts brae is held to cannot tell minIter from its absence.
+            const std::string offLog = std::filesystem::path(argv[8]).parent_path().string() + "/log.interFoam";
+            const std::vector<LinearSolveRecord> offUx = brae::gatecheck::readOfSolves(offLog, "Ux");
+            std::size_t differ = 0;
+            for (std::size_t k = 0; k < offUx.size() && k < ofUx.size(); ++k)
+            {
+                differ += (offUx[k].nIterations != ofUx[k].nIterations) ? 1 : 0;
+            }
+            std::printf("  CONTROL: without `minIter 1` OpenFOAM logs %zu of %zu Ux sweep counts differently\n",
+                        differ, ofUx.size());
+            check("...so the sweep counts brae is held to can tell minIter from its absence",
+                  !ofUx.empty() && offUx.size() == ofUx.size() && differ > 0);
+        }
+        else if (argc > 8 && alphaMinIter)
         {
             // minIter DOES NOT MOVE damBreak's FIELDS: the one pre-solve that starts under tolerance is the
             // first, and it starts on an exact solution, so the forced sweep changes nothing (measured at

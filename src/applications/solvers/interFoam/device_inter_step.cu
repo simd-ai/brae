@@ -437,8 +437,8 @@ void deviceInterStep(
             if (ctl.momentum.smoothSolver)
             {
                 deviceSymGaussSeidel(Ak, b, *Uk[k], dNf.data(), ctl.momentum.tol, ctl.momentum.relTol,
-                                     ctl.momentum.maxIter, &perf, /*minIter=*/0, ctl.momentum.nSweeps,
-                                     ctl.momentum.symmetric);
+                                     ctl.momentum.maxIter, &perf, ctl.momentum.minIter,
+                                     ctl.momentum.nSweeps, ctl.momentum.symmetric);
             }
             else
             {

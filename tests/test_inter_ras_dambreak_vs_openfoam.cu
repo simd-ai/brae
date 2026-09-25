@@ -133,9 +133,15 @@ int main(
     // FIELD's name. The closure took k's for both until this profile; the device still refuses.
     const bool splitDivSST = (profile == "splitDivSST");
     const bool splitDiv = (profile == "splitDiv") || splitDivSST;
+    // `lowRe`: the epsilon wall patches name `lowReCorrection true`, which switches epsilon to the
+    // resolved form on faces with y+ < yPlusLam and drops their wall production. Parsed by brae's reader
+    // all along and read by nothing under interFoam.
+    const bool lowRe = (profile == "lowRe") || (profile == "lowReOff");
+    const bool lowReOn = (profile == "lowRe");
     const char* secondName = (sst || frozenSST || splitSolveSST || splitDivSST) ? "omega" : "epsilon";
     std::printf("  profile: %s\n",
-                splitDivSST ? "splitDivSST -- div(phi,omega) limitedLinear beside div(phi,k) upwind"
+                lowRe ? "lowRe -- epsilonWallFunction with lowReCorrection true"
+              : splitDivSST ? "splitDivSST -- div(phi,omega) limitedLinear beside div(phi,k) upwind"
               : splitDiv ? "splitDiv -- div(phi,epsilon) limitedLinear beside div(phi,k) upwind"
               : splitSolveSST ? "splitSolveSST -- omegaFinal its own entry, tolerance 1e-12 and 2 sweeps"
               : splitSolve ? "splitSolve -- epsilonFinal its own entry, tolerance 1e-12 and 2 sweeps"
@@ -209,6 +215,15 @@ int main(
         check("brae read div(phi,k) as the case's own Gauss upwind", !t.kDiv.limitedLinear);
         check("...and the second field's as Gauss limitedLinear 1",
               t.secondDiv.limitedLinear && t.secondDiv.limiterCoeff == scalar(1));
+    }
+
+    if (lowRe)
+    {
+        // THE FLAG, in brae's own struct: without this the arm would pass on a brae that parsed the entry
+        // and threaded nothing, which is exactly the defect it exists to hold.
+        check(lowReOn ? "brae read `lowReCorrection` off the epsilon wall patches"
+                      : "...and the control run has it OFF, so the pair differs in that entry alone",
+              fin.turbulence.coeffs.epsLowRe == lowReOn);
     }
 
     auto readCells = [&](const std::string& path)
@@ -415,7 +430,10 @@ int main(
     // MEASURED for nutAtmosphere against plain uniform: U 2.7e-03, nut 4.7e-02 -- 20 of the atmosphere's
     // 46 faces take air IN at t = 0.005, where the inletValue stands in for the cell's nut
     // ...and the second outer corrector against one: MEASURED U 4.6e-02 at t = 0.005
-    check(splitDiv ? "...and limitedLinear on the second equation alone moves OpenFOAM's U against upwind "
+    check(lowRe ? "...and `lowReCorrection` moves OpenFOAM's own U by more than 1% against the log law. At "
+                  "the tutorial's own nu = 1e-6 it moves it by EXACTLY ZERO -- no face has y+ under "
+                  "yPlusLam -- which is why this profile raises the water viscosity to 1e-2"
+          : splitDiv ? "...and limitedLinear on the second equation alone moves OpenFOAM's U against upwind "
                      "on both -- a different matrix, not a different stopping point"
           : splitSolve ? "...and the second equation's own solver entry moves OpenFOAM's U at all against "
                        "one entry for both -- it is a stopping point, so the move is small and the "
@@ -428,7 +446,8 @@ int main(
           : nutAtmosphere ? "...and the atmosphere's inletOutlet nut moves it by more than 1e-3"
           : custom ? "...and the custom settings move it by more than 1%"
                    : "...and the lineage moves it by more than 10%, so `density` is live on this fixture",
-          dOtherU.rel() > (nutAtmosphere ? scalar(1e-3)
+          dOtherU.rel() > (lowRe ? scalar(0.01)
+                         : nutAtmosphere ? scalar(1e-3)
                          // MEASURED: kEpsilon 1.5e-04 of U (nut 4.5e-03), kOmegaSST 2.4e-05 (nut
                          // 2.2e-04) -- the SST closure's omega is far less sensitive to its convection
                          // scheme here than kEpsilon's epsilon is. brae is 1.3e-14 and 1.1e-12 from

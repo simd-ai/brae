@@ -452,7 +452,8 @@ void momentumPredictor(GeometricField<vector>&     U,
     FvVectorMatrix solved = UEqnOut;
     addMomentumPredictorSource(solved, faceForce, m, g, patches);
     SolverPerformance perf[3];
-    solveVector(solved, U, m, patches, sc.tolU, sc.relTolU, sc.maxIterU, 0, sc.solutionD, perf, &sc.which);
+    solveVector(solved, U, m, patches, sc.tolU, sc.relTolU, sc.maxIterU, sc.minIterU, sc.solutionD,
+                perf, &sc.which);
     // fvMatrix::solve() ends with psi.correctBoundaryConditions(); solveVector's evaluateBoundary() is
     // only half of that for a flux-conditional patch -- see updateVelocityPatchesFromCells.
     updateVelocityPatchesFromCells(U, patches);

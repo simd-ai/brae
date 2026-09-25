@@ -303,6 +303,23 @@ int main(
               dShipN.rel() > scalar(1000)*std::fmax(dN.rel(), scalar(1e-14)) && dShipN.rel() > floor);
     }
 
+    // DOES THIS CASE NAME A PATCH beta1? Read from the fields brae already built, so the assertion below
+    // fires exactly on the cases that have the feature and no profile string has to be kept in step.
+    bool patchBeta1Differs = false;
+    for (std::size_t pi = 0; pi < patches.size() && !fin.turbulence.omega.internal.empty(); ++pi)
+    {
+        if (patches[pi].type != "wall") continue;
+        if (fin.turbulence.omega.boundary[pi]->wallCoeffs().beta1 != fin.turbulence.sstCoeffs.beta1)
+        {
+            patchBeta1Differs = true;
+        }
+    }
+    if (patchBeta1Differs)
+    {
+        std::printf("  this case's omega wall patch names its OWN beta1 -- the host honours it, the "
+                    "device refuses\n");
+    }
+
     // THE DEVICE LOOP REFUSES, by name
     int nDev = 0;
     if (cudaGetDeviceCount(&nDev) != cudaSuccess)
@@ -313,6 +330,28 @@ int main(
     if (nDev <= 0)
     {
         std::printf("  (no CUDA device: the device refusal is not exercised)\n");
+    }
+    else if (patchBeta1Differs)
+    {
+        // THE DEVICE REFUSES A PATCH `beta1`, and the condition is read from the CASE rather than passed
+        // as a profile name: omegaWallFunction reads its own beta1 from the patch dictionary
+        // (omegaWallFunctionFvPatchScalarField.C:404-409) and the host closure uses it, while the device
+        // kernel takes one beta1 for the whole field (device_komega_sst.cu:371). Refused there rather
+        // than run the model's value at the wall.
+        InterFields dev;
+        bool named = false;
+        try
+        {
+            runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
+            std::printf("  FAIL the device arm RAN a case whose omega patch names its own beta1\n");
+            ++failures;
+        }
+        catch (const std::exception& e)
+        {
+            named = std::string(e.what()).find("its own omegaWallFunction coefficient") != std::string::npos;
+            std::printf("  device refusal: %s\n", e.what());
+        }
+        check("the device arm refuses a patch beta1 under its own name", named);
     }
     else
     {

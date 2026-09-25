@@ -94,7 +94,7 @@ stage()
     case "$profile" in
         laminar)
             sed -i 's/^simulationType .*/simulationType laminar;/' "$C/constant/turbulenceProperties" ;;
-        uniform|custom|nutAtmosphere|sst|frozen|frozenFloored|frozenSST|splitSolve|splitSolveSST|splitDiv|splitDivSST)
+        uniform|custom|nutAtmosphere|sst|frozen|frozenFloored|frozenSST|splitSolve|splitSolveSST|splitDiv|splitDivSST|lowRe|lowReOff)
             sed -i '/^density /d' "$C/constant/turbulenceProperties"
             sed -i 's/^\( *\)div(rhoPhi,k) .*/\1div(phi,k)      Gauss upwind;/; s/^\( *\)div(rhoPhi,epsilon) .*/\1div(phi,epsilon) Gauss upwind;/' \
                 "$C/system/fvSchemes"
@@ -234,6 +234,43 @@ DIVEOF
         grep -q "div(phi,$SECF) Gauss limitedLinear 1;" "$C/system/fvSchemes" \
             || { echo "FAIL: the second field's div entry was not changed"; return 1; }
     fi
+    # `lowRe` / `lowReOff`: a PAIR, identical but for `lowReCorrection` on the epsilon wall patches. On a
+    # face with y+ < yPlusLam epsilonWallFunction switches epsilon to the RESOLVED form 2*k*nu/y^2 and
+    # contributes NO wall production (epsilonWallFunctionFvPatchScalarField.C:242, :338) -- a different
+    # BRANCH, not a scaling. brae parsed the entry and NOTHING under interFoam read it, so the branch
+    # could never fire.
+    #
+    # BOTH RAISE THE WATER VISCOSITY TO 1e-2, and that is what makes the arm possible: at the tutorial`s
+    # own nu = 1e-6 no face on this mesh has y+ under yPlusLam, so the switch changes NOTHING -- measured,
+    # OpenFOAM against itself, 0.0000e+00 on every field. At 1e-2 the wall is resolved and it moves
+    # OpenFOAM`s own epsilon on all 2268 cells, worst relative 7.8e+00. The twin is the control, because
+    # the raised nu means no other profile is comparable.
+    if [ "$profile" = lowRe ] || [ "$profile" = lowReOff ]; then
+        LOWRE_ON=0
+        [ "$profile" = lowRe ] && LOWRE_ON=1
+        LOWRE_ON="$LOWRE_ON" python3 - "$C" <<'LOWEOF' || { echo "FAIL: the $profile profile was not staged"; return 1; }
+import os, re, sys
+d = sys.argv[1]
+q = d + "/constant/transportProperties"
+t = open(q).read()
+t, n = re.subn(r"(water\s*\{[^}]*?nu\s+)\[?[^;\]]*\]?;", r"\g<1>1e-2;", t, flags=re.S)
+if n == 0:
+    t, n = re.subn(r"nu\s+1e-06;", "nu              1e-2;", t, count=1)
+assert n >= 1, "could not raise the water viscosity"
+open(q, "w").write(t)
+if os.environ["LOWRE_ON"] == "1":
+    q = d + "/0/epsilon"
+    t = open(q).read()
+    t, n = re.subn(r"(type\s+epsilonWallFunction;\n)", r"\1        lowReCorrection true;\n", t)
+    assert n >= 1, "no epsilonWallFunction entry in 0/epsilon"
+    open(q, "w").write(t)
+    print("  epsilon: lowReCorrection set on %d wall patch(es), water nu raised to 1e-2" % n)
+else:
+    print("  water nu raised to 1e-2, lowReCorrection left off (the control)")
+LOWEOF
+        grep -q "1e-2;" "$C/constant/transportProperties" \
+            || { echo "FAIL: the viscosity was not raised"; return 1; }
+    fi
     # `outer`: the shipped case with nOuterCorrectors 2 -- the second pass starts from the first pass's
     # alpha, U and phi, and every once-per-step update must stay once per step. The DEVICE alpha step
     # reset alpha1 to its old time at the start of every pass until this profile measured it: the
@@ -306,7 +343,7 @@ PYEOF
 }
 
 rc=0
-for p in laminar variable uniform custom nutAtmosphere sst outer frozen frozenFloored frozenSST splitSolve splitSolveSST splitDiv splitDivSST; do
+for p in laminar variable uniform custom nutAtmosphere sst outer frozen frozenFloored frozenSST splitSolve splitSolveSST splitDiv splitDivSST lowReOff lowRe; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_ras_dambreak_vs_openfoam: staging failed"; exit 1; }
@@ -349,6 +386,9 @@ done
        splitDiv uniform "$W/laminar/$END" "$W/uniform/$END" || rc=1
 "$BIN" "$W/splitDivSST" "$W/splitDivSST/0" "$W/splitDivSST/$END" "$STEPS" "$W/splitDivSST/log.interFoam" \
        splitDivSST uniform "$W/laminar/$END" "$W/sst/$END" || rc=1
+# ...and epsilonWallFunction's `lowReCorrection`, whose control is the `uniform` run in the log law.
+"$BIN" "$W/lowRe" "$W/lowRe/0" "$W/lowRe/$END" "$STEPS" "$W/lowRe/log.interFoam" \
+       lowRe uniform "$W/laminar/$END" "$W/lowReOff/$END" || rc=1
 
 echo "interfoam_ras_dambreak_vs_openfoam: rc $rc"
 exit $rc

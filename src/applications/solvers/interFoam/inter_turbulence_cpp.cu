@@ -596,6 +596,42 @@ InterTurbulence readInterTurbulence(
     bound(t.k, t.coeffs.kMin, *mesh, *geometry, patches, "k");
     bound(t.epsilon, t.coeffs.epsilonMin, *mesh, *geometry, patches, "epsilon");
     t.nutWallKind = readNutWallKinds(startDir, t.epsilon, patches);
+    // epsilonWallFunction's `lowReCorrection`, off the epsilon BC that names it
+    // (epsilonWallFunctionFvPatchScalarField.C:373, :414). On a face with y+ < yPlusLam it switches
+    // epsilon to the RESOLVED form 2*k*nu/y^2 and contributes NO wall production (:242, :338) -- a
+    // different branch, not a scaling.
+    //
+    // NOTHING IN interFoam READ IT. The reader has parsed it into PatchFieldData::epsLowRe all along and
+    // the single-phase drivers thread it (turbulence_setup.cuh:784-791), but no interFoam site did, so
+    // `t.coeffs.epsLowRe` stayed false and kEpsilon_cpp.cu's low-Re branch could never fire: a case
+    // asking for it got the high-Re log-law epsilon with no notice. The entry sits inside a
+    // boundaryField patch dictionary, which the defaults audit does not track per key, which is why it
+    // went unseen.
+    {
+        const FieldData<scalar> epsRaw = readField<scalar>(startDir + "/epsilon");
+        for (const auto& pb : epsRaw.boundary)
+        {
+            if (pb.type == "epsilonWallFunction" && pb.epsLowRe)
+            {
+                t.coeffs.epsLowRe = true;
+            }
+        }
+        // ONE FLAG FOR EVERY WALL is what the closure carries (KEpsilonCoeffs::epsLowRe), while OpenFOAM
+        // reads it per patch. A case that sets it on some walls and not others would run it on all of
+        // them here, so that is refused rather than approximated.
+        if (t.coeffs.epsLowRe)
+        {
+            for (const auto& pb : epsRaw.boundary)
+            {
+                if (pb.type != "epsilonWallFunction" || pb.epsLowRe) continue;
+                throw std::runtime_error(
+                    std::string(WHO) + "epsilon patch `" + pb.name + "` is an epsilonWallFunction WITHOUT "
+                    "`lowReCorrection` while another wall has it. OpenFOAM reads the switch per patch; "
+                    "this closure carries one flag for every wall, so running it would apply the "
+                    "resolved-sublayer branch on a wall the case left in the log law.");
+            }
+        }
+    }
     // the closure tells k's and epsilon's flux-conditional patches the volumetric phi and nothing else
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {

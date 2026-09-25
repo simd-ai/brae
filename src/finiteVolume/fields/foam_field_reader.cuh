@@ -23,6 +23,27 @@
 
 namespace brae {
 
+// Foam::Switch on a TOKEN, the boundaryField form. FoamDict::switchOr does this for a dictionary entry;
+// the patch dictionaries here are read straight off a TokenStream, so they need the same table.
+// Switch.C:92-137: `false no off none 0 f n` and `true yes on any 1 t y`, and anything else is
+// OpenFOAM's `Unknown switch <str>` FatalError -- NOT false. Five patch switches in this file tested
+// `{true,yes,on,1}` and read every other word, including OpenFOAM's own `any`, `t` and `y`, as FALSE:
+// each of those silently runs a BC feature the case switched ON.
+inline bool ofSwitchToken(
+    const std::string& v,
+    const char*        key)
+{
+    if (v == "true" || v == "yes" || v == "on" || v == "any" || v == "1" || v == "t" || v == "y")
+    {
+        return true;
+    }
+    if (v == "false" || v == "no" || v == "off" || v == "none" || v == "0" || v == "f" || v == "n")
+    {
+        return false;
+    }
+    throw std::runtime_error("Unknown switch " + v + " for entry `" + std::string(key) + "`");
+}
+
 template <typename T> inline T readFoamValue(TokenStream& ts);
 template <> inline scalar readFoamValue<scalar>(TokenStream& ts) { return ts.nextScalar(); }
 template <> inline vector readFoamValue<vector>(TokenStream& ts)
@@ -116,6 +137,9 @@ struct PatchFieldData
     // may differ; brae applies one model-wide value per closure. Parsed so a per-patch value can be
     // ANNOUNCED instead of skipped (item 16h); honouring it per patch is queued as 16h-port.
     scalar         wfCmu = 0.09, wfKappa = 0.41, wfE = 9.8;
+    // omegaWallFunction's own, from the PATCH dict (omegaWallFunctionFvPatchScalarField.C:408)
+    scalar         wfBeta1 = 0.075;
+    bool           hasWfBeta1 = false;
     bool           hasWfCmu = false, hasWfKappa = false, hasWfE = false;
     // ...and the VISCOUS/INERTIAL SUBLAYER BLENDING those four wall functions also read from the patch
     // dictionary (wallFunctionBlenders.C:59-82: `blending`, one of stepwise/max/binomial/exponential/
@@ -789,13 +813,13 @@ inline FieldData<T> readField(const std::string& path)
                     else if (key == "boundNut")   // atmNutkWallFunction: clamp nut>=0 (true/false)
                     {
                         const std::string v = ts.next();
-                        p.atmBoundNut = (v == "true" || v == "yes" || v == "on" || v == "1");
+                        p.atmBoundNut = ofSwitchToken(v, "boundNut");
                         ts.expect(";");
                     }
                     else if (key == "lowReCorrection")   // epsilonWallFunction: resolved-sublayer branch
                     {
                         const std::string v = ts.next();
-                        p.epsLowRe = (v == "true" || v == "yes" || v == "on" || v == "1");
+                        p.epsLowRe = ofSwitchToken(v, "lowReCorrection");
                         ts.expect(";");
                     }
                     else if (key == "flowDir" || key == "zDir")
@@ -844,7 +868,7 @@ inline FieldData<T> readField(const std::string& path)
                         if (key == "kappa") p.ablKappa = v;
                         else p.ablCmu = v;
                     }
-                    else if ((key == "kappa" || key == "Cmu" || key == "E") && !p.hasABL)
+                    else if ((key == "kappa" || key == "Cmu" || key == "E" || key == "beta1") && !p.hasABL)
                     {
                         // A wall function's own coefficients (see PatchFieldData). Stored on every
                         // non-ABL entry that carries them; whether the entry IS a wall function is
@@ -858,6 +882,7 @@ inline FieldData<T> readField(const std::string& path)
                         ts.expect(";");
                         if      (key == "kappa") { p.wfKappa = v; p.hasWfKappa = true; }
                         else if (key == "Cmu")   { p.wfCmu   = v; p.hasWfCmu   = true; p.Cmu = v; }
+                        else if (key == "beta1") { p.wfBeta1 = v; p.hasWfBeta1 = true; }
                         else                     { p.wfE     = v; p.hasWfE     = true; }
                     }
                     else if (key == "blending")
@@ -918,7 +943,7 @@ inline FieldData<T> readField(const std::string& path)
                     else if (key == "setAverage" && p.type == "timeVaryingMappedFixedValue")
                     {
                         const std::string v = ts.next();
-                        if (v == "true" || v == "yes" || v == "on" || v == "1")
+                        if (ofSwitchToken(v, "setAverage"))
                             p.mapUnsupported = "setAverage";   // rescales to the file average -- fully matters at steady
                         ts.expect(";");
                     }
@@ -1273,7 +1298,7 @@ inline FieldData<T> readField(const std::string& path)
                     else if (key == "uniformJump")
                     {
                         const std::string w = ts.next();
-                        p.uniformJump = (w == "true" || w == "yes" || w == "on" || w == "1");
+                        p.uniformJump = ofSwitchToken(w, "uniformJump");
                         ts.expect(";");
                     }
                     else if (key == "jump")
@@ -1367,7 +1392,7 @@ inline FieldData<T> readField(const std::string& path)
                     else if (key == "extrapolateProfile")
                     {
                         const std::string w = ts.next();
-                        p.extrapolateProfile = (w == "true" || w == "yes" || w == "on" || w == "1");
+                        p.extrapolateProfile = ofSwitchToken(w, "extrapolateProfile");
                         ts.expect(";");
                     }
                     else if (key == "phi")    // the flux a flux-conditional condition looks up, by NAME

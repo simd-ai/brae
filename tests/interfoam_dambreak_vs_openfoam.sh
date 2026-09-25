@@ -270,6 +270,37 @@ t = t[:m.start(2)] + body + t[m.end(2):]
 open(q, 'w').write(t)
 PYEOF
     fi
+    if [ "$profile" = momminiter ]; then
+        # THE MOMENTUM ENTRY NAMES `minIter 1`, the twin of `alphaminiter`. `lduMatrix::solver::stop`
+        # runs the loop on while nIterations_ < minIter_ EVEN WHEN the residual is already under the
+        # tolerance, so a U solve that enters converged still takes a sweep and MOVES U. brae hardcoded
+        # 0 at the momentum solve and the reader REFUSED a case that named one.
+        #
+        # THE TOLERANCE IS DELIBERATELY LOOSE (0.5) so the solve enters converged and minIter is the only
+        # thing that makes it sweep -- exactly how the RAS gate`s `custom` profile makes minIter visible.
+        # `momentumPredictor yes` with the `"U.*"` key, as `mompred` stages it.
+        sed -i 's/momentumPredictor  *no;/momentumPredictor yes;/' "$C/system/fvSolution"
+        sed -i 's/^\( *\)U$/\1"U.*"/' "$C/system/fvSolution"
+        python3 - "$C" <<'MOMEOF' || { echo "FAIL: the $profile profile was not staged"; return 1; }
+import os, re, sys
+q = os.path.join(sys.argv[1], "system/fvSolution")
+t = open(q).read()
+m = re.search(r'("U\.\*"\s*\{)([^}]*)\}', t)
+assert m, "no U.* entry to give its own tolerance"
+body = m.group(2)
+assert "minIter" not in body, "the tutorial names minIter already"
+body = re.sub(r"tolerance\s+[^;]+;", "tolerance       0.5;", body)
+body = re.sub(r"solver\s+\w+;", "solver          smoothSolver;", body)
+if "smoother" not in body: body = body + "    smoother        symGaussSeidel;\n    "
+body = body + "    minIter         1;\n    "
+t = t[:m.start(2)] + body + t[m.end(2):]
+open(q, "w").write(t)
+MOMEOF
+        grep -q "minIter         1;" "$C/system/fvSolution" \
+            || { echo "FAIL: minIter was not added to the U entry"; return 1; }
+        grep -q "momentumPredictor yes;" "$C/system/fvSolution" \
+            || { echo "FAIL: the momentum predictor was not switched on"; return 1; }
+    fi
     if [ "$profile" = outflow ]; then
         # THE WATER COLUMN REACHES THE ATMOSPHERE, whose faces over it turn out to be OUTFLOW (the patch
         # fixes p_rgh, not p, so the column top sees the lower pressure): water leaves through them.
@@ -352,11 +383,86 @@ PYEOF
     [ "$profile" = prevcorrsub ] && std="$W/prevcorr/$end"
     # ...and the three PIMPLE profiles read the big-step run without their setting
     case "$profile" in nouter|nonorth|mompred|rhophi|vanleerv|linear|compression|alphaminiter) std="$W/bigstep/$end" ;; esac
+    # ...and the momentum minIter reads the SAME case with the predictor on and no minIter: the
+    # only difference is the iteration floor, so any gap between them is the floor's
+    [ "$profile" = momminiter ] && std="$W/mompred/$end"
     # ...and the gradient profile reads the sheared run it differs from in its gradSchemes alone
     [ "$profile" = gradLsqLimited ] && std="$W/sheared/$end"
     # ...and the small-step nHat profile reads the small-step run without its entry
     [ "$profile" = nHatLimited ] && std="$W/small/$end"
     "$BIN" "$C" "$C/0" "$C/$end" "$STEPS" "$C/log.interFoam" "$C.control" "$profile" $std
+}
+
+
+# THE rAU RESTART. `initCorrectPhi.H:5-17` reads rAU READ_IF_PRESENT with a default of 1 and includes
+# `correctPhi.H` immediately after, so on a RESTART the very FIRST CorrectPhi interpolates the FILE`s rAU
+# and not 1. It is AUTO_WRITE and `pEqn.H:87` clears it only under `!correctPhi`, so a case with
+# `correctPhi yes` writes one into every time directory. brae REFUSED the file`s presence.
+#
+# THE MESH IS STATIC ON PURPOSE. `correctPhi` defaults to mesh.dynamic() but a case may set it, and a
+# MOVING restart is blocked by a different refusal that stands: brae reads the mesh from constant/polyMesh
+# only, and OpenFOAM restarts a moved mesh from the points written beside the fields. A static damBreak
+# with `correctPhi yes` isolates rAU from that.
+#
+# MEASURED on the directory OpenFOAM writes here: rAU is nonuniform over 2268 cells, 9.9e-07 .. 1.0e-03 --
+# three to six orders below the 1 a cold start assumes, which is what makes the restart a discriminator.
+restart_rAU()
+{
+    local C="$W/rauInit" R="$W/rauRestart"
+    rm -rf "${C:?}" "${R:?}"
+    cp -r "$SRC" "$C" || return 1
+    rm -rf "${C:?}"/[1-9]* "${C:?}"/0 "${C:?}"/processor* "${C:?}"/log.*
+    cp -r "$C/0.orig" "$C/0"
+    python3 - "$C" <<'RAUEOF' || { echo "FAIL: the rAU restart was not staged"; return 1; }
+import re, sys
+d = sys.argv[1]
+q = d + "/system/fvSolution"
+t = open(q).read()
+t, n = re.subn(r"momentumPredictor\s+no;", "momentumPredictor no;\n    correctPhi      yes;", t, count=1)
+assert n == 1, "momentumPredictor no; not found to add correctPhi beside"
+open(q, "w").write(t)
+c = d + "/system/controlDict"
+t = open(c).read()
+for k, v in [("adjustTimeStep","no"), ("deltaT","0.001"), ("endTime","0.005"),
+             ("writeControl","timeStep"), ("writeInterval","5"), ("writeFormat","ascii"),
+             ("writePrecision","15")]:
+    t, n = re.subn(r"^%s\s.*" % k, "%s %s;" % (k.ljust(15), v), t, flags=re.M)
+    assert n == 1, k
+open(c, "w").write(t)
+RAUEOF
+    ( cd "$C" && blockMesh > log.blockMesh 2>&1 && setFields > log.setFields 2>&1 \
+        && interFoam > log.interFoam 2>&1 ) \
+        || { echo "FAIL: the rAU restart source run"; tail -15 "$C/log.interFoam"; return 1; }
+    [ -f "$C/0.005/rAU" ] \
+        || { echo "FAIL: OpenFOAM wrote no rAU under correctPhi -- the arm cannot witness the fix"; return 1; }
+    # THE ARM IS NOT VACUOUS unless what is on disk is far from the default
+    python3 - "$C/0.005/rAU" <<'RAUEOF' || return 1
+import re, sys
+s = open(sys.argv[1]).read()
+m = re.search(r"internalField\s+nonuniform[^(]*\(\s*(.*?)\s*\)\s*;", s, re.S)
+assert m, "the written rAU is uniform -- a restart would be indistinguishable from a cold start"
+v = [float(x) for x in m.group(1).split()]
+assert max(v) < 0.5, "the written rAU reaches %g, too close to the default 1 to witness it" % max(v)
+print("  rAU on disk: %d cells, %.4g .. %.4g -- far from the 1 a cold start assumes" % (len(v), min(v), max(v)))
+RAUEOF
+    cp -r "$C" "$R" || return 1
+    rm -f "$R"/log.*
+    python3 - "$R" <<'RAUEOF' || { echo "FAIL: the restart controlDict"; return 1; }
+import re, sys
+q = sys.argv[1] + "/system/controlDict"
+t = open(q).read()
+t = re.sub(r"^startFrom .*", "startFrom       startTime;", t, flags=re.M)
+t = re.sub(r"^startTime .*", "startTime       0.005;", t, flags=re.M)
+t = re.sub(r"^endTime .*", "endTime         0.01;", t, flags=re.M)
+assert "startTime       0.005;" in t and "endTime         0.01;" in t
+open(q, "w").write(t)
+RAUEOF
+    ( cd "$R" && interFoam > log.interFoam 2>&1 ) \
+        || { echo "FAIL: OpenFOAM did not restart"; tail -15 "$R/log.interFoam"; return 1; }
+    [ -d "$R/0.01" ] || { echo "FAIL: the restart wrote no 0.01 directory"; return 1; }
+    # argv[6] is the alpha-solver control case; this arm reuses the restart itself, and argv[8] is the
+    # directory the restart starts FROM, which is where OpenFOAM wrote the rAU under test.
+    "$BIN" "$R" "$R/0.005" "$R/0.01" 5 "$R/log.interFoam" "$R" raurestart "$C/0.005"
 }
 
 rc=0
@@ -374,7 +480,9 @@ run_at "$DT_BIG" vanleerv || rc=1
 run_at "$DT_BIG" linear || rc=1
 run_at "$DT_BIG" compression || rc=1
 run_at "$DT_BIG" alphaminiter || rc=1
+run_at "$DT_BIG" momminiter || rc=1
 run_at "$DT_BIG" sheared || rc=1
 run_at "$DT_BIG" gradLsqLimited || rc=1
 run_at "$DT" nHatLimited || rc=1
+restart_rAU || rc=1
 exit $rc

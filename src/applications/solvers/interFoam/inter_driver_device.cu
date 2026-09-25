@@ -554,8 +554,12 @@ RunReport runInterFoamDevice(
         // the same controls the host driver and the mesh update take, grad(pcorr)'s entry included
         const CorrectPhiControls cpc = correctPhiControlsOf(f, meshAgglomeration);
         const SurfaceScalarField one = unitFaceField(m, fvp);
+        // initCorrectPhi.H's rAUf: `fvc::interpolate(rAU())` under `correctPhi` (correctPhi.H:6) and a
+        // literal 1 only in the `else` branch (initCorrectPhi.H:28). See the host loop for the
+        // measurement -- a restart's rAU is the file's, and passing 1 there is 2.5e-04 of p_rgh.
+        const SurfaceScalarField rAUfStart = f.correctPhi ? fvc::interpolate(f.rAU, m, g, fvp) : one;
         CorrectPhiInput cin;
-        cin.rAUf = &one;
+        cin.rAUf = &rAUfStart;
         cin.rhoPhi = &f.rhoPhi;
         cin.solveLog = &initPcorrSolves;
         correctPhi(f.U, f.phi, f.p_rgh, cin, cpc, m, g, fvp);
@@ -1529,6 +1533,15 @@ RunReport runInterFoamDevice(
         C.momentum.tol = us.tol;
         C.momentum.relTol = us.relTol;
         C.momentum.maxIter = us.maxIter;
+        C.momentum.minIter = us.minIter;
+        // minIter reaches the device's Gauss-Seidel sweep; deviceJacobiBiCGStab takes no minIter, so
+        // naming one beside a solver that is not smoothSolver would stop a sweep short and say nothing.
+        if (us.minIter > 0 && !us.gaussSeidel())
+            throw std::runtime_error(
+                "brae interFoam (device): the U solver names `minIter " + std::to_string(us.minIter)
+                + "` beside `solver " + us.solver + "`. The device momentum solve honours minIter on its "
+                  "Gauss-Seidel branch only; BiCGStab there takes no iteration floor. Refused rather "
+                  "than stop a sweep earlier than OpenFOAM does.");
         C.momentum.smoothSolver = us.gaussSeidel();
         C.momentum.symmetric = (us.smoother == "symGaussSeidel");
         C.momentum.nSweeps = us.nSweeps;

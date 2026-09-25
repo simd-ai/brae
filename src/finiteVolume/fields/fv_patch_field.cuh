@@ -30,6 +30,12 @@ struct WallFunctionCoeffs
     scalar Cmu   = 0.09;
     scalar kappa = 0.41;
     scalar E     = 9.8;
+    // omegaWallFunction's OWN beta1, read from the PATCH dictionary with its own default
+    // (omegaWallFunctionFvPatchScalarField.C:404-409, `beta1_(dict.getOrDefault<scalar>("beta1", 0.075))`)
+    // and used in omegaVis at :222. It is NOT the model's beta1: a case writing
+    // `kOmegaSSTCoeffs { beta1 0.08; }` changes the EQUATION's blend and leaves the wall at 0.075, and
+    // brae used the model's at the wall -- a silent substitution on any case that sets it.
+    scalar beta1 = 0.075;
     // wallFunctionCoefficients.C:40-52: ten fixed-point iterations of ypl = log(max(E ypl, 1))/kappa from 11.
     scalar yPlusLam() const
     {
@@ -2910,7 +2916,7 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     std::unique_ptr<fvPatchField<T>> f = makePatchFieldImpl<T>(p, d);
     if (f)
     {
-        f->setWallCoeffs(WallFunctionCoeffs{d.wfCmu, d.wfKappa, d.wfE});
+        f->setWallCoeffs(WallFunctionCoeffs{d.wfCmu, d.wfKappa, d.wfE, d.wfBeta1});
         // ...AND THE FLUX NAME ONLY FOR A CLASS THAT READS ONE. `fixedFluxPressure` has NO `phiName_`
         // member at all in v2412: its dictionary constructor reads the gradient and value entries and
         // nothing else (fixedFluxPressureFvPatchScalarField.C -- `readGradientEntry` / `readValueEntry`,

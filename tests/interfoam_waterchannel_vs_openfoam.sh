@@ -218,6 +218,52 @@ PYEOF
     # 3.0634e-02, U 4.4383e-04, alpha 1.9940e-05, 4 of 10 omega counts, 22 failures. With the entry
     # read: host k 2.4249e-12 / omega 2.9758e-12, device 2.1456e-12 / 4.0655e-12, every count
     # OpenFOAM's on both.
+    # `correctWallsOff`: fvSchemes' `wallDist { correctWalls no; }`. meshWavePatchDistMethod.C:59 reads it
+    # (default true) and hands it to patchWave(mesh, patchIDs, correctWalls_); patchWave::correct()
+    # (patchWave.C:178-236) always runs the wave and takes the cell value from it, and only THEN,
+    # `if (correctWalls_)`, overwrites the wall-adjacent cells with the exact distance to the face
+    # POLYGON. So `no` leaves those cells on the wave's face-CENTRE distance. brae hardcoded the
+    # correction and REFUSED the entry. Its control is the `sst` run, which is the same case with the
+    # correction on -- so the only difference is y on the cells that touch a wall.
+    # `wallCoeffs`: the WALL PATCH names its OWN Cmu, kappa, E and beta1 on nut and omega. OpenFOAM builds
+    # `wallFunctionCoefficients` from the PATCH dictionary in every wall function
+    # (wallFunctionCoefficients.C:68-80), deriving yPlusLam from that patch's kappa and E, and
+    # omegaWallFunction reads its own `beta1` there too (omegaWallFunctionFvPatchScalarField.C:408). None
+    # of them comes from the model dictionary. brae's kOmegaSST closure used model-wide values and the
+    # reader REFUSED any patch that named its own -- refusing a case OpenFOAM runs. Its control is the
+    # `sst` run, which is the same case at the defaults.
+    if [ "$profile" = wallCoeffs ]; then
+        python3 - "$C" <<'WCEOF' || { echo "FAIL: the wallCoeffs profile was not staged"; return 1; }
+import re, sys
+d = sys.argv[1]
+for fld, extra in (("nut", ""), ("omega", "        beta1           0.08;\n")):
+    q = d + "/0/" + fld
+    t = open(q).read()
+    # every wall-function entry in the file gets the patch's own coefficients
+    pat = r"(type\s+(?:nutk|omega)WallFunction;\n)"
+    t, n = re.subn(pat, r"\1        Cmu             0.085;\n        kappa           0.40;\n"
+                        r"        E               9.0;\n" + extra, t)
+    assert n >= 1, "no wall function entry in 0/%s" % fld
+    open(q, "w").write(t)
+    print("  %s: %d wall-function entries given their own coefficients" % (fld, n))
+WCEOF
+        grep -q "Cmu             0.085;" "$C/0/nut" && grep -q "beta1           0.08;" "$C/0/omega" \
+            || { echo "FAIL: the patch coefficients were not written"; return 1; }
+    fi
+    if [ "$profile" = correctWallsOff ]; then
+        python3 - "$C" <<'CWEOF' || { echo "FAIL: the correctWallsOff profile was not staged"; return 1; }
+import re, sys
+q = sys.argv[1] + "/system/fvSchemes"
+t = open(q).read()
+m = re.search(r"wallDist\s*\{([^}]*)\}", t)
+assert m, "no wallDist block to add correctWalls to"
+assert "correctWalls" not in m.group(1), "the tutorial names correctWalls already"
+t = t[:m.end(1)] + "    correctWalls    no;\n" + t[m.end(1):]
+open(q, "w").write(t)
+CWEOF
+        grep -q "correctWalls    no;" "$C/system/fvSchemes" \
+            || { echo "FAIL: correctWalls was not written"; return 1; }
+    fi
     if [ "$profile" = pbicg ]; then
         python3 - "$C" <<'PYEOF' || { echo "FAIL: the pbicg profile was not staged"; return 1; }
 import re, sys
@@ -302,7 +348,7 @@ PYEOF
 
 rc=0
 for p in laminar sst nutPatches nutInletZeroGrad nutInletZero oneCorrector oneCorrectorLaminar \
-         limitedLinear pbicg; do
+         limitedLinear pbicg correctWallsOff wallCoeffs; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_waterchannel_vs_openfoam: staging failed"; exit 1; }
@@ -335,6 +381,13 @@ grep -q "Solving for omega" "$W/laminar/log.interFoam" \
 # somewhere else, and that is the whole point of reading the entry.
 "$BIN" "$W/pbicg" "$W/pbicg/0" "$W/pbicg/$END" "$STEPS" "$W/pbicg/log.interFoam" \
        "$W/laminar/$END" "$W/sst/$END" || rc=1
+# ...and `wallDist { correctWalls no; }`, whose control is the `sst` run: the same case with the
+# correction on, so the only thing between them is y on the wall-adjacent cells.
+"$BIN" "$W/correctWallsOff" "$W/correctWallsOff/0" "$W/correctWallsOff/$END" "$STEPS" \
+       "$W/correctWallsOff/log.interFoam" "$W/laminar/$END" "$W/sst/$END" || rc=1
+# ...and the wall patch's OWN Cmu/kappa/E/beta1, whose control is the `sst` run at the defaults.
+"$BIN" "$W/wallCoeffs" "$W/wallCoeffs/0" "$W/wallCoeffs/$END" "$STEPS" \
+       "$W/wallCoeffs/log.interFoam" "$W/laminar/$END" "$W/sst/$END" || rc=1
 "$BIN" "$W/nutPatches" "$W/nutPatches/0" "$W/nutPatches/$END" "$STEPS" "$W/nutPatches/log.interFoam" \
        "$W/laminar/$END" "$W/sst/$END" || rc=1
 # the control is OpenFOAM's answer with the patch pinned at 0: nut 1.4e-05 away, a floor of 1e-6 (six

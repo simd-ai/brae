@@ -373,6 +373,11 @@ struct MomentumSolveControls
     scalar tolU    = 1e-7;
     scalar relTolU = 0;
     int    maxIterU = 1000;
+    // lduMatrix::solver::stop -- the loop runs on while nIterations_ < minIter_ EVEN WHEN the residual
+    // is already under the tolerance (lduMatrixSolver.C), so a solve that enters converged still takes
+    // a sweep and MOVES U. This was hardcoded 0 at the solve and the reader refused a case that named
+    // one; the alpha pre-solve beside it has honoured minIter since damBreak's big step.
+    int    minIterU = 0;
     // the case's solver for U -- see InterFields::uSolve
     VectorLinearSolver which;
     // fvMesh::validComponents: a 2-D case does not solve the empty direction (fvMatrixSolve.C:162-164).
